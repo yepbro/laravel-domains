@@ -1,189 +1,200 @@
 ---
-name: Прод-отчёт (larasites)
-description: Отчёт-сводка о состоянии прода Domain Crawler — сервер larasites (155.212.174.88): нагрузка CPU/RAM/диск, глубина и лаг групп очередей q:dns/q:http/q:render/q:render-fallback/q:analyze/q:dead (pending потребителей, не XLEN), скорость и прогресс конвейера, сколько доменов проверено, retention/компактификация контента, статус юнитов systemd (running/failed), движки рендера и фолбэк (после деплоя этапа 35/36). Запускать, когда просят оценить самочувствие прода: «дай отчёт о нагрузке», «что с продом/сервером», «какая скорость/глубина очередей», «почему диск/память/лаги растут», «сколько доменов проверено», упоминание larasites, dashboard.laracity.ru или 155.212.174.88 в контексте состояния/метрик. Скилл показывает только агрегированные метрики и НЕ подходит для работы с логами: «покажи последние строки логов», tail/grep журнала, «логи юнита за вчера», поиск ошибок в логах — для этого нужны инструменты чтения журналов, а не этот скилл.
+name: Prod report (larasites)
+description: A summary report on the state of the Domain Crawler production — the larasites server (155.212.174.88): CPU/RAM/disk load, depth and lag of the q:dns/q:http/q:render/q:render-fallback/q:analyze/q:dead queue groups (the consumer pending, not XLEN), pipeline speed and progress, how many domains are checked, content retention/compaction, systemd unit status (running/failed), render engines and fallback (after the stage 35/36 deploy). Run it when asked to assess the production health: "give a load report", "what's up with prod/the server", "what is the queue speed/depth", "why are disk/memory/lags growing", "how many domains are checked", a mention of larasites, dashboard.laracity.ru or 155.212.174.88 in a status/metrics context. The skill shows only aggregated metrics and is NOT suitable for log work: "show the last log lines", journal tail/grep, "unit logs for yesterday", searching for errors in logs — journal-reading tools are needed for that, not this skill.
 ---
 
-# Прод-отчёт: larasites (Domain Crawler)
+# Prod report: larasites (Domain Crawler)
 
-Скилл собирает разовый снимок состояния прода и оформляет его отчётом.
-Прод — единственный боевой сервер проекта, деплой нативный systemd
-(НЕ docker — контейнеры искать не надо).
+The skill collects a one-off snapshot of the production state and formats
+it as a report.
+Prod is the project's only production server; the deploy is native systemd
+(NOT docker — do not look for containers).
 
-## Правила безопасности
+## Safety rules
 
-1. **Сбор данных — только чтение.** Никаких `restart`/`stop` юнитов,
-   `DEL`/`XTRIM` в Redis, vacuum, `--vacuum-size`, записи в psql — без
-   явной команды пользователя. Отчёт заканчивается рекомендациями и
-   вопросом, а не действиями.
-2. **`crawler-scheduler` может быть остановлен намеренно оператором**
-   (так было 03.11.2026). Обнаружив `inactive` — сообщить в отчёте и
-   спросить, а не «чинить».
-3. SSH — только через алиас `larasites` (root, ключ). Прямые IP и пароли
-   не использовать.
-4. Все тяжёлые запросы (psql, два среза очередей) и так щадящие: один
-   прогон `collect.sh` ≈ 25–30 с. Не запускать его чаще, чем нужно.
+1. **Data collection is read-only.** No unit `restart`/`stop`,
+   no `DEL`/`XTRIM` in Redis, no vacuum, no `--vacuum-size`, no psql
+   writes — without an explicit user command. The report ends with
+   recommendations and a question, not actions.
+2. **`crawler-scheduler` may be stopped intentionally by the operator**
+   (this happened on 03.11.2026). On finding it `inactive` — report it
+   and ask, do not "fix" it.
+3. SSH — only via the `larasites` alias (root, key). Do not use direct
+   IPs or passwords.
+4. All heavy queries (psql, two queue snapshots) are gentle anyway: one
+   `collect.sh` run ≈ 25–30 s. Do not run it more often than necessary.
 
-## Порядок работы
+## Procedure
 
-1. Запусти сборщик:
+1. Run the collector:
    ```bash
-   <base-dir>/scripts/collect.sh              # интервал срезов 20 с
-   collect.sh --interval 45                   # точнее скорости очередей
+   <base-dir>/scripts/collect.sh              # snapshot interval 20 s
+   collect.sh --interval 45                   # more precise queue speed
    ```
-   Скрипт ходит по ssh на `larasites` и печатает markdown-снимок по
-   секциям: Система, Юниты, Топ CPU, Очереди (с расчётом скоростей),
-   Redis, Конвейер (crawlerctl), PostgreSQL, Контент, Метрики, Логи.
-2. Прочитай снимок и интерпретируй: что в норме, что нет — по таблице
-   красных флагов ниже.
-3. При аномалиях открой `references/prod-topology.md` — там прод-топология,
-   точечные команды для углубления по каждому блоку и известные инциденты.
-   Углубляйся только по подозрительным секциям, не бегай по всему серверу.
-4. Оформи отчёт по шаблону ниже.
-5. **Выведи отчёт в чат целиком И сохрани его же (тот же текст) в файл**
-   `prod-reports/YYYY-MM-DD-HHMMSS.md` — путь от корня репо; имя —
-   дата-время формирования отчёта в локальной таймзоне, секунды обязательны
-   (пример: `prod-reports/2026-11-03-193215.md`). После отчёта отдельной
-   строкой назови путь к сохранённому файлу. Каталог `prod-reports/` уже
-   существует в корне репо и целиком игнорируется git (там свой `.gitignore`)
-   — отчёты локальные, в коммиты не попадают.
-6. Закончи вопросом о дальнейших действиях.
+   The script goes over ssh to `larasites` and prints a markdown snapshot
+   in sections: System, Units, Top CPU, Queues (with rate calculation),
+   Redis, Pipeline (crawlerctl), PostgreSQL, Content, Metrics, Logs.
+2. Read the snapshot and interpret it: what is normal and what is not —
+   using the red flags table below.
+3. On anomalies, open `references/prod-topology.md` — it has the prod
+   topology, targeted commands for going deeper on each block, and known
+   incidents. Go deeper only on the suspicious sections; do not run all
+   over the server.
+4. Format the report using the template below.
+5. **Output the report to the chat in full AND save the same text to a file**
+   `prod-reports/YYYY-MM-DD-HHMMSS.md` — the path is from the repo root; the
+   name is the report generation date-time in the local timezone, seconds
+   are mandatory (example: `prod-reports/2026-11-03-193215.md`). After the
+   report, state the path to the saved file on a separate line. The
+   `prod-reports/` directory already exists in the repo root and is
+   entirely ignored by git (it has its own `.gitignore`)
+   — the reports are local and never reach commits.
+6. Finish with a question about further actions.
 
-## Ключевые формулы (не путать!)
+## Key formulas (do not mix up!)
 
-- **Остаток очереди = `lag` группы + `pending`** (in-flight без ACK).
-  `XLEN` — это НЕ остаток: стрим хранит историю обработанных записей до
-  XTRIM. Инцидент 03.11.2026: XLEN q:render = 150 тыс., реальный остаток
-  (lag) = 9.9 тыс. — ошибка в 15 раз. `crawler_queue_depth` в метриках
-  считается правильно: `min(lag, XLEN) + pending`.
-- **Скорость потребления** = Δ`entries-read` группы / Δt (два среза).
-- **Приток** = (Δ`entries-read` + Δ`lag`) / Δt — отрицательный Δlag значит
-  бэклог рассасывается.
-- **q:render между снимками сравнивать ТОЛЬКО с учётом рендер-долга.**
-  Пока глубина q:render ниже `render.queue_high_watermark` (T-174, на
-  проде 10 тыс.), проход доработки `RequeueRenderPending` в http-worker
-  (тик ~1 мин, пачка до 100 доменов, T-066) пополняет очередь из доменов
-  с флагом `render_pending` — лаг держится у порога и почти не меняется,
-  пока долг не исчерпан: «лаг не тает» ≠ затор. Полный рендер-долг =
-  lag(q:render) + `render_pending` (счётчик crawler_counters; метрика
-  monitor `crawler_render_pending_domains`). Тренд и ETA («бэклог уйдёт
-  за N») считать по сумме; прогноз по одному лагу корректен только при
-  render_pending = 0.
-- `q:dead` — кладбище без потребителя: для него только XLEN, лага нет.
-- **q:render-fallback — шестой стрим (после деплоя этапа 35/36 — см.
-  раздел «Движки рендера и фолбэк» ниже).** Консьюмер есть (группа
-  `render-fallback-worker`, воркер B) — лаг/скорость/приток считаются
-  как у рабочих стримов, это не q:dead. Очередь пустая при
-  engine=chromium — движковый guard: фолбэк публикуют только
-  движки-кандидаты (moli/lightpanda), chromium сам себе не фолбэчится;
-  пустая очередь при живом B — норма, пока канарейки нет. При канарейке
-  целевой fallback-рейт ≤15 % потока этапа; глубина должна быть
-  ≪ 15 000 (MAXLEN стрима): у потолка XADD обрезает недоставленное —
-  потеря задач.
-- **Баланс-чек фолбэка (сверка приёмки):**
-  `increase(crawler_render_fallback_published_total)` (воркер A)
-  = `increase(crawler_render_fallback_consumed_total)` (воркер B)
-  + depth(q:render-fallback) + `increase(buried)` — см. раздел ниже.
+- **Queue backlog = group `lag` + `pending`** (in-flight without ACK).
+  `XLEN` is NOT the backlog: the stream keeps the history of processed
+  entries until XTRIM. Incident 03.11.2026: XLEN q:render = 150k, the real
+  backlog (lag) = 9.9k — an error of 15x. `crawler_queue_depth` in the
+  metrics is computed correctly: `min(lag, XLEN) + pending`.
+- **Consumption rate** = group Δ`entries-read` / Δt (two snapshots).
+- **Inflow** = (Δ`entries-read` + Δ`lag`) / Δt — a negative Δlag means
+  the backlog is draining.
+- **Compare q:render between snapshots ONLY taking the render debt into
+  account.** While the q:render depth is below `render.queue_high_watermark`
+  (T-174, 10k in prod), the `RequeueRenderPending` rework pass in the
+  http-worker (tick ~1 min, a batch of up to 100 domains, T-066)
+  replenishes the queue from domains with the `render_pending` flag —
+  the lag stays near the threshold and barely changes until the debt is
+  exhausted: "the lag is not melting" ≠ a jam. The full render debt =
+  lag(q:render) + `render_pending` (a crawler_counters counter; the
+  monitor metric `crawler_render_pending_domains`). Compute the trend and
+  the ETA ("the backlog will clear in N") from the sum; a forecast from
+  the lag alone is correct only at render_pending = 0.
+- `q:dead` is a graveyard without a consumer: only XLEN applies to it,
+  there is no lag.
+- **q:render-fallback is the sixth stream (after the stage 35/36 deploy —
+  see the "Render engines and fallback" section below).** There is a
+  consumer (the `render-fallback-worker` group, worker B) — lag/rate/
+  inflow are computed as for the working streams; this is not q:dead. An
+  empty queue at engine=chromium is the engine guard: the fallback is
+  published only by candidate engines (moli/lightpanda), chromium does
+  not fall back to itself; an empty queue with B alive is normal while
+  there are no canaries. With a canary the target fallback rate is
+  ≤15% of the stage flow; the depth must be ≪ 15,000 (the stream MAXLEN):
+  at the cap XADD truncates the undelivered entries — task loss.
+- **Fallback balance check (acceptance reconciliation):**
+  `increase(crawler_render_fallback_published_total)` (worker A)
+  = `increase(crawler_render_fallback_consumed_total)` (worker B)
+  + depth(q:render-fallback) + `increase(buried)` — see the section below.
 
-## Красные флаги
+## Red flags
 
-| Флаг | Порог / признак | Куда копать |
+| Flag | Threshold / sign | Where to dig |
 |---|---|---|
-| Load | ≥ 2× vCPU (8) устойчиво | Топ CPU: `headless-shell`/`postgres` в рендере — норма (базовые замеры — docs/load-measurements.md); после деплоя 35/36 — ещё движки moli/lightpanda (бюджет ≤1 ГБ каждый) и воркер B (+256M, второй headless-shell — см. раздел «Движки рендера и фолбэк») — тоже норма; аномалия — незнакомый процесс |
-| Память | swap занят и растёт | `postgres` с большим RSS, копии chromium; MemoryHigh юнитов |
-| Диск `/` | ≥ 85% или < 10 Г свободно | retention/компактификация: журнал http-worker (`проход компактификации паков`, retention skips), `/var/log` |
-| Очередь | lag растёт (приток > потребления) | Жив ли воркер (`systemctl`), WARN «рендер-тарпит» у render-worker |
-| q:render | лаг у ~10 тыс. (`render.queue_high_watermark`) не тает | Норма при render_pending > 0: проход доработки T-066/T-174 пополняет очередь из долга — затор только при потреблении 0; тренд смотреть по lag + render_pending (см. формулы) |
-| q:render-fallback (после деплоя 35/36) | глубина растёт к 7 500 (алерт `render_fallback_depth`, потолок MAXLEN 15 000, снятие < 6 750) | Темп воркера B (`render.fallback.worker_rate`, юнит crawler-render-fallback-worker, метрики :9120) против потока публикаций; у потолка 15 000 XADD обрезает недоставленное — потеря задач |
-| suspended{gate\|budget} (после деплоя 35/36) | рост `crawler_render_fallback_suspended_total` | gate — основной движок (moli/lightpanda) недоступен: стрик browser-ошибок закрыл публикацию до восстановления; budget — доля публикаций за окно ушла за потолок `render.fallback.share_percent`; решать про движок (чинить/откат на chromium), задачи при этом не теряются |
-| render_browser_errors (после деплоя 35/36) | стрик роста browser-ошибок рендера (алерт) | Зависание CDP движка при живом контейнере/юните движка: статус движка, Warn-логи воркера; не чинится быстро — откат на chromium |
-| Записи в q:render-fallback при engine=chromium | XLEN > 0 при движке сборки chromium | Движковый guard: chromium сам себе не фолбэчится — публикаций быть не должно; сверить `render.engine` и сборку воркера A |
-| Конвейер | скорость 0 дом/с, но pending > 0 | `systemctl is-active crawler-scheduler` — если стоит, см. правило 2 выше |
-| q:dead | растёт | Журнал воркеров: исчерпаны retry (`redis.max_attempts`) |
-| Счётчики | `checks:<сегодня>` = 0 при активном фронте | Журнал scheduler → dns-worker, цепочка постановок |
-| Логи | journal > 1 Г или syslog растёт | Вернулся спам? drop-in `crawler-chromium.service.d/10-logfilter.conf` на месте? |
-| PG | `n_dead_tup` contents/subdomain_results — миллионы | Автовактуум не успевает (docs/db.md) |
+| Load | ≥ 2× vCPU (8) sustained | Top CPU: `headless-shell`/`postgres` in rendering — normal (baseline measurements — docs/load-measurements.md); after the 35/36 deploy — also the moli/lightpanda engines (budget ≤1 GB each) and worker B (+256M, a second headless-shell — see the "Render engines and fallback" section) — also normal; an anomaly is an unfamiliar process |
+| Memory | swap occupied and growing | `postgres` with a large RSS, chromium copies; unit MemoryHigh |
+| Disk `/` | ≥ 85% or < 10 GB free | retention/compaction: the http-worker journal (the "pack compaction pass" line, retention skips), `/var/log` |
+| Queue | lag growing (inflow > consumption) | Is the worker alive (`systemctl`), the render-worker WARN "render tarpit" |
+| q:render | the lag near ~10k (`render.queue_high_watermark`) is not melting | Normal at render_pending > 0: the T-066/T-174 rework pass replenishes the queue from the debt — a jam only at zero consumption; watch the trend via lag + render_pending (see the formulas) |
+| q:render-fallback (after the 35/36 deploy) | depth growing toward 7,500 (the `render_fallback_depth` alert, the MAXLEN cap 15,000, cleared < 6,750) | Worker B rate (`render.fallback.worker_rate`, the crawler-render-fallback-worker unit, metrics :9120) against the publication flow; at the 15,000 cap XADD truncates the undelivered entries — task loss |
+| suspended{gate\|budget} (after the 35/36 deploy) | growth of `crawler_render_fallback_suspended_total` | gate — the main engine (moli/lightpanda) is unavailable: a browser-error streak closed publication until recovery; budget — the share of publications per window exceeded the `render.fallback.share_percent` cap; decide on the engine (fix/roll back to chromium), tasks are not lost meanwhile |
+| render_browser_errors (after the 35/36 deploy) | a streak of growing render browser errors (alert) | A CDP engine hang with the engine container/unit alive: the engine status, the worker Warn logs; if it does not clear quickly — roll back to chromium |
+| Entries in q:render-fallback at engine=chromium | XLEN > 0 with the build engine chromium | Engine guard: chromium does not fall back to itself — there must be no publications; verify `render.engine` and the worker A build |
+| Pipeline | rate 0 domains/s but pending > 0 | `systemctl is-active crawler-scheduler` — if it is stopped, see rule 2 above |
+| q:dead | growing | Worker journals: retries exhausted (`redis.max_attempts`) |
+| Counters | `checks:<today>` = 0 with the front active | scheduler → dns-worker journal, the enqueue chain |
+| Logs | journal > 1 GB or syslog growing | Is the spam back? Is the `crawler-chromium.service.d/10-logfilter.conf` drop-in in place? |
+| PG | `n_dead_tup` of contents/subdomain_results — millions | Autovacuum cannot keep up (docs/db.md) |
 
-## Движки рендера и фолбэк (этап 35/36)
+## Render engines and fallback (stage 35/36)
 
-**Единая оговорка: до деплоя этапа 35/36 новых сущностей на проде НЕТ** —
-q:render-fallback отсутствует в Redis, юнита crawler-render-fallback-worker
-нет, порт 9120 никто не слушает, движков moli/lightpanda нет; метрики
-движков/фолбэка в /metrics отсутствуют либо стоят нулями без роста
-(предсозданные серии S-P1-4; серия published — открытый словарь — не
-рождается вовсе). Это НОРМА, а не аномалия (код влит в master, прод ждёт
-пуша в production); все правила раздела действуют после деплоя —
-повторять оговорку в каждой строке не нужно.
+**A single caveat: before the stage 35/36 deploy the new entities DO NOT
+exist in prod** —
+q:render-fallback is absent from Redis, there is no crawler-render-fallback-worker
+unit, nobody listens on port 9120, there are no moli/lightpanda engines; the
+engine/fallback metrics in /metrics are absent or sit at zero without growth
+(the pre-created S-P1-4 series; the published series — an open dictionary —
+is never born). This is NORMAL, not an anomaly (the code is merged into
+master, prod awaits the push to production); all the rules of this section
+apply after the deploy —
+no need to repeat the caveat in every line.
 
-- **Баланс-чек приёмки** (шаг 4 ТЗР §6.2):
-  `increase(crawler_render_fallback_published_total)` (воркер A, :9105)
-  = `increase(crawler_render_fallback_consumed_total)` (воркер B, :9120)
-  + `crawler_queue_depth{queue="q:render-fallback"}` (глубина — backlog
-  группы B: лаг + pending) + `increase(crawler_queue_dead_buried_total
-  {queue="q:render-fallback"})`. Сверять по приростам между рестартами
-  (счётчики процессные); при дренированной очереди остаток нулевой;
-  равенство держится, пока глубина ниже MAXLEN (15 000).
-- **Источники `/metrics` рендер-воркеров с лейблом `engine`**
+- **Acceptance balance check** (step 4 of the render-fallback spec §6.2):
+  `increase(crawler_render_fallback_published_total)` (worker A, :9105)
+  = `increase(crawler_render_fallback_consumed_total)` (worker B, :9120)
+  + `crawler_queue_depth{queue="q:render-fallback"}` (the depth — the backlog
+  of group B: lag + pending) + `increase(crawler_queue_dead_buried_total
+  {queue="q:render-fallback"})`. Compare by increments between restarts
+  (the counters are per-process); with the queue drained the remainder is
+  zero; the equality holds while the depth is below the MAXLEN (15,000).
+- **`/metrics` sources of the render workers with the `engine` label**
   (chromium|moli|lightpanda): `crawler_render_records_total
-  {rendered,engine}` — доля движков (ветка rendered="true" — воркеры
-  рендера, "false" — HTTP-этап без лейбла), тарпит-финализации —
-  `crawler_render_tarpit_finalized_total{engine}`, фолбэк —
+  {rendered,engine}` — engine shares (the rendered="true" branch — render
+  workers, "false" — the HTTP stage without the label), tarpit
+  finalizations —
+  `crawler_render_tarpit_finalized_total{engine}`, the fallback —
   `crawler_render_fallback_{published,consumed,suspended}_total`.
-  Публикации/приостановки экспонирует воркер A (:9105), потребление —
-  только сборка B.
-- **Порт метрик воркера B — 9120** (вне зоны экземпляров
-  render-worker@). Встретится 9110 в старых заметках — УСТАРЕЛО после
-  фикса S-P2-3, правильный порт 9120.
-- **Панель «Движки рендера» дашборда** (сайт): темп/успешность/
-  tarpit-рейт/RSS по движкам; строка фолбэка — fallback-рейт (доля
-  публикаций от страниц этапа), темпы публикаций/потребления, исходы
-  consumed, глубина q:render-fallback.
-- **Load-блок:** после деплоя в топе CPU/RAM появляются движки
-  moli/lightpanda (бюджет ≤1 ГБ каждый) и воркер B (+256M; второй
-  headless-shell — в docker-runtime контейнер render-fallback со своим
-  браузером, нативно общий crawler-chromium) — включать в оценку нормы.
+  Publications/suspensions are exposed by worker A (:9105), consumption —
+  only by the B build.
+- **Worker B metrics port — 9120** (outside the render-worker@ instance
+  range). If 9110 shows up in old notes — OUTDATED after the S-P2-3 fix;
+  the correct port is 9120.
+- **The "Render engines" dashboard panel** (site): rate/success/
+  tarpit rate/RSS per engine; the fallback row — the fallback rate (the
+  share of publications from stage pages), the publication/consumption
+  rates, the consumed outcomes, the q:render-fallback depth.
+- **Load block:** after the deploy the moli/lightpanda engines
+  (budget ≤1 GB each) and worker B (+256M; a second
+  headless-shell — in docker-runtime the render-fallback container with
+  its own browser, natively the shared crawler-chromium) appear in the top
+  CPU/RAM — include them in the normal-state assessment.
 
-## Шаблон отчёта
+## Report template
 
-Точные заголовки секций (сравнение с прошлым отчётом — плюс, если есть):
+Exact section headings (a comparison with the previous report — a plus,
+if available):
 
 ```markdown
-# Отчёт: прод larasites (155.212.174.88), ДД.ММ.ГГГГ ЧЧ:ММ МСК
+# Report: prod larasites (155.212.174.88), DD.MM.YYYY HH:MM MSK
 
-## 1. Нагрузка на сервер — вердикт одним предложением
-| Метрика | Значение | Оценка |
+## 1. Server load — a one-sentence verdict
+| Metric | Value | Assessment |
 |---|---|---|
-(load / vCPU, RAM + swap, диск, ключевые потребители CPU; после деплоя
-этапа 35/36 движки moli/lightpanda и воркер B в топе — норма, см. флаг Load)
+(load / vCPU, RAM + swap, disk, the key CPU consumers; after the
+stage 35/36 deploy the moli/lightpanda engines and worker B in the top are
+normal, see the Load flag)
 
-## 2. Очереди
-| Очередь | Остаток (lag) | Pending | Потребление | Приток | Оценка |
+## 2. Queues
+| Queue | Backlog (lag) | Pending | Consumption | Inflow | Assessment |
 |---|---|---|---|---|---|
-(q:dns/q:http/q:render/q:render-fallback/q:analyze/q:dead; тренд lag —
-растёт/спадает; для q:render — обязательно с учётом render_pending,
-см. формулы; q:render-fallback — после деплоя 35/36, правила — раздел
-«Движки рендера и фолбэк»)
+(q:dns/q:http/q:render/q:render-fallback/q:analyze/q:dead; the lag trend —
+growing/declining; for q:render — always taking render_pending into
+account, see the formulas; q:render-fallback — after the 35/36 deploy,
+the rules are in the "Render engines and fallback" section)
 
-## 3. Прогресс конвейера
-проверено X из Y млн (Z%), скорость доменов за сутки (счётчик checks:),
-крупнейшие непройденные зоны
+## 3. Pipeline progress
+X of Y million checked (Z%), the domain rate over 24 hours (the checks:
+counter), the largest zones not yet crawled
 
-## 4. Аномалии и корневые причины
-нумерованный список; каждая аномалия — с доказательством из снимка
-(значение метрики, строка лога, счётчик)
+## 4. Anomalies and root causes
+a numbered list; each anomaly — with evidence from the snapshot
+(a metric value, a log line, a counter)
 
-## 5. Рекомендации
-нумерованный список; что можно сделать и что это даст;
-действия на проде — только после подтверждения пользователем
+## 5. Recommendations
+a numbered list; what can be done and what it will give;
+production actions — only after user confirmation
 ```
 
-Если пользователь спросил узко («только очереди» / «только диск») —
-запусти сборщик целиком (дёшево), но в отчёт вынеси запрошенный блок
-первым, остальное — кратко в одну-две строки.
+If the user asked narrowly ("queues only" / "disk only") —
+run the collector in full (it is cheap), but put the requested block
+first in the report; the rest — briefly, in one or two lines.
 
-## Ссылки
+## References
 
-- `references/prod-topology.md` — сервер, конвейер, порты метрик, точечные
-  команды углубления, известные инциденты и их признаки.
-- В репо: `docs/runbooks.md`, `docs/operations.md`, `docs/redis.md`,
-  `docs/content.md` (retention/компактификация), `docs/db.md`,
-  `docs/load-measurements.md` (базовые замеры производительности).
+- `references/prod-topology.md` — the server, the pipeline, the metrics
+  ports, targeted deep-dive commands, known incidents and their signs.
+- In the repo: `docs/runbooks.md`, `docs/operations.md`, `docs/redis.md`,
+  `docs/content.md` (retention/compaction), `docs/db.md`,
+  `docs/load-measurements.md` (baseline performance measurements).

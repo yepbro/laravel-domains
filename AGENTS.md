@@ -1,96 +1,101 @@
 # AGENTS.md
 
-Инструкция для агента, работающего в цикле над задачами проекта.
+Instructions for an agent working in a loop on project tasks.
 
-## Проект
+## Project
 
-Go-монорепозиторий: сервис массовой проверки доменов и поиска сайтов на Laravel.
-Dev-окружение — Docker (Go на хосте не нужен). Структура и описание — в `README.md`.
-ТЗ: `tasks/TZ_*.md`. Декомпозиция на задачи: `tasks/tasks.md`.
+Go monorepo: a service for bulk domain checking and discovery of Laravel sites.
+The dev environment is Docker (Go is not needed on the host). Structure and description: `README.md`.
+Specs: `tasks/TZ_*.md`. Task breakdown: `tasks/tasks.md`.
 
-## Оформление новых задач
+## New task format
 
-- Подробности новой задачи (контекст и симптомы инцидента, корневая
-  причина, требования, критерии приёмки, ссылки на ТЗ/отчёты/коммиты) —
-  отдельный файл `tasks/task/<T-NNN>-<slug>.md`.
-- В плане `tasks/tasks.md` — только строка-заголовок со статусом и
-  ссылкой на файл задачи:
-  `- **T-NNN** [статус] — <заголовок> ([подробности](task/<T-NNN>-<slug>.md))`.
-  Подробности в плане не дублируются; правки деталей живут в файле задачи.
-- Субагенту задачи передавать ссылку на файл задачи — он читает его сам.
+- Details of a new task (incident context and symptoms, root
+  cause, requirements, acceptance criteria, links to specs/reports/commits) go
+  into a separate file `tasks/task/<T-NNN>-<slug>.md`.
+- The `tasks/tasks.md` plan holds only a title line with the status and
+  a link to the task file:
+  `- **T-NNN** [status] — <title> ([details](task/<T-NNN>-<slug>.md))`.
+  Details are not duplicated in the plan; detail edits live in the task file.
+- Pass the task file link to the task subagent — it reads the file itself.
 
-## Цикл работы
+## Work cycle
 
-1. Выбрать задачу: первую `[в работе]`; если такой нет — верхнюю `[новая]` (сверху вниз).
-   Нет подходящих задач — цикл завершён.
-2. Поставить ей статус `[в работе]` в `tasks/tasks.md`.
-3. Реализовать задачу по её описанию и ссылкам на ТЗ.
-4. Прогнать проверки (см. «Команды»). Всё зелёное — обязательно.
-5. При необходимости создать/обновить документацию: `docs/`, `README.md`; при необходимости — `AGENTS.md`.
-6. Поставить статус `[сделана]` и сделать итоговый коммит. Перейти к п. 1.
+1. Pick a task: the first `[in progress]` one; if there is none — the topmost `[new]` one (top to bottom).
+   No suitable tasks — the cycle is finished.
+2. Set its status to `[in progress]` in `tasks/tasks.md`.
+3. Implement the task according to its description and the spec links.
+4. Run the checks (see "Commands"). All green — mandatory.
+5. If needed, create/update documentation: `docs/`, `README.md`; if needed — `AGENTS.md`.
+6. Set the status to `[done]` and make the final commit. Go to step 1.
 
-## Правила работы в цикле
+## Cycle operating rules
 
-Основная сессия управляет циклом; каждую задачу выполняет отдельный субагент.
-Раздел «Цикл работы» выше — внутренний цикл субагента.
+The main session drives the cycle; each task is executed by a separate subagent.
+The "Work cycle" section above is the subagent's inner loop.
 
-### Порядок выполнения задачи
+### Task execution order
 
-Основная сессия держит скользящее окно до 4 задач одновременно (см.
-«Параллельное выполнение»): пока есть свободные слоты и подходящие
-независимые задачи, запускает новые, не дожидаясь завершения уже идущих.
+The main session keeps a sliding window of up to 4 tasks at a time (see
+"Parallel execution"): while there are free slots and suitable
+independent tasks, it launches new ones without waiting for the running
+ones to finish.
 
-1. Основная сессия выбирает следующую независимую задачу (первую
-   `[в работе]`; если нет — верхнюю `[новая]`, пропуская зависимые
-   от идущих), ставит ей `[в работе]` статусным коммитом в основной
-   ветке, создаёт для задачи feature-ветку `t-NNN` и worktree (см.
-   «Ветки и worktree») и запускает субагента **в фоне** с моделью
-   `zai-coding-plan/glm-5.3` (любая разработка — только через неё)
-   с полным контекстом: текст задачи, ссылки на ТЗ, актуальное
-   состояние репозитория, требования по проверкам.
-2. Субагент выполняет внутренний цикл (реализация → тесты → документация)
-   в worktree ветки `t-NNN` и делает **один коммит на задачу** (формат
-   `<тип>: <описание> (T-0NN)`). `tasks/tasks.md` субагент **не трогает**:
-   статусы меняет только основная сессия (п. 5) — это убирает конфликты
-   rebase параллельных волн и делает статус честным («сделана» = «в
-   master»). Правки по ревью вносятся через `git commit --amend` —
-   коммит остаётся один. Субагент не пушит и не мержит.
-3. После зелёных тестов субагент проводит код-ревью по схеме из раздела
-   «Схема ревью» ниже, с доработкой в своей сессии: согласен с замечанием —
-   фикс + amend + повторный прогон тестов; не согласен — аргументированное
-   обоснование. Ревью — один раунд (упавший ревьюер закрывается fallback'ом
-   из цепочки, это всё ещё один раунд). Если все ревьюеры цепочки
-   недоступны (лимиты, ошибки) — ревью не проводится, факт фиксируется
-   в отчёте и коммите.
-4. По уведомлению о завершении субагента основная сессия верифицирует
-   результат: коммит на месте и ровно один, `git status` чистый, статус
-   в `tasks/tasks.md` обновлён; при сомнениях — контрольный `make test` /
-   `make lint`. Верификация и мерж идут параллельно с остальными
-   задачами окна; освободившийся слот сразу занимает следующая задача.
-5. После верификации основная сессия вливает ветку задачи в `master`
-   линейно — rebase + `--ff-only` (см. «Линейная история master»),
-   последовательно; после каждого вливания — `make test` +
-   `make test-integration` в основном дереве, затем удаляет
-   worktree и ветку задачи. Пуш — только по явному указанию
-   (см. «Правила»).
-   После зелёного влития — статусный коммит `chore: T-0NN [сделана] —
-   <краткое резюме из отчёта>` в `tasks/tasks.md` (статус ставит только
-   основная сессия — см. п. 2).
-6. Субагент возвращает полный отчёт: что сделано и какие решения приняты,
-   результаты проверок, итоги ревью (замечания / исправления / отклонения),
-   хеш коммита. Основная сессия проверяет отчёт и подводит итог.
+1. The main session picks the next independent task (the first
+   `[in progress]` one; if none — the topmost `[new]` one, skipping those
+   dependent on the running tasks), sets it to `[in progress]` with a status
+   commit in the main branch, creates a feature branch `t-NNN` and a
+   worktree for the task (see "Branches and worktrees") and launches a
+   subagent **in the background** with the model
+   `zai-coding-plan/glm-5.3` (all development goes through it only)
+   with full context: the task text, links to the specs, the current
+   repository state, and the check requirements.
+2. The subagent runs the inner loop (implementation → tests → documentation)
+   in the worktree of the `t-NNN` branch and makes **one commit per task**
+   (format `<type>: <description> (T-0NN)`). The subagent **does not touch**
+   `tasks/tasks.md`: only the main session changes statuses (step 5) —
+   this removes rebase conflicts between parallel waves and keeps the
+   status honest ("done" = "in master"). Review fixes are applied via
+   `git commit --amend` — the commit stays single. The subagent does not
+   push and does not merge.
+3. After green tests the subagent runs a code review per the scheme from
+   the "Review scheme" section below, with follow-up work in its own
+   session: agrees with a finding — fix + amend + a re-run of the tests;
+   disagrees — a reasoned justification. The review is one round (a failed
+   reviewer is covered by a fallback from the chain — still one round).
+   If all reviewers in the chain are unavailable (limits, errors) — no
+   review is performed; the fact is recorded in the report and the commit.
+4. On the subagent completion notification the main session verifies the
+   result: the commit is in place and there is exactly one, `git status`
+   is clean, the status in `tasks/tasks.md` is updated; if in doubt — a
+   control `make test` / `make lint`. Verification and merging run in
+   parallel with the other window tasks; the freed slot is immediately
+   taken by the next task.
+5. After verification the main session merges the task branch into `master`
+   linearly — rebase + `--ff-only` (see "Linear master history"),
+   sequentially; after each merge — `make test` +
+   `make test-integration` in the main tree, then it removes the
+   task worktree and branch. Pushing — only on an explicit instruction
+   (see "Rules").
+   After a green merge — the status commit `chore: T-0NN [done] — <short
+   summary from the report>` in `tasks/tasks.md` (only the main session
+   sets the status — see step 2).
+6. The subagent returns a full report: what was done and which decisions
+   were made, the check results, the review outcomes (findings / fixes /
+   rejections), the commit hash. The main session validates the report
+   and wraps up.
 
-### Схема ревью
+### Review scheme
 
-Цепочка ревьюеров — строго по списку; fallback запускается **только**
-если предыдущий не дал ревью (ненулевой exit, ошибка авторизации/
-провайдера/квоты в файле вывода или отсутствие текста находок); цепочка
-останавливается на первом, кто выдал находки. Ревью выполняется **один
-раз на задачу** — повторных раундов нет; упавший основной, закрытый
-fallback'ом, — всё ещё один раунд.
+The reviewer chain — strictly by the list; a fallback is launched **only**
+if the previous one produced no review (a non-zero exit, an auth/
+provider/quota error in the output file, or no findings text); the chain
+stops at the first one that produced findings. The review runs **once
+per task** — no repeat rounds; a failed primary covered
+by a fallback is still one round.
 
-1. Основной ревьюер — `opencode run` с `opencode-go/deepseek-v4.1-flash`,
-   из рабочего дерева под ревью:
+1. Primary reviewer — `opencode run` with `opencode-go/deepseek-v4.1-flash`,
+   from the worktree under review:
 
    ```bash
    timeout 1200 opencode run --auto \
@@ -99,18 +104,18 @@ fallback'ом, — всё ещё один раунд.
      > /tmp/opencode/review/<slug>-deepseek.md 2>&1; echo "exit=$?"
    ```
 
-   `--auto` — авто-аппрув всех разрешений, не запрещённых явно: без
-   него неинтерактивный run не может ответить на запрос `ask` и
-   зависает либо отклоняется. Доступ к путям вне рабочей директории
-   разрешён по умолчанию; read-only ревьюера обеспечивает промпт
-   (правила ниже), а не разрешения.
+   `--auto` — auto-approval of all permissions not explicitly denied:
+   without it a non-interactive run cannot answer an `ask` request and
+   hangs or gets rejected. Access to paths outside the working directory
+   is allowed by default; the reviewer's read-only mode is ensured by the
+   prompt (rules below), not by permissions.
 
-   Ревьюер — отдельный CLI-процесс из shell сессии-исполнителя
-   (инструмента спавна вложенных субагентов нет — не искать). Промпт
-   передаёт правила read-only и путь отчёта; финальное сообщение
-   остаётся в stdout-файле как резервная копия.
-2. Первый fallback — `cursor-agent` (Cursor CLI, модель `grok-4.7-high`;
-   авторизация/диагностика — `~/.config/opencode/agent-cursor.md`):
+   The reviewer is a separate CLI process from the executing session's
+   shell (there is no nested-subagent spawn tool — do not look for one).
+   The prompt carries the read-only rules and the report path; the final
+   message remains in the stdout file as a backup.
+2. First fallback — `cursor-agent` (Cursor CLI, model `grok-4.7-high`;
+   auth/diagnostics — `~/.config/opencode/agent-cursor.md`):
 
    ```bash
    timeout 1200 cursor-agent -p --output-format text --mode ask \
@@ -119,18 +124,18 @@ fallback'ом, — всё ещё один раунд.
      > /tmp/opencode/review/<slug>-cursor.md 2>&1; echo "exit=$?"
    ```
 
-   Параметры: `-p` — headless-режим с печатью ответа в stdout (без
-   него поднимается TUI); `--mode ask` — read-only на уровне CLI
-   (правки и шелл заблокированы самим режимом — сильнее промпта);
-   `--trust` — снять интерактивный вопрос доверия каталогу, без него
-   headless-запуск зависает; `--model` — модель на один запуск;
-   `</dev/null` держит headless. `-f`/`--yolo` не использовать —
-   они принудительно разрешают команды и противоречат read-only.
-   Как и у kimi, text-вывод может содержать рабочий транскрипт —
-   искать тело отчёта (метки P0–P3), прежде чем считать запуск
-   проваленным.
-3. Второй fallback — `opencode run` с `zai-coding-plan/glm-5.3#max`
-   (та же форма команды, что у основного, другая модель):
+   Parameters: `-p` — headless mode with the response printed to stdout
+   (without it a TUI comes up); `--mode ask` — read-only at the CLI level
+   (edits and shell are blocked by the mode itself — stronger than the
+   prompt); `--trust` — removes the interactive directory-trust question,
+   without it a headless run hangs; `--model` — the model for a single
+   run; `</dev/null` keeps it headless. Do not use `-f`/`--yolo` —
+   they force-allow commands and contradict read-only.
+   As with kimi, the text output may contain a working transcript —
+   look for the report body (P0–P3 labels) before declaring the run
+   failed.
+3. Second fallback — `opencode run` with `zai-coding-plan/glm-5.3#max`
+   (the same command shape as the primary, a different model):
 
    ```bash
    timeout 1200 opencode run --auto \
@@ -138,8 +143,8 @@ fallback'ом, — всё ещё один раунд.
      --title "review-<slug>" "$(cat /tmp/opencode/review/prompt-<slug>.md)" \
      > /tmp/opencode/review/<slug>-glm.md 2>&1; echo "exit=$?"
    ```
-4. Третий fallback — `kimi` (Kimi Code CLI, модель `kimi-code/k3.1-pro`;
-   авторизация/диагностика — `~/.config/opencode/agent-kimi.md`):
+4. Third fallback — `kimi` (Kimi Code CLI, model `kimi-code/k3.1-pro`;
+   auth/diagnostics — `~/.config/opencode/agent-kimi.md`):
 
    ```bash
    timeout 1200 kimi -m kimi-code/k3.1-pro \
@@ -147,215 +152,239 @@ fallback'ом, — всё ещё один раунд.
      > /tmp/opencode/review/<slug>-kimi.md 2>&1; echo "exit=$?"
    ```
 
-   Никогда не сочетать `-p` с `-y`/`--auto`; `</dev/null` держит
-   headless. Text-вывод может содержать рабочий транскрипт перед
-   телом отчёта — искать тело (находки с метками P0–P3), прежде чем
-   считать запуск проваленным.
+   Never combine `-p` with `-y`/`--auto`; `</dev/null` keeps it
+   headless. The text output may contain a working transcript before
+   the report body — look for the body (findings with P0–P3 labels)
+   before declaring the run failed.
 
-Правила ревьюера (единые для всей цепочки; явно дублируются в промпте —
-read-only и формат P0–P3 обязаны быть в тексте промпта):
+Reviewer rules (the same for the whole chain; explicitly duplicated in the
+prompt — read-only and the P0–P3 format must be present in the prompt
+text):
 
-- Строго read-only: не меняет файлы репозитория, не делает коммиты
-  и ветки. Единственная запись — отчёт `/tmp/opencode/review/NN-<slug>.md`.
-- Отчёт: находки P0–P3 (P0 — безопасность/потеря данных/краш; P1 —
-  значимый баг; P2 — качество кода; P3 — идеи), файл:строка, суть,
-  предлагаемое исправление, уверенность (high/medium/low). Каждая
-  находка проверяется по контексту: callers/консументы через grep по
-  репозиторию до включения в отчёт; неподтверждённое — не находка.
+- Strictly read-only: does not modify repository files, makes no commits
+  or branches. The only write is the report `/tmp/opencode/review/NN-<slug>.md`.
+- Report: P0–P3 findings (P0 — security/data loss/crash; P1 —
+  a significant bug; P2 — code quality; P3 — ideas), file:line, essence,
+  a proposed fix, confidence (high/medium/low). Every finding is verified
+  against context: callers/consumers via grep across the
+  repository before inclusion in the report; unverified — not a finding.
 
-Выигравший ревьюер выполняется **синхронно в сессии субагента**:
-субагент ждёт завершения CLI-вызова, обрабатывает находки и только
-потом возвращает финальный отчёт (не в фоне и не «после отчёта» —
-сессия закроется раньше, находки останутся необработанными).
+The winning reviewer runs **synchronously in the subagent's session**:
+the subagent waits for the CLI call to finish, processes the findings and
+only then returns the final report (not in the background and not "after
+the report" — the session would close earlier and the findings would stay
+unprocessed).
 
-Недоступны все в цепочке (ненулевой exit, ошибки провайдера/лимиты в
-файлах вывода) — ревью не проводится (см. «Порядок выполнения задачи»,
-п. 3).
+If everyone in the chain is unavailable (a non-zero exit, provider errors/
+limits in the output files) — no review is performed (see "Task execution
+order", step 3).
 
-### Массовое код-ревью и фиксы
+### Bulk code review and fixes
 
-Сплошной аудит кодовой базы — отдельный режим поверх цикла задач
-(например, перед релизом). Порядок:
+A full codebase audit is a separate mode on top of the task cycle
+(for example, before a release). Procedure:
 
-1. **Baseline.** `make test` + `make lint` в основном дереве — зелёная
-   точка отсчёта, чтобы отличать «сломали» от «было сломано».
-2. **Этапы.** Код делится на группы пакетов, не пересекающиеся по
-   файлам, ~5–10k строк на этап (текущая разбивка — 12 этапов: ingest,
+1. **Baseline.** `make test` + `make lint` in the main tree — a green
+   reference point to tell "we broke it" from "it was already broken".
+2. **Stages.** The code is split into package groups that do not overlap
+   by files, ~5–10k lines per stage (the current split — 12 stages: ingest,
    httpfetch, httpworker, dns, render, analyzer+rules, content,
-   scheduler+queue, core-infra, CLI/testbed, e2e-тесты, deploy/infra;
-   обновлять при росте кода).
-3. **Ревью.** Этапы ревьюятся субагентами по «Схеме ревью» в скользящем
-   окне (см. «Параллельное выполнение»); ревью read-only по основному
-   дереву.
-4. **Консолидация.** Дедуп находок между этапами, приоритизация P0→P3,
-   группы фиксов по доменам.
-5. **Фиксы.** Субагенты с моделью `zai-coding-plan/glm-5.3#max`
-   (glm-модели — только через провайдер `zai-coding-plan`);
-   группа фиксов
-   (домен) = один worktree `~/worktrees/laravel-domains/fix-<slug>`
-   (правила — «Ветки и worktree»). **Каждое изменение — отдельный
-   коммит** `fix: <описание> (<ID находки>)`. Перед каждым коммитом —
-   `COMPOSE_PROJECT_NAME=crawler make test` + `make lint` в worktree.
-   Невалидная находка не исправляется, а разбирается в отчёте с
-   аргументацией; P3 уровня новой функциональности не форсировать —
-   вынести задачей в `tasks/tasks.md`.
-6. **Вливание.** После зелёных тестов основная сессия вливает
-   `fix-<slug>` в `master` линейно — rebase + `--ff-only`
-   (см. «Линейная история master»), последовательно; удаляет worktree
-   и ветку. Финал — `make test` + `make lint` + `make test-integration`
-   в основном дереве и сводный отчёт по находкам и исправлениям.
+   scheduler+queue, core-infra, CLI/testbed, e2e tests, deploy/infra;
+   update as the code grows).
+3. **Review.** Stages are reviewed by subagents per the "Review scheme" in
+   a sliding window (see "Parallel execution"); the review is read-only
+   against the main tree.
+4. **Consolidation.** Deduplicate findings across stages, prioritize
+   P0→P3, group the fixes by domains.
+5. **Fixes.** Subagents with the model `zai-coding-plan/glm-5.3#max`
+   (glm models — only via the `zai-coding-plan` provider);
+   a fix group
+   (domain) = one worktree `~/worktrees/laravel-domains/fix-<slug>`
+   (rules — "Branches and worktrees"). **Each change is a separate
+   commit** `fix: <description> (<finding ID>)`. Before each commit —
+   `COMPOSE_PROJECT_NAME=crawler make test` + `make lint` in the worktree.
+   An invalid finding is not fixed but is analyzed in the report with
+   argumentation; P3 items at the level of new functionality are not
+   forced in — take them out as a task in `tasks/tasks.md`.
+6. **Merge.** After green tests the main session merges
+   `fix-<slug>` into `master` linearly — rebase + `--ff-only`
+   (see "Linear master history"), sequentially; it removes the worktree
+   and the branch. The finale — `make test` + `make lint` +
+   `make test-integration` in the main tree and a consolidated report on
+   the findings and fixes.
 
-### Ветки и worktree
+### Branches and worktrees
 
-- Работа по задачам цикла в основной ветке (`master`) **не ведётся**. Любая
-  задача — последовательная или параллельная с другими — выполняется
-  субагентом в feature-ветке `t-NNN` в отдельном worktree
-  `~/worktrees/laravel-domains/<t-NNN>` (рецепт — в глобальном AGENTS.md:
-  создание worktree и ветки, бутстрап `.env`/рабочих каталогов, удаление
-  после мержа).
-- В основной ветке основная сессия делает только служебные коммиты:
-  статусные `chore: … в работе` при запуске задач (по одной или пачкой —
-  как удобнее), точечные фиксы упавших после вливания проверок
-  (с пометкой задачи в сообщении), правки AGENTS.md
-  по прямым поручениям. Merge-коммиты не создаются (линейная история —
-  см. «Линейная история master»).
-- Фиксы по итогам массового ревью — ветка `fix-<slug>` и worktree
-  `~/worktrees/laravel-domains/fix-<slug>` (см. «Массовое код-ревью
-  и фиксы»); правила работы в нём те же.
-- В worktree разрешены только `make test` / `make lint` / `make fmt` /
-  `make mutate` с `COMPOSE_PROJECT_NAME=crawler`; `make up/down/clean/test-integration`
-  и другие цели, меняющие основной docker-стек, запрещены.
+- Work on cycle tasks is **not done** in the main branch (`master`). Any
+  task — sequential or parallel with others — is executed
+  by a subagent in a feature branch `t-NNN` in a separate worktree
+  `~/worktrees/laravel-domains/<t-NNN>` (the recipe is in the global
+  AGENTS.md: creating the worktree and branch, bootstrapping `.env`/working
+  directories, removal
+  after the merge).
+- In the main branch the main session makes only service commits:
+  status commits `chore: … in progress` when launching tasks (one at a
+  time or in a batch — whichever is more convenient), targeted fixes of
+  checks that failed after a merge
+  (with the task noted in the message), AGENTS.md edits
+  on direct instructions. No merge commits are created (linear history —
+  see "Linear master history").
+- Fixes following a bulk review — the `fix-<slug>` branch and the worktree
+  `~/worktrees/laravel-domains/fix-<slug>` (see "Bulk code review
+  and fixes"); the operating rules in it are the same.
+- Only `make test` / `make lint` / `make fmt` /
+  `make mutate` with `COMPOSE_PROJECT_NAME=crawler` are allowed in a
+  worktree; `make up/down/clean/test-integration`
+  and other targets that change the main docker stack are forbidden.
 
-### Линейная история master
+### Linear master history
 
-На `master` действует branch protection GitHub «Require linear
-history»: merge-коммиты запрещены (bypass-обход владельца не
-используем). Вливание ветки задачи/фикса — только линейно:
+On `master` the GitHub branch protection "Require linear
+history" is in effect: merge commits are forbidden (the owner
+bypass is not used). Merging a task/fix branch — only linearly:
 
-    git -C <worktree> rebase master   # перестроить ветку на текущий master
-    git merge --ff-only <branch>      # в основном дереве; fast-forward
+    git -C <worktree> rebase master   # rebuild the branch on the current master
+    git merge --ff-only <branch>      # in the main tree; fast-forward
 
-- Rebase выполняется в worktree (ветка там на чекауте); конфликты
-  разрешает основная сессия в этом же worktree.
-- Вливания — последовательно; после каждого — `make test`
-  (+ `make test-integration` для задач, затрагивающих миграции, БД,
-  очереди, testbed), затем удаление worktree и ветки. Пуш
-  (`git push origin master`) — только по явному указанию (см. «Правила»).
+- The rebase is performed in the worktree (the branch is checked out
+  there); conflicts are resolved by the main session in the same worktree.
+- Merges are sequential; after each — `make test`
+  (+ `make test-integration` for tasks touching migrations, the DB,
+  queues, the testbed), then removal of the worktree and the branch.
+  Pushing (`git push origin master`) — only on an explicit instruction
+  (see "Rules").
 
-### Деплой: ветка production
+### Deploy: the production branch
 
-Прод деплоится только с ветки `production` (push в production → ci →
-deploy → healthcheck с авто-откатом; детали — docs/ci-cd.md).
+Production is deployed only from the `production` branch (a push to
+production → ci →
+deploy → healthcheck with auto-rollback; details — docs/ci-cd.md).
 
-- Коммиты — **только в `master`** (feature-ветки вливаются в него
-  линейно, см. «Линейная история master»). В `production` коммиты не
-  делаются никогда: это движущийся ff-указатель на коммит из истории
-  `master`. Собственные коммиты в `production` и force-push в него
-  запрещены (не-ff пуш GitHub отвергает сам).
-- Релиз — `git push origin master:production` (или `<sha>:production`);
-  перед пушем проверить, что ff возможен:
+- Commits — **only to `master`** (feature branches are merged into it
+  linearly, see "Linear master history"). Commits are never made to
+  `production`: it is a moving ff pointer to a commit from the
+  `master` history. Its own commits to `production` and force-pushes to it
+  are forbidden (GitHub itself rejects a non-ff push).
+- A release is `git push origin master:production` (or `<sha>:production`);
+  before pushing, check that ff is possible:
   `git fetch && git merge-base --is-ancestor origin/production master`.
-  Пуш в `production` = деплой на боевой сервер.
-- Хотфикс и откат релиза — коммит/revert в `master`, затем ff
-  `production` (история вперёд, контент назад). Cherry-picк напрямую
-  в `production` ломает ff-связь с `master` — не допускается.
-- Триггер `workflow_run` в `deploy.yml` GitHub читает только с ветки
-  по умолчанию (`master`) — правки workflows деплоя проходят через
-  `master`, изменения только в `production` на триггеры не влияют.
-- Временная остановка юнита на сервере — `systemctl stop` (без disable):
-  юнит остаётся enabled и сам возвращается на следующем деплое
-  (`systemctl start crawler.target` в install поднимает его до
-  healthcheck). Планово отключённый юнит (`disable --now` + `mask`)
-  healthcheck и проверка юнитов в install/rollback-скриптах не
-  проверяют; обратное включение — `systemctl unmask` + `enable --now`
-  (+ рестарт `crawler.target`).
+  A push to `production` = a deploy to the production server.
+- A hotfix and a release rollback — a commit/revert in `master`, then ff
+  `production` (history forward, content backward). Cherry-picking
+  directly to `production` breaks the ff link with `master` — not allowed.
+- The `workflow_run` trigger in `deploy.yml` reads only from the branch
+  by default (`master`) — deploy workflow edits go through
+  `master`; changes only in `production` do not affect the triggers.
+- A temporary stop of a unit on the server — `systemctl stop` (without
+  disable):
+  the unit stays enabled and comes back on its own on the next deploy
+  (`systemctl start crawler.target` in install brings it up before the
+  healthcheck). A deliberately disabled unit (`disable --now` + `mask`)
+  is not checked by the healthcheck or by the unit checks in the
+  install/rollback scripts; re-enabling — `systemctl unmask` + `enable --now`
+  (+ a restart of `crawler.target`).
 
-### Параллельное выполнение
+### Parallel execution
 
-- По умолчанию — скользящее окно: до 4 независимых задач одновременно
-  (внутри этапа — сверху вниз по мере запуска); чисто последовательный
-  запуск — только когда все оставшиеся задачи зависимые.
-- Параллельно можно запускать только независимые задачи (разные пакеты/файлы,
-  без общих миграций и схемы БД); зависимые — строго последовательно
-  (следующая стартует после мержа предыдущей).
-- При параллельном запуске у каждой задачи своя ветка и свой worktree
-  (см. «Ветки и worktree»); вливание веток — последовательно из
-  основного дерева, линейно (см. «Линейная история master»), после
-  каждого — `make test` + `make test-integration` в основном дереве.
-- **Скользящее окно субагентов:** одновременно работает не более 4
-  субагентов любого типа (задачи цикла, ревью, фиксы). Всех запускают
-  в фоне; уведомление о завершении одного — сигнал немедленно запустить
-  следующего из очереди, не дожидаясь окончания остальных. Очередь можно
-  миксовать (задачи + ревью + фиксы), если файлы задач не пересекаются.
-  Ревью — read-only по основному дереву; задачи и фиксы — в worktree;
-  мержи и служебные коммиты выполняет основная сессия.
-- **Принудительный останов субагента:** `opencode session delete
-  <sessionID>` (сессия помечается cancelled). Перед этим отобрать
-  рабочий каталог: worktree удалить (`git worktree remove --force`;
-  каталоги, созданные контейнером от root, — через sudo; при пересоздании
-  агентом — удалить ветку и каталог, зарегистрировав worktree заново).
-  Применять при смене модели/задачи, зомби-агентах, уходе не туда.
+- By default — a sliding window: up to 4 independent tasks at a time
+  (within a stage — top to bottom as they are launched); purely
+  sequential execution — only when all remaining tasks are dependent.
+- Only independent tasks may run in parallel (different packages/files,
+  no shared migrations or DB schema); dependent ones — strictly
+  sequentially (the next one starts after the previous one is merged).
+- When running in parallel, each task has its own branch and its own
+  worktree
+  (see "Branches and worktrees"); branches are merged — sequentially from
+  the main tree, linearly (see "Linear master history"), after
+  each — `make test` + `make test-integration` in the main tree.
+- **Subagent sliding window:** no more than 4
+  subagents of any type work at a time (cycle tasks, reviews, fixes). All
+  are launched in the background; the completion notification of one is
+  the signal to immediately launch the next one from the queue, without
+  waiting for the rest to finish. The queue may be mixed
+  (tasks + reviews + fixes) as long as task files do not overlap.
+  Reviews — read-only against the main tree; tasks and fixes — in a
+  worktree; merges and service commits are done by the main session.
+- **Forced subagent stop:** `opencode session delete
+  <sessionID>` (the session is marked cancelled). Before that, take away
+  the working directory: remove the worktree (`git worktree remove --force`;
+  directories created by the container as root — via sudo; when recreated
+  by the agent — remove the branch and the directory, registering the
+  worktree anew).
+  Use when switching the model/task, for zombie agents, or when an agent
+  goes off track.
 
-### Разовые задачи вне плана
+### One-off tasks outside the plan
 
-Поручения вне `tasks/tasks.md` (CI, инфраструктура, документация) выполняются
-субагентом по тем же правилам; статус в tasks.md не меняется, коммит без
-T-номера. Ревью — по необходимости, по схеме из «Схема ревью».
+Assignments outside `tasks/tasks.md` (CI, infrastructure, documentation) are
+executed by a subagent under the same rules; the status in tasks.md is not
+changed, the commit has no T-number. Review — as needed, per the scheme
+from "Review scheme".
 
-## Тесты
+## Tests
 
-- Тесты обязательны: новая/изменённая логика покрывается юнит-тестами.
-- Перед коммитом: `make test` и `make lint` — без ошибок.
-- `make test-race` — обязателен для задач, затрагивающих пакеты с горутинными
-  циклами/воркерами (набор `RACE_PKGS` в Makefile: monitor, scheduler,
+- Tests are mandatory: new/changed logic is covered by unit tests.
+- Before a commit: `make test` and `make lint` — no errors.
+- `make test-race` — mandatory for tasks touching packages with goroutine
+  loops/workers (the `RACE_PKGS` set in the Makefile: monitor, scheduler,
   renderworker, httpworker, dnsworker, queue, render, content): `make test`
-  идёт без `-race`, гонки в тестах с фоновыми циклами он не видит (в CI —
-  отдельный шаг).
-- `make test-integration` — если затронуты миграции, БД, очереди, сервисы или testbed.
-- Упавший тест — чинить; если вне рамок задачи, зафиксировать причину в коммите и `tasks/tasks.md`.
+  runs without `-race` and does not see races in tests with background
+  loops (a separate step in CI).
+- `make test-integration` — if migrations, the DB, queues, services, or
+  the testbed are affected.
+- A failing test — fix it; if it is outside the task scope, record the
+  cause in the commit and `tasks/tasks.md`.
 
-## Документация
+## Documentation
 
-- Обновляется после успешных прогонов тестов, а не до.
-- Что обновлять при изменении поведения, конфига, структуры проекта, миграций, Makefile: `README.md`, соответствующий файл в `docs/`.
-- Устаревшая документация — баг: править в рамках той же задачи.
+- Updated after successful test runs, not before.
+- What to update when behavior, config, project structure, migrations, or
+  the Makefile change: `README.md`, the corresponding file in `docs/`.
+- Outdated documentation is a bug: fix it within the same task.
 
-## Коммиты
+## Commits
 
-- Одна задача — один коммит (код, тесты, docs); `tasks/tasks.md` субагент не трогает. Статус `[сделана]` — отдельный служебный коммит основной сессии после зелёного влития (`chore: T-0NN [сделана] — <резюме>`); `[в работе]` — статусный коммит волны при запуске.
-- Формат сообщения: `<тип>: <описание> (T-0NN)`. Типы: `feat`, `fix`, `docs`, `test`, `refactor`, `chore`.
-- Не смешивать изменения, не относящиеся к задаче. Мусор (`var/`, `tmp/`, локальные конфиги) не коммитить.
+- One task — one commit (code, tests, docs); the subagent does not touch `tasks/tasks.md`. The `[done]` status is a separate service commit by the main session after a green merge (`chore: T-0NN [done] — <summary>`); `[in progress]` is the status commit of the wave at launch.
+- Message format: `<type>: <description> (T-0NN)`. Types: `feat`, `fix`, `docs`, `test`, `refactor`, `chore`.
+- Do not mix in changes unrelated to the task. Do not commit junk (`var/`, `tmp/`, local configs).
 
-## Правила
+## Rules
 
-- **Не пушить без явного указания:** `git push` (в т.ч. `git push
-  origin master` после вливаний и `git push origin master:production` —
-  релиз на прод) не выполняется, пока пользователь
-  прямо не попросит об этом. Коммиты и вливания — локально, без пуша.
-- **Модели субагентов:** любая разработка (задачи цикла, разовые
-  поручения) — `zai-coding-plan/glm-5.3`; правки по ревью в рамках
-  задачи вносит тот же субагент, без смены модели. Отдельные субагенты
-  фиксов массового ревью — `zai-coding-plan/glm-5.3#max` (см.
-  «Массовое код-ревью и фиксы»). glm-модели — только через провайдер
-  `zai-coding-plan`. Ревью — по «Схеме ревью» (цепочка: `opencode run
+- **No pushing without an explicit instruction:** `git push` (including
+  `git push
+  origin master` after merges and `git push origin master:production` —
+  a production release) is not executed until the user
+  explicitly asks for it. Commits and merges are local, without pushing.
+- **Subagent models:** all development (cycle tasks, one-off
+  assignments) — `zai-coding-plan/glm-5.3`; review fixes within
+  a task are made by the same subagent, without changing the model.
+  Separate subagents for bulk-review fixes —
+  `zai-coding-plan/glm-5.3#max` (see
+  "Bulk code review and fixes"). glm models — only via the provider
+  `zai-coding-plan`. Review — per the "Review scheme" (chain: `opencode run
   opencode-go/deepseek-v4.1-flash` → `cursor-agent grok-4.7-high` →
-  `opencode run zai-coding-plan/glm-5.3#max` → `kimi kimi-code/k3.1-pro`; один раунд).
-- Этапы в `tasks/tasks.md` выполнять по порядку; внутри этапа — сверху вниз.
-- Следовать структуре, именованию и стилю существующего кода.
-- Поведенческую логику (статусы, состояния, жизненные циклы, повторы)
-  проектировать и дорабатывать как явный конечный автомат — фиксированный
-  набор состояний, события и таблица допустимых переходов, а не разрозненные
-  флаги и условия (реестр автоматов и приоритеты формализации —
+  `opencode run zai-coding-plan/glm-5.3#max` → `kimi kimi-code/k3.1-pro`;
+  one round).
+- Execute the stages in `tasks/tasks.md` in order; within a stage — top to bottom.
+- Follow the structure, naming, and style of the existing code.
+- Design and refine behavioral logic (statuses, states, lifecycles,
+  retries) as an explicit finite-state machine — a fixed
+  set of states, events, and a transition table of allowed transitions,
+  not scattered flags and conditions (the FSM registry and the
+  formalization priorities —
   `tasks/TZ-fsm.md`).
-- Задача заблокирована — вернуть статус `[новая]`, добавить под ней строку с причиной, взять следующую.
-- Сомнения в трактовке ТЗ — решать по тексту ТЗ; принятое решение кратко зафиксировать в коммите.
-- Существующее поведение не ломать; фиксации требуют и изменения контрактов между сервисами.
+- A task is blocked — return its status to `[new]`, add a line with the
+  reason under it, take the next one.
+- Doubts about the spec interpretation — resolve by the spec text; briefly
+  record the accepted decision in the commit.
+- Do not break existing behavior; changes to contracts between services
+  must be recorded too.
 
-## Команды
+## Commands
 
-- `make up` / `make down` / `make ps` — окружение.
-- `make test` — юнит-тесты; `make test-integration` — интеграционные.
-- `make mutate` — мутационное тестирование (тяжёлое; docs/mutation-testing.md).
-- `make lint`, `make fmt` — линтер и форматирование.
-- `make logs SERVICE=<имя>` — логи сервиса.
-- Полный список: `make help`.
+- `make up` / `make down` / `make ps` — the environment.
+- `make test` — unit tests; `make test-integration` — integration tests.
+- `make mutate` — mutation testing (heavy; docs/mutation-testing.md).
+- `make lint`, `make fmt` — the linter and formatting.
+- `make logs SERVICE=<name>` — service logs.
+- Full list: `make help`.

@@ -1,218 +1,234 @@
-# Прод-топология larasites и команды углубления
+# larasites prod topology and deep-dive commands
 
-Сервер: `ssh larasites` → root@155.212.174.88 (pulpirzvk.fvds.ru, IXcellerate).
-4 vCPU / 8 ГБ RAM / NVMe 79 ГБ, Ubuntu 24.04.5, ядро 6.8.
-Load 12–17 во время активного рендера — известный рабочий режим (проект
-сознательно перегружает CPU рендерами; docs/load-measurements.md).
+Server: `ssh larasites` → root@155.212.174.88 (pulpirzvk.fvds.ru, IXcellerate).
+4 vCPU / 8 GB RAM / NVMe 79 GB, Ubuntu 24.04.5, kernel 6.8.
+Load 12–17 during active rendering is a known working mode (the project
+deliberately overloads the CPU with renders; docs/load-measurements.md).
 
-## Деплой (нативный systemd, НЕ docker)
+## Deploy (native systemd, NOT docker)
 
-- Бинарники: `/opt/crawler/bin/` (ingest, scheduler, dns-worker, http-worker,
+- Binaries: `/opt/crawler/bin/` (ingest, scheduler, dns-worker, http-worker,
   render-worker, analyzer, monitor, web, dashboard, **crawlerctl**).
-- Рабочий каталог сервисов: `/var/lib/crawler` (контент — `content/`,
-  входящие — `incoming/`).
-- Окружение: `/etc/crawler/crawler.env`; конфиг: `/etc/crawler/config.yaml`.
-- Юниты: `crawler-{ingest,scheduler,dns-worker,http-worker,render-worker,
+- Service working directory: `/var/lib/crawler` (content — `content/`,
+  incoming — `incoming/`).
+- Environment: `/etc/crawler/crawler.env`; config: `/etc/crawler/config.yaml`.
+- Units: `crawler-{ingest,scheduler,dns-worker,http-worker,render-worker,
   render-worker@9109,render-fallback-worker,analyzer,monitor,web,dashboard,
-  chromium}` (render-fallback-worker — воркер B, появляется после деплоя
-  этапа 35/36; до деплоя юнита нет — норма), плюс
+  chromium}` (render-fallback-worker — worker B, appears after the stage
+  35/36 deploy; before the deploy there is no unit — normal), plus
   `redis-server`, `postgresql@16-main`, `unbound`, `nginx`, `fail2ban`.
 
-### Подводный камень crawler.env
+### The crawler.env pitfall
 
-Строка `CRAWLER_HTTP_USER_AGENT=... (+https://...; ...)` содержит скобки —
-`source` в bash падает на ней с syntax error, переменные после неё не
-загружаются. Для `crawlerctl status` хватает ранних строк (DSN на строках
-2–3), поэтому рабочий вызов:
+The line `CRAWLER_HTTP_USER_AGENT=... (+https://...; ...)` contains parentheses —
+`source` in bash fails on it with a syntax error, and the variables after it
+are not loaded. For `crawlerctl status` the early lines are enough (the DSN
+is on lines 2–3), so the working invocation is:
 
 ```bash
 set -a; . /etc/crawler/crawler.env 2>/dev/null; set +a
-/opt/crawler/bin/crawlerctl status          # зоны… итого, очереди, скорость, цикл
+/opt/crawler/bin/crawlerctl status          # zones… totals, queues, speed, cycle
 ```
 
-## Конвейер и очереди (Redis Streams)
+## Pipeline and queues (Redis Streams)
 
-**До деплоя этапа 35/36 ветки фолбэка на проде нет** (стрима
-q:render-fallback в Redis, юнита воркера B, порта 9120; метрики
-движков/фолбэка в /metrics — отсутствуют или нулевые серии без роста,
-в т.ч. предсозданные нули suspended/consumed): это норма, а не
-аномалия — код в master, прод ждёт пуша в production; правила этого
-блока действуют после деплоя.
+**Before the stage 35/36 deploy there is no fallback branch in prod** (no
+q:render-fallback stream in Redis, no worker B unit, no port 9120; the
+engine/fallback metrics in /metrics — absent or zero series without growth,
+including the pre-created suspended/consumed zeros): this is normal, not
+an anomaly — the code is in master, prod awaits the push to production;
+the rules of this block apply after the deploy.
 
 ```
 scheduler ──> q:dns ──> dns-worker ──> q:http ──> http-worker ─┬─> q:analyze ──> analyzer ──> PostgreSQL
                                           │                    └─> q:render ──> render-worker ─┬─> q:analyze
-                                          │                                        │ движко-зависимые сбои рендера
-                                          │                                        │ (тарпит T-148 / класс задачи T-172
-                                          │                                        │  на последней доставке, после
-                                          │                                        │  деплоя этапа 35/36)
+                                          │                                        │ engine-dependent render failures
+                                          │                                        │ (tarpit T-148 / task class T-172
+                                          │                                        │  on the last delivery, after the
+                                          │                                        │  stage 35/36 deploy)
                                           │                                        └─> q:render-fallback ──> render-fallback-worker
-                                          │                                                                     (воркер B, chromium, потолок темпа
+                                          │                                                                     (worker B, chromium, rate cap
                                           │                                                                      render.fallback.worker_rate)
                                           │                                                                        └─> q:analyze
-                           (исчерпаны retry ──> q:dead — без потребителя, ручной разбор)
+                           (retries exhausted ──> q:dead — no consumer, manual triage)
 ```
 
-Группы: `dns-worker`, `http-worker`, `render-worker`,
-`render-fallback-worker` (после деплоя 35/36), `analyzer` — по одной
-на стрим. Поле сообщений — `subdomain_results` (DNSBatch/HTTPTask/Result).
+Groups: `dns-worker`, `http-worker`, `render-worker`,
+`render-fallback-worker` (after the 35/36 deploy), `analyzer` — one
+per stream. The message field — `subdomain_results` (DNSBatch/HTTPTask/Result).
 
-Ветка фолбэка (после деплоя): при включённом `render.fallback.enabled`
-движко-зависимые кандидаты рендера не финализируются, а публикуются
-воркером A в q:render-fallback; воркер B (тот же бинарь, chromium)
-дорабатывает их темпом `render.fallback.worker_rate`: успех —
-`rendered = true` + q:analyze, исчерпание — маркер `render_failed_at`
-+ q:analyze. **Health-гейт/бюджет доли** — защита от шторма
-публикаций: стрик browser-ошибок (гейт — основной движок недоступен)
-или перерасход `render.fallback.share_percent` за окно (бюджет)
-приостанавливает публикации — задачи при этом НЕ теряются:
-финализируются маркером как обычно, browser-класс ждёт в redelivery
-q:render. При engine=chromium публикаций нет вовсе — движковый guard
-(chromium сам себе не фолбэчится, пустая очередь — норма).
+The fallback branch (after the deploy): with `render.fallback.enabled` on,
+engine-dependent render candidates are not finalized but are published
+by worker A to q:render-fallback; worker B (the same binary, chromium)
+reworks them at the `render.fallback.worker_rate` rate: success —
+`rendered = true` + q:analyze, exhaustion — the `render_failed_at`
+marker + q:analyze. **The health gate/share budget** — protection against
+a publication storm: a browser-error streak (the gate — the main engine
+is unavailable) or exceeding `render.fallback.share_percent` for a window
+(the budget) suspends publications — tasks are NOT lost in the process:
+they are finalized with the marker as usual, the browser class waits in
+the q:render redelivery. At engine=chromium there are no publications at
+all — the engine guard
+(chromium does not fall back to itself, an empty queue is normal).
 
-- Глубина: `min(lag, XLEN) + pending` — так считает и `crawler_queue_depth`.
-- Два среза `XINFO GROUPS` (Δentries-read) → скорость. См. формулы в SKILL.md.
-- XINFO GROUPS --raw, одна группа, позиции строк (Redis 7.4):
+- Depth: `min(lag, XLEN) + pending` — `crawler_queue_depth` computes it
+  the same way.
+- Two `XINFO GROUPS` snapshots (Δentries-read) → the rate. See the
+  formulas in SKILL.md.
+- XINFO GROUPS --raw, one group, line positions (Redis 7.4):
   2=name, 4=consumers, 6=pending, 8=last-delivered-id, 10=entries-read, 12=lag.
-- Backpressure: общий `scheduler.queue_high_watermark` (100 тыс.), а у
-  q:render — отдельный `render.queue_high_watermark` (T-174, на проде
-  10 тыс., `/etc/crawler/config.yaml` секция `render:`). Выше порога
-  SPA-записи не публикуются, у домена ставится флаг `render_pending`
-  (бит 1 `domains.flags`).
-- Пополнение q:render из долга (T-066): пока глубина стрима ниже
-  `render.queue_high_watermark`, проход доработки `RequeueRenderPending`
-  в http-worker (тик ~1 мин, пачка до 100 доменов) публикует SPA-задачи
-  доменов с флагом и снимает бит — переходы бита ведут счётчик
-  `crawler_counters['render_pending']` (T-175). Следствие: лаг q:render
-  держится у порога, пока долг не исчерпан. Между снимками сравнивать
-  только сумму **lag(q:render) + render_pending** (готовая метрика
-  monitor: `crawler_render_pending_domains`); дренаж жив — если в
-  журнале http-worker идёт «проход доработки рендера» (full=true —
-  пачка упёрлась в порог, это норма).
+- Backpressure: the common `scheduler.queue_high_watermark` (100k), while
+  q:render has a separate `render.queue_high_watermark` (T-174, 10k in
+  prod, the `render:` section of `/etc/crawler/config.yaml`). Above the
+  threshold SPA entries are not published, and the domain gets the flag
+  `render_pending`
+  (bit 1 of `domains.flags`).
+- Replenishing q:render from the debt (T-066): while the stream depth is
+  below
+  `render.queue_high_watermark`, the `RequeueRenderPending` rework pass
+  in the http-worker (tick ~1 min, a batch of up to 100 domains) publishes
+  the SPA tasks of flagged domains and clears the bit — bit transitions
+  feed the counter
+  `crawler_counters['render_pending']` (T-175). Consequence: the q:render
+  lag stays near the threshold until the debt is exhausted. Between
+  snapshots compare only the sum **lag(q:render) + render_pending** (a
+  ready monitor metric:
+  `crawler_render_pending_domains`); the drain is alive if the
+  http-worker journal shows the "render rework pass" line (full=true —
+  the batch hit the threshold, this is normal).
 
-## Порты метрик (Prometheus, 127.0.0.1, с сервера)
+## Metrics ports (Prometheus, 127.0.0.1, from the server)
 
-| Порт | Сервис |
+| Port | Service |
 |---|---|
-| 9100 | monitor (сводные + алерты: frozen-очереди, redis, PG slow, OOM) |
-| 9104 | http-worker (retention, компактификация, HTTP-этап) |
-| 9105 / 9109 | render-worker (осн. + второй экземпляр @9109) |
+| 9100 | monitor (aggregates + alerts: frozen queues, redis, PG slow, OOM) |
+| 9104 | http-worker (retention, compaction, HTTP stage) |
+| 9105 / 9109 | render-worker (main + the second instance @9109) |
 | 9106 | analyzer |
-| 9120 | render-fallback-worker, воркер B — после деплоя этапа 35/36 (порт фиксированный: 9109+ — зона экземпляров render-worker@; 9110 в старых заметках — устарело, фикс S-P2-3) |
+| 9120 | render-fallback-worker, worker B — after the stage 35/36 deploy (the port is fixed: 9109+ is the render-worker@ instance range; 9110 in old notes is outdated, the S-P2-3 fix) |
 
 ```bash
 curl -s 127.0.0.1:9104/metrics | grep -E '^crawler_queue_depth|^crawler_content_'
 curl -s 127.0.0.1:9100/metrics | grep -E '^crawler_(queue|unit|redis)'
 ```
 
-### Словарь метрик рендера: движки и фолбэк (после деплоя 35/36)
+### Render metrics dictionary: engines and fallback (after the 35/36 deploy)
 
-- `crawler_render_fallback_published_total{reason}` — задачи,
-  опубликованные в q:render-fallback из путей финализации без рендера
-  (движко-зависимые причины: тарпит, класс задачи на последней
-  доставке); reason — код `net::ERR_*` / `timeout` / `other`;
-  числитель fallback-рейта. Экспонирует воркер A (:9105).
-- `crawler_render_fallback_consumed_total{result}` — потребление
-  q:render-fallback воркером B по исходу доставки: `rendered` —
-  доработка успешна (DOM записан); `finalized` — фолбэк исчерпан,
-  запись закрыта маркером `render_failed_at`; `skipped` — строка ушла
-  из-под задачи (строки нет / без итогового URL), без побочных
-  эффектов. Считает только сборка B (:9120); ошибочные доставки живут
-  в PEL до клейма либо bury в q:dead.
-- `crawler_render_fallback_suspended_total{reason}` — события (не
-  состояние!) приостановки публикаций фолбэка: `gate` — health-гейт,
-  стрик инфра-ошибок класса браузера (основной движок недоступен)
-  достиг `render.fallback.health_gate_streak`; `budget` — доля
-  публикаций за окно 1000 доставок ушла за потолок
-  `render.fallback.share_percent`. Пока приостановка держится,
-  кандидаты финализируются штатно с маркером — задачи не теряются.
-- `crawler_render_records_total{rendered,engine}` — записи по признаку
-  rendered (`false` — HTTP-этап, без engine; `true` — воркеры рендера);
-  метка `engine` (chromium|moli|lightpanda) — движок сборки воркера,
-  материал доли движков. Тарпит-финализации атрибутируются движку —
+- `crawler_render_fallback_published_total{reason}` — tasks
+  published to q:render-fallback from the finalize-without-render paths
+  (engine-dependent reasons: tarpit, task class on the last
+  delivery); reason — the code `net::ERR_*` / `timeout` / `other`;
+  the numerator of the fallback rate. Exposed by worker A (:9105).
+- `crawler_render_fallback_consumed_total{result}` — consumption of
+  q:render-fallback by worker B by delivery outcome: `rendered` —
+  the rework succeeded (the DOM is written); `finalized` — the fallback
+  is exhausted, the entry is closed with the `render_failed_at` marker;
+  `skipped` — the entry slipped out from under the task (no entry / no
+  final URL), without side
+  effects. Only the B build counts it (:9120); failed deliveries live
+  in the PEL until claimed or buried to q:dead.
+- `crawler_render_fallback_suspended_total{reason}` — events (not
+  state!) of fallback publication suspension: `gate` — the health gate,
+  a streak of browser-class infra errors (the main engine is unavailable)
+  reached `render.fallback.health_gate_streak`; `budget` — the share
+  of publications per 1000-delivery window exceeded the cap
+  `render.fallback.share_percent`. While the suspension holds,
+  candidates are finalized as usual with the marker — tasks are not lost.
+- `crawler_render_records_total{rendered,engine}` — entries by the
+  rendered flag (`false` — the HTTP stage, without engine; `true` —
+  render workers);
+  the `engine` label (chromium|moli|lightpanda) — the build engine of the
+  worker, the material for the engine shares. Tarpit finalizations are
+  attributed to the engine —
   `crawler_render_tarpit_finalized_total{engine}`.
 
 ## PostgreSQL (sudo -u postgres psql -d crawler)
 
-- Размеры: `SELECT relname, pg_size_pretty(pg_total_relation_size(relid))
+- Sizes: `SELECT relname, pg_size_pretty(pg_total_relation_size(relid))
   FROM pg_statio_user_tables ORDER BY 2 DESC LIMIT 8;`
-  Ориентир на 03.11.2026: domains_default ~10 Г, subdomain_results_default
-  ~7.5 Г, contents ~0.26 Г (сам контент — в паках на диске, не в БД).
-- Живость таблиц: `n_live_tup`/`n_dead_tup` у `contents`,
+  As of 03.11.2026: domains_default ~10 GB, subdomain_results_default
+  ~7.5 GB, contents ~0.26 GB (the content itself lives in packs on disk,
+  not in the DB).
+- Table liveness: `n_live_tup`/`n_dead_tup` of `contents`,
   `subdomain_results_default`, `laravel_domains`.
-- Счётчики `crawler_counters` (3 колонки: имя, значение, время):
-  `checks:ГГГГ-ММ-ДД` — проверок доменов за сутки (0 при стоящем фронте);
-  `laravel_appeared_total` / `laravel_lost_total` — находки;
-  `render_pending` — рендер-долг (защита retention, T-166/T-185);
-  полный рендер-долг = лаг q:render + это значение — сравнивать q:render
-  между снимками только вместе с ним (метрика
+- The `crawler_counters` counters (3 columns: name, value, time):
+  `checks:YYYY-MM-DD` — domain checks per 24 hours (0 when the front is
+  stopped);
+  `laravel_appeared_total` / `laravel_lost_total` — finds;
+  `render_pending` — the render debt (retention protection, T-166/T-185);
+  the full render debt = the q:render lag + this value — compare q:render
+  between snapshots only together with it (the metric
   `crawler_render_pending_domains`);
-  `reanalyze:*` — шум, фильтровать.
+  `reanalyze:*` — noise, filter it out.
 
-## Контент-хранилище и диск
+## Content storage and disk
 
-- Паки: `/var/lib/crawler/content/pack-NNNNNN.pack` (~489 МБ каждый).
-  Рост/освобождение: retention (6 ч, чистит ссылки у старых не-находок) +
-  часовая компактификация — ОБА цикла в http-worker. Проверка:
+- Packs: `/var/lib/crawler/content/pack-NNNNNN.pack` (~489 MB each).
+  Growth/reclamation: retention (6 h, clears the references of old
+  non-finds) +
+  hourly compaction — BOTH cycles in the http-worker. Check:
   ```bash
-  journalctl -u crawler-http-worker --since -24h | grep -E "компактификации|retention"
+  journalctl -u crawler-http-worker --since -24h | grep -E "compaction|retention"
   ```
-  Норма: проход раз в час, `freed_bytes` > 0. Retention skips при глубине
-  q:analyze ≥ watermark — периодически норм, постоянно — блокирует очистку.
-- Логи: journal ≤ 1 Г (SystemMaxUse), ForwardToSyslog=no; спам chromium
-  погашен drop-in'ом `crawler-chromium.service.d/10-logfilter.conf`
-  (репо: `deploy/systemd/crawler-chromium.service.d/`).
-- `/var/log/postgresql` ~0.3 Г — норм; растёт — лог-уровень PG.
+  Normal: a pass once per hour, `freed_bytes` > 0. Retention skips at a
+  q:analyze depth ≥ watermark — occasionally normal, constant — blocks
+  cleanup.
+- Logs: journal ≤ 1 GB (SystemMaxUse), ForwardToSyslog=no; chromium spam
+  is suppressed by the `crawler-chromium.service.d/10-logfilter.conf`
+  drop-in
+  (repo: `deploy/systemd/crawler-chromium.service.d/`).
+- `/var/log/postgresql` ~0.3 GB — normal; if growing — the PG log level.
 
-## Дашборд и входы
+## Dashboard and entry points
 
-- Операторский: `https://dashboard.laracity.ru` (HTTP Basic, JSON-снимок
-  `GET /api/status` — те же очереди/скорости, что в crawlerctl).
-- Лендинги: `https://sites.laravel.city`, `https://sites.laracity.ru`.
+- Operator: `https://dashboard.laracity.ru` (HTTP Basic, the JSON snapshot
+  `GET /api/status` — the same queues/rates as in crawlerctl).
+- Landing pages: `https://sites.laravel.city`, `https://sites.laracity.ru`.
 
-## Известные инциденты (что искать по признакам)
+## Known incidents (what to look for by signs)
 
-| Дата | Признак | Причина |
+| Date | Sign | Cause |
 |---|---|---|
-| 03.11.2026 | «остаток очереди» в 15 раз выше правды | XLEN приняли за глубину; правда — lag |
-| 03.11.2026 | скорость 0 дом/с сутками, q:dns/q:http пустые | crawler-scheduler остановлен вручную оператором |
-| 23.10.2026 | лаг q:render ≈99 тыс., retention стоит | рендер-долг: защита записей от удаления (T-166/T-167) |
-| 03.11.2026 | syslog +2.5 ГБ за 2 дня | консоли чужих страниц из chromium (см. drop-in выше) |
-| 04.11.2026 | лаг q:render ~9,9 тыс. сутами «не тает», прогноз дренажа за часы не сбылся | равновесие у `render.queue_high_watermark` (10 тыс.): проход доработки T-066/T-174 пополняет очередь из render_pending (~350 тыс.) — это норма; метрика — lag + render_pending, ETA по сумме |
-| 06.11.2026 | движки-кандидаты красные на per-engine срезе (прогоны на дев-стенде, НЕ прод) | стендовое сравнение движков (этап 35/36): moli 1.1.21/1.1.22 — `Fetch.enable` InvalidParams (PR upstream #2470, ждём 1.1.23), lightpanda 1.0.2/1.0.3 — один browser context на соединение (upstream #4151, watch), chromium — baseline ≈92% успешности; контекст для будущих канареечных окон |
-| 09–11.11.2026 | WARN «проход retention контента … выборка кандидатов: timeout» каждые 15 мин, метрики :9104 нулевые; с T-273 — `retention_errors_total` растёт пачками раз в «проход+15 мин»; render-late «выборка: timeout» | регрессия T-271: клиентский таймаут меньше стоимости первого catch-up-прохода с нулевым курсором (курсор в памяти процесса, без коммита не двигается) + закрепления развернули join render-late от domains; фикс T-273 (3600/300 с, unpinned, reset тикера, метрики ошибок), дренаж бэклога — «спокойное окно» docs/operations.md §4.6 (деплой всегда поднимает scheduler сам — окно возобновлять вручную; нули счётчиков при живом проходе — норма, итог по pass_seconds_count) |
-| 10.11.2026 | moli v1.1.23 всё ещё красный на срезе (дев-стенд, НЕ прод; T-272) | InvalidParams на `Fetch.enable` ушёл (наш upstream PR #2470 + парный #2476 вошли в 1.1.23): навигация/DOM/cookies/изоляция/UA зелёные, контроль chromium 6/6 PASS на том же стенде. Срез держат красным дефекты перехвата Fetch: (1) при включённом перехвате синхронный XHR из JS страницы падает NetworkError на клиенте — запрос до сервера не доходит (лог moli: Uncaught NetworkError … XMLHttpRequest); (2) `fetch.failRequest` главной навигации не завершает навигацию ошибкой загрузки — вкладка неотзывчива, ERR_BLOCKED_BY_CLIENT вне канала loadFailed (класс context, кода загрузки нет); (3) Stylesheet не принят и в v1.1.23 (supports_fetch_enable) — CSS-режим `BlockStylesheet` валит весь вызов InvalidParams, базовый профиль не страдает (дефолт false). Пин откачен на v1.1.21 (контейнер остановлен, как было); тег crawler/moli:v1.1.23 остался локально — следующий пере-тест начинается с возврата пары в .env, без сборки. План: issue в апстрим + пере-тест по следующему релизу (T-247) |
+| 03.11.2026 | the "queue backlog" is 15x above the truth | XLEN was taken for the depth; the truth is lag |
+| 03.11.2026 | rate 0 domains/s for days, q:dns/q:http empty | crawler-scheduler stopped manually by the operator |
+| 23.10.2026 | q:render lag ≈99k, retention idle | render debt: protection of entries from deletion (T-166/T-167) |
+| 03.11.2026 | syslog +2.5 GB in 2 days | consoles of foreign pages from chromium (see the drop-in above) |
+| 04.11.2026 | q:render lag ~9.9k "not melting" for days, the hours-scale drain forecast failed | equilibrium at `render.queue_high_watermark` (10k): the T-066/T-174 rework pass replenishes the queue from render_pending (~350k) — this is normal; the metric is lag + render_pending, the ETA from the sum |
+| 06.11.2026 | candidate engines red on the per-engine snapshot (runs on the dev bench, NOT prod) | bench comparison of engines (stage 35/36): moli 1.1.21/1.1.22 — `Fetch.enable` InvalidParams (upstream PR #2470, waiting for 1.1.23), lightpanda 1.0.2/1.0.3 — one browser context per connection (upstream #4151, watch), chromium — the baseline ≈92% success; context for future canary windows |
+| 09–11.11.2026 | WARN "content retention pass … candidate selection: timeout" every 15 min, :9104 metrics at zero; since T-273 — `retention_errors_total` growing in bursts once per "pass + 15 min"; render-late "selection: timeout" | T-271 regression: the client timeout is shorter than the cost of the first catch-up pass with a zero cursor (the cursor lives in the process memory, it does not move without a commit) + the unpinning flipped the render-late join away from domains; the T-273 fix (3600/300 s, unpinned, ticker reset, error metrics), backlog drain — the "quiet window" docs/operations.md §4.6 (the deploy always brings the scheduler up itself — resume the window manually; zero counters with a live pass are normal, the total is by pass_seconds_count) |
+| 10.11.2026 | moli v1.1.23 still red on the snapshot (dev bench, NOT prod; T-272) | The InvalidParams on `Fetch.enable` is gone (our upstream PR #2470 + the paired #2476 made it into 1.1.23): navigation/DOM/cookies/isolation/UA are green, the chromium control is 6/6 PASS on the same bench. The snapshot is kept red by the Fetch interception defects: (1) with interception on, a synchronous XHR from the page JS fails with NetworkError on the client — the request never reaches the server (the moli log: Uncaught NetworkError … XMLHttpRequest); (2) `fetch.failRequest` of the main navigation does not finish the navigation with a load error — the tab is unresponsive, ERR_BLOCKED_BY_CLIENT outside the loadFailed channel (class context, no load code); (3) Stylesheet is still not accepted in v1.1.23 (supports_fetch_enable) — the CSS mode `BlockStylesheet` fails the whole call with InvalidParams, the base profile is unaffected (the default false). The pin is rolled back to v1.1.21 (the container is stopped, as before); the crawler/moli:v1.1.23 tag remains local — the next retest starts with restoring the pair in .env, without a build. Plan: an upstream issue + a retest with the next release (T-247) |
 
-## Точечные команды по блокам
+## Targeted commands per block
 
 ```bash
-# юнит и его рестарты/окружение
+# the unit and its restarts/environment
 systemctl status crawler-render-worker --no-pager -l
 systemctl show crawler-scheduler -p ActiveState,NRestarts,MainPID,ActiveEnterTimestamp
 
-# журнал сервиса (ошибки за час)
+# the service journal (errors for the last hour)
 journalctl -u crawler-http-worker --since -1h -q | grep -iE "err|warn|fatal|panic" | tail -20
 
-# зависшие сообщения очереди (pending у группы)
+# stuck queue messages (the group pending)
 redis-cli XPENDING q:render render-worker
 
-# фолбэк рендера (после деплоя этапа 35/36; до деплоя стрима/юнита нет —
-# это норма): pending группы воркера B
+# render fallback (after the stage 35/36 deploy; before the deploy there is no
+# stream/unit —
+# this is normal): the worker B group pending
 redis-cli XPENDING q:render-fallback render-fallback-worker
 
-# потребление фолбэка воркером B — его экспозиция :9120
+# fallback consumption by worker B — its :9120 exposition
 curl -s 127.0.0.1:9120/metrics | grep fallback
 
-# приостановки публикаций (gate/budget) — экспозиция основного воркера A
+# publication suspensions (gate/budget) — the primary worker A exposition
 curl -s 127.0.0.1:9105/metrics | grep suspended
 
-# дренаж рендер-долга: пополнение q:render из render_pending (T-066)
-journalctl -u crawler-http-worker --since -30m -q | grep "проход доработки рендера" | tail -5
+# render debt drain: replenishing q:render from render_pending (T-066)
+journalctl -u crawler-http-worker --since -30m -q | grep "render rework pass" | tail -5
 
-# состояние домена
+# domain state
 set -a; . /etc/crawler/crawler.env 2>/dev/null; set +a
 /opt/crawler/bin/crawlerctl domain example.com --json
 
-# медленные запросы PG
+# slow PG queries
 sudo -u postgres psql -d crawler -c "SELECT calls, round(mean_exec_time::numeric,0) ms, left(query,80) FROM pg_stat_statements ORDER BY mean_exec_time DESC LIMIT 10;"
 ```
