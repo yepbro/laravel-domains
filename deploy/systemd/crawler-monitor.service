@@ -1,22 +1,23 @@
-# Domain Crawler — monitor: прогресс зон, метрики, алерты (ТЗ 5.9).
-# MemoryMax — строка бюджета «Go-сервисы ≈ 1,3 ГБ» (ТЗ 3.2), раскладка —
-# docs/deploy.md. Адрес HTTP-ендпоинта задаёт monitor.listen в конфиге
-# (важнее METRICS_ADDR — docs/services.md); Environment ниже — страховка
-# loopback (переменная окружения важнее YAML — docs/configuration.md),
-# даже если config.yaml скопирован из примера без правок: метрики не
-# выставляются на внешние интерфейсы (ТЗ §9), как у остальных сервисов
-# (METRICS_ADDR=127.0.0.1:9101…9108 в их юнитах). /dev/nvme* (SMART,
-# ТЗ 10.3) отдаётся группе nvme-smart (udev-правило и drop-in —
-# deploy/smartd/, T-089): без него алерт износа честно «не измеряется».
-# Доставка алертов в Telegram (T-162) читает TELEGRAM_BOT_TOKEN/
-# TELEGRAM_CHAT_ID из EnvironmentFile ниже (monitor звёт exec
-# /opt/crawler/bin/telegram-notify.sh — docs/operations.md §4.3); без
-# секретов доставка выключена, алерты остаются Warn в journald.
+# Domain Crawler — monitor: zone progress, metrics, alerts (spec 5.9).
+# MemoryMax — the "Go services ≈ 1.3 GB" budget line (spec 3.2); breakdown
+# in docs/deploy.md. The HTTP endpoint address is set by monitor.listen in
+# the config (it beats METRICS_ADDR — docs/services.md); the Environment
+# below is the loopback guard (an environment variable beats YAML —
+# docs/configuration.md), even if config.yaml is copied from the example
+# unedited: metrics are not exposed on external interfaces (spec §9), like
+# in the other services (METRICS_ADDR=127.0.0.1:9101…9108 in their units).
+# /dev/nvme* (SMART, spec 10.3) is granted to the nvme-smart group (the
+# udev rule and drop-in — deploy/smartd/, T-089): without it the wear alert
+# honestly reports "not measured".
+# The Telegram alert delivery (T-162) reads TELEGRAM_BOT_TOKEN/
+# TELEGRAM_CHAT_ID from the EnvironmentFile below (monitor execs
+# /opt/crawler/bin/telegram-notify.sh — docs/operations.md §4.3); without
+# the secrets delivery is disabled, alerts stay Warn in journald.
 
 [Unit]
-Description=Domain Crawler — monitor (прогресс, метрики, алерты)
+Description=Domain Crawler — monitor (progress, metrics, alerts)
 PartOf=crawler.target
-# Комментарий о After/Wants без Requires — crawler-ingest.service.
+# For the After/Wants without Requires rationale, see crawler-ingest.service.
 After=network-online.target postgresql.service redis-server.service unbound.service
 Wants=network-online.target
 StartLimitIntervalSec=300
@@ -27,7 +28,8 @@ Type=simple
 User=crawler-monitor
 Group=crawler
 EnvironmentFile=/etc/crawler/crawler.env
-# Loopback-страховка адреса метрик: env важнее YAML (см. шапку юнита).
+# Loopback guard for the metrics address: env beats YAML (see the unit
+# header).
 Environment=CRAWLER_MONITOR_LISTEN=127.0.0.1:9100
 WorkingDirectory=/var/lib/crawler
 SyslogIdentifier=crawler-monitor
@@ -36,14 +38,15 @@ Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=30s
 MemoryMax=128M
-# CPU-приоритет (T-158): обвязка — агрегаты мониторинга по 47 млн строк
-# (BacklogLoop GROUP BY каждые 30 с + ZoneStats, §12) не должны
-# отнимать CPU у конвейера (PSI some 91–95%). Вес 50 против 1000 у
-# критического пути; замедление сводки при голоде — размен штатный.
+# CPU priority (T-158): a supporting service — the monitoring aggregates
+# over 47M rows (the BacklogLoop GROUP BY every 30 s + ZoneStats, §12) must
+# not take CPU from the pipeline (PSI some 91–95%). Weight 50 vs 1000 for
+# the critical path; a slower summary under starvation is the intended
+# trade-off.
 CPUWeight=50
 LimitNOFILE=65535
 UMask=0007
-# --- Изоляция (ТЗ §9/§10.1) ---
+# --- Isolation (spec §9/§10.1) ---
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict

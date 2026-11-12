@@ -1,34 +1,34 @@
-# Domain Crawler — http-worker: HTTP-загрузка, редиректы, алиасы (ТЗ 5.5).
-# Самый тяжёлый из Go-сервисов (раскладка бюджета — docs/deploy.md):
-# до http.task_concurrency доменных задач на экземпляр (192 по умолчанию —
-# T-157, возврат 256 — по замеру после T-163; T-139 — скользящее
-# потребление q:http) × метаданные задач и ≤ http.task_per_domain
-# транзитных буферов читаемых тел (тела страниц не удерживаются — ранний
-# Put T-147 сразу сохраняет каждую страницу в хранилище), кэш итоговых
-# URL и хранилище контента; мягкий потолок кучи Go — http.mem_limit
-# (768 MiB по умолчанию, debug.SetMemoryLimit): у порога GC сам
-# возвращает страницы ОС, не доводя anon до MemoryHigh/MemoryMax.
-# MemoryMax 900M — по повторному
-# замеру после T-139 (docs/load-measurements.md §11, T-143): 256 слотов
-# держали anon avg ≈ 855 MiB (834–873, oom=0 в окне 12 мин), т.е.
-# ≈ 3.34 MiB на слот — замер кода до T-147 (тогда тела
-# записей-оригиналов держались до конца задачи); сутки на 256 —
-# два фатала юнита (§12, T-157: 05:48 killed by OOM killer, 09:17 пик
-# 900.5 MiB = MemoryMax; MemoryHigh 850M — 120 095 reclaim-событий) —
-# дефолт понижен до 192, устойчиво по пропитке волны 21 (860–893 MiB,
-# oom=0, NRestarts=0); возврат 256 — после T-163 (метрики замера слота
-# на :9104 + mem_limit) по замеру сэмплером. На сервере потолок задан
-# персистентным drop-in'ом
-# `systemctl set-property` — здесь закреплён (drop-in снять:
-# load-measurements.md §3). Прежние 384M подходили впритык уже на
-# 128 слотах (anon ≈ 380 из 384 MiB, oom=0). Строка «Go-сервисы
-# ≈ 1,3 ГБ» (ТЗ 3.2) выдерживается: все Go-сервисы суммарно
-# ≈ 1.0–1.15 GiB (docs/deploy.md §2).
+# Domain Crawler — http-worker: HTTP fetching, redirects, aliases (spec 5.5).
+# The heaviest of the Go services (budget breakdown — docs/deploy.md):
+# up to http.task_concurrency domain tasks per instance (192 by default —
+# T-157; returning to 256 — per the measurement after T-163; T-139 — the
+# sliding consumption of q:http) × task metadata and ≤ http.task_per_domain
+# transit buffers of the bodies being read (page bodies are not held — the
+# early Put of T-147 stores each page into the store immediately), the
+# final URL cache and the content store; the soft Go heap cap —
+# http.mem_limit (768 MiB by default, debug.SetMemoryLimit): near the
+# threshold the GC returns pages to the OS by itself, never letting anon
+# reach MemoryHigh/MemoryMax.
+# MemoryMax 900M — per the repeated measurement after T-139
+# (docs/load-measurements.md §11, T-143): 256 slots held anon avg
+# ≈ 855 MiB (834–873, oom=0 in a 12 min window), i.e. ≈ 3.34 MiB per slot
+# — a measurement of the pre-T-147 code (back then the bodies of the
+# original records were held until the end of the task); a day at 256 —
+# two fatal unit failures (§12, T-157: 05:48 killed by OOM killer, 09:17
+# peak 900.5 MiB = MemoryMax; MemoryHigh 850M — 120,095 reclaim events) —
+# the default was lowered to 192, steady per the wave 21 soak (860–893 MiB,
+# oom=0, NRestarts=0); returning to 256 — after T-163 (the slot measurement
+# metrics on :9104 + mem_limit), per the sampler measurement. On the server
+# the cap is set by a persistent drop-in of `systemctl set-property` —
+# here it is pinned (to remove the drop-in: load-measurements.md §3). The
+# previous 384M already fit snugly at 128 slots (anon ≈ 380 of 384 MiB,
+# oom=0). The "Go services ≈ 1.3 GB" line (spec 3.2) holds: all Go
+# services together ≈ 1.0–1.15 GiB (docs/deploy.md §2).
 
 [Unit]
-Description=Domain Crawler — http-worker (HTTP-загрузка)
+Description=Domain Crawler — http-worker (HTTP fetching)
 PartOf=crawler.target
-# Комментарий о After/Wants без Requires — crawler-ingest.service.
+# For the After/Wants without Requires rationale, see crawler-ingest.service.
 After=network-online.target postgresql.service redis-server.service unbound.service
 Wants=network-online.target
 StartLimitIntervalSec=300
@@ -46,40 +46,42 @@ ExecStart=/opt/crawler/bin/http-worker
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=30s
-# Мягкий потолок (T-145): выше 850M ядро возвращает память reclaim'ом
-# (троттлинг аллокаций), не дожидаясь hard-лимита 900M и OOM-kill.
-# Замер сэмплером — MemoryCurrent cgroup (anon + page cache): 192 слота
-# стабильно 860–893 MiB (пропитка волны 21, oom=0; код до T-147).
-# Слотовая составляющая ≈3.34 MiB/слот (замер §11 тем же сэмплером)
-# ≈ 640 MiB — остальное page cache пишущего контент-стора: reclaim под
-# MemoryHigh режет в первую очередь его (безболезненно), а не живые
-# слоты. С T-163 вторая линия обороны до ядра — мягкий потолок кучи Go
-# http.mem_limit (768 MiB): у порога GC сам возвращает страницы ОС,
-# событиям `high` взяться не из чего, пока живая куча в бюджете.
-# Рост выше 850 сверх кеша — перегрев (стартовый пик: раскатка на 256
-# давила healthz, §11 — 834–873 MiB): троттлинг даёт GC/scavenger время
-# вернуть память за 50 MiB до OOM-kill слотов. Рост memory.events `high`
-# в рабочей зоне — норма; `oom`/`oom_kill` и NRestarts — нет: их видит
-# алерт unit_oom (internal/monitor/unitevents.go, T-145).
+# Soft cap (T-145): above 850M the kernel returns memory by reclaim
+# (allocation throttling), without waiting for the hard limit of 900M and
+# an OOM kill. Sampler measurement — the cgroup MemoryCurrent (anon + page
+# cache): 192 slots stably 860–893 MiB (the wave 21 soak, oom=0; pre-T-147
+# code). The slot share is ≈3.34 MiB/slot (the §11 measurement, the same
+# sampler) ≈ 640 MiB — the rest is the page cache of the writing content
+# store: reclaim under MemoryHigh cuts it first (painlessly), not the live
+# slots. Since T-163 the second line of defense before the kernel is the
+# soft Go heap cap http.mem_limit (768 MiB): near the threshold the GC
+# returns pages to the OS by itself, leaving nothing for the `high` events
+# as long as the live heap fits the budget. Growth above 850 beyond the
+# cache is overheating (a startup peak: rolling out to 256 squeezed
+# healthz, §11 — 834–873 MiB): throttling gives the GC/scavenger time to
+# return memory 50 MiB before an OOM kill of slots. Growth of
+# memory.events `high` in the working zone is normal; `oom`/`oom_kill` and
+# NRestarts are not: the unit_oom alert watches them
+# (internal/monitor/unitevents.go, T-145).
 MemoryHigh=850M
 MemoryMax=900M
-# CPU-приоритет (T-158): критический путь конвейера. Замер §12: PSI CPU
-# some 91–95%, load 25/4 vCPU — postgres (177%), chromium (140%) и
-# analyzer (66%) отбирали CPU у проверки: http-worker получал ~90%
-# одного ядра. Вес 1000 против дефолта 100 отдаёт спорный CPU узкому
-# месту конвейера (HTTP-этап — load-measurements §3); вес — не потолок,
-# действует только при конкуренции.
+# CPU priority (T-158): a critical path of the pipeline. §12 measurement:
+# PSI CPU some 91–95%, load 25/4 vCPU — postgres (177%), chromium (140%)
+# and analyzer (66%) took CPU from the check: http-worker got ~90% of one
+# core. Weight 1000 vs the default 100 gives the contested CPU to the
+# pipeline's narrow spot (the HTTP stage — load-measurements §3); a weight
+# is not a cap, it acts only under contention.
 CPUWeight=1000
-# http.concurrency 2000 — по соединению на проверку; nofile как в
-# dev-окружении, sysctl (ip_local_port_range, conntrack) — T-088.
+# http.concurrency 2000 — one connection per check; nofile as in the dev
+# environment; the sysctls (ip_local_port_range, conntrack) — T-088.
 LimitNOFILE=65535
 UMask=0007
-# --- Изоляция (ТЗ §9/§10.1) ---
+# --- Isolation (spec §9/§10.1) ---
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
-# Пак-файлы контента пишет в общий с render-worker каталог (группа crawler,
-# setgid-каталог — права новых файлов остаются в группе).
+# It writes content pack files into the directory shared with render-worker
+# (the crawler group, a setgid directory — new files keep group ownership).
 ReadWritePaths=/var/lib/crawler/content
 ProtectHome=yes
 ProtectKernelTunables=yes

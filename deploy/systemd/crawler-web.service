@@ -1,31 +1,35 @@
-# Domain Crawler — web: публичный лендинг (этап 13, T-121…T-124).
-# web.listen — публичный порт системы для посетителей: наружу сервис
-# публикует reverse-proxy с TLS (первый образец — deploy/nginx/),
-# сам держит loopback (дефолт конфига 127.0.0.1:8080). Метрики и пробы
-# — METRICS_ADDR на loopback (127.0.0.1:9107, как у остальных юнитов):
-# наружу не выставляется ничего, кроме лендинга (ТЗ §9); операторский
-# дашборд — отдельный юнит crawler-dashboard со своим слушателем.
-# MemoryMax — строка бюджета «Go-сервисы» (ТЗ 3.2), раскладка —
-# docs/deploy.md: живые проверки формы гонят полный конвейер checker
-# (T-123: DNS → HTTP с телами страниц → рендер → анализ), поэтому 256M,
-# а не 128M «лёгких» юнитов без сетевых буферов. С T-220 конвейер
-# работает на одном долгоживущем контуре (цепь резолверов с малым
-# пулом UDP ≈ 48 fd на сервис, общий Fetcher, один render.Manager),
-# одновременность режет web.live_concurrency (перегруз — быстрый 503,
-# не очередь до web.timeout): параллельные проверки больше не множат
-# сокеты на каждый запрос и не исчерпывают LimitNOFILE вместе с
+# Domain Crawler — web: the public landing page (stage 13, T-121…T-124).
+# web.listen — the public port of the visitor-facing system: a reverse-proxy
+# with TLS publishes the service externally (the first example —
+# deploy/nginx/), the service itself keeps loopback (the config default
+# 127.0.0.1:8080). Metrics and probes — METRICS_ADDR on loopback
+# (127.0.0.1:9107, like the other units): nothing but the landing page is
+# exposed externally (spec §9); the operator dashboard is a separate unit,
+# crawler-dashboard, with its own listener.
+# MemoryMax — the "Go services" budget line (spec 3.2); breakdown —
+# docs/deploy.md: live form checks drive the full checker pipeline
+# (T-123: DNS → HTTP with page bodies → render → analysis), hence 256M,
+# not the 128M of the "light" units without network buffers. Since T-220
+# the pipeline runs on a single long-lived circuit (a resolver chain with a
+# small UDP pool ≈ 48 fd per service, a shared Fetcher, one render.Manager),
+# concurrency is cut by web.live_concurrency (overload — a quick 503, not a
+# queue up to web.timeout): parallel checks no longer multiply sockets per
+# request and no longer exhaust LimitNOFILE together with
 # /healthz.
-# Вариант unix-сокета вместо TCP (по месту деплоя): CRAWLER_WEB_LISTEN=
-# /run/crawler-web/web.sock в crawler.env + proxy_pass
-# http://unix:/run/crawler-web/web.sock в nginx — RuntimeDirectory ниже
-# создаёт каталог в /run (ProtectSystem=strict остальное запрещает).
+# A unix socket instead of TCP (depends on the deployment site):
+# CRAWLER_WEB_LISTEN=
+# /run/crawler-web/web.sock in crawler.env + proxy_pass
+# http://unix:/run/crawler-web/web.sock in nginx — the RuntimeDirectory
+# below creates the directory in /run (ProtectSystem=strict forbids the
+# rest).
 
 [Unit]
-Description=Domain Crawler — web (публичный лендинг)
+Description=Domain Crawler — web (public landing page)
 PartOf=crawler.target
-# Комментарий о After/Wants без Requires — crawler-ingest.service.
-# crawler-chromium — только порядок: живой проверке формы нужен CDP
-# (render.remote_url), без браузера лендинг и stored-данные работают.
+# For the After/Wants without Requires rationale, see crawler-ingest.service.
+# crawler-chromium — ordering only: a live form check needs CDP
+# (render.remote_url); without the browser the landing page and stored data
+# work.
 After=network-online.target crawler-chromium.service postgresql.service redis-server.service unbound.service
 Wants=network-online.target
 StartLimitIntervalSec=300
@@ -36,10 +40,12 @@ Type=simple
 User=crawler-web
 Group=crawler
 EnvironmentFile=/etc/crawler/crawler.env
-# Loopback-страховка адреса метрик: env важнее YAML (см. шапку юнита).
+# Loopback guard for the metrics address: env beats YAML (see the unit
+# header).
 Environment=METRICS_ADDR=127.0.0.1:9107
-# Публичный адрес не фиксируется: web.listen из конфига (loopback под
-# nginx); смена — CRAWLER_WEB_LISTEN в crawler.env (TCP или unix-сокет).
+# The public address is not pinned: web.listen from the config (loopback
+# behind nginx); to change it — CRAWLER_WEB_LISTEN in crawler.env (TCP or a
+# unix socket).
 RuntimeDirectory=crawler-web
 WorkingDirectory=/var/lib/crawler
 SyslogIdentifier=crawler-web
@@ -48,13 +54,13 @@ Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=30s
 MemoryMax=256M
-# CPU-приоритет (T-158): обвязка — лендинг и разовые живые проверки
-# формы не конкурент массовому конвейеру при CPU-голоде (§12: PSI some
-# 91–95%); вес 50 против 1000 у критического пути.
+# CPU priority (T-158): a supporting service — the landing page and one-off
+# live form checks are no match for the mass pipeline under CPU starvation
+# (§12: PSI some 91–95%); weight 50 vs 1000 for the critical path.
 CPUWeight=50
 LimitNOFILE=65535
 UMask=0007
-# --- Изоляция (ТЗ §9/§10.1) ---
+# --- Isolation (spec §9/§10.1) ---
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict

@@ -1,19 +1,20 @@
-# Domain Crawler — ресайкл Chromium (render): плановый рестарт юнита
-# crawler-chromium раз в 2 ч, запускается таймером
-# crawler-chromium-recycle.timer (T-208; на боевом сервере установлен
-# 29.10 в окне дренажа T-198, перенесён в комплект). В remote-режиме —
-# по умолчанию боевого деплоя — воркер не может перезапустить чужой
-# браузер (T-065): без ресайкла процесс копит память (400→950+ МиБ
-# за ~2 ч) и деградирует — таймауты рендера удваиваются; замер 29.10:
-# после ресайкла вдвое ниже, 227→110. Рестарт прерывает идущие рендеры
-# (<1 мин) — доставки вернутся клеймом (идемпотентность ТЗ 3.4), воркер
-# переживает паузу потребления при мёртвом браузере (docs/render.md).
-# Обоснование и установка — docs/deploy.md §2.2.
-# PartOf гасит юнит вместе с набором: после stop crawler.target
-# незавершённый ресайкл не продолжится (T-215).
+# Domain Crawler — Chromium recycle (render): a scheduled restart of the
+# crawler-chromium unit every 2 h, driven by the
+# crawler-chromium-recycle.timer timer (T-208; installed on the production
+# server Oct 29 in the drain window of T-198, moved into the set). In
+# remote mode — the production deploy default — the worker cannot restart
+# a foreign browser process (T-065): without recycle the process
+# accumulates memory (400→950+ MiB over ~2 h) and degrades — render
+# timeouts double; the Oct 29 measurement: after recycle they are twice as
+# low, 227→110. The restart interrupts in-flight renders (<1 min) —
+# deliveries return via claim (idempotency, spec 3.4), and the worker
+# survives the consumption pause with a dead browser (docs/render.md).
+# Rationale and installation — docs/deploy.md §2.2.
+# PartOf stops the unit together with the set: after stop crawler.target
+# an unfinished recycle does not continue (T-215).
 
 [Unit]
-Description=Ресайкл crawler-chromium (дренаж рендер-долга T-198)
+Description=Recycle of crawler-chromium (render debt drain T-198)
 PartOf=crawler.target
 
 [Service]

@@ -1,15 +1,16 @@
-# Domain Crawler — групповая цель всех сервисов приложения (ТЗ 4.1).
-# Сервисы привязаны PartOf= к этой цели: `systemctl stop crawler.target`
-# останавливает весь набор разом (в graceful-порядке юнитов), restart —
-# перезапускает. Пара ресайкла chromium (T-215): таймер входит в цель
-# enable-симлинком (WantedBy=crawler.target), сервис поднимается таймером;
-# оба юнита PartOf= (в список Wants выше не включены).
-# Инфраструктура (postgresql/redis/unbound — пакеты ОС,
-# см. drop-in'ы рядом) в цель не входит: у них свой жизненный цикл пакета.
-# Установка и включение — docs/deploy.md (ТЗ 10.1).
+# Domain Crawler — the group target of all application services (spec 4.1).
+# The services are bound to this target with PartOf=: `systemctl stop
+# crawler.target` stops the whole set at once (in the graceful order of the
+# units), restart restarts them. The chromium recycle pair (T-215): the
+# timer joins the target with an enable symlink (WantedBy=crawler.target),
+# the service is brought up by the timer; both units are PartOf= (not in
+# the Wants list above).
+# Infrastructure (postgresql/redis/unbound — OS packages, see the drop-ins
+# alongside) is not part of the target: it has the package's own lifecycle.
+# Installation and enabling — docs/deploy.md (spec 10.1).
 
 [Unit]
-Description=Domain Crawler — все сервисы приложения
+Description=Domain Crawler — all application services
 Wants=crawler-chromium.service
 Wants=crawler-ingest.service
 Wants=crawler-scheduler.service

@@ -1,21 +1,23 @@
-# Domain Crawler — Chromium headless-shell для render-worker (CDP на
-# 127.0.0.1:9222). ТЗ 3.2: строка бюджета отдельная — «Chromium (рендер,
-# cgroup MemoryMax) ≈ 2 ГБ»; ТЗ 10.1: Chromium — отдельный пакет/каталог
-# (не пакет ОС, а дистрибутив headless-shell в /opt/crawler/chromium —
-# та же сборка, что в образе chromedp/headless-shell dev/dev-runtime
-# окружения, версия — CHROMEDP_HEADLESS_IMAGE в .env.example).
+# Domain Crawler — Chromium headless-shell for the render-worker (CDP on
+# 127.0.0.1:9222). Spec 3.2: a separate budget line — "Chromium (render,
+# cgroup MemoryMax) ≈ 2 GB"; spec 10.1: Chromium is a separate
+# package/directory (not an OS package but the headless-shell distribution
+# in /opt/crawler/chromium — the same build as in the chromedp/headless-shell
+# image of the dev/dev-runtime environment; the version —
+# CHROMEDP_HEADLESS_IMAGE in .env.example).
 #
-# Отдельный юнит, а не процесс воркера (render.remote_url пуст = собственный
-# процесс): у Chromium своя cgroup с потолком 2 ГБ — OOM внутри браузера
-# (отдельная вкладка/процесс рендера) убивается ядром в пределах этой
-# cgroup и перезапускается systemd'ом, не затрагивая воркер и остальные
-# сервисы; рестарты по числу страниц изнутри воркера (T-065) в remote-режиме
-# не работают (чужой процесс) — потолок и рестарт держит этот юнит
-# (аналогия mem_limit dev-сервиса chromium, docs/render.md, docs/deploy.md).
+# A separate unit, not a worker process (empty render.remote_url = own
+# process): Chromium gets its own cgroup with a 2 GB cap — an OOM inside
+# the browser (a separate tab/render process) is killed by the kernel
+# within that cgroup and restarted by systemd, without touching the worker
+# and the other services; per-page restarts from inside the worker (T-065)
+# do not work in remote mode (a foreign process) — the cap and the restart
+# are owned by this unit (an analogy of the mem_limit of the dev chromium
+# service, docs/render.md, docs/deploy.md).
 #
-# --no-sandbox обязателен: непривилегированный пользователь без
-# user-namespace sandbox (тот же флаг передаёт воркер в локальном режиме,
-# internal/render). Слушает только loopback — CDP не наружу (ТЗ §9).
+# --no-sandbox is mandatory: an unprivileged user without a user-namespace
+# sandbox (the worker passes the same flag in local mode, internal/render).
+# Listens on loopback only — CDP is not exposed (spec §9).
 
 [Unit]
 Description=Domain Crawler — Chromium (headless-shell, CDP 127.0.0.1:9222)
@@ -34,21 +36,22 @@ ExecStart=/opt/crawler/chromium/headless-shell --remote-debugging-address=127.0.
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=15s
-# ТЗ 3.2: бюджет Chromium ≈ 2 ГБ (потолок выше бюджета не нужен: воркер
-# в отдельной cgroup, это потолок только браузера; сопоставимо
-# с MEM_CHROMIUM/MEM_RENDER dev-окружения).
+# Spec 3.2: the Chromium budget is ≈ 2 GB (a cap above the budget is not
+# needed: the worker is in a separate cgroup, this caps only the browser;
+# comparable to MEM_CHROMIUM/MEM_RENDER of the dev environment).
 MemoryMax=2048M
 LimitNOFILE=65535
 UMask=0007
-# --- Изоляция (ТЗ §9/§10.1) ---
-# Набор мягче, чем у Go-сервисов: V8 требует исполняемую память JIT
-# (MemoryDenyWriteExecute сломал бы JS), network change listener браузера
-# общается через AF_NETLINK. Остальное — как у сервисов.
+# --- Isolation (spec §9/§10.1) ---
+# The set is softer than for the Go services: V8 requires executable memory
+# for the JIT (MemoryDenyWriteExecute would break JS), and the browser's
+# network change listener talks over AF_NETLINK. The rest — as for the
+# services.
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
-# Служебный профиль браузера (страницы задач живут в изолированных
-# контекстах CDP и его не касаются — docs/render.md).
+# The browser's service profile (task pages live in isolated CDP contexts
+# and never touch it — docs/render.md).
 ReadWritePaths=/var/lib/crawler/chromium
 ProtectHome=yes
 ProtectKernelTunables=yes

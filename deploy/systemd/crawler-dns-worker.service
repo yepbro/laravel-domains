@@ -1,16 +1,17 @@
-# Domain Crawler — dns-worker: DNS-проверка апекса и субдоменов (ТЗ 5.4).
-# MemoryMax — строка бюджета «Go-сервисы ≈ 1,3 ГБ» (ТЗ 3.2), раскладка —
-# docs/deploy.md §2 (сумма потолков девяти юнитов — 2308M): dns-worker
-# единственный из «лёгких» держит пул UDP-сокетов (dns.udp_pool_size
-# 2000) + буферы обменов + TTL-кэш резолвов. Потолок поднят 256M → 384M
-# по замеру §12 (T-160): на ≈47 млн доменов воркер периодически упирался
-# в 256 MiB (в §6 на смеси ru/rf/su max был 141 MiB), запас — из
+# Domain Crawler — dns-worker: the DNS check of the apex and subdomains
+# (spec 5.4). MemoryMax — the "Go services ≈ 1.3 GB" budget line (spec 3.2);
+# breakdown — docs/deploy.md §2 (the sum of the nine units' caps is 2308M):
+# of the "light" services dns-worker is the only one holding a pool of UDP
+# sockets (dns.udp_pool_size 2000) + exchange buffers + a TTL cache of
+# resolutions. The cap was raised 256M → 384M per the §12 measurement
+# (T-160): on ≈47M domains the worker periodically pressed against 256 MiB
+# (in §6 on a ru/rf/su mix the max was 141 MiB); the headroom comes from
 # MemAvailable 2.6 GiB.
 
 [Unit]
-Description=Domain Crawler — dns-worker (DNS-проверка)
+Description=Domain Crawler — dns-worker (DNS check)
 PartOf=crawler.target
-# Комментарий о After/Wants без Requires — crawler-ingest.service.
+# For the After/Wants without Requires rationale, see crawler-ingest.service.
 After=network-online.target postgresql.service redis-server.service unbound.service
 Wants=network-online.target
 StartLimitIntervalSec=300
@@ -29,17 +30,18 @@ Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=30s
 MemoryMax=384M
-# CPU-приоритет (T-158): критический путь конвейера — питает q:http
-# (в замере §12 при PSI some 91–95% проверка получала ~90% одного ядра
-# против postgres 177% + chromium 140% + analyzer 66%). Вес 1000 как у
-# http-worker: DNS-этап не должен отставать от HTTP, иначе конвейер
-# душится сверху (backpressure q:http, load-measurements §3).
+# CPU priority (T-158): a critical path of the pipeline — it feeds q:http
+# (in the §12 measurement, at PSI some 91–95%, the check got ~90% of one
+# core vs postgres 177% + chromium 140% + analyzer 66%). Weight 1000, like
+# http-worker: the DNS stage must not lag behind HTTP, otherwise the
+# pipeline is throttled from above (backpressure of q:http,
+# load-measurements §3).
 CPUWeight=1000
-# 2000 сокетов пула UDP + TTL-кэш резолвера: nofile как в dev-окружении
-# (deploy/docker/compose.yaml), sysctl-потолки — T-088.
+# 2000 UDP pool sockets + the resolver's TTL cache: nofile as in the dev
+# environment (deploy/docker/compose.yaml); the sysctl caps — T-088.
 LimitNOFILE=65535
 UMask=0007
-# --- Изоляция (ТЗ §9/§10.1) ---
+# --- Isolation (spec §9/§10.1) ---
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict

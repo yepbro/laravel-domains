@@ -1,13 +1,13 @@
-# Domain Crawler — analyzer: поиск Laravel по правилам (ТЗ 5.8).
-# MemoryMax — строка бюджета «Go-сервисы ≈ 1,3 ГБ» (ТЗ 3.2), раскладка —
-# docs/deploy.md. Правила читает из /etc/crawler/rules (RO — ProtectSystem),
-# перезагрузка без рестарта: systemctl kill -s HUP crawler-analyzer
+# Domain Crawler — analyzer: Laravel discovery by rules (spec 5.8).
+# MemoryMax — the "Go services ≈ 1.3 GB" budget line (spec 3.2); breakdown in
+# docs/deploy.md. Reads rules from /etc/crawler/rules (RO — ProtectSystem),
+# reload without restart: systemctl kill -s HUP crawler-analyzer
 # (Options.OnSIGHUP, docs/services.md).
 
 [Unit]
-Description=Domain Crawler — analyzer (поиск Laravel)
+Description=Domain Crawler — analyzer (Laravel discovery)
 PartOf=crawler.target
-# Комментарий о After/Wants без Requires — crawler-ingest.service.
+# For the After/Wants without Requires rationale, see crawler-ingest.service.
 After=network-online.target postgresql.service redis-server.service unbound.service
 Wants=network-online.target
 StartLimitIntervalSec=300
@@ -26,25 +26,25 @@ Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=30s
 MemoryMax=128M
-# CPU-приоритет (T-158): фоновый анализ не должен отбирать CPU у
-# проверки — analyzer держал 66% CPU при живом конвейере и PSI some
-# 91–95% (§12). Вес 200 + абсолютная квота 1,5 ядра: текущую работу
-# не режет (66% < 150%), ограничивает всплески фоновых проходов по
-# накопленному контенту.
+# CPU priority (T-158): background analysis must not take CPU away from
+# the check — analyzer held 66% CPU with the pipeline live and PSI some
+# 91–95% (§12). Weight 200 + a hard quota of 1.5 cores: it does not cut
+# current work (66% < 150%), it limits bursts of background passes over
+# the accumulated content.
 CPUWeight=200
 CPUQuota=150%
 LimitNOFILE=65535
 UMask=0007
-# --- Изоляция (ТЗ §9/§10.1) ---
+# --- Isolation (spec §9/§10.1) ---
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
-# Хранилище контента: читает паки, но берёт и общий flock .packs.lock
-# (O_RDWR — защита от ротации во время чтения, internal/content) — каталог
-# обязан быть доступен на запись группе crawler (T-135: без этого юнит
-# падал permission denied на открытии lock).
+# Content store: it reads packs, but also takes the shared flock .packs.lock
+# (O_RDWR — protection against rotation during reads, internal/content) — the
+# directory must be writable by the crawler group (T-135: without this the
+# unit failed with permission denied on opening the lock).
 ReadWritePaths=/var/lib/crawler/content
-# Правила читает из /etc/crawler/rules (RO под strict), ничего не пишет.
+# It reads rules from /etc/crawler/rules (RO under strict) and writes nothing.
 ProtectHome=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes

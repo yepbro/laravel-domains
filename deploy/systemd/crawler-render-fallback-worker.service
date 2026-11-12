@@ -1,53 +1,54 @@
-# Domain Crawler — render-fallback-worker (воркер B): доработка на
-# Chromium задач, не прошедших рендер на основном движке (ТЗР этапа 35
-# §4.5, T-240; очередь q:render-fallback — T-237). Тот же бинарник, что
-# crawler-render-worker.service: сборка отличается стримом потребления —
-# RENDER_WORKER_STREAM=q:render-fallback (параметр запуска, как
-# METRICS_ADDR; стрим потребления — параметр сборки воркера, не поля
-# конфигурации, ТЗ §4.1 п.3). Группа — каноническая пара стрима
-# (queue.WorkingGroups): render-fallback-worker, отдельная от основной
-# render-worker — доставки q:render-fallback не делятся с основным
-# конвейером.
+# Domain Crawler — render-fallback-worker (worker B): finishing on
+# Chromium the tasks that failed rendering on the primary engine (render
+# spec stage 35 §4.5, T-240; the q:render-fallback queue — T-237). The same
+# binary as crawler-render-worker.service: the build differs in the
+# consumption stream — RENDER_WORKER_STREAM=q:render-fallback (a run
+# parameter, like METRICS_ADDR; the consumption stream is a build-time
+# parameter of the worker, not a configuration field, spec §4.1 item 3).
+# The group is the stream's canonical pair (queue.WorkingGroups):
+# render-fallback-worker, separate from the primary render-worker —
+# q:render-fallback deliveries are not shared with the main pipeline.
 #
-# Темп (ФТ-13): render.fallback.worker_rate записей за скользящее окно
-# 1 мин (renderworker.RateWindow) из общего /etc/crawler/config.yaml —
-# батч-режим «собрать и доработать» без наращивания chromium-мощности;
-# действует и при выключенном фолбэке (накопленное дорабатывается до
-# пуста, ФТ-14). Воркер B фолбэк не публикует (рекурсия запрещена,
-# ФТ-10 — publishFallback отсекает по стриму потребления).
+# The rate (FR-13): render.fallback.worker_rate records over a sliding
+# 1 min window (renderworker.RateWindow) from the shared
+# /etc/crawler/config.yaml — a batch mode of "collect and finish" without
+# adding chromium capacity; it also acts while the fallback is off (the
+# accumulated backlog is finished down to empty, FR-14). Worker B does not
+# publish to the fallback (recursion is forbidden, FR-10 — publishFallback
+# filters by the consumption stream).
 #
-# Chromium: общий с основным воркером — render.remote_url из crawler.env
-# (ws://127.0.0.1:9222, юнит crawler-chromium.service; перезапуск изнутри
-# воркера в remote-режиме невозможен — потолок держит MemoryMax юнита
-# chromium). Движок за сборкой B закреплён юнит-локальным
-# EnvironmentFile ниже (render-fallback-worker.env, ПОСЛЕ общего
-# crawler.env — важнее): при переводе основного воркера на движка-
-# кандидата (правка render.engine/remote_url в общем конфиге/окружении,
-# T-248/T-249) воркер B обязан остаться на chromium — рекурсивный
-# фолбэк запрещён (ФТ-10), метрики сборок не смешиваются
-# (crawler_render_records_total{engine}). Ресайкл-пара T-208
-# (crawler-chromium-recycle.timer)
-# применима КАК ЕСТЬ, новых файлов не нужно: ExecStart ресайкл-сервиса
-# перезапускает именно crawler-chromium.service — общий браузер обоих
-# воркеров; собственная пара воркеру B не требуется (локального
-# headless-shell в нативном деплое нет — это режим docker-runtime,
-# сервис render-fallback профиля runtime в deploy/docker/compose.yaml,
-# где перезапуски делает сам воркер, T-065).
+# Chromium: shared with the primary worker — render.remote_url from
+# crawler.env (ws://127.0.0.1:9222, the crawler-chromium.service unit; a
+# restart from inside the worker is impossible in remote mode — the cap is
+# held by the chromium unit's MemoryMax). The engine behind build B is
+# pinned by the unit-local EnvironmentFile below (render-fallback-worker.env,
+# AFTER the shared crawler.env — it wins): when the primary worker is moved
+# to the candidate engine (editing render.engine/remote_url in the shared
+# config/environment, T-248/T-249), worker B must stay on chromium — a
+# recursive fallback is forbidden (FR-10), and the builds' metrics are not
+# mixed (crawler_render_records_total{engine}). The recycle pair of T-208
+# (crawler-chromium-recycle.timer) applies AS IS, no new files needed: the
+# recycle service's ExecStart restarts exactly crawler-chromium.service —
+# the browser shared by both workers; worker B needs no pair of its own
+# (there is no local headless-shell in the native deploy — that is the
+# docker-runtime mode, the render-fallback service of the runtime profile
+# in deploy/docker/compose.yaml, where the worker does the restarts itself,
+# T-065).
 #
-# Порт метрик 9120 (S-P2-3): 9101–9108 заняты комплектом, 9109+ —
-# диапазон экземпляров render-worker@ (§2.2); порт вынесен из зоны
-# естественного роста экземпляров (9109, 9110, 9111, …), чтобы
-# масштабирование на следующий свободный порт не натыкалось на воркера
-# B — crawler-render-worker@9120 не запускать (коллизия bind).
-# Не входит в enable-список комплекта (§4.6): включение — осознанный шаг
-# ввода фолбэка (строка бюджета §2 +256M, +5 соединений пула БД — §4.5);
-# до готовности канарейки может работать по пустой очереди — проверка
-# проводки (ТЗ §4.5 п.3).
+# The metrics port 9120 (S-P2-3): 9101–9108 are taken by the set, 9109+ is
+# the render-worker@ instance range (§2.2); the port is placed outside the
+# natural instance growth zone (9109, 9110, 9111, …) so that scaling to the
+# next free port does not collide with worker B — do not start
+# crawler-render-worker@9120 (a bind collision).
+# Not in the set's enable list (§4.6): enabling it is a deliberate step of
+# introducing the fallback (the §2 budget line +256M, +5 DB pool
+# connections — §4.5); until the canary is ready it may run on an empty
+# queue — the wiring check (spec §4.5 item 3).
 
 [Unit]
-Description=Domain Crawler — render-fallback-worker (воркер B: доработка фолбэка на Chromium)
+Description=Domain Crawler — render-fallback-worker (worker B: fallback finishing on Chromium)
 PartOf=crawler.target
-# Комментарий о After/Wants без Requires — crawler-ingest.service.
+# For the After/Wants without Requires rationale, see crawler-ingest.service.
 After=network-online.target crawler-chromium.service postgresql.service redis-server.service unbound.service
 Wants=network-online.target crawler-chromium.service
 StartLimitIntervalSec=300
@@ -55,28 +56,29 @@ StartLimitBurst=10
 
 [Service]
 Type=simple
-# Отдельный пользователь по правилу «один на сервис» (ТЗ §10.1, §3):
-# воркер B — другой логический сервис (свой стрим/группа), а не
-# экземпляр шаблона render-worker@ (те делят пользователя основного
-# воркера — масштабирование одного сервиса).
+# A separate user per the "one per service" rule (spec §10.1, §3): worker B
+# is a different logical service (its own stream/group), not an instance of
+# the render-worker@ template (those share the primary worker's user —
+# scaling a single service).
 User=crawler-render-fallback-worker
 Group=crawler
 EnvironmentFile=/etc/crawler/crawler.env
-# Закрепление chromium за сборкой B (ТЗ §4.5 п.1): юнит-локальный файл
-# читается ПОСЛЕ общего crawler.env — одноимённые переменные важнее
-# (приоритет поздних EnvironmentFile, как per-instance файл у
-# crawler-render-worker@.service). Содержимое (установка —
-# docs/deploy.md §2.3):
+# Pinning chromium to build B (spec §4.5 item 1): the unit-local file is
+# read AFTER the shared crawler.env — same-named variables win (the
+# priority of later EnvironmentFiles, like the per-instance file of
+# crawler-render-worker@.service). Contents (installation — docs/deploy.md
+# §2.3):
 #   CRAWLER_RENDER_ENGINE=chromium
-#   CRAWLER_RENDER_REMOTE_URL=ws://127.0.0.1:9222   # только когда общий
-#   # crawler.env переведён на движка-кандидата или второй Chromium
-#   # (:9223) — возвращает B к chromium основного юнита.
-# «-»: до включения фолбэка юнит стартует и без файла (движок тогда
-# наследуется из общего конфига — базовое поведение без канарейки).
+#   CRAWLER_RENDER_REMOTE_URL=ws://127.0.0.1:9222   # only when the shared
+#   # crawler.env has been moved to the candidate engine or a second
+#   # Chromium (:9223) — it returns B to the primary unit's chromium.
+# The "-": before the fallback is enabled the unit starts even without the
+# file (the engine is then inherited from the shared config — the base
+# behavior without the canary).
 EnvironmentFile=-/etc/crawler/render-fallback-worker.env
 Environment=METRICS_ADDR=127.0.0.1:9120
-# Сборка воркера B (ФТ-12): стрим потребления q:render-fallback; группа
-# выводится канонической парой стрима (render-fallback-worker).
+# Worker B build (FR-12): the consumption stream q:render-fallback; the
+# group is derived as the stream's canonical pair (render-fallback-worker).
 Environment=RENDER_WORKER_STREAM=q:render-fallback
 WorkingDirectory=/var/lib/crawler
 SyslogIdentifier=crawler-render-fallback-worker
@@ -85,21 +87,22 @@ Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=30s
 MemoryMax=256M
-# Как у основного render-worker (замер T-092 §6, T-169): DOM в полёте ≤
-# render.contexts × content.max_store_bytes + буферы pgx/очереди; темп
-# воркера B ниже, потолок оставлен с запасом — контроль после деплоя:
-# memory.events oom=0, NRestarts 0 (бюджет — docs/deploy.md §2/§2.3).
-# CPU-приоритет (T-158): этап конвейера с потолком темпа — вес 300, как
-# у основного воркера; тяжёлый CPU рендера живёт в chromium (отдельная
-# cgroup на дефолте 100).
+# Same as the primary render-worker (the T-092 §6 measurement, T-169): DOM
+# in flight ≤ render.contexts × content.max_store_bytes + pgx/queue
+# buffers; worker B's rate is lower, the cap is left with headroom — the
+# post-deploy check: memory.events oom=0, NRestarts 0 (the budget —
+# docs/deploy.md §2/§2.3).
+# CPU priority (T-158): a pipeline stage with a rate cap — weight 300, like
+# the primary worker; the render's heavy CPU lives in chromium (a separate
+# cgroup at the default 100).
 CPUWeight=300
 LimitNOFILE=65535
 UMask=0007
-# --- Изоляция (ТЗ §9/§10.1) ---
+# --- Isolation (spec §9/§10.1) ---
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
-# Заменяет HTML на DOM в общем с http-worker хранилище контента.
+# It replaces HTML with DOM in the content store shared with http-worker.
 ReadWritePaths=/var/lib/crawler/content
 ProtectHome=yes
 ProtectKernelTunables=yes

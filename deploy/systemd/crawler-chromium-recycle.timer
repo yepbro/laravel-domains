@@ -1,19 +1,20 @@
-# Domain Crawler — таймер ресайкла Chromium (T-208): раз в 2 ч запускает
-# crawler-chromium-recycle.service (рестарт crawler-chromium; пара
-# установлена на боевом сервере 29.10 в окне T-198, перенесена в
-# комплект). Период — по замеру деградации 29.10 (~2 ч, шапка
-# crawler-chromium-recycle.service); первый запуск через 30 мин после
-# активации таймера (OnActiveSec) — после старта браузер свежий и в
-# ресайкле не нуждается. Обоснование и установка — docs/deploy.md §2.2.
+# Domain Crawler — Chromium recycle timer (T-208): every 2 h it starts
+# crawler-chromium-recycle.service (a restart of crawler-chromium; the pair
+# was installed on the production server Oct 29 in the T-198 window and
+# moved into the set). The period follows the Oct 29 degradation
+# measurement (~2 h, the header of crawler-chromium-recycle.service); the
+# first run comes 30 min after the timer is activated (OnActiveSec) — right
+# after the start the browser is fresh and needs no recycle. Rationale and
+# installation — docs/deploy.md §2.2.
 #
-# Жизненный цикл — вместе с набором (T-215): PartOf=crawler.target гасит
-# таймер при остановке набора — очередной тик (раз в 2 ч) не запустит
-# остановленный chromium; WantedBy=crawler.target (enable-симлинк в
-# crawler.target.wants/) возвращает таймер при старте набора: PartOf
-# транслирует только stop/restart, не start.
+# Lifecycle — together with the set (T-215): PartOf=crawler.target stops
+# the timer when the set is stopped — the next tick (every 2 h) will not
+# start the stopped chromium; WantedBy=crawler.target (the enable symlink
+# in crawler.target.wants/) brings the timer back when the set starts:
+# PartOf only propagates stop/restart, not start.
 
 [Unit]
-Description=Таймер ресайкла crawler-chromium каждые 2 ч
+Description=crawler-chromium recycle timer every 2 h
 PartOf=crawler.target
 
 [Timer]
