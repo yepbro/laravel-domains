@@ -1,11 +1,13 @@
-// Тесты триажа мутантов CI-прогона 09.11.2026 (половина A): добивки
-// zonestats.go — ошибки Scan/rows.Err каждого читателя и писателя
-// (строки не той ширины, деградированные наборы), нулевые значения на
-// ошибках, сбой Begin/Commit, счётчики-мISMATCH перезаписей, суммы
-// FILTER-колонок по нескольким зонам, заполнение «Old := New» для
-// отсутствующих корзин, дрейф-отчёт (тишина без дрейфа, ровно пять
-// строк топа, точная сумма), Histорgram-корзины метрик цикла и
-// пред-отменённый ctx стартового прохода (gauge «статус повис»).
+// The triage tests of the mutants of the CI run of Nov 09 2026 (half A):
+// the finishing work on zonestats.go — the Scan/rows.Err errors of each
+// reader and writer
+// (rows of the wrong width, degraded sets), zero values on
+// errors, a Begin/Commit failure, the write count mismatches, the sums
+// of the FILTER columns over several zones, the "Old := New" fill-in for
+// absent baskets, the drift report (silence without drift, exactly five
+// top lines, the exact sum), the histogram buckets of the loop metrics
+// and the pre-cancelled ctx of the starting pass (the "status hung"
+// gauge).
 package monitor
 
 import (
@@ -19,16 +21,16 @@ import (
 	"crawler/internal/metrics"
 )
 
-// zsLogger — текстовый логгер цикла в буфер (уровень Debug).
+// zsLogger — the loop's text logger into a buffer (the Debug level).
 func zsLogger(buf *zonestatsSyncBuf) *slog.Logger {
 	return slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 }
 
-// TestZoneStatsScanErrors — ошибка Scan каждой позиции прохода (строка
-// не той ширины) обёрнута контекстом шага; проход падает.
+// TestZoneStatsScanErrors — a Scan error of each pass position (a row
+// of the wrong width) is wrapped with the step context; the pass fails.
 func TestZoneStatsScanErrors(t *testing.T) {
-	// Шаги с «узкой» строкой: Scan каждого читателя/писателя обязан
-	// провалиться и уронить проход с контекстом «чтение».
+	// The steps with a "narrow" row: the Scan of each reader/writer must
+	// fail and fail the pass with the "reading" context.
 	for _, tc := range []struct {
 		name string
 		step int
@@ -65,12 +67,13 @@ func TestZoneStatsScanErrors(t *testing.T) {
 	}
 }
 
-// TestZoneStatsRowsErr — rows.Err после прочитанной строки роняет
-// читателя с контекстом шага (обрыв соединения — не «строки нет»);
-// пустой ответ скалярных агрегатов истории/часовых корзин — обрыв
-// протокола.
+// TestZoneStatsRowsErr — rows.Err after a read row fails the
+// reader with the step context (a connection break is not "the row is
+// missing");
+// an empty answer of the scalar history/hourly basket aggregates — a
+// protocol break.
 func TestZoneStatsRowsErr(t *testing.T) {
-	// Строка есть, после неё — ошибка итерации.
+	// A row exists, an iteration error follows it.
 	rowErr := func(row []any) *zonestatsFakeRows {
 		return &zonestatsFakeRows{rows: [][]any{row}, err: errors.New("обрыв соединения")}
 	}
@@ -105,8 +108,8 @@ func TestZoneStatsRowsErr(t *testing.T) {
 			}
 		})
 	}
-	// Пустой ответ скалярного агрегата (история/часовые корзины без
-	// GROUP BY обязаны отвечать строкой) — обрыв протокола.
+	// An empty answer of a scalar aggregate (history/hourly baskets
+	// without GROUP BY must answer with a row) — a protocol break.
 	for _, tc := range []struct {
 		name string
 		step int
@@ -131,10 +134,10 @@ func TestZoneStatsRowsErr(t *testing.T) {
 	}
 }
 
-// TestZoneStatsWriteCountMismatch — RETURNING с недостающими строками
-// роняет перезапись зон/счётчиков (строки обязательны).
+// TestZoneStatsWriteCountMismatch — a RETURNING with missing rows
+// fails the zone/counter overwrite (the rows are mandatory).
 func TestZoneStatsWriteCountMismatch(t *testing.T) {
-	// Две зоны в чтении, RETURNING — одна: «перезаписано 1 из 2».
+	// Two zones in the read, RETURNING — one: "overwritten 1 of 2".
 	steps := stepsOfPass(
 		zoneValsOf(7, 10, 4, 2, 3, 1),
 		zoneValsOf(7, 10, 4, 2, 3, 1),
@@ -146,14 +149,14 @@ func TestZoneStatsWriteCountMismatch(t *testing.T) {
 	steps[12].rows = zonestatsRows(
 		aggRowOf(7, 10, 4, 2, 3, make([]int64, len(statusAggCols)), 0),
 		aggRowOf(9, 2, 2, 0, 0, make([]int64, len(statusAggCols)), 0))
-	steps[16].rows = zonestatsRows(zoneValsOf(7, 10, 4, 2, 3, 1)) // зона 9 потеряна
+	steps[16].rows = zonestatsRows(zoneValsOf(7, 10, 4, 2, 3, 1)) // zone 9 is lost
 	pool := &zonestatsFakePool{steps: steps}
 	if _, err := ZoneStatsOnce(context.Background(), pool, ZoneStatsOptions{}); err == nil ||
 		!strings.Contains(err.Error(), "перезаписано 1 из 2") {
 		t.Errorf("ошибка зон = %v, want «перезаписано 1 из 2»", err)
 	}
 
-	// Upsert счётчиков с неполной легендой — «N из M строк».
+	// A counter upsert with an incomplete legend — "N of M rows".
 	steps2 := stepsOfPass(
 		zoneValsOf(7, 10, 4, 2, 3, 1),
 		zoneValsOf(7, 10, 4, 2, 3, 1),
@@ -169,7 +172,7 @@ func TestZoneStatsWriteCountMismatch(t *testing.T) {
 	}
 }
 
-// TestZoneStatsBeginError — сбой открытия транзакции — ошибка прохода.
+// TestZoneStatsBeginError — a transaction open failure is a pass error.
 func TestZoneStatsBeginError(t *testing.T) {
 	pool := &zonestatsFakePool{beginErr: errors.New("пул исчерпан")}
 	if _, err := ZoneStatsOnce(context.Background(), pool, ZoneStatsOptions{}); err == nil ||
@@ -178,9 +181,9 @@ func TestZoneStatsBeginError(t *testing.T) {
 	}
 }
 
-// TestZoneStatsSumsMultipleZones — значения суточных строк и корзин —
-// СУММЫ FILTER-колонок по всем зонам (мутанты присваивания теряли все,
-// кроме последней зоны).
+// TestZoneStatsSumsMultipleZones — the values of the daily rows and the
+// baskets are the SUMS of the FILTER columns over all zones (assignment
+// mutants lost all but the last zone).
 func TestZoneStatsSumsMultipleZones(t *testing.T) {
 	statuses := make([]int64, len(statusAggCols))
 	steps := stepsOfPass(
@@ -203,28 +206,28 @@ func TestZoneStatsSumsMultipleZones(t *testing.T) {
 		t.Fatalf("ZoneStatsOnce: %v", err)
 	}
 	calls := pool.calls()
-	// Суточные строки: checks 3+30, temp 1+10.
+	// The daily rows: checks 3+30, temp 1+10.
 	if got := calls[18].args[0].(int64); got != 33 {
 		t.Errorf("checks:СУММА = %d, want 33 (3+30)", got)
 	}
 	if got := calls[19].args[0].(int64); got != 11 {
 		t.Errorf("temp_error:СУММА = %d, want 11 (1+10)", got)
 	}
-	// Корзины ретрая: зрелая 4+40, сегодняшняя 2+20.
+	// The retry baskets: the mature one 4+40, today's 2+20.
 	if got := calls[21].args[0].(int64); got != 44 {
 		t.Errorf("зрелая корзина = %d, want 44", got)
 	}
 	if got := calls[22].args[0].(int64); got != 22 {
 		t.Errorf("сегодняшняя корзина = %d, want 22", got)
 	}
-	// «Статус повис» — тоже сумма по зонам.
+	// The "status hung" — also a sum over zones.
 	if res.NewDoneStale != 55 {
 		t.Errorf("NewDoneStale = %d, want 55 (5+50)", res.NewDoneStale)
 	}
 }
 
-// TestZoneStatsFillOldEqualsNew — корзины, которых не было: позиция —
-// заполнение (Old := New), не дрейф.
+// TestZoneStatsFillOldEqualsNew — baskets that did not exist: the
+// position is a fill-in (Old := New), not drift.
 func TestZoneStatsFillOldEqualsNew(t *testing.T) {
 	statuses := make([]int64, len(statusAggCols))
 	steps := stepsOfPass(
@@ -234,8 +237,9 @@ func TestZoneStatsFillOldEqualsNew(t *testing.T) {
 		zonestatsRows(),
 		fullCounterRows(nil),
 		fullCounterRows(nil))
-	// Все старые корзины/суточные — пустые (строк нет); новые значения
-	// шагов ненулевые (заготовленные нули stepsOfPass заменяем).
+	// All the old baskets/dailies are empty (no rows); the new values
+	// of the steps are non-zero (we replace the preset zeros of
+	// stepsOfPass).
 	steps[18].rows = zonestatsRows([]any{int64(7)})
 	steps[19].rows = zonestatsRows([]any{int64(3)})
 	steps[21].rows = zonestatsRows([]any{int64(9)})
@@ -268,10 +272,10 @@ func TestZoneStatsFillOldEqualsNew(t *testing.T) {
 	}
 }
 
-// TestZoneStatsAggErrorsZeroValues — ошибки читателей агрегатов
-// возвращают нулевые значения (пин нулей на ошибке).
+// TestZoneStatsAggErrorsZeroValues — the aggregate reader errors
+// return zero values (a zero pin on error).
 func TestZoneStatsAggErrorsZeroValues(t *testing.T) {
-	// История: Query-ошибка — нули.
+	// History: a Query error — zeros.
 	errTx := func() *zonestatsFakeTx {
 		pool := &zonestatsFakePool{steps: []zonestatsStep{{err: errors.New("бд недоступна")}}}
 		tx, _ := pool.Begin(context.Background())
@@ -280,27 +284,27 @@ func TestZoneStatsAggErrorsZeroValues(t *testing.T) {
 	if a, l, err := readHistoryAgg(context.Background(), errTx()); err == nil || a != 0 || l != 0 {
 		t.Errorf("история: (%d/%d, %v), want нули и ошибка", a, l, err)
 	}
-	// Часовые корзины: Query-ошибка — нулевая структура (пин полей).
+	// The hourly baskets: a Query error — a zero struct (a field pin).
 	if h, err := readHourlyAgg(context.Background(), errTx()); err == nil || h.prevResults != 0 || h.curReanalyze != 0 {
 		t.Errorf("часовые корзины: (%+v, %v), want нули и ошибка", h, err)
 	}
-	// Суточное значение: Query-ошибка — 0/false.
+	// The daily value: a Query error — 0/false.
 	if v, exists, err := readDailyValue(context.Background(), errTx(), readDailyChecksSQL, "суточная"); err == nil || v != 0 || exists {
 		t.Errorf("readDailyValue: (%v/%v, %v), want 0/false и ошибка", v, exists, err)
 	}
-	// Перезапись суточной строки: пустой ответ upsert — ошибка и 0.
+	// The daily row overwrite: an empty upsert answer — an error and 0.
 	upEmpty := &zonestatsFakePool{steps: []zonestatsStep{{rows: zonestatsRows()}}}
 	upTx, _ := upEmpty.Begin(context.Background())
 	if v, err := writeDailyCounter(context.Background(), upTx, recountDailyChecksSQL, 5, time.Unix(0, 0), "суточная"); err == nil || v != 0 {
 		t.Errorf("writeDailyCounter: (%v, %v), want 0 и ошибка пустого upsert", v, err)
 	}
-	// Ошибка Query у writeDailyCounter — тоже 0.
+	// A Query error of writeDailyCounter — also 0.
 	werr := &zonestatsFakePool{steps: []zonestatsStep{{err: errors.New("бд недоступна")}}}
 	wtx, _ := werr.Begin(context.Background())
 	if v, err := writeDailyCounter(context.Background(), wtx, recountDailyChecksSQL, 5, time.Unix(0, 0), "суточная"); err == nil || v != 0 {
 		t.Errorf("writeDailyCounter (Query-сбой): (%v, %v), want 0 и ошибка", v, err)
 	}
-	// Очистка корзин: Query-ошибка — ошибка с контекстом.
+	// The basket cleanup: a Query error — an error with context.
 	cerr := &zonestatsFakePool{steps: []zonestatsStep{{err: errors.New("бд недоступна")}}}
 	ctxTx, _ := cerr.Begin(context.Background())
 	if err := cleanupBaskets(context.Background(), ctxTx, retryMatureCleanupSQL, "очистка корзин ретрая"); err == nil ||
@@ -309,7 +313,7 @@ func TestZoneStatsAggErrorsZeroValues(t *testing.T) {
 	}
 }
 
-// TestAbsDiff — |a − b| обеих ориентаций и нуля.
+// TestAbsDiff — |a − b| of both orientations and zero.
 func TestAbsDiff(t *testing.T) {
 	for _, c := range [][3]int64{{5, 3, 2}, {3, 5, 2}, {0, 0, 0}, {-4, 3, 7}} {
 		if got := absDiff(c[0], c[1]); got != c[2] {
@@ -318,9 +322,9 @@ func TestAbsDiff(t *testing.T) {
 	}
 }
 
-// TestZoneStatsLoopNoDriftNoWarn — стационарные проходы (без дрейфа) не
-// поднимают Warn «реконсиляция: дрейф» (мутант вырезания return при
-// пустом drifted спамил бы positions=0).
+// TestZoneStatsLoopNoDriftNoWarn — steady-state passes (without drift)
+// do not raise the drift Warn (a return cut-out mutant with an empty
+// drifted would spam positions=0).
 func TestZoneStatsLoopNoDriftNoWarn(t *testing.T) {
 	slogBuf := &zonestatsSyncBuf{}
 	logger := zsLogger(slogBuf)
@@ -350,9 +354,9 @@ func TestZoneStatsLoopNoDriftNoWarn(t *testing.T) {
 	}
 }
 
-// TestZoneStatsLoopDriftWarnExact — дрейф нескольких позиций: Warn с
-// точной суммой |Δ| и ровно пятью строками топа (шестая и дальше —
-// счётчиком, не строками).
+// TestZoneStatsLoopDriftWarnExact — the drift of several positions: a
+// Warn with the exact |Δ| sum and exactly five top lines (the sixth and
+// beyond — by the counter, not lines).
 func TestZoneStatsLoopDriftWarnExact(t *testing.T) {
 	slogBuf := &zonestatsSyncBuf{}
 	logger := zsLogger(slogBuf)
@@ -365,8 +369,9 @@ func TestZoneStatsLoopDriftWarnExact(t *testing.T) {
 		zonestatsRows(),
 		fullCounterRows(nil),
 		fullCounterRows(nil))
-	// Второй проход: 7 позиций зон с дрейфом 2 каждая (все колонки двух
-	// зон + третья зона), сумма |Δ| = 14; single-дрейф вариант ниже.
+	// The second pass: 7 zone positions with a drift of 2 each (all the
+	// columns of two zones + a third zone), the |Δ| sum = 14; the
+	// single-drift variant below.
 	drift := stepsOfPass(
 		zoneValsOf(7, 10, 4, 2, 3, 1),
 		zoneValsOf(7, 10, 4, 2, 3, 1),
@@ -399,11 +404,13 @@ func TestZoneStatsLoopDriftWarnExact(t *testing.T) {
 		t.Fatalf("ZoneStatsLoop: %v", err)
 	}
 	log := slogBuf.String()
-	// Дрейф: четыре колонки зоны 9 (по 2) + total зоны 11 (4) = 12.
+	// The drift: four columns of zone 9 (2 each) + the total of zone 11
+	// (4) = 12.
 	if !strings.Contains(log, "sum_abs=12") {
 		t.Errorf("Warn без точной суммы дрейфа (want sum_abs=12):\n%s", log)
 	}
-	// Топ — ровно пять позиций (шестая дрейфующая — за скобками топа).
+	// The top is exactly five positions (the sixth drifting one is
+	// outside the top).
 	for _, want := range []string{"zone:9:total: 0 → 2", "zone:11:total: 0 → 4"} {
 		if !strings.Contains(log, want) {
 			t.Errorf("Warn без %q:\n%s", want, log)
@@ -415,8 +422,8 @@ func TestZoneStatsLoopDriftWarnExact(t *testing.T) {
 	if strings.Contains(log, "positions=6") {
 		t.Errorf("топ не обрезан пятью строками:\n%s", log)
 	}
-	// Одна дрейфующая позиция — Warn всё равно поднимается (граница
-	// «ровно одна» у мутанта len(drifted) == 1 глотала бы его).
+	// One drifting position — the Warn is raised anyway (a
+	// len(drifted) == 1 mutant boundary would swallow it).
 	slogBuf2 := &zonestatsSyncBuf{}
 	logger2 := zsLogger(slogBuf2)
 	single := stepsOfPass(
@@ -446,9 +453,9 @@ func TestZoneStatsLoopDriftWarnExact(t *testing.T) {
 	}
 }
 
-// TestZoneStatsLoopCancelledCtx — пред-отменённый ctx: стартовый проход
-// выполняется (источник жив), gauge «статус повис» выставляется, выход
-// nil (мутант case true&& не выставлял бы gauge).
+// TestZoneStatsLoopCancelledCtx — a pre-cancelled ctx: the starting pass
+// runs (the source is alive), the "status hung" gauge is set, the exit
+// is nil (a case true&& mutant would not set the gauge).
 func TestZoneStatsLoopCancelledCtx(t *testing.T) {
 	reg := metrics.New("monitor")
 	statuses := make([]int64, len(statusAggCols))
@@ -476,12 +483,13 @@ func TestZoneStatsLoopCancelledCtx(t *testing.T) {
 	}
 }
 
-// TestZoneStatsLoopMetricsBuckets — корзины гистограммы прохода:
-// экспонента 0.5с ×2, ровно 11 штук (замер §12 — десятки секунд).
+// TestZoneStatsLoopMetricsBuckets — the pass histogram buckets:
+// an exponent of 0.5 s ×2, exactly 11 of them (measurement §12 — tens
+// of seconds).
 func TestZoneStatsLoopMetricsBuckets(t *testing.T) {
 	reg := metrics.New("monitor")
 	m := newZoneStatsLoopMetrics(reg)
-	m.observe(1.0) // серия материализуется — Gather видит семейство
+	m.observe(1.0) // the series materializes — Gather sees the family
 	families, err := reg.Gather()
 	if err != nil {
 		t.Fatal(err)

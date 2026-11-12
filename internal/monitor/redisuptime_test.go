@@ -1,9 +1,10 @@
-// Юнит-тесты источника аптайма Redis и алерта redis_restart (T-270,
-// ФТ-2.2): разбор INFO server (таблица: секции/CRLF, отсутствующие и
-// кривые поля), RedisInfo против фейкового клиента go-redis (nil-клиент,
-// ошибка команды, секция запроса), порог окна рестарта (граница ровно
-// на окне — уже не «недавно»), деградации (источник не задан / ошибка —
-// «не измеряется»). Живой Redis — за границами юнит-тестов.
+// Redis uptime source and redis_restart alert unit tests (T-270,
+// FR-2.2): INFO server parsing (a table: sections/CRLF, missing and
+// malformed fields), RedisInfo against a fake go-redis client (a nil
+// client, a command error, the requested section), the restart window
+// threshold (the boundary exactly at the window — no longer "recent"),
+// degradations (the source not set / an error — "not measured").
+// A live Redis is outside the unit tests.
 package monitor
 
 import (
@@ -14,14 +15,14 @@ import (
 	"time"
 )
 
-// fakeRedisUptime — аптайм по заготовке, очередь ошибок; стиль
-// fakeRedisMem.
+// fakeRedisUptime — uptime from a preset, an error queue; the
+// fakeRedisMem style.
 type fakeRedisUptime struct {
 	errs []error
 	up   RedisUptime
 }
 
-// compile-time: фейк — RedisUptimeSource.
+// compile-time: the fake is a RedisUptimeSource.
 var _ RedisUptimeSource = (*fakeRedisUptime)(nil)
 
 func (f *fakeRedisUptime) RedisUptime(context.Context) (RedisUptime, error) {
@@ -31,11 +32,11 @@ func (f *fakeRedisUptime) RedisUptime(context.Context) (RedisUptime, error) {
 	return f.up, nil
 }
 
-// --- разбор INFO -------------------------------------------------------------
+// --- INFO parsing -------------------------------------------------------------
 
-// TestParseRedisUptimeINFO — строки «ключ:значение», заголовки секций
-// и CRLF; отсутствующее поле, нечисловое и отрицательное секунды —
-// ошибки (формат фиксирован сервером).
+// TestParseRedisUptimeINFO — the "key:value" lines, section headers
+// and CRLF; a missing field, a non-numeric and a negative seconds value
+// are errors (the format is fixed by the server).
 func TestParseRedisUptimeINFO(t *testing.T) {
 	raw := "# Server\r\n" +
 		"redis_version:7.0.15\r\n" +
@@ -51,7 +52,7 @@ func TestParseRedisUptimeINFO(t *testing.T) {
 		t.Errorf("parse = %+v, want {900}", up)
 	}
 
-	// Без \r (юникс-вывод) — тот же результат.
+	// Without \r (unix output) — the same result.
 	if up, err = parseRedisUptimeINFO(strings.ReplaceAll(raw, "\r", "")); err != nil || up.Seconds != 900 {
 		t.Errorf("без CR: (%+v, %v), want ({900}, nil)", up, err)
 	}
@@ -67,9 +68,9 @@ func TestParseRedisUptimeINFO(t *testing.T) {
 	}
 }
 
-// TestRedisInfoUptimeClient — RedisInfo читает секцию server тем же
-// клиентом, что память (redismem_test.go): nil-клиент и ошибка команды
-// — ошибки источника.
+// TestRedisInfoUptimeClient — RedisInfo reads the server section with
+// the same client as memory (redismem_test.go): a nil client and a
+// command error — source errors.
 func TestRedisInfoUptimeClient(t *testing.T) {
 	if _, err := (RedisInfo{}).RedisUptime(context.Background()); err == nil ||
 		!strings.Contains(err.Error(), "клиент не задан") {
@@ -92,11 +93,12 @@ func TestRedisInfoUptimeClient(t *testing.T) {
 	}
 }
 
-// --- алерт redis_restart ------------------------------------------------------
+// --- the redis_restart alert ------------------------------------------------------
 
-// TestAlertsRedisRestartThreshold — окно 15 мин: аптайп меньше окна —
-// рестарт «недавно» (срабатывание), ровно на окне — уже нет (снятие сам
-// выход из окна: уровень монотонен, память машины не нужна).
+// TestAlertsRedisRestartThreshold — the 15 min window: uptime below the
+// window — a "recent" restart (firing), exactly at the window — already
+// not (clearing by itself when leaving the window: the level is
+// monotonic, no machine memory needed).
 func TestAlertsRedisRestartThreshold(t *testing.T) {
 	if AlertRedisRestartWindow != 15*time.Minute {
 		t.Fatalf("AlertRedisRestartWindow = %v, want 15 мин (3 прохода алертов)", AlertRedisRestartWindow)
@@ -108,11 +110,11 @@ func TestAlertsRedisRestartThreshold(t *testing.T) {
 		uptime int64
 		want   string
 	}{
-		{30, AlertStatusFiring},  // полминуты назад — рестарт
-		{899, AlertStatusFiring}, // 14 мин 59 с — рестарт
-		{900, AlertStatusOK},     // ровно окно — уже не «недавно»
-		{3600, AlertStatusOK},    // час — норма
-		{5, AlertStatusFiring},   // новый рестарт сбросил аптайм
+		{30, AlertStatusFiring},  // half a minute ago — a restart
+		{899, AlertStatusFiring}, // 14 min 59 s — a restart
+		{900, AlertStatusOK},     // exactly the window — no longer "recent"
+		{3600, AlertStatusOK},    // an hour — the norm
+		{5, AlertStatusFiring},   // a new restart reset the uptime
 	}
 	for i, s := range steps {
 		got := m.transition(env.Alerts, ctx, obs(int64(s.uptime)))
@@ -120,7 +122,7 @@ func TestAlertsRedisRestartThreshold(t *testing.T) {
 			t.Errorf("шаг %d (uptime %d с): статус = %s (%s), want %s", i, s.uptime, got.Status, got.Detail, s.want)
 		}
 	}
-	// Detail — аптайм и предупреждение о потерях стримов.
+	// The detail — the uptime and the stream loss warning.
 	hot := m.transition(env.Alerts, ctx, obs(int64(30)))
 	if hot.Status != AlertStatusFiring ||
 		!strings.Contains(hot.Detail, "30s") ||
@@ -129,11 +131,11 @@ func TestAlertsRedisRestartThreshold(t *testing.T) {
 	}
 }
 
-// TestAlertsRedisRestartDegradation — без источника и при его ошибке
-// алерт «не измеряется» (источник командует cmd/monitor: живой Redis в
-// юнит-тестах отсутствует — норма, не ложное срабатывание).
+// TestAlertsRedisRestartDegradation — without a source and on its error
+// the alert is "not measured" (the source commands in cmd/monitor: a
+// live Redis is absent in unit tests — the norm, not a false firing).
 func TestAlertsRedisRestartDegradation(t *testing.T) {
-	env := newAlertsTestEnv(t, nil) // источник не задан (не проводился wiring)
+	env := newAlertsTestEnv(t, nil) // the source is not set (no wiring was done)
 	if s := snapshotOf(t, env.Pass(context.Background()), AlertRedisRestart); s.Status != AlertStatusNotMeasured {
 		t.Errorf("без источника: статус = %s, want not_measured", s.Status)
 	}

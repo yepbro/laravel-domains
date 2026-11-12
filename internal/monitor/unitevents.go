@@ -1,40 +1,44 @@
-// Источник контроля OOM и рестартов юнитов crawler (T-145, ТЗ 5.9):
-// счётчики memory.events cgroup v2 (oom/oom_kill/high) и NRestarts systemd.
-// oom/oom_kill/NRestarts питают алерт unit_oom, рост счётчика high между
-// проходами — алерт троттлинга MemoryHigh (memory_high, T-162: предвестник
-// фаталов http-worker T-157 — оба читают один снимок источника).
-// Потолки памяти юнитов заданы MemoryMax (T-085/T-143; soft MemoryHigh
-// http-worker — тем же T-145), но потолок — страховка, а не гарантия:
-// OOM-kill или крэш-рестарт — незапланированный простой конвейера
-// (ТЗ 3.4) и первый симптом невыполнения бюджета (docs/deploy.md §2);
-// алерт unit_oom (alerts.go) бьёт Warn в journald monitor, один Warn
-// на эпизод (механика переходов T-080).
+// A source of crawler unit OOM and restart monitoring (T-145, spec 5.9):
+// the memory.events counters of cgroup v2 (oom/oom_kill/high) and the
+// NRestarts of systemd. oom/oom_kill/NRestarts feed the unit_oom alert,
+// the growth of the high counter between passes — the MemoryHigh
+// throttling alert (memory_high, T-162: a precursor of the http-worker
+// fatals of T-157 — both read one source snapshot).
+// Unit memory caps are set by MemoryMax (T-085/T-143; the http-worker's
+// soft MemoryHigh — by the same T-145), but a cap is a guard, not a
+// guarantee: an OOM-kill or a crash restart is unscheduled pipeline
+// downtime (spec 3.4) and the first symptom of the budget not being met
+// (docs/deploy.md §2); the unit_oom alert (alerts.go) hits a Warn in the
+// monitor's journald, one Warn per episode (the T-080 transition
+// mechanics).
 //
-// Источники — без новых зависимостей (DBus-клиент не заводится):
+// The sources avoid new dependencies (no DBus client is introduced):
 //
-//   - список юнитов и NRestarts — `systemctl show 'crawler-*.service'
-//     -p Id -p NRestarts`: свойства менеджера читаются непривилегированно
-//     (как `systemctl status` от любого пользователя — polkit на чтение
-//     свойств не спрашивает), шаблон покрывает и остановленные/failed
-//     юниты (краш-лупа по StartLimitBurst видно NRestarts, хотя cgroup
-//     уже удалена);
-//   - oom/oom_kill — прямое чтение
-//     /sys/fs/cgroup/system.slice/<юнит>/memory.events: файлы cgroup
-//     world-readable (0444 root), ProtectControlGroups юнита монитора
-//     монтирует cgroupfs read-only — на чтение не влияет. Прямое чтение
-//     — не выбор из равных: systemd не экспортирует счётчики memory.events
-//     как свойства (systemd 259 не знает -p MemoryEvents), файл —
-//     единственный путь; сэмплер t092 читал то же от root.
+//   - the unit list and NRestarts — `systemctl show 'crawler-*.service'
+//     -p Id -p NRestarts`: the manager properties are read
+//     unprivileged (like `systemctl status` under any user — polkit does
+//     not ask for property reads), the pattern covers stopped/failed
+//     units too (NRestarts of a crash loop by StartLimitBurst is visible
+//     although the cgroup is already removed);
+//   - oom/oom_kill — a direct read of
+//     /sys/fs/cgroup/system.slice/<unit>/memory.events: the cgroup files
+//     are world-readable (0444 root), the ProtectControlGroups of the
+//     monitor unit mounts cgroupfs read-only — reads are unaffected.
+//     The direct read is not a choice among equals: systemd does not
+//     export the memory.events counters as properties (systemd 259 does
+//     not know -p MemoryEvents), the file is the only path; the t092
+//     sampler read the same as root.
 //
-// В dev-контейнере нет ни systemd (runtime-образ distroless без
-// systemctl), ни system.slice — источник возвращает ошибку класса
-// errNoSystemd, алерт по ней тихо «не измеряется» (Debug, без Warn и
-// без ложного срабатывания): тот же контракт, что у SMART NVMe
-// (alerts.go) — окружение без systemd для dev — норма, а не авария.
-// Прочие ошибки (боевой хост, но systemd/cgroupfs недоступен) — алерт
-// «не измеряется» с Warn каждого прохода, цикл живёт: отказ уже
-// работавшего контроля не должен быть невидимым. На боевом хосте
-// systemctl и cgroupfs доступны юниту монитора без дополнительных прав.
+// The dev container has neither systemd (the distroless runtime image
+// without systemctl) nor system.slice — the source returns an
+// errNoSystemd class error, the alert degrades quietly to "not measured"
+// on it (Debug, no Warn and no false firing): the same contract as SMART
+// NVMe (alerts.go) — an environment without systemd for dev is the norm,
+// not a failure. Other errors (a production host but systemd/cgroupfs
+// unavailable) — the alert is "not measured" with a Warn of each pass,
+// the loop keeps living: the failure of already working monitoring must
+// not be invisible. On the production host systemctl and cgroupfs are
+// available to the monitor unit without extra privileges.
 package monitor
 
 import (
@@ -51,102 +55,110 @@ import (
 	"time"
 )
 
-// unitEventsPattern — шаблон юнитов контроля: все crawler-сервисы
-// системного slice. crawler.target не матчится суффиксом .service, а
-// .service-суффикс отсекает возможные не-сервисные юниты набора.
+// unitEventsPattern — the pattern of monitored units: all crawler
+// services of the system slice. crawler.target does not match the
+// .service suffix, and the .service suffix cuts off possible
+// non-service units of the set.
 const unitEventsPattern = "crawler-*.service"
 
-// errNoSystemd — окружение без systemd (контейнер): systemctl не
-// установлен или PID 1 — не systemd. Ожидаемое состояние dev-окружения,
-// а не авария: алерт по этому классу деградирует тихо (как SMART),
-// остальные ошибки источника (боевой хост, но systemd/cgroupfs сломан)
-// — Warn каждого прохода, стиль остальных источников (зонд ingest).
+// errNoSystemd — an environment without systemd (a container): systemctl
+// is not installed or PID 1 is not systemd. An expected state of the dev
+// environment, not a failure: the alert degrades quietly on this class
+// (like SMART), the other source errors (a production host but a broken
+// systemd/cgroupfs) — a Warn of each pass, the style of the other
+// sources (the ingest probe).
 var errNoSystemd = errors.New("systemd отсутствует (контейнер/dev)")
 
-// Значения метки kind метрики crawler_unit_oom_events (uniteventsmetrics).
+// Values of the kind label of the crawler_unit_oom_events metric (uniteventsmetrics).
 const (
-	// unitEventOOM — memory.events oom: OOM-killer работал в cgroup.
+	// unitEventOOM is memory.events oom: the OOM-killer ran in the cgroup.
 	unitEventOOM = "oom"
-	// unitEventOOMKill — memory.events oom_kill: процессы убиты.
+	// unitEventOOMKill is memory.events oom_kill: processes were killed.
 	unitEventOOMKill = "oom_kill"
 )
 
-// UnitEvents — снимок событий одного юнита crawler за жизнь его cgroup
-// (memory.events) и юнита (NRestarts).
+// UnitEvents is a snapshot of one crawler unit's events over the life of
+// its cgroup (memory.events) and the unit (NRestarts).
 type UnitEvents struct {
-	// Unit — имя юнита (crawler-http-worker.service).
+	// Unit is the unit name (crawler-http-worker.service).
 	Unit string
-	// OOM — memory.events oom: число срабатываний OOM-killer в cgroup
-	// (попытки, включая отбитые reclaim'ом).
+	// OOM is memory.events oom: the number of OOM-killer firings in the
+	// cgroup (attempts, including ones fended off by reclaim).
 	OOM uint64
-	// OOMKill — memory.events oom_kill: убитые OOM-killer'ом процессы.
+	// OOMKill is memory.events oom_kill: processes killed by the OOM-killer.
 	OOMKill uint64
-	// High — memory.events high: число попаданий за мягкий потолок
-	// MemoryHigh — каждый — принудительный reclaim/задержки (троттлинг).
-	// Абсолютное значение накапливается за жизнь cgroup (http-worker с
-	// MemoryHigh=850M набирает >100 тыс. за сутки — deploy/systemd/
-	// crawler-http-worker.service): событие алерта memory_high — рост
-	// счётчика между проходами, не само значение (T-162).
+	// High is memory.events high: the number of hits against the soft
+	// MemoryHigh cap — each one is a forced reclaim/delays
+	// (throttling). The absolute value accumulates over the cgroup's
+	// life (an http-worker with MemoryHigh=850M gains >100 k per day —
+	// deploy/systemd/crawler-http-worker.service): the memory_high alert
+	// event is the counter's growth between passes, not the value
+	// itself (T-162).
 	High uint64
-	// NRestarts — systemctl NRestarts: крэш-рестарты с последнего
-	// старта/сброса состояния юнита (reset-failed/stop).
+	// NRestarts is the systemctl NRestarts: crash restarts since the
+	// last start/unit state reset (reset-failed/stop).
 	NRestarts uint64
 }
 
-// hot — у юнита есть события (алерт смотрит только на это).
+// hot — the unit has events (the alert only looks at this).
 func (e UnitEvents) hot() bool {
 	return e.OOM > 0 || e.OOMKill > 0 || e.NRestarts > 0
 }
 
-// UnitEventsSource — источник событий юнитов; интерфейс для подмены в
-// юнит-тестах (реальное чтение — systemctl + cgroupfs, в тестовом
-// контейнере их нет). Стиль SpaceChecker/WearSource/BadHashesSource.
+// UnitEventsSource is a unit events source; an interface for
+// substitution in unit tests (the real read is systemctl + cgroupfs,
+// which the test container does not have).
+// SpaceChecker/WearSource/BadHashesSource style.
 type UnitEventsSource interface {
-	// UnitEvents возвращает снимки всех юнитов crawler-*.service.
-	// Ошибка = «не измеряется» с причиной (контейнер без systemd);
-	// пустой список без ошибки — systemd жив, юниты не загружены.
+	// UnitEvents returns snapshots of all crawler-*.service units.
+	// An error means "not measured", with the reason attached (a
+	// container without systemd); an empty list without an error —
+	// systemd is alive, no units are loaded.
 	UnitEvents(ctx context.Context) ([]UnitEvents, error)
 }
 
-// OSUnitEvents — UnitEventsSource поверх systemctl show + cgroup v2:
-// один exec на проход (шаблон раскрывается менеджером сразу по всем
-// юнитам) и по одному чтению memory.events на юнит.
+// OSUnitEvents is a UnitEventsSource on top of systemctl show + cgroup
+// v2: one exec per pass (the pattern is expanded by the manager for all
+// units at once) and one memory.events read per unit.
 type OSUnitEvents struct {
-	// CgroupFS — корень cgroup v2 ("" — "/sys/fs/cgroup"); тесты
-	// подменяют каталогом (стиль SysFS/DevFS у OSWear).
+	// CgroupFS is the cgroup v2 root ("" — "/sys/fs/cgroup"); tests
+	// substitute it with a directory (the SysFS/DevFS style of OSWear).
 	CgroupFS string
-	// Systemctl — путь к systemctl ("" — "systemctl" из PATH); тесты
-	// подменяют заглушкой-скриптом.
+	// Systemctl is the path to systemctl ("" — "systemctl" from PATH);
+	// tests substitute it with a stub script.
 	Systemctl string
-	// Timeout — бюджет одного прохода источника, включая exec
-	// (0 — unitEventsProbeTimeout); тесты подменяют малым, чтобы не
-	// ждать реальных секунд на зависшей заглушке.
+	// Timeout is the budget of one source pass, exec included
+	// (0 — unitEventsProbeTimeout); tests substitute it with a small
+	// value so as not to wait real seconds on a hung stub.
 	Timeout time.Duration
 }
 
-// unitEventsProbeTimeout — бюджет прохода источника: проходы алертов
-// последовательны (Pass), зависший systemctl/D-Bus не должен останавливать
-// оценку остальных алертов дольше пары периодов цикла. 10 с — с запасом
-// против холодного старта менеджера и одновременно ≪ периода цикла 60 с.
+// unitEventsProbeTimeout is the budget of a source pass: the alert
+// passes are sequential (Pass), a hung systemctl/D-Bus must not stop the
+// evaluation of the other alerts for more than a couple of loop periods.
+// 10 s — with a margin against a cold manager start and at the same time
+// ≪ the 60 s loop period.
 //
-// Точное значение различимо только паузой в секунды против зависшего
-// процесса — противоречит герметичности юнит-тестов
-// (docs/mutation-testing.md §4): значение — настроечный бюджет, а не
-// логика (стиль ingestProbeTimeout).
+// The exact value is only distinguishable by a seconds-long pause
+// against a hung process — it contradicts the hermeticity of unit tests
+// (docs/mutation-testing.md §4): the value is a configuration budget,
+// not logic (the ingestProbeTimeout style).
 // mutator-disable-next-line arithmetic/base, numbers/decrementer, numbers/incrementer
 const unitEventsProbeTimeout = 10 * time.Second
 
-// compile-time: OSUnitEvents — UnitEventsSource.
+// compile-time: OSUnitEvents is a UnitEventsSource.
 var _ UnitEventsSource = OSUnitEvents{}
 
-// UnitEvents собирает события всех юнитов crawler: systemctl show даёт
-// список и NRestarts, memory.events каждого юнита — oom/oom_kill.
-// Юнит без cgroup (остановлен: failed после исчерпания StartLimit или
-// перед первым стартом) читается нулями событий памяти — NRestarts
-// такого юнита остаётся в снимке и алертится. Чтение всех юнитов
-// обходит целиком: ошибки каждого собираются в одну причину с именами
-// (диагностика видит все отказавшие), но снимок не отдаётся — непрочитанный
-// счётчик не подменяется нулём, иначе сбой чтения ложно снимал бы алерт.
+// UnitEvents collects the events of all crawler units: systemctl show
+// gives the list and NRestarts, memory.events of each unit —
+// oom/oom_kill. A unit without a cgroup (stopped: failed after the
+// StartLimit is exhausted or before the first start) is read with zero
+// memory events — the NRestarts of such a unit stays in the snapshot and
+// alerts. The reading of all units is traversed in full: each error is
+// collected into one reason with names (diagnostics sees all the failed
+// ones), but the snapshot is not returned — an unread counter is not
+// substituted with zero, otherwise a read failure would falsely clear
+// the alert.
 func (s OSUnitEvents) UnitEvents(ctx context.Context) ([]UnitEvents, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -157,15 +169,16 @@ func (s OSUnitEvents) UnitEvents(ctx context.Context) ([]UnitEvents, error) {
 		return nil, err
 	}
 	systemctl := s.Systemctl
-	// Дефолт из PATH живёт только на боевом хосте: юнит-тесты всегда
-	// задают Systemctl скриптом, реальный exec в тестах недопустим.
+	// The PATH default lives only on the production host: unit tests
+	// always set Systemctl with a script, a real exec in tests is not
+	// allowed.
 	// mutator-disable-next-line branch/if
 	if systemctl == "" {
 		// mutator-disable-next-line statement/remove
 		systemctl = "systemctl"
 	}
 	cgroupFS := s.CgroupFS
-	// Дефолт «/sys/fs/cgroup» — как systemctl выше.
+	// The "/sys/fs/cgroup" default — like systemctl above.
 	// mutator-disable-next-line branch/if
 	if cgroupFS == "" {
 		// mutator-disable-next-line statement/remove
@@ -182,11 +195,12 @@ func (s OSUnitEvents) UnitEvents(ctx context.Context) ([]UnitEvents, error) {
 		if stderr := strings.TrimSpace(errOut.String()); stderr != "" {
 			reason = fmt.Errorf("systemctl show: %w: %s", err, stderr)
 		}
-		// Окружение без systemd — ожидаемая деградация: бинаря нет в PATH
-		// (dev-контейнер distroless) или PID 1 не systemd — тихий класс
-		// errNoSystemd; прочее (боевой хост, systemd сломан — в т.ч.
-		// заданный путь исчез, зависший менеджер срезан таймаутом) —
-		// ошибка как есть, алерт ответит Warn.
+		// An environment without systemd — an expected degradation: the
+		// binary is not in PATH (a distroless dev container) or PID 1 is
+		// not systemd — the quiet errNoSystemd class; everything else
+		// (a production host with a broken systemd — including the given
+		// path vanished, a hung manager cut off by the timeout) — the
+		// error as is, the alert will answer with a Warn.
 		if errors.Is(err, exec.ErrNotFound) ||
 			strings.Contains(errOut.String(), "System has not been booted with systemd") {
 			return nil, fmt.Errorf("monitor: юниты: %w: %w", errNoSystemd, reason)
@@ -195,11 +209,11 @@ func (s OSUnitEvents) UnitEvents(ctx context.Context) ([]UnitEvents, error) {
 	}
 	units := parseSystemctlShow(out.String())
 	if len(units) > 0 {
-		// Корень системного slice обязан существовать на cgroup v2-хосте
-		// (systemctl уже ответил — systemd есть). Отсутствие — не «юниты
-		// без событий», а неработающий источник (cgroup v1/hybrid, чужой
-		// корень): без проверки все ENOENT ниже сложились бы в ложное
-		// «ok» по нулям.
+		// The system slice root must exist on a cgroup v2 host
+		// (systemctl has already answered — systemd is there). Its absence
+		// is not "units without events" but a non-working source
+		// (cgroup v1/hybrid, a foreign root): without the check all the
+		// ENOENTs below would fold into a false "ok" by zeros.
 		sliceDir := filepath.Join(cgroupFS, "system.slice")
 		if _, err := os.Stat(sliceDir); err != nil {
 			return nil, fmt.Errorf("monitor: юниты: cgroup v2 %s недоступен: %w", sliceDir, err)
@@ -221,7 +235,7 @@ func (s OSUnitEvents) UnitEvents(ctx context.Context) ([]UnitEvents, error) {
 	return units, nil
 }
 
-// timeout — бюджет прохода с дефолтом.
+// timeout — the pass budget with the default.
 func (s OSUnitEvents) timeout() time.Duration {
 	if s.Timeout > 0 {
 		return s.Timeout
@@ -229,16 +243,17 @@ func (s OSUnitEvents) timeout() time.Duration {
 	return unitEventsProbeTimeout
 }
 
-// parseSystemctlShow разбирает вывод `systemctl show -p Id -p NRestarts
-// <шаблон>`: блоки «Id=…\nNRestarts=…» по юниту (порядок строк в блоке
-// фиксирован менеджером, разделитель — пустая строка, но парсер не
-// зависит от порядка). NRestarts вне числа («[not set]» — юнит ещё не
-// запускался) читается нулём, как в сэмплере t092-sample.sh; NRestarts
-// до первого Id отбрасывается. Выделен чистой функцией для табличного
-// теста без процесса.
+// parseSystemctlShow parses the output of `systemctl show -p Id
+// -p NRestarts <pattern>`: the "Id=…\nNRestarts=…" blocks per unit (the
+// line order in a block is fixed by the manager, the separator is an
+// empty line, but the parser does not depend on the order). A
+// non-numeric NRestarts ("[not set]" — the unit has never started) is
+// read as zero, as in the t092-sample.sh sampler; an NRestarts before
+// the first Id is discarded. Extracted as a pure function for a table
+// test without a process.
 func parseSystemctlShow(out string) []UnitEvents {
 	var units []UnitEvents
-	// cur — индекс текущего юнита; −1 — Id ещё не встречался.
+	// cur is the index of the current unit; −1 — no Id seen yet.
 	cur := -1
 	for _, line := range strings.Split(out, "\n") {
 		switch {
@@ -259,18 +274,18 @@ func parseSystemctlShow(out string) []UnitEvents {
 	return units
 }
 
-// memoryEvents — счётчики файла memory.events, нужные алертам:
-// oom/oom_kill (unit_oom, T-145) и high (memory_high, T-162).
+// memoryEvents — the memory.events file counters the alerts need:
+// oom/oom_kill (unit_oom, T-145) and high (memory_high, T-162).
 type memoryEvents struct {
 	OOM     uint64
 	OOMKill uint64
 	High    uint64
 }
 
-// readMemoryEvents читает oom/oom_kill/high одного юнита из memory.events.
-// Файла нет (юнит без cgroup — остановлен) — нули: счётчики живут в
-// cgroup и пересозданием обнуляются, рестарт такой юнит уже учёл в
-// NRestarts.
+// readMemoryEvents reads oom/oom_kill/high of one unit from
+// memory.events. No file (a unit without a cgroup — stopped) — zeros:
+// the counters live in the cgroup and are zeroed by its recreation,
+// a restart of such a unit is already accounted in NRestarts.
 func readMemoryEvents(path string) (memoryEvents, error) {
 	b, err := os.ReadFile(path)
 	if errors.Is(err, fs.ErrNotExist) {
@@ -282,11 +297,12 @@ func readMemoryEvents(path string) (memoryEvents, error) {
 	return parseMemoryEvents(string(b))
 }
 
-// parseMemoryEvents разбирает файл memory.events: строки «ключ значение»
-// (low/high/max/oom/oom_kill/oom_group); для алертов нужны oom/oom_kill/
-// high, остальные ключи пропускаются, отсутствующие — нули. Значение не
-// число — ошибка (формат фиксирован ядром, кривой файл — не молчать).
-// Выделен чистой функцией для табличного теста.
+// parseMemoryEvents parses the memory.events file: "key value" lines
+// (low/high/max/oom/oom_kill/oom_group); the alerts need oom/oom_kill/
+// high, the other keys are skipped, missing ones — zeros. A value that
+// is not a number is an error (the format is fixed by the kernel, a
+// malformed file must not be silently ignored).
+// Extracted as a pure function for a table test.
 func parseMemoryEvents(data string) (memoryEvents, error) {
 	var ev memoryEvents
 	for _, line := range strings.Split(data, "\n") {

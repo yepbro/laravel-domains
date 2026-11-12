@@ -1,10 +1,11 @@
-// Юнит-тесты цикла медленных запросов (T-177): формат сообщения
-// (шапка, строки с меткой сервиса и pid, обрезка текста, согласование
-// числительных, хвост «…и ещё»), дебаунс pid+query_start (новый
-// оператор — одно сообщение, дляящийся — тишина, завершившийся покидает
-// базу, новый старт того же pid — снова сообщение, сбой источника базу
-// не роняет), выключение интервалом 0. Живой pg_stat_activity — вне
-// юнит-тестов (герметичность, стиль load_test.go / zonestats_test.go).
+// Slow queries loop unit tests (T-177): the message format (the header,
+// the lines with the service label and pid, the text truncation, the
+// numeral agreement, the "…and more" tail), the pid+query_start
+// debounce (a new statement — one message, a continuing one — silence,
+// a finished one leaves the base, a new start of the same pid — a
+// message again, a source failure does not drop the base), disabling
+// by an interval of 0. A live pg_stat_activity is outside unit tests
+// (hermeticity, the load_test.go / zonestats_test.go style).
 package monitor
 
 import (
@@ -16,12 +17,13 @@ import (
 	"time"
 )
 
-// fakeSlowSource — источник с запланированными снимками по проходам
-// (стиль fakeLoadSource); исчерпав план, отдаёт пустые снимки.
-// Счётчик под мьютексом: пишет горутина цикла, читает горутина теста
-// (waitSlowPasses) — без замка это гонка под -race (T-190; стиль
-// zonestatsFakePool). План passes/errs заполняется до старта цикла и
-// дальше только читается — замка не требует.
+// fakeSlowSource — a source with scheduled snapshots per pass (the
+// fakeLoadSource style); having exhausted the plan, it returns empty
+// snapshots. The counter is under a mutex: the loop goroutine writes
+// it, the test goroutine reads it (waitSlowPasses) — without the lock
+// it is a race under -race (T-190; the zonestatsFakePool style). The
+// passes/errs plan is filled before the loop starts and afterwards is
+// only read — it needs no lock.
 type fakeSlowSource struct {
 	mu     sync.Mutex
 	passes [][]SlowQuery
@@ -43,25 +45,26 @@ func (s *fakeSlowSource) SlowQueries(context.Context, time.Duration) ([]SlowQuer
 	return nil, nil
 }
 
-// count — число выполненных проходов (потокобезопасное чтение счётчика).
+// count — the number of completed passes (a thread-safe read of the counter).
 func (s *fakeSlowSource) count() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.calls
 }
 
-// slowQueryAt — оператор с ключом дебаунса (pid, старт).
+// slowQueryAt — a statement with the debounce key (pid, start).
 func slowQueryAt(pid int, app string, sec float64, started time.Time, query string) SlowQuery {
 	return SlowQuery{PID: pid, App: app, Seconds: sec, StartedAt: started, Query: query}
 }
 
-// waitSlowPasses ждёт, пока источник отдаст минимум n снимков (стиль
-// TestZoneStatsLoopTicker), и отменяет цикл: после исчерпания плана
-// снимки пусты — рассылок больше не появляется, проверки числа
-// сообщений детерминированы. Счётчик читается через count() под
-// мьютексом фейка: пишет его горутина цикла (гонка под -race, T-190);
-// сам отчёт (reports) читается только после <-done — канал даёт
-// happens-before для всех рассылок цикла.
+// waitSlowPasses waits until the source returns at least n snapshots
+// (the TestZoneStatsLoopTicker style) and cancels the loop: after the
+// plan is exhausted the snapshots are empty — no more deliveries
+// appear, the message count checks are deterministic. The counter is
+// read through count() under the fake's mutex: the loop goroutine
+// writes it (a race under -race, T-190); the report itself (reports) is
+// read only after <-done — the channel provides happens-before for all
+// the loop deliveries.
 func waitSlowPasses(t *testing.T, src *fakeSlowSource, n int, cancel context.CancelFunc, done <-chan error) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
@@ -90,9 +93,9 @@ func TestSlowQueryKey(t *testing.T) {
 	}
 }
 
-// TestSlowQueryLoop_Passes — полный прогон проходов: дебаунс pid+
-// query_start: длящийся оператор молчит, новый старт того же pid —
-// снова событие, завершившийся покидает базу.
+// TestSlowQueryLoop_Passes — a full run of passes: the pid+query_start
+// debounce: a continuing statement is silent, a new start of the same
+// pid is an event again, a finished one leaves the base.
 func TestSlowQueryLoop_Passes(t *testing.T) {
 	t0 := time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
 	long := slowQueryAt(11, "scheduler", 42.3, t0, "UPDATE domains SET …")
@@ -101,12 +104,12 @@ func TestSlowQueryLoop_Passes(t *testing.T) {
 
 	var reports []string
 	src := &fakeSlowSource{passes: [][]SlowQuery{
-		{long},          // старт: 1 новый
-		{long, other},   // длящийся молчит, другой новый
-		{long, other},   // оба длятся — тишина
-		{},              // все закончились
-		{long, restart}, // pid 11: новый старт оператора — событие
-		{long, restart}, // тишина
+		{long},          // start: 1 new one
+		{long, other},   // the continuing one is silent, the other is new
+		{long, other},   // both continue — silence
+		{},              // all finished
+		{long, restart}, // pid 11: a new statement start — an event
+		{long, restart}, // silence
 	}}
 	opts := SlowQueryOptions{
 		Interval: time.Millisecond,
@@ -121,10 +124,10 @@ func TestSlowQueryLoop_Passes(t *testing.T) {
 	if len(reports) != 3 {
 		t.Fatalf("сообщений = %d, want 3 (новый оператор + другой оператор + новый старт)", len(reports))
 	}
-	// Шапка считает новые (события), длящиеся с прошлых проходов —
-	// дополнением «всего в работе». Проход 5: после пустого прохода 4
-	// оба оператора снова «новые» (ключ evicted — на практике
-	// завершившийся оператор не возвращается).
+	// The header counts the new ones (events), those continuing from
+	// previous passes — by the "total in flight" addition. Pass 5: after
+	// the empty pass 4 both statements are "new" again (the key evicted —
+	// in practice a finished statement does not return).
 	for i, want := range []string{
 		"1 медленный запрос (порог 3с)",
 		"1 медленный запрос (порог 3с), всего в работе 2",
@@ -136,18 +139,19 @@ func TestSlowQueryLoop_Passes(t *testing.T) {
 	}
 }
 
-// TestSlowQueryLoop_ErrorKeepsDebounce — сбой источника не роняет базу
-// дебаунса: оператор, наблюдавшийся до ошибки и вернувшийся после (тот
-// же pid+старт — не заканчивался), повторного сообщения не порождает.
+// TestSlowQueryLoop_ErrorKeepsDebounce — a source failure does not drop
+// the debounce base: a statement observed before the error and back
+// after it (the same pid+start — it did not finish) does not produce a
+// repeated message.
 func TestSlowQueryLoop_ErrorKeepsDebounce(t *testing.T) {
 	t0 := time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
 	long := slowQueryAt(21, "analyzer", 31.5, t0, "SELECT …")
 	var reports []string
 	src := &fakeSlowSource{passes: [][]SlowQuery{
-		{long}, // старт: 1 сообщение
-		{long}, // длящийся: тишина
-		{long}, // ошибка источника: Warn без рассылки, база живёт
-		{long}, // возврат снимка: тот же ключ — тишина
+		{long}, // start: 1 message
+		{long}, // continuing: silence
+		{long}, // a source error: a Warn without a delivery, the base lives
+		{long}, // the snapshot returns: the same key — silence
 	}}
 	src.errs = []error{nil, nil, errors.New("БД недоступна"), nil}
 
@@ -162,18 +166,18 @@ func TestSlowQueryLoop_ErrorKeepsDebounce(t *testing.T) {
 	}
 }
 
-// TestSlowQueryLoop_FinishedEvicted — пустой снимок без ошибки — честное
-// «оператор закончился»: ключ покидает базу, повторное наблюдение того
-// же ключа (вырожденный случай — на практике query_start уникален)
-// снова считается событием.
+// TestSlowQueryLoop_FinishedEvicted — an empty snapshot without an
+// error — an honest "the statement finished": the key leaves the base,
+// a re-observation of the same key (a degenerate case — in practice
+// query_start is unique) counts as an event again.
 func TestSlowQueryLoop_FinishedEvicted(t *testing.T) {
 	t0 := time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
 	long := slowQueryAt(21, "analyzer", 31.5, t0, "SELECT …")
 	var reports []string
 	src := &fakeSlowSource{passes: [][]SlowQuery{
-		{long}, // старт: 1 сообщение
-		{},     // закончился: ключ покинул базу
-		{long}, // то же наблюдение снова — ключ уже не в базе: сообщение
+		{long}, // start: 1 message
+		{},     // finished: the key left the base
+		{long}, // the same observation again — the key is no longer in the base: a message
 	}}
 	opts := SlowQueryOptions{Interval: time.Millisecond, Notify: func(text string) { reports = append(reports, text) }}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -200,8 +204,8 @@ func TestSlowQueryLoop_Disabled(t *testing.T) {
 	}
 }
 
-// TestSlowQueryLoop_SourceError — ошибка каждого прохода не убивает
-// цикл и не рассылает пустых сообщений.
+// TestSlowQueryLoop_SourceError — an error of each pass does not kill
+// the loop and does not deliver empty messages.
 func TestSlowQueryLoop_SourceError(t *testing.T) {
 	var reports []string
 	src := &fakeSlowSource{errs: []error{errors.New("БД недоступна")}}
@@ -228,9 +232,9 @@ func TestFormatSlowQueryReport(t *testing.T) {
 	r := formatSlowQueryReport(fresh, len(fresh), 3*time.Second)
 	for _, want := range []string{
 		"🐌 PostgreSQL: 5 медленных запросов (порог 3с)",
-		"• 42.3с [scheduler] pid 101: UPDATE \"domains\" SET check_state = 1, queued_at = now()", // пробелы схлопнуты
+		"• 42.3с [scheduler] pid 101: UPDATE \"domains\" SET check_state = 1, queued_at = now()", // spaces collapsed
 		"• 7.8с [http-worker] pid 202: SELECT * FROM domains WHERE id = 42",
-		"• 4.2с pid 203: " + strings.Repeat("x", slowQueryMaxChars) + "…", // без метки, обрезка
+		"• 4.2с pid 203: " + strings.Repeat("x", slowQueryMaxChars) + "…", // no label, truncation
 		"…и ещё 2",
 	} {
 		if !strings.Contains(r, want) {
@@ -244,14 +248,14 @@ func TestFormatSlowQueryReport(t *testing.T) {
 		t.Errorf("тотальное число равно новым — дополнение %q не нужно:\n%s", s, r)
 	}
 
-	// Длящиеся с прошлых проходов: 2 в работе, 1 новое.
+	// Continuing from previous passes: 2 in flight, 1 new.
 	r = formatSlowQueryReport(fresh[:1], 2, 3*time.Second)
 	if !strings.Contains(r, "1 медленный запрос (порог 3с), всего в работе 2") {
 		t.Errorf("шапка без «всего в работе 2»:\n%s", r)
 	}
 
-	// Один запрос — единственное число; нецелый порог — как есть;
-	// скрытый текст — пометка.
+	// One query — the singular; a non-whole threshold — as is;
+	// hidden text — the marker.
 	r = formatSlowQueryReport([]SlowQuery{slowQueryAt(7, "monitor-cli", 9.1, t0, "")}, 1, 2500*time.Millisecond)
 	for _, want := range []string{
 		"1 медленный запрос (порог 2.5с",
@@ -262,8 +266,8 @@ func TestFormatSlowQueryReport(t *testing.T) {
 		}
 	}
 
-	// Согласование числительных: 23 — «запроса» (2–4), 11 и 12 —
-	// «запросов» (исключение десятков), 21 — «запрос».
+	// The numeral agreement: 23 — the paucal form (2–4), 11 and 12 —
+	// the genitive plural (the tens exception), 21 — the singular.
 	for n, want := range map[int]string{
 		2: "медленных запроса", 5: "медленных запросов",
 		11: "медленных запросов", 21: "медленный запрос", 23: "медленных запроса",

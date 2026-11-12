@@ -1,8 +1,9 @@
-// Юнит-тесты рендер-долга (T-175): снимок (счётчик crawler_counters из
-// пула + лаг q:render), сводка одной строкой, деградации источников
-// (обязана быть ошибкой, не тихим нулём), цикл одним проходом на фейках
-// с проверкой gauge crawler_render_pending_domains. Живые БД/Redis —
-// вне юнит-тестов (герметичность, стиль alerts_test.go).
+// Render debt unit tests (T-175): the snapshot (the crawler_counters
+// counter from the pool + the q:render lag), the one-line summary,
+// source degradations (it must be an error, not a silent zero), the
+// loop with one pass on fakes with a check of the
+// crawler_render_pending_domains gauge. Live DB/Redis are outside
+// unit tests (hermeticity, the alerts_test.go style).
 package monitor
 
 import (
@@ -19,8 +20,8 @@ import (
 	"crawler/internal/queue"
 )
 
-// TestRenderDebtValue — арифметика и сводка одной строкой (тот же текст
-// в журнале цикла, детали алерта и строке отчёта нагрузки).
+// TestRenderDebtValue — the arithmetic and the one-line summary (the
+// same text in the loop log, the alert detail and the load report line).
 func TestRenderDebtValue(t *testing.T) {
 	d := RenderDebt{Flags: 443000, Lag: 99120}
 	if d.Total() != 542120 {
@@ -35,8 +36,9 @@ func TestRenderDebtValue(t *testing.T) {
 	}
 }
 
-// TestRenderDebtReader — источник читает счётчик из пула и лаг q:render;
-// nil-зависимости и ошибки — ошибки источника (не нули).
+// TestRenderDebtReader — the source reads the counter from the pool and
+// the q:render lag; nil dependencies and errors are source errors
+// (not zeros).
 func TestRenderDebtReader(t *testing.T) {
 	ctx := context.Background()
 
@@ -49,7 +51,7 @@ func TestRenderDebtReader(t *testing.T) {
 	if d.Flags != 443000 || d.Lag != 99120 || d.Total() != 542120 {
 		t.Fatalf("снимок = %+v, want флаги 443000 лаг 99120", d)
 	}
-	// SQL — точный контракт (фейк падает на неожидаемом).
+	// The SQL — the exact contract (the fake fails on the unexpected).
 	if calls := pool.calls(); len(calls) != 1 || calls[0].sql != renderDebtFlagsSQL {
 		t.Fatalf("запросов = %+v, want один renderDebtFlagsSQL", calls)
 	}
@@ -57,7 +59,7 @@ func TestRenderDebtReader(t *testing.T) {
 		t.Fatalf("Len звали для %v, want только q:render", streams)
 	}
 
-	// nil-зависимости.
+	// Nil dependencies.
 	if _, err := (RenderDebtReader{}).RenderDebt(ctx); err == nil {
 		t.Error("пул nil: хочу ошибку")
 	}
@@ -65,7 +67,7 @@ func TestRenderDebtReader(t *testing.T) {
 		t.Error("Redis nil: хочу ошибку")
 	}
 
-	// Ошибки источника — ошибки (молчаливый ноль сделал бы gauge ложью).
+	// Source errors are errors (a silent zero would make the gauge a lie).
 	poolErr := &alertsPool{debtErrs: []error{errors.New("бд недоступна")}}
 	if _, err := (RenderDebtReader{Pool: poolErr, Redis: lener}).RenderDebt(ctx); err == nil ||
 		!strings.Contains(err.Error(), "счётчик") {
@@ -95,10 +97,11 @@ func TestRenderDebtReader(t *testing.T) {
 	}
 }
 
-// TestRenderDebtLoopOnePass — отмена до старта: стартовый проход
-// выполняется, gauge пишется флагами (лаг — территория
-// crawler_queue_depth), сводка — Debug (журнал не флудит), цикл выходит
-// nil; сбой источника — Warn без записи gauge.
+// TestRenderDebtLoopOnePass — a cancellation before the start: the
+// starting pass runs, the gauge is written with the flags (the lag is
+// the territory of crawler_queue_depth), the summary is Debug (the log
+// does not flood), the loop exits nil; a source failure — a Warn
+// without writing the gauge.
 func TestRenderDebtLoopOnePass(t *testing.T) {
 	pool := &alertsPool{debt: []int64{443000}}
 	lener := &fakeLener{lens: map[string]int64{queue.StreamRender: 99120}}
@@ -136,10 +139,11 @@ func TestRenderDebtLoopOnePass(t *testing.T) {
 		t.Errorf("сводка пишется не одной строкой на проход:\n%s", buf.String())
 	}
 
-	// Сбой источника — Warn каждого прохода, цикл живёт, gauge держит
-	// последнее значение (hold-last): источник с постоянной ошибкой и
-	// живым ctx (отмена глушит Warn — часть остановки, стиль
-	// ZoneStatsLoop), проходы считаются по вызовам источника.
+	// A source failure — a Warn of each pass, the loop keeps living, the
+	// gauge holds the last value (hold-last): a source with a permanent
+	// error and a live ctx (a cancellation mutes the Warn — part of the
+	// shutdown, the ZoneStatsLoop style), the passes are counted by the
+	// source calls.
 	failing := &fakeRenderDebtSource{err: errors.New("бд недоступна")}
 	var buf2 bytes.Buffer
 	ctx2, cancel2 := context.WithCancel(context.Background())
@@ -173,14 +177,15 @@ func TestRenderDebtLoopOnePass(t *testing.T) {
 		t.Errorf("gauge после сбоя = %v (found=%v), want прежние 443000 (hold-last)", v, ok)
 	}
 
-	// nil-источник — ошибка цикла (контракт OnRun).
+	// A nil source — a loop error (the OnRun contract).
 	if err := RenderDebtLoop(context.Background(), nil, RenderDebtOptions{}); err == nil {
 		t.Error("источник nil: хочу ошибку")
 	}
 }
 
-// fakeRenderDebtSource — RenderDebtSource по заготовке с постоянной
-// ошибкой и счётчиком вызовов (синхронизация теста с горутиной цикла).
+// fakeRenderDebtSource — a RenderDebtSource from a preset with a
+// permanent error and a call counter (syncing the test with the loop
+// goroutine).
 type fakeRenderDebtSource struct {
 	mu    sync.Mutex
 	debt  RenderDebt

@@ -1,9 +1,11 @@
-// Тесты триажа мутантов CI-прогона 09.11.2026 (половина A): добивки
-// slowqueries.go — источник PGSlowQueries (пул не задан, SQL-контракт и
-// параметры, дефолт лимита, ошибки Query/Scan/Err), согласование
-// числительных по всему диапазону, ключ дебаунса, порог целыми
-// секундами, метрики (метка unknown без application_name) и пины
-// констант. Фейк пула — zonestatsFakePool (тот же интерфейс db.DB).
+// Triage tests of the mutants of the CI run of Nov 09 2026 (half A):
+// the finishing work on slowqueries.go — the PGSlowQueries source
+// (the pool not set, the SQL contract and the parameters, the limit
+// default, the Query/Scan/Err errors), the numeral agreement over the
+// whole range, the debounce key, the threshold as whole seconds, the
+// metrics (the unknown label without an application_name) and the
+// constant pins. The pool fake is zonestatsFakePool (the same db.DB
+// interface).
 package monitor
 
 import (
@@ -23,14 +25,14 @@ func TestPGSlowQueries_NoPool(t *testing.T) {
 	}
 }
 
-// slowScanRow — строка снимка pg_stat_activity правильной ширины.
+// slowScanRow — a pg_stat_activity snapshot row of the right width.
 func slowScanRow(pid int, app string, sec float64, query string) []any {
 	return []any{pid, app, sec, time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC), query}
 }
 
-// TestPGSlowQueries_Contract — точный SQL-текст и параметры: исключение
-// своего application_name, порог секундами (float), лимит строк;
-// нулевой/отрицательный лимит — дефолт.
+// TestPGSlowQueries_Contract — the exact SQL text and parameters: the
+// exclusion of its own application_name, the threshold in seconds
+// (a float), the row limit; a zero/negative limit — the default.
 func TestPGSlowQueries_Contract(t *testing.T) {
 	pool := &zonestatsFakePool{steps: []zonestatsStep{{rows: zonestatsRows()}}}
 	src := PGSlowQueries{Pool: pool, ExcludeApp: "monitor"}
@@ -65,20 +67,20 @@ func TestPGSlowQueries_Contract(t *testing.T) {
 	}
 }
 
-// TestPGSlowQueries_Errors — ошибки Query/Scan/Err роняют источник.
+// TestPGSlowQueries_Errors — Query/Scan/Err errors fail the source.
 func TestPGSlowQueries_Errors(t *testing.T) {
 	src := PGSlowQueries{Pool: &zonestatsFakePool{steps: []zonestatsStep{{err: errors.New("бд недоступна")}}}}
 	if q, err := src.SlowQueries(context.Background(), time.Second); err == nil || q != nil {
 		t.Errorf("Query-ошибка: (%v, %v), want nil и ошибка", q, err)
 	}
-	// Строка не той ширины — Scan-ошибка с контекстом «чтение».
+	// A row of the wrong width — a Scan error with the "reading" context.
 	narrow := &zonestatsFakePool{steps: []zonestatsStep{
 		{rows: zonestatsRows([]any{7, "app"})}}}
 	if _, err := (PGSlowQueries{Pool: narrow}).SlowQueries(context.Background(), time.Second); err == nil ||
 		!strings.Contains(err.Error(), "чтение") {
 		t.Errorf("Scan-ошибка = %v, want контекст чтения", err)
 	}
-	// Ошибка итерации после строки — ошибка источника.
+	// An iteration error after a row — a source error.
 	r := &zonestatsFakeRows{rows: [][]any{slowScanRow(11, "scheduler", 42.3, "SELECT 1")}, err: errors.New("обрыв")}
 	if _, err := (PGSlowQueries{Pool: &zonestatsFakePool{steps: []zonestatsStep{{rows: r}}}}).
 		SlowQueries(context.Background(), time.Second); err == nil ||
@@ -87,8 +89,8 @@ func TestPGSlowQueries_Errors(t *testing.T) {
 	}
 }
 
-// TestSlowQueriesPluralAll — согласование числительных по диапазону
-// (дифференциальный прогон против эталона русской множественной формы).
+// TestSlowQueriesPluralAll — the numeral agreement over the whole range
+// (a differential run against the reference Russian plural form).
 func TestSlowQueriesPluralAll(t *testing.T) {
 	plural := func(n int) string {
 		switch {
@@ -107,8 +109,8 @@ func TestSlowQueriesPluralAll(t *testing.T) {
 	}
 }
 
-// TestSlowQueryKeyExact — ключ дебаунса — pid и наносекунды старта
-// десятичной записью.
+// TestSlowQueryKeyExact — the debounce key — the pid and the start's
+// nanoseconds in decimal notation.
 func TestSlowQueryKeyExact(t *testing.T) {
 	at := time.Date(2026, 10, 24, 12, 0, 0, 123456789, time.UTC)
 	q := SlowQuery{PID: 42, StartedAt: at}
@@ -118,8 +120,8 @@ func TestSlowQueryKeyExact(t *testing.T) {
 	}
 }
 
-// TestSlowDurStringExact — целые секунды — без дробного хвоста, даже
-// гигантские (мутант FormatFloat дал бы экспоненту).
+// TestSlowDurStringExact — whole seconds — without a fractional tail,
+// even gigantic ones (a FormatFloat mutant would give an exponent).
 func TestSlowDurStringExact(t *testing.T) {
 	for d, want := range map[time.Duration]string{
 		3 * time.Second:          "3",
@@ -133,7 +135,7 @@ func TestSlowDurStringExact(t *testing.T) {
 	}
 }
 
-// TestSlowQueryConsts — пины констант цикла.
+// TestSlowQueryConsts — the pins of the loop constants.
 func TestSlowQueryConsts(t *testing.T) {
 	if DefaultSlowQueryInterval != 10*time.Second {
 		t.Errorf("DefaultSlowQueryInterval = %v, want 10s", DefaultSlowQueryInterval)
@@ -152,7 +154,7 @@ func TestSlowQueryConsts(t *testing.T) {
 	}
 }
 
-// slowCounterValue — текущее значение счётчика с метками.
+// slowCounterValue — the current counter value with labels.
 func slowCounterValue(t *testing.T, reg *metrics.Registry, name string, labels map[string]string) (float64, bool) {
 	t.Helper()
 	families, err := reg.Gather()
@@ -182,8 +184,8 @@ func slowCounterValue(t *testing.T, reg *metrics.Registry, name string, labels m
 	return 0, false
 }
 
-// TestSlowQueryMetricsObserve — gauge текущих и счётчик по метке
-// сервиса; пустая метка — unknown.
+// TestSlowQueryMetricsObserve — the current gauge and the counter by
+// the service label; an empty label — unknown.
 func TestSlowQueryMetricsObserve(t *testing.T) {
 	reg := metrics.New("monitor")
 	m := newSlowQueryMetrics(reg)
@@ -199,7 +201,7 @@ func TestSlowQueryMetricsObserve(t *testing.T) {
 			t.Errorf("total{app=%s} = (%v, %v), want %v", app, v, ok, want)
 		}
 	}
-	// nil-приёмник — no-op без паники.
+	// A nil receiver — a no-op without a panic.
 	var nilm *slowQueryMetrics
 	nilm.observe(0, nil)
 }

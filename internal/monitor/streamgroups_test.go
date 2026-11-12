@@ -1,8 +1,8 @@
-// Тесты источника групп стримов (T-162): XINFO GROUPS + XLEN по рабочим
-// стримам, глубина группы — формула гейта (min(lag, XLEN) + pending,
-// кламп T-168, неопределённый лаг −1), last-delivered-id проходит как
-// есть; стрим без ключа — пустой вклад (не ошибка), ошибка чтения —
-// ошибка прохода.
+// Stream group source tests (T-162): XINFO GROUPS + XLEN over the
+// worker streams, the group depth — the gate formula (min(lag, XLEN) +
+// pending, the T-168 clamp, an undefined lag of −1), last-delivered-id
+// passes through as is; a stream without a key — no contribution
+// (not an error), a read error — a pass error.
 package monitor
 
 import (
@@ -16,12 +16,12 @@ import (
 	"crawler/internal/queue"
 )
 
-// fakeGroupsRedis — окно go-redis: XINFO GROUPS и XLEN по заготовкам
-// (стиль fakeBackpressure в internal/queue).
+// fakeGroupsRedis — a go-redis window: XINFO GROUPS and XLEN from
+// presets (the fakeBackpressure style in internal/queue).
 type fakeGroupsRedis struct {
 	groups map[string][]redis.XInfoGroup
 	xlen   map[string]int64
-	// groupErrs/lensErrs — ошибки по стримам (очередь из одного элемента).
+	// groupErrs/lensErrs — per-stream errors (a one-element queue).
 	groupErrs map[string]error
 	lensErrs  map[string]error
 }
@@ -36,7 +36,7 @@ func (f *fakeGroupsRedis) XInfoGroups(_ context.Context, key string) *redis.XInf
 		cmd.SetVal(grp)
 		return cmd
 	}
-	// стрима нет — как Redis: ошибка no such key.
+	// the stream does not exist — like Redis: a no such key error.
 	cmd.SetErr(redis.Nil)
 	return cmd
 }
@@ -51,16 +51,17 @@ func (f *fakeGroupsRedis) XLen(_ context.Context, key string) *redis.IntCmd {
 	return cmd
 }
 
-// TestRedisStreamGroups — глубина группы и last-delivered-id по каждой
-// группе рабочих стримов; кламп лага по XLEN; группы не у всех стримов.
+// TestRedisStreamGroups — the group depth and last-delivered-id for each
+// worker stream group; the lag clamp by XLEN; not all streams have
+// groups.
 func TestRedisStreamGroups(t *testing.T) {
 	rdb := &fakeGroupsRedis{
 		groups: map[string][]redis.XInfoGroup{
-			// lag 98 при XLEN 50 — кламп: min(98, 50) + pending 2 = 52.
+			// lag 98 at XLEN 50 — the clamp: min(98, 50) + pending 2 = 52.
 			queue.StreamRender: {{
 				Name: "render-worker", Lag: 98, Pending: 2, LastDeliveredID: "1761280800000-0",
 			}},
-			// Неопределённый лаг (−1) — только pending (T-168).
+			// An undefined lag (−1) — pending only (T-168).
 			queue.StreamAnalyze: {{
 				Name: "analyzer", Lag: -1, Pending: 5, LastDeliveredID: "0-0",
 			}},
@@ -89,8 +90,9 @@ func TestRedisStreamGroups(t *testing.T) {
 		t.Errorf("q:analyze/analyzer = %+v, want depth=5 (lag −1: только pending) и ID 0-0", ana)
 	}
 
-	// Стрим с ключом, но без групп (потребители не создавались) — вклада
-	// нет: замерять доставки не по кому.
+	// A stream with a key but without groups (the consumers were never
+	// created) — no contribution: there is no one whose deliveries
+	// could be measured.
 	rdb2 := &fakeGroupsRedis{
 		groups: map[string][]redis.XInfoGroup{queue.StreamDNS: {}},
 		xlen:   map[string]int64{queue.StreamDNS: 10},
@@ -100,8 +102,8 @@ func TestRedisStreamGroups(t *testing.T) {
 	}
 }
 
-// TestRedisStreamGroupsErrors — ошибка чтения (не «нет ключа») любого
-// стрима — ошибка прохода с именем стрима; nil-клиент — ошибка.
+// TestRedisStreamGroupsErrors — a read error (not "no key") of any
+// stream — a pass error with the stream name; a nil client — an error.
 func TestRedisStreamGroupsErrors(t *testing.T) {
 	rdb := &fakeGroupsRedis{
 		groups:    map[string][]redis.XInfoGroup{},
@@ -115,7 +117,7 @@ func TestRedisStreamGroupsErrors(t *testing.T) {
 
 	rdb2 := &fakeGroupsRedis{
 		groups: map[string][]redis.XInfoGroup{
-			// группa есть, XLEN падает — тоже ошибка прохода.
+			// the group exists, XLEN fails — also a pass error.
 			queue.StreamDNS: {{Name: "dns-worker", Lag: 1, Pending: 0}},
 		},
 		xlen:     map[string]int64{},

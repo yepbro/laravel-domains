@@ -1,19 +1,21 @@
-// Метрики событий юнитов crawler (T-145, ТЗ 5.9): gauge
-// crawler_unit_oom_events{unit,kind} (oom/oom_kill из memory.events) и
-// crawler_unit_restarts{unit} (NRestarts). Значения монотонны внутри
-// жизни cgroup/юнита, но обнуляются пересозданием cgroup на рестарте —
-// gauge, а не counter: сброс counter'а в Prometheus лживо выглядит
-// скачком rate/increase, gauge честно отражает «текущее число событий
-// юнита» (counter-семантика у crawler_laravel_appeared_total корректна
-// ровно потому, что там журнал append-only и сбросов нет).
+// Crawler unit event metrics (T-145, spec 5.9): the crawler_unit_oom_events
+// {unit,kind} gauge (oom/oom_kill from memory.events) and
+// crawler_unit_restarts{unit} (NRestarts). The values are monotonic within
+// the life of a cgroup/unit but reset when the cgroup is recreated on a
+// restart — a gauge, not a counter: a counter reset in Prometheus falsely
+// looks like a rate/increase jump, while a gauge honestly reflects "the
+// current number of unit events" (the counter semantics of
+// crawler_laravel_appeared_total are correct precisely because its log is
+// append-only and has no resets).
 //
-// Архитектурно — обёртка источника UnitEventsSource, а не хук
-// AlertsOptions.OnPass: данные для приборов — вход прохода алертов, а
-// не итог (AlertSnapshot не несёт пер-юнитных значений), и чтение
-// источников дорого дублировать отдельным циклом. Один проход читает
-// источник один раз — обёртка зеркалит результат в метрики и возвращает
-// его оценщику; тот же шов, что CleanupMetrics.Observe (T-099), с той
-// разницей, что шов у источника, а не у хука.
+// Architecturally this is a wrapper over the UnitEventsSource, not a hook
+// on AlertsOptions.OnPass: the data feeding the instruments is the input
+// of the alert pass, not the outcome (AlertSnapshot carries no per-unit
+// values), and duplicating the source reads with a separate loop is
+// expensive. One pass reads the source once — the wrapper mirrors the
+// result into the metrics and returns it to the evaluator; the same seam
+// as CleanupMetrics.Observe (T-099), with the difference that the seam is
+// at the source, not at the hook.
 package monitor
 
 import (
@@ -24,26 +26,26 @@ import (
 	"crawler/internal/metrics"
 )
 
-// UnitEventsMetrics — приборы событий юнитов поверх другого
-// UnitEventsSource (транзит + зеркало в метрики).
+// UnitEventsMetrics is crawler unit event instruments on top of another
+// UnitEventsSource (transit + mirroring into metrics).
 type UnitEventsMetrics struct {
-	// events — crawler_unit_oom_events{unit,kind}: oom/oom_kill.
+	// events is crawler_unit_oom_events{unit,kind}: oom/oom_kill.
 	events *prometheus.GaugeVec
-	// memHigh — crawler_unit_memory_high_events{unit}: memory.events high.
+	// memHigh is crawler_unit_memory_high_events{unit}: memory.events high.
 	memHigh *prometheus.GaugeVec
-	// restarts — crawler_unit_restarts{unit}: NRestarts.
+	// restarts is crawler_unit_restarts{unit}: NRestarts.
 	restarts *prometheus.GaugeVec
-	// src — исходный источник (обязателен).
+	// src is the underlying source (required).
 	src UnitEventsSource
 }
 
-// compile-time: UnitEventsMetrics — UnitEventsSource.
+// compile-time: UnitEventsMetrics is a UnitEventsSource.
 var _ UnitEventsSource = (*UnitEventsMetrics)(nil)
 
-// NewUnitEventsMetrics оборачивает src источником с метриками в reg;
-// nil reg — чистый транзит (изолированные сборки без реестра, стиль
-// NewNearGauge). Идемпотентен (T-076): повторная регистрация идентичных
-// приборов делит уже созданные векторы.
+// NewUnitEventsMetrics wraps src with a metrics source in reg;
+// a nil reg is pure transit (isolated builds without a registry, the
+// NewNearGauge style). Idempotent (T-076): re-registering identical
+// instruments shares the already created vectors.
 func NewUnitEventsMetrics(reg *metrics.Registry, src UnitEventsSource) *UnitEventsMetrics {
 	m := &UnitEventsMetrics{src: src}
 	if reg == nil {
@@ -64,9 +66,10 @@ func NewUnitEventsMetrics(reg *metrics.Registry, src UnitEventsSource) *UnitEven
 	return m
 }
 
-// UnitEvents читает исходный источник и зеркалит результат в метрики.
-// Ошибка источника метрики не трогает — держат последнее значение
-// (hold-last, как сэмплер t092): сбой чтения не рвёт график.
+// UnitEvents reads the underlying source and mirrors the result into
+// the metrics. A source error leaves the metrics untouched — they keep
+// the last value (hold-last, like the t092 sampler): a read failure
+// does not tear the graph.
 func (m *UnitEventsMetrics) UnitEvents(ctx context.Context) ([]UnitEvents, error) {
 	list, err := m.src.UnitEvents(ctx)
 	if err != nil {

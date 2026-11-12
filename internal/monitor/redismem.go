@@ -1,14 +1,16 @@
-// Источник памяти Redis для алерта redis_memory (T-154, ТЗ 5.9/3.2):
-// used_memory/maxmemory из INFO memory того же клиента go-redis, что
-// читает глубины стримов (cmd/monitor). При политике noeviction (бюджет
-// Redis ≤ 0,5 ГБ, ТЗ 3.2 — docs/redis.md) заполнение maxmemory —
-// отказ записи XADD («OOM command not allowed», инциденты T-093 и 22.10:
-// docs/load-measurements.md §11.1): прямого счётчика отказов INFO не
-// отдаёт, доля памяти — прокси-метрика предстоящих отказов.
+// Redis memory source for the redis_memory alert (T-154, spec 5.9/3.2):
+// used_memory/maxmemory from INFO memory of the same go-redis client
+// that reads stream depths (cmd/monitor). Under the noeviction policy
+// (the Redis budget ≤ 0.5 GB, spec 3.2 — docs/redis.md) filling up
+// maxmemory means XADD write failures ("OOM command not allowed",
+// the T-093 and Oct 22 incidents: docs/load-measurements.md §11.1):
+// INFO exposes no direct failure counter; the memory share is a proxy
+// metric for upcoming failures.
 //
-// Разбор — вручную по строкам «ключ:значение» (секции «# …» — комментарии):
-// нужны три поля, формат фиксирован сервером; полноценный парсер INFO
-// не окупает зависимость (стиль parseBadHashesExposition).
+// Parsing is manual, over "key:value" lines (the "# …" sections are
+// comments): only three fields are needed, the format is fixed by the
+// server; a full INFO parser does not pay for the dependency
+// (parseBadHashesExposition style).
 package monitor
 
 import (
@@ -20,46 +22,46 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// RedisMemory — снимок памяти Redis из INFO memory.
+// RedisMemory is a Redis memory snapshot from INFO memory.
 type RedisMemory struct {
-	// UsedBytes — used_memory: байты набора данных целиком (вместе со
-	// служебными структурами сервера — именно эта величина ограничена
-	// maxmemory, а не «полезные» данные стримов).
+	// UsedBytes is used_memory: the byte size of the whole dataset
+	// (server overhead structures included — this is exactly the value
+	// capped by maxmemory, not the "useful" stream data).
 	UsedBytes int64
-	// MaxBytes — maxmemory: потолок в байтах; 0 — потолка нет
-	// (алерт по доле тогда не применим).
+	// MaxBytes is maxmemory: the cap in bytes; 0 — no cap
+	// (the share alert does not apply then).
 	MaxBytes int64
-	// Policy — maxmemory_policy (боевая — noeviction, ТЗ 3.2).
+	// Policy is maxmemory_policy (production runs noeviction, spec 3.2).
 	Policy string
 }
 
-// RedisMemorySource — источник памяти Redis; интерфейс для подмены в
-// юнит-тестах (реальное чтение — INFO живого Redis, в тестах его нет).
-// Стиль WearSource/UnitEventsSource.
+// RedisMemorySource is a Redis memory source; an interface for
+// substitution in unit tests (the real read is INFO from a live Redis,
+// which tests do not have). WearSource/UnitEventsSource style.
 type RedisMemorySource interface {
-	// RedisMemory возвращает снимок INFO memory. Ошибка = «не измеряется»
-	// с причиной.
+	// RedisMemory returns an INFO memory snapshot. An error means
+	// "not measured", with the reason attached.
 	RedisMemory(ctx context.Context) (RedisMemory, error)
 }
 
-// redisInfoCmd — окно в go-redis: только INFO (узкое, как claimStreams/
-// redisDepth в internal/queue); *redis.Client (queue.NewClient)
-// и *redis.ClusterClient удовлетворяют интерфейсу.
+// redisInfoCmd is a window into go-redis: INFO only (narrow, like
+// claimStreams/redisDepth in internal/queue); *redis.Client
+// (queue.NewClient) and *redis.ClusterClient satisfy the interface.
 type redisInfoCmd interface {
 	Info(ctx context.Context, section ...string) *redis.StringCmd
 }
 
-// RedisInfo — RedisMemorySource поверх INFO memory.
+// RedisInfo is a RedisMemorySource on top of INFO memory.
 type RedisInfo struct {
-	// RDB — клиент Redis (тот же, что у гейта глубин, cmd/monitor);
-	// nil — ошибка источника.
+	// RDB is the Redis client (the same one the depth gate uses,
+	// cmd/monitor); nil — a source error.
 	RDB redisInfoCmd
 }
 
-// compile-time: RedisInfo — RedisMemorySource.
+// compile-time: RedisInfo is a RedisMemorySource.
 var _ RedisMemorySource = RedisInfo{}
 
-// RedisMemory читает секцию memory ответа INFO и разбирает её.
+// RedisMemory reads the memory section of the INFO response and parses it.
 func (s RedisInfo) RedisMemory(ctx context.Context) (RedisMemory, error) {
 	if s.RDB == nil {
 		return RedisMemory{}, fmt.Errorf("monitor: память Redis: клиент не задан")
@@ -71,12 +73,13 @@ func (s RedisInfo) RedisMemory(ctx context.Context) (RedisMemory, error) {
 	return parseRedisMemoryINFO(raw)
 }
 
-// parseRedisMemoryINFO разбирает ответ INFO: строки «ключ:значение»,
-// заголовки секций («# Memory») и пустые строки пропускаются; нужны поля
-// used_memory, maxmemory, maxmemory_policy. Отсутствие поля или
-// нечисловое/отрицательное значение байт — ошибка: формат фиксирован
-// сервером, кривой ответ — не молчать (стиль parseMemoryEvents).
-// Выделен чистой функцией для табличного теста без Redis.
+// parseRedisMemoryINFO parses the INFO response: "key:value" lines,
+// section headers ("# Memory") and empty lines are skipped; the fields
+// used_memory, maxmemory, maxmemory_policy are required. A missing field
+// or a non-numeric/negative byte value is an error: the format is fixed
+// by the server, a malformed response must not be silently ignored
+// (parseMemoryEvents style). Extracted as a pure function for a table
+// test without Redis.
 func parseRedisMemoryINFO(raw string) (RedisMemory, error) {
 	fields := make(map[string]string)
 	for _, line := range strings.Split(raw, "\n") {
@@ -99,7 +102,7 @@ func parseRedisMemoryINFO(raw string) (RedisMemory, error) {
 	return RedisMemory{UsedBytes: used, MaxBytes: max, Policy: policy}, nil
 }
 
-// infoBytes достаёт числовое поле байт из разобранного INFO.
+// infoBytes extracts a numeric byte field from the parsed INFO.
 func infoBytes(fields map[string]string, key string) (int64, error) {
 	v, ok := fields[key]
 	if !ok {

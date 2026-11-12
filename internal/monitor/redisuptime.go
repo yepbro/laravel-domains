@@ -1,17 +1,18 @@
-// Источник аптайма Redis для алерта redis_restart (T-270, ТЗ-fsm §3
-// ФТ-2.2): uptime_in_seconds из INFO server того же клиента go-redis,
-// что читает память (redismem.go) и глубины стримов (cmd/monitor).
-// Рестарт Redis при отсутствии персистентности (docs/redis.md §5 —
-// осознанный выбор) теряет ВСЕ недоставленные записи стримов: потерянные
-// q:dns самолечатся lease-проходом T-029 (строки в queued), а q:http при
-// уже записанном done зависают до компенсатора T-270 — рестарт остаётся
-// главной причиной класса потерь «статус повис» (инцидент 22.10:
-// когорта 1865 доменов, gauge T-256). Алерт даёт оператору сигнал в
-// момент события, не когорту gauge спустя сутки.
+// Redis uptime source for the redis_restart alert (T-270, the TZ-fsm
+// spec §3 FR-2.2): uptime_in_seconds from INFO server of the same
+// go-redis client that reads memory (redismem.go) and stream depths
+// (cmd/monitor). A Redis restart without persistence (docs/redis.md §5 —
+// a deliberate choice) loses ALL undelivered stream entries: lost
+// q:dns entries self-heal by the T-029 lease pass (the lines return to
+// queued), while q:http entries with an already written done hang until
+// the T-270 compensator — a restart remains the main cause of the
+// "status hung" loss class (the Oct 22 incident: a cohort of 1865
+// domains, the T-256 gauge). The alert gives the operator a signal at
+// the moment of the event, not a gauge cohort a day later.
 //
-// Разбор — вручную по строкам «ключ:значение» (секции «# …» —
-// комментарии), как parseRedisMemoryINFO: нужно одно поле, формат
-// фиксирован сервером.
+// Parsing is manual, over "key:value" lines (the "# …" sections are
+// comments), like parseRedisMemoryINFO: one field is needed, the format
+// is fixed by the server.
 package monitor
 
 import (
@@ -21,27 +22,28 @@ import (
 	"strings"
 )
 
-// RedisUptime — снимок аптайма Redis из INFO server.
+// RedisUptime is a Redis uptime snapshot from INFO server.
 type RedisUptime struct {
-	// Seconds — uptime_in_seconds: секунды с запуска сервера; рестарт
-	// обнуляет — «меньше окна» ловит недавний рестарт без памяти машины.
+	// Seconds is uptime_in_seconds: seconds since the server started;
+	// a restart resets it — "below the window" catches a recent restart
+	// without relying on machine memory.
 	Seconds int64
 }
 
-// RedisUptimeSource — источник аптайма Redis; интерфейс для подмены в
-// юнит-тестах (реальное чтение — INFO живого Redis, в тестах его нет).
-// Стиль RedisMemorySource.
+// RedisUptimeSource is a Redis uptime source; an interface for
+// substitution in unit tests (the real read is INFO from a live Redis,
+// which tests do not have). RedisMemorySource style.
 type RedisUptimeSource interface {
-	// RedisUptime возвращает снимок INFO server. Ошибка = «не измеряется»
-	// с причиной.
+	// RedisUptime returns an INFO server snapshot. An error means
+	// "not measured", with the reason attached.
 	RedisUptime(ctx context.Context) (RedisUptime, error)
 }
 
-// compile-time: RedisInfo — и источник памяти, и источник аптайма (INFO
-// разных секций одного клиента).
+// compile-time: RedisInfo is both a memory source and an uptime source
+// (INFO of different sections of the same client).
 var _ RedisUptimeSource = RedisInfo{}
 
-// RedisUptime читает секцию server ответа INFO и разбирает её.
+// RedisUptime reads the server section of the INFO response and parses it.
 func (s RedisInfo) RedisUptime(ctx context.Context) (RedisUptime, error) {
 	if s.RDB == nil {
 		return RedisUptime{}, fmt.Errorf("monitor: аптайм Redis: клиент не задан")
@@ -53,12 +55,13 @@ func (s RedisInfo) RedisUptime(ctx context.Context) (RedisUptime, error) {
 	return parseRedisUptimeINFO(raw)
 }
 
-// parseRedisUptimeINFO разбирает ответ INFO: строки «ключ:значение»,
-// заголовки секций («# Server») и пустые строки пропускаются; нужно поле
-// uptime_in_seconds. Отсутствие поля или нечисловое/отрицательное
-// значение — ошибка: формат фиксирован сервером, кривой ответ — не
-// молчать (стиль parseRedisMemoryINFO). Выделен чистой функцией для
-// табличного теста без Redis.
+// parseRedisUptimeINFO parses the INFO response: "key:value" lines,
+// section headers ("# Server") and empty lines are skipped; the field
+// uptime_in_seconds is required. A missing field or a non-numeric/
+// negative value is an error: the format is fixed by the server, a
+// malformed response must not be silently ignored
+// (parseRedisMemoryINFO style). Extracted as a pure function for a
+// table test without Redis.
 func parseRedisUptimeINFO(raw string) (RedisUptime, error) {
 	fields := make(map[string]string)
 	for _, line := range strings.Split(raw, "\n") {
@@ -73,8 +76,8 @@ func parseRedisUptimeINFO(raw string) (RedisUptime, error) {
 	return RedisUptime{Seconds: secs}, nil
 }
 
-// infoSeconds — числовое поле секунд из разобранного INFO
-// (неотрицательное; парный infoBytes — байты, redismem.go).
+// infoSeconds is a numeric seconds field from the parsed INFO
+// (non-negative; its counterpart infoBytes handles bytes, redismem.go).
 func infoSeconds(fields map[string]string, key string) (int64, error) {
 	v, ok := fields[key]
 	if !ok {

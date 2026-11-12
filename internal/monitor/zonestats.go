@@ -1,84 +1,94 @@
-// Package monitor — служебный сервис мониторинга (ТЗ 5.9). Файл
-// zonestats — реконсиляция инкрементальных счётчиков конвейера (T-178,
-// ТЗИ tasks/TZ_incremental_counters.md §7): один совмещённый проход раз
-// в monitor.zone_stats_interval — единственный полный проход domains в
-// стационаре (замер §12 docs/load-measurements.md: живые агрегаты
-// zoneStatsSQL/domainStatusSQL/backlogSQL/historyStatsSQL — большая
-// часть CPU postgres; T-161 смягчил интервалами/кэшом, T-178 убрал
-// сами проходы из путей чтения — читатели идут по счётчикам, ТЗИ §8).
+// Package monitor — the monitoring utility service (spec 5.9). The
+// zonestats file — reconciliation of the pipeline's incremental counters
+// (T-178, the incremental-counters spec, tasks/TZ_incremental_counters.md
+// §7): one combined pass per monitor.zone_stats_interval — the only full
+// domains pass in steady state (measurement §12 docs/load-measurements.md:
+// the live aggregates zoneStatsSQL/domainStatusSQL/backlogSQL/
+// historyStatsSQL are most of the postgres CPU; T-161 softened it with
+// intervals/cache, T-178 removed the passes themselves from the read
+// paths — readers go by the counters, the incremental-counters spec §8).
 //
-// Проход авторитетен: значение каждого счётчика перезаписывается целиком
-// агрегатом, инкременты переходов (ТЗИ §6, scheduler/ingest/httpworker/
-// analyzer) дают свежесть между проходами. Состав прохода (одна
-// транзакция, один снапшот — согласованность всех позиций на один
-// момент):
+// The pass is authoritative: the value of each counter is overwritten in
+// full by the aggregate, the transition increments (the incremental-counters
+// spec §6, scheduler/ingest/httpworker/analyzer) give freshness between
+// passes. The pass composition (one transaction, one snapshot — the
+// consistency of all positions at one moment):
 //
 //   - zones: domains_total/domains_pending/domains_queued/
-//     domains_checked — один FILTER-агрегат domains GROUP BY zone_id
-//     (партиционный ключ — partitionwise aggregate, как T-078),
-//     domains_laravel — агрегат laravel_domains (T-120). Базовое
-//     множество всех колонок — status <> deleted (унификация ТЗИ §4.1:
-//     удалённый домен не является ни работой, ни прогрессом);
-//   - crawler_counters: строки status_<имя> по model.Statuses (все
-//     строки domains, включая deleted — легенда полная, ТЗИ §4.2),
-//     render_pending — счётчик бита T-175 (тот же предикат, что бэкфилл
-//     миграции 000015 и инкременты renderq: без фильтра статуса; бит
-//     удаляемого домена снимает применение delete той же транзакцией с
-//     декрементом, T-186 — редкие рассинхроны гасит этот проход),
-//     laravel_appeared_total/laravel_lost_total — агрегат
-//     laravel_history (кумулятивы T-118), checks:YYYY-MM-DD — суточный
-//     счётчик проверок (T-179, TZ_slow_done_today §6: живой аналог
-//     прежнего подзапроса count(*) … WHERE last_checked_at =
-//     current_date; имя дня вычисляет БД — отдельным оператором после
-//     скаляров, в unnest-пачку с Go-именем не кладётся: рассинхрон
-//     таймзоны Go/БД молча развёл бы строку и окно FILTER),
-//     temp_error:YYYY-MM-DD — суточный числитель доли temp_error
-//     (T-182, TZ_slow_dns_share §6: та же FILTER-цена нуля, знаменатель
-//     алерта доли — строка checks:), корзины зрелости ретрая
-//     retry_mature:YYYY-MM-DD (T-202: зрелые кандидаты temp_error по
-//     датам эпизодов — guard тяжёлой выборки ретрая; FILTER-колонки
-//     «зрелые сегодня/сегодняшние эпизоды», устаревшие корзины проход
-//     удаляет — живут две строки, вчерашняя и сегодняшняя), часовые
-//     корзины темпа results:/rendered:YYYY-MM-DD"T"HH24 (T-203: окна
-//     «последний час» темпа дашборда; живые подзапросы по
-//     subdomain_results деградировали heap-fetch'ами — контрольная
-//     точка этапа 27; агрегат окна двух живых часов по checked_at —
-//     FILTER-позиции prev/cur, rendered — асинхронный флаг этапа
-//     рендера в часе ЭПИЗОДА строки; проход держит две корзины каждой
-//     семьи — предыдущий час (хвост окна чтения: поздние рендеры
-//     дорабатывают его весь текущий час) и текущий, устаревшие
-//     удаляет) и часовые корзины неанализированных хвостов переанализа
-//     reanalyze:YYYY-MM-DD"T"HH24 (T-204: строки с rules_version IS
-//     NULL по часам эпизодов — guard часового тика переанализа; те же
-//     FILTER-позиции prev/cur агрегата окна, две живые корзины,
-//     устаревшие удаляет), new_done_stale — домены «статус повис»
-//     (status = new ∧ check_state = done ∧ last_checked_at старше
-//     суток, ФТ-2.2 ТЗ-fsm: FILTER-колонка f_new_done_stale того же
-//     скана; стационарно ноль — норма; лечит компенсатор T-270 —
-//     scheduler/stalerequeue.go, guard часового прохода читает эту
-//     строку; gauge/алерт — сигнал о новых потерях);
-//   - дрейф |старое − новое| каждой позиции: до перезаписи читаются
-//     прежние значения, после — новые (транзакция видит собственную
-//     запись); ненулевой дрейф — gauge crawler_counters_drift + Warn
-//     (ТЗИ §7.1.3). Первый проход цикла дрейфом не считается: после
-//     миграции/простоя он заполняет нули (ТЗИ §5).
+//     domains_checked — one FILTER aggregate of domains GROUP BY zone_id
+//     (the partitioning key — a partitionwise aggregate, like T-078),
+//     domains_laravel — the laravel_domains aggregate (T-120). The base
+//     set of all columns is status <> deleted (the unification of the
+//     incremental-counters spec §4.1: a deleted domain is neither work
+//     nor progress);
+//   - crawler_counters: the status_<name> rows by model.Statuses (all
+//     domains rows, deleted included — the legend is complete, the
+//     incremental-counters spec §4.2),
+//     render_pending — the bit counter of T-175 (the same predicate as
+//     the backfill of migration 000015 and the renderq increments: no
+//     status filter; the bit of a deleted domain is cleared by applying
+//     the delete in the same transaction with a decrement, T-186 — rare
+//     desyncs are extinguished by this pass),
+//     laravel_appeared_total/laravel_lost_total — the laravel_history
+//     aggregate (the T-118 cumulatives), checks:YYYY-MM-DD — the daily
+//     checks counter (T-179, TZ_slow_done_today §6: the live analog of
+//     the former count(*) … WHERE last_checked_at = current_date
+//     subquery; the day name is computed by the DB — a separate
+//     statement after the scalars, not put into the unnest batch with
+//     the Go name: a Go/DB timezone desync would silently split the row
+//     and the FILTER window),
+//     temp_error:YYYY-MM-DD — the daily numerator of the temp_error
+//     share (T-182, TZ_slow_dns_share §6: the same zero FILTER cost, the
+//     denominator of the share alert is the checks: row), the retry
+//     maturity baskets retry_mature:YYYY-MM-DD (T-202: mature temp_error
+//     candidates by episode dates — the guard of the heavy retry
+//     selection; the FILTER columns "mature today/today's episodes",
+//     stale baskets the pass deletes — two rows live, yesterday's and
+//     today's), the hourly tempo baskets results:/rendered:YYYY-MM-DD"T"HH24
+//     (T-203: the "last hour" windows of the dashboard tempo; the live
+//     subqueries over subdomain_results degraded with heap fetches — the
+//     checkpoint of stage 27; the two-live-hours window aggregate by
+//     checked_at — the prev/cur FILTER positions, rendered — the async
+//     flag of the render stage in the EPISODE hour of the row; the pass
+//     keeps two baskets of each family — the previous hour (the tail of
+//     the reading window: late renders keep working it all through the
+//     current hour) and the current one, stale ones are deleted) and the
+//     hourly baskets of the unanalyzed reanalysis tails
+//     reanalyze:YYYY-MM-DD"T"HH24 (T-204: rows with rules_version IS
+//     NULL by episode hours — the guard of the hourly reanalysis tick;
+//     the same prev/cur FILTER positions of the window aggregate, two
+//     live baskets, stale ones are deleted), new_done_stale — the
+//     "status hung" domains (status = new ∧ check_state = done ∧
+//     last_checked_at older than a day, FR-2.2 of the TZ-fsm spec: the
+//     f_new_done_stale FILTER column of the same scan; a steady-state
+//     zero is the norm; healed by the T-270 compensator —
+//     scheduler/stalerequeue.go, the guard of its hourly pass reads this
+//     row; the gauge/alert is the signal of new losses);
+//   - the drift |old − new| of each position: before the overwrite the
+//     old values are read, after — the new ones (the transaction sees
+//     its own writes); a non-zero drift — the crawler_counters_drift
+//     gauge + a Warn (the incremental-counters spec §7.1.3). The first
+//     pass of the loop does not count as drift: after a migration/
+//     downtime it fills in the zeros (the incremental-counters spec §5).
 //
-// Скан domains в проходе один: per-zone агрегат dom (FILTER по
-// check_state без фильтра статуса) обслуживает и колонки зон
-// (total/pending/queued/checked — status <> deleted в FILTER), и
-// глобальное распределение статусов + бит рендера (суммы по зонам), и
-// суточные окна проверок с temp_error-числителем (FILTER
-// last_checked_at = current_date × статус, T-179/T-182), и корзины
-// зрелости ретрая temp_error по датам эпизодов (T-202) —
-// дополнительная цена FILTER-колонок ноль (ТЗИ §13.3). Часовые корзины
-// темпа (T-203) и хвостов переанализа (T-204) считаются ОТДЕЛЬНЫМ
-// агрегатом subdomain_results по окну двух живых часов (index-диапазон
-// checked_at — цена пропорциональна окну, в ≤ 2 раза больше прежнего
-// ежеминутного читателя темпа, здесь — раз в zone_stats_interval).
+// The domains scan in the pass is one: the per-zone aggregate dom (the
+// FILTER by check_state without the status filter) serves both the zone
+// columns (total/pending/queued/checked — status <> deleted in FILTER),
+// and the global status distribution + the render bit (the sums over
+// zones), and the daily check windows with the temp_error numerator (the
+// FILTER last_checked_at = current_date × status, T-179/T-182), and the
+// retry maturity baskets of temp_error by episode dates (T-202) — the
+// extra cost of the FILTER columns is zero (the incremental-counters
+// spec §13.3). The hourly tempo baskets (T-203) and the reanalysis tail
+// ones (T-204) are computed by a SEPARATE subdomain_results aggregate
+// over the two-live-hours window (the checked_at index range — the cost
+// is proportional to the window, at most 2× the former per-minute tempo
+// reader, here — once per zone_stats_interval).
 //
-// Семантика колонок зон — комментарий пакета ниже; изменения против
-// T-078 — только расширение (pending/queued), существующие колонки
-// читают лендинг (T-122), crawlerctl status, партиционирование.
+// The semantics of the zone columns — the package comment below; the
+// changes against T-078 are only extensions (pending/queued), the
+// existing columns are read by the landing (T-122), crawlerctl status,
+// partitioning.
 package monitor
 
 import (
@@ -100,33 +110,36 @@ import (
 	"crawler/internal/model"
 )
 
-// DefaultZoneStatsInterval — период реконсиляции: 30 минут. Исходные
-// 60 с (верх коридора ТЗ 5.9) рассчитаны на малый корпус: замер §12
-// docs/load-measurements.md (47 млн строк) — UPDATE-агрегат в тройке
-// главных статей CPU postgres; T-161 поднял до 5 мин, T-178 оставил
-// период реконсиляции тем же: в стационаре это единственный полный
-// проход domains (критерий ТЗИ §1.2). Решение оператора 26.10 (T-199)
-// по заготовке ТЗИ §7.1 «после приработки волны интервал можно
-// разредить до 15–30 мин»: замер окна медленных запросов после деплоя
-// 3bffc62 (25.10 18:16 → 26.10 03:05 UTC) — реконсиляция единственный
-// оставшийся полный проход, 48 % суммарного медленного времени БД
-// (100 событий >3 с, медиана 39 с, max 501 с) при проходе раз в 5 мин;
-// интервал разрежен до 30 мин, дрейф между проходами обязан быть
-// нулевым — по замеру дрейфа оператор видит, когда интервал можно
-// вернуть короче. Коридор ТЗ остаётся доступным конфигом
-// monitor.zone_stats_interval; цикл алертов с T-206 идёт собственным
-// интервалом (monitor.alerts_interval, DefaultAlertsInterval 5 мин) —
-// порог остановки прогресса остаётся в периодах реконсиляции
-// (AlertStallFactor × интервал = 2,5 ч): zones.updated_at пишет этот
-// цикл.
+// DefaultZoneStatsInterval — the reconciliation period: 30 minutes. The
+// original 60 s (the top of the spec 5.9 corridor) targeted a small
+// corpus: measurement §12 docs/load-measurements.md (47 M rows) — the
+// UPDATE aggregate is in the top three of the postgres CPU items; T-161
+// raised it to 5 min, T-178 kept the reconciliation period the same: in
+// steady state it is the only full domains pass (the incremental-counters
+// spec §1.2 criterion). The operator's decision of Oct 26 (T-199) per
+// the incremental-counters spec §7.1 template "after the wave's break-in
+// the interval may be thinned out to 15–30 min": the measurement of the
+// slow query window after the deploy 3bffc62 (Oct 25 18:16 → Oct 26
+// 03:05 UTC) — the reconciliation is the only remaining full pass, 48%
+// of the total slow DB time (100 events >3 s, median 39 s, max 501 s)
+// at a pass every 5 min; the interval was thinned out to 30 min, the
+// drift between passes must be zero — by the drift measurement the
+// operator sees when the interval can be brought back shorter. The
+// spec corridor remains available as the monitor.zone_stats_interval
+// config; since T-206 the alert loop runs on its own interval
+// (monitor.alerts_interval, DefaultAlertsInterval 5 min) — the progress
+// stall threshold remains in reconciliation periods
+// (AlertStallFactor × the interval = 2.5 h): zones.updated_at is written
+// by this loop.
 const DefaultZoneStatsInterval = 30 * time.Minute
 
 // ---------------------------------------------------------------- SQL
 
-// statusAggCols — легенда статусов и их колонки-позиции в per-zone
-// агрегате domainsAggSQL: ОДИН источник для генерации SQL (FILTER-колонки)
-// и чтения в Go (порядок колонок результата) — рассинхронизация легенды
-// model.Statuses и колонок невозможна по построению (ревью P3-4).
+// statusAggCols — the status legend and their column positions in the
+// per-zone domainsAggSQL aggregate: ONE source for both the SQL
+// generation (the FILTER columns) and the Go reading (the result column
+// order) — a desync of the model.Statuses legend and the columns is
+// impossible by construction (review P3-4).
 var statusAggCols = []struct {
 	status model.Status
 	col    string
@@ -142,9 +155,10 @@ var statusAggCols = []struct {
 }
 
 func init() {
-	// Сверка по индексам, а не только по длине (ревью R2 P3-6): замена
-	// одного статуса другим держала бы длину равной — легенда разъехалась
-	// бы молча, агрегат писал бы чужие значения.
+	// A check by indexes, not only by length (review R2 P3-6): replacing
+	// one status with another would keep the length equal — the legend
+	// would drift apart silently and the aggregate would write foreign
+	// values.
 	if len(statusAggCols) != len(model.Statuses) {
 		panic("monitor: statusAggCols не совпадает с model.Statuses по длине — легенда агрегата неполна")
 	}
@@ -155,49 +169,54 @@ func init() {
 	}
 }
 
-// domainsAggSQL — per-zone агрегат живого распределения, статусов и бита
-// рендера ОДНИМ сканом domains (ТЗИ §7.1): FILTER-вариант count считает
-// все позиции за один проход. Коды check_state/status/flags — константы
-// model, вшитые в текст литералами (коды схемы, а не данные — стиль
-// lease.go); GROUP BY по ключу партиционирования (zone_id в листах
-// HASH-субпартиций T-005 входит в PK) позволяет partitionwise
-// aggregate. Фильтра зоны нет: агрегат обслуживает и колонки зон, и
-// глобальные суммы (статусы, бит рендера) — фильтр зон ограничивал бы
-// глобальные счётчики (ТЗИ §9: recount --zone глобальные счётчики
-// пересчитывает всегда). f_render — предикат бэкфилла 000015 и
-// инкрементов T-175 (без фильтра статуса: бит удаляемых доменов снимает
-// применение delete той же транзакцией, T-186, — предикат остаётся
-// статус-нейтральным, как бэкфилл и инкременты). f_checks_today —
-// суточное окно проверок (T-179): тот же предикат
-// last_checked_at = current_date, что у прежнего подзапроса done_today
-// throughputSQL (включая строки deleted — живой аналог их не фильтровал);
-// FILTER-колонка — цена нуля на уже идущем скане (ТЗИ §13.3), сумма по
-// зонам — значение строки checks:YYYY-MM-DD. f_temp_today — числитель
-// доли temp_error суток (T-182, TZ_slow_dns_share §6): то же окно
-// × статус temp_error, FILTER-цена нуля (живой аналог прежнего dnsShareSQL
-// считал окно целиком и ходил в heap за статусом — запрос №6 журнала
-// медленных 24.10), сумма по зонам — значение строки
-// temp_error:YYYY-MM-DD. f_retry_mature_today/f_retry_mature_past —
-// корзины зрелости ретрая temp_error (T-202): зрелые кандидаты
-// (status = temp_error × check_state = done) по датам эпизодов —
-// сегодняшние эпизоды (last_checked_at = current_date, зреют к полуночи
-// следующего дня) и созревшая когорта (last_checked_at <
-// current_date — окно ретрая «старше 24 ч» по date-колонке зреет
-// когортами в полночь); суммы по зонам — значения корзин
-// retry_mature:YYYY-MM-DD, читаемых guard тяжёлой выборки ретрая
-// (scheduler/retry.go, retryMatureSQL), FILTER-цена нуля на том же
-// скане. f_new_done_stale — домены «статус повис» (ФТ-2.2 ТЗ-fsm,
-// T-256): status = new ∧ check_state = done ∧ last_checked_at <
-// current_date — DNS-этап записал ветку «есть адреса» (О6 общей
-// таблицы статусов, internal/model/enums.go), а HTTP-итог (О7–О9) не
-// пришёл (задача q:http потеряна). Граница суток —
-// точность колонки last_checked_at (date, ТЗ 6.1), та же реализация
-// «старше 24 ч», что у окна ретрая T-031/T-202 (retrySelectSQL:
-// date < now() − 24ч эквивалентно date < current_date). NULL
-// last_checked_at не считается: писатели done ставят отметку всегда,
-// NULL у new∧done — мусор ручного SQL, а не повисший статус. Сумма по
-// зонам — значение строки new_done_stale и gauge
-// crawler_domains_new_done_stale; стационарно ноль в норме.
+// domainsAggSQL — the per-zone aggregate of the live distribution,
+// statuses and the render bit by ONE scan of domains (the
+// incremental-counters spec §7.1): the FILTER variant of count counts all
+// the positions in one pass. The check_state/status/flags codes are
+// model constants inlined into the text as literals (schema codes, not
+// data — the lease.go style); GROUP BY on the partitioning key (zone_id
+// in the HASH subpartition leaves of T-005 is part of the PK) enables a
+// partitionwise aggregate. There is no zone filter: the aggregate serves
+// both the zone columns and the global sums (statuses, the render bit) —
+// a zone filter would cap the global counters (the incremental-counters
+// spec §9: recount --zone always recomputes the global counters).
+// f_render — the predicate of the 000015 backfill and the T-175
+// increments (no status filter: the bit of deleted domains is cleared by
+// applying the delete in the same transaction, T-186, — the predicate
+// stays status-neutral, like the backfill and the increments).
+// f_checks_today — the daily checks window (T-179): the same predicate
+// last_checked_at = current_date as the former done_today throughputSQL
+// subquery (deleted rows included — the live analog did not filter
+// them); the FILTER column costs zero on the already running scan (the
+// incremental-counters spec §13.3), the sum over zones is the value of
+// the checks:YYYY-MM-DD row. f_temp_today — the numerator of the daily
+// temp_error share (T-182, TZ_slow_dns_share §6): the same window × the
+// temp_error status, a zero FILTER cost (the former dnsShareSQL live
+// analog counted the window in full and went to the heap for the status
+// — query #6 of the slow-query log of Oct 24), the sum over zones is the
+// value of the temp_error:YYYY-MM-DD row.
+// f_retry_mature_today/f_retry_mature_past — the retry maturity baskets
+// of temp_error (T-202): the mature candidates (status = temp_error ×
+// check_state = done) by episode dates — today's episodes
+// (last_checked_at = current_date, they mature at midnight of the next
+// day) and the matured cohort (last_checked_at < current_date — the
+// retry window "older than 24 h" by the date column matures in cohorts
+// at midnight); the sums over zones are the values of the
+// retry_mature:YYYY-MM-DD baskets read by the guard of the heavy retry
+// selection (scheduler/retry.go, retryMatureSQL), a zero FILTER cost on
+// the same scan. f_new_done_stale — the "status hung" domains (FR-2.2 of
+// the TZ-fsm spec, T-256): status = new ∧ check_state = done ∧
+// last_checked_at < current_date — the DNS stage wrote the "addresses
+// exist" branch (O6 of the general status table,
+// internal/model/enums.go), and the HTTP outcome (O7–O9) did not arrive
+// (the q:http task is lost). The day boundary is the precision of the
+// last_checked_at column (date, spec 6.1), the same "older than 24 h"
+// implementation as the retry window T-031/T-202 (retrySelectSQL:
+// date < now() − 24 h is equivalent to date < current_date). A NULL
+// last_checked_at does not count: the done writers always set the
+// stamp, a NULL at new∧done is manual SQL junk, not a hung status. The
+// sum over zones is the value of the new_done_stale row and the
+// crawler_domains_new_done_stale gauge; steady-state zero is the norm.
 var domainsAggSQL = func() string {
 	cols := make([]string, 0, len(statusAggCols)+10)
 	cols = append(cols,
@@ -218,59 +237,62 @@ var domainsAggSQL = func() string {
 	return "SELECT zone_id, " + strings.Join(cols, ", ") + " FROM domains GROUP BY zone_id"
 }()
 
-// zoneAggRow — строка per-zone агрегата (колонки domainsAggSQL): значения
-// состояний и легенда статусов по порядку statusAggCols + бит рендера +
-// суточное окно проверок (T-179), его temp_error-числитель (T-182),
-// корзины зрелости ретрая (T-202: сегодняшние/созревшие эпизоды
-// temp_error × done) и домены «статус повис» (ФТ-2.2: new ∧ done ∧
-// старше суток).
+// zoneAggRow — a row of the per-zone aggregate (the domainsAggSQL
+// columns): the state values and the status legend in the statusAggCols
+// order + the render bit + the daily checks window (T-179), its
+// temp_error numerator (T-182), the retry maturity baskets (T-202:
+// today's/matured temp_error × done episodes) and the "status hung"
+// domains (FR-2.2: new ∧ done ∧ older than a day).
 type zoneAggRow struct {
 	zone                            int16
 	total, pending, queued, checked int64
-	statuses                        []int64 // по порядку statusAggCols
+	statuses                        []int64 // in the statusAggCols order
 	render                          int64
 	checksToday                     int64 // FILTER last_checked_at = current_date (T-179)
 	tempToday                       int64 // FILTER last_checked_at = current_date AND status = temp_error (T-182)
 	retryToday                      int64 // FILTER status = temp_error AND done AND last_checked_at = current_date (T-202)
 	retryPast                       int64 // FILTER status = temp_error AND done AND last_checked_at < current_date (T-202)
-	newDoneStale                    int64 // FILTER status = new AND done AND last_checked_at < current_date (ФТ-2.2, T-256)
+	newDoneStale                    int64 // FILTER status = new AND done AND last_checked_at < current_date (FR-2.2, T-256)
 }
 
-// recountAggQuerySQL — чтение per-zone агрегата прохода (единственный
-// полный скан domains реконсиляции, ТЗИ §7.1).
+// recountAggQuerySQL — reading the per-zone aggregate of the pass (the
+// only full domains scan of the reconciliation, the incremental-counters
+// spec §7.1).
 var recountAggQuerySQL = "SELECT * FROM (" + domainsAggSQL + ") AS agg ORDER BY zone_id"
 
-// laravelAggQuerySQL — агрегат Laravel-счётчиков зон (T-120): строки
-// laravel_domains уже прошли порог analyzer (§13.1), отдельный порог
-// не нужен.
+// laravelAggQuerySQL — the aggregate of the zone Laravel counters
+// (T-120): the laravel_domains rows have already passed the analyzer
+// threshold (§13.1), a separate threshold is not needed.
 const laravelAggQuerySQL = "SELECT zone_id, count(*) AS laravel FROM laravel_domains GROUP BY zone_id ORDER BY zone_id"
 
-// historyAggSQL — кумулятивы appeared/lost журнала детекции. Размен
-// ТЗИ (§6.5 «убирают часовой seq scan» против §7.1.2 «агрегат
-// laravel_history в проходе»): журнал append-only и на порядок меньше
-// domains (события — только переходы Laravel-находимок), проход раз в
-// zone_stats_interval по нему — секунды против десятков секунд скана
-// domains; инкременты analyzer дают свежесть, агрегат — авторитет.
+// historyAggSQL — the appeared/lost cumulatives of the detection log.
+// The incremental-counters spec trade-off (§6.5 "they remove the hourly
+// seq scan" against §7.1.2 "the laravel_history aggregate in the
+// pass"): the log is append-only and an order of magnitude smaller than
+// domains (the events are only the Laravel find transitions), a pass
+// once per zone_stats_interval over it is seconds against the tens of
+// seconds of the domains scan; the analyzer increments give freshness,
+// the aggregate is the authority.
 const historyAggSQL = "SELECT count(*) FILTER (WHERE appeared) AS h_appeared, " +
 	"count(*) FILTER (WHERE NOT appeared) AS h_lost FROM laravel_history"
 
-// hourlyAggSQL — живой агрегат часовых корзин (T-203): окно двух
-// живых часов по subdomain_results (границы вычисляет БД —
-// date_trunc('hour', now()), индекс checked_at обслуживает диапазон),
-// FILTER-позиции — те же предикаты, что у прежних живых подзапросов
-// results_hour/rendered_hour throughputSQL (та же граница «последний
-// час», календарная: prev — строки часа [trunc(now−1ч), trunc(now)),
-// cur — [trunc(now), …]; WHERE — нижняя граница окна). rendered —
-// асинхронный флаг этапа рендера: позиция часа учитывает строки,
-// отрендеренные ПОЗЖЕ своей проверки — как и инкремент renderworker
-// (час эпизода строки), потому корзины сходятся с живым count(*)
-// по календарному часу. prev_reanalyze/cur_reanalyze (T-204) — хвосты
-// переанализа: строки с rules_version IS NULL (никогда не
-// анализировались — вставка записи результата или замена контента
-// рендером) — предикат guard'а тикового прохода
-// (analyzer/reanalyze.go); цена FILTER-колонки ноль на том же скане.
-// Скалярный агрегат без GROUP BY — ровно одна строка (пустое окно —
-// нули, не пустой набор).
+// hourlyAggSQL — the live aggregate of the hourly baskets (T-203): the
+// two-live-hours window over subdomain_results (the bounds are computed
+// by the DB — date_trunc('hour', now()), the checked_at index serves the
+// range), the FILTER positions are the same predicates as the former
+// live results_hour/rendered_hour subqueries of throughputSQL (the same
+// "last hour" boundary, calendar one: prev — the rows of the hour
+// [trunc(now−1h), trunc(now)), cur — [trunc(now), …]; WHERE — the lower
+// window bound). rendered — the async flag of the render stage: the hour
+// position counts the rows rendered LATER than their check — like the
+// renderworker increment (the hour of the row's episode), which is why
+// the baskets converge with the live count(*) over the calendar hour.
+// prev_reanalyze/cur_reanalyze (T-204) — the reanalysis tails: rows with
+// rules_version IS NULL (never analyzed — an insert of a result record
+// or a content replacement by render) — the predicate of the tick pass
+// guard (analyzer/reanalyze.go); the FILTER column costs zero on the
+// same scan. A scalar aggregate without GROUP BY — exactly one row (an
+// empty window — zeros, not an empty set).
 const hourlyAggSQL = "SELECT " +
 	"count(*) FILTER (WHERE checked_at < date_trunc('hour', now())) AS prev_results, " +
 	"count(*) FILTER (WHERE checked_at < date_trunc('hour', now()) AND rendered) AS prev_rendered, " +
@@ -281,15 +303,17 @@ const hourlyAggSQL = "SELECT " +
 	"FROM subdomain_results " +
 	"WHERE checked_at >= date_trunc('hour', now() - interval '1 hour')"
 
-// recountZonesSQL — перезапись колонок зон значениями агрегата из Go
-// (unnest-пачка; зона без живых доменов получает нули — значение в Go
-// вычислено с нулями по отсутствию в агрегате). Блокирует строки зон
-// ПЕРВЫМИ — до строк crawler_counters (recountCountersSQL): порядок
-// «зоны → счётчики» общий с писателями переходов (httpworker/record.go,
-// analyzer) и исключает циклы блокировок (ревью P3-2). updated_at —
-// момент прохода (живость monitor, ТЗ 5.9 «остановка прогресса»).
-// RETURNING — новые значения колонок для дрейфа (PG16 без RETURNING
-// OLD: старые читаются до оператора в той же транзакции).
+// recountZonesSQL — overwriting the zone columns with the aggregate
+// values from Go (an unnest batch; a zone without live domains gets
+// zeros — the Go value was computed with zeros by its absence from the
+// aggregate). It locks the zone rows FIRST — before the crawler_counters
+// rows (recountCountersSQL): the "zones → counters" order is shared with
+// the transition writers (httpworker/record.go, analyzer) and rules out
+// lock cycles (review P3-2). updated_at — the moment of the pass (the
+// monitor liveness, spec 5.9 "progress stall").
+// RETURNING — the new column values for the drift (PG16 without
+// RETURNING OLD: the old ones are read before the statement in the same
+// transaction).
 const recountZonesSQL = "UPDATE zones AS z " +
 	"SET domains_total = u.total, " +
 	"domains_pending = u.pending, " +
@@ -302,136 +326,142 @@ const recountZonesSQL = "UPDATE zones AS z " +
 	"WHERE z.id = u.id " +
 	"RETURNING z.id, z.domains_total, z.domains_pending, z.domains_queued, z.domains_checked, z.domains_laravel"
 
-// recountCountersSQL — upsert глобальных скаляров значениями из Go
-// (строки создаёт первый проход, ТЗИ §5); блокирует строки
-// crawler_counters ПОСЛЕДНИМИ — после зон (порядок против дедлоков,
-// комментарий recountZonesSQL).
+// recountCountersSQL — upsert of the global scalars with the values from
+// Go (the rows are created by the first pass, the incremental-counters
+// spec §5); it locks the crawler_counters rows LAST — after the zones
+// (the anti-deadlock order, the recountZonesSQL comment).
 const recountCountersSQL = "INSERT INTO crawler_counters (name, value, updated_at) " +
 	"SELECT u.name, u.value, $3 " +
 	"FROM unnest($1::text[], $2::int8[]) AS u(name, value) " +
 	"ON CONFLICT (name) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at " +
 	"RETURNING name, value"
 
-// readZonesSQL — старые значения колонок зон до перезаписи (дрейф).
-// $1 — фильтр зоны (NULL — все).
+// readZonesSQL — the old zone column values before the overwrite
+// (drift). $1 — the zone filter (NULL — all).
 const readZonesSQL = "SELECT id, domains_total, domains_pending, domains_queued, domains_checked, domains_laravel " +
 	"FROM zones WHERE ($1::int2 IS NULL OR id = $1)"
 
-// readCountersSQL — старые значения глобальных счётчиков до upsert
-// (дрейф); отсутствующая строка — старое 0 (первый проход заполняет).
+// readCountersSQL — the old global counter values before the upsert
+// (drift); a missing row — an old value of 0 (the first pass fills it).
 const readCountersSQL = "SELECT name, value FROM crawler_counters WHERE name = ANY($1)"
 
-// readDailyChecksSQL — старое значение строки суточного счётчика
-// проверок до перезаписи (дрейф, T-179): имя дня вычисляет БД
-// (current_date) — та же таймзона, что у FILTER-колонки f_checks_today
-// прохода и now() записи last_checked_at (T-058); пустой результат —
-// строки дня ещё нет (создаёт инкремент записи или этот проход —
-// заполнение, не дрейф, прецедент «первый проход заполняет», ТЗИ §5).
+// readDailyChecksSQL — the old value of the daily checks counter row
+// before the overwrite (drift, T-179): the day name is computed by the
+// DB (current_date) — the same timezone as the f_checks_today FILTER
+// column of the pass and the now() of the last_checked_at write (T-058);
+// an empty result — the day row does not exist yet (the write increment
+// or this pass creates it — a fill-in, not drift, the "first pass fills"
+// precedent, the incremental-counters spec §5).
 const readDailyChecksSQL = "SELECT value FROM crawler_counters " +
 	"WHERE name = 'checks:' || to_char(current_date, 'YYYY-MM-DD')"
 
-// readDailyTempSQL — старое значение строки суточного числителя
-// temp_error до перезаписи (дрейф, T-182): пара readDailyChecksSQL,
-// строка temp_error:YYYY-MM-DD (инкремент записи результата с вердиктом
-// temp_error, TZ_slow_dns_share §5); пустой результат — строки дня ещё
-// нет (первый temp_error-эпизод суток или проход создаст) — заполнение,
-// не дрейф.
+// readDailyTempSQL — the old value of the daily temp_error numerator row
+// before the overwrite (drift, T-182): a pair of readDailyChecksSQL, the
+// temp_error:YYYY-MM-DD row (the increment of a result record with a
+// temp_error verdict, TZ_slow_dns_share §5); an empty result — the day
+// row does not exist yet (the first temp_error episode of the day, or
+// the pass will create it) — a fill-in, not drift.
 const readDailyTempSQL = "SELECT value FROM crawler_counters " +
 	"WHERE name = 'temp_error:' || to_char(current_date, 'YYYY-MM-DD')"
 
-// recountDailyChecksSQL — перезапись строки текущего дня значением
-// агрегата прохода (T-179, TZ_slow_done_today §6): value := сумма
-// FILTER-колонок f_checks_today per-zone агрегата, имя дня — снова БД
-// (рассинхрон таймзоны Go/БД развёл бы строку и окно). Блокировка
-// строки — последней, после зон и глобальных скаляров (порядок против
-// дедлоков, комментарий recountZonesSQL; общий с инкрементом записи
-// результата record.go: зоны → render_pending → checks:). RETURNING —
-// новое значение для дрейфа.
+// recountDailyChecksSQL — overwriting the current day row with the pass
+// aggregate value (T-179, TZ_slow_done_today §6): value := the sum of
+// the f_checks_today FILTER columns of the per-zone aggregate, the day
+// name — again by the DB (a Go/DB timezone desync would split the row
+// and the window). The row lock is the last one, after the zones and the
+// global scalars (the anti-deadlock order, the recountZonesSQL comment;
+// shared with the result record increment record.go: zones →
+// render_pending → checks:). RETURNING — the new value for the drift.
 const recountDailyChecksSQL = "INSERT INTO crawler_counters (name, value, updated_at) " +
 	"VALUES ('checks:' || to_char(current_date, 'YYYY-MM-DD'), $1::int8, $2) " +
 	"ON CONFLICT (name) DO UPDATE " +
 	"SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at " +
 	"RETURNING value"
 
-// recountDailyTempSQL — перезапись суточного числителя temp_error
-// значением агрегата прохода (T-182, TZ_slow_dns_share §6): value := сумма
-// FILTER-колонок f_temp_today; пара recountDailyChecksSQL — блокировка
-// ПОСЛЕ строки знаменателя (тот же порядок, что у инкрементов record.go:
-// checks: → temp_error: — без циклов блокировок), RETURNING — новое
-// значение для дрейфа. Строку дня без temp_error-событий проход создаёт
-// значением окна (может быть нулём) — симметрия знаменателю, читатель
-// доли до прохода видит coalesce-ноль инкрементов.
+// recountDailyTempSQL — overwriting the daily temp_error numerator with
+// the pass aggregate value (T-182, TZ_slow_dns_share §6): value := the sum
+// of the f_temp_today FILTER columns; a pair of recountDailyChecksSQL —
+// the lock AFTER the denominator row (the same order as the record.go
+// increments: checks: → temp_error: — no lock cycles), RETURNING — the
+// new value for the drift. The pass creates the day row without
+// temp_error events with the window value (possibly zero) — symmetry
+// with the denominator, the share reader before the pass sees the
+// coalesce zero of the increments.
 const recountDailyTempSQL = "INSERT INTO crawler_counters (name, value, updated_at) " +
 	"VALUES ('temp_error:' || to_char(current_date, 'YYYY-MM-DD'), $1::int8, $2) " +
 	"ON CONFLICT (name) DO UPDATE " +
 	"SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at " +
 	"RETURNING value"
 
-// Корзины зрелости ретрая temp_error (T-202). Имя — дата эпизода
-// (last_checked_at записи результата temp_error): корзина становится
-// «зрелой» (суммируется guard'ом retryMatureSQL планировщика) в полночь
-// следующего дня — момент созревания когорты при date-точности колонки.
-// Проход поддерживает РОВНО ДВЕ живые корзины — вчерашнюю (зрелая
-// когорта, value := FILTER f_retry_mature_past) и сегодняшнюю
-// (эпизоды суток, value := FILTER f_retry_mature_today): старшие
-// корзины удаляет (устаревший учёт дренажей прошлых суток и хвостовые
-// декременты дат эпизодов старше вчерашней — их значение уже в сумме
-// вчерашней корзины, пересчитанной агрегатом). Имена вычисляет БД
-// (current_date/current_date − 1) — рассинхрон таймзоны Go/БД развёл бы
-// корзину и окно FILTER (стиль T-179). Порядок блокировок — последними
-// в проходе, после суточных строк, в порядке «очистка → зрелая →
-// сегодняшняя»: общий с писателями (record.go: … → retry_mature:;
-// retry.go: декремент корзины дат эпизодов; monitor — здесь), без
-// циклов блокировок. Оговорка (ревью T-202): порядок выполнения
-// нессылаемых DML-CTE одного оператора PostgreSQL документацией не
-// гарантируется («executed concurrently… unpredictable») — инцидент
-// 07.11 показал инверсию на проде (rm → zc записи результата
-// dns-worker: ребро «счётчики → зоны», дедлоки 40P01 ~3–4/ч), и
-// горячие писатели переведены на отдельные операторы (T-267:
-// инкремент DNS-этапа — autocommit после записи, декремент requeue —
-// второй оператор транзакции решения); у оставшихся много-CTE-писателей
-// порядок перечисления (зоны раньше счётчиков) — по-прежнему опора
-// отсутствия циклов; при смене поведения PG смотреть сюда (радикальное
-// лечение — отдельные операторы транзакции, прецедент T-267).
+// The retry maturity baskets of temp_error (T-202). The name is the
+// episode date (the last_checked_at of the temp_error result record):
+// the basket becomes "mature" (summed by the retryMatureSQL guard of the
+// scheduler) at midnight of the next day — the moment the cohort
+// matures at the date precision of the column. The pass maintains
+// EXACTLY TWO live baskets — yesterday's (the mature cohort,
+// value := the f_retry_mature_past FILTER) and today's (the episodes of
+// the day, value := the f_retry_mature_today FILTER): it deletes the
+// older ones (the stale accounting of the past days' drains and the tail
+// decrements of episode dates older than yesterday's — their value is
+// already in the sum of the yesterday basket recomputed by the
+// aggregate). The names are computed by the DB
+// (current_date/current_date − 1) — a Go/DB timezone desync would split
+// the basket and the FILTER window (the T-179 style). The lock order is
+// last in the pass, after the daily rows, in the "cleanup → mature →
+// today" order: shared with the writers (record.go: … → retry_mature:;
+// retry.go: a basket decrement of episode dates; monitor — here), with
+// no lock cycles. A caveat (the T-202 review): the execution order of
+// non-referencing DML CTEs of one PostgreSQL statement is not guaranteed
+// by the documentation ("executed concurrently… unpredictable") — the
+// Nov 07 incident showed an inversion in production (rm → zc of a
+// dns-worker result record: the "counters → zones" edge, 40P01 deadlocks
+// ~3–4/h), and the hot writers were moved to separate statements
+// (T-267: the DNS stage increment — autocommit after the write, the
+// requeue decrement — the second statement of the decision transaction);
+// for the remaining multi-CTE writers the enumeration order (the zones
+// before the counters) is still the reliance for the absence of cycles;
+// if PG changes the behavior, look here (the radical cure — separate
+// statements of the transaction, the T-267 precedent).
 const (
-	// readRetryPastSQL — старое значение зрелой корзины (вчерашней) до
-	// перезаписи (дрейф, T-202); пустой результат — корзины ещё нет
-	// (заполнение, не дрейф).
+	// readRetryPastSQL — the old value of the mature (yesterday's) basket
+	// before the overwrite (drift, T-202); an empty result — the basket
+	// does not exist yet (a fill-in, not drift).
 	readRetryPastSQL = "SELECT value FROM crawler_counters " +
 		"WHERE name = 'retry_mature:' || to_char(current_date - 1, 'YYYY-MM-DD')"
 
-	// readRetryTodaySQL — старое значение сегодняшней корзины (дрейф,
-	// T-202); пустой результат — корзины нет до первого temp_error-эпизода
-	// суток (инкремент или проход создаст).
+	// readRetryTodaySQL — the old value of today's basket (drift, T-202);
+	// an empty result — no basket until the first temp_error episode of
+	// the day (the increment or the pass will create it).
 	readRetryTodaySQL = "SELECT value FROM crawler_counters " +
 		"WHERE name = 'retry_mature:' || to_char(current_date, 'YYYY-MM-DD')"
 
-	// retryMatureCleanupSQL — удаление корзин старше вчерашней: их
-	// когорты уже слиты в зрелую корзину перезаписью ниже (агрегат
-	// f_retry_mature_past считает статусы целиком, а не по датам), а
-	// строки попадают в диапазон суммы guard'а — хвосты декрементов
-	// дат старых эпизодов с отрицательными значениями искажали бы сумму
-	// до ближайшего прохода; корзины — живое расписание дренажа, не
-	// история темпа (в отличие от суточных строк, T-179 §10.4).
-	// RETURNING — для единого Query-протокола прохода (значения не
-	// читаются).
+	// retryMatureCleanupSQL — deleting the baskets older than yesterday's:
+	// their cohorts are already merged into the mature basket by the
+	// overwrite below (the f_retry_mature_past aggregate counts the
+	// statuses in full, not by dates), and the rows fall into the guard's
+	// sum range — the tails of decrements of old episode dates with
+	// negative values would distort the sum until the next pass; the
+	// baskets are the live drain schedule, not a tempo history (unlike
+	// the daily rows, T-179 §10.4).
+	// RETURNING — for the unified Query protocol of the pass (the values
+	// are not read).
 	retryMatureCleanupSQL = "DELETE FROM crawler_counters " +
 		"WHERE name >= 'retry_mature:' " +
 		"AND name < 'retry_mature:' || to_char(current_date - 1, 'YYYY-MM-DD') " +
 		"RETURNING value"
 
-	// recountRetryPastSQL — перезапись зрелой корзины значением
-	// FILTER-колонки f_retry_mature_past (сумма по зонам), RETURNING —
-	// новое значение для дрейфа.
+	// recountRetryPastSQL — overwriting the mature basket with the value
+	// of the f_retry_mature_past FILTER column (the sum over zones),
+	// RETURNING — the new value for the drift.
 	recountRetryPastSQL = "INSERT INTO crawler_counters (name, value, updated_at) " +
 		"VALUES ('retry_mature:' || to_char(current_date - 1, 'YYYY-MM-DD'), $1::int8, $2) " +
 		"ON CONFLICT (name) DO UPDATE " +
 		"SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at " +
 		"RETURNING value"
 
-	// recountRetryTodaySQL — перезапись сегодняшней корзины значением
-	// FILTER-колонки f_retry_mature_today (сумма по зонам); пара
-	// recountRetryPastSQL, блокировка — последней из корзин.
+	// recountRetryTodaySQL — overwriting today's basket with the value of
+	// the f_retry_mature_today FILTER column (the sum over zones); a pair
+	// of recountRetryPastSQL, the lock is the last of the baskets.
 	recountRetryTodaySQL = "INSERT INTO crawler_counters (name, value, updated_at) " +
 		"VALUES ('retry_mature:' || to_char(current_date, 'YYYY-MM-DD'), $1::int8, $2) " +
 		"ON CONFLICT (name) DO UPDATE " +
@@ -439,79 +469,84 @@ const (
 		"RETURNING value"
 )
 
-// Корзины неанализированных хвостов переанализа (T-204):
-// reanalyze:YYYY-MM-DD"T"HH24 — строки subdomain_results с
-// rules_version IS NULL (никогда не анализировались) по часам ЭПИЗОДА
-// (checked_at). Guard часового тика переанализа
-// (analyzer/reanalyze.go, reanalyzeGuardSQL) суммирует корзины старше
-// текущего часа: незрелый in-flight-поток (запись → q:analyze → штамп —
-// секунды) живёт в корзине текущего часа и guard не открывает;
-// пережившая границу часа без штампа публикация — потерянный хвост —
-// открывает, тик вычитывает окно и публикует. Стационар без потерь
-// стоит одну сумму индексного диапазона из пары строк — тяжёлая
-// выборка окна (heap-визит ~84 тыс. строк/ч ради неиндексируемого
-// rules_version, HOT-инвариант) не выполняется вовсе (уточнение того
-// же класса, что T-191 → T-202: наивный счётчик «записано без
-// анализа» не отличает хвосты от непрерывного потока — зрелость дают
-// ЧАСОВЫЕ корзины, прецедент retry_mature). Инкременты — транзакции
-// записи результата (record.go, час now() = checked_at строк) и замены
-// контента рендером (renderworker, час эпизода из RETURNING —
-// рендер-опоздание воскрешает корзину старого часа, guard открывается
-// впустую: хвост за курсором, следующий проход корзину удаляет);
-// декремент — штамп анализатора только устаревших строк (охрана
-// версии, worker.go): повторные доставки не двоят, штампы старой
-// версии (дренажи смены правил) дают отрицательный дрейф до прохода —
-// держит guard закрытым на время дренажа, у тика там своя работа.
-// Проход поддерживает РОВНО ДВЕ живые корзины — предыдущий час
-// (пересчитывается, а не только текущая: поздние декременты штампов
-// дорабатывают её весь текущий час) и текущий; устаревшие удаляет
-// (по образцу retry_mature/hourly-семей T-202/T-203). Порядок
-// блокировок — между корзинами ретрая и rendered-темпа (единый
-// порядок семей всех писателей «retry_mature: → reanalyze: →
-// rendered: → results:» — конвенция, НЕ лексикографика имён
-// ('retry_mature:' лексикографически последний: 't' > 'a'/'n'/'s');
-// от дедлоков важна лишь согласованность порядка у всех писателей),
-// внутри семьи «очистка → prev → cur»: общий с писателями (record.go:
-// … → retry_mature: → reanalyze: → results:; renderworker:
-// reanalyze: → rendered:; analyzer: единственная точка reanalyze:) —
-// без циклов. Guard видит суммы живых корзин сразу после фиксации.
+// The baskets of the unanalyzed reanalysis tails (T-204):
+// reanalyze:YYYY-MM-DD"T"HH24 — the subdomain_results rows with
+// rules_version IS NULL (never analyzed) by the EPISODE hour
+// (checked_at). The guard of the hourly reanalysis tick
+// (analyzer/reanalyze.go, reanalyzeGuardSQL) sums the baskets older than
+// the current hour: the immature in-flight flow (write → q:analyze →
+// stamp — seconds) lives in the current-hour basket and the guard does
+// not open; a publication that survived the hour boundary without a
+// stamp — a lost tail — opens it, the tick reads out the window and
+// publishes. A lossless steady state costs one sum of an index range out
+// of a pair of rows — the heavy window selection (a heap visit of ~84 k
+// rows/h for the non-indexable rules_version, the HOT invariant) is not
+// performed at all (a refinement of the same class as T-191 → T-202: a
+// naive "written without analysis" counter does not distinguish the
+// tails from a continuous flow — the HOURLY baskets give the maturity,
+// the retry_mature precedent). The increments are the result record
+// transactions (record.go, the hour of now() = the rows' checked_at) and
+// the content replacement by render (renderworker, the episode hour from
+// RETURNING — a render delay resurrects the old-hour basket and the
+// guard opens in vain: the tail is beyond the cursor, the next pass
+// deletes the basket);
+// a decrement is the analyzer stamping only stale rows (the version
+// guard, worker.go): repeated deliveries do not double, the stamps of an
+// old version (the rule-change drains) give a negative drift until the
+// pass — it keeps the guard closed during the drain, the tick has its
+// own work there.
+// The pass maintains EXACTLY TWO live baskets — the previous hour
+// (recomputed, not only the current one: late stamp decrements keep
+// working it all through the current hour) and the current one; stale
+// ones are deleted (after the retry_mature/hourly families of
+// T-202/T-203). The lock order is between the retry baskets and the
+// rendered tempo ones (a single family order of all writers
+// "retry_mature: → reanalyze: → rendered: → results:" — a convention,
+// NOT the lexicographics of the names
+// ('retry_mature:' is lexicographically last: 't' > 'a'/'n'/'s');
+// against deadlocks only the order consistency across all writers
+// matters), inside a family "cleanup → prev → cur": shared with the
+// writers (record.go: … → retry_mature: → reanalyze: → results:;
+// renderworker: reanalyze: → rendered:; analyzer: the single reanalyze:
+// point) — no cycles. The guard sees the sums of the live baskets right
+// after the commit.
 const (
-	// readHourlyReanalyzePrevSQL — старое значение корзины хвостов
-	// предыдущего часа до перезаписи (дрейф, T-204); пустой результат —
-	// корзины ещё нет (до первого инкремента/прохода; заполнение, не
-	// дрейф).
+	// readHourlyReanalyzePrevSQL — the old value of the previous-hour tail
+	// basket before the overwrite (drift, T-204); an empty result — the
+	// basket does not exist yet (before the first increment/pass; a
+	// fill-in, not drift).
 	readHourlyReanalyzePrevSQL = "SELECT value FROM crawler_counters " +
 		"WHERE name = 'reanalyze:' || to_char(date_trunc('hour', now() - interval '1 hour'), 'YYYY-MM-DD\"T\"HH24')"
 
-	// readHourlyReanalyzeCurSQL — старое значение корзины хвостов
-	// текущего часа (дрейф, T-204); пара readHourlyReanalyzePrevSQL.
+	// readHourlyReanalyzeCurSQL — the old value of the current-hour tail
+	// basket (drift, T-204); a pair of readHourlyReanalyzePrevSQL.
 	readHourlyReanalyzeCurSQL = "SELECT value FROM crawler_counters " +
 		"WHERE name = 'reanalyze:' || to_char(date_trunc('hour', now()), 'YYYY-MM-DD\"T\"HH24')"
 
-	// hourlyReanalyzeCleanupSQL — удаление корзин хвостов старше
-	// предыдущего часа: живой хвост часа H обслуживается тиком часа H+1
-	// (корзина H = prev, guard открыт); не подобранный за два часа
-	// (сбойные тики) хвост за границей корзин — остаточный класс
-	// время-формы (T-193 §4.2): рестарт с якорем 24 ч или полный дренаж
-	// смены правил. RETURNING — протокол Query прохода (значения не
-	// читаются).
+	// hourlyReanalyzeCleanupSQL — deleting the tail baskets older than the
+	// previous hour: the live tail of hour H is served by the tick of
+	// hour H+1 (the H basket = prev, the guard open); a tail not picked up
+	// within two hours (failed ticks) beyond the baskets is the residual
+	// time-form class (T-193 §4.2): a restart with the 24 h anchor or a
+	// full rule-change drain. RETURNING — the Query protocol of the pass
+	// (the values are not read).
 	hourlyReanalyzeCleanupSQL = "DELETE FROM crawler_counters " +
 		"WHERE name >= 'reanalyze:' " +
 		"AND name < 'reanalyze:' || to_char(date_trunc('hour', now() - interval '1 hour'), 'YYYY-MM-DD\"T\"HH24') " +
 		"RETURNING value"
 
-	// recountHourlyReanalyzePrevSQL — перезапись корзины хвостов
-	// предыдущего часа значением FILTER-позиции prev_reanalyze агрегата
-	// hourlyAggSQL, RETURNING — новое значение для дрейфа.
+	// recountHourlyReanalyzePrevSQL — overwriting the previous-hour tail
+	// basket with the value of the prev_reanalyze FILTER position of the
+	// hourlyAggSQL aggregate, RETURNING — the new value for the drift.
 	recountHourlyReanalyzePrevSQL = "INSERT INTO crawler_counters (name, value, updated_at) " +
 		"VALUES ('reanalyze:' || to_char(date_trunc('hour', now() - interval '1 hour'), 'YYYY-MM-DD\"T\"HH24'), $1::int8, $2) " +
 		"ON CONFLICT (name) DO UPDATE " +
 		"SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at " +
 		"RETURNING value"
 
-	// recountHourlyReanalyzeCurSQL — перезапись корзины хвостов текущего
-	// часа (FILTER-позиция cur_reanalyze); блокировка — после
-	// предыдущей (возрастание имён).
+	// recountHourlyReanalyzeCurSQL — overwriting the current-hour tail
+	// basket (the cur_reanalyze FILTER position); the lock after the
+	// previous one (the names ascend).
 	recountHourlyReanalyzeCurSQL = "INSERT INTO crawler_counters (name, value, updated_at) " +
 		"VALUES ('reanalyze:' || to_char(date_trunc('hour', now()), 'YYYY-MM-DD\"T\"HH24'), $1::int8, $2) " +
 		"ON CONFLICT (name) DO UPDATE " +
@@ -519,111 +554,122 @@ const (
 		"RETURNING value"
 )
 
-// Часовые корзины темпа (T-203): results:YYYY-MM-DD"T"HH24 — строки
-// subdomain_results, вставленные транзакцией записи результата HTTP-этапа
-// (инкремент httpworker/record.go, дельта — RowsAffected INSERT-пачки;
-// час корзины — date_trunc('hour', now()) той же транзакции, checked_at
-// строк — тот же now()), rendered:… — строки, переведённые в
-// rendered = true этапом рендера (инкремент renderworker/worker.go по
-// checked_at строки из RETURNING UPDATE — час ЭПИЗОДА, не рендера: так
-// считало живое окно прежнего читателя). Замена живых подзапросов
-// results_hour/rendered_hour throughputSQL (count(*) по
-// checked_at >= now() − 1 ч): index-only scan свежих страниц окна
-// деградировал heap-fetch'ами — контрольная точка этапа 27 (медиана
-// 6,0 с > 3 с, 108 событий; тот же механизм, что у суточного окна
-// T-179 — замер §2 TZ_slow_done_today). Корзина — календарный час:
-// скользящее окно «последний час» читатель (status.throughputSQL)
-// собирает суммой ДВУХ живых корзин — предыдущей и текущей, делитель
-// темпа — фактическая длина покрытого окна; сходимость корзин с живым
-// count(*) гарантируется по календарному часу — здесь (hourlyAggSQL,
-// FILTER-позиции prev/cur). Проход держит РОВНО ДВЕ живые корзины
-// каждой семьи: предыдущий час — «хвост окна чтения» (поздние
-// rendered-инкременты строк прошлого часа дорабатывают его корзину
-// весь текущий час — потому пересчитывается, а не только текущая) и
-// текущий час; устаревшие корзины удаляет (по образцу retry_mature,
-// T-202 — корзины живое окно темпа, не история). Имена вычисляет БД
-// (date_trunc от now()) — рассинхрон таймзоны Go/БД развёл бы корзину
-// и окно агрегата (стиль T-179/T-202). Порядок блокировок — финал
-// прохода после корзин ретрая, семьи лексикографически
-// «rendered: → results:», внутри семьи «очистка → предыдущая →
-// текущая» (возрастание имён: час лексикографичен): общий с писателями
-// (record.go: … → retry_mature: → results: последним; renderworker:
-// единственная точка rendered:; monitor — здесь), без циклов.
-// Пограничный случай: rendered-инкремент опоздания > 1 ч (строка часа
-// H−2 отрендерена в часе H) воскрешает корзину H−2 upsert'ом — читатель
-// её не читает (IN-список двух живых часов), следующий проход удаляет;
-// живому окну она не принадлежала и прежде (окно «последний час»).
+// The hourly tempo baskets (T-203): results:YYYY-MM-DD"T"HH24 — the
+// subdomain_results rows inserted by the HTTP stage result record
+// transaction (the httpworker/record.go increment, the delta — the
+// RowsAffected of the INSERT batch;
+// the basket hour is the date_trunc('hour', now()) of the same
+// transaction, the rows' checked_at is the same now()), rendered:… — the
+// rows switched to rendered = true by the render stage (the
+// renderworker/worker.go increment by the row's checked_at from the
+// UPDATE RETURNING — the EPISODE hour, not the render one: that is how
+// the live window of the former reader counted). The replacement of the
+// live results_hour/rendered_hour subqueries of throughputSQL (count(*)
+// over checked_at >= now() − 1 h): the index-only scan of the fresh
+// window pages degraded with heap fetches — the checkpoint of stage 27
+// (a median of 6.0 s > 3 s, 108 events; the same mechanism as the daily
+// window of T-179 — measurement §2 of TZ_slow_done_today). The basket is
+// a calendar hour:
+// the "last hour" sliding window reader (status.throughputSQL) assembles
+// it as the sum of the TWO live baskets — the previous and the current
+// one, the tempo divisor is the actual length of the covered window; the
+// baskets' convergence with the live count(*) is guaranteed over the
+// calendar hour — here (hourlyAggSQL,
+// the prev/cur FILTER positions). The pass keeps EXACTLY TWO live
+// baskets of each family: the previous hour is the "tail of the reading
+// window" (late rendered-increments of the past hour's rows keep working
+// its basket all through the current hour — hence it is recomputed, not
+// only the current one) and the current hour; stale baskets are deleted
+// (after retry_mature, T-202 — the baskets are the live tempo window,
+// not a history). The names are computed by the DB (date_trunc of
+// now()) — a Go/DB timezone desync would split the basket and the
+// aggregate window (the T-179/T-202 style). The lock order is the end of
+// the pass after the retry baskets, the families lexicographically
+// "rendered: → results:", inside a family "cleanup → previous →
+// current" (the names ascend: the hour is lexicographic): shared with
+// the writers (record.go: … → retry_mature: → results: last;
+// renderworker: the single rendered: point; monitor — here), no cycles.
+// A boundary case: a rendered-increment delay > 1 h (a row of hour
+// H−2 rendered in hour H) resurrects the H−2 basket by an upsert — the
+// reader does not read it (the IN list of the two live hours), the next
+// pass deletes it;
+// it did not belong to the live window before either (the "last hour"
+// window).
 const (
-	// readHourlyRenderedPrevSQL — старое значение корзины rendered-темпа
-	// предыдущего часа до перезаписи (дрейф, T-203); пустой результат —
-	// корзины ещё нет (до первого rendered-эпизода часа; заполнение, не
-	// дрейф).
+	// readHourlyRenderedPrevSQL — the old value of the previous-hour
+	// rendered-tempo basket before the overwrite (drift, T-203); an empty
+	// result — the basket does not exist yet (before the first rendered
+	// episode of the hour; a fill-in, not drift).
 	readHourlyRenderedPrevSQL = "SELECT value FROM crawler_counters " +
 		"WHERE name = 'rendered:' || to_char(date_trunc('hour', now() - interval '1 hour'), 'YYYY-MM-DD\"T\"HH24')"
 
-	// readHourlyRenderedCurSQL — старое значение корзины rendered-темпа
-	// текущего часа (дрейф, T-203); пара readHourlyRenderedPrevSQL.
+	// readHourlyRenderedCurSQL — the old value of the current-hour
+	// rendered-tempo basket (drift, T-203); a pair of
+	// readHourlyRenderedPrevSQL.
 	readHourlyRenderedCurSQL = "SELECT value FROM crawler_counters " +
 		"WHERE name = 'rendered:' || to_char(date_trunc('hour', now()), 'YYYY-MM-DD\"T\"HH24')"
 
-	// readHourlyResultsPrevSQL — старое значение корзины темпа
-	// результатов предыдущего часа (дрейф, T-203).
+	// readHourlyResultsPrevSQL — the old value of the previous-hour
+	// results-tempo basket (drift, T-203).
 	readHourlyResultsPrevSQL = "SELECT value FROM crawler_counters " +
 		"WHERE name = 'results:' || to_char(date_trunc('hour', now() - interval '1 hour'), 'YYYY-MM-DD\"T\"HH24')"
 
-	// readHourlyResultsCurSQL — старое значение корзины темпа
-	// результатов текущего часа (дрейф, T-203).
+	// readHourlyResultsCurSQL — the old value of the current-hour
+	// results-tempo basket (drift, T-203).
 	readHourlyResultsCurSQL = "SELECT value FROM crawler_counters " +
 		"WHERE name = 'results:' || to_char(date_trunc('hour', now()), 'YYYY-MM-DD\"T\"HH24')"
 
-	// hourlyRenderedCleanupSQL — удаление корзин rendered-темпа старше
-	// предыдущего часа: их строки вне живого окна чтения (читатель
-	// суммирует prev+cur), значение хвоста не нужно; поздние инкременты
-	// устаревших часов см. комментарий семейства. RETURNING — протокол
-	// Query прохода (значения не читаются).
+	// hourlyRenderedCleanupSQL — deleting the rendered-tempo baskets older
+	// than the previous hour: their rows are outside the live reading
+	// window (the reader sums prev+cur), the tail value is not needed; for
+	// late increments of stale hours see the family comment. RETURNING —
+	// the Query protocol of the pass (the values are not read).
 	hourlyRenderedCleanupSQL = "DELETE FROM crawler_counters " +
 		"WHERE name >= 'rendered:' " +
 		"AND name < 'rendered:' || to_char(date_trunc('hour', now() - interval '1 hour'), 'YYYY-MM-DD\"T\"HH24') " +
 		"RETURNING value"
 
-	// hourlyResultsCleanupSQL — удаление корзин темпа результатов старше
-	// предыдущего часа; пара hourlyRenderedCleanupSQL (results-инкременты
-	// всегда текущего часа — опозданий не бывает, хвост — только строки,
-	// пересчитанные в prev).
+	// hourlyResultsCleanupSQL — deleting the results-tempo baskets older
+	// than the previous hour; a pair of hourlyRenderedCleanupSQL
+	// (results-increments are always of the current hour — there are no
+	// delays, the tail is only the rows recomputed into prev).
 	hourlyResultsCleanupSQL = "DELETE FROM crawler_counters " +
 		"WHERE name >= 'results:' " +
 		"AND name < 'results:' || to_char(date_trunc('hour', now() - interval '1 hour'), 'YYYY-MM-DD\"T\"HH24') " +
 		"RETURNING value"
 
-	// recountHourlyRenderedPrevSQL — перезапись корзины rendered-темпа
-	// предыдущего часа значением FILTER-позиции prev_rendered агрегата
-	// hourlyAggSQL, RETURNING — новое значение для дрейфа.
+	// recountHourlyRenderedPrevSQL — overwriting the previous-hour
+	// rendered-tempo basket with the value of the prev_rendered FILTER
+	// position of the hourlyAggSQL aggregate, RETURNING — the new value
+	// for the drift.
 	recountHourlyRenderedPrevSQL = "INSERT INTO crawler_counters (name, value, updated_at) " +
 		"VALUES ('rendered:' || to_char(date_trunc('hour', now() - interval '1 hour'), 'YYYY-MM-DD\"T\"HH24'), $1::int8, $2) " +
 		"ON CONFLICT (name) DO UPDATE " +
 		"SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at " +
 		"RETURNING value"
 
-	// recountHourlyRenderedCurSQL — перезапись корзины rendered-темпа
-	// текущего часа (FILTER-позиция cur_rendered); блокировка — после
-	// предыдущей (возрастание имён).
+	// recountHourlyRenderedCurSQL — overwriting the current-hour
+	// rendered-tempo basket (the cur_rendered FILTER position); the lock
+	// after the previous one (the names ascend).
 	recountHourlyRenderedCurSQL = "INSERT INTO crawler_counters (name, value, updated_at) " +
 		"VALUES ('rendered:' || to_char(date_trunc('hour', now()), 'YYYY-MM-DD\"T\"HH24'), $1::int8, $2) " +
 		"ON CONFLICT (name) DO UPDATE " +
 		"SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at " +
 		"RETURNING value"
 
-	// recountHourlyResultsPrevSQL — перезапись корзины темпа результатов
-	// предыдущего часа (FILTER-позиция prev_results); семья results: —
-	// после rendered: (лексикографика префиксов — порядок блокировок).
+	// recountHourlyResultsPrevSQL — overwriting the previous-hour
+	// results-tempo basket (the prev_results FILTER position); the
+	// results: family — after rendered: (the prefix lexicographics — the
+	// lock order).
 	recountHourlyResultsPrevSQL = "INSERT INTO crawler_counters (name, value, updated_at) " +
 		"VALUES ('results:' || to_char(date_trunc('hour', now() - interval '1 hour'), 'YYYY-MM-DD\"T\"HH24'), $1::int8, $2) " +
 		"ON CONFLICT (name) DO UPDATE " +
 		"SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at " +
 		"RETURNING value"
 
-	// recountHourlyResultsCurSQL — перезапись корзины темпа результатов
-	// текущего часа (FILTER-позиция cur_results); финал прохода.
+	// recountHourlyResultsCurSQL — overwriting the current-hour
+	// results-tempo basket (the cur_results FILTER position); the end of
+	// the pass.
 	recountHourlyResultsCurSQL = "INSERT INTO crawler_counters (name, value, updated_at) " +
 		"VALUES ('results:' || to_char(date_trunc('hour', now()), 'YYYY-MM-DD\"T\"HH24'), $1::int8, $2) " +
 		"ON CONFLICT (name) DO UPDATE " +
@@ -631,18 +677,19 @@ const (
 		"RETURNING value"
 )
 
-// CounterNames — имена строк глобальных счётчиков, поддерживаемых
-// реконсиляцией (легенда для чтения/сверки). Суточные строки
-// checks:YYYY-MM-DD и temp_error:YYYY-MM-DD (T-179/T-182), корзины
-// зрелости ретрая retry_mature:YYYY-MM-DD (T-202) и часовые корзины
-// темпа results:/rendered: и хвостов переанализа reanalyze:
-// (T-203/T-204) сюда не входят: имена дней/часов вычисляет БД
-// (readDailyChecksSQL/recountDailyChecksSQL, их temp-пары, пары корзин
-// ретрая и часовых корзин), в unnest-пачке с Go-именами их нет.
-// new_done_stale (ФТ-2.2) — абсолютный уровень, как status_*: пишется
-// только реконсиляцией (инкрементов нет), читается точечным лукапом
-// алерта domains_new_done_stale, gauge'ом цикла и guard'ом компенсатора
-// T-270 (scheduler/stalerequeue.go).
+// CounterNames — the names of the global counter rows maintained by the
+// reconciliation (the legend for reading/verification). The daily rows
+// checks:YYYY-MM-DD and temp_error:YYYY-MM-DD (T-179/T-182), the retry
+// maturity baskets retry_mature:YYYY-MM-DD (T-202) and the hourly tempo
+// baskets results:/rendered: and the reanalysis tail ones reanalyze:
+// (T-203/T-204) are not here: the day/hour names are computed by the DB
+// (readDailyChecksSQL/recountDailyChecksSQL, their temp pairs, the retry
+// basket and hourly basket pairs), they are not in the unnest batch with
+// the Go names.
+// new_done_stale (FR-2.2) — an absolute level, like status_*: written
+// only by the reconciliation (no increments), read by the point lookup
+// of the domains_new_done_stale alert, the loop's gauge and the guard of
+// the T-270 compensator (scheduler/stalerequeue.go).
 func CounterNames() []string {
 	names := make([]string, 0, len(model.Statuses)+4)
 	for _, s := range model.Statuses {
@@ -651,157 +698,168 @@ func CounterNames() []string {
 	return append(names, "render_pending", "laravel_appeared_total", "laravel_lost_total", "new_done_stale")
 }
 
-// driftCounterNames — глобальные строки с ДЕЛЬТА-ведомой семантикой:
-// инкременты переходов поддерживают значение между проходами, дрейф в
-// стационаре обязан быть нулевым (ТЗИ §7.1.3, §11). Строки status_*
-// сюда не входят: распределение статусов пишется ТОЛЬКО реконсиляцией
-// (ТЗИ §13.3 — старые статусы переходов не пинируются предикатами
-// операторов), под живой нагрузкой их «дрейф» — freshwater лаг
-// интервала, а не аномалия: Warn/gauge по ним шумели бы на каждом
-// проходе, verify — никогда не сходился бы без допуска. Суточные строки
-// checks:/temp_error: (T-179/T-182) — дельта-ведомые, но с потоковой
-// семантикой расхождения (события записи результата HTTP против доменов
-// дня всех веток конвейера, TZ_slow_done_today §5.1): их позиции
-// daily:checks/daily:temp_error ведутся в проходе отдельно (имя дня
-// вычисляет БД), а verify их не сверяет — под нагрузкой расхождение
-// равно разнице потоков этапов с прошлого прохода (свежесть, не
-// аномалия).
+// driftCounterNames — the global rows with DELTA-driven semantics:
+// the transition increments maintain the value between the passes, the
+// drift in steady state must be zero (the incremental-counters spec
+// §7.1.3, §11). The status_* rows are not here: the status distribution
+// is written ONLY by the reconciliation (the incremental-counters spec
+// §13.3 — the old transition statuses are not pinned by the statement
+// predicates), under live load their "drift" is the freshwater lag of
+// the interval, not an anomaly: a Warn/gauge on them would be noise on
+// every pass, verify would never converge without a tolerance. The
+// daily checks:/temp_error: rows (T-179/T-182) are delta-driven but with
+// a streaming mismatch semantics (the HTTP result record events against
+// the domains of the day of all the pipeline branches,
+// TZ_slow_done_today §5.1): their daily:checks/daily:temp_error
+// positions are maintained by the pass separately (the day name is
+// computed by the DB), and verify does not cross-check them — under load
+// the mismatch equals the difference of the stage flows since the last
+// pass (freshness, not an anomaly).
 func driftCounterNames() []string {
 	return []string{"render_pending", "laravel_appeared_total", "laravel_lost_total"}
 }
 
-// dailyChecksCounter — метка позиции суточного счётчика проверок в
-// дрейфе прохода (T-179, TZ_slow_done_today §8). Потоковая, а не
-// нулевая в стационаре: не участвует в агрегированном Warn
-// (reportDrift), наблюдается только gauge.
+// dailyChecksCounter — the label of the daily checks counter position in
+// the pass drift (T-179, TZ_slow_done_today §8). Streaming, not
+// zero-at-steady-state: it does not take part in the aggregated Warn
+// (reportDrift), only the gauge observes it.
 const dailyChecksCounter = "daily:checks"
 
-// dailyTempCounter — метка позиции суточного числителя temp_error в
-// дрейфе прохода (T-182, TZ_slow_dns_share §6): та же потоковая
-// семантика, что dailyChecksCounter (числитель и знаменатель расходятся
-// с живым окном вместе — повторы эпизодов суток), вне Warn, наблюдается
-// gauge.
+// dailyTempCounter — the label of the daily temp_error numerator position
+// in the pass drift (T-182, TZ_slow_dns_share §6): the same streaming
+// semantics as dailyChecksCounter (the numerator and the denominator
+// diverge from the live window together — the repeated episodes of the
+// day), outside the Warn, observed by the gauge.
 const dailyTempCounter = "daily:temp_error"
 
-// retryMaturePastCounter — метка зрелой корзины ретрая temp_error в
-// дрейфе прохода (T-202): инкременты/декременты считают события
-// (эпизоды записи результата против ретраев), живое окно FILTER —
-// домены (status = temp_error × done × дата); дубль-доставки и
-// повторные эпизоды суток дают +1 к живому нулю, кандидаты, ушедшие
-// мимо ретрая (удаление temp_error-домена delete-файлом, возрастная
-// перепроверка T-030), оставляют +1 в корзине до прохода — потоковая
-// семантика (как daily:*, TZ_slow_done_today §5.1), вне Warn,
-// наблюдается gauge.
+// retryMaturePastCounter — the label of the mature retry temp_error
+// basket in the pass drift (T-202): the increments/decrements count
+// events (result record episodes against retries), the live FILTER
+// window — domains (status = temp_error × done × date); duplicate
+// deliveries and repeated episodes of the day give +1 to the live zero,
+// candidates that bypassed the retry (a deletion of a temp_error domain
+// by the delete file, the age recheck of T-030) leave +1 in the basket
+// until the pass — a streaming semantics (like daily:*,
+// TZ_slow_done_today §5.1), outside the Warn,
+// observed by the gauge.
 const retryMaturePastCounter = "retry_mature:past"
 
-// retryMatureTodayCounter — метка сегодняшней корзины ретрая temp_error
-// (T-202): та же потоковая семантика, что retryMaturePastCounter
-// (сегодняшние эпизоды: инкременты — события, FILTER — домены).
+// retryMatureTodayCounter — the label of today's retry temp_error basket
+// (T-202): the same streaming semantics as retryMaturePastCounter
+// (today's episodes: the increments are events, the FILTER is domains).
 const retryMatureTodayCounter = "retry_mature:today"
 
-// dailyStreamingPositions — суточные позиции потоковой семантики
-// (T-179/T-182): инкременты считают события записи результатов HTTP,
-// живое окно прохода — домены дня всех веток конвейера; стационарного
-// нуля нет, агрегированный Warn дрейфа их не поднимает (шум под живой
-// нагрузкой), gauge экспонирует.
+// dailyStreamingPositions — the daily positions of the streaming
+// semantics (T-179/T-182): the increments count the HTTP result record
+// events, the live pass window is the domains of the day of all the
+// pipeline branches; there is no steady-state zero, the aggregated drift
+// Warn does not raise them (noise under live load), the gauge exposes
+// them.
 func dailyStreamingPositions() []string {
 	return []string{dailyChecksCounter, dailyTempCounter}
 }
 
-// retryMatureStreamingPositions — позиции корзин зрелости ретрая
-// (T-202) той же потоковой семантики, что суточные строки: события
-// эпизодов против живых доменов фильтра; в Warn не входят, наблюдается
-// gauge (комментарий retryMaturePastCounter).
+// retryMatureStreamingPositions — the retry maturity basket positions
+// (T-202) of the same streaming semantics as the daily rows: the episode
+// events against the live filtered domains; they are not in the Warn,
+// observed by the gauge (the retryMaturePastCounter comment).
 func retryMatureStreamingPositions() []string {
 	return []string{retryMaturePastCounter, retryMatureTodayCounter}
 }
 
-// hourlyRenderedPrevCounter — метка корзины rendered-темпа предыдущего
-// часа в дрейфе прохода (T-203): инкременты renderworker считают
-// события (переводы строк в rendered), живой агрегат — строки окна;
-// повторный рендер уже rendered-строки (повторная доставка, DOM тем же
-// хэшем) и перезаписи эпизодов (запись результата удаляет отрендеренные
-// строки) дают расхождение до прохода — потоковая семантика (как
-// daily:*, TZ_slow_done_today §5.1), вне Warn, наблюдается gauge.
+// hourlyRenderedPrevCounter — the label of the previous-hour
+// rendered-tempo basket in the pass drift (T-203): the renderworker
+// increments count events (row switches to rendered), the live
+// aggregate — the window rows;
+// a re-render of an already rendered row (a repeated delivery, the DOM
+// by the same hash) and the episode overwrites (a result record deletes
+// the rendered rows) give a mismatch until the pass — a streaming
+// semantics (like daily:*, TZ_slow_done_today §5.1), outside the Warn,
+// observed by the gauge.
 const hourlyRenderedPrevCounter = "rendered:prev"
 
-// hourlyRenderedCurCounter — метка корзины rendered-темпа текущего часа
-// (T-203): та же потоковая семантика, что hourlyRenderedPrevCounter.
+// hourlyRenderedCurCounter — the label of the current-hour rendered-tempo
+// basket (T-203): the same streaming semantics as
+// hourlyRenderedPrevCounter.
 const hourlyRenderedCurCounter = "rendered:cur"
 
-// hourlyResultsPrevCounter — метка корзины темпа результатов
-// предыдущего часа (T-203): инкременты записи результата считают
-// события вставки строк, живой агрегат — строки (перезапись эпизода
-// удаляет старые строки окна, не декрементируя корзину) — потоковая
-// семантика, вне Warn, наблюдается gauge.
+// hourlyResultsPrevCounter — the label of the previous-hour results-tempo
+// basket (T-203): the result record increments count the row insertion
+// events, the live aggregate is the rows (an episode overwrite deletes
+// the old window rows without decrementing the basket) — a streaming
+// semantics, outside the Warn, observed by the gauge.
 const hourlyResultsPrevCounter = "results:prev"
 
-// hourlyResultsCurCounter — метка корзины темпа результатов текущего
-// часа (T-203); пара hourlyResultsPrevCounter.
+// hourlyResultsCurCounter — the label of the current-hour results-tempo
+// basket (T-203); a pair of hourlyResultsPrevCounter.
 const hourlyResultsCurCounter = "results:cur"
 
-// hourlyReanalyzePrevCounter — метка корзины неанализированных хвостов
-// переанализа предыдущего часа в дрейфе прохода (T-204): инкременты
-// записи/рендера и декременты штампов считают события переходов, живой
-// агрегат — строки с rules_version IS NULL; перезапись эпизода
-// (record.go DELETE без декремента), рендер непроштампованной строки
-// (двойной инкремент одного хвоста) и штампы старой версии (дренажи)
-// дают расхождение до прохода — потоковая семантика (семейство
-// T-202/T-203), вне Warn, наблюдается gauge.
+// hourlyReanalyzePrevCounter — the label of the previous-hour unanalyzed
+// reanalysis tail basket in the pass drift (T-204): the record/render
+// increments and the stamp decrements count the transition events, the
+// live aggregate — the rows with rules_version IS NULL; an episode
+// overwrite (a record.go DELETE without a decrement), a render of an
+// unstamped row (a double increment of one tail) and the stamps of an
+// old version (the drains) give a mismatch until the pass — a streaming
+// semantics (the T-202/T-203 family), outside the Warn, observed by the
+// gauge.
 const hourlyReanalyzePrevCounter = "reanalyze:prev"
 
-// hourlyReanalyzeCurCounter — метка корзины хвостов переанализа
-// текущего часа (T-204); пара hourlyReanalyzePrevCounter.
+// hourlyReanalyzeCurCounter — the label of the current-hour reanalysis
+// tail basket (T-204); a pair of hourlyReanalyzePrevCounter.
 const hourlyReanalyzeCurCounter = "reanalyze:cur"
 
-// hourlyStreamingPositions — позиции часовых корзин темпа (T-203) и
-// хвостов переанализа (T-204) потоковой семантики: события вставки
-// строк/перевода в rendered/штампа против живых строк окна;
-// стационарного нуля нет (дубль-доставки, перезаписи эпизодов,
-// дренажи), агрегированный Warn дрейфа их не поднимает (шум под живой
-// нагрузкой), gauge экспонирует.
+// hourlyStreamingPositions — the hourly tempo basket positions (T-203)
+// and the reanalysis tail ones (T-204) of the streaming semantics: the
+// events of row insertions/switches to rendered/stamps against the live
+// window rows;
+// there is no steady-state zero (duplicate deliveries, episode
+// overwrites, drains), the aggregated drift Warn does not raise them
+// (noise under live load), the gauge exposes them.
 func hourlyStreamingPositions() []string {
 	return []string{hourlyReanalyzePrevCounter, hourlyReanalyzeCurCounter,
 		hourlyRenderedPrevCounter, hourlyRenderedCurCounter, hourlyResultsPrevCounter, hourlyResultsCurCounter}
 }
 
-// ---------------------------------------------------------------- проход
+// ---------------------------------------------------------------- pass
 
-// ZoneStatsDB — пул для прохода: db.DB с транзакциями (дрейф и
-// перезапись — один снапшот); *pgxpool.Pool удовлетворяет интерфейсу
-// (стиль RetryDB/RecordDB).
+// ZoneStatsDB — the pool for the pass: a db.DB with transactions (the
+// drift and the overwrite are one snapshot); *pgxpool.Pool satisfies the
+// interface (the RetryDB/RecordDB style).
 type ZoneStatsDB interface {
 	db.DB
 	Begin(ctx context.Context) (pgx.Tx, error)
 }
 
-// compile-time: реальный пул подходит под интерфейс.
+// compile-time: the real pool fits the interface.
 var _ ZoneStatsDB = (*pgxpool.Pool)(nil)
 
-// ZoneStatsOptions — параметры реконсиляции; нулевые значения
-// заменяются дефолтами (withDefaults, стиль scheduler.RecheckOptions).
+// ZoneStatsOptions — the reconciliation options; zero values are
+// replaced by defaults (withDefaults, the scheduler.RecheckOptions style).
 type ZoneStatsOptions struct {
-	// Interval — период цикла ZoneStatsLoop (DefaultZoneStatsInterval);
-	// рабочее значение — monitor.zone_stats_interval из конфига. На разовый
-	// ZoneStatsOnce не влияет.
+	// Interval is the period of the ZoneStatsLoop loop
+	// (DefaultZoneStatsInterval);
+	// the working value is monitor.zone_stats_interval from the config. It
+	// does not affect a one-off ZoneStatsOnce.
 	Interval time.Duration
-	// Now — источник времени для zones.updated_at и crawler_counters.
-	// updated_at; nil — time.Now. Тесты подставляют фиксированные часы
-	// (стиль scheduler, T-030).
+	// Now is the time source for zones.updated_at and
+	// crawler_counters.updated_at; nil — time.Now. Tests substitute fixed
+	// hours (the scheduler style, T-030).
 	Now func() time.Time
-	// Zone — фильтр разового прохода (recount --zone, ТЗИ §9):
-	// перезаписываются колонки только выбранной зоны, глобальные
-	// счётчики пересчитываются всегда. nil — все зоны; на цикл
-	// ZoneStatsLoop не влияет (периодический проход всегда полный).
+	// Zone is the filter of a one-off pass (recount --zone, the
+	// incremental-counters spec §9):
+	// only the chosen zone's columns are overwritten, the global
+	// counters are always recomputed. nil — all zones; it does not affect
+	// the ZoneStatsLoop loop (the periodic pass is always full).
 	Zone *int16
-	// Log — логгер цикла ZoneStatsLoop; nil — записи подавлены
-	// (slog.DiscardHandler). ZoneStatsOnce не логирует — итог возвращается
-	// ZoneStatsResult.
+	// Log is the logger of the ZoneStatsLoop loop; nil — records
+	// suppressed (slog.DiscardHandler). ZoneStatsOnce does not log — the
+	// result is returned as ZoneStatsResult.
 	Log *slog.Logger
 }
 
-// withDefaults заменяет неположительные значения дефолтами (Now
-// проверяется отдельно: функций — nil).
+// withDefaults replaces the non-positive values with defaults (Now is
+// checked separately: functions are nil).
 func (o ZoneStatsOptions) withDefaults() ZoneStatsOptions {
 	if o.Interval <= 0 {
 		o.Interval = DefaultZoneStatsInterval
@@ -809,17 +867,18 @@ func (o ZoneStatsOptions) withDefaults() ZoneStatsOptions {
 	return o
 }
 
-// CounterPosition — позиция реконсиляции: имя для метрики/CLI
-// (zone:<id>:pending, global:status_alive — ТЗИ §11) и пара
-// старое/новое. New — записанное значение, Old — прочитанное до
-// перезаписи (у verify — живой агрегат против сохранённого).
+// CounterPosition — a reconciliation position: the name for the
+// metric/CLI (zone:<id>:pending, global:status_alive — the
+// incremental-counters spec §11) and the old/new pair. New is the
+// written value, Old is the one read before the overwrite (for verify —
+// the live aggregate against the stored one).
 type CounterPosition struct {
 	Counter string
 	Old     int64
 	New     int64
 }
 
-// Drift — |старое − новое| позиции.
+// Drift — |old − new| of the position.
 func (p CounterPosition) Drift() int64 {
 	d := p.New - p.Old
 	if d < 0 {
@@ -828,55 +887,58 @@ func (p CounterPosition) Drift() int64 {
 	return d
 }
 
-// ZoneStatsResult — итог одного прохода ZoneStatsOnce.
+// ZoneStatsResult — the result of one ZoneStatsOnce pass.
 type ZoneStatsResult struct {
-	// Zones — зоны, чьи колонки перезаписаны (число строк RETURNING —
-	// каждая строка зон обновляется один раз).
+	// Zones is the zones whose columns were overwritten (the RETURNING
+	// row count — each zone row is updated once).
 	Zones int64
-	// Positions — все позиции прохода (колонки зон + глобальные
-	// скаляры) со старым/новым значениями; Positions[i].Drift() > 0 —
-	// дрейф. Пустой может быть только у прохода с фильтром несуществующей
-	// зоны.
+	// Positions is all the positions of the pass (the zone columns + the
+	// global scalars) with the old/new values; Positions[i].Drift() > 0 is
+	// drift. It can be empty only for a pass with a filter of a
+	// non-existent zone.
 	Positions []CounterPosition
-	// NewDoneStale — домены «статус повис» (ФТ-2.2 ТЗ-fsm, T-256):
-	// status = new ∧ check_state = done ∧ last_checked_at старше суток —
-	// сумма FILTER-колонки f_new_done_stale per-zone агрегата; значение
-	// строки new_done_stale и gauge crawler_domains_new_done_stale
-	// (цикл ZoneStatsLoop). Стационарно ноль в норме; ненулевое —
-	// потерянная задача q:http (О6 без О7–О9, общая таблица статусов
-	// internal/model/enums.go) — лечит компенсатор T-270 (guard его
-	// часового прохода — чтение этой строки), gauge остаётся сигналом
-	// о новых потерях.
+	// NewDoneStale — the "status hung" domains (FR-2.2 of the TZ-fsm spec,
+	// T-256): status = new ∧ check_state = done ∧ last_checked_at older
+	// than a day — the sum of the f_new_done_stale FILTER column of the
+	// per-zone aggregate; the value of the new_done_stale row and the
+	// crawler_domains_new_done_stale gauge (the ZoneStatsLoop loop). A
+	// steady-state zero is the norm; a non-zero one is a lost q:http task
+	// (O6 without O7–O9, the general status table
+	// internal/model/enums.go) — healed by the T-270 compensator (its
+	// hourly pass guard is a read of this row), the gauge remains the
+	// signal of new losses.
 	NewDoneStale int64
 }
 
-// zoneColumnPositions — метрики позиций колонок зоны (порядок —
-// колонки readZonesSQL/recountZonesSQL RETURNING, без id).
+// zoneColumnPositions — the metrics of the zone column positions (the
+// order is the columns of readZonesSQL/recountZonesSQL RETURNING, no id).
 var zoneColumnPositions = [...]string{"total", "pending", "queued", "checked", "laravel"}
 
-// ZoneStatsOnce выполняет один совмещённый проход реконсиляции (ТЗИ
-// §7.1) в одной транзакции: (1) читает старые значения зон, счётчиков,
-// суточных строк (проверок и temp_error, T-179/T-182), корзин зрелости
-// ретрая (T-202), часовых корзин темпа (T-203) и корзин хвостов
-// переанализа (T-204); (2) единственный полный скан domains — per-zone
-// агрегат (recountAggQuerySQL, включая FILTER-колонки last_checked_at
-// = current_date и корзины зрелости, T-179/T-182/T-202), агрегаты
-// laravel_domains и laravel_history и агрегат часовых корзин
-// (hourlyAggSQL — окно двух живых часов subdomain_results, позиции
-// темпа T-203 и хвостов переанализа T-204); (3) перезаписывает колонки
-// зон unnest-пачкой значений (блокировки зон — первыми); (4) upsert-ит
-// глобальные скаляры (блокировки crawler_counters — после зон, порядок
-// против дедлоков — recountZonesSQL), суточные строки (в порядке
-// checks: → temp_error:), корзины зрелости ретрая (очистка устаревших
-// → зрелая → сегодняшняя, T-202), корзины хвостов переанализа и
-// часовые корзины темпа (финал прохода: reanalyze-семья, затем
-// rendered-семья, затем results-семья, в каждой «очистка →
-// предыдущая → текущая», T-203/T-204); RETURNING операторов даёт новые
-// значения для дрейфа. Проход идемпотентен (ТЗ 3.4): повтор даёт те же
-// значения; сбой откатывает транзакцию целиком — половинчатых
-// состояний не бывает. Фильтр Zone (recount --zone) ограничивает
-// перезапись зон; глобальные скаляры, суточные строки и корзины
-// пересчитываются всегда (ТЗИ §9).
+// ZoneStatsOnce performs one combined reconciliation pass (the
+// incremental-counters spec §7.1) in one transaction: (1) it reads the
+// old values of the zones, the counters, the daily rows (checks and
+// temp_error, T-179/T-182), the retry maturity baskets (T-202), the
+// hourly tempo baskets (T-203) and the reanalysis tail baskets (T-204);
+// (2) the only full domains scan — the per-zone aggregate
+// (recountAggQuerySQL, including the FILTER columns of last_checked_at
+// = current_date and the maturity baskets, T-179/T-182/T-202), the
+// laravel_domains and laravel_history aggregates and the hourly basket
+// aggregate (hourlyAggSQL — the two-live-hours window of
+// subdomain_results, the T-203 tempo positions and the T-204 reanalysis
+// tail ones); (3) it overwrites the zone columns with an unnest batch of
+// values (the zone locks first); (4) it upserts the global scalars (the
+// crawler_counters locks after the zones, the anti-deadlock order —
+// recountZonesSQL), the daily rows (in the checks: → temp_error: order),
+// the retry maturity baskets (cleanup of stale ones → mature → today's,
+// T-202), the reanalysis tail baskets and the hourly tempo baskets (the
+// end of the pass: the reanalyze family, then the rendered family, then
+// the results family, in each one "cleanup → previous → current",
+// T-203/T-204); the RETURNING of the statements gives the new values for
+// the drift. The pass is idempotent (spec 3.4): a repeat gives the same
+// values; a failure rolls back the transaction in full — there are no
+// half-done states. The Zone filter (recount --zone) limits the zone
+// overwrite; the global scalars, the daily rows and the baskets are
+// always recomputed (the incremental-counters spec §9).
 func ZoneStatsOnce(ctx context.Context, pool ZoneStatsDB, opts ZoneStatsOptions) (ZoneStatsResult, error) {
 	if pool == nil {
 		return ZoneStatsResult{}, errors.New("monitor: реконсиляция счётчиков: пул не задан")
@@ -891,7 +953,7 @@ func ZoneStatsOnce(ctx context.Context, pool ZoneStatsDB, opts ZoneStatsOptions)
 	if err != nil {
 		return ZoneStatsResult{}, fmt.Errorf("monitor: реконсиляция счётчиков: транзакция: %w", err)
 	}
-	// Откат безусловно: после Commit — no-op (стиль T-044).
+	// An unconditional rollback: after Commit it is a no-op (the T-044 style).
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	oldZones, err := readZonePositions(ctx, tx, o.Zone)
@@ -902,9 +964,9 @@ func ZoneStatsOnce(ctx context.Context, pool ZoneStatsDB, opts ZoneStatsOptions)
 	if err != nil {
 		return ZoneStatsResult{}, err
 	}
-	// Суточные строки — тем же блоком старых чтений (снапшот один): имя
-	// дня вычисляет БД (T-179/T-182), присутствие — признак заполнения
-	// (дрейф только у существующей строки).
+	// The daily rows — in the same block of old reads (one snapshot): the
+	// day name is computed by the DB (T-179/T-182), presence is the fill-in
+	// sign (drift only for an existing row).
 	oldDaily, dailyExists, err := readDailyValue(ctx, tx, readDailyChecksSQL, "суточная строка проверок")
 	if err != nil {
 		return ZoneStatsResult{}, err
@@ -913,8 +975,9 @@ func ZoneStatsOnce(ctx context.Context, pool ZoneStatsDB, opts ZoneStatsOptions)
 	if err != nil {
 		return ZoneStatsResult{}, err
 	}
-	// Корзины зрелости ретрая (T-202) — тем же блоком: присутствие —
-	// признак заполнения (корзину создаёт инкремент или этот проход).
+	// The retry maturity baskets (T-202) — the same block: presence is
+	// the fill-in sign (the basket is created by an increment or this
+	// pass).
 	oldRetryPast, retryPastExists, err := readDailyValue(ctx, tx, readRetryPastSQL, "зрелая корзина ретрая")
 	if err != nil {
 		return ZoneStatsResult{}, err
@@ -923,9 +986,9 @@ func ZoneStatsOnce(ctx context.Context, pool ZoneStatsDB, opts ZoneStatsOptions)
 	if err != nil {
 		return ZoneStatsResult{}, err
 	}
-	// Часовые корзины темпа (T-203) — тем же блоком: присутствие —
-	// признак заполнения (корзину создаёт инкремент записи/рендера или
-	// этот проход), имя часа вычисляет БД.
+	// The hourly tempo baskets (T-203) — the same block: presence is the
+	// fill-in sign (the basket is created by a record/render increment or
+	// this pass), the hour name is computed by the DB.
 	oldHourRenderedPrev, hourRenderedPrevExists, err := readDailyValue(ctx, tx, readHourlyRenderedPrevSQL, "корзина rendered-темпа предыдущего часа")
 	if err != nil {
 		return ZoneStatsResult{}, err
@@ -942,9 +1005,10 @@ func ZoneStatsOnce(ctx context.Context, pool ZoneStatsDB, opts ZoneStatsOptions)
 	if err != nil {
 		return ZoneStatsResult{}, err
 	}
-	// Корзины хвостов переанализа (T-204) — тем же блоком: присутствие —
-	// признак заполнения (корзину создаёт инкремент записи/рендера,
-	// декремент штампа или этот проход), имя часа вычисляет БД.
+	// The reanalysis tail baskets (T-204) — the same block: presence is
+	// the fill-in sign (the basket is created by a record/render
+	// increment, a stamp decrement or this pass), the hour name is
+	// computed by the DB.
 	oldHourReanalyzePrev, hourReanalyzePrevExists, err := readDailyValue(ctx, tx, readHourlyReanalyzePrevSQL, "корзина хвостов переанализа предыдущего часа")
 	if err != nil {
 		return ZoneStatsResult{}, err
@@ -954,7 +1018,7 @@ func ZoneStatsOnce(ctx context.Context, pool ZoneStatsDB, opts ZoneStatsOptions)
 		return ZoneStatsResult{}, err
 	}
 
-	// Единственный полный скан domains: per-zone агрегат + смежные.
+	// The only full domains scan: the per-zone aggregate + the adjacent ones.
 	agg, err := readZoneAgg(ctx, tx)
 	if err != nil {
 		return ZoneStatsResult{}, err
@@ -967,15 +1031,17 @@ func ZoneStatsOnce(ctx context.Context, pool ZoneStatsDB, opts ZoneStatsOptions)
 	if err != nil {
 		return ZoneStatsResult{}, err
 	}
-	// Агрегат часовых корзин темпа (T-203): окно двух живых часов
-	// subdomain_results —FILTER-позиции prev/cur обеих семей.
+	// The aggregate of the hourly tempo baskets (T-203): the
+	// two-live-hours window of subdomain_results — the prev/cur FILTER
+	// positions of both families.
 	hourly, err := readHourlyAgg(ctx, tx)
 	if err != nil {
 		return ZoneStatsResult{}, err
 	}
 
-	// Колонки зон: значения — агрегат, зона без живых доменов — нули.
-	// Порядок обхода детерминирован (slice zoneIDs отсортирован).
+	// The zone columns: the values are the aggregate, a zone without live
+	// domains is zeros.
+	// The traversal order is deterministic (the zoneIDs slice is sorted).
 	zoneIDs := make([]int16, 0, len(oldZones))
 	for id := range oldZones {
 		zoneIDs = append(zoneIDs, id)
@@ -1005,11 +1071,12 @@ func ZoneStatsOnce(ctx context.Context, pool ZoneStatsDB, opts ZoneStatsOptions)
 		return ZoneStatsResult{}, err
 	}
 
-	// Глобальные скаляры: суммы per-zone агрегата + кумулятивы журнала.
+	// The global scalars: the sums of the per-zone aggregate + the log
+	// cumulatives.
 	globals := globalCounters(agg, hAppeared, hLost)
 	names := make([]string, 0, len(globals))
 	values := make([]int64, 0, len(globals))
-	for _, name := range CounterNames() { // детерминированный порядок
+	for _, name := range CounterNames() { // a deterministic order
 		names = append(names, name)
 		values = append(values, globals[name])
 	}
@@ -1017,13 +1084,14 @@ func ZoneStatsOnce(ctx context.Context, pool ZoneStatsDB, opts ZoneStatsOptions)
 	if err != nil {
 		return ZoneStatsResult{}, err
 	}
-	// Суточные строки — последними записями прохода (T-179/T-182):
-	// значение — сумма FILTER-колонок f_checks_today/f_temp_today, строка
-	// дня — всегда глобальная (фильтр Zone касался только колонок зон);
-	// порядок «checks: → temp_error:» общий с инкрементами record.go —
-	// без циклов блокировок. Ротация суток — просто новая строка: проход
-	// после полуночи создаёт её значением окна, вчерашняя остаётся
-	// историей темпа.
+	// The daily rows — the last writes of the pass (T-179/T-182):
+	// the value is the sum of the f_checks_today/f_temp_today FILTER
+	// columns, the day row is always global (the Zone filter only touched
+	// the zone columns);
+	// the "checks: → temp_error:" order is shared with the record.go
+	// increments — no lock cycles. The day rotation is simply a new row:
+	// the pass after midnight creates it with the window value, the
+	// yesterday one stays as the tempo history.
 	var checksToday, tempToday, newDoneStale int64
 	for i := range agg {
 		checksToday += agg[i].checksToday
@@ -1038,15 +1106,16 @@ func ZoneStatsOnce(ctx context.Context, pool ZoneStatsDB, opts ZoneStatsOptions)
 	if err != nil {
 		return ZoneStatsResult{}, err
 	}
-	// Корзины зрелости ретрая (T-202) — последними записями прохода:
-	// устаревшие корзины удаляются (значение зрелой когорты несут
-	// целиком в вчерашней корзине), затем перезаписываются зрелая
-	// (FILTER f_retry_mature_past) и сегодняшняя (f_retry_mature_today)
-	// — суммы тех же FILTER-колонок per-zone агрегата; порядок
-	// «очистка → зрелая → сегодняшняя» замыкает порядок блокировок
-	// писателей (record.go/dnsworker: инкремент сегодняшней; retry:
-	// декремент дат эпизодов) — без циклов. Guard тяжёлой выборки
-	// ретрая видит сумму зрелых корзин сразу после фиксации.
+	// The retry maturity baskets (T-202) — the last writes of the pass:
+	// the stale baskets are deleted (the mature cohort value is carried in
+	// full in the yesterday basket), then the mature one (the FILTER
+	// f_retry_mature_past) and today's (f_retry_mature_today) are
+	// overwritten — the sums of the same FILTER columns of the per-zone
+	// aggregate; the "cleanup → mature → today's" order closes the
+	// writers' lock order (record.go/dnsworker: the today increment;
+	// retry: the episode date decrement) — no cycles. The guard of the
+	// heavy retry selection sees the sum of the mature baskets right
+	// after the commit.
 	if err := cleanupBaskets(ctx, tx, retryMatureCleanupSQL, "очистка корзин ретрая"); err != nil {
 		return ZoneStatsResult{}, err
 	}
@@ -1063,13 +1132,14 @@ func ZoneStatsOnce(ctx context.Context, pool ZoneStatsDB, opts ZoneStatsOptions)
 	if err != nil {
 		return ZoneStatsResult{}, err
 	}
-	// Корзины хвостов переанализа (T-204) — за корзинами ретрая, перед
-	// корзинами rendered-темпа (порядок блокировок семей
-	// «retry_mature: → reanalyze: → rendered: → results:», комментарий
-	// семейства): устаревшие корзины удаляются, затем перезаписываются
-	// prev (FILTER-позиция prev_reanalyze — поздние декременты штампов
-	// дорабатывают её весь текущий час) и cur. Guard тика переанализа
-	// видит суммы живых корзин сразу после фиксации.
+	// The reanalysis tail baskets (T-204) — after the retry baskets, before
+	// the rendered-tempo ones (the family lock order
+	// "retry_mature: → reanalyze: → rendered: → results:", the family
+	// comment): the stale baskets are deleted, then prev is overwritten
+	// (the prev_reanalyze FILTER position — late stamp decrements keep
+	// working it all through the current hour) and cur. The guard of the
+	// reanalysis tick sees the sums of the live baskets right after the
+	// commit.
 	if err := cleanupBaskets(ctx, tx, hourlyReanalyzeCleanupSQL, "очистка корзин хвостов переанализа"); err != nil {
 		return ZoneStatsResult{}, err
 	}
@@ -1081,15 +1151,16 @@ func ZoneStatsOnce(ctx context.Context, pool ZoneStatsDB, opts ZoneStatsOptions)
 	if err != nil {
 		return ZoneStatsResult{}, err
 	}
-	// Часовые корзины темпа (T-203) — финал прохода: устаревшие корзины
-	// удаляются (вне окна чтения), затем перезаписываются живые —
-	// prev (хвост окна чтения: поздние rendered-инкременты дорабатывают
-	// его весь текущий час) и cur; семьи в лексикографике префиксов
-	// «rendered: → results:», внутри — «очистка → prev → cur» — порядок
-	// блокировок общий с писателями (record.go: … → results: последним;
-	// renderworker: rendered:) — без циклов. Читатель темпа
-	// (status.throughputSQL) видит суммы живых корзин сразу после
-	// фиксации.
+	// The hourly tempo baskets (T-203) — the end of the pass: the stale
+	// baskets are deleted (outside the reading window), then the live ones
+	// are overwritten — prev (the tail of the reading window: late
+	// rendered-increments keep working it all through the current hour)
+	// and cur; the families in the prefix lexicographics
+	// "rendered: → results:", inside — "cleanup → prev → cur" — the lock
+	// order is shared with the writers (record.go: … → results: last;
+	// renderworker: rendered:) — no cycles. The tempo reader
+	// (status.throughputSQL) sees the sums of the live baskets right
+	// after the commit.
 	if err := cleanupBaskets(ctx, tx, hourlyRenderedCleanupSQL, "очистка корзин rendered-темпа"); err != nil {
 		return ZoneStatsResult{}, err
 	}
@@ -1120,7 +1191,7 @@ func ZoneStatsOnce(ctx context.Context, pool ZoneStatsDB, opts ZoneStatsOptions)
 	for _, id := range zoneIDs {
 		nz, ok := newZones[id]
 		if !ok {
-			continue // RETURNING не вернул (зону удалили мимо кода) — старая остаётся
+			continue // RETURNING did not return it (the zone was deleted past the code) — the old one stays
 		}
 		oz := oldZones[id]
 		newVals := [...]int64{nz.total, nz.pending, nz.queued, nz.checked, nz.laravel}
@@ -1133,9 +1204,10 @@ func ZoneStatsOnce(ctx context.Context, pool ZoneStatsDB, opts ZoneStatsOptions)
 			})
 		}
 	}
-	// Позиции дрейфа — только дельта-ведомые счётчики (driftCounterNames):
-	// status_* исключены (пишутся одной реконсиляцией — их «дрейф» это
-	// свежесть интервала, не аномалия).
+	// The drift positions — only the delta-driven counters
+	// (driftCounterNames):
+	// the status_* ones are excluded (written by one reconciliation —
+	// their "drift" is the interval freshness, not an anomaly).
 	for _, name := range driftCounterNames() {
 		res.Positions = append(res.Positions, CounterPosition{
 			Counter: "global:" + name,
@@ -1143,17 +1215,19 @@ func ZoneStatsOnce(ctx context.Context, pool ZoneStatsDB, opts ZoneStatsOptions)
 			New:     newCounters[name],
 		})
 	}
-	// Суточные позиции (T-179/T-182): дрейф — потоковая разница семантик,
-	// а не аномалия: инкременты считают события записи результата
-	// HTTP-этапа, живое окно — домены дня всех веток (DNS-терминальные
-	// завершения — not_delegated и пр. — эпизода HTTP не имеют), между
-	// ними — повторные эпизоды суток. Числитель temp_error расходится
-	// вдобавок ретраями, закрывшими ошибку (событие осталось в истории).
-	// Стационарного нуля нет (в отличие от render_pending), позиции
-	// наблюдаемые. Строки дня ещё не было — заполнение, не дрейф
-	// (Old := New): расхождение с нулём считало бы in-flight записи
-	// DNS-этапа, к инкрементам отношения не имеющие (прецедент —
-	// стартовый проход цикла, ТЗИ §7.1.3).
+	// The daily positions (T-179/T-182): the drift is a streaming
+	// difference of semantics, not an anomaly: the increments count the
+	// HTTP stage result record events, the live window is the domains of
+	// the day of all the branches (the DNS terminal completions —
+	// not_delegated and the like — have no HTTP episode), between them —
+	// the repeated episodes of the day. The temp_error numerator
+	// additionally diverges by the retries that closed the error (the
+	// event stayed in the history).
+	// There is no steady-state zero (unlike render_pending), the positions
+	// are observable. The day row did not exist yet — a fill-in, not drift
+	// (Old := New): a mismatch with zero would count the in-flight DNS
+	// stage writes, unrelated to the increments (the precedent — the
+	// starting pass of the loop, the incremental-counters spec §7.1.3).
 	dailyOld := oldDaily
 	if !dailyExists {
 		dailyOld = newDaily
@@ -1172,12 +1246,14 @@ func ZoneStatsOnce(ctx context.Context, pool ZoneStatsDB, opts ZoneStatsOptions)
 		Old:     tempOld,
 		New:     newTemp,
 	})
-	// Корзины зрелости ретрая (T-202): дрейф — потоковая разница семантик
-	// (события эпизодов/ретраев против живых доменов фильтра — дубль-доставки,
-	// повторные эпизоды суток, кандидаты мимо ретрая), не аномалия:
-	// стационарного нуля нет, позиции наблюдаемые, в Warn не входят
-	// (retryMatureStreamingPositions). Корзины не было — заполнение, не
-	// дрейф (Old := New), прецедент стартового прохода (ТЗИ §7.1.3).
+	// The retry maturity baskets (T-202): the drift is a streaming
+	// difference of semantics (the episode/retry events against the live
+	// filtered domains — duplicate deliveries,
+	// repeated episodes of the day, candidates bypassing the retry), not an
+	// anomaly: there is no steady-state zero, the positions are observable,
+	// they are not in the Warn (retryMatureStreamingPositions). No basket
+	// existed — a fill-in, not drift (Old := New), the starting-pass
+	// precedent (the incremental-counters spec §7.1.3).
 	retryPastOld := oldRetryPast
 	if !retryPastExists {
 		retryPastOld = newRetryPast
@@ -1196,12 +1272,14 @@ func ZoneStatsOnce(ctx context.Context, pool ZoneStatsDB, opts ZoneStatsOptions)
 		Old:     retryTodayOld,
 		New:     newRetryToday,
 	})
-	// Часовые корзины темпа (T-203): дрейф — потоковая разница семантик
-	// (события вставки строк/перевода в rendered против живых строк окна
-	// — дубль-доставки, перезаписи эпизодов, повторные рендеры), не
-	// аномалия: стационарного нуля нет, позиции наблюдаемые, в Warn не
-	// входят (hourlyStreamingPositions). Корзины не было — заполнение,
-	// не дрейф (Old := New), прецедент стартового прохода (ТЗИ §7.1.3).
+	// The hourly tempo baskets (T-203): the drift is a streaming
+	// difference of semantics (the row insertion/switch-to-rendered events
+	// against the live window rows
+	// — duplicate deliveries, episode overwrites, re-renders), not an
+	// anomaly: there is no steady-state zero, the positions are observable,
+	// they are not in the Warn (hourlyStreamingPositions). No basket
+	// existed — a fill-in, not drift (Old := New), the starting-pass
+	// precedent (the incremental-counters spec §7.1.3).
 	appendHourly := func(counter string, old int64, exists bool, newV int64) {
 		if !exists {
 			old = newV
@@ -1216,27 +1294,29 @@ func ZoneStatsOnce(ctx context.Context, pool ZoneStatsDB, opts ZoneStatsOptions)
 	appendHourly(hourlyRenderedCurCounter, oldHourRenderedCur, hourRenderedCurExists, newHourRenderedCur)
 	appendHourly(hourlyResultsPrevCounter, oldHourResultsPrev, hourResultsPrevExists, newHourResultsPrev)
 	appendHourly(hourlyResultsCurCounter, oldHourResultsCur, hourResultsCurExists, newHourResultsCur)
-	// Корзины хвостов переанализа (T-204): та же потоковая семантика —
-	// события переходов против живых NULL-строк окна (комментарий
-	// hourlyReanalyzePrevCounter); корзины не было — заполнение, не
-	// дрейф (Old := New), прецедент стартового прохода (ТЗИ §7.1.3).
+	// The reanalysis tail baskets (T-204): the same streaming semantics —
+	// the transition events against the live NULL rows of the window (the
+	// hourlyReanalyzePrevCounter comment); no basket existed — a fill-in,
+	// not drift (Old := New), the starting-pass precedent (the
+	// incremental-counters spec §7.1.3).
 	appendHourly(hourlyReanalyzePrevCounter, oldHourReanalyzePrev, hourReanalyzePrevExists, newHourReanalyzePrev)
 	appendHourly(hourlyReanalyzeCurCounter, oldHourReanalyzeCur, hourReanalyzeCurExists, newHourReanalyzeCur)
 	return res, nil
 }
 
-// laravelAggRow — строка агрегата laravel_domains.
+// laravelAggRow — a row of the laravel_domains aggregate.
 type laravelAggRow struct {
 	zone    int16
 	laravel int64
 }
 
-// readZoneAgg — per-zone агрегат domainsAggSQL: колонки в порядке
-// домена, затем легенда statusAggCols, бит рендера, суточное окно
-// проверок, его temp_error-числитель (T-179/T-182), корзины зрелости
-// ретрая (T-202) и домены «статус повис» (ФТ-2.2). Приёмник — db.DB
-// (транзакция прохода или пул verify: агрегат один, точка правды —
-// ТЗИ §9).
+// readZoneAgg — the per-zone domainsAggSQL aggregate: the domain columns
+// in order, then the statusAggCols legend, the render bit, the daily
+// checks window, its temp_error numerator (T-179/T-182), the retry
+// maturity baskets (T-202) and the "status hung" domains (FR-2.2). The
+// receiver is a db.DB
+// (the pass transaction or the verify pool: the aggregate is one, the
+// point of truth — the incremental-counters spec §9).
 func readZoneAgg(ctx context.Context, q db.DB) ([]zoneAggRow, error) {
 	rows, err := q.Query(ctx, recountAggQuerySQL)
 	if err != nil {
@@ -1264,7 +1344,7 @@ func readZoneAgg(ctx context.Context, q db.DB) ([]zoneAggRow, error) {
 	return out, nil
 }
 
-// readLaravelAgg — агрегат laravel_domains по зонам.
+// readLaravelAgg — the laravel_domains aggregate over zones.
 func readLaravelAgg(ctx context.Context, tx pgx.Tx) ([]laravelAggRow, error) {
 	rows, err := tx.Query(ctx, laravelAggQuerySQL)
 	if err != nil {
@@ -1285,7 +1365,7 @@ func readLaravelAgg(ctx context.Context, tx pgx.Tx) ([]laravelAggRow, error) {
 	return out, nil
 }
 
-// readHistoryAgg — кумулятивы appeared/lost журнала детекции.
+// readHistoryAgg — the appeared/lost cumulatives of the detection log.
 func readHistoryAgg(ctx context.Context, tx pgx.Tx) (appeared, lost int64, err error) {
 	rows, err := tx.Query(ctx, historyAggSQL)
 	if err != nil {
@@ -1304,19 +1384,21 @@ func readHistoryAgg(ctx context.Context, tx pgx.Tx) (appeared, lost int64, err e
 	return appeared, lost, nil
 }
 
-// hourlyAggRow — FILTER-позиции агрегата часовых корзин (hourlyAggSQL,
-// T-203/T-204): prev/cur семей темпа (results — все строки окна часа,
-// rendered — с флагом итогового DOM) и хвостов переанализа (строки с
-// rules_version IS NULL).
+// hourlyAggRow — the FILTER positions of the hourly basket aggregate
+// (hourlyAggSQL,
+// T-203/T-204): the prev/cur of the tempo families (results — all the
+// rows of the hour window,
+// rendered — with the final DOM flag) and the reanalysis tails (rows
+// with rules_version IS NULL).
 type hourlyAggRow struct {
 	prevResults, prevRendered   int64
 	curResults, curRendered     int64
 	prevReanalyze, curReanalyze int64
 }
 
-// readHourlyAgg — агрегат часовых корзин (T-203/T-204): скалярный
-// агрегат без GROUP BY обязан вернуть ровно одну строку (пустое окно —
-// нули); пустой набор — обрыв протокола, ошибка.
+// readHourlyAgg — the hourly basket aggregate (T-203/T-204): a scalar
+// aggregate without GROUP BY must return exactly one row (an empty
+// window — zeros); an empty set — a protocol break, an error.
 func readHourlyAgg(ctx context.Context, tx pgx.Tx) (hourlyAggRow, error) {
 	rows, err := tx.Query(ctx, hourlyAggSQL)
 	if err != nil {
@@ -1337,8 +1419,8 @@ func readHourlyAgg(ctx context.Context, tx pgx.Tx) (hourlyAggRow, error) {
 	return r, nil
 }
 
-// writeZonePositions — перезапись колонок зонunnest-пачкой; возврат —
-// новые значения колонок по RETURNING.
+// writeZonePositions — overwriting the zone columns with an unnest
+// batch; the return is the new column values by RETURNING.
 func writeZonePositions(ctx context.Context, tx pgx.Tx, ids []int16, total, pending, queued, checked, laravel []int64, at time.Time) (map[int16]zonePositionRow, error) {
 	out := make(map[int16]zonePositionRow, len(ids))
 	if len(ids) == 0 {
@@ -1366,8 +1448,8 @@ func writeZonePositions(ctx context.Context, tx pgx.Tx, ids []int16, total, pend
 	return out, nil
 }
 
-// writeGlobalCounters — upsert глобальных скаляров; возврат — новые
-// значения по RETURNING.
+// writeGlobalCounters — the upsert of the global scalars; the return is
+// the new values by RETURNING.
 func writeGlobalCounters(ctx context.Context, tx pgx.Tx, names []string, values []int64, at time.Time) (map[string]int64, error) {
 	rows, err := tx.Query(ctx, recountCountersSQL, names, values, at)
 	if err != nil {
@@ -1392,11 +1474,12 @@ func writeGlobalCounters(ctx context.Context, tx pgx.Tx, names []string, values 
 	return out, nil
 }
 
-// readDailyValue — старое значение суточной строки (T-179 checks:,
-// T-182 temp_error:) в транзакции прохода: sqlQ — точечный PK-лукап с
-// именем дня, вычисляемым БД; what — контекст ошибок. exists различает
-// «0» от «строки дня ещё нет» (заполнение — не дрейф). Пустой набор без
-// ошибки rows.Err — честное отсутствие строки.
+// readDailyValue — the old value of a daily row (T-179 checks:,
+// T-182 temp_error:) in the pass transaction: sqlQ is a point PK lookup
+// with the day name computed by the DB; what is the error context. exists
+// distinguishes a "0" from "the day row does not exist yet" (a fill-in is
+// not drift). An empty set without a rows.Err error — an honest absence
+// of the row.
 func readDailyValue(ctx context.Context, tx pgx.Tx, sqlQ, what string) (value int64, exists bool, err error) {
 	rows, err := tx.Query(ctx, sqlQ)
 	if err != nil {
@@ -1404,8 +1487,8 @@ func readDailyValue(ctx context.Context, tx pgx.Tx, sqlQ, what string) (value in
 	}
 	defer rows.Close()
 	if !rows.Next() {
-		// Сначала сбой чтения: обрыв соединения — не «строки нет»
-		// (стиль renderDebtCount).
+		// The read failure first: a connection break is not "the row is
+		// missing" (the renderDebtCount style).
 		if err := rows.Err(); err != nil {
 			return 0, false, fmt.Errorf("monitor: реконсиляция счётчиков: %s: %w", what, err)
 		}
@@ -1420,11 +1503,12 @@ func readDailyValue(ctx context.Context, tx pgx.Tx, sqlQ, what string) (value in
 	return value, true, nil
 }
 
-// cleanupBaskets — удаление устаревших корзин (DELETE … RETURNING,
-// T-202/T-203-стиль): retryMatureCleanupSQL/hourlyRenderedCleanupSQL/
-// hourlyResultsCleanupSQL. RETURNING value — протокол Query (проход не
-// использует Exec), значения не читаются: живые корзины ниже
-// перезаписываются агрегатом целиком, удалённые — вне окна чтения.
+// cleanupBaskets — deleting the stale baskets (DELETE … RETURNING,
+// the T-202/T-203 style): retryMatureCleanupSQL/hourlyRenderedCleanupSQL/
+// hourlyResultsCleanupSQL. The RETURNING value is the Query protocol (the
+// pass does not use Exec), the values are not read: the live baskets
+// below are overwritten by the aggregate in full, the deleted ones are
+// outside the reading window.
 func cleanupBaskets(ctx context.Context, tx pgx.Tx, sqlQ, what string) error {
 	rows, err := tx.Query(ctx, sqlQ)
 	if err != nil {
@@ -1433,8 +1517,8 @@ func cleanupBaskets(ctx context.Context, tx pgx.Tx, sqlQ, what string) error {
 	defer rows.Close()
 	var discarded int64
 	for rows.Next() {
-		// Значение удалённой корзины не читается: живые позиции
-		// переписываются агрегатом целиком.
+		// The deleted basket's value is not read: the live positions are
+		// rewritten by the aggregate in full.
 		if err := rows.Scan(&discarded); err != nil {
 			return fmt.Errorf("monitor: реконсиляция счётчиков: %s: чтение: %w", what, err)
 		}
@@ -1445,11 +1529,11 @@ func cleanupBaskets(ctx context.Context, tx pgx.Tx, sqlQ, what string) error {
 	return nil
 }
 
-// writeDailyCounter — перезапись суточной строки значением агрегата
-// прохода (recountDailyChecksSQL/recountDailyTempSQL, T-179/T-182);
-// возврат — новое значение по RETURNING (дрейф). Upsert создаёт строку
-// первого прохода дня (или исправляет созданную инкрементами — проход
-// авторитетен).
+// writeDailyCounter — overwriting a daily row with the pass aggregate
+// value (recountDailyChecksSQL/recountDailyTempSQL, T-179/T-182);
+// the return is the new value by RETURNING (drift). The upsert creates
+// the row of the day's first pass (or fixes the one created by the
+// increments — the pass is authoritative).
 func writeDailyCounter(ctx context.Context, tx pgx.Tx, sqlQ string, value int64, at time.Time, what string) (int64, error) {
 	rows, err := tx.Query(ctx, sqlQ, value, at)
 	if err != nil {
@@ -1469,10 +1553,12 @@ func writeDailyCounter(ctx context.Context, tx pgx.Tx, sqlQ string, value int64,
 	return fresh, nil
 }
 
-// globalCounters — глобальные скаляры из per-zone агрегата (суммы
-// легенды статусов и бита рендера — один скан domains уже выполнен)
-// и кумулятивов журнала. Одна точка правды соответствия «зона →
-// глобальные суммы» для реконсиляции и verify (ТЗИ §9).
+// globalCounters — the global scalars from the per-zone aggregate (the
+// sums of the status legend and the render bit — one domains scan is
+// already done)
+// and the log cumulatives. The single point of truth of the "zone →
+// global sums" mapping for the reconciliation and verify (the
+// incremental-counters spec §9).
 func globalCounters(agg []zoneAggRow, appeared, lost int64) map[string]int64 {
 	out := make(map[string]int64, len(statusAggCols)+4)
 	for i, c := range statusAggCols {
@@ -1493,13 +1579,14 @@ func globalCounters(agg []zoneAggRow, appeared, lost int64) map[string]int64 {
 	return out
 }
 
-// zonePositionRow — значения колонок одной зоны (старые или новые).
+// zonePositionRow — the column values of one zone (old or new).
 type zonePositionRow struct {
 	total, pending, queued, checked, laravel int64
 }
 
-// readZonePositions — текущие значения колонок зон (в транзакции
-// прохода: до оператора — старые, после — собственная запись).
+// readZonePositions — the current zone column values (in the pass
+// transaction: before the statement — the old ones, after — its own
+// writes).
 func readZonePositions(ctx context.Context, tx pgx.Tx, zone *int16) (map[int16]zonePositionRow, error) {
 	rows, err := tx.Query(ctx, readZonesSQL, zone)
 	if err != nil {
@@ -1521,9 +1608,9 @@ func readZonePositions(ctx context.Context, tx pgx.Tx, zone *int16) (map[int16]z
 	return out, nil
 }
 
-// readCounterValues — текущие значения глобальных счётчиков по именам
-// (отсутствующая строка — 0: первый проход после миграции заполняет,
-// ТЗИ §5).
+// readCounterValues — the current global counter values by names
+// (a missing row — 0: the first pass after a migration fills it,
+// the incremental-counters spec §5).
 func readCounterValues(ctx context.Context, tx pgx.Tx, names []string) (map[string]int64, error) {
 	rows, err := tx.Query(ctx, readCountersSQL, names)
 	if err != nil {
@@ -1545,24 +1632,28 @@ func readCounterValues(ctx context.Context, tx pgx.Tx, names []string) (map[stri
 	return out, nil
 }
 
-// ZoneStatsLoop — периодический цикл реконсиляции (ТЗ 5.9, ТЗИ §7.2):
-// ZoneStatsOnce по ticker, первый проход — сразу при старте (свежие
-// счётчики после простоя/рестарта и заполнение нулей после миграции —
-// потому первый проход дрейгом не считается: Warn/gauge по нему не
-// поднимаются, ТЗИ §7.1.3), а не ждёт тика. Ошибка прохода прерывает
-// только его: логируется Warn, цикл живёт (контракт OnRun, T-012) —
-// очередной проход повторит по актуальному состоянию. Отмена ctx —
-// чистый выход с nil (graceful shutdown, ТЗ 3.4). Итог прохода —
-// Debug, а не Info: проход успешен всегда, когда жива БД.
+// ZoneStatsLoop — the periodic reconciliation loop (spec 5.9, the
+// incremental-counters spec §7.2):
+// ZoneStatsOnce by ticker, the first pass right at start (fresh counters
+// after a downtime/restart and the zero fill-in after a migration —
+// hence the first pass does not count as drift: no Warn/gauge is raised
+// on it, the incremental-counters spec §7.1.3), it does not wait for a
+// tick. A pass error interrupts only that pass: a Warn is logged, the
+// loop lives (the OnRun contract, T-012) —
+// the next pass will retry against the actual state. A ctx cancellation —
+// a clean exit with nil (graceful shutdown, spec 3.4). The pass result is
+// Debug, not Info: the pass succeeds whenever the DB is alive.
 //
-// Single-flight (T-161): проходы выполняются в горутине самого цикла —
-// новый проход структурно не может начаться, пока не завершился
-// предыдущий; проход дольше интервала (рост таблицы, замер §12)
-// сбрасывает накопившийся тик ticker'а (иначе новый проход стартовал бы
-// сразу за медленным — непрерывный агрегат), Warn и счётчик
-// crawler_zonestats_skipped_ticks_total поднимают шум. reg — реестр
-// метрик сервиса (метрики прохода и дрейфа; nil — цикл без метрик,
-// пересчёт живёт: смысл цикла — реконсиляция, а не приборы).
+// Single-flight (T-161): the passes run in the loop's own goroutine —
+// a new pass structurally cannot start while the previous one has not
+// finished; a pass longer than the interval (table growth, measurement
+// §12) resets the accumulated ticker tick (otherwise a new pass would
+// start right behind the slow one — a continuous aggregate), a Warn and
+// the crawler_zonestats_skipped_ticks_total counter raise the noise. reg
+// is the service metric registry (the pass and drift metrics; nil — the
+// loop without metrics,
+// the recount lives: the loop's purpose is reconciliation, not
+// instruments).
 func ZoneStatsLoop(ctx context.Context, pool db.DB, reg *metrics.Registry, opts ZoneStatsOptions) error {
 	if pool == nil {
 		return errors.New("monitor: реконсиляция счётчиков: пул не задан")
@@ -1580,8 +1671,9 @@ func ZoneStatsLoop(ctx context.Context, pool db.DB, reg *metrics.Registry, opts 
 	log.Info("цикл реконсиляции счётчиков конвейера",
 		"interval", o.Interval.String())
 
-	// Тикер до стартового прохода: тики отсчитываются от старта цикла,
-	// дренаж накопившегося тика в pass видит один и тот же тикер.
+	// The ticker before the starting pass: the ticks are counted from the
+	// loop start, draining an accumulated tick in pass sees the same
+	// ticker.
 	ticker := time.NewTicker(o.Interval)
 	defer ticker.Stop()
 	first := true
@@ -1589,35 +1681,37 @@ func ZoneStatsLoop(ctx context.Context, pool db.DB, reg *metrics.Registry, opts 
 		started := time.Now()
 		res, err := ZoneStatsOnce(ctx, txPool, o)
 		switch {
-		// Тело ветки пустое (только комментарий): branch/case подменяет
-		// его на noop-EmptyStmt, печать которого идентична оригиналу, —
-		// мутант с пустым диффом, тестом не убить; подавление генерации —
-		// единственная альтернатива блэклисту чексумм (§4).
+		// The branch body is empty (only a comment): branch/case would
+		// replace it with a noop EmptyStmt whose print is identical to the
+		// original — a mutant with an empty diff that no test can kill;
+		// suppressing the generation is the only alternative to the checksum
+		// blacklist (§4).
 		// mutator-disable-next-line branch/case
 		case err != nil && ctx.Err() != nil:
-			// Отмена во время прохода — часть остановки, не тревога.
+			// A cancellation during the pass — part of the shutdown, not an alarm.
 		case err != nil:
 			log.Warn("проход реконсиляции счётчиков", "err", err)
 		default:
 			reportDrift(log, m, res, first)
-			// Gauge «статус повис» (ФТ-2.2) — уровень, а не дрейф:
-			// выставляется каждым успешным проходом, включая первый
-			// заполняющий (стационар — честный ноль).
+			// The "status hung" gauge (FR-2.2) — a level, not a drift:
+			// it is set by every successful pass, including the first
+			// filling one (steady state — an honest zero).
 			m.setNewDoneStale(res.NewDoneStale)
 			log.Debug("проход реконсиляции счётчиков", "zones", res.Zones)
-			// «Первый» снимается только успешным проходом (ревью P3-5):
-			// сбойный старт (БД ещё не готова) счётчиков не заполнил —
-			// следующий проход всё ещё «заполняющий», его разница не
-			// дрейф (ТЗИ §7.1.3).
+			// "First" is cleared only by a successful pass (review P3-5):
+			// a failing start (the DB not ready yet) did not fill the
+			// counters —
+			// the next pass is still "filling", its difference is not
+			// drift (the incremental-counters spec §7.1.3).
 			first = false
 		}
 		took := time.Since(started)
 		m.observe(took.Seconds())
 		if took > o.Interval {
-			// Single-flight: сбросить тик, накопившийся за медленный
-			// проход, — иначе новый проход стартовал бы сразу за этим
-			// (select/default — тика может и не быть: Warn честен
-			// по длительности, дренаж в этом случае no-op).
+			// Single-flight: reset the tick accumulated during the slow
+			// pass — otherwise a new pass would start right behind this
+			// one (select/default — there may be no tick: the Warn is honest
+			// about the duration, the drain is a no-op in that case).
 			select {
 			case <-ticker.C:
 			default:
@@ -1639,23 +1733,28 @@ func ZoneStatsLoop(ctx context.Context, pool db.DB, reg *metrics.Registry, opts 
 	}
 }
 
-// reportDrift — наблюдение дрейфа (ТЗИ §7.1.3): gauge каждой позиции
-// (стационар — 0), Warn при ненулевом дрейфе любой позиции — КРОМЕ
-// суточных строк (T-179/T-182), корзин зрелости ретрая (T-202) и
-// часовых корзин темпа (T-203): их «дрейф» — потоковая разница семантик
-// (события записи HTTP против доменов дня всех веток), ненулевая под
-// живой нагрузкой почти всегда — Warn каждым проходом (каждые 30 мин)
-// хоронил бы сигнал
-// остальных позиций под шумом (отступление от §8 TZ_slow_done_today,
-// писавшегося в предположении «дрейф = повторы, доля мала»;
-// наблюдаемость позиций — gauge). Первый проход цикла (fillFirst) не
-// наблюдается вовсе: после миграции/простоя он заполняет нули — старые
-// значения не дрейф, а отсутствие счётчиков (ТЗИ §5); метрики по нему
-// не поднимаются, со второго прохода gauge экспонирует все позиции
-// (включая нулевые). Warn агрегирует: проход по 2 тыс. зон с полным
-// дрейфом (рестарт на обнулённых счётчиках) не должен флудить журнал —
-// счётчик позиций, сумма |Δ| и первые пять имён; полный список —
-// crawlerctl counters verify (ТЗИ §9).
+// reportDrift — the drift observability (the incremental-counters spec
+// §7.1.3): a gauge of each position
+// (steady state — 0), a Warn on a non-zero drift of any position — EXCEPT
+// the daily rows (T-179/T-182), the retry maturity baskets (T-202) and
+// the hourly tempo baskets (T-203): their "drift" is a streaming
+// difference of semantics
+// (the HTTP record events against the domains of the day of all the
+// branches), non-zero under live load almost always — a Warn on every
+// pass (every 30 min) would bury the signal
+// of the other positions under the noise (a deviation from §8 of
+// TZ_slow_done_today, written under the assumption "drift = repeats, the
+// share is small";
+// the positions' observability — gauge). The first pass of the loop
+// (fillFirst) is not observed at all: after a migration/downtime it fills
+// in the zeros — the old values are not a drift but the absence of the
+// counters (the incremental-counters spec §5); no metrics are raised on
+// it, from the second pass the gauge exposes all the positions
+// (the zero ones included). The Warn aggregates: a pass over 2 k zones
+// with a full drift (a restart on zeroed counters) must not flood the
+// log —
+// the position counter, the |Δ| sum and the first five names; the full
+// list — crawlerctl counters verify (the incremental-counters spec §9).
 func reportDrift(log *slog.Logger, m *zoneStatsLoopMetrics, res ZoneStatsResult, fillFirst bool) {
 	if fillFirst {
 		return
@@ -1689,26 +1788,29 @@ func reportDrift(log *slog.Logger, m *zoneStatsLoopMetrics, res ZoneStatsResult,
 		"positions", len(drifted), "sum_abs", sum, "top", top)
 }
 
-// zoneStatsLoopMetrics — приборы цикла реконсиляции (T-161/T-178):
-// длительность прохода, счётчик пропущенных тиков, gauge дрейфа и gauge
-// доменов «статус повис» (ФТ-2.2, T-256); nil-приёмник — no-op (цикл без
-// реестра, стиль scheduler.backlogLoopMetrics).
+// zoneStatsLoopMetrics — the instruments of the reconciliation loop
+// (T-161/T-178):
+// the pass duration, the skipped tick counter, the drift gauge and the
+// "status hung" domains gauge (FR-2.2, T-256); a nil receiver is a no-op
+// (a loop without a registry, the scheduler.backlogLoopMetrics style).
 type zoneStatsLoopMetrics struct {
 	seconds prometheus.ObserverVec
 	skipped *prometheus.CounterVec
 	drift   *prometheus.GaugeVec
-	// newDoneStale — значение строки new_done_stale прохода (уровень,
-	// не дрейф): выставляется каждым успешным проходом, включая первый
-	// заполняющий (в отличие от дрейфа — норма ноль и «заполнять» нечего).
+	// newDoneStale — the value of the pass's new_done_stale row (a level,
+	// not drift): it is set by every successful pass, including the first
+	// filling one (unlike the drift — the zero norm and there is nothing
+	// to "fill").
 	newDoneStale *prometheus.GaugeVec
 }
 
-// newZoneStatsLoopMetrics — приборы в реестре reg (nil — nil). Корзины —
-// экспонента 0.5 с…~8.5 мин: проход — агрегат по всем доменам (замер
-// §12 — десятки секунд на 47 млн строк), дефолтные корзины Prometheus
-// (потолок 10 с) малы. crawler_counters_recount_seconds — переименование
-// crawler_zonestats_pass_seconds (T-178, ТЗИ §7.2: проход совмещённый),
-// корзины прежние.
+// newZoneStatsLoopMetrics — the instruments in the reg registry (nil —
+// nil). The buckets are an exponent of 0.5 s…~8.5 min: a pass is an
+// aggregate over all domains (measurement
+// §12 — tens of seconds on 47 M rows), the default Prometheus buckets
+// (a 10 s cap) are small. crawler_counters_recount_seconds — a rename of
+// crawler_zonestats_pass_seconds (T-178, the incremental-counters spec
+// §7.2: the pass is combined), the buckets unchanged.
 func newZoneStatsLoopMetrics(reg *metrics.Registry) *zoneStatsLoopMetrics {
 	if reg == nil {
 		return nil
@@ -1734,7 +1836,7 @@ func newZoneStatsLoopMetrics(reg *metrics.Registry) *zoneStatsLoopMetrics {
 	}
 }
 
-// observe — фиксация длительности прохода; nil — no-op.
+// observe — recording the pass duration; nil — a no-op.
 func (m *zoneStatsLoopMetrics) observe(seconds float64) {
 	if m == nil {
 		return
@@ -1742,7 +1844,7 @@ func (m *zoneStatsLoopMetrics) observe(seconds float64) {
 	m.seconds.WithLabelValues().Observe(seconds)
 }
 
-// skip — пропуск тика; nil — no-op.
+// skip — a skipped tick; nil — a no-op.
 func (m *zoneStatsLoopMetrics) skip() {
 	if m == nil {
 		return
@@ -1750,8 +1852,8 @@ func (m *zoneStatsLoopMetrics) skip() {
 	m.skipped.WithLabelValues().Inc()
 }
 
-// setNewDoneStale — выставляет gauge доменов «статус повис» значением
-// успешного прохода (ФТ-2.2); nil — no-op.
+// setNewDoneStale — sets the "status hung" domains gauge to the value of
+// a successful pass (FR-2.2); nil — a no-op.
 func (m *zoneStatsLoopMetrics) setNewDoneStale(n int64) {
 	if m == nil {
 		return
@@ -1761,9 +1863,12 @@ func (m *zoneStatsLoopMetrics) setNewDoneStale(n int64) {
 
 // ---------------------------------------------------------------- verify
 
-// verifyZonesSQL — сверка колонок зон с живым агрегатом без записи
-// (ТЗИ §9): сохранённые значения рядом с агрегатом; COALESCE — зона без
-// живых доменов вне агрегата. $1 — фильтр зоны (NULL — все).
+// verifyZonesSQL — cross-checking the zone columns against the live
+// aggregate without writing
+// (the incremental-counters spec §9): the stored values next to the
+// aggregate; COALESCE — a zone without
+// live domains is outside the aggregate. $1 — the zone filter (NULL —
+// all).
 var verifyZonesSQL = "SELECT z.id, " +
 	"z.domains_total, COALESCE(a.total, 0), " +
 	"z.domains_pending, COALESCE(a.pending, 0), " +
@@ -1775,28 +1880,34 @@ var verifyZonesSQL = "SELECT z.id, " +
 	"LEFT JOIN (SELECT zone_id, count(*) AS laravel FROM laravel_domains GROUP BY zone_id) AS l ON l.zone_id = z.id " +
 	"WHERE ($1::int2 IS NULL OR z.id = $1) ORDER BY z.id"
 
-// VerifyOptions — параметры сверки; используется crawlerctl counters
-// verify (ТЗИ §9) и интеграционными тестами (готовая verify-логика,
-// ТЗИ §12.2).
+// VerifyOptions — the cross-check options; used by crawlerctl counters
+// verify (the incremental-counters spec §9) and by the integration tests
+// (the ready verify logic,
+// the incremental-counters spec §12.2).
 type VerifyOptions struct {
-	// Zone — фильтр зоны (nil — все зоны; глобальные счётчики сверяются
-	// всегда полностью).
+	// Zone is the zone filter (nil — all zones; the global counters are
+	// always checked in full).
 	Zone *int16
-	// Tolerance — допуск расхождения (по умолчанию 0 — счётчики обязаны
-	// сходиться точно; > 0 — для сверки под живой нагрузкой, когда между
-	// чтением сохранённого и живого агрегата проходят инкременты).
+	// Tolerance is the mismatch tolerance (0 by default — the counters
+	// must converge exactly; > 0 — for a check under live load, when
+	// increments happen between reading the stored value and the live
+	// aggregate).
 	Tolerance int64
 }
 
-// VerifyCounters сверяет счётчики с живыми агрегатами БЕЗ записи
-// (ТЗИ §9): сохранённые значения zones/crawler_counters против
-// агрегатов domains/laravel_domains/laravel_history (тот же per-zone
-// агрегат и функция глобальных сумм, что у реконсиляции, — одна точка
-// правды, ТЗИ §9). Возвращает позиции с расхождением выше допуска
-// (Old — сохранённое, New — живой агрегат); пустой срез — счётчики
-// сходятся. Снимок не атомарен между сохранённым и живым чтением —
-// под живой нагрузкой единичные расхождения в темпе переходов закрывает
-// tolerance.
+// VerifyCounters cross-checks the counters against the live DB aggregates
+// WITHOUT writing
+// (the incremental-counters spec §9): the stored zones/crawler_counters
+// values against the
+// domains/laravel_domains/laravel_history aggregates (the same per-zone
+// aggregate and the global sums function as the reconciliation's — one
+// point of truth, the incremental-counters spec §9). It returns the
+// positions with a mismatch above the tolerance
+// (Old — the stored one, New — the live aggregate); an empty slice — the
+// counters converge. The snapshot is not atomic between the stored and
+// the live read —
+// under live load the single mismatches at the transition tempo are
+// closed by the tolerance.
 func VerifyCounters(ctx context.Context, pool db.DB, opts VerifyOptions) ([]CounterPosition, error) {
 	if pool == nil {
 		return nil, errors.New("monitor: сверка счётчиков: пул не задан")
@@ -1837,8 +1948,9 @@ func VerifyCounters(ctx context.Context, pool db.DB, opts VerifyOptions) ([]Coun
 	}
 	rows.Close()
 
-	// Живые глобальные скаляры: тот же агрегат и та же функция сумм,
-	// что у реконсиляции (одна точка правды соответствия).
+	// The live global scalars: the same aggregate and the same sums
+	// function as the reconciliation's (one point of truth of the
+	// mapping).
 	agg, err := readZoneAgg(ctx, pool)
 	if err != nil {
 		return nil, fmt.Errorf("monitor: сверка счётчиков: глобальные: %w", err)
@@ -1869,21 +1981,25 @@ func VerifyCounters(ctx context.Context, pool db.DB, opts VerifyOptions) ([]Coun
 		return nil, err
 	}
 	for _, name := range driftCounterNames() {
-		// Только дельта-ведомые скаляры: распределение статусов пишется
-		// только реконсиляцией (ТЗИ §13.3) — сверка «сохранённое против
-		// живого» под нагрузкой расходится на темп статусов, это
-		// свежесть интервала, не дрейф. Суточные строки checks:/temp_error:
-		// (T-179/T-182), корзины зрелости ретрая retry_mature: (T-202) и
-		// часовые корзины темпа results:/rendered: (T-203) и хвостов
-		// переанализа reanalyze: (T-204) — тоже мимо сверки: инкременты
-		// считают события (записи результата, переводы в rendered,
-		// штампы версий), живой агрегат — строки окна; под нагрузкой
-		// расхождение равно разнице потоков с прошлого прохода —
-		// наблюдается позициями daily:*/retry_mature:*/rendered:* /
-		// results:*/reanalyze:* прохода реконсиляции, сверка с допуском 0
-		// сигналила бы штатную работу (у корзин ретрая/темпа/хвостов
-		// вдобавок проход держит только две живые строки на семью и
-		// свёртывает старые, поимённая сверка дат/часов не определена).
+		// Only the delta-driven scalars: the status distribution is written
+		// only by the reconciliation (the incremental-counters spec §13.3) —
+		// a "stored vs live" check under load diverges by the status tempo,
+		// that is
+		// the interval freshness, not drift. The daily checks:/temp_error:
+		// rows (T-179/T-182), the retry maturity baskets retry_mature:
+		// (T-202) and
+		// the hourly tempo baskets results:/rendered: (T-203) and the
+		// reanalysis tails reanalyze: (T-204) are also outside the check:
+		// the increments
+		// count events (result records, switches to rendered,
+		// version stamps), the live aggregate — the window rows; under load
+		// the mismatch equals the flow difference since the last pass —
+		// observed by the daily:*/retry_mature:*/rendered:* /
+		// results:*/reanalyze:* positions of the reconciliation pass, a
+		// check with a 0 tolerance would flag routine work (the
+		// retry/tempo/tail baskets additionally keep only two live rows per
+		// family and
+		// fold the old ones, a by-name date/hour check is undefined).
 		if absDiff(stored[name], live[name]) > opts.Tolerance {
 			out = append(out, CounterPosition{
 				Counter: "global:" + name,
@@ -1895,8 +2011,8 @@ func VerifyCounters(ctx context.Context, pool db.DB, opts VerifyOptions) ([]Coun
 	return out, nil
 }
 
-// readStoredCounters — сохранённые строки crawler_counters (сверка:
-// отсутствующая строка — 0).
+// readStoredCounters — the stored crawler_counters rows (the check:
+// a missing row — 0).
 const storedCountersSQL = "SELECT name, value FROM crawler_counters"
 
 func readStoredCounters(ctx context.Context, pool db.DB) (map[string]int64, error) {
@@ -1920,8 +2036,7 @@ func readStoredCounters(ctx context.Context, pool db.DB) (map[string]int64, erro
 	return out, nil
 }
 
-// absDiff — |a − b|.
-func absDiff(a, b int64) int64 {
+// absDiff — |a − b|.func absDiff(a, b int64) int64 {
 	if a > b {
 		return a - b
 	}

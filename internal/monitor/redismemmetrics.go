@@ -1,15 +1,16 @@
-// Метрики памяти Redis (T-154, ТЗ 5.9): gauge crawler_redis_memory_ratio
-// (used_memory/maxmemory — прокси-метрика предстоящих OOM-отказов записи
-// при noeviction) и crawler_redis_memory_bytes{kind=used|max}.
+// Redis memory metrics (T-154, spec 5.9): the crawler_redis_memory_ratio
+// gauge (used_memory/maxmemory — a proxy metric for upcoming OOM write
+// failures under noeviction) and crawler_redis_memory_bytes{kind=used|max}.
 //
-// Архитектурно — обёртка источника RedisMemorySource, а не хук
-// AlertsOptions.OnPass: тот же шов, что UnitEventsMetrics (T-145), —
-// данные для приборов это вход прохода алертов, чтение источника
-// дорого дублировать отдельным циклом, один проход читает источник один
-// раз и зеркалит снимок в метрики. Ошибка источника метрики не трогает
-// (hold-last, стиль t092-сэмплера): сбой чтения не рвёт график.
-// maxmemory 0 (без потолка) — ratio не определён и не пишется, bytes
-// пишутся: абсолюты честны и без потолка.
+// Architecturally this is a wrapper over the RedisMemorySource, not a
+// hook on AlertsOptions.OnPass: the same seam as UnitEventsMetrics
+// (T-145) — the data feeding the instruments is the input of the alert
+// pass, duplicating the source read with a separate loop is expensive,
+// so one pass reads the source once and mirrors the snapshot into the
+// metrics. A source error leaves the metrics untouched (hold-last, the
+// t092 sampler style): a read failure does not tear the graph. With
+// maxmemory 0 (no cap) the ratio is undefined and is not written, while
+// bytes are: absolutes are honest even without a cap.
 package monitor
 
 import (
@@ -20,31 +21,31 @@ import (
 	"crawler/internal/metrics"
 )
 
-// Значения метки kind метрики crawler_redis_memory_bytes.
+// Values of the kind label of the crawler_redis_memory_bytes metric.
 const (
-	// redisMemKindUsed — used_memory.
+	// redisMemKindUsed is used_memory.
 	redisMemKindUsed = "used"
-	// redisMemKindMax — maxmemory.
+	// redisMemKindMax is maxmemory.
 	redisMemKindMax = "max"
 )
 
-// RedisMemoryMetrics — приборы памяти Redis поверх другого
-// RedisMemorySource (транзит + зеркало в метрики).
+// RedisMemoryMetrics is Redis memory instruments on top of another
+// RedisMemorySource (transit + mirroring into metrics).
 type RedisMemoryMetrics struct {
-	// ratio — crawler_redis_memory_ratio: used_memory/maxmemory.
+	// ratio is crawler_redis_memory_ratio: used_memory/maxmemory.
 	ratio *prometheus.GaugeVec
-	// bytes — crawler_redis_memory_bytes{kind}: used/max.
+	// bytes is crawler_redis_memory_bytes{kind}: used/max.
 	bytes *prometheus.GaugeVec
-	// src — исходный источник (обязателен).
+	// src is the underlying source (required).
 	src RedisMemorySource
 }
 
-// compile-time: RedisMemoryMetrics — RedisMemorySource.
+// compile-time: RedisMemoryMetrics is a RedisMemorySource.
 var _ RedisMemorySource = (*RedisMemoryMetrics)(nil)
 
-// NewRedisMemoryMetrics оборачивает src источником с метриками в reg;
-// nil reg — чистый транзит (изолированные сборки без реестра, стиль
-// NewUnitEventsMetrics). Идемпотентен (T-076).
+// NewRedisMemoryMetrics wraps src with a metrics source in reg;
+// a nil reg is pure transit (isolated builds without a registry, the
+// NewUnitEventsMetrics style). Idempotent (T-076).
 func NewRedisMemoryMetrics(reg *metrics.Registry, src RedisMemorySource) *RedisMemoryMetrics {
 	m := &RedisMemoryMetrics{src: src}
 	if reg == nil {
@@ -61,7 +62,7 @@ func NewRedisMemoryMetrics(reg *metrics.Registry, src RedisMemorySource) *RedisM
 	return m
 }
 
-// RedisMemory читает исходный источник и зеркалит снимок в метрики.
+// RedisMemory reads the underlying source and mirrors the snapshot into the metrics.
 func (m *RedisMemoryMetrics) RedisMemory(ctx context.Context) (RedisMemory, error) {
 	snap, err := m.src.RedisMemory(ctx)
 	if err != nil {

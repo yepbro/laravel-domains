@@ -1,7 +1,7 @@
-// Тесты источника PSI (T-162): парсер файла давления (some avg10/60/300,
-// полный файл CPU без full, лишние строки, битые значения), деградации
-// (ядро без PSI — errNoPSI, прочие ошибки чтения), отмена ctx, обёртка
-// метрик.
+// PSI source tests (T-162): the pressure file parser (some avg10/60/300,
+// a full CPU file without full, extra lines, broken values),
+// degradations (a kernel without PSI — errNoPSI, other read errors),
+// ctx cancellation, the metrics wrapper.
 package monitor
 
 import (
@@ -15,9 +15,9 @@ import (
 	"crawler/internal/metrics"
 )
 
-// TestParsePSI — разбор строки some: три средних, total пропускается;
-// строка full (у памяти/IO; у CPU её нет) мимо; отсутствие some или
-// битые поля — ошибки.
+// TestParsePSI — parsing a some line: three averages, total is skipped;
+// a full line (memory/IO have it; CPU does not) does not pass; a missing
+// some or broken fields are errors.
 func TestParsePSI(t *testing.T) {
 	st, err := parsePSI("some avg10=1.25 avg60=2.50 avg300=3.75 total=562500\n")
 	if err != nil {
@@ -27,23 +27,24 @@ func TestParsePSI(t *testing.T) {
 		t.Errorf("средние = %+v, want 1.25/2.5/3.75", st)
 	}
 
-	// Файл с full-строкой (ядро отдаёт её у памяти/IO — парсер CPU-файла
-	// обязан пропускать).
+	// A file with a full line (the kernel returns it for memory/IO —
+	// the CPU file parser must skip it).
 	st, err = parsePSI("full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n" +
 		"some avg10=91.02 avg60=92.10 avg300=93.45 total=16815000000\n")
 	if err != nil || st.Avg300 != 93.45 {
 		t.Errorf("full+some: (%+v, %v), want some avg300=93.45", st, err)
 	}
 
-	// Пустой файл / только full / мусор — строки some нет.
+	// An empty file / only full / garbage — there is no some line.
 	for _, bad := range []string{"", "full avg10=0 avg60=0 avg300=0 total=0\n", "garbage\n"} {
 		if _, err := parsePSI(bad); err == nil || !strings.Contains(err.Error(), "some") {
 			t.Errorf("%q: ошибка = %v, want «строка some отсутствует»", bad, err)
 		}
 	}
 
-	// Битые значения: не число, отрицательное, >100, пропавшее поле —
-	// формат фиксирован ядром, кривой файл не молчать.
+	// Broken values: not a number, negative, >100, a missing field —
+	// the format is fixed by the kernel, a malformed file must not be
+	// silently ignored.
 	for _, bad := range []string{
 		"some avg10=x avg60=1 avg300=1 total=0\n",
 		"some avg10=-1 avg60=1 avg300=1 total=0\n",
@@ -56,9 +57,9 @@ func TestParsePSI(t *testing.T) {
 	}
 }
 
-// TestOSPISource — чтение по заданному пути; отсутствие файла — errNoPSI
-// (тихий класс деградации алерта), прочие ошибки — как есть; отмена ctx —
-// до обращения к файлу.
+// TestOSPISource — reading by the given path; a missing file is errNoPSI
+// (the quiet degradation class of the alert), other errors — as is; a ctx
+// cancellation — before the file access.
 func TestOSPISource(t *testing.T) {
 	dir := t.TempDir()
 	file := filepath.Join(dir, "cpu")
@@ -70,19 +71,19 @@ func TestOSPISource(t *testing.T) {
 		t.Errorf("PSI по файлу: (%+v, %v), want avg300=4", st, err)
 	}
 
-	// Нет файла — ядро без PSI: тихий класс (алерт деградирует без Warn).
+	// No file — a kernel without PSI: the quiet class (the alert degrades without a Warn).
 	_, err = (OSPSI{Path: filepath.Join(dir, "нет")}).PSI(context.Background())
 	if !errors.Is(err, errNoPSI) {
 		t.Errorf("нет файла: ошибка = %v, want errNoPSI", err)
 	}
 
-	// Каталог вместо файла — прочая ошибка (не errNoPSI).
+	// A directory instead of a file — another error (not errNoPSI).
 	_, err = (OSPSI{Path: dir}).PSI(context.Background())
 	if err == nil || errors.Is(err, errNoPSI) {
 		t.Errorf("каталог вместо файла: ошибка = %v, want обычная ошибка чтения", err)
 	}
 
-	// Отмена ctx — до обращения к файлу.
+	// A ctx cancellation — before the file access.
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if _, err := (OSPSI{Path: file}).PSI(ctx); !errors.Is(err, context.Canceled) {
@@ -90,10 +91,11 @@ func TestOSPISource(t *testing.T) {
 	}
 }
 
-// TestOSPSIDefaultPath — пустой Path читает боевой /proc/pressure/cpu:
-// на CI-хосте с PSI в ядре ответ валиден (0–100, значения не фиксируются —
-// давление хоста меняется между запусками), без PSI — errNoPSI; проверяется
-// договорённость дефолта, не значения.
+// TestOSPSIDefaultPath — an empty Path reads the production
+// /proc/pressure/cpu: on a CI host with PSI in the kernel the answer is
+// valid (0–100, the values are not pinned — the host pressure changes
+// between runs), without PSI — errNoPSI; the default convention is
+// checked, not the values.
 func TestOSPSIDefaultPath(t *testing.T) {
 	st, err := (OSPSI{}).PSI(context.Background())
 	if err != nil {
@@ -107,9 +109,9 @@ func TestOSPSIDefaultPath(t *testing.T) {
 	}
 }
 
-// TestPSIMetrics — обёртка зеркалит средние в crawler_psi_cpu_some_percent
-// {kind=avg10/60/300}, ошибка источника — чистый транзит ошибки, gauge
-// держит последнее значение (hold-last).
+// TestPSIMetrics — the wrapper mirrors the averages into
+// crawler_psi_cpu_some_percent {kind=avg10/60/300}, a source error — a
+// clean error transit, the gauge keeps the last value (hold-last).
 func TestPSIMetrics(t *testing.T) {
 	reg := metrics.New("monitor")
 	src := &fakePSI{psi: PSIStat{Avg10: 10, Avg60: 20, Avg300: 30}}
@@ -126,7 +128,7 @@ func TestPSIMetrics(t *testing.T) {
 		}
 	}
 
-	// Ошибка источника: метрики не трогаются, ошибка возвращается.
+	// A source error: the metrics are untouched, the error is returned.
 	src.err = errors.New("отказ")
 	if _, err := m.PSI(context.Background()); err == nil {
 		t.Error("ошибка источника проглочена")
@@ -136,7 +138,7 @@ func TestPSIMetrics(t *testing.T) {
 		t.Errorf("после ошибки avg300 = (%v, %v), want 30 (hold-last)", v, ok)
 	}
 
-	// nil-реестр — чистый транзит.
+	// A nil registry — pure transit.
 	src.err = nil
 	plain := NewPSIMetrics(nil, src)
 	if st, err := plain.PSI(context.Background()); err != nil || st.Avg10 != 10 {

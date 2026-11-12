@@ -1,19 +1,20 @@
-// Источник состояния групп потребителей рабочих стримов для алерта
-// замороженной очереди (T-162; сигнатура отравленной задачи T-159:
-// XREADGROUP не отдаёт записи — last-delivered-id группы стоит, а глубина
-// (backlog) ненулевая; замер §12 — все P0 находили вручную именно по
-// таким «тихим» простоям). Глубина группы — queue.GroupDepth: общий
-// расчёт с гейтом backpressure (min(lag, XLEN) + pending, кламп
-// фантомного лага после обрезки недоставленного — T-168) — источник
-// обязан соглашаться с алертом переполнения очередей о том, есть ли
-// работа.
+// Source of the worker-stream consumer group state for the frozen queue
+// alert (T-162; the poisoned-task signature from T-159:
+// XREADGROUP returns no entries — the group's last-delivered-id stands
+// still while the backlog is non-zero; measurement §12 — every P0 was
+// found manually precisely by such "quiet" standstills). The group depth
+// is queue.GroupDepth: the same arithmetic as the backpressure gate
+// (min(lag, XLEN) + pending, the clamp of the phantom lag after the
+// undelivered trim — T-168) — the source must agree with the queue
+// overflow alert on whether there is work to do.
 //
-// Данные — XINFO GROUPS по каждому рабочему стриму (имя группы, lag,
-// pending, last-delivered-id) и XLEN для клампа: то же окно в go-redis,
-// что у redisDepth в internal/queue, но своим интерфейсом — пакет queue
-// не тянет проверок алертов в API гейта (гейт — механизм продюсера,
-// монитор — наблюдатель, ТЗ 5.9); сама формула глубины — общая
-// (queue.GroupDepth), чтобы наблюдение и гейт не разошлись.
+// The data is XINFO GROUPS for each worker stream (group name, lag,
+// pending, last-delivered-id) and XLEN for the clamp: the same window
+// into go-redis as redisDepth in internal/queue, but through its own
+// interface — the queue package does not pull alert checks into the gate
+// API (the gate is a producer mechanism, the monitor is an observer,
+// spec 5.9); the depth formula itself is shared (queue.GroupDepth) so
+// that observation and the gate do not drift apart.
 package monitor
 
 import (
@@ -27,58 +28,64 @@ import (
 	"crawler/internal/queue"
 )
 
-// StreamGroupState — снимок одной группы потребления рабочего стрима.
+// StreamGroupState is a snapshot of one consumer group of a worker stream.
 type StreamGroupState struct {
-	// Stream — имя стрима (q:http).
+	// Stream is the stream name (q:http).
 	Stream string
-	// Group — имя группы (http-worker).
+	// Group is the group name (http-worker).
 	Group string
-	// Depth — глубина очереди группы: непрочитанный остаток
-	// (min(lag, XLEN) — кламп T-168) плюс неподтверждённые доставки
-	// (pending). Формула — queue.GroupDepth (общая с BackpressureGate.Len).
+	// Depth is the group queue depth: the unread backlog
+	// (min(lag, XLEN) — the T-168 clamp) plus unacknowledged deliveries
+	// (pending). The formula is queue.GroupDepth (shared with
+	// BackpressureGate.Len).
 	Depth int64
-	// LastDeliveredID — last-delivered-id группы из XINFO GROUPS: ID
-	// последней записи, доставленной потребителям (XREADGROUP ">").
-	// Движется только новыми доставками: стоящий ID при Depth > 0 —
-	// очередь не читается. "0-0" — доставок не было вовсе.
+	// LastDeliveredID is the group's last-delivered-id from XINFO GROUPS:
+	// the ID of the last entry delivered to consumers (XREADGROUP ">").
+	// It moves only with new deliveries: a standing ID at Depth > 0 —
+	// the queue is not being read. "0-0" — no deliveries ever happened.
 	LastDeliveredID string
 }
 
-// StreamGroupsSource — источник состояния групп рабочих стримов;
-// интерфейс для подмены в юнит-тестах (реальное чтение — XINFO/XLEN живого
-// Redis, в тестах его нет). Стиль StreamLener/RedisMemorySource.
+// StreamGroupsSource is a worker-stream group state source; an interface
+// for substitution in unit tests (the real read is XINFO/XLEN from a
+// live Redis, which tests do not have). StreamLener/RedisMemorySource
+// style.
 type StreamGroupsSource interface {
-	// StreamGroups возвращает снимки всех групп рабочих стримов.
-	// Стримы без групп (не существует или потребители не создавались)
-	// в список не входят: замерять движение доставок не по кому.
-	// Ошибка = «не измеряется» с причиной.
+	// StreamGroups returns snapshots of all worker-stream groups.
+	// Streams without groups (the stream does not exist or the consumers
+	// were never created) are not included in the list: there is no one
+	// whose delivery movement could be measured.
+	// An error means "not measured", with the reason attached.
 	StreamGroups(ctx context.Context) ([]StreamGroupState, error)
 }
 
-// redisGroupsCmd — окно в go-redis для групп стримов: XINFO GROUPS и
-// XLEN (узкое, как redisDepth в internal/queue); *redis.Client
-// (queue.NewClient) и *redis.ClusterClient удовлетворяют интерфейсу.
+// redisGroupsCmd is a window into go-redis for stream groups: XINFO
+// GROUPS and XLEN (narrow, like redisDepth in internal/queue);
+// *redis.Client (queue.NewClient) and *redis.ClusterClient satisfy
+// the interface.
 type redisGroupsCmd interface {
 	XLen(ctx context.Context, key string) *redis.IntCmd
 	XInfoGroups(ctx context.Context, key string) *redis.XInfoGroupsCmd
 }
 
-// RedisStreamGroups — StreamGroupsSource поверх XINFO GROUPS + XLEN того
-// же клиента go-redis, что читает глубины стримов (cmd/monitor).
+// RedisStreamGroups is a StreamGroupsSource on top of XINFO GROUPS +
+// XLEN of the same go-redis client that reads stream depths
+// (cmd/monitor).
 type RedisStreamGroups struct {
-	// RDB — клиент Redis; nil — ошибка источника.
+	// RDB is the Redis client; nil — a source error.
 	RDB redisGroupsCmd
 }
 
-// compile-time: RedisStreamGroups — StreamGroupsSource.
+// compile-time: RedisStreamGroups is a StreamGroupsSource.
 var _ StreamGroupsSource = RedisStreamGroups{}
 
-// StreamGroups обходит рабочие стримы (alertStreams): стрим без групп
-// (нет ключа — Redis отвечает ошибкой, или группы не создавались) —
-// пустой вклад, глубина такого стрима — территория алерта переполнения
-// (Len читает XLEN). Ошибка чтения любого стрима останавливает проход
-// целиком: непрочитанные состояния не подменяются пустотой, иначе сбой
-// ложно «оживлял» бы замороженную группу (сброс трекинга в машине queue_frozen).
+// StreamGroups traverses the worker streams (alertStreams): a stream
+// without groups (the key is missing — Redis answers with an error — or
+// the groups were never created) contributes nothing, the depth of such
+// a stream is the queue overflow alert's territory (Len reads XLEN).
+// A read error on any stream stops the whole pass: unread states are not
+// substituted with emptiness, otherwise a failure would falsely "revive"
+// a frozen group (resetting the tracking in the queue_frozen FSM).
 func (s RedisStreamGroups) StreamGroups(ctx context.Context) ([]StreamGroupState, error) {
 	if s.RDB == nil {
 		return nil, fmt.Errorf("monitor: группы стримов: клиент Redis не задан")
@@ -87,9 +94,9 @@ func (s RedisStreamGroups) StreamGroups(ctx context.Context) ([]StreamGroupState
 	for _, stream := range alertStreams {
 		groups, err := s.RDB.XInfoGroups(ctx, stream).Result()
 		if err != nil {
-			// Стрима ещё нет — Redis отвечает ошибкой no such key (не пустым
-			// списком): групп нет, стрим не заморожен (та же ветка, что у
-			// BackpressureGate.Len).
+			// The stream does not exist yet — Redis answers with a
+			// no such key error (not an empty list): no groups, the stream
+			// is not frozen (the same branch as BackpressureGate.Len).
 			if errors.Is(err, redis.Nil) || strings.Contains(err.Error(), "no such key") {
 				continue
 			}
@@ -98,8 +105,8 @@ func (s RedisStreamGroups) StreamGroups(ctx context.Context) ([]StreamGroupState
 		if len(groups) == 0 {
 			continue
 		}
-		// XLEN — верхняя грань непрочитанного остатка каждой группы
-		// (кламп T-168): недоставленные записи живут в стриме.
+		// XLEN — the upper bound of each group's unread backlog
+		// (the T-168 clamp): undelivered entries live in the stream.
 		xlen, err := s.RDB.XLen(ctx, stream).Result()
 		if err != nil {
 			return nil, fmt.Errorf("monitor: группы %s (XLEN): %w", stream, err)
@@ -108,8 +115,8 @@ func (s RedisStreamGroups) StreamGroups(ctx context.Context) ([]StreamGroupState
 			out = append(out, StreamGroupState{
 				Stream: stream,
 				Group:  g.Name,
-				// −1 — lag неопределён (обрезка недоставленного, Redis < 7.0):
-				// GroupDepth учитывает только точный pending.
+				// −1 — the lag is undefined (the undelivered trim, Redis < 7.0):
+				// GroupDepth counts only the exact pending.
 				Depth:           queue.GroupDepth(g, xlen),
 				LastDeliveredID: g.LastDeliveredID,
 			})

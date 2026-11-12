@@ -1,12 +1,12 @@
-// Второй раунд триажа мутантов (догонка прогона monitor 0.901): прямые
-// тесты reportDrift и машин на фактических границах, VerifyCounters на
-// фейковом пуле (юнит-уровень: ошибки каждого шага сверки, флаги Close
-// строк, допуски), пины нулей на каждой ошибочной ветке читателей
-// реконсиляции, ошибки источников с исходным текстом (psi/redis/
-// renderdebt/unitevents), readMemInfo с посторонними строками, границы
-// withDefaults в единицах (1нс — рабочее значение), точные значения
-// парсеров на base/bitSize-инъекциях и полный диапазон согласования
-// числительных.
+// The second round of mutant triage (catching up with the monitor run
+// of 0.901): direct tests of reportDrift and the machines at the actual
+// boundaries, VerifyCounters on a fake pool (the unit level: the errors
+// of each cross-check step, the row Close flags, the tolerances), pins
+// of zeros on every error branch of the reconciliation readers, source
+// errors with the original text (psi/redis/renderdebt/unitevents),
+// readMemInfo with foreign lines, the withDefaults boundaries at unit
+// values (1ns — a working value), the exact parser values on
+// base/bitSize injections and the full numeral agreement range.
 package monitor
 
 import (
@@ -27,11 +27,12 @@ import (
 	"crawler/internal/queue"
 )
 
-// --- reportDrift: прямые вызовы (без гонок цикла) ----------------------------
+// --- reportDrift: direct calls (without loop races) ----------------------------
 
-// TestReportDriftDirect — первый проход молчит; стационар без дрейфа
-// молчит; N позиций дрейфа — Warn с точной суммой и ровно пятью строками
-// топа (шестая и дальше — счётчиком позиций, не строками).
+// TestReportDriftDirect — the first pass is silent; a steady state
+// without drift is silent; N drift positions — a Warn with the exact sum
+// and exactly five top lines (the sixth and beyond — by the position
+// counter, not lines).
 func TestReportDriftDirect(t *testing.T) {
 	slogBuf := &zonestatsSyncBuf{}
 	logger := zsLogger(slogBuf)
@@ -39,19 +40,19 @@ func TestReportDriftDirect(t *testing.T) {
 	m := newZoneStatsLoopMetrics(reg)
 	zero := []CounterPosition{{Counter: "zone:7:total", Old: 5, New: 5}}
 
-	// Первый проход (fillFirst) — полная тишина даже с дрейфом.
+	// The first pass (fillFirst) — complete silence even with drift.
 	reportDrift(logger, m, ZoneStatsResult{Positions: []CounterPosition{
 		{Counter: "x", Old: 1, New: 2}}}, true)
 	if log := slogBuf.String(); log != "" {
 		t.Fatalf("fillFirst пишет лог:\n%s", log)
 	}
-	// Стационар (дрейфа нет) — тишина.
+	// Steady state (no drift) — silence.
 	reportDrift(logger, m, ZoneStatsResult{Positions: zero}, false)
 	if log := slogBuf.String(); log != "" {
 		t.Fatalf("стационар без дрейфа пишет Warn:\n%s", log)
 	}
-	// Потоковые позиции (daily/retry/hourly) не поднимают Warn — но
-	// пишутся в gauge.
+	// The streaming positions (daily/retry/hourly) do not raise a Warn —
+	// but are written to the gauge.
 	reportDrift(logger, m, ZoneStatsResult{Positions: []CounterPosition{
 		{Counter: dailyChecksCounter, Old: 7, New: 9}}}, false)
 	if log := slogBuf.String(); strings.Contains(log, "level=WARN") {
@@ -61,8 +62,8 @@ func TestReportDriftDirect(t *testing.T) {
 		t.Errorf("gauge потоковой позиции = %v, want 2", v)
 	}
 
-	// Семь дрейфующих позиций по 2: Warn с sum_abs=14 и ровно пятью
-	// строками топа.
+	// Seven drifting positions by 2 each: a Warn with sum_abs=14 and
+	// exactly five top lines.
 	slogBuf = &zonestatsSyncBuf{}
 	logger = zsLogger(slogBuf)
 	positions := make([]CounterPosition, 7)
@@ -88,9 +89,9 @@ func TestReportDriftDirect(t *testing.T) {
 	}
 }
 
-// --- VerifyCounters: юнит-уровень на фейковом пуле -----------------------------
+// --- VerifyCounters: unit level on a fake pool -----------------------------
 
-// verifyRow — строка verifyZonesSQL: id + 5 пар (сохранено, живой агрегат).
+// verifyRow — a verifyZonesSQL row: id + 5 pairs (stored, the live aggregate).
 func verifyRow(id int16, stored, live [5]int64) []any {
 	row := []any{id}
 	for i := range stored {
@@ -99,12 +100,12 @@ func verifyRow(id int16, stored, live [5]int64) []any {
 	return row
 }
 
-// verifySteps — шаги одного прохода сверки: зоны (verifyZonesSQL),
-// история (historyAggSQL), агрегат (recountAggQuerySQL), сохранённые
-// счётчики (storedCountersSQL).
+// verifySteps — the steps of one cross-check pass: zones
+// (verifyZonesSQL), history (historyAggSQL), the aggregate
+// (recountAggQuerySQL), the stored counters (storedCountersSQL).
 func verifySteps(zones, agg, history, stored *zonestatsFakeRows) []zonestatsStep {
-	// Порядок запросов сверки: зоны → per-zone агрегат → история →
-	// сохранённые счётчики.
+	// The order of the cross-check queries: zones → the per-zone
+	// aggregate → history → the stored counters.
 	return []zonestatsStep{{rows: zones}, {rows: agg}, {rows: history}, {rows: stored}}
 }
 
@@ -112,8 +113,8 @@ func TestVerifyCountersCleanAndDiff(t *testing.T) {
 	statuses := make([]int64, len(statusAggCols))
 	statuses[4] = 5
 	aggRow := aggRowOf(7, 10, 4, 2, 3, statuses, 2)
-	// Совпадают — пустой результат. Шаги держим локально: пул выбирает
-	// их из своей головы по ходу прохода, pool.steps после вызова пуст.
+	// Matching — an empty result. We keep the steps locally: the pool
+	// makes them up as the pass goes, pool.steps is empty after the call.
 	steps := verifySteps(
 		zonestatsRows(verifyRow(7, [5]int64{10, 4, 2, 3, 1}, [5]int64{10, 4, 2, 3, 1})),
 		zonestatsRows(aggRow),
@@ -128,16 +129,16 @@ func TestVerifyCountersCleanAndDiff(t *testing.T) {
 	if len(out) != 0 {
 		t.Errorf("расхождения при совпадении: %+v", out)
 	}
-	// Все наборы строк закрыты Close и на счастливом пути (зоны и
-	// история закрываются явными вызовами после чтения — не только
-	// ошибочными ветками выше).
+	// All the row sets are Closed on the happy path too (zones and history
+	// are closed by explicit calls after reading — not only by the error
+	// branches above).
 	for i, step := range steps {
 		if !step.rows.closed {
 			t.Errorf("строки шага %d не закрыты Close", i)
 		}
 	}
 
-	// Расхождение зоны и глобального счётчика — позиции с Old/New.
+	// A zone/global counter mismatch — positions with Old/New.
 	pool2 := &zonestatsFakePool{steps: verifySteps(
 		zonestatsRows(verifyRow(7, [5]int64{10, 4, 0, 3, 1}, [5]int64{10, 6, 2, 3, 1})),
 		zonestatsRows(aggRow),
@@ -168,7 +169,7 @@ func TestVerifyCountersCleanAndDiff(t *testing.T) {
 		t.Errorf("render_pending = %+v, want old=5 new=2", p)
 	}
 
-	// Допуск: расхождение в пределах Tolerance не наблюдается.
+	// Tolerance: a mismatch within Tolerance is not observed.
 	pool3 := &zonestatsFakePool{steps: verifySteps(
 		zonestatsRows(verifyRow(7, [5]int64{10, 4, 2, 3, 1}, [5]int64{10, 4, 2, 3, 1})),
 		zonestatsRows(aggRow),
@@ -186,7 +187,7 @@ func TestVerifyCountersErrors(t *testing.T) {
 	aggRow := aggRowOf(7, 10, 4, 2, 3, statuses, 0)
 	hist := zonestatsRows([]any{int64(0), int64(0)})
 	stored := zonestatsRows()
-	// Ошибка каждого шага — с контекстом шага.
+	// An error of each step — with the step context.
 	for _, tc := range []struct {
 		name string
 		step int
@@ -208,7 +209,7 @@ func TestVerifyCountersErrors(t *testing.T) {
 			t.Errorf("%s: %v, want контекст %q с исходной", tc.name, err, tc.want)
 		}
 	}
-	// Пустой ответ истории — обрыв протокола.
+	// An empty history answer — a protocol break.
 	steps := verifySteps(
 		zonestatsRows(verifyRow(7, [5]int64{1, 1, 1, 1, 1}, [5]int64{1, 1, 1, 1, 1})),
 		zonestatsRows(aggRow), zonestatsRows(), stored)
@@ -216,8 +217,8 @@ func TestVerifyCountersErrors(t *testing.T) {
 		!strings.Contains(err.Error(), "пустой ответ") {
 		t.Errorf("пустая история = %v, want обрыв протокола", err)
 	}
-	// Кривые строки (Scan-ошибки) каждого набора — с контекстом «чтение»
-	// (свежие наборы на итерацию: итератор строк одноразовый).
+	// Malformed rows (Scan errors) of each set — with the "reading"
+	// context (fresh sets per iteration: the row iterator is one-shot).
 	narrow := [][]any{{int16(7)}, {int64(1)}, {int64(9)}, {"имя"}}
 	for i, row := range narrow {
 		steps := verifySteps(
@@ -231,8 +232,8 @@ func TestVerifyCountersErrors(t *testing.T) {
 			t.Errorf("шаг %d: %v, want контекст чтения", i, err)
 		}
 	}
-	// rows.Err после строк зон/агрегата/истории/сохранённых — с исходной
-	// (свежие наборы на итерацию).
+	// rows.Err after the zone/aggregate/history/stored rows — with the
+	// original one (fresh sets per iteration).
 	for i := 0; i < 4; i++ {
 		steps := verifySteps(
 			zonestatsRows(verifyRow(7, [5]int64{1, 1, 1, 1, 1}, [5]int64{1, 1, 1, 1, 1})),
@@ -244,22 +245,22 @@ func TestVerifyCountersErrors(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "обрыв") {
 			t.Errorf("rows.Err шага %d = %v, want исходная", i, err)
 		}
-		// Строки закрыты даже на ошибке итерации.
+		// The rows are closed even on an iteration error.
 		if !steps[i].rows.closed && i != 0 {
 			t.Errorf("шаг %d: строки не закрыты", i)
 		}
 	}
 }
 
-// --- читатели реконсиляции: пины нулей каждой ошибочной ветки -------------------
+// --- reconciliation readers: zero pins of every error branch -------------------
 
-// TestZoneStatsReaderErrorPins — каждый читатель на каждой ошибке
-// возвращает нулевые значения (пин), ошибки — с исходной причиной.
+// TestZoneStatsReaderErrorPins — each reader on each error returns zero
+// values (a pin), the errors — with the original reason.
 func TestZoneStatsReaderErrorPins(t *testing.T) {
 	ctx := context.Background()
 	boom := errors.New("бум")
 
-	// readHistoryAgg: пустой ответ, Scan, rows.Err — нули.
+	// readHistoryAgg: an empty answer, Scan, rows.Err — zeros.
 	p := &zonestatsFakePool{steps: []zonestatsStep{{rows: zonestatsRows()}}}
 	tx, _ := p.Begin(ctx)
 	if a, l, err := readHistoryAgg(ctx, tx); err == nil || a != 0 || l != 0 ||
@@ -280,8 +281,8 @@ func TestZoneStatsReaderErrorPins(t *testing.T) {
 		t.Errorf("история/rows.Err: (%v/%v, %v)", a, l, err)
 	}
 
-	// readDailyValue: rowsErr до строки, пусто-ок (ноль/false), Scan,
-	// rowsErr после строки.
+	// readDailyValue: rowsErr before the row, empty-ok (zero/false), Scan,
+	// rowsErr after the row.
 	for _, tc := range []struct {
 		rows  *zonestatsFakeRows
 		wantV int64
@@ -303,7 +304,7 @@ func TestZoneStatsReaderErrorPins(t *testing.T) {
 		}
 	}
 
-	// writeDailyCounter: пустой ответ upsert, Scan, rows.Err — ноль.
+	// writeDailyCounter: an empty upsert answer, Scan, rows.Err — zero.
 	dailyRows := []*zonestatsFakeRows{
 		zonestatsRows(),
 		{rows: [][]any{{int64(1), int64(2)}}, scanErr: boom},
@@ -317,7 +318,7 @@ func TestZoneStatsReaderErrorPins(t *testing.T) {
 		}
 	}
 
-	// cleanupBaskets: Scan и rows.Err — ошибки с контекстом.
+	// cleanupBaskets: Scan and rows.Err — errors with context.
 	cleanupRows := []*zonestatsFakeRows{
 		{rows: [][]any{{int64(1), int64(2)}}, scanErr: boom},
 		{rows: [][]any{{int64(1)}}, err: boom},
@@ -332,7 +333,7 @@ func TestZoneStatsReaderErrorPins(t *testing.T) {
 	}
 
 	// readZonePositions/readCounterValues/readZoneAgg/readLaravelAgg:
-	// Query-ошибка и rows.Err — nil-значения с исходной причиной.
+	// a Query error and rows.Err — nil values with the original reason.
 	p = &zonestatsFakePool{steps: []zonestatsStep{{err: boom}}}
 	tx, _ = p.Begin(ctx)
 	if m, err := readZonePositions(ctx, tx, nil); err == nil || m != nil {
@@ -353,7 +354,7 @@ func TestZoneStatsReaderErrorPins(t *testing.T) {
 	if m, err := readLaravelAgg(ctx, tx); err == nil || m != nil {
 		t.Errorf("laravel-агрегат/Query: (%v, %v), want nil и ошибка", m, err)
 	}
-	// rows.Err каждого — ошибка.
+	// rows.Err of each — an error.
 	rowErr := func(rows [][]any) *zonestatsFakeRows {
 		return &zonestatsFakeRows{rows: rows, err: boom}
 	}
@@ -385,11 +386,11 @@ func TestZoneStatsReaderErrorPins(t *testing.T) {
 	}
 }
 
-// --- load: точные значения и пропущенные границы --------------------------------
+// --- load: exact values and missed boundaries --------------------------------
 
-// TestReadMemInfoForeignLines — посторонние строки meminfo (без двоеточия,
-// пустое значение) пропускаются, не обрывают разбор; значения различимы
-// по основанию (19kB ≠ base-9).
+// TestReadMemInfoForeignLines — foreign meminfo lines (without a colon,
+// an empty value) are skipped, they do not break the parsing; the values
+// are distinguishable by the base (19kB ≠ base-9).
 func TestReadMemInfoForeignLines(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "meminfo")
@@ -405,28 +406,28 @@ func TestReadMemInfoForeignLines(t *testing.T) {
 		t.Errorf("посторонние строки: (%v/%v/%v/%v, %v), want 19456/7168/0/0",
 			tt, a, st, sf, err)
 	}
-	// Значение 2^63 КиБ в постороннем поле — валидно для uint64
-	// (мутант bitSize 63 обязан принять).
+	// A 2^63 KiB value in a foreign field — valid for uint64
+	// (a bitSize 63 mutant must accept it).
 	if err := writeFileForTest(p, "MemTotal: 19 kB\nMemAvailable: 7 kB\nHuge: 9223372036854775808 kB\n"); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, _, _, err := readMemInfo(p); err != nil {
 		t.Errorf("постороннее поле 2^63: %v, want валидно (uint64)", err)
 	}
-	// Нет файла — ошибка с нулями (пин).
+	// No file — an error with zeros (a pin).
 	tt, a, st, sf, err = readMemInfo(filepath.Join(dir, "нет"))
 	if err == nil || tt != 0 || a != 0 || st != 0 || sf != 0 {
 		t.Errorf("нет файла: (%v/%v/%v/%v, %v), want нули и ошибка", tt, a, st, sf, err)
 	}
 }
 
-// writeFileForTest — файл фикстуры (os.WriteFile обёртка).
+// writeFileForTest — a fixture file (an os.WriteFile wrapper).
 func writeFileForTest(p, content string) error {
 	return os.WriteFile(p, []byte(content), 0o644)
 }
 
-// TestReadLoadAvgMissingFilePins — отсутствующий файл: нули (пин значений
-// на ошибке чтения).
+// TestReadLoadAvgMissingFilePins — a missing file: zeros (a pin of the
+// values on a read error).
 func TestReadLoadAvgMissingFilePins(t *testing.T) {
 	l1, l5, l15, err := readLoadAvg(filepath.Join(t.TempDir(), "нет"))
 	if err == nil || l1 != 0 || l5 != 0 || l15 != 0 {
@@ -434,8 +435,8 @@ func TestReadLoadAvgMissingFilePins(t *testing.T) {
 	}
 }
 
-// TestReadProcsMissingRoot — отсутствующий корень: ошибка с контекстом
-// «процессы» (не пустой снимок).
+// TestReadProcsMissingRoot — a missing root: an error with the procs
+// context (not an empty snapshot).
 func TestReadProcsMissingRoot(t *testing.T) {
 	if m, err := readProcs(filepath.Join(t.TempDir(), "нет")); err == nil ||
 		!strings.Contains(err.Error(), "процессы") {
@@ -443,8 +444,8 @@ func TestReadProcsMissingRoot(t *testing.T) {
 	}
 }
 
-// TestReadCPUStatMissingFileContext — отсутствующий файл: ошибка с
-// контекстом «/proc/stat» (не ошибка «без строки cpu»).
+// TestReadCPUStatMissingFileContext — a missing file: an error with the
+// "/proc/stat" context (not the "no cpu line" error).
 func TestReadCPUStatMissingFileContext(t *testing.T) {
 	if _, err := readCPUStat(filepath.Join(t.TempDir(), "нет")); err == nil ||
 		!strings.Contains(err.Error(), "/proc/stat") {
@@ -452,23 +453,23 @@ func TestReadCPUStatMissingFileContext(t *testing.T) {
 	}
 }
 
-// TestParseProcStatLineLeadingParen — имя с самого начала строки
-// (open == 0) — валидная строка, не пустой вклад.
+// TestParseProcStatLineLeadingParen — a name at the very start of the
+// line (open == 0) — a valid row, not an empty contribution.
 func TestParseProcStatLineLeadingParen(t *testing.T) {
 	line := "(weird) R 1 2 3 4 5 6 7 8 9 10 3 4"
 	if comm, ticks := parseProcStatLine([]byte(line)); comm != "weird" || ticks != 7 {
 		t.Errorf("open==0: (%q, %d), want weird и 7", comm, ticks)
 	}
-	// open < 0 → false: строки без открывающей скобки — пустой вклад.
+	// open < 0 → false: lines without an opening paren — no contribution.
 	if comm, _ := parseProcStatLine([]byte("7 no paren R 1 2 3 4 5 6 7 8 9 10 3 4")); comm != "" {
 		t.Errorf("без скобки = %q, want пустой вклад", comm)
 	}
 }
 
-// --- slowqueries: границы единиц и полный диапазон числительных ------------------
+// --- slowqueries: unit boundaries and the full numeral range ------------------
 
-// TestSlowQueriesPluralFullRange — согласование числительных по диапазону
-// 0..3000 (мутанты n%99/n%101 различимы на n > 1300).
+// TestSlowQueriesPluralFullRange — the numeral agreement over the range
+// 0..3000 (n%99/n%101 mutants are distinguishable at n > 1300).
 func TestSlowQueriesPluralFullRange(t *testing.T) {
 	plural := func(n int) string {
 		switch {
@@ -486,8 +487,8 @@ func TestSlowQueriesPluralFullRange(t *testing.T) {
 	}
 }
 
-// TestSlowQueriesUnitBoundaries — единичные значения рабочих параметров
-// не заменяются дефолтами (границы «≤ 0»).
+// TestSlowQueriesUnitBoundaries — unit values of the working parameters
+// are not replaced by defaults (the "≤ 0" boundaries).
 func TestSlowQueriesUnitBoundaries(t *testing.T) {
 	if got := (SlowQueryOptions{MinDuration: 1}).withDefaults().MinDuration; got != 1 {
 		t.Errorf("MinDuration=1: %v, want как задан", got)
@@ -501,8 +502,9 @@ func TestSlowQueriesUnitBoundaries(t *testing.T) {
 	}
 }
 
-// TestSlowQueryLoopStartupAndMetrics — стартовый проход выполняется сразу
-// (до первого тика) и пишет метрики; интервал 1нс — рабочее значение.
+// TestSlowQueryLoopStartupAndMetrics — the starting pass runs right away
+// (before the first tick) and writes metrics; a 1ns interval is a
+// working value.
 func TestSlowQueryLoopStartupAndMetrics(t *testing.T) {
 	reg := metrics.New("monitor")
 	t0 := time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
@@ -510,7 +512,7 @@ func TestSlowQueryLoopStartupAndMetrics(t *testing.T) {
 	src := &fakeSlowSource{passes: [][]SlowQuery{{q}}}
 	var reports []string
 	opts := SlowQueryOptions{
-		Interval: time.Hour, // тик не наступит: только стартовый проход
+		Interval: time.Hour, // the tick never comes: only the starting pass
 		Metrics:  reg,
 		Notify:   func(text string) { reports = append(reports, text) },
 	}
@@ -521,11 +523,11 @@ func TestSlowQueryLoopStartupAndMetrics(t *testing.T) {
 	if len(reports) != 1 {
 		t.Fatalf("отчётов = %d, want 1 (стартовый проход до тика)", len(reports))
 	}
-	// Шапка завершается переводом строки (строки запросов с новой строки).
+	// The header ends with a newline (the query lines start on a new line).
 	if !strings.Contains(reports[0], "(порог 3с)\n") {
 		t.Errorf("шапка без перевода строки:\n%q", reports[0])
 	}
-	// Метрики стартового прохода: gauge и счётчик.
+	// The starting pass metrics: the gauge and the counter.
 	if v, ok := gaugeLabels(t, reg, "crawler_pg_slow_queries", nil); !ok || v != 1 {
 		t.Errorf("crawler_pg_slow_queries = (%v, %v), want 1", v, ok)
 	}
@@ -533,8 +535,9 @@ func TestSlowQueryLoopStartupAndMetrics(t *testing.T) {
 		t.Errorf("total{app=scheduler} = (%v, %v), want 1", v, ok)
 	}
 
-	// Интервал 1нс — рабочий (не «выключен»): цикл живёт и повторяет
-	// проходы, отчёт стартового прохода приходит и при Interval=1нс.
+	// A 1ns interval is working (not "disabled"): the loop lives and
+	// repeats the passes, the starting pass report arrives at
+	// Interval=1ns too.
 	src2 := &fakeSlowSource{passes: [][]SlowQuery{{q}}}
 	var reports2 []string
 	opts2 := SlowQueryOptions{
@@ -550,7 +553,7 @@ func TestSlowQueryLoopStartupAndMetrics(t *testing.T) {
 	}
 }
 
-// TestPGSlowQueriesRows — строки снимка читаются в результат (не глотаются).
+// TestPGSlowQueriesRows — the snapshot rows are read into the result (not swallowed).
 func TestPGSlowQueriesRows(t *testing.T) {
 	pool := &zonestatsFakePool{steps: []zonestatsStep{
 		{rows: zonestatsRows(slowScanRow(11, "scheduler", 42.3, "SELECT 1"),
@@ -564,10 +567,10 @@ func TestPGSlowQueriesRows(t *testing.T) {
 	}
 }
 
-// --- psi/redis/renderdebt/unitevents: исходный текст ошибок ----------------------
+// --- psi/redis/renderdebt/unitevents: the original error text ----------------------
 
-// TestOSPSISourceReadErrorText — каталог вместо файла: ошибка несёт
-// исходный текст чтения (не превращается в ошибку формата PSI).
+// TestOSPSISourceReadErrorText — a directory instead of a file: the error
+// carries the original read text (it does not turn into a PSI format error).
 func TestOSPSISourceReadErrorText(t *testing.T) {
 	dir := t.TempDir()
 	_, err := (OSPSI{Path: dir}).PSI(context.Background())
@@ -577,8 +580,8 @@ func TestOSPSISourceReadErrorText(t *testing.T) {
 	}
 }
 
-// TestParsePSIMissingFieldKeepsError — отсутствующее поле — ошибка
-// формата (не тихий нулевой снимок).
+// TestParsePSIMissingFieldKeepsError — a missing field is a format error
+// (not a quiet zero snapshot).
 func TestParsePSIMissingFieldKeepsError(t *testing.T) {
 	if st, err := parsePSI("some avg60=1 avg300=1 total=0\n"); err == nil || st != (PSIStat{}) {
 		t.Errorf("нет avg10: (%+v, %v), want нули и ошибка", st, err)
@@ -588,16 +591,16 @@ func TestParsePSIMissingFieldKeepsError(t *testing.T) {
 	}
 }
 
-// TestInfoSecondsMissingField — отсутствующее поле INFO — ошибка (не
-// тихий ноль).
+// TestInfoSecondsMissingField — a missing INFO field is an error (not a
+// silent zero).
 func TestInfoSecondsMissingField(t *testing.T) {
 	if v, err := infoSeconds(map[string]string{"другое": "1"}, "uptime_in_seconds"); err == nil || v != 0 {
 		t.Errorf("нет поля: (%v, %v), want 0 и ошибка", v, err)
 	}
 }
 
-// TestInfoBytesMissingFieldAndBitSize — отсутствующее поле и граница
-// bitSize (2^62 валидна для int64/64, отвергается 63).
+// TestInfoBytesMissingFieldAndBitSize — a missing field and the bitSize
+// boundary (2^62 is valid for int64/64, rejected at 63).
 func TestInfoBytesMissingFieldAndBitSize(t *testing.T) {
 	if v, err := infoBytes(map[string]string{}, "maxmemory"); err == nil || v != 0 {
 		t.Errorf("нет поля: (%v, %v), want 0 и ошибка", v, err)
@@ -610,7 +613,7 @@ func TestInfoBytesMissingFieldAndBitSize(t *testing.T) {
 	}
 }
 
-// TestRedisUptimeSourceError — ошибка чтения INFO — с исходным текстом.
+// TestRedisUptimeSourceError — an INFO read error — with the original text.
 func TestRedisUptimeSourceError(t *testing.T) {
 	if _, err := redisUptimeOf(context.Background(), errInfoSource{}); err == nil ||
 		!strings.Contains(err.Error(), "connection refused") {
@@ -618,14 +621,14 @@ func TestRedisUptimeSourceError(t *testing.T) {
 	}
 }
 
-// errInfoSource — источник INFO с заготовленной ошибкой.
+// errInfoSource — an INFO source with a preset error.
 type errInfoSource struct{}
 
 func (errInfoSource) Info(context.Context) (string, error) {
 	return "", errors.New("connection refused")
 }
 
-// redisUptimeOf — обёртка чтения аптайма (сборка из INFO).
+// redisUptimeOf — an uptime reading wrapper (assembled from INFO).
 func redisUptimeOf(ctx context.Context, src interface {
 	Info(context.Context) (string, error)
 }) (RedisUptime, error) {
@@ -641,7 +644,7 @@ func redisUptimeOf(ctx context.Context, src interface {
 	return RedisUptime{Seconds: secs}, nil
 }
 
-// parseRedisInfo — разбор INFO в карту полей (локальная копия для теста).
+// parseRedisInfo — parsing INFO into a field map (a local copy for the test).
 func parseRedisInfo(raw string) map[string]string {
 	fields := map[string]string{}
 	for _, line := range strings.Split(raw, "\n") {
@@ -652,8 +655,8 @@ func parseRedisInfo(raw string) map[string]string {
 	return fields
 }
 
-// TestRenderDebtOfErrors — ошибки источника с исходным текстом: пул не
-// задан, Redis не задан, ошибка счётчика.
+// TestRenderDebtOfErrors — source errors with the original text: the pool
+// not set, Redis not set, a counter error.
 func TestRenderDebtOfErrors(t *testing.T) {
 	if _, err := renderDebtOf(context.Background(), nil, nil); err == nil ||
 		!strings.Contains(err.Error(), "пул БД не задан") {
@@ -666,9 +669,9 @@ func TestRenderDebtOfErrors(t *testing.T) {
 	}
 }
 
-// TestRenderDebtLoopUnitIntervalAndGauge — интервал 1нс — рабочее
-// значение (стартовый проход выполняется и пишет gauge долга; цикл
-// живёт до отмены).
+// TestRenderDebtLoopUnitIntervalAndGauge — a 1ns interval is a working
+// value (the starting pass runs and writes the debt gauge; the loop
+// lives until cancellation).
 func TestRenderDebtLoopUnitIntervalAndGauge(t *testing.T) {
 	src := &fakeDebtSource{debt: RenderDebt{Flags: 3, Lag: 1}}
 	reg := metrics.New("monitor")
@@ -677,7 +680,7 @@ func TestRenderDebtLoopUnitIntervalAndGauge(t *testing.T) {
 	go func() {
 		done <- RenderDebtLoop(ctx, src, RenderDebtOptions{Interval: 1, Metrics: reg})
 	}()
-	// Стартовый проход обязан выполниться до отмены: ждём gauge.
+	// The starting pass must complete before cancellation: we wait for the gauge.
 	deadline := time.Now().Add(2 * time.Second)
 	var v float64
 	var ok bool
@@ -696,10 +699,10 @@ func TestRenderDebtLoopUnitIntervalAndGauge(t *testing.T) {
 	}
 }
 
-// --- unitevents: границы ------------------------------------------------------------
+// --- unitevents: boundaries ------------------------------------------------------------
 
-// TestParseSystemctlShowNRestartsBoundaries — NRestarts до первого Id
-// пропускается (не обрывает разбор), значения в десятой системе.
+// TestParseSystemctlShowNRestartsBoundaries — an NRestarts before the
+// first Id is skipped (it does not break the parsing), values in base 10.
 func TestParseSystemctlShowNRestartsBoundaries(t *testing.T) {
 	out := "NRestarts=99\n" +
 		"Id=a.service\nNRestarts=123\n" +
@@ -717,8 +720,8 @@ func TestParseSystemctlShowNRestartsBoundaries(t *testing.T) {
 	}
 }
 
-// TestParseMemoryEventsForeignLine — строка без значения не обрывает
-// разбор (continue), ключи после неё читаются.
+// TestParseMemoryEventsForeignLine — a line without a value does not
+// break the parsing (continue), the keys after it are read.
 func TestParseMemoryEventsForeignLine(t *testing.T) {
 	ev, err := parseMemoryEvents("low\noom 4\n")
 	if err != nil || ev.OOM != 4 {
@@ -726,8 +729,8 @@ func TestParseMemoryEventsForeignLine(t *testing.T) {
 	}
 }
 
-// TestOSUnitEventsCancelledCtx — отменённый ctx: ошибка контекста с
-// исходной (не пустой снимок).
+// TestOSUnitEventsCancelledCtx — a cancelled ctx: a context error with
+// the original one (not an empty snapshot).
 func TestOSUnitEventsCancelledCtx(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -736,16 +739,16 @@ func TestOSUnitEventsCancelledCtx(t *testing.T) {
 	}
 }
 
-// --- streamgroups: несколько стримов ------------------------------------------------
+// --- streamgroups: several streams ------------------------------------------------
 
-// TestStreamGroupsSkipEmptyThenRead — пустой стрим пропускается, Straße
-// за ним читается (continue, не break).
+// TestStreamGroupsSkipEmptyThenRead — an empty stream is skipped, the
+// one after it is read (continue, not break).
 func TestStreamGroupsSkipEmptyThenRead(t *testing.T) {
 	group := redis.XInfoGroup{Name: "g", Lag: 3, Pending: 1, EntriesRead: 10}
 	rdb := &fakeGroupsRedis{
 		groups: map[string][]redis.XInfoGroup{
-			alertStreams[0]: {},      // пустой — пропускается
-			alertStreams[1]: {group}, // читается после пустого
+			alertStreams[0]: {},      // empty — skipped
+			alertStreams[1]: {group}, // read after the empty one
 			queue.StreamDNS: {},
 		},
 		xlen: map[string]int64{alertStreams[1]: 5},
@@ -759,26 +762,26 @@ func TestStreamGroupsSkipEmptyThenRead(t *testing.T) {
 	}
 }
 
-// --- alertstate: недостающие границы --------------------------------------------------
+// --- alertstate: missing boundaries --------------------------------------------------
 
-// TestNewDoneStaleInvalidSnapshots — невалидные метки снапшотов: первый
-// проход инкрементирует серию (нет базы), повтор той же невалидной
-// метки — новый снапшот (недействительная метка не совпадает с прошлой
-// валидной).
+// TestNewDoneStaleInvalidSnapshots — invalid snapshot stamps: the first
+// pass increments the series (no base), a repeat of the same invalid
+// stamp is a new snapshot (an invalid stamp does not match the previous
+// valid one).
 func TestNewDoneStaleInvalidSnapshots(t *testing.T) {
-	invalid := staleRow{value: 5} // snap невалиден
-	// Первый проход — серия растёт даже без валидной метки.
+	invalid := staleRow{value: 5} // snap is invalid
+	// The first pass — the series grows even without a valid stamp.
 	tr := &newDoneStaleTrack{minPasses: 2}
 	if s := tr.decide("", time.Time{}, invalid); !strings.Contains(s.detail, "1/2") {
 		t.Errorf("первый невалидный снапшот: %s, want серию 1/2", s.detail)
 	}
-	// Повтор невалидного — тоже рост: невалидная метка не считается
-	// совпадением с прошлой (!Valid).
+	// A repeat of the invalid one is growth too: an invalid stamp is not
+	// counted as matching the previous one (!Valid).
 	if s := tr.decide("", time.Time{}, invalid); !strings.Contains(s.detail, "2/2") {
 		t.Errorf("повтор невалидного: %s, want серию 2/2 (невалидная метка ≠ любой)", s.detail)
 	}
-	// Валидная метка, равная времени ноль: первый проход — рост
-	// (нет базы — серия инкрементируется).
+	// A valid stamp equal to the zero time: the first pass — growth
+	// (no base — the series is incremented).
 	zero := staleRow{value: 5, snap: sql.NullTime{Time: time.Time{}, Valid: true}}
 	tr2 := &newDoneStaleTrack{minPasses: 2}
 	if s := tr2.decide("", time.Time{}, zero); !strings.Contains(s.detail, "1/2") {
@@ -786,8 +789,8 @@ func TestNewDoneStaleInvalidSnapshots(t *testing.T) {
 	}
 }
 
-// TestCounterGrowthFirstPassBase — первый проход счётчика — база
-// (серия 0), не рост.
+// TestCounterGrowthFirstPassBase — a counter's first pass is the base
+// (series 0), not growth.
 func TestCounterGrowthFirstPassBase(t *testing.T) {
 	tr := &counterGrowthTrack{minPasses: 2}
 	s := tr.decide("", time.Time{}, 100)
@@ -800,29 +803,30 @@ func TestCounterGrowthFirstPassBase(t *testing.T) {
 	}
 }
 
-// TestRenderDebtTrackThresholdExact — долг ровно у порога с серией
-// роста — НЕ срабатывание (строгое >); долг ниже порога с серией — ок.
+// TestRenderDebtTrackThresholdExact — a debt exactly at the threshold
+// with a growth series — NOT a firing (strict >); a debt below the
+// threshold with a series — ok.
 func TestRenderDebtTrackThresholdExact(t *testing.T) {
 	d := func(total int64) RenderDebt { return RenderDebt{Flags: total} }
-	// Ровно порог: 5 → 10 (серия 2), total == domains → ok.
+	// Exactly the threshold: 5 → 10 (series 2), total == domains → ok.
 	tr := &renderDebtTrack{domains: 10, passes: 2}
 	_ = tr.decide("", time.Time{}, d(5))
 	_ = tr.decide("", time.Time{}, d(8))
 	if s := tr.decide("", time.Time{}, d(10)); s.status != AlertStatusOK {
 		t.Errorf("долг ровно у порога: %s, want ok (строгое >)", s.status)
 	}
-	// Ниже порога с полной серией — ok (мутант «true» срабатывал бы).
+	// Below the threshold with a full series — ok (a "true" mutant would fire).
 	tr2 := &renderDebtTrack{domains: 10, passes: 2}
 	_ = tr2.decide("", time.Time{}, d(6))
 	_ = tr2.decide("", time.Time{}, d(7))
 	if s := tr2.decide("", time.Time{}, d(8)); s.status != AlertStatusOK {
 		t.Errorf("долг ниже порога с серией: %s, want ok", s.status)
 	}
-	// Граница ceil порога снятия: порог 9 → снятие < 9 (ceil(8.1));
-	// уровень 8 снимает, 9 — удерживает.
+	// The ceil boundary of the clearing threshold: the threshold 9 →
+	// clearing < 9 (ceil(8.1)); the level 8 clears, 9 holds.
 	tr3 := &renderDebtTrack{domains: 9, passes: 1}
-	_ = tr3.decide("", time.Time{}, d(2))  // база
-	_ = tr3.decide("", time.Time{}, d(15)) // рост → firing
+	_ = tr3.decide("", time.Time{}, d(2))  // the base
+	_ = tr3.decide("", time.Time{}, d(15)) // growth → firing
 	if s := tr3.decide("", time.Time{}, d(9)); s.status != AlertStatusFiring {
 		t.Errorf("удержание на 9 (порог 9): %s, want firing", s.status)
 	}
@@ -831,20 +835,20 @@ func TestRenderDebtTrackThresholdExact(t *testing.T) {
 	}
 }
 
-// TestRenderFbDepthBelowWatermarkAfterDrop — глубина ниже порога с
-// полной серией роста — ок (мутант «true» срабатывал бы).
+// TestRenderFbDepthBelowWatermarkAfterDrop — the depth below the
+// watermark with a full growth series — ok (a "true" mutant would fire).
 func TestRenderFbDepthBelowWatermarkAfterDrop(t *testing.T) {
 	tr := &renderFbDepthTrack{wm: 100, passes: 2}
-	_ = tr.decide("", time.Time{}, 105) // база
-	_ = tr.decide("", time.Time{}, 90)  // сброс (убыток)
-	_ = tr.decide("", time.Time{}, 91)  // рост 1
+	_ = tr.decide("", time.Time{}, 105) // the base
+	_ = tr.decide("", time.Time{}, 90)  // a drop (a loss)
+	_ = tr.decide("", time.Time{}, 91)  // growth 1
 	if s := tr.decide("", time.Time{}, 92); s.status != AlertStatusOK {
 		t.Errorf("ниже порога с серией: %s (%s), want ok", s.status, s.detail)
 	}
 }
 
-// TestQueueFreezeMovingCounter — деталь ok называет счётчик движимых
-// групп: группа с движущимся ID считается.
+// TestQueueFreezeMovingCounter — the ok detail names the moving-groups
+// counter: a group with a moving ID is counted.
 func TestQueueFreezeMovingCounter(t *testing.T) {
 	env := newAlertsTestEnv(t, nil)
 	m := env.newQueueFreezeMachine()
@@ -853,8 +857,8 @@ func TestQueueFreezeMovingCounter(t *testing.T) {
 	if !strings.Contains(s.Detail, "1 из 1") {
 		t.Errorf("движущаяся группа: %q, want «1 из 1»", s.Detail)
 	}
-	// Несколько групп: пустая до замороженной не обрывает разбор —
-	// замороженная за пустой видна.
+	// Several groups: an empty one before a frozen one does not break the
+	// parsing — the frozen one behind the empty one is seen.
 	now := time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
 	env2 := newAlertsTestEnv(t, func(o *AlertsOptions) {
 		o.QueueFreeze = 15 * time.Minute
@@ -873,10 +877,11 @@ func TestQueueFreezeMovingCounter(t *testing.T) {
 	}
 }
 
-// --- load: точный отчёт с чувствительными значениями -------------------------------
+// --- load: an exact report with sensitive values -------------------------------
 
-// TestLoadReportLoopMetricsAndDebt — второй проход: cpu-приборы пишутся
-// (дельта есть), строка рендер-долга из рабочего источника в отчёте.
+// TestLoadReportLoopMetricsAndDebt — the second pass: the cpu instruments
+// are written (there is a delta), the render debt line from the working
+// source is in the report.
 func TestLoadReportLoopMetricsAndDebt(t *testing.T) {
 	reg := metrics.New("monitor")
 	st := LoadStat{
@@ -906,7 +911,7 @@ func TestLoadReportLoopMetricsAndDebt(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- LoadReportLoop(ctx, two, opts) }()
-	<-reports // база
+	<-reports // the base
 	var r string
 	select {
 	case r = <-reports:
@@ -918,8 +923,8 @@ func TestLoadReportLoopMetricsAndDebt(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatalf("цикл: %v", err)
 	}
-	// CPU-приборы второго прохода: дельта 40000 (user 100000, idle 0)
-	// — busy 100%, user 250%.
+	// The second pass CPU instruments: a delta of 40000 (user 100000,
+	// idle 0) — busy 100%, user 250%.
 	if v, ok := gaugeLabels(t, reg, "crawler_os_cpu_percent", map[string]string{"kind": "busy"}); !ok || v != 100 {
 		t.Errorf("cpu{kind=busy} = (%v, %v), want 100", v, ok)
 	}
@@ -931,8 +936,8 @@ func TestLoadReportLoopMetricsAndDebt(t *testing.T) {
 	}
 }
 
-// TestReadMemInfoZeroTotal — MemTotal: 0 — ошибка (пустое значение
-// обязательного поля, мутант ослабления принимал бы).
+// TestReadMemInfoZeroTotal — MemTotal: 0 — an error (an empty value of a
+// required field, a weakening mutant would accept it).
 func TestReadMemInfoZeroTotal(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "meminfo")
@@ -944,8 +949,8 @@ func TestReadMemInfoZeroTotal(t *testing.T) {
 	}
 }
 
-// TestRedisQueuesLenNoSuchKeyComplete — текстовый «no such key»: стрим
-// в снимке присутствует ({0 0}), карта полная.
+// TestRedisQueuesLenNoSuchKeyComplete — a textual "no such key": the
+// stream is present in the snapshot ({0 0}), the map is complete.
 func TestRedisQueuesLenNoSuchKeyComplete(t *testing.T) {
 	rdb := &fakeGroupsRedis{
 		groups:   map[string][]redis.XInfoGroup{},
@@ -961,14 +966,14 @@ func TestRedisQueuesLenNoSuchKeyComplete(t *testing.T) {
 	}
 }
 
-// TestLoadReportLoopNanosecondInterval — интервал 1нс — рабочее
-// значение (не «выключен»): стартовый проход выполняется.
+// TestLoadReportLoopNanosecondInterval — a 1ns interval is a working
+// value (not "disabled"): the starting pass runs.
 func TestLoadReportLoopNanosecondInterval(t *testing.T) {
 	st := LoadStat{Load1: 1, Load5: 1, Load15: 1, CPU: CPUStat{Cores: 1},
 		MemTotal: 1, MemAvailable: 1}
 	src := &fakeLoadSource{states: []LoadStat{st}}
-	// Счётчик инкрементируется из горутины цикла (Notify) и опрашивается
-	// здесь до остановки — только атомарно (race-detector).
+	// The counter is incremented from the loop goroutine (Notify) and
+	// polled here before the stop — atomically only (race-detector).
 	var reports atomic.Int64
 	done := make(chan error, 1)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -991,8 +996,8 @@ func TestLoadReportLoopNanosecondInterval(t *testing.T) {
 	}
 }
 
-// TestZoneStatsLoopMetricsNilReceiver — nil-приёмники метрик цикла —
-// no-op без паники.
+// TestZoneStatsLoopMetricsNilReceiver — nil loop metric receivers are
+// no-ops without a panic.
 func TestZoneStatsLoopMetricsNilReceiver(t *testing.T) {
 	var m *zoneStatsLoopMetrics
 	m.observe(0)

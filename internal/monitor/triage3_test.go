@@ -1,14 +1,15 @@
-// Третья добивка триажа (прогон monitor 0.970): точные тексты ошибок
-// чтения (отсутствующий файл — «no such file», отсутствующее поле —
-// «отсутствует», пустой ответ — «пустой ответ»), вырезания return в
-// OSLoad (битые loadavg/meminfo роняют проход, а не снимок с нулями),
-// кривой PSI some при валидном full, негативные проверки топа (пятая
-// строка не печатается), границы cpu-строки (ровно 5 полей), MemTotal 0
-// с пином нулей, диск Total 1 байт, отрицательный busy в gauge, нулевой
-// src цикла, newDoneStale с value=1, notify без getenv, счётчик
-// вызовов источника рендер-долга, закрытие строк VerifyCounters на
-// каждой ветке, UnitEvents с отменой ctx (errors.Is) и timeout 1нс,
-// parseMemoryEvents беззначная строка ключа счётчика.
+// The third triage finish (the monitor run of 0.970): the exact texts of
+// read errors (a missing file — the "no such file" text, a missing
+// field — the missing-field text, an empty answer — the empty-answer
+// text), return cut-outs in OSLoad (broken loadavg/meminfo fail the
+// pass, not a zero snapshot), a malformed PSI some at a valid full,
+// negative top checks (the fifth line is not printed), cpu-line
+// boundaries (exactly 5 fields), MemTotal 0 with a zero pin, a disk
+// Total of 1 byte, a negative busy in the gauge, a nil loop src,
+// newDoneStale with value=1, notify without getenv, the render debt
+// source call counter, the VerifyCounters row closing on every branch,
+// UnitEvents with a ctx cancellation (errors.Is) and a 1ns timeout,
+// parseMemoryEvents with a valueless counter key line.
 package monitor
 
 import (
@@ -24,14 +25,14 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// fakeCgroup/fakeSystemctl — фикстуры юнит-событий (unitevents_test.go).
+// fakeCgroup/fakeSystemctl — the unit events fixtures (unitevents_test.go).
 
-// TestOSLoadSourceErrorTexts — битые обязательные файлы: ошибка несёт
-// исходный текст чтения (мутанты вырезания return доводили бы до
-// нулевого снимка или повторной ошибки с чужим текстом).
+// TestOSLoadSourceErrorTexts — broken required files: the error carries
+// the original read text (return cut-out mutants would lead to a zero
+// snapshot or a re-error with a foreign text).
 func TestOSLoadSourceErrorTexts(t *testing.T) {
 	root := fullCPUFixtures(t)
-	writeFix(t, root, "loadavg", "x 1 2\n") // loadavg не число
+	writeFix(t, root, "loadavg", "x 1 2\n") // loadavg is not a number
 	_, err := (OSLoad{Root: root}).Load(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "loadavg") {
 		t.Errorf("битый loadavg: %v, want ошибку loadavg", err)
@@ -44,8 +45,8 @@ func TestOSLoadSourceErrorTexts(t *testing.T) {
 		t.Errorf("битый meminfo: %v, want ошибку meminfo", err)
 	}
 
-	// Отсутствующий файл — текст «no such file or directory» (ошибка
-	// чтения, не производная форма).
+	// A missing file — the "no such file or directory" text (a read
+	// error, not a derived form).
 	for _, miss := range []string{"loadavg", "stat", "meminfo"} {
 		root3 := fullCPUFixtures(t)
 		if err := removeFix(root3, miss); err != nil {
@@ -58,15 +59,15 @@ func TestOSLoadSourceErrorTexts(t *testing.T) {
 	}
 }
 
-// TestOSLoadBrokenSomeValidFull — кривая строка some при валидной full
-// (и наоборот): ошибка соответствующего вида — проход не молчит и не
-// подменяет виды.
+// TestOSLoadBrokenSomeValidFull — a malformed some line at a valid full
+// (and vice versa): an error of the respective kind — the pass is not
+// silent and does not substitute the kinds.
 func TestOSLoadBrokenSomeValidFull(t *testing.T) {
 	root := fullCPUFixtures(t)
 	writeFix(t, root, "pressure/memory",
 		"some avg10=x avg60=1 avg300=1\nfull avg10=1 avg60=1 avg300=1\n")
-	// Кривая строка some роняет проход даже при валидной full (мутант
-	// вырезания return проглатывал ошибку и возвращал снимок).
+	// A malformed some line fails the pass even at a valid full (a
+	// return cut-out mutant swallowed the error and returned a snapshot).
 	if _, err := (OSLoad{Root: root}).Load(context.Background()); err == nil {
 		t.Error("кривой some при валидной full: хочу ошибку прохода")
 	}
@@ -78,8 +79,8 @@ func TestOSLoadBrokenSomeValidFull(t *testing.T) {
 	}
 }
 
-// TestReadMemInfoNoFileText — отсутствующий meminfo: текст «no such
-// file», значения нули.
+// TestReadMemInfoNoFileText — a missing meminfo: the "no such file"
+// text, zero values.
 func TestReadMemInfoNoFileText(t *testing.T) {
 	tt, a, st, sf, err := readMemInfo(filepath.Join(t.TempDir(), "нет"))
 	if err == nil || !strings.Contains(err.Error(), "no such file") ||
@@ -88,8 +89,8 @@ func TestReadMemInfoNoFileText(t *testing.T) {
 	}
 }
 
-// TestReadMemInfoMissingFieldPins — отсутствие MemTotal/MemAvailable:
-// нулевые значения (пин) и ошибка обязательности.
+// TestReadMemInfoMissingFieldPins — missing MemTotal/MemAvailable: zero
+// values (a pin) and the requiredness error.
 func TestReadMemInfoMissingFieldPins(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "meminfo")
@@ -100,7 +101,7 @@ func TestReadMemInfoMissingFieldPins(t *testing.T) {
 	if err == nil || tt != 0 || a != 0 || st != 0 || sf != 0 {
 		t.Errorf("нет обязательных полей: (%v/%v/%v/%v, %v), want нули и ошибку", tt, a, st, sf, err)
 	}
-	// MemTotal 0 — та же ошибка, нули.
+	// MemTotal 0 — the same error, zeros.
 	if err := writeFileForTest(p, "MemTotal: 0 kB\nMemAvailable: 1 kB\n"); err != nil {
 		t.Fatal(err)
 	}
@@ -108,8 +109,8 @@ func TestReadMemInfoMissingFieldPins(t *testing.T) {
 	if err == nil || tt != 0 || a != 0 || st != 0 || sf != 0 {
 		t.Errorf("MemTotal 0: (%v/%v/%v/%v, %v), want нули и ошибку", tt, a, st, sf, err)
 	}
-	// Значение без единицы (одно поле): ошибка разбора, а не паника
-	// индекса соседнего поля.
+	// A value without a unit (one field): a parse error, not a panic on
+	// the index of the neighboring field.
 	if err := writeFileForTest(p, "MemTotal: y\n"); err != nil {
 		t.Fatal(err)
 	}
@@ -118,8 +119,8 @@ func TestReadMemInfoMissingFieldPins(t *testing.T) {
 	}
 }
 
-// TestReadCPUStatFieldsBoundary — ровно пять полей cpu-строки — валидно,
-// четыре — ошибка, шесть — валидно (границы < 5).
+// TestReadCPUStatFieldsBoundary — exactly five fields of the cpu line is
+// valid, four is an error, six is valid (the < 5 boundaries).
 func TestReadCPUStatFieldsBoundary(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "stat")
@@ -129,8 +130,8 @@ func TestReadCPUStatFieldsBoundary(t *testing.T) {
 	if _, err := readCPUStat(p); err == nil {
 		t.Error("три числа: хочу ошибку (строка короче пяти полей)")
 	}
-	// Четыре числа (пять полей с «cpu») — валидны: отсутствующие
-	// поля читаются нулями.
+	// Four numbers (five fields with "cpu") are valid: missing fields are
+	// read as zeros.
 	if err := writeFileForTest(p, "cpu  1 2 3 4\ncpu0 1 1 1 1\n"); err != nil {
 		t.Fatal(err)
 	}
@@ -153,11 +154,12 @@ func TestReadCPUStatFieldsBoundary(t *testing.T) {
 	}
 }
 
-// TestReadProcsNoEmptyComm — вклад без имени не попадает в агрегат
-// (PID без stat / кривая строка): ключ "" отсутствует.
+// TestReadProcsNoEmptyComm — a contribution without a name does not get
+// into the aggregate (a PID without stat / a malformed line): the ""
+// key is absent.
 func TestReadProcsNoEmptyComm(t *testing.T) {
 	root := fullCPUFixtures(t)
-	mkdirFixRaw(t, root, "400") // PID без stat — пустой вклад
+	mkdirFixRaw(t, root, "400") // a PID without stat — no contribution
 	mkdirFix(t, root, "401", "(broken) no parens here", "1 1\n")
 	procs, err := readProcs(root)
 	if err != nil {
@@ -168,7 +170,7 @@ func TestReadProcsNoEmptyComm(t *testing.T) {
 	}
 }
 
-// TestLoadReportLoopNilSource — источник не задан: ошибка, не паника.
+// TestLoadReportLoopNilSource — the source not set: an error, not a panic.
 func TestLoadReportLoopNilSource(t *testing.T) {
 	if err := LoadReportLoop(context.Background(), nil, LoadReportOptions{Interval: time.Minute}); err == nil ||
 		!strings.Contains(err.Error(), "источник не задан") {
@@ -176,8 +178,8 @@ func TestLoadReportLoopNilSource(t *testing.T) {
 	}
 }
 
-// TestFormatLoadReportTopNotExtended — пятый кандидат топа CPU не
-// печатается (срез ровно topProcs).
+// TestFormatLoadReportTopNotExtended — the fifth top CPU candidate is
+// not printed (the slice is exactly topProcs).
 func TestFormatLoadReportTopNotExtended(t *testing.T) {
 	st := LoadStat{
 		Load1: 1, Load5: 1, Load15: 1, CPU: CPUStat{Cores: 1},
@@ -193,8 +195,8 @@ func TestFormatLoadReportTopNotExtended(t *testing.T) {
 	}
 }
 
-// TestCPUDeltaClampFraction — busy в (−1, 0) тоже прижимается к нулю
-// (дробный перелив idle, мутант ослабления границы клампа).
+// TestCPUDeltaClampFraction — busy in (−1, 0) is clamped to zero too
+// (a fractional idle overflow, a clamp boundary weakening mutant).
 func TestCPUDeltaClampFraction(t *testing.T) {
 	prev := CPUStat{Total: 100, Cores: 1}
 	cur := CPUStat{Idle: 300, Total: 300, Cores: 1} // d=200, idle 1.5
@@ -207,8 +209,8 @@ func TestCPUDeltaClampFraction(t *testing.T) {
 	}
 }
 
-// TestFormatLoadReportTinyDisk — диск Total 1 байт: процент считается
-// (не гасится), 100% при полном avail.
+// TestFormatLoadReportTinyDisk — a disk Total of 1 byte: the percent is
+// computed (not suppressed), 100% at a full avail.
 func TestFormatLoadReportTinyDisk(t *testing.T) {
 	st := LoadStat{
 		Load1: 1, Load5: 1, Load15: 1, CPU: CPUStat{Cores: 1},
@@ -221,8 +223,8 @@ func TestFormatLoadReportTinyDisk(t *testing.T) {
 	}
 }
 
-// TestLoadReportLoopSpaceErrorSecondDir — сбой statfs первого каталога
-// не обрывает секцию: второй каталог печатается.
+// TestLoadReportLoopSpaceErrorSecondDir — a statfs failure of the first
+// directory does not break the section: the second directory is printed.
 func TestLoadReportLoopSpaceErrorSecondDir(t *testing.T) {
 	st := LoadStat{Load1: 1, Load5: 1, Load15: 1, CPU: CPUStat{Cores: 1},
 		MemTotal: 1, MemAvailable: 1}
@@ -263,8 +265,8 @@ func TestLoadReportLoopSpaceErrorSecondDir(t *testing.T) {
 	}
 }
 
-// switchSpaceSource — SpaceChecker с результатами по каталогам по
-// порядку (первый — ошибка).
+// switchSpaceSource — a SpaceChecker with per-directory results in order
+// (the first is an error).
 type switchSpaceSource struct {
 	stats []SpaceStat
 	errs  []error
@@ -284,8 +286,8 @@ func (s *switchSpaceSource) Space(string) (SpaceStat, error) {
 	return st, nil
 }
 
-// TestNewDoneStaleValueOne — значение 1 — полноценный снапшот (серия
-// растёт, граница n > 0).
+// TestNewDoneStaleValueOne — a value of 1 is a full-fledged snapshot
+// (the series grows, the n > 0 boundary).
 func TestNewDoneStaleValueOne(t *testing.T) {
 	t0 := time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
 	tr := &newDoneStaleTrack{minPasses: 2}
@@ -300,19 +302,20 @@ func TestNewDoneStaleValueOne(t *testing.T) {
 	}
 }
 
-// TestTelegramNotifierNoGetenv — конструктор без Getenv использует
-// os.Getenv (без паники на nil-функции).
+// TestTelegramNotifierNoGetenv — the constructor without Getenv uses
+// os.Getenv (no panic on a nil function).
 func TestTelegramNotifierNoGetenv(t *testing.T) {
-	// Секретов в окружении теста нет: конструктор честно выключает
-	// доставку, но getenv вызван (не nil-функция).
+	// There are no secrets in the test environment: the constructor
+	// honestly disables the delivery, but getenv was called (not a nil
+	// function).
 	n := NewTelegramNotifier(TelegramOptions{Enabled: true, Script: "/bin/true"})
 	if n == nil {
 		t.Fatal("конструктор без Getenv вернул nil")
 	}
 }
 
-// TestRedisUptimeMissingFieldText — отсутствующее поле INFO server —
-// ошибка «поле отсутствует» (не молчаливый ноль).
+// TestRedisUptimeMissingFieldText — a missing INFO server field is the
+// missing-field error (not a silent zero).
 func TestRedisUptimeMissingFieldText(t *testing.T) {
 	if _, err := (RedisInfo{RDB: &fakeInfoRedis{info: "# Server\nrun_id:x\n"}}).RedisUptime(context.Background()); err == nil ||
 		!strings.Contains(err.Error(), "uptime_in_seconds отсутствует") {
@@ -320,9 +323,10 @@ func TestRedisUptimeMissingFieldText(t *testing.T) {
 	}
 }
 
-// TestRedisUptimeCmdErrorUnderlying — ошибка команды INFO несёт исходную
-// причину (мутант вырезания return падал бы в разбор пустого ответа —
-// текст был бы «поле отсутствует», без причины команды).
+// TestRedisUptimeCmdErrorUnderlying — an INFO command error carries the
+// original reason (a return cut-out mutant would fall into parsing an
+// empty answer — the text would be the missing-field one, without the
+// command reason).
 func TestRedisUptimeCmdErrorUnderlying(t *testing.T) {
 	failing := &fakeInfoRedis{err: errors.New("connection reset")}
 	if _, err := (RedisInfo{RDB: failing}).RedisUptime(context.Background()); err == nil ||
@@ -331,10 +335,11 @@ func TestRedisUptimeCmdErrorUnderlying(t *testing.T) {
 	}
 }
 
-// TestRenderDebtIterErrorEmptyText — обрыв итерации при НУЛЕ строк
-// (Next ложен сразу, rows.Err ≠ nil): причина — обрыв, а не «строки
-// нет» (мутант глушения возврата подменял текстом отсутствующей строки,
-// уводя диагностику в runbooks — ревью T-175, P3-2).
+// TestRenderDebtIterErrorEmptyText — an iteration break at ZERO rows
+// (Next false right away, rows.Err ≠ nil): the reason is the break, not
+// the missing-row one (a return-muting mutant substituted the
+// missing-row text, sending diagnostics to the runbooks — the T-175
+// review, P3-2).
 func TestRenderDebtIterErrorEmptyText(t *testing.T) {
 	pool := &alertsPool{debtEmpty: true, debtRowsErr: errors.New("обрыв итерации")}
 	_, err := (RenderDebtReader{Pool: pool, Redis: &fakeLener{}}).RenderDebt(context.Background())
@@ -343,8 +348,8 @@ func TestRenderDebtIterErrorEmptyText(t *testing.T) {
 	}
 }
 
-// TestRedisMemoryMissingFieldText — отсутствующее поле INFO memory —
-// ошибка «поле отсутствует».
+// TestRedisMemoryMissingFieldText — a missing INFO memory field is the
+// missing-field error.
 func TestRedisMemoryMissingFieldText(t *testing.T) {
 	if _, err := (RedisInfo{RDB: &fakeInfoRedis{info: "# Memory\nused_memory_human:1K\n"}}).RedisMemory(context.Background()); err == nil ||
 		!strings.Contains(err.Error(), "отсутствует") {
@@ -352,8 +357,9 @@ func TestRedisMemoryMissingFieldText(t *testing.T) {
 	}
 }
 
-// TestParsePSIMissingFieldText — отсутствующее поле PSI — ошибка
-// «поле отсутствует» (мутант глотал и возвращал частичный снимок).
+// TestParsePSIMissingFieldText — a missing PSI field is the
+// missing-field error (a mutant swallowed it and returned a partial
+// snapshot).
 func TestParsePSIMissingFieldText(t *testing.T) {
 	if _, err := parsePSI("some avg60=1 avg300=1\n"); err == nil ||
 		!strings.Contains(err.Error(), "avg10 отсутствует") {
@@ -361,8 +367,8 @@ func TestParsePSIMissingFieldText(t *testing.T) {
 	}
 }
 
-// TestStreamGroupsClosedFlags — фейк групп: пустые группы не запрашивают
-// XLEN (счётчик вызовов).
+// TestStreamGroupsClosedFlags — the group fake: empty groups do not
+// request XLEN (a call counter).
 func TestStreamGroupsClosedFlags(t *testing.T) {
 	inner := &fakeGroupsRedis{
 		groups: map[string][]redis.XInfoGroup{alertStreams[0]: {}},
@@ -378,7 +384,7 @@ func TestStreamGroupsClosedFlags(t *testing.T) {
 	}
 }
 
-// countingGroupsRedis — fakeGroupsRedis со счётчиком XLEN.
+// countingGroupsRedis — a fakeGroupsRedis with an XLEN counter.
 type countingGroupsRedis struct {
 	fakeGroupsRedis
 	xlenCalls int
@@ -389,8 +395,9 @@ func (r *countingGroupsRedis) XLen(ctx context.Context, stream string) *redis.In
 	return r.fakeGroupsRedis.XLen(ctx, stream)
 }
 
-// TestRenderDebtLoopSourceCalls — Interval 1нс: тикер молотит, источник
-// зовётся много раз (мутант «выключен» звал бы только стартовый).
+// TestRenderDebtLoopSourceCalls — a 1ns Interval: the ticker hammers,
+// the source is called many times (a "disabled" mutant would call only
+// the starting one).
 func TestRenderDebtLoopSourceCalls(t *testing.T) {
 	src := &countingDebtSource{debt: RenderDebt{Flags: 1, Lag: 1}}
 	done := make(chan error, 1)
@@ -409,9 +416,9 @@ func TestRenderDebtLoopSourceCalls(t *testing.T) {
 	}
 }
 
-// countingDebtSource — источник рендер-долга со счётчиком вызовов;
-// счётчик атомарный: RenderDebt зовётся из горутины цикла, calls() —
-// из теста до остановки цикла (race-detector).
+// countingDebtSource — a render debt source with a call counter;
+// the counter is atomic: RenderDebt is called from the loop goroutine,
+// calls() from the test before the loop stops (race-detector).
 type countingDebtSource struct {
 	debt RenderDebt
 	n    atomic.Int64
@@ -424,12 +431,12 @@ func (s *countingDebtSource) RenderDebt(context.Context) (RenderDebt, error) {
 
 func (s *countingDebtSource) calls() int { return int(s.n.Load()) }
 
-// TestVerifyCountersClosedEveryBranch — строки сверки закрываются Close
-// на каждой ошибочной ветке (Scan-ошибка и пустой ответ истории).
+// TestVerifyCountersClosedEveryBranch — the cross-check rows are Closed
+// on every error branch (a Scan error and an empty history answer).
 func TestVerifyCountersClosedEveryBranch(t *testing.T) {
 	statuses := make([]int64, len(statusAggCols))
 	aggRow := aggRowOf(7, 10, 4, 2, 3, statuses, 0)
-	// Scan-ошибка истории: hrows.Close вызван.
+	// A history Scan error: hrows.Close was called.
 	steps := verifySteps(
 		zonestatsRows(verifyRow(7, [5]int64{1, 1, 1, 1, 1}, [5]int64{1, 1, 1, 1, 1})),
 		zonestatsRows(aggRow),
@@ -441,7 +448,7 @@ func TestVerifyCountersClosedEveryBranch(t *testing.T) {
 	if !steps[2].rows.closed {
 		t.Error("hrows не закрыты при Scan-ошибке")
 	}
-	// Пустой ответ истории: hrows.Close вызван.
+	// An empty history answer: hrows.Close was called.
 	steps2 := verifySteps(
 		zonestatsRows(verifyRow(7, [5]int64{1, 1, 1, 1, 1}, [5]int64{1, 1, 1, 1, 1})),
 		zonestatsRows(aggRow),
@@ -453,7 +460,7 @@ func TestVerifyCountersClosedEveryBranch(t *testing.T) {
 	if !steps2[2].rows.closed {
 		t.Error("hrows не закрыты при пустом ответе")
 	}
-	// rows.Err истории: закрыты.
+	// A history rows.Err: closed.
 	steps3 := verifySteps(
 		zonestatsRows(verifyRow(7, [5]int64{1, 1, 1, 1, 1}, [5]int64{1, 1, 1, 1, 1})),
 		zonestatsRows(aggRow),
@@ -465,7 +472,7 @@ func TestVerifyCountersClosedEveryBranch(t *testing.T) {
 	if !steps3[2].rows.closed {
 		t.Error("hrows не закрыты при rows.Err")
 	}
-	// rows.Err зон: закрыты.
+	// A zones rows.Err: closed.
 	steps4 := verifySteps(
 		&zonestatsFakeRows{rows: [][]any{verifyRow(7, [5]int64{1, 1, 1, 1, 1}, [5]int64{1, 1, 1, 1, 1})}, err: errors.New("обрыв")},
 		zonestatsRows(aggRow),
@@ -477,7 +484,7 @@ func TestVerifyCountersClosedEveryBranch(t *testing.T) {
 	if !steps4[0].rows.closed {
 		t.Error("rows зон не закрыты при rows.Err")
 	}
-	// Scan-ошибка зон: закрыты.
+	// A zones Scan error: closed.
 	steps5 := verifySteps(
 		&zonestatsFakeRows{rows: [][]any{{int16(7)}}, scanErr: errors.New("бум")},
 		zonestatsRows(aggRow),
@@ -489,7 +496,7 @@ func TestVerifyCountersClosedEveryBranch(t *testing.T) {
 	if !steps5[0].rows.closed {
 		t.Error("rows зон не закрыты при Scan-ошибке")
 	}
-	// rows.Err сохранённых: закрыты.
+	// A stored rows.Err: closed.
 	steps6 := verifySteps(
 		zonestatsRows(verifyRow(7, [5]int64{1, 1, 1, 1, 1}, [5]int64{1, 1, 1, 1, 1})),
 		zonestatsRows(aggRow),
@@ -501,7 +508,7 @@ func TestVerifyCountersClosedEveryBranch(t *testing.T) {
 	if !steps6[3].rows.closed {
 		t.Error("rows сохранённых не закрыты при rows.Err")
 	}
-	// rows.Err агрегата (читается readZoneAgg с defer Close) — закрыты.
+	// An aggregate rows.Err (read by readZoneAgg with a defer Close) — closed.
 	steps7 := verifySteps(
 		zonestatsRows(verifyRow(7, [5]int64{1, 1, 1, 1, 1}, [5]int64{1, 1, 1, 1, 1})),
 		&zonestatsFakeRows{rows: [][]any{aggRow}, err: errors.New("обрыв")},
@@ -515,8 +522,8 @@ func TestVerifyCountersClosedEveryBranch(t *testing.T) {
 	}
 }
 
-// TestZoneStatsWriteDailyEmptyText — пустой ответ upsert — ошибка
-// «пустой ответ upsert» (не производная Scan).
+// TestZoneStatsWriteDailyEmptyText — an empty upsert answer is the
+// empty-upsert-answer error (not a derived Scan).
 func TestZoneStatsWriteDailyEmptyText(t *testing.T) {
 	p := &zonestatsFakePool{steps: []zonestatsStep{{rows: zonestatsRows()}}}
 	tx, _ := p.Begin(context.Background())
@@ -526,23 +533,26 @@ func TestZoneStatsWriteDailyEmptyText(t *testing.T) {
 	}
 }
 
-// TestOSUnitEventsCtxErrors — отмена ctx до и после таймаута-обёртки:
-// ошибки — контекстные (errors.Is), не пустой снимок.
+// TestOSUnitEventsCtxErrors — a ctx cancellation before and after the
+// timeout wrapper: the errors are context ones (errors.Is), not an
+// empty snapshot.
 func TestOSUnitEventsCtxErrors(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if _, err := (OSUnitEvents{}).UnitEvents(ctx); !errors.Is(err, context.Canceled) {
 		t.Errorf("отмена до старта: %v, want context.Canceled", err)
 	}
-	// Timeout 1нс — истёкшая обёртка: ошибка контекста (не дефолт окна).
+	// A 1ns Timeout — an expired wrapper: a context error (not the window
+	// default).
 	if _, err := (OSUnitEvents{Timeout: 1}).UnitEvents(context.Background()); err == nil ||
 		!strings.Contains(err.Error(), "context deadline exceeded") {
 		t.Errorf("Timeout 1нс: %v, want deadline exceeded", err)
 	}
 }
 
-// TestParseMemoryEventsBareKey — строка-ключ без значения не роняет
-// разбор и не превращается в ошибку числа (посторонние ключи мимо).
+// TestParseMemoryEventsBareKey — a key line without a value does not
+// break the parsing and does not turn into a number error (foreign keys
+// do not pass).
 func TestParseMemoryEventsBareKey(t *testing.T) {
 	if _, err := parseMemoryEvents("oom\n"); err != nil {
 		t.Errorf("ключ без значения: %v, want пропуск", err)
@@ -552,23 +562,24 @@ func TestParseMemoryEventsBareKey(t *testing.T) {
 	}
 }
 
-// TestAlertDescKnownAndUnknown — известному алерту — описание из
-// легенды (не имя), неизвестному — имя.
+// TestAlertDescKnownAndUnknown — a known alert gets the legend
+// description (not the name), an unknown one — the name.
 func TestAlertDescKnownAndUnknown(t *testing.T) {
 	for name := range alertDescs {
 		if got := alertDesc(name); got == name {
 			t.Errorf("alertDesc(%s) = имя, want описание легенды", name)
 		}
-		break // достаточно одного известного
+		break // one known one is enough
 	}
 	if got := alertDesc("нет-такого-алерта"); got != "нет-такого-алерта" {
 		t.Errorf("alertDesc(неизвестный) = %q, want имя как есть", got)
 	}
 }
 
-// TestOSUnitEventsSingleBrokenEvents — один юнит с кривым memory.events
-// (читается, но не число): снимок не отдаётся (непрочитанный счётчик не
-// подменяется нулями), ошибка называет юнит.
+// TestOSUnitEventsSingleBrokenEvents — one unit with a malformed
+// memory.events (readable but not a number): the snapshot is not
+// returned (an unread counter is not substituted with zeros), the error
+// names the unit.
 func TestOSUnitEventsSingleBrokenEvents(t *testing.T) {
 	root := t.TempDir()
 	cg := filepath.Join(root, "cg")

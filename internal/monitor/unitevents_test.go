@@ -1,14 +1,15 @@
-// Юнит-тесты контроля OOM/рестартов юнитов crawler (T-145, ТЗ 5.9) на
-// фейковых источниках: пороги алерта (oom/oom_kill/NRestarts по
-// отдельности и вместе), эпизод (один Warn на серию — фронтовая
-// механика переходов), тихие деградации (нет источника, ошибка
-// systemd-окружения, пустой список юнитов — без Warn, как SMART),
-// разбор вывода systemctl show и memory.events (таблицы, включая
-// «[not set]» и мусорные строки), OSUnitEvents против заглушек
-// (скрипт-systemctl в TempDir + дерево cgroupfs; юнит без cgroup —
-// нулями), метрики-обёртка (gauge по юнитам, hold-last на ошибке).
-// Реальное чтение хостового cgroupfs/exec systemctl — за границами
-// тестов (hermeticity, docs/mutation-testing.md §4).
+// Crawler unit OOM/restart monitoring unit tests (T-145, spec 5.9) on
+// fake sources: the alert thresholds (oom/oom_kill/NRestarts separately
+// and together), the episode (one Warn per series — the front transition
+// mechanics), quiet degradations (no source, a systemd environment
+// error, an empty unit list — without a Warn, like SMART), the parsing
+// of systemctl show output and memory.events (tables, including
+// "[not set]" and junk lines), OSUnitEvents against stubs
+// (a script-systemctl in TempDir + a cgroupfs tree; a unit without a
+// cgroup — with zeros), the metrics wrapper (gauges per unit,
+// hold-last on an error).
+// Real reads of the host cgroupfs/exec systemctl are outside the tests
+// (hermeticity, docs/mutation-testing.md §4).
 package monitor
 
 import (
@@ -27,9 +28,9 @@ import (
 	"crawler/internal/metrics"
 )
 
-// --- фейковый источник --------------------------------------------------------
+// --- fake source --------------------------------------------------------
 
-// fakeUnitEvents — снимки юнитов по заготовке, очередь ошибок, протокол.
+// fakeUnitEvents — unit snapshots from a preset, an error queue, the protocol.
 type fakeUnitEvents struct {
 	mu    sync.Mutex
 	units []UnitEvents
@@ -47,8 +48,8 @@ func (f *fakeUnitEvents) UnitEvents(context.Context) ([]UnitEvents, error) {
 	return f.units, nil
 }
 
-// newUnitEnv — тестовый оценщик с живым источником юнитов: дефолт —
-// два здоровых юнита (все счётчики нули).
+// newUnitEnv — a test evaluator with a live unit source: the default is
+// two healthy units (all counters zero).
 func newUnitEnv(t *testing.T, units []UnitEvents) (*alertsTestEnv, *fakeUnitEvents) {
 	t.Helper()
 	env := newAlertsTestEnv(t, nil)
@@ -57,11 +58,11 @@ func newUnitEnv(t *testing.T, units []UnitEvents) (*alertsTestEnv, *fakeUnitEven
 	return env, src
 }
 
-// --- алерт unit_oom -------------------------------------------------------------
+// --- the unit_oom alert -------------------------------------------------------------
 
-// TestAlertsUnitOOMFire — каждый вид события отдельно включает алерт:
-// oom, oom_kill, NRestarts; вместе — один detail с каждым юнитом и его
-// счётчиками; все нули — ok с числом юнитов.
+// TestAlertsUnitOOMFire — each kind of event alone turns the alert on:
+// oom, oom_kill, NRestarts; together — one detail with each unit and its
+// counters; all zeros — ok with the number of units.
 func TestAlertsUnitOOMFire(t *testing.T) {
 	ctx := context.Background()
 	cases := []struct {
@@ -83,7 +84,7 @@ func TestAlertsUnitOOMFire(t *testing.T) {
 		}
 	}
 
-	// Два горячих юнита — оба в detail, здоровый третий не упомянут.
+	// Two hot units — both in the detail, the healthy third not mentioned.
 	env, _ := newUnitEnv(t, []UnitEvents{
 		{Unit: "crawler-http-worker.service", OOMKill: 1},
 		{Unit: "crawler-monitor.service"},
@@ -102,7 +103,7 @@ func TestAlertsUnitOOMFire(t *testing.T) {
 		t.Errorf("detail %q называет здоровый юнит", s.Detail)
 	}
 
-	// Все нули — ok; деталь называет число юнитов.
+	// All zeros — ok; the detail names the number of units.
 	env, _ = newUnitEnv(t, []UnitEvents{
 		{Unit: "crawler-http-worker.service"},
 		{Unit: "crawler-monitor.service"},
@@ -113,9 +114,9 @@ func TestAlertsUnitOOMFire(t *testing.T) {
 	}
 }
 
-// TestAlertsUnitOOMEpisode — один Warn на эпизод: срабатывание — Warn
-// «АЛЕРТ», устойчивое срабатывание — тихо, сброс счётчиков (рестарт/
-// reset-failed юнита) — Info «алерт снят».
+// TestAlertsUnitOOMEpisode — one Warn per episode: a firing — a Warn,
+// a sustained firing — silence, a counter reset (a unit restart/
+// reset-failed) — a clearing Info.
 func TestAlertsUnitOOMEpisode(t *testing.T) {
 	env, src := newUnitEnv(t, []UnitEvents{{Unit: "crawler-http-worker.service", OOMKill: 1}})
 	ctx := context.Background()
@@ -126,14 +127,14 @@ func TestAlertsUnitOOMEpisode(t *testing.T) {
 		t.Fatalf("срабатывание без Warn:\n%s", env.buf.String())
 	}
 
-	// Продолжение эпизода (счётчики не сброшены) — тихо.
+	// An episode continuation (counters not reset) — silence.
 	before := env.buf.String()
 	env.Pass(ctx)
 	if delta := env.buf.String()[len(before):]; strings.Contains(delta, "level=WARN") || strings.Contains(delta, "level=INFO") {
 		t.Errorf("устойчивое срабатывание повторило сигнал:\n%s", delta)
 	}
 
-	// Новое событие того же юнита внутри эпизода — без второго Warn.
+	// A new event of the same unit inside the episode — without a second Warn.
 	src.units = []UnitEvents{{Unit: "crawler-http-worker.service", OOMKill: 2, NRestarts: 1}}
 	env.Pass(ctx)
 	delta := env.buf.String()[len(before):]
@@ -141,7 +142,7 @@ func TestAlertsUnitOOMEpisode(t *testing.T) {
 		t.Errorf("новое событие внутри эпизода дало второй сигнал:\n%s", delta)
 	}
 
-	// Сброс состояния юнита (cgroup пересоздана, NRestarts обнулён) — Info.
+	// A unit state reset (the cgroup recreated, NRestarts zeroed) — an Info.
 	src.units = []UnitEvents{{Unit: "crawler-http-worker.service"}}
 	before = env.buf.String()
 	env.Pass(ctx)
@@ -150,19 +151,20 @@ func TestAlertsUnitOOMEpisode(t *testing.T) {
 	}
 }
 
-// TestAlertsUnitOOMDegradation — деградации источника двух классов:
-// окружение без systemd (errNoSystemd — тихое «не измеряется», без
-// Warn, контракт SMART) и боевой отказ источника (Warn каждого прохода,
-// стиль зонда ingest); плюс источник не задан и пустой список юнитов.
+// TestAlertsUnitOOMDegradation — source degradations of two classes:
+// an environment without systemd (errNoSystemd — a quiet "not measured",
+// no Warn, the SMART contract) and a production source failure (a Warn
+// of each pass, the ingest probe style); plus the source not set and an
+// empty unit list.
 func TestAlertsUnitOOMDegradation(t *testing.T) {
-	env := newAlertsTestEnv(t, nil) // UnitEvents не задан
-	env.deps.UnitEvents = nil       // явное отсутствие источника (T-162 дал env здоровый по умолчанию)
+	env := newAlertsTestEnv(t, nil) // UnitEvents not set
+	env.deps.UnitEvents = nil       // an explicit absence of a source (T-162 gave env a healthy default)
 	s := snapshotOf(t, env.Pass(context.Background()), AlertUnitOOM)
 	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "источник не задан") {
 		t.Errorf("без источника: %s (%s), want not_measured «источник не задан»", s.Status, s.Detail)
 	}
 
-	// Dev-контейнер без systemd — тихо: Debug-переход, без Warn.
+	// A dev container without systemd — quiet: a Debug transition, no Warn.
 	env, src := newUnitEnv(t, nil)
 	src.errs = []error{fmt.Errorf("monitor: юниты: %w: systemctl show: %w",
 		errNoSystemd, errors.New("exec: systemctl: executable file not found"))}
@@ -174,8 +176,8 @@ func TestAlertsUnitOOMDegradation(t *testing.T) {
 		t.Errorf("отсутствие systemd дало Warn (должно быть тихим, как SMART):\n%s", env.buf.String())
 	}
 
-	// Боевой отказ источника — Warn каждого прохода, «не измеряется»
-	// с причиной; следующий проход по живому источнику работает.
+	// A production source failure — a Warn of each pass, "not measured"
+	// with the reason; the next pass against a live source works.
 	env, src = newUnitEnv(t, []UnitEvents{{Unit: "crawler-http-worker.service"}})
 	src.errs = []error{errors.New("monitor: юниты: memory.events: EIO")}
 	s = snapshotOf(t, env.Pass(context.Background()), AlertUnitOOM)
@@ -189,7 +191,7 @@ func TestAlertsUnitOOMDegradation(t *testing.T) {
 		t.Errorf("после отказа: %s (%s), want ok (цикл живёт)", s.Status, s.Detail)
 	}
 
-	// systemd жив, юниты не загружены — пустой список без ошибки.
+	// systemd alive, no units loaded — an empty list without an error.
 	src.units = nil
 	s = snapshotOf(t, env.Pass(context.Background()), AlertUnitOOM)
 	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "не найдены") {
@@ -197,11 +199,11 @@ func TestAlertsUnitOOMDegradation(t *testing.T) {
 	}
 }
 
-// --- разбор вывода systemctl show ----------------------------------------------
+// --- parsing of systemctl show output ----------------------------------------------
 
-// TestParseSystemctlShow — блоки Id/NRestarts по юниту, «[not set]» и
-// мусорные значения — нули (как t092-sample.sh), NRestarts до Id —
-// отбрасывается, пустой вывод — пустой список.
+// TestParseSystemctlShow — the Id/NRestarts blocks per unit, "[not set]"
+// and junk values — zeros (like t092-sample.sh), an NRestarts before an
+// Id is discarded, an empty output — an empty list.
 func TestParseSystemctlShow(t *testing.T) {
 	units := parseSystemctlShow("Id=crawler-http-worker.service\nNRestarts=2\n\n" +
 		"Id=crawler-monitor.service\nNRestarts=0\n\n")
@@ -215,7 +217,7 @@ func TestParseSystemctlShow(t *testing.T) {
 		t.Errorf("второй юнит = %+v, want crawler-monitor.service NRestarts=0", units[1])
 	}
 
-	// «[not set]» (юнит не запускался) и нечисло — нули, не ошибка.
+	// "[not set]" (the unit never started) and a non-number — zeros, not an error.
 	for _, val := range []string{"[not set]", "мусор"} {
 		units = parseSystemctlShow("Id=crawler-web.service\nNRestarts=" + val + "\n")
 		if len(units) != 1 || units[0].NRestarts != 0 {
@@ -223,7 +225,7 @@ func TestParseSystemctlShow(t *testing.T) {
 		}
 	}
 
-	// NRestarts до первого Id отбрасывается; посторонние строки — мимо.
+	// An NRestarts before the first Id is discarded; foreign lines do not pass.
 	units = parseSystemctlShow("NRestarts=9\nId=crawler-dns-worker.service\nLoadState=loaded\nNRestarts=1\n")
 	if len(units) != 1 || units[0].Unit != "crawler-dns-worker.service" || units[0].NRestarts != 1 {
 		t.Errorf("странный блок: %+v, want dns-worker NRestarts=1 (ранний NRestarts=9 отброшен)", units)
@@ -237,10 +239,11 @@ func TestParseSystemctlShow(t *testing.T) {
 	}
 }
 
-// --- разбор memory.events --------------------------------------------------------
+// --- parsing of memory.events --------------------------------------------------------
 
-// TestParseMemoryEvents — oom/oom_kill/high из полного файла, чужие ключи
-// и отсутствующие строки — мимо/нули, нечисловое значение — ошибка.
+// TestParseMemoryEvents — oom/oom_kill/high from a full file, foreign
+// keys and missing lines do not pass / zeros, a non-numeric value is an
+// error.
 func TestParseMemoryEvents(t *testing.T) {
 	ev, err := parseMemoryEvents("low 0\nhigh 42\nmax 7\noom 3\noom_kill 1\noom_group 0\n")
 	if err != nil || ev.OOM != 3 || ev.OOMKill != 1 || ev.High != 42 {
@@ -257,7 +260,7 @@ func TestParseMemoryEvents(t *testing.T) {
 		t.Errorf("пустой файл = (%d, %d, %d, %v), want нули без ошибки", ev.OOM, ev.OOMKill, ev.High, err)
 	}
 
-	// Строка без пробела — не ключ-значение, мимо.
+	// A line without a space — not a key-value, skipped.
 	if _, err := parseMemoryEvents("oomkill\n"); err != nil {
 		t.Errorf("строка без значения: ошибка = %v, want пропуск", err)
 	}
@@ -273,17 +276,17 @@ func TestParseMemoryEvents(t *testing.T) {
 	}
 }
 
-// --- OSUnitEvents против заглушек ---------------------------------------------
+// --- OSUnitEvents against stubs ---------------------------------------------
 
-// fakeSystemctl — исполняемый скрипт-заглушка systemctl в каталоге dir:
-// печатает out в stdout; при fail — stderr и код 1.
+// fakeSystemctl — an executable systemctl stub script in the dir
+// directory: prints out to stdout; on fail — stderr and exit code 1.
 func fakeSystemctl(t *testing.T, dir, out, failMsg string) string {
 	t.Helper()
 	script := "#!/bin/sh\n"
 	if failMsg != "" {
 		script += "echo '" + failMsg + "' >&2\nexit 1\n"
 	} else {
-		// heredoc с кавычкой — без подстановок, вывод дословный.
+		// A quoted heredoc — no substitutions, verbatim output.
 		script += "cat <<'SYSTEMCTL_SHOW_EOF'\n" + out + "\nSYSTEMCTL_SHOW_EOF\n"
 	}
 	path := filepath.Join(dir, "systemctl-fake")
@@ -293,12 +296,12 @@ func fakeSystemctl(t *testing.T, dir, out, failMsg string) string {
 	return path
 }
 
-// fakeCgroup — дерево cgroupfs юнита с memory.events в каталоге root;
-// dir == "" — юнит без cgroup (остановлен).
+// fakeCgroup — a unit cgroupfs tree with memory.events in the root
+// directory; events == "" — a unit without a cgroup (stopped).
 func fakeCgroup(t *testing.T, root, unit, events string) {
 	t.Helper()
 	if events == "" {
-		return // каталог юнита не создаётся
+		return // the unit directory is not created
 	}
 	dir := filepath.Join(root, "system.slice", unit)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -309,10 +312,10 @@ func fakeCgroup(t *testing.T, root, unit, events string) {
 	}
 }
 
-// TestOSUnitEvents — systemctl show даёт юниты и NRestarts, memory.events
-// — oom/oom_kill/high (high — троттлинг MemoryHigh, алерт memory_high
-// T-162); юнит без cgroup — нули событий памяти (остановлен, рестарты
-// учтены NRestarts).
+// TestOSUnitEvents — systemctl show gives the units and NRestarts,
+// memory.events — oom/oom_kill/high (high — MemoryHigh throttling, the
+// memory_high alert T-162); a unit without a cgroup — zero memory
+// events (stopped, restarts accounted by NRestarts).
 func TestOSUnitEvents(t *testing.T) {
 	root := t.TempDir()
 	cg := filepath.Join(root, "cg")
@@ -320,7 +323,7 @@ func TestOSUnitEvents(t *testing.T) {
 		"Id=crawler-analyzer.service\nNRestarts=0\n"
 	fakeCgroup(t, cg, "crawler-http-worker.service", "low 0\nhigh 12\noom 3\noom_kill 1\n")
 	fakeCgroup(t, cg, "crawler-analyzer.service", "low 0\noom 0\noom_kill 0\n")
-	// У monitor.service каталога нет — как у остановленного юнита.
+	// monitor.service has no directory — like a stopped unit.
 	show += "\nId=crawler-monitor.service\nNRestarts=1\n"
 
 	units, err := (OSUnitEvents{
@@ -345,8 +348,9 @@ func TestOSUnitEvents(t *testing.T) {
 	}
 }
 
-// TestOSUnitEventsEmptyShow — systemd жив, шаблон ничего не нашёл: пустой
-// список без ошибки (алерт сам переведёт в «не измеряется»).
+// TestOSUnitEventsEmptyShow — systemd alive, the pattern found nothing:
+// an empty list without an error (the alert will switch to "not
+// measured" by itself).
 func TestOSUnitEventsEmptyShow(t *testing.T) {
 	root := t.TempDir()
 	units, err := (OSUnitEvents{
@@ -361,15 +365,15 @@ func TestOSUnitEventsEmptyShow(t *testing.T) {
 	}
 }
 
-// TestOSUnitEventsErrors — классы отказов: «не systemd» (нет бинаря,
-// PID 1 не systemd — errNoSystemd, тихий класс алерта) и боевые ошибки
-// (systemctl упал по другой причине, испорченный memory.events — имена
-// всех отказавших юнитов, обход без fail-fast), зависший systemctl —
-// бюджет таймаута.
+// TestOSUnitEventsErrors — the failure classes: "not systemd" (no
+// binary, PID 1 not systemd — errNoSystemd, the quiet alert class) and
+// production errors (systemctl failed for another reason, a corrupted
+// memory.events — the names of all failed units, the traversal without
+// fail-fast), a hung systemctl — the timeout budget.
 func TestOSUnitEventsErrors(t *testing.T) {
 	root := t.TempDir()
 
-	// PID 1 не systemd — ожидаемое отсутствие окружения.
+	// PID 1 is not systemd — an expected absence of the environment.
 	errNoBoot := "System has not been booted with systemd (PID 1)"
 	_, err := (OSUnitEvents{
 		CgroupFS:  filepath.Join(root, "cg"),
@@ -382,8 +386,8 @@ func TestOSUnitEventsErrors(t *testing.T) {
 		t.Errorf("PID 1 не systemd: ошибка = %v, want класс errNoSystemd", err)
 	}
 
-	// Бинаря нет в PATH (dev-контейнер, Systemctl="" → «systemctl») —
-	// тихий класс errNoSystemd.
+	// The binary is not in PATH (a dev container, Systemctl="" →
+	// "systemctl") — the quiet errNoSystemd class.
 	_, err = (OSUnitEvents{
 		CgroupFS:  filepath.Join(root, "cg"),
 		Systemctl: "systemctl-точно-отсутствует-t145",
@@ -392,8 +396,9 @@ func TestOSUnitEventsErrors(t *testing.T) {
 		t.Errorf("systemctl отсутствует в PATH: ошибка = %v, want класс errNoSystemd", err)
 	}
 
-	// Явно заданный путь исчез (боевая поломка пакета, не контейнер) —
-	// НЕ тихий класс: молчать о сломанном systemctl нельзя.
+	// The explicitly given path vanished (a production package breakage,
+	// not a container) — NOT the quiet class: staying silent about a
+	// broken systemctl is not allowed.
 	_, err = (OSUnitEvents{
 		CgroupFS:  filepath.Join(root, "cg"),
 		Systemctl: filepath.Join(root, "исчезнувший-systemctl"),
@@ -402,7 +407,7 @@ func TestOSUnitEventsErrors(t *testing.T) {
 		t.Errorf("заданный путь отсутствует: ошибка = %v, want боевая ошибка (не errNoSystemd)", err)
 	}
 
-	// Боевая ошибка systemctl (не «нет systemd») — не тихий класс.
+	// A production systemctl error (not "no systemd") — not the quiet class.
 	_, err = (OSUnitEvents{
 		CgroupFS:  filepath.Join(root, "cg"),
 		Systemctl: fakeSystemctl(t, root, "", "Failed to connect to bus"),
@@ -414,8 +419,8 @@ func TestOSUnitEventsErrors(t *testing.T) {
 		t.Errorf("падение шины: ошибка = %v, не должен быть классом errNoSystemd", err)
 	}
 
-	// Испорченный memory.events у двух юнитов: обход продолжает список,
-	// причина называет каждого отказавшего (без fail-fast на первом).
+	// A corrupted memory.events of two units: the traversal continues the
+	// list, the reason names each failed one (no fail-fast on the first).
 	cg := filepath.Join(root, "cg")
 	show := "Id=crawler-http-worker.service\nNRestarts=0\n\nId=crawler-dns-worker.service\nNRestarts=0\n"
 	fakeCgroup(t, cg, "crawler-http-worker.service", "oom много\n")
@@ -428,7 +433,7 @@ func TestOSUnitEventsErrors(t *testing.T) {
 		}
 	}
 
-	// Отмена ctx — до обращения к systemctl.
+	// A ctx cancellation — before the systemctl access.
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	_, err = (OSUnitEvents{Systemctl: fakeSystemctl(t, root, "", "")}).UnitEvents(ctx)
@@ -437,13 +442,13 @@ func TestOSUnitEventsErrors(t *testing.T) {
 	}
 }
 
-// TestOSUnitEventsTimeout — зависший systemctl срезается бюджетом
-// источника (проходы алертов последовательны — зависание не должно
-// останавливать цикл): короткий Timeout + спящая заглушка. exec —
-// чтобы kill пришёл в сам процесс, а не ждал осиротевшего потомка
-// на дескрипторах пайпа (модель прямого потомка, как реальный
-// systemctl). Маркер-файл доказывает, что процесс стартовал: ошибка
-// тогда — именно срыв по бюджету, а не отказ запуска.
+// TestOSUnitEventsTimeout — a hung systemctl is cut off by the source
+// budget (the alert passes are sequential — a hang must not stop the
+// loop): a short Timeout + a sleeping stub. exec — so that the kill
+// lands in the process itself instead of waiting for an orphaned child
+// on the pipe descriptors (the direct-child model, like the real
+// systemctl). The marker file proves the process started: the error is
+// then exactly a budget cut-off, not a launch refusal.
 func TestOSUnitEventsTimeout(t *testing.T) {
 	root := t.TempDir()
 	marker := filepath.Join(root, "started")
@@ -464,10 +469,10 @@ func TestOSUnitEventsTimeout(t *testing.T) {
 	if _, merr := os.Stat(marker); merr != nil {
 		t.Fatalf("заглушка не стартовала (маркер не создан) — таймаут не проверен: %v", merr)
 	}
-	// Тождество ошибки не фиксируем (kill по ctx приходит как
-	// «signal: killed», не обёртка DeadlineExceeded) — существенен
-	// сам срыв по бюджету и не-тихий класс (боевой отказ, не «нет
-	// systemd»).
+	// The error identity is not pinned (the kill by ctx arrives as
+	// "signal: killed", not a DeadlineExceeded wrapper) — what matters is
+	// the budget cut-off itself and the non-quiet class (a production
+	// failure, not "no systemd").
 	if errors.Is(err, errNoSystemd) {
 		t.Errorf("зависший systemctl: ошибка = %v, не класс errNoSystemd", err)
 	}
@@ -476,13 +481,14 @@ func TestOSUnitEventsTimeout(t *testing.T) {
 	}
 }
 
-// TestOSUnitEventsNoCgroupRoot — systemd отвечает, юниты есть, но
-// корня system.slice нет (cgroup v1/hybrid, чужой CgroupFS) — ошибка
-// источника, а не ложное «ok» по нулям ENOENT (раунд 2 ревью, P3).
+// TestOSUnitEventsNoCgroupRoot — systemd answers, the units are there,
+// but there is no system.slice root (cgroup v1/hybrid, a foreign
+// CgroupFS) — a source error, not a false "ok" by ENOENT zeros
+// (review round 2, P3).
 func TestOSUnitEventsNoCgroupRoot(t *testing.T) {
 	root := t.TempDir()
 	show := "Id=crawler-http-worker.service\nNRestarts=0\n"
-	// Каталог cg не создаётся: корня system.slice нет.
+	// The cg directory is not created: there is no system.slice root.
 	_, err := (OSUnitEvents{
 		CgroupFS:  filepath.Join(root, "cg"),
 		Systemctl: fakeSystemctl(t, root, show, ""),
@@ -494,8 +500,8 @@ func TestOSUnitEventsNoCgroupRoot(t *testing.T) {
 		t.Errorf("корень cgroup v2 отсутствует: ошибка = %v, не класс errNoSystemd (systemctl-то ответил)", err)
 	}
 
-	// Пустой список юнитов при том же отсутствующем корне — без ошибки:
-	// читать нечего, алерт сам скажет «не найдены».
+	// An empty unit list with the same missing root — without an error:
+	// there is nothing to read, the alert will say "not found" by itself.
 	_, err = (OSUnitEvents{
 		CgroupFS:  filepath.Join(root, "cg"),
 		Systemctl: fakeSystemctl(t, root, "", ""),
@@ -505,12 +511,12 @@ func TestOSUnitEventsNoCgroupRoot(t *testing.T) {
 	}
 }
 
-// --- метрики-обёртка -------------------------------------------------------------
+// --- metrics wrapper -------------------------------------------------------------
 
-// gaugeLabels — значение gauge по имени и парам метка=значение.
-// Служебную метку service (подставляет фабрика реестра) критерий не
-// считает: серия матчится, когда все метки want совпадают, а прочие
-// сводятся к service.
+// gaugeLabels — a gauge value by name and the label=value pairs.
+// The service utility label (substituted by the registry factory) is
+// not counted by the criterion: a series matches when all the want
+// labels coincide and the rest reduce to service.
 func gaugeLabels(t *testing.T, g prometheus.Gatherer, name string, want map[string]string) (float64, bool) {
 	t.Helper()
 	families, err := g.Gather()
@@ -545,9 +551,9 @@ func gaugeLabels(t *testing.T, g prometheus.Gatherer, name string, want map[stri
 	return 0, false
 }
 
-// TestUnitEventsMetrics — обёртка зеркалит снимок в gauge обоих приборов
-// (метки unit/kind), ошибка источника держит последние значения
-// (hold-last), nil-реестр — чистый транзит.
+// TestUnitEventsMetrics — the wrapper mirrors the snapshot into the
+// gauges of both instruments (the unit/kind labels), a source error
+// keeps the last values (hold-last), a nil registry — pure transit.
 func TestUnitEventsMetrics(t *testing.T) {
 	reg := metrics.New("monitor")
 	src := &fakeUnitEvents{units: []UnitEvents{
@@ -576,7 +582,7 @@ func TestUnitEventsMetrics(t *testing.T) {
 		}
 	}
 
-	// Ошибка источника — транзит ошибки, метрики не тронуты (hold-last).
+	// A source error — the error transit, the metrics untouched (hold-last).
 	src.errs = []error{errors.New("контейнер без systemd")}
 	if _, err := m.UnitEvents(context.Background()); err == nil {
 		t.Error("ошибка источника не прокинута")
@@ -585,7 +591,7 @@ func TestUnitEventsMetrics(t *testing.T) {
 		t.Errorf("после ошибки restarts = (%v, %v), want прежние 2", v, ok)
 	}
 
-	// Новые значения перезаписывают gauge (не копятся рядами).
+	// New values overwrite the gauge (they do not accumulate as rows).
 	src.errs = nil
 	src.units = []UnitEvents{{Unit: "crawler-http-worker.service", OOM: 4, NRestarts: 3}}
 	if _, err := m.UnitEvents(context.Background()); err != nil {
@@ -598,7 +604,7 @@ func TestUnitEventsMetrics(t *testing.T) {
 		t.Errorf("перезапись gauge: restarts = %v, want 3", v)
 	}
 
-	// nil-реестр — транзит без приборов (изолированные сборки).
+	// A nil registry — transit without instruments (isolated builds).
 	plain := NewUnitEventsMetrics(nil, &fakeUnitEvents{units: []UnitEvents{{Unit: "u.service"}}})
 	units, err := plain.UnitEvents(context.Background())
 	if err != nil || len(units) != 1 || units[0].Unit != "u.service" {

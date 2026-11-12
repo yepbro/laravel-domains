@@ -1,9 +1,10 @@
-// Юнит-тесты источника памяти Redis (T-154): разбор INFO memory
-// (таблица: секции/CRLF, отсутствующие и кривые поля), RedisInfo против
-// фейкового клиента go-redis (nil-клиент, ошибка команды, секция
-// запроса), метрики-обёртка (gauge ratio/bytes, hold-last на ошибке,
-// maxmemory 0 — ratio не пишется, транзит без реестра). Живой Redis —
-// за границами юнит-тестов (интеграционные, T-032).
+// Redis memory source unit tests (T-154): INFO memory parsing
+// (a table: sections/CRLF, missing and malformed fields), RedisInfo
+// against a fake go-redis client (a nil client, a command error, the
+// requested section), the metrics wrapper (the ratio/bytes gauges,
+// hold-last on an error, maxmemory 0 — the ratio is not written, transit
+// without a registry). A live Redis is outside the unit tests
+// (integration, T-032).
 package monitor
 
 import (
@@ -18,7 +19,7 @@ import (
 	"crawler/internal/metrics"
 )
 
-// fakeInfoRedis — INFO по заготовке; протокол секций, очередь ошибок.
+// fakeInfoRedis — INFO from a preset; the section protocol, an error queue.
 type fakeInfoRedis struct {
 	mu       sync.Mutex
 	info     string
@@ -26,7 +27,7 @@ type fakeInfoRedis struct {
 	sections [][]string
 }
 
-// compile-time: фейк взаимозаменяем с клиентом go-redis.
+// compile-time: the fake is interchangeable with the go-redis client.
 var _ redisInfoCmd = (*fakeInfoRedis)(nil)
 
 func (f *fakeInfoRedis) Info(_ context.Context, section ...string) *redis.StringCmd {
@@ -36,7 +37,7 @@ func (f *fakeInfoRedis) Info(_ context.Context, section ...string) *redis.String
 	return redis.NewStringResult(f.info, f.err)
 }
 
-// fakeRedisMem — снимок памяти по заготовке, очередь ошибок, протокол.
+// fakeRedisMem — a memory snapshot from a preset, an error queue, the protocol.
 type fakeRedisMem struct {
 	mu    sync.Mutex
 	mem   RedisMemory
@@ -44,7 +45,7 @@ type fakeRedisMem struct {
 	calls int
 }
 
-// compile-time: фейк — RedisMemorySource.
+// compile-time: the fake is a RedisMemorySource.
 var _ RedisMemorySource = (*fakeRedisMem)(nil)
 
 func (f *fakeRedisMem) RedisMemory(context.Context) (RedisMemory, error) {
@@ -57,11 +58,11 @@ func (f *fakeRedisMem) RedisMemory(context.Context) (RedisMemory, error) {
 	return f.mem, nil
 }
 
-// --- разбор INFO -------------------------------------------------------------
+// --- INFO parsing -------------------------------------------------------------
 
-// TestParseRedisMemoryINFO — строки «ключ:значение», заголовки секций
-// и CRLF; отсутствующее поле, нечисловое и отрицательное значения байт,
-// отсутствующая политика — ошибки (формат фиксирован сервером).
+// TestParseRedisMemoryINFO — the "key:value" lines, section headers
+// and CRLF; a missing field, a non-numeric and a negative byte value, a
+// missing policy are errors (the format is fixed by the server).
 func TestParseRedisMemoryINFO(t *testing.T) {
 	raw := "# Memory\r\n" +
 		"used_memory:104857600\r\n" +
@@ -79,14 +80,14 @@ func TestParseRedisMemoryINFO(t *testing.T) {
 		t.Errorf("parse:\n получил  %+v\n хочу     %+v", m, want)
 	}
 
-	// Без \r (юникс-вывод) — тот же результат.
+	// Without \r (unix output) — the same result.
 	m, err = parseRedisMemoryINFO(strings.ReplaceAll(raw, "\r", ""))
 	if err != nil || m != want {
 		t.Errorf("без CR: (%+v, %v), хочу (%+v, nil)", m, err, want)
 	}
 
-	// maxmemory 0 — валидное значение «потолка нет» (не ошибка парса:
-	// доля не определена, но абсолюты и политика читаются).
+	// maxmemory 0 — a valid "no cap" value (not a parse error:
+	// the share is undefined, but the absolutes and the policy are read).
 	m, err = parseRedisMemoryINFO("# Memory\nused_memory:10\nmaxmemory:0\nmaxmemory_policy:noeviction\n")
 	if err != nil {
 		t.Fatalf("maxmemory 0: %v, want валидный снимок", err)
@@ -111,10 +112,11 @@ func TestParseRedisMemoryINFO(t *testing.T) {
 	}
 }
 
-// --- источник ------------------------------------------------------------------
+// --- source ------------------------------------------------------------------
 
-// TestRedisInfoSource — nil-клиент ошибка; фейк — разбор ответа; ошибка
-// команды прокидывается; запрос идёт секцией memory.
+// TestRedisInfoSource — a nil client is an error; the fake — parsing the
+// answer; a command error is propagated; the request goes with the
+// memory section.
 func TestRedisInfoSource(t *testing.T) {
 	if _, err := (RedisInfo{}).RedisMemory(context.Background()); err == nil ||
 		!strings.Contains(err.Error(), "клиент не задан") {
@@ -140,12 +142,12 @@ func TestRedisInfoSource(t *testing.T) {
 	}
 }
 
-// --- метрики-обёртка -------------------------------------------------------------
+// --- metrics wrapper -------------------------------------------------------------
 
-// TestRedisMemoryMetrics — обёртка зеркалит снимок в gauge ratio/bytes
-// (метка kind), ошибка источника держит последние значения, maxmemory 0
-// — ratio не пишется (не определён), bytes пишутся; nil-реестр —
-// чистый транзит.
+// TestRedisMemoryMetrics — the wrapper mirrors the snapshot into the
+// ratio/bytes gauges (the kind label), a source error keeps the last
+// values, maxmemory 0 — the ratio is not written (undefined), bytes are
+// written; a nil registry — pure transit.
 func TestRedisMemoryMetrics(t *testing.T) {
 	reg := metrics.New("monitor")
 	src := &fakeRedisMem{mem: RedisMemory{UsedBytes: 4096, MaxBytes: 8192, Policy: "noeviction"}}
@@ -163,7 +165,7 @@ func TestRedisMemoryMetrics(t *testing.T) {
 		}
 	}
 
-	// Ошибка источника — транзит ошибки, метрики держат последнее.
+	// A source error — the error transit, the metrics keep the last values.
 	src.errs = []error{errors.New("redis недоступен")}
 	if _, err := m.RedisMemory(context.Background()); err == nil {
 		t.Error("ошибка источника не прокинута")
@@ -172,7 +174,7 @@ func TestRedisMemoryMetrics(t *testing.T) {
 		t.Errorf("после ошибки ratio = (%v, %v), want прежние 0.5", v, ok)
 	}
 
-	// Новые значения перезаписывают gauge.
+	// New values overwrite the gauge.
 	src.errs = nil
 	src.mem = RedisMemory{UsedBytes: 6144, MaxBytes: 8192, Policy: "noeviction"}
 	if _, err := m.RedisMemory(context.Background()); err != nil {
@@ -182,8 +184,8 @@ func TestRedisMemoryMetrics(t *testing.T) {
 		t.Errorf("перезапись ratio = %v, want 0.75", v)
 	}
 
-	// maxmemory 0 (без потолка) — ratio не определён и не пишется,
-	// абсолюты честны: used обновлён, max — 0.
+	// maxmemory 0 (no cap) — the ratio is undefined and is not written,
+	// the absolutes are honest: used updated, max — 0.
 	src.mem = RedisMemory{UsedBytes: 2048, MaxBytes: 0, Policy: "noeviction"}
 	if _, err := m.RedisMemory(context.Background()); err != nil {
 		t.Fatal(err)
@@ -195,7 +197,7 @@ func TestRedisMemoryMetrics(t *testing.T) {
 		t.Errorf("bytes{max} = %v, want 0", v)
 	}
 
-	// nil-реестр — транзит без приборов.
+	// A nil registry — transit without instruments.
 	plain := NewRedisMemoryMetrics(nil, &fakeRedisMem{mem: RedisMemory{UsedBytes: 1, MaxBytes: 2, Policy: "noeviction"}})
 	snap, err := plain.RedisMemory(context.Background())
 	if err != nil || snap.UsedBytes != 1 || snap.MaxBytes != 2 {
