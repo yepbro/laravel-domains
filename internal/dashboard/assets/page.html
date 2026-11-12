@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="ru">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -8,7 +8,7 @@
      может отличаться от dashboard.refresh сервера: фронт показывает
      последний готовый снимок, а не ждёт своей сборки. -->
 <meta name="dashboard-refresh" content="5">
-<title>Дашборд Domain Crawler</title>
+<title>Domain Crawler Dashboard</title>
 <link rel="stylesheet" href="/assets/style.css">
 <script src="/assets/app.js" defer></script>
 </head>
@@ -16,89 +16,89 @@
 
 <header class="topbar">
   <div class="topbar-title">
-    <h1>Дашборд Domain Crawler</h1>
-    <span class="hint">опрос каждые <span id="refresh-secs">5</span> с · только наблюдение</span>
+    <h1>Domain Crawler Dashboard</h1>
+    <span class="hint">polling every <span id="refresh-secs">5</span> s · observe only</span>
   </div>
   <div class="topbar-status">
-    <span id="conn" class="conn conn-wait">запуск…</span>
-    <span id="built-at" class="hint">снимок: н/д</span>
+    <span id="conn" class="conn conn-wait">starting…</span>
+    <span id="built-at" class="hint">snapshot: n/a</span>
   </div>
 </header>
 
 <noscript>
-  <div class="notice">Для работы дашборда нужен JavaScript: автообновление,
-  спарклайны и обработка повторного входа выполняются в браузере (ТЗД §6.4).</div>
+  <div class="notice">The dashboard needs JavaScript: auto-refresh, sparklines and
+  re-login handling run in the browser (dashboard spec §6.4).</div>
 </noscript>
 
 <main>
 
 <!-- §5.1–5.2: сводка и скорость. Значения расставляет app.js из /api/status,
      «н/д» — до первого снимка и для деградировавших секций (§5.9). -->
-<section class="cards" aria-label="Сводка конвейера">
+<section class="cards" aria-label="Pipeline summary">
   <div class="card">
-    <div class="card-label">Всего доменов</div>
-    <div class="card-value" id="v-total">н/д</div>
-    <div class="card-sub">по всем зонам</div>
+    <div class="card-label">Total domains</div>
+    <div class="card-value" id="v-total">n/a</div>
+    <div class="card-sub">across all zones</div>
   </div>
   <div class="card">
-    <div class="card-label">Проверено</div>
-    <div class="card-value" id="v-checked">н/д</div>
+    <div class="card-label">Checked</div>
+    <div class="card-value" id="v-checked">n/a</div>
     <div class="card-sub" id="v-checked-sub">—</div>
     <div class="bar"><div class="bar-fill" id="bar-checked"></div></div>
   </div>
   <div class="card">
-    <div class="card-label">В работе</div>
-    <div class="card-value" id="v-inwork">н/д</div>
+    <div class="card-label">In flight</div>
+    <div class="card-value" id="v-inwork">n/a</div>
     <div class="card-sub">pending + queued</div>
   </div>
   <div class="card">
-    <div class="card-label">Дом./с</div>
-    <div class="card-value" id="v-dps">н/д</div>
-    <div class="card-sub">окно суток</div>
+    <div class="card-label">Domains/s</div>
+    <div class="card-value" id="v-dps">n/a</div>
+    <div class="card-sub">daily window</div>
     <svg class="spark" id="spark-dps" viewBox="0 0 120 28" preserveAspectRatio="none"
-         role="img" aria-label="спарклайн доменов в секунду"><polyline vector-effect="non-scaling-stroke"/></svg>
+         role="img" aria-label="domains per second sparkline"><polyline vector-effect="non-scaling-stroke"/></svg>
   </div>
   <div class="card">
-    <div class="card-label">HTTP-рез./с</div>
-    <div class="card-value" id="v-rps">н/д</div>
-    <div class="card-sub">окно часа</div>
+    <div class="card-label">HTTP res./s</div>
+    <div class="card-value" id="v-rps">n/a</div>
+    <div class="card-sub">hourly window</div>
     <svg class="spark" id="spark-rps" viewBox="0 0 120 28" preserveAspectRatio="none"
-         role="img" aria-label="спарклайн HTTP-результатов в секунду"><polyline vector-effect="non-scaling-stroke"/></svg>
+         role="img" aria-label="HTTP results per second sparkline"><polyline vector-effect="non-scaling-stroke"/></svg>
   </div>
   <div class="card">
-    <div class="card-label">Ренд./с</div>
-    <div class="card-value" id="v-renders">н/д</div>
-    <div class="card-sub">окно часа</div>
+    <div class="card-label">Render/s</div>
+    <div class="card-value" id="v-renders">n/a</div>
+    <div class="card-sub">hourly window</div>
     <svg class="spark" id="spark-renders" viewBox="0 0 120 28" preserveAspectRatio="none"
-         role="img" aria-label="спарклайн рендеров в секунду"><polyline vector-effect="non-scaling-stroke"/></svg>
+         role="img" aria-label="renders per second sparkline"><polyline vector-effect="non-scaling-stroke"/></svg>
   </div>
   <div class="card">
-    <div class="card-label">ETA цикла</div>
-    <div class="card-value" id="v-eta">н/д</div>
-    <div class="card-sub" id="v-eta-sub">остаток первого цикла: н/д</div>
+    <div class="card-label">Cycle ETA</div>
+    <div class="card-value" id="v-eta">n/a</div>
+    <div class="card-sub" id="v-eta-sub">first-cycle remainder: n/a</div>
   </div>
   <div class="card">
-    <div class="card-label">Laravel-находок</div>
-    <div class="card-value" id="v-laravel">н/д</div>
-    <div class="card-sub" id="v-laravel-sub">за 24 ч: н/д</div>
+    <div class="card-label">Laravel finds</div>
+    <div class="card-value" id="v-laravel">n/a</div>
+    <div class="card-sub" id="v-laravel-sub">last 24 h: n/a</div>
   </div>
 </section>
 
 <!-- §5.4: пять стримов; подсветка глубины рабочего стрима против его
      эффективного watermark (queue_watermarks) и ненулевого q:dead — app.js. -->
 <section>
-  <h2>Очереди <span class="hint" id="queue-hint"></span></h2>
+  <h2>Queues <span class="hint" id="queue-hint"></span></h2>
   <div class="tbl-wrap">
     <table class="tbl">
       <thead>
         <tr>
-          <th>Стрим</th>
-          <th class="num">Глубина</th>
-          <th class="th-spark">История (окно ~10 мин)</th>
+          <th>Stream</th>
+          <th class="num">Depth</th>
+          <th class="th-spark">History (~10 min window)</th>
         </tr>
       </thead>
       <tbody id="queues-body">
-        <tr><td colspan="3" class="nd">н/д</td></tr>
+        <tr><td colspan="3" class="nd">n/a</td></tr>
       </tbody>
     </table>
   </div>
@@ -112,47 +112,47 @@
      рендер-воркеров (dashboard.render_metrics_urls); адреса не заданы
      или экспозиции недоступны — «н/д». -->
 <section>
-  <h2>Движки рендера <span class="hint" id="render-hint"></span></h2>
+  <h2>Render engines <span class="hint" id="render-hint"></span></h2>
   <div class="tbl-wrap">
     <table class="tbl">
       <thead>
         <tr>
-          <th>Движок</th>
-          <th class="num">Ренд./с</th>
-          <th class="num">Успешно</th>
-          <th class="num">Финализаций</th>
-          <th class="num">Успешность</th>
-          <th class="num">Тарпит-рейт</th>
+          <th>Engine</th>
+          <th class="num">Render/s</th>
+          <th class="num">Rendered</th>
+          <th class="num">Finalizations</th>
+          <th class="num">Success</th>
+          <th class="num">Tarpit rate</th>
           <th class="num">RSS</th>
         </tr>
       </thead>
       <tbody id="render-engines-body">
-        <tr><td colspan="7" class="nd">н/д</td></tr>
+        <tr><td colspan="7" class="nd">n/a</td></tr>
       </tbody>
     </table>
   </div>
-  <div class="fb" id="render-fallback"><span class="nd">н/д</span></div>
+  <div class="fb" id="render-fallback"><span class="nd">n/a</span></div>
 </section>
 
 <!-- §5.3: зоны с прогресс-барами; punycode — имя, unicode — подсказка. -->
 <section>
-  <h2>Зоны</h2>
+  <h2>Zones</h2>
   <div class="tbl-wrap">
     <table class="tbl">
       <thead>
         <tr>
-          <th>Зона</th>
-          <th>Активность</th>
-          <th class="num">Всего</th>
-          <th class="num">Проверено</th>
-          <th class="th-progress">Прогресс</th>
+          <th>Zone</th>
+          <th>State</th>
+          <th class="num">Total</th>
+          <th class="num">Checked</th>
+          <th class="th-progress">Progress</th>
           <th class="num">pending</th>
           <th class="num">queued</th>
           <th class="num">done</th>
         </tr>
       </thead>
       <tbody id="zones-body">
-        <tr><td colspan="8" class="nd">н/д</td></tr>
+        <tr><td colspan="8" class="nd">n/a</td></tr>
       </tbody>
     </table>
   </div>
@@ -160,27 +160,27 @@
 
 <!-- §5.5: полоса-легенда распределения статусов со счётчиками. -->
 <section>
-  <h2>Статусы доменов</h2>
+  <h2>Domain statuses</h2>
   <div class="statusbar" id="statusbar"></div>
   <div class="legend" id="statuslegend"></div>
 </section>
 
 <!-- §5.6: последние Laravel-находки. -->
 <section>
-  <h2>Последние находки Laravel</h2>
+  <h2>Latest Laravel finds</h2>
   <div class="tbl-wrap">
     <table class="tbl">
       <thead>
         <tr>
-          <th>Домен</th>
-          <th>Зона</th>
+          <th>Domain</th>
+          <th>Zone</th>
           <th class="num">score</th>
-          <th>Версии</th>
-          <th>Обновлён</th>
+          <th>Versions</th>
+          <th>Updated</th>
         </tr>
       </thead>
       <tbody id="laravel-body">
-        <tr><td colspan="5" class="nd">н/д</td></tr>
+        <tr><td colspan="5" class="nd">n/a</td></tr>
       </tbody>
     </table>
   </div>
@@ -188,23 +188,23 @@
 
 <!-- §5.7: последние ingest-файлы. -->
 <section>
-  <h2>Последние ingest-файлы</h2>
+  <h2>Latest ingest files</h2>
   <div class="tbl-wrap">
     <table class="tbl">
       <thead>
         <tr>
-          <th>Файл</th>
-          <th>Действие</th>
-          <th class="num">Строк</th>
-          <th class="num">Добавлено</th>
-          <th class="num">Уже было</th>
-          <th class="num">Удалено</th>
-          <th class="num">Отклонено</th>
-          <th>Обработан</th>
+          <th>File</th>
+          <th>Action</th>
+          <th class="num">Lines</th>
+          <th class="num">Added</th>
+          <th class="num">Existed</th>
+          <th class="num">Deleted</th>
+          <th class="num">Rejected</th>
+          <th>Processed</th>
         </tr>
       </thead>
       <tbody id="ingest-body">
-        <tr><td colspan="8" class="nd">н/д</td></tr>
+        <tr><td colspan="8" class="nd">n/a</td></tr>
       </tbody>
     </table>
   </div>
@@ -212,14 +212,14 @@
 
 <!-- §5.8: чипы здоровья сервисов (dashboard.probes). -->
 <section>
-  <h2>Здоровье сервисов</h2>
-  <div class="chips" id="health"><span class="nd">н/д</span></div>
+  <h2>Service health</h2>
+  <div class="chips" id="health"><span class="nd">n/a</span></div>
 </section>
 
 </main>
 
-<footer class="footer">Domain Crawler — внутренний операторский дашборд,
-данные read-only из снимка конвейера; исторические графики — в Prometheus.</footer>
+<footer class="footer">Domain Crawler — an internal operator dashboard,
+read-only data from the pipeline snapshot; historical charts live in Prometheus.</footer>
 
 </body>
 </html>

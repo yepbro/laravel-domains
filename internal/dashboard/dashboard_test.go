@@ -128,7 +128,7 @@ func sessionCookie(t *testing.T, rec *httptest.ResponseRecorder) *http.Cookie {
 			return c
 		}
 	}
-	t.Fatalf("ответ без Set-Cookie %s: %v", sessionCookieName, rec.Result().Cookies())
+	t.Fatalf("the response without Set-Cookie %s: %v", sessionCookieName, rec.Result().Cookies())
 	return nil
 }
 
@@ -147,20 +147,20 @@ func TestNewCredentials(t *testing.T) {
 		hash    string
 		wantErr string
 	}{
-		{"пустое имя", "", valid, "username пуст"},
-		{"пустой хэш", testUser, "", "password_hash пуст"},
-		{"обе пустые", "", "", "username пуст"},                        // the name is checked first
-		{"имя с двоеточием", "op:erator", valid, "не может содержать"}, // Basic splits at the first ":" — a login would be impossible
-		{"мусор вместо хэша", testUser, " plaintext ", "password_hash: "},
-		{"хэш без схемы", testUser, "sha256$1000$c2FsdA==$a2V5", "password_hash: "},
-		{"хэш короткой солью", testUser, "pbkdf2-sha256$1000$c2FsdA==$MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=", "password_hash: "},
-		{"хэш коротким ключом", testUser, "pbkdf2-sha256$1000$MDEyMzQ1Njc4OWFiY2RlZg==$a2V5", "password_hash: "},
-		{"хэш нулевыми итерациями", testUser, "pbkdf2-sha256$0$MDEyMzQ1Njc4OWFiY2RlZg==$MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=", "password_hash: "},
+		{"an empty name", "", valid, "the username is empty"},
+		{"an empty hash", testUser, "", "password_hash is empty"},
+		{"both empty", "", "", "the username is empty"},                        // the name is checked first
+		{"a name with a colon", "op:erator", valid, "must not contain"}, // Basic splits at the first ":" — a login would be impossible
+		{"junk instead of a hash", testUser, " plaintext ", "password_hash: "},
+		{"a hash without the scheme", testUser, "sha256$1000$c2FsdA==$a2V5", "password_hash: "},
+		{"a hash with a short salt", testUser, "pbkdf2-sha256$1000$c2FsdA==$MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=", "password_hash: "},
+		{"a hash with a short key", testUser, "pbkdf2-sha256$1000$MDEyMzQ1Njc4OWFiY2RlZg==$a2V5", "password_hash: "},
+		{"a hash with zero iterations", testUser, "pbkdf2-sha256$0$MDEyMzQ1Njc4OWFiY2RlZg==$MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=", "password_hash: "},
 	} {
 		cfg := config.Default()
 		cfg.Dashboard.Username, cfg.Dashboard.PasswordHash = tc.user, tc.hash
 		if _, err := New(fakePinger{}, cfg, Options{}); err == nil || !strings.Contains(err.Error(), tc.wantErr) {
-			t.Errorf("%s: New = %v, хочу ошибку с %q", tc.name, err, tc.wantErr)
+			t.Errorf("%s: New = %v, want an error with %q", tc.name, err, tc.wantErr)
 		}
 	}
 	// Without a DB pool the server is pointless (the credentials are
@@ -168,15 +168,15 @@ func TestNewCredentials(t *testing.T) {
 	// parsing).
 	cfg := config.Default()
 	cfg.Dashboard.Username, cfg.Dashboard.PasswordHash = testUser, valid
-	if _, err := New(nil, cfg, Options{}); err == nil || !strings.Contains(err.Error(), "пул БД не задан") {
-		t.Errorf("New(nil db, валидные креды) = %v, хочу «пул БД не задан»", err)
+	if _, err := New(nil, cfg, Options{}); err == nil || !strings.Contains(err.Error(), "the DB pool is not set") {
+		t.Errorf("New(nil db, valid credentials) = %v, want the DB pool is not set", err)
 	}
-	if _, err := New(fakePinger{}, nil, Options{}); err == nil || !strings.Contains(err.Error(), "конфигурация не задана") {
-		t.Errorf("New(nil cfg) = %v, хочу «конфигурация не задана»", err)
+	if _, err := New(fakePinger{}, nil, Options{}); err == nil || !strings.Contains(err.Error(), "the configuration is not set") {
+		t.Errorf("New(nil cfg) = %v, want the configuration is not set", err)
 	}
 	// Valid credentials assemble.
 	if _, err := New(fakePinger{}, cfg, Options{}); err != nil {
-		t.Errorf("New(валидные креды): %v", err)
+		t.Errorf("New(valid credentials): %v", err)
 	}
 }
 
@@ -189,11 +189,11 @@ func TestAuthRequired(t *testing.T) {
 	for _, path := range []string{"/", "/api/status", "/assets/app.js"} {
 		rec := doReq(h, http.MethodGet, path, "10.0.0.1:1111", nil)
 		if rec.Code != http.StatusUnauthorized {
-			t.Errorf("GET %s без кредов = %d, хочу 401", path, rec.Code)
+			t.Errorf("GET %s without credentials = %d, want 401", path, rec.Code)
 		}
 		chal := rec.Header().Get("WWW-Authenticate")
 		if !strings.HasPrefix(chal, `Basic realm="dashboard"`) {
-			t.Errorf("GET %s: WWW-Authenticate = %q, хочу Basic realm=\"dashboard\"", path, chal)
+			t.Errorf("GET %s: WWW-Authenticate = %q, want Basic realm=\"dashboard\"", path, chal)
 		}
 	}
 }
@@ -212,28 +212,28 @@ func TestAuthWrongCredentials(t *testing.T) {
 		user string
 		pass string
 	}{
-		{"неверный пароль", testUser, "wrong"},
-		{"неверное имя", "admin", testPassword},
-		{"оба неверны", "admin", "wrong"},
-		{"пустые", "", ""},
+		{"a wrong password", testUser, "wrong"},
+		{"a wrong name", "admin", testPassword},
+		{"both wrong", "admin", "wrong"},
+		{"empty", "", ""},
 	} {
 		rec := doReq(h, http.MethodGet, "/", "10.0.0.2:2222",
 			map[string]string{"Authorization": basic(tc.user, tc.pass)})
 		if rec.Code != http.StatusUnauthorized {
-			t.Errorf("%s: статус = %d, хочу 401", tc.name, rec.Code)
+			t.Errorf("%s: status = %d, want 401", tc.name, rec.Code)
 		}
 		if rec.Header().Get("WWW-Authenticate") == "" {
-			t.Errorf("%s: 401 без WWW-Authenticate", tc.name)
+			t.Errorf("%s: a 401 without WWW-Authenticate", tc.name)
 		}
 	}
 
 	logs := buf.String()
 	if !strings.Contains(logs, "10.0.0.2") {
-		t.Errorf("Warn без IP-адреса (§9.2):\n%s", logs)
+		t.Errorf("a Warn without the IP address (§9.2):\n%s", logs)
 	}
 	for _, secret := range []string{testPassword, "wrong", "Basic ", srv.cfgHashFragment(t)} {
 		if strings.Contains(logs, secret) {
-			t.Errorf("лог содержит креды (%q), §9.2:\n%s", secret, logs)
+			t.Errorf("the log holds credentials (%q), §9.2:\n%s", secret, logs)
 		}
 	}
 }
@@ -244,7 +244,7 @@ func TestAuthWrongCredentials(t *testing.T) {
 func (s *Server) cfgHashFragment(t *testing.T) string {
 	t.Helper()
 	if len(s.hash.Salt) < 8 {
-		t.Fatalf("соль хэша короче 8 байт: %d", len(s.hash.Salt))
+		t.Fatalf("the hash salt is shorter than 8 bytes: %d", len(s.hash.Salt))
 	}
 	return base64.StdEncoding.EncodeToString(s.hash.Salt)
 }
@@ -257,25 +257,25 @@ func TestAuthSuccess(t *testing.T) {
 
 	rec := doReq(h, http.MethodGet, "/", "10.0.0.3:3333", authed())
 	if rec.Code != http.StatusOK {
-		t.Fatalf("правильные креды: статус = %d, хочу 200 (тело: %s)", rec.Code, rec.Body.String())
+		t.Fatalf("correct credentials: status = %d, want 200 (the body: %s)", rec.Code, rec.Body.String())
 	}
 	c := sessionCookie(t, rec)
 	if !c.HttpOnly {
-		t.Error("cookie без HttpOnly (§7.5)")
+		t.Error("a cookie without HttpOnly (§7.5)")
 	}
 	if c.SameSite != http.SameSiteLaxMode {
-		t.Errorf("SameSite = %v, хочу Lax (§7.5)", c.SameSite)
+		t.Errorf("SameSite = %v, want Lax (§7.5)", c.SameSite)
 	}
 	if c.MaxAge != int(sessionTTL.Seconds()) {
-		t.Errorf("MaxAge = %d, хочу %d (§7.5: 24 ч)", c.MaxAge, int(sessionTTL.Seconds()))
+		t.Errorf("MaxAge = %d, want %d (§7.5: 24 h)", c.MaxAge, int(sessionTTL.Seconds()))
 	}
 	// Value format: <unix-expiry>.<hex HMAC-SHA256>.
 	expiry, sig, ok := strings.Cut(c.Value, ".")
 	if !ok || len(sig) != 64 {
-		t.Fatalf("значение cookie %q: ожидался <expiry>.<hex-64>", c.Value)
+		t.Fatalf("the cookie value %q: <expiry>.<hex-64> expected", c.Value)
 	}
 	if exp, err := strconv.ParseInt(expiry, 10, 64); err != nil || exp != clock.now.Add(sessionTTL).Unix() {
-		t.Errorf("expiry %q: хочу unix-время now+24ч", expiry)
+		t.Errorf("expiry %q: want the unix time now+24h", expiry)
 	}
 }
 
@@ -294,17 +294,17 @@ func TestAuthCookieSecure(t *testing.T) {
 		directTLS  bool
 		want       bool
 	}{
-		{"loopback-прокси + XFP https", "127.0.0.1:4101", "https", false, false, true},
-		{"loopback-прокси + XFP HTTP (регистр)", "127.0.0.1:4102", "HTTPS", false, false, true},
-		{"loopback-прокси + список XFP (клиент, прокси)", "127.0.0.1:4103", "http, https", false, false, true},
-		{"loopback-прокси + XFP http (вход без TLS)", "127.0.0.1:4104", "http", false, false, false},
-		{"loopback без XFP (прямой dev-доступ)", "127.0.0.1:4105", "", false, false, false},
-		{"чужой пир + подделка XFP https", "203.0.113.9:4106", "https", false, false, false},
-		{"прямое TLS-соединение", "203.0.113.9:4107", "", false, true, true},
+		{"a loopback proxy + XFP https", "127.0.0.1:4101", "https", false, false, true},
+		{"a loopback proxy + XFP HTTP (case)", "127.0.0.1:4102", "HTTPS", false, false, true},
+		{"a loopback proxy + an XFP list (client, proxy)", "127.0.0.1:4103", "http, https", false, false, true},
+		{"a loopback proxy + XFP http (an entry without TLS)", "127.0.0.1:4104", "http", false, false, false},
+		{"loopback without XFP (a direct dev access)", "127.0.0.1:4105", "", false, false, false},
+		{"a foreign peer + a forged XFP https", "203.0.113.9:4106", "https", false, false, false},
+		{"a direct TLS connection", "203.0.113.9:4107", "", false, true, true},
 		// A unix peer — a trusted proxy (the dashboard listens on TCP
 		// only — the parity branch with internal/web, T-221/T-227).
-		{"unix-пир + XFP https", "@", "https", true, false, true},
-		{"unix-пир без XFP", "@", "", true, false, false},
+		{"a unix peer + XFP https", "@", "https", true, false, true},
+		{"a unix peer without XFP", "@", "", true, false, false},
 	} {
 		req := httptest.NewRequest(http.MethodGet, "/", nil)
 		req.RemoteAddr = tc.remoteAddr
@@ -322,10 +322,10 @@ func TestAuthCookieSecure(t *testing.T) {
 		rec := httptest.NewRecorder()
 		newTestServer(t, nil).Handler().ServeHTTP(rec, req)
 		if rec.Code != http.StatusOK {
-			t.Fatalf("%s: статус = %d, хочу 200 (тело: %s)", tc.name, rec.Code, rec.Body.String())
+			t.Fatalf("%s: status = %d, want 200 (the body: %s)", tc.name, rec.Code, rec.Body.String())
 		}
 		if got := sessionCookie(t, rec).Secure; got != tc.want {
-			t.Errorf("%s: cookie Secure = %v, хочу %v", tc.name, got, tc.want)
+			t.Errorf("%s: the cookie Secure = %v, want %v", tc.name, got, tc.want)
 		}
 	}
 }
@@ -349,17 +349,17 @@ func TestSessionCookie(t *testing.T) {
 	// is passed (a server without a snapshot source — the §5.9
 	// semantics).
 	if good := doReqCookie(h, http.MethodGet, "/api/status", "10.0.0.4:4445", valid); good.Code != http.StatusServiceUnavailable {
-		t.Fatalf("валидная cookie: статус = %d, хочу 503 (нет источника снимков, не 401)", good.Code)
+		t.Fatalf("a valid cookie: status = %d, want 503 (no snapshot source, not 401)", good.Code)
 	}
 
 	// (2) The signature is tampered.
 	e0, s0, _ := strings.Cut(valid.Value, ".")
 	tamperedSig := &http.Cookie{Name: sessionCookieName, Value: e0 + "." + flipHexNibble(s0)}
 	if tamperedSig.Value == valid.Value {
-		t.Fatal("тампер не изменил значение подписи")
+		t.Fatal("the tamper did not change the signature value")
 	}
 	if rec2 := doReqCookie(h, http.MethodGet, "/", "10.0.0.4:4446", tamperedSig); rec2.Code != http.StatusUnauthorized {
-		t.Errorf("тамперена подпись: статус = %d, хочу 401", rec2.Code)
+		t.Errorf("a tampered signature: status = %d, want 401", rec2.Code)
 	}
 
 	// (3) The expiry is tampered (the signature no longer matches).
@@ -368,18 +368,18 @@ func TestSessionCookie(t *testing.T) {
 	if rec3 := doReqCookie(h, http.MethodGet, "/", "10.0.0.4:4447", &http.Cookie{
 		Name: sessionCookieName, Value: strconv.FormatInt(bumped, 10) + "." + s0,
 	}); rec3.Code != http.StatusUnauthorized {
-		t.Errorf("тамперен expiry: статус = %d, хочу 401", rec3.Code)
+		t.Errorf("a tampered expiry: status = %d, want 401", rec3.Code)
 	}
 
 	// (4) Expired: the same signature, the clock moved past the expiry.
 	clock.now = clock.now.Add(sessionTTL + time.Second)
 	if rec4 := doReqCookie(h, http.MethodGet, "/", "10.0.0.4:4448", valid); rec4.Code != http.StatusUnauthorized {
-		t.Errorf("просроченная cookie: статус = %d, хочу 401", rec4.Code)
+		t.Errorf("an expired cookie: status = %d, want 401", rec4.Code)
 	}
 	// A second before expiry — still valid.
 	clock.now = clock.now.Add(-2 * time.Second)
 	if rec5 := doReqCookie(h, http.MethodGet, "/", "10.0.0.4:4449", valid); rec5.Code != http.StatusOK {
-		t.Errorf("cookie на секунду до истечения: статус = %d, хочу 200", rec5.Code)
+		t.Errorf("a cookie a second before the expiry: status = %d, want 200", rec5.Code)
 	}
 
 	// (5) A password_hash change — a new derived key: the previous
@@ -390,10 +390,10 @@ func TestSessionCookie(t *testing.T) {
 	cfg2.Dashboard.PasswordHash = fastHash(t, testPassword) // a new salt → a new key
 	srv2, err := New(fakePinger{}, cfg2, Options{Now: clock.Now})
 	if err != nil {
-		t.Fatalf("New(новый хэш): %v", err)
+		t.Fatalf("New(a new hash): %v", err)
 	}
 	if rec6 := doReqCookie(srv2.Handler(), http.MethodGet, "/", "10.0.0.4:4450", valid); rec6.Code != http.StatusUnauthorized {
-		t.Errorf("cookie после смены password_hash: статус = %d, хочу 401", rec6.Code)
+		t.Errorf("a cookie after the password_hash change: status = %d, want 401", rec6.Code)
 	}
 }
 
@@ -433,7 +433,7 @@ func TestBruteForceBlock(t *testing.T) {
 	for i := 0; i < maxLoginFailures; i++ {
 		rec := doReq(h, http.MethodGet, "/", "10.0.0.5:5555", bad)
 		if rec.Code != http.StatusUnauthorized {
-			t.Fatalf("попытка %d: статус = %d, хочу 401 (окно ещё не заполнено)", i+1, rec.Code)
+			t.Fatalf("attempt %d: status = %d, want 401 (the window is not full yet)", i+1, rec.Code)
 		}
 	}
 
@@ -442,21 +442,21 @@ func TestBruteForceBlock(t *testing.T) {
 	clock.now = clock.now.Add(30 * time.Second)
 	blocked := doReq(h, http.MethodGet, "/", "10.0.0.5:5555", bad)
 	if blocked.Code != http.StatusTooManyRequests {
-		t.Fatalf("после %d неудач: статус = %d, хочу 429", maxLoginFailures, blocked.Code)
+		t.Fatalf("after %d failures: status = %d, want 429", maxLoginFailures, blocked.Code)
 	}
 	if ra := blocked.Header().Get("Retry-After"); ra != "30" {
-		t.Errorf("Retry-After = %q, хочу \"30\" (остаток окна)", ra)
+		t.Errorf("Retry-After = %q, want \"30\" (the window remainder)", ra)
 	}
 	// Blocking applies to correct credentials too — brute force does
 	// not spend the KDF.
 	blockedOK := doReq(h, http.MethodGet, "/", "10.0.0.5:5555", authed())
 	if blockedOK.Code != http.StatusTooManyRequests {
-		t.Errorf("блокировка не держится на верных кредах: %d, хочу 429", blockedOK.Code)
+		t.Errorf("the block does not hold on correct credentials: %d, want 429", blockedOK.Code)
 	}
 	// A foreign IP at the same moment — a normal 401.
 	other := doReq(h, http.MethodGet, "/", "10.0.0.6:6666", bad)
 	if other.Code != http.StatusUnauthorized {
-		t.Errorf("чужой IP: статус = %d, хочу 401 (per-IP окно)", other.Code)
+		t.Errorf("a foreign IP: status = %d, want 401 (a per-IP window)", other.Code)
 	}
 
 	// A valid cookie passes even from a blocked IP: an operator with a
@@ -464,11 +464,11 @@ func TestBruteForceBlock(t *testing.T) {
 	// auth order).
 	loggedIn := doReq(h, http.MethodGet, "/", "10.0.0.7:7777", authed())
 	if loggedIn.Code != http.StatusOK {
-		t.Fatalf("вход для cookie: %d", loggedIn.Code)
+		t.Fatalf("the login for the cookie: %d", loggedIn.Code)
 	}
 	withSession := doReqCookie(h, http.MethodGet, "/", "10.0.0.5:5555", sessionCookie(t, loggedIn))
 	if withSession.Code != http.StatusOK {
-		t.Errorf("валидная cookie с заблокированного IP: %d, хочу 200", withSession.Code)
+		t.Errorf("a valid cookie from a blocked IP: %d, want 200", withSession.Code)
 	}
 
 	// The window has fully expired — verification works again (401
@@ -476,7 +476,7 @@ func TestBruteForceBlock(t *testing.T) {
 	clock.now = clock.now.Add(31 * time.Second) // 30 + 31 > 60 s since the first failure
 	expired := doReq(h, http.MethodGet, "/", "10.0.0.5:5555", bad)
 	if expired.Code != http.StatusUnauthorized {
-		t.Errorf("после истечения окна: статус = %d, хочу 401 (не 429)", expired.Code)
+		t.Errorf("after the window expiry: status = %d, want 401 (not 429)", expired.Code)
 	}
 }
 
@@ -491,15 +491,15 @@ func TestBruteForceSuccessResets(t *testing.T) {
 
 	for i := 0; i < 4; i++ {
 		if rec := doReq(h, http.MethodGet, "/", ip, bad); rec.Code != http.StatusUnauthorized {
-			t.Fatalf("неудача %d: %d", i+1, rec.Code)
+			t.Fatalf("failure %d: %d", i+1, rec.Code)
 		}
 	}
 	if rec := doReq(h, http.MethodGet, "/", ip, authed()); rec.Code != http.StatusOK {
-		t.Fatalf("успешный вход после опечаток: %d, хочу 200", rec.Code)
+		t.Fatalf("a successful login after typos: %d, want 200", rec.Code)
 	}
 	for i := 0; i < 4; i++ {
 		if rec := doReq(h, http.MethodGet, "/", ip, bad); rec.Code != http.StatusUnauthorized {
-			t.Fatalf("неудача после сброса %d: %d, хочу 401 (окно началось заново)", i+1, rec.Code)
+			t.Fatalf("a failure after the reset %d: %d, want 401 (the window started anew)", i+1, rec.Code)
 		}
 	}
 }
@@ -562,15 +562,15 @@ func TestBruteForceConcurrentBatch(t *testing.T) {
 		case http.StatusTooManyRequests:
 			limited++
 		default:
-			t.Fatalf("параллельная пачка: неожиданный статус %d (хочу 401 или 429)", c)
+			t.Fatalf("a concurrent batch: an unexpected status %d (want 401 or 429)", c)
 		}
 	}
 	if unauthorized != maxLoginFailures || limited != n-maxLoginFailures {
-		t.Errorf("параллельная пачка %d: 401=%d, 429=%d, хочу %d и %d — слоты достаются ровно %d попыткам",
+		t.Errorf("a concurrent batch %d: 401=%d, 429=%d, want %d and %d — the slots go to exactly %d attempts",
 			n, unauthorized, limited, maxLoginFailures, n-maxLoginFailures, maxLoginFailures)
 	}
 	if calls := verifier.calls.Load(); calls > maxLoginFailures {
-		t.Errorf("Verify вызван %d раз при параллельной пачке %d, хочу ≤%d (KDF за лимитом не выполняется)",
+		t.Errorf("Verify called %d times in a concurrent batch of %d, want ≤%d (the KDF does not run beyond the limit)",
 			calls, n, maxLoginFailures)
 	}
 }
@@ -612,17 +612,17 @@ func TestBruteForceConcurrentSuccessBatch(t *testing.T) {
 		case http.StatusTooManyRequests:
 			limited++
 		default:
-			t.Fatalf("параллельные валидные попытки: неожиданный статус %d", c)
+			t.Fatalf("concurrent valid attempts: an unexpected status %d", c)
 		}
 	}
 	if passed != maxLoginFailures || limited != 1 {
-		t.Errorf("параллельные валидные %d: 200=%d, 429=%d, хочу %d и 1 (потолок одновременных сверок)",
+		t.Errorf("concurrent valid %d: 200=%d, 429=%d, want %d and 1 (the ceiling on concurrent verifications)",
 			n, passed, limited, maxLoginFailures)
 	}
 	// Successes charge the slots by resetting the window — the next
 	// attempt is free.
 	if rec := doReq(h, http.MethodGet, "/", "10.0.0.15:1515", authHeader); rec.Code != http.StatusOK {
-		t.Errorf("вход после пачки успехов: %d, хочу 200 (окно не заполнено успехами)", rec.Code)
+		t.Errorf("a login after the burst of successes: %d, want 200 (the window is not filled with successes)", rec.Code)
 	}
 }
 
@@ -644,24 +644,24 @@ func TestBruteForcePartialWindowExpiry(t *testing.T) {
 
 	// One failure: the window started but is not full.
 	if rec := doReq(h, http.MethodGet, "/", ip, bad); rec.Code != http.StatusUnauthorized {
-		t.Fatalf("одиночная неудача: %d, хочу 401", rec.Code)
+		t.Fatalf("a single failure: %d, want 401", rec.Code)
 	}
 	// A pause longer than the window: the next minute starts with a
 	// clean counter.
 	clock.now = clock.now.Add(loginWindow + time.Second)
 	for i := 0; i < maxLoginFailures; i++ {
 		if rec := doReq(h, http.MethodGet, "/", ip, bad); rec.Code != http.StatusUnauthorized {
-			t.Fatalf("неудача нового окна %d: %d, хочу 401 (хвост старого окна не переносится)", i+1, rec.Code)
+			t.Fatalf("a new-window failure %d: %d, want 401 (the old window tail is not carried over)", i+1, rec.Code)
 		}
 	}
 	if calls := verifier.calls.Load(); calls != maxLoginFailures+1 {
-		t.Fatalf("Verify: %d вызовов, хочу %d (одна + новое окно без хвоста)", calls, maxLoginFailures+1)
+		t.Fatalf("Verify: %d calls, want %d (one + the new window without the tail)", calls, maxLoginFailures+1)
 	}
 	if rec := doReq(h, http.MethodGet, "/", ip, bad); rec.Code != http.StatusTooManyRequests {
-		t.Fatalf("попытка сверх нового окна: %d, хочу 429", rec.Code)
+		t.Fatalf("an attempt beyond the new window: %d, want 429", rec.Code)
 	}
 	if calls := verifier.calls.Load(); calls != maxLoginFailures+1 {
-		t.Errorf("429 потратил сверку: Verify %d, хочу прежние %d", calls, maxLoginFailures+1)
+		t.Errorf("the 429 spent a verification: Verify %d, want the previous %d", calls, maxLoginFailures+1)
 	}
 }
 
@@ -683,22 +683,22 @@ func TestBruteForceVerifyBudget(t *testing.T) {
 	// Five sequential failures — a verification each, the window full.
 	for i := 0; i < maxLoginFailures; i++ {
 		if rec := doReq(h, http.MethodGet, "/", ip, bad); rec.Code != http.StatusUnauthorized {
-			t.Fatalf("неудача %d: %d", i+1, rec.Code)
+			t.Fatalf("failure %d: %d", i+1, rec.Code)
 		}
 	}
 	if calls := verifier.calls.Load(); calls != maxLoginFailures {
-		t.Fatalf("после %d неудач Verify вызван %d раз, хочу %d", maxLoginFailures, calls, maxLoginFailures)
+		t.Fatalf("after %d failures Verify was called %d times, want %d", maxLoginFailures, calls, maxLoginFailures)
 	}
 
 	// The sixth (wrong and correct credentials) — 429 without a
 	// verification.
 	for i, header := range []map[string]string{bad, authed()} {
 		if rec := doReq(h, http.MethodGet, "/", ip, header); rec.Code != http.StatusTooManyRequests {
-			t.Errorf("попытка %d с заполненным окном: %d, хочу 429", i+1, rec.Code)
+			t.Errorf("attempt %d with a full window: %d, want 429", i+1, rec.Code)
 		}
 	}
 	if calls := verifier.calls.Load(); calls != maxLoginFailures {
-		t.Errorf("429 потратил сверку: Verify %d раз, хочу прежние %d", calls, maxLoginFailures)
+		t.Errorf("the 429 spent a verification: Verify %d times, want the previous %d", calls, maxLoginFailures)
 	}
 
 	// The window expired — a successful login resets it, the next
@@ -707,14 +707,14 @@ func TestBruteForceVerifyBudget(t *testing.T) {
 	clock.now = clock.now.Add(loginWindow + time.Second)
 	verifier.verdict = true
 	if rec := doReq(h, http.MethodGet, "/", ip, authed()); rec.Code != http.StatusOK {
-		t.Fatalf("вход после истечения окна: %d, хочу 200", rec.Code)
+		t.Fatalf("a login after the window expiry: %d, want 200", rec.Code)
 	}
 	verifier.verdict = false
 	if rec := doReq(h, http.MethodGet, "/", ip, bad); rec.Code != http.StatusUnauthorized {
-		t.Fatalf("неудача после успешного входа: %d, хочу 401 (окно сброшено)", rec.Code)
+		t.Fatalf("a failure after a successful login: %d, want 401 (the window was reset)", rec.Code)
 	}
 	if calls := verifier.calls.Load(); calls != maxLoginFailures+2 {
-		t.Errorf("Verify после сброса окна: %d вызовов, хочу %d (вход + неудача)", calls, maxLoginFailures+2)
+		t.Errorf("Verify after the window reset: %d calls, want %d (a login + a failure)", calls, maxLoginFailures+2)
 	}
 }
 
@@ -730,32 +730,32 @@ func TestRoutes(t *testing.T) {
 
 	rec := doReq(h, http.MethodGet, "/", "10.0.0.9:9999", authed())
 	if rec.Code != http.StatusOK {
-		t.Errorf("GET / = %d, хочу 200 (страница T-130)", rec.Code)
+		t.Errorf("GET / = %d, want 200 (the T-130 page)", rec.Code)
 	}
 	body := rec.Body.String()
-	if !strings.Contains(body, "Дашборд Domain Crawler") {
-		t.Errorf("GET /: не страница дашборда:\n%s", body)
+	if !strings.Contains(body, "Domain Crawler Dashboard") {
+		t.Errorf("GET /: not a dashboard page:\n%s", body)
 	}
 	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "text/html") {
-		t.Errorf("GET /: Content-Type = %q, хочу text/html", ct)
+		t.Errorf("GET /: Content-Type = %q, want text/html", ct)
 	}
 
 	rec = doReq(h, http.MethodGet, "/api/status", "10.0.0.9:9999", authed())
 	if rec.Code != http.StatusServiceUnavailable {
-		t.Errorf("GET /api/status = %d, хочу 503 (снимок ещё не собран, §5.9)", rec.Code)
+		t.Errorf("GET /api/status = %d, want 503 (the snapshot is not collected yet, §5.9)", rec.Code)
 	}
 	if cc := rec.Header().Get("Cache-Control"); cc != "no-store" {
-		t.Errorf("Cache-Control = %q, хочу no-store (§6.2)", cc)
+		t.Errorf("Cache-Control = %q, want no-store (§6.2)", cc)
 	}
 	if !strings.Contains(rec.Body.String(), "snapshot_not_ready") {
-		t.Errorf("тело /api/status без JSON-ошибки: %s", rec.Body.String())
+		t.Errorf("the /api/status body without a JSON error: %s", rec.Body.String())
 	}
 
 	if rec = doReq(h, http.MethodGet, "/assets/app.css", "10.0.0.9:9999", authed()); rec.Code != http.StatusNotFound {
-		t.Errorf("GET /assets/app.css = %d, хочу 404 (файла в embed нет)", rec.Code)
+		t.Errorf("GET /assets/app.css = %d, want 404 (the file is not in embed)", rec.Code)
 	}
 	if rec = doReq(h, http.MethodGet, "/nope", "10.0.0.9:9999", authed()); rec.Code != http.StatusNotFound {
-		t.Errorf("GET /nope = %d, хочу 404", rec.Code)
+		t.Errorf("GET /nope = %d, want 404", rec.Code)
 	}
 }
 
@@ -772,12 +772,12 @@ func TestMethodNotAllowed(t *testing.T) {
 	} {
 		rec := doReq(h, tc.method, tc.path, "10.0.0.10:1010", authed())
 		if rec.Code != http.StatusMethodNotAllowed {
-			t.Errorf("%s %s = %d, хочу 405", tc.method, tc.path, rec.Code)
+			t.Errorf("%s %s = %d, want 405", tc.method, tc.path, rec.Code)
 		}
 	}
 	// HEAD is served as GET (the server suppresses the body).
 	if rec := doReq(h, http.MethodHead, "/", "10.0.0.10:1010", authed()); rec.Code != http.StatusOK {
-		t.Errorf("HEAD / = %d, хочу 200", rec.Code)
+		t.Errorf("HEAD / = %d, want 200", rec.Code)
 	}
 }
 
@@ -794,16 +794,16 @@ func TestSecurityHeaders(t *testing.T) {
 		{"livez", http.MethodGet, "/livez", nil},
 		{"healthz", http.MethodGet, "/healthz", nil},
 		{"robots", http.MethodGet, "/robots.txt", nil},
-		{"страница", http.MethodGet, "/", authed()},
-		{"статика", http.MethodGet, "/assets/style.css", authed()},
-		{"без кредов", http.MethodGet, "/", nil},
+		{"the page", http.MethodGet, "/", authed()},
+		{"the statics", http.MethodGet, "/assets/style.css", authed()},
+		{"without credentials", http.MethodGet, "/", nil},
 	} {
 		rec := doReq(h, tc.method, tc.path, "10.0.0.11:1111", tc.header)
 		if got := rec.Header().Get("X-Content-Type-Options"); got != "nosniff" {
-			t.Errorf("%s: X-Content-Type-Options = %q, хочу nosniff", tc.name, got)
+			t.Errorf("%s: X-Content-Type-Options = %q, want nosniff", tc.name, got)
 		}
 		if got := rec.Header().Get("Content-Security-Policy"); got != contentSecurityPolicy {
-			t.Errorf("%s: CSP = %q, хочу %q", tc.name, got, contentSecurityPolicy)
+			t.Errorf("%s: CSP = %q, want %q", tc.name, got, contentSecurityPolicy)
 		}
 	}
 }
@@ -819,29 +819,29 @@ func TestServiceRoutes(t *testing.T) {
 
 	rec := doReq(h, http.MethodGet, "/healthz", "10.0.0.12:1212", nil)
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "ok") {
-		t.Errorf("healthz = %d %q, хочу 200 ok", rec.Code, rec.Body.String())
+		t.Errorf("healthz = %d %q, want 200 ok", rec.Code, rec.Body.String())
 	}
 	if ct := rec.Header().Get("Content-Type"); ct != "text/plain; charset=utf-8" {
-		t.Errorf("healthz: Content-Type = %q, хочу text/plain; charset=utf-8", ct)
+		t.Errorf("healthz: Content-Type = %q, want text/plain; charset=utf-8", ct)
 	}
 
 	rec = doReq(h, http.MethodGet, "/livez", "10.0.0.12:1212", nil)
 	if rec.Code != http.StatusOK || rec.Body.String() != "ok" {
-		t.Errorf("livez = %d %q, хочу 200 с телом ok", rec.Code, rec.Body.String())
+		t.Errorf("livez = %d %q, want 200 with an ok body", rec.Code, rec.Body.String())
 	}
 	if ct := rec.Header().Get("Content-Type"); ct != "text/plain; charset=utf-8" {
-		t.Errorf("livez: Content-Type = %q, хочу text/plain; charset=utf-8", ct)
+		t.Errorf("livez: Content-Type = %q, want text/plain; charset=utf-8", ct)
 	}
 
 	rec = doReq(h, http.MethodGet, "/robots.txt", "10.0.0.12:1212", nil)
 	if rec.Code != http.StatusOK {
-		t.Fatalf("robots.txt = %d, хочу 200", rec.Code)
+		t.Fatalf("robots.txt = %d, want 200", rec.Code)
 	}
 	if body := rec.Body.String(); !strings.Contains(body, "User-agent: *") || !strings.Contains(body, "Disallow: /") {
-		t.Errorf("robots.txt без полного disallow:\n%s", body)
+		t.Errorf("robots.txt without the full disallow:\n%s", body)
 	}
 	if ct := rec.Header().Get("Content-Type"); ct != "text/plain; charset=utf-8" {
-		t.Errorf("robots.txt: Content-Type = %q, хочу text/plain; charset=utf-8", ct)
+		t.Errorf("robots.txt: Content-Type = %q, want text/plain; charset=utf-8", ct)
 	}
 
 	// healthz with the DB unavailable — 503.
@@ -853,7 +853,7 @@ func TestServiceRoutes(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 	if rec = doReq(srv.Handler(), http.MethodGet, "/healthz", "10.0.0.12:1213", nil); rec.Code != http.StatusServiceUnavailable {
-		t.Errorf("healthz при сбое БД = %d, хочу 503", rec.Code)
+		t.Errorf("healthz on a DB failure = %d, want 503", rec.Code)
 	}
 }
 
@@ -868,11 +868,11 @@ func TestClientIP(t *testing.T) {
 		realIP     string
 		want       string
 	}{
-		{"loopback + валидный X-Real-IP", "127.0.0.1:40000", "203.0.113.7", "203.0.113.7"},
-		{"loopback + мусор в заголовке", "127.0.0.1:40000", "не-ip", "127.0.0.1"},
-		{"loopback + пустой заголовок", "127.0.0.1:40000", "", "127.0.0.1"},
-		{"не-loopback + заголовок игнорируется", "203.0.113.9:40000", "198.51.100.1", "203.0.113.9"},
-		{"прямой адрес без порта", "192.0.2.10", "", "192.0.2.10"},
+		{"loopback + a valid X-Real-IP", "127.0.0.1:40000", "203.0.113.7", "203.0.113.7"},
+		{"loopback + junk in the header", "127.0.0.1:40000", "not-an-ip", "127.0.0.1"},
+		{"loopback + an empty header", "127.0.0.1:40000", "", "127.0.0.1"},
+		{"not loopback + the header ignored", "203.0.113.9:40000", "198.51.100.1", "203.0.113.9"},
+		{"a direct address without a port", "192.0.2.10", "", "192.0.2.10"},
 	} {
 		r := httptest.NewRequest(http.MethodGet, "/", nil)
 		r.RemoteAddr = tc.remoteAddr
@@ -880,7 +880,7 @@ func TestClientIP(t *testing.T) {
 			r.Header.Set("X-Real-IP", tc.realIP)
 		}
 		if got := clientIP(r); got != tc.want {
-			t.Errorf("%s: clientIP = %q, хочу %q", tc.name, got, tc.want)
+			t.Errorf("%s: clientIP = %q, want %q", tc.name, got, tc.want)
 		}
 	}
 }
@@ -921,7 +921,7 @@ func TestRunGracefulStop(t *testing.T) {
 		}
 		if time.Now().After(deadline) {
 			cancel()
-			t.Fatal("сервер не поднялся за 2 с")
+			t.Fatal("the server did not start within 2 s")
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -931,18 +931,18 @@ func TestRunGracefulStop(t *testing.T) {
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Fatalf("Run после отмены: %v, хочу nil", err)
+			t.Fatalf("Run after the cancellation: %v, want nil", err)
 		}
 	case <-time.After(3 * time.Second):
-		t.Fatal("сервер не остановился после отмены ctx")
+		t.Fatal("the server did not stop after the ctx cancellation")
 	}
-	if s := logs.String(); !strings.Contains(s, "публичный сервис дашборда запущен") || !strings.Contains(s, addr) {
-		t.Errorf("лог запуска без слушателя %s:\n%s", addr, s)
+	if s := logs.String(); !strings.Contains(s, "the public dashboard service started") || !strings.Contains(s, addr) {
+		t.Errorf("the startup log without the listener %s:\n%s", addr, s)
 	}
 	gDeadline := time.Now().Add(2 * time.Second)
 	for runtime.NumGoroutine() > base {
 		if time.Now().After(gDeadline) {
-			t.Errorf("горутины Run не завершились после остановки: база %d, сейчас %d (ёмкость done=0 оставила бы Serve висеть)", base, runtime.NumGoroutine())
+			t.Errorf("the Run goroutines did not finish after the stop: baseline %d, now %d (a done capacity of 0 would leave Serve hanging)", base, runtime.NumGoroutine())
 			break
 		}
 		time.Sleep(2 * time.Millisecond)
@@ -956,9 +956,9 @@ func TestRunListenError(t *testing.T) {
 	srv := newTestServer(t, nil)
 	err := srv.Run(context.Background(), "127.0.0.1:99999")
 	if err == nil {
-		t.Fatal("Run(порт 99999) = nil, хочу ошибку слушателя")
+		t.Fatal("Run(port 99999) = nil, want a listener error")
 	}
-	if !strings.Contains(err.Error(), "слушатель") || !strings.Contains(err.Error(), "127.0.0.1:99999") {
-		t.Errorf("ошибка без адреса слушателя: %v", err)
+	if !strings.Contains(err.Error(), "listener") || !strings.Contains(err.Error(), "127.0.0.1:99999") {
+		t.Errorf("the error without the listener address: %v", err)
 	}
 }

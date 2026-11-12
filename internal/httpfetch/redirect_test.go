@@ -53,7 +53,7 @@ func (r *redirectResolverStub) calls() []string {
 // redirectResolverFail is a resolver whose invocation means a test error:
 // paths without resolving (the DNS stage addresses) must not call it.
 var redirectResolverFail = ResolverFunc(func(ctx context.Context, host string) ([]netip.Addr, error) {
-	return nil, fmt.Errorf("неожидаемый резолв %q", host)
+	return nil, fmt.Errorf("an unexpected resolve %q", host)
 })
 
 // redirectReqURL is the test server URL with a swapped host and a path.
@@ -75,7 +75,7 @@ func redirectReadBody(t *testing.T, res *ChainResult) string {
 	b, err := io.ReadAll(res.Result.Body)
 	_ = res.Result.Body.Close()
 	if err != nil {
-		t.Fatalf("чтение итогового тела: %v", err)
+		t.Fatalf("reading the final body: %v", err)
 	}
 	return string(b)
 }
@@ -109,14 +109,14 @@ func TestFetchChainThreeSteps(t *testing.T) {
 		t.Fatalf("FetchChain: %v", err)
 	}
 	if got.Result.StatusCode != http.StatusOK {
-		t.Errorf("итоговый статус: %d, ожидался 200", got.Result.StatusCode)
+		t.Errorf("final status: %d, 200 expected", got.Result.StatusCode)
 	}
 	if body := redirectReadBody(t, got); body != "FINAL" {
-		t.Errorf("итоговое тело: %q", body)
+		t.Errorf("final body: %q", body)
 	}
 	final := redirectTestURL(srv.URL, "chain.example.net", "/two")
 	if got.Result.FinalURL.String() != final {
-		t.Errorf("итоговый URL: %s, ожидался %s", got.Result.FinalURL, final)
+		t.Errorf("final URL: %s, expected %s", got.Result.FinalURL, final)
 	}
 	want := []RedirectStep{
 		{URL: redirectTestURL(srv.URL, "chain.example.net", "/"), Status: 301},
@@ -124,7 +124,7 @@ func TestFetchChainThreeSteps(t *testing.T) {
 		{URL: final, Status: 200},
 	}
 	if !reflect.DeepEqual(got.Chain, want) {
-		t.Errorf("цепочка: %+v, ожидалась %+v", got.Chain, want)
+		t.Errorf("chain: %+v, %+v expected", got.Chain, want)
 	}
 }
 
@@ -153,18 +153,18 @@ func TestFetchChainRedirectCodes(t *testing.T) {
 				t.Fatalf("FetchChain: %v", err)
 			}
 			if got.Result.StatusCode != http.StatusOK {
-				t.Errorf("итоговый статус: %d, ожидался 200", got.Result.StatusCode)
+				t.Errorf("final status: %d, 200 expected", got.Result.StatusCode)
 			}
 			if method.Load() != http.MethodGet {
-				t.Errorf("метод запроса после %d: %q, ожидался GET", code, method.Load())
+				t.Errorf("the request method after %d: %q, GET expected", code, method.Load())
 			}
 			if len(got.Chain) != 2 {
-				t.Errorf("цепочка: %+v, ожидались 2 шага", got.Chain)
+				t.Errorf("chain: %+v, 2 steps expected", got.Chain)
 			}
 		})
 	}
 
-	t.Run("300-не-переход", func(t *testing.T) {
+	t.Run("300-not-a-hop", func(t *testing.T) {
 		var lands atomic.Int32
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path == "/start" {
@@ -184,13 +184,13 @@ func TestFetchChainRedirectCodes(t *testing.T) {
 			t.Fatalf("FetchChain: %v", err)
 		}
 		if got.Result.StatusCode != http.StatusMultipleChoices {
-			t.Errorf("итоговый статус: %d, ожидался 300", got.Result.StatusCode)
+			t.Errorf("final status: %d, 300 expected", got.Result.StatusCode)
 		}
 		if n := lands.Load(); n != 0 {
-			t.Errorf("за 300 прослежено %d переходов", n)
+			t.Errorf("%d hops followed at 300", n)
 		}
 		if len(got.Chain) != 1 {
-			t.Errorf("цепочка: %+v, ожидался 1 шаг", got.Chain)
+			t.Errorf("chain: %+v, 1 step expected", got.Chain)
 		}
 	})
 }
@@ -205,8 +205,8 @@ func TestFetchChainRelativeLocation(t *testing.T) {
 		location string // {port} — the test server's port
 		wantPath string
 	}{
-		{"абсолютный-путь", "/dir/page", "/land", "/land"},
-		{"относительный-путь", "/dir/page", "sub/land", "/dir/sub/land"},
+		{"absolute-path", "/dir/page", "/land", "/land"},
+		{"relative-path", "/dir/page", "sub/land", "/dir/sub/land"},
 		// Protocol-relative inherits only the scheme — the port must be in
 		// the Location itself, otherwise the hop would go to the standard
 		// :80.
@@ -234,10 +234,10 @@ func TestFetchChainRelativeLocation(t *testing.T) {
 			}
 			want := redirectReqURL(srv.URL, "rel.example.net", c.wantPath)
 			if got.Result.FinalURL.String() != want.String() {
-				t.Errorf("итоговый URL: %s, ожидался %s", got.Result.FinalURL, want)
+				t.Errorf("final URL: %s, expected %s", got.Result.FinalURL, want)
 			}
 			if body := redirectReadBody(t, got); body != "OK "+c.wantPath {
-				t.Errorf("итоговое тело: %q", body)
+				t.Errorf("final body: %q", body)
 			}
 		})
 	}
@@ -261,13 +261,13 @@ func TestFetchChainLoop(t *testing.T) {
 	got, err := FetchChain(context.Background(), f, FetchRequest{
 		URL: redirectReqURL(srv.URL, "loop.example.net", "/a"), Addrs: loopbackAddr()})
 	if !errors.Is(err, ErrTooManyRedirects) {
-		t.Fatalf("ожидался ErrTooManyRedirects, получено: %v", err)
+		t.Fatalf("ErrTooManyRedirects expected, got: %v", err)
 	}
 	if got.Result != nil {
-		t.Error("при цикле итогового ответа нет")
+		t.Error("no final response on a cycle")
 	}
 	if len(got.Chain) != 2 {
-		t.Errorf("цепочка: %+v, ожидались 2 шага", got.Chain)
+		t.Errorf("chain: %+v, 2 steps expected", got.Chain)
 	}
 }
 
@@ -284,10 +284,10 @@ func TestFetchChainSelfRedirect(t *testing.T) {
 	got, err := FetchChain(context.Background(), f, FetchRequest{
 		URL: redirectReqURL(srv.URL, "self.example.net", "/self"), Addrs: loopbackAddr()})
 	if !errors.Is(err, ErrTooManyRedirects) {
-		t.Fatalf("ожидался ErrTooManyRedirects, получено: %v", err)
+		t.Fatalf("ErrTooManyRedirects expected, got: %v", err)
 	}
 	if len(got.Chain) != 1 {
-		t.Errorf("цепочка: %+v, ожидался 1 шаг", got.Chain)
+		t.Errorf("chain: %+v, 1 step expected", got.Chain)
 	}
 }
 
@@ -295,7 +295,7 @@ func TestFetchChainSelfRedirect(t *testing.T) {
 // exact repetition of a URL with the query is a cycle, unique queries are
 // not (counter redirects are legitimate).
 func TestFetchChainQueryInCycleKey(t *testing.T) {
-	t.Run("повтор-query-цикл", func(t *testing.T) {
+	t.Run("repeated-query-cycle", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			switch r.URL.Query().Get("i") {
 			case "1", "2":
@@ -310,14 +310,14 @@ func TestFetchChainQueryInCycleKey(t *testing.T) {
 		start.RawQuery = "i=1"
 		got, err := FetchChain(context.Background(), f, FetchRequest{URL: start, Addrs: loopbackAddr()})
 		if !errors.Is(err, ErrTooManyRedirects) {
-			t.Fatalf("ожидался ErrTooManyRedirects, получено: %v", err)
+			t.Fatalf("ErrTooManyRedirects expected, got: %v", err)
 		}
 		if len(got.Chain) != 2 {
-			t.Errorf("цепочка: %+v, ожидались 2 шага", got.Chain)
+			t.Errorf("chain: %+v, 2 steps expected", got.Chain)
 		}
 	})
 
-	t.Run("уникальные-query-не-цикл", func(t *testing.T) {
+	t.Run("unique-queries-not-a-cycle", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if i := r.URL.Query().Get("i"); i == "1" || i == "2" {
 				w.Header().Set("Location", "/u?i=3")
@@ -336,10 +336,10 @@ func TestFetchChainQueryInCycleKey(t *testing.T) {
 			t.Fatalf("FetchChain: %v", err)
 		}
 		if got.Result.StatusCode != http.StatusOK {
-			t.Errorf("итоговый статус: %d, ожидался 200", got.Result.StatusCode)
+			t.Errorf("final status: %d, 200 expected", got.Result.StatusCode)
 		}
 		if len(got.Chain) != 2 {
-			t.Errorf("цепочка: %+v, ожидались 2 шага", got.Chain)
+			t.Errorf("chain: %+v, 2 steps expected", got.Chain)
 		}
 	})
 }
@@ -361,16 +361,16 @@ func TestFetchChainLimitExceeded(t *testing.T) {
 		URL: redirectReqURL(srv.URL, "limit.example.net", "/inf"), Addrs: loopbackAddr(),
 	}, ChainOptions{MaxRedirects: 3})
 	if !errors.Is(err, ErrTooManyRedirects) {
-		t.Fatalf("ожидался ErrTooManyRedirects, получено: %v", err)
+		t.Fatalf("ErrTooManyRedirects expected, got: %v", err)
 	}
 	if got.Result != nil {
-		t.Error("при превышении лимита итогового ответа нет")
+		t.Error("no final response when the limit is exceeded")
 	}
 	if len(got.Chain) != 4 {
-		t.Errorf("цепочка: %+v, ожидались 4 шага (1 стартовый + 3 перехода)", got.Chain)
+		t.Errorf("chain: %+v, 4 steps expected (1 start + 3 hops)", got.Chain)
 	}
 	if n := hits.Load(); n != 4 {
-		t.Errorf("запросов к серверу: %d, ожидалось 4", n)
+		t.Errorf("requests to the server: %d, 4 expected", n)
 	}
 }
 
@@ -389,13 +389,13 @@ func TestFetchChainDefaultLimit(t *testing.T) {
 	got, err := FetchChain(context.Background(), f, FetchRequest{
 		URL: redirectReqURL(srv.URL, "def.example.net", "/inf"), Addrs: loopbackAddr()})
 	if !errors.Is(err, ErrTooManyRedirects) {
-		t.Fatalf("ожидался ErrTooManyRedirects, получено: %v", err)
+		t.Fatalf("ErrTooManyRedirects expected, got: %v", err)
 	}
 	if n := hits.Load(); n != 1+DefaultMaxRedirects {
-		t.Errorf("запросов к серверу: %d, ожидалось %d (1 стартовый + %d переходов)", n, 1+DefaultMaxRedirects, DefaultMaxRedirects)
+		t.Errorf("requests to the server: %d, %d expected (1 start + %d hops)", n, 1+DefaultMaxRedirects, DefaultMaxRedirects)
 	}
 	if len(got.Chain) != 1+DefaultMaxRedirects {
-		t.Errorf("цепочка: %d шагов, ожидалось %d", len(got.Chain), 1+DefaultMaxRedirects)
+		t.Errorf("chain: %d steps, %d expected", len(got.Chain), 1+DefaultMaxRedirects)
 	}
 }
 
@@ -424,13 +424,13 @@ func TestFetchChainZeroLimit(t *testing.T) {
 			t.Fatalf("MaxRedirects %d: %v", max, err)
 		}
 		if got.Result.StatusCode != http.StatusFound {
-			t.Errorf("MaxRedirects %d: итоговый статус %d, ожидался 302", max, got.Result.StatusCode)
+			t.Errorf("MaxRedirects %d: final status %d, 302 expected", max, got.Result.StatusCode)
 		}
 		if len(got.Chain) != 1 {
-			t.Errorf("MaxRedirects %d: цепочка %+v, ожидался 1 шаг", max, got.Chain)
+			t.Errorf("MaxRedirects %d: chain %+v, 1 step expected", max, got.Chain)
 		}
 		if n := lands.Load(); n != 0 {
-			t.Errorf("MaxRedirects %d: выполнено переходов %d", max, n)
+			t.Errorf("MaxRedirects %d: hops performed %d", max, n)
 		}
 	}
 }
@@ -454,7 +454,7 @@ func TestFetchChainZeroLimitNoMetaScan(t *testing.T) {
 	}
 	defer func() { _ = got.Result.Body.Close() }()
 	if _, wrapped := got.Result.Body.(*redirectBody); wrapped {
-		t.Error("при max_redirects=0 тело не должно сканироваться на meta refresh")
+		t.Error("at max_redirects=0 the body must not be scanned for meta refresh")
 	}
 }
 
@@ -469,21 +469,21 @@ func TestFetchChainMetaRefresh(t *testing.T) {
 		meta   string
 		follow bool
 	}{
-		{"обычный", `<meta http-equiv="refresh" content="3; url=/after">`, true},
-		{"нулевая-задержка", `<meta http-equiv="refresh" content="0;url=/after">`, true},
-		{"регистр-и-пробелы", `<META HTTP-EQUIV="Refresh" CONTENT=" 7 ;  URL  =  /after  ">`, true},
-		{"кавычки-вокруг-url", `<meta http-equiv="refresh" content="0; url='/after'">`, true},
-		{"одинарные-атрибуты", `<meta http-equiv='refresh' content='0; url=/after'>`, true},
-		{"самозакрытый", `<meta http-equiv="refresh" content="0; url=/after" />`, true},
-		{"content-первым", `<meta content="0; url=/after" http-equiv="refresh">`, true},
-		{"без-url", `<meta http-equiv="refresh" content="10">`, false},
-		{"пустой-url", `<meta http-equiv="refresh" content="0; url=">`, false},
-		{"битое-число", `<meta http-equiv="refresh" content="soon; url=/after">`, false},
-		{"без-числа", `<meta http-equiv="refresh" content="url=/after">`, false},
-		{"не-url-параметр", `<meta http-equiv="refresh" content="5; href=/after">`, false},
-		{"отрицательное-число", `<meta http-equiv="refresh" content="-1; url=/after">`, false},
-		{"не-refresh", `<meta http-equiv="content-type" content="0; url=/after">`, false},
-		{"metadata-не-мета", `<metadata http-equiv="refresh" content="0; url=/after">`, false},
+		{"ordinary", `<meta http-equiv="refresh" content="3; url=/after">`, true},
+		{"zero-delay", `<meta http-equiv="refresh" content="0;url=/after">`, true},
+		{"case-and-spaces", `<META HTTP-EQUIV="Refresh" CONTENT=" 7 ;  URL  =  /after  ">`, true},
+		{"quotes-around-url", `<meta http-equiv="refresh" content="0; url='/after'">`, true},
+		{"single-quoted-attributes", `<meta http-equiv='refresh' content='0; url=/after'>`, true},
+		{"self-closing", `<meta http-equiv="refresh" content="0; url=/after" />`, true},
+		{"content-first", `<meta content="0; url=/after" http-equiv="refresh">`, true},
+		{"no-url", `<meta http-equiv="refresh" content="10">`, false},
+		{"empty-url", `<meta http-equiv="refresh" content="0; url=">`, false},
+		{"broken-number", `<meta http-equiv="refresh" content="soon; url=/after">`, false},
+		{"no-number", `<meta http-equiv="refresh" content="url=/after">`, false},
+		{"not-a-url-parameter", `<meta http-equiv="refresh" content="5; href=/after">`, false},
+		{"negative-number", `<meta http-equiv="refresh" content="-1; url=/after">`, false},
+		{"not-refresh", `<meta http-equiv="content-type" content="0; url=/after">`, false},
+		{"metadata-not-meta", `<metadata http-equiv="refresh" content="0; url=/after">`, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -506,18 +506,18 @@ func TestFetchChainMetaRefresh(t *testing.T) {
 			if c.follow {
 				body := redirectReadBody(t, got)
 				if got.Result.StatusCode != http.StatusOK || body != "AFTER" {
-					t.Errorf("ожидался переход на /after, итог: %d %q", got.Result.StatusCode, body)
+					t.Errorf("a hop to /after expected, result: %d %q", got.Result.StatusCode, body)
 				}
 				if len(got.Chain) != 2 {
-					t.Errorf("цепочка: %+v, ожидались 2 шага", got.Chain)
+					t.Errorf("chain: %+v, 2 steps expected", got.Chain)
 				}
 				return
 			}
 			if got.Result.StatusCode != http.StatusOK || !strings.Contains(redirectReadBody(t, got), "STAY") {
-				t.Errorf("переход не должен выполняться, итог: %d", got.Result.StatusCode)
+				t.Errorf("the hop must not happen, result: %d", got.Result.StatusCode)
 			}
 			if len(got.Chain) != 1 {
-				t.Errorf("цепочка: %+v, ожидался 1 шаг", got.Chain)
+				t.Errorf("chain: %+v, 1 step expected", got.Chain)
 			}
 		})
 	}
@@ -562,16 +562,16 @@ func TestFetchChainMetaRefreshContentTypes(t *testing.T) {
 			}
 			if c.follow {
 				if body := redirectReadBody(t, got); body != "AFTER" {
-					t.Errorf("Content-Type %q: ожидался переход, итог %q", c.ct, body)
+					t.Errorf("Content-Type %q: a hop expected, result %q", c.ct, body)
 				}
 				return
 			}
 			body := redirectReadBody(t, got)
 			if !strings.Contains(body, meta) {
-				t.Errorf("Content-Type %q: итоговое тело изменено: %q", c.ct, body)
+				t.Errorf("Content-Type %q: the final body changed: %q", c.ct, body)
 			}
 			if len(got.Chain) != 1 {
-				t.Errorf("Content-Type %q: цепочка %+v, ожидался 1 шаг", c.ct, got.Chain)
+				t.Errorf("Content-Type %q: chain %+v, 1 step expected", c.ct, got.Chain)
 			}
 		})
 	}
@@ -591,12 +591,12 @@ func TestRedirectNextNoContentType(t *testing.T) {
 		FinalURL:   base,
 	}
 	if _, follow := redirectNext(res); follow {
-		t.Error("ответ без Content-Type не должен уходить в мета-скан")
+		t.Error("a response without a Content-Type must not go into the meta scan")
 	}
 	got, err := io.ReadAll(res.Body)
 	_ = res.Body.Close()
 	if err != nil || string(got) != html {
-		t.Errorf("тело изменено при пропуске скана: %d байт, err %v", len(got), err)
+		t.Errorf("the body changed on the scan skip: %d bytes, err %v", len(got), err)
 	}
 }
 
@@ -604,7 +604,7 @@ func TestRedirectNextNoContentType(t *testing.T) {
 // a 404 with a meta tag does not hop; for 3xx Location has priority.
 func TestFetchChainMetaRefreshStatuses(t *testing.T) {
 	const meta = `<meta http-equiv="refresh" content="0; url=/after">`
-	t.Run("404-не-сканируется", func(t *testing.T) {
+	t.Run("404-not-scanned", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "text/html")
 			w.WriteHeader(http.StatusNotFound)
@@ -619,14 +619,14 @@ func TestFetchChainMetaRefreshStatuses(t *testing.T) {
 			t.Fatalf("FetchChain: %v", err)
 		}
 		if got.Result.StatusCode != http.StatusNotFound {
-			t.Errorf("итоговый статус: %d, ожидался 404", got.Result.StatusCode)
+			t.Errorf("final status: %d, 404 expected", got.Result.StatusCode)
 		}
 		if len(got.Chain) != 1 {
-			t.Errorf("цепочка: %+v, ожидался 1 шаг", got.Chain)
+			t.Errorf("chain: %+v, 1 step expected", got.Chain)
 		}
 	})
 
-	t.Run("у-3xx-приоритет-location", func(t *testing.T) {
+	t.Run("3xx-location-has-priority", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path == "/page" {
 				w.Header().Set("Location", "/landed")
@@ -644,7 +644,7 @@ func TestFetchChainMetaRefreshStatuses(t *testing.T) {
 			t.Fatalf("FetchChain: %v", err)
 		}
 		if body := redirectReadBody(t, got); body != "BY-LOCATION" {
-			t.Errorf("итоговое тело: %q, ожидался переход по Location", body)
+			t.Errorf("final body: %q, a hop by Location expected", body)
 		}
 	})
 }
@@ -654,7 +654,7 @@ func TestFetchChainMetaRefreshStatuses(t *testing.T) {
 // full (the scan prefix + the rest of the stream).
 func TestFetchChainMetaRefreshBigBody(t *testing.T) {
 	pad := strings.Repeat("<!-- padding-padding-padding -->", 1200) // ~35 KiB
-	t.Run("мета-за-границей-чанка", func(t *testing.T) {
+	t.Run("meta-beyond-the-chunk-boundary", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path == "/after" {
 				_, _ = fmt.Fprint(w, "AFTER")
@@ -672,11 +672,11 @@ func TestFetchChainMetaRefreshBigBody(t *testing.T) {
 			t.Fatalf("FetchChain: %v", err)
 		}
 		if body := redirectReadBody(t, got); body != "AFTER" {
-			t.Errorf("переход за границей чанков не выполнен, итог %q", body)
+			t.Errorf("the hop beyond the chunk boundary did not happen, result %q", body)
 		}
 	})
 
-	t.Run("тело-возвращается-целиком", func(t *testing.T) {
+	t.Run("the-body-comes-back-whole", func(t *testing.T) {
 		want := "<html><head>" + pad + "</head><body>BIG-TAIL</body></html>"
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "text/html")
@@ -691,10 +691,10 @@ func TestFetchChainMetaRefreshBigBody(t *testing.T) {
 			t.Fatalf("FetchChain: %v", err)
 		}
 		if body := redirectReadBody(t, got); body != want {
-			t.Errorf("итоговое тело: %d байт, ожидалось %d (roundtrip нарушен)", len(body), len(want))
+			t.Errorf("final body: %d bytes, %d expected (the roundtrip is broken)", len(body), len(want))
 		}
 		if len(got.Chain) != 1 {
-			t.Errorf("цепочка: %+v, ожидался 1 шаг", got.Chain)
+			t.Errorf("chain: %+v, 1 step expected", got.Chain)
 		}
 	})
 }
@@ -715,10 +715,10 @@ func TestFetchChainMetaRefreshSelfURL(t *testing.T) {
 	got, err := FetchChain(context.Background(), f, FetchRequest{
 		URL: redirectReqURL(srv.URL, "selfmeta.example.net", "/page"), Addrs: loopbackAddr()})
 	if !errors.Is(err, ErrTooManyRedirects) {
-		t.Fatalf("ожидался ErrTooManyRedirects (цикл), получено: %v", err)
+		t.Fatalf("ErrTooManyRedirects (a cycle) expected, got: %v", err)
 	}
 	if len(got.Chain) != 1 {
-		t.Errorf("цепочка: %+v, ожидался 1 шаг", got.Chain)
+		t.Errorf("chain: %+v, 1 step expected", got.Chain)
 	}
 }
 
@@ -744,10 +744,10 @@ func TestFetchChainMetaRefreshUnfollowableURLKeepsBody(t *testing.T) {
 		t.Fatalf("FetchChain: %v", err)
 	}
 	if body := redirectReadBody(t, got); body != want {
-		t.Errorf("итоговое тело: %d байт, ожидалось %d (префикс мета-скана потерян)", len(body), len(want))
+		t.Errorf("final body: %d bytes, %d expected (the meta-scan prefix is lost)", len(body), len(want))
 	}
 	if len(got.Chain) != 1 {
-		t.Errorf("цепочка: %+v, ожидался 1 шаг (перехода нет)", got.Chain)
+		t.Errorf("chain: %+v, 1 step expected (no hop)", got.Chain)
 	}
 }
 
@@ -777,10 +777,10 @@ func TestFetchChainMetaRefreshZeroLimitKeepsBody(t *testing.T) {
 		t.Fatalf("FetchChainOpts: %v", err)
 	}
 	if body := redirectReadBody(t, got); body != want {
-		t.Errorf("итоговое тело: %q, ожидалось исходное (%d байт)", body, len(want))
+		t.Errorf("final body: %q, the original expected (%d bytes)", body, len(want))
 	}
 	if n := lands.Load(); n != 0 {
-		t.Errorf("MaxRedirects 0: выполнено переходов %d", n)
+		t.Errorf("MaxRedirects 0: hops performed %d", n)
 	}
 }
 
@@ -818,17 +818,17 @@ func TestFetchChainUnicodeHostInLocation(t *testing.T) {
 		t.Fatalf("FetchChain: %v", err)
 	}
 	if body := redirectReadBody(t, got); body != "IDN OK" {
-		t.Errorf("итоговое тело: %q", body)
+		t.Errorf("final body: %q", body)
 	}
 	_, srvPort, _ := net.SplitHostPort(strings.TrimPrefix(srv.URL, "http://"))
 	if calls := rs.calls(); len(calls) != 1 || calls[0] != asciiHost {
-		t.Errorf("резолверу передан %v, ожидался punycode %q", calls, asciiHost)
+		t.Errorf("the resolver received %v, the punycode %q expected", calls, asciiHost)
 	}
 	if want := net.JoinHostPort(asciiHost, srvPort); gotHost.Load() != want {
-		t.Errorf("Host итогового запроса: %q, ожидался %q", gotHost.Load(), want)
+		t.Errorf("the final request Host: %q, %q expected", gotHost.Load(), want)
 	}
 	if host := got.Result.FinalURL.Hostname(); host != asciiHost {
-		t.Errorf("итоговый URL-хост: %q, ожидался %q", host, asciiHost)
+		t.Errorf("the final URL host: %q, %q expected", host, asciiHost)
 	}
 }
 
@@ -859,16 +859,16 @@ func TestFetchChainSchemeSwitchHTTPToHTTPS(t *testing.T) {
 		t.Fatalf("FetchChain: %v", err)
 	}
 	if body := redirectReadBody(t, got); body != "secure page" {
-		t.Errorf("итоговое тело: %q", body)
+		t.Errorf("final body: %q", body)
 	}
 	if got.Result.TLS == nil {
-		t.Error("итоговый ответ не по TLS")
+		t.Error("the final response is not over TLS")
 	}
 	if s := got.Result.FinalURL.Scheme; s != "https" {
-		t.Errorf("итоговая схема: %q, ожидался https", s)
+		t.Errorf("the final scheme: %q, https expected", s)
 	}
 	if got.Result.FinalURL.Host != "same.example.net:"+tlsPort {
-		t.Errorf("итоговый хост: %q", got.Result.FinalURL.Host)
+		t.Errorf("the final host: %q", got.Result.FinalURL.Host)
 	}
 }
 
@@ -895,13 +895,13 @@ func TestFetchChainOtherHostResolves(t *testing.T) {
 		t.Fatalf("FetchChain: %v", err)
 	}
 	if body := redirectReadBody(t, got); !strings.HasPrefix(body, "OTHER ") {
-		t.Errorf("итоговое тело: %q", body)
+		t.Errorf("final body: %q", body)
 	}
 	if calls := rs.calls(); len(calls) != 1 || calls[0] != "other.example.net" {
-		t.Errorf("резолвер: %v, ожидался один вызов other.example.net", calls)
+		t.Errorf("the resolver: %v, one call of other.example.net expected", calls)
 	}
 	if host := got.Result.FinalURL.Hostname(); host != "other.example.net" {
-		t.Errorf("итоговый хост: %q", host)
+		t.Errorf("the final host: %q", host)
 	}
 }
 
@@ -913,9 +913,9 @@ func TestFetchChainInvalidLocation(t *testing.T) {
 		name     string
 		location string
 	}{
-		{"битый-url", "http://[::1"},
-		{"чужая-схема", "ftp://example.invalid/x"},
-		{"битый-punycode", "http://xn--.example.net/"},
+		{"broken-url", "http://[::1"},
+		{"a-foreign-scheme", "ftp://example.invalid/x"},
+		{"broken-punycode", "http://xn--.example.net/"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -932,10 +932,10 @@ func TestFetchChainInvalidLocation(t *testing.T) {
 				t.Fatalf("FetchChain: %v", err)
 			}
 			if got.Result.StatusCode != http.StatusFound {
-				t.Errorf("итоговый статус: %d, ожидался 302", got.Result.StatusCode)
+				t.Errorf("final status: %d, 302 expected", got.Result.StatusCode)
 			}
 			if len(got.Chain) != 1 {
-				t.Errorf("цепочка: %+v, ожидался 1 шаг", got.Chain)
+				t.Errorf("chain: %+v, 1 step expected", got.Chain)
 			}
 		})
 	}
@@ -977,16 +977,16 @@ func TestFetchChainContextCancel(t *testing.T) {
 	elapsed := time.Since(start)
 	if err == nil {
 		_ = got.Result.Body.Close()
-		t.Fatal("ожидалась отмена цепочки")
+		t.Fatal("a chain cancellation expected")
 	}
 	if !errors.Is(err, context.Canceled) {
-		t.Errorf("ошибка не пробрасывает context.Canceled: %v", err)
+		t.Errorf("the error does not propagate context.Canceled: %v", err)
 	}
 	if elapsed >= 2*time.Second {
-		t.Errorf("отмена сработала поздно: %s", elapsed)
+		t.Errorf("the cancellation fired late: %s", elapsed)
 	}
 	if len(got.Chain) != 1 {
-		t.Errorf("цепочка: %+v, ожидался 1 шаг до отмены", got.Chain)
+		t.Errorf("chain: %+v, 1 step expected before the cancellation", got.Chain)
 	}
 }
 
@@ -997,7 +997,7 @@ func TestFetchChainContextCancel(t *testing.T) {
 // slow hops are interrupted with a timeout-classified error (temp_error at
 // the consumer, spec 6.2) without holding a worker slot for minutes.
 func TestFetchChainBudget(t *testing.T) {
-	t.Run("молчаливый хоп прерывается бюджетом", func(t *testing.T) {
+	t.Run("a silent hop is interrupted by the budget", func(t *testing.T) {
 		stall := make(chan struct{})
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path == "/start" {
@@ -1029,17 +1029,17 @@ func TestFetchChainBudget(t *testing.T) {
 		}, ChainOptions{MaxRedirects: 3, TotalTimeout: 250 * time.Millisecond})
 		elapsed := time.Since(start)
 		if err == nil || !IsTimeout(err) {
-			t.Fatalf("ожидался таймаут бюджета цепочки, получено: %v", err)
+			t.Fatalf("a chain-budget timeout expected, got: %v", err)
 		}
 		if elapsed >= 2*time.Second {
-			t.Errorf("бюджет сработал поздно: %s", elapsed)
+			t.Errorf("the budget fired late: %s", elapsed)
 		}
 		if len(got.Chain) != 1 {
-			t.Errorf("цепочка: %+v, ожидался 1 шаг до таймаута", got.Chain)
+			t.Errorf("chain: %+v, 1 step expected before the timeout", got.Chain)
 		}
 	})
 
-	t.Run("бюджет копится по хопам", func(t *testing.T) {
+	t.Run("the budget accumulates across hops", func(t *testing.T) {
 		// Each hop fits into its own timeouts (400 ms < 5 s), but three
 		// hops do not fit into the 1 s budget: the third is interrupted
 		// mid-way. The margins are 200 ms in both directions — robust to
@@ -1056,10 +1056,10 @@ func TestFetchChainBudget(t *testing.T) {
 			URL: redirectReqURL(srv.URL, "slowchain.example.net", "/a"), Addrs: loopbackAddr(),
 		}, ChainOptions{MaxRedirects: 3, TotalTimeout: 1 * time.Second})
 		if err == nil || !IsTimeout(err) {
-			t.Fatalf("ожидался таймаут бюджета цепочки, получено: %v", err)
+			t.Fatalf("a chain-budget timeout expected, got: %v", err)
 		}
 		if len(got.Chain) != 2 {
-			t.Errorf("цепочка: %d шагов, ожидались 2 (третий хоп за бюджетом)", len(got.Chain))
+			t.Errorf("chain: %d steps, 2 expected (the third hop is beyond the budget)", len(got.Chain))
 		}
 	})
 }
@@ -1086,11 +1086,11 @@ func TestRedirectResolveIPLiteral(t *testing.T) {
 	for _, c := range cases {
 		u, ok := redirectResolve(base, c.raw)
 		if ok != c.ok {
-			t.Errorf("redirectResolve(%q): ok=%v, ожидалось %v", c.raw, ok, c.ok)
+			t.Errorf("redirectResolve(%q): ok=%v, %v expected", c.raw, ok, c.ok)
 			continue
 		}
 		if ok && u.String() != c.want {
-			t.Errorf("redirectResolve(%q) = %q, ожидалось %q", c.raw, u, c.want)
+			t.Errorf("redirectResolve(%q) = %q, %q expected", c.raw, u, c.want)
 		}
 	}
 }
@@ -1101,7 +1101,7 @@ func TestRedirectResolveIPLiteral(t *testing.T) {
 func TestFetchChainIPv6LiteralLocation(t *testing.T) {
 	ln, err := net.Listen("tcp", "[::1]:0")
 	if err != nil {
-		t.Skipf("IPv6-петля недоступна: %v", err)
+		t.Skipf("the IPv6 loopback is unavailable: %v", err)
 	}
 	srv6 := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = fmt.Fprint(w, "V6-LAND")
@@ -1123,12 +1123,12 @@ func TestFetchChainIPv6LiteralLocation(t *testing.T) {
 		t.Fatalf("FetchChain: %v", err)
 	}
 	if body := redirectReadBody(t, got); body != "V6-LAND" {
-		t.Errorf("итоговое тело: %q, ожидался переход на [::1]", body)
+		t.Errorf("final body: %q, a hop to [::1] expected", body)
 	}
 	if host := got.Result.FinalURL.Hostname(); host != "::1" {
-		t.Errorf("хост итогового URL: %q, ожидался ::1", host)
+		t.Errorf("the final URL host: %q, ::1 expected", host)
 	}
 	if len(got.Chain) != 2 {
-		t.Errorf("цепочка: %+v, ожидались 2 шага", got.Chain)
+		t.Errorf("chain: %+v, 2 steps expected", got.Chain)
 	}
 }

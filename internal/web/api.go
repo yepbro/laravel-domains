@@ -46,7 +46,7 @@ type checkerDB struct{ db DB }
 func (c checkerDB) Ping(ctx context.Context) error { return c.db.Ping(ctx) }
 
 func (c checkerDB) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFromSource) (int64, error) {
-	return 0, errors.New("web: CopyFrom не используется формой")
+	return 0, errors.New("web: CopyFrom is not used by the form")
 }
 
 func (c checkerDB) Exec(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
@@ -54,7 +54,7 @@ func (c checkerDB) Exec(_ context.Context, sql string, _ ...any) (pgconn.Command
 	// not call Exec; the form log is written by its own path (recordCheck)
 	// bypassing the adapter. If checker ever starts writing, the error
 	// will expose it immediately instead of passing silently.
-	return pgconn.CommandTag{}, fmt.Errorf("web: неожидаемый Exec живой проверки: %s", sql)
+	return pgconn.CommandTag{}, fmt.Errorf("web: an unexpected live check Exec: %s", sql)
 }
 
 func (c checkerDB) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
@@ -113,7 +113,7 @@ type signalJSON struct {
 // errLiveOverloaded — the semaphore of concurrent live checks is full
 // (T-220): a fast 503 with Retry-After instead of waiting for a slot up
 // to web.timeout.
-var errLiveOverloaded = errors.New("живая проверка перегружена")
+var errLiveOverloaded = errors.New("the live check is overloaded")
 
 // handleCheckDomainLive — T-123: validation → stored → live (timeout
 // web.timeout, the web.live_concurrency semaphore) → a web_checks
@@ -182,7 +182,7 @@ func (s *Server) handleCheckDomainLive(w http.ResponseWriter, r *http.Request) {
 		}()
 	default:
 		liveErr = errLiveOverloaded
-		s.opt.Log.Warn("форма: живая проверка перегружена", "domain", normalized,
+		s.opt.Log.Warn("form: the live check is overloaded", "domain", normalized,
 			"limit", cap(s.liveSem))
 	}
 
@@ -233,7 +233,7 @@ func (s *Server) handleCheckDomainLive(w http.ResponseWriter, r *http.Request) {
 		if isIP {
 			s.recordCheck(r.Context(), normalized, resp.Found, resp.Score, resp.DurationMS, ip)
 		} else {
-			s.opt.Log.Warn("форма: журнал web_checks пропущен — адрес клиента не IP (пир без валидного заголовка прокси)",
+			s.opt.Log.Warn("form: the web_checks journal entry skipped — the client address is not an IP (a peer without a valid proxy header)",
 				"domain", normalized)
 			s.met.Failure(checkErrNonIP)
 		}
@@ -254,7 +254,7 @@ func (s *Server) handleCheckDomainLive(w http.ResponseWriter, r *http.Request) {
 		s.met.Failure(checkErrLive)
 		if resp.Stored == nil {
 			s.met.Outcome(checkResultFailed)
-			s.opt.Log.Warn("форма: живая проверка не удалась", "domain", normalized, "err", liveErr)
+			s.opt.Log.Warn("form: the live check failed", "domain", normalized, "err", liveErr)
 			checkWriteError(w, "check_failed", http.StatusBadGateway)
 			return
 		}
@@ -274,7 +274,7 @@ func validateCheckInput(input string) (string, error) {
 	s := strings.TrimSpace(input)
 	s = strings.TrimSuffix(s, ".")
 	if s == "" || len(s) > 2048 {
-		return "", fmt.Errorf("пустой или сверхдлинный ввод")
+		return "", fmt.Errorf("an empty or oversized input")
 	}
 	s = strings.ToLower(s)
 	// http(s)://host/… → host (the port is cut off).
@@ -288,11 +288,11 @@ func validateCheckInput(input string) (string, error) {
 		}
 	}
 	if strings.ContainsAny(s, " /\\@:") {
-		return "", fmt.Errorf("мусор в имени")
+		return "", fmt.Errorf("junk in the name")
 	}
 	res, err := idn.Normalize(s)
 	if err != nil {
-		return "", fmt.Errorf("не домен: %w", err)
+		return "", fmt.Errorf("not a domain: %w", err)
 	}
 	return res.ASCII, nil
 }
@@ -354,7 +354,7 @@ func (s *Server) recordCheck(ctx context.Context, punycode string, found bool, s
 		// The domain and the cause — without the visitor address (no
 		// personal data in the log; the address stays only in
 		// web_checks).
-		s.opt.Log.Warn("форма: журнал web_checks не записан", "domain", punycode, "err", err)
+		s.opt.Log.Warn("form: the web_checks journal entry was not written", "domain", punycode, "err", err)
 		s.met.Failure(checkErrJournal)
 	}
 }

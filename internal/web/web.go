@@ -82,7 +82,7 @@ type DB interface {
 var Locales = []string{"ru", "en"}
 
 // DefaultLocale — where GET / redirects to.
-const DefaultLocale = "ru"
+const DefaultLocale = "en"
 
 // Options — the service options.
 type Options struct {
@@ -163,14 +163,14 @@ func (v landingVM) ToJSON(s string) template.HTML {
 // pages.
 func New(db DB, cfg *config.Config, opts Options) (*Server, error) {
 	if db == nil {
-		return nil, errors.New("web: пул БД не задан (postgres.dsn обязателен)")
+		return nil, errors.New("web: the DB pool is not set (postgres.dsn is mandatory)")
 	}
 	if cfg == nil {
-		return nil, errors.New("web: конфигурация не задана")
+		return nil, errors.New("web: the configuration is not set")
 	}
 	tpl, err := template.ParseFS(templates, "templates/landing.html")
 	if err != nil {
-		return nil, fmt.Errorf("web: шаблоны: %w", err)
+		return nil, fmt.Errorf("web: templates: %w", err)
 	}
 	if opts.Log == nil {
 		opts.Log = slog.New(slog.DiscardHandler)
@@ -202,7 +202,7 @@ var newLiveCircuit = func(ctx context.Context, cfg *config.Config, log checker.L
 // errLiveStopped — the live check circuit is closed forever (the Run
 // exit, the service is stopping): requests no longer assemble a new
 // circuit.
-var errLiveStopped = errors.New("живая проверка остановлена: сервис завершается")
+var errLiveStopped = errors.New("the live check is stopped: the service is shutting down")
 
 // liveFunc returns the LiveFunc of the live check: the substituted
 // liveCheck seam (tests) or the Run of the lazily assembled circuit.
@@ -311,12 +311,12 @@ func (s *Server) Run(ctx context.Context, listen string) error {
 		// t.TempDir in tests) — removing someone else's live socket is
 		// not a scenario.
 		if err := os.Remove(listen); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			return fmt.Errorf("web: старый сокет %s: %w", listen, err)
+			return fmt.Errorf("web: a stale socket %s: %w", listen, err)
 		}
 	}
 	ln, err := net.Listen(network, listen)
 	if err != nil {
-		return fmt.Errorf("web: слушатель %s: %w", listen, err)
+		return fmt.Errorf("web: listener %s: %w", listen, err)
 	}
 	if network == "unix" {
 		// A socket file removal error is no reason to fail the Run
@@ -334,12 +334,12 @@ func (s *Server) Run(ctx context.Context, listen string) error {
 		// Serve closes the listener itself; ErrServerClosed — the normal
 		// exit after Shutdown, not an error.
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			done <- fmt.Errorf("web: сервер %s: %w", listen, err)
+			done <- fmt.Errorf("web: server %s: %w", listen, err)
 			return
 		}
 		done <- nil
 	}()
-	s.opt.Log.Info("публичный сервис лендинга запущен", "listen", listen)
+	s.opt.Log.Info("the public landing service started", "listen", listen)
 
 	select {
 	case err := <-done:
@@ -350,7 +350,7 @@ func (s *Server) Run(ctx context.Context, listen string) error {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 		defer cancel()
 		if err := srv.Shutdown(shutdownCtx); err != nil {
-			return fmt.Errorf("web: остановка: %w", err)
+			return fmt.Errorf("web: shutdown: %w", err)
 		}
 		return nil
 	}
@@ -377,7 +377,7 @@ func (s *Server) handleLanding(w http.ResponseWriter, r *http.Request) {
 	}
 	data, err := FetchLandingData(r.Context(), s.db)
 	if err != nil {
-		s.opt.Log.Warn("данные лендинга", "locale", locale, "err", err)
+		s.opt.Log.Warn("landing data", "locale", locale, "err", err)
 		http.Error(w, "temporarily unavailable", http.StatusInternalServerError)
 		return
 	}
@@ -390,7 +390,7 @@ func (s *Server) handleLanding(w http.ResponseWriter, r *http.Request) {
 	}); err != nil {
 		// The header may already be gone — the status cannot be changed;
 		// we log and abort.
-		s.opt.Log.Warn("рендер лендинга", "locale", locale, "err", err)
+		s.opt.Log.Warn("landing render", "locale", locale, "err", err)
 	}
 }
 
@@ -438,7 +438,7 @@ func (s *Server) handleRobots(w http.ResponseWriter, r *http.Request) {
 	b, err := staticFS.ReadFile("static/robots.txt")
 	if err != nil {
 		// embed — the file is in the binary; its absence is a build error.
-		s.opt.Log.Error("robots.txt отсутствует в embed", "err", err)
+		s.opt.Log.Error("robots.txt is missing from embed", "err", err)
 		http.Error(w, "temporarily unavailable", http.StatusInternalServerError)
 		return
 	}

@@ -69,11 +69,11 @@ var _ db.DB = (*snapPool)(nil)
 func (p *snapPool) Ping(context.Context) error { return nil }
 
 func (p *snapPool) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFromSource) (int64, error) {
-	return 0, errors.New("snapPool: CopyFrom не должен вызываться")
+	return 0, errors.New("snapPool: CopyFrom must not be called")
 }
 
 func (p *snapPool) Exec(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
-	return pgconn.CommandTag{}, fmt.Errorf("snapPool: неожидаемый Exec: %s", sql)
+	return pgconn.CommandTag{}, fmt.Errorf("snapPool: an unexpected Exec: %s", sql)
 }
 
 func (p *snapPool) Query(ctx context.Context, sql string, _ ...any) (pgx.Rows, error) {
@@ -153,7 +153,7 @@ func (p *snapPool) Query(ctx context.Context, sql string, _ ...any) (pgx.Rows, e
 		}
 		return snapRowsOf(rows...), nil
 	default:
-		return nil, fmt.Errorf("snapPool: неожидаемый SQL Query: %s", sql)
+		return nil, fmt.Errorf("snapPool: an unexpected SQL Query: %s", sql)
 	}
 }
 
@@ -194,11 +194,11 @@ func (r *snapRows) Next() bool {
 
 func (r *snapRows) Scan(dest ...any) error {
 	if r.i == 0 || r.i > len(r.rows) {
-		return errors.New("snapRows: Scan без Next")
+		return errors.New("snapRows: Scan without Next")
 	}
 	row := r.rows[r.i-1]
 	if len(dest) != len(row) {
-		return fmt.Errorf("snapRows: приёмников %d, колонок %d", len(dest), len(row))
+		return fmt.Errorf("snapRows: dest %d, columns %d", len(dest), len(row))
 	}
 	for i, d := range dest {
 		v := row[i]
@@ -220,29 +220,29 @@ func (r *snapRows) Scan(dest ...any) error {
 		case **string:
 			dst2, ok := v.(*string)
 			if !ok && v != nil {
-				return fmt.Errorf("snapRows: колонка %d: %T — ожидался *string", i, v)
+				return fmt.Errorf("snapRows: column %d: %T — a *string expected", i, v)
 			}
 			*dst = dst2
 		case **int16:
 			dst2, ok := v.(*int16)
 			if !ok && v != nil {
-				return fmt.Errorf("snapRows: колонка %d: %T — ожидался *int16", i, v)
+				return fmt.Errorf("snapRows: column %d: %T — an *int16 expected", i, v)
 			}
 			*dst = dst2
 		case **int64:
 			dst2, ok := v.(*int64)
 			if !ok && v != nil {
-				return fmt.Errorf("snapRows: колонка %d: %T — ожидался *int64", i, v)
+				return fmt.Errorf("snapRows: column %d: %T — an *int64 expected", i, v)
 			}
 			*dst = dst2
 		case **time.Time:
 			dst2, ok := v.(*time.Time)
 			if !ok && v != nil {
-				return fmt.Errorf("snapRows: колонка %d: %T — ожидался *time.Time", i, v)
+				return fmt.Errorf("snapRows: column %d: %T — a *time.Time expected", i, v)
 			}
 			*dst = dst2
 		default:
-			return fmt.Errorf("snapRows: приёмник %T не поддерживается", d)
+			return fmt.Errorf("snapRows: the dest %T is not supported", d)
 		}
 	}
 	return nil
@@ -329,7 +329,7 @@ func TestCollectOnceSections(t *testing.T) {
 		t.Fatal("CollectOnce = nil")
 	}
 	if len(snap.Errors) != 0 {
-		t.Fatalf("errors = %v, хочу пусто", snap.Errors)
+		t.Fatalf("errors = %v, want empty", snap.Errors)
 	}
 	// §5.1–5.4: the common sections.
 	if len(snap.Zones) != 1 || snap.Zones[0].Name != "crawl.test" {
@@ -342,10 +342,10 @@ func TestCollectOnceSections(t *testing.T) {
 		t.Errorf("throughput = %+v", snap.Throughput)
 	}
 	if snap.Rates == nil || snap.Rates.Remaining != 60 || snap.Rates.DomainsPerSec == nil {
-		t.Errorf("rates = %+v, хочу remaining 60 и известную скорость", snap.Rates)
+		t.Errorf("rates = %+v, want remaining 60 and a known rate", snap.Rates)
 	}
 	if len(snap.Queues) != len(status.Streams) {
-		t.Errorf("queues = %v, хочу все %d стримов", snap.Queues, len(status.Streams))
+		t.Errorf("queues = %v, want all %d streams", snap.Queues, len(status.Streams))
 	}
 	// §5.5–5.7.
 	if snap.Statuses["new"] != 58 || snap.Statuses["alive"] != 40 || snap.Statuses["temp_error"] != 0 {
@@ -361,20 +361,20 @@ func TestCollectOnceSections(t *testing.T) {
 	// not a section; the gate not configured — the effective thresholds
 	// of the working streams are 0.
 	if len(snap.QueueWatermarks) != len(status.Streams)-1 {
-		t.Errorf("queue_watermarks = %v, хочу %d рабочих стримов (без q:dead)",
+		t.Errorf("queue_watermarks = %v, want %d working streams (no q:dead)",
 			snap.QueueWatermarks, len(status.Streams)-1)
 	}
 	for s, wm := range snap.QueueWatermarks {
 		if wm != 0 {
-			t.Errorf("queue_watermarks[%s] = %d, хочу 0 (гейт не настроен)", s, wm)
+			t.Errorf("queue_watermarks[%s] = %d, want 0 (the gate is not configured)", s, wm)
 		}
 	}
 	// Probes not configured — the section is "n/a" without an error.
 	if snap.Health != nil {
-		t.Errorf("health = %+v, хочу nil (пробы не заданы)", snap.Health)
+		t.Errorf("health = %+v, want nil (no probes set)", snap.Health)
 	}
 	if snap.BuiltAt != "2026-10-19T12:00:00Z" {
-		t.Errorf("built_at = %q, хочу RFC3339 момента Now", snap.BuiltAt)
+		t.Errorf("built_at = %q, want the RFC3339 of the Now moment", snap.BuiltAt)
 	}
 }
 
@@ -401,23 +401,23 @@ func TestCollectOnceDegradation(t *testing.T) {
 			continue
 		}
 		if _, ok := snap.Errors[section]; !ok {
-			t.Errorf("errors не содержит секцию %q: %v", section, snap.Errors)
+			t.Errorf("errors without the section %q: %v", section, snap.Errors)
 		}
 	}
 	if _, ok := snap.Errors["queues"]; ok {
-		t.Errorf("живой Redis в errors: %v", snap.Errors)
+		t.Errorf("a live Redis in errors: %v", snap.Errors)
 	}
 	if snap.Zones != nil || snap.Totals != nil || snap.Throughput != nil || snap.Rates != nil {
-		t.Error("секции БД не null при отказе пула")
+		t.Error("the DB sections are not null on a pool failure")
 	}
 	if snap.Statuses != nil || snap.Laravel != nil || snap.Ingest != nil {
-		t.Error("секции статусов/laravel/ingest не null при отказе пула")
+		t.Error("the statuses/laravel/ingest sections are not null on a pool failure")
 	}
 	if snap.Queues == nil {
-		t.Error("очереди null при живом Redis (деградация секции БД не роняет их)")
+		t.Error("the queues are null with a live Redis (a DB section degradation does not take them down)")
 	}
 	if len(snap.Health) != 1 || !snap.Health[0].Up {
-		t.Errorf("health = %+v, хочу живую пробу (§5.9: БД не роняет пробы)", snap.Health)
+		t.Errorf("health = %+v, want a live probe (§5.9: the DB does not take the probes down)", snap.Health)
 	}
 
 	// JSON: degraded sections — null, errors — the reason map.
@@ -430,7 +430,7 @@ func TestCollectOnceDegradation(t *testing.T) {
 		`"statuses":null`, `"laravel":null`, `"ingest":null`, `"queues":{`,
 		`"errors":{"ingest":"status: ingest: db: connection refused"`, `"health":[{"name":"svc","up":true}]`} {
 		if !strings.Contains(doc, want) {
-			t.Errorf("JSON не содержит %s:\n%s", want, doc)
+			t.Errorf("the JSON without %s:\n%s", want, doc)
 		}
 	}
 }
@@ -446,13 +446,13 @@ func TestCollectOnceRedisDegradation(t *testing.T) {
 
 	snap := coll.CollectOnce(context.Background())
 	if snap.Queues != nil {
-		t.Error("queues не null при отказе Redis")
+		t.Error("the queues are not null on a Redis failure")
 	}
 	if _, ok := snap.Errors["queues"]; !ok {
-		t.Errorf("errors без причины очередей: %v", snap.Errors)
+		t.Errorf("errors without the queues reason: %v", snap.Errors)
 	}
 	if len(snap.Errors) != 1 || snap.Zones == nil || snap.Laravel == nil {
-		t.Errorf("отказ Redis задел чужие секции: %v", snap.Errors)
+		t.Errorf("the Redis failure touched foreign sections: %v", snap.Errors)
 	}
 }
 
@@ -491,16 +491,16 @@ func TestCollectOnceRedisHang(t *testing.T) {
 	select {
 	case snap := <-done:
 		if snap.Queues != nil {
-			t.Error("queues не null при зависшем Redis")
+			t.Error("the queues are not null with a hung Redis")
 		}
 		if _, ok := snap.Errors["queues"]; !ok {
-			t.Errorf("errors без причины очередей: %v", snap.Errors)
+			t.Errorf("errors without the queues reason: %v", snap.Errors)
 		}
 		if len(snap.Errors) != 1 || snap.Totals == nil || snap.Zones == nil || snap.Laravel == nil {
-			t.Errorf("зависший Redis задел чужие секции: %v (tot=%v zones=%v)", snap.Errors, snap.Totals, snap.Zones)
+			t.Errorf("the hung Redis touched foreign sections: %v (tot=%v zones=%v)", snap.Errors, snap.Totals, snap.Zones)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("CollectOnce не вернулся: бюджет queueFetchTimeout не разрубает зависший Redis")
+		t.Fatal("CollectOnce did not return: the queueFetchTimeout budget does not cut through a hung Redis")
 	}
 }
 
@@ -511,7 +511,7 @@ func TestCollectOnceNilLenner(t *testing.T) {
 	coll := newSnapCollector(t, healthyPool(), nil, nil)
 	snap := coll.CollectOnce(context.Background())
 	if snap.Queues != nil || snap.Errors["queues"] == "" {
-		t.Errorf("nil lenner: queues = %v, errors = %v — хочу деградацию секции", snap.Queues, snap.Errors)
+		t.Errorf("a nil lenner: queues = %v, errors = %v — a section degradation expected", snap.Queues, snap.Errors)
 	}
 }
 
@@ -541,49 +541,49 @@ func TestCollectOnceStatusCache(t *testing.T) {
 
 	snap1 := coll.CollectOnce(ctx)
 	if snap1.Totals == nil || len(snap1.Errors) != 0 {
-		t.Fatalf("первый проход: totals=%v errors=%v", snap1.Totals, snap1.Errors)
+		t.Fatalf("the first pass: totals=%v errors=%v", snap1.Totals, snap1.Errors)
 	}
 	snap2 := coll.CollectOnce(ctx)
 	if snap2.Totals == nil || len(snap2.Errors) != 0 {
-		t.Fatalf("второй проход (из кэша): totals=%v errors=%v", snap2.Totals, snap2.Errors)
+		t.Fatalf("the second pass (from the cache): totals=%v errors=%v", snap2.Totals, snap2.Errors)
 	}
 	if snap2.Totals.DomainsTotal != snap1.Totals.DomainsTotal {
-		t.Errorf("итоги из кэша = %v, want %v", snap2.Totals.DomainsTotal, snap1.Totals.DomainsTotal)
+		t.Errorf("the totals from the cache = %v, want %v", snap2.Totals.DomainsTotal, snap1.Totals.DomainsTotal)
 	}
 
 	// Heavy sections — one selection per TTL window, light ones — every
 	// pass.
 	calls := pool.calls()
 	if n := countSQLCalls(calls, "FROM zones AS z"); n != 1 {
-		t.Errorf("выборок зон = %d, want 1 (кэш в окне TTL)", n)
+		t.Errorf("zone selects = %d, want 1 (the cache within the TTL window)", n)
 	}
 	if n := countSQLCalls(calls, "AS done_today"); n != 1 {
-		t.Errorf("выборок темпа = %d, want 1 (кэш в окне TTL)", n)
+		t.Errorf("throughput selects = %d, want 1 (the cache within the TTL window)", n)
 	}
 	// The status marker — LIKE 'status (domainStatusSQL): throughputSQL
 	// with T-179 also reads crawler_counters (the daily counter of
 	// checks).
 	if n := countSQLCalls(calls, "LIKE 'status"); n != 1 {
-		t.Errorf("выборок статусов = %d, want 1 (кэш в окне TTL)", n)
+		t.Errorf("status selects = %d, want 1 (the cache within the TTL window)", n)
 	}
 	if n := countSQLCalls(calls, "ORDER BY ld.updated_at"); n != 2 {
-		t.Errorf("выборок последних находок = %d, want 2 (лёгкая секция без кэша)", n)
+		t.Errorf("latest finds selects = %d, want 2 (a light section without a cache)", n)
 	}
 	if n := countSQLCalls(calls, "FROM ingest_files"); n != 2 {
-		t.Errorf("выборок журнала ingest = %d, want 2 (лёгкая секция без кэша)", n)
+		t.Errorf("ingest journal selects = %d, want 2 (a light section without a cache)", n)
 	}
 
 	// After the TTL expires the heavy sections are recomputed.
 	time.Sleep(80 * time.Millisecond)
 	if snap3 := coll.CollectOnce(ctx); snap3.Totals == nil || len(snap3.Errors) != 0 {
-		t.Fatalf("проход после TTL: totals=%v errors=%v", snap3.Totals, snap3.Errors)
+		t.Fatalf("the pass after the TTL: totals=%v errors=%v", snap3.Totals, snap3.Errors)
 	}
 	calls = pool.calls()
 	if n := countSQLCalls(calls, "FROM zones AS z"); n != 2 {
-		t.Errorf("выборок зон после TTL = %d, want 2 (перечёт)", n)
+		t.Errorf("zone selects after the TTL = %d, want 2 (a recount)", n)
 	}
 	if n := countSQLCalls(calls, "AS done_today"); n != 2 {
-		t.Errorf("выборок темпа после TTL = %d, want 2 (перечёт)", n)
+		t.Errorf("throughput selects after the TTL = %d, want 2 (a recount)", n)
 	}
 }
 
@@ -591,7 +591,7 @@ func TestCollectOnceStatusCache(t *testing.T) {
 // pointless: an error.
 func TestNewCollectorNilPool(t *testing.T) {
 	if _, err := NewCollector(nil, nil, config.Default().Dashboard, CollectorOptions{}); err == nil {
-		t.Error("NewCollector(nil) = nil, хочу ошибку")
+		t.Error("NewCollector(nil) = nil, want an error")
 	}
 }
 
@@ -652,33 +652,33 @@ func TestProbes(t *testing.T) {
 	snap := coll.CollectOnce(context.Background())
 	elapsed := time.Since(started)
 	if elapsed >= 2*slow {
-		t.Errorf("пробы шли последовательно: %v >= 2×%v (§5.8 — параллельно)", elapsed, slow)
+		t.Errorf("the probes ran sequentially: %v >= 2×%v (§5.8 — in parallel)", elapsed, slow)
 	}
 
 	if len(snap.Health) != 6 {
-		t.Fatalf("health = %+v, хочу 6 проб", snap.Health)
+		t.Fatalf("health = %+v, want 6 probes", snap.Health)
 	}
 	// Order — by name (deterministic JSON).
 	wantNames := []string{"alive", "broken", "down", "redir", "slow-a", "slow-b"}
 	for i, p := range snap.Health {
 		if p.Name != wantNames[i] {
-			t.Errorf("health[%d].name = %q, хочу %q", i, p.Name, wantNames[i])
+			t.Errorf("health[%d].name = %q, want %q", i, p.Name, wantNames[i])
 		}
 	}
 	if !snap.Health[0].Up {
-		t.Errorf("живая проба down: %+v", snap.Health[0])
+		t.Errorf("a live probe down: %+v", snap.Health[0])
 	}
 	if snap.Health[1].Up || !strings.Contains(snap.Health[1].Error, "HTTP 500") {
-		t.Errorf("не-200: %+v, хочу down «HTTP 500»", snap.Health[1])
+		t.Errorf("a non-200: %+v, want down HTTP 500", snap.Health[1])
 	}
 	if snap.Health[2].Up || snap.Health[2].Error == "" {
-		t.Errorf("отказ соединения: %+v, хочу down с причиной", snap.Health[2])
+		t.Errorf("a connection refusal: %+v, want down with a reason", snap.Health[2])
 	}
 	if snap.Health[3].Up || !strings.Contains(snap.Health[3].Error, "HTTP 301") {
-		t.Errorf("редирект: %+v, хочу down «HTTP 301» (проба не следует за Location)", snap.Health[3])
+		t.Errorf("a redirect: %+v, want down HTTP 301 (the probe does not follow Location)", snap.Health[3])
 	}
 	if !snap.Health[4].Up || !snap.Health[5].Up {
-		t.Errorf("медленные, но ответившие: %+v %+v, хочу up", snap.Health[4], snap.Health[5])
+		t.Errorf("slow but answering: %+v %+v, want up", snap.Health[4], snap.Health[5])
 	}
 
 	// The probe path: base + /livez, including with a trailing slash.
@@ -686,7 +686,7 @@ func TestProbes(t *testing.T) {
 	defer mu.Unlock()
 	for host, path := range paths {
 		if path != "/livez" {
-			t.Errorf("проба %s пошла на %q, хочу /livez", host, path)
+			t.Errorf("the probe %s went to %q, want /livez", host, path)
 		}
 	}
 }
@@ -707,10 +707,10 @@ func TestProbeTimeout(t *testing.T) {
 	})
 	snap := coll.CollectOnce(context.Background())
 	if len(snap.Health) != 1 || snap.Health[0].Up {
-		t.Fatalf("health = %+v, хочу одну down-пробу", snap.Health)
+		t.Fatalf("health = %+v, want a single down probe", snap.Health)
 	}
 	if !strings.Contains(snap.Health[0].Error, "Timeout") {
-		t.Errorf("причина = %q, хочу таймаут клиента", snap.Health[0].Error)
+		t.Errorf("the reason = %q, want a client timeout", snap.Health[0].Error)
 	}
 }
 
@@ -732,7 +732,7 @@ func TestSnapshotJSONForm(t *testing.T) {
 	}
 	var doc map[string]json.RawMessage
 	if err := json.Unmarshal(b, &doc); err != nil {
-		t.Fatalf("снимок не JSON-объект: %v;\n%s", err, b)
+		t.Fatalf("the snapshot is not a JSON object: %v;\n%s", err, b)
 	}
 	// The exact key set: 5 CLI sections + the dashboard sections +
 	// built_at. render — the engines panel (T-246): null — the
@@ -741,26 +741,26 @@ func TestSnapshotJSONForm(t *testing.T) {
 	wantKeys := []string{"zones", "totals", "queues", "throughput", "rates",
 		"statuses", "laravel", "ingest", "health", "errors", "built_at", "queue_watermarks", "render"}
 	if len(doc) != len(wantKeys) {
-		t.Errorf("ключи = %d (%v), хочу %d", len(doc), docKeys(doc), len(wantKeys))
+		t.Errorf("the keys = %d (%v), want %d", len(doc), docKeys(doc), len(wantKeys))
 	}
 	for _, k := range wantKeys {
 		if _, ok := doc[k]; !ok {
-			t.Errorf("JSON без ключа %q: %s", k, b)
+			t.Errorf("the JSON without the key %q: %s", k, b)
 		}
 	}
 	// §5.4: effective thresholds per stream — clamped by half the
 	// MAXLEN (T-141: q:dns — 125 chunks, single items — 75,000;
 	// q:render-fallback — 15,000/2 = 7,500, the T-237 policy).
 	if want := `{"q:analyze":75000,"q:dns":125,"q:http":75000,"q:render":75000,"q:render-fallback":7500}`; string(doc["queue_watermarks"]) != want {
-		t.Errorf("queue_watermarks = %s, хочу %s (§5.4, эффективные пороги T-141)", doc["queue_watermarks"], want)
+		t.Errorf("queue_watermarks = %s, want %s (§5.4, the effective T-141 thresholds)", doc["queue_watermarks"], want)
 	}
 	// Key order — the CLI sections first (embedded SummaryJSON).
 	if got := string(b); !strings.HasPrefix(got, `{"zones":`) {
-		t.Errorf("JSON начинается с %q — секции CLI должны быть первыми", got[:20])
+		t.Errorf("the JSON starts with %q — the CLI sections must come first", got[:20])
 	}
 	// errors — an empty object, built_at — RFC3339.
 	if string(doc["errors"]) != "{}" {
-		t.Errorf("errors = %s, хочу {}", doc["errors"])
+		t.Errorf("errors = %s, want {}", doc["errors"])
 	}
 	var builtAt time.Time
 	if err := json.Unmarshal(doc["built_at"], &builtAt); err != nil {
@@ -781,7 +781,7 @@ func TestSnapshotJSONForm(t *testing.T) {
 		t.Fatalf("statuses: %v", err)
 	}
 	if len(statuses) != len(model.Statuses) || statuses["new"] != 58 {
-		t.Errorf("statuses = %v, хочу легенду %d статусов", statuses, len(model.Statuses))
+		t.Errorf("statuses = %v, want the legend of %d statuses", statuses, len(model.Statuses))
 	}
 }
 
@@ -807,20 +807,20 @@ func TestAPIStatusSnapshot(t *testing.T) {
 
 	rec := doReq(h, http.MethodGet, "/api/status", "10.0.0.20:2020", authed())
 	if rec.Code != http.StatusOK {
-		t.Fatalf("GET /api/status = %d, хочу 200 (тело: %s)", rec.Code, rec.Body.String())
+		t.Fatalf("GET /api/status = %d, want 200 (the body: %s)", rec.Code, rec.Body.String())
 	}
 	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "application/json") {
-		t.Errorf("Content-Type = %q, хочу application/json", ct)
+		t.Errorf("Content-Type = %q, want application/json", ct)
 	}
 	if cc := rec.Header().Get("Cache-Control"); cc != "no-store" {
-		t.Errorf("Cache-Control = %q, хочу no-store (§6.2)", cc)
+		t.Errorf("Cache-Control = %q, want no-store (§6.2)", cc)
 	}
 	var doc Snapshot
 	if err := json.Unmarshal(rec.Body.Bytes(), &doc); err != nil {
-		t.Fatalf("тело не JSON-снимок: %v;\n%s", err, rec.Body.String())
+		t.Fatalf("the body is not a JSON snapshot: %v;\n%s", err, rec.Body.String())
 	}
 	if len(doc.Zones) != 1 || doc.Totals == nil {
-		t.Errorf("снимок без секций CLI: %+v", doc)
+		t.Errorf("the snapshot without the CLI sections: %+v", doc)
 	}
 
 	// A source without a snapshot (the loop has not collected yet) —
@@ -828,7 +828,7 @@ func TestAPIStatusSnapshot(t *testing.T) {
 	srv = newTestServer(t, func(o *Options) { o.Snapshots = staticSource{} })
 	rec = doReq(srv.Handler(), http.MethodGet, "/api/status", "10.0.0.20:2021", authed())
 	if rec.Code != http.StatusServiceUnavailable || !strings.Contains(rec.Body.String(), "snapshot_not_ready") {
-		t.Errorf("без снимка: %d %s, хочу 503 snapshot_not_ready", rec.Code, rec.Body.String())
+		t.Errorf("without a snapshot: %d %s, want 503 snapshot_not_ready", rec.Code, rec.Body.String())
 	}
 }
 
@@ -837,12 +837,12 @@ func TestAPIStatusSnapshot(t *testing.T) {
 // noise), non-zero — RFC3339 in UTC regardless of the input zone.
 func TestRFC3339Zero(t *testing.T) {
 	if got := rfc3339Zero(time.Time{}); got != "" {
-		t.Errorf("rfc3339Zero(zero) = %q, хочу пустую строку (NULL processed_at — пусто)", got)
+		t.Errorf("rfc3339Zero(zero) = %q, want an empty string (a NULL processed_at — empty)", got)
 	}
 	plus3 := time.FixedZone("utc+3", 3*60*60)
 	tm := time.Date(2026, 10, 19, 9, 0, 0, 0, plus3)
 	if got, want := rfc3339Zero(tm), "2026-10-19T06:00:00Z"; got != want {
-		t.Errorf("rfc3339Zero(%v) = %q, хочу %q (приведение к UTC)", tm, got, want)
+		t.Errorf("rfc3339Zero(%v) = %q, want %q (a reduction to UTC)", tm, got, want)
 	}
 }
 
@@ -857,11 +857,11 @@ func TestAPIStatusNoEscapeHTML(t *testing.T) {
 	})
 	rec := doReq(srv.Handler(), http.MethodGet, "/api/status", "10.0.0.21:2121", authed())
 	if rec.Code != http.StatusOK {
-		t.Fatalf("GET /api/status = %d (тело: %s)", rec.Code, rec.Body.String())
+		t.Fatalf("GET /api/status = %d (the body: %s)", rec.Code, rec.Body.String())
 	}
 	body := rec.Body.String()
 	if !strings.Contains(body, "shop&co.crawl.test") || strings.Contains(body, `\u0026`) {
-		t.Errorf("«&» домена экранирован — должен приходить как есть (стиль CLI):\n%s", body)
+		t.Errorf("the domain & is escaped — it must come as is (the CLI style):\n%s", body)
 	}
 }
 
@@ -876,11 +876,11 @@ func TestAPIStatusEncodeError(t *testing.T) {
 	})
 	rec := doReq(srv.Handler(), http.MethodGet, "/api/status", "10.0.0.21:2122", authed())
 	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("NaN в снимке: статус = %d, хочу 500 (частичный JSON со 200 недопустим; тело: %s)",
+		t.Fatalf("a NaN in the snapshot: status = %d, want 500 (a partial JSON with a 200 is not allowed; the body: %s)",
 			rec.Code, rec.Body.String())
 	}
 	if !strings.Contains(rec.Body.String(), "snapshot encode failed") {
-		t.Errorf("тело = %q, хочу диагноз snapshot encode failed", rec.Body.String())
+		t.Errorf("the body = %q, want the snapshot encode failed diagnosis", rec.Body.String())
 	}
 }
 
@@ -909,7 +909,7 @@ func TestCollectorLoop(t *testing.T) {
 	for coll.Current() == nil {
 		if time.Now().After(deadline) {
 			cancel()
-			t.Fatal("снимок не стал готовым после первого прохода")
+			t.Fatal("the snapshot did not become ready after the first pass")
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
@@ -930,14 +930,14 @@ func TestCollectorLoop(t *testing.T) {
 		if time.Now().After(deadline) {
 			cancel()
 			if fresh == nil || fresh.Totals == nil {
-				t.Fatalf("снимок не заменился: снимок без итогов")
+				t.Fatalf("the snapshot was not replaced: a snapshot without the totals")
 			}
-			t.Fatalf("снимок не заменился: domains_checked = %d, хочу 41", fresh.Totals.DomainsChecked)
+			t.Fatalf("the snapshot was not replaced: domains_checked = %d, want 41", fresh.Totals.DomainsChecked)
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
 	if after := len(pool.calls()); after <= before {
-		t.Errorf("проходов после ожидания = %d (было %d) — цикл не тикает", after, before)
+		t.Errorf("passes after the wait = %d (was %d) — the loop does not tick", after, before)
 	}
 
 	// A ctx cancellation — a clean exit.
@@ -945,10 +945,10 @@ func TestCollectorLoop(t *testing.T) {
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Fatalf("Loop после отмены: %v, хочу nil", err)
+			t.Fatalf("Loop after the cancellation: %v, want nil", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("Loop не завершился после отмены ctx")
+		t.Fatal("Loop did not finish after the ctx cancellation")
 	}
 }
 
@@ -975,15 +975,15 @@ func TestCollectorLoopRedisDownFromStart(t *testing.T) {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("Redis вниз с самого старта: снимок так и не обслуживается (вечный 503)")
+			t.Fatal("Redis is down from the very start: the snapshot is never served (an eternal 503)")
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
 	if snap.Queues != nil || snap.Errors["queues"] == "" {
-		t.Errorf("очереди = %v, errors = %v — хочу деградацию секции", snap.Queues, snap.Errors)
+		t.Errorf("queues = %v, errors = %v — a section degradation expected", snap.Queues, snap.Errors)
 	}
 	if snap.Totals == nil || snap.Laravel == nil {
-		t.Errorf("сводка по БД не собрана при живом каркасе: %+v", snap)
+		t.Errorf("the DB summary not collected with a live scaffold: %+v", snap)
 	}
 }
 
@@ -1002,12 +1002,12 @@ func TestCollectorLoopDegradedFirstPass(t *testing.T) {
 	deadline := time.Now().Add(500 * time.Millisecond)
 	for len(pool.calls()) < 6 { // several degraded passes
 		if time.Now().After(deadline) {
-			t.Fatal("цикл не сделал проходов")
+			t.Fatal("the loop made no passes")
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
 	if got := coll.Current(); got != nil {
-		t.Errorf("Current() = %+v без каркаса сводки, хочу nil (503)", got)
+		t.Errorf("Current() = %+v without the summary scaffold, want nil (503)", got)
 	}
 	cancel()
 	if err := <-done; err != nil {

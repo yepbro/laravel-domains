@@ -33,7 +33,7 @@ var migrationName = regexp.MustCompile(`^(\d+)_(.+)\.(up|down)\.sql$`)
 func TestEmbeddedFiles_ValidPairs(t *testing.T) {
 	entries, err := migrations.FS.ReadDir(".")
 	if err != nil {
-		t.Fatalf("ReadDir встроенного набора: %v", err)
+		t.Fatalf("ReadDir of the embedded set: %v", err)
 	}
 
 	type pair struct{ up, down bool }
@@ -41,7 +41,7 @@ func TestEmbeddedFiles_ValidPairs(t *testing.T) {
 	for _, e := range entries {
 		m := migrationName.FindStringSubmatch(e.Name())
 		if m == nil {
-			t.Errorf("%s: имя не соответствует формату NNN_name.up|down.sql", e.Name())
+			t.Errorf("%s: the name does not match the NNN_name.up|down.sql format", e.Name())
 			continue
 		}
 		v := parseVersion(t, m[1])
@@ -61,20 +61,20 @@ func TestEmbeddedFiles_ValidPairs(t *testing.T) {
 			t.Fatalf("ReadFile %s: %v", e.Name(), err)
 		}
 		if len(strings.TrimSpace(string(raw))) == 0 {
-			t.Errorf("%s: пустой файл миграции", e.Name())
+			t.Errorf("%s: an empty migration file", e.Name())
 		}
 	}
 
 	if len(versions) == 0 {
-		t.Fatal("встроенный набор миграций пуст")
+		t.Fatal("the embedded migration set is empty")
 	}
 	for v := uint(1); v <= uint(len(versions)); v++ {
 		p, ok := versions[v]
 		if !ok {
-			t.Fatalf("версия %d отсутствует: версии должны идти с 1 без пропусков", v)
+			t.Fatalf("version %d is missing: versions must run from 1 without gaps", v)
 		}
 		if !p.up || !p.down {
-			t.Errorf("версия %d: неполная пара (up=%v down=%v)", v, p.up, p.down)
+			t.Errorf("version %d: an incomplete pair (up=%v down=%v)", v, p.up, p.down)
 		}
 	}
 }
@@ -90,15 +90,15 @@ func TestSource_IOFS(t *testing.T) {
 
 	next, err := src.First()
 	if err != nil {
-		t.Fatalf("First: %v (набор пуст?)", err)
+		t.Fatalf("First: %v (is the set empty?)", err)
 	}
 	seen := map[uint]bool{}
 	for err == nil {
 		if next == 0 {
-			t.Fatal("некорректная версия 0")
+			t.Fatal("an invalid version 0")
 		}
 		if seen[next] {
-			t.Fatalf("версия %d встречается дважды", next)
+			t.Fatalf("version %d occurs twice", next)
 		}
 		seen[next] = true
 		next, err = src.Next(next)
@@ -106,10 +106,10 @@ func TestSource_IOFS(t *testing.T) {
 	// iofs reports the end of the set with an fs.ErrNotExist error, not
 	// io.EOF.
 	if err != nil && !errors.Is(err, fs.ErrNotExist) && !errors.Is(err, io.EOF) {
-		t.Fatalf("Next: неожиданная ошибка: %v", err)
+		t.Fatalf("Next: an unexpected error: %v", err)
 	}
 	if len(seen) == 0 {
-		t.Fatal("источник не отдал ни одной версии")
+		t.Fatal("the source returned no versions")
 	}
 
 	for v := range seen {
@@ -119,18 +119,18 @@ func TestSource_IOFS(t *testing.T) {
 		} {
 			r, identifier, err := read(v)
 			if err != nil {
-				t.Fatalf("чтение %s версии %d: %v", name, v, err)
+				t.Fatalf("reading %s of version %d: %v", name, v, err)
 			}
 			body, err := io.ReadAll(r)
 			_ = r.Close()
 			if err != nil {
-				t.Fatalf("содержимое %s версии %d: %v", name, v, err)
+				t.Fatalf("the body of %s of version %d: %v", name, v, err)
 			}
 			if identifier == "" {
-				t.Errorf("версия %d: пустой идентификатор %s-миграции", v, name)
+				t.Errorf("version %d: an empty %s migration identifier", v, name)
 			}
 			if len(strings.TrimSpace(string(body))) == 0 {
-				t.Errorf("версия %d: пустая %s-миграция", v, name)
+				t.Errorf("version %d: an empty %s migration", v, name)
 			}
 		}
 	}
@@ -140,9 +140,9 @@ func TestSource_IOFS(t *testing.T) {
 // touching the network.
 func TestUp_EmptyDSN(t *testing.T) {
 	if err := Up(t.Context(), ""); err == nil {
-		t.Fatal("Up с пустым DSN должен вернуть ошибку")
+		t.Fatal("Up with an empty DSN must return an error")
 	} else if !strings.Contains(err.Error(), "DSN") {
-		t.Errorf("ошибка должна упоминать DSN: %v", err)
+		t.Errorf("the error must mention DSN: %v", err)
 	}
 }
 
@@ -158,13 +158,13 @@ func TestUp_ConnectTimeout(t *testing.T) {
 	start := time.Now()
 	err := Up(t.Context(), dsn)
 	if err == nil {
-		t.Fatal("Up к недоступной БД должен вернуть ошибку")
+		t.Fatal("Up against an unavailable database must return an error")
 	}
-	if !strings.Contains(err.Error(), "недоступен") {
-		t.Errorf("ошибка должна упоминать недоступность БД: %v", err)
+	if !strings.Contains(err.Error(), "unavailable") {
+		t.Errorf("the error must mention the database unavailability: %v", err)
 	}
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
-		t.Errorf("Up ждал %s — заметно дольше таймаута подключения", elapsed)
+		t.Errorf("Up waited %s — noticeably longer than the connect timeout", elapsed)
 	}
 }
 
@@ -182,10 +182,10 @@ func TestOpenAndWait_ClosesDBOnError(t *testing.T) {
 
 	_, err := openAndWait(t.Context(), "not-a-real-dsn")
 	if err == nil {
-		t.Fatal("openAndWait с всегда падающим драйвером должен вернуть ошибку")
+		t.Fatal("openAndWait with an always-failing driver must return an error")
 	}
 	if !failConnectorOf.closed.Load() {
-		t.Error("*sql.DB не закрыт на пути ошибки (утечка opener-горутины и соединений)")
+		t.Error("*sql.DB is not closed on the error path (an opener goroutine and connections leak)")
 	}
 }
 
@@ -199,7 +199,7 @@ type failConnector struct {
 
 func (c *failConnector) Connect(context.Context) (driver.Conn, error) {
 	c.connects.Add(1)
-	return nil, errors.New("нет соединения")
+	return nil, errors.New("no connection")
 }
 
 func (c *failConnector) Driver() driver.Driver { return failDriver{} }
@@ -209,7 +209,7 @@ func (c *failConnector) Close() error { c.closed.Store(true); return nil }
 type failDriver struct{}
 
 func (failDriver) Open(string) (driver.Conn, error) {
-	return nil, errors.New("нет соединения")
+	return nil, errors.New("no connection")
 }
 
 func (failDriver) OpenConnector(string) (driver.Connector, error) { return failConnectorOf, nil }
@@ -229,34 +229,34 @@ func TestRedactDSN(t *testing.T) {
 		name, dsn, want string
 	}{
 		{
-			"пароль в userinfo",
+			"a password in userinfo",
 			"postgres://crawler:secret@172.28.100.2:5432/crawler?sslmode=disable",
 			"postgres://crawler@172.28.100.2:5432/crawler?sslmode=disable",
 		},
 		{
-			"без пароля",
+			"no password",
 			"postgres://crawler@localhost:5432/crawler",
 			"postgres://crawler@localhost:5432/crawler",
 		},
 		{
-			"пароль в query-строке (libpq-форма pgx)",
+			"a password in the query string (the pgx libpq form)",
 			"postgres://crawler@172.28.100.2:5432/crawler?password=dev-only-crawler&sslmode=disable",
 			"postgres://crawler@172.28.100.2:5432/crawler?password=redacted&sslmode=disable",
 		},
 		{
-			"sslpassword в query-строке",
+			"sslpassword in the query string",
 			"postgres://crawler@localhost:5432/crawler?sslpassword=key&sslmode=verify-full",
 			"postgres://crawler@localhost:5432/crawler?sslmode=verify-full&sslpassword=redacted",
 		},
 		{
-			"пароль и в userinfo, и в query",
+			"a password in both userinfo and query",
 			"postgres://crawler:secret@localhost:5432/crawler?password=dev-only-crawler",
 			"postgres://crawler@localhost:5432/crawler?password=redacted",
 		},
 		{
-			"мусор — не раскрываем",
+			"junk — not revealed",
 			"not a url at all",
-			"см. postgres.dsn (конфигурация) / APP_PG_DSN",
+			"see postgres.dsn (configuration) / APP_PG_DSN",
 		},
 	}
 	for _, c := range cases {
@@ -277,27 +277,27 @@ func TestWithRunnerTag(t *testing.T) {
 		name, dsn, want string
 	}{
 		{
-			"URL с параметрами",
+			"a URL with parameters",
 			"postgres://crawler:secret@127.0.0.1:5432/crawler?sslmode=disable",
 			"postgres://crawler:secret@127.0.0.1:5432/crawler?application_name=" + tag + "&sslmode=disable",
 		},
 		{
-			"application_name перезаписывается (раннер обязан быть отличим)",
+			"application_name is overwritten (the runner must be distinguishable)",
 			"postgres://crawler@localhost:5432/crawler?application_name=custom",
 			"postgres://crawler@localhost:5432/crawler?application_name=" + tag,
 		},
 		{
-			"URL без параметров",
+			"a URL without parameters",
 			"postgres://crawler@localhost/crawler",
 			"postgres://crawler@localhost/crawler?application_name=" + tag,
 		},
 		{
-			"keyword-DSN — без метки",
+			"a keyword DSN — no tag",
 			"host=localhost port=5432 user=crawler",
 			"host=localhost port=5432 user=crawler",
 		},
 		{
-			"мусор — без метки",
+			"junk — no tag",
 			"not a url at all",
 			"not a url at all",
 		},
@@ -325,12 +325,12 @@ func TestInterruptedInRun(t *testing.T) {
 		err  error
 		want bool
 	}{
-		{"тело миграции", inRun, true},
-		{"тело миграции с текстом сервера", inRunMsg, true},
-		{"тело миграции, обёрнутая", fmt.Errorf("миграции: применение: %w", inRun), true},
-		{"ожидание внутренней блокировки", lockWait, false},
-		{"SetVersion без метки", setVersion, false},
-		{"посторонняя ошибка", errors.New("network"), false},
+		{"migration body", inRun, true},
+		{"migration body with the server text", inRunMsg, true},
+		{"migration body, wrapped", fmt.Errorf("migrate: apply: %w", inRun), true},
+		{"an internal lock wait", lockWait, false},
+		{"SetVersion without the marker", setVersion, false},
+		{"a foreign error", errors.New("network"), false},
 		{"nil", nil, false},
 	}
 	for _, c := range cases {
@@ -366,13 +366,13 @@ func TestCancelApplying_RetriesUntilBudget(t *testing.T) {
 	before := failConnectorOf.connects.Load()
 	start := time.Now()
 	if cancelApplying(db, "crawler-migrations-test", done) {
-		t.Fatal("cancelApplying без БД не может отменить запрос")
+		t.Fatal("cancelApplying without a database cannot cancel a query")
 	}
 	if elapsed := time.Since(start); elapsed < 250*time.Millisecond {
-		t.Errorf("cancelApplying завершился за %s — раньше бюджета отмены", elapsed)
+		t.Errorf("cancelApplying finished in %s — earlier than the cancel budget", elapsed)
 	}
 	if attempts := failConnectorOf.connects.Load() - before; attempts < 2 {
-		t.Errorf("cancelApplying сдался после первой попытки (попыток соединения: %d), а должен повторять", attempts)
+		t.Errorf("cancelApplying gave up after the first attempt (%d connection attempts), it must retry", attempts)
 	}
 }
 
@@ -399,13 +399,13 @@ func TestCancelApplying_StopsWhenUpDone(t *testing.T) {
 	before := failConnectorOf.connects.Load()
 	start := time.Now()
 	if cancelApplying(db, "crawler-migrations-test", done) {
-		t.Fatal("cancelApplying без БД не может отменить запрос")
+		t.Fatal("cancelApplying without a database cannot cancel a query")
 	}
 	if elapsed := time.Since(start); elapsed > time.Second {
-		t.Errorf("cancelApplying вышел по done за %s — заметно дольше одной попытки", elapsed)
+		t.Errorf("cancelApplying exited on done in %s — noticeably longer than one attempt", elapsed)
 	}
 	if attempts := failConnectorOf.connects.Load() - before; attempts != 0 {
-		t.Errorf("cancelApplying сделал %d попыток после завершения применения — должен выйти сразу", attempts)
+		t.Errorf("cancelApplying made %d attempts after the apply finished — it must exit at once", attempts)
 	}
 }
 
@@ -414,7 +414,7 @@ func parseVersion(t *testing.T, s string) uint {
 	var v uint
 	for _, c := range s {
 		if c < '0' || c > '9' {
-			t.Fatalf("версия %q не число", s)
+			t.Fatalf("version %q is not a number", s)
 		}
 		v = v*10 + uint(c-'0')
 	}

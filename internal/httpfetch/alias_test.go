@@ -28,16 +28,16 @@ func aliasResults(t *testing.T, domain string, in []AliasInput) []aliasGot {
 	t.Helper()
 	res := DetectAliases(domain, in)
 	if len(res) != len(in) {
-		t.Fatalf("DetectAliases: длина результата %d, хочу %d", len(res), len(in))
+		t.Fatalf("DetectAliases: the result length %d, want %d", len(res), len(in))
 	}
 	got := make([]aliasGot, len(res))
 	for i, r := range res {
 		if r.SubdomainID != in[i].SubdomainID || r.Variant != in[i].Variant {
-			t.Errorf("результат[%d]: идентичность (%d, %v) не совпадает со входом (%d, %v)",
+			t.Errorf("result[%d]: the identity (%d, %v) does not match the input (%d, %v)",
 				i, r.SubdomainID, r.Variant, in[i].SubdomainID, in[i].Variant)
 		}
 		if (r.AliasSubdomainID == nil) != (r.AliasKind == model.AliasNone) {
-			t.Errorf("результат[%d]: alias_subdomain_id = %v при alias_kind %v — пара должна быть согласована",
+			t.Errorf("result[%d]: alias_subdomain_id = %v with alias_kind %v — the pair must be consistent",
 				i, r.AliasSubdomainID, r.AliasKind)
 		}
 		got[i] = aliasGot{kind: r.AliasKind, orig: -1, store: r.StoreContent}
@@ -100,12 +100,12 @@ func TestDetectAliasesSameHashDifferentURLs(t *testing.T) {
 		{kind: model.AliasIdentical, orig: 0, store: false},
 	}
 	if got := aliasResults(t, "example.com", in); !reflect.DeepEqual(got, want) {
-		t.Errorf("парковка по хэшу: got %+v, want %+v", got, want)
+		t.Errorf("a parking by hash: got %+v, want %+v", got, want)
 	}
 }
 
 func TestDetectAliasesChainOfThree(t *testing.T) {
-	t.Run("редирект-цепочка a→b→c", func(t *testing.T) {
+	t.Run("a redirect chain a→b→c", func(t *testing.T) {
 		// a and b converge on c's address, c is at home: a single original
 		// (c), both aliases are redirects to it.
 		in := []AliasInput{
@@ -122,11 +122,11 @@ func TestDetectAliasesChainOfThree(t *testing.T) {
 			{kind: model.AliasNone, orig: -1, store: true},
 		}
 		if got := aliasResults(t, "example.com", in); !reflect.DeepEqual(got, want) {
-			t.Errorf("цепочка a=b=c: got %+v, want %+v", got, want)
+			t.Errorf("the chain a=b=c: got %+v, want %+v", got, want)
 		}
 	})
 
-	t.Run("хэш-цепочка a=b=c", func(t *testing.T) {
+	t.Run("a hash chain a=b=c", func(t *testing.T) {
 		// All three are at home with identical content: one class, the
 		// original is the minimal subdomain_id, the rest are identical.
 		in := []AliasInput{
@@ -143,7 +143,7 @@ func TestDetectAliasesChainOfThree(t *testing.T) {
 			{kind: model.AliasIdentical, orig: 2, store: false},
 		}
 		if got := aliasResults(t, "example.com", in); !reflect.DeepEqual(got, want) {
-			t.Errorf("хэш-цепочка a=b=c: got %+v, want %+v", got, want)
+			t.Errorf("the hash chain a=b=c: got %+v, want %+v", got, want)
 		}
 	})
 }
@@ -162,7 +162,7 @@ func TestDetectAliasesNilHashURLCriterion(t *testing.T) {
 		{kind: model.AliasNone, orig: -1, store: false}, // no content — nothing to store
 	}
 	if got := aliasResults(t, "example.com", in); !reflect.DeepEqual(got, want) {
-		t.Errorf("nil-хэш, URL-критерий: got %+v, want %+v", got, want)
+		t.Errorf("a nil hash, the URL criterion: got %+v, want %+v", got, want)
 	}
 }
 
@@ -183,12 +183,12 @@ func TestDetectAliasesNoMatches(t *testing.T) {
 		{kind: model.AliasNone, orig: -1, store: false},
 	}
 	if got := aliasResults(t, "example.com", in); !reflect.DeepEqual(got, want) {
-		t.Errorf("без совпадений: got %+v, want %+v", got, want)
+		t.Errorf("no matches: got %+v, want %+v", got, want)
 	}
 }
 
 func TestDetectAliasesOriginChoice(t *testing.T) {
-	t.Run("одинаковый контент без редиректа — оригинал апекс", func(t *testing.T) {
+	t.Run("identical content without a redirect — the apex is the original", func(t *testing.T) {
 		// Testbed WWWSame: both at home, one hash. The minimal
 		// subdomain_id is the apex (0), www is identical to it.
 		in := []AliasInput{
@@ -206,7 +206,7 @@ func TestDetectAliasesOriginChoice(t *testing.T) {
 		}
 	})
 
-	t.Run("результат не зависит от порядка входа", func(t *testing.T) {
+	t.Run("the result does not depend on the input order", func(t *testing.T) {
 		// Parallel subdomain fetches complete in arbitrary order — the
 		// decisions must match.
 		inA := []AliasInput{
@@ -224,14 +224,14 @@ func TestDetectAliasesOriginChoice(t *testing.T) {
 		}
 		wantReversed := []aliasGot{want[1], want[0]}
 		if !reflect.DeepEqual(gotA, want) {
-			t.Errorf("порядок A: got %+v, want %+v", gotA, want)
+			t.Errorf("order A: got %+v, want %+v", gotA, want)
 		}
 		if !reflect.DeepEqual(gotB, wantReversed) {
-			t.Errorf("порядок B: got %+v, want %+v", gotB, wantReversed)
+			t.Errorf("order B: got %+v, want %+v", gotB, wantReversed)
 		}
 	})
 
-	t.Run("общий внешний URL — оригинал минимальный subdomain_id", func(t *testing.T) {
+	t.Run("a shared external URL — the minimal subdomain_id is the original", func(t *testing.T) {
 		// Both moved to the hosting parking page: nobody is "at home", the
 		// original is the minimal id, the second is identical (not a
 		// redirect to a subdomain).
@@ -246,7 +246,7 @@ func TestDetectAliasesOriginChoice(t *testing.T) {
 			{kind: model.AliasNone, orig: -1, store: true},
 		}
 		if got := aliasResults(t, "example.com", in); !reflect.DeepEqual(got, want) {
-			t.Errorf("внешний URL: got %+v, want %+v", got, want)
+			t.Errorf("an external URL: got %+v, want %+v", got, want)
 		}
 	})
 }
@@ -265,18 +265,18 @@ func TestDetectAliasesNormalization(t *testing.T) {
 		{kind: model.AliasNone, orig: -1, store: true},
 	}
 	if got := aliasResults(t, "Example.COM.", in); !reflect.DeepEqual(got, want) {
-		t.Errorf("нормализация: got %+v, want %+v", got, want)
+		t.Errorf("normalization: got %+v, want %+v", got, want)
 	}
 }
 
 func TestDetectAliasesDegenerate(t *testing.T) {
-	t.Run("пустой вход", func(t *testing.T) {
+	t.Run("an empty input", func(t *testing.T) {
 		if got := DetectAliases("example.com", nil); len(got) != 0 {
-			t.Errorf("пустой вход: got %+v, хочу пусто", got)
+			t.Errorf("an empty input: got %+v, want empty", got)
 		}
 	})
 
-	t.Run("запись без итогового URL независима", func(t *testing.T) {
+	t.Run("a record without a final URL is independent", func(t *testing.T) {
 		// The host is empty — there is no page (fetch error): no URL
 		// criterion, no alias, no content stored.
 		in := []AliasInput{
@@ -290,11 +290,11 @@ func TestDetectAliasesDegenerate(t *testing.T) {
 			{kind: model.AliasNone, orig: -1, store: true},
 		}
 		if got := aliasResults(t, "example.com", in); !reflect.DeepEqual(got, want) {
-			t.Errorf("без итогового URL: got %+v, want %+v", got, want)
+			t.Errorf("without a final URL: got %+v, want %+v", got, want)
 		}
 	})
 
-	t.Run("варианты одного субдомена алиасами не бывают", func(t *testing.T) {
+	t.Run("variants of one subdomain are never aliases", func(t *testing.T) {
 		// The folding contract (T-054): variants of one subdomain are
 		// different sites. Even if they end up in one class transitively
 		// (via the hash of a third subdomain), a reference to their own
@@ -314,7 +314,7 @@ func TestDetectAliasesDegenerate(t *testing.T) {
 			{kind: model.AliasIdentical, orig: 2, store: false},
 		}
 		if got := aliasResults(t, "example.com", in); !reflect.DeepEqual(got, want) {
-			t.Errorf("варианты одного субдомена: got %+v, want %+v", got, want)
+			t.Errorf("variants of one subdomain: got %+v, want %+v", got, want)
 		}
 	})
 }

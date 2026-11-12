@@ -60,8 +60,8 @@ func TestUserAgentFromConfigReachesServer(t *testing.T) {
 		cfg  config.HTTP
 		want string
 	}{
-		{"кастомный из конфига", config.HTTP{UserAgent: custom}, custom},
-		{"дефолт конфигурации", config.Default().HTTP, config.DefaultUserAgent},
+		{"a custom one from the config", config.HTTP{UserAgent: custom}, custom},
+		{"the config default", config.Default().HTTP, config.DefaultUserAgent},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var gotUA atomicString
@@ -73,7 +73,7 @@ func TestUserAgentFromConfigReachesServer(t *testing.T) {
 
 			o := NewOptions(tc.cfg)
 			if o.UserAgent != tc.want {
-				t.Fatalf("NewOptions: UA %q, ожидался %q", o.UserAgent, tc.want)
+				t.Fatalf("NewOptions: UA %q, %q expected", o.UserAgent, tc.want)
 			}
 			f := NewFetcher(o)
 			res, err := f.Fetch(context.Background(), FetchRequest{
@@ -85,7 +85,7 @@ func TestUserAgentFromConfigReachesServer(t *testing.T) {
 			}
 			defer func() { _ = res.Body.Close() }()
 			if gotUA.Load() != tc.want {
-				t.Errorf("сервер увидел User-Agent %q, ожидался %q", gotUA.Load(), tc.want)
+				t.Errorf("the server saw the User-Agent %q, %q expected", gotUA.Load(), tc.want)
 			}
 		})
 	}
@@ -97,10 +97,10 @@ func TestUserAgentFromConfigReachesServer(t *testing.T) {
 func TestNewOptionsUserAgentFallback(t *testing.T) {
 	o := NewOptions(config.HTTP{})
 	if o.UserAgent != config.DefaultUserAgent {
-		t.Errorf("NewOptions(пустая секция): UA %q, ожидался дефолт %q", o.UserAgent, config.DefaultUserAgent)
+		t.Errorf("NewOptions(an empty section): UA %q, the default %q expected", o.UserAgent, config.DefaultUserAgent)
 	}
 	if strings.TrimSpace(o.UserAgent) == "" {
-		t.Error("UA при сборке из конфигурации не должен быть пустым")
+		t.Error("the UA assembled from the configuration must not be empty")
 	}
 }
 
@@ -122,7 +122,7 @@ func TestFetchRootOnlyNoRobots(t *testing.T) {
 	u := hostURL(srv.URL, "www.example-test.net")
 	res, err := f.Fetch(context.Background(), FetchRequest{URL: u, Addrs: loopbackAddr()})
 	if err != nil {
-		t.Fatalf("Fetch без пути: %v", err)
+		t.Fatalf("Fetch without a path: %v", err)
 	}
 	_ = res.Body.Close()
 
@@ -131,23 +131,23 @@ func TestFetchRootOnlyNoRobots(t *testing.T) {
 	u2.Path = "/"
 	res, err = f.Fetch(context.Background(), FetchRequest{URL: &u2, Addrs: loopbackAddr()})
 	if err != nil {
-		t.Fatalf("Fetch с путём \"/\": %v", err)
+		t.Fatalf("Fetch with the \"/\" path: %v", err)
 	}
 	_ = res.Body.Close()
 
 	reqs := log.all()
 	if len(reqs) != 2 {
-		t.Fatalf("запросов: %d, ожидалось ровно 2 (по одному на Fetch), журнал: %+v", len(reqs), reqs)
+		t.Fatalf("requests: %d, exactly 2 expected (one per Fetch), the log: %+v", len(reqs), reqs)
 	}
 	for i, r := range reqs {
 		if r.method != http.MethodGet {
-			t.Errorf("запрос %d: метод %q, ожидался GET", i, r.method)
+			t.Errorf("request %d: the method %q, GET expected", i, r.method)
 		}
 		if r.path != "/" {
-			t.Errorf("запрос %d: путь %q — запрашивается только главная страница «/», robots.txt и иные пути исключены (ТЗ 5.5, §9)", i, r.path)
+			t.Errorf("request %d: the path %q — only the main page \"/\" is requested, robots.txt and other paths are excluded (spec 5.5, §9)", i, r.path)
 		}
 		if r.ua != "RootCrawler/1.0 (+https://example.example/contact; admin@example.example)" {
-			t.Errorf("запрос %d: User-Agent %q", i, r.ua)
+			t.Errorf("request %d: the User-Agent %q", i, r.ua)
 		}
 	}
 }
@@ -182,23 +182,23 @@ func TestUserAgentOnRedirectChain(t *testing.T) {
 	defer func() { _ = res.Result.Body.Close() }()
 
 	if res.Result.StatusCode != http.StatusOK {
-		t.Errorf("итоговый статус: %d, ожидался 200", res.Result.StatusCode)
+		t.Errorf("final status: %d, 200 expected", res.Result.StatusCode)
 	}
 	if len(res.Chain) != 2 {
-		t.Errorf("шагов цепочки: %d, ожидалось 2, цепочка: %+v", len(res.Chain), res.Chain)
+		t.Errorf("chain steps: %d, 2 expected, the chain: %+v", len(res.Chain), res.Chain)
 	}
 
 	reqs := log.all()
 	if len(reqs) != 2 {
-		t.Fatalf("запросов: %d, ожидалось 2 (стартовый «/» и ход по Location), журнал: %+v", len(reqs), reqs)
+		t.Fatalf("requests: %d, 2 expected (the start \"/\" and the hop by Location), the log: %+v", len(reqs), reqs)
 	}
 	wantPaths := []string{"/", "/landing"}
 	for i, r := range reqs {
 		if r.method != http.MethodGet || r.path != wantPaths[i] {
-			t.Errorf("запрос %d: %s %q, ожидался GET %q", i, r.method, r.path, wantPaths[i])
+			t.Errorf("request %d: %s %q, GET %q expected", i, r.method, r.path, wantPaths[i])
 		}
 		if r.ua != chainUA {
-			t.Errorf("запрос %d (%s): User-Agent %q, ожидался конфигурационный", i, r.path, r.ua)
+			t.Errorf("request %d (%s): the User-Agent %q, the configured one expected", i, r.path, r.ua)
 		}
 	}
 }
@@ -213,23 +213,23 @@ func TestUserAgentConfigValidation(t *testing.T) {
 		return c
 	}
 	if err := base().Validate(); err != nil {
-		t.Fatalf("дефолтная конфигурация должна быть валидна: %v", err)
+		t.Fatalf("the default configuration must be valid: %v", err)
 	}
 
 	for _, tc := range []struct {
 		name string
 		ua   string
 	}{
-		{"пустой", "   "},
-		{"перевод строки", "Bot/1.0\nX:Injected"},
-		{"управляющий символ", "Bot/1.0\x00"},
-		{"слишком длинный", strings.Repeat("a", 513)},
+		{"empty", "   "},
+		{"a line break", "Bot/1.0\nX:Injected"},
+		{"a control character", "Bot/1.0\x00"},
+		{"too long", strings.Repeat("a", 513)},
 	} {
 		c := base()
 		c.HTTP.UserAgent = tc.ua
 		err := c.Validate()
 		if err == nil || !strings.Contains(err.Error(), "http.user_agent") {
-			t.Errorf("%s: ожидалась ошибка валидации http.user_agent, получено: %v", tc.name, err)
+			t.Errorf("%s: an http.user_agent validation error expected, got: %v", tc.name, err)
 		}
 	}
 
@@ -238,6 +238,6 @@ func TestUserAgentConfigValidation(t *testing.T) {
 	c := base()
 	c.HTTP.UserAgent = strings.Repeat("a", 512)
 	if err := c.Validate(); err != nil {
-		t.Errorf("UA в 512 байт должен проходить валидацию: %v", err)
+		t.Errorf("a 512-byte UA must pass validation: %v", err)
 	}
 }

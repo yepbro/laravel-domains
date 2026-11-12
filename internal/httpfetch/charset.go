@@ -86,7 +86,7 @@ const (
 // ErrDecompressTooLarge — the decompressed body exceeded the cap
 // (protection against zip bombs, spec 5.5). The response body remains
 // readable up to the cap; the error is returned by reading beyond it.
-var ErrDecompressTooLarge = errors.New("httpfetch: распакованное тело превышает потолок распаковки")
+var ErrDecompressTooLarge = errors.New("httpfetch: the decompressed body exceeds the decompression cap")
 
 // --- compression: Accept-Encoding and capped decompression ------------------
 
@@ -110,7 +110,7 @@ func parseContentCodings(contentEncoding string) ([]string, error) {
 		case "gzip", "x-gzip", "br", "deflate", "identity":
 			codings = append(codings, c)
 		default:
-			return nil, fmt.Errorf("httpfetch: неподдерживаемое Content-Encoding %q (ожидается gzip/br/deflate/identity)", contentEncoding)
+			return nil, fmt.Errorf("httpfetch: an unsupported Content-Encoding %q (gzip/br/deflate/identity expected)", contentEncoding)
 		}
 	}
 	return codings, nil
@@ -179,7 +179,7 @@ func decodeContentEncoding(rc io.ReadCloser, contentEncoding string, limit int64
 				return cur, nil
 			}
 			if err != nil {
-				return nil, fmt.Errorf("httpfetch: битый gzip-заголовок тела: %w", err)
+				return nil, fmt.Errorf("httpfetch: a broken body gzip header: %w", err)
 			}
 			cur = &decompressCap{dec: gz, src: cur, left: limit}
 		case "br":

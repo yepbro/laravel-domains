@@ -83,8 +83,8 @@ BEGIN
     -- The zone must exist: a zone partition without a row in zones —
     -- a data error (zones are created by ingest, spec 5.1).
     IF NOT EXISTS (SELECT 1 FROM zones WHERE id = p_zone_id) THEN
-        RAISE EXCEPTION 'create_zone_partitions: зоны % нет в таблице zones', p_zone_id
-            USING HINT = 'зона создаётся автоматически при первом входном файле (ТЗ 5.1)';
+        RAISE EXCEPTION 'create_zone_partitions: zone % is missing from the zones table', p_zone_id
+            USING HINT = 'the zone is created automatically by the first incoming file (spec 5.1)';
     END IF;
 
     -- A power of two 1..1024: any modulus is valid, but a power of two
@@ -92,7 +92,7 @@ BEGIN
     -- without rebuilding the zone's other leaves.
     IF p_hash_parts < 1 OR p_hash_parts > 1024
        OR p_hash_parts & (p_hash_parts - 1) <> 0 THEN
-        RAISE EXCEPTION 'create_zone_partitions: hash_parts = %, ожидается степень двойки от 1 до 1024', p_hash_parts;
+        RAISE EXCEPTION 'create_zone_partitions: hash_parts = %, a power of two from 1 to 1024 is expected', p_hash_parts;
     END IF;
 
     -- Serialization of repeated calls for the same zone (transactional —
@@ -124,7 +124,7 @@ BEGIN
                   format('FOR VALUES IN (%L)', p_zone_id::text)
               )
         ) THEN
-            RAISE NOTICE 'create_zone_partitions: %: партиция зоны % уже существует, пропуск', v_table, p_zone_id;
+            RAISE NOTICE 'create_zone_partitions: %: the zone % partition already exists, skipping', v_table, p_zone_id;
             CONTINUE;
         END IF;
 
@@ -138,7 +138,7 @@ BEGIN
           AND parent.relname = v_table
           AND pg_get_expr(c.relpartbound, c.oid) = 'DEFAULT';
         IF v_default IS NULL THEN
-            RAISE EXCEPTION 'create_zone_partitions: у таблицы % нет DEFAULT-партиции', v_table;
+            RAISE EXCEPTION 'create_zone_partitions: the table % has no DEFAULT partition', v_table;
         END IF;
 
         v_part := format('%s_z%s', v_table, p_zone_id);
@@ -174,7 +174,7 @@ BEGIN
             'INSERT INTO %I SELECT * FROM moved',
             v_default, p_zone_id, v_part);
         GET DIAGNOSTICS v_moved = ROW_COUNT;
-        RAISE NOTICE 'create_zone_partitions: %: перенесено строк из DEFAULT: %', v_table, v_moved;
+        RAISE NOTICE 'create_zone_partitions: %: rows moved out of DEFAULT: %', v_table, v_moved;
 
         -- 4. The DEFAULT back in place: the zone's rows are no longer there.
         EXECUTE format('ALTER TABLE %I ATTACH PARTITION %I DEFAULT', v_table, v_default);

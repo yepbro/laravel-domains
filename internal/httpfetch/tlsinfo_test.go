@@ -45,7 +45,7 @@ func newTLSTestCA(t *testing.T, cn string) *tlsTestCA {
 	t.Helper()
 	pub, key, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
-		t.Fatalf("ключ CA: %v", err)
+		t.Fatalf("the CA key: %v", err)
 	}
 	tmpl := &x509.Certificate{
 		SerialNumber:          big.NewInt(1),
@@ -58,11 +58,11 @@ func newTLSTestCA(t *testing.T, cn string) *tlsTestCA {
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, pub, key)
 	if err != nil {
-		t.Fatalf("сертификат CA: %v", err)
+		t.Fatalf("the CA certificate: %v", err)
 	}
 	cert, err := x509.ParseCertificate(der)
 	if err != nil {
-		t.Fatalf("разбор сертификата CA: %v", err)
+		t.Fatalf("parsing the CA certificate: %v", err)
 	}
 	return &tlsTestCA{cert: cert, key: key}
 }
@@ -76,7 +76,7 @@ func issueTLSLeaf(t *testing.T, parent *x509.Certificate, parentKey crypto.Signe
 	t.Helper()
 	pub, key, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
-		t.Fatalf("ключ листа: %v", err)
+		t.Fatalf("the leaf key: %v", err)
 	}
 	tmpl := &x509.Certificate{
 		SerialNumber:          big.NewInt(0x2a),
@@ -95,11 +95,11 @@ func issueTLSLeaf(t *testing.T, parent *x509.Certificate, parentKey crypto.Signe
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, signerCert, pub, signerKey)
 	if err != nil {
-		t.Fatalf("сертификат листа: %v", err)
+		t.Fatalf("the leaf certificate: %v", err)
 	}
 	cert, err := x509.ParseCertificate(der)
 	if err != nil {
-		t.Fatalf("разбор сертификата листа: %v", err)
+		t.Fatalf("parsing the leaf certificate: %v", err)
 	}
 	return cert, key
 }
@@ -159,9 +159,9 @@ func TestTLSInfoVerificationWindow(t *testing.T) {
 		now  time.Time
 		want TLSProblem // "" — no reasons
 	}{
-		{"до окна", notBefore.Add(-time.Hour), TLSProblemNotYetValid},
-		{"внутри окна", notBefore.Add(12 * time.Hour), ""},
-		{"после окна", notAfter.Add(time.Hour), TLSProblemExpired},
+		{"before the window", notBefore.Add(-time.Hour), TLSProblemNotYetValid},
+		{"inside the window", notBefore.Add(12 * time.Hour), ""},
+		{"after the window", notAfter.Add(time.Hour), TLSProblemExpired},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			info := newTLSInfoAt(cs, "window.example.net", tc.now)
@@ -170,15 +170,15 @@ func TestTLSInfoVerificationWindow(t *testing.T) {
 			}
 			if tc.want == "" {
 				if !info.Valid || len(info.Problems) != 0 {
-					t.Errorf("ожидался valid без причин, получено valid=%v problems=%v", info.Valid, info.Problems)
+					t.Errorf("valid without reasons expected, got valid=%v problems=%v", info.Valid, info.Problems)
 				}
 				return
 			}
 			if info.Valid {
-				t.Errorf("ожидался invalid (%s), получено valid", tc.want)
+				t.Errorf("invalid (%s) expected, got valid", tc.want)
 			}
 			if len(info.Problems) != 1 || info.Problems[0] != tc.want {
-				t.Errorf("причины: получено %v, ожидалась [%s]", info.Problems, tc.want)
+				t.Errorf("reasons: got %v, [%s] expected", info.Problems, tc.want)
 			}
 		})
 	}
@@ -206,13 +206,13 @@ func TestTLSInfoHostnameMatch(t *testing.T) {
 	} {
 		info := newTLSInfoAt(cs, tc.host, now)
 		if info == nil {
-			t.Fatalf("хост %s: TLSInfo nil", tc.host)
+			t.Fatalf("host %s: TLSInfo nil", tc.host)
 		}
 		if tc.wantProb == "" && !info.Valid {
-			t.Errorf("хост %s: ожидался valid, получено %v", tc.host, info.Problems)
+			t.Errorf("host %s: valid expected, got %v", tc.host, info.Problems)
 		}
 		if tc.wantProb != "" && (info.Valid || len(info.Problems) != 1 || info.Problems[0] != tc.wantProb) {
-			t.Errorf("хост %s: ожидалась причина %s, получено valid=%v %v", tc.host, tc.wantProb, info.Valid, info.Problems)
+			t.Errorf("host %s: the reason %s expected, got valid=%v %v", tc.host, tc.wantProb, info.Valid, info.Problems)
 		}
 	}
 
@@ -226,7 +226,7 @@ func TestTLSInfoHostnameMatch(t *testing.T) {
 	} {
 		info := newTLSInfoAt(tlsChainState(cnLeaf, ca.cert), host, now)
 		if info.Valid != wantValid {
-			t.Errorf("CN-fallback %s: valid=%v, ожидалось %v (problems %v)", host, info.Valid, wantValid, info.Problems)
+			t.Errorf("CN-fallback %s: valid=%v, %v expected (problems %v)", host, info.Valid, wantValid, info.Problems)
 		}
 	}
 
@@ -239,7 +239,7 @@ func TestTLSInfoHostnameMatch(t *testing.T) {
 	} {
 		info := newTLSInfoAt(tlsChainState(ipLeaf, ca.cert), host, now)
 		if info.Valid != wantValid {
-			t.Errorf("IP-хост %s: valid=%v, ожидалось %v (problems %v)", host, info.Valid, wantValid, info.Problems)
+			t.Errorf("an IP host %s: valid=%v, %v expected (problems %v)", host, info.Valid, wantValid, info.Problems)
 		}
 	}
 }
@@ -258,16 +258,16 @@ func TestTLSInfoSelfSigned(t *testing.T) {
 		t.Fatal("TLSInfo nil")
 	}
 	if info.Valid {
-		t.Error("самоподписанный сертификат признан valid")
+		t.Error("a self-signed certificate recognized as valid")
 	}
 	if !info.SelfSigned {
-		t.Error("SelfSigned не выставлен")
+		t.Error("SelfSigned is not set")
 	}
 	if len(info.Problems) != 1 || info.Problems[0] != TLSProblemSelfSigned {
-		t.Errorf("причины: получено %v, ожидалась [self_signed]", info.Problems)
+		t.Errorf("reasons: got %v, [self_signed] expected", info.Problems)
 	}
 	if info.ChainLength != 1 || len(info.ChainSubjects) != 1 {
-		t.Errorf("цепочка самоподписанного: длина %d, субъекты %v", info.ChainLength, info.ChainSubjects)
+		t.Errorf("the self-signed chain: length %d, subjects %v", info.ChainLength, info.ChainSubjects)
 	}
 }
 
@@ -290,33 +290,33 @@ func TestTLSInfoFields(t *testing.T) {
 	}
 
 	if info.SubjectCommonName != "fields.example.net" || info.SubjectOrganization != "Leaf Org" {
-		t.Errorf("субъект: CN=%q O=%q", info.SubjectCommonName, info.SubjectOrganization)
+		t.Errorf("the subject: CN=%q O=%q", info.SubjectCommonName, info.SubjectOrganization)
 	}
 	if info.IssuerCommonName != "Fields CA" || info.IssuerOrganization != "tlsinfo tests" {
-		t.Errorf("издатель: CN=%q O=%q", info.IssuerCommonName, info.IssuerOrganization)
+		t.Errorf("the issuer: CN=%q O=%q", info.IssuerCommonName, info.IssuerOrganization)
 	}
 	if info.SerialNumber != "2a" {
-		t.Errorf("серийный номер: %q, ожидался 2a (hex)", info.SerialNumber)
+		t.Errorf("the serial number: %q, 2a (hex) expected", info.SerialNumber)
 	}
 	if !info.NotBefore.Equal(notBefore) || !info.NotAfter.Equal(notAfter) {
-		t.Errorf("срок действия: %v…%v, ожидался %v…%v", info.NotBefore, info.NotAfter, notBefore, notAfter)
+		t.Errorf("the validity: %v…%v, %v…%v expected", info.NotBefore, info.NotAfter, notBefore, notAfter)
 	}
 	if len(info.DNSNames) != 1 || info.DNSNames[0] != "fields.example.net" {
 		t.Errorf("SAN DNS: %v", info.DNSNames)
 	}
 	wantIPs := []netip.Addr{netip.MustParseAddr("127.0.0.1"), netip.MustParseAddr("2001:db8::1")}
 	if len(info.IPAddresses) != 2 || info.IPAddresses[0] != wantIPs[0] || info.IPAddresses[1] != wantIPs[1] {
-		t.Errorf("SAN IP: %v, ожидался %v", info.IPAddresses, wantIPs)
+		t.Errorf("SAN IPs: %v, %v expected", info.IPAddresses, wantIPs)
 	}
 	if info.ChainLength != 2 {
-		t.Errorf("длина цепочки: %d, ожидалась 2", info.ChainLength)
+		t.Errorf("the chain length: %d, 2 expected", info.ChainLength)
 	}
 	wantSubjects := []string{leaf.Subject.String(), ca.cert.Subject.String()}
 	if len(info.ChainSubjects) != 2 || info.ChainSubjects[0] != wantSubjects[0] || info.ChainSubjects[1] != wantSubjects[1] {
-		t.Errorf("субъекты цепочки: %v, ожидался %v", info.ChainSubjects, wantSubjects)
+		t.Errorf("the chain subjects: %v, %v expected", info.ChainSubjects, wantSubjects)
 	}
 	if !info.Valid || info.SelfSigned {
-		t.Errorf("CA-подписанный сертификат в окне: valid=%v self_signed=%v, ожидалось true/false", info.Valid, info.SelfSigned)
+		t.Errorf("a CA-signed certificate inside the window: valid=%v self_signed=%v, true/false expected", info.Valid, info.SelfSigned)
 	}
 
 	// JSON tags: the subdomain_results.tls column (jsonb) — the
@@ -327,15 +327,15 @@ func TestTLSInfoFields(t *testing.T) {
 	}
 	var m map[string]any
 	if err := json.Unmarshal(b, &m); err != nil {
-		t.Fatalf("разбор json: %v", err)
+		t.Fatalf("parsing the json: %v", err)
 	}
 	for _, key := range []string{"valid", "not_before", "not_after", "chain_length", "serial"} {
 		if _, ok := m[key]; !ok {
-			t.Errorf("json без ключа %q: %s", key, b)
+			t.Errorf("the json without the key %q: %s", key, b)
 		}
 	}
 	if _, ok := m["problems"]; ok {
-		t.Errorf("пустые problems не опущены: %s", b)
+		t.Errorf("empty problems are not omitted: %s", b)
 	}
 }
 
@@ -343,10 +343,10 @@ func TestTLSInfoFields(t *testing.T) {
 // certificates is nil, not an error (§8).
 func TestTLSInfoNoTLS(t *testing.T) {
 	if got := NewTLSInfo(nil, "x.example.net"); got != nil {
-		t.Errorf("nil-состояние: получено %v", got)
+		t.Errorf("a nil state: got %v", got)
 	}
 	if got := NewTLSInfo(&tls.ConnectionState{}, "x.example.net"); got != nil {
-		t.Errorf("без PeerCertificates: получено %v", got)
+		t.Errorf("without PeerCertificates: got %v", got)
 	}
 }
 
@@ -366,17 +366,17 @@ func TestFetchTLSInfoSelfSigned(t *testing.T) {
 
 	res := fetchInsecure(t, hostURL(srv.URL, "self.example.net").String())
 	if res.TLS == nil || res.TLSInfo == nil {
-		t.Fatalf("TLS-соединение не установлено: TLS=%v TLSInfo=%v", res.TLS, res.TLSInfo)
+		t.Fatalf("the TLS connection is not established: TLS=%v TLSInfo=%v", res.TLS, res.TLSInfo)
 	}
 	info := res.TLSInfo
 	if info.Valid || len(info.Problems) != 1 || info.Problems[0] != TLSProblemSelfSigned {
-		t.Errorf("самоподписанный сервер: valid=%v problems=%v", info.Valid, info.Problems)
+		t.Errorf("a self-signed server: valid=%v problems=%v", info.Valid, info.Problems)
 	}
 	if !info.SelfSigned || info.ChainLength != 1 {
 		t.Errorf("SelfSigned=%v ChainLength=%d", info.SelfSigned, info.ChainLength)
 	}
 	if info.SubjectCommonName != "self.example.net" {
-		t.Errorf("CN субъекта: %q", info.SubjectCommonName)
+		t.Errorf("the subject CN: %q", info.SubjectCommonName)
 	}
 }
 
@@ -399,29 +399,29 @@ func TestFetchTLSInfoChainAndHostname(t *testing.T) {
 	}
 	info := res.TLSInfo
 	if !info.Valid {
-		t.Errorf("SAN-матч: valid=%v problems=%v", info.Valid, info.Problems)
+		t.Errorf("a SAN match: valid=%v problems=%v", info.Valid, info.Problems)
 	}
 	if info.SelfSigned {
-		t.Error("CA-подписанный лист помечен самоподписанным")
+		t.Error("a CA-signed leaf is marked self-signed")
 	}
 	if info.IssuerCommonName != "Chain CA" {
-		t.Errorf("издатель: %q, ожидался Chain CA", info.IssuerCommonName)
+		t.Errorf("the issuer: %q, Chain CA expected", info.IssuerCommonName)
 	}
 	if info.ChainLength != 2 {
-		t.Errorf("длина цепочки: %d, ожидалась 2 (лист+CA)", info.ChainLength)
+		t.Errorf("the chain length: %d, 2 expected (leaf+CA)", info.ChainLength)
 	}
 	wantSubjects := []string{leaf.Subject.String(), ca.cert.Subject.String()}
 	if len(info.ChainSubjects) != 2 || info.ChainSubjects[0] != wantSubjects[0] || info.ChainSubjects[1] != wantSubjects[1] {
-		t.Errorf("субъекты цепочки: %v, ожидался %v", info.ChainSubjects, wantSubjects)
+		t.Errorf("the chain subjects: %v, %v expected", info.ChainSubjects, wantSubjects)
 	}
 
 	res = fetchInsecure(t, hostURL(srv.URL, "wrong.example.net").String())
 	if res.TLSInfo == nil {
-		t.Fatal("TLSInfo nil при мисматче")
+		t.Fatal("TLSInfo nil on a mismatch")
 	}
 	if res.TLSInfo.Valid || len(res.TLSInfo.Problems) != 1 ||
 		res.TLSInfo.Problems[0] != TLSProblemHostnameMismatch {
-		t.Errorf("SAN-мисс: valid=%v problems=%v", res.TLSInfo.Valid, res.TLSInfo.Problems)
+		t.Errorf("a SAN mismatch: valid=%v problems=%v", res.TLSInfo.Valid, res.TLSInfo.Problems)
 	}
 }
 
@@ -434,7 +434,7 @@ func TestFetchTLSInfoPlainHTTP(t *testing.T) {
 
 	res := fetchInsecure(t, srv.URL)
 	if res.TLS != nil || res.TLSInfo != nil {
-		t.Errorf("http без TLS: TLS=%v TLSInfo=%v, ожидалось nil/nil", res.TLS, res.TLSInfo)
+		t.Errorf("http without TLS: TLS=%v TLSInfo=%v, nil/nil expected", res.TLS, res.TLSInfo)
 	}
 }
 
@@ -451,28 +451,28 @@ func (tlsTestNetError) Temporary() bool { return true }
 // from network ones (timeouts, cancellation) and others.
 func TestIsTLSCertError(t *testing.T) {
 	cert := &x509.Certificate{}
-	verifyErr := &tls.CertificateVerificationError{Err: errors.New("проверка не прошла")}
+	verifyErr := &tls.CertificateVerificationError{Err: errors.New("verification failed")}
 	cases := []struct {
 		name string
 		err  error
 		want bool
 	}{
 		{"nil", nil, false},
-		{"верификация", verifyErr, true},
-		{"обёрнутая верификация", fmt.Errorf("httpfetch: GET https://x: %w", verifyErr), true},
+		{"verification", verifyErr, true},
+		{"a wrapped verification", fmt.Errorf("httpfetch: GET https://x: %w", verifyErr), true},
 		{"hostname", x509.HostnameError{Certificate: cert, Host: "h"}, true},
-		{"истёк", x509.CertificateInvalidError{Cert: cert, Reason: x509.Expired}, true},
-		{"неизвестный издатель", x509.UnknownAuthorityError{Cert: cert}, true},
-		{"нет системных корней", x509.SystemRootsError{}, true},
-		{"не-TLS ответ", tls.RecordHeaderError{Msg: "first record does not look like a TLS handshake"}, true},
-		{"отказ предупреждением", tls.AlertError(40), true},
-		{"сетевой таймаут", tlsTestNetError{}, false},
-		{"отмена контекста", context.DeadlineExceeded, false},
-		{"прочее", errors.New("обычная ошибка"), false},
+		{"expired", x509.CertificateInvalidError{Cert: cert, Reason: x509.Expired}, true},
+		{"an unknown issuer", x509.UnknownAuthorityError{Cert: cert}, true},
+		{"no system roots", x509.SystemRootsError{}, true},
+		{"a non-TLS response", tls.RecordHeaderError{Msg: "first record does not look like a TLS handshake"}, true},
+		{"refused by an alert", tls.AlertError(40), true},
+		{"a network timeout", tlsTestNetError{}, false},
+		{"a context cancellation", context.DeadlineExceeded, false},
+		{"other", errors.New("an ordinary error"), false},
 	}
 	for _, tc := range cases {
 		if got := IsTLSCertError(tc.err); got != tc.want {
-			t.Errorf("%s: IsTLSCertError=%v, ожидалось %v", tc.name, got, tc.want)
+			t.Errorf("%s: IsTLSCertError=%v, %v expected", tc.name, got, tc.want)
 		}
 	}
 }

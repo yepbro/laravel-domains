@@ -8,84 +8,6 @@ package web
 // escaped by the template.
 type messages map[string]string
 
-var ruMessages = messages{
-	"title":         "LaraSites — Открой для себя сайты на Laravel",
-	"description":   "LaraSites находит сайты на Laravel: мгновенная проверка домена, каталог проектов, статистика и свежие находки. Подписывайтесь на обновления в Telegram.",
-	"sharing.title": "LaraSites",
-	"sharing.desc":  "Laravel-проекты, живые примеры и статистика.",
-
-	"header.nav_statistics":        "Статистика",
-	"header.nav_catalog":           "Каталог",
-	"header.nav_latest":            "Уже найдено",
-	"header.nav_how_it_works":      "Как это работает",
-	"header.nav_domain_check_form": "Проверить домен",
-	"header.nav_contacts":          "Контакты",
-
-	"hero.title":         "Мы находим Laravel там, где его не видно",
-	"hero.subtitle":      "Сканируем миллионы доменов и детектим Laravel — даже если он работает только как API.",
-	"hero.cta_primary":   "Проверить свой домен",
-	"hero.cta_secondary": "Посмотреть найденные сайты",
-
-	"statistics.title":         "Статистика",
-	"statistics.total_zones":   "Всего зон",
-	"statistics.total_domains": "Всего доменов",
-	"statistics.checked":       "Проверено доменов",
-	"statistics.with_laravel":  "Найдено доменов с Laravel",
-	"statistics.per_day":       "Находок за 24 часа",
-
-	"zone_cloud.title":    "Самые популярные доменные зоны",
-	"zone_cloud.subtitle": "Наведи на зону, чтобы увидеть, сколько доменов с Laravel в базе",
-	"zone_cloud.domains":  "Laravel доменов",
-
-	"zone_table.zone":       "Имя зоны",
-	"zone_table.checked":    "Проверено доменов",
-	"zone_table.laravel":    "Доменов с Laravel",
-	"zone_table.percentage": "Процент доменов с Laravel",
-	"zone_table.empty":      "Зоны ещё не добавлены.",
-
-	"form.title":         "Проверь домен на Laravel",
-	"form.label":         "Моментальная проверка",
-	"form.placeholder":   "домен.рф или example.com",
-	"form.help":          "Поддерживаются домены любого уровня и IDN (национальные домены).",
-	"form.button":        "Проверить домен",
-	"form.found":         "Laravel: найден",
-	"form.not_found":     "Laravel: не найден",
-	"form.error":         "Не удалось проверить — попробуйте позже",
-	"form.rate_limited":  "Не более 4 проверок в минуту",
-	"form.invalid":       "Неверный формат домена или URL",
-	"form.server_error":  "Ошибка сервера — попробуйте позже",
-	"form.details.title": "Информация о проверке",
-
-	"latest.title":    "Последние найденные проекты на Laravel",
-	"latest.subtitle": "Мы обновляем список по мере сканирования.",
-	"latest.empty":    "Домены ещё не найдены.",
-	"latest.updated":  "Обновлено",
-	"latest.catalog":  "Перейти в каталог",
-
-	"how.title":    "Как это работает",
-	"how.s1.title": "Загружаем списки доменов",
-	"how.s1.desc":  "Зоны регистраторов и публичные даммы дают миллионы имён — конвейер ставит их в очередь проверки.",
-	"how.s2.title": "Проверяем DNS и поддомены",
-	"how.s2.desc":  "Резолвим апекс и поддомены www/api/app/crm/admin, затем HTTP обеих схем — чтобы найти Laravel даже в API-only конфигурациях.",
-	"how.s3.title": "Анализируем сигналы",
-	"how.s3.desc":  "Пассивно анализируем уже скачанные страницы: куки XSRF-TOKEN и шифрованные конверты, сборку Vite/Mix, welcome-страницы и JSON-ответы API.",
-
-	"telegram.title":    "Новости LaraCity в Telegram",
-	"telegram.subtitle": "Апдейты парсера, каталога и других проектов экосистемы.",
-	"telegram.button":   "Подписаться в Telegram",
-
-	"catalog.title":  "Каталог сайтов на Laravel",
-	"catalog.desc":   "Реальные проекты, живые примеры на этом фреймворке.",
-	"catalog.button": "Перейти в каталог",
-
-	"contacts.title":    "Контакты",
-	"contacts.email":    "denis@yepbro.ru",
-	"contacts.telegram": "https://t.me/yepbro_ru",
-
-	"footer.copyright":      "© 2025 LaraCity",
-	"footer.not_affiliated": "Not affiliated with Laravel.",
-}
-
 var enMessages = messages{
 	"title":         "LaraSites — Discover Laravel-powered sites",
 	"description":   "LaraSites finds sites built with Laravel: instant domain check, project catalog, statistics and fresh discoveries. Subscribe to updates on Telegram.",
@@ -173,4 +95,8 @@ func localeMessages(locale string) messages {
 	return localeMessagesMap[DefaultLocale]
 }
 
-var localeMessagesMap = map[string]messages{"ru": ruMessages, "en": enMessages}
+// The owner decision (stage eng-55): English is the landing content for
+// both locales — the i18n mechanism (locale routing, the dictionary
+// lookup, hreflang/sitemap of both locales) is kept, the /ru route serves
+// the same English dictionary.
+var localeMessagesMap = map[string]messages{"ru": enMessages, "en": enMessages}

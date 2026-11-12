@@ -68,7 +68,7 @@ func postFormUnix(t *testing.T, c *http.Client, realIP, xff string) int {
 	}
 	resp, err := c.Do(req)
 	if err != nil {
-		t.Fatalf("POST формы: %v", err)
+		t.Fatalf("POSTing the form: %v", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	return resp.StatusCode
@@ -115,27 +115,27 @@ func TestCheckDomainUnixSocketBuckets(t *testing.T) {
 	// — the second passes (before T-221 the "@" peer was not trusted and
 	// all visitors shared one bucket: 4 checks/min for the whole site).
 	if st := postFormUnix(t, client, "198.51.100.1", ""); st != http.StatusOK {
-		t.Fatalf("первый запрос c X-Real-IP A: %d, хочу 200", st)
+		t.Fatalf("the first request with X-Real-IP A: %d, want 200", st)
 	}
 	if st := postFormUnix(t, client, "198.51.100.1", ""); st != http.StatusTooManyRequests {
-		t.Fatalf("повтор с X-Real-IP A: %d, хочу 429 (лимит 1 исчерпан)", st)
+		t.Fatalf("a repeat with X-Real-IP A: %d, want 429 (the limit 1 is exhausted)", st)
 	}
 	if st := postFormUnix(t, client, "198.51.100.2", ""); st != http.StatusOK {
-		t.Fatalf("запрос с X-Real-IP B: %d, хочу 200 (бакет независим)", st)
+		t.Fatalf("a request with X-Real-IP B: %d, want 200 (an independent bucket)", st)
 	}
 	// X-Forwarded-For without X-Real-IP — the fallback address source:
 	// the key is the LAST entry (our proxy appended it; the client start
 	// of the list is not trusted — P1-1 of the T-221 review).
 	if st := postFormUnix(t, client, "", "6.6.6.6, 198.51.100.3"); st != http.StatusOK {
-		t.Fatalf("запрос с X-Forwarded-For C: %d, хочу 200 (свой бакет по последней позиции)", st)
+		t.Fatalf("a request with X-Forwarded-For C: %d, want 200 (its own bucket by the last entry)", st)
 	}
 	// A forged first entry of the XFF gives no new bucket: the same
 	// address at the end of the list — the limit is exhausted.
 	if st := postFormUnix(t, client, "", "1.2.3.4, 198.51.100.3"); st != http.StatusTooManyRequests {
-		t.Fatalf("подделка начала XFF: %d, хочу 429 (бакет один — по последней позиции)", st)
+		t.Fatalf("forging the start of the XFF: %d, want 429 (one bucket — by the last entry)", st)
 	}
 	if got := db.webCheckInserts(); got != 3 {
-		t.Fatalf("INSERT web_checks выполнен %d раз, хочу 3 (по одному на валидный IP)", got)
+		t.Fatalf("the INSERT web_checks ran %d times, want 3 (one per valid IP)", got)
 	}
 
 	// An "@" peer without headers: the shared label bucket — the first
@@ -143,19 +143,19 @@ func TestCheckDomainUnixSocketBuckets(t *testing.T) {
 	// (inet NOT NULL), the skip of each request is a Warn in the log.
 	warnsBefore := strings.Count(buf.String(), "web_checks")
 	if st := postFormUnix(t, client, "", ""); st != http.StatusOK {
-		t.Fatalf("первый запрос без заголовков: %d, хочу 200 (бакет-метка свеж)", st)
+		t.Fatalf("the first request without headers: %d, want 200 (the bucket key is fresh)", st)
 	}
 	if st := postFormUnix(t, client, "", ""); st != http.StatusTooManyRequests {
-		t.Fatalf("второй запрос без заголовков: %d, хочу 429 (общий бакет-метка)", st)
+		t.Fatalf("the second request without headers: %d, want 429 (the shared bucket key)", st)
 	}
 	if got := db.webCheckInserts(); got != 3 {
-		t.Fatalf("INSERT web_checks после не-IP пира: %d обращений, хочу по-прежнему 3 (запись не пытается)", got)
+		t.Fatalf("the INSERT web_checks after a non-IP peer: %d calls, still want 3 (no write is attempted)", got)
 	}
 	// The log skip — a Warn per each completed request (the first passed
 	// the limit and reached the log; the second — a 429, it did not
 	// reach the log).
 	if got, want := strings.Count(buf.String(), "web_checks")-warnsBefore, 1; got != want {
-		t.Errorf("Warn-ов пропуска журнала %d, хочу %d (не молча):\n%s", got, want, buf.String())
+		t.Errorf("%d journal-skip Warns, want %d (not silently):\n%s", got, want, buf.String())
 	}
 }
 
@@ -177,13 +177,13 @@ func TestCheckDomainUnixJournalError(t *testing.T) {
 	client := newUnixTestServer(t, srv.Handler())
 
 	if st := postFormUnix(t, client, "198.51.100.7", ""); st != http.StatusOK {
-		t.Fatalf("ответ при отказе журнала: %d, хочу 200 (best-effort)", st)
+		t.Fatalf("the response on a journal failure: %d, want 200 (best-effort)", st)
 	}
 	if !strings.Contains(buf.String(), "web_checks") {
-		t.Errorf("отказ INSERT web_checks не логируется:\n%s", buf.String())
+		t.Errorf("the INSERT web_checks failure is not logged:\n%s", buf.String())
 	}
 	if got := db.webCheckInserts(); got != 1 {
-		t.Fatalf("попыток INSERT web_checks %d, хочу 1", got)
+		t.Fatalf("INSERT web_checks attempts %d, want 1", got)
 	}
 }
 
@@ -206,10 +206,10 @@ func TestRecordCheckClientCanceled(t *testing.T) {
 	srv.recordCheck(ctx, "example.com", true, 0.5, 10, "198.51.100.1")
 
 	if got := db.webCheckInserts(); got != 1 {
-		t.Fatalf("INSERT web_checks при отменённом контексте клиента: %d, хочу 1 (журнал живёт своим окном)", got)
+		t.Fatalf("the INSERT web_checks with the client context canceled: %d, want 1 (the journal lives in its own window)", got)
 	}
 	if buf.Len() != 0 {
-		t.Errorf("отмена клиента отражена как отказ журнала (не должна):\n%s", buf.String())
+		t.Errorf("the client cancellation reflected as a journal failure (it must not be):\n%s", buf.String())
 	}
 }
 
@@ -267,15 +267,15 @@ func TestCheckDomainMetrics(t *testing.T) {
 
 	// ok + a log failure (journal): the first request from IP A.
 	if st := serveOn(srv, "203.0.113.1:1000", `{"domain":"example.com"}`); st != http.StatusOK {
-		t.Fatalf("ok-запрос: %d, хочу 200", st)
+		t.Fatalf("the ok request: %d, want 200", st)
 	}
 	// rate_limited: a repeat from the same IP A.
 	if st := serveOn(srv, "203.0.113.1:1000", `{"domain":"example.com"}`); st != http.StatusTooManyRequests {
-		t.Fatalf("повтор: %d, хочу 429", st)
+		t.Fatalf("a repeat: %d, want 429", st)
 	}
 	// invalid: a junk domain from IP B (the validation after the limit).
 	if st := serveOn(srv, "203.0.113.2:1000", `{"domain":"not a domain"}`); st != http.StatusUnprocessableEntity {
-		t.Fatalf("мусорный ввод: %d, хочу 422", st)
+		t.Fatalf("junk input: %d, want 422", st)
 	}
 
 	// busy: the semaphore slot is taken by a blocked pipeline (IP C),
@@ -292,11 +292,11 @@ func TestCheckDomainMetrics(t *testing.T) {
 	go func() { done <- serveOn(srv, "203.0.113.4:1000", `{"domain":"example.com"}`) }()
 	<-entered
 	if st := serveOn(srv, "203.0.113.5:1000", `{"domain":"example.com"}`); st != http.StatusServiceUnavailable {
-		t.Fatalf("запрос поверх занятого слота: %d, хочу 503 busy", st)
+		t.Fatalf("a request over a busy slot: %d, want 503 busy", st)
 	}
 	close(block)
 	if st := <-done; st != http.StatusOK {
-		t.Fatalf("занявший слот: %d, хочу 200", st)
+		t.Fatalf("the slot holder: %d, want 200", st)
 	}
 
 	// failed + a live error: a pipeline failure without stored data (a
@@ -307,13 +307,13 @@ func TestCheckDomainMetrics(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 	failing.liveCheck = func(context.Context, *config.Config, checker.Pool, string, checker.Logger) (*checker.Result, error) {
-		return nil, errors.New("конвейер недоступен")
+		return nil, errors.New("the pipeline is unavailable")
 	}
 	if st := serveOn(failing, "203.0.113.3:1000", `{"domain":"example.com"}`); st != http.StatusBadGateway {
-		t.Fatalf("сбой конвейера: %d, хочу 502", st)
+		t.Fatalf("a pipeline failure: %d, want 502", st)
 	}
 	if st := serveOn(failing, "@", `{"domain":"example.com"}`); st != http.StatusBadGateway {
-		t.Fatalf("unix-пир без заголовков: %d, хочу 502 (сбой конвейера, stored нет)", st)
+		t.Fatalf("a unix peer without headers: %d, want 502 (a pipeline failure, no stored data)", st)
 	}
 
 	// stored_only: the live check failed, the domain is known to the
@@ -326,7 +326,7 @@ func TestCheckDomainMetrics(t *testing.T) {
 	}
 	stored.liveCheck = failing.liveCheck
 	if st := serveOn(stored, "203.0.113.6:1000", `{"domain":"example.com"}`); st != http.StatusOK {
-		t.Fatalf("сбой конвейера с сохранёнными данными: %d, хочу 200 (stored_only)", st)
+		t.Fatalf("a pipeline failure with stored data: %d, want 200 (stored_only)", st)
 	}
 
 	for _, tc := range []struct {
@@ -345,7 +345,7 @@ func TestCheckDomainMetrics(t *testing.T) {
 		{"errors type=non_ip", counterByLabels(t, reg, "crawler_web_check_errors_total", map[string]string{"type": "non_ip"}), 1},
 	} {
 		if tc.got != tc.want {
-			t.Errorf("%s = %v, хочу %v", tc.name, tc.got, tc.want)
+			t.Errorf("%s = %v, want %v", tc.name, tc.got, tc.want)
 		}
 	}
 
@@ -368,7 +368,7 @@ func TestCheckDomainMetrics(t *testing.T) {
 		}
 	}
 	if !histogramObserved {
-		t.Error("crawler_web_check_seconds без 5 наблюдений (2 ok + 2 failed + 1 stored_only)")
+		t.Error("crawler_web_check_seconds without 5 observations (2 ok + 2 failed + 1 stored_only)")
 	}
 
 	// Serving the registry by the /metrics handler (like the framework
@@ -380,7 +380,7 @@ func TestCheckDomainMetrics(t *testing.T) {
 		"crawler_web_checks_total", "crawler_web_check_errors_total", "crawler_web_check_seconds",
 	} {
 		if !strings.Contains(body, want) {
-			t.Errorf("/metrics не отдаёт %s", want)
+			t.Errorf("/metrics does not serve %s", want)
 		}
 	}
 }

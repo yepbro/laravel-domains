@@ -45,7 +45,7 @@ const (
 // credentials are mandatory (dashboard spec §7.7).
 func Generate(password string, iterations int) (string, error) {
 	if password == "" {
-		return "", fmt.Errorf("пароль пуст")
+		return "", fmt.Errorf("the password is empty")
 	}
 	if iterations <= 0 {
 		iterations = DefaultIterations
@@ -57,7 +57,7 @@ func Generate(password string, iterations int) (string, error) {
 	// a fatal process crash, not a Generate error.
 	// mutator-disable-next-line branch/if
 	if _, err := rand.Read(salt); err != nil {
-		return "", fmt.Errorf("соль: %w", err)
+		return "", fmt.Errorf("salt: %w", err)
 	}
 	key, err := pbkdf2.Key(sha256.New, password, salt, iterations, KeyLen)
 	// Unreachable branch (T-M11): pbkdf2.Key fails only when keyLength
@@ -96,25 +96,25 @@ type PasswordHash struct {
 func Parse(s string) (PasswordHash, error) {
 	parts := strings.Split(s, "$")
 	if len(parts) != 4 || parts[0] != Scheme {
-		return PasswordHash{}, fmt.Errorf("ожидается строка вида %s$<итерации>$<соль-b64>$<ключ-b64>", Scheme)
+		return PasswordHash{}, fmt.Errorf("a string of the form %s$<iterations>$<salt-b64>$<key-b64> is expected", Scheme)
 	}
 	iter, err := strconv.Atoi(parts[1])
 	if err != nil || iter < 1 {
-		return PasswordHash{}, fmt.Errorf("итерации: ожидается положительное целое, получено %q", parts[1])
+		return PasswordHash{}, fmt.Errorf("iterations: a positive integer is expected, got %q", parts[1])
 	}
 	salt, err := base64.StdEncoding.DecodeString(parts[2])
 	if err != nil {
-		return PasswordHash{}, fmt.Errorf("соль: base64: %w", err)
+		return PasswordHash{}, fmt.Errorf("salt: base64: %w", err)
 	}
 	if len(salt) < MinSaltLen {
-		return PasswordHash{}, fmt.Errorf("соль: минимум %d байт, получено %d", MinSaltLen, len(salt))
+		return PasswordHash{}, fmt.Errorf("salt: minimum %d bytes, got %d", MinSaltLen, len(salt))
 	}
 	key, err := base64.StdEncoding.DecodeString(parts[3])
 	if err != nil {
-		return PasswordHash{}, fmt.Errorf("ключ: base64: %w", err)
+		return PasswordHash{}, fmt.Errorf("key: base64: %w", err)
 	}
 	if len(key) != KeyLen {
-		return PasswordHash{}, fmt.Errorf("ключ: ровно %d байт, получено %d", KeyLen, len(key))
+		return PasswordHash{}, fmt.Errorf("key: exactly %d bytes, got %d", KeyLen, len(key))
 	}
 	return PasswordHash{Iterations: iter, Salt: salt, Key: key}, nil
 }

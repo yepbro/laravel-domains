@@ -74,15 +74,15 @@ func NewMetrics(reg *metrics.Registry) *Metrics {
 	return &Metrics{
 		checks: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_web_checks_total",
-			Help: "Запросы формы проверки домена по исходам: ok — живая проверка прошла (200), stored_only — живая сбоила, ответ из сохранённых данных (200), failed — живая сбоила без сохранённых данных (502), busy — перегруз семафора живых проверок (503), rate_limited — рейт-лимит формы (429), invalid — мусорный ввод (422).",
+			Help: "Domain check form requests by outcome: ok — the live check passed (200), stored_only — the live check failed, the answer is assembled from the stored data (200), failed — the live check failed with no stored data (502), busy — the live check semaphore is overloaded (503), rate_limited — the form rate limit (429), invalid — junk input (422).",
 		}, "result"),
 		errors: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_web_check_errors_total",
-			Help: "Сбои формы проверки по классам: live — конвейер живой проверки не удался (перегруз — исход busy, не ошибка), journal — INSERT web_checks не удался (строка журнала потеряна), non_ip — адрес клиента не IP (unix-сокет без валидного заголовка прокси), запись журнала пропущена.",
+			Help: "Domain check form failures by class: live — the live check pipeline failed (an overload is the busy outcome, not an error), journal — the INSERT into web_checks failed (a journal row is lost), non_ip — the client address is not an IP (a unix socket without a valid proxy header), the journal entry is skipped.",
 		}, metrics.LabelType),
 		seconds: reg.MustHistogram(prometheus.HistogramOpts{
 			Name:    "crawler_web_check_seconds",
-			Help:    "Полное время обработки запроса формы, прошедшего лимит и валидацию (stored-чтение, живая проверка, запись журнала; 429/422/перегруз 503 не наблюдаются — работы не выполняли).",
+			Help:    "The full processing time of a form request that passed the rate limit and validation (the stored read, the live check, the journal write; 429/422 and the 503 overload are not observed — no work was done).",
 			Buckets: webCheckSecondsBuckets,
 		}).WithLabelValues(),
 	}

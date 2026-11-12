@@ -47,11 +47,11 @@ func loopbackAddr() []netip.Addr {
 func hostURL(base, host string) *url.URL {
 	u, err := url.Parse(base)
 	if err != nil {
-		panic(fmt.Sprintf("тестовый URL %q: %v", base, err))
+		panic(fmt.Sprintf("test URL %q: %v", base, err))
 	}
 	_, port, err := net.SplitHostPort(u.Host)
 	if err != nil {
-		panic(fmt.Sprintf("тестовый URL %q без порта: %v", base, err))
+		panic(fmt.Sprintf("test URL %q without a port: %v", base, err))
 	}
 	u.Host = net.JoinHostPort(host, port)
 	return u
@@ -86,7 +86,7 @@ func newTestFetcher(t *testing.T, opts Options, dial dialFunc) (*Fetcher, func()
 func TestDialAddrsFallback(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatalf("слушатель: %v", err)
+		t.Fatalf("listener: %v", err)
 	}
 	defer func() { _ = ln.Close() }()
 
@@ -110,21 +110,21 @@ func TestDialAddrsFallback(t *testing.T) {
 		[]netip.Addr{netip.MustParseAddr("203.0.113.1"), netip.MustParseAddr("192.0.2.10")}, "80")
 	elapsed := time.Since(start)
 	if err != nil || conn == nil {
-		t.Fatalf("ожидалось соединение через второй адрес: %v", err)
+		t.Fatalf("a connection via the second address expected: %v", err)
 	}
 	defer func() { _ = conn.Close() }()
 	if elapsed < 40*time.Millisecond {
-		t.Errorf("фолбэк раньше паузы FallbackDelay: %s", elapsed)
+		t.Errorf("the fallback before the FallbackDelay pause: %s", elapsed)
 	}
 	got := calls()
 	if len(got) != 2 {
-		t.Errorf("попытки подключения: ожидалось 2 адреса, получено %v", got)
+		t.Errorf("connect attempts: 2 addresses expected, got %v", got)
 	}
 	// The hanging attempt must be canceled by the winner's return.
 	select {
 	case <-released:
 	case <-time.After(2 * time.Second):
-		t.Errorf("проигравшая попытка не отменена (утечка диала)")
+		t.Errorf("the losing attempt is not canceled (a dial leak)")
 	}
 }
 
@@ -133,7 +133,7 @@ func TestDialAddrsFallback(t *testing.T) {
 func TestDialAddrsFirstWins(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatalf("слушатель: %v", err)
+		t.Fatalf("listener: %v", err)
 	}
 	defer func() { _ = ln.Close() }()
 
@@ -148,11 +148,11 @@ func TestDialAddrsFirstWins(t *testing.T) {
 	conn, err := f.dialAddrs(context.Background(),
 		[]netip.Addr{netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2")}, "80")
 	if err != nil || conn == nil {
-		t.Fatalf("ожидалось соединение: %v", err)
+		t.Fatalf("a connection expected: %v", err)
 	}
 	_ = conn.Close()
 	if got := calls(); len(got) != 1 {
-		t.Errorf("после успеха первого адреса запущено попыток: %d (ожидалась 1)", len(got))
+		t.Errorf("attempts started after the first address succeeded: %d (1 expected)", len(got))
 	}
 }
 
@@ -160,7 +160,7 @@ func TestDialAddrsFirstWins(t *testing.T) {
 // starts the next one without a pause — a sequential fallback with no
 // latency.
 func TestDialAddrsAllFailImmediate(t *testing.T) {
-	boom := errors.New("сеть недоступна")
+	boom := errors.New("network unavailable")
 	f, calls := newTestFetcher(t, Options{
 		ConnectTimeout: 2 * time.Second,
 		FallbackDelay:  500 * time.Millisecond, // the pause must not fire
@@ -173,13 +173,13 @@ func TestDialAddrsAllFailImmediate(t *testing.T) {
 		[]netip.Addr{netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2"), netip.MustParseAddr("192.0.2.3")}, "80")
 	elapsed := time.Since(start)
 	if err == nil || !errors.Is(err, boom) {
-		t.Fatalf("ожидалась ошибка последней попытки: %v", err)
+		t.Fatalf("the last attempt error expected: %v", err)
 	}
 	if got := calls(); len(got) != 3 {
-		t.Errorf("попыток: %d, ожидалось 3 (все адреса)", len(got))
+		t.Errorf("attempts: %d, 3 expected (all addresses)", len(got))
 	}
 	if elapsed >= 500*time.Millisecond {
-		t.Errorf("фолбэк ждал паузу при мгновенных отказах: %s", elapsed)
+		t.Errorf("the fallback waited for the pause on instant failures: %s", elapsed)
 	}
 }
 
@@ -195,7 +195,7 @@ func TestDialAddrsConnectTimeout(t *testing.T) {
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-time.After(10 * time.Second):
-			return nil, errors.New("диал не был прерван")
+			return nil, errors.New("the dial was not interrupted")
 		}
 	})
 
@@ -204,16 +204,16 @@ func TestDialAddrsConnectTimeout(t *testing.T) {
 		[]netip.Addr{netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2")}, "80")
 	elapsed := time.Since(start)
 	if err == nil {
-		t.Fatal("ожидалась ошибка connect-таймаута")
+		t.Fatal("a connect-timeout error expected")
 	}
 	if !IsTimeout(err) {
-		t.Errorf("connect-таймаут не распознан IsTimeout: %v", err)
+		t.Errorf("the connect timeout is not recognized by IsTimeout: %v", err)
 	}
 	if got := calls(); len(got) != 2 {
-		t.Errorf("попыток: %d, ожидалось 2", len(got))
+		t.Errorf("attempts: %d, 2 expected", len(got))
 	}
 	if elapsed >= 2*time.Second {
-		t.Errorf("connect-таймаут сработал слишком поздно: %s", elapsed)
+		t.Errorf("the connect timeout fired too late: %s", elapsed)
 	}
 }
 
@@ -254,7 +254,7 @@ func TestDialAddrsCancelAfterWinner(t *testing.T) {
 		if err != nil {
 			if !errors.Is(err, context.Canceled) {
 				cancel()
-				t.Fatalf("ожидалась ошибка отмены, получено: %v", err)
+				t.Fatalf("a cancellation error expected, got: %v", err)
 			}
 			cancelled++
 			continue
@@ -263,7 +263,7 @@ func TestDialAddrsCancelAfterWinner(t *testing.T) {
 		cancel()
 	}
 	if cancelled == 0 {
-		t.Fatal("гонка не выполнилась: ни одного выхода по отмене")
+		t.Fatal("the race did not happen: not a single cancellation exit")
 	}
 	// Closing the losers/the cancellation winner is asynchronous: the
 	// attempt goroutine of the last iteration may be closing the
@@ -279,7 +279,7 @@ func TestDialAddrsCancelAfterWinner(t *testing.T) {
 	c, d := closed, created
 	mu.Unlock()
 	if c != d {
-		t.Errorf("закрыто %d из %d соединений — утечка победителя по отмене ctx", c, d)
+		t.Errorf("%d of %d connections closed — a cancellation-winner leak", c, d)
 	}
 }
 
@@ -299,18 +299,18 @@ func (c *closeCountingConn) Close() error {
 func TestDialAddrsEmptyAndSingle(t *testing.T) {
 	f := NewFetcher(Options{})
 	if _, err := f.dialAddrs(context.Background(), nil, "80"); err == nil {
-		t.Error("пустой список адресов должен давать ошибку")
+		t.Error("an empty address list must produce an error")
 	}
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatalf("слушатель: %v", err)
+		t.Fatalf("listener: %v", err)
 	}
 	defer func() { _ = ln.Close() }()
 	conn, err := f.dialAddrs(context.Background(), loopbackAddr(),
 		strconv.Itoa(ln.Addr().(*net.TCPAddr).Port))
 	if err != nil {
-		t.Fatalf("единственный адрес: %v", err)
+		t.Fatalf("a single address: %v", err)
 	}
 	_ = conn.Close()
 }
@@ -336,31 +336,31 @@ func TestFetchBasic(t *testing.T) {
 	defer func() { _ = res.Body.Close() }()
 
 	if res.StatusCode != http.StatusOK || res.Status != "200 OK" {
-		t.Errorf("статус: %d %q", res.StatusCode, res.Status)
+		t.Errorf("status: %d %q", res.StatusCode, res.Status)
 	}
 	if res.Header.Get("X-Stage") != "http" {
-		t.Errorf("заголовок ответа не перенесён: %v", res.Header)
+		t.Errorf("the response header did not come through: %v", res.Header)
 	}
 	body, err := io.ReadAll(res.Body)
 	if err != nil {
-		t.Fatalf("чтение тела: %v", err)
+		t.Fatalf("body read: %v", err)
 	}
 	if string(body) != "hello" {
-		t.Errorf("тело: %q", body)
+		t.Errorf("body: %q", body)
 	}
 	if res.FinalURL.String() != u.String() {
-		t.Errorf("итоговый URL: %s, ожидался %s", res.FinalURL, u)
+		t.Errorf("final URL: %s, expected %s", res.FinalURL, u)
 	}
 	if res.TLS != nil {
-		t.Error("http-ответ не должен содержать TLS-состояние")
+		t.Error("an http response must not carry a TLS state")
 	}
 	if res.Elapsed <= 0 || res.Elapsed > 2*time.Second {
-		t.Errorf("время ответа вне разумных границ: %s", res.Elapsed)
+		t.Errorf("the response time is out of sane bounds: %s", res.Elapsed)
 	}
 	// The request host comes from the URL, the connection — by the DNS
 	// stage address.
 	if host, _, _ := net.SplitHostPort(gotHost.Load()); host != "www.example-test.net" {
-		t.Errorf("Host-заголовок: %q, ожидался www.example-test.net", gotHost.Load())
+		t.Errorf("the Host header: %q, www.example-test.net expected", gotHost.Load())
 	}
 	if gotUA.Load() != "TestCrawler/1.0 (contact: test@example.invalid)" {
 		t.Errorf("User-Agent: %q", gotUA.Load())
@@ -380,7 +380,7 @@ func TestFetchUsesProvidedAddrs(t *testing.T) {
 	})
 	f.res = ResolverFunc(func(ctx context.Context, host string) ([]netip.Addr, error) {
 		resolverCalls++
-		return nil, errors.New("резолвер не должен вызываться")
+		return nil, errors.New("the resolver must not be called")
 	})
 
 	res, err := f.Fetch(context.Background(), FetchRequest{URL: hostURL(srv.URL, "main.example.net"), Addrs: loopbackAddr()})
@@ -389,10 +389,10 @@ func TestFetchUsesProvidedAddrs(t *testing.T) {
 	}
 	_ = res.Body.Close()
 	if got := calls(); len(got) != 1 || got[0] != netip.MustParseAddr("127.0.0.1") {
-		t.Errorf("диал по адресам DNS-этапа: %v", got)
+		t.Errorf("dial by the DNS-stage addresses: %v", got)
 	}
 	if resolverCalls != 0 {
-		t.Errorf("резолвер вызван %d раз при наличии адресов", resolverCalls)
+		t.Errorf("the resolver was called %d times with addresses present", resolverCalls)
 	}
 }
 
@@ -432,21 +432,21 @@ func TestFetchHTTPS_HostAndSNIOverResolvedIP(t *testing.T) {
 
 	body, _ := io.ReadAll(res.Body)
 	if string(body) != "secure" {
-		t.Errorf("тело: %q", body)
+		t.Errorf("body: %q", body)
 	}
 	if res.TLS == nil {
-		t.Error("TLS-соединение не установлено")
+		t.Error("the TLS connection is not established")
 	}
 	select {
 	case sni := <-sniCh:
 		if sni != "sni-probe.example.net" {
-			t.Errorf("SNI: %q, ожидался sni-probe.example.net", sni)
+			t.Errorf("SNI: %q, sni-probe.example.net expected", sni)
 		}
 	default:
-		t.Error("ServerName не отправлен (SNI отсутствует)")
+		t.Error("ServerName not sent (no SNI)")
 	}
 	if host, _, _ := net.SplitHostPort(gotHost.Load()); host != "sni-probe.example.net" {
-		t.Errorf("Host: %q, ожидался sni-probe.example.net", gotHost.Load())
+		t.Errorf("Host: %q, sni-probe.example.net expected", gotHost.Load())
 	}
 }
 
@@ -464,7 +464,7 @@ func TestRoundTripResolvesHostsWithoutStageAddrs(t *testing.T) {
 		req, err := http.NewRequestWithContext(context.Background(), http.MethodGet,
 			hostURL(srv.URL, "redirect-target.example.net").String(), nil)
 		if err != nil {
-			t.Fatalf("запрос: %v", err)
+			t.Fatalf("request: %v", err)
 		}
 		return req
 	}
@@ -473,7 +473,7 @@ func TestRoundTripResolvesHostsWithoutStageAddrs(t *testing.T) {
 	plain := ResolverFunc(func(ctx context.Context, host string) ([]netip.Addr, error) {
 		calls++
 		if host != "redirect-target.example.net" {
-			t.Errorf("резолв неожидаемого хоста: %q", host)
+			t.Errorf("a resolve of an unexpected host: %q", host)
 		}
 		return loopbackAddr(), nil
 	})
@@ -487,7 +487,7 @@ func TestRoundTripResolvesHostsWithoutStageAddrs(t *testing.T) {
 		_ = resp.Body.Close()
 	}
 	if calls != 2 {
-		t.Errorf("без кэша: резолвов %d, ожидалось 2", calls)
+		t.Errorf("without the cache: %d resolves, 2 expected", calls)
 	}
 
 	cached := 0
@@ -499,12 +499,12 @@ func TestRoundTripResolvesHostsWithoutStageAddrs(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		resp, err := f2.RoundTrip(newReq())
 		if err != nil {
-			t.Fatalf("RoundTrip с кэшем #%d: %v", i+1, err)
+			t.Fatalf("RoundTrip with the cache #%d: %v", i+1, err)
 		}
 		_ = resp.Body.Close()
 	}
 	if cached != 1 {
-		t.Errorf("с кэшем: резолвов %d, ожидался 1", cached)
+		t.Errorf("with the cache: %d resolves, 1 expected", cached)
 	}
 }
 
@@ -518,21 +518,21 @@ func TestDialContextRedirectIPLiteral(t *testing.T) {
 	resolverCalls := 0
 	f := NewFetcher(Options{Resolver: ResolverFunc(func(ctx context.Context, host string) ([]netip.Addr, error) {
 		resolverCalls++
-		return nil, errors.New("резолвер не нужен для IP-литерала")
+		return nil, errors.New("the resolver is not needed for an IP literal")
 	})})
 
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet,
 		"http://127.0.0.1:"+port+"/", nil)
 	if err != nil {
-		t.Fatalf("запрос: %v", err)
+		t.Fatalf("request: %v", err)
 	}
 	resp, err := f.RoundTrip(req)
 	if err != nil {
-		t.Fatalf("RoundTrip к IP-литералу: %v", err)
+		t.Fatalf("RoundTrip to an IP literal: %v", err)
 	}
 	_ = resp.Body.Close()
 	if resolverCalls != 0 {
-		t.Errorf("IP-литерал вызвал резолвер (%d раз)", resolverCalls)
+		t.Errorf("an IP literal called the resolver (%d times)", resolverCalls)
 	}
 }
 
@@ -580,7 +580,7 @@ func TestAddrIsInternal(t *testing.T) {
 	}
 	for _, s := range internal {
 		if !AddrIsInternal(netip.MustParseAddr(s)) {
-			t.Errorf("AddrIsInternal(%s) = false, хочу true", s)
+			t.Errorf("AddrIsInternal(%s) = false, want true", s)
 		}
 	}
 	external := []string{
@@ -589,7 +589,7 @@ func TestAddrIsInternal(t *testing.T) {
 	}
 	for _, s := range external {
 		if AddrIsInternal(netip.MustParseAddr(s)) {
-			t.Errorf("AddrIsInternal(%s) = true, хочу false", s)
+			t.Errorf("AddrIsInternal(%s) = true, want false", s)
 		}
 	}
 }
@@ -613,10 +613,10 @@ func TestLookupBlocksInternalAddrs(t *testing.T) {
 
 	addrs, err := f.lookup(context.Background(), "mixed.example.net")
 	if err != nil {
-		t.Fatalf("резолв со внешним адресом: %v", err)
+		t.Fatalf("a resolve with an external address: %v", err)
 	}
 	if len(addrs) != 1 || addrs[0] != netip.MustParseAddr("192.0.2.10") {
-		t.Errorf("ожидался только внешний адрес, получено %v", addrs)
+		t.Errorf("only the external address expected, got %v", addrs)
 	}
 
 	for _, host := range []string{
@@ -627,7 +627,7 @@ func TestLookupBlocksInternalAddrs(t *testing.T) {
 		"::ffff:127.0.0.1", "::ffff:169.254.169.254", "::ffff:10.0.0.5", "::ffff:0.0.0.0",
 	} {
 		if _, err := f.lookup(context.Background(), host); err == nil {
-			t.Errorf("внутренний литерал %q не заблокирован", host)
+			t.Errorf("the internal literal %q is not blocked", host)
 		}
 	}
 	f2 := NewFetcher(Options{
@@ -637,7 +637,7 @@ func TestLookupBlocksInternalAddrs(t *testing.T) {
 		}),
 	})
 	if _, err := f2.lookup(context.Background(), "internal-only.example.net"); err == nil {
-		t.Error("ответ только с внутренними адресами не заблокирован")
+		t.Error("an answer with internal-only addresses is not blocked")
 	}
 
 	// The flag off — the previous behavior: the addresses pass as is.
@@ -647,7 +647,7 @@ func TestLookupBlocksInternalAddrs(t *testing.T) {
 		}),
 	})
 	if addrs, err := f3.lookup(context.Background(), "legacy.example.net"); err != nil || len(addrs) != 1 {
-		t.Errorf("без флага внутренние адреса должны проходить: %v %v", addrs, err)
+		t.Errorf("without the flag the internal addresses must pass: %v %v", addrs, err)
 	}
 }
 
@@ -669,8 +669,8 @@ func TestFetchBlocksInternalDNSAddrs(t *testing.T) {
 			URL:   redirectReqURL(srv.URL, "ssrf.example.net", "/start"),
 			Addrs: []netip.Addr{netip.MustParseAddr(addr)},
 		})
-		if err == nil || !strings.Contains(err.Error(), "внутренние") {
-			t.Errorf("%s: ожидалась блокировка внутренних адресов DNS-этапа, получено: %v", addr, err)
+		if err == nil || !strings.Contains(err.Error(), "internal") {
+			t.Errorf("%s: a block of the DNS-stage internal addresses expected, got: %v", addr, err)
 		}
 	}
 	// A mixed list leaves the external ones — the funnel's semantics; the
@@ -684,12 +684,12 @@ func TestFetchBlocksInternalDNSAddrs(t *testing.T) {
 		},
 	})
 	if err != nil {
-		t.Fatalf("смешанный список адресов: %v", err)
+		t.Fatalf("a mixed address list: %v", err)
 	}
 	_ = res.Body.Close()
 	attempts := dialed()
 	if len(attempts) != 1 || attempts[0] != netip.MustParseAddr("203.0.113.10") {
-		t.Errorf("до диала дошли адреса %v, хочу только 203.0.113.10", attempts)
+		t.Errorf("the addresses that reached the dial %v, want only 203.0.113.10", attempts)
 	}
 
 	// The flag off — the DNS stage addresses pass as is (dev/testbed).
@@ -698,7 +698,7 @@ func TestFetchBlocksInternalDNSAddrs(t *testing.T) {
 	res2, err := f2.Fetch(context.Background(), FetchRequest{
 		URL: redirectReqURL(srv.URL, "dev.example.net", "/start"), Addrs: loopbackAddr()})
 	if err != nil {
-		t.Fatalf("без флага внутренние адреса DNS-этапа должны проходить: %v", err)
+		t.Fatalf("without the flag the DNS-stage internal addresses must pass: %v", err)
 	}
 	_ = res2.Body.Close()
 }
@@ -721,11 +721,11 @@ func TestFetchChainBlocksInternalRedirect(t *testing.T) {
 	got, err := FetchChain(context.Background(), f, FetchRequest{
 		URL:   redirectReqURL(srv.URL, "ssrf.example.net", "/start"),
 		Addrs: []netip.Addr{netip.MustParseAddr("203.0.113.10")}})
-	if err == nil || !strings.Contains(err.Error(), "внутренние") {
-		t.Fatalf("ожидалась блокировка внутреннего адреса, получено: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "internal") {
+		t.Fatalf("a block of the internal address expected, got: %v", err)
 	}
 	if len(got.Chain) != 1 {
-		t.Errorf("цепочка: %+v, ожидался 1 шаг (перехода нет)", got.Chain)
+		t.Errorf("chain: %+v, 1 step expected (no hop)", got.Chain)
 	}
 }
 
@@ -751,14 +751,14 @@ func TestFetchChainBlocksInternalRedirect4in6(t *testing.T) {
 		got, err := FetchChain(context.Background(), f, FetchRequest{
 			URL:   redirectReqURL(srv.URL, "ssrf.example.net", "/start"),
 			Addrs: []netip.Addr{netip.MustParseAddr("203.0.113.10")}})
-		if err == nil || !strings.Contains(err.Error(), "внутренние") {
-			t.Errorf("Location %s: ожидалась блокировка IPv4-в-IPv6 внутреннего литерала, получено: %v",
+		if err == nil || !strings.Contains(err.Error(), "internal") {
+			t.Errorf("Location %s: a block of the IPv4-in-IPv6 internal literal expected, got: %v",
 				location, err)
 			srv.Close()
 			continue
 		}
 		if len(got.Chain) != 1 {
-			t.Errorf("Location %s: цепочка %+v, ожидался 1 шаг (перехода нет)", location, got.Chain)
+			t.Errorf("Location %s: chain %+v, 1 step expected (no hop)", location, got.Chain)
 		}
 		srv.Close()
 	}
@@ -803,13 +803,13 @@ func TestFetchHeaderTimeout(t *testing.T) {
 	_, err := f.Fetch(context.Background(), FetchRequest{URL: hostURL(srv.URL, "tarpit.example.net"), Addrs: loopbackAddr()})
 	elapsed := time.Since(start)
 	if err == nil {
-		t.Fatal("ожидался таймаут заголовков")
+		t.Fatal("a header timeout expected")
 	}
 	if !IsTimeout(err) {
-		t.Errorf("таймаут заголовков не распознан IsTimeout: %v", err)
+		t.Errorf("the header timeout is not recognized by IsTimeout: %v", err)
 	}
 	if elapsed >= 2*time.Second {
-		t.Errorf("таймаут заголовков сработал поздно: %s", elapsed)
+		t.Errorf("the header timeout fired late: %s", elapsed)
 	}
 }
 
@@ -833,17 +833,17 @@ func TestFetchTotalTimeoutBodyTarpit(t *testing.T) {
 	f := NewFetcher(Options{TotalTimeout: 250 * time.Millisecond})
 	res, err := f.Fetch(context.Background(), FetchRequest{URL: hostURL(srv.URL, "tarpit.example.net"), Addrs: loopbackAddr()})
 	if err != nil {
-		t.Fatalf("заголовки должны успеть: %v", err)
+		t.Fatalf("the headers must make it in time: %v", err)
 	}
 	start := time.Now()
 	_, readErr := io.ReadAll(res.Body)
 	elapsed := time.Since(start)
 	_ = res.Body.Close()
 	if readErr == nil {
-		t.Fatal("чтение тела должно прерваться общим таймаутом")
+		t.Fatal("the body read must be interrupted by the total timeout")
 	}
 	if elapsed >= 2*time.Second {
-		t.Errorf("общий таймаут прервал чтение поздно: %s", elapsed)
+		t.Errorf("the total timeout interrupted the read late: %s", elapsed)
 	}
 }
 
@@ -852,7 +852,7 @@ func TestFetchTotalTimeoutBodyTarpit(t *testing.T) {
 func TestFetchTLSHandshakeTimeout(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatalf("слушатель: %v", err)
+		t.Fatalf("listener: %v", err)
 	}
 	conns := make(chan net.Conn, 16)
 	go func() {
@@ -887,13 +887,13 @@ func TestFetchTLSHandshakeTimeout(t *testing.T) {
 	_, err = f.Fetch(context.Background(), FetchRequest{URL: u, Addrs: loopbackAddr()})
 	elapsed := time.Since(start)
 	if err == nil {
-		t.Fatal("ожидался таймаут TLS-рукопожатия")
+		t.Fatal("a TLS handshake timeout expected")
 	}
 	if !IsTimeout(err) {
-		t.Errorf("таймаут TLS не распознан IsTimeout: %v", err)
+		t.Errorf("the TLS timeout is not recognized by IsTimeout: %v", err)
 	}
 	if elapsed >= 2*time.Second {
-		t.Errorf("таймаут TLS сработал поздно: %s", elapsed)
+		t.Errorf("the TLS timeout fired late: %s", elapsed)
 	}
 }
 
@@ -918,13 +918,13 @@ func TestFetchContextCancel(t *testing.T) {
 	_, err := f.Fetch(ctx, FetchRequest{URL: hostURL(srv.URL, "cancel.example.net"), Addrs: loopbackAddr()})
 	elapsed := time.Since(start)
 	if err == nil {
-		t.Fatal("ожидалась отмена запроса")
+		t.Fatal("a request cancellation expected")
 	}
 	if !errors.Is(err, context.Canceled) {
-		t.Errorf("ошибка отмены не пробрасывает context.Canceled: %v", err)
+		t.Errorf("the cancellation error does not propagate context.Canceled: %v", err)
 	}
 	if elapsed >= 2*time.Second {
-		t.Errorf("отмена сработала поздно: %s", elapsed)
+		t.Errorf("the cancellation fired late: %s", elapsed)
 	}
 }
 
@@ -933,7 +933,7 @@ func TestFetchConnectionRefused(t *testing.T) {
 	// stays in the request address.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatalf("слушатель: %v", err)
+		t.Fatalf("listener: %v", err)
 	}
 	_, port, _ := net.SplitHostPort(ln.Addr().String())
 	_ = ln.Close()
@@ -943,19 +943,19 @@ func TestFetchConnectionRefused(t *testing.T) {
 	res, err := f.Fetch(context.Background(), FetchRequest{URL: u, Addrs: loopbackAddr()})
 	if err == nil {
 		_ = res.Body.Close()
-		t.Fatal("ожидался отказ соединения")
+		t.Fatal("a connection refusal expected")
 	}
 	if res != nil {
-		t.Error("при ошибке результат не возвращается")
+		t.Error("no result is returned on an error")
 	}
 	if IsTimeout(err) {
-		t.Errorf("отказ соединения (RST) не таймаут: %v", err)
+		t.Errorf("a connection refusal (RST) is not a timeout: %v", err)
 	}
 	if !IsConnectFailure(err) {
-		t.Errorf("отказ соединения (RST) не распознан как отказ connect-фазы (T-164): %v", err)
+		t.Errorf("a connection refusal (RST) is not recognized as a connect-phase failure (T-164): %v", err)
 	}
 	if !strings.Contains(err.Error(), "gone.example.net") {
-		t.Errorf("ошибка без контекста запроса: %v", err)
+		t.Errorf("the error without the request context: %v", err)
 	}
 }
 
@@ -966,18 +966,18 @@ func TestFetchValidation(t *testing.T) {
 	u := &url.URL{Scheme: "http", Host: "x.example.net"}
 
 	if _, err := f.Fetch(context.Background(), FetchRequest{Addrs: loopbackAddr()}); err == nil {
-		t.Error("запрос без URL должен отклоняться")
+		t.Error("a request without a URL must be rejected")
 	}
 	bad := &url.URL{Scheme: "ftp", Host: "x.example.net"}
 	if _, err := f.Fetch(context.Background(), FetchRequest{URL: bad, Addrs: loopbackAddr()}); err == nil {
-		t.Error("не-http(s) схема должна отклоняться")
+		t.Error("a non-http(s) scheme must be rejected")
 	}
 	noHost := &url.URL{Scheme: "http"}
 	if _, err := f.Fetch(context.Background(), FetchRequest{URL: noHost, Addrs: loopbackAddr()}); err == nil {
-		t.Error("URL без хоста должен отклоняться")
+		t.Error("a URL without a host must be rejected")
 	}
 	if _, err := f.Fetch(context.Background(), FetchRequest{URL: u}); err == nil {
-		t.Error("запрос без адресов DNS-этапа должен отклоняться")
+		t.Error("a request without DNS-stage addresses must be rejected")
 	}
 }
 
@@ -993,10 +993,10 @@ func TestOptionsFromConfig(t *testing.T) {
 	o := NewOptions(cfg)
 	if o.ConnectTimeout != 3*time.Second || o.TLSHandshakeTimeout != 4*time.Second ||
 		o.HeaderTimeout != 7*time.Second || o.TotalTimeout != 15*time.Second {
-		t.Errorf("таймауты из конфигурации: %+v", o)
+		t.Errorf("the timeouts from the configuration: %+v", o)
 	}
 	if o.MaxBodyBytes != 1<<20 || o.UserAgent != "CfgCrawler/1.0" {
-		t.Errorf("лимит тела и UA из конфигурации: %+v", o)
+		t.Errorf("the body limit and UA from the configuration: %+v", o)
 	}
 
 	// Zero Options — the defaults of the spec 5.5 limits table.
@@ -1004,26 +1004,26 @@ func TestOptionsFromConfig(t *testing.T) {
 	if d.ConnectTimeout != DefaultConnectTimeout || d.TLSHandshakeTimeout != DefaultTLSHandshakeTimeout ||
 		d.HeaderTimeout != DefaultHeaderTimeout || d.TotalTimeout != DefaultTotalTimeout ||
 		d.FallbackDelay != DefaultFallbackDelay {
-		t.Errorf("дефолты таблицы лимитов: %+v", d)
+		t.Errorf("the limits-table defaults: %+v", d)
 	}
 }
 
 // TestIsTimeout — recognizing timeouts by error categories.
 func TestIsTimeout(t *testing.T) {
 	if !IsTimeout(context.DeadlineExceeded) {
-		t.Error("DeadlineExceeded — таймаут")
+		t.Error("DeadlineExceeded is a timeout")
 	}
-	if !IsTimeout(fmt.Errorf("обёртка: %w", context.DeadlineExceeded)) {
-		t.Error("обёрнутый DeadlineExceeded — таймаут")
+	if !IsTimeout(fmt.Errorf("wrap: %w", context.DeadlineExceeded)) {
+		t.Error("a wrapped DeadlineExceeded is a timeout")
 	}
 	if IsTimeout(context.Canceled) {
-		t.Error("отмена — не таймаут")
+		t.Error("a cancellation is not a timeout")
 	}
-	if IsTimeout(errors.New("просто ошибка")) {
-		t.Error("обычная ошибка — не таймаут")
+	if IsTimeout(errors.New("just an error")) {
+		t.Error("an ordinary error is not a timeout")
 	}
 	if IsTimeout(nil) {
-		t.Error("nil — не таймаут")
+		t.Error("nil is not a timeout")
 	}
 }
 
@@ -1057,26 +1057,26 @@ func TestIsConnectFailure(t *testing.T) {
 	}{
 		{"nil", nil, false},
 		{"refused", dialRefusedErr(), true},
-		{"connect-таймаут (дедлайн диала)", dialTimeoutErr(), true},
-		{"connect-таймаут (ETIMEDOUT)", &net.OpError{
+		{"connect timeout (the dial deadline)", dialTimeoutErr(), true},
+		{"connect timeout (ETIMEDOUT)", &net.OpError{
 			Op: "dial", Net: "tcp",
 			Addr: &net.TCPAddr{IP: net.IPv4(192, 0, 2, 2).To4(), Port: 80},
 			Err:  &os.SyscallError{Syscall: "connect", Err: syscall.ETIMEDOUT},
 		}, true},
-		{"обёртка Fetch", fmt.Errorf("httpfetch: GET https://x.example/: %w", dialRefusedErr()), true},
-		{"обёртка гонки адресов", fmt.Errorf("httpfetch: недоступны все 2 адресов: %w", dialTimeoutErr()), true},
-		{"отмена в фазе диала", &net.OpError{
+		{"a Fetch wrap", fmt.Errorf("httpfetch: GET https://x.example/: %w", dialRefusedErr()), true},
+		{"an address-race wrap", fmt.Errorf("httpfetch: all 2 addresses failed: %w", dialTimeoutErr()), true},
+		{"a cancellation in the dial phase", &net.OpError{
 			Op: "dial", Net: "tcp",
 			Addr: &net.TCPAddr{IP: net.IPv4(192, 0, 2, 3).To4(), Port: 80},
 			Err:  context.Canceled,
 		}, false},
-		{"refused на чтении (соединение было)", &net.OpError{
+		{"refused on read (the connection was up)", &net.OpError{
 			Op: "read", Net: "tcp",
 			Addr: &net.TCPAddr{IP: net.IPv4(192, 0, 2, 4).To4(), Port: 80},
 			Err:  &os.SyscallError{Syscall: "read", Err: syscall.ECONNREFUSED},
 		}, false},
-		{"таймаут без диала (заголовки/общий)", context.DeadlineExceeded, false},
-		{"обычная ошибка", errors.New("connection refused (текстом)"), false},
+		{"a timeout without a dial (headers/total)", context.DeadlineExceeded, false},
+		{"an ordinary error", errors.New("connection refused (as text)"), false},
 	}
 	for _, tc := range cases {
 		if got := IsConnectFailure(tc.err); got != tc.want {

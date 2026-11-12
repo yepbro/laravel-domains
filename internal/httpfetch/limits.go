@@ -190,15 +190,15 @@ func parsePerIPOverrides(m map[string]int) ([]PerIPOverride, error) {
 	for cidr, limit := range m {
 		prefix, err := netip.ParsePrefix(cidr)
 		if err != nil {
-			return nil, fmt.Errorf("httpfetch: per-IP override %q: ожидается CIDR IPv4/IPv6", cidr)
+			return nil, fmt.Errorf("httpfetch: a per-IP override %q: an IPv4/IPv6 CIDR is expected", cidr)
 		}
 		if limit < 1 {
-			return nil, fmt.Errorf("httpfetch: per-IP override %s: лимит %d меньше 1", prefix, limit)
+			return nil, fmt.Errorf("httpfetch: a per-IP override %s: the limit %d is below 1", prefix, limit)
 		}
 		masked := prefix.Masked()
 		key := masked.String()
 		if _, dup := seen[key]; dup {
-			return nil, fmt.Errorf("httpfetch: per-IP override: сеть %s перечислена дважды", key)
+			return nil, fmt.Errorf("httpfetch: a per-IP override: the network %s is listed twice", key)
 		}
 		seen[key] = struct{}{}
 		out = append(out, PerIPOverride{Prefix: masked, Limit: limit})
@@ -521,7 +521,7 @@ func (f *Fetcher) dialLimited(ctx context.Context, addr netip.Addr, port string)
 }
 
 // errLimitBodyClosed — reading after the body was closed.
-var errLimitBodyClosed = errors.New("httpfetch: чтение закрытого тела")
+var errLimitBodyClosed = errors.New("httpfetch: reading a closed body")
 
 // BodyLimiter is a response body under the T-049 limits: the MaxBodyBytes
 // cap (truncation with the Truncated flag, not a network error) and the
@@ -742,7 +742,7 @@ type limitBodySpeedError struct {
 }
 
 func (e *limitBodySpeedError) Error() string {
-	return fmt.Sprintf("httpfetch: тело отдаётся медленнее %d байт/с (осталось %d байт) — тарпит", e.speed, e.remain)
+	return fmt.Sprintf("httpfetch: the body is served slower than %d bytes/s (%d bytes remain) — a tarpit", e.speed, e.remain)
 }
 
 func (e *limitBodySpeedError) Timeout() bool   { return true }

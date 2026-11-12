@@ -62,7 +62,7 @@ func postCheck(t *testing.T, url string) (int, string) {
 	resp, err := http.Post(url+"/api/check-domain", "application/json",
 		strings.NewReader(`{"domain":"example.com"}`))
 	if err != nil {
-		t.Fatalf("POST формы: %v", err)
+		t.Fatalf("POSTing the form: %v", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	body := make([]byte, 4096)
@@ -124,7 +124,7 @@ func TestLiveCircuitSingleUnderLoad(t *testing.T) {
 				if resp.StatusCode == http.StatusOK {
 					healthz.Add(1)
 				} else {
-					t.Errorf("healthz под нагрузкой: %d, хочу 200", resp.StatusCode)
+					t.Errorf("healthz under load: %d, want 200", resp.StatusCode)
 				}
 			}
 		}
@@ -134,20 +134,20 @@ func TestLiveCircuitSingleUnderLoad(t *testing.T) {
 
 	for i, st := range statuses {
 		if st != http.StatusOK {
-			t.Errorf("запрос %d: статус %d, хочу 200 (семфор 10, контур жив)", i, st)
+			t.Errorf("request %d: status %d, want 200 (the semaphore 10, the circuit alive)", i, st)
 		}
 	}
 	if got := builds.Load(); got != 1 {
-		t.Fatalf("контур собран %d раз на 10 параллельных проверок, хочу 1", got)
+		t.Fatalf("the circuit assembled %d times for 10 concurrent checks, want 1", got)
 	}
 	if healthz.Load() == 0 {
-		t.Error("пробы /healthz не успели отработать за окно нагрузки — тест не доказал живость healthz")
+		t.Error("the /healthz probes did not get their turn within the load window — the test did not prove healthz liveness")
 	}
 
 	// Stopping the service closes the circuit exactly once and forever.
 	srv.closeLive()
 	if got := builds.Load(); got != 1 {
-		t.Fatalf("после closeLive контур пересобран (%d сборок)", got)
+		t.Fatalf("after closeLive the circuit was reassembled (%d builds)", got)
 	}
 }
 
@@ -199,7 +199,7 @@ func TestLiveSemaphoreOverload(t *testing.T) {
 		select {
 		case <-entered:
 		case <-time.After(3 * time.Second):
-			t.Fatal("конвейер не занял слот за 3 с")
+			t.Fatal("the pipeline did not take a slot within 3 s")
 		}
 	}
 
@@ -217,11 +217,11 @@ func TestLiveSemaphoreOverload(t *testing.T) {
 	extra.Wait()
 	for i, st := range extraStatuses {
 		if st != http.StatusServiceUnavailable {
-			t.Errorf("запрос поверх занятых слотов: %d, хочу 503", st)
+			t.Errorf("a request over the busy slots: %d, want 503", st)
 			continue
 		}
 		if !strings.Contains(extraBodies[i], `"busy"`) {
-			t.Errorf("тело 503 без error:busy: %s", extraBodies[i])
+			t.Errorf("the 503 body without error:busy: %s", extraBodies[i])
 		}
 	}
 
@@ -229,11 +229,11 @@ func TestLiveSemaphoreOverload(t *testing.T) {
 	close(release)
 	for i := 0; i < 2; i++ {
 		if st := <-slow; st != http.StatusOK {
-			t.Errorf("занявший слот запрос: %d, хочу 200", st)
+			t.Errorf("the slot-holding request: %d, want 200", st)
 		}
 	}
 	if got := maxInFlight.Load(); got > 2 {
-		t.Fatalf("одновременно внутри конвейера %d, лимит 2", got)
+		t.Fatalf("%d inside the pipeline at once, the limit 2", got)
 	}
 }
 
@@ -270,7 +270,7 @@ func TestLiveSemaphoreRetryAfter(t *testing.T) {
 	select {
 	case <-entered:
 	case <-time.After(3 * time.Second):
-		t.Fatal("первый запрос не вошёл в слот за 3 с")
+		t.Fatal("the first request did not enter the slot within 3 s")
 	}
 	resp, err := http.Post(ts.URL+"/api/check-domain", "application/json",
 		strings.NewReader(`{"domain":"example.com"}`))
@@ -281,22 +281,22 @@ func TestLiveSemaphoreRetryAfter(t *testing.T) {
 	n, _ := resp.Body.Read(body)
 	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("второй запрос при занятом слоте: %d, хочу 503", resp.StatusCode)
+		t.Fatalf("the second request with a busy slot: %d, want 503", resp.StatusCode)
 	}
 	if ra := resp.Header.Get("Retry-After"); ra == "" {
-		t.Error("503 перегрузки без Retry-After")
+		t.Error("the 503 overload without Retry-After")
 	}
 	// A JSON body with a correct Content-Type (T-227, the unification
 	// with 422).
 	if ct := resp.Header.Get("Content-Type"); ct != "application/json; charset=utf-8" {
-		t.Errorf("503 Content-Type = %q, хочу application/json", ct)
+		t.Errorf("the 503 Content-Type = %q, want application/json", ct)
 	}
 	if !strings.Contains(string(body[:n]), `"busy"`) {
-		t.Errorf("тело 503: %s", string(body[:n]))
+		t.Errorf("the 503 body: %s", string(body[:n]))
 	}
 	close(release)
 	if st := <-first; st != http.StatusOK {
-		t.Fatalf("первый (в слоте) запрос: %d, хочу 200", st)
+		t.Fatalf("the first (in-slot) request: %d, want 200", st)
 	}
 }
 
@@ -316,7 +316,7 @@ func TestLiveCircuitBuildRetriedAfterFailure(t *testing.T) {
 	prev := newLiveCircuit
 	newLiveCircuit = func(context.Context, *config.Config, checker.Logger) (checker.LiveCircuit, error) {
 		if builds.Add(1) == 1 {
-			return nil, errors.New("правила ещё не разложены")
+			return nil, errors.New("the rules are not laid out yet")
 		}
 		return &fakeCircuit{run: func(_ context.Context, _ *config.Config, _ checker.Pool, domain string, _ checker.Logger) (*checker.Result, error) {
 			return &checker.Result{Domain: domain}, nil
@@ -337,19 +337,19 @@ func TestLiveCircuitBuildRetriedAfterFailure(t *testing.T) {
 	}
 	firstBody := readBody(t, resp)
 	if resp.StatusCode != http.StatusBadGateway || !strings.Contains(firstBody, "check_failed") {
-		t.Fatalf("первый запрос (сборка упала): %d %s, хочу 502 check_failed", resp.StatusCode, firstBody)
+		t.Fatalf("the first request (the assembly failed): %d %s, want 502 check_failed", resp.StatusCode, firstBody)
 	}
 	if ct := resp.Header.Get("Content-Type"); ct != "application/json; charset=utf-8" {
-		t.Errorf("502 Content-Type = %q, хочу application/json", ct)
+		t.Errorf("the 502 Content-Type = %q, want application/json", ct)
 	}
 	if got := builds.Load(); got != 1 {
-		t.Fatalf("попыток сборки %d после первого запроса, хочу 1", got)
+		t.Fatalf("assembly attempts %d after the first request, want 1", got)
 	}
 	if st, _ := postCheck(t, ts.URL); st != http.StatusOK {
-		t.Fatalf("повторный запрос: %d, хочу 200 (сборка повторена)", st)
+		t.Fatalf("the repeat request: %d, want 200 (the assembly retried)", st)
 	}
 	if got := builds.Load(); got != 2 {
-		t.Fatalf("попыток сборки %d, хочу 2 (ошибка не запомнена)", got)
+		t.Fatalf("assembly attempts %d, want 2 (the error is not remembered)", got)
 	}
 }
 
@@ -375,18 +375,18 @@ func TestLiveCircuitClosedNoRebuild(t *testing.T) {
 	defer ts.Close()
 
 	if st, _ := postCheck(t, ts.URL); st != http.StatusOK {
-		t.Fatalf("первый запрос: %d, хочу 200", st)
+		t.Fatalf("the first request: %d, want 200", st)
 	}
 	if got := builds.Load(); got != 1 {
-		t.Fatalf("контур собран %d раз, хочу 1", got)
+		t.Fatalf("the circuit assembled %d times, want 1", got)
 	}
 
 	srv.closeLive()
 	if st, body := postCheck(t, ts.URL); st != http.StatusBadGateway || !strings.Contains(body, "check_failed") {
-		t.Fatalf("запрос после остановки: %d %s, хочу 502 check_failed (без пересборки)", st, body)
+		t.Fatalf("the request after the stop: %d %s, want 502 check_failed (no reassembly)", st, body)
 	}
 	if got := builds.Load(); got != 1 {
-		t.Fatalf("после closeLive контур собран заново (%d сборок), хочу без пересборки", got)
+		t.Fatalf("after closeLive the circuit was assembled again (%d builds), want no reassembly", got)
 	}
 }
 
@@ -426,28 +426,28 @@ func TestRunClosesLiveCircuit(t *testing.T) {
 		}
 		if time.Now().After(deadline) {
 			cancel()
-			t.Fatal("сервер не поднялся за 2 с")
+			t.Fatal("the server did not start within 2 s")
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
 
 	if st, _ := postCheck(t, "http://"+addr); st != http.StatusOK {
-		t.Fatalf("проверка формы через Run: %d, хочу 200", st)
+		t.Fatalf("the form check via Run: %d, want 200", st)
 	}
 	if got := builds.Load(); got != 1 {
-		t.Fatalf("контур собран %d раз, хочу 1", got)
+		t.Fatalf("the circuit assembled %d times, want 1", got)
 	}
 
 	cancel()
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Fatalf("Run после отмены: %v", err)
+			t.Fatalf("Run after the cancellation: %v", err)
 		}
 	case <-time.After(3 * time.Second):
-		t.Fatal("сервер не остановился после отмены ctx")
+		t.Fatal("the server did not stop after the ctx cancellation")
 	}
 	if got := circ.closes.Load(); got != 1 {
-		t.Fatalf("контур закрыт %d раз на остановке сервиса, хочу 1", got)
+		t.Fatalf("the circuit closed %d times on the service stop, want 1", got)
 	}
 }

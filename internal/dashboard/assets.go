@@ -60,7 +60,7 @@ func (s *Server) handleAssets(w http.ResponseWriter, r *http.Request) {
 func (s *Server) serveAsset(w http.ResponseWriter, name, contentType string) {
 	b, err := assetsFS.ReadFile("assets/" + name)
 	if err != nil {
-		s.opt.Log.Error("артефакт фронта отсутствует в embed", "asset", name, "err", err)
+		s.opt.Log.Error("the front-end artifact is missing from embed", "asset", name, "err", err)
 		http.Error(w, "asset unavailable", http.StatusInternalServerError)
 		return
 	}

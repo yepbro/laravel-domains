@@ -60,7 +60,7 @@ type fakeDB struct {
 func (d *fakeDB) Ping(context.Context) error { return d.ping }
 
 func (d *fakeDB) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFromSource) (int64, error) {
-	return 0, errors.New("CopyFrom не должен вызываться")
+	return 0, errors.New("CopyFrom must not be called")
 }
 
 func (d *fakeDB) Exec(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
@@ -112,7 +112,7 @@ func (d *fakeDB) Query(ctx context.Context, sql string, _ ...any) (pgx.Rows, err
 		}
 		return webRowsOf([][]any{{d.seed.domainInfo}}), nil
 	default:
-		return nil, fmt.Errorf("fakeDB: неожидаемый SQL: %s", sql)
+		return nil, fmt.Errorf("fakeDB: an unexpected SQL: %s", sql)
 	}
 }
 
@@ -142,7 +142,7 @@ func (r *webRows) Next() bool {
 
 func (r *webRows) Scan(dest ...any) error {
 	if r.i == 0 || r.i > len(r.rows) || len(dest) != len(r.rows[r.i-1]) {
-		return fmt.Errorf("webRows: Scan без Next или арность %d ≠ колонок", len(dest))
+		return fmt.Errorf("webRows: Scan without Next or the arity %d ≠ columns", len(dest))
 	}
 	row := r.rows[r.i-1]
 	for i, d := range dest {
@@ -158,7 +158,7 @@ func (r *webRows) Scan(dest ...any) error {
 		case *[]byte:
 			*dst = row[i].([]byte)
 		default:
-			return fmt.Errorf("webRows: приёмник[%d] %T", i, d)
+			return fmt.Errorf("webRows: dest[%d] %T", i, d)
 		}
 	}
 	return nil
@@ -206,10 +206,10 @@ func newTestServer(t *testing.T, db DB) *Server {
 func TestNewNilDB(t *testing.T) {
 	cfg := config.Default()
 	if _, err := New(nil, cfg, Options{}); err == nil {
-		t.Fatal("New(nil) = nil error, хочу ошибку")
+		t.Fatal("New(nil) = nil error, want an error")
 	}
 	if _, err := New(&fakeDB{}, nil, Options{}); err == nil {
-		t.Fatal("New(nil cfg) = nil error, хочу ошибку")
+		t.Fatal("New(nil cfg) = nil error, want an error")
 	}
 }
 
@@ -221,7 +221,7 @@ func TestRoutingLanding(t *testing.T) {
 	defer ts.Close()
 
 	for locale, want := range map[string][]string{
-		"ru": {"Мы находим Laravel", "Статистика", `data-count="4242"`, "shop.example.com", "Сканируем миллионы"},
+		"ru": {"We find Laravel", "Statistics", `data-count="4242"`, "shop.example.com", "We scan millions"},
 		"en": {"We find Laravel", "Statistics", `data-count="4242"`, "shop.example.com"},
 	} {
 		resp, err := http.Get(ts.URL + "/" + locale)
@@ -232,12 +232,12 @@ func TestRoutingLanding(t *testing.T) {
 		n, _ := resp.Body.Read(body)
 		_ = resp.Body.Close()
 		if resp.StatusCode != http.StatusOK {
-			t.Errorf("/%s: статус = %d", locale, resp.StatusCode)
+			t.Errorf("/%s: status = %d", locale, resp.StatusCode)
 			continue
 		}
 		for _, w := range want {
 			if !strings.Contains(string(body[:n]), w) {
-				t.Errorf("/%s: тело не содержит %q", locale, w)
+				t.Errorf("/%s: the body does not contain %q", locale, w)
 			}
 		}
 	}
@@ -246,7 +246,7 @@ func TestRoutingLanding(t *testing.T) {
 	// Location.
 	resp, _ := http.Get(ts.URL + "/de")
 	if resp.StatusCode != http.StatusNotFound {
-		t.Errorf("/de = %d, хочу 404", resp.StatusCode)
+		t.Errorf("/de = %d, want 404", resp.StatusCode)
 	}
 	_ = resp.Body.Close()
 
@@ -256,7 +256,7 @@ func TestRoutingLanding(t *testing.T) {
 	}
 	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		t.Errorf("favicon = %d, хочу 200 (go:embed)", resp.StatusCode)
+		t.Errorf("favicon = %d, want 200 (go:embed)", resp.StatusCode)
 	}
 
 	req, _ := http.NewRequest("GET", ts.URL+"/", nil)
@@ -267,7 +267,7 @@ func TestRoutingLanding(t *testing.T) {
 	}
 	_ = resp.Body.Close()
 	if loc := resp.Header.Get("Location"); loc != "/"+DefaultLocale {
-		t.Errorf("Location корня = %q, хочу /%s", loc, DefaultLocale)
+		t.Errorf("the root Location = %q, want /%s", loc, DefaultLocale)
 	}
 }
 
@@ -283,7 +283,7 @@ func TestLandingDBError(t *testing.T) {
 	}
 	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusInternalServerError {
-		t.Errorf("сбой БД: статус = %d, хочу 500", resp.StatusCode)
+		t.Errorf("the DB failure: status = %d, want 500", resp.StatusCode)
 	}
 }
 
@@ -298,7 +298,7 @@ func (brokenDB) Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
 	return pgconn.CommandTag{}, errors.New("no")
 }
 func (brokenDB) Query(context.Context, string, ...any) (pgx.Rows, error) {
-	return nil, errors.New("бд недоступна")
+	return nil, errors.New("the db is unavailable")
 }
 
 // TestHealthzDB — an unavailable DB: a 503.
@@ -313,7 +313,7 @@ func TestHealthzDB(t *testing.T) {
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusServiceUnavailable {
-		t.Errorf("healthz = %d, хочу 503", resp.StatusCode)
+		t.Errorf("healthz = %d, want 503", resp.StatusCode)
 	}
 }
 
@@ -336,7 +336,7 @@ func TestMethodNotAllowed(t *testing.T) {
 		}
 		_ = resp.Body.Close()
 		if resp.StatusCode != http.StatusMethodNotAllowed {
-			t.Errorf("%s %s: статус = %d, хочу 405", tc.method, tc.path, resp.StatusCode)
+			t.Errorf("%s %s: status = %d, want 405", tc.method, tc.path, resp.StatusCode)
 		}
 	}
 }
@@ -366,7 +366,7 @@ func TestRunGracefulStop(t *testing.T) {
 		}
 		if time.Now().After(deadline) {
 			cancel()
-			t.Fatal("сервер не поднялся за 2 с")
+			t.Fatal("the server did not start within 2 s")
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -375,10 +375,10 @@ func TestRunGracefulStop(t *testing.T) {
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Fatalf("Run после отмены: %v, хочу nil", err)
+			t.Fatalf("Run after the cancellation: %v, want nil", err)
 		}
 	case <-time.After(3 * time.Second):
-		t.Fatal("сервер не остановился после отмены ctx")
+		t.Fatal("the server did not stop after the ctx cancellation")
 	}
 }
 
@@ -417,7 +417,7 @@ func TestRunUnixSocket(t *testing.T) {
 		}
 		if time.Now().After(deadline) {
 			cancel()
-			t.Fatal("unix-сокет не поднялся за 2 с")
+			t.Fatal("the unix socket did not start within 2 s")
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -426,13 +426,13 @@ func TestRunUnixSocket(t *testing.T) {
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Fatalf("Run(unix) после отмены: %v, хочу nil", err)
+			t.Fatalf("Run(unix) after the cancellation: %v, want nil", err)
 		}
 	case <-time.After(3 * time.Second):
-		t.Fatal("unix-сокет не остановился после отмены ctx")
+		t.Fatal("the unix socket did not stop after the ctx cancellation")
 	}
 	if _, err := os.Stat(sock); !os.IsNotExist(err) {
-		t.Errorf("файл сокета %s не убран после остановки (stat err: %v)", sock, err)
+		t.Errorf("the socket file %s was not removed after the stop (stat err: %v)", sock, err)
 	}
 }
 
@@ -454,14 +454,14 @@ func TestRobotsSitemap(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		t.Errorf("robots.txt = %d, хочу 200", resp.StatusCode)
+		t.Errorf("robots.txt = %d, want 200", resp.StatusCode)
 	}
 	if ct := resp.Header.Get("Content-Type"); ct != "text/plain; charset=utf-8" {
-		t.Errorf("robots.txt Content-Type = %q, хочу text/plain", ct)
+		t.Errorf("robots.txt Content-Type = %q, want text/plain", ct)
 	}
 	for _, want := range []string{"User-agent: *", "Disallow: /api/"} {
 		if !strings.Contains(string(body), want) {
-			t.Errorf("robots.txt не содержит %q", want)
+			t.Errorf("robots.txt does not contain %q", want)
 		}
 	}
 
@@ -474,22 +474,22 @@ func TestRobotsSitemap(t *testing.T) {
 	body, _ = io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		t.Errorf("sitemap.xml = %d, хочу 200", resp.StatusCode)
+		t.Errorf("sitemap.xml = %d, want 200", resp.StatusCode)
 	}
 	if ct := resp.Header.Get("Content-Type"); ct != "application/xml; charset=utf-8" {
-		t.Errorf("sitemap.xml Content-Type = %q, хочу application/xml", ct)
+		t.Errorf("sitemap.xml Content-Type = %q, want application/xml", ct)
 	}
 	s := string(body)
 	if !strings.Contains(s, `<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">`) {
-		t.Errorf("sitemap.xml без схемы sitemap 0.9:\n%s", s)
+		t.Errorf("sitemap.xml without the sitemap 0.9 schema:\n%s", s)
 	}
 	for _, locale := range Locales {
 		if !strings.Contains(s, "<loc>"+ts.URL+"/"+locale+"</loc>") {
-			t.Errorf("sitemap.xml без URL локали /%s:\n%s", locale, s)
+			t.Errorf("sitemap.xml without the locale URL /%s:\n%s", locale, s)
 		}
 	}
 	if n := strings.Count(s, "<loc>"); n != len(Locales) {
-		t.Errorf("sitemap.xml содержит %d URL, хочу %d (только локали):\n%s", n, len(Locales), s)
+		t.Errorf("sitemap.xml holds %d URLs, want %d (locales only):\n%s", n, len(Locales), s)
 	}
 
 	// Behind the reverse proxy the scheme is carried by X-Forwarded-Proto
@@ -507,10 +507,10 @@ func TestRobotsSitemap(t *testing.T) {
 	req.Header.Set("X-Forwarded-Proto", "https")
 	srv.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
-		t.Errorf("sitemap.xml за прокси = %d, хочу 200", rec.Code)
+		t.Errorf("sitemap.xml behind the proxy = %d, want 200", rec.Code)
 	}
 	if want := "<loc>https://crawler.example.com/ru</loc>"; !strings.Contains(rec.Body.String(), want) {
-		t.Errorf("sitemap.xml за прокси без %q:\n%s", want, rec.Body.String())
+		t.Errorf("sitemap.xml behind the proxy without %q:\n%s", want, rec.Body.String())
 	}
 	rec = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodGet, "/sitemap.xml", nil)
@@ -519,7 +519,7 @@ func TestRobotsSitemap(t *testing.T) {
 	req.Header.Set("X-Forwarded-Proto", "javascript") // junk — not a web scheme
 	srv.Handler().ServeHTTP(rec, req)
 	if want := "<loc>http://crawler.example.com/ru</loc>"; !strings.Contains(rec.Body.String(), want) {
-		t.Errorf("sitemap.xml с мусорной схемой без %q:\n%s", want, rec.Body.String())
+		t.Errorf("sitemap.xml with a junk scheme without %q:\n%s", want, rec.Body.String())
 	}
 
 	// GET-only routes: a POST is served by the mux as a 405.
@@ -530,7 +530,7 @@ func TestRobotsSitemap(t *testing.T) {
 	}
 	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusMethodNotAllowed {
-		t.Errorf("POST /robots.txt = %d, хочу 405", resp.StatusCode)
+		t.Errorf("POST /robots.txt = %d, want 405", resp.StatusCode)
 	}
 }
 
@@ -583,7 +583,7 @@ func TestSitemapCanonicalHost(t *testing.T) {
 			// The canonical host is set: a direct request with foreign
 			// Host/XFP affects neither the host nor the scheme (the
 			// default — http, a connection without TLS).
-			name:       "канон + недоверенный пир с чужими Host/XFP",
+			name:       "canonical + an untrusted peer with foreign Host/XFP",
 			publicHost: "crawler.example.com", remote: "203.0.113.9:40001", host: evil,
 			xfp:  "https",
 			want: "<loc>http://crawler.example.com/ru</loc>",
@@ -591,7 +591,7 @@ func TestSitemapCanonicalHost(t *testing.T) {
 		{
 			// The canonical host + a trusted loopback peer with XFP
 			// https: the scheme is https, the request Host is ignored.
-			name:       "канон + loopback-прокси с XFP https",
+			name:       "canonical + a loopback proxy with XFP https",
 			publicHost: "crawler.example.com", remote: "127.0.0.1:40002", host: evil,
 			xfp:  "https",
 			want: "<loc>https://crawler.example.com/ru</loc>",
@@ -599,7 +599,7 @@ func TestSitemapCanonicalHost(t *testing.T) {
 		{
 			// The canonical host + a trusted unix-socket peer: the same
 			// result.
-			name:       "канон + unix-прокси с XFP https",
+			name:       "canonical + a unix proxy with XFP https",
 			publicHost: "crawler.example.com", remote: "@", host: evil,
 			xfp: "https", unix: true,
 			want: "<loc>https://crawler.example.com/ru</loc>",
@@ -607,7 +607,7 @@ func TestSitemapCanonicalHost(t *testing.T) {
 		{
 			// The canonical host + an XFP list: the last entry (ours),
 			// the start of the list came from the client.
-			name:       "канон + список XFP (клиент, прокси)",
+			name:       "canonical + an XFP list (client, proxy)",
 			publicHost: "crawler.example.com", remote: "127.0.0.1:40003", host: evil,
 			xfp:  "http, https",
 			want: "<loc>https://crawler.example.com/ru</loc>",
@@ -616,7 +616,7 @@ func TestSitemapCanonicalHost(t *testing.T) {
 			// A direct TLS connection: https regardless of the XFP (web
 			// does not listen this way — the publicScheme branch for the
 			// future, T-227).
-			name:       "канон + прямое TLS с XFP http",
+			name:       "canonical + a direct TLS with XFP http",
 			publicHost: "crawler.example.com", remote: "203.0.113.9:40006", host: evil,
 			xfp: "http", directTLS: true,
 			want: "<loc>https://crawler.example.com/ru</loc>",
@@ -625,7 +625,7 @@ func TestSitemapCanonicalHost(t *testing.T) {
 			// No canonical host: the fallback to the request Host behind
 			// a trusted peer (the public entry passes the Host as
 			// $host).
-			name:   "фолбэк Host + loopback-прокси с XFP https",
+			name:   "the Host fallback + a loopback proxy with XFP https",
 			remote: "127.0.0.1:40004", host: "crawler.example.com",
 			xfp:  "https",
 			want: "<loc>https://crawler.example.com/ru</loc>",
@@ -633,7 +633,7 @@ func TestSitemapCanonicalHost(t *testing.T) {
 		{
 			// No canonical host, the peer is untrusted: the XFP is not
 			// read — the default connection scheme (http).
-			name:   "фолбэк Host + недоверенный пир с XFP https",
+			name:   "the Host fallback + an untrusted peer with XFP https",
 			remote: "203.0.113.9:40005", host: "crawler.example.com",
 			xfp:  "https",
 			want: "<loc>http://crawler.example.com/ru</loc>",
@@ -641,10 +641,10 @@ func TestSitemapCanonicalHost(t *testing.T) {
 	} {
 		got := body(tc.publicHost, tc.remote, tc.host, tc.xfp, tc.unix, tc.directTLS)
 		if !strings.Contains(got, tc.want) {
-			t.Errorf("%s: sitemap без %q:\n%s", tc.name, tc.want, got)
+			t.Errorf("%s: the sitemap without %q:\n%s", tc.name, tc.want, got)
 		}
 		if strings.Contains(got, evil) {
-			t.Errorf("%s: sitemap зависит от Host недоверенной стороны (%s):\n%s", tc.name, evil, got)
+			t.Errorf("%s: the sitemap depends on the Host of an untrusted party (%s):\n%s", tc.name, evil, got)
 		}
 	}
 }

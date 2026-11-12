@@ -46,7 +46,7 @@ func TestValidateCheckInput(t *testing.T) {
 		got, err := validateCheckInput(tc.in)
 		if tc.wantErr {
 			if err == nil {
-				t.Errorf("validate(%q) = %q, хочу ошибку", tc.in, got)
+				t.Errorf("validate(%q) = %q, want an error", tc.in, got)
 			}
 			continue
 		}
@@ -55,7 +55,7 @@ func TestValidateCheckInput(t *testing.T) {
 			continue
 		}
 		if got != tc.want {
-			t.Errorf("validate(%q) = %q, хочу %q", tc.in, got, tc.want)
+			t.Errorf("validate(%q) = %q, want %q", tc.in, got, tc.want)
 		}
 	}
 }
@@ -67,19 +67,19 @@ func TestRateLimit(t *testing.T) {
 	now := time.Now()
 	for i := 0; i < 4; i++ {
 		if !l.allow("1.2.3.4", now) {
-			t.Fatalf("запрос %d отклонён, хочу пропуск (лимит 4)", i+1)
+			t.Fatalf("request %d rejected, want a pass (the limit 4)", i+1)
 		}
 	}
 	if l.allow("1.2.3.4", now) {
-		t.Fatal("пятый запрос в минуту прошёл, хочу отказ")
+		t.Fatal("the fifth request in a minute passed, want a refusal")
 	}
 	if l.allow("5.6.7.8", now) {
 		// Another IP — its own bucket.
 	} else {
-		t.Fatal("чужой IP отклонён общим бакетом")
+		t.Fatal("a foreign IP rejected by the shared bucket")
 	}
 	if !l.allow("1.2.3.4", now.Add(16*time.Second)) {
-		t.Fatal("через четверть минуты бакет не восстановил один токен")
+		t.Fatal("a quarter minute later the bucket has not restored one token")
 	}
 }
 
@@ -119,36 +119,36 @@ func TestClientIP(t *testing.T) {
 		want                string
 		wantIP              bool
 	}{
-		{"прямой адрес без заголовка", "203.0.113.7:44321", "", "", false, "203.0.113.7", true},
+		{"a direct address without a header", "203.0.113.7:44321", "", "", false, "203.0.113.7", true},
 		{"nginx loopback + X-Real-IP", "127.0.0.1:51234", "198.51.100.9", "", false, "198.51.100.9", true},
 		{"nginx ipv6-loopback + X-Real-IP", "[::1]:51234", "198.51.100.9", "", false, "198.51.100.9", true},
-		{"loopback + мусорный заголовок", "127.0.0.1:51234", "not-an-ip", "", false, "127.0.0.1", true},
-		{"loopback + заголовок с портом", "127.0.0.1:51234", "198.51.100.9:443", "", false, "127.0.0.1", true},
-		{"чужой адрес + подделка заголовка", "203.0.113.7:44321", "198.51.100.9", "", false, "203.0.113.7", true},
+		{"loopback + a junk header", "127.0.0.1:51234", "not-an-ip", "", false, "127.0.0.1", true},
+		{"loopback + a header with a port", "127.0.0.1:51234", "198.51.100.9:443", "", false, "127.0.0.1", true},
+		{"a foreign address + a forged header", "203.0.113.7:44321", "198.51.100.9", "", false, "203.0.113.7", true},
 		// A unix socket (T-221): the peer is trusted, like loopback TCP.
-		{"unix-пир + X-Real-IP", "@", "198.51.100.9", "", true, "198.51.100.9", true},
-		{"unix-пир именованный + X-Real-IP", "/run/client.sock", "198.51.100.9", "", true, "198.51.100.9", true},
-		{"unix-пир, путь сокета с двоеточием", "/run/web:s.sock", "198.51.100.9", "", true, "198.51.100.9", true},
-		{"unix-пир + XFF одна позиция", "@", "", "198.51.100.10", true, "198.51.100.10", true},
-		{"unix-пир + XFF ipv6", "@", "", "2001:db8::1", true, "2001:db8::1", true},
-		{"unix-пир + XFF, клиентский мусор в начале", "@", "", "junk, 6.6.6.6, 198.51.100.10", true, "198.51.100.10", true},
-		{"unix-пир + XFF, подделка первой позиции", "@", "", "1.2.3.4, 198.51.100.10", true, "198.51.100.10", true},
-		{"unix-пир без заголовков", "@", "", "", true, unixLocalKey, false},
-		{"unix-пир именованный без заголовков", "/run/client.sock", "", "", true, unixLocalKey, false},
-		{"unix-пир + мусорный X-Real-IP, валидный XFF", "@", "not-an-ip", "198.51.100.10", true, "198.51.100.10", true},
-		{"unix-пир + мусор в конце XFF", "@", "", "198.51.100.10, junk", true, unixLocalKey, false},
+		{"a unix peer + X-Real-IP", "@", "198.51.100.9", "", true, "198.51.100.9", true},
+		{"a named unix peer + X-Real-IP", "/run/client.sock", "198.51.100.9", "", true, "198.51.100.9", true},
+		{"a unix peer, a socket path with a colon", "/run/web:s.sock", "198.51.100.9", "", true, "198.51.100.9", true},
+		{"a unix peer + a single-entry XFF", "@", "", "198.51.100.10", true, "198.51.100.10", true},
+		{"a unix peer + an ipv6 XFF", "@", "", "2001:db8::1", true, "2001:db8::1", true},
+		{"a unix peer + an XFF with client junk at the start", "@", "", "junk, 6.6.6.6, 198.51.100.10", true, "198.51.100.10", true},
+		{"a unix peer + an XFF with a forged first entry", "@", "", "1.2.3.4, 198.51.100.10", true, "198.51.100.10", true},
+		{"a unix peer without headers", "@", "", "", true, unixLocalKey, false},
+		{"a named unix peer without headers", "/run/client.sock", "", "", true, unixLocalKey, false},
+		{"a unix peer + a junk X-Real-IP, a valid XFF", "@", "not-an-ip", "198.51.100.10", true, "198.51.100.10", true},
+		{"a unix peer + junk at the end of the XFF", "@", "", "198.51.100.10, junk", true, unixLocalKey, false},
 		// A forgery over TCP does not extend trust: the XFF of a foreign
 		// peer and of a loopback peer without X-Real-IP is not read (the
 		// TCP branch of T-124); a RemoteAddr without an IP (no unix
 		// connection context) gets no trust and is not written into the
 		// log.
-		{"чужой TCP-адрес + подделка XFF", "203.0.113.7:44321", "", "198.51.100.9", false, "203.0.113.7", true},
-		{"loopback TCP без X-Real-IP (XFF не читается)", "127.0.0.1:51234", "", "198.51.100.9", false, "127.0.0.1", true},
-		{"путь с двоеточием без контекста unix — не доверяем", "/run/web:s.sock", "", "198.51.100.9", false, "/run/web", false},
+		{"a foreign TCP address + a forged XFF", "203.0.113.7:44321", "", "198.51.100.9", false, "203.0.113.7", true},
+		{"loopback TCP without X-Real-IP (the XFF is not read)", "127.0.0.1:51234", "", "198.51.100.9", false, "127.0.0.1", true},
+		{"a path with a colon without the unix context — not trusted", "/run/web:s.sock", "", "198.51.100.9", false, "/run/web", false},
 	} {
 		got, isIP := clientIP(req(tt.remote, tt.realIP, tt.xff, tt.unix))
 		if got != tt.want || isIP != tt.wantIP {
-			t.Errorf("%s: clientIP = (%q, %v), хочу (%q, %v)", tt.name, got, isIP, tt.want, tt.wantIP)
+			t.Errorf("%s: clientIP = (%q, %v), want (%q, %v)", tt.name, got, isIP, tt.want, tt.wantIP)
 		}
 	}
 }
@@ -188,7 +188,7 @@ func TestCheckDomainE2E(t *testing.T) {
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("статус = %d, хочу 200", resp.StatusCode)
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
 	body := make([]byte, 1<<16)
 	n, _ := resp.Body.Read(body)
@@ -199,7 +199,7 @@ func TestCheckDomainE2E(t *testing.T) {
 		`"rule":"cookie_xsrf_token"`, `"stored"`, `"status":"new"`,
 	} {
 		if !strings.Contains(got, want) {
-			t.Errorf("ответ не содержит %s:\n%s", want, got)
+			t.Errorf("the response does not contain %s:\n%s", want, got)
 		}
 	}
 	// web_checks is written: the fake carries no INSERT semantics — we
@@ -208,10 +208,10 @@ func TestCheckDomainE2E(t *testing.T) {
 	// (T-221: Query without reading rows swallowed the error — the log
 	// silently went empty).
 	if len(db.queries) == 0 {
-		t.Error("к БД не было обращений (stored/web_checks)")
+		t.Error("no DB calls (stored/web_checks)")
 	}
 	if got := db.webCheckInserts(); got != 1 {
-		t.Errorf("INSERT web_checks через Exec выполнен %d раз, хочу 1", got)
+		t.Errorf("the INSERT web_checks via Exec ran %d times, want 1", got)
 	}
 }
 
@@ -228,15 +228,15 @@ func TestCheckDomainInvalid(t *testing.T) {
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusUnprocessableEntity {
-		t.Fatalf("статус = %d, хочу 422", resp.StatusCode)
+		t.Fatalf("status = %d, want 422", resp.StatusCode)
 	}
 	body := make([]byte, 256)
 	n, _ := resp.Body.Read(body)
 	if !strings.Contains(string(body[:n]), `"invalid"`) {
-		t.Errorf("тело 422 не в формате формы: %s", string(body[:n]))
+		t.Errorf("the 422 body is not in the form format: %s", string(body[:n]))
 	}
 	if ct := resp.Header.Get("Content-Type"); ct != "application/json; charset=utf-8" {
-		t.Errorf("422 Content-Type = %q, хочу application/json (T-227)", ct)
+		t.Errorf("the 422 Content-Type = %q, want application/json (T-227)", ct)
 	}
 }
 
@@ -266,24 +266,24 @@ func TestCheckDomainRateLimited(t *testing.T) {
 	first := post()
 	defer func() { _ = first.Body.Close() }()
 	if first.StatusCode != http.StatusOK {
-		t.Fatalf("первый запрос = %d, хочу 200", first.StatusCode)
+		t.Fatalf("the first request = %d, want 200", first.StatusCode)
 	}
 	second := post()
 	defer func() { _ = second.Body.Close() }()
 	if second.StatusCode != http.StatusTooManyRequests {
-		t.Fatalf("второй запрос = %d, хочу 429 (лимит 1)", second.StatusCode)
+		t.Fatalf("the second request = %d, want 429 (the limit 1)", second.StatusCode)
 	}
 	if ra := second.Header.Get("Retry-After"); ra == "" {
-		t.Error("429 без Retry-After")
+		t.Error("a 429 without Retry-After")
 	}
 	// A JSON body with a correct Content-Type (T-227): http.Error used
 	// to serve JSON with text/plain — landing.js looks at the status,
 	// but this is the uniformity contract for all form outcomes.
 	if ct := second.Header.Get("Content-Type"); ct != "application/json; charset=utf-8" {
-		t.Errorf("429 Content-Type = %q, хочу application/json", ct)
+		t.Errorf("the 429 Content-Type = %q, want application/json", ct)
 	}
 	if !strings.Contains(readBody(t, second), `"rate_limited"`) {
-		t.Error("тело 429 без error:rate_limited")
+		t.Error("the 429 body without error:rate_limited")
 	}
 }
 

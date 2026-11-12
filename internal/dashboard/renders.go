@@ -95,7 +95,7 @@ func parsePromExposition(r io.Reader) ([]promSample, error) {
 		if i := strings.IndexByte(line, '{'); i >= 0 {
 			end := promLabelsEnd(line, i)
 			if end < 0 {
-				return nil, fmt.Errorf("метрики: строка %d: метки без закрывающей скобки", n+1)
+				return nil, fmt.Errorf("metrics: line %d: labels without a closing brace", n+1)
 			}
 			name = line[:i]
 			labels = line[i+1 : end]
@@ -116,20 +116,20 @@ func parsePromExposition(r io.Reader) ([]promSample, error) {
 		}
 		valueFields := strings.Fields(rest)
 		if len(valueFields) == 0 {
-			return nil, fmt.Errorf("метрики: строка %d: нет значения", n+1)
+			return nil, fmt.Errorf("metrics: line %d: no value", n+1)
 		}
 		v, err := strconv.ParseFloat(valueFields[0], 64)
 		if err != nil {
-			return nil, fmt.Errorf("метрики: строка %d: значение %q: %w", n+1, valueFields[0], err)
+			return nil, fmt.Errorf("metrics: line %d: the value %q: %w", n+1, valueFields[0], err)
 		}
 		parsed, err := parsePromLabels(labels)
 		if err != nil {
-			return nil, fmt.Errorf("метрики: строка %d: %w", n+1, err)
+			return nil, fmt.Errorf("metrics: line %d: %w", n+1, err)
 		}
 		out = append(out, promSample{Name: name, Labels: parsed, Value: v})
 	}
 	if err := sc.Err(); err != nil {
-		return nil, fmt.Errorf("чтение экспозиции: %w", err)
+		return nil, fmt.Errorf("reading the exposition: %w", err)
 	}
 	return out, nil
 }
@@ -195,7 +195,7 @@ func promLabelPair(pair string, labels map[string]string) error {
 	}
 	k, v, found := strings.Cut(pair, "=")
 	if !found || len(v) < 2 || v[0] != '"' || v[len(v)-1] != '"' {
-		return fmt.Errorf("метка %q без значения в кавычках", pair)
+		return fmt.Errorf("the label %q without a quoted value", pair)
 	}
 	labels[strings.TrimSpace(k)] = promUnescape(v[1 : len(v)-1])
 	return nil
@@ -286,19 +286,19 @@ func (c *Collector) collectRenderCounters(ctx context.Context) (renderCounters, 
 func (c *Collector) fetchRenderMetrics(ctx context.Context, raw string) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, raw, nil)
 	if err != nil {
-		return nil, fmt.Errorf("экспозиция %s: %w", raw, err)
+		return nil, fmt.Errorf("exposition %s: %w", raw, err)
 	}
 	resp, err := c.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("экспозиция %s: %w", raw, err)
+		return nil, fmt.Errorf("exposition %s: %w", raw, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("экспозиция %s: статус %s", raw, resp.Status)
+		return nil, fmt.Errorf("exposition %s: status %s", raw, resp.Status)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, renderBodyLimit))
 	if err != nil {
-		return nil, fmt.Errorf("экспозиция %s: чтение: %w", raw, err)
+		return nil, fmt.Errorf("exposition %s: read: %w", raw, err)
 	}
 	return body, nil
 }

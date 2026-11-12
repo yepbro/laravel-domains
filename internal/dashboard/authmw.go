@@ -85,7 +85,7 @@ func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 		// the whole window.
 		user, pass, ok := r.BasicAuth()
 		if !ok || !s.verifyCredentials(user, pass) {
-			s.opt.Log.Warn("неудачная сверка Basic-кредов дашборда", "ip", ip)
+			s.opt.Log.Warn("a failed dashboard Basic credential verification", "ip", ip)
 			w.Header().Set("WWW-Authenticate", `Basic realm="dashboard", charset="UTF-8"`)
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return

@@ -69,7 +69,7 @@ RUN set -eux; \
     case "${TARGETARCH}" in \
         amd64) arch=x64 ;; \
         arm64) arch=arm64 ;; \
-        *) echo "css: неподдерживаемая архитектура ${TARGETARCH}" >&2; exit 1 ;; \
+        *) echo "css: unsupported architecture ${TARGETARCH}" >&2; exit 1 ;; \
     esac; \
     wget -q -O /usr/local/bin/tailwindcss \
         "https://github.com/tailwindlabs/tailwindcss/releases/download/${TAILWINDCSS_VERSION}/tailwindcss-linux-${arch}-musl" \

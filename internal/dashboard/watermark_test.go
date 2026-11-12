@@ -36,7 +36,7 @@ func TestQueueWatermarksSync(t *testing.T) {
 		want      map[string]int64
 	}{
 		{
-			"дефолты конфигурации: кламп по пределам T-141",
+			"the config defaults: clamped by the T-141 bounds",
 			100000, 0,
 			map[string]int64{
 				queue.StreamDNS: 125, queue.StreamHTTP: 75000,
@@ -46,7 +46,7 @@ func TestQueueWatermarksSync(t *testing.T) {
 			},
 		},
 		{
-			"явно заниженный watermark ниже всех пределов",
+			"a deliberately low watermark below all bounds",
 			50, 0,
 			map[string]int64{
 				queue.StreamDNS: 50, queue.StreamHTTP: 50,
@@ -55,7 +55,7 @@ func TestQueueWatermarksSync(t *testing.T) {
 			},
 		},
 		{
-			"нестандартный MaxLen: кламп по его половине",
+			"a non-standard MaxLen: clamped by its half",
 			100000, 300,
 			map[string]int64{
 				queue.StreamDNS: 150, queue.StreamHTTP: 150,
@@ -64,7 +64,7 @@ func TestQueueWatermarksSync(t *testing.T) {
 			},
 		},
 		{
-			"MaxLen выше watermark: без клампа",
+			"a MaxLen above the watermark: no clamping",
 			100000, 250000,
 			map[string]int64{
 				queue.StreamDNS: 100000, queue.StreamHTTP: 100000,
@@ -73,7 +73,7 @@ func TestQueueWatermarksSync(t *testing.T) {
 			},
 		},
 		{
-			"гейт отключён (watermark ≤ 0): пороги 0",
+			"the gate off (a watermark ≤ 0): thresholds 0",
 			0, 0,
 			map[string]int64{
 				queue.StreamDNS: 0, queue.StreamHTTP: 0,
@@ -92,7 +92,7 @@ func TestQueueWatermarksSync(t *testing.T) {
 			for _, s := range status.Streams {
 				if s == queue.StreamDead {
 					if _, ok := snap.QueueWatermarks[s]; ok {
-						t.Errorf("queue_watermarks[%s] есть, хочу отсутствие (q:dead гейтом не ограничивается)", s)
+						t.Errorf("queue_watermarks[%s] present, want its absence (q:dead is not limited by the gate)", s)
 					}
 					continue
 				}
@@ -101,10 +101,10 @@ func TestQueueWatermarksSync(t *testing.T) {
 				// T-080).
 				monitorWM := queue.StreamWatermark(tc.watermark, tc.maxLen, s)
 				if got := snap.QueueWatermarks[s]; got != monitorWM {
-					t.Errorf("queue_watermarks[%s] = %d, хочу %d (порог монитора)", s, got, monitorWM)
+					t.Errorf("queue_watermarks[%s] = %d, want %d (the monitor threshold)", s, got, monitorWM)
 				}
 				if got := snap.QueueWatermarks[s]; got != tc.want[s] {
-					t.Errorf("queue_watermarks[%s] = %d, хочу %d (точное значение связки)", s, got, tc.want[s])
+					t.Errorf("queue_watermarks[%s] = %d, want %d (the exact wiring value)", s, got, tc.want[s])
 				}
 			}
 		})
@@ -124,7 +124,7 @@ func TestQueueWatermarksNotSection(t *testing.T) {
 
 	snap := coll.CollectOnce(context.Background())
 	if snap.Queues != nil {
-		t.Fatal("queues не null при отказе Redis (предусловие теста)")
+		t.Fatal("the queues are not null on a Redis failure (the test precondition)")
 	}
 	want := map[string]int64{
 		queue.StreamDNS: 125, queue.StreamHTTP: 75000,
@@ -132,7 +132,7 @@ func TestQueueWatermarksNotSection(t *testing.T) {
 	}
 	for s, wm := range want {
 		if got := snap.QueueWatermarks[s]; got != wm {
-			t.Errorf("queue_watermarks[%s] = %d при лежащем Redis, хочу %d", s, got, wm)
+			t.Errorf("queue_watermarks[%s] = %d with Redis down, want %d", s, got, wm)
 		}
 	}
 }

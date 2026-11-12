@@ -24,7 +24,7 @@
 (function () {
     'use strict';
 
-    var ND = 'н/д';
+    var ND = 'n/a';
     var HISTORY_LIMIT = 120; // ~10 minutes of history at a 5 s period (§6.4)
 
     // The status legend of spec 6.2 in the model.Statuses order (the snapshot's
@@ -33,14 +33,14 @@
     var STATUS_ORDER = ['new', 'not_delegated', 'delegated_no_address', 'no_http',
         'alive', 'temp_error', 'deleted', 'invalid'];
     var STATUS_LABEL = {
-        new: 'новый',
-        not_delegated: 'не делегирован',
-        delegated_no_address: 'делегирован без адресов',
-        no_http: 'без веба',
-        alive: 'жив',
-        temp_error: 'врем. ошибка',
-        deleted: 'удалён',
-        invalid: 'мусор'
+        new: 'new',
+        not_delegated: 'not delegated',
+        delegated_no_address: 'delegated, no addresses',
+        no_http: 'no web',
+        alive: 'alive',
+        temp_error: 'temp error',
+        deleted: 'deleted',
+        invalid: 'junk'
     };
     var STATUS_COLOR = {
         new: '#58a6ff',
@@ -104,55 +104,45 @@
     // fmtInt — thousands grouping ("1,234,567"); null/undefined — "n/a".
     function fmtInt(v) {
         if (!num(v)) return ND;
-        return v.toLocaleString('ru-RU');
-    }
-
-    // pluRu — the Russian plural form (1 chunk, 2 chunks, 5 chunks): the
-    // watermark hint names the q:dns depth unit.
-    function pluRu(n, one, few, many) {
-        var m10 = n % 10;
-        var m100 = n % 100;
-        if (m10 === 1 && m100 !== 11) return one;
-        if (m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14)) return few;
-        return many;
+        return v.toLocaleString('en-US');
     }
 
     // fmtRate — a rate: large values as an integer, small ones with up to
     // three decimals.
     function fmtRate(v) {
         if (!num(v)) return ND;
-        if (v >= 100) return Math.round(v).toLocaleString('ru-RU');
-        if (v >= 1) return String(v.toFixed(1)).replace('.', ',');
-        return String(v.toFixed(3)).replace('.', ',');
+        if (v >= 100) return Math.round(v).toLocaleString('en-US');
+        if (v >= 1) return v.toFixed(1);
+        return v.toFixed(3);
     }
 
     // fmtPct — percentages with a decimal comma.
     function fmtPct(v) {
-        return String(v.toFixed(1)).replace('.', ',') + '%';
+        return v.toFixed(1) + '%';
     }
 
     // fmtBytes — human-readable bytes (1.2 GiB / 850 MiB / 512 KiB), like the
     // monitor's alertBytes; null/undefined — "n/a".
     function fmtBytes(v) {
         if (!num(v)) return ND;
-        var units = [[1 << 30, 'ГиБ'], [1 << 20, 'МиБ'], [1 << 10, 'КиБ']];
+        var units = [[1 << 30, 'GiB'], [1 << 20, 'MiB'], [1 << 10, 'KiB']];
         for (var i = 0; i < units.length; i++) {
             if (v >= units[i][0]) {
-                return String((v / units[i][0]).toFixed(1)).replace('.', ',') + ' ' + units[i][1];
+                return (v / units[i][0]).toFixed(1) + ' ' + units[i][1];
             }
         }
-        return v + ' Б';
+        return v + ' B';
     }
 
     // fmtDur — a human-readable duration, like the CLI's status.FormatDuration:
     // "45s", "13m", "5h 20m", "3d 4h".
     function fmtDur(sec) {
         if (!num(sec)) return ND;
-        if (sec < 60) return sec + ' с';
-        if (sec < 3600) return Math.round(sec / 60) + ' м';
-        if (sec < 86400) return Math.floor(sec / 3600) + ' ч ' +
-            String(Math.floor((sec % 3600) / 60)).padStart(2, '0') + ' м';
-        return Math.floor(sec / 86400) + ' д ' + Math.floor((sec % 86400) / 3600) + ' ч';
+        if (sec < 60) return sec + 's';
+        if (sec < 3600) return Math.round(sec / 60) + 'm';
+        if (sec < 86400) return Math.floor(sec / 3600) + 'h ' +
+            String(Math.floor((sec % 3600) / 60)).padStart(2, '0') + 'm';
+        return Math.floor(sec / 86400) + 'd ' + Math.floor((sec % 86400) / 3600) + 'h';
     }
 
     // fmtTime — the snapshot's RFC3339 stamp into the operator's local time.
@@ -160,7 +150,7 @@
         if (!iso) return ND;
         var d = new Date(iso);
         if (isNaN(d.getTime())) return ND;
-        return d.toLocaleString('ru-RU');
+        return d.toLocaleString('en-US');
     }
 
     function setVal(id, text, title) {
@@ -177,7 +167,7 @@
     // errTitle — the reason a section degraded, for the "n/a" caption (§5.9).
     function errTitle(snap, section) {
         var reason = snap && snap.errors ? snap.errors[section] : undefined;
-        return reason ? ('секция недоступна: ' + reason) : undefined;
+        return reason ? ('section unavailable: ' + reason) : undefined;
     }
 
     // ndRow — the "n/a" placeholder row of a table section.
@@ -246,7 +236,7 @@
                 ? (tot.domains_checked / tot.domains_total) * 100 : 0;
             setVal('v-total', fmtInt(tot.domains_total));
             setVal('v-checked', fmtInt(tot.domains_checked));
-            setVal('v-checked-sub', fmtPct(pct) + ' от ' + fmtInt(tot.domains_total));
+            setVal('v-checked-sub', fmtPct(pct) + ' of ' + fmtInt(tot.domains_total));
             if (bar) bar.style.width = Math.min(100, pct) + '%';
             setVal('v-inwork', fmtInt(tot.pending + tot.queued));
         } else {
@@ -259,24 +249,24 @@
 
         var rates = snap.rates;
         var ratesErr = zonesErr || errTitle(snap, 'throughput') ||
-            'скорости считаются из секций зон и темпа — одна недоступна';
+            'the rates are computed from the zones and throughput sections — one is unavailable';
         if (rates) {
             setVal('v-dps', rates.domains_per_sec != null
                 ? fmtRate(rates.domains_per_sec) : ND,
             rates.domains_per_sec != null
                 ? undefined
-                : 'окно суток короче 10 минут — скорость ещё не определена');
+                : 'the daily window is shorter than 10 minutes — the rate is not yet determined');
             setVal('v-rps', fmtRate(rates.results_per_sec));
             setVal('v-renders', fmtRate(rates.renders_per_sec));
             setVal('v-eta', rates.eta_sec != null ? fmtDur(rates.eta_sec) : ND,
-                rates.eta_sec != null ? undefined : 'скорость неизвестна — ETA не считается');
-            setVal('v-eta-sub', 'остаток первого цикла: ' + fmtInt(rates.remaining));
+                rates.eta_sec != null ? undefined : 'the rate is unknown — the ETA is not computed');
+            setVal('v-eta-sub', 'first-cycle remainder: ' + fmtInt(rates.remaining));
         } else {
             setVal('v-dps', ND, ratesErr);
             setVal('v-rps', ND, ratesErr);
             setVal('v-renders', ND, ratesErr);
             setVal('v-eta', ND, ratesErr);
-            setVal('v-eta-sub', 'остаток первого цикла: ' + ND);
+            setVal('v-eta-sub', 'first-cycle remainder: ' + ND);
         }
 
         pushSeries(hist.dps, rates ? rates.domains_per_sec : null);
@@ -293,10 +283,10 @@
         var l = snap.laravel;
         if (l) {
             setVal('v-laravel', fmtInt(l.total));
-            setVal('v-laravel-sub', 'за 24 ч: ' + fmtInt(l.last_24h));
+            setVal('v-laravel-sub', 'last 24 h: ' + fmtInt(l.last_24h));
         } else {
             setVal('v-laravel', ND, errTitle(snap, 'laravel'));
-            setVal('v-laravel-sub', 'за 24 ч: ' + ND);
+            setVal('v-laravel-sub', 'last 24 h: ' + ND);
         }
     }
 
@@ -325,12 +315,12 @@
             if (wm > 0) {
                 // q:dns is counted in chunks, the per-item streams in records.
                 wmParts.push(s + ' ' + fmtInt(wm) +
-                    (s === 'q:dns' ? ' ' + pluRu(wm, 'пачка', 'пачки', 'пачек') : ''));
+                    (s === 'q:dns' ? ' chunks' : ''));
             }
         });
         if (hint) {
             hint.textContent = wmParts.length
-                ? 'пороги backpressure: ' + wmParts.join(' · ')
+                ? 'backpressure thresholds: ' + wmParts.join(' · ')
                 : '';
         }
 
@@ -366,7 +356,7 @@
 
             var dead = s === STREAM_DEAD && depth > 0;
             var name = el('td', dead ? 'q-dead-nonzero' : null, s);
-            if (dead) name.title = 'мертвые задачи: требуется разбор оператора';
+            if (dead) name.title = 'dead tasks: operator triage required';
             row.appendChild(name);
 
             var depthTd = el('td', 'num' + (dead ? ' q-dead-nonzero' : ''), fmtInt(depth));
@@ -409,7 +399,7 @@
             ndRow(body, 7, errTitle(snap, 'render'));
             var nd = el('span', 'nd', ND);
             if (!snap.errors || !snap.errors.render) {
-                nd.title = 'адреса экспозиций не заданы (dashboard.render_metrics_urls пуст)';
+                nd.title = 'exposure addresses are not set (dashboard.render_metrics_urls is empty)';
             } else {
                 nd.title = errTitle(snap, 'render');
             }
@@ -420,7 +410,7 @@
 
         if (!r.engines || !r.engines.length) {
             ndRow(body, 7);
-            body.lastChild.firstChild.textContent = 'воркеры без рендеров';
+            body.lastChild.firstChild.textContent = 'workers without renders';
         } else {
             r.engines.forEach(function (e) {
                 var row = el('tr');
@@ -431,10 +421,10 @@
                 var pct = el('td', 'num',
                     num(e.success_pct) ? fmtPct(e.success_pct) : '—');
                 if (!num(e.success_pct)) {
-                    pct.title = 'атрибутированных движком завершений ещё нет';
+                    pct.title = 'no engine-attributed finalizations yet';
                 } else {
-                    pct.title = 'доля успешных среди завершений с меткой движка ' +
-                        '(движко-независимые DNS/cert-финализации не входят)';
+                    pct.title = 'the share of successful among the engine-labeled finalizations ' +
+                        '(engine-independent DNS/cert finalizations are excluded)';
                 }
                 row.appendChild(pct);
                 // Tarpit rate — the share of the engine's tarpit finalizations
@@ -444,9 +434,9 @@
                     num(e.tarpit_pct) ? fmtPct(e.tarpit_pct) : '—');
                 if (num(e.tarpit_pct)) {
                     tar.title = fmtInt(e.tarpit_total || 0) +
-                        ' тарпит-финализаций из завершений движка с рестарта воркера';
+                        ' tarpit finalizations out of the engine finalizations since the worker restart';
                 } else {
-                    tar.title = 'атрибутированных движком завершений ещё нет';
+                    tar.title = 'no engine-attributed finalizations yet';
                 }
                 row.appendChild(tar);
                 // RSS — the sum of the engine workers' memory (S-P3-2); 0 —
@@ -454,8 +444,8 @@
                 // T-235).
                 var rss = el('td', 'num', e.rss_bytes > 0 ? fmtBytes(e.rss_bytes) : '—');
                 rss.title = e.rss_bytes > 0
-                    ? 'process_resident_memory_bytes воркеров движка'
-                    : 'RSS недоступен (экспозиция без метки engine)';
+                    ? 'process_resident_memory_bytes of the engine workers'
+                    : 'RSS unavailable (the exposure has no engine label)';
                 row.appendChild(rss);
                 body.appendChild(row);
             });
@@ -472,32 +462,32 @@
         var f = r.fallback || {};
         var by = f.consumed_by_result || {};
         var parts = [];
-        parts.push('фолбэк: опубликовано ' + fmtInt(f.published_total) +
-            ' (' + fmtRate(f.published_per_sec) + '/с)');
+        parts.push('fallback: published ' + fmtInt(f.published_total) +
+            ' (' + fmtRate(f.published_per_sec) + '/s)');
         if (num(f.rate_pct)) {
-            parts.push('fallback-рейт ' + fmtPct(f.rate_pct) +
-                ' от страниц этапа');
+            parts.push('fallback rate ' + fmtPct(f.rate_pct) +
+                ' of stage pages');
         } else {
-            parts.push('fallback-рейт —');
+            parts.push('fallback rate —');
         }
-        parts.push('потреблено ' + fmtInt(f.consumed_total) +
-            ' (' + fmtRate(f.consumed_per_sec) + '/с) — доработано ' + fmtInt(by.rendered || 0) +
-            ' / финализировано ' + fmtInt(by.finalized || 0) +
-            ' / пропущено ' + fmtInt(by.skipped || 0));
+        parts.push('consumed ' + fmtInt(f.consumed_total) +
+            ' (' + fmtRate(f.consumed_per_sec) + '/s) — reworked ' + fmtInt(by.rendered || 0) +
+            ' / finalized ' + fmtInt(by.finalized || 0) +
+            ' / skipped ' + fmtInt(by.skipped || 0));
         var depth = el('span');
         if (num(f.depth)) {
-            depth.appendChild(document.createTextNode('глубина q:render-fallback: ' + fmtInt(f.depth)));
+            depth.appendChild(document.createTextNode('q:render-fallback depth: ' + fmtInt(f.depth)));
         } else {
-            var dnd = el('span', 'nd', 'глубина q:render-fallback: ' + ND);
-            dnd.title = 'глубина недоступна (Redis)';
+            var dnd = el('span', 'nd', 'q:render-fallback depth: ' + ND);
+            dnd.title = 'the depth is unavailable (Redis)';
             depth.appendChild(dnd);
         }
         fb.appendChild(document.createTextNode(parts.join(' · ')));
         fb.appendChild(document.createTextNode(' · '));
         fb.appendChild(depth);
         if (hint) {
-            hint.textContent = 'успешность/тарпит-рейт — по метке engine метрик этапа; ' +
-                'кумулятивы — с рестарта воркеров; fallback-рейт — published/страницы этапа';
+            hint.textContent = 'success/tarpit rate — by the stage metrics engine label; ' +
+                'cumulatives — since the worker restarts; the fallback rate — published/stage pages';
         }
     }
 
@@ -514,7 +504,7 @@
         }
         if (snap.zones.length === 0) {
             ndRow(body, 8);
-            body.lastChild.firstChild.textContent = 'зон нет';
+            body.lastChild.firstChild.textContent = 'no zones';
             return;
         }
 
@@ -529,7 +519,7 @@
             var state = el('td');
             state.appendChild(el('span',
                 z.active ? 'badge badge-on' : 'badge badge-off',
-                z.active ? 'активна' : 'пауза'));
+                z.active ? 'active' : 'paused'));
             row.appendChild(state);
 
             row.appendChild(el('td', 'num', fmtInt(z.domains_total)));
@@ -603,7 +593,7 @@
         });
 
         var summary = el('span');
-        summary.appendChild(document.createTextNode('всего · ' + fmtInt(total)));
+        summary.appendChild(document.createTextNode('total · ' + fmtInt(total)));
         legend.appendChild(summary);
     }
 
@@ -621,7 +611,7 @@
         }
         if (!l.recent || !l.recent.length) {
             ndRow(body, 5);
-            body.lastChild.firstChild.textContent = 'находок ещё нет';
+            body.lastChild.firstChild.textContent = 'no finds yet';
             return;
         }
 
@@ -652,7 +642,7 @@
         }
         if (snap.ingest.length === 0) {
             ndRow(body, 8);
-            body.lastChild.firstChild.textContent = 'файлов ещё нет';
+            body.lastChild.firstChild.textContent = 'no files yet';
             return;
         }
 
@@ -680,7 +670,7 @@
         if (!snap.health) {
             // Not an error: no probes are set (dashboard.probes is empty, §5.9).
             var nd = el('span', 'nd', ND);
-            nd.title = 'пробы не заданы (dashboard.probes пуст)';
+            nd.title = 'no probes set (dashboard.probes is empty)';
             box.appendChild(nd);
             return;
         }
@@ -713,7 +703,7 @@
         renderLaravel(snap);
         renderIngest(snap);
         renderHealth(snap);
-        setVal('built-at', 'снимок: ' + fmtTime(snap.built_at));
+        setVal('built-at', 'snapshot: ' + fmtTime(snap.built_at));
     }
 
     var timer = null;
@@ -728,17 +718,17 @@
                     // either silently resends the cached credentials or shows
                     // the re-login dialog.
                     if (timer) clearInterval(timer);
-                    setConn('требуется повторный вход…', 'conn-err');
+                    setConn('re-login required…', 'conn-err');
                     location.reload();
                     return null;
                 }
                 if (resp.status === 503) {
                     // §5.9: the first snapshot has not been collected yet.
-                    setConn('снимок готовится…', 'conn-wait');
+                    setConn('snapshot is being prepared…', 'conn-wait');
                     return null;
                 }
                 if (!resp.ok) {
-                    setConn('ошибка обновления: HTTP ' + resp.status, 'conn-err');
+                    setConn('refresh error: HTTP ' + resp.status, 'conn-err');
                     return null;
                 }
                 return resp.json().catch(function () { return null; });
@@ -747,13 +737,13 @@
                 if (!snap) return;
                 try {
                     render(snap);
-                    setConn('обновлено ' + new Date().toLocaleTimeString('ru-RU'), 'conn-ok');
+                    setConn('updated ' + new Date().toLocaleTimeString('en-US'), 'conn-ok');
                 } catch (e) {
-                    setConn('ошибка отрисовки снимка', 'conn-err');
+                    setConn('snapshot render error', 'conn-err');
                 }
             })
             .catch(function () {
-                setConn('нет соединения с дашбордом', 'conn-err');
+                setConn('no connection to the dashboard', 'conn-err');
             });
     }
 

@@ -190,7 +190,7 @@ type Collector struct {
 // section (period/probes).
 func NewCollector(pool db.DB, lens status.StreamLener, cfg config.Dashboard, opts CollectorOptions) (*Collector, error) {
 	if pool == nil {
-		return nil, errors.New("dashboard: сборщик снимков: пул БД не задан")
+		return nil, errors.New("dashboard: the snapshot collector: the DB pool is not set")
 	}
 	if cfg.Refresh.D() > 0 && opts.Interval == 0 {
 		opts.Interval = cfg.Refresh.D()
@@ -443,7 +443,7 @@ func (c *Collector) probeOne(ctx context.Context, name, base string) ProbeJSON {
 // collection longer than the period simply shifts the next tick (the
 // ticker does not accumulate misses).
 func (c *Collector) Loop(ctx context.Context) error {
-	c.opt.Log.Info("цикл сборки снимков дашборда",
+	c.opt.Log.Info("the dashboard snapshot build loop",
 		"interval", c.opt.Interval.String(), "probes", len(c.opt.Probes), "render_metrics", len(c.opt.RenderMetrics))
 
 	pass := func() {
@@ -465,9 +465,9 @@ func (c *Collector) Loop(ctx context.Context) error {
 		c.snap.Store(snap)
 		c.metrics.observe(result, time.Since(started).Seconds())
 		if result == snapshotResultError {
-			c.opt.Log.Warn("сборка снимка дашборда с ошибками секций", "errors", snap.Errors)
+			c.opt.Log.Warn("the dashboard snapshot built with section errors", "errors", snap.Errors)
 		} else {
-			c.opt.Log.Debug("сборка снимка дашборда", "built_at", snap.BuiltAt)
+			c.opt.Log.Debug("the dashboard snapshot built", "built_at", snap.BuiltAt)
 		}
 	}
 
@@ -506,11 +506,11 @@ func newCollectorMetrics(reg *metrics.Registry) *collectorMetrics {
 	return &collectorMetrics{
 		snapshots: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_dashboard_snapshots_total",
-			Help: "Сборки снимка дашборда по результату: ok — все секции живы, error — есть деградированные (снимок публикуется, ТЗД §5.9).",
+			Help: "Dashboard snapshot builds by outcome: ok — all sections are alive, error — some degraded (the snapshot is published, dashboard spec §5.9).",
 		}, "result"),
 		seconds: reg.MustHistogram(prometheus.HistogramOpts{
 			Name:    "crawler_dashboard_snapshot_seconds",
-			Help:    "Длительность сборки снимка дашборда (один проход всех секций, ТЗД §4.4).",
+			Help:    "The dashboard snapshot build duration (a single pass over all sections, dashboard spec §4.4).",
 			Buckets: prometheus.ExponentialBuckets(0.05, 2, 13),
 		}),
 	}

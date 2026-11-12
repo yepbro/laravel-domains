@@ -97,7 +97,7 @@ const advisoryLockKey = 0x63726177 // "craw"
 // ErrDirty is returned when the schema stayed in a dirty state after an
 // interrupted migration: golang-migrate refuses to apply the next ones
 // until the version is confirmed manually.
-var ErrDirty = errors.New("миграции: схема в dirty-состоянии (прерванная миграция); выполните TRUNCATE schema_migrations или `migrate force <версия>` после разбора причины")
+var ErrDirty = errors.New("migrate: the schema is in a dirty state (an interrupted migration); run TRUNCATE schema_migrations or `migrate force <version>` after the incident analysis")
 
 // ErrInterrupted is returned when the application is interrupted by a
 // context cancellation (a shutdown signal): the running SQL was cancelled
@@ -105,7 +105,7 @@ var ErrDirty = errors.New("миграции: схема в dirty-состоян�
 // entirely, the schema version returned to the last applied one. The next
 // start will apply the interrupted migration again — this is a normal fast
 // shutdown, not a failure.
-var ErrInterrupted = errors.New("миграции: применение прервано сигналом завершения")
+var ErrInterrupted = errors.New("migrate: the apply was interrupted by the shutdown signal")
 
 // runnerAppPrefix — the prefix of the application_name of the runner's
 // connections; tagSeq makes the label unique per Up call: the migration
@@ -126,7 +126,7 @@ var (
 // finishes the application.
 func Up(ctx context.Context, dsn string) error {
 	if dsn == "" {
-		return errors.New("миграции: пустой DSN PostgreSQL")
+		return errors.New("migrate: an empty PostgreSQL DSN")
 	}
 
 	// The connections label: pg_cancel_backend addresses by it only this
@@ -145,7 +145,7 @@ func Up(ctx context.Context, dsn string) error {
 	// of the session, so it cannot be held on a pool connection.
 	conn, err := db.Conn(ctx)
 	if err != nil {
-		return fmt.Errorf("миграции: соединение для блокировки: %w", err)
+		return fmt.Errorf("migrate: the lock connection: %w", err)
 	}
 	defer conn.Close() //nolint:errcheck // also releases the advisory lock
 
@@ -156,14 +156,14 @@ func Up(ctx context.Context, dsn string) error {
 
 	src, err := newSource()
 	if err != nil {
-		return fmt.Errorf("миграции: встроенные файлы: %w", err)
+		return fmt.Errorf("migrate: the embedded files: %w", err)
 	}
 
 	// One migration = one multi-line SQL file: pgx executes it entirely
 	// via the simple protocol (without arguments), like the CLI migrate.
 	driver, err := pgxmigrate.WithInstance(db, &pgxmigrate.Config{})
 	if err != nil {
-		return fmt.Errorf("миграции: драйвер БД: %w", err)
+		return fmt.Errorf("migrate: the database driver: %w", err)
 	}
 
 	m, err := migrate.NewWithInstance("iofs", src, "postgres", driver)
@@ -171,9 +171,9 @@ func Up(ctx context.Context, dsn string) error {
 		// The driver already holds the dedicated connection — close it,
 		// so it does not leak on this path either.
 		if cerr := driver.Close(); cerr != nil {
-			slog.Warn("миграции: закрытие драйвера", "err", cerr)
+			slog.Warn("migrate: closing the driver", "err", cerr)
 		}
-		return fmt.Errorf("миграции: инициализация: %w", err)
+		return fmt.Errorf("migrate: initialization: %w", err)
 	}
 	// m.Close closes the source and the driver: the connection held by
 	// the driver returns to the pool immediately instead of living without
@@ -181,7 +181,7 @@ func Up(ctx context.Context, dsn string) error {
 	// connections; an in-use one stays hanging).
 	defer func() {
 		if _, cerr := m.Close(); cerr != nil {
-			slog.Warn("миграции: закрытие раннера", "err", cerr)
+			slog.Warn("migrate: closing the runner", "err", cerr)
 		}
 	}()
 	m.LockTimeout = lockTimeout
@@ -215,19 +215,19 @@ func Up(ctx context.Context, dsn string) error {
 	case err == nil:
 		version, _, verr := m.Version()
 		if verr != nil {
-			return fmt.Errorf("миграции: версия после применения: %w", verr)
+			return fmt.Errorf("migrate: the version after the apply: %w", verr)
 		}
-		slog.Info("миграции: схема применена", "version", version)
+		slog.Info("migrate: the schema is applied", "version", version)
 		return nil
 	case errors.Is(err, migrate.ErrNoChange):
-		slog.Info("миграции: схема уже актуальна, применение не требуется")
+		slog.Info("migrate: the schema is already up to date, nothing to apply")
 		return nil
 	case cancelled.Load():
 		return interrupted(driver, m, err)
 	case errors.As(err, new(migrate.ErrDirty)):
 		return ErrDirty
 	default:
-		return fmt.Errorf("миграции: применение: %w", err)
+		return fmt.Errorf("migrate: apply: %w", err)
 	}
 }
 
@@ -247,12 +247,12 @@ func Up(ctx context.Context, dsn string) error {
 // state — no reset needed.
 func interrupted(driver database.Driver, m *migrate.Migrate, err error) error {
 	if !interruptedInRun(err) {
-		return fmt.Errorf("%w: применение остановлено до тела миграции, состояние схемы не менялось: %w", ErrInterrupted, err)
+		return fmt.Errorf("%w: the apply stopped before the migration body, the schema state was not changed: %w", ErrInterrupted, err)
 	}
 
 	version, dirty, verr := m.Version()
 	if verr != nil || !dirty || version == 0 {
-		return fmt.Errorf("%w: состояние версии не удалось подтвердить: %w", ErrInterrupted, err)
+		return fmt.Errorf("%w: the version state could not be confirmed: %w", ErrInterrupted, err)
 	}
 
 	prev := int(version) - 1
@@ -263,12 +263,12 @@ func interrupted(driver database.Driver, m *migrate.Migrate, err error) error {
 		// The schema was rolled back (an implicit transaction), but the
 		// version row stayed dirty: the next start hits ErrDirty — the
 		// recovery direction is the same as for any interrupted migration.
-		return fmt.Errorf("%w: миграция %d отменена и откатана, но версия не восстановлена (осталась dirty): %w; откат версии: %v",
+		return fmt.Errorf("%w: migration %d was canceled and rolled back, but the version was not restored (still dirty): %w; the version rollback: %v",
 			ErrInterrupted, version, err, serr)
 	}
-	slog.Warn("миграции: применение прервано сигналом, миграция откатана, схема на предыдущей версии",
+	slog.Warn("migrate: the apply was interrupted by the signal, the migration rolled back, the schema is on the previous version",
 		"interrupted_version", version, "rolled_back_to", prev)
-	return fmt.Errorf("%w: миграция %d отменена и откатана целиком, схема на версии %d, повторный старт применит её заново: %w",
+	return fmt.Errorf("%w: migration %d was canceled and rolled back in full, the schema is on version %d, the next start applies it again: %w",
 		ErrInterrupted, version, prev, err)
 }
 
@@ -319,7 +319,7 @@ func cancelApplying(db *sql.DB, tag string, done <-chan struct{}) bool {
 		var n int
 		if err := db.QueryRowContext(ctx, query, tag).Scan(&n); err != nil {
 			if ctx.Err() == nil {
-				slog.Warn("миграции: попытка снять применяющуюся миграцию не удалась, повторю", "err", err)
+				slog.Warn("migrate: the attempt to cancel the running migration failed, retrying", "err", err)
 			}
 		} else if n > 0 {
 			return true
@@ -330,7 +330,7 @@ func cancelApplying(db *sql.DB, tag string, done <-chan struct{}) bool {
 		// the application, or the budget.
 		select {
 		case <-ctx.Done():
-			slog.Warn("миграции: снять применяющуюся миграцию не удалось — доработает до конца", "tag", tag)
+			slog.Warn("migrate: the running migration could not be canceled — it runs to completion", "tag", tag)
 			return false
 		case <-done:
 			return false
@@ -363,7 +363,7 @@ func acquireAdvisoryLock(ctx context.Context, conn *sql.Conn) error {
 	defer cancel()
 	const query = `SELECT pg_advisory_lock($1)`
 	if _, err := conn.ExecContext(lockCtx, query, advisoryLockKey); err != nil {
-		return fmt.Errorf("миграции: ожидание advisory-блокировки (её держит другой экземпляр?): %w", err)
+		return fmt.Errorf("migrate: waiting for the advisory lock (is another instance holding it?): %w", err)
 	}
 	return nil
 }
@@ -373,7 +373,7 @@ func acquireAdvisoryLock(ctx context.Context, conn *sql.Conn) error {
 func releaseAdvisoryLock(conn *sql.Conn) {
 	const query = `SELECT pg_advisory_unlock($1)`
 	if _, err := conn.ExecContext(context.Background(), query, advisoryLockKey); err != nil {
-		slog.Warn("миграции: снятие advisory-блокировки не удалось (снимется при закрытии соединения)", "err", err)
+		slog.Warn("migrate: releasing the advisory lock failed (it is released on connection close)", "err", err)
 	}
 }
 
@@ -391,7 +391,7 @@ func newSource() (source.Driver, error) {
 func openAndWait(ctx context.Context, dsn string) (*sql.DB, error) {
 	db, err := sql.Open(sqlDriver, dsn)
 	if err != nil {
-		return nil, fmt.Errorf("миграции: разбор DSN: %w", err)
+		return nil, fmt.Errorf("migrate: DSN parse: %w", err)
 	}
 	// On error paths (a timeout, a cancellation) the *sql.DB is closed:
 	// otherwise a background opener goroutine and the connections that
@@ -414,12 +414,12 @@ func openAndWait(ctx context.Context, dsn string) (*sql.DB, error) {
 		}
 		if time.Now().After(deadline) {
 			redacted := redactDSN(dsn)
-			return nil, fmt.Errorf("миграции: PostgreSQL недоступен (%s): %w", redacted, err)
+			return nil, fmt.Errorf("migrate: PostgreSQL unavailable (%s): %w", redacted, err)
 		}
-		slog.Info("миграции: PostgreSQL ещё недоступен, повторю попытку", "err", err.Error(), "retry_in", connectRetryInterval.String())
+		slog.Info("migrate: PostgreSQL is still unavailable, retrying", "err", err.Error(), "retry_in", connectRetryInterval.String())
 		select {
 		case <-ctx.Done():
-			return nil, fmt.Errorf("миграции: ожидание PostgreSQL прервано: %w", ctx.Err())
+			return nil, fmt.Errorf("migrate: waiting for PostgreSQL interrupted: %w", ctx.Err())
 		case <-time.After(connectRetryInterval):
 		}
 	}
@@ -429,5 +429,5 @@ func openAndWait(ctx context.Context, dsn string) (*sql.DB, error) {
 // implementation with internal/db; the fallback mentions the env source of
 // the runner's DSN too — APP_PG_DSN).
 func redactDSN(dsn string) string {
-	return db.RedactDSN(dsn, "см. postgres.dsn (конфигурация) / APP_PG_DSN")
+	return db.RedactDSN(dsn, "see postgres.dsn (configuration) / APP_PG_DSN")
 }

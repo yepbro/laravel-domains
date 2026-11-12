@@ -43,7 +43,7 @@ func encodeBytes(t *testing.T, cm *charmap.Charmap, s string) []byte {
 	t.Helper()
 	b, err := cm.NewEncoder().Bytes([]byte(s))
 	if err != nil {
-		t.Fatalf("кодирование %v: %v", cm, err)
+		t.Fatalf("encoding %v: %v", cm, err)
 	}
 	return b
 }
@@ -121,13 +121,13 @@ func headerOf(contentType string) http.Header {
 // ContentSaver zeroes out content_hash) with no charset, whatever the
 // input — nil or an empty slice.
 func TestToUTF8EmptyBody(t *testing.T) {
-	for name, body := range map[string][]byte{"nil": nil, "пустой слайс": {}} {
+	for name, body := range map[string][]byte{"nil": nil, "empty slice": {}} {
 		got := ToUTF8(headerOf("text/html; charset=windows-1251"), body)
 		if got.UTF8 == nil || len(got.UTF8) != 0 {
-			t.Fatalf("%s: UTF8=%#v, ожидался пустой не-nil слайс", name, got.UTF8)
+			t.Fatalf("%s: UTF8=%#v, a non-nil empty slice expected", name, got.UTF8)
 		}
 		if got.Charset != "" || got.Source != CharsetNone {
-			t.Fatalf("%s: получили %+v, ожидались пустой charset и CharsetNone", name, got)
+			t.Fatalf("%s: got %+v, an empty charset and CharsetNone expected", name, got)
 		}
 	}
 }
@@ -148,10 +148,10 @@ func TestToUTF8BOMOnlyBody(t *testing.T) {
 	} {
 		got := ToUTF8(headerOf("text/html"), tc.body)
 		if got.UTF8 == nil || len(got.UTF8) != 0 {
-			t.Fatalf("%s: UTF8=%#v, ожидался пустой не-nil слайс", tc.name, got.UTF8)
+			t.Fatalf("%s: UTF8=%#v, a non-nil empty slice expected", tc.name, got.UTF8)
 		}
 		if got.Charset != tc.charset || got.Source != CharsetBOM {
-			t.Fatalf("%s: charset=%q source=%v, ожидались %q/bom", tc.name, got.Charset, got.Source, tc.charset)
+			t.Fatalf("%s: charset=%q source=%v, %q/bom expected", tc.name, got.Charset, got.Source, tc.charset)
 		}
 	}
 }
@@ -162,10 +162,10 @@ func TestToUTF8HeaderCharset(t *testing.T) {
 	got := ToUTF8(headerOf("text/html; charset=windows-1251"),
 		encodeBytes(t, charmap.Windows1251, ruSample))
 	if string(got.UTF8) != ruSample {
-		t.Errorf("декод windows-1251: получили %q", got.UTF8)
+		t.Errorf("windows-1251 decode: got %q", got.UTF8)
 	}
 	if got.Charset != "windows-1251" || got.Source != CharsetHeader {
-		t.Errorf("источник: charset=%q source=%v, ожидались windows-1251/header", got.Charset, got.Source)
+		t.Errorf("source: charset=%q source=%v, windows-1251/header expected", got.Charset, got.Source)
 	}
 }
 
@@ -175,7 +175,7 @@ func TestToUTF8HeaderAliasAndCase(t *testing.T) {
 	got := ToUTF8(headerOf(`text/html; charset="CP1251"`),
 		encodeBytes(t, charmap.Windows1251, ruSample))
 	if got.Charset != "windows-1251" || got.Source != CharsetHeader || string(got.UTF8) != ruSample {
-		t.Errorf("алиас CP1251: charset=%q source=%v совпадение=%v",
+		t.Errorf("the CP1251 alias: charset=%q source=%v match=%v",
 			got.Charset, got.Source, string(got.UTF8) == ruSample)
 	}
 }
@@ -185,10 +185,10 @@ func TestToUTF8BOMUTF8(t *testing.T) {
 	body := append([]byte{0xEF, 0xBB, 0xBF}, ruSample...)
 	got := ToUTF8(headerOf("text/html; charset=koi8-r"), body)
 	if got.Source != CharsetBOM || got.Charset != "utf-8" {
-		t.Fatalf("источник: %+v, ожидался BOM/utf-8", got)
+		t.Fatalf("source: %+v, BOM/utf-8 expected", got)
 	}
 	if string(got.UTF8) != ruSample {
-		t.Errorf("BOM не снят или тело искажено: %q", got.UTF8)
+		t.Errorf("the BOM is not stripped or the body is distorted: %q", got.UTF8)
 	}
 }
 
@@ -207,10 +207,10 @@ func TestToUTF8BOMUTF16(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			got := ToUTF8(headerOf("text/html; charset=windows-1251"), tc.body)
 			if got.Source != CharsetBOM || got.Charset != tc.want {
-				t.Fatalf("источник: charset=%q source=%v, ожидались %q/bom", got.Charset, got.Source, tc.want)
+				t.Fatalf("source: charset=%q source=%v, %q/bom expected", got.Charset, got.Source, tc.want)
 			}
 			if string(got.UTF8) != "Привет, мир!" {
-				t.Errorf("декод: %q", got.UTF8)
+				t.Errorf("decode: %q", got.UTF8)
 			}
 		})
 	}
@@ -223,10 +223,10 @@ func TestToUTF8MetaCharset(t *testing.T) {
 		"<html><head><meta charset=\"windows-1251\"><title>Проверка</title></head><body>"+ruSample+"</body></html>")
 	got := ToUTF8(headerOf("text/html"), body)
 	if got.Charset != "windows-1251" || got.Source != CharsetMeta {
-		t.Fatalf("источник: charset=%q source=%v, ожидались windows-1251/meta", got.Charset, got.Source)
+		t.Fatalf("source: charset=%q source=%v, windows-1251/meta expected", got.Charset, got.Source)
 	}
 	if !strings.Contains(string(got.UTF8), ruSample) {
-		t.Errorf("декод по meta: тело не содержит образец: %q", got.UTF8)
+		t.Errorf("the meta decode: the body does not contain the sample: %q", got.UTF8)
 	}
 }
 
@@ -237,10 +237,10 @@ func TestToUTF8MetaHTTPEquiv(t *testing.T) {
 		`<html><head><meta http-equiv="Content-Type" content="text/html; charset=koi8-r"></head><body>`+ruSample+`</body></html>`)
 	got := ToUTF8(headerOf(""), body)
 	if got.Charset != "koi8-r" || got.Source != CharsetMeta {
-		t.Fatalf("источник: charset=%q source=%v, ожидались koi8-r/meta", got.Charset, got.Source)
+		t.Fatalf("source: charset=%q source=%v, koi8-r/meta expected", got.Charset, got.Source)
 	}
 	if !strings.Contains(string(got.UTF8), ruSample) {
-		t.Errorf("декод по http-equiv: %q", got.UTF8)
+		t.Errorf("the http-equiv decode: %q", got.UTF8)
 	}
 }
 
@@ -251,7 +251,7 @@ func TestToUTF8HeaderBeatsMeta(t *testing.T) {
 		`<html><head><meta charset="windows-1251"></head><body>`+ruSample+`</body></html>`)
 	got := ToUTF8(headerOf("text/html; charset=koi8-r"), body)
 	if got.Charset != "koi8-r" || got.Source != CharsetHeader {
-		t.Fatalf("приоритет: charset=%q source=%v, ожидались koi8-r/header", got.Charset, got.Source)
+		t.Fatalf("priority: charset=%q source=%v, koi8-r/header expected", got.Charset, got.Source)
 	}
 }
 
@@ -262,7 +262,7 @@ func TestToUTF8UnknownHeaderLabel(t *testing.T) {
 		`<html><head><meta charset="koi8-r"></head><body>`+ruSample+`</body></html>`)
 	got := ToUTF8(headerOf("text/html; charset=x-unknown-cp866"), body)
 	if got.Charset != "koi8-r" || got.Source != CharsetMeta {
-		t.Fatalf("неизвестная метка: charset=%q source=%v, ожидались koi8-r/meta", got.Charset, got.Source)
+		t.Fatalf("an unknown label: charset=%q source=%v, koi8-r/meta expected", got.Charset, got.Source)
 	}
 }
 
@@ -279,10 +279,10 @@ func TestToUTF8DetectUTF8(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			got := ToUTF8(headerOf("text/html"), []byte(tc.body))
 			if got.Charset != "utf-8" || got.Source != CharsetDetect {
-				t.Fatalf("источник: charset=%q source=%v, ожидались utf-8/detect", got.Charset, got.Source)
+				t.Fatalf("source: charset=%q source=%v, utf-8/detect expected", got.Charset, got.Source)
 			}
 			if string(got.UTF8) != tc.body {
-				t.Errorf("тело изменилось: %q", got.UTF8)
+				t.Errorf("the body changed: %q", got.UTF8)
 			}
 		})
 	}
@@ -294,10 +294,10 @@ func TestToUTF8DetectUTF8(t *testing.T) {
 func TestToUTF8DetectKOI8R(t *testing.T) {
 	got := ToUTF8(headerOf(""), encodeBytes(t, charmap.KOI8R, ruSample))
 	if got.Charset != "koi8-r" || got.Source != CharsetDetect {
-		t.Fatalf("детект: charset=%q source=%v, ожидались koi8-r/detect", got.Charset, got.Source)
+		t.Fatalf("detect: charset=%q source=%v, koi8-r/detect expected", got.Charset, got.Source)
 	}
 	if string(got.UTF8) != ruSample {
-		t.Errorf("декод: %q", got.UTF8)
+		t.Errorf("decode: %q", got.UTF8)
 	}
 }
 
@@ -307,10 +307,10 @@ func TestToUTF8DetectKOI8R(t *testing.T) {
 func TestToUTF8DetectWindows1251(t *testing.T) {
 	got := ToUTF8(headerOf(""), encodeBytes(t, charmap.Windows1251, ruSample))
 	if got.Charset != "windows-1251" || got.Source != CharsetDetect {
-		t.Fatalf("детект: charset=%q source=%v, ожидались windows-1251/detect", got.Charset, got.Source)
+		t.Fatalf("detect: charset=%q source=%v, windows-1251/detect expected", got.Charset, got.Source)
 	}
 	if string(got.UTF8) != ruSample {
-		t.Errorf("декод: %q", got.UTF8)
+		t.Errorf("decode: %q", got.UTF8)
 	}
 }
 
@@ -322,10 +322,10 @@ func TestToUTF8DetectRescuesMislabeledMeta(t *testing.T) {
 		`<html><head><meta charset="windows-1252"></head><body>`+ruSample+`</body></html>`)
 	got := ToUTF8(headerOf("text/html"), body)
 	if got.Charset != "windows-1251" || got.Source != CharsetDetect {
-		t.Fatalf("спасение: charset=%q source=%v, ожидались windows-1251/detect", got.Charset, got.Source)
+		t.Fatalf("rescue: charset=%q source=%v, windows-1251/detect expected", got.Charset, got.Source)
 	}
 	if !strings.Contains(string(got.UTF8), ruSample) {
-		t.Errorf("декод: %q", got.UTF8)
+		t.Errorf("decode: %q", got.UTF8)
 	}
 }
 
@@ -335,10 +335,10 @@ func TestToUTF8DetectRescuesMislabeledMeta(t *testing.T) {
 func TestToUTF8DefaultWindows1252(t *testing.T) {
 	got := ToUTF8(headerOf(""), encodeBytes(t, charmap.Windows1252, "École naïve café"))
 	if got.Charset != "windows-1252" || got.Source != CharsetDefault {
-		t.Fatalf("умолчание: charset=%q source=%v, ожидались windows-1252/default", got.Charset, got.Source)
+		t.Fatalf("default: charset=%q source=%v, windows-1252/default expected", got.Charset, got.Source)
 	}
 	if string(got.UTF8) != "École naïve café" {
-		t.Errorf("latin-1 декод: %q", got.UTF8)
+		t.Errorf("the latin-1 decode: %q", got.UTF8)
 	}
 }
 
@@ -348,13 +348,13 @@ func TestToUTF8InvalidUTF8Replaced(t *testing.T) {
 	body := []byte("текст\xff\xfe и \xc3 конец")
 	got := ToUTF8(headerOf("text/html; charset=utf-8"), body)
 	if got.Charset != "utf-8" || got.Source != CharsetHeader {
-		t.Fatalf("источник: %+v", got)
+		t.Fatalf("source: %+v", got)
 	}
 	if !strings.Contains(string(got.UTF8), "\uFFFD") {
-		t.Errorf("ожидались замены U+FFFD: %q", got.UTF8)
+		t.Errorf("U+FFFD replacements expected: %q", got.UTF8)
 	}
 	if !strings.Contains(string(got.UTF8), "текст") || !strings.Contains(string(got.UTF8), "конец") {
-		t.Errorf("валидная часть потеряна: %q", got.UTF8)
+		t.Errorf("the valid part is lost: %q", got.UTF8)
 	}
 }
 
@@ -378,15 +378,15 @@ func TestDecodeContentEncoding(t *testing.T) {
 		_ = got.Close()
 	})
 
-	t.Run("пустое-значение", func(t *testing.T) {
+	t.Run("empty-value", func(t *testing.T) {
 		rc := io.NopCloser(bytes.NewReader(plain))
 		got, err := decodeContentEncoding(rc, "", 0)
 		if err != nil {
-			t.Fatalf("пусто: %v", err)
+			t.Fatalf("empty: %v", err)
 		}
 		b, _ := io.ReadAll(got)
 		if !bytes.Equal(b, plain) {
-			t.Errorf("пусто: %q", b)
+			t.Errorf("empty: %q", b)
 		}
 		_ = got.Close()
 	})
@@ -397,12 +397,12 @@ func TestDecodeContentEncoding(t *testing.T) {
 		compressed func() []byte
 	}{
 		{"gzip", "gzip", func() []byte { return gzipBytes(t, plain) }},
-		{"gzip-регистр", " GZip ", func() []byte { return gzipBytes(t, plain) }},
-		{"x-gzip-алиас", "x-gzip", func() []byte { return gzipBytes(t, plain) }},
+		{"gzip-case", " GZip ", func() []byte { return gzipBytes(t, plain) }},
+		{"x-gzip-alias", "x-gzip", func() []byte { return gzipBytes(t, plain) }},
 		{"br", "br", func() []byte { return brotliBytes(t, plain) }},
 		{"deflate-zlib", "deflate", func() []byte { return zlibBytes(t, plain) }},
-		{"deflate-регистр", " Deflate ", func() []byte { return zlibBytes(t, plain) }},
-		{"deflate-сырой", "deflate", func() []byte { return flateRawBytes(t, plain) }},
+		{"deflate-case", " Deflate ", func() []byte { return zlibBytes(t, plain) }},
+		{"deflate-raw", "deflate", func() []byte { return flateRawBytes(t, plain) }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := decodeContentEncoding(io.NopCloser(bytes.NewReader(tc.compressed())), tc.enc, 0)
@@ -411,7 +411,7 @@ func TestDecodeContentEncoding(t *testing.T) {
 			}
 			b, err := io.ReadAll(got)
 			if err != nil || !bytes.Equal(b, plain) {
-				t.Errorf("%s: длина=%d err=%v", tc.name, len(b), err)
+				t.Errorf("%s: len=%d err=%v", tc.name, len(b), err)
 			}
 			_ = got.Close()
 		})
@@ -429,7 +429,7 @@ func TestDecodeContentEncodingUnsupported(t *testing.T) {
 		"gzip,,br", "gzip,", ",br", "br,,",
 	} {
 		if _, err := decodeContentEncoding(io.NopCloser(bytes.NewReader(nil)), ce, 0); err == nil {
-			t.Errorf("Content-Encoding %q: ожидалась ошибка", ce)
+			t.Errorf("Content-Encoding %q: an error expected", ce)
 		}
 	}
 }
@@ -448,16 +448,16 @@ func TestDecodeContentEncodingLayered(t *testing.T) {
 		enc  string
 		body []byte
 	}{
-		{"gzip-затем-br", "gzip, br", brotliBytes(t, gzipBytes(t, plain))},
-		{"br-затем-gzip", "br, gzip", gzipBytes(t, brotliBytes(t, plain))},
-		{"gzip-в-gzip", "gzip, gzip", gzipBytes(t, gzipBytes(t, plain))},
-		{"deflate-внешний", "gzip, deflate", zlibBytes(t, gzipBytes(t, plain))},
-		{"deflate-внешний-сырой", "br, deflate", flateRawBytes(t, brotliBytes(t, plain))},
-		{"deflate-внутренний", "deflate, gzip", gzipBytes(t, zlibBytes(t, plain))},
-		{"identity-в-середине", "gzip, identity, br", brotliBytes(t, gzipBytes(t, plain))},
-		{"identity-внутри", "identity, gzip", gzipBytes(t, plain)},
-		{"x-gzip-в-составе", "x-gzip, br", brotliBytes(t, gzipBytes(t, plain))},
-		{"регистр-и-пробелы", " GZip , BR ", brotliBytes(t, gzipBytes(t, plain))},
+		{"gzip-then-br", "gzip, br", brotliBytes(t, gzipBytes(t, plain))},
+		{"br-then-gzip", "br, gzip", gzipBytes(t, brotliBytes(t, plain))},
+		{"gzip-in-gzip", "gzip, gzip", gzipBytes(t, gzipBytes(t, plain))},
+		{"deflate-outer", "gzip, deflate", zlibBytes(t, gzipBytes(t, plain))},
+		{"deflate-outer-raw", "br, deflate", flateRawBytes(t, brotliBytes(t, plain))},
+		{"deflate-inner", "deflate, gzip", gzipBytes(t, zlibBytes(t, plain))},
+		{"identity-in-the-middle", "gzip, identity, br", brotliBytes(t, gzipBytes(t, plain))},
+		{"identity-inside", "identity, gzip", gzipBytes(t, plain)},
+		{"x-gzip-in-compound", "x-gzip, br", brotliBytes(t, gzipBytes(t, plain))},
+		{"case-and-spaces", " GZip , BR ", brotliBytes(t, gzipBytes(t, plain))},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := decodeContentEncoding(io.NopCloser(bytes.NewReader(tc.body)), tc.enc, 0)
@@ -466,7 +466,7 @@ func TestDecodeContentEncodingLayered(t *testing.T) {
 			}
 			b, err := io.ReadAll(got)
 			if err != nil || !bytes.Equal(b, plain) {
-				t.Errorf("%s: длина=%d err=%v", tc.name, len(b), err)
+				t.Errorf("%s: len=%d err=%v", tc.name, len(b), err)
 			}
 			_ = got.Close()
 		})
@@ -483,15 +483,15 @@ func TestDecodeContentEncodingLayeredBomb(t *testing.T) {
 	got, err := decodeContentEncoding(
 		io.NopCloser(bytes.NewReader(brotliBytes(t, gzipBytes(t, bomb)))), "gzip, br", 4096)
 	if err != nil {
-		t.Fatalf("обёртка бомбы: %v", err)
+		t.Fatalf("the bomb wrapper: %v", err)
 	}
 	defer func() { _ = got.Close() }()
 	b, err := io.ReadAll(got)
 	if !errors.Is(err, ErrDecompressTooLarge) {
-		t.Fatalf("ожидался ErrDecompressTooLarge, получено err=%v (прочитано %d)", err, len(b))
+		t.Fatalf("ErrDecompressTooLarge expected, got err=%v (%d read)", err, len(b))
 	}
 	if len(b) != 4096 {
-		t.Errorf("до потолка должно читаться ровно 4096, прочитано %d", len(b))
+		t.Errorf("exactly 4096 must be readable up to the cap, %d read", len(b))
 	}
 }
 
@@ -531,15 +531,15 @@ func TestDecodeContentEncodingBomb(t *testing.T) {
 	bomb := bytes.Repeat([]byte("A"), 1<<20) // decompresses to 1 MB
 	got, err := decodeContentEncoding(io.NopCloser(bytes.NewReader(gzipBytes(t, bomb))), "gzip", 4096)
 	if err != nil {
-		t.Fatalf("обёртка бомбы: %v", err)
+		t.Fatalf("the bomb wrapper: %v", err)
 	}
 	defer func() { _ = got.Close() }()
 	b, err := io.ReadAll(got)
 	if !errors.Is(err, ErrDecompressTooLarge) {
-		t.Fatalf("ожидался ErrDecompressTooLarge, получено err=%v (прочитано %d)", err, len(b))
+		t.Fatalf("ErrDecompressTooLarge expected, got err=%v (%d read)", err, len(b))
 	}
 	if len(b) != 4096 {
-		t.Errorf("до потолка должно читаться ровно 4096, прочитано %d", len(b))
+		t.Errorf("exactly 4096 must be readable up to the cap, %d read", len(b))
 	}
 }
 
@@ -549,11 +549,11 @@ func TestDecodeContentEncodingExactLimit(t *testing.T) {
 	plain := bytes.Repeat([]byte("B"), 1000)
 	got, err := decodeContentEncoding(io.NopCloser(bytes.NewReader(gzipBytes(t, plain))), "gzip", 1000)
 	if err != nil {
-		t.Fatalf("обёртка: %v", err)
+		t.Fatalf("the wrapper: %v", err)
 	}
 	b, err := io.ReadAll(got)
 	if err != nil || !bytes.Equal(b, plain) {
-		t.Fatalf("ровно в потолок: len=%d err=%v", len(b), err)
+		t.Fatalf("exactly at the cap: len=%d err=%v", len(b), err)
 	}
 	_ = got.Close()
 }
@@ -573,7 +573,7 @@ func TestDecodeContentEncodingClosesSource(t *testing.T) {
 
 	got, err := decodeContentEncoding(newRC(gzipBytes(t, []byte("тело"))), "gzip", 1<<20)
 	if err != nil {
-		t.Fatalf("обёртка: %v", err)
+		t.Fatalf("the wrapper: %v", err)
 	}
 	_, _ = io.ReadAll(got)
 	if err := got.Close(); err != nil {
@@ -586,7 +586,7 @@ func TestDecodeContentEncodingClosesSource(t *testing.T) {
 	bad := append(gzipBytes(t, []byte("x")), 0xFF, 0xFF, 0xFF)
 	got2, err := decodeContentEncoding(newRC(bad), "gzip", 1<<20)
 	if err != nil {
-		t.Fatalf("обёртка битого: %v", err)
+		t.Fatalf("the broken wrapper: %v", err)
 	}
 	_, _ = io.ReadAll(got2) // the stream error does not matter for the test
 	_ = got2.Close()
@@ -594,7 +594,7 @@ func TestDecodeContentEncodingClosesSource(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	if closed != 2 {
-		t.Errorf("закрытий исходного тела: %d, ожидалось 2", closed)
+		t.Errorf("source body closes: %d, expected 2", closed)
 	}
 }
 
@@ -667,7 +667,7 @@ func TestFetchAcceptEncoding(t *testing.T) {
 	res := fetchFrom(t, f, srv.URL)
 	defer func() { _ = res.Body.Close() }()
 	if got := ae.Get(); got != "gzip, br" {
-		t.Errorf("Accept-Encoding сервера: %q, ожидался %q", got, "gzip, br")
+		t.Errorf("the server Accept-Encoding: %q, expected %q", got, "gzip, br")
 	}
 }
 
@@ -689,16 +689,16 @@ func TestFetchGzipRoundtrip(t *testing.T) {
 
 	b, err := io.ReadAll(res.Body)
 	if err != nil {
-		t.Fatalf("чтение: %v", err)
+		t.Fatalf("read: %v", err)
 	}
 	if string(b) != plain {
-		t.Errorf("тело: %q", b)
+		t.Errorf("body: %q", b)
 	}
 	if v := res.Header.Get("Content-Encoding"); v != "" {
-		t.Errorf("Content-Encoding не снят: %q", v)
+		t.Errorf("Content-Encoding not stripped: %q", v)
 	}
 	if v := res.Header.Get("Content-Length"); v != "" {
-		t.Errorf("Content-Length не снят: %q", v)
+		t.Errorf("Content-Length not stripped: %q", v)
 	}
 }
 
@@ -716,10 +716,10 @@ func TestFetchBrotliRoundtrip(t *testing.T) {
 
 	b, err := io.ReadAll(res.Body)
 	if err != nil {
-		t.Fatalf("чтение: %v", err)
+		t.Fatalf("read: %v", err)
 	}
 	if string(b) != plain {
-		t.Errorf("тело: %q", b)
+		t.Errorf("body: %q", b)
 	}
 }
 
@@ -735,10 +735,10 @@ func TestFetchIdentityKeepsHeaders(t *testing.T) {
 	defer func() { _ = res.Body.Close() }()
 	b, _ := io.ReadAll(res.Body)
 	if string(b) != "plain" {
-		t.Errorf("тело: %q", b)
+		t.Errorf("body: %q", b)
 	}
 	if v := res.Header.Get("Content-Length"); v != "5" {
-		t.Errorf("Content-Length искажён: %q", v)
+		t.Errorf("Content-Length distorted: %q", v)
 	}
 }
 
@@ -762,13 +762,13 @@ func TestFetchMultiLineContentEncoding(t *testing.T) {
 
 	b, err := io.ReadAll(res.Body)
 	if err != nil {
-		t.Fatalf("чтение: %v", err)
+		t.Fatalf("read: %v", err)
 	}
 	if string(b) != plain {
-		t.Errorf("тело: %q", b)
+		t.Errorf("body: %q", b)
 	}
 	if v := res.Header.Get("Content-Encoding"); v != "" {
-		t.Errorf("Content-Encoding не снят: %q", v)
+		t.Errorf("Content-Encoding not stripped: %q", v)
 	}
 }
 
@@ -788,13 +788,13 @@ func TestFetchIdentityCompositeKeepsHeaders(t *testing.T) {
 	defer func() { _ = res.Body.Close() }()
 	b, _ := io.ReadAll(res.Body)
 	if !bytes.Equal(b, body) {
-		t.Errorf("тело: %q", b)
+		t.Errorf("body: %q", b)
 	}
 	if v := res.Header.Get("Content-Encoding"); v != "identity, identity" {
-		t.Errorf("Content-Encoding искажён: %q", v)
+		t.Errorf("Content-Encoding distorted: %q", v)
 	}
 	if v := res.Header.Get("Content-Length"); v != strconv.Itoa(len(body)) {
-		t.Errorf("Content-Length искажён: %q", v)
+		t.Errorf("Content-Length distorted: %q", v)
 	}
 }
 
@@ -807,10 +807,10 @@ func TestFetchGzipEmptyBody(t *testing.T) {
 	defer func() { _ = res.Body.Close() }()
 	b, err := io.ReadAll(res.Body)
 	if err != nil {
-		t.Fatalf("пустое gzip-тело: %v", err)
+		t.Fatalf("an empty gzip body: %v", err)
 	}
 	if len(b) != 0 {
-		t.Errorf("ожидалось пустое тело, получено %q", b)
+		t.Errorf("an empty body expected, got %q", b)
 	}
 }
 
@@ -824,7 +824,7 @@ func TestFetchUnsupportedEncoding(t *testing.T) {
 	u, _ := url.Parse(srv.URL)
 	_, err := f.Fetch(t.Context(), FetchRequest{URL: u, Addrs: loopbackAddr()})
 	if err == nil || !strings.Contains(err.Error(), "Content-Encoding") {
-		t.Fatalf("ожидалась ошибка Content-Encoding, получено %v", err)
+		t.Fatalf("a Content-Encoding error expected, got %v", err)
 	}
 }
 
@@ -839,7 +839,7 @@ func TestFetchDeflateRoundtrip(t *testing.T) {
 		want string
 	}{
 		{"zlib", zlibBytes(t, []byte("deflate-zlib-body")), "deflate-zlib-body"},
-		{"сырой-поток", flateRawBytes(t, []byte("deflate-raw-body")), "deflate-raw-body"},
+		{"raw-stream", flateRawBytes(t, []byte("deflate-raw-body")), "deflate-raw-body"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			srv, ae := encodingServer(t, tc.body, map[string]string{
@@ -850,16 +850,16 @@ func TestFetchDeflateRoundtrip(t *testing.T) {
 			defer func() { _ = res.Body.Close() }()
 			b, err := io.ReadAll(res.Body)
 			if err != nil {
-				t.Fatalf("чтение: %v", err)
+				t.Fatalf("read: %v", err)
 			}
 			if string(b) != tc.want {
-				t.Errorf("тело: %q, ожидалось %q", b, tc.want)
+				t.Errorf("body: %q, expected %q", b, tc.want)
 			}
 			if res.Header.Get("Content-Encoding") != "" {
-				t.Errorf("Content-Encoding не снят: %q", res.Header.Get("Content-Encoding"))
+				t.Errorf("Content-Encoding not stripped: %q", res.Header.Get("Content-Encoding"))
 			}
 			if ae.Get() != acceptEncoding {
-				t.Errorf("Accept-Encoding: %q, ожидался %q (deflate не рекламируем)", ae.Get(), acceptEncoding)
+				t.Errorf("Accept-Encoding: %q, expected %q (deflate is not advertised)", ae.Get(), acceptEncoding)
 			}
 		})
 	}
@@ -879,10 +879,10 @@ func TestFetchGzipBomb(t *testing.T) {
 	defer func() { _ = res.Body.Close() }()
 	b, err := io.ReadAll(res.Body)
 	if !errors.Is(err, ErrDecompressTooLarge) {
-		t.Fatalf("ожидался ErrDecompressTooLarge, получено %v (прочитано %d)", err, len(b))
+		t.Fatalf("ErrDecompressTooLarge expected, got %v (%d read)", err, len(b))
 	}
 	if len(b) != 64<<10 {
-		t.Errorf("до потолка должно читаться 64 КиБ, прочитано %d", len(b))
+		t.Errorf("64 KiB must be readable up to the cap, %d read", len(b))
 	}
 }
 
@@ -903,13 +903,13 @@ func runBodyLimitCase(t *testing.T, ce string, wrap func([]byte) []byte, size, l
 	defer func() { _ = res.Body.Close() }()
 	b, readErr := io.ReadAll(res.Body)
 	if readErr != nil {
-		t.Fatalf("обрезка — не ошибка чтения: %v", readErr)
+		t.Fatalf("truncation is not a read error: %v", readErr)
 	}
 	if len(b) != min(size, limit) {
-		t.Errorf("прочитано %d байт, ожидалось %d", len(b), min(size, limit))
+		t.Errorf("%d bytes read, %d expected", len(b), min(size, limit))
 	}
 	if res.BodyLimiter == nil || !res.BodyLimiter.Truncated() == wantTrunc {
-		t.Errorf("признак обрезки: %v, ожидался %v", res.BodyLimiter.Truncated(), wantTrunc)
+		t.Errorf("the truncation flag: %v, expected %v", res.BodyLimiter.Truncated(), wantTrunc)
 	}
 }
 
@@ -927,9 +927,9 @@ func TestFetchGzipJustOverLimit(t *testing.T) {
 		t.Helper()
 		runBodyLimitCase(t, "gzip", func(b []byte) []byte { return gzipBytes(t, b) }, size, limit, wantTrunc)
 	}
-	t.Run("ровно в лимит", func(t *testing.T) { run(t, 1000, 1000, false) })
-	t.Run("на байт больше", func(t *testing.T) { run(t, 1001, 1000, true) })
-	t.Run("заметно больше", func(t *testing.T) { run(t, 64<<10, 1000, true) })
+	t.Run("exactly at the limit", func(t *testing.T) { run(t, 1000, 1000, false) })
+	t.Run("one byte over", func(t *testing.T) { run(t, 1001, 1000, true) })
+	t.Run("noticeably over", func(t *testing.T) { run(t, 64<<10, 1000, true) })
 }
 
 // TestFetchLayeredJustOverLimit: compound packaging "slightly over the
@@ -944,9 +944,9 @@ func TestFetchLayeredJustOverLimit(t *testing.T) {
 			return brotliBytes(t, gzipBytes(t, b))
 		}, size, limit, wantTrunc)
 	}
-	t.Run("ровно в лимит", func(t *testing.T) { run(t, 1000, 1000, false) })
-	t.Run("на байт больше", func(t *testing.T) { run(t, 1001, 1000, true) })
-	t.Run("заметно больше", func(t *testing.T) { run(t, 64<<10, 1000, true) })
+	t.Run("exactly at the limit", func(t *testing.T) { run(t, 1000, 1000, false) })
+	t.Run("one byte over", func(t *testing.T) { run(t, 1001, 1000, true) })
+	t.Run("noticeably over", func(t *testing.T) { run(t, 64<<10, 1000, true) })
 }
 
 // TestFetchGzipBombUnderLimiter: a bomb with the T-049 limits enabled —
@@ -970,10 +970,10 @@ func TestFetchGzipBombUnderLimiter(t *testing.T) {
 	defer func() { _ = res.Body.Close() }()
 	b, readErr := io.ReadAll(res.Body)
 	if !errors.Is(readErr, ErrDecompressTooLarge) {
-		t.Fatalf("бомба = %v, want ErrDecompressTooLarge (T-051)", readErr)
+		t.Fatalf("the bomb = %v, want ErrDecompressTooLarge (T-051)", readErr)
 	}
 	if len(b) != limit {
-		t.Errorf("прочитано %d байт, ожидался лимит %d", len(b), limit)
+		t.Errorf("%d bytes read, the limit %d expected", len(b), limit)
 	}
 }
 
@@ -996,19 +996,19 @@ func TestFetchLayeredRoundtrip(t *testing.T) {
 
 	b, err := io.ReadAll(res.Body)
 	if err != nil {
-		t.Fatalf("чтение: %v", err)
+		t.Fatalf("read: %v", err)
 	}
 	if string(b) != plain {
-		t.Errorf("тело: %q", b)
+		t.Errorf("body: %q", b)
 	}
 	if v := res.Header.Get("Content-Encoding"); v != "" {
-		t.Errorf("Content-Encoding не снят: %q", v)
+		t.Errorf("Content-Encoding not stripped: %q", v)
 	}
 	if v := res.Header.Get("Content-Length"); v != "" {
-		t.Errorf("Content-Length не снят: %q", v)
+		t.Errorf("Content-Length not stripped: %q", v)
 	}
 	if ae.Get() != acceptEncoding {
-		t.Errorf("Accept-Encoding: %q, ожидался %q (составные не рекламируем)", ae.Get(), acceptEncoding)
+		t.Errorf("Accept-Encoding: %q, expected %q (compound values are not advertised)", ae.Get(), acceptEncoding)
 	}
 }
 
@@ -1030,10 +1030,10 @@ func TestFetchLayeredBombUnderLimiter(t *testing.T) {
 	defer func() { _ = res.Body.Close() }()
 	b, readErr := io.ReadAll(res.Body)
 	if !errors.Is(readErr, ErrDecompressTooLarge) {
-		t.Fatalf("бомба = %v, want ErrDecompressTooLarge (T-051)", readErr)
+		t.Fatalf("the bomb = %v, want ErrDecompressTooLarge (T-051)", readErr)
 	}
 	if len(b) != limit {
-		t.Errorf("прочитано %d байт, ожидался лимит %d", len(b), limit)
+		t.Errorf("%d bytes read, the limit %d expected", len(b), limit)
 	}
 }
 
@@ -1056,13 +1056,13 @@ func TestFetchDecompressCeilingFollowsLimiter(t *testing.T) {
 	defer func() { _ = res.Body.Close() }()
 	b, readErr := io.ReadAll(res.Body)
 	if readErr != nil {
-		t.Fatalf("тело меньше лимита — чтение без ошибки: %v", readErr)
+		t.Fatalf("the body is below the limit — a read without error: %v", readErr)
 	}
 	if len(b) != len(page) {
-		t.Errorf("прочитано %d байт, ожидалось %d (потолок не из Limits.MaxBodyBytes)", len(b), len(page))
+		t.Errorf("%d bytes read, %d expected (the cap is not from Limits.MaxBodyBytes)", len(b), len(page))
 	}
 	if res.BodyLimiter.Truncated() {
-		t.Error("тело меньше лимита помечено обрезкой")
+		t.Error("a body below the limit is marked truncated")
 	}
 }
 
@@ -1082,14 +1082,14 @@ func TestFetchGzipCharsetChain(t *testing.T) {
 
 	raw, err := io.ReadAll(res.Body)
 	if err != nil {
-		t.Fatalf("чтение: %v", err)
+		t.Fatalf("read: %v", err)
 	}
 	got := ToUTF8(res.Header, raw)
 	if got.Charset != "windows-1251" || got.Source != CharsetMeta {
-		t.Fatalf("кодировка: charset=%q source=%v", got.Charset, got.Source)
+		t.Fatalf("the charset: charset=%q source=%v", got.Charset, got.Source)
 	}
 	if !strings.Contains(string(got.UTF8), ruSample) {
-		t.Errorf("русский текст не восстановлен: %q", got.UTF8)
+		t.Errorf("the Russian text is not restored: %q", got.UTF8)
 	}
 }
 
@@ -1108,7 +1108,7 @@ func TestRoundTripDecompresses(t *testing.T) {
 	f := NewFetcher(Options{})
 	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL, nil)
 	if err != nil {
-		t.Fatalf("запрос: %v", err)
+		t.Fatalf("request: %v", err)
 	}
 	resp, err := f.RoundTrip(req)
 	if err != nil {
@@ -1117,7 +1117,7 @@ func TestRoundTripDecompresses(t *testing.T) {
 	b, err := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
 	if err != nil || string(b) != "roundtrip" {
-		t.Fatalf("тело: %q err=%v", b, err)
+		t.Fatalf("body: %q err=%v", b, err)
 	}
 	if ae.Get() != "gzip, br" {
 		t.Errorf("Accept-Encoding: %q", ae.Get())
@@ -1140,9 +1140,9 @@ func TestRoundTripDecompresses(t *testing.T) {
 	b2, _ := io.ReadAll(resp2.Body)
 	_ = resp2.Body.Close()
 	if ae2.Get() != "identity" {
-		t.Errorf("чужой Accept-Encoding затёрт: %q", ae2.Get())
+		t.Errorf("a foreign Accept-Encoding overwritten: %q", ae2.Get())
 	}
 	if string(b2) != "как есть" {
-		t.Errorf("тело 2: %q", b2)
+		t.Errorf("body 2: %q", b2)
 	}
 }

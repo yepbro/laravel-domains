@@ -149,14 +149,14 @@ func corpusRun(t *testing.T, tc corpusCase) []corpusRecord {
 		}
 		records, err := DecideVariants(first, second)
 		if err != nil {
-			t.Fatalf("corpus %q: DecideVariants(субдомен %q): %v", tc.name, sub.label, err)
+			t.Fatalf("corpus %q: DecideVariants(subdomain %q): %v", tc.name, sub.label, err)
 		}
 		for _, r := range records {
 			if !r.Variant.Valid() {
-				t.Fatalf("corpus %q: вариант %d не проходит model.Variant.Valid()", tc.name, r.Variant)
+				t.Fatalf("corpus %q: variant %d fails model.Variant.Valid()", tc.name, r.Variant)
 			}
 			if !r.Scheme.Valid() {
-				t.Fatalf("corpus %q: схема %d не проходит model.Scheme.Valid()", tc.name, r.Scheme)
+				t.Fatalf("corpus %q: scheme %d fails model.Scheme.Valid()", tc.name, r.Scheme)
 			}
 			data := httpsIn
 			if r.Scheme == model.SchemeHTTP {
@@ -183,28 +183,28 @@ func corpusRun(t *testing.T, tc corpusCase) []corpusRecord {
 	}
 	results := DetectAliases(tc.domain, in)
 	if len(results) != len(in) {
-		t.Fatalf("corpus %q: DetectAliases вернул %d решений, хочу %d", tc.name, len(results), len(in))
+		t.Fatalf("corpus %q: DetectAliases returned %d results, want %d", tc.name, len(results), len(in))
 	}
 
 	out := make([]corpusRecord, len(results))
 	for i, res := range results {
 		if !res.AliasKind.Valid() {
-			t.Errorf("corpus %q: запись %d: алиас %d не проходит model.AliasKind.Valid()",
+			t.Errorf("corpus %q: record %d: alias %d fails model.AliasKind.Valid()",
 				tc.name, i, res.AliasKind)
 		}
 		if (res.AliasSubdomainID == nil) != (res.AliasKind == model.AliasNone) {
-			t.Errorf("corpus %q: запись %d: alias_subdomain_id = %v при alias_kind %v — пара должна быть согласована",
+			t.Errorf("corpus %q: record %d: alias_subdomain_id = %v with alias_kind %v — the pair must be consistent",
 				tc.name, i, res.AliasSubdomainID, res.AliasKind)
 		}
 		if res.AliasSubdomainID != nil && *res.AliasSubdomainID == in[i].SubdomainID {
-			t.Errorf("corpus %q: запись %d: alias_subdomain_id указывает на свой субдомен %d (ТЗ 5.5 п. 6 — «другого субдомена»)",
+			t.Errorf("corpus %q: record %d: alias_subdomain_id points to its own subdomain %d (spec 5.5 item 6 — another subdomain)",
 				tc.name, i, in[i].SubdomainID)
 		}
 		if res.StoreContent && in[i].ContentHash == nil {
-			t.Errorf("corpus %q: запись %d: StoreContent при nil-хэше — сохранять нечего", tc.name, i)
+			t.Errorf("corpus %q: record %d: StoreContent with a nil hash — nothing to store", tc.name, i)
 		}
 		if res.SubdomainID != in[i].SubdomainID || res.Variant != in[i].Variant {
-			t.Errorf("corpus %q: запись %d: идентичность (%d, %v) не параллельна входу (%d, %v)",
+			t.Errorf("corpus %q: record %d: the identity (%d, %v) is not parallel to the input (%d, %v)",
 				tc.name, i, res.SubdomainID, res.Variant, in[i].SubdomainID, in[i].Variant)
 		}
 		rec := corpusRecord{
@@ -229,7 +229,7 @@ func corpusRecordString(r corpusRecord) string {
 	if r.aliasSub >= 0 {
 		orig = fmt.Sprintf("%d", r.aliasSub)
 	}
-	return fmt.Sprintf("{субдомен %d, variant %v, scheme %v, alias_kind %v, alias_subdomain_id %s, контент %v}",
+	return fmt.Sprintf("{subdomain %d, variant %v, scheme %v, alias_kind %v, alias_subdomain_id %s, content %v}",
 		r.subdomain, r.variant, r.scheme, r.aliasKind, orig, r.store)
 }
 
@@ -244,7 +244,7 @@ func TestVariantsCorpus(t *testing.T) {
 		// www's own address ⇒ a redirect alias (kind 2) to www; the
 		// content is stored once at the www original.
 		{
-			name:   "bare → www: итоговый URL апекса — адрес www; апекс — редирект-алиас на www",
+			name:   "bare → www: the apex final URL is the www address; the apex is a redirect alias to www",
 			domain: "example.com",
 			subs: []corpusSubdomain{
 				{
@@ -269,7 +269,7 @@ func TestVariantsCorpus(t *testing.T) {
 		// apex's own address ⇒ the class original is the apex (id 0, the
 		// minimal subdomain_id), www is a redirect alias to it.
 		{
-			name:   "www → bare: зеркально — оригинал апекс, www — редирект-алиас",
+			name:   "www → bare: mirrored — the apex is the original, www is a redirect alias",
 			domain: "example.com",
 			subs: []corpusSubdomain{
 				{
@@ -297,7 +297,7 @@ func TestVariantsCorpus(t *testing.T) {
 		// split the site: the query is outside the criterion (spec 5.5
 		// item 5 "host and path").
 		{
-			name:   "http → https: обе проверки сходятся на одну страницу — одна запись variant 0 scheme https",
+			name:   "http → https: both checks converge on one page — one variant 0 scheme https record",
 			domain: "example.com",
 			subs: []corpusSubdomain{
 				{
@@ -318,7 +318,7 @@ func TestVariantsCorpus(t *testing.T) {
 		// are independent and store their own content. An explicit :80 in
 		// the final URL does not interfere — the port is stripped.
 		{
-			name:   "http ведёт на другой сайт: чужой итоговый хост — две записи variant 0 (https) и variant 1 (http)",
+			name:   "http leads to another site: a foreign final host — two records, variant 0 (https) and variant 1 (http)",
 			domain: "example.com",
 			subs: []corpusSubdomain{
 				{
@@ -340,7 +340,7 @@ func TestVariantsCorpus(t *testing.T) {
 		// identical to it (kind 1 — its own address, foreign content);
 		// the class content is stored once.
 		{
-			name:   "парковка: равный хэш при разных URL — www идентичен апексу, контент один",
+			name:   "a parking: an equal hash at different URLs — www is identical to the apex, one content",
 			domain: "example.com",
 			subs: []corpusSubdomain{
 				{
@@ -366,7 +366,7 @@ func TestVariantsCorpus(t *testing.T) {
 		// a single original (api), both others are redirect aliases to it;
 		// the transitivity of a=b=c gives one class.
 		{
-			name:   "цепочка из трёх: admin и app редиректят на api — оригинал один (api)",
+			name:   "a chain of three: admin and app redirect to api — one original (api)",
 			domain: "example.com",
 			subs: []corpusSubdomain{
 				{
@@ -400,7 +400,7 @@ func TestVariantsCorpus(t *testing.T) {
 		// admin (id 2), the rest are identical (kind 1, their own address
 		// at an equal hash).
 		{
-			name:   "цепочка из трёх по хэшу: все дома, контент один — оригинал минимальный subdomain_id",
+			name:   "a chain of three by hash: all at home, one content — the minimal subdomain_id is the original",
 			domain: "example.com",
 			subs: []corpusSubdomain{
 				{
@@ -433,7 +433,7 @@ func TestVariantsCorpus(t *testing.T) {
 		// URL; there is no class content to store (store false even for
 		// the original).
 		{
-			name:   "nil-хэши: контент не сохранён — bare → www работает по итоговому URL, контент не хранится",
+			name:   "nil hashes: content not stored — bare → www works by the final URL, no content is stored",
 			domain: "example.com",
 			subs: []corpusSubdomain{
 				{
@@ -461,7 +461,7 @@ func TestVariantsCorpus(t *testing.T) {
 		// and www converge (www → bare) — a redirect alias to the apex's
 		// variant 0, while variant 1 has its own content and no aliases.
 		{
-			name:   "один хэш nil: хэш-ветка недоказуема — у апекса два варианта; www → bare — редирект на variant 0",
+			name:   "one hash nil: the hash branch is unprovable — the apex has two variants; www → bare — a redirect to variant 0",
 			domain: "example.com",
 			subs: []corpusSubdomain{
 				{
@@ -489,7 +489,7 @@ func TestVariantsCorpus(t *testing.T) {
 		// no_http status is decided by the T-058 aggregator per §7),
 		// while www is alive and yields its record without any aliases.
 		{
-			name:   "субдомены независимы: апекс не отвечает вовсе — записей нет; www жив своей записью",
+			name:   "subdomains are independent: the apex does not answer at all — no records; www lives with its own record",
 			domain: "example.com",
 			subs: []corpusSubdomain{
 				{
@@ -514,7 +514,7 @@ func TestVariantsCorpus(t *testing.T) {
 		// two records; variant 1 (the parking) does not enter the alias
 		// class and stores its own content.
 		{
-			name:   "смешанный: https апекса сходится на www (алиас), http апекса уезжает в парковку (variant 1)",
+			name:   "mixed: the apex https converges on www (an alias), the apex http moves to a parking (variant 1)",
 			domain: "example.com",
 			subs: []corpusSubdomain{
 				{
@@ -543,7 +543,7 @@ func TestVariantsCorpus(t *testing.T) {
 		// the record's scheme is the data source. The sites are different —
 		// no aliases.
 		{
-			name:   "работает один протокол: апекс только https, www только http — по одной записи со своей scheme",
+			name:   "one protocol works: the apex https-only, www http-only — one record each with its own scheme",
 			domain: "example.com",
 			subs: []corpusSubdomain{
 				{
@@ -570,7 +570,7 @@ func TestVariantsCorpus(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			got := corpusRun(t, tc)
 			if len(got) != len(tc.want) {
-				t.Errorf("записей %d, хочу %d:\n  получено: %s\n  ожидалось: %s",
+				t.Errorf("records %d, want %d:\n  got: %s\n  expected: %s",
 					len(got), len(tc.want), corpusRecordsString(got), corpusRecordsString(tc.want))
 			}
 			n := len(got)
@@ -579,7 +579,7 @@ func TestVariantsCorpus(t *testing.T) {
 			}
 			for i := 0; i < n; i++ {
 				if got[i] != tc.want[i] {
-					t.Errorf("запись[%d] = %s, хочу %s", i, corpusRecordString(got[i]), corpusRecordString(tc.want[i]))
+					t.Errorf("record[%d] = %s, want %s", i, corpusRecordString(got[i]), corpusRecordString(tc.want[i]))
 				}
 			}
 		})

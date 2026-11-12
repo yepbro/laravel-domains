@@ -455,17 +455,17 @@ func (f *Fetcher) decodeResponseBody(resp *http.Response) error {
 // Content-Encoding — see RoundTrip).
 func (f *Fetcher) Fetch(ctx context.Context, r FetchRequest) (*FetchResult, error) {
 	if r.URL == nil {
-		return nil, errors.New("httpfetch: запрос без URL")
+		return nil, errors.New("httpfetch: a request without a URL")
 	}
 	if r.URL.Scheme != "http" && r.URL.Scheme != "https" {
-		return nil, fmt.Errorf("httpfetch: неподдерживаемая схема %q (ожидается http/https)", r.URL.Scheme)
+		return nil, fmt.Errorf("httpfetch: unsupported scheme %q (http/https expected)", r.URL.Scheme)
 	}
 	host := strings.ToLower(r.URL.Hostname())
 	if host == "" {
-		return nil, fmt.Errorf("httpfetch: URL %s без хоста", r.URL)
+		return nil, fmt.Errorf("httpfetch: the URL %s without a host", r.URL)
 	}
 	if len(r.Addrs) == 0 {
-		return nil, fmt.Errorf("httpfetch: %s: нет адресов DNS-этапа (ТЗ 5.5 п. 2)", r.URL)
+		return nil, fmt.Errorf("httpfetch: %s: no DNS-stage addresses (spec 5.5 item 2)", r.URL)
 	}
 
 	tctx, cancel := context.WithTimeout(ctx, f.opt.TotalTimeout)
@@ -576,11 +576,11 @@ func addrsFromContext(ctx context.Context) *addrsValue {
 // addresses.
 func (f *Fetcher) dialContext(ctx context.Context, network, addr string) (net.Conn, error) {
 	if network != "tcp" && network != "tcp4" && network != "tcp6" {
-		return nil, fmt.Errorf("httpfetch: неподдерживаемая сеть %q", network)
+		return nil, fmt.Errorf("httpfetch: an unsupported network %q", network)
 	}
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
-		return nil, fmt.Errorf("httpfetch: адрес подключения %q: %w", addr, err)
+		return nil, fmt.Errorf("httpfetch: the connect address %q: %w", addr, err)
 	}
 	host = strings.ToLower(host)
 
@@ -591,7 +591,7 @@ func (f *Fetcher) dialContext(ctx context.Context, network, addr string) (net.Co
 	// network with no DNS stage control is no better than an internal
 	// host from Location.
 	if info := addrsFromContext(ctx); info != nil && info.host == host {
-		addrs, err := f.filterInternalAddrs(fmt.Sprintf("хост %q", info.host), info.addrs)
+		addrs, err := f.filterInternalAddrs(fmt.Sprintf("the host %q", info.host), info.addrs)
 		if err != nil {
 			return nil, err
 		}
@@ -622,13 +622,13 @@ func (f *Fetcher) lookup(ctx context.Context, host string) ([]netip.Addr, error)
 		var err error
 		addrs, err = f.res.LookupNetIP(ctx, host)
 		if err != nil {
-			return nil, fmt.Errorf("httpfetch: резолв %q: %w", host, err)
+			return nil, fmt.Errorf("httpfetch: resolve %q: %w", host, err)
 		}
 		if len(addrs) == 0 {
-			return nil, fmt.Errorf("httpfetch: резолв %q: пустой ответ", host)
+			return nil, fmt.Errorf("httpfetch: resolve %q: an empty answer", host)
 		}
 	}
-	return f.filterInternalAddrs(fmt.Sprintf("резолв %q", host), addrs)
+	return f.filterInternalAddrs(fmt.Sprintf("resolve %q", host), addrs)
 }
 
 // filterInternalAddrs is the single funnel of the SSRF circuit (T-219):
@@ -652,7 +652,7 @@ func (f *Fetcher) filterInternalAddrs(subject string, addrs []netip.Addr) ([]net
 		}
 	}
 	if len(external) == 0 {
-		return nil, fmt.Errorf("httpfetch: %s: только внутренние адреса %v — заблокировано (SSRF, http.block_internal_addrs)", subject, addrs)
+		return nil, fmt.Errorf("httpfetch: %s: internal-only addresses %v — blocked (SSRF, http.block_internal_addrs)", subject, addrs)
 	}
 	return external, nil
 }
@@ -715,7 +715,7 @@ func (f *Fetcher) dialTimed(ctx context.Context, addr netip.Addr, port string) (
 func (f *Fetcher) dialAddrs(ctx context.Context, addrs []netip.Addr, port string) (net.Conn, error) {
 	switch len(addrs) {
 	case 0:
-		return nil, errors.New("httpfetch: нет адресов для подключения")
+		return nil, errors.New("httpfetch: no addresses to connect to")
 	case 1:
 		return f.dialLimited(ctx, addrs[0], port)
 	}
@@ -768,7 +768,7 @@ func (f *Fetcher) dialAddrs(ctx context.Context, addrs []netip.Addr, port string
 				return conn, nil
 			}
 			if fails == len(addrs) {
-				return nil, fmt.Errorf("httpfetch: недоступны все %d адресов: %w", len(addrs), err)
+				return nil, fmt.Errorf("httpfetch: all %d addresses failed: %w", len(addrs), err)
 			}
 			if fails == started && started < len(addrs) {
 				// all launched attempts failed — the next address without

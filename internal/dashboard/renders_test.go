@@ -36,10 +36,10 @@ weird_metric{a="x,y",b="q\"r"} 1.5
 `
 	samples, err := parsePromExposition(strings.NewReader(expo))
 	if err != nil {
-		t.Fatalf("разбор: %v", err)
+		t.Fatalf("parse: %v", err)
 	}
 	if len(samples) != 4 {
-		t.Fatalf("сэмплов = %d, want 4 (HELP/TYPE пропущены):\n%+v", len(samples), samples)
+		t.Fatalf("samples = %d, want 4 (HELP/TYPE skipped):\n%+v", len(samples), samples)
 	}
 	byName := map[string]promSample{}
 	for _, s := range samples {
@@ -47,31 +47,31 @@ weird_metric{a="x,y",b="q\"r"} 1.5
 	}
 	rec := byName["crawler_render_records_total|true"]
 	if rec.Value != 1000 || rec.Labels["engine"] != "moli" {
-		t.Errorf("запись с метками = %+v, want engine=moli 1000", rec)
+		t.Errorf("the record with labels = %+v, want engine=moli 1000", rec)
 	}
 	if s := byName["crawler_render_records_total|false"]; s.Value != 42 || s.Labels["engine"] != "" {
-		t.Errorf("запись rendered=false = %+v, want 42 без engine", s)
+		t.Errorf("the rendered=false record = %+v, want 42 without an engine", s)
 	}
 	if s := byName["crawler_render_tarpit_finalized_total|"]; s.Value != 7 {
-		t.Errorf("сэмпл без меток = %+v, want 7", s)
+		t.Errorf("the sample without labels = %+v, want 7", s)
 	}
 	// A comma inside quotes is part of the value, an escaped quote is
 	// unescaped.
 	w := byName["weird_metric|"]
 	if w.Labels["a"] != "x,y" || w.Labels["b"] != `q"r` || w.Value != 1.5 {
-		t.Errorf("метки с запятой/кавычкой = %+v", w.Labels)
+		t.Errorf("labels with a comma/quote = %+v", w.Labels)
 	}
 
 	for _, tc := range []struct{ name, expo, wantErr string }{
-		{"метки без закрывающей", `m{x="1" 5`, "закрывающей"},
-		{"нет значения", `m{x="1"}`, "нет значения"},
-		{"значение не число", `m{x="1"} abc`, "значение"},
-		{"метка без кавычек", `m{x=1} 5`, "кавычках"},
+		{"labels without a closing", `m{x="1" 5`, "closing"},
+		{"no value", `m{x="1"}`, "no value"},
+		{"the value is not a number", `m{x="1"} abc`, "value"},
+		{"a label without quotes", `m{x=1} 5`, "quoted"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if _, err := parsePromExposition(strings.NewReader(tc.expo)); err == nil ||
 				!strings.Contains(err.Error(), tc.wantErr) {
-				t.Fatalf("ошибка = %v, want содержит %q", err, tc.wantErr)
+				t.Fatalf("the error = %v, want it to contain %q", err, tc.wantErr)
 			}
 		})
 	}
@@ -215,19 +215,19 @@ func TestCollectRenderPanel(t *testing.T) {
 	// success = 1000/1100.
 	snap := coll.CollectOnce(ctx)
 	if snap.Render == nil {
-		t.Fatal("render = nil, want секция собрана")
+		t.Fatal("render = nil, want the section collected")
 	}
 	if len(snap.Errors) != 0 {
-		t.Fatalf("errors = %v, want пусто", snap.Errors)
+		t.Fatalf("errors = %v, want empty", snap.Errors)
 	}
 	if len(snap.Render.Engines) != 2 ||
 		snap.Render.Engines[0].Engine != "chromium" ||
 		snap.Render.Engines[1].Engine != "moli" {
-		t.Fatalf("engines = %+v, want chromium,moli по алфавиту", snap.Render.Engines)
+		t.Fatalf("engines = %+v, want chromium,moli alphabetically", snap.Render.Engines)
 	}
 	moli := snap.Render.Engines[1]
 	if moli.RenderedTotal != 1000 || moli.FinalizedTotal != 100 {
-		t.Errorf("moli кумулятивы = %+v, want rendered 1000 finalized 100", moli)
+		t.Errorf("the moli cumulatives = %+v, want rendered 1000 finalized 100", moli)
 	}
 	if moli.SuccessPct == nil || math.Abs(*moli.SuccessPct-1000.0/1100*100) > 1e-9 {
 		t.Errorf("moli success = %v, want 1000/1100", moli.SuccessPct)
@@ -237,31 +237,31 @@ func TestCollectRenderPanel(t *testing.T) {
 	// denominator.
 	if moli.TarpitTotal != 25 || moli.TarpitPct == nil ||
 		math.Abs(*moli.TarpitPct-25.0/1125*100) > 1e-9 {
-		t.Errorf("moli тарпиты = %+v (%v), want 25 и 25/1125", moli.TarpitTotal, moli.TarpitPct)
+		t.Errorf("the moli tarpits = %+v (%v), want 25 and 25/1125", moli.TarpitTotal, moli.TarpitPct)
 	}
 	if moli.RSSBytes != 512<<20 {
 		t.Errorf("moli RSS = %d, want %d (process_resident_memory_bytes)", moli.RSSBytes, 512<<20)
 	}
 	chromium := snap.Render.Engines[0]
 	if chromium.RenderedTotal != 50 || chromium.FinalizedTotal != 0 || chromium.SuccessPct == nil || *chromium.SuccessPct != 100 {
-		t.Errorf("chromium = %+v, want 50/0 и 100%%", chromium)
+		t.Errorf("chromium = %+v, want 50/0 and 100%%", chromium)
 	}
 	// The lazy tarpit family (no series) — 0 and a rate of 0 given
 	// existing finalizations, not "—" and not a missing engine.
 	if chromium.TarpitTotal != 0 || chromium.TarpitPct == nil || *chromium.TarpitPct != 0 {
-		t.Errorf("chromium тарпиты = %d (%v), want 0 и 0%%", chromium.TarpitTotal, chromium.TarpitPct)
+		t.Errorf("the chromium tarpits = %d (%v), want 0 and 0%%", chromium.TarpitTotal, chromium.TarpitPct)
 	}
 	if chromium.RSSBytes != 256<<20 {
 		t.Errorf("chromium RSS = %d, want %d", chromium.RSSBytes, 256<<20)
 	}
 	for _, e := range snap.Render.Engines {
 		if e.RenderedPerSec != 0 {
-			t.Errorf("%s: темп первого прохода = %v, want 0 (база)", e.Engine, e.RenderedPerSec)
+			t.Errorf("%s: the first-pass rate = %v, want 0 (the baseline)", e.Engine, e.RenderedPerSec)
 		}
 	}
 	fb := snap.Render.Fallback
 	if fb.PublishedTotal != 10 || fb.PublishedPerSec != 0 {
-		t.Errorf("published = %+v, want 10 и темп 0 (база)", fb)
+		t.Errorf("published = %+v, want 10 and a rate of 0 (the baseline)", fb)
 	}
 	// S-P3-2: the fallback rate — the share of published of stage
 	// pages (10/(2000+300), the denominator — both exposures).
@@ -269,11 +269,11 @@ func TestCollectRenderPanel(t *testing.T) {
 		t.Errorf("rate_pct = %v, want 10/2300", fb.RatePct)
 	}
 	if fb.ConsumedTotal != 8 || fb.ConsumedPerSec != 0 {
-		t.Errorf("consumed = %+v, want 8 и темп 0 (база)", fb)
+		t.Errorf("consumed = %+v, want 8 and a rate of 0 (the baseline)", fb)
 	}
 	if fb.ConsumedByResult["rendered"] != 5 ||
 		fb.ConsumedByResult["finalized"] != 1 || fb.ConsumedByResult["skipped"] != 2 {
-		t.Errorf("consumed по исходам = %v, want 5/1/2", fb.ConsumedByResult)
+		t.Errorf("consumed by outcome = %v, want 5/1/2", fb.ConsumedByResult)
 	}
 	if fb.Depth == nil || *fb.Depth != 3 {
 		t.Errorf("depth = %v, want 3", fb.Depth)
@@ -293,26 +293,26 @@ func TestCollectRenderPanel(t *testing.T) {
 	setClock(time.Date(2026, 11, 6, 12, 0, 10, 0, time.UTC))
 	snap = coll.CollectOnce(ctx)
 	if snap.Render == nil {
-		t.Fatal("второй проход: render = nil")
+		t.Fatal("the second pass: render = nil")
 	}
 	moli = snap.Render.Engines[1]
 	if moli.RenderedPerSec != 10 {
-		t.Errorf("moli темп = %v, want 10 (100 рендеров за 10 с)", moli.RenderedPerSec)
+		t.Errorf("the moli rate = %v, want 10 (100 renders in 10 s)", moli.RenderedPerSec)
 	}
 	if snap.Render.Engines[0].RenderedPerSec != 0 {
-		t.Errorf("chromium темп = %v, want 0", snap.Render.Engines[0].RenderedPerSec)
+		t.Errorf("the chromium rate = %v, want 0", snap.Render.Engines[0].RenderedPerSec)
 	}
 	if snap.Render.Fallback.PublishedPerSec != 0.2 {
-		t.Errorf("published темп = %v, want 0.2 (2 за 10 с)", snap.Render.Fallback.PublishedPerSec)
+		t.Errorf("the published rate = %v, want 0.2 (2 in 10 s)", snap.Render.Fallback.PublishedPerSec)
 	}
 	if snap.Render.Fallback.ConsumedPerSec != 0.2 {
-		t.Errorf("consumed темп = %v, want 0.2 (2 доработки за 10 с)", snap.Render.Fallback.ConsumedPerSec)
+		t.Errorf("the consumed rate = %v, want 0.2 (2 reworks in 10 s)", snap.Render.Fallback.ConsumedPerSec)
 	}
 	if snap.Render.Fallback.ConsumedTotal != 10 {
 		t.Errorf("consumed = %d, want 10 (7+1+2)", snap.Render.Fallback.ConsumedTotal)
 	}
 	if pct := snap.Render.Fallback.RatePct; pct == nil || math.Abs(*pct-12.0/2400*100) > 1e-9 {
-		t.Errorf("rate_pct второго прохода = %v, want 12/2400", pct)
+		t.Errorf("the second-pass rate_pct = %v, want 12/2400", pct)
 	}
 
 	// Worker A restart (the cumulative dropped) — a zero delta, not a
@@ -323,16 +323,16 @@ func TestCollectRenderPanel(t *testing.T) {
 	setClock(time.Date(2026, 11, 6, 12, 0, 20, 0, time.UTC))
 	snap = coll.CollectOnce(ctx)
 	if got := snap.Render.Engines[1].RenderedPerSec; got != 0 {
-		t.Errorf("темп после рестарта = %v, want 0 (сброс базы)", got)
+		t.Errorf("the rate after the restart = %v, want 0 (the baseline reset)", got)
 	}
 	if pct := snap.Render.Engines[1].SuccessPct; pct == nil || *pct != 100 {
-		t.Errorf("успешность после рестарта = %v, want 100 (5/5)", pct)
+		t.Errorf("the success after the restart = %v, want 100 (5/5)", pct)
 	}
 	if pct := snap.Render.Fallback.RatePct; pct == nil || *pct != 0 {
-		t.Errorf("fallback-рейт после рестарта = %v, want 0 (публикаций нет, этап жив)", pct)
+		t.Errorf("the fallback rate after the restart = %v, want 0 (no publications, the stage is alive)", pct)
 	}
 	if got := snap.Render.Fallback.ConsumedPerSec; got != 0 {
-		t.Errorf("consumed темп без движения = %v, want 0", got)
+		t.Errorf("the consumed rate without movement = %v, want 0", got)
 	}
 }
 
@@ -345,10 +345,10 @@ func TestCollectRenderDegradation(t *testing.T) {
 	coll, _ := newRenderCollector(t, &renderLens{}, nil)
 	snap := coll.CollectOnce(context.Background())
 	if snap.Render != nil {
-		t.Error("render без адресов не nil, want «н/д»")
+		t.Error("render without addresses is not nil, want n/a")
 	}
 	if _, ok := snap.Errors["render"]; ok {
-		t.Errorf("адреса не заданы — ошибка секции: %v", snap.Errors)
+		t.Errorf("no addresses set — a section error: %v", snap.Errors)
 	}
 
 	// The exposure unavailable (a closed server) — the section
@@ -359,13 +359,13 @@ func TestCollectRenderDegradation(t *testing.T) {
 	coll, _ = newRenderCollector(t, &renderLens{}, []string{deadURL})
 	snap = coll.CollectOnce(context.Background())
 	if snap.Render != nil {
-		t.Error("render при недоступной экспозиции не nil")
+		t.Error("render with an unreachable exposure is not nil")
 	}
 	if snap.Errors["render"] == "" {
-		t.Errorf("errors без причины render: %v", snap.Errors)
+		t.Errorf("errors without the render reason: %v", snap.Errors)
 	}
 	if len(snap.Errors) != 1 || snap.Zones == nil || snap.Queues == nil {
-		t.Errorf("деградация задела чужие секции: %v", snap.Errors)
+		t.Errorf("the degradation touched foreign sections: %v", snap.Errors)
 	}
 
 	// A broken exposure (labels not closed) — a parse error with a
@@ -377,7 +377,7 @@ func TestCollectRenderDegradation(t *testing.T) {
 	coll, _ = newRenderCollector(t, &renderLens{}, []string{broken.URL})
 	snap = coll.CollectOnce(context.Background())
 	if snap.Render != nil || snap.Errors["render"] == "" {
-		t.Errorf("битая экспозиция: render=%v errors=%v, want деградация", snap.Render, snap.Errors)
+		t.Errorf("a broken exposure: render=%v errors=%v, want a degradation", snap.Render, snap.Errors)
 	}
 
 	// The depth unavailable (Redis down) — Depth nil, the section
@@ -390,15 +390,15 @@ func TestCollectRenderDegradation(t *testing.T) {
 	coll, _ = newRenderCollector(t, &renderLens{err: errors.New("redis: timeout")}, []string{alive.URL})
 	snap = coll.CollectOnce(context.Background())
 	if snap.Render == nil || snap.Render.Fallback.Depth != nil {
-		t.Errorf("render=%v depth=%v, want секция жива с Depth nil", snap.Render, snap.Render.Fallback.Depth)
+		t.Errorf("render=%v depth=%v, want the section alive with a nil Depth", snap.Render, snap.Render.Fallback.Depth)
 	}
 	// An exposure without stage_tasks (no stage pages) — the fallback
 	// rate is "—" (nil), not a panic and not 0.
 	if snap.Render.Fallback.RatePct != nil {
-		t.Errorf("rate_pct без страниц этапа = %v, want nil", *snap.Render.Fallback.RatePct)
+		t.Errorf("rate_pct without stage pages = %v, want nil", *snap.Render.Fallback.RatePct)
 	}
 	if len(snap.Errors) != 1 || snap.Errors["queues"] == "" {
-		t.Errorf("отказ Redis не отражён секцией очередей: %v", snap.Errors)
+		t.Errorf("the Redis failure is not reflected in the queues section: %v", snap.Errors)
 	}
 }
 
@@ -410,6 +410,6 @@ func TestCollectRenderNotConfiguredByDefault(t *testing.T) {
 	coll := newSnapCollector(t, healthyPool(), &fakeLenner{}, nil)
 	snap := coll.CollectOnce(context.Background())
 	if snap.Render != nil {
-		t.Fatal("render при дефолтном конфиге не nil")
+		t.Fatal("render with the default config is not nil")
 	}
 }

@@ -104,16 +104,16 @@ type Server struct {
 // project.
 func ParseCredentials(cfg *config.Config) (auth.PasswordHash, error) {
 	if cfg.Dashboard.Username == "" {
-		return auth.PasswordHash{}, errors.New("dashboard: username пуст — креды оператора обязательны (ТЗД §7.7)")
+		return auth.PasswordHash{}, errors.New("dashboard: the username is empty — operator credentials are mandatory (dashboard spec §7.7)")
 	}
 	// The Basic scheme splits credentials at the first ":" (r.BasicAuth):
 	// a name with a colon can never match — we refuse immediately, with
 	// a clear error, instead of a "silent" login failure.
 	if strings.Contains(cfg.Dashboard.Username, ":") {
-		return auth.PasswordHash{}, errors.New("dashboard: username не может содержать «:» (синтаксис Basic user:pass)")
+		return auth.PasswordHash{}, errors.New("dashboard: the username must not contain \":\" (the Basic user:pass syntax)")
 	}
 	if cfg.Dashboard.PasswordHash == "" {
-		return auth.PasswordHash{}, errors.New("dashboard: password_hash пуст — креды оператора обязательны (ТЗД §7.7)")
+		return auth.PasswordHash{}, errors.New("dashboard: password_hash is empty — operator credentials are mandatory (dashboard spec §7.7)")
 	}
 	hash, err := auth.Parse(cfg.Dashboard.PasswordHash)
 	if err != nil {
@@ -127,10 +127,10 @@ func ParseCredentials(cfg *config.Config) (auth.PasswordHash, error) {
 // the §7.7 startup check (see ParseCredentials).
 func New(db Pinger, cfg *config.Config, opts Options) (*Server, error) {
 	if db == nil {
-		return nil, errors.New("dashboard: пул БД не задан (postgres.dsn обязателен)")
+		return nil, errors.New("dashboard: the DB pool is not set (postgres.dsn is mandatory)")
 	}
 	if cfg == nil {
-		return nil, errors.New("dashboard: конфигурация не задана")
+		return nil, errors.New("dashboard: the configuration is not set")
 	}
 	hash, err := ParseCredentials(cfg)
 	if err != nil {
@@ -195,7 +195,7 @@ func (s *Server) secureHeaders(next http.Handler) http.Handler {
 func (s *Server) Run(ctx context.Context, listen string) error {
 	ln, err := net.Listen("tcp", listen)
 	if err != nil {
-		return fmt.Errorf("dashboard: слушатель %s: %w", listen, err)
+		return fmt.Errorf("dashboard: listener %s: %w", listen, err)
 	}
 	srv := &http.Server{
 		Handler: s.Handler(),
@@ -240,12 +240,12 @@ func (s *Server) Run(ctx context.Context, listen string) error {
 		// into done after Run returned is unobservable.
 		// mutator-disable-next-line expression/remove, branch/if
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			done <- fmt.Errorf("dashboard: сервер %s: %w", listen, err)
+			done <- fmt.Errorf("dashboard: server %s: %w", listen, err)
 			return
 		}
 		done <- nil
 	}()
-	s.opt.Log.Info("публичный сервис дашборда запущен", "listen", listen)
+	s.opt.Log.Info("the public dashboard service started", "listen", listen)
 
 	select {
 	case err := <-done:
@@ -267,7 +267,7 @@ func (s *Server) Run(ctx context.Context, listen string) error {
 		// above, T-M11).
 		// mutator-disable-next-line branch/if
 		if err := srv.Shutdown(shutdownCtx); err != nil {
-			return fmt.Errorf("dashboard: остановка: %w", err)
+			return fmt.Errorf("dashboard: shutdown: %w", err)
 		}
 		return nil
 	}

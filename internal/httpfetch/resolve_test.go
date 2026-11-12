@@ -41,57 +41,57 @@ func TestCachingResolverHitMissTTL(t *testing.T) {
 	// A miss: the first call goes to the resolver.
 	addrs, err := c.LookupNetIP(ctx, "redirect.example.net")
 	if err != nil || len(addrs) != 2 {
-		t.Fatalf("первый резолв: %v %v", addrs, err)
+		t.Fatalf("the first resolve: %v %v", addrs, err)
 	}
 	if got := inner.calls.Load(); got != 1 {
-		t.Fatalf("обращений к резолверу: %d, ожидалось 1", got)
+		t.Fatalf("resolver calls: %d, 1 expected", got)
 	}
 
 	// A hit: within the TTL the resolver is not touched.
 	clock.advance(59 * time.Second)
 	if _, err := c.LookupNetIP(ctx, "redirect.example.net"); err != nil {
-		t.Fatalf("резолв из кэша: %v", err)
+		t.Fatalf("a resolve from the cache: %v", err)
 	}
 	if got := inner.calls.Load(); got != 1 {
-		t.Fatalf("кэш не сработал: обращений %d, ожидалось 1", got)
+		t.Fatalf("the cache did not work: %d calls, 1 expected", got)
 	}
 
 	// Expiry: an entry older than the TTL — the resolver again.
 	clock.advance(2 * time.Second) // 61 s in total > 60 s
 	if _, err := c.LookupNetIP(ctx, "redirect.example.net"); err != nil {
-		t.Fatalf("резолв после истечения: %v", err)
+		t.Fatalf("a resolve after the expiry: %v", err)
 	}
 	if got := inner.calls.Load(); got != 2 {
-		t.Fatalf("после TTL ожидался новый резолв: обращений %d", got)
+		t.Fatalf("a new resolve expected after the TTL: %d calls", got)
 	}
 	if len(c.entries) != 1 {
-		t.Errorf("записей в кэше: %d, ожидалась 1", len(c.entries))
+		t.Errorf("cache entries: %d, 1 expected", len(c.entries))
 	}
 
 	// The key is case-insensitive: the same host in another case is a hit.
 	if _, err := c.LookupNetIP(ctx, "  Redirect.Example.NET "); err != nil {
-		t.Fatalf("резолв в другом регистре: %v", err)
+		t.Fatalf("a resolve in a different case: %v", err)
 	}
 	if got := inner.calls.Load(); got != 2 {
-		t.Errorf("регистр хоста должен давать попадание: обращений %d, ожидалось 2", got)
+		t.Errorf("the host case must hit: %d calls, 2 expected", got)
 	}
 }
 
 // TestCachingResolverErrorsNotCached: a resolver failure is retried by a
 // real request, an empty successful response is cached.
 func TestCachingResolverErrorsNotCached(t *testing.T) {
-	boom := errors.New("резолвер недоступен")
+	boom := errors.New("the resolver is unavailable")
 	inner := &fakeResolver{err: boom}
 	c := NewCachingResolver(inner, CacheOptions{})
 
 	ctx := context.Background()
 	for i := 0; i < 2; i++ {
 		if _, err := c.LookupNetIP(ctx, "broken.example.net"); !errors.Is(err, boom) {
-			t.Fatalf("ошибка резолвера не пробрасывается: %v", err)
+			t.Fatalf("the resolver error does not propagate: %v", err)
 		}
 	}
 	if got := inner.calls.Load(); got != 2 {
-		t.Errorf("ошибка не должна кэшироваться: обращений %d, ожидалось 2", got)
+		t.Errorf("the error must not be cached: %d calls, 2 expected", got)
 	}
 
 	// An empty successful response is a legal outcome (NODATA): cache it
@@ -99,13 +99,13 @@ func TestCachingResolverErrorsNotCached(t *testing.T) {
 	inner.err = nil
 	inner.addrs = nil
 	if addrs, err := c.LookupNetIP(ctx, "nodata.example.net"); err != nil || addrs != nil {
-		t.Fatalf("пустой ответ: %v %v", addrs, err)
+		t.Fatalf("an empty answer: %v %v", addrs, err)
 	}
 	if _, err := c.LookupNetIP(ctx, "nodata.example.net"); err != nil {
-		t.Fatalf("пустой ответ из кэша: %v", err)
+		t.Fatalf("an empty answer from the cache: %v", err)
 	}
 	if got := inner.calls.Load(); got != 3 {
-		t.Errorf("пустой ответ должен кэшироваться: обращений %d, ожидалось 3", got)
+		t.Errorf("an empty answer must be cached: %d calls, 3 expected", got)
 	}
 }
 
@@ -125,7 +125,7 @@ func TestCachingResolverEviction(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(c.entries) != 2 {
-		t.Fatalf("записей: %d, ожидалось 2", len(c.entries))
+		t.Fatalf("entries: %d, 2 expected", len(c.entries))
 	}
 
 	// A third entry with two live ones: one was evicted (which one is
@@ -134,10 +134,10 @@ func TestCachingResolverEviction(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(c.entries) != 2 {
-		t.Errorf("предел записей не удержан: %d", len(c.entries))
+		t.Errorf("the entry cap is not held: %d", len(c.entries))
 	}
 	if _, ok := c.entries["c.example.net"]; !ok {
-		t.Error("новая запись вытеснена вместо старой")
+		t.Error("the new entry was evicted instead of the old one")
 	}
 
 	// After the TTL expires, an overflow purges the expired entries, not
@@ -147,10 +147,10 @@ func TestCachingResolverEviction(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(c.entries) != 1 {
-		t.Errorf("истёкшие записи не вычищены: %d, ожидалась 1 живая", len(c.entries))
+		t.Errorf("expired entries are not purged: %d, 1 alive expected", len(c.entries))
 	}
 	if _, ok := c.entries["d.example.net"]; !ok {
-		t.Error("запись после чистки отсутствует")
+		t.Error("the entry is missing after the purge")
 	}
 }
 
@@ -166,13 +166,13 @@ func TestCachingResolverConcurrent(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			if _, err := c.LookupNetIP(context.Background(), "hot.example.net"); err != nil {
-				t.Errorf("конкурентный резолв: %v", err)
+				t.Errorf("a concurrent resolve: %v", err)
 			}
 		}()
 	}
 	wg.Wait()
 	if len(c.entries) != 1 {
-		t.Errorf("записей: %d, ожидалась 1", len(c.entries))
+		t.Errorf("entries: %d, 1 expected", len(c.entries))
 	}
 }
 
@@ -180,14 +180,14 @@ func TestCachingResolverConcurrent(t *testing.T) {
 func TestResolverFunc(t *testing.T) {
 	var fn ResolverFunc = func(ctx context.Context, host string) ([]netip.Addr, error) {
 		if host != "fn.example.net" {
-			return nil, errors.New("неожидаемый хост")
+			return nil, errors.New("an unexpected host")
 		}
 		return testAddrs, nil
 	}
 	var r Resolver = fn // interface compilation needs no separate check
 	addrs, err := r.LookupNetIP(context.Background(), "fn.example.net")
 	if err != nil || len(addrs) != len(testAddrs) {
-		t.Fatalf("адаптер: %v %v", addrs, err)
+		t.Fatalf("the adapter: %v %v", addrs, err)
 	}
 }
 
@@ -198,10 +198,10 @@ func TestSystemResolverLocalhost(t *testing.T) {
 	defer cancel()
 	addrs, err := SystemResolver.LookupNetIP(ctx, "localhost")
 	if err != nil {
-		t.Fatalf("системный резолвер: %v", err)
+		t.Fatalf("the system resolver: %v", err)
 	}
 	if len(addrs) == 0 {
-		t.Fatal("localhost без адресов")
+		t.Fatal("localhost without addresses")
 	}
 }
 

@@ -54,30 +54,30 @@ func TestLimitOptionsFromConfigAndDefaults(t *testing.T) {
 	lo := NewLimitOptions(cfg)
 	if lo.MaxBodyBytes != 3<<20 || lo.MinBodySpeed != 4096 || lo.PerIPConns != 3 ||
 		lo.GlobalConns != 777 || lo.MaxRPS != 500 {
-		t.Errorf("перенос из секции http: %+v", lo)
+		t.Errorf("the carry-over from the http section: %+v", lo)
 	}
 	// The prefix map (T-165) is parsed into override limits (masking
 	// normalization); junk in manual assembly disables the whole list (the
 	// valid path cuts junk off earlier).
 	if len(lo.PerIPOverrides) != 1 {
-		t.Fatalf("override-лимиты: %v, want один префикс", lo.PerIPOverrides)
+		t.Fatalf("the override limits: %v, want one prefix", lo.PerIPOverrides)
 	}
 	if o := lo.PerIPOverrides[0]; o.Prefix.String() != "195.208.0.0/16" || o.Limit != 12 {
 		t.Errorf("override = %s:%d, want 195.208.0.0/16:12", o.Prefix, o.Limit)
 	}
-	bad := NewLimitOptions(config.HTTP{PerIPLimit: 3, PerIPOverrides: map[string]int{"мусор": 8}})
+	bad := NewLimitOptions(config.HTTP{PerIPLimit: 3, PerIPOverrides: map[string]int{"junk": 8}})
 	if bad.PerIPOverrides != nil {
-		t.Errorf("мусорная карта: %v, want nil (отключение целиком)", bad.PerIPOverrides)
+		t.Errorf("a junk map: %v, want nil (the feature off as a whole)", bad.PerIPOverrides)
 	}
 
 	// NewOptions always enables limits (the production transport comes
 	// with limits).
 	o := NewOptions(cfg)
 	if o.Limits == nil {
-		t.Fatal("NewOptions: лимиты не включены")
+		t.Fatal("NewOptions: the limits are not enabled")
 	}
 	if o.Limits.MaxBodyBytes != 3<<20 || o.Limits.MaxRPS != 500 {
-		t.Errorf("лимиты NewOptions: %+v", o.Limits)
+		t.Errorf("the NewOptions limits: %+v", o.Limits)
 	}
 
 	// Defaults: the spec 5.5 limits table + the derived ones (RPS, the
@@ -86,10 +86,10 @@ func TestLimitOptionsFromConfigAndDefaults(t *testing.T) {
 	if d.MaxBodyBytes != DefaultLimitBodyBytes || d.MinBodySpeed != DefaultLimitBodySpeed ||
 		d.MinSpeedWindow != DefaultLimitSpeedWindow || d.PerIPConns != DefaultLimitPerIPConns ||
 		d.GlobalConns != DefaultLimitGlobalConns || d.MaxRPS != DefaultLimitRPS {
-		t.Errorf("дефолты лимитов: %+v", d)
+		t.Errorf("the limit defaults: %+v", d)
 	}
 	if d.Burst != d.GlobalConns {
-		t.Errorf("дефолт всплеска: %d, ожидался GlobalConns=%d", d.Burst, d.GlobalConns)
+		t.Errorf("the burst default: %d, GlobalConns=%d expected", d.Burst, d.GlobalConns)
 	}
 }
 
@@ -99,19 +99,19 @@ func TestLimitOptionsFromConfigAndDefaults(t *testing.T) {
 func TestBodyLimiterDeadline(t *testing.T) {
 	b := &BodyLimiter{speed: 2048, window: 500 * time.Millisecond}
 	if d := b.deadlineLocked(4096); d != 2*time.Second {
-		t.Errorf("дедлайн остатка 4096 байт при 2048 байт/с: %s, ожидалось 2s", d)
+		t.Errorf("the deadline of a 4096-byte remainder at 2048 bytes/s: %s, 2s expected", d)
 	}
 	if d := b.deadlineLocked(100); d != 500*time.Millisecond {
-		t.Errorf("короткий остаток без пола окна: %s, ожидалось 500ms", d)
+		t.Errorf("a short remainder without the window floor: %s, 500ms expected", d)
 	}
 	b.speed = 0
 	if d := b.deadlineLocked(4096); d != 0 {
-		t.Errorf("выключенный анти-тарпит не должен давать дедлайн: %s", d)
+		t.Errorf("the anti-tarpit off must not produce a deadline: %s", d)
 	}
 	// A large remainder at 1 byte/s does not overflow time.Duration.
 	b.speed = 1
 	if d := b.deadlineLocked(2 << 20); d <= 0 {
-		t.Errorf("большой остаток: неожиданный дедлайн %s", d)
+		t.Errorf("a large remainder: an unexpected deadline %s", d)
 	}
 }
 
@@ -123,7 +123,7 @@ func TestBodyLimiterClosedRead(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 	if _, err := b.Read(make([]byte, 4)); !errors.Is(err, errLimitBodyClosed) {
-		t.Errorf("чтение закрытого тела: %v", err)
+		t.Errorf("reading a closed body: %v", err)
 	}
 }
 
@@ -153,13 +153,13 @@ func TestBodyLimiterZeroBufAndRepeatRead(t *testing.T) {
 			func() {}, LimitOptions{MaxBodyBytes: int64(limit)}) // speed 0 — the watchdog is off
 
 		if n, err := bl.Read(nil); n != 0 || err != nil {
-			t.Errorf("Read(nil) = (%d, %v), ожидалось (0, nil)", n, err)
+			t.Errorf("Read(nil) = (%d, %v), expected (0, nil)", n, err)
 		}
 		if n, err := bl.Read(make([]byte, 0)); n != 0 || err != nil {
-			t.Errorf("Read(пустой буфер) = (%d, %v), ожидалось (0, nil)", n, err)
+			t.Errorf("Read(an empty buffer) = (%d, %v), expected (0, nil)", n, err)
 		}
 		if reads != 0 {
-			t.Fatalf("нулевые буферы прочитали источник: %d чтений", reads)
+			t.Fatalf("zero buffers read the source: %d reads", reads)
 		}
 
 		buf := make([]byte, size+8)
@@ -167,29 +167,29 @@ func TestBodyLimiterZeroBufAndRepeatRead(t *testing.T) {
 		for got < limit && got < size {
 			n, err := bl.Read(buf[got:])
 			if err != nil {
-				t.Fatalf("чтение до потолка: %v", err)
+				t.Fatalf("reading up to the cap: %v", err)
 			}
 			got += n
 		}
 		if _, err := bl.Read(buf); err != io.EOF {
-			t.Fatalf("проба хвоста: %v, ожидался io.EOF", err)
+			t.Fatalf("the tail probe: %v, io.EOF expected", err)
 		}
 		if bl.Truncated() != wantTrunc {
-			t.Errorf("признак обрезки: %v, ожидался %v", bl.Truncated(), wantTrunc)
+			t.Errorf("the truncation flag: %v, expected %v", bl.Truncated(), wantTrunc)
 		}
 		probes := reads
 		for i := 0; i < 3; i++ {
 			if n, err := bl.Read(buf); n != 0 || err != io.EOF {
-				t.Errorf("повторное чтение №%d: (%d, %v), ожидалось (0, io.EOF)", i+1, n, err)
+				t.Errorf("re-read #%d: (%d, %v), expected (0, io.EOF)", i+1, n, err)
 			}
 		}
 		if reads != probes {
-			t.Errorf("повторные чтения тронули источник: %d → %d чтений", probes, reads)
+			t.Errorf("re-reads touched the source: %d → %d reads", probes, reads)
 		}
 		_ = bl.Close()
 	}
-	t.Run("сверх лимита", func(t *testing.T) { run(t, 10, 5, true) })
-	t.Run("ровно в лимит", func(t *testing.T) { run(t, 5, 5, false) })
+	t.Run("over the limit", func(t *testing.T) { run(t, 10, 5, true) })
+	t.Run("exactly at the limit", func(t *testing.T) { run(t, 5, 5, false) })
 }
 
 // --- the rate token bucket ---------------------------------------------------
@@ -207,21 +207,21 @@ func TestLimitBucketPacing(t *testing.T) {
 	elapsed := time.Since(start)
 	// 2 instantly + 3 × 40 ms ≈ 120 ms; the lower bound with a margin.
 	if elapsed < 100*time.Millisecond {
-		t.Errorf("темп ведра не выдержан: 5 токенов за %s (ожидалось ≥100ms)", elapsed)
+		t.Errorf("the bucket rate is not held: 5 tokens in %s (≥100ms expected)", elapsed)
 	}
 	if elapsed >= 2*time.Second {
-		t.Errorf("темп ведра затянут: %s", elapsed)
+		t.Errorf("the bucket rate is stretched: %s", elapsed)
 	}
 
 	// An empty bucket: the wait is interrupted by a ctx cancellation.
 	slow := newLimitBucket(0.001, 1)
 	if err := slow.take(context.Background()); err != nil {
-		t.Fatalf("burst-токен: %v", err)
+		t.Fatalf("the burst token: %v", err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	if err := slow.take(ctx); !errors.Is(err, context.DeadlineExceeded) {
-		t.Errorf("ожидание токена не прервано отменой: %v", err)
+		t.Errorf("the token wait is not interrupted by the cancellation: %v", err)
 	}
 }
 
@@ -237,11 +237,11 @@ func TestLimitIPMapQueueAndCancel(t *testing.T) {
 
 	r1, err := m.acquire(ctx, ip)
 	if err != nil {
-		t.Fatalf("слот 1: %v", err)
+		t.Fatalf("slot 1: %v", err)
 	}
 	r2, err := m.acquire(ctx, ip)
 	if err != nil {
-		t.Fatalf("слот 2: %v", err)
+		t.Fatalf("slot 2: %v", err)
 	}
 
 	// The third one queues (does not return while the slots are taken).
@@ -256,7 +256,7 @@ func TestLimitIPMapQueueAndCancel(t *testing.T) {
 	}()
 	select {
 	case err := <-queued:
-		t.Fatalf("третий слот взят при полном потолке: %v", err)
+		t.Fatalf("a third slot taken at the full cap: %v", err)
 	case <-time.After(100 * time.Millisecond):
 	}
 
@@ -265,10 +265,10 @@ func TestLimitIPMapQueueAndCancel(t *testing.T) {
 	select {
 	case err := <-queued:
 		if err != nil {
-			t.Fatalf("ожидающий не получил слот: %v", err)
+			t.Fatalf("the waiter did not get a slot: %v", err)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("очередь не пробудилась освобождением слота")
+		t.Fatal("the queue did not wake on the slot release")
 	}
 
 	// A cancelled waiter gets an error and takes no slot.
@@ -284,10 +284,10 @@ func TestLimitIPMapQueueAndCancel(t *testing.T) {
 	select {
 	case err := <-cancelled:
 		if !errors.Is(err, context.Canceled) {
-			t.Errorf("отмена очереди: %v", err)
+			t.Errorf("the queue cancellation: %v", err)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("отмена не разбудила ждущего")
+		t.Fatal("the cancellation did not wake the waiter")
 	}
 
 	// The emptied map is cleaned: no per-IP entries.
@@ -297,7 +297,7 @@ func TestLimitIPMapQueueAndCancel(t *testing.T) {
 	entries := len(m.entries)
 	m.mu.Unlock()
 	if entries != 0 {
-		t.Errorf("записи per-IP не очищены: %d", entries)
+		t.Errorf("the per-IP entries are not cleaned up: %d", entries)
 	}
 }
 
@@ -315,11 +315,11 @@ func TestLimitStateAcquireDial(t *testing.T) {
 
 	r1, err := st.acquireDial(ctx, ip1)
 	if err != nil {
-		t.Fatalf("соединение 1: %v", err)
+		t.Fatalf("connection 1: %v", err)
 	}
 	r2, err := st.acquireDial(ctx, ip2)
 	if err != nil {
-		t.Fatalf("соединение 2: %v", err)
+		t.Fatalf("connection 2: %v", err)
 	}
 
 	// The global cap is exhausted (per-IP is not): the third one queues.
@@ -327,7 +327,7 @@ func TestLimitStateAcquireDial(t *testing.T) {
 	go func() {
 		rel, err := st.acquireDial(ctx, ip3)
 		if err != nil {
-			t.Errorf("соединение 3: %v", err)
+			t.Errorf("connection 3: %v", err)
 			rel = func() {}
 		}
 		queued <- struct{ rel func() }{rel}
@@ -335,7 +335,7 @@ func TestLimitStateAcquireDial(t *testing.T) {
 	select {
 	case got := <-queued:
 		got.rel()
-		t.Fatal("третье соединение прошло полный глобальный потолок")
+		t.Fatal("a third connection passed the full global cap")
 	case <-time.After(100 * time.Millisecond):
 	}
 
@@ -350,10 +350,10 @@ func TestLimitStateAcquireDial(t *testing.T) {
 	select {
 	case err := <-cancelled:
 		if !errors.Is(err, context.Canceled) {
-			t.Errorf("отмена очереди диала: %v", err)
+			t.Errorf("the dial queue cancellation: %v", err)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("отмена не разбудила ждущего соединения")
+		t.Fatal("the cancellation did not wake the connection waiter")
 	}
 
 	// Releasing a global slot wakes the queue.
@@ -362,7 +362,7 @@ func TestLimitStateAcquireDial(t *testing.T) {
 	case got := <-queued:
 		defer got.rel()
 	case <-time.After(time.Second):
-		t.Fatal("очередь соединений не пробудилась")
+		t.Fatal("the connection queue did not wake")
 	}
 	r2()
 }
@@ -380,11 +380,11 @@ func TestParsePerIPOverrides(t *testing.T) {
 		"192.0.2.0/24":   2,
 	})
 	if err != nil {
-		t.Fatalf("разбор карты: %v", err)
+		t.Fatalf("parsing the map: %v", err)
 	}
 	want := map[string]int{"195.208.0.0/16": 12, "2a02:6b8::/32": 8, "192.0.2.0/24": 2}
 	if len(overrides) != len(want) {
-		t.Fatalf("ожидалось %d override, получено %v", len(want), overrides)
+		t.Fatalf("%d overrides expected, got %v", len(want), overrides)
 	}
 	for _, o := range overrides {
 		if o.Limit != want[o.Prefix.String()] {
@@ -393,16 +393,16 @@ func TestParsePerIPOverrides(t *testing.T) {
 	}
 
 	for name, m := range map[string]map[string]int{
-		"мусорный CIDR":  {"195.208.0.0.1/16": 8},
-		"лимит меньше 1": {"195.208.0.0/16": 0},
-		"дубль сети":     {"195.208.0.0/16": 8, "195.208.9.9/16": 12},
+		"a junk CIDR":  {"195.208.0.0.1/16": 8},
+		"a limit below 1": {"195.208.0.0/16": 0},
+		"a duplicate network":     {"195.208.0.0/16": 8, "195.208.9.9/16": 12},
 	} {
 		if _, err := parsePerIPOverrides(m); err == nil {
-			t.Errorf("%s: ожидалась ошибка разбора", name)
+			t.Errorf("%s: a parse error expected", name)
 		}
 	}
 	if got, err := parsePerIPOverrides(nil); err != nil || got != nil {
-		t.Errorf("пустая карта: %v, %v — ожидалось nil, nil", got, err)
+		t.Errorf("an empty map: %v, %v — nil, nil expected", got, err)
 	}
 }
 
@@ -417,7 +417,7 @@ func TestLimitIPMapLimitFor(t *testing.T) {
 		"2a02:6b8::/32":  4,
 	})
 	if err != nil {
-		t.Fatalf("разбор: %v", err)
+		t.Fatalf("parse: %v", err)
 	}
 	st := newLimitState(LimitOptions{
 		PerIPConns: 2, PerIPOverrides: overrides,
@@ -458,7 +458,7 @@ func TestLimitIPMapOverrideCapacity(t *testing.T) {
 	for i := 0; i < 4; i++ {
 		r, err := st.ips.acquire(ctx, park)
 		if err != nil {
-			t.Fatalf("слот %d в префиксе: %v", i+1, err)
+			t.Fatalf("slot %d in the prefix: %v", i+1, err)
 		}
 		parkRel = append(parkRel, r)
 	}
@@ -466,14 +466,14 @@ func TestLimitIPMapOverrideCapacity(t *testing.T) {
 	go func() {
 		rel, err := st.ips.acquire(ctx, park)
 		if err != nil {
-			t.Errorf("пятое соединение префикса: %v", err)
+			t.Errorf("the prefix fifth connection: %v", err)
 			rel = func() {}
 		}
 		parkQueued <- rel
 	}()
 	select {
 	case <-parkQueued:
-		t.Fatal("пятый слот префикса взят при лимите 4")
+		t.Fatal("the prefix fifth slot taken at the limit 4")
 	case <-time.After(100 * time.Millisecond):
 	}
 
@@ -481,24 +481,24 @@ func TestLimitIPMapOverrideCapacity(t *testing.T) {
 	plain := netip.MustParseAddr("192.0.2.7")
 	r1, err := st.ips.acquire(ctx, plain)
 	if err != nil {
-		t.Fatalf("слот 1 вне префикса: %v", err)
+		t.Fatalf("slot 1 outside the prefix: %v", err)
 	}
 	r2, err := st.ips.acquire(ctx, plain)
 	if err != nil {
-		t.Fatalf("слот 2 вне префикса: %v", err)
+		t.Fatalf("slot 2 outside the prefix: %v", err)
 	}
 	plainQueued := make(chan func(), 1)
 	go func() {
 		rel, err := st.ips.acquire(ctx, plain)
 		if err != nil {
-			t.Errorf("третье соединение вне префикса: %v", err)
+			t.Errorf("a third connection outside the prefix: %v", err)
 			rel = func() {}
 		}
 		plainQueued <- rel
 	}()
 	select {
 	case <-plainQueued:
-		t.Fatal("третий слот вне префикса взят при общем лимите 2")
+		t.Fatal("a third slot outside the prefix taken at the shared limit 2")
 	case <-time.After(100 * time.Millisecond):
 	}
 
@@ -508,14 +508,14 @@ func TestLimitIPMapOverrideCapacity(t *testing.T) {
 	case rel := <-parkQueued:
 		rel()
 	case <-time.After(time.Second):
-		t.Fatal("очередь префикса не пробудилась")
+		t.Fatal("the prefix queue did not wake")
 	}
 	r1()
 	select {
 	case rel := <-plainQueued:
 		rel()
 	case <-time.After(time.Second):
-		t.Fatal("очередь вне префикса не пробудилась")
+		t.Fatal("the outside-the-prefix queue did not wake")
 	}
 	for _, r := range parkRel[1:] {
 		r()
@@ -539,7 +539,7 @@ func TestLimitIPMapWaitObserved(t *testing.T) {
 
 	r1, err := m.acquire(ctx, ip)
 	if err != nil {
-		t.Fatalf("слот 1: %v", err)
+		t.Fatalf("slot 1: %v", err)
 	}
 
 	// A waiter behind a holder: does not return while the slot is taken.
@@ -547,14 +547,14 @@ func TestLimitIPMapWaitObserved(t *testing.T) {
 	go func() {
 		rel, err := m.acquire(ctx, ip)
 		if err != nil {
-			t.Errorf("ждущий: %v", err)
+			t.Errorf("the waiter: %v", err)
 			rel = func() {}
 		}
 		got <- rel
 	}()
 	select {
 	case <-got:
-		t.Fatal("второй слот взят при полном потолке")
+		t.Fatal("a second slot taken at the full cap")
 	case <-time.After(100 * time.Millisecond):
 	}
 
@@ -570,16 +570,16 @@ func TestLimitIPMapWaitObserved(t *testing.T) {
 	select {
 	case err := <-cancelled:
 		if !errors.Is(err, context.Canceled) {
-			t.Errorf("отмена очереди: %v", err)
+			t.Errorf("the queue cancellation: %v", err)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("отмена не разбудила ждущего")
+		t.Fatal("the cancellation did not wake the waiter")
 	}
 	mu.Lock()
 	n := len(waits)
 	mu.Unlock()
 	if n != 1 {
-		t.Fatalf("после отмены наблюдений %d, want 1 (только мгновенный слот)", n)
+		t.Fatalf("observations after the cancellation %d, want 1 (only the instant slot)", n)
 	}
 
 	// The grant is woken by a release; the queue wait is observed.
@@ -588,18 +588,18 @@ func TestLimitIPMapWaitObserved(t *testing.T) {
 	case rel := <-got:
 		rel()
 	case <-time.After(time.Second):
-		t.Fatal("очередь не пробудилась освобождением")
+		t.Fatal("the queue did not wake on the release")
 	}
 	mu.Lock()
 	defer mu.Unlock()
 	if len(waits) != 2 {
-		t.Fatalf("наблюдений %d, want 2", len(waits))
+		t.Fatalf("observations %d, want 2", len(waits))
 	}
 	if waits[1] < 20*time.Millisecond {
-		t.Errorf("ожидание очереди %s, want ≥20ms (ждущий стоял ≥100ms)", waits[1])
+		t.Errorf("the queue wait %s, want ≥20ms (the waiter stood ≥100ms)", waits[1])
 	}
 	if waits[0] >= waits[1] {
-		t.Errorf("мгновенный слот %s не меньше ожидания очереди %s", waits[0], waits[1])
+		t.Errorf("the instant slot %s is not less than the queue wait %s", waits[0], waits[1])
 	}
 }
 
@@ -636,7 +636,7 @@ func waitCount(t *testing.T, entered func() int64, want int64) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("счётчик вошедших %d, ожидался %d", entered(), want)
+	t.Fatalf("the entered counter %d, %d expected", entered(), want)
 }
 
 // smallLimits is the limits for the integration tests: the connection caps
@@ -694,34 +694,34 @@ func TestFetcherPerIPLimitQueue(t *testing.T) {
 	// The slots are taken: the third does not dial — still two handlers.
 	time.Sleep(300 * time.Millisecond)
 	if got := entered(); got != 2 {
-		t.Fatalf("лимит per-IP пропущен: вошло обработчиков %d (ожидалось 2)", got)
+		t.Fatalf("the per-IP limit passed: %d handlers entered (2 expected)", got)
 	}
 
 	// Release: the bodies are read out, the connections close, the slots
 	// go to the waiting third request.
 	release()
 	if _, err := io.ReadAll(res1.Body); err != nil {
-		t.Fatalf("тело 1: %v", err)
+		t.Fatalf("body 1: %v", err)
 	}
 	_ = res1.Body.Close()
 	if _, err := io.ReadAll(res2.Body); err != nil {
-		t.Fatalf("тело 2: %v", err)
+		t.Fatalf("body 2: %v", err)
 	}
 
 	select {
 	case got := <-third:
 		if got.err != nil {
-			t.Fatalf("Fetch 3 после освобождения: %v", got.err)
+			t.Fatalf("Fetch 3 after the release: %v", got.err)
 		}
 		defer func() { _ = got.res.Body.Close() }()
 		if got.res.StatusCode != http.StatusOK {
-			t.Errorf("статус 3: %d", got.res.StatusCode)
+			t.Errorf("status 3: %d", got.res.StatusCode)
 		}
 		if _, err := io.ReadAll(got.res.Body); err != nil {
-			t.Errorf("тело 3: %v", err)
+			t.Errorf("body 3: %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("третий запрос не прошёл после освобождения слотов")
+		t.Fatal("the third request did not pass after the slots were released")
 	}
 	waitCount(t, entered, 3)
 }
@@ -762,13 +762,13 @@ func TestFetcherPerIPQueueCancelled(t *testing.T) {
 	_, err = f.Fetch(ctx, FetchRequest{URL: u, Addrs: loopbackAddr()})
 	elapsed := time.Since(start)
 	if err == nil {
-		t.Fatal("ожидалась ошибка отмены запроса в очереди per-IP")
+		t.Fatal("a request-cancellation error in the per-IP queue expected")
 	}
 	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Errorf("ошибка очереди не пробрасывает DeadlineExceeded: %v", err)
+		t.Errorf("the queue error does not propagate DeadlineExceeded: %v", err)
 	}
 	if elapsed >= 3*time.Second {
-		t.Errorf("отмена очереди сработала поздно: %s", elapsed)
+		t.Errorf("the queue cancellation fired late: %s", elapsed)
 	}
 }
 
@@ -813,22 +813,22 @@ func TestFetchBodyLimitExactAndTruncated(t *testing.T) {
 		got, readErr := io.ReadAll(res.Body)
 		_ = res.Body.Close()
 		if readErr != nil {
-			t.Fatalf("обрезка — не ошибка чтения: %v", readErr)
+			t.Fatalf("truncation is not a read error: %v", readErr)
 		}
 		if len(got) != min(size, limit) {
-			t.Errorf("прочитано %d байт, ожидалось %d", len(got), min(size, limit))
+			t.Errorf("%d bytes read, %d expected", len(got), min(size, limit))
 		}
 		if res.BodyLimiter == nil {
-			t.Fatal("BodyLimiter не подставлен")
+			t.Fatal("BodyLimiter is not set")
 		}
 		if res.BodyLimiter.Truncated() != wantTrunc {
-			t.Errorf("признак обрезки: %v, ожидался %v", res.BodyLimiter.Truncated(), wantTrunc)
+			t.Errorf("the truncation flag: %v, expected %v", res.BodyLimiter.Truncated(), wantTrunc)
 		}
 	}
 
-	t.Run("ровно в лимит", func(t *testing.T) { run(t, body(1024, true), 1024, 1024, false) })
-	t.Run("сверх лимита", func(t *testing.T) { run(t, body(4096, true), 4096, 1024, true) })
-	t.Run("сверх лимита chunked", func(t *testing.T) { run(t, body(4096, false), 4096, 1024, true) })
+	t.Run("exactly at the limit", func(t *testing.T) { run(t, body(1024, true), 1024, 1024, false) })
+	t.Run("over the limit", func(t *testing.T) { run(t, body(4096, true), 4096, 1024, true) })
+	t.Run("over the limit chunked", func(t *testing.T) { run(t, body(4096, false), 4096, 1024, true) })
 }
 
 // --- the anti-tarpit ---------------------------------------------------------
@@ -863,27 +863,27 @@ func TestFetchBodyTarpitSpeed(t *testing.T) {
 	})
 	res, err := f.Fetch(context.Background(), FetchRequest{URL: hostURL(srv.URL, "tarpit-body.example.net"), Addrs: loopbackAddr()})
 	if err != nil {
-		t.Fatalf("заголовки должны успеть: %v", err)
+		t.Fatalf("the headers must make it in time: %v", err)
 	}
 	start := time.Now()
 	_, readErr := io.ReadAll(res.Body)
 	elapsed := time.Since(start)
 	if readErr == nil {
-		t.Fatal("тарпит тела должен прерываться нарушением скорости")
+		t.Fatal("a body tarpit must be interrupted by the speed violation")
 	}
 	if !IsTimeout(readErr) {
-		t.Errorf("нарушение скорости — тайм-классификация, получено: %v", readErr)
+		t.Errorf("a speed violation is timeout-classified, got: %v", readErr)
 	}
-	if !strings.Contains(readErr.Error(), "тарпит") {
-		t.Errorf("ошибка без указания причины: %v", readErr)
+	if !strings.Contains(readErr.Error(), "tarpit") {
+		t.Errorf("the error without the reason: %v", readErr)
 	}
 	if elapsed < 150*time.Millisecond || elapsed >= 2*time.Second {
-		t.Errorf("нарушение скорости сработало вне границ окна: %s", elapsed)
+		t.Errorf("the speed violation fired outside the window bounds: %s", elapsed)
 	}
 	// The connection is closed: a repeated read gets the same error, not a
 	// block.
 	if _, err := res.Body.Read(make([]byte, 16)); err == nil || !IsTimeout(err) {
-		t.Errorf("чтение после нарушения: %v", err)
+		t.Errorf("a read after the violation: %v", err)
 	}
 	_ = res.Body.Close()
 }
@@ -919,13 +919,13 @@ func TestFetchBodySpeedPacedOK(t *testing.T) {
 	got, readErr := io.ReadAll(res.Body)
 	_ = res.Body.Close()
 	if readErr != nil {
-		t.Fatalf("ложное срабатывание анти-тарпита: %v", readErr)
+		t.Fatalf("a false anti-tarpit trigger: %v", readErr)
 	}
 	if len(got) != 4096 {
-		t.Errorf("прочитано %d байт, ожидалось 4096", len(got))
+		t.Errorf("%d bytes read, 4096 expected", len(got))
 	}
 	if res.BodyLimiter.Truncated() {
-		t.Error("тело в лимите не должно получать признак обрезки")
+		t.Error("a body within the limit must not get the truncation flag")
 	}
 }
 
@@ -950,7 +950,7 @@ func TestRoundTripRPSPacing(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL, nil)
 		if err != nil {
-			t.Fatalf("запрос: %v", err)
+			t.Fatalf("request: %v", err)
 		}
 		resp, err := f.RoundTrip(req)
 		if err != nil {
@@ -962,10 +962,10 @@ func TestRoundTripRPSPacing(t *testing.T) {
 	elapsed := time.Since(start)
 	// Burst 1 + 2 tokens of 50 ms ≈ 100 ms.
 	if elapsed < 90*time.Millisecond {
-		t.Errorf("темп RPS не выдержан: 3 запроса за %s (ожидалось ≥90ms)", elapsed)
+		t.Errorf("the RPS rate is not held: 3 requests in %s (≥90ms expected)", elapsed)
 	}
 	if elapsed >= 2*time.Second {
-		t.Errorf("темп RPS затянут: %s", elapsed)
+		t.Errorf("the RPS rate is stretched: %s", elapsed)
 	}
 }
 
@@ -995,17 +995,17 @@ func TestKeepAliveConnectionNotReused(t *testing.T) {
 			t.Fatalf("Fetch #%d: %v", i+1, err)
 		}
 		if _, err := io.ReadAll(res.Body); err != nil {
-			t.Fatalf("тело #%d: %v", i+1, err)
+			t.Fatalf("body #%d: %v", i+1, err)
 		}
 		_ = res.Body.Close()
 	}
 	mu.Lock()
 	defer mu.Unlock()
 	if len(remotes) != 2 {
-		t.Errorf("ожидались 2 разных соединения (keep-alive выключен), соединений: %d", len(remotes))
+		t.Errorf("2 different connections expected (keep-alive off), connections: %d", len(remotes))
 	}
 	if closeHeader != 2 {
-		t.Errorf("Connection: close в обоих запросах: заголовок в %d из 2", closeHeader)
+		t.Errorf("Connection: close in both requests: the header in %d of 2", closeHeader)
 	}
 }
 
@@ -1024,10 +1024,10 @@ func TestFetchWithoutLimitsNoLimiter(t *testing.T) {
 	}
 	defer func() { _ = res.Body.Close() }()
 	if res.BodyLimiter != nil {
-		t.Error("без Options.Limits BodyLimiter должен быть nil")
+		t.Error("without Options.Limits BodyLimiter must be nil")
 	}
 	body, err := io.ReadAll(res.Body)
 	if err != nil || string(body) != "plain" {
-		t.Errorf("тело без лимитов: %q, %v", body, err)
+		t.Errorf("the body without limits: %q, %v", body, err)
 	}
 }

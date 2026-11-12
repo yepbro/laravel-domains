@@ -145,7 +145,7 @@ func DecideVariants(a, b VariantInput) ([]VariantRecord, error) {
 	case a.Scheme == model.SchemeHTTP && b.Scheme == model.SchemeHTTPS:
 		httpsIn, httpIn = b, a
 	default:
-		return nil, fmt.Errorf("httpfetch: итоги проверок не пара http+https: схемы %v и %v",
+		return nil, fmt.Errorf("httpfetch: the check outcomes are not an http+https pair: schemes %v and %v",
 			a.Scheme, b.Scheme)
 	}
 

@@ -94,27 +94,27 @@ const (
 // dashboard pattern of T-129, not a public page).
 func FetchLandingData(ctx context.Context, pool Querier) (LandingData, error) {
 	if pool == nil {
-		return LandingData{}, fmt.Errorf("web: данные лендинга: пул не задан")
+		return LandingData{}, fmt.Errorf("web: landing data: the pool is not set")
 	}
 	var data LandingData
 
 	rows, err := pool.Query(ctx, statsSQL)
 	if err != nil {
-		return LandingData{}, fmt.Errorf("web: статистика: %w", err)
+		return LandingData{}, fmt.Errorf("web: statistics: %w", err)
 	}
 	for rows.Next() {
 		if err := rows.Scan(&data.Stats.Zones, &data.Stats.Total,
 			&data.Stats.Checked, &data.Stats.Laravel); err != nil {
 			rows.Close()
-			return LandingData{}, fmt.Errorf("web: статистика: чтение: %w", err)
+			return LandingData{}, fmt.Errorf("web: statistics: read: %w", err)
 		}
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
-		return LandingData{}, fmt.Errorf("web: статистика: %w", err)
+		return LandingData{}, fmt.Errorf("web: statistics: %w", err)
 	}
 	rows.Close()
-	data.Stats.Last24h, err = countRows(ctx, pool, last24hSQL, "находки за 24 ч")
+	data.Stats.Last24h, err = countRows(ctx, pool, last24hSQL, "finds in 24 h")
 	if err != nil {
 		return LandingData{}, err
 	}
@@ -147,10 +147,10 @@ func countRows(ctx context.Context, pool Querier, sql, what string) (int64, erro
 	defer rows.Close()
 	var n int64
 	if !rows.Next() {
-		return 0, fmt.Errorf("web: %s: пустой ответ агрегата", what)
+		return 0, fmt.Errorf("web: %s: an empty aggregate answer", what)
 	}
 	if err := rows.Scan(&n); err != nil {
-		return 0, fmt.Errorf("web: %s: чтение: %w", what, err)
+		return 0, fmt.Errorf("web: %s: read: %w", what, err)
 	}
 	return n, rows.Err()
 }
@@ -158,7 +158,7 @@ func countRows(ctx context.Context, pool Querier, sql, what string) (int64, erro
 func fetchZones(ctx context.Context, pool Querier, sql string, withChecked bool) ([]ZoneItem, error) {
 	rows, err := pool.Query(ctx, sql)
 	if err != nil {
-		return nil, fmt.Errorf("web: зоны: %w", err)
+		return nil, fmt.Errorf("web: zones: %w", err)
 	}
 	defer rows.Close()
 	var out []ZoneItem
@@ -169,7 +169,7 @@ func fetchZones(ctx context.Context, pool Querier, sql string, withChecked bool)
 			dest = []any{&z.Name, &z.NameUnicode, &z.Checked, &z.Laravel}
 		}
 		if err := rows.Scan(dest...); err != nil {
-			return nil, fmt.Errorf("web: зоны: чтение: %w", err)
+			return nil, fmt.Errorf("web: zones: read: %w", err)
 		}
 		out = append(out, z)
 	}
@@ -203,25 +203,25 @@ func fetchLatest(ctx context.Context, pool Querier) ([]LatestItem, error) {
 	subs := map[int16]string{}
 	srows, err := pool.Query(ctx, subdomainsSQL)
 	if err != nil {
-		return nil, fmt.Errorf("web: справочник субдоменов: %w", err)
+		return nil, fmt.Errorf("web: the subdomain reference table: %w", err)
 	}
 	for srows.Next() {
 		var id int16
 		var label string
 		if err := srows.Scan(&id, &label); err != nil {
 			srows.Close()
-			return nil, fmt.Errorf("web: справочник субдоменов: чтение: %w", err)
+			return nil, fmt.Errorf("web: the subdomain reference table: read: %w", err)
 		}
 		subs[id] = label
 	}
 	srows.Close()
 	if err := srows.Err(); err != nil {
-		return nil, fmt.Errorf("web: справочник субдоменов: %w", err)
+		return nil, fmt.Errorf("web: the subdomain reference table: %w", err)
 	}
 
 	rows, err := pool.Query(ctx, latestSQL)
 	if err != nil {
-		return nil, fmt.Errorf("web: последние находки: %w", err)
+		return nil, fmt.Errorf("web: the latest finds: %w", err)
 	}
 	defer rows.Close()
 	var out []LatestItem
@@ -234,7 +234,7 @@ func fetchLatest(ctx context.Context, pool Querier) ([]LatestItem, error) {
 			updated time.Time
 		)
 		if err := rows.Scan(&it.Name, &mask, &verMin, &verMax, &updated); err != nil {
-			return nil, fmt.Errorf("web: последние находки: чтение: %w", err)
+			return nil, fmt.Errorf("web: the latest finds: read: %w", err)
 		}
 		m := model.DNSMask(mask)
 		for _, id := range m.IDs() {
@@ -252,7 +252,7 @@ func fetchLatest(ctx context.Context, pool Querier) ([]LatestItem, error) {
 		case verMax != "":
 			it.VerText = "≤ " + verMax
 		}
-		it.UpdatedText = updated.UTC().Format("02.01.2006")
+		it.UpdatedText = updated.UTC().Format("Jan 02, 2006")
 		out = append(out, it)
 	}
 	return out, rows.Err()

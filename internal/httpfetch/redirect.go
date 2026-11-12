@@ -71,7 +71,7 @@ var (
 // error code in the result, while the final domain status (no_http if no
 // subdomain answered) is decided by the episode aggregator (T-058, the §7
 // algorithm).
-var ErrTooManyRedirects = errors.New("httpfetch: слишком много редиректов")
+var ErrTooManyRedirects = errors.New("httpfetch: too many redirects")
 
 // RedirectStep is a chain step: the request URL and the status of the
 // received response (the format of the subdomain_results.redirects
@@ -138,7 +138,7 @@ func FetchChain(ctx context.Context, f *Fetcher, req FetchRequest) (*ChainResult
 // CachingResolver wrapper of T-047 in the worker wiring).
 func FetchChainOpts(ctx context.Context, f *Fetcher, req FetchRequest, opts ChainOptions) (*ChainResult, error) {
 	if req.URL == nil {
-		return nil, errors.New("httpfetch: запрос без URL")
+		return nil, errors.New("httpfetch: a request without a URL")
 	}
 	max := opts.MaxRedirects
 	if max < 0 {
@@ -150,7 +150,7 @@ func FetchChainOpts(ctx context.Context, f *Fetcher, req FetchRequest, opts Chai
 	// punycode; normalization guards against unexpected unicode.
 	start, ok := redirectResolve(req.URL, req.URL.String())
 	if !ok {
-		return nil, fmt.Errorf("httpfetch: стартовый URL %s: схема или хост не нормализуются", req.URL)
+		return nil, fmt.Errorf("httpfetch: the start URL %s: the scheme or host does not normalize", req.URL)
 	}
 	startHost := start.Hostname()
 	visited := map[string]struct{}{redirectKey(start): {}}
@@ -199,11 +199,11 @@ func FetchChainOpts(ctx context.Context, f *Fetcher, req FetchRequest, opts Chai
 		if redirects >= max {
 			cancelBudget()
 			return &ChainResult{Chain: chain}, fmt.Errorf(
-				"%w: лимит %d превышен на переходе к %s", ErrTooManyRedirects, max, next)
+				"%w: the limit %d exceeded on the hop to %s", ErrTooManyRedirects, max, next)
 		}
 		if _, dup := visited[redirectKey(next)]; dup {
 			cancelBudget()
-			return &ChainResult{Chain: chain}, fmt.Errorf("%w: цикл на %s", ErrTooManyRedirects, next)
+			return &ChainResult{Chain: chain}, fmt.Errorf("%w: a cycle at %s", ErrTooManyRedirects, next)
 		}
 		visited[redirectKey(next)] = struct{}{}
 		redirects++
