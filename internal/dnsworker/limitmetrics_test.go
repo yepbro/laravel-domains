@@ -1,7 +1,7 @@
-// Юнит-тесты коллектора состояния лимитёра DNS (T-077): no-op на
-// nil-зависимостях, экспорт снимка LimitStats в gauges по метке kind,
-// чистый выход по отмене ctx. Источник состояния — замыкание над
-// заготовленным снимком (LimitStatsFunc).
+// Unit tests of the DNS limiter state collector (T-077): a no-op on nil
+// dependencies, the export of a LimitStats snapshot into the gauges by
+// the kind label, a clean exit on a ctx cancellation. The state source is
+// a closure over a prepared snapshot (LimitStatsFunc).
 package dnsworker
 
 import (
@@ -16,8 +16,8 @@ import (
 	"crawler/internal/metrics"
 )
 
-// limitGaugeValue — значение gauge-метрики name без меток (кроме
-// сервисной): первый ряд семейства.
+// limitGaugeValue — the value of the gauge metric name without labels
+// (except the service one): the first series of the family.
 func limitGaugeValue(t *testing.T, g prometheus.Gatherer, name string) float64 {
 	t.Helper()
 	families, err := g.Gather()
@@ -34,11 +34,12 @@ func limitGaugeValue(t *testing.T, g prometheus.Gatherer, name string) float64 {
 			}
 		}
 	}
-	return -1 // метрика не найдена — тест провалит сравнением
+	return -1 // the metric is not found — the test will fail by comparison
 }
 
 func TestCollectLimitLoopNoop(t *testing.T) {
-	// Без реестра или источника — no-op, не паникует и не регистрирует.
+	// Without a registry or a source — a no-op: no panic, no
+	// registration.
 	if err := CollectLimitLoop(context.Background(), nil, func() dnsclient.LimitStats { return dnsclient.LimitStats{} }, time.Millisecond, nil); err != nil {
 		t.Fatalf("nil-реестр: %v", err)
 	}
@@ -46,8 +47,9 @@ func TestCollectLimitLoopNoop(t *testing.T) {
 	if err := CollectLimitLoop(context.Background(), reg, nil, time.Millisecond, nil); err != nil {
 		t.Fatalf("nil-источник: %v", err)
 	}
-	// Базовые метрики каркаса (service_up, build_info, Go/runtime) в
-	// реестре есть, приборов лимитёра быть не должно.
+	// The service framework's base metrics (service_up, build_info,
+	// Go/runtime) are in the registry; there must be no limiter
+	// instruments.
 	families, err := reg.Gather()
 	if err != nil {
 		t.Fatalf("Gather: %v", err)
@@ -61,7 +63,8 @@ func TestCollectLimitLoopNoop(t *testing.T) {
 
 func TestCollectLimitLoopExportsStats(t *testing.T) {
 	reg := metrics.New("dns-worker")
-	// Снимок «адаптив на дне»: 2/2000, 100/10000, окно 150/200 таймаутов.
+	// A snapshot of "the adaptive at the floor": 2/2000, 100/10000, a
+	// window of 150/200 timeouts.
 	snap := dnsclient.LimitStats{
 		Concurrency:    2,
 		ConcurrencyCfg: 2000,
@@ -79,7 +82,7 @@ func TestCollectLimitLoopExportsStats(t *testing.T) {
 		done <- CollectLimitLoop(ctx, reg, func() dnsclient.LimitStats { return snap }, time.Millisecond, nil)
 	}()
 
-	// Первый проход — сразу при старте: ждём появления значений.
+	// The first pass — right at startup: wait for the values to appear.
 	deadline := time.Now().Add(2 * time.Second)
 	for dnsMetricValue(t, reg, "crawler_dns_limit_concurrency", limitKindEffective) < 0 &&
 		time.Now().Before(deadline) {
@@ -116,8 +119,8 @@ func TestCollectLimitLoopExportsStats(t *testing.T) {
 	}
 }
 
-// TestCollectLimitLoopRatioEmptyWindow — окно ещё наполняется: доля 0,
-// а не паника деления на ноль.
+// TestCollectLimitLoopRatioEmptyWindow — the window is still filling:
+// the share is 0, not a division-by-zero panic.
 func TestCollectLimitLoopRatioEmptyWindow(t *testing.T) {
 	reg := metrics.New("dns-worker")
 	ctx, cancel := context.WithCancel(context.Background())
@@ -126,7 +129,7 @@ func TestCollectLimitLoopRatioEmptyWindow(t *testing.T) {
 	go func() {
 		done <- CollectLimitLoop(ctx, reg, func() dnsclient.LimitStats {
 			return dnsclient.LimitStats{Concurrency: 2000, ConcurrencyCfg: 2000}
-		}, time.Hour, nil) // первый проход — сразу, тики не нужны
+		}, time.Hour, nil) // the first pass — right away; the ticks are not needed
 	}()
 
 	deadline := time.Now().Add(2 * time.Second)

@@ -1,12 +1,13 @@
-// Юнит-тесты записи результата DNS-эпизода и цикла dns-worker (T-039;
-// ТЗ 5.4 пп. 4–5, §7, 3.4; инкремент корзины retry_mature отдельным
-// оператором после записи — T-267; ретрай 40P01 точек записи — T-268) на
-// фейковых пуле, очереди и резолвере — без БД, Redis и сети. Решение
-// статусов (DecideEpisode), точные SQL-тексты и параметры записи, порядок
-// «публикация q:http → запись done», ветка wildcard, ошибки/отмена,
-// идемпотентный повтор пачки (фильтр актуальности) и smoke цикла Run
-// (чтение → эпизоды → XACK). Поведение против живых Redis/PostgreSQL/
-// unbound — интеграционные тесты (T-032, T-040).
+// Unit tests of recording the DNS episode result and of the dns-worker
+// loop (T-039; spec 5.4 items 4–5, §7, 3.4; the retry_mature bucket
+// increment by a separate statement after the write — T-267; the 40P01
+// retry of the write points — T-268) on fake pool, queue and resolver —
+// no DB, Redis or network. The status decision (DecideEpisode), the
+// exact SQL texts and the write parameters, the "publish q:http → write
+// done" order, the wildcard branch, the errors/cancellation, the
+// idempotent batch repeat (the currency filter) and the smoke test of
+// the Run loop (read → episodes → XACK). The behavior against live
+// Redis/PostgreSQL/unbound — integration tests (T-032, T-040).
 package dnsworker
 
 import (
@@ -34,10 +35,11 @@ import (
 	"crawler/internal/queue"
 )
 
-// --- общий протокол событий пула и очереди ------------------------------
+// --- the common protocol of the pool and queue events ---------------------
 
-// resultEventKind — тип события общего протокола (порядок операций
-// «публикация → запись» проверяется по индексам событий).
+// resultEventKind — the type of an event of the common protocol (the
+// order of the "publication → write" operations is checked by the event
+// indexes).
 type resultEventKind string
 
 const (
@@ -49,19 +51,20 @@ const (
 	resultEvConsume   resultEventKind = "consume"
 )
 
-// resultEvent — запись протокола: операция, деталь (SQL/стрим) и аргументы.
+// resultEvent — a protocol record: the operation, the detail (the SQL/the
+// stream) and the arguments.
 type resultEvent struct {
 	kind   resultEventKind
 	detail string
 	args   []any
 }
 
-// resultJournal — потокобезопасный протокол событий (цикл Run работает в
-// горутине, эпизоды — параллельно).
+// resultJournal — a thread-safe event protocol (the Run loop works in a
+// goroutine, the episodes run in parallel).
 type resultJournal struct {
 	mu     sync.Mutex
 	events []resultEvent
-	// ackNotify — неблокирующий сигнал на каждое Ack (синхронизация smoke).
+	// ackNotify — a non-blocking signal per Ack (the smoke sync).
 	ackNotify chan struct{}
 }
 
@@ -79,7 +82,8 @@ func (j *resultJournal) snapshot() []resultEvent {
 	return out
 }
 
-// indexOf возвращает индекс первого события вида (0-based) или −1.
+// indexOf returns the index of the first event of the kind (0-based) or
+// −1.
 func (j *resultJournal) indexOf(k resultEventKind, detail string) int {
 	j.mu.Lock()
 	defer j.mu.Unlock()
@@ -113,10 +117,10 @@ func (j *resultJournal) signalAck() {
 	}
 }
 
-// --- фейковый pgx-пул ----------------------------------------------------
+// --- the fake pgx pool ------------------------------------------------------
 
-// resultFakeRows — pgx.Rows с заготовленными строками; позиционный Scan
-// (стиль enqueueFakeRows).
+// resultFakeRows — pgx.Rows with prepared rows; a positional Scan (the
+// enqueueFakeRows style).
 type resultFakeRows struct {
 	rows    [][]any
 	i       int
@@ -170,35 +174,38 @@ func (r *resultFakeRows) Scan(dest ...any) error {
 func (r *resultFakeRows) Values() ([]any, error) { return r.rows[r.i-1], nil }
 func (r *resultFakeRows) RawValues() [][]byte    { return nil }
 
-// Conn и TypeMap — часть pgx.Rows, не используемая позиционным Scan.
+// Conn and TypeMap — the part of pgx.Rows not used by the positional
+// Scan.
 func (r *resultFakeRows) Conn() *pgx.Conn      { return nil }
 func (r *resultFakeRows) TypeMap() *pgtype.Map { return nil }
 
-// resultFakePool — db.DB без БД: Query различает справочник субдоменов и
-// фильтр пачки по тексту SQL, Exec возвращает заготовленные результаты по
-// очереди (дефолт — UPDATE 1). Всё пишется в общий протокол.
+// resultFakePool — a db.DB without a DB: Query distinguishes the
+// subdomains reference table from the batch filter by the SQL text, and
+// Exec returns the prepared results in order (the default — UPDATE 1).
+// Everything is written into the common protocol.
 type resultFakePool struct {
 	j *resultJournal
 
-	subdomains []model.Subdomain // ответ справочника
-	subsErr    error             // ошибка чтения справочника
+	subdomains []model.Subdomain // the reference table answer
+	subsErr    error             // the reference table read error
 
-	// pending — заготовленные строки фильтра (зона, id, flags); nil —
-	// «зеркало»: актуальны все ключи пачки с чистым битом http_published.
+	// pending — the prepared rows of the filter (zone, id, flags); nil —
+	// "the mirror": all the batch keys are current, with a clean
+	// http_published bit.
 	pending     [][3]any
 	pendingErr  error
 	pendScanErr error
 
-	execTags []pgconn.CommandTag // результат каждого Exec по очереди
-	execErrs []error             // ошибки Exec по очереди
-	execErr  error               // липовая ошибка всех Exec (если задана)
+	execTags []pgconn.CommandTag // the result of each Exec, in order
+	execErrs []error             // the Exec errors, in order
+	execErr  error               // a sticky error of all Exec (if set)
 
 	mu      sync.Mutex
 	execs   []resultExec
 	queries int
 }
 
-// resultExec — записанный вызов Exec.
+// resultExec — a recorded Exec call.
 type resultExec struct {
 	sql  string
 	args []any
@@ -210,10 +217,11 @@ func (p *resultFakePool) CopyFrom(context.Context, pgx.Identifier, []string, pgx
 	return 0, errors.New("resultFakePool: CopyFrom не должен вызываться")
 }
 
-// recordExec — учёт одного оператора записи (T-178: операторы записи
-// результата — CTE с внешним SELECT count, идут через Query; протокол и
-// заготовки тегов/ошибок — общие с Exec): возвращает число переведённых
-// строк (тег «UPDATE N»).
+// recordExec — the accounting of a single write statement (T-178: the
+// result write statements are CTEs with an outer SELECT count, they go
+// through Query; the protocol and the tag/error preparations are common
+// with Exec): returns the number of transitioned rows (an "UPDATE N"
+// tag).
 func (p *resultFakePool) recordExec(sql string, args ...any) (int64, error) {
 	p.mu.Lock()
 	p.execs = append(p.execs, resultExec{sql: sql, args: args})
@@ -263,8 +271,8 @@ func (p *resultFakePool) Query(ctx context.Context, sql string, args ...any) (pg
 		}
 		return resultFakeRowsOf(rows...), nil
 	case resultUpdateStatusSQL, resultUpdateKeepStatusSQL, resultInvalidSQL:
-		// Операторы записи результата (T-178): CTE с внешним SELECT
-		// count(*) — результат одной строкой.
+		// The result write statements (T-178): CTEs with an outer SELECT
+		// count(*) — the result is one row.
 		n, err := p.recordExec(sql, args...)
 		if err != nil {
 			return nil, err
@@ -282,8 +290,9 @@ func (p *resultFakePool) Query(ctx context.Context, sql string, args ...any) (pg
 		if p.pending != nil {
 			rows3 = p.pending
 		} else {
-			// Зеркало: актуальны все ключи пачки (args: []int2, []int8),
-			// бит http_published чист (домен ещё не публиковал).
+			// The mirror: all the batch keys are current (args:
+			// []int2, []int8), the http_published bit is clean (the
+			// domain has not published yet).
 			zones := args[0].([]int16)
 			ids := args[1].([]int64)
 			for i := range zones {
@@ -302,7 +311,7 @@ func (p *resultFakePool) Query(ctx context.Context, sql string, args ...any) (pg
 	}
 }
 
-// resultPoolExecs — снимок вызовов Exec.
+// resultPoolExecs — a snapshot of the Exec calls.
 func (p *resultFakePool) resultPoolExecs() []resultExec {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -311,33 +320,34 @@ func (p *resultFakePool) resultPoolExecs() []resultExec {
 	return out
 }
 
-// --- фейковая очередь ----------------------------------------------------
+// --- the fake queue ---------------------------------------------------------
 
-// resultFakeQueue — queue.Queue: Publish проверяет значения через
-// queue.HTTPTask.Validate-контракт не повторяет — просто типизирует и
-// запоминает; Consume раздаёт заготовленные доставки по одной, исчерпав —
-// ждёт отмены ctx (реальный XREADGROUP блокируется); Ack фиксируется.
+// resultFakeQueue — a queue.Queue: Publish only types and remembers the
+// values — the queue.HTTPTask.Validate contract is not repeated;
+// Consume hands out the prepared deliveries one by one and, once
+// exhausted, waits for the ctx cancellation (a real XREADGROUP blocks);
+// Ack is recorded.
 type resultFakeQueue struct {
 	j *resultJournal
 
 	deliveries []queue.Delivery
-	consumeErr error // липовая ошибка первого чтения
+	consumeErr error // a sticky error of the first read
 
-	publishErrs []error // ошибки Publish по очереди
+	publishErrs []error // the Publish errors, in order
 
 	mu        sync.Mutex
 	publishes []resultPublish
 	acked     []resultAck
 }
 
-// resultPublish — записанная публикация.
+// resultPublish — a recorded publication.
 type resultPublish struct {
 	stream string
 	task   queue.HTTPTask
 	msg    queue.Message
 }
 
-// resultAck — записанное подтверждение.
+// resultAck — a recorded acknowledgment.
 type resultAck struct {
 	stream string
 	group  string
@@ -376,7 +386,7 @@ func (q *resultFakeQueue) Consume(ctx context.Context, stream, group, consumer s
 	}
 	if q.consumeErr != nil {
 		err := q.consumeErr
-		q.consumeErr = nil // однократная: цикл обязан пережить и продолжить
+		q.consumeErr = nil // one-shot: the loop must survive and continue
 		return nil, err
 	}
 	q.mu.Lock()
@@ -394,8 +404,9 @@ func (q *resultFakeQueue) Consume(ctx context.Context, stream, group, consumer s
 	if len(out) > 0 {
 		return out, nil
 	}
-	// Пустое чтение: реальная очередь блокируется в XREADGROUP — фейк
-	// ждёт отмены (smoke-цикл паркуется до конца теста).
+	// An empty read: the real queue blocks in XREADGROUP — the fake
+	// waits for the cancellation (the smoke loop parks until the end of
+	// the test).
 	<-ctx.Done()
 	return nil, ctx.Err()
 }
@@ -430,40 +441,43 @@ func (q *resultFakeQueue) resultAcks() []resultAck {
 	return out
 }
 
-// --- фейковый резолвер ---------------------------------------------------
+// --- the fake resolver --------------------------------------------------------
 
-// resultAnswer — заготовленный ответ на вопрос: Result с кодом и записями
-// либо ошибка обмена (транспорт после ретраев dnsclient).
+// resultAnswer — a prepared answer to a question: a Result with a code
+// and records, or an exchange error (transport after the dnsclient
+// retries).
 type resultAnswer struct {
 	rcode dnsclient.RCode
 	an    []dns.RR
 	err   error
 }
 
-// resultReply — ответ с кодом и секцией answer.
+// resultReply — an answer with a code and an answer section.
 func resultReply(rcode dnsclient.RCode, an ...dns.RR) resultAnswer {
 	return resultAnswer{rcode: rcode, an: an}
 }
 
-// errResultNet — транспортная ошибка (не отмена ctx).
+// errResultNet — a transport error (not a ctx cancellation).
 var errResultNet = errors.New("fake network error")
 
-// resultQKey — ключ вопроса: каноническое имя (строчные, FQDN) и тип.
+// resultQKey — the question key: the canonical name (lowercase, FQDN)
+// and the type.
 type resultQKey struct {
 	name string
 	typ  uint16
 }
 
-// resultFakeResolver — dnsclient.Resolver, отвечающий по имени и типу
-// вопроса (в отличие от сценарного по порядку — эпизод комбинирует апекс,
-// субдомены и wildcard-детект). Записи вида wildcard ищутся по суффиксу
-// зоны: детект-вопрос T-038 несёт случайную метку.
+// resultFakeResolver — a dnsclient.Resolver answering by the name and
+// type of the question (unlike the scenario one, which answers by
+// order — an episode combines the apex, the subdomains and the wildcard
+// detection). Wildcard-like records are looked up by the zone suffix:
+// the T-038 detection question carries a random label.
 type resultFakeResolver struct {
 	mu      sync.Mutex
 	answers map[resultQKey]resultAnswer
-	wild    map[string]resultAnswer // суффикс зоны → ответ <random>.<зона>
+	wild    map[string]resultAnswer // a zone suffix → a <random>.<zone> answer
 	calls   []dnsclient.Question
-	onCall  func(n int) // тест дергает отмену ctx между обменами
+	onCall  func(n int) // the test pulls the ctx cancellation between the exchanges
 }
 
 var _ dnsclient.Resolver = (*resultFakeResolver)(nil)
@@ -475,14 +489,15 @@ func resultNewResolver() *resultFakeResolver {
 	}
 }
 
-// resultSet задаёт точный ответ на вопрос (имя канонизируется).
+// setAnswer sets the exact answer to a question (the name is
+// canonicalized).
 func (f *resultFakeResolver) setAnswer(name string, typ uint16, a resultAnswer) {
 	key := resultQKey{name: strings.ToLower(dns.Fqdn(name)), typ: typ}
 	f.answers[key] = a
 }
 
-// resultSetWild задаёт ответ wildcard-детекта для зоны (suffix — имя
-// домена, например "example.com").
+// setWild sets the wildcard detection answer for a zone (suffix — the
+// domain name, "example.com" for example).
 func (f *resultFakeResolver) setWild(zone string, a resultAnswer) {
 	f.wild[strings.ToLower(dns.Fqdn(zone))] = a
 }
@@ -526,9 +541,10 @@ func (f *resultFakeResolver) resultCalls() []dnsclient.Question {
 	return append([]dnsclient.Question(nil), f.calls...)
 }
 
-// --- помощники сценариев --------------------------------------------------
+// --- scenario helpers --------------------------------------------------------
 
-// resultSubs — справочник: апекс (id 0), www (id 1), admin (id 2).
+// resultSubs — the reference table: the apex (id 0), www (id 1), admin
+// (id 2).
 func resultSubs() []model.Subdomain {
 	return []model.Subdomain{
 		{ID: 0, Label: "", Enabled: true},
@@ -537,8 +553,9 @@ func resultSubs() []model.Subdomain {
 	}
 }
 
-// resultSetDelegated — домен с адресами: апекс A, www CNAME→cdn с A,
-// admin NXDOMAIN, wildcard-детект — NXDOMAIN (wildcard нет).
+// resultSetDelegated — a domain with addresses: an apex A, a www
+// CNAME→cdn with an A, an admin NXDOMAIN, a wildcard detection —
+// NXDOMAIN (no wildcard).
 func resultSetDelegated(f *resultFakeResolver, domain string) {
 	f.setAnswer(domain, dns.TypeA,
 		resultReply(dnsclient.RCodeNOERROR, apexARR(domain+".", "192.0.2.10")))
@@ -549,13 +566,13 @@ func resultSetDelegated(f *resultFakeResolver, domain string) {
 	f.setWild(domain, resultReply(dnsclient.RCodeNXDOMAIN))
 }
 
-// resultSetNXDOMAIN — домен без делегирования (апекс NXDOMAIN).
+// resultSetNXDOMAIN — a non-delegated domain (an apex NXDOMAIN).
 func resultSetNXDOMAIN(f *resultFakeResolver, domain string) {
 	f.setAnswer(domain, dns.TypeA, resultReply(dnsclient.RCodeNXDOMAIN))
 }
 
-// resultSetWildcardZone — домен под wildcard: апекс A, www NODATA (NS
-// подтверждает), admin — адреса wildcard-ответа.
+// resultSetWildcardZone — a domain under a wildcard: an apex A, a www
+// NODATA (an NS confirms), an admin — the wildcard answer's addresses.
 func resultSetWildcardZone(f *resultFakeResolver, domain string) {
 	f.setAnswer(domain, dns.TypeA,
 		resultReply(dnsclient.RCodeNOERROR, apexARR(domain+".", "192.0.2.1")))
@@ -567,7 +584,7 @@ func resultSetWildcardZone(f *resultFakeResolver, domain string) {
 	f.setWild(domain, resultReply(dnsclient.RCodeNOERROR, apexARR("wild."+domain+".", "198.51.100.7")))
 }
 
-// resultDelivery — доставка DNSBatch с task_id и доменами.
+// resultDelivery — a DNSBatch delivery with a task_id and domains.
 func resultDelivery(id string, taskID string, domains ...queue.DNSDomain) queue.Delivery {
 	payload, err := json.Marshal(queue.DNSBatch{TaskID: taskID, Domains: domains})
 	if err != nil {
@@ -576,7 +593,8 @@ func resultDelivery(id string, taskID string, domains ...queue.DNSDomain) queue.
 	return queue.Delivery{Stream: queue.StreamDNS, ID: id, Payload: payload}
 }
 
-// resultWaitAck — ждёт первого Ack в протоколе (smoke-синхронизация).
+// resultWaitAck — waits for the first Ack in the protocol (the smoke
+// sync).
 func resultWaitAck(j *resultJournal, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -588,21 +606,23 @@ func resultWaitAck(j *resultJournal, timeout time.Duration) bool {
 	return false
 }
 
-// --- SQL-контракты ---------------------------------------------------------
+// --- SQL contracts ------------------------------------------------------------
 
-// TestResultSQLContract фиксирует точные тексты операторов записи (стиль
-// dispatch_test: ожидание собирается независимо от прод-кода, литералы —
-// коды схемы ТЗ 6.1/6.2: done = 2, temp_error = 5, deleted = 6; бит
-// http_published = 4, маска снятия — знаковое ~4 = −5, T-108).
+// TestResultSQLContract fixes the exact texts of the write statements
+// (the dispatch_test style: the expectation is assembled independently
+// of the production code; the literals are the schema codes of
+// spec 6.1/6.2: done = 2, temp_error = 5, deleted = 6; the
+// http_published bit = 4, the clear mask is signed ~4 = −5, T-108).
 func TestResultSQLContract(t *testing.T) {
-	// Операторы записи результата — CTE (T-178): предчтение старого
-	// состояния FOR UPDATE, перевод, дельты счётчиков зоны по старому
-	// состоянию; внешний SELECT — счёт переведённых строк. Оператор
-	// строго «domains → zones» (T-267): инкремент корзины зрелости
-	// ретрая (T-202) вынесен отдельным autocommit-оператором
-	// resultMatureIncSQL — нессылаемые DML-CTE зон и счётчика одного
-	// оператора исполняются в непредсказуемом порядке (инцидент 07.11 —
-	// ребро «счётчики → зоны», runbooks.md §2.8).
+	// The result write statements — CTEs (T-178): a FOR UPDATE pre-read
+	// of the old state, the transition, the zone counter deltas by the
+	// old state; the outer SELECT — the count of the transitioned rows.
+	// The statement is strictly "domains → zones" (T-267): the retry
+	// maturity bucket increment (T-202) is moved out into a separate
+	// autocommit statement, resultMatureIncSQL — the unreferenced DML
+	// CTEs of the zones and of the counter in one statement execute in
+	// an unpredictable order (the Nov 07 incident — the edge "counters →
+	// zones", runbooks.md §2.8).
 	const cteTail = "FOR UPDATE), " +
 		"upd AS (UPDATE domains AS t "
 	const cteShift = "FROM s WHERE t.zone_id = s.zone_id AND t.id = s.id " +
@@ -633,10 +653,11 @@ func TestResultSQLContract(t *testing.T) {
 			resultUpdateStatusSQL)
 	}
 
-	// Инкремент корзины зрелости — отдельный autocommit-оператор после
-	// записи (T-267): upsert-паттерн recordRetryMatureBumpSQL HTTP-этапа,
-	// дельта — литерал 1 (один домен на вызов), ключ current_date
-	// вычисляет БД (таймзона согласована с last_checked_at записи).
+	// The maturity bucket increment — a separate autocommit statement
+	// after the write (T-267): the upsert pattern of the HTTP stage's
+	// recordRetryMatureBumpSQL, the delta — the literal 1 (one domain
+	// per call), the current_date key is computed by the DB (the time
+	// zone is aligned with the write's last_checked_at).
 	wantMature := "INSERT INTO crawler_counters (name, value, updated_at) " +
 		"VALUES ('retry_mature:' || to_char(current_date, 'YYYY-MM-DD'), 1, now()) " +
 		"ON CONFLICT (name) DO UPDATE " +
@@ -683,15 +704,16 @@ func TestResultSQLContract(t *testing.T) {
 		t.Errorf("subdomainsSelectSQL = %q, want %q", subdomainsSelectSQL, want)
 	}
 
-	// Литералы текста обязаны следовать за кодами модели: при изменении
-	// кодов/бит тест ловит рассинхронизацию (биты flags — ТЗ 6.1 «…»).
+	// The text literals must follow the model codes: when the codes/bits
+	// change, the test catches the desync (the flags bits — spec 6.1
+	// "…").
 	if int16(model.FlagHTTPPublished) != 4 || int16(^int16(model.FlagHTTPPublished)) != -5 {
 		t.Errorf("бит http_published = %d, маска снятия = %d: обновите литералы wantStatus/wantKeep/wantMark",
 			int16(model.FlagHTTPPublished), int16(^int16(model.FlagHTTPPublished)))
 	}
 }
 
-// --- DecideEpisode ---------------------------------------------------------
+// --- DecideEpisode ------------------------------------------------------------
 
 func TestResultDecideEpisode(t *testing.T) {
 	delegated := &ApexResult{Status: ApexDelegated, Addresses: apexAddrs("192.0.2.10")}
@@ -797,8 +819,9 @@ func TestResultDecideEpisode(t *testing.T) {
 			wantTemp: true,
 		},
 		{
-			// DNS-02: дефект зоны — не сбой резолвера: цикл CNAME на www
-			// постоянен, повторы T-031 ничего не изменят — «адресов нет».
+			// DNS-02: a zone defect is not a resolver failure: the CNAME
+			// loop at www is permanent, the T-031 repeats will change
+			// nothing — "no addresses".
 			name: "адресов нет, цикл CNAME субдомена — delegated_no_address",
 			apex: noAddress,
 			rep: &SubdomReport{Results: []SubdomResult{
@@ -821,8 +844,8 @@ func TestResultDecideEpisode(t *testing.T) {
 			wantSt:  model.StatusDelegatedNoAddress,
 		},
 		{
-			// Транспортный сбой рядом с дефектом зоны всё же temp:
-			// «адресов нет» по молчащему резолверу не выводится.
+			// A transport failure next to a zone defect is still temp:
+			// "no addresses" is not derived from a silent resolver.
 			name: "адресов нет, цикл CNAME и транспорт — temp_error",
 			apex: noAddress,
 			rep: &SubdomReport{Results: []SubdomResult{
@@ -848,8 +871,9 @@ func TestResultDecideEpisode(t *testing.T) {
 			wantTemp: true,
 		},
 		{
-			// DNS-02: дефект зоны у субдомена без адресов не портит итог
-			// нашедшим адреса и не помечает эпизод temp.
+			// DNS-02: a zone defect at a subdomain without addresses does
+			// not spoil the outcome of the one that found addresses and
+			// does not mark the episode temp.
 			name: "адреса есть, у другого субдомена цикл CNAME — без temp",
 			apex: delegated,
 			rep: &SubdomReport{Mask: mustMask(t, 0), Results: []SubdomResult{
@@ -921,7 +945,7 @@ func TestResultDecideEpisode(t *testing.T) {
 	}
 }
 
-// mustMask — маска с битами (падение — ошибка теста).
+// mustMask — a mask with the bits (a failure is a test error).
 func mustMask(t *testing.T, ids ...int) model.DNSMask {
 	t.Helper()
 	m, err := model.NewDNSMask(ids...)
@@ -931,7 +955,7 @@ func mustMask(t *testing.T, ids ...int) model.DNSMask {
 	return m
 }
 
-// --- RecordEpisode ---------------------------------------------------------
+// --- RecordEpisode --------------------------------------------------------------
 
 func TestResultRecordEpisode(t *testing.T) {
 	t.Run("терминальный статус — оператор с status и CASE temp_attempts", func(t *testing.T) {
@@ -993,8 +1017,9 @@ func TestResultRecordEpisode(t *testing.T) {
 		if len(execs[1].args) != 0 {
 			t.Errorf("args инкремента = %v, want пусто (ключ current_date вычисляет БД)", execs[1].args)
 		}
-		// Порядок в протоколе: инкремент строго после записи (T-267) —
-		// счётчик ждёт зафиксированного перехода, не наоборот.
+		// The order in the protocol: the increment strictly after the
+		// write (T-267) — the counter waits for the recorded transition,
+		// not the other way around.
 		ei, ii := j.indexOf(resultEvExec, resultUpdateStatusSQL), j.indexOf(resultEvExec, resultMatureIncSQL)
 		if ei < 0 || ii < 0 || ei > ii {
 			t.Fatalf("порядок нарушен: запись=%d инкремент=%d (нужна запись до инкремента)", ei, ii)
@@ -1069,10 +1094,11 @@ func TestResultRecordEpisode(t *testing.T) {
 	})
 }
 
-// TestResultRecordEpisodeDeadlock — фолт-инъекция 40P01 (T-268): дедлок
-// оператора записи поглощается повтором autocommit-команды как есть —
-// DNS-эпизод не роняется и не переигрывается (XACK доставки пройдёт);
-// после исчерпания попыток ошибка наружу (доставка без XACK, ТЗ 3.4).
+// TestResultRecordEpisodeDeadlock — a 40P01 fault injection (T-268):
+// the write statement's deadlock is absorbed by repeating the
+// autocommit command as is — the DNS episode is neither dropped nor
+// replayed (the delivery's XACK goes through); after the attempts are
+// exhausted, the error goes out (a delivery without XACK, spec 3.4).
 func TestResultRecordEpisodeDeadlock(t *testing.T) {
 	deadlock := &pgconn.PgError{Code: "40P01", Message: "deadlock detected"}
 
@@ -1129,10 +1155,10 @@ func TestResultRecordEpisodeDeadlock(t *testing.T) {
 	})
 }
 
-// TestResultRecordInvalidDeadlock — диагноз invalid под 40P01-ретраем
-// (T-268, тот же resultRetry): дедлок поглощается повтором той же
-// команды — ядовитая строка выводится из цикла переиздания без
-// ределивери доставки.
+// TestResultRecordInvalidDeadlock — the invalid diagnosis under a 40P01
+// retry (T-268, the same resultRetry): the deadlock is absorbed by
+// repeating the same command — the poison row leaves the re-publication
+// loop without a delivery redelivery.
 func TestResultRecordInvalidDeadlock(t *testing.T) {
 	reg := metrics.New("dns-worker")
 	pool := &resultFakePool{j: &resultJournal{},
@@ -1150,14 +1176,16 @@ func TestResultRecordInvalidDeadlock(t *testing.T) {
 	}
 }
 
-// TestResultRunDeadlockAck — критерий приёмки T-268: дедлок записи
-// результата поглощён повтором — доставка q:dns подтверждается (XACK),
-// задача не сгорает в ределивери; метрика растёт.
+// TestResultRunDeadlockAck — the T-268 acceptance criterion: the result
+// write deadlock is absorbed by the retry — the q:dns delivery is
+// acknowledged (XACK), the task does not burn in a redelivery; the
+// metric grows.
 func TestResultRunDeadlockAck(t *testing.T) {
 	reg := metrics.New("dns-worker")
 	j := &resultJournal{ackNotify: make(chan struct{}, 4)}
-	// Порядок Exec (Concurrency 1): пометка публикации → запись; запись
-	// спотыкается о дедлок и повторяется (третий Exec — по умолчанию nil).
+	// The Exec order (Concurrency 1): the publication mark → the write;
+	// the write stumbles on a deadlock and repeats (the third Exec —
+	// nil by default).
 	pool := &resultFakePool{j: j, subdomains: resultSubs(),
 		execErrs: []error{nil, &pgconn.PgError{Code: "40P01", Message: "deadlock detected"}}}
 	q := &resultFakeQueue{j: j, deliveries: []queue.Delivery{
@@ -1202,18 +1230,20 @@ func TestResultRunDeadlockAck(t *testing.T) {
 	}
 }
 
-// --- ProcessDomain ---------------------------------------------------------
+// --- ProcessDomain ------------------------------------------------------------
 
-// TestResultProcessDomainWithAddrs — сквозной эпизод домена с адресами:
-// порядок «публикация q:http → запись done» (§3.4), содержимое задачи
-// (адреса A/AAAA, CNAME апекса и субдоменов), оператор записи без status.
+// TestResultProcessDomainWithAddrs — an end-to-end episode of a domain
+// with addresses: the "publish q:http → write done" order (§3.4), the
+// task contents (the A/AAAA addresses, the apex and subdomain CNAMEs),
+// the write statement without a status.
 func TestResultProcessDomainWithAddrs(t *testing.T) {
 	j := &resultJournal{}
 	pool := &resultFakePool{j: j}
 	q := &resultFakeQueue{j: j}
 	resolve := resultNewResolver()
 	resultSetDelegated(resolve, "example.com")
-	// askAAAA: апекс и www отвечают AAAA (терминальные имена цепочки).
+	// askAAAA: the apex and www answer AAAA (the chain's terminal
+	// names).
 	resolve.setAnswer("example.com", dns.TypeAAAA,
 		resultReply(dnsclient.RCodeNOERROR, apexAAAARR("example.com.", "2001:db8::1")))
 	resolve.setAnswer("cdn.example.com", dns.TypeAAAA,
@@ -1224,8 +1254,9 @@ func TestResultProcessDomainWithAddrs(t *testing.T) {
 		t.Fatalf("ProcessDomain: %v", err)
 	}
 
-	// Порядок: публикация q:http → пометка http_published → запись
-	// (комментарий файла): индекс публикации строго меньше первого Exec.
+	// The order: the q:http publication → the http_published mark → the
+	// write (the file comment): the publication index is strictly less
+	// than the first Exec.
 	if pi, ei := j.indexOf(resultEvPublish, queue.StreamHTTP), j.indexOf(resultEvExec, ""); pi < 0 || ei < 0 || pi > ei {
 		t.Fatalf("порядок нарушен: publish=%d exec=%d (нужна публикация до пометки/записи)", pi, ei)
 	}
@@ -1258,8 +1289,9 @@ func TestResultProcessDomainWithAddrs(t *testing.T) {
 		ZoneID: 3, DomainID: 11, Name: "example.com",
 		Subdomains: []queue.HTTPSubdomain{
 			{SubdomainID: 0, Label: "", Addrs: []string{"192.0.2.10", "2001:db8::1"}},
-			// CNAME — presentation-форма без корневой точки (валидируется
-			// очередью по лимиту 253 октета, T-024).
+			// CNAME — the presentation form without the root dot
+			// (validated by the queue against the 253-octet limit,
+			// T-024).
 			{SubdomainID: 1, Label: "www", Addrs: []string{"203.0.113.5", "2001:db8::2"}, CNAME: "cdn.example.com"},
 		},
 	}
@@ -1271,8 +1303,9 @@ func TestResultProcessDomainWithAddrs(t *testing.T) {
 	}
 }
 
-// TestResultProcessDomainNXDOMAIN — терминальная ветка апекса: субдомены
-// и wildcard не опрашиваются (RFC 8020), записи — status=not_delegated.
+// TestResultProcessDomainNXDOMAIN — a terminal apex branch: the
+// subdomains and the wildcard are not polled (RFC 8020), the write is
+// status=not_delegated.
 func TestResultProcessDomainNXDOMAIN(t *testing.T) {
 	j := &resultJournal{}
 	pool := &resultFakePool{j: j}
@@ -1301,9 +1334,10 @@ func TestResultProcessDomainNXDOMAIN(t *testing.T) {
 	}
 }
 
-// TestResultProcessDomainWildcard — wildcard-зона: admin исключён из
-// задачи (адреса ⊆ wildcard-ответу), апекс идёт всегда; wildcard-детект
-// сбой — продолжение без фильтрации (политика T-038).
+// TestResultProcessDomainWildcard — a wildcard zone: admin is excluded
+// from the task (its addresses ⊆ the wildcard answer), the apex always
+// goes; a wildcard detection failure — a continuation without filtering
+// (the T-038 policy).
 func TestResultProcessDomainWildcard(t *testing.T) {
 	t.Run("детект сработал — исключённые не публикуются, маска полная", func(t *testing.T) {
 		j := &resultJournal{}
@@ -1342,7 +1376,7 @@ func TestResultProcessDomainWildcard(t *testing.T) {
 		q := &resultFakeQueue{j: j}
 		resolve := resultNewResolver()
 		resultSetDelegated(resolve, "flaky.example.com")
-		// Детект-вопрос (случайная метка) — транспортный сбой.
+		// The detection question (a random label) — a transport failure.
 		resolve.setWild("flaky.example.com", resultAnswer{err: errResultNet})
 
 		if err := ProcessDomain(context.Background(), pool, q, resolve,
@@ -1360,10 +1394,11 @@ func TestResultProcessDomainWildcard(t *testing.T) {
 	})
 }
 
-// TestResultProcessDomainErrors — ошибки шагов: сбой публикации — без
-// записи (домен вернётся повторной доставкой); сбой записи — ошибка после
-// публикации (ограниченный дубль задачи, §3.4); отмена ctx — эпизод не
-// завершён, ничего не публикуется и не записывается.
+// TestResultProcessDomainErrors — step errors: a publication failure —
+// without a write (the domain comes back via redelivery); a write
+// failure — an error after the publication (a bounded task duplicate,
+// §3.4); a ctx cancellation — the episode did not finish, nothing is
+// published or written.
 func TestResultProcessDomainErrors(t *testing.T) {
 	t.Run("сбой публикации — без записи", func(t *testing.T) {
 		j := &resultJournal{}
@@ -1432,7 +1467,7 @@ func TestResultProcessDomainErrors(t *testing.T) {
 		resultSetDelegated(resolve, "example.com")
 		ctx, cancel := context.WithCancel(context.Background())
 		resolve.onCall = func(n int) {
-			if n >= 2 { // после апекса, в субдоменах
+			if n >= 2 { // after the apex, in the subdomains
 				cancel()
 			}
 		}
@@ -1458,10 +1493,11 @@ func TestResultProcessDomainErrors(t *testing.T) {
 	})
 }
 
-// --- staging-пометка публикации q:http (T-108) --------------------------------
+// --- the q:http publication staging mark (T-108) --------------------------------
 
-// TestResultMarkHTTPPublished — пометка после публикации: точный SQL
-// (OR бита с сохранением прочих), охраны done/deleted, ошибки, отмена.
+// TestResultMarkHTTPPublished — the mark after the publication: the
+// exact SQL (an OR of the bit with the others preserved), the
+// done/deleted guards, the errors, the cancellation.
 func TestResultMarkHTTPPublished(t *testing.T) {
 	t.Run("ставит бит одним UPDATE", func(t *testing.T) {
 		pool := &resultFakePool{j: &resultJournal{}}
@@ -1515,10 +1551,11 @@ func TestResultMarkHTTPPublished(t *testing.T) {
 	})
 }
 
-// TestResultProcessDomainPublishedSkip — повторная доставка эпизода с
-// опубликованной задачей (бит http_published стоит): публикация
-// пропускается (нет дубля q:http), пометка не повторяется, эпизод доходит
-// до записи — домен получает done (T-108).
+// TestResultProcessDomainPublishedSkip — a redelivery of an episode
+// with an already published task (the http_published bit is set): the
+// publication is skipped (no q:http duplicate), the mark is not
+// repeated, the episode reaches the write — the domain receives done
+// (T-108).
 func TestResultProcessDomainPublishedSkip(t *testing.T) {
 	j := &resultJournal{}
 	pool := &resultFakePool{j: j}
@@ -1528,7 +1565,7 @@ func TestResultProcessDomainPublishedSkip(t *testing.T) {
 
 	dom := PendingDomain{
 		DNSDomain:     queue.DNSDomain{ZoneID: 3, DomainID: 11, Name: "example.com"},
-		HTTPPublished: true, // предыдущая попытка опубликовала, запись не прошла
+		HTTPPublished: true, // the previous attempt published, the write did not go through
 	}
 	if err := ProcessDomain(context.Background(), pool, q, resolve, dom, resultSubs(), false, nil, nil); err != nil {
 		t.Fatalf("ProcessDomain: %v", err)
@@ -1546,12 +1583,14 @@ func TestResultProcessDomainPublishedSkip(t *testing.T) {
 	}
 }
 
-// TestResultProcessDomainMarkFailure — сбой UPDATE пометки после успешной
-// публикации — non-fatal (T-108): эпизод завершается записью, плата —
-// возможный дубль q:http на повторной доставке, не потеря.
+// TestResultProcessDomainMarkFailure — an UPDATE failure of the mark
+// after a successful publication is non-fatal (T-108): the episode
+// finishes with the write, the price is a possible q:http duplicate on
+// redelivery, not a loss.
 func TestResultProcessDomainMarkFailure(t *testing.T) {
 	j := &resultJournal{}
-	// Первый Exec (пометка) падает, запись (второй) — проходит.
+	// The first Exec (the mark) fails, the write (the second) goes
+	// through.
 	pool := &resultFakePool{j: j, execErrs: []error{errors.New("бд моргнула"), nil}}
 	q := &resultFakeQueue{j: j}
 	resolve := resultNewResolver()
@@ -1570,15 +1609,16 @@ func TestResultProcessDomainMarkFailure(t *testing.T) {
 	}
 }
 
-// TestResultProcessDomainMatureFailure — сбой инкремента корзины
-// retry_mature ПОСЛЕ записи — non-fatal (T-267): переход зафиксирован,
-// эпизод завершён (доставка подтверждается), повторная доставка
-// бессильна (охрана done отсечёт оба оператора), корзину ±1 догонит
-// реконсиляция monitor — Warn, а не ошибка эпизода.
+// TestResultProcessDomainMatureFailure — a failure of the retry_mature
+// bucket increment AFTER the write is non-fatal (T-267): the transition
+// is recorded, the episode is finished (the delivery is acknowledged),
+// a redelivery is powerless (the done guard will cut off both
+// statements), the monitor reconciliation will catch the bucket up by
+// ±1 — a Warn, not an episode error.
 func TestResultProcessDomainMatureFailure(t *testing.T) {
 	var buf bytes.Buffer
 	log := slog.New(slog.NewTextHandler(&buf, nil))
-	// SERVFAIL апекса — терминальный temp_error без субдоменов (§7).
+	// An apex SERVFAIL — a terminal temp_error without subdomains (§7).
 	j := &resultJournal{}
 	pool := &resultFakePool{j: j, execErrs: []error{nil, errors.New("бд моргнула")}}
 	q := &resultFakeQueue{j: j}
@@ -1601,12 +1641,13 @@ func TestResultProcessDomainMatureFailure(t *testing.T) {
 	}
 }
 
-// TestResultProcessBatchRedeliveryPartial — сценарий T-108 целиком:
-// первая попытка пачки из трёх делегированных доменов — первый записан,
-// у двух остальных запись упала после публикации (пометка стоит);
-// повторная доставка — записанный отсечён фильтром, опубликованные
-// доводятся до записи БЕЗ повторной публикации (дублей q:http нет),
-// доставка подтверждается (XACK-семантика Processing не меняется).
+// TestResultProcessBatchRedeliveryPartial — the T-108 scenario in full:
+// the first attempt of a batch of three delegated domains — the first
+// is recorded, the write for the other two failed after the publication
+// (the mark is set); the redelivery — the recorded one is cut off by
+// the filter, the published ones are driven to the write WITHOUT a
+// repeated publication (no q:http duplicates), the delivery is
+// acknowledged (the XACK semantics of Processing do not change).
 func TestResultProcessBatchRedeliveryPartial(t *testing.T) {
 	newDelivery := func() queue.Delivery {
 		return resultDelivery("7-1", "task-7",
@@ -1615,9 +1656,9 @@ func TestResultProcessBatchRedeliveryPartial(t *testing.T) {
 			queue.DNSDomain{ZoneID: 3, DomainID: 13, Name: "c.example.com"})
 	}
 
-	// Попытка 1: Concurrency 1 — детерминированный порядок Exec:
-	// a: пометка(0), запись(1); b: пометка(2), запись(3) — сбой;
-	// c: пометка(4), запись(5) — сбой.
+	// Attempt 1: Concurrency 1 — a deterministic Exec order:
+	// a: mark(0), write(1); b: mark(2), write(3) — a failure;
+	// c: mark(4), write(5) — a failure.
 	j := &resultJournal{}
 	q := &resultFakeQueue{j: j}
 	resolve := resultNewResolver()
@@ -1637,9 +1678,9 @@ func TestResultProcessBatchRedeliveryPartial(t *testing.T) {
 		t.Fatalf("публикаций после попытки 1 = %d, want 3 (по одной на домен)", got)
 	}
 
-	// Повторная доставка: a записан (done — фильтр отсекает), b и c —
-	// не записаны с битом http_published (публикация была). Запись БД
-	// восстановлена.
+	// Redelivery: a is recorded (done — the filter cuts it off), b and c
+	// are not recorded, with the http_published bit set (the publication
+	// happened). The DB write is restored.
 	pool2 := &resultFakePool{j: j, subdomains: resultSubs(), pending: [][3]any{
 		{int16(3), int64(12), int16(model.FlagHTTPPublished)},
 		{int16(3), int64(13), int16(model.FlagHTTPPublished)},
@@ -1663,7 +1704,8 @@ func TestResultProcessBatchRedeliveryPartial(t *testing.T) {
 		}
 	}
 
-	// Повтор сделал только записи (без пометок — бит уже стоит).
+	// The repeat only did the writes (without the marks — the bit is
+	// already set).
 	execs := pool2.resultPoolExecs()
 	if len(execs) != 2 {
 		t.Fatalf("Exec повторной доставки = %d, want 2 (только записи)", len(execs))
@@ -1675,7 +1717,7 @@ func TestResultProcessBatchRedeliveryPartial(t *testing.T) {
 	}
 }
 
-// --- PendingDomains / LoadSubdomains ---------------------------------------
+// --- PendingDomains / LoadSubdomains -----------------------------------------
 
 func TestResultPendingDomains(t *testing.T) {
 	t.Run("зеркало — все ключи пачки в её порядке, бит чист", func(t *testing.T) {
@@ -1712,8 +1754,9 @@ func TestResultPendingDomains(t *testing.T) {
 	})
 
 	t.Run("заготовленный фильтр — только недоработанные, с битом публикации", func(t *testing.T) {
-		// a: done — отсечён; b: не записан, бит стоит (опубликован);
-		// c: не записан, бит чист (не доходил до публикации).
+		// a: done — cut off; b: not recorded, the bit is set
+		// (published); c: not recorded, the bit is clean (never reached
+		// the publication).
 		pool := &resultFakePool{j: &resultJournal{}, pending: [][3]any{
 			{int16(3), int64(12), int16(model.FlagHTTPPublished)},
 			{int16(3), int64(13), int16(0)},
@@ -1814,7 +1857,7 @@ func TestResultLoadSubdomains(t *testing.T) {
 	})
 }
 
-// --- Options ---------------------------------------------------------------
+// --- Options ------------------------------------------------------------------
 
 func TestResultOptionsDefaults(t *testing.T) {
 	o := Options{}.withDefaults()
@@ -1846,11 +1889,12 @@ func TestResultRunValidation(t *testing.T) {
 	}
 }
 
-// --- детерминированные состояния пачки (DNS-03) ----------------------------
+// --- the deterministic batch states (DNS-03) ------------------------------------
 
-// TestResultProcessBatchDictStates — пустой, целиком отключённый или
-// кривой справочник subdomains — конфигурация, а не яд: пачка
-// подтверждается без эпизодов, повторная доставка её не крутит.
+// TestResultProcessBatchDictStates — an empty, entirely disabled or
+// malformed subdomains reference table is configuration, not poison:
+// the batch is acknowledged without episodes, a redelivery does not
+// spin it.
 func TestResultProcessBatchDictStates(t *testing.T) {
 	dom := queue.DNSDomain{ZoneID: 3, DomainID: 11, Name: "example.com"}
 	cases := []struct {
@@ -1864,7 +1908,7 @@ func TestResultProcessBatchDictStates(t *testing.T) {
 		}},
 		{"кривая строка справочника", []model.Subdomain{
 			{ID: 0, Label: "", Enabled: true},
-			{ID: 99, Label: "bad", Enabled: true}, // id вне 0..62
+			{ID: 99, Label: "bad", Enabled: true}, // an id outside 0..62
 		}},
 	}
 	for _, tc := range cases {
@@ -1889,12 +1933,13 @@ func TestResultProcessBatchDictStates(t *testing.T) {
 	}
 }
 
-// TestResultProcessBatchPoisonDomain — домен с пустым именем
-// (детерминированная ошибка эпизода) не роняет пачку: терминальный
-// диагноз invalid (T-109) — отдельный оператор по ядовитой строке,
-// остальные домены обрабатываются штатно, доставка подтверждается.
-// Эпизоды параллельны (Concurrency 2): порядок операторов недетерминирован
-// — записи сверяются по domain_id.
+// TestResultProcessBatchPoisonDomain — a domain with an empty name (a
+// deterministic episode error) does not drop the batch: the terminal
+// invalid diagnosis (T-109) — a separate statement for the poison row;
+// the other domains are processed normally, the delivery is
+// acknowledged. The episodes run in parallel (Concurrency 2): the order
+// of the statements is not deterministic — the writes are matched by
+// domain_id.
 func TestResultProcessBatchPoisonDomain(t *testing.T) {
 	j := &resultJournal{}
 	pool := &resultFakePool{j: j, subdomains: resultSubs()}
@@ -1934,9 +1979,10 @@ func TestResultProcessBatchPoisonDomain(t *testing.T) {
 	}
 }
 
-// TestResultProcessBatchPoisonDomainRecordError — сбой записи диагноза
-// invalid — ошибка эпизода: пачка не подтверждается (без XACK), повторная
-// доставка доиграет фиксацию ( идемпотентность охран T-109).
+// TestResultProcessBatchPoisonDomainRecordError — a failure of the
+// invalid diagnosis write is an episode error: the batch is not
+// acknowledged (no XACK), a redelivery will finish the fixation (the
+// guard idempotency of T-109).
 func TestResultProcessBatchPoisonDomainRecordError(t *testing.T) {
 	j := &resultJournal{}
 	pool := &resultFakePool{j: j, subdomains: resultSubs()}
@@ -1953,8 +1999,9 @@ func TestResultProcessBatchPoisonDomainRecordError(t *testing.T) {
 	}
 }
 
-// TestResultRecordInvalid — оператор диагноза ядовитой строки: точный
-// SQL-текст и параметры, охраны (UPDATE 0 — успех), ошибки.
+// TestResultRecordInvalid — the poison row diagnosis statement: the
+// exact SQL text and parameters, the guards (an UPDATE 0 — success),
+// the errors.
 func TestResultRecordInvalid(t *testing.T) {
 	t.Run("оператор с литералом invalid и охранами", func(t *testing.T) {
 		pool := &resultFakePool{j: &resultJournal{}}
@@ -2003,10 +2050,11 @@ func TestResultRecordInvalid(t *testing.T) {
 	})
 }
 
-// --- smoke цикла Run ---------------------------------------------------------
+// --- the smoke test of the Run loop ----------------------------------------------
 
-// TestResultRunSmoke — сквозной цикл: чтение q:dns → справочник → фильтр →
-// эпизоды → публикация q:http → запись → XACK; чистый выход по отмене ctx.
+// TestResultRunSmoke — an end-to-end loop: a q:dns read → the reference
+// table → the filter → the episodes → the q:http publication → the write
+// → XACK; a clean exit on a ctx cancellation.
 func TestResultRunSmoke(t *testing.T) {
 	j := &resultJournal{ackNotify: make(chan struct{}, 4)}
 	pool := &resultFakePool{j: j, subdomains: resultSubs()}
@@ -2039,8 +2087,8 @@ func TestResultRunSmoke(t *testing.T) {
 		t.Fatal("Run не завершился после отмены ctx")
 	}
 
-	// Публикация — только домену с адресами; запись — обоим; пометка —
-	// только опубликованному (example.com).
+	// The publication — only to the domain with addresses; the write —
+	// to both; the mark — only to the published one (example.com).
 	publishes := q.resultPublishes()
 	if len(publishes) != 1 || publishes[0].task.DomainID != 11 ||
 		publishes[0].task.Name != "example.com" {
@@ -2073,17 +2121,17 @@ func TestResultRunSmoke(t *testing.T) {
 	}
 }
 
-// TestResultRunIdempotentRedelivery — повторная доставка уже записанной
-// пачки: фильтр отсекает done-строки — без DNS-обменов и дубликатов
-// q:http, доставка подтверждается.
+// TestResultRunIdempotentRedelivery — a redelivery of an already
+// recorded batch: the filter cuts off the done rows — no DNS exchanges
+// and no q:http duplicates, the delivery is acknowledged.
 func TestResultRunIdempotentRedelivery(t *testing.T) {
 	j := &resultJournal{ackNotify: make(chan struct{}, 4)}
-	pool := &resultFakePool{j: j, subdomains: resultSubs(), pending: [][3]any{}} // всё done/deleted
+	pool := &resultFakePool{j: j, subdomains: resultSubs(), pending: [][3]any{}} // everything is done/deleted
 	q := &resultFakeQueue{j: j, deliveries: []queue.Delivery{
 		resultDelivery("2-1", "task-2",
 			queue.DNSDomain{ZoneID: 3, DomainID: 11, Name: "example.com"}),
 	}}
-	resolve := resultNewResolver() // сценарии не заданы: обмен = ошибка сценария
+	resolve := resultNewResolver() // no scenarios set: an exchange = a scenario error
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -2119,9 +2167,9 @@ func TestResultRunIdempotentRedelivery(t *testing.T) {
 	}
 }
 
-// TestResultRunSurvivesErrors — ошибка обработки (сбой публикации) не
-// останавливает цикл и не подтверждает доставку; следующая обрабатывается;
-// ошибка чтения переживается.
+// TestResultRunSurvivesErrors — a processing error (a publication
+// failure) does not stop the loop and does not acknowledge the delivery;
+// the next one is processed; a read error is survived.
 func TestResultRunSurvivesErrors(t *testing.T) {
 	j := &resultJournal{ackNotify: make(chan struct{}, 4)}
 	pool := &resultFakePool{j: j, subdomains: resultSubs()}
@@ -2132,7 +2180,8 @@ func TestResultRunSurvivesErrors(t *testing.T) {
 			resultDelivery("3-2", "task-4",
 				queue.DNSDomain{ZoneID: 3, DomainID: 32, Name: "gone.example.com"}),
 		},
-		// Первая публикация q:http падает — первая доставка не подтверждается.
+		// The first q:http publication fails — the first delivery is not
+		// acknowledged.
 		publishErrs: []error{errors.New("redis unavailable")},
 	}
 	resolve := resultNewResolver()
@@ -2163,8 +2212,9 @@ func TestResultRunSurvivesErrors(t *testing.T) {
 	if len(acks) != 1 || acks[0].ids[0] != "3-2" {
 		t.Fatalf("XACK = %+v, want только 3-2 (3-1 без XACK — вернётся доставкой)", acks)
 	}
-	// Записан только домен второй доставки; публикация пыталась — один раз
-	// (безуспешно, у gone.example.com адресов нет — публиковать нечего).
+	// Only the domain of the second delivery was recorded; the
+	// publication was attempted — once (unsuccessfully;
+	// gone.example.com has no addresses — nothing to publish).
 	if n := j.count(resultEvExec); n != 1 {
 		t.Errorf("записей %d, want 1", n)
 	}

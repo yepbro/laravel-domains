@@ -1,6 +1,6 @@
-// Тесты wildcard-детекта (T-038). Без сети: резолвер — фейк,
-// реализующий dnsclient.Resolver; RR-конструкторы — в стиле тестов
-// internal/dnsclient.
+// Tests of the wildcard detection (T-038). Without a network: the
+// resolver is a fake implementing dnsclient.Resolver; the RR constructors
+// are in the style of the internal/dnsclient tests.
 
 package dnsworker
 
@@ -17,16 +17,17 @@ import (
 	"crawler/internal/model"
 )
 
-// --- фейковый резолвер -------------------------------------------------------
+// --- the fake resolver --------------------------------------------------------
 
-// wildFakeResolver фиксирует вопросы и отвечает функцией. Тесты
-// однопоточны (DetectWildcard синхронный) — блокировки не нужны.
+// wildFakeResolver records the questions and answers with a function.
+// The tests are single-threaded (DetectWildcard is synchronous) — no
+// locks are needed.
 type wildFakeResolver struct {
 	calls  []dnsclient.Question
 	answer func(q dnsclient.Question) (*dnsclient.Result, error)
 }
 
-// compile-time check: wildFakeResolver — dnsclient.Resolver.
+// compile-time check: wildFakeResolver is a dnsclient.Resolver.
 var _ dnsclient.Resolver = (*wildFakeResolver)(nil)
 
 func (f *wildFakeResolver) Exchange(ctx context.Context, q dnsclient.Question) (*dnsclient.Result, error) {
@@ -58,12 +59,12 @@ func wildCNAME(from, to string) dns.RR {
 	}
 }
 
-// wildMakeResult — итог Exchange с кодом и секцией answer.
+// wildMakeResult — an Exchange outcome with a code and an answer section.
 func wildMakeResult(rcode dnsclient.RCode, an ...dns.RR) *dnsclient.Result {
 	return &dnsclient.Result{RCode: rcode, Answer: an}
 }
 
-// --- генерация случайной метки ----------------------------------------------
+// --- random label generation ---------------------------------------------------
 
 func TestWildRandomLabel(t *testing.T) {
 	seen := make(map[string]bool, 1000)
@@ -80,8 +81,9 @@ func TestWildRandomLabel(t *testing.T) {
 				t.Fatalf("символ %q вне алфавита a-z0-9: %q", c, label)
 			}
 		}
-		// Префикс punycode невозможен (дефиса в алфавите нет), но
-		// инвариант дешёвый — проверяется явно.
+		// The punycode prefix is impossible (there is no hyphen in the
+		// alphabet), but the invariant is cheap — it is checked
+		// explicitly.
 		if strings.HasPrefix(label, "xn--") {
 			t.Fatalf("метка с punycode-префиксом: %q", label)
 		}
@@ -92,11 +94,12 @@ func TestWildRandomLabel(t *testing.T) {
 	}
 }
 
-// --- DetectWildcard ---------------------------------------------------------
+// --- DetectWildcard -------------------------------------------------------------
 
-// TestDetectWildcardZoneWithWildcard — случайное имя получает A-записи:
-// зона под wildcard, адресы перенесены в итог, метка стабильна в вызове
-// (имя вопроса = метка + домен).
+// TestDetectWildcardZoneWithWildcard — the random name receives A
+// records: the zone is under a wildcard, the addresses are carried into
+// the outcome, the label is stable within the call (the question name =
+// the label + the domain).
 func TestDetectWildcardZoneWithWildcard(t *testing.T) {
 	f := &wildFakeResolver{answer: func(q dnsclient.Question) (*dnsclient.Result, error) {
 		return wildMakeResult(dnsclient.RCodeNOERROR,
@@ -123,15 +126,16 @@ func TestDetectWildcardZoneWithWildcard(t *testing.T) {
 	if q.Type != dns.TypeA {
 		t.Fatalf("тип детект-вопроса %v, ожидался A (ТЗ 5.4 п. 3)", dns.TypeToString[q.Type])
 	}
-	// Fqdn (завершающая точка) — дело транспорта dnsclient; фейк видит
-	// имя как передал DetectWildcard.
+	// Fqdn (the trailing dot) is the dnsclient transport's business; the
+	// fake sees the name as DetectWildcard passed it.
 	if want := info.Label + ".example.com"; q.Name != want {
 		t.Fatalf("вопрос %q не совпадает с заявленной меткой (ожидался %q)", q.Name, want)
 	}
 }
 
-// TestDetectWildcardZoneWithoutWildcard — NXDOMAIN на случайное имя:
-// зоны без wildcard, все субдомены честные (детект-отрицание).
+// TestDetectWildcardZoneWithoutWildcard — NXDOMAIN for the random name:
+// no wildcard in the zone, all subdomains genuine (the detection
+// negation).
 func TestDetectWildcardZoneWithoutWildcard(t *testing.T) {
 	f := &wildFakeResolver{answer: func(q dnsclient.Question) (*dnsclient.Result, error) {
 		return wildMakeResult(dnsclient.RCodeNXDOMAIN), nil
@@ -152,8 +156,9 @@ func TestDetectWildcardZoneWithoutWildcard(t *testing.T) {
 	}
 }
 
-// TestDetectWildcardNODATA — NOERROR без A-записей: wildcard без адресов
-// (или NODATA) — сравнивать нечего, итог как без wildcard.
+// TestDetectWildcardNODATA — NOERROR without A records: a wildcard
+// without addresses (or NODATA) — nothing to compare, the outcome as
+// without a wildcard.
 func TestDetectWildcardNODATA(t *testing.T) {
 	f := &wildFakeResolver{answer: func(q dnsclient.Question) (*dnsclient.Result, error) {
 		return wildMakeResult(dnsclient.RCodeNOERROR), nil
@@ -168,8 +173,9 @@ func TestDetectWildcardNODATA(t *testing.T) {
 	}
 }
 
-// TestDetectWildcardCNAMEChain — wildcard-обёртка CNAME: адреса берутся
-// конечные (A цели), сама CNAME-запись в набор не попадает.
+// TestDetectWildcardCNAMEChain — a wildcard wrapped in a CNAME: the
+// terminal addresses are taken (the target's A); the CNAME record itself
+// does not enter the set.
 func TestDetectWildcardCNAMEChain(t *testing.T) {
 	f := &wildFakeResolver{answer: func(q dnsclient.Question) (*dnsclient.Result, error) {
 		return wildMakeResult(dnsclient.RCodeNOERROR,
@@ -189,8 +195,9 @@ func TestDetectWildcardCNAMEChain(t *testing.T) {
 	}
 }
 
-// TestDetectWildcardCNAMEWithoutA — CNAME на имя без A-записей: wildcard
-// адресов не даёт, детект для целей сравнения отрицателен (без ошибки).
+// TestDetectWildcardCNAMEWithoutA — a CNAME to a name without A records:
+// the wildcard gives no addresses, the detection is negative for
+// comparison purposes (without an error).
 func TestDetectWildcardCNAMEWithoutA(t *testing.T) {
 	f := &wildFakeResolver{answer: func(q dnsclient.Question) (*dnsclient.Result, error) {
 		return wildMakeResult(dnsclient.RCodeNOERROR,
@@ -206,9 +213,10 @@ func TestDetectWildcardCNAMEWithoutA(t *testing.T) {
 	}
 }
 
-// TestDetectWildcardServFail — неавторитетный ответ: детект не удался
-// (ошибка, не «успешное отрицание»); проверку домена не роняет —
-// политика потребителя «продолжить без фильтрации» документирована.
+// TestDetectWildcardServFail — a non-authoritative answer: the detection
+// failed (an error, not a "successful negation"); it does not drop the
+// domain check — the consumer's "continue without filtering" policy is
+// documented.
 func TestDetectWildcardServFail(t *testing.T) {
 	f := &wildFakeResolver{answer: func(q dnsclient.Question) (*dnsclient.Result, error) {
 		return wildMakeResult(dnsclient.RCodeSERVFAIL), nil
@@ -226,8 +234,9 @@ func TestDetectWildcardServFail(t *testing.T) {
 	}
 }
 
-// TestDetectWildcardNetworkError — ошибка сети/транспорта прокидывается
-// с сохранением причины; «детект не удался», не паника.
+// TestDetectWildcardNetworkError — a network/transport error is
+// propagated with the cause preserved; "the detection failed", not a
+// panic.
 func TestDetectWildcardNetworkError(t *testing.T) {
 	sentinel := errors.New("резолвер недоступен")
 	f := &wildFakeResolver{answer: func(q dnsclient.Question) (*dnsclient.Result, error) {
@@ -243,9 +252,10 @@ func TestDetectWildcardNetworkError(t *testing.T) {
 	}
 }
 
-// TestDetectWildcardCtxCancelled — отмена контекста: ошибка отмены
-// прокидывается из резолвера без подмены (проверку ctx до транспорта
-// делает dnsclient.Client — детект её не дублирует).
+// TestDetectWildcardCtxCancelled — a context cancellation: the
+// cancellation error is propagated from the resolver without a
+// substitution (the ctx check before the transport is done by
+// dnsclient.Client — the detection does not duplicate it).
 func TestDetectWildcardCtxCancelled(t *testing.T) {
 	f := &wildFakeResolver{answer: func(q dnsclient.Question) (*dnsclient.Result, error) {
 		t.Error("ответ не должен запрашиваться при отменённом ctx")
@@ -263,8 +273,8 @@ func TestDetectWildcardCtxCancelled(t *testing.T) {
 	}
 }
 
-// TestDetectWildcardEmptyDomain — пустое имя домена: ошибка до генерации
-// метки и до обмена.
+// TestDetectWildcardEmptyDomain — an empty domain name: an error before
+// the label generation and before the exchange.
 func TestDetectWildcardEmptyDomain(t *testing.T) {
 	f := &wildFakeResolver{answer: func(q dnsclient.Question) (*dnsclient.Result, error) {
 		t.Error("обмен не должен происходить для пустого домена")
@@ -282,9 +292,9 @@ func TestDetectWildcardEmptyDomain(t *testing.T) {
 	}
 }
 
-// TestDetectWildcardLabelUniqueAndStablePerCall — два детекта дают
-// разные метки (уникальность), и каждая метка действительно та, что
-// ушла в вопрос (стабильность внутри вызова).
+// TestDetectWildcardLabelUniqueAndStablePerCall — two detections give
+// different labels (uniqueness), and each label is really the one that
+// went into the question (stability within a call).
 func TestDetectWildcardLabelUniqueAndStablePerCall(t *testing.T) {
 	f := &wildFakeResolver{answer: func(q dnsclient.Question) (*dnsclient.Result, error) {
 		return wildMakeResult(dnsclient.RCodeNOERROR, wildA(q.Name, "192.0.2.10")), nil
@@ -312,21 +322,21 @@ func TestDetectWildcardLabelUniqueAndStablePerCall(t *testing.T) {
 	}
 }
 
-// --- MarkWildcardSubdomains -------------------------------------------------
+// --- MarkWildcardSubdomains -------------------------------------------------------
 
-// TestMarkWildcardSubdomains — таблица пометки: подмножество/равенство
-// адресов → wildcard; апекс и www — никогда; адрес вне набора или пустые
-// адреса — честный субдомен.
+// TestMarkWildcardSubdomains — the marking table: a subset/equality of
+// the addresses → wildcard; the apex and www — never; an address outside
+// the set or empty addresses — a genuine subdomain.
 func TestMarkWildcardSubdomains(t *testing.T) {
 	wild := []net.IP{net.ParseIP("192.0.2.10"), net.ParseIP("192.0.2.11")}
 	subs := []WildSubdomain{
-		{ID: 0, Label: "", Addrs: wild}, // апекс — исключение ТЗ 5.4 п. 3
+		{ID: 0, Label: "", Addrs: wild}, // the apex — the spec 5.4 item 3 exception
 		{ID: 1, Label: "www", Addrs: wild},
-		{ID: 2, Label: "admin", Addrs: []net.IP{net.ParseIP("192.0.2.10")}},                            // подмножество
-		{ID: 3, Label: "crm", Addrs: []net.IP{net.ParseIP("192.0.2.11"), net.ParseIP("192.0.2.10")}},   // равенство
-		{ID: 4, Label: "api", Addrs: []net.IP{net.ParseIP("192.0.2.10"), net.ParseIP("198.51.100.7")}}, // частичное совпадение
-		{ID: 5, Label: "app", Addrs: []net.IP{net.ParseIP("198.51.100.7")}},                            // всё вне набора
-		{ID: 6, Label: "shop", Addrs: nil},                                                             // без адресов
+		{ID: 2, Label: "admin", Addrs: []net.IP{net.ParseIP("192.0.2.10")}},                            // a subset
+		{ID: 3, Label: "crm", Addrs: []net.IP{net.ParseIP("192.0.2.11"), net.ParseIP("192.0.2.10")}},   // an equality
+		{ID: 4, Label: "api", Addrs: []net.IP{net.ParseIP("192.0.2.10"), net.ParseIP("198.51.100.7")}}, // a partial match
+		{ID: 5, Label: "app", Addrs: []net.IP{net.ParseIP("198.51.100.7")}},                            // everything outside the set
+		{ID: 6, Label: "shop", Addrs: nil},                                                             // no addresses
 	}
 
 	res, err := MarkWildcardSubdomains(wild, subs)
@@ -348,8 +358,8 @@ func TestMarkWildcardSubdomains(t *testing.T) {
 	}
 }
 
-// TestMarkWildcardSubdomainsNoWildcard — пустой набор адресов wildcard
-// (детект отрицателен/не удался): не помечается никто.
+// TestMarkWildcardSubdomainsNoWildcard — an empty set of wildcard
+// addresses (the detection is negative/failed): nobody is marked.
 func TestMarkWildcardSubdomainsNoWildcard(t *testing.T) {
 	subs := []WildSubdomain{
 		{ID: 2, Label: "admin", Addrs: []net.IP{net.ParseIP("192.0.2.10")}},
@@ -363,18 +373,18 @@ func TestMarkWildcardSubdomainsNoWildcard(t *testing.T) {
 		t.Fatalf("без wildcard-адресов маска обязана быть пустой: %v", res.Mask.IDs())
 	}
 
-	// Пустой вход субдоменов — тоже без ошибки.
+	// An empty subdomain input — also without an error.
 	res, err = MarkWildcardSubdomains([]net.IP{net.ParseIP("192.0.2.10")}, nil)
 	if err != nil || !res.Mask.IsEmpty() {
 		t.Fatalf("пустой вход субдоменов: res=%v err=%v", res, err)
 	}
 }
 
-// TestMarkWildcardSubdomainsIPForms — одна точка в 4- и 16-октетной
-// форме — один адрес (net.IP.Equal); IPv6-адрес вне wildcard-набора (A)
-// оставляет субдомен честным.
+// TestMarkWildcardSubdomainsIPForms — one point in the 4- and 16-octet
+// forms is one address (net.IP.Equal); an IPv6 address outside the
+// wildcard set (of A records) leaves the subdomain genuine.
 func TestMarkWildcardSubdomainsIPForms(t *testing.T) {
-	wild := []net.IP{net.ParseIP("192.0.2.10")} // запись A — 4-октетная форма
+	wild := []net.IP{net.ParseIP("192.0.2.10")} // an A record — the 4-octet form
 
 	mapped, err := MarkWildcardSubdomains(wild, []WildSubdomain{
 		{ID: 2, Label: "admin", Addrs: []net.IP{net.ParseIP("192.0.2.10").To16()}},
@@ -386,9 +396,10 @@ func TestMarkWildcardSubdomainsIPForms(t *testing.T) {
 		t.Fatal("16-октетная форма того же адреса обязана совпадать с 4-октетной")
 	}
 
-	// IPv6-адрес не входит в wildcard-набор (детект — A-запрос, ТЗ 5.4
-	// п. 3): двойной стек не помечается и уходит на HTTP — безопасное
-	// направление (лишняя проверка вместо пропущенного сайта).
+	// An IPv6 address is not inside the wildcard set (the detection is an
+	// A query, spec 5.4 item 3): a dual stack is not marked and goes to
+	// HTTP — the safe direction (an extra check instead of a missed
+	// site).
 	dual, err := MarkWildcardSubdomains(wild, []WildSubdomain{
 		{ID: 3, Label: "crm", Addrs: []net.IP{net.ParseIP("192.0.2.10"), net.ParseIP("2001:db8::1")}},
 	})
@@ -400,13 +411,13 @@ func TestMarkWildcardSubdomainsIPForms(t *testing.T) {
 	}
 }
 
-// TestMarkWildcardSubdomainsInvalidID — номер вне 0..62 (модель маски):
-// ошибка, частичная маска не возвращается.
+// TestMarkWildcardSubdomainsInvalidID — a number outside 0..62 (the mask
+// model): an error, a partial mask is not returned.
 func TestMarkWildcardSubdomainsInvalidID(t *testing.T) {
 	wild := []net.IP{net.ParseIP("192.0.2.10")}
 	for _, id := range []int{-1, 63, 100} {
 		res, err := MarkWildcardSubdomains(wild, []WildSubdomain{
-			{ID: 2, Label: "admin", Addrs: wild}, // валидный идёт первым
+			{ID: 2, Label: "admin", Addrs: wild}, // the valid one goes first
 			{ID: id, Label: "broken", Addrs: wild},
 		})
 		if err == nil {
@@ -421,9 +432,10 @@ func TestMarkWildcardSubdomainsInvalidID(t *testing.T) {
 	}
 }
 
-// TestWildScenarioEndToEnd — связка детект + пометка на одном сценарии
-// (зона под wildcard, CNAME-обёртка): половина субдоменов — заглушка,
-// апекс/www и субдомен с собственным адресом идут на HTTP.
+// TestWildScenarioEndToEnd — detection + marking together on one
+// scenario (a zone under a wildcard, a CNAME wrap): half of the
+// subdomains are the stub, the apex/www and the subdomain with its own
+// address go to HTTP.
 func TestWildScenarioEndToEnd(t *testing.T) {
 	f := &wildFakeResolver{answer: func(q dnsclient.Question) (*dnsclient.Result, error) {
 		return wildMakeResult(dnsclient.RCodeNOERROR,
@@ -452,7 +464,8 @@ func TestWildScenarioEndToEnd(t *testing.T) {
 			t.Errorf("субдомен %d: wildcard=%v, ожидалось %v", id, res.IsWildcard(id), want)
 		}
 	}
-	// В маску не попадают и AAAA-адреса цепочки, и CNAME — только A.
+	// Neither the AAAA addresses of the chain nor the CNAME enter the
+	// mask — only the A records.
 	if ids := res.IDs(); len(ids) != 2 || ids[0] != 4 || ids[1] != 5 {
 		t.Fatalf("IDs(): %v, ожидалось [4 5]", ids)
 	}

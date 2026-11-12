@@ -1,7 +1,8 @@
-// Юнит-тесты коллектора переключений DNS на резерв (T-107): no-op на
-// nil-зависимостях, экспорт первого снимка в счётчики, накопление
-// дельтами между проходами и перезапуск источника (отрицательная дельта).
-// Источник состояния — замыкание над мутируемым снимком (FallbackStatsFunc).
+// Unit tests of the DNS fallback switch collector (T-107): a no-op on
+// nil dependencies, the export of the first snapshot into the counters,
+// accumulation by the deltas between passes, and a source restart (a
+// negative delta). The state source is a closure over a mutable snapshot
+// (FallbackStatsFunc).
 
 package dnsworker
 
@@ -18,8 +19,8 @@ import (
 	"crawler/internal/metrics"
 )
 
-// fallbackCounterValue — значение counter-метрики name (без меток, кроме
-// сервисной): первый ряд семейства.
+// fallbackCounterValue — the value of the counter metric name (without
+// labels except the service one): the first series of the family.
 func fallbackCounterValue(t *testing.T, g prometheus.Gatherer, name string) float64 {
 	t.Helper()
 	families, err := g.Gather()
@@ -36,11 +37,11 @@ func fallbackCounterValue(t *testing.T, g prometheus.Gatherer, name string) floa
 			}
 		}
 	}
-	return -1 // метрика не найдена — тест провалит сравнением
+	return -1 // the metric is not found — the test will fail by comparison
 }
 
-// mutateStats — мутируемый источник снимков: коллектор в фоне, тест
-// меняет значения между проходами.
+// mutateStats — a mutable snapshot source: the collector runs in the
+// background, the test changes the values between the passes.
 type mutateStats struct {
 	mu  sync.Mutex
 	val dnsclient.FallbackStats
@@ -59,7 +60,8 @@ func (m *mutateStats) get() dnsclient.FallbackStats {
 }
 
 func TestCollectFallbackLoopNoop(t *testing.T) {
-	// Без реестра или источника — no-op, не паникует и не регистрирует.
+	// Without a registry or a source — a no-op: no panic, no
+	// registration.
 	if err := CollectFallbackLoop(context.Background(), nil, func() dnsclient.FallbackStats { return dnsclient.FallbackStats{} }, time.Millisecond, nil); err != nil {
 		t.Fatalf("nil-реестр: %v", err)
 	}
@@ -88,13 +90,14 @@ func TestCollectFallbackLoopExportsAndDeltas(t *testing.T) {
 		done <- CollectFallbackLoop(ctx, reg, src.get, time.Millisecond, nil)
 	}()
 
-	// Первый проход — сразу при старте: снимок {5, 2}.
+	// The first pass — right at startup: the snapshot {5, 2}.
 	waitFor(t, func() bool {
 		return fallbackCounterValue(t, reg, "crawler_dns_fallback_switches_total") == 5 &&
 			fallbackCounterValue(t, reg, "crawler_dns_fallback_exhausted_total") == 2
 	})
 
-	// Источник накопил ещё: счётчики растут дельтой, а не переприсваиваются.
+	// The source accumulated more: the counters grow by a delta rather
+	// than being reassigned.
 	src.set(dnsclient.FallbackStats{Switches: 8, Exhausted: 3})
 	waitFor(t, func() bool {
 		return fallbackCounterValue(t, reg, "crawler_dns_fallback_switches_total") == 8 &&
@@ -112,9 +115,9 @@ func TestCollectFallbackLoopExportsAndDeltas(t *testing.T) {
 	}
 }
 
-// TestCollectFallbackLoopSourceRestart — счётчик источника «уменьшился»
-// (цепь пересоздали): прометеевский счётчик монотонен, добавляется
-// значение нового снимка целиком (5 → 3 даёт 5+3).
+// TestCollectFallbackLoopSourceRestart — the source counter "went
+// down" (the chain was recreated): a Prometheus counter is monotonic,
+// so the value of the new snapshot is added in full (5 → 3 yields 5+3).
 func TestCollectFallbackLoopSourceRestart(t *testing.T) {
 	reg := metrics.New("dns-worker")
 	src := &mutateStats{}
@@ -139,7 +142,8 @@ func TestCollectFallbackLoopSourceRestart(t *testing.T) {
 	<-done
 }
 
-// waitFor — опрос условия до 2 с (коллектор тикает в фоне).
+// waitFor — polling of the condition for up to 2 s (the collector ticks
+// in the background).
 func waitFor(t *testing.T, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)

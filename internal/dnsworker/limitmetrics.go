@@ -1,16 +1,18 @@
-// Коллектор состояния лимитёра DNS (T-077, ТЗ 5.9): периодический съём
-// LimitResolver.Stats в gauges — адаптивное снижение параллелизма/QPS по
-// доле таймаутов (T-035, ТЗ 5.4) обязано быть наблюдаемым. Без экспорта
-// конвейер мог бы молча работать на 1 % плановой мощности (резолвер
-// таймаутит, лимиты на «дне»), а Prometheus показывал бы только рост
-// глубины q:dns и доли temp_error — без причины.
+// Collector of the DNS limiter state (T-077, spec 5.9): periodic polling
+// of LimitResolver.Stats into gauges — the adaptive downscaling of
+// concurrency/QPS by the timeout share (T-035, spec 5.4) must be
+// observable. Without the export, the pipeline could silently run at 1%
+// of its planned capacity (the resolver times out, the limits are at the
+// floor) while Prometheus would show only the growth of the q:dns depth
+// and of the temp_error share — with no cause.
 //
-// Архитектурно — по образцу коллектора глубины очередей
-// (metrics.CollectQueueLoop): цикл живёт в сервисе-носителе лимитёра
-// (dns-worker), источник состояния внедряется функцией LimitStatsFunc
-// (метод Stats декоратора) — пакет не создаёт обратных зависимостей
-// dnsclient → metrics. Данные и приборы разделены как в dnsclient:
-// LimitStats — снимок без метрик, сюда — только экспорт.
+// Architecturally — modeled on the queue depth collector
+// (metrics.CollectQueueLoop): the loop lives in the service carrying the
+// limiter (dns-worker), the state source is injected as the
+// LimitStatsFunc (the Stats method of the decorator) — the package does
+// not create reverse dependencies dnsclient → metrics. Data and
+// instruments are separated as in dnsclient: LimitStats is a snapshot
+// without metrics, and this file is export only.
 package dnsworker
 
 import (
@@ -24,29 +26,30 @@ import (
 	"crawler/internal/metrics"
 )
 
-// DefaultLimitCollectInterval — период съёма состояния лимитёра: как у
-// коллектора очередей, равен типовому интервалу скрейпа Prometheus
-// (dev-конфиг deploy/docker/prometheus) — каждый скрейп видит свежее
-// значение, чаще незачем: адаптив меняет лимиты на масштабе окна обменов,
-// а не миллисекунд.
+// DefaultLimitCollectInterval — the limiter state polling period: like
+// the queue collector, it equals the typical Prometheus scrape interval
+// (dev config deploy/docker/prometheus) — every scrape sees a fresh
+// value, and there is no reason to poll more often: the adaptive changes
+// the limits on the scale of an exchange window, not milliseconds.
 const DefaultLimitCollectInterval = 15 * time.Second
 
-// Значения метки kind: configured — настроенные потолки (dns.concurrency,
-// dns.max_qps, ТЗ 5.10), effective — действующие после адаптива. Пара рядов
-// в одной метрике даёт PromQL-готовую долю деградации:
+// The values of the kind label: configured — the configured caps
+// (dns.concurrency, dns.max_qps, spec 5.10), effective — the actual ones
+// after the adaptive downscaling. The pair of series in one metric gives
+// a PromQL-ready degradation share:
 // crawler_dns_limit_qps{kind="effective"} / {kind="configured"}.
 const (
 	limitKindEffective  = "effective"
 	limitKindConfigured = "configured"
 )
 
-// LimitStatsFunc — источник состояния лимитёра: удовлетворяется методом
-// Stats декоратора *dnsclient.LimitResolver (значение метода); юнит-тесты
-// подменяют замыканием над заготовленным снимком.
+// LimitStatsFunc — the source of the limiter state: satisfied by the
+// Stats method of the *dnsclient.LimitResolver decorator (a method
+// value); unit tests substitute a closure over a prepared snapshot.
 type LimitStatsFunc func() dnsclient.LimitStats
 
-// limitGauges — приборы коллектора (создаются один раз, значения
-// перезаписываются каждым проходом).
+// limitGauges — the collector instruments (created once, the values are
+// overwritten by every pass).
 type limitGauges struct {
 	concurrency *prometheus.GaugeVec // crawler_dns_limit_concurrency{kind}
 	qps         *prometheus.GaugeVec // crawler_dns_limit_qps{kind}
@@ -54,9 +57,10 @@ type limitGauges struct {
 	inflight    prometheus.Gauge     // crawler_dns_inflight
 }
 
-// newLimitGauges регистрирует приборы в реестре reg; nil — nil (сервис
-// без реестра — изолированные сборки — коллектор не поднимается).
-// Идемпотентен (T-076): повторный вызов делит те же векторы.
+// newLimitGauges registers the instruments in the reg registry; nil in —
+// nil out (a service without a registry — isolated builds — has no
+// collector). Idempotent (T-076): a repeated call shares the same
+// vectors.
 func newLimitGauges(reg *metrics.Registry) *limitGauges {
 	if reg == nil {
 		return nil
@@ -81,7 +85,7 @@ func newLimitGauges(reg *metrics.Registry) *limitGauges {
 	}
 }
 
-// collectLimitPass — один проход: снимок источника → значения gauges.
+// collectLimitPass — one pass: a source snapshot → the gauge values.
 func collectLimitPass(g *limitGauges, stats LimitStatsFunc) {
 	st := stats()
 	g.concurrency.WithLabelValues(limitKindEffective).Set(float64(st.Concurrency))
@@ -89,20 +93,20 @@ func collectLimitPass(g *limitGauges, stats LimitStatsFunc) {
 	g.qps.WithLabelValues(limitKindEffective).Set(st.QPS)
 	g.qps.WithLabelValues(limitKindConfigured).Set(st.QPSCfg)
 	ratio := 0.0
-	if st.WindowSize > 0 { // окно наполняется — доля по набранному
+	if st.WindowSize > 0 { // the window is filling — the share per what has been collected
 		ratio = float64(st.WindowTimeouts) / float64(st.WindowSize)
 	}
 	g.ratio.Set(ratio)
 	g.inflight.Set(float64(st.InFlight))
 }
 
-// CollectLimitLoop — периодический цикл съёма состояния лимитёра DNS:
-// первый проход сразу при старте, далее по ticker с периодом interval
-// (0 — DefaultLimitCollectInterval). Отмена ctx — чистый выход (graceful
-// shutdown, ТЗ 3.4); nil-зависимости — no-op: сервис без реестра не
-// должен падать на старте. Работает до отмены ctx и возвращает nil —
-// тот же контракт, что у metrics.CollectQueueLoop (фоновый коллектор
-// сервиса, T-012).
+// CollectLimitLoop — the periodic loop polling the DNS limiter state:
+// the first pass runs immediately at startup, then on a ticker with the
+// interval period (0 — DefaultLimitCollectInterval). A ctx cancellation
+// is a clean exit (graceful shutdown, spec 3.4); nil dependencies are a
+// no-op: a service without a registry must not crash at startup. Runs
+// until ctx is cancelled and returns nil — the same contract as
+// metrics.CollectQueueLoop (the service's background collector, T-012).
 func CollectLimitLoop(
 	ctx context.Context,
 	reg *metrics.Registry,
@@ -111,7 +115,7 @@ func CollectLimitLoop(
 	log *slog.Logger,
 ) error {
 	if stats == nil {
-		return nil // раньше регистрации: приборы не плодятся без источника
+		return nil // before registration: no instruments without a source
 	}
 	g := newLimitGauges(reg)
 	if g == nil {

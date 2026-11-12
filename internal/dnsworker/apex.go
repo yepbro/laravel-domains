@@ -1,32 +1,37 @@
-// Dns-worker: проверка апекса домена (T-036; ТЗ 5.4 п. 1, §6.2, §7).
+// Dns-worker: domain apex check (T-036; spec 5.4 item 1, §6.2, §7).
 //
-// CheckApex — первый шаг DNS-этапа алгоритма ТЗ §7: запрос A апекса и
-// классификация ответа по веткам §6.2. Здесь только запросы через
-// dnsclient.Resolver и классификация: запись статуса/domains.dns_mask и
-// публикация q:http — T-039; субдомены (A/AAAA/CNAME) и wildcard-детект —
-// T-037/T-038, они наращивают конвейер после апекса.
+// CheckApex is the first step of the spec §7 DNS stage algorithm: an A
+// query for the apex and classification of the response into §6.2
+// branches. Only queries via dnsclient.Resolver and classification live
+// here: writing the status/domains.dns_mask and publishing q:http is
+// T-039; subdomains (A/AAAA/CNAME) and wildcard detection are
+// T-037/T-038 — they extend the pipeline after the apex.
 //
-// Решения классификации (зафиксированы по ТЗ):
+// Classification decisions (fixed per the spec):
 //
-//   - NXDOMAIN — единственный источник not_delegated: §6.2 прямо
-//     определяет статус как «апекс NXDOMAIN», RFC 8020 распространяет
-//     отрицательный ответ резолвера на всё поддерево имён — субдомены и
-//     wildcard не запрашиваются (ApexStatus.Stop, «дальше не идти»);
-//   - SERVFAIL, REFUSED и прочие коды (FORMERR, NOTIMP, …), а также сеть
-//     после исчерпания ретраев dnsclient → temp_error: резолвер не
-//     ответил о зоне. REFUSED — заявление резолвера о себе (ACL, лимит
-//     запросов, перегрузка), а не об отсутствии делегирования: ложный
-//     терминальный not_delegated по вине резолвера исключён, temp_error
-//     возвращает домен в повтор (T-031);
-//   - отмена/дедлайн ctx — ошибка вызывающему, а не итог домена: эпизод
-//     не завершён, задача вернётся доставкой (lease/XAUTOCLAIM, ТЗ 3.4);
-//   - AAAA апекса не запрашивается: ТЗ 5.4 п. 2 относит AAAA к субдоменам
-//     (там же апекс — метка "", T-037); адреса этого шага — IPv4 из
-//     A-записей апекса.
+//   - NXDOMAIN is the only source of not_delegated: §6.2 defines the
+//     status explicitly as "apex NXDOMAIN"; RFC 8020 extends the
+//     resolver's negative answer to the whole subtree of names —
+//     subdomains and the wildcard are not queried (ApexStatus.Stop,
+//     "do not proceed");
+//   - SERVFAIL, REFUSED and other codes (FORMERR, NOTIMP, …), as well as
+//     a network failure after dnsclient retries are exhausted →
+//     temp_error: the resolver did not answer about the zone. REFUSED is
+//     the resolver speaking about itself (ACL, query rate limit,
+//     overload), not about the absence of delegation: a false terminal
+//     not_delegated caused by the resolver is ruled out; temp_error
+//     returns the domain to retry (T-031);
+//   - ctx cancellation/deadline is an error for the caller, not the
+//     domain's outcome: the episode did not finish, the task comes back
+//     via delivery (lease/XAUTOCLAIM, spec 3.4);
+//   - the apex AAAA is not queried: spec 5.4 item 2 assigns AAAA to
+//     subdomains (there the apex is label "", T-037); the addresses of
+//     this step are IPv4 from the apex A records.
 //
-// NS «при необходимости» (§5.4 п. 1): пока A отвечает адресами, NS не
-// нужен; NS запрашивается только при пустом A (NODATA) и подтверждает
-// существование зоны — ветка «есть NS/ответ, но нет A/AAAA» §5.4 п. 5.
+// NS "when needed" (§5.4 item 1): while A answers with addresses, NS is
+// not needed; NS is queried only on an empty A (NODATA) and confirms the
+// zone exists — the "NS/response present, no A/AAAA" branch of §5.4
+// item 5.
 
 package dnsworker
 
@@ -43,45 +48,48 @@ import (
 	"crawler/internal/model"
 )
 
-// ErrEmptyDomain — пустое/пробельное имя домена в пачке q:dns (мусорная
-// или порченая строка domains). Ошибка детерминирована: повторная
-// доставка не изменит исход, поэтому цикл воркера фиксирует её
-// терминальным диагнозом invalid (RecordInvalid, T-109), не роняя пачку
-// (DNS-03): строка выводится из цикла переиздания, а не возвращается
-// lease-проходом бесконечно.
+// ErrEmptyDomain — an empty/whitespace domain name in a q:dns batch (a
+// junk or corrupted domains string). The error is deterministic:
+// redelivery will not change the outcome, so the worker loop records it
+// with the terminal invalid diagnosis (RecordInvalid, T-109) instead of
+// dropping the batch (DNS-03): the row leaves the re-publication loop
+// instead of coming back with every lease pass.
 var ErrEmptyDomain = errors.New("dnsworker: пустое имя домена — апекс обязателен")
 
-// ApexStatus — ветка классификации ответа апекса (ТЗ 5.4 п. 1, §6.2, §7).
-// Имена веток, совпадающих со статусами домена ТЗ 6.2, — имена статусов;
-// ApexDelegated — промежуточный итог (финальный статус ставит HTTP-этап).
+// ApexStatus — a branch of the apex response classification (spec 5.4
+// item 1, §6.2, §7). Branch names that coincide with the domain statuses
+// of spec 6.2 are the status names; ApexDelegated is an intermediate
+// outcome (the final status is set by the HTTP stage).
 type ApexStatus int8
 
 const (
-	// ApexDelegated — NOERROR, в ответе есть A-записи: апекс делегирован,
-	// адреса есть («есть адреса → q:http», §7). Конвейер продолжается:
-	// субдомены (T-037), wildcard (T-038), запись результата (T-039);
-	// адреса — вход HTTP-этапа (§5.4 п. 4, §5.5 п. 2).
+	// ApexDelegated — NOERROR with A records in the response: the apex is
+	// delegated, addresses exist ("addresses → q:http", §7). The pipeline
+	// continues: subdomains (T-037), wildcard (T-038), recording the
+	// result (T-039); the addresses are the HTTP stage input (§5.4
+	// item 4, §5.5 item 2).
 	ApexDelegated ApexStatus = iota
-	// ApexDelegatedNoAddress — NOERROR без A-записей (NODATA): имя
-	// существует, адресов у апекса нет; зону подтверждает NS-запрос
-	// («есть NS/ответ, но нет A/AAAA», §5.4 п. 5). Отдельная ветка по §7
-	// («нет адресов → delegated_no_address»), но итоговый статус решает
-	// T-039: адреса могут найтись у субдоменов (T-037), конвейер
-	// продолжается.
+	// ApexDelegatedNoAddress — NOERROR without A records (NODATA): the
+	// name exists, the apex has no addresses; an NS query confirms the
+	// zone ("NS/response present, no A/AAAA", §5.4 item 5). A separate
+	// branch per §7 ("no addresses → delegated_no_address"), but the
+	// final status is decided by T-039: addresses may be found at
+	// subdomains (T-037), the pipeline continues.
 	ApexDelegatedNoAddress
-	// ApexNotDelegated — NXDOMAIN апекса: статус not_delegated (§6.2),
-	// субдомены и wildcard не проверяются — RFC 8020 (NXDOMAIN доказывает
-	// отсутствие всего поддерева имён). См. Stop.
+	// ApexNotDelegated — apex NXDOMAIN: status not_delegated (§6.2),
+	// subdomains and the wildcard are not checked — RFC 8020 (NXDOMAIN
+	// proves the absence of the whole subtree of names). See Stop.
 	ApexNotDelegated
-	// ApexTempError — SERVFAIL, REFUSED, иной код ответа либо сеть после
-	// ретраев dnsclient: статус temp_error (§6.2, «требуется повтор»),
-	// эпизод повторится целиком (T-031). Субдомены не проверяются.
+	// ApexTempError — SERVFAIL, REFUSED, another response code, or a
+	// network failure after dnsclient retries: status temp_error (§6.2,
+	// "a retry is required"), the episode repeats in full (T-031).
+	// Subdomains are not checked.
 	ApexTempError
 )
 
-// String возвращает имя ветки классификации ("delegated",
-// "delegated_no_address", "not_delegated", "temp_error"); для кода вне
-// перечня — "ApexStatus(<код>)".
+// String returns the name of the classification branch ("delegated",
+// "delegated_no_address", "not_delegated", "temp_error"); for a code
+// outside the list — "ApexStatus(<code>)".
 func (s ApexStatus) String() string {
 	switch s {
 	case ApexDelegated:
@@ -97,22 +105,24 @@ func (s ApexStatus) String() string {
 	}
 }
 
-// Stop — явный признак «дальше не идти» (ТЗ 5.4 п. 1): NXDOMAIN завершает
-// DNS-этап домена — субдомены (T-037) и wildcard (T-038) не проверяются
-// (RFC 8020: отрицательный ответ резолвера распространяется на всё
-// поддерево); temp_error тоже останавливает эпизод — при неотвечающем
-// резолвере проверка субдоменов бессмысленна, повтор назначается целиком
-// (T-031). Ветки делегирования продолжают конвейер (false).
+// Stop — an explicit "do not proceed" sign (spec 5.4 item 1): NXDOMAIN
+// ends the domain's DNS stage — subdomains (T-037) and the wildcard
+// (T-038) are not checked (RFC 8020: the resolver's negative answer
+// extends to the whole subtree); temp_error also stops the episode —
+// with an unresponsive resolver, checking subdomains is pointless, and
+// the retry is scheduled for the episode in full (T-031). The delegation
+// branches continue the pipeline (false).
 func (s ApexStatus) Stop() bool {
 	return s == ApexNotDelegated || s == ApexTempError
 }
 
-// DomainStatus возвращает код domains.status (ТЗ 6.2) для терминальных
-// веток апекса: ApexNotDelegated → StatusNotDelegated (NXDOMAIN, RFC
-// 8020), ApexTempError → StatusTempError. Для веток делегирования итог
-// на этом шаге не решен — false: адреса субдоменов (T-037) дают либо
-// задачу q:http, либо статус delegated_no_address (§5.4 п. 5, §7) —
-// запись выполняет T-039.
+// DomainStatus returns the domains.status code (spec 6.2) for the
+// terminal apex branches: ApexNotDelegated → StatusNotDelegated
+// (NXDOMAIN, RFC 8020), ApexTempError → StatusTempError. For the
+// delegation branches the outcome is not decided at this step — false:
+// the subdomain addresses (T-037) yield either a q:http task or the
+// delegated_no_address status (§5.4 item 5, §7); T-039 performs the
+// write.
 func (s ApexStatus) DomainStatus() (model.Status, bool) {
 	switch s {
 	case ApexNotDelegated:
@@ -124,34 +134,39 @@ func (s ApexStatus) DomainStatus() (model.Status, bool) {
 	}
 }
 
-// ApexResult — структурированный итог проверки апекса: классификация,
-// адреса апекса и признак подтверждающего NS-запроса. Запись в БД и
-// публикация q:http — T-039; здесь только результат запросов.
+// ApexResult — the structured outcome of the apex check: the
+// classification, the apex addresses, and the flag of the confirming NS
+// query. The DB write and the q:http publication are T-039; here only
+// the query results.
 type ApexResult struct {
-	// Status — ветка классификации (см. ApexStatus).
+	// Status — the classification branch (see ApexStatus).
 	Status ApexStatus
-	// Addresses — IPv4-адреса A-записей апекса в порядке ответа; вход
-	// HTTP-этапа (§5.4 п. 4, §5.5 п. 2). Непуста только для ApexDelegated
-	// (AAAA апекса — T-037, NS-записи адресами не являются).
+	// Addresses — the IPv4 addresses of the apex A records in response
+	// order; the HTTP stage input (§5.4 item 4, §5.5 item 2). Non-empty
+	// only for ApexDelegated (the apex AAAA is T-037; NS records are not
+	// addresses).
 	Addresses []netip.Addr
-	// NSQueried — выполнялся ли подтверждающий NS-запрос (только ветка
-	// NODATA, §5.4 п. 1) — диагностика и обоснование
-	// ApexDelegatedNoAddress для логов T-039.
+	// NSQueried — whether the confirming NS query ran (the NODATA branch
+	// only, §5.4 item 1) — diagnostics and justification of
+	// ApexDelegatedNoAddress for the T-039 logs.
 	NSQueried bool
 }
 
-// CheckApex проверяет апекс домена (ТЗ 5.4 п. 1): запрос A, при пустом
-// ответе — подтверждающий NS, и классификация итога по §6.2/§7.
+// CheckApex checks the domain apex (spec 5.4 item 1): an A query, a
+// confirming NS query on an empty response, and classification of the
+// outcome per §6.2/§7.
 //
-// domain — полное имя домена в punycode, как в сообщении q:dns (ТЗ 5.2);
-// завершающая точка не обязательна (приводится к FQDN). Ветвление и
-// признаки — в комментарии пакета и ApexStatus; результат не пишется
-// в БД — запись статуса, dns_mask и публикация q:http — T-039.
+// domain is the full domain name in punycode, as in the q:dns message
+// (spec 5.2); the trailing dot is optional (normalized to FQDN). The
+// branching and the flags are described in the package comment and
+// ApexStatus; the result is not written to the DB — the status write,
+// dns_mask and the q:http publication are T-039.
 //
-// Ошибка возвращается только для детерминированных отказов: пустое имя
-// домена и отмена/дедлайн ctx. Ошибки сети после ретраев dnsclient
-// (контракт T-034: ошибка = попытки исчерпаны) и любые коды ответа —
-// ветки классификации (ApexTempError), а не ошибка.
+// An error is returned only for deterministic failures: an empty domain
+// name and ctx cancellation/deadline. Network errors after dnsclient
+// retries (the T-034 contract: an error means attempts exhausted) and
+// any response codes are classification branches (ApexTempError), not
+// errors.
 func CheckApex(ctx context.Context, r dnsclient.Resolver, domain string) (*ApexResult, error) {
 	fqdn, err := apexFQDN(domain)
 	if err != nil {
@@ -161,7 +176,7 @@ func CheckApex(ctx context.Context, r dnsclient.Resolver, domain string) (*ApexR
 		return nil, err
 	}
 
-	// Шаг 1 — A апекса (ТЗ 5.4 п. 1).
+	// Step 1 — the apex A (spec 5.4 item 1).
 	res, err := r.Exchange(ctx, dnsclient.Question{Name: fqdn, Type: dns.TypeA})
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
@@ -174,19 +189,20 @@ func CheckApex(ctx context.Context, r dnsclient.Resolver, domain string) (*ApexR
 		if addrs := apexAAddresses(res); len(addrs) > 0 {
 			return &ApexResult{Status: ApexDelegated, Addresses: addrs}, nil
 		}
-		// NODATA: имя существует (NOERROR — RFC 2308), адресов нет;
-		// делегирование подтверждает NS-запрос (шаг 2).
+		// NODATA: the name exists (NOERROR — RFC 2308), no addresses;
+		// the NS query (step 2) confirms the delegation.
 	case dnsclient.RCodeNXDOMAIN:
-		// Домен не делегирован; поддерево не существует (RFC 8020) —
-		// субдомены и wildcard не проверяются, NS не нужен.
+		// The domain is not delegated; the subtree does not exist
+		// (RFC 8020) — subdomains and the wildcard are not checked, NS
+		// is not needed.
 		return &ApexResult{Status: ApexNotDelegated}, nil
 	default:
-		// SERVFAIL, REFUSED, FORMERR, NOTIMP и прочие — резолвер не
-		// ответил о зоне: повтор эпизода (T-031).
+		// SERVFAIL, REFUSED, FORMERR, NOTIMP and others — the resolver
+		// did not answer about the zone: repeat the episode (T-031).
 		return &ApexResult{Status: ApexTempError}, nil
 	}
 
-	// Шаг 2 — NS «при необходимости» (ТЗ 5.4 п. 1): только когда A пуст.
+	// Step 2 — NS "when needed" (spec 5.4 item 1): only when A is empty.
 	ns, err := r.Exchange(ctx, dnsclient.Question{Name: fqdn, Type: dns.TypeNS})
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
@@ -197,30 +213,34 @@ func CheckApex(ctx context.Context, r dnsclient.Resolver, domain string) (*ApexR
 	out := &ApexResult{Status: ApexDelegatedNoAddress, NSQueried: true}
 	switch ns.RCode {
 	case dnsclient.RCodeNOERROR:
-		// Зона (или имя) существует: «есть NS/ответ, но нет A/AAAA»
-		// (§5.4 п. 5) — адресов нет и у апекса (шаг 1); NS-записи сами
-		// по себе адресами не являются. Финальный статус — T-039 по
-		// итогам субдоменов (§7): даже без адресов у апекса субдомены
-		// (например www) могут дать адреса и задачу q:http.
+		// The zone (or the name) exists: "NS/response present, no
+		// A/AAAA" (§5.4 item 5) — the apex has no addresses either
+		// (step 1); NS records are not addresses by themselves. The
+		// final status is T-039 based on the subdomain outcomes (§7):
+		// even without apex addresses, subdomains (www, for example)
+		// may yield addresses and a q:http task.
 	case dnsclient.RCodeNXDOMAIN:
-		// Более свежий отрицательный ответ противоречит NOERROR шага 1 —
-		// регистрация исчезла между запросами; последнее слово резолвера:
-		// имени нет (RFC 8020), субдомены не проверяются.
+		// A fresher negative answer contradicts the NOERROR of step 1 —
+		// the registration disappeared between the queries; the
+		// resolver has the last word: the name does not exist
+		// (RFC 8020), the subdomains are not checked.
 		out.Status = ApexNotDelegated
 	default:
-		// SERVFAIL/REFUSED/… и на NS — резолвер не ответил, temp_error.
+		// SERVFAIL/REFUSED/… on NS too — the resolver did not answer:
+		// temp_error.
 		out.Status = ApexTempError
 	}
 	return out, nil
 }
 
-// apexFQDN приводит имя домена к FQDN вопроса miekg/dns: завершающая
-// точка (dns.Fqdn идемпотентна — уже приведённое имя не меняется).
-// dnsclient.Exchange добавляет точку сам; здесь контракт фиксируется
-// явно — вопрос всегда уходит в канонической форме. Проверка минимальна:
-// имя обязано быть непустым и не корневой зоной; глубокая валидация —
-// территория internal/idn на входе в систему (ТЗ 5.2), из q:dns имя
-// приходит уже нормализованным (T-024).
+// apexFQDN normalizes the domain name to the miekg/dns question FQDN:
+// a trailing dot (dns.Fqdn is idempotent — an already normalized name is
+// unchanged). dnsclient.Exchange appends the dot itself; the contract is
+// fixed explicitly here — the question always goes out in canonical
+// form. The check is minimal: the name must be non-empty and not the
+// root zone; deep validation is the territory of internal/idn at system
+// input (spec 5.2); the name arrives from q:dns already normalized
+// (T-024).
 func apexFQDN(domain string) (string, error) {
 	name := dns.Fqdn(strings.TrimSpace(domain))
 	if name == "." {
@@ -229,12 +249,13 @@ func apexFQDN(domain string) (string, error) {
 	return name, nil
 }
 
-// apexAAddresses собирает IPv4-адреса A-записей ответа в порядке
-// следования. RecordsOf фильтрует по типу; цепочку CNAME разворачивает
-// рекурсор (Unbound) и приносит целевые A-записи в ту же секцию answer —
-// разворачивание вручную — территория субдоменов (T-037). Записи без
-// валидного IPv4 пропускаются: в ответе исправного резолвера их не
-// бывает, страховка от мусора не роняет классификацию (ветка NODATA).
+// apexAAddresses collects the IPv4 addresses of the response A records in
+// answer order. RecordsOf filters by type; the CNAME chain is unwound by
+// the recursing resolver (Unbound), which brings the target A records
+// into the same answer section — unwinding manually is subdomain
+// territory (T-037). Records without a valid IPv4 are skipped: a healthy
+// resolver's response contains none, and this safety net against junk
+// does not break the classification (the NODATA branch).
 func apexAAddresses(res *dnsclient.Result) []netip.Addr {
 	rrs := res.RecordsOf(dns.TypeA)
 	if len(rrs) == 0 {

@@ -1,90 +1,104 @@
-// Запись результата DNS-эпизода и рабочий цикл dns-worker (T-039; ТЗ 5.4
-// пп. 4–5, §7, 6.1, 6.2, 3.4). Файл замыкает конвейер этапа: эпизод
-// (CheckApex T-036 → CheckSubdomains T-037 → DetectWildcard T-038)
-// превращается в запись domains и — при найденных адресах — в задачу
-// q:http (формат T-024), а цикл Run собирает всё это на потреблении
-// пачек q:dns (T-024/T-025). Сборка сервиса — cmd/dns-worker.
+// Recording the DNS episode result and the dns-worker working loop
+// (T-039; spec 5.4 items 4–5, §7, 6.1, 6.2, 3.4). The file closes the
+// stage pipeline: an episode (CheckApex T-036 → CheckSubdomains T-037 →
+// DetectWildcard T-038) turns into a domains row and — when addresses
+// are found — into a q:http task (the T-024 format), and the Run loop
+// assembles all of that on the consumption of q:dns batches
+// (T-024/T-025). The service assembly — cmd/dns-worker.
 //
-// Статусы по §7 (решения зафиксированы по тексту ТЗ):
+// Statuses per §7 (the decisions fixed per the spec text):
 //
-//   - NXDOMAIN апекса → status = not_delegated, эпизод done (§5.4 п. 1,
-//     RFC 8020): субдомены не проверялись, маска обнуляется — хранится
-//     только последний результат (§3.5);
-//   - SERVFAIL/таймаут апекса → status = temp_error, done: повтор
-//     назначит планировщик (T-031 по temp_error_retry_after);
-//   - адреса есть (маска без wildcard-исключений непуста, §5.4 п. 5) →
-//     задача q:http, done; терминальный статус НЕ пишется: alive/no_http
-//     — итог HTTP-этапа (§6.2), домен сохраняет прежний статус (для
-//     первой проверки — new) до его завершения. Аналог T-030: статус
-//     хранит итог прошлой проверки, check_state — состояние цикла;
-//   - адресов нет → status = delegated_no_address, done («есть NS/ответ,
-//     но нет A/AAAA у ни одного субдомена», §5.4 п. 5). Сюда же угловой
-//     случай «резолвятся только wildcard-синтезированные имена»: все
-//     DNS-живые субдомены объяснены wildcard-ом (кроме апекса/www,
-//     T-038), публиковать пустую q:http нельзя (контракт T-024) —
-//     HTTP-проверимых имён нет, что по смыслу и есть «нет адресов»;
-//     dns_mask при этом честно хранит резолвящиеся биты (§5.4 п. 4:
-//     бит — «резолвящийся субдомен», wildcard-фильтр исключает из
-//     HTTP-проверки, не из маски);
-//   - сбой резолвера по субдомену (транспорт после ретраев, SERVFAIL,
-//     иные коды, кроме NOERROR/NXDOMAIN) при найденных адресах — эпизод
-//     завершается задачей q:http по частичному итогу (T-037: итог по
-//     каждому субдомену отдельно; потерянное имя покроет регулярная
-//     перепроверка T-030), без адресов — temp_error: классифицировать
-//     «нет адресов» по молчащему резолверу нельзя (ложный терминальный
-//     статус), повтор T-031 перепроверит эпизод. Дефекты самой зоны —
-//     цикл и превышение глубины CNAME (ErrSubdomCNAMELoop/Depth) — сбоям
-//     не ровня: резолвер ответил, сломано у домена; итог субдомена
-//     «адресов нет» без temp_error (sentinel-ошибки разбираются
-//     errors.Is, T-037).
+//   - an apex NXDOMAIN → status = not_delegated, the episode done
+//     (§5.4 item 1, RFC 8020): subdomains were not checked, the mask is
+//     zeroed — only the last result is stored (§3.5);
+//   - an apex SERVFAIL/timeout → status = temp_error, done: the
+//     scheduler will schedule the retry (T-031 by
+//     temp_error_retry_after);
+//   - addresses present (the mask without wildcard exclusions is
+//     non-empty, §5.4 item 5) → a q:http task, done; a terminal status
+//     is NOT written: alive/no_http — the HTTP stage outcome (§6.2),
+//     and the domain keeps its previous status (new for the first
+//     check) until that stage finishes. An analogue of T-030: the
+//     status stores the outcome of the past check, check_state — the
+//     state of the loop;
+//   - no addresses → status = delegated_no_address, done ("an NS/an
+//     answer is present, but no A/AAAA at any subdomain", §5.4 item 5).
+//     The corner case "only wildcard-synthesized names resolve" lands
+//     here too: all DNS-live subdomains are explained by the wildcard
+//     (except the apex/www, T-038), publishing an empty q:http is not
+//     allowed (the T-024 contract) — there are no HTTP-checkable names,
+//     which in meaning is exactly "no addresses"; dns_mask still
+//     honestly stores the resolving bits (§5.4 item 4: a bit is "a
+//     resolving subdomain", the wildcard filter excludes from the HTTP
+//     check, not from the mask);
+//   - a subdomain resolver failure (transport after retries, SERVFAIL,
+//     other codes besides NOERROR/NXDOMAIN) with addresses found — the
+//     episode finishes with a q:http task on the partial outcome
+//     (T-037: an outcome per subdomain separately; the lost name will
+//     be covered by the regular T-030 recheck), without addresses —
+//     temp_error: "no addresses" cannot be classified from a silent
+//     resolver (a false terminal status), and the T-031 retry will
+//     recheck the episode. Defects of the zone itself — a CNAME loop
+//     and a depth overrun (ErrSubdomCNAMELoop/Depth) — are not the
+//     peers of failures: the resolver answered, the domain is what is
+//     broken; the subdomain outcome is "no addresses" without
+//     temp_error (the sentinel errors are parsed with errors.Is,
+//     T-037).
 //
-// Порядок «публикация q:http → запись done» (§3.4, в духе T-028:
-// PostgreSQL — источник истины, done — точка фиксации эпизода):
+// The "publish q:http → write done" order (§3.4, in the spirit of
+// T-028: PostgreSQL is the source of truth, done is the episode's
+// commit point):
 //
-//   - задача q:http публикуется ДО перевода домена в done. Сбой записи
-//     после публикации оставляет домен queued и доставку q:dns без XACK
-//     (Processing, T-025): повторная доставка повторит эпизод, но задача
-//     не теряется. Обратный порядок при сбое публикации оставлял бы
-//     домен done без задачи q:http навсегда (HTTP-этап не начнётся,
-//     фильтр актуальности отбрасывает done-строки, чинила бы только
-//     перепроверка T-030 — полгода) — отвергнут ревью DNS-04 и
-//     перепроверен для Q-02: RecoverLoop возвращает только зависшие
-//     доставки, состояние строки ему не изменить;
-//   - единица повтора сужена до домена (DNS-04, T-108): сразу после
-//     успешной публикации q:http эпизод ставит staging-пометку
-//     http_published (бит 2 domains.flags, модель model.Flags — как
-//     render_pending T-066; без миграции: ТЗ 6.1 оставляет биты flags
-//     открытыми, «…»). Повторная доставка пачки читает бит фильтром
-//     актуальности и НЕ публикует q:http повторно — только доходит до
-//     записи (DNS-эпизод повторяется: результат не хранился нигде,
-//     §3.5, а задачи q:http на стороне потребителя дедупликации не
-//     имеет — дубль = полная повторная HTTP-проверка). До T-108 один
-//     сбой записи стоил до redis.max_attempts × |пачка| повторных
-//     эпизодов и дублей q:http по опубликовавшим доменам; теперь дубль
-//     возможен только в окне между XADD и постановкой бита (краш воркера
-//     или отказ БД в одном UPDATE) и в межэпизодных гонках lease
-//     (существовали и до T-108). Формализованная спецификация бита
-//     (состояния, 4 перехода, окно дубля) — таблица у
-//     resultMarkPublishedSQL (T-257, ТЗ tasks/TZ-fsm.md §3 ФТ-3);
-//   - снятие бита: записью результата (тот же UPDATE — done ⇒ бит чист)
-//     и постановкой планировщика (pending → queued, T-028: каждый
-//     новый эпизод начинается с чистого бита — единая точка сброса
-//     закрывает и lease-возврат T-029, и воскрешение T-018, и
-//     перепроверку T-030 без правки каждого прохода). На done/pending
-//     строке бит может остаться выставленным до следующей постановки —
-//     читает его только фильтр пачки (done отсечён), значения вне
-//     эпизода бит не имеет;
-//   - постановка бита — non-fatal: отказ UPDATE после публикации не
-//     роняет эпизод (запись результата важнее), повторная доставка в
-//     этом случае публикует дубль — цена окна, а не потеря;
-//   - из инварианта «done ⇒ задача опубликована» фильтр актуальности
-//     выводит идемпотентность: повторная доставка пачки обрабатывает
-//     только недоработанные домены (не done и не deleted), уже
-//     записанные пропускаются без DNS-обмена и без дубликата q:http.
+//   - the q:http task is published BEFORE the domain is moved to done.
+//     A write failure after the publication leaves the domain queued
+//     and the q:dns delivery without XACK (Processing, T-025): a
+//     redelivery will repeat the episode, but the task is not lost. The
+//     reverse order would leave the domain done without a q:http task
+//     forever on a publication failure (the HTTP stage would never
+//     start, the currency filter drops done rows, only the T-030
+//     recheck would fix it — half a year later) — rejected by the
+//     DNS-04 review and rechecked for Q-02: RecoverLoop returns only
+//     the stuck deliveries, it cannot change a row's state;
+//   - the unit of retry is narrowed to the domain (DNS-04, T-108):
+//     right after a successful q:http publication the episode sets the
+//     http_published staging mark (bit 2 of domains.flags, the
+//     model.Flags model — like render_pending T-066; without a
+//     migration: spec 6.1 leaves the flags bits open, "…"). A batch
+//     redelivery reads the bit with the currency filter and does NOT
+//     publish q:http again — it only reaches the write (the DNS episode
+//     repeats: the result was not stored anywhere, §3.5, and q:http
+//     tasks have no deduplication on the consumer side — a duplicate =
+//     a full repeated HTTP check). Before T-108, a single write failure
+//     cost up to redis.max_attempts × |batch| repeated episodes and
+//     q:http duplicates for the already published domains; now a
+//     duplicate is possible only in the window between the XADD and
+//     setting the bit (a worker crash or a DB failure in one UPDATE)
+//     and in the cross-episode lease races (they existed before T-108
+//     too). The formalized bit specification (states, 4 transitions,
+//     the duplicate window) — the table at resultMarkPublishedSQL
+//     (T-257, spec tasks/TZ-fsm.md §3 FR-3);
+//   - clearing the bit: by the result write (the same UPDATE — done ⇒
+//     the bit is clean) and by the scheduler enqueue (pending → queued,
+//     T-028: every new episode starts with a clean bit — the single
+//     reset point also covers the lease return of T-029, the
+//     resurrection of T-018 and the recheck of T-030 without editing
+//     every pass). On a done/pending row the bit may stay set until the
+//     next enqueue — only the batch filter reads it (done is cut off),
+//     outside the episode the bit has no value;
+//   - setting the bit is non-fatal: an UPDATE failure after the
+//     publication does not drop the episode (the result write matters
+//     more); in that case a redelivery publishes a duplicate — the
+//     price of the window, not a loss;
+//   - from the invariant "done ⇒ the task is published" the currency
+//     filter derives idempotency: a batch redelivery processes only the
+//     unfinished domains (not done and not deleted); the already
+//     recorded ones are skipped without a DNS exchange and without a
+//     q:http duplicate.
 //
-// Wildcard-детект (T-038) при сбое не роняет эпизод: продолжение без
-// фильтрации — несколько лишних HTTP-запросов к заглушке; temp_error
-// для домена не нужен (апекс уже классифицирован, T-036).
+// Wildcard detection (T-038) does not drop the episode on a failure:
+// continuing without filtering — a few extra HTTP requests to the stub;
+// temp_error for the domain is not needed (the apex is already
+// classified, T-036).
 
 package dnsworker
 
@@ -108,85 +122,95 @@ import (
 	"crawler/internal/queue"
 )
 
-// SQL записи результата. Один оператор на домен (стиль охран T-029/
-// T-030): охраны перепроверяют состояние строки на момент блокировки —
-// удалённый во время проверки домен не перезаписывается (§13.1, §8:
-// «результат не записывается (проверка статуса при записи)»), уже
-// записанный результат не затирается повторной доставкой (идемпотентность
-// ТЗ 3.4). Коды схемы — литералами, а не данными (стиль dispatchZoneSQL,
-// T-027); last_checked_at = now() — время сервера БД (T-028), колонка
-// date получает дату приведением присваивания.
+// The result SQL. One statement per domain (the guard style of T-029/
+// T-030): the guards recheck the row state at the moment of locking —
+// a domain deleted during the check is not overwritten (§13.1, §8:
+// "the result is not written (a status check at write time)"), and an
+// already recorded result is not overwritten by a redelivery (the
+// idempotency of spec 3.4). Schema codes — as literals, not data (the
+// dispatchZoneSQL style, T-027); last_checked_at = now() is the DB
+// server time (T-028), the date column receives the date by the
+// assignment cast.
 //
-// Переходы check_state здесь — строки Р2/Р3/Р4/Р13 спецификации
-// автомата (единая точка правды: internal/scheduler/checkstate.go,
-// T-255).
+// The check_state transitions here are rows R2/R3/R4/R13 of the machine
+// specification (the single point of truth:
+// internal/scheduler/checkstate.go, T-255).
 //
-// # Таблица решений DNS-этапа автомата status (T-256, ТЗ-fsm §3 ФТ-2)
+// # The DNS stage decision table of the status machine (T-256, the TZ-fsm spec §3 FR-2)
 //
-// Общая часть (все этапы и писатели) — одной таблицей в
-// internal/model/enums.go у кодов model.Status; здесь — развёртка
-// DNS-веток (О2–О6, О10 общей таблицы) с привязкой к операторам и
-// входам. Решение принимает чистая функция DecideEpisode (таблица —
-// её контракт, покрыта юнит-тестом TestResultDecideEpisode):
+// The common part (all stages and writers) — one table in
+// internal/model/enums.go at the model.Status codes; here — the
+// expansion of the DNS branches (O2–O6, O10 of the common table) bound
+// to the statements and inputs. The decision is made by the pure
+// function DecideEpisode (the table is its contract, covered by the
+// TestResultDecideEpisode unit test):
 //
-//	| Ветка | Вход эпизода | Решение EpisodeResult | Оператор записи |
+//	| Branch | Episode input | EpisodeResult decision | Write statement |
 //	|-------|--------------|----------------------|-----------------|
-//	| С1 (О2) | апекс NXDOMAIN | SetStatus: not_delegated; маска пуста, субдомены не проверялись (RFC 8020) | resultUpdateStatusSQL |
-//	| С2 (О3) | апекс SERVFAIL/таймаут | SetStatus: temp_error; маска пуста, субдомены не проверялись | resultUpdateStatusSQL |
-//	| С3 (О6) | HTTP-набор после wildcard-фильтра непуст (частичный сбой субдоменов задачу не рушит, T-037) | SetStatus = false: статус решит HTTP-этап (О7–О9), домен сохраняет прежний (первая проверка — new); публикация q:http | resultUpdateKeepStatusSQL |
-//	| С4 (О4) | HTTP-набор пуст, сбоев резолвера нет (все NOERROR/NXDOMAIN — NXDOMAIN субдомена авторитетен; дефекты зоны — цикл/глубина CNAME — не сбой; wildcard-only — «адресов нет») | SetStatus: delegated_no_address | resultUpdateStatusSQL |
-//	| С5 (О5) | HTTP-набор пуст, был сбой резолвера (транспорт после ретраев либо код вне NOERROR/NXDOMAIN) | SetStatus: temp_error — «нет адресов» по молчащему резолверу не выводится (ложный терминальный статус) | resultUpdateStatusSQL |
-//	| С6 (О10) | ядовитая строка: ErrEmptyDomain (пустое имя) | SetStatus: invalid — вне DecideEpisode, диагноз ставит RecordInvalid (T-109) | resultInvalidSQL |
+//	| S1 (O2) | apex NXDOMAIN | SetStatus: not_delegated; mask empty, subdomains not checked (RFC 8020) | resultUpdateStatusSQL |
+//	| S2 (O3) | apex SERVFAIL/timeout | SetStatus: temp_error; mask empty, subdomains not checked | resultUpdateStatusSQL |
+//	| S3 (O6) | the HTTP set is non-empty after the wildcard filter (a partial subdomain failure will not sink the task, T-037) | SetStatus = false: the status will be decided by the HTTP stage (O7–O9), the domain keeps its previous one (the first check — new); the q:http publication | resultUpdateKeepStatusSQL |
+//	| S4 (O4) | the HTTP set is empty, no resolver failures (all NOERROR/NXDOMAIN — a subdomain NXDOMAIN is authoritative; zone defects — a CNAME loop/depth — are not a failure; wildcard-only — "no addresses") | SetStatus: delegated_no_address | resultUpdateStatusSQL |
+//	| S5 (O5) | the HTTP set is empty, there was a resolver failure (transport after retries or a code outside NOERROR/NXDOMAIN) | SetStatus: temp_error — "no addresses" is not derived from a silent resolver (a false terminal status) | resultUpdateStatusSQL |
+//	| S6 (O10) | poison row: ErrEmptyDomain (an empty name) | SetStatus: invalid — outside DecideEpisode, the diagnosis is set by RecordInvalid (T-109) | resultInvalidSQL |
 //
-// Асимметрии зафиксированы в общей таблице (model/enums.go): temp_error
-// без адресов зреет к финализации А1 у планировщика (retry), прочие
-// ветки терминальны сами. Аномалия «статус повис» — С3 без HTTP-итога
-// (status = new ∧ check_state = done) — наблюдаема gauge'ом ФТ-2.2
-// (спецификация — model/enums.go).
+// The asymmetries are recorded in the common table (model/enums.go):
+// temp_error without addresses ripens toward the scheduler's A1
+// finalization (retry); the other branches are terminal by themselves.
+// The "stuck status" anomaly — S3 without an HTTP outcome
+// (status = new ∧ check_state = done) — is observable by the gauge of
+// FR-2.2 (the specification — model/enums.go).
 //
-// Дельты счётчиков зон (T-178, ревью P1-1): DNS-этап — главный переход
-// queued/pending → done конвейера, оператор ведёт domains_queued/
-// domains_pending −n и domains_checked +n по старому состоянию строки
-// (ТЗИ §6.1.2: предикат check_state <> done не пинирует старое —
-// предчтение FOR UPDATE в CTE s той же транзакции-оператора). Домен в
-// pending (lease вернул посреди эпизода) корректно даёт pending −1 /
-// checked +1. RowsAffected счётчика зоны отдельно не проверяется: строки
-// зон создаются ingest'ом раньше доменов (EnsureZone, T-014).
+// Zone counter deltas (T-178, review P1-1): the DNS stage is the main
+// queued/pending → done transition of the pipeline; the statement keeps
+// domains_queued/domains_pending −n and domains_checked +n by the old
+// row state (the incremental-counters spec §6.1.2: the check_state <>
+// done predicate does not pin the old state — the FOR UPDATE pre-read
+// in the CTE s of the same statement-transaction). A domain in pending
+// (the lease returned it mid-episode) correctly yields pending −1 /
+// checked +1. RowsAffected of the zone counter is not checked
+// separately: zone rows are created by ingest before the domains
+// (EnsureZone, T-014).
 //
-// temp_attempts (T-031): счётчик повторов сбрасывается в 0 на каждом
-// не-temp_error итоге — новый эпизод временной ошибки начинается с чистого
-// счётчика (контракт T-031 возложен на DNS-этап); temp_error сохраняет
-// накопленное — наращивает планировщик при назначении повтора.
+// temp_attempts (T-031): the retry counter is reset to 0 on every
+// non-temp_error outcome — a new temporary-error episode starts with a
+// clean counter (the T-031 contract is assigned to the DNS stage);
+// temp_error keeps the accumulated value — the scheduler increments it
+// when scheduling the retry.
 //
-// queued_at = NULL завершает lease вместе с эпизодом: ненулевая отметка
-// остаётся только у queued-строк (инвариант T-018/T-029/T-030).
+// queued_at = NULL ends the lease together with the episode: a non-null
+// stamp remains only at queued rows (the T-018/T-029/T-030 invariant).
 //
-// flags: оба оператора снимают бит http_published (T-108) — done-строка
-// всегда чиста от staging-пометки; прочие биты (is_idn, render_pending)
-// сохраняются знаковой маской ~бита (побитовые операторы PG повышают
-// smallint до int — возврат ::int2, стиль renderq.go T-066).
+// flags: both statements clear the http_published bit (T-108) — a done
+// row is always clean of the staging mark; the other bits (is_idn,
+// render_pending) are preserved by the sign mask ~bit (PG bitwise
+// operators promote smallint to int — hence the ::int2 cast, the
+// renderq.go style of T-066).
 var (
-	// resultUpdateStatusSQL — терминальный статус DNS-эпизода
-	// (not_delegated / temp_error / delegated_no_address). Внешний
-	// SELECT — число фактически переведённых строк (идемпотентность
-	// повторной доставки: охрана отсекла — 0). Оператор строго
-	// «domains → zones» (T-267): инкремент корзины зрелости ретрая
-	// crawler_counters['retry_mature: сутки'] (T-202) выведен из него
-	// отдельным autocommit-оператором resultMatureIncSQL — порядок
-	// исполнения нессылаемых DML-CTE одного оператора PostgreSQL не
-	// гарантирует (оговорка в monitor/zonestats.go), на проде 07.11
-	// CTE rm/zc исполнились инверсно (rm → zc): оператор держал строку
-	// счётчика и ждал зону — ребро «счётчики → зоны» против http-worker
-	// RecordAndPublish (держит зоны до Commit, ждёт retry_mature:today)
-	// замыкало цикл дедлока 40P01 (~3–4/ч; разбор — runbooks.md §2.8).
-	// SERVFAIL-ветка апекса и temp_error-итог без адресов — полноправные
-	// источники temp_error-эпизодов (массовый DNS-инцидент 24.10 оставил
-	// 491 тыс. доменов именно через эту ветку), их эпизоды зреют к
-	// полуночи и обязаны попадать в корзину тем же ключом, что пишет
-	// HTTP-этап (current_date записи) — иначе guard ретрая недоучитывал
-	// бы DNS-когорту; декремент той же корзины — планировщик
-	// (retryRequeueMatureSQL/retryFinalizeSQL), авторитет —
-	// реконсиляция monitor (FILTER-позиции прохода).
+	// resultUpdateStatusSQL — the terminal status of a DNS episode
+	// (not_delegated / temp_error / delegated_no_address). The outer
+	// SELECT is the number of actually transitioned rows (the
+	// idempotency of redelivery: a guard cut it off — 0). The statement
+	// is strictly "domains → zones" (T-267): the retry maturity bucket
+	// increment of crawler_counters['retry_mature: <current date>']
+	// (T-202) is derived from it into a separate autocommit statement,
+	// resultMatureIncSQL — PostgreSQL does not guarantee the execution
+	// order of the unreferenced DML CTEs of one statement (the caveat
+	// in monitor/zonestats.go); in production on Nov 07 the CTEs rm/zc
+	// executed inversely (rm → zc): the statement held the counter row
+	// and waited on the zone — the edge "counters → zones" against
+	// http-worker RecordAndPublish (holds the zones until Commit, waits
+	// on retry_mature:today) closed the 40P01 deadlock cycle (~3–4/h;
+	// the breakdown — runbooks.md §2.8).
+	// The SERVFAIL branch of the apex and a temp_error outcome without
+	// addresses are full-fledged sources of temp_error episodes (the
+	// mass DNS incident of Oct 24 left 491K domains exactly through this
+	// branch); their episodes ripen by midnight and must land in the
+	// bucket under the same key the HTTP stage writes (the current_date
+	// of the record) — otherwise the retry guard would miss the DNS
+	// cohort; the decrement of the same bucket is the scheduler's
+	// (retryRequeueMatureSQL/retryFinalizeSQL), the authority — the
+	// monitor reconciliation (the FILTER positions of the pass).
 	resultUpdateStatusSQL = "WITH s AS (" +
 		"SELECT zone_id, id, check_state FROM domains " +
 		fmt.Sprintf("WHERE zone_id = $1::int2 AND id = $2::int8 AND status <> %d AND check_state <> %d ",
@@ -208,28 +232,31 @@ var (
 		"WHERE z.id = c.zone_id) " +
 		"SELECT count(*) FROM upd"
 
-	// resultMatureIncSQL — инкремент корзины зрелости ретрая
-	// crawler_counters['retry_mature: сутки'] у temp_error-итога
-	// DNS-эпизода: +1 отдельным autocommit-оператором ПОСЛЕ успешной
-	// записи (T-267; прежде — CTE rm resultUpdateStatusSQL, чей
-	// нессылаемый порядок исполнения и создавал ребро дедлока —
-	// комментарий выше). Upsert-паттерн recordRetryMatureBumpSQL
-	// HTTP-этапа (internal/httpworker record.go), дельта — литерал 1
-	// (один домен на вызов), ключ current_date вычисляет БД — тот же,
-	// что у инкремента HTTP-этапа и декремента ретрая. Окно
-	// неатомарности ±1 до ближайшей реконсиляции (≤
-	// monitor.zone_stats_interval): сбой между операторами оставляет
-	// переход записанным (done), а корзину заниженной — безопасно,
-	// авторитет семейства — реконсиляция monitor, guard ретрая читает
-	// только корзины прошедших суток (retryMatureSQL).
+	// resultMatureIncSQL — the retry maturity bucket increment of
+	// crawler_counters['retry_mature: <current date>'] for a temp_error
+	// outcome of a DNS episode: +1 by a separate autocommit statement
+	// AFTER the successful write (T-267; before — the CTE rm of
+	// resultUpdateStatusSQL, whose unreferenced execution order created
+	// the deadlock edge — see the comment above). The upsert pattern of
+	// the HTTP stage's recordRetryMatureBumpSQL (internal/httpworker
+	// record.go), the delta — the literal 1 (one domain per call), the
+	// current_date key is computed by the DB — the same as the HTTP
+	// stage increment and the retry decrement. The non-atomicity window
+	// of ±1 until the nearest reconciliation (≤
+	// monitor.zone_stats_interval): a failure between the statements
+	// leaves the transition recorded (done) and the bucket understated —
+	// safe; the family's authority is the monitor reconciliation, and
+	// the retry guard reads only the buckets of past days
+	// (retryMatureSQL).
 	resultMatureIncSQL = "INSERT INTO crawler_counters (name, value, updated_at) " +
 		"VALUES ('retry_mature:' || to_char(current_date, 'YYYY-MM-DD'), 1, now()) " +
 		"ON CONFLICT (name) DO UPDATE " +
 		"SET value = crawler_counters.value + EXCLUDED.value, updated_at = now()"
 
-	// resultUpdateKeepStatusSQL — ветка «есть адреса»: статус не пишется
-	// (итог поставит HTTP-этап, §7), temp_attempts сбрасывается — эпизод
-	// успешен. Дельты зон и предчтение — как у терминальной ветки (T-178).
+	// resultUpdateKeepStatusSQL — the "addresses present" branch: the
+	// status is not written (the HTTP stage will set the outcome, §7),
+	// temp_attempts is reset — the episode succeeded. The zone deltas
+	// and the pre-read — as in the terminal branch (T-178).
 	resultUpdateKeepStatusSQL = "WITH s AS (" +
 		"SELECT zone_id, id, check_state FROM domains " +
 		fmt.Sprintf("WHERE zone_id = $1::int2 AND id = $2::int8 AND status <> %d AND check_state <> %d ",
@@ -250,106 +277,117 @@ var (
 		"WHERE z.id = c.zone_id) " +
 		"SELECT count(*) FROM upd"
 
-	// resultMarkPublishedSQL — постановка staging-бита http_published
-	// (T-108, DNS-04): бит ставится сразу после успешного XADD q:http и
-	// до записи результата — повторная доставка пачки по биту отличит
-	// «опубликовано, не записано» от «не доходило» и не станет публиковать
-	// дубль. Охраны — как у записи результата: done-строка пометки не
-	// получает (эпизод уже зафиксирован), deleted — вне цикла (§13.1);
-	// строки в pending (lease вернул посреди эпизода) помечаются — задача
-	// опубликована независимо от аренды. OR сохраняет прочие биты flags.
+	// resultMarkPublishedSQL — setting the http_published staging bit
+	// (T-108, DNS-04): the bit is set right after a successful XADD of
+	// q:http and before the result write — a batch redelivery tells by
+	// the bit "published, not recorded" from "never got there" and does
+	// not publish a duplicate. The guards are as in the result write: a
+	// done row receives no mark (the episode is already fixed), deleted
+	// is outside the loop (§13.1); rows in pending (the lease returned
+	// them mid-episode) are marked — the task is published regardless of
+	// the lease. OR preserves the other bits of flags.
 	//
-	// # Автомат бита http_published (T-257, ТЗ tasks/TZ-fsm.md §3 ФТ-3)
+	// # The http_published bit machine (T-257, spec tasks/TZ-fsm.md §3 FR-3)
 	//
-	// Единая точка правды о жизненном цикле staging-бита (бит 2
-	// domains.flags, model.FlagHTTPPublished — T-108). Переходы остаются
-	// SQL-операторами с охранными предикатами (ТЗ-fsm §1): спецификация —
-	// таблица ниже, писатели бита (последняя колонка) сверяются с ней,
-	// не дублируют. Смежные автоматы: check_state
-	// (internal/scheduler/checkstate.go, T-255 — записи результата ниже
-	// его строки Р2/Р3/Р4/Р13, постановка — Р1), status (ТЗ-fsm §3 ФТ-2).
-	// Формализация не меняет поведение: спецификация + сценарный
-	// интеграционный тест (test/integration/httpbit_test.go, ТЗ-fsm §4).
+	// The single point of truth about the staging bit lifecycle (bit 2
+	// of domains.flags, model.FlagHTTPPublished — T-108). The
+	// transitions remain SQL statements with guard predicates
+	// (the TZ-fsm spec §1): the specification is the table below, the bit writers
+	// (the last column) check against it rather than duplicate it.
+	// Adjacent machines: check_state (internal/scheduler/checkstate.go,
+	// T-255 — the result writes below are its rows R2/R3/R4/R13, the
+	// scheduler enqueue is R1), status (the TZ-fsm spec §3 FR-2). The
+	// formalization does not change behavior: the specification + a
+	// scenario integration test (test/integration/httpbit_test.go,
+	// the TZ-fsm spec §4).
 	//
-	// ## Состояния (бит × фаза эпизода)
+	// ## States (bit × episode phase)
 	//
-	//	чистый (0)       публикации q:http в текущем эпизоде не было:
-	//	                  строка вне эпизода, эпизод до XADD либо уже
-	//	                  записан записью DNS-результата
-	//	опубликован (1)  XADD q:http текущего эпизода прошёл, результат
-	//	                  DNS ещё не записан; читатель один — фильтр
-	//	                  пачки (resultPendingSQL)
+	//	clean (0)         no q:http publication in the current episode:
+	//	                  the row is outside the episode, the episode is
+	//	                  before the XADD or is already recorded by the
+	//	                  DNS result write
+	//	published (1)     the XADD q:http of the current episode went
+	//	                  through, the DNS result is not recorded yet;
+	//	                  a single reader — the batch filter
+	//	                  (resultPendingSQL)
 	//
-	// Значение бит имеет только внутри эпизода (от постановки в queued
-	// до записи результата). Вне эпизода может стоять: на pending —
-	// пока запись результата из pending (Р4, DNS-операторы) или
-	// постановка нового эпизода (Б3) не снимет; на done — если done
-	// записал HTTP-этап после потерянной DNS-записи (HTTP-ветка Р4 бит
-	// не трогает, И2); на deleted — до воскрешения (Р9 сохраняет
-	// flags — чистит ближайшая постановка Б3). Читает бит только
-	// фильтр пачки (done/deleted отсечены его охранными предикатами) —
-	// значения вне эпизода бит не имеет.
+	// The bit has a value only inside an episode (from the enqueue into
+	// queued until the result write). Outside an episode it may stay
+	// set: at pending — until the result write from pending (R4, the
+	// DNS statements) or a new episode enqueue (B3) clears it; at done —
+	// if done was written by the HTTP stage after a lost DNS write (the
+	// HTTP branch of R4 does not touch the bit, I2); at deleted — until
+	// resurrection (R9 preserves flags — the nearest enqueue B3 cleans
+	// it). Only the batch filter reads the bit (done/deleted are cut
+	// off by its guard predicates) — outside an episode the bit has no
+	// value.
 	//
-	// ## Переходы: состояние × событие × охраны × цель × побочные действия
+	// ## Transitions: state × event × guards × target × side effects
 	//
-	//	| № | Исходное | Событие | Охраны | Цель | Побочные действия | Писатель |
-	//	|---|----------|---------|--------|------|-------------------|----------|
-	//	| Б1 | чистый | успешный XADD q:http (эпизод с адресами) | status <> deleted, check_state <> done | опубликован | flags OR бит, прочие сохранены; non-fatal — отказ пометки не роняет эпизод (запись результата важнее) | resultMarkPublishedSQL, MarkHTTPPublished |
-	//	| Б2 | опубликован | запись результата DNS-эпизода из любого не-done состояния: терминальный статус (Р2), «есть адреса» (Р3), lease вернул посреди эпизода — запись из pending (Р4), диагноз invalid (Р13) | status <> deleted, check_state <> done | чистый | flags AND ~бита (прочие сохранены); queued_at = NULL; last_checked_at = now() — теми же операторами, что пишут done | resultUpdateStatusSQL, resultUpdateKeepStatusSQL, resultInvalidSQL |
-	//	| Б3 | опубликован | постановка планировщика (новый эпизод: pending → queued, Р1) | check_state = pending, status <> deleted | чистый | flags AND ~бита — единая точка сброса на входе в эпизод: любой возврат строки в работу (lease, воскрещение, перепроверка, ручной recheck) идёт через pending → queued; пометка прошлого эпизода иначе подавила бы публикацию нового — потеря задачи q:http | scheduler/enqueue.go enqueueUpdate |
-	//	| Б4 | опубликован | повторная доставка пачки q:dns (запись прошлого эпизода не состоялась — сбой/краш до done) | фильтр пачки: status <> deleted, check_state <> done | опубликован (без изменения — публикация ПРОПУЩЕНА) | дубль q:http исключён: домен пачки приходит с HTTPPublished, ProcessDomain пропускает Publish и доходит до записи (Б2); DNS-обмен эпизода повторяется (результат не хранился, §3.5) | resultPendingSQL + ProcessDomain |
+	//	| # | From | Event | Guards | Target | Side effects | Writer |
+	//	|---|------|-------|--------|--------|--------------|--------|
+	//	| B1 | clean | a successful XADD q:http (an episode with addresses) | status <> deleted, check_state <> done | published | flags OR bit, the others preserved; non-fatal — a mark failure does not drop the episode (the result write matters more) | resultMarkPublishedSQL, MarkHTTPPublished |
+	//	| B2 | published | a DNS episode result write from any non-done state: a terminal status (R2), "addresses present" (R3), the lease returned mid-episode — a write from pending (R4), an invalid diagnosis (R13) | status <> deleted, check_state <> done | clean | flags AND ~bit (the others preserved); queued_at = NULL; last_checked_at = now() — by the same statements that write done | resultUpdateStatusSQL, resultUpdateKeepStatusSQL, resultInvalidSQL |
+	//	| B3 | published | the scheduler enqueue (a new episode: pending → queued, R1) | check_state = pending, status <> deleted | clean | flags AND ~bit — the single reset point at the entry to an episode: any return of the row to work (a lease, a resurrection, a recheck, a manual recheck) goes through pending → queued; the mark of a past episode would otherwise suppress the publication of the new one — a lost q:http task | scheduler/enqueue.go enqueueUpdate |
+	//	| B4 | published | a batch q:dns redelivery (the past episode's write did not happen — a failure/crash before done) | the batch filter: status <> deleted, check_state <> done | published (unchanged — the publication is SKIPPED) | a q:http duplicate is excluded: the batch's domain arrives with HTTPPublished, ProcessDomain skips Publish and reaches the write (B2); the episode's DNS exchanges repeat (the result was not stored, §3.5) | resultPendingSQL + ProcessDomain |
 	//
-	// ## Окно «XADD без бита»: дубль публикации допустим
+	// ## The "XADD without the bit" window: a publication duplicate is allowed
 	//
-	// Между успешным XADD и постановкой бита (Б1) — краш воркера либо
-	// отказ UPDATE: повторная доставка застаёт бит чистым, Б4 не
-	// срабатывает — публикуется дубль q:http. Дубль ДОПУСТИМ: цена окна,
-	// а не потеря — полная повторная HTTP-проверка домена без записи
-	// (дедупликации задач на стороне потребителя q:http нет, ТЗ 3.4
-	// at-least-once), ограничен попытками доставки. Пометка ДО XADD при
-	// сбое XADD подавляла бы публикацию навсегда (потеря задачи q:http)
-	// — окно дубля выбрано вместо окна потери; потому же постановка
-	// бита non-fatal. Второй источник дублей — межэпизодные гонки lease
-	// (существовали до T-108): lease вернул строку, постановка нового
-	// эпизода сняла бит (Б3), а старая доставка дошла после — дубль
-	// нового эпизода, ограничен той же ценой.
+	// Between a successful XADD and setting the bit (B1) — a worker
+	// crash or an UPDATE failure: the redelivery finds the bit clean,
+	// B4 does not fire — a q:http duplicate is published. The duplicate
+	// is ALLOWED: the price of the window, not a loss — a full repeated
+	// HTTP check of the domain without a record (no task deduplication
+	// on the q:http consumer side, spec 3.4 at-least-once), bounded by
+	// the delivery attempts. A mark BEFORE the XADD would suppress the
+	// publication forever on an XADD failure (a lost q:http task) — the
+	// duplicate window was chosen over the loss window; for the same
+	// reason setting the bit is non-fatal. The second source of
+	// duplicates — cross-episode lease races (they existed before
+	// T-108): the lease returned a row, the new episode enqueue cleared
+	// the bit (B3), and the old delivery arrived after — a duplicate of
+	// the new episode, bounded by the same price.
 	//
-	// ## Инварианты
+	// ## Invariants
 	//
-	//	И1  бит ставится только после успешного XADD q:http (Б1) — до
-	//	    публикации бита не существует.
-	//	И2  запись результата DNS-эпизода всегда снимает бит (Б2, все
-	//	    три оператора — из queued и из pending, DNS-ветка Р4);
-	//	    запись HTTP-этапа (HTTP-ветка Р4, recordDomainSQL) бит НЕ
-	//	    трогает — сохраняет прочие биты, кроме dead_host_cutoff
-	//	    (T-164): done-строка может нести бит от потерянной DNS-записи,
-	//	    снимет следующая постановка (Б3). delete (Р14) и воскрешение
-	//	    (Р9) бит тоже не трогают — у воскрешённого чистит ближайшая
-	//	    постановка.
-	//	И3  каждый новый эпизод начинается с чистого бита: единственный
-	//	    переход в queued — постановка планировщика, она же сбрасывает
-	//	    бит (Б3; И4 спецификации check_state).
-	//	И4  дубль q:http возможен только в окне «XADD без бита» и
-	//	    межэпизодных гонках lease — ограничен попытками доставки
-	//	    (ТЗ 3.4); потеря задачи исключена порядком «публикация →
-	//	    запись» (T-028, комментарий файла).
+	//	I1  the bit is set only after a successful XADD q:http (B1) —
+	//	    before the publication the bit does not exist.
+	//	I2  a DNS episode result write always clears the bit (B2, all
+	//	    three statements — from queued and from pending, the DNS
+	//	    branch of R4); the HTTP stage write (the HTTP branch of R4,
+	//	    recordDomainSQL) does NOT touch the bit — it preserves the
+	//	    other bits except dead_host_cutoff (T-164): a done row may
+	//	    carry the bit from a lost DNS write, the next enqueue (B3)
+	//	    will clear it. delete (R14) and resurrection (R9) do not
+	//	    touch the bit either — for a resurrected row the nearest
+	//	    enqueue cleans it.
+	//	I3  every new episode starts with a clean bit: the only
+	//	    transition into queued is the scheduler enqueue, and it
+	//	    clears the bit (B3; I4 of the check_state specification).
+	//	I4  a q:http duplicate is possible only in the "XADD without the
+	//	    bit" window and the cross-episode lease races — bounded by
+	//	    the delivery attempts (spec 3.4); a task loss is excluded by
+	//	    the "publication → write" order (T-028, the file comment).
 	resultMarkPublishedSQL = "UPDATE domains AS t " +
 		fmt.Sprintf("SET flags = (t.flags | %d)::int2 ", int16(model.FlagHTTPPublished)) +
 		fmt.Sprintf("WHERE t.zone_id = $1::int2 AND t.id = $2::int8 AND t.status <> %d AND t.check_state <> %d",
 			int16(model.StatusDeleted), int16(model.CheckStateDone))
 
-	// resultInvalidSQL — терминальный диагноз ядовитой строки (T-109,
-	// остаток DNS-03): статус invalid для домена, чья проверка
-	// невозможна детерминированно (пустое имя, ErrEmptyDomain). Запись
-	// завершает lease и выводит строку из бесконечного цикла queued →
-	// lease-возврат → dispatch: перепроверка (recheck, T-030) invalid не
-	// возвращает — строки не переиздаются. dns_mask не пишется: маска —
-	// факт DNS-эпизода, которого у мусорной строки нет; temp_attempts
-	// сбрасывается (повторов не будет); бит http_published снимается —
-	// done-строка чиста от staging-пометки (T-108). Охраны — как у
-	// записи результата: deleted не перезаписывается (§13.1), повторная
-	// доставка уже зафиксированного диагноза идемпотентна (ТЗ 3.4).
-	// Дельты зон и предчтение — как у записи результата (T-178).
+	// resultInvalidSQL — the terminal diagnosis of a poison row (T-109,
+	// the remainder of DNS-03): the invalid status for a domain whose
+	// check is deterministically impossible (an empty name,
+	// ErrEmptyDomain). The write ends the lease and takes the row out of
+	// the infinite queued → lease-return → dispatch loop: a recheck
+	// (T-030) does not return invalid — the rows are not republished.
+	// dns_mask is not written: the mask is a fact of the DNS episode,
+	// which a junk row does not have; temp_attempts is reset (there
+	// will be no retries); the http_published bit is cleared — a done
+	// row is clean of the staging mark (T-108). The guards are as in
+	// the result write: deleted is not overwritten (§13.1), the
+	// redelivery of an already recorded diagnosis is idempotent
+	// (spec 3.4). The zone deltas and the pre-read — as in the result
+	// write (T-178).
 	resultInvalidSQL = "WITH s AS (" +
 		"SELECT zone_id, id, check_state FROM domains " +
 		fmt.Sprintf("WHERE zone_id = $1::int2 AND id = $2::int8 AND status <> %d AND check_state <> %d ",
@@ -370,70 +408,80 @@ var (
 		"WHERE z.id = c.zone_id) " +
 		"SELECT count(*) FROM upd"
 
-	// resultPendingSQL — фильтр актуальности пачки q:dns: остаются домены
-	// ещё не записанные (check_state <> done — повторная доставка,
-	// идемпотентность) и не удалённые (§13.1); flags — staging-пометка
-	// публикации q:http (T-108): бит говорит повторной доставке пропустить
-	// публикацию. unnest WITH ORDINALITY сохраняет порядок пачки
-	// (чередование зон T-027) детерминированным.
+	// resultPendingSQL — the currency filter of a q:dns batch: the
+	// domains not yet recorded remain (check_state <> done — the
+	// redelivery, idempotency) and the not deleted ones (§13.1); flags —
+	// the q:http publication staging mark (T-108): the bit tells the
+	// redelivery to skip the publication. unnest WITH ORDINALITY keeps
+	// the batch order (the zone interleaving of T-027) deterministic.
 	resultPendingSQL = "SELECT u.zone_id, u.id, d.flags " +
 		"FROM unnest($1::int2[], $2::int8[]) WITH ORDINALITY AS u(zone_id, id, ord) " +
 		"JOIN domains AS d ON d.zone_id = u.zone_id AND d.id = u.id " +
 		fmt.Sprintf("WHERE d.status <> %d AND d.check_state <> %d ", int16(model.StatusDeleted), int16(model.CheckStateDone)) +
 		"ORDER BY u.ord"
 
-	// subdomainsSelectSQL — справочник проверяемых субдоменов (ТЗ 5.10).
+	// subdomainsSelectSQL — the reference table of the checked
+	// subdomains (spec 5.10).
 	subdomainsSelectSQL = "SELECT id, label, enabled FROM subdomains ORDER BY id"
 )
 
-// ErrSubdomainsEmpty — справочник subdomains пуст (сбой миграции/чистка):
-// состояние детерминировано, повторная доставка его не лечит — цикл
-// воркера подтверждает пачку с Warn (домены вернёт lease-проход
-// T-029/T-030 после починки справочника), а не крутит повторы до q:dead
-// (DNS-03).
+// ErrSubdomainsEmpty — the subdomains reference table is empty (a
+// migration failure/a cleanup): the state is deterministic and
+// redelivery does not cure it — the worker loop acknowledges the batch
+// with a Warn (the lease pass of T-029/T-030 will bring the domains
+// back after the reference table is fixed) instead of spinning retries
+// until q:dead (DNS-03).
 var ErrSubdomainsEmpty = errors.New("dnsworker: справочник subdomains пуст — нужен хотя бы апекс (ТЗ 5.10)")
 
-// EpisodeResult — решение DNS-эпизода одного домена: что писать в
-// domains и что публиковать в q:http (ТЗ 5.4 пп. 4–5, §7). Строится
-// чистой функцией DecideEpisode из результатов T-036/037/038.
+// EpisodeResult — the DNS episode decision for one domain: what to write
+// into domains and what to publish into q:http (spec 5.4 items 4–5,
+// §7). Built by the pure function DecideEpisode from the outcomes of
+// T-036/037/038.
 type EpisodeResult struct {
-	// SetStatus — писать ли domains.status: терминальные ветки DNS-этапа
-	// (not_delegated/temp_error/delegated_no_address); false — есть
-	// адреса, итог за HTTP-этапом (§7).
+	// SetStatus — whether to write domains.status: the terminal
+	// branches of the DNS stage
+	// (not_delegated/temp_error/delegated_no_address); false —
+	// addresses present, the outcome belongs to the HTTP stage (§7).
 	SetStatus bool
-	// Status — статус терминальной ветки (валиден при SetStatus).
+	// Status — the status of the terminal branch (valid with
+	// SetStatus).
 	Status model.Status
-	// Mask — domains.dns_mask: биты резолвящихся субдоменов этого эпизода
-	// (§5.4 п. 4), включая wildcard-синтезированные (T-038 исключает их
-	// из HTTP-проверки, не из маски).
+	// Mask — domains.dns_mask: the bits of this episode's resolving
+	// subdomains (§5.4 item 4), including the wildcard-synthesized
+	// ones (T-038 excludes them from the HTTP check, not from the
+	// mask).
 	Mask model.DNSMask
-	// HTTPSubdomains — DNS-живые субдомены задачи q:http (T-024): адреса
-	// A/AAAA и CNAME (§5.4 п. 4), wildcard-исключённые — кроме апекса и
-	// www, которые не помечаются никогда (T-038). Пусто — задачи нет.
+	// HTTPSubdomains — the DNS-live subdomains of the q:http task
+	// (T-024): A/AAAA addresses and CNAME (§5.4 item 4), the
+	// wildcard-excluded ones except the apex and www, which are never
+	// marked (T-038). Empty — no task.
 	HTTPSubdomains []queue.HTTPSubdomain
-	// TempFailed — были ли у субдоменов сбои резолвера (транспорт,
-	// SERVFAIL/иные коды): диагностика для логов; на решение влияет только
-	// при пустом HTTP-наборе (temp_error вместо delegated_no_address).
+	// TempFailed — whether the subdomains had resolver failures
+	// (transport, SERVFAIL/other codes): diagnostics for the logs; it
+	// affects the decision only with an empty HTTP set (temp_error
+	// instead of delegated_no_address).
 	TempFailed bool
 }
 
-// HasHTTPTask сообщает, есть ли адреса для HTTP-этапа (§5.4 п. 5: «есть
-// адреса → задача в q:http») — по набору после wildcard-фильтра.
+// HasHTTPTask reports whether there are addresses for the HTTP stage
+// (§5.4 item 5: "addresses → a task into q:http") — by the set after
+// the wildcard filter.
 func (r EpisodeResult) HasHTTPTask() bool { return len(r.HTTPSubdomains) > 0 }
 
-// DecideEpisode сводит результаты шагов эпизода к решению записи (ТЗ §7).
-// Чистая функция — без БД и очереди; apex обязателен, отчёт субдоменов —
-// для ветвей делегирования (Stop-ветки апекса субдомены не проверяют,
-// RFC 8020/T-036). Правила статусов — в комментарии файла.
+// DecideEpisode reduces the episode step outcomes to a recording
+// decision (spec §7). A pure function — no DB and no queue; the apex is
+// required, the subdomain report is for the delegation branches (the
+// Stop branches of the apex do not check subdomains, RFC 8020/T-036).
+// The status rules are in the file comment.
 func DecideEpisode(apex *ApexResult, rep *SubdomReport, wild WildcardResult) (EpisodeResult, error) {
 	if apex == nil {
 		return EpisodeResult{}, errors.New("dnsworker: решение эпизода: нет результата апекса (T-036)")
 	}
 	var out EpisodeResult
 
-	// Терминальные ветки апекса: NXDOMAIN (not_delegated) и
-	// SERVFAIL/таймаут (temp_error) — субдомены не проверялись, маска
-	// эпизода пуста (§3.5 — только последний результат).
+	// Terminal apex branches: NXDOMAIN (not_delegated) and
+	// SERVFAIL/timeout (temp_error) — subdomains were not checked, the
+	// episode mask is empty (§3.5 — only the last result).
 	if status, terminal := apex.Status.DomainStatus(); terminal {
 		out.SetStatus = true
 		out.Status = status
@@ -448,14 +496,16 @@ func DecideEpisode(apex *ApexResult, rep *SubdomReport, wild WildcardResult) (Ep
 
 	temp := false
 	for _, r := range rep.Results {
-		// Сбой резолвера: транспорт (Err) либо код вне {NOERROR, NXDOMAIN}
-		// — NXDOMAIN субдомена авторитетен (имени нет, RFC 8020),
-		// в том числе CNAME→NXDOMAIN (T-037). Дефекты цепочки CNAME
-		// (ErrSubdomCNAMELoop/Depth, sentinel-ошибки T-037) — не сбой
-		// резолвера: резолвер ответил исправно, зона сломана постоянно —
-		// повтор эпизода не изменит исход, итог субдомена «адресов нет»,
-		// а не temp_error (три полных повтора T-031 здесь — лишняя работа
-		// и шумный статус).
+		// A resolver failure: transport (Err) or a code outside
+		// {NOERROR, NXDOMAIN} — a subdomain NXDOMAIN is authoritative
+		// (the name does not exist, RFC 8020), including
+		// CNAME→NXDOMAIN (T-037). CNAME chain defects
+		// (ErrSubdomCNAMELoop/Depth, the sentinel errors of T-037) are
+		// not a resolver failure: the resolver answered correctly, the
+		// zone is permanently broken — an episode repeat will not
+		// change the outcome, the subdomain outcome is "no addresses",
+		// not temp_error (three full T-031 repeats here are extra work
+		// and a noisy status).
 		if r.Err != nil {
 			if !errors.Is(r.Err, ErrSubdomCNAMELoop) && !errors.Is(r.Err, ErrSubdomCNAMEDepth) {
 				temp = true
@@ -464,20 +514,21 @@ func DecideEpisode(apex *ApexResult, rep *SubdomReport, wild WildcardResult) (Ep
 			temp = true
 		}
 		if !r.HasAddrs() || wild.IsWildcard(r.ID) {
-			continue // не DNS-живой или объяснён wildcard-ом (T-038)
+			continue // not DNS-live or explained by the wildcard (T-038)
 		}
 		out.HTTPSubdomains = append(out.HTTPSubdomains, queue.HTTPSubdomain{
 			SubdomainID: int16(r.ID),
 			Label:       r.Label,
 			Addrs:       resultAddrStrings(r),
-			CNAME:       resultCNAME(r.CNAME()), // прямой псевдоним, presentation-форма
+			CNAME:       resultCNAME(r.CNAME()), // the direct alias, the presentation form
 		})
 	}
 	out.TempFailed = temp
 
 	if out.HasHTTPTask() {
-		// Есть адреса → q:http; статус не пишется (HTTP-этап решит,
-		// §7). Частичный сбой субдоменов задачу не рушит (T-037).
+		// Addresses → q:http; the status is not written (the HTTP stage
+		// will decide, §7). A partial subdomain failure will not sink
+		// the task (T-037).
 		return out, nil
 	}
 	out.SetStatus = true
@@ -489,9 +540,9 @@ func DecideEpisode(apex *ApexResult, rep *SubdomReport, wild WildcardResult) (Ep
 	return out, nil
 }
 
-// resultAddrStrings — строковые адреса субдомена для задачи q:http
-// (queue.HTTPSubdomain.Addrs, парсинг netip проверяет очередь, T-024):
-// сначала A, затем AAAA, в порядке записей ответа (T-037).
+// resultAddrStrings — the string addresses of a subdomain for the q:http
+// task (queue.HTTPSubdomain.Addrs, the queue checks the netip parsing,
+// T-024): first A, then AAAA, in answer record order (T-037).
 func resultAddrStrings(r SubdomResult) []string {
 	addrs := make([]string, 0, len(r.A)+len(r.AAAA))
 	for _, a := range r.A {
@@ -503,37 +554,42 @@ func resultAddrStrings(r SubdomResult) []string {
 	return addrs
 }
 
-// resultCNAME — цель CNAME для задачи q:http без завершающей точки:
-// имена в сообщениях очереди хранятся presentation-формой без корневой
-// точки (как DNSDomain.Name, ТЗ 5.2), иначе предельный псевдоним
-// 253 октета + точка не прошёл бы валидацию длины очереди (T-024).
+// resultCNAME — the CNAME target for the q:http task without a trailing
+// dot: names in queue messages are stored in presentation form without
+// the root dot (like DNSDomain.Name, spec 5.2); otherwise the extreme
+// 253-octet alias plus the dot would not pass the queue length
+// validation (T-024).
 func resultCNAME(c string) string {
 	return strings.TrimSuffix(c, ".")
 }
 
-// RecordEpisode записывает результат DNS-эпизода одного домена (ТЗ 5.4
-// п. 4): перевод в done одним оператором UPDATE с охраной актуальности —
-// удалённый во время проверки домен не перезаписывается (§13.1), уже
-// записанный результат повторная доставка не трогает (идемпотентность,
-// ТЗ 3.4 — XACK только после записи, T-025); тем же оператором снимается
-// бит http_published (T-108): done — точка, где staging-пометка публикации
-// выполнила своё назначение; CTE того же оператора ведут дельты
-// счётчиков зоны по старому состоянию строки (T-178, ревью P1-1).
-// temp_error-итог дополнительно инкрементирует корзину зрелости ретрая
-// crawler_counters['retry_mature: сутки'] — ОТДЕЛЬНЫМ autocommit-оператором
-// resultMatureIncSQL после успешной записи (T-267): счётчик и зоны —
-// разные операторы, порядок их блокировок детерминирован (нессылаемые
-// DML-CTE одного оператора PG порядком не гарантирует — инцидент 07.11,
-// runbooks.md §2.8). Окно неатомарности ±1 до ближайшей реконсиляции
-// (≤ monitor.zone_stats_interval): сбой инкремента не отменяет
-// зафиксированный переход и не лечится повторной доставкой (охрана done
-// отсечёт оба оператора) — возвращает (true, err): вызыватель завершает
-// эпизод (корзину выровняет monitor), а не роняет доставку.
-// Оба оператора — autocommit под 40P01-ретраем (T-268, resultRetry):
-// повторяется команда как есть, БЕЗ повторного DNS-эпизода (эпизод на
-// порядки дороже команды, а охраны делают повтор безопасным — ТЗ 3.4).
-// Возвращает false, когда охраны отсекли строку (done/deleted) — это
-// успех, а не ошибка.
+// RecordEpisode records the DNS episode outcome of one domain (spec 5.4
+// item 4): a transition into done by a single UPDATE statement with a
+// currency guard — a domain deleted during the check is not overwritten
+// (§13.1), an already recorded result is not touched by a redelivery
+// (idempotency, spec 3.4 — XACK only after the write, T-025); the same
+// statement clears the http_published bit (T-108): done is the point
+// where the publication staging mark has served its purpose; the CTEs of
+// the same statement keep the zone counter deltas by the old row state
+// (T-178, review P1-1).
+// A temp_error outcome additionally increments the retry maturity
+// bucket crawler_counters['retry_mature: <current date>'] — by a
+// SEPARATE autocommit statement resultMatureIncSQL after the successful
+// write (T-267): the counter and the zones are different statements, the
+// order of their locks is deterministic (one PG statement does not
+// guarantee the order of its unreferenced DML CTEs — the Nov 07
+// incident, runbooks.md §2.8). The non-atomicity window of ±1 until the
+// nearest reconciliation (≤ monitor.zone_stats_interval): an increment
+// failure does not cancel the recorded transition and is not cured by a
+// redelivery (the done guard will cut off both statements) — it returns
+// (true, err): the caller finishes the episode (the monitor will catch
+// the bucket up) instead of dropping the delivery.
+// Both statements are autocommit under a 40P01 retry (T-268,
+// resultRetry): the command repeats as is, WITHOUT repeating the DNS
+// episode (an episode is orders of magnitude more expensive than a
+// command, and the guards make the repeat safe — spec 3.4).
+// Returns false when the guards cut the row off (done/deleted) — that
+// is success, not an error.
 func RecordEpisode(ctx context.Context, pool db.DB, zoneID int16, domainID int64, res EpisodeResult, met *Metrics) (bool, error) {
 	if pool == nil {
 		return false, errors.New("dnsworker: запись результата: пул не задан")
@@ -562,12 +618,14 @@ func RecordEpisode(ctx context.Context, pool db.DB, zoneID int16, domainID int64
 		return false, err
 	}
 	if n > 0 && res.SetStatus && res.Status == model.StatusTempError {
-		// Корзина зрелости — отдельный autocommit ПОСЛЕ записи (T-267):
-		// сбой здесь не роняет эпизод — переход зафиксирован, повторная
-		// доставка его не улучшит (охрана done), корзину ±1 догонит
-		// реконсиляция monitor. 40P01-ретрай (T-268) — прежде сбоя:
-		// дедлок корзины гасится повтором upsert'а, окно неатомарности
-		// остаётся только для иных ошибок.
+		// The maturity bucket — a separate autocommit AFTER the write
+		// (T-267): a failure here does not drop the episode — the
+		// transition is recorded, a redelivery will not improve it (the
+		// done guard), and the monitor reconciliation will catch the
+		// bucket up by ±1. The 40P01 retry (T-268) comes before the
+		// failure: a bucket deadlock is absorbed by repeating the
+		// upsert, the non-atomicity window remains only for other
+		// errors.
 		if err := resultRetry(ctx, met, func() error {
 			_, err := pool.Exec(ctx, resultMatureIncSQL)
 			return err
@@ -578,20 +636,22 @@ func RecordEpisode(ctx context.Context, pool db.DB, zoneID int16, domainID int64
 	return n > 0, nil
 }
 
-// resultRetry — обёртка 40P01-повтора точки записи DNS-этапа (T-268):
-// команда (autocommit-оператор записи) повторяется как есть — охраны
-// актуальности делают повтор идемпотентным (ТЗ 3.4), DNS-эпизод не
-// переигрывается; met может быть nil (изолированные сборки — приборы
-// no-op). Параметры — DefaultDeadlockRetry.
+// resultRetry — the 40P01 retry wrapper of the DNS stage write point
+// (T-268): the command (the autocommit write statement) repeats as is —
+// the currency guards make the repeat idempotent (spec 3.4), the DNS
+// episode is not replayed; met may be nil (isolated builds — the
+// instruments are no-ops). The parameters — DefaultDeadlockRetry.
 func resultRetry(ctx context.Context, met *Metrics, fn func() error) error {
 	return db.RetryDeadlock(ctx, db.DefaultDeadlockRetry, met.DBDeadlockRetried, fn)
 }
 
-// MarkHTTPPublished ставит бит http_published — staging-пометку «задача
-// q:http этого эпизода опубликована» (T-108). Вызывается строго после
-// успешной публикации и до записи результата: повторная доставка пачки
-// по биту пропустит публикацию (нет дубля q:http) и доидёт до записи.
-// Возвращает false, когда охраны отсекли строку (done/deleted) — успех.
+// MarkHTTPPublished sets the http_published bit — the staging mark "the
+// q:http task of this episode is published" (T-108). Called strictly
+// after a successful publication and before the result write: the batch
+// redelivery will skip the publication by the bit (no q:http duplicate)
+// and reach the write.
+// Returns false when the guards cut the row off (done/deleted) —
+// success.
 func MarkHTTPPublished(ctx context.Context, pool db.DB, zoneID int16, domainID int64) (bool, error) {
 	if pool == nil {
 		return false, errors.New("dnsworker: пометка публикации: пул не задан")
@@ -603,16 +663,17 @@ func MarkHTTPPublished(ctx context.Context, pool db.DB, zoneID int16, domainID i
 	return tag.RowsAffected() > 0, nil
 }
 
-// RecordInvalid фиксирует терминальный диагноз ядовитой строки — статус
-// invalid (T-109): домен, чья проверка невозможна детерминированно
-// (пустое имя, ErrEmptyDomain), покидает цикл переиздания вместо
-// бесконечного lease-возврата. Оператор resultInvalidSQL с охранами
-// актуальности: удалённый домен не перезаписывается (§13.1), повторная
-// доставка зафиксированного диагноза — no-op (идемпотентность, ТЗ 3.4);
-// CTE ведёт дельты счётчиков зоны (T-178). Autocommit-оператор под
-// 40P01-ретраем (T-268, resultRetry) — как запись результата.
-// Возвращает false, когда охраны отсекли строку (done/deleted) — это
-// успех, а не ошибка.
+// RecordInvalid records the terminal diagnosis of a poison row — the
+// invalid status (T-109): a domain whose check is deterministically
+// impossible (an empty name, ErrEmptyDomain) leaves the re-publication
+// loop instead of an infinite lease return. The resultInvalidSQL
+// statement with currency guards: a deleted domain is not overwritten
+// (§13.1), the redelivery of an already recorded diagnosis is a no-op
+// (idempotency, spec 3.4); the CTE keeps the zone counter deltas
+// (T-178). An autocommit statement under a 40P01 retry (T-268,
+// resultRetry) — like the result write.
+// Returns false when the guards cut the row off (done/deleted) — that
+// is success, not an error.
 func RecordInvalid(ctx context.Context, pool db.DB, zoneID int16, domainID int64, met *Metrics) (bool, error) {
 	if pool == nil {
 		return false, errors.New("dnsworker: диагноз invalid: пул не задан")
@@ -628,10 +689,10 @@ func RecordInvalid(ctx context.Context, pool db.DB, zoneID int16, domainID int64
 	return n > 0, nil
 }
 
-// resultCount выполняет CTE-оператор перевода в done и возвращает число
-// фактически переведённых строк (внешний SELECT; для одиночного UPDATE
-// CommandTag неприменим — оператор теперь составной, T-178). what —
-// контекст операции в сообщении об ошибке.
+// resultCount executes the CTE statement of the transition into done and
+// returns the number of actually transitioned rows (the outer SELECT;
+// for a single UPDATE CommandTag is inapplicable — the statement is now
+// composite, T-178). what — the operation context in the error message.
 func resultCount(ctx context.Context, pool db.DB, sql string, args []any, zoneID int16, domainID int64, what string) (int64, error) {
 	rows, err := pool.Query(ctx, sql, args...)
 	if err != nil {
@@ -644,22 +705,25 @@ func resultCount(ctx context.Context, pool db.DB, sql string, args []any, zoneID
 	return n, nil
 }
 
-// ProcessDomain — DNS-эпизод одного домена целиком (ТЗ 5.4, §7): апекс
-// (T-036) → субдомены и wildcard-детект (T-037/T-038, только для ветвей
-// делегирования) → решение (DecideEpisode) → публикация q:http → запись
-// результата (RecordEpisode). Порядок «публикация → запись» и цена
-// повтора при сбое записи — в комментарии файла; ошибка любого шага —
-// ошибка эпизода: домен остаётся без записи, доставка q:dns не
-// подтверждается и повторится (Processing, T-025).
+// ProcessDomain — the DNS episode of one domain in full (spec 5.4, §7):
+// the apex (T-036) → subdomains and wildcard detection (T-037/T-038,
+// for the delegation branches only) → the decision (DecideEpisode) →
+// the q:http publication → the result write (RecordEpisode). The
+// "publication → write" order and the price of a retry on a write
+// failure are in the file comment; an error of any step is an episode
+// error: the domain stays unwritten, the q:dns delivery is not
+// acknowledged and will be redelivered (Processing, T-025).
 //
-// dom — домен пачки q:dns с состоянием staging-пометки (PendingDomain,
-// фильтр T-108): dom.HTTPPublished = true означает, что предыдущая
-// попытка доставки успела опубликовать задачу q:http — публикация
-// пропускается (дубль не создаётся), эпизод доходит до записи;
-// subs — справочник subdomains (все строки; отключённые пропускает
-// CheckSubdomains); askAAAA — dns.ipv6 (ТЗ 5.4: AAAA отключаются
-// конфигом без IPv6); met — приборы этапа (T-077; nil — изолированные
-// сборки без метрик); log — nil подавляет записи.
+// dom — a q:dns batch domain with the staging mark state
+// (PendingDomain, the T-108 filter): dom.HTTPPublished = true means the
+// previous delivery attempt managed to publish the q:http task — the
+// publication is skipped (no duplicate is created), the episode reaches
+// the write;
+// subs — the subdomains reference table (all rows; CheckSubdomains
+// skips the disabled ones); askAAAA — dns.ipv6 (spec 5.4: AAAA is
+// disabled by config when there is no IPv6); met — the stage
+// instruments (T-077; nil — isolated builds without metrics); log —
+// nil suppresses the records.
 func ProcessDomain(
 	ctx context.Context,
 	pool db.DB,
@@ -698,11 +762,12 @@ func ProcessDomain(
 		info, werr := DetectWildcard(ctx, resolve, dom.Name)
 		switch {
 		case werr != nil && ctx.Err() != nil:
-			// Отмена/дедлайн — эпизод не завершён (не «детект не удался»).
+			// A cancellation/deadline — the episode did not finish (not
+			// "the detection failed").
 			return fmt.Errorf("dnsworker: домен %s: wildcard-детект: %w", dom.Name, werr)
 		case werr != nil:
-			// Политика T-038: продолжить без фильтрации — все DNS-живые
-			// субдомены идут в HTTP.
+			// The T-038 policy: continue without filtering — all
+			// DNS-live subdomains go to HTTP.
 			log.Warn("wildcard-детект не удался — продолжаю без фильтрации",
 				"domain", dom.Name, "err", werr)
 		case info.Detected:
@@ -718,13 +783,14 @@ func ProcessDomain(
 		return fmt.Errorf("dnsworker: домен %s: %w", dom.Name, err)
 	}
 
-	// Сначала публикация q:http, затем запись done (порядок — в
-	// комментарии файла): сбой записи вернёт эпизод повторной доставкой.
-	// Повторная доставка эпизода с уже опубликованной задачей (бит
-	// http_published, T-108) публикацию пропускает — доходит до записи.
+	// First the q:http publication, then the done write (the order is in
+	// the file comment): a write failure returns the episode via
+	// redelivery. The redelivery of an episode with an already published
+	// task (the http_published bit, T-108) skips the publication — it
+	// reaches the write.
 	switch {
 	case !res.HasHTTPTask():
-		// Терминальная ветка — публиковать нечего.
+		// A terminal branch — nothing to publish.
 	case dom.HTTPPublished:
 		log.Debug("q:http уже опубликована предыдущей попыткой — публикация пропущена",
 			"domain", dom.Name, "zone_id", dom.ZoneID, "domain_id", dom.DomainID)
@@ -738,10 +804,11 @@ func ProcessDomain(
 		if _, err := q.Publish(ctx, queue.StreamHTTP, task); err != nil {
 			return fmt.Errorf("dnsworker: домен %s: публикация q:http: %w", dom.Name, err)
 		}
-		// Staging-пометка (T-108): failsafe окна «опубликовано, не
-		// записано». Non-fatal: отказ пометки не роняет эпизод — запись
-		// результата важнее; плата — возможный дубль q:http на повторной
-		// доставке (ограничен попытками, ТЗ 3.4), не потеря.
+		// The staging mark (T-108): a failsafe for the "published, not
+		// recorded" window. Non-fatal: a mark failure does not drop the
+		// episode — the result write matters more; the price is a
+		// possible q:http duplicate on redelivery (bounded by the
+		// attempts, spec 3.4), not a loss.
 		marked, merr := MarkHTTPPublished(ctx, pool, dom.ZoneID, dom.DomainID)
 		switch {
 		case merr != nil:
@@ -758,24 +825,26 @@ func ProcessDomain(
 		return err
 	}
 	if !recorded {
-		// Гонка с delete-файлом (§13.1) или повторная доставка уже
-		// записанного результата — оба случая штатные.
+		// A race with a delete (§13.1) or a redelivery of an already
+		// recorded outcome — both cases are normal.
 		log.Debug("результат не записан — домен удалён или уже done",
 			"domain", dom.Name, "zone_id", dom.ZoneID, "domain_id", dom.DomainID)
 		return nil
 	}
 	if err != nil {
-		// Переход зафиксирован, инкремент корзины retry_mature — нет
-		// (T-267): окно неатомарности ±1, повторная доставка бессильна
-		// (охрана done отсечёт запись и инкремент), корзину догонит
-		// реконсиляция monitor — эпизод завершён, non-fatal (стиль
-		// пометки T-108).
+		// The transition is recorded, the retry_mature bucket increment
+		// is not (T-267): a ±1 non-atomicity window, redelivery is
+		// powerless (the done guard will cut off the write and the
+		// increment), the monitor reconciliation will catch the bucket
+		// up — the episode is finished, non-fatal (the T-108 mark
+		// style).
 		log.Warn("инкремент корзины retry_mature не записан — корзину догонит реконсиляция",
 			"domain", dom.Name, "zone_id", dom.ZoneID, "domain_id", dom.DomainID, "err", err)
 	}
 	if res.SetStatus {
-		// Терминальная ветка DNS-этапа — счётчик финальных статусов
-		// (T-077, ТЗ 5.9); ветка «есть адреса» статуса не пишет.
+		// A terminal branch of the DNS stage — the final status counter
+		// (T-077, spec 5.9); the "addresses present" branch writes no
+		// status.
 		met.DomainStatus(res.Status)
 	}
 	log.Debug("DNS-эпизод записан",
@@ -784,9 +853,10 @@ func ProcessDomain(
 	return nil
 }
 
-// resultWildSubs — вход T-038 из отчёта T-037: адреса A/AAAA субдомена
-// как net.IP (MarkWildcardSubdomains сравнивает net.IP.Equal — формы
-// 4/16 октетов одной точки не различаются).
+// resultWildSubs — the T-038 input from the T-037 report: the A/AAAA
+// addresses of a subdomain as net.IP (MarkWildcardSubdomains compares
+// with net.IP.Equal — the 4/16-octet forms of one point are not
+// distinguished).
 func resultWildSubs(rep *SubdomReport) []WildSubdomain {
 	out := make([]WildSubdomain, 0, len(rep.Results))
 	for _, r := range rep.Results {
@@ -802,10 +872,11 @@ func resultWildSubs(rep *SubdomReport) []WildSubdomain {
 	return out
 }
 
-// LoadSubdomains читает справочник проверяемых субдоменов (ТЗ 5.10):
-// источник списка — таблица subdomains (управление crawlerctl, T-083).
-// Перечитывается на каждую пачку: справочник крошечный (≤63 строк), а
-// изменения (add/disable) подхватываются без рестарта воркеров.
+// LoadSubdomains reads the reference table of the checked subdomains
+// (spec 5.10): the source of the list is the subdomains table (managed
+// by crawlerctl, T-083). Re-read for every batch: the reference table is
+// tiny (≤63 rows), and changes (add/disable) are picked up without a
+// worker restart.
 func LoadSubdomains(ctx context.Context, pool db.DB) ([]model.Subdomain, error) {
 	if pool == nil {
 		return nil, errors.New("dnsworker: справочник субдоменов: пул не задан")
@@ -833,30 +904,31 @@ func LoadSubdomains(ctx context.Context, pool db.DB) ([]model.Subdomain, error) 
 	return subs, nil
 }
 
-// resultKey — ключ строки domains в фильтре пачки.
+// resultKey — the key of a domains row in the batch filter.
 type resultKey struct {
 	zone int16
 	id   int64
 }
 
-// PendingDomain — домен пачки q:dns, ждущий обработки, с состоянием
-// staging-пометки публикации (T-108): HTTPPublished = бит http_published
-// строки — предыдущая попытка доставки успела опубликовать задачу q:http,
-// повтор публикацию пропускает (ProcessDomain) и доходит до записи.
+// PendingDomain — a q:dns batch domain awaiting processing, with the
+// publication staging mark state (T-108): HTTPPublished is the
+// http_published bit of the row — the previous delivery attempt managed
+// to publish the q:http task, a repeat skips the publication
+// (ProcessDomain) and reaches the write.
 type PendingDomain struct {
 	queue.DNSDomain
 	HTTPPublished bool
 }
 
-// PendingDomains фильтрует пачку q:dns по актуальности строк (один
-// SELECT, unnest-пачка — стиль §3.5): остаются домены, чей результат ещё
-// не записан (check_state <> done) и которые не удалены (§13.1), вместе с
-// битом http_published (T-108) — маркером «задача q:http этого эпизода
-// уже опубликована». Повторная доставка пачки (Processing, T-025)
-// обрабатывает только их — без дубликатов q:http (опубликованные
-// домены перезаписываются без публикации) и без повторной работы по
-// записанным; пустой результат — пачка уже отработана, доставка просто
-// подтверждается.
+// PendingDomains filters the q:dns batch by row currency (a single
+// SELECT, an unnest batch — the §3.5 style): the domains whose result is
+// not yet recorded (check_state <> done) and which are not deleted
+// (§13.1) remain, together with the http_published bit (T-108) — the
+// marker "the q:http task of this episode is already published". A batch
+// redelivery (Processing, T-025) processes only them — without q:http
+// duplicates (the published domains are rewritten without a publication)
+// and without re-doing the recorded ones; an empty result — the batch is
+// already done, the delivery is simply acknowledged.
 func PendingDomains(ctx context.Context, pool db.DB, batch []queue.DNSDomain) ([]PendingDomain, error) {
 	if pool == nil {
 		return nil, errors.New("dnsworker: фильтр пачки: пул не задан")
@@ -890,7 +962,7 @@ func PendingDomains(ctx context.Context, pool db.DB, batch []queue.DNSDomain) ([
 		}
 		if d, ok := byKey[k]; ok {
 			pending = append(pending, PendingDomain{
-				DNSDomain:     d, // ORDER BY u.ord — порядок пачки
+				DNSDomain:     d, // ORDER BY u.ord — the batch order
 				HTTPPublished: model.Flags(flags).IsHTTPPublished(),
 			})
 		}
@@ -901,67 +973,72 @@ func PendingDomains(ctx context.Context, pool db.DB, batch []queue.DNSDomain) ([
 	return pending, nil
 }
 
-// Дефолты цикла dns-worker.
+// The dns-worker loop defaults.
 const (
-	// DefaultGroup — группа потребителей q:dns: одна на все экземпляры
-	// dns-worker (ТЗ 4.2 — consumer groups масштабируют воркеров
-	// горизонтально; записи раздаются внутри группы).
+	// DefaultGroup — the q:dns consumer group: one for all dns-worker
+	// instances (spec 4.2 — consumer groups scale the workers
+	// horizontally; records are distributed inside the group).
 	DefaultGroup = "dns-worker"
 
-	// DefaultConcurrency — предел одновременных эпизодов: зеркалирует
-	// dns.concurrency (ТЗ 5.10) — плановый параллелизм DNS-обменов
-	// LimitResolver (T-035). Эпизод домена — последовательность обменов,
-	// поэтому потолок эпизодов равен потолку обменов; темп отдельного
-	// эпизода дополнительно ограничен декоратором резолвера.
+	// DefaultConcurrency — the limit of concurrent episodes: mirrors
+	// dns.concurrency (spec 5.10) — the planned parallelism of DNS
+	// exchanges of LimitResolver (T-035). A domain episode is a
+	// sequence of exchanges, so the episode cap equals the exchange
+	// cap; the pace of an individual episode is additionally
+	// bounded by the resolver decorator.
 	DefaultConcurrency = dnsclient.DefaultLimitConcurrency
 
-	// DefaultConsume — записей q:dns за одно чтение: запись — пачка до
-	// scheduler.batch_size доменов (T-028), эпизоды внутри идут параллельно
-	// до Concurrency; большее окно чтения не прибавляет работы, пока
-	// заняты слоты.
+	// DefaultConsume — q:dns records per single read: a record is a
+	// batch of up to scheduler.batch_size domains (T-028), the episodes
+	// inside run in parallel up to Concurrency; a larger read window
+	// adds no work while the slots are busy.
 	DefaultConsume = 1
 
-	// DefaultErrorWait — пауза после ошибок БД/Redis: холостые круги не
-	// греют ни БД, ни логи (стиль T-028); неподтверждённые доставки
-	// вернёт XAUTOCLAIM (T-025) — спешить некуда.
+	// DefaultErrorWait — a pause after DB/Redis errors: idle loops warm
+	// neither the DB nor the logs (the T-028 style); the unacknowledged
+	// deliveries will be returned by XAUTOCLAIM (T-025) — no hurry.
 	DefaultErrorWait = 30 * time.Second
 )
 
-// Options — параметры цикла dns-worker; нулевые значения заменяются
-// дефолтами (withDefaults, стиль scheduler.EnqueueOptions).
+// Options — the dns-worker loop parameters; zero values are replaced by
+// the defaults (withDefaults, the scheduler.EnqueueOptions style).
 type Options struct {
-	// Concurrency — максимум одновременных DNS-эпизодов (доменов);
-	// 0 — DefaultConcurrency (dns.concurrency, ТЗ 5.10).
+	// Concurrency — the maximum of concurrent DNS episodes (domains);
+	// 0 — DefaultConcurrency (dns.concurrency, spec 5.10).
 	Concurrency int
-	// Group — группа потребителей q:dns; "" — DefaultGroup.
+	// Group — the q:dns consumer group; "" — DefaultGroup.
 	Group string
-	// Consumer — имя потребителя группы; "" — "dns-worker-<pid>"
-	// (уникально в пределах экземпляра — различает PEL владельцев).
+	// Consumer — the name of the group's consumer; "" —
+	// "dns-worker-<pid>" (unique within an instance — distinguishes the
+	// PELs of the owners).
 	Consumer string
-	// Consume — записей q:dns за одно чтение; 0 — DefaultConsume.
+	// Consume — q:dns records per single read; 0 — DefaultConsume.
 	Consume int
-	// AskAAAA — запрашивать ли AAAA субдоменов (dns.ipv6, ТЗ 5.4).
+	// AskAAAA — whether to query the subdomains' AAAA (dns.ipv6,
+	// spec 5.4).
 	AskAAAA bool
-	// Recover — слой возврата зависших доставок (Reliab, T-025): Run
-	// поднимает фоновый RecoverLoop (XAUTOCLAIM → та же обработка →
-	// XACK) с теми же Group/Consumer; nil — восстановления нет
-	// (изолированные сборки и тесты без Redis-специфики).
+	// Recover — the stuck delivery return layer (Reliab, T-025): Run
+	// starts a background RecoverLoop (XAUTOCLAIM → the same processing
+	// → XACK) with the same Group/Consumer; nil — no recovery
+	// (isolated builds and tests without Redis specifics).
 	Recover *queue.Reliab
-	// RecoverBatch — пачка клейма RecoverLoop за проход; 0 — дефолт
-	// очереди (queue.DefaultRecoverBatch). Боевая сборка передаёт
-	// redis.recover_batch (T-153): темп возврата зависших — настраиваемая
-	// величина очереди, а не окно потребления этапа.
+	// RecoverBatch — the RecoverLoop's claim batch per pass; 0 — the
+	// queue default (queue.DefaultRecoverBatch). The production build
+	// passes redis.recover_batch (T-153): the pace of returning stuck
+	// deliveries is a queue-configurable value, not a stage consumption
+	// window.
 	RecoverBatch int
-	// RecoverInterval — период опроса зависших записей RecoverLoop;
-	// 0 — дефолт очереди (queue.DefaultRecoverInterval). Конфиг —
-	// redis.recover_interval (T-153).
+	// RecoverInterval — the RecoverLoop's polling period for stuck
+	// records; 0 — the queue default (queue.DefaultRecoverInterval).
+	// The config — redis.recover_interval (T-153).
 	RecoverInterval time.Duration
-	// Metrics — реестр Prometheus сервиса (T-077, ТЗ 5.9): из него Run
-	// строит приборы этапа (NewMetrics — счётчик эпизодов, гистограмма
-	// длительностей, счётчик финальных статусов); nil — без метрик
-	// (изолированные сборки и тесты).
+	// Metrics — the service's Prometheus registry (T-077, spec 5.9):
+	// Run builds the stage instruments from it (NewMetrics — the
+	// episode counter, the duration histogram, the final status
+	// counter); nil — without metrics (isolated builds and tests).
 	Metrics *metrics.Registry
-	// Log — логгер цикла; nil — записи подавлены (slog.DiscardHandler).
+	// Log — the loop's logger; nil — the records are suppressed
+	// (slog.DiscardHandler).
 	Log *slog.Logger
 }
 
@@ -981,14 +1058,15 @@ func (o Options) withDefaults() Options {
 	return o
 }
 
-// Run — рабочий цикл dns-worker (ТЗ 5.4): читает пачки q:dns группой
-// потребителей и обрабатывает каждую доставку паттерном Processing
-// (T-025): эпизоды доменов → публикация q:http → запись результата →
-// XACK. Работает до отмены ctx и возвращает nil — контракт OnRun каркаса
-// (T-012: graceful shutdown — начатые эпизоды дорабатывают или
-// возвращаются очереди повторной доставкой). Ошибка чтения или обработки
-// не останавливает цикл: логируется (Warn), неподтверждённая доставка
-// вернётся XAUTOCLAIM (ТЗ 4.2).
+// Run — the dns-worker working loop (spec 5.4): reads q:dns batches with
+// a consumer group and processes every delivery with the Processing
+// pattern (T-025): domain episodes → the q:http publication → the result
+// write → XACK. Runs until ctx is cancelled and returns nil — the OnRun
+// contract of the service framework (T-012: graceful shutdown — the started
+// episodes finish their work or return to the queue via redelivery). A
+// read or processing error does not stop the loop: it is logged (Warn),
+// and the unacknowledged delivery will come back via XAUTOCLAIM
+// (spec 4.2).
 func Run(ctx context.Context, pool db.DB, q queue.Queue, resolve dnsclient.Resolver, opts Options) error {
 	if pool == nil {
 		return errors.New("dnsworker: цикл воркера: пул не задан")
@@ -1004,7 +1082,7 @@ func Run(ctx context.Context, pool db.DB, q queue.Queue, resolve dnsclient.Resol
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	met := NewMetrics(o.Metrics) // nil без реестра — приборы no-op (T-077)
+	met := NewMetrics(o.Metrics) // nil without a registry — the instruments are no-ops (T-077)
 	log.Info("цикл dns-worker",
 		"group", o.Group, "consumer", o.Consumer,
 		"concurrency", o.Concurrency, "consume", o.Consume, "ask_aaaa", o.AskAAAA)
@@ -1018,10 +1096,11 @@ func Run(ctx context.Context, pool db.DB, q queue.Queue, resolve dnsclient.Resol
 		}
 	}
 
-	// Возврат зависших доставок (T-025): фоновый RecoverLoop от имени
-	// того же потребителя — клейм XAUTOCLAIM и та же обработка пачек.
-	// Живёт до отмены ctx; Run дожидается его выхода (начатая пачка
-	// дорабатывает или остаётся неподтверждённой, ТЗ 3.4).
+	// Return of stuck deliveries (T-025): a background RecoverLoop on
+	// behalf of the same consumer — an XAUTOCLAIM claim and the same
+	// batch processing. Lives until ctx is cancelled; Run waits for its
+	// exit (a started batch finishes its work or stays unacknowledged,
+	// spec 3.4).
 	if o.Recover != nil {
 		recDone := make(chan struct{})
 		go func() {
@@ -1032,8 +1111,8 @@ func Run(ctx context.Context, pool db.DB, q queue.Queue, resolve dnsclient.Resol
 				Stream:   queue.StreamDNS,
 				Group:    o.Group,
 				Consumer: o.Consumer,
-				// Темп обхода PEL — очередь, не этап (redis.recover_*,
-				// T-153); нули — дефолты очереди.
+				// The PEL traversal pace — the queue's, not the stage's
+				// (redis.recover_*, T-153); zeros — the queue defaults.
 				Batch:    o.RecoverBatch,
 				Interval: o.RecoverInterval,
 				Log:      log,
@@ -1054,7 +1133,7 @@ func Run(ctx context.Context, pool db.DB, q queue.Queue, resolve dnsclient.Resol
 		}
 		for _, d := range deliveries {
 			if ctx.Err() != nil {
-				return nil // остановка: доставка не читалась — не подтверждена
+				return nil // stopping: the delivery was not read — not acknowledged
 			}
 			err := queue.Processing(ctx, q, o.Group, d, func(c context.Context, del queue.Delivery) error {
 				return processBatch(c, pool, q, resolve, del, o, met, log)
@@ -1063,7 +1142,7 @@ func Run(ctx context.Context, pool db.DB, q queue.Queue, resolve dnsclient.Resol
 				continue
 			}
 			if ctx.Err() != nil {
-				return nil // отмена в работе — повторная доставка, не тревога
+				return nil // a cancellation mid-work — a redelivery, not an alarm
 			}
 			log.Warn("пачка q:dns не подтверждена — вернётся повторной доставкой",
 				"entry", d.ID, "err", err)
@@ -1071,30 +1150,33 @@ func Run(ctx context.Context, pool db.DB, q queue.Queue, resolve dnsclient.Resol
 	}
 }
 
-// processBatch обрабатывает одну доставку q:dns (пачка доменов, T-024):
-// справочник субдоменов → фильтр актуальности (PendingDomains) → эпизоды
-// доменов параллельно до Concurrency (dns.concurrency, ТЗ 5.10). Ошибка
-// любого эпизода — ошибка всей доставки (без XACK): повторная доставка
-// прогонит пачку заново, фильтр отсечёт уже записанные домены, а бит
-// http_published (T-108) исключит дубликаты публикации — повторяется
-// только недоработанное (идемпотентность, ТЗ 3.4).
-// Завершённые эпизоды идут в приборы met (T-077): счётчик задач этапа,
-// гистограмма длительностей (статусы терминальных веток считает
-// ProcessDomain после записи).
+// processBatch processes a single q:dns delivery (a batch of domains,
+// T-024): the subdomains reference table → the currency filter
+// (PendingDomains) → the domain episodes in parallel up to Concurrency
+// (dns.concurrency, spec 5.10). An error of any episode is the error of
+// the whole delivery (no XACK): a redelivery will run the batch again,
+// the filter will cut off the already recorded domains, and the
+// http_published bit (T-108) will exclude publication duplicates — only
+// the unfinished work repeats (idempotency, spec 3.4).
+// Finished episodes go into the met instruments (T-077): the stage task
+// counter, the duration histogram (the statuses of the terminal branches
+// are counted by ProcessDomain after the write).
 //
-// Не ронывают доставку детерминированные состояния, которые повторная
-// доставка не лечит (DNS-03): пустой или целиком отключённый/кривой
-// справочник субдоменов — конфигурация, а не яд (пачка подтверждается с
-// Warn, домены вернёт lease-проход T-029/T-030 после починки справочника
-// — повторами до q:dead очередь замусоривалась бы каждой пачкой, а
-// терминальный статус заморозил бы домены навсегда: они исправны и
-// обязаны обработаться после починки); домен с пустым именем — мусорная
-// строка (T-109): фиксируется терминальный диагноз invalid
-// (RecordInvalid), Warn по домену и продолжение — остальные домены пачки
-// обрабатываются, доставка подтверждается; строка выводится из цикла
-// переиздания (recheck invalid не возвращает). Транспортные сбои
-// (БД/Redis) и порченое сообщение (Decode) — по-прежнему ошибка без
-// XACK: их повторная доставка лечит (T-025).
+// Deterministic states that redelivery does not cure do not drop the
+// delivery (DNS-03): an empty, entirely disabled or malformed subdomains
+// reference table is configuration, not poison (the batch is
+// acknowledged with a Warn, and the lease pass of T-029/T-030 will bring
+// the domains back after the reference table is fixed — with retries
+// until q:dead the queue would be littered by every batch, and a
+// terminal status would freeze the domains forever: they are healthy
+// and must be processed after the fix); a domain with an empty name is
+// a junk row (T-109): the terminal invalid diagnosis is recorded
+// (RecordInvalid), a Warn per domain and continuation — the other
+// domains of the batch are processed, the delivery is acknowledged; the
+// row leaves the republication loop (a recheck does not return
+// invalid). Transport failures (DB/Redis) and a corrupted message
+// (Decode) — still an error without XACK: their redelivery cures them
+// (T-025).
 func processBatch(
 	ctx context.Context,
 	pool db.DB,
@@ -1107,8 +1189,8 @@ func processBatch(
 ) error {
 	batch, err := queue.Decode[queue.DNSBatch](del)
 	if err != nil {
-		// Ядовитая запись: повторная доставка бессмысленна, но очередь
-		// попытается — исчерпает попытки и уйдёт в q:dead (T-025).
+		// A poison record: a redelivery is pointless, but the queue will
+		// try — exhaust the attempts and go to q:dead (T-025).
 		return fmt.Errorf("dnsworker: запись %s стрима %s: %w", del.ID, del.Stream, err)
 	}
 	subs, err := LoadSubdomains(ctx, pool)
@@ -1122,9 +1204,9 @@ func processBatch(
 	}
 	enabled, err := filterEnabledSubdomains(subs)
 	if err != nil || len(enabled) == 0 {
-		// Кривые строки или все субдомены отключены (штатная операция
-		// crawlerctl subdomains disable) — конфигурация: повтор доставки
-		// не изменит исход.
+		// Malformed rows or all subdomains disabled (a normal crawlerctl
+		// subdomains disable operation) — configuration: a delivery
+		// repeat will not change the outcome.
 		if err != nil {
 			log.Warn("справочник subdomains некорректен — пачка q:dns подтверждена без обработки",
 				"entry", del.ID, "batch", len(batch.Domains), "err", err)
@@ -1144,9 +1226,10 @@ func processBatch(
 		return nil
 	}
 
-	// Семафор ограничивает одновременные эпизоды (глубина — Concurrency,
-	// приобретается до запуска горутины — очередь не растёт); ошибки
-	// собираются до первой (mutex, без errgroup — зависимость косвенная).
+	// The semaphore bounds the concurrent episodes (the depth —
+	// Concurrency, acquired before starting the goroutine — the queue
+	// does not grow); the errors are collected up to the first one (a
+	// mutex, no errgroup — the dependency is indirect).
 	sem := make(chan struct{}, o.Concurrency)
 	var (
 		wg       sync.WaitGroup
@@ -1155,7 +1238,8 @@ func processBatch(
 	)
 	for i := range pending {
 		if err := ctx.Err(); err != nil {
-			// Остановка: не начатые домены вернутся повторной доставкой.
+			// Stopping: the not started domains will come back via
+			// redelivery.
 			mu.Lock()
 			if firstErr == nil {
 				firstErr = err
@@ -1172,16 +1256,18 @@ func processBatch(
 			err := ProcessDomain(ctx, pool, q, resolve, dom, subs, o.AskAAAA, met, log)
 			switch {
 			case err == nil:
-				// Эпизод завершён — пропускная способность и
-				// длительность этапа (T-077, ТЗ 5.9).
+				// The episode is finished — the stage throughput and
+				// duration (T-077, spec 5.9).
 				met.Episode(time.Since(start))
 			case errors.Is(err, ErrEmptyDomain):
-				// Ядовитый домен: детерминированная ошибка, повтор
-				// доставки не изменит исход — терминальный диагноз invalid
-				// (T-109) вместо вечного цикла queued→lease→dispatch.
-				// Warn и продолжение: остальные домены пачки обрабатываются,
-				// доставка подтверждается. Сбой записи диагноза — ошибка
-				// эпизода (без XACK): повторная доставка доиграет фиксацию.
+				// A poison domain: a deterministic error, a delivery
+				// repeat will not change the outcome — the terminal
+				// invalid diagnosis (T-109) instead of the eternal
+				// queued→lease→dispatch loop. A Warn and continuation:
+				// the other domains of the batch are processed, the
+				// delivery is acknowledged. A diagnosis write failure is
+				// an episode error (no XACK): a redelivery will finish
+				// the fixation.
 				recorded, rerr := RecordInvalid(ctx, pool, dom.ZoneID, dom.DomainID, met)
 				switch {
 				case rerr != nil:
@@ -1195,8 +1281,8 @@ func processBatch(
 					log.Warn("домен с пустым именем — зафиксирован диагноз invalid, строка выведена из цикла переиздания",
 						"entry", del.ID, "zone_id", dom.ZoneID, "domain_id", dom.DomainID)
 				default:
-					// Охраны отсекли (deleted/уже done) — повторная доставка
-					// или конкурентный delete: штатно.
+					// The guards cut it off (deleted/already done) — a
+					// redelivery or a concurrent delete: normal.
 					log.Debug("диагноз invalid не записан — домен удалён или уже done",
 						"entry", del.ID, "zone_id", dom.ZoneID, "domain_id", dom.DomainID)
 				}

@@ -1,7 +1,8 @@
-// Тесты проверки апекса (T-036): все ветки классификации на сценарном
-// фейке dnsclient.Resolver — сеть не нужна. Фейк отвечает на вызовы по
-// порядку записями сценария и фиксирует вопросы (формат FQDN, тип A/NS),
-// порядок и число обращений.
+// Tests of the apex check (T-036): all classification branches on a
+// scenario fake of dnsclient.Resolver — no network needed. The fake
+// answers the calls with the scenario records in order and records the
+// questions (the FQDN format, the A/NS type), the order and the number
+// of calls.
 
 package dnsworker
 
@@ -19,36 +20,40 @@ import (
 	"crawler/internal/model"
 )
 
-// --- сценарный фейк Resolver -------------------------------------------------
+// --- the scenario fake of Resolver -------------------------------------------
 
-// apexStep — один ответ сценария: либо Result с кодом и секцией answer,
-// либо ошибка (имитация сети после исчерпания ретраев dnsclient).
+// apexStep — a single scenario answer: either a Result with a code and
+// an answer section, or an error (a network failure simulation after the
+// dnsclient retries are exhausted).
 type apexStep struct {
 	rcode  dnsclient.RCode
 	answer []dns.RR
 	err    error
 }
 
-// apexReply — шаг-ответ с кодом и записями answer.
+// apexReply — an answer step with a code and answer records.
 func apexReply(rcode dnsclient.RCode, an ...dns.RR) apexStep {
 	return apexStep{rcode: rcode, answer: an}
 }
 
-// apexFail — шаг-ошибка Exchange (контракт T-034: сеть, попытки исчерпаны).
+// apexFail — an Exchange error step (the T-034 contract: the network,
+// the attempts are exhausted).
 func apexFail(err error) apexStep {
 	return apexStep{err: err}
 }
 
-// apexTimeoutErr — сетевая ошибка с признаком таймаута (стиль dnsclient).
+// apexTimeoutErr — a network error with the timeout sign (the dnsclient
+// style).
 type apexTimeoutErr struct{}
 
 func (apexTimeoutErr) Error() string   { return "fake i/o timeout" }
 func (apexTimeoutErr) Timeout() bool   { return true }
 func (apexTimeoutErr) Temporary() bool { return true }
 
-// apexFakeResolver — сценарный dnsclient.Resolver без сети: каждый вызов
-// снимает очередной шаг сценария и фиксирует вопрос. onCall (если задан)
-// вызывается после фиксации — тест дергает отмену ctx между запросами.
+// apexFakeResolver — a scenario dnsclient.Resolver without a network:
+// every call takes the next scenario step and records the question.
+// onCall (if set) is called after the recording — the test pulls the ctx
+// cancellation between the queries.
 type apexFakeResolver struct {
 	steps  []apexStep
 	calls  []dnsclient.Question
@@ -71,7 +76,7 @@ func (f *apexFakeResolver) Exchange(ctx context.Context, q dnsclient.Question) (
 	return &dnsclient.Result{RCode: st.rcode, Answer: st.answer}, nil
 }
 
-// --- конструкторы записей ----------------------------------------------------
+// --- record constructors ------------------------------------------------------
 
 func apexARR(name, ip string) dns.RR {
 	return &dns.A{
@@ -101,7 +106,7 @@ func apexNSRR(name, host string) dns.RR {
 	}
 }
 
-// apexAddrs — []netip.Addr для сравнения адресов в тестах.
+// apexAddrs — []netip.Addr for comparing addresses in the tests.
 func apexAddrs(ips ...string) []netip.Addr {
 	out := make([]netip.Addr, len(ips))
 	for i, ip := range ips {
@@ -110,7 +115,7 @@ func apexAddrs(ips ...string) []netip.Addr {
 	return out
 }
 
-// --- классификация: все ветки --------------------------------------------------
+// --- classification: all branches ----------------------------------------------
 
 func TestCheckApexClassification(t *testing.T) {
 	cases := []struct {
@@ -287,7 +292,7 @@ func TestCheckApexClassification(t *testing.T) {
 	}
 }
 
-// --- формат вопросов: FQDN и типы ----------------------------------------------
+// --- question format: FQDN and types -------------------------------------------
 
 func TestCheckApexQuestionFormat(t *testing.T) {
 	t.Run("имя с точкой и без — один и тот же FQDN-вопрос A", func(t *testing.T) {
@@ -339,7 +344,7 @@ func TestCheckApexQuestionFormat(t *testing.T) {
 	})
 }
 
-// --- адреса: состав и порядок ---------------------------------------------------
+// --- addresses: composition and order ------------------------------------------
 
 func TestCheckApexAddresses(t *testing.T) {
 	t.Run("только валидные IPv4 из A, порядок ответа сохранён", func(t *testing.T) {
@@ -347,8 +352,8 @@ func TestCheckApexAddresses(t *testing.T) {
 		fake := &apexFakeResolver{steps: []apexStep{
 			apexReply(dnsclient.RCodeNOERROR,
 				apexARR("example.com.", "192.0.2.2"),
-				bad, // A без IP — мусор, пропускается
-				apexAAAARR("example.com.", "2001:db8::1"), // не тот тип записи
+				bad, // an A without an IP — junk, skipped
+				apexAAAARR("example.com.", "2001:db8::1"), // not the record type we need
 				apexARR("example.com.", "192.0.2.1"))}}
 		res, err := CheckApex(context.Background(), fake, "example.com")
 		if err != nil {
@@ -388,7 +393,7 @@ func TestCheckApexAddresses(t *testing.T) {
 	})
 }
 
-// --- контракт ApexStatus: Stop и DomainStatus ------------------------------------
+// --- the ApexStatus contract: Stop and DomainStatus ----------------------------
 
 func TestApexStatusStopAndDomainStatus(t *testing.T) {
 	cases := []struct {
@@ -421,7 +426,7 @@ func TestApexStatusStopAndDomainStatus(t *testing.T) {
 	}
 }
 
-// --- отмена контекста --------------------------------------------------------
+// --- context cancellation -------------------------------------------------------
 
 func TestCheckApexContext(t *testing.T) {
 	t.Run("отмена до запроса — ошибка, резолвер не зовётся", func(t *testing.T) {
@@ -456,7 +461,7 @@ func TestCheckApexContext(t *testing.T) {
 		defer cancel()
 		fake := &apexFakeResolver{steps: []apexStep{
 			apexReply(dnsclient.RCodeNOERROR), // A: NODATA
-			apexFail(context.Canceled)}}       // NS: отмена во время запроса
+			apexFail(context.Canceled)}}       // NS: a cancellation during the query
 		fake.onCall = func(n int) {
 			if n == 2 {
 				cancel()
@@ -471,8 +476,9 @@ func TestCheckApexContext(t *testing.T) {
 		}
 	})
 	t.Run("ошибка Exchange без отмены ctx — temp_error, не ошибка", func(t *testing.T) {
-		// Резолвер вернул context.Canceled, но собственный ctx жив:
-		// классификация по состоянию вызывающего контекста.
+		// The resolver returned context.Canceled, but the caller's own
+		// ctx is alive: the classification goes by the state of the
+		// caller's context.
 		fake := &apexFakeResolver{steps: []apexStep{apexFail(context.Canceled)}}
 		res, err := CheckApex(context.Background(), fake, "example.com")
 		if err != nil {
@@ -484,7 +490,7 @@ func TestCheckApexContext(t *testing.T) {
 	})
 }
 
-// --- недопустимое имя --------------------------------------------------------
+// --- an invalid name -------------------------------------------------------------
 
 func TestCheckApexEmptyDomain(t *testing.T) {
 	for _, name := range []string{"", "   ", "."} {

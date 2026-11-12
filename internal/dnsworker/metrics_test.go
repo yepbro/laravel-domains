@@ -1,9 +1,9 @@
-// Юнит-тесты приборов DNS-этапа (T-077, ТЗ 5.9): nil-безопасность,
-// регистрация и экспорт значений через Gather (счётчик эпизодов,
-// гистограмма длительностей, счётчик финальных статусов), инкременты
-// в типовом пути цикла Run — на фейках пула/очереди/резолвера из
-// result_test.go (два домена: с адресами — без статуса, NXDOMAIN —
-// not_delegated).
+// Unit tests of the DNS stage instruments (T-077, spec 5.9): nil safety,
+// registration and the export of the values via Gather (the episode
+// counter, the duration histogram, the final status counter), the
+// increments on the typical path of the Run loop — on the pool/queue/
+// resolver fakes from result_test.go (two domains: with addresses — no
+// status, NXDOMAIN — not_delegated).
 package dnsworker
 
 import (
@@ -18,8 +18,9 @@ import (
 	"crawler/internal/queue"
 )
 
-// dnsMetricValue — значение серии counter/histogram-семейства name с
-// меткой label (для гистограммы берётся счётчик наблюдений _count).
+// dnsMetricValue — the value of the counter/histogram family name's
+// series with the label label (for a histogram the observation count
+// _count is taken).
 func dnsMetricValue(t *testing.T, g prometheus.Gatherer, name, label string) float64 {
 	t.Helper()
 	families, err := g.Gather()
@@ -46,7 +47,7 @@ func dnsMetricValue(t *testing.T, g prometheus.Gatherer, name, label string) flo
 			}
 		}
 	}
-	return -1 // серия не найдена — тест провалит сравнением
+	return -1 // the series is not found — the test will fail by comparison
 }
 
 func TestMetricsNilSafe(t *testing.T) {
@@ -54,9 +55,9 @@ func TestMetricsNilSafe(t *testing.T) {
 		t.Fatal("NewMetrics(nil) != nil — изолированные сборки без реестра")
 	}
 	var m *Metrics
-	m.Episode(time.Second)             // no-op, не паникует
-	m.DomainStatus(model.StatusNoHTTP) // no-op
-	m.DBDeadlockRetried(1)             // no-op (T-268)
+	m.Episode(time.Second)             // a no-op, no panic
+	m.DomainStatus(model.StatusNoHTTP) // a no-op
+	m.DBDeadlockRetried(1)             // a no-op (T-268)
 }
 
 func TestMetricsRegistered(t *testing.T) {
@@ -74,7 +75,8 @@ func TestMetricsRegistered(t *testing.T) {
 	m.DBDeadlockRetried(1) // T-268
 	m.DBDeadlockRetried(2)
 
-	// Проверки серий (имя + значение метки): задачи и длительности.
+	// Series checks (the name + the label value): the tasks and the
+	// durations.
 	if got := dnsMetricValue(t, reg, "crawler_stage_tasks_total", metrics.StageDNS); got != 2 {
 		t.Errorf("crawler_stage_tasks_total = %v, want 2", got)
 	}
@@ -95,9 +97,9 @@ func TestMetricsRegistered(t *testing.T) {
 	}
 }
 
-// TestMetricsRunSmoke — приборы инкрементируются типовым путём цикла:
-// пачка q:dns с двумя доменами (адреса есть — без статуса; NXDOMAIN —
-// not_delegated) → 2 эпизода, 1 терминальный статус.
+// TestMetricsRunSmoke — the instruments are incremented on the typical
+// loop path: a q:dns batch with two domains (addresses present — no
+// status; NXDOMAIN — not_delegated) → 2 episodes, 1 terminal status.
 func TestMetricsRunSmoke(t *testing.T) {
 	reg := metrics.New("dns-worker")
 	j := &resultJournal{ackNotify: make(chan struct{}, 4)}

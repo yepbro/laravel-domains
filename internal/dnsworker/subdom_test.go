@@ -1,9 +1,11 @@
-// Юнит-тесты проверки субдоменов (T-037, ТЗ 5.4 п. 2) на фейковом
-// dnsclient.Resolver без сети (стиль internal/dnsclient/client_test.go):
-// A-записи, цепочки CNAME в одном ответе и обменами, циклы и предел
-// глубины, CNAME→NXDOMAIN, флаг AAAA, агрегация DNSMask, изоляция ошибок
-// субдоменов, валидация входа и отмена ctx. Идентификаторы — с префиксом
-// subdom против параллельных файлов apex*/wild* (T-036/T-038).
+// Unit tests of the subdomain check (T-037, spec 5.4 item 2) on a fake
+// dnsclient.Resolver without a network (the style of
+// internal/dnsclient/client_test.go): A records, CNAME chains in one
+// answer and across exchanges, loops and the depth limit,
+// CNAME→NXDOMAIN, the AAAA flag, the DNSMask aggregation, the isolation
+// of subdomain errors, input validation and a ctx cancellation. The
+// identifiers carry the subdom prefix against the parallel apex*/wild*
+// files (T-036/T-038).
 
 package dnsworker
 
@@ -22,18 +24,18 @@ import (
 	"crawler/internal/model"
 )
 
-// --- фейковый Resolver -------------------------------------------------------
+// --- the fake Resolver --------------------------------------------------------
 
-// subdomFakeResolver — dnsclient.Resolver без сети: handler отвечает на
-// вопросы, все вызовы записываются (контракт числа и порядка обменов —
-// часть проверок: лишних CNAME-вопросов и повторных обходов цепочки
-// быть не должно).
+// subdomFakeResolver — a dnsclient.Resolver without a network: the
+// handler answers the questions, all calls are recorded (the contract on
+// the number and order of the exchanges is part of the checks: there
+// must be no extra CNAME questions and no repeated chain traversals).
 type subdomFakeResolver struct {
 	calls   []dnsclient.Question
 	handler func(q dnsclient.Question) (*dnsclient.Result, error)
 }
 
-// compile-time check: фейк — Resolver.
+// compile-time check: the fake is a Resolver.
 var _ dnsclient.Resolver = (*subdomFakeResolver)(nil)
 
 func (f *subdomFakeResolver) Exchange(ctx context.Context, q dnsclient.Question) (*dnsclient.Result, error) {
@@ -44,21 +46,21 @@ func (f *subdomFakeResolver) Exchange(ctx context.Context, q dnsclient.Question)
 	return f.handler(q)
 }
 
-// subdomZone — декларативная зона для фейка: секция answer, RCODE и
-// транспортные ошибки по ключу «fqdn|тип» (subdomKey). Отсутствующий
-// ключ — NOERROR с пустым ответом (NODATA).
+// subdomZone — a declarative zone for the fake: the answer section, the
+// RCODE and transport errors by the "fqdn|type" key (subdomKey). A
+// missing key — NOERROR with an empty answer (NODATA).
 type subdomZone struct {
 	answers map[string][]dns.RR
 	rcodes  map[string]dnsclient.RCode
 	errs    map[string]error
 }
 
-// subdomKey — ключ зоны: каноническое имя и тип записи.
+// subdomKey — the zone key: the canonical name and the record type.
 func subdomKey(name string, t uint16) string {
 	return subdomCanon(name) + "|" + dns.TypeToString[t]
 }
 
-// subdomResolver собирает Resolver из зоны.
+// subdomResolver assembles a Resolver from the zone.
 func (z subdomZone) resolver() *subdomFakeResolver {
 	return &subdomFakeResolver{handler: func(q dnsclient.Question) (*dnsclient.Result, error) {
 		key := subdomKey(q.Name, q.Type)
@@ -73,7 +75,7 @@ func (z subdomZone) resolver() *subdomFakeResolver {
 	}}
 }
 
-// --- конструкторы записей и вспомогательные проверки -----------------------
+// --- record constructors and helper checks ------------------------------------
 
 func subdomA(name, ip string) dns.RR {
 	return &dns.A{
@@ -96,7 +98,8 @@ func subdomCNAME(from, to string) dns.RR {
 	}
 }
 
-// subdomIPs — строковое представление адресов для сообщений об ошибке.
+// subdomIPs — the string representation of the addresses for error
+// messages.
 func subdomIPs(addrs []netip.Addr) []string {
 	out := make([]string, 0, len(addrs))
 	for _, a := range addrs {
@@ -105,7 +108,7 @@ func subdomIPs(addrs []netip.Addr) []string {
 	return out
 }
 
-// subdomEqualIPs сравнивает адреса как строки в порядке следования.
+// subdomEqualIPs compares the addresses as strings in order.
 func subdomEqualIPs(t *testing.T, got []netip.Addr, want ...string) {
 	t.Helper()
 	if gotS, wantS := subdomIPs(got), want; len(gotS) != len(wantS) {
@@ -119,7 +122,7 @@ func subdomEqualIPs(t *testing.T, got []netip.Addr, want ...string) {
 	}
 }
 
-// subdomCallCount считает обмены с именем и типом.
+// subdomCallCount counts the exchanges with the name and type.
 func subdomCallCount(f *subdomFakeResolver, name string, t uint16) int {
 	n := 0
 	for _, q := range f.calls {
@@ -130,9 +133,9 @@ func subdomCallCount(f *subdomFakeResolver, name string, t uint16) int {
 	return n
 }
 
-// subdomAssertNoCNAMEQuestions — контракт проекта: отдельные вопросы типа
-// CNAME не выдаются, записи CNAME приходят в ответах A/AAAA (RFC 1035
-// §3.3.1; комментарий subdomCheckOne).
+// subdomAssertNoCNAMEQuestions — the project contract: separate
+// CNAME-type questions are not issued, CNAME records arrive in the
+// A/AAAA answers (RFC 1035 §3.3.1; the subdomCheckOne comment).
 func subdomAssertNoCNAMEQuestions(t *testing.T, f *subdomFakeResolver) {
 	t.Helper()
 	for _, q := range f.calls {
@@ -142,7 +145,7 @@ func subdomAssertNoCNAMEQuestions(t *testing.T, f *subdomFakeResolver) {
 	}
 }
 
-// subdomSubs — вход из строк-меток с последовательными id.
+// subdomSubs — an input of label rows with sequential ids.
 func subdomSubs(labels ...string) []model.Subdomain {
 	subs := make([]model.Subdomain, 0, len(labels))
 	for i, l := range labels {
@@ -151,13 +154,13 @@ func subdomSubs(labels ...string) []model.Subdomain {
 	return subs
 }
 
-// --- A-записи напрямую -------------------------------------------------------
+// --- A records directly ---------------------------------------------------------
 
 func TestSubdomDirectA(t *testing.T) {
 	z := subdomZone{answers: map[string][]dns.RR{
 		subdomKey("example.com", dns.TypeA): {
 			subdomA("example.com.", "192.0.2.10"),
-			subdomA("example.com.", "192.0.2.10"), // дубль записи — один адрес
+			subdomA("example.com.", "192.0.2.10"), // a duplicate record — one address
 			subdomA("example.com.", "192.0.2.11"),
 		},
 		subdomKey("www.example.com", dns.TypeA): {subdomA("www.example.com.", "192.0.2.20")},
@@ -177,7 +180,7 @@ func TestSubdomDirectA(t *testing.T) {
 		t.Fatalf("апекс: label=%q id=%d, ожидалось \"\" и 0", apex.Label, apex.ID)
 	}
 	subdomEqualIPs(t, apex.A, "192.0.2.10", "192.0.2.11")
-	subdomEqualIPs(t, apex.AAAA) // AAAA-вопрос задан, ответ пуст (NODATA)
+	subdomEqualIPs(t, apex.AAAA) // the AAAA question was asked, the answer is empty (NODATA)
 	if apex.HasAddrs() != true {
 		t.Fatal("апекс: HasAddrs = false при найденных A")
 	}
@@ -191,8 +194,9 @@ func TestSubdomDirectA(t *testing.T) {
 	www := rep.Results[1]
 	subdomEqualIPs(t, www.A, "192.0.2.20")
 
-	// Апекс спрашивается именем самого домена (не «.example.com»),
-	// вопросы AAAA заданы обоим, CNAME-вопросов нет.
+	// The apex is queried by the domain name itself (not ".example.com"),
+	// the AAAA questions are asked of both, and there are no CNAME
+	// questions.
 	if q := f.calls[0]; subdomCanon(q.Name) != "example.com." || q.Type != dns.TypeA {
 		t.Fatalf("первый вопрос %q %v, ожидался A example.com.", q.Name, dns.TypeToString[q.Type])
 	}
@@ -204,17 +208,18 @@ func TestSubdomDirectA(t *testing.T) {
 	}
 	subdomAssertNoCNAMEQuestions(t, f)
 
-	// Маска: оба субдомена с адресами (биты 0 и 1).
+	// The mask: both subdomains have addresses (bits 0 and 1).
 	if want := model.DNSMask(0b11); rep.Mask != want {
 		t.Fatalf("маска %v (%05b), ожидалось %v", rep.Mask, int64(rep.Mask), want)
 	}
 }
 
-// --- цепочки CNAME -----------------------------------------------------------
+// --- CNAME chains ---------------------------------------------------------------
 
 func TestSubdomCNAMEOneHopInAnswer(t *testing.T) {
-	// Рекурсор прикладывает цепочку к ответу целиком: CNAME и A цели —
-	// в одном ответе, второй A-обмен не нужен.
+	// The recursing resolver attaches the chain to the answer in full:
+	// the CNAME and the target's A are in one answer, a second A
+	// exchange is not needed.
 	z := subdomZone{answers: map[string][]dns.RR{
 		subdomKey("www.example.com", dns.TypeA): {
 			subdomCNAME("www.example.com.", "example.com."),
@@ -236,7 +241,7 @@ func TestSubdomCNAMEOneHopInAnswer(t *testing.T) {
 		t.Fatalf("CNAME=%q Target=%q, ожидалась цель example.com.", r.CNAME(), r.Target())
 	}
 	subdomEqualIPs(t, r.A, "192.0.2.1")
-	subdomEqualIPs(t, r.AAAA, "2001:db8::1") // AAAA — по терминальному имени
+	subdomEqualIPs(t, r.AAAA, "2001:db8::1") // AAAA — by the terminal name
 	if !r.HasAddrs() || !rep.Mask.Test(0) {
 		t.Fatal("www с адресами: бит маски не поставлен")
 	}
@@ -253,8 +258,9 @@ func TestSubdomCNAMEOneHopInAnswer(t *testing.T) {
 }
 
 func TestSubdomCNAMEFollowUpExchanges(t *testing.T) {
-	// Ответ первого обмена содержит только CNAME (цель вне зоны охвата
-	// ответа) — терминал доискивается собственным обменом.
+	// The answer of the first exchange contains only the CNAME (the
+	// target is outside the answer's coverage) — the terminal is chased
+	// by its own exchange.
 	z := subdomZone{answers: map[string][]dns.RR{
 		subdomKey("www.example.com", dns.TypeA): {
 			subdomCNAME("www.example.com.", "cdn.example.net."),
@@ -284,8 +290,8 @@ func TestSubdomCNAMEFollowUpExchanges(t *testing.T) {
 }
 
 func TestSubdomLongChainInOneAnswer(t *testing.T) {
-	// Цепочка www→c1→…→c5 с A у c5 целиком в одном ответе: разворачивается
-	// без единого дополнительного обмена.
+	// The chain www→c1→…→c5 with an A at c5 entirely in one answer: it
+	// unwinds without a single extra exchange.
 	chain := []string{"www.example.com.", "c1.example.net.", "c2.example.net.",
 		"c3.example.net.", "c4.example.net.", "c5.example.net."}
 	answer := []dns.RR{subdomCNAME(chain[0], chain[1])}
@@ -316,8 +322,9 @@ func TestSubdomLongChainInOneAnswer(t *testing.T) {
 }
 
 func TestSubdomCNAMELoop(t *testing.T) {
-	// A→B→A: цикл виден по множеству посещённых имён раньше предела
-	// глубины; адресов нет, бит не ставится, AAAA не спрашивается.
+	// A→B→A: the loop is visible via the set of visited names earlier
+	// than the depth limit; no addresses, the bit is not set, AAAA is
+	// not asked.
 	z := subdomZone{answers: map[string][]dns.RR{
 		subdomKey("www.example.com", dns.TypeA): {subdomCNAME("www.example.com.", "a.example.com.")},
 		subdomKey("a.example.com", dns.TypeA):   {subdomCNAME("a.example.com.", "www.example.com.")},
@@ -347,8 +354,8 @@ func TestSubdomCNAMELoop(t *testing.T) {
 }
 
 func TestSubdomCNAMEDepthExceeded(t *testing.T) {
-	// Лестница уникальных имён длиннее предела: обрыв ErrSubdomCNAMEDepth
-	// после subdomMaxChain переходов.
+	// A ladder of unique names longer than the limit: it breaks off with
+	// ErrSubdomCNAMEDepth after subdomMaxChain hops.
 	const rungs = subdomMaxChain + 5
 	z := subdomZone{answers: map[string][]dns.RR{}}
 	for i := 0; i < rungs; i++ {
@@ -376,11 +383,11 @@ func TestSubdomCNAMEDepthExceeded(t *testing.T) {
 }
 
 func TestSubdomCNAMETargetNXDOMAIN(t *testing.T) {
-	// CNAME на внешнее имя, которого не существует (RFC 8020): субдомен-
-	// псевдоним существует, адресов нет — Err нет, признак NXDOMAIN в
-	// RCode, бит не ставится, AAAA не спрашивается (NXDOMAIN безусловен
-	// для всех типов). Для статуса домена — вклад в «нет адресов»
-	// (ТЗ 5.4 п. 5), не temp_error.
+	// A CNAME to an external name that does not exist (RFC 8020): the
+	// alias subdomain exists, there are no addresses — no Err, the
+	// NXDOMAIN sign is in RCode, the bit is not set, AAAA is not asked
+	// (NXDOMAIN is unconditional for all types). For the domain status —
+	// a contribution to "no addresses" (spec 5.4 item 5), not temp_error.
 	z := subdomZone{
 		answers: map[string][]dns.RR{
 			subdomKey("www.example.com", dns.TypeA): {
@@ -418,10 +425,10 @@ func TestSubdomCNAMETargetNXDOMAIN(t *testing.T) {
 	}
 }
 
-// --- флаг AAAA ---------------------------------------------------------------
+// --- the AAAA flag ---------------------------------------------------------------
 
 func TestSubdomAAAAFlag(t *testing.T) {
-	// Выключен — вопросов AAAA нет вовсе, адреса только A.
+	// Off — no AAAA questions at all, the addresses are A only.
 	z := subdomZone{answers: map[string][]dns.RR{
 		subdomKey("example.com", dns.TypeA):    {subdomA("example.com.", "192.0.2.1")},
 		subdomKey("example.com", dns.TypeAAAA): {subdomAAAA("example.com.", "2001:db8::1")},
@@ -439,8 +446,8 @@ func TestSubdomAAAAFlag(t *testing.T) {
 		t.Fatal("бит по A-адресам не поставлен")
 	}
 
-	// Включён и имя живёт только по IPv6: A — NODATA, AAAA даёт адреса,
-	// субдомен считается резолвящимся.
+	// On, and the name only lives over IPv6: A — NODATA, AAAA gives the
+	// addresses, the subdomain counts as resolving.
 	z2 := subdomZone{answers: map[string][]dns.RR{
 		subdomKey("v6.example.com", dns.TypeAAAA): {subdomAAAA("v6.example.com.", "2001:db8::3")},
 	}}
@@ -458,9 +465,10 @@ func TestSubdomAAAAFlag(t *testing.T) {
 }
 
 func TestSubdomAAAATransportError(t *testing.T) {
-	// Транспортный сбой AAAA при найденных A: бит ставится по имеющимся
-	// адресам (субдомен резолвится), сбой — в Err, RCode последнего
-	// успешного обмена сохранён (NOERROR).
+	// A transport failure of AAAA with A records found: the bit is set
+	// by the available addresses (the subdomain resolves), the failure —
+	// in Err, the RCode of the last successful exchange is preserved
+	// (NOERROR).
 	z := subdomZone{
 		answers: map[string][]dns.RR{
 			subdomKey("www.example.com", dns.TypeA): {subdomA("www.example.com.", "192.0.2.7")},
@@ -488,12 +496,12 @@ func TestSubdomAAAATransportError(t *testing.T) {
 	}
 }
 
-// --- агрегация DNSMask и изоляция ошибок ------------------------------------
+// --- DNSMask aggregation and error isolation -------------------------------------
 
 func TestSubdomMaskAggregatesAndErrorsIsolated(t *testing.T) {
-	// Пачка субдоменов с разными исходами: SERVFAIL, NXDOMAIN и
-	// транспортный сбой отдельных имён не прерывают остальные — итог по
-	// каждому, маска только по адресам.
+	// A batch of subdomains with different outcomes: SERVFAIL, NXDOMAIN
+	// and a transport failure of individual names do not interrupt the
+	// others — an outcome per each, the mask only by the addresses.
 	z := subdomZone{
 		answers: map[string][]dns.RR{
 			subdomKey("example.com", dns.TypeA):     {subdomA("example.com.", "192.0.2.1")},
@@ -537,7 +545,7 @@ func TestSubdomMaskAggregatesAndErrorsIsolated(t *testing.T) {
 		t.Fatalf("api: Err=%v RCode=%v — транспортный сбой в Err", api.Err, api.RCode)
 	}
 
-	// Биты 0 и 4 — только субдомены с адресами.
+	// Bits 0 and 4 — only the subdomains with addresses.
 	want, errW := model.NewDNSMask(0, 4)
 	if errW != nil {
 		t.Fatalf("NewDNSMask: %v", errW)
@@ -551,8 +559,9 @@ func TestSubdomMaskAggregatesAndErrorsIsolated(t *testing.T) {
 }
 
 func TestSubdomDisabledSkipped(t *testing.T) {
-	// Отключённые строки справочника не спрашиваются и в отчёт не входят:
-	// входом может быть полный справочник (фильтр «включённые» — здесь).
+	// Disabled rows of the reference table are not queried and do not
+	// enter the report: the input may be the full reference table (the
+	// "enabled" filter lives here).
 	z := subdomZone{answers: map[string][]dns.RR{
 		subdomKey("www.example.com", dns.TypeA):   {subdomA("www.example.com.", "192.0.2.2")},
 		subdomKey("admin.example.com", dns.TypeA): {subdomA("admin.example.com.", "192.0.2.3")},
@@ -575,7 +584,7 @@ func TestSubdomDisabledSkipped(t *testing.T) {
 	}
 }
 
-// --- валидация входа ---------------------------------------------------------
+// --- input validation -------------------------------------------------------------
 
 func TestSubdomValidationErrors(t *testing.T) {
 	long := strings.Repeat("a", 64)
@@ -615,10 +624,11 @@ func TestSubdomValidationErrors(t *testing.T) {
 	}
 }
 
-// --- отмена контекста --------------------------------------------------------
+// --- context cancellation -----------------------------------------------------------
 
 func TestSubdomContextCanceled(t *testing.T) {
-	// Отмена до вызова: ни одного обмена, ошибка ctx, отчёта нет.
+	// A cancellation before the call: not a single exchange, a ctx
+	// error, no report.
 	f := subdomZone{answers: map[string][]dns.RR{
 		subdomKey("example.com", dns.TypeA): {subdomA("example.com.", "192.0.2.1")},
 	}}.resolver()
@@ -633,14 +643,15 @@ func TestSubdomContextCanceled(t *testing.T) {
 		t.Fatal("отчёт при отмене не выдаётся")
 	}
 
-	// Отмена в середине пачки: первый субдомен проверен, обмен второго
-	// прерывается — весь вызов завершается ошибкой ctx без частичного
-	// отчёта (задача вернётся доставкой at-least-once, ТЗ 3.4).
+	// A cancellation in the middle of the batch: the first subdomain is
+	// checked, the second's exchange is interrupted — the whole call
+	// ends with a ctx error without a partial report (the task will come
+	// back via at-least-once delivery, spec 3.4).
 	ctx2, cancel2 := context.WithCancel(context.Background())
 	defer cancel2()
 	f2 := &subdomFakeResolver{handler: func(q dnsclient.Question) (*dnsclient.Result, error) {
 		if subdomCanon(q.Name) == subdomCanon("www.example.com") {
-			cancel2() // воркер «погиб» посреди второго субдомена
+			cancel2() // the worker "died" in the middle of the second subdomain
 			return nil, ctx2.Err()
 		}
 		return &dnsclient.Result{RCode: dnsclient.RCodeNOERROR,
