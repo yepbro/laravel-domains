@@ -97,7 +97,7 @@ echo "паков: $(ls /var/lib/crawler/content 2>/dev/null | grep -c '^pack-')"
 echo "старейший/новейший пак:"
 ls -lh --time-style=long-iso /var/lib/crawler/content 2>/dev/null | awk '/pack-/ {print $6, $7, $8}' | sed -n '1p;$p'
 echo "[компактификация/retention за 24ч]"
-journalctl -u crawler-http-worker --since -24h -q 2>/dev/null | grep -E "компактификации паков|retention" | tail -5
+journalctl -u crawler-http-worker --since -24h -q 2>/dev/null | grep -E "pack compaction pass|retention" | tail -5
 echo
 
 echo "## Метрики http-worker:9104"
