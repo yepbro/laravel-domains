@@ -29,7 +29,7 @@ type DNSMask int64
 // table (crawlerctl subdomains add, spec 5.10).
 func ValidateSubdomainID(id int) error {
 	if id < 0 || id > maxSubdomainID {
-		return fmt.Errorf("model: номер субдомена %d вне диапазона 0..%d (максимум %d субдомена, бит 63 маски знаковый; ТЗ 5.10)", id, maxSubdomainID, MaxSubdomains)
+		return fmt.Errorf("model: subdomain id %d out of range 0..%d (at most %d subdomains, bit 63 of the mask is the sign bit; spec 5.10)", id, maxSubdomainID, MaxSubdomains)
 	}
 	return nil
 }

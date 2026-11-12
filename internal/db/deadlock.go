@@ -123,7 +123,7 @@ func IsDeadlock(err error) bool {
 // attempt was interrupted by a shutdown, not exhausted.
 func RetryDeadlock(ctx context.Context, r DeadlockRetry, onRetry func(attempt int), fn func() error) error {
 	if fn == nil {
-		return errors.New("db: ретрай 40P01: повторяемая функция не задана")
+		return errors.New("db: 40P01 retry: retryable function not set")
 	}
 	o := r.withDefaults()
 	err := fn()

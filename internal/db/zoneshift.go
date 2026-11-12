@@ -91,10 +91,10 @@ func (s *ZoneShift) Exec(ctx context.Context, ex Execer) error {
 	}
 	tag, err := ex.Exec(ctx, ZoneCounterShiftSQL, ids, total, pending, queued, checked)
 	if err != nil {
-		return fmt.Errorf("db: сдвиг счётчиков зон (%d зон): %w", len(ids), err)
+		return fmt.Errorf("db: zone counter shift (%d zones): %w", len(ids), err)
 	}
 	if tag.RowsAffected() != int64(len(ids)) {
-		return fmt.Errorf("db: сдвиг счётчиков зон: затронуто %d строк из %d (строка зоны обязательна)",
+		return fmt.Errorf("db: zone counter shift: %d of %d rows affected (the zone row is required)",
 			tag.RowsAffected(), len(ids))
 	}
 	return nil

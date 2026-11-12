@@ -584,10 +584,10 @@ func TestStatusFetchErrors(t *testing.T) {
 	boom := errors.New("boom")
 	pool := newStatusPool()
 	pool.setQueryErr(boom)
-	if _, err := FetchZoneStats(context.Background(), pool); err == nil || !strings.Contains(err.Error(), "status: зоны:") {
+	if _, err := FetchZoneStats(context.Background(), pool); err == nil || !strings.Contains(err.Error(), "status: zones:") {
 		t.Errorf("FetchZoneStats err = %v, хочу контекст «status: зоны:»", err)
 	}
-	if _, err := FetchThroughput(context.Background(), pool); err == nil || !strings.Contains(err.Error(), "status: темп:") {
+	if _, err := FetchThroughput(context.Background(), pool); err == nil || !strings.Contains(err.Error(), "status: throughput:") {
 		t.Errorf("FetchThroughput err = %v, хочу контекст «status: темп:»", err)
 	}
 	if _, err := FetchZoneStats(context.Background(), nil); err == nil {
@@ -611,14 +611,14 @@ func TestFetchRowDegradations(t *testing.T) {
 		glitch  statusGlitch
 		wantErr string
 	}{
-		{"зоны: нечитаемая строка", zoneStatsSQL, statusGlitch{badRow: true}, "status: зоны: чтение:"},
-		{"зоны: ошибка итерации", zoneStatsSQL, statusGlitch{rowsErr: errors.New("соединение сброшено")}, "status: зоны: соединение сброшено"},
-		{"темп: пустой ответ", throughputSQL, statusGlitch{empty: true}, "status: темп: пустой ответ"},
-		{"темп: нечитаемая строка", throughputSQL, statusGlitch{badRow: true}, "status: темп: чтение:"},
-		{"темп: ошибка итерации", throughputSQL, statusGlitch{rowsErr: errors.New("соединение сброшено")}, "status: темп: соединение сброшено"},
-		{"статусы: нечитаемая строка", domainStatusSQL, statusGlitch{badRow: true}, "status: статусы: чтение:"},
-		{"статусы: ошибка итерации", domainStatusSQL, statusGlitch{rowsErr: errors.New("соединение сброшено")}, "status: статусы: соединение сброшено"},
-		{"ingest: нечитаемая строка", ingestRecentSQL, statusGlitch{badRow: true}, "status: ingest: чтение:"},
+		{"зоны: нечитаемая строка", zoneStatsSQL, statusGlitch{badRow: true}, "status: zones: reading:"},
+		{"зоны: ошибка итерации", zoneStatsSQL, statusGlitch{rowsErr: errors.New("соединение сброшено")}, "status: zones: соединение сброшено"},
+		{"темп: пустой ответ", throughputSQL, statusGlitch{empty: true}, "status: throughput: empty response"},
+		{"темп: нечитаемая строка", throughputSQL, statusGlitch{badRow: true}, "status: throughput: reading:"},
+		{"темп: ошибка итерации", throughputSQL, statusGlitch{rowsErr: errors.New("соединение сброшено")}, "status: throughput: соединение сброшено"},
+		{"статусы: нечитаемая строка", domainStatusSQL, statusGlitch{badRow: true}, "status: statuses: reading:"},
+		{"статусы: ошибка итерации", domainStatusSQL, statusGlitch{rowsErr: errors.New("соединение сброшено")}, "status: statuses: соединение сброшено"},
+		{"ingest: нечитаемая строка", ingestRecentSQL, statusGlitch{badRow: true}, "status: ingest: reading:"},
 		{"ingest: ошибка итерации", ingestRecentSQL, statusGlitch{rowsErr: errors.New("соединение сброшено")}, "status: ingest: соединение сброшено"},
 	}
 	for _, tc := range cases {
@@ -744,7 +744,7 @@ func TestFetchDomainStatuses(t *testing.T) {
 	// The pool errors and a nil pool.
 	pool = newStatusPool()
 	pool.setQueryErr(errors.New("boom"))
-	if _, err := FetchDomainStatuses(context.Background(), pool); err == nil || !strings.Contains(err.Error(), "status: статусы:") {
+	if _, err := FetchDomainStatuses(context.Background(), pool); err == nil || !strings.Contains(err.Error(), "status: statuses:") {
 		t.Errorf("ошибка пула = %v, хочу контекст «status: статусы:»", err)
 	}
 	if _, err := FetchDomainStatuses(context.Background(), nil); err == nil {
@@ -838,7 +838,7 @@ func TestFetchLaravelStatsDegradations(t *testing.T) {
 	// An empty aggregate without a rows error — an honest "empty".
 	pool := seeded(map[string]statusGlitch{laravelTotalsSQL: {empty: true}})
 	_, err := FetchLaravelStats(ctx, pool)
-	if err == nil || !strings.Contains(err.Error(), "status: laravel: пустой ответ агрегата") {
+	if err == nil || !strings.Contains(err.Error(), "status: laravel: empty aggregate response") {
 		t.Fatalf("пустой агрегат: ошибка = %v, want «пустой ответ агрегата»", err)
 	}
 	if n := pool.closeCount(); n != 1 {
@@ -1073,24 +1073,24 @@ func TestFormatDuration(t *testing.T) {
 		sec  int64
 		want string
 	}{
-		{0, "0с"},
-		{45, "45с"},
-		{59, "59с"},
-		{60, "1м"},
-		{89, "1м"},    // (89+30)/60 = 1: the rounding boundary to a minute
-		{90, "2м"},    // rounding to a minute
-		{3599, "60м"}, // 59m59s → 60m
-		{3600, "1ч 00м"},
-		{5370, "1ч 29м"}, // 1h29m30s: the minutes from the remainder, not from the whole number
-		{7199, "1ч 59м"}, // 1h59m59s: an hour is full 3600-second blocks
-		{19200, "5ч 20м"},
-		{86399, "23ч 59м"}, // the edge of the hours branch: the day has not started yet
-		{86400, "1д 0ч"},
-		{89999, "1д 0ч"},   // 1d 0h59m59s: the hour from the day remainder
-		{93599, "1д 1ч"},   // 1d 1h59m59s
-		{93600, "1д 2ч"},   // exactly 1d 2h
-		{172799, "1д 23ч"}, // 1d 23h59m59s: the edge before "2d"
-		{275400, "3д 4ч"},
+		{0, "0s"},
+		{45, "45s"},
+		{59, "59s"},
+		{60, "1m"},
+		{89, "1m"},    // (89+30)/60 = 1: the rounding boundary to a minute
+		{90, "2m"},    // rounding to a minute
+		{3599, "60m"}, // 59m59s → 60m
+		{3600, "1h 00m"},
+		{5370, "1h 29m"}, // 1h29m30s: the minutes from the remainder, not from the whole number
+		{7199, "1h 59m"}, // 1h59m59s: an hour is full 3600-second blocks
+		{19200, "5h 20m"},
+		{86399, "23h 59m"}, // the edge of the hours branch: the day has not started yet
+		{86400, "1d 0h"},
+		{89999, "1d 0h"},   // 1d 0h59m59s: the hour from the day remainder
+		{93599, "1d 1h"},   // 1d 1h59m59s
+		{93600, "1d 2h"},   // exactly 1d 2h
+		{172799, "1d 23h"}, // 1d 23h59m59s: the edge before "2d"
+		{275400, "3d 4h"},
 	}
 	for _, tc := range cases {
 		if got := FormatDuration(tc.sec); got != tc.want {

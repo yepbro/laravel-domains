@@ -173,31 +173,31 @@ func (o LimitOptions) withDefaults() LimitOptions {
 // non-multiplicative factors.
 func (o LimitOptions) validate() error {
 	if o.Concurrency < 1 {
-		return fmt.Errorf("dnsclient: лимит concurrency %d: ожидается ≥ 1", o.Concurrency)
+		return fmt.Errorf("dnsclient: concurrency limit %d: expected ≥ 1", o.Concurrency)
 	}
 	if o.MaxQPS < 1 {
-		return fmt.Errorf("dnsclient: лимит max_qps %d: ожидается ≥ 1", o.MaxQPS)
+		return fmt.Errorf("dnsclient: max_qps limit %d: expected ≥ 1", o.MaxQPS)
 	}
 	if o.Burst < 1 {
-		return fmt.Errorf("dnsclient: лимит burst %d: ожидается ≥ 1", o.Burst)
+		return fmt.Errorf("dnsclient: burst limit %d: expected ≥ 1", o.Burst)
 	}
 	if o.AdaptiveWindow < 2 {
-		return fmt.Errorf("dnsclient: окно адаптива %d: ожидается ≥ 2", o.AdaptiveWindow)
+		return fmt.Errorf("dnsclient: adaptive window %d: expected ≥ 2", o.AdaptiveWindow)
 	}
 	if o.AdaptiveHighRatio <= 0 || o.AdaptiveHighRatio > 1 {
-		return fmt.Errorf("dnsclient: порог снижения %v: ожидается (0, 1]", o.AdaptiveHighRatio)
+		return fmt.Errorf("dnsclient: downshift threshold %v: expected (0, 1]", o.AdaptiveHighRatio)
 	}
 	if o.AdaptiveLowRatio <= 0 || o.AdaptiveLowRatio >= o.AdaptiveHighRatio {
-		return fmt.Errorf("dnsclient: порог восстановления %v: ожидается (0, %v)", o.AdaptiveLowRatio, o.AdaptiveHighRatio)
+		return fmt.Errorf("dnsclient: recovery threshold %v: expected (0, %v)", o.AdaptiveLowRatio, o.AdaptiveHighRatio)
 	}
 	if o.AdaptiveDownFactor <= 0 || o.AdaptiveDownFactor >= 1 {
-		return fmt.Errorf("dnsclient: фактор снижения %v: ожидается (0, 1)", o.AdaptiveDownFactor)
+		return fmt.Errorf("dnsclient: downshift factor %v: expected (0, 1)", o.AdaptiveDownFactor)
 	}
 	if o.AdaptiveUpFactor <= 1 || o.AdaptiveUpFactor > 10 {
-		return fmt.Errorf("dnsclient: фактор восстановления %v: ожидается (1, 10]", o.AdaptiveUpFactor)
+		return fmt.Errorf("dnsclient: recovery factor %v: expected (1, 10]", o.AdaptiveUpFactor)
 	}
 	if o.AdaptiveFloorDivisor < 1 {
-		return fmt.Errorf("dnsclient: делитель пола лимитов %d: ожидается ≥ 1", o.AdaptiveFloorDivisor)
+		return fmt.Errorf("dnsclient: limit floor divisor %d: expected ≥ 1", o.AdaptiveFloorDivisor)
 	}
 	return nil
 }
@@ -631,7 +631,7 @@ func NewLimitResolver(next Resolver, opts LimitOptions) (*LimitResolver, error) 
 // newLimitResolver is the common part with clock injection (tests).
 func newLimitResolver(next Resolver, opts LimitOptions, clock limitClock) (*LimitResolver, error) {
 	if next == nil {
-		return nil, errors.New("dnsclient: NewLimitResolver: нижний резолвер не задан")
+		return nil, errors.New("dnsclient: NewLimitResolver: underlying resolver not set")
 	}
 	opts = opts.withDefaults()
 	if err := opts.validate(); err != nil {

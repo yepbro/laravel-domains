@@ -290,18 +290,18 @@ func TestError(t *testing.T) {
 	if e.Err == nil {
 		t.Error("Err = nil, want причина (ошибка idna)")
 	}
-	if msg := e.Error(); !strings.Contains(msg, "невалидное имя домена") || !strings.Contains(msg, "xn--bcher--kva.com") {
+	if msg := e.Error(); !strings.Contains(msg, "invalid domain name") || !strings.Contains(msg, "xn--bcher--kva.com") {
 		t.Errorf("Error() = %q, want класс и имя", msg)
 	}
 
 	// Формат Error() — точные строки, с причиной и без (мутант
 	// вырезания return терял бы причину, оставляя формат «: %v»).
-	withCause := &Error{Kind: ErrNameLen, Name: "x", Err: errors.New("причина")}
-	if got, want := withCause.Error(), `idn: имя длиннее 253 символов: "x": причина`; got != want {
+	withCause := &Error{Kind: ErrNameLen, Name: "x", Err: errors.New("reason")}
+	if got, want := withCause.Error(), `idn: name longer than 253 characters: "x": reason`; got != want {
 		t.Errorf("Error() с причиной = %q, want %q", got, want)
 	}
 	withoutCause := &Error{Kind: ErrEmpty, Name: "y"}
-	if got, want := withoutCause.Error(), `idn: пустое имя: "y"`; got != want {
+	if got, want := withoutCause.Error(), `idn: empty name: "y"`; got != want {
 		t.Errorf("Error() без причины = %q, want %q", got, want)
 	}
 

@@ -101,7 +101,7 @@ func (rt *Runtime) Run(ctx context.Context, _ *config.Config, pool Pool, domain 
 	start := time.Now()
 	norm, err := idn.Normalize(domain)
 	if err != nil {
-		return nil, fmt.Errorf("checker: некорректное имя домена %q: %w", domain, err)
+		return nil, fmt.Errorf("checker: invalid domain name %q: %w", domain, err)
 	}
 	res := &Result{Domain: norm.ASCII, Unicode: norm.Unicode, Zone: norm.Zone}
 
@@ -118,7 +118,7 @@ func (rt *Runtime) Run(ctx context.Context, _ *config.Config, pool Pool, domain 
 	dnsStart := time.Now()
 	apex, err := dnsworker.CheckApex(ctx, resolve, norm.ASCII)
 	if err != nil {
-		return nil, fmt.Errorf("checker: %s: апекс: %w", norm.ASCII, err)
+		return nil, fmt.Errorf("checker: %s: apex: %w", norm.ASCII, err)
 	}
 	res.Apex = apex.Status.String()
 	if apex.Status.Stop() {
@@ -131,19 +131,19 @@ func (rt *Runtime) Run(ctx context.Context, _ *config.Config, pool Pool, domain 
 
 	rep, err := dnsworker.CheckSubdomains(ctx, resolve, norm.ASCII, subs, rt.cfg.DNS.IPv6)
 	if err != nil {
-		return nil, fmt.Errorf("checker: %s: субдомены: %w", norm.ASCII, err)
+		return nil, fmt.Errorf("checker: %s: subdomains: %w", norm.ASCII, err)
 	}
 	var wild dnsworker.WildcardResult
 	if info, werr := dnsworker.DetectWildcard(ctx, resolve, norm.ASCII); werr != nil {
-		log.Warn("checker: wildcard-детект не удался — продолжаю без фильтрации", "err", werr)
+		log.Warn("checker: wildcard detection failed — continuing without filtering", "err", werr)
 	} else if info.Detected {
 		if wild, err = dnsworker.MarkWildcardSubdomains(info.Addrs, wildSubs(rep)); err != nil {
-			return nil, fmt.Errorf("checker: %s: wildcard-пометка: %w", norm.ASCII, err)
+			return nil, fmt.Errorf("checker: %s: wildcard marking: %w", norm.ASCII, err)
 		}
 	}
 	episode, err := dnsworker.DecideEpisode(apex, rep, wild)
 	if err != nil {
-		return nil, fmt.Errorf("checker: %s: решение эпизода: %w", norm.ASCII, err)
+		return nil, fmt.Errorf("checker: %s: episode decision: %w", norm.ASCII, err)
 	}
 	if !episode.HasHTTPTask() {
 		res.Terminal = episode.Status.String()
@@ -221,7 +221,7 @@ func (rt *Runtime) Run(ctx context.Context, _ *config.Config, pool Pool, domain 
 				sr.Scheme = "http"
 			}
 			if rec.ErrClass != httpworker.ErrNone {
-				sr.Status = "ошибка " + rec.ErrClass.String()
+				sr.Status = "error " + rec.ErrClass.String()
 			} else {
 				sr.Status = fmt.Sprintf("%d", rec.HTTPStatus)
 			}
@@ -240,7 +240,7 @@ func (rt *Runtime) Run(ctx context.Context, _ *config.Config, pool Pool, domain 
 					page.Headers = map[string][]string(ro.ResponseHeaders)
 					sr.Rendered = true
 				} else if render.ClassOf(rerr) == render.ClassBrowser {
-					log.Warn("checker: рендер недоступен — SPA по исходному HTML до конца проверки", "err", rerr)
+					log.Warn("checker: render unavailable — SPA on the raw HTML for the rest of the check", "err", rerr)
 					renderDown = true
 				}
 			}

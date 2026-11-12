@@ -116,7 +116,7 @@ const lockTimeoutSQLFmt = "SET lock_timeout = '%dms'"
 func LockTimeout(d time.Duration) AfterConnectFunc {
 	return func(ctx context.Context, conn *pgx.Conn) error {
 		if d <= 0 {
-			return fmt.Errorf("db: SET lock_timeout: неположительная длительность %s", d)
+			return fmt.Errorf("db: SET lock_timeout: non-positive duration %s", d)
 		}
 		sql := fmt.Sprintf(lockTimeoutSQLFmt, d.Milliseconds())
 		if _, err := conn.Exec(ctx, sql); err != nil {
@@ -193,18 +193,18 @@ func NewOptions(pg config.Postgres) Options {
 // the DSN), the rest — health-check and connection lifetimes.
 func buildPoolConfig(opts Options) (*pgxpool.Config, error) {
 	if strings.TrimSpace(opts.DSN) == "" {
-		return nil, errors.New("db: пустой DSN PostgreSQL")
+		return nil, errors.New("db: empty PostgreSQL DSN")
 	}
 	switch {
 	case opts.PoolSize == 0:
 		opts.PoolSize = DefaultPoolSize
 	case opts.PoolSize < 0 || opts.PoolSize > MaxPoolSize:
-		return nil, fmt.Errorf("db: pool_size %d вне диапазона 1..%d (бюджет ТЗ 6.3: 20–50 соединений на все сервисы суммарно)", opts.PoolSize, MaxPoolSize)
+		return nil, fmt.Errorf("db: pool_size %d out of range 1..%d (spec 6.3 budget: 20–50 connections across ALL services)", opts.PoolSize, MaxPoolSize)
 	}
 
 	cfg, err := pgxpool.ParseConfig(opts.DSN)
 	if err != nil {
-		return nil, fmt.Errorf("db: разбор DSN: %w", err)
+		return nil, fmt.Errorf("db: parsing DSN: %w", err)
 	}
 
 	cfg.MaxConns = int32(opts.PoolSize)
@@ -235,11 +235,11 @@ func Open(ctx context.Context, opts Options) (*pgxpool.Pool, error) {
 
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
-		return nil, fmt.Errorf("db: создание пула: %w", err)
+		return nil, fmt.Errorf("db: creating pool: %w", err)
 	}
 	if err := pool.Ping(ctx); err != nil {
 		pool.Close()
-		return nil, fmt.Errorf("db: PostgreSQL недоступен (%s): %w", redactDSN(opts.DSN), err)
+		return nil, fmt.Errorf("db: PostgreSQL unreachable (%s): %w", redactDSN(opts.DSN), err)
 	}
 	return pool, nil
 }
@@ -289,5 +289,5 @@ func RedactDSN(dsn, fallback string) string {
 
 // redactDSN — RedactDSN with the db package's fallback message.
 func redactDSN(dsn string) string {
-	return RedactDSN(dsn, "см. postgres.dsn (конфигурация)")
+	return RedactDSN(dsn, "see postgres.dsn (configuration)")
 }

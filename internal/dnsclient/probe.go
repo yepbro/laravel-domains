@@ -48,7 +48,7 @@ var probeQuestion = Question{Name: ".", Type: dns.TypeNS}
 // sentence the resolver).
 func Probe(ctx context.Context, r Resolver) error {
 	if r == nil {
-		return errors.New("dnsclient: Probe: резолвер не задан")
+		return errors.New("dnsclient: Probe: resolver not set")
 	}
 	_, err := r.Exchange(ctx, probeQuestion)
 	return err
@@ -63,7 +63,7 @@ func Probe(ctx context.Context, r Resolver) error {
 // guarantees a primary resolver, spec 5.10).
 func ProbeChain(ctx context.Context, targets []FallbackTarget, log *slog.Logger) error {
 	if len(targets) == 0 {
-		return errors.New("dnsclient: ProbeChain: цепь резолверов пуста")
+		return errors.New("dnsclient: ProbeChain: resolver chain is empty")
 	}
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
@@ -73,21 +73,21 @@ func ProbeChain(ctx context.Context, targets []FallbackTarget, log *slog.Logger)
 		err := Probe(ctx, t.Resolver)
 		if err == nil {
 			alive++
-			log.Info("стартовая проба резолвера: отвечает", "resolver", t.Addr)
+			log.Info("resolver startup probe: responds", "resolver", t.Addr)
 			continue
 		}
 		// A ctx cancellation is not "all dead": the probe aborts with that error.
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
 		}
-		log.Warn("стартовая проба резолвера: не отвечает", "resolver", t.Addr, "err", err)
+		log.Warn("resolver startup probe: no response", "resolver", t.Addr, "err", err)
 	}
 	if alive == 0 {
 		addrs := make([]string, len(targets))
 		for i, t := range targets {
 			addrs[i] = t.Addr
 		}
-		return fmt.Errorf("dnsclient: стартовая проба: не отвечает ни один резолвер цепи (%d): %s",
+		return fmt.Errorf("dnsclient: startup probe: no resolver in the chain responds (%d): %s",
 			len(targets), strings.Join(addrs, ", "))
 	}
 	return nil

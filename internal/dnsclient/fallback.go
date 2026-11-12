@@ -87,11 +87,11 @@ var _ Resolver = (*FallbackResolver)(nil)
 // resolver is an error (a programming one, caught at service startup).
 func NewFallbackResolver(primary FallbackTarget, fallbacks ...FallbackTarget) (*FallbackResolver, error) {
 	if primary.Resolver == nil {
-		return nil, errors.New("dnsclient: NewFallbackResolver: основной резолвер не задан")
+		return nil, errors.New("dnsclient: NewFallbackResolver: primary resolver not set")
 	}
 	for i, f := range fallbacks {
 		if f.Resolver == nil {
-			return nil, fmt.Errorf("dnsclient: NewFallbackResolver: резервный резолвер %d не задан", i+1)
+			return nil, fmt.Errorf("dnsclient: NewFallbackResolver: fallback resolver %d not set", i+1)
 		}
 	}
 	// A copy: the caller's slice must not affect the chain after assembly.
@@ -140,7 +140,7 @@ func (r *FallbackResolver) Exchange(ctx context.Context, q Question) (*Result, e
 		lastErr = err
 	}
 	r.exhausted.Add(1)
-	return nil, fmt.Errorf("dnsclient: %s %s: не ответил ни один резолвер цепи (%d): %s; последний: %w",
+	return nil, fmt.Errorf("dnsclient: %s %s: no resolver in the chain responded (%d): %s; last: %w",
 		qTypeName(q.Type), q.Name, len(fails), strings.Join(fails, "; "), lastErr)
 }
 

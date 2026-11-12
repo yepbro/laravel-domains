@@ -337,7 +337,7 @@ func TestServeShutdownTimeout(t *testing.T) {
 	start := time.Now()
 	lc.term <- syscall.SIGTERM
 	err := lc.waitDone(t)
-	if err == nil || !strings.Contains(err.Error(), "не остановилась") {
+	if err == nil || !strings.Contains(err.Error(), "did not stop") {
 		t.Fatalf("serve = %v, хочу ошибку таймаута остановки", err)
 	}
 	if elapsed := time.Since(start); elapsed > 450*time.Millisecond {
@@ -428,7 +428,7 @@ func TestServeHTTPServerError(t *testing.T) {
 	lc.failHTTP(t) // «падение сервера»: закрытие listener из-под Serve
 
 	err := lc.waitDone(t)
-	if err == nil || !strings.Contains(err.Error(), "HTTP-сервер метрик") {
+	if err == nil || !strings.Contains(err.Error(), "metrics HTTP server") {
 		t.Fatalf("serve = %v, хочу ошибку HTTP-сервера", err)
 	}
 	want := []string{"onrun-done", "pool-closed"}
@@ -452,7 +452,7 @@ func TestServeOnRunPanic(t *testing.T) {
 
 	<-ready
 	err := lc.waitDone(t)
-	if err == nil || !strings.Contains(err.Error(), "паника") {
+	if err == nil || !strings.Contains(err.Error(), "panic") {
 		t.Fatalf("serve = %v, хочу ошибку паники OnRun", err)
 	}
 	if !lc.rec.has("pool-closed") {
@@ -464,7 +464,7 @@ func TestServeOnRunPanic(t *testing.T) {
 
 // TestRunValidation — имя сервиса обязательно.
 func TestRunValidation(t *testing.T) {
-	if err := Run(Options{}); err == nil || !strings.Contains(err.Error(), "имя сервиса") {
+	if err := Run(Options{}); err == nil || !strings.Contains(err.Error(), "service name") {
 		t.Fatalf("Run без Name = %v, хочу ошибку об обязательном имени", err)
 	}
 }

@@ -118,8 +118,8 @@ func TestBuildPoolConfig_Validation(t *testing.T) {
 		want string // a substring of the expected error
 	}{
 		{"пустой DSN", Options{}, "пустой DSN"},
-		{"отрицательный pool_size", Options{DSN: testDSN, PoolSize: -1}, "вне диапазона"},
-		{"pool_size больше лимита", Options{DSN: testDSN, PoolSize: MaxPoolSize + 1}, "вне диапазона"},
+		{"отрицательный pool_size", Options{DSN: testDSN, PoolSize: -1}, "out of range"},
+		{"pool_size больше лимита", Options{DSN: testDSN, PoolSize: MaxPoolSize + 1}, "out of range"},
 		{"битый DSN", Options{DSN: "://not-a-dsn"}, "разбор DSN"},
 	}
 	for _, tc := range cases {
@@ -199,8 +199,8 @@ func TestOpen_UnreachableFailFast(t *testing.T) {
 	if err == nil {
 		t.Fatal("Open на недоступном PostgreSQL должен вернуть ошибку")
 	}
-	if !strings.Contains(err.Error(), "недоступен") {
-		t.Errorf("ошибка = %v, want «недоступен»", err)
+	if !strings.Contains(err.Error(), "unreachable") {
+		t.Errorf("ошибка = %v, want «unreachable»", err)
 	}
 	if strings.Contains(err.Error(), "secret") {
 		t.Error("пароль DSN попал в сообщение об ошибке")
@@ -233,7 +233,7 @@ func TestRedactDSN(t *testing.T) {
 			t.Errorf("%s: redactDSN = %q, want %q", c.name, got, c.want)
 		}
 	}
-	if got := redactDSN("postgres://localhost/db"); got != "см. postgres.dsn (конфигурация)" {
+	if got := redactDSN("postgres://localhost/db"); got != "see postgres.dsn (configuration)" {
 		t.Errorf("redactDSN без пользователя = %q", got)
 	}
 }

@@ -192,7 +192,7 @@ func (s Status) Valid() bool {
 func ParseStatus(name string) (Status, error) {
 	s, ok := statusByName[strings.ToLower(strings.TrimSpace(name))]
 	if !ok {
-		return 0, fmt.Errorf("model: неизвестный статус домена %q (ТЗ 6.2: %s)", name, strings.Join(statusNamesList(), ", "))
+		return 0, fmt.Errorf("model: unknown domain status %q (spec 6.2: %s)", name, strings.Join(statusNamesList(), ", "))
 	}
 	return s, nil
 }
@@ -312,7 +312,7 @@ func ParseScheme(name string) (Scheme, error) {
 	case "https":
 		return SchemeHTTPS, nil
 	default:
-		return 0, fmt.Errorf("model: неизвестный протокол %q (допустимы http, https)", name)
+		return 0, fmt.Errorf("model: unknown scheme %q (allowed: http, https)", name)
 	}
 }
 

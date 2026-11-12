@@ -1306,24 +1306,24 @@ func (c *Config) Validate() error {
 
 	// postgres
 	if strings.TrimSpace(c.Postgres.DSN) == "" {
-		problems = append(problems, "postgres.dsn: обязателен (postgres.dsn в YAML или переменные CRAWLER_POSTGRES_DSN/APP_PG_DSN)")
+		problems = append(problems, "postgres.dsn: required (postgres.dsn in YAML or the CRAWLER_POSTGRES_DSN/APP_PG_DSN env vars)")
 	}
 	if !inRange(c.Postgres.PoolSize, 1, 100) {
-		problems = append(problems, rangeMsg("postgres.pool_size", c.Postgres.PoolSize, 1, 100)+"; рекомендация ТЗ: 20–50 на все сервисы")
+		problems = append(problems, rangeMsg("postgres.pool_size", c.Postgres.PoolSize, 1, 100)+"; spec recommendation: 20–50 across ALL services")
 	}
 
 	// redis
 	if err := checkHostPort(c.Redis.Addr); err != nil {
-		problems = append(problems, fmt.Sprintf("redis.addr: ожидается host:port, задано %q", c.Redis.Addr))
+		problems = append(problems, fmt.Sprintf("redis.addr: expected host:port, got %q", c.Redis.Addr))
 	}
 	// 0 — пределы по стримам из пакета queue (T-025); явный предел ниже
 	// 1000 усекал бы рабочий набор даже маленькой очереди.
 	if c.Redis.MaxLen != 0 && !inRange(c.Redis.MaxLen, 1000, 100000000) {
-		problems = append(problems, rangeMsg("redis.maxlen", c.Redis.MaxLen, 1000, 100000000)+" (0 — пределы по стримам по умолчанию)")
+		problems = append(problems, rangeMsg("redis.maxlen", c.Redis.MaxLen, 1000, 100000000)+" (0 — per-stream default limits)")
 	}
 	// Минимум 1: ноль доставок означал бы q:dead до первой обработки.
 	if !inRange(c.Redis.MaxAttempts, 1, 100) {
-		problems = append(problems, rangeMsg("redis.max_attempts", c.Redis.MaxAttempts, 1, 100)+" (ТЗ 4.2: по умолчанию 3)")
+		problems = append(problems, rangeMsg("redis.max_attempts", c.Redis.MaxAttempts, 1, 100)+" (spec 4.2: default 3)")
 	}
 	if c.Redis.ClaimMinIdle <= 0 {
 		problems = append(problems, nonPositiveDur("redis.claim_min_idle", c.Redis.ClaimMinIdle))
@@ -1339,14 +1339,14 @@ func (c *Config) Validate() error {
 	// trim_interval); реже часа — обход PEL после инцидента затягивается
 	// на сутки (5К записей / 64 за проход × 1 ч ≈ 78 ч).
 	if c.Redis.RecoverInterval < Duration(time.Second) || c.Redis.RecoverInterval > Duration(time.Hour) {
-		problems = append(problems, fmt.Sprintf("redis.recover_interval: ожидается %s..%s, задано %s",
+		problems = append(problems, fmt.Sprintf("redis.recover_interval: expected %s..%s, got %s",
 			Duration(time.Second), Duration(time.Hour), c.Redis.RecoverInterval))
 	}
 	// Коридор осмысленных значений: чаще секунды — холостые проходы по
 	// четырём стримам, реже суток — история копится до потолка MAXLEN
 	// (защита всё равно есть, но теряется смысл механизма).
 	if c.Redis.TrimInterval < Duration(time.Second) || c.Redis.TrimInterval > Duration(24*time.Hour) {
-		problems = append(problems, fmt.Sprintf("redis.trim_interval: ожидается %s..%s, задано %s",
+		problems = append(problems, fmt.Sprintf("redis.trim_interval: expected %s..%s, got %s",
 			Duration(time.Second), Duration(24*time.Hour), c.Redis.TrimInterval))
 	}
 	// Гигиена консьюмеров (T-155): порог меньше минуты вычищал бы
@@ -1355,13 +1355,13 @@ func (c *Config) Validate() error {
 	// пересоздания; больше 30 дней — мёртвые копятся быстрее деплоев,
 	// механизму нет смысла.
 	if c.Redis.ConsumerIdle < Duration(time.Minute) || c.Redis.ConsumerIdle > Duration(720*time.Hour) {
-		problems = append(problems, fmt.Sprintf("redis.consumer_idle: ожидается %s..%s, задано %s",
+		problems = append(problems, fmt.Sprintf("redis.consumer_idle: expected %s..%s, got %s",
 			Duration(time.Minute), Duration(720*time.Hour), c.Redis.ConsumerIdle))
 	}
 
 	// ingest
 	if c.Ingest.Dir == "" {
-		problems = append(problems, "ingest.dir: не задан (наблюдаемая папка incoming)")
+		problems = append(problems, "ingest.dir: not set (the watched incoming directory)")
 	}
 	if !inRange(c.Ingest.BatchSize, 1, 1000000) {
 		problems = append(problems, rangeMsg("ingest.batch_size", c.Ingest.BatchSize, 1, 1000000))
@@ -1370,17 +1370,17 @@ func (c *Config) Validate() error {
 		problems = append(problems, rangeMsg("ingest.stable_seconds", c.Ingest.StableSeconds, 1, 3600))
 	}
 	if c.Ingest.ScanInterval < Duration(10*time.Millisecond) || c.Ingest.ScanInterval > Duration(time.Hour) {
-		problems = append(problems, fmt.Sprintf("ingest.scan_interval: ожидается %s..%s, задано %s",
+		problems = append(problems, fmt.Sprintf("ingest.scan_interval: expected %s..%s, got %s",
 			Duration(10*time.Millisecond), Duration(time.Hour), c.Ingest.ScanInterval))
 	}
 	if c.Ingest.MaxErrorRatio <= 0 || c.Ingest.MaxErrorRatio > 1 {
-		problems = append(problems, fmt.Sprintf("ingest.max_error_ratio: ожидается (0, 1], задано %v", c.Ingest.MaxErrorRatio))
+		problems = append(problems, fmt.Sprintf("ingest.max_error_ratio: expected (0, 1], got %v", c.Ingest.MaxErrorRatio))
 	}
 	// Лимиты архивов (T-133) нельзя отключить нулём: защита от zip-бомб
 	// обязательна; верхняя граница — от опечаток, не от эксплуатации.
 	if c.Ingest.ArchiveMaxUncompressed <= 0 || c.Ingest.ArchiveMaxUncompressed > 1<<40 {
 		problems = append(problems, fmt.Sprintf(
-			"ingest.archive_max_uncompressed: ожидается %s..%s, задано %s (потолок суммарного несжатого объёма членов архива)",
+			"ingest.archive_max_uncompressed: expected %s..%s, got %s (cap on the total uncompressed size of archive members)",
 			ByteSize(1), ByteSize(1<<40), c.Ingest.ArchiveMaxUncompressed))
 	}
 	if !inRange(c.Ingest.ArchiveMaxFiles, 1, 1000000) {
@@ -1396,12 +1396,12 @@ func (c *Config) Validate() error {
 		nz, err := idn.NormalizeZone(z)
 		if err != nil {
 			problems = append(problems, fmt.Sprintf(
-				"ingest.allowed_zone_paths: %q — не имя зоны (%v); ожидается многоуровневое имя зоны в punycode нижним регистром, минимум одна точка — например crawl.test", z, err))
+				"ingest.allowed_zone_paths: %q is not a zone name (%v); expected a multi-level zone name in lowercase punycode with at least one dot — e.g. crawl.test", z, err))
 			continue
 		}
 		if !strings.Contains(nz, ".") {
 			problems = append(problems, fmt.Sprintf(
-				"ingest.allowed_zone_paths: %q — TLD-зоне в allowlist делать нечего (её каталог уже рабочий); ожидается многоуровневое имя с точкой — например crawl.test", z))
+				"ingest.allowed_zone_paths: %q — a TLD has no place in the allowlist (its directory is already the working one); expected a multi-level name with a dot — e.g. crawl.test", z))
 		}
 	}
 
@@ -1416,7 +1416,7 @@ func (c *Config) Validate() error {
 	// величиной (алерт остановки прогресса — zones.updated_at, не этот
 	// gauge).
 	if c.Scheduler.BacklogInterval < Duration(30*time.Second) || c.Scheduler.BacklogInterval > Duration(time.Hour) {
-		problems = append(problems, fmt.Sprintf("scheduler.backlog_interval: ожидается %s..%s, задано %s (период gauge глубины backlog, T-161)",
+		problems = append(problems, fmt.Sprintf("scheduler.backlog_interval: expected %s..%s, got %s (backlog depth gauge period, T-161)",
 			Duration(30*time.Second), Duration(time.Hour), c.Scheduler.BacklogInterval))
 	}
 	// ТЗ 5.3: пачки планировщика 1000–10000 — границы нормативные
@@ -1429,10 +1429,10 @@ func (c *Config) Validate() error {
 	// Явный redis.maxlen — сознательный выход из политики: его
 	// арифметику держит оператор (арифметика — docs/redis.md §3.1).
 	if !inRange(c.Scheduler.BatchSize, minSchedulerBatchSize, maxSchedulerBatchSize) {
-		problems = append(problems, rangeMsg("scheduler.batch_size", c.Scheduler.BatchSize, minSchedulerBatchSize, maxSchedulerBatchSize)+" (ТЗ 5.3)")
+		problems = append(problems, rangeMsg("scheduler.batch_size", c.Scheduler.BatchSize, minSchedulerBatchSize, maxSchedulerBatchSize)+" (spec 5.3)")
 	}
 	if c.Scheduler.QueueHighWatermark < 1 {
-		problems = append(problems, "scheduler.queue_high_watermark: ожидается положительное число, задано "+strconv.Itoa(c.Scheduler.QueueHighWatermark))
+		problems = append(problems, "scheduler.queue_high_watermark: expected a positive integer, got "+strconv.Itoa(c.Scheduler.QueueHighWatermark))
 	}
 	if c.Scheduler.Lease <= 0 {
 		problems = append(problems, nonPositiveDur("scheduler.lease", c.Scheduler.Lease))
@@ -1441,7 +1441,7 @@ func (c *Config) Validate() error {
 		problems = append(problems, nonPositiveDur("scheduler.temp_error_retry_after", c.Scheduler.TempErrorRetryAfter))
 	}
 	if !inRange(c.Scheduler.TempErrorMaxRetries, 1, 100) {
-		problems = append(problems, rangeMsg("scheduler.temp_error_max_retries", c.Scheduler.TempErrorMaxRetries, 1, 100)+"; минимум 1 — temp_error по определению требует повтор (ТЗ 6.2)")
+		problems = append(problems, rangeMsg("scheduler.temp_error_max_retries", c.Scheduler.TempErrorMaxRetries, 1, 100)+"; minimum 1 — temp_error by definition requires a retry (spec 6.2)")
 	}
 	// Потолки стримов (T-141) — см. комментарий у batch_size.
 	// Веса зон (ТЗ 5.3, T-106): ключи по возрастанию — детерминированный
@@ -1453,27 +1453,27 @@ func (c *Config) Validate() error {
 	for _, name := range sortedKeys(c.Scheduler.ZoneWeights) {
 		if name == "" || len(name) > 253 || !zoneNameRe.MatchString(name) {
 			problems = append(problems, fmt.Sprintf(
-				"scheduler.zone_weights: %q — ожидается имя зоны — TLD в punycode нижним регистром, как в справочнике zones (in, uk; IDN — xn--p1ai)", name))
+				"scheduler.zone_weights: %q — expected a zone name: a TLD in lowercase punycode, as in the zones reference table (in, uk; IDN — xn--p1ai)", name))
 			continue
 		}
 		if w := c.Scheduler.ZoneWeights[name]; !inRange(w, 1, 1000) {
 			problems = append(problems, fmt.Sprintf(
-				"scheduler.zone_weights: зона %q: ожидается вес 1..1000, задано %d (доля зоны в пачке пропорциональна весу; 1 — равный круговой порядок)", name, w))
+				"scheduler.zone_weights: zone %q: expected weight 1..1000, got %d (a zone's share of a chunk is proportional to its weight; 1 — equal round-robin order)", name, w))
 		}
 	}
 
 	// dns
 	if len(c.DNS.Resolvers) == 0 {
-		problems = append(problems, "dns.resolvers: нужен хотя бы один резолвер (например, локальный unbound)")
+		problems = append(problems, "dns.resolvers: at least one resolver is required (e.g. a local unbound)")
 	}
 	for _, r := range c.DNS.Resolvers {
 		if err := checkHostPort(r); err != nil {
-			problems = append(problems, fmt.Sprintf("dns.resolvers: %q: ожидается host:port", r))
+			problems = append(problems, fmt.Sprintf("dns.resolvers: %q: expected host:port", r))
 		}
 	}
 	for _, r := range c.DNS.FallbackResolvers {
 		if err := checkHostPort(r); err != nil {
-			problems = append(problems, fmt.Sprintf("dns.fallback_resolvers: %q: ожидается host:port", r))
+			problems = append(problems, fmt.Sprintf("dns.fallback_resolvers: %q: expected host:port", r))
 		}
 	}
 	if !inRange(c.DNS.Concurrency, 1, 100000) {
@@ -1490,7 +1490,7 @@ func (c *Config) Validate() error {
 	}
 	// Минимум 1 — ТЗ 5.4 ретраи требует; максимум — dnsclient.MaxRetries.
 	if !inRange(c.DNS.Retries, 1, 10) {
-		problems = append(problems, rangeMsg("dns.retries", c.DNS.Retries, 1, 10)+"; минимум 1 — ТЗ 5.4 требует ретраев")
+		problems = append(problems, rangeMsg("dns.retries", c.DNS.Retries, 1, 10)+"; minimum 1 — spec 5.4 requires retries")
 	}
 	if c.DNS.RetryDelay <= 0 {
 		problems = append(problems, nonPositiveDur("dns.retry_delay", c.DNS.RetryDelay))
@@ -1504,7 +1504,7 @@ func (c *Config) Validate() error {
 		problems = append(problems, rangeMsg("http.concurrency", c.HTTP.Concurrency, 1, 100000))
 	}
 	if !inRange(c.HTTP.PerIPLimit, 1, 64) {
-		problems = append(problems, rangeMsg("http.per_ip_limit", c.HTTP.PerIPLimit, 1, 64)+"; рекомендация ТЗ: 3–4")
+		problems = append(problems, rangeMsg("http.per_ip_limit", c.HTTP.PerIPLimit, 1, 64)+"; spec recommendation: 3–4")
 	}
 	// Префиксы парковщиков (T-165): ключ обязан быть разбираемым CIDR
 	// (IPv4/IPv6), лимит — в диапазоне per_ip_limit; одна сеть не может
@@ -1515,15 +1515,15 @@ func (c *Config) Validate() error {
 	for cidr, limit := range c.HTTP.PerIPOverrides {
 		prefix, err := netip.ParsePrefix(cidr)
 		if err != nil {
-			problems = append(problems, fmt.Sprintf("http.per_ip_overrides: ключ %q — ожидается CIDR IPv4/IPv6 (например 195.208.0.0/16)", cidr))
+			problems = append(problems, fmt.Sprintf("http.per_ip_overrides: key %q — expected an IPv4/IPv6 CIDR (e.g. 195.208.0.0/16)", cidr))
 			continue
 		}
 		if !inRange(limit, 1, 64) {
-			problems = append(problems, rangeMsg("http.per_ip_overrides["+cidr+"]", limit, 1, 64)+"; диапазон как у http.per_ip_limit")
+			problems = append(problems, rangeMsg("http.per_ip_overrides["+cidr+"]", limit, 1, 64)+"; same range as http.per_ip_limit")
 		}
 		masked := prefix.Masked().String()
 		if _, dup := seenNets[masked]; dup {
-			problems = append(problems, fmt.Sprintf("http.per_ip_overrides: сеть %s перечислена дважды (после маскирования CIDR)", masked))
+			problems = append(problems, fmt.Sprintf("http.per_ip_overrides: network %s listed twice (after CIDR masking)", masked))
 			continue
 		}
 		seenNets[masked] = struct{}{}
@@ -1541,13 +1541,13 @@ func (c *Config) Validate() error {
 		problems = append(problems, nonPositiveDur("http.total_timeout", c.HTTP.TotalTimeout))
 	}
 	if !inRange(c.HTTP.MaxRedirects, 0, 100) {
-		problems = append(problems, rangeMsg("http.max_redirects", c.HTTP.MaxRedirects, 0, 100)+" (0 — не следовать редиректами)")
+		problems = append(problems, rangeMsg("http.max_redirects", c.HTTP.MaxRedirects, 0, 100)+" (0 — do not follow redirects)")
 	}
 	if c.HTTP.MaxBodyBytes <= 0 {
-		problems = append(problems, "http.max_body_bytes: ожидается положительный размер, задано "+c.HTTP.MaxBodyBytes.String())
+		problems = append(problems, "http.max_body_bytes: expected a positive size, got "+c.HTTP.MaxBodyBytes.String())
 	}
 	if c.HTTP.MinBodySpeed <= 0 {
-		problems = append(problems, "http.min_body_speed: ожидается положительная скорость (байт/с), задано "+c.HTTP.MinBodySpeed.String())
+		problems = append(problems, "http.min_body_speed: expected a positive speed (bytes/s), got "+c.HTTP.MinBodySpeed.String())
 	}
 	if !inRange(c.HTTP.MaxRPS, 1, 1000000) {
 		problems = append(problems, rangeMsg("http.max_rps", c.HTTP.MaxRPS, 1, 1000000))
@@ -1564,7 +1564,7 @@ func (c *Config) Validate() error {
 		problems = append(problems, rangeMsg("http.task_consume", c.HTTP.TaskConsume, 1, 1000))
 	}
 	if !inRange(c.HTTP.TaskPerDomain, 1, 126) {
-		problems = append(problems, rangeMsg("http.task_per_domain", c.HTTP.TaskPerDomain, 1, 126)+" (проверок в задаче ≤ 2 × 63 субдомена)")
+		problems = append(problems, rangeMsg("http.task_per_domain", c.HTTP.TaskPerDomain, 1, 126)+" (checks per task ≤ 2 × 63 subdomains)")
 	}
 	// Мягкий потолок кучи (T-163): 0 — выключен; рабочий диапазон — от
 	// холостого набора воркера (ниже — вечный GC) до разумного бюджета
@@ -1572,22 +1572,22 @@ func (c *Config) Validate() error {
 	// юнита бессмысленно, но не запрещено: потолок задаёт оператор по
 	// своему деплою (юнит, контейнер dev-стека), конфиг о юните не знает.
 	if t := c.HTTP.MemLimit; t != 0 && (t < 256<<20 || t > 16<<30) {
-		problems = append(problems, fmt.Sprintf("http.mem_limit: ожидается 0 (выключено) или %s..%s, задано %s",
+		problems = append(problems, fmt.Sprintf("http.mem_limit: expected 0 (disabled) or %s..%s, got %s",
 			ByteSize(256<<20), ByteSize(16<<30), t))
 	}
 	if strings.TrimSpace(c.HTTP.UserAgent) == "" {
-		problems = append(problems, "http.user_agent: обязателен (честный User-Agent с контактами, ТЗ 5.5/§9)")
+		problems = append(problems, "http.user_agent: required (an honest User-Agent with contacts, spec 5.5/§9)")
 	}
 	// Значение идёт в заголовок запроса одним полем: переводы строк и
 	// управляющие символы ломали бы запрос (а \r\n — инъекция заголовков).
 	for _, r := range c.HTTP.UserAgent {
 		if r < 0x20 || r == 0x7f {
-			problems = append(problems, "http.user_agent: переводы строк и управляющие символы недопустимы (значение ставится в заголовок)")
+			problems = append(problems, "http.user_agent: newlines and control characters are not allowed (the value goes into a header)")
 			break
 		}
 	}
 	if n := len(c.HTTP.UserAgent); n > maxUserAgentLen {
-		problems = append(problems, fmt.Sprintf("http.user_agent: слишком длинный (%d байт, максимум %d) — имя и контакты, не текст", n, maxUserAgentLen))
+		problems = append(problems, fmt.Sprintf("http.user_agent: too long (%d bytes, maximum %d) — a name and contacts, not prose", n, maxUserAgentLen))
 	}
 
 	// render
@@ -1603,29 +1603,29 @@ func (c *Config) Validate() error {
 	switch c.Render.Engine {
 	case "", EngineChromium, EngineMoli, EngineLightpanda: // "" — конфиг без Default() (chromium)
 	default:
-		problems = append(problems, fmt.Sprintf("render.engine: ожидается %s|%s|%s, задано %q",
+		problems = append(problems, fmt.Sprintf("render.engine: expected %s|%s|%s, got %q",
 			EngineChromium, EngineMoli, EngineLightpanda, c.Render.Engine))
 	}
 	if c.Render.Engine == EngineMoli || c.Render.Engine == EngineLightpanda {
 		if c.Render.RemoteURL == "" {
 			problems = append(problems, fmt.Sprintf(
-				"render.engine: для %s обязателен render.remote_url (внешний CDP-сервер ws://host:9222; собственный процесс браузера — только %s)",
+				"render.engine: %s requires render.remote_url (an external CDP server ws://host:9222; its own browser process — only %s)",
 				c.Render.Engine, EngineChromium))
 		}
 		if t := c.Render.RestartMemoryBytes; t != 0 {
 			problems = append(problems, fmt.Sprintf(
-				"render.restart_memory_bytes: для движка %s ожидается 0 (RSS чужого процесса недоступен), задано %s",
+				"render.restart_memory_bytes: for engine %s expected 0 (the RSS of a foreign process is unavailable), got %s",
 				c.Render.Engine, t))
 		}
 	}
 	if c.Render.RemoteURL != "" {
 		u, err := url.Parse(c.Render.RemoteURL)
 		if err != nil || u.Host == "" {
-			problems = append(problems, fmt.Sprintf("render.remote_url: ожидается URL вида ws://host:9222, задано %q", c.Render.RemoteURL))
+			problems = append(problems, fmt.Sprintf("render.remote_url: expected a ws://host:9222-style URL, got %q", c.Render.RemoteURL))
 		}
 	}
 	if !inRange(c.Render.Contexts, 1, 16) {
-		problems = append(problems, rangeMsg("render.contexts", c.Render.Contexts, 1, 16)+"; рекомендация ТЗ: 2–4")
+		problems = append(problems, rangeMsg("render.contexts", c.Render.Contexts, 1, 16)+"; spec recommendation: 2–4")
 	}
 	if c.Render.Timeout <= 0 {
 		problems = append(problems, nonPositiveDur("render.timeout", c.Render.Timeout))
@@ -1641,7 +1641,7 @@ func (c *Config) Validate() error {
 	}
 	if c.Render.TimeoutAttempts > c.Redis.MaxAttempts {
 		problems = append(problems, fmt.Sprintf(
-			"render.timeout_attempts: %d > redis.max_attempts %d — тарпит ушёл бы в q:dead до финализации без рендера (T-148); поднимите redis.max_attempts или снизьте render.timeout_attempts",
+			"render.timeout_attempts: %d > redis.max_attempts %d — a tarpit would end up in q:dead before finalization without render (T-148); raise redis.max_attempts or lower render.timeout_attempts",
 			c.Render.TimeoutAttempts, c.Redis.MaxAttempts))
 	}
 	if !inRange(c.Render.RestartEveryPages, 1, 1000000) {
@@ -1651,7 +1651,7 @@ func (c *Config) Validate() error {
 	// от холостого RSS headless-shell с контекстами (ниже — краш-луп
 	// перезапусков) до разумного бюджета одного воркера (ТЗ 3.2).
 	if t := c.Render.RestartMemoryBytes; t != 0 && (t < 256<<20 || t > 16<<30) {
-		problems = append(problems, fmt.Sprintf("render.restart_memory_bytes: ожидается 0 (отключено) или %s..%s, задано %s",
+		problems = append(problems, fmt.Sprintf("render.restart_memory_bytes: expected 0 (disabled) or %s..%s, got %s",
 			ByteSize(256<<20), ByteSize(16<<30), t))
 	}
 	// Ворота ёмкости q:render (T-174): 0 — общий порог
@@ -1661,7 +1661,7 @@ func (c *Config) Validate() error {
 	// MAXLEN делает проводка (не здесь — предел зависит от
 	// redis.maxlen стрима).
 	if w := c.Render.QueueHighWatermark; w != 0 && !inRange(w, 1, 100000000) {
-		problems = append(problems, fmt.Sprintf("render.queue_high_watermark: ожидается 0 (порог scheduler.queue_high_watermark) или %d..%d, задано %d",
+		problems = append(problems, fmt.Sprintf("render.queue_high_watermark: expected 0 (follows scheduler.queue_high_watermark) or %d..%d, got %d",
 			1, 100000000, w))
 	}
 	// Потолок выборки позднего переиздателя (T-274): 0 — дефолт кода
@@ -1669,7 +1669,7 @@ func (c *Config) Validate() error {
 	// выборку (петля обречённых повторов T-271), сутки и больше не имеют
 	// смысла при минутном тике цикла.
 	if d := c.Render.LateSelectTimeout; d != 0 && (d < Duration(time.Minute) || d > Duration(24*time.Hour)) {
-		problems = append(problems, fmt.Sprintf("render.late_select_timeout: ожидается 0 (дефолт кода) или %s..%s, задано %s",
+		problems = append(problems, fmt.Sprintf("render.late_select_timeout: expected 0 (code default) or %s..%s, got %s",
 			Duration(time.Minute), Duration(24*time.Hour), d))
 	}
 	// Приоритет зон прохода доработки (T-184): синтаксически невозможное
@@ -1681,11 +1681,11 @@ func (c *Config) Validate() error {
 	for _, name := range c.Render.RequeueDeprioritizedZones {
 		if name == "" || len(name) > 253 || !zoneNameRe.MatchString(name) {
 			problems = append(problems, fmt.Sprintf(
-				"render.requeue_deprioritized_zones: %q — ожидается имя зоны — TLD в punycode нижним регистром, как в справочнике zones (in, uk; IDN — xn--p1ai)", name))
+				"render.requeue_deprioritized_zones: %q — expected a zone name: a TLD in lowercase punycode, as in the zones reference table (in, uk; IDN — xn--p1ai)", name))
 			continue
 		}
 		if seenDepr[name] {
-			problems = append(problems, fmt.Sprintf("render.requeue_deprioritized_zones: повтор %q", name))
+			problems = append(problems, fmt.Sprintf("render.requeue_deprioritized_zones: duplicate %q", name))
 			continue
 		}
 		seenDepr[name] = true
@@ -1704,7 +1704,7 @@ func (c *Config) Validate() error {
 		problems = append(problems, rangeMsg("render.fallback.worker_rate", c.Render.Fallback.WorkerRate, 1, 1000000))
 	}
 	if p := c.Render.Fallback.SharePercent; p != 0 && !(p >= 0 && p <= 100) {
-		problems = append(problems, fmt.Sprintf("render.fallback.share_percent: ожидается 0 (без потолка) или (0..100], задано %v", p))
+		problems = append(problems, fmt.Sprintf("render.fallback.share_percent: expected 0 (no cap) or (0..100], got %v", p))
 	}
 	if !inRange(c.Render.Fallback.HealthGateStreak, 1, 100) {
 		problems = append(problems, rangeMsg("render.fallback.health_gate_streak", c.Render.Fallback.HealthGateStreak, 1, 100))
@@ -1712,20 +1712,20 @@ func (c *Config) Validate() error {
 
 	// content
 	if c.Content.Dir == "" {
-		problems = append(problems, "content.dir: не задан (каталог пак-файлов)")
+		problems = append(problems, "content.dir: not set (the pack file directory)")
 	}
 	if c.Content.PackSize < 1<<20 || c.Content.PackSize > 8<<30 {
-		problems = append(problems, fmt.Sprintf("content.pack_size: ожидается %s..%s, задано %s (рекомендация ТЗ: 512 МБ–1 ГБ)",
+		problems = append(problems, fmt.Sprintf("content.pack_size: expected %s..%s, got %s (spec recommendation: 512 MB–1 GB)",
 			ByteSize(1<<20), ByteSize(8<<30), c.Content.PackSize))
 	}
 	if c.Content.MaxStoreBytes <= 0 || c.Content.MaxStoreBytes > 16<<20 {
-		problems = append(problems, fmt.Sprintf("content.max_store_bytes: ожидается %s..%s, задано %s (рекомендация ТЗ: 1–2 МБ)",
+		problems = append(problems, fmt.Sprintf("content.max_store_bytes: expected %s..%s, got %s (spec recommendation: 1–2 MB)",
 			ByteSize(1), ByteSize(16<<20), c.Content.MaxStoreBytes))
 	}
 	// Порог переполнения диска (ТЗ 8): 0 выключал бы обязательную для ТЗ
 	// паузу записи, > 95 останавливал бы запись на заведомо живом томе.
 	if c.Content.DiskFreePercent <= 0 || c.Content.DiskFreePercent > 95 {
-		problems = append(problems, fmt.Sprintf("content.disk_free_percent: ожидается (0, 95], задано %v", c.Content.DiskFreePercent))
+		problems = append(problems, fmt.Sprintf("content.disk_free_percent: expected (0, 95], got %v", c.Content.DiskFreePercent))
 	}
 	// Retention (T-166): 0 — выключено; коридор 1m..30d: окно меньше
 	// минуты тонет в латентности потребителей (анализ — секунды), больше
@@ -1734,26 +1734,26 @@ func (c *Config) Validate() error {
 	// держит формат interval PostgreSQL свободным от микросекундных
 	// компонент Duration.String() («µs» в interval-синтаксисе сервера).
 	if r := c.Content.Retention; r != 0 && (r < Duration(time.Minute) || r > Duration(720*time.Hour)) {
-		problems = append(problems, fmt.Sprintf("content.retention: ожидается 0 (выключено) или %s..%s, задано %s",
+		problems = append(problems, fmt.Sprintf("content.retention: expected 0 (disabled) or %s..%s, got %s",
 			Duration(time.Minute), Duration(720*time.Hour), r))
 	}
 	// Период проходов: чаще минуты — лишние сканы старения (пачка и так
 	// до 50 тыс. строк), реже суток — окно плавает сутками.
 	if c.Content.RetentionInterval < Duration(time.Minute) || c.Content.RetentionInterval > Duration(24*time.Hour) {
-		problems = append(problems, fmt.Sprintf("content.retention_interval: ожидается %s..%s, задано %s",
+		problems = append(problems, fmt.Sprintf("content.retention_interval: expected %s..%s, got %s",
 			Duration(time.Minute), Duration(24*time.Hour), c.Content.RetentionInterval))
 	}
 	// Пачка: 1000 — не тонуть в раунд-триппах при притоке ≈3 млн
 	// строк/сут, 100 тыс. — потолок вилки постановки × 2 (транзакция
 	// держит блокировки строк пачки, гипертрофить её ни к чему).
 	if !inRange(c.Content.RetentionBatch, 1000, 100000) {
-		problems = append(problems, rangeMsg("content.retention_batch", c.Content.RetentionBatch, 1000, 100000)+" (рабочая вилка 10–50 тыс., T-166)")
+		problems = append(problems, rangeMsg("content.retention_batch", c.Content.RetentionBatch, 1000, 100000)+" (production range 10–50k, T-166)")
 	}
 	// Порог интерлока: 0 — общий порог scheduler.queue_high_watermark;
 	// положительное значение не выше потолка стримов (10⁸ — граница
 	// валидации redis.maxlen, тот же порядок).
 	if w := c.Content.RetentionAnalyzeWatermark; w != 0 && !inRange(w, 1, 100000000) {
-		problems = append(problems, fmt.Sprintf("content.retention_analyze_watermark: ожидается 0 (порог scheduler.queue_high_watermark) или %d..%d, задано %d",
+		problems = append(problems, fmt.Sprintf("content.retention_analyze_watermark: expected 0 (follows scheduler.queue_high_watermark) or %d..%d, got %d",
 			1, 100000000, w))
 	}
 	// Потолок выборки пачки retention (T-274): 0 — дефолт кода (7200 с);
@@ -1761,39 +1761,39 @@ func (c *Config) Validate() error {
 	// (штатная пачка замера T-201 до 222,8 с, catch-up-проход — десятки
 	// минут), выше суток — бессмысленно (интервал проходов час).
 	if d := c.Content.RetentionSelectTimeout; d != 0 && (d < Duration(time.Minute) || d > Duration(24*time.Hour)) {
-		problems = append(problems, fmt.Sprintf("content.retention_select_timeout: ожидается 0 (дефолт кода) или %s..%s, задано %s",
+		problems = append(problems, fmt.Sprintf("content.retention_select_timeout: expected 0 (code default) or %s..%s, got %s",
 			Duration(time.Minute), Duration(24*time.Hour), d))
 	}
 
 	// analyzer
 	if c.Analyzer.RulesDir == "" {
-		problems = append(problems, "analyzer.rules_dir: не задан (каталог YAML-правил Laravel)")
+		problems = append(problems, "analyzer.rules_dir: not set (the Laravel YAML rules directory)")
 	}
 	if c.Analyzer.LaravelMinScore <= 0 || c.Analyzer.LaravelMinScore > 1 {
-		problems = append(problems, fmt.Sprintf("analyzer.laravel_min_score: ожидается (0, 1], задано %v", c.Analyzer.LaravelMinScore))
+		problems = append(problems, fmt.Sprintf("analyzer.laravel_min_score: expected (0, 1], got %v", c.Analyzer.LaravelMinScore))
 	}
 
 	// subdomains
 	switch {
 	case len(c.Subdomains) == 0:
-		problems = append(problems, "subdomains: список не может быть пустым (нужен хотя бы апекс — пустая строка)")
+		problems = append(problems, "subdomains: the list must not be empty (at least the apex is required — an empty string)")
 	case len(c.Subdomains) > maxSubdomains:
-		problems = append(problems, fmt.Sprintf("subdomains: не более %d (битовая маска dns_mask), задано %d", maxSubdomains, len(c.Subdomains)))
+		problems = append(problems, fmt.Sprintf("subdomains: at most %d (the dns_mask bit width), got %d", maxSubdomains, len(c.Subdomains)))
 	}
 	seen := make(map[string]bool, len(c.Subdomains))
 	for _, s := range c.Subdomains {
 		if s != "" && !subdomainLabelRe.MatchString(s) {
-			problems = append(problems, fmt.Sprintf("subdomains: %q — ожидается DNS-метка строчными буквами без точек (пустая строка — апекс)", s))
+			problems = append(problems, fmt.Sprintf("subdomains: %q — expected a lowercase DNS label without dots (an empty string is the apex)", s))
 		}
 		if seen[s] {
-			problems = append(problems, fmt.Sprintf("subdomains: повтор %q", s))
+			problems = append(problems, fmt.Sprintf("subdomains: duplicate %q", s))
 		}
 		seen[s] = true
 	}
 
 	// monitor
 	if err := checkHostPort(c.Monitor.Listen); err != nil {
-		problems = append(problems, fmt.Sprintf("monitor.listen: ожидается [host]:port, задано %q", c.Monitor.Listen))
+		problems = append(problems, fmt.Sprintf("monitor.listen: expected [host]:port, got %q", c.Monitor.Listen))
 	}
 	// Период реконсиляции (T-161 поднял дефолт 60с→5м, T-199 — 5м→30м
 	// по замеру окна медленных после 3bffc62): коридор 30с..1ч — нижняя
@@ -1801,7 +1801,7 @@ func (c *Config) Validate() error {
 	// верхняя ограничивает и порог остановки прогресса
 	// (5 × интервал, 2,5 ч на дефолте): updated_at пишет этот цикл.
 	if c.Monitor.ZoneStatsInterval < Duration(30*time.Second) || c.Monitor.ZoneStatsInterval > Duration(time.Hour) {
-		problems = append(problems, fmt.Sprintf("monitor.zone_stats_interval: ожидается %s..%s, задано %s",
+		problems = append(problems, fmt.Sprintf("monitor.zone_stats_interval: expected %s..%s, got %s",
 			Duration(30*time.Second), Duration(time.Hour), c.Monitor.ZoneStatsInterval))
 	}
 	// Период цикла алертов (T-206 — отвязка от реконсиляции): коридор
@@ -1809,14 +1809,14 @@ func (c *Config) Validate() error {
 	// алертов (зонд /metrics ingest, XINFO, systemctl) сам становится
 	// шумом, дольше часа растягиваются окна детекции в проходах.
 	if c.Monitor.AlertsInterval < Duration(30*time.Second) || c.Monitor.AlertsInterval > Duration(time.Hour) {
-		problems = append(problems, fmt.Sprintf("monitor.alerts_interval: ожидается %s..%s, задано %s",
+		problems = append(problems, fmt.Sprintf("monitor.alerts_interval: expected %s..%s, got %s",
 			Duration(30*time.Second), Duration(time.Hour), c.Monitor.AlertsInterval))
 	}
 	// Отчёт нагрузки (T-173): 0 — выключен; иначе коридор 1м..1ч —
 	// чаще — спам группе оператора, реже — окно шире эпизодов голода.
 	if lr := c.Monitor.LoadReportInterval; lr != 0 &&
 		(lr < Duration(time.Minute) || lr > Duration(time.Hour)) {
-		problems = append(problems, fmt.Sprintf("monitor.load_report_interval: ожидается 0 (выключен) или %s..%s, задано %s",
+		problems = append(problems, fmt.Sprintf("monitor.load_report_interval: expected 0 (disabled) or %s..%s, got %s",
 			Duration(time.Minute), Duration(time.Hour), lr))
 	}
 	// Медленные запросы (T-177): период 0 — выключен, иначе коридор
@@ -1827,12 +1827,12 @@ func (c *Config) Validate() error {
 	// короткие эпизоды цикл ловит частично (полный след — лог сервера).
 	if sq := c.Monitor.SlowQueryInterval; sq != 0 &&
 		(sq < Duration(5*time.Second) || sq > Duration(10*time.Minute)) {
-		problems = append(problems, fmt.Sprintf("monitor.slow_query_interval: ожидается 0 (выключен) или %s..%s, задано %s",
+		problems = append(problems, fmt.Sprintf("monitor.slow_query_interval: expected 0 (disabled) or %s..%s, got %s",
 			Duration(5*time.Second), Duration(10*time.Minute), sq))
 	}
 	if c.Monitor.SlowQueryInterval != 0 && c.Monitor.SlowQueryMinDuration != 0 &&
 		(c.Monitor.SlowQueryMinDuration < Duration(time.Second) || c.Monitor.SlowQueryMinDuration > Duration(time.Hour)) {
-		problems = append(problems, fmt.Sprintf("monitor.slow_query_min_duration: ожидается 0 (дефолт) или %s..%s, задано %s",
+		problems = append(problems, fmt.Sprintf("monitor.slow_query_min_duration: expected 0 (default) or %s..%s, got %s",
 			Duration(time.Second), Duration(time.Hour), c.Monitor.SlowQueryMinDuration))
 	}
 	// Рендер-долг (T-175): проход дешевле любого разумного периода,
@@ -1840,21 +1840,21 @@ func (c *Config) Validate() error {
 	// опрашивать нечего, дольше часа gauge отстаёт от сводки отчёта
 	// нагрузки 10 мин).
 	if c.Monitor.RenderDebtInterval < Duration(30*time.Second) || c.Monitor.RenderDebtInterval > Duration(time.Hour) {
-		problems = append(problems, fmt.Sprintf("monitor.render_debt_interval: ожидается %s..%s, задано %s",
+		problems = append(problems, fmt.Sprintf("monitor.render_debt_interval: expected %s..%s, got %s",
 			Duration(30*time.Second), Duration(time.Hour), c.Monitor.RenderDebtInterval))
 	}
 	if c.Monitor.IngestMetricsURL != "" {
 		if u, err := url.Parse(c.Monitor.IngestMetricsURL); err != nil ||
 			(u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 			problems = append(problems, fmt.Sprintf(
-				"monitor.ingest_metrics_url: ожидается абсолютный http(s)-адрес, задано %q", c.Monitor.IngestMetricsURL))
+				"monitor.ingest_metrics_url: expected an absolute http(s) URL, got %q", c.Monitor.IngestMetricsURL))
 		}
 	}
 	if c.Monitor.RenderMetricsURL != "" {
 		if u, err := url.Parse(c.Monitor.RenderMetricsURL); err != nil ||
 			(u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 			problems = append(problems, fmt.Sprintf(
-				"monitor.render_metrics_url: ожидается абсолютный http(s)-адрес, задано %q", c.Monitor.RenderMetricsURL))
+				"monitor.render_metrics_url: expected an absolute http(s) URL, got %q", c.Monitor.RenderMetricsURL))
 		}
 	}
 
@@ -1867,25 +1867,25 @@ func (c *Config) Validate() error {
 	// смены вахты оператора (6ч) — дольше молчащий алерт никто не ждёт.
 	if c.Monitor.Alerts.DiskFreeCritBytes >= c.Monitor.Alerts.DiskFreeMinBytes {
 		problems = append(problems, fmt.Sprintf(
-			"monitor.alerts.disk_free_crit_bytes: эскалация (%s) ожидается меньше минимума disk_free_min_bytes (%s)",
+			"monitor.alerts.disk_free_crit_bytes: the escalation (%s) must be below the disk_free_min_bytes minimum (%s)",
 			c.Monitor.Alerts.DiskFreeCritBytes, c.Monitor.Alerts.DiskFreeMinBytes))
 	}
 	if c.Monitor.Alerts.QueueFreeze < Duration(time.Minute) || c.Monitor.Alerts.QueueFreeze > Duration(6*time.Hour) {
-		problems = append(problems, fmt.Sprintf("monitor.alerts.queue_freeze_window: ожидается %s..%s, задано %s",
+		problems = append(problems, fmt.Sprintf("monitor.alerts.queue_freeze_window: expected %s..%s, got %s",
 			Duration(time.Minute), Duration(6*time.Hour), c.Monitor.Alerts.QueueFreeze))
 	}
 	if c.Monitor.Alerts.PSICPUPercent <= 0 || c.Monitor.Alerts.PSICPUPercent > 100 {
 		problems = append(problems, fmt.Sprintf(
-			"monitor.alerts.psi_cpu_percent: ожидается 0–100 (доля %%), задано %v",
+			"monitor.alerts.psi_cpu_percent: expected 0–100 (a %% share), got %v",
 			c.Monitor.Alerts.PSICPUPercent))
 	}
 	if c.Monitor.Alerts.PSIWindow < Duration(time.Minute) || c.Monitor.Alerts.PSIWindow > Duration(6*time.Hour) {
-		problems = append(problems, fmt.Sprintf("monitor.alerts.psi_cpu_window: ожидается %s..%s, задано %s",
+		problems = append(problems, fmt.Sprintf("monitor.alerts.psi_cpu_window: expected %s..%s, got %s",
 			Duration(time.Minute), Duration(6*time.Hour), c.Monitor.Alerts.PSIWindow))
 	}
 	if c.Monitor.Alerts.MemHighPasses < 1 || c.Monitor.Alerts.MemHighPasses > 10 {
 		problems = append(problems, fmt.Sprintf(
-			"monitor.alerts.mem_high_passes: ожидается 1..10 проходов, задано %d",
+			"monitor.alerts.mem_high_passes: expected 1..10 passes, got %d",
 			c.Monitor.Alerts.MemHighPasses))
 	}
 	// Рендер-долг (T-175): порог в доменах — 1..100 млн (верхняя грань
@@ -1894,16 +1894,16 @@ func (c *Config) Validate() error {
 	// mem_high_passes.
 	if dd := c.Monitor.Alerts.RenderDebtDomains; dd < 1 || dd > 100000000 {
 		problems = append(problems, fmt.Sprintf(
-			"monitor.alerts.render_debt_domains: ожидается 1..100000000 доменов, задано %d", dd))
+			"monitor.alerts.render_debt_domains: expected 1..100000000 domains, got %d", dd))
 	}
 	if c.Monitor.Alerts.RenderDebtPasses < 1 || c.Monitor.Alerts.RenderDebtPasses > 10 {
 		problems = append(problems, fmt.Sprintf(
-			"monitor.alerts.render_debt_passes: ожидается 1..10 проходов, задано %d",
+			"monitor.alerts.render_debt_passes: expected 1..10 passes, got %d",
 			c.Monitor.Alerts.RenderDebtPasses))
 	}
 	if c.Monitor.Alerts.Telegram && c.Monitor.Alerts.TelegramScript == "" {
 		problems = append(problems,
-			"monitor.alerts.telegram_script: путь telegram-notify.sh обязателен при включённой доставке (monitor.alerts.telegram)")
+			"monitor.alerts.telegram_script: the telegram-notify.sh path is required when delivery is enabled (monitor.alerts.telegram)")
 	}
 
 	// web (этап 13, T-121)
@@ -1911,26 +1911,26 @@ func (c *Config) Validate() error {
 	// (вариант деплоя за nginx, T-124): Run различает форму по «/».
 	if err := checkHostPort(c.Web.Listen); err != nil {
 		if !strings.HasPrefix(c.Web.Listen, "/") {
-			problems = append(problems, fmt.Sprintf("web.listen: ожидается [host]:port или абсолютный путь unix-сокета, задано %q", c.Web.Listen))
+			problems = append(problems, fmt.Sprintf("web.listen: expected [host]:port or an absolute unix socket path, got %q", c.Web.Listen))
 		} else if len(c.Web.Listen) > 100 {
 			// Потолок sockaddr_un.sun_path — 108 байт: длинный путь упал
 			// бы при Listen уже на запуске, валидация даёт ошибку конфига.
-			problems = append(problems, fmt.Sprintf("web.listen: путь unix-сокета длиннее 100 байт, задано %q", c.Web.Listen))
+			problems = append(problems, fmt.Sprintf("web.listen: the unix socket path is longer than 100 bytes, got %q", c.Web.Listen))
 		}
 	}
 	// Минимум 1 — ноль означал бы неограниченную форму; потолок — от
 	// абсурда, не от эксплуатации.
 	if !inRange(c.Web.RateLimit, 1, 1000) {
-		problems = append(problems, rangeMsg("web.rate_limit", c.Web.RateLimit, 1, 1000)+" (проверок формы в минуту на IP)")
+		problems = append(problems, rangeMsg("web.rate_limit", c.Web.RateLimit, 1, 1000)+" (form checks per minute per IP)")
 	}
 	// Семафор одновременных живых проверок (T-220): минимум 1 — форма
 	// работает; потолок 64 — далеко за ресурсный бюджет юнита (MemoryMax
 	// 256M), практические значения — единицы.
 	if !inRange(c.Web.LiveConcurrency, 1, 64) {
-		problems = append(problems, rangeMsg("web.live_concurrency", c.Web.LiveConcurrency, 1, 64)+" (одновременных живых проверок)")
+		problems = append(problems, rangeMsg("web.live_concurrency", c.Web.LiveConcurrency, 1, 64)+" (concurrent live checks)")
 	}
 	if c.Web.Timeout <= 0 || c.Web.Timeout > Duration(10*time.Minute) {
-		problems = append(problems, fmt.Sprintf("web.timeout: ожидается %s..%s, задано %s",
+		problems = append(problems, fmt.Sprintf("web.timeout: expected %s..%s, got %s",
 			Duration(time.Second), Duration(10*time.Minute), c.Web.Timeout))
 	}
 	// Канонический хост публичного адреса (T-227): host[:port] без
@@ -1945,7 +1945,7 @@ func (c *Config) Validate() error {
 			hostPart = h[:i]
 			if n, err := strconv.Atoi(h[i+1:]); err != nil || n < 1 || n > 65535 {
 				problems = append(problems, fmt.Sprintf(
-					"web.public_host: порт не в 1..65535 — ожидается host[:port] (например crawler.example.com:8443), задано %q", h))
+					"web.public_host: port not in 1..65535 — expected host[:port] (e.g. crawler.example.com:8443), got %q", h))
 			}
 		}
 		// «:» без порта («https:»), пустой хост, userinfo («user@host»),
@@ -1956,7 +1956,7 @@ func (c *Config) Validate() error {
 			(strings.Contains(hostPart, ":") &&
 				(!strings.HasPrefix(hostPart, "[") || !strings.HasSuffix(hostPart, "]"))) {
 			problems = append(problems, fmt.Sprintf(
-				"web.public_host: ожидается host[:port] без схемы, пути и userinfo (например crawler.example.com, IPv6 — в скобках), задано %q", h))
+				"web.public_host: expected host[:port] without scheme, path or userinfo (e.g. crawler.example.com, IPv6 in brackets), got %q", h))
 		}
 	}
 
@@ -1966,28 +1966,28 @@ func (c *Config) Validate() error {
 	// сервисов проекта; сам формат password_hash разбирает
 	// internal/dashboard/auth на старте дашборда.
 	if err := checkHostPort(c.Dashboard.Listen); err != nil {
-		problems = append(problems, fmt.Sprintf("dashboard.listen: ожидается [host]:port, задано %q", c.Dashboard.Listen))
+		problems = append(problems, fmt.Sprintf("dashboard.listen: expected [host]:port, got %q", c.Dashboard.Listen))
 	}
 	if c.Dashboard.Refresh < Duration(time.Second) || c.Dashboard.Refresh > Duration(5*time.Minute) {
-		problems = append(problems, fmt.Sprintf("dashboard.refresh: ожидается %s..%s, задано %s",
+		problems = append(problems, fmt.Sprintf("dashboard.refresh: expected %s..%s, got %s",
 			Duration(time.Second), Duration(5*time.Minute), c.Dashboard.Refresh))
 	}
 	// TTL кэша тяжёлых агрегатов (T-161): коридор постановки 1–5 мин —
 	// меньше минуты кэш не спасает на дефолтном refresh 5 с, больше
 	// 5 минут — сводка теряет оперативность.
 	if c.Dashboard.StatusCacheTTL < Duration(time.Minute) || c.Dashboard.StatusCacheTTL > Duration(5*time.Minute) {
-		problems = append(problems, fmt.Sprintf("dashboard.status_cache_ttl: ожидается %s..%s, задано %s",
+		problems = append(problems, fmt.Sprintf("dashboard.status_cache_ttl: expected %s..%s, got %s",
 			Duration(time.Minute), Duration(5*time.Minute), c.Dashboard.StatusCacheTTL))
 	}
 	for _, name := range sortedStringKeys(c.Dashboard.Probes) {
 		if name == "" {
-			problems = append(problems, "dashboard.probes: имя пробы не может быть пустым")
+			problems = append(problems, "dashboard.probes: the probe name must not be empty")
 			continue
 		}
 		u, err := url.Parse(c.Dashboard.Probes[name])
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 			problems = append(problems, fmt.Sprintf(
-				"dashboard.probes: %s=%q — ожидается абсолютный http(s)-адрес (базовый URL метрик сервиса, ТЗД §8.3)", name, c.Dashboard.Probes[name]))
+				"dashboard.probes: %s=%q — expected an absolute http(s) URL (the service metrics base URL, dashboard spec §8.3)", name, c.Dashboard.Probes[name]))
 		}
 	}
 	// Адреса панели движков (T-246) — тот же критерий абсолютного
@@ -1996,7 +1996,7 @@ func (c *Config) Validate() error {
 		u, err := url.Parse(raw)
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 			problems = append(problems, fmt.Sprintf(
-				"dashboard.render_metrics_urls: %q — ожидается абсолютный http(s)-адрес (экспозиция /metrics рендер-воркера)", raw))
+				"dashboard.render_metrics_urls: %q — expected an absolute http(s) URL (the render worker /metrics exposition)", raw))
 		}
 	}
 
@@ -2004,13 +2004,13 @@ func (c *Config) Validate() error {
 	switch c.Log.Level {
 	case "", "debug", "info", "warn", "error": // "" — конфиг без Default()
 	default:
-		problems = append(problems, fmt.Sprintf("log.level: ожидается debug|info|warn|error, задано %q", c.Log.Level))
+		problems = append(problems, fmt.Sprintf("log.level: expected debug|info|warn|error, got %q", c.Log.Level))
 	}
 
 	if len(problems) == 0 {
 		return nil
 	}
-	return fmt.Errorf("невалидные значения (%d): %s", len(problems), strings.Join(problems, "; "))
+	return fmt.Errorf("invalid values (%d): %s", len(problems), strings.Join(problems, "; "))
 }
 
 // checkHostPort проверяет форму host:port (адреса резолверов, redis,
@@ -2022,7 +2022,7 @@ func checkHostPort(s string) error {
 	}
 	n, err := strconv.Atoi(port)
 	if err != nil || n < 1 || n > 65535 {
-		return fmt.Errorf("порт %q", port)
+		return fmt.Errorf("port %q", port)
 	}
 	return nil
 }
@@ -2051,9 +2051,9 @@ func sortedStringKeys(m map[string]string) []string {
 }
 
 func rangeMsg(field string, v, lo, hi int) string {
-	return fmt.Sprintf("%s: ожидается %d..%d, задано %d", field, lo, hi, v)
+	return fmt.Sprintf("%s: expected %d..%d, got %d", field, lo, hi, v)
 }
 
 func nonPositiveDur(field string, d Duration) string {
-	return fmt.Sprintf("%s: ожидается положительная длительность, задано %s", field, d)
+	return fmt.Sprintf("%s: expected a positive duration, got %s", field, d)
 }

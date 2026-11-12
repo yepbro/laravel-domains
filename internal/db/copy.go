@@ -21,11 +21,11 @@ type RowIter func() ([]any, error)
 // An empty chunk is a no-op without touching the DB.
 func CopyFrom(ctx context.Context, pool DB, table pgx.Identifier, columns []string, rows [][]any) (int64, error) {
 	if len(columns) == 0 {
-		return 0, errors.New("db: COPY: список колонок пуст")
+		return 0, errors.New("db: COPY: empty column list")
 	}
 	for i, row := range rows {
 		if len(row) != len(columns) {
-			return 0, fmt.Errorf("db: COPY %s: строка %d содержит %d значений, колонок %d", table, i, len(row), len(columns))
+			return 0, fmt.Errorf("db: COPY %s: row %d has %d values, %d columns", table, i, len(row), len(columns))
 		}
 	}
 	if len(rows) == 0 {
@@ -33,7 +33,7 @@ func CopyFrom(ctx context.Context, pool DB, table pgx.Identifier, columns []stri
 	}
 	n, err := pool.CopyFrom(ctx, table, columns, pgx.CopyFromRows(rows))
 	if err != nil {
-		return n, fmt.Errorf("db: COPY %s (%d строк): %w", table, len(rows), err)
+		return n, fmt.Errorf("db: COPY %s (%d rows): %w", table, len(rows), err)
 	}
 	return n, nil
 }
@@ -48,10 +48,10 @@ func CopyFrom(ctx context.Context, pool DB, table pgx.Identifier, columns []stri
 // that failed).
 func CopyFromStream(ctx context.Context, pool DB, table pgx.Identifier, columns []string, batchSize int, next RowIter) (int64, error) {
 	if len(columns) == 0 {
-		return 0, errors.New("db: COPY: список колонок пуст")
+		return 0, errors.New("db: COPY: empty column list")
 	}
 	if batchSize < 1 {
-		return 0, fmt.Errorf("db: COPY %s: размер пачки %d, минимум 1", table, batchSize)
+		return 0, fmt.Errorf("db: COPY %s: batch size %d, minimum 1", table, batchSize)
 	}
 
 	var total int64
@@ -66,7 +66,7 @@ func CopyFromStream(ctx context.Context, pool DB, table pgx.Identifier, columns 
 		return err
 	}
 	interrupted := func(rowIdx int, cause error) error {
-		return fmt.Errorf("db: COPY %s прерван на строке %d (скопировано %d): %w", table, rowIdx, total, cause)
+		return fmt.Errorf("db: COPY %s aborted at row %d (copied %d): %w", table, rowIdx, total, cause)
 	}
 
 	rowIdx := 0
@@ -79,10 +79,10 @@ func CopyFromStream(ctx context.Context, pool DB, table pgx.Identifier, columns 
 			break
 		}
 		if err != nil {
-			return total, fmt.Errorf("db: COPY %s: источник строк на строке %d (скопировано %d): %w", table, rowIdx, total, err)
+			return total, fmt.Errorf("db: COPY %s: row source failed at row %d (copied %d): %w", table, rowIdx, total, err)
 		}
 		if len(row) != len(columns) {
-			return total, fmt.Errorf("db: COPY %s: строка %d содержит %d значений, колонок %d", table, rowIdx, len(row), len(columns))
+			return total, fmt.Errorf("db: COPY %s: row %d has %d values, %d columns", table, rowIdx, len(row), len(columns))
 		}
 		batch = append(batch, row)
 		rowIdx++

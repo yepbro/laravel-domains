@@ -292,7 +292,7 @@ func TestExchangeRetriesExhausted(t *testing.T) {
 	if !errors.Is(err, sentinel) {
 		t.Fatalf("ошибка не оборачивает последнюю причину: %v", err)
 	}
-	if !strings.Contains(err.Error(), "исчерпаны попытки") || !strings.Contains(err.Error(), "example.com") {
+	if !strings.Contains(err.Error(), "attempts exhausted") || !strings.Contains(err.Error(), "example.com") {
 		t.Fatalf("сообщение без контекста: %v", err)
 	}
 	if n := len(*calls); n != 3 { // the first + 2 retries
@@ -346,10 +346,10 @@ func TestExchangeQuestionValidation(t *testing.T) {
 		q    Question
 		want string
 	}{
-		{"пустое имя", Question{Name: "", Type: dns.TypeA}, "имя вопроса пусто"},
-		{"пробельное имя", Question{Name: "  ", Type: dns.TypeA}, "имя вопроса пусто"},
-		{"нулевой тип", Question{Name: "example.com", Type: 0}, "неизвестный тип записи"},
-		{"несуществующий тип", Question{Name: "example.com", Type: 0xFFFF}, "неизвестный тип записи"},
+		{"пустое имя", Question{Name: "", Type: dns.TypeA}, "empty question name"},
+		{"пробельное имя", Question{Name: "  ", Type: dns.TypeA}, "empty question name"},
+		{"нулевой тип", Question{Name: "example.com", Type: 0}, "unknown record type"},
+		{"несуществующий тип", Question{Name: "example.com", Type: 0xFFFF}, "unknown record type"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -378,7 +378,7 @@ func TestExchangeBadNameFailsPack(t *testing.T) {
 	})
 	if _, err := c.Exchange(context.Background(), Question{Name: long, Type: dns.TypeA}); err == nil {
 		t.Fatal("ожидается ошибка упаковки")
-	} else if !strings.Contains(err.Error(), "некорректное имя вопроса") {
+	} else if !strings.Contains(err.Error(), "invalid question name") {
 		t.Fatalf("сообщение без контекста упаковки: %v", err)
 	}
 	if len(*calls) != 0 {

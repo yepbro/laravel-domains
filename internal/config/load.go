@@ -41,7 +41,7 @@ func LoadEnv(getenv func(string) string) (*Config, error) {
 		}
 	}
 	if path == "" {
-		return build(Default(), getenv, "без файла (значения по умолчанию + окружение)")
+		return build(Default(), getenv, "no file (defaults + environment)")
 	}
 	return loadPath(path, getenv)
 }
@@ -55,13 +55,13 @@ func LoadFile(path string) (*Config, error) {
 func loadPath(path string, getenv func(string) string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("config: чтение %s: %w", path, err)
+		return nil, fmt.Errorf("config: reading %s: %w", path, err)
 	}
 	cfg := Default()
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true) // опечатка в ключе — ошибка, а не молчаливо пропущенное значение
 	if err := dec.Decode(cfg); err != nil && !errors.Is(err, io.EOF) {
-		return nil, fmt.Errorf("config: разбор %s: %w", path, err)
+		return nil, fmt.Errorf("config: parsing %s: %w", path, err)
 	}
 	return build(cfg, getenv, path)
 }
@@ -227,7 +227,7 @@ func (c *Config) applyEnv(getenv func(string) string) error {
 			continue // пустое значение переменной считается незаданным
 		}
 		if err := s.set(c, v); err != nil {
-			errs = append(errs, fmt.Errorf("переменная %s: %w", s.key, err))
+			errs = append(errs, fmt.Errorf("env var %s: %w", s.key, err))
 		}
 	}
 	// Устаревшая APP_PG_DSN (deploy/docker/compose.yaml, Makefile):
@@ -248,7 +248,7 @@ func setInt(get func(*Config) *int) func(*Config, string) error {
 	return func(c *Config, v string) error {
 		n, err := strconv.Atoi(strings.TrimSpace(v))
 		if err != nil {
-			return fmt.Errorf("ожидается целое число, получено %q", v)
+			return fmt.Errorf("expected an integer, got %q", v)
 		}
 		*get(c) = n
 		return nil
@@ -259,7 +259,7 @@ func setInt64(get func(*Config) *int64) func(*Config, string) error {
 	return func(c *Config, v string) error {
 		n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
 		if err != nil {
-			return fmt.Errorf("ожидается целое число, получено %q", v)
+			return fmt.Errorf("expected an integer, got %q", v)
 		}
 		*get(c) = n
 		return nil
@@ -270,7 +270,7 @@ func setFloat(get func(*Config) *float64) func(*Config, string) error {
 	return func(c *Config, v string) error {
 		f, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
 		if err != nil {
-			return fmt.Errorf("ожидается число, получено %q", v)
+			return fmt.Errorf("expected a number, got %q", v)
 		}
 		*get(c) = f
 		return nil
@@ -281,7 +281,7 @@ func setBool(get func(*Config) *bool) func(*Config, string) error {
 	return func(c *Config, v string) error {
 		b, err := strconv.ParseBool(strings.TrimSpace(v))
 		if err != nil {
-			return fmt.Errorf("ожидается булево значение (true/false/1/0), получено %q", v)
+			return fmt.Errorf("expected a boolean (true/false/1/0), got %q", v)
 		}
 		*get(c) = b
 		return nil
@@ -360,11 +360,11 @@ func setZoneWeights(get func(*Config) *map[string]int) func(*Config, string) err
 			}
 			name, weight, ok := strings.Cut(part, "=")
 			if !ok {
-				return fmt.Errorf("ожидается карта «имя_зоны=вес» через запятую (com=5,org=2), получено %q", part)
+				return fmt.Errorf("expected a comma-separated zone=weight map (com=5,org=2), got %q", part)
 			}
 			n, err := strconv.Atoi(strings.TrimSpace(weight))
 			if err != nil {
-				return fmt.Errorf("вес зоны %s: ожидается целое число, получено %q", strings.TrimSpace(name), weight)
+				return fmt.Errorf("zone %s weight: expected an integer, got %q", strings.TrimSpace(name), weight)
 			}
 			m[strings.ToLower(strings.TrimSpace(name))] = n
 		}
@@ -390,15 +390,15 @@ func setPerIPOverrides(get func(*Config) *map[string]int) func(*Config, string) 
 			}
 			cidr, limit, ok := strings.Cut(part, "=")
 			if !ok {
-				return fmt.Errorf("ожидается карта «CIDR=лимит» через запятую (195.208.0.0/16=12), получено %q", part)
+				return fmt.Errorf("expected a comma-separated CIDR=limit map (195.208.0.0/16=12), got %q", part)
 			}
 			prefix, err := netip.ParsePrefix(strings.TrimSpace(cidr))
 			if err != nil {
-				return fmt.Errorf("лимит per-IP %s: ожидается CIDR IPv4/IPv6, получено %q", strings.TrimSpace(cidr), cidr)
+				return fmt.Errorf("per-IP limit %s: expected an IPv4/IPv6 CIDR, got %q", strings.TrimSpace(cidr), cidr)
 			}
 			n, err := strconv.Atoi(strings.TrimSpace(limit))
 			if err != nil {
-				return fmt.Errorf("лимит per-IP %s: ожидается целое число, получено %q", strings.TrimSpace(cidr), limit)
+				return fmt.Errorf("per-IP limit %s: expected an integer, got %q", strings.TrimSpace(cidr), limit)
 			}
 			m[prefix.Masked().String()] = n
 		}
@@ -426,7 +426,7 @@ func setStringMap(get func(*Config) *map[string]string) func(*Config, string) er
 			}
 			name, val, ok := strings.Cut(part, "=")
 			if !ok {
-				return fmt.Errorf("ожидается карта «имя=значение» через запятую (mon=http://m:9101), получено %q", part)
+				return fmt.Errorf("expected a comma-separated name=value map (mon=http://m:9101), got %q", part)
 			}
 			m[strings.ToLower(strings.TrimSpace(name))] = strings.TrimSpace(val)
 		}

@@ -29,7 +29,7 @@ import (
 
 // ErrPoolClosed is returned by Get after Close (Put closes the socket
 // silently: its exchange has finished, nobody and nothing waits for it).
-var ErrPoolClosed = errors.New("dnsclient: пул UDP-сокетов закрыт")
+var ErrPoolClosed = errors.New("dnsclient: UDP socket pool closed")
 
 // UDPPool is a pool of connected UDP sockets to one address. Safe for
 // concurrent use from goroutines.
@@ -58,10 +58,10 @@ type UDPPool struct {
 // startup probe (T-107). The context bounds the opening.
 func NewUDPPool(ctx context.Context, addr string, size int) (*UDPPool, error) {
 	if size < 1 {
-		return nil, fmt.Errorf("dnsclient: размер пула UDP-сокетов %d: ожидается ≥ 1", size)
+		return nil, fmt.Errorf("dnsclient: UDP socket pool size %d: expected ≥ 1", size)
 	}
 	if _, _, err := net.SplitHostPort(addr); err != nil {
-		return nil, fmt.Errorf("dnsclient: адрес резолвера %q: ожидается host:port: %w", addr, err)
+		return nil, fmt.Errorf("dnsclient: resolver address %q: expected host:port: %w", addr, err)
 	}
 	p := &UDPPool{
 		addr: addr,
@@ -74,7 +74,7 @@ func NewUDPPool(ctx context.Context, addr string, size int) (*UDPPool, error) {
 		conn, err := p.dial(ctx)
 		if err != nil {
 			_ = p.Close()
-			return nil, fmt.Errorf("dnsclient: открытие пула UDP-сокетов к %s (сокет %d из %d): %w", addr, i+1, size, err)
+			return nil, fmt.Errorf("dnsclient: opening UDP socket pool to %s (socket %d of %d): %w", addr, i+1, size, err)
 		}
 		p.free <- conn
 	}
@@ -94,7 +94,7 @@ func (p *UDPPool) dialUDP(ctx context.Context) (*net.UDPConn, error) {
 	udp, ok := conn.(*net.UDPConn)
 	if !ok {
 		_ = conn.Close()
-		return nil, fmt.Errorf("dnsclient: %s: соединение не UDP (%T)", p.addr, conn)
+		return nil, fmt.Errorf("dnsclient: %s: connection is not UDP (%T)", p.addr, conn)
 	}
 	return udp, nil
 }

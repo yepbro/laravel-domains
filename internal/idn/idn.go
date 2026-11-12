@@ -67,12 +67,12 @@ const (
 
 // kindDescriptions — тексты классов для Error() и String().
 var kindDescriptions = map[ErrorKind]string{
-	ErrEmpty:       "пустое имя",
-	ErrInvalid:     "невалидное имя домена",
-	ErrLabelLen:    "метка длиннее 63 символов",
-	ErrNameLen:     "имя длиннее 253 символов",
-	ErrNoLabel:     "нет метки перед зоной",
-	ErrNumericZone: "числовая зона — таких TLD не существует",
+	ErrEmpty:       "empty name",
+	ErrInvalid:     "invalid domain name",
+	ErrLabelLen:    "label longer than 63 characters",
+	ErrNameLen:     "name longer than 253 characters",
+	ErrNoLabel:     "no label before the zone",
+	ErrNumericZone: "numeric zone — no such TLDs exist",
 }
 
 // String возвращает текст класса (стиль model.Status.String).
@@ -267,11 +267,11 @@ func normalizeASCII(name string) (string, error) {
 	// причиной, мутант вырезания return эквивалентен.
 	// mutator-disable-next-line branch/if
 	if ascii == "" {
-		return "", newErr(ErrInvalid, name, errors.New("пустая метка"))
+		return "", newErr(ErrInvalid, name, errors.New("empty label"))
 	}
 	for _, label := range strings.Split(ascii, ".") {
 		if label == "" {
-			return "", newErr(ErrInvalid, name, errors.New("пустая метка"))
+			return "", newErr(ErrInvalid, name, errors.New("empty label"))
 		}
 		if len(label) > maxLabelLen {
 			return "", newErr(ErrLabelLen, name, nil)

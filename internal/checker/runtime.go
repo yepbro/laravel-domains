@@ -113,7 +113,7 @@ var newResolverChainFn = newResolverChain
 // частично открытые ресурсы закрыты.
 func NewRuntime(ctx context.Context, cfg *config.Config, log Logger, opts RuntimeOptions) (*Runtime, error) {
 	if cfg == nil {
-		return nil, errors.New("checker: контур живой проверки без конфигурации")
+		return nil, errors.New("checker: live check runtime without configuration")
 	}
 	if ctx == nil {
 		ctx = context.Background()

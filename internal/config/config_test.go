@@ -485,10 +485,10 @@ func TestLoadYAMLErrors(t *testing.T) {
 	}{
 		{"неизвестное поле", "postgres:\n  dsn: x\n  unknown_key: 1\n", "unknown_key"},
 		{"неизвестная секция", "postgers:\n  dsn: x\n", "postgers"},
-		{"длительность без единицы", "http:\n  total_timeout: 20\n", "длительность"},
-		{"кривая длительность", "http:\n  total_timeout: \"abc\"\n", "длительность"},
-		{"кривой размер", "content:\n  pack_size: \"512QB\"\n", "размер"},
-		{"размер не число", "content:\n  pack_size: \"много\"\n", "размер"},
+		{"длительность без единицы", "http:\n  total_timeout: 20\n", "duration"},
+		{"кривая длительность", "http:\n  total_timeout: \"abc\"\n", "duration"},
+		{"кривой размер", "content:\n  pack_size: \"512QB\"\n", "size"},
+		{"размер не число", "content:\n  pack_size: \"много\"\n", "size"},
 		{"не тот тип", "http:\n  concurrency: \"много\"\n", "unmarshal"},
 		{"веса не карта", "scheduler:\n  zone_weights: [1, 2]\n", "unmarshal"},
 		{"вес не число", "scheduler:\n  zone_weights:\n    com: много\n", "unmarshal"},
@@ -535,9 +535,9 @@ ingest:
 		path    string
 		wantMsg string
 	}{
-		{"TLD-зона", "com", "TLD-зоне в allowlist делать нечего"},
-		{"не имя зоны", "под_чёртка.test", "не имя зоны"},
-		{"пустая запись", "\" \"", "не имя зоны"},
+		{"TLD-зона", "com", "a TLD has no place in the allowlist"},
+		{"не имя зоны", "под_чёртка.test", "is not a zone name"},
+		{"пустая запись", "\" \"", "is not a zone name"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -579,7 +579,7 @@ func TestZoneNameErrorTexts(t *testing.T) {
 			t.Errorf("текст валидации не содержит %q:\n%s", want, msg)
 		}
 	}
-	for _, banned := range []string{"co.uk", "составные"} {
+	for _, banned := range []string{"co.uk", "composite"} {
 		if strings.Contains(msg, banned) {
 			t.Errorf("текст валидации упоминает составные зоны (%q) — убраны ТЗТ §6.2:\n%s", banned, msg)
 		}
@@ -1446,7 +1446,7 @@ func TestSubdomainsNormalize(t *testing.T) {
 		t.Errorf("subdomains после normalize: ожидаются %v, получено %v", want, cfg.Subdomains)
 	}
 	_, err := loadFrom(t, "subdomains:\n  - \"\"\n  - \"www\"\n  - \"WWW\"\n", validDSN())
-	if err == nil || !strings.Contains(err.Error(), "повтор") {
+	if err == nil || !strings.Contains(err.Error(), "duplicate") {
 		t.Errorf("www и WWW после normalize — дубль, ожидается ошибка, получено %v", err)
 	}
 }
@@ -1485,7 +1485,7 @@ func TestRequeueDeprioritizedZonesNormalize(t *testing.T) {
 	// Дубль после приведения — ошибка валидации (как «WWW»/«www» у
 	// subdomains).
 	_, err := loadFrom(t, "render:\n  requeue_deprioritized_zones:\n    - com\n    - \" COM \"\n", validDSN())
-	if err == nil || !strings.Contains(err.Error(), "повтор") {
+	if err == nil || !strings.Contains(err.Error(), "duplicate") {
 		t.Errorf("com и COM после normalize — дубль, ожидается ошибка, получено %v", err)
 	}
 }

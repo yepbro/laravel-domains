@@ -85,12 +85,12 @@ func TestCopyFrom_Validation(t *testing.T) {
 		t.Errorf("пустая пачка привела к вызовам БД: %v", f.batches)
 	}
 
-	if _, err := CopyFrom(ctx, f, testTable, nil, simpleRows(1)); err == nil || !strings.Contains(err.Error(), "колонок") {
+	if _, err := CopyFrom(ctx, f, testTable, nil, simpleRows(1)); err == nil || !strings.Contains(err.Error(), "columns") {
 		t.Errorf("пустой список колонок: err = %v, want ошибка про колонки", err)
 	}
 
 	bad := [][]any{{1, 2, 3}}
-	if _, err := CopyFrom(ctx, f, testTable, []string{"a", "b"}, bad); err == nil || !strings.Contains(err.Error(), "строка 0") {
+	if _, err := CopyFrom(ctx, f, testTable, []string{"a", "b"}, bad); err == nil || !strings.Contains(err.Error(), "row 0") {
 		t.Errorf("несоответствие строки колонкам: err = %v, want ошибка со строкой 0", err)
 	}
 	if len(f.batches) != 0 {
@@ -168,7 +168,7 @@ func TestCopyFromStream_SourceError(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), boom.Error()) {
 		t.Fatalf("err = %v, want обёрнутая %v", err, boom)
 	}
-	if !strings.Contains(err.Error(), "скопировано 20") {
+	if !strings.Contains(err.Error(), "copied 20") {
 		t.Errorf("err = %v, want упоминание 20 закоммиченных строк (2 полные пачки)", err)
 	}
 	if n != 20 {
@@ -183,7 +183,7 @@ func TestCopyFromStream_RowMismatch(t *testing.T) {
 	f := &fakeCopier{}
 	rows := [][]any{{1, 2, 3}, {1, 2}} // the second row is short
 	n, err := CopyFromStream(context.Background(), f, testTable, []string{"a", "b", "c"}, 10, (&rowsIter{rows: rows}).next)
-	if err == nil || !strings.Contains(err.Error(), "строка 1") {
+	if err == nil || !strings.Contains(err.Error(), "row 1") {
 		t.Errorf("err = %v, want ошибка про строку 1", err)
 	}
 	if n != 0 || len(f.batches) != 0 {

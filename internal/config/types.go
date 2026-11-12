@@ -25,11 +25,11 @@ func (d Duration) String() string { return time.Duration(d).String() }
 // UnmarshalYAML разбирает длительность из YAML-скаляра.
 func (d *Duration) UnmarshalYAML(node *yaml.Node) error {
 	if node.Kind != yaml.ScalarNode {
-		return fmt.Errorf("длительность: ожидается строка вида \"30m\", не %s (строка %d)", node.Tag, node.Line)
+		return fmt.Errorf("duration: expected a string like \"30m\", not %s (line %d)", node.Tag, node.Line)
 	}
 	v, err := ParseDuration(node.Value)
 	if err != nil {
-		return fmt.Errorf("длительность: %w", err)
+		return fmt.Errorf("duration: %w", err)
 	}
 	*d = Duration(v)
 	return nil
@@ -40,7 +40,7 @@ func (d *Duration) UnmarshalYAML(node *yaml.Node) error {
 func ParseDuration(s string) (time.Duration, error) {
 	d, err := time.ParseDuration(strings.TrimSpace(s))
 	if err != nil {
-		return 0, fmt.Errorf("ожидается длительность вида \"5s\", \"30m\", \"24h\", получено %q", s)
+		return 0, fmt.Errorf("expected a duration like \"5s\", \"30m\", \"24h\", got %q", s)
 	}
 	return d, nil
 }
@@ -71,11 +71,11 @@ func (b ByteSize) String() string {
 // с единицей измерения.
 func (b *ByteSize) UnmarshalYAML(node *yaml.Node) error {
 	if node.Kind != yaml.ScalarNode {
-		return fmt.Errorf("размер: ожидается число или строка вида \"512MB\", не %s (строка %d)", node.Tag, node.Line)
+		return fmt.Errorf("size: expected a number or a string like \"512MB\", not %s (line %d)", node.Tag, node.Line)
 	}
 	v, err := ParseSize(node.Value)
 	if err != nil {
-		return fmt.Errorf("размер: %w", err)
+		return fmt.Errorf("size: %w", err)
 	}
 	*b = ByteSize(v)
 	return nil
@@ -99,18 +99,18 @@ var sizeUnits = map[string]int64{
 func ParseSize(s string) (int64, error) {
 	m := sizeRe.FindStringSubmatch(strings.TrimSpace(s))
 	if m == nil {
-		return 0, fmt.Errorf("ожидается количество байт или строка с единицей (\"512MB\", \"1GiB\"), получено %q", s)
+		return 0, fmt.Errorf("expected a byte count or a string with a unit (\"512MB\", \"1GiB\"), got %q", s)
 	}
 	n, err := strconv.ParseInt(m[1], 10, 64)
 	if err != nil {
-		return 0, fmt.Errorf("значение %s слишком велико", m[1])
+		return 0, fmt.Errorf("value %s is too large", m[1])
 	}
 	mult, ok := sizeUnits[strings.ToLower(m[2])]
 	if !ok {
-		return 0, fmt.Errorf("неизвестная единица %q (допустимы B, KB, MB, GB, KiB, MiB, GiB)", m[2])
+		return 0, fmt.Errorf("unknown unit %q (allowed: B, KB, MB, GB, KiB, MiB, GiB)", m[2])
 	}
 	if mult > 1 && n > math.MaxInt64/mult {
-		return 0, fmt.Errorf("значение %q превышает допустимый размер", s)
+		return 0, fmt.Errorf("value %q exceeds the allowed size", s)
 	}
 	return n * mult, nil
 }

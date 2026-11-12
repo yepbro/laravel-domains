@@ -233,11 +233,11 @@ type Throughput struct {
 // FetchZoneStats executes zoneStatsSQL and collects the zone rows.
 func FetchZoneStats(ctx context.Context, pool db.DB) ([]ZoneStats, error) {
 	if pool == nil {
-		return nil, errors.New("status: зоны: пул не задан")
+		return nil, errors.New("status: zones: pool not set")
 	}
 	rows, err := pool.Query(ctx, zoneStatsSQL)
 	if err != nil {
-		return nil, fmt.Errorf("status: зоны: %w", err)
+		return nil, fmt.Errorf("status: zones: %w", err)
 	}
 	defer rows.Close()
 	var zones []ZoneStats
@@ -245,13 +245,13 @@ func FetchZoneStats(ctx context.Context, pool db.DB) ([]ZoneStats, error) {
 		var z ZoneStats
 		if err := rows.Scan(&z.ID, &z.Name, &z.NameUnicode, &z.IsActive,
 			&z.DomainsTotal, &z.Pending, &z.Queued, &z.DomainsChecked); err != nil {
-			return nil, fmt.Errorf("status: зоны: чтение: %w", err)
+			return nil, fmt.Errorf("status: zones: reading: %w", err)
 		}
 		z.Done = z.DomainsChecked // one counter column — both semantics (T-178)
 		zones = append(zones, z)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("status: зоны: %w", err)
+		return nil, fmt.Errorf("status: zones: %w", err)
 	}
 	return zones, nil
 }
@@ -260,22 +260,22 @@ func FetchZoneStats(ctx context.Context, pool db.DB) ([]ZoneStats, error) {
 // SELECT without FROM).
 func FetchThroughput(ctx context.Context, pool db.DB) (Throughput, error) {
 	if pool == nil {
-		return Throughput{}, errors.New("status: темп: пул не задан")
+		return Throughput{}, errors.New("status: throughput: pool not set")
 	}
 	rows, err := pool.Query(ctx, throughputSQL)
 	if err != nil {
-		return Throughput{}, fmt.Errorf("status: темп: %w", err)
+		return Throughput{}, fmt.Errorf("status: throughput: %w", err)
 	}
 	defer rows.Close()
 	if !rows.Next() {
-		return Throughput{}, errors.New("status: темп: пустой ответ")
+		return Throughput{}, errors.New("status: throughput: empty response")
 	}
 	var t Throughput
 	if err := rows.Scan(&t.DoneToday, &t.ElapsedSec, &t.ResultsHour, &t.RenderedHour, &t.HourWindowSec); err != nil {
-		return Throughput{}, fmt.Errorf("status: темп: чтение: %w", err)
+		return Throughput{}, fmt.Errorf("status: throughput: reading: %w", err)
 	}
 	if err := rows.Err(); err != nil {
-		return Throughput{}, fmt.Errorf("status: темп: %w", err)
+		return Throughput{}, fmt.Errorf("status: throughput: %w", err)
 	}
 	return t, nil
 }
@@ -327,11 +327,11 @@ type IngestReport struct {
 // manual fix of the table (runbooks §6).
 func FetchDomainStatuses(ctx context.Context, pool db.DB) (map[string]int64, error) {
 	if pool == nil {
-		return nil, errors.New("status: статусы: пул не задан")
+		return nil, errors.New("status: statuses: pool not set")
 	}
 	rows, err := pool.Query(ctx, domainStatusSQL)
 	if err != nil {
-		return nil, fmt.Errorf("status: статусы: %w", err)
+		return nil, fmt.Errorf("status: statuses: %w", err)
 	}
 	defer rows.Close()
 	counts := make(map[string]int64, len(model.Statuses))
@@ -343,7 +343,7 @@ func FetchDomainStatuses(ctx context.Context, pool db.DB) (map[string]int64, err
 		var name string
 		var n int64
 		if err := rows.Scan(&name, &n); err != nil {
-			return nil, fmt.Errorf("status: статусы: чтение: %w", err)
+			return nil, fmt.Errorf("status: statuses: reading: %w", err)
 		}
 		if _, ok := counts[strings.TrimPrefix(name, statusPrefix)]; !ok {
 			continue // a name outside the model.Statuses legend — the comment above
@@ -351,7 +351,7 @@ func FetchDomainStatuses(ctx context.Context, pool db.DB) (map[string]int64, err
 		counts[strings.TrimPrefix(name, statusPrefix)] = n
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("status: статусы: %w", err)
+		return nil, fmt.Errorf("status: statuses: %w", err)
 	}
 	return counts, nil
 }
@@ -366,7 +366,7 @@ func FetchDomainStatuses(ctx context.Context, pool db.DB) (map[string]int64, err
 // duration of the second query (with pool_size=1 — a deadlock).
 func FetchLaravelStats(ctx context.Context, pool db.DB) (LaravelStats, error) {
 	if pool == nil {
-		return LaravelStats{}, errors.New("status: laravel: пул не задан")
+		return LaravelStats{}, errors.New("status: laravel: pool not set")
 	}
 	var st LaravelStats
 	rows, err := pool.Query(ctx, laravelTotalsSQL)
@@ -382,11 +382,11 @@ func FetchLaravelStats(ctx context.Context, pool db.DB) (LaravelStats, error) {
 		if err != nil {
 			return LaravelStats{}, fmt.Errorf("status: laravel: %w", err)
 		}
-		return LaravelStats{}, errors.New("status: laravel: пустой ответ агрегата")
+		return LaravelStats{}, errors.New("status: laravel: empty aggregate response")
 	}
 	if err := rows.Scan(&st.Total, &st.Last24h); err != nil {
 		rows.Close()
-		return LaravelStats{}, fmt.Errorf("status: laravel: чтение: %w", err)
+		return LaravelStats{}, fmt.Errorf("status: laravel: reading: %w", err)
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
@@ -396,7 +396,7 @@ func FetchLaravelStats(ctx context.Context, pool db.DB) (LaravelStats, error) {
 
 	rows, err = pool.Query(ctx, laravelRecentSQL)
 	if err != nil {
-		return LaravelStats{}, fmt.Errorf("status: laravel: последние: %w", err)
+		return LaravelStats{}, fmt.Errorf("status: laravel: latest: %w", err)
 	}
 	defer rows.Close()
 	st.Recent = make([]LaravelRecent, 0, 10)
@@ -408,7 +408,7 @@ func FetchLaravelStats(ctx context.Context, pool db.DB) (LaravelStats, error) {
 			updated time.Time
 		)
 		if err := rows.Scan(&it.Domain, &it.Zone, &it.Score, &verMin, &verMax, &updated); err != nil {
-			return LaravelStats{}, fmt.Errorf("status: laravel: последние: чтение: %w", err)
+			return LaravelStats{}, fmt.Errorf("status: laravel: latest: reading: %w", err)
 		}
 		if verMin != nil {
 			it.VerMin = *verMin
@@ -420,7 +420,7 @@ func FetchLaravelStats(ctx context.Context, pool db.DB) (LaravelStats, error) {
 		st.Recent = append(st.Recent, it)
 	}
 	if err := rows.Err(); err != nil {
-		return LaravelStats{}, fmt.Errorf("status: laravel: последние: %w", err)
+		return LaravelStats{}, fmt.Errorf("status: laravel: latest: %w", err)
 	}
 	return st, nil
 }
@@ -432,7 +432,7 @@ func FetchLaravelStats(ctx context.Context, pool db.DB) (LaravelStats, error) {
 // RecordFile); NULL is legal only for manually inserted rows.
 func FetchIngestReports(ctx context.Context, pool db.DB) ([]IngestReport, error) {
 	if pool == nil {
-		return nil, errors.New("status: ingest: пул не задан")
+		return nil, errors.New("status: ingest: pool not set")
 	}
 	rows, err := pool.Query(ctx, ingestRecentSQL)
 	if err != nil {
@@ -454,7 +454,7 @@ func FetchIngestReports(ctx context.Context, pool db.DB) ([]IngestReport, error)
 		)
 		if err := rows.Scan(&path, &action, &lines, &added, &existed, &deleted,
 			&rejected, &processed); err != nil {
-			return nil, fmt.Errorf("status: ingest: чтение: %w", err)
+			return nil, fmt.Errorf("status: ingest: reading: %w", err)
 		}
 		if path != nil {
 			it.Path = *path
@@ -505,7 +505,7 @@ var Streams = queue.AllStreams()
 // unavailable server are pointless.
 func FetchQueueLens(ctx context.Context, lenner StreamLener) (map[string]int64, error) {
 	if lenner == nil {
-		return nil, errors.New("status: очереди: клиент не задан")
+		return nil, errors.New("status: queues: client not set")
 	}
 	lens := make(map[string]int64, len(Streams))
 	for _, s := range Streams {
@@ -615,12 +615,12 @@ func ComputeRates(t Throughput, pending, queued int64) Rates {
 func FormatDuration(sec int64) string {
 	switch {
 	case sec < 60:
-		return fmt.Sprintf("%dс", sec)
+		return fmt.Sprintf("%ds", sec)
 	case sec < 3600:
-		return fmt.Sprintf("%dм", (sec+30)/60)
+		return fmt.Sprintf("%dm", (sec+30)/60)
 	case sec < 86400:
-		return fmt.Sprintf("%dч %02dм", sec/3600, (sec%3600)/60)
+		return fmt.Sprintf("%dh %02dm", sec/3600, (sec%3600)/60)
 	default:
-		return fmt.Sprintf("%dд %dч", sec/86400, (sec%86400)/3600)
+		return fmt.Sprintf("%dd %dh", sec/86400, (sec%86400)/3600)
 	}
 }

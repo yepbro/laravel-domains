@@ -205,7 +205,7 @@ func TestFallbackAllDead(t *testing.T) {
 	if err == nil {
 		t.Fatal("исчерпание цепи — ошибка")
 	}
-	for _, want := range []string{"10.0.0.1:53", "10.0.0.2:53", "10.0.0.3:53", "не ответил ни один резолвер", "example.com"} {
+	for _, want := range []string{"10.0.0.1:53", "10.0.0.2:53", "10.0.0.3:53", "no resolver in the chain responded", "example.com"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("сообщение без %q: %v", want, err)
 		}

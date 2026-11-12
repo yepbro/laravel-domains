@@ -86,14 +86,14 @@ type Options struct {
 // обходом-страховкой.
 func Dir(ctx context.Context, opts Options) (<-chan File, error) {
 	if opts.Dir == "" {
-		return nil, errors.New("watch: не задан наблюдаемый каталог (Options.Dir)")
+		return nil, errors.New("watch: watched directory not set (Options.Dir)")
 	}
 	o := opts.withDefaults()
 
 	// Каталога может не быть (том монтируется позже) — создаём и
 	// наблюдаем как обычно.
 	if err := os.MkdirAll(o.Dir, 0o755); err != nil {
-		return nil, fmt.Errorf("watch: каталог %s: %w", o.Dir, err)
+		return nil, fmt.Errorf("watch: directory %s: %w", o.Dir, err)
 	}
 	fw, err := fsnotify.NewWatcher()
 	if err != nil {
@@ -118,7 +118,7 @@ func Dir(ctx context.Context, opts Options) (<-chan File, error) {
 		watched: make(map[string]struct{}),
 	}
 	files := make(chan File, o.QueueSize)
-	log.Info("наблюдаю каталог входных файлов",
+	log.Info("watching the incoming files directory",
 		"dir", o.Dir,
 		"stable_after", o.StableAfter.String(),
 		"scan_interval", o.ScanInterval.String())
@@ -249,7 +249,7 @@ func (w *watcher) emitReady(ctx context.Context, files chan<- File) {
 		if !ok {
 			continue
 		}
-		w.log.Debug("файл стабилен", "path", f.Path, "size", f.Size)
+		w.log.Debug("file is stable", "path", f.Path, "size", f.Size)
 		select {
 		case files <- f: // backpressure: ждём потребителя, ничего не теряем
 		case <-ctx.Done():
@@ -270,15 +270,15 @@ func (w *watcher) walk(root string) {
 			if path == root {
 				// Наблюдаемый каталог исчез (том отвалился): вернём его
 				// и watch; обход повторится по следующему тику.
-				w.log.Warn("наблюдаемый каталог недоступен", "dir", root, "err", err)
+				w.log.Warn("watched directory unavailable", "dir", root, "err", err)
 				if mkErr := os.MkdirAll(root, 0o755); mkErr != nil {
-					w.log.Warn("создание каталога", "dir", root, "err", mkErr)
+					w.log.Warn("creating directory", "dir", root, "err", mkErr)
 				} else {
 					w.addWatch(root)
 				}
 				return fs.SkipAll
 			}
-			w.log.Warn("обход каталога", "path", path, "err", err)
+			w.log.Warn("directory walk", "path", path, "err", err)
 			return nil // пропустить запись, продолжить обход
 		}
 		if d.IsDir() {
@@ -302,7 +302,7 @@ func (w *watcher) walk(root string) {
 		return nil
 	})
 	if err != nil {
-		w.log.Warn("обход каталога", "dir", root, "err", err)
+		w.log.Warn("directory walk", "dir", root, "err", err)
 	}
 }
 

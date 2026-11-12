@@ -104,20 +104,20 @@ func (b *UpdateBuilder) build() (string, []Column, error) {
 
 	var problems []string
 	if strings.TrimSpace(b.table) == "" {
-		problems = append(problems, "не задана таблица")
+		problems = append(problems, "table not set")
 	}
 	if len(b.keys) == 0 {
-		problems = append(problems, "не заданы ключи (Update(...).Key(...))")
+		problems = append(problems, "keys not set (Update(...).Key(...))")
 	}
 	if len(b.assigns) == 0 && len(b.exprs) == 0 {
-		problems = append(problems, "не задано ни одного присваивания (Set/SetExpr)")
+		problems = append(problems, "no assignments set (Set/SetExpr)")
 	}
 	for _, c := range cols {
 		if strings.TrimSpace(c.Name) == "" {
-			problems = append(problems, "колонка с пустым именем")
+			problems = append(problems, "column with an empty name")
 		}
 		if strings.TrimSpace(c.Type) == "" {
-			problems = append(problems, fmt.Sprintf("колонка %s: не задан SQL-тип", c.Name))
+			problems = append(problems, fmt.Sprintf("column %s: SQL type not set", c.Name))
 		}
 	}
 	if len(problems) > 0 {
@@ -165,7 +165,7 @@ func (b *UpdateBuilder) args(columns [][]any) ([]any, error) {
 		for i, c := range cols {
 			names[i] = c.Name
 		}
-		return nil, fmt.Errorf("db: UPDATE %s: передано %d массивов значений, нужно %d (колонки: %s)",
+		return nil, fmt.Errorf("db: UPDATE %s: got %d value arrays, need %d (columns: %s)",
 			b.table, len(columns), len(cols), strings.Join(names, ", "))
 	}
 
@@ -176,7 +176,7 @@ func (b *UpdateBuilder) args(columns [][]any) ([]any, error) {
 			continue
 		}
 		if len(col) != n {
-			return nil, fmt.Errorf("db: UPDATE %s: колонка %s содержит %d значений, а остальные %d (массивы обязаны быть параллельными)",
+			return nil, fmt.Errorf("db: UPDATE %s: column %s has %d values while the rest have %d (arrays must be parallel)",
 				b.table, cols[i].Name, len(col), n)
 		}
 	}
@@ -207,7 +207,7 @@ func (b *UpdateBuilder) SQL() (string, error) {
 // Returning use Query.
 func (b *UpdateBuilder) Exec(ctx context.Context, pool DB, columns ...[]any) (int64, error) {
 	if len(b.returning) > 0 {
-		return 0, fmt.Errorf("db: UPDATE %s: задан Returning — используйте Query", b.table)
+		return 0, fmt.Errorf("db: UPDATE %s: Returning is set — use Query", b.table)
 	}
 	args, err := b.args(columns)
 	if err != nil {
@@ -222,7 +222,7 @@ func (b *UpdateBuilder) Exec(ctx context.Context, pool DB, columns ...[]any) (in
 	}
 	tag, err := pool.Exec(ctx, sql, args...)
 	if err != nil {
-		return 0, fmt.Errorf("db: UPDATE %s (%d строк): %w", b.table, len(columns[0]), err)
+		return 0, fmt.Errorf("db: UPDATE %s (%d rows): %w", b.table, len(columns[0]), err)
 	}
 	return tag.RowsAffected(), nil
 }
@@ -231,14 +231,14 @@ func (b *UpdateBuilder) Exec(ctx context.Context, pool DB, columns ...[]any) (in
 // (the table alias is t). The caller must close pgx.Rows.
 func (b *UpdateBuilder) Query(ctx context.Context, pool DB, columns ...[]any) (pgx.Rows, error) {
 	if len(b.returning) == 0 {
-		return nil, fmt.Errorf("db: UPDATE %s: Returning не задан — используйте Exec", b.table)
+		return nil, fmt.Errorf("db: UPDATE %s: Returning is not set — use Exec", b.table)
 	}
 	args, err := b.args(columns)
 	if err != nil {
 		return nil, err
 	}
 	if args == nil {
-		return nil, errors.New("db: UPDATE " + b.table + ": Query с пустой пачкой не возвращает строк")
+		return nil, errors.New("db: UPDATE " + b.table + ": Query with an empty batch returns no rows")
 	}
 	sql, _, err := b.build()
 	if err != nil {
@@ -246,7 +246,7 @@ func (b *UpdateBuilder) Query(ctx context.Context, pool DB, columns ...[]any) (p
 	}
 	rows, err := pool.Query(ctx, sql, args...)
 	if err != nil {
-		return nil, fmt.Errorf("db: UPDATE %s (%d строк): %w", b.table, len(columns[0]), err)
+		return nil, fmt.Errorf("db: UPDATE %s (%d rows): %w", b.table, len(columns[0]), err)
 	}
 	return rows, nil
 }

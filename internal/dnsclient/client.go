@@ -93,13 +93,13 @@ type Question struct {
 // error is deterministic, retrying it is pointless.
 func (q Question) validate() error {
 	if strings.TrimSpace(q.Name) == "" {
-		return errors.New("dnsclient: имя вопроса пусто")
+		return errors.New("dnsclient: empty question name")
 	}
 	// The sign of a working type is an RR implementation in miekg/dns:
 	// pseudo-types from TypeToString (None, Reserved) have no records, and
 	// neither do service ones (AXFR/IXFR); this also guarantees the response parses.
 	if dns.TypeToRR[q.Type] == nil {
-		return fmt.Errorf("dnsclient: неизвестный тип записи %d (ожидаются dns.TypeA/AAAA/CNAME/NS/…)", q.Type)
+		return fmt.Errorf("dnsclient: unknown record type %d (expected dns.TypeA/AAAA/CNAME/NS/…)", q.Type)
 	}
 	return nil
 }
@@ -246,14 +246,14 @@ func (o Options) withDefaults() Options {
 // and are not repeated here; only what normalization cannot sensibly fix is caught.
 func (o Options) validate() error {
 	if _, _, err := net.SplitHostPort(o.Addr); err != nil {
-		return fmt.Errorf("dnsclient: адрес резолвера: %w", err)
+		return fmt.Errorf("dnsclient: resolver address: %w", err)
 	}
 	if o.Retries > MaxRetries {
-		return fmt.Errorf("dnsclient: retries %d: максимум %d", o.Retries, MaxRetries)
+		return fmt.Errorf("dnsclient: retries %d: maximum %d", o.Retries, MaxRetries)
 	}
 	// Guard against direct construction bypassing NewClient.
 	if o.UDPPoolSize < 1 {
-		return fmt.Errorf("dnsclient: udp_pool_size %d: ожидается ≥ 1", o.UDPPoolSize)
+		return fmt.Errorf("dnsclient: udp_pool_size %d: expected ≥ 1", o.UDPPoolSize)
 	}
 	return nil
 }
@@ -328,7 +328,7 @@ func (c *Client) Exchange(ctx context.Context, q Question) (*Result, error) {
 	if _, err := msg.Pack(); err != nil {
 		// The packing error is deterministic (name length/characters) —
 		// retries will not change the outcome.
-		return nil, fmt.Errorf("dnsclient: некорректное имя вопроса %q: %w", q.Name, err)
+		return nil, fmt.Errorf("dnsclient: invalid question name %q: %w", q.Name, err)
 	}
 
 	start := time.Now()
@@ -369,7 +369,7 @@ func (c *Client) Exchange(ctx context.Context, q Question) (*Result, error) {
 			}
 		}
 	}
-	return nil, fmt.Errorf("dnsclient: %s %s: исчерпаны попытки (%d сетевых обменов): %w",
+	return nil, fmt.Errorf("dnsclient: %s %s: attempts exhausted (%d network exchanges): %w",
 		qTypeName(q.Type), q.Name, attempts, lastErr)
 }
 
@@ -435,13 +435,13 @@ func (c *Client) exchangeNet(ctx context.Context, m *dns.Msg, tcp bool) (*dns.Ms
 func (c *Client) udpExchange(ctx context.Context, m *dns.Msg) (*dns.Msg, error) {
 	conn, err := c.pool.Get(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("сокет из пула: %w", err)
+		return nil, fmt.Errorf("socket from pool: %w", err)
 	}
 	defer c.pool.Put(conn)
 
 	wire, err := m.Pack()
 	if err != nil {
-		return nil, fmt.Errorf("упаковка запроса: %w", err)
+		return nil, fmt.Errorf("packing request: %w", err)
 	}
 	dl, ok := ctx.Deadline()
 	if !ok {
@@ -499,7 +499,7 @@ func (c *Client) tcpExchange(ctx context.Context, m *dns.Msg) (*dns.Msg, error) 
 		return nil, err
 	}
 	if resp.Id != m.Id {
-		return nil, fmt.Errorf("идентификатор ответа %d не совпадает с запросом %d", resp.Id, m.Id)
+		return nil, fmt.Errorf("response id %d does not match request %d", resp.Id, m.Id)
 	}
 	return resp, nil
 }

@@ -197,7 +197,7 @@ func TestCacheNilPool(t *testing.T) {
 	clock := &cacheClock{now: time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)}
 	c := NewCache(CacheOptions{TTL: time.Minute, Now: clock.Now})
 	if _, err := c.ZoneStats(context.Background(), nil); err == nil ||
-		!strings.Contains(err.Error(), "пул не задан") {
+		!strings.Contains(err.Error(), "pool not set") {
 		t.Fatalf("nil-пул = %v, want ошибка FetchZoneStats", err)
 	}
 }

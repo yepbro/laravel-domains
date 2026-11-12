@@ -78,7 +78,7 @@ func (r *escalateResolver) Exchange(ctx context.Context, q dnsclient.Question) (
 	if lastRes != nil {
 		return lastRes, nil
 	}
-	return nil, fmt.Errorf("checker: %s: не ответил ни один резолвер цепи (%d): %s; последний: %w",
+	return nil, fmt.Errorf("checker: %s: no resolver in the chain responded (%d): %s; last: %w",
 		q.Name, len(fails), strings.Join(fails, "; "), lastErr)
 }
 
@@ -106,7 +106,7 @@ func newResolverChain(ctx context.Context, cfg config.DNS, udpPoolSize int) (dns
 	}
 	primary, err := dnsclient.NewClient(ctx, primaryOpts)
 	if err != nil {
-		return nil, nil, fmt.Errorf("checker: основной резолвер %s: %w", primaryOpts.Addr, err)
+		return nil, nil, fmt.Errorf("checker: primary resolver %s: %w", primaryOpts.Addr, err)
 	}
 	clients := []*dnsclient.Client{primary}
 	closeAll := func() error {
@@ -128,7 +128,7 @@ func newResolverChain(ctx context.Context, cfg config.DNS, udpPoolSize int) (dns
 		c, err := dnsclient.NewClient(ctx, opts)
 		if err != nil {
 			_ = closeAll()
-			return nil, nil, fmt.Errorf("checker: резервный резолвер %s: %w", addr, err)
+			return nil, nil, fmt.Errorf("checker: fallback resolver %s: %w", addr, err)
 		}
 		clients = append(clients, c)
 		targets = append(targets, escalateTarget{addr: addr, res: c})

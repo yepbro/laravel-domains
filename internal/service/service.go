@@ -107,7 +107,7 @@ type Options struct {
 // Run возвращает её вызывающему немедленно, не дожидаясь OnRun и очистки
 // ресурсов (HTTP-сервер метрик, пул) — main выходит с кодом 1, как и для
 // любой ошибки Run.
-var errForcedExit = errors.New("повторный сигнал завершения")
+var errForcedExit = errors.New("second shutdown signal")
 
 // migrateUp — применение миграций при старте (internal/migrate.Up);
 // перемененная для подмены в тестах жизненного цикла (шов в духе
@@ -155,7 +155,7 @@ func EnvOr(key, defaultVal string) string {
 // ресурсов; main выходит с кодом 1, как и для любой ошибки Run.
 func Run(opts Options) error {
 	if opts.Name == "" {
-		return errors.New("service: имя сервиса обязательно")
+		return errors.New("service: service name is required")
 	}
 	if opts.MetricsAddr == "" {
 		opts.MetricsAddr = ":9090"
@@ -227,13 +227,13 @@ func Run(opts Options) error {
 			// Сигнал прервал применение: миграция откатана на стороне
 			// PostgreSQL, версия схемы — последняя применённая. Это
 			// штатная быстрая остановка, а не сбой (T-112).
-			opts.Logger.Info("сигнал завершения во время применения схемы — миграция прервана и откатана, повторный старт доведёт")
+			opts.Logger.Info("shutdown signal during schema apply — the migration was interrupted and rolled back; the next start will finish it")
 			return nil
 		case migSignalled.Load():
-			opts.Logger.Info("сигнал завершения во время применения схемы — останавливаюсь после миграций")
+			opts.Logger.Info("shutdown signal during schema apply — stopping after the migrations")
 			return nil
 		case migErr != nil:
-			opts.Logger.Error("миграции", "err", migErr)
+			opts.Logger.Error("migrations", "err", migErr)
 			return migErr
 		}
 	}
@@ -260,7 +260,7 @@ func Run(opts Options) error {
 		})
 		cancel()
 		if err != nil {
-			opts.Logger.Error("пул PostgreSQL", "err", err)
+			opts.Logger.Error("PostgreSQL pool", "err", err)
 			return err
 		}
 		pool = p
@@ -295,14 +295,14 @@ func Run(opts Options) error {
 	if pool != nil {
 		closePool = func() {
 			pool.Close()
-			opts.Logger.Info("пул PostgreSQL закрыт")
+			opts.Logger.Info("PostgreSQL pool closed")
 		}
 	}
 
 	// Listen отделён от Serve: ошибка занятого адреса — до старта OnRun.
 	ln, err := net.Listen("tcp", opts.MetricsAddr)
 	if err != nil {
-		opts.Logger.Error("HTTP-сервер метрик", "addr", opts.MetricsAddr, "err", err)
+		opts.Logger.Error("metrics HTTP server", "addr", opts.MetricsAddr, "err", err)
 		closePool() // пул уже создан — не оставлять его соединения
 		return err
 	}
@@ -312,7 +312,7 @@ func Run(opts Options) error {
 		// Раньше здесь был прямой os.Exit(1) — обход defer'ов и
 		// непроверяемость в тестах. Ошибка доезжает до main: его реакция
 		// на любую ошибку Run и так os.Exit(1), код выхода не меняется.
-		opts.Logger.Warn("повторный сигнал — принудительное завершение без ожидания остановки")
+		opts.Logger.Warn("second signal — forcing exit without waiting for shutdown")
 	}
 	return err
 }
@@ -395,7 +395,7 @@ func serve(opts Options, srv *http.Server, ln net.Listener, closePool func(), te
 			case <-hupDone:
 				return
 			case <-hup:
-				logger.Info("получен SIGHUP")
+				logger.Info("SIGHUP received")
 				if opts.OnSIGHUP != nil {
 					opts.OnSIGHUP()
 				}
@@ -420,8 +420,8 @@ func serve(opts Options, srv *http.Server, ln net.Listener, closePool func(), te
 				// лога и очистки: превращаем в ошибку, дальше — обычный
 				// graceful shutdown (переведёт в код выхода 1).
 				if r := recover(); r != nil {
-					logger.Error("паника в рабочей логике", "panic", r, "stack", string(debug.Stack()))
-					done <- fmt.Errorf("OnRun: паника: %v", r)
+					logger.Error("panic in the working logic", "panic", r, "stack", string(debug.Stack()))
+					done <- fmt.Errorf("OnRun: panic: %v", r)
 				}
 			}()
 			done <- opts.OnRun(runCtx)
@@ -437,17 +437,17 @@ func serve(opts Options, srv *http.Server, ln net.Listener, closePool func(), te
 	)
 	select {
 	case sig := <-term:
-		logger.Info("сигнал завершения — graceful shutdown", "signal", sig.String())
+		logger.Info("shutdown signal — graceful shutdown", "signal", sig.String())
 	case err := <-httpErr:
-		logger.Error("HTTP-сервер метрик", "err", err)
-		httpFail = fmt.Errorf("HTTP-сервер метрик: %w", err)
+		logger.Error("metrics HTTP server", "err", err)
+		httpFail = fmt.Errorf("metrics HTTP server: %w", err)
 	case err := <-onRunDone:
 		onRunFinished = true
 		onRunErr = err
 		if err != nil {
-			logger.Error("рабочая логика", "err", err)
+			logger.Error("working logic", "err", err)
 		} else {
-			logger.Info("рабочая логика завершена — останавливаю сервис")
+			logger.Info("working logic finished — stopping the service")
 		}
 	}
 	cancelRun()
@@ -467,13 +467,13 @@ func serve(opts Options, srv *http.Server, ln net.Listener, closePool func(), te
 			// (именно он остановил сервис), но финализация воркера
 			// (возврат задач в очередь, ТЗ 3.4) тоже заслуживает лога.
 			if err != nil {
-				logger.Error("рабочая логика при остановке", "err", err)
+				logger.Error("working logic during shutdown", "err", err)
 			}
 		case <-term:
 			return errForcedExit
 		case <-timer.C:
 			timedOut = true
-			logger.Warn("рабочая логика не остановилась за таймаут — продолжаю остановку",
+			logger.Warn("working logic did not stop within the timeout — continuing shutdown",
 				"timeout", opts.ShutdownTimeout.String())
 		}
 	}
@@ -485,10 +485,10 @@ func serve(opts Options, srv *http.Server, ln net.Listener, closePool func(), te
 		httpCtx, cancelHTTP := context.WithTimeout(context.Background(), remain)
 		defer cancelHTTP()
 		if err := srv.Shutdown(httpCtx); err != nil {
-			logger.Warn("остановка HTTP-сервера метрик", "err", err)
+			logger.Warn("metrics HTTP server shutdown", "err", err)
 		}
 	} else if err := srv.Close(); err != nil {
-		logger.Warn("закрытие HTTP-сервера метрик", "err", err)
+		logger.Warn("metrics HTTP server close", "err", err)
 	}
 
 	// 3) Пул БД — последним.
@@ -498,7 +498,7 @@ func serve(opts Options, srv *http.Server, ln net.Listener, closePool func(), te
 	case httpFail != nil:
 		return httpFail
 	case timedOut:
-		return fmt.Errorf("рабочая логика не остановилась за %s", opts.ShutdownTimeout)
+		return fmt.Errorf("working logic did not stop within %s", opts.ShutdownTimeout)
 	default:
 		return onRunErr
 	}
