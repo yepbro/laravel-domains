@@ -1,34 +1,37 @@
 // ---------------------------------------------------------------- recheck
 //
-// crawlerctl recheck (T-084, ТЗ 4.1): принудительная постановка доменов
-// на проверку — «ручные задачи» из ТЗ 4.1. Имена — в любой форме
-// (unicode/punycode, регистр, точка; internal/idn.Normalize — тот же
-// конвейер, что у domain, T-081), домены ищутся по ключу (zone, label)
-// (UNIQUE, миграция 000001).
+// crawlerctl recheck (T-084, spec 4.1): forced enqueueing of domains for
+// checking — the "manual tasks" from spec 4.1. Names are accepted in any
+// form (unicode/punycode, case, trailing dot; internal/idn.Normalize — the
+// same pipeline as domain, T-081); domains are looked up by the key
+// (zone, label) (UNIQUE, migration 000001).
 //
-// Механизм (зафиксирован по семантике T-028/T-030, консистентен
-// subdomains recheck T-083): перевод check_state → pending,
-// queued_at = NULL — публикацию в q:dns делает планировщик, он владеет
-// backpressure (watermark) и lease (T-028); CLI, публикующий сам,
-// дублировал бы конвейер и обходил бы порог очереди. Домен в pending
-// подберёт DispatchBatch (T-027) в круговом порядке между зонами.
+// The mechanism (pinned by the T-028/T-030 semantics, consistent with
+// subdomains recheck T-083): check_state → pending, queued_at = NULL —
+// the publication into q:dns is done by the scheduler, which owns the
+// backpressure (watermark) and the lease (T-028); a CLI publishing by
+// itself would duplicate the pipeline and bypass the queue threshold.
+// A pending domain is picked up by DispatchBatch (T-027) in a round-robin
+// fashion between zones.
 //
-// Семантика по исходным состояниям (check_state):
+// Semantics by the original states (check_state):
 //
-//   - done → pending: основной случай (оператор проверил руками сайт —
-//     не ждём recheck_interval, ТЗ 5.3);
-//   - pending → pending: идемпотентный no-op — домен уже ждёт, перевод
-//     ничего не меняет;
-//   - queued → pending: равносилен ручному возврату lease (T-029):
-//     домен взят в работу, повторная проверка гарантируется; задача
-//     в q:dns уже могла быть опубликована — домен проверится дважды,
-//     доставка at-least-once и идемпотентные записи результатов это
-//     допускают (ТЗ 3.4), дубль работы ограничен одним циклом.
+//   - done → pending: the main case (an operator checked the site by
+//     hand — we do not wait for recheck_interval, spec 5.3);
+//   - pending → pending: an idempotent no-op — the domain is already
+//     waiting, the transition changes nothing;
+//   - queued → pending: equivalent to a manual lease refund (T-029):
+//     the domain has been taken into work, a re-check is guaranteed; the
+//     task may already have been published into q:dns — the domain will
+//     be checked twice; at-least-once delivery and idempotent result
+//     records allow this (spec 3.4), the duplicated work is limited to
+//     one cycle.
 //
-// deleted — отказ с сообщением (ТЗ 13.1: удалённые не проверяются);
-// не найденные (нет зоны/нет метки в зоне) — отказ со списком; код 1
-// возвращается, если хоть один домен не поставлен (поставленные всё
-// равно переводятся — частичный успех виден в выводе).
+// deleted — a rejection with a message (spec 13.1: deleted domains are
+// not checked); not found (no zone / no label in the zone) — a rejection
+// with a list; exit code 1 is returned if at least one domain was not
+// enqueued (the enqueued ones are translated anyway — the partial
+// success is visible in the output).
 
 package main
 
@@ -45,7 +48,7 @@ import (
 	"crawler/internal/model"
 )
 
-// recheckHelp — справка crawlerctl recheck --help.
+// recheckHelp — the crawlerctl recheck --help text.
 const recheckHelp = `crawlerctl recheck — принудительная постановка домена на проверку
 
 Использование:
@@ -70,20 +73,20 @@ check_state = pending (queued_at сбрасывается), публикацию
 
 // ---------------------------------------------------------------- SQL
 
-// recheckLookupSQL — разрешение всех запрошенных имён одним запросом:
-// полные punycode-имена приходят массивом (unnest — стиль пакетных
-// операций internal/db), WITH ORDINALITY сохраняет порядок аргументов
-// для вывода. Зона — длиннейший суффикс имени, присутствующий
-// в справочнике zones (как отделяет зону domain_info, T-082: PSL
-// тестовых зон вроде crawl.test не знает, последняя метка неверна;
-// co.uk предпочитается uk), LATERAL LIMIT 1 — по убыванию длины.
-// Метка — префикс имени без точки и зоны: substr(name, 1,
-// length(name) − length(zone) − 1). LEFT JOIN-ы не теряют ни одно
-// имя: отсутствующая зона/метка — coalesce-нули (id ≥ 1 у реальных
-// строк, миграция 000001). is_active зоны — предупреждение «домен ждёт
-// включения зоны» (zones disable, T-084). Зона заведомо не содержит
-// «%»/«_» (idna.Lookup, ТЗ 5.2) — LIKE-шаблон безопасен. Выверено
-// живым прогоном в изолированной схеме (стиль T-081).
+// recheckLookupSQL — resolves all requested names with a single query:
+// full punycode names arrive as an array (unnest — the internal/db batch
+// operations style), WITH ORDINALITY preserves the argument order for
+// output. The zone is the longest suffix of the name present in the zones
+// reference table (the same way domain_info splits the zone, T-082: PSL
+// does not know test zones like crawl.test, the last label would be
+// wrong; co.uk is preferred over uk), LATERAL LIMIT 1 — by descending
+// length. The label is the name prefix without the dot and the zone:
+// substr(name, 1, length(name) − length(zone) − 1). The LEFT JOINs lose
+// no name: a missing zone/label — coalesce zeros (real rows have id ≥ 1,
+// migration 000001). The zone is_active — the warning "the domain waits
+// for the zone to be enabled" (zones disable, T-084). A zone never
+// contains "%" / "_" (idna.Lookup, spec 5.2) — the LIKE pattern is safe.
+// Verified by a live run in an isolated schema (the T-081 style).
 const recheckLookupSQL = "SELECT n.ord, " +
 	"coalesce(z.id, 0) AS zone_id, coalesce(z.name, '') AS zone_name, coalesce(z.is_active, false) AS zone_on, " +
 	"coalesce(d.id, 0) AS domain_id, coalesce(d.label, '') AS label, " +
@@ -97,30 +100,30 @@ const recheckLookupSQL = "SELECT n.ord, " +
 	"LEFT JOIN domains AS d ON d.zone_id = z.id AND d.label = substr(n.name, 1, length(n.name) - length(z.name) - 1) " +
 	"ORDER BY n.ord"
 
-// recheckUpdateSQL — перевод найденных доменов в pending одним
-// оператором по ключам PK (unnest — стиль enqueueUpdate T-028):
-// check_state = pending и queued_at = NULL — как у суточной
-// перепроверки (T-030): у pending нет lease, его заведёт постановка
-// в очередь. Переход check_state — строка Р11 спецификации автомата
-// (единая точка правды: internal/scheduler/checkstate.go, T-255).
-// Охрана d.status <> deleted перепроверяет статус на момент
-// блокировки строки — гонка с delete-файлом (T-019) не переведёт
-// удаляемый домен; RETURNING — ключи фактически переведённых строк
-// (пропущенные raced в deleted и попадают в отказ).
+// recheckUpdateSQL — moves the found domains to pending with a single
+// statement over PK keys (unnest — the enqueueUpdate T-028 style):
+// check_state = pending and queued_at = NULL — as in the daily recheck
+// (T-030): pending has no lease, the enqueueing will set one. The
+// check_state transition is row R11 of the FSM spec (the single source of
+// truth: internal/scheduler/checkstate.go, T-255).
+// The guard d.status <> deleted re-checks the status at the row lock
+// moment — a race with the delete file (T-019) will not move a domain
+// being deleted; RETURNING — the keys of the actually moved rows (the
+// ones raced into deleted are skipped and end up in the rejection).
 const recheckUpdateSQL = "UPDATE domains AS d " +
 	"SET check_state = $1, queued_at = NULL " +
 	"FROM unnest($2::int2[], $3::int8[]) AS k(zone_id, domain_id) " +
 	"WHERE d.zone_id = k.zone_id AND d.id = k.domain_id AND d.status <> $4 " +
 	"RETURNING d.zone_id, d.id"
 
-// recheckStatesSQL — старые check_state переводимых строк точечным
-// предчтением FOR UPDATE (T-178, ТЗИ §6.1.2: оператор перевода не
-// пинирует старое состояние — pending/queued/done переводятся alike, а
-// PG 16 без RETURNING OLD): блокировка строки сериализует предчтение с
-// переводом в одной транзакции (recheckDB) — старое состояние
-// актуально на момент UPDATE, дельты счётчиков зон точны (done →
-// checked −n/pending +n, queued → queued −n/pending +n, pending → без
-// дельт: состояние не менялось).
+// recheckStatesSQL — the old check_states of the rows being moved, a
+// point pre-read with FOR UPDATE (T-178, incremental-counters spec
+// §6.1.2: the move operator does not pin the old state — pending/queued/
+// done are moved alike, and PG 16 has no RETURNING OLD): the row lock
+// serializes the pre-read with the move in one transaction (recheckDB) —
+// the old state is actual at the UPDATE moment, the zone counter deltas
+// are exact (done → checked −n/pending +n, queued → queued −n/pending +n,
+// pending → no deltas: the state did not change).
 const recheckStatesSQL = "SELECT d.zone_id, d.id, d.check_state " +
 	"FROM domains AS d " +
 	"JOIN unnest($1::int2[], $2::int8[]) AS k(zone_id, domain_id) " +
@@ -128,32 +131,32 @@ const recheckStatesSQL = "SELECT d.zone_id, d.id, d.check_state " +
 	"WHERE d.status <> $3 " +
 	"FOR UPDATE OF d"
 
-// recheckDB — пул перевода с транзакциями: предчтение состояний,
-// перевод и дельты счётчиков зон атомарны (T-178, ТЗИ §6.1.3);
-// *pgxpool.Pool (openManagePool) удовлетворяет интерфейсу.
+// recheckDB — a move pool with transactions: the state pre-read, the move
+// and the zone counter deltas are atomic (T-178, incremental-counters spec
+// §6.1.3); *pgxpool.Pool (openManagePool) satisfies the interface.
 type recheckDB interface {
 	db.DB
 	Begin(ctx context.Context) (pgx.Tx, error)
 }
 
-// ---------------------------------------------------------------- данные
+// ---------------------------------------------------------------- data
 
-// recheckItem — один запрошенный домен после разрешения имени
-// (строка recheckLookupSQL). Нулевые id — «нет строки» (coalesce).
+// recheckItem — one requested domain after name resolution
+// (a recheckLookupSQL row). Zero ids — "no row" (coalesce).
 type recheckItem struct {
 	ord      int64
-	zoneID   int16 // 0 — зоны нет в справочнике
+	zoneID   int16 // 0 — the zone is not in the reference table
 	zoneName string
-	zoneOn   bool  // is_active зоны
-	domainID int64 // 0 — домена нет в зоне
+	zoneOn   bool  // the zone is_active
+	domainID int64 // 0 — the domain is not in the zone
 	label    string
 	state    model.CheckState
 	status   model.Status
 }
 
-// fetchRecheckItems разрешает полные punycode-имена (уже нормализованы)
-// в строки доменов; результат — по одному элементу на имя, в порядке
-// аргументов (ord).
+// fetchRecheckItems resolves full punycode names (already normalized)
+// into domain rows; the result — one item per name, in the argument
+// order (ord).
 func fetchRecheckItems(ctx context.Context, pool db.DB, names []string) ([]recheckItem, error) {
 	rows, err := pool.Query(ctx, recheckLookupSQL, names)
 	if err != nil {
@@ -163,7 +166,7 @@ func fetchRecheckItems(ctx context.Context, pool db.DB, names []string) ([]reche
 	items := make([]recheckItem, 0, len(names))
 	for rows.Next() {
 		var it recheckItem
-		var state, status int16 // коды схем (smallint), типы модели — ниже
+		var state, status int16 // schema codes (smallint), model types below
 		if err := rows.Scan(&it.ord, &it.zoneID, &it.zoneName, &it.zoneOn,
 			&it.domainID, &it.label, &state, &status); err != nil {
 			return nil, fmt.Errorf("разрешение имён доменов: чтение: %w", err)
@@ -180,20 +183,19 @@ func fetchRecheckItems(ctx context.Context, pool db.DB, names []string) ([]reche
 	return items, nil
 }
 
-// recheckKey — ключ строки domains (PK, ТЗ 6.1): перевод адресуется
-// парой (zone_id, id); дубликаты ключей в unnest не страшны — UPDATE
-// применится один раз на строку.
+// recheckKey — a domains row key (PK, spec 6.1): a move is addressed by
+// the (zone_id, id) pair; duplicate keys in unnest are harmless — the
+// UPDATE applies once per row.
 type recheckKey struct {
 	zone int16
 	id   int64
 }
 
-// recheckTranslate переводит найденные домены в pending в одной
-// транзакции (T-178): предчтение старых состояний FOR UPDATE →
-// перевод (recheckUpdateSQL) → дельты счётчиков зон по старым
-// состояниям переведённых строк (db.ZoneShift); возвращает множество
-// фактически переведённых ключей (по RETURNING — охрана status могла
-// пропустить строку).
+// recheckTranslate moves the found domains to pending in one transaction
+// (T-178): the FOR UPDATE pre-read of the old states → the move
+// (recheckUpdateSQL) → the zone counter deltas by the old states of the
+// moved rows (db.ZoneShift); returns the set of the actually moved keys
+// (per RETURNING — the status guard could skip a row).
 func recheckTranslate(ctx context.Context, pool recheckDB, keys []recheckKey) (map[recheckKey]bool, error) {
 	zones := make([]int16, len(keys))
 	ids := make([]int64, len(keys))
@@ -205,12 +207,12 @@ func recheckTranslate(ctx context.Context, pool recheckDB, keys []recheckKey) (m
 	if err != nil {
 		return nil, fmt.Errorf("перевод доменов в pending: транзакция: %w", err)
 	}
-	// Откат безусловно: после Commit — no-op (стиль T-044).
+	// Rollback unconditionally: after Commit it is a no-op (the T-044 style).
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	// Старые состояния: блокировка строк делает предчтение и перевод
-	// согласованными (дубль-доставка record/lease меняет состояние
-	// только до блокировки — после неё мимо транзакции не пройти).
+	// Old states: the row locks keep the pre-read and the move consistent
+	// (duplicate record/lease delivery changes the state only up to the
+	// lock — after it there is no way around the transaction).
 	oldStates := make(map[recheckKey]model.CheckState, len(keys))
 	rows, err := tx.Query(ctx, recheckStatesSQL, zones, ids, int16(model.StatusDeleted))
 	if err != nil {
@@ -251,7 +253,7 @@ func recheckTranslate(ctx context.Context, pool recheckDB, keys []recheckKey) (m
 		case model.CheckStateQueued:
 			shift.Add(k.zone, 0, 1, -1, 0) // queued −1, pending +1
 		}
-		// pending → pending: состояние не менялось — без дельт.
+		// pending → pending: the state did not change — no deltas.
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
@@ -268,29 +270,29 @@ func recheckTranslate(ctx context.Context, pool recheckDB, keys []recheckKey) (m
 	return done, nil
 }
 
-// ---------------------------------------------------------------- действие
+// ---------------------------------------------------------------- action
 
-// recheckRun — постановка доменов на проверку: разрешение имён,
-// перевод найденных, построчный итог. Возвращает ошибку, если хоть
-// один домен не поставлен (переведённые остаются в pending — перевод
-// не откатывается, повтор команды идемпотентен). names — полные
-// punycode-имена (idn.Normalize), порядок сохраняется в выводе.
+// recheckRun — enqueues domains for checking: name resolution, moving the
+// found ones, a per-line summary. Returns an error if at least one domain
+// was not enqueued (the moved ones stay in pending — the move is not
+// rolled back, a repeated command run is idempotent). names — full
+// punycode names (idn.Normalize), the order is preserved in the output.
 func recheckRun(ctx context.Context, pool recheckDB, names []string, stdout io.Writer) error {
 	items, err := fetchRecheckItems(ctx, pool, names)
 	if err != nil {
 		return err
 	}
 
-	// Кандидаты на перевод: найденные и не deleted. Отказы собираются
-	// построчно (что именно не поставлено и почему).
+	// Candidates for the move: found and not deleted. Rejections are
+	// collected per line (what exactly was not enqueued and why).
 	var keys []recheckKey
 	var failed []string
 	for _, it := range items {
-		name := names[it.ord-1] // ord — 1-базис WITH ORDINALITY
+		name := names[it.ord-1] // ord is 1-based, WITH ORDINALITY
 		switch {
 		case it.zoneID == 0:
-			// Зона-кандидат для сообщения — длиннейший суффикс имени
-			// (стиль domainNotFound, T-081: что именно не найдено).
+			// A candidate zone for the message — the longest name suffix
+			// (the domainNotFound style, T-081: what exactly is not found).
 			zone := zoneSuffixCandidates(name)[0]
 			out(stdout, "%s: не найден: зоны %s нет в справочнике (зоны создаёт ingest при первом файле)\n", name, zone)
 			failed = append(failed, name)
@@ -314,11 +316,11 @@ func recheckRun(ctx context.Context, pool recheckDB, names []string, stdout io.W
 		}
 	}
 
-	// Построчный итог перевода — вторым проходом по items (порядок
-	// аргументов): перевод мог пропустить строку, raced в deleted.
+	// Per-line summary of the move — a second pass over items (the
+	// argument order): the move could skip a row raced into deleted.
 	for _, it := range items {
 		if it.domainID == 0 {
-			continue // отказ уже напечатан
+			continue // the rejection is already printed
 		}
 		name := names[it.ord-1]
 		k := recheckKey{zone: it.zoneID, id: it.domainID}
@@ -344,8 +346,8 @@ func recheckRun(ctx context.Context, pool recheckDB, names []string, stdout io.W
 	return nil
 }
 
-// joinNames перечисляет имена отказа: первые три полностью, остаток
-// счётчиком (+N) — сообщение-строка не растягивается.
+// joinNames lists the rejection names: the first three in full, the rest
+// as a counter (+N) — the one-line message does not stretch.
 func joinNames(names []string) string {
 	const show = 3
 	if len(names) <= show {
@@ -354,12 +356,12 @@ func joinNames(names []string) string {
 	return fmt.Sprintf("%s (+%d)", strings.Join(names[:show], ", "), len(names)-show)
 }
 
-// ---------------------------------------------------------------- команда
+// ---------------------------------------------------------------- command
 
-// cmdRecheck — crawlerctl recheck: нормализация имён (до конфигурации —
-// неверное имя это ошибка использования, код 2), затем разовая
-// постановка. Ctrl-C/SIGTERM прерывают команду; переведённое остаётся
-// (перевод идемпотентен, повтор продолжает).
+// cmdRecheck — crawlerctl recheck: name normalization (before the
+// configuration — a wrong name is a usage error, exit code 2), then a
+// one-shot enqueue. Ctrl-C/SIGTERM interrupt the command; the moved ones
+// stay (the move is idempotent, a repeat continues).
 func cmdRecheck(args []string, stdout, stderr io.Writer) error {
 	fs := newFlagSet("recheck")
 	if handled, err := parseFlags(fs, recheckHelp, args, stdout); handled {

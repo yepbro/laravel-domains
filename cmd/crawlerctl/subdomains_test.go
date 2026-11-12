@@ -1,13 +1,14 @@
-// Юнит-тесты crawlerctl subdomains (T-083, ТЗ 5.10, 13.1) на фейковом
-// пуле (db.DB) — без БД. Проверяются точные SQL-тексты (контракт, стиль
-// status_test.go) и живая семантика фейка: справочник (уникальность
-// метки, назначение свободного бита max(id)+1, максимум 63 — бит 63
-// знаковый; disable меняет только enabled, бит и маски стабильны),
-// запуск проверки нового субдомена (done → pending пачками с охраной
-// check_state/status и фильтром зоны, deleted исключается, счётчик
-// затронутых), ошибки (нет субдомена, выключен, зона не найдена, сбой
-// БД, прерывание дренажа). Поведение против живого PostgreSQL —
-// dev-окружение (docker compose run --rm tools go run ./cmd/crawlerctl).
+// Unit tests for crawlerctl subdomains (T-083, spec 5.10, 13.1) on a fake
+// pool (db.DB) — without a DB. Checked: the exact SQL texts (a contract,
+// the status_test.go style) and the fake's live semantics: the reference
+// table (label uniqueness, assignment of the free bit max(id)+1, the
+// maximum 63 — bit 63 is the sign bit; disable changes only enabled, the
+// bit and the masks are stable), starting a check of a new subdomain
+// (done → pending in batches with the check_state/status guard and the
+// zone filter, deleted is excluded, the affected counter), errors (no
+// subdomain, disabled, zone not found, DB failure, drain interruption).
+// Behavior against live PostgreSQL — the dev environment
+// (docker compose run --rm tools go run ./cmd/crawlerctl).
 package main
 
 import (
@@ -28,10 +29,10 @@ import (
 	"crawler/internal/model"
 )
 
-// --- SQL-контракты ----------------------------------------------------------
+// --- SQL contracts ---------------------------------------------------------
 
-// want-тексты дублируют константы: изменение SQL без обновления ожиданий
-// (или наоборот) валит тест громко.
+// The want texts duplicate the constants: a SQL change without updating
+// the expectations (or vice versa) fails the test loudly.
 const (
 	wantSubdomainsSelect = "SELECT id, label, enabled FROM subdomains ORDER BY id"
 	wantSubdomainByLabel = "SELECT id, label, enabled FROM subdomains WHERE label = $1"
@@ -68,9 +69,9 @@ const (
 		"WHERE z.id = c.zone_id) " +
 		"SELECT count(*) FROM upd"
 
-	// wantSubZoneIDByName — контракт analyzer.ZoneIDByName (переиспользуется
-	// recheck для --zone): текст зафиксирован здесь, чтобы смена чужого
-	// запроса не прошла молча.
+	// wantSubZoneIDByName — the analyzer.ZoneIDByName contract (reused by
+	// recheck for --zone): the text is pinned here so that a change of a
+	// foreign query does not pass silently.
 	wantSubZoneIDByName = "SELECT id FROM zones WHERE name = $1"
 )
 
@@ -91,9 +92,9 @@ func TestSubdomainsSQLContract(t *testing.T) {
 	}
 }
 
-// --- фейковый пул (db.DB) -----------------------------------------------------
+// --- fake pool (db.DB) --------------------------------------------------------
 
-// subdomSeed — домен фейка для семантики перевода done → pending.
+// subdomSeed — a fake domain for the done → pending move semantics.
 type subdomSeed struct {
 	zone   int16
 	id     int64
@@ -101,17 +102,18 @@ type subdomSeed struct {
 	status model.Status
 }
 
-// subCall — обращение к пулу для контрактных проверок.
+// subCall — a pool call, for contract checks.
 type subCall struct {
 	sql  string
 	args []any
 }
 
-// subdomainsPool — db.DB без БД: живая семантика SQL команды subdomains —
-// справочник (SELECT по метке/биту, max(id)+1, INSERT, UPDATE enabled),
-// зоны по имени (аналог analyzer.ZoneIDByName) и перевод done → pending
-// по domains (выборка с LIMIT, охраной check_state/status, фильтром
-// зоны, ORDER BY zone_id, id).
+// subdomainsPool — a db.DB without a DB: the live semantics of the
+// subdomains command SQL — the reference table (SELECT by label/bit,
+// max(id)+1, INSERT, UPDATE enabled), zones by name (the analog of
+// analyzer.ZoneIDByName) and the done → pending move over domains (a
+// selection with LIMIT, the check_state/status guard, the zone filter,
+// ORDER BY zone_id, id).
 type subdomainsPool struct {
 	subs    []subdomainRow
 	zones   map[string]int16
@@ -120,14 +122,14 @@ type subdomainsPool struct {
 	mu           sync.Mutex
 	queryErr     error
 	execErr      error
-	execErrAfter int // первые N Exec успешны, затем execErr (прерывание дренажа)
+	execErrAfter int // the first N Exec calls succeed, then execErr (a drain interruption)
 	queries      []subCall
 	execs        []subCall
 }
 
 var _ db.DB = (*subdomainsPool)(nil)
 
-// newSubdomainsPool — начальное наполнение миграции 000001 и две зоны.
+// newSubdomainsPool — the initial filling of migration 000001 and two zones.
 func newSubdomainsPool() *subdomainsPool {
 	return &subdomainsPool{
 		subs: []subdomainRow{
@@ -144,7 +146,7 @@ func (p *subdomainsPool) seedDomain(zone int16, id int64, st model.CheckState, s
 	p.domains = append(p.domains, subdomSeed{zone: zone, id: id, state: st, status: status})
 }
 
-// subByID — строка справочника по биту для проверок итога.
+// subByID — a reference table row by bit, for summary checks.
 func (p *subdomainsPool) subByID(id int16) subdomainRow {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -164,9 +166,10 @@ func (p *subdomainsPool) Exec(_ context.Context, sql string, args ...any) (pgcon
 	return pgconn.CommandTag{}, fmt.Errorf("subdomainsPool: неожидаемый Exec: %s (recheck — CTE через Query, T-178)", sql)
 }
 
-// recheck — семантика подзапроса и внешнего WHERE: кандидаты — done
-// и не deleted [зоны], ORDER BY (zone_id, id), LIMIT; выбранные
-// переводятся в pending. Возвращает число переведённых.
+// recheck — the semantics of the subquery and the outer WHERE: the
+// candidates are done and not deleted [of the zone], ORDER BY
+// (zone_id, id), LIMIT; the selected ones are moved to pending. Returns
+// the moved count.
 func (p *subdomainsPool) recheck(done, deleted int16, zone int16, limit int) int64 {
 	cands := make([]subdomSeed, 0, len(p.domains))
 	for _, d := range p.domains {
@@ -201,8 +204,8 @@ func (p *subdomainsPool) Query(_ context.Context, sql string, args ...any) (pgx.
 		return nil, p.queryErr
 	}
 	switch sql {
-	// Операторы перевода recheck — CTE с внешним SELECT count (T-178):
-	// учитываются в протоколе execs (заготовки ошибок/дренажа).
+	// The recheck move statements — CTEs with an outer SELECT count (T-178):
+	// counted in the execs protocol (the error/drain hooks).
 	case subdomainRecheckAllSQL:
 		p.execs = append(p.execs, subCall{sql, append([]any(nil), args...)})
 		if p.execErr != nil && (p.execErrAfter == 0 || len(p.execs) > p.execErrAfter) {
@@ -280,7 +283,7 @@ func (p *subdomainsPool) Query(_ context.Context, sql string, args ...any) (pgx.
 
 func TestSubdomainsListRun(t *testing.T) {
 	pool := newSubdomainsPool()
-	pool.subs[2].enabled = false // admin выключен
+	pool.subs[2].enabled = false // admin is disabled
 
 	var stdout bytes.Buffer
 	if err := subdomainsListRun(context.Background(), pool, &stdout); err != nil {
@@ -290,8 +293,8 @@ func TestSubdomainsListRun(t *testing.T) {
 	if !strings.Contains(got, "бит  метка") {
 		t.Errorf("вывод без заголовка:\n%s", got)
 	}
-	// Строки по порядку битов (апекс '' показан как «(апекс)»); акт —
-	// последний символ строки: «+» включён, «-» выключен.
+	// Rows in bit order (the apex '' is shown with its own marker); act —
+	// the last character of the row: "+" enabled, "-" disabled.
 	lines := strings.Split(strings.TrimSpace(got), "\n")
 	rows := []struct{ prefix, mark string }{
 		{"  0  (апекс)", "+"},
@@ -335,7 +338,7 @@ func TestSubdomainsAddRun(t *testing.T) {
 	if err := subdomainsAddRun(context.Background(), pool, "shop", &stdout); err != nil {
 		t.Fatalf("subdomainsAddRun: %v", err)
 	}
-	// Свободный бит — max(id)+1 = 6; строка вставлена включённой.
+	// The free bit — max(id)+1 = 6; the row is inserted enabled.
 	if want := (subdomainRow{6, "shop", true}); pool.subs[len(pool.subs)-1] != want {
 		t.Errorf("вставлена строка %+v, хочу %+v", pool.subs[len(pool.subs)-1], want)
 	}
@@ -352,14 +355,15 @@ func TestSubdomainsAddRunDuplicate(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "уже есть в справочнике: бит 1, включён") {
 		t.Fatalf("ошибка = %v, хочу «уже есть … бит 1»", err)
 	}
-	// Вставки не было: только проверка метки и свободного бита не дошли.
+	// No insert happened: only the label and free-bit checks, none reached
+	// the insert.
 	for _, c := range pool.queries {
 		if c.sql == subdomainInsertSQL {
 			t.Errorf("дубль метки не должен вставлять строку: %v", c)
 		}
 	}
 
-	// Выключенная метка — тот же отказ, состояние указано.
+	// A disabled label — the same rejection, with the state named.
 	pool2 := newSubdomainsPool()
 	pool2.subs[1].enabled = false
 	err = subdomainsAddRun(context.Background(), pool2, "www", &bytes.Buffer{})
@@ -369,8 +373,8 @@ func TestSubdomainsAddRunDuplicate(t *testing.T) {
 }
 
 func TestSubdomainsAddRunMax63(t *testing.T) {
-	// Справочник заполнен: биты 0..62 (63 строки) — следующего бита нет
-	// (бит 63 знаковый), вставка не выполняется.
+	// The reference table is full: bits 0..62 (63 rows) — no next bit
+	// (bit 63 is the sign bit), no insert is performed.
 	pool := newSubdomainsPool()
 	pool.subs = nil
 	for id := int16(0); id < 63; id++ {
@@ -388,7 +392,7 @@ func TestSubdomainsAddRunMax63(t *testing.T) {
 func TestSubdomainsAddRunInsertError(t *testing.T) {
 	pool := newSubdomainsPool()
 	pool.queryErr = errors.New("нет соединения")
-	// Ошибка проявляется на первом же обращении (проверка метки).
+	// The error shows up at the first query (the label check).
 	err := subdomainsAddRun(context.Background(), pool, "shop", &bytes.Buffer{})
 	if err == nil {
 		t.Fatal("ожидалась ошибка БД")
@@ -407,14 +411,14 @@ func TestSubdomainsDisableRun(t *testing.T) {
 	if pool.subs[1].enabled {
 		t.Error("www должен быть выключен после disable")
 	}
-	// Бит стабилен: строка осталась на месте, id/метка не менялись.
+	// The bit is stable: the row stayed in place, id/label unchanged.
 	if pool.subs[1] != (subdomainRow{1, "www", false}) {
 		t.Errorf("строка www = %+v, хочу {1 www false}", pool.subs[1])
 	}
 	if !strings.Contains(stdout.String(), "www (бит 1) выключен") {
 		t.Errorf("вывод не содержит итог:\n%s", stdout.String())
 	}
-	// Маски/данные не трогаются: UPDATE domains не выполнялся вовсе.
+	// Masks/data are not touched: no UPDATE domains was executed at all.
 	if len(pool.execs) != 0 {
 		t.Errorf("disable не трогает domains, Exec не ждали: %v", pool.execs)
 	}
@@ -436,7 +440,7 @@ func TestSubdomainsDisableRunByID(t *testing.T) {
 }
 
 func TestSubdomainsDisableRunLabelPriority(t *testing.T) {
-	// Цифровая метка существует — она важнее номера бита.
+	// A numeric label exists — it takes precedence over the bit number.
 	pool := newSubdomainsPool()
 	pool.seedSub(subdomainRow{7, "3", true})
 
@@ -459,16 +463,17 @@ func TestSubdomainsDisableRunNotFound(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), `субдомен "nope" не найден в справочнике`) {
 		t.Fatalf("ошибка = %v, хочу «не найден в справочнике»", err)
 	}
-	// Числовой аргумент мимо занятых битов — тоже не найден.
+	// A numeric argument missing from the occupied bits — also not found.
 	err = subdomainsDisableRun(context.Background(), pool, "42", &bytes.Buffer{})
 	if err == nil || !strings.Contains(err.Error(), "не найден") {
 		t.Fatalf("ошибка = %v, хочу «не найден»", err)
 	}
 }
 
-// TestSubdomainsDisableRunBitOutOfRange — числовой аргумент вне диапазона
-// битов 0..62: усечение int16 не должно молча сводить его к чужому биту
-// (65537 → www, бит 1) — «не найден», справочник не тронут.
+// TestSubdomainsDisableRunBitOutOfRange — a numeric argument outside the
+// bit range 0..62: an int16 truncation must not silently map it to a
+// foreign bit (65537 → www, bit 1) — "not found", the reference table is
+// not touched.
 func TestSubdomainsDisableRunBitOutOfRange(t *testing.T) {
 	pool := newSubdomainsPool()
 	for _, arg := range []string{"65537", "131073", "100", "-1", "65536"} {
@@ -500,7 +505,7 @@ func TestSubdomainsDisableRunApexGuard(t *testing.T) {
 
 func TestSubdomainsDisableRunAlreadyDisabled(t *testing.T) {
 	pool := newSubdomainsPool()
-	pool.subs[2].enabled = false // admin уже выключен
+	pool.subs[2].enabled = false // admin is already disabled
 
 	var stdout bytes.Buffer
 	if err := subdomainsDisableRun(context.Background(), pool, "admin", &stdout); err != nil {
@@ -509,7 +514,7 @@ func TestSubdomainsDisableRunAlreadyDisabled(t *testing.T) {
 	if !strings.Contains(stdout.String(), "уже выключен") {
 		t.Errorf("вывод не сообщает «уже выключен»:\n%s", stdout.String())
 	}
-	// Идемпотентная ветка — до записи: UPDATE не выполнялся вовсе.
+	// The idempotent branch — before any write: no UPDATE was executed at all.
 	for _, c := range pool.queries {
 		if c.sql == subdomainDisableSQL {
 			t.Errorf("«уже выключен» не должен делать UPDATE: %v", c)
@@ -521,12 +526,12 @@ func TestSubdomainsDisableRunAlreadyDisabled(t *testing.T) {
 
 func TestSubdomainsRecheckRunTranslate(t *testing.T) {
 	pool := newSubdomainsPool()
-	pool.seedDomain(7, 1, model.CheckStateDone, model.StatusAlive)        // переводится
-	pool.seedDomain(7, 2, model.CheckStateDone, model.StatusDeleted)      // deleted — охрана
-	pool.seedDomain(7, 3, model.CheckStatePending, model.StatusAlive)     // уже в цикле
-	pool.seedDomain(7, 4, model.CheckStateQueued, model.StatusAlive)      // в работе (lease)
-	pool.seedDomain(9, 5, model.CheckStateDone, model.StatusNotDelegated) // переводится
-	pool.seedDomain(9, 6, model.CheckStateDone, model.StatusTempError)    // переводится (temp_error — кандидат)
+	pool.seedDomain(7, 1, model.CheckStateDone, model.StatusAlive)        // moved
+	pool.seedDomain(7, 2, model.CheckStateDone, model.StatusDeleted)      // deleted — the guard
+	pool.seedDomain(7, 3, model.CheckStatePending, model.StatusAlive)     // already in the cycle
+	pool.seedDomain(7, 4, model.CheckStateQueued, model.StatusAlive)      // in work (lease)
+	pool.seedDomain(9, 5, model.CheckStateDone, model.StatusNotDelegated) // moved
+	pool.seedDomain(9, 6, model.CheckStateDone, model.StatusTempError)    // moved (temp_error — a candidate)
 
 	var stdout bytes.Buffer
 	if err := subdomainsRecheckRun(context.Background(), pool, "www", nil, "все", &stdout); err != nil {
@@ -536,8 +541,8 @@ func TestSubdomainsRecheckRunTranslate(t *testing.T) {
 	if !strings.Contains(got, "субдомен www (бит 1), зона: все") || !strings.Contains(got, "переведено в проверку (pending): 3") {
 		t.Errorf("вывод не содержит итог:\n%s", got)
 	}
-	// Семантика: done и не deleted → pending; остальные состояния и
-	// статусы не тронуты.
+	// Semantics: done and not deleted → pending; the other states and
+	// statuses are not touched.
 	want := []model.CheckState{model.CheckStatePending, model.CheckStateDone,
 		model.CheckStatePending, model.CheckStateQueued, model.CheckStatePending, model.CheckStatePending}
 	for i, w := range want {
@@ -546,7 +551,7 @@ func TestSubdomainsRecheckRunTranslate(t *testing.T) {
 		}
 	}
 
-	// Контракт параметров: коды pending/done/deleted и размер пачки.
+	// The parameter contract: the pending/done/deleted codes and the batch size.
 	if len(pool.execs) != 1 {
 		t.Fatalf("Exec обращений = %d, хочу 1 (частичная пачка завершает дренаж)", len(pool.execs))
 	}
@@ -567,7 +572,7 @@ func TestSubdomainsRecheckRunTranslate(t *testing.T) {
 func TestSubdomainsRecheckRunZone(t *testing.T) {
 	pool := newSubdomainsPool()
 	pool.seedDomain(7, 1, model.CheckStateDone, model.StatusAlive)
-	pool.seedDomain(9, 2, model.CheckStateDone, model.StatusAlive) // другая зона — не трогается
+	pool.seedDomain(9, 2, model.CheckStateDone, model.StatusAlive) // another zone — not touched
 
 	zone := int16(7)
 	var stdout bytes.Buffer
@@ -587,8 +592,8 @@ func TestSubdomainsRecheckRunZone(t *testing.T) {
 }
 
 func TestSubdomainsRecheckRunBatches(t *testing.T) {
-	// Дренаж пачками: 2·5000 + 1 доменов — три прохода, частичная пачка
-	// завершает цикл (стиль RecheckOnce, T-030).
+	// Draining in batches: 2·5000 + 1 domains — three passes, a partial
+	// batch ends the cycle (the RecheckOnce style, T-030).
 	pool := newSubdomainsPool()
 	const total = 2*subdomainRecheckBatch + 1
 	for i := int64(1); i <= total; i++ {
@@ -613,7 +618,7 @@ func TestSubdomainsRecheckRunBatches(t *testing.T) {
 }
 
 func TestSubdomainsRecheckRunEmpty(t *testing.T) {
-	pool := newSubdomainsPool() // доменов нет
+	pool := newSubdomainsPool() // no domains
 
 	var stdout bytes.Buffer
 	if err := subdomainsRecheckRun(context.Background(), pool, "www", nil, "все", &stdout); err != nil {
@@ -636,8 +641,8 @@ func TestSubdomainsRecheckRunUnknownSubdomain(t *testing.T) {
 		t.Errorf("перевод не должен выполняться: %v", pool.execs)
 	}
 
-	// Выключенный субдомен проверять бессмысленно — DNS-воркер его
-	// пропускает (ТЗ 5.4 п. 2).
+	// A disabled subdomain is pointless to check — the DNS worker skips
+	// it (spec 5.4 item 2).
 	pool.subs[1].enabled = false
 	err = subdomainsRecheckRun(context.Background(), pool, "www", nil, "все", &bytes.Buffer{})
 	if err == nil || !strings.Contains(err.Error(), "выключен") {
@@ -655,7 +660,7 @@ func TestSubdomainsRecheckRunErrors(t *testing.T) {
 		t.Fatalf("ошибка = %v, хочу контекст перевода", err)
 	}
 
-	// Прерывание после первой полной пачки: частичный итог в ошибке.
+	// An interruption after the first full batch: a partial total in the error.
 	pool2 := newSubdomainsPool()
 	const total = 2 * subdomainRecheckBatch
 	for i := int64(1); i <= total; i++ {
@@ -668,11 +673,12 @@ func TestSubdomainsRecheckRunErrors(t *testing.T) {
 	}
 }
 
-// --- команды через run --------------------------------------------------------
+// --- commands via run ----------------------------------------------------------
 
-// TestRunSubdomainsExecution — путь выполнения команд subdomains без
-// инфраструктуры: детерминированный отказ конфигурации (код 1) с контекстом
-// команды — валидация входа идёт раньше (ошибки использования — код 2).
+// TestRunSubdomainsExecution — the subdomains command execution path
+// without infrastructure: a deterministic configuration failure (code 1)
+// with the command context — input validation runs earlier (usage errors —
+// code 2).
 func TestRunSubdomainsExecution(t *testing.T) {
 	t.Setenv("CRAWLER_CONFIG", filepath.Join(t.TempDir(), "missing.yaml"))
 

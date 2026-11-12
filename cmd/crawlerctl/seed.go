@@ -1,10 +1,10 @@
 // ---------------------------------------------------------------- seed
 //
-// Команда dev-окружения: тестовые списки доменов в incoming (scenarios.yaml
-// testbed, «плохие» строки для rejected-лога, синтетический набор для
-// замеров). Реализована полностью; вызов — make seed / make seed-bulk.
-// Имена зон и доменов нормализуются пакетом internal/idn — единый конвейер
-// проекта (ТЗ 5.2), а не локальный вызов idna.
+// A dev-environment command: test domain lists into incoming (the testbed
+// scenarios.yaml, "bad" lines for the rejected log, a synthetic set for
+// measurements). Fully implemented; invoked via make seed / make seed-bulk.
+// Zone and domain names are normalized by the internal/idn package — the
+// project-wide pipeline (spec 5.2), not a local idna call.
 
 package main
 
@@ -21,7 +21,7 @@ import (
 	"crawler/internal/idn"
 )
 
-// seedHelp — справка crawlerctl seed --help.
+// seedHelp — the crawlerctl seed --help text.
 const seedHelp = `crawlerctl seed — тестовые списки доменов для dev-окружения
 
 Использование:
@@ -74,7 +74,7 @@ func cmdSeed(args []string, stdout, stderr io.Writer) error {
 
 	total := 0
 
-	// 1. Домены сценариев testbed — основная зона.
+	// 1. Testbed scenario domains — the base zone.
 	var lines []string
 	for _, s := range sc.Scenarios {
 		zone := baseZone
@@ -95,8 +95,9 @@ func cmdSeed(args []string, stdout, stderr io.Writer) error {
 	}
 	total += n
 
-	// 2. Простые домены дополнительных зон (в unicode-имена каталогов зон
-	// кладём и unicode-, и punycode-формы — проверка нормализации каталогов).
+	// 2. Plain domains of additional zones (both the unicode and punycode
+	// forms go into unicode-named zone directories — a check of directory
+	// normalization).
 	for _, p := range sc.Plain {
 		var zoneLines []string
 		for _, nm := range p.Names {
@@ -104,9 +105,9 @@ func cmdSeed(args []string, stdout, stderr io.Writer) error {
 			if err != nil {
 				return fmt.Errorf("seed: домен %s: %w", nm.Label, err)
 			}
-			zoneLines = append(zoneLines, nm.Label+"."+p.Zone, full) // обе формы
+			zoneLines = append(zoneLines, nm.Label+"."+p.Zone, full) // both forms
 		}
-		// каталог зоны — в исходной (unicode) форме, как приходит от заказчика
+		// the zone directory keeps the original (unicode) form, as delivered by the customer
 		n, err := writeFile(filepath.Join(*incoming, p.Zone, "add", "seed.txt"), zoneLines)
 		if err != nil {
 			return err
@@ -114,17 +115,17 @@ func cmdSeed(args []string, stdout, stderr io.Writer) error {
 		total += n
 	}
 
-	// 3. «Плохие» строки для проверки отклонения (ingest).
+	// 3. "Bad" lines for the rejection check (ingest).
 	bad := []string{
 		"# невалидные строки: ingest должен отклонить их с указанием причины",
 		"не-из-этой-зоны.ru",
 		"-leading-dash." + baseZone,
 		"trailing-dash-." + baseZone,
 		"..empty-label." + baseZone,
-		strings.Repeat("a", 64) + "." + baseZone,  // метка > 63
-		strings.Repeat("b", 250) + "." + baseZone, // полное имя > 253
+		strings.Repeat("a", 64) + "." + baseZone,  // label > 63
+		strings.Repeat("b", 250) + "." + baseZone, // full name > 253
 		"пробел внутри." + baseZone,
-		"xn--." + baseZone, // некорректный punycode
+		"xn--." + baseZone, // invalid punycode
 	}
 	n, err = writeFile(filepath.Join(*incoming, baseZone, "add", "seed-bad.txt"), bad)
 	if err != nil {
@@ -132,9 +133,9 @@ func cmdSeed(args []string, stdout, stderr io.Writer) error {
 	}
 	total += n
 
-	// 4. Большой синтетический набор для замеров (без обращения к сети).
-	// Запись потоковая: N не материализуется в памяти (при N = 10^6 список
-	// строк занял бы сотни МБ).
+	// 4. A large synthetic set for measurements (no network access).
+	// Writing is streamed: N is not materialized in memory (at N = 10^6 a
+	// list of strings would take hundreds of MB).
 	if *bulk > 0 {
 		path := filepath.Join(*incoming, baseZone, "add", "seed-bulk.txt")
 		n, err := writeBulkFile(path, *bulk, baseZone)
@@ -145,7 +146,7 @@ func cmdSeed(args []string, stdout, stderr io.Writer) error {
 		out(stdout, "seed: bulk %d доменов → %s\n", *bulk, path)
 	}
 
-	// Каталоги processed/failed рядом с incoming.
+	// processed/failed directories next to incoming.
 	for _, d := range []string{"processed", "failed"} {
 		if err := os.MkdirAll(filepath.Join(*incoming, d), 0o755); err != nil {
 			return err
@@ -156,8 +157,8 @@ func cmdSeed(args []string, stdout, stderr io.Writer) error {
 	return nil
 }
 
-// writeFile записывает файл списком строк; существующий перезаписывается
-// (идемпотентность повторного make seed).
+// writeFile writes a file as a list of lines; an existing file is
+// overwritten (idempotency of a repeated make seed).
 func writeFile(path string, lines []string) (int, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return 0, err
@@ -173,9 +174,9 @@ func writeFile(path string, lines []string) (int, error) {
 	return len(lines), nil
 }
 
-// writeBulkFile записывает n синтетических доменов b%08d.<зона> потоково
-// (bufio.Writer): bulk-набор для замеров бывает миллионом строк — список
-// в памяти не материализуется. Идемпотентность — как у writeFile.
+// writeBulkFile streams n synthetic domains b%08d.<zone> via bufio.Writer:
+// the bulk set for measurements can reach a million lines — the list is
+// never materialized in memory. Idempotency as in writeFile.
 func writeBulkFile(path string, n int, zone string) (int, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return 0, err

@@ -1,8 +1,9 @@
 // ---------------------------------------------------------------- test-rules
 //
-// Команда dev-окружения: прогон правил Laravel по корпусу образцов
-// testdata/laravel-samples без сети; сверка is_laravel/диапазона версий с
-// meta.yaml. Реализована полностью; вызов — make test-rules.
+// A dev-environment command: runs the Laravel rules against the sample
+// corpus testdata/laravel-samples without network; cross-checks
+// is_laravel/version range against meta.yaml. Fully implemented;
+// invoked via make test-rules.
 
 package main
 
@@ -16,7 +17,7 @@ import (
 	"crawler/internal/rules"
 )
 
-// testRulesHelp — справка crawlerctl test-rules --help.
+// testRulesHelp — the crawlerctl test-rules --help text.
 const testRulesHelp = `crawlerctl test-rules — прогон правил Laravel по корпусу образцов
 
 Использование:
@@ -41,9 +42,10 @@ func cmdTestRules(args []string, stdout, stderr io.Writer) error {
 	if handled, err := parseFlags(fs, testRulesHelp, args, stdout); handled {
 		return err
 	}
-	// Дефолт порога синхронизирован с боевой конфигурацией (CLI-06):
-	// явно заданный флаг важнее, недоступная конфигурация (локальный
-	// прогон без стека) оставляет 0.6 — команда остаётся офлайн-инструментом.
+	// The threshold default is kept in sync with the production
+	// configuration (CLI-06): an explicitly set flag takes precedence;
+	// an unavailable configuration (a local run without the stack)
+	// leaves 0.6 in place — the command stays an offline tool.
 	if !flagExplicit(fs, "min-score") {
 		if cfg, err := config.Load(); err == nil {
 			*minScore = cfg.Analyzer.LaravelMinScore

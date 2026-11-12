@@ -1,9 +1,9 @@
-// Юнит-тесты crawlerctl zones collapse (T-196): роутинг, флаги и
-// диагностика использования без инфраструктуры — валидный вызов доходит
-// до конфигурации и падает детерминированно (код 1, стиль
-// TestRunZonesSyncExecution). SQL и логика переноса — тесты пакета
-// internal/collapse (фейковое соединение) и test/integration (живая
-// схема).
+// Unit tests for crawlerctl zones collapse (T-196): routing, flags and
+// usage diagnostics without infrastructure — a valid invocation reaches
+// the configuration and fails deterministically (exit code 1, the
+// TestRunZonesSyncExecution style). The SQL and the move logic are
+// covered by internal/collapse package tests (a fake connection) and
+// test/integration (the live schema).
 package main
 
 import (
@@ -13,9 +13,9 @@ import (
 	"testing"
 )
 
-// TestRunZonesCollapseExecution — путь выполнения: разбор флагов до
-// соединения с БД; отказ конфигурации — код 1; --skip-reconcile без
-// --apply и лишние аргументы — код 2.
+// TestRunZonesCollapseExecution — the execution path: flag parsing up to
+// the DB connection; a configuration failure — exit code 1; --skip-reconcile
+// without --apply and extra arguments — exit code 2.
 func TestRunZonesCollapseExecution(t *testing.T) {
 	t.Setenv("CRAWLER_CONFIG", filepath.Join(t.TempDir(), "missing.yaml"))
 

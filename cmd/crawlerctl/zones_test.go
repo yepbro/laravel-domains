@@ -1,11 +1,12 @@
-// Юнит-тесты crawlerctl zones (T-084, ТЗ 4.1, 5.3) на фейковом пуле
-// (db.DB) — без БД. Проверяются точные SQL-тексты (контракт, стиль
-// subdomains_test.go) и живая семантика фейка: справочник (list по
-// возрастанию имени, NULL/совпадающий name_unicode — «—», счётчики,
-// итоговая строка), включение/выключение по имени (normalize идёт
-// раньше, UPDATE меняет только is_active, повтор — «уже включена/
-// выключена», домены не трогаются), ошибки (неизвестная зона, сбой БД).
-// Поведение против живого PostgreSQL — dev-окружение (make shell).
+// Unit tests for crawlerctl zones (T-084, spec 4.1, 5.3) on a fake pool
+// (db.DB) — without a DB. Checked: the exact SQL texts (a contract, the
+// subdomains_test.go style) and the fake's live semantics: the reference
+// table (list by ascending name, NULL/matching name_unicode — "—", the
+// counters, the totals row), enabling/disabling by name (normalize runs
+// first, the UPDATE changes only is_active, a repeat — "already
+// enabled/disabled", domains not touched), errors (an unknown zone, a DB
+// failure). Behavior against live PostgreSQL — the dev environment
+// (make shell).
 package main
 
 import (
@@ -24,10 +25,10 @@ import (
 	"crawler/internal/db"
 )
 
-// --- SQL-контракты ----------------------------------------------------------
+// --- SQL contracts ---------------------------------------------------------
 
-// want-тексты дублируют константы: изменение SQL без обновления ожиданий
-// (или наоборот) валит тест громко.
+// The want texts duplicate the constants: a SQL change without updating
+// the expectations (or vice versa) fails the test loudly.
 const (
 	wantZonesSelect = "SELECT id, name, coalesce(name_unicode, '') AS name_unicode, " +
 		"is_active, domains_total, domains_checked FROM zones ORDER BY name"
@@ -51,11 +52,12 @@ func TestZonesSQLContract(t *testing.T) {
 	}
 }
 
-// --- фейковый пул (db.DB) -----------------------------------------------------
+// --- fake pool (db.DB) --------------------------------------------------------
 
-// zonesPool — db.DB без БД: живая семантика SQL команды zones — справочник
-// по имени (SELECT всего списка и по имени) и UPDATE is_active по id
-// (RETURNING строки; меняется только флаг).
+// zonesPool — a db.DB without a DB: the live semantics of the zones
+// command SQL — the reference table (SELECT of the whole list and by
+// name) and the is_active UPDATE by id (RETURNING of the row; only the
+// flag changes).
 type zonesPool struct {
 	zones []zoneRow
 
@@ -115,7 +117,7 @@ func (p *zonesPool) Query(_ context.Context, sql string, args ...any) (pgx.Rows,
 		active, id := args[0].(bool), args[1].(int16)
 		for i := range p.zones {
 			if p.zones[i].id == id {
-				p.zones[i].active = active // меняется только is_active
+				p.zones[i].active = active // only is_active changes
 				z := p.zones[i]
 				return statusRowsOf([]any{z.id, z.name, z.nameUnicode, z.active}), nil
 			}
@@ -137,11 +139,11 @@ func TestZonesListRun(t *testing.T) {
 	}
 	got := stdout.String()
 
-	// Строки по возрастанию имени (первая — crawl.test); unicode — только
-	// отличающийся от punycode (ASCII-зоны без name_unicode — «—»);
-	// акт — последний символ строки.
+	// Rows by ascending name (the first — crawl.test); unicode — only the
+	// one differing from punycode (ASCII zones without name_unicode — "—");
+	// act — the last character of the row.
 	lines := strings.Split(strings.TrimSpace(got), "\n")
-	if len(lines) != 1+len(pool.zones)+1 { // заголовок + зоны + итог
+	if len(lines) != 1+len(pool.zones)+1 { // header + zones + totals
 		t.Fatalf("строк %d, хочу %d:\n%s", len(lines), len(pool.zones)+2, got)
 	}
 	if !strings.HasPrefix(lines[0], "id") || !strings.Contains(lines[0], "зона") {
@@ -153,8 +155,8 @@ func TestZonesListRun(t *testing.T) {
 	if !strings.Contains(lines[1], "—") || strings.Contains(lines[1], "москва") {
 		t.Errorf("unicode-колонка ASCII-зоны должна быть «—»: %q", lines[1])
 	}
-	// «акт» — колонка после unicode; всего/проверено идут дальше,
-	// поэтому маркер ищется по полям строки.
+	// "act" — the column after unicode; total/checked come further, so
+	// the mark is looked up by the row fields.
 	if fields := strings.Fields(lines[1]); len(fields) < 4 || fields[3] != "+" {
 		t.Errorf("активная зона — акт «+»: %q", lines[1])
 	}
@@ -186,7 +188,7 @@ func TestZonesListRunQueryError(t *testing.T) {
 func TestZonesToggleRun(t *testing.T) {
 	pool := newZonesPool()
 
-	// disable активной зоны.
+	// Disabling an active zone.
 	var stdout bytes.Buffer
 	if err := zonesToggleRun(context.Background(), pool, "disable", "crawl.test", &stdout); err != nil {
 		t.Fatalf("zonesToggleRun disable: %v", err)
@@ -197,8 +199,8 @@ func TestZonesToggleRun(t *testing.T) {
 	if pool.zones[0].active {
 		t.Error("crawl.test должна быть выключена после disable")
 	}
-	// Домены не трогаются: UPDATE domains не выполнялся вовсе (только
-	// lookup по имени и UPDATE zones).
+	// Domains are not touched: no UPDATE domains was executed at all
+	// (only the lookup by name and the UPDATE zones).
 	for _, c := range pool.queries {
 		if strings.Contains(c.sql, "FROM domains") {
 			t.Errorf("toggle не должен трогать domains: %v", c)
@@ -209,7 +211,7 @@ func TestZonesToggleRun(t *testing.T) {
 		t.Errorf("UPDATE = %v %v, хочу is_active=false, id=7", upd.sql, upd.args)
 	}
 
-	// enable выключенной зоны — с unicode-именем в сообщении.
+	// Enabling a disabled zone — with the unicode name in the message.
 	stdout.Reset()
 	if err := zonesToggleRun(context.Background(), pool, "enable", "example.test", &stdout); err != nil {
 		t.Fatalf("zonesToggleRun enable: %v", err)
@@ -223,7 +225,7 @@ func TestZonesToggleRun(t *testing.T) {
 }
 
 func TestZonesToggleRunUnicodeZone(t *testing.T) {
-	// Зона с name_unicode: сообщения показывают обе формы.
+	// A zone with name_unicode: the messages show both forms.
 	pool := newZonesPool()
 	pool.zones[0].active = false
 
@@ -234,7 +236,7 @@ func TestZonesToggleRunUnicodeZone(t *testing.T) {
 	if !strings.Contains(stdout.String(), "xn--80adxhks (москва) (id 11) уже включена") {
 		t.Errorf("вывод не содержит «уже включена» с unicode-именем:\n%s", stdout.String())
 	}
-	// Состояние совпадает — UPDATE не выполнялся (идемпотентность).
+	// The state matches — no UPDATE was executed (idempotency).
 	last := pool.queries[len(pool.queries)-1]
 	if last.sql == zoneSetActiveSQL {
 		t.Errorf("повторный enable не должен обновлять: %v", last)
@@ -275,11 +277,11 @@ func TestZonesToggleRunQueryError(t *testing.T) {
 	}
 }
 
-// --- команды через run --------------------------------------------------------
+// --- commands via run -----------------------------------------------------------
 
-// TestRunZonesExecution — путь выполнения команд zones без инфраструктуры:
-// детерминированный отказ конфигурации (код 1) с контекстом команды —
-// валидация входа идёт раньше (ошибки использования — код 2).
+// TestRunZonesExecution — the zones command execution path without
+// infrastructure: a deterministic configuration failure (code 1) with the
+// command context — input validation runs earlier (usage errors — code 2).
 func TestRunZonesExecution(t *testing.T) {
 	t.Setenv("CRAWLER_CONFIG", filepath.Join(t.TempDir(), "missing.yaml"))
 

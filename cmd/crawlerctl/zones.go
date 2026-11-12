@@ -1,22 +1,23 @@
 // ---------------------------------------------------------------- zones
 //
-// crawlerctl zones (T-084, ТЗ 4.1, 5.3): управление зонами проверки —
-// list/enable/disable флага zones.is_active и sync — наполнение
-// справочника из реестра IANA (T-125, zonessync.go). Зона — справочная
-// строка (создаёт ingest при первом файле, ТЗ 5.1, или zones sync);
-// is_active — участие зоны
-// в выборке планировщика: DispatchBatch (T-027) джойнит зоны с условием
-// z.is_active, поэтому выключенная зона не выбирается вовсе — её домены
-// остаются pending и ждут включения (datafix не нужен: enable возвращает
-// зону в выборку автоматически, состояние доменов не менялось).
+// crawlerctl zones (T-084, spec 4.1, 5.3): zone management — list/enable/
+// disable of the zones.is_active flag and sync — filling the reference
+// table from the IANA registry (T-125, zonessync.go). A zone is a
+// reference row (created by ingest on the first file, spec 5.1, or by
+// zones sync); is_active — the zone participation
+// in the scheduler selection: DispatchBatch (T-027) joins zones with the
+// z.is_active condition, so a disabled zone is never selected at all — its
+// domains stay pending and wait for the zone to be enabled (no datafix
+// needed: enable returns the zone into the selection automatically, the
+// domain states did not change).
 //
-// disable НЕ трогает домены (ТЗ 13.1: удалённый/выключенный — состояние
-// сохраняется): ни check_state, ни статусы, ни результаты; приостановка
-// выразилась единственным флагом зоны. Ingest выключенной зоны продолжает
-// работать: приём файлов не зависит от is_active (ТЗ 5.1), домены
-// накапливаются и проверятся после включения. Счётчики прогресса
-// domains_total/domains_checked обновляет monitor (T-078, ТЗ 5.9) —
-// list их только показывает.
+// disable does not touch domains (spec 13.1: deleted/disabled — the state
+// is preserved): neither check_state, nor statuses, nor results; the
+// pause is expressed by the single zone flag. Ingest of a disabled zone
+// keeps working: file ingest does not depend on is_active (spec 5.1),
+// domains accumulate and are checked after enabling. The progress
+// counters domains_total/domains_checked are updated by monitor (T-078,
+// spec 5.9) — list only displays them.
 
 package main
 
@@ -32,7 +33,7 @@ import (
 	"crawler/internal/idn"
 )
 
-// zonesHelp — справка crawlerctl zones [--help] и по действиям.
+// zonesHelp — the crawlerctl zones [--help] text and per-action help.
 const zonesHelp = `crawlerctl zones — управление зонами проверки (ТЗ 4.1, 5.3)
 
 Использование:
@@ -95,39 +96,41 @@ const zonesHelp = `crawlerctl zones — управление зонами про
 
 // ---------------------------------------------------------------- SQL
 
-// zonesSelectSQL — весь справочник зон по возрастанию имени (стиль
-// zoneStatsSQL из internal/status, T-079): name — punycode (каноническая форма), coalesce
-// даёт пустую строку вместо NULL у ASCII-зон (name_unicode хранится
-// только для отображения и отличающихся от name, ТЗ 5.2 п. 7).
+// zonesSelectSQL — the whole zone reference table by ascending name (the
+// zoneStatsSQL style from internal/status, T-079): name — punycode (the canonical form), coalesce
+// gives an empty string instead of NULL for ASCII zones (name_unicode is
+// stored only for display and for names differing from name, spec 5.2 item 7).
 const zonesSelectSQL = "SELECT id, name, coalesce(name_unicode, '') AS name_unicode, " +
 	"is_active, domains_total, domains_checked FROM zones ORDER BY name"
 
-// zoneByNameSQL — строка зоны по punycode-имени (UNIQUE, миграция 000001):
-// разыменование аргумента enable/disable и проверка «зона уже в состоянии».
+// zoneByNameSQL — a zone row by punycode name (UNIQUE, migration 000001):
+// the dereference of the enable/disable argument and the "zone already in
+// the state" check.
 const zoneByNameSQL = "SELECT id, name, coalesce(name_unicode, '') AS name_unicode, " +
 	"is_active, domains_total, domains_checked FROM zones WHERE name = $1"
 
-// zoneSetActiveSQL — включение/выключение зоны одним UPDATE по id:
-// меняется только is_active, домены и счётчики не трогаются (ТЗ 13.1;
-// updated_at — владение monitor, T-078). RETURNING — строка после
-// обновления (пусто — гонка удаления зоны между lookup и UPDATE).
+// zoneSetActiveSQL — enabling/disabling a zone with a single UPDATE by id:
+// only is_active changes, domains and counters are not touched (spec 13.1;
+// updated_at is monitor's ownership, T-078). RETURNING — the row after
+// the update (empty — a race with zone deletion between the lookup and
+// the UPDATE).
 const zoneSetActiveSQL = "UPDATE zones SET is_active = $1 WHERE id = $2 " +
 	"RETURNING id, name, coalesce(name_unicode, '') AS name_unicode, is_active"
 
-// ---------------------------------------------------------------- данные
+// ---------------------------------------------------------------- data
 
-// zoneRow — строка справочника зон для CLI (колонки миграции 000001;
-// счётчики обновляет monitor, T-078).
+// zoneRow — a zone reference table row for the CLI (the migration 000001
+// columns; the counters are updated by monitor, T-078).
 type zoneRow struct {
 	id          int16
-	name        string // punycode — каноническая форма (ТЗ 5.2)
-	nameUnicode string // "" — NULL; только отображение
+	name        string // punycode — the canonical form (spec 5.2)
+	nameUnicode string // "" — NULL; display only
 	active      bool
 	total       int64 // domains_total
 	checked     int64 // domains_checked
 }
 
-// scanZoneRow читает строку справочника в порядке колонок SQL-константы.
+// scanZoneRow reads a reference table row in the column order of the SQL constant.
 func scanZoneRow(scan func(dest ...any) error) (zoneRow, error) {
 	var z zoneRow
 	if err := scan(&z.id, &z.name, &z.nameUnicode, &z.active, &z.total, &z.checked); err != nil {
@@ -136,7 +139,7 @@ func scanZoneRow(scan func(dest ...any) error) (zoneRow, error) {
 	return z, nil
 }
 
-// fetchZones — весь справочник по возрастанию имени (list).
+// fetchZones — the whole reference table by ascending name (list).
 func fetchZones(ctx context.Context, pool db.DB) ([]zoneRow, error) {
 	rows, err := pool.Query(ctx, zonesSelectSQL)
 	if err != nil {
@@ -157,7 +160,7 @@ func fetchZones(ctx context.Context, pool db.DB) ([]zoneRow, error) {
 	return zones, nil
 }
 
-// lookupZoneByName — строка зоны по punycode-имени; found = false — зоны нет.
+// lookupZoneByName — a zone row by punycode name; found = false — no such zone.
 func lookupZoneByName(ctx context.Context, pool db.DB, name string) (zoneRow, bool, error) {
 	rows, err := pool.Query(ctx, zoneByNameSQL, name)
 	if err != nil {
@@ -177,9 +180,10 @@ func lookupZoneByName(ctx context.Context, pool db.DB, name string) (zoneRow, bo
 	return zoneRow{}, false, nil
 }
 
-// setZoneActive — включение/выключение по id; возвращает строку после
-// обновления. Пустой ответ — строка исчезла между lookup и UPDATE
-// (зоны никто не удаляет, поэтому отказ трактуется как ошибка БД-контракта).
+// setZoneActive — enabling/disabling by id; returns the row after the
+// update. An empty answer — the row disappeared between the lookup and
+// the UPDATE (nobody deletes zones, so the rejection is treated as a DB
+// contract error).
 func setZoneActive(ctx context.Context, pool db.DB, id int16, active bool) (zoneRow, error) {
 	rows, err := pool.Query(ctx, zoneSetActiveSQL, active, id)
 	if err != nil {
@@ -199,8 +203,8 @@ func setZoneActive(ctx context.Context, pool db.DB, id int16, active bool) (zone
 	return z, nil
 }
 
-// zoneDesc — имя зоны для сообщений: punycode + unicode-форма, если
-// отличается (name_unicode пуст для ASCII-зон, ТЗ 5.2 п. 7).
+// zoneDesc — the zone name for messages: punycode + the unicode form if
+// it differs (name_unicode is empty for ASCII zones, spec 5.2 item 7).
 func zoneDesc(z zoneRow) string {
 	if z.nameUnicode != "" && z.nameUnicode != z.name {
 		return fmt.Sprintf("%s (%s)", z.name, z.nameUnicode)
@@ -208,9 +212,9 @@ func zoneDesc(z zoneRow) string {
 	return z.name
 }
 
-// ---------------------------------------------------------------- действия
+// ---------------------------------------------------------------- actions
 
-// zonesListRun — вывод справочника зон: id, имя, unicode, акт, счётчики.
+// zonesListRun — prints the zone reference table: id, name, unicode, act, counters.
 func zonesListRun(ctx context.Context, pool db.DB, stdout io.Writer) error {
 	zones, err := fetchZones(ctx, pool)
 	if err != nil {
@@ -230,7 +234,7 @@ func zonesListRun(ctx context.Context, pool db.DB, stdout io.Writer) error {
 		checked += z.checked
 		uni := z.nameUnicode
 		if uni == z.name {
-			uni = "" // совпадает с punycode — колонку не дублируем
+			uni = "" // equals the punycode — no column duplication
 		}
 		if uni == "" {
 			uni = "—"
@@ -249,15 +253,15 @@ func zonesListRun(ctx context.Context, pool db.DB, stdout io.Writer) error {
 			}
 		}
 	}
-	// Числовые колонки (id, счётчики) — вправо, текстовые — влево
-	// (стиль writeStatusTable, T-079).
+	// Numeric columns (id, counters) — right-aligned, text — left-aligned
+	// (the writeStatusTable style, T-079).
 	for _, r := range rows {
 		var b strings.Builder
 		for i, c := range r {
 			if i > 0 {
 				b.WriteByte(' ')
 			}
-			if i == 0 || i >= 4 { // id и счётчики — числа
+			if i == 0 || i >= 4 { // id and counters are numbers
 				fmt.Fprintf(&b, "%*s", widths[i], c)
 			} else {
 				fmt.Fprintf(&b, "%-*s", widths[i], c)
@@ -270,9 +274,9 @@ func zonesListRun(ctx context.Context, pool db.DB, stdout io.Writer) error {
 	return nil
 }
 
-// zonesToggleRun — включение/выключение зоны по имени (is_active).
-// Идемпотентно: повторный enable/disable сообщает «уже включена/выключена»
-// (стиль subdomains disable, T-083).
+// zonesToggleRun — enabling/disabling a zone by name (is_active).
+// Idempotent: a repeated enable/disable reports "already enabled/disabled"
+// (the subdomains disable style, T-083).
 func zonesToggleRun(ctx context.Context, pool db.DB, action string, name string, stdout io.Writer) error {
 	z, found, err := lookupZoneByName(ctx, pool, name)
 	if err != nil {
@@ -304,9 +308,9 @@ func zonesToggleRun(ctx context.Context, pool db.DB, action string, name string,
 	return nil
 }
 
-// ---------------------------------------------------------------- команды
+// ---------------------------------------------------------------- commands
 
-// cmdZones — роутинг действий зон: list / enable / disable / sync
+// cmdZones — routing of the zone actions: list / enable / disable / sync
 // (sync — T-125, zonessync.go) / collapse (T-196, zonescollapse.go).
 func cmdZones(args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
@@ -359,8 +363,9 @@ func zonesToggle(action string, args []string, stdout, stderr io.Writer) error {
 	if fs.NArg() != 1 {
 		return usagef("укажите зону: crawlerctl zones %s crawl.test", action)
 	}
-	// Валидация входа — тем же конвейером, что и каталоги incoming
-	// (internal/idn.NormalizeZone): зона хранится в punycode (ТЗ 5.2).
+	// Input validation — through the same pipeline as the incoming
+	// directories (internal/idn.NormalizeZone): the zone is stored in
+	// punycode (spec 5.2).
 	zone, err := idn.NormalizeZone(fs.Arg(0))
 	if err != nil {
 		return usagef("zones %s: некорректное имя зоны %q: %v", action, fs.Arg(0), err)

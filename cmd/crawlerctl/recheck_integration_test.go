@@ -1,17 +1,17 @@
-// Интеграционные тесты переходов ручного recheck спецификации автомата
-// check_state (T-255, ТЗ ТЗ-fsm §3 ФТ-1: строки Р11/Р12; единая точка
-// правды — internal/scheduler/checkstate.go) против живого PostgreSQL:
-// crawlerctl recheck переводит found-домены любого check_state (done /
-// queued / pending) в pending со сбросом queued_at и дельтами зон по
-// старому состоянию, deleted — отказ; crawlerctl subdomains recheck
-// дренажом переводит done → pending. SQL-контракты и семантика перевода
-// — юнит-тесты recheck_test.go/subdomains_test.go на фейках; здесь —
-// реальное поведение операторов на мигрированной схеме (образец —
-// fixtures_import_integration_test.go; спецификация требует
-// интеграционных тестов ВСЕХ переходов, а crawlerctl — package main,
-// из test/integration не импортируется). Запуск: make test-integration
-// (CRAWLER_INTEGRATION=1, тот же список пакетов в Makefile); без
-// переменной тест пропускается.
+// Integration tests for the manual recheck transitions of the check_state
+// FSM spec (T-255, TZ-fsm spec §3 FR-1: rows R11/R12; the single source of
+// truth — internal/scheduler/checkstate.go) against live PostgreSQL:
+// crawlerctl recheck moves found domains of any check_state (done / queued
+// / pending) to pending with a queued_at reset and zone deltas by the old
+// state; deleted — a rejection; crawlerctl subdomains recheck moves
+// done → pending by draining. The SQL contracts and the move semantics —
+// the recheck_test.go/subdomains_test.go unit tests on fakes; here — the
+// real operator behavior on a migrated schema (the sample —
+// fixtures_import_integration_test.go; the spec requires integration tests
+// for ALL transitions, and crawlerctl is package main, not importable from
+// test/integration). Run: make test-integration (CRAWLER_INTEGRATION=1,
+// the same package list in the Makefile); without the variable the test
+// is skipped.
 package main
 
 import (
@@ -26,10 +26,11 @@ import (
 	"crawler/internal/monitor"
 )
 
-// TestRecheckSpecTransitionsLive — переходы Р11 (ручной recheck: done /
-// queued / pending → pending, deleted — отказ) и Р12 (массовый recheck
-// субдомена: done → pending дренажом): queued_at сбрасывается, дельты
-// зон сходятся с реконсиляцией T-178 после каждого эпизода.
+// TestRecheckSpecTransitionsLive — the R11 transitions (manual recheck:
+// done / queued / pending → pending, deleted — a rejection) and R12 (the
+// mass recheck of a subdomain: done → pending by draining): queued_at is
+// reset, the zone deltas reconcile with the T-178 reconciliation after
+// each episode.
 func TestRecheckSpecTransitionsLive(t *testing.T) {
 	if os.Getenv("CRAWLER_INTEGRATION") != "1" {
 		t.Skip("интеграционный тест recheck: запустите make test-integration")
@@ -64,7 +65,7 @@ func TestRecheckSpecTransitionsLive(t *testing.T) {
 	seed("pending", model.CheckStatePending, model.StatusNew, false)
 	seed("del", model.CheckStateDone, model.StatusDeleted, false)
 
-	// Ручной INSERT мимо дельт: реконсиляция — авторитет.
+	// A manual INSERT bypassing the deltas: the reconciliation is the authority.
 	if _, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{}); err != nil {
 		t.Fatalf("реконсиляция: %v", err)
 	}
@@ -72,7 +73,7 @@ func TestRecheckSpecTransitionsLive(t *testing.T) {
 		t.Fatalf("после реконсиляции: mismatch=%v err=%v", mismatch, err)
 	}
 
-	// Р11: перевод найденных (done/queued/pending) в pending, del — отказ.
+	// R11: the found ones (done/queued/pending) are moved to pending, del — a rejection.
 	var stdout bytes.Buffer
 	err := recheckRun(ctx, pool,
 		namesOf("done.recheck.test", "queued.recheck.test", "pending.recheck.test", "del.recheck.test"),
@@ -143,17 +144,19 @@ func TestRecheckSpecTransitionsLive(t *testing.T) {
 		t.Fatalf("после ручного recheck: mismatch=%v err=%v (дельты по старым состояниям)", mismatch, err)
 	}
 
-	// Р12: массовый recheck субдомена — done → pending дренажом; не-done
-	// не трогаются. del снова делаем done-кандидатом? Нет: deleted
-	// исключён охраной — проверяем на единственном done.
+	// R12: the mass recheck of a subdomain — done → pending by draining;
+	// non-done ones are not touched. Make del a done candidate again? No:
+	// deleted is excluded by the guard — we check on the only done.
 	if _, err := pool.Exec(ctx,
 		"UPDATE domains SET check_state = $1 WHERE zone_id = $2 AND label = 'done'",
 		int16(model.CheckStateDone), zone); err != nil {
 		t.Fatalf("возврат в done: %v", err)
 	}
-	// Справочник субдоменов не сеем: сид миграции 000001 уже содержит
-	// (1, 'www') с enabled = true — lookupSubdomainLabel найдёт его.
-	// Ручной UPDATE мимо дельт — реконсиляция выравнивает до дренажа.
+	// The subdomain reference table is not seeded: the migration 000001
+	// seed already contains (1, 'www') with enabled = true —
+	// lookupSubdomainLabel will find it.
+	// A manual UPDATE bypassing the deltas — the reconciliation aligns
+	// the counters before the drain.
 	if _, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{}); err != nil {
 		t.Fatalf("реконсиляция (перед Р12): %v", err)
 	}

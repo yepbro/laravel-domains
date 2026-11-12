@@ -1,12 +1,13 @@
-// Юнит-тесты crawlerctl recheck (T-084, ТЗ 4.1, 5.3) на фейковом пуле
-// (db.DB) — без БД. Проверяются точные SQL-тексты (контракт, стиль
-// subdomains_test.go) и живая семантика фейка: разрешение имён пачкой
-// (unnest + WITH ORDINALITY, LEFT JOIN зон/доменов — не найденные не
-// теряются, порядок аргументов сохраняется), перевод найденных в pending
-// одним UPDATE по ключам PK с охраной status <> deleted и RETURNING
-// ключей, построчный итог (не найден: нет зоны / нет метки; удалён —
-// отказ; было check_state), частичный успех — код 1, ошибки БД.
-// Поведение против живого PostgreSQL — dev-окружение (make shell).
+// Unit tests for crawlerctl recheck (T-084, spec 4.1, 5.3) on a fake pool
+// (db.DB) — without a DB. The exact SQL texts are checked (a contract, the
+// subdomains_test.go style) along with the fake's live semantics: batch
+// name resolution (unnest + WITH ORDINALITY, LEFT JOIN of zones/domains —
+// not-found ones are not lost, the argument order is preserved), moving
+// the found ones to pending with a single UPDATE over PK keys with the
+// status <> deleted guard and RETURNING of the keys, the per-line summary
+// (not found: no zone / no label; deleted — a rejection; the old
+// check_state), a partial success — code 1, DB errors.
+// Behavior against live PostgreSQL — the dev environment (make shell).
 package main
 
 import (
@@ -27,7 +28,7 @@ import (
 	"crawler/internal/model"
 )
 
-// --- SQL-контракты ----------------------------------------------------------
+// --- SQL contracts ---------------------------------------------------------
 
 const wantRecheckLookup = "SELECT n.ord, " +
 	"coalesce(z.id, 0) AS zone_id, coalesce(z.name, '') AS zone_name, coalesce(z.is_active, false) AS zone_on, " +
@@ -48,7 +49,7 @@ const wantRecheckUpdate = "UPDATE domains AS d " +
 	"WHERE d.zone_id = k.zone_id AND d.id = k.domain_id AND d.status <> $4 " +
 	"RETURNING d.zone_id, d.id"
 
-// wantRecheckStates — предчтение старых состояний FOR UPDATE (T-178).
+// wantRecheckStates — the FOR UPDATE pre-read of the old states (T-178).
 const wantRecheckStates = "SELECT d.zone_id, d.id, d.check_state " +
 	"FROM domains AS d " +
 	"JOIN unnest($1::int2[], $2::int8[]) AS k(zone_id, domain_id) " +
@@ -68,17 +69,17 @@ func TestRecheckSQLContract(t *testing.T) {
 	}
 }
 
-// --- фейковый пул (db.DB) -----------------------------------------------------
+// --- fake pool (db.DB) --------------------------------------------------------
 
-// recheckZoneSeed — зона фейка.
+// recheckZoneSeed — a fake zone.
 type recheckZoneSeed struct {
 	id     int16
 	name   string
 	active bool
 }
 
-// recheckDomainSeed — домен фейка (label + зона; queuedAt имитирует
-// queued_at: сбрасывается переводом в pending).
+// recheckDomainSeed — a fake domain (label + zone; queuedAt mimics
+// queued_at: it is reset by the move to pending).
 type recheckDomainSeed struct {
 	zone     int16
 	id       int64
@@ -88,19 +89,19 @@ type recheckDomainSeed struct {
 	queuedAt bool
 }
 
-// recheckPool — db.DB без БД: живая семантика SQL команды recheck —
-// разрешение (зона, метка) → строки (LEFT JOIN, ord), перевод ключей
-// в pending (охрана deleted, RETURNING фактически переведённых).
+// recheckPool — a db.DB without a DB: the live semantics of the recheck
+// SQL — resolution of (zone, label) → rows (LEFT JOIN, ord), moving keys
+// to pending (the deleted guard, RETURNING of the actually moved ones).
 type recheckPool struct {
 	zones   []recheckZoneSeed
 	domains []recheckDomainSeed
 
 	mu            sync.Mutex
 	queryErr      error
-	queryErrAfter int // первые N Query успешны, затем queryErr (сбой перевода)
+	queryErrAfter int // the first N Query calls succeed, then queryErr (a move failure)
 	onUpdate      func()
 	queries       []subCall
-	execs         []subCall // Exec транзакций (сдвиг счётчиков зон, T-178)
+	execs         []subCall // transaction Execs (the zone counter shift, T-178)
 }
 
 var _ db.DB = (*recheckPool)(nil)
@@ -142,7 +143,7 @@ func (p *recheckPool) Query(_ context.Context, sql string, args ...any) (pgx.Row
 		return p.statesRows(args[0].([]int16), args[1].([]int64), args[2].(int16)), nil
 	case recheckUpdateSQL:
 		if p.onUpdate != nil {
-			p.onUpdate() // гонка между lookup и UPDATE (например, delete-файл)
+			p.onUpdate() // a race between the lookup and the UPDATE (e.g. a delete file)
 		}
 		return p.updateRows(args[0].(int16), args[1].([]int16), args[2].([]int64), args[3].(int16)), nil
 	default:
@@ -150,14 +151,14 @@ func (p *recheckPool) Query(_ context.Context, sql string, args ...any) (pgx.Row
 	}
 }
 
-// Begin — транзакция перевода (T-178: предчтение состояний, перевод и
-// дельты счётчиков зон атомарны).
+// Begin — the move transaction (T-178: the state pre-read, the move and
+// the zone counter deltas are atomic).
 func (p *recheckPool) Begin(context.Context) (pgx.Tx, error) {
 	return &recheckPoolTx{pool: p}, nil
 }
 
-// recheckPoolTx — транзакция поверх фейка: Query/Exec идут в протокол
-// пула (Exec — сдвиг счётчиков зон), Commit/Rollback считаются.
+// recheckPoolTx — a transaction over the fake: Query/Exec go into the
+// pool protocol (Exec — the zone counter shift), Commit/Rollback are counted.
 type recheckPoolTx struct {
 	pgx.Tx
 	pool     *recheckPool
@@ -183,8 +184,8 @@ func (t *recheckPoolTx) Exec(_ context.Context, sql string, args ...any) (pgconn
 func (t *recheckPoolTx) Commit(context.Context) error   { t.commits++; return nil }
 func (t *recheckPoolTx) Rollback(context.Context) error { t.rollback++; return nil }
 
-// statesRows применяет семантику recheckStatesSQL (T-178): старые
-// состояния строк по ключам с охраной status <> deleted (FOR UPDATE).
+// statesRows applies the recheckStatesSQL semantics (T-178): the old
+// states of rows by keys with the status <> deleted guard (FOR UPDATE).
 func (p *recheckPool) statesRows(zones []int16, ids []int64, deleted int16) pgx.Rows {
 	var rows [][]any
 	for i, zone := range zones {
@@ -199,10 +200,10 @@ func (p *recheckPool) statesRows(zones []int16, ids []int64, deleted int16) pgx.
 	return statusRowsOf(rows...)
 }
 
-// lookupRows применяет семантику recheckLookupSQL: зона — длиннейший
-// суффикс имени из справочника (LATERAL LIMIT 1), метка — имя без
-// «.»+зоны; отсутствующая зона/метка — нули (coalesce), порядок —
-// порядок аргументов (ord).
+// lookupRows applies the recheckLookupSQL semantics: the zone — the
+// longest name suffix from the reference table (LATERAL LIMIT 1), the
+// label — the name without "."+zone; a missing zone/label — zeros
+// (coalesce), the order — the argument order (ord).
 func (p *recheckPool) lookupRows(names []string) pgx.Rows {
 	rows := make([][]any, len(names))
 	for i, name := range names {
@@ -231,9 +232,9 @@ func (p *recheckPool) lookupRows(names []string) pgx.Rows {
 	return statusRowsOf(rows...)
 }
 
-// updateRows применяет семантику recheckUpdateSQL: перевод в pending по
-// ключам PK с перепроверкой status <> deleted; возвращает ключи
-// фактически переведённых строк (RETURNING). queued_at сбрасывается.
+// updateRows applies the recheckUpdateSQL semantics: a move to pending
+// over PK keys with a re-check of status <> deleted; returns the keys of
+// the actually moved rows (RETURNING). queued_at is reset.
 func (p *recheckPool) updateRows(pending int16, zones []int16, ids []int64, deleted int16) pgx.Rows {
 	var rows [][]any
 	for i, zone := range zones {
@@ -251,9 +252,9 @@ func (p *recheckPool) updateRows(pending int16, zones []int16, ids []int64, dele
 	return statusRowsOf(rows...)
 }
 
-// domain — строка домена фейка по ключу для проверок итога.
+// domain — a fake domain row by key, for summary checks.
 
-// namesOf — нормализованные punycode-имена (ord соответствует входу).
+// namesOf — normalized punycode names (ord matches the input).
 func namesOf(names ...string) []string {
 	res := make([]string, len(names))
 	for i, n := range names {
@@ -266,15 +267,15 @@ func namesOf(names ...string) []string {
 	return res
 }
 
-// --- перевод -------------------------------------------------------------------
+// --- move ----------------------------------------------------------------------
 
 func TestRecheckRunTranslate(t *testing.T) {
 	pool := newRecheckPool()
-	pool.seed(7, 1, "done", model.CheckStateDone, model.StatusAlive)       // основной случай
-	pool.seed(7, 2, "pending", model.CheckStatePending, model.StatusAlive) // уже ждёт — идемпотентно
-	pool.seed(7, 3, "queued", model.CheckStateQueued, model.StatusAlive)   // в работе — как возврат lease
-	pool.seed(7, 4, "temp", model.CheckStateDone, model.StatusTempError)   // temp_error — кандидат
-	pool.seed(7, 5, "gone", model.CheckStateDone, model.StatusDeleted)     // deleted — отказ
+	pool.seed(7, 1, "done", model.CheckStateDone, model.StatusAlive)       // the main case
+	pool.seed(7, 2, "pending", model.CheckStatePending, model.StatusAlive) // already waiting — idempotent
+	pool.seed(7, 3, "queued", model.CheckStateQueued, model.StatusAlive)   // in work — as a lease refund
+	pool.seed(7, 4, "temp", model.CheckStateDone, model.StatusTempError)   // temp_error — a candidate
+	pool.seed(7, 5, "gone", model.CheckStateDone, model.StatusDeleted)     // deleted — a rejection
 
 	var stdout bytes.Buffer
 	err := recheckRun(context.Background(), pool,
@@ -285,7 +286,7 @@ func TestRecheckRunTranslate(t *testing.T) {
 	}
 	got := stdout.String()
 
-	// Найденные переведены: по строке на домен с прежним состоянием.
+	// The found ones are moved: one line per domain with the old state.
 	for name, was := range map[string]string{
 		"done.crawl.test":    "done",
 		"pending.crawl.test": "pending",
@@ -303,8 +304,8 @@ func TestRecheckRunTranslate(t *testing.T) {
 		t.Errorf("вывод без итога:\n%s", got)
 	}
 
-	// Семантика перевода: check_state = pending, queued_at сброшен
-	// (в т.ч. у взятого в работу), deleted не тронут.
+	// Move semantics: check_state = pending, queued_at reset
+	// (including the one taken into work), deleted untouched.
 	for i, want := range []model.CheckState{model.CheckStatePending, model.CheckStatePending,
 		model.CheckStatePending, model.CheckStatePending, model.CheckStateDone} {
 		if d := pool.domains[i]; d.state != want {
@@ -318,7 +319,7 @@ func TestRecheckRunTranslate(t *testing.T) {
 		t.Errorf("deleted-домен изменился: %+v", pool.domains[4])
 	}
 
-	// Контракт параметров UPDATE: код pending, ключи PK, охрана deleted.
+	// The UPDATE parameter contract: the pending code, the PK keys, the deleted guard.
 	upd := pool.queries[len(pool.queries)-1]
 	if upd.sql != recheckUpdateSQL {
 		t.Fatalf("SQL = %s, хочу перевод", upd.sql)
@@ -376,15 +377,15 @@ func TestRecheckRunNotFound(t *testing.T) {
 	if !strings.Contains(got, "переведено в проверку (pending): 0 из 2") {
 		t.Errorf("вывод без итога 0 из 2:\n%s", got)
 	}
-	// Перевода не было — только разрешение имён.
+	// No move happened — the name resolution only.
 	if len(pool.queries) != 1 {
 		t.Errorf("обращений = %d, хочу 1 (только lookup)", len(pool.queries))
 	}
 }
 
 func TestRecheckRunInactiveZone(t *testing.T) {
-	// Зона выключена (zones disable): домен переводится, но проверка
-	// ждёт включения зоны — предупреждение в строке домена.
+	// The zone is disabled (zones disable): the domain is moved but the
+	// check waits for the zone to be enabled — a warning in the domain line.
 	pool := newRecheckPool()
 	pool.seed(9, 1, "paused", model.CheckStateDone, model.StatusAlive)
 
@@ -402,8 +403,8 @@ func TestRecheckRunInactiveZone(t *testing.T) {
 }
 
 func TestRecheckRunDuplicates(t *testing.T) {
-	// Повтор имени в аргументах: оба разрешения находят один домен,
-	// перевод по ключу применяется один раз, вывод — по строке на аргумент.
+	// A repeated name in the arguments: both resolutions find the same
+	// domain, the move by key applies once, the output — one line per argument.
 	pool := newRecheckPool()
 	pool.seed(7, 1, "dup", model.CheckStateDone, model.StatusAlive)
 
@@ -421,9 +422,9 @@ func TestRecheckRunDuplicates(t *testing.T) {
 }
 
 func TestRecheckRunRaceDeleted(t *testing.T) {
-	// Статус изменился на deleted между lookup и UPDATE: охрана
-	// status <> deleted пропускает строку, RETURNING её не отдаёт —
-	// домен попадает в отказ как «не поставлен».
+	// The status changed to deleted between the lookup and the UPDATE: the
+	// status <> deleted guard skips the row, RETURNING does not return it —
+	// the domain ends up in the rejection as "not enqueued".
 	pool := newRecheckPool()
 	pool.seed(7, 1, "racy", model.CheckStateDone, model.StatusAlive)
 	pool.onUpdate = func() { pool.domains[0].status = model.StatusDeleted }
@@ -476,11 +477,11 @@ func TestJoinNames(t *testing.T) {
 	}
 }
 
-// --- команда через run -----------------------------------------------------------
+// --- command via run -------------------------------------------------------------
 
-// TestRunRecheckExecution — путь выполнения recheck без инфраструктуры:
-// детерминированный отказ конфигурации (код 1) с контекстом команды —
-// валидация имён идёт раньше (ошибки использования — код 2).
+// TestRunRecheckExecution — the recheck execution path without
+// infrastructure: a deterministic configuration failure (code 1) with the
+// command context — name validation runs earlier (usage errors — code 2).
 func TestRunRecheckExecution(t *testing.T) {
 	t.Setenv("CRAWLER_CONFIG", filepath.Join(t.TempDir(), "missing.yaml"))
 

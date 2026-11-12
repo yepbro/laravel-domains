@@ -1,15 +1,16 @@
 // ---------------------------------------------------------------- status
 //
-// crawlerctl status (T-079, ТЗ 5.9): вывод сводки по зонам, очередям,
-// скорости и ожидаемому времени завершения первого цикла проверок.
-// Данные и расчёты — пакет internal/status (ТЗД §4.5, T-126): общая
-// библиотека сводки CLI и дашборда, один источник правды о смысле чисел;
-// SQL-тексты, выборки и производные величины — там, здесь — только
-// форматирование (таблица/JSON) и склейка команды с инфраструктурой
-// (конфигурация, пул БД, Redis).
+// crawlerctl status (T-079, spec 5.9): prints a summary of zones, queues,
+// check rate and the expected completion time of the first check cycle.
+// The data and the calculations live in the internal/status package
+// (dashboard spec §4.5, T-126): the shared summary library of the CLI and
+// the dashboard, a single source of truth about the meaning of the numbers;
+// the SQL texts, the selections and the derived values are there, and this
+// file only formats (table/JSON) and wires the command to the
+// infrastructure (configuration, DB pool, Redis).
 //
-// Недоступный Redis не прячет сводку по БД: секция очередей печатается с
-// «н/д», команда завершается кодом 1.
+// An unavailable Redis does not hide the DB summary: the queues section is
+// printed with "n/a" and the command exits with code 1.
 
 package main
 
@@ -26,7 +27,7 @@ import (
 	"crawler/internal/status"
 )
 
-// statusHelp — справка crawlerctl status --help.
+// statusHelp — the crawlerctl status --help text.
 const statusHelp = `crawlerctl status — сводка по зонам, очередям, скорости (ТЗ 5.9)
 
 Использование:
@@ -46,9 +47,9 @@ last_checked_at имеет точность дня; HTTP-результаты и
 Коды возврата: 0 — успех, 1 — ошибка, 2 — использование.
 `
 
-// ---------------------------------------------------------------- вывод
+// ---------------------------------------------------------------- output
 
-// actMark — колонка «акт»: зона участвует в проверках.
+// actMark — the "act" column: the zone participates in checks.
 func actMark(active bool) string {
 	if active {
 		return "+"
@@ -56,7 +57,7 @@ func actMark(active bool) string {
 	return "-"
 }
 
-// percentMark — доля проверенных по счётчикам зоны; «—» при пустой зоне.
+// percentMark — the checked share by the zone counters; "—" for an empty zone.
 func percentMark(checked, total int64) string {
 	if total <= 0 {
 		return "—"
@@ -64,16 +65,16 @@ func percentMark(checked, total int64) string {
 	return fmt.Sprintf("%.0f%%", float64(checked)*100/float64(total))
 }
 
-// writeStatusTable — человекочитаемая сводка: моноширинная таблица зон
-// (текстовые колонки влево, числа вправо), очереди, скорость, цикл.
-// lens == nil — Redis недоступен, очереди «н/д».
+// writeStatusTable — a human-readable summary: a monospace zone table
+// (text columns left-aligned, numbers right-aligned), queues, rate, cycle.
+// lens == nil — Redis is unavailable, queues are "n/a".
 func writeStatusTable(w io.Writer, zones []status.ZoneStats, tot status.Totals, thr status.Throughput, rates status.Rates, lens map[string]int64) {
 	out(w, "зоны: всего/проверено/pending/queued/done — инкрементальные счётчики zones\n"+
 		"(дельты переходов + реконсиляция monitor, T-178; deleted вне базового множества)\n\n")
 
-	// Колонки: зона и акт — текст, остальные — числа (выравнивание
-	// вправо). Имя зоны — punycode (каноническая форма, как каталог
-	// incoming/<зона>); unicode-форма — в --json.
+	// Columns: zone and act — text, the rest — numbers (right-aligned).
+	// The zone name is punycode (the canonical form, like the
+	// incoming/<zone> directory); the unicode form — in --json.
 	head := []string{"зона", "акт", "всего", "проверено", "%", "pending", "queued", "done"}
 	rows := [][]string{head}
 	row := func(cells ...string) []string { return cells }
@@ -102,7 +103,7 @@ func writeStatusTable(w io.Writer, zones []status.ZoneStats, tot status.Totals, 
 			if i > 0 {
 				b.WriteByte(' ')
 			}
-			if i >= 2 { // числовые колонки — вправо
+			if i >= 2 { // numeric columns — right-aligned
 				fmt.Fprintf(&b, "%*s", widths[i], c)
 			} else {
 				fmt.Fprintf(&b, "%-*s", widths[i], c)
@@ -129,11 +130,11 @@ func writeStatusTable(w io.Writer, zones []status.ZoneStats, tot status.Totals, 
 	} else {
 		out(w, "  доменов/с          н/д   (окно с начала суток короче %s)\n", status.FormatDuration(status.MinSpeedWindowSec))
 	}
-	// Окно темпа результатов/рендеров — корзины календарных часов
-	// (T-203): фактическая длина покрытого окна 1–2 ч печатается рядом —
-	// «N за окно» без длины вводило бы в заблуждение скользящим «часом»;
-	// нулевое окно (ручной сбор) — фиксированный час, тот же фолбэк, что
-	// ComputeRates.
+	// The results/renders rate window — calendar hour buckets (T-203): the
+	// actual length of the covered 1-2 h window is printed next to it —
+	// "N per window" without the length would mislead with a sliding
+	// "hour"; a zero window (manual collection) — a fixed hour, the same
+	// fallback as ComputeRates.
 	window := thr.HourWindowSec
 	if window <= 0 {
 		window = 3600
@@ -155,10 +156,11 @@ func writeStatusTable(w io.Writer, zones []status.ZoneStats, tot status.Totals, 
 	}
 }
 
-// writeStatusJSON — машинный вывод (стиль domain --json): те же данные,
-// что в таблице; «н/д» — null (скорость без окна, ETA без скорости,
-// очереди без Redis). Wire-формат — status.BuildSummaryJSON (ТЗД §6.2,
-// T-129): тот же контракт полей отдаёт /api/status дашборда.
+// writeStatusJSON — machine output (the domain --json style): the same
+// data as in the table; "n/a" — null (a rate without a window, an ETA
+// without a rate, queues without Redis). The wire format —
+// status.BuildSummaryJSON (dashboard spec §6.2, T-129): /api/status of the
+// dashboard serves the same field contract.
 func writeStatusJSON(w io.Writer, zones []status.ZoneStats, tot status.Totals, thr status.Throughput, rates status.Rates, lens map[string]int64) error {
 	doc := status.BuildSummaryJSON(zones, tot, thr, rates, lens)
 	enc := json.NewEncoder(w)
@@ -166,9 +168,9 @@ func writeStatusJSON(w io.Writer, zones []status.ZoneStats, tot status.Totals, t
 	return enc.Encode(doc)
 }
 
-// ---------------------------------------------------------------- команда
+// ---------------------------------------------------------------- command
 
-// cmdStatus — crawlerctl status: сборка сводки из БД и Redis и вывод.
+// cmdStatus — crawlerctl status: builds the summary from the DB and Redis and prints it.
 func cmdStatus(args []string, stdout, stderr io.Writer) error {
 	fs := newFlagSet("status")
 	asJSON := fs.Bool("json", false, "машинный вывод (для скриптов)")
@@ -179,22 +181,22 @@ func cmdStatus(args []string, stdout, stderr io.Writer) error {
 		return usagef("status: лишние аргументы %v (сводка берётся целиком, без позиционных аргументов)", fs.Args())
 	}
 
-	// Конфигурация — единый YAML + окружение (internal/config): DSN
-	// PostgreSQL и адрес Redis (стиль reanalyze, T-074).
+	// The configuration — a single YAML + environment (internal/config):
+	// the PostgreSQL DSN and the Redis address (the reanalyze style, T-074).
 	cfg, err := config.Load()
 	if err != nil {
 		return fmt.Errorf("status: %w", err)
 	}
-	// Ctrl-C/SIGTERM отменяют тяжёлые агрегаты (полные проходы больших
-	// таблиц) — единый хелпер команд (signalCtx).
+	// Ctrl-C/SIGTERM cancel the heavy aggregates (full passes over large
+	// tables) — the shared command helper (signalCtx).
 	ctx, stop := signalCtx()
 	defer stop()
 
-	// CLI pool_size = 2 — бюджет соединений ТЗ 6.3 у сервисов (стиль
-	// manage.go, T-074).
+	// CLI pool_size = 2 — the connection budget of spec 6.3, as in the
+	// services (the manage.go style, T-074).
 	poolOpts := db.NewOptions(cfg.Postgres)
 	poolOpts.PoolSize = 2
-	poolOpts.AppName = "crawlerctl" // метка в pg_stat_activity (T-177)
+	poolOpts.AppName = "crawlerctl" // label in pg_stat_activity (T-177)
 	pool, err := db.Open(ctx, poolOpts)
 	if err != nil {
 		return fmt.Errorf("status: %w", err)
@@ -212,9 +214,10 @@ func cmdStatus(args []string, stdout, stderr io.Writer) error {
 	tot := status.ComputeTotals(zones)
 	rates := status.ComputeRates(thr, tot.Pending, tot.Queued)
 
-	// Глубина очередей — через гейт backpressure (T-026): узкий API
-	// Len над go-redis; порог гейта здесь не участвует. Недоступный Redis
-	// не прячет сводку по БД: печатаем с «н/д», завершаемся кодом 1.
+	// The queue depth — through the backpressure gate (T-026): the narrow
+	// Len API over go-redis; the gate threshold is not involved here. An
+	// unavailable Redis does not hide the DB summary: we print with "n/a"
+	// and exit with code 1.
 	rdb := queue.NewClient(cfg.Redis.Addr)
 	defer func() { _ = rdb.Close() }()
 	lens, qErr := status.FetchQueueLens(ctx, queue.NewBackpressureGate(rdb, queue.BackpressureOptions{}))

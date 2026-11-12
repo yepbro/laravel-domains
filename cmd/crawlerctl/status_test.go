@@ -1,7 +1,8 @@
-// Юнит-тесты вывода crawlerctl status (T-079, ТЗ 5.9): формат таблицы и
-// JSON (null для «н/д»), роутинг/коды и справка. SQL-контракты, семантика
-// агрегатов и расчёты — тесты пакета internal/status (T-126, ТЗД §4.5);
-// поведение против живых PostgreSQL/Redis — dev-окружение (make status).
+// Unit tests for the crawlerctl status output (T-079, spec 5.9): the table
+// and JSON formats (null for "n/a"), routing/exit codes and the help text.
+// The SQL contracts, the aggregate semantics and the calculations —
+// internal/status package tests (T-126, dashboard spec §4.5); behavior
+// against live PostgreSQL/Redis — the dev environment (make status).
 package main
 
 import (
@@ -20,13 +21,13 @@ import (
 	"crawler/internal/status"
 )
 
-// --- общий фейк pgx.Rows -------------------------------------------------------
+// --- shared pgx.Rows fake -------------------------------------------------------
 
-// statusRows — pgx.Rows с заготовленными строками (Scan позиционный,
-// типы int16/string/bool/int64/float32/float64/[]byte). Общий фейк
-// тестов команд crawlerctl (zones, subdomains, near, recheck, …);
-// родился со status (T-079), логика ушла в internal/status (T-126) —
-// фейк остаётся здесь, у тестов CLI.
+// statusRows — pgx.Rows with pre-loaded rows (positional Scan, the
+// int16/string/bool/int64/float32/float64/[]byte types). The shared fake
+// of the crawlerctl command tests (zones, subdomains, near, recheck, …);
+// born with status (T-079), the logic moved to internal/status (T-126) —
+// the fake stays here, with the CLI tests.
 type statusRows struct {
 	rows [][]any
 	i    int
@@ -83,16 +84,16 @@ func (r *statusRows) Scan(dest ...any) error {
 	return nil
 }
 
-// --- вывод ------------------------------------------------------------------------
+// --- output ----------------------------------------------------------------------
 
-// TestPercentMark — доля проверенных; пустая зона — «—».
+// TestPercentMark — the checked share; an empty zone — "—".
 func TestPercentMark(t *testing.T) {
 	cases := []struct {
 		checked, total int64
 		want           string
 	}{
 		{40, 100, "40%"},
-		{1, 3, "33%"}, // доля до целых процентов
+		{1, 3, "33%"}, // share rounded down to whole percents
 		{0, 0, "—"},
 		{5, 0, "—"},
 	}
@@ -103,24 +104,24 @@ func TestPercentMark(t *testing.T) {
 	}
 }
 
-// statusTestSnapshot — согласованный набор данных для тестов вывода:
-// две зоны (одна без доменов), замеры и скорости из TestComputeRates.
+// statusTestSnapshot — a consistent dataset for the output tests:
+// two zones (one without domains), measurements and rates from TestComputeRates.
 func statusTestSnapshot() (zones []status.ZoneStats, tot status.Totals, thr status.Throughput, rates status.Rates) {
 	zones = []status.ZoneStats{
 		{ID: 1, Name: "crawl.test", IsActive: true, DomainsTotal: 100, DomainsChecked: 40, Pending: 60, Queued: 2, Done: 38},
-		// Зона без доменов (LEFT JOIN): счётчик monitor остался от прошлого
-		// наполнения — в итог он всё равно входит.
+		// A zone without domains (LEFT JOIN): the monitor counter is left
+		// over from a previous filling — it still enters the totals.
 		{ID: 3, Name: "empty.test", IsActive: false, DomainsTotal: 10, DomainsChecked: 0},
 	}
 	tot = status.ComputeTotals(zones)
 	thr = status.Throughput{DoneToday: 3600, ElapsedSec: 3600, ResultsHour: 7200, RenderedHour: 3600, HourWindowSec: 3600}
-	rates = status.ComputeRates(thr, tot.Pending, tot.Queued) // 1 дом./с → ETA 62с
+	rates = status.ComputeRates(thr, tot.Pending, tot.Queued) // 1 domain/s → ETA 62s
 	return zones, tot, thr, rates
 }
 
-// TestWriteStatusTable — формат: заголовок и колонки зон, итого, очереди
-// по всем стримам, скорость с окнами, цикл с ETA; выравнивание чисел
-// вправо не рвёт колонки итога.
+// TestWriteStatusTable — the format: the zone header and columns, totals,
+// queues across all streams, the rate with windows, the cycle with the ETA;
+// right-aligned numbers do not break the totals columns.
 func TestWriteStatusTable(t *testing.T) {
 	zones, tot, thr, rates := statusTestSnapshot()
 	lens := map[string]int64{"q:dns": 5, "q:http": 0, "q:render": 12, "q:analyze": 3, "q:dead": 1}
@@ -130,10 +131,10 @@ func TestWriteStatusTable(t *testing.T) {
 	got := b.String()
 
 	for _, want := range []string{
-		"зона", "pending", "queued", "done", // заголовок
+		"зона", "pending", "queued", "done", // header
 		"crawl.test +", "empty.test -",
-		"60", "38", "итого", "40%", // агрегаты и итог
-		"q:dns 5", "q:render 12", "q:dead 1", // очереди
+		"60", "38", "итого", "40%", // aggregates and totals
+		"q:dns 5", "q:render 12", "q:dead 1", // queues
 		"доменов/с          1.0   (3600 проверено с начала суток, прошло 1ч 00м)",
 		"HTTP-результатов/с 2.0   (7200 за окно темпа 1ч 00м)",
 		"рендеров/с         1.0   (3600 с итоговым DOM за то же окно)",
@@ -144,9 +145,9 @@ func TestWriteStatusTable(t *testing.T) {
 		}
 	}
 
-	// Итог выровнен по правому краю числовых колонок: ширина колонки
-	// «всего» — не меньше самого длинного значения (100), итого (110)
-	// расширяет её; строка итога заканчивается числами done.
+	// The totals row is right-aligned with the numeric columns: the width
+	// of the total column is at least the longest value (100); the
+	// totals (110) widen it; the totals row ends with the done numbers.
 	for _, line := range strings.Split(got, "\n") {
 		if strings.HasPrefix(line, "итого") {
 			if !strings.HasSuffix(line, "38") {
@@ -159,11 +160,11 @@ func TestWriteStatusTable(t *testing.T) {
 	}
 }
 
-// TestWriteStatusTableDegraded — Redis недоступен: очереди «н/д», сводка
-// по БД печатается; пустой цикл помечается завершённым.
+// TestWriteStatusTableDegraded — Redis is unavailable: queues are "n/a",
+// the DB summary is printed; an empty cycle is marked as completed.
 func TestWriteStatusTableDegraded(t *testing.T) {
 	_, tot, thr, _ := statusTestSnapshot()
-	rates := status.ComputeRates(thr, 0, 0) // цикл пуст
+	rates := status.ComputeRates(thr, 0, 0) // the cycle is empty
 
 	var b bytes.Buffer
 	writeStatusTable(&b, nil, tot, thr, rates, nil)
@@ -179,7 +180,7 @@ func TestWriteStatusTableDegraded(t *testing.T) {
 		}
 	}
 
-	// Короткое окно суток — скорость и ETA честно «н/д».
+	// A short day window — the rate and the ETA honestly "n/a".
 	thr = status.Throughput{ElapsedSec: 300, ResultsHour: 0}
 	rates = status.ComputeRates(thr, 10, 0)
 	b.Reset()
@@ -195,9 +196,9 @@ func TestWriteStatusTableDegraded(t *testing.T) {
 	}
 }
 
-// TestWriteStatusJSON — машинный вывод: поля зон/итога/очередей/темпа,
-// округление скоростей, null для «н/д» (nil-карта очередей, скорости
-// без окна, ETA без скорости).
+// TestWriteStatusJSON — machine output: the zone/totals/queues/throughput
+// fields, rate rounding, null for "n/a" (a nil queue map, rates without
+// a window, an ETA without a rate).
 func TestWriteStatusJSON(t *testing.T) {
 	zones, tot, thr, rates := statusTestSnapshot()
 	lens := map[string]int64{"q:dns": 5, "q:http": 0, "q:render": 12, "q:analyze": 3, "q:dead": 1}
@@ -252,8 +253,8 @@ func TestWriteStatusJSON(t *testing.T) {
 	if doc.Throughput.DoneToday != 3600 || doc.Throughput.ElapsedSec != 3600 {
 		t.Errorf("throughput = %+v", doc.Throughput)
 	}
-	// Длина окна корзин темпа — в wire-формате (T-203): машинный
-	// потребитель видит, чему кратна сумма results_hour.
+	// The length of the rate bucket window is in the wire format (T-203):
+	// a machine consumer sees what the results_hour sum is a multiple of.
 	if doc.Throughput.HourWindowSec != 3600 {
 		t.Errorf("hour_window_sec = %v, хочу 3600", doc.Throughput.HourWindowSec)
 	}
@@ -267,8 +268,8 @@ func TestWriteStatusJSON(t *testing.T) {
 		t.Errorf("eta_sec = %v, хочу 62", doc.Rates.ETASec)
 	}
 
-	// Деградация: короткое окно + недоступный Redis → null-поля, остаток
-	// без ETA; json при этом валиден.
+	// Degradation: a short window + unavailable Redis → null fields, the
+	// remainder without an ETA; the json stays valid.
 	b.Reset()
 	thr = status.Throughput{ElapsedSec: 300}
 	rates = status.ComputeRates(thr, 10, 0)
@@ -301,15 +302,17 @@ func TestWriteStatusJSON(t *testing.T) {
 	}
 }
 
-// --- роутинг/коды -------------------------------------------------------------------
+// --- routing/exit codes --------------------------------------------------------------
 
-// TestRunStatus — путь выполнения без инфраструктуры: команды нужен
-// конфиг (DSN PostgreSQL, Redis) — при его отсутствии ошибка выполнения
-// (код 1) до соединений (стиль TestRunReanalyze); --json не ломает путь.
+// TestRunStatus — the execution path without infrastructure: the command
+// needs a config (the PostgreSQL DSN, Redis) — without one it is an
+// execution error (code 1) before connections (the TestRunReanalyze
+// style); --json does not break the path.
 func TestRunStatus(t *testing.T) {
-	// Явно отсутствующий конфиг-файл: детерминированный отказ до любых
-	// соединений (в контейнере tools переменные CRAWLER_* могли бы собрать
-	// конфигурацию из окружения — тест не должен ходить в живой стек).
+	// An explicitly missing config file: a deterministic failure before
+	// any connections (in the tools container the CRAWLER_* variables
+	// could assemble a configuration from the environment — the test must
+	// not touch the live stack).
 	t.Setenv("CRAWLER_CONFIG", filepath.Join(t.TempDir(), "missing.yaml"))
 
 	var stdout, stderr bytes.Buffer
@@ -335,11 +338,11 @@ func TestRunStatus(t *testing.T) {
 	}
 }
 
-// TestStatusHelpMentionsStreams — справка перечисляет все стримы и ETA
-// (содержание целиком проверяет TestRunHelpPerCommand в main_test.go);
-// источник темпа — часовые корзины (T-203): справка не должна обещать
-// живой «последний час» по subdomain_results (устаревший текст — находка
-// ревью T-203 P2-1).
+// TestStatusHelpMentionsStreams — the help lists all streams and the ETA
+// (TestRunHelpPerCommand in main_test.go checks the full content); the
+// throughput source is the hour buckets (T-203): the help must not promise
+// a live "last hour" over subdomain_results (an outdated text — the T-203
+// P2-1 review finding).
 func TestStatusHelpMentionsStreams(t *testing.T) {
 	for _, s := range status.Streams {
 		if !strings.Contains(statusHelp, s) {

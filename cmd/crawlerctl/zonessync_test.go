@@ -1,13 +1,14 @@
-// Юнит-тесты crawlerctl zones sync (T-125, этап 14) на фейковом пуле
-// (db.DB) и httptest-сервере — без БД и сети. Проверяются разбор среза
-// IANA (версия из первого комментария, верхний регистр, unicode→punycode,
-// дедуп, мусор с номером строки), точные SQL-тексты и параметры (контракт,
-// стиль zones_test.go) и живая семантика фейка: пакетная вставка добавляет
-// только новые зоны включёнными, существующие не меняются вовсе, без
-// --deactivate-missing зоны БД не выключаются, с флагом выключаются
-// отсутствующие в срезе (идемпотентно, с отчётом); e2e run() — коды
-// возврата и контексты ошибок по образцу соседних команд. Поведение
-// против живых PostgreSQL/data.iana.org — dev-окружение (make shell).
+// Unit tests for crawlerctl zones sync (T-125, stage 14) on a fake pool
+// (db.DB) and an httptest server — without a DB and the network. Checked:
+// the IANA slice parsing (the version from the first comment, upper case,
+// unicode→punycode, dedup, junk with a line number), the exact SQL texts
+// and parameters (a contract, the zones_test.go style) and the fake's live
+// semantics: the batch insert adds only new zones enabled, existing ones
+// are not touched at all, without --deactivate-missing DB zones are not
+// disabled, with the flag the ones missing from the slice are disabled
+// (idempotently, with a report); the e2e run() — exit codes and error
+// contexts modeled on the neighboring commands. Behavior against live
+// PostgreSQL/data.iana.org — the dev environment (make shell).
 package main
 
 import (
@@ -31,10 +32,10 @@ import (
 	"crawler/internal/db"
 )
 
-// --- SQL-контракты ----------------------------------------------------------
+// --- SQL contracts ---------------------------------------------------------
 
-// want-тексты дублируют константы: изменение SQL без обновления ожиданий
-// (или наоборот) валит тест громко.
+// The want texts duplicate the constants: a SQL change without updating
+// the expectations (or vice versa) fails the test loudly.
 const wantZonesSyncInsert = "INSERT INTO zones (name, name_unicode, is_active) " +
 	"SELECT u.name, nullif(u.unicode, ''), true " +
 	"FROM unnest($1::text[], $2::text[]) AS u(name, unicode) " +
@@ -56,12 +57,12 @@ func TestZonesSyncSQLContract(t *testing.T) {
 	}
 }
 
-// --- парсер -------------------------------------------------------------------
+// --- parser ------------------------------------------------------------------
 
 func TestParseZoneList(t *testing.T) {
-	// Мини-копия формата среза: комментарий версии, верхний регистр,
-	// unicode- и punycode-написания одной зоны (дедуп после нормализации),
-	// хвостовой комментарий и пустые строки.
+	// A mini copy of the slice format: a version comment, upper case,
+	// unicode and punycode spellings of one zone (dedup after
+	// normalization), a trailing comment and empty lines.
 	src := "# Version 2026101900, Last Updated Sun Oct 19 07:07:01 2026 UTC\n" +
 		"AAA\nCOM\nOrg\nРФ\nXN--P1AI\n# хвостовой комментарий — не версия\n\n"
 	list, err := parseZoneList([]byte(src))
@@ -71,7 +72,7 @@ func TestParseZoneList(t *testing.T) {
 	if list.Version != "2026101900" {
 		t.Errorf("версия = %q, хочу 2026101900", list.Version)
 	}
-	want := []string{"aaa", "com", "org", "xn--p1ai"} // РФ и XN--P1AI — одна зона
+	want := []string{"aaa", "com", "org", "xn--p1ai"} // XN--P1AI and its unicode spelling converge into one
 	if !reflect.DeepEqual(list.Zones, want) {
 		t.Errorf("зоны = %v, хочу %v", list.Zones, want)
 	}
@@ -84,7 +85,7 @@ func TestParseZoneListVersion(t *testing.T) {
 	cases := map[string]string{
 		"# Version 2026101900, Last Updated Sun Oct 19 07:07:01 2026 UTC": "2026101900",
 		"# Version 42":  "42",
-		"# свой список": "свой список", // не-версионный комментарий — целиком
+		"# свой список": "свой список", // a non-version comment — in full
 		"#":             "",
 	}
 	for comment, want := range cases {
@@ -97,7 +98,7 @@ func TestParseZoneListVersion(t *testing.T) {
 			t.Errorf("версия из %q = %q, хочу %q", comment, list.Version, want)
 		}
 	}
-	// Файл без комментариев вовсе.
+	// A file without comments at all.
 	list, err := parseZoneList([]byte("COM\nORG\n"))
 	if err != nil {
 		t.Fatalf("parseZoneList без комментария: %v", err)
@@ -105,7 +106,7 @@ func TestParseZoneListVersion(t *testing.T) {
 	if list.Version != "" {
 		t.Errorf("версия = %q, хочу пустую", list.Version)
 	}
-	// Комментарий после строк зон — не шапка, версией не становится.
+	// A comment after the zone lines — not a header, does not become the version.
 	list, err = parseZoneList([]byte("COM\n# поздний комментарий\nORG\n"))
 	if err != nil {
 		t.Fatalf("parseZoneList с поздним комментарием: %v", err)
@@ -116,8 +117,9 @@ func TestParseZoneListVersion(t *testing.T) {
 }
 
 func TestParseZoneListGarbageLine(t *testing.T) {
-	// Мусор — ошибка с номером строки (нумерация всех строк файла),
-	// не тихий скип: строка 4 после комментария, валидной зоны и пустой.
+	// Junk — an error with the line number (the numbering covers all file
+	// lines), not a silent skip: line 4 after the comment, a valid zone
+	// and an empty line.
 	src := "# Version 1\nCOM\n\nbad!!zone\nORG\n"
 	_, err := parseZoneList([]byte(src))
 	if err == nil || !strings.Contains(err.Error(), "строка 4") {
@@ -141,8 +143,8 @@ func TestParseZoneListNoZones(t *testing.T) {
 }
 
 func TestParseZoneListCRLF(t *testing.T) {
-	// Windows-концы строк (файл могли править на хосте) — TrimSpace
-	// снимает \r до нормализации.
+	// Windows line endings (the file could have been edited on a host) —
+	// TrimSpace removes \r before normalization.
 	list, err := parseZoneList([]byte("# Version 2026101900\r\nCOM\r\nORG\r\n"))
 	if err != nil {
 		t.Fatalf("parseZoneList CRLF: %v", err)
@@ -152,7 +154,7 @@ func TestParseZoneListCRLF(t *testing.T) {
 	}
 }
 
-// --- загрузка -----------------------------------------------------------------
+// --- download ------------------------------------------------------------------
 
 func TestFetchZoneList(t *testing.T) {
 	body := "# Version 2026101900\nCOM\nORG\n"
@@ -161,7 +163,7 @@ func TestFetchZoneList(t *testing.T) {
 		case "/ok":
 			_, _ = w.Write([]byte(body))
 		case "/big":
-			_, _ = w.Write(bytes.Repeat([]byte("a\n"), 600*1024)) // > 1 МиБ
+			_, _ = w.Write(bytes.Repeat([]byte("a\n"), 600*1024)) // > 1 MiB
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -184,15 +186,15 @@ func TestFetchZoneList(t *testing.T) {
 		!strings.Contains(err.Error(), "больше лимита") {
 		t.Errorf("ошибка потолка = %v, хочу «больше лимита»", err)
 	}
-	// Недостижимый адрес — ошибка загрузки (таймаут/отказ соединения).
+	// An unreachable address — a download error (timeout / connection refusal).
 	if _, err := fetchZoneList(context.Background(), "http://127.0.0.1:1/tlds.txt"); err == nil ||
 		!strings.Contains(err.Error(), "загрузка") {
 		t.Errorf("ошибка соединения = %v, хочу контекст загрузки", err)
 	}
 }
 
-// TestReadZoneListFile — офлайн-путь --file с тем же потолком размера,
-// что и загрузка по URL: --file и --url — один и тот же вход.
+// TestReadZoneListFile — the offline --file path with the same size cap
+// as the URL download: --file and --url are the same input.
 func TestReadZoneListFile(t *testing.T) {
 	dir := t.TempDir()
 	small := filepath.Join(dir, "tlds.txt")
@@ -219,14 +221,14 @@ func TestReadZoneListFile(t *testing.T) {
 	}
 }
 
-// --- фейковый пул (db.DB) -------------------------------------------------------
+// --- fake pool (db.DB) ----------------------------------------------------------
 
-// syncPool — db.DB без БД: живая семантика SQL команд zones sync —
-// пакетная вставка unnest с отсечением существующих имён (NOT EXISTS +
-// ON CONFLICT: новые зоны получают следующий id и is_active = true,
-// существующие не меняются; RowsAffected — только вставленные) и
-// выключение отсутствующих в списке (охрана is_active — повтор 0 строк;
-// RETURNING только фактически выключенных).
+// syncPool — a db.DB without a DB: the live semantics of the zones sync
+// SQL — the unnest batch insert with existing-name filtering (NOT EXISTS +
+// ON CONFLICT: new zones get the next id and is_active = true, existing
+// ones are not changed; RowsAffected — only inserted) and the disabling
+// of the ones missing from the list (the is_active guard — a repeat
+// disables 0 rows; RETURNING only of the actually disabled).
 type syncPool struct {
 	zones  []zoneRow
 	nextID int16
@@ -269,7 +271,7 @@ func (p *syncPool) Exec(_ context.Context, sql string, args ...any) (pgconn.Comm
 		inserted := 0
 		for i, name := range names {
 			if p.zoneIndex(name) >= 0 {
-				continue // уже есть: NOT EXISTS отсеял до вставки
+				continue // already there: NOT EXISTS filtered it before the insert
 			}
 			p.zones = append(p.zones, zoneRow{id: p.nextID, name: name, nameUnicode: unicodes[i], active: true})
 			p.nextID++
@@ -296,15 +298,15 @@ func (p *syncPool) Query(_ context.Context, sql string, args ...any) (pgx.Rows, 
 		}
 		var off []zoneRow
 		for i := range p.zones {
-			if p.zones[i].active && !inFile[p.zones[i].name] { // охрана is_active
+			if p.zones[i].active && !inFile[p.zones[i].name] { // the is_active guard
 				p.zones[i].active = false
 				off = append(off, p.zones[i])
 			}
 		}
 		sort.Slice(off, func(i, j int) bool { return off[i].name < off[j].name })
-		// Строки — ровно колонки RETURNING (id, name, name_unicode): фейк
-		// зеркалит SQL, а не приёмники Scan — рассинхрон валит тест здесь,
-		// а не на живой БД.
+		// The rows — exactly the RETURNING columns (id, name, name_unicode):
+		// the fake mirrors the SQL, not the Scan destinations — a desync
+		// fails the test here, not on the live DB.
 		rows := make([][]any, len(off))
 		for i, z := range off {
 			rows[i] = []any{z.id, z.name, z.nameUnicode}
@@ -315,7 +317,7 @@ func (p *syncPool) Query(_ context.Context, sql string, args ...any) (pgx.Rows, 
 	}
 }
 
-// zoneIndex — индекс зоны по имени (вызывается под мьютексом пула).
+// zoneIndex — the index of a zone by name (called under the pool mutex).
 func (p *syncPool) zoneIndex(name string) int {
 	for i := range p.zones {
 		if p.zones[i].name == name {
@@ -325,12 +327,12 @@ func (p *syncPool) zoneIndex(name string) int {
 	return -1
 }
 
-// --- запись: вставка ---------------------------------------------------------
+// --- write: insert ------------------------------------------------------------
 
-// syncSampleList — срез поверх сида newSyncPool: com/org/xn--p1ai новые,
-// example.test и xn--80adxhks уже есть, crawl.test отсутствует (кандидат
-// на --deactivate-missing). Разбирается настоящим парсером — заодно
-// проверяется связка unicode→punycode→unicode-колонка.
+// syncSampleList — a slice over the newSyncPool seed: com/org/xn--p1ai
+// are new, example.test and xn--80adxhks already exist, crawl.test is
+// missing (a candidate for --deactivate-missing). Parsed by the real
+// parser — which also checks the unicode→punycode→unicode-column chain.
 func syncSampleList(t *testing.T) zoneListFile {
 	t.Helper()
 	src := "# Version 2026101900, Last Updated Sun Oct 19 07:07:01 2026 UTC\n" +
@@ -362,8 +364,8 @@ func TestZonesSyncRun(t *testing.T) {
 		t.Errorf("без --deactivate-missing отчёта о выключении быть не должно:\n%s", got)
 	}
 
-	// Одна пакетная вставка: имена в порядке файла, unicode — только
-	// XN--зоны (пустая строка для ASCII → NULL через nullif в SQL).
+	// A single batch insert: the names in file order, unicode — only for
+	// XN-- zones (an empty string for ASCII → NULL via nullif in SQL).
 	if len(pool.execs) != 1 {
 		t.Fatalf("Exec-вызовов %d, хочу 1 (одна вставка)", len(pool.execs))
 	}
@@ -378,8 +380,8 @@ func TestZonesSyncRun(t *testing.T) {
 		t.Errorf("unicode = %v, хочу %v", call.args[1], want)
 	}
 
-	// Новые зоны — включённые, с id за сидом; существующие не тронуты:
-	// example.test осталась выключенной, счётчики crawl.test прежними.
+	// New zones — enabled, with ids after the seed; existing ones are not
+	// touched: example.test stays disabled, the crawl.test counters unchanged.
 	for _, name := range []string{"com", "org", "xn--p1ai"} {
 		i := pool.zoneIndex(name)
 		if i < 0 {
@@ -397,15 +399,16 @@ func TestZonesSyncRun(t *testing.T) {
 		t.Errorf("crawl.test изменена: %+v — sync не трогает существующие", crawl)
 	}
 
-	// Без флага зоны БД не из среза не выключаются — UPDATE не выполнялся.
+	// Without the flag the DB zones missing from the slice are not
+	// disabled — no UPDATE was executed.
 	for _, q := range pool.queries {
 		if q.sql == zonesDeactivateMissingSQL {
 			t.Errorf("без --deactivate-missing выключения быть не должно: %v", q)
 		}
 	}
 
-	// Идемпотентность: повторный запуск с тем же срезом — 0 вставок,
-	// состояние пула прежнее.
+	// Idempotency: a repeated run with the same slice — 0 inserts, the
+	// pool state unchanged.
 	stdout.Reset()
 	if err := zonesSyncRun(context.Background(), pool, list, false, &stdout); err != nil {
 		t.Fatalf("повторный zonesSyncRun: %v", err)
@@ -427,16 +430,16 @@ func TestZonesSyncRunDeactivateMissing(t *testing.T) {
 		t.Fatalf("zonesSyncRun --deactivate-missing: %v", err)
 	}
 	got := stdout.String()
-	// crawl.test есть в БД, нет в срезе — выключена и перечислена;
-	// example.test нет в срезе, но она уже выключена — охрана is_active,
-	// в отчёт не попадает.
+	// crawl.test is in the DB but not in the slice — disabled and listed;
+	// example.test is not in the slice but is already disabled — the
+	// is_active guard, it does not get into the report.
 	if !strings.Contains(got, "выключено отсутствующих в срезе (retired TLD): 1: crawl.test") {
 		t.Errorf("вывод не содержит списка выключенных:\n%s", got)
 	}
 	if i := pool.zoneIndex("crawl.test"); i < 0 || pool.zones[i].active {
 		t.Error("crawl.test должна быть выключена")
 	}
-	// UPDATE выполнен один раз с полным списком зон среза.
+	// The UPDATE is executed once with the full zone list of the slice.
 	var deact []subCall
 	for _, q := range pool.queries {
 		if q.sql == zonesDeactivateMissingSQL {
@@ -450,7 +453,7 @@ func TestZonesSyncRunDeactivateMissing(t *testing.T) {
 		t.Errorf("аргумент выключения = %v, хочу %v", deact[0].args[0], want)
 	}
 
-	// Повторный запуск — идемпотентен: выключать больше нечего.
+	// A repeated run — idempotent: nothing left to disable.
 	stdout.Reset()
 	if err := zonesSyncRun(context.Background(), pool, list, true, &stdout); err != nil {
 		t.Fatalf("повторный zonesSyncRun: %v", err)
@@ -478,13 +481,13 @@ func TestZonesSyncRunErrors(t *testing.T) {
 	}
 }
 
-// --- команды через run ---------------------------------------------------------
+// --- commands via run -----------------------------------------------------------
 
-// TestRunZonesSyncExecution — путь выполнения zones sync без
-// инфраструктуры: чтение/разбор среза идут до конфигурации и пула, поэтому
-// отказ источника и мусорная строка — код 1 без упоминания конфигурации,
-// валидный срез — детерминированный отказ конфигурации (код 1); ошибки
-// использования (флаги, аргументы) — код 2.
+// TestRunZonesSyncExecution — the zones sync execution path without
+// infrastructure: the slice is read/parsed before the configuration and
+// the pool, so a source failure and a junk line — code 1 without any
+// configuration mention, a valid slice — a deterministic configuration
+// failure (code 1); usage errors (flags, arguments) — code 2.
 func TestRunZonesSyncExecution(t *testing.T) {
 	t.Setenv("CRAWLER_CONFIG", filepath.Join(t.TempDir(), "missing.yaml"))
 
@@ -532,9 +535,9 @@ func TestRunZonesSyncExecution(t *testing.T) {
 	}
 }
 
-// TestRunZonesSyncURL — источник --url: успешная загрузка доходит до
-// конфигурации (отказ в ней), отказ источника (HTTP 500) — код 1 с
-// контекстом загрузки до обращения к конфигурации.
+// TestRunZonesSyncURL — the --url source: a successful download reaches
+// the configuration (fails in it), a source failure (HTTP 500) — code 1
+// with the download context before touching the configuration.
 func TestRunZonesSyncURL(t *testing.T) {
 	t.Setenv("CRAWLER_CONFIG", filepath.Join(t.TempDir(), "missing.yaml"))
 

@@ -1,12 +1,13 @@
 // ---------------------------------------------------------------- zones collapse
 //
-// crawlerctl zones collapse (T-196, ТЗТ §7): перенос данных 2LD-зон в
-// TLD-зоны — обслуживание окна простоя после перехода на TLD-семантику
-// зоны (internal/idn, T-194). Сухой запуск по умолчанию: инвентаризация
-// и план без изменений; --apply выполняет перенос батчами (§7.3).
-// Логика — internal/collapse (переиспользуется интеграционными тестами
-// против живой схемы); здесь — флаги, конфигурация (DSN и allowlist
-// ingest.allowed_zone_paths — его зоны не сворачиваются) и пул.
+// crawlerctl zones collapse (T-196, the tld-only-zones spec §7): moves
+// 2LD zone data into TLD zones — maintenance of the downtime window after
+// the switch to TLD zone semantics (internal/idn, T-194). A dry run is
+// the default: inventory and plan without changes; --apply performs the
+// move in batches (§7.3). The logic lives in internal/collapse (reused by
+// integration tests against the live schema); this file holds the flags,
+// the configuration (the DSN and the ingest.allowed_zone_paths allowlist —
+// its zones are not collapsed) and the pool.
 
 package main
 
@@ -20,10 +21,10 @@ import (
 	"crawler/internal/db"
 )
 
-// zonesCollapse — crawlerctl zones collapse: dry-run по умолчанию,
-// --apply/--skip-reconcile/--force (§7.1). Пул — как у соседних команд
-// управления (openManagePool, но конфиг нужен и для allowlist — читается
-// здесь же, стиль counters.go).
+// zonesCollapse — crawlerctl zones collapse: dry-run by default,
+// --apply/--skip-reconcile/--force (§7.1). The pool is as in the
+// neighboring management commands (openManagePool, but the config is
+// also needed for the allowlist — read here, counters.go style).
 func zonesCollapse(args []string, stdout, stderr io.Writer) error {
 	fs := newFlagSet("zones collapse")
 	apply := fs.Bool("apply", false, "выполнить перенос (без флага — dry-run: инвентаризация и план)")
@@ -39,8 +40,8 @@ func zonesCollapse(args []string, stdout, stderr io.Writer) error {
 		return usagef("zones collapse: --skip-reconcile дополняет --apply (dry-run ничего не переносит и не реконсилярует)")
 	}
 
-	// Одноразовый CLI: Ctrl-C/SIGTERM прерывают перенос — завершённые
-	// батчи остаются, повтор команды продолжает с места остановки.
+	// A one-off CLI command: Ctrl-C/SIGTERM interrupt the move — completed
+	// batches stay, a repeated command run continues from where it stopped.
 	ctx, stop := signalCtx()
 	defer stop()
 
@@ -49,8 +50,8 @@ func zonesCollapse(args []string, stdout, stderr io.Writer) error {
 		return fmt.Errorf("zones collapse: %w", err)
 	}
 	poolOpts := db.NewOptions(cfg.Postgres)
-	poolOpts.PoolSize = 2           // бюджет соединений ТЗ 6.3 — у сервисов
-	poolOpts.AppName = "crawlerctl" // метка в pg_stat_activity (T-177)
+	poolOpts.PoolSize = 2           // connection budget of spec 6.3 — as the services
+	poolOpts.AppName = "crawlerctl" // label in pg_stat_activity (T-177)
 	pool, err := db.Open(ctx, poolOpts)
 	if err != nil {
 		return fmt.Errorf("zones collapse: %w", err)
@@ -58,12 +59,12 @@ func zonesCollapse(args []string, stdout, stderr io.Writer) error {
 	defer pool.Close()
 
 	opts := collapse.Options{
-		Allowlist:     cfg.Ingest.AllowedZonePaths, // нормализация — internal/config (T-195)
+		Allowlist:     cfg.Ingest.AllowedZonePaths, // normalization — internal/config (T-195)
 		Apply:         *apply,
 		Force:         *force,
 		SkipReconcile: *skipReconcile,
-		// Warn о неудачной финальной уборке moving_ids (T-229) — в stderr,
-		// стиль manage.go (stdout — только отчёт команды).
+		// The warn about a failed final moving_ids cleanup (T-229) goes to
+		// stderr, manage.go style (stdout carries only the command report).
 		Log: slog.New(slog.NewTextHandler(stderr, nil)),
 	}
 	if err := collapse.Run(ctx, pool, opts, stdout); err != nil {

@@ -1,12 +1,13 @@
 // ---------------------------------------------------------------- near
 //
-// Команда разбора серой зоны Laravel-детекции (T-115, по итогам анализа
-// larasites): laravel_findings хранит все срабатывания правил независимо
-// от порога (T-071) — серая зона (min_score/2 <= score < min_score,
-// «почти-срабатывания») до этой команды видна только SQL-запросом руками.
-// Назначение — материал калибровки весов/порога (T-116/T-117) и разбор
-// спорных случаев: вывод домена, сработавших сигналов и evidence — как
-// раздел Laravel crawlerctl domain, но по множеству доменов.
+// A command for triaging the Laravel detection gray zone (T-115, following
+// the larasites analysis): laravel_findings stores all rule firings
+// regardless of the threshold (T-071) — the gray zone (min_score/2 <= score
+// < min_score, "near-firings") could only be seen by hand-written SQL
+// before this command. The purpose — calibration material for weights and
+// the threshold (T-116/T-117) and triage of contested cases: it prints the
+// domain, the fired signals and the evidence — like the Laravel section of
+// crawlerctl domain, but across many domains.
 
 package main
 
@@ -23,7 +24,7 @@ import (
 	"crawler/internal/model"
 )
 
-// nearHelp — справка crawlerctl near --help.
+// nearHelp — the crawlerctl near --help text.
 const nearHelp = `crawlerctl near — находки Laravel в серой зоне порога (T-115)
 
 Использование:
@@ -42,7 +43,7 @@ const nearHelp = `crawlerctl near — находки Laravel в серой зо�
 Коды возврата: 0 — успех, 1 — ошибка, 2 — использование.
 `
 
-// nearRow — строка выборки серой зоны: домен + находка (субдомен×вариант).
+// nearRow — a gray-zone selection row: domain + finding (subdomain×variant).
 type nearRow struct {
 	ZoneID      int16
 	DomainID    int64
@@ -54,16 +55,16 @@ type nearRow struct {
 	VerMin      string
 	VerMax      string
 	IsLaravel   bool
-	Signals     []domainSignal // формат laravel_findings.signals (T-071)
+	Signals     []domainSignal // the laravel_findings.signals format (T-071)
 }
 
-// nearSelectSQL — выборка серой зоны: findings сJOIN доменов и зон (имя
-// домена для вывода), субдомены — LEFT JOIN (бит закреплён за id навсегда,
-// но строка справочника в теории может отсутствовать у порченых данных —
-// COALESCE честнее падения). Зона — параметр-фильтр (NULL — все зоны):
-// значение оператора, не код схемы. Порядок — score DESC (самые близкие
-// к порогу первыми — главный материал разбора), доменный ключ в хвосте
-// детерминирует пачку.
+// nearSelectSQL — the gray-zone selection: findings JOINed with domains and
+// zones (the domain name for output), subdomains via LEFT JOIN (the bit is
+// bound to the id forever, but with corrupted data the reference row can in
+// theory be missing — COALESCE is more honest than a crash). The zone is a
+// filter parameter (NULL — all zones): an operator value, not schema logic.
+// The order is score DESC (the ones closest to the threshold first — the
+// main triage material), the domain key at the tail determines the batch.
 const nearSelectSQL = "SELECT f.zone_id, f.domain_id, d.label || '.' || z.name AS name, " +
 	"f.subdomain_id, COALESCE(s.label, '') AS subdomain, f.variant, " +
 	"f.score, COALESCE(f.ver_min, ''), COALESCE(f.ver_max, ''), f.is_laravel, f.signals " +
@@ -85,8 +86,8 @@ func cmdNear(args []string, stdout, stderr io.Writer) error {
 	}
 	zoneName := ""
 	if *zone != "" {
-		// Валидация входа — тем же конвейером, что и каталоги incoming
-		// (internal/idn.NormalizeZone): зона хранится в punycode.
+		// Input validation — through the same pipeline as the incoming
+		// directories (internal/idn.NormalizeZone): the zone is stored in punycode.
 		normalized, err := idn.NormalizeZone(*zone)
 		if err != nil {
 			return usagef("near: некорректное имя зоны %q: %v", *zone, err)
@@ -100,9 +101,10 @@ func cmdNear(args []string, stdout, stderr io.Writer) error {
 		return usagef("near: порог %v вне (0, 1)", *minScore)
 	}
 
-	// Порог по умолчанию синхронизирован с боевой конфигурацией (CLI-06,
-	// стиль test-rules): конфигурация здесь обязательна (нужен DSN), так
-	// что источник надёжнее дефолта — явный флаг важнее обоих.
+	// The default threshold is kept in sync with the production configuration
+	// (CLI-06, the test-rules style): the configuration is mandatory here
+	// (the DSN is needed), so that source is more reliable than the default —
+	// an explicit flag takes precedence over both.
 	cfg, err := config.Load()
 	if err != nil {
 		return fmt.Errorf("near: %w", err)
@@ -115,8 +117,8 @@ func cmdNear(args []string, stdout, stderr io.Writer) error {
 	defer stop()
 
 	poolOpts := db.NewOptions(cfg.Postgres)
-	poolOpts.PoolSize = 2           // бюджет соединений ТЗ 6.3 — у сервисов
-	poolOpts.AppName = "crawlerctl" // метка в pg_stat_activity (T-177)
+	poolOpts.PoolSize = 2           // connection budget of spec 6.3 — as the services
+	poolOpts.AppName = "crawlerctl" // label in pg_stat_activity (T-177)
 	pool, err := db.Open(ctx, poolOpts)
 	if err != nil {
 		return fmt.Errorf("near: %w", err)
@@ -160,7 +162,7 @@ func cmdNear(args []string, stdout, stderr io.Writer) error {
 	return nil
 }
 
-// nearFetch выполняет выборку и разбирает signals каждой строки.
+// nearFetch runs the selection and parses the signals of each row.
 func nearFetch(ctx context.Context, pool db.DB, zoneID *int16, minScore float64) ([]nearRow, error) {
 	var zoneArg any
 	if zoneID != nil {
@@ -196,8 +198,8 @@ func nearFetch(ctx context.Context, pool db.DB, zoneID *int16, minScore float64)
 	return res, nil
 }
 
-// nearPrintRow — вывод одной находки: строка домена + сигналы с evidence
-// (стиль раздела Laravel crawlerctl domain / test-rules).
+// nearPrintRow — prints one finding: a domain line + signals with evidence
+// (the style of the Laravel section of crawlerctl domain / test-rules).
 func nearPrintRow(w io.Writer, r nearRow) {
 	sub := r.Subdomain
 	if sub == "" {

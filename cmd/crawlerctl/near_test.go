@@ -1,9 +1,10 @@
-// Юнит-тесты crawlerctl near (T-115) на фейковом pgx-пуле: точный
-// SQL-текст выборки (контракт, стиль status_test.go), живая семантика
-// фейка (диапазон серой зоны, фильтр зоны, сортировка score DESC,
-// расшифровка signals), вывод строк и сигналов; run() без конфигурации —
-// ошибка выполнения до соединений. Поведение против живой БД —
-// dev-окружение (crawlerctl near на dev-стеке).
+// Unit tests for crawlerctl near (T-115) on a fake pgx pool: the exact
+// SQL text of the selection (a contract, the status_test.go style), the
+// fake's live semantics (the gray-zone range, the zone filter, the
+// score DESC sort, the signals decoding), the row and signal output;
+// run() without a configuration — an execution error before connections.
+// Behavior against the live DB — the dev environment (crawlerctl near on
+// the dev stack).
 package main
 
 import (
@@ -23,7 +24,7 @@ import (
 	"crawler/internal/db"
 )
 
-// wantNearSelectSQL — ожидаемый текст выборки серой зоны.
+// wantNearSelectSQL — the expected gray-zone selection text.
 const wantNearSelectSQL = "SELECT f.zone_id, f.domain_id, d.label || '.' || z.name AS name, " +
 	"f.subdomain_id, COALESCE(s.label, '') AS subdomain, f.variant, " +
 	"f.score, COALESCE(f.ver_min, ''), COALESCE(f.ver_max, ''), f.is_laravel, f.signals " +
@@ -35,9 +36,9 @@ const wantNearSelectSQL = "SELECT f.zone_id, f.domain_id, d.label || '.' || z.na
 	"AND f.score >= $2::real AND f.score < $3::real " +
 	"ORDER BY f.score DESC, f.zone_id, f.domain_id, f.subdomain_id, f.variant"
 
-// --- фейковый пул (db.DB) ----------------------------------------------------
+// --- fake pool (db.DB) -------------------------------------------------------
 
-// nearSeed — находка в фейке: домен + score + signals.
+// nearSeed — a finding in the fake: domain + score + signals.
 type nearSeed struct {
 	zone       int16
 	domain     int64
@@ -49,12 +50,13 @@ type nearSeed struct {
 	verMin     string
 	verMax     string
 	isLaravel  bool
-	signalsJxn string // JSON массива signals
+	signalsJxn string // JSON of the signals array
 }
 
-// nearPool — db.DB без БД: живая семантика nearSelectSQL (фильтры зоны и
-// диапазона, ORDER BY score DESC; доменный ключ в хвосте сортировки
-// фейком не моделируется — score сидов в тестах уникальны).
+// nearPool — a db.DB without a DB: the live semantics of nearSelectSQL
+// (the zone and range filters, ORDER BY score DESC; the domain key at the
+// sort tail is not modeled by the fake — seed scores in the tests are
+// unique).
 type nearPool struct {
 	seeds []nearSeed
 
@@ -91,7 +93,7 @@ func (p *nearPool) Query(ctx context.Context, sql string, args ...any) (pgx.Rows
 	return p.selectRows(args), nil
 }
 
-// selectRows применяет семантику nearSelectSQL к сидам.
+// selectRows applies the nearSelectSQL semantics to the seeds.
 func (p *nearPool) selectRows(args []any) pgx.Rows {
 	var zoneArg *int16
 	if args[0] != nil {
@@ -120,18 +122,18 @@ func (p *nearPool) selectRows(args []any) pgx.Rows {
 	return statusRowsOf(rows...)
 }
 
-// --- тесты --------------------------------------------------------------------
+// --- tests --------------------------------------------------------------------
 
-// TestNearSQLContract — текст выборки зафиксирован: стартовые столбцы,
-// JOIN-ы, фильтры диапазона и зоны, порядок.
+// TestNearSQLContract — the selection text is pinned: the leading columns,
+// the JOINs, the range and zone filters, the order.
 func TestNearSQLContract(t *testing.T) {
 	if nearSelectSQL != wantNearSelectSQL {
 		t.Errorf("nearSelectSQL:\n%s\nwant:\n%s", nearSelectSQL, wantNearSelectSQL)
 	}
 }
 
-// TestNearFetch — живая семантика фейка: диапазон серой зоны, фильтр
-// зоны, сортировка score DESC, разбор signals.
+// TestNearFetch — the fake's live semantics: the gray-zone range, the
+// zone filter, the score DESC sort, the signals parsing.
 func TestNearFetch(t *testing.T) {
 	pool := &nearPool{
 		seeds: []nearSeed{
@@ -141,7 +143,7 @@ func TestNearFetch(t *testing.T) {
 				signalsJxn: `[{"rule":"meta_generator","weight":0.3,"evidence":"Laravel"}]`},
 			{zone: 5, domain: 13, name: "gamma.org", subID: 1, sub: "www", score: 0.40,
 				signalsJxn: `[{"rule":"welcome_page","weight":0.4,"evidence":"5.x"}]`},
-			// Вне диапазона: слишком слабая и подтверждённая.
+			// Out of range: too weak and already confirmed.
 			{zone: 3, domain: 14, name: "weak.com", score: 0.25, signalsJxn: `[]`},
 			{zone: 3, domain: 15, name: "strong.com", score: 0.65, signalsJxn: `[]`},
 		},
@@ -161,7 +163,7 @@ func TestNearFetch(t *testing.T) {
 		t.Errorf("signals alpha.com = %+v, хочу два правила с разбором JSON", rows[0].Signals)
 	}
 
-	// Фильтр зоны: только com.
+	// Zone filter: com only.
 	zoneID := int16(3)
 	rows, err = nearFetch(context.Background(), pool, &zoneID, 0.6)
 	if err != nil {
@@ -176,7 +178,7 @@ func TestNearFetch(t *testing.T) {
 		}
 	}
 
-	// Параметры первого вызова — зона nil (все) и границы диапазона.
+	// The parameters of the first call — a nil zone (all) and the range bounds.
 	first := pool.args[0]
 	if first[0] != nil {
 		t.Errorf("args[0] = %v, хочу nil для зоны без фильтра", first[0])
@@ -189,8 +191,8 @@ func TestNearFetch(t *testing.T) {
 	}
 }
 
-// TestNearFetchErrors — ошибки БД и пустой справочник зон не роняют
-// корректный путь, но завершают команду.
+// TestNearFetchErrors — DB errors and a garbage signals payload do not
+// crash a correct path but finish the command.
 func TestNearFetchErrors(t *testing.T) {
 	t.Run("ошибка БД", func(t *testing.T) {
 		pool := &nearPool{queryErr: errors.New("бд недоступна")}
@@ -209,8 +211,8 @@ func TestNearFetchErrors(t *testing.T) {
 	})
 }
 
-// TestNearPrintRow — формат вывода: домен, субдомен/вариант, score,
-// версии, сигналы с evidence; пустая метка — апекс.
+// TestNearPrintRow — the output format: domain, subdomain/variant, score,
+// versions, signals with evidence; an empty label — the apex.
 func TestNearPrintRow(t *testing.T) {
 	var buf bytes.Buffer
 	nearPrintRow(&buf, nearRow{
@@ -239,8 +241,8 @@ func TestNearPrintRow(t *testing.T) {
 	}
 }
 
-// TestRunNear — без конфигурации (нет YAML и окружения) команда завершается
-// кодом 1 до соединений (стиль TestRunStatus).
+// TestRunNear — without a configuration (no YAML and no environment) the
+// command exits with code 1 before connections (the TestRunStatus style).
 func TestRunNear(t *testing.T) {
 	t.Setenv("CRAWLER_CONFIG", filepath.Join(t.TempDir(), "missing.yaml"))
 
@@ -257,7 +259,7 @@ func TestRunNear(t *testing.T) {
 	}
 }
 
-// TestRunNearUsage — порог вне (0, 1) и лишние аргументы — код 2.
+// TestRunNearUsage — a threshold outside (0, 1) and extra arguments — exit code 2.
 func TestRunNearUsage(t *testing.T) {
 	t.Setenv("CRAWLER_CONFIG", filepath.Join(t.TempDir(), "missing.yaml"))
 

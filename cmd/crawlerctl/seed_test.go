@@ -1,5 +1,6 @@
-// Тест crawlerctl seed: bulk-набор пишется потоково (CLI-08) — содержимое
-// и счётчик те же, что дали бы материализованные строки.
+// Test for crawlerctl seed: the bulk set is written in a streaming fashion
+// (CLI-08) — the content and the counter are the same as materialized
+// strings would give.
 package main
 
 import (
@@ -15,8 +16,8 @@ import (
 	"crawler/internal/idn"
 )
 
-// seedRepoRoot — корень репозитория (стиль cmd/testbedgen): файлы стенда
-// читаются тестами согласованности конфигурации dev-окружения.
+// seedRepoRoot — the repository root (cmd/testbedgen style): the bench
+// files are read by dev-environment configuration consistency tests.
 func seedRepoRoot(t *testing.T) string {
 	t.Helper()
 	root, err := filepath.Abs(filepath.Join("..", ".."))
@@ -26,8 +27,8 @@ func seedRepoRoot(t *testing.T) string {
 	return root
 }
 
-// TestSeedBulk — файл seed-bulk.txt содержит ровно N строк b%08d.<зона>
-// по порядку, счётчик итога учитывает их; повторы идемпотентны.
+// TestSeedBulk — the seed-bulk.txt file contains exactly N b%08d.<zone>
+// lines in order; the final counter includes them; repeats are idempotent.
 func TestSeedBulk(t *testing.T) {
 	dir := t.TempDir()
 	scen := filepath.Join(dir, "scenarios.yaml")
@@ -62,7 +63,7 @@ func TestSeedBulk(t *testing.T) {
 	if lines[0] != "b00000000.crawl.test" || lines[bulk-1] != "b00000999.crawl.test" {
 		t.Errorf("края набора = %q..%q, хочу b00000000..b00000999", lines[0], lines[bulk-1])
 	}
-	// Все строки уникальны и в зоне.
+	// All lines are unique and within the zone.
 	seen := make(map[string]bool, bulk)
 	for _, l := range lines {
 		if seen[l] {
@@ -75,19 +76,20 @@ func TestSeedBulk(t *testing.T) {
 	}
 }
 
-// TestSeedZonesAllowedInDevConfig — согласованность стенда и конфига dev
-// (Т-197): seed пишет в incoming/<зона>/add/ базовую зону сценариев и зоны
-// plain-блока scenarios.yaml. Все эти каталоги многоуровневые (зоны testbed
-// обслуживает coredns), значит каждый обязан входить в allowlist
-// ingest.allowed_zone_paths конфига dev-окружения — иначе TLD-семантика
-// приёма отправит файлы seed в failed/ и dev-шаг «make seed → ingest
-// обработал» сломается. Продуктовый конфиг (config.example.yaml) allowlist
-// не задаёт — там тестовых зон нет.
+// TestSeedZonesAllowedInDevConfig — bench/config.dev consistency
+// (T-197): seed writes the base scenario zone and the zones of the
+// plain block of scenarios.yaml into incoming/<zone>/add/. All these
+// directories are multi-level (the testbed zones are served by coredns),
+// hence each one must be in the ingest.allowed_zone_paths allowlist of
+// the dev-environment configuration — otherwise the TLD semantics of
+// ingest would send the seed files to failed/ and the dev step
+// "make seed → ingest processed" would break. The production config
+// (config.example.yaml) defines no allowlist — it has no test zones.
 func TestSeedZonesAllowedInDevConfig(t *testing.T) {
 	root := seedRepoRoot(t)
 
-	// Конфиг dev-окружения валиден и несёт allowlist (нормализация —
-	// punycode нижним регистром — на стороне config.LoadFile).
+	// The dev-environment configuration is valid and carries an allowlist
+	// (normalization — punycode in lower case — is on the config.LoadFile side).
 	cfg, err := config.LoadFile(filepath.Join(root, "deploy", "docker", "config.dev.yaml"))
 	if err != nil {
 		t.Fatalf("config.LoadFile(config.dev.yaml): %v", err)
@@ -97,8 +99,8 @@ func TestSeedZonesAllowedInDevConfig(t *testing.T) {
 		allowed[z] = true
 	}
 
-	// Зоны, в которые пишет seed (cmdSeed): Zones[0] — базовая, далее —
-	// plain-блок. Формат scenarios.yaml — cmd/testbedgen.
+	// Zones seed writes to (cmdSeed): Zones[0] — the base one, then the
+	// plain block. The scenarios.yaml format — cmd/testbedgen.
 	raw, err := os.ReadFile(filepath.Join(root, "deploy", "docker", "testbed", "scenarios.yaml"))
 	if err != nil {
 		t.Fatal(err)

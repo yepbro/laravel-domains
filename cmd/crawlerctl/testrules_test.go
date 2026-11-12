@@ -1,6 +1,6 @@
-// Тест crawlerctl test-rules: порог is_laravel синхронизирован с
-// analyzer.laravel_min_score из конфигурации (CLI-06) — явный флаг важнее,
-// без конфигурации остаётся 0.6.
+// Test for crawlerctl test-rules: the is_laravel threshold is kept in sync
+// with analyzer.laravel_min_score from the configuration (CLI-06) — an
+// explicit flag takes precedence; without a configuration it stays 0.6.
 package main
 
 import (
@@ -11,9 +11,9 @@ import (
 	"testing"
 )
 
-// testRulesCorpus — минимальный корпус: одно правило html/Laravel весом
-// 0.7 и один положительный образец. Score 0.7 проходит порог 0.6
-// и не проходит 0.9 — различение источников порога.
+// testRulesCorpus — a minimal corpus: one html/Laravel rule with weight
+// 0.7 and one positive sample. Score 0.7 passes the 0.6 threshold
+// and fails 0.9 — distinguishing the threshold sources.
 func testRulesCorpus(t *testing.T) (rulesDir, samplesDir string) {
 	t.Helper()
 	root := t.TempDir()
@@ -42,8 +42,8 @@ func testRulesCorpus(t *testing.T) (rulesDir, samplesDir string) {
 	return rulesDir, samplesDir
 }
 
-// testRulesConfig — минимальная валидная конфигурация с заданным порогом
-// (остальное заполняют дефолты internal/config, обязателен только DSN).
+// testRulesConfig — a minimal valid configuration with the given threshold
+// (internal/config defaults fill in the rest; only the DSN is required).
 func testRulesConfig(t *testing.T, minScore string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "config.yaml")
@@ -57,10 +57,10 @@ func testRulesConfig(t *testing.T, minScore string) string {
 	return path
 }
 
-// TestRunTestRulesMinScore — порог is_laravel: дефолт берётся из
-// analyzer.laravel_min_score, явный флаг переопределяет конфигурацию,
-// без конфигурации — 0.6 (локальный офлайн-прогон). Образец score 0.7:
-// OK при пороге 0.6, FAIL при 0.9.
+// TestRunTestRulesMinScore — the is_laravel threshold: the default is
+// taken from analyzer.laravel_min_score, an explicit flag overrides the
+// configuration, without a configuration it is 0.6 (a local offline run).
+// A sample with score 0.7: OK at threshold 0.6, FAIL at 0.9.
 func TestRunTestRulesMinScore(t *testing.T) {
 	rulesDir, samplesDir := testRulesCorpus(t)
 
@@ -77,19 +77,19 @@ func TestRunTestRulesMinScore(t *testing.T) {
 		return code, stdout.String() + stderr.String()
 	}
 
-	// Дефолт — порог из конфигурации: 0.9 выше score 0.7 → FAIL.
+	// Default — the threshold from the configuration: 0.9 is above score 0.7 → FAIL.
 	code, out := runCorpus(testRulesConfig(t, "0.9"))
 	if code != exitError || !strings.Contains(out, "порог 0.90") || !strings.Contains(out, "FAIL") {
 		t.Errorf("конфиг 0.9 без флага: код = %d, хочу exitError с порогом 0.90 и FAIL:\n%s", code, out)
 	}
 
-	// Явный флаг важнее конфигурации: 0.6 → OK.
+	// An explicit flag takes precedence over the configuration: 0.6 → OK.
 	code, out = runCorpus(testRulesConfig(t, "0.9"), "--min-score", "0.6")
 	if code != exitOK || !strings.Contains(out, "порог 0.60") || !strings.Contains(out, "OK") {
 		t.Errorf("флаг 0.6 при конфиге 0.9: код = %d, хочу exitOK с порогом 0.60:\n%s", code, out)
 	}
 
-	// Конфигурации нет (локальный прогон без стека) — дефолт флага 0.6.
+	// No configuration (a local run without the stack) — the flag default 0.6.
 	code, out = runCorpus("")
 	if code != exitOK || !strings.Contains(out, "порог 0.60") || !strings.Contains(out, "OK") {
 		t.Errorf("без конфигурации: код = %d, хочу exitOK с порогом 0.60 (дефолт):\n%s", code, out)
