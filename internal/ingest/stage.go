@@ -1,19 +1,20 @@
-// Package ingest — загрузка валидированных строк входных файлов в БД
-// (этап 1, ТЗ 5.1/3.5).
+// Package ingest — loading validated lines of input files into the DB
+// (stage 1, spec 5.1/3.5).
 //
-// Staging-таблица ingest_stage (миграция 000004) принимает поток строк
-// одного файла пачками по ingest.batch_size (по умолчанию 50 000, ТЗ 5.1)
-// через COPY: каждая пачка — отдельная транзакция, память ограничена
-// размером пачки, отмена контекста между пачками не теряет законченные
-// пачки (ТЗ 3.4/3.5). Применение add/delete к domains — задачи T-018/T-019;
-// после применения партия очищается (ClearBatch).
+// The staging table ingest_stage (migration 000004) takes the stream of
+// lines of one file in chunks of ingest.batch_size (50,000 by default,
+// spec 5.1) via COPY: each chunk is a separate transaction, memory is
+// bounded by the chunk size, and cancelling the context between chunks
+// does not lose completed chunks (spec 3.4/3.5). Applying add/delete to
+// domains — tasks T-018/T-019; after applying, the batch is cleared
+// (ClearBatch).
 //
-// Идемпотентность (ТЗ 3.4, 5.1): партия идентифицируется batch_id —
-// время создания плюс случайность (T-098). Повторная загрузка той же
-// партии (перезапуск прерванной) сначала удаляет свои прежние строки
-// и копирует поток заново — данные не портятся и не дублируются, мусор
-// не накапливается. Параллельные загрузки (разные batch_id) не мешают
-// друг другу: очистка адресована только своей партии.
+// Idempotency (spec 3.4, 5.1): a batch is identified by batch_id — the
+// creation time plus randomness (T-098). Reloading the same batch
+// (restarting an interrupted one) first deletes its previous rows and
+// copies the stream anew — data is not corrupted or duplicated, junk
+// does not accumulate. Parallel loads (different batch_id) do not
+// interfere with each other: clearing targets only its own batch.
 package ingest
 
 import (
@@ -30,36 +31,35 @@ import (
 	"crawler/internal/model"
 )
 
-// BatchIDLen — размер идентификатора партии загрузки: 16 байт (128 бит).
+// BatchIDLen — the size of the load batch identifier: 16 bytes (128 bits).
 const BatchIDLen = 16
 
-// batchTimeLen — размер временно́го префикса идентификатора: старшие
-// 8 байт, микросекунды Unix (T-098).
+// batchTimeLen — the size of the time prefix of the identifier: the high
+// 8 bytes, Unix microseconds (T-098).
 const batchTimeLen = 8
 
-// compile-time: префикс времени помещается в идентификатор — срезы
-// id[:batchTimeLen] ниже иначе вышли бы за границы массива.
+// compile-time: the time prefix fits into the identifier — otherwise the
+// id[:batchTimeLen] slices below would go beyond the array bounds.
 var _ [BatchIDLen - batchTimeLen]struct{}
 
-// BatchID — идентификатор партии загрузки staging: BatchIDLen байт —
-// старшие batchTimeLen: микросекунды Unix времени создания партии
-// (big-endian), остальные: случайные байты (crypto/rand, NewBatchID).
-// Выдаётся один на загрузку файла, объединяет все COPY-пачки этой
-// загрузки и адресует очистку партии. Время в префиксе делает побайтовый
-// порядок (memcmp bytea в PostgreSQL) хронологическим: фоновая зачистка
-// осиротевших партий (CleanupStaleBatches, T-098) режет диапазон
-// batch_id по возрасту без колонки времени — и всё ещё сканом по
-// префиксу первичного ключа.
+// BatchID — the staging load batch identifier: BatchIDLen bytes — the
+// high batchTimeLen are the Unix microseconds of the batch creation time
+// (big-endian), the rest are random bytes (crypto/rand, NewBatchID).
+// Issued one per file load, it ties together all COPY chunks of this
+// load and addresses the batch clearing. The time in the prefix makes
+// the byte order (memcmp bytea in PostgreSQL) chronological: the
+// background cleanup of orphaned batches (CleanupStaleBatches, T-098)
+// cuts the batch_id range by age without a time column — and still by a
+// scan over the primary key prefix.
 type BatchID [BatchIDLen]byte
 
-// NewBatchID генерирует идентификатор партии с текущим временем создания.
+// NewBatchID generates a batch identifier with the current creation time.
 func NewBatchID() (BatchID, error) {
 	return newBatchIDAt(time.Now())
 }
 
-// newBatchIDAt — генерация идентификатора партии с заданным временем
-// создания (заглушка времени в тестах): временной префикс плюс
-// случайный хвост.
+// newBatchIDAt — generating a batch identifier with a given creation
+// time (time stubbing in tests): the time prefix plus a random tail.
 func newBatchIDAt(t time.Time) (BatchID, error) {
 	var id BatchID
 	binary.BigEndian.PutUint64(id[:batchTimeLen], uint64(t.UnixMicro()))
@@ -69,76 +69,84 @@ func newBatchIDAt(t time.Time) (BatchID, error) {
 	return id, nil
 }
 
-// batchIDBefore — граница «создана строго раньше момента t» в терминах
-// batch_id: идентификаторы партий, созданных до t, побайтово меньше
-// возвращаемого. Нулевой случайный хвост — минимальное значение своей
-// микросекунды, поэтому партии микросекунды t и моложе не задеваются.
+// batchIDBefore — the "created strictly before moment t" boundary in
+// batch_id terms: identifiers of batches created before t are byte-wise
+// smaller than the returned one. A zero random tail is the minimum
+// value of its microsecond, so batches of microsecond t and later are
+// not touched.
 func batchIDBefore(t time.Time) BatchID {
 	var id BatchID
 	binary.BigEndian.PutUint64(id[:batchTimeLen], uint64(t.UnixMicro()))
 	return id
 }
 
-// Batch — партия: загрузка строк одного входного файла в staging.
-// Строки зона-каталога принадлежат одной зоне (ТЗ 5.1: путь
-// <зона>/add|delete/*.txt), и зона задаётся на партии; строки зона-less
-// файла (add|delete/<файл>) несут зону каждая (Row.ZoneID — выведена из
-// имени, T-014/validate), ZoneID партии остаётся нулём. Операция у файла
-// одна, поэтому действие задаётся на партии
-// и пишется в каждую строку: применение (T-018/T-019) читает всё нужное из
-// самой строки staging без побочных справочников.
+// Batch — a batch: the load of lines of one input file into staging.
+// The lines of a zone directory belong to one zone (spec 5.1: the path
+// <zone>/add|delete/*.txt), and the zone is set on the batch; the lines
+// of a zone-less file (add|delete/<file>) each carry their zone
+// (Row.ZoneID — derived from the name, T-014/validate), the batch
+// ZoneID stays zero. The file has a single operation, so the action is
+// set on the batch and written into every line: applying (T-018/T-019)
+// reads everything it needs from the staging line itself, without side
+// reference tables.
 type Batch struct {
-	ID     BatchID      // идентификатор партии (NewBatchID)
-	ZoneID int16        // зона файла (zones.id); 0 — зона-less файл
-	Action model.Action // 1 add, 2 delete (ТЗ 5.1)
+	ID     BatchID      // the batch identifier (NewBatchID)
+	ZoneID int16        // the file zone (zones.id); 0 — a zone-less file
+	Action model.Action // 1 add, 2 delete (spec 5.1)
 }
 
-// Row — валидированная строка входного файла (проверка имён — T-016):
-// метка домена без зоны в punycode (ТЗ 5.2; может быть составной —
-// «магазин.рф.co.uk» в зоне co.uk даёт «xn--80aairftm.xn--p1ai»,
-// контракт internal/idn) и её позиция в файле. У зона-less файла строка
-// несёт и свою зону (ZoneID — zones.id, EnsureZone конвейера); у файла
-// зона-каталога ZoneID нулевой — зона берётся из партии.
+// Row — a validated line of an input file (name checking — T-016):
+// a domain label without a zone in punycode (spec 5.2; it may be
+// composite — "магазин.рф.co.uk" in the co.uk zone gives
+// "xn--80aairftm.xn--p1ai", the internal/idn contract) and its
+// position in the file. For a zone-less file the line also carries its
+// zone (ZoneID — zones.id, the pipeline EnsureZone); for a
+// zone-directory file ZoneID is zero — the zone is taken from the
+// batch.
 type Row struct {
 	Label  string
-	ZoneID int16 // зоны.id строки; 0 — из Batch.ZoneID
-	LineNo int64 // номер строки в исходном файле, с единицы
+	ZoneID int16 // the row's zones.id; 0 — from Batch.ZoneID
+	LineNo int64 // the line number in the source file, 1-based
 }
 
-// RowIter — источник строк потока: следующая строка либо io.EOF в конце.
-// Как и db.RowIter, позволяет читать данные лениво (построчно из файла),
-// не материализуя их целиком — память определяется размером пачки (ТЗ 3.5).
+// RowIter — the source of the line stream: the next line or io.EOF at
+// the end. Like db.RowIter, it allows reading data lazily (line by
+// line from the file) without materializing it entirely — memory is
+// determined by the chunk size (spec 3.5).
 type RowIter func() (Row, error)
 
-// StageTable / StageColumns — staging-таблица и колонки COPY в порядке
-// объявления миграции 000004; соответствие SQL — тестом контракта
-// TestStageTableContract (интеграционная проверка схемы — T-023).
+// StageTable / StageColumns — the staging table and the COPY columns in
+// the declaration order of migration 000004; the SQL correspondence is
+// checked by the TestStageTableContract contract test (the integration
+// schema check — T-023).
 var (
 	StageTable   = pgx.Identifier{"ingest_stage"}
 	StageColumns = []string{"batch_id", "zone_id", "label", "action", "line_no"}
 )
 
-// MaxLabelLen — предел длины метки домена: 63 октета в ASCII-форме
-// (ТЗ 5.2 п. 4). Здесь это дешёвый инвариант строки: слишком длинную метку
-// обязан отклонить валидатор потока (T-016).
+// MaxLabelLen — the domain label length limit: 63 octets in ASCII form
+// (spec 5.2 item 4). Here it is a cheap line invariant: the stream
+// validator (T-016) must reject a too long label.
 const MaxLabelLen = 63
 
-// clearStageSQL — очистка партии: ведущий batch_id первичного ключа
-// обслуживает скан по префиксу. Имя таблицы — из StageTable (экранирование
-// идентификатора, как в internal/db), единый источник для SQL и COPY.
+// clearStageSQL — batch clearing: the leading batch_id of the primary
+// key serves a prefix scan. The table name comes from StageTable
+// (identifier quoting, as in internal/db), a single source for SQL and
+// COPY.
 var clearStageSQL = "DELETE FROM " + StageTable.Sanitize() + " WHERE batch_id = $1"
 
-// Stage загружает поток валидированных строк в staging-таблицу пачками по
-// batchSize строк (ingest.batch_size, по умолчанию 50 000 — ТЗ 5.1) через
-// db.CopyFromStream: пачка — отдельная транзакция COPY, память ограничена
-// batchSize (ТЗ 3.5); отмена ctx между пачками прерывает загрузку, не
-// затрагивая законченные пачки (ТЗ 3.4). Возвращает число строк, попавших
-// в staging (без строк пачки, упавшей или отменённой).
+// Stage loads the stream of validated lines into the staging table in
+// chunks of batchSize rows (ingest.batch_size, 50,000 by default —
+// spec 5.1) via db.CopyFromStream: a chunk is a separate COPY
+// transaction, memory is bounded by batchSize (spec 3.5); cancelling
+// ctx between chunks interrupts the load without touching completed
+// chunks (spec 3.4). Returns the number of lines that made it into
+// staging (not counting the lines of a failed or cancelled chunk).
 //
-// Перед копированием удаляются прежние строки этой партии: повторный вызов
-// с тем же Batch.ID перезаписывает партию с чистого листа — данные не
-// дублируются и не портятся (идемпотентность повтора, ТЗ 3.4). Чужие
-// партии (другие batch_id) не затрагиваются.
+// Before copying, the previous rows of this batch are deleted: a repeat
+// call with the same Batch.ID rewrites the batch from scratch — data is
+// not duplicated or corrupted (the idempotency of a retry, spec 3.4).
+// Foreign batches (other batch_id) are not touched.
 func Stage(ctx context.Context, pool db.DB, b Batch, batchSize int, next RowIter) (int64, error) {
 	if b.ID == (BatchID{}) {
 		return 0, errors.New("ingest: партия без идентификатора (ingest.NewBatchID)")
@@ -153,10 +161,10 @@ func Stage(ctx context.Context, pool db.DB, b Batch, batchSize int, next RowIter
 		return 0, fmt.Errorf("ingest: размер пачки %d, минимум 1 (ingest.batch_size)", batchSize)
 	}
 
-	// Идемпотентность повтора (ТЗ 3.4): источник истины — входной файл,
-	// поэтому прерванная загрузка просто перезаливается целиком, а не
-	// дополняется: затираем свою прошлую партию (недогруженную либо уже
-	// применённую) и копируем поток заново.
+	// Retry idempotency (spec 3.4): the source of truth is the input
+	// file, so an interrupted load is simply reloaded in full, not
+	// appended to: we wipe our own previous batch (under-loaded or
+	// already applied) and copy the stream anew.
 	if _, err := ClearBatch(ctx, pool, b.ID); err != nil {
 		return 0, err
 	}
@@ -168,10 +176,10 @@ func Stage(ctx context.Context, pool db.DB, b Batch, batchSize int, next RowIter
 	return staged, nil
 }
 
-// ClearBatch удаляет из staging все строки партии и возвращает их число.
-// Вызывается Stage перед загрузкой (перезапись своей партии) и будущим
-// применением после завершения (T-018/T-019) — staging не растёт от файла
-// к файлу.
+// ClearBatch deletes from staging all rows of the batch and returns
+// their number. Called by Stage before loading (rewriting its own
+// batch) and by the future apply after completion (T-018/T-019) —
+// staging does not grow from file to file.
 func ClearBatch(ctx context.Context, pool db.DB, id BatchID) (int64, error) {
 	if id == (BatchID{}) {
 		return 0, errors.New("ingest: партия без идентификатора (ingest.NewBatchID)")
@@ -183,16 +191,18 @@ func ClearBatch(ctx context.Context, pool db.DB, id BatchID) (int64, error) {
 	return tag.RowsAffected(), nil
 }
 
-// rowIter адаптирует типизированный поток строк под db.RowIter: собирает
-// значения колонок COPY (в порядке StageColumns) и проверяет дешёвые
-// инварианты каждой строки — полная валидация имён делается до загрузки
-// (T-016). Проверки защищают staging от программных ошибок источника:
-// метка непустая и не-ASCII (это метка без зоны в punycode, ТЗ 5.2),
-// составной бывает (контракт internal/idn — точки допустимы), но каждая
-// её часть непустая и не длиннее MaxLabelLen (ТЗ 5.2 п. 4); номер строки
-// с единицы и строго растёт — уникальность (batch_id, line_no) внутри
-// партии до БД. Зона строки — Row.ZoneID (зона-less файл), при нулевой —
-// ZoneID партии (файл зона-каталога); обязана быть zones.id >= 1.
+// rowIter adapts the typed line stream to db.RowIter: it collects the
+// COPY column values (in StageColumns order) and checks cheap
+// per-line invariants — full name validation happens before loading
+// (T-016). The checks protect staging from programming errors of the
+// source: the label is non-empty and non-ASCII (it is a label without
+// a zone in punycode, spec 5.2); it may be composite (the internal/idn
+// contract — dots are allowed), but each of its parts is non-empty and
+// no longer than MaxLabelLen (spec 5.2 item 4); the line number is
+// 1-based and strictly grows — the (batch_id, line_no) uniqueness
+// within a batch is enforced before the DB. The line zone is
+// Row.ZoneID (a zone-less file), falling back to the batch ZoneID (a
+// zone-directory file); it must be a zones.id >= 1.
 func (b Batch) rowIter(next RowIter) db.RowIter {
 	var lastLine int64
 	return func() ([]any, error) {
@@ -224,9 +234,9 @@ func (b Batch) rowIter(next RowIter) db.RowIter {
 	}
 }
 
-// validLabelParts — составная метка допустима (контракт internal/idn,
-// ТЗ 5.2): каждая часть между точками — непустая метка DNS не длиннее
-// MaxLabelLen октет.
+// validLabelParts — a composite label is allowed (the internal/idn
+// contract, spec 5.2): each part between dots is a non-empty DNS label
+// no longer than MaxLabelLen octets.
 func validLabelParts(label string) bool {
 	start := 0
 	for i := 0; i <= len(label); i++ {
@@ -240,7 +250,7 @@ func validLabelParts(label string) bool {
 	return true
 }
 
-// isASCII — все октеты метки меньше 0x80 (punycode-форма, ТЗ 5.2).
+// isASCII — all octets of the label are below 0x80 (the punycode form, spec 5.2).
 func isASCII(s string) bool {
 	for i := 0; i < len(s); i++ {
 		if s[i] > 0x7f {

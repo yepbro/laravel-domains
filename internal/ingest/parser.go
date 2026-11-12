@@ -1,32 +1,33 @@
-// Package ingest — обработка входных файлов доменов (ТЗ 5.1).
+// Package ingest — processing of input domain files (spec 5.1).
 //
-// Потоковый построчный парсер — этап между наблюдением каталога
-// (internal/watch, T-013) и валидацией имён (T-016): читает io.Reader и
-// отдаёт значимые строки с номерами; по номерам rejected-лог (T-016) и
-// отчёт файла (T-021) указывают на реальную строку. Память не зависит от
-// размера файла (ТЗ 3.5): фиксированное окно чтения и накопитель одной
-// строки, файл целиком в память не собирается.
+// A streaming line-by-line parser — the stage between directory watching
+// (internal/watch, T-013) and name validation (T-016): it reads an
+// io.Reader and yields meaningful lines with their numbers; the numbers
+// let the rejected log (T-016) and the file report (T-021) point at the
+// real line. Memory does not depend on the file size (spec 3.5): a fixed
+// read window and an accumulator for a single line; the file is never
+// assembled in memory as a whole.
 //
-// Формат файла (ТЗ 5.1): UTF-8, одна запись в строке. Парсер отвечает
-// только за формат и ничего не знает про домены: значимая строка
-// отдаётся как есть, соответствие полному имени домена проверяет
-// потребитель (T-016, internal/idn). Правила разбора:
+// File format (spec 5.1): UTF-8, one record per line. The parser is
+// responsible for the format only and knows nothing about domains: a
+// meaningful line is yielded as is; matching a full domain name is
+// checked by the consumer (T-016, internal/idn). Parsing rules:
 //
-//   - конец строки — \n, \r или пара \r\n (CRLF не делится на два конца);
-//     нормализация — снятие конца строки;
-//   - BOM (U+FEFF) снимается только в начале файла; в середине строки он
-//     остаётся в данных и убирается дальше по конвейеру маппингом UTS-46
-//     (idn.Normalize, ТЗ 5.2);
-//   - пустые строки и строки-комментарии (первый значимый символ «#»)
-//     пропускаются (ТЗ 5.1);
-//   - крайние пробелы снимаются (unicode.IsSpace — тот же предикат, что
-//     в idn.cleanup); внутренние пробелы остаются: в многословной строке
-//     это разделители полей извлечения (T-132), одиночное имя
-//     нормализуется как есть (ТЗ 5.2 п. 1);
-//   - строка длиннее MaxLineLen байт или с невалидным UTF-8 отклоняется
-//     с номером и причиной, разбор продолжается — файл не считается
-//     ошибочным из-за единичных плохих строк (ТЗ 5.1); отклонения
-//     отдаются потребителю для rejected-лога (T-016).
+//   - a line ending is \n, \r or the pair \r\n (CRLF is not split into
+//     two endings); normalization is removing the line ending;
+//   - the BOM (U+FEFF) is removed only at the beginning of the file; in
+//     the middle of a line it stays in the data and is removed further
+//     down the pipeline by the UTS-46 mapping (idn.Normalize, spec 5.2);
+//   - empty lines and comment lines (first meaningful character "#")
+//     are skipped (spec 5.1);
+//   - outer spaces are removed (unicode.IsSpace — the same predicate as
+//     in idn.cleanup); inner spaces remain: in a multi-word line they are
+//     the field separators for extraction (T-132), a single name is
+//     normalized as is (spec 5.2 item 1);
+//   - a line longer than MaxLineLen bytes or with invalid UTF-8 is
+//     rejected with its number and reason, parsing continues — the file
+//     is not considered erroneous because of single bad lines (spec 5.1);
+//     rejections are yielded to the consumer for the rejected log (T-016).
 package ingest
 
 import (
@@ -38,92 +39,96 @@ import (
 	"unicode/utf8"
 )
 
-// MaxLineLen — лимит сырой строки файла (без конца строки), байты.
-// Валидная строка («полное имя домена», ТЗ 5.1) после нормализации не
-// длиннее 253 октет в ASCII-форме (ТЗ 5.2 п. 4), а её исходная форма —
-// не длиннее с запасом: каждый октет punycode-формы соответствует не
-// более чем одной кодовой точке входа (≤4 байта UTF-8), то есть ≤1012
-// байт плюс крайние пробелы и завершающая точка. Строки длиннее — мусор:
-// они отклоняются построчно, не буферизуясь без лимита (ТЗ 3.5), и не
-// мешают разбору остальных строк файла.
+// MaxLineLen — the limit for a raw file line (without the line ending),
+// in bytes. A valid line (a "full domain name", spec 5.1) is not longer
+// than 253 octets in ASCII form after normalization (spec 5.2 item 4),
+// and its original form is not longer with a margin: each octet of the
+// punycode form corresponds to at most one code point of the input
+// (≤4 bytes of UTF-8), i.e. ≤1012 bytes plus outer spaces and the
+// trailing dot. Longer lines are junk: they are rejected line by line,
+// without buffering beyond the limit (spec 3.5), and do not interfere
+// with parsing the rest of the file.
 const MaxLineLen = 1024
 
-// maxRejectText — сколько байт сырой строки переносить в Reject.Text:
-// вход недоверенный, rejected-логу (T-016) длинный мусор не нужен.
+// maxRejectText — how many bytes of the raw line to carry into
+// Reject.Text: the input is untrusted, the rejected log (T-016) does not
+// need long junk.
 const maxRejectText = 255
 
-// Reason — устойчивая причина отклонения строки в пакете ingest: у парсера
-// (невалидный UTF-8, длинная строка) и у валидатора (классы idn.ErrorKind,
-// wrong_zone, no_domain — см. validate.go). Попадает в rejected-лог и отчёт
-// файла.
+// Reason — a stable reason for line rejection in the ingest package: the
+// parser's (invalid UTF-8, long line) and the validator's (the
+// idn.ErrorKind classes, wrong_zone, no_domain — see validate.go). Goes
+// into the rejected log and the file report.
 type Reason string
 
 const (
-	// ReasonUTF8 — строка не является валидным UTF-8: формат файла —
-	// UTF-8 (ТЗ 5.1).
+	// ReasonUTF8 — the line is not valid UTF-8: the file format is
+	// UTF-8 (spec 5.1).
 	ReasonUTF8 Reason = "invalid_utf8"
-	// ReasonLong — сырая строка длиннее MaxLineLen байт: мусор, а не
-	// имя (обоснование лимита — MaxLineLen).
+	// ReasonLong — the raw line is longer than MaxLineLen bytes: junk,
+	// not a name (the limit rationale — MaxLineLen).
 	ReasonLong Reason = "line_len"
 )
 
-// Line — значимая строка файла (не пустая и не комментарий).
+// Line — a meaningful file line (not empty, not a comment).
 type Line struct {
-	// Num — номер физической строки файла, 1-based. Пустые, комментарии
-	// и отклонённые строки тоже нумеруются: rejected-лог (T-016) и отчёт
-	// (T-021) ссылаются на реальную строку файла.
+	// Num — the physical line number in the file, 1-based. Empty lines,
+	// comments and rejected lines are numbered too: the rejected log
+	// (T-016) and the report (T-021) reference the real file line.
 	Num int
-	// Text — содержимое строки: без конца строки, без BOM первой строки
-	// и без крайних пробелов. Внутренние пробелы остаются: в многословной
-	// строке это разделители полей извлечения (T-132), в одиночном имени
-	// их снимает нормализация (ТЗ 5.2 п. 1).
+	// Text — the line content: without the line ending, without the BOM
+	// of the first line and without outer spaces. Inner spaces remain: in
+	// a multi-word line they are the field separators for extraction
+	// (T-132); for a single name normalization removes them (spec 5.2
+	// item 1).
 	Text string
 }
 
-// Reject — строка, отклонённая парсером (ReasonUTF8, ReasonLong).
-// Валидация доменного имени — не здесь: парсер отвечает за формат,
-// семантику строки проверяет потребитель (T-016).
+// Reject — a line rejected by the parser (ReasonUTF8, ReasonLong).
+// Domain name validation is not here: the parser is responsible for the
+// format, the consumer checks the line semantics (T-016).
 type Reject struct {
-	// Num — номер физической строки файла, 1-based.
+	// Num — the physical line number in the file, 1-based.
 	Num int
-	// Reason — причина отклонения.
+	// Reason — the rejection reason.
 	Reason Reason
-	// Text — начало сырой строки без конца строки (до maxRejectText
-	// байт). При ReasonUTF8 может содержать невалидные байты как есть —
-	// это исходные данные строки.
+	// Text — the beginning of the raw line without the line ending (up to
+	// maxRejectText bytes). With ReasonUTF8 it may contain invalid bytes
+	// as is — these are the original line data.
 	Text string
-	// Bytes — полный размер сырой строки в байтах (без конца строки).
+	// Bytes — the full size of the raw line in bytes (without the line ending).
 	Bytes int
 }
 
-// Stats — счётчики строк обработанного файла; основа отчёта ТЗ 5.1
-// (кол-во строк, … отклонено) — задача T-021. Инвариант:
+// Stats — line counters of a processed file; the basis of the spec 5.1
+// report (the number of lines, … rejected) — task T-021. Invariant:
 // Total = Skipped + Rejected + Data.
 type Stats struct {
-	Total    int // всего физических строк файла
-	Skipped  int // пропущено: пустые строки и комментарии «#»
-	Rejected int // отклонено парсером: не UTF-8, длиннее MaxLineLen
-	Data     int // отдано значимых строк (OnLine)
+	Total    int // total physical lines of the file
+	Skipped  int // skipped: empty lines and "#" comments
+	Rejected int // rejected by the parser: not UTF-8, longer than MaxLineLen
+	Data     int // meaningful lines yielded (OnLine)
 }
 
-// Options — параметры разбора. Оба колбэка необязательны: nil — строки
-// соответствующего рода только считаются.
+// Options — parsing parameters. Both callbacks are optional: nil means
+// lines of the corresponding kind are only counted.
 type Options struct {
-	// OnLine вызывается для каждой значимой строки. Возвращённая ошибка
-	// останавливает разбор и возвращается из Parse обёрнутой с номером
-	// строки — способ останова по решению потребителя (например, ошибка
-	// записи в БД, отмена).
+	// OnLine is called for each meaningful line. The returned error stops
+	// parsing and is returned from Parse wrapped with the line number —
+	// the way to stop at the consumer's discretion (for example, a DB
+	// write error, cancellation).
 	OnLine func(Line) error
-	// OnReject вызывается для каждой отклонённой строки — сырьё
-	// rejected-лога T-016. Ошибка останавливает разбор как у OnLine.
+	// OnReject is called for each rejected line — the raw material of the
+	// T-016 rejected log. An error stops parsing like OnLine.
 	OnReject func(Reject) error
 }
 
-// Parse читает r построчно: значимые строки — в opts.OnLine, отклонённые —
-// в opts.OnReject, пустые и комментарии — молча пропускаются. Возвращает
-// счётчики. Ошибка — либо сбой чтения r, либо ошибка колбэка; строки,
-// отданные до ошибки, остаются у потребителя (разбор не «откатывается»),
-// счётчики соответствуют отданному.
+// Parse reads r line by line: meaningful lines go to opts.OnLine,
+// rejected ones — to opts.OnReject, empty ones and comments are silently
+// skipped. Returns the counters. An error is either an r read failure or
+// a callback error; lines yielded before the error remain with the
+// consumer (parsing does not "roll back"), the counters match what was
+// yielded.
 func Parse(r io.Reader, opts Options) (Stats, error) {
 	var st Stats
 	sc := newScanner(r)
@@ -173,7 +178,7 @@ func Parse(r io.Reader, opts Options) (Stats, error) {
 	}
 }
 
-// emitReject передаёт отклонение потребителю с общей обработкой ошибок.
+// emitReject passes a rejection to the consumer with common error handling.
 func (o Options) emitReject(rj Reject) error {
 	if o.OnReject == nil {
 		return nil
@@ -184,7 +189,7 @@ func (o Options) emitReject(rj Reject) error {
 	return nil
 }
 
-// truncateText обрезает сырую строку до maxRejectText байт для Reject.Text.
+// truncateText cuts the raw line to maxRejectText bytes for Reject.Text.
 func truncateText(raw []byte) string {
 	if len(raw) > maxRejectText {
 		raw = raw[:maxRejectText]
@@ -192,29 +197,30 @@ func truncateText(raw []byte) string {
 	return string(raw)
 }
 
-// scanWindow — окно чтения по умолчанию, 64 КиБ: строки в нём почти
-// всегда помещаются целиком (лимит строки — MaxLineLen), а refill
-// дозакрывает редкие пересечения края.
+// scanWindow — the default read window, 64 KiB: lines almost always fit
+// in it entirely (the line limit is MaxLineLen), and refill handles the
+// rare edge crossings.
 const scanWindow = 64 << 10
 
-// scanner — построчный сканер байтового потока с фиксированной памятью
-// (окно + накопитель одной строки, ТЗ 3.5). Концы строк \n, \r и \r\n;
-// BOM снимается один раз, в начале файла.
+// scanner — a byte stream line scanner with fixed memory (a window plus
+// the accumulator of one line, spec 3.5). Line endings are \n, \r and
+// \r\n; the BOM is removed once, at the beginning of the file.
 type scanner struct {
 	r       io.Reader
-	buf     []byte // массив окна чтения
-	pend    []byte // непотреблённые байты (префикс buf)
-	acc     []byte // накопитель строки, пересекающей край окна (cap = MaxLineLen)
-	started bool   // BOM проверяется один раз, перед первой строкой
+	buf     []byte // the read window buffer
+	pend    []byte // unconsumed bytes (a prefix of buf)
+	acc     []byte // accumulator for a line crossing the window edge (cap = MaxLineLen)
+	started bool   // the BOM is checked once, before the first line
 	eof     bool
-	err     error // ошибка чтения: выдаётся, когда окно иссякнет
+	err     error // read error: yielded when the window runs out
 }
 
 func newScanner(r io.Reader) *scanner { return newScannerWindow(r, scanWindow) }
 
-// newScannerWindow — сканер с окном заданного размера: тесты прижимают
-// окно, чтобы проверить границы (CR на краю окна, CRLF через край,
-// BOM). Минимум 3 байта — длина BOM.
+// newScannerWindow — a scanner with a window of the given size: tests
+// squeeze the window to check the boundaries (a CR at the window edge,
+// CRLF across the edge, the BOM). The minimum is 3 bytes — the BOM
+// length.
 func newScannerWindow(r io.Reader, window int) *scanner {
 	if window < 3 {
 		window = 3
@@ -226,13 +232,14 @@ func newScannerWindow(r io.Reader, window int) *scanner {
 	}
 }
 
-// refill пополняет окно, перенося непотреблённые байты в его начало
-// (окно исчерпано не полностью, когда строка пересекла край или CR
-// оказался последним байтом). Read может отдавать мало — окно
-// доливается целиком, чтобы BOM в начале файла не оказался разрезан
-// между окнами. Возвращает true, если в окне есть данные; EOF и ошибка
-// чтения запоминаются: ошибка выдаётся следующим readLine после
-// исчерпания окна — уже прочитанные строки не теряются.
+// refill tops up the window, moving unconsumed bytes to its beginning
+// (the window is not fully exhausted when a line crossed the edge or a
+// CR happened to be the last byte). Read may return little — the window
+// is topped up entirely so that the BOM at the beginning of the file is
+// not split between windows. Returns true if there is data in the
+// window; EOF and a read error are remembered: the error is yielded by
+// the next readLine after the window is exhausted — already read lines
+// are not lost.
 func (s *scanner) refill() bool {
 	if s.eof || s.err != nil {
 		return false
@@ -250,8 +257,8 @@ func (s *scanner) refill() bool {
 			break
 		}
 		if k == 0 {
-			// Read обязан возвращать данные или ошибку; иначе — защита
-			// от зацикливания (io.ErrNoProgress).
+			// Read must return data or an error; otherwise — a guard
+			// against looping (io.ErrNoProgress).
 			s.err = io.ErrNoProgress
 			break
 		}
@@ -260,17 +267,18 @@ func (s *scanner) refill() bool {
 	return n > 0
 }
 
-// stripBOM снимает UTF-8 BOM (U+FEFF) в начале файла — и только в начале.
+// stripBOM removes the UTF-8 BOM (U+FEFF) at the beginning of the file — and only there.
 func (s *scanner) stripBOM() {
 	if len(s.pend) >= 3 && bytes.Equal(s.pend[:3], []byte{0xEF, 0xBB, 0xBF}) {
 		s.pend = s.pend[3:]
 	}
 }
 
-// readLine возвращает следующую физическую строку файла. line — байты
-// без конца строки (для строки длиннее MaxLineLen — первые MaxLineLen
-// байт), size — полный размер строки в байтах; ok = false — строк больше
-// нет. Ошибка чтения возвращается, когда данные окна исчерпаны.
+// readLine returns the next physical line of the file. line is the bytes
+// without the line ending (for a line longer than MaxLineLen — the first
+// MaxLineLen bytes), size is the full line size in bytes; ok = false
+// means there are no more lines. A read error is returned when the
+// window data is exhausted.
 func (s *scanner) readLine() (line []byte, size int, ok bool, err error) {
 	if !s.started {
 		s.started = true
@@ -281,7 +289,7 @@ func (s *scanner) readLine() (line []byte, size int, ok bool, err error) {
 	for {
 		i := bytes.IndexAny(s.pend, "\r\n")
 		if i < 0 {
-			// конца строки в окне нет: хвост строки уходит в накопитель
+			// no line ending in the window: the line tail goes into the accumulator
 			size += len(s.pend)
 			s.take(len(s.pend))
 			s.pend = s.pend[:0]
@@ -289,15 +297,15 @@ func (s *scanner) readLine() (line []byte, size int, ok bool, err error) {
 				if s.err != nil {
 					return nil, 0, false, s.err
 				}
-				break // EOF: строка закончилась вместе с файлом
+				break // EOF: the line ends together with the file
 			}
 			continue
 		}
 		size += i
 		s.take(i)
 		s.pend = s.pend[i:]
-		// CR последним байтом окна: дочитываем, чтобы не разделить пару
-		// CRLF (заодно не потерять его при EOF).
+		// CR as the last byte of the window: read on so as not to split a
+		// CRLF pair (and not lose it at EOF).
 		for len(s.pend) == 1 && s.pend[0] == '\r' && s.refill() {
 		}
 		if s.pend[0] == '\r' {
@@ -314,12 +322,13 @@ func (s *scanner) readLine() (line []byte, size int, ok bool, err error) {
 	if size == 0 {
 		return nil, 0, false, nil
 	}
-	return s.acc, size, true, nil // последняя строка без конца строки
+	return s.acc, size, true, nil // the last line without a line ending
 }
 
-// take дописывает в накопитель первые n байт окна, не превосходя лимит
-// MaxLineLen: перебор фиксируется счётчиком size (readLine), а не
-// памятью — длинный мусор не буферизуется (ТЗ 3.5).
+// take appends the first n bytes of the window to the accumulator without
+// exceeding the MaxLineLen limit: the overflow is recorded by the size
+// counter (readLine), not by memory — long junk is not buffered
+// (spec 3.5).
 func (s *scanner) take(n int) {
 	if room := MaxLineLen - len(s.acc); n > room {
 		n = room

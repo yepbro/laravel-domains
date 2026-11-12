@@ -1,8 +1,9 @@
-// Юнит-тесты учёта файлов в ingest_files (T-021, ТЗ 5.1, 6.1): фейковый
-// FileStore для конвейера (pipeline_test.go), SQLFileStore — текст SQL и
-// параметры на фейковом pgx-пуле без БД (стиль zones_test.go), формат
-// лог-отчёта renderReport и отображение счётчиков FileReport.record.
-// Реальное поведение против БД — интеграционные тесты ingest (T-023).
+// Unit tests of file accounting in ingest_files (T-021, spec 5.1, 6.1): the
+// fake FileStore for the pipeline (pipeline_test.go), SQLFileStore — the SQL
+// text and parameters against a fake pgx pool without a DB (the style of
+// zones_test.go), the log report format of renderReport and the mapping of
+// the FileReport.record counters.
+// Real behavior against the DB — the ingest integration tests (T-023).
 package ingest
 
 import (
@@ -21,16 +22,16 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-// --- фейковый FileStore ---------------------------------------------------
+// --- fake FileStore---------------------------------------------------
 
-// fakeFileStore — память-журнал ingest_files с протоколом вызовов.
-// Строки с одним sha256 (разные зона/действие — сценарии T-113)
-// возвращаются в порядке добавления.
+// fakeFileStore — an in-memory journal of ingest_files with a call protocol.
+// Rows with the same sha256 (different zone/action — the T-113 scenarios)
+// are returned in insertion order.
 type fakeFileStore struct {
 	known   map[string][]model.IngestFile
-	bySAErr error // ошибка FilesBySHA256, если задана
+	bySAErr error // the FilesBySHA256 error, if set
 	records []FileRecord
-	recErr  error // ошибка RecordFile, если задана
+	recErr  error // the RecordFile error, if set
 }
 
 func newFakeFileStore(known ...model.IngestFile) *fakeFileStore {
@@ -45,7 +46,7 @@ func (f *fakeFileStore) FilesBySHA256(_ context.Context, sha []byte) ([]model.In
 	if f.bySAErr != nil {
 		return nil, f.bySAErr
 	}
-	return f.known[string(sha)], nil // nil = содержимое не обрабатывалось
+	return f.known[string(sha)], nil // nil = the content was not processed
 }
 
 func (f *fakeFileStore) RecordFile(_ context.Context, rec FileRecord) error {
@@ -56,14 +57,14 @@ func (f *fakeFileStore) RecordFile(_ context.Context, rec FileRecord) error {
 	return nil
 }
 
-// --- фейковый pgx-пул для SQLFileStore ------------------------------------
+// --- fake pgx pool for SQLFileStore------------------------------------
 
-// fileColNames — имена колонок в порядке ingestFileColumns.
+// fileColNames — column names in the ingestFileColumns order.
 var fileColNames = strings.Split(ingestFileColumns, ", ")
 
-// fileRows — pgx.Rows с заготовленными строками ingest_files: Scan
-// раскладывает значения позиционно, FieldDescriptions — имена колонок
-// для RowToStructByName (как fakeRows в zones_test.go).
+// fileRows — pgx.Rows with pre-made ingest_files rows: Scan lays out the
+// values positionally, FieldDescriptions gives the column names for
+// RowToStructByName (like fakeRows in zones_test.go).
 type fileRows struct {
 	rows   [][]any
 	i      int
@@ -105,7 +106,7 @@ func (r *fileRows) Scan(dest ...any) error {
 		}
 		val := reflect.ValueOf(row[i])
 		if target.Kind() == reflect.Pointer {
-			// NULL-колонка модели (указатель): *Action, *string, …
+			// a NULL model column (pointer): *Action, *string, …
 			p := reflect.New(val.Type())
 			p.Elem().Set(val)
 			target.Set(p)
@@ -119,14 +120,14 @@ func (r *fileRows) Scan(dest ...any) error {
 func (r *fileRows) Values() ([]any, error) { return r.rows[r.i-1], nil }
 func (r *fileRows) RawValues() [][]byte    { return nil }
 
-// Conn и TypeMap — часть pgx.Rows, не используемая коллектором.
+// Conn and TypeMap — the part of pgx.Rows not used by the collector.
 func (r *fileRows) Conn() *pgx.Conn      { return nil }
 func (r *fileRows) TypeMap() *pgtype.Map { return nil }
 
-// fakeFilePool — db.DB для SQLFileStore: запоминает SQL и аргументы,
-// Query выдаёт заготовленные строки, Exec — заготовленный тег/ошибку.
+// fakeFilePool — a db.DB for SQLFileStore: it remembers the SQL and the
+// arguments, Query yields the pre-made rows, Exec — the pre-made tag/error.
 type fakeFilePool struct {
-	queries  []zoneQuery // переиспользование типа из zones_test.go
+	queries  []zoneQuery // reusing the type from zones_test.go
 	results  []*fileRows
 	queryErr error
 	execSQL  []string
@@ -169,9 +170,9 @@ const wantFileInsert = "INSERT INTO ingest_files " +
 	"(zone_id, action, path, sha256, lines_total, added, existed, deleted, rejected, processed_at) " +
 	"VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"
 
-// TestSQLFilesBySHA256 — все строки журнала с данным содержимым
-// (T-113: одно содержимое может доставляться в разных зоне/действии —
-// точная повторная доставка ищется конвейером по тройке).
+// TestSQLFilesBySHA256 — all journal rows with the given content (T-113:
+// one content may be delivered in different zone/action — exact redelivery
+// is looked up by the pipeline by the triple).
 func TestSQLFilesBySHA256(t *testing.T) {
 	when := time.Date(2026, 10, 17, 10, 0, 0, 0, time.UTC)
 	action := model.ActionAdd
@@ -216,8 +217,8 @@ func TestSQLFilesBySHA256(t *testing.T) {
 	}
 }
 
-// TestSQLFilesBySHA256None — содержимое не обрабатывалось: пустой срез
-// без ошибки (не обрабатывалось — не ошибка хранилища).
+// TestSQLFilesBySHA256None — the content was not processed: an empty slice
+// without an error (not processed is not a store error).
 func TestSQLFilesBySHA256None(t *testing.T) {
 	pool := &fakeFilePool{results: []*fileRows{{}}}
 	store := NewFileStore(pool)
@@ -262,8 +263,8 @@ func TestSQLRecordFile(t *testing.T) {
 	}
 }
 
-// TestSQLRecordFileBadSHA — отчёт без полного sha256 — ошибка до БД:
-// битый хэш сломал бы идемпотентность (уникальная тройка
+// TestSQLRecordFileBadSHA — a report without a full sha256 — an error before
+// the DB: a broken hash would break idempotency (the unique triple
 // (zone_id, action, sha256), T-113).
 func TestSQLRecordFileBadSHA(t *testing.T) {
 	pool := &fakeFilePool{}
@@ -278,8 +279,8 @@ func TestSQLRecordFileBadSHA(t *testing.T) {
 	}
 }
 
-// TestSQLFileStoreErrors — ошибки хранилища оборачиваются контекстом
-// «db: ingest_files» (стиль SQLZoneStore).
+// TestSQLFileStoreErrors — store errors are wrapped with the "db:
+// ingest_files" context (the SQLZoneStore style).
 func TestSQLFileStoreErrors(t *testing.T) {
 	boom := errors.New("соединение потеряно")
 
@@ -298,10 +299,11 @@ func TestSQLFileStoreErrors(t *testing.T) {
 	}
 }
 
-// --- лог-отчёт ------------------------------------------------------------
+// --- log report------------------------------------------------------------
 
-// TestRenderReport — формат лог-отчёта (ТЗ 5.1: рядом с файлом в failed/)
-// зафиксирован: причина, счётчики строк по этапам, применение по действию.
+// TestRenderReport — the log report format (spec 5.1: next to the file in
+// failed/) is fixed: the reason, the line counters by stages, the apply
+// counts by action.
 func TestRenderReport(t *testing.T) {
 	rep := FileReport{
 		Zone:       "com",
@@ -340,8 +342,8 @@ func TestRenderReport(t *testing.T) {
 	}
 }
 
-// TestRenderReportDeleteFailed — отчёт ошибочного delete-файла: применения
-// нет, причины отклонений прилагаются; зона не разобрана — прочерк.
+// TestRenderReportDeleteFailed — the report of a failed delete file: no
+// apply, the rejection reasons are attached; the zone is unparsed — a dash.
 func TestRenderReportDeleteFailed(t *testing.T) {
 	rep := FileReport{
 		Zone:       "net",
@@ -371,8 +373,8 @@ func TestRenderReportDeleteFailed(t *testing.T) {
 	}
 }
 
-// TestRenderReportNoPath — путь не разобран (ошибочные файлы тоже
-// получают лог-отчёт): зона и действие — прочерки, sha256 нет.
+// TestRenderReportNoPath — the path is unparsed (failed files also get a
+// log report): the zone and action are dashes, no sha256.
 func TestRenderReportNoPath(t *testing.T) {
 	want := strings.Join([]string{
 		"# лог-отчёт ingest (ТЗ 5.1)",
@@ -393,8 +395,8 @@ func TestRenderReportNoPath(t *testing.T) {
 	}
 }
 
-// TestFileReportRecord — отображение итога в колонки ingest_files (ТЗ 6.1):
-// Revived входит в Added, NotFound колонки не имеет.
+// TestFileReportRecord — the mapping of the report into the ingest_files
+// columns (spec 6.1): Revived is included in Added, NotFound has no column.
 func TestFileReportRecord(t *testing.T) {
 	at := time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC)
 	rep := FileReport{
@@ -413,9 +415,9 @@ func TestFileReportRecord(t *testing.T) {
 	}
 }
 
-// TestMergeReasons — отклонения парсера и валидатора суммируются по
-// причинам; имена не пересекаются (invalid_utf8/line_len против классов
-// idn и wrong_zone).
+// TestMergeReasons — the parser's and the validator's rejections are summed
+// by reason; the names do not overlap (invalid_utf8/line_len vs the idn
+// classes and wrong_zone).
 func TestMergeReasons(t *testing.T) {
 	got := mergeReasons(
 		map[Reason]int{ReasonLong: 2, ReasonUTF8: 1},
@@ -427,6 +429,6 @@ func TestMergeReasons(t *testing.T) {
 	}
 }
 
-// compile-time: SQLFileStore — FileStore поверх internal/db.
+// compile-time: SQLFileStore — a FileStore on top of internal/db.
 var _ FileStore = (*SQLFileStore)(nil)
 var _ FileStore = (*fakeFileStore)(nil)

@@ -1,19 +1,21 @@
-// Сквозной конвейер обработки одного входного файла (T-021; ТЗ 5.1):
-// событие internal/watch → ParsePath (T-014) → EnsureZone (T-014) →
-// один проход по файлу: потоковый разбор (T-015) и sha256 содержимого
-// через io.TeeReader — чтение ровно одно, второго прохода по файлу нет
-// (ТЗ 3.5) → валидация строк с rejected-логом (T-016) → загрузка в
-// staging (T-017) → применение add/delete (T-018/T-019) → отчёт в
-// ingest_files (report.go) → перемещение файла в processed/ или failed/.
-// Архивы (.zip/.tar/.tar.gz/.tgz/.gz) ветвятся по расширению на
-// потоковую распаковку — archive.go (T-133): члены проходят те же
-// Parse/Validator/Stage, единица учёта — архив.
+// The end-to-end pipeline for processing one input file (T-021;
+// spec 5.1): an internal/watch event → ParsePath (T-014) → EnsureZone
+// (T-014) → one pass over the file: streaming parsing (T-015) and the
+// content sha256 via io.TeeReader — exactly one read, there is no
+// second pass over the file (spec 3.5) → line validation with the
+// rejected log (T-016) → loading into staging (T-017) → applying
+// add/delete (T-018/T-019) → the report into ingest_files (report.go)
+// → moving the file to processed/ or failed/. Archives
+// (.zip/.tar/.tar.gz/.tgz/.gz) branch by extension into streaming
+// unpacking — archive.go (T-133): members go through the same
+// Parse/Validator/Stage, the unit of accounting is the archive.
 //
-// Идемпотентность (ТЗ 3.4, 5.1; T-113): защита от повторной обработки —
-// точная повторная доставка, совпадение (зона, действие, sha256) в
-// ingest_files; конвейер проверяет хэш после загрузки staging (хэш
-// известен только к концу чтения) и до применения.
-// Классы исходов и решение «файл остаётся или уходит в архив» — Outcome.
+// Idempotency (spec 3.4, 5.1; T-113): protection against reprocessing
+// — exact redelivery, a match of (zone, action, sha256) in
+// ingest_files; the pipeline checks the hash after the staging load
+// (the hash is only known by the end of reading) and before applying.
+// The outcome classes and the "does the file stay or go to the
+// archive" decision — Outcome.
 package ingest
 
 import (
@@ -33,67 +35,70 @@ import (
 	"crawler/internal/model"
 )
 
-// DefaultBatchSize — размер пачки COPY загрузки staging по умолчанию
-// (ingest.batch_size, ТЗ 5.10). Дублирует config.Default, чтобы конвейер
-// работал и без конфигурации (стиль DefaultMaxErrorRatio, T-016).
+// DefaultBatchSize — the default COPY chunk size of the staging load
+// (ingest.batch_size, spec 5.10). Duplicates config.Default so the
+// pipeline works without configuration too (the DefaultMaxErrorRatio
+// style, T-016).
 const DefaultBatchSize = 50000
 
-// Каталоги архива приёма — верхний уровень incoming (ТЗ 5.1):
-// processed/ — успешно обработанные файлы, failed/ — файлы с ошибкой и
-// лог-отчётом рядом. internal/watch их не наблюдает (T-013).
+// Ingest archive directories — the top level of incoming (spec 5.1):
+// processed/ — successfully processed files, failed/ — files with an
+// error and a log report nearby. internal/watch does not watch them
+// (T-013).
 const (
 	DirProcessed = "processed"
 	DirFailed    = "failed"
 )
 
-// stageChanSize — буфер канала строк между разбором файла и загрузкой
-// staging: парсер не ждёт БД на каждой строке, а память ограничена
-// (ТЗ 3.5).
+// stageChanSize — the buffer of the line channel between file parsing
+// and the staging load: the parser does not wait for the DB on every
+// line, and memory is bounded (spec 3.5).
 const stageChanSize = 1024
 
-// errStopped — производитель строк остановлен потребителем (загрузка
-// прервана ошибкой БД): парсер завершается досрочно.
+// errStopped — the line producer was stopped by the consumer (the load
+// was interrupted by a DB error): the parser finishes early.
 var errStopped = errors.New("ingest: загрузка партии остановлена")
 
-// PipelineOptions — параметры конвейера; нулевые значения заменяются
-// дефолтами (стиль watch.Options, T-013).
+// PipelineOptions — pipeline parameters; zero values are replaced by
+// defaults (the watch.Options style, T-013).
 type PipelineOptions struct {
-	// Dir — наблюдаемый каталог incoming (ingest.dir): файлы приходят
-	// путями внутри него, там же размещается архив processed/failed
-	// (ТЗ 5.1).
+	// Dir — the watched incoming directory (ingest.dir): files arrive
+	// with paths inside it, and the processed/failed archive is placed
+	// there too (spec 5.1).
 	Dir string
-	// BatchSize — строк на пачку COPY в staging (ingest.batch_size).
+	// BatchSize — rows per COPY chunk into staging (ingest.batch_size).
 	BatchSize int
-	// MaxErrorRatio — порог доли отклонённых строк файла
-	// (ingest.max_error_ratio); 0 — DefaultMaxErrorRatio. Для архивов
-	// действует на член (T-133): член выше порога роняет архив целиком.
+	// MaxErrorRatio — the threshold for the share of rejected file lines
+	// (ingest.max_error_ratio); 0 — DefaultMaxErrorRatio. For archives
+	// it acts on a member (T-133): a member above the threshold fails
+	// the archive as a whole.
 	MaxErrorRatio float64
-	// ArchiveMaxUncompressed — потолок суммарного несжатого объёма членов
-	// архива (ingest.archive_max_uncompressed, T-133); 0 — дефолт.
+	// ArchiveMaxUncompressed — the cap on the total uncompressed size of
+	// archive members (ingest.archive_max_uncompressed, T-133); 0 — the default.
 	ArchiveMaxUncompressed int64
-	// ArchiveMaxFiles — потолок числа записей архива
-	// (ingest.archive_max_files, T-133); 0 — дефолт.
+	// ArchiveMaxFiles — the cap on the number of archive entries
+	// (ingest.archive_max_files, T-133); 0 — the default.
 	ArchiveMaxFiles int
-	// AllowedZonePaths — многоуровневые зоны, которым разрешено быть
-	// каталогами incoming (ingest.allowed_zone_paths, ТЗТ §5.1):
-	// тестовые зоны testbed (crawl.test); nil/пусто — рабочие каталоги
-	// только TLD. Файл запрещённого многоуровневого каталога — ошибка
-	// уровня файла (failed/, T-021).
+	// AllowedZonePaths — multi-level zones allowed to be incoming
+	// directories (ingest.allowed_zone_paths, the tld-only-zones spec
+	// §5.1): testbed test zones (crawl.test); nil/empty — working
+	// directories are TLD-only. A file of a forbidden multi-level
+	// directory is a file-level error (failed/, T-021).
 	AllowedZonePaths []string
-	// RejectLog — логгер rejected (NewRejectedLogger, T-016); nil —
-	// записи подавлены (счётчики ведутся всё равно).
+	// RejectLog — the rejected logger (NewRejectedLogger, T-016); nil —
+	// records suppressed (counters are kept anyway).
 	RejectLog *slog.Logger
-	// Log — логгер сервиса для итогов обработки; nil — подавлен.
+	// Log — the service logger for processing outcomes; nil — suppressed.
 	Log *slog.Logger
-	// Now — источник времени для processed_at (заглушка в тестах);
+	// Now — the time source for processed_at (a stub in tests);
 	// nil — time.Now.
 	Now func() time.Time
 }
 
-// Pipeline — сквозная обработка готового входного файла (ТЗ 5.1) из
-// готовых ступеней T-014…T-020. Самостоятельного состояния между файлами
-// не держит: идемпотентность — по тройке (зона, действие, sha256) в
-// ingest_files, а не в памяти.
+// Pipeline — end-to-end processing of a ready input file (spec 5.1)
+// from the ready stages T-014…T-020. It keeps no state of its own
+// between files: idempotency — via the (zone, action, sha256) triple
+// in ingest_files, not in memory.
 type Pipeline struct {
 	zones ZoneStore
 	files FileStore
@@ -103,9 +108,9 @@ type Pipeline struct {
 	now   func() time.Time
 }
 
-// NewPipeline — конвейер над хранилищами: ZoneStore (T-014), FileStore
-// (журнал ingest_files, report.go) и пул ApplyDB для staging и применения
-// (применение add — в одной транзакции, T-205).
+// NewPipeline — a pipeline over the stores: ZoneStore (T-014),
+// FileStore (the ingest_files log, report.go) and an ApplyDB pool for
+// staging and applying (the add apply is in one transaction, T-205).
 func NewPipeline(zones ZoneStore, files FileStore, pool ApplyDB, opts PipelineOptions) (*Pipeline, error) {
 	if zones == nil || files == nil || pool == nil {
 		return nil, errors.New("ingest: конвейер: обязательны ZoneStore, FileStore и пул БД")
@@ -136,44 +141,47 @@ func NewPipeline(zones ZoneStore, files FileStore, pool ApplyDB, opts PipelineOp
 	return &Pipeline{zones: zones, files: files, pool: pool, opts: opts, log: log, now: now}, nil
 }
 
-// OutcomeKind — чем закончилась обработка файла.
+// OutcomeKind — how the file processing ended.
 type OutcomeKind string
 
 const (
-	// OutcomeApplied — файл применён к БД, отчёт записан в ingest_files,
-	// файл перемещён в processed/.
+	// OutcomeApplied — the file was applied to the DB, the report was
+	// written to ingest_files, the file was moved to processed/.
 	OutcomeApplied OutcomeKind = "applied"
-	// OutcomeDuplicate — точная повторная доставка: та же тройка
-	// (зона, действие, sha256) уже в журнале ingest_files (ТЗ 5.1,
-	// T-113): загрузка отброшена, файл перемещён в processed/ без
-	// нового отчёта.
+	// OutcomeDuplicate — exact redelivery: the same (zone, action,
+	// sha256) triple is already in the ingest_files log (spec 5.1,
+	// T-113): the load was discarded, the file was moved to processed/
+	// without a new report.
 	OutcomeDuplicate OutcomeKind = "duplicate"
-	// OutcomeFailed — файл ошибочен по своей сути (структура пути,
-	// имя зоны, доля отказов выше порога): перемещён в failed/ с
-	// лог-отчётом рядом; отчёт в ingest_files не пишется — тот же хэш
-	// не занимает журнал, исправленный файл можно загрузить снова.
+	// OutcomeFailed — the file is invalid in itself (the path structure,
+	// the zone name, an error share above the threshold): moved to
+	// failed/ with the log report nearby; no report is written to
+	// ingest_files — the same hash does not occupy the log, a corrected
+	// file can be loaded again.
 	OutcomeFailed OutcomeKind = "failed"
-	// OutcomeLeft — инфраструктурный сбой (БД, чтение файла): файл
-	// остаётся в incoming и переработается после перезапуска сервиса
-	// или изменения файла (доставка at-least-once, ТЗ 3.4); обработка
-	// следующих файлов продолжается.
+	// OutcomeLeft — an infrastructure failure (the DB, file reading):
+	// the file stays in incoming and will be reprocessed after a
+	// service restart or a file change (at-least-once delivery,
+	// spec 3.4); processing of the following files continues.
 	OutcomeLeft OutcomeKind = "left"
 )
 
-// Outcome — итог обработки файла: класс, счётчики (заполнены в меру
-// дошедшего) и причина (для failed/left — в лог).
+// Outcome — the outcome of file processing: the class, the counters
+// (filled in as far as they arrived) and the reason (for failed/left
+// — into the log).
 type Outcome struct {
 	Kind   OutcomeKind
 	Report FileReport
 	Err    error
 }
 
-// Process обрабатывает готовый файл (событие internal/watch, T-013):
-// полный конвейер ТЗ 5.1 и перемещение файла по итогу. Возвращаемая
-// ошибка не nil только для OutcomeLeft (сбой инфраструктуры — файл
-// остался в incoming): это не «файловая» проблема, её видит вызывающий;
-// applied/duplicate/failed — плановые итоги, ошибка возврата nil,
-// причина failed — в Outcome.Err.
+// Process processes a ready file (an internal/watch event, T-013): the
+// full spec 5.1 pipeline and moving the file by the outcome. The
+// returned error is not nil only for OutcomeLeft (an infrastructure
+// failure — the file stayed in incoming): that is not a "file"
+// problem, the caller sees it; applied/duplicate/failed are planned
+// outcomes, the returned error is nil, the failed reason is in
+// Outcome.Err.
 func (p *Pipeline) Process(ctx context.Context, abs string) (Outcome, error) {
 	o := p.process(ctx, abs)
 	if o.Kind == OutcomeLeft {
@@ -182,38 +190,41 @@ func (p *Pipeline) Process(ctx context.Context, abs string) (Outcome, error) {
 	return o, nil
 }
 
-// process — реализация Process без ветвления возврата.
+// process — the Process implementation without return branching.
 func (p *Pipeline) process(ctx context.Context, abs string) Outcome {
 	rel := filepath.ToSlash(abs)
 	if r, err := filepath.Rel(p.opts.Dir, abs); err == nil {
 		rel = filepath.ToSlash(r)
 	}
-	// Путь вне incoming/ошибки Rel уходят в ParsePath как есть — он
-	// отвергает недопустимую структуру сам (T-014).
+	// A path outside incoming / Rel errors go into ParsePath as is — it
+	// rejects an invalid structure itself (T-014).
 
 	f, err := ParsePath(rel)
 	if err != nil {
-		// Структура пути и имя зоны не изменятся от повтора — файл
-		// ошибочен (ТЗ 5.1: failed/ с лог-отчётом).
+		// The path structure and the zone name will not change on a
+		// retry — the file is invalid (spec 5.1: failed/ with the log
+		// report).
 		return p.failFile(abs, FileReport{Path: rel}, err)
 	}
 	rep := FileReport{Zone: f.Zone, Action: f.Action, Path: f.Path}
 
-	// Многоуровневый каталог зоны — только из allowlist (ТЗТ §5.1):
-	// проверка до EnsureZone и чтения файла — запрещённый каталог не
-	// создаёт зону в справочнике и не грузит партию, файл сразу
-	// ошибочен (failed/ с причиной, строки не разбираются, T-021).
-	// Та же проверка стоит в NewValidator (страховка прямых вызовов
-	// валидатора вне конвейера).
+	// A multi-level zone directory — only from the allowlist (the
+	// tld-only-zones spec §5.1): the check runs before EnsureZone and
+	// reading the file — a forbidden directory neither creates a zone in
+	// the reference table nor loads a batch, the file is invalid right
+	// away (failed/ with the reason, lines are not parsed, T-021).
+	// The same check stands in NewValidator (a guard for direct
+	// validator calls outside the pipeline).
 	if err := checkZonePath(f.Zone, p.opts.AllowedZonePaths); err != nil {
 		return p.failFile(abs, rep, fmt.Errorf("ingest: файл %s: %w", f.Path, err))
 	}
 
-	// Зона зона-каталога находится или создаётся автоматически при первом
-	// файле (ТЗ 5.1; EnsureZone, T-014) и сразу согревает кэш зон строк.
-	// Зона-less файл (f.Zone == "") зон upfront не знает: зоны создаются
-	// лениво по первым строкам (emitRow), кэш — на файл. Сбой —
-	// инфраструктурный: файл остаётся (at-least-once, ТЗ 3.4).
+	// The zone of a zone directory is found or created automatically on
+	// the first file (spec 5.1; EnsureZone, T-014) and immediately
+	// warms the line zone cache. A zone-less file (f.Zone == "") has no
+	// upfront zones: they are created lazily by the first lines
+	// (emitRow), the cache is per file. A failure is an infrastructure
+	// one: the file stays (at-least-once, spec 3.4).
 	zoneIDs := make(map[string]int16)
 	if f.Zone != "" {
 		z, zerr := EnsureZone(ctx, p.zones, f.Zone)
@@ -223,7 +234,7 @@ func (p *Pipeline) process(ctx context.Context, abs string) Outcome {
 		rep.ZoneID = z.ID
 		zoneIDs[f.Zone] = z.ID
 	}
-	zoneID := rep.ZoneID // 0 — зона-less файл (отчёт: zone_id NULL)
+	zoneID := rep.ZoneID // 0 — a zone-less file (the report: zone_id NULL)
 
 	id, err := NewBatchID()
 	if err != nil {
@@ -235,15 +246,16 @@ func (p *Pipeline) process(ctx context.Context, abs string) Outcome {
 	if err != nil {
 		return Outcome{Kind: OutcomeLeft, Report: rep, Err: fmt.Errorf("ingest: чтение файла %s: %w", abs, err)}
 	}
-	// Файл открыт только для чтения: ошибка закрытия безвредна.
+	// The file is opened read-only: a close error is harmless.
 	defer func() { _ = fh.Close() }()
 
-	// Один проход по файлу (ТЗ 3.5): байты одновременно идут в sha256
-	// (TeeReader) и в парсер; валидные строки грузятся в staging по мере
-	// разбора. Хэш известен к концу чтения — проверка дубля ниже.
-	// Архивы (T-133) ветвятся по расширению: tar/gz — тот же единственный
-	// проход (TeeReader под распаковщиками), zip — проход хэша плюс чтение
-	// членов по смещениям (ReaderAt: формат с произвольным доступом).
+	// One pass over the file (spec 3.5): bytes go simultaneously into
+	// sha256 (TeeReader) and into the parser; valid lines are loaded
+	// into staging as parsing proceeds. The hash is known by the end of
+	// reading — the duplicate check is below. Archives (T-133) branch by
+	// extension: tar/gz — the same single pass (TeeReader under the
+	// unpackers), zip — a hash pass plus reading members by offsets
+	// (ReaderAt: a random-access format).
 	h := sha256.New()
 	var (
 		st   Stats
@@ -266,16 +278,17 @@ func (p *Pipeline) process(ctx context.Context, abs string) Outcome {
 	rep.Reasons = vres.Reasons
 	if err != nil {
 		if errors.Is(err, errArchiveRejected) || errors.Is(err, errZoneNotAllowed) {
-			// Ошибка по сути файла: архив ошибочен (битый, лимиты, член
-			// выше порога — T-133) либо многоуровневая зона каталога вне
-			// allowlist (страховочная ветка NewValidator — рабочая
-			// проверка стоит в начале process; сюда попадает только при
-			// рассинхроне опций, классифицируем файлом, не вечным
-			// retry): как txt-файл с долей отказов выше порога — строки
-			// не применяются, партия отбрасывается (ТЗ 5.1), файл целиком
-			// в failed/ с лог-отчётом; частично принятые строки не
-			// применялись, повторная подача идемпотентна (ON CONFLICT
-			// DO NOTHING, ТЗ 5.1).
+			// An error in the substance of the file: the archive is
+			// invalid (broken, limits, a member above the threshold —
+			// T-133) or a multi-level directory zone outside the
+			// allowlist (the NewValidator guard branch — the working
+			// check stands at the beginning of process; this is reached
+			// only on option desync, we classify the file, not an eternal
+			// retry): like a txt file with an error share above the
+			// threshold — lines are not applied, the batch is discarded
+			// (spec 5.1), the file as a whole goes to failed/ with the log
+			// report; partially accepted lines were not applied,
+			// resubmission is idempotent (ON CONFLICT DO NOTHING, spec 5.1).
 			if derr := p.clearBatch(ctx, id); derr != nil {
 				p.discard(id)
 				return Outcome{Kind: OutcomeLeft, Report: rep, Err: derr}
@@ -287,17 +300,19 @@ func (p *Pipeline) process(ctx context.Context, abs string) Outcome {
 	}
 
 	if vres.Failed {
-		// Доля отказов выше порога (T-016): файл ошибочен целиком,
-		// строки не применяются — партия отбрасывается (ТЗ 5.1).
+		// The error share is above the threshold (T-016): the file is
+		// invalid as a whole, lines are not applied — the batch is
+		// discarded (spec 5.1).
 		if derr := p.clearBatch(ctx, id); derr != nil {
-			// Очистка не прошла (в т.ч. отмена ctx при graceful
-			// shutdown): retry собственным контекстом — строки партии
-			// не должны оставаться в staging (batch_id не встретится).
+			// The clearing did not go through (including ctx cancellation
+			// during graceful shutdown): retried with its own context —
+			// the batch lines must not stay in staging (the batch_id will
+			// never be seen again).
 			p.discard(id)
 			return Outcome{Kind: OutcomeLeft, Report: rep, Err: derr}
 		}
-		// Числитель/знаменатель — как в вердикте streamStage: отказы
-		// парсера (invalid_utf8, line_len) плюс отказы валидатора.
+		// Numerator/denominator — as in the streamStage verdict: parser
+		// rejections (invalid_utf8, line_len) plus validator rejections.
 		rejectedAll := int64(st.Rejected) + int64(vres.Rejected)
 		contentAll := int64(vres.Total) + int64(st.Rejected)
 		return p.failFile(abs, rep, fmt.Errorf(
@@ -305,12 +320,12 @@ func (p *Pipeline) process(ctx context.Context, abs string) Outcome {
 			rejectedAll, contentAll, p.opts.MaxErrorRatio))
 	}
 
-	// Идемпотентность (ТЗ 5.1; T-113): пропускается только точная
-	// повторная доставка — совпадение (зона, действие, sha256); у
-	// зона-less файла «зона» журнала — NULL (зон у файла нет).
-	// Дубль с другим действием (undo тем же списком: add/, затем
-	// delete/) и дубль в другой зоне обрабатываются: безвредность
-	// повторного применения гарантируют операции над доменами (T-097).
+	// Idempotency (spec 5.1; T-113): only exact redelivery is skipped —
+	// a match of (zone, action, sha256); for a zone-less file the log
+	// "zone" is NULL (a file has no zones). A duplicate with another
+	// action (an undo by the same list: add/, then delete/) and a
+	// duplicate in another zone are processed: the harmlessness of
+	// repeated applying is guaranteed by the domain operations (T-097).
 	known, err := p.files.FilesBySHA256(ctx, rep.SHA256)
 	if err != nil {
 		p.discard(id)
@@ -325,23 +340,23 @@ func (p *Pipeline) process(ctx context.Context, abs string) Outcome {
 		sameAction := k.Action != nil && *k.Action == f.Action
 		switch {
 		case sameZone && sameAction:
-			dup = k // точная повторная доставка
+			dup = k // exact redelivery
 		case sameAction:
 			if crossZone == nil {
-				crossZone = k // то же действие в другой зоне
+				crossZone = k // the same action in another zone
 			}
 		default:
 			if crossAction == nil {
-				crossAction = k // другое действие, зона любая
+				crossAction = k // another action, any zone
 			}
 		}
 	}
 
 	if dup != nil {
 		if derr := p.clearBatch(ctx, id); derr != nil {
-			// Дубль не применяется, но партия уже загружена: сбой
-			// очистки (в т.ч. отмена ctx) ретрается discard'ом — как в
-			// ветке порога ошибок выше.
+			// The duplicate is not applied, but the batch is already
+			// loaded: a clearing failure (including ctx cancellation) is
+			// retried by discard — as in the error threshold branch above.
 			p.discard(id)
 			return Outcome{Kind: OutcomeLeft, Report: rep, Err: derr}
 		}
@@ -355,11 +370,11 @@ func (p *Pipeline) process(ctx context.Context, abs string) Outcome {
 		return Outcome{Kind: OutcomeDuplicate, Report: rep}
 	}
 
-	// Точной повторной доставки нет — файл применяется. То же
-	// содержимое уже доставлялось иначе: повторная обработка в другой
-	// зоне при том же действии легитимна (домены той зоны первая
-	// доставка не трогала), но оператору полезно её видеть (Warn,
-	// ING-P2-5); другое действие — плановый undo (Info).
+	// No exact redelivery — the file is applied. The same content was
+	// already delivered differently: reprocessing in another zone with
+	// the same action is legitimate (the first delivery did not touch
+	// that zone's domains), but it is useful for the operator to see it
+	// (Warn, ING-P2-5); another action — a planned undo (Info).
 	if crossZone != nil {
 		p.log.Warn("дубль по sha256 в другой зоне при том же действии — обрабатывается",
 			"path", f.Path, "action", f.Action.String(), "zone_id", zoneID,
@@ -374,13 +389,13 @@ func (p *Pipeline) process(ctx context.Context, abs string) Outcome {
 			"first_processed_at", derefTime(crossAction.ProcessedAt))
 	}
 
-	// Применение по действию файла (ТЗ 5.1): add → ApplyAdd,
-	// delete → ApplyDelete. Оба идемпотентны (ТЗ 3.4), сбой — файл
-	// остаётся в incoming, повтор сойдётся к тому же итогу.
+	// Applying by the file action (spec 5.1): add → ApplyAdd,
+	// delete → ApplyDelete. Both are idempotent (spec 3.4); a failure —
+	// the file stays in incoming, a retry converges to the same outcome.
 	switch f.Action {
 	case model.ActionAdd:
-		// Пачки применения — тем же ingest.batch_size, что и пачки COPY
-		// в staging (T-205).
+		// Apply chunks — the same ingest.batch_size as the COPY chunks
+		// into staging (T-205).
 		res, aerr := ApplyAdd(ctx, p.pool, batch, p.opts.BatchSize)
 		if aerr != nil {
 			p.discard(id)
@@ -399,9 +414,10 @@ func (p *Pipeline) process(ctx context.Context, abs string) Outcome {
 		rep.NotFound = res.NotFound
 	}
 
-	// Отчёт — после обработки файла (ТЗ 5.1: «после обработки файла
-	// пишется отчёт»). Уникальность (zone_id, action, sha256) — второй
-	// рубеж защиты от дублей: конкурентный отчёт отвергается схемой
+	// The report — after processing the file (spec 5.1: "after
+	// processing the file a report is written"). The (zone_id, action,
+	// sha256) uniqueness is the second line of defense against
+	// duplicates: a concurrent report is rejected by the schema
 	// (sqlFileRecord).
 	if rerr := p.files.RecordFile(ctx, rep.record(p.now())); rerr != nil {
 		return Outcome{Kind: OutcomeLeft, Report: rep,
@@ -409,8 +425,9 @@ func (p *Pipeline) process(ctx context.Context, abs string) Outcome {
 	}
 
 	if _, merr := p.moveFile(DirProcessed, f.Path, abs); merr != nil {
-		// Отчёт уже в журнале: повторная обработка найдёт дубль и лишь
-		// перенесёт файл — самовосстановление без повторного применения.
+		// The report is already in the log: reprocessing will find the
+		// duplicate and only move the file — self-healing without
+		// re-applying.
 		return Outcome{Kind: OutcomeLeft, Report: rep, Err: merr}
 	}
 
@@ -423,12 +440,14 @@ func (p *Pipeline) process(ctx context.Context, abs string) Outcome {
 	return Outcome{Kind: OutcomeApplied, Report: rep}
 }
 
-// emitRow — строка файла в строку staging: зона записи (Entry.Zone — зона
-// пути либо, у зона-less файла, выведенная из имени) резолвится в zones.id
-// через кэш файла; отсутствующая зона создаётся автоматически (EnsureZone,
-// ТЗ 5.1) — по первой строке зона-less файла или первой строке новой зоны.
-// Кэш держит одну размороженную EnsureZone-проверку на зону файла:
-// файл зона-каталога — один entry, зона-less — по числу зон файла.
+// emitRow — a file line into a staging row: the record zone
+// (Entry.Zone — the path zone or, for a zone-less file, the one
+// derived from the name) is resolved into zones.id via the file cache;
+// a missing zone is created automatically (EnsureZone, spec 5.1) — by
+// the first line of a zone-less file or the first line of a new zone.
+// The cache keeps one EnsureZone check (the zone is unfrozen) per file
+// zone: a zone-directory file — one entry, a zone-less one — as many
+// as the file's zones.
 func (p *Pipeline) emitRow(ctx context.Context, cache map[string]int16, emit func(Row) error, e Entry, lineNo int64) error {
 	id, ok := cache[e.Zone]
 	if !ok {
@@ -442,16 +461,17 @@ func (p *Pipeline) emitRow(ctx context.Context, cache map[string]int16, emit fun
 	return emit(Row{ZoneID: id, Label: e.Label, LineNo: lineNo})
 }
 
-// streamStage — один проход по файлу (повторного чтения нет, ТЗ 3.5):
-// поток r идёт в парсер (T-015), значимые строки валидируются (T-016) и
-// грузятся в staging (T-017) по мере разбора. Возвращает счётчики
-// парсера, итог валидации (Reasons — уже объединённые с построчными
-// отклонениями парсера; Failed — по доле отказов валидатора и парсера
-// вместе) и число загруженных строк. Ошибка — сбой чтения файла или
-// загрузки; счётчики соответствуют отданному.
+// streamStage — one pass over the file (no re-reading, spec 3.5): the
+// stream r goes into the parser (T-015), meaningful lines are
+// validated (T-016) and loaded into staging (T-017) as parsing
+// proceeds. Returns the parser counters, the validation outcome
+// (Reasons — already merged with the per-line parser rejections;
+// Failed — by the error share of the validator and the parser
+// together) and the number of loaded lines. An error is a file reading
+// or loading failure; the counters match what was yielded.
 //
-// Парсер толкающий (OnLine), Stage — тянущий (RowIter); связка —
-// stageStream (горутина-производитель и буферизованный канал).
+// The parser is pushing (OnLine), Stage is pulling (RowIter); the link
+// is stageStream (a producer goroutine and a buffered channel).
 func (p *Pipeline) streamStage(ctx context.Context, r io.Reader, f File, batch Batch, zoneIDs map[string]int16) (Stats, FileResult, int64, error) {
 	v, err := NewValidator(ValidatorOptions{
 		File:             f.Path,
@@ -463,9 +483,10 @@ func (p *Pipeline) streamStage(ctx context.Context, r io.Reader, f File, batch B
 	if err != nil {
 		return Stats{}, FileResult{}, 0, fmt.Errorf("ingest: файл %s: %w", f.Path, err)
 	}
-	// Построчные отказы парсера пишутся тем же rejected-логом, что и
-	// отказы валидатора (формат — Validator.reject): Reject.Text парсер
-	// уже обрезал (maxRejectText), nil-логгер — записи подавлены.
+	// Per-line parser rejections are written to the same rejected log
+	// as the validator rejections (the format — Validator.reject):
+	// Reject.Text was already truncated by the parser (maxRejectText),
+	// a nil logger — records suppressed.
 	rejectLog := p.opts.RejectLog
 	if rejectLog == nil {
 		rejectLog = slog.New(slog.DiscardHandler)
@@ -473,7 +494,7 @@ func (p *Pipeline) streamStage(ctx context.Context, r io.Reader, f File, batch B
 
 	var (
 		st       Stats
-		prejects = make(map[Reason]int) // построчные отклонения парсера
+		prejects = make(map[Reason]int) // per-line parser rejections
 	)
 	staged, serr, perr := p.stageStream(ctx, batch, func(emit func(Row) error) error {
 		var perr error
@@ -481,7 +502,7 @@ func (p *Pipeline) streamStage(ctx context.Context, r io.Reader, f File, batch B
 			OnLine: func(l Line) error {
 				e, _, ok := v.Line(l.Num, l.Text)
 				if !ok {
-					return nil // отклонение учтено валидатором (rejected-лог)
+					return nil // the rejection is counted by the validator (the rejected log)
 				}
 				return p.emitRow(ctx, zoneIDs, emit, e, int64(l.Num))
 			},
@@ -507,24 +528,25 @@ func (p *Pipeline) streamStage(ctx context.Context, r io.Reader, f File, batch B
 	}
 	res := v.Finish()
 	res.Reasons = mergeReasons(prejects, res.Reasons)
-	// Построчные отказы парсера (invalid_utf8, line_len) до v.Line не
-	// доходят и потому не в счётчиках Finish — досчитываем их в порог
-	// сами: доля ошибок считается по всем содержательным строкам файла
-	// (битый дамп — именно не-UTF-8, docs/incoming-files.md §4), иначе
-	// файл целиком из мусора (Data = 0) прошёл бы как успешный (ING-P1-2).
+	// Per-line parser rejections (invalid_utf8, line_len) never reach
+	// v.Line and are therefore not in the Finish counters — we add them
+	// into the threshold ourselves: the error share is counted over all
+	// meaningful lines of the file (a broken dump is exactly non-UTF-8,
+	// docs/incoming-files.md §4), otherwise a file of pure junk
+	// (Data = 0) would pass as successful (ING-P1-2).
 	res.Failed = overErrorRatio(p.opts.MaxErrorRatio, res.Total, res.Rejected, st.Rejected)
 	return st, res, staged, nil
 }
 
-// stageStream — связка производителя строк и загрузки staging (ТЗ 3.5):
-// produce толкает валидные строки через emit, Stage тянет их из
-// буферизованного канала пачками COPY. Память ограничена stageChanSize и
-// размером пачки; при ошибке загрузки потребитель закрывает stop,
-// производитель завершается без утечки. Возвращает ошибки загрузки и
-// производителя раздельно: остановленный потребителем производитель
-// (errStopped) — не ошибка, cause — в stageErr. Счётчики производителя
-// остаются его замыканиям (после возврата горутина закончена — чтение
-// безопасно).
+// stageStream — the link between the line producer and the staging
+// load (spec 3.5): produce pushes valid lines through emit, Stage
+// pulls them from the buffered channel in COPY chunks. Memory is
+// bounded by stageChanSize and the chunk size; on a load error the
+// consumer closes stop, the producer finishes without a leak. Load and
+// producer errors are returned separately: a producer stopped by the
+// consumer (errStopped) is not an error, the cause is in stageErr.
+// The producer counters stay in its closures (by the time of the
+// return the goroutine has finished — reading is safe).
 func (p *Pipeline) stageStream(ctx context.Context, batch Batch, produce func(emit func(Row) error) error) (staged int64, stageErr, produceErr error) {
 	rows := make(chan Row, stageChanSize)
 	stop := make(chan struct{})
@@ -563,8 +585,9 @@ func (p *Pipeline) stageStream(ctx context.Context, batch Batch, produce func(em
 	return staged, nil, perr
 }
 
-// clearBatch — очистка партии в staging; ошибка оборачивается контекстом
-// (после ошибки обработки или для неприменяемой партии).
+// clearBatch — clearing the batch in staging; the error is wrapped
+// with context (after a processing error or for a non-applicable
+// batch).
 func (p *Pipeline) clearBatch(ctx context.Context, id BatchID) error {
 	if _, err := ClearBatch(ctx, p.pool, id); err != nil {
 		return fmt.Errorf("ingest: отбрасывание партии в %s: %w", StageTable, err)
@@ -572,18 +595,21 @@ func (p *Pipeline) clearBatch(ctx context.Context, id BatchID) error {
 	return nil
 }
 
-// discardTimeout — запас на очистку партии после сбоя: отдельный
-// контекст с таймаутом, чтобы best-effort очистка не висела вечно.
+// discardTimeout — the margin for clearing a batch after a failure: a
+// separate context with a timeout so that best-effort clearing does
+// not hang forever.
 const discardTimeout = 5 * time.Second
 
-// discard — отбросить партию после инфраструктурного сбоя (best effort):
-// каждая попытка обработки берёт новый batch_id, строки неудачной партии
-// мертвы — чистим, чтобы staging не рос (T-017). Вызывается и с уже
-// отменённым ctx (graceful shutdown в момент загрузки): очистка обязана
-// переживать отмену — иначе строки партии оставались бы в staging
-// навсегда (batch_id больше не встретится) и таблица росла от рестарта
-// к рестарту. Контекст — свой, с таймаутом; ошибка очистки не затеняет
-// основную: логируется.
+// discard — drop the batch after an infrastructure failure (best
+// effort): every processing attempt takes a new batch_id, the rows of
+// the failed batch are dead — we clean them up so staging does not
+// grow (T-017). Also called with an already cancelled ctx (graceful
+// shutdown at the moment of loading): the clearing must survive
+// cancellation — otherwise the batch rows would stay in staging
+// forever (the batch_id will never be seen again) and the table would
+// grow from restart to restart. The context is its own, with a
+// timeout; a clearing error does not shadow the main one: it is
+// logged.
 func (p *Pipeline) discard(id BatchID) {
 	ctx, cancel := context.WithTimeout(context.Background(), discardTimeout)
 	defer cancel()
@@ -592,20 +618,21 @@ func (p *Pipeline) discard(id BatchID) {
 	}
 }
 
-// failFile — файл ошибочен: перемещение в failed/ и лог-отчёт рядом
-// (ТЗ 5.1). rel назначения — разобранный путь (зеркалит зону/операцию);
-// путь из неразобранного отчёта не доверяется (Process — публичный API,
-// абсолютный путь или «..» в компонентах filepath.Join вывел бы за
-// пределы failed/): файл кладётся по базовому имени. Имя отчёта —
-// <файл>.report.
+// failFile — the file is invalid: moving to failed/ and the log
+// report nearby (spec 5.1). The rel of the destination is the parsed
+// path (it mirrors the zone/action); the path from an unparsed report
+// is not trusted (Process is a public API; an absolute path or ".."
+// in the components would let filepath.Join escape failed/): the file
+// is placed by its base name. The report name is <file>.report.
 func (p *Pipeline) failFile(abs string, rep FileReport, reason error) Outcome {
 	rel := archiveRel(rep.Path, abs)
 	dst, err := p.moveFile(DirFailed, rel, abs)
 	if err != nil {
 		return Outcome{Kind: OutcomeLeft, Report: rep, Err: err}
 	}
-	// Файл уже убран из incoming: сбой записи отчёта не возвращает его —
-	// причина ошибки сохранена в логе сервиса.
+	// The file is already out of incoming: a report write failure does
+	// not bring it back — the error reason is preserved in the service
+	// log.
 	if werr := os.WriteFile(dst+".report", []byte(renderReport(rep, "ошибочен — "+reason.Error())), 0o644); werr != nil {
 		p.log.Warn("лог-отчёт рядом с файлом не записан",
 			"path", dst+".report", "err", werr)
@@ -615,12 +642,14 @@ func (p *Pipeline) failFile(abs string, rep FileReport, reason error) Outcome {
 	return Outcome{Kind: OutcomeFailed, Report: rep, Err: reason}
 }
 
-// moveFile перемещает файл в архив processed/failed, сохраняя структуру
-// зоны и операции (incoming/com/add/x.txt → processed/com/add/x.txt):
-// происхождение файла видно в архиве без журнала. rel — путь назначения
-// внутри каталога архива. os.Rename на Unix молча заменяет цель, поэтому
-// занятое имя проверяется явно; коллизия (другой экземпляр файла с тем
-// же именем) получает числовой суффикс: x.txt → x-2.txt, x-3.txt, …
+// moveFile moves the file to the processed/failed archive preserving
+// the zone and action structure (incoming/com/add/x.txt →
+// processed/com/add/x.txt): the file origin is visible in the archive
+// without the log. rel — the destination path inside the archive
+// directory. os.Rename on Unix silently replaces the target, so a
+// taken name is checked explicitly; a collision (another instance of
+// a file with the same name) gets a numeric suffix: x.txt → x-2.txt,
+// x-3.txt, …
 func (p *Pipeline) moveFile(archive, rel, abs string) (string, error) {
 	dst := filepath.Join(p.opts.Dir, archive, filepath.FromSlash(rel))
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
@@ -634,7 +663,7 @@ func (p *Pipeline) moveFile(archive, rel, abs string) (string, error) {
 			target = fmt.Sprintf("%s-%d%s", stem, i, ext)
 		}
 		if _, err := os.Lstat(target); err == nil {
-			continue // имя занято другим экземпляром
+			continue // the name is taken by another instance
 		} else if !errors.Is(err, fs.ErrNotExist) {
 			return "", fmt.Errorf("ingest: архив %s: %w", target, err)
 		}
@@ -645,11 +674,12 @@ func (p *Pipeline) moveFile(archive, rel, abs string) (string, error) {
 	}
 }
 
-// archiveRel — безопасный относительный путь назначения внутри каталога
-// архива. Разобранный ParsePath путь безопасен по построению (path.Clean,
-// без «..» — T-014); неразобранный rep.Path не доверяется: абсолютный
-// путь или «..» в компонентах после filepath.Join выходили бы за пределы
-// processed/failed (ING-P3-1) — подставляется базовое имя файла.
+// archiveRel — a safe relative destination path inside the archive
+// directory. A path parsed by ParsePath is safe by construction
+// (path.Clean, no ".." — T-014); an unparsed rep.Path is not trusted:
+// an absolute path or ".." in the components would escape
+// processed/failed after filepath.Join (ING-P3-1) — the file's base
+// name is substituted.
 func archiveRel(rel, abs string) string {
 	if rel != "" && !path.IsAbs(rel) {
 		if c := path.Clean(rel); c != "." && c != ".." && !strings.HasPrefix(c, "../") {
@@ -659,7 +689,7 @@ func archiveRel(rel, abs string) string {
 	return filepath.Base(abs)
 }
 
-// derefString — значение NULL-колонки журнала для лога (пустая строка).
+// derefString — the value of a NULL log column for the log (an empty string).
 func derefString(s *string) string {
 	if s == nil {
 		return ""
@@ -667,7 +697,7 @@ func derefString(s *string) string {
 	return *s
 }
 
-// derefTime — значение NULL-колонки журнала для лога (нулевой момент).
+// derefTime — the value of a NULL log column for the log (the zero moment).
 func derefTime(t *time.Time) time.Time {
 	if t == nil {
 		return time.Time{}
@@ -675,7 +705,7 @@ func derefTime(t *time.Time) time.Time {
 	return *t
 }
 
-// derefAction — значение NULL-колонки журнала для лога (пустое имя).
+// derefAction — the value of a NULL log column for the log (an empty name).
 func derefAction(a *model.Action) string {
 	if a == nil {
 		return ""
@@ -683,7 +713,7 @@ func derefAction(a *model.Action) string {
 	return a.String()
 }
 
-// derefInt16 — значение NULL-колонки журнала для лога (ноль).
+// derefInt16 — the value of a NULL log column for the log (zero).
 func derefInt16(v *int16) int16 {
 	if v == nil {
 		return 0

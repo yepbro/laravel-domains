@@ -1,6 +1,6 @@
-// Юнит-тесты валидации строк ingest (T-016): принадлежность зоне пути,
-// типизированные причины отклонения, лог rejected (формат закреплён),
-// счётчики и порог доли ошибок на файл.
+// Unit tests of ingest line validation (T-016): belonging to the path zone,
+// typed rejection reasons, the rejected log (the format is fixed), the
+// counters and the per-file error ratio threshold.
 package ingest
 
 import (
@@ -11,11 +11,11 @@ import (
 	"testing"
 )
 
-// newValidator — валидатор одного файла с логом rejected в буфер
-// (проверка записей) и заданным порогом доли ошибок. Многоуровневая
-// зона каталога автоматически попадает в allowlist (ТЗТ §5.1): эти
-// тесты проверяют семантику domainLabel; gate allowlist — отдельно в
-// TestNewValidator.
+// newValidator — a validator of one file with the rejected log into a buffer
+// (checking the entries) and a given error ratio threshold. A multi-level
+// directory zone automatically goes into the allowlist (the tld-only-zones
+// spec §5.1): these tests check the domainLabel semantics; the allowlist
+// gate — separately in TestNewValidator.
 func newValidator(t *testing.T, zone string, ratio float64) (*Validator, *bytes.Buffer) {
 	t.Helper()
 	var allowed []string
@@ -45,28 +45,30 @@ func TestLineValid(t *testing.T) {
 		label    string
 		isIDN    bool
 	}{
-		// Домен из зоны пути; помарки ввода прощаются нормализацией
-		// (ТЗ 5.2 п. 1: регистр, пробелы, завершающая точка).
+		// A domain from the path zone; input blemishes are forgiven by
+		// normalization (spec 5.2 item 1: case, spaces, the trailing dot).
 		{"простой", "com", "example.com", "com", "example", false},
 		{"регистр и точка", "com", "  EXAMPLE.Com. ", "com", "example", false},
-		// IDN: строка в unicode, зона пути в punycode — и наоборот.
+		// IDN: a line in unicode, the path zone in punycode — and vice versa.
 		{"unicode строка в punycode зоне", "xn--p1ai", "пример.рф", "xn--p1ai", "xn--e1afmkfd", true},
 		{"punycode строка в punycode зоне", "xn--p1ai", "xn--e1afmkfd.xn--p1ai", "xn--p1ai", "xn--e1afmkfd", true},
 		{"unicode зона каталога", "РФ.", "пример.рф", "xn--p1ai", "xn--e1afmkfd", true},
-		// бит is_idn — по метке домена, а не по зоне (ТЗ 5.2 п. 9).
+		// the is_idn bit — by the domain label, not by the zone (spec 5.2 item 9).
 		{"ascii метка в idn зоне", "xn--p1ai", "example.xn--p1ai", "xn--p1ai", "example", false},
-		// Зона пути — составное имя глубже TLD имени (ветка 3
-		// domainLabel: каталог задаёт зону явно, тестовые зоны T-014).
+		// The path zone is a compound name deeper than the name TLD (branch 3
+		// of domainLabel: the directory sets the zone explicitly, the T-014
+		// test zones).
 		{"составная зона пути", "co.uk", "example.co.uk", "co.uk", "example", false},
 		{"составная метка", "co.uk", "магазин.рф.co.uk", "co.uk", "xn--80aairftm.xn--p1ai", true},
-		// 2LD-регистрация в TLD-зоне пути: зона имени — TLD (idn,
-		// TLD-only), составная метка — норма (ТЗТ §5.3: бывший
-		// wrong_zone).
+		// A 2LD registration in a TLD path zone: the name zone is the TLD
+		// (idn, TLD-only), a compound label is the norm (the tld-only-zones
+		// spec §5.3: formerly wrong_zone).
 		{"2LD-регистрация в TLD-зоне", "uk", "example.co.uk", "uk", "example.co", false},
 		{"частный суффикс в TLD-зоне", "io", "foo.github.io", "io", "foo.github", false},
 		{"5g.in в зоне in", "in", "example.5g.in", "in", "example.5g", false},
-		// Зона пути глубже TLD имени — тестовые зоны (T-014):
-		// у example.crawl.test зона имени test, зона пути crawl.test.
+		// The path zone deeper than the name TLD — the test zones (T-014):
+		// for example.crawl.test the name zone is test, the path zone is
+		// crawl.test.
 		{"зона пути глубже TLD", "crawl.test", "example.crawl.test", "crawl.test", "example", false},
 		{"составная метка вне списка", "crawl.test", "sub.example.crawl.test", "crawl.test", "sub.example", false},
 		{"последняя метка как зона", "test", "crawl.test", "test", "crawl", false},
@@ -96,21 +98,22 @@ func TestLineValid(t *testing.T) {
 
 func TestLineRejected(t *testing.T) {
 	longName := strings.Repeat("a", 63) + "." + strings.Repeat("b", 63) + "." +
-		strings.Repeat("c", 63) + "." + strings.Repeat("d", 62) // 254 октета
+		strings.Repeat("c", 63) + "." + strings.Repeat("d", 62) // 254 octets
 	tests := []struct {
 		name   string
 		zone   string
 		line   string
 		reason Reason
 	}{
-		// Домен из другой зоны (ТЗ 5.2 п. 6).
+		// A domain from another zone (spec 5.2 item 6).
 		{"другая зона", "com", "example.org", ReasonWrongZone},
 		{"субдомен другой зоны", "com", "sub.example.org", ReasonWrongZone},
 		{"валидный idn не из зоны", "com", "пример.рф", ReasonWrongZone},
-		// Голый суффикс — валидное имя другой зоны (TLD-only: зона uk,
-		// метка co): в чужом каталоге — wrong_zone (ТЗТ §12.6).
+		// A bare suffix — a valid name of another zone (TLD-only: the zone
+		// uk, the label co): in a foreign directory — wrong_zone (the
+		// tld-only-zones spec §12.6).
 		{"голый суффикс другой зоны", "com", "co.uk", ReasonWrongZone},
-		// Классы idn.Error (ТЗ 5.2).
+		// The idn.Error classes (spec 5.2).
 		{"пустая строка", "com", "", ReasonEmpty},
 		{"только пробелы", "com", "   ", ReasonEmpty},
 		{"только точка", "com", ".", ReasonEmpty},
@@ -119,9 +122,9 @@ func TestLineRejected(t *testing.T) {
 		{"пустая метка", "com", "example..com", ReasonInvalid},
 		{"метка длиннее 63", "com", strings.Repeat("a", 64) + ".com", ReasonLabelLen},
 		{"имя длиннее 253", "com", longName, ReasonNameLen},
-		// Метки перед зоной нет: имя — сам TLD.
+		// There is no label before the zone: the name is the TLD itself.
 		{"голый TLD", "com", "com", ReasonNoLabel},
-		// Зона пути вне TLD: имя совпадает с зоной.
+		// A path zone that is not a TLD: the name coincides with the zone.
 		{"имя равно зоне пути", "crawl.test", "crawl.test", ReasonNoLabel},
 	}
 	for _, tc := range tests {
@@ -141,8 +144,9 @@ func TestLineRejected(t *testing.T) {
 	}
 }
 
-// Формат лога rejected: текстовый slog, атрибут service=rejected, запись
-// с атрибутами файл/номер строки/обрезанная строка/причина (ТЗ 5.1).
+// The rejected log format: a text slog, the service=rejected attribute, an
+// entry with the file/line number/truncated line/reason attributes
+// (spec 5.1).
 func TestRejectedLogFormat(t *testing.T) {
 	v, buf := newValidator(t, "com", 0)
 	if _, _, ok := v.Line(3, "example.org"); ok {
@@ -163,18 +167,19 @@ func TestRejectedLogFormat(t *testing.T) {
 	}
 }
 
-// Длинный мусор обрезается до 255 рун с многоточием (вход недоверенный).
+// Long junk is truncated to 255 runes with an ellipsis (the input is untrusted).
 func TestRejectedLogTruncates(t *testing.T) {
 	v, buf := newValidator(t, "com", 0)
-	v.Line(1, strings.Repeat("ё", 300)+".com") // невалидная метка любой длины
+	v.Line(1, strings.Repeat("ё", 300)+".com") // an invalid label of any length
 	want := "text=" + strings.Repeat("ё", maxLoggedRunes) + "…"
 	if !strings.Contains(buf.String(), want) {
 		t.Errorf("строка в логе не обрезана до %d рун", maxLoggedRunes)
 	}
 }
 
-// Порог доли ошибок: доля, равная порогу, файл не роняет; превышение —
-// файл ошибочен целиком (ТЗ 5.1; сигнал failed/ для T-021).
+// The error ratio threshold: a ratio equal to the threshold does not fail
+// the file; an excess — the file is failed as a whole (spec 5.1; the
+// failed/ signal for T-021).
 func TestErrorRatioBoundary(t *testing.T) {
 	run := func(t *testing.T, ratio float64, bad, good int) FileResult {
 		t.Helper()
@@ -183,7 +188,7 @@ func TestErrorRatioBoundary(t *testing.T) {
 			v.Line(i+1, "example"+string(rune('a'+i%26))+".com")
 		}
 		for i := 0; i < bad; i++ {
-			v.Line(good+i+1, "example.org") // не из зоны
+			v.Line(good+i+1, "example.org") // not from the zone
 		}
 		return v.Finish()
 	}
@@ -213,8 +218,8 @@ func TestErrorRatioBoundary(t *testing.T) {
 	})
 }
 
-// Счётчики файла: всего/принято/отклонено и распределение причин
-// (отчёт ingest_files, ТЗ 5.1, T-021).
+// The file counters: total/accepted/rejected and the reason distribution
+// (the ingest_files report, spec 5.1, T-021).
 func TestFinishStats(t *testing.T) {
 	v, _ := newValidator(t, "com", 0)
 	lines := []string{"example.com", "example.org", "", "example..com", "shop.com"}
@@ -252,9 +257,10 @@ func TestNewValidator(t *testing.T) {
 			t.Error("невалидная зона должна давать ошибку")
 		}
 	})
-	// Gate многоуровневых каталогов (ТЗТ §5.1): рабочие каталоги — TLD,
-	// зона с точкой — только из allowlist; ошибка уровня файла
-	// идентифицируется errors.Is (конвейер → failed/, T-021).
+	// The gate of multi-level directories (the tld-only-zones spec §5.1):
+	// working directories are TLDs, a zone with a dot — from the allowlist
+	// only; the file-level error is identified by errors.Is (the pipeline →
+	// failed/, T-021).
 	t.Run("многоуровневая зона без allowlist", func(t *testing.T) {
 		for _, zone := range []string{"co.uk", "crawl.test", "a.b.c"} {
 			_, err := NewValidator(ValidatorOptions{Zone: zone})
@@ -276,9 +282,9 @@ func TestNewValidator(t *testing.T) {
 		}
 	})
 	t.Run("allowlist-запись в верхнем регистре", func(t *testing.T) {
-		// Нормализация записи внутри checkZonePath: прямые вызовы с
-		// ненормализованным списком тоже работают (конфиг канонизирует
-		// записи при загрузке — здесь эта страховка).
+		// The entry is normalized inside checkZonePath: direct calls with an
+		// unnormalized list work too (the config canonicalizes the entries at
+		// load — this is that guard here).
 		v, err := NewValidator(ValidatorOptions{
 			Zone:             "crawl.test",
 			AllowedZonePaths: []string{"Crawl.Test"},
@@ -317,11 +323,11 @@ func TestNewValidator(t *testing.T) {
 	})
 }
 
-// TestValidatorZoneless — зона-less файл (Zone == ""): зоны строк
-// выводятся из самих имён (TLD — последняя метка), файл смешивает
-// зоны, wrong_zone невозможна. Тестовые зоны: example.crawl.test
-// относится к зоне test с составной меткой — для testbed пользоваться
-// зона-каталогами.
+// TestValidatorZoneless — a zone-less file (Zone == ""): line zones are
+// derived from the names themselves (the TLD is the last label), the file
+// mixes zones, wrong_zone is impossible. Test zones: example.crawl.test
+// belongs to the zone test with a compound label — for the testbed use
+// zone directories.
 func TestValidatorZoneless(t *testing.T) {
 	v, err := NewValidator(ValidatorOptions{File: "add/list.txt", MaxErrorRatio: 0.5})
 	if err != nil {
@@ -346,17 +352,17 @@ func TestValidatorZoneless(t *testing.T) {
 			t.Errorf("Line(%q) = зона %q метка %q, want %q/%q", tc.line, e.Zone, e.Label, tc.zone, tc.label)
 		}
 	}
-	// IDN-метка: флаг по punycode-метке.
+	// An IDN label: the flag by the punycode label.
 	e, _, ok := v.Line(len(cases)+1, "тест.рф")
 	if !ok || e.Zone != "xn--p1ai" || !e.IsIDN || !strings.HasPrefix(e.Label, "xn--") {
 		t.Errorf("IDN-строка = %+v ok=%v, want зона xn--p1ai, IsIDN, punycode-метка", e, ok)
 	}
 
-	// Голый TLD — метки перед зоной нет: отклонение no_label.
+	// A bare TLD — no label before the zone: a no_label rejection.
 	if _, reason, ok := v.Line(len(cases)+2, "com"); ok || reason != ReasonNoLabel {
 		t.Errorf("строка \"com\" = ok=%v причина %s, want no_label", ok, reason)
 	}
-	// Посторонние данные без домена — no_domain (T-132).
+	// Foreign data without a domain — no_domain (T-132).
 	if _, reason, ok := v.Line(len(cases)+3, "hello world"); ok || reason != ReasonNoDomain {
 		t.Errorf("строка без домена = ok=%v причина %s, want no_domain", ok, reason)
 	}
@@ -367,13 +373,14 @@ func TestValidatorZoneless(t *testing.T) {
 	}
 }
 
-// TestValidatorZonelessNumericZone — числовая зона из вывода зоны — не
-// домен (регрессия дампа .SU: кандидат-дата «18.06.1999» проходила
-// валидацию, выводилась в фиктивную зону 1999 и применялась как
-// домен-дата). Дата и IPv4-литерал отклоняются (numeric_zone), числовая
-// метка в буквенной зоне валидна. Голый суффикс дамп-строки (sochi.su)
-// с TLD-only-зонами — валидный домен: мусор без фильтра (ТЗТ
-// tld-only-zones §12.6); строка из одних дат — no_domain.
+// TestValidatorZonelessNumericZone — a numeric zone derived from the zone
+// output is not a domain (the .SU dump regression: a candidate date
+// "18.06.1999" passed validation, was output into the fictitious zone 1999
+// and applied as a date-domain). A date and an IPv4 literal are rejected
+// (numeric_zone), a numeric label in a letter zone is valid. The bare
+// suffix of a dump line (sochi.su) with TLD-only zones is a valid domain:
+// junk without the filter (the tld-only-zones spec §12.6); a line of dates
+// only — no_domain.
 func TestValidatorZonelessNumericZone(t *testing.T) {
 	v, err := NewValidator(ValidatorOptions{File: "add/list.txt", MaxErrorRatio: 1})
 	if err != nil {
@@ -388,15 +395,16 @@ func TestValidatorZonelessNumericZone(t *testing.T) {
 	if e, _, ok := v.Line(3, "123.com"); !ok || e.Zone != "com" || e.Label != "123" {
 		t.Errorf("числовая метка в буквенной зоне = %+v ok=%v, want com/123", e, ok)
 	}
-	// Строка дампа .SU: первый кандидат sochi.su — голый суффикс,
-	// валиден как домен (зона su, метка sochi) — мусор без фильтра
-	// (ТЗТ §12.6); даты полей до проверки не доходят.
+	// A .SU dump line: the first candidate sochi.su is a bare suffix, valid
+	// as a domain (the zone su, the label sochi) — junk without the filter
+	// (the tld-only-zones spec §12.6); the field dates do not reach the
+	// check.
 	const line = "SOCHI.SU\tRUCENTER-SU\t18.06.1999\t01.10.2027\t01.11.2027\t1"
 	if e, _, ok := v.Line(4, line); !ok || e.Zone != "su" || e.Label != "sochi" {
 		t.Errorf("строка дампа = %+v ok=%v, want su/sochi (голый суффикс валиден)", e, ok)
 	}
-	// Строка выгрузки без домена: кандидаты-даты — numeric_zone,
-	// прошедшего нет — no_domain.
+	// A registrar export line without a domain: the candidate dates are
+	// numeric_zone, none passes — no_domain.
 	const datesOnly = "RUCENTER-SU\t18.06.1999\t01.10.2027\t01.11.2027\t1"
 	if _, reason, ok := v.Line(5, datesOnly); ok || reason != ReasonNoDomain {
 		t.Errorf("строка из дат = ok=%v причина %s, want no_domain", ok, reason)

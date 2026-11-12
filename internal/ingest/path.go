@@ -1,25 +1,28 @@
-// Package ingest — приём файлов доменов из наблюдаемого каталога incoming
-// (ТЗ 5.1 основного ТЗ).
+// Package ingest — ingestion of domain files from the watched incoming
+// directory (spec 5.1 of the main spec).
 //
-// Конвейер приёма (разбор пути → построчный парсинг → валидация строк →
-// загрузка и применение) собирается задачами T-014…T-021; T-014 вводит
-// первые ступени:
+// The ingest pipeline (path parsing → line parsing → row validation →
+// load and apply) is assembled by tasks T-014…T-021; T-014 introduces
+// the first stages:
 //
-//   - ParsePath (path.go): разбор пути готового файла относительно incoming
-//     по схеме <зона>/add|delete/<файл> (*.txt или архив поддерживаемого
-//     формата — T-133) — нормализованная зона и действие
-//     файла; имя каталога зоны в unicode или punycode нормализуется в одну
-//     зону — дублей зон в двух формах не возникает (ТЗ 5.1, 11.4 п. 1).
-//     Вторая схема — add|delete/<файл> без каталога зоны: зона-less файл
-//     может смешивать зоны, зона каждой строки выводится из самого имени
-//     (internal/idn: TLD — последняя метка, validate.go);
-//   - EnsureZone (zones.go): зона ищется по punycode-имени, отсутствующая
-//     создаётся автоматически при первом файле с is_active = true (ТЗ 5.1).
+//   - ParsePath (path.go): parses the path of a ready file relative to
+//     incoming under the <zone>/add|delete/<file> scheme (*.txt or an
+//     archive of a supported format — T-133) — the normalized zone and
+//     the file action; a zone directory name in unicode or punycode
+//     normalizes into one zone, so no zone duplicates in two forms arise
+//     (spec 5.1, 11.4 item 1). The second scheme is add|delete/<file>
+//     without a zone directory: a zone-less file may mix zones, and the
+//     zone of each line is derived from the name itself (internal/idn:
+//     the TLD is the last label, validate.go);
+//   - EnsureZone (zones.go): the zone is looked up by punycode name, a
+//     missing one is created automatically on the first file with
+//     is_active = true (spec 5.1).
 //
-// Готовые файлы выдаёт наблюдатель internal/watch (T-013) абсолютными
-// путями; приём работает с путём относительно incoming (разделитель «/»,
-// как в filepath.Rel) — его вычислит сборка конвейера ingest, и он же
-// пишется в журнал ingest_files (T-021).
+// Ready files are delivered by the internal/watch watcher (T-013) as
+// absolute paths; ingest works with the path relative to incoming
+// ("/" separator, as in filepath.Rel) — the ingest pipeline assembly
+// computes it, and the same path is written to the ingest_files log
+// (T-021).
 package ingest
 
 import (
@@ -32,34 +35,33 @@ import (
 	"crawler/internal/model"
 )
 
-// PathErrorKind — класс ошибки разбора пути входного файла: устойчивая
-// причина для отчёта об ошибке файла (failed/, ТЗ 5.1 — T-021).
+// PathErrorKind — a class of input file path parsing errors: a stable
+// reason for the file error report (failed/, spec 5.1 — T-021).
 type PathErrorKind string
 
 const (
-	// ErrPathStructure — путь не вида <зона>/add|delete/<файл> и не вида
-	// add|delete/<файл>: нет каталога add|delete (или он не в нижнем
-	// регистре), лишняя вложенность, абсолютный путь либо выход за
-	// пределы incoming.
+	// ErrPathStructure — the path is neither <zone>/add|delete/<file> nor
+	// add|delete/<file>: no add|delete directory (or it is not lowercase),
+	// extra nesting, an absolute path, or an escape beyond incoming.
 	ErrPathStructure PathErrorKind = "structure"
-	// ErrPathNotTXT — имя файла не *.txt и не архив поддерживаемого
-	// формата (.zip/.tar/.tar.gz/.tgz/.gz — T-133): по ТЗ 5.1 готовность
-	// файла — появление отслеживаемого имени (временные *.tmp/*.part
-	// наблюдатель не выдаёт).
+	// ErrPathNotTXT — the file name is not *.txt and not an archive of a
+	// supported format (.zip/.tar/.tar.gz/.tgz/.gz — T-133): per spec 5.1,
+	// file readiness is the appearance of a tracked name (temporary
+	// *.tmp/*.part files are not delivered by the watcher).
 	ErrPathNotTXT PathErrorKind = "not_txt"
-	// ErrPathZone — имя каталога зоны не нормализуется (ТЗ 5.2 п. 6);
-	// причина — *idn.Error, доступна через errors.As/Unwrap.
+	// ErrPathZone — the zone directory name does not normalize (spec 5.2
+	// item 6); the cause is *idn.Error, available via errors.As/Unwrap.
 	ErrPathZone PathErrorKind = "zone"
 )
 
-// pathKindDescriptions — тексты классов для Error() и String().
+// pathKindDescriptions — class texts for Error() and String().
 var pathKindDescriptions = map[PathErrorKind]string{
 	ErrPathStructure: "структура пути не <зона>/add|delete/<файл> и не add|delete/<файл>",
 	ErrPathNotTXT:    "имя файла не *.txt и не архив поддерживаемого формата",
 	ErrPathZone:      "невалидное имя каталога зоны",
 }
 
-// String возвращает текст класса (стиль idn.ErrorKind.String).
+// String returns the class text (the idn.ErrorKind.String style).
 func (k PathErrorKind) String() string {
 	if d, ok := pathKindDescriptions[k]; ok {
 		return d
@@ -67,12 +69,12 @@ func (k PathErrorKind) String() string {
 	return string(k)
 }
 
-// PathError — типизированная ошибка разбора пути: класс, исходный путь
-// и причина (для ErrPathZone — *idn.Error).
+// PathError — a typed path parsing error: the class, the original path
+// and the cause (for ErrPathZone — *idn.Error).
 type PathError struct {
-	Kind PathErrorKind // класс — причина отказа файла
-	Path string        // исходный относительный путь
-	Err  error         // причина; nil для ошибок структуры
+	Kind PathErrorKind // class — the file failure reason
+	Path string        // the original relative path
+	Err  error         // the cause; nil for structure errors
 }
 
 func (e *PathError) Error() string {
@@ -82,11 +84,11 @@ func (e *PathError) Error() string {
 	return fmt.Sprintf("ingest: %s: %q", e.Kind, e.Path)
 }
 
-// Unwrap даёт доступ к причине (errors.Is/As по цепочке — до *idn.Error).
+// Unwrap gives access to the cause (errors.Is/As along the chain — up to *idn.Error).
 func (e *PathError) Unwrap() error { return e.Err }
 
-// PathKindOf возвращает класс ошибки разбора пути; ok = false, если err —
-// не *PathError (чужая ошибка).
+// PathKindOf returns the path parsing error class; ok = false if err is
+// not a *PathError (a foreign error).
 func PathKindOf(err error) (PathErrorKind, bool) {
 	var e *PathError
 	if errors.As(err, &e) {
@@ -95,52 +97,55 @@ func PathKindOf(err error) (PathErrorKind, bool) {
 	return "", false
 }
 
-// File — путь входного файла, разобранный по схеме ТЗ 5.1
-// <зона>/add|delete/*.txt или зоне-less add|delete/<файл>.
+// File — an input file path parsed under the spec 5.1 scheme
+// <zone>/add|delete/*.txt or the zone-less add|delete/<file>.
 type File struct {
-	// Zone — нормализованная зона в ASCII-форме (punycode, ТЗ 5.2 п. 6):
-	// ключ поиска zones.name; unicode- и punycode-имя каталога дают одно
-	// значение (ТЗ 11.4 п. 1). Пустая строка — зона-less файл
-	// (add|delete/<файл> без каталога зоны): зоны строк выводятся из
-	// самих имён (validate.go), файл может смешивать зоны.
+	// Zone — the normalized zone in ASCII form (punycode, spec 5.2 item 6):
+	// the zones.name lookup key; the unicode and punycode directory names
+	// give one value (spec 11.4 item 1). The empty string means a zone-less
+	// file (add|delete/<file> without a zone directory): the zones of the
+	// lines are derived from the names themselves (validate.go), the file
+	// may mix zones.
 	Zone string
-	// ZoneUnicode — unicode-форма зоны для отображения (ТЗ 5.2 п. 7):
-	// значение zones.name_unicode при создании зоны; для ASCII-зоны
-	// совпадает с Zone. У зоны-less файла — пустая.
+	// ZoneUnicode — the unicode form of the zone for display (spec 5.2
+	// item 7): the value of zones.name_unicode when the zone is created;
+	// for an ASCII zone it equals Zone. Empty for a zone-less file.
 	ZoneUnicode string
-	// Action — действие файла: add — добавить или обновить домены,
-	// delete — удалить (ТЗ 5.1; model.Action, колонка ingest_files.action).
+	// Action — the file action: add — add or update domains, delete —
+	// remove them (spec 5.1; model.Action, the ingest_files.action column).
 	Action model.Action
-	// Path — путь относительно incoming после очистки (path.Clean: без
-	// «.»/«..» и лишних разделителей) — пишется в журнал ingest_files
+	// Path — the path relative to incoming after cleaning (path.Clean: no
+	// "."/".." and no extra separators) — written to the ingest_files log
 	// (T-021).
 	Path string
 }
 
-// ParsePath разбирает путь готового файла относительно incoming:
-// <зона>/add|delete/<файл> → нормализованная зона и действие (ТЗ 5.1;
-// файл — *.txt или архив поддерживаемого формата, T-133); либо
-// add|delete/<файл> → зона-less файл (Zone = "": зоны строк выводятся
-// из имён, смешанные зоны в одном файле допустимы).
+// ParsePath parses the path of a ready file relative to incoming:
+// <zone>/add|delete/<file> → the normalized zone and the action (spec 5.1;
+// the file is *.txt or an archive of a supported format, T-133); or
+// add|delete/<file> → a zone-less file (Zone = "": the zones of the lines
+// come from the names, mixed zones in one file are allowed).
 //
-// Правила:
+// Rules:
 //
-//   - два или ровно три компонента: [каталог зоны,] каталог операции,
-//     имя файла; лишняя вложенность и отсутствие add/delete —
+//   - two or exactly three components: [zone directory,] operation
+//     directory, file name; extra nesting or a missing add/delete —
 //     ErrPathStructure;
-//   - имя каталога операции — строго «add» или «delete» в нижнем регистре:
-//     структура каталогов ТЗ 5.1 фиксирована, а регистр файловой системы
-//     Linux точен — иное имя это другая структура, а не вариант записи;
-//   - имя файла — *.txt или архив поддерживаемого формата (.zip, .tar,
-//     .tar.gz, .tgz, .gz — T-133), без учёта регистра, как фильтр
-//     готовности наблюдателя (internal/watch, ТЗ 5.1): всё, что он
-//     выдаёт, приём разбирает одинаково; иначе — ErrPathNotTXT;
-//   - имя каталога зоны нормализуется idn.NormalizeZone (многоуровневые
-//     имена вроде crawl.test синтаксически допустимы — рабочие каталоги
-//     только TLD, gate многоуровневых путей — allowlist в конвейере
-//     валидации, ТЗТ tld-only-zones §5.1); ошибка нормализации —
-//     ErrPathZone с причиной *idn.Error;
-//   - абсолютные пути и «..» за пределами incoming — ErrPathStructure.
+//   - the operation directory name is strictly "add" or "delete" in
+//     lowercase: the spec 5.1 directory structure is fixed, and the Linux
+//     filesystem is case-sensitive — any other name is a different
+//     structure, not a spelling variant;
+//   - the file name is *.txt or an archive of a supported format (.zip,
+//     .tar, .tar.gz, .tgz, .gz — T-133), case-insensitive, mirroring the
+//     watcher readiness filter (internal/watch, spec 5.1): everything it
+//     delivers is parsed by ingest the same way; otherwise —
+//     ErrPathNotTXT;
+//   - the zone directory name is normalized by idn.NormalizeZone
+//     (multi-level names like crawl.test are syntactically valid —
+//     working directories are TLD-only, the gate for multi-level paths is
+//     the allowlist in the validation pipeline, the tld-only-zones spec
+//     §5.1); a normalization error — ErrPathZone with a *idn.Error cause;
+//   - absolute paths and ".." beyond incoming — ErrPathStructure.
 func ParsePath(rel string) (File, error) {
 	if rel == "" || path.IsAbs(rel) {
 		return File{}, &PathError{Kind: ErrPathStructure, Path: rel}
@@ -153,9 +158,9 @@ func ParsePath(rel string) (File, error) {
 	parts := strings.Split(p, "/")
 	var zoneDir, opDir, name string
 	switch len(parts) {
-	case 3: // <зона>/add|delete/<файл> — ТЗ 5.1
+	case 3: // <zone>/add|delete/<file> — spec 5.1
 		zoneDir, opDir, name = parts[0], parts[1], parts[2]
-	case 2: // add|delete/<файл> — зона-less, зоны строк из имён
+	case 2: // add|delete/<file> — zone-less, line zones come from the names
 		opDir, name = parts[0], parts[1]
 	default:
 		return File{}, &PathError{Kind: ErrPathStructure, Path: rel}
@@ -171,22 +176,23 @@ func ParsePath(rel string) (File, error) {
 		return File{}, &PathError{Kind: ErrPathStructure, Path: rel}
 	}
 
-	// path.Ext даёт хвост от последней точки; готовность по ТЗ 5.1 —
-	// имя *.txt, регистр не важен (равно фильтру наблюдателя), или архив
-	// поддерживаемого формата (.zip, .tar, .tar.gz, .tgz, .gz — T-133):
-	// всё, что выдаёт наблюдатель, приём разбирает одинаково.
+	// path.Ext returns the tail from the last dot; readiness per spec 5.1
+	// is a *.txt name, case does not matter (same as the watcher filter),
+	// or an archive of a supported format (.zip, .tar, .tar.gz, .tgz, .gz —
+	// T-133): everything the watcher delivers, ingest parses the same way.
 	if !fileNameAccepted(name) {
 		return File{}, &PathError{Kind: ErrPathNotTXT, Path: rel}
 	}
 
-	// Зона-less файл — без каталога зоны: File.Zone = "", зоны строк
-	// выводятся из имён валидатором (validate.go).
+	// A zone-less file — without a zone directory: File.Zone = "", the zones
+	// of the lines are derived from the names by the validator (validate.go).
 	if zoneDir == "" {
 		return File{Action: action, Path: p}, nil
 	}
 
-	// Зона тоже нормализуется тем же способом, что и домен (ТЗ 5.2 п. 6):
-	// unicode-каталог «москва» и punycode «xn--80adxhks» — одна зона.
+	// The zone is normalized the same way as a domain (spec 5.2 item 6):
+	// the unicode directory "москва" and the punycode "xn--80adxhks" are
+	// one zone.
 	zone, err := idn.NormalizeZone(zoneDir)
 	if err != nil {
 		return File{}, &PathError{Kind: ErrPathZone, Path: rel, Err: err}
@@ -199,9 +205,10 @@ func ParsePath(rel string) (File, error) {
 	}, nil
 }
 
-// fileNameAccepted — имя входного файла: *.txt или архив поддерживаемого
-// формата (T-133), без учёта регистра — зеркалит фильтр готовности
-// наблюдателя (internal/watch.wantFile): приём разбирает всё выданное им.
+// fileNameAccepted — an input file name: *.txt or an archive of a
+// supported format (T-133), case-insensitive — mirrors the watcher
+// readiness filter (internal/watch.wantFile): ingest parses everything
+// it delivers.
 func fileNameAccepted(name string) bool {
 	return strings.EqualFold(path.Ext(name), ".txt") || isArchiveName(name)
 }

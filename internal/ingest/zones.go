@@ -1,7 +1,8 @@
-// Справочник зон приёма (ТЗ 5.1, 5.2 пп. 6–7): EnsureZone — найти зону по
-// punycode-имени или создать автоматически при первом файле (is_active =
-// true); доступ к БД — через маленький интерфейс ZoneStore (юнит-тесты —
-// на фейке), SQL-реализация SQLZoneStore — поверх internal/db.
+// Reference table of ingest zones (spec 5.1, 5.2 items 6-7): EnsureZone
+// looks up a zone by punycode name or creates one automatically on the
+// first file (is_active = true); DB access goes through the small
+// ZoneStore interface (unit tests run against a fake); the SQL
+// implementation SQLZoneStore sits on top of internal/db.
 package ingest
 
 import (
@@ -16,38 +17,39 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// ErrZoneNotFound — зоны с указанным punycode-именем нет в таблице zones.
-// Возвращается ZoneStore.ZoneByName; для EnsureZone это сигнал создать
-// зону (ТЗ 5.1: автоматически при первом файле).
+// ErrZoneNotFound — no zone with the given punycode name exists in the
+// zones table. Returned by ZoneStore.ZoneByName; for EnsureZone this is
+// the signal to create the zone (spec 5.1: automatically on the first file).
 var ErrZoneNotFound = errors.New("ingest: зоны нет в таблице zones")
 
-// ZoneStore — доступ к таблице zones, необходимый приёму файлов: найти
-// зону по имени или создать. Интерфейс маленький намеренно: EnsureZone
-// зависит только от него, поэтому юнит-тесты обходятся фейком, а хранилище
-// подменяемо (SQLZoneStore — pgx; тестовый дубль — сколько угодно).
+// ZoneStore — access to the zones table required by file ingest: find a
+// zone by name or create one. The interface is deliberately small:
+// EnsureZone depends only on it, so unit tests get by with a fake and the
+// store is replaceable (SQLZoneStore — pgx; any number of test doubles).
 type ZoneStore interface {
-	// ZoneByName возвращает строку zones по punycode-имени (zones.name,
-	// ТЗ 5.2: внутри системы хранится ASCII-форма). Отсутствие зоны —
-	// ошибка ErrZoneNotFound, прочее — ошибка хранилища.
+	// ZoneByName returns the zones row by punycode name (zones.name,
+	// spec 5.2: the ASCII form is what is stored inside the system). A
+	// missing zone is ErrZoneNotFound; anything else is a store error.
 	ZoneByName(ctx context.Context, name string) (model.Zone, error)
 
-	// CreateZone создаёт зону с is_active = true (ТЗ 5.1) и возвращает её
-	// строку. Имя уже занято — не ошибка: возвращается существующая строка
-	// (конкурентная обработка двух файлов одной зоны — одна зона, без
-	// дублей, ТЗ 11.4 п. 1).
+	// CreateZone creates a zone with is_active = true (spec 5.1) and returns
+	// its row. An already taken name is not an error: the existing row is
+	// returned (concurrent processing of two files of the same zone — one
+	// zone, no duplicates, spec 11.4 item 1).
 	CreateZone(ctx context.Context, name string, nameUnicode *string) (model.Zone, error)
 }
 
-// EnsureZone возвращает зону с именем из каталога incoming (unicode или
-// punycode — ТЗ 5.1): имя нормализуется в ASCII-форму (ТЗ 5.2 п. 6), по
-// ней зона ищется в БД, а отсутствующая создаётся автоматически при первом
-// файле с is_active = true (ТЗ 5.1, 11.4 п. 1). Так unicode- и
-// punycode-каталог одной зоны сходятся в одну строку zones — оба имени
-// нормализуются в один ключ поиска.
+// EnsureZone returns the zone named by the incoming directory (unicode or
+// punycode — spec 5.1): the name is normalized to its ASCII form (spec 5.2
+// item 6), the zone is looked up in the DB by that name, and a missing one
+// is created automatically on the first file with is_active = true (spec
+// 5.1, 11.4 item 1). This is how the unicode and punycode directories of
+// one zone converge into a single zones row — both names normalize into
+// one lookup key.
 //
-// name новой зоны — punycode (zones.name), name_unicode — unicode-форма
-// только для отображения (ТЗ 5.2 п. 7); для ASCII-зоны она совпадает с
-// name и не хранится (NULL): информации не несёт.
+// name of a new zone — punycode (zones.name), name_unicode — the unicode
+// form for display only (spec 5.2 item 7); for an ASCII zone it equals
+// name and is not stored (NULL): it carries no information.
 func EnsureZone(ctx context.Context, store ZoneStore, zone string) (model.Zone, error) {
 	ascii, err := idn.NormalizeZone(zone)
 	if err != nil {
@@ -69,9 +71,9 @@ func EnsureZone(ctx context.Context, store ZoneStore, zone string) (model.Zone, 
 	return z, nil
 }
 
-// displayUnicode — значение zones.name_unicode для punycode-имени зоны:
-// unicode-форма (idna.ToUnicode на лету, ТЗ 5.2 п. 7), если отличается от
-// ASCII-формы; для ASCII-зоны — nil (NULL).
+// displayUnicode — the value of zones.name_unicode for a punycode zone
+// name: the unicode form (idna.ToUnicode on the fly, spec 5.2 item 7) if
+// it differs from the ASCII form; for an ASCII zone — nil (NULL).
 func displayUnicode(ascii string) *string {
 	if u := idn.ToUnicode(ascii); u != ascii {
 		return &u
@@ -79,36 +81,36 @@ func displayUnicode(ascii string) *string {
 	return nil
 }
 
-// zoneColumns — колонки строки zones в порядке полей model.Zone; теги db
-// модели соответствуют этому списку (pgx.RowToStructByName, T-008).
+// zoneColumns — columns of a zones row in model.Zone field order; the
+// model's db tags correspond to this list (pgx.RowToStructByName, T-008).
 const zoneColumns = "id, name, name_unicode, is_active, domains_total, domains_checked, updated_at"
 
 const (
 	sqlZoneByName = "SELECT " + zoneColumns + " FROM zones WHERE name = $1"
 
-	// is_active задаётся явно, а не DEFAULT схемы: «новая зона создаётся
-	// автоматически при первом файле (is_active = true)» — ТЗ 5.1.
-	// ON CONFLICT DO NOTHING: конкурентное создание той же зоны — не
-	// ошибка; без RETURNING-строки существующая читается повторным
-	// поиском (ниже в CreateZone).
+	// is_active is set explicitly rather than by the schema DEFAULT: "a new
+	// zone is created automatically on the first file (is_active = true)" —
+	// spec 5.1. ON CONFLICT DO NOTHING: concurrent creation of the same
+	// zone is not an error; without a RETURNING row the existing one is
+	// read by a repeated lookup (below in CreateZone).
 	sqlZoneCreate = "INSERT INTO zones (name, name_unicode, is_active) " +
 		"VALUES ($1, $2, true) ON CONFLICT (name) DO NOTHING RETURNING " + zoneColumns
 )
 
-// SQLZoneStore — ZoneStore поверх pgx-пула (internal/db). Реальное
-// поведение против живой БД — интеграционные тесты (T-023); юнит-тесты
-// проверяют текст SQL и параметры на фейковом пуле.
+// SQLZoneStore — ZoneStore on top of a pgx pool (internal/db). Real
+// behavior against a live DB is covered by integration tests (T-023);
+// unit tests verify the SQL text and parameters against a fake pool.
 type SQLZoneStore struct {
 	pool db.DB
 }
 
-// NewZoneStore — ZoneStore на pgx-пуле (*pgxpool.Pool и любые обёртки,
-// удовлетворяющие db.DB).
+// NewZoneStore — a ZoneStore on a pgx pool (*pgxpool.Pool and any wrappers
+// satisfying db.DB).
 func NewZoneStore(pool db.DB) *SQLZoneStore {
 	return &SQLZoneStore{pool: pool}
 }
 
-// ZoneByName ищет зону по punycode-имени; отсутствующая — ErrZoneNotFound.
+// ZoneByName looks up the zone by punycode name; a missing one — ErrZoneNotFound.
 func (s *SQLZoneStore) ZoneByName(ctx context.Context, name string) (model.Zone, error) {
 	z, err := s.queryZone(ctx, sqlZoneByName, "поиск зоны "+name, name)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -117,10 +119,11 @@ func (s *SQLZoneStore) ZoneByName(ctx context.Context, name string) (model.Zone,
 	return z, err
 }
 
-// CreateZone вставляет зону (name — punycode, name_unicode — отображение,
-// ТЗ 5.2 п. 7) и возвращает её строку. Если INSERT не вернул строку
-// (ON CONFLICT DO NOTHING — имя занято конкурентным созданием), зона
-// читается повторным поиском: два файла одной зоны дают одну строку zones.
+// CreateZone inserts the zone (name — punycode, name_unicode — display,
+// spec 5.2 item 7) and returns its row. If the INSERT returned no row
+// (ON CONFLICT DO NOTHING — the name is taken by a concurrent creation),
+// the zone is read by a repeated lookup: two files of one zone give one
+// zones row.
 func (s *SQLZoneStore) CreateZone(ctx context.Context, name string, nameUnicode *string) (model.Zone, error) {
 	z, err := s.queryZone(ctx, sqlZoneCreate, "создание зоны "+name, name, nameUnicode)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -129,9 +132,9 @@ func (s *SQLZoneStore) CreateZone(ctx context.Context, name string, nameUnicode 
 	return z, err
 }
 
-// queryZone выполняет запрос, возвращающий не более одной строки zones,
-// и разбирает её в model.Zone. pgx.ErrNoRows не оборачивается: вызывающие
-// (ZoneByName/CreateZone) трактуют его сами.
+// queryZone runs a query returning at most one zones row and parses it
+// into model.Zone. pgx.ErrNoRows is not wrapped: the callers
+// (ZoneByName/CreateZone) interpret it themselves.
 func (s *SQLZoneStore) queryZone(ctx context.Context, sql, what string, args ...any) (model.Zone, error) {
 	rows, err := s.pool.Query(ctx, sql, args...)
 	if err != nil {

@@ -1,7 +1,8 @@
-// Юнит-тесты потокового парсера входных файлов (ТЗ 5.1, 11.1): UTF-8 и
-// BOM, концы строк CRLF/CR, пустые строки и комментарии, лимит длины
-// строки, нумерация строк и счётчики, ошибки чтения и колбэков, границы
-// окна чтения (white-box) и постоянство памяти на большом потоке (ТЗ 3.5).
+// Unit tests of the streaming parser of input files (spec 5.1, 11.1): UTF-8
+// and BOM, CRLF/CR line endings, empty lines and comments, the line length
+// limit, line numbering and counters, read and callback errors, the read
+// window boundaries (white-box), and constant memory on a large stream
+// (spec 3.5).
 package ingest
 
 import (
@@ -13,7 +14,7 @@ import (
 	"testing"
 )
 
-// gotLine / gotReject — что увидел потребитель Parse.
+// gotLine / gotReject — what the Parse consumer saw.
 type gotLine struct {
 	num  int
 	text string
@@ -26,7 +27,7 @@ type gotReject struct {
 	bytes  int
 }
 
-// parseString прогоняет Parse по строке и собирает всё, что он отдал.
+// parseString runs Parse over a string and collects everything it yielded.
 func parseString(input string) (Stats, []gotLine, []gotReject, error) {
 	return parse(io.Reader(strings.NewReader(input)))
 }
@@ -56,13 +57,13 @@ func TestParse(t *testing.T) {
 		lines   []gotLine
 		rejects []gotReject
 	}{
-		// ТЗ 11.1: пустой файл.
+		// Spec 11.1: an empty file.
 		{
 			name:  "пустой файл",
 			in:    "",
 			stats: Stats{},
 		},
-		// ТЗ 11.1: только комментарии.
+		// Spec 11.1: comments only.
 		{
 			name:  "только комментарии",
 			in:    "# список доменов\n  # отступ-комментарий\r\n#\n",
@@ -73,7 +74,7 @@ func TestParse(t *testing.T) {
 			in:    "\n\r\n \t \n",
 			stats: Stats{Total: 3, Skipped: 3},
 		},
-		// ТЗ 11.1: CRLF (и одиночный CR — тоже конец строки).
+		// Spec 11.1: CRLF (and a lone CR is a line ending too).
 		{
 			name:  "CRLF",
 			in:    "example.com\r\nпример.рф\r\n",
@@ -92,7 +93,7 @@ func TestParse(t *testing.T) {
 				{2, "b.com"},
 			},
 		},
-		// ТЗ 11.1: BOM — снимается только в начале файла.
+		// Spec 11.1: BOM — stripped only at the start of the file.
 		{
 			name:  "BOM в начале",
 			in:    "\ufeffa.com\nb.com\n",
@@ -113,10 +114,10 @@ func TestParse(t *testing.T) {
 			stats: Stats{Total: 2, Data: 2},
 			lines: []gotLine{
 				{1, "a.com"},
-				{2, "\ufeffb.com"}, // уберёт нормализация (UTS-46), не парсер
+				{2, "\ufeffb.com"}, // normalization (UTS-46) will remove it, not the parser
 			},
 		},
-		// ТЗ 11.1: пустые строки между данными.
+		// Spec 11.1: empty lines between data lines.
 		{
 			name:  "пустые строки между данными",
 			in:    "\na.com\n\n\nb.com\n",
@@ -126,9 +127,10 @@ func TestParse(t *testing.T) {
 				{5, "b.com"},
 			},
 		},
-		// Пробелы: крайние снимаются, внутренние остаются в Line.Text —
-		// парсер не знает о формате записи; дальше их разбирает извлечение
-		// T-132 (разделитель полей) либо нормализация одиночного имени.
+		// Spaces: leading/trailing ones are stripped, inner ones stay in
+		// Line.Text — the parser does not know the record format; further
+		// down they are parsed by extraction (T-132, the field delimiter) or
+		// by normalization of a single name.
 		{
 			name:  "крайние пробелы снимаются",
 			in:    "  \texample.com \t \n",
@@ -141,14 +143,14 @@ func TestParse(t *testing.T) {
 			stats: Stats{Total: 1, Data: 1},
 			lines: []gotLine{{1, "при мер.рф"}},
 		},
-		// Комментарий — только первый значимый символ «#».
+		// A comment — "#" as the first significant character only.
 		{
 			name:  "решётка не в начале — не комментарий",
 			in:    "a.com#x\n",
 			stats: Stats{Total: 1, Data: 1},
 			lines: []gotLine{{1, "a.com#x"}},
 		},
-		// Файл без завершающего перевода строки.
+		// A file without the trailing newline.
 		{
 			name:  "без завершающего перевода строки",
 			in:    "a.com\nb.com",
@@ -158,8 +160,8 @@ func TestParse(t *testing.T) {
 				{2, "b.com"},
 			},
 		},
-		// Слишком длинная строка: отклонение, разбор продолжается
-		// (лимит — MaxLineLen, обоснование там же).
+		// A too long line: rejection, parsing continues
+		// (the limit is MaxLineLen; the rationale is there too).
 		{
 			name:  "строка ровно MaxLineLen — ещё валидна",
 			in:    strings.Repeat("a", MaxLineLen),
@@ -175,7 +177,7 @@ func TestParse(t *testing.T) {
 			},
 			lines: []gotLine{{2, "b.com"}},
 		},
-		// Невалидный UTF-8: отклонение строки, файл не падает.
+		// Invalid UTF-8: the line is rejected, the file does not fail.
 		{
 			name:  "невалидный UTF-8",
 			in:    "ok\xff.com\nb.com\n",
@@ -185,7 +187,7 @@ func TestParse(t *testing.T) {
 			},
 			lines: []gotLine{{2, "b.com"}},
 		},
-		// Всё вперемешку: нумерация физических строк сквозная.
+		// Everything mixed: physical line numbering is continuous.
 		{
 			name: "смешанный файл",
 			in: "\ufeff# заголовок\r\n" +
@@ -248,8 +250,8 @@ func compareRejects(t *testing.T, got, want []gotReject) {
 	}
 }
 
-// TestParseNilCallbacks — колбэки необязательны: Parse годится как
-// счётчик строк файла (предпроверка, отчёт T-021).
+// TestParseNilCallbacks — the callbacks are optional: Parse works as a
+// line counter of the file (precheck, the T-021 report).
 func TestParseNilCallbacks(t *testing.T) {
 	st, err := Parse(strings.NewReader("a.com\n# комментарий\n\n"), Options{})
 	if err != nil {
@@ -261,11 +263,11 @@ func TestParseNilCallbacks(t *testing.T) {
 	}
 }
 
-// errStop — сентинел ошибок колбэка.
+// errStop — the sentinel of callback errors.
 var errStop = errors.New("остановка потребителем")
 
-// TestParseCallbackError — ошибка колбэка останавливает разбор и
-// возвращается обёрнутой; отданное остаётся у потребителя.
+// TestParseCallbackError — a callback error stops parsing and is returned
+// wrapped; what was yielded stays with the consumer.
 func TestParseCallbackError(t *testing.T) {
 	var st Stats
 	var got []gotLine
@@ -289,7 +291,7 @@ func TestParseCallbackError(t *testing.T) {
 	}
 	compareLines(t, got, []gotLine{{1, "a.com"}, {2, "stop.com"}})
 
-	// То же для OnReject.
+	// The same for OnReject.
 	st, err = Parse(strings.NewReader(strings.Repeat("a", MaxLineLen+1)+"\n"), Options{
 		OnReject: func(Reject) error { return errStop },
 	})
@@ -301,8 +303,8 @@ func TestParseCallbackError(t *testing.T) {
 	}
 }
 
-// failReader — первые n байт источника, затем ошибка fail (сбой чтения
-// посреди файла).
+// failReader — the first n bytes of the source, then the fail error (a read
+// failure in the middle of the file).
 type failReader struct {
 	r    io.Reader
 	n    int
@@ -321,8 +323,8 @@ func (f *failReader) Read(p []byte) (int, error) {
 	return k, err
 }
 
-// TestParseReadError — сбой чтения: готовые строки отданы, Parse
-// возвращает ошибку, недочитанный хвост не выдан.
+// TestParseReadError — a read failure: the complete lines have been yielded,
+// Parse returns an error, the unread tail is not emitted.
 func TestParseReadError(t *testing.T) {
 	errDisk := errors.New("диск отвалился")
 	var got []gotLine
@@ -342,9 +344,9 @@ func TestParseReadError(t *testing.T) {
 	compareLines(t, got, []gotLine{{1, "a.com"}})
 }
 
-// shortReader — не больше max байт за Read: по контракту io.Reader
-// короткие выдачи допустимы; refill обязан доливать окно (в том числе не
-// резать BOM).
+// shortReader — no more than max bytes per Read: by the io.Reader contract
+// short reads are allowed; refill must top up the window (including not
+// cutting the BOM).
 type shortReader struct {
 	r   io.Reader
 	max int
@@ -357,7 +359,7 @@ func (s shortReader) Read(p []byte) (int, error) {
 	return s.r.Read(p)
 }
 
-// TestParseShortReads — результат коротких чтений совпадает с цельным.
+// TestParseShortReads — the result of short reads matches the whole-read one.
 func TestParseShortReads(t *testing.T) {
 	in := "\ufeff# комментарий\r\na.com\r\nb.com\rc.com\n#\n"
 	wantStats, wantLines, wantRejects, err := parseString(in)
@@ -375,9 +377,10 @@ func TestParseShortReads(t *testing.T) {
 	compareRejects(t, rejects, wantRejects)
 }
 
-// TestScannerWindowBoundaries — сканер с прижатым окном: пары CRLF и
-// одиночные CR на краю окна, строки, пересекающие окно, BOM в окне 3.
-// Память парсера — окно + накопитель; окно может быть любым ≥3 байт.
+// TestScannerWindowBoundaries — a scanner with a squeezed window: CRLF pairs
+// and lone CRs at the window edge, lines crossing the window, a BOM in a
+// window of 3. Parser memory — a window + an accumulator; the window may be
+// any size ≥3 bytes.
 func TestScannerWindowBoundaries(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -425,9 +428,9 @@ func TestScannerWindowBoundaries(t *testing.T) {
 	}
 }
 
-// TestScannerOverlongLine — строка длиннее MaxLineLen, пересекающая окно
-// многократно: накопитель не растёт сверх лимита, размер строки честный,
-// следующая строка читается нормально (ТЗ 3.5).
+// TestScannerOverlongLine — a line longer than MaxLineLen crossing the
+// window many times: the accumulator does not grow beyond the limit, the
+// line size is honest, the next line is read normally (spec 3.5).
 func TestScannerOverlongLine(t *testing.T) {
 	sc := newScannerWindow(
 		strings.NewReader(strings.Repeat("a", MaxLineLen+5)+"\r\nok"), 7)
@@ -451,7 +454,7 @@ func TestScannerOverlongLine(t *testing.T) {
 		t.Errorf("readLine после конца = (%v, %v), want (false, nil)", ok, err)
 	}
 
-	// То же без конца строки — файл кончился вместе с мусором.
+	// The same without a line ending — the file ended together with the junk.
 	sc = newScannerWindow(strings.NewReader(strings.Repeat("x", MaxLineLen+2)), 5)
 	_, size, ok, err = sc.readLine()
 	if err != nil || !ok || size != MaxLineLen+2 {
@@ -459,9 +462,9 @@ func TestScannerOverlongLine(t *testing.T) {
 	}
 }
 
-// lineGen — io.Reader, синтезирующий lines строк «d%08d.crawl.test\n»
-// (~21 байт на строку) без файла на диске: поток в десятки МБ для теста
-// памяти (ТЗ 3.5, 11.1).
+// lineGen — an io.Reader synthesizing lines lines of "d%08d.crawl.test\n"
+// (~21 bytes per line) without a file on disk: a stream of tens of MB for
+// the memory test (spec 3.5, 11.1).
 type lineGen struct {
 	lines int
 	i     int
@@ -481,8 +484,8 @@ func (g *lineGen) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-// heapLive — живая куча после принудительной сборки мусора: выборки в тесте
-// памяти меряют именно удерживаемое, а не накопленный мусор.
+// heapLive — the live heap after a forced garbage collection: the samples in
+// the memory test measure exactly what is retained, not accumulated garbage.
 func heapLive(t *testing.T) uint64 {
 	t.Helper()
 	runtime.GC()
@@ -491,13 +494,14 @@ func heapLive(t *testing.T) uint64 {
 	return m.HeapAlloc
 }
 
-// TestParseMemoryConstant — память разбора не зависит от размера файла
-// (ТЗ 3.5): поток ≈40 МиБ (на два порядка больше окна чтения), потребитель
-// ничего не удерживает — живая куча во время и после разбора обязана
-// оставаться в константе. Буферизация файла целиком дала бы живые ~40 МиБ.
+// TestParseMemoryConstant — parse memory does not depend on the file size
+// (spec 3.5): a stream of ≈40 MiB (two orders of magnitude more than the
+// read window), the consumer retains nothing — the live heap during and
+// after parsing must stay within a constant. Buffering the file as a whole
+// would give a live ~40 MiB.
 func TestParseMemoryConstant(t *testing.T) {
-	const lines = 2_000_000 // ~40 МиБ потока
-	const limit = 24 << 20  // запас на шум GC; поток — больше
+	const lines = 2_000_000 // ~40 MiB of stream
+	const limit = 24 << 20  // margin for GC noise; the stream is bigger
 
 	base := heapLive(t)
 	var maxLive, afterLive uint64

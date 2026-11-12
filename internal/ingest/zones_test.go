@@ -1,8 +1,8 @@
-// Юнит-тесты справочника зон приёма (T-014, ТЗ 5.1, 5.2 пп. 6–7):
-// EnsureZone — на фейковом ZoneStore (поиск, автоматическое создание
-// is_active = true, name_unicode, одна зона для unicode/punycode),
-// SQLZoneStore — текст SQL и параметры на фейковом pgx-пуле без БД
-// (реальное поведение — интеграционные тесты, T-023).
+// Unit tests of the reference table of ingest zones (T-014, spec 5.1,
+// 5.2 items 6-7): EnsureZone — against a fake ZoneStore (lookup, automatic
+// creation with is_active = true, name_unicode, one zone for
+// unicode/punycode), SQLZoneStore — the SQL text and parameters against a
+// fake pgx pool without a DB (real behavior — the integration tests, T-023).
 package ingest
 
 import (
@@ -21,16 +21,16 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-// --- фейковый ZoneStore -------------------------------------------------
+// --- fake ZoneStore-------------------------------------------------
 
-// fakeZoneStore — память-хранилище зон с протоколом вызовов.
+// fakeZoneStore — an in-memory zone store with a call protocol.
 type fakeZoneStore struct {
 	zones      map[string]model.Zone
 	nextID     int16
-	byNameErr  error    // ошибка ZoneByName, если задана
-	createErr  error    // ошибка CreateZone, если задана
-	calls      []string // протокол: "byName:<имя>", "create:<имя>"
-	createdUni *string  // name_unicode последнего CreateZone
+	byNameErr  error    // the ZoneByName error, if set
+	createErr  error    // the CreateZone error, if set
+	calls      []string // the protocol: "byName:<name>", "create:<name>"
+	createdUni *string  // name_unicode of the last CreateZone
 }
 
 func newFakeZoneStore(zones ...model.Zone) *fakeZoneStore {
@@ -62,7 +62,8 @@ func (f *fakeZoneStore) CreateZone(_ context.Context, name string, nameUnicode *
 	if f.createErr != nil {
 		return model.Zone{}, f.createErr
 	}
-	// Контракт ZoneStore: занятое имя — не ошибка, вернуть существующее.
+	// The ZoneStore contract: an already taken name is not an error, return
+	// the existing one.
 	if z, ok := f.zones[name]; ok {
 		return z, nil
 	}
@@ -108,8 +109,9 @@ func TestEnsureZoneCreates(t *testing.T) {
 	}
 }
 
-// TestEnsureZoneUnicodePunycode — ТЗ 11.4 п. 1: оба написания каталога —
-// одна зона; второе имя находит созданную строку и новой не создаёт.
+// TestEnsureZoneUnicodePunycode — spec 11.4 item 1: both spellings of the
+// directory are one zone; the second name finds the created row and does
+// not create a new one.
 func TestEnsureZoneUnicodePunycode(t *testing.T) {
 	store := newFakeZoneStore()
 
@@ -128,15 +130,15 @@ func TestEnsureZoneUnicodePunycode(t *testing.T) {
 		t.Errorf("name_unicode = %v, want «москва» (ТЗ 5.2 п. 7)", fromPuny.NameUnicode)
 	}
 	if want := []string{
-		"byName:xn--80adxhks", "create:xn--80adxhks", // первое имя — создана
-		"byName:xn--80adxhks", // второе — найдена, без создания
+		"byName:xn--80adxhks", "create:xn--80adxhks", // the first name — created
+		"byName:xn--80adxhks", // the second — found, without creation
 	}; !reflect.DeepEqual(store.calls, want) {
 		t.Errorf("вызовы = %v, want %v", store.calls, want)
 	}
 }
 
-// TestEnsureZoneNormalizesInput — вход нормализуется тем же конвейером
-// (ТЗ 5.2 п. 6): регистр, пробелы, завершающая точка.
+// TestEnsureZoneNormalizesInput — the input is normalized by the same
+// pipeline (spec 5.2 item 6): case, spaces, the trailing dot.
 func TestEnsureZoneNormalizesInput(t *testing.T) {
 	store := newFakeZoneStore()
 	z, err := EnsureZone(context.Background(), store, " МосквА. ")
@@ -148,14 +150,15 @@ func TestEnsureZoneNormalizesInput(t *testing.T) {
 	}
 }
 
-// TestEnsureZoneCreateResolvesRace — ZoneStore.CreateZone возвращает
-// существующую строку, если зону создал конкурент (контракт интерфейса).
+// TestEnsureZoneCreateResolvesRace — ZoneStore.CreateZone returns the
+// existing row if the zone was created by a concurrent writer (the
+// interface contract).
 func TestEnsureZoneCreateResolvesRace(t *testing.T) {
-	// zones.name — всегда punycode (ТЗ 5.2): «рф» хранится как xn--p1ai.
+	// zones.name is always punycode (spec 5.2): "рф" is stored as xn--p1ai.
 	uni := "рф"
 	winner := model.Zone{ID: 3, Name: "xn--p1ai", NameUnicode: &uni, IsActive: true}
 	store := newFakeZoneStore(winner)
-	store.byNameErr = ErrZoneNotFound // поиск «не заметил» зону — гонка
+	store.byNameErr = ErrZoneNotFound // the lookup "did not notice" the zone — a race
 
 	z, err := EnsureZone(context.Background(), store, "рф")
 	if err != nil {
@@ -206,17 +209,17 @@ func TestEnsureZoneInvalidName(t *testing.T) {
 	}
 }
 
-// --- фейковый pgx-пул для SQLZoneStore -----------------------------------
+// --- fake pgx pool for SQLZoneStore-----------------------------------
 
-// zoneColNames — имена колонок в порядке zoneColumns.
+// zoneColNames — column names in the zoneColumns order.
 var zoneColNames = []string{"id", "name", "name_unicode", "is_active", "domains_total", "domains_checked", "updated_at"}
 
-// fakeRows — pgx.Rows с заготовленными строками: FieldDescriptions — имена
-// колонок zones, Scan раскладывает значения по приёмникам так же, как pgx
-// делает это для model.Zone по тегам db (RowToStructByName).
+// fakeRows — pgx.Rows with pre-made rows: FieldDescriptions gives the zones
+// column names, Scan lays the values out over the destinations the same way
+// pgx does it for model.Zone by the db tags (RowToStructByName).
 type fakeRows struct {
 	rows   [][]any
-	i      int // индекс текущей строки (0 — до первого Next)
+	i      int // the index of the current row (0 — before the first Next)
 	closed bool
 }
 
@@ -260,7 +263,7 @@ func (r *fakeRows) Scan(dest ...any) error {
 		}
 		val := reflect.ValueOf(row[i])
 		if target.Kind() == reflect.Pointer {
-			// NULL-колонка модели (указатель): *string, *time.Time.
+			// a NULL model column (pointer): *string, *time.Time.
 			p := reflect.New(val.Type())
 			p.Elem().Set(val)
 			target.Set(p)
@@ -275,16 +278,16 @@ func (r *fakeRows) Values() ([]any, error) { return r.rows[r.i-1], nil }
 
 func (r *fakeRows) RawValues() [][]byte { return nil }
 
-// Conn и TypeMap — часть pgx.Rows, не используемая CollectOneRow.
+// Conn and TypeMap — the part of pgx.Rows not used by CollectOneRow.
 func (r *fakeRows) Conn() *pgx.Conn      { return nil }
 func (r *fakeRows) TypeMap() *pgtype.Map { return nil }
 
-// fakeZonePool — db.DB, запоминающий SQL и аргументы и выдающий
-// заготовленные результаты по очереди.
+// fakeZonePool — a db.DB that remembers the SQL and the arguments and hands
+// out the pre-made results one by one.
 type fakeZonePool struct {
 	queries []zoneQuery
 	results []fakeRows
-	err     error // ошибка самого Query, если задана
+	err     error // the error of Query itself, if set
 }
 
 type zoneQuery struct {
@@ -310,7 +313,7 @@ func (p *fakeZonePool) Query(_ context.Context, sql string, args ...any) (pgx.Ro
 	return &rows, nil
 }
 
-// --- SQLZoneStore: текст SQL и параметры ---------------------------------
+// --- SQLZoneStore: the SQL text and parameters---------------------------------
 
 const wantZoneSelect = "SELECT id, name, name_unicode, is_active, domains_total, domains_checked, updated_at " +
 	"FROM zones WHERE name = $1"
@@ -359,7 +362,7 @@ func TestSQLZoneByNameIDN(t *testing.T) {
 }
 
 func TestSQLZoneByNameNotFound(t *testing.T) {
-	pool := &fakeZonePool{results: []fakeRows{zoneRows()}} // ноль строк
+	pool := &fakeZonePool{results: []fakeRows{zoneRows()}} // zero rows
 	store := NewZoneStore(pool)
 
 	if _, err := store.ZoneByName(context.Background(), "net"); !errors.Is(err, ErrZoneNotFound) {
@@ -389,11 +392,12 @@ func TestSQLCreateZone(t *testing.T) {
 	}
 }
 
-// TestSQLCreateZoneConflict — INSERT без RETURNING-строки (ON CONFLICT):
-// зону создал конкурент, читается повторным поиском.
+// TestSQLCreateZoneConflict — an INSERT without a RETURNING row (ON
+// CONFLICT): the zone was created by a concurrent writer, read back by a
+// repeated lookup.
 func TestSQLCreateZoneConflict(t *testing.T) {
 	pool := &fakeZonePool{results: []fakeRows{
-		zoneRows(), // INSERT … DO NOTHING — строк нет
+		zoneRows(), // INSERT … DO NOTHING — no rows
 		zoneRows([]any{int16(5), "xn--p1ai", "рф", true, int64(0), int64(0), nil}),
 	}}
 	store := NewZoneStore(pool)
@@ -433,6 +437,6 @@ func TestSQLZoneQueryError(t *testing.T) {
 	}
 }
 
-// compile-time: SQLZoneStore — реализация ZoneStore поверх internal/db.
+// compile-time: SQLZoneStore — a ZoneStore implementation on top of internal/db.
 var _ ZoneStore = (*SQLZoneStore)(nil)
 var _ db.DB = (*fakeZonePool)(nil)

@@ -1,16 +1,16 @@
-// Учёт обработанных файлов в ingest_files (T-021; ТЗ 5.1, 6.1): запись
-// отчёта (sha256, действие, счётчики строк и применения) и защита от
-// повторной обработки того же файла по уникальной тройке
-// (zone_id, action, sha256) — точной повторной доставки (T-113).
-// Доступ к БД — через маленький интерфейс FileStore (юнит-тесты — на
-// фейке, стиль ZoneStore из T-014), SQL-реализация SQLFileStore —
-// поверх internal/db.
+// Accounting of processed files in ingest_files (T-021; spec 5.1, 6.1):
+// writing the report (sha256, action, line and apply counters) and
+// protection against reprocessing the same file via the unique triple
+// (zone_id, action, sha256) — exact redelivery (T-113). DB access goes
+// through the small FileStore interface (unit tests run against a fake,
+// the ZoneStore style from T-014); the SQL implementation SQLFileStore
+// sits on top of internal/db.
 //
-// Здесь же — текстовый лог-отчёт об обработке файла (renderReport):
-// рядом с файлом в failed/ (ТЗ 5.1: «файлы с ошибкой (с лог-отчётом
-// рядом)») и основа записей лога сервиса. Формат фиксирован тестом
-// TestRenderReport; rejected-лог построчных отклонений (T-016) остаётся
-// отдельным потоком записей.
+// Also here — the text log report on file processing (renderReport):
+// next to the file in failed/ (spec 5.1: "files with an error (with a
+// log report nearby)") and the basis of the service log records. The
+// format is fixed by the TestRenderReport test; the rejected log of
+// per-line rejections (T-016) remains a separate stream of records.
 package ingest
 
 import (
@@ -27,78 +27,80 @@ import (
 	"crawler/internal/model"
 )
 
-// FileStore — журнал обработанных файлов ingest_files (ТЗ 5.1, 6.1),
-// необходимый конвейеру приёма: защита от повторной обработки того же
-// файла и запись отчёта. Интерфейс маленький намеренно (как ZoneStore,
-// T-014): юнит-тесты конвейера обходятся фейком, SQL-реализация
-// подменяема.
+// FileStore — the ingest_files log of processed files (spec 5.1, 6.1)
+// required by the ingest pipeline: protection against reprocessing the
+// same file and report writing. The interface is deliberately small
+// (like ZoneStore, T-014): pipeline unit tests get by with a fake, the
+// SQL implementation is replaceable.
 type FileStore interface {
-	// FilesBySHA256 возвращает все строки журнала с данным sha256
-	// (любые зона и действие, от ранней к поздней): конвейер ищет
-	// среди них точную повторную доставку — совпадение
-	// (zone_id, action, sha256), уникальный ключ T-113, — и
-	// подсвечивает то же содержимое, доставлявшееся иначе (другая
-	// зона, другое действие). Пустой срез — содержимое не
-	// обрабатывалось, прочее — ошибка хранилища.
+	// FilesBySHA256 returns all log rows with the given sha256 (any zone
+	// and action, from earliest to latest): the pipeline searches among
+	// them for an exact redelivery — a match of (zone_id, action, sha256),
+	// the unique key of T-113 — and flags the same content that was
+	// delivered differently (another zone, another action). An empty
+	// slice — the content was not processed; anything else — a store
+	// error.
 	FilesBySHA256(ctx context.Context, sha []byte) ([]model.IngestFile, error)
 
-	// RecordFile пишет отчёт обработанного файла (счётчики применения).
-	// Тройка (zone_id, action, sha256) уникальна (миграция 000009):
-	// конкурентный отчёт того же файла — ошибка хранилища.
+	// RecordFile writes the report of a processed file (the apply
+	// counters). The triple (zone_id, action, sha256) is unique
+	// (migration 000009): a concurrent report of the same file is a
+	// store error.
 	RecordFile(ctx context.Context, rec FileRecord) error
 }
 
-// FileRecord — строка ingest_files для обработанного файла (ТЗ 6.1):
-// значения колонок отчёта. Отображение счётчиков конвейера —
+// FileRecord — an ingest_files row for a processed file (spec 6.1):
+// the values of the report columns. The mapping of pipeline counters —
 // FileReport.record.
 type FileRecord struct {
-	ZoneID      int16        // зона файла (zones.id)
-	Action      model.Action // 1 add, 2 delete (ТЗ 6.1)
-	Path        string       // путь относительно incoming (ParsePath)
-	SHA256      []byte       // хэш содержимого, 32 октета
-	LinesTotal  int64        // всего физических строк файла
-	Added       int64        // add: добавлено (включая возвращённых из deleted)
-	Existed     int64        // add: уже было
-	Deleted     int64        // delete: переведено в deleted
-	Rejected    int64        // отклонено строк (парсер + валидатор)
-	ProcessedAt time.Time    // момент завершения обработки
+	ZoneID      int16        // the file zone (zones.id)
+	Action      model.Action // 1 add, 2 delete (spec 6.1)
+	Path        string       // the path relative to incoming (ParsePath)
+	SHA256      []byte       // content hash, 32 octets
+	LinesTotal  int64        // total physical lines of the file
+	Added       int64        // add: added (including those revived from deleted)
+	Existed     int64        // add: already existed
+	Deleted     int64        // delete: moved to deleted
+	Rejected    int64        // lines rejected (parser + validator)
+	ProcessedAt time.Time    // the moment processing finished
 }
 
-// ingestFileColumns — колонки ingest_files в порядке полей model.IngestFile
-// (теги db модели, T-008); pgx.RowToStructByName.
+// ingestFileColumns — the ingest_files columns in model.IngestFile field
+// order (the model's db tags, T-008); pgx.RowToStructByName.
 const ingestFileColumns = "id, zone_id, action, path, sha256, lines_total, added, existed, deleted, rejected, processed_at"
 
 const (
-	// От ранней к поздней (ORDER BY id): классификация доставок в
-	// конвейере детерминирована, ссылки «первая доставка» — ранняя.
-	// Обслуживается ingest_files_sha256_idx (миграция 000009).
+	// From earliest to latest (ORDER BY id): the classification of
+	// deliveries in the pipeline is deterministic, the "first delivery"
+	// references are the earliest. Served by ingest_files_sha256_idx
+	// (migration 000009).
 	sqlFilesBySHA = "SELECT " + ingestFileColumns + " FROM ingest_files WHERE sha256 = $1 ORDER BY id"
 
-	// Простой INSERT, без ON CONFLICT: конкурентный отчёт того же файла
-	// (второй экземпляр сервиса) отвергается уникальной тройкой
-	// (zone_id, action, sha256) — схеме виднее, обрабатывался ли файл;
-	// подавлять конфликт молча значило бы потерять счётчики одной из
-	// попыток.
+	// A plain INSERT, no ON CONFLICT: a concurrent report of the same
+	// file (a second service instance) is rejected by the unique triple
+	// (zone_id, action, sha256) — the schema knows better whether the
+	// file was processed; silently suppressing the conflict would lose
+	// the counters of one of the attempts.
 	sqlFileRecord = "INSERT INTO ingest_files " +
 		"(zone_id, action, path, sha256, lines_total, added, existed, deleted, rejected, processed_at) " +
 		"VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"
 )
 
-// SQLFileStore — FileStore поверх pgx-пула (internal/db). Реальное
-// поведение против живой БД — интеграционные тесты ingest (T-023);
-// юнит-тесты проверяют текст SQL и параметры на фейковом пуле.
+// SQLFileStore — FileStore on top of a pgx pool (internal/db). Real
+// behavior against a live DB — the ingest integration tests (T-023);
+// unit tests verify the SQL text and parameters against a fake pool.
 type SQLFileStore struct {
 	pool db.DB
 }
 
-// NewFileStore — FileStore на pgx-пуле (*pgxpool.Pool и любые обёртки,
-// удовлетворяющие db.DB).
+// NewFileStore — a FileStore on a pgx pool (*pgxpool.Pool and any
+// wrappers satisfying db.DB).
 func NewFileStore(pool db.DB) *SQLFileStore {
 	return &SQLFileStore{pool: pool}
 }
 
-// FilesBySHA256 — все строки журнала с данным содержимым, от ранней к
-// поздней; пустой срез — содержимое не обрабатывалось.
+// FilesBySHA256 — all log rows with the given content, from earliest to
+// latest; an empty slice — the content was not processed.
 func (s *SQLFileStore) FilesBySHA256(ctx context.Context, sha []byte) ([]model.IngestFile, error) {
 	rows, err := s.pool.Query(ctx, sqlFilesBySHA, sha)
 	if err != nil {
@@ -111,16 +113,17 @@ func (s *SQLFileStore) FilesBySHA256(ctx context.Context, sha []byte) ([]model.I
 	return fs, nil
 }
 
-// RecordFile пишет отчёт обработанного файла. Зона-less файл пишет
-// zone_id = NULL (зон у файла нет — они у строк); NULL в уникальной
-// тройке (zone_id, action, sha256) не конфликтует (миграция 000009),
-// защиту от точной повторной доставки выполняет конвейер.
+// RecordFile writes the report of a processed file. A zone-less file
+// writes zone_id = NULL (a file has no zones — lines do); NULL in the
+// unique triple (zone_id, action, sha256) does not conflict
+// (migration 000009), the exact-redelivery protection is done by the
+// pipeline.
 func (s *SQLFileStore) RecordFile(ctx context.Context, rec FileRecord) error {
 	if len(rec.SHA256) != sha256.Size {
 		return fmt.Errorf("ingest: отчёт файла %s: sha256 — %d октетов, ожидается %d",
 			rec.Path, len(rec.SHA256), sha256.Size)
 	}
-	var zoneID any // nil → NULL: зона-less файл (add|delete/<файл>)
+	var zoneID any // nil → NULL: a zone-less file (add|delete/<file>)
 	if rec.ZoneID > 0 {
 		zoneID = rec.ZoneID
 	}
@@ -134,54 +137,58 @@ func (s *SQLFileStore) RecordFile(ctx context.Context, rec FileRecord) error {
 	return nil
 }
 
-// FileReport — итог обработки одного файла: счётчики строк (парсер
-// T-015 + валидатор T-016) и применения (T-018/T-019). Значения пишутся
-// в ingest_files (record) и в лог-отчёт (renderReport); поля без колонок
-// в схеме (Skipped, Accepted, Revived, NotFound, Reasons) живут только
-// в лог-отчёте и записях лога сервиса.
+// FileReport — the outcome of processing one file: line counters
+// (parser T-015 + validator T-016) and apply counters (T-018/T-019).
+// The values are written to ingest_files (record) and to the log report
+// (renderReport); fields without schema columns (Skipped, Accepted,
+// Revived, NotFound, Reasons) live only in the log report and the
+// service log records.
 type FileReport struct {
-	// Zone — punycode-зона пути файла (в БД — ZoneID; для лог-отчёта).
-	// Пуста у зона-less файла (add|delete/<файл>: зоны строк — из имён)
-	// и если путь не разобран (ошибочные файлы тоже получают лог-отчёт).
+	// Zone — the punycode zone of the file path (in the DB — ZoneID; for
+	// the log report). Empty for a zone-less file (add|delete/<file>: the
+	// line zones come from the names) and if the path was not parsed
+	// (invalid files also get a log report).
 	Zone string
-	// ZoneID — идентификатор zones.id; 0 — зона-less файл или путь
-	// не разобран (в журнале — NULL).
+	// ZoneID — the zones.id identifier; 0 — a zone-less file or the path
+	// was not parsed (NULL in the log).
 	ZoneID int16
-	// Action — действие файла (1 add, 2 delete); 0 при неразобранном пути.
+	// Action — the file action (1 add, 2 delete); 0 if the path was not parsed.
 	Action model.Action
-	// Path — путь относительно incoming (ParsePath) — пишется в
+	// Path — the path relative to incoming (ParsePath) — written to
 	// ingest_files.path (T-014).
 	Path string
-	// SHA256 — хэш содержимого файла; nil, если чтение не завершилось.
+	// SHA256 — the content hash of the file; nil if reading did not complete.
 	SHA256 []byte
 
-	// Счётчики строк.
-	LinesTotal int64 // физических строк файла (ТЗ 5.1: «кол-во строк»)
-	Skipped    int64 // пустые строки и комментарии — в БД не попадают
-	Rejected   int64 // отклонено: парсер (UTF-8/длина) + валидатор (имя/зона)
-	Accepted   int64 // валидных строк (дошло до staging)
+	// Line counters.
+	LinesTotal int64 // physical lines of the file (spec 5.1: "the number of lines")
+	Skipped    int64 // empty lines and comments — not stored in the DB
+	Rejected   int64 // rejected: parser (UTF-8/length) + validator (name/zone)
+	Accepted   int64 // valid lines (made it to staging)
 
-	// Reasons — отклонения в разрезе причин (Reason), для лог-отчёта.
+	// Reasons — rejections broken down by reason (Reason), for the log report.
 	Reasons map[Reason]int
 
-	// Members — членов архива обработано (T-133); у txt-файлов 0.
-	// Колонки в схеме нет — только лог-отчёт и записи лога сервиса.
+	// Members — archive members processed (T-133); 0 for txt files.
+	// There is no schema column — only the log report and the service
+	// log records.
 	Members int
 
-	// Применение (после ApplyAdd/ApplyDelete; нули, если не дошло).
+	// Apply (after ApplyAdd/ApplyDelete; zeros if it never got there).
 	Added    int64 // add: Inserted + Revived
-	Revived  int64 // add: возвращено из deleted — часть Added
-	Existed  int64 // add: уже было
-	Deleted  int64 // delete: переведено в deleted
-	NotFound int64 // delete: строк без домена в БД
+	Revived  int64 // add: revived from deleted — part of Added
+	Existed  int64 // add: already existed
+	Deleted  int64 // delete: moved to deleted
+	NotFound int64 // delete: rows without the domain in the DB
 }
 
-// record — значения колонок ingest_files для этого итога (ТЗ 6.1).
-// Отображение счётчиков: Revived входит в Added (возвращённый из
-// deleted домен — тоже результат файла «добавлен», отдельных сущностей
-// схема не различает); NotFound колонки не имеет (ТЗ 5.1 перечисляет
-// добавлено/уже было/удалено/отклонено) — он виден в лог-отчёте:
-// NotFound = Accepted − Deleted по строкам delete-файла.
+// record — the ingest_files column values for this outcome (spec 6.1).
+// Counter mapping: Revived is part of Added (a domain revived from
+// deleted is also the file's "added" result; the schema does not
+// distinguish separate entities); NotFound has no column (spec 5.1
+// lists added/already existed/deleted/rejected) — it is visible in the
+// log report: NotFound = Accepted − Deleted over the lines of a delete
+// file.
 func (r FileReport) record(at time.Time) FileRecord {
 	return FileRecord{
 		ZoneID:      r.ZoneID,
@@ -197,10 +204,11 @@ func (r FileReport) record(at time.Time) FileRecord {
 	}
 }
 
-// renderReport — текстовый лог-отчёт об обработке файла (ТЗ 5.1: failed/
-// — «файлы с ошибкой (с лог-отчётом рядом)»; тот же текст — основа
-// записей лога сервиса). verdict — итог одной строкой: «применён»,
-// «дубль по sha256 — уже был обработан», «ошибочен — <причина>».
+// renderReport — the text log report on file processing (spec 5.1:
+// failed/ — "files with an error (with a log report nearby)"; the same
+// text is the basis of the service log records). verdict — the outcome
+// in one line: applied, a sha256 duplicate — already processed,
+// invalid — <reason>.
 func renderReport(rep FileReport, verdict string) string {
 	var b strings.Builder
 	b.WriteString("# лог-отчёт ingest (ТЗ 5.1)\n")
@@ -225,8 +233,8 @@ func renderReport(rep FileReport, verdict string) string {
 	fmt.Fprintf(&b, "  пропущено (пустые и комментарии): %d\n", rep.Skipped)
 	fmt.Fprintf(&b, "  отклонено: %d\n", rep.Rejected)
 	for _, r := range sortedReasons(rep.Reasons) {
-		// string(r), не %s: в отчёте — устойчивое имя причины (как в
-		// rejected-логе, T-016), а не его текст.
+		// string(r), not %s: the report carries the stable reason name
+		// (as in the rejected log, T-016), not its text.
 		fmt.Fprintf(&b, "    %s: %d\n", string(r), rep.Reasons[r])
 	}
 	fmt.Fprintf(&b, "  валидных: %d\n", rep.Accepted)
@@ -242,7 +250,7 @@ func renderReport(rep FileReport, verdict string) string {
 	return b.String()
 }
 
-// actionName — имя действия файла; нулевое (путь не разобран) — прочерк.
+// actionName — the file action name; zero value (path not parsed) — a dash.
 func actionName(a model.Action) string {
 	if a.Valid() {
 		return a.String()
@@ -250,8 +258,8 @@ func actionName(a model.Action) string {
 	return "—"
 }
 
-// sortedReasons — причины отклонений в детерминированном порядке
-// (алфавит): лог-отчёт воспроизводим от строки к строке.
+// sortedReasons — rejection reasons in a deterministic order
+// (alphabetical): the log report is reproducible line by line.
 func sortedReasons(m map[Reason]int) []Reason {
 	out := make([]Reason, 0, len(m))
 	for r := range m {
@@ -261,9 +269,10 @@ func sortedReasons(m map[Reason]int) []Reason {
 	return out
 }
 
-// mergeReasons — отклонения парсера и валидатора в одной карте
-// (FileReport.Reasons): причины парсера (invalid_utf8, line_len) и
-// валидатора (wrong_zone, классы idn.ErrorKind) не пересекаются по именам.
+// mergeReasons — parser and validator rejections in one map
+// (FileReport.Reasons): the parser reasons (invalid_utf8, line_len) and
+// the validator ones (wrong_zone, the idn.ErrorKind classes) do not
+// overlap by name.
 func mergeReasons(parser, validator map[Reason]int) map[Reason]int {
 	out := make(map[Reason]int, len(parser)+len(validator))
 	for k, n := range parser {

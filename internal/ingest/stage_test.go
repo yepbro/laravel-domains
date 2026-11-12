@@ -1,8 +1,9 @@
-// Юнит-тесты загрузчика staging без БД (стиль internal/db/copy_test.go):
-// нарезка пачек и содержимое строк COPY, очистка партии перед загрузкой,
-// счётчики, отмена между пачками, ошибки источника и инварианты строк,
-// лимит памяти пачкой, контракт staging-таблицы против SQL миграции 000004.
-// Реальная загрузка — интеграционные тесты ingest (T-023).
+// Unit tests of the staging loader without a DB (the style of
+// internal/db/copy_test.go): batch slicing and the COPY row content, the
+// batch cleanup before loading, counters, cancellation between batches,
+// source errors and row invariants, the memory cap per batch, the staging
+// table contract against the SQL of migration 000004.
+// The real loading — the ingest integration tests (T-023).
 package ingest
 
 import (
@@ -26,15 +27,15 @@ import (
 	"crawler/migrations"
 )
 
-// fakeDB записывает порядок обращений (exec/copy), строки каждого COPY и
-// аргументы Exec; при заданной ошибке возвращает её.
+// fakeDB records the order of calls (exec/copy), the rows of each COPY and
+// the Exec arguments; when an error is set, it returns it.
 type fakeDB struct {
-	ops      []string // порядок обращений: "exec:<sql>", "copy:<n>"
+	ops      []string // the order of calls: "exec:<sql>", "copy:<n>"
 	execSQL  []string
 	execArgs [][]any
-	execTag  pgconn.CommandTag // возвращается Exec (RowsAffected)
-	batches  []int             // строк в каждом вызове CopyFrom
-	rows     [][]any           // все строки всех пачек по порядку
+	execTag  pgconn.CommandTag // returned by Exec (RowsAffected)
+	batches  []int             // rows in each CopyFrom call
+	rows     [][]any           // all rows of all batches in order
 	copyErr  error
 	execErr  error
 }
@@ -58,7 +59,7 @@ func (f *fakeDB) CopyFrom(_ context.Context, table pgx.Identifier, columns []str
 		return 0, f.copyErr
 	}
 	if len(f.batches) == 0 {
-		// первый вызов: свернуть контракт таблицы и колонок
+		// the first call: pin down the table and columns contract
 		if !slices.Equal(table, StageTable) {
 			return 0, fmt.Errorf("COPY в %v, want %v", table, StageTable)
 		}
@@ -83,11 +84,11 @@ func (f *fakeDB) Exec(_ context.Context, sql string, args ...any) (pgconn.Comman
 
 func (f *fakeDB) Query(context.Context, string, ...any) (pgx.Rows, error) { return nil, nil }
 
-// rowsIter — типизированный источник строк с подсчётом вызовов.
+// rowsIter — a typed row source with call counting.
 type rowsIter struct {
 	rows    []Row
 	nextIdx int
-	onNext  func(i int) // побочный эффект перед выдачей строки i (отмена и т.п.)
+	onNext  func(i int) // a side effect before yielding row i (cancellation etc.)
 }
 
 func (it *rowsIter) next() (Row, error) {
@@ -102,7 +103,7 @@ func (it *rowsIter) next() (Row, error) {
 	return it.rows[i], nil
 }
 
-// genRows — n строк example-<i> с номерами строк от from.
+// genRows — n rows example-<i> with line numbers from from.
 func genRows(n int) []Row {
 	rows := make([]Row, n)
 	for i := range rows {
@@ -144,7 +145,7 @@ func TestNewBatchID(t *testing.T) {
 	if id == other {
 		t.Error("два NewBatchID совпали: идентификаторы партий должны быть уникальными")
 	}
-	// Префикс времени создания (T-098): микросекунды между вызовами.
+	// The creation time prefix (T-098): microseconds between the calls.
 	got := int64(binary.BigEndian.Uint64(id[:batchTimeLen]))
 	after := time.Now().UnixMicro()
 	if got < before || got > after {
@@ -152,15 +153,15 @@ func TestNewBatchID(t *testing.T) {
 	}
 }
 
-// TestBatchIDAgeOrdering — побайтовый порядок batch_id совпадает с
-// хронологией создания (T-098): партия старше границы зачистки под неё
-// попадает, партия на границе и моложе — нет. Семантика диапазона
-// «batch_id < границы» против живой БД — интеграционные тесты ingest.
+// TestBatchIDAgeOrdering — the byte order of batch_id matches the creation
+// chronology (T-098): a batch older than the purge cutoff falls under it, a
+// batch at the cutoff and younger does not. The semantics of the "batch_id <
+// cutoff" range against a live DB — the ingest integration tests.
 func TestBatchIDAgeOrdering(t *testing.T) {
 	base := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
 	cutoff := batchIDBefore(base.Add(StaleBatchAge))
 
-	old, err := newBatchIDAt(base) // создана на сутки раньше границы
+	old, err := newBatchIDAt(base) // created a day before the cutoff
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -168,7 +169,7 @@ func TestBatchIDAgeOrdering(t *testing.T) {
 		t.Error("партия старше порога обязана попадать под зачистку: batch_id < границы")
 	}
 
-	fresh, err := newBatchIDAt(base.Add(StaleBatchAge)) // ровно на границе
+	fresh, err := newBatchIDAt(base.Add(StaleBatchAge)) // exactly at the cutoff
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -184,7 +185,7 @@ func TestBatchIDAgeOrdering(t *testing.T) {
 		t.Error("партия моложе границы не должна удаляться")
 	}
 
-	// Уникальность внутри одной микросекунды — случайным хвостом.
+	// Uniqueness within one microsecond — by the random tail.
 	sameA, err := newBatchIDAt(base)
 	if err != nil {
 		t.Fatal(err)
@@ -210,11 +211,11 @@ func TestStage_Batching(t *testing.T) {
 	if staged != 105 {
 		t.Errorf("загружено %d, want 105", staged)
 	}
-	// 10 полных пачек + хвост из 5 строк (ТЗ 5.1: пачки по batch_size).
+	// 10 full batches + a tail of 5 rows (spec 5.1: batches of batch_size).
 	if got, want := strings.Join(ints(f.batches), ","), "10,10,10,10,10,10,10,10,10,10,5"; got != want {
 		t.Errorf("пачки = [%s], want [%s]", got, want)
 	}
-	// Перед копированием партия очищается — идемпотентность повтора (ТЗ 3.4).
+	// Before copying the batch is cleared — the idempotency of a retry (spec 3.4).
 	if len(f.ops) == 0 || f.ops[0] != "exec:"+clearStageSQL {
 		t.Errorf("первое обращение = %v, want очистка партии %q", f.ops, clearStageSQL)
 	}
@@ -222,7 +223,7 @@ func TestStage_Batching(t *testing.T) {
 		t.Errorf("очисток %d, want 1 (только своя партия перед загрузкой)", len(f.execSQL))
 	}
 
-	// Содержимое строк COPY: партия, зона, метка, операция, номер строки.
+	// The COPY row content: the batch, the zone, the label, the action, the line number.
 	if len(f.rows) != 105 {
 		t.Fatalf("строк в COPY %d, want 105", len(f.rows))
 	}
@@ -234,9 +235,9 @@ func TestStage_Batching(t *testing.T) {
 	}
 }
 
-// TestStage_MemoryBoundedByBatch — CopyFrom получает не больше batchSize
-// строк за раз: материализуется только одна пачка, память не зависит от
-// размера файла (ТЗ 3.5).
+// TestStage_MemoryBoundedByBatch — CopyFrom receives no more than batchSize
+// rows at a time: only one batch is materialized, memory does not depend on
+// the file size (spec 3.5).
 func TestStage_MemoryBoundedByBatch(t *testing.T) {
 	f := &fakeDB{}
 	staged, err := Stage(context.Background(), f, validBatch(t), 100, (&rowsIter{rows: genRows(1000)}).next)
@@ -262,8 +263,8 @@ func TestStage_EmptyInput(t *testing.T) {
 	if len(f.batches) != 0 {
 		t.Errorf("пустой ввод привёл к вызовам COPY: %v", f.batches)
 	}
-	// Очистка партии выполняется и на пустом вводе: повтор пустого файла
-	// затирает прежние строки партии.
+	// The batch cleanup runs on empty input too: a retry of an empty file
+	// wipes the batch's previous rows.
 	if len(f.execSQL) != 1 {
 		t.Errorf("очисток %d, want 1", len(f.execSQL))
 	}
@@ -300,16 +301,16 @@ func TestStage_Validation(t *testing.T) {
 	}
 }
 
-// TestStage_CancelBetweenBatches — отмена ctx между пачками прерывает
-// загрузку, законченные пачки остаются в staging (повтор перезаливает партию
-// начисто — ТЗ 3.4/3.5).
+// TestStage_CancelBetweenBatches — a ctx cancellation between batches
+// interrupts the loading, the finished batches stay in staging (a retry
+// re-uploads the batch from scratch — spec 3.4/3.5).
 func TestStage_CancelBetweenBatches(t *testing.T) {
 	f := &fakeDB{}
 	ctx, cancel := context.WithCancel(context.Background())
 
 	it := &rowsIter{rows: genRows(100)}
 	it.onNext = func(i int) {
-		if i == 30 { // строки 0–29: три пачки уже закоммичены
+		if i == 30 { // rows 0–29: three batches are already committed
 			cancel()
 		}
 	}
@@ -349,13 +350,14 @@ func TestStage_SourceError(t *testing.T) {
 	}
 }
 
-// TestStage_BadRow — инварианты строки отбивают загрузку до БД; строки
-// пачек, закоммиченных раньше, остаются (границы пачек, ТЗ 3.4).
+// TestStage_BadRow — the row invariants reject the load before the DB; the
+// rows of the batches committed earlier stay (the batch boundaries,
+// spec 3.4).
 func TestStage_BadRow(t *testing.T) {
 	cases := []struct {
 		name string
 		row  Row
-		want string // фрагмент ожидаемой ошибки
+		want string // a fragment of the expected error
 	}{
 		{"пустая метка", Row{Label: "", LineNo: 1}, "пустая метка"},
 		{"не-ASCII метка", Row{Label: "пример", LineNo: 1}, "punycode"},
@@ -368,8 +370,8 @@ func TestStage_BadRow(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			f := &fakeDB{}
-			// Пачка 10: плохая строка на позиции 10 — первая пачка уже
-			// закоммичена, вторая отбита целиком.
+			// A batch of 10: the bad row at position 10 — the first batch is
+			// already committed, the second is rejected entirely.
 			rows := append(genRows(10), tc.row)
 			staged, err := Stage(context.Background(), f, validBatch(t), 10, (&rowsIter{rows: rows}).next)
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
@@ -385,10 +387,10 @@ func TestStage_BadRow(t *testing.T) {
 	}
 }
 
-// TestStage_CompositeLabel — составные метки (контракт internal/idn,
-// ТЗ 5.2; docs/incoming-files.md: «www2.example.crawl.test — ок»)
-// проходят в staging как есть: валидатор T-016 отдаёт их одной меткой
-// зоны пути, точки внутри допустимы.
+// TestStage_CompositeLabel — composite labels (the internal/idn contract,
+// spec 5.2; docs/incoming-files.md: "www2.example.crawl.test — ok") pass
+// into staging as is: the T-016 validator yields them as one label of the
+// path zone, dots inside are allowed.
 func TestStage_CompositeLabel(t *testing.T) {
 	f := &fakeDB{}
 	b := validBatch(t)
@@ -457,7 +459,7 @@ func TestClearBatch(t *testing.T) {
 		t.Errorf("аргументы = %v, want идентификатор партии", f.execArgs)
 	}
 
-	// Нулевой идентификатор — ошибка без обращения к БД.
+	// A zero identifier — an error without a DB call.
 	if _, err := ClearBatch(context.Background(), f, BatchID{}); err == nil {
 		t.Error("нулевой идентификатор: ожидалась ошибка")
 	}
@@ -466,13 +468,13 @@ func TestClearBatch(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------- контракт схемы
+// ---------------------------------------------------------------- the schema contract
 
-// TestStageTableContract — соответствие миграции 000004 (встроенный набор
-// migrations/) загрузчику: UNLOGGED-таблица ingest_stage, колонки и типы
-// в порядке StageColumns, все NOT NULL, PK (batch_id, line_no), без
-// дополнительных индексов; down удаляет таблицу. Живая проверка схемы —
-// интеграционный schema_test.go (T-023).
+// TestStageTableContract — migration 000004 (the embedded migrations/ set)
+// matches the loader: the UNLOGGED table ingest_stage, the columns and types
+// in the StageColumns order, all NOT NULL, the PK (batch_id, line_no), no
+// extra indexes; down drops the table. The live schema check — the
+// integration schema_test.go (T-023).
 func TestStageTableContract(t *testing.T) {
 	up := readMigration(t, "000004_ingest_staging.up.sql")
 
@@ -510,8 +512,8 @@ func TestStageTableContract(t *testing.T) {
 	}
 }
 
-// TestClearStageSQLContract — очистка адресует ту же таблицу, что и COPY
-// (StageTable), только свою партию.
+// TestClearStageSQLContract — the cleanup targets the same table as COPY
+// (StageTable), its own batch only.
 func TestClearStageSQLContract(t *testing.T) {
 	if want := `DELETE FROM "ingest_stage" WHERE batch_id = $1`; clearStageSQL != want {
 		t.Errorf("clearStageSQL = %q, want %q", clearStageSQL, want)
@@ -527,16 +529,16 @@ func readMigration(t *testing.T, name string) string {
 	return string(raw)
 }
 
-// stageColumn — колонка из DDL: имя, тип, NOT NULL.
+// stageColumn — a column from the DDL: the name, the type, NOT NULL.
 type stageColumn struct {
 	name    string
 	typ     string
 	notNull bool
 }
 
-// parseCreateTable разбирает тело CREATE TABLE первой таблицы файла.
-// Строки DDL принадлежат миграции проекта (без вложенных скобок в колонках),
-// лёгкий разбор достаточен для контракта.
+// parseCreateTable parses the CREATE TABLE body of the file's first table.
+// The DDL lines belong to the project's migration (no nested parens in the
+// columns), a light parse is enough for the contract.
 func parseCreateTable(t *testing.T, sql string) []stageColumn {
 	t.Helper()
 
@@ -544,7 +546,7 @@ func parseCreateTable(t *testing.T, sql string) []stageColumn {
 	start := -1
 	for i, line := range lines {
 		if strings.Contains(line, "CREATE") && strings.Contains(line, "TABLE") {
-			start = i + 1 // первая строка после заголовка CREATE
+			start = i + 1 // the first line after the CREATE header
 			break
 		}
 	}
@@ -559,7 +561,7 @@ func parseCreateTable(t *testing.T, sql string) []stageColumn {
 			continue
 		}
 		if strings.HasPrefix(line, ")") {
-			break // конец тела таблицы
+			break // the end of the table body
 		}
 		line = strings.TrimSuffix(line, ",")
 		if strings.HasPrefix(line, "PRIMARY KEY") {
@@ -592,16 +594,17 @@ func colNames(cols []stageColumn) []string {
 	return names
 }
 
-// TestStageRowZone — зона строки COPY: Row.ZoneID (зона-less файл) с
-// откатом на ZoneID партии (файл зона-каталога); без зоны ни в строке,
-// ни в партии — ошибка rowIter, строка в БД не попадает.
+// TestStageRowZone — the COPY row zone: Row.ZoneID (a zone-less file) with
+// a fallback to the batch ZoneID (a zone-directory file); with a zone in
+// neither the row nor the batch — a rowIter error, the row does not reach
+// the DB.
 func TestStageRowZone(t *testing.T) {
 	id, err := NewBatchID()
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// Зона-less партия: каждая строка несёт свою зону.
+	// A zone-less batch: each row carries its own zone.
 	f := &fakeDB{}
 	rows := []Row{
 		{Label: "example", ZoneID: 7, LineNo: 1},
@@ -621,7 +624,7 @@ func TestStageRowZone(t *testing.T) {
 		}
 	}
 
-	// Файл зона-каталога: ZoneID строки нулевая — зона партии.
+	// A zone-directory file: the row ZoneID is zero — the batch zone.
 	f2 := &fakeDB{}
 	rows2 := []Row{{Label: "example", LineNo: 1}, {Label: "foo", LineNo: 2}}
 	if _, err := Stage(context.Background(), f2, Batch{ID: id, ZoneID: 5, Action: model.ActionAdd}, 10, (&rowsIter{rows: rows2}).next); err != nil {
@@ -633,8 +636,8 @@ func TestStageRowZone(t *testing.T) {
 		}
 	}
 
-	// Зона не определена нигде: ошибка rowIter — пачка COPY не доходит
-	// до БД целиком (транзакция пачки, ТЗ 3.5).
+	// The zone is undefined everywhere: a rowIter error — the COPY batch
+	// does not reach the DB at all (the batch transaction, spec 3.5).
 	f3 := &fakeDB{}
 	bad := []Row{{Label: "example", ZoneID: 9, LineNo: 1}, {Label: "foo", LineNo: 2}}
 	_, err = Stage(context.Background(), f3, Batch{ID: id, Action: model.ActionAdd}, 10, (&rowsIter{rows: bad}).next)

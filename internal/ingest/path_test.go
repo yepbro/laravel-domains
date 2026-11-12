@@ -1,7 +1,7 @@
-// Юнит-тесты разбора пути входного файла <зона>/add|delete/*.txt (T-014,
-// ТЗ 5.1): корректные пути, нормализация имени каталога зоны в unicode и
-// punycode в одну зону (ТЗ 11.4 п. 1), типизированные ошибки структуры,
-// расширения и невалидной зоны.
+// Unit tests of parsing the input file path <zone>/add|delete/*.txt (T-014,
+// spec 5.1): correct paths, normalization of the zone directory name in
+// unicode and punycode into one zone (spec 11.4 item 1), typed errors of
+// structure, extension and invalid zone.
 package ingest
 
 import (
@@ -20,7 +20,7 @@ func TestParsePathValid(t *testing.T) {
 		zone   string       // want Zone (punycode)
 		uni    string       // want ZoneUnicode
 		action model.Action // want Action
-		clean  string       // want Path (после path.Clean)
+		clean  string       // want Path (after path.Clean)
 	}{
 		{name: "ascii зона add", path: "com/add/list.txt", zone: "com", uni: "com", action: model.ActionAdd, clean: "com/add/list.txt"},
 		{name: "ascii зона delete", path: "net/delete/2026-10-17.txt", zone: "net", uni: "net", action: model.ActionDelete, clean: "net/delete/2026-10-17.txt"},
@@ -31,15 +31,15 @@ func TestParsePathValid(t *testing.T) {
 		{name: "точки в имени файла", path: "com/add/2026.10.17.txt", zone: "com", uni: "com", action: model.ActionAdd, clean: "com/add/2026.10.17.txt"},
 		{name: "очистка разделителей", path: "com//add/./list.txt", zone: "com", uni: "com", action: model.ActionAdd, clean: "com/add/list.txt"},
 		{name: "хвостовой слэш", path: "com/add/list.txt/", zone: "com", uni: "com", action: model.ActionAdd, clean: "com/add/list.txt"},
-		// Архивы поддерживаемых форматов (T-133) — имена как у txt.
+		// Archives of supported formats (T-133) — names like txt.
 		{name: "zip", path: "com/add/zone.zip", zone: "com", uni: "com", action: model.ActionAdd, clean: "com/add/zone.zip"},
 		{name: "tar", path: "net/delete/plain.tar", zone: "net", uni: "net", action: model.ActionDelete, clean: "net/delete/plain.tar"},
 		{name: "tar.gz", path: "com/add/wrapped.tar.gz", zone: "com", uni: "com", action: model.ActionAdd, clean: "com/add/wrapped.tar.gz"},
 		{name: "tgz", path: "com/add/short.tgz", zone: "com", uni: "com", action: model.ActionAdd, clean: "com/add/short.tgz"},
 		{name: "gz", path: "com/add/list.gz", zone: "com", uni: "com", action: model.ActionAdd, clean: "com/add/list.gz"},
 		{name: "архив в верхнем регистре", path: "com/add/ZONE.ZIP", zone: "com", uni: "com", action: model.ActionAdd, clean: "com/add/ZONE.ZIP"},
-		// Зона-less файлы (add|delete/<файл>): зоны строк выводятся из
-		// имён (validate.go), файл может смешивать зоны.
+		// Zone-less files (add|delete/<file>): line zones are derived from
+		// the names (validate.go), the file may mix zones.
 		{name: "зона-less add", path: "add/list.txt", zone: "", uni: "", action: model.ActionAdd, clean: "add/list.txt"},
 		{name: "зона-less delete", path: "delete/old.txt", zone: "", uni: "", action: model.ActionDelete, clean: "delete/old.txt"},
 		{name: "зона-less .TXT", path: "add/LIST.TXT", zone: "", uni: "", action: model.ActionAdd, clean: "add/LIST.TXT"},
@@ -68,8 +68,8 @@ func TestParsePathValid(t *testing.T) {
 	}
 }
 
-// TestParsePathZoneUnicodePunycode — ядро ТЗ 11.4 п. 1: unicode- и
-// punycode-имя каталога — одна зона, без дублей.
+// TestParsePathZoneUnicodePunycode — the core of spec 11.4 item 1: the
+// unicode and punycode directory names are one zone, without duplicates.
 func TestParsePathZoneUnicodePunycode(t *testing.T) {
 	uni, err := ParsePath("москва/add/новые.txt")
 	if err != nil {
@@ -142,8 +142,8 @@ func TestParsePathErrors(t *testing.T) {
 	}
 }
 
-// TestParsePathZoneErrorUnwrap — причина ошибки зоны доступна как *idn.Error
-// (класс — в отчёт об ошибке файла, ТЗ 5.1).
+// TestParsePathZoneErrorUnwrap — the zone error cause is available as
+// *idn.Error (the class goes into the file error report, spec 5.1).
 func TestParsePathZoneErrorUnwrap(t *testing.T) {
 	_, err := ParsePath("xn--/add/list.txt")
 	if err == nil {

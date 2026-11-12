@@ -1,13 +1,14 @@
-// Сквозные юнит-тесты конвейера ingest (T-021, ТЗ 5.1) без БД: фейковые
-// ZoneStore (zones_test.go), FileStore (report_test.go) и pgx-пул с
-// заготовленными результатами Stage/ApplyAdd/ApplyDelete; файлы — во
-// временных каталогах (t.TempDir). Сценарии: удачный add, удачный
-// delete, дубль — точная повторная доставка (T-113: та же зона, действие
-// и sha256 — не применяется повторно), то же содержимое другой зоной/
-// действием — обработка (undo), порог ошибок →
-// failed/ с лог-отчётом, битая структура пути → failed/, инфраструктурный
-// сбой → файл остаётся в incoming (at-least-once, ТЗ 3.4), коллизия имён
-// в архиве. Реальное поведение против БД — интеграционные тесты (T-023).
+// End-to-end unit tests of the ingest pipeline (T-021, spec 5.1) without a
+// DB: fake ZoneStore (zones_test.go), FileStore (report_test.go) and a pgx
+// pool with pre-made Stage/ApplyAdd/ApplyDelete results; the files live in
+// temporary directories (t.TempDir). Scenarios: a successful add, a
+// successful delete, a duplicate — exact redelivery (T-113: the same zone,
+// action and sha256 — not applied again), the same content with another
+// zone/action — processed (undo), the error threshold →
+// failed/ with a log report, a broken path structure → failed/, an
+// infrastructure failure → the file stays in incoming (at-least-once,
+// spec 3.4), a name collision inside an archive. Real behavior against the
+// DB — the integration tests (T-023).
 package ingest
 
 import (
@@ -34,34 +35,35 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-// --- фейковый пул конвейера ----------------------------------------------
+// --- the fake pool of the pipeline----------------------------------------------
 
-// pipeExec — заготовленный результат одного Exec по очереди.
+// pipeExec — a pre-made result of one Exec, handed out in turn.
 type pipeExec struct {
 	tag pgconn.CommandTag
 	err error
 }
 
-// pipePool — db.DB для конвейера: CopyFrom считает строки пачек COPY
-// (staging), Exec выдаёт результаты по очереди (в транзакции применения
-// add — общая очередь), Query отвечает на известные SQL ApplyAdd
-// (граница пачки и RETURNING вставки — по модели staging: строки COPY
-// партии с line_no в диапазоне курсора; inserted — сколько строк пачки
-// «вставляется», конфликтами считаются остальные) и ApplyDelete. Как
-// реальный pgx, отказывается работать с отменённым контекстом.
+// pipePool — a db.DB for the pipeline: CopyFrom counts the rows of the COPY
+// batches (staging), Exec hands out results in turn (in the add apply
+// transaction — one common queue), Query answers the known ApplyAdd SQL
+// (the batch boundary and the RETURNING of the insert — by the staging
+// model: the COPY rows of the batch with line_no in the cursor range;
+// inserted — how many rows of the batch are "inserted", the rest count as
+// conflicts) and ApplyDelete. Like real pgx, it refuses to work with a
+// canceled context.
 type pipePool struct {
-	ops      []string // протокол: "exec:<sql>", "query:<sql>", "copy:<n>", "begin", "commit"
-	copies   []int64  // размеры пачек COPY по очереди
-	copyVals [][]any  // строки всех пачек COPY (значения колонок)
+	ops      []string // the protocol: "exec:<sql>", "query:<sql>", "copy:<n>", "begin", "commit"
+	copies   []int64  // the COPY batch sizes in turn
+	copyVals [][]any  // the rows of all COPY batches (the column values)
 	copyErr  error
 
-	execs []pipeExec // результаты Exec по очереди (конец — нулевой тег)
+	execs []pipeExec // the Exec results in turn (the end — a zero tag)
 	execI int
 
-	inserted   int64 // ответ CTE вставки (T-178: Query)
-	revived    int64 // ответ CTE возврата (T-178: Query)
-	uniques    int64 // ответ countAddSQL (уникальных доменов партии add)
-	delDeleted int64 // ответ applyDeleteSQL
+	inserted   int64 // the answer of the insert CTE (T-178: Query)
+	revived    int64 // the answer of the revive CTE (T-178: Query)
+	uniques    int64 // the answer of countAddSQL (the unique domains of the add batch)
+	delDeleted int64 // the answer of applyDeleteSQL
 	delMissing int64
 
 	begins  int
@@ -110,8 +112,8 @@ func (p *pipePool) Exec(ctx context.Context, sql string, _ ...any) (pgconn.Comma
 	return pgconn.CommandTag{}, nil
 }
 
-// oneRowRows — pgx.Rows из одной строки для позиционного Scan
-// (countAddSQL — RowTo[int64], applyDeleteSQL — Scan двух счётчиков).
+// oneRowRows — pgx.Rows of one row for a positional Scan (countAddSQL —
+// RowTo[int64], applyDeleteSQL — a Scan of two counters).
 type oneRowRows struct {
 	vals   []any
 	next   bool
@@ -138,7 +140,7 @@ func (r *oneRowRows) Scan(dest ...any) error {
 	return nil
 }
 
-// scanAny присваивает значение приёмнику через reflect (int64 и указатели).
+// scanAny assigns the value to the destination via reflect (int64 and pointers).
 func scanAny(dest any, val any) error {
 	target := reflect.ValueOf(dest).Elem()
 	v := reflect.ValueOf(val)
@@ -161,7 +163,7 @@ func (r *oneRowRows) FieldDescriptions() []pgconn.FieldDescription {
 func (r *oneRowRows) Values() ([]any, error) { return r.vals, nil }
 func (r *oneRowRows) RawValues() [][]byte    { return nil }
 
-// Conn и TypeMap — часть pgx.Rows, не используемая коллекторами.
+// Conn and TypeMap — the part of pgx.Rows not used by the collectors.
 func (r *oneRowRows) Conn() *pgx.Conn      { return nil }
 func (r *oneRowRows) TypeMap() *pgtype.Map { return nil }
 
@@ -172,8 +174,9 @@ func (p *pipePool) Query(ctx context.Context, sql string, args ...any) (pgx.Rows
 	p.ops = append(p.ops, "query:"+sql)
 	switch sql {
 	case addChunkBoundSQL:
-		// Граница пачки: line_no limit-й строки партии после курсора по
-		// модели staging (строки COPY этой партии).
+		// The batch boundary: the line_no of the limit-th row of the batch
+		// after the cursor, by the staging model (the COPY rows of this
+		// batch).
 		after, limit := args[2].(int64), args[3].(int)
 		rows := p.stageRows(args[0].([]byte), args[1].(int16), after, 1<<62)
 		if n := len(rows); n > limit {
@@ -185,8 +188,8 @@ func (p *pipePool) Query(ctx context.Context, sql string, args ...any) (pgx.Rows
 		}
 		return cleanupRows([]any{bound}), nil
 	case insertAddSQL:
-		// RETURNING zone_id вставленных строк пачки: первые inserted строк
-		// диапазона (остальные — конфликты).
+		// RETURNING zone_id of the inserted rows of the batch: the first
+		// inserted rows of the range (the rest — conflicts).
 		from, to := args[2].(int64), args[3].(int64)
 		rows := p.stageRows(args[0].([]byte), args[1].(int16), from, to)
 		if n := int(p.inserted); n < len(rows) {
@@ -202,21 +205,21 @@ func (p *pipePool) Query(ctx context.Context, sql string, args ...any) (pgx.Rows
 	case countAddSQL:
 		return &oneRowRows{vals: []any{p.uniques}}, nil
 	case applyDeleteSQL:
-		// T-269: строка несёт и битовые массивы (в конвейерных тестах
-		// флаговых строк нет — вторая пара не выполняется).
+		// T-269: the row carries the bit arrays too (the pipeline tests have
+		// no flagged rows — the second pair is not executed).
 		return &oneRowRows{vals: []any{p.delDeleted, p.delMissing, []int16{}, []string{}}}, nil
 	}
 	return nil, fmt.Errorf("pipePool: неожидаемый запрос: %s", sql)
 }
 
-// stagedRow — строка партии в модели staging фейка.
+// stagedRow — a batch row in the fake's staging model.
 type stagedRow struct {
 	lineNo int64
 	zoneID int16
 }
 
-// stageRows — строки партии в модели staging (строки COPY) с line_no в
-// (after, to]; to >= 1<<62 — без верхней границы.
+// stageRows — the batch rows in the staging model (the COPY rows) with
+// line_no in (after, to]; to >= 1<<62 — without an upper bound.
 func (p *pipePool) stageRows(batch []byte, action int16, after, to int64) []stagedRow {
 	var rows []stagedRow
 	for _, vals := range p.copyVals {
@@ -231,8 +234,8 @@ func (p *pipePool) stageRows(batch []byte, action int16, after, to int64) []stag
 	return rows
 }
 
-// Begin — транзакция применения add (T-205): операции идут через пул
-// (общий протокол и очередь Exec), Commit/Rollback — флаги.
+// Begin — the add apply transaction (T-205): the operations go through the
+// pool (the common protocol and the Exec queue), Commit/Rollback — flags.
 func (p *pipePool) Begin(ctx context.Context) (pgx.Tx, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -242,9 +245,9 @@ func (p *pipePool) Begin(ctx context.Context) (pgx.Tx, error) {
 	return &pipeTx{pool: p}, nil
 }
 
-// pipeTx — транзакция фейкового пула конвейера.
+// pipeTx — a transaction of the fake pipeline pool.
 type pipeTx struct {
-	pgx.Tx // остальные методы pgx.Tx конвейер не использует
+	pgx.Tx // the pipeline does not use the other pgx.Tx methods
 
 	pool *pipePool
 }
@@ -265,9 +268,9 @@ func (t *pipeTx) Commit(context.Context) error {
 
 func (t *pipeTx) Rollback(context.Context) error { return nil }
 
-// --- сборка конвейера ------------------------------------------------------
+// --- pipeline assembly------------------------------------------------------
 
-// pipeTest — окружение теста конвейера: каталог incoming, фейки, конвейер.
+// pipeTest — the pipeline test environment: the incoming directory, the fakes, the pipeline.
 type pipeTest struct {
 	dir   string // incoming (t.TempDir)
 	zones *fakeZoneStore
@@ -289,7 +292,7 @@ func newPipeTest(t *testing.T) *pipeTest {
 	pipe, err := NewPipeline(pt.zones, pt.files, pt.pool, PipelineOptions{
 		Dir:       pt.dir,
 		BatchSize: 10,
-		Log:       nil, // подавлен: итоги проверяются по Outcome
+		Log:       nil, // suppressed: the outcomes are checked via Outcome
 		Now:       func() time.Time { return pt.now },
 	})
 	if err != nil {
@@ -299,8 +302,8 @@ func newPipeTest(t *testing.T) *pipeTest {
 	return pt
 }
 
-// addFile — файл rel (относительно incoming) с содержимым content;
-// возвращает абсолютный путь.
+// addFile — a file rel (relative to incoming) with the content content;
+// returns the absolute path.
 func (pt *pipeTest) addFile(t *testing.T, rel, content string) string {
 	t.Helper()
 	abs := filepath.Join(pt.dir, filepath.FromSlash(rel))
@@ -313,7 +316,7 @@ func (pt *pipeTest) addFile(t *testing.T, rel, content string) string {
 	return abs
 }
 
-// exists — файл/каталог существует.
+// exists — the file/directory exists.
 func exists(t *testing.T, path string) bool {
 	t.Helper()
 	_, err := os.Lstat(path)
@@ -323,7 +326,7 @@ func exists(t *testing.T, path string) bool {
 	return err == nil
 }
 
-// readFile — содержимое файла (для лог-отчётов).
+// readFile — the file content (for log reports).
 func readFile(t *testing.T, path string) string {
 	t.Helper()
 	b, err := os.ReadFile(path)
@@ -333,10 +336,11 @@ func readFile(t *testing.T, path string) string {
 	return string(b)
 }
 
-// --- сценарии --------------------------------------------------------------
+// --- scenarios--------------------------------------------------------------
 
-// TestPipelineAdd — удачный add: строка применена, отчёт записан в
-// ingest_files, файл перемещён в processed/ с сохранением структуры.
+// TestPipelineAdd — a successful add: the lines are applied, the report is
+// written into ingest_files, the file is moved to processed/ keeping the
+// structure.
 func TestPipelineAdd(t *testing.T) {
 	pt := newPipeTest(t)
 	content := "example.com\n# комментарий\n\nfoo.com\nexample.com\n"
@@ -344,12 +348,12 @@ func TestPipelineAdd(t *testing.T) {
 	sha := sha256.Sum256([]byte(content))
 
 	pt.pool.execs = []pipeExec{
-		{tag: pgconn.NewCommandTag("DELETE 0")}, // очистка перед загрузкой (Stage)
-		{tag: pgconn.NewCommandTag("DELETE 3")}, // очистка после применения
+		{tag: pgconn.NewCommandTag("DELETE 0")}, // the cleanup before loading (Stage)
+		{tag: pgconn.NewCommandTag("DELETE 3")}, // the cleanup after the apply
 	}
-	pt.pool.inserted = 1 // новый: foo (example существует в deleted)
-	pt.pool.revived = 1  // возвращён из deleted: example
-	pt.pool.uniques = 2  // уникальных меток партии: example, foo (дубль строки — одна метка)
+	pt.pool.inserted = 1 // new: foo (example already exists in deleted)
+	pt.pool.revived = 1  // revived from deleted: example
+	pt.pool.uniques = 2  // the unique labels of the batch: example, foo (a duplicate line — one label)
 
 	out, err := pt.pipe.Process(context.Background(), abs)
 	if err != nil {
@@ -363,8 +367,8 @@ func TestPipelineAdd(t *testing.T) {
 	if rep.Zone != "com" || rep.ZoneID != 1 || rep.Action != model.ActionAdd {
 		t.Errorf("файл отчёта = %+v, want зона com (id 1), действие add", rep)
 	}
-	// 5 физических строк: 3 значимых (дубль example — тоже строка),
-	// 1 комментарий, 1 пустая; валидных 3.
+	// 5 physical lines: 3 significant (a duplicate example is a line too),
+	// 1 comment, 1 empty; 3 valid.
 	if rep.LinesTotal != 5 || rep.Skipped != 2 || rep.Accepted != 3 || rep.Rejected != 0 {
 		t.Errorf("счётчики строк = %+v, want 5/2/3/0", rep)
 	}
@@ -375,7 +379,7 @@ func TestPipelineAdd(t *testing.T) {
 		t.Errorf("sha256 = %x, want хэш содержимого %x", rep.SHA256, sha)
 	}
 
-	// Отчёт в журнале: счётчики файла одной строкой ingest_files (ТЗ 6.1).
+	// The report in the journal: the file counters as one ingest_files row (spec 6.1).
 	if len(pt.files.records) != 1 {
 		t.Fatalf("записей в журнале = %d, want 1", len(pt.files.records))
 	}
@@ -388,10 +392,10 @@ func TestPipelineAdd(t *testing.T) {
 		t.Errorf("запись журнала = %+v, want %+v", rec, wantRec)
 	}
 
-	// Обращения к БД: очистка → COPY → применение в одной транзакции
-	// (граница пачки → вставка → граница «пусто» → дельты зон → возврат →
-	// подсчёт → очистка → фиксация), затем — ничего (Stage и ApplyAdd,
-	// фиксированный порядок T-017/T-018/T-205).
+	// DB calls: cleanup → COPY → the apply in one transaction (the batch
+	// boundary → the insert → the "empty" boundary → the zone deltas → the
+	// revive → the count → the cleanup → the commit), then — nothing (Stage
+	// and ApplyAdd, the fixed order of T-017/T-018/T-205).
 	want := []string{
 		"exec:" + clearStageSQL,
 		"copy:3",
@@ -410,7 +414,7 @@ func TestPipelineAdd(t *testing.T) {
 			strings.Join(pt.pool.ops, "\n"), strings.Join(want, "\n"))
 	}
 
-	// Файл уходит в processed/ с сохранением структуры (ТЗ 5.1).
+	// The file goes to processed/ keeping the structure (spec 5.1).
 	if exists(t, abs) {
 		t.Error("файл остался в incoming")
 	}
@@ -419,9 +423,9 @@ func TestPipelineAdd(t *testing.T) {
 	}
 }
 
-// TestPipelineZonelessAdd — зона-less файл (add/<файл>): зоны создаются
-// лениво по первым строкам, строки staging несут зону каждую, отчёт —
-// с zone_id NULL (ZoneID 0), файл уходит в processed/add/.
+// TestPipelineZonelessAdd — a zone-less file (add/<file>): the zones are
+// created lazily by the first lines, the staging rows each carry a zone,
+// the report has zone_id NULL (ZoneID 0), the file goes to processed/add/.
 func TestPipelineZonelessAdd(t *testing.T) {
 	pt := newPipeTest(t)
 	content := "example.com\nfoo.ru\nbar.com\n"
@@ -429,9 +433,9 @@ func TestPipelineZonelessAdd(t *testing.T) {
 	sha := sha256.Sum256([]byte(content))
 
 	pt.pool.execs = []pipeExec{
-		{tag: pgconn.NewCommandTag("DELETE 0")}, // очистка перед загрузкой (Stage)
-		// вставка/возврат — ответы Query (inserted=3, revived=0)
-		{tag: pgconn.NewCommandTag("DELETE 3")}, // очистка после применения
+		{tag: pgconn.NewCommandTag("DELETE 0")}, // the cleanup before loading (Stage)
+		// the insert/revive — the Query answers (inserted=3, revived=0)
+		{tag: pgconn.NewCommandTag("DELETE 3")}, // the cleanup after the apply
 	}
 	pt.pool.inserted = 3
 	pt.pool.revived = 0
@@ -459,13 +463,13 @@ func TestPipelineZonelessAdd(t *testing.T) {
 		t.Errorf("sha256 = %x, want хэш содержимого %x", rep.SHA256, sha)
 	}
 
-	// Зоны созданы лениво по первым строкам: com (первая строка), ru.
+	// The zones are created lazily by the first lines: com (the first line), ru.
 	wantCalls := []string{"byName:com", "create:com", "byName:ru", "create:ru"}
 	if !reflect.DeepEqual(pt.zones.calls, wantCalls) {
 		t.Errorf("обращения к зонам = %v, want %v (кэш: com повторно не ищется)", pt.zones.calls, wantCalls)
 	}
 
-	// Строки COPY несут зону каждая: example→com(1), foo→ru(2), bar→com(1).
+	// The COPY rows each carry a zone: example→com(1), foo→ru(2), bar→com(1).
 	wantZone := []int16{1, 2, 1}
 	if len(pt.pool.copyVals) != len(wantZone) {
 		t.Fatalf("строк COPY = %d, want %d", len(pt.pool.copyVals), len(wantZone))
@@ -476,7 +480,7 @@ func TestPipelineZonelessAdd(t *testing.T) {
 		}
 	}
 
-	// Отчёт в журнале: зона-less файл пишет ZoneID 0 (NULL в БД).
+	// The report in the journal: a zone-less file writes ZoneID 0 (NULL in the DB).
 	if len(pt.files.records) != 1 {
 		t.Fatalf("записей в журнале = %d, want 1", len(pt.files.records))
 	}
@@ -485,7 +489,7 @@ func TestPipelineZonelessAdd(t *testing.T) {
 		t.Errorf("запись журнала = %+v, want ZoneID 0, путь add/list.txt, added 3", rec)
 	}
 
-	// Файл уходит в processed/ с сохранением структуры (без каталога зоны).
+	// The file goes to processed/ keeping the structure (no zone directory).
 	if exists(t, abs) {
 		t.Error("файл остался в incoming")
 	}
@@ -494,13 +498,13 @@ func TestPipelineZonelessAdd(t *testing.T) {
 	}
 }
 
-// TestPipelineZonelessNumericZone — фиктивные числовые зоны не возникают:
-// в зона-less файле строки-даты (кандидаты извлечения T-132 из полей
-// выгрузки) отклоняются, зона не выводится и не создаётся (регрессия
-// дампа .SU: строка «SOCHI.SU <регистратор> <дата>…» применялась как домен
-// «18.06.1999» с автоматической зоной 1999). Голый суффикс sochi.su
-// валиден как домен su (мусор без фильтра, ТЗТ tld-only-zones §12.6),
-// строка из одних дат — no_domain.
+// TestPipelineZonelessNumericZone — fictitious numeric zones do not arise:
+// in a zone-less file the date lines (the T-132 extraction candidates from
+// the registrar export fields) are rejected, the zone is neither derived nor
+// created (the .SU dump regression: the line "SOCHI.SU <registrar> <date>…"
+// was applied as the domain "18.06.1999" with the automatic zone 1999). The
+// bare suffix sochi.su is valid as the domain su (junk without the filter,
+// the tld-only-zones spec §12.6), a line of dates only — no_domain.
 func TestPipelineZonelessNumericZone(t *testing.T) {
 	pt := newPipeTest(t)
 	content := "0-0.SU\tARDIS-SU\t17.11.2015\t17.11.2026\t20.12.2026\t1\n" +
@@ -509,20 +513,21 @@ func TestPipelineZonelessNumericZone(t *testing.T) {
 	abs := pt.addFile(t, "add/su_dump.txt", content)
 
 	pt.pool.execs = []pipeExec{
-		{tag: pgconn.NewCommandTag("DELETE 0")}, // очистка перед загрузкой (Stage)
-		// вставка/возврат — ответы Query (inserted=2, revived=0)
-		{tag: pgconn.NewCommandTag("DELETE 2")}, // очистка после применения
+		{tag: pgconn.NewCommandTag("DELETE 0")}, // the cleanup before loading (Stage)
+		// the insert/revive — the Query answers (inserted=2, revived=0)
+		{tag: pgconn.NewCommandTag("DELETE 2")}, // the cleanup after the apply
 	}
 	pt.pool.inserted = 2
 	pt.pool.revived = 0
 	pt.pool.uniques = 2
 
-	// Треть строк отклонена — дефолтного порога 10% хватило бы
-	// «уронить» файл; здесь проверяется применение, а не порог.
+	// A third of the lines are rejected — the default threshold of 10%
+	// would be enough to fail the file; what is checked here is the apply,
+	// not the threshold.
 	pipe, err := NewPipeline(pt.zones, pt.files, pt.pool, PipelineOptions{
 		Dir:           pt.dir,
 		BatchSize:     10,
-		MaxErrorRatio: 0.5, // 1 отклонение из 3 — файл не роняется (строго выше)
+		MaxErrorRatio: 0.5, // 1 rejection out of 3 — the file does not fail (strictly above)
 		Now:           func() time.Time { return pt.now },
 	})
 	if err != nil {
@@ -543,12 +548,12 @@ func TestPipelineZonelessNumericZone(t *testing.T) {
 		t.Errorf("Reasons = %+v, want ровно no_domain: 1", rep.Reasons)
 	}
 
-	// Единственная зона файла — su: фиктивная «1999» не создаётся.
+	// The file's only zone is su: the fictitious "1999" is not created.
 	if want := []string{"byName:su", "create:su"}; !reflect.DeepEqual(pt.zones.calls, want) {
 		t.Errorf("обращения к зонам = %v, want %v", pt.zones.calls, want)
 	}
-	// В staging ушли два домена su — не даты: рядовая метка и голый
-	// суффикс sochi (валидный мусор, ТЗТ §12.6).
+	// Two su domains went into staging — not dates: an ordinary label and
+	// the bare suffix sochi (valid junk, the tld-only-zones spec §12.6).
 	if len(pt.pool.copyVals) != 2 {
 		t.Fatalf("строк COPY = %d, want 2", len(pt.pool.copyVals))
 	}
@@ -562,9 +567,9 @@ func TestPipelineZonelessNumericZone(t *testing.T) {
 	}
 }
 
-// TestPipelineZonelessDuplicate — точная повторная доставка зона-less
-// файла: совпадение (NULL-зона, действие, sha256) — не применяется,
-// перемещается в processed без нового отчёта (T-113).
+// TestPipelineZonelessDuplicate — exact redelivery of a zone-less file: a
+// match (NULL zone, action, sha256) — not applied, moved to processed
+// without a new report (T-113).
 func TestPipelineZonelessDuplicate(t *testing.T) {
 	pt := newPipeTest(t)
 	content := "example.com\nfoo.ru\n"
@@ -574,7 +579,7 @@ func TestPipelineZonelessDuplicate(t *testing.T) {
 	add := model.ActionAdd
 	path := "add/first.txt"
 	pt.files = newFakeFileStore(
-		model.IngestFile{ // прежняя доставка того же содержимого — тоже зона-less
+		model.IngestFile{ // the previous delivery of the same content — zone-less too
 			ID: 5, ZoneID: nil, Action: &add, Path: &path,
 			SHA256: sha[:], ProcessedAt: &processed,
 		},
@@ -602,8 +607,8 @@ func TestPipelineZonelessDuplicate(t *testing.T) {
 	}
 }
 
-// TestPipelineDelete — удачный delete: домены переведены в deleted,
-// счётчики Deleted/NotFound в отчёте.
+// TestPipelineDelete — a successful delete: the domains are moved to
+// deleted, the Deleted/NotFound counters in the report.
 func TestPipelineDelete(t *testing.T) {
 	pt := newPipeTest(t)
 	content := "a.net\nb.net\n"
@@ -611,8 +616,8 @@ func TestPipelineDelete(t *testing.T) {
 	sha := sha256.Sum256([]byte(content))
 
 	pt.pool.execs = []pipeExec{
-		{tag: pgconn.NewCommandTag("DELETE 0")}, // очистка перед загрузкой
-		{tag: pgconn.NewCommandTag("DELETE 2")}, // очистка после применения
+		{tag: pgconn.NewCommandTag("DELETE 0")}, // the cleanup before loading
+		{tag: pgconn.NewCommandTag("DELETE 2")}, // the cleanup after the apply
 	}
 	pt.pool.delDeleted = 1
 	pt.pool.delMissing = 1
@@ -636,7 +641,7 @@ func TestPipelineDelete(t *testing.T) {
 	if rec.Deleted != 1 || rec.Action != model.ActionDelete || !reflect.DeepEqual(rec.SHA256, sha[:]) {
 		t.Errorf("запись журнала = %+v, want deleted 1, sha256 содержимого", rec)
 	}
-	// NotFound — только лог-отчёт: колонки в ingest_files нет (ТЗ 6.1).
+	// NotFound — the log report only: there is no column in ingest_files (spec 6.1).
 	if rec.Added != 0 || rec.Existed != 0 || rec.Rejected != 0 {
 		t.Errorf("запись журнала = %+v, want нулевые add-счётчики", rec)
 	}
@@ -644,8 +649,8 @@ func TestPipelineDelete(t *testing.T) {
 	want := []string{
 		"exec:" + clearStageSQL,
 		"copy:2",
-		"begin", // транзакция применения delete (T-269): перевод статуса и
-		// пара «бит × счётчик» — два оператора одной транзакции
+		"begin", // the delete apply transaction (T-269): the status flip and
+		// the "bit × counter" pair — two statements of one transaction
 		"query:" + applyDeleteSQL,
 		"commit",
 		"exec:" + clearStageSQL,
@@ -659,14 +664,14 @@ func TestPipelineDelete(t *testing.T) {
 	}
 }
 
-// TestPipelineExtractLines — смешанные строки файла (T-132): извлечённые
-// домены грузятся в staging и применяются, строки без домена — отклонения
-// no_domain (rejected-лог + разрез Reasons отчёта), счётчики прежние
-// (added/rejected, новых полей нет).
+// TestPipelineExtractLines — the mixed lines of a file (T-132): the
+// extracted domains are loaded into staging and applied, the lines without
+// a domain — no_domain rejections (the rejected log + the Reasons cut of
+// the report), the counters stay the same (added/rejected, no new fields).
 func TestPipelineExtractLines(t *testing.T) {
 	pt := newPipeTest(t)
-	content := "xxx.com 2029-11-11 TIMEWEB\n" + // пример заказчика
-		"https://shop.com/page\n" + // URL с путём
+	content := "xxx.com 2029-11-11 TIMEWEB\n" + // a customer example
+		"https://shop.com/page\n" + // a URL with a path
 		"plain.com\n" +
 		"нет домена тут\n" // no_domain
 	abs := pt.addFile(t, "com/add/list.txt", content)
@@ -676,7 +681,7 @@ func TestPipelineExtractLines(t *testing.T) {
 	pipe, err := NewPipeline(pt.zones, pt.files, pt.pool, PipelineOptions{
 		Dir:           pt.dir,
 		BatchSize:     10,
-		MaxErrorRatio: 0.5, // 1 отклонение из 4 — файл не роняется
+		MaxErrorRatio: 0.5, // 1 rejection out of 4 — the file does not fail
 		RejectLog:     NewRejectedLogger(&buf, slog.LevelInfo),
 		Now:           func() time.Time { return pt.now },
 	})
@@ -684,9 +689,9 @@ func TestPipelineExtractLines(t *testing.T) {
 		t.Fatal(err)
 	}
 	pt.pool.execs = []pipeExec{
-		{tag: pgconn.NewCommandTag("DELETE 0")}, // очистка перед загрузкой (Stage)
-		// вставка/возврат — ответы Query (inserted=3, revived=0)
-		{tag: pgconn.NewCommandTag("DELETE 4")}, // очистка после применения
+		{tag: pgconn.NewCommandTag("DELETE 0")}, // the cleanup before loading (Stage)
+		// the insert/revive — the Query answers (inserted=3, revived=0)
+		{tag: pgconn.NewCommandTag("DELETE 4")}, // the cleanup after the apply
 	}
 	pt.pool.inserted = 3
 	pt.pool.revived = 0
@@ -712,7 +717,7 @@ func TestPipelineExtractLines(t *testing.T) {
 	if len(pt.files.records) != 1 || pt.files.records[0].Rejected != 1 || pt.files.records[0].Added != 3 {
 		t.Errorf("журнал = %+v, want rejected 1, added 3", pt.files.records)
 	}
-	// В staging ушли три извлечённых домена (не исходные строки).
+	// Three extracted domains went into staging (not the original lines).
 	want := []string{
 		"exec:" + clearStageSQL,
 		"copy:3",
@@ -730,8 +735,8 @@ func TestPipelineExtractLines(t *testing.T) {
 		t.Errorf("порядок обращений =\n%s\nwant:\n%s",
 			strings.Join(pt.pool.ops, "\n"), strings.Join(want, "\n"))
 	}
-	// Строка без домена — в rejected-логе с исходным текстом и причиной
-	// (текст с пробелами slog заключает в кавычки).
+	// The line without a domain — in the rejected log with the original text
+	// and the reason (slog quotes text with spaces).
 	logged := buf.String()
 	for _, wantFrag := range []string{
 		"file=com/add/list.txt",
@@ -748,11 +753,11 @@ func TestPipelineExtractLines(t *testing.T) {
 	}
 }
 
-// TestPipelineDuplicate — точная повторная доставка (T-113): та же
-// тройка (зона, действие, sha256) уже в журнале (в том числе среди
-// других доставок того же содержимого — точное совпадение побеждает):
-// партия отброшена, применение не выполняется, отчёт не дублируется,
-// файл уходит в processed/.
+// TestPipelineDuplicate — exact redelivery (T-113): the same triple (zone,
+// action, sha256) is already in the journal (including among other
+// deliveries of the same content — the exact match wins): the batch is
+// discarded, the apply does not run, the report is not duplicated, the file
+// goes to processed/.
 func TestPipelineDuplicate(t *testing.T) {
 	pt := newPipeTest(t)
 	content := "example.com\n"
@@ -763,15 +768,15 @@ func TestPipelineDuplicate(t *testing.T) {
 	add, del := model.ActionAdd, model.ActionDelete
 	path, otherPath, undoPath := "com/add/list.txt", "net/add/list.txt", "com/delete/x.txt"
 	pt.files = newFakeFileStore(
-		model.IngestFile{ // другое действие, та же зона (undo)
+		model.IngestFile{ // another action, the same zone (undo)
 			ID: 6, ZoneID: &zone, Action: &del, Path: &undoPath,
 			SHA256: sha[:], ProcessedAt: &processed,
 		},
-		model.IngestFile{ // точная повторная доставка
+		model.IngestFile{ // exact redelivery
 			ID: 5, ZoneID: &zone, Action: &add, Path: &path,
 			SHA256: sha[:], ProcessedAt: &processed,
 		},
-		model.IngestFile{ // то же действие, другая зона
+		model.IngestFile{ // the same action, another zone
 			ID: 7, ZoneID: &otherZone, Action: &add, Path: &otherPath,
 			SHA256: sha[:], ProcessedAt: &processed,
 		},
@@ -795,8 +800,8 @@ func TestPipelineDuplicate(t *testing.T) {
 		t.Errorf("записей в журнале = %d, want 0 (дубль не перезаписывает отчёт)", len(pt.files.records))
 	}
 
-	// Загрузка была (хэш известен только после чтения), применение — нет:
-	// очистка → COPY → отбрасывание партии.
+	// The loading happened (the hash is known only after reading), the apply
+	// did not: cleanup → COPY → the batch discard.
 	want := []string{
 		"exec:" + clearStageSQL,
 		"copy:1",
@@ -811,10 +816,10 @@ func TestPipelineDuplicate(t *testing.T) {
 	}
 }
 
-// TestPipelineDuplicateOtherZoneWarn — дубль по sha256 в другой зоне при
-// том же действии (T-113): точной повторной доставки нет, файл
-// применяется (домены этой зоны первая доставка не трогала) — но
-// оператору подсвечивается Warn (ING-P2-5, неконтрактная часть).
+// TestPipelineDuplicateOtherZoneWarn — a sha256 duplicate in another zone
+// with the same action (T-113): no exact redelivery, the file is applied
+// (the first delivery did not touch this zone's domains) — but a Warn is
+// highlighted to the operator (ING-P2-5, a non-contract part).
 func TestPipelineDuplicateOtherZoneWarn(t *testing.T) {
 	pt := newPipeTest(t)
 	content := "example.com\n"
@@ -830,9 +835,9 @@ func TestPipelineDuplicateOtherZoneWarn(t *testing.T) {
 	})
 
 	pt.pool.execs = []pipeExec{
-		{tag: pgconn.NewCommandTag("DELETE 0")}, // очистка перед загрузкой (Stage)
-		// вставка/возврат — ответы Query (inserted=1, revived=0)
-		{tag: pgconn.NewCommandTag("DELETE 1")}, // очистка после применения
+		{tag: pgconn.NewCommandTag("DELETE 0")}, // the cleanup before loading (Stage)
+		// the insert/revive — the Query answers (inserted=1, revived=0)
+		{tag: pgconn.NewCommandTag("DELETE 1")}, // the cleanup after the apply
 	}
 	pt.pool.inserted = 1
 	pt.pool.revived = 0
@@ -872,12 +877,12 @@ func TestPipelineDuplicateOtherZoneWarn(t *testing.T) {
 	}
 }
 
-// TestPipelineUndoSameContentApplied — undo тем же списком (T-113):
-// то же содержимое доставлено в delete/ после add/ — действие другое,
-// точной повторной доставки нет, файл обрабатывается: домены
-// удаляются, отчёт в журнале. Переопределяет пиннинг T-097
-// (TestIngest_SameContentCrossActionSkipped, контракт дедупа сменила
-// T-113).
+// TestPipelineUndoSameContentApplied — an undo by the same list (T-113):
+// the same content was delivered to delete/ after add/ — a different
+// action, no exact redelivery, the file is processed: the domains are
+// deleted, the report in the journal. It overrides the T-097 pinning
+// (TestIngest_SameContentCrossActionSkipped, the dedup contract was
+// replaced by T-113).
 func TestPipelineUndoSameContentApplied(t *testing.T) {
 	pt := newPipeTest(t)
 	content := "example.com\n"
@@ -893,8 +898,8 @@ func TestPipelineUndoSameContentApplied(t *testing.T) {
 	})
 
 	pt.pool.execs = []pipeExec{
-		{tag: pgconn.NewCommandTag("DELETE 0")}, // очистка перед загрузкой (Stage)
-		{tag: pgconn.NewCommandTag("DELETE 1")}, // очистка после применения
+		{tag: pgconn.NewCommandTag("DELETE 0")}, // the cleanup before loading (Stage)
+		{tag: pgconn.NewCommandTag("DELETE 1")}, // the cleanup after the apply
 	}
 	pt.pool.delDeleted = 1
 
@@ -930,13 +935,14 @@ func TestPipelineUndoSameContentApplied(t *testing.T) {
 	}
 }
 
-// TestPipelineErrorRatio — доля отклонённых строк выше порога (T-016):
-// файл целиком ошибочен — применение не выполняется, файл → failed/
-// с лог-отчётом рядом, отчёт в ingest_files не пишется (хэш ошибочного
-// файла не занимает журнал — исправленный файл можно загрузить снова).
+// TestPipelineErrorRatio — the rejected-line ratio above the threshold
+// (T-016): the file is failed as a whole — the apply does not run, the file
+// → failed/ with a log report next to it, the report is not written into
+// ingest_files (the hash of a failed file does not occupy the journal — the
+// fixed file can be loaded again).
 func TestPipelineErrorRatio(t *testing.T) {
 	pt := newPipeTest(t)
-	content := "a.org\nb.org\nc.com\n" // 2/3 отклонений (wrong_zone) > 0.1
+	content := "a.org\nb.org\nc.com\n" // 2/3 rejections (wrong_zone) > 0.1
 	abs := pt.addFile(t, "com/add/list.txt", content)
 	sha := sha256.Sum256([]byte(content))
 
@@ -962,7 +968,7 @@ func TestPipelineErrorRatio(t *testing.T) {
 		t.Errorf("записей в журнале = %d, want 0", len(pt.files.records))
 	}
 
-	// Загрузка была, применение — нет; партия отброшена.
+	// The loading happened, the apply did not; the batch was discarded.
 	want := []string{
 		"exec:" + clearStageSQL,
 		"copy:1", // c.com
@@ -973,7 +979,7 @@ func TestPipelineErrorRatio(t *testing.T) {
 			strings.Join(pt.pool.ops, "\n"), strings.Join(want, "\n"))
 	}
 
-	// Файл — в failed/ с лог-отчётом рядом (ТЗ 5.1).
+	// The file — in failed/ with a log report next to it (spec 5.1).
 	failed := filepath.Join(pt.dir, DirFailed, "com/add/list.txt")
 	if exists(t, abs) || !exists(t, failed) {
 		t.Fatalf("файл должен лежать в %s, исходный удалён", failed)
@@ -992,14 +998,14 @@ func TestPipelineErrorRatio(t *testing.T) {
 	}
 }
 
-// TestPipelineParserRejectsFailFile — построчные отказы парсера
-// (invalid_utf8, line_len) учитываются в пороге доли ошибок (T-016):
-// файл, чей мусор не дошёл до валидатора, всё равно ошибочен целиком
-// (битый дамп — именно не-UTF-8, docs/incoming-files.md §4), а не
-// «успешно применённая» пустая партия.
+// TestPipelineParserRejectsFailFile — the parser's per-line rejections
+// (invalid_utf8, line_len) are counted in the error ratio threshold
+// (T-016): a file whose junk did not reach the validator is still failed as
+// a whole (a broken dump is exactly non-UTF-8, docs/incoming-files.md §4),
+// not a "successfully applied" empty batch.
 func TestPipelineParserRejectsFailFile(t *testing.T) {
-	// 1 строка не-UTF-8 + 8 валидных: валидатор один 0/8 не роняет,
-	// объединённая доля 1/9 > 0.1 — файл ошибочен.
+	// 1 non-UTF-8 line + 8 valid ones: the validator alone does not fail
+	// 0/8, the combined ratio 1/9 > 0.1 — the file is failed.
 	t.Run("мусор плюс валидные строки", func(t *testing.T) {
 		pt := newPipeTest(t)
 		var b strings.Builder
@@ -1031,9 +1037,10 @@ func TestPipelineParserRejectsFailFile(t *testing.T) {
 		}
 	})
 
-	// Файл целиком из не-UTF-8: парсер отверг каждую строку, валидатор
-	// не видел ни одной (total = 0) — без учёта отказов парсера доля
-	// считалась бы 0/0 и файл уезжал бы в processed/.
+	// A file entirely of non-UTF-8: the parser rejected every line, the
+	// validator saw none (total = 0) — without counting the parser's
+	// rejections the ratio would be computed as 0/0 and the file would go to
+	// processed/.
 	t.Run("файл целиком из не-UTF-8", func(t *testing.T) {
 		pt := newPipeTest(t)
 		abs := pt.addFile(t, "com/add/dump.txt", "\xff\xfe\xff\n\xff\xfe\n")
@@ -1051,7 +1058,7 @@ func TestPipelineParserRejectsFailFile(t *testing.T) {
 		if rep := out.Report; rep.Rejected != 2 || rep.Accepted != 0 {
 			t.Errorf("счётчики = %+v, want rejected 2, accepted 0", rep)
 		}
-		// Партия из нуля строк отброшена, применение не выполнялось.
+		// The zero-row batch was discarded, the apply did not run.
 		want := []string{"exec:" + clearStageSQL, "exec:" + clearStageSQL}
 		if !reflect.DeepEqual(pt.pool.ops, want) {
 			t.Errorf("обращения = %v, want очистка → отбрасывание партии без COPY", pt.pool.ops)
@@ -1062,8 +1069,9 @@ func TestPipelineParserRejectsFailFile(t *testing.T) {
 	})
 }
 
-// TestPipelineBadPath — структура пути не <зона>/add|delete/*.txt
-// (T-014): файл ошибочен, до БД не доходит, failed/ с лог-отчётом.
+// TestPipelineBadPath — the path structure is not <zone>/add|delete/*.txt
+// (T-014): the file is failed, nothing reaches the DB, failed/ with a log
+// report.
 func TestPipelineBadPath(t *testing.T) {
 	pt := newPipeTest(t)
 	abs := pt.addFile(t, "com/list.txt", "example.com\n")
@@ -1091,8 +1099,8 @@ func TestPipelineBadPath(t *testing.T) {
 	}
 }
 
-// TestPipelineBadZoneDir — имя каталога зоны не нормализуется (T-014):
-// файл ошибочен (failed/), зона не создаётся.
+// TestPipelineBadZoneDir — the zone directory name does not normalize
+// (T-014): the file is failed (failed/), the zone is not created.
 func TestPipelineBadZoneDir(t *testing.T) {
 	pt := newPipeTest(t)
 	abs := pt.addFile(t, "не%зона/add/list.txt", "example.com\n")
@@ -1115,11 +1123,13 @@ func TestPipelineBadZoneDir(t *testing.T) {
 	}
 }
 
-// TestPipelineZonePathAllowlist — многоуровневый каталог зоны
-// (incoming/<зона с точкой>/) вне allowlist ingest.allowed_zone_paths —
-// ошибка уровня файла (ТЗТ §5.1): файл в failed/ с причиной, строки не
-// разбираются, зона не создаётся; зона из allowlist (crawl.test в
-// testbed) обрабатывается штатно по ветке 3 domainLabel (ТЗТ §5.2).
+// TestPipelineZonePathAllowlist — a multi-level zone directory
+// (incoming/<zone with a dot>/) outside the ingest.allowed_zone_paths
+// allowlist — a file-level error (the tld-only-zones spec §5.1): the file in
+// failed/ with the reason, the lines are not parsed, the zone is not
+// created; a zone from the allowlist (crawl.test in the testbed) is
+// processed normally by branch 3 of domainLabel (the tld-only-zones
+// spec §5.2).
 func TestPipelineZonePathAllowlist(t *testing.T) {
 	t.Run("вне allowlist — failed", func(t *testing.T) {
 		pt := newPipeTest(t)
@@ -1135,7 +1145,7 @@ func TestPipelineZonePathAllowlist(t *testing.T) {
 		if !errors.Is(out.Err, errZoneNotAllowed) {
 			t.Errorf("причина = %v, want errZoneNotAllowed", out.Err)
 		}
-		// Строки не разбираются, зона не создаётся, партия не грузится.
+		// The lines are not parsed, the zone is not created, the batch is not loaded.
 		if len(pt.pool.ops) != 0 || len(pt.files.records) != 0 || len(pt.zones.calls) != 0 {
 			t.Errorf("при запрете зоны обращений к БД быть не должно: ops=%v records=%d zones=%v",
 				pt.pool.ops, len(pt.files.records), pt.zones.calls)
@@ -1162,8 +1172,8 @@ func TestPipelineZonePathAllowlist(t *testing.T) {
 		abs := pt.addFile(t, "crawl.test/add/list.txt", "example.crawl.test\n")
 
 		pt.pool.execs = []pipeExec{
-			{tag: pgconn.NewCommandTag("DELETE 0")}, // очистка перед загрузкой (Stage)
-			{tag: pgconn.NewCommandTag("DELETE 1")}, // очистка после применения
+			{tag: pgconn.NewCommandTag("DELETE 0")}, // the cleanup before loading (Stage)
+			{tag: pgconn.NewCommandTag("DELETE 1")}, // the cleanup after the apply
 		}
 		pt.pool.inserted = 1
 		pt.pool.uniques = 1
@@ -1175,9 +1185,10 @@ func TestPipelineZonePathAllowlist(t *testing.T) {
 		if out.Kind != OutcomeApplied {
 			t.Fatalf("итог = %s, want applied", out.Kind)
 		}
-		// Ветка 3 domainLabel (ТЗТ §5.2): example.crawl.test в каталоге
-		// crawl.test — метка example, зона пути crawl.test. Метка строки
-		// проверяется по партии staging (COPY: batch, zone, label, …).
+		// Branch 3 of domainLabel (the tld-only-zones spec §5.2):
+		// example.crawl.test in the crawl.test directory — the label example,
+		// the path zone crawl.test. The line label is checked against the
+		// staging batch (COPY: batch, zone, label, …).
 		if rep := out.Report; rep.Zone != "crawl.test" || rep.Added != 1 {
 			t.Errorf("отчёт = %+v, want зона crawl.test, added 1", rep)
 		}
@@ -1193,13 +1204,13 @@ func TestPipelineZonePathAllowlist(t *testing.T) {
 	})
 }
 
-// TestPipelineFailFileOutsideIncoming — Process — публичный API: путь
-// вне incoming (rel с «..» после filepath.Rel, ParsePath его отвергает)
-// не должен выводить архив за пределы failed/ (ING-P3-1): назначение
-// санируется до базового имени файла.
+// TestPipelineFailFileOutsideIncoming — Process is a public API: a path
+// outside incoming (a rel with ".." after filepath.Rel, ParsePath rejects
+// it) must not move the archive outside failed/ (ING-P3-1): the destination
+// is sanitized to the file's base name.
 func TestPipelineFailFileOutsideIncoming(t *testing.T) {
 	pt := newPipeTest(t)
-	// Файл-сиблинг каталога incoming: rel = "../escape/com/list.txt".
+	// A sibling file of the incoming directory: rel = "../escape/com/list.txt".
 	abs := filepath.Join(filepath.Dir(pt.dir), "escape", "com", "list.txt")
 	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
 		t.Fatal(err)
@@ -1222,14 +1233,15 @@ func TestPipelineFailFileOutsideIncoming(t *testing.T) {
 	if !exists(t, failed+".report") {
 		t.Error("лог-отчёт не записан рядом с файлом")
 	}
-	// Архив не вышел за пределы failed/ (и не «провалился» в ../).
+	// The archive did not leave failed/ (and did not "fall through" into ../).
 	if exists(t, filepath.Join(pt.dir, "escape", "com", "list.txt")) {
 		t.Error("файл оказался снаружи failed/ — путь назначения не санирован")
 	}
 }
 
-// TestPipelineZoneDBError — сбой БД на этапе зоны: файл остаётся в
-// incoming (at-least-once, ТЗ 3.4), итог left, ошибка — вызывающему.
+// TestPipelineZoneDBError — a DB failure at the zone stage: the file stays
+// in incoming (at-least-once, spec 3.4), the outcome is left, the error goes
+// to the caller.
 func TestPipelineZoneDBError(t *testing.T) {
 	pt := newPipeTest(t)
 	abs := pt.addFile(t, "com/add/list.txt", "example.com\n")
@@ -1250,8 +1262,8 @@ func TestPipelineZoneDBError(t *testing.T) {
 	}
 }
 
-// TestPipelineStageError — сбой COPY: файл остаётся в incoming, партия
-// отброшена (staging не растёт), повтор возьмёт новую партию.
+// TestPipelineStageError — a COPY failure: the file stays in incoming, the
+// batch is discarded (staging does not grow), a retry will take a new batch.
 func TestPipelineStageError(t *testing.T) {
 	pt := newPipeTest(t)
 	abs := pt.addFile(t, "com/add/list.txt", "example.com\n")
@@ -1267,7 +1279,7 @@ func TestPipelineStageError(t *testing.T) {
 	if !exists(t, abs) {
 		t.Error("файл должен остаться в incoming")
 	}
-	// очистка (Stage) → COPY (сбой) → отбрасывание партии (best effort)
+	// cleanup (Stage) → COPY (failure) → the batch discard (best effort)
 	if len(pt.pool.ops) != 3 || pt.pool.ops[0] != "exec:"+clearStageSQL ||
 		!strings.HasPrefix(pt.pool.ops[1], "copy:") || pt.pool.ops[2] != "exec:"+clearStageSQL {
 		t.Errorf("обращения = %v, want очистка, COPY, отбрасывание партии", pt.pool.ops)
@@ -1277,15 +1289,16 @@ func TestPipelineStageError(t *testing.T) {
 	}
 }
 
-// TestPipelineApplyError — сбой применения add: файл остаётся, отчёт не
-// пишется (применение не состоялось целиком), партия отброшена.
+// TestPipelineApplyError — an add apply failure: the file stays, the report
+// is not written (the apply did not happen as a whole), the batch is
+// discarded.
 func TestPipelineApplyError(t *testing.T) {
 	pt := newPipeTest(t)
 	abs := pt.addFile(t, "com/add/list.txt", "example.com\n")
 	boom := errors.New("сервер закрыл соединение")
 	pt.pool.execs = []pipeExec{
 		{tag: pgconn.NewCommandTag("DELETE 0")}, // Stage
-		{err: boom},                             // вставка
+		{err: boom},                             // the insert
 	}
 
 	out, err := pt.pipe.Process(context.Background(), abs)
@@ -1298,7 +1311,7 @@ func TestPipelineApplyError(t *testing.T) {
 	if len(pt.files.records) != 0 {
 		t.Error("отчёт не пишется при сбое применения")
 	}
-	// вставка без очистки ApplyAdd (сбой) → отбрасывание конвейером
+	// the insert without the ApplyAdd cleanup (failure) → the pipeline discard
 	if !strings.Contains(strings.Join(pt.pool.ops, "\n"), "query:"+insertAddSQL) {
 		t.Errorf("обращения = %v, want попытка вставки", pt.pool.ops)
 	}
@@ -1307,15 +1320,15 @@ func TestPipelineApplyError(t *testing.T) {
 	}
 }
 
-// TestPipelineRecordError — сбой записи отчёта: применение состоялось,
-// но файл остаётся в incoming — повтор найдёт дубль по sha256 и только
-// перенесёт файл (самовосстановление, ТЗ 3.4/5.1).
+// TestPipelineRecordError — a report write failure: the apply happened, but
+// the file stays in incoming — a retry will find the sha256 duplicate and
+// only move the file (self-recovery, spec 3.4/5.1).
 func TestPipelineRecordError(t *testing.T) {
 	pt := newPipeTest(t)
 	abs := pt.addFile(t, "com/add/list.txt", "example.com\n")
 	pt.pool.execs = []pipeExec{
 		{tag: pgconn.NewCommandTag("DELETE 0")},
-		// вставка/возврат — ответы Query (inserted=1, revived=0)
+		// the insert/revive — the Query answers (inserted=1, revived=0)
 		{tag: pgconn.NewCommandTag("DELETE 1")},
 	}
 	pt.pool.inserted = 1
@@ -1330,9 +1343,9 @@ func TestPipelineRecordError(t *testing.T) {
 	if out.Kind != OutcomeLeft || !exists(t, abs) {
 		t.Fatalf("итог = %s, want left и файл в incoming", out.Kind)
 	}
-	// Применение состоялось полностью (транзакция: границы/вставка пачки,
-	// дельты зон, возврат, подсчёт, очистка, фиксация) — на повторе дубль
-	// по sha256 только перенесёт файл.
+	// The apply happened fully (the transaction: the batch boundaries/insert,
+	// the zone deltas, the revive, the count, the cleanup, the commit) — on
+	// a retry the sha256 duplicate will only move the file.
 	if len(pt.pool.ops) != 11 {
 		t.Errorf("обращений к БД = %d (%v), want 11 — применение завершено", len(pt.pool.ops), pt.pool.ops)
 	}
@@ -1341,8 +1354,8 @@ func TestPipelineRecordError(t *testing.T) {
 	}
 }
 
-// TestPipelineDuplicateCheckError — сбой проверки дубля: файл остаётся,
-// применение не выполняется.
+// TestPipelineDuplicateCheckError — a duplicate check failure: the file
+// stays, the apply does not run.
 func TestPipelineDuplicateCheckError(t *testing.T) {
 	pt := newPipeTest(t)
 	abs := pt.addFile(t, "com/add/list.txt", "example.com\n")
@@ -1362,9 +1375,9 @@ func TestPipelineDuplicateCheckError(t *testing.T) {
 	}
 }
 
-// TestPipelineContextCanceled — отменённый контекст: как реальный pgx,
-// фейк отказывает на первом обращении; файл остаётся (graceful shutdown
-// дорабатывает или возвращает, ТЗ 3.4).
+// TestPipelineContextCanceled — a canceled context: like real pgx, the fake
+// refuses the first call; the file stays (graceful shutdown finishes it or
+// returns it, spec 3.4).
 func TestPipelineContextCanceled(t *testing.T) {
 	pt := newPipeTest(t)
 	abs := pt.addFile(t, "com/add/list.txt", "example.com\n")
@@ -1384,23 +1397,24 @@ func TestPipelineContextCanceled(t *testing.T) {
 	if len(pt.files.records) != 0 {
 		t.Error("журнал не пишется при отмене")
 	}
-	// Партия очищена и после отмены ctx: discard чистит staging собственным
-	// контекстом (ING-P2-3) — строки не копятся в staging от рестарта к
-	// рестарту. (Очистка внутри Stage с отменённым ctx не дошла до БД —
-	// фейк, как pgx, отказывает до записи обращения.)
+	// The batch is cleared after the ctx cancellation too: discard cleans
+	// staging with its own context (ING-P2-3) — the rows do not pile up in
+	// staging from restart to restart. (The cleanup inside Stage with a
+	// canceled ctx did not reach the DB — the fake, like pgx, refuses before
+	// recording the call.)
 	if len(pt.pool.ops) != 1 || pt.pool.ops[0] != "exec:"+clearStageSQL {
 		t.Errorf("обращения = %v, want одна очистка отброшенной партии", pt.pool.ops)
 	}
 }
 
-// TestPipelineMoveCollision — в архиве уже есть файл с тем же именем
-// (другой экземпляр): новый получает числовой суффикс, существующий
-// не затирается.
+// TestPipelineMoveCollision — the archive already has a file with the same
+// name (another instance): the new one gets a numeric suffix, the existing
+// one is not overwritten.
 func TestPipelineMoveCollision(t *testing.T) {
 	pt := newPipeTest(t)
 	content := "example.com\n"
 	abs := pt.addFile(t, "com/add/list.txt", content)
-	// Другой экземпляр с тем же именем уже обработан ранее.
+	// Another instance with the same name was processed earlier.
 	older := filepath.Join(pt.dir, DirProcessed, "com/add/list.txt")
 	if err := os.MkdirAll(filepath.Dir(older), 0o755); err != nil {
 		t.Fatal(err)
@@ -1410,7 +1424,7 @@ func TestPipelineMoveCollision(t *testing.T) {
 	}
 	pt.pool.execs = []pipeExec{
 		{tag: pgconn.NewCommandTag("DELETE 0")},
-		// вставка/возврат — ответы Query (inserted=1, revived=0)
+		// the insert/revive — the Query answers (inserted=1, revived=0)
 		{tag: pgconn.NewCommandTag("DELETE 1")},
 	}
 	pt.pool.inserted = 1
@@ -1432,9 +1446,9 @@ func TestPipelineMoveCollision(t *testing.T) {
 	}
 }
 
-// TestPipelineEmptyFile — файл без доменов (пустой/одни комментарии):
-// не ошибочен (T-016: файл без содержательных строк ошибочным не
-// считается), применяется как пустая партия, отчёт пишется.
+// TestPipelineEmptyFile — a file without domains (empty/comments only): not
+// failed (T-016: a file without meaningful lines is not considered failed),
+// applied as an empty batch, the report is written.
 func TestPipelineEmptyFile(t *testing.T) {
 	pt := newPipeTest(t)
 	abs := pt.addFile(t, "com/add/empty.txt", "# только комментарий\n\n")
@@ -1453,8 +1467,9 @@ func TestPipelineEmptyFile(t *testing.T) {
 	if len(pt.files.records) != 1 {
 		t.Error("отчёт пустого файла должен записаться в журнал")
 	}
-	// COPY с пустой пачкой не выполняется (db.CopyFrom: пустая пачка — no-op);
-	// применение пустой партии — границы и подсчёт без вставки и дельт.
+	// A COPY with an empty batch does not run (db.CopyFrom: an empty batch is
+	// a no-op); the apply of an empty batch — the boundaries and the count
+	// without the insert and the deltas.
 	if strings.Join(pt.pool.ops, "\n") != strings.Join([]string{
 		"exec:" + clearStageSQL,
 		"begin",
@@ -1468,8 +1483,8 @@ func TestPipelineEmptyFile(t *testing.T) {
 	}
 }
 
-// TestPipelineRejectLogPassed — rejected-лог (T-016) подключается к
-// конвейеру и получает отклонённые строки файла с их причинами.
+// TestPipelineRejectLogPassed — the rejected log (T-016) is wired into the
+// pipeline and receives the file's rejected lines with their reasons.
 func TestPipelineRejectLogPassed(t *testing.T) {
 	pt := newPipeTest(t)
 	abs := pt.addFile(t, "com/add/list.txt", "a.org\n") // wrong_zone
@@ -1496,10 +1511,10 @@ func TestPipelineRejectLogPassed(t *testing.T) {
 	}
 }
 
-// TestPipelineParserRejectLog — построчные отказы парсера пишутся в
-// rejected-лог тем же форматом, что и отказы валидатора (ТЗ 5.1,
-// docs/incoming-files.md §3, §7: invalid_utf8/line_len — причины лога,
-// обрезанная строка — в записи).
+// TestPipelineParserRejectLog — the parser's per-line rejections are written
+// into the rejected log in the same format as the validator's rejections
+// (spec 5.1, docs/incoming-files.md §3, §7: invalid_utf8/line_len — the log
+// reasons, the truncated line — in the entry).
 func TestPipelineParserRejectLog(t *testing.T) {
 	pt := newPipeTest(t)
 	content := "example.com\n\xff\xfe\n" + strings.Repeat("a", MaxLineLen+76) + "\n"
@@ -1526,7 +1541,7 @@ func TestPipelineParserRejectLog(t *testing.T) {
 		"reason=invalid_utf8",
 		"line=3",
 		"reason=line_len",
-		"text=" + strings.Repeat("a", maxRejectText), // обрезка парсера, байты
+		"text=" + strings.Repeat("a", maxRejectText), // the parser's truncation, bytes
 	} {
 		if !strings.Contains(logged, want) {
 			t.Errorf("rejected-лог = %q, want запись с %q", logged, want)
@@ -1534,7 +1549,7 @@ func TestPipelineParserRejectLog(t *testing.T) {
 	}
 }
 
-// TestNewPipelineValidation — обязательные зависимости и каталог.
+// TestNewPipelineValidation — the mandatory dependencies and the directory.
 func TestNewPipelineValidation(t *testing.T) {
 	opts := PipelineOptions{Dir: "/tmp"}
 	if _, err := NewPipeline(nil, newFakeFileStore(), &pipePool{}, opts); err == nil {
@@ -1550,7 +1565,7 @@ func TestNewPipelineValidation(t *testing.T) {
 		t.Error("каталог incoming обязателен")
 	}
 
-	// Дефолты: размер пачки и порог доли ошибок (стиль T-016).
+	// The defaults: the batch size and the error ratio threshold (the T-016 style).
 	p, err := NewPipeline(newFakeZoneStore(), newFakeFileStore(), &pipePool{},
 		PipelineOptions{Dir: "/tmp"})
 	if err != nil {
