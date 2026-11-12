@@ -51,7 +51,10 @@ allow_force_pushes OFF, allow_deletions OFF, enforce_admins ON.
   репо, кроме testdata/ и deploy/docker/testbed/ → пусто; полный прогон
   test + test-race + lint + test-integration.
 - **Этап 7 — squash + релиз (вне мандата этого цикла, с владельцем):**
-  archive/ru-v1 → soft reset в корень → один коммит → тег v1.0.0 →
+  обновить архив (fast-forward `archive/ru-v1` на tip master и запушить в
+  приватный GitVerse-репозиторий `yepbro/laravel-domains-archive`, remote
+  `gitverse-archive`; ветка создана и запушена 11.11.2026 — на GitHub
+  архивная ветка не нужна) → soft reset в корень → один коммит → тег v1.0.0 →
   временно включить force-push в protection → push -f master →
   push -f master:production (спокойное окно) → вернуть protection →
   удалить этот план-файл из истории (он исчезает сам: не попадает в squash)
