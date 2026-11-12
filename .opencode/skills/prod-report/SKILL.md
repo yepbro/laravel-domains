@@ -1,6 +1,6 @@
 ---
 name: Prod report (larasites)
-description: A summary report on the state of the Domain Crawler production — the larasites server (155.212.174.88): CPU/RAM/disk load, depth and lag of the q:dns/q:http/q:render/q:render-fallback/q:analyze/q:dead queue groups (the consumer pending, not XLEN), pipeline speed and progress, how many domains are checked, content retention/compaction, systemd unit status (running/failed), render engines and fallback (after the stage 35/36 deploy). Run it when asked to assess the production health: "give a load report", "what's up with prod/the server", "what is the queue speed/depth", "why are disk/memory/lags growing", "how many domains are checked", a mention of larasites, dashboard.laracity.ru or 155.212.174.88 in a status/metrics context. The skill shows only aggregated metrics and is NOT suitable for log work: "show the last log lines", journal tail/grep, "unit logs for yesterday", searching for errors in logs — journal-reading tools are needed for that, not this skill.
+description: A summary report on the state of the Domain Crawler production — the larasites server (155.212.174.88): CPU/RAM/disk load, depth and lag of the q:dns/q:http/q:render/q:render-fallback/q:analyze/q:dead queue groups (the consumer pending, not XLEN), pipeline speed and progress, how many domains are checked, content retention/compaction, systemd unit status (running/failed), render engines and fallback (after the stage 35/36 deploy). Run it when asked to assess the production health: "give a load report", "what's up with prod/the server", "what is the queue speed/depth", "why are disk/memory/lags growing", "how many domains are checked", a mention of larasites, dashboard.laracity.ru or 155.212.174.88 in a status/metrics context. The skill shows only aggregated metrics and is NOT suitable for log work: "show the last log lines", journal tail/grep, "unit logs for yesterday", searching for errors in logs — journal-reading tools are needed for that, not this skill. The standing-watch mode is covered too: "keep an eye on prod", "check once an hour / every 20 minutes", "monitor continuously, you may stop/start the queue yourself" — periodic light snapshots (scripts/hourly-snap.sh), compact diff reports, and queue stop/start autonomy per the skill criteria.
 ---
 
 # Prod report: larasites (Domain Crawler)
@@ -23,6 +23,10 @@ Prod is the project's only production server; the deploy is native systemd
    IPs or passwords.
 4. All heavy queries (psql, two queue snapshots) are gentle anyway: one
    `collect.sh` run ≈ 25–30 s. Do not run it more often than necessary.
+5. **The standing watch mode (section below) may extend these rules by an
+   explicit user grant** to stop/start `crawler-scheduler` — and only it,
+   only within the criteria of that section. Rule 2 ("ask, do not fix")
+   applies unless the grant covers the situation.
 
 ## Procedure
 
@@ -50,6 +54,51 @@ Prod is the project's only production server; the deploy is native systemd
    entirely ignored by git (it has its own `.gitignore`)
    — the reports are local and never reach commits.
 6. Finish with a question about further actions.
+
+## Standing watch (continuous monitoring)
+
+Launched when the user asks to watch prod with a period ("check once an
+hour", "every 20 minutes") — usually with a grant to decide on stopping/
+starting the queue (`crawler-scheduler`). One-off report rules stay for
+one-off reports; this section adds the loop and the autonomy.
+
+### Procedure
+
+1. Baseline snapshot right away:
+   `<base-dir>/scripts/hourly-snap.sh` — a light diff-grade snapshot
+   (~15–20 s, no double queue cuts; collect.sh stays for one-off reports).
+2. Background timer per the requested period:
+   `sleep <N> && <base-dir>/scripts/hourly-snap.sh`. On each tick:
+   analyze → decide (criteria below) → post a compact diff-report →
+   relaunch the timer.
+3. Quiet-hour format: a 5–6 row diff table (load / PG OOM / checks rate /
+   retention cursor / disk+content / queue depths) + "no action
+   required". Do NOT write hourly files into `prod-reports/` — full
+   reports and files only on anomalies, actions taken, and the final
+   summary of the watch.
+4. Any prod action — with a one-line justification in the report.
+
+### Autonomy criteria (only under an explicit user grant)
+
+| Decision | Criterion | Action |
+|---|---|---|
+| STOP the front | ≥1 PG cgroup OOM kill per hour with the front active (the "long retention select + full front" pattern) | `systemctl stop crawler-scheduler`, open a drain window: `<base-dir>/scripts/drain-guard.sh [cap-min]` — the guard restarts the front itself on pass completion or the cap |
+| STOP the front | disk ≥ 80% or content growing >1 GB/h with retention stalled | same: a calm window per `docs/operations.md` §4.6 + drain-guard |
+| START the front | the stop criterion is gone (the retention cursor advances / a pass completed, OOM kills 0, the disk shrinking) | `systemctl start crawler-scheduler` |
+| START the front | the scheduler is inactive with no active reason while the system is healthy (e.g. left after a deploy) | start it, report the fact |
+
+Safeguards: every stop window gets a self-restart cap (drain-guard,
+default 90 min) — the front must never stay down forever; nothing beyond
+`crawler-scheduler` is stopped/started without a separate user command.
+
+### Recovery after an agent-server restart
+
+Background timers and the guard die on opencode server restarts
+(a recurring environment fact). On resuming a session with an open
+standing watch: take an immediate `hourly-snap.sh`, then relaunch the
+timer; if a stop window was open — decide per the criteria above whether
+to start the front (healthy system → start; the drain criterion still
+holding → re-arm the guard).
 
 ## Key formulas (do not mix up!)
 
@@ -107,6 +156,8 @@ Prod is the project's only production server; the deploy is native systemd
 | Counters | `checks:<today>` = 0 with the front active | scheduler → dns-worker journal, the enqueue chain |
 | Logs | journal > 1 GB or syslog growing | Is the spam back? Is the `crawler-chromium.service.d/10-logfilter.conf` drop-in in place? |
 | PG | `n_dead_tup` of contents/subdomain_results — millions | Autovacuum cannot keep up (docs/db.md) |
+| PG OOM kills | ≥1 cgroup OOM kill of postgres per hour with the front active (often a long retention select + full front) | The tight PG memory ceiling (F2, the operations.md journal); a calm window per docs/operations.md §4.6 + scripts/drain-guard.sh; with the persisted cursor (T-274) restarts no longer reset the drain |
+| scheduler active unexpectedly | active although the operator had stopped it | Deploys restart crawler.target (install) — re-open the stop window after a deploy if it must survive it (docs/operations.md §4.6) |
 
 ## Render engines and fallback (stage 35/36)
 
@@ -195,6 +246,7 @@ first in the report; the rest — briefly, in one or two lines.
 
 - `references/prod-topology.md` — the server, the pipeline, the metrics
   ports, targeted deep-dive commands, known incidents and their signs.
-- In the repo: `docs/runbooks.md`, `docs/operations.md`, `docs/redis.md`,
+- In the repo: `docs/runbooks.md`, `docs/operations.md` (§4.6 — the
+  "calm window" runbook), `docs/redis.md`,
   `docs/content.md` (retention/compaction), `docs/db.md`,
   `docs/load-measurements.md` (baseline performance measurements).
