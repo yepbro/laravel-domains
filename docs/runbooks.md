@@ -338,7 +338,7 @@ after T-159 — cert hosts too: a permanent certificate error
 `ERR_CERT_DATE_INVALID` since T-172; per the measurement: 0 successful
 retries out of 321 per day) is finalized without render on the first
 delivery (a host property, retries are pointless —
-[`render.md`](render.md), "Queue cycles"); after T-211 —
+[`render.md`](render.md), "Queue cycle"); after T-211 —
 DNS-dead hosts too (`ERR_NAME_NOT_RESOLVED`: the entry reached `q:render`
 through a live HTTP episode and the name stopped resolving — DNS
 recovery on a scale of days does not fit the retry window, the T-207
