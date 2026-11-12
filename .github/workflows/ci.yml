@@ -1,9 +1,10 @@
 name: ci
 
-# Прогон на master, production и в PR: событие push на ветке с открытым PR
-# дублировало бы тот же коммит двумя ранами. production нужен отдельно:
-# deploy (workflow_run) срабатывает по зелёному ci-рану на production
-# (docs/ci-cd.md) — без push-рана ci на этой ветке цепочка деплоя не стартует.
+# Runs on master, production and PRs: a push event on a branch with an open
+# PR would duplicate the same commit with two runs. production is needed
+# separately: deploy (workflow_run) fires on a green ci run on production
+# (docs/ci-cd.md) — without a push-run of ci on that branch the deploy
+# chain never starts.
 on:
   push:
     branches: [master, production]
@@ -18,32 +19,35 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Один job: сборка общая (одни образы для линта, тестов и integration),
-  # integration-стек — единственный compose-проект со статической подсетью
-  # и томами; вынос шагов в отдельные jobs удвоил бы сборки без выгоды.
+  # One job: the build is shared (the same images for lint, tests and
+  # integration), the integration stack is the only compose project with a
+  # static subnet and volumes; splitting the steps into separate jobs would
+  # double the builds with no benefit.
   build-and-test:
     name: build · lint · test · integration
-    # ubuntu-latest с 19.10.2026 мигрирует на Ubuntu 26 — фиксируем образ
-    # раннера, чтобы окружение CI не менялось под проектом само по себе.
+    # ubuntu-latest migrates to Ubuntu 26 starting Oct 19, 2026 — pin the
+    # runner image so the CI environment does not change under the project
+    # on its own.
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
-      # Те же compose-файлы, что и локально, + кэш слоёв type=gha
+      # The same compose files as locally, plus type=gha layer caching
       COMPOSE: docker compose --project-directory . -f deploy/docker/compose.yaml -f deploy/docker/compose.ci.yaml --env-file .env
     steps:
-      # depth 2: в PR-ранах HEAD — merge-commit, а для извещения нужен
-      # head-коммит ветки PR (родитель merge-коммита); depth 1 его не
-      # содержит.
+      # depth 2: in PR runs HEAD is a merge commit, while the notification
+      # needs the PR branch's head commit (the merge commit's parent);
+      # depth 1 does not include it.
       - uses: actions/checkout@v7
         with:
           fetch-depth: 2
 
-      # Сборка всех образов (dev-образ с golangci-lint/delve/air + mockserver
-      # с полной компиляцией + unbound) с кэшем BuildKit и загрузкой в docker
-      # не влезает в ~14 ГБ свободных на раннере: «no space left on device».
-      # Прекомпилированные SDK раннера (Android, .NET, GHC, CodeQL ≈ 20 ГБ)
-      # проекту не нужны — убираем их до сборки.
-      - name: Освободить место на диске раннера
+      # Building all images (the dev image with golangci-lint/delve/air +
+      # mockserver with a full compile + unbound) with the BuildKit cache
+      # and loading them into docker does not fit into the ~14 GB free on
+      # the runner: "no space left on device". The runner's precompiled
+      # SDKs (Android, .NET, GHC, CodeQL ≈ 20 GB) are not needed by the
+      # project — remove them before the build.
+      - name: Free runner disk space
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
             /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
@@ -52,53 +56,55 @@ jobs:
 
       - uses: docker/setup-buildx-action@v4
 
-      - name: Подготовить .env
+      - name: Prepare .env
         run: cp .env.example .env
 
-      - name: Сборка образов (с кэшем слоёв)
+      - name: Build images (with layer cache)
         id: build
         run: make build COMPOSE="$COMPOSE"
 
-      # Образы уже загружены в docker daemon, слои выгружены в кэш GHA —
-      # состояние BuildKit (несколько ГБ) не нужно дальнейшим шагам (lint/
-      # test/test-integration запускают готовые образы без пересборки),
-      # а build-runtime в конце собирает с нуля и так. Освобождаем место
-      # для образов инфраструктуры и томов тестового прогона.
-      - name: Освободить кэш BuildKit после сборки
+      # The images are already loaded into the docker daemon, the layers are
+      # exported to the GHA cache — the BuildKit state (several GB) is not
+      # needed by the later steps (lint/test/test-integration run the ready
+      # images without rebuilding), and build-runtime at the end builds from
+      # scratch anyway. Free up space for the infrastructure images and the
+      # test-run volumes.
+      - name: Prune the BuildKit cache after the build
         run: |
           docker builder prune -af || true
           df -h /
 
-      - name: Линт (golangci-lint)
+      - name: Lint (golangci-lint)
         id: lint
         run: make lint COMPOSE="$COMPOSE"
 
-      - name: Модульные тесты
+      - name: Unit tests
         id: test
         run: make test COMPOSE="$COMPOSE"
 
-      # Детектор гонок для горутинных циклов monitor (T-190): штатный
-      # make test идёт без -race; шаг дёшев — образы уже загружены,
-      # гоняется один пакет.
-      - name: Тесты с детектором гонок (monitor)
+      # The race detector for the goroutine loops of monitor (T-190): the
+      # regular make test runs without -race; the step is cheap — the images
+      # are already loaded, a single package runs.
+      - name: Race-detector tests (monitor)
         id: test-race
         run: make test-race COMPOSE="$COMPOSE"
 
-      - name: Правила Laravel по корпусу образцов
+      - name: Laravel rules against the sample corpus
         id: test-rules
         run: make test-rules COMPOSE="$COMPOSE"
 
-      - name: Интеграционные тесты на testbed
+      - name: Integration tests on the testbed
         id: test-integration
         run: make test-integration COMPOSE="$COMPOSE"
 
-      - name: Проверка боевых образов (runtime + render)
+      - name: Production image check (runtime + render)
         id: build-runtime
         run: make build-runtime
 
-      # Диагностика при падении: состояние и логи всех сервисов — в artifact
-      # (консольный лог раннера GitHub хранит и так, но без хвостов сервисов).
-      - name: Собрать диагностику (при падении)
+      # Diagnostics on failure: the state and logs of all services go into
+      # an artifact (GitHub keeps the runner console log anyway, but without
+      # the service log tails).
+      - name: Collect diagnostics (on failure)
         if: failure()
         run: |
           mkdir -p ci-logs
@@ -107,7 +113,7 @@ jobs:
           $COMPOSE --profile '*' logs --no-color --tail=500 \
             > ci-logs/services.log 2>&1 || true
 
-      - name: Выгрузить диагностику в artifact (при падении)
+      - name: Upload diagnostics to an artifact (on failure)
         if: failure()
         uses: actions/upload-artifact@v7
         with:
@@ -115,42 +121,45 @@ jobs:
           retention-days: 7
           path: ci-logs/
 
-      # Извещение Telegram (ТЗ §10.4): одно сообщение на провал рана ci.
-      # Категория — по первому провалившемуся шагу (шаги до него зелёные,
-      # после — skipped): сборка образов/линт/боевые образы → «Ошибка в
-      # коде», тесты → «Ошибка тестов»; прочие провалы (диагностика,
-      # подготовка окружения) → фолбэк «Ошибка конвейера CI» — события
-      # нет в таблице §10.4, но молчать о красном ране хуже (решение
-      # зафиксировано в коммите T-136). Ручные запуски ci молчат —
-      # §10.4: ручные прогоны извещений не порождают. Сбой отправки не
-      # красит ран: continue-on-error + guard секретов в скрипте
-      # (PR из форков). Успешные ci-раны не извещаются (§10.4).
-      - name: Извещение Telegram
+      # Telegram notification (spec §10.4): one message per failed ci run.
+      # The category follows the first failed step (the steps before it are
+      # green, the ones after are skipped): image build/lint/production
+      # images → "Ошибка в коде", tests → "Ошибка тестов"; other failures
+      # (diagnostics, environment preparation) → the "Ошибка конвейера CI"
+      # fallback — the event is missing from the §10.4 table, but staying
+      # silent about a red run is worse (the decision is recorded in
+      # commit T-136). Manual ci runs stay silent — §10.4: manual runs do
+      # not produce notifications. A send failure does not fail the run:
+      # continue-on-error + the secrets guard in the script (PRs from
+      # forks). Successful ci runs are not notified (§10.4).
+      - name: Telegram notification
         if: failure() && github.event_name != 'workflow_dispatch'
         continue-on-error: true
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          # Имена шагов в категориях синхронизировать с name: шагов выше.
+          # The step names in the categories must be kept in sync with the
+          # name: of the steps above.
           event="Ошибка конвейера CI"
-          step="вне шагов сборки и тестов (см. лог рана)"
+          step="outside build and test steps (see the run log)"
           if [ "${{ steps.build.outcome }}" = failure ]; then
-            event="Ошибка в коде"; step="Сборка образов (с кэшем слоёв)"
+            event="Ошибка в коде"; step="Build images (with layer cache)"
           elif [ "${{ steps.lint.outcome }}" = failure ]; then
-            event="Ошибка в коде"; step="Линт (golangci-lint)"
+            event="Ошибка в коде"; step="Lint (golangci-lint)"
           elif [ "${{ steps.test.outcome }}" = failure ]; then
-            event="Ошибка тестов"; step="Модульные тесты"
+            event="Ошибка тестов"; step="Unit tests"
           elif [ "${{ steps.test-race.outcome }}" = failure ]; then
-            event="Ошибка тестов"; step="Тесты с детектором гонок (monitor)"
+            event="Ошибка тестов"; step="Race-detector tests (monitor)"
           elif [ "${{ steps.test-rules.outcome }}" = failure ]; then
-            event="Ошибка тестов"; step="Правила Laravel по корпусу образцов"
+            event="Ошибка тестов"; step="Laravel rules against the sample corpus"
           elif [ "${{ steps.test-integration.outcome }}" = failure ]; then
-            event="Ошибка тестов"; step="Интеграционные тесты на testbed"
+            event="Ошибка тестов"; step="Integration tests on the testbed"
           elif [ "${{ steps.build-runtime.outcome }}" = failure ]; then
-            event="Ошибка в коде"; step="Проверка боевых образов (runtime + render)"
+            event="Ошибка в коде"; step="Production image check (runtime + render)"
           fi
-          # В PR-ранах HEAD — merge-commit: виновный коммит = head ветки PR.
+          # In PR runs HEAD is a merge commit: the offending commit is the
+          # PR branch head.
           args=(--status fail --event "$event" --workflow ci --step "$step")
           if [ -n "${{ github.event.pull_request.head.sha }}" ]; then
             args+=(--sha "${{ github.event.pull_request.head.sha }}")

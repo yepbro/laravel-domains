@@ -1,6 +1,6 @@
-# Prometheus (dev) — сбор метрик всех сервисов проекта.
-# Сервисы приложения находяться через docker DNS (dns_sd), поэтому у самого
-# prometheus DNS не переопределён.
+# Prometheus (dev) — metric scraping for all the project's services.
+# The app services are discovered via docker DNS (dns_sd), so prometheus
+# itself has no DNS override.
 global:
   scrape_interval: 15s
   evaluation_interval: 15s
@@ -48,12 +48,12 @@ scrape_configs:
         port: 9105
         type: A
 
-  # Воркер B фолбэка (T-240, S-P3-3): контейнер профиля runtime — метрики
-  # на стандартном порте бинарника 9105 в своём network namespace (docker.md
-  # §8). Пока профиль не поднят, у dns_sd нет таргетов — job молчит и
-  # оживает вместе с сервисом render-fallback (crawler_service_up,
-  # consumed/глубина для баланса published/consumed — services.md,
-  # «Метрики рабочей логики»).
+  # The fallback worker B (T-240, S-P3-3): a runtime profile container —
+  # metrics on the binary's standard port 9105 inside its own network
+  # namespace (docker.md §8). While the profile is not up, dns_sd has no
+  # targets — the job stays silent and comes alive together with the
+  # render-fallback service (crawler_service_up, consumed/depth for the
+  # published/consumed balance — services.md, "working-logic metrics").
   - job_name: render-fallback
     dns_sd_configs:
       - names: ["render-fallback"]

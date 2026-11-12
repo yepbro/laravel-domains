@@ -1,13 +1,14 @@
 name: ops-telegram-env
 
-# Разовая/повторяемая доставка Telegram-секретов мониторинга на боевой
-# сервер (T-173): значения TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID живут в
-# секретах репозитория (write-only — прочитать их нельзя) и нужны в
-# EnvironmentFile юнита crawler-monitor (/etc/crawler/crawler.env), чтобы
-# монитор доставлял алерты (T-162) и отчёты нагрузки (T-173) оператору.
-# CI — единственное место с доступом и к секретам, и к серверу
-# (DEPLOY_SSH_KEY, тот же, что у deploy). Запуск — только вручную
-# workflow_dispatch; шаги повторяют SSH-паттерн deploy.yml.
+# One-off/repeatable delivery of the monitoring Telegram secrets to the
+# production server (T-173): the TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID values
+# live in repository secrets (write-only — they cannot be read) and are
+# needed in the EnvironmentFile of the crawler-monitor unit
+# (/etc/crawler/crawler.env), so that monitor delivers alerts (T-162) and
+# load reports (T-173) to the operator. CI is the only place with access to
+# both the secrets and the server (DEPLOY_SSH_KEY, the same one deploy
+# uses). Runs manually only, via workflow_dispatch; the steps follow the
+# SSH pattern of deploy.yml.
 on:
   workflow_dispatch:
 
@@ -29,17 +30,18 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Настроить SSH
+      - name: Set up SSH
         run: |
           install -m 600 /dev/null id_ed25519
           printf '%s\n' "${{ secrets.DEPLOY_SSH_KEY }}" > id_ed25519
           printf '%s\n' "${{ secrets.DEPLOY_SSH_KNOWN_HOSTS }}" > known_hosts.txt
 
-      # Секреты передаются аргументами bash-скрипта по SSH: GitHub маскирует
-      # их в логах рана, скрипт значения не печатает (deploy/telegram-env.sh;
-      # стиль «bash -s» из deploy.yml). Коды скрипта: 4 — нет env-файла или
-      # аргументов, 3 — строка включения доставки не найдена в журнале.
-      - name: Доставить секреты и перезапустить monitor
+      # Secrets are passed as arguments to the bash script over SSH: GitHub
+      # masks them in the run logs, the script never prints the values
+      # (deploy/telegram-env.sh; the "bash -s" style from deploy.yml).
+      # Script exit codes: 4 — no env file or arguments, 3 — the delivery
+      # enablement line was not found in the journal.
+      - name: Deliver secrets and restart monitor
         run: |
           set +e
           ssh $SSH_OPTS -i id_ed25519 "$SSH_HOST" 'bash -s -- ' \

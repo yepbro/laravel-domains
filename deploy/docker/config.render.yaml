@@ -1,20 +1,22 @@
-# Конфигурация боевого render-контейнера — compose-профиль runtime, сервис
-# render (deploy/docker/compose.yaml). Отличие от dev-конфига
-# config.dev.yaml: remote_url пуст — render-worker запускает собственный
-# процесс headless-shell (боевой режим, Dockerfile.render), а не подключается
-# к внешнему compose-сервису chromium. Остальные секции берутся значениями по
-# умолчанию (internal/config, ТЗ 5.10); адреса БД/очереди приходят переменными
-# окружения (APP_PG_DSN, CRAWLER_REDIS_ADDR — см. compose.yaml).
+# The production render container configuration — the compose runtime
+# profile, the render service (deploy/docker/compose.yaml). The difference
+# from the dev config config.dev.yaml: remote_url is empty — render-worker
+# starts its own headless-shell process (production mode, Dockerfile.render)
+# instead of connecting to the external compose service chromium. The other
+# sections take the default values (internal/config, spec 5.10); the
+# DB/queue addresses come via environment variables (APP_PG_DSN,
+# CRAWLER_REDIS_ADDR — see compose.yaml).
 
 postgres:
-  dsn: "" # задаётся APP_PG_DSN из compose.yaml
+  dsn: "" # set by APP_PG_DSN from compose.yaml
 
 render:
-  remote_url: "" # боевой режим: собственный процесс headless-shell
-  contexts: 8 # дефолт T-169 (спрос ≈1,2 стр/с против ёмкости 4 ≈0,8 — дренаж сравнялся с притоком; здесь браузер — собственный процесс воркера, контроль RSS T-065 работает: порог 1536 MiB срабатывает раньше общего лимита контейнера 2 ГиБ, где живёт и Go-часть ~128 МБ; при проживании RSS у порога — делить на systemd-юниты с отдельными cgroup, deploy.md §2.2)
+  remote_url: "" # production mode: its own headless-shell process
+  contexts: 8 # the T-169 default (demand ≈1.2 pages/s vs the capacity of 4 ≈0.8 — the drain caught up with the inflow; here the browser is the worker's own process, the T-065 RSS control works: the 1536 MiB threshold trips before the container's 2 GiB total limit, where the ~128 MB Go part also lives; at sustained RSS residency near the threshold — split into systemd units with separate cgroups, deploy.md §2.2)
   timeout: "25s"
   restart_every_pages: 500
-  # Порог перезапуска по RSS (T-065): 1,5 ГиБ при лимите контейнера 2 ГиБ
-  # (бюджет Chromium ≈ 2 ГБ, ТЗ 3.2) — перезапуск до cgroup-OOM;
-  # обоснование — docs/render.md, раздел «Перезапуск браузера».
+  # The RSS restart threshold (T-065): 1.5 GiB at a container limit of
+  # 2 GiB (the Chromium budget ≈ 2 GB, spec 3.2) — a restart before
+  # cgroup-OOM; the rationale — docs/render.md, the "Browser restart"
+  # section.
   restart_memory_bytes: "1536MiB"

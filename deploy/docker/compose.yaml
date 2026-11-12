@@ -1,50 +1,51 @@
-# Domain Crawler — dev-окружение.
-# Запуск через Makefile из корня репозитория (make up / make up-infra / ...),
-# либо вручную: docker compose --project-directory . -f deploy/docker/compose.yaml ...
+# Domain Crawler — the dev environment.
+# Run via the Makefile from the repository root (make up / make up-infra /
+# ...), or manually: docker compose --project-directory . -f deploy/docker/compose.yaml ...
 #
-# Профили:
-#   (по умолчанию) postgres, redis, unbound
-#   testbed        coredns, testweb, mockserver — изолированный «мини-интернет»
-#   app            Go-сервисы проекта + chromium
+# Profiles:
+#   (default)      postgres, redis, unbound
+#   testbed        coredns, testweb, mockserver — an isolated "mini-internet"
+#   app            the project's Go services + chromium
 #   monitoring     prometheus
-#   runtime        render — боевой render-контейнер (Dockerfile.render);
-#                  render-fallback — воркер B: тот же образ, стрим
-#                  q:render-fallback и потолок темпа (T-240, ТЗ §4.5)
-#   render-engines lightpanda, moli — альтернативные движки рендера (T-241)
-#   tools          adminer, redis-insight, tools (запускаются по требованию)
+#   runtime        render — the production render container (Dockerfile.render);
+#                  render-fallback — worker B: the same image, the
+#                  q:render-fallback stream and a rate cap (T-240, spec §4.5)
+#   render-engines lightpanda, moli — alternative render engines (T-241)
+#   tools          adminer, redis-insight, tools (started on demand)
 #
-# Сеть crawler_net (172.28.100.0/24) — детерминированные адреса (T-180):
-# ipv4_address задан всем долгоживущим сервисам. Динамический аллокатор
-# Docker не резервирует адреса остановленных контейнеров, и стартующий
-# динамический сервис занимал чужой адрес — владелец падал «Address
-# already in use» (инциденты 2026-10-23/24 — tasks/tasks.md, этап 28).
-# План адресов по классам (таблица с профилями — docs/docker.md §8):
-#   инфраструктура: postgres 172.28.100.2, redis 172.28.100.3, unbound 172.28.100.10
+# The crawler_net network (172.28.100.0/24) — deterministic addresses
+# (T-180): ipv4_address is set for all long-lived services. The dynamic
+# allocator of Docker does not reserve addresses of stopped containers, and
+# a starting dynamic service used to take a foreign address — the owner
+# fell over "Address already in use" (the 2026-10-23/24 incidents —
+# tasks/tasks.md, stage 28). The address plan by class (the table with
+# profiles — docs/docker.md §8):
+#   infrastructure: postgres 172.28.100.2, redis 172.28.100.3, unbound 172.28.100.10
 #   testbed:        coredns 172.28.100.11, testweb 172.28.100.12, mockserver 172.28.100.13
 #   app:            chromium 172.28.100.14; monitor 172.28.100.20, ingest 172.28.100.21,
 #                   scheduler 172.28.100.22, dns-worker 172.28.100.23, http-worker 172.28.100.24,
 #                   render-worker 172.28.100.25, analyzer 172.28.100.26, web 172.28.100.27,
-#                   dashboard 172.28.100.28 — адрес .2k = порт метрик 910k; .29 — резерв
+#                   dashboard 172.28.100.28 — address .2k = the metrics port 910k; .29 — reserved
 #   runtime:        render 172.28.100.15, render-fallback 172.28.100.18 (T-240)
 #   render-engines: lightpanda 172.28.100.16, moli 172.28.100.17 (T-241)
 #   monitoring:     prometheus 172.28.100.30
-#   tools:          adminer 172.28.100.31, redis-insight 172.28.100.32 (далее свободно)
-#   172.28.100.250 — «чёрная дыра» (адрес без слушателя для сценариев
-#   закрытых портов) — не занимается ни одним сервисом.
-# Адреса инфраструктуры/testbed/chromium/render неизменны исторически и
-# менять их нельзя — они зафиксированы у потребителей: testbedgen печёт
-# .12 в DNS-зоны (cmd/testbedgen/main.go Network.TestwebIP), live-тесты
-# рендера ходят на ws://172.28.100.14:9222, DSN .2 — config.dev.yaml
-# и тесты миграций.
-# Исключение — run-контейнер tools: адрес НЕ задаётся (см. комментарий
-# у сервиса tools). Остаточный риск: живой одноразовый run-контейнер
-# (make test/lint/debug, docker compose run) может динамически занять
-# адрес остановленного статического сервиса — аллокатор выдаёт свободные
-# адреса с младших — и владелец не стартанёт «Address already in use»
-# до завершения run-контейнера; окно ограничено его временем жизни и
-# самозалечивается (--rm).
-# Приложениям адреса инфраструктуры выдаются через переменные окружения,
-# а DNS всех сервисов приложения указывает на unbound (см. 7.2 ТЗ).
+#   tools:          adminer 172.28.100.31, redis-insight 172.28.100.32 (free below)
+#   172.28.100.250 — the "black hole" (an address without a listener for the
+#   closed-port scenarios) — not claimed by any service.
+# The infrastructure/testbed/chromium/render addresses are historically
+# fixed and must not be changed — consumers pin them: testbedgen bakes .12
+# into the DNS zones (cmd/testbedgen/main.go Network.TestwebIP), the render
+# live tests go to ws://172.28.100.14:9222, the .2 DSN — config.dev.yaml
+# and the migration tests.
+# The exception is the tools run container: the address is NOT set (see the
+# comment at the tools service). The residual risk: a live one-off run
+# container (make test/lint/debug, docker compose run) may dynamically take
+# the address of a stopped static service — the allocator hands out free
+# addresses from the low end — and the owner will not start, "Address
+# already in use", until the run container finishes; the window is bounded
+# by its lifetime and self-heals (--rm).
+# Applications get the infrastructure addresses via environment variables,
+# and the DNS of all the app services points at unbound (see spec 7.2).
 
 name: crawler
 
@@ -67,26 +68,28 @@ x-go-common: &go-common
   user: "${DEV_UID:-1000}:${DEV_GID:-1000}"
   environment: &go-common-env
     HOME: /tmp
-    # GOPATH — во временный каталог внутри контейнера: каталог /go из образа
-    # принадлежит root, а сюда Go кладёт кэш sumdb (make mod-download/go get
-    # после make clean). Модули — в общем томе GOMODCACHE, он тут ни при чём.
+    # GOPATH — a temp directory inside the container: the image's /go
+    # directory is owned by root, while Go puts the sumdb cache here
+    # (make mod-download/go get after make clean). The modules live in the
+    # shared GOMODCACHE volume, it has nothing to do with this.
     GOPATH: /tmp/gopath
     GOMODCACHE: /gomod
     GOCACHE: /gocache
     GOFLAGS: -mod=readonly
-    # Значения подставляются из .env; DSN — статический IP сети crawler_net.
-    # CRAWLER_CONFIG — путь к единому YAML (internal/config, ТЗ 5.10);
-    # переменные CRAWLER_* переопределяют значения из него (docs/configuration.md).
-    # Только переменные, которые код действительно читает: адреса Redis и
-    # резолвера, пути каталогов сервисы берут из config.dev.yaml, а не из
-    # окружения (таблица envSpecs в internal/config).
+    # The values are substituted from .env; the DSN — a static IP of the
+    # crawler_net network. CRAWLER_CONFIG — the path to the single YAML
+    # (internal/config, spec 5.10); the CRAWLER_* variables override its
+    # values (docs/configuration.md). Only the variables the code actually
+    # reads: the Redis and resolver addresses, the directory paths the
+    # services take from config.dev.yaml, not from the environment (the
+    # envSpecs table in internal/config).
     APP_PG_DSN: postgres://${APP_DB_USER:-crawler}:${APP_DB_PASSWORD:-dev-only-crawler}@172.28.100.2:5432/${POSTGRES_DB:-crawler}?sslmode=disable
     CRAWLER_CONFIG: /etc/crawler/config.yaml
     CRAWLER_HTTP_USER_AGENT: "${CRAWLER_USER_AGENT:-DomainCrawler/dev (+dev-environment; contact: dev@example.invalid)}"
   volumes:
-    - .:/src                      # исходный код (bind, hot reload)
-    - gomodcache:/gomod           # кэш Go-модулей (общий, именованный том)
-    - gocache:/gocache            # кэш сборки (общий, именованный том)
+    - .:/src                      # the source code (bind, hot reload)
+    - gomodcache:/gomod           # the Go module cache (shared, named volume)
+    - gocache:/gocache            # the build cache (shared, named volume)
     - ./deploy/docker/config.dev.yaml:/etc/crawler/config.yaml:ro
     - ./rules:/etc/crawler/rules:ro
     - ./var/content:/data/content
@@ -102,13 +105,14 @@ x-go-common: &go-common
       hard: 65535
   sysctls:
     net.ipv4.ip_local_port_range: "1024 65535"
-  # Healthcheck контейнеров приложения — liveness-проба /livez (T-110):
-  # контейнер здоров, пока процесс жив и отвечает HTTP. Readiness /healthz
-  # (пинг пула PostgreSQL, 503 при сбое) в healthcheck сознательно не
-  # используется: задачи воркеры тянут из Redis-очередей сами —
-  # маршрутизатора «впускать трафик» нет, а при недоступной БД стена
-  # unhealthy-воркеров лишь дублировала бы статус самого postgres
-  # (у него свой healthcheck); /healthz остаётся оператору и мониторингу.
+  # The app containers' healthcheck — the /livez liveness probe (T-110):
+  # a container is healthy while its process is alive and answers HTTP.
+  # The readiness /healthz (a PostgreSQL pool ping, 503 on failure) is
+  # deliberately not used in the healthcheck: the workers pull tasks from
+  # the Redis queues themselves — there is no "admit traffic" router, and
+  # with the DB down a wall of unhealthy workers would only duplicate the
+  # postgres status (it has its own healthcheck); /healthz stays for the
+  # operator and monitoring.
   healthcheck:
     test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:$${METRICS_PORT:-9090}/livez || exit 1"]
     interval: 15s
@@ -116,16 +120,17 @@ x-go-common: &go-common
     retries: 20
     start_period: 120s
 
-# Сервисы приложения используют unbound как единственный внешний резолвер
-# (ТЗ 7.2): Docker пересылает на указанный адрес всё, что не является именем
-# сервисов compose. У tools DNS оставлен стандартным (нужен proxy.golang.org).
+# The app services use unbound as the only external resolver (spec 7.2):
+# Docker forwards everything that is not a compose service name to the
+# specified address. tools keeps the default DNS (it needs
+# proxy.golang.org).
 x-app-dns: &app-dns
   dns:
     - 172.28.100.10
 
 services:
   # ==========================================================================
-  # Инфраструктура (профиль по умолчанию)
+  # Infrastructure (the default profile)
   # ==========================================================================
 
   postgres:
@@ -183,22 +188,25 @@ services:
         ALPINE_VERSION: ${ALPINE_VERSION:-3.24.2}
     image: crawler/unbound:local
     environment:
-      # testbed: всё форвардится в coredns, остальное REFUSED.
-      # Режим internet включается только make up-internet (ALLOW_INTERNET=1):
-      # рекурсия с корневых серверов, prefetch, кэш ≈ 542 МБ (ТЗ 5.4/3.2).
-      # Публичные fallback-резолверы unbound НЕ получает — семантика forward-zone
-      # делает форвардеры первичными; fallback — на клиенте dns-worker
-      # (dns.fallback_resolvers, см. docs/docker.md, раздел «Unbound»).
+      # testbed: everything is forwarded to coredns, the rest REFUSED.
+      # The internet mode is enabled only by make up-internet
+      # (ALLOW_INTERNET=1): recursion from the root servers, prefetch, a
+      # cache of ≈ 542 MB (spec 5.4/3.2). unbound does NOT get public
+      # fallback resolvers — the forward-zone semantics makes the
+      # forwarders authoritative; the fallback lives on the dns-worker
+      # client (dns.fallback_resolvers, see docs/docker.md, the "Unbound"
+      # section).
       UNBOUND_MODE: ${UNBOUND_MODE:-testbed}
     command: ["/bin/sh", "-c", "exec unbound -d -c /etc/unbound/unbound.$${UNBOUND_MODE:-testbed}.conf"]
     networks:
       crawler_net:
         ipv4_address: 172.28.100.10
-    # ТЗ 3.2: бюджет Unbound ≈ 0,7 ГБ (mem_limit — docker-аналог MemoryMax из
-    # ТЗ 10.1). Режим internet дорастает до кэшей суммарно ≈ 542 МБ (таблицы
-    # растут лениво по заполнении, стартовый RSS ~20 МБ) — запас ~160 МБ на
-    # процесс и буферы потоков; режим testbed занимает ~150 МБ, лимит-потолок
-    # память не резервирует. Для слабых машин в testbed можно вернуть 256m
+    # spec 3.2: the Unbound budget ≈ 0.7 GB (mem_limit — the docker analog
+    # of the spec 10.1 MemoryMax). The internet mode grows its caches to
+    # ≈ 542 MB in total (the tables grow lazily as they fill, the starting
+    # RSS ~20 MB) — ~160 MB of headroom for the process and the thread
+    # buffers; the testbed mode takes ~150 MB, the cap limit does not
+    # reserve memory. On weak machines in testbed it can go back to 256m
     # (.env: MEM_UNBOUND).
     mem_limit: ${MEM_UNBOUND:-700m}
     restart: unless-stopped
@@ -210,7 +218,7 @@ services:
       start_period: 10s
 
   # ==========================================================================
-  # Тестовый стенд (profile: testbed)
+  # Test bench (profile: testbed)
   # ==========================================================================
 
   coredns:
@@ -228,7 +236,7 @@ services:
     profiles: ["testbed"]
 
   testweb:
-    # Caddy с виртуальными хостами по сценариям из deploy/docker/testbed/web/Caddyfile
+    # Caddy with virtual hosts per the scenarios from deploy/docker/testbed/web/Caddyfile
     image: ${CADDY_IMAGE:-caddy:2.11.7-alpine}
     volumes:
       - ./deploy/docker/testbed/web/Caddyfile:/etc/caddy/Caddyfile:ro
@@ -253,9 +261,9 @@ services:
     profiles: ["testbed"]
 
   mockserver:
-    # «Злые» сценарии, которые нельзя описать статикой: тарпит, огромные тела,
-    # zip-бомба, обрыв соединения, бесконечные редиректы, плохие TLS-сертификаты.
-    # Исходник: cmd/mockserver
+    # "Nasty" scenarios that cannot be described statically: a tarpit, huge
+    # bodies, a zip bomb, a connection drop, endless redirects, bad TLS
+    # certificates. Source: cmd/mockserver
     build:
       context: .
       dockerfile: deploy/docker/Dockerfile.go
@@ -278,9 +286,10 @@ services:
     profiles: ["testbed"]
 
   # ==========================================================================
-  # Приложения проекта (profile: app)
-  # Статические адреса .20–.28: адрес .2k = порт метрик 910k (план — шапка
-  # файла, docs/docker.md §8); .29 — резерв под новый сервис app.
+  # Project applications (profile: app)
+  # Static addresses .20–.28: address .2k = the metrics port 910k (the plan
+  # — the file header, docs/docker.md §8); .29 — reserved for a new app
+  # service.
   # ==========================================================================
 
   ingest:
@@ -297,7 +306,7 @@ services:
       - gocache:/gocache
       - ./deploy/docker/config.dev.yaml:/etc/crawler/config.yaml:ro
       - ./rules:/etc/crawler/rules:ro
-      # наблюдаемая папка и соседние каталоги — bind с хоста (ТЗ 4.2)
+      # the watched directory and the neighboring directories — a host bind (spec 4.2)
       - ./var/incoming:/data/incoming
       - ./var/content:/data/content
     mem_limit: 256m
@@ -357,17 +366,17 @@ services:
       <<: *go-common-env
       SERVICE: http-worker
       METRICS_PORT: "9104"
-    # Самый тяжёлый Go-сервис: слоты задач q:http (http.task_concurrency,
-    # дефолт 192, T-157 — config.dev.yaml задачный параллелизм не
-    # понижает) удерживают тела страниц до 2 МиБ до конца задачи домена
-    # (дедупликация алиасов): замер ≈3.34 MiB anon/слот → avg ≈855 MiB
-    # на 256 слотах (docs/load-measurements.md §11, T-143) — сутки
-    # на 256 дали два фатала юнита (§12, T-157), дефолт понижен до 192
-    # (устойчиво по пропитке этапа 22: 860–893 MiB, oom=0, NRestarts=0).
-    # Прежние 384m вмещали лишь 128 слотов (anon ≈380 из 384 MiB) — на
-    # 256 OOM контейнера. Паритет с MemoryMax=900M боевого
-    # юнита (deploy/systemd/crawler-http-worker.service); снижать только
-    # вместе с http.task_concurrency.
+    # The heaviest Go service: the q:http task slots (http.task_concurrency,
+    # the default 192, T-157 — config.dev.yaml does not lower the task
+    # parallelism) hold page bodies up to 2 MiB until the end of the domain
+    # task (alias deduplication): ≈3.34 MiB anon/slot measured → avg ≈855
+    # MiB at 256 slots (docs/load-measurements.md §11, T-143) — a day at
+    # 256 gave two unit fatals (§12, T-157), the default lowered to 192
+    # (stable by the stage 22 soak: 860–893 MiB, oom=0, NRestarts=0).
+    # The previous 384m fit only 128 slots (anon ≈380 of 384 MiB) — at 256
+    # the container OOMs. Parity with the production unit's MemoryMax=900M
+    # (deploy/systemd/crawler-http-worker.service); lower it only together
+    # with http.task_concurrency.
     mem_limit: 900m
     depends_on:
       postgres:
@@ -437,14 +446,14 @@ services:
     profiles: ["app"]
 
   web:
-    # Публичный лендинг (этап 13, T-124): в dev публикуется на loopback
-    # хоста (127.0.0.1:WEB_PORT, web.listen в config.dev.yaml слушает
-    # 8080 в контейнере) — как и операторский дашборд (сервис
-    # dashboard ниже, DASHBOARD_PORT); боевой вход — reverse-proxy
-    # с TLS (deploy/nginx/, docs/deploy.md).
-    # METRICS_ADDR разворачивает метрики на интерфейсы docker-сети для
-    # Prometheus (наружу порт не публикуется — ТЗ §9); дефолт кода/юнита —
-    # loopback 127.0.0.1:9107.
+    # The public landing page (stage 13, T-124): in dev it is published on
+    # the host loopback (127.0.0.1:WEB_PORT, web.listen in config.dev.yaml
+    # listens on 8080 in the container) — like the operator dashboard (the
+    # dashboard service below, DASHBOARD_PORT); the production entry — a
+    # reverse-proxy with TLS (deploy/nginx/, docs/deploy.md).
+    # METRICS_ADDR exposes the metrics on the docker network interfaces for
+    # Prometheus (the port is not published outward — spec §9); the
+    # code/unit default — loopback 127.0.0.1:9107.
     <<: [*go-common, *app-dns]
     build: *go-build
     command: ["./deploy/docker/scripts/air-entrypoint.sh"]
@@ -453,11 +462,12 @@ services:
       SERVICE: web
       METRICS_PORT: "9107"
       METRICS_ADDR: ":9107"
-      # Форма лендинга (T-123): живая проверка реальных доменов в dev.
-      # Testbed-unbound герметичен — на всё вне тестовых зон отвечает
-      # SERVFAIL, чекер эскалирует на публичные dns.fallback_resolvers
-      # (internal/checker/resolve.go). Массовый конвейер (dns-worker)
-      # этого env не получает — герметичность краула не меняется.
+      # The landing form (T-123): live checks of real domains in dev.
+      # The testbed unbound is hermetic — it answers SERVFAIL for anything
+      # outside the test zones, the checker escalates to the public
+      # dns.fallback_resolvers (internal/checker/resolve.go). The bulk
+      # pipeline (dns-worker) does not get this env — the crawl
+      # hermeticity does not change.
       CRAWLER_DNS_FALLBACK_RESOLVERS: "1.1.1.1:53,9.9.9.9:53"
     ports:
       - "127.0.0.1:${WEB_PORT:-8081}:8080"
@@ -473,15 +483,17 @@ services:
     profiles: ["app"]
 
   dashboard:
-    # Операторский дашборд конвейера (этап 15, ТЗД; T-128…T-131): единая
-    # страница состояния с доступом по паролю (HTTP Basic, креды — секция
-    # dashboard в config.dev.yaml), строго read-only. В dev публикуется
-    # на loopback хоста (127.0.0.1:DASHBOARD_PORT, dashboard.listen в
-    # config.dev.yaml слушает 8090 в контейнере); боевой вход — loopback
-    # за reverse-proxy с TLS (схема web/T-124, docs/deploy.md §6).
-    # METRICS_ADDR разворачивает метрики на интерфейсы docker-сети для
-    # Prometheus (наружу порт не публикуется — ТЗ §9); дефолт кода/юнита —
-    # loopback 127.0.0.1:9108 (следующий за web:9107).
+    # The pipeline operator dashboard (stage 15, dashboard spec;
+    # T-128…T-131): a single status page with password access (HTTP Basic,
+    # the credentials — the dashboard section in config.dev.yaml), strictly
+    # read-only. In dev it is published on the host loopback
+    # (127.0.0.1:DASHBOARD_PORT, dashboard.listen in config.dev.yaml
+    # listens on 8090 in the container); the production entry — loopback
+    # behind a reverse-proxy with TLS (the web scheme/T-124, docs/deploy.md
+    # §6). METRICS_ADDR exposes the metrics on the docker network
+    # interfaces for Prometheus (the port is not published outward —
+    # spec §9); the code/unit default — loopback 127.0.0.1:9108 (the next
+    # one after web:9107).
     <<: [*go-common, *app-dns]
     build: *go-build
     command: ["./deploy/docker/scripts/air-entrypoint.sh"]
@@ -504,12 +516,13 @@ services:
     profiles: ["app"]
 
   chromium:
-    # Headless Chromium для render-worker (CDP на :9222).
-    # shm_size вместо --disable-dev-shm-usage; init — уборка zombie (ТЗ 4.3).
-    # mem_limit — бюджет Chromium ТЗ 3.2 (≈2 ГБ, docker-аналог cgroup
-    # MemoryMax из ТЗ 10.1). Перезапуск по страницам/памяти (T-065) здесь
-    # ограничен порогом страниц: воркер в remote-режиме не видит RSS чужого
-    # контейнера — жёсткий потолок и рестарт держит этот лимит + restart.
+    # Headless Chromium for render-worker (CDP on :9222).
+    # shm_size instead of --disable-dev-shm-usage; init — zombie reaping
+    # (spec 4.3). mem_limit — the Chromium budget of spec 3.2 (≈2 GB, the
+    # docker analog of the spec 10.1 cgroup MemoryMax). The restart by
+    # pages/memory (T-065) is limited here by the page threshold: the
+    # worker in remote mode does not see the foreign container's RSS — a
+    # hard cap and the restart are held by this limit + restart.
     image: ${CHROMEDP_HEADLESS_IMAGE:-chromedp/headless-shell:156.0.8078.17}
     shm_size: "1gb"
     init: true
@@ -523,38 +536,41 @@ services:
     profiles: ["app"]
 
   # ==========================================================================
-  # Альтернативные движки рендера (profile: render-engines, этап 35 / T-241)
+  # Alternative render engines (profile: render-engines, stage 35 / T-241)
   # ==========================================================================
 
   lightpanda:
-    # Lightpanda (github.com/lightpanda-io/browser) — альтернативный
-    # CDP-движок рендера для локальной разработки и стендовых прогонов
-    # (ТЗ рендер-движков §4.7, ФТ-16): render-worker переключается на него
-    # заменой render.remote_url в config.dev.yaml. Отдельный профиль:
-    # движки не поднимаются вместе с make up — три браузера одновременно
-    # дев-машине не нужны (бюджет памяти), конкретный движок стартует по
-    # требованию (docs/dev-environment.md, «Движки рендера»). Версия
-    # закреплена LIGHTPANDA_IMAGE (ФТ-17: смена — отдельная процедура со
-    # smoke-прогоном).
+    # Lightpanda (github.com/lightpanda-io/browser) — an alternative CDP
+    # render engine for local development and bench runs (the render
+    # engines spec §4.7, FR-16): render-worker switches to it by changing
+    # render.remote_url in config.dev.yaml. A separate profile: the engines
+    # do not come up with make up — three browsers at once are not needed
+    # on a dev machine (the memory budget), a specific engine starts on
+    # demand (docs/dev-environment.md, "Render engines"). The version is
+    # pinned by LIGHTPANDA_IMAGE (FR-17: a change is a separate procedure
+    # with a smoke run).
     image: ${LIGHTPANDA_IMAGE:-lightpanda/browser:1.0.2}
     environment:
-      # ФТ-18: телеметрия Lightpanda включена в release-сборках по умолчанию
-      # и для краулера по чужим доменам недопустима — выключена (отключает
-      # сам факт наличия переменной; значение true для читаемости).
+      # FR-18: Lightpanda telemetry is enabled in release builds by default
+      # and is unacceptable for a crawler over foreign domains — disabled
+      # (this removes the very fact of the variable being present; the true
+      # value is for readability).
       LIGHTPANDA_DISABLE_TELEMETRY: "true"
-    # Базовый serve-запуск оставляем от CMD образа (lightpanda serve --host
-    # 0.0.0.0 --port 9222 --log-level info; --obey-robots не передаётся —
-    # ФТ-18). --advertise-host — страховка сторонних CDP-клиентов, которые
-    # ходят по webSocketDebuggerUrl из /json/version: Lightpanda строит
-    # его из адреса бинда, а не из Host-запроса. Воркеру флаг не нужен
-    # (T-234): remote-аллокатор движка lightpanda подключается по адресу
-    # render.remote_url как есть (docs/render.md, «Движки рендера»).
-    # Значение равно статическому адресу сервиса (план адресов выше).
+    # The basic serve launch is left to the image's CMD (lightpanda serve
+    # --host 0.0.0.0 --port 9222 --log-level info; --obey-robots is not
+    # passed — FR-18). --advertise-host — a guard for third-party CDP
+    # clients that go by the webSocketDebuggerUrl from /json/version:
+    # Lightpanda builds it from the bind address, not from the request
+    # Host. The worker does not need the flag (T-234): the lightpanda
+    # engine's remote allocator connects by the render.remote_url address
+    # as is (docs/render.md, "Render engines"). The value equals the
+    # service's static address (the address plan above).
     command: ["/bin/lightpanda", "serve", "--host", "0.0.0.0", "--port", "9222", "--advertise-host", "172.28.100.16", "--log-level", "info"]
-    # DNS — unbound, как chromium: движок сам резолвит имена страниц
-    # (ТЗ 5.4). Бюджет памяти — стартовый потолок движка (ТЗ рендер-движков
-    # §4.7 п.2, ≤1 ГБ): remote-воркер не видит RSS чужого контейнера,
-    # жёсткий потолок держит mem_limit + restart.
+    # DNS — unbound, like chromium: the engine resolves the page names
+    # itself (spec 5.4). The memory budget — the engine's starting cap (the
+    # render engines spec §4.7 item 2, ≤1 GB): the remote worker does not
+    # see the foreign container's RSS, the hard cap is held by
+    # mem_limit + restart.
     dns:
       - 172.28.100.10
     networks:
@@ -562,11 +578,12 @@ services:
         ipv4_address: 172.28.100.16
     mem_limit: ${MEM_LIGHTPANDA:-1gb}
     restart: unless-stopped
-    # Healthcheck — /json/version (общий CDP-эндпоинт всех трёх движков,
-    # тот же, что у health-checkа воркера и TestChromium_CDP). Образ —
-    # debian:stable-slim без wget/curl, единственный HTTP-клиент — bash
-    # /dev/tcp: открываем соединение, шлём GET, grep по «Browser» в теле
-    # подтверждает ответ именно /json/version.
+    # The healthcheck — /json/version (the CDP endpoint shared by all three
+    # engines, the same one the worker's health check and TestChromium_CDP
+    # use). The image is debian:stable-slim without wget/curl, the only
+    # HTTP client is bash /dev/tcp: we open a connection, send a GET, and a
+    # grep for "Browser" in the body confirms the answer is exactly
+    # /json/version.
     healthcheck:
       test: ["CMD-SHELL", "bash -c \"exec 3<>/dev/tcp/127.0.0.1/9222 && printf 'GET /json/version HTTP/1.1\\r\\nHost: 127.0.0.1\\r\\nConnection: close\\r\\n\\r\\n' >&3 && grep -q Browser <&3\" || exit 1"]
       interval: 15s
@@ -576,14 +593,16 @@ services:
     profiles: ["render-engines"]
 
   moli:
-    # Moli (github.com/lexmount/moli) — второй альтернативный CDP-движок
-    # (ФТ-16; лицензии Apache-2.0/MIT). Официального образа нет: минимальный
-    # свой образ из tarball релиза — deploy/docker/Dockerfile.moli. Версия и
-    # контрольная сумма ассета закреплены в .env парой MOLI_VERSION/
-    # MOLI_SHA256 (ФТ-17). Запуск — serve без --layout и без --resource,
-    # --obey-robots не передаётся, --block-private-networks не включается
-    # (ФТ-18 и testbed: страницы отдаёт testweb с приватным адресом —
-    # обоснование в Dockerfile.moli); хост бинда переопределён ниже.
+    # Moli (github.com/lexmount/moli) — the second alternative CDP engine
+    # (FR-16; Apache-2.0/MIT licenses). There is no official image: the
+    # minimal own image from the release tarball —
+    # deploy/docker/Dockerfile.moli. The version and the asset checksum are
+    # pinned in .env by the MOLI_VERSION/MOLI_SHA256 pair (FR-17). The
+    # launch is serve without --layout and without --resource,
+    # --obey-robots is not passed, --block-private-networks is not enabled
+    # (FR-18 and testbed: the pages are served by testweb at a private
+    # address — the rationale is in Dockerfile.moli); the bind host is
+    # overridden below.
     build:
       context: .
       dockerfile: deploy/docker/Dockerfile.moli
@@ -591,21 +610,24 @@ services:
         DEBIAN_VERSION: ${DEBIAN_VERSION:-13.7-slim}
         MOLI_VERSION: ${MOLI_VERSION:-v1.1.21}
         MOLI_SHA256: ${MOLI_SHA256:-048d9e482b6c618af08b17eb19200ea65b1b2fafd39975e5b9de19a60653ed8f}
-    # Тег с версией, а не :local — иначе up -d не замечает смену MOLI_VERSION
-    # (образ есть — пересборки нет, ФТ-17 молча не применяется): новой
-    # версии тега локально нет, compose собирает его сам; прежний тег
-    # остаётся для открата (dc --profile render-engines up -d moli).
+    # A version tag, not :local — otherwise up -d does not notice a
+    # MOLI_VERSION change (the image exists — no rebuild, FR-17 silently
+    # not applied): the new version's tag is not present locally, compose
+    # builds it itself; the previous tag remains as a revert path
+    # (dc --profile render-engines up -d moli).
     image: crawler/moli:${MOLI_VERSION:-v1.1.21}
-    # Бинд на статический адрес сервиса (а не 0.0.0.0 из CMD): Moli
-    # строит webSocketDebuggerUrl из адреса бинда, флага --advertise-host
-    # нет — рекламируется сам адрес бинда. Воркеру это уже не критично
-    # (T-234: remote-аллокатор движка moli берёт из /json/version только
-    # путь browser-сессии, authority подставляет из render.remote_url —
-    # docs/render.md, «Движки рендера»), но адрес даёт честную рекламу
-    # для сторонних CDP-клиентов и healthcheck ниже, идущий по нему же
-    # (127.0.0.1 при таком бинде не слушается — проверено).
+    # A bind to the service's static address (not 0.0.0.0 from the CMD):
+    # Moli builds webSocketDebuggerUrl from the bind address, there is no
+    # --advertise-host flag — the bind address itself is advertised. This
+    # no longer matters to the worker (T-234: the moli engine's remote
+    # allocator takes only the browser session path from /json/version and
+    # substitutes the authority from render.remote_url — docs/render.md,
+    # "Render engines"), but the address gives an honest advertisement for
+    # third-party CDP clients and for the healthcheck below, which goes to
+    # the same address (127.0.0.1 is not listened on with this bind —
+    # verified).
     command: ["serve", "--host", "172.28.100.17", "--port", "9222"]
-    # DNS/память — симметрично lightpanda (см. комментарий выше).
+    # DNS/memory — symmetric to lightpanda (see the comment above).
     dns:
       - 172.28.100.10
     networks:
@@ -613,13 +635,14 @@ services:
         ipv4_address: 172.28.100.17
     mem_limit: ${MEM_MOLI:-1gb}
     restart: unless-stopped
-    # Healthcheck — /json/version, curl из собственного образа (в отличие
-    # от lightpanda свой образ собираем сами и кладём в него HTTP-клиент —
-    # по образцу mockserver в Dockerfile.go). Адрес — статический IP
-    # сервиса: moli не слушает 127.0.0.1 при бинде на конкретный адрес.
-    # Внимание: адрес moli зашит в трёх местах (ipv4_address, command
-    # --host и эта проба) — при смене адреса по плану менять все три
-    # (docs/docker.md §8).
+    # The healthcheck — /json/version, curl from the own image (unlike
+    # lightpanda we build the own image ourselves and put an HTTP client
+    # into it — modeled on mockserver in Dockerfile.go). The address — the
+    # service's static IP: moli does not listen on 127.0.0.1 when bound to
+    # a specific address. Caution: the moli address is hardcoded in three
+    # places (ipv4_address, the command --host and this probe) — when
+    # changing the address, change all three per the plan (docs/docker.md
+    # §8).
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://172.28.100.17:9222/json/version >/dev/null || exit 1"]
       interval: 15s
@@ -629,21 +652,22 @@ services:
     profiles: ["render-engines"]
 
   # ==========================================================================
-  # Боевой render-контейнер (profile: runtime)
+  # Production render container (profile: runtime)
   # ==========================================================================
 
   render:
-    # Боевой режим рендера целиком в одном контейнере: render-worker запускает
-    # собственный Chromium (deploy/docker/Dockerfile.render). Ресурсные
-    # требования фиксируются здесь (T-065): mem_limit — бюджет Chromium ≈2 ГБ
-    # (ТЗ 3.2, docker-аналог cgroup MemoryMax из ТЗ 10.1 — OOM не заденет
-    # остальные сервисы); shm_size/init — как dev-сервису chromium (ТЗ 4.3);
-    # cap_drop/no-new-privileges — непривилегированный запуск (§9). Перезапуск
-    # Chromium каждые N страниц и по порогу RSS — изнутри воркера
-    # (render.restart_every_pages / render.restart_memory_bytes, T-065,
-    # docs/render.md); systemd-юниты с MemoryMax — этап 9 (ТЗ 10.1).
-    # Рабочий цикл очередей подключается T-067; сейчас сервис стартует и
-    # отвечает healthz.
+    # The production render mode entirely in one container: render-worker
+    # starts its own Chromium (deploy/docker/Dockerfile.render). The
+    # resource requirements are pinned here (T-065): mem_limit — the
+    # Chromium budget ≈2 GB (spec 3.2, the docker analog of the spec 10.1
+    # cgroup MemoryMax — OOM will not touch the other services);
+    # shm_size/init — like the dev chromium service (spec 4.3);
+    # cap_drop/no-new-privileges — an unprivileged run (§9). The Chromium
+    # restart every N pages and by the RSS threshold — from inside the
+    # worker (render.restart_every_pages / render.restart_memory_bytes,
+    # T-065, docs/render.md); the systemd units with MemoryMax — stage 9
+    # (spec 10.1). The queue cycle wiring lands with T-067; currently the
+    # service starts and answers healthz.
     build:
       context: .
       dockerfile: deploy/docker/Dockerfile.render
@@ -652,13 +676,14 @@ services:
         GO_VERSION: ${GO_VERSION:?GO_VERSION must be set (см. .env.example)}
         CHROMEDP_HEADLESS_IMAGE: ${CHROMEDP_HEADLESS_IMAGE:-chromedp/headless-shell:156.0.8078.17}
     image: crawler/render:local
-    # Воркер пишет пак-файлы контента в host-bind ./var/content, каталог
-    # принадлежит DEV_UID на хосте — а образ завершается USER nobody (65534),
-    # у которого на bind прав нет: запись падала permission denied (профиль
-    # app маскирует проблему — там сервисы работают от DEV_UID). Как остальные
-    # сервисы, render запускается от DEV_UID/DEV_GID: непривилегированный
-    # не-root (ТЗ §9/§10.1; nobody остаётся в образе для запусков без
-    # host-bind) + cap_drop/no-new-privileges ниже.
+    # The worker writes the content pack files to the host-bind
+    # ./var/content, the directory is owned by DEV_UID on the host — while
+    # the image ends with USER nobody (65534), which has no rights on the
+    # bind: writes used to fail with permission denied (the app profile
+    # masks the problem — there the services run as DEV_UID). Like the
+    # other services, render runs as DEV_UID/DEV_GID: an unprivileged
+    # non-root (spec §9/§10.1; nobody stays in the image for runs without
+    # a host-bind) + cap_drop/no-new-privileges below.
     user: "${DEV_UID:-1000}:${DEV_GID:-1000}"
     environment:
       APP_PG_DSN: postgres://${APP_DB_USER:-crawler}:${APP_DB_PASSWORD:-dev-only-crawler}@172.28.100.2:5432/${POSTGRES_DB:-crawler}?sslmode=disable
@@ -668,8 +693,9 @@ services:
     volumes:
       - ./deploy/docker/config.render.yaml:/etc/crawler/config.render.yaml:ro
       - ./var/content:/data/content
-    # DNS — unbound: и воркеру (очереди по именам не нужны, адреса статические),
-    # и Chromium — он резолвит имена страниц контейнера (ТЗ 5.4 через unbound).
+    # DNS — unbound: for the worker (the queues do not need names, the
+    # addresses are static) and for Chromium — it resolves the container's
+    # page names (spec 5.4 via unbound).
     dns:
       - 172.28.100.10
     dns_opt:
@@ -691,20 +717,21 @@ services:
         condition: service_healthy
     profiles: ["runtime"]
 
-  # Воркер B — фолбэк-рендер на Chromium (ТЗР этапа 35 §4.5, T-240):
-  # тот же бинарь/образ, что render, другой сборкой — стрим потребления
-  # q:render-fallback (RENDER_WORKER_STREAM, группа — каноническая пара
-  # render-fallback-worker) и потолок темпа render.fallback.worker_rate
-  # (ФТ-13: записей за скользящее окно 1 мин — renderworker.RateWindow).
-  # Движок chromium, собственный headless-shell в контейнере (без
-  # изменений, Dockerfile.render): перезапуски по страницам/RSS — изнутри
-  # воркера (T-065), как у render; recycle-пара T-208 к docker-рендерам
-  # не относится (она про нативный юнит crawler-chromium.service,
-  # docs/deploy.md §2.3). Ресурсы — те же строки бюджета Chromium ≈2 ГБ
-  # (ТЗ 3.2): движок тот же, темп ниже (MEM_RENDER_FALLBACK отдельной
-  # переменной — калибровка стендом §5.1 ТЗР). Поднимается по готовности
-  # канарейки (ТЗ §4.5 п.3): до включения фолбэка работает по пустой
-  # очереди — проверка проводки.
+  # Worker B — the Chromium fallback render (render spec stage 35 §4.5,
+  # T-240): the same binary/image as render, a different build — the
+  # q:render-fallback consumption stream (RENDER_WORKER_STREAM, the group —
+  # the canonical pair render-fallback-worker) and the rate cap
+  # render.fallback.worker_rate (FR-13: entries per the 1 min sliding
+  # window — renderworker.RateWindow). The engine is chromium, its own
+  # headless-shell in the container (no changes, Dockerfile.render): the
+  # restarts by pages/RSS — from inside the worker (T-065), like render;
+  # the T-208 recycle pair does not apply to docker renders (it is about
+  # the native crawler-chromium.service unit, docs/deploy.md §2.3). The
+  # resources — the same lines of the Chromium budget ≈2 GB (spec 3.2):
+  # the engine is the same, the pace is lower (MEM_RENDER_FALLBACK as a
+  # separate variable — bench calibration, render spec §5.1). Brought up
+  # once the canary is ready (spec §4.5 item 3): until the fallback is
+  # enabled it works off an empty queue — a wiring check.
   render-fallback:
     build:
       context: .
@@ -719,9 +746,10 @@ services:
       APP_PG_DSN: postgres://${APP_DB_USER:-crawler}:${APP_DB_PASSWORD:-dev-only-crawler}@172.28.100.2:5432/${POSTGRES_DB:-crawler}?sslmode=disable
       CRAWLER_REDIS_ADDR: 172.28.100.3:6379
       CRAWLER_CONFIG: /etc/crawler/config.render-fallback.yaml
-      # Сборка воркера B (T-240, ФТ-12): стрим потребления — параметр
-      # запуска (не конфигурации, ТЗ §4.1 п.3); группа выводится канонической
-      # парой стрима (queue.WorkingGroups): render-fallback-worker.
+      # The worker B build (T-240, FR-12): the consumption stream is a
+      # launch parameter (not configuration, spec §4.1 item 3); the group
+      # is derived as the stream's canonical pair (queue.WorkingGroups):
+      # render-fallback-worker.
       RENDER_WORKER_STREAM: q:render-fallback
       CRAWLER_HTTP_USER_AGENT: "${CRAWLER_USER_AGENT:-DomainCrawler/dev (+dev-environment; contact: dev@example.invalid)}"
     volumes:
@@ -749,7 +777,7 @@ services:
     profiles: ["runtime"]
 
   # ==========================================================================
-  # Мониторинг (profile: monitoring)
+  # Monitoring (profile: monitoring)
   # ==========================================================================
 
   prometheus:
@@ -775,7 +803,7 @@ services:
     profiles: ["monitoring"]
 
   # ==========================================================================
-  # Сервисные инструменты (profile: tools)
+  # Service tools (profile: tools)
   # ==========================================================================
 
   adminer:
@@ -813,49 +841,53 @@ services:
     profiles: ["tools"]
 
   tools:
-    # Контейнер с Go-тулчейном, crawlerctl, migrate, lint.
-    # У него НЕ переопределён DNS (нужен proxy.golang.org для новых модулей),
-    # поэтому новые зависимости качаются отсюда: make mod-download.
+    # A container with the Go toolchain, crawlerctl, migrate, lint.
+    # Its DNS is NOT overridden (proxy.golang.org is needed for new
+    # modules), so new dependencies are downloaded from here:
+    # make mod-download.
     #
-    # Статический адрес НЕ задаётся — единственное исключение плана адресов
-    # (T-180): прогоны make test / lint / debug и docker compose run — это
-    # ОДНОРАЗОВЫЕ run-контейнеры, запускаемые параллельно из основного
-    # дерева и worktree'ов с COMPOSE_PROJECT_NAME=crawler, т.е. в ту же сеть
-    # crawler_net; общий статический адрес конфликтовал бы между ними
-    # («Address already in use»). Остаточный риск: живой run-контейнер может
-    # динамически занять адрес остановленного статического сервиса (аллокатор
-    # выдаёт свободные адреса с младших) — владелец не стартанёт до его
-    # завершения; окно ограничено временем жизни run-контейнера и
-    # самозалечивается (--rm). Аналогично make debug SERVICE=<app-сервис>:
-    # перед запуском остановите штатный контейнер сервиса (dc stop <svc>),
-    # иначе run-контейнер не получит его статический адрес.
+    # A static address is NOT set — the only exception to the address plan
+    # (T-180): the make test / lint / debug runs and docker compose run are
+    # ONE-OFF run containers, started in parallel from the main tree and
+    # the worktrees with COMPOSE_PROJECT_NAME=crawler, i.e. into the same
+    # crawler_net network; a shared static address would conflict between
+    # them ("Address already in use"). The residual risk: a live run
+    # container may dynamically take the address of a stopped static
+    # service (the allocator hands out free addresses from the low end) —
+    # the owner will not start until it finishes; the window is bounded by
+    # the run container's lifetime and self-heals (--rm). Likewise
+    # make debug SERVICE=<app service>: stop the service's regular
+    # container before launching (dc stop <svc>), otherwise the run
+    # container will not get its static address.
     <<: *go-common
     build: *go-build
     command: ["sleep", "infinity"]
-    # Явное networks (переопределяет плоский список якоря go-common) ради
-    # DNS-алиасов трекер-доменов live-теста block_tracker_domains (T-214,
-    # block_live_test.go): run-контейнер сам отдаёт зонды трекер-доменов —
-    # герметичный unbound эти имена не резолвит, а без резолва «заблокировано»
-    # в тесте неотличимо от DNS-отказа. Хосты — не Google-аналитика:
-    # google-домены в HSTS-preload Chromium (http-зонд принудительно
-    # апгрейдится на https и падает на TLS с HTTP-сервером теста).
-    # Алиасы применяются только с флагом `docker compose run --use-aliases`
-    # (без него run-контейнеры алиасы служб не получают), живут, пока жив
-    # run-контейнер (make test/lint — секунды-минуты) и действуют только в
-    # dev-стеке; параллельные run-контейнеры разделяют имена (round-robin
-    # Docker DNS) — окно гонки того же класса, что и динамические адреса
-    # T-180.
+    # An explicit networks (overrides the go-common anchor's flat list) for
+    # the DNS aliases of the block_tracker_domains live test's tracker
+    # domains (T-214, block_live_test.go): the run container serves the
+    # tracker-domain probes itself — the hermetic unbound does not resolve
+    # these names, and without a resolution "blocked" in the test is
+    # indistinguishable from a DNS failure. The hosts are not Google
+    # analytics: google domains are in Chromium's HSTS preload (the http
+    # probe is force-upgraded to https and fails on TLS with the test's
+    # HTTP server). The aliases apply only with the
+    # `docker compose run --use-aliases` flag (without it run containers do
+    # not get service aliases), live as long as the run container lives
+    # (make test/lint — seconds-minutes) and act only in the dev stack;
+    # parallel run containers share the names (round-robin Docker DNS) — a
+    # race window of the same class as the dynamic addresses of T-180.
     networks:
       crawler_net:
         aliases:
           - c.clarity.ms
           - mc.yandex.ru
     environment:
-      # Поверх общих переменных — адрес CDP dev-chromium для live-тестов
-      # рендера (internal/render/*_live_test.go) и приёмочных тестов
-      # (accChromiumWS); тесты запускаются именно в tools (make test /
-      # make test-integration). Сервисам приложения не нужен: воркер берёт
-      # адрес из render.remote_url в config.dev.yaml.
+      # On top of the shared variables — the CDP address of the dev
+      # chromium for the render live tests (internal/render/*_live_test.go)
+      # and the acceptance tests (accChromiumWS); the tests run in tools
+      # (make test / make test-integration). The app services do not need
+      # it: the worker takes the address from render.remote_url in
+      # config.dev.yaml.
       <<: *go-common-env
       CHROMIUM_WS_URL: ws://172.28.100.14:9222
     volumes:
@@ -869,13 +901,15 @@ services:
       - ./var/incoming:/data/incoming
       - ./var/content:/data/content
     restart: "no"
-    # Healthcheck общего якоря здесь вечно красный: tools — sleep infinity,
-    # HTTP-сервера метрик в контейнере нет. Отключаем — иначе шум в dc ps
-    # и подвисший up --wait, если поднять профиль tools целиком (T-110).
+    # The shared anchor's healthcheck is perpetually red here: tools is
+    # sleep infinity, there is no metrics HTTP server in the container.
+    # Disabling it — otherwise noise in dc ps and a hung up --wait if the
+    # tools profile is brought up whole (T-110).
     healthcheck:
       disable: true
-    # Лимит выше, чем у сервисов: go vet/lint/test компилируют все пакеты
-    # модуля, включая тяжёлые зависимости (go-redis, chromedp, prometheus).
+    # A higher limit than the services': go vet/lint/test compile all the
+    # module's packages, including the heavy dependencies (go-redis,
+    # chromedp, prometheus).
     mem_limit: 2g
     profiles: ["tools"]
 

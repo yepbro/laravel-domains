@@ -1,46 +1,51 @@
-# Конфигурация воркера B — фолбэк-рендер на Chromium (ТЗР этапа 35 §4.5,
-# T-240): тот же бинарь render-worker другой сборкой конфигурации.
-# Отличия от боевого профиля config.render.yaml:
-#   - стрим потребления q:render-fallback и группа render-fallback-worker —
-#     переменная сборки RENDER_WORKER_STREAM=q:render-fallback в сервисе
-#     render-fallback (compose) / юните crawler-render-fallback-worker
-#     (systemd): стрим потребления — параметр сборки воркера, не поля
-#     конфигурации (ТЗ §4.1 п.3, T-236); группа — каноническая пара стрима
-#     queue.WorkingGroups, отдельно её не задают;
-#   - темп — render.fallback.worker_rate (ФТ-13): не больше записей за
-#     скользящее окно renderworker.RateWindow = 1 мин — батч-режим
-#     «собрать и доработать» без наращивания chromium-мощности; действует
-#     и при выключенном фолбэке (накопленное дорабатывается до пуста,
-#     ФТ-14).
-# Движок chromium, remote_url пуст — собственный процесс headless-shell
-# (сегодняшний render-образ, без изменений); адреса БД/очереди приходят
-# переменными окружения (APP_PG_DSN, CRAWLER_REDIS_ADDR — см. compose.yaml).
+# The worker B configuration — the Chromium fallback render (render spec
+# stage 35 §4.5, T-240): the same render-worker binary, a different
+# configuration build. Differences from the production profile
+# config.render.yaml:
+#   - the q:render-fallback consumption stream and the
+#     render-fallback-worker group — the
+#     RENDER_WORKER_STREAM=q:render-fallback build variable in the
+#     render-fallback service (compose) / the crawler-render-fallback-worker
+#     unit (systemd): the consumption stream is a worker build parameter,
+#     not a configuration field (spec §4.1 item 3, T-236); the group is the
+#     stream's canonical pair of queue.WorkingGroups, it is not set
+#     separately;
+#   - the pace — render.fallback.worker_rate (FR-13): no more entries than
+#     the renderworker.RateWindow = 1 min sliding window — the "collect and
+#     rework" batch mode without scaling up chromium capacity; it applies
+#     with the fallback disabled too (the accumulated backlog is reworked
+#     to empty, FR-14).
+# The engine is chromium, remote_url is empty — its own headless-shell
+# process (today's render image, no changes); the DB/queue addresses come
+# via environment variables (APP_PG_DSN, CRAWLER_REDIS_ADDR — see
+# compose.yaml).
 
 postgres:
-  dsn: "" # задаётся APP_PG_DSN из compose.yaml
+  dsn: "" # set by APP_PG_DSN from compose.yaml
 
 render:
-  # Воркер B всегда на chromium (ТЗ §4.5 п.1): дорабатывает движко-
-  # зависимые сбои основного движка — рекурсивный фолбэк запрещён (ФТ-10).
+  # Worker B is always on chromium (spec §4.5 item 1): it reworks the
+  # engine-dependent failures of the main engine — a recursive fallback is
+  # forbidden (FR-10).
   engine: chromium
-  remote_url: "" # собственный процесс headless-shell (боевой режим, Dockerfile.render)
-  contexts: 8 # как у основного render: слоты пула потолком темпа просто недогружаются
+  remote_url: "" # its own headless-shell process (production mode, Dockerfile.render)
+  contexts: 8 # like the main render: pool slots simply sit underloaded as the rate cap
   timeout: "25s"
   restart_every_pages: 500
-  # Порог перезапуска по RSS (T-065) — как у основного render: перезапуск
-  # до cgroup-OOM (бюджет ≈2 ГБ, ТЗ 3.2); обоснование — docs/render.md,
-  # раздел «Перезапуск браузера».
+  # The RSS restart threshold (T-065) — like the main render: a restart
+  # before cgroup-OOM (the budget ≈2 GB, spec 3.2); the rationale —
+  # docs/render.md, the "Browser restart" section.
   restart_memory_bytes: "1536MiB"
   fallback:
-    # Флаг публикации: воркеру B безразличен (publishFallback публикует
-    # только из стрима q:render — рекурсия запрещена, ФТ-10), здесь —
-    # документация контура: выключение фичи (ФТ-14) — флагом конфига
-    # ПЕРВИЧНОГО воркера, накопленное в q:render-fallback этот воркер
-    # доработает до пуста.
+    # The publication flag: worker B is indifferent to it (publishFallback
+    # publishes only from the q:render stream — recursion forbidden,
+    # FR-10); here it documents the circuit: disabling the feature (FR-14)
+    # is done by the flag of the PRIMARY worker's config, this worker will
+    # rework whatever accumulated in q:render-fallback to empty.
     enabled: true
-    # Потолок темпа — единственное поле, которым сборка B отличается
-    # поведенчески: записей за скользящее окно 1 мин (renderworker.
-    # RateWindow). Дефолт 100 ≈ полной мощности одного chromium
-    # (8 контекстов × ~5 с/страница ≈ 1,6 стр/с) — стартовое значение,
-    # калибруется стендовым прогоном (ТЗ §4.4 п.4).
+    # The rate cap — the only field by which the B build differs
+    # behaviorally: entries per the 1 min sliding window (renderworker.
+    # RateWindow). The default 100 ≈ the full capacity of one chromium
+    # (8 contexts × ~5 s/page ≈ 1.6 pages/s) — a starting value, calibrated
+    # by a bench run (spec §4.4 item 4).
     worker_rate: 100

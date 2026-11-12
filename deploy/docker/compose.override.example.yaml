@@ -1,17 +1,18 @@
-# Шаблон локальных переопределений compose.
-# Скопируйте в deploy/docker/compose.override.yaml (в .gitignore) и правьте
-# под себя. Файл подхватывается автоматически, если запускать compose из
-# каталога deploy/docker; при запуске через Makefile добавьте путь явно:
+# Template of local compose overrides.
+# Copy it to deploy/docker/compose.override.yaml (gitignored) and edit to
+# taste. The file is picked up automatically when compose runs from the
+# deploy/docker directory; when running via the Makefile, add the path
+# explicitly:
 #   make up COMPOSE="docker compose --project-directory . \
 #     -f deploy/docker/compose.yaml -f deploy/docker/compose.override.yaml \
 #     --env-file .env"
 #
-# Типовые примеры — раскомментируйте нужное.
+# Typical examples — uncomment what you need.
 
 services:
 
-  # Отладка выбранного сервиса под delve (make debug SERVICE=dns-worker):
-  # сервис пересобирается и стартует под отладчиком на 127.0.0.1:2345.
+  # Debugging a chosen service under delve (make debug SERVICE=dns-worker):
+  # the service is rebuilt and starts under the debugger on 127.0.0.1:2345.
   dns-worker:
     environment:
       SERVICE: dns-worker
@@ -26,14 +27,14 @@ services:
       - --listen=0.0.0.0:2345
       - --api-version=2
       - --accept-multiclient
-    # под отладчиком перезапускать по падению не нужно
+    # under the debugger there is no need to restart on failure
     restart: "no"
 
-  # Уменьшение лимитов для слабой машины:
+  # Lower limits for a weak machine:
   # postgres:
   #   mem_limit: 768m
 
-  # Проброс дополнительных портов:
+  # Publishing additional ports:
   # http-worker:
   #   ports:
   #     - "127.0.0.1:9104:9104"

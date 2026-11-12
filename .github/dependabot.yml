@@ -1,6 +1,6 @@
-# Dependabot: обновления GitHub Actions и Go-зависимостей.
-# Версии базовых docker-образов dependabot не ведёт: они фиксируются
-# через ARG в Dockerfile'ах и переменные в .env.example (см. deploy/docker/).
+# Dependabot: GitHub Actions and Go dependency updates.
+# Dependabot does not track base docker image versions: they are pinned
+# via ARG in the Dockerfiles and by variables in .env.example (see deploy/docker/).
 version: 2
 updates:
   - package-ecosystem: github-actions
@@ -19,9 +19,9 @@ updates:
     schedule:
       interval: weekly
       day: monday
-    # Только прямые зависимости: косвенные подтянутся вместе с ними.
-    # Директиву go поднимать нельзя: версия Go фиксируется целиком
-    # в .env (GO_VERSION) и Dockerfile'ах.
+    # Only direct dependencies: indirect ones come along with them.
+    # The go directive must not be bumped: the Go version is pinned wholesale
+    # in .env (GO_VERSION) and in the Dockerfiles.
     allow:
       - dependency-type: direct
     groups:

@@ -1,346 +1,367 @@
-# Пример конфигурации сервисов Domain Crawler (ТЗ 5.10 основного ТЗ).
-# Скопируйте в config.yaml рядом с бинарниками (или укажите путь
-# переменной окружения CRAWLER_CONFIG):
+# Example configuration of the Domain Crawler services (spec 5.10 of the
+# main spec). Copy it to config.yaml next to the binaries (or set the path
+# via the CRAWLER_CONFIG environment variable):
 #
 #   cp config.example.yaml config.yaml
 #
-# Приоритет значений: переменные окружения > этот файл > значения по
-# умолчанию. Полный список переменных и правила валидации — docs/configuration.md.
+# Value priority: environment variables > this file > the defaults. The
+# full variable list and validation rules — docs/configuration.md.
 
 postgres:
   dsn: "postgres://crawler:PASSWORD@127.0.0.1:5432/crawler?sslmode=disable"
-  # pool_size задаётся НА ОДИН сервис, а рекомендация ТЗ (20–50) — бюджет
-  # СУММАРНО на все: 8 сервисов × 5 + dashboard (2 — задаёт его юнит;
-  # глобальная переменная ниже его переопределит) + crawlerctl (2) +
-  # админ ≈ 44–46 при max_connections=50 (3 слота резервирует superuser)
-  # — docs/db.md, «Бюджет соединений». Менять — только с пересчётом суммы.
+  # pool_size is set PER SERVICE, while the spec recommendation (20–50) is
+  # a budget for ALL services combined: 8 services × 5 + dashboard (2 — its
+  # unit sets it; the global variable below would override it) +
+  # crawlerctl (2) + admin ≈ 44–46 at max_connections=50 (superuser
+  # reserves 3 slots) — docs/db.md, "Connection budget". Change it only
+  # with a recount of the total.
   pool_size: 5
 
 redis:
   addr: "127.0.0.1:6379"
-  # maxlen — явный предел длины всех стримов (XADD MAXLEN ~);
-  # 0 — пределы по стримам по умолчанию, пересчитаны по замерам T-141
-  # под бюджет Redis ≤ 0,5 ГБ (docs/redis.md §3.1): q:dns 250 пачек
-  # (запись ≈ 64 КиБ на 1000 доменов, замер), штучные
-  # q:http/q:render/q:analyze 150 000 (записи 0,3–0,7 КиБ), q:dead
-  # 10 000 (записи без payload, байтовый потолок единицы МБ)
+  # maxlen — an explicit length limit for all streams (XADD MAXLEN ~);
+  # 0 — the per-stream defaults, recalculated from the T-141 measurements
+  # for a Redis budget ≤ 0.5 GB (docs/redis.md §3.1): q:dns 250 chunks
+  # (an entry ≈ 64 KiB per 1000 domains, measured), the per-item
+  # q:http/q:render/q:analyze 150,000 (entries 0.3–0.7 KiB), q:dead
+  # 10,000 (entries without payload, a byte cap of a few MB)
   maxlen: 0
-  max_attempts: 3                   # доставок задачи до перевода в q:dead (ТЗ 4.2)
-  claim_min_idle: "10m"             # простой pending-записи до возврата клеймом XAUTOCLAIM (окно удержания воркера)
-  # Темп возврата зависших (T-153): RecoverLoop клеймит recover_batch
-  # записей за проход раз в recover_interval (полная пачка — без паузы);
-  # время самовосстановления PEL ≈ размер PEL / (batch/interval).
-  # Инвариант: batch × худшее время записи этапа (рендер, timeout 15 с)
-  # < claim_min_idle, иначе хвост пачки перклеймится и жжёт попытки;
-  # дефолт 64: типовой рендер ~5 с × 64 ≈ 5,3 мин < 10 мин (запас ×1,9).
-  # Поднимая batch (до 256 в инцидентах), пропорционально поднимайте
-  # claim_min_idle — docs/configuration.md, раздел redis.
+  max_attempts: 3                   # task deliveries before moving to q:dead (spec 4.2)
+  claim_min_idle: "10m"             # pending-entry idle time before an XAUTOCLAIM re-claim (the worker's lease window)
+  # The pace of returning stuck entries (T-153): RecoverLoop claims
+  # recover_batch entries per pass every recover_interval (a full chunk —
+  # no pause); the PEL self-recovery time ≈ PEL size / (batch/interval).
+  # Invariant: batch × the worst stage-entry time (render, timeout 15 s)
+  # < claim_min_idle, otherwise the tail of the chunk gets re-claimed and
+  # burns attempts; the default 64: a typical render ~5 s × 64 ≈ 5.3 min
+  # < 10 min (×1.9 headroom). When raising batch (up to 256 in incidents),
+  # raise claim_min_idle proportionally — docs/configuration.md, the redis
+  # section.
   recover_batch: 64
-  recover_interval: "30s"           # период опроса зависших при неполной пачке (1s..1h)
-  trim_interval: "1m"               # период XTRIM MINID: освобождение подтверждённого префикса стримов (T-141; 1s..24h)
-  # consumer_idle — порог неактивности консьюмера группы для чистки
-  # (T-155): после рестартов воркеров их pid-консьюмеры остаются в группах
-  # навсегда; цикл scheduler удаляет XGROUP DELCONSUMER строго пустых
-  # (pending = 0) и неактивных дольше порога — тем же темпом, что
-  # trim_interval. Консьюмеры с pending не трогаются никогда
-  # (DELCONSUMER с pending теряет их PEL — недоставка навсегда).
-  consumer_idle: "2h"               # порог неактивности пустого консьюмера до удаления из группы (1m..30d)
+  recover_interval: "30s"           # poll period for stuck entries when the chunk is partial (1s..1h)
+  trim_interval: "1m"               # the XTRIM MINID period: releasing the confirmed stream prefix (T-141; 1s..24h)
+  # consumer_idle — the consumer inactivity threshold for cleanup (T-155):
+  # after worker restarts their pid consumers stay in the groups forever;
+  # the scheduler loop removes with XGROUP DELCONSUMER only strictly empty
+  # (pending = 0) consumers inactive longer than the threshold — at the
+  # same pace as trim_interval. Consumers with pending entries are never
+  # touched (DELCONSUMER with pending loses their PEL — undelivered
+  # forever).
+  consumer_idle: "2h"               # the idle threshold for an empty consumer before removal from the group (1m..30d)
 
 ingest:
-  dir: "/data/incoming"              # наблюдаемая папка: <зона>/add|delete/*.txt и архивы
-  batch_size: 50000                  # строк на одну пачку COPY
-  stable_seconds: 10                 # размер/mtime файла должны быть стабильны
-  scan_interval: "30s"               # полный обход папки как страховка fsnotify
-  max_error_ratio: 0.1               # доля отклонённых строк, выше которой файл ошибочен
-  # Лимиты приёма архивов (.zip/.tar/.tar.gz/.tgz/.gz, T-133) — защита от
-  # zip-бомб; превышение — архив целиком в failed/ с лог-отчётом.
-  archive_max_uncompressed: "8GiB"   # потолок суммарного несжатого объёма членов
-                                     # (несжатая зона .com ≈ 1,5 ГБ — с запасом)
-  archive_max_files: 1000            # потолок числа записей архива
-  # Allowlist многоуровневых зон каталогов приёма: рабочие каталоги —
-  # только TLD (incoming/<tld>/add|delete/), каталог с точкой в имени
-  # зоны (incoming/<зона с точкой>/) допустим лишь из этого списка —
-  # тестовые зоны testbed (пример — crawl.test), которым TLD-семантика
-  # запрещает быть «зоной пути». Файл вне списка — ошибка уровня файла
-  # (failed/, строки не разбираются). Продуктовое значение — пусто.
+  dir: "/data/incoming"              # the watched directory: <zone>/add|delete/*.txt and archives
+  batch_size: 50000                  # lines per COPY chunk
+  stable_seconds: 10                 # the file size/mtime must stay stable
+  scan_interval: "30s"               # a full directory walk as the fsnotify guard
+  max_error_ratio: 0.1               # the share of rejected lines above which the file is invalid
+  # Archive ingest limits (.zip/.tar/.tar.gz/.tgz/.gz, T-133) — protection
+  # against zip bombs; an overrun puts the whole archive into failed/ with
+  # a log report.
+  archive_max_uncompressed: "8GiB"   # a cap on the total uncompressed size of the members
+                                     # (the uncompressed .com zone ≈ 1.5 GB — with headroom)
+  archive_max_files: 1000            # a cap on the number of archive entries
+  # Allowlist of multi-level ingest directory zones: the working
+  # directories are TLD-only (incoming/<tld>/add|delete/), a directory with
+  # a dot in the zone name (incoming/<dotted zone>/) is allowed only from
+  # this list — testbed test zones (an example — crawl.test), which the
+  # TLD semantics forbids from being a "path zone". A file outside the list
+  # is a file-level error (failed/, the lines are not parsed). The
+  # production value is empty.
   allowed_zone_paths: []
 
 scheduler:
-  recheck_interval: "4380h"          # ≈ 6 месяцев (done → pending)
-  batch_size: 1000                  # норматив ТЗ 1000–10000; 1000 = замеренная пачка ≈ 64 КиБ (бюджет Redis, T-141)
-  queue_high_watermark: 100000       # backpressure: выше порога задачи не публикуются (ворота ёмкости q:render — отдельный render.queue_high_watermark, T-174)
-  lease: "30m"                       # срок аренды queued-домена
-  temp_error_retry_after: "24h"      # повтор temp_error
-  temp_error_max_retries: 3          # максимум повторов подряд, далее итоговый статус
-  # Период gauge глубины backlog (T-077): суммы инкрементальных
-  # счётчиков зон (T-178) — чтение справочника, миллисекунды; период
-  # задаёт свежесть gauge дашборда, не нагрузку. Дефолт 5 минут,
-  # коридор 30s..1h; 30–60 с коридора ТЗ 5.9 — для малых корпусов.
+  recheck_interval: "4380h"          # ≈ 6 months (done → pending)
+  batch_size: 1000                  # the spec norm 1000–10000; 1000 = a measured chunk ≈ 64 KiB (the Redis budget, T-141)
+  queue_high_watermark: 100000       # backpressure: above the threshold tasks are not published (the q:render capacity gate — a separate render.queue_high_watermark, T-174)
+  lease: "30m"                       # the lease term of a queued domain
+  temp_error_retry_after: "24h"      # the temp_error retry
+  temp_error_max_retries: 3          # the maximum retries in a row, then the final status
+  # The backlog depth gauge period (T-077): sums of the zones' incremental
+  # counters (T-178) — a reference-table read, milliseconds; the period
+  # sets the dashboard gauge freshness, not the load. The default 5
+  # minutes, range 30s..1h; the 30–60 s of the spec 5.9 range is for small
+  # corpora.
   backlog_interval: "5m"
-  # Веса зон кругового выбора (ТЗ 5.3: «веса зон — опционально»): имя зоны —
-  # TLD (punycode, как в справочнике zones; IDN — xn--p1ai) → вес 1..1000;
-  # доля зоны в пачке пропорциональна весу. Отсутствие карты — равный
-  # круговой порядок. Имени может не быть в справочнике (зону создаёт
-  # ingest первым файлом) — Warn, зона проверяется с весом 1.
+  # Zone weights of the round-robin selection (spec 5.3: "zone weights are
+  # optional"): the zone name is a TLD (punycode, as in the zones reference
+  # table; IDN — xn--p1ai) → weight 1..1000; the zone's share of a chunk is
+  # proportional to the weight. No map — an equal round-robin order. The
+  # name may be missing from the reference table (ingest creates the zone
+  # with its first file) — a Warn, the zone is checked with weight 1.
   # zone_weights:
   #   com: 5
   #   xn--p1ai: 2
 
 dns:
-  resolvers: ["127.0.0.1:53"]        # локальный unbound
-  fallback_resolvers: ["1.1.1.1:53", "9.9.9.9:53"]   # резерв: переключение на каждый обмен при транспортном отказе локального (T-107)
-  concurrency: 2000                  # потолок одновременных обменов (лимитёр T-035)
-  max_qps: 10000                     # средний темп; всплески до concurrency подряд
-  ipv6: true                         # false — AAAA отвечаются локально (пустой NOERROR, без сети)
-  timeout: "2s"                      # таймаут одной UDP-попытки (internal/dnsclient)
-  tcp_timeout: "5s"                  # таймаут TCP-fallback при усечении (TC=1)
-  retries: 2                         # повторы сверх первой попытки (таймаут/сеть)
-  retry_delay: "200ms"               # пауза между попытками
-  udp_pool_size: 2000                # пул UDP-сокетов; обычно = concurrency
+  resolvers: ["127.0.0.1:53"]        # the local unbound
+  fallback_resolvers: ["1.1.1.1:53", "9.9.9.9:53"]   # the reserve: a per-exchange switch on a transport failure of the local one (T-107)
+  concurrency: 2000                  # the cap on concurrent exchanges (the T-035 limiter)
+  max_qps: 10000                     # the average rate; bursts up to concurrency in a row
+  ipv6: true                         # false — AAAA is answered locally (an empty NOERROR, no network)
+  timeout: "2s"                      # the timeout of a single UDP attempt (internal/dnsclient)
+  tcp_timeout: "5s"                  # the TCP-fallback timeout on truncation (TC=1)
+  retries: 2                         # retries beyond the first attempt (timeout/network)
+  retry_delay: "200ms"               # the pause between attempts
+  udp_pool_size: 2000                # the UDP socket pool; usually = concurrency
 
 http:
-  concurrency: 2000                  # транспорт: глобальный потолок одновременных соединений (T-049)
-  per_ip_limit: 4                    # рекомендация ТЗ: 3–4 соединения на IP
-  # Повышенные лимиты per-IP для префиксов парковщиков (T-165): карта
-  # «CIDR → лимит», матчинг диалимого IP по самому длинному совпавшему
-  # префиксу (longest-prefix); одна сеть дважды не валидна
-  # («195.208.0.0/16» и «195.208.9.9/16» — одна сеть). Мотивация:
-  # head-of-line парковочных IP (T-092 §3) — миллионы доменов com/xyz
-  # на IP парковщиков, per_ip_limit 4 при FIFO растягивает задачи к 20 с.
-  # Материал для выбора префиксов — гистограмма ожидания слота
-  # crawler_http_per_ip_wait_seconds (:9104): доля ожиданий > 2 с
-  # (корзина le=2) ≥ 5% на смеси боя — вот когда override оправдан.
-  # Лимиты 1..64 (диапазон per_ip_limit), параллелизм в любом случае
-  # ограничен http.concurrency. Отсутствие карты — один per_ip_limit
-  # на все IP (прежнее поведение). Env:
+  concurrency: 2000                  # transport: the global cap on concurrent connections (T-049)
+  per_ip_limit: 4                    # the spec recommendation: 3–4 connections per IP
+  # Elevated per-IP limits for parker prefixes (T-165): a "CIDR → limit"
+  # map, matching the dialed IP by the longest matching prefix
+  # (longest-prefix); the same network twice is invalid ("195.208.0.0/16"
+  # and "195.208.9.9/16" are one network). Motivation: head-of-line of the
+  # parking IPs (T-092 §3) — millions of com/xyz domains on parker IPs,
+  # per_ip_limit 4 with FIFO stretches tasks to 20 s. Material for picking
+  # prefixes — the crawler_http_per_ip_wait_seconds slot-wait histogram
+  # (:9104): the share of waits > 2 s (the le=2 bucket) ≥ 5% on the
+  # production mix — that is when an override is justified. The limits are
+  # 1..64 (the per_ip_limit range), the parallelism is bounded by
+  # http.concurrency anyway. No map — a single per_ip_limit for all IPs
+  # (the previous behavior). Env:
   #   CRAWLER_HTTP_PER_IP_OVERRIDES=195.208.0.0/16=12,2a02:6b8::/32=8
   # per_ip_overrides:
   #   "195.208.0.0/16": 12
   #   "2a02:6b8::/32": 8
   connect_timeout: "5s"
-  tls_handshake_timeout: "5s"          # TLS-рукопожатие (таблица лимитов ТЗ 5.5)
+  tls_handshake_timeout: "5s"          # the TLS handshake (the spec 5.5 limits table)
   header_timeout: "10s"
   total_timeout: "20s"
   max_redirects: 8
   max_body_bytes: 2097152            # 2 MiB
-  min_body_speed: 2048               # мин. скорость тела после первого байта, байт/с — тарпиты (ТЗ 5.5)
-  max_rps: 1000                      # глобальный темп запросов (RPS); всплески до concurrency
-  # SSRF-контур (T-219): фильтровать внутренние адреса (loopback/RFC1918/
-  # ULA/link-local, включая IPv4-в-IPv6) на всех путях — адреса DNS-этапа,
-  # редиректы, литералы и запросы рендера; перехват рендера резолвит и
-  # произвольные имена-хосты (T-230) — DNS-rebinding во времени (имя
-  # публичное на HTTP-этапе, внутреннее к моменту рендера) отклоняется в
-  # самом Chromium; остаточный вектор (различение атакующим двух резолвов)
-  # держит egress-политика контейнера Chromium. Пример боевого деплоя
-  # несёт true: для Internet-эксплуатации обязателен (рядом с краулером
-  # в сети живут БД, Redis, resolver); выключать false — только осознанно
-  # для dev/testbed со внутренними сетями (172.28.100.0/24). Дефолт
-  # кода — false.
+  min_body_speed: 2048               # the min body speed after the first byte, bytes/s — tarpits (spec 5.5)
+  max_rps: 1000                      # the global request rate (RPS); bursts up to concurrency
+  # SSRF guard (T-219): filter internal addresses (loopback/RFC1918/ULA/
+  # link-local, including IPv4-in-IPv6) on all paths — DNS-stage addresses,
+  # redirects, literals and render requests; the render interception also
+  # resolves arbitrary hostnames (T-230) — time-based DNS rebinding (a name
+  # public at the HTTP stage, internal by render time) is rejected by
+  # Chromium itself; the residual vector (the attacker distinguishing the
+  # two resolutions) is held by the egress policy of the Chromium
+  # container. The production deploy example carries true: it is a must for
+  # Internet operation (databases, Redis and a resolver live on the network
+  # next to the crawler); switching it to false — only deliberately, for a
+  # dev/testbed with internal networks (172.28.100.0/24). The code default
+  # is false.
   block_internal_addrs: true
-  user_agent: "DomainCrawler/1.0 (+https://example.example/contact; admin@example.example)"  # честный UA с контактами — обязателен; подставьте реальные контакты оператора (ТЗ §9)
-  # Задачный параллелизм цикла http-worker (T-139; не транспорт!):
-  # потребление q:http скользящее — следующее чтение при освобождении
-  # слота задачи, окно чтения параллелизм не ограничивает. Дефолт 192
-  # (T-157; прежний 256 — замеры T-092/§11: 47.6 дом/с): сутки на 256 —
-  # два фатала юнита (§12: 05:48 OOM-kill, 09:17 пик 900.5 MiB =
-  # MemoryMax; MemoryHigh 850M — 120 095 reclaim-событий), 192 слота
-  # устойчивы (пропитка волны 21: 860–893 MiB, oom=0, NRestarts=0;
-  # скорость ≈17–19 дом/с). Замеры сделаны до раннего Put T-147 (тела
-  # больше не удерживаются до конца задачи); T-163 добавил метрики
-  # замера слота (crawler_http_tasks_inflight, crawler_http_body_bytes_
-  # inflight, crawler_http_body_bytes на :9104) и мягкий потолок кучи
-  # (mem_limit ниже) — возврат 256 по замеру сэмплером после деплоя;
-  # память = task_concurrency × (метаданные задачи + транзитные буферы
-  # ≤ task_per_domain × max_body_bytes), поднимайте task_concurrency
-  # только с пересчётом этого бюджета.
-  task_concurrency: 192              # одновременных задач q:http (доменов) в цикле воркера
-  task_consume: 16                   # записей за одно чтение: пачка XREADGROUP + буфер предвыборки; столько же неудач подряд — порог предохранителя паузы
-  task_per_domain: 8                 # параллельных проверок (субдомен × протокол) внутри задачи домена
-  # Dead-host cutoff (T-164): apex и www, не прошедшие connect-фазу
-  # (connection refused или connect-таймаут по ОБОИМ протоколам),
-  # завершают задачу без проверки остальных субдоменов — мёртвые хосты
-  # массовых зон перестают жечь слоты таймаутным хвостом (замер §12
-  # docs/load-measurements.md: mean 11.5 с при транспорте 0.54 с/запрос,
-  # 60% задач в бакете 10–30 с). Записи пропущенных субдоменов — по §8
-  # («нет ответа»: записей нет), признак — бит dead_host_cutoff в
-  # domains.flags и метрики crawler_http_dead_host_cutoff_* (:9104) — по
-  # ним строится контрольная выборка ложных cutoff (критерий < 1%).
-  # Дефолт true: сигнатура строгая (оба главных хоста × оба протокола ×
-  # только connect-фаза); connect-таймауты дают temp_error и перепроверку
-  # T-031 (ложный cutoff самозалечивается). false — прежнее поведение.
+  user_agent: "DomainCrawler/1.0 (+https://example.example/contact; admin@example.example)"  # an honest UA with contacts — a must; substitute the operator's real contacts (spec §9)
+  # The task parallelism of the http-worker loop (T-139; not transport!):
+  # the q:http consumption is sliding — the next read happens when a task
+  # slot frees up, the read window is not bounded by the parallelism. The
+  # default 192 (T-157; the previous 256 — the T-092/§11 measurements:
+  # 47.6 domains/s): a day at 256 — two unit fatals (§12: 05:48 OOM-kill,
+  # 09:17 a 900.5 MiB peak = MemoryMax; MemoryHigh 850M — 120,095 reclaim
+  # events), 192 slots are stable (the wave 21 soak: 860–893 MiB, oom=0,
+  # NRestarts=0; the rate ≈17–19 domains/s). The measurements were taken
+  # before the early Put of T-147 (bodies are no longer held until the end
+  # of the task); T-163 added slot measurement metrics
+  # (crawler_http_tasks_inflight, crawler_http_body_bytes_inflight,
+  # crawler_http_body_bytes on :9104) and a soft heap cap (mem_limit
+  # below) — return to 256 after measuring with the sampler post-deploy;
+  # memory = task_concurrency × (task metadata + transit buffers
+  # ≤ task_per_domain × max_body_bytes), raise task_concurrency only with
+  # a recount of this budget.
+  task_concurrency: 192              # concurrent q:http tasks (domains) in the worker loop
+  task_consume: 16                   # entries per read: an XREADGROUP chunk + the prefetch buffer; as many failures in a row — the pause fuse threshold
+  task_per_domain: 8                 # parallel checks (subdomain × protocol) inside a domain task
+  # Dead-host cutoff (T-164): apex and www that do not get through the
+  # connect phase (connection refused or a connect timeout on BOTH
+  # protocols) finish the task without checking the remaining subdomains —
+  # the dead hosts of bulk zones stop burning slots with a timeout tail
+  # (the §12 measurement, docs/load-measurements.md: mean 11.5 s at a
+  # transport of 0.54 s/request, 60% of tasks in the 10–30 s bucket). The
+  # entries of skipped subdomains — per §8 ("no answer": no entries), the
+  # marker is the dead_host_cutoff bit in domains.flags and the
+  # crawler_http_dead_host_cutoff_* metrics (:9104) — they build the
+  # control sample of false cutoffs (the criterion < 1%). The default true:
+  # the signature is strict (both main hosts × both protocols × the connect
+  # phase only); connect timeouts yield a temp_error and a recheck per
+  # T-031 (a false cutoff self-heals). false — the previous behavior.
   dead_host_cutoff: true
-  # Мягкий потолок памяти Go-рантайма http-worker (T-163,
-  # debug.SetMemoryLimit): у порога GC сам возвращает страницы ОС —
-  # вместо reclaim-штормов ядра на MemoryHigh и OOM-kill на MemoryMax
-  # (фаталы T-157). Page cache записи паков в учёт не входит — держите
-  # ниже MemoryHigh юнита с запасом (дефолт 768 MiB против 850M/900M;
-  # юнит — deploy/systemd/crawler-http-worker.service). Живая куча выше
-  # потолка не роняет процесс: GC до 50% CPU (замедление, не смерть).
-  # 0 — выключено.
-  mem_limit: "768MiB"                  # мягкий потолок кучи Go-рантайма http-worker
+  # A soft memory cap of the http-worker Go runtime (T-163,
+  # debug.SetMemoryLimit): near the threshold the GC returns pages to the
+  # OS itself — instead of kernel reclaim storms at MemoryHigh and
+  # OOM-kill at MemoryMax (the T-157 fatals). The page cache of pack
+  # writing is not counted — keep it below the unit's MemoryHigh with
+  # headroom (the default 768 MiB vs 850M/900M; the unit —
+  # deploy/systemd/crawler-http-worker.service). A live heap above the cap
+  # does not kill the process: the GC up to 50% CPU (a slowdown, not
+  # death). 0 — disabled.
+  mem_limit: "768MiB"                  # the soft heap cap of the http-worker Go runtime
 
 render:
-  # Движок рендера: chromium (умолчание) | moli | lightpanda.
-  # chromium — сегодняшнее поведение: собственный headless-shell в бою
-  # или внешний CDP dev-стека (remote_url). moli/lightpanda — внешний
-  # CDP-сервер: remote_url обязателен, restart_memory_bytes — 0 (RSS
-  # чужого процесса недоступен); контейнер движка поднимает
-  # инфраструктура, ядро рендера движок не различает.
+  # The render engine: chromium (the default) | moli | lightpanda.
+  # chromium — today's behavior: its own headless-shell in production or
+  # the external CDP of the dev stack (remote_url). moli/lightpanda — an
+  # external CDP server: remote_url is required, restart_memory_bytes — 0
+  # (the foreign process's RSS is unavailable); the engine container is
+  # brought up by the infrastructure, the render core does not distinguish
+  # engines.
   engine: chromium
-  # remote_url — расширение dev-окружения: внешний Chromium по CDP.
-  # В боевом режиме воркер запускает браузер сам, оставьте пустым.
+  # remote_url — a dev-environment extension: an external Chromium over
+  # CDP. In production mode the worker starts the browser itself, leave it
+  # empty.
   remote_url: ""
-  # Параллельные страницы Chromium (слоты пула). Значение привязано к
-  # железу: замер 24.10 на проде (4 ядра) — 8 контекстов давали load
-  # 16.5 и CPU-голод (страницы не успевали — таймауты), 4 — тот же
-  # полезный темп (~65 зад/мин) при load ~12.6. 8 (T-169) — для машин
-  # с запасом ядер: спрос при свободном гейте ≈1,2 стр/с (замер §12,
-  # docs/load-measurements.md), ёмкость 4 контекстов ≈0,8 стр/с
-  # (5,1 с/страница, T-092 §4). Память Chromium растёт сублинейно:
-  # RSS при 4 контекстах ~550 МБ, порог перезапуска
-  # restart_memory_bytes 1,5 ГиБ и cgroup ≈2 ГБ (ТЗ 3.2); потолок
-  # одного Chromium — второй Chromium (:9223) и второй render-worker
-  # (deploy.md §2.2).
+  # Concurrent Chromium pages (the pool slots). The value is tied to the
+  # hardware: the Oct 24 measurement on prod (4 cores) — 8 contexts gave a
+  # load of 16.5 and CPU starvation (the pages did not finish — timeouts),
+  # 4 — the same useful pace (~65 tasks/min) at a load of ~12.6. 8 (T-169)
+  # — for machines with core headroom: the demand at a free gate ≈1.2
+  # pages/s (the §12 measurement, docs/load-measurements.md), the capacity
+  # of 4 contexts ≈0.8 pages/s (5.1 s/page, T-092 §4). Chromium memory
+  # grows sublinearly: the RSS at 4 contexts ~550 MB, the restart threshold
+  # restart_memory_bytes 1.5 GiB and cgroup ≈2 GB (spec 3.2); scaling
+  # beyond one Chromium — a second Chromium (:9223) and a second
+  # render-worker (deploy.md §2.2).
   contexts: 4
-  # Ступень 2 T-169 (значение прода с 23.10): хвост успешных рендеров
-  # >15 с — 13% (<20% критерия, гистограмма :9105); тарпит-финализация
-  # теперь timeout_attempts × 15 с. 25 с — если хвост тяжелее критерия
-  # и редкие сверхтяжёлые страницы важнее коротких тарпитов.
+  # Step 2 of T-169 (the prod value since Oct 23): the tail of successful
+  # renders >15 s — 13% (<20% of the criterion, the :9105 histogram);
+  # tarpit finalization is now timeout_attempts × 15 s. 25 s — if the tail
+  # is heavier than the criterion and the rare super-heavy pages matter
+  # more than short tarpits.
   timeout: "15s"
-  # Тарпит-бюджет рендера (T-148): сколько доставок задачи могут завершиться
-  # таймаутом страницы (timeout), прежде чем запись финализируется БЕЗ
-  # рендера — итогом остаётся сырой HTML HTTP-фазы (rendered = false),
-  # запись уходит в q:analyze, доставка подтверждается. Тяжёлая страница
-  # не падает в q:dead и не жжёт попытки как случайная ошибка; q:dead —
-  # только инфраструктурным ошибкам (БД, браузер, публикация). Обязан
-  # быть не выше redis.max_attempts (проверяется валидацией).
-  # С 24.10 на проде 1: при 2 тарпит-запись между попытками ждала
-  # claim_min_idle 10 мин (XAUTOCLAIM), сжигая слот-время воркера на
-  # перепопытки; 1 — финализация с первого таймаута. 2 — если тяжёлым
-  # страницам нужен шанс на повторе в изменившихся условиях.
+  # The render tarpit budget (T-148): how many task deliveries may end
+  # with a page timeout (timeout) before the entry is finalized WITHOUT a
+  # render — the raw HTML of the HTTP phase remains the outcome
+  # (rendered = false), the entry goes to q:analyze, the delivery is
+  # acknowledged. A heavy page does not fall into q:dead and does not burn
+  # attempts as a random error; q:dead — for infrastructure errors only
+  # (the DB, the browser, publishing). It must not exceed
+  # redis.max_attempts (checked by validation).
+  # Since Oct 24 the prod value is 1: at 2 a tarpit entry waited
+  # claim_min_idle 10 min between attempts (XAUTOCLAIM), burning worker
+  # slot-time on re-attempts; 1 — finalization at the first timeout. 2 —
+  # if heavy pages need a second chance under changed conditions.
   timeout_attempts: 1
   restart_every_pages: 500
-  # Порог перезапуска браузера по памяти: суммарный RSS процессов Chromium
-  # (боевой режим) ≥ порога → перезапуск до cgroup-OOM; 0 — отключить.
-  # Ниже лимита контейнера (бюджет Chromium ≈ 2 ГБ, ТЗ 3.2). При 8
-  # контекстах порог не поднимается (T-169): запас 512 МиБ покрывает рост
-  # RSS страниц в полёте между проверками (раз в задачу); проживание у
-  # порога — насыщение одного Chromium (ответ — второй Chromium :9223,
-  # deploy.md §2.2, не подъём порога).
+  # The browser restart threshold by memory: the total RSS of the Chromium
+  # processes (production mode) ≥ the threshold → a restart before
+  # cgroup-OOM; 0 — disable. Below the container limit (the Chromium budget
+  # ≈ 2 GB, spec 3.2). At 8 contexts the threshold is not raised (T-169):
+  # the 512 MiB headroom covers RSS growth of in-flight pages between
+  # checks (once per task); a sustained residency at the threshold — one
+  # Chromium saturated (the answer is a second Chromium :9223, deploy.md
+  # §2.2, not a threshold raise).
   restart_memory_bytes: "1536MiB"
-  # Блокировка CSS в рендер-контексте (T-213): при true перечень
-  # блокируемых типов (Image/Media/Font, T-062 — 91% веса страницы)
-  # пополняется Stylesheet — оставшиеся 5–10% байт плюс style/layout CPU.
-  # Дефолт false — осознанное решение: у редких сайтов JS читает
-  # computed styles/media queries, на не-применённых стилях итоговый DOM
-  # (и вердикты детекции) мог бы отличаться. Включать только после A/B
-  # на проде: диф сигнатур Laravel до/после на одинаковой выборке
-  # (критерий — доля расхождений детекции <1%) и темп не хуже.
+  # CSS blocking in the render context (T-213): when true, the list of
+  # blocked types (Image/Media/Font, T-062 — 91% of the page weight) is
+  # extended with Stylesheet — the remaining 5–10% of bytes plus
+  # style/layout CPU. The default false — a deliberate decision: on rare
+  # sites JS reads computed styles/media queries, and on unapplied styles
+  # the final DOM (and the detection verdicts) might differ. Enable only
+  # after an A/B on prod: a diff of the Laravel signatures before/after on
+  # the same sample (the criterion — the detection mismatch share <1%) and
+  # no worse pace.
   block_stylesheet: false
-  # Блокировка доменов веб-аналитики/телеметрии в рендер-контексте
-  # (T-214): Google Analytics, GTM, DoubleClick, Яндекс Метрика, Hotjar
-  # и пр. (список и принцип выбора — internal/render/block.go и
-  # docs/render.md). Аналитика ходит Script/XHR — по типам не ловится,
-  # а режет трафик (5–15 запросов, 100–500 КБ на страницу) и CPU
-  # таймеров трекеров. Дефолт true — трекеры не участвуют в детекции
-  # Laravel (сигнатуры — контент и скрипты самого сайта), свой домен
-  # и пути с похожей подстрокой не задеты (точная хостовая проверка);
-  # контроль после включения — метрики этапа (темп/успешность рендера
-  # не хуже текущих).
+  # Blocking web-analytics/telemetry domains in the render context
+  # (T-214): Google Analytics, GTM, DoubleClick, Yandex Metrika, Hotjar
+  # etc. (the list and the selection principle — internal/render/block.go
+  # and docs/render.md). Analytics goes over Script/XHR — not caught by
+  # types, but it cuts traffic (5–15 requests, 100–500 KB per page) and
+  # burns tracker timer CPU. The default true — trackers do not take part
+  # in Laravel detection (the signatures are the site's own content and
+  # scripts), one's own domain and paths with a similar substring are not
+  # affected (an exact host check); the post-enablement control — the
+  # stage metrics (the render pace/success no worse than current).
   block_tracker_domains: true
-  # Ворота ёмкости q:render (T-174): глубина стрима (backlog группы
-  # потребления) ≥ порога — SPA-записи не публикуются, домен получает
-  # флаг render_pending той же транзакцией результата (доработается
-  # проходом позже — задачи не теряются); ниже порога — публикация как
-  # обычно. Отдельный порог, а не общий scheduler.queue_high_watermark:
-  # при клампе T-168 (min(lag, XLEN)+pending) общий порог 100 тыс.
-  # держал ворота открытыми при лаге 98,4 тыс. — приток равнялся
-  # потреблению (равновесие 24.10), дренаж долга нулевой. Дефолт
-  # 10 тыс. ≈ 2 ч буфера потребления (замер 24.10: ≈5,1 тыс. задач/ч):
-  # закрывает ворота на текущем долге и возвращает гистерезис
-  # «дренируем — впускаем». Эффективное значение — с клампом
-  # min(watermark, MAXLEN/2), как у гейта публикации (при дефолте не
-  # активен: 10 тыс. < 75 тыс.). 0 — общий
+  # The q:render capacity gate (T-174): the stream depth (the consuming
+  # group's backlog) ≥ the threshold — SPA entries are not published, the
+  # domain gets the render_pending flag in the same result transaction
+  # (reworked by a pass later — tasks are not lost); below the threshold —
+  # publishing as usual. A separate threshold, not the shared
+  # scheduler.queue_high_watermark: with the T-168 clamp
+  # (min(lag, XLEN)+pending) the shared threshold of 100k kept the gate
+  # open at a lag of 98.4k — the inflow equaled consumption (the Oct 24
+  # equilibrium), the debt drain was zero. The default 10k ≈ 2 h of
+  # consumption buffer (the Oct 24 measurement: ≈5.1k tasks/h): it closes
+  # the gate on the current debt and returns the "draining — admitting"
+  # hysteresis. The effective value is with the min(watermark, MAXLEN/2)
+  # clamp, like the publication gate (at the default it is inactive:
+  # 10k < 75k). 0 — the shared
   # scheduler.queue_high_watermark.
   queue_high_watermark: 10000
-  # Потолок одной выборки пачки позднего переиздателя рендера (T-274;
-  # значение 300 с — T-273): серверный statement_timeout и клиентский
-  # ctx-дедлайн; таймаут меньше стоимости catch-up-выборки даёт петлю
-  # обречённых повторов (T-271). 0 — дефолт кода.
+  # The cap on a single select of the render late re-publisher batch
+  # (T-274; the 300 s value — T-273): the server-side statement_timeout
+  # and the client ctx deadline; a timeout cheaper than the catch-up
+  # select gives a loop of doomed retries (T-271). 0 — the code default.
   late_select_timeout: "300s"
-  # Приоритет дренажа рендер-долга (T-184, решение (а) замера T-176):
-  # имена зон — TLD (punycode, как в справочнике zones), чей долг
-  # (флаг render_pending) проход доработки обслуживает по остаточному
-  # принципу — пачка прохода собирается сначала доменами остальных зон
-  # (высокий DOM-вклад рендера), долг перечисленных зон добирается при
-  # их исчерпании; записи не теряются, зоны списка дорабатываются
-  # последними. Ворота q:render дозируют публикации — приоритет
-  # распоряжается освободившейся ёмкостью. Пустой список (умолчание) —
-  # прежний порядок без фильтра зон (T-181). Наблюдаемость — поле
-  # deprioritized строки «проход доработки рендера» журнала http-worker.
-  # Прод (замер T-176): парковочные .рф — 98–99% состоявшихся рендеров
-  # с выходом 0,5% находок:
+  # The render debt drain priority (T-184, decision (a) of the T-176
+  # measurement): the zone names — TLDs (punycode, as in the zones
+  # reference table) whose debt (the render_pending flag) the rework pass
+  # serves on a leftovers basis — the pass chunk is assembled first from
+  # the domains of the other zones (the high DOM contribution of render),
+  # the debt of the listed zones is picked up when they run out; entries
+  # are not lost, the listed zones are reworked last. The q:render gate
+  # meters the publications — the priority disposes of the freed capacity.
+  # An empty list (the default) — the previous order without a zone filter
+  # (T-181). Observability — the deprioritized field of the "render rework
+  # pass" line of the http-worker log.
+  # Prod (the T-176 measurement): the parking .рф — 98–99% of the completed
+  # renders with a 0.5% find yield:
   # requeue_deprioritized_zones:
   #   - "xn--p1ai"
-  # Очередь фолбэка на Chromium: задачи, не прошедшие рендер на основном
-  # движке по движко-зависимой причине (тарпит, класс задачи на последней
-  # попытке), дорабатываются отдельным chromium-воркером B из
-  # q:render-fallback. Выключена (умолчание): первичный воркер финализирует
-  # без рендера как сегодня; включение/выключение — правкой флага,
-  # накопленная очередь дорабатывается до пуста. DNS- и cert-сбои фолбэка
-  # не получают — Chromium их не исправит.
+  # The Chromium fallback queue: tasks that did not get a render on the
+  # main engine for an engine-dependent reason (a tarpit, the task class on
+  # the last attempt) are reworked by a separate chromium worker B from
+  # q:render-fallback. Disabled (the default): the primary worker
+  # finalizes without a render as today; enabling/disabling — by flipping
+  # the flag, the accumulated queue is reworked to empty. DNS and cert
+  # failures get no fallback — Chromium will not fix them.
   fallback:
     enabled: false
-    # Потолок темпа воркера B, записей за окно потребления воркера:
-    # батч-режим «собрать и доработать» без наращивания chromium-мощности.
-    # 100 ≈ полной мощности одного chromium (8 контекстов × ~5 с/страница);
-    # стартовое значение — калибруется стендовым прогоном.
+    # The worker B rate cap, entries per the worker's consumption window:
+    # the "collect and rework" batch mode without scaling up chromium
+    # capacity. 100 ≈ the full capacity of one chromium (8 contexts ×
+    # ~5 s/page); the starting value — calibrated by a bench run.
     worker_rate: 100
-    # Бюджет доли фолбэка, % рендер-потока за окно (1000 доставок
-    # этапа): перерасход приостанавливает публикации следующего окна,
-    # задачи финализируются штатно, поднимается алерт. 30 — порог
-    # экономики (fallback-рейт выше ~30% обнуляет выгоду фичи);
-    # 0 — без потолка.
+    # The fallback share budget, % of the render flow per window (1000
+    # stage deliveries): an overrun suspends the next window's
+    # publications, the tasks finalize normally, an alert fires. 30 — the
+    # economics threshold (a fallback rate above ~30% nullifies the
+    # feature's benefit); 0 — no cap.
     share_percent: 30
-    # Health-гейт: столько подряд инфра-ошибок «основной движок
-    # недоступен» приостанавливают фолбэк-публикацию до восстановления
-    # движка — перелив всего потока на дорогой chromium при падении
-    # лёгкого исключён; единичная ошибка — шум, порог не срабатывает.
+    # The health gate: this many "main engine unavailable" infra errors in
+    # a row suspend fallback publishing until the engine recovers —
+    # spilling the whole flow onto the expensive chromium while the cheap
+    # one is down is excluded; a single error is noise, the threshold does
+    # not trip.
     health_gate_streak: 3
 
 content:
-  dir: "/data/content"                # пак-файлы pack-NNNNNN.pack (docs/content.md)
-  pack_size: "512MB"                 # порог ротации пака; рекомендация ТЗ: 512 МБ–1 ГБ
-  max_store_bytes: 2097152           # лимит одного контента; рекомендация ТЗ: 1–2 МБ
-  zstd_dictionary: "/data/content/dict.zst"   # crawlerctl dict train; пусто — без словаря
-  disk_free_percent: 5               # порог свободного места каталога контента, %:
-                                     # ниже — пауза записи контента + алерт (ТЗ 8)
-  # Retention контента и трим jsonb не-находок (T-166): записи старше окна,
-  # не Laravel-находки и не ждущие рендера теряют content_hash и тяжёлые
-  # jsonb; паспорт строки остаётся (docs/content.md). Стационарный объём
-  # контента = суточный приток × окно (при 20 GiB/сут 6 ч ≈ 5 GiB).
-  retention: "6h"                    # окно жизни контента не-находок; 0 — выключено
-  retention_interval: "1h"           # период проходов цикла (место возвращает
-                                     # часовая компактификация паков T-045)
-  retention_batch: 10000             # строк в пачке-транзакции; вилка 10–50 тыс.
-  retention_analyze_watermark: 0     # порог интерлока: глубина q:analyze ≥ порога —
-                                     # анализатор не успевает, проход пропускается;
-                                     # 0 — общий scheduler.queue_high_watermark
-  retention_select_timeout: "2h"     # потолок одной выборки пачки в мс-дедлайне
-                                     # statement_timeout + ctx (T-274): 2 ч — удвоенный
-                                     # запас над замерами 10–11.11.2026 первого
-                                     # catch-up-прохода с нулевого курсора (3600 с
-                                     # T-273 хватило только спокойной системе);
-                                     # 0 — дефолт кода. Курсор дренажа персистентен
-                                     # (retention_drain_cursor) — рестарт http-worker
-                                     # продолжает с сохранённой позиции
+  dir: "/data/content"                # the pack files pack-NNNNNN.pack (docs/content.md)
+  pack_size: "512MB"                 # the pack rotation threshold; the spec recommendation: 512 MB–1 GB
+  max_store_bytes: 2097152           # the limit for one content; the spec recommendation: 1–2 MB
+  zstd_dictionary: "/data/content/dict.zst"   # crawlerctl dict train; empty — no dictionary
+  disk_free_percent: 5               # the content directory free-space threshold, %:
+                                     # below it — a content write pause + an alert (spec 8)
+  # Content retention and the jsonb trim of non-finds (T-166): entries
+  # older than the window that are not Laravel finds and are not waiting
+  # for a render lose content_hash and the heavy jsonb; the row passport
+  # stays (docs/content.md). The steady-state content volume = the daily
+  # inflow × the window (at 20 GiB/day a 6 h window ≈ 5 GiB).
+  retention: "6h"                    # the content lifetime window for non-finds; 0 — disabled
+  retention_interval: "1h"           # the loop pass period (the space is returned
+                                     # by the hourly pack compaction of T-045)
+  retention_batch: 10000             # rows per transaction chunk; range 10–50k
+  retention_analyze_watermark: 0     # the interlock threshold: the q:analyze depth ≥ the threshold —
+                                     # the analyzer cannot keep up, the pass is skipped;
+                                     # 0 — the shared scheduler.queue_high_watermark
+  retention_select_timeout: "2h"     # the cap on one batch select in the ms deadline of
+                                     # statement_timeout + ctx (T-274): 2 h — double
+                                     # the headroom over the Nov 10–11, 2026 measurements
+                                     # of the first catch-up pass from a zero cursor (the 3600 s
+                                     # of T-273 was enough only for a quiet system);
+                                     # 0 — the code default. The drain cursor is persistent
+                                     # (retention_drain_cursor) — an http-worker restart
+                                     # continues from the saved position
 
 analyzer:
-  rules_dir: "/etc/crawler/rules"    # YAML-правила Laravel (ТЗ 5.8)
-  laravel_min_score: 0.6             # порог is_laravel, диапазон (0, 1]
+  rules_dir: "/etc/crawler/rules"    # the Laravel YAML rules (spec 5.8)
+  laravel_min_score: 0.6             # the is_laravel threshold, range (0, 1]
 
-subdomains:                          # начальное наполнение таблицы subdomains;
-  - ""                               # "" — апекс домена; максимум 63 (dns_mask)
+subdomains:                          # the initial fill of the subdomains table;
+  - ""                               # "" — the domain apex; maximum 63 (dns_mask)
   - "www"
   - "admin"
   - "crm"
@@ -348,188 +369,205 @@ subdomains:                          # начальное наполнение �
   - "app"
 
 monitor:
-  # Loopback: метрики и пробы (livez/healthz) не выставляются на внешние
-  # интерфейсы (ТЗ §9);
-  # «:9100» (все интерфейсы) — только внутри docker-сети (config.dev.yaml).
+  # Loopback: the metrics and the probes (livez/healthz) are not exposed
+  # on external interfaces (spec §9);
+  # ":9100" (all interfaces) — only inside the docker network
+  # (config.dev.yaml).
   listen: "127.0.0.1:9100"
-  # Период реконсиляции инкрементальных счётчиков конвейера (T-178):
-  # один совмещённый проход (колонки зон + строки crawler_counters) —
-  # единственный полный проход domains в стационаре; между проходами
-  # счётчики ведут дельты переходов. Дефолт 30 минут (T-199): T-161
-  # поднял исходные 60 с до 5 минут (замер §12 — десятки секунд на
-  # 47 млн строк), замер окна медленных запросов после деплоя 3bffc62
-  # (26.10) — реконсиляция единственный оставшийся полный проход
-  # domains, 48 % медленного времени БД при интервале 5 мин; решение
-  # оператора 26.10 по заготовке ТЗИ §7.1 («после приработки волны
-  # интервал можно разредить до 15–30 мин», дрейф в стационаре обязан
-  # быть нулевым). Порог алерта остановки прогресса — 5 × интервал
-  # (2,5 ч): zones.updated_at пишет этот цикл, порог считает его
-  # пропусками. Коридор 30s..1h, 30–60 с коридора ТЗ 5.9 — для малых
-  # корпусов (dev-конфиг docker держит 60s).
+  # The pipeline incremental counter reconciliation period (T-178): one
+  # combined pass (the zone columns + the crawler_counters rows) — the only
+  # full domains pass in steady state; between passes the counters keep
+  # transition deltas. The default 30 minutes (T-199): T-161 raised the
+  # original 60 s to 5 minutes (the §12 measurement — tens of seconds on
+  # 47M rows), the slow-query window measurement after the 3bffc62 deploy
+  # (Oct 26) — reconciliation is the only remaining full domains pass,
+  # 48% of the slow DB time at a 5 min interval; the operator's Oct 26
+  # decision on the incremental-counters spec §7.1 draft ("after the wave
+  # break-in the interval can be spaced out to 15–30 min", the steady-state
+  # drift must be zero). The progress-stop alert threshold — 5 × the
+  # interval (2.5 h): zones.updated_at is written by this loop, the
+  # threshold counts its skips. Range 30s..1h, the 30–60 s of the spec 5.9
+  # range is for small corpora (the docker dev config keeps 60s).
   zone_stats_interval: "30m"
-  # Период цикла оценки алертов (T-206 — отвязка от реконсиляции,
-  # решение оператора 26.10): дефолт 5 минут — прежняя частота. T-161
-  # держал «одну пару циклов» на zone_stats_interval, T-199 разредил
-  # реконсиляцию до 30 мин — окна детекции в проходах растянулись
-  # в 6 раз (queue_dead 15 → 90 мин, memory_high/render_debt 10 →
-  # 60 мин, bad_hashes 75 мин → 7,5 ч), PSI-выборка (окно 30 мин)
-  # выродилась в два соседних прохода. Собственный интервал
-  # возвращает прежние эффективные окна и погрешность PSI ~5 мин;
-  # порог остановки прогресса остаётся в периодах реконсиляции
-  # (zone_stats_interval выше). Коридор 30s..1h — по образцу
+  # The alert evaluation loop period (T-206 — decoupled from
+  # reconciliation, the operator's Oct 26 decision): the default 5 minutes
+  # — the previous frequency. T-161 kept "one pair of loops" on
+  # zone_stats_interval, T-199 spaced the reconciliation out to 30 min —
+  # the per-pass detection windows stretched 6× (queue_dead 15 → 90 min,
+  # memory_high/render_debt 10 → 60 min, bad_hashes 75 min → 7.5 h), the
+  # PSI sample (a 30 min window) degenerated into two neighboring passes.
+  # An own interval returns the previous effective windows and the ~5 min
+  # PSI error; the progress-stop threshold stays in reconciliation periods
+  # (zone_stats_interval above). Range 30s..1h — modeled on
   # zone_stats_interval.
   alerts_interval: "5m"
-  # Отчёт системной нагрузки оператору (T-173): раз в период — снимок
-  # в Telegram (та же доставка, что у алертов) и журнал monitor:
-  # CPU/PSI/load, топ процессов (htop-вид: CPU и RSS по имени), RAM/swap,
-  # свободное место каталога контента, глубина очередей q:* и темп их
-  # потребления. Дефолт 10 минут; 0 — выключить; коридор 1m..1h.
+  # The system load report to the operator (T-173): once per period — a
+  # snapshot to Telegram (the same delivery as the alerts) and the monitor
+  # log: CPU/PSI/load, the top processes (an htop view: CPU and RSS by
+  # name), RAM/swap, the content directory free space, the q:* queue depths
+  # and their consumption pace. The default 10 minutes; 0 — disable;
+  # range 1m..1h.
   load_report_interval: "10m"
-  # Медленные запросы PostgreSQL (T-177): цикл опрашивает pg_stat_activity,
-  # выполняемые дольше порога клиентские операторы уходят в Telegram (если
-  # включён slow_query_telegram ниже) той же доставкой, что алерты и отчёт
-  # нагрузки (дебаунс pid+query_start — каждый оператор один раз; собственные
-  # агрегаты monitor исключены application_name пула), дублируются Warn
-  # в журнал и метрики crawler_pg_slow_queries*. Полный посмертный след —
-  # журнал сервера PostgreSQL (log_min_duration_statement=3s, боевой
-  # конфиг T-086). Порог по умолчанию 3 с — как у лога сервера; коридор
-  # 1s..1h; интервал 10 с (снимок дешёвый), 0 — выключить, коридор 5s..10m.
+  # Slow PostgreSQL queries (T-177): the loop polls pg_stat_activity,
+  # client statements running longer than the threshold go to Telegram (if
+  # slow_query_telegram below is enabled) with the same delivery as the
+  # alerts and the load report (a pid+query_start debounce — each statement
+  # once; monitor's own aggregates are excluded by the pool's
+  # application_name), and are duplicated as a Warn into the log and the
+  # crawler_pg_slow_queries* metrics. The full post-mortem trail — the
+  # PostgreSQL server log (log_min_duration_statement=3s, the production
+  # config T-086). The default threshold 3 s — like the server log; range
+  # 1s..1h; the interval 10 s (a snapshot is cheap), 0 — disable, range
+  # 5s..10m.
   slow_query_interval: "10s"
   slow_query_min_duration: "3s"
-  # Доставка медленных запросов в Telegram (та же доставка, что алерты
-  # и отчёт нагрузки: бот/группа/скрипт — monitor.alerts). По умолчанию
-  # false — медленные запросы остаются Warn в журнале monitor, метриками
-  # crawler_pg_slow_queries* и полным посмертным следом в журнале сервера
-  # PostgreSQL: медленный запрос — диагностика, а не событие, требующее
-  # реакции «сейчас»; true — каждый новый оператор (дебаунс
-  # pid+query_start) уходит сообщением в группу.
+  # Delivering slow queries to Telegram (the same delivery as the alerts
+  # and the load report: bot/group/script — monitor.alerts). The default
+  # false — slow queries remain a Warn in the monitor log, in the
+  # crawler_pg_slow_queries* metrics and as the full post-mortem trail in
+  # the PostgreSQL server log: a slow query is diagnostics, not an event
+  # demanding a "now" reaction; true — each new statement (the
+  # pid+query_start debounce) goes to the group as a message.
   slow_query_telegram: false
-  # Зонд алерта мусорных content_hash (T-099): /metrics сервиса ingest
-  # (loopback по METRICS_ADDR юнита); пустая строка — алерт «не измеряется».
+  # The junk content_hash alert probe (T-099): the /metrics of the ingest
+  # service (loopback via the unit's METRICS_ADDR); an empty string — the
+  # alert is "not measured".
   ingest_metrics_url: "http://127.0.0.1:9101/metrics"
-  # Зонд алерта бюджета доли фолбэка рендера (T-246): /metrics
-  # рендер-воркера (loopback 9105) — счётчик событий приостановки
-  # crawler_render_fallback_suspended_total{reason="budget"} (T-239);
-  # пустая строка — алерт «не измеряется» (тихо).
+  # The render fallback share budget alert probe (T-246): the render
+  # worker's /metrics (loopback 9105) — the suspension event counter
+  # crawler_render_fallback_suspended_total{reason="budget"} (T-239); an
+  # empty string — the alert is "not measured" (silent).
   render_metrics_url: "http://127.0.0.1:9105/metrics"
-  # Цикл рендер-долга (T-175): раз в период — счётчик доменов с флагом
-  # render_pending (crawler_counters, ведут переходы бита) + лаг q:render
-  # в gauge crawler_render_pending_domains и строкой сводки в журнал
-  # (Debug); та же цифра — строкой в отчёте нагрузки T-173. Дефолт
-  # 5 минут (проход дешёвый — Lookup + XLEN, период выбирает свежесть,
-  # долг — медленная величина; паритет с пересчётом зон закончился —
-  # T-199 разредил реконсиляцию до 30 мин); коридор 30s..1h
-  # (по образцу zone_stats_interval). Алерт render_debt ходит проходом
-  # алертов (alerts_interval, T-206), это поле его частоту не задаёт.
+  # The render debt loop (T-175): once per period — the count of domains
+  # with the render_pending flag (crawler_counters keep the bit
+  # transitions) + the q:render lag into the crawler_render_pending_domains
+  # gauge and as a summary line into the log (Debug); the same figure — as
+  # a line in the T-173 load report. The default 5 minutes (the pass is
+  # cheap — Lookup + XLEN, the period picks the freshness, the debt is a
+  # slow quantity; the parity with the zone recount ended — T-199 spaced
+  # the reconciliation out to 30 min); range 30s..1h (modeled on
+  # zone_stats_interval). The render_debt alert runs on the alert pass
+  # (alerts_interval, T-206), this field does not set its frequency.
   render_debt_interval: "5m"
-  # Алерты T-162: недостающие пороги ТЗ 5.9 (замер §12) и доставка
-  # оператору. Пороги очередей/процента диска остаются в своих секциях
-  # (scheduler.queue_high_watermark, content.disk_free_percent).
+  # The T-162 alerts: the missing spec 5.9 thresholds (the §12 measurement)
+  # and delivery to the operator. The queue/disk-percent thresholds stay in
+  # their own sections (scheduler.queue_high_watermark,
+  # content.disk_free_percent).
   alerts:
-    # Доставка переходов алертов (срабатывание 🚨 / снятие ✅ отдельными
-    # сообщениями, дубли дебаунсятся) в Telegram тем же ботом/группой,
-    # что и извещения CI/CD (§10.4). Секреты не в YAML: monitor берёт
-    # TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID из EnvironmentFile юнита
-    # (/etc/crawler/crawler.env) — нет любого → доставка выключена,
-    # алерты остаются Warn в журнале. Скрипт ставится на хост руками
-    # (docs/operations.md §4.3: деплой везёт только бинарники).
+    # Delivering alert transitions (firing 🚨 / clearing ✅ as separate
+    # messages, duplicates debounced) to Telegram with the same bot/group
+    # as the CI/CD notifications (§10.4). Secrets are not in YAML: monitor
+    # takes TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID from the unit's
+    # EnvironmentFile (/etc/crawler/crawler.env) — either missing → the
+    # delivery is disabled, the alerts remain Warn in the log. The script
+    # is placed on the host by hand (docs/operations.md §4.3: the deploy
+    # ships only binaries).
     telegram: true
     telegram_script: "/opt/crawler/bin/telegram-notify.sh"
-    # Абсолютный минимум свободного места каталога контента (Warn) и
-    # эскалация (отдельный алерт): процентный порог на томе 79 ГБ
-    # поздний — 10 % = 8 ГБ ≈ 5 ч до заполнения при темпе ≈36 GiB/сут
-    # (замер §12); 15/10 GiB дают запас на разбор независимо от тома.
+    # The absolute minimum of the content directory free space (a Warn) and
+    # the escalation (a separate alert): a percent threshold on a 79 GB
+    # volume is late — 10% = 8 GB ≈ 5 h until full at a pace of ≈36
+    # GiB/day (the §12 measurement); 15/10 GiB give headroom for triage
+    # regardless of the volume.
     disk_free_min_bytes: "15GiB"
     disk_free_crit_bytes: "10GiB"
-    # Замороженная очередь: last-delivered-id группы стрима не движется
-    # при глубине > 0 (сигнатура отравленной задачи T-159 — потребитель
-    # не читает); живая группа двигает ID каждые секунды.
+    # A frozen queue: the stream group's last-delivered-id does not move at
+    # a depth > 0 (the poison task signature of T-159 — the consumer does
+    # not read); a live group moves the ID every few seconds.
     queue_freeze_window: "15m"
-    # Голод CPU по PSI some (avg300): выше порога устойчиво окно —
-    # разовые шпильки (деплой, ретро-пачки) алертом не считаются.
+    # CPU starvation by PSI some (avg300): above the threshold for a
+    # sustained window — one-off spikes (a deploy, retro chunks) do not
+    # count as an alert.
     psi_cpu_percent: 90
     psi_cpu_window: "30m"
-    # Троттлинг MemoryHigh: проходов алертов подряд с ростом счётчика
-    # memory.events high юнита (предвестник фаталов http-worker T-157);
-    # 2 × 5 мин = 10 мин устойчивого reclaim-давления (период проходов —
-    # alerts_interval, T-206).
+    # MemoryHigh throttling: alert passes in a row with growth of the
+    # unit's memory.events high counter (a precursor of the T-157
+    # http-worker fatals); 2 × 5 min = 10 min of sustained reclaim pressure
+    # (the pass period — alerts_interval, T-206).
     mem_high_passes: 2
-    # Накопление рендер-долга (T-175): долг (флаги render_pending по
-    # счётчику + лаг q:render) выше порога И растёт N проходов подряд —
-    # приток SPA обгоняет дренаж (алерт queue_frozen такой случай не
-    # ловит: доставки идут). 50 тыс. — ниже долга морозки 24.10
-    # (443 тыс., найден ручным SQL), выше фона локальных переполнений
-    # (тысячи, гасятся проходом доработки за минуты). Сработавший алерт
-    # держится до дренажа ниже 90 % порога (гистерезис: колебания лага
-    # при стационарном долге не качают эпизод 🚨/✅; стагнация без роста
-    # оператора не будит — видна строкой отчёта нагрузки и gauge).
+    # Render debt accumulation (T-175): the debt (the render_pending flags
+    # by the counter + the q:render lag) above the threshold AND growing
+    # for N passes in a row — the SPA inflow outruns the drain (the
+    # queue_frozen alert does not catch this case: deliveries are flowing).
+    # 50k — below the Oct 24 freeze debt (443k, found by manual SQL), above
+    # the background of local overflows (thousands, damped by a rework pass
+    # in minutes). A fired alert holds until the drain drops below 90% of
+    # the threshold (hysteresis: lag fluctuations at a steady debt do not
+    # pump a 🚨/✅ episode; stagnation without growth does not wake the
+    # operator — visible as a load-report line and in the gauge).
     render_debt_domains: 50000
-    # 2 × 5 мин = 10 мин непрерывного роста (по образцу mem_high_passes;
-    # проход серии — период цикла алертов alerts_interval, T-206):
-    # разовый скачок волны SPA — штатное переполнение, устойчивый рост —
-    # стационарное накопление.
+    # 2 × 5 min = 10 min of continuous growth (modeled on mem_high_passes;
+    # the series pass period — the alert loop period alerts_interval,
+    # T-206): a one-off SPA wave jump — a regular overflow, a sustained
+    # growth — steady-state accumulation.
     render_debt_passes: 2
 
 web:
-  # Публичный лендинг (этап 13, T-121): публичный порт системы для
-  # посетителей — наружу публикует reverse-proxy с TLS (deploy/nginx/ —
-  # первый образец, T-124), сам сервис держит loopback; метрики web —
-  # на METRICS_ADDR (127.0.0.1:9107). listen — [host]:port или
-  # абсолютный путь unix-сокета (вариант деплоя за nginx).
-  # Операторский дашборд — отдельный слушатель dashboard.listen (ТЗД).
+  # The public landing page (stage 13, T-121): the system's public port
+  # for visitors — a reverse-proxy with TLS publishes it outward
+  # (deploy/nginx/ — the first specimen, T-124), the service itself keeps
+  # loopback; the web metrics — on METRICS_ADDR (127.0.0.1:9107). listen —
+  # [host]:port or an absolute unix socket path (the deploy variant behind
+  # nginx). The operator dashboard — a separate dashboard.listen listener
+  # (dashboard spec).
   listen: "127.0.0.1:8080"
-  rate_limit: 4                      # живых проверок формы с IP в минуту (T-123)
-  timeout: "60s"                     # потолок живой проверки: DNS→HTTP→рендер→анализ
-  # Потолок одновременных живых проверок (T-220): семафор до запуска
-  # конвейера, избыток — быстрый 503 с Retry-After (не очередь до
-  # timeout); конвейер работает на общем долгоживущем контуре — одна
-  # цепь резолверов с малым пулом UDP, общий Fetcher, кэш правил,
-  # один render.Manager на сервис.
+  rate_limit: 4                      # live form checks per IP per minute (T-123)
+  timeout: "60s"                     # the live check cap: DNS→HTTP→render→analysis
+  # The cap on concurrent live checks (T-220): a semaphore before the
+  # pipeline starts, the surplus — a fast 503 with Retry-After (not a queue
+  # until timeout); the pipeline runs on the shared long-lived circuit —
+  # one resolver chain with a small UDP pool, a shared Fetcher, a rule
+  # cache, one render.Manager per service.
   live_concurrency: 4
-  # Канонический хост публичного адреса (T-227): им собираются абсолютные
-  # URL sitemap.xml — Host запроса за прокси передаёт nginx значением
-  # посетителя, без канона <loc> зависел бы от чужого заголовка. Пустое
-  # значение — фолбэк на Host запроса; публикуемый наружу лендинг
-  # задаёт поле своим доменом (при нестандартном порте — с портом).
+  # The canonical host of the public address (T-227): the absolute
+  # sitemap.xml URLs are built with it — behind the proxy nginx passes the
+  # visitor's value as the request Host, without a canonical one the <loc>
+  # would depend on a foreign header. An empty value — a fallback to the
+  # request Host; the publicly published landing sets the field to its own
+  # domain (with the port at a non-standard port).
   # public_host: "crawler.example.com"
 
 dashboard:
-  # Операторский дашборд конвейера (ТЗД): публичный адрес страниц и API.
-  # Дефолт — loopback: публикация наружу — reverse-proxy с TLS (ТЗД §9.1),
-  # не сам сервис; метрики дашборда — на METRICS_ADDR (127.0.0.1:9108).
+  # The pipeline operator dashboard (dashboard spec): the public address
+  # of the pages and API. The default — loopback: publishing outward is a
+  # reverse-proxy with TLS (dashboard spec §9.1), not the service itself;
+  # the dashboard metrics — on METRICS_ADDR (127.0.0.1:9108).
   listen: "127.0.0.1:8090"
-  refresh: "5s"                      # период сборки снимка, коридор 1s..5m (ТЗД §8.3)
-  # TTL кэша тяжёлых агрегатов сводки (зоны/темп/статусы — полные
-  # проходы domains, T-161): в окне TTL проходы refresh не повторяют
-  # агрегат; дефолт 60 с — нижняя граница коридора 1m..5m постановки
-  # (при refresh 5 с — один полный проход domains в минуту вместо
-  # двенадцати). Лёгкие секции (последние находки, журнал ingest)
-  # остаются живыми каждый проход.
+  refresh: "5s"                      # the snapshot build period, range 1s..5m (dashboard spec §8.3)
+  # The TTL of the heavy summary aggregates cache (zones/pace/statuses —
+  # full domains passes, T-161): within the TTL window the refresh passes
+  # do not repeat the aggregate; the default 60 s — the lower bound of the
+  # spec's 1m..5m range (at refresh 5 s — one full domains pass per minute
+  # instead of twelve). The light sections (the latest finds, the ingest
+  # log) stay live on every pass.
   status_cache_ttl: "1m"
-  # Креды оператора (HTTP Basic): обязательны для запуска cmd/dashboard
-  # (ТЗД §7.7), остальные сервисы секцию игнорируют. password_hash
-  # генерируется командой crawlerctl dashboard-secret (пароль — аргумент
-  # или stdin); открытый пароль в конфиге и окружении запрещён (ТЗД §7.2).
+  # The operator credentials (HTTP Basic): required to run cmd/dashboard
+  # (dashboard spec §7.7), the other services ignore the section.
+  # password_hash is generated by the crawlerctl dashboard-secret command
+  # (the password — an argument or stdin); a plaintext password in the
+  # config and the environment is forbidden (dashboard spec §7.2).
   # username: "admin"
   # password_hash: "pbkdf2-sha256$600000$…$…"
-  # Пробы живости сервисов для секции здоровья (ТЗД §5.8): имя → базовый
-  # URL метрик (каркас отдаёт /livez); в systemd-деплое — loopback-адреса
-  # метрик юнитов (полный список — docs/deploy.md), в docker-сети — имя
-  # сервиса и его METRICS_PORT (deploy/docker/config.dev.yaml).
-  # Пустая карта — секция «н/д».
+  # Service liveness probes for the health section (dashboard spec §5.8):
+  # name → the metrics base URL (the framework serves /livez); in the
+  # systemd deploy — the units' loopback metric addresses (the full list —
+  # docs/deploy.md), in the docker network — the service name and its
+  # METRICS_PORT (deploy/docker/config.dev.yaml). An empty map — the
+  # section shows "n/a".
   # probes:
   #   dns-worker: "http://127.0.0.1:9103"
   #   http-worker: "http://127.0.0.1:9104"
-  # Панель движков рендера (T-246, ТЗ рендера §4.6 п.4): экспозиции
-  # /metrics рендер-воркеров — основная сборка (метки engine счётчиков
-  # этапа, T-235) и сборка воркера B фолбэка (потребление q:render-
-  # fallback, порт 9120 — deploy.md §2.3); глубина очереди читается из
-  # Redis напрямую. Дефолт (ключ не задан) — экспозиция основной сборки
-  # 127.0.0.1:9105, согласован с monitor.render_metrics_url; адрес B
-  # дописывают при включении фолбэка. Пустой список — панель «н/д».
+  # The render engines panel (T-246, render spec §4.6 item 4): the
+  # /metrics expositions of the render workers — the main build (the engine
+  # labels of the stage counters, T-235) and the fallback worker B build
+  # (the q:render-fallback consumption, port 9120 — deploy.md §2.3); the
+  # queue depth is read from Redis directly. The default (the key unset) —
+  # the main build's exposition 127.0.0.1:9105, consistent with
+  # monitor.render_metrics_url; the B address is added when enabling the
+  # fallback. An empty list — the panel shows "n/a".
   # render_metrics_urls:
   #   - "http://127.0.0.1:9105/metrics"
   #   - "http://127.0.0.1:9120/metrics"
 
 log:
-  level: "info"                      # уровень логирования сервисов: debug|info|warn|error
+  level: "info"                      # the service log level: debug|info|warn|error

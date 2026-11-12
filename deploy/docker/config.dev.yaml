@@ -1,14 +1,16 @@
-# Dev-конфигурация сервисов Domain Crawler (ТЗ 5.10 основного ТЗ).
-# Подставляется в контейнеры как /etc/crawler/config.yaml.
-# Значения-адреса соответствуют статическим IP сети crawler_net в compose.yaml;
-# при развитии сервисов значения из переменных окружения имеют приоритет.
+# Dev configuration of the Domain Crawler services (spec 5.10 of the main
+# spec). Mounted into the containers as /etc/crawler/config.yaml.
+# The address values match the static IPs of the crawler_net network in
+# compose.yaml; as the services evolve, environment variable values take
+# priority.
 
 postgres:
-  # Полный DSN собирается из APP_PG_DSN (env), здесь — форма по умолчанию.
+  # The full DSN is assembled from APP_PG_DSN (env); here — the default form.
   dsn: "postgres://crawler:crawler@172.28.100.2:5432/crawler?sslmode=disable"
-  # 20 — dev-масштаб: max_connections=130 (postgresql.dev.conf — стек сервисов
-  # + параллельные прогоны тестов). Боевой бюджет (max_connections=50) —
-  # 5 на сервис: config.example.yaml, docs/db.md «Бюджет соединений».
+  # 20 — the dev scale: max_connections=130 (postgresql.dev.conf — the
+  # service stack + parallel test runs). The production budget
+  # (max_connections=50) — 5 per service: config.example.yaml, docs/db.md
+  # "Connection budget".
   pool_size: 20
 
 redis:
@@ -18,33 +20,34 @@ ingest:
   dir: "/data/incoming"
   batch_size: 50000
   stable_seconds: 10
-  scan_interval: "5s"               # dev: страховочный обход чаще
-  # Многоуровневые тестовые зоны testbed (ТЗТ tld-only-zones §5.1/§6.1):
-  # рабочие каталоги приёма — только TLD (incoming/<tld>/add|delete/),
-  # зоны сценариев стенда (deploy/docker/testbed/scenarios.yaml — их
-  # обслуживает coredns) обязаны быть «зонами пути», поэтому перечислены
-  # в allowlist; иначе make seed кладёт файлы в каталоги, которые ingest
-  # отправит в failed/. Имена — punycode нижним регистром (как zones.name;
-  # проверка.test → xn--80adjurfhd.test). Бой — пусто (config.example.yaml).
+  scan_interval: "5s"               # dev: the guard walk runs more often
+  # Multi-level testbed test zones (the tld-only-zones spec §5.1/§6.1):
+  # the ingest working directories are TLD-only (incoming/<tld>/add|delete/),
+  # the bench scenario zones (deploy/docker/testbed/scenarios.yaml —
+  # served by coredns) must be "path zones", so they are listed in the
+  # allowlist; otherwise make seed puts files into directories that ingest
+  # will send to failed/. Names — lowercase punycode (as zones.name;
+  # проверка.test → xn--80adjurfhd.test). Production — empty
+  # (config.example.yaml).
   allowed_zone_paths:
-    - crawl.test            # базовая зона сценариев (e2e ingest→check)
+    - crawl.test            # the base scenario zone (e2e ingest→check)
     - crawl2.test
-    - co.test               # составная тестовая зона (бывший аналог co.uk)
-    - xn--80adjurfhd.test   # проверка.test — IDN-зона сценариев
+    - co.test               # a composite test zone (a former co.uk analog)
+    - xn--80adjurfhd.test   # проверка.test — the IDN scenario zone
 
 scheduler:
-  recheck_interval: "4380h"          # ~6 месяцев
-  batch_size: 1000                   # ≈64 КиБ запись q:dns — бюджет Redis (T-141)
+  recheck_interval: "4380h"          # ~6 months
+  batch_size: 1000                   # ≈64 KiB per q:dns entry — the Redis budget (T-141)
   queue_high_watermark: 100000
   lease: "30m"
   temp_error_retry_after: "24h"
 
 dns:
   resolvers: ["172.28.100.10:53"]      # unbound
-  fallback_resolvers: []             # в dev наружу не ходим
+  fallback_resolvers: []             # in dev we do not go outward
   concurrency: 2000
   max_qps: 10000
-  ipv6: false                        # в docker-сети IPv6 нет
+  ipv6: false                        # no IPv6 in the docker network
 
 http:
   concurrency: 2000
@@ -57,31 +60,34 @@ http:
   user_agent: "DomainCrawler/dev (+dev-environment; contact: dev@example.invalid)"
 
 render:
-  # dev: внешний chromium-контейнер (compose-сервис chromium, ws://172.28.100.14:9222)
+  # dev: an external chromium container (the compose service chromium,
+  # ws://172.28.100.14:9222)
   remote_url: "ws://172.28.100.14:9222"
-  # Альтернативные движки рендера (этап 35, ФТ-16): контейнер движка
-  # поднимается профилем render-engines, здесь меняются engine и один
-  # адрес (закомментированные образцы), затем dc restart render-worker —
-  # air конфиг не перечитывает. Порог перезапуска ниже уже 0 — правка
-  # образца движка сводится к engine + remote_url (для moli/lightpanda
-  # валидация требует 0). Подробности: docs/render.md и
-  # docs/dev-environment.md, «Движки рендера».
+  # Alternative render engines (stage 35, FR-16): the engine container is
+  # brought up by the render-engines profile, here engine and one address
+  # are changed (the commented specimens), then dc restart render-worker —
+  # air does not reload the config. The restart threshold below is already
+  # 0 — changing the engine specimen reduces to engine + remote_url (for
+  # moli/lightpanda validation requires 0). Details: docs/render.md and
+  # docs/dev-environment.md, "Render engines".
   #   lightpanda (dc --profile render-engines up -d lightpanda):
   # engine: "lightpanda"
   # remote_url: "ws://172.28.100.16:9222"
   #   moli (dc --profile render-engines up -d moli):
   # engine: "moli"
   # remote_url: "ws://172.28.100.17:9222"
-  # Осознанно ниже боевого дефолта 4 (T-142): dev-chromium делят юнит- и
-  # live-тесты рендера, консервативный параллелизм держит память
-  # контейнера (MEM_CHROMIUM 2048m) предсказуемой под смоук-прогонами.
+  # Deliberately below the production default of 4 (T-142): dev-chromium is
+  # shared by the render unit and live tests, a conservative parallelism
+  # keeps the container memory (MEM_CHROMIUM 2048m) predictable under smoke
+  # runs.
   contexts: 3
   timeout: "25s"
   restart_every_pages: 500
-  # 0 обязателен для moli/lightpanda (валидация: RSS чужого процесса
-  # недоступен), а в dev порог и так не работал бы — браузер всегда
-  # внешний контейнер, не процесс воркера. Без ключа профиль унаследовал
-  # бы боевой дефолт 1536MiB и отвергал переключение движка.
+  # 0 is required for moli/lightpanda (validation: the foreign process's
+  # RSS is unavailable), and in dev the threshold would not work anyway —
+  # the browser is always an external container, not a worker process.
+  # Without the key the profile would inherit the production default
+  # 1536MiB and reject switching the engine.
   restart_memory_bytes: 0
 
 content:
@@ -94,7 +100,7 @@ analyzer:
   rules_dir: "/etc/crawler/rules"
   laravel_min_score: 0.6
 
-subdomains:                          # начальное наполнение таблицы subdomains
+subdomains:                          # the initial fill of the subdomains table
   - ""
   - "www"
   - "admin"
@@ -104,44 +110,48 @@ subdomains:                          # начальное наполнение �
 
 monitor:
   listen: ":9100"
-  # Dev держит верх коридора ТЗ 5.9 (30–60 с): корпус дев-стенда мал,
-  # свежесть счётчиков удобна живой приёмке; боевой дефолт с T-199 —
-  # 30 мин (реконсиляция — единственный полный проход domains, замер
-  # окна медленных после 3bffc62).
+  # Dev keeps the top of the spec 5.9 range (30–60 s): the dev bench corpus
+  # is small, counter freshness suits live acceptance; the production
+  # default since T-199 — 30 min (reconciliation — the only full domains
+  # pass, the slow-window measurement after 3bffc62).
   zone_stats_interval: "60s"
-  # Алерты в dev — те же 60 с (как до T-206): живая приёмка выигрывает
-  # от мгновенной реакции окон; боевой дефолт — 5 мин (прежняя частота).
+  # Alerts in dev — the same 60 s (as before T-206): live acceptance wins
+  # from the instant window reaction; the production default — 5 min (the
+  # previous frequency).
   alerts_interval: "60s"
-  # Зонд алерта мусорных content_hash (T-099): /metrics сервиса ingest
-  # по имени сервиса в docker-сети (то же, что скрейпит Prometheus).
+  # The junk content_hash alert probe (T-099): the /metrics of the ingest
+  # service by the service name in the docker network (the same as
+  # Prometheus scrapes).
   ingest_metrics_url: "http://ingest:9101/metrics"
-  # Зонд алерта бюджета доли фолбэка рендера (T-246): /metrics
-  # render-worker по имени сервиса в docker-сети.
+  # The render fallback share budget alert probe (T-246): the render
+  # worker's /metrics by the service name in the docker network.
   render_metrics_url: "http://render-worker:9105/metrics"
 
 web:
-  # dev: лендинг слушает все интерфейсы контейнера (:8080 — внутри
-  # docker-сети), наружу порт публикует compose-сервис web на 127.0.0.1
-  # хоста (WEB_PORT); дефолт конфига — loopback под reverse-proxy
-  # (systemd-деплой, deploy/nginx/).
+  # dev: the landing listens on all the container's interfaces (:8080 —
+  # inside the docker network), the compose service web publishes the port
+  # outward on the host's 127.0.0.1 (WEB_PORT); the config default —
+  # loopback behind a reverse-proxy (the systemd deploy, deploy/nginx/).
   listen: ":8080"
 
 dashboard:
-  # dev: дашборд слушает все интерфейсы контейнера (:8090 — внутри
-  # docker-сети), наружу порт публикует compose-сервис dashboard на
-  # 127.0.0.1 хоста (DASHBOARD_PORT); дефолт конфига — loopback под
-  # reverse-proxy с TLS (systemd-деплой, docs/deploy.md §6).
+  # dev: the dashboard listens on all the container's interfaces (:8090 —
+  # inside the docker network), the compose service dashboard publishes the
+  # port outward on the host's 127.0.0.1 (DASHBOARD_PORT); the config
+  # default — loopback behind a reverse-proxy with TLS (the systemd deploy,
+  # docs/deploy.md §6).
   listen: ":8090"
-  # Dev-креды оператора: admin/admin — ТОЛЬКО dev-окружение
-  # (docs/dev-environment.md, «Дашборд»). Перегенерация хэша:
+  # Dev operator credentials: admin/admin — the dev environment ONLY
+  # (docs/dev-environment.md, "Dashboard"). Hash regeneration:
   #   printf 'admin' | docker compose --project-directory . \
   #     -f deploy/docker/compose.yaml --env-file .env \
   #     run --rm -T tools go run ./cmd/crawlerctl dashboard-secret
   username: admin
   password_hash: "pbkdf2-sha256$600000$U4QVNdJGZODPI4hlFGHoNw==$lwv+2vxJN7K3ZQIuEueR0KDOfBrNkQIXccDg3EAWEdo="
-  # Пробы живости сервисов конвейера для секции здоровья (ТЗД §5.8):
-  # имена compose-сервисов и их METRICS_PORT в docker-сети
-  # (METRICS_ADDR=:91xx в compose — тот же адрес, что скрейпит Prometheus).
+  # Pipeline service liveness probes for the health section (dashboard
+  # spec §5.8): the compose service names and their METRICS_PORT in the
+  # docker network (METRICS_ADDR=:91xx in compose — the same address
+  # Prometheus scrapes).
   probes:
     ingest: "http://ingest:9101"
     scheduler: "http://scheduler:9102"
@@ -150,17 +160,18 @@ dashboard:
     render-worker: "http://render-worker:9105"
     analyzer: "http://analyzer:9106"
     monitor: "http://monitor:9100"
-  # Панель движков рендера (T-246): экспозиция основной сборки
-  # render-worker (движок этапа — метки engine). Воркер B фолбэка —
-  # сервис render-fallback профиля runtime (в docker-сети — тот же
-  # дефолт бинарника :9105, т.е. http://render-fallback:9105/metrics;
-  # адрес добавляют для стендовых прогонов фолбэка, docs/render.md);
-  # на стандартном dev-стеке B не поднимается — без него панель
-  # показывает только движок этапа, потребление/глубина — нули.
+  # The render engines panel (T-246): the main render-worker build's
+  # exposition (the stage engine — the engine labels). The fallback worker
+  # B — the render-fallback service of the runtime profile (in the docker
+  # network — the binary's same :9105 default, i.e.
+  # http://render-fallback:9105/metrics; the address is added for bench
+  # fallback runs, docs/render.md); on the standard dev stack B is not
+  # brought up — without it the panel shows only the stage engine,
+  # consumption/depth — zeros.
   render_metrics_urls:
     - "http://render-worker:9105/metrics"
-    # воркер B (раскомментировать для стендовых прогонов фолбэка):
+    # worker B (uncomment for bench fallback runs):
     # - "http://render-fallback:9105/metrics"
 
 log:
-  level: "info"                    # dev: info, для отладки воркеров — debug
+  level: "info"                    # dev: info, debug for debugging the workers

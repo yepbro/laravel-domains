@@ -1,12 +1,13 @@
-# Конфиг go-mutesting для make mutate (docs/mutation-testing.md).
-# Формат — форк avito-tech/go-mutesting (config.yml.dist в его репозитории).
+# go-mutesting config for make mutate (docs/mutation-testing.md).
+# The format is a fork of avito-tech/go-mutesting (config.yml.dist in its repo).
 #
-# Файлы без соседнего *_test.go не мутируются: убить мутанта без тестов
-# невозможно — такие файлы дали бы бесконечный поток «выживших».
-# Файлы, чей тест под build-тегом (например, интеграционным), — по той же
-# причине: go test в мутационном прогоне их не исполняет.
+# Files without a sibling *_test.go are not mutated: killing a mutant without
+# tests is impossible — such files would produce an endless stream of
+# "survivors". Files whose tests live under a build tag (for example, an
+# integration one) are skipped for the same reason: go test in a mutation
+# run does not execute them.
 skip_without_test: true
 skip_with_build_tags: true
 silent_mode: false
-# HTML-отчёт по выжившим мутантам (рядом всегда пишется report.json).
+# HTML report on the surviving mutants (report.json is always written alongside).
 html_output: true

@@ -1,5 +1,5 @@
-# Кэш слоёв BuildKit для CI (GitHub Actions, type=gha).
-# Применяется ТОЛЬКО в CI явным ключом -f; локально файл не используется:
+# BuildKit layer cache for CI (GitHub Actions, type=gha).
+# Applied ONLY in CI via the explicit -f flag; the file is not used locally:
 #   docker compose -f compose.yaml -f compose.ci.yaml build
 services:
   ingest: &build-cache
@@ -16,6 +16,7 @@ services:
   monitor: *build-cache
   tools: *build-cache
   mockserver: *build-cache
-  # moli (render-engines) попадает в make build через --profile '*': без
-  # кэш-скоупов каждый CI-ран качал бы 45 МБ tarball и ставил apt-пакеты.
+  # moli (render-engines) gets into make build via --profile '*': without
+  # the cache scopes every CI run would download a 45 MB tarball and install
+  # apt packages.
   moli: *build-cache
