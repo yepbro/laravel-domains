@@ -1,14 +1,15 @@
-// Юнит-тесты crawlerctl domain (T-081, ТЗ 5.11) на фейковых пуле (db.DB)
-// и хранилище контента — без БД и пак-файлов. Проверяются точный текст
-// SQL-запросов (контракт с функцией domain_info миграции 000006 — единая
-// точка правды, стиль status_test.go), разбор jsonb-ответа, нормализация
-// форм имени (регистр/точка/unicode/punycode — до обращения к БД),
-// выбор записи для --content (приоритет DOM-рендера), формат сводки
-// (разделы, расшифровка dns_mask, таблица результатов, признаки Laravel
-// с фрагментами и слабыми срабатываниями), машинный вывод (--json —
-// сырой jsonb; found:false для неизвестного) и понятные сообщения
-// «что именно не найдено». Поведение против живого стека — dev-окружение
-// (make domain NAME=…).
+// Unit tests for crawlerctl domain (T-081, spec 5.11) on a fake pool
+// (db.DB) and a fake content store — no DB or pack files. Covered: the
+// exact SQL text (the contract with the domain_info function of
+// migration 000006 — a single source of truth, the status_test.go
+// style), jsonb response parsing, name form normalization
+// (case/trailing dot/unicode/punycode — before touching the DB), the
+// --content record choice (the rendered-DOM priority), the summary
+// format (sections, the dns_mask breakdown, the results table, Laravel
+// signs with evidence fragments and weak rule hits), machine output
+// (--json — the raw jsonb; found:false for an unknown domain) and clear
+// "what exactly was not found" messages. Behavior against the live
+// stack — the dev environment (make domain NAME=…).
 package main
 
 import (
@@ -32,20 +33,21 @@ import (
 	"crawler/internal/idn"
 )
 
-// --- SQL-контракты ----------------------------------------------------------
+// --- SQL contracts ----------------------------------------------------------
 
-// wantDomainInfoSQL / wantZoneLongestSQL — ожидаемый текст запросов;
-// фейк сопоставляет SQL точно, неожидаемый запрос валит тест громко.
+// wantDomainInfoSQL / wantZoneLongestSQL — the expected query texts; the
+// fake matches SQL exactly, an unexpected query fails the test loudly.
 const wantDomainInfoSQL = "SELECT domain_info($1) AS info"
 
 const wantZoneLongestSQL = "SELECT z.name FROM zones AS z " +
 	"WHERE z.name = ANY($1::text[]) " +
 	"ORDER BY length(z.name) DESC, z.name LIMIT 1"
 
-// domainFixtureJSON — типовой ответ domain_info: живой домен с двумя
-// DNS-живыми субдоменами, тремя результатами (апекс DOM, алиас www,
-// ошибка api), агрегатом Laravel и парой срабатываний — уверенное
-// и слабое. Формат — контракт миграции 000006 (T-082).
+// domainFixtureJSON — a typical domain_info response: a live domain with
+// two DNS-alive subdomains, three results (apex DOM, a www alias, an api
+// error), the Laravel aggregate and a couple of rule hits — one
+// confirmed and one weak. The format is the migration 000006 contract
+// (T-082).
 const domainFixtureJSON = `{
   "zone": {"id": 1, "name": "crawl.test", "name_unicode": null},
   "domain": {
@@ -92,7 +94,7 @@ const domainFixtureJSON = `{
   }
 }`
 
-// domainFixtureInfo — разобранный доменныйFixtureJSON.
+// domainFixtureInfo — the parsed domainFixtureJSON.
 func domainFixtureInfo(t *testing.T) domainInfo {
 	t.Helper()
 	var info domainInfo
@@ -102,11 +104,11 @@ func domainFixtureInfo(t *testing.T) domainInfo {
 	return info
 }
 
-// --- фейковый пул (db.DB) ----------------------------------------------------
+// --- fake pool (db.DB) ----------------------------------------------------
 
-// domainPool — db.DB без БД: infos (punycode имя → json domain_info,
-// пустое значение или отсутствие ключа — NULL «не найдено»), zones —
-// справочник для zoneLongestSQL.
+// domainPool — db.DB without a DB: infos (punycode name → domain_info
+// json; an empty value or a missing key — NULL "not found"), zones —
+// the reference table for zoneLongestSQL.
 type domainPool struct {
 	infos map[string]string
 	zones []string
@@ -162,7 +164,7 @@ func (p *domainPool) Query(ctx context.Context, sql string, args ...any) (pgx.Ro
 		if js, ok := p.infos[name]; ok && js != "" {
 			return domainRowsOf([]any{[]byte(js)}), nil
 		}
-		return domainRowsOf([]any{nil}), nil // NULL: не найдено
+		return domainRowsOf([]any{nil}), nil // NULL: not found
 	case zoneLongestSQL:
 		cands, _ := args[0].([]string)
 		best := ""
@@ -185,8 +187,8 @@ func (p *domainPool) Query(ctx context.Context, sql string, args ...any) (pgx.Ro
 	}
 }
 
-// domainRows — pgx.Rows с заготовленными строками (Scan позиционный;
-// nil-значение — SQL NULL). Значения колонок: []byte, string.
+// domainRows — pgx.Rows with prepared rows (positional Scan; a nil
+// value — SQL NULL). Column values: []byte, string.
 type domainRows struct {
 	rows [][]any
 	i    int
@@ -241,9 +243,9 @@ func (r *domainRows) Scan(dest ...any) error {
 	return nil
 }
 
-// --- фейковое хранилище контента ---------------------------------------------
+// --- fake content store ---------------------------------------------
 
-// fakeContentStore — domainContentStore: байты по hex-хэшу или ошибка.
+// fakeContentStore — domainContentStore: bytes by hex hash or an error.
 type fakeContentStore struct {
 	data map[string][]byte
 	err  error
@@ -260,7 +262,7 @@ func (s *fakeContentStore) Get(_ context.Context, h content.Hash) ([]byte, error
 	return d, nil
 }
 
-// --- SQL и семантика выборок ---------------------------------------------------
+// --- SQL and query semantics ---------------------------------------------------
 
 func TestDomainSQLContract(t *testing.T) {
 	if domainInfoSQL != wantDomainInfoSQL {
@@ -271,9 +273,10 @@ func TestDomainSQLContract(t *testing.T) {
 	}
 }
 
-// TestFetchDomainInfo — вызов функции с punycode-именем, разбор jsonb
-// (зона/статусы/dns_alive/результаты/laravel с findings), NULL → found
-// false без ошибки; ошибки пула — с контекстом команды.
+// TestFetchDomainInfo — calling the function with a punycode name,
+// parsing the jsonb (zone/statuses/dns_alive/results/laravel with
+// findings), NULL → found=false without an error; pool errors carry the
+// command context.
 func TestFetchDomainInfo(t *testing.T) {
 	pool := newDomainPool()
 	pool.seedInfo("laravel-11.crawl.test", domainFixtureJSON)
@@ -330,14 +333,14 @@ func TestFetchDomainInfo(t *testing.T) {
 		t.Errorf("signals = %+v", sigs)
 	}
 
-	// NULL «не найдено» — не ошибка.
+	// NULL "not found" — not an error.
 	pool = newDomainPool()
 	_, raw, found, err = fetchDomainInfo(context.Background(), pool, "no-such.crawl.test")
 	if err != nil || found || raw != nil {
 		t.Errorf("NULL: raw=%v found=%v err=%v, хочу nil/false/nil", raw, found, err)
 	}
 
-	// Ошибки пула — с контекстом; nil-пул — ошибка, не паника.
+	// Pool errors carry context; a nil pool is an error, not a panic.
 	boom := errors.New("boom")
 	pool = newDomainPool()
 	pool.setQueryErr(boom)
@@ -348,7 +351,7 @@ func TestFetchDomainInfo(t *testing.T) {
 		t.Error("fetchDomainInfo(nil) = nil, хочу ошибку")
 	}
 
-	// Битый json — ошибка разбора, а не молчание.
+	// Broken json is a parse error, not silence.
 	pool = newDomainPool()
 	pool.seedInfo("bad.crawl.test", "{не json")
 	if _, _, _, err := fetchDomainInfo(context.Background(), pool, "bad.crawl.test"); err == nil || !strings.Contains(err.Error(), "разбор json") {
@@ -356,9 +359,10 @@ func TestFetchDomainInfo(t *testing.T) {
 	}
 }
 
-// TestDomainNormalizeForms — нормализация входа оператора (ТЗ 5.2):
-// регистр, точка на конце, пробелы, unicode и punycode дают одно
-// punycode-имя — оно и уходит в domain_info (аргумент запроса).
+// TestDomainNormalizeForms — operator input normalization (spec 5.2):
+// case, a trailing dot, spaces, unicode and punycode all yield one
+// punycode name — it is what goes into domain_info (the query
+// argument).
 func TestDomainNormalizeForms(t *testing.T) {
 	forms := map[string]string{
 		"laravel-11.crawl.test":   "laravel-11.crawl.test",
@@ -385,8 +389,8 @@ func TestDomainNormalizeForms(t *testing.T) {
 	}
 }
 
-// TestZoneSuffixCandidates — кандидаты в зону: все суффиксы кроме
-// полного имени, длиннейший первым (как режет domain_info).
+// TestZoneSuffixCandidates — zone candidates: all suffixes except the
+// full name, longest first (as domain_info splits them).
 func TestZoneSuffixCandidates(t *testing.T) {
 	cases := []struct {
 		name string
@@ -404,8 +408,8 @@ func TestZoneSuffixCandidates(t *testing.T) {
 	}
 }
 
-// TestFetchCatalogZone — длиннейший суффикс в zones (co.uk предпочтается
-// uk); не найдено — best = длиннейший кандидат, found=false.
+// TestFetchCatalogZone — the longest suffix in zones (co.uk is preferred
+// over uk); not found — best = the longest candidate, found=false.
 func TestFetchCatalogZone(t *testing.T) {
 	pool := newDomainPool()
 	pool.zones = []string{"uk", "co.uk", "test"}
@@ -429,7 +433,7 @@ func TestFetchCatalogZone(t *testing.T) {
 		t.Errorf("нет зоны: zone=%q found=%v err=%v, хочу unknown.tld/false", zone, found, err)
 	}
 
-	// Ошибки и nil-пул.
+	// Errors and a nil pool.
 	pool.setQueryErr(errors.New("boom"))
 	if _, _, err := fetchCatalogZone(context.Background(), pool, "x.test"); err == nil || !strings.Contains(err.Error(), "domain: зоны:") {
 		t.Errorf("err = %v, хочу контекст «domain: зоны:»", err)
@@ -439,11 +443,11 @@ func TestFetchCatalogZone(t *testing.T) {
 	}
 }
 
-// --- выбор контента ------------------------------------------------------------
+// --- content choice ------------------------------------------------------------
 
-// TestSelectContentResult — приоритет отрендеренной записи (DOM —
-// итоговый результат конвейера), иначе первая запись с контентом
-// в порядке субдомен×вариант; без контента — false.
+// TestSelectContentResult — the rendered record has priority (DOM is the
+// pipeline's final result), otherwise the first record with content in
+// subdomain×variant order; no content — false.
 func TestSelectContentResult(t *testing.T) {
 	hash := "00112233445566778899aabbccddeeff"
 	cases := []struct {
@@ -502,7 +506,7 @@ func TestSelectContentResult(t *testing.T) {
 	}
 }
 
-// --- форматирование ---------------------------------------------------------------
+// --- formatting ---------------------------------------------------------------
 
 func TestSubLabel(t *testing.T) {
 	if got := subLabel(""); got != "(апекс)" {
@@ -546,7 +550,7 @@ func TestHTTPErrorName(t *testing.T) {
 }
 
 func TestFormatDomainTS(t *testing.T) {
-	// timestamptz (ISO 8601 из jsonb) → дата-время; date и мусор — как есть.
+	// timestamptz (ISO 8601 from the jsonb) → date-time; date and junk stay as-is.
 	cases := []struct {
 		in, want string
 	}{
@@ -565,8 +569,9 @@ func TestFormatDomainTS(t *testing.T) {
 	}
 }
 
-// TestResultCells — ячейки таблицы результатов: статус/http 0 и пустой
-// URL без ошибки — «—», контент DOM/HTML/—, алиасы, ошибка с классом.
+// TestResultCells — results table cells: status/http 0 and an empty URL
+// without an error — "—", content DOM/HTML/—, aliases, an error with its
+// class.
 func TestResultCells(t *testing.T) {
 	cases := []struct {
 		name string
@@ -629,12 +634,12 @@ func TestResultCells(t *testing.T) {
 	}
 }
 
-// --- человекочитаемый вывод ---------------------------------------------------------
+// --- human-readable output ---------------------------------------------------------
 
-// TestWriteDomainText — разделы сводки по фикстуре: шапка с зоной
-// и статусами, расшифровка dns_mask, таблица результатов (схема/статус/
-// контент/алиас/URL/ошибка), признаки Laravel с версиями, правилами
-// и фрагментами, слабые срабатывания отдельной секцией.
+// TestWriteDomainText — summary sections against the fixture: a header
+// with the zone and statuses, the dns_mask breakdown, the results table
+// (scheme/status/content/alias/URL/error), Laravel signs with versions,
+// rules and evidence fragments, weak rule hits as a separate section.
 func TestWriteDomainText(t *testing.T) {
 	info := domainFixtureInfo(t)
 
@@ -657,7 +662,7 @@ func TestWriteDomainText(t *testing.T) {
 		}
 	}
 
-	// Строки таблицы: паддинг не проверяем — только ячейки в строке.
+	// Table rows: padding is not checked — only the cells within a line.
 	var apexLine, wwwLine, apiLine string
 	for _, line := range strings.Split(got, "\n") {
 		switch {
@@ -670,9 +675,10 @@ func TestWriteDomainText(t *testing.T) {
 		}
 	}
 
-	// Ширины колонок — в рунах (CLI-11): «субдомен» (7 рун, 14 байт) —
-	// самая широкая ячейка колонки, за ней сразу разделитель, а не байтовый
-	// запас; строки данных паддятся к той же ширине (www → 3 + 4 пробела).
+	// Column widths are in runes (CLI-11): the Cyrillic header cell
+	// (7 runes, 14 bytes) — the widest cell of the column, followed
+	// immediately by the separator, not byte-based slack; data rows are
+	// padded to the same width (www → 3 + 4 spaces).
 	for _, line := range strings.Split(got, "\n") {
 		if strings.HasPrefix(line, "субдомен ") {
 			if !strings.HasPrefix(line, "субдомен вар.") {
@@ -719,9 +725,9 @@ func TestWriteDomainText(t *testing.T) {
 	}
 }
 
-// TestWriteDomainTextVariants — крайние случаи сводки: IDN-домен
-// (unicode-строка и флаги), пустые результаты, отсутствие признаков
-// Laravel, temp-попытки.
+// TestWriteDomainTextVariants — summary edge cases: an IDN domain (the
+// unicode string and flags), empty results, no Laravel signs, temp
+// attempts.
 func TestWriteDomainTextVariants(t *testing.T) {
 	var info domainInfo
 	info.Zone.Name = "xn--p1ai"
@@ -757,10 +763,10 @@ func TestWriteDomainTextVariants(t *testing.T) {
 	}
 }
 
-// --- машинный вывод -------------------------------------------------------------
+// --- machine output -------------------------------------------------------------
 
-// TestWriteDomainJSON — сырой jsonb pretty-print: содержимое не меняется,
-// отступ 2 пробела, завершающий перевод строки.
+// TestWriteDomainJSON — raw jsonb pretty-print: the content is unchanged,
+// a 2-space indent, a trailing newline.
 func TestWriteDomainJSON(t *testing.T) {
 	var b strings.Builder
 	if err := writeDomainJSON(&b, []byte(domainFixtureJSON)); err != nil {
@@ -785,7 +791,7 @@ func TestWriteDomainJSON(t *testing.T) {
 	}
 }
 
-// TestWriteDomainNotFoundJSON — found:false с уточнением по зоне.
+// TestWriteDomainNotFoundJSON — found:false with the zone clarification.
 func TestWriteDomainNotFoundJSON(t *testing.T) {
 	var b bytes.Buffer
 	if err := writeDomainNotFoundJSON(&b, "example.crawl.test", "crawl.test", false); err != nil {
@@ -805,11 +811,12 @@ func TestWriteDomainNotFoundJSON(t *testing.T) {
 	}
 }
 
-// --- не найдено -------------------------------------------------------------------
+// --- not found -------------------------------------------------------------------
 
-// TestDomainNotFound — что именно не найдено (ТЗ 5.11): зона есть —
-// «нет домена с меткой», зоны нет — «зона отсутствует в справочнике»;
-// --json печатает found:false и возвращает ошибку (код 1 через run).
+// TestDomainNotFound — what exactly was not found (spec 5.11): the zone
+// exists — "no domain with the label"; the zone does not exist — "the
+// zone is missing from the reference table"; --json prints found:false
+// and returns an error (code 1 via run).
 func TestDomainNotFound(t *testing.T) {
 	pool := newDomainPool()
 	pool.zones = []string{"crawl.test"}
@@ -825,13 +832,13 @@ func TestDomainNotFound(t *testing.T) {
 		t.Errorf("--json: err=%v out=%s; хочу found:false + zone_found:true + ошибка", err, out.String())
 	}
 
-	pool = newDomainPool() // зон нет вовсе
+	pool = newDomainPool() // no zones at all
 	err = domainNotFound(context.Background(), pool, "example.unknown.tld", false, &strings.Builder{})
 	if err == nil || !strings.Contains(err.Error(), "зона unknown.tld отсутствует в справочнике zones") {
 		t.Errorf("err = %v, хочу «зона unknown.tld отсутствует в справочнике zones»", err)
 	}
 
-	// Ошибка уточнения — ошибка команды, а не «не найдено».
+	// A clarification failure is a command error, not "not found".
 	pool = newDomainPool()
 	pool.setQueryErr(errors.New("boom"))
 	if err := domainNotFound(context.Background(), pool, "x.crawl.test", false, &strings.Builder{}); err == nil || !strings.Contains(err.Error(), "domain: зоны:") {
@@ -839,11 +846,11 @@ func TestDomainNotFound(t *testing.T) {
 	}
 }
 
-// --- контент ----------------------------------------------------------------------
+// --- content ----------------------------------------------------------------------
 
-// TestWriteDomainContent — stdout получает ровно байты выбранной записи,
-// stderr — сводку и пометку (запись, вид, размер, хэш); отсутствие
-// контента и ошибки хранилища — понятные ошибки.
+// TestWriteDomainContent — stdout receives exactly the bytes of the
+// selected record, stderr — the summary and the note (record, kind,
+// size, hash); missing content and store errors are clear errors.
 func TestWriteDomainContent(t *testing.T) {
 	info := domainFixtureInfo(t)
 	page := []byte("<!DOCTYPE html><html><body>Laravel 11</body></html>\n")
@@ -859,7 +866,7 @@ func TestWriteDomainContent(t *testing.T) {
 		t.Errorf("stdout = %q, хочу только байты контента", stdout.String())
 	}
 	for _, want := range []string{
-		"домен:        laravel-11.crawl.test", // сводка — в stderr
+		"домен:        laravel-11.crawl.test", // the summary goes to stderr
 		"контент (--content): субдомен (апекс), вариант main, DOM (рендер),",
 		fmt.Sprintf(" %d байт, хэш 00112233445566778899aabbccddeeff", len(page)),
 	} {
@@ -868,7 +875,7 @@ func TestWriteDomainContent(t *testing.T) {
 		}
 	}
 
-	// Записи с контентом нет — понятная ошибка.
+	// A record with no content — a clear error.
 	noContent := info
 	noContent.Results = []domainResult{{Subdomain: "api", Error: 1}}
 	if err := writeDomainContent(context.Background(), store, noContent, 0.6, &stdout, &stderr); err == nil ||
@@ -876,8 +883,9 @@ func TestWriteDomainContent(t *testing.T) {
 		t.Errorf("err = %v, хочу «нет сохранённого контента»", err)
 	}
 
-	// Хэш из функции битый (не 16 байт hex) — ошибка данных, не паника.
-	// Апекс показывается меткой «(апекс)», а не пустой сырой строкой.
+	// A broken hash from the function (not 16 hex bytes) — a data error,
+	// not a panic. The apex is shown with the apex label (a Russian
+	// literal), not an empty raw string.
 	badHash := info
 	badHash.Results = []domainResult{{Subdomain: "", ContentHash: "abc", Rendered: true}}
 	if err := writeDomainContent(context.Background(), store, badHash, 0.6, &stdout, &stderr); err == nil ||
@@ -886,7 +894,8 @@ func TestWriteDomainContent(t *testing.T) {
 		t.Errorf("err = %v, хочу «некорректный content_hash» с меткой (апекс)", err)
 	}
 
-	// Хранилище не нашло байты (ссылка есть, блока нет) — ошибка с хэшем.
+	// The store did not find the bytes (the reference exists, the block
+	// does not) — an error carrying the hash.
 	store = &fakeContentStore{err: content.ErrNotFound}
 	if err := writeDomainContent(context.Background(), store, info, 0.6, &stdout, &stderr); err == nil ||
 		!strings.Contains(err.Error(), "00112233445566778899aabbccddeeff") {
@@ -894,13 +903,14 @@ func TestWriteDomainContent(t *testing.T) {
 	}
 }
 
-// --- роутинг/коды -------------------------------------------------------------------
+// --- routing/codes -------------------------------------------------------------------
 
-// TestRunDomain — путь выполнения без инфраструктуры: команде нужен
-// конфиг (DSN PostgreSQL) — при его отсутствии ошибка выполнения (код 1)
-// до соединений (стиль TestRunStatus). Валидация входа идёт раньше:
-// неверное имя и сочетание флагов — код 2 даже без конфигурации;
-// нормализованные формы имени проходят валидацию (доходят до конфига).
+// TestRunDomain — the execution path without infrastructure: the command
+// needs a config (the PostgreSQL DSN) — without one, an execution error
+// (code 1) before any connections (the TestRunStatus style). Input
+// validation comes first: a bad name and an incompatible flag
+// combination are code 2 even without configuration; normalized name
+// forms pass validation (they reach the config).
 func TestRunDomain(t *testing.T) {
 	t.Setenv("CRAWLER_CONFIG", filepath.Join(t.TempDir(), "missing.yaml"))
 
@@ -921,8 +931,8 @@ func TestRunDomain(t *testing.T) {
 		t.Errorf("stdout до соединения не пуст:\n%s", stdout)
 	}
 
-	// Формы имени (регистр/точка/unicode) проходят нормализацию — та же
-	// ошибка конфигурации, не «некорректное имя».
+	// Name forms (case/trailing dot/unicode) pass normalization — the same
+	// configuration error, not a bad-name usage error.
 	for _, name := range []string{"Laravel-11.CRAWL.Test.", "пример.crawl.test", "xn--e1afmkfd.crawl.test"} {
 		code, _, stderr = runCase("domain", "--json", name)
 		if code != exitError || !strings.Contains(stderr, "domain: config:") {
@@ -930,7 +940,7 @@ func TestRunDomain(t *testing.T) {
 		}
 	}
 
-	// Валидация входа — раньше конфигурации.
+	// Input validation comes before the configuration.
 	code, _, stderr = runCase("domain", "bad!!name.test")
 	if code != exitUsage || !strings.Contains(stderr, "некорректное имя домена") {
 		t.Errorf("невалидное имя: код %d, stderr:\n%s; хочу код 2", code, stderr)

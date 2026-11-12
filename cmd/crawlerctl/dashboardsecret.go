@@ -1,10 +1,11 @@
 // ---------------------------------------------------------------- dashboard-secret
 //
-// Команда генерации хэша пароля оператора дашборда (ТЗД §7.3, T-127):
-// печатает готовую строку dashboard.password_hash формата ТЗД §7.2.
-// KDF, разбор и сверка формата — пакет internal/dashboard/auth (его же
-// использует cmd/dashboard, T-128). Команда работает без инфраструктуры
-// (БД/Redis не нужны).
+// Command for generating the dashboard operator password hash
+// (dashboard spec §7.3, T-127): prints a ready-made
+// dashboard.password_hash string in the dashboard spec §7.2 format.
+// KDF, parsing and format verification live in the
+// internal/dashboard/auth package (cmd/dashboard uses it too, T-128).
+// The command runs without infrastructure (no DB/Redis needed).
 
 package main
 
@@ -18,7 +19,7 @@ import (
 	"crawler/internal/dashboard/auth"
 )
 
-// dashboardSecretHelp — справка crawlerctl dashboard-secret --help.
+// dashboardSecretHelp — help text for crawlerctl dashboard-secret --help.
 const dashboardSecretHelp = `crawlerctl dashboard-secret — генерация хэша пароля дашборда
 
 Использование:
@@ -42,7 +43,7 @@ PBKDF2-HMAC-SHA256, 600000 итераций (OWASP), соль 16 байт, кл�
 пароль — ошибка использования (код 2).
 `
 
-// stdin — источник пароля команды (шов тестов; в процессе — os.Stdin).
+// stdin — the command's password source (test seam; in-process — os.Stdin).
 var stdin io.Reader = os.Stdin
 
 func cmdDashboardSecret(args []string, stdout, stderr io.Writer) error {
@@ -58,8 +59,9 @@ func cmdDashboardSecret(args []string, stdout, stderr io.Writer) error {
 		password = fs.Arg(0)
 	} else {
 		line, err := bufio.NewReader(stdin).ReadString('\n')
-		// EOF — не ошибка: piped-пароль может быть без перевода строки;
-		// пустой ввод (EOF сразу) станет пустым паролем ниже.
+		// EOF is not an error: a piped password may lack a trailing
+		// newline; empty input (EOF right away) becomes an empty
+		// password below.
 		if err != nil && err != io.EOF {
 			return fmt.Errorf("dashboard-secret: чтение пароля из stdin: %w", err)
 		}

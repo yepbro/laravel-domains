@@ -1,12 +1,13 @@
-// Интеграционный тест наката фикстуры (T-243) против живого PostgreSQL
-// дев-окружения: критерий задачи — повторный накат идемпотентен — на
-// реальном SQL (юнит-тесты проверяют контракты текстом на фейковом пуле,
-// ревью T-243 P2-3). Изоляция — одноразовая схема с миграциями в БД
-// дев-стека (образец withTestSchema интеграционных тестов; сам тест живёт
-// в пакете crawlerctl — вызвает внутренние функции команды напрямую).
-// Запуск: make test-integration (CRAWLER_INTEGRATION=1, БД — APP_PG_DSN
-// tools-контейнера); без переменной тест пропускается (make test его
-// не замечает).
+// Integration test of the fixture import (T-243) against the live
+// PostgreSQL of the dev environment: the task's criterion — a repeated
+// import is idempotent — on real SQL (unit tests check the contracts by
+// text on a fake pool, review T-243 P2-3). Isolation — a one-off schema
+// with migrations in the dev-stack DB (the withTestSchema model of the
+// integration tests; the test itself lives in the crawlerctl package —
+// it calls the command's internal functions directly). Run: make
+// test-integration (CRAWLER_INTEGRATION=1, the DB — the tools
+// container's APP_PG_DSN); without the variable the test is skipped
+// (make test does not notice it).
 package main
 
 import (
@@ -22,7 +23,7 @@ import (
 	"crawler/internal/migrate"
 )
 
-// t243Schema — изолированная схема с миграциями в БД дев-стека.
+// t243Schema — an isolated schema with migrations in the dev-stack DB.
 func t243Schema(t *testing.T) (*pgxpool.Pool, func()) {
 	t.Helper()
 	base := os.Getenv("APP_PG_DSN")
@@ -67,8 +68,8 @@ func t243Schema(t *testing.T) (*pgxpool.Pool, func()) {
 	return pool, func() { pool.Close(); cleanup() }
 }
 
-// dsnSep — разделитель для дописывания параметра в DSN ("?" нет — "?",
-// уже есть — "&").
+// dsnSep — the separator for appending a parameter to the DSN (no "?" —
+// "?", already present — "&").
 func dsnSep(dsn string) string {
 	for i := 0; i < len(dsn); i++ {
 		if dsn[i] == '?' {
@@ -78,11 +79,11 @@ func dsnSep(dsn string) string {
 	return "?"
 }
 
-// TestFixturesImportIdempotentLive — накат дампа v1 на живую схему:
-// повторный накат не размножает строки (дубли ключей нет), состояние
-// дампа восстанавливается (content_hash сбрасывается после имитации
-// прогона воркера), последовательности выше максимума дампа, осиротевший
-// контент прогона выметается повторным накатом.
+// TestFixturesImportIdempotentLive — importing a v1 dump into a live
+// schema: a repeated import does not multiply rows (no duplicate keys),
+// the dump state is restored (content_hash is reset after a worker run
+// simulation), the sequences are above the dump's maximum, the run's
+// orphaned content is swept by the repeated import.
 func TestFixturesImportIdempotentLive(t *testing.T) {
 	if os.Getenv("CRAWLER_INTEGRATION") != "1" {
 		t.Skip("интеграционный тест наката: запустите make test-integration")
@@ -91,7 +92,8 @@ func TestFixturesImportIdempotentLive(t *testing.T) {
 	pool, cleanup := t243Schema(t)
 	defer cleanup()
 
-	// Дамп: строка с контентной ссылкой (ok) и без (heavy NULL-колонки).
+	// Dump: a row with a content reference (ok) and one without (heavy
+	// NULL columns).
 	ts := time.Date(2026, 11, 5, 10, 0, 0, 0, time.UTC)
 	url := "https://fixture.example/"
 	dump := &fixturesDump{
@@ -116,7 +118,7 @@ func TestFixturesImportIdempotentLive(t *testing.T) {
 		return n
 	}
 
-	// Накат №1: строки на месте, контентные ссылки сброшены.
+	// Import #1: the rows are in place, the content references are reset.
 	if _, err := fixturesImportRun(ctx, pool, dump, os.Stdout); err != nil {
 		t.Fatalf("накат 1: %v", err)
 	}
@@ -127,8 +129,9 @@ func TestFixturesImportIdempotentLive(t *testing.T) {
 		t.Fatalf("контентные ссылки не сброшены: %d", n)
 	}
 
-	// Имитация прогона воркера: DOM записан (contents + refcount), строка
-	// переведена в rendered со ссылкой (worker.go: Put → renderUpdateSQL).
+	// Worker run simulation: a DOM is written (contents + refcount), the
+	// row is set to rendered with a reference (worker.go: Put →
+	// renderUpdateSQL).
 	someHash := []byte{9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9}
 	if _, err := pool.Exec(ctx,
 		"INSERT INTO contents (hash, pack_id, off, len, raw_len, refcount) VALUES ($1, 0, 0, 1, 1, 1)", someHash); err != nil {
@@ -139,8 +142,8 @@ func TestFixturesImportIdempotentLive(t *testing.T) {
 		t.Fatalf("имитация рендера: %v", err)
 	}
 
-	// Накат №2 (сброс к состоянию дампа): дубликатов нет, ссылка сброшена,
-	// осиротевший контент прогона выметан (ревью P2-1).
+	// Import #2 (a reset to the dump state): no duplicates, the reference
+	// is reset, the run's orphaned content is swept (review P2-1).
 	var out bytes.Buffer
 	if _, err := fixturesImportRun(ctx, pool, dump, &out); err != nil {
 		t.Fatalf("накат 2: %v", err)
@@ -160,8 +163,8 @@ func TestFixturesImportIdempotentLive(t *testing.T) {
 		t.Errorf("осиротевший контент прогона не убран повторным накатом: %d", n)
 	}
 
-	// Последовательности: выше максимума дампа — новые строки не
-	// сталкиваются с фикстурой (контракт T-242).
+	// Sequences: above the dump's maximum — new rows do not collide with
+	// the fixture (the T-242 contract).
 	var seq int64
 	if err := pool.QueryRow(ctx, "SELECT last_value FROM domain_id_seq").Scan(&seq); err != nil || seq < 77 {
 		t.Errorf("domain_id_seq last_value = %d (err %v), хочу ≥ 77", seq, err)

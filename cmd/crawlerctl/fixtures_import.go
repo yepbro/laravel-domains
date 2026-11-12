@@ -1,52 +1,55 @@
-// ---------------------------------------------------------------- накат
+// ---------------------------------------------------------------- import
 //
-// crawlerctl fixtures import (T-243, ТЗ задач выбора движка рендера
-// tasks/TZ_render_engines.md §6.1 п. 3–4): идемпотентный накат дампа
-// формата v1 (fixtures export, T-242) в тестовую БД стенда и публикация
-// задач фикстуры прямо в q:render — рендер-этап тестируется изолированно,
-// без DNS/HTTP. Тестовая БД изолирована от прода (§6.1 п. 3): миграции
-// дев-стека применяются отдельно, сюда — только строки дампа.
+// crawlerctl fixtures import (T-243, the render engine selection task
+// spec tasks/TZ_render_engines.md §6.1 items 3–4): an idempotent import
+// of a format v1 dump (fixtures export, T-242) into the bench's test DB
+// and publishing of the fixture tasks straight into q:render — the render
+// stage is tested in isolation, without DNS/HTTP. The test DB is
+// isolated from production (§6.1 item 3): the dev-stack migrations are
+// applied separately, only dump rows come here.
 //
-// Идемпотентность наката — по первичным ключам из ключей дампа (строки
-// T-242 сохраняют оригинальные идентификаторы): INSERT … ON CONFLICT (PK)
-// DO UPDATE — повторный накат не дублирует строки, а восстанавливает
-// состояние дампа (прогон воркера меняет строки — rendered, ссылки на
-// контент, маркеры финализации; повторный накат возвращает фикстуру к
-// исходному виду, два прогона сравниваются на одном старте). Единственное
-// сознательное отличие от дампа: content_hash сбрасывается в NULL —
-// контент-хранилище не выгружалось (T-242), продовая ссылка на стенде
-// висячая и ломала бы запись рендера (SwapRefTx, ErrRefIntegrity); DOM
-// на стенде пишет сам рендер. Последовательности — по заметкам контракта
-// T-242 (докомментарий fixtures.go): zones.id — GENERATED ALWAYS AS
-// IDENTITY, оригинальные id входят через OVERRIDING SYSTEM VALUE;
-// domains.id — nextval('domain_id_seq'); после наката обе
-// последовательности выставляются setval'ем выше максимума (GREATEST из
-// максимума таблицы и дампа) — новые зоны/домены стенда не начинаются с 1
-// и не сталкиваются с фикстурой.
+// Import idempotency — by primary keys from the dump keys (T-242 rows
+// keep their original identifiers): INSERT … ON CONFLICT (PK) DO UPDATE —
+// a repeated import does not duplicate rows but restores the dump state
+// (a worker run changes rows — rendered, content references,
+// finalization markers; a repeated import returns the fixture to its
+// original look, so two runs are compared from the same start). The only
+// deliberate difference from the dump: content_hash is reset to NULL —
+// the content store was not exported (T-242), the production reference
+// would dangle on the bench and break the render's write (SwapRefTx,
+// ErrRefIntegrity); the DOM on the bench is written by the render
+// itself. Sequences — per the T-242 contract notes (the fixtures.go doc
+// comment): zones.id — GENERATED ALWAYS AS IDENTITY, original ids enter
+// via OVERRIDING SYSTEM VALUE; domains.id — nextval('domain_id_seq');
+// after the import both sequences are set by setval above the maximum
+// (GREATEST of the table's and the dump's maximum) — the bench's new
+// zones/domains do not start at 1 and do not collide with the fixture.
 //
-// Естественные ключи (zones.name, domains (zone_id, label)) не входят в
-// конфликтный набор: накат по PK предполагает чистую тестовую БД (миграции
-// без данных, §6.1 п. 3); зона/домен с тем же именем, но другим id —
-// конфликт UNIQUE, который проверяется до записи понятной ошибкой (не
-// внутренностями pgcode 23505 от INSERT).
+// Natural keys (zones.name, domains (zone_id, label)) are not in the
+// conflict set: a PK-based import assumes a clean test DB (migrations
+// without data, §6.1 item 3); a zone/domain with the same name but a
+// different id is a UNIQUE conflict that is checked with a clear error
+// before writing (not with pgcode 23505 internals from the INSERT).
 //
-// Публикация (--publish): по одному сообщению queue.Result на строку дампа
-// (тот же контракт, что публикуют HTTP-этап и проход доработки в q:render,
-// renderq.go; Fresh не ставится — его задаёт сам воркер при публикации
-// q:analyze, worker.go) в стрим q:render конфигурации стенда. Режим all —
-// все записи дампа, smoke — только домены smoke-подвыборки (§6.1 п. 6).
-// Дубли ключей внутри выборки отсекаются с подсчётом (дамп T-242 —
-// множество, защита от собранных вручную); повторный запуск import с
-// --publish добавляет записи в стрим заново — между прогонами стрим
-// очищается (инструкция — docs/dev-environment.md).
+// Publishing (--publish): one queue.Result message per dump row (the
+// same contract that the HTTP stage and the rework pass publish into
+// q:render, renderq.go; Fresh is not set — the worker itself sets it
+// when publishing to q:analyze, worker.go) into the bench
+// configuration's q:render stream. Mode all — all dump rows, smoke —
+// only the smoke subsample domains (§6.1 item 6). Duplicate keys within
+// the selection are cut off with a count (the T-242 dump is a set, a
+// guard against hand-assembled ones); rerunning import with --publish
+// adds the tasks into the stream again — the stream is cleared between
+// runs (the instructions are in docs/dev-environment.md).
 //
-// Запись — только с явным --force (S-P3-5, сверхраунд ревью этапа 35;
-// образец — zones collapse --apply): накат перезаписывает зоны/домены/
-// строки результатов по PK и выметает contents, ошибочный DSN необратимо
-// менял бы чужие строки. Без флага — dry-run: цель из DSN (без пароля) и
-// полный план наката без единой записи; с флагом цель и план печатаются
-// перед первой записью. --publish дополняет --force — публикация q:render
-// молча не идёт.
+// Writing — only with an explicit --force (S-P3-5, an extra review round
+// of stage 35; the model is zones collapse --apply): the import
+// overwrites zones/domains/result rows by PK and sweeps contents; a
+// wrong DSN would irreversibly change someone else's rows. Without the
+// flag — a dry-run: the target from the DSN (no password) and the full
+// import plan without a single write; with the flag the target and the
+// plan are printed before the first write. --publish complements
+// --force — the q:render publishing silently does not happen.
 
 package main
 
@@ -70,35 +73,36 @@ import (
 	"crawler/internal/queue"
 )
 
-// fixturesImportBatch — строк дампа в одном INSERT (unnest-массивы): все
-// колонки таблиц — один параметр-массив на колонку (стиль recordInsertSQL,
-// T-058); 500 строк × ≤17 колонок не упирается в лимит протокола
-// (unsigned short параметров), дубль пакетных проходов — как у drain-циклов
-// (subdomainRecheckBatch).
+// fixturesImportBatch — dump rows in one INSERT (unnest arrays): all
+// table columns — one array parameter per column (the recordInsertSQL
+// style, T-058); 500 rows × ≤17 columns does not hit the protocol limit
+// (an unsigned short of parameters), a batch-pass doubling — like the
+// drain cycles (subdomainRecheckBatch).
 const fixturesImportBatch = 500
 
-// Режимы публикации --publish (двузначный флаг: пусто — не публиковать).
+// The --publish publishing modes (a two-valued flag: empty — do not publish).
 const (
-	fixturesPublishAll   = "all"   // все записи дампа (полный прогон §5.1)
-	fixturesPublishSmoke = "smoke" // домены smoke-подвыборки (§6.1 п. 6)
+	fixturesPublishAll   = "all"   // all dump rows (the full §5.1 run)
+	fixturesPublishSmoke = "smoke" // the smoke subsample domains (§6.1 item 6)
 )
 
 // ---------------------------------------------------------------- SQL
 
-// fixturesZoneByNameSQL — естественный ключ зон для предпроверки наката:
-// зона с тем же name, но другим id (конфликт UNIQUE) ловится до INSERT
-// понятной ошибкой. ANY по массиву имён дампа.
+// fixturesZoneByNameSQL — the natural zone keys for the import
+// pre-check: a zone with the same name but a different id (a UNIQUE
+// conflict) is caught before the INSERT with a clear error. ANY over the
+// dump's name array.
 const fixturesZoneByNameSQL = "SELECT id, name FROM zones WHERE name = ANY($1::text[])"
 
-// fixturesDomainByLabelSQL — то же для доменов: (zone_id, label) из
-// unnest-ключей дампа (стиль пакетных операций internal/db).
+// fixturesDomainByLabelSQL — the same for domains: (zone_id, label) from
+// the dump's unnest keys (the batch operation style of internal/db).
 const fixturesDomainByLabelSQL = "SELECT d.zone_id, d.label, d.id FROM domains AS d " +
 	"JOIN unnest($1::int2[], $2::text[]) AS k(zone_id, label) " +
 	"ON d.zone_id = k.zone_id AND d.label = k.label"
 
-// fixturesImportZonesSQL — накат зон по PK: оригинальные id входят мимо
-// identity (OVERRIDING SYSTEM VALUE, контракт T-242), конфликт PK —
-// обновление до состояния дампа (идемпотентность повторного наката).
+// fixturesImportZonesSQL — zone import by PK: original ids enter past
+// the identity (OVERRIDING SYSTEM VALUE, the T-242 contract); a PK
+// conflict — an update to the dump state (re-import idempotency).
 const fixturesImportZonesSQL = "INSERT INTO zones " +
 	"(id, name, name_unicode, is_active, domains_total, domains_checked, updated_at) " +
 	"OVERRIDING SYSTEM VALUE " +
@@ -111,12 +115,12 @@ const fixturesImportZonesSQL = "INSERT INTO zones " +
 	"is_active = EXCLUDED.is_active, domains_total = EXCLUDED.domains_total, " +
 	"domains_checked = EXCLUDED.domains_checked, updated_at = EXCLUDED.updated_at"
 
-// fixturesImportDomainsSQL — накат доменов по PK (zone_id, id); метка и
-// состояние — из дампа (UNIQUE (zone_id, label) закрыт предпроверкой).
-// last_checked_at приводится к date из timestamptz со сдвигом в UTC
-// (AT TIME ZONE 'UTC'): прямое приведение брало бы дату в TimeZone
-// сессии — при отрицательном смещении (стенд вне UTC) дата уезжала бы
-// на день назад.
+// fixturesImportDomainsSQL — domain import by PK (zone_id, id); the
+// label and state come from the dump (UNIQUE (zone_id, label) is covered
+// by the pre-check). last_checked_at is cast to date from timestamptz
+// with a UTC shift (AT TIME ZONE 'UTC'): a direct cast would take the
+// date in the session's TimeZone — with a negative offset (a bench
+// outside UTC) the date would slide a day back.
 const fixturesImportDomainsSQL = "INSERT INTO domains " +
 	"(zone_id, id, label, status, check_state, flags, dns_mask, queued_at, last_checked_at, temp_attempts) " +
 	"SELECT d.zone_id, d.id, d.label, d.status, d.check_state, d.flags, d.dns_mask, " +
@@ -131,18 +135,20 @@ const fixturesImportDomainsSQL = "INSERT INTO domains " +
 	"dns_mask = EXCLUDED.dns_mask, queued_at = EXCLUDED.queued_at, " +
 	"last_checked_at = EXCLUDED.last_checked_at, temp_attempts = EXCLUDED.temp_attempts"
 
-// fixturesImportResultsSQL — накат строк subdomain_results по PK
-// (zone_id, domain_id, subdomain_id, variant): колонки — контракт формата
-// v1 (fixturesResultCols, T-242) + render_failed_at (страта failed);
-// колонок БД вне дампа (addrs/cname/tls/redirects) накат не касается —
-// они не выгружались (обезличивание §6.1 п. 2) и задаче рендера не нужны.
-// content_hash намеренно НЕ накатывается (и сбрасывается в NULL
-// повторным накатом): контент-хранилище не выгружалось (T-242, «DOM
-// пишет сам рендер стенда»), продовая ссылка на стенде висит в воздухе
-// и валит запись результата рендера — SwapRefTx снимает ссылку старого
-// контента и падает ErrRefIntegrity на отсутствующей строке contents
-// (internal/content/refcount.go); NULL — валидное «контента нет»
-// (hasOld=false, воркер пишет свой DOM без свопа).
+// fixturesImportResultsSQL — subdomain_results row import by PK
+// (zone_id, domain_id, subdomain_id, variant): the columns are the
+// format v1 contract (fixturesResultCols, T-242) + render_failed_at (the
+// failed stratum); DB columns outside the dump (addrs/cname/tls/
+// redirects) are untouched by the import — they were not exported
+// (de-identification, §6.1 item 2) and the render task does not need
+// them. content_hash is deliberately NOT imported (and is reset to NULL
+// by a repeated import): the content store was not exported (T-242, "the
+// bench's render writes the DOM itself"), the production reference
+// dangles on the bench and breaks the render result write — SwapRefTx
+// removes the old content's reference and fails with ErrRefIntegrity on
+// the missing contents row (internal/content/refcount.go); NULL is a
+// valid "no content" (hasOld=false, the worker writes its own DOM
+// without a swap).
 const fixturesImportResultsSQL = "INSERT INTO subdomain_results " +
 	"(zone_id, domain_id, subdomain_id, variant, scheme, " +
 	"http_status, final_url, alias_kind, alias_subdomain_id, " +
@@ -170,13 +176,14 @@ const fixturesImportResultsSQL = "INSERT INTO subdomain_results " +
 	"checked_at = EXCLUDED.checked_at, rules_version = EXCLUDED.rules_version, " +
 	"render_failed_at = EXCLUDED.render_failed_at"
 
-// Последовательности наката (заметки контракта T-242): identity зон — по
-// pg_get_serial_sequence (информация о связи есть у GENERATED ALWAYS AS
-// IDENTITY), domain_id_seq — литералом: DEFAULT nextval без OWNED BY не
-// связан с колонкой, pg_get_serial_sequence('domains', 'id') вернул бы
-// NULL (миграция 000001). GREATEST с максимумом таблицы закрывает БД,
-// где до фикстуры уже есть строки с бо́льшими id; setval(v) выставляет
-// last_value=v (is_called) — nextval выдаст v+1.
+// Import sequences (the T-242 contract notes): the zones identity — via
+// pg_get_serial_sequence (GENERATED ALWAYS AS IDENTITY carries the
+// linkage info), domain_id_seq — by literal: a DEFAULT nextval without
+// OWNED BY is not linked to the column, pg_get_serial_sequence('domains',
+// 'id') would return NULL (migration 000001). GREATEST with the table's
+// maximum covers DBs that already have rows with larger ids before the
+// fixture; setval(v) sets last_value=v (is_called) — nextval will
+// return v+1.
 const (
 	fixturesZonesSeqSQL = "SELECT setval(pg_get_serial_sequence('zones', 'id'), " +
 		"GREATEST((SELECT coalesce(max(id), 0) FROM zones), $1::int))"
@@ -185,23 +192,23 @@ const (
 		"GREATEST((SELECT coalesce(max(id), 0) FROM domains), $1::int8))"
 )
 
-// fixturesSweepContentsSQL — уборка осиротевшего контента после прогона
-// (ревью T-243 P2-1): повторный накат сбрасывает content_hash строк, но
-// не трогает contents — ссылки DOM прошлого прогона оставались с
-// refcount > 0 и нулём держателей: компактификация удаляет только
-// refcount = 0, retention выбирает лишь строки с живыми ссылками —
-// контент не освобождался никогда и рос с каждым прогоном. На стенде
-// единственный держатель ссылок — subdomain_results: выметаем строки
-// contents без ссылок (паки на диске подожмёт компактификация
-// хранилища — файлы учёта не держат). Выполняется при остановленных
-// воркерах стенда (Put до записи результата — транзиентная ссылка).
+// fixturesSweepContentsSQL — cleanup of orphaned content after a run
+// (review T-243 P2-1): a repeated import resets the rows' content_hash
+// but does not touch contents — the DOM references of the previous run
+// were left with refcount > 0 and zero holders: compaction removes only
+// refcount = 0, retention picks only rows with live references — the
+// content was never freed and grew with every run. On the bench the only
+// reference holder is subdomain_results: we sweep contents rows without
+// references (compaction of the store will shrink the packs on disk —
+// the accounting files do not hold them). Runs with the bench's workers
+// stopped (Put before the result write — a transient reference).
 const fixturesSweepContentsSQL = "DELETE FROM contents WHERE NOT EXISTS " +
 	"(SELECT 1 FROM subdomain_results AS r WHERE r.content_hash = contents.hash)"
 
-// План наката (S-P3-5) — read-only счётчики для dry-run и вводного
-// вывода --force: существующие по PK строки дампа (разбивка «вставка /
-// обновление») и объём уборки контента — предикат тот же, что у
-// fixturesSweepContentsSQL, но подсчётом, без DELETE.
+// The import plan (S-P3-5) — read-only counters for the dry-run and the
+// --force intro output: dump rows already existing by PK (an insert /
+// update breakdown) and the content cleanup volume — the same predicate
+// as fixturesSweepContentsSQL but counting, without a DELETE.
 const (
 	fixturesPlanZonesExistSQL = "SELECT count(*) FROM zones AS z " +
 		"JOIN unnest($1::int2[]) AS k(id) ON z.id = k.id"
@@ -220,13 +227,13 @@ const (
 		"(SELECT 1 FROM subdomain_results AS r WHERE r.content_hash = contents.hash)"
 )
 
-// ---------------------------------------------------------------- дамп
+// ---------------------------------------------------------------- dump
 
-// fixturesDump — прочитанный дамп формата v1: манифест и строки файлов
-// (структуры — общие с export, T-242). Дубли ключей внутри файлов
-// (дамп T-242 — множество, защита от собранных вручную) вычитываются при
-// чтении: побеждает последняя запись — та же семантика, что у наката
-// поверх существующих строк.
+// fixturesDump — a read format v1 dump: the manifest and the file rows
+// (the structs are shared with export, T-242). Duplicate keys within the
+// files (the T-242 dump is a set, a guard against hand-assembled ones)
+// are folded during reading: the last entry wins — the same semantics as
+// importing over existing rows.
 type fixturesDump struct {
 	Manifest fixturesManifest
 	Zones    []fixturesZone
@@ -239,9 +246,9 @@ type fixturesDump struct {
 	DupResults int
 }
 
-// fixturesReadNDJSON читает файл дампа построчно (один JSON-объект на
-// строку): json.Decoder в потоке — строки дампа (headers/cookies) не
-// ограничены по размеру, bufio.Reader держит память в узде.
+// fixturesReadNDJSON reads a dump file line by line (one JSON object per
+// line): a streaming json.Decoder — dump rows (headers/cookies) are not
+// size-limited, bufio.Reader keeps memory in check.
 func fixturesReadNDJSON[T any](path string) ([]T, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -263,8 +270,8 @@ func fixturesReadNDJSON[T any](path string) ([]T, error) {
 	}
 }
 
-// fixturesDedup схлопывает дубли ключей: побеждает последняя запись
-// (состояние дампа), счётчик — в отчёт.
+// fixturesDedup folds duplicate keys: the last entry wins (the dump
+// state), the counter goes to the report.
 func fixturesDedup[T any, K comparable](rows []T, dups *int, key func(T) K) []T {
 	if len(rows) < 2 {
 		return rows
@@ -284,15 +291,16 @@ func fixturesDedup[T any, K comparable](rows []T, dups *int, key func(T) K) []T 
 	return out
 }
 
-// fixturesReadDump читает и валидирует дамп формата v1. manifest.json
-// появляется в выгрузке последним — его отсутствие означает незавершённый
-// дамп (контракт T-242), накат не выполняется. Счётчики строк файлов в
-// манифесте сверяются с фактически прочитанными (обрезанный при копировании
-// дамп — ошибка, а не молчаливый частичный накат); ссылочная целостность
-// (зоны доменов, домены строк) и уникальность естественных ключей
-// (zones.name, (zone_id, label) доменов — PK-дедуп их не видит, INSERT
-// упал бы pgcode 23505) проверяются до БД: обрезанный или пересобранный
-// руками дамп падает понятной ошибкой.
+// fixturesReadDump reads and validates a format v1 dump. manifest.json
+// appears last in the export — its absence means an incomplete dump (the
+// T-242 contract) and no import happens. The manifest's file row
+// counters are cross-checked against what was actually read (a dump
+// truncated while copying is an error, not a silent partial import);
+// referential integrity (the domains' zones, the rows' domains) and the
+// uniqueness of natural keys (zones.name, the domains' (zone_id, label)
+// — the PK dedup does not see them, the INSERT would fail with pgcode
+// 23505) are checked before the DB: a truncated or hand-reassembled
+// dump fails with a clear error.
 func fixturesReadDump(dir string) (*fixturesDump, error) {
 	raw, err := os.ReadFile(filepath.Join(dir, "manifest.json"))
 	if err != nil {
@@ -308,8 +316,8 @@ func fixturesReadDump(dir string) (*fixturesDump, error) {
 	}
 
 	dump := &fixturesDump{Manifest: manifest}
-	// Чтение до дедупа: счётчик манифеста — про строки файла, дубли
-	// вычитаются после сверки.
+	// Reading before the dedup: the manifest's counter is about the file
+	// rows, duplicates are folded after the cross-check.
 	files := []struct {
 		name string
 		read func() error
@@ -361,16 +369,17 @@ func fixturesReadDump(dir string) (*fixturesDump, error) {
 		}
 	}
 
-	// Дубли ключей внутри файлов — множества с последней записью.
+	// Duplicate keys within the files — sets with the last entry winning.
 	dump.Zones = fixturesDedup(dump.Zones, &dump.DupZones, func(z fixturesZone) int16 { return z.ID })
 	dump.Domains = fixturesDedup(dump.Domains, &dump.DupDomains,
 		func(d fixturesDomain) fixturesDomainKey { return fixturesDomainKey{d.ZoneID, d.ID} })
 	dump.Results = fixturesDedup(dump.Results, &dump.DupResults,
 		func(r fixturesResult) fixturesKey { return fixturesKey{r.ZoneID, r.DomainID, r.SubdomainID, r.Variant} })
 
-	// Идентификаторы положительны: нулевые/отрицательные (битые ручные
-	// дампы) уронят и PK, и очередь (queue.Result.validate) — честнее
-	// упасть до записи с указанием файла.
+	// Identifiers are positive: zero/negative ones (broken hand-made
+	// dumps) would bring down both the PK and the queue
+	// (queue.Result.validate) — it is more honest to fail before writing,
+	// naming the file.
 	seenNames := make(map[string]bool, len(dump.Zones))
 	for _, z := range dump.Zones {
 		if z.ID <= 0 {
@@ -412,11 +421,11 @@ func fixturesReadDump(dir string) (*fixturesDump, error) {
 	return dump, nil
 }
 
-// ---------------------------------------------------------------- накат
+// ---------------------------------------------------------------- import
 
-// fixturesImportStats — итог наката: применённые строки (после дедупа
-// дампа) и выставленные последовательности (0 — не выполнялся: пустой
-// файл дампа, sequence не трогаем).
+// fixturesImportStats — the import result: the applied rows (after the
+// dump dedup) and the set sequences (0 — not executed: an empty dump
+// file, the sequence is untouched).
 type fixturesImportStats struct {
 	Zones     int
 	Domains   int
@@ -425,11 +434,11 @@ type fixturesImportStats struct {
 	DomainSeq int64
 }
 
-// fixturesImportRun — накат дампа в тестовую БД: предпроверки
-// естественных ключей → зоны (OVERRIDING SYSTEM VALUE) → домены →
-// строки результатов → последовательности. Каждый оператор — автокоммит
-// (одноразовый инструмент): прерванный накат повторяется целиком,
-// идемпотентность по PK докатывает то же состояние.
+// fixturesImportRun — the dump import into the test DB: natural-key
+// pre-checks → zones (OVERRIDING SYSTEM VALUE) → domains → result rows →
+// sequences. Every statement autocommits (a one-off tool): an
+// interrupted import is repeated in full, the PK idempotency finishes
+// the same state.
 func fixturesImportRun(ctx context.Context, pool db.DB, dump *fixturesDump, stdout io.Writer) (*fixturesImportStats, error) {
 	if err := fixturesCheckNaturalKeys(ctx, pool, dump); err != nil {
 		return nil, err
@@ -456,9 +465,10 @@ func fixturesImportRun(ctx context.Context, pool db.DB, dump *fixturesDump, stdo
 			return nil, err
 		}
 	}
-	// Уборка осиротевшего контента прошлогопрогона (fixturesSweepContentsSQL):
-	// сброс content_hash строк оставил бы ссылки contents без держателей.
-	// Воркеры стенда в этот момент остановлены (инструкция прогона).
+	// Cleanup of the previous run's orphaned content (fixturesSweepContentsSQL):
+	// resetting the rows' content_hash would leave contents references
+	// without holders. The bench's workers are stopped at this moment
+	// (the run instructions).
 	var swept int64
 	if len(dump.Results) > 0 {
 		tag, err := pool.Exec(ctx, fixturesSweepContentsSQL)
@@ -480,10 +490,11 @@ func fixturesImportRun(ctx context.Context, pool db.DB, dump *fixturesDump, stdo
 	return stats, nil
 }
 
-// fixturesCheckNaturalKeys — зоны с тем же именем и домены с той же
-// меткой, но другим id: конфликт UNIQUE, невидимый для ON CONFLICT по PK.
-// Накат рассчитан на чистую тестовую БД (§6.1 п. 3); конфликт — ошибка с
-// перечнем, а не pgcode 23505 из глубины INSERT.
+// fixturesCheckNaturalKeys — zones with the same name and domains with
+// the same label but a different id: a UNIQUE conflict invisible to ON
+// CONFLICT by PK. The import assumes a clean test DB (§6.1 item 3); a
+// conflict is an error with a list, not a pgcode 23505 from the depths
+// of the INSERT.
 func fixturesCheckNaturalKeys(ctx context.Context, pool db.DB, dump *fixturesDump) error {
 	if len(dump.Zones) > 0 {
 		names := make([]string, 0, len(dump.Zones))
@@ -520,9 +531,9 @@ func fixturesCheckNaturalKeys(ctx context.Context, pool db.DB, dump *fixturesDum
 	if len(dump.Domains) > 0 {
 		zones := make([]int16, 0, len(dump.Domains))
 		labels := make([]string, 0, len(dump.Domains))
-		// Естественный ключ домена — пара (zone_id, label): map по
-		// строковому ключу zone:label (число:текст однозначно, ':'
-		// в DNS-метке недопустим) → id дампа.
+		// The domain's natural key is the (zone_id, label) pair: a map by
+		// the string key zone:label (number:text is unambiguous, ':' is
+		// invalid in a DNS label) → the dump id.
 		byLabel := make(map[string]int64, len(dump.Domains))
 		for _, d := range dump.Domains {
 			zones = append(zones, d.ZoneID)
@@ -557,8 +568,9 @@ func fixturesCheckNaturalKeys(ctx context.Context, pool db.DB, dump *fixturesDum
 	return nil
 }
 
-// fixturesImportZones — накат зон пачками (зон в дампе единицы, пачка —
-// тот же механизм). Возвращает число применённых строк.
+// fixturesImportZones — zone import in batches (a handful of zones in a
+// dump, the batch is the same mechanism). Returns the number of applied
+// rows.
 func fixturesImportZones(ctx context.Context, pool db.DB, zones []fixturesZone) (int, error) {
 	applied := 0
 	for start := 0; start < len(zones); start += fixturesImportBatch {
@@ -596,7 +608,7 @@ func fixturesImportZones(ctx context.Context, pool db.DB, zones []fixturesZone) 
 	return applied, nil
 }
 
-// fixturesImportDomains — накат доменов пачками по fixturesImportBatch.
+// fixturesImportDomains — domain import in fixturesImportBatch batches.
 func fixturesImportDomains(ctx context.Context, pool db.DB, domains []fixturesDomain) (int, error) {
 	applied := 0
 	for start := 0; start < len(domains); start += fixturesImportBatch {
@@ -638,10 +650,11 @@ func fixturesImportDomains(ctx context.Context, pool db.DB, domains []fixturesDo
 	return applied, nil
 }
 
-// fixturesImportResults — накат строк subdomain_results пачками. jsonb
-// (headers/cookies) идёт текстом в jsonb[] (стиль recordInsertSQL, T-058);
-// NULL-колонки — nil-элементы массивов. content_hash не передаётся
-// вовсе (см. fixturesImportResultsSQL): колонка получает DEFAULT NULL.
+// fixturesImportResults — subdomain_results row import in batches. jsonb
+// (headers/cookies) goes as text into jsonb[] (the recordInsertSQL
+// style, T-058); NULL columns are nil array elements. content_hash is
+// not passed at all (see fixturesImportResultsSQL): the column gets
+// DEFAULT NULL.
 func fixturesImportResults(ctx context.Context, pool db.DB, rowsIn []fixturesResult) (int, error) {
 	applied := 0
 	for start := 0; start < len(rowsIn); start += fixturesImportBatch {
@@ -716,8 +729,8 @@ func fixturesImportResults(ctx context.Context, pool db.DB, rowsIn []fixturesRes
 	return applied, nil
 }
 
-// fixturesJSONText — jsonb дампа (json.RawMessage) в элемент text[] для
-// cast jsonb[]: nil (NULL в дампе) остаётся nil.
+// fixturesJSONText — the dump's jsonb (json.RawMessage) into a text[]
+// element for the jsonb[] cast: nil (NULL in the dump) stays nil.
 func fixturesJSONText(raw json.RawMessage) *string {
 	if len(raw) == 0 {
 		return nil
@@ -726,8 +739,8 @@ func fixturesJSONText(raw json.RawMessage) *string {
 	return &s
 }
 
-// fixturesSetval выставляет последовательность и возвращает новое
-// значение (для отчёта).
+// fixturesSetval sets a sequence and returns the new value (for the
+// report).
 func fixturesSetval(ctx context.Context, pool db.DB, sql string, maxID int64) (int64, error) {
 	rows, err := pool.Query(ctx, sql, maxID)
 	if err != nil {
@@ -744,7 +757,7 @@ func fixturesSetval(ctx context.Context, pool db.DB, sql string, maxID int64) (i
 	return v, rows.Err()
 }
 
-// maxDumpZoneID — максимальный id зон дампа (для setval).
+// maxDumpZoneID — the maximum id of the dump's zones (for setval).
 func maxDumpZoneID(zones []fixturesZone) int64 {
 	var max int64
 	for _, z := range zones {
@@ -755,7 +768,7 @@ func maxDumpZoneID(zones []fixturesZone) int64 {
 	return max
 }
 
-// maxDumpDomainID — максимальный id доменов дампа.
+// maxDumpDomainID — the maximum id of the dump's domains.
 func maxDumpDomainID(domains []fixturesDomain) int64 {
 	var max int64
 	for _, d := range domains {
@@ -766,33 +779,35 @@ func maxDumpDomainID(domains []fixturesDomain) int64 {
 	return max
 }
 
-// ---------------------------------------------------------------- план (S-P3-5)
+// ---------------------------------------------------------------- plan (S-P3-5)
 
-// fixturesImportPlan — план наката: цель из DSN без секрета и счётчики по
-// таблицам — всё, что оператор обязан видеть до первой записи. Строится
-// только SELECT'ами: dry-run (без --force) и вводный вывод перед реальным
-// накатом — один и тот же план.
+// fixturesImportPlan — the import plan: the target from the DSN without
+// the secret and the per-table counters — everything the operator must
+// see before the first write. Built with SELECTs only: the dry-run
+// (without --force) and the intro output before a real import are the
+// same plan.
 type fixturesImportPlan struct {
-	Target        string // user@host:port/dbname — без пароля (fixturesImportTarget)
-	Zones         int    // строки дампа к накату (после дедупа)
-	ZonesExist    int    // из них уже в БД по PK → ON CONFLICT DO UPDATE
+	Target        string // user@host:port/dbname — no password (fixturesImportTarget)
+	Zones         int    // dump rows to import (after the dedup)
+	ZonesExist    int    // of them already in the DB by PK → ON CONFLICT DO UPDATE
 	Domains       int
 	DomainsExist  int
 	Results       int
 	ResultsExist  int
-	SweepContents int64 // строк contents выметет накат (сироты без живых ссылок)
-	MaxZoneID     int64 // последовательности поднимутся не ниже максимума дампа
+	SweepContents int64 // contents rows the import will sweep (orphans without live references)
+	MaxZoneID     int64 // the sequences will be raised to at least the dump's maximum
 	MaxDomainID   int64
 	DupZones      int
 	DupDomains    int
 	DupResults    int
 }
 
-// fixturesImportTarget — цель наката из DSN для вывода оператору:
-// user@host:port/dbname без пароля и query-секретов (S-P3-5: накат
-// перезаписывает строки, цель обязана быть на экране до записи — но не
-// весь DSN). DSN не в URL-форме (keyword/value) и неразбораемые строки —
-// db.RedactDSN: пароль вырезан, структура не раскрывается глубже.
+// fixturesImportTarget — the import target from the DSN for the operator
+// output: user@host:port/dbname without the password and query secrets
+// (S-P3-5: the import overwrites rows, the target must be on screen
+// before writing — but not the whole DSN). A DSN not in URL form
+// (keyword/value) and unparsable strings — db.RedactDSN: the password is
+// cut out, the structure is not revealed further.
 func fixturesImportTarget(dsn string) string {
 	u, err := url.Parse(dsn)
 	if err != nil || u.Host == "" || u.Path == "" {
@@ -805,11 +820,11 @@ func fixturesImportTarget(dsn string) string {
 	return user + u.Host + u.Path // host[:port] + /dbname
 }
 
-// fixturesImportPlanBuild — план по дампу и текущему состоянию БД:
-// предпроверки естественных ключей (те же, что у наката, — отказ честнее
-// увидеть в dry-run, до --force), разбивка строк дампа на вставку и
-// обновление по существующим PK, объём выметаемого контента. Только
-// чтение.
+// fixturesImportPlanBuild — the plan over the dump and the current DB
+// state: natural-key pre-checks (the same as the import's — failing is
+// more honest to see in the dry-run, before --force), the dump rows
+// broken down into inserts and updates by existing PKs, the content
+// sweep volume. Read-only.
 func fixturesImportPlanBuild(ctx context.Context, pool db.DB, dump *fixturesDump, target string) (*fixturesImportPlan, error) {
 	if err := fixturesCheckNaturalKeys(ctx, pool, dump); err != nil {
 		return nil, err
@@ -869,7 +884,7 @@ func fixturesImportPlanBuild(ctx context.Context, pool db.DB, dump *fixturesDump
 	return plan, nil
 }
 
-// fixturesCountRows — скалярный count-запрос плана.
+// fixturesCountRows — the plan's scalar count query.
 func fixturesCountRows(ctx context.Context, pool db.DB, sql string, args ...any) (int64, error) {
 	rows, err := pool.Query(ctx, sql, args...)
 	if err != nil {
@@ -886,9 +901,10 @@ func fixturesCountRows(ctx context.Context, pool db.DB, sql string, args ...any)
 	return n, rows.Err()
 }
 
-// fixturesPrintPlan — план наката: цель (сверьте, что это стенд, а не
-// прод), строки по таблицам с разбивкой вставка/обновление,
-// последовательности, дубли ключей дампа, выметаемый контент.
+// fixturesPrintPlan — the import plan: the target (verify this is the
+// bench, not production), rows per table with an insert/update
+// breakdown, the sequences, the dump's duplicate keys, the swept
+// content.
 func fixturesPrintPlan(w io.Writer, plan *fixturesImportPlan, mode string) {
 	out(w, "цель наката: %s (режим: %s)\n", plan.Target, mode)
 	out(w, "план: зоны %d (вставка %d, обновление %d), домены %d (вставка %d, обновление %d), "+
@@ -903,9 +919,9 @@ func fixturesPrintPlan(w io.Writer, plan *fixturesImportPlan, mode string) {
 	out(w, "выметается из contents: %d строк без живых ссылок\n", plan.SweepContents)
 }
 
-// fixturesPublishCount — задач публикации по режиму (строка плана):
-// all — все строки дампа, smoke — строки доменов подвыборки (тот же
-// фильтр, что у fixturesPublishRun).
+// fixturesPublishCount — the publishing tasks per mode (a plan line):
+// all — all dump rows, smoke — the subsample domain rows (the same
+// filter as fixturesPublishRun).
 func fixturesPublishCount(dump *fixturesDump, mode string) int {
 	if mode != fixturesPublishSmoke {
 		return len(dump.Results)
@@ -923,18 +939,19 @@ func fixturesPublishCount(dump *fixturesDump, mode string) int {
 	return n
 }
 
-// fixturesImportOpts — параметры выполнения наката.
+// fixturesImportOpts — the import execution parameters.
 type fixturesImportOpts struct {
-	Force     bool   // запись; без флага — dry-run
-	DSN       string // цель из DSN (без секрета) для плана
-	Publish   string // режим публикации: "", all, smoke (только с Force)
-	RedisAddr string // цель публикации для плана
+	Force     bool   // write; without the flag — a dry-run
+	DSN       string // the target from the DSN (no secret) for the plan
+	Publish   string // the publishing mode: "", all, smoke (only with Force)
+	RedisAddr string // the publishing target for the plan
 }
 
-// fixturesImportApply — план и накат: до первой записи — цель из DSN и
-// полный план; без Force — dry-run, возврат без записи (SELECT'ы плана —
-// не запись); с Force — план печатается и выполняется накат. Выделен из
-// fixturesImportCmd для тестов флага без конфигурации и БД.
+// fixturesImportApply — the plan and the import: before the first write
+// — the target from the DSN and the full plan; without Force — a dry-run,
+// returning without writing (the plan's SELECTs are not writes); with
+// Force — the plan is printed and the import runs. Extracted from
+// fixturesImportCmd for flag tests without configuration and a DB.
 func fixturesImportApply(ctx context.Context, pool db.DB, dump *fixturesDump, opts fixturesImportOpts, stdout io.Writer) error {
 	plan, err := fixturesImportPlanBuild(ctx, pool, dump, fixturesImportTarget(opts.DSN))
 	if err != nil {
@@ -957,11 +974,11 @@ func fixturesImportApply(ctx context.Context, pool db.DB, dump *fixturesDump, op
 	return err
 }
 
-// ---------------------------------------------------------------- публикация
+// ---------------------------------------------------------------- publishing
 
-// fixturesPublishStats — итог публикации: опубликованные задачи, пропущенные
-// дубли ключей, разбивка по стратам дампа и (в smoke-режиме) домены
-// подвыборки.
+// fixturesPublishStats — the publishing result: published tasks, skipped
+// duplicate keys, the breakdown by the dump's strata and (in smoke mode)
+// the subsample domains.
 type fixturesPublishStats struct {
 	Published    int
 	SkippedDups  int
@@ -969,22 +986,23 @@ type fixturesPublishStats struct {
 	SmokeDomains int
 }
 
-// fixturesPublishRun — публикация задач фикстуры в q:render (§6.1 п. 4):
-// по одному queue.Result на строку дампа — тот же контракт, что у
-// продюсеров q:render (renderq.go: HTTP-этап и проход доработки); Fresh
-// не ставится — рендер-воркер сам помечает Fresh публикацию q:analyze
-// (worker.go). Стрим — константа конфигурации стенда; ворота T-174 не
-// участвуют: стенд публикует разово в пустую очередь (долг/глубина —
-// забота живого конвейера, не изолированного прогона).
+// fixturesPublishRun — publishing the fixture tasks into q:render
+// (§6.1 item 4): one queue.Result per dump row — the same contract as
+// the q:render producers (renderq.go: the HTTP stage and the rework
+// pass); Fresh is not set — the render worker itself marks Fresh its
+// q:analyze publishing (worker.go). The stream is the bench
+// configuration's constant; the T-174 gates do not participate: the bench
+// publishes once into an empty queue (debt/depth is the live pipeline's
+// concern, not an isolated run's).
 func fixturesPublishRun(ctx context.Context, q queue.Queue, dump *fixturesDump, mode string, stdout io.Writer) (*fixturesPublishStats, error) {
 	if mode != fixturesPublishAll && mode != fixturesPublishSmoke {
 		return nil, fmt.Errorf("публикация: неизвестный режим %q (допустимы: %s, %s)", mode, fixturesPublishAll, fixturesPublishSmoke)
 	}
 
-	// Имя домена — из строк дампа (label.zone, punycode): его пишут
-	// продюсеры q:render для логов и ручного разбора (ТЗ 4.2). Отсутствие
-	// (рассинхрон дампа исключён чтением) — пустое имя, контракт
-	// queue.Result имя опциональным делает.
+	// The domain name — from the dump rows (label.zone, punycode): the
+	// q:render producers write it for logs and manual analysis (spec
+	// 4.2). An absence (a dump desync is excluded by reading) — an empty
+	// name; the queue.Result contract makes the name optional.
 	labels := make(map[fixturesDomainKey]string, len(dump.Domains))
 	for _, d := range dump.Domains {
 		labels[fixturesDomainKey{d.ZoneID, d.ID}] = d.Label
@@ -1005,7 +1023,7 @@ func fixturesPublishRun(ctx context.Context, q queue.Queue, dump *fixturesDump, 
 		return label + "." + zone
 	}
 
-	// Режим smoke — только строки доменов smoke-подвыборки (§6.1 п. 6).
+	// Smoke mode — only the rows of the smoke subsample domains (§6.1 item 6).
 	selection := dump.Results
 	stats := &fixturesPublishStats{Strata: map[string]int{}}
 	if mode == fixturesPublishSmoke {
@@ -1021,16 +1039,16 @@ func fixturesPublishRun(ctx context.Context, q queue.Queue, dump *fixturesDump, 
 			}
 		}
 		if len(selection) == 0 {
-			// Пустая smoke-подвыборка с кодом 0 неотличима оператору от
-			// рабочего прогона (деградировавший дамп, не тот каталог) —
-			// честный отказ: вызывающий скрипт не должен считать прогон
-			// состоявшимся.
+			// An empty smoke subsample with code 0 is indistinguishable to
+			// the operator from a working run (a degraded dump, the wrong
+			// directory) — an honest refusal: the calling script must not
+			// count the run as having happened.
 			return stats, fmt.Errorf("публикация: smoke-подвыборка пуста (доменов %d, задач 0) — публиковать нечего", stats.SmokeDomains)
 		}
 	}
 
-	// Дубли ключей (множество задач — одинаковый инвариант дампа T-242)
-	// пропускаются с подсчётом: каждая строка — ровно одна задача.
+	// Duplicate keys (a set of tasks — the same invariant as the T-242
+	// dump) are skipped with a count: each row is exactly one task.
 	seen := make(map[fixturesKey]bool, len(selection))
 	for _, r := range selection {
 		k := fixturesKey{r.ZoneID, r.DomainID, r.SubdomainID, r.Variant}
@@ -1068,13 +1086,14 @@ func fixturesPublishRun(ctx context.Context, q queue.Queue, dump *fixturesDump, 
 	return stats, nil
 }
 
-// ---------------------------------------------------------------- команда
+// ---------------------------------------------------------------- command
 
-// fixturesImportCmd — crawlerctl fixtures import: разбор флагов, чтение
-// дампа (локальные проверки до инфраструктуры), план и накат за --force
-// (S-P3-5: без флага — dry-run, --publish дополняет --force), публикация.
-// Подключения — по образцу reanalyze: конфигурация + окружение
-// (internal/config), пул 2 (бюджет ТЗ 6.3), Redis — адрес секции redis.
+// fixturesImportCmd — crawlerctl fixtures import: flag parsing, dump
+// reading (local checks before infrastructure), the plan and the import
+// behind --force (S-P3-5: without the flag — a dry-run, --publish
+// complements --force), publishing. Connections follow the reanalyze
+// pattern: configuration + environment (internal/config), pool 2 (the
+// spec 6.3 budget), Redis — the redis section's address.
 func fixturesImportCmd(args []string, stdout, stderr io.Writer) error {
 	fs := newFlagSet("fixtures import")
 	dir := fs.String("dir", "", "каталог дампа формата v1 (обязателен)")
@@ -1109,8 +1128,8 @@ func fixturesImportCmd(args []string, stdout, stderr io.Writer) error {
 		return fmt.Errorf("fixtures import: %w", err)
 	}
 	poolOpts := db.NewOptions(cfg.Postgres)
-	poolOpts.PoolSize = 2           // бюджет соединений ТЗ 6.3 — у сервисов
-	poolOpts.AppName = "crawlerctl" // метка в pg_stat_activity (T-177)
+	poolOpts.PoolSize = 2           // connection budget per spec 6.3 — same as the services
+	poolOpts.AppName = "crawlerctl" // label in pg_stat_activity (T-177)
 	pool, err := db.Open(ctx, poolOpts)
 	if err != nil {
 		return fmt.Errorf("fixtures import: %w", err)
@@ -1136,7 +1155,7 @@ func fixturesImportCmd(args []string, stdout, stderr io.Writer) error {
 	rdb := queue.NewClient(cfg.Redis.Addr)
 	defer func() { _ = rdb.Close() }()
 	q := queue.NewRedisQueue(rdb, queue.RedisOptions{
-		MaxLen: int64(cfg.Redis.MaxLen), // XADD MAXLEN ~ на каждом стриме (T-025)
+		MaxLen: int64(cfg.Redis.MaxLen), // XADD MAXLEN ~ per stream (T-025)
 	})
 	if _, err := fixturesPublishRun(ctx, q, dump, *publish, stdout); err != nil {
 		return fmt.Errorf("fixtures import: %w", err)

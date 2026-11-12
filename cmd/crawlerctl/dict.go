@@ -1,12 +1,13 @@
-// ---------------------------------------------------------------- словарь zstd
+// ---------------------------------------------------------------- zstd dictionary
 //
-// Команда управления словарём сжатия контента (ТЗ 5.7, ТЗ 13.2: параметры
-// сжатия — на усмотрение разработки). Обучение и переобучение — одно и то
-// же действие (train): файл словаря перезаписывается атомарно, сервисы
-// подхватывают его при следующем старте по пути content.zstd_dictionary.
-// Прежний словарь при переобучении архивируется в реестр прежних словарей
-// (dict-<id>.zstd рядом с новым файлом, T-103) — записанный контент
-// остаётся читаемым. Реализована полностью.
+// Command for managing the content compression dictionary (spec 5.7,
+// spec 13.2: compression parameters are at the developers' discretion).
+// Training and retraining are the same action (train): the dictionary
+// file is overwritten atomically and the services pick it up on the next
+// start via the content.zstd_dictionary path. On retraining the previous
+// dictionary is archived into the retired-dictionary registry
+// (dict-<id>.zstd next to the new file, T-103) — the already written
+// content stays readable. Fully implemented.
 
 package main
 
@@ -23,7 +24,7 @@ import (
 	"crawler/internal/content"
 )
 
-// dictHelp — справка crawlerctl dict --help.
+// dictHelp — help text for crawlerctl dict --help.
 const dictHelp = `crawlerctl dict — управление словарём сжатия zstd (ТЗ 5.7)
 
 Использование:
@@ -41,8 +42,8 @@ testdata/laravel-samples. Переобучение — повторный зап
 остаются читаемыми.
 `
 
-// dictTrainSampleDefault — каталог образцов по умолчанию (как у test-rules):
-// в dev-контейнере tools репозиторий смонтирован в /src.
+// dictTrainSampleDefault — default sample directory (same as test-rules):
+// in the tools dev container the repository is mounted at /src.
 const dictTrainSampleDefault = "testdata/laravel-samples"
 
 func cmdDict(args []string, stdout, stderr io.Writer) error {
@@ -73,15 +74,16 @@ func dictTrain(args []string, stdout, stderr io.Writer) error {
 			samplePaths = append(samplePaths, v)
 			return nil
 		})
-	// Стандартный flag останавливает разбор на первом позиционном аргументе,
-	// а по справке выходной файл идёт до --samples: флаги (и их значения)
-	// переставляются в начало, позиционные — в конец.
+	// The standard flag package stops parsing at the first positional
+	// argument, while the help puts the output file before --samples:
+	// flags (and their values) are moved to the front, positionals to
+	// the end.
 	var pass, pos []string
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		switch {
 		case a == "--":
-			// Терминатор флагов: остальное — позиционные аргументы.
+			// Flag terminator: everything after it is a positional argument.
 			pos = append(pos, args[i+1:]...)
 			i = len(args)
 		case a == "-h" || a == "--help":
@@ -95,7 +97,7 @@ func dictTrain(args []string, stdout, stderr io.Writer) error {
 		case strings.HasPrefix(a, "-samples=") || strings.HasPrefix(a, "--samples="):
 			pass = append(pass, a)
 		case strings.HasPrefix(a, "-"):
-			pass = append(pass, a) // неизвестный флаг — ошибка разбора с именем
+			pass = append(pass, a) // unknown flag — a parse error carrying the name
 		default:
 			pos = append(pos, a)
 		}
@@ -132,8 +134,9 @@ func dictTrain(args []string, stdout, stderr io.Writer) error {
 	}
 	out(stdout, "dict train: словарь обучен: %d байт, ID %08x\n", len(d.Raw()), d.ID())
 
-	// Замер на обучающем корпусе — ориентир для оператора (реальный эффект
-	// измеряется на новых страницах того же шаблона).
+	// Measurement on the training corpus — a reference point for the
+	// operator (the real effect is measured on fresh pages of the same
+	// template).
 	var plainSum, dictSum, evalBytes int
 	for _, s := range samples {
 		plainSum += len(content.Compress(s))
@@ -143,10 +146,11 @@ func dictTrain(args []string, stdout, stderr io.Writer) error {
 	out(stdout, "dict train: оценка сжатия корпуса %d байт: без словаря %d, со словарём %d\n",
 		evalBytes, plainSum, dictSum)
 
-	// Прежний словарь — в реестр прежних (T-103): до записи нового файла,
-	// сбой архивации оставляет прежний активным. Переобучение не делает
-	// записанный контент нечитаемым — прежний словарь читается ленивой
-	// до-регистрацией. Тот же ID (тот же корпус) — архивировать нечего.
+	// The previous dictionary goes to the retired registry (T-103) before
+	// the new file is written: an archiving failure leaves the previous
+	// one active. Retraining does not make written content unreadable —
+	// the previous dictionary is read back via lazy re-registration.
+	// Same ID (same corpus) — nothing to archive.
 	if prev, err := content.LoadDict(outPath); err == nil {
 		if prev.ID() != d.ID() {
 			regPath := content.DictRegistryPath(filepath.Dir(outPath), prev.ID())
@@ -157,8 +161,9 @@ func dictTrain(args []string, stdout, stderr io.Writer) error {
 			out(stdout, "dict train: прежний словарь ID %08x — в реестре: %s\n", prev.ID(), regPath)
 		}
 	} else if !errors.Is(err, iofs.ErrNotExist) {
-		// Прежний файл не словарь: читаемости старых паков он не даёт,
-		// новый запишется поверх — оператору знать.
+		// The previous file is not a dictionary: it cannot make old packs
+		// readable, and the new one will be written over it — the
+		// operator should know.
 		out(stderr, "dict train: прежний файл %s не является словарём zstd (%v), архивация пропущена\n",
 			outPath, err)
 	}
@@ -170,17 +175,17 @@ func dictTrain(args []string, stdout, stderr io.Writer) error {
 	return nil
 }
 
-// collectSampleFiles собирает пути HTML-файлов: каждый путь — файл или
-// каталог (рекурсивный обход, только *.html/*.htm). Порядок лексический
-// (WalkDir) — обучение детерминировано.
+// collectSampleFiles collects HTML file paths: each path is a file or a
+// directory (recursive walk, only *.html/*.htm). The order is lexical
+// (WalkDir) — training is deterministic.
 func collectSampleFiles(paths []string) ([]string, error) {
 	var files []string
 	for _, p := range paths {
 		st, err := os.Stat(p)
 		if err != nil {
-			// Путь образцов указывается в справке, а не в сырой ошибке os:
-			// «stat …: no such file» без контекста не говорит, что это
-			// именно --samples.
+			// The samples path is named in the error, not the raw os error:
+			// "stat …: no such file" without context does not say it is
+			// --samples.
 			return nil, fmt.Errorf("образцы %s: %w", p, err)
 		}
 		if !st.IsDir() {
@@ -205,7 +210,7 @@ func collectSampleFiles(paths []string) ([]string, error) {
 	return files, nil
 }
 
-// isHTMLFile — расширение файла .html/.htm.
+// isHTMLFile — the file extension is .html/.htm.
 func isHTMLFile(path string) bool {
 	switch strings.ToLower(filepath.Ext(path)) {
 	case ".html", ".htm":
@@ -214,8 +219,8 @@ func isHTMLFile(path string) bool {
 	return false
 }
 
-// readSamples читает файлы по порядку, пока суммарный размер не превысит
-// limit: память переобучения ограничена даже на огромном каталоге образцов.
+// readSamples reads files in order until the total size exceeds limit:
+// retraining memory is capped even on a huge sample directory.
 func readSamples(files []string, limit int) ([][]byte, int) {
 	samples := make([][]byte, 0, len(files))
 	var total int
@@ -225,7 +230,7 @@ func readSamples(files []string, limit int) ([][]byte, int) {
 		}
 		b, err := os.ReadFile(f)
 		if err != nil {
-			continue // нечитаемый образец пропускаем: обучение не должно падать из-за одного файла
+			continue // skip an unreadable sample: training must not fail because of one file
 		}
 		samples = append(samples, b)
 		total += len(b)

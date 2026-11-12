@@ -1,8 +1,9 @@
-// Юнит-тесты команды crawlerctl counters (T-178, ТЗИ §9): справка и
-// роутинг подкоманд (коды 0/2), ошибки использования (лишние аргументы,
-// отрицательный допуск), разрешение имени зоны (некорректное имя — код
-// 2), формат возраста. Выполнение list/recount/verify против живой БД —
-// интеграционные тесты (test/integration/counters_test.go).
+// Unit tests for the crawlerctl counters command (T-178,
+// incremental-counters spec §9): help and subcommand routing (codes 0/2),
+// usage errors (extra arguments, negative tolerance), zone name
+// resolution (a bad name — code 2), age format. Running
+// list/recount/verify against a live DB — integration tests
+// (test/integration/counters_test.go).
 package main
 
 import (
@@ -14,9 +15,9 @@ import (
 	"time"
 )
 
-// TestCountersHelp — справка: общая (counters --help) и каждой
-// подкоманды начинается с имени, содержит «Использование» и коды
-// возврата; run даёт 0.
+// TestCountersHelp — help: the general one (counters --help) and each
+// subcommand's start with the name, contain the usage heading (a Russian
+// literal until stage 5) and the exit codes; run returns 0.
 func TestCountersHelp(t *testing.T) {
 	for _, args := range [][]string{
 		{"counters", "--help"},
@@ -41,8 +42,9 @@ func TestCountersHelp(t *testing.T) {
 	}
 }
 
-// TestCountersRouting — роутинг: без подкоманды и неизвестная — код 2;
-// подкоманда с лишними аргументами — код 2 (до обращения к БД).
+// TestCountersRouting — routing: no subcommand and unknown subcommand —
+// code 2; a subcommand with extra arguments — code 2 (before touching
+// the DB).
 func TestCountersRouting(t *testing.T) {
 	cases := []struct {
 		name string
@@ -69,8 +71,8 @@ func TestCountersRouting(t *testing.T) {
 	}
 }
 
-// TestCountersVerifyUsage — значение флагов: отрицательный допуск —
-// код 2 (до обращения к БД).
+// TestCountersVerifyUsage — flag validation: negative tolerance —
+// code 2 (before touching the DB).
 func TestCountersVerifyUsage(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := run([]string{"counters", "verify", "--tolerance", "-1"}, &stdout, &stderr)
@@ -82,11 +84,11 @@ func TestCountersVerifyUsage(t *testing.T) {
 	}
 }
 
-// TestCountersZoneFlagUsage — некорректное имя зоны (символ вне
-// UTS-46: «_»): ошибка использования ДО обращения к БД, код 2 —
-// поведение не зависит от доступности стека (CI гоняет юнит-прогоны
-// без postgres; пробелы cleanup вырезает — «a b.test» нормализуется
-// в валидное «ab.test» и годится только веткой живого стека).
+// TestCountersZoneFlagUsage — a bad zone name (a character outside
+// UTS-46: "_"): usage error BEFORE touching the DB, code 2 — the
+// behavior does not depend on stack availability (CI runs unit passes
+// without postgres; cleanup strips spaces — "a b.test" normalizes to
+// the valid "ab.test" and would only pass via the live-stack branch).
 func TestCountersZoneFlagUsage(t *testing.T) {
 	for _, sub := range []string{"recount", "verify"} {
 		var stdout, stderr bytes.Buffer
@@ -100,8 +102,8 @@ func TestCountersZoneFlagUsage(t *testing.T) {
 	}
 }
 
-// TestCountersAge — формат возраста: NULL/zero — «—», секунды, минуты,
-// часы, сутки.
+// TestCountersAge — age format: NULL/zero — "—", seconds, minutes,
+// hours, days.
 func TestCountersAge(t *testing.T) {
 	if got := countersAge(time.Time{}); got != "—" {
 		t.Errorf("нулевое время = %q, хочу «—»", got)
@@ -121,14 +123,15 @@ func TestCountersAge(t *testing.T) {
 			t.Errorf("возраст(%v) = %q, хочу %q", tc.ago, got, tc.want)
 		}
 	}
-	// Отрицательный возраст (будущее) клампится — не «−3с назад».
+	// Negative age (the future) is clamped — not "-3s ago".
 	if got := countersAge(now.Add(time.Minute)); !strings.HasSuffix(got, "назад") || strings.HasPrefix(got, "-") {
 		t.Errorf("будущее = %q, хочу кламп", got)
 	}
 }
 
-// TestCountersFlagHelpRequested — help-токен первой позицией обрабатывается
-// до разбора флагов подкоманд (контракт parseFlags «help»).
+// TestCountersFlagHelpRequested — a help token in the first position is
+// handled before the subcommand's flag parsing (the parseFlags "help"
+// contract).
 func TestCountersFlagHelpRequested(t *testing.T) {
 	fs := newFlagSet("counters verify")
 	fs.Int64("tolerance", 0, "")

@@ -1,13 +1,13 @@
 // ---------------------------------------------------------------- counters
 //
-// crawlerctl counters (T-178, ТЗИ §9): управление инкрементальными
-// счётчиками конвейера — значения (list), ручной пересчёт реконсиляцией
-// (recount переиспользует Once-функции monitor — SQL в одной точке
-// правды) и сверка без записи (verify). Назначение: восстановление
-// после инцидентов (сбой между переходом и дельтой чинит очередной
-// проход monitor; здесь — руками), cron-пересчёт для малых корпусов без
-// постоянного monitor, послеоперационная сверка (миграции,
-// восстановление из бэкапа).
+// crawlerctl counters (T-178, incremental-counters spec §9): management of
+// the pipeline's incremental counters — values (list), manual recount via
+// reconciliation (recount reuses the monitor Once functions — SQL kept in
+// a single source of truth), and a read-only cross-check (verify).
+// Purpose: recovery after incidents (a failure between a transition and
+// its delta is repaired by the next monitor pass; here — by hand), cron
+// recount for small corpora without a permanent monitor, post-maintenance
+// cross-check (migrations, restore from backup).
 
 package main
 
@@ -27,7 +27,7 @@ import (
 	"crawler/internal/monitor"
 )
 
-// countersHelp — справка crawlerctl counters --help.
+// countersHelp — help text for crawlerctl counters --help.
 const countersHelp = `crawlerctl counters — инкрементальные счётчики конвейера (T-178)
 
 Использование:
@@ -56,20 +56,20 @@ monitor.zone_stats_interval).
 
 // ---------------------------------------------------------------- SQL list
 
-// countersListZonesSQL — итоги справочника зон для list: суммы колонок
-// (все живые домены корпуса) и живость обновления (max(updated_at) —
-// момент последней реконсиляции).
+// countersListZonesSQL — zone reference-table totals for list: sums of
+// columns (all live domains of the corpus) and update freshness
+// (max(updated_at) — the moment of the last reconciliation).
 const countersListZonesSQL = "SELECT coalesce(sum(domains_total), 0), " +
 	"coalesce(sum(domains_pending), 0), coalesce(sum(domains_queued), 0), " +
 	"coalesce(sum(domains_checked), 0), coalesce(sum(domains_laravel), 0), " +
 	"max(updated_at), count(*) FROM zones"
 
-// countersListRowsSQL — строки глобальных счётчиков для list.
+// countersListRowsSQL — global counter rows for list.
 const countersListRowsSQL = "SELECT name, value, updated_at FROM crawler_counters ORDER BY name"
 
-// cmdCounters — роутинг подкоманд: list | recount | verify; help-токены
-// до имени подкоманды печатают общую справку (контракт TestRunHelp-
-// PerCommand: crawlerctl counters --help → код 0).
+// cmdCounters — subcommand routing: list | recount | verify; help tokens
+// before the subcommand name print the general help (the TestRunHelp-
+// PerCommand contract: crawlerctl counters --help → exit code 0).
 func cmdCounters(args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
 		return usagef("укажите подкоманду: crawlerctl counters list|recount|verify")
@@ -89,8 +89,8 @@ func cmdCounters(args []string, stdout, stderr io.Writer) error {
 	}
 }
 
-// openCountersPool — пул команды (стиль near): бюджет соединений ТЗ 6.3,
-// метка в pg_stat_activity (T-177).
+// openCountersPool — command pool (near style): connection budget per
+// spec 6.3, label in pg_stat_activity (T-177).
 func openCountersPool(ctx context.Context) (*pgxpool.Pool, error) {
 	cfg, err := config.Load()
 	if err != nil {
@@ -106,9 +106,9 @@ func openCountersPool(ctx context.Context) (*pgxpool.Pool, error) {
 	return pool, nil
 }
 
-// countersZoneName — punycode-имя зоны: нормализация/синтаксис ДО
-// обращения к БД (некорректное имя — ошибка использования, код 2,
-// без зависимости от доступности стека); пустое имя — все зоны.
+// countersZoneName — punycode zone name: normalization/syntax checked
+// BEFORE touching the DB (a bad name is a usage error, exit code 2,
+// without depending on stack availability); empty name — all zones.
 func countersZoneName(name string) (string, error) {
 	if name == "" {
 		return "", nil
@@ -120,8 +120,8 @@ func countersZoneName(name string) (string, error) {
 	return normalized, nil
 }
 
-// countersResolveZone — нормализованное имя зоны → id справочника;
-// пустое имя — nil (все зоны).
+// countersResolveZone — normalized zone name → reference-table id;
+// empty name — nil (all zones).
 func countersResolveZone(ctx context.Context, pool *pgxpool.Pool, normalized string) (*int16, string, error) {
 	if normalized == "" {
 		return nil, "все", nil
@@ -136,8 +136,7 @@ func countersResolveZone(ctx context.Context, pool *pgxpool.Pool, normalized str
 	return &id, normalized, nil
 }
 
-// countersAge — возраст момента относительно сейчас («5м назад», «—»
-// для NULL).
+// countersAge — age of a moment relative to now ("5m ago", "—" for NULL).
 func countersAge(at time.Time) string {
 	if at.IsZero() {
 		return "—"
@@ -152,9 +151,9 @@ func countersAge(at time.Time) string {
 	return fmt.Sprintf("%s назад", monitorAgeDuration(d))
 }
 
-// monitorAgeDuration — округлый интервал возраста (формат
-// status.FormatDuration без зависимости от пакета status в CLI-таблице:
-// словарь тот же).
+// monitorAgeDuration — rounded age interval (the status.FormatDuration
+// format without depending on the status package in the CLI table:
+// same vocabulary).
 func monitorAgeDuration(d time.Duration) string {
 	switch {
 	case d < time.Hour:
@@ -186,9 +185,9 @@ func countersList(args []string, stdout, stderr io.Writer) error {
 	}
 	defer pool.Close()
 
-	// Зоны — итоги справочника (id, total, pending, queued, checked,
-	// laravel, возраст последней реконсиляции; count — отличить пустой
-	// справочник от «реконсиляции ещё не было», ревью P3-6).
+	// Zones — reference-table totals (id, total, pending, queued, checked,
+	// laravel, age of the last reconciliation; count distinguishes an
+	// empty reference table from "no reconciliation yet", review P3-6).
 	var z struct {
 		total, pending, queued, checked, laravel int64
 		updated                                  *time.Time
@@ -212,7 +211,7 @@ func countersList(args []string, stdout, stderr io.Writer) error {
 	}
 	rows.Close()
 
-	// Глобальные счётчики — построчно.
+	// Global counters — line by line.
 	crows, err := pool.Query(ctx, countersListRowsSQL)
 	if err != nil {
 		return fmt.Errorf("counters list: счётчики: %w", err)
@@ -370,7 +369,7 @@ func countersVerify(args []string, stdout, stderr io.Writer) error {
 	for _, p := range mismatch {
 		out(stdout, "  %-32s %14d %14d %d\n", p.Counter, p.Old, p.New, p.Drift())
 	}
-	// Код 1: дрейф есть — вызывающий скрипт обязан видеть расхождение.
+	// Exit code 1: drift exists — the calling script must see the mismatch.
 	return fmt.Errorf("counters verify: дрейф счётчиков — %d позиций (лечит crawlerctl counters recount)",
 		len(mismatch))
 }

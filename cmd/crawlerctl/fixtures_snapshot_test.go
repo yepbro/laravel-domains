@@ -1,9 +1,10 @@
-// Юнит-тесты crawlerctl fixtures snapshot (T-244): разбор exposition
-// text format Prometheus (метки, экраны, корзины), сбор приборов этапа
-// рендера, структурные метрики DOM (узлы/скрипты), границы стримов по ID
-// записей, SQL-контракт снапшота и roundtrip записи/чтения файла.
-// Живой прогон снапшота против дев-стека — самопроверка задачи
-// (результаты — в отчёте), не тест.
+// Unit tests for crawlerctl fixtures snapshot (T-244): Prometheus
+// exposition text format parsing (labels, escapes, buckets), collecting
+// the render stage's instruments, structural DOM metrics
+// (nodes/scripts), stream boundaries by record IDs, the snapshot's SQL
+// contract and the file write/read roundtrip. A live snapshot run
+// against the dev stack is the task's self-check (the results go into
+// the report), not a test.
 package main
 
 import (
@@ -22,9 +23,9 @@ import (
 	"crawler/internal/content"
 )
 
-// TestFixturesParsePromMetrics — разбор exposition text format: сэмпл
-// без меток, с метками, экраны в значениях, HELP/TYPE пропускаются,
-// битые строки — ошибки.
+// TestFixturesParsePromMetrics — exposition text format parsing: a
+// sample without labels, with labels, escapes in values, HELP/TYPE
+// skipped, broken lines are errors.
 func TestFixturesParsePromMetrics(t *testing.T) {
 	data := []byte(strings.Join([]string{
 		`# HELP crawler_stage_tasks_total Задачи этапов.`,
@@ -85,8 +86,9 @@ func TestFixturesParsePromMetrics(t *testing.T) {
 	}
 }
 
-// TestFixturesMetricsFromSamples — сбор приборов этапа: сэмплы чужих
-// стадий отфильтрованы, словари причин собраны, корзины отсортированы.
+// TestFixturesMetricsFromSamples — stage instrument collection: samples
+// of foreign stages are filtered, the reason dictionaries are collected,
+// the buckets are sorted.
 func TestFixturesMetricsFromSamples(t *testing.T) {
 	samples := []fixturesPromSample{
 		{Name: "crawler_stage_tasks_total", Labels: map[string]string{"stage": "dns"}, Value: 10},
@@ -130,7 +132,8 @@ func TestFixturesMetricsFromSamples(t *testing.T) {
 	}
 }
 
-// fakeStreamClient — Redis-клиент по сценарию: длины стримов и границы.
+// fakeStreamClient — a scenario-driven Redis client: stream lengths and
+// boundaries.
 type fakeStreamClient struct {
 	lens    map[string]int64
 	firstID string
@@ -149,8 +152,9 @@ func (f *fakeStreamClient) XRevRangeN(_ context.Context, _, _, _ string, _ int64
 	return redis.NewXMessageSliceCmdResult([]redis.XMessage{{ID: f.lastID}}, nil)
 }
 
-// TestFixturesSnapshotStreams — снимок стримов: длины и границы q:analyze
-// по ID записей; пустой q:analyze — границы нулевые.
+// TestFixturesSnapshotStreams — a snapshot of the streams: the lengths
+// and the q:analyze boundaries by record IDs; an empty q:analyze — zero
+// boundaries.
 func TestFixturesSnapshotStreams(t *testing.T) {
 	fake := &fakeStreamClient{
 		lens:    map[string]int64{"q:render": 0, "q:render-fallback": 2, "q:analyze": 500, "q:dead": 1},
@@ -178,7 +182,8 @@ func TestFixturesSnapshotStreams(t *testing.T) {
 	}
 }
 
-// TestFixturesStreamIDMs — ID записи: миллисекунды и отбраковка мусора.
+// TestFixturesStreamIDMs — a record ID: milliseconds and junk
+// rejection.
 func TestFixturesStreamIDMs(t *testing.T) {
 	if ms, ok := fixturesStreamIDMs("1762000000123-42"); !ok || ms != 1762000000123 {
 		t.Errorf("ID = %d/%v", ms, ok)
@@ -190,15 +195,16 @@ func TestFixturesStreamIDMs(t *testing.T) {
 	}
 }
 
-// TestFixturesSnapshotDOMStats — узлы и скрипты DOM: структура, а не
-// байты (нормализованное сравнение живого DOM).
+// TestFixturesSnapshotDOMStats — the DOM's nodes and scripts: the
+// structure, not bytes (a normalized comparison of the live DOM).
 func TestFixturesSnapshotDOMStats(t *testing.T) {
 	dom := []byte(`<!DOCTYPE html><html><head><script>1</script></head>` +
 		`<body><p>текст</p><script>2</script><!--комментарий--><div><span/></div></body></html>`)
 	nodes, scripts := fixturesSnapshotDOMStats(dom)
-	// Дерево: document, html, head, script, text, body, p, text, script,
-	// text (комментарий), div, span — точное число не хардкодим, проверяем
-	// порядок и ненулевые части; скриптов ровно 2.
+	// The tree: document, html, head, script, text, body, p, text,
+	// script, text (the comment), div, span — the exact number is not
+	// hardcoded, we check the order and the non-zero parts; exactly 2
+	// scripts.
 	if scripts != 2 {
 		t.Errorf("скриптов %d, хочу 2", scripts)
 	}
@@ -210,7 +216,7 @@ func TestFixturesSnapshotDOMStats(t *testing.T) {
 	}
 }
 
-// fakeContentGetter — хранилище контента по сценарию: hash → DOM.
+// fakeContentGetter — a scenario-driven content store: hash → DOM.
 type fakeContentGetter map[string][]byte
 
 func (f fakeContentGetter) Get(_ context.Context, hash content.Hash) ([]byte, error) {
@@ -221,8 +227,8 @@ func (f fakeContentGetter) Get(_ context.Context, hash content.Hash) ([]byte, er
 	return dom, nil
 }
 
-// TestFixturesSnapshotParseDOM — структурные метрики по хранилищу:
-// посчитанные строки, пропуск отсутствующего контента.
+// TestFixturesSnapshotParseDOM — structural metrics over the store:
+// counted rows, missing content skipped.
 func TestFixturesSnapshotParseDOM(t *testing.T) {
 	dom := []byte("<html><body><p>x</p><script>y</script></body></html>")
 	hash := content.HashOf(dom)
@@ -244,8 +250,9 @@ func TestFixturesSnapshotParseDOM(t *testing.T) {
 	}
 }
 
-// TestFixturesSnapshotRowsSQLContract — SQL-контракт снапшота: ключи
-// дампа unnest-массивами, контент и вердикты анализатора LEFT JOIN'ами.
+// TestFixturesSnapshotRowsSQLContract — the snapshot's SQL contract: the
+// dump's keys as unnest arrays, the content and the analyzer's verdicts
+// via LEFT JOINs.
 func TestFixturesSnapshotRowsSQLContract(t *testing.T) {
 	for _, want := range []string{
 		"unnest($1::int2[], $2::int8[], $3::int2[], $4::int2[])",
@@ -261,8 +268,9 @@ func TestFixturesSnapshotRowsSQLContract(t *testing.T) {
 	}
 }
 
-// TestFixturesSnapshotFileRoundtrip — запись/чтение файла снапшота:
-// атомарный tmp+rename, roundtrip полей, чужая версия формата — ошибка.
+// TestFixturesSnapshotFileRoundtrip — snapshot file write/read: an
+// atomic tmp+rename, a field roundtrip, a foreign format version is an
+// error.
 func TestFixturesSnapshotFileRoundtrip(t *testing.T) {
 	dir := t.TempDir()
 	rss := int64(96 << 20)
@@ -332,10 +340,10 @@ func TestFixturesSnapshotFileRoundtrip(t *testing.T) {
 	}
 }
 
-// TestRunFixturesSnapshotAndReport — использование команд: справка,
-// валидация флагов до инфраструктуры (код 2), отказ источника метрик
-// (код 1), отчёт по файлам снапшотов без инфраструктуры (код 0) и
-// --fail-exit на испорченном прогоне.
+// TestRunFixturesSnapshotAndReport — command usage: help, flag
+// validation before infrastructure (code 2), a metrics source failure
+// (code 1), a report over snapshot files without infrastructure (code 0)
+// and --fail-exit on a corrupted run.
 func TestRunFixturesSnapshotAndReport(t *testing.T) {
 	t.Setenv("CRAWLER_CONFIG", filepath.Join(t.TempDir(), "missing.yaml"))
 
@@ -382,14 +390,14 @@ func TestRunFixturesSnapshotAndReport(t *testing.T) {
 		})
 	}
 
-	// Отчёт по файлам снапшотов: инфраструктура не нужна — код 0 и все
-	// разделы в stdout; испорченный прогон + --fail-exit — код 1.
+	// Report over snapshot files: no infrastructure needed — code 0 and
+	// all sections in stdout; a corrupted run + --fail-exit — code 1.
 	dir := t.TempDir()
 	b := snapOf("chromium-1", "chromium", snapRows(100, nil))
 	cGood := snapOf("moli-1", "moli", snapRows(100, nil))
 	cBad := snapOf("moli-2", "moli", snapRows(100, func(i int, r *fixturesSnapshotRow) {
 		if i < 5 {
-			r.IsLaravel = !r.IsLaravel // 5% расхождений детекции
+			r.IsLaravel = !r.IsLaravel // 5% detection divergence
 		}
 	}))
 	pathB := filepath.Join(dir, "b.snapshot.json")

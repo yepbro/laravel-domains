@@ -1,11 +1,12 @@
-// Юнит-тесты crawlerctl fixtures export (T-242): роутинг/флаги/справка —
-// без инфраструктуры (валидный вызов доходит до конфигурации и падает
-// детерминированно, стиль TestRunZonesCollapseExecution); пропорции квот
-// (метод наибольших остатков), smoke-подвыборка (детерминизм, имена),
-// NDJSON-кодирование строк (контракт формата v1: NULL → null, bytea →
-// base64, jsonb как есть), коллектор дублей и SQL-контракты выборки
-// (подстроки предикатов — стиль renderq_test.go). Живой прогон выгрузки
-// против дев-БД — самопроверка задачи (результаты — в отчёте), не тест.
+// Unit tests for crawlerctl fixtures export (T-242): routing/flags/help —
+// without infrastructure (a valid call reaches the configuration and
+// fails deterministically, the TestRunZonesCollapseExecution style);
+// quota proportions (the largest remainder method), the smoke subsample
+// (determinism, names), NDJSON row encoding (the format v1 contract:
+// NULL → null, bytea → base64, jsonb as-is), the duplicate collector and
+// the selection SQL contracts (predicate substrings — the renderq_test.go
+// style). A live export run against the dev DB is the task's self-check
+// (the results go into the report), not a test.
 package main
 
 import (
@@ -26,9 +27,9 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-// TestRunFixtures — использование команды: справка, неизвестное действие,
-// валидация флагов до соединения с БД (код 2), отсутствие конфигурации
-// после валидации (код 1).
+// TestRunFixtures — command usage: help, an unknown action, flag
+// validation before the DB connection (code 2), missing configuration
+// after validation (code 1).
 func TestRunFixtures(t *testing.T) {
 	t.Setenv("CRAWLER_CONFIG", filepath.Join(t.TempDir(), "missing.yaml"))
 
@@ -86,8 +87,9 @@ func TestRunFixtures(t *testing.T) {
 	}
 }
 
-// TestFixturesAllocateQuotas — метод наибольших остатков: точные доли,
-// добор остатка, детерминизм при равных долях, вырожденные случаи.
+// TestFixturesAllocateQuotas — the largest remainder method: exact
+// shares, a remainder top-up, determinism on equal shares, degenerate
+// cases.
 func TestFixturesAllocateQuotas(t *testing.T) {
 	t.Run("точные доли без остатка", func(t *testing.T) {
 		got := fixturesAllocateQuotas(map[int16]int64{1: 100, 2: 300}, 8)
@@ -103,8 +105,9 @@ func TestFixturesAllocateQuotas(t *testing.T) {
 	})
 
 	t.Run("добор наибольшим остатком", func(t *testing.T) {
-		// 100/(100+100+100+1)*10: базы 2,2,2,0; остаток 2 — зоны с большей
-		// дробной частью (последняя: 0.098) и, при равенстве, меньший zone_id.
+		// 100/(100+100+100+1)*10: bases 2,2,2,0; a remainder of 2 — zones
+		// with a larger fractional part (the last one: 0.098) and, on a
+		// tie, the smaller zone_id.
 		got := fixturesAllocateQuotas(map[int16]int64{1: 100, 2: 100, 3: 100, 4: 1}, 10)
 		if total := got[1] + got[2] + got[3] + got[4]; total != 10 {
 			t.Fatalf("сумма квот = %d, хочу 10 (%v)", total, got)
@@ -112,7 +115,7 @@ func TestFixturesAllocateQuotas(t *testing.T) {
 		if got[4] > 1 {
 			t.Errorf("зона с 1 строкой получила квоту %d (> доступного)", got[4])
 		}
-		// Три равные зоны делят 10 как 4/3/3 (+1 наименьшему id).
+		// Three equal zones split 10 as 4/3/3 (+1 to the smallest id).
 		if got[1] != 4 || got[2] != 3 || got[3] != 3 {
 			t.Errorf("равные зоны: квоты %d/%d/%d, хочу 4/3/3", got[1], got[2], got[3])
 		}
@@ -165,8 +168,9 @@ func TestFixturesAllocateQuotas(t *testing.T) {
 	})
 }
 
-// TestFixturesCollect — коллектор выборки: метка страты, отсечение дублей
-// ключей (строка не попадает в дамп дважды — идемпотентность наката).
+// TestFixturesCollect — the selection collector: the stratum label,
+// duplicate key cutting (a row never enters the dump twice — the import
+// idempotency).
 func TestFixturesCollect(t *testing.T) {
 	c := newFixturesCollect()
 	c.add("ok", []fixturesResult{
@@ -174,7 +178,7 @@ func TestFixturesCollect(t *testing.T) {
 		{ZoneID: 1, DomainID: 1, SubdomainID: 1, Variant: 0},
 	})
 	c.add("heavy", []fixturesResult{
-		{ZoneID: 1, DomainID: 1, SubdomainID: 0, Variant: 0}, // дубль ok
+		{ZoneID: 1, DomainID: 1, SubdomainID: 0, Variant: 0}, // an ok duplicate
 		{ZoneID: 1, DomainID: 2, SubdomainID: 0, Variant: 0},
 	})
 	if len(c.rows) != 3 {
@@ -190,9 +194,9 @@ func TestFixturesCollect(t *testing.T) {
 	}
 }
 
-// TestFixturesEncodeAll — контракт NDJSON формата v1: по объекту на
-// строку, NULL-колонки → null, bytea → base64, jsonb → как есть, без
-// экранирования HTML, time → RFC 3339.
+// TestFixturesEncodeAll — the format v1 NDJSON contract: one object per
+// line, NULL columns → null, bytea → base64, jsonb → as-is, without HTML
+// escaping, time → RFC 3339.
 func TestFixturesEncodeAll(t *testing.T) {
 	ts := time.Date(2026, 11, 5, 12, 30, 0, 0, time.UTC)
 	httpStatus := int16(200)
@@ -225,22 +229,22 @@ func TestFixturesEncodeAll(t *testing.T) {
 	if m["content_hash"] != "AQID" {
 		t.Errorf("content_hash = %v, хочу AQID", m["content_hash"])
 	}
-	// jsonb → вложенный JSON; NULL jsonb → null
+	// jsonb → nested JSON; NULL jsonb → null
 	if h, ok := m["headers"].(map[string]any); !ok || h["content-type"] == nil {
 		t.Errorf("headers не вложенный JSON: %v", m["headers"])
 	}
 	if m["cookies"] != nil {
 		t.Errorf("cookies = %v, хочу null", m["cookies"])
 	}
-	// NULL-колонки → null (не отсутствие поля)
+	// NULL columns → null (not a missing field)
 	if m["render_failed_at"] != nil {
 		t.Errorf("render_failed_at = %v, хочу null", m["render_failed_at"])
 	}
-	// без экранирования HTML: & и <> из final_url — как есть
+	// without HTML escaping: & and <> from final_url — as-is
 	if !strings.Contains(line, "&b=<2>") {
 		t.Errorf("final_url экранирован HTML в NDJSON:\n%s", line)
 	}
-	// время → RFC 3339
+	// time → RFC 3339
 	if m["checked_at"] != "2026-11-05T12:30:00Z" {
 		t.Errorf("checked_at = %v, хочу RFC 3339", m["checked_at"])
 	}
@@ -248,7 +252,7 @@ func TestFixturesEncodeAll(t *testing.T) {
 		t.Errorf("stratum = %v, хочу ok", m["stratum"])
 	}
 
-	// NULL-строка: все опциональные поля отсутствуют.
+	// A NULL row: all optional fields are absent.
 	var nullLine bytes.Buffer
 	if err := fixturesEncodeAll(&nullLine, []fixturesResult{{ZoneID: 1, DomainID: 2, SubdomainID: 0, Variant: 0, Scheme: 1, CheckedAt: ts, Stratum: "failed"}}); err != nil {
 		t.Fatalf("кодирование NULL-строки: %v", err)
@@ -267,8 +271,8 @@ func TestFixturesEncodeAll(t *testing.T) {
 	}
 }
 
-// TestFixturesDomainNDJSON — строка domains дампа: NULL-колонки → null,
-// все колонки таблицы присутствуют (контракт наката T-243).
+// TestFixturesDomainNDJSON — a domains row of the dump: NULL columns →
+// null, all table columns present (the T-243 import contract).
 func TestFixturesDomainNDJSON(t *testing.T) {
 	var buf bytes.Buffer
 	if err := fixturesEncodeAll(&buf, []fixturesDomain{{ZoneID: 3, ID: 9, Label: "example", Status: 2, CheckState: 2, Flags: 1, DNSMask: 5, TempAttempts: 0}}); err != nil {
@@ -288,12 +292,13 @@ func TestFixturesDomainNDJSON(t *testing.T) {
 	}
 }
 
-// TestFixturesSmokePick — smoke-подвыборка: детерминизм (тот же seed —
-// тот же порядок), лимит, имя label.zone, устойчивость к порядку строк.
+// TestFixturesSmokePick — the smoke subsample: determinism (the same
+// seed — the same order), the limit, the label.zone name, robustness to
+// the row order.
 func TestFixturesSmokePick(t *testing.T) {
 	rows := []fixturesResult{
 		{ZoneID: 7, DomainID: 1, SubdomainID: 0, Variant: 0},
-		{ZoneID: 7, DomainID: 1, SubdomainID: 1, Variant: 0}, // тот же домен
+		{ZoneID: 7, DomainID: 1, SubdomainID: 1, Variant: 0}, // the same domain
 		{ZoneID: 7, DomainID: 2, SubdomainID: 0, Variant: 0},
 		{ZoneID: 3, DomainID: 5, SubdomainID: 0, Variant: 0},
 	}
@@ -318,7 +323,7 @@ func TestFixturesSmokePick(t *testing.T) {
 		}
 	}
 
-	// Все домены уникальны в выборке.
+	// All domains in the selection are unique.
 	seen := map[fixturesDomainKey]bool{}
 	for _, s := range a {
 		k := fixturesDomainKey{s.ZoneID, s.DomainID}
@@ -328,7 +333,7 @@ func TestFixturesSmokePick(t *testing.T) {
 		seen[k] = true
 	}
 
-	// Лимит больше уникальных доменов — все; нулевой — пусто.
+	// A limit above the unique domains — all of them; zero — empty.
 	if got := fixturesSmokePick(rows, domains, zones, "242", 100); len(got) != 3 {
 		t.Errorf("лимит 100: %d доменов, хочу 3 (уникальных)", len(got))
 	}
@@ -337,10 +342,10 @@ func TestFixturesSmokePick(t *testing.T) {
 	}
 }
 
-// TestFixturesSQLContract — контракты SQL выборки: базовый предикат
-// «реальная задача q:render» во всех стратах, свежесть failed, размер
-// контента heavy, анти-join ok против heavy, детерминированный порядок
-// md5, идентификаторы ключей в выборке доменов.
+// TestFixturesSQLContract — the selection SQL contracts: the base
+// "real q:render task" predicate in all strata, the failed freshness,
+// the heavy content size, the ok anti-join against heavy, the
+// deterministic md5 order, the key identifiers in the domain selection.
 func TestFixturesSQLContract(t *testing.T) {
 	base := "final_url IS NOT NULL"
 	for name, sql := range map[string]string{
@@ -377,7 +382,7 @@ func TestFixturesSQLContract(t *testing.T) {
 		!strings.Contains(fixturesSelectOkSQL, "ex.zone_id IS NULL") {
 		t.Errorf("selectOk: анти-join против heavy потерян: %s", fixturesSelectOkSQL)
 	}
-	// Детерминированный порядок — во всех по-зонных выборках.
+	// The deterministic order — in all per-zone selections.
 	for name, sql := range map[string]string{
 		"ok": fixturesSelectOkSQL, "heavy": fixturesSelectHeavySQL, "failed": fixturesSelectFailedSQL,
 	} {
@@ -395,7 +400,7 @@ func TestFixturesSQLContract(t *testing.T) {
 	if !strings.Contains(fixturesZonesSQL, "id = ANY($1::int2[])") {
 		t.Errorf("zonesSQL: зоны не массивом id: %s", fixturesZonesSQL)
 	}
-	// Колонки выборки: контракт формата (без addrs/cname/tls/redirects).
+	// Selection columns: the format contract (no addrs/cname/tls/redirects).
 	for _, banned := range []string{"r.addrs", "r.cname", "r.tls", "r.redirects"} {
 		if strings.Contains(fixturesResultCols, banned) {
 			t.Errorf("fixturesResultCols: обезличиваемая колонка %s в выборке", banned)
@@ -408,8 +413,8 @@ func TestFixturesSQLContract(t *testing.T) {
 	}
 }
 
-// TestFixturesWriteFile — атомарная запись: файл появляется под финальным
-// именем, .tmp не остаётся; ошибка записи не оставляет полуфайла.
+// TestFixturesWriteFile — an atomic write: the file appears under the
+// final name, no .tmp remains; a write error leaves no half-file.
 func TestFixturesWriteFile(t *testing.T) {
 	dir := t.TempDir()
 	write := func(s string) error {
@@ -431,8 +436,8 @@ func TestFixturesWriteFile(t *testing.T) {
 		t.Errorf(".tmp остался после успешной записи: %v", err)
 	}
 
-	// Ошибка функции записи: полуфайл под финальным именем не появляется,
-	// старое содержимое не портится (переименование не выполняется).
+	// A write function error: no half-file under the final name appears,
+	// the old content is not damaged (no rename is performed).
 	fail := fixturesWriteFile(dir, "a.ndjson", func(w *bufio.Writer) error {
 		_, _ = w.WriteString("мусор")
 		return errors.New("прервано")
@@ -448,11 +453,12 @@ func TestFixturesWriteFile(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------- оркестрация
+// ---------------------------------------------------------------- orchestration
 
-// fixturesRows — pgx.Rows с заготовленными строками выборки фикстуры
-// (приёмники — типы полей fixtures*, включая указатели NULL-колонок;
-// общий statusRows их не поддерживает — здесь свой набор, стиль T-079).
+// fixturesRows — pgx.Rows with prepared fixture selection rows (the
+// dest types are the fixtures* field types, including NULL column
+// pointers; the shared statusRows does not support them — a local set
+// here, the T-079 style).
 type fixturesRows struct {
 	rows [][]any
 	i    int
@@ -550,11 +556,11 @@ func (r *fixturesRows) Scan(dest ...any) error {
 	return nil
 }
 
-// fixturesPool — фейковый db.DB: маршрутизация по маркерам SQL выборки
-// фикстуры. Сценарий: зона 7 (su) с двумя ok-строками, прочие страты
-// пусты (деградация), один домен и одна зона.
+// fixturesPool — a fake db.DB: routing by the fixture selection SQL
+// markers. The scenario: zone 7 (su) with two ok rows, the other strata
+// empty (degradation), one domain and one zone.
 type fixturesPool struct {
-	failOn string // подстрока SQL: вернуть ошибку (имитация сбоя БД)
+	failOn string // an SQL substring: return an error (a DB failure simulation)
 }
 
 func (p *fixturesPool) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFromSource) (int64, error) {
@@ -581,7 +587,7 @@ func (p *fixturesPool) Query(_ context.Context, sql string, _ ...any) (pgx.Rows,
 		}}, nil
 	case strings.Contains(sql, "count(*)") && strings.Contains(sql, "rendered"): // count ok
 		return &fixturesRows{rows: [][]any{{int16(7), int64(2)}}}, nil
-	case strings.Contains(sql, "count(*)"): // count heavy/failed — пусто
+	case strings.Contains(sql, "count(*)"): // count heavy/failed — empty
 		return &fixturesRows{}, nil
 	case strings.Contains(sql, "LIMIT $3::int8"), strings.Contains(sql, "LIMIT $4::int8"): // heavy/failed
 		return &fixturesRows{}, nil
@@ -595,11 +601,12 @@ func (p *fixturesPool) Query(_ context.Context, sql string, _ ...any) (pgx.Rows,
 	}
 }
 
-// TestFixturesExportRun — оркестрация выгрузки на фейковом пуле: все пять
-// файлов, манифест согласован со строками, деградации честные; повторный
-// прогон поверх старого манифеста перезаписывает его; падение до записи
-// файлов сохраняет прежний манифест, падение в середине записи — убирает
-// (контракт «manifest есть ⇒ дамп завершён», ревью T-242 P1).
+// TestFixturesExportRun — the export orchestration on a fake pool: all
+// five files, the manifest consistent with the rows, honest
+// degradations; a rerun over the old manifest overwrites it; a failure
+// before writing the files keeps the old manifest, a failure mid-write
+// removes it (the "manifest present ⇒ dump complete" contract, review
+// T-242 P1).
 func TestFixturesExportRun(t *testing.T) {
 	params := fixturesParams{OK: 5, Heavy: 5, Failed: 5, Smoke: 1, Weeks: 4, Seed: 242}
 
@@ -613,7 +620,7 @@ func TestFixturesExportRun(t *testing.T) {
 		if _, err := fixturesExportRun(context.Background(), &fixturesPool{}, params, &out); err != nil {
 			t.Fatalf("выгрузка: %v", err)
 		}
-		// Все файлы дампа на месте, прежний манифест заменён.
+		// All dump files in place, the old manifest replaced.
 		manifest := filepath.Join(dir, "manifest.json")
 		b, err := os.ReadFile(manifest)
 		if err != nil {
@@ -637,7 +644,7 @@ func TestFixturesExportRun(t *testing.T) {
 				t.Errorf("страта %s: %+v (хочу пусто с деградацией)", s, m.Strata[s])
 			}
 		}
-		// Согласованность файлов со счётчиками манифеста.
+		// File/manifest counter consistency.
 		for name, want := range map[string]int{
 			"zones.ndjson": 1, "domains.ndjson": 1, "subdomain_results.ndjson": 2, "smoke.ndjson": 1,
 		} {
@@ -655,7 +662,7 @@ func TestFixturesExportRun(t *testing.T) {
 		if strings.Contains(out.String(), "manifest.json: 0") {
 			t.Errorf("вывод с «manifest.json: 0 строк»:\n%s", out.String())
 		}
-		// smoke-домен — из выборки, с именем label.zone.
+		// The smoke domain — from the selection, with the label.zone name.
 		smokeLine, err := os.ReadFile(filepath.Join(dir, "smoke.ndjson"))
 		if err != nil || !strings.Contains(string(smokeLine), `"name":"ok.su"`) {
 			t.Errorf("smoke.ndjson: %s (%v)", smokeLine, err)
@@ -668,7 +675,7 @@ func TestFixturesExportRun(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(dir, "manifest.json"), []byte("старый-полный"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		pool := &fixturesPool{failOn: "FROM zones WHERE"} // последний запрос, до записи файлов
+		pool := &fixturesPool{failOn: "FROM zones WHERE"} // the last query, before writing files
 		var out bytes.Buffer
 		if _, err := fixturesExportRun(context.Background(), pool, params, &out); err == nil {
 			t.Fatal("сбой БД не возвращён ошибкой")
@@ -684,9 +691,9 @@ func TestFixturesExportRun(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(dir, "manifest.json"), []byte("старый-полный"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		// zones.ndjson — каталог: запись .tmp пройдёт, rename поверх
-		// каталога упадёт — сбой ровно между удалением манифеста и его
-		// новой записью.
+		// zones.ndjson — a directory: writing .tmp succeeds, renaming over
+		// a directory fails — a failure exactly between removing the
+		// manifest and writing the new one.
 		if err := os.Mkdir(filepath.Join(dir, "zones.ndjson"), 0o700); err != nil {
 			t.Fatal(err)
 		}
@@ -700,7 +707,7 @@ func TestFixturesExportRun(t *testing.T) {
 	})
 }
 
-// readLines — непустые строки файла (для счётчиков файлов дампа).
+// readLines — the file's non-empty lines (for the dump file counters).
 func readLines(path string) ([]string, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {

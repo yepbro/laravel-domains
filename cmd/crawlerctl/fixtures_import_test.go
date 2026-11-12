@@ -1,12 +1,11 @@
-// Юнит-тесты crawlerctl fixtures import (T-243): роутинг/флаги — в
-// TestRunFixtures (fixtures_test.go), здесь — чтение и валидация дампа
-// формата v1 (манифест, дубли ключей, ссылочная целостность), контракты
-// SQL наката (OVERRIDING SYSTEM VALUE, ON CONFLICT по PK, setval выше
-// максимума, предпроверки естественных ключей) на фейковом пуле
-// (идемпотентность повторного наката — поведение ON CONFLICT, живой
-// прогон против дев-БД — самопроверка задачи, не тест) и публикация
-// q:render на фейковой очереди (режимы all/smoke, дедуп, счётчики,
-// имена label.zone).
+// Unit tests for crawlerctl fixtures import (T-243): routing/flags live
+// in TestRunFixtures (fixtures_test.go); here — format v1 dump reading
+// and validation (the manifest, duplicate keys, referential integrity),
+// the import SQL contracts (OVERRIDING SYSTEM VALUE, ON CONFLICT by PK,
+// setval above the maximum, natural-key pre-checks) on a fake pool
+// (re-import idempotency — ON CONFLICT behavior; a live run against the
+// dev DB is the task's self-check, not a test) and q:render publishing
+// on a fake queue (all/smoke modes, dedup, counters, label.zone names).
 package main
 
 import (
@@ -28,10 +27,11 @@ import (
 	"crawler/internal/queue"
 )
 
-// ---------------------------------------------------------------- дамп
+// ---------------------------------------------------------------- dump
 
-// writeDumpDir — каталог дампа формата v1 из строк (fixturesEncodeAll —
-// тот же кодировщик, что у export: файлы теста читает тот же читатель).
+// writeDumpDir — a format v1 dump directory built from rows
+// (fixturesEncodeAll — the same encoder as export: the test files are
+// read back by the same reader).
 func writeDumpDir(t *testing.T, dir string, manifest *fixturesManifest, zones []fixturesZone,
 	domains []fixturesDomain, results []fixturesResult, smoke []fixturesSmokeDomain) {
 	t.Helper()
@@ -89,8 +89,8 @@ func writeDumpDir(t *testing.T, dir string, manifest *fixturesManifest, zones []
 	}
 }
 
-// importDumpFixture — согласованный мини-дамп: зона su (id 7), домен,
-// две строки результатов (ok и heavy) и один smoke-домен.
+// importDumpFixture — a consistent mini-dump: the su zone (id 7), a
+// domain, two result rows (ok and heavy) and one smoke domain.
 func importDumpFixture() (zones []fixturesZone, domains []fixturesDomain, results []fixturesResult, smoke []fixturesSmokeDomain) {
 	ts := time.Date(2026, 11, 5, 10, 0, 0, 0, time.UTC)
 	url := "https://ok.example/"
@@ -106,9 +106,9 @@ func importDumpFixture() (zones []fixturesZone, domains []fixturesDomain, result
 	return
 }
 
-// TestFixturesReadDump — чтение дампа формата v1: полнота (манифест —
-// маркер завершённости), версия формата, файлы, дубли ключей (побеждает
-// последняя запись), ссылочная целостность.
+// TestFixturesReadDump — format v1 dump reading: completeness (the
+// manifest is the completion marker), the format version, the files,
+// duplicate keys (the last entry wins), referential integrity.
 func TestFixturesReadDump(t *testing.T) {
 	zones, domains, results, smoke := importDumpFixture()
 
@@ -216,7 +216,7 @@ func TestFixturesReadDump(t *testing.T) {
 	t.Run("дубли ключей — последняя запись побеждает", func(t *testing.T) {
 		dir := t.TempDir()
 		dupResults := append(append([]fixturesResult{}, results...), results[0])
-		dupResults[2].Stratum = "failed" // дубль ключа первой строки — тяжелее различить
+		dupResults[2].Stratum = "failed" // a duplicate of the first row's key — harder to tell apart
 		dupDomains := append(append([]fixturesDomain{}, domains...), domains[0])
 		dupDomains[1].Label = "other"
 		writeDumpDir(t, dir, nil, zones, dupDomains, dupResults, smoke)
@@ -261,29 +261,30 @@ func TestFixturesReadDump(t *testing.T) {
 	})
 }
 
-// ---------------------------------------------------------------- пул
+// ---------------------------------------------------------------- pool
 
-// importPool — фейковый db.DB для наката: INSERT идут в Exec (RowsAffected
-// из длины первой колонки-массива — пачка строк), предпроверки, setval и
-// read-only счётчики плана (S-P3-5) — в Query с заготовленными ответами;
-// все SQL запоминаются (контракты и повторный прогон).
+// importPool — a fake db.DB for the import: INSERTs go to Exec
+// (RowsAffected from the length of the first array column — a batch of
+// rows), the pre-checks, setval and the plan's read-only counters
+// (S-P3-5) go to Query with prepared answers; all SQL is remembered
+// (the contracts and the repeated run).
 type importPool struct {
 	mu sync.Mutex
-	// execSQL — тексты выполненных INSERT/setval-запросов (порядок).
+	// execSQL — the texts of the executed INSERT/setval statements (in order).
 	execSQL []string
-	// querySQL — тексты Query (предпроверки, setval, план).
+	// querySQL — the Query texts (pre-checks, setval, the plan).
 	querySQL []string
-	// zoneRows — ответ предпроверки зон: (id, name).
+	// zoneRows — the zone pre-check answer: (id, name).
 	zoneRows [][]any
-	// domainRows — ответ предпроверки доменов: (zone_id, label, id).
+	// domainRows — the domain pre-check answer: (zone_id, label, id).
 	domainRows [][]any
-	// setvalVal — ответ setval.
+	// setvalVal — the setval answer.
 	setvalVal int64
-	// Счётчики плана: существующие по PK строки дампа и выметаемый
-	// контент (dry-run читает их SELECT'ами).
+	// Plan counters: dump rows existing by PK and the swept content (the
+	// dry-run reads them with SELECTs).
 	zonesExist, domainsExist, resultsExist int
 	sweepVal                               int64
-	failOn                                 string // подстрока SQL → ошибка
+	failOn                                 string // an SQL substring → an error
 }
 
 func (p *importPool) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFromSource) (int64, error) {
@@ -297,8 +298,8 @@ func (p *importPool) Exec(ctx context.Context, sql string, args ...any) (pgconn.
 	if p.failOn != "" && strings.Contains(sql, p.failOn) {
 		return pgconn.CommandTag{}, fmt.Errorf("фиктивный сбой БД (%s)", p.failOn)
 	}
-	// RowsAffected = строк в пачке: первая колонка всех INSERT наката —
-	// массив zone_id.
+	// RowsAffected = rows in the batch: the first column of every import
+	// INSERT is the zone_id array.
 	if len(args) > 0 {
 		if arr, ok := args[0].([]int16); ok {
 			return pgconn.NewCommandTag(fmt.Sprintf("INSERT 0 %d", len(arr))), nil
@@ -315,13 +316,13 @@ func (p *importPool) Query(_ context.Context, sql string, _ ...any) (pgx.Rows, e
 		return nil, fmt.Errorf("фиктивный сбой БД (%s)", p.failOn)
 	}
 	switch {
-	case strings.Contains(sql, "count(*) FROM zones AS z"): // план: существующие PK
+	case strings.Contains(sql, "count(*) FROM zones AS z"): // plan: existing PKs
 		return &fixturesRows{rows: [][]any{{int64(p.zonesExist)}}}, nil
 	case strings.Contains(sql, "count(*) FROM domains AS d"):
 		return &fixturesRows{rows: [][]any{{int64(p.domainsExist)}}}, nil
 	case strings.Contains(sql, "count(*) FROM subdomain_results AS r"):
 		return &fixturesRows{rows: [][]any{{int64(p.resultsExist)}}}, nil
-	case strings.Contains(sql, "count(*) FROM contents"): // план: уборка
+	case strings.Contains(sql, "count(*) FROM contents"): // plan: cleanup
 		return &fixturesRows{rows: [][]any{{p.sweepVal}}}, nil
 	case strings.Contains(sql, "SELECT id, name FROM zones"):
 		return &fixturesRows{rows: p.zoneRows}, nil
@@ -351,7 +352,7 @@ func (p *importPool) countSQL(substr string) int {
 	return n
 }
 
-// importDump — дамп из importDumpFixture, завёрнутый в fixturesDump.
+// importDump — a dump from importDumpFixture wrapped into fixturesDump.
 func importDump(t *testing.T) *fixturesDump {
 	t.Helper()
 	zones, domains, results, smoke := importDumpFixture()
@@ -361,9 +362,10 @@ func importDump(t *testing.T) *fixturesDump {
 	}
 }
 
-// TestFixturesImportRun — накат на фейковом пуле: порядок предпроверки →
-// зоны → домены → результаты → последовательности; счётчики; повторный
-// прогон выполняет те же идемпотентные операторы (ON CONFLICT по PK).
+// TestFixturesImportRun — the import on a fake pool: the order
+// pre-check → zones → domains → results → sequences; the counters; a
+// repeated run executes the same idempotent statements (ON CONFLICT by
+// PK).
 func TestFixturesImportRun(t *testing.T) {
 	t.Run("успех: порядок и счётчики", func(t *testing.T) {
 		pool := &importPool{setvalVal: 7}
@@ -380,12 +382,13 @@ func TestFixturesImportRun(t *testing.T) {
 			t.Errorf("последовательности не выставлены: %+v", stats)
 		}
 		exec, query := pool.calls()
-		// Порядок: предпроверки (Query) до INSERT, setval (Query) и уборка
-		// осиротевшего контента (Exec без параметров) — после.
-		if n := len(exec); n != 4 { // зоны, домены, результаты, уборка contents
+		// Order: the pre-checks (Query) before the INSERT; setval (Query)
+		// and the orphaned content cleanup (an Exec without parameters) —
+		// after.
+		if n := len(exec); n != 4 { // zones, domains, results, contents cleanup
 			t.Errorf("Exec-вызовов %d (%v), хочу 4", n, exec)
 		}
-		if n := len(query); n != 4 { // 2 предпроверки + 2 setval
+		if n := len(query); n != 4 { // 2 pre-checks + 2 setval
 			t.Errorf("Query-вызовов %d (%v), хочу 4", n, query)
 		}
 		if !strings.Contains(out.String(), "накат: зоны 1, домены 1, строки результатов 2") {
@@ -402,9 +405,9 @@ func TestFixturesImportRun(t *testing.T) {
 				t.Fatalf("прогон %d: %v", run, err)
 			}
 		}
-		// Оба прогона — INSERT с ON CONFLICT по PK (идемпотентность не
-		// «пропускаем повторно», а «перезаписываем тем же состоянием»):
-		// по одному оператору на таблицу и setval на прогон.
+		// Both runs — INSERT with ON CONFLICT by PK (idempotency is not
+		// "skip the repeat" but "overwrite with the same state"): one
+		// statement per table and one setval per run.
 		for _, substr := range []string{
 			"OVERRIDING SYSTEM VALUE",
 			"ON CONFLICT (id) DO UPDATE",
@@ -419,7 +422,7 @@ func TestFixturesImportRun(t *testing.T) {
 				t.Errorf("оператор %q выполнен %d раз за 2 прогона, хочу 2", substr, n)
 			}
 		}
-		// Плоских INSERT без конфликта накат не делает вовсе.
+		// The import makes no plain INSERT without a conflict at all.
 		if pool.countSQL("ON CONFLICT") != pool.countSQL("INSERT INTO") {
 			t.Errorf("есть INSERT без ON CONFLICT — повторный накат дублировал бы строки")
 		}
@@ -449,7 +452,7 @@ func TestFixturesImportRun(t *testing.T) {
 	})
 
 	t.Run("конфликт имени зоны — отказ до записи", func(t *testing.T) {
-		pool := &importPool{zoneRows: [][]any{{int16(3), "su"}}} // в дампе su = id 7
+		pool := &importPool{zoneRows: [][]any{{int16(3), "su"}}} // in the dump su = id 7
 		var out bytes.Buffer
 		_, err := fixturesImportRun(context.Background(), pool, importDump(t), &out)
 		if err == nil || !strings.Contains(err.Error(), "su (id дампа 7, id БД 3)") {
@@ -461,7 +464,7 @@ func TestFixturesImportRun(t *testing.T) {
 	})
 
 	t.Run("конфликт метки домена — отказ до записи", func(t *testing.T) {
-		pool := &importPool{domainRows: [][]any{{int16(7), "ok", int64(5)}}} // в дампе ok = id 42
+		pool := &importPool{domainRows: [][]any{{int16(7), "ok", int64(5)}}} // in the dump ok = id 42
 		var out bytes.Buffer
 		_, err := fixturesImportRun(context.Background(), pool, importDump(t), &out)
 		if err == nil || !strings.Contains(err.Error(), "id дампа 42, id БД 5") {
@@ -505,10 +508,11 @@ func TestFixturesImportRun(t *testing.T) {
 	})
 }
 
-// TestFixturesImportForceGate — гейт --force (S-P3-5): без флага — только
-// план (цель из DSN без секрета, счётчики вставки/обновления по таблицам,
-// дубли ключей, выметаемый контент), БД не тронута (ни одного Exec);
-// с флагом — план и накат; цель не содержит пароль DSN.
+// TestFixturesImportForceGate — the --force gate (S-P3-5): without the
+// flag — only the plan (the target from the DSN without the secret, the
+// insert/update counters per table, duplicate keys, the swept content),
+// the DB untouched (not a single Exec); with the flag — the plan and the
+// import; the target carries no DSN password.
 func TestFixturesImportForceGate(t *testing.T) {
 	dsn := "postgres://crawler:secret@127.0.0.1:5432/stand?sslmode=disable"
 
@@ -540,11 +544,11 @@ func TestFixturesImportForceGate(t *testing.T) {
 		if exec, _ := pool.calls(); len(exec) != 0 {
 			t.Errorf("dry-run записал в БД: %d Exec-операторов", len(exec))
 		}
-		// План — на SELECT'ах: предпроверки и счётчики существующих PK.
+		// The plan runs on SELECTs: the pre-checks and the existing-PK counters.
 		_, query := pool.calls()
 		joined := strings.Join(query, "\n")
 		for _, substr := range []string{
-			"SELECT id, name FROM zones", // предпроверка естественных ключей
+			"SELECT id, name FROM zones", // the natural-key pre-check
 			"count(*) FROM zones AS z",
 			"count(*) FROM domains AS d",
 			"count(*) FROM subdomain_results AS r",
@@ -604,7 +608,7 @@ func TestFixturesImportForceGate(t *testing.T) {
 	})
 
 	t.Run("конфликт имени зоны виден в dry-run — до записи", func(t *testing.T) {
-		pool := &importPool{zoneRows: [][]any{{int16(3), "su"}}} // в дампе su = id 7
+		pool := &importPool{zoneRows: [][]any{{int16(3), "su"}}} // in the dump su = id 7
 		var out bytes.Buffer
 		if err := fixturesImportApply(context.Background(), pool, importDump(t),
 			fixturesImportOpts{DSN: dsn}, &out); err == nil ||
@@ -617,9 +621,9 @@ func TestFixturesImportForceGate(t *testing.T) {
 	})
 }
 
-// TestFixturesImportTarget — цель из DSN: user@host:port/dbname, никогда
-// пароль (userinfo или query); keyword/value-DSN и мусор — маска
-// db.RedactDSN без структуры.
+// TestFixturesImportTarget — the target from the DSN: user@host:port/
+// dbname, never the password (userinfo or query); keyword/value DSNs and
+// junk — the db.RedactDSN mask without structure.
 func TestFixturesImportTarget(t *testing.T) {
 	for _, c := range []struct{ dsn, want string }{
 		{"postgres://crawler:secret@127.0.0.1:5432/stand?sslmode=disable", "crawler@127.0.0.1:5432/stand"},
@@ -638,9 +642,9 @@ func TestFixturesImportTarget(t *testing.T) {
 	}
 }
 
-// TestFixturesImportSQLContract — контракты SQL наката: unnest-массивы
-// (колонка = параметр), jsonb текстом, timestamptz, все обновляемые
-// колонки в DO UPDATE, sequence-заметки контракта T-242.
+// TestFixturesImportSQLContract — the import SQL contracts: unnest
+// arrays (a column = a parameter), jsonb as text, timestamptz, all
+// updatable columns in DO UPDATE, the T-242 contract's sequence notes.
 func TestFixturesImportSQLContract(t *testing.T) {
 	if !strings.Contains(fixturesImportZonesSQL, "OVERRIDING SYSTEM VALUE") {
 		t.Errorf("зоны: нет OVERRIDING SYSTEM VALUE (identity, контракт T-242): %s", fixturesImportZonesSQL)
@@ -664,14 +668,16 @@ func TestFixturesImportSQLContract(t *testing.T) {
 			t.Errorf("результаты: нет %s: %s", need, fixturesImportResultsSQL)
 		}
 	}
-	// Контентная ссылка не накатывается и сбрасывается: contents не
-	// выгружался (T-242), продовая ссылка на стенде — висячая, запись
-	// рендера падала бы ErrRefIntegrity (SwapRefTx).
+	// The content reference is not imported and is reset: contents was
+	// not exported (T-242), the production reference would dangle on the
+	// bench, and the render write would fail with ErrRefIntegrity
+	// (SwapRefTx).
 	if strings.Contains(fixturesImportResultsSQL, "content_hash = EXCLUDED.content_hash") ||
 		!strings.Contains(fixturesImportResultsSQL, "content_hash = NULL") {
 		t.Errorf("результаты: content_hash обязан сбрасываться в NULL: %s", fixturesImportResultsSQL)
 	}
-	// Колонки вне дампа (обезличивание T-242) накат не пересобирает.
+	// The import does not reassemble columns outside the dump (T-242
+	// de-identification).
 	for _, banned := range []string{"addrs", "cname", "tls", "redirects", "stratum"} {
 		if strings.Contains(fixturesImportResultsSQL, banned) {
 			t.Errorf("результаты: колонка %s вне контракта дампа: %s", banned, fixturesImportResultsSQL)
@@ -680,8 +686,9 @@ func TestFixturesImportSQLContract(t *testing.T) {
 	if !strings.Contains(fixturesDomainsSeqSQL, "GREATEST((SELECT coalesce(max(id), 0) FROM domains)") {
 		t.Errorf("domain_id_seq: setval не выше максимума таблицы: %s", fixturesDomainsSeqSQL)
 	}
-	// Уборка осиротевшего контента: только строки без живой ссылки
-	// (revью T-243 P2-1 — refcount не декрементируется сбросом ссылок).
+	// Orphaned content cleanup: only rows without a live reference
+	// (review T-243 P2-1 — refcount is not decremented by resetting
+	// references).
 	if !strings.Contains(fixturesSweepContentsSQL, "DELETE FROM contents") ||
 		!strings.Contains(fixturesSweepContentsSQL, "NOT EXISTS") ||
 		strings.Contains(fixturesSweepContentsSQL, "refcount") {
@@ -689,13 +696,13 @@ func TestFixturesImportSQLContract(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------- публикация
+// ---------------------------------------------------------------- publishing
 
-// publishQueue — фейковая очередь: Publish проверяет тип сообщения и
-// стрим (глубокая валидация значений — территория пакета queue, у
-// RedisQueue; здесь — то, что контролирует публикация фикстуры) и
-// запоминает; failAt — номер публикации, на котором падать (0 — не
-// падать).
+// publishQueue — a fake queue: Publish checks the message type and the
+// stream (deep value validation is the queue package's territory, over
+// at RedisQueue; here — what the fixture publishing controls) and
+// remembers; failAt — the publishing number to fail on (0 — do not
+// fail).
 type publishQueue struct {
 	failAt    int
 	failErr   error
@@ -727,9 +734,10 @@ func (q *publishQueue) Ack(context.Context, string, string, ...string) error {
 	return errors.New("publishQueue: Ack не вызывается")
 }
 
-// TestFixturesPublishRun — публикация задач фикстуры: режим all (все
-// записи, имена label.zone, Fresh не ставится — его задаёт воркер),
-// режим smoke (домены подвыборки), дубли ключей, сбой публикации.
+// TestFixturesPublishRun — publishing the fixture tasks: the all mode
+// (all rows, label.zone names, Fresh is not set — the worker sets it),
+// the smoke mode (subsample domains), duplicate keys, a publishing
+// failure.
 func TestFixturesPublishRun(t *testing.T) {
 	t.Run("all: все записи с именами", func(t *testing.T) {
 		q := &publishQueue{}
@@ -761,7 +769,8 @@ func TestFixturesPublishRun(t *testing.T) {
 
 	t.Run("smoke: только домены подвыборки", func(t *testing.T) {
 		dump := importDump(t)
-		// Второй домен вне smoke: строка его субдомена не публикуется.
+		// The second domain is outside smoke: its subdomain's row is not
+		// published.
 		dump.Domains = append(dump.Domains, fixturesDomain{ZoneID: 7, ID: 43, Label: "other"})
 		dump.Results = append(dump.Results, fixturesResult{ZoneID: 7, DomainID: 43,
 			SubdomainID: 0, Variant: 0, Scheme: 2, CheckedAt: time.Now(), Stratum: "ok"})
@@ -786,7 +795,7 @@ func TestFixturesPublishRun(t *testing.T) {
 
 	t.Run("дубли ключей задач пропускаются с подсчётом", func(t *testing.T) {
 		dump := importDump(t)
-		dump.Results = append(dump.Results, dump.Results[0]) // дубль ключа
+		dump.Results = append(dump.Results, dump.Results[0]) // a duplicate key
 		q := &publishQueue{}
 		var out bytes.Buffer
 		stats, err := fixturesPublishRun(context.Background(), q, dump, fixturesPublishAll, &out)
@@ -815,7 +824,7 @@ func TestFixturesPublishRun(t *testing.T) {
 
 	t.Run("пустая smoke-подвыборка — отказ, а не пустой прогон", func(t *testing.T) {
 		dump := importDump(t)
-		dump.Smoke = nil // деградировавший дамп / не тот каталог
+		dump.Smoke = nil // a degraded dump / the wrong directory
 		q := &publishQueue{}
 		var out bytes.Buffer
 		if _, err := fixturesPublishRun(context.Background(), q, dump, fixturesPublishSmoke, &out); err == nil ||

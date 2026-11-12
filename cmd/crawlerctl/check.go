@@ -1,9 +1,10 @@
 // ---------------------------------------------------------------- check
 //
-// Живая проверка одного домена вне цикла планировщика (T-119): конвейер
-// вынесен в библиотечный пакет internal/checker (T-123 — общий для CLI и
-// формы лендинга), команда печатает итог. Read-only к БД и очередям;
-// UA/таймауты — из конфигурации; никаких активных зондов (этика §5.8/§9).
+// Live check of a single domain outside the scheduler loop (T-119): the
+// pipeline lives in the library package internal/checker (T-123 — shared
+// by the CLI and the landing form), the command prints the result.
+// Read-only with respect to the DB and queues; UA/timeouts come from the
+// configuration; no active probes (ethics §5.8/§9).
 
 package main
 
@@ -17,7 +18,7 @@ import (
 	"crawler/internal/idn"
 )
 
-// checkHelp — справка crawlerctl check --help.
+// checkHelp — help text for crawlerctl check --help.
 const checkHelp = `crawlerctl check — живая проверка домена конвейером (T-119)
 
 Использование:
@@ -58,8 +59,8 @@ func cmdCheck(args []string, stdout, stderr io.Writer) error {
 	defer stop()
 
 	poolOpts := db.NewOptions(cfg.Postgres)
-	poolOpts.PoolSize = 2           // бюджет соединений ТЗ 6.3 — у сервисов
-	poolOpts.AppName = "crawlerctl" // метка в pg_stat_activity (T-177)
+	poolOpts.PoolSize = 2           // connection budget per spec 6.3 — same as the services
+	poolOpts.AppName = "crawlerctl" // label in pg_stat_activity (T-177)
 	pool, err := db.Open(ctx, poolOpts)
 	if err != nil {
 		return fmt.Errorf("check: %w", err)
@@ -74,7 +75,7 @@ func cmdCheck(args []string, stdout, stderr io.Writer) error {
 	return nil
 }
 
-// checkLog — минимальный логгер пакета checker в stderr команды.
+// checkLog — minimal logger for the checker package, writing to the command's stderr.
 type checkLog struct{ out io.Writer }
 
 func (l checkLog) Warn(msg string, args ...any) {
@@ -86,7 +87,7 @@ func (l checkLog) Warn(msg string, args ...any) {
 }
 func (l checkLog) Info(msg string, args ...any) {}
 
-// checkPrintResult — вывод итога проверки.
+// checkPrintResult — prints the check result.
 func checkPrintResult(w io.Writer, res *checker.Result, minScore float64, rulesDir string) {
 	out(w, "check: %s (зона %s", res.Domain, res.Zone)
 	if res.Unicode != res.Domain {

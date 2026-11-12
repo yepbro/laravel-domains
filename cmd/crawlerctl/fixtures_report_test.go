@@ -1,10 +1,11 @@
-// Юнит-тесты crawlerctl fixtures report (T-244): диф детекции по
-// протоколу T-213 (санити «два прогона одной конфигурации — диф ≈0» и
-// «искусственно испорченный прогон ловится»), успешность с вычетом
-// движко-независимых потерь, темп и время страницы (гистограмма),
-// структурные метрики DOM, вердикты против порогов §5.1 п. 4 и честные
-// деградации отсутствующих источников. Снапшоты — синтетические
-// структуры (формат v1), инфраструктура не нужна.
+// Unit tests for crawlerctl fixtures report (T-244): the detection diff
+// per the T-213 protocol (the sanity checks "two runs of one
+// configuration — diff ≈0" and "an artificially corrupted run is
+// caught"), success with the engine-independent losses subtracted, pace
+// and page time (the histogram), structural DOM metrics, verdicts
+// against the §5.1 item 4 thresholds and honest degradations of missing
+// sources. Snapshots are synthetic structures (format v1); no
+// infrastructure is needed.
 package main
 
 import (
@@ -15,9 +16,9 @@ import (
 	"time"
 )
 
-// snapRows — снапшот на n одинаковых строках: rendered+контент и
-// Laravel-вердикт по умолчанию (протокол T-213: сравнимые ключи —
-// контент записан прогоном и проштампован анализатором этого прогона).
+// snapRows — a snapshot over n identical rows: rendered+content and a
+// default Laravel verdict (the T-213 protocol: comparable keys — the
+// content written by the run and stamped by that run's analyzer).
 func snapRows(n int, mut func(i int, r *fixturesSnapshotRow)) []fixturesSnapshotRow {
 	rules := int32(7)
 	out := make([]fixturesSnapshotRow, 0, n)
@@ -27,7 +28,7 @@ func snapRows(n int, mut func(i int, r *fixturesSnapshotRow)) []fixturesSnapshot
 			Rendered: true, HasContent: true,
 			ContentHash: "aabb", DOMLen: 1000, DOMParsed: true,
 			DOMNodes: 100, DOMScripts: 10,
-			RulesVersion:        &rules, // штамп анализатора по этому DOM
+			RulesVersion:        &rules, // the analyzer's stamp for this DOM
 			LaravelFound:        true,
 			IsLaravel:           i%10 == 0,
 			Score:               0.7,
@@ -41,8 +42,8 @@ func snapRows(n int, mut func(i int, r *fixturesSnapshotRow)) []fixturesSnapshot
 	return out
 }
 
-// snapOf — снапшот с базовой идентичностью прогонов (label/engine
-// различаются — это разные прогоны одной выборки).
+// snapOf — a snapshot with the runs' basic identity (label/engine
+// differ — these are different runs of one selection).
 func snapOf(label, engine string, rows []fixturesSnapshotRow) *fixturesSnapshot {
 	return &fixturesSnapshot{
 		FormatVersion: fixturesSnapshotVersion,
@@ -54,7 +55,7 @@ func snapOf(label, engine string, rows []fixturesSnapshotRow) *fixturesSnapshot 
 	}
 }
 
-// verdictOf — вердикт по имени из отчёта (нет — nil).
+// verdictOf — a verdict by name from the report (none — nil).
 func verdictOf(t *testing.T, r *fixturesReport, namePart string) *fixturesReportVerdict {
 	t.Helper()
 	for i := range r.Verdicts {
@@ -65,8 +66,8 @@ func verdictOf(t *testing.T, r *fixturesReport, namePart string) *fixturesReport
 	return nil
 }
 
-// TestFixturesReportDetectionSanity — санити-критерий задачи: два прогона
-// одной конфигурации → диф детекции 0, вердикт ПРОЙДЕН.
+// TestFixturesReportDetectionSanity — the task's sanity criterion: two
+// runs of one configuration → a detection diff of 0, a PASSED verdict.
 func TestFixturesReportDetectionSanity(t *testing.T) {
 	b := snapOf("chromium-1", "chromium", snapRows(300, nil))
 	c := snapOf("chromium-2", "chromium", snapRows(300, nil))
@@ -86,13 +87,13 @@ func TestFixturesReportDetectionSanity(t *testing.T) {
 	}
 }
 
-// TestFixturesReportDetectionCorrupted — искусственно испорченный прогон:
-// вердикты анализатора перевернуты у >1% ключей — отчёт ловит
-// расхождение (НЕ ПРОЙДЕН, доля видна в тексте).
+// TestFixturesReportDetectionCorrupted — an artificially corrupted run:
+// the analyzer's verdicts flipped at >1% of keys — the report catches
+// the divergence (FAILED, the share is visible in the text).
 func TestFixturesReportDetectionCorrupted(t *testing.T) {
 	b := snapOf("chromium-1", "chromium", snapRows(300, nil))
 	c := snapOf("moli-1", "moli", snapRows(300, func(i int, r *fixturesSnapshotRow) {
-		if i < 6 { // 2% сравнимых ключей с противоположным вердиктом
+		if i < 6 { // 2% of comparable keys with the opposite verdict
 			r.IsLaravel = !r.IsLaravel
 		}
 	}))
@@ -116,14 +117,14 @@ func TestFixturesReportDetectionCorrupted(t *testing.T) {
 	}
 }
 
-// TestFixturesReportDetectionDegradations — деградации дифа детекции:
-// анализатор не доработал (строки без штампа), правила менялись;
-// и «потеря всех признаков» ловится как расхождение (P1-1).
+// TestFixturesReportDetectionDegradations — detection diff degradations:
+// the analyzer has not finished (rows without a stamp), the rules
+// changed; and "all signs lost" is caught as a divergence (P1-1).
 func TestFixturesReportDetectionDegradations(t *testing.T) {
 	t.Run("анализатор не доработал — строка без штампа", func(t *testing.T) {
 		b := snapOf("chromium-1", "chromium", snapRows(10, nil))
 		c := snapOf("moli-1", "moli", snapRows(10, func(i int, r *fixturesSnapshotRow) {
-			r.RulesVersion = nil // рендер прошёл, анализатор по этому DOM не прошёл
+			r.RulesVersion = nil // the render passed, the analyzer has not passed over this DOM
 		}))
 		r, err := fixturesReportBuild(b, c, fixturesDefaultMemoryBudget)
 		if err != nil {
@@ -156,8 +157,8 @@ func TestFixturesReportDetectionDegradations(t *testing.T) {
 	t.Run("потеря всех признаков — расхождение, а не пропуск", func(t *testing.T) {
 		b := snapOf("chromium-1", "chromium", snapRows(100, nil))
 		c := snapOf("moli-1", "moli", snapRows(100, func(i int, r *fixturesSnapshotRow) {
-			if i%10 == 0 { // все baseline-Laravel строки
-				r.LaravelFound = false // анализатор удалил findings: ни одного срабатывания
+			if i%10 == 0 { // all baseline-Laravel rows
+				r.LaravelFound = false // the analyzer deleted the findings: not a single hit
 				r.IsLaravel = false
 				r.FindingRulesVersion = nil
 			}
@@ -178,12 +179,12 @@ func TestFixturesReportDetectionDegradations(t *testing.T) {
 	})
 }
 
-// TestFixturesReportSuccess — успешность: доля строк с DOM прогона;
-// вердикт с вычетом движко-независимых потерь (DNS/cert из метрик)
-// и строгое сравнение без метрик.
+// TestFixturesReportSuccess — success: the share of rows with the run's
+// DOM; the verdict with the engine-independent losses subtracted (DNS/
+// cert from the metrics) and a strict comparison without metrics.
 func TestFixturesReportSuccess(t *testing.T) {
 	base := snapOf("chromium-1", "chromium", snapRows(100, nil))
-	// Кандидат: 90 успешных, 10 без DOM.
+	// Candidate: 90 successful, 10 without a DOM.
 	cand := snapOf("moli-1", "moli", snapRows(100, func(i int, r *fixturesSnapshotRow) {
 		if i >= 90 {
 			r.Rendered, r.HasContent, r.ContentHash, r.DOMLen = false, false, "", 0
@@ -205,14 +206,14 @@ func TestFixturesReportSuccess(t *testing.T) {
 	})
 
 	t.Run("с метриками — вычет DNS/cert потерь", func(t *testing.T) {
-		b := *base // копия: метрики под-теста не текут в другие
+		b := *base // a copy: the sub-test's metrics do not leak into others
 		b.Streams = &fixturesSnapshotStreams{AnalyzeLen: 100, AnalyzeFirstMs: 1000, AnalyzeLastMs: 21000}
 		b.Metrics = &fixturesSnapshotMetrics{ProcessStartSeconds: 1, Tasks: 100, SecondsCount: 100, SecondsSum: 300}
 		c := *cand
 		c.Streams = &fixturesSnapshotStreams{AnalyzeLen: 100, AnalyzeFirstMs: 1000, AnalyzeLastMs: 21000}
 		c.Metrics = &fixturesSnapshotMetrics{
 			ProcessStartSeconds: 2, Tasks: 100, SecondsCount: 100, SecondsSum: 350,
-			DNSFinalized: 5, CertFinalized: 6, // 11% движко-независимых потерь
+			DNSFinalized: 5, CertFinalized: 6, // 11% engine-independent losses
 		}
 		r, err := fixturesReportBuild(&b, &c, fixturesDefaultMemoryBudget)
 		if err != nil {
@@ -231,16 +232,16 @@ func TestFixturesReportSuccess(t *testing.T) {
 	})
 }
 
-// TestFixturesReportPace — темп по границам q:analyze и вердикт «не хуже
-// базового»; пустые стримы — НЕТ ДАННЫХ.
+// TestFixturesReportPace — the pace over the q:analyze boundaries and
+// the "not worse than baseline" verdict; empty streams — NO DATA.
 func TestFixturesReportPace(t *testing.T) {
 	b := snapOf("chromium-1", "chromium", snapRows(50, nil))
-	b.Streams = &fixturesSnapshotStreams{AnalyzeLen: 51, AnalyzeFirstMs: 1000, AnalyzeLastMs: 11000} // 5 стр/с
+	b.Streams = &fixturesSnapshotStreams{AnalyzeLen: 51, AnalyzeFirstMs: 1000, AnalyzeLastMs: 11000} // 5 rows/s
 	c := snapOf("moli-1", "moli", snapRows(50, nil))
 
 	t.Run("кандидат быстрее", func(t *testing.T) {
-		c2 := *c                                                                                         // копия структуры, а не указателя: мутации не текут в соседние под-тесты
-		c2.Streams = &fixturesSnapshotStreams{AnalyzeLen: 51, AnalyzeFirstMs: 2000, AnalyzeLastMs: 8200} // 8.06 стр/с
+		c2 := *c                                                                                     // a copy of the struct, not the pointer: mutations do not leak into neighboring sub-tests
+		c2.Streams = &fixturesSnapshotStreams{AnalyzeLen: 51, AnalyzeFirstMs: 2000, AnalyzeLastMs: 8200} // 8.06 rows/s
 		r, err := fixturesReportBuild(b, &c2, fixturesDefaultMemoryBudget)
 		if err != nil {
 			t.Fatalf("отчёт: %v", err)
@@ -255,7 +256,7 @@ func TestFixturesReportPace(t *testing.T) {
 	})
 	t.Run("кандидат медленнее", func(t *testing.T) {
 		c2 := *c
-		c2.Streams = &fixturesSnapshotStreams{AnalyzeLen: 51, AnalyzeFirstMs: 1000, AnalyzeLastMs: 26000} // 2 стр/с
+		c2.Streams = &fixturesSnapshotStreams{AnalyzeLen: 51, AnalyzeFirstMs: 1000, AnalyzeLastMs: 26000} // 2 rows/s
 		r, err := fixturesReportBuild(b, &c2, fixturesDefaultMemoryBudget)
 		if err != nil {
 			t.Fatalf("отчёт: %v", err)
@@ -275,8 +276,8 @@ func TestFixturesReportPace(t *testing.T) {
 	})
 }
 
-// TestFixturesHistQuantile — квантиль по корзинам гистограммы:
-// интерполяция внутри корзины, плоский участок, отсутствие данных.
+// TestFixturesHistQuantile — a quantile over the histogram's buckets:
+// interpolation inside a bucket, a flat stretch, missing data.
 func TestFixturesHistQuantile(t *testing.T) {
 	buckets := []fixturesHistBucket{
 		{0.5, 10}, {1, 20}, {2.5, 50}, {5, 90}, {10, 100},
@@ -284,11 +285,11 @@ func TestFixturesHistQuantile(t *testing.T) {
 	if got := fixturesHistQuantile(buckets, 100, 0.5); got == nil || *got != 2.5 {
 		t.Errorf("p50 = %v, хочу 2.5", got)
 	}
-	// p95: ранг 95 — корзина [5,10) с 90..100 → 5 + (95-90)/10*5 = 7.5.
+	// p95: rank 95 — the [5,10) bucket with 90..100 → 5 + (95-90)/10*5 = 7.5.
 	if got := fixturesHistQuantile(buckets, 100, 0.95); got == nil || *got != 7.5 {
 		t.Errorf("p95 = %v, хочу 7.5", got)
 	}
-	// p10 — ровно на границе первой корзины.
+	// p10 — exactly at the first bucket's bound.
 	if got := fixturesHistQuantile(buckets, 100, 0.10); got == nil || *got != 0.5 {
 		t.Errorf("p10 = %v, хочу 0.5", got)
 	}
@@ -300,16 +301,16 @@ func TestFixturesHistQuantile(t *testing.T) {
 	}
 }
 
-// TestFixturesReportDOM — структурные метрики DOM: медианы отношений,
-// доля идентичного DOM, аномальные пары.
+// TestFixturesReportDOM — structural DOM metrics: the medians of the
+// ratios, the share of identical DOM, anomalous pairs.
 func TestFixturesReportDOM(t *testing.T) {
 	b := snapOf("chromium-1", "chromium", snapRows(100, nil))
 	c := snapOf("moli-1", "moli", snapRows(100, func(i int, r *fixturesSnapshotRow) {
 		switch {
-		case i < 90: // стабильное ядро — тот же DOM
-		case i < 95: // чуть другой (отношение в допуске)
+		case i < 90: // the stable core — the same DOM
+		case i < 95: // slightly different (the ratio within tolerance)
 			r.ContentHash, r.DOMLen, r.DOMNodes, r.DOMScripts = "ccdd", 1200, 110, 10
-		default: // аномальные — втрое короче
+		default: // anomalous — three times shorter
 			r.ContentHash, r.DOMLen, r.DOMNodes, r.DOMScripts = "eeff", 300, 90, 10
 		}
 	}))
@@ -335,8 +336,9 @@ func TestFixturesReportDOM(t *testing.T) {
 	}
 }
 
-// TestFixturesReportMemoryAndCrashes — пороги памяти (⅓ бюджета) и
-// crashes: операторский вход, прокси browser-класса, деградация.
+// TestFixturesReportMemoryAndCrashes — the memory thresholds (⅓ of the
+// budget) and crashes: the operator's input, the browser-class proxy,
+// degradation.
 func TestFixturesReportMemoryAndCrashes(t *testing.T) {
 	newSnap := func(label string, rss *int64, crashes *int64, metrics *fixturesSnapshotMetrics) *fixturesSnapshot {
 		s := snapOf(label, "moli", snapRows(10, nil))
@@ -405,9 +407,10 @@ func TestFixturesReportMemoryAndCrashes(t *testing.T) {
 	})
 }
 
-// TestFixturesReportCumulative — воркер не перезапускался между
-// снапшотами: счётчики накопительные — предупреждение и деградация
-// вердиктов, завязанных на метрики candidate (browser-класс).
+// TestFixturesReportCumulative — the worker was not restarted between
+// the snapshots: the counters are cumulative — a warning and a
+// degradation of the verdicts tied to the candidate's metrics (the
+// browser class).
 func TestFixturesReportCumulative(t *testing.T) {
 	b := snapOf("chromium-1", "chromium", snapRows(10, nil))
 	b.Metrics = &fixturesSnapshotMetrics{ProcessStartSeconds: 42, Tasks: 10}
@@ -431,20 +434,21 @@ func TestFixturesReportCumulative(t *testing.T) {
 	}
 }
 
-// TestFixturesReportKeysMismatch — снапшоты по разным выборкам: отчёт
-// отказывается сравнивать (ошибка), а не сравнивает яблоки с грушами.
+// TestFixturesReportKeysMismatch — snapshots over different selections:
+// the report refuses to compare (an error) rather than comparing apples
+// with oranges.
 func TestFixturesReportKeysMismatch(t *testing.T) {
 	b := snapOf("chromium-1", "chromium", snapRows(10, nil))
 	c := snapOf("moli-1", "moli", snapRows(10, func(i int, r *fixturesSnapshotRow) {
-		r.DomainID += 100 // другой дамп
+		r.DomainID += 100 // a different dump
 	}))
 	if _, err := fixturesReportBuild(b, c, fixturesDefaultMemoryBudget); err == nil {
 		t.Fatalf("отчёт по разным выборкам не отказался")
 	}
 }
 
-// TestFixturesReportPendingWork — незавершённый прогон: остатки
-// q:render/q:render-fallback видны предупреждениями.
+// TestFixturesReportPendingWork — an incomplete run: the q:render/
+// q:render-fallback leftovers are visible as warnings.
 func TestFixturesReportPendingWork(t *testing.T) {
 	b := snapOf("chromium-1", "chromium", snapRows(10, nil))
 	c := snapOf("moli-1", "moli", snapRows(10, nil))
@@ -461,9 +465,9 @@ func TestFixturesReportPendingWork(t *testing.T) {
 	}
 }
 
-// TestFixturesReportEmptyMetrics — пустые метрики candidate (чужой/
-// перезапущенный после прогона воркер): вердикт crashes деградирует,
-// предупреждение есть (ревью T-244 P2-1).
+// TestFixturesReportEmptyMetrics — the candidate's empty metrics (a
+// foreign worker, or one restarted after the run): the crashes verdict
+// degrades, there is a warning (review T-244 P2-1).
 func TestFixturesReportEmptyMetrics(t *testing.T) {
 	b := snapOf("chromium-1", "chromium", snapRows(10, nil))
 	b.Metrics = &fixturesSnapshotMetrics{ProcessStartSeconds: 1, Tasks: 5, SecondsCount: 5, SecondsSum: 10}
@@ -487,9 +491,9 @@ func TestFixturesReportEmptyMetrics(t *testing.T) {
 	}
 }
 
-// TestFixturesReportPaceWithoutStreams — время страницы (ср./p95) из
-// гистограммы печатается и без темпа: метрики снимались, Redis — нет
-// (ревью T-244 P2-2).
+// TestFixturesReportPaceWithoutStreams — the page time (avg/p95) from
+// the histogram is printed even without a pace: the metrics were taken,
+// Redis was not (review T-244 P2-2).
 func TestFixturesReportPaceWithoutStreams(t *testing.T) {
 	b := snapOf("chromium-1", "chromium", snapRows(10, nil))
 	b.Metrics = &fixturesSnapshotMetrics{
@@ -521,14 +525,14 @@ func TestFixturesReportPaceWithoutStreams(t *testing.T) {
 	}
 }
 
-// TestFixturesReportDOMScriptZero — пары, где один из прогонов не выполнил
-// ни одного <script>: в медианы не входят, но видны отдельной метрикой
-// (ревью T-244 P2-3).
+// TestFixturesReportDOMScriptZero — pairs where one of the runs executed
+// no <script> at all: they are not in the medians but are visible as a
+// separate metric (review T-244 P2-3).
 func TestFixturesReportDOMScriptZero(t *testing.T) {
 	b := snapOf("chromium-1", "chromium", snapRows(100, nil))
 	c := snapOf("moli-1", "moli", snapRows(100, func(i int, r *fixturesSnapshotRow) {
 		if i < 3 {
-			r.DOMScripts = 0 // кандидат не выполнил ни одного скрипта
+			r.DOMScripts = 0 // the candidate executed no scripts
 		}
 	}))
 	r, err := fixturesReportBuild(b, c, fixturesDefaultMemoryBudget)
@@ -548,12 +552,12 @@ func TestFixturesReportDOMScriptZero(t *testing.T) {
 	}
 }
 
-// TestFixturesReportTruncatedKeys — снапшот с усеченным набором строк
-// (строки дампа исчезли из БД): предупреждение, а не молчаливый
-// знаменатель (ревью T-244 P2-4).
+// TestFixturesReportTruncatedKeys — a snapshot with a truncated set of
+// rows (dump rows vanished from the DB): a warning, not a silent
+// denominator (review T-244 P2-4).
 func TestFixturesReportTruncatedKeys(t *testing.T) {
 	b := snapOf("chromium-1", "chromium", snapRows(10, nil))
-	b.Dump.Keys = 12 // дамп насчитывал 12, в БД осталось 10
+	b.Dump.Keys = 12 // the dump counted 12, 10 remain in the DB
 	c := snapOf("moli-1", "moli", snapRows(10, nil))
 	r, err := fixturesReportBuild(b, c, fixturesDefaultMemoryBudget)
 	if err != nil {
@@ -568,8 +572,8 @@ func TestFixturesReportTruncatedKeys(t *testing.T) {
 	}
 }
 
-// TestFixturesReportPairSanity — саниты пары: одинаковые метки и
-// baseline не-chromium — предупреждения (ревью T-244 P3-4).
+// TestFixturesReportPairSanity — the pair's sanity checks: identical
+// labels and a non-chromium baseline — warnings (review T-244 P3-4).
 func TestFixturesReportPairSanity(t *testing.T) {
 	b := snapOf("run", "moli", snapRows(10, nil))
 	c := snapOf("run", "moli", snapRows(10, nil))
@@ -586,9 +590,9 @@ func TestFixturesReportPairSanity(t *testing.T) {
 	}
 }
 
-// TestFixturesHistQuantileSentinelTail — ранг выше кумуляты при
-// сентинеле +Inf последней корзиной: последняя конечная граница, не
-// MaxFloat64 (ревью T-244 P3-2).
+// TestFixturesHistQuantileSentinelTail — a rank above the cumulative
+// with the +Inf sentinel as the last bucket: the last finite bound, not
+// MaxFloat64 (review T-244 P3-2).
 func TestFixturesHistQuantileSentinelTail(t *testing.T) {
 	buckets := []fixturesHistBucket{
 		{0.5, 10}, {5, 60}, {math.MaxFloat64, 70},
@@ -602,8 +606,8 @@ func TestFixturesHistQuantileSentinelTail(t *testing.T) {
 	}
 }
 
-// TestFixturesReportFullText — готовый отчёт целиком: все разделы §5.1
-// п. 3 и все вердикты п. 4 присутствуют в тексте.
+// TestFixturesReportFullText — the complete report: all §5.1 item 3
+// sections and all item 4 verdicts are present in the text.
 func TestFixturesReportFullText(t *testing.T) {
 	rssB, rssC := int64(768<<20), int64(96<<20)
 	zero := int64(0)
@@ -661,8 +665,8 @@ func TestFixturesReportFullText(t *testing.T) {
 	}
 }
 
-// TestFixturesReasonList — словарь причин строкой: сортировка по счёту,
-// детерминизм при равенстве.
+// TestFixturesReasonList — the reason dictionary as a string: sorting by
+// count, determinism on ties.
 func TestFixturesReasonList(t *testing.T) {
 	got := fixturesReasonList(map[string]float64{"timeout": 5, "net::ERR_CONNECTION_REFUSED": 7, "other": 5})
 	if got != "net::ERR_CONNECTION_REFUSED: 7, other: 5, timeout: 5" {
@@ -673,7 +677,7 @@ func TestFixturesReasonList(t *testing.T) {
 	}
 }
 
-// TestFixturesFormatBytes — человекочитаемые байты для строк отчёта.
+// TestFixturesFormatBytes — human-readable bytes for the report lines.
 func TestFixturesFormatBytes(t *testing.T) {
 	cases := map[int64]string{
 		512:                         "512 B",

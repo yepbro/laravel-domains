@@ -1,32 +1,36 @@
 // ---------------------------------------------------------------- domain
 //
-// crawlerctl domain (T-081, ТЗ 5.11): информация о домене по имени —
-// для оператора (сводка по разделам) и скриптов (--json). Единственный
-// источник данных — SQL-функция domain_info(text) (миграция 000006,
-// T-082): у CLI и psql одна точка правды. Роль команды — нормализовать
-// вход (internal/idn, тот же конвейер, что и для строк incoming),
-// украсить вывод и по флагу --content распаковать контент из хранилища
-// (content_hash в результатах — ссылка, байты отдаёт ContentStore).
+// crawlerctl domain (T-081, spec 5.11): information about a domain by
+// name — for the operator (a sectioned summary) and for scripts (--json).
+// The single source of data is the SQL function domain_info(text)
+// (migration 000006, T-082): the CLI and psql share one source of truth.
+// The command's role is to normalize the input (internal/idn, the same
+// pipeline as for incoming rows), to dress up the output and, with the
+// --content flag, to unpack content from the store (content_hash in the
+// results is a reference; the bytes come from the ContentStore).
 //
-// Решения (зафиксированы по ТЗ 5.11):
+// Decisions (fixed per spec 5.11):
 //
-//   - не найдено «что именно»: domain_info на пустой случай отвечает
-//     NULL без различия «нет зоны»/«нет домена в зоне»; команда доуточняет
-//     одним лёгким запросом к справочнику zones (длиннейший суффикс
-//     имени, присутствующий в zones, — так же зону отделяет функция);
-//   - --json — сырой ответ domain_info (pretty-print); домен не найден —
-//     объект {"found":false,…} и код 1;
-//   - --content — stdout получает только байты выбранной записи (итоговый
-//     DOM рендера либо сырой HTML), сводка и пометка о выбранной записи —
-//     в stderr: поток можно перенаправлять в файл. Выбор записи — первая
-//     «осмысленная»: приоритет отрендеренной (DOM — главный результат
-//     конвейера для SPA, ТЗ 5.6), далее первая запись с контентом
-//     в порядке субдомен×вариант. --json и --content несовместимы:
-//     машинный вывод не смешивается с байтами контента;
-//   - cookies и заголовки (ТЗ 5.11) в вывод не входят: они живут
-//     в subdomain_results, а не в хранилище контента, и в ответ
-//     domain_info не попали (контракт T-082); сводка и так не байтовая,
-//     а --content обязан оставаться чистым потоком.
+//   - "what exactly" is not found: domain_info answers NULL on the empty
+//     case without distinguishing "no zone"/"no domain in the zone"; the
+//     command clarifies with one light query against the zones reference
+//     table (the longest name suffix present in zones — the function
+//     splits the zone the same way);
+//   - --json is the raw domain_info response (pretty-print); domain not
+//     found — the {"found":false,…} object and exit code 1;
+//   - --content — stdout receives only the bytes of the selected record
+//     (the render's final DOM or the raw HTML); the summary and the note
+//     about the selected record go to stderr, so the stream can be
+//     redirected to a file. The record choice is the first "meaningful"
+//     one: the rendered record has priority (DOM is the pipeline's main
+//     result for SPA, spec 5.6), then the first record with content in
+//     subdomain×variant order. --json and --content are incompatible:
+//     machine output is never mixed with content bytes;
+//   - cookies and headers (spec 5.11) are not part of the output: they
+//     live in subdomain_results, not in the content store, and did not
+//     make it into the domain_info response (the T-082 contract); the
+//     summary is not byte-oriented anyway, and --content must remain a
+//     clean stream.
 
 package main
 
@@ -50,7 +54,7 @@ import (
 	"crawler/internal/model"
 )
 
-// domainHelp — справка crawlerctl domain --help.
+// domainHelp — help text for crawlerctl domain --help.
 const domainHelp = `crawlerctl domain — информация о домене по имени (ТЗ 5.11)
 
 Использование:
@@ -85,37 +89,39 @@ is_laravel (домены только со слабыми срабатывани
 
 // ---------------------------------------------------------------- SQL
 
-// domainInfoSQL — единственная выборка команды: SQL-функция domain_info
-// (миграция 000006, T-082) возвращает сводку домена одним jsonb —
-// зона/статусы/dns_alive/результаты/laravel-агрегат с findings; домен
-// или зона не найдены — NULL, не ошибка. Функция сама отделяет зону
-// (длиннейший суффикс имени из справочника zones) и ищет домен по
-// уникальному ключу (zone_id, label) без полного сканирования.
+// domainInfoSQL — the command's only query: the SQL function domain_info
+// (migration 000006, T-082) returns the domain summary as one jsonb —
+// zone/statuses/dns_alive/results/laravel aggregate with findings; a
+// missing domain or zone is NULL, not an error. The function splits off
+// the zone itself (the longest name suffix from the zones reference
+// table) and looks the domain up by the unique key (zone_id, label)
+// without a full scan.
 const domainInfoSQL = "SELECT domain_info($1) AS info"
 
-// zoneLongestSQL — уточнение для «не найдено» (ТЗ 5.11: сообщение
-// указывает, что именно не найдено): длиннейший суффикс имени,
-// присутствующий в справочнике zones. Суффиксы-кандидаты (все, кроме
-// полной длины — у домена есть хоть одна метка перед зоной) передаёт
-// команда; зона без доменов не бывает (зоны создаёт ingest вместе
-// с доменами), поэтому кандидатов достаточно.
+// zoneLongestSQL — the clarification for "not found" (spec 5.11: the
+// message says what exactly was not found): the longest name suffix
+// present in the zones reference table. The command passes the candidate
+// suffixes (all but the full length — a domain has at least one label
+// before the zone); a zone without domains does not exist (ingest
+// creates zones together with domains), so the candidates are enough.
 const zoneLongestSQL = "SELECT z.name FROM zones AS z " +
 	"WHERE z.name = ANY($1::text[]) " +
 	"ORDER BY length(z.name) DESC, z.name LIMIT 1"
 
-// ---------------------------------------------------------------- данные
+// ---------------------------------------------------------------- data
 
-// domainSubRef — {id, label} справочника subdomains из jsonb
-// (dns_alive, laravel.found_on).
+// domainSubRef — {id, label} from the subdomains reference table, from
+// the jsonb (dns_alive, laravel.found_on).
 type domainSubRef struct {
 	ID    int16  `json:"id"`
 	Label string `json:"label"`
 }
 
-// domainResult — строка results: результат по паре (субдомен, вариант).
-// Nullable-колонки (http_status, final_url, alias, error, content_hash)
-// приходят json null → нулевые значения Go; для вывода это то же
-// «значения нет» (http_status 0 и error 0 не встречаются как данные).
+// domainResult — a results row: the result for a (subdomain, variant)
+// pair. Nullable columns (http_status, final_url, alias, error,
+// content_hash) arrive as json null → zero Go values; for the output
+// that is the same "no value" (http_status 0 and error 0 never occur as
+// data).
 type domainResult struct {
 	SubdomainID int16  `json:"subdomain_id"`
 	Subdomain   string `json:"subdomain"`
@@ -127,21 +133,21 @@ type domainResult struct {
 	Alias       string `json:"alias"`
 	Rendered    bool   `json:"rendered"`
 	Error       int16  `json:"error"`
-	ContentHash string `json:"content_hash"` // hex; "" — контента нет
+	ContentHash string `json:"content_hash"` // hex; "" — no content
 	CheckedAt   string `json:"checked_at"`
 }
 
-// domainSignal — свидетельство из laravel_findings.signals
-// ([{rule, weight, evidence}, …] — формат этапа записи, T-071).
+// domainSignal — evidence from laravel_findings.signals
+// ([{rule, weight, evidence}, …] — the recording stage format, T-071).
 type domainSignal struct {
 	Rule     string  `json:"rule"`
 	Weight   float64 `json:"weight"`
 	Evidence string  `json:"evidence"`
 }
 
-// domainFinding — строка laravel_findings: срабатывания правил по одному
-// результату; слабые (is_laravel = false, score ниже порога) хранятся
-// так же, как и подтвердившие (ТЗ 5.8, 13.1).
+// domainFinding — a laravel_findings row: rule hits for one result;
+// weak ones (is_laravel = false, score below the threshold) are stored
+// the same way as confirmed ones (spec 5.8, 13.1).
 type domainFinding struct {
 	SubdomainID int16          `json:"subdomain_id"`
 	Subdomain   string         `json:"subdomain"`
@@ -153,8 +159,9 @@ type domainFinding struct {
 	Signals     []domainSignal `json:"signals"`
 }
 
-// domainLaravel — агрегат laravel_domains с расшифровкой found_on
-// и всеми findings домена по убыванию score (контракт T-082).
+// domainLaravel — the laravel_domains aggregate with the found_on
+// breakdown and all of the domain's findings by descending score
+// (the T-082 contract).
 type domainLaravel struct {
 	Score        float64         `json:"score"`
 	VerMin       string          `json:"ver_min"`
@@ -166,9 +173,9 @@ type domainLaravel struct {
 	Findings     []domainFinding `json:"findings"`
 }
 
-// domainInfo — ответ domain_info. Метки времени — строки как есть
-// (last_checked_at имеет точность дня, timestamptz — ISO 8601;
-// оформление — formatDomainTS, разбор в time.Time ничего не добавляет).
+// domainInfo — the domain_info response. Timestamps are strings as-is
+// (last_checked_at has day precision, timestamptz — ISO 8601; the
+// formatting is formatDomainTS, parsing into time.Time adds nothing).
 type domainInfo struct {
 	Zone struct {
 		ID          int16  `json:"id"`
@@ -193,9 +200,9 @@ type domainInfo struct {
 	Laravel  *domainLaravel `json:"laravel"`
 }
 
-// fetchDomainInfo вызывает domain_info(имя punycode): сырой jsonb (для
-// --json) и разобранная копия (для человекочитаемого вывода). NULL —
-// домен или зона не найдены: found=false без ошибки.
+// fetchDomainInfo calls domain_info(punycode name): the raw jsonb (for
+// --json) and a parsed copy (for the human-readable output). NULL —
+// the domain or zone was not found: found=false without an error.
 func fetchDomainInfo(ctx context.Context, pool db.DB, name string) (info domainInfo, raw []byte, found bool, err error) {
 	if pool == nil {
 		return domainInfo{}, nil, false, errors.New("domain: domain_info: пул не задан")
@@ -214,7 +221,7 @@ func fetchDomainInfo(ctx context.Context, pool db.DB, name string) (info domainI
 	if err := rows.Err(); err != nil {
 		return domainInfo{}, nil, false, fmt.Errorf("domain: domain_info: %w", err)
 	}
-	if raw == nil { // NULL: не найдено — не ошибка (контракт T-082)
+	if raw == nil { // NULL: not found — not an error (the T-082 contract)
 		return domainInfo{}, nil, false, nil
 	}
 	if err := json.Unmarshal(raw, &info); err != nil {
@@ -223,9 +230,10 @@ func fetchDomainInfo(ctx context.Context, pool db.DB, name string) (info domainI
 	return info, raw, true, nil
 }
 
-// zoneSuffixCandidates — суффиксы имени-кандидаты в зону (длиннейший
-// первым): example.crawl.test → [crawl.test, test]. Полное имя не входит:
-// у домена перед зоной есть хотя бы одна метка (как в domain_info).
+// zoneSuffixCandidates — name suffixes that are zone candidates (longest
+// first): example.crawl.test → [crawl.test, test]. The full name is not
+// included: a domain has at least one label before the zone (as in
+// domain_info).
 func zoneSuffixCandidates(name string) []string {
 	labels := strings.Split(name, ".")
 	cands := make([]string, 0, len(labels)-1)
@@ -235,10 +243,10 @@ func zoneSuffixCandidates(name string) []string {
 	return cands
 }
 
-// fetchCatalogZone ищет длиннейший суффикс имени в справочнике zones
-// (второй запрос команды — только когда domain_info вернул NULL).
-// Возвращает best (найденная зона, иначе длиннейший кандидат — для
-// сообщения «какой зоны не хватает») и found.
+// fetchCatalogZone looks up the longest name suffix in the zones
+// reference table (the command's second query — only when domain_info
+// returned NULL). Returns best (the found zone, otherwise the longest
+// candidate — for the "which zone is missing" message) and found.
 func fetchCatalogZone(ctx context.Context, pool db.DB, name string) (best string, found bool, err error) {
 	if pool == nil {
 		return "", false, errors.New("domain: зоны: пул не задан")
@@ -254,7 +262,7 @@ func fetchCatalogZone(ctx context.Context, pool db.DB, name string) (best string
 	defer rows.Close()
 	var zone []byte
 	if !rows.Next() {
-		// Не найдено — не ошибка: best остаётся длиннейшим кандидатом.
+		// Not found — not an error: best stays the longest candidate.
 		return cands[0], false, rows.Err()
 	}
 	if err := rows.Scan(&zone); err != nil {
@@ -269,9 +277,9 @@ func fetchCatalogZone(ctx context.Context, pool db.DB, name string) (best string
 	return string(zone), true, nil
 }
 
-// ---------------------------------------------------------------- вывод
+// ---------------------------------------------------------------- output
 
-// subLabel — метка субдомена для вывода: ” — апекс домена (id 0).
+// subLabel — subdomain label for output: ” — the domain's apex (id 0).
 func subLabel(label string) string {
 	if label == "" {
 		return "(апекс)"
@@ -279,9 +287,9 @@ func subLabel(label string) string {
 	return label
 }
 
-// orEmDash — пустая строка → «—» (значения нет). Локальное имя, а не
-// orDash из test-rules («?»): в сводке домена пустые поля — именно
-// «нет значения».
+// orEmDash — an empty string → "—" (no value). A local name, not the
+// orDash from test-rules ("?"): in the domain summary empty fields mean
+// precisely "no value".
 func orEmDash(s string) string {
 	if s == "" {
 		return "—"
@@ -289,16 +297,16 @@ func orEmDash(s string) string {
 	return s
 }
 
-// parseDomainTS разбирает метку времени из jsonb: timestamptz приходит
-// ISO 8601 (RFC 3339); date («2006-01-02», last_checked_at) времени не
-// содержит и на разбор не попадает — выводится как есть. Чужой формат
-// не роняет вывод: строка показывается сырой.
+// parseDomainTS parses a timestamp from the jsonb: timestamptz arrives
+// ISO 8601 (RFC 3339); date ("2006-01-02", last_checked_at) carries no
+// time and never reaches the parser — it is printed as-is. A foreign
+// format does not crash the output: the string is shown raw.
 func parseDomainTS(s string) (time.Time, error) {
 	return time.Parse(time.RFC3339Nano, s)
 }
 
-// formatDomainTS — метка времени из jsonb для вывода: timestamptz (ISO
-// 8601) → «2006-01-02 15:04:05», date остаётся как есть.
+// formatDomainTS — a jsonb timestamp for output: timestamptz (ISO 8601)
+// → "2006-01-02 15:04:05", date stays as-is.
 func formatDomainTS(s string) string {
 	if t, err := parseDomainTS(s); err == nil {
 		return t.Format("2006-01-02 15:04:05")
@@ -306,8 +314,8 @@ func formatDomainTS(s string) string {
 	return s
 }
 
-// formatDomainTSShort — то же без секунд (колонка «проверен» таблицы
-// результатов).
+// formatDomainTSShort — the same without seconds (the "checked" column
+// of the results table).
 func formatDomainTSShort(s string) string {
 	if t, err := parseDomainTS(s); err == nil {
 		return t.Format("2006-01-02 15:04")
@@ -315,8 +323,8 @@ func formatDomainTSShort(s string) string {
 	return s
 }
 
-// httpStatusDesc — HTTP-статус результата: 0/null — «—» (нулевого
-// статуса не бывает — статус есть у ответа, а не у ошибки запроса).
+// httpStatusDesc — the result's HTTP status: 0/null — "—" (a zero status
+// does not exist — a response has a status, a request error does not).
 func httpStatusDesc(r domainResult) string {
 	if r.HTTPStatus == 0 {
 		return "—"
@@ -324,8 +332,8 @@ func httpStatusDesc(r domainResult) string {
 	return strconv.FormatInt(int64(r.HTTPStatus), 10)
 }
 
-// verRange — диапазон версий Laravel: «9.0 – 11», «≥ 9.0», «≤ 11»;
-// обе границы пусты — «—» (нашлись признаки без версии).
+// verRange — the Laravel version range: "9.0 – 11", "≥ 9.0", "≤ 11";
+// both bounds empty — "—" (signs were found without a version).
 func verRange(min, max string) string {
 	switch {
 	case min != "" && max != "":
@@ -342,9 +350,10 @@ func verRange(min, max string) string {
 	}
 }
 
-// httpErrorName — имя класса ошибки субдомена по коду
-// subdomain_results.error. Коды — internal/httpworker.ErrorClass (кладёт
-// T-058); имена продублированы, чтобы CLI не тянул пакет воркера.
+// httpErrorName — the subdomain error class name by the
+// subdomain_results.error code. Codes — internal/httpworker.ErrorClass
+// (introduced by T-058); the names are duplicated so the CLI does not
+// pull in the worker package.
 func httpErrorName(code int16) string {
 	switch code {
 	case 0:
@@ -364,8 +373,9 @@ func httpErrorName(code int16) string {
 	}
 }
 
-// contentKind — что сохранено в записи: итоговый DOM рендера или сырой
-// HTML (ТЗ 5.6); «—» — контента нет (проверка не дошла до загрузки тел).
+// contentKind — what is stored in the record: the render's final DOM or
+// the raw HTML (spec 5.6); "—" — no content (the check never got to
+// fetching bodies).
 func contentKind(r domainResult) string {
 	switch {
 	case r.ContentHash == "":
@@ -377,8 +387,8 @@ func contentKind(r domainResult) string {
 	}
 }
 
-// aliasDesc — связь субдомена с другим субдоменом (ТЗ 5.5 п. 6):
-// «≡ метка» — идентичен, «→ метка» — редирект.
+// aliasDesc — the subdomain's relation to another subdomain (spec 5.5
+// item 6): "≡ label" — identical, "→ label" — redirect.
 func aliasDesc(r domainResult) string {
 	switch model.AliasKind(r.AliasKind) {
 	case model.AliasIdentical:
@@ -390,8 +400,8 @@ func aliasDesc(r domainResult) string {
 	}
 }
 
-// resultFinalDesc — итоговый URL либо ошибка проверки (код и класс,
-// ТЗ 5.11 «ошибка»), «—» — ни того ни другого.
+// resultFinalDesc — the final URL or the check error (code and class,
+// spec 5.11 "error"), "—" — neither.
 func resultFinalDesc(r domainResult) string {
 	desc := r.FinalURL
 	if r.Error != 0 {
@@ -405,10 +415,11 @@ func resultFinalDesc(r domainResult) string {
 	return orEmDash(desc)
 }
 
-// writeDomainText — человекочитаемая сводка: шапка (домен/зона/статусы),
-// DNS-живые субдомены, таблица результатов, признаки Laravel.
-// minScore — порог laravel_domains из конфигурации (аналогично
-// отображается в §5.8: score ≥ порога попадает в агрегат).
+// writeDomainText — the human-readable summary: a header
+// (domain/zone/statuses), DNS-alive subdomains, the results table, the
+// Laravel signs. minScore — the laravel_domains threshold from the
+// configuration (also shown in §5.8: a score ≥ the threshold makes it
+// into the aggregate).
 func writeDomainText(w io.Writer, info domainInfo, minScore float64) {
 	d, z := info.Domain, info.Zone
 
@@ -440,7 +451,7 @@ func writeDomainText(w io.Writer, info domainInfo, minScore float64) {
 		out(w, "temp-попытки: %d\n", d.TempAttempts)
 	}
 
-	// Расшифровка dns_mask — labels справочника subdomains (ТЗ 5.11).
+	// The dns_mask breakdown — labels from the subdomains reference table (spec 5.11).
 	if len(info.DNSAlive) == 0 {
 		out(w, "\nDNS-живые субдомены (dns_mask = %d): нет\n", d.DNSMask)
 	} else {
@@ -451,9 +462,9 @@ func writeDomainText(w io.Writer, info domainInfo, minScore float64) {
 		out(w, "\nDNS-живые субдомены (dns_mask = %d): %s\n", d.DNSMask, strings.Join(labels, ", "))
 	}
 
-	// Результаты по субдоменам × вариантам — моноширинная таблица
-	// (стиль writeStatusTable: ширины по содержимому, последняя колонка
-	// без паддинга).
+	// Results by subdomain × variant — a monospace table (the
+	// writeStatusTable style: widths from content, the last column
+	// without padding).
 	out(w, "\nрезультаты по субдоменам и вариантам:\n")
 	if len(info.Results) == 0 {
 		out(w, "  — нет (домен не проверялся или DNS не делегирован)\n")
@@ -487,7 +498,7 @@ func writeDomainText(w io.Writer, info domainInfo, minScore float64) {
 					b.WriteByte(' ')
 				}
 				if i == len(row)-1 {
-					b.WriteString(c) // последняя колонка — как есть
+					b.WriteString(c) // the last column — as-is
 				} else {
 					fmt.Fprintf(&b, "%-*s", widths[i], c)
 				}
@@ -499,10 +510,10 @@ func writeDomainText(w io.Writer, info domainInfo, minScore float64) {
 	writeLaravelText(w, info.Laravel, minScore)
 }
 
-// writeLaravelText — раздел признаков Laravel: агрегат (score, диапазон
-// версий, субдомены, версия правил), подтвердившие срабатывания с
-// фрагментами-свидетельствами и отдельной секцией слабые (is_laravel =
-// false, ниже порога) — все срабатывания хранятся (ТЗ 13.1).
+// writeLaravelText — the Laravel signs section: the aggregate (score,
+// version range, subdomains, rules version), confirmed rule hits with
+// evidence fragments, and a separate section for weak ones (is_laravel =
+// false, below the threshold) — all rule hits are stored (spec 13.1).
 func writeLaravelText(w io.Writer, l *domainLaravel, minScore float64) {
 	out(w, "\nLaravel:\n")
 	if l == nil {
@@ -543,8 +554,8 @@ func writeLaravelText(w io.Writer, l *domainLaravel, minScore float64) {
 	}
 }
 
-// writeFindingText — одно срабатывание: субдомен, вариант, score,
-// диапазон версий (если сузился) и правила с фрагментами-свидетельствами.
+// writeFindingText — one rule hit: the subdomain, variant, score, the
+// version range (if narrowed) and the rules with evidence fragments.
 func writeFindingText(w io.Writer, f domainFinding) {
 	ver := verRange(f.VerMin, f.VerMax)
 	if ver != "—" {
@@ -557,16 +568,17 @@ func writeFindingText(w io.Writer, f domainFinding) {
 	}
 }
 
-// scoreFmt — score/вес с тремя знаками: точность real в laravel_*
-// (T-071) короче, дальнейший хвост не информативен.
+// scoreFmt — score/weight with three decimals: the real precision in
+// laravel_* (T-071) is shorter, the further tail carries no
+// information.
 func scoreFmt(v float64) string {
 	return strconv.FormatFloat(v, 'f', 3, 64)
 }
 
-// writeDomainJSON — машинный вывод: сырой ответ domain_info
-// (pretty-print, 2 пробела — нормализованный вид для глаз, json
-// валиден и для jq). Ответ приходит из jsonb — всегда валиден; отказ
-// json.Indent (чужой источник) страхуется выводом как есть.
+// writeDomainJSON — machine output: the raw domain_info response
+// (pretty-print, 2 spaces — a normalized look for the eyes; the json is
+// also valid for jq). The response comes from jsonb — always valid; a
+// json.Indent failure (a foreign source) is guarded by printing as-is.
 func writeDomainJSON(w io.Writer, raw []byte) error {
 	var buf bytes.Buffer
 	if err := json.Indent(&buf, raw, "", "  "); err != nil {
@@ -580,8 +592,9 @@ func writeDomainJSON(w io.Writer, raw []byte) error {
 	return nil
 }
 
-// writeDomainNotFoundJSON — машинный ответ на «не найдено»:
-// found=false и что удалось выяснить о зоне (для скриптов).
+// writeDomainNotFoundJSON — the machine answer to "not found":
+// found=false and whatever could be learned about the zone (for
+// scripts).
 func writeDomainNotFoundJSON(w io.Writer, name, zone string, zoneFound bool) error {
 	enc := json.NewEncoder(w)
 	enc.SetEscapeHTML(false)
@@ -596,20 +609,21 @@ func writeDomainNotFoundJSON(w io.Writer, name, zone string, zoneFound bool) err
 	return nil
 }
 
-// ---------------------------------------------------------------- контент
+// ---------------------------------------------------------------- content
 
-// domainContentStore — часть ContentStore, нужная domain --content:
-// только Get. *content.PackStore (T-042) удовлетворяет; выделено
-// интерфейсом для тестов без хранилища.
+// domainContentStore — the part of the ContentStore that domain
+// --content needs: only Get. *content.PackStore (T-042) satisfies it;
+// extracted as an interface for tests without a store.
 type domainContentStore interface {
 	Get(ctx context.Context, hash content.Hash) ([]byte, error)
 }
 
-// selectContentResult — запись, чей контент показывает --content:
-// первая «осмысленная». Приоритет — отрендеренной записи (итоговый DOM
-// SPA — главный результат конвейера, ТЗ 5.6), при равенстве — первая
-// запись с контентом в порядке субдомен×вариант (domain_info
-// сортирует по subdomain_id, variant: апекс и основной вариант раньше).
+// selectContentResult — the record whose content --content shows: the
+// first "meaningful" one. Priority goes to the rendered record (the
+// SPA's final DOM is the pipeline's main result, spec 5.6); on a tie —
+// the first record with content in subdomain×variant order (domain_info
+// sorts by subdomain_id, variant: the apex and the main variant come
+// first).
 func selectContentResult(results []domainResult) (domainResult, bool) {
 	first := -1
 	for i, r := range results {
@@ -629,9 +643,9 @@ func selectContentResult(results []domainResult) (domainResult, bool) {
 	return results[first], true
 }
 
-// writeDomainContent — вывод контента по --content: сводка домена и
-// пометка о выбранной записи — в stderr, байты — в stdout как есть
-// (перенаправление в файл; ТЗ 5.11 «распаковываются из хранилища»).
+// writeDomainContent — the --content output: the domain summary and the
+// note about the selected record go to stderr, the bytes go to stdout
+// as-is (redirect to a file; spec 5.11 "unpacked from the store").
 func writeDomainContent(ctx context.Context, store domainContentStore, info domainInfo, minScore float64, stdout, stderr io.Writer) error {
 	sel, ok := selectContentResult(info.Results)
 	if !ok {
@@ -662,10 +676,10 @@ func writeDomainContent(ctx context.Context, store domainContentStore, info doma
 	return nil
 }
 
-// ---------------------------------------------------------------- команда
+// ---------------------------------------------------------------- command
 
-// cmdDomain — crawlerctl domain: нормализация имени (ТЗ 5.2), выборка
-// domain_info, вывод (--json / --content / человекочитаемый).
+// cmdDomain — crawlerctl domain: name normalization (spec 5.2), the
+// domain_info query, output (--json / --content / human-readable).
 func cmdDomain(args []string, stdout, stderr io.Writer) error {
 	fs := newFlagSet("domain")
 	asJSON := fs.Bool("json", false, "машинный вывод: ответ domain_info как есть (pretty-print)")
@@ -679,17 +693,18 @@ func cmdDomain(args []string, stdout, stderr io.Writer) error {
 	if *asJSON && *withContent {
 		return usagef("domain: флаги --json и --content несовместимы (машинный вывод не смешивается с байтами контента)")
 	}
-	// Нормализация ввода оператора — Normalize из internal/idn: тот же
-	// конвейер, что у строк incoming (ТЗ 5.2). До конфигурации: неверное
-	// имя — код 2 без обращения к стеку.
+	// Operator input normalization — Normalize from internal/idn: the same
+	// pipeline as for incoming rows (spec 5.2). Before the configuration:
+	// a bad name is code 2 without touching the stack.
 	res, err := idn.Normalize(fs.Arg(0))
 	if err != nil {
 		return usagef("некорректное имя домена %q: %v", fs.Arg(0), err)
 	}
 
-	// Конфигурация — единый YAML + окружение (internal/config): DSN
-	// PostgreSQL, каталог контента и словарь zstd для --content,
-	// порог laravel_min_score для раздела Laravel (стиль status, T-079).
+	// Configuration — a single YAML + environment (internal/config): the
+	// PostgreSQL DSN, the content directory and the zstd dictionary for
+	// --content, the laravel_min_score threshold for the Laravel section
+	// (the status style, T-079).
 	cfg, err := config.Load()
 	if err != nil {
 		return fmt.Errorf("domain: %w", err)
@@ -697,11 +712,11 @@ func cmdDomain(args []string, stdout, stderr io.Writer) error {
 	ctx, stop := signalCtx()
 	defer stop()
 
-	// CLI pool_size = 2 — бюджет соединений ТЗ 6.3 у сервисов (стиль
-	// manage.go, T-074).
+	// CLI pool_size = 2 — the spec 6.3 connection budget as in the
+	// services (the manage.go style, T-074).
 	poolOpts := db.NewOptions(cfg.Postgres)
 	poolOpts.PoolSize = 2
-	poolOpts.AppName = "crawlerctl" // метка в pg_stat_activity (T-177)
+	poolOpts.AppName = "crawlerctl" // label in pg_stat_activity (T-177)
 	pool, err := db.Open(ctx, poolOpts)
 	if err != nil {
 		return fmt.Errorf("domain: %w", err)
@@ -721,12 +736,13 @@ func cmdDomain(args []string, stdout, stderr io.Writer) error {
 	}
 
 	if *withContent {
-		// Читатель хранилища контента без записи — стиль analyzer
-		// (T-071): тот же словарь zstd и PackStore, что у пишущих этапов
-		// (иначе распаковка чужих блоков невозможна), лимиты Put не нужны.
-		// ReadOnly: чтение не создаёт каталог и файл блокировки — работает
-		// и без прав на запись в content.dir, опечатка в каталоге не
-		// создаёт посторонних путей (runbook: проверка чтения контента).
+		// A read-only content store reader — the analyzer style (T-071):
+		// the same zstd dictionary and PackStore as the writing stages
+		// (otherwise unpacking foreign blocks is impossible); Put limits
+		// are not needed. ReadOnly: reading creates neither the directory
+		// nor the lock file — it works even without write access to
+		// content.dir, and a typo in the directory does not create
+		// stray paths (runbook: content read check).
 		if _, err := content.SetDictFile(cfg.Content.ZstdDictionary, slog.New(slog.NewTextHandler(stderr, nil))); err != nil {
 			return fmt.Errorf("domain: %w", err)
 		}
@@ -743,10 +759,10 @@ func cmdDomain(args []string, stdout, stderr io.Writer) error {
 	return nil
 }
 
-// domainNotFound — понятное сообщение, что именно не найдено (ТЗ 5.11):
-// domain_info на оба случая отвечает NULL, команда доуточняет по
-// справочнику zones. --json печатает found:false (скрипты), человек
-// получает сообщение в stderr через run (код 1).
+// domainNotFound — a clear message about what exactly was not found
+// (spec 5.11): domain_info answers NULL for both cases, the command
+// clarifies against the zones reference table. --json prints found:false
+// (scripts); a human gets the message on stderr via run (code 1).
 func domainNotFound(ctx context.Context, pool db.DB, name string, asJSON bool, stdout io.Writer) error {
 	zone, zoneFound, err := fetchCatalogZone(ctx, pool, name)
 	if err != nil {

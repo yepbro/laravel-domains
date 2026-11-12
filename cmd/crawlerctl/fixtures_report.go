@@ -1,28 +1,32 @@
-// ---------------------------------------------------------------- отчёт
+// ---------------------------------------------------------------- report
 //
-// crawlerctl fixtures report (T-244, ТЗ задач выбора движка рендера
-// tasks/TZ_render_engines.md §5.1 п. 3–4, §6.1 п. 5): сравнение двух
-// снапшотов прогонов (fixtures snapshot) — baseline-chromium и
-// движка-кандидата — по метрикам §5.1 п. 3 с явными строками вердикта
-// против порогов допуска к канарейке §5.1 п. 4:
+// crawlerctl fixtures report (T-244, the render engine selection task
+// spec tasks/TZ_render_engines.md §5.1 items 3–4, §6.1 item 5):
+// comparing two run snapshots (fixtures snapshot) — baseline-chromium
+// and the candidate engine — by the §5.1 item 3 metrics with explicit
+// verdict lines against the canary admission thresholds of §5.1 item 4:
 //
-//	доля успешных рендеров;      причины финализаций (словарь net::ERR_* из
-//	                             taskFinalizeReason);
-//	темп (стр/с, ср./p95);       память RSS движка (<⅓ бюджета chromium);
-//	диф детекции Laravel (<1%, протокол T-213 — вердикты анализатора
-//	кандидата против baseline-chromium);
-//	структурные метрики DOM (длина, узлы, скрипты) — нормализованное
-//	сравнение (медианы отношений), побайтовый диф не применяется: живой
-//	DOM недетерминирован;
-//	0 crashes ядра движка.
+//	the share of successful renders;  finalization reasons (the
+//	                                  net::ERR_* dictionary of
+//	                                  taskFinalizeReason);
+//	pace (rows/s, avg/p95);           the engine's RSS memory (<⅓ of the
+//	                                  chromium budget);
+//	the Laravel detection diff (<1%, the T-213 protocol — the
+//	candidate's analyzer verdicts against baseline-chromium);
+//	structural DOM metrics (length, nodes, scripts) — a normalized
+//	comparison (medians of ratios); a byte-level diff is not applied:
+//	the live DOM is non-deterministic;
+//	0 engine core crashes.
 //
-// Сравнение честно деградирует: источник, отсутствующий в снапшоте
-// (метрики не снимались, analyzer не доработал хвост, RSS движка не
-// задан оператором), даёт строку «НЕТ ДАННЫХ» вместо вердикта — отчёт
-// не выдумывает значения и не скрывает пробелы. Счётчики метрик валидны
-// для одного прогона, только если воркер перезапускался между прогонами
-// (момент старта процесса в снапшоте): иначе они накопительные, и
-// завязанные на них вердикты деградируют с предупреждением.
+// The comparison degrades honestly: a source missing from the snapshot
+// (metrics not taken, the analyzer has not finished the tail, the
+// engine RSS not set by the operator) yields a NO DATA line (the
+// verdictNone constant, Russian until stage 5) instead of a verdict —
+// the report invents no values and hides no
+// gaps. The metric counters are valid for a single run only if the
+// worker was restarted between runs (the process start moment is in the
+// snapshot); otherwise they are cumulative, and the verdicts tied to
+// them degrade with a warning.
 
 package main
 
@@ -35,29 +39,31 @@ import (
 	"strings"
 )
 
-// fixturesDefaultMemoryBudget — бюджет памяти chromium-воркера для
-// порога §5.1 п. 4 «память <⅓ бюджета chromium»: прод-бюджет рендер-контура
-// ≈2 ГБ (ТЗ 3.2; docs/deploy.md §2). Флаг --memory-budget переопределяет
-// для стенда с другим профилем.
+// fixturesDefaultMemoryBudget — the chromium worker's memory budget for
+// the §5.1 item 4 threshold "memory <⅓ of the chromium budget": the
+// render circuit's production budget ≈2 GB (spec 3.2; docs/deploy.md
+// §2). The --memory-budget flag overrides it for a bench with a
+// different profile.
 const fixturesDefaultMemoryBudget = 2 << 30
 
-// Статусы строк вердикта.
+// Verdict line statuses.
 const (
 	verdictPass = "ПРОЙДЕН"
 	verdictFail = "НЕ ПРОЙДЕН"
 	verdictNone = "НЕТ ДАННЫХ"
 )
 
-// fixturesReportVerdict — одна строка вердикта против порога §5.1 п. 4.
+// fixturesReportVerdict — one verdict line against a §5.1 item 4
+// threshold.
 type fixturesReportVerdict struct {
-	Name   string // формулировка порога
+	Name   string // the threshold wording
 	Status string // verdictPass | verdictFail | verdictNone
-	Detail string // числа, по которым вынесен вердикт
+	Detail string // the numbers the verdict was based on
 }
 
-// fixturesReport — расчёт сравнения двух снапшотов: все метрики §5.1
-// п. 3 и вердикты п. 4. Структура (а не текст) — чтобы тесты проверяли
-// суть; печать — fixturesReportPrint.
+// fixturesReport — the comparison computation over two snapshots: all
+// §5.1 item 3 metrics and the item 4 verdicts. A structure (not text) —
+// so the tests check the substance; printing — fixturesReportPrint.
 type fixturesReport struct {
 	Keys            int
 	Seed            int64
@@ -67,29 +73,29 @@ type fixturesReport struct {
 	CandidateEngine string
 	Warnings        []string
 
-	SuccessRenderedB int // успешные рендеры (rendered + контент) / Tasks
+	SuccessRenderedB int // successful renders (rendered + content) / Tasks
 	SuccessRenderedC int
 	SuccessPctB      float64
 	SuccessPctC      float64
-	IndepLossPctC    *float64 // движко-независимые потери candidate: (dns+cert)/задачи, % (nil — без метрик)
+	IndepLossPctC    *float64 // the candidate's engine-independent losses: (dns+cert)/tasks, % (nil — no metrics)
 
-	PaceB      *float64 // стр/с по границам q:analyze (nil — нет данных)
+	PaceB      *float64 // rows/s over the q:analyze boundaries (nil — no data)
 	PaceC      *float64
 	PaceTasksB int64
 	PaceTasksC int64
 	PaceSecB   float64
 	PaceSecC   float64
-	AvgB       *float64 // ср. время страницы по гистограмме, с
+	AvgB       *float64 // the average page time over the histogram, s
 	AvgC       *float64
-	P95B       *float64 // p95 времени страницы, с
+	P95B       *float64 // the p95 page time, s
 	P95C       *float64
 
-	RSSB   *int64 // макс. RSS движка baseline, байты
+	RSSB   *int64 // the baseline engine's max RSS, bytes
 	RSSC   *int64
-	Budget int64 // бюджет chromium для порога ⅓
+	Budget int64 // the chromium budget for the ⅓ threshold
 
-	CrashesC    *int64  // падения ядра движка candidate (оператор)
-	BrowserErrC float64 // browser-класс ошибок candidate (движок недоступен, прокси)
+	CrashesC    *int64  // the candidate's engine core crashes (the operator)
+	BrowserErrC float64 // the candidate's browser-class errors (the engine unavailable, proxy)
 
 	DetectionComparable int
 	DetectionDiff       int
@@ -97,16 +103,17 @@ type fixturesReport struct {
 	DetectionFoundB     int
 	DetectionFoundC     int
 
-	// Причины финализаций — словарь taskFinalizeReason (net::ERR_*),
-	// тарпит/cert/DNS-финализации и публикации фолбэка (§5.1 п. 3).
-	// nil — метрики прогона не снимались.
+	// Finalization reasons — the taskFinalizeReason dictionary (net::ERR_*),
+	// tarpit/cert/DNS finalizations and fallback publications (§5.1
+	// item 3). nil — the run's metrics were not taken.
 	FinalizeB *fixturesSnapshotMetrics
 	FinalizeC *fixturesSnapshotMetrics
 
-	// Метрики candidate валидны для одного прогона (воркер перезапускался
-	// между снапшотами и события есть); false — не снимались,
-	// накопительные или пустые (чужой/перезапущенный после прогона
-	// воркер: Tasks и SecondsCount нулевые, ревью T-244 P2-1).
+	// The candidate's metrics are valid for a single run (the worker was
+	// restarted between the snapshots and there are events); false — not
+	// taken, cumulative or empty (a foreign worker, or one restarted
+	// after the run: Tasks and SecondsCount are zero, review T-244
+	// P2-1).
 	MetricsValidC bool
 	MetricsEmptyC bool
 	Cumulative    bool
@@ -114,22 +121,22 @@ type fixturesReport struct {
 	DOMPairs           int
 	DOMIdentical       int
 	DOMIdenticalPct    float64
-	DOMMedLenRatio     *float64 // медиана отношений candidate/baseline
+	DOMMedLenRatio     *float64 // the median of the candidate/baseline ratios
 	DOMMedNodesRatio   *float64
 	DOMMedScriptsRatio *float64
 	DOMAnomalousPairs  int
 	DOMAnomalousPct    float64
-	DOMScriptZeroPairs int // пары, где один из прогонов не выполнил ни одного <script>
+	DOMScriptZeroPairs int // pairs where one of the runs executed no <script> at all
 
 	Verdicts []fixturesReportVerdict
-	Fail     bool // есть хоть один НЕ ПРОЙДЕН
+	Fail     bool // at least one failed verdict (verdictFail)
 }
 
-// ---------------------------------------------------------------- расчёты
+// ---------------------------------------------------------------- calculations
 
-// fixturesSuccessCount — успешные рендеры прогона: rendered + контентная
-// ссылка (после наката T-243 ссылка появляется только у DOM, записанного
-// прогоном).
+// fixturesSuccessCount — a run's successful renders: rendered + a content
+// reference (after the T-243 import a reference appears only for a DOM
+// written by the run).
 func fixturesSuccessCount(snap *fixturesSnapshot) int {
 	n := 0
 	for _, r := range snap.Rows {
@@ -140,10 +147,11 @@ func fixturesSuccessCount(snap *fixturesSnapshot) int {
 	return n
 }
 
-// fixturesPace — темп прогона (стр/с) по стриму q:analyze: записи
-// публикуются воркером по ходу обработки, (N−1) интервалов между первой
-// и последней дают средний темп dorаботки потока. nil — данных нет
-// (стрим не снимался или в нём меньше двух записей).
+// fixturesPace — the run's pace (rows/s) over the q:analyze stream: the
+// worker publishes records as it processes, the (N−1) intervals between
+// the first and the last give the average pace of the rework stream.
+// nil — no data (the stream was not captured or has fewer than two
+// records).
 func fixturesPace(s *fixturesSnapshotStreams) (pace *float64, tasks int64, sec float64) {
 	if s == nil || s.AnalyzeLen < 2 || s.AnalyzeLastMs <= s.AnalyzeFirstMs {
 		return nil, 0, 0
@@ -153,44 +161,45 @@ func fixturesPace(s *fixturesSnapshotStreams) (pace *float64, tasks int64, sec f
 	return &v, s.AnalyzeLen, sec
 }
 
-// fixturesHistQuantile — квантиль по кумулятивным корзинам гистограммы
-// (интерполяция как у Prometheus histogram_quantile). nil — гистограммы
-// или квантиля нет. Замыкающая корзина (сентинел MaxFloat64 вместо +Inf):
-// интерполяции в бесконечность нет — возвращается последняя конечная
-// граница (нижняя оценка хвоста за timeout).
+// fixturesHistQuantile — a quantile over the histogram's cumulative
+// buckets (interpolation like Prometheus histogram_quantile). nil — no
+// histogram or quantile. The closing bucket (the MaxFloat64 sentinel
+// instead of +Inf): there is no interpolation into infinity — the last
+// finite bound is returned (a lower estimate of the tail beyond the
+// timeout).
 func fixturesHistQuantile(buckets []fixturesHistBucket, count float64, q float64) *float64 {
 	if count <= 0 || len(buckets) == 0 {
 		return nil
 	}
 	rank := q * count
-	var prevLE, prevCount float64 // нижняя граница первой корзины — 0
+	var prevLE, prevCount float64 // the first bucket's lower bound is 0
 	for i, b := range buckets {
 		if b.Count < rank {
 			prevLE, prevCount = b.LE, b.Count
 			continue
 		}
 		if b.Count == prevCount {
-			v := b.LE // плоский участок: все наблюдения на границе
+			v := b.LE // a flat stretch: all observations at the bound
 			return &v
 		}
 		if b.LE >= math.MaxFloat64 {
 			if prevCount == 0 {
-				return nil // единственная корзина — сентинел: конечных границ нет
+				return nil // the only bucket is the sentinel: no finite bounds
 			}
-			v := prevLE // ранг в замыкающей корзине: нижняя оценка хвоста
+			v := prevLE // the rank in the closing bucket: a lower tail estimate
 			return &v
 		}
 		v := prevLE + (rank-prevCount)/(b.Count-prevCount)*(b.LE-prevLE)
 		if i == 0 {
-			v = b.LE * rank / b.Count // от нуля до первой границы
+			v = b.LE * rank / b.Count // from zero to the first bound
 		}
 		return &v
 	}
 	last := buckets[len(buckets)-1].LE
 	if last >= math.MaxFloat64 {
-		// сентинел +Inf как последняя граница (ранг выше кумуляты битого
-		// экспоза): честнее последняя конечная граница, чем 1.8e308 с
-		// (ревью T-244 P3-2)
+		// the +Inf sentinel as the last bound (the rank above the cumulative
+		// of a broken exposition): the last finite bound is more honest
+		// than 1.8e308 s (review T-244 P3-2)
 		if len(buckets) > 1 {
 			last = buckets[len(buckets)-2].LE
 		} else {
@@ -200,7 +209,7 @@ func fixturesHistQuantile(buckets []fixturesHistBucket, count float64, q float64
 	return &last
 }
 
-// fixturesHistAvg — среднее по sum/count гистограммы.
+// fixturesHistAvg — the average over the histogram's sum/count.
 func fixturesHistAvg(sum, count float64) *float64 {
 	if count <= 0 {
 		return nil
@@ -209,7 +218,8 @@ func fixturesHistAvg(sum, count float64) *float64 {
 	return &v
 }
 
-// fixturesMedian — медиана среза (срез не мутирует: копия).
+// fixturesMedian — the median of a slice (the slice is not mutated: a
+// copy).
 func fixturesMedian(values []float64) *float64 {
 	if len(values) == 0 {
 		return nil
@@ -226,7 +236,7 @@ func fixturesMedian(values []float64) *float64 {
 	return &v
 }
 
-// fixturesRowMap — строки снапшота по ключу.
+// fixturesRowMap — the snapshot's rows by key.
 func fixturesRowMap(snap *fixturesSnapshot) map[fixturesKey]fixturesSnapshotRow {
 	m := make(map[fixturesKey]fixturesSnapshotRow, len(snap.Rows))
 	for _, r := range snap.Rows {
@@ -235,9 +245,9 @@ func fixturesRowMap(snap *fixturesSnapshot) map[fixturesKey]fixturesSnapshotRow 
 	return m
 }
 
-// fixturesKeysUnionMismatch — несовпадение множеств ключей двух снапшотов
-// (сняты по разным дампам): отчёт требует одну выборку — возвращаются
-// чужие ключи baseline и candidate.
+// fixturesKeysUnionMismatch — a mismatch of the two snapshots' key sets
+// (taken over different dumps): the report requires one selection — the
+// keys foreign to baseline and candidate are returned.
 func fixturesKeysUnionMismatch(b, c map[fixturesKey]fixturesSnapshotRow) (onlyB, onlyC int) {
 	for k := range b {
 		if _, ok := c[k]; !ok {
@@ -252,19 +262,19 @@ func fixturesKeysUnionMismatch(b, c map[fixturesKey]fixturesSnapshotRow) (onlyB,
 	return onlyB, onlyC
 }
 
-// fixturesDetection — диф детекции Laravel (протокол T-213): вердикты
-// анализатора кандидата против baseline построчно. Сравнимы строки,
-// записанные прогоном в обоих случаях (контент есть) и проштампованные
-// анализатором этого прогона (rules_version строки NOT NULL: рендер
-// обнуляет штамп, анализатор ставит — NULL означает «анализатор не
-// доработал», findings в БД могли остаться от прошлого прогона, ревью
-// T-244 P1-2). Вердикт строки — is_laravel при наличии findings и false
-// при их отсутствии: анализатор УДАЛЯЕТ строку findings при нуле
-// срабатываний (findingDeleteSQL) — отсутствие строки это штатное
-// «признаков нет», а не «не доработал»; иначе полная потеря/появление
-// сигналов выпадала бы из дифа (ревью T-244 P1-1). Версии правил
-// находок возвращаются для сверки: разные наборы правил делают порог
-// <1% несравнимым.
+// fixturesDetection — the Laravel detection diff (the T-213 protocol):
+// the candidate's analyzer verdicts against baseline row by row.
+// Comparable rows are those written by the run in both cases (content
+// present) and stamped by that run's analyzer (the row's rules_version
+// NOT NULL: the render clears the stamp, the analyzer sets it — NULL
+// means "the analyzer has not finished"; findings in the DB could be
+// left over from a previous run, review T-244 P1-2). A row's verdict is
+// is_laravel when findings exist and false when they do not: the
+// analyzer DELETES the findings row at zero hits (findingDeleteSQL) — a
+// missing row is the normal "no signs", not "not finished"; otherwise a
+// full loss/appearance of signals would fall out of the diff (review
+// T-244 P1-1). The findings' rule versions are returned for a cross-
+// check: different rule sets make the <1% threshold incomparable.
 func fixturesDetection(b, c map[fixturesKey]fixturesSnapshotRow) (comparable, diff, foundB, foundC int, rulesB, rulesC map[int32]int) {
 	rulesB, rulesC = map[int32]int{}, map[int32]int{}
 	for k, rb := range b {
@@ -273,7 +283,7 @@ func fixturesDetection(b, c map[fixturesKey]fixturesSnapshotRow) (comparable, di
 			continue
 		}
 		if !rb.HasContent || !rc.HasContent || rb.RulesVersion == nil || rc.RulesVersion == nil {
-			continue // не записана прогоном или не проанализирована в нём
+			continue // not written by the run or not analyzed in it
 		}
 		comparable++
 		if rb.FindingRulesVersion != nil {
@@ -295,14 +305,15 @@ func fixturesDetection(b, c map[fixturesKey]fixturesSnapshotRow) (comparable, di
 	return comparable, diff, foundB, foundC, rulesB, rulesC
 }
 
-// fixturesDOMCompare — структурные метрики DOM: пары ключей с контентом
-// в обоих прогонах; идентичный DOM (content_hash — дедуп хранилища),
-// медианы отношений candidate/baseline (длина/узлы/скрипты — считать
-// структуру, не байты: живой DOM недетерминирован) и доля аномальных пар
-// по длине (вне ×0.5…×2 — движок собрал принципиально другую страницу);
-// плюс пары, где один из прогонов не выполнил НИ ОДНОГО скрипта
-// (в медианы они не входят — отношение к нулю бессмысленно, но потеря
-// всех <script> это самостоятельный сигнал, ревью T-244 P2-3).
+// fixturesDOMCompare — structural DOM metrics: key pairs with content in
+// both runs; an identical DOM (content_hash — the store's dedup), the
+// medians of the candidate/baseline ratios (length/nodes/scripts —
+// count the structure, not bytes: the live DOM is non-deterministic)
+// and the share of anomalous pairs by length (outside ×0.5…×2 — the
+// engine assembled a fundamentally different page); plus the pairs where
+// one of the runs executed NOT A SINGLE script (they are not in the
+// medians — a ratio to zero is meaningless, but losing all <script> is
+// a signal of its own, review T-244 P2-3).
 func fixturesDOMCompare(b, c map[fixturesKey]fixturesSnapshotRow) (pairs, identical, anomalous, scriptZero int, medLen, medNodes, medScripts *float64) {
 	var lenRatios, nodeRatios, scriptRatios []float64
 	for k, rb := range b {
@@ -328,7 +339,7 @@ func fixturesDOMCompare(b, c map[fixturesKey]fixturesSnapshotRow) (pairs, identi
 			case rb.DOMScripts > 0 && rc.DOMScripts > 0:
 				scriptRatios = append(scriptRatios, float64(rc.DOMScripts)/float64(rb.DOMScripts))
 			case rb.DOMScripts == 0 && rc.DOMScripts == 0:
-				// без скриптов в обоих — норма для статических страниц
+				// no scripts in either — normal for static pages
 			default:
 				scriptZero++
 			}
@@ -338,17 +349,18 @@ func fixturesDOMCompare(b, c map[fixturesKey]fixturesSnapshotRow) (pairs, identi
 		fixturesMedian(lenRatios), fixturesMedian(nodeRatios), fixturesMedian(scriptRatios)
 }
 
-// fixturesMetricsCumulative — накопительные ли счётчики пары снапшотов:
-// метрики снимались в обоих, но процесс воркера один (старт не менялся) —
-// значения candidate включают прогон baseline.
+// fixturesMetricsCumulative — are a snapshot pair's counters cumulative:
+// the metrics were taken in both, but the worker process is one (the
+// start did not change) — the candidate's values include the baseline's
+// run.
 func fixturesMetricsCumulative(b, c *fixturesSnapshot) bool {
 	return b.Metrics != nil && c.Metrics != nil &&
 		b.Metrics.ProcessStartSeconds != 0 &&
 		b.Metrics.ProcessStartSeconds == c.Metrics.ProcessStartSeconds
 }
 
-// fixturesFinalizedSum — суммарные финализации класса задачи (по словарю
-// причин) — для строк причин.
+// fixturesFinalizedSum — the total finalizations of the task class (by
+// the reason dictionary) — for the reason lines.
 func fixturesFinalizedSum(m map[string]float64) float64 {
 	var sum float64
 	for _, v := range m {
@@ -357,9 +369,9 @@ func fixturesFinalizedSum(m map[string]float64) float64 {
 	return sum
 }
 
-// fixturesReportBuild — расчёт сравнения: метрики §5.1 п. 3 + вердикты
-// п. 4. Ошибка — снапшоты по разным выборкам (дальше сравнивать
-// бессмысленно).
+// fixturesReportBuild — the comparison computation: the §5.1 item 3
+// metrics + the item 4 verdicts. An error — the snapshots are over
+// different selections (comparing further is pointless).
 func fixturesReportBuild(b, c *fixturesSnapshot, budget int64) (*fixturesReport, error) {
 	rowsB, rowsC := fixturesRowMap(b), fixturesRowMap(c)
 	if onlyB, onlyC := fixturesKeysUnionMismatch(rowsB, rowsC); onlyB+onlyC > 0 {
@@ -378,8 +390,9 @@ func fixturesReportBuild(b, c *fixturesSnapshot, budget int64) (*fixturesReport,
 	if b.Dump.Seed != c.Dump.Seed {
 		r.Warnings = append(r.Warnings, fmt.Sprintf("seed дампов расходится: baseline %d, candidate %d — выборки могли собраться из разных состояний БД", b.Dump.Seed, c.Dump.Seed))
 	}
-	// Сверки выборки: снапшот с усечённым набором строк (строки дампа
-	// исчезли из БД) занижал бы знаменатель успешности незаметно (P2-4).
+	// Selection cross-checks: a snapshot with a truncated set of rows
+	// (dump rows vanished from the DB) would silently understate the
+	// success denominator (P2-4).
 	for _, s := range []struct {
 		name string
 		snap *fixturesSnapshot
@@ -400,9 +413,10 @@ func fixturesReportBuild(b, c *fixturesSnapshot, budget int64) (*fixturesReport,
 	if cumulative {
 		r.Warnings = append(r.Warnings, "воркер не перезапускался между прогонами (process_start_time совпадает): счётчики candidate накопительные — причины финализаций, время страницы и browser-ошибки включают baseline-прогон, вердикты по ним деградированы; темп по стримам q:analyze и успешность по строкам БД валидны")
 	}
-	// Незавершённость прогонов видна по остаткам стримов; проверяются ОБА
-	// прогона: неполный baseline ослаблял бы порог успешности для
-	// кандидата (P2-5); q:dead молча уменьшает успешность любого прогона.
+	// Run incompleteness is visible from the stream leftovers; BOTH runs
+	// are checked: an incomplete baseline would weaken the success
+	// threshold for the candidate (P2-5); q:dead silently reduces any
+	// run's success.
 	for _, s := range []struct {
 		name string
 		snap *fixturesSnapshot
@@ -423,7 +437,7 @@ func fixturesReportBuild(b, c *fixturesSnapshot, budget int64) (*fixturesReport,
 		}
 	}
 
-	// Успешность: строки с DOM прогона / задачи выборки.
+	// Success: rows with the run's DOM / the selection's tasks.
 	r.SuccessRenderedB = fixturesSuccessCount(b)
 	r.SuccessRenderedC = fixturesSuccessCount(c)
 	r.SuccessPctB = pct(r.SuccessRenderedB, r.Keys)
@@ -433,7 +447,7 @@ func fixturesReportBuild(b, c *fixturesSnapshot, budget int64) (*fixturesReport,
 		r.IndepLossPctC = &v
 	}
 
-	// Темп и время страницы.
+	// Pace and page time.
 	r.PaceB, r.PaceTasksB, r.PaceSecB = fixturesPace(b.Streams)
 	r.PaceC, r.PaceTasksC, r.PaceSecC = fixturesPace(c.Streams)
 	if b.Metrics != nil {
@@ -445,7 +459,7 @@ func fixturesReportBuild(b, c *fixturesSnapshot, budget int64) (*fixturesReport,
 		r.P95C = fixturesHistQuantile(c.Metrics.Buckets, c.Metrics.SecondsCount, 0.95)
 	}
 
-	// Память и краши.
+	// Memory and crashes.
 	r.RSSB, r.RSSC = b.EngineRSSMax, c.EngineRSSMax
 	r.CrashesC = c.EngineCrashes
 	r.FinalizeB, r.FinalizeC = b.Metrics, c.Metrics
@@ -463,7 +477,7 @@ func fixturesReportBuild(b, c *fixturesSnapshot, budget int64) (*fixturesReport,
 		}
 	}
 
-	// Диф детекции.
+	// Detection diff.
 	comparable, diff, foundB, foundC, rulesB, rulesC := fixturesDetection(rowsB, rowsC)
 	r.DetectionComparable = comparable
 	r.DetectionDiff = diff
@@ -483,7 +497,7 @@ func fixturesReportBuild(b, c *fixturesSnapshot, budget int64) (*fixturesReport,
 		r.Warnings = append(r.Warnings, "версии правил анализатора в прогонах расходятся (rules_version) — порог детекции <1% сравнивает разные наборы правил, вердикт деградирован")
 	}
 
-	// Структурные метрики DOM.
+	// Structural DOM metrics.
 	r.DOMPairs, r.DOMIdentical, r.DOMAnomalousPairs, r.DOMScriptZeroPairs, r.DOMMedLenRatio, r.DOMMedNodesRatio, r.DOMMedScriptsRatio =
 		fixturesDOMCompare(rowsB, rowsC)
 	r.DOMIdenticalPct = pct(r.DOMIdentical, r.DOMPairs)
@@ -498,12 +512,13 @@ func fixturesReportBuild(b, c *fixturesSnapshot, budget int64) (*fixturesReport,
 	return r, nil
 }
 
-// fixturesReportVerdicts — строки вердикта против порогов §5.1 п. 4.
-// Порядок — по тексту ТЗ: детекция, успешность, темп, память, crashes.
+// fixturesReportVerdicts — verdict lines against the §5.1 item 4
+// thresholds. The order follows the spec's text: detection, success,
+// pace, memory, crashes.
 func fixturesReportVerdicts(r *fixturesReport, rulesDiffer bool) []fixturesReportVerdict {
 	var out []fixturesReportVerdict
 
-	// Детекция Laravel < 1% (T-213).
+	// Laravel detection < 1% (T-213).
 	switch {
 	case r.DetectionComparable == 0:
 		out = append(out, fixturesReportVerdict{Name: "детекция Laravel < 1%",
@@ -519,7 +534,7 @@ func fixturesReportVerdicts(r *fixturesReport, rulesDiffer bool) []fixturesRepor
 			Status: verdictFail, Detail: fmt.Sprintf("%s расхождений (%d из %d сравнимых)", pctf(r.DetectionRatePct), r.DetectionDiff, r.DetectionComparable)})
 	}
 
-	// Успешность: candidate ≥ baseline − движко-независимые потери (DNS/cert).
+	// Success: candidate ≥ baseline − engine-independent losses (DNS/cert).
 	switch {
 	case r.IndepLossPctC != nil && r.SuccessPctC >= r.SuccessPctB-*r.IndepLossPctC:
 		out = append(out, fixturesReportVerdict{Name: "успешность ≥ baseline − движко-независимые потери",
@@ -528,8 +543,9 @@ func fixturesReportVerdicts(r *fixturesReport, rulesDiffer bool) []fixturesRepor
 		out = append(out, fixturesReportVerdict{Name: "успешность ≥ baseline − движко-независимые потери",
 			Status: verdictFail, Detail: fmt.Sprintf("%s < %s − %s (DNS/cert)", pctf(r.SuccessPctC), pctf(r.SuccessPctB), pctf(*r.IndepLossPctC))})
 	case r.SuccessPctC >= r.SuccessPctB:
-		// Потери неизвестны (метрик нет) — строгое сравнение: завышает
-		// требования к кандидату, но не пропускает регресс.
+		// The losses are unknown (no metrics) — a strict comparison: it
+		// raises the bar for the candidate but lets no regression
+		// through.
 		out = append(out, fixturesReportVerdict{Name: "успешность ≥ baseline (строго: потери DNS/cert неизвестны)",
 			Status: verdictPass, Detail: fmt.Sprintf("%s ≥ %s", pctf(r.SuccessPctC), pctf(r.SuccessPctB))})
 	default:
@@ -537,7 +553,7 @@ func fixturesReportVerdicts(r *fixturesReport, rulesDiffer bool) []fixturesRepor
 			Status: verdictFail, Detail: fmt.Sprintf("%s < %s; снимите --metrics прогона для вычета движко-независимых потерь", pctf(r.SuccessPctC), pctf(r.SuccessPctB))})
 	}
 
-	// Темп не хуже базового.
+	// Pace not worse than baseline.
 	switch {
 	case r.PaceB == nil || r.PaceC == nil:
 		out = append(out, fixturesReportVerdict{Name: "темп не хуже базового",
@@ -550,7 +566,7 @@ func fixturesReportVerdicts(r *fixturesReport, rulesDiffer bool) []fixturesRepor
 			Status: verdictFail, Detail: fmt.Sprintf("%.2f < %.2f стр/с", *r.PaceC, *r.PaceB)})
 	}
 
-	// Память < ⅓ бюджета chromium.
+	// Memory < ⅓ of the chromium budget.
 	switch {
 	case r.RSSC == nil:
 		out = append(out, fixturesReportVerdict{Name: "память < ⅓ бюджета chromium",
@@ -563,7 +579,7 @@ func fixturesReportVerdicts(r *fixturesReport, rulesDiffer bool) []fixturesRepor
 			Status: verdictFail, Detail: fmt.Sprintf("%s ≥ ⅓ от %s", fixturesFormatBytes(*r.RSSC), fixturesFormatBytes(r.Budget))})
 	}
 
-	// 0 crashes ядра движка.
+	// 0 engine core crashes.
 	switch {
 	case r.CrashesC != nil:
 		status, word := verdictPass, "0 падений ядра движка"
@@ -585,12 +601,12 @@ func fixturesReportVerdicts(r *fixturesReport, rulesDiffer bool) []fixturesRepor
 	return out
 }
 
-// ---------------------------------------------------------------- печать
+// ---------------------------------------------------------------- printing
 
-// pctf — проценты строкой (2 знака).
+// pctf — percentages as a string (2 decimals).
 func pctf(v float64) string { return fmt.Sprintf("%.2f%%", v) }
 
-// fixturesFormatBytes — байты человекочитаемо (KiB/MiB/GiB).
+// fixturesFormatBytes — bytes in a human-readable form (KiB/MiB/GiB).
 func fixturesFormatBytes(v int64) string {
 	switch {
 	case v >= 1<<30:
@@ -604,7 +620,7 @@ func fixturesFormatBytes(v int64) string {
 	}
 }
 
-// ratioOrNone — отношение строкой «×N.NN» или прочерк.
+// ratioOrNone — a ratio as an "×N.NN" string or a dash.
 func ratioOrNone(v *float64) string {
 	if v == nil {
 		return "—"
@@ -612,8 +628,8 @@ func ratioOrNone(v *float64) string {
 	return fmt.Sprintf("×%.2f", *v)
 }
 
-// fixturesReportPrint — текст отчёта: метрики §5.1 п. 3 и вердикты п. 4
-// (возвращается тем же текстом в --out).
+// fixturesReportPrint — the report text: the §5.1 item 3 metrics and the
+// item 4 verdicts (--out gets the same text).
 func fixturesReportPrint(w io.Writer, r *fixturesReport) {
 	out(w, "Отчёт сравнения движков рендера (ТЗ рендера §5.1; T-244)\n")
 	out(w, "Выборка: %d задач фикстуры (дамп seed %d)\n", r.Keys, r.Seed)
@@ -646,9 +662,9 @@ func fixturesReportPrint(w io.Writer, r *fixturesReport) {
 		} else {
 			out(w, "  %s: темп нет данных (стримы q:analyze не сняты или < 2 записей)", name)
 		}
-		// Время страницы — самостоятельная метрика §5.1 п. 3 (гистограмма
-		// этапа): печатается и без темпа, метрики могли сниматься без Redis
-		// (ревью T-244 P2-2).
+		// Page time is a §5.1 item 3 metric of its own (the stage's
+		// histogram): printed even without a pace — the metrics could have
+		// been taken without Redis (review T-244 P2-2).
 		if avg != nil {
 			out(w, "; ср. %.2f с", *avg)
 		}
@@ -710,7 +726,7 @@ func fixturesReportPrint(w io.Writer, r *fixturesReport) {
 	}
 }
 
-// rssOrNone — RSS строкой или «нет данных».
+// rssOrNone — RSS as a string or "no data".
 func rssOrNone(v *int64) string {
 	if v == nil {
 		return "нет данных"
@@ -718,8 +734,8 @@ func rssOrNone(v *int64) string {
 	return fixturesFormatBytes(*v)
 }
 
-// fixturesReasonList — словарь «причина → счёт» строкой (по убыванию
-// счёта, причина = ключ): причины финализаций/фолбэка.
+// fixturesReasonList — the "reason → count" dictionary as a string (by
+// descending count, reason = key): finalization/fallback reasons.
 func fixturesReasonList(m map[string]float64) string {
 	if len(m) == 0 {
 		return "—"
@@ -745,12 +761,13 @@ func fixturesReasonList(m map[string]float64) string {
 	return strings.Join(parts, ", ")
 }
 
-// ---------------------------------------------------------------- команда
+// ---------------------------------------------------------------- command
 
-// fixturesReportCmd — crawlerctl fixtures report: чтение двух снапшотов,
-// расчёт, печать (и запись --out тем же текстом). Код возврата не зависит
-// от вердиктов (отчёт — не гейт); --fail-exit переводит любой НЕ ПРОЙДЕН
-// в код 1 для скриптов цикла T-247.
+// fixturesReportCmd — crawlerctl fixtures report: reading two snapshots,
+// the computation, printing (and writing --out with the same text). The
+// exit code does not depend on the verdicts (a report is not a gate);
+// --fail-exit turns any failed verdict (verdictFail) into code 1 for the
+// T-247 cycle's scripts.
 func fixturesReportCmd(args []string, stdout, stderr io.Writer) error {
 	fs := newFlagSet("fixtures report")
 	baseline := fs.String("baseline", "", "снапшот baseline-chromium (обязателен)")
@@ -790,8 +807,9 @@ func fixturesReportCmd(args []string, stdout, stderr io.Writer) error {
 	text := buf.String()
 	out(stdout, "%s", text)
 	if *outPath != "" {
-		// Атомарно (tmp + rename, как снапшот): прерванная запись не
-		// оставляет полуфайла протокола T-247 (ревью T-244 P3-5).
+		// Atomically (tmp + rename, like the snapshot): an interrupted
+		// write leaves no half-file of the T-247 protocol (review T-244
+		// P3-5).
 		tmp := *outPath + ".tmp"
 		if err := os.WriteFile(tmp, []byte(text), 0o644); err != nil {
 			return fmt.Errorf("fixtures report: запись %s: %w", *outPath, err)
@@ -808,7 +826,7 @@ func fixturesReportCmd(args []string, stdout, stderr io.Writer) error {
 	return nil
 }
 
-// failedVerdictNames — имена непройденных вердиктов (сообщение --fail-exit).
+// failedVerdictNames — the names of failed verdicts (the --fail-exit message).
 func failedVerdictNames(r *fixturesReport) []string {
 	var names []string
 	for _, v := range r.Verdicts {

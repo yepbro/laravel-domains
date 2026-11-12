@@ -12,36 +12,37 @@ import (
 	"crawler/internal/content"
 )
 
-// runCase — сценарий TestRun: аргументы CLI, ожидаемый код возврата и
-// подстроки в stdout/stderr (пустая строка — вывод не проверяется).
+// runCase — a TestRun scenario: the CLI arguments, the expected exit
+// code and the substrings in stdout/stderr (an empty string — the output
+// is not checked).
 type runCase struct {
 	name  string
 	args  []string
 	code  int
 	inOut string
 	inErr string
-	noOut string // подстроки, которых в stdout быть не должно
+	noOut string // substrings that must not be in stdout
 }
 
 func TestRun(t *testing.T) {
 	cases := []runCase{
-		// Роутинг верхнего уровня.
+		// Top-level routing.
 		{name: "без аргументов — справка и код 2", args: nil, code: exitUsage, inErr: "crawlerctl — CLI Domain Crawler"},
 		{name: "help", args: []string{"help"}, code: exitOK, inOut: "crawlerctl — CLI Domain Crawler"},
 		{name: "--help", args: []string{"--help"}, code: exitOK, inOut: "crawlerctl — CLI"},
 		{name: "неизвестная команда", args: []string{"nope"}, code: exitUsage, inErr: `неизвестная команда "nope"`},
 
-		// status — функциональная команда (T-079): требует конфигурацию
-		// (БД/Redis); путь выполнения без инфраструктуры — TestRunStatus
-		// в status_test.go, здесь — использование и справка.
+		// status — a functional command (T-079): it needs configuration
+		// (DB/Redis); the execution path without infrastructure is
+		// TestRunStatus in status_test.go; here — usage and help.
 		{name: "status лишний аргумент", args: []string{"status", "foo"}, code: exitUsage, inErr: "лишние аргументы"},
 		{name: "status неизвестный флаг", args: []string{"status", "--nope"}, code: exitUsage, inErr: "status: "},
 		{name: "status --help", args: []string{"status", "--help"}, code: exitOK, inOut: "сводка по зонам"},
 
-		// domain — функциональная команда (T-081): требует конфигурацию
-		// (PostgreSQL, для --content — каталог контента); путь выполнения
-		// без инфраструктуры — TestRunDomain в domain_test.go, здесь —
-		// использование и справка.
+		// domain — a functional command (T-081): it needs configuration
+		// (PostgreSQL, and the content directory for --content); the
+		// execution path without infrastructure is TestRunDomain in
+		// domain_test.go; here — usage and help.
 		{name: "domain без имени", args: []string{"domain"}, code: exitUsage, inErr: "укажите имя домена"},
 		{name: "domain два имени", args: []string{"domain", "a.test", "b.test"}, code: exitUsage, inErr: "укажите имя домена"},
 		{name: "domain --json --content несовместимы", args: []string{"domain", "--json", "--content", "x.crawl.test"},
@@ -55,10 +56,11 @@ func TestRun(t *testing.T) {
 			inErr: "domain: "},
 		{name: "domain --help", args: []string{"domain", "--help"}, code: exitOK, inOut: "ТЗ 5.11"},
 
-		// subdomains — функциональная команда (T-083): требует конфигурацию
-		// (БД) — путь выполнения без инфраструктуры проверяет отдельный
-		// TestRunSubdomainsExecution и субтесты subdomains_test.go; здесь —
-		// использование и справка.
+		// subdomains — a functional command (T-083): it needs
+		// configuration (the DB) — the execution path without
+		// infrastructure is checked by the separate
+		// TestRunSubdomainsExecution and the subdomains_test.go subtests;
+		// here — usage and help.
 		{name: "subdomains без действия", args: []string{"subdomains"}, code: exitUsage, inErr: "укажите действие"},
 		{name: "subdomains неизвестное действие", args: []string{"subdomains", "fly"}, code: exitUsage, inErr: `допустимы: list, add, disable, recheck`},
 		{name: "subdomains add без метки", args: []string{"subdomains", "add"}, code: exitUsage, inErr: "укажите метку"},
@@ -70,10 +72,10 @@ func TestRun(t *testing.T) {
 		{name: "subdomains --help", args: []string{"subdomains", "--help"}, code: exitOK, inOut: "subdomains list"},
 		{name: "subdomains add --help", args: []string{"subdomains", "add", "--help"}, code: exitOK, inOut: "управление проверяемыми субдоменами"},
 
-		// zones — функциональная команда (T-084): требует конфигурацию
-		// (БД) — путь выполнения без инфраструктуры проверяет отдельный
-		// TestRunZonesExecution и субтесты zones_test.go; здесь —
-		// использование и справка.
+		// zones — a functional command (T-084): it needs configuration
+		// (the DB) — the execution path without infrastructure is checked
+		// by the separate TestRunZonesExecution and the zones_test.go
+		// subtests; here — usage and help.
 		{name: "zones без действия", args: []string{"zones"}, code: exitUsage, inErr: "укажите действие"},
 		{name: "zones неизвестное действие", args: []string{"zones", "fly"}, code: exitUsage, inErr: `допустимы: list, enable, disable, sync, collapse`},
 		{name: "zones enable без зоны", args: []string{"zones", "enable"}, code: exitUsage, inErr: "укажите зону"},
@@ -82,23 +84,23 @@ func TestRun(t *testing.T) {
 		{name: "zones enable --help", args: []string{"zones", "enable", "--help"}, code: exitOK, inOut: "управление зонами проверки"},
 		{name: "zones sync --help", args: []string{"zones", "sync", "--help"}, code: exitOK, inOut: "tlds-alpha-by-domain.txt"},
 
-		// reanalyze — функциональная команда (T-074): требует конфигурацию
-		// (БД/Redis) — путь выполнения с инфраструктурой проверяет отдельный
-		// TestRunReanalyze; здесь — использование и справка.
+		// reanalyze — a functional command (T-074): it needs configuration
+		// (DB/Redis) — the execution path with infrastructure is checked
+		// by the separate TestRunReanalyze; here — usage and help.
 		{name: "reanalyze --zone невалидная", args: []string{"reanalyze", "--zone", "bad!!zone"}, code: exitUsage, inErr: "некорректное имя зоны"},
 		{name: "reanalyze --zone без значения", args: []string{"reanalyze", "--zone"}, code: exitUsage, inErr: "reanalyze: "},
 		{name: "reanalyze лишний аргумент", args: []string{"reanalyze", "foo"}, code: exitUsage, inErr: "лишние аргументы"},
 		{name: "reanalyze --help", args: []string{"reanalyze", "--help"}, code: exitOK, inOut: "переанализ сохранённых результатов"},
 
-		// recheck — функциональная команда (T-084): требует конфигурацию
-		// (БД) — путь выполнения без инфраструктуры проверяет отдельный
-		// TestRunRecheckExecution и субтесты recheck_test.go; здесь —
-		// использование и справка.
+		// recheck — a functional command (T-084): it needs configuration
+		// (the DB) — the execution path without infrastructure is checked
+		// by the separate TestRunRecheckExecution and the recheck_test.go
+		// subtests; here — usage and help.
 		{name: "recheck без домена", args: []string{"recheck"}, code: exitUsage, inErr: "укажите домен"},
 		{name: "recheck невалидное имя", args: []string{"recheck", "ok.crawl.test", "bad!!name"}, code: exitUsage, inErr: "некорректное имя домена"},
 		{name: "recheck --help", args: []string{"recheck", "--help"}, code: exitOK, inOut: "принудительная постановка"},
 
-		// dict — обучение словаря zstd (T-043).
+		// dict — zstd dictionary training (T-043).
 		{name: "dict без действия", args: []string{"dict"}, code: exitUsage, inErr: "укажите действие"},
 		{name: "dict неизвестное действие", args: []string{"dict", "fly"}, code: exitUsage, inErr: `допустимы: train`},
 		{name: "dict --help", args: []string{"dict", "--help"}, code: exitOK, inOut: "словарём сжатия zstd"},
@@ -114,9 +116,10 @@ func TestRun(t *testing.T) {
 		{name: "dict train неизвестный флаг", args: []string{"dict", "train", "--nope", "d.zst"}, code: exitUsage,
 			inErr: "dict train: "},
 
-		// dashboard-secret — генерация хэша пароля дашборда (ТЗД §7.3):
-		// работает без инфраструктуры; функциональные тесты и раундтрип —
-		// TestRunDashboardSecret* в dashboardsecret_test.go.
+		// dashboard-secret — dashboard password hash generation (dashboard
+		// spec §7.3): it runs without infrastructure; the functional tests
+		// and the roundtrip — TestRunDashboardSecret* in
+		// dashboardsecret_test.go.
 		{name: "dashboard-secret пустой аргумент", args: []string{"dashboard-secret", ""}, code: exitUsage, inErr: "пустой пароль"},
 		{name: "dashboard-secret два аргумента", args: []string{"dashboard-secret", "a", "b"}, code: exitUsage, inErr: "лишние аргументы"},
 		{name: "dashboard-secret неизвестный флаг", args: []string{"dashboard-secret", "--nope"}, code: exitUsage,
@@ -124,7 +127,8 @@ func TestRun(t *testing.T) {
 		{name: "dashboard-secret --help", args: []string{"dashboard-secret", "--help"}, code: exitOK,
 			inOut: "истории shell"},
 
-		// dev-команды: роутинг и справка (функциональные тесты — у самих команд).
+		// dev commands: routing and help (the functional tests live with
+		// the commands themselves).
 		{name: "seed --help", args: []string{"seed", "--help"}, code: exitOK, inOut: "crawlerctl seed"},
 		{name: "seed несуществующий сценарий", args: []string{"seed", "--scenarios", "/nonexistent/scenarios.yaml"},
 			code: exitError, inErr: "seed:"},
@@ -151,16 +155,18 @@ func TestRun(t *testing.T) {
 	}
 }
 
-// TestRunReanalyze — путь выполнения reanalyze (T-074) без инфраструктуры:
-// команда требует конфигурацию (DSN PostgreSQL, Redis, каталог правил) —
-// при её отсутствии завершается ошибкой выполнения (код 1) с контекстом
-// задачи, не трогая сеть. Валидация входа идёт раньше: неверная зона —
-// код 2 даже без конфигурации (таблица TestRun). Работа против живых
-// БД/Redis — dev-окружение (make reanalyze).
+// TestRunReanalyze — the reanalyze execution path (T-074) without
+// infrastructure: the command needs configuration (the PostgreSQL DSN,
+// Redis, the rules directory) — without it, it ends with an execution
+// error (code 1) carrying the task context, without touching the
+// network. Input validation comes first: a bad zone is code 2 even
+// without configuration (the TestRun table). Working against live
+// DB/Redis — the dev environment (make reanalyze).
 func TestRunReanalyze(t *testing.T) {
-	// Явно отсутствующий конфиг-файл: детерминированный отказ до любых
-	// соединений (в контейнере tools переменные APP_* могли бы собрать
-	// конфигурацию из окружения — тест не должен ходить в живой стек).
+	// An explicitly missing config file: a deterministic refusal before
+	// any connections (in the tools container the APP_* variables could
+	// assemble a configuration from the environment — the test must not
+	// touch the live stack).
 	t.Setenv("CRAWLER_CONFIG", filepath.Join(t.TempDir(), "missing.yaml"))
 
 	var stdout, stderr bytes.Buffer
@@ -172,7 +178,8 @@ func TestRunReanalyze(t *testing.T) {
 		t.Errorf("stderr не содержит контекст конфигурации:\n%s", stderr.String())
 	}
 
-	// Валидная зона — та же ошибка конфигурации (проверка входа прошла).
+	// A valid zone — the same configuration error (the input check
+	// passed).
 	stdout.Reset()
 	stderr.Reset()
 	code = run([]string{"reanalyze", "--zone", "Crawl.Test."}, &stdout, &stderr)
@@ -184,8 +191,8 @@ func TestRunReanalyze(t *testing.T) {
 	}
 }
 
-// TestUsageTextListsCommands — справка упоминает все команды таблицы
-// (забытая команда — частый баг каркаса).
+// TestUsageTextListsCommands — the help mentions every command of the
+// table (a forgotten command is a skeleton's usual bug).
 func TestUsageTextListsCommands(t *testing.T) {
 	for name := range commands {
 		if !strings.Contains(usageText, name) {
@@ -199,8 +206,8 @@ func TestUsageTextListsCommands(t *testing.T) {
 	}
 }
 
-// TestRunHelpPerCommand — у каждой команды --help даёт код 0 и человекочитаемую
-// справку (не пустую и не дефолтную flag.PrintDefaults).
+// TestRunHelpPerCommand — every command's --help gives code 0 and a
+// human-readable help (not empty and not the default flag.PrintDefaults).
 func TestRunHelpPerCommand(t *testing.T) {
 	for name := range commands {
 		t.Run(name, func(t *testing.T) {
@@ -220,8 +227,9 @@ func TestRunHelpPerCommand(t *testing.T) {
 	}
 }
 
-// TestParseFlags — контракт parseFlags: явный help → ErrHelp; ошибка
-// парсинга → usageErr; успех — флаги разобраны, позиционные доступны.
+// TestParseFlags — the parseFlags contract: an explicit help → ErrHelp;
+// a parsing error → usageErr; success — the flags are parsed, the
+// positionals are available.
 func TestParseFlags(t *testing.T) {
 	var stdout bytes.Buffer
 
@@ -237,8 +245,8 @@ func TestParseFlags(t *testing.T) {
 		}
 	})
 
-	// Значение флага, требующего значения, — не запрос справки, даже
-	// если это сам токен --help (CLI-03).
+	// The value of a flag that takes a value is not a help request, even
+	// when it is the --help token itself (CLI-03).
 	t.Run("help значением флага", func(t *testing.T) {
 		fs := newFlagSet("x")
 		fs.String("incoming", "", "")
@@ -294,8 +302,8 @@ func TestParseFlags(t *testing.T) {
 	})
 }
 
-// TestNormalizeSubdomainLabel — валидация метки субдомена: punycode,
-// регистр, края, длина.
+// TestNormalizeSubdomainLabel — subdomain label validation: punycode,
+// case, edges, length.
 func TestNormalizeSubdomainLabel(t *testing.T) {
 	ok := map[string]string{
 		"www":          "www",
@@ -318,8 +326,9 @@ func TestNormalizeSubdomainLabel(t *testing.T) {
 	}
 }
 
-// dictTrainSamplePages — детерминированные HTML-образцы для функционального
-// теста команды: общий шаблон + уникальные вставки (как в internal/content).
+// dictTrainSamplePages — deterministic HTML samples for the command's
+// functional test: a shared template + unique inserts (as in
+// internal/content).
 func dictTrainSamplePages(n int) []string {
 	pages := make([]string, n)
 	for i := 0; i < n; i++ {
@@ -333,8 +342,9 @@ func dictTrainSamplePages(n int) []string {
 	return pages
 }
 
-// dictTrainSamplePagesAlt — второй шаблон (заглушка хостинга): другое
-// содержимое словаря — другой ID (сценарий переобучения, T-103).
+// dictTrainSamplePagesAlt — a second template (a hosting suspension
+// page): a different dictionary content — a different ID (the
+// retraining scenario, T-103).
 func dictTrainSamplePagesAlt(n int) []string {
 	pages := make([]string, n)
 	for i := range pages {
@@ -348,7 +358,7 @@ func dictTrainSamplePagesAlt(n int) []string {
 	return pages
 }
 
-// writeSampleDir — каталог с HTML-образцами страниц.
+// writeSampleDir — a directory with HTML page samples.
 func writeSampleDir(t *testing.T, dir string, pages []string) {
 	t.Helper()
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -361,9 +371,10 @@ func writeSampleDir(t *testing.T, dir string, pages []string) {
 	}
 }
 
-// TestRunDictTrainRetiresPrevious — переобучение архивирует прежний
-// словарь в реестр (dict-<id>.zstd рядом с новым файлом): кадры,
-// сжатые прежним словарём, читаются после замены активного (T-103).
+// TestRunDictTrainRetiresPrevious — retraining archives the previous
+// dictionary into the registry (dict-<id>.zstd next to the new file):
+// frames compressed by the previous dictionary stay readable after the
+// active one is replaced (T-103).
 func TestRunDictTrainRetiresPrevious(t *testing.T) {
 	dir := t.TempDir()
 	samplesA := filepath.Join(dir, "a")
@@ -372,7 +383,7 @@ func TestRunDictTrainRetiresPrevious(t *testing.T) {
 	writeSampleDir(t, samplesB, dictTrainSamplePagesAlt(10))
 	dictPath := filepath.Join(dir, "dict.zst")
 
-	// Первое обучение.
+	// The first training.
 	var stdout, stderr bytes.Buffer
 	if code := run([]string{"dict", "train", dictPath, "--samples", samplesA}, &stdout, &stderr); code != exitOK {
 		t.Fatalf("первый train: код = %d, stderr:\n%s", code, stderr.String())
@@ -381,11 +392,12 @@ func TestRunDictTrainRetiresPrevious(t *testing.T) {
 	if err != nil {
 		t.Fatalf("словарь первого train: %v", err)
 	}
-	// Кадр, сжатый первым словарём (контент «до переобучения»).
+	// A frame compressed by the first dictionary (content "before
+	// retraining").
 	page := dictTrainSamplePages(101)[100]
 	frame := first.Compress([]byte(page))
 
-	// Переобучение: прежний словарь — в реестре.
+	// Retraining: the previous dictionary — in the registry.
 	stdout.Reset()
 	stderr.Reset()
 	if code := run([]string{"dict", "train", dictPath, "--samples", samplesB}, &stdout, &stderr); code != exitOK {
@@ -411,8 +423,8 @@ func TestRunDictTrainRetiresPrevious(t *testing.T) {
 		t.Fatal("переобучение не сменило ID словаря — тест ничего не проверяет")
 	}
 
-	// Прежний кадр читается после переобучения: реестр подключается тем
-	// же путём конфигурации, что и активный файл.
+	// The old frame is readable after retraining: the registry is loaded
+	// through the same configuration path as the active file.
 	if ok, err := content.SetDictFile(dictPath, nil); err != nil || !ok {
 		t.Fatalf("SetDictFile: ok=%v err=%v", ok, err)
 	}
@@ -423,7 +435,7 @@ func TestRunDictTrainRetiresPrevious(t *testing.T) {
 	}
 }
 
-// mustReadFile — содержимое файла или фатальная ошибка теста.
+// mustReadFile — a file's contents or a fatal test error.
 func mustReadFile(t *testing.T, path string) []byte {
 	t.Helper()
 	raw, err := os.ReadFile(path)
@@ -433,8 +445,9 @@ func mustReadFile(t *testing.T, path string) []byte {
 	return raw
 }
 
-// TestRunDictTrain — сквозной прогон команды: образцы → словарь в файле,
-// код 0; словарь валиден и распаковывается (content.NewDict).
+// TestRunDictTrain — an end-to-end run of the command: samples → a
+// dictionary in a file, code 0; the dictionary is valid and decompresses
+// (content.NewDict).
 func TestRunDictTrain(t *testing.T) {
 	dir := t.TempDir()
 	samples := filepath.Join(dir, "samples")
@@ -446,7 +459,7 @@ func TestRunDictTrain(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	// Не-HTML файл — игнорируется сборщиком образцов.
+	// A non-HTML file — ignored by the sample collector.
 	if err := os.WriteFile(filepath.Join(samples, "meta.yaml"), []byte("id: x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -458,7 +471,7 @@ func TestRunDictTrain(t *testing.T) {
 		t.Fatalf("код = %d, хочу %d; stderr:\n%s", code, exitOK, stderr.String())
 	}
 	outStr := stdout.String()
-	// meta.yaml не входит: сборщик берёт только *.html/*.htm.
+	// meta.yaml is not included: the collector takes only *.html/*.htm.
 	for _, want := range []string{"файлов-образцов 10 из 10", "словарь обучен", "словарь записан"} {
 		if !strings.Contains(outStr, want) {
 			t.Errorf("stdout не содержит %q:\n%s", want, outStr)
@@ -473,12 +486,12 @@ func TestRunDictTrain(t *testing.T) {
 	if err != nil {
 		t.Fatalf("словарь невалиден: %v", err)
 	}
-	page := dictTrainSamplePages(101)[100] // новая страница, не из обучающих
+	page := dictTrainSamplePages(101)[100] // a fresh page, not from the training set
 	if _, err := d.Decompress(d.Compress([]byte(page))); err != nil {
 		t.Errorf("roundtrip со словарём команды: %v", err)
 	}
 
-	// Каталог без HTML — ошибка выполнения (код 1), не использования.
+	// A directory without HTML — an execution error (code 1), not usage.
 	empty := filepath.Join(dir, "empty")
 	if err := os.MkdirAll(empty, 0o755); err != nil {
 		t.Fatal(err)

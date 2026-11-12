@@ -1,11 +1,12 @@
-// Интеграционный тест снапшота и отчёта сравнения (T-244) против живого
-// PostgreSQL дев-окружения: критерий задачи — «на двух прогонах одной
-// конфигурации диф детекции ≈0, на испорченном прогоне отчёт ловит
-// расхождение» — проверяется на реальном SQL (юнит-тесты гоняют чистые
-// структуры). Изоляция — одноразовая схема с миграциями в БД дев-стека
-// (общий helper живых тестов фикстур t243Schema, T-243). Запуск:
-// make test-integration (CRAWLER_INTEGRATION=1, БД — APP_PG_DSN
-// tools-контейнера); без переменной тест пропускается.
+// Integration test of the snapshot and the comparison report (T-244)
+// against the live PostgreSQL of the dev environment: the task's
+// criterion — "on two runs of the same configuration the detection diff
+// ≈0; on a corrupted run the report catches the divergence" — is checked
+// on real SQL (unit tests exercise pure structures). Isolation — a
+// one-off schema with migrations in the dev-stack DB (the shared helper
+// of the live fixture tests t243Schema, T-243). Run: make
+// test-integration (CRAWLER_INTEGRATION=1, the DB — the tools
+// container's APP_PG_DSN); without the variable the test is skipped.
 package main
 
 import (
@@ -15,11 +16,11 @@ import (
 	"time"
 )
 
-// TestFixturesSnapshotReportLive — два прогона одной выборки на живой
-// схеме: снимки через fixturesSnapshotReadRows (SQL снапшота), отчёт
-// fixturesReportBuild — детекция ≈0, DOM-пары/идентичность, успешность;
-// испорченный прогон (перевёрнутые вердикты) ловится вердиктом
-// НЕ ПРОЙДЕН.
+// TestFixturesSnapshotReportLive — two runs of one selection on a live
+// schema: snapshots via fixturesSnapshotReadRows (the snapshot SQL), the
+// report via fixturesReportBuild — detection ≈0, DOM pairs/identity,
+// success; a corrupted run (flipped verdicts) is caught by a FAILED
+// verdict.
 func TestFixturesSnapshotReportLive(t *testing.T) {
 	if os.Getenv("CRAWLER_INTEGRATION") != "1" {
 		t.Skip("интеграционный тест снапшота/отчёта: запустите make test-integration")
@@ -28,7 +29,8 @@ func TestFixturesSnapshotReportLive(t *testing.T) {
 	pool, cleanup := t243Schema(t)
 	defer cleanup()
 
-	// Дамп: 6 задач одного домена (ok-страта, базовый предикат final_url).
+	// Dump: 6 tasks of one domain (the ok stratum, the base final_url
+	// predicate).
 	ts := time.Date(2026, 11, 6, 10, 0, 0, 0, time.UTC)
 	url := "https://fixture.example/"
 	dump := &fixturesDump{
@@ -46,12 +48,12 @@ func TestFixturesSnapshotReportLive(t *testing.T) {
 		t.Fatalf("накат: %v", err)
 	}
 
-	// simulateRun — прогон: success/finalize/вердикты. Контракт воркера
-	// (renderUpdateSQL): rendered=true вместе с content_hash и
-	// rules_version=NULL — анализатор затем штампует строку заново;
-	// findings пишутся только при срабатываниях (findingUpsertSQL), при
-	// нуле — DELETE (findingDeleteSQL, P1-1). laravel[sub]==nil —
-	// анализатор по строке ещё не прошёл (rules_version остаётся NULL).
+	// simulateRun — a run: success/finalize/verdicts. The worker contract
+	// (renderUpdateSQL): rendered=true together with content_hash and
+	// rules_version=NULL — the analyzer then re-stamps the row; findings
+	// are written only on hits (findingUpsertSQL), at zero — DELETE
+	// (findingDeleteSQL, P1-1). laravel[sub]==nil — the analyzer has not
+	// passed over the row yet (rules_version stays NULL).
 	simulateRun := func(finalized map[int16]bool, laravel map[int16]*bool, domHash map[int16]string, domLen map[int16]int32) {
 		t.Helper()
 		for sub := int16(1); sub <= 6; sub++ {
@@ -75,7 +77,7 @@ func TestFixturesSnapshotReportLive(t *testing.T) {
 			}
 			isLaravel, ok := laravel[sub]
 			if !ok {
-				continue // хвост q:analyze: строка без штампа анализатора
+				continue // the q:analyze tail: a row without the analyzer's stamp
 			}
 			if _, err := pool.Exec(ctx,
 				"UPDATE subdomain_results SET rules_version = 7 WHERE zone_id = 9 AND domain_id = 77 AND subdomain_id = $1 AND variant = 0", sub); err != nil {
@@ -115,8 +117,8 @@ func TestFixturesSnapshotReportLive(t *testing.T) {
 		}
 	}
 
-	// Прогон 1 (chromium): 5 успехов (sub 1..5), 1 финализация; вердикты
-	// на всех успехах, Laravel на 1 и 4.
+	// Run 1 (chromium): 5 successes (sub 1..5), 1 finalization; verdicts
+	// on all successes, Laravel on 1 and 4.
 	reset := func() {
 		if _, err := fixturesImportRun(ctx, pool, dump, os.Stdout); err != nil {
 			t.Fatalf("повторный накат: %v", err)
@@ -132,8 +134,8 @@ func TestFixturesSnapshotReportLive(t *testing.T) {
 	)
 	snapChromium := take("chromium-1", "chromium")
 
-	// Прогон 2 (moli): те же задачи; 5 успехов, у sub 3 — другой DOM
-	// (движок собрал другую страницу), вердикты идентичны.
+	// Run 2 (moli): the same tasks; 5 successes, sub 3 has a different
+	// DOM (the engine assembled a different page), verdicts identical.
 	reset()
 	simulateRun(
 		map[int16]bool{6: true},
@@ -164,9 +166,9 @@ func TestFixturesSnapshotReportLive(t *testing.T) {
 		t.Fatalf("медиана длины DOM = %v, хочу 1", report.DOMMedLenRatio)
 	}
 
-	// Испорченный прогон: у субдомена 1 сигнал ПРОПАЛ вовсе (анализатор
-	// удалил findings — ни одного срабатывания, P1-1), у субдомена 2 —
-	// появился; 2 из 5 сравнимых (40%) — отчёт обязан поймать оба.
+	// Corrupted run: subdomain 1's signal VANISHED entirely (the analyzer
+	// deleted the findings — not a single hit, P1-1), subdomain 2's —
+	// appeared; 2 of 5 comparable (40%) — the report must catch both.
 	reset()
 	simulateRun(
 		map[int16]bool{6: true},
@@ -187,13 +189,14 @@ func TestFixturesSnapshotReportLive(t *testing.T) {
 		t.Fatalf("вердикт детекции = %+v, хочу НЕ ПРОЙДЕН", v)
 	}
 
-	// Хвост q:analyze: у субдомена 4 DOM записан, но анализатор не прошёл
-	// (rules_version NULL, findings в БД — от прошлого прогона): строка не
-	// сравнима (P1-2) — findings прошлого прогона не дают ложный ноль.
+	// The q:analyze tail: subdomain 4's DOM is written but the analyzer
+	// has not passed (rules_version NULL, the findings in the DB are from
+	// the previous run): the row is not comparable (P1-2) — the previous
+	// run's findings do not produce a false zero.
 	reset()
 	simulateRun(
 		map[int16]bool{6: true},
-		map[int16]*bool{1: bp(true), 2: bp(false), 3: bp(false), 5: bp(false)}, // 4 — без штампа
+		map[int16]*bool{1: bp(true), 2: bp(false), 3: bp(false), 5: bp(false)}, // 4 — no stamp
 		map[int16]string{1: "01010101010101010101010101010101", 2: "02020202020202020202020202020202",
 			3: "03030303030303030303030303030303", 4: "04040404040404040404040404040404", 5: "05050505050505050505050505050505"},
 		map[int16]int32{1: 1000, 2: 2000, 3: 3000, 4: 4000, 5: 5000},
@@ -211,5 +214,5 @@ func TestFixturesSnapshotReportLive(t *testing.T) {
 	}
 }
 
-// bp — *bool литерал для карт срабатываний (Go не имеет литерала указателя).
+// bp — a *bool literal for the hit maps (Go has no pointer literal).
 func bp(v bool) *bool { return &v }
