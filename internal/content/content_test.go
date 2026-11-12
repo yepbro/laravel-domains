@@ -11,7 +11,7 @@ func TestCompressRoundTrip(t *testing.T) {
 		nil,
 		{},
 		[]byte("<html><body>привет, мир</body></html>"),
-		[]byte(strings.Repeat("<div class=\"row\">парковка хостинга</div>\n", 1000)),
+		[]byte(strings.Repeat("<div class=\"row\">hosting parking</div>\n", 1000)),
 	}
 	for _, src := range cases {
 		compressed := Compress(src)

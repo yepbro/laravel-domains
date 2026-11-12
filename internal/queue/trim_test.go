@@ -115,10 +115,10 @@ func TestTrimOncePendingKept(t *testing.T) {
 		t.Fatalf("TrimOnce: %v", err)
 	}
 	if n != 7 {
-		t.Errorf("удалено %d, хочу 7 (ответ XTRIM)", n)
+		t.Errorf("removed %d, want 7 (the XTRIM answer)", n)
 	}
 	if len(f.trims) != 1 || f.trims[0]["stream"] != StreamHTTP || f.trims[0]["minid"] != "101-0" {
-		t.Fatalf("XTRIM %+v, хочу MINID 101-0 в %s (старейшая pending)", f.trims, StreamHTTP)
+		t.Fatalf("XTRIM %+v, want MINID 101-0 in %s (the oldest pending)", f.trims, StreamHTTP)
 	}
 }
 
@@ -135,10 +135,10 @@ func TestTrimOnceEmptyPEL(t *testing.T) {
 		t.Fatalf("TrimOnce: %v", err)
 	}
 	if len(f.trims) != 1 || f.trims[0]["minid"] != "42-1" {
-		t.Fatalf("XTRIM %+v, хочу MINID 42-1 (last-delivered-id)", f.trims)
+		t.Fatalf("XTRIM %+v, want MINID 42-1 (last-delivered-id)", f.trims)
 	}
 	if len(f.pends) != 0 {
-		t.Errorf("XPENDING при пустом pending группы не нужен: %v", f.pends)
+		t.Errorf("XPENDING with the group's pending empty is not needed: %v", f.pends)
 	}
 }
 
@@ -165,7 +165,7 @@ func TestTrimOnceMinAcrossGroups(t *testing.T) {
 		t.Fatalf("TrimOnce: %v", err)
 	}
 	if len(f.trims) != 1 || f.trims[0]["minid"] != "999-0" {
-		t.Fatalf("XTRIM %+v, хочу MINID 999-0 (минимум по группам)", f.trims)
+		t.Fatalf("XTRIM %+v, want MINID 999-0 (the minimum across groups)", f.trims)
 	}
 
 	f = &fakeTrim{
@@ -180,7 +180,7 @@ func TestTrimOnceMinAcrossGroups(t *testing.T) {
 		t.Fatalf("TrimOnce: %v", err)
 	}
 	if len(f.trims) != 1 || f.trims[0]["minid"] != "0-0" {
-		t.Fatalf("XTRIM %+v, хочу MINID 0-0 (свежая группа держит точку — история ей ещё не доставлена)", f.trims)
+		t.Fatalf("XTRIM %+v, want MINID 0-0 (a fresh group holds the point — no history delivered to it yet)", f.trims)
 	}
 }
 
@@ -199,16 +199,16 @@ func TestTrimOnceNoGroupsAndNoKey(t *testing.T) {
 		Streams: []string{StreamDead, StreamRender, StreamDNS},
 	})
 	if err != nil {
-		t.Fatalf("TrimOnce: %v (стрим без групп/ключа — не ошибка)", err)
+		t.Fatalf("TrimOnce: %v (a stream without groups/a key — not an error)", err)
 	}
 	if n != 0 {
-		t.Errorf("удалено %d, хочу 0", n)
+		t.Errorf("removed %d, want 0", n)
 	}
 	if len(stuck) != 0 {
-		t.Errorf("застрявшие без групп/ключа: %v", stuck)
+		t.Errorf("stuck without groups/a key: %v", stuck)
 	}
 	if len(f.trims) != 0 {
-		t.Errorf("XTRIM по стриму без групп/ключа: %+v", f.trims)
+		t.Errorf("XTRIM on a stream without groups/a key: %+v", f.trims)
 	}
 }
 
@@ -231,13 +231,13 @@ func TestTrimOncePendingErrorSkipsStream(t *testing.T) {
 		Streams: []string{StreamHTTP, StreamAnalyze},
 	})
 	if err == nil {
-		t.Fatal("ошибка XPENDING не возвращена")
+		t.Fatal("the XPENDING error not returned")
 	}
 	if n != 0 {
-		t.Errorf("удалено %d, хочу 0 (сбойный стрим пропущен)", n)
+		t.Errorf("removed %d, want 0 (the failing stream skipped)", n)
 	}
 	if len(f.trims) != 1 || f.trims[0]["stream"] != StreamAnalyze {
-		t.Fatalf("XTRIM %+v, хочу только %s (валидная часть отрабатывает)", f.trims, StreamAnalyze)
+		t.Fatalf("XTRIM %+v, want %s only (the valid part runs)", f.trims, StreamAnalyze)
 	}
 }
 
@@ -246,13 +246,13 @@ func TestTrimOncePendingErrorSkipsStream(t *testing.T) {
 func TestTrimOnceUnknownStreamAndNilClient(t *testing.T) {
 	f := &fakeTrim{}
 	if _, _, err := TrimOnce(context.Background(), f, TrimOptions{Streams: []string{"q:unknown"}}); err == nil {
-		t.Error("неизвестный стрим не отвергнут")
+		t.Error("an unknown stream not rejected")
 	}
 	if _, _, err := TrimOnce(context.Background(), nil, TrimOptions{}); err == nil {
-		t.Error("nil-клиент не отвергнут")
+		t.Error("a nil client not rejected")
 	}
 	if len(f.trims) != 0 {
-		t.Errorf("XTRIM при ошибках аргументов: %+v", f.trims)
+		t.Errorf("XTRIM on argument errors: %+v", f.trims)
 	}
 }
 
@@ -275,13 +275,13 @@ func TestTrimOnceStuckSignal(t *testing.T) {
 		t.Fatalf("TrimOnce: %v", err)
 	}
 	if len(stuck) != 1 || stuck[0] != StreamAnalyze {
-		t.Fatalf("застрявшие = %v, хочу [%s] (XLEN 120 000 ≥ ¾ предела 150 000)", stuck, StreamAnalyze)
+		t.Fatalf("stuck = %v, want [%s] (XLEN 120,000 ≥ ¾ of the limit 150,000)", stuck, StreamAnalyze)
 	}
 
 	// Below the threshold — no signal.
 	f.xlen[StreamAnalyze] = 100_000
 	if _, stuck, _ := TrimOnce(context.Background(), f, TrimOptions{Streams: []string{StreamAnalyze}}); len(stuck) != 0 {
-		t.Errorf("застрявшие при XLEN 100 000 < 112 500: %v", stuck)
+		t.Errorf("stuck at XLEN 100,000 < 112,500: %v", stuck)
 	}
 
 	// An explicit limit from the options: the threshold is computed from
@@ -289,7 +289,7 @@ func TestTrimOnceStuckSignal(t *testing.T) {
 	if _, stuck, _ := TrimOnce(context.Background(), f, TrimOptions{
 		Streams: []string{StreamAnalyze}, MaxLen: 120_000,
 	}); len(stuck) != 1 || stuck[0] != StreamAnalyze {
-		t.Errorf("застрявшие при явном MaxLen 120 000 и XLEN 100 000: %v, хочу [%s]", stuck, StreamAnalyze)
+		t.Errorf("stuck at explicit MaxLen 120,000 and XLEN 100,000: %v, want [%s]", stuck, StreamAnalyze)
 	}
 }
 
@@ -302,22 +302,22 @@ func TestTrimOptionsDefaults(t *testing.T) {
 	o := TrimOptions{}.withDefaults()
 	want := workingStreams()
 	if !reflect.DeepEqual(o.Streams, want) {
-		t.Errorf("Streams по умолчанию = %v, хочу %v (без q:dead)", o.Streams, want)
+		t.Errorf("the default Streams = %v, want %v (no q:dead)", o.Streams, want)
 	}
 	for _, s := range want {
 		if !knownStream(s) {
-			t.Errorf("workingStreams содержит неизвестный стрим %q", s)
+			t.Errorf("workingStreams contains an unknown stream %q", s)
 		}
 	}
 	if len(want) != 5 {
-		t.Errorf("рабочих стримов задач %d (%v), хочу 5 — новый стрим добавьте в workingStreams", len(want), want)
+		t.Errorf("working task streams %d (%v), want 5 — add a new stream to workingStreams", len(want), want)
 	}
 	if o.Interval != DefaultTrimInterval {
-		t.Errorf("Interval по умолчанию = %s, хочу %s", o.Interval, DefaultTrimInterval)
+		t.Errorf("the default Interval = %s, want %s", o.Interval, DefaultTrimInterval)
 	}
 	o = TrimOptions{Streams: []string{StreamDead}, Interval: time.Nanosecond}.withDefaults()
 	if !reflect.DeepEqual(o.Streams, []string{StreamDead}) || o.Interval != time.Nanosecond {
-		t.Errorf("явные значения заменены дефолтами: %+v", o)
+		t.Errorf("explicit values replaced by the defaults: %+v", o)
 	}
 }
 
@@ -341,7 +341,7 @@ func TestTrimLoopCancel(t *testing.T) {
 	for len(f.trimCalls()) == 0 {
 		select {
 		case <-deadline:
-			t.Fatal("первый проход TrimLoop не выполнен")
+			t.Fatal("the first TrimLoop pass did not run")
 		default:
 			time.Sleep(time.Millisecond)
 		}
@@ -350,9 +350,9 @@ func TestTrimLoopCancel(t *testing.T) {
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Fatalf("TrimLoop после отмены: %v, хочу nil", err)
+			t.Fatalf("TrimLoop after the cancel: %v, want nil", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("TrimLoop не завершился после отмены ctx")
+		t.Fatal("TrimLoop did not finish after the ctx cancel")
 	}
 }

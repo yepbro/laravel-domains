@@ -119,17 +119,17 @@ func NewRedisQueue(rdb redisStreams, opt RedisOptions) *RedisQueue {
 // sustained unavailability — InfraError.
 func (q *RedisQueue) Publish(ctx context.Context, stream string, msg Message) (string, error) {
 	if !knownStream(stream) {
-		return "", fmt.Errorf("queue: неизвестный стрим %q (рабочие стримы — константы пакета: StreamDNS, StreamHTTP, StreamRender, StreamRenderFallback, StreamAnalyze, StreamDead)", stream)
+		return "", fmt.Errorf("queue: unknown stream %q (working streams are package constants: StreamDNS, StreamHTTP, StreamRender, StreamRenderFallback, StreamAnalyze, StreamDead)", stream)
 	}
 	if !streamAllowed(msg, stream) {
-		return "", fmt.Errorf("queue: сообщение %T публикуется в %v, а не в %q", msg, msg.Streams(), stream)
+		return "", fmt.Errorf("queue: %T is published to %v, not %q", msg, msg.Streams(), stream)
 	}
 	if err := msg.validate(); err != nil {
 		return "", err
 	}
 	data, err := marshalMessage(msg)
 	if err != nil {
-		return "", fmt.Errorf("queue: сериализовать %T: %w", msg, err)
+		return "", fmt.Errorf("queue: serialize %T: %w", msg, err)
 	}
 	args := &redis.XAddArgs{
 		Stream: stream,
@@ -170,9 +170,9 @@ func (q *RedisQueue) Publish(ctx context.Context, stream string, msg Message) (s
 			// Sustained write unavailability: the InfraError marker —
 			// workers stop reading on it, RecoverLoop does not claim
 			// (T-152); no XACK — the publication did not happen.
-			return "", &InfraError{Op: "publish в " + stream, Err: err}
+			return "", &InfraError{Op: "publish to " + stream, Err: err}
 		}
-		return "", fmt.Errorf("queue: publish в %s: %w", stream, err)
+		return "", fmt.Errorf("queue: publish to %s: %w", stream, err)
 	}
 	return id, nil
 }
@@ -182,16 +182,16 @@ func (q *RedisQueue) Publish(ctx context.Context, stream string, msg Message) (s
 // — an empty result without an error (the Block expired).
 func (q *RedisQueue) Consume(ctx context.Context, stream, group, consumer string, n int) ([]Delivery, error) {
 	if !knownStream(stream) {
-		return nil, fmt.Errorf("queue: неизвестный стрим %q", stream)
+		return nil, fmt.Errorf("queue: unknown stream %q", stream)
 	}
 	if group == "" {
-		return nil, fmt.Errorf("queue: не задана группа потребителей стрима %s", stream)
+		return nil, fmt.Errorf("queue: consumer group of stream %s not set", stream)
 	}
 	if consumer == "" {
-		return nil, fmt.Errorf("queue: не задано имя потребителя группы %s", group)
+		return nil, fmt.Errorf("queue: consumer name of group %s not set", group)
 	}
 	if n < 1 {
-		return nil, fmt.Errorf("queue: размер пачки %d < 1", n)
+		return nil, fmt.Errorf("queue: batch size %d < 1", n)
 	}
 	if err := q.ensureGroup(ctx, stream, group, "0"); err != nil {
 		return nil, err
@@ -228,7 +228,7 @@ func (q *RedisQueue) Consume(ctx context.Context, stream, group, consumer string
 		return nil, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("queue: read %s (группа %s): %w", stream, group, err)
+		return nil, fmt.Errorf("queue: read %s (group %s): %w", stream, group, err)
 	}
 	out := make([]Delivery, 0, len(res))
 	for _, xs := range res {
@@ -257,9 +257,9 @@ func (q *RedisQueue) Ack(ctx context.Context, stream, group string, ids ...strin
 			// written, the entry stayed in pending and will come back via
 			// redelivery (idempotency, spec 3.4); the marker tells the
 			// worker this is not a processing error.
-			return &InfraError{Op: fmt.Sprintf("ack %s (группа %s)", stream, group), Err: err}
+			return &InfraError{Op: fmt.Sprintf("ack %s (group %s)", stream, group), Err: err}
 		}
-		return fmt.Errorf("queue: ack %s (группа %s): %w", stream, group, err)
+		return fmt.Errorf("queue: ack %s (group %s): %w", stream, group, err)
 	}
 	return nil
 }
@@ -279,7 +279,7 @@ func (q *RedisQueue) ensureGroup(ctx context.Context, stream, group, start strin
 	}
 	err := q.rdb.XGroupCreateMkStream(ctx, stream, group, start).Err()
 	if err != nil && !isBusyGroup(err) {
-		return fmt.Errorf("queue: создать группу %s в %s: %w", group, stream, err)
+		return fmt.Errorf("queue: create group %s in %s: %w", group, stream, err)
 	}
 	q.groups.Store(key, start)
 	return nil
@@ -335,7 +335,7 @@ func streamIDGreater(a, b string) bool {
 func splitStreamID(id string) (ms, seq int64, err error) {
 	s1, s2, ok := strings.Cut(id, "-")
 	if !ok {
-		return 0, 0, fmt.Errorf("queue: идентификатор записи %q не вида ms-seq", id)
+		return 0, 0, fmt.Errorf("queue: entry id %q is not of the ms-seq form", id)
 	}
 	if ms, err = strconv.ParseInt(s1, 10, 64); err != nil {
 		return 0, 0, err

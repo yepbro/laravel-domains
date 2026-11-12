@@ -81,17 +81,17 @@ func (DNSBatch) Streams() []string { return []string{StreamDNS} }
 
 func (b DNSBatch) validate() error {
 	if len(b.Domains) == 0 {
-		return fmt.Errorf("queue: q:dns: пустая пачка доменов")
+		return fmt.Errorf("queue: q:dns: empty domain batch")
 	}
 	for i, d := range b.Domains {
 		if d.ZoneID <= 0 {
-			return fmt.Errorf("queue: q:dns: домен №%d: zone_id %d ≤ 0", i+1, d.ZoneID)
+			return fmt.Errorf("queue: q:dns: domain #%d: zone_id %d ≤ 0", i+1, d.ZoneID)
 		}
 		if d.DomainID <= 0 {
-			return fmt.Errorf("queue: q:dns: домен №%d: domain_id %d ≤ 0", i+1, d.DomainID)
+			return fmt.Errorf("queue: q:dns: domain #%d: domain_id %d ≤ 0", i+1, d.DomainID)
 		}
 		if err := checkName(d.Name); err != nil {
-			return fmt.Errorf("queue: q:dns: домен №%d: %w", i+1, err)
+			return fmt.Errorf("queue: q:dns: domain #%d: %w", i+1, err)
 		}
 	}
 	return nil
@@ -134,25 +134,25 @@ func (t HTTPTask) validate() error {
 		return fmt.Errorf("queue: q:http: %w", err)
 	}
 	if len(t.Subdomains) == 0 {
-		return fmt.Errorf("queue: q:http: нет DNS-живых субдоменов (задача не публикуется, ТЗ 5.4 п. 5)")
+		return fmt.Errorf("queue: q:http: no DNS-live subdomains (the task is not published, spec 5.4 p. 5)")
 	}
 	for i, s := range t.Subdomains {
 		if err := model.ValidateSubdomainID(int(s.SubdomainID)); err != nil {
-			return fmt.Errorf("queue: q:http: субдомен №%d: %w", i+1, err)
+			return fmt.Errorf("queue: q:http: subdomain #%d: %w", i+1, err)
 		}
 		if len(s.Label) > maxLabelLen || strings.ContainsAny(s.Label, ". ") {
-			return fmt.Errorf("queue: q:http: субдомен №%d: метка %q — одна DNS-метка до %d октетов", i+1, s.Label, maxLabelLen)
+			return fmt.Errorf("queue: q:http: subdomain #%d: label %q is a single DNS label of up to %d octets", i+1, s.Label, maxLabelLen)
 		}
 		if len(s.Addrs) == 0 {
-			return fmt.Errorf("queue: q:http: субдомен №%d: нет адресов", i+1)
+			return fmt.Errorf("queue: q:http: subdomain #%d: no addresses", i+1)
 		}
 		for _, a := range s.Addrs {
 			if _, err := netip.ParseAddr(a); err != nil {
-				return fmt.Errorf("queue: q:http: субдомен №%d: адрес %q: %w", i+1, a, err)
+				return fmt.Errorf("queue: q:http: subdomain #%d: address %q: %w", i+1, a, err)
 			}
 		}
 		if len(s.CNAME) > maxNameLen {
-			return fmt.Errorf("queue: q:http: субдомен №%d: CNAME длиннее %d октетов", i+1, maxNameLen)
+			return fmt.Errorf("queue: q:http: subdomain #%d: CNAME longer than %d octets", i+1, maxNameLen)
 		}
 	}
 	return nil
@@ -192,19 +192,19 @@ func (Result) Streams() []string {
 
 func (r Result) validate() error {
 	if r.ZoneID <= 0 {
-		return fmt.Errorf("queue: результат: zone_id %d ≤ 0", r.ZoneID)
+		return fmt.Errorf("queue: result: zone_id %d ≤ 0", r.ZoneID)
 	}
 	if r.DomainID <= 0 {
-		return fmt.Errorf("queue: результат: domain_id %d ≤ 0", r.DomainID)
+		return fmt.Errorf("queue: result: domain_id %d ≤ 0", r.DomainID)
 	}
 	if err := model.ValidateSubdomainID(int(r.SubdomainID)); err != nil {
-		return fmt.Errorf("queue: результат: %w", err)
+		return fmt.Errorf("queue: result: %w", err)
 	}
 	if !r.Variant.Valid() {
-		return fmt.Errorf("queue: результат: вариант %d (0 основной, 1 http)", r.Variant)
+		return fmt.Errorf("queue: result: variant %d (0 main, 1 http)", r.Variant)
 	}
 	if len(r.Name) > maxNameLen {
-		return fmt.Errorf("queue: результат: имя длиннее %d октетов", maxNameLen)
+		return fmt.Errorf("queue: result: name longer than %d octets", maxNameLen)
 	}
 	return nil
 }
@@ -250,7 +250,7 @@ func (Dead) Streams() []string { return []string{StreamDead} }
 
 func (d Dead) validate() error {
 	if d.TaskID == "" {
-		return fmt.Errorf("queue: q:dead: пустой task_id")
+		return fmt.Errorf("queue: q:dead: empty task_id")
 	}
 	switch d.Stream {
 	// The branch body is empty (valid streams have nothing to check):
@@ -262,10 +262,10 @@ func (d Dead) validate() error {
 	// mutator-disable-next-line branch/case
 	case StreamDNS, StreamHTTP, StreamRender, StreamRenderFallback, StreamAnalyze:
 	default:
-		return fmt.Errorf("queue: q:dead: стрим-источник %q не является рабочим стримом задач", d.Stream)
+		return fmt.Errorf("queue: q:dead: source stream %q is not a working task stream", d.Stream)
 	}
 	if d.EntryID == "" {
-		return fmt.Errorf("queue: q:dead: пустой entry_id")
+		return fmt.Errorf("queue: q:dead: empty entry_id")
 	}
 	if d.Attempts < 1 {
 		return fmt.Errorf("queue: q:dead: attempts %d < 1", d.Attempts)
@@ -273,22 +273,22 @@ func (d Dead) validate() error {
 	// The subject identifiers (T-105) are optional (deadSubjectOf is
 	// best-effort); the ones that are set must be valid.
 	if d.ZoneID < 0 || d.DomainID < 0 {
-		return fmt.Errorf("queue: q:dead: идентификаторы домена %d/%d отрицательны", d.ZoneID, d.DomainID)
+		return fmt.Errorf("queue: q:dead: domain identifiers %d/%d are negative", d.ZoneID, d.DomainID)
 	}
 	if d.Domains < 0 {
-		return fmt.Errorf("queue: q:dead: размер пачки %d < 0", d.Domains)
+		return fmt.Errorf("queue: q:dead: batch size %d < 0", d.Domains)
 	}
 	if len(d.Name) > maxNameLen {
-		return fmt.Errorf("queue: q:dead: имя длиннее %d октетов", maxNameLen)
+		return fmt.Errorf("queue: q:dead: name longer than %d octets", maxNameLen)
 	}
 	if !d.Variant.Valid() {
-		return fmt.Errorf("queue: q:dead: вариант %d (0 основной, 1 http)", d.Variant)
+		return fmt.Errorf("queue: q:dead: variant %d (0 main, 1 http)", d.Variant)
 	}
 	if err := model.ValidateSubdomainID(int(d.SubdomainID)); err != nil {
 		return fmt.Errorf("queue: q:dead: %w", err)
 	}
 	if len(d.Payload) > 0 && !json.Valid(d.Payload) {
-		return fmt.Errorf("queue: q:dead: payload — исходное сообщение старой записи (JSON), задано %d байт", len(d.Payload))
+		return fmt.Errorf("queue: q:dead: payload is the original message of a legacy entry (JSON), %d bytes set", len(d.Payload))
 	}
 	return nil
 }
@@ -388,7 +388,7 @@ func marshalMessage(msg Message) ([]byte, error) {
 		}
 		return json.Marshal(m)
 	default:
-		return nil, fmt.Errorf("queue: неизвестный тип сообщения %T (форматы вводит только пакет queue)", msg)
+		return nil, fmt.Errorf("queue: unknown message type %T (formats are defined only by the queue package)", msg)
 	}
 }
 
@@ -402,17 +402,17 @@ func marshalMessage(msg Message) ([]byte, error) {
 func Decode[T Message](d Delivery) (T, error) {
 	var m T
 	if len(d.Payload) == 0 {
-		return m, fmt.Errorf("queue: %s: запись %s без поля data", d.Stream, d.ID)
+		return m, fmt.Errorf("queue: %s: entry %s has no data field", d.Stream, d.ID)
 	}
 	if err := json.Unmarshal(d.Payload, &m); err != nil {
-		return m, fmt.Errorf("queue: %s: запись %s: %w", d.Stream, d.ID, err)
+		return m, fmt.Errorf("queue: %s: entry %s: %w", d.Stream, d.ID, err)
 	}
 	if !streamAllowed(m, d.Stream) {
-		return m, fmt.Errorf("queue: %s: запись %s: сообщение %T не относится к этому стриму (допустимы %v)",
+		return m, fmt.Errorf("queue: %s: entry %s: message %T does not belong to this stream (allowed: %v)",
 			d.Stream, d.ID, m, m.Streams())
 	}
 	if err := m.validate(); err != nil {
-		return m, fmt.Errorf("queue: %s: запись %s: %w", d.Stream, d.ID, err)
+		return m, fmt.Errorf("queue: %s: entry %s: %w", d.Stream, d.ID, err)
 	}
 	return m, nil
 }
@@ -432,10 +432,10 @@ func streamAllowed(msg Message, stream string) bool {
 // a deep syntax check is the territory of internal/idn at the system input.
 func checkName(name string) error {
 	if name == "" {
-		return fmt.Errorf("пустое имя домена")
+		return fmt.Errorf("empty domain name")
 	}
 	if len(name) > maxNameLen {
-		return fmt.Errorf("имя длиннее %d октетов", maxNameLen)
+		return fmt.Errorf("name longer than %d octets", maxNameLen)
 	}
 	return nil
 }

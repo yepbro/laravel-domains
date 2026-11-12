@@ -60,7 +60,7 @@ func Check(t *testing.T, file string) {
 	fset := token.NewFileSet()
 	parsed, err := parser.ParseFile(fset, file, nil, 0)
 	if err != nil {
-		t.Fatalf("разбор %s: %v", file, err)
+		t.Fatalf("parsing %s: %v", file, err)
 	}
 	var run *ast.FuncDecl
 	for _, d := range parsed.Decls {
@@ -69,13 +69,13 @@ func Check(t *testing.T, file string) {
 		}
 	}
 	if run == nil {
-		t.Fatalf("функция run в %s не найдена", file)
+		t.Fatalf("the run function not found in %s", file)
 	}
 
 	var (
 		withCancel = token.NoPos // ctx, cancel := context.WithCancel(ctx)
 		ctxName    string        // идентификатор производного ctx (LHS[0])
-		cancelName = "cancel"    // идентификатор отмены (LHS[1]; контракт паттерна)
+		cancelName = "cancel"    // the cancel identifier (LHS[1]; the pattern's contract)
 		joinDefer  *ast.DeferStmt
 		waits      int // bg.Wait() в run — ровно один
 		launches   int
@@ -91,7 +91,7 @@ func Check(t *testing.T, file string) {
 		if d, ok := st.(*ast.DeferStmt); ok {
 			if callsBgWait(d) {
 				if joinDefer != nil {
-					broken = append(broken, "больше одного defer с bg.Wait()")
+					broken = append(broken, "more than one defer with bg.Wait()")
 				}
 				joinDefer = d
 			}
@@ -141,13 +141,13 @@ func Check(t *testing.T, file string) {
 						firstGo = goSt.Pos()
 					}
 					if i == 0 || !isBgAddOne(n.List[i-1]) {
-						broken = append(broken, "go-запуск без bg.Add(1) непосредственно перед ним — цикл вне джойна (T-223/T-232)")
+						broken = append(broken, "a go launch without bg.Add(1) right before it — the loop is outside the join (T-223/T-232)")
 					}
 					if !defersBgDoneTopLevel(goSt) {
-						broken = append(broken, "go-запуск без безусловного defer bg.Done() верхнего уровня литерала")
+						broken = append(broken, "a go launch without an unconditional top-level defer bg.Done() of the literal")
 					}
 					if ctxName != "" && !mentionsIdent(goSt, ctxName) {
-						broken = append(broken, "go-запуск не использует производный ctx "+ctxName+" — отмена джойн-defer его не остановит (T-232)")
+						broken = append(broken, "a go launch does not use the derived ctx "+ctxName+" — the join-defer cancel will not stop it (T-232)")
 					}
 					continue
 				}
@@ -155,7 +155,7 @@ func Check(t *testing.T, file string) {
 				// счётчике любого выхода, включая штатный (P3-1
 				// ревью T-232 — реалистично при удалении цикла).
 				if isBgAddOne(st) && (i+1 >= len(n.List) || !isGoStmt(n.List[i+1])) {
-					broken = append(broken, "bg.Add(1) без go-запуска непосредственно после него — bg.Wait() повиснет (T-232)")
+					broken = append(broken, "bg.Add(1) without a go launch right after it — bg.Wait() will hang (T-232)")
 				}
 			}
 		case *ast.CallExpr:
@@ -167,23 +167,23 @@ func Check(t *testing.T, file string) {
 	})
 
 	if withCancel == token.NoPos {
-		t.Fatalf("%s: в run нет производной отмены (context.WithCancel) — ранний выход/паника оставляют циклы с живым ctx", file)
+		t.Fatalf("%s: run has no derived cancel (context.WithCancel) — an early exit/panic leaves the loops with a live ctx", file)
 	}
 	if joinDefer == nil {
-		t.Fatalf("%s: в run нет defer с bg.Wait() на верхнем уровне — фоновые циклы не джойнятся до defer-закрытий ресурсов", file)
+		t.Fatalf("%s: run has no defer with bg.Wait() at the top level — the background loops are not joined before the defer resource closes", file)
 	}
 	// Джойн-defer: безусловный cancel() ДО bg.Wait() (P2-1 ревью
 	// T-232): Wait-до-cancel и условный cancel — дедлок на раннем
 	// выходе (циклы не отменены, Wait не вернётся; на штатной остановке
 	// замаскировано уже отменённым родителем).
 	if err := joinDeferOrder(joinDefer, cancelName); err != "" {
-		t.Errorf("%s: джойн-defer: %s", file, err)
+		t.Errorf("%s: join-defer: %s", file, err)
 	}
 	if waits != 1 {
-		t.Errorf("%s: вызовов bg.Wait() в run = %d, хочу 1 (только джойн-defer)", file, waits)
+		t.Errorf("%s: bg.Wait() calls in run = %d, want 1 (the join-defer only)", file, waits)
 	}
 	if launches == 0 {
-		t.Fatalf("%s: в run нет go-запусков фоновых циклов — проверять нечего", file)
+		t.Fatalf("%s: run has no go launches of background loops — nothing to check", file)
 	}
 	// Производный ctx — главному циклу воркера: финальный return с
 	// вызовом цикла обязан передавать его (P2-2 ревью T-232); return
@@ -191,7 +191,7 @@ func Check(t *testing.T, file string) {
 	if ctxName != "" {
 		if last := len(run.Body.List) - 1; last >= 0 {
 			if ret, ok := run.Body.List[last].(*ast.ReturnStmt); ok && hasCallExpr(ret) && !mentionsIdent(ret, ctxName) {
-				t.Errorf("%s: финальный return не передаёт производный ctx %s главному циклу — остановка run не погасит его (T-232)", file, ctxName)
+				t.Errorf("%s: the final return does not pass the derived ctx %s to the main loop — stopping run will not extinguish it (T-232)", file, ctxName)
 			}
 		}
 	}
@@ -203,14 +203,14 @@ func Check(t *testing.T, file string) {
 			continue
 		}
 		if d.Pos() > joinDefer.Pos() {
-			t.Errorf("%s: defer (%s) зарегистрирован после джойна — LIFO закроет его ресурс раньше остановки циклов", file, fset.Position(d.Pos()))
+			t.Errorf("%s: the defer (%s) is registered after the join — LIFO will close its resource before the loops stop", file, fset.Position(d.Pos()))
 		}
 	}
 	if withCancel > joinDefer.Pos() {
-		t.Errorf("%s: производная отмена стоит после джойн-defer — циклы могут получить неотменяемый ctx", file)
+		t.Errorf("%s: the derived cancel comes after the join-defer — the loops may get a non-cancellable ctx", file)
 	}
 	if firstGo != token.NoPos && firstGo < joinDefer.Pos() {
-		t.Errorf("%s: go-запуск цикла стоит до регистрации джойн-defer — путь между ними выходит из run без джойна", file)
+		t.Errorf("%s: the loop's go launch comes before the join-defer registration — a path between them exits run without a join", file)
 	}
 	for _, b := range broken {
 		t.Error(b)
@@ -224,7 +224,7 @@ func Check(t *testing.T, file string) {
 func joinDeferOrder(d *ast.DeferStmt, cancelName string) string {
 	lit, ok := d.Call.Fun.(*ast.FuncLit)
 	if !ok {
-		return "ожидался func-литерал «cancel(); bg.Wait()», не именованный вызов"
+		return "a func literal «cancel(); bg.Wait()» expected, not a named call"
 	}
 	cancelPos, waitPos := token.NoPos, token.NoPos
 	for _, st := range lit.Body.List {
@@ -247,11 +247,11 @@ func joinDeferOrder(d *ast.DeferStmt, cancelName string) string {
 	}
 	switch {
 	case cancelPos == token.NoPos:
-		return "нет безусловного " + cancelName + "() верхнего уровня — ранний выход run не остановит ещё живые циклы, Wait зависнет"
+		return "no unconditional " + cancelName + "() at the top level — an early exit of run will not stop the still-live loops, Wait will hang"
 	case waitPos == token.NoPos:
-		return "нет bg.Wait() верхнего уровня литерала"
+		return "no top-level bg.Wait() of the literal"
 	case waitPos < cancelPos:
-		return "bg.Wait() стоит до " + cancelName + "() — не отмененные циклы не выйдут, Wait повиснет (дедлок раннего выхода)"
+		return "bg.Wait() comes before " + cancelName + "() — uncancelled loops will not exit, Wait will hang (an early-exit deadlock)"
 	}
 	return ""
 }

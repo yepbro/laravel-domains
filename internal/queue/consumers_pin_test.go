@@ -33,15 +33,15 @@ func TestWorkingGroupsMatchWorkerDefaults(t *testing.T) {
 	}
 	got := queue.WorkingGroups()
 	if len(got) != len(want)+1 { // + the q:render-fallback pair (the worker B profile)
-		t.Fatalf("WorkingGroups = %v, хочу пары %v + q:render-fallback=render-fallback-worker (лишний/недостающий стрим — обновите очередь и воркеров согласованно)", got, want)
+		t.Fatalf("WorkingGroups = %v, want the pairs %v + q:render-fallback=render-fallback-worker (an extra/missing stream — update the queue and the workers in sync)", got, want)
 	}
 	for stream, group := range want {
 		if got[stream] != group {
-			t.Errorf("WorkingGroups[%s] = %q, хочу %q (%s DefaultGroup воркера)", stream, got[stream], group, stream)
+			t.Errorf("WorkingGroups[%s] = %q, want %q (the %s worker's DefaultGroup)", stream, got[stream], group, stream)
 		}
 	}
 	if got[queue.StreamRenderFallback] != "render-fallback-worker" {
-		t.Errorf("WorkingGroups[%s] = %q, хочу %q (группа профиля воркера B, T-240/ФТ-12)",
+		t.Errorf("WorkingGroups[%s] = %q, want %q (the worker-B profile group, T-240/FR-12)",
 			queue.StreamRenderFallback, got[queue.StreamRenderFallback], "render-fallback-worker")
 	}
 }

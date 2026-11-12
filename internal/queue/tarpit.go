@@ -88,24 +88,24 @@ func NewTarpitCounter(rdb tarpitClient) *TarpitCounter {
 // upper bound (docs/redis.md §2).
 func (c *TarpitCounter) Track(ctx context.Context, taskID, delivery string, ttl time.Duration) (int, error) {
 	if taskID == "" {
-		return 0, fmt.Errorf("queue: тарпит-счётчик: пустой task_id")
+		return 0, fmt.Errorf("queue: tarpit counter: empty task_id")
 	}
 	if delivery == "" {
-		return 0, fmt.Errorf("queue: тарпит-счётчик %s: пустой идентификатор доставки", TarpitKey(taskID))
+		return 0, fmt.Errorf("queue: tarpit counter %s: empty delivery identifier", TarpitKey(taskID))
 	}
 	if ttl <= 0 {
-		return 0, fmt.Errorf("queue: тарпит-счётчик %s: TTL %s ≤ 0 (EXPIRE удалил бы ключ)", TarpitKey(taskID), ttl)
+		return 0, fmt.Errorf("queue: tarpit counter %s: TTL %s ≤ 0 (EXPIRE would delete the key)", TarpitKey(taskID), ttl)
 	}
 	key := TarpitKey(taskID)
 	if _, err := c.rdb.SAdd(ctx, key, delivery).Result(); err != nil {
-		return 0, fmt.Errorf("queue: тарпит-счётчик %s: отметка доставки %s: %w", key, delivery, err)
+		return 0, fmt.Errorf("queue: tarpit counter %s: delivery mark %s: %w", key, delivery, err)
 	}
 	if _, err := c.rdb.Expire(ctx, key, ttl).Result(); err != nil {
-		return 0, fmt.Errorf("queue: тарпит-счётчик %s: TTL %s: %w", key, ttl, err)
+		return 0, fmt.Errorf("queue: tarpit counter %s: TTL %s: %w", key, ttl, err)
 	}
 	n, err := c.rdb.SCard(ctx, key).Result()
 	if err != nil {
-		return 0, fmt.Errorf("queue: тарпит-счётчик %s: мощность множества: %w", key, err)
+		return 0, fmt.Errorf("queue: tarpit counter %s: set cardinality: %w", key, err)
 	}
 	return int(n), nil
 }

@@ -44,7 +44,7 @@ func NewDeadBuriedHook(reg *Registry) func(stream string) {
 	}
 	buried := reg.MustCounter(prometheus.CounterOpts{
 		Name: "crawler_queue_dead_buried_total",
-		Help: "Переводы задач в q:dead (Reliab.bury, T-154): запись исчерпала лимит попыток доставок без подтверждения и ушла в карантин ручного разбора. Метка queue — стрим-источник задачи. Рост — смерти задач: темп(rate) — поток смертей, неразобранный остаток — crawler_queue_depth{queue=\"q:dead\"} монитора (алерт queue_dead); разбор — runbooks §2.",
+		Help: "Tasks moved to q:dead (Reliab.bury, T-154): the entry exhausted its attempt limit of deliveries without acknowledgement and went to the manual triage quarantine. The queue label is the task's source stream. Growth — task deaths: the rate — the death flow, the unresolved remainder — the monitor's crawler_queue_depth{queue=\"q:dead\"} (the queue_dead alert); triage — runbooks §2.",
 	}, LabelQueue)
 	return func(stream string) { buried.WithLabelValues(stream).Inc() }
 }
@@ -60,7 +60,7 @@ func NewDeadUnidentifiedHook(reg *Registry) func(stream string) {
 	}
 	unidentified := reg.MustCounter(prometheus.CounterOpts{
 		Name: "crawler_queue_dead_unidentified_total",
-		Help: "Неидентифицируемые записи, переведённые в q:dead (Reliab.bury, T-260/ФТ-6.1): запись PEL без task_id (тело вне форматов пакета) исчерпала лимит попыток доставок; переведена с синтетическим task_id unknown:<stream>:<entry-id>, без предметных полей — разбор ручной (runbooks §2). Метка queue — стрим-источник записи. Стационарно ноль: рост — записи публикуются мимо контракта пакета (ручной XADD, баг писателя) — найти источник по entry_id.",
+		Help: "Unidentifiable entries moved to q:dead (Reliab.bury, T-260/FR-6.1): a PEL entry without a task_id (a body outside the package formats) exhausted its delivery attempt limit; moved with the synthetic task_id unknown:<stream>:<entry-id>, without subject fields — the triage is manual (runbooks §2). The queue label is the entry's source stream. Steadily zero: growth — entries are published bypassing the package contract (a manual XADD, a writer bug) — find the source by entry_id.",
 	}, LabelQueue)
 	return func(stream string) { unidentified.WithLabelValues(stream).Inc() }
 }

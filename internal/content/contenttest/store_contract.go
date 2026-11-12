@@ -40,9 +40,9 @@ func StoreContract(t *testing.T, newStore func(t *testing.T) content.ContentStor
 	// для контракта это просто байты).
 	data := [][]byte{
 		nil,
-		[]byte("<html><body>итоговая страница</body></html>"),
+		[]byte("<html><body>final page</body></html>"),
 		[]byte("bin\x00\x01\xff content \x00"),
-		bytes.Repeat([]byte("<div>парковка хостинга</div>"), 8192), // ~168 КиБ
+		bytes.Repeat([]byte("<div>hosting parking</div>"), 8192), // ~168 KiB
 	}
 	ctx := context.Background()
 
@@ -54,7 +54,7 @@ func StoreContract(t *testing.T, newStore func(t *testing.T) content.ContentStor
 				t.Fatalf("Put(%d): %v", i, err)
 			}
 			if !res.Created {
-				t.Errorf("Put(%d): первый Put должен записать новый контент, Created = false", i)
+				t.Errorf("Put(%d): the first Put must write new content, Created = false", i)
 			}
 			if want := content.HashOf(d); res.Hash != want {
 				t.Errorf("Put(%d): hash = %s, want HashOf(data) = %s", i, res.Hash, want)
@@ -64,56 +64,56 @@ func StoreContract(t *testing.T, newStore func(t *testing.T) content.ContentStor
 				t.Fatalf("Get(%d): %v", i, err)
 			}
 			if !bytes.Equal(got, d) {
-				t.Errorf("Get(%d): байты не совпали: got %d, want %d байт", i, len(got), len(d))
+				t.Errorf("Get(%d): the bytes do not match: got %d, want %d bytes", i, len(got), len(d))
 			}
 			// Get возвращает независимую копию (контракт метода).
 			if len(got) > 0 {
 				got[0] ^= 0xff
 				again, err := store.Get(ctx, res.Hash)
 				if err != nil {
-					t.Fatalf("повторный Get(%d): %v", i, err)
+					t.Fatalf("the repeated Get(%d): %v", i, err)
 				}
 				if !bytes.Equal(again, d) {
-					t.Errorf("Get(%d): правка результата первого Get изменила хранилище", i)
+					t.Errorf("Get(%d): editing the first Get's result changed the store", i)
 				}
 			}
 		}
 	})
 
-	t.Run("Put не изменяет данные", func(t *testing.T) {
+	t.Run("Put does not modify the data", func(t *testing.T) {
 		store := newStore(t)
-		d := []byte("изменяемые данные")
+		d := []byte("mutable data")
 		before := bytes.Clone(d)
 		if _, err := store.Put(ctx, d); err != nil {
 			t.Fatalf("Put: %v", err)
 		}
 		if !bytes.Equal(d, before) {
-			t.Error("Put изменил переданные данные")
+			t.Error("Put modified the passed data")
 		}
 	})
 
-	t.Run("идемпотентность Put", func(t *testing.T) {
+	t.Run("Put idempotency", func(t *testing.T) {
 		store := newStore(t)
 		first, err := store.Put(ctx, data[1])
 		if err != nil {
-			t.Fatalf("первый Put: %v", err)
+			t.Fatalf("the first Put: %v", err)
 		}
 		second, err := store.Put(ctx, bytes.Clone(data[1]))
 		if err != nil {
-			t.Fatalf("повторный Put: %v", err)
+			t.Fatalf("the repeated Put: %v", err)
 		}
 		if first.Hash != second.Hash {
-			t.Errorf("тот же контент дал разные хэши: %s и %s", first.Hash, second.Hash)
+			t.Errorf("the same content produced different hashes: %s and %s", first.Hash, second.Hash)
 		}
 		if second.Created {
-			t.Error("повторный Put записал байты заново: Created = true, want false (дедупликация)")
+			t.Error("the repeated Put wrote the bytes again: Created = true, want false (deduplication)")
 		}
 		if got, err := store.Get(ctx, second.Hash); err != nil || !bytes.Equal(got, data[1]) {
-			t.Errorf("Get после повторного Put: %v, совпадение = %v", err, bytes.Equal(got, data[1]))
+			t.Errorf("Get after the repeated Put: %v, match = %v", err, bytes.Equal(got, data[1]))
 		}
 	})
 
-	t.Run("разный контент — разный Hash", func(t *testing.T) {
+	t.Run("different content — a different Hash", func(t *testing.T) {
 		store := newStore(t)
 		a, err := store.Put(ctx, data[1])
 		if err != nil {
@@ -124,11 +124,11 @@ func StoreContract(t *testing.T, newStore func(t *testing.T) content.ContentStor
 			t.Fatalf("Put(b): %v", err)
 		}
 		if a.Hash == b.Hash {
-			t.Errorf("разный контент дал один хэш %s", a.Hash)
+			t.Errorf("different content produced one hash %s", a.Hash)
 		}
 	})
 
-	t.Run("ссылки: Put ×N — Delete ×N", func(t *testing.T) {
+	t.Run("references: Put ×N — Delete ×N", func(t *testing.T) {
 		store := newStore(t)
 		const n = 3
 		res, err := store.Put(ctx, data[3])
@@ -137,7 +137,7 @@ func StoreContract(t *testing.T, newStore func(t *testing.T) content.ContentStor
 		}
 		for i := 1; i < n; i++ { // n ссылок всего
 			if _, err := store.Put(ctx, data[3]); err != nil {
-				t.Fatalf("Put-ссылка %d: %v", i, err)
+				t.Fatalf("the Put reference %d: %v", i, err)
 			}
 		}
 		for i := 1; i < n; i++ { // пока есть ссылки, контент жив
@@ -145,59 +145,59 @@ func StoreContract(t *testing.T, newStore func(t *testing.T) content.ContentStor
 				t.Fatalf("Delete %d: %v", i, err)
 			}
 			if _, err := store.Get(ctx, res.Hash); err != nil {
-				t.Fatalf("Get после Delete %d из %d ссылок: %v (контент ещё нужен)", i, n, err)
+				t.Fatalf("Get after Delete %d of %d references: %v (the content is still needed)", i, n, err)
 			}
 		}
 		if err := store.Delete(ctx, res.Hash); err != nil { // последняя ссылка
-			t.Fatalf("Delete последней ссылки: %v", err)
+			t.Fatalf("Delete of the last reference: %v", err)
 		}
 		if _, err := store.Get(ctx, res.Hash); !errors.Is(err, content.ErrNotFound) {
-			t.Errorf("Get после исчерпания ссылок: %v, want ErrNotFound", err)
+			t.Errorf("Get after the references are exhausted: %v, want ErrNotFound", err)
 		}
 		if err := store.Delete(ctx, res.Hash); !errors.Is(err, content.ErrNotFound) {
-			t.Errorf("Delete без ссылок: %v, want ErrNotFound", err)
+			t.Errorf("Delete without references: %v, want ErrNotFound", err)
 		}
 	})
 
-	t.Run("Get несуществующего", func(t *testing.T) {
+	t.Run("Get of a nonexistent one", func(t *testing.T) {
 		store := newStore(t)
-		for _, h := range []content.Hash{{}, content.HashOf([]byte("такого контента нет"))} {
+		for _, h := range []content.Hash{{}, content.HashOf([]byte("no such content"))} {
 			if _, err := store.Get(ctx, h); !errors.Is(err, content.ErrNotFound) {
 				t.Errorf("Get(%s): %v, want ErrNotFound", h, err)
 			}
 		}
 	})
 
-	t.Run("Delete несуществующего", func(t *testing.T) {
+	t.Run("Delete of a nonexistent one", func(t *testing.T) {
 		store := newStore(t)
-		h := content.HashOf([]byte("такого контента нет"))
+		h := content.HashOf([]byte("no such content"))
 		if err := store.Delete(ctx, h); !errors.Is(err, content.ErrNotFound) {
 			t.Errorf("Delete(%s): %v, want ErrNotFound", h, err)
 		}
 	})
 
-	t.Run("отмена контекста", func(t *testing.T) {
+	t.Run("context cancellation", func(t *testing.T) {
 		store := newStore(t)
 		canceled, cancel := context.WithCancel(context.Background())
 		cancel()
-		d := []byte("данные отменённой записи")
+		d := []byte("data of a cancelled write")
 		if _, err := store.Put(canceled, d); !errors.Is(err, context.Canceled) {
-			t.Errorf("Put с отменённым ctx: %v, want context.Canceled", err)
+			t.Errorf("Put with a cancelled ctx: %v, want context.Canceled", err)
 		}
 		h := content.HashOf(d)
 		if _, err := store.Get(canceled, h); !errors.Is(err, context.Canceled) {
-			t.Errorf("Get с отменённым ctx: %v, want context.Canceled", err)
+			t.Errorf("Get with a cancelled ctx: %v, want context.Canceled", err)
 		}
 		if err := store.Delete(canceled, h); !errors.Is(err, context.Canceled) {
-			t.Errorf("Delete с отменённым ctx: %v, want context.Canceled", err)
+			t.Errorf("Delete with a cancelled ctx: %v, want context.Canceled", err)
 		}
 		// Отменённые операции не меняют хранилище: контент не появился.
 		if _, err := store.Get(ctx, h); !errors.Is(err, content.ErrNotFound) {
-			t.Errorf("Get после отменённого Put: %v, want ErrNotFound", err)
+			t.Errorf("Get after a cancelled Put: %v, want ErrNotFound", err)
 		}
 	})
 
-	t.Run("параллельные Put одного контента", func(t *testing.T) {
+	t.Run("parallel Puts of one content", func(t *testing.T) {
 		store := newStore(t)
 		const workers = 8
 		var wg sync.WaitGroup
@@ -208,7 +208,7 @@ func StoreContract(t *testing.T, newStore func(t *testing.T) content.ContentStor
 				defer wg.Done()
 				res, err := store.Put(ctx, data[3])
 				if err != nil {
-					t.Errorf("Put горутины %d: %v", i, err)
+					t.Errorf("the goroutine's Put %d: %v", i, err)
 					return
 				}
 				hashes[i] = res.Hash
@@ -218,17 +218,17 @@ func StoreContract(t *testing.T, newStore func(t *testing.T) content.ContentStor
 		want := content.HashOf(data[3])
 		for i, h := range hashes {
 			if h != want {
-				t.Fatalf("горутина %d: hash = %s, want %s", i, h, want)
+				t.Fatalf("goroutine %d: hash = %s, want %s", i, h, want)
 			}
 		}
 		// Каждый Put добавил свою ссылку: workers удалений исчерпывают контент.
 		for i := 0; i < workers; i++ {
 			if err := store.Delete(ctx, want); err != nil {
-				t.Fatalf("Delete %d из %d: %v", i+1, workers, err)
+				t.Fatalf("Delete %d of %d: %v", i+1, workers, err)
 			}
 		}
 		if _, err := store.Get(ctx, want); !errors.Is(err, content.ErrNotFound) {
-			t.Errorf("Get после %d Delete: %v, want ErrNotFound", workers, err)
+			t.Errorf("Get after %d Deletes: %v, want ErrNotFound", workers, err)
 		}
 	})
 }

@@ -53,7 +53,7 @@ func NewQueueGauge(reg *Registry) *prometheus.GaugeVec {
 	}
 	return reg.MustGauge(prometheus.GaugeOpts{
 		Name: "crawler_queue_depth",
-		Help: "Глубина очереди задач: непрочитанный группой остаток (ограничен длиной стрима) и неподтверждённые доставки (backlog групп потребления).",
+		Help: "Task queue depth: the group-unread remainder (capped by the stream length) and unacknowledged deliveries (the consumer groups' backlog).",
 	}, LabelQueue)
 }
 
@@ -65,13 +65,13 @@ func NewQueueGauge(reg *Registry) *prometheus.GaugeVec {
 // successful value.
 func CollectQueueDepths(ctx context.Context, gauge *prometheus.GaugeVec, lenOf LenFunc, streams []string) error {
 	if gauge == nil || lenOf == nil {
-		return errors.New("metrics: сбор глубины очередей: gauge и источник глубины обязательны")
+		return errors.New("metrics: queue depth collection: the gauge and the depth source are required")
 	}
 	var errs []error
 	for _, stream := range streams {
 		n, err := lenOf(ctx, stream)
 		if err != nil {
-			errs = append(errs, fmt.Errorf("metrics: глубина %s: %w", stream, err))
+			errs = append(errs, fmt.Errorf("metrics: depth %s: %w", stream, err))
 			continue
 		}
 		gauge.WithLabelValues(stream).Set(float64(n))
@@ -107,11 +107,11 @@ func CollectQueueLoop(
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	log.Info("коллектор глубины очередей", "streams", streams, "interval", interval.String())
+	log.Info("queue depth collector", "streams", streams, "interval", interval.String())
 
 	pass := func() {
 		if err := CollectQueueDepths(ctx, gauge, lenOf, streams); err != nil && ctx.Err() == nil {
-			log.Warn("сбор глубины очередей", "err", err)
+			log.Warn("queue depth collection", "err", err)
 		}
 	}
 

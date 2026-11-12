@@ -50,21 +50,21 @@ func TestInfraCause(t *testing.T) {
 		{"OOM", oomErr, true},
 		{"LOADING", testRedisError("LOADING Redis is loading the dataset in memory"), true},
 		{"READONLY", testRedisError("READONLY You can't write against a read only replica"), true},
-		{"таймаут сокета", netTimeout, true},
-		{"сброс соединения", connReset, true},
-		{"обрыв соединения", io.EOF, true},
-		{"пул соединений", fmt.Errorf("redis: %w", redis.ErrPoolTimeout), true},
-		{"обёртка OOM", fmt.Errorf("queue: publish в q:http: %w", oomErr), true},
-		{"ошибка обработки", errors.New("db: write result: timeout"), false},
-		{"ответ о команде", errors.New("ERR wrong number of arguments"), false},
-		{"отмена ctx", fmt.Errorf("обработка: %w", context.Canceled), false},
-		{"дедлайн ctx вызывающего", fmt.Errorf("обработка: %w", context.DeadlineExceeded), false},
+		{"socket timeout", netTimeout, true},
+		{"connection reset", connReset, true},
+		{"connection drop", io.EOF, true},
+		{"connection pool", fmt.Errorf("redis: %w", redis.ErrPoolTimeout), true},
+		{"OOM wrapper", fmt.Errorf("queue: publish to q:http: %w", oomErr), true},
+		{"a processing error", errors.New("db: write result: timeout"), false},
+		{"a command error reply", errors.New("ERR wrong number of arguments"), false},
+		{"ctx cancel", fmt.Errorf("processing: %w", context.Canceled), false},
+		{"the caller's ctx deadline", fmt.Errorf("processing: %w", context.DeadlineExceeded), false},
 		{"nil", nil, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			if got := infraCause(c.err); got != c.want {
-				t.Errorf("infraCause(%v) = %v, хочу %v", c.err, got, c.want)
+				t.Errorf("infraCause(%v) = %v, want %v", c.err, got, c.want)
 			}
 		})
 	}
@@ -74,23 +74,23 @@ func TestInfraCause(t *testing.T) {
 // wrapper chains (Processing → OnResult → Publish) and does not arise
 // for processing errors.
 func TestInfraErrorIsInfra(t *testing.T) {
-	infra := &InfraError{Op: "publish в q:analyze", Err: oomErr}
+	infra := &InfraError{Op: "publish to q:analyze", Err: oomErr}
 	if !IsInfra(infra) {
 		t.Fatal("IsInfra(InfraError) = false")
 	}
-	if !IsInfra(fmt.Errorf("queue: запись 1-1 стрима q:render не подтверждена: %w",
-		fmt.Errorf("renderworker: домен a.test: публикация q:analyze: %w", infra))) {
-		t.Error("маркер не прошёл через двойную %w-обёртку")
+	if !IsInfra(fmt.Errorf("queue: entry 1-1 of stream q:render not acknowledged: %w",
+		fmt.Errorf("renderworker: domain a.test: q:analyze publication: %w", infra))) {
+		t.Error("the marker did not pass through the double %w wrap")
 	}
 	if IsInfra(errors.New("db: write result: timeout")) {
-		t.Error("ошибка обработки классифицирована как инфраструктурная")
+		t.Error("a processing error classified as infrastructural")
 	}
-	if !strings.Contains(infra.Error(), "publish в q:analyze") ||
+	if !strings.Contains(infra.Error(), "publish to q:analyze") ||
 		!strings.Contains(infra.Error(), "OOM command not allowed") {
-		t.Errorf("сообщение InfraError без операции/причины: %q", infra.Error())
+		t.Errorf("the InfraError message without the op/cause: %q", infra.Error())
 	}
 	if !errors.Is(infra, oomErr) {
-		t.Error("Unwrap не отдаёт исходную ошибку")
+		t.Error("Unwrap does not return the original error")
 	}
 }
 
@@ -99,18 +99,18 @@ func TestInfraErrorIsInfra(t *testing.T) {
 // notice the mutant).
 func TestPublishRetryDefaults(t *testing.T) {
 	if DefaultPublishRetries != 2 {
-		t.Errorf("DefaultPublishRetries = %d, хочу 2 (T-152: короткая серия повторов)", DefaultPublishRetries)
+		t.Errorf("DefaultPublishRetries = %d, want 2 (T-152: a short retry series)", DefaultPublishRetries)
 	}
 	if DefaultPublishRetryPause != 250*time.Millisecond {
-		t.Errorf("DefaultPublishRetryPause = %s, хочу 250ms", DefaultPublishRetryPause)
+		t.Errorf("DefaultPublishRetryPause = %s, want 250ms", DefaultPublishRetryPause)
 	}
 	q := NewRedisQueue(&fakeRedis{}, RedisOptions{})
 	if q.opt.PublishRetries != DefaultPublishRetries || q.opt.PublishRetryPause != DefaultPublishRetryPause {
-		t.Errorf("нулевые опции повторов не заменены дефолтами: %+v", q.opt)
+		t.Errorf("zero retry options not replaced by the defaults: %+v", q.opt)
 	}
 	q = NewRedisQueue(&fakeRedis{}, RedisOptions{PublishRetries: 1, PublishRetryPause: time.Nanosecond})
 	if q.opt.PublishRetries != 1 || q.opt.PublishRetryPause != time.Nanosecond {
-		t.Errorf("единичные опции заменены дефолтами: %+v", q.opt)
+		t.Errorf("unit options replaced by the defaults: %+v", q.opt)
 	}
 }
 
@@ -127,10 +127,10 @@ func TestPublishRetriesInfra(t *testing.T) {
 	fake := &fakeRedis{addErrs: []error{oomErr, oomErr}}
 	q := NewRedisQueue(fake, RedisOptions{PublishRetryPause: time.Nanosecond})
 	if _, err := q.Publish(context.Background(), StreamDNS, msg); err != nil {
-		t.Fatalf("Publish после повторов: %v", err)
+		t.Fatalf("Publish after retries: %v", err)
 	}
 	if len(fake.adds) != 3 {
-		t.Errorf("вызовов XADD: %d, хочу 3 (1 + 2 повтора)", len(fake.adds))
+		t.Errorf("XADD calls: %d, want 3 (1 + 2 retries)", len(fake.adds))
 	}
 
 	// A persistent OOM: InfraError, the retries are exhausted
@@ -139,13 +139,13 @@ func TestPublishRetriesInfra(t *testing.T) {
 	q = NewRedisQueue(fake, RedisOptions{PublishRetries: 2, PublishRetryPause: time.Nanosecond})
 	_, err := q.Publish(context.Background(), StreamDNS, msg)
 	if !IsInfra(err) {
-		t.Fatalf("устойчивый сбой: %v, хочу InfraError", err)
+		t.Fatalf("a sustained failure: %v, want InfraError", err)
 	}
-	if !strings.Contains(err.Error(), "publish в q:dns") {
-		t.Errorf("ошибка без операции: %q", err.Error())
+	if !strings.Contains(err.Error(), "publish to q:dns") {
+		t.Errorf("the error without the op: %q", err.Error())
 	}
 	if len(fake.adds) != 3 {
-		t.Errorf("вызовов XADD: %d, хочу 3 (1 + PublishRetries 2)", len(fake.adds))
+		t.Errorf("XADD calls: %d, want 3 (1 + PublishRetries 2)", len(fake.adds))
 	}
 
 	// A non-infrastructure XADD error — without retries (a retry would
@@ -154,10 +154,10 @@ func TestPublishRetriesInfra(t *testing.T) {
 	q = NewRedisQueue(fake, RedisOptions{PublishRetryPause: time.Nanosecond})
 	_, err = q.Publish(context.Background(), StreamDNS, msg)
 	if err == nil || IsInfra(err) {
-		t.Fatalf("не-инфраструктурная ошибка: %v", err)
+		t.Fatalf("a non-infrastructure error: %v", err)
 	}
 	if len(fake.adds) != 1 {
-		t.Errorf("вызовов XADD: %d, хочу 1 (повтора нет)", len(fake.adds))
+		t.Errorf("XADD calls: %d, want 1 (no retry)", len(fake.adds))
 	}
 
 	// A ctx cancellation in the pause between retries: no new XADD, the
@@ -175,13 +175,13 @@ func TestPublishRetriesInfra(t *testing.T) {
 	select {
 	case err := <-done:
 		if !IsInfra(err) {
-			t.Fatalf("отмена в паузе: %v, хочу InfraError", err)
+			t.Fatalf("a cancel during the pause: %v, want InfraError", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("Publish не вышел по отмене ctx")
+		t.Fatal("Publish did not exit on ctx cancel")
 	}
 	if len(fake.adds) != 1 {
-		t.Errorf("вызовов XADD после отмены: %d, хочу 1", len(fake.adds))
+		t.Errorf("XADD calls after the cancel: %d, want 1", len(fake.adds))
 	}
 }
 
@@ -194,17 +194,17 @@ func TestAckInfraError(t *testing.T) {
 	q := NewRedisQueue(fake, RedisOptions{})
 	err := q.Ack(context.Background(), StreamHTTP, "http-worker", "1-1")
 	if !IsInfra(err) {
-		t.Fatalf("Ack при OOM: %v, хочу InfraError", err)
+		t.Fatalf("Ack under OOM: %v, want InfraError", err)
 	}
 	if !strings.Contains(err.Error(), "ack q:http") {
-		t.Errorf("ошибка без операции: %q", err.Error())
+		t.Errorf("the error without the op: %q", err.Error())
 	}
 
 	fake = &fakeRedis{ackErr: errors.New("ERR no such key")}
 	q = NewRedisQueue(fake, RedisOptions{})
 	err = q.Ack(context.Background(), StreamHTTP, "http-worker", "1-1")
 	if err == nil || IsInfra(err) {
-		t.Fatalf("Ack с рядовой ошибкой: %v", err)
+		t.Fatalf("Ack with a regular error: %v", err)
 	}
 }
 
@@ -266,20 +266,20 @@ func TestReliabWritable(t *testing.T) {
 
 	fake.setProbeErr(oomErr)
 	if r.Writable(context.Background()) {
-		t.Error("Writable при падающей пробе = true")
+		t.Error("Writable with a failing probe = true")
 	}
 	fake.setProbeErr(nil)
 	if !r.Writable(context.Background()) {
-		t.Error("Writable при проходящей пробе = false")
+		t.Error("Writable with a passing probe = false")
 	}
 	if fake.setCount() != 2 {
-		t.Errorf("проб выполнено %d, хочу 2", fake.setCount())
+		t.Errorf("probes made %d, want 2", fake.setCount())
 	}
 
 	// Without the probe (the client cannot SET) the gate is transparent.
 	r2 := NewReliab(&fakeClaimRedis{}, NewRedisQueue(&fakeClaimRedis{}, RedisOptions{}), ReliabOptions{})
 	if !r2.Writable(context.Background()) {
-		t.Error("Writable без пробы = false (гейт обязан быть прозрачным)")
+		t.Error("Writable without a probe = false (the gate must be transparent)")
 	}
 }
 
@@ -316,7 +316,7 @@ func TestRecoverLoopGatedByProbe(t *testing.T) {
 		select {
 		case <-done:
 		case <-time.After(5 * time.Second):
-			t.Fatal("RecoverLoop не остановился по отмене ctx")
+			t.Fatal("RecoverLoop did not stop on ctx cancel")
 		}
 	}
 	defer stop()
@@ -325,14 +325,14 @@ func TestRecoverLoopGatedByProbe(t *testing.T) {
 	// processing is not called.
 	time.Sleep(250 * time.Millisecond)
 	if n := fake.setCount(); n < 2 {
-		t.Fatalf("проб записи %d, хочу ≥2 (гейт вообще не опрашивает пробу)", n)
+		t.Fatalf("write probes %d, want ≥2 (the gate does not poll the probe at all)", n)
 	}
 	if n := fake.claimCount(); n != 0 {
-		t.Fatalf("клеймов при недоступной записи: %d, хочу 0 (попытки не расходуются)", n)
+		t.Fatalf("claims with writes unavailable: %d, want 0 (attempts are not spent)", n)
 	}
 	select {
 	case d := <-processed:
-		t.Fatalf("обработка при недоступной записи: %+v", d)
+		t.Fatalf("processing with writes unavailable: %+v", d)
 	default:
 	}
 
@@ -343,12 +343,12 @@ func TestRecoverLoopGatedByProbe(t *testing.T) {
 	select {
 	case d := <-processed:
 		if d.ID != "1718-0" {
-			t.Errorf("обработана чужая доставка: %+v", d)
+			t.Errorf("a foreign delivery processed: %+v", d)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("после восстановления записи клейм не вернул доставку в работу")
+		t.Fatal("after the write recovery the claim did not return the delivery to work")
 	}
 	if n := fake.claimCount(); n == 0 {
-		t.Error("клейм после восстановления не выполнен")
+		t.Error("the claim after the recovery not made")
 	}
 }

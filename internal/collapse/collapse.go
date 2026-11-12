@@ -252,7 +252,7 @@ type Spec struct {
 func SpecOf(z ZoneRow) (Spec, error) {
 	i := strings.LastIndexByte(z.Name, '.')
 	if i <= 0 || i == len(z.Name)-1 {
-		return Spec{}, fmt.Errorf("имя зоны %q — не составное (пустая метка зоны или префикса)", z.Name)
+		return Spec{}, fmt.Errorf("zone name %q is not compound (an empty zone or prefix label)", z.Name)
 	}
 	return Spec{ID: z.ID, Name: z.Name, TLD: z.Name[i+1:], Prefix: z.Name[:i]}, nil
 }
@@ -285,11 +285,11 @@ type Result struct {
 // список для dry-run, цикла переноса и предусловия.
 func Inventory(ctx context.Context, pool db.DB, allowlist []string) ([]ZoneRow, error) {
 	if pool == nil {
-		return nil, errors.New("collapse: инвентаризация: пул не задан")
+		return nil, errors.New("collapse: inventory: pool not set")
 	}
 	rows, err := pool.Query(ctx, InventorySQL, allowlistArg(allowlist))
 	if err != nil {
-		return nil, fmt.Errorf("collapse: инвентаризация 2LD-зон: %w", err)
+		return nil, fmt.Errorf("collapse: 2LD zone inventory: %w", err)
 	}
 	defer rows.Close()
 	var zones []ZoneRow
@@ -297,12 +297,12 @@ func Inventory(ctx context.Context, pool db.DB, allowlist []string) ([]ZoneRow, 
 		var z ZoneRow
 		if err := rows.Scan(&z.ID, &z.Name, &z.Total, &z.Domains, &z.Results,
 			&z.Findings, &z.History, &z.Files, &z.Parts); err != nil {
-			return nil, fmt.Errorf("collapse: инвентаризация 2LD-зон: чтение: %w", err)
+			return nil, fmt.Errorf("collapse: 2LD zone inventory: scan: %w", err)
 		}
 		zones = append(zones, z)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("collapse: инвентаризация 2LD-зон: %w", err)
+		return nil, fmt.Errorf("collapse: 2LD zone inventory: %w", err)
 	}
 	return zones, nil
 }
@@ -324,7 +324,7 @@ func QueuedCounts(ctx context.Context, pool db.DB, ids []int16) (map[int16]int64
 	}
 	rows, err := pool.Query(ctx, QueuedSQL, ids, int16(model.CheckStateQueued))
 	if err != nil {
-		return nil, fmt.Errorf("collapse: домены в очереди: %w", err)
+		return nil, fmt.Errorf("collapse: queued domains: %w", err)
 	}
 	defer rows.Close()
 	queued := make(map[int16]int64)
@@ -332,12 +332,12 @@ func QueuedCounts(ctx context.Context, pool db.DB, ids []int16) (map[int16]int64
 		var id int16
 		var n int64
 		if err := rows.Scan(&id, &n); err != nil {
-			return nil, fmt.Errorf("collapse: домены в очереди: чтение: %w", err)
+			return nil, fmt.Errorf("collapse: queued domains: scan: %w", err)
 		}
 		queued[id] = n
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("collapse: домены в очереди: %w", err)
+		return nil, fmt.Errorf("collapse: queued domains: %w", err)
 	}
 	return queued, nil
 }
@@ -348,7 +348,7 @@ func QueuedCounts(ctx context.Context, pool db.DB, ids []int16) (map[int16]int64
 // в состоянии, с которого повтор команды продолжается.
 func Zone(ctx context.Context, conn Conn, spec Spec, batch int) (Result, error) {
 	if conn == nil {
-		return Result{}, fmt.Errorf("зона %s: соединение не задано", spec.Name)
+		return Result{}, fmt.Errorf("zone %s: connection not set", spec.Name)
 	}
 	if batch <= 0 {
 		batch = DefaultBatch
@@ -364,18 +364,18 @@ func Zone(ctx context.Context, conn Conn, spec Spec, batch int) (Result, error) 
 
 	// Шаг 2 — партиции TLD до переноса (строки ложатся сразу в них).
 	if _, err := conn.Exec(ctx, CallPartitionsSQL, tid); err != nil {
-		return res, fmt.Errorf("зона %s: партиции зоны %s (id %d): %w", spec.Name, spec.TLD, tid, err)
+		return res, fmt.Errorf("zone %s: partitions of zone %s (id %d): %w", spec.Name, spec.TLD, tid, err)
 	}
 
 	// Шаг 3 — moving_ids: замороженное множество переносимых id.
 	if _, err := conn.Exec(ctx, movingDropSQL); err != nil {
-		return res, fmt.Errorf("зона %s: пересоздание moving_ids: %w", spec.Name, err)
+		return res, fmt.Errorf("zone %s: recreating moving_ids: %w", spec.Name, err)
 	}
 	if _, err := conn.Exec(ctx, movingCreateSQL, spec.ID); err != nil {
-		return res, fmt.Errorf("зона %s: moving_ids: %w", spec.Name, err)
+		return res, fmt.Errorf("zone %s: moving_ids: %w", spec.Name, err)
 	}
 	if _, err := conn.Exec(ctx, movingIndexSQL); err != nil {
-		return res, fmt.Errorf("зона %s: индекс moving_ids: %w", spec.Name, err)
+		return res, fmt.Errorf("zone %s: moving_ids index: %w", spec.Name, err)
 	}
 
 	// Спот-чек §7.5: первый домен зоны до переноса (после — пусто,
@@ -416,7 +416,7 @@ func Zone(ctx context.Context, conn Conn, spec Spec, batch int) (Result, error) 
 
 	// laravel_history — одним оператором на зону (без партиций).
 	if tag, err := conn.Exec(ctx, moveHistorySQL, tid, spec.ID); err != nil {
-		return res, fmt.Errorf("зона %s: laravel_history: %w", spec.Name, err)
+		return res, fmt.Errorf("zone %s: laravel_history: %w", spec.Name, err)
 	} else {
 		res.History = tag.RowsAffected()
 	}
@@ -424,12 +424,12 @@ func Zone(ctx context.Context, conn Conn, spec Spec, batch int) (Result, error) 
 	// Шаг 5 — дедуп-журнал ingest_files: дубль содержимого в T удаляется,
 	// остаток перепривязывается.
 	if tag, err := conn.Exec(ctx, filesDedupeSQL, spec.ID, tid); err != nil {
-		return res, fmt.Errorf("зона %s: дедуп ingest_files: %w", spec.Name, err)
+		return res, fmt.Errorf("zone %s: ingest_files dedup: %w", spec.Name, err)
 	} else {
 		res.FilesDupes = tag.RowsAffected()
 	}
 	if tag, err := conn.Exec(ctx, filesMoveSQL, tid, spec.ID); err != nil {
-		return res, fmt.Errorf("зона %s: ingest_files: %w", spec.Name, err)
+		return res, fmt.Errorf("zone %s: ingest_files: %w", spec.Name, err)
 	} else {
 		res.Files = tag.RowsAffected()
 	}
@@ -443,9 +443,9 @@ func Zone(ctx context.Context, conn Conn, spec Spec, batch int) (Result, error) 
 
 	// Шаг 7 — строка зоны.
 	if tag, err := conn.Exec(ctx, ZoneDeleteSQL, spec.ID); err != nil {
-		return res, fmt.Errorf("зона %s: удаление строки: %w", spec.Name, err)
+		return res, fmt.Errorf("zone %s: row deletion: %w", spec.Name, err)
 	} else if tag.RowsAffected() != 1 {
-		return res, fmt.Errorf("зона %s: удаление строки: затронуто %d строк, ожидалась 1", spec.Name, tag.RowsAffected())
+		return res, fmt.Errorf("zone %s: row deletion: %d rows affected, want 1", spec.Name, tag.RowsAffected())
 	}
 	return res, nil
 }
@@ -456,17 +456,17 @@ func Zone(ctx context.Context, conn Conn, spec Spec, batch int) (Result, error) 
 func ensureZone(ctx context.Context, conn db.DB, name string) (id int16, created bool, err error) {
 	rows, err := conn.Query(ctx, ZoneIDByNameSQL, name)
 	if err != nil {
-		return 0, false, fmt.Errorf("зона %s: чтение справочника: %w", name, err)
+		return 0, false, fmt.Errorf("zone %s: reference table read: %w", name, err)
 	}
 	defer rows.Close()
 	if rows.Next() {
 		if err := rows.Scan(&id); err != nil {
-			return 0, false, fmt.Errorf("зона %s: чтение справочника: %w", name, err)
+			return 0, false, fmt.Errorf("zone %s: reference table read: %w", name, err)
 		}
 		return id, false, rows.Err()
 	}
 	if err := rows.Err(); err != nil {
-		return 0, false, fmt.Errorf("зона %s: чтение справочника: %w", name, err)
+		return 0, false, fmt.Errorf("zone %s: reference table read: %w", name, err)
 	}
 	// unicode-форма (стиль zones sync): только отличающаяся от punycode.
 	unicode := ""
@@ -475,14 +475,14 @@ func ensureZone(ctx context.Context, conn db.DB, name string) (id int16, created
 	}
 	irows, err := conn.Query(ctx, ZoneInsertSQL, name, unicode)
 	if err != nil {
-		return 0, false, fmt.Errorf("зона %s: вставка зоны %s: %w", name, name, err)
+		return 0, false, fmt.Errorf("zone %s: inserting zone %s: %w", name, name, err)
 	}
 	defer irows.Close()
 	if !irows.Next() {
-		return 0, false, fmt.Errorf("зона %s: вставка зоны %s: строка не вставлена", name, name)
+		return 0, false, fmt.Errorf("zone %s: inserting zone %s: no row inserted", name, name)
 	}
 	if err := irows.Scan(&id); err != nil {
-		return 0, false, fmt.Errorf("зона %s: вставка зоны %s: чтение: %w", name, name, err)
+		return 0, false, fmt.Errorf("zone %s: inserting zone %s: scan: %w", name, name, err)
 	}
 	return id, true, irows.Err()
 }
@@ -492,18 +492,18 @@ func ensureZone(ctx context.Context, conn db.DB, name string) (id int16, created
 func firstZoneLabel(ctx context.Context, conn db.DB, zoneID int16) (string, bool, error) {
 	rows, err := conn.Query(ctx, spotLabelSQL, zoneID)
 	if err != nil {
-		return "", false, fmt.Errorf("зона %d: первый домен: %w", zoneID, err)
+		return "", false, fmt.Errorf("zone %d: first domain: %w", zoneID, err)
 	}
 	defer rows.Close()
 	if rows.Next() {
 		var label string
 		if err := rows.Scan(&label); err != nil {
-			return "", false, fmt.Errorf("зона %d: первый домен: чтение: %w", zoneID, err)
+			return "", false, fmt.Errorf("zone %d: first domain: scan: %w", zoneID, err)
 		}
 		return label, true, rows.Err()
 	}
 	if err := rows.Err(); err != nil {
-		return "", false, fmt.Errorf("зона %d: первый домен: %w", zoneID, err)
+		return "", false, fmt.Errorf("zone %d: first domain: %w", zoneID, err)
 	}
 	return "", false, nil
 }
@@ -515,14 +515,14 @@ func firstZoneLabel(ctx context.Context, conn db.DB, zoneID int16) (string, bool
 func movingChunk(ctx context.Context, conn db.DB, after int64, limit int) ([]int64, error) {
 	rows, err := conn.Query(ctx, movingChunkSQL, after, limit)
 	if err != nil {
-		return nil, fmt.Errorf("moving_ids: пачка: %w", err)
+		return nil, fmt.Errorf("moving_ids: chunk: %w", err)
 	}
 	defer rows.Close()
 	var ids []int64
 	for rows.Next() {
 		var id int64
 		if err := rows.Scan(&id); err != nil {
-			return nil, fmt.Errorf("moving_ids: пачка: чтение: %w", err)
+			return nil, fmt.Errorf("moving_ids: chunk: scan: %w", err)
 		}
 		ids = append(ids, id)
 	}
@@ -543,7 +543,7 @@ func moveBatch(ctx context.Context, conn Conn, spec Spec, tid int16, lo, hi int6
 	var m batchMoved
 	tx, err := conn.Begin(ctx)
 	if err != nil {
-		return m, fmt.Errorf("зона %s: батч [%d, %d]: транзакция: %w", spec.Name, lo, hi, err)
+		return m, fmt.Errorf("zone %s: batch [%d, %d]: transaction: %w", spec.Name, lo, hi, err)
 	}
 	// Откат безусловно: после Commit — no-op (стиль monitor, T-044).
 	defer func() { _ = tx.Rollback(ctx) }()
@@ -561,12 +561,12 @@ func moveBatch(ctx context.Context, conn Conn, spec Spec, tid int16, lo, hi int6
 	for _, st := range steps {
 		tag, err := tx.Exec(ctx, st.sql, st.args...)
 		if err != nil {
-			return m, fmt.Errorf("зона %s: батч [%d, %d]: %w", spec.Name, lo, hi, err)
+			return m, fmt.Errorf("zone %s: batch [%d, %d]: %w", spec.Name, lo, hi, err)
 		}
 		*st.dst = tag.RowsAffected()
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return m, fmt.Errorf("зона %s: батч [%d, %d]: фиксация: %w", spec.Name, lo, hi, err)
+		return m, fmt.Errorf("zone %s: batch [%d, %d]: commit: %w", spec.Name, lo, hi, err)
 	}
 	return m, nil
 }
@@ -575,35 +575,35 @@ func moveBatch(ctx context.Context, conn Conn, spec Spec, tid int16, lo, hi int6
 // выборка партиций (ZonePartsSQL) и DROP по каждой. Имена — из каталога,
 // экранирование идентификатора — pgx.Identifier (ввод извне недопустим).
 func dropZonePartitions(ctx context.Context, conn db.DB, spec Spec) ([]string, error) {
-	what := fmt.Sprintf("зона %s: партиции: ", spec.Name)
+	what := fmt.Sprintf("zone %s: partitions: ", spec.Name)
 
 	left, err := zoneLeft(ctx, conn, spec.ID)
 	if err != nil {
-		return nil, fmt.Errorf("%sостаток: %w", what, err)
+		return nil, fmt.Errorf("%sleftover: %w", what, err)
 	}
 	tables := []string{"domains", "subdomain_results", "laravel_domains", "laravel_findings", "laravel_history", "ingest_files"}
 	for i, n := range left {
 		if n > 0 {
-			return nil, fmt.Errorf("%sперенос неполон: в зоне осталось строк %s — %d (аномалия данных; DROP удалил бы их)",
+			return nil, fmt.Errorf("%sthe move is incomplete: %s rows remain in the zone — %d (a data anomaly; DROP would delete them)",
 				what, tables[i], n)
 		}
 	}
 
 	prows, err := conn.Query(ctx, ZonePartsSQL, spec.ID)
 	if err != nil {
-		return nil, fmt.Errorf("%sвыборка: %w", what, err)
+		return nil, fmt.Errorf("%sselection: %w", what, err)
 	}
 	defer prows.Close()
 	var parts []string
 	for prows.Next() {
 		var parent, part string
 		if err := prows.Scan(&parent, &part); err != nil {
-			return nil, fmt.Errorf("%sвыборка: чтение: %w", what, err)
+			return nil, fmt.Errorf("%sselection: scan: %w", what, err)
 		}
 		parts = append(parts, part)
 	}
 	if err := prows.Err(); err != nil {
-		return nil, fmt.Errorf("%sвыборка: %w", what, err)
+		return nil, fmt.Errorf("%sselection: %w", what, err)
 	}
 	for _, part := range parts {
 		if _, err := conn.Exec(ctx, "DROP TABLE "+pgx.Identifier{part}.Sanitize()); err != nil {
@@ -624,10 +624,10 @@ func zoneLeft(ctx context.Context, conn db.DB, zoneID int16) (left [6]int64, err
 	}
 	defer rows.Close()
 	if !rows.Next() {
-		return left, errors.New("пустой ответ агрегата")
+		return left, errors.New("empty aggregate answer")
 	}
 	if err := rows.Scan(&left[0], &left[1], &left[2], &left[3], &left[4], &left[5]); err != nil {
-		return left, fmt.Errorf("чтение: %w", err)
+		return left, fmt.Errorf("scan: %w", err)
 	}
 	return left, rows.Err()
 }
@@ -669,23 +669,23 @@ func PostChecks(ctx context.Context, pool db.DB, allowlist []string) (zonesLeft 
 func zonesLeftCount(ctx context.Context, pool db.DB, allowlist []string) (int64, error) {
 	zrows, err := pool.Query(ctx, CheckZonesLeftSQL, allowlistArg(allowlist))
 	if err != nil {
-		return 0, fmt.Errorf("collapse: пост-проверка 2LD-зон: %w", err)
+		return 0, fmt.Errorf("collapse: 2LD zone post-check: %w", err)
 	}
 	defer zrows.Close()
 	if !zrows.Next() {
 		// Сначала сбой чтения: обрыв соединения — не «пусто» (стиль
 		// monitor.readDailyValue, ревью T-217 P3-4).
 		if err := zrows.Err(); err != nil {
-			return 0, fmt.Errorf("collapse: пост-проверка 2LD-зон: %w", err)
+			return 0, fmt.Errorf("collapse: 2LD zone post-check: %w", err)
 		}
-		return 0, fmt.Errorf("collapse: пост-проверка 2LD-зон: пустой ответ агрегата")
+		return 0, fmt.Errorf("collapse: 2LD zone post-check: empty aggregate answer")
 	}
 	var zonesLeft int64
 	if err := zrows.Scan(&zonesLeft); err != nil {
-		return 0, fmt.Errorf("collapse: пост-проверка 2LD-зон: чтение: %w", err)
+		return 0, fmt.Errorf("collapse: 2LD zone post-check: scan: %w", err)
 	}
 	if err := zrows.Err(); err != nil {
-		return 0, fmt.Errorf("collapse: пост-проверка 2LD-зон: %w", err)
+		return 0, fmt.Errorf("collapse: 2LD zone post-check: %w", err)
 	}
 	return zonesLeft, nil
 }
@@ -695,23 +695,23 @@ func zonesLeftCount(ctx context.Context, pool db.DB, allowlist []string) (int64,
 func orphansCounts(ctx context.Context, pool db.DB) (Orphans, error) {
 	orows, err := pool.Query(ctx, CheckOrphansSQL)
 	if err != nil {
-		return Orphans{}, fmt.Errorf("collapse: пост-проверка сирот: %w", err)
+		return Orphans{}, fmt.Errorf("collapse: orphan post-check: %w", err)
 	}
 	defer orows.Close()
 	if !orows.Next() {
 		// Сначала сбой чтения — не «пусто» (пара zonesLeftCount,
 		// ревью T-217 P3-4).
 		if err := orows.Err(); err != nil {
-			return Orphans{}, fmt.Errorf("collapse: пост-проверка сирот: %w", err)
+			return Orphans{}, fmt.Errorf("collapse: orphan post-check: %w", err)
 		}
-		return Orphans{}, fmt.Errorf("collapse: пост-проверка сирот: пустой ответ агрегата")
+		return Orphans{}, fmt.Errorf("collapse: orphan post-check: empty aggregate answer")
 	}
 	var orphans Orphans
 	if err := orows.Scan(&orphans.Domains, &orphans.Results, &orphans.Laravel, &orphans.Findings, &orphans.History); err != nil {
-		return Orphans{}, fmt.Errorf("collapse: пост-проверка сирот: чтение: %w", err)
+		return Orphans{}, fmt.Errorf("collapse: orphan post-check: scan: %w", err)
 	}
 	if err := orows.Err(); err != nil {
-		return Orphans{}, fmt.Errorf("collapse: пост-проверка сирот: %w", err)
+		return Orphans{}, fmt.Errorf("collapse: orphan post-check: %w", err)
 	}
 	return orphans, nil
 }
@@ -721,21 +721,21 @@ func orphansCounts(ctx context.Context, pool db.DB) (Orphans, error) {
 func SpotCheck(ctx context.Context, pool db.DB, name, wantZone, wantLabel string) error {
 	rows, err := pool.Query(ctx, SpotCheckSQL, name)
 	if err != nil {
-		return fmt.Errorf("collapse: спот-чек %s: %w", name, err)
+		return fmt.Errorf("collapse: spot check %s: %w", name, err)
 	}
 	defer rows.Close()
 	if !rows.Next() {
-		return fmt.Errorf("collapse: спот-чек %s: domain_info не нашёл домен", name)
+		return fmt.Errorf("collapse: spot check %s: domain_info found no domain", name)
 	}
 	var zone, label string
 	if err := rows.Scan(&zone, &label); err != nil {
-		return fmt.Errorf("collapse: спот-чек %s: чтение: %w", name, err)
+		return fmt.Errorf("collapse: spot check %s: scan: %w", name, err)
 	}
 	if err := rows.Err(); err != nil {
-		return fmt.Errorf("collapse: спот-чек %s: %w", name, err)
+		return fmt.Errorf("collapse: spot check %s: %w", name, err)
 	}
 	if zone != wantZone || label != wantLabel {
-		return fmt.Errorf("collapse: спот-чек %s: зона %q, label %q; хочу зону %q, label %q",
+		return fmt.Errorf("collapse: spot check %s: zone %q, label %q; want zone %q, label %q",
 			name, zone, label, wantZone, wantLabel)
 	}
 	return nil
@@ -761,7 +761,7 @@ func dropMoving(conn Conn, timeout time.Duration, log *slog.Logger) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	if _, err := conn.Exec(ctx, movingDropSQL); err != nil {
-		log.Warn("collapse: финальная уборка moving_ids не выполнена — temp-таблица останется в сессии соединения, следующий запуск зоны пересоздаст её",
+		log.Warn("collapse: the final moving_ids cleanup not done — the temp table will stay in the connection's session, the next zone run will recreate it",
 			"err", err)
 	}
 }
@@ -776,7 +776,7 @@ func dropMoving(conn Conn, timeout time.Duration, log *slog.Logger) {
 // в его сессии), чтения — через пул.
 func Run(ctx context.Context, pool *pgxpool.Pool, opts Options, stdout io.Writer) error {
 	if pool == nil {
-		return errors.New("collapse: пул не задан")
+		return errors.New("collapse: pool not set")
 	}
 	log := opts.Log
 	if log == nil {
@@ -793,7 +793,7 @@ func Run(ctx context.Context, pool *pgxpool.Pool, opts Options, stdout io.Writer
 		return err
 	}
 	if len(zones) == 0 {
-		out(stdout, "2LD-зон вне allowlist нет — сворачивать нечего (no-op)\n")
+		out(stdout, "no 2LD zones outside the allowlist — nothing to collapse (no-op)\n")
 		return nil
 	}
 
@@ -824,19 +824,19 @@ func Run(ctx context.Context, pool *pgxpool.Pool, opts Options, stdout io.Writer
 				parts = append(parts, fmt.Sprintf("%s — %d", z.Name, n))
 			}
 		}
-		out(stdout, "домены в очереди (check_state = 1) в затрагиваемых зонах: %s\n", strings.Join(parts, ", "))
+		out(stdout, "queued domains (check_state = 1) in the affected zones: %s\n", strings.Join(parts, ", "))
 		if !opts.Apply {
-			out(stdout, "дренируйте очереди перед переносом (runbook ТЗТ §8.2) или повторите с --force\n")
+			out(stdout, "drain the queues before the move (the TLD-only-zones runbook §8.2) or repeat with --force\n")
 		} else if !opts.Force {
-			return fmt.Errorf("в затрагиваемых зонах есть домены в очереди (check_state = 1): %s; дренируйте очереди (runbook ТЗТ §8.2) или повторите с --force",
+			return fmt.Errorf("the affected zones have queued domains (check_state = 1): %s; drain the queues (the TLD-only-zones runbook §8.2) or repeat with --force",
 				strings.Join(parts, ", "))
 		} else {
-			out(stdout, "продолжение по --force (после разбора очередей оператором, runbook ТЗТ §8.2)\n")
+			out(stdout, "continuing with --force (after the operator's queue triage, the TLD-only-zones runbook §8.2)\n")
 		}
 	}
 
 	if !opts.Apply {
-		out(stdout, "dry-run: данные не изменены; перенос выполнит crawlerctl zones collapse --apply\n")
+		out(stdout, "dry-run: no data changed; the move will be done by crawlerctl zones collapse --apply\n")
 		return nil
 	}
 
@@ -844,7 +844,7 @@ func Run(ctx context.Context, pool *pgxpool.Pool, opts Options, stdout io.Writer
 	// инвентаризации; сбой останавливает команду с именем зоны.
 	conn, err := pool.Acquire(ctx)
 	if err != nil {
-		return fmt.Errorf("collapse: соединение переноса: %w", err)
+		return fmt.Errorf("collapse: move connection: %w", err)
 	}
 	defer func() {
 		// Финальная уборка moving_ids (§7.2): temp-таблица пережила бы
@@ -870,11 +870,11 @@ func Run(ctx context.Context, pool *pgxpool.Pool, opts Options, stdout io.Writer
 	// реконсиляция (T-178) авторитетно пересчитывает TLD-зоны и
 	// глобальные кумулятивы; --skip-reconcile оставляет это monitor.
 	if opts.SkipReconcile {
-		out(stdout, "реконсиляция счётчиков пропущена (--skip-reconcile): колонки зон пересчитает первый проход monitor\n")
+		out(stdout, "counter reconciliation skipped (--skip-reconcile): the first monitor pass will recompute the zone columns\n")
 	} else {
 		rec, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{})
 		if err != nil {
-			return fmt.Errorf("collapse: реконсиляция счётчиков: %w", err)
+			return fmt.Errorf("collapse: counter reconciliation: %w", err)
 		}
 		drifted := 0
 		for _, p := range rec.Positions {
@@ -884,7 +884,7 @@ func Run(ctx context.Context, pool *pgxpool.Pool, opts Options, stdout io.Writer
 			drifted++
 			out(stdout, "  %-32s %12d → %d (Δ%d)\n", p.Counter, p.Old, p.New, p.Drift())
 		}
-		out(stdout, "реконсиляция счётчиков: перезаписано зон %d, позиций с дрейфом %d\n", rec.Zones, drifted)
+		out(stdout, "counter reconciliation: %d zones rewritten, %d positions with drift\n", rec.Zones, drifted)
 	}
 
 	// Пост-проверки §7.5.
@@ -892,20 +892,20 @@ func Run(ctx context.Context, pool *pgxpool.Pool, opts Options, stdout io.Writer
 	if err != nil {
 		return err
 	}
-	out(stdout, "пост-проверки: 2LD-зон вне allowlist: %d; сиротских zone_id: domains %d, subdomain_results %d, laravel_domains %d, laravel_findings %d, laravel_history %d\n",
+	out(stdout, "post-checks: 2LD zones outside the allowlist: %d; orphan zone_id: domains %d, subdomain_results %d, laravel_domains %d, laravel_findings %d, laravel_history %d\n",
 		zonesLeft, orphans.Domains, orphans.Results, orphans.Laravel, orphans.Findings, orphans.History)
 	if zonesLeft != 0 || orphans.Any() {
-		return fmt.Errorf("пост-проверки не сошлись: 2LD-зон %d, сирот %+v", zonesLeft, orphans)
+		return fmt.Errorf("post-checks do not add up: %d 2LD zones, orphans %+v", zonesLeft, orphans)
 	}
 	if !opts.SkipReconcile {
 		mismatch, err := monitor.VerifyCounters(ctx, pool, monitor.VerifyOptions{})
 		if err != nil {
-			return fmt.Errorf("collapse: сверка счётчиков: %w", err)
+			return fmt.Errorf("collapse: counter cross-check: %w", err)
 		}
 		if len(mismatch) > 0 {
-			return fmt.Errorf("collapse: счётчики зон ≠ агрегат: %d позиций с дрейфом (лечит crawlerctl counters recount)", len(mismatch))
+			return fmt.Errorf("collapse: zone counters ≠ the aggregate: %d positions with drift (crawlerctl counters recount fixes it)", len(mismatch))
 		}
-		out(stdout, "счётчики зон = агрегат: расхождений нет\n")
+		out(stdout, "zone counters = the aggregate: no mismatches\n")
 	}
 
 	// Спот-чек §7.5: по одному перенесённому имени на зону с доменами.
@@ -917,9 +917,9 @@ func Run(ctx context.Context, pool *pgxpool.Pool, opts Options, stdout io.Writer
 		if err := SpotCheck(ctx, pool, res.SpotName, specs[i].TLD, res.SpotLabel); err != nil {
 			return err
 		}
-		out(stdout, "спот-чек %s: зона %s, label %s — ок\n", res.SpotName, specs[i].TLD, res.SpotLabel)
+		out(stdout, "spot check %s: zone %s, label %s — ok\n", res.SpotName, specs[i].TLD, res.SpotLabel)
 	}
-	out(stdout, "перенос завершён: 2LD-зон %d\n", len(zones))
+	out(stdout, "the move is finished: %d 2LD zones\n", len(zones))
 	return nil
 }
 
@@ -932,13 +932,13 @@ func out(w io.Writer, format string, a ...any) {
 // printPlan — таблица плана §7.4 в стиле zones list: числовые колонки
 // вправо, текстовые влево; итог — по каждой целевой TLD.
 func printPlan(w io.Writer, zones []ZoneRow) {
-	head := []string{"зона", "TLD", "доменов", "результатов", "находок", "история", "файлов", "партиции"}
+	head := []string{"zone", "TLD", "domains", "results", "findings", "history", "files", "partitions"}
 	rows := [][]string{head}
 	for _, z := range zones {
 		tld := zoneTLD(z.Name)
 		parts := "default"
 		if z.Parts {
-			parts = "есть"
+			parts = "yes"
 		}
 		rows = append(rows, []string{
 			z.Name, tld,
@@ -986,11 +986,11 @@ func printPlan(w io.Writer, zones []ZoneRow) {
 				n++
 			}
 		}
-		word := "зона"
+		word := "zone"
 		if n > 1 {
-			word = "зоны"
+			word = "zones"
 		}
-		out(w, "итого: 2LD-зон %d, доменов %d → %s %s\n", n, byTLD[tld], word, tld)
+		out(w, "total: %d 2LD zones, %d domains → %s %s\n", n, byTLD[tld], word, tld)
 	}
 }
 
@@ -1004,13 +1004,13 @@ func zoneTLD(name string) string {
 func printMoved(w io.Writer, r Result) {
 	newMark := ""
 	if r.TLDZoneNew {
-		newMark = " (зона создана)"
+		newMark = " (zone created)"
 	}
-	parts := "партиций нет"
+	parts := "no partitions"
 	if len(r.DroppedParts) > 0 {
-		parts = fmt.Sprintf("партиции др. %d: %s", len(r.DroppedParts), strings.Join(r.DroppedParts, ", "))
+		parts = fmt.Sprintf("%d partitions dropped: %s", len(r.DroppedParts), strings.Join(r.DroppedParts, ", "))
 	}
-	out(w, "%s → %s (id %d%s): батчей %d, доменов %d, результатов %d, laravel-доменов %d, находок %d, история %d, файлов %d (дублей удалено %d), %s\n",
+	out(w, "%s → %s (id %d%s): batches %d, domains %d, results %d, laravel domains %d, findings %d, history %d, files %d (%d dupes removed), %s\n",
 		r.Zone, r.TLD, r.TLDZoneID, newMark, r.Batches, r.Domains, r.Results,
 		r.Laravel, r.Findings, r.History, r.Files, r.FilesDupes, parts)
 }

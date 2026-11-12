@@ -54,11 +54,11 @@ func (f *triConsumersFake) XGroupDelConsumer(ctx context.Context, stream, group,
 // the default does not replace them.
 func TestConsumersTriagePins(t *testing.T) {
 	if DefaultConsumerIdle != 2*time.Hour {
-		t.Errorf("DefaultConsumerIdle = %s, хочу ровно 2ч (T-155: суровые рестарты волн)", DefaultConsumerIdle)
+		t.Errorf("DefaultConsumerIdle = %s, want exactly 2h (T-155: harsh restarts of waves)", DefaultConsumerIdle)
 	}
 	o := ConsumerOptions{Idle: time.Nanosecond, Interval: time.Nanosecond}.withDefaults()
 	if o.Idle != time.Nanosecond || o.Interval != time.Nanosecond {
-		t.Errorf("единичные Idle/Interval заменены дефолтами: %+v (дефолт — только для ≤ 0)", o)
+		t.Errorf("unit Idle/Interval replaced by the defaults: %+v (the default only for ≤ 0)", o)
 	}
 }
 
@@ -82,7 +82,7 @@ func TestConsumersTriageIdleBoundary(t *testing.T) {
 		t.Fatalf("CleanupConsumersOnce: %v", err)
 	}
 	if removed != 1 {
-		t.Errorf("удалено %d, хочу 1 (idle == порог — уже мёртвый)", removed)
+		t.Errorf("removed %d, want 1 (idle == the threshold — already dead)", removed)
 	}
 }
 
@@ -94,7 +94,7 @@ func TestConsumersTriageIdleBoundary(t *testing.T) {
 func TestConsumersTriageXInfoErrors(t *testing.T) {
 	quiet := map[string]error{
 		"redis.Nil":         redis.Nil,
-		"текст no such key": errors.New("ERR no such key"), // the textual form of the Redis answer
+		"the no such key text": errors.New("ERR no such key"), // the textual form of the Redis answer
 		"NOGROUP":           errors.New("NOGROUP No such consumer group 'x' for key name 'y'"),
 	}
 	for name, err := range quiet {
@@ -103,10 +103,10 @@ func TestConsumersTriageXInfoErrors(t *testing.T) {
 			Groups: map[string]string{StreamHTTP: "http-worker"},
 		})
 		if err != nil {
-			t.Errorf("%s: %v (нет стрима/группы — не ошибка)", name, err)
+			t.Errorf("%s: %v (no stream/group — not an error)", name, err)
 		}
 		if removed != 0 {
-			t.Errorf("%s: удалено %d, хочу 0", name, removed)
+			t.Errorf("%s: removed %d, want 0", name, removed)
 		}
 	}
 
@@ -115,10 +115,10 @@ func TestConsumersTriageXInfoErrors(t *testing.T) {
 		Groups: map[string]string{StreamDNS: "dns-worker"},
 	})
 	if err == nil {
-		t.Fatal("ошибка чтения списка консьюмеров проглочена")
+		t.Fatal("the consumer list read error swallowed")
 	}
 	if removed != 0 {
-		t.Errorf("удалено %d при ошибке, хочу 0", removed)
+		t.Errorf("removed %d on error, want 0", removed)
 	}
 }
 
@@ -127,20 +127,20 @@ func TestConsumersTriageXInfoErrors(t *testing.T) {
 func TestConsumersTriageNilClientCounts(t *testing.T) {
 	removed, err := CleanupConsumersOnce(context.Background(), nil, ConsumerOptions{})
 	if err == nil {
-		t.Fatal("nil-клиент не отвергнут")
+		t.Fatal("a nil client not rejected")
 	}
 	if removed != 0 {
-		t.Errorf("удалено %d при nil-клиенте, хочу 0", removed)
+		t.Errorf("removed %d with a nil client, want 0", removed)
 	}
 	loopErr := make(chan error, 1)
 	go func() { loopErr <- CleanupConsumersLoop(context.Background(), nil, ConsumerOptions{}) }()
 	select {
 	case err := <-loopErr:
 		if err == nil {
-			t.Error("цикл с nil-клиентом не вернул ошибку")
+			t.Error("the loop with a nil client did not return an error")
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("CleanupConsumersLoop с nil-клиентом не завершился ошибкой")
+		t.Fatal("CleanupConsumersLoop with a nil client did not finish with an error")
 	}
 }
 
@@ -163,10 +163,10 @@ func TestConsumersTriageStreamLoopBreaks(t *testing.T) {
 		Idle:   time.Hour,
 	})
 	if err == nil {
-		t.Fatal("неизвестный стрим не возвращён ошибкой")
+		t.Fatal("an unknown stream not returned as an error")
 	}
 	if removed != 1 || len(f.delCalls()) != 1 {
-		t.Errorf("после сбойной пары: удалено %d, DELCONSUMER %v — рабочий стрим обязан чиститься", removed, f.delCalls())
+		t.Errorf("after the failing pair: removed %d, DELCONSUMER %v — a working stream must be cleaned", removed, f.delCalls())
 	}
 
 	// An empty group of the same map — also does not break the walk.
@@ -181,10 +181,10 @@ func TestConsumersTriageStreamLoopBreaks(t *testing.T) {
 		Idle:   time.Hour,
 	})
 	if err == nil {
-		t.Fatal("пустая группа не возвращена ошибкой")
+		t.Fatal("an empty group not returned as an error")
 	}
 	if removed != 1 {
-		t.Errorf("после пустой группы: удалено %d, хочу 1", removed)
+		t.Errorf("after the empty group: removed %d, want 1", removed)
 	}
 
 	// Inside a group: a recheck failure at the first candidate — the
@@ -204,10 +204,10 @@ func TestConsumersTriageStreamLoopBreaks(t *testing.T) {
 		Idle:   time.Hour,
 	})
 	if err == nil {
-		t.Fatal("сбой перепроверки pending не возвращён ошибкой")
+		t.Fatal("the pending re-check failure not returned as an error")
 	}
 	if removed != 1 {
-		t.Errorf("удалено %d, хочу 1 (второй кандидат после сбойной перепроверки)", removed)
+		t.Errorf("removed %d, want 1 (the second candidate after the failing re-check)", removed)
 	}
 
 	// A revival race at the first one (the recheck saw pending) — the
@@ -228,10 +228,10 @@ func TestConsumersTriageStreamLoopBreaks(t *testing.T) {
 		Idle:   time.Hour,
 	})
 	if err != nil {
-		t.Fatalf("гонка оживления — не ошибка: %v", err)
+		t.Fatalf("the revival race — not an error: %v", err)
 	}
 	if removed != 1 {
-		t.Errorf("удалено %d, хочу 1 (после гонки оживления первого)", removed)
+		t.Errorf("removed %d, want 1 (after the first one's revival race)", removed)
 	}
 
 	// A DELCONSUMER failure of the first one — an error with a zero count
@@ -256,14 +256,14 @@ func TestConsumersTriageStreamLoopBreaks(t *testing.T) {
 		Idle:   time.Hour,
 	})
 	if err == nil {
-		t.Fatal("сбой DELCONSUMER не возвращён ошибкой")
+		t.Fatal("the DELCONSUMER failure not returned as an error")
 	}
 	if removed != 1 {
-		t.Errorf("удалено %d, хочу 1 (первый сбой — не удалён, второй удалён)", removed)
+		t.Errorf("removed %d, want 1 (the first fails — not removed, the second removed)", removed)
 	}
 	dels := tf.delCalls()
 	if len(dels) != 2 || dels[1] != StreamDNS+"|dns-worker|dns-worker-2" {
-		t.Errorf("DELCONSUMER %v, хочу обе попытки", dels)
+		t.Errorf("DELCONSUMER %v, want both attempts", dels)
 	}
 
 	// A single candidate with a DELCONSUMER failure: an error, the count
@@ -284,7 +284,7 @@ func TestConsumersTriageStreamLoopBreaks(t *testing.T) {
 		Idle:   time.Hour,
 	})
 	if err == nil || removed != 0 {
-		t.Errorf("сбой DELCONSUMER: (%d, %v), хочу (0, ошибка)", removed, err)
+		t.Errorf("a DELCONSUMER failure: (%d, %v), want (0, an error)", removed, err)
 	}
 }
 
@@ -307,10 +307,10 @@ func TestConsumersTriageEmptyGroupKnownStream(t *testing.T) {
 		Idle:   time.Hour,
 	})
 	if err == nil || !strings.Contains(err.Error(), StreamDNS) {
-		t.Fatalf("пустая группа q:dns: %v, want ошибку про q:dns", err)
+		t.Fatalf("the empty q:dns group: %v, want an error about q:dns", err)
 	}
 	if removed != 1 || len(f.delCalls()) != 1 {
-		t.Errorf("хвост за пустой группой: удалено %d, DELCONSUMER %v — хочу 1/1 (continue, не break)", removed, f.delCalls())
+		t.Errorf("the tail after the empty group: removed %d, DELCONSUMER %v — want 1/1 (continue, not break)", removed, f.delCalls())
 	}
 }
 
@@ -324,12 +324,12 @@ func TestConsumersTriageSortedStreamOrder(t *testing.T) {
 	for i := 0; i < 50; i++ {
 		_, err := CleanupConsumersOnce(context.Background(), &fakeConsumers{}, ConsumerOptions{Groups: groups})
 		if err == nil {
-			t.Fatal("три пустые группы: хочу ошибку прохода")
+			t.Fatal("three empty groups: want a pass error")
 		}
 		msg := err.Error()
 		ia, id, ih := strings.Index(msg, StreamAnalyze), strings.Index(msg, StreamDNS), strings.Index(msg, StreamHTTP)
 		if ia < 0 || id < 0 || ih < 0 || ia >= id || id >= ih {
-			t.Fatalf("порядок ошибок не по возрастанию стримов: %q", msg)
+			t.Fatalf("the error order not ascending by stream: %q", msg)
 		}
 	}
 }
@@ -352,11 +352,11 @@ func TestConsumersTriagePendingWindow(t *testing.T) {
 		t.Fatalf("CleanupConsumersOnce: %v", err)
 	}
 	if len(f.pendArgs) != 1 {
-		t.Fatalf("перепроверок %d, хочу 1", len(f.pendArgs))
+		t.Fatalf("re-checks %d, want 1", len(f.pendArgs))
 	}
 	a := f.pendArgs[0]
 	if a.Count != 1 || a.Start != "-" || a.End != "+" {
-		t.Errorf("XPENDING EXTENDED %+v: хочу Count=1 Start=- End=+ (минимальное окно гонки)", a)
+		t.Errorf("XPENDING EXTENDED %+v: want Count=1 Start=- End=+ (the minimal race window)", a)
 	}
 
 	// One PEL entry carried away is already an undeliverable-forever
@@ -372,7 +372,7 @@ func TestConsumersTriagePendingWindow(t *testing.T) {
 		Groups: map[string]string{StreamDNS: "dns-worker"},
 		Idle:   time.Hour,
 	}); err == nil {
-		t.Error("DELCONSUMER унёс 1 pending-запись — хочу ошибку (грань > 0, не > 1)")
+		t.Error("DELCONSUMER removed 1 pending entry — want an error (the boundary is > 0, not > 1)")
 	}
 }
 
@@ -398,15 +398,15 @@ func TestInfraCauseTriagePlainStrings(t *testing.T) {
 	}
 	for _, c := range cases {
 		if got := infraCause(errors.New(c.text)); got != c.want {
-			t.Errorf("infraCause(%q) = %v, хочу %v", c.text, got, c.want)
+			t.Errorf("infraCause(%q) = %v, want %v", c.text, got, c.want)
 		}
 	}
 	// Transport inside a wrapper: an unexpected EOF and a closed client.
 	if !infraCause(fmt.Errorf("queue: publish: %w", io.ErrUnexpectedEOF)) {
-		t.Error("io.ErrUnexpectedEOF в обёртке — инфраструктурный сбой")
+		t.Error("io.ErrUnexpectedEOF in a wrap — an infrastructure failure")
 	}
 	if !infraCause(fmt.Errorf("queue: publish: %w", redis.ErrClosed)) {
-		t.Error("redis.ErrClosed в обёртке — инфраструктурный сбой")
+		t.Error("redis.ErrClosed in a wrap — an infrastructure failure")
 	}
 }
 
@@ -425,10 +425,10 @@ func TestPublishRetryTriageStops(t *testing.T) {
 	fake := &fakeRedis{addErrs: []error{oomErr}}
 	q := NewRedisQueue(fake, RedisOptions{PublishRetries: 2, PublishRetryPause: time.Nanosecond})
 	if _, err := q.Publish(context.Background(), StreamDNS, msg); err != nil {
-		t.Fatalf("Publish после повтора: %v", err)
+		t.Fatalf("Publish after the retry: %v", err)
 	}
 	if len(fake.adds) != 2 {
-		t.Errorf("вызовов XADD %d, хочу 2 (успех второго — серия остановлена)", len(fake.adds))
+		t.Errorf("XADD calls %d, want 2 (the second succeeds — the series stops)", len(fake.adds))
 	}
 
 	// OOM, then a non-infrastructure error: a retry is pointless — the
@@ -438,10 +438,10 @@ func TestPublishRetryTriageStops(t *testing.T) {
 	q = NewRedisQueue(fake, RedisOptions{PublishRetries: 2, PublishRetryPause: time.Nanosecond})
 	_, err := q.Publish(context.Background(), StreamDNS, msg)
 	if err == nil || IsInfra(err) {
-		t.Fatalf("не-инфраструктурная ошибка в середине серии: %v", err)
+		t.Fatalf("a non-infrastructure error mid-series: %v", err)
 	}
 	if len(fake.adds) != 2 {
-		t.Errorf("вызовов XADD %d, хочу 2 (не-инфра ошибка — без дожигания попыток)", len(fake.adds))
+		t.Errorf("XADD calls %d, want 2 (a non-infra error — no attempt burn-down)", len(fake.adds))
 	}
 }
 
@@ -454,16 +454,16 @@ func TestPublishRetryTriageStops(t *testing.T) {
 // docs/redis.md §3.1).
 func TestReliabTriagePins(t *testing.T) {
 	if writeProbeTTL != 2*time.Hour {
-		t.Errorf("writeProbeTTL = %s, хочу ровно 2ч", writeProbeTTL)
+		t.Errorf("writeProbeTTL = %s, want exactly 2h", writeProbeTTL)
 	}
 	if DNSStreamBytesPerDomain != 66 {
-		t.Errorf("DNSStreamBytesPerDomain = %d, хочу 66 (замер T-141)", DNSStreamBytesPerDomain)
+		t.Errorf("DNSStreamBytesPerDomain = %d, want 66 (the T-141 measurement)", DNSStreamBytesPerDomain)
 	}
 	if UnitStreamBytesWorst != 717 {
-		t.Errorf("UnitStreamBytesWorst = %d, хочу 717 (верх замера T-092)", UnitStreamBytesWorst)
+		t.Errorf("UnitStreamBytesWorst = %d, want 717 (the upper bound of the T-092 measurement)", UnitStreamBytesWorst)
 	}
 	if DeadStreamBytesWorst != 205 {
-		t.Errorf("DeadStreamBytesWorst = %d, хочу 205 (~150–300 Б T-105)", DeadStreamBytesWorst)
+		t.Errorf("DeadStreamBytesWorst = %d, want 205 (~150–300 B, T-105)", DeadStreamBytesWorst)
 	}
 }
 
@@ -479,16 +479,16 @@ func TestReliabTriageRefundArgs(t *testing.T) {
 	r := newTestReliab(fake, ReliabOptions{})
 
 	if err := r.Refund(context.Background(), "", "recover-1", claimed); err == nil || len(fake.dos) != 0 {
-		t.Errorf("Refund с пустой группой: (%v, команд %d), хочу ошибку без команд", err, len(fake.dos))
+		t.Errorf("Refund with an empty group: (%v, %d commands), want an error without commands", err, len(fake.dos))
 	}
 	if err := r.Refund(context.Background(), "http", "", claimed); err == nil || len(fake.dos) != 0 {
-		t.Errorf("Refund с пустым потребителем: (%v, команд %d), хочу ошибку без команд", err, len(fake.dos))
+		t.Errorf("Refund with an empty consumer: (%v, %d commands), want an error without commands", err, len(fake.dos))
 	}
 	if err := r.Refund(context.Background(), "", "c", nil); err != nil {
-		t.Errorf("Refund пустой пачки с пустой группой: %v, хочу прозрачный nil", err)
+		t.Errorf("Refund of an empty batch with an empty group: %v, want a transparent nil", err)
 	}
 	if err := newTestReliab(&fakeClaimRedis{}, ReliabOptions{}).Refund(context.Background(), "", "c", nil); err != nil {
-		t.Errorf("Refund(nil-пачка): %v, хочу nil", err)
+		t.Errorf("Refund(nil batch): %v, want nil", err)
 	}
 
 	// RefundUnclassified: the same guards.
@@ -496,13 +496,13 @@ func TestReliabTriageRefundArgs(t *testing.T) {
 	fake = &fakeClaimRedis{}
 	r = newTestReliab(fake, ReliabOptions{})
 	if err := r.RefundUnclassified(context.Background(), "", "recover-1", ds); err == nil || len(fake.dos) != 0 {
-		t.Errorf("RefundUnclassified с пустой группой: (%v, команд %d), хочу ошибку без команд", err, len(fake.dos))
+		t.Errorf("RefundUnclassified with an empty group: (%v, %d commands), want an error without commands", err, len(fake.dos))
 	}
 	if err := r.RefundUnclassified(context.Background(), "http", "", ds); err == nil || len(fake.pends) != 0 {
-		t.Errorf("RefundUnclassified с пустым потребителем: (%v, XPENDING %d), хочу ошибку до чтений", err, len(fake.pends))
+		t.Errorf("RefundUnclassified with an empty consumer: (%v, XPENDING %d), want an error before the reads", err, len(fake.pends))
 	}
 	if err := r.RefundUnclassified(context.Background(), "", "c", nil); err != nil {
-		t.Errorf("RefundUnclassified пустой пачки: %v, хочу прозрачный nil", err)
+		t.Errorf("RefundUnclassified of an empty batch: %v, want a transparent nil", err)
 	}
 
 	// A client without the Do window: both refunds are transparent, the
@@ -511,13 +511,13 @@ func TestReliabTriageRefundArgs(t *testing.T) {
 	ro := NewReliab(claimOnly, NewRedisQueue(claimOnly.claimStreams.(*fakeClaimRedis), RedisOptions{}), ReliabOptions{})
 	emptyFake := claimOnly.claimStreams.(*fakeClaimRedis)
 	if err := ro.Refund(context.Background(), "g", "c", claimed); err != nil {
-		t.Errorf("Refund без окна Do: %v, хочу nil", err)
+		t.Errorf("Refund without a Do window: %v, want nil", err)
 	}
 	if err := ro.RefundUnclassified(context.Background(), "g", "c", ds); err != nil {
-		t.Errorf("RefundUnclassified без окна Do: %v, хочу nil", err)
+		t.Errorf("RefundUnclassified without a Do window: %v, want nil", err)
 	}
 	if len(emptyFake.pends) != 0 || len(emptyFake.dos) != 0 {
-		t.Errorf("команды без окна Do: XPENDING %d, Do %d — гейт обязан молчать", len(emptyFake.pends), len(emptyFake.dos))
+		t.Errorf("commands without a Do window: XPENDING %d, Do %d — the gate must stay silent", len(emptyFake.pends), len(emptyFake.dos))
 	}
 }
 
@@ -536,11 +536,11 @@ func TestReliabTriageUnclassifiedContinue(t *testing.T) {
 		{Stream: StreamHTTP, ID: "1-2", Payload: []byte(`{"task_id":"t2"}`)},
 	}
 	err := newTestReliab(fake, ReliabOptions{}).RefundUnclassified(context.Background(), "http", "recover-1", ds)
-	if err == nil || !contains(err, "счётчик доставок") {
-		t.Fatalf("ошибка классификации: %v, хочу контекст счётчика", err)
+	if err == nil || !contains(err, "delivery counter") {
+		t.Fatalf("the classification error: %v, want the counter context", err)
 	}
 	if len(fake.dos) != 1 || fake.dos[0][5] != "1-2" {
-		t.Errorf("возврат %v, хочу команду только для 1-2", fake.dos)
+		t.Errorf("the refund %v, want a command for 1-2 only", fake.dos)
 	}
 
 	// The first entry left the PEL (an empty answer): it needs no refund,
@@ -552,7 +552,7 @@ func TestReliabTriageUnclassifiedContinue(t *testing.T) {
 		t.Fatalf("RefundUnclassified: %v", err)
 	}
 	if len(fake.dos) != 1 || fake.dos[0][5] != "1-2" {
-		t.Errorf("возврат %v, хочу команду только для 1-2 (1-1 вне PEL)", fake.dos)
+		t.Errorf("the refund %v, want a command for 1-2 only (1-1 outside the PEL)", fake.dos)
 	}
 }
 
@@ -607,10 +607,10 @@ func TestTrimTriageErrors(t *testing.T) {
 	}}
 	n, _, err := triTrimStreamOnce(t, f, TrimOptions{})
 	if err == nil {
-		t.Fatal("ошибка чтения групп проглочена")
+		t.Fatal("the group list read error swallowed")
 	}
 	if n != 0 {
-		t.Errorf("удалено %d при ошибке, хочу 0", n)
+		t.Errorf("removed %d on error, want 0", n)
 	}
 
 	// An XPENDING error of the group — the stream is skipped with an
@@ -621,10 +621,10 @@ func TestTrimTriageErrors(t *testing.T) {
 	}}
 	n, _, err = triTrimStreamOnce(t, f, TrimOptions{})
 	if err == nil {
-		t.Fatal("ошибка XPENDING проглочена")
+		t.Fatal("the XPENDING error swallowed")
 	}
 	if n != 0 {
-		t.Errorf("удалено %d при ошибке pending, хочу 0", n)
+		t.Errorf("removed %d on a pending error, want 0", n)
 	}
 
 	// An XTRIM error — a pass error, the count is 0, the XLEN is not
@@ -634,10 +634,10 @@ func TestTrimTriageErrors(t *testing.T) {
 	}, trimErr: errors.New("OOM command not allowed")}
 	n, _, err = triTrimStreamOnce(t, f, TrimOptions{})
 	if err == nil {
-		t.Fatal("ошибка XTRIM проглочена")
+		t.Fatal("the XTRIM error swallowed")
 	}
 	if n != 0 || f.xlenCalls != 0 {
-		t.Errorf("XTRIM-сбой: (удалено %d, XLEN %d), хочу (0, 0)", n, f.xlenCalls)
+		t.Errorf("an XTRIM failure: (removed %d, XLEN %d), want (0, 0)", n, f.xlenCalls)
 	}
 
 	// An XLEN error — a pass error (the stream's count is not accepted
@@ -649,31 +649,31 @@ func TestTrimTriageErrors(t *testing.T) {
 	}, xlenErr: errors.New("connection reset")}
 	n, _, err = triTrimStreamOnce(t, f, TrimOptions{})
 	if err == nil {
-		t.Fatal("ошибка XLEN проглочена")
+		t.Fatal("the XLEN error swallowed")
 	}
 	if n != 0 {
-		t.Errorf("удалено %d при ошибке XLEN, хочу 0 (счёт сбойного стрима не принимается)", n)
+		t.Errorf("removed %d on an XLEN error, want 0 (a failing stream's count is not accepted)", n)
 	}
 	// The XTRIM itself ran before the length error.
 	if len(f.trims) != 1 {
-		t.Errorf("XTRIM до ошибки XLEN: %+v, хочу одну обрезку", f.trims)
+		t.Errorf("XTRIM before the XLEN error: %+v, want one trim", f.trims)
 	}
 
 	// A nil client: an error with a zero count; the loop — an immediate
 	// error.
 	n, _, err = TrimOnce(context.Background(), nil, TrimOptions{})
 	if err == nil || n != 0 {
-		t.Errorf("nil-клиент TrimOnce: (%d, %v), хочу (0, ошибка)", n, err)
+		t.Errorf("TrimOnce with a nil client: (%d, %v), want (0, an error)", n, err)
 	}
 	loopErr := make(chan error, 1)
 	go func() { loopErr <- TrimLoop(context.Background(), nil, TrimOptions{}) }()
 	select {
 	case err := <-loopErr:
 		if err == nil {
-			t.Error("TrimLoop с nil-клиентом не вернул ошибку")
+			t.Error("TrimLoop with a nil client did not return an error")
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("TrimLoop с nil-клиентом не завершился ошибкой")
+		t.Fatal("TrimLoop with a nil client did not finish with an error")
 	}
 }
 
@@ -694,7 +694,7 @@ func TestTrimTriagePointAndStuck(t *testing.T) {
 		t.Fatalf("TrimOnce: %v", err)
 	}
 	if len(f.trims) != 1 || f.trims[0]["minid"] != "101-0" {
-		t.Errorf("XTRIM %+v, хочу MINID 101-0 (pending в одну запись — тоже PEL)", f.trims)
+		t.Errorf("XTRIM %+v, want MINID 101-0 (a single-entry pending is a PEL too)", f.trims)
 	}
 
 	// A race: XINFO showed pending, XPENDING — already empty (Count 0):
@@ -712,7 +712,7 @@ func TestTrimTriagePointAndStuck(t *testing.T) {
 		t.Fatalf("TrimOnce: %v", err)
 	}
 	if len(f.trims) != 1 || f.trims[0]["minid"] != "50-0" {
-		t.Errorf("XTRIM %+v, хочу MINID 50-0 (пустая перепроверка не сбрасывает точку)", f.trims)
+		t.Errorf("XTRIM %+v, want MINID 50-0 (an empty re-check does not reset the point)", f.trims)
 	}
 
 	// The sum across streams: two streams of 7 removed each — 14 in
@@ -732,7 +732,7 @@ func TestTrimTriagePointAndStuck(t *testing.T) {
 		t.Fatalf("TrimOnce: %v", err)
 	}
 	if n != 21 {
-		t.Errorf("удалено %d, хочу 21 (сумма по трём стримам)", n)
+		t.Errorf("removed %d, want 21 (the sum over three streams)", n)
 	}
 
 	// Exactly 3/4 of the limit — already a stuck prefix
@@ -746,7 +746,7 @@ func TestTrimTriagePointAndStuck(t *testing.T) {
 		t.Fatalf("TrimOnce: %v", err)
 	}
 	if len(stuck) != 1 {
-		t.Errorf("застрявшие %v при XLEN 3/4 = потолок 4, хочу сигнал", stuck)
+		t.Errorf("stuck %v at XLEN 3/4 = the cap 4, want the signal", stuck)
 	}
 
 	// An explicit limit of 1 — a legitimate value (the default only for
@@ -760,7 +760,7 @@ func TestTrimTriagePointAndStuck(t *testing.T) {
 		t.Fatalf("TrimOnce: %v", err)
 	}
 	if len(stuck) != 1 {
-		t.Errorf("застрявшие %v при XLEN 2 > предел 1: явный предел обязан действовать", stuck)
+		t.Errorf("stuck %v at XLEN 2 > the limit 1: an explicit limit must take effect", stuck)
 	}
 }
 
@@ -772,20 +772,20 @@ func TestTrimTriageNoGroupsNoXLen(t *testing.T) {
 	f := &triTrimFake{fakeTrim: &fakeTrim{groups: map[string][]redis.XInfoGroup{}}}
 	n, stuck, err := triTrimStreamOnce(t, f, TrimOptions{})
 	if err != nil {
-		t.Fatalf("TrimOnce без групп: %v", err)
+		t.Fatalf("TrimOnce without groups: %v", err)
 	}
 	if n != 0 || len(stuck) != 0 {
-		t.Errorf("без групп: (%d, %v), хочу (0, пусто)", n, stuck)
+		t.Errorf("without groups: (%d, %v), want (0, empty)", n, stuck)
 	}
 	if f.xlenCalls != 0 {
-		t.Errorf("XLEN без групп: %d вызовов, хочу 0", f.xlenCalls)
+		t.Errorf("XLEN without groups: %d calls, want 0", f.xlenCalls)
 	}
 
 	// An unknown stream — an error with a zero count.
 	f2 := &triTrimFake{fakeTrim: &fakeTrim{}}
 	n, _, err = TrimOnce(context.Background(), f2, TrimOptions{Streams: []string{"q:typo"}})
 	if err == nil || n != 0 {
-		t.Errorf("неизвестный стрим: (%d, %v), хочу (0, ошибку)", n, err)
+		t.Errorf("an unknown stream: (%d, %v), want (0, an error)", n, err)
 	}
 }
 
@@ -804,7 +804,7 @@ func TestTrimTriageLateGroupContributes(t *testing.T) {
 		t.Fatalf("TrimOnce: %v", err)
 	}
 	if len(f.trims) != 1 || f.trims[0]["minid"] != "5-0" {
-		t.Errorf("XTRIM %+v, хочу MINID 5-0 (пустая группа — не конец обхода)", f.trims)
+		t.Errorf("XTRIM %+v, want MINID 5-0 (an empty group is not the end of the traversal)", f.trims)
 	}
 }
 
@@ -821,15 +821,15 @@ func TestTarpitTriageZeroCountOnErrors(t *testing.T) {
 		delivery string
 		ttl      time.Duration
 	}{
-		{"пустой task_id", "", "e1#1", time.Hour},
-		{"пустая доставка", "t1", "", time.Hour},
-		{"нулевой TTL", "t1", "e1#1", 0},
-		{"отрицательный TTL", "t1", "e1#1", -time.Second},
+		{"empty task_id", "", "e1#1", time.Hour},
+		{"empty delivery", "t1", "", time.Hour},
+		{"zero TTL", "t1", "e1#1", 0},
+		{"negative TTL", "t1", "e1#1", -time.Second},
 	}
 	for _, cs := range validation {
 		n, err := NewTarpitCounter(newFakeTarpitRedis()).Track(ctx, cs.taskID, cs.delivery, cs.ttl)
 		if err == nil || n != 0 {
-			t.Errorf("%s: (%d, %v), хочу (0, ошибку)", cs.name, n, err)
+			t.Errorf("%s: (%d, %v), want (0, an error)", cs.name, n, err)
 		}
 	}
 	commandErrs := []struct {
@@ -845,14 +845,14 @@ func TestTarpitTriageZeroCountOnErrors(t *testing.T) {
 		cs.inject(f)
 		n, err := NewTarpitCounter(f).Track(ctx, "t1", "e1#1", time.Hour)
 		if err == nil || n != 0 {
-			t.Errorf("сбой %s: (%d, %v), хочу (0, ошибку)", cs.name, n, err)
+			t.Errorf("a failure of %s: (%d, %v), want (0, an error)", cs.name, n, err)
 		}
 	}
 
 	// A TTL of 1 ns — a legitimate positive value: the mark is set.
 	f := newFakeTarpitRedis()
 	if n, err := NewTarpitCounter(f).Track(ctx, "t1", "e1#1", time.Nanosecond); err != nil || n != 1 {
-		t.Errorf("TTL 1ns: (%d, %v), хочу (1, nil) — положительный TTL не отбрасывается", n, err)
+		t.Errorf("TTL 1ns: (%d, %v), want (1, nil) — a positive TTL is not rejected", n, err)
 	}
 }
 
@@ -892,18 +892,18 @@ func TestRecoverLoopTriageNoClaimAfterCancel(t *testing.T) {
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Fatalf("RecoverLoop после отмены: %v, хочу nil", err)
+			t.Fatalf("RecoverLoop after the cancel: %v, want nil", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("RecoverLoop не завершился после отмены ctx")
+		t.Fatal("RecoverLoop did not finish after the ctx cancel")
 	}
 	// Exactly one claim: no repeated claim on the canceled ctx.
 	time.Sleep(50 * time.Millisecond)
 	if n := fake.claimsCount(); n != 1 {
-		t.Errorf("клеймов после отмены ctx: %d, хочу 1 (выход до пробы записи и клейма)", n)
+		t.Errorf("claims after the ctx cancel: %d, want 1 (exit before the write probe and the claim)", n)
 	}
 	if len(fake.dos) != 0 {
-		t.Errorf("возвратов попыток после отмены: %d, хочу 0 (хвост пачки не начат)", len(fake.dos))
+		t.Errorf("refunds after the cancel: %d, want 0 (the batch tail not started)", len(fake.dos))
 	}
 }
 

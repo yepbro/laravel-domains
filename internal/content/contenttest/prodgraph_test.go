@@ -18,7 +18,7 @@ import (
 // пакета).
 func TestNotInProductionGraph(t *testing.T) {
 	if _, err := exec.LookPath("go"); err != nil {
-		t.Skipf("toolchain Go недоступна, проверка прод-графа пропущена: %v", err)
+		t.Skipf("the Go toolchain unavailable, the production graph check skipped: %v", err)
 	}
 	out, err := exec.Command("go", "list", "-deps", "crawler/cmd/...").Output()
 	if err != nil {
@@ -32,7 +32,7 @@ func TestNotInProductionGraph(t *testing.T) {
 		}
 	}
 	if len(bad) > 0 {
-		t.Errorf("прод-граф cmd содержит тестовые пакеты %v — contenttest "+
-			"обязан импортироваться только из _test-файлов (T-228)", bad)
+		t.Errorf("the cmd production graph contains test packages %v — contenttest "+
+			"must be imported from _test files only (T-228)", bad)
 	}
 }

@@ -110,14 +110,14 @@ func TestCleanupConsumersOnceSelection(t *testing.T) {
 		t.Fatalf("CleanupConsumersOnce: %v", err)
 	}
 	if removed != 1 {
-		t.Errorf("удалено %d, хочу 1 (только пустой неактивный)", removed)
+		t.Errorf("removed %d, want 1 (only the empty inactive one)", removed)
 	}
 	dels := f.delCalls()
 	if len(dels) != 1 || dels[0] != StreamHTTP+"|http-worker|http-worker-461002" {
-		t.Fatalf("DELCONSUMER %v, хочу только пустой неактивный http-worker-461002", dels)
+		t.Fatalf("DELCONSUMER %v, want only the empty inactive http-worker-461002", dels)
 	}
 	if len(f.pendArgs) != 1 || f.pendArgs[0].Consumer != "http-worker-461002" {
-		t.Errorf("перепроверка pending: %+v, хочу одну по кандидату http-worker-461002", f.pendArgs)
+		t.Errorf("the pending re-check: %+v, want one for the candidate http-worker-461002", f.pendArgs)
 	}
 }
 
@@ -146,10 +146,10 @@ func TestCleanupConsumersOnceRaceyPEL(t *testing.T) {
 		t.Fatalf("CleanupConsumersOnce: %v", err)
 	}
 	if removed != 0 {
-		t.Errorf("удалено %d, хочу 0 (перепроверка увидела pending)", removed)
+		t.Errorf("removed %d, want 0 (the re-check saw pending)", removed)
 	}
 	if dels := f.delCalls(); len(dels) != 0 {
-		t.Errorf("DELCONSUMER при непустой перепроверке: %v", dels)
+		t.Errorf("DELCONSUMER with a non-empty re-check: %v", dels)
 	}
 }
 
@@ -172,10 +172,10 @@ func TestCleanupConsumersOnceCarriedPEL(t *testing.T) {
 		Idle:   2 * time.Hour,
 	})
 	if err == nil {
-		t.Fatal("унесённый DELCONSUMER-ом pending не возвращён ошибкой")
+		t.Fatal("the pending removed by DELCONSUMER not reported as an error")
 	}
 	if removed != 1 {
-		t.Errorf("удалено %d, хочу 1 (консьюмер удалён, ошибка — сигнал)", removed)
+		t.Errorf("removed %d, want 1 (the consumer removed, the error is the signal)", removed)
 	}
 }
 
@@ -197,13 +197,13 @@ func TestCleanupConsumersOnceNoStreamAndNoGroup(t *testing.T) {
 		},
 	})
 	if err != nil {
-		t.Fatalf("CleanupConsumersOnce: %v (нет стрима/группы — не ошибка)", err)
+		t.Fatalf("CleanupConsumersOnce: %v (no stream/group — not an error)", err)
 	}
 	if removed != 0 {
-		t.Errorf("удалено %d, хочу 0", removed)
+		t.Errorf("removed %d, want 0", removed)
 	}
 	if dels := f.delCalls(); len(dels) != 0 {
-		t.Errorf("DELCONSUMER без стрима/группы: %v", dels)
+		t.Errorf("DELCONSUMER without a stream/group: %v", dels)
 	}
 }
 
@@ -233,10 +233,10 @@ func TestCleanupConsumersOncePartialFailure(t *testing.T) {
 	}
 	removed, err := CleanupConsumersOnce(context.Background(), f, ConsumerOptions{})
 	if err == nil {
-		t.Fatal("частичный сбой не возвращён ошибкой")
+		t.Fatal("the partial failure not returned as an error")
 	}
 	if removed != 2 {
-		t.Errorf("удалено %d, хочу 2 (q:http и q:analyze; q:dns сбой, q:render не подтверждён)", removed)
+		t.Errorf("removed %d, want 2 (q:http and q:analyze; q:dns fails, q:render not acknowledged)", removed)
 	}
 	dels := f.delCalls()
 	want := []string{
@@ -244,7 +244,7 @@ func TestCleanupConsumersOncePartialFailure(t *testing.T) {
 		StreamHTTP + "|http-worker|http-worker-1",
 	}
 	if !reflect.DeepEqual(dels, want) {
-		t.Fatalf("DELCONSUMER %v, хочу %v (сортировка стримов, сбойные пропущены)", dels, want)
+		t.Fatalf("DELCONSUMER %v, want %v (stream order, the failing ones skipped)", dels, want)
 	}
 }
 
@@ -256,18 +256,18 @@ func TestCleanupConsumersOnceUnknownStreamAndNilClient(t *testing.T) {
 	if _, err := CleanupConsumersOnce(context.Background(), f, ConsumerOptions{
 		Groups: map[string]string{"q:unknown": "g"},
 	}); err == nil {
-		t.Error("неизвестный стрим не отвергнут")
+		t.Error("an unknown stream not rejected")
 	}
 	if _, err := CleanupConsumersOnce(context.Background(), f, ConsumerOptions{
 		Groups: map[string]string{StreamDNS: ""},
 	}); err == nil {
-		t.Error("пустая группа не отвергнута")
+		t.Error("an empty group not rejected")
 	}
 	if _, err := CleanupConsumersOnce(context.Background(), nil, ConsumerOptions{}); err == nil {
-		t.Error("nil-клиент не отвергнут")
+		t.Error("a nil client not rejected")
 	}
 	if dels := f.delCalls(); len(dels) != 0 {
-		t.Errorf("DELCONSUMER при ошибках аргументов: %v", dels)
+		t.Errorf("DELCONSUMER on argument errors: %v", dels)
 	}
 }
 
@@ -281,21 +281,21 @@ func TestCleanupConsumersOnceUnknownStreamAndNilClient(t *testing.T) {
 func TestConsumerOptionsDefaults(t *testing.T) {
 	o := ConsumerOptions{}.withDefaults()
 	if !reflect.DeepEqual(o.Groups, WorkingGroups()) {
-		t.Errorf("Groups по умолчанию = %v, хочу %v (WorkingGroups)", o.Groups, WorkingGroups())
+		t.Errorf("the default Groups = %v, want %v (WorkingGroups)", o.Groups, WorkingGroups())
 	}
 	if len(o.Groups) != len(workingStreams()) {
-		t.Errorf("WorkingGroups покрывает %d стримов, рабочих — %d: новый стрим добавьте в WorkingGroups", len(o.Groups), len(workingStreams()))
+		t.Errorf("WorkingGroups covers %d streams, %d are working: add a new stream to WorkingGroups", len(o.Groups), len(workingStreams()))
 	}
 	for s := range o.Groups {
 		if !knownStream(s) || s == StreamDead {
-			t.Errorf("WorkingGroups содержит неподходящий стрим %q", s)
+			t.Errorf("WorkingGroups contains an unsuitable stream %q", s)
 		}
 	}
 	if o.Idle != DefaultConsumerIdle {
-		t.Errorf("Idle по умолчанию = %s, хочу %s", o.Idle, DefaultConsumerIdle)
+		t.Errorf("the default Idle = %s, want %s", o.Idle, DefaultConsumerIdle)
 	}
 	if o.Interval != DefaultConsumerInterval {
-		t.Errorf("Interval по умолчанию = %s, хочу %s", o.Interval, DefaultConsumerInterval)
+		t.Errorf("the default Interval = %s, want %s", o.Interval, DefaultConsumerInterval)
 	}
 	o = ConsumerOptions{
 		Groups:   map[string]string{StreamHTTP: "http-worker"},
@@ -303,7 +303,7 @@ func TestConsumerOptionsDefaults(t *testing.T) {
 		Interval: time.Hour,
 	}.withDefaults()
 	if o.Idle != time.Minute || o.Interval != time.Hour || !reflect.DeepEqual(o.Groups, map[string]string{StreamHTTP: "http-worker"}) {
-		t.Errorf("явные значения заменены дефолтами: %+v", o)
+		t.Errorf("explicit values replaced by the defaults: %+v", o)
 	}
 }
 
@@ -335,7 +335,7 @@ func TestCleanupConsumersLoopCancel(t *testing.T) {
 	for len(f.delCalls()) == 0 {
 		select {
 		case <-deadline:
-			t.Fatal("первый проход CleanupConsumersLoop не выполнен")
+			t.Fatal("the first CleanupConsumersLoop pass did not run")
 		default:
 			time.Sleep(time.Millisecond)
 		}
@@ -344,9 +344,9 @@ func TestCleanupConsumersLoopCancel(t *testing.T) {
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Fatalf("CleanupConsumersLoop после отмены: %v, хочу nil", err)
+			t.Fatalf("CleanupConsumersLoop after cancellation: %v, want nil", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("CleanupConsumersLoop не завершился после отмены ctx")
+		t.Fatal("CleanupConsumersLoop did not finish after ctx cancellation")
 	}
 }

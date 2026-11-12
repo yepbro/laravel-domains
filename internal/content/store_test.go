@@ -20,7 +20,7 @@ func TestHashOf(t *testing.T) {
 	cases := [][]byte{
 		nil,
 		{},
-		[]byte("<html><body>итоговая страница</body></html>"),
+		[]byte("<html><body>final page</body></html>"),
 		[]byte("bin\x00\x01\xff content \x00"),
 	}
 	for i, d := range cases {

@@ -238,10 +238,10 @@ func GroupDepth(g redis.XInfoGroup, xlen int64) int64 {
 // the metric — in the file header.
 func (g *BackpressureGate) Len(ctx context.Context, stream string) (int64, error) {
 	if !knownStream(stream) {
-		return 0, fmt.Errorf("queue: неизвестный стрим %q (рабочие стримы — константы пакета: StreamDNS, StreamHTTP, StreamRender, StreamRenderFallback, StreamAnalyze, StreamDead)", stream)
+		return 0, fmt.Errorf("queue: unknown stream %q (working streams are package constants: StreamDNS, StreamHTTP, StreamRender, StreamRenderFallback, StreamAnalyze, StreamDead)", stream)
 	}
 	if g.rdb == nil {
-		return 0, fmt.Errorf("queue: глубина %s: клиент Redis не задан", stream)
+		return 0, fmt.Errorf("queue: depth %s: Redis client not set", stream)
 	}
 	groups, err := g.rdb.XInfoGroups(ctx, stream).Result()
 	if err != nil {
@@ -252,13 +252,13 @@ func (g *BackpressureGate) Len(ctx context.Context, stream string) (int64, error
 		if errors.Is(err, redis.Nil) || strings.Contains(err.Error(), "no such key") {
 			groups = nil
 		} else {
-			return 0, fmt.Errorf("queue: глубина %s: %w", stream, err)
+			return 0, fmt.Errorf("queue: depth %s: %w", stream, err)
 		}
 	}
 	if len(groups) == 0 {
 		n, err := g.rdb.XLen(ctx, stream).Result()
 		if err != nil {
-			return 0, fmt.Errorf("queue: глубина %s (групп нет, XLEN): %w", stream, err)
+			return 0, fmt.Errorf("queue: depth %s (no groups, XLEN): %w", stream, err)
 		}
 		return n, nil
 	}
@@ -273,7 +273,7 @@ func (g *BackpressureGate) Len(ctx context.Context, stream string) (int64, error
 	// the depth degenerates into pending, conservatively.
 	xlen, err := g.rdb.XLen(ctx, stream).Result()
 	if err != nil {
-		return 0, fmt.Errorf("queue: глубина %s (кламп лага, XLEN): %w", stream, err)
+		return 0, fmt.Errorf("queue: depth %s (lag clamp, XLEN): %w", stream, err)
 	}
 	var depth int64
 	for _, grp := range groups {
@@ -307,12 +307,12 @@ func (g *BackpressureGate) AwaitCapacity(ctx context.Context, stream string) err
 		}
 		if !waited {
 			waited = true
-			g.opt.Log.Warn("публикация приостановлена: глубина очереди у порога",
+			g.opt.Log.Warn("publication paused: queue depth at threshold",
 				"stream", stream, "depth", n, "watermark", watermark)
 		}
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("queue: ожидание ёмкости %s: %w", stream, ctx.Err())
+			return fmt.Errorf("queue: awaiting capacity %s: %w", stream, ctx.Err())
 		case <-time.After(g.opt.Interval):
 		}
 	}
@@ -345,7 +345,7 @@ func NewWatermarkPublisher(q Queue, gate *BackpressureGate) *WatermarkPublisher 
 // cache (other producers can close the threshold too).
 func (p *WatermarkPublisher) Publish(ctx context.Context, stream string, msg Message) (string, error) {
 	if p.gate == nil {
-		return "", fmt.Errorf("queue: публикация %s: гейт не задан (NewWatermarkPublisher)", stream)
+		return "", fmt.Errorf("queue: publish %s: gate not set (NewWatermarkPublisher)", stream)
 	}
 	if err := p.gate.AwaitCapacity(ctx, stream); err != nil {
 		return "", err

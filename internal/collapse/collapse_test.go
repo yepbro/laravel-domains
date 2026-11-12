@@ -98,11 +98,11 @@ func TestSQLContract(t *testing.T) {
 	}
 	for sql, want := range cases {
 		if sql != want {
-			t.Errorf("SQL-контракт:\nполучен  %s\nожидался %s", sql, want)
+			t.Errorf("the SQL contract:\n got  %s\n want %s", sql, want)
 		}
 	}
 	if DefaultBatch != 50000 {
-		t.Errorf("DefaultBatch = %d, хочу 50000 (§7.3)", DefaultBatch)
+		t.Errorf("DefaultBatch = %d, want 50000 (§7.3)", DefaultBatch)
 	}
 }
 
@@ -119,12 +119,12 @@ func TestSpecOf(t *testing.T) {
 			t.Fatalf("SpecOf(%q): %v", tc.name, err)
 		}
 		if spec.TLD != tc.tld || spec.Prefix != tc.prefix || spec.ID != 7 || spec.Name != tc.name {
-			t.Errorf("SpecOf(%q) = %+v, хочу TLD %q, префикс %q", tc.name, spec, tc.tld, tc.prefix)
+			t.Errorf("SpecOf(%q) = %+v, want TLD %q, prefix %q", tc.name, spec, tc.tld, tc.prefix)
 		}
 	}
 	for _, bad := range []string{"in", ".in", "5g.", "in."} {
 		if _, err := SpecOf(ZoneRow{ID: 1, Name: bad}); err == nil {
-			t.Errorf("SpecOf(%q): ожидалась ошибка пустой метки", bad)
+			t.Errorf("SpecOf(%q): an empty-label error expected", bad)
 		}
 	}
 }
@@ -167,11 +167,11 @@ func (r *fakeRows) Next() bool {
 
 func (r *fakeRows) Scan(dest ...any) error {
 	if r.i == 0 || r.i > len(r.rows) {
-		return errors.New("fakeRows: Scan без Next")
+		return errors.New("fakeRows: Scan without Next")
 	}
 	row := r.rows[r.i-1]
 	if len(dest) != len(row) {
-		return fmt.Errorf("fakeRows: приёмников %d, колонок %d", len(dest), len(row))
+		return fmt.Errorf("fakeRows: %d destinations, %d columns", len(dest), len(row))
 	}
 	for i, d := range dest {
 		v := row[i]
@@ -185,7 +185,7 @@ func (r *fakeRows) Scan(dest ...any) error {
 		case *bool:
 			*dst = v.(bool)
 		default:
-			return fmt.Errorf("fakeRows: приёмник %T не поддерживается", d)
+			return fmt.Errorf("fakeRows: the destination %T is not supported", d)
 		}
 	}
 	return nil
@@ -322,7 +322,7 @@ func (f *fakeConn) zoneByID(id int16) bool {
 }
 
 func (f *fakeConn) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFromSource) (int64, error) {
-	return 0, errors.New("fakeConn: CopyFrom не должен вызываться")
+	return 0, errors.New("fakeConn: CopyFrom must not be called")
 }
 
 // op — протокол шагов (под мьютексом).
@@ -409,7 +409,7 @@ func (f *fakeConn) Exec(_ context.Context, sql string, args ...any) (pgconn.Comm
 		return pgconn.NewCommandTag("DELETE 0"), nil
 	default:
 		if !strings.HasPrefix(sql, "DROP TABLE ") {
-			return pgconn.CommandTag{}, errors.New("fakeConn: неожидаемый Exec: " + sql)
+			return pgconn.CommandTag{}, errors.New("fakeConn: an unexpected Exec: " + sql)
 		}
 		name := strings.Trim(sql[len("DROP TABLE "):], `"`)
 		f.op("drop:" + name)
@@ -421,7 +421,7 @@ func (f *fakeConn) Exec(_ context.Context, sql string, args ...any) (pgconn.Comm
 				}
 			}
 		}
-		return pgconn.CommandTag{}, fmt.Errorf("fakeConn: партиции %s нет", name)
+		return pgconn.CommandTag{}, fmt.Errorf("fakeConn: the partition %s does not exist", name)
 	}
 }
 
@@ -609,7 +609,7 @@ func (f *fakeConn) query(sql string, args []any) (*fakeRows, error) {
 		// пост-проверок тоже обязан приходить без открытых set'ов —
 		// перестановка хелперов местами на реальном пуле тот же дедлок.
 		if f.openSets > 0 {
-			return nil, fmt.Errorf("fakeConn: CheckZonesLeftSQL при открытом set'е (%d) — пост-проверки не выдают запросы при открытом set'е (дедлок пула, T-217)", f.openSets)
+			return nil, fmt.Errorf("fakeConn: CheckZonesLeftSQL with an open set (%d) — post-checks must not issue queries while a set is open (the pool deadlock, T-217)", f.openSets)
 		}
 		allow := map[string]bool{}
 		for _, a := range args[0].([]string) {
@@ -629,7 +629,7 @@ func (f *fakeConn) query(sql string, args []any) (*fakeRows, error) {
 		// set) Acquire второго запроса ждал бы вечно (дедлок
 		// пост-проверок инцидента 29.10). Стиль statusPool.
 		if f.openSets > 0 {
-			return nil, fmt.Errorf("fakeConn: CheckOrphansSQL при открытом set'е (%d) — первый set пост-проверок закрывается до второго запроса (дедлок пула, T-217)", f.openSets)
+			return nil, fmt.Errorf("fakeConn: CheckOrphansSQL with an open set (%d) — the first post-check set closes before the second query (the pool deadlock, T-217)", f.openSets)
 		}
 		var d, r, ld, lf, h int64
 		for _, dom := range f.domains {
@@ -667,7 +667,7 @@ func (f *fakeConn) query(sql string, args []any) (*fakeRows, error) {
 		}
 		return fakeRowsOf(), nil
 	default:
-		return nil, errors.New("fakeConn: неожидаемый Query: " + sql)
+		return nil, errors.New("fakeConn: an unexpected Query: " + sql)
 	}
 }
 
@@ -679,7 +679,7 @@ func (f *fakeConn) Begin(ctx context.Context) (pgx.Tx, error) {
 		return nil, err
 	}
 	if f.beginErrAfter > 0 && f.begins > f.beginErrAfter {
-		return nil, errors.New("имитация сбоя: соединение потеряно")
+		return nil, errors.New("a failure simulation: the connection is lost")
 	}
 	f.op("begin")
 	return &fakeTx{conn: f}, nil
@@ -717,7 +717,7 @@ func (tx *fakeTx) Exec(_ context.Context, sql string, args ...any) (pgconn.Comma
 	case moveResultsSQL, moveLaravelSQL, moveFindingsSQL:
 		return f.moveChildren(sql, args[0].(int16), args[1].(int16), args[2].(int64), args[3].(int64))
 	default:
-		return pgconn.CommandTag{}, errors.New("fakeTx: неожидаемый Exec: " + sql)
+		return pgconn.CommandTag{}, errors.New("fakeTx: an unexpected Exec: " + sql)
 	}
 }
 
@@ -756,8 +756,8 @@ func TestZoneFullTransfer(t *testing.T) {
 	f.files = []fFile{
 		{zone: zid, action: 1, sha256: "aa"},
 		{zone: zid, action: 1, sha256: "bb"},
-		{zone: in, action: 1, sha256: "aa"}, // конфликт ключа (zone_id, action, sha256)
-		{zone: 3, action: 2, sha256: "cc"},  // чужая зона — не трогается
+		{zone: in, action: 1, sha256: "aa"}, // a key conflict (zone_id, action, sha256)
+		{zone: 3, action: 2, sha256: "cc"},  // a foreign zone — not touched
 	}
 
 	res, err := Zone(context.Background(), f, spec5g(zid), 3) // batch = 3 → 3 батча
@@ -781,66 +781,66 @@ func TestZoneFullTransfer(t *testing.T) {
 		"zone-delete",
 	}
 	if got := strings.Join(f.ops, ","); got != strings.Join(wantOps, ",") {
-		t.Errorf("протокол шагов:\nполучен  %s\nожидался %s", got, strings.Join(wantOps, ","))
+		t.Errorf("the step protocol:\n got  %s\n want %s", got, strings.Join(wantOps, ","))
 	}
 
 	// Домены: зона in, label с доклейкой префикса.
 	for _, d := range f.domains {
 		if d.zone != in {
-			t.Fatalf("домен %d остался в зоне %d, хочу %d (in)", d.id, d.zone, in)
+			t.Fatalf("domain %d stayed in zone %d, want %d (in)", d.id, d.zone, in)
 		}
 		if want := "example" + strconv.FormatInt(d.id, 10) + ".5g"; d.label != want {
-			t.Errorf("домен %d: label %q, хочу %q (доклейка префикса)", d.id, d.label, want)
+			t.Errorf("domain %d: label %q, want %q (the prefix appended)", d.id, d.label, want)
 		}
 	}
 	// Дети всех таблиц и история переехали.
 	for table, rows := range f.children {
 		for _, c := range rows {
 			if c.zone != in {
-				t.Errorf("%s: домен %d остался в зоне %d", table, c.domain, c.zone)
+				t.Errorf("%s: domain %d stayed in zone %d", table, c.domain, c.zone)
 			}
 		}
 	}
 	// Файлы: дубль удалён, остальные перепривязаны; чужой не тронут.
 	if len(f.files) != 3 {
-		t.Fatalf("ingest_files: строк %d, хочу 3 (дубль удалён)", len(f.files))
+		t.Fatalf("ingest_files: %d rows, want 3 (the dupe removed)", len(f.files))
 	}
 	for _, fl := range f.files {
 		switch fl.sha256 {
 		case "aa", "bb":
 			if fl.zone != in {
-				t.Errorf("файл %s в зоне %d, хочу in (дубль 5g.in удалён, владелец и bb в in)", fl.sha256, fl.zone)
+				t.Errorf("the file %s in zone %d, want in (the 5g.in dupe removed, the owner and bb in in)", fl.sha256, fl.zone)
 			}
 		case "cc":
 			if fl.zone != 3 {
-				t.Errorf("чужой файл cc в зоне %d, хочу 3 (не трогается)", fl.zone)
+				t.Errorf("the foreign file cc in zone %d, want 3 (not touched)", fl.zone)
 			}
 		}
 	}
 	// Партиции 2LD дропнуты (партиции TLD созданы шагом 2).
 	if len(f.parts[zid]) != 0 {
-		t.Errorf("партиции 2LD остались: %v", f.parts[zid])
+		t.Errorf("the 2LD partitions remain: %v", f.parts[zid])
 	}
 	if len(f.parts[in]) != 4 {
-		t.Errorf("партиции зоны in не созданы шагом 2: %v", f.parts[in])
+		t.Errorf("the partitions of zone in not created by step 2: %v", f.parts[in])
 	}
 	if _, ok := f.zoneID("5g.in"); ok {
-		t.Error("строка зоны 5g.in не удалена")
+		t.Error("the row of zone 5g.in not deleted")
 	}
 
 	// Счётчики результата (все строки — этим запуском).
 	if res.Domains != 7 || res.Results != 7 || res.Laravel != 7 || res.Findings != 7 || res.History != 7 {
-		t.Errorf("счётчики результата: %+v, хочу по 7 строк каждой таблицы", res)
+		t.Errorf("the result counters: %+v, want 7 rows in each table", res)
 	}
 	if res.Files != 1 || res.FilesDupes != 1 {
-		t.Errorf("ingest_files: перенесено %d, дублей удалено %d; хочу 1 и 1", res.Files, res.FilesDupes)
+		t.Errorf("ingest_files: %d moved, %d dupes removed; want 1 and 1", res.Files, res.FilesDupes)
 	}
 	if res.Batches != 3 || res.TLDZoneNew || res.TLDZoneID != in {
-		t.Errorf("итог зоны: батчей %d, зона TLD id %d (новая %v), хочу 3 / %d / существующая",
+		t.Errorf("the zone result: %d batches, the TLD zone id %d (new %v), want 3 / %d / existing",
 			res.Batches, res.TLDZoneID, res.TLDZoneNew, in)
 	}
 	if res.SpotName != "example10.5g.in" || res.SpotLabel != "example10.5g" {
-		t.Errorf("спот-чек: имя %q, label %q; хочу example10.5g.in / example10.5g", res.SpotName, res.SpotLabel)
+		t.Errorf("the spot check: name %q, label %q; want example10.5g.in / example10.5g", res.SpotName, res.SpotLabel)
 	}
 }
 
@@ -858,7 +858,7 @@ func TestZoneBatches(t *testing.T) {
 	// Одна пачка [5, 9000]: все 3 id — в одном батче (пачка строк,
 	// ширина id-пространства между ними не множит батчи).
 	if f.begins != 1 {
-		t.Errorf("транзакций %d, хочу 1 (все id в одной пачке)", f.begins)
+		t.Errorf("transactions %d, want 1 (all ids in one chunk)", f.begins)
 	}
 	var dom []call
 	var child []call
@@ -871,22 +871,22 @@ func TestZoneBatches(t *testing.T) {
 		}
 	}
 	if len(dom) != 1 {
-		t.Fatalf("батчей UPDATE доменов %d, хочу 1", len(dom))
+		t.Fatalf("%d domain UPDATE batches, want 1", len(dom))
 	}
 	in, _ := f.zoneID("in")
 	// Параметры UPDATE доменов: tid, префикс, zid, lo, hi (контракт §7.3).
 	if got := dom[0].args; len(got) != 5 || got[0] != in || got[1] != "5g" ||
 		got[2] != zid || got[3] != int64(5) || got[4] != int64(9000) {
-		t.Errorf("аргументы UPDATE доменов = %v, хочу [%d 5g %d 5 9000]", got, in, zid)
+		t.Errorf("the domain UPDATE args = %v, want [%d 5g %d 5 9000]", got, in, zid)
 	}
 	// Дети — тем же диапазоном, тем же батчем (4 UPDATE вместе).
 	if len(child) != 3 {
-		t.Fatalf("UPDATE детей в батче: %d таблиц, хочу 3", len(child))
+		t.Fatalf("child UPDATEs in the batch: %d tables, want 3", len(child))
 	}
 	for _, c := range child {
 		if got := c.args; len(got) != 4 || got[0] != in || got[1] != zid ||
 			got[2] != int64(5) || got[3] != int64(9000) {
-			t.Errorf("аргументы UPDATE детей %s = %v", c.sql[:30], got)
+			t.Errorf("the child UPDATE args %s = %v", c.sql[:30], got)
 		}
 	}
 }
@@ -901,13 +901,13 @@ func TestZoneEmpty(t *testing.T) {
 		t.Fatalf("Zone: %v", err)
 	}
 	if res.Batches != 0 || res.Domains != 0 || res.SpotName != "" {
-		t.Errorf("пустая зона: %+v, хочу нули без спот-чека", res)
+		t.Errorf("an empty zone: %+v, want zeros without a spot check", res)
 	}
 	if _, ok := f.zoneID("5g.in"); ok {
-		t.Error("строка пустой зоны не удалена")
+		t.Error("the empty zone's row not deleted")
 	}
 	if !strings.Contains(strings.Join(f.ops, ","), "zone-delete") {
-		t.Error("шаг удаления строки не выполнялся")
+		t.Error("the row deletion step did not run")
 	}
 }
 
@@ -921,8 +921,8 @@ func TestZoneResume(t *testing.T) {
 
 	f.beginErrAfter = 1 // первый батч commit, второй Begin — сбой
 	_, err := Zone(context.Background(), f, spec5g(zid), 2)
-	if err == nil || !strings.Contains(err.Error(), "зона 5g.in") {
-		t.Fatalf("ошибка прерывания = %v, хочу контекст зоны 5g.in", err)
+	if err == nil || !strings.Contains(err.Error(), "zone 5g.in") {
+		t.Fatalf("the interrupt error = %v, want the zone 5g.in context", err)
 	}
 	// Частичный перенос: пачка [1,2] уехала, файлы/партиции/зона на месте.
 	moved, left := 0, 0
@@ -935,10 +935,10 @@ func TestZoneResume(t *testing.T) {
 		}
 	}
 	if moved != 2 || left != 3 {
-		t.Fatalf("после сбоя: перенесено %d, осталось %d; хочу 2/3", moved, left)
+		t.Fatalf("after the failure: %d moved, %d left; want 2/3", moved, left)
 	}
 	if _, ok := f.zoneID("5g.in"); !ok {
-		t.Fatal("строка зоны удалена до завершения переноса")
+		t.Fatal("the zone's row deleted before the move finished")
 	}
 
 	// Повтор: moving_ids пересобран по остатку, пачки адресуют только
@@ -946,21 +946,21 @@ func TestZoneResume(t *testing.T) {
 	f.beginErrAfter = 0
 	res, err := Zone(context.Background(), f, spec5g(zid), 2)
 	if err != nil {
-		t.Fatalf("повтор Zone: %v", err)
+		t.Fatalf("the repeated Zone: %v", err)
 	}
 	if res.Domains != 3 {
-		t.Errorf("повтор перенёс %d доменов, хочу 3 (остаток; уже перенесённые не трогаются)", res.Domains)
+		t.Errorf("the rerun moved %d domains, want 3 (the remainder; the already moved ones untouched)", res.Domains)
 	}
 	for _, d := range f.domains {
 		if d.zone != in {
-			t.Fatalf("домен %d в зоне %d после повтора, хочу in", d.id, d.zone)
+			t.Fatalf("domain %d in zone %d after the rerun, want in", d.id, d.zone)
 		}
 		if want := "example" + strconv.FormatInt(d.id, 10) + ".5g"; d.label != want {
-			t.Errorf("домен %d: label %q, хочу %q", d.id, d.label, want)
+			t.Errorf("domain %d: label %q, want %q", d.id, d.label, want)
 		}
 	}
 	if _, ok := f.zoneID("5g.in"); ok {
-		t.Error("строка зоны не удалена повтором")
+		t.Error("the zone's row not deleted by the rerun")
 	}
 
 	// Повтор по завершённой зоне: перенос не находит ни одной строки
@@ -974,10 +974,10 @@ func TestZoneResume(t *testing.T) {
 	f2.zones = append(f2.zones, fZone{id: zid2, name: "5g.in"})
 	res, err = Zone(context.Background(), f2, Spec{ID: zid2, Name: "5g.in", TLD: "in", Prefix: "5g"}, 2)
 	if err != nil {
-		t.Fatalf("повтор по пустой зоне: %v", err)
+		t.Fatalf("the rerun on an empty zone: %v", err)
 	}
 	if res.Domains != 0 || res.History != 0 || res.Files != 0 || res.Batches != 0 {
-		t.Errorf("повтор по пустой зоне перенёс строки: %+v", res)
+		t.Errorf("the rerun on an empty zone moved rows: %+v", res)
 	}
 }
 
@@ -991,20 +991,20 @@ func TestZoneBatchConflict(t *testing.T) {
 
 	_, err := Zone(context.Background(), f, spec5g(zid), 2)
 	if err == nil {
-		t.Fatal("конфликт UNIQUE не остановил команду")
+		t.Fatal("a UNIQUE conflict did not stop the command")
 	}
-	for _, want := range []string{"зона 5g.in", "[3, 4]", "domains_zone_id_label_key"} {
+	for _, want := range []string{"zone 5g.in", "[3, 4]", "domains_zone_id_label_key"} {
 		if !strings.Contains(err.Error(), want) {
-			t.Errorf("ошибка %q не содержит %q", err, want)
+			t.Errorf("the error %q does not contain %q", err, want)
 		}
 	}
 	ops := strings.Join(f.ops, ",")
 	if !strings.Contains(ops, "rollback") {
-		t.Error("транзакция батча не откатилась")
+		t.Error("the batch transaction did not roll back")
 	}
 	for _, late := range []string{"files-move", "zone-delete", "drop:"} {
 		if strings.Contains(ops, late) {
-			t.Errorf("после сбоя батча выполнился шаг %q", late)
+			t.Errorf("after the batch failure step %q ran", late)
 		}
 	}
 	// Первый батч остался зафиксированным (возобновляемость).
@@ -1016,7 +1016,7 @@ func TestZoneBatchConflict(t *testing.T) {
 		}
 	}
 	if n != 2 {
-		t.Errorf("зафиксированный батч перенёс %d доменов, хочу 2", n)
+		t.Errorf("the committed batch moved %d domains, want 2", n)
 	}
 }
 
@@ -1030,17 +1030,17 @@ func TestZoneLeftGuard(t *testing.T) {
 	f.children[moveResultsSQL] = append(f.children[moveResultsSQL], fChild{zid, 60000})
 
 	_, err := Zone(context.Background(), f, spec5g(zid), 50000)
-	if err == nil || !strings.Contains(err.Error(), "перенос неполон") {
-		t.Fatalf("ошибка = %v, хочу отказ страховки остатка", err)
+	if err == nil || !strings.Contains(err.Error(), "the move is incomplete") {
+		t.Fatalf("the error = %v, want the leftover guard rejection", err)
 	}
 	if !strings.Contains(err.Error(), "subdomain_results") {
-		t.Errorf("ошибка %v не называет таблицу остатка", err)
+		t.Errorf("the error %v does not name the leftover table", err)
 	}
 	if len(f.parts[zid]) != 4 {
-		t.Errorf("партиции дропнуты при остатке строк: %v", f.parts[zid])
+		t.Errorf("partitions dropped with rows left: %v", f.parts[zid])
 	}
 	if _, ok := f.zoneID("5g.in"); !ok {
-		t.Error("строка зоны удалена при остатке строк")
+		t.Error("the zone's row deleted with rows left")
 	}
 }
 
@@ -1064,16 +1064,16 @@ func TestZoneNewTLDZone(t *testing.T) {
 	}
 	uk, ok := f.zoneID("uk")
 	if !ok {
-		t.Fatal("зона uk не создана")
+		t.Fatal("the zone uk not created")
 	}
 	if res.TLDZoneID != uk || !res.TLDZoneNew {
-		t.Errorf("итог зоны: TLD id %d (новая %v)", res.TLDZoneID, res.TLDZoneNew)
+		t.Errorf("the zone result: the TLD id %d (new %v)", res.TLDZoneID, res.TLDZoneNew)
 	}
 	if len(f.parts[uk]) != 4 {
-		t.Errorf("партиции новой зоны uk не созданы: %v", f.parts[uk])
+		t.Errorf("the partitions of the new zone uk not created: %v", f.parts[uk])
 	}
 	if d := f.domains[0]; d.zone != uk || d.label != "shop.co" {
-		t.Errorf("домен: зона %d, label %q; хочу uk / shop.co", d.zone, d.label)
+		t.Errorf("the domain: zone %d, label %q; want uk / shop.co", d.zone, d.label)
 	}
 	// Вставка зоны TLD — аргументы контракта шага 1.
 	var insert *call
@@ -1083,7 +1083,7 @@ func TestZoneNewTLDZone(t *testing.T) {
 		}
 	}
 	if insert == nil || insert.args[0] != "uk" || insert.args[1] != "" {
-		t.Errorf("вставка зоны TLD = %+v, хочу (uk, \"\" — nullif → NULL)", insert)
+		t.Errorf("the TLD zone insert = %+v, want (uk, \"\" — nullif → NULL)", insert)
 	}
 }
 
@@ -1092,22 +1092,22 @@ func TestZoneNewTLDZone(t *testing.T) {
 func TestZoneExecError(t *testing.T) {
 	f := newFakeConn()
 	zid := f.seed2LD(t, []int64{1}, false)
-	f.errE = errors.New("отказ БД")
+	f.errE = errors.New("DB failure")
 
 	if _, err := Zone(context.Background(), f, spec5g(zid), 50000); err == nil ||
-		!strings.Contains(err.Error(), "зона 5g.in") {
-		t.Errorf("ошибка подготовки = %v, хочу контекст зоны", err)
+		!strings.Contains(err.Error(), "zone 5g.in") {
+		t.Errorf("the prepare error = %v, want the zone context", err)
 	}
 	if d := f.domains[0]; d.zone != zid {
-		t.Errorf("домен перенесён при отказе БД: %+v", d)
+		t.Errorf("a domain moved on a DB failure: %+v", d)
 	}
 }
 
 // TestZoneNilConn — отказ до обращения к БД.
 func TestZoneNilConn(t *testing.T) {
 	if _, err := Zone(context.Background(), nil, spec5g(1), 0); err == nil ||
-		!strings.Contains(err.Error(), "соединение не задано") {
-		t.Errorf("Zone(nil) = %v, хочу отказ", err)
+		!strings.Contains(err.Error(), "connection not set") {
+		t.Errorf("Zone(nil) = %v, want a rejection", err)
 	}
 }
 
@@ -1126,21 +1126,21 @@ func TestInventory(t *testing.T) {
 		t.Fatalf("Inventory: %v", err)
 	}
 	if len(zones) != 2 {
-		t.Fatalf("2LD-зон %d, хочу 2 (5g.in и crawl.test; TLD не считаются)", len(zones))
+		t.Fatalf("%d 2LD zones, want 2 (5g.in and crawl.test; TLDs do not count)", len(zones))
 	}
 	z := zones[0]
 	if z.Name != "5g.in" || z.ID != zid || z.Domains != 2 || z.Results != 2 ||
 		z.Findings != 2 || z.History != 2 || z.Files != 1 || !z.Parts {
-		t.Errorf("строка инвентаризации = %+v", z)
+		t.Errorf("the inventory row = %+v", z)
 	}
 
 	// Allowlist исключает свои зоны из сворачивания (§7.1).
 	zones, err = Inventory(context.Background(), f, []string{"5g.in", "crawl.test"})
 	if err != nil {
-		t.Fatalf("Inventory с allowlist: %v", err)
+		t.Fatalf("Inventory with an allowlist: %v", err)
 	}
 	if len(zones) != 0 {
-		t.Errorf("allowlist-зоны попали в инвентаризацию: %+v", zones)
+		t.Errorf("allowlist zones made it into the inventory: %+v", zones)
 	}
 }
 
@@ -1155,19 +1155,19 @@ func TestQueuedCounts(t *testing.T) {
 		t.Fatalf("QueuedCounts: %v", err)
 	}
 	if n := queued[zid]; n != 2 {
-		t.Errorf("доменов в очереди %d, хочу 2", n)
+		t.Errorf("queued domains %d, want 2", n)
 	}
 	// Аргументы контракта: массив зон и код check_state = 1 (queued).
 	last := f.queries[len(f.queries)-1]
 	if ids := last.args[0].([]int16); len(ids) != 1 || ids[0] != zid {
-		t.Errorf("аргумент зон = %v", last.args[0])
+		t.Errorf("the zones argument = %v", last.args[0])
 	}
 	if last.args[1] != int16(1) {
-		t.Errorf("check_state = %v, хочу 1 (queued)", last.args[1])
+		t.Errorf("check_state = %v, want 1 (queued)", last.args[1])
 	}
 
 	if queued, err = QueuedCounts(context.Background(), f, nil); err != nil || len(queued) != 0 {
-		t.Errorf("пустой список зон: %v, %v", queued, err)
+		t.Errorf("an empty zone list: %v, %v", queued, err)
 	}
 }
 
@@ -1185,17 +1185,17 @@ func TestPostChecksAndSpot(t *testing.T) {
 		t.Fatalf("PostChecks: %v", err)
 	}
 	if left != 1 {
-		t.Errorf("2LD-зон %d, хочу 1 (переноса ещё не было)", left)
+		t.Errorf("%d 2LD zones, want 1 (no move yet)", left)
 	}
 
 	// Сироты: ребёнок в зоне без строки.
 	f.children[moveResultsSQL] = append(f.children[moveResultsSQL], fChild{9999, 1})
 	_, orphans, err := PostChecks(context.Background(), f, allow)
 	if err != nil {
-		t.Fatalf("PostChecks с сиротами: %v", err)
+		t.Fatalf("PostChecks with orphans: %v", err)
 	}
 	if orphans.Results != 1 || !orphans.Any() {
-		t.Errorf("сироты = %+v, хочу 1 в subdomain_results", orphans)
+		t.Errorf("orphans = %+v, want 1 in subdomain_results", orphans)
 	}
 
 	// Чистое состояние: перенос руками фейка — зона удалена, домен
@@ -1219,23 +1219,23 @@ func TestPostChecksAndSpot(t *testing.T) {
 	}
 	left, orphans, err = PostChecks(context.Background(), f, allow)
 	if err != nil {
-		t.Fatalf("PostChecks чистый: %v", err)
+		t.Fatalf("PostChecks clean: %v", err)
 	}
 	if left != 0 || orphans.Any() {
-		t.Errorf("чистое состояние: left %d, сироты %+v", left, orphans)
+		t.Errorf("the clean state: left %d, orphans %+v", left, orphans)
 	}
 
 	// Спот-чек: эмуляция domain_info отвечает зону T и label с префиксом.
 	if err := SpotCheck(context.Background(), f, "example1.5g.in", "in", "example1.5g"); err != nil {
 		t.Fatalf("SpotCheck: %v", err)
 	}
-	if err := SpotCheck(context.Background(), f, "example1.5g.in", "in", "не-такой"); err == nil ||
+	if err := SpotCheck(context.Background(), f, "example1.5g.in", "in", "no-such"); err == nil ||
 		!strings.Contains(err.Error(), "label") {
-		t.Errorf("SpotCheck с чужим label = %v, хочу расхождение label", err)
+		t.Errorf("SpotCheck with a foreign label = %v, want a label mismatch", err)
 	}
 	if err := SpotCheck(context.Background(), f, "no-such.in", "in", "no-such"); err == nil ||
-		!strings.Contains(err.Error(), "не нашёл") {
-		t.Errorf("SpotCheck отсутствующего = %v, хочу «не нашёл»", err)
+		!strings.Contains(err.Error(), "found no domain") {
+		t.Errorf("SpotCheck of a missing domain = %v, want «found no domain»", err)
 	}
 }
 
@@ -1257,17 +1257,17 @@ func TestPostChecksClosesSetBeforeOrphans(t *testing.T) {
 	open := f.openSets
 	f.mu.Unlock()
 	if open != 0 {
-		t.Errorf("после PostChecks открытых set'ов %d, хочу 0 (оба set'а закрываются)", open)
+		t.Errorf("after PostChecks %d open sets, want 0 (both sets close)", open)
 	}
 }
 
 // TestAllowlistArg — nil → пустой массив: ALL(NULL) вышибает предикат.
 func TestAllowlistArg(t *testing.T) {
 	if got := allowlistArg(nil); got == nil || len(got) != 0 {
-		t.Errorf("allowlistArg(nil) = %v, хочу пустой не-nil массив", got)
+		t.Errorf("allowlistArg(nil) = %v, want an empty non-nil slice", got)
 	}
 	if got := allowlistArg([]string{"crawl.test"}); len(got) != 1 || got[0] != "crawl.test" {
-		t.Errorf("allowlistArg = %v, хочу вход без изменений", got)
+		t.Errorf("allowlistArg = %v, want the input unchanged", got)
 	}
 }
 
@@ -1283,14 +1283,14 @@ func TestPrintPlanFormat(t *testing.T) {
 	printPlan(&b, zones)
 	got := b.String()
 	for _, want := range []string{
-		"зона", "TLD", "доменов", "результатов", "находок", "история", "файлов", "партиции",
-		"5g.in", " in ", "12", "есть",
+		"zone", "TLD", "domains", "results", "findings", "history", "files", "partitions",
+		"5g.in", " in ", "12", "yes",
 		"co.in", "default",
-		"итого: 2LD-зон 2, доменов 3456801 → зоны in",
-		"итого: 2LD-зон 1, доменов 7 → зона uk",
+		"total: 2 2LD zones, 3456801 domains → zones in",
+		"total: 1 2LD zones, 7 domains → zone uk",
 	} {
 		if !strings.Contains(got, want) {
-			t.Errorf("план не содержит %q:\n%s", want, got)
+			t.Errorf("the plan does not contain %q:\n%s", want, got)
 		}
 	}
 	// Числа вправо: колонка доменов выровнена по ширине максимального
@@ -1299,11 +1299,11 @@ func TestPrintPlanFormat(t *testing.T) {
 		switch {
 		case strings.HasPrefix(line, "5g.in"):
 			if !strings.Contains(line, "      12 ") {
-				t.Errorf("колонка доменов 5g.in не вправо:\n%s", got)
+				t.Errorf("the domains column of 5g.in not right-aligned:\n%s", got)
 			}
 		case strings.HasPrefix(line, "co.in"):
 			if !strings.Contains(line, " 3456789 ") {
-				t.Errorf("колонка доменов co.in не вправо:\n%s", got)
+				t.Errorf("the domains column of co.in not right-aligned:\n%s", got)
 			}
 		}
 	}
@@ -1330,15 +1330,15 @@ func (h *hangDropConn) Exec(ctx context.Context, sql string, _ ...any) (pgconn.C
 }
 
 func (h *hangDropConn) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFromSource) (int64, error) {
-	return 0, errors.New("hangDropConn: CopyFrom не должен вызываться")
+	return 0, errors.New("hangDropConn: CopyFrom must not be called")
 }
 
 func (h *hangDropConn) Query(context.Context, string, ...any) (pgx.Rows, error) {
-	return nil, errors.New("hangDropConn: Query не должен вызываться")
+	return nil, errors.New("hangDropConn: Query must not be called")
 }
 
 func (h *hangDropConn) Begin(context.Context) (pgx.Tx, error) {
-	return nil, errors.New("hangDropConn: Begin не должен вызываться")
+	return nil, errors.New("hangDropConn: Begin must not be called")
 }
 
 // TestDropMovingTimeout — уборка moving_ids обязана отменяться
@@ -1347,7 +1347,7 @@ func (h *hangDropConn) Begin(context.Context) (pgx.Tx, error) {
 // возвращаясь (затенять результат команды ей нечем).
 func TestDropMovingTimeout(t *testing.T) {
 	if movingDropTimeout != 5*time.Second {
-		t.Errorf("movingDropTimeout = %s, хочу 5s (образец discardTimeout, ingest)", movingDropTimeout)
+		t.Errorf("movingDropTimeout = %s, want 5s (modeled on discardTimeout, ingest)", movingDropTimeout)
 	}
 	conn := &hangDropConn{canceled: make(chan struct{})}
 	var logBuf strings.Builder
@@ -1359,14 +1359,14 @@ func TestDropMovingTimeout(t *testing.T) {
 	started := time.Now()
 	dropMoving(conn, budget, log)
 	if elapsed := time.Since(started); elapsed > time.Second {
-		t.Errorf("уборка висела %s — бюджет %s не отменил зависший DROP", elapsed, budget)
+		t.Errorf("the cleanup hung for %s — the %s budget did not cancel the hung DROP", elapsed, budget)
 	}
 	select {
 	case <-conn.canceled:
 	default:
-		t.Error("Exec не увидел отмену контекста (контекст без дедлайна висел бы вечно)")
+		t.Error("Exec did not see the context cancel (a context without a deadline would hang forever)")
 	}
 	if out := logBuf.String(); !strings.Contains(out, "moving_ids") {
-		t.Errorf("ошибка уборки не попала в лог (Warn): %q", out)
+		t.Errorf("the cleanup error did not reach the log (Warn): %q", out)
 	}
 }

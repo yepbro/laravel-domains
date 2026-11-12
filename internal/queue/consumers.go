@@ -162,7 +162,7 @@ func (o ConsumerOptions) withDefaults() ConsumerOptions {
 // an error: nothing to clean.
 func CleanupConsumersOnce(ctx context.Context, rdb consumerGroups, opt ConsumerOptions) (int, error) {
 	if rdb == nil {
-		return 0, errors.New("queue: чистка консьюмеров: клиент Redis не задан")
+		return 0, errors.New("queue: consumer cleanup: Redis client not set")
 	}
 	o := opt.withDefaults()
 	// The pairs are traversed in ascending stream-name order — a
@@ -180,11 +180,11 @@ func CleanupConsumersOnce(ctx context.Context, rdb consumerGroups, opt ConsumerO
 	for _, stream := range streams {
 		group := o.Groups[stream]
 		if !knownStream(stream) {
-			errs = append(errs, fmt.Errorf("queue: чистка консьюмеров: неизвестный стрим %q (стримы очереди — константы пакета: StreamDNS, StreamHTTP, StreamRender, StreamRenderFallback, StreamAnalyze, StreamDead)", stream))
+			errs = append(errs, fmt.Errorf("queue: consumer cleanup: unknown stream %q (queue streams are package constants: StreamDNS, StreamHTTP, StreamRender, StreamRenderFallback, StreamAnalyze, StreamDead)", stream))
 			continue
 		}
 		if group == "" {
-			errs = append(errs, fmt.Errorf("queue: чистка консьюмеров %s: не задана группа", stream))
+			errs = append(errs, fmt.Errorf("queue: consumer cleanup %s: group not set", stream))
 			continue
 		}
 		// The group counter is exact under any outcome: the increment
@@ -215,7 +215,7 @@ func cleanupGroup(ctx context.Context, rdb consumerGroups, stream, group string,
 		if errors.Is(err, redis.Nil) || strings.Contains(err.Error(), "no such key") || isNoGroup(err) {
 			return 0, nil
 		}
-		return 0, fmt.Errorf("queue: чистка консьюмеров %s (группа %s): %w", stream, group, err)
+		return 0, fmt.Errorf("queue: consumer cleanup %s (group %s): %w", stream, group, err)
 	}
 	var (
 		removed int
@@ -237,7 +237,7 @@ func cleanupGroup(ctx context.Context, rdb consumerGroups, stream, group string,
 			// Emptiness not confirmed — do not delete: the next pass
 			// will retry (the consumer stays in the group, nothing is
 			// lost).
-			errs = append(errs, fmt.Errorf("queue: чистка консьюмеров %s (группа %s): проверка pending %s: %w", stream, group, c.Name, err))
+			errs = append(errs, fmt.Errorf("queue: consumer cleanup %s (group %s): pending check %s: %w", stream, group, c.Name, err))
 			continue
 		}
 		if len(pend) > 0 {
@@ -247,7 +247,7 @@ func cleanupGroup(ctx context.Context, rdb consumerGroups, stream, group string,
 		}
 		pel, err := rdb.XGroupDelConsumer(ctx, stream, group, c.Name).Result()
 		if err != nil {
-			errs = append(errs, fmt.Errorf("queue: чистка консьюмеров %s (группа %s): удаление %s: %w", stream, group, c.Name, err))
+			errs = append(errs, fmt.Errorf("queue: consumer cleanup %s (group %s): deleting %s: %w", stream, group, c.Name, err))
 			continue
 		}
 		removed++
@@ -255,7 +255,7 @@ func cleanupGroup(ctx context.Context, rdb consumerGroups, stream, group string,
 			// The revival race did happen: PEL entries were removed
 			// together with the consumer — an undelivery forever (the
 			// file header), triage by the journal is required.
-			errs = append(errs, fmt.Errorf("queue: чистка консьюмеров %s (группа %s): удаление %s унесло %d pending-записей (гонка оживления) — записи не будут доставлены, разберите вручную по идентификаторам предмета", stream, group, c.Name, pel))
+			errs = append(errs, fmt.Errorf("queue: consumer cleanup %s (group %s): deleting %s removed %d pending entries (the revival race) — the entries will never be delivered, triage them manually by the subject identifiers", stream, group, c.Name, pel))
 		}
 	}
 	return removed, errors.Join(errs...)
@@ -272,7 +272,7 @@ func cleanupGroup(ctx context.Context, rdb consumerGroups, stream, group string,
 // (T-012, graceful shutdown, spec 3.4).
 func CleanupConsumersLoop(ctx context.Context, rdb consumerGroups, opt ConsumerOptions) error {
 	if rdb == nil {
-		return errors.New("queue: цикл чистки консьюмеров: клиент Redis не задан")
+		return errors.New("queue: consumer cleanup loop: Redis client not set")
 	}
 	o := opt.withDefaults()
 	log := o.Log
@@ -284,16 +284,16 @@ func CleanupConsumersLoop(ctx context.Context, rdb consumerGroups, opt ConsumerO
 		pairs = append(pairs, s+"="+g)
 	}
 	sort.Strings(pairs)
-	log.Info("цикл чистки мёртвых консьюмеров групп",
+	log.Info("dead consumer group cleanup loop",
 		"groups", strings.Join(pairs, ","), "idle", o.Idle.String(), "interval", o.Interval.String())
 
 	cleanup := func() {
 		removed, err := CleanupConsumersOnce(ctx, rdb, o)
 		if err != nil && ctx.Err() == nil {
-			log.Warn("чистка мёртвых консьюмеров групп", "err", err)
+			log.Warn("dead consumer group cleanup", "err", err)
 		}
 		if removed > 0 {
-			log.Info("удалены мёртвые консьюмеры групп", "removed", removed, "idle", o.Idle.String())
+			log.Info("dead consumer groups removed", "removed", removed, "idle", o.Idle.String())
 		}
 	}
 

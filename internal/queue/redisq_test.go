@@ -113,17 +113,17 @@ var (
 // interval — a valid wait, not "zero".
 func TestRedisQueueBlockDefault(t *testing.T) {
 	if DefaultRedisBlock != 2*time.Second {
-		t.Errorf("DefaultRedisBlock = %s, хочу 2s (литерал — пин константы)", DefaultRedisBlock)
+		t.Errorf("DefaultRedisBlock = %s, want 2s (the literal pins the constant)", DefaultRedisBlock)
 	}
 	for _, block := range []time.Duration{0, -time.Second} {
 		q := NewRedisQueue(&fakeRedis{}, RedisOptions{Block: block})
 		if q.opt.Block != DefaultRedisBlock {
-			t.Errorf("Block %s не заменён дефолтом: %s", block, q.opt.Block)
+			t.Errorf("Block %s not replaced by the default: %s", block, q.opt.Block)
 		}
 	}
 	q := NewRedisQueue(&fakeRedis{}, RedisOptions{Block: time.Nanosecond})
 	if q.opt.Block != time.Nanosecond {
-		t.Errorf("Block 1нс заменён дефолтом: %s, хочу 1нс (положительное ожидание валидно)", q.opt.Block)
+		t.Errorf("Block 1ns replaced by the default: %s, want 1ns (a positive wait is valid)", q.opt.Block)
 	}
 }
 
@@ -138,41 +138,41 @@ func TestRedisQueuePublish(t *testing.T) {
 		t.Fatalf("Publish: %v", err)
 	}
 	if id != "1718-0" {
-		t.Errorf("Publish вернул %q, хочу идентификатор записи %q", id, fake.addID)
+		t.Errorf("Publish returned %q, want the entry id %q", id, fake.addID)
 	}
 	if len(fake.adds) != 1 {
-		t.Fatalf("вызовов XADD: %d, хочу 1", len(fake.adds))
+		t.Fatalf("XADD calls: %d, want 1", len(fake.adds))
 	}
 	add := fake.adds[0]
 	if add.Stream != StreamDNS {
-		t.Errorf("XADD в стрим %q, хочу %q", add.Stream, StreamDNS)
+		t.Errorf("XADD to stream %q, want %q", add.Stream, StreamDNS)
 	}
 	// The T-025 policy: without an explicit limit the stream limit
 	// applies.
 	if add.MaxLen != DefaultStreamMaxLen(StreamDNS) || !add.Approx {
-		t.Errorf("XADD без MaxLen в опциях: MaxLen=%d Approx=%v, хочу MAXLEN ~ %d",
+		t.Errorf("XADD without MaxLen in options: MaxLen=%d Approx=%v, want MAXLEN ~ %d",
 			add.MaxLen, add.Approx, DefaultStreamMaxLen(StreamDNS))
 	}
 	values, ok := add.Values.(map[string]any)
 	if !ok {
-		t.Fatalf("XADD values: %T, хочу map[string]any", add.Values)
+		t.Fatalf("XADD values: %T, want map[string]any", add.Values)
 	}
 	data, ok := values[fieldData].([]byte)
 	if !ok {
-		t.Fatalf("XADD values[%q]: %T, хочу []byte", fieldData, values[fieldData])
+		t.Fatalf("XADD values[%q]: %T, want []byte", fieldData, values[fieldData])
 	}
 	var probe struct {
 		TaskID  string      `json:"task_id"`
 		Domains []DNSDomain `json:"domains"`
 	}
 	if err := json.Unmarshal(data, &probe); err != nil {
-		t.Fatalf("поле data не JSON: %v", err)
+		t.Fatalf("the data field is not JSON: %v", err)
 	}
 	if len(probe.TaskID) != 32 {
-		t.Errorf("пустой task_id не заполнен при публикации: %q", probe.TaskID)
+		t.Errorf("the empty task_id not filled on publication: %q", probe.TaskID)
 	}
 	if len(probe.Domains) != 1 || probe.Domains[0].Name != "example.com" {
-		t.Errorf("поле data: %+v", probe)
+		t.Errorf("the data field: %+v", probe)
 	}
 }
 
@@ -185,7 +185,7 @@ func TestRedisQueuePublishMaxLen(t *testing.T) {
 	}
 	add := fake.adds[0]
 	if add.MaxLen != 100000 || !add.Approx {
-		t.Errorf("MAXLEN ~ не передан: MaxLen=%d Approx=%v", add.MaxLen, add.Approx)
+		t.Errorf("MAXLEN ~ not passed: MaxLen=%d Approx=%v", add.MaxLen, add.Approx)
 	}
 }
 
@@ -198,9 +198,9 @@ func TestRedisQueuePublishError(t *testing.T) {
 		msg     Message
 		wantErr string
 	}{
-		{"чужой стрим", StreamHTTP, DNSBatch{Domains: []DNSDomain{{ZoneID: 1, DomainID: 1, Name: "a.test"}}}, "публикуется в"},
-		{"невалидное сообщение", StreamDNS, DNSBatch{}, "пустая пачка"},
-		{"неизвестный стрим", "q:typo", DNSBatch{Domains: []DNSDomain{{ZoneID: 1, DomainID: 1, Name: "a.test"}}}, "неизвестный стрим"},
+		{"a foreign stream", StreamHTTP, DNSBatch{Domains: []DNSDomain{{ZoneID: 1, DomainID: 1, Name: "a.test"}}}, "published to"},
+		{"an invalid message", StreamDNS, DNSBatch{}, "empty batch"},
+		{"an unknown stream", "q:typo", DNSBatch{Domains: []DNSDomain{{ZoneID: 1, DomainID: 1, Name: "a.test"}}}, "unknown stream"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -208,10 +208,10 @@ func TestRedisQueuePublishError(t *testing.T) {
 			q := NewRedisQueue(fake, RedisOptions{})
 			_, err := q.Publish(context.Background(), c.stream, c.msg)
 			if err == nil || !strings.Contains(err.Error(), c.wantErr) {
-				t.Fatalf("Publish: %v, хочу ошибку с %q", err, c.wantErr)
+				t.Fatalf("Publish: %v, want an error with %q", err, c.wantErr)
 			}
 			if len(fake.adds) != 0 {
-				t.Errorf("невалидное сообщение дошло до XADD: %+v", fake.adds)
+				t.Errorf("the invalid message reached XADD: %+v", fake.adds)
 			}
 		})
 	}
@@ -219,7 +219,7 @@ func TestRedisQueuePublishError(t *testing.T) {
 	fake := &fakeRedis{addErr: errors.New("connection refused")}
 	q := NewRedisQueue(fake, RedisOptions{})
 	if _, err := q.Publish(context.Background(), StreamDNS, DNSBatch{Domains: []DNSDomain{{ZoneID: 1, DomainID: 1, Name: "a.test"}}}); err == nil {
-		t.Fatal("ошибка XADD не возвращена")
+		t.Fatal("the XADD error not returned")
 	}
 }
 
@@ -239,12 +239,12 @@ func TestRedisQueuePublishMarshalError(t *testing.T) {
 	fake := &fakeRedis{}
 	q := NewRedisQueue(fake, RedisOptions{})
 	_, err := q.Publish(context.Background(), StreamDNS, alienMessage{})
-	if err == nil || !strings.Contains(err.Error(), "сериализовать") ||
-		!strings.Contains(err.Error(), "неизвестный тип") {
-		t.Fatalf("Publish: %v, хочу ошибку сериализации с типом сообщения", err)
+	if err == nil || !strings.Contains(err.Error(), "serialize") ||
+		!strings.Contains(err.Error(), "unknown message type") {
+		t.Fatalf("Publish: %v, want a serialization error naming the message type", err)
 	}
 	if len(fake.adds) != 0 {
-		t.Errorf("несериализуемое сообщение дошло до XADD: %+v", fake.adds)
+		t.Errorf("the non-serializable message reached XADD: %+v", fake.adds)
 	}
 }
 
@@ -269,26 +269,26 @@ func TestRedisQueueConsume(t *testing.T) {
 	// The group is created on the first read: from the start of the
 	// stream, MKSTREAM.
 	if want := []string{StreamDNS + " dns 0"}; !reflect.DeepEqual(fake.creates, want) {
-		t.Errorf("XGROUP CREATE: %v, хочу %v", fake.creates, want)
+		t.Errorf("XGROUP CREATE: %v, want %v", fake.creates, want)
 	}
 
 	// The XREADGROUP arguments: only the group's new entries, the batch
 	// and the wait.
 	if len(fake.reads) != 1 {
-		t.Fatalf("вызовов XREADGROUP: %d, хочу 1", len(fake.reads))
+		t.Fatalf("XREADGROUP calls: %d, want 1", len(fake.reads))
 	}
 	args := fake.reads[0]
 	if args.Group != "dns" || args.Consumer != "dns-1" {
-		t.Errorf("группа/потребитель: %q/%q", args.Group, args.Consumer)
+		t.Errorf("group/consumer: %q/%q", args.Group, args.Consumer)
 	}
 	if want := []string{StreamDNS, ">"}; !reflect.DeepEqual(args.Streams, want) {
-		t.Errorf("Streams: %v, хочу %v", args.Streams, want)
+		t.Errorf("Streams: %v, want %v", args.Streams, want)
 	}
 	if args.Count != 10 {
-		t.Errorf("Count: %d, хочу 10", args.Count)
+		t.Errorf("Count: %d, want 10", args.Count)
 	}
 	if args.Block != DefaultRedisBlock {
-		t.Errorf("Block: %s, хочу по умолчанию %s", args.Block, DefaultRedisBlock)
+		t.Errorf("Block: %s, want the default %s", args.Block, DefaultRedisBlock)
 	}
 
 	want := []Delivery{
@@ -297,7 +297,7 @@ func TestRedisQueueConsume(t *testing.T) {
 		{Stream: StreamDNS, ID: "1720-0", Payload: nil},
 	}
 	if !reflect.DeepEqual(got, want) {
-		t.Errorf("Consume:\n получил  %+v\n хочу     %+v", got, want)
+		t.Errorf("Consume:\n got  %+v\n want %+v", got, want)
 	}
 }
 
@@ -310,18 +310,18 @@ func TestRedisQueueConsumeGroupCached(t *testing.T) {
 		}
 	}
 	if len(fake.creates) != 1 {
-		t.Errorf("XGROUP CREATE вызван %d раз, хочу 1 (группа запоминается)", len(fake.creates))
+		t.Errorf("XGROUP CREATE called %d times, want 1 (the group is remembered)", len(fake.creates))
 	}
 	if len(fake.reads) != 3 {
-		t.Errorf("XREADGROUP вызван %d раз, хочу 3", len(fake.reads))
+		t.Errorf("XREADGROUP called %d times, want 3", len(fake.reads))
 	}
 
 	// Another group of the same stream — a separate creation.
 	if _, err := q.Consume(context.Background(), StreamHTTP, "http-2", "http-1", 5); err != nil {
-		t.Fatalf("Consume другой группы: %v", err)
+		t.Fatalf("Consume of another group: %v", err)
 	}
 	if len(fake.creates) != 2 {
-		t.Errorf("XGROUP CREATE вызван %d раз, хочу 2", len(fake.creates))
+		t.Errorf("XGROUP CREATE called %d times, want 2", len(fake.creates))
 	}
 }
 
@@ -332,7 +332,7 @@ func TestRedisQueueConsumeBusyGroup(t *testing.T) {
 	}
 	q := NewRedisQueue(fake, RedisOptions{})
 	if _, err := q.Consume(context.Background(), StreamAnalyze, "analyzer", "analyzer-1", 1); err != nil {
-		t.Fatalf("BUSYGROUP — не ошибка: %v", err)
+		t.Fatalf("BUSYGROUP — not an error: %v", err)
 	}
 }
 
@@ -352,18 +352,18 @@ func TestRedisQueueConsumeGroupLost(t *testing.T) {
 
 	// The first read creates the group and lands in the cache.
 	if _, err := q.Consume(context.Background(), StreamDNS, "dns", "dns-1", 1); err != nil {
-		t.Fatalf("Consume до потери: %v", err)
+		t.Fatalf("Consume before the loss: %v", err)
 	}
 	// The second — after the stream "loss": NOGROUP, recreation, retry.
 	got, err := q.Consume(context.Background(), StreamDNS, "dns", "dns-1", 1)
 	if err != nil || got != nil {
-		t.Fatalf("Consume после потери: (%v, %v), хочу (nil, nil)", got, err)
+		t.Fatalf("Consume after the loss: (%v, %v), want (nil, nil)", got, err)
 	}
 	if len(fake.creates) != 2 {
-		t.Errorf("XGROUP CREATE вызван %d раз, хочу 2 (пересоздание после NOGROUP)", len(fake.creates))
+		t.Errorf("XGROUP CREATE called %d times, want 2 (recreation after NOGROUP)", len(fake.creates))
 	}
 	if len(fake.reads) != 3 {
-		t.Errorf("XREADGROUP вызван %d раз, хочу 3", len(fake.reads))
+		t.Errorf("XREADGROUP called %d times, want 3", len(fake.reads))
 	}
 }
 
@@ -389,18 +389,18 @@ func TestRedisQueueConsumeGroupLostAtProgress(t *testing.T) {
 	q := NewRedisQueue(fake, RedisOptions{})
 
 	if got, err := q.Consume(context.Background(), StreamDNS, "dns", "dns-1", 10); err != nil || len(got) != 2 {
-		t.Fatalf("первое чтение: (%v, %v)", got, err)
+		t.Fatalf("the first read: (%v, %v)", got, err)
 	}
 	// The group "loss": recreation from the progress of the first read.
 	if got, err := q.Consume(context.Background(), StreamDNS, "dns", "dns-1", 10); err != nil || got != nil {
-		t.Fatalf("чтение после потери: (%v, %v), хочу (nil, nil)", got, err)
+		t.Fatalf("the read after the loss: (%v, %v), want (nil, nil)", got, err)
 	}
 	want := []string{
 		StreamDNS + " dns 0",      // the first creation — from the start of the stream
 		StreamDNS + " dns 1719-0", // the recovery — from the last read
 	}
 	if !reflect.DeepEqual(fake.creates, want) {
-		t.Errorf("XGROUP CREATE: %v, хочу %v", fake.creates, want)
+		t.Errorf("XGROUP CREATE: %v, want %v", fake.creates, want)
 	}
 }
 
@@ -420,13 +420,13 @@ func TestRedisQueueConsumeGroupLostNoCache(t *testing.T) {
 
 	got, err := q.Consume(context.Background(), StreamDNS, "dns", "dns-1", 1)
 	if err != nil || got != nil {
-		t.Fatalf("Consume после потери: (%v, %v), хочу (nil, nil)", got, err)
+		t.Fatalf("Consume after the loss: (%v, %v), want (nil, nil)", got, err)
 	}
 	if want := []string{StreamDNS + " dns 0"}; !reflect.DeepEqual(fake.creates, want) {
-		t.Errorf("XGROUP CREATE: %v, хочу %v (пересоздание с начала)", fake.creates, want)
+		t.Errorf("XGROUP CREATE: %v, want %v (recreation from the beginning)", fake.creates, want)
 	}
 	if len(fake.reads) != 2 {
-		t.Errorf("XREADGROUP вызван %d раз, хочу 2 (чтение и повтор после пересоздания)", len(fake.reads))
+		t.Errorf("XREADGROUP called %d times, want 2 (a read and a retry after the recreation)", len(fake.reads))
 	}
 }
 
@@ -443,11 +443,11 @@ func TestRedisQueueConsumeGroupRecreateError(t *testing.T) {
 	q := NewRedisQueue(fake, RedisOptions{})
 
 	_, err := q.Consume(context.Background(), StreamDNS, "dns", "dns-1", 1)
-	if err == nil || !strings.Contains(err.Error(), "создать группу") {
-		t.Fatalf("Consume: %v, хочу ошибку пересоздания группы", err)
+	if err == nil || !strings.Contains(err.Error(), "create group") {
+		t.Fatalf("Consume: %v, want a group-recreation error", err)
 	}
 	if len(fake.reads) != 1 {
-		t.Errorf("XREADGROUP вызван %d раз, хочу 1 (повторного чтения после сбоя нет)", len(fake.reads))
+		t.Errorf("XREADGROUP called %d times, want 1 (no repeated read after the failure)", len(fake.reads))
 	}
 }
 
@@ -456,14 +456,14 @@ func TestRedisQueueConsumeErrors(t *testing.T) {
 
 	fake := &fakeRedis{createErr: errors.New("ERR connection refused")}
 	if _, err := NewRedisQueue(fake, RedisOptions{}).Consume(ctx, StreamDNS, "dns", "dns-1", 1); err == nil ||
-		!strings.Contains(err.Error(), "создать группу") {
-		t.Errorf("ошибка создания группы: %v", err)
+		!strings.Contains(err.Error(), "create group") {
+		t.Errorf("the group creation error: %v", err)
 	}
 
 	fake = &fakeRedis{readErr: errors.New("ERR bad group")}
 	if _, err := NewRedisQueue(fake, RedisOptions{}).Consume(ctx, StreamDNS, "dns", "dns-1", 1); err == nil ||
 		!strings.Contains(err.Error(), "read") {
-		t.Errorf("ошибка чтения: %v", err)
+		t.Errorf("the read error: %v", err)
 	}
 }
 
@@ -473,19 +473,19 @@ func TestRedisQueueConsumeBadArgs(t *testing.T) {
 		stream, group, consumer string
 		n                       int
 	}{
-		{"неизвестный стрим", "q:typo", "g", "c", 1},
-		{"без группы", StreamDNS, "", "c", 1},
-		{"без потребителя", StreamDNS, "g", "", 1},
-		{"пачка 0", StreamDNS, "g", "c", 0},
+		{"an unknown stream", "q:typo", "g", "c", 1},
+		{"no group", StreamDNS, "", "c", 1},
+		{"no consumer", StreamDNS, "g", "", 1},
+		{"batch 0", StreamDNS, "g", "c", 0},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			fake := &fakeRedis{}
 			if _, err := NewRedisQueue(fake, RedisOptions{}).Consume(context.Background(), c.stream, c.group, c.consumer, c.n); err == nil {
-				t.Fatal("ожидалась ошибка аргументов")
+				t.Fatal("an argument error expected")
 			}
 			if len(fake.reads)+len(fake.creates) != 0 {
-				t.Errorf("Redis вызван с плохими аргументами: %+v %+v", fake.creates, fake.reads)
+				t.Errorf("Redis called with bad arguments: %+v %+v", fake.creates, fake.reads)
 			}
 		})
 	}
@@ -498,7 +498,7 @@ func TestRedisQueueConsumeBlockOption(t *testing.T) {
 		t.Fatalf("Consume: %v", err)
 	}
 	if got := fake.reads[0].Block; got != 500*time.Millisecond {
-		t.Errorf("Block: %s, хочу 500ms", got)
+		t.Errorf("Block: %s, want 500ms", got)
 	}
 }
 
@@ -506,7 +506,7 @@ func TestRedisQueueConsumeEmpty(t *testing.T) {
 	fake := &fakeRedis{readErr: redis.Nil}
 	got, err := NewRedisQueue(fake, RedisOptions{}).Consume(context.Background(), StreamDNS, "dns", "dns-1", 1)
 	if err != nil || got != nil {
-		t.Errorf("пустое чтение: (%v, %v), хочу (nil, nil)", got, err)
+		t.Errorf("an empty read: (%v, %v), want (nil, nil)", got, err)
 	}
 }
 
@@ -517,21 +517,21 @@ func TestRedisQueueAck(t *testing.T) {
 		t.Fatalf("Ack: %v", err)
 	}
 	if want := []ackCall{{StreamDNS, "dns", []string{"1718-0", "1719-0"}}}; !reflect.DeepEqual(fake.acks, want) {
-		t.Errorf("XACK: %+v, хочу %+v", fake.acks, want)
+		t.Errorf("XACK: %+v, want %+v", fake.acks, want)
 	}
 
 	// Without identifiers — no Redis call is needed.
 	fake.acks = nil
 	if err := q.Ack(context.Background(), StreamDNS, "dns"); err != nil {
-		t.Fatalf("Ack без ids: %v", err)
+		t.Fatalf("Ack without ids: %v", err)
 	}
 	if len(fake.acks) != 0 {
-		t.Errorf("XACK с пустым списком ids: %+v", fake.acks)
+		t.Errorf("XACK with an empty ids list: %+v", fake.acks)
 	}
 
 	fake.ackErr = errors.New("ERR no such group")
 	if err := q.Ack(context.Background(), StreamDNS, "dns", "1-0"); err == nil || !strings.Contains(err.Error(), "ack") {
-		t.Errorf("ошибка XACK: %v", err)
+		t.Errorf("the XACK error: %v", err)
 	}
 }
 
@@ -544,7 +544,7 @@ func TestRedisQueueTrackProgress(t *testing.T) {
 	q := NewRedisQueue(&fakeRedis{}, RedisOptions{})
 	q.trackProgress(StreamDNS, "dns", nil)
 	if _, ok := q.groups.Load(groupKey(StreamDNS, "dns")); ok {
-		t.Error("пустая пачка создала запись в кэше групп")
+		t.Error("an empty batch created an entry in the group cache")
 	}
 
 	// An empty start mark (a blank spot: the cache guard value) —
@@ -556,7 +556,7 @@ func TestRedisQueueTrackProgress(t *testing.T) {
 	})
 	v, _ := q.groups.Load(groupKey(StreamDNS, "dns"))
 	if got, _ := v.(string); got != "1719-5" {
-		t.Errorf("прогресс группы = %q, хочу 1719-5 (максимум прочитанных id)", got)
+		t.Errorf("the group progress = %q, want 1719-5 (the maximum read id)", got)
 	}
 }
 
@@ -570,23 +570,23 @@ func TestStreamIDGreater(t *testing.T) {
 		a, b string
 		want bool
 	}{
-		{"больше по ms, короче лексикографически", "1000-0", "999-0", true},
-		{"меньше по ms, длиннее лексикографически", "999-0", "1000-0", false},
-		{"равные ms, больше по seq", "5-2", "5-1", true},
-		{"равные ms, меньше по seq", "5-0", "5-1", false},
-		{"полностью равные", "5-0", "5-0", false},
+		{"greater by ms, lexicographically smaller", "1000-0", "999-0", true},
+		{"smaller by ms, lexicographically greater", "999-0", "1000-0", false},
+		{"equal ms, greater by seq", "5-2", "5-1", true},
+		{"equal ms, smaller by seq", "5-0", "5-1", false},
+		{"fully equal", "5-0", "5-0", false},
 		// b with a negative seq — the only form where skipping the a check
 		// is distinguishable: ams/aseq are zero, the ms equality sends the
 		// comparison into seq (0 > −1), whereas the correct code with an
 		// unparseable a is always false.
-		{"a не вида ms-seq", "junk", "0--1", false},
-		{"b не вида ms-seq", "5-0", "junk", false},
-		{"оба не вида ms-seq", "junk", "junk", false},
+		{"a is not of the ms-seq form", "junk", "0--1", false},
+		{"b is not of the ms-seq form", "5-0", "junk", false},
+		{"both are not of the ms-seq form", "junk", "junk", false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			if got := streamIDGreater(c.a, c.b); got != c.want {
-				t.Errorf("streamIDGreater(%q, %q) = %v, хочу %v", c.a, c.b, got, c.want)
+				t.Errorf("streamIDGreater(%q, %q) = %v, want %v", c.a, c.b, got, c.want)
 			}
 		})
 	}
@@ -602,17 +602,17 @@ func TestSplitStreamID(t *testing.T) {
 		ms, seq int64
 		wantErr string // "" — without an error
 	}{
-		{"нулевой seq", "1718-0", 1718, 0, ""},
-		{"ненулевой seq", "1718-42", 1718, 42, ""},
-		{"десятичная база ms", "11-0", 11, 0, ""},
-		{"десятичная база seq", "0-11", 0, 11, ""},
-		{"цифра 9 в seq", "0-9", 0, 9, ""},
+		{"a zero seq", "1718-0", 1718, 0, ""},
+		{"a non-zero seq", "1718-42", 1718, 42, ""},
+		{"decimal ms", "11-0", 11, 0, ""},
+		{"decimal seq", "0-11", 0, 11, ""},
+		{"the digit 9 in seq", "0-9", 0, 9, ""},
 		{"ms 2⁶³−1", "9223372036854775807-0", 9223372036854775807, 0, ""},
 		{"seq 2⁶³−1", "0-9223372036854775807", 0, 9223372036854775807, ""},
-		{"без дефиса", "junk", 0, 0, "не вида ms-seq"},
-		{"ms не число", "abc-1", 0, 0, "invalid syntax"},
-		{"seq не число", "1-xyz", 0, 0, "invalid syntax"},
-		{"hex-запись не десятична", "0x10-0", 0, 0, "invalid syntax"},
+		{"no dash", "junk", 0, 0, "ms-seq"},
+		{"ms is not a number", "abc-1", 0, 0, "invalid syntax"},
+		{"seq is not a number", "1-xyz", 0, 0, "invalid syntax"},
+		{"a hex entry is not decimal", "0x10-0", 0, 0, "invalid syntax"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -622,15 +622,15 @@ func TestSplitStreamID(t *testing.T) {
 					t.Fatalf("splitStreamID(%q): %v", c.id, err)
 				}
 				if ms != c.ms || seq != c.seq {
-					t.Errorf("splitStreamID(%q) = %d-%d, хочу %d-%d", c.id, ms, seq, c.ms, c.seq)
+					t.Errorf("splitStreamID(%q) = %d-%d, want %d-%d", c.id, ms, seq, c.ms, c.seq)
 				}
 				return
 			}
 			if err == nil || !strings.Contains(err.Error(), c.wantErr) {
-				t.Fatalf("splitStreamID(%q) = %d-%d, %v; хочу ошибку с %q", c.id, ms, seq, err, c.wantErr)
+				t.Fatalf("splitStreamID(%q) = %d-%d, %v; want an error with %q", c.id, ms, seq, err, c.wantErr)
 			}
 			if ms != 0 || seq != 0 {
-				t.Errorf("splitStreamID(%q) при ошибке = %d-%d, хочу 0-0", c.id, ms, seq)
+				t.Errorf("splitStreamID(%q) on error = %d-%d, want 0-0", c.id, ms, seq)
 			}
 		})
 	}
@@ -640,15 +640,15 @@ func TestSplitStreamID(t *testing.T) {
 // only caller — ensureGroup — has nothing to protect.
 func TestIsBusyGroup(t *testing.T) {
 	if isBusyGroup(nil) {
-		t.Error("isBusyGroup(nil) = true, хочу false")
+		t.Error("isBusyGroup(nil) = true, want false")
 	}
 	if !isBusyGroup(errors.New("BUSYGROUP Consumer Group name already exists")) {
-		t.Error("BUSYGROUP не распознан")
+		t.Error("BUSYGROUP not recognized")
 	}
 	if isBusyGroup(errors.New("ERR connection refused")) {
-		t.Error("чужая ошибка распознана как BUSYGROUP")
+		t.Error("a foreign error recognized as BUSYGROUP")
 	}
 	if isNoGroup(nil) {
-		t.Error("isNoGroup(nil) = true, хочу false")
+		t.Error("isNoGroup(nil) = true, want false")
 	}
 }

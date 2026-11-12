@@ -168,7 +168,7 @@ func (o TrimOptions) streamMaxLen(stream string) int64 {
 // — an empty pass without an error: there is nothing to release.
 func TrimOnce(ctx context.Context, rdb trimStreams, opt TrimOptions) (int64, []string, error) {
 	if rdb == nil {
-		return 0, nil, errors.New("queue: освобождение стримов: клиент Redis не задан")
+		return 0, nil, errors.New("queue: stream release: Redis client not set")
 	}
 	o := opt.withDefaults()
 	var (
@@ -200,7 +200,7 @@ func TrimOnce(ctx context.Context, rdb trimStreams, opt TrimOptions) (int64, []s
 // this, the stream's groups need triage.
 func trimStream(ctx context.Context, rdb trimStreams, stream string, opt TrimOptions) (int64, bool, error) {
 	if !knownStream(stream) {
-		return 0, false, fmt.Errorf("queue: освобождение: неизвестный стрим %q (стримы очереди — константы пакета: StreamDNS, StreamHTTP, StreamRender, StreamRenderFallback, StreamAnalyze, StreamDead)", stream)
+		return 0, false, fmt.Errorf("queue: release: unknown stream %q (queue streams are package constants: StreamDNS, StreamHTTP, StreamRender, StreamRenderFallback, StreamAnalyze, StreamDead)", stream)
 	}
 	groups, err := rdb.XInfoGroups(ctx, stream).Result()
 	if err != nil {
@@ -210,7 +210,7 @@ func trimStream(ctx context.Context, rdb trimStreams, stream string, opt TrimOpt
 		if errors.Is(err, redis.Nil) || strings.Contains(err.Error(), "no such key") {
 			return 0, false, nil
 		}
-		return 0, false, fmt.Errorf("queue: освобождение %s: группы: %w", stream, err)
+		return 0, false, fmt.Errorf("queue: release %s: groups: %w", stream, err)
 	}
 	if len(groups) == 0 {
 		// No groups (as with q:dead): there is no acknowledged prefix, the
@@ -226,7 +226,7 @@ func trimStream(ctx context.Context, rdb trimStreams, stream string, opt TrimOpt
 				// A PEL read error — trimming by last-delivered-id is
 				// unsafe: pending entries may sit below it. The stream
 				// is skipped entirely: the next pass will retry.
-				return 0, false, fmt.Errorf("queue: освобождение %s (группа %s): pending: %w", stream, g.Name, err)
+				return 0, false, fmt.Errorf("queue: release %s (group %s): pending: %w", stream, g.Name, err)
 			}
 			if p.Count > 0 {
 				// A race: between XINFO and XPENDING everything was
@@ -251,7 +251,7 @@ func trimStream(ctx context.Context, rdb trimStreams, stream string, opt TrimOpt
 	if safe != "" {
 		n, err = rdb.XTrimMinID(ctx, stream, safe).Result()
 		if err != nil {
-			return 0, false, fmt.Errorf("queue: освобождение %s (XTRIM MINID %s): %w", stream, safe, err)
+			return 0, false, fmt.Errorf("queue: release %s (XTRIM MINID %s): %w", stream, safe, err)
 		}
 	}
 	// A stuck prefix: the groups are alive (they exist) while the length
@@ -263,7 +263,7 @@ func trimStream(ctx context.Context, rdb trimStreams, stream string, opt TrimOpt
 	if err != nil {
 		// The length is a signal, not an invariant: an XLEN error does not
 		// cancel the trim.
-		return n, false, fmt.Errorf("queue: освобождение %s: длина: %w", stream, err)
+		return n, false, fmt.Errorf("queue: release %s: length: %w", stream, err)
 	}
 	if limit := opt.streamMaxLen(stream); length*4 >= limit*3 {
 		isStuck = true
@@ -286,28 +286,28 @@ func trimStream(ctx context.Context, rdb trimStreams, stream string, opt TrimOpt
 // service framework (T-012, graceful shutdown, spec 3.4).
 func TrimLoop(ctx context.Context, rdb trimStreams, opt TrimOptions) error {
 	if rdb == nil {
-		return errors.New("queue: цикл освобождения: клиент Redis не задан")
+		return errors.New("queue: release loop: Redis client not set")
 	}
 	o := opt.withDefaults()
 	log := o.Log
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	log.Info("цикл освобождения подтверждённого префикса стримов",
+	log.Info("acknowledged stream prefix release loop",
 		"streams", strings.Join(o.Streams, ","), "interval", o.Interval.String())
 
 	warned := make(map[string]bool, len(o.Streams)) // a Warn once per stuck episode
 	trim := func() {
 		_, stuck, err := TrimOnce(ctx, rdb, o)
 		if err != nil && ctx.Err() == nil {
-			log.Warn("освобождение подтверждённого префикса", "err", err)
+			log.Warn("acknowledged prefix release", "err", err)
 		}
 		stuckSet := make(map[string]bool, len(stuck))
 		for _, s := range stuck {
 			stuckSet[s] = true
 			if !warned[s] {
 				warned[s] = true
-				log.Warn("подтверждённый префикс стрима у потолка, точка обрезки не двигается — проверьте группы стрима (осиротевшая группа с замороженным last-delivered-id держит обрезку)",
+				log.Warn("acknowledged stream prefix at the cap, the trim point is not advancing — check the stream's groups (an orphaned group with a frozen last-delivered-id holds the trim)",
 					"stream", s, "maxlen", o.streamMaxLen(s))
 			}
 		}

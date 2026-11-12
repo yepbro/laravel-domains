@@ -115,12 +115,12 @@ func TestNewBackpressureGateIntervalDefault(t *testing.T) {
 	for _, interval := range []time.Duration{0, -time.Second} {
 		g := NewBackpressureGate(nil, BackpressureOptions{Watermark: 1, Interval: interval})
 		if g.opt.Interval != DefaultBackpressureInterval {
-			t.Errorf("Interval %s не заменён дефолтом: %s", interval, g.opt.Interval)
+			t.Errorf("Interval %s not replaced by the default: %s", interval, g.opt.Interval)
 		}
 	}
 	g := NewBackpressureGate(nil, BackpressureOptions{Watermark: 1, Interval: time.Nanosecond})
 	if g.opt.Interval != time.Nanosecond {
-		t.Errorf("Interval 1нс заменён дефолтом: %s, хочу 1нс (положительный интервал валиден)", g.opt.Interval)
+		t.Errorf("Interval 1ns replaced by the default: %s, want 1ns (a positive interval is valid)", g.opt.Interval)
 	}
 }
 
@@ -130,18 +130,18 @@ func TestNewBackpressureGateIntervalDefault(t *testing.T) {
 func TestBackpressureStreamMaxLen(t *testing.T) {
 	g := NewBackpressureGate(nil, BackpressureOptions{})
 	if got := g.streamMaxLen(StreamDNS); got != 250 {
-		t.Errorf("streamMaxLen без MaxLen = %d, хочу 250 (политика q:dns, T-141)", got)
+		t.Errorf("streamMaxLen without MaxLen = %d, want 250 (the q:dns policy, T-141)", got)
 	}
 	if got := g.streamMaxLen(StreamHTTP); got != 150_000 {
-		t.Errorf("streamMaxLen без MaxLen = %d, хочу 150000 (политика штучных стримов, T-141)", got)
+		t.Errorf("streamMaxLen without MaxLen = %d, want 150000 (the unit-stream policy, T-141)", got)
 	}
 	g = NewBackpressureGate(nil, BackpressureOptions{MaxLen: 1})
 	if got := g.streamMaxLen(StreamHTTP); got != 1 {
-		t.Errorf("streamMaxLen при MaxLen=1 = %d, хочу 1 (явный предел валиден)", got)
+		t.Errorf("streamMaxLen with MaxLen=1 = %d, want 1 (an explicit limit is valid)", got)
 	}
 	g = NewBackpressureGate(nil, BackpressureOptions{MaxLen: -7})
 	if got := g.streamMaxLen(StreamHTTP); got != 150_000 {
-		t.Errorf("streamMaxLen при отрицательном MaxLen = %d, хочу 150000 (политика)", got)
+		t.Errorf("streamMaxLen with negative MaxLen = %d, want 150000 (the policy)", got)
 	}
 }
 
@@ -156,18 +156,18 @@ func TestStreamWatermark(t *testing.T) {
 		stream    string
 		want      int64
 	}{
-		{"нулевый watermark отключает", 0, 1000, StreamHTTP, 0},
-		{"отрицательный watermark отключает", -5, 1000, StreamHTTP, 0},
-		{"предел политики q:dns", 100_000, 0, StreamDNS, 125},
-		{"предел политики штучных", 600_000, 0, StreamHTTP, 75_000},
-		{"явный предел 1 — порог 0", 100_000, 1, StreamDNS, 0},
-		{"минимум — watermark", 7, 100, StreamHTTP, 7},
-		{"минимум — половина предела", 200, 100, StreamHTTP, 50},
+		{"zero watermark disables", 0, 1000, StreamHTTP, 0},
+		{"negative watermark disables", -5, 1000, StreamHTTP, 0},
+		{"the q:dns policy cap", 100_000, 0, StreamDNS, 125},
+		{"the unit-stream policy cap", 600_000, 0, StreamHTTP, 75_000},
+		{"explicit limit 1 — threshold 0", 100_000, 1, StreamDNS, 0},
+		{"the minimum is the watermark", 7, 100, StreamHTTP, 7},
+		{"the minimum is half the limit", 200, 100, StreamHTTP, 50},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			if got := StreamWatermark(c.watermark, c.maxLen, c.stream); got != c.want {
-				t.Errorf("StreamWatermark(%d, %d, %s) = %d, хочу %d",
+				t.Errorf("StreamWatermark(%d, %d, %s) = %d, want %d",
 					c.watermark, c.maxLen, c.stream, got, c.want)
 			}
 		})
@@ -187,16 +187,16 @@ func TestGroupDepth(t *testing.T) {
 		xlen int64
 		want int64
 	}{
-		{"лаг с pending", 27409, 120, 136500, 27529},
-		{"кламп фантомного лага по XLEN (T-168)", 1753, 0, 1, 1},
-		{"лаг 0 — прибавка нуля", 0, 5, 100, 5},
-		{"lag −1 (неопределён) — только pending", -1, 8, 3, 8},
-		{"пустая группа", 0, 0, 0, 0},
+		{"lag with pending", 27409, 120, 136500, 27529},
+		{"phantom lag clamped by XLEN (T-168)", 1753, 0, 1, 1},
+		{"lag 0 — a zero increment", 0, 5, 100, 5},
+		{"lag −1 (undefined) — pending only", -1, 8, 3, 8},
+		{"empty group", 0, 0, 0, 0},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			if got := GroupDepth(redis.XInfoGroup{Name: "g", Lag: c.lag, Pending: c.pend}, c.xlen); got != c.want {
-				t.Errorf("GroupDepth(lag=%d, pending=%d, xlen=%d) = %d, хочу %d",
+				t.Errorf("GroupDepth(lag=%d, pending=%d, xlen=%d) = %d, want %d",
 					c.lag, c.pend, c.xlen, got, c.want)
 			}
 		})
@@ -220,13 +220,13 @@ func TestBackpressureLen(t *testing.T) {
 		t.Fatalf("Len: %v", err)
 	}
 	if n != 52 {
-		t.Errorf("Len = %d, хочу 52 (lag 30+7 + pending 12+3)", n)
+		t.Errorf("Len = %d, want 52 (lag 30+7 + pending 12+3)", n)
 	}
 	if want := []string{StreamHTTP}; !reflect.DeepEqual(fake.infos, want) {
-		t.Errorf("XINFO GROUPS ключи: %v, хочу %v", fake.infos, want)
+		t.Errorf("XINFO GROUPS keys: %v, want %v", fake.infos, want)
 	}
 	if want := []string{StreamHTTP}; !reflect.DeepEqual(fake.xlens, want) {
-		t.Errorf("XLEN ключи: %v, хочу %v (один вызов — кламп лага групп, T-168)", fake.xlens, want)
+		t.Errorf("XLEN keys: %v, want %v (one call — the group lag clamp, T-168)", fake.xlens, want)
 	}
 
 	// lag is undefined (−1: the trim cut off the undelivered) — only
@@ -235,7 +235,7 @@ func TestBackpressureLen(t *testing.T) {
 	fake.xlen = 3
 	gate = NewBackpressureGate(fake, BackpressureOptions{Watermark: 100})
 	if n, err := gate.Len(context.Background(), StreamHTTP); err != nil || n != 8 {
-		t.Errorf("Len при неопределённом lag: (%d, %v), хочу (8, nil)", n, err)
+		t.Errorf("Len with undefined lag: (%d, %v), want (8, nil)", n, err)
 	}
 
 	// No groups — no entry has been delivered: the depth equals XLEN.
@@ -243,10 +243,10 @@ func TestBackpressureLen(t *testing.T) {
 	fake.xlen = 34
 	gate = NewBackpressureGate(fake, BackpressureOptions{Watermark: 100})
 	if n, err := gate.Len(context.Background(), StreamHTTP); err != nil || n != 34 {
-		t.Errorf("Len без групп: (%d, %v), хочу XLEN (34, nil)", n, err)
+		t.Errorf("Len without groups: (%d, %v), want XLEN (34, nil)", n, err)
 	}
 	if want := []string{StreamHTTP}; !reflect.DeepEqual(fake.xlens, want) {
-		t.Errorf("XLEN ключи: %v, хочу %v", fake.xlens, want)
+		t.Errorf("XLEN keys: %v, want %v", fake.xlens, want)
 	}
 
 	// The stream does not exist yet (redis.Nil / "no such key") — no
@@ -265,23 +265,23 @@ func TestBackpressureLen(t *testing.T) {
 		gate = NewBackpressureGate(fake, BackpressureOptions{Watermark: 100})
 		n, err := gate.Len(context.Background(), StreamHTTP)
 		if err != nil || n != 34 {
-			t.Errorf("Len несуществующего стрима (%s): (%d, %v), хочу XLEN (34, nil)", name, n, err)
+			t.Errorf("Len of a nonexistent stream (%s): (%d, %v), want XLEN (34, nil)", name, n, err)
 		}
 		if want := []string{StreamHTTP}; !reflect.DeepEqual(fake.xlens, want) {
-			t.Errorf("Len несуществующего стрима (%s): XLEN ключи %v, хочу %v", name, fake.xlens, want)
+			t.Errorf("Len of a nonexistent stream (%s): XLEN keys %v, want %v", name, fake.xlens, want)
 		}
 	}
 
 	// Errors — a zero depth and the exact text.
 	if n, err := gate.Len(context.Background(), "q:typo"); err == nil || n != 0 ||
-		!strings.Contains(err.Error(), "неизвестный стрим") {
-		t.Errorf("Len чужого стрима: (%d, %v), хочу (0, неизвестный стрим)", n, err)
+		!strings.Contains(err.Error(), "unknown stream") {
+		t.Errorf("Len of a foreign stream: (%d, %v), want (0, unknown stream)", n, err)
 	}
 
 	gate = NewBackpressureGate(nil, BackpressureOptions{Watermark: 100})
 	if n, err := gate.Len(context.Background(), StreamDNS); err == nil || n != 0 ||
-		!strings.Contains(err.Error(), "клиент Redis не задан") {
-		t.Errorf("Len без клиента: (%d, %v), хочу (0, клиент не задан)", n, err)
+		!strings.Contains(err.Error(), "Redis client not set") {
+		t.Errorf("Len without a client: (%d, %v), want (0, client not set)", n, err)
 	}
 
 	fake = &fakeBackpressure{
@@ -290,8 +290,8 @@ func TestBackpressureLen(t *testing.T) {
 	}
 	gate = NewBackpressureGate(fake, BackpressureOptions{Watermark: 100})
 	if n, err := gate.Len(context.Background(), StreamDNS); err == nil || n != 0 ||
-		!strings.Contains(err.Error(), "глубина") {
-		t.Errorf("Len при недоступном Redis: (%d, %v), хочу (0, ошибка глубины)", n, err)
+		!strings.Contains(err.Error(), "depth") {
+		t.Errorf("Len with Redis unavailable: (%d, %v), want (0, a depth error)", n, err)
 	}
 
 	// An XLEN error with no groups is returned (the gate does not guess
@@ -300,8 +300,8 @@ func TestBackpressureLen(t *testing.T) {
 	fake.xlenErr = errors.New("ERR connection refused")
 	gate = NewBackpressureGate(fake, BackpressureOptions{Watermark: 100})
 	if n, err := gate.Len(context.Background(), StreamDNS); err == nil || n != 0 ||
-		!strings.Contains(err.Error(), "групп нет") {
-		t.Errorf("Len с ошибкой XLEN: (%d, %v), хочу (0, ошибка XLEN)", n, err)
+		!strings.Contains(err.Error(), "no groups") {
+		t.Errorf("Len with an XLEN error: (%d, %v), want (0, an XLEN error)", n, err)
 	}
 }
 
@@ -324,7 +324,7 @@ func TestBackpressureLenClampsTrimmedLag(t *testing.T) {
 	fake.xlen = 1
 	gate := NewBackpressureGate(fake, BackpressureOptions{Watermark: 100})
 	if n, err := gate.Len(ctx, StreamDNS); err != nil || n != 1 {
-		t.Errorf("Len фантома: (%d, %v), хочу (1, nil) — min(1753, XLEN 1)", n, err)
+		t.Errorf("Len of the phantom: (%d, %v), want (1, nil) — min(1753, XLEN 1)", n, err)
 	}
 
 	// The real backlog is not distorted: the live q:http measurement of
@@ -333,7 +333,7 @@ func TestBackpressureLenClampsTrimmedLag(t *testing.T) {
 	fake.xlen = 107_367
 	gate = NewBackpressureGate(fake, BackpressureOptions{Watermark: 100})
 	if n, err := gate.Len(ctx, StreamHTTP); err != nil || n != 98_931 {
-		t.Errorf("Len реального бэклога: (%d, %v), хочу (98931, nil)", n, err)
+		t.Errorf("Len of the real backlog: (%d, %v), want (98931, nil)", n, err)
 	}
 
 	// The clamp does not touch pending: the unacknowledged-delivery
@@ -343,7 +343,7 @@ func TestBackpressureLenClampsTrimmedLag(t *testing.T) {
 	fake.xlen = 1
 	gate = NewBackpressureGate(fake, BackpressureOptions{Watermark: 100})
 	if n, err := gate.Len(ctx, StreamDNS); err != nil || n != 31 {
-		t.Errorf("Len фантома с pending: (%d, %v), хочу (31, nil) — min(1753,1)+30", n, err)
+		t.Errorf("Len of the phantom with pending: (%d, %v), want (31, nil) — min(1753,1)+30", n, err)
 	}
 
 	// lag 0 — clamping zero changes nothing: the depth = pending.
@@ -351,7 +351,7 @@ func TestBackpressureLenClampsTrimmedLag(t *testing.T) {
 	fake.xlen = 5
 	gate = NewBackpressureGate(fake, BackpressureOptions{Watermark: 100})
 	if n, err := gate.Len(ctx, StreamRender); err != nil || n != 12 {
-		t.Errorf("Len при lag 0: (%d, %v), хочу (12, nil)", n, err)
+		t.Errorf("Len at lag 0: (%d, %v), want (12, nil)", n, err)
 	}
 
 	// Several groups — the clamp per each with the stream's common XLEN:
@@ -365,7 +365,7 @@ func TestBackpressureLenClampsTrimmedLag(t *testing.T) {
 	fake.xlen = 10
 	gate = NewBackpressureGate(fake, BackpressureOptions{Watermark: 100})
 	if n, err := gate.Len(ctx, StreamAnalyze); err != nil || n != 17 {
-		t.Errorf("Len нескольких групп: (%d, %v), хочу (17, nil) — min(2000,10)+min(5,10)+2", n, err)
+		t.Errorf("Len of several groups: (%d, %v), want (17, nil) — min(2000,10)+min(5,10)+2", n, err)
 	}
 
 	// The gate with the phantom is open: the q:dns threshold =
@@ -376,10 +376,10 @@ func TestBackpressureLenClampsTrimmedLag(t *testing.T) {
 	fake.xlen = 1
 	g := newTestGate(fake, 100000)
 	if err := g.AwaitCapacity(ctx, StreamDNS); err != nil {
-		t.Fatalf("AwaitCapacity с фантомным лагом: %v", err)
+		t.Fatalf("AwaitCapacity with a phantom lag: %v", err)
 	}
 	if len(fake.infos) != 1 {
-		t.Errorf("проверок %d, хочу 1 (клампнутая глубина ниже порога): %v", len(fake.infos), fake.infos)
+		t.Errorf("checks %d, want 1 (the clamped depth is below the threshold): %v", len(fake.infos), fake.infos)
 	}
 
 	// An XLEN error with live groups — the gate does not guess the
@@ -389,8 +389,8 @@ func TestBackpressureLenClampsTrimmedLag(t *testing.T) {
 	fake.xlenErr = errors.New("ERR connection refused")
 	gate = NewBackpressureGate(fake, BackpressureOptions{Watermark: 100})
 	if n, err := gate.Len(ctx, StreamDNS); err == nil || n != 0 ||
-		!strings.Contains(err.Error(), "кламп лага") {
-		t.Errorf("Len с ошибкой XLEN: (%d, %v), хочу (0, ошибка клампа)", n, err)
+		!strings.Contains(err.Error(), "lag clamp") {
+		t.Errorf("Len with an XLEN error: (%d, %v), want (0, a clamp error)", n, err)
 	}
 }
 
@@ -409,7 +409,7 @@ func TestBackpressureWatermarkCappedByMaxLen(t *testing.T) {
 	fake.xlen = 125
 	gate := newTestGate(fake, 100000)
 	if err := gate.AwaitCapacity(context.Background(), StreamDNS); err != nil {
-		t.Fatalf("AwaitCapacity ниже ограниченного порога: %v", err)
+		t.Fatalf("AwaitCapacity below the clamped threshold: %v", err)
 	}
 
 	fake = newFakeBackpressure(grp(125, 0), grp(124, 0))
@@ -419,7 +419,7 @@ func TestBackpressureWatermarkCappedByMaxLen(t *testing.T) {
 		t.Fatalf("AwaitCapacity q:dns: %v", err)
 	}
 	if len(fake.infos) != 2 {
-		t.Errorf("проверок %d, хочу 2 (125 ≥ порог 125 — гейт закрыт): %v", len(fake.infos), fake.infos)
+		t.Errorf("checks %d, want 2 (125 ≥ threshold 125 — the gate is closed): %v", len(fake.infos), fake.infos)
 	}
 
 	// A one-off stream: half of the policy cap (150,000 / 2) is below
@@ -428,16 +428,16 @@ func TestBackpressureWatermarkCappedByMaxLen(t *testing.T) {
 	fake.xlen = 75_000
 	gate = newTestGate(fake, 100000)
 	if err := gate.AwaitCapacity(context.Background(), StreamHTTP); err != nil {
-		t.Fatalf("AwaitCapacity ниже порога 75 000: %v", err)
+		t.Fatalf("AwaitCapacity below the threshold 75,000: %v", err)
 	}
 	fake = newFakeBackpressure(grp(75_000, 0), grp(74_999, 0))
 	fake.xlen = 75_000
 	gate = newTestGate(fake, 100000)
 	if err := gate.AwaitCapacity(context.Background(), StreamHTTP); err != nil {
-		t.Fatalf("AwaitCapacity штучного стрима: %v", err)
+		t.Fatalf("AwaitCapacity of a unit stream: %v", err)
 	}
 	if len(fake.infos) != 2 {
-		t.Errorf("проверок %d, хочу 2 (75 000 ≥ порог 75 000 — гейт закрыт): %v", len(fake.infos), fake.infos)
+		t.Errorf("checks %d, want 2 (75,000 ≥ threshold 75,000 — the gate is closed): %v", len(fake.infos), fake.infos)
 	}
 
 	// An explicit cap from the options (redis.maxlen, Q-03) with a half
@@ -448,7 +448,7 @@ func TestBackpressureWatermarkCappedByMaxLen(t *testing.T) {
 		Watermark: 100000, MaxLen: 400000, Interval: time.Millisecond,
 	})
 	if err := gate.AwaitCapacity(context.Background(), StreamHTTP); err != nil {
-		t.Fatalf("AwaitCapacity ниже порога 100 000: %v", err)
+		t.Fatalf("AwaitCapacity below the threshold 100,000: %v", err)
 	}
 
 	// An explicit cap from the options caps it too.
@@ -458,10 +458,10 @@ func TestBackpressureWatermarkCappedByMaxLen(t *testing.T) {
 		Watermark: 100000, MaxLen: 4000, Interval: time.Millisecond,
 	})
 	if err := gate.AwaitCapacity(context.Background(), StreamHTTP); err != nil {
-		t.Fatalf("AwaitCapacity с явным MaxLen: %v", err)
+		t.Fatalf("AwaitCapacity with an explicit MaxLen: %v", err)
 	}
 	if len(fake.infos) != 2 {
-		t.Errorf("проверок %d, хочу 2 (порог ограничен 2 000): %v", len(fake.infos), fake.infos)
+		t.Errorf("checks %d, want 2 (the threshold is clamped to 2,000): %v", len(fake.infos), fake.infos)
 	}
 }
 
@@ -471,10 +471,10 @@ func TestBackpressureGateBelowWatermark(t *testing.T) {
 	gate := newTestGate(fake, 100)
 
 	if err := gate.AwaitCapacity(context.Background(), StreamDNS); err != nil {
-		t.Fatalf("AwaitCapacity ниже порога: %v", err)
+		t.Fatalf("AwaitCapacity below the threshold: %v", err)
 	}
 	if want := []string{StreamDNS}; !reflect.DeepEqual(fake.infos, want) {
-		t.Errorf("XINFO GROUPS: %d вызовов (%v), хочу 1 — ниже порога проходит сразу", len(fake.infos), fake.infos)
+		t.Errorf("XINFO GROUPS: %d calls (%v), want 1 — below the threshold it passes immediately", len(fake.infos), fake.infos)
 	}
 }
 
@@ -486,10 +486,10 @@ func TestBackpressureGateAtWatermark(t *testing.T) {
 	gate := newTestGate(fake, 100)
 
 	if err := gate.AwaitCapacity(context.Background(), StreamDNS); err != nil {
-		t.Fatalf("AwaitCapacity на пороге: %v", err)
+		t.Fatalf("AwaitCapacity at the threshold: %v", err)
 	}
 	if len(fake.infos) != 3 {
-		t.Errorf("проверок %d, хочу 3 (два отказа, третья ниже порога): %v", len(fake.infos), fake.infos)
+		t.Errorf("checks %d, want 3 (two rejections, the third below the threshold): %v", len(fake.infos), fake.infos)
 	}
 }
 
@@ -499,10 +499,10 @@ func TestBackpressureGateAboveWatermark(t *testing.T) {
 	gate := newTestGate(fake, 100)
 
 	if err := gate.AwaitCapacity(context.Background(), StreamRender); err != nil {
-		t.Fatalf("AwaitCapacity выше порога: %v", err)
+		t.Fatalf("AwaitCapacity above the threshold: %v", err)
 	}
 	if len(fake.infos) != 2 {
-		t.Errorf("проверок %d, хочу 2 (ожидание и повтор): %v", len(fake.infos), fake.infos)
+		t.Errorf("checks %d, want 2 (a wait and a retry): %v", len(fake.infos), fake.infos)
 	}
 }
 
@@ -519,16 +519,16 @@ func TestBackpressureGateRetriesOverInterval(t *testing.T) {
 	start := time.Now()
 	err := gate.AwaitCapacity(ctx, StreamDNS)
 	if err == nil {
-		t.Fatal("AwaitCapacity при закрытом гейте прошёл без ошибки")
+		t.Fatal("AwaitCapacity with a closed gate passed without an error")
 	}
 	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Errorf("ошибка ожидания: %v, хочу context.DeadlineExceeded", err)
+		t.Errorf("wait error: %v, want context.DeadlineExceeded", err)
 	}
 	if elapsed := time.Since(start); elapsed < 80*time.Millisecond {
-		t.Errorf("вышел раньше двух интервалов ожидания: %s", elapsed)
+		t.Errorf("returned earlier than two wait intervals: %s", elapsed)
 	}
 	if len(fake.infos) < 2 {
-		t.Errorf("проверок %d, хочу ≥ 2 (повторы через интервал): %v", len(fake.infos), fake.infos)
+		t.Errorf("checks %d, want ≥ 2 (retries via the interval): %v", len(fake.infos), fake.infos)
 	}
 }
 
@@ -543,10 +543,10 @@ func TestBackpressureGateCanceledContext(t *testing.T) {
 	cancel()
 	err := gate.AwaitCapacity(ctx, StreamDNS)
 	if !errors.Is(err, context.Canceled) {
-		t.Errorf("ошибка: %v, хочу context.Canceled", err)
+		t.Errorf("error: %v, want context.Canceled", err)
 	}
 	if len(fake.infos) != 1 {
-		t.Errorf("проверок %d, хочу 1", len(fake.infos))
+		t.Errorf("checks %d, want 1", len(fake.infos))
 	}
 }
 
@@ -558,11 +558,11 @@ func TestBackpressureGateDepthError(t *testing.T) {
 	gate := newTestGate(fake, 10)
 
 	if err := gate.AwaitCapacity(context.Background(), StreamDNS); err == nil ||
-		!strings.Contains(err.Error(), "глубина") {
-		t.Errorf("ошибка чтения глубины не возвращена: %v", err)
+		!strings.Contains(err.Error(), "depth") {
+		t.Errorf("the depth read error not returned: %v", err)
 	}
 	if len(fake.infos) != 1 {
-		t.Errorf("проверок %d, хочу 1 — ошибку гейт не ретраит", len(fake.infos))
+		t.Errorf("checks %d, want 1 — the gate does not retry an error", len(fake.infos))
 	}
 }
 
@@ -572,10 +572,10 @@ func TestBackpressureGateUngated(t *testing.T) {
 	fake := newFakeBackpressure(grp(1000, 0))
 	disabled := NewBackpressureGate(fake, BackpressureOptions{Watermark: 0})
 	if err := disabled.AwaitCapacity(context.Background(), StreamDNS); err != nil {
-		t.Errorf("отключённый гейт: %v", err)
+		t.Errorf("disabled gate: %v", err)
 	}
 	if len(fake.infos)+len(fake.xlens) != 0 {
-		t.Errorf("отключённый гейт полез в Redis: %v %v", fake.infos, fake.xlens)
+		t.Errorf("the disabled gate touched Redis: %v %v", fake.infos, fake.xlens)
 	}
 
 	gate := newTestGate(fake, 10)
@@ -583,7 +583,7 @@ func TestBackpressureGateUngated(t *testing.T) {
 		t.Errorf("q:dead: %v", err)
 	}
 	if len(fake.infos)+len(fake.xlens) != 0 {
-		t.Errorf("q:dead не должен гейтироваться: %v %v", fake.infos, fake.xlens)
+		t.Errorf("q:dead must not be gated: %v %v", fake.infos, fake.xlens)
 	}
 
 	// q:render-fallback — publication from render finalization without
@@ -594,15 +594,15 @@ func TestBackpressureGateUngated(t *testing.T) {
 		t.Errorf("q:render-fallback: %v", err)
 	}
 	if len(fake.infos)+len(fake.xlens) != 0 {
-		t.Errorf("q:render-fallback не должен гейтироваться: %v %v", fake.infos, fake.xlens)
+		t.Errorf("q:render-fallback must not be gated: %v %v", fake.infos, fake.xlens)
 	}
 
 	if err := gate.AwaitCapacity(context.Background(), "q:typo"); err == nil ||
-		!strings.Contains(err.Error(), "неизвестный стрим") {
-		t.Errorf("чужой стрим: %v", err)
+		!strings.Contains(err.Error(), "unknown stream") {
+		t.Errorf("foreign stream: %v", err)
 	}
 	if len(fake.infos)+len(fake.xlens) != 0 {
-		t.Errorf("чужой стрим не должен проверяться: %v %v", fake.infos, fake.xlens)
+		t.Errorf("a foreign stream must not be checked: %v %v", fake.infos, fake.xlens)
 	}
 }
 
@@ -622,14 +622,14 @@ func TestBackpressureGateLogsWait(t *testing.T) {
 		t.Fatalf("AwaitCapacity: %v", err)
 	}
 	if len(fake.infos) != 3 {
-		t.Fatalf("проверок %d, хочу 3 (два отказа, третья ниже порога): %v", len(fake.infos), fake.infos)
+		t.Fatalf("checks %d, want 3 (two rejections, the third below the threshold): %v", len(fake.infos), fake.infos)
 	}
 	out := buf.String()
 	if !strings.Contains(out, StreamDNS) || !strings.Contains(out, "100") {
-		t.Errorf("запись о приостановке не оставлена или без контекста: %q", out)
+		t.Errorf("the pause entry not logged or without context: %q", out)
 	}
-	if n := strings.Count(out, "приостановлена"); n != 1 {
-		t.Errorf("записей о приостановке %d, хочу 1 (без спама на каждый повтор): %q", n, out)
+	if n := strings.Count(out, "paused"); n != 1 {
+		t.Errorf("pause entries %d, want 1 (no spam on every retry): %q", n, out)
 	}
 }
 
@@ -644,11 +644,11 @@ func TestWatermarkPublisherPublish(t *testing.T) {
 		t.Fatalf("Publish: %v", err)
 	}
 	if id != "1718-0" {
-		t.Errorf("Publish вернул %q, хочу %q", id, fake.addID)
+		t.Errorf("Publish returned %q, want %q", id, fake.addID)
 	}
 	want := []string{"xinfo:" + StreamDNS, "xlen:" + StreamDNS, "xadd:" + StreamDNS}
 	if !reflect.DeepEqual(fake.log, want) {
-		t.Errorf("порядок команд: %v, хочу %v (глубина — затем публикация)", fake.log, want)
+		t.Errorf("command order: %v, want %v (depth — then publication)", fake.log, want)
 	}
 	if len(fake.adds) != 1 || fake.adds[0].Stream != StreamDNS {
 		t.Errorf("XADD: %+v", fake.adds)
@@ -662,7 +662,7 @@ func TestWatermarkPublisherWaitsThenPublishes(t *testing.T) {
 	pub := newTestPublisher(fake)
 
 	if _, err := pub.Publish(context.Background(), StreamDNS, dnsBatch()); err != nil {
-		t.Fatalf("Publish после ожидания: %v", err)
+		t.Fatalf("Publish after waiting: %v", err)
 	}
 	want := []string{
 		"xinfo:" + StreamDNS, "xlen:" + StreamDNS, // closed: depth 100 ≥ 100
@@ -670,7 +670,7 @@ func TestWatermarkPublisherWaitsThenPublishes(t *testing.T) {
 		"xadd:" + StreamDNS,
 	}
 	if !reflect.DeepEqual(fake.log, want) {
-		t.Errorf("порядок команд: %v, хочу %v (публикация только после ёмкости)", fake.log, want)
+		t.Errorf("command order: %v, want %v (publication only after capacity)", fake.log, want)
 	}
 }
 
@@ -687,15 +687,15 @@ func TestWatermarkPublisherChecksBeforeEveryBatch(t *testing.T) {
 	want := make([]string, 0, 9)
 	for i := 0; i < 3; i++ {
 		if _, err := pub.Publish(context.Background(), StreamDNS, dnsBatch()); err != nil {
-			t.Fatalf("Publish пачки №%d: %v", i+1, err)
+			t.Fatalf("Publish of batch #%d: %v", i+1, err)
 		}
 		want = append(want, "xinfo:"+StreamDNS, "xlen:"+StreamDNS, "xadd:"+StreamDNS)
 	}
 	if !reflect.DeepEqual(fake.log, want) {
-		t.Errorf("порядок команд:\n получил  %v\n хочу     %v", fake.log, want)
+		t.Errorf("command order:\n got  %v\n want %v", fake.log, want)
 	}
 	if len(fake.adds) != 3 {
-		t.Errorf("XADD вызовов %d, хочу 3", len(fake.adds))
+		t.Errorf("XADD calls %d, want 3", len(fake.adds))
 	}
 }
 
@@ -712,13 +712,13 @@ func TestWatermarkPublisherDeadNotGated(t *testing.T) {
 		Payload:  json.RawMessage(`{"task_id":"t"}`),
 	}
 	if _, err := pub.Publish(context.Background(), StreamDead, msg); err != nil {
-		t.Fatalf("Publish в q:dead: %v", err)
+		t.Fatalf("Publish to q:dead: %v", err)
 	}
 	if len(fake.infos)+len(fake.xlens) != 0 {
-		t.Errorf("q:dead не должен гейтироваться: %v %v", fake.infos, fake.xlens)
+		t.Errorf("q:dead must not be gated: %v %v", fake.infos, fake.xlens)
 	}
 	if len(fake.adds) != 1 {
-		t.Errorf("XADD в q:dead: %+v", fake.adds)
+		t.Errorf("XADD to q:dead: %+v", fake.adds)
 	}
 }
 
@@ -732,11 +732,11 @@ func TestWatermarkPublisherErrors(t *testing.T) {
 	}
 	pub := newTestPublisher(fake)
 	if _, err := pub.Publish(ctx, StreamDNS, dnsBatch()); err == nil ||
-		!strings.Contains(err.Error(), "глубина") {
-		t.Errorf("ошибка гейта: %v", err)
+		!strings.Contains(err.Error(), "depth") {
+		t.Errorf("gate error: %v", err)
 	}
 	if len(fake.adds) != 0 {
-		t.Errorf("при ошибке гейта публикация не выполняется: %+v", fake.adds)
+		t.Errorf("on a gate error the publication must not happen: %+v", fake.adds)
 	}
 
 	// A ctx cancellation in the gate — a clean exit without publication.
@@ -746,10 +746,10 @@ func TestWatermarkPublisherErrors(t *testing.T) {
 	canceled, cancel := context.WithCancel(ctx)
 	cancel()
 	if _, err := pub.Publish(canceled, StreamDNS, dnsBatch()); !errors.Is(err, context.Canceled) {
-		t.Errorf("отмена ctx: %v", err)
+		t.Errorf("ctx cancel: %v", err)
 	}
 	if len(fake.adds) != 0 {
-		t.Errorf("при отмене ctx публикация не выполняется: %+v", fake.adds)
+		t.Errorf("on ctx cancel the publication must not happen: %+v", fake.adds)
 	}
 
 	// An error of the publication itself — after the passed gate.
@@ -760,7 +760,7 @@ func TestWatermarkPublisherErrors(t *testing.T) {
 	}
 	pub = newTestPublisher(fake)
 	if _, err := pub.Publish(ctx, StreamDNS, dnsBatch()); err == nil {
-		t.Error("ошибка XADD не возвращена")
+		t.Error("the XADD error not returned")
 	}
 
 	// An invalid message — an error of the wrapped queue (the gate
@@ -769,10 +769,10 @@ func TestWatermarkPublisherErrors(t *testing.T) {
 	fake.xlen = 5
 	pub = newTestPublisher(fake)
 	if _, err := pub.Publish(ctx, StreamDNS, DNSBatch{}); err == nil {
-		t.Error("невалидное сообщение опубликовано")
+		t.Error("an invalid message was published")
 	}
 	if len(fake.adds) != 0 {
-		t.Errorf("невалидное сообщение дошло до XADD: %+v", fake.adds)
+		t.Errorf("the invalid message reached XADD: %+v", fake.adds)
 	}
 
 	// A wrapper without a gate — an explicit error: flow control is not
@@ -780,8 +780,8 @@ func TestWatermarkPublisherErrors(t *testing.T) {
 	fake = newFakeBackpressure(grp(5, 0))
 	pub = NewWatermarkPublisher(NewRedisQueue(fake, RedisOptions{}), nil)
 	if _, err := pub.Publish(ctx, StreamDNS, dnsBatch()); err == nil ||
-		!strings.Contains(err.Error(), "гейт") {
-		t.Errorf("обёртка без гейта: %v", err)
+		!strings.Contains(err.Error(), "gate") {
+		t.Errorf("wrapper without a gate: %v", err)
 	}
 }
 
@@ -793,15 +793,15 @@ func TestWatermarkPublisherPassthrough(t *testing.T) {
 
 	got, err := pub.Consume(context.Background(), StreamDNS, "dns", "dns-1", 1)
 	if err != nil || got != nil {
-		t.Errorf("Consume: (%v, %v), хочу (nil, nil)", got, err)
+		t.Errorf("Consume: (%v, %v), want (nil, nil)", got, err)
 	}
 	if err := pub.Ack(context.Background(), StreamDNS, "dns", "1718-0"); err != nil {
 		t.Fatalf("Ack: %v", err)
 	}
 	if len(fake.infos)+len(fake.xlens) != 0 {
-		t.Errorf("Consume/Ack не должны мерить глубину: %v %v", fake.infos, fake.xlens)
+		t.Errorf("Consume/Ack must not measure depth: %v %v", fake.infos, fake.xlens)
 	}
 	if want := []ackCall{{StreamDNS, "dns", []string{"1718-0"}}}; !reflect.DeepEqual(fake.acks, want) {
-		t.Errorf("XACK: %+v, хочу %+v", fake.acks, want)
+		t.Errorf("XACK: %+v, want %+v", fake.acks, want)
 	}
 }

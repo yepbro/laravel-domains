@@ -92,7 +92,7 @@ var _ tarpitClient = (*fakeTarpitRedis)(nil)
 // documentation and of manual redis-cli triage).
 func TestTarpitKey(t *testing.T) {
 	if got, want := TarpitKey("abc123"), "render:tarpit:abc123"; got != want {
-		t.Errorf("TarpitKey = %q, хочу %q", got, want)
+		t.Errorf("TarpitKey = %q, want %q", got, want)
 	}
 }
 
@@ -106,23 +106,23 @@ func TestTarpitCounterTrack(t *testing.T) {
 	ttl := 48 * time.Hour
 
 	if n, err := c.Track(ctx, "t1", "e1#1", ttl); err != nil || n != 1 {
-		t.Errorf("Track(t1, e1#1) = (%d, %v), хочу (1, nil)", n, err)
+		t.Errorf("Track(t1, e1#1) = (%d, %v), want (1, nil)", n, err)
 	}
 	if n, err := c.Track(ctx, "t1", "e1#2", ttl); err != nil || n != 2 {
-		t.Errorf("Track(t1, e1#2) = (%d, %v), хочу (2, nil)", n, err)
+		t.Errorf("Track(t1, e1#2) = (%d, %v), want (2, nil)", n, err)
 	}
 	if n, err := c.Track(ctx, "t2", "e9#1", ttl); err != nil || n != 1 {
-		t.Errorf("Track(t2, e9#1) = (%d, %v), хочу (1, nil) — задачи не смешиваются", n, err)
+		t.Errorf("Track(t2, e9#1) = (%d, %v), want (1, nil) — tasks are not mixed", n, err)
 	}
 	key := TarpitKey("t1")
 	if len(f.ttls) != 2 {
-		t.Errorf("TTL поставлены %d ключам, хочу 2", len(f.ttls))
+		t.Errorf("TTLs set for %d keys, want 2", len(f.ttls))
 	}
 	if got := f.ttls[key]; got != ttl {
-		t.Errorf("TTL %s = %s, хочу %s", key, got, ttl)
+		t.Errorf("TTL %s = %s, want %s", key, got, ttl)
 	}
 	if len(f.expiry) != 3 {
-		t.Errorf("EXPIRE вызван %d раз, хочу 3 (освежается каждой отметкой)", len(f.expiry))
+		t.Errorf("EXPIRE called %d times, want 3 (refreshed by every mark)", len(f.expiry))
 	}
 }
 
@@ -136,11 +136,11 @@ func TestTarpitCounterTrackIdempotent(t *testing.T) {
 
 	for i := 0; i < 3; i++ {
 		if n, err := c.Track(ctx, "t1", "e1#2", time.Hour); err != nil || n != 1 {
-			t.Errorf("Track №%d той же доставки = (%d, %v), хочу (1, nil)", i+1, n, err)
+			t.Errorf("Track #%d of the same delivery = (%d, %v), want (1, nil)", i+1, n, err)
 		}
 	}
 	if got := f.sadds; len(got) != 3 {
-		t.Errorf("SADD вызван %d раз, хочу 3", len(got))
+		t.Errorf("SADD called %d times, want 3", len(got))
 	}
 }
 
@@ -157,20 +157,20 @@ func TestTarpitCounterTrackValidation(t *testing.T) {
 		delivery string
 		ttl      time.Duration
 	}{
-		{"пустой task_id", "", "e1#1", time.Hour},
-		{"пустая доставка", "t1", "", time.Hour},
-		{"нулевой TTL", "t1", "e1#1", 0},
-		{"отрицательный TTL", "t1", "e1#1", -time.Second},
+		{"empty task_id", "", "e1#1", time.Hour},
+		{"empty delivery", "t1", "", time.Hour},
+		{"zero TTL", "t1", "e1#1", 0},
+		{"negative TTL", "t1", "e1#1", -time.Second},
 	}
 	for _, cs := range cases {
 		t.Run(cs.name, func(t *testing.T) {
 			if _, err := c.Track(ctx, cs.taskID, cs.delivery, cs.ttl); err == nil {
-				t.Fatal("ожидаюсь ошибка валидации")
+				t.Fatal("a validation error expected")
 			}
 		})
 	}
 	if len(f.sadds) != 0 || len(f.expiry) != 0 {
-		t.Errorf("команды Redis выполнялись (%d SADD, %d EXPIRE) — валидация обязана отсекать до них",
+		t.Errorf("Redis commands executed (%d SADD, %d EXPIRE) — validation must cut off before them",
 			len(f.sadds), len(f.expiry))
 	}
 }
@@ -193,7 +193,7 @@ func TestTarpitCounterTrackErrors(t *testing.T) {
 			f := newFakeTarpitRedis()
 			c.inject(f)
 			if _, err := NewTarpitCounter(f).Track(context.Background(), "t1", "e1#1", time.Hour); err == nil {
-				t.Fatal("сбой команды обязан возвращаться ошибкой")
+				t.Fatal("a command failure must return an error")
 			}
 		})
 	}

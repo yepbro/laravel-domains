@@ -184,7 +184,7 @@ func DefaultStreamMaxLen(stream string) int64 {
 // a log and continue (does not stop the others, spec 3.4).
 func Processing(ctx context.Context, q Queue, group string, d Delivery, process func(context.Context, Delivery) error) error {
 	if process == nil {
-		return fmt.Errorf("queue: Processing записи %s стрима %s: не задан обработчик", d.ID, d.Stream)
+		return fmt.Errorf("queue: Processing of entry %s of stream %s: handler not set", d.ID, d.Stream)
 	}
 	return ProcessingAttempt(ctx, q, group, d, 1, func(c context.Context, del Delivery, _ int) error {
 		return process(c, del)
@@ -202,10 +202,10 @@ func Processing(ctx context.Context, q Queue, group string, d Delivery, process 
 // an error (the Processing style).
 func ProcessingAttempt(ctx context.Context, q Queue, group string, d Delivery, attempts int, process func(context.Context, Delivery, int) error) error {
 	if process == nil {
-		return fmt.Errorf("queue: Processing записи %s стрима %s: не задан обработчик", d.ID, d.Stream)
+		return fmt.Errorf("queue: Processing of entry %s of stream %s: handler not set", d.ID, d.Stream)
 	}
 	if err := process(ctx, d, attempts); err != nil {
-		return fmt.Errorf("queue: запись %s стрима %s не подтверждена (без XACK, вернётся повторной доставкой): %w", d.ID, d.Stream, err)
+		return fmt.Errorf("queue: entry %s of stream %s not acknowledged (no XACK, it will come back via redelivery): %w", d.ID, d.Stream, err)
 	}
 	return q.Ack(ctx, d.Stream, group, d.ID)
 }
@@ -422,19 +422,19 @@ type Claimed struct {
 // An empty result without an error — there are no stuck entries.
 func (r *Reliab) Claim(ctx context.Context, stream, group, consumer string, minIdle time.Duration, n int, start string) ([]Claimed, []Delivery, string, error) {
 	if !knownStream(stream) {
-		return nil, nil, "", fmt.Errorf("queue: неизвестный стрим %q", stream)
+		return nil, nil, "", fmt.Errorf("queue: unknown stream %q", stream)
 	}
 	if group == "" {
-		return nil, nil, "", fmt.Errorf("queue: не задана группа потребителей стрима %s", stream)
+		return nil, nil, "", fmt.Errorf("queue: consumer group of stream %s not set", stream)
 	}
 	if consumer == "" {
-		return nil, nil, "", fmt.Errorf("queue: не задано имя потребителя группы %s", group)
+		return nil, nil, "", fmt.Errorf("queue: consumer name of group %s not set", group)
 	}
 	if minIdle <= 0 {
 		minIdle = r.opt.MinIdle
 	}
 	if n < 1 {
-		return nil, nil, "", fmt.Errorf("queue: размер пачки клейма %d < 1", n)
+		return nil, nil, "", fmt.Errorf("queue: claim batch size %d < 1", n)
 	}
 	if start == "" {
 		start = "0-0"
@@ -448,7 +448,7 @@ func (r *Reliab) Claim(ctx context.Context, stream, group, consumer string, minI
 		Count:    int64(n),
 	}).Result()
 	if err != nil {
-		return nil, nil, "", fmt.Errorf("queue: claim %s (группа %s): %w", stream, group, err)
+		return nil, nil, "", fmt.Errorf("queue: claim %s (group %s): %w", stream, group, err)
 	}
 	if next == "" {
 		next = "0-0" // the PEL walk is finished — the next one from the beginning
@@ -485,7 +485,7 @@ func (r *Reliab) Claim(ctx context.Context, stream, group, consumer string, minI
 			Count:  1,
 		}).Result()
 		if err != nil {
-			errs = append(errs, fmt.Errorf("queue: счётчик доставок записи %s (%s): %w", m.ID, stream, err))
+			errs = append(errs, fmt.Errorf("queue: delivery counter of entry %s (%s): %w", m.ID, stream, err))
 			// The claim has already spent an attempt — the entry is
 			// returned to have it refunded (FR-6.2): without this a read
 			// failure burned the attempt without a trace.
@@ -594,13 +594,13 @@ func (r *Reliab) Refund(ctx context.Context, group, consumer string, claimed []C
 		return nil
 	}
 	if group == "" || consumer == "" {
-		return fmt.Errorf("queue: возврат попыток: не заданы группа (%q) или потребитель (%q)", group, consumer)
+		return fmt.Errorf("queue: attempt refund: group (%q) or consumer (%q) not set", group, consumer)
 	}
 	// The stream — the production constants of the package, as in Claim:
 	// we do not send XCLAIM for an arbitrary name.
 	for _, c := range claimed {
 		if !knownStream(c.Stream) {
-			return fmt.Errorf("queue: возврат попыток: неизвестный стрим %q", c.Stream)
+			return fmt.Errorf("queue: attempt refund: unknown stream %q", c.Stream)
 		}
 	}
 	ids := make(map[refundKey][]string, len(claimed))
@@ -621,7 +621,7 @@ func (r *Reliab) Refund(ctx context.Context, group, consumer string, claimed []C
 		}
 		args = append(args, "justid", "retrycount", int64(k.attempts))
 		if err := r.refund.Do(ctx, args...).Err(); err != nil {
-			errs = append(errs, fmt.Errorf("queue: возврат попыток записям %s стрима %s (группа %s): %w",
+			errs = append(errs, fmt.Errorf("queue: attempt refund to entries %s of stream %s (group %s): %w",
 				strings.Join(list, ","), k.stream, group, err))
 		}
 	}
@@ -662,13 +662,13 @@ func (r *Reliab) RefundUnclassified(ctx context.Context, group, consumer string,
 		return nil
 	}
 	if group == "" || consumer == "" {
-		return fmt.Errorf("queue: возврат попыток: не заданы группа (%q) или потребитель (%q)", group, consumer)
+		return fmt.Errorf("queue: attempt refund: group (%q) or consumer (%q) not set", group, consumer)
 	}
 	// The stream — the production constants of the package, as in
 	// Claim/Refund: we do not send XPENDING for an arbitrary name.
 	for _, d := range ds {
 		if !knownStream(d.Stream) {
-			return fmt.Errorf("queue: возврат попыток: неизвестный стрим %q", d.Stream)
+			return fmt.Errorf("queue: attempt refund: unknown stream %q", d.Stream)
 		}
 	}
 	classified := make([]Claimed, 0, len(ds))
@@ -682,7 +682,7 @@ func (r *Reliab) RefundUnclassified(ctx context.Context, group, consumer string,
 			Count:  1,
 		}).Result()
 		if err != nil {
-			errs = append(errs, fmt.Errorf("queue: счётчик доставок записи %s (%s): %w", d.ID, d.Stream, err))
+			errs = append(errs, fmt.Errorf("queue: delivery counter of entry %s (%s): %w", d.ID, d.Stream, err))
 			continue
 		}
 		if len(pending) == 0 {
@@ -745,9 +745,9 @@ func (r *Reliab) bury(ctx context.Context, group string, d Delivery, attempts in
 	if unidentified {
 		taskID = unknownTaskID(d.Stream, d.ID)
 	}
-	reason := fmt.Sprintf("исчерпан лимит попыток %d: доставок без подтверждения — %d", r.opt.MaxAttempts, attempts)
+	reason := fmt.Sprintf("attempt limit %d exhausted: %d deliveries without ack", r.opt.MaxAttempts, attempts)
 	if unidentified {
-		reason = fmt.Sprintf("запись вне форматов пакета (без task_id), лимит попыток %d: доставок без подтверждения — %d",
+		reason = fmt.Sprintf("entry outside package formats (no task_id), attempt limit %d exhausted: %d deliveries without ack",
 			r.opt.MaxAttempts, attempts)
 	}
 	dead := Dead{
@@ -775,10 +775,10 @@ func (r *Reliab) bury(ctx context.Context, group string, d Delivery, attempts in
 		}
 	}
 	if _, err := r.q.Publish(ctx, StreamDead, dead); err != nil {
-		return fmt.Errorf("queue: публикация в q:dead записи %s стрима %s: %w", d.ID, d.Stream, err)
+		return fmt.Errorf("queue: publishing entry %s of stream %s to q:dead: %w", d.ID, d.Stream, err)
 	}
 	if err := r.q.Ack(ctx, d.Stream, group, d.ID); err != nil {
-		return fmt.Errorf("queue: подтверждение перенесённой в q:dead записи %s стрима %s: %w", d.ID, d.Stream, err)
+		return fmt.Errorf("queue: acknowledging the q:dead-moved entry %s of stream %s: %w", d.ID, d.Stream, err)
 	}
 	if unidentified {
 		if r.opt.OnBuryUnidentified != nil {

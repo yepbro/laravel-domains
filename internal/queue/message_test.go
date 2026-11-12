@@ -25,7 +25,7 @@ func TestMessageStreams(t *testing.T) {
 	}
 	for _, c := range cases {
 		if got, want := c.msg.Streams(), c.want; !reflect.DeepEqual(got, want) {
-			t.Errorf("%T.Streams() = %v, хочу %v", c.msg, got, want)
+			t.Errorf("%T.Streams() = %v, want %v", c.msg, got, want)
 		}
 	}
 }
@@ -73,25 +73,25 @@ func TestMessageWireFormat(t *testing.T) {
 			`{"task_id":"t3","zone_id":3,"domain_id":42,"subdomain_id":1,"variant":1,"name":"www.example.com"}`,
 		},
 		{
-			"результат без имени",
+			"result without a name",
 			Result{TaskID: "t4", ZoneID: 3, DomainID: 42, SubdomainID: 0, Variant: model.VariantMain},
 			`{"task_id":"t4","zone_id":3,"domain_id":42,"subdomain_id":0,"variant":0}`,
 		},
 		{
-			"q:dead пачки",
+			"a q:dead batch entry",
 			Dead{
 				TaskID:   "t1",
 				Stream:   StreamDNS,
 				EntryID:  "1718-0",
 				Attempts: 3,
-				Reason:   "исчерпан лимит попыток 3: доставок без подтверждения — 4",
+				Reason:   "attempt limit 3 exhausted: 4 deliveries without ack",
 				Domains:  5000,
 			},
 			`{"task_id":"t1","stream":"q:dns","entry_id":"1718-0","attempts":3,` +
-				`"reason":"исчерпан лимит попыток 3: доставок без подтверждения — 4","domains":5000}`,
+				`"reason":"attempt limit 3 exhausted: 4 deliveries without ack","domains":5000}`,
 		},
 		{
-			"q:dead штучной задачи",
+			"a q:dead unit-task entry",
 			Dead{
 				TaskID:      "t2",
 				Stream:      StreamRender,
@@ -114,7 +114,7 @@ func TestMessageWireFormat(t *testing.T) {
 				t.Fatalf("marshalMessage(%T): %v", c.msg, err)
 			}
 			if string(got) != c.want {
-				t.Errorf("формат %T:\n получил  %s\n хочу     %s", c.msg, got, c.want)
+				t.Errorf("the format of %T:\n got  %s\n want %s", c.msg, got, c.want)
 			}
 		})
 	}
@@ -165,7 +165,7 @@ func TestMessageRoundtrip(t *testing.T) {
 			t.Fatalf("%s: Decode: %v", c.stream, err)
 		}
 		if !reflect.DeepEqual(got, c.msg) {
-			t.Errorf("%s: roundtrip %T:\n получил  %+v\n хочу     %+v", c.stream, c.msg, got, c.msg)
+			t.Errorf("%s: roundtrip %T:\n got  %+v\n want %+v", c.stream, c.msg, got, c.msg)
 		}
 	}
 }
@@ -197,10 +197,10 @@ func TestMarshalFillsTaskID(t *testing.T) {
 			TaskID string `json:"task_id"`
 		}
 		if err := json.Unmarshal(data, &probe); err != nil {
-			t.Fatalf("разбор %s: %v", data, err)
+			t.Fatalf("parsing %s: %v", data, err)
 		}
 		if len(probe.TaskID) != 32 {
-			t.Errorf("%T: task_id %q — ожидается новый идентификатор NewTaskID (32 символа; hex-алфавит — TestNewTaskID)", msg, probe.TaskID)
+			t.Errorf("%T: task_id %q — a fresh NewTaskID identifier expected (32 chars; the hex alphabet — TestNewTaskID)", msg, probe.TaskID)
 		}
 	}
 }
@@ -211,15 +211,15 @@ func TestNewTaskID(t *testing.T) {
 	for i := 0; i < 1000; i++ {
 		id := NewTaskID()
 		if len(id) != 32 {
-			t.Fatalf("NewTaskID() = %q — ожидается 32 hex-символа", id)
+			t.Fatalf("NewTaskID() = %q — 32 hex chars expected", id)
 		}
 		if seen[id] {
-			t.Fatalf("NewTaskID(): повтор %q на итерации %d", id, i)
+			t.Fatalf("NewTaskID(): a repeat %q at iteration %d", id, i)
 		}
 		seen[id] = true
 		for _, r := range id {
 			if !strings.ContainsRune(hex, r) {
-				t.Fatalf("NewTaskID() = %q: неожиданный символ %q", id, r)
+				t.Fatalf("NewTaskID() = %q: an unexpected character %q", id, r)
 			}
 		}
 	}
@@ -234,7 +234,7 @@ func TestDecodeUnknownFields(t *testing.T) {
 		t.Fatalf("Decode: %v", err)
 	}
 	if len(got.Domains) != 1 || got.Domains[0].Name != "example.com" {
-		t.Errorf("Decode с неизвестными полями: %+v", got)
+		t.Errorf("Decode with unknown fields: %+v", got)
 	}
 }
 
@@ -249,23 +249,23 @@ func TestDecodeBadData(t *testing.T) {
 		decode  func(Delivery) error
 	}{
 		{
-			"битый JSON", StreamDNS, `{`, "unexpected end of JSON",
+			"broken JSON", StreamDNS, `{`, "unexpected end of JSON",
 			func(d Delivery) error { _, err := Decode[DNSBatch](d); return err },
 		},
 		{
-			"массив вместо объекта", StreamDNS, `[]`, "cannot unmarshal array",
+			"an array instead of an object", StreamDNS, `[]`, "cannot unmarshal array",
 			func(d Delivery) error { _, err := Decode[DNSBatch](d); return err },
 		},
 		{
-			"null", StreamDNS, `null`, "пустая пачка",
+			"null", StreamDNS, `null`, "empty batch",
 			func(d Delivery) error { _, err := Decode[DNSBatch](d); return err },
 		},
 		{
-			"чужой формат полей", StreamDNS, `{"task_id":"t1","subdomains":[]}`, "пустая пачка",
+			"a foreign field format", StreamDNS, `{"task_id":"t1","subdomains":[]}`, "empty batch",
 			func(d Delivery) error { _, err := Decode[DNSBatch](d); return err },
 		},
 		{
-			"пустая пачка", StreamDNS, `{"task_id":"t1","domains":[]}`, "пустая пачка",
+			"empty batch", StreamDNS, `{"task_id":"t1","domains":[]}`, "empty batch",
 			func(d Delivery) error { _, err := Decode[DNSBatch](d); return err },
 		},
 		{
@@ -277,40 +277,40 @@ func TestDecodeBadData(t *testing.T) {
 			func(d Delivery) error { _, err := Decode[DNSBatch](d); return err },
 		},
 		{
-			"пустое имя", StreamDNS, `{"task_id":"t1","domains":[{"zone_id":1,"domain_id":1,"name":""}]}`, "пустое имя",
+			"empty domain name", StreamDNS, `{"task_id":"t1","domains":[{"zone_id":1,"domain_id":1,"name":""}]}`, "empty domain name",
 			func(d Delivery) error { _, err := Decode[DNSBatch](d); return err },
 		},
 		{
-			"имя длиннее 253", StreamDNS,
-			`{"task_id":"t1","domains":[{"zone_id":1,"domain_id":1,"name":"` + strings.Repeat("a", 254) + `"}]}`, "имя длиннее",
+			"name longer than 253", StreamDNS,
+			`{"task_id":"t1","domains":[{"zone_id":1,"domain_id":1,"name":"` + strings.Repeat("a", 254) + `"}]}`, "name longer than",
 			func(d Delivery) error { _, err := Decode[DNSBatch](d); return err },
 		},
 		{
-			"нет субдоменов", StreamHTTP, `{"task_id":"t1","zone_id":1,"domain_id":1,"name":"a.test","subdomains":[]}`, "нет DNS-живых",
+			"no subdomains", StreamHTTP, `{"task_id":"t1","zone_id":1,"domain_id":1,"name":"a.test","subdomains":[]}`, "no DNS-live",
 			func(d Delivery) error { _, err := Decode[HTTPTask](d); return err },
 		},
 		{
-			"бит субдомена вне диапазона", StreamHTTP,
+			"subdomain bit out of range", StreamHTTP,
 			`{"task_id":"t1","zone_id":1,"domain_id":1,"name":"a.test","subdomains":[{"subdomain_id":63,"label":"x","addrs":["192.0.2.1"]}]}`, "out of range",
 			func(d Delivery) error { _, err := Decode[HTTPTask](d); return err },
 		},
 		{
-			"кривой адрес", StreamHTTP,
-			`{"task_id":"t1","zone_id":1,"domain_id":1,"name":"a.test","subdomains":[{"subdomain_id":0,"label":"","addrs":["не IP"]}]}`, "адрес",
+			"a bad address", StreamHTTP,
+			`{"task_id":"t1","zone_id":1,"domain_id":1,"name":"a.test","subdomains":[{"subdomain_id":0,"label":"","addrs":["not-an-ip"]}]}`, "address",
 			func(d Delivery) error { _, err := Decode[HTTPTask](d); return err },
 		},
 		{
-			"нет адресов", StreamHTTP,
-			`{"task_id":"t1","zone_id":1,"domain_id":1,"name":"a.test","subdomains":[{"subdomain_id":0,"label":"","addrs":[]}]}`, "нет адресов",
+			"no addresses", StreamHTTP,
+			`{"task_id":"t1","zone_id":1,"domain_id":1,"name":"a.test","subdomains":[{"subdomain_id":0,"label":"","addrs":[]}]}`, "no addresses",
 			func(d Delivery) error { _, err := Decode[HTTPTask](d); return err },
 		},
 		{
-			"метка с точкой", StreamHTTP,
-			`{"task_id":"t1","zone_id":1,"domain_id":1,"name":"a.test","subdomains":[{"subdomain_id":0,"label":"a.b","addrs":["192.0.2.1"]}]}`, "метка",
+			"a label with a dot", StreamHTTP,
+			`{"task_id":"t1","zone_id":1,"domain_id":1,"name":"a.test","subdomains":[{"subdomain_id":0,"label":"a.b","addrs":["192.0.2.1"]}]}`, "label",
 			func(d Delivery) error { _, err := Decode[HTTPTask](d); return err },
 		},
 		{
-			"кривой вариант", StreamRender, `{"task_id":"t1","zone_id":1,"domain_id":1,"subdomain_id":0,"variant":7}`, "вариант",
+			"a bad variant", StreamRender, `{"task_id":"t1","zone_id":1,"domain_id":1,"subdomain_id":0,"variant":7}`, "variant",
 			func(d Delivery) error { _, err := Decode[Result](d); return err },
 		},
 		{
@@ -318,20 +318,20 @@ func TestDecodeBadData(t *testing.T) {
 			func(d Delivery) error { _, err := Decode[Dead](d); return err },
 		},
 		{
-			"кривой вариант", StreamDead, `{"task_id":"t1","stream":"q:render","entry_id":"1-0","attempts":1,"variant":7}`, "вариант",
+			"a bad variant", StreamDead, `{"task_id":"t1","stream":"q:render","entry_id":"1-0","attempts":1,"variant":7}`, "variant",
 			func(d Delivery) error { _, err := Decode[Dead](d); return err },
 		},
 		{
-			"имя длиннее 253", StreamDead,
-			`{"task_id":"t1","stream":"q:http","entry_id":"1-0","attempts":1,"name":"` + strings.Repeat("a", 254) + `"}`, "имя длиннее",
+			"name longer than 253", StreamDead,
+			`{"task_id":"t1","stream":"q:http","entry_id":"1-0","attempts":1,"name":"` + strings.Repeat("a", 254) + `"}`, "name longer than",
 			func(d Delivery) error { _, err := Decode[Dead](d); return err },
 		},
 		{
-			"отрицательный размер пачки", StreamDead, `{"task_id":"t1","stream":"q:dns","entry_id":"1-0","attempts":1,"domains":-1}`, "пачки",
+			"a negative batch size", StreamDead, `{"task_id":"t1","stream":"q:dns","entry_id":"1-0","attempts":1,"domains":-1}`, "batch size",
 			func(d Delivery) error { _, err := Decode[Dead](d); return err },
 		},
 		{
-			"бит субдомена вне диапазона", StreamDead,
+			"subdomain bit out of range", StreamDead,
 			`{"task_id":"t1","stream":"q:render","entry_id":"1-0","attempts":1,"subdomain_id":63}`, "out of range",
 			func(d Delivery) error { _, err := Decode[Dead](d); return err },
 		},
@@ -340,10 +340,10 @@ func TestDecodeBadData(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			err := c.decode(Delivery{Stream: c.stream, ID: "7-0", Payload: []byte(c.payload)})
 			if err == nil {
-				t.Fatalf("декодировано без ошибки, хочу ошибку с %q", c.wantErr)
+				t.Fatalf("decoded without an error, want an error with %q", c.wantErr)
 			}
 			if !strings.Contains(err.Error(), c.wantErr) || !strings.Contains(err.Error(), "7-0") {
-				t.Errorf("ошибка %q не содержит %q и идентификатор записи", err, c.wantErr)
+				t.Errorf("the error %q does not contain %q and the entry identifier", err, c.wantErr)
 			}
 		})
 	}
@@ -355,13 +355,13 @@ func TestDecodeBadData(t *testing.T) {
 func TestDecodeWrongStream(t *testing.T) {
 	resultJSON := `{"task_id":"t1","zone_id":1,"domain_id":1,"subdomain_id":0,"variant":0}`
 	if _, err := Decode[Result](Delivery{Stream: StreamDNS, ID: "1-0", Payload: []byte(resultJSON)}); err == nil {
-		t.Error("Decode[Result] из q:dns: ожидалась ошибка стрима")
+		t.Error("Decode[Result] from q:dns: a stream error expected")
 	}
 	if _, err := Decode[DNSBatch](Delivery{Stream: StreamHTTP, ID: "1-0", Payload: []byte(`{"task_id":"t1"}`)}); err == nil {
-		t.Error("Decode[DNSBatch] из q:http: ожидалась ошибка стрима")
+		t.Error("Decode[DNSBatch] from q:http: a stream error expected")
 	}
 	if _, err := Decode[Result](Delivery{Stream: StreamRender, ID: "1-0", Payload: nil}); err == nil {
-		t.Error("Decode без поля data: ожидалась ошибка")
+		t.Error("Decode without a data field: an error expected")
 	}
 }
 
@@ -375,13 +375,13 @@ func TestDecodeEmptyPayload(t *testing.T) {
 		payload []byte
 	}{
 		{"nil", nil},
-		{"пустой срез", []byte{}},
+		{"an empty slice", []byte{}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			_, err := Decode[Result](Delivery{Stream: StreamRender, ID: "9-9", Payload: c.payload})
-			if err == nil || !strings.Contains(err.Error(), "q:render: запись 9-9 без поля data") {
-				t.Errorf("Decode(payload %q) = %v, хочу ошибку «q:render: запись 9-9 без поля data»", c.name, err)
+			if err == nil || !strings.Contains(err.Error(), "q:render: entry 9-9 has no data field") {
+				t.Errorf("Decode(payload %q) = %v, want the error «q:render: entry 9-9 has no data field»", c.name, err)
 			}
 		})
 	}
@@ -395,33 +395,33 @@ func TestValidateMessages(t *testing.T) {
 		msg     Message
 		wantErr string
 	}{
-		{"пачка ок", DNSBatch{Domains: []DNSDomain{{ZoneID: 1, DomainID: 1, Name: "a.test"}}}, ""},
-		{"пачка пуста", DNSBatch{}, "пустая пачка"},
+		{"batch ok", DNSBatch{Domains: []DNSDomain{{ZoneID: 1, DomainID: 1, Name: "a.test"}}}, ""},
+		{"batch empty", DNSBatch{}, "empty batch"},
 		{
-			"http ок",
+			"http ok",
 			HTTPTask{ZoneID: 1, DomainID: 1, Name: "a.test", Subdomains: []HTTPSubdomain{{SubdomainID: 0, Addrs: []string{"192.0.2.1"}}}},
 			"",
 		},
 		{
-			"http без имени",
+			"http without a name",
 			HTTPTask{ZoneID: 1, DomainID: 1, Subdomains: []HTTPSubdomain{{SubdomainID: 0, Addrs: []string{"192.0.2.1"}}}},
-			"пустое имя",
+			"empty domain name",
 		},
-		{"результат ок", Result{ZoneID: 1, DomainID: 1, SubdomainID: 0, Variant: model.VariantHTTP}, ""},
-		{"результат с кривым вариантом", Result{ZoneID: 1, DomainID: 1, SubdomainID: 0, Variant: model.Variant(5)}, "вариант"},
-		{"dead ок", Dead{TaskID: "t", Stream: StreamAnalyze, EntryID: "1-0", Attempts: 1}, ""},
-		{"dead из q:render-fallback", Dead{TaskID: "t", Stream: StreamRenderFallback, EntryID: "1-0", Attempts: 1}, ""},
-		{"dead без task_id", Dead{Stream: StreamAnalyze, EntryID: "1-0", Attempts: 1}, "task_id"},
-		{"dead из q:dead", Dead{TaskID: "t", Stream: StreamDead, EntryID: "1-0", Attempts: 1}, "стрим-источник"},
+		{"result ok", Result{ZoneID: 1, DomainID: 1, SubdomainID: 0, Variant: model.VariantHTTP}, ""},
+		{"result with a bad variant", Result{ZoneID: 1, DomainID: 1, SubdomainID: 0, Variant: model.Variant(5)}, "variant"},
+		{"dead ok", Dead{TaskID: "t", Stream: StreamAnalyze, EntryID: "1-0", Attempts: 1}, ""},
+		{"dead from q:render-fallback", Dead{TaskID: "t", Stream: StreamRenderFallback, EntryID: "1-0", Attempts: 1}, ""},
+		{"dead without task_id", Dead{Stream: StreamAnalyze, EntryID: "1-0", Attempts: 1}, "task_id"},
+		{"dead from q:dead", Dead{TaskID: "t", Stream: StreamDead, EntryID: "1-0", Attempts: 1}, "source stream"},
 		{
-			"dead с битым payload старой записи",
+			"dead with a broken legacy-entry payload",
 			Dead{TaskID: "t", Stream: StreamDNS, EntryID: "1-0", Attempts: 1, Payload: json.RawMessage(`{`)},
 			"payload",
 		},
 		{
-			"dead кривой вариант",
+			"dead with a bad variant",
 			Dead{TaskID: "t", Stream: StreamRender, EntryID: "1-0", Attempts: 1, Variant: model.Variant(5)},
-			"вариант",
+			"variant",
 		},
 		// The identifier boundaries "≤ 0": zero is invalid just like the
 		// negatives (the mutants "< 0" and "≤ -1" would let it through).
@@ -437,34 +437,34 @@ func TestValidateMessages(t *testing.T) {
 			HTTPTask{ZoneID: 1, DomainID: 0, Name: "a.test", Subdomains: []HTTPSubdomain{{SubdomainID: 0, Addrs: []string{"192.0.2.1"}}}},
 			"domain_id 0 ≤ 0",
 		},
-		{"результат zone_id 0", Result{ZoneID: 0, DomainID: 1, SubdomainID: 0, Variant: model.VariantMain}, "zone_id 0 ≤ 0"},
-		{"результат domain_id 0", Result{ZoneID: 1, DomainID: 0, SubdomainID: 0, Variant: model.VariantMain}, "domain_id 0 ≤ 0"},
+		{"result zone_id 0", Result{ZoneID: 0, DomainID: 1, SubdomainID: 0, Variant: model.VariantMain}, "zone_id 0 ≤ 0"},
+		{"result domain_id 0", Result{ZoneID: 1, DomainID: 0, SubdomainID: 0, Variant: model.VariantMain}, "domain_id 0 ≤ 0"},
 		// Bit 63 of the mask is signed — the only invalidity of the
 		// message.
-		{"результат бит 63", Result{ZoneID: 1, DomainID: 1, SubdomainID: 63, Variant: model.VariantMain}, "out of range"},
+		{"result bit 63", Result{ZoneID: 1, DomainID: 1, SubdomainID: 63, Variant: model.VariantMain}, "out of range"},
 		{
-			"результат имя длиннее 253",
+			"result name longer than 253",
 			Result{ZoneID: 1, DomainID: 1, SubdomainID: 0, Variant: model.VariantMain, Name: strings.Repeat("a", 254)},
-			"имя длиннее 253",
+			"name longer than 253",
 		},
-		{"dead пустой entry_id", Dead{TaskID: "t", Stream: StreamDNS, EntryID: "", Attempts: 1}, "пустой entry_id"},
+		{"dead empty entry_id", Dead{TaskID: "t", Stream: StreamDNS, EntryID: "", Attempts: 1}, "empty entry_id"},
 		// The q:dead subject identifiers are optional, but a set one
 		// must be non-negative: -1 is an error (0 is allowed, "not set",
 		// see "dead ok" above).
-		{"dead zone_id -1", Dead{TaskID: "t", Stream: StreamDNS, EntryID: "1-0", Attempts: 1, ZoneID: -1}, "отрицательны"},
-		{"dead domain_id -1", Dead{TaskID: "t", Stream: StreamDNS, EntryID: "1-0", Attempts: 1, DomainID: -1}, "отрицательны"},
+		{"dead zone_id -1", Dead{TaskID: "t", Stream: StreamDNS, EntryID: "1-0", Attempts: 1, ZoneID: -1}, "are negative"},
+		{"dead domain_id -1", Dead{TaskID: "t", Stream: StreamDNS, EntryID: "1-0", Attempts: 1, DomainID: -1}, "are negative"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			err := c.msg.validate()
 			if c.wantErr == "" {
 				if err != nil {
-					t.Errorf("validate(%T): неожиданная ошибка %v", c.msg, err)
+					t.Errorf("validate(%T): an unexpected error %v", c.msg, err)
 				}
 				return
 			}
 			if err == nil || !strings.Contains(err.Error(), c.wantErr) {
-				t.Errorf("validate(%T) = %v, хочу ошибку с %q", c.msg, err, c.wantErr)
+				t.Errorf("validate(%T) = %v, want an error with %q", c.msg, err, c.wantErr)
 			}
 		})
 	}
@@ -479,16 +479,16 @@ func TestValidateDNSBatchItemNumber(t *testing.T) {
 		second  DNSDomain
 		wantErr string
 	}{
-		{"zone_id", DNSDomain{ZoneID: 0, DomainID: 1, Name: "b.test"}, "домен №2: zone_id 0 ≤ 0"},
-		{"domain_id", DNSDomain{ZoneID: 1, DomainID: 0, Name: "b.test"}, "домен №2: domain_id 0 ≤ 0"},
-		{"имя", DNSDomain{ZoneID: 1, DomainID: 1, Name: ""}, "домен №2: пустое имя"},
+		{"zone_id", DNSDomain{ZoneID: 0, DomainID: 1, Name: "b.test"}, "domain #2: zone_id 0 ≤ 0"},
+		{"domain_id", DNSDomain{ZoneID: 1, DomainID: 0, Name: "b.test"}, "domain #2: domain_id 0 ≤ 0"},
+		{"name", DNSDomain{ZoneID: 1, DomainID: 1, Name: ""}, "domain #2: empty domain name"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			first := DNSDomain{ZoneID: 1, DomainID: 1, Name: "a.test"}
 			err := DNSBatch{Domains: []DNSDomain{first, c.second}}.validate()
 			if err == nil || !strings.Contains(err.Error(), c.wantErr) {
-				t.Errorf("validate = %v, хочу ошибку с %q", err, c.wantErr)
+				t.Errorf("validate = %v, want an error with %q", err, c.wantErr)
 			}
 		})
 	}
@@ -505,29 +505,29 @@ func TestValidateHTTPTaskSubdomainItemNumber(t *testing.T) {
 		wantErrs []string
 	}{
 		{
-			"бит субдомена вне диапазона",
+			"subdomain bit out of range",
 			HTTPSubdomain{SubdomainID: 63, Label: "x", Addrs: []string{"192.0.2.1"}},
-			[]string{"субдомен №2"},
+			[]string{"subdomain #2"},
 		},
 		{
-			"метка длиннее 63",
+			"label longer than 63",
 			HTTPSubdomain{SubdomainID: 1, Label: strings.Repeat("a", 64), Addrs: []string{"192.0.2.1"}},
-			[]string{"субдомен №2: метка", "до 63 октетов"},
+			[]string{"subdomain #2: label", "up to 63 octets"},
 		},
 		{
-			"нет адресов",
+			"no addresses",
 			HTTPSubdomain{SubdomainID: 1, Label: "x"},
-			[]string{"субдомен №2: нет адресов"},
+			[]string{"subdomain #2: no addresses"},
 		},
 		{
-			"кривой адрес",
-			HTTPSubdomain{SubdomainID: 1, Label: "x", Addrs: []string{"не IP"}},
-			[]string{"субдомен №2: адрес"},
+			"a bad address",
+			HTTPSubdomain{SubdomainID: 1, Label: "x", Addrs: []string{"not-an-ip"}},
+			[]string{"subdomain #2: address"},
 		},
 		{
-			"CNAME длиннее 253",
+			"CNAME longer than 253",
 			HTTPSubdomain{SubdomainID: 1, Label: "x", Addrs: []string{"192.0.2.1"}, CNAME: strings.Repeat("c", 254)},
-			[]string{"субдомен №2: CNAME длиннее 253"},
+			[]string{"subdomain #2: CNAME longer than 253"},
 		},
 	}
 	for _, c := range cases {
@@ -539,11 +539,11 @@ func TestValidateHTTPTaskSubdomainItemNumber(t *testing.T) {
 			}
 			err := task.validate()
 			if err == nil {
-				t.Fatalf("validate: декодировано без ошибки, хочу ошибку с %v", c.wantErrs)
+				t.Fatalf("validate: decoded without an error, want an error with %v", c.wantErrs)
 			}
 			for _, want := range c.wantErrs {
 				if !strings.Contains(err.Error(), want) {
-					t.Errorf("ошибка %q не содержит %q", err, want)
+					t.Errorf("the error %q does not contain %q", err, want)
 				}
 			}
 		})
@@ -558,7 +558,7 @@ func TestValidateHTTPTaskSubdomainItemNumber(t *testing.T) {
 func TestValidateExactLimits(t *testing.T) {
 	name253 := strings.Repeat("a", 253)
 	if err := (DNSBatch{Domains: []DNSDomain{{ZoneID: 1, DomainID: 1, Name: name253}}}).validate(); err != nil {
-		t.Errorf("имя 253 октета (q:dns): %v", err)
+		t.Errorf("a 253-octet name (q:dns): %v", err)
 	}
 	task := HTTPTask{
 		ZoneID: 1, DomainID: 1, Name: name253,
@@ -570,14 +570,14 @@ func TestValidateExactLimits(t *testing.T) {
 		}},
 	}
 	if err := task.validate(); err != nil {
-		t.Errorf("метка 63 и CNAME 253 октета (q:http): %v", err)
+		t.Errorf("a 63-octet label and a 253-octet CNAME (q:http): %v", err)
 	}
 	if err := (Result{ZoneID: 1, DomainID: 1, SubdomainID: 0, Variant: model.VariantMain, Name: name253}).validate(); err != nil {
-		t.Errorf("имя 253 октета (результат): %v", err)
+		t.Errorf("a 253-octet name (result): %v", err)
 	}
 	dead := Dead{TaskID: "t", Stream: StreamDNS, EntryID: "1-0", Attempts: 1, Name: name253}
 	if err := dead.validate(); err != nil {
-		t.Errorf("имя 253 октета (q:dead): %v", err)
+		t.Errorf("a 253-octet name (q:dead): %v", err)
 	}
 }
 
@@ -595,7 +595,7 @@ func TestDeadSubjectOf(t *testing.T) {
 		want    Dead
 	}{
 		{
-			"пачка q:dns",
+			"a q:dns batch",
 			StreamDNS,
 			`{"task_id":"t1","domains":[{"zone_id":1,"domain_id":1,"name":"a.test"},{"zone_id":2,"domain_id":2,"name":"b.test"},{"zone_id":1,"domain_id":3,"name":"c.test"}]}`,
 			Dead{Domains: 3},
@@ -603,25 +603,25 @@ func TestDeadSubjectOf(t *testing.T) {
 		{"q:http", StreamHTTP,
 			`{"task_id":"t2","zone_id":3,"domain_id":42,"name":"example.com","subdomains":[]}`,
 			Dead{ZoneID: 3, DomainID: 42, Name: "example.com"}},
-		{"q:render основной вариант", StreamRender,
+		{"q:render main variant", StreamRender,
 			`{"task_id":"t3","zone_id":3,"domain_id":42,"subdomain_id":0,"variant":0,"name":"example.com"}`,
 			Dead{ZoneID: 3, DomainID: 42, Name: "example.com"}},
-		{"q:render-fallback http-вариант", StreamRenderFallback,
+		{"q:render-fallback http variant", StreamRenderFallback,
 			`{"task_id":"t6","zone_id":3,"domain_id":42,"subdomain_id":2,"variant":1,"name":"www.example.com"}`,
 			Dead{ZoneID: 3, DomainID: 42, SubdomainID: 2, Variant: model.VariantHTTP, Name: "www.example.com"}},
-		{"q:analyze http-вариант", StreamAnalyze,
+		{"q:analyze http variant", StreamAnalyze,
 			`{"task_id":"t4","zone_id":3,"domain_id":42,"subdomain_id":1,"variant":1,"name":"www.example.com"}`,
 			Dead{ZoneID: 3, DomainID: 42, SubdomainID: 1, Variant: model.VariantHTTP, Name: "www.example.com"}},
-		{"q:dns без пачки", StreamDNS, `{"task_id":"t5"}`, Dead{}},
-		{"чужой формат", StreamHTTP, `{"no":"format"}`, Dead{}},
-		{"мусор", StreamDNS, `не JSON`, Dead{}},
+		{"q:dns without a batch", StreamDNS, `{"task_id":"t5"}`, Dead{}},
+		{"a foreign format", StreamHTTP, `{"no":"format"}`, Dead{}},
+		{"junk", StreamDNS, `not JSON`, Dead{}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			var d Dead
 			deadSubjectOf(&d, c.stream, []byte(c.payload))
 			if !reflect.DeepEqual(d, c.want) {
-				t.Errorf("deadSubjectOf:\n получил  %+v\n хочу     %+v", d, c.want)
+				t.Errorf("deadSubjectOf:\n got  %+v\n want %+v", d, c.want)
 			}
 		})
 	}
@@ -633,16 +633,16 @@ func TestDeadSubjectOf(t *testing.T) {
 // publish payload (bury, TestReliabClaimDeadByteGuard).
 func TestDecodeDeadLegacyPayload(t *testing.T) {
 	legacy := `{"task_id":"t1","stream":"q:dns","entry_id":"1-0","attempts":4,` +
-		`"reason":"исчерпан лимит попыток 3: доставок без подтверждения — 4",` +
+		`"reason":"attempt limit 3 exhausted: 4 deliveries without ack",` +
 		`"payload":{"task_id":"t1","domains":[{"zone_id":1,"domain_id":1,"name":"a.test"}]}}`
 	dead, err := Decode[Dead](Delivery{Stream: StreamDead, ID: "2-0", Payload: []byte(legacy)})
 	if err != nil {
-		t.Fatalf("старая запись q:dead не декодируется: %v", err)
+		t.Fatalf("the legacy q:dead entry does not decode: %v", err)
 	}
 	if dead.TaskID != "t1" || dead.Stream != StreamDNS || dead.EntryID != "1-0" || dead.Attempts != 4 {
-		t.Errorf("поля старой записи: %+v", dead)
+		t.Errorf("the legacy entry's fields: %+v", dead)
 	}
 	if len(dead.Payload) == 0 || !json.Valid(dead.Payload) {
-		t.Errorf("payload старой записи не прочитан: %q", dead.Payload)
+		t.Errorf("the legacy entry's payload not read: %q", dead.Payload)
 	}
 }

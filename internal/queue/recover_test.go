@@ -42,7 +42,7 @@ func runRecoverLoop(t *testing.T, fake *fakeClaimRedis, opt RecoverOptions, proc
 		select {
 		case <-done:
 		case <-time.After(5 * time.Second):
-			t.Fatal("RecoverLoop не остановился по отмене ctx")
+			t.Fatal("RecoverLoop did not stop on ctx cancel")
 		}
 	}
 }
@@ -76,7 +76,7 @@ func waitProcessed(t *testing.T, processed chan Delivery) Delivery {
 	case d := <-processed:
 		return d
 	case <-time.After(5 * time.Second):
-		t.Fatal("обработка зависшей доставки не началась")
+		t.Fatal("the stalled delivery processing did not start")
 		return Delivery{}
 	}
 }
@@ -97,30 +97,30 @@ func TestRecoverLoopClaimProcess(t *testing.T) {
 	}, nil)
 	d := waitProcessed(t, processed)
 	if d.ID != "1718-0" || d.Stream != StreamHTTP {
-		t.Errorf("обработана чужая доставка: %+v", d)
+		t.Errorf("a foreign delivery processed: %+v", d)
 	}
 	stop() // waiting for the exit — inside runRecoverLoop
 
 	// The claim on behalf of the loop's consumer, the XACK — after
 	// processing.
 	if len(fake.claims) != 1 {
-		t.Fatalf("вызовов XAUTOCLAIM: %d, хочу 1", len(fake.claims))
+		t.Fatalf("XAUTOCLAIM calls: %d, want 1", len(fake.claims))
 	}
 	c := fake.claims[0]
 	if c.Stream != StreamHTTP || c.Group != "http" || c.Consumer != "recover-1" || c.Count != 4 {
-		t.Errorf("XAUTOCLAIM: стрим/группа/потребитель/пачка: %+v", c)
+		t.Errorf("XAUTOCLAIM: stream/group/consumer/batch: %+v", c)
 	}
 	// A minIdle of 0 from the loop — the reliability layer's option (the
 	// worker's MinIdle).
 	if c.MinIdle != time.Minute {
-		t.Errorf("XAUTOCLAIM MinIdle: %s, хочу 1m (из ReliabOptions теста)", c.MinIdle)
+		t.Errorf("XAUTOCLAIM MinIdle: %s, want 1m (from the test's ReliabOptions)", c.MinIdle)
 	}
 	if want := []ackCall{{StreamHTTP, "http", []string{"1718-0"}}}; !sameAcks(fake.acks, want) {
-		t.Errorf("XACK после обработки: %+v, хочу %+v", fake.acks, want)
+		t.Errorf("XACK after processing: %+v, want %+v", fake.acks, want)
 	}
 	// A working entry does not go to q:dead.
 	if len(fake.adds) != 0 {
-		t.Errorf("публикаций в q:dead быть не должно: %+v", fake.adds)
+		t.Errorf("there must be no publications to q:dead: %+v", fake.adds)
 	}
 }
 
@@ -146,10 +146,10 @@ func TestRecoverLoopProcessError(t *testing.T) {
 	stop()
 
 	if len(fake.acks) != 0 {
-		t.Errorf("XACK после сбоя обработки: %+v", fake.acks)
+		t.Errorf("XACK after a processing failure: %+v", fake.acks)
 	}
 	if len(fake.adds) != 0 {
-		t.Errorf("сбой обработки не переводит запись в q:dead: %+v", fake.adds)
+		t.Errorf("a processing failure does not move the entry to q:dead: %+v", fake.adds)
 	}
 }
 
@@ -178,21 +178,21 @@ func TestRecoverLoopDrainsFullBatch(t *testing.T) {
 	second := waitProcessed(t, processed) // the tick — an hour: the second only via the drain
 	stop()
 	if first.ID != "1718-0" || second.ID != "1719-0" {
-		t.Errorf("дренаж: %+v затем %+v, хочу 1718-0 и 1719-0", first, second)
+		t.Errorf("drain: %+v then %+v, want 1718-0 and 1719-0", first, second)
 	}
 	// The second claim continues from the first one's cursor, not from
 	// the beginning of the PEL.
 	if len(fake.claims) < 2 {
-		t.Fatalf("клеймов %d, хочу ≥ 2", len(fake.claims))
+		t.Fatalf("claims %d, want ≥ 2", len(fake.claims))
 	}
 	if got := fake.claims[1].Start; got != "1720-0" {
-		t.Errorf("курсор второго клейма = %q, хочу 1720-0 (перенос между проходами)", got)
+		t.Errorf("the second claim's cursor = %q, want 1720-0 (carried between passes)", got)
 	}
 	if !sameAcks(fake.acks, []ackCall{
 		{StreamDNS, "dns", []string{"1718-0"}},
 		{StreamDNS, "dns", []string{"1719-0"}},
 	}) {
-		t.Errorf("XACK дренированных: %+v", fake.acks)
+		t.Errorf("XACK of the drained entries: %+v", fake.acks)
 	}
 }
 
@@ -219,14 +219,14 @@ func TestRecoverLoopDead(t *testing.T) {
 
 	select {
 	case d := <-processed:
-		t.Errorf("исчерпавшая попытки запись обработана: %+v", d)
+		t.Errorf("the attempt-exhausted entry processed: %+v", d)
 	default:
 	}
 	if len(fake.adds) != 1 || fake.adds[0].Stream != StreamDead {
-		t.Errorf("Dead не опубликован: %+v", fake.adds)
+		t.Errorf("the Dead not published: %+v", fake.adds)
 	}
 	if want := []ackCall{{StreamRender, "render", []string{"1718-0"}}}; !sameAcks(fake.acks, want) {
-		t.Errorf("XACK перенесённой записи: %+v, хочу %+v", fake.acks, want)
+		t.Errorf("XACK of the moved entry: %+v, want %+v", fake.acks, want)
 	}
 }
 
@@ -258,14 +258,14 @@ func TestRecoverLoopLogs(t *testing.T) {
 	stop()
 
 	out := buf.String()
-	if !strings.Contains(out, "цикл возврата зависших доставок") {
-		t.Errorf("стартовая запись цикла не оставлена: %q", out)
+	if !strings.Contains(out, "stalled delivery recovery loop") {
+		t.Errorf("the loop start entry not logged: %q", out)
 	}
-	if strings.Contains(out, "клейм") {
-		t.Errorf("успешный клейм записан предупреждением: %q", out)
+	if strings.Contains(out, "claim") {
+		t.Errorf("a successful claim logged as a warning: %q", out)
 	}
-	if strings.Contains(out, "не подтверждена") {
-		t.Errorf("успешная обработка записана предупреждением: %q", out)
+	if strings.Contains(out, "not acknowledged") {
+		t.Errorf("a successful processing logged as a warning: %q", out)
 	}
 }
 
@@ -280,8 +280,8 @@ func TestRecoverLoopLogsErrors(t *testing.T) {
 	_, _, stop := runRecoverLoop(t, fake, recoverLogOpts(&buf, time.Millisecond), nil)
 	time.Sleep(50 * time.Millisecond) // at least one tick with an error
 	stop()
-	if !strings.Contains(buf.String(), "возврат зависших доставок: клейм") {
-		t.Errorf("ошибка клейма не записана: %q", buf.String())
+	if !strings.Contains(buf.String(), "stalled delivery recovery: claim") {
+		t.Errorf("the claim error not logged: %q", buf.String())
 	}
 
 	// A processing error: without an XACK, with a record about the return
@@ -303,11 +303,11 @@ func TestRecoverLoopLogsErrors(t *testing.T) {
 		func(context.Context, Delivery) error { return errors.New("db: write result: timeout") })
 	time.Sleep(50 * time.Millisecond)
 	stop()
-	if !strings.Contains(buf.String(), "не подтверждена") {
-		t.Errorf("ошибка обработки не записана: %q", buf.String())
+	if !strings.Contains(buf.String(), "not acknowledged") {
+		t.Errorf("the processing error not logged: %q", buf.String())
 	}
 	if len(fake.acks) != 0 {
-		t.Errorf("XACK после сбоя обработки: %+v", fake.acks)
+		t.Errorf("XACK after a processing failure: %+v", fake.acks)
 	}
 }
 
@@ -324,10 +324,10 @@ func TestRecoverLoopCanceledContext(t *testing.T) {
 	err := RecoverLoop(ctx, r, func(context.Context, Delivery) error { return nil },
 		recoverLogOpts(&buf, time.Hour))
 	if err != nil {
-		t.Fatalf("выход по отменённому ctx: %v, хочу nil", err)
+		t.Fatalf("exit on a cancelled ctx: %v, want nil", err)
 	}
-	if strings.Contains(buf.String(), "клейм") {
-		t.Errorf("клейм при отменённом ctx записан предупреждением: %q", buf.String())
+	if strings.Contains(buf.String(), "claim") {
+		t.Errorf("a claim on a cancelled ctx logged as a warning: %q", buf.String())
 	}
 }
 
@@ -373,10 +373,10 @@ func TestRecoverLoopCanceledMidBatch(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	if want := []string{"1718-0"}; !reflect.DeepEqual(handled, want) {
-		t.Errorf("обработаны %v, хочу %v (после отмены пачка не продолжается)", handled, want)
+		t.Errorf("processed %v, want %v (the batch does not continue after the cancel)", handled, want)
 	}
-	if strings.Contains(buf.String(), "не подтверждена") {
-		t.Errorf("ошибка обработки при отменённом ctx записана предупреждением: %q", buf.String())
+	if strings.Contains(buf.String(), "not acknowledged") {
+		t.Errorf("a processing error on a cancelled ctx logged as a warning: %q", buf.String())
 	}
 }
 
@@ -433,26 +433,26 @@ func TestRecoverLoopCancelRefundsUnprocessed(t *testing.T) {
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Fatalf("RecoverLoop после отмены: %v", err)
+			t.Fatalf("RecoverLoop after the cancel: %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("RecoverLoop не остановился по отмене ctx")
+		t.Fatal("RecoverLoop did not stop on ctx cancel")
 	}
 
 	mu.Lock()
 	defer mu.Unlock()
 	if want := []string{"1-1", "1-2"}; !reflect.DeepEqual(handled, want) {
-		t.Fatalf("обработаны %v, хочу %v (после отмены пачка не продолжается)", handled, want)
+		t.Fatalf("processed %v, want %v (the batch does not continue after the cancel)", handled, want)
 	}
 	// The T-222 criterion: the attempts of the unprocessed (4 − 2)
 	// entries do not grow — one refund command for the batch tail with
 	// the pre-claim counter.
 	if len(fake.dos) != 1 {
-		t.Fatalf("команд возврата: %d, хочу 1 (хвост 1-3, 1-4 одной группой)", len(fake.dos))
+		t.Fatalf("refund commands: %d, want 1 (the tail 1-3, 1-4 in one group)", len(fake.dos))
 	}
 	want := []interface{}{"xclaim", StreamHTTP, "http", "recover-1", int64(0), "1-3", "1-4", "justid", "retrycount", int64(1)}
 	if got := fake.dos[0]; !reflect.DeepEqual(got, want) {
-		t.Errorf("возврат:\n получил  %v\n хочу     %v", got, want)
+		t.Errorf("refund:\n got  %v\n want %v", got, want)
 	}
 	// The entries reworked before the cancel: the first is acknowledged
 	// before the cancel. The acknowledgement of the second goes over the
@@ -462,7 +462,7 @@ func TestRecoverLoopCancelRefundsUnprocessed(t *testing.T) {
 	if !sameAcks(fake.acks, []ackCall{
 		{StreamHTTP, "http", []string{"1-1"}},
 	}) {
-		t.Errorf("XACK до отмены: %+v", fake.acks)
+		t.Errorf("XACK before the cancel: %+v", fake.acks)
 	}
 }
 
@@ -495,18 +495,18 @@ func TestRecoverLoopRefundsUnclassified(t *testing.T) {
 	}, nil)
 	d := waitProcessed(t, processed) // the valid part of the batch — into the work
 	if d.ID != "1-2" {
-		t.Errorf("обработана доставка %s, хочу 1-2 (валидная часть пачки)", d.ID)
+		t.Errorf("the delivery %s processed, want 1-2 (the valid part of the batch)", d.ID)
 	}
 	stop()
 
 	// The attempt of 1-1 is refunded: the counter after the claim is 2,
 	// the rollback to 1 — one command for the same group/consumer.
 	if len(fake.dos) != 1 {
-		t.Fatalf("команд возврата: %d, хочу 1 (запись без классификации)", len(fake.dos))
+		t.Fatalf("refund commands: %d, want 1 (the entry without classification)", len(fake.dos))
 	}
 	want := []interface{}{"xclaim", StreamHTTP, "http", "recover-1", int64(0), "1-1", "justid", "retrycount", int64(1)}
 	if got := fake.dos[0]; !reflect.DeepEqual(got, want) {
-		t.Errorf("возврат:\n получил  %v\n хочу     %v", got, want)
+		t.Errorf("refund:\n got  %v\n want %v", got, want)
 	}
 	// The counter of 1-1 was read twice: the classification (a failure)
 	// and the refund (a success).
@@ -517,15 +517,15 @@ func TestRecoverLoopRefundsUnclassified(t *testing.T) {
 		}
 	}
 	if reads != 2 {
-		t.Errorf("чтений счётчика 1-1: %d, хочу 2 (классификация + возврат)", reads)
+		t.Errorf("counter reads of 1-1: %d, want 2 (classification + refund)", reads)
 	}
 	// The valid entry is processed and acknowledged; the unclassified
 	// entry gets its attempt back — nothing goes to q:dead.
 	if want := []ackCall{{StreamHTTP, "http", []string{"1-2"}}}; !sameAcks(fake.acks, want) {
-		t.Errorf("XACK валидной записи: %+v, хочу %+v", fake.acks, want)
+		t.Errorf("XACK of the valid entry: %+v, want %+v", fake.acks, want)
 	}
 	if len(fake.adds) != 0 {
-		t.Errorf("публикаций в q:dead быть не должно: %+v", fake.adds)
+		t.Errorf("there must be no publications to q:dead: %+v", fake.adds)
 	}
 }
 
@@ -563,16 +563,16 @@ func TestRecoverLoopUnclassifiedOutOfInvariantSkipsRefund(t *testing.T) {
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Fatalf("RecoverLoop после отмены: %v", err)
+			t.Fatalf("RecoverLoop after the cancel: %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("RecoverLoop не остановился по отмене ctx")
+		t.Fatal("RecoverLoop did not stop on ctx cancel")
 	}
 	if len(fake.dos) != 0 {
-		t.Errorf("возврат вне инварианта: %+v, хочу 0 команд (чужой клейм не гасим)", fake.dos)
+		t.Errorf("a refund outside the invariant: %+v, want 0 commands (someone else's claim is not extinguished)", fake.dos)
 	}
-	if !strings.Contains(buf.String(), "классификация дольше claim_min_idle") {
-		t.Errorf("пропуск возврата вне инварианта не записан: %q", buf.String())
+	if !strings.Contains(buf.String(), "classification took longer than claim_min_idle") {
+		t.Errorf("the out-of-invariant refund skip not logged: %q", buf.String())
 	}
 }
 
@@ -611,16 +611,16 @@ func TestRecoverLoopCancelOutOfInvariantSkipsRefund(t *testing.T) {
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Fatalf("RecoverLoop после отмены вне инварианта: %v", err)
+			t.Fatalf("RecoverLoop after the cancel outside the invariant: %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("RecoverLoop не остановился по отмене ctx")
+		t.Fatal("RecoverLoop did not stop on ctx cancel")
 	}
 	if len(fake.dos) != 0 {
-		t.Errorf("возврат вне инварианта: %+v, хочу 0 команд (чужой клейм не гасим)", fake.dos)
+		t.Errorf("a refund outside the invariant: %+v, want 0 commands (someone else's claim is not extinguished)", fake.dos)
 	}
-	if !strings.Contains(buf.String(), "возврат попыток пропущен") {
-		t.Errorf("пропуск возврата вне инварианта не записан: %q", buf.String())
+	if !strings.Contains(buf.String(), "attempt refund skipped") {
+		t.Errorf("the out-of-invariant refund skip not logged: %q", buf.String())
 	}
 }
 
@@ -654,16 +654,16 @@ func TestRecoverLoopCancelRefundFails(t *testing.T) {
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Fatalf("RecoverLoop после отмены со сбойным возвратом: %v", err)
+			t.Fatalf("RecoverLoop after the cancel with a failing refund: %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("RecoverLoop не остановился по отмене ctx")
+		t.Fatal("RecoverLoop did not stop on ctx cancel")
 	}
-	if !strings.Contains(buf.String(), "не возвращены") {
-		t.Errorf("сбой возврата попыток не записан: %q", buf.String())
+	if !strings.Contains(buf.String(), "not returned") {
+		t.Errorf("the refund failure not logged: %q", buf.String())
 	}
 	if len(fake.dos) != 1 {
-		t.Errorf("попыток возврата: %d, хочу 1 (best effort — одна команда)", len(fake.dos))
+		t.Errorf("refund commands: %d, want 1 (best effort — one command)", len(fake.dos))
 	}
 }
 
@@ -673,17 +673,17 @@ func TestRecoverLoopValidation(t *testing.T) {
 	fake := &fakeClaimRedis{}
 	if err := RecoverLoop(context.Background(), nil, func(context.Context, Delivery) error { return nil }, RecoverOptions{
 		Stream: StreamDNS, Group: "dns", Consumer: "c",
-	}); err == nil || !contains(err, "надёжности") {
+	}); err == nil || !contains(err, "reliability") {
 		t.Errorf("nil Reliab: %v", err)
 	}
 	r := newTestReliab(fake, ReliabOptions{})
 	if err := RecoverLoop(context.Background(), r, nil, RecoverOptions{
 		Stream: StreamDNS, Group: "dns", Consumer: "c",
-	}); err == nil || !contains(err, "обработчик") {
-		t.Errorf("nil обработчик: %v", err)
+	}); err == nil || !contains(err, "handler") {
+		t.Errorf("a nil handler: %v", err)
 	}
 	if len(fake.claims) != 0 {
-		t.Errorf("Redis вызван с плохими аргументами: %+v", fake.claims)
+		t.Errorf("Redis called with bad arguments: %+v", fake.claims)
 	}
 }
 
@@ -693,23 +693,23 @@ func TestRecoverLoopValidation(t *testing.T) {
 func TestRecoverOptionsDefaults(t *testing.T) {
 	o := RecoverOptions{}.withDefaults()
 	if DefaultRecoverBatch != 64 {
-		t.Errorf("DefaultRecoverBatch = %d, хочу 64 (T-153: темп обхода PEL; литерал — пин константы)", DefaultRecoverBatch)
+		t.Errorf("DefaultRecoverBatch = %d, want 64 (T-153: the PEL traversal pace; the literal pins the constant)", DefaultRecoverBatch)
 	}
 	if DefaultRecoverInterval != 30*time.Second {
-		t.Errorf("DefaultRecoverInterval = %s, хочу 30s (литерал — пин константы)", DefaultRecoverInterval)
+		t.Errorf("DefaultRecoverInterval = %s, want 30s (the literal pins the constant)", DefaultRecoverInterval)
 	}
 	if o.Batch != 64 {
-		t.Errorf("Batch = %d, хочу 64 (DefaultRecoverBatch, литерал — пин константы)", o.Batch)
+		t.Errorf("Batch = %d, want 64 (DefaultRecoverBatch, the literal pins the constant)", o.Batch)
 	}
 	if o.Interval != 30*time.Second {
-		t.Errorf("Interval = %s, хочу 30s (DefaultRecoverInterval, литерал — пин константы)", o.Interval)
+		t.Errorf("Interval = %s, want 30s (DefaultRecoverInterval, the literal pins the constant)", o.Interval)
 	}
 	o = RecoverOptions{Batch: 1, Interval: time.Nanosecond}.withDefaults()
 	if o.Batch != 1 {
-		t.Errorf("Batch = %d, хочу 1 (положительная пачка валидна)", o.Batch)
+		t.Errorf("Batch = %d, want 1 (a positive batch is valid)", o.Batch)
 	}
 	if o.Interval != time.Nanosecond {
-		t.Errorf("Interval = %s, хочу 1нс (положительный интервал валиден)", o.Interval)
+		t.Errorf("Interval = %s, want 1ns (a positive interval is valid)", o.Interval)
 	}
 }
 
@@ -734,10 +734,10 @@ func TestProcessingAttempt(t *testing.T) {
 		t.Fatalf("ProcessAttempt: %v", err)
 	}
 	if got != 3 {
-		t.Errorf("обработчик видел attempts=%d, хочу 3 (счётчик доставок PEL)", got)
+		t.Errorf("the handler saw attempts=%d, want 3 (the PEL delivery counter)", got)
 	}
 	if want := []ackCall{{StreamRender, "render-worker", []string{"1-1"}}}; !sameAcks(fake.acks, want) {
-		t.Errorf("XACK после успешной обработки: %+v, хочу %+v", fake.acks, want)
+		t.Errorf("XACK after successful processing: %+v, want %+v", fake.acks, want)
 	}
 
 	// A processing error — without an XACK, the attempt number is not
@@ -745,17 +745,17 @@ func TestProcessingAttempt(t *testing.T) {
 	fake2 := &fakeClaimRedis{}
 	r2 := newTestReliab(fake2, ReliabOptions{})
 	err = r2.ProcessAttempt(context.Background(), "render-worker", d, 2,
-		func(context.Context, Delivery, int) error { return errors.New("таймаут") })
-	if err == nil || !strings.Contains(err.Error(), "таймаут") {
-		t.Fatalf("ошибка обработки: %v", err)
+		func(context.Context, Delivery, int) error { return errors.New("timeout") })
+	if err == nil || !strings.Contains(err.Error(), "timeout") {
+		t.Fatalf("the processing error: %v", err)
 	}
 	if len(fake2.acks) != 0 {
-		t.Errorf("XACK при ошибке: %+v", fake2.acks)
+		t.Errorf("XACK on error: %+v", fake2.acks)
 	}
 
 	// A nil handler — an error before Redis.
 	if err := ProcessingAttempt(context.Background(), NewRedisQueue(&fakeClaimRedis{}, RedisOptions{}), "g", d, 1, nil); err == nil {
-		t.Error("nil обработчик: ожидалась ошибка")
+		t.Error("a nil handler: an error expected")
 	}
 }
 
@@ -790,22 +790,22 @@ func TestRecoverLoopAttempt(t *testing.T) {
 	select {
 	case g := <-got:
 		if g.id != "1718-0" || g.attempts != 2 {
-			t.Errorf("обработчик видел (%s, попытка %d), хочу (1718-0, 2)", g.id, g.attempts)
+			t.Errorf("the handler saw (%s, attempt %d), want (1718-0, 2)", g.id, g.attempts)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("обработка клеймнутой доставки не началась")
+		t.Fatal("the claimed delivery processing did not start")
 	}
 	cancel()
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Fatalf("RecoverLoopAttempt после отмены: %v", err)
+			t.Fatalf("RecoverLoopAttempt after the cancel: %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("RecoverLoopAttempt не остановился по отмене ctx")
+		t.Fatal("RecoverLoopAttempt did not stop on ctx cancel")
 	}
 	if want := []ackCall{{StreamRender, "render-worker", []string{"1718-0"}}}; !sameAcks(fake.acks, want) {
-		t.Errorf("XACK после обработки: %+v, хочу %+v", fake.acks, want)
+		t.Errorf("XACK after processing: %+v, want %+v", fake.acks, want)
 	}
 }
 
@@ -817,16 +817,16 @@ func TestRecoverLoopAttemptValidation(t *testing.T) {
 	r := newTestReliab(fake, ReliabOptions{})
 	if err := RecoverLoopAttempt(context.Background(), r, nil, RecoverOptions{
 		Stream: StreamRender, Group: "g", Consumer: "c",
-	}); err == nil || !contains(err, "обработчик") {
-		t.Errorf("nil обработчик RecoverLoopAttempt: %v", err)
+	}); err == nil || !contains(err, "handler") {
+		t.Errorf("the nil handler RecoverLoopAttempt: %v", err)
 	}
 	if err := RecoverLoop(context.Background(), r, nil, RecoverOptions{
 		Stream: StreamRender, Group: "g", Consumer: "c",
-	}); err == nil || !contains(err, "обработчик") {
-		t.Errorf("nil обработчик RecoverLoop: %v", err)
+	}); err == nil || !contains(err, "handler") {
+		t.Errorf("the nil handler RecoverLoop: %v", err)
 	}
 	if len(fake.claims) != 0 {
-		t.Errorf("Redis вызван с плохими аргументами: %+v", fake.claims)
+		t.Errorf("Redis called with bad arguments: %+v", fake.claims)
 	}
 }
 
@@ -898,7 +898,7 @@ func TestRecoverLoopIntervalPaces(t *testing.T) {
 		select {
 		case <-done:
 		case <-time.After(5 * time.Second):
-			t.Fatal("RecoverLoop не остановился по отмене ctx")
+			t.Fatal("RecoverLoop did not stop on ctx cancel")
 		}
 	}
 	defer stop()
@@ -907,14 +907,14 @@ func TestRecoverLoopIntervalPaces(t *testing.T) {
 	// The batch from the options is applied to the first claim
 	// (Count = Batch).
 	if c := fake.batch(); c != 2 {
-		t.Errorf("XAUTOCLAIM Count = %d, хочу 2 (Batch из опций)", c)
+		t.Errorf("XAUTOCLAIM Count = %d, want 2 (the options' Batch)", c)
 	}
 	time.Sleep(40 * time.Millisecond)
 	if n := fake.claims(); n != 1 {
-		t.Errorf("клеймов до тика: %d, хочу 1 (неполная пачка ждёт Interval, не клейм сразу)", n)
+		t.Errorf("claims before the tick: %d, want 1 (an incomplete batch waits for the Interval, does not claim immediately)", n)
 	}
 	time.Sleep(400 * time.Millisecond) // > 2 ticks of 120 ms each
 	if n := fake.claims(); n < 2 {
-		t.Errorf("клеймов после тиков: %d, хочу ≥ 2 (тик задаёт темп, обход не прекращается)", n)
+		t.Errorf("claims after the ticks: %d, want ≥ 2 (the tick sets the pace, the traversal does not stop)", n)
 	}
 }

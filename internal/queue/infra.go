@@ -54,7 +54,7 @@ type InfraError struct {
 }
 
 func (e *InfraError) Error() string {
-	return fmt.Sprintf("queue: %s: инфраструктурный сбой Redis: %v", e.Op, e.Err)
+	return fmt.Sprintf("queue: %s: Redis infrastructure failure: %v", e.Op, e.Err)
 }
 
 func (e *InfraError) Unwrap() error { return e.Err }

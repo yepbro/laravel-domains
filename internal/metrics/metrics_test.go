@@ -40,10 +40,10 @@ func TestHandler(t *testing.T) {
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("статус = %d, want 200", resp.StatusCode)
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
 	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/plain") {
-		t.Errorf("Content-Type = %q, want text/plain (формат Prometheus)", ct)
+		t.Errorf("Content-Type = %q, want text/plain (the Prometheus format)", ct)
 	}
 
 	body, err := io.ReadAll(resp.Body)
@@ -57,7 +57,7 @@ func TestHandler(t *testing.T) {
 		`go_goroutines`, // the Go/runtime collector
 	} {
 		if !strings.Contains(text, want) {
-			t.Errorf("в /metrics нет строки %q", want)
+			t.Errorf("the /metrics has no line %q", want)
 		}
 	}
 }
@@ -71,7 +71,7 @@ func TestBuildInfoMode(t *testing.T) {
 	defer func() { buildMode = prev }()
 
 	if text := scrape(t, New("svc")); !strings.Contains(text, `crawler_build_info{mode="prod",revision="",service="svc",version="dev"} 1`) {
-		t.Errorf("в /metrics нет crawler_build_info с инъекцированным mode:\n%s", text)
+		t.Errorf("the /metrics has no crawler_build_info with an injected mode:\n%s", text)
 	}
 }
 
@@ -88,7 +88,7 @@ func TestBuildInfoVersionRevision(t *testing.T) {
 	if text := scrape(t, New("svc")); !strings.Contains(text,
 		`crawler_build_info{mode="dev-stub",revision="abc1234",service="svc",version="v1.2.3-4-gabc1234-dirty"} 1`,
 	) {
-		t.Errorf("в /metrics нет crawler_build_info с инъекцированными version/revision:\n%s", text)
+		t.Errorf("the /metrics has no crawler_build_info with injected version/revision:\n%s", text)
 	}
 }
 
@@ -98,7 +98,7 @@ func TestHandlerBareRegistry(t *testing.T) {
 	bare := prometheus.NewRegistry()
 	bare.MustRegister(collectors.NewGoCollector())
 	if text := scrape(t, bare); !strings.Contains(text, "go_goroutines") {
-		t.Error("Handler должен принимать *prometheus.Registry напрямую")
+		t.Error("Handler must accept a *prometheus.Registry directly")
 	}
 }
 
@@ -110,13 +110,13 @@ func TestFactoryAutoServiceLabel(t *testing.T) {
 
 	tasks := reg.MustCounter(prometheus.CounterOpts{
 		Name: "crawler_stage_tasks_total",
-		Help: "Обработанные домены по этапам конвейера.",
+		Help: "Pipeline domains processed, by stage.",
 	}, LabelStage)
 	tasks.WithLabelValues("dns").Inc()
 
 	depth := reg.MustGauge(prometheus.GaugeOpts{
 		Name: "crawler_queue_depth",
-		Help: "Длина очереди задач.",
+		Help: "The task queue length.",
 	}, LabelQueue)
 	depth.WithLabelValues("q:dns").Set(42)
 
@@ -124,20 +124,20 @@ func TestFactoryAutoServiceLabel(t *testing.T) {
 	// arguments
 	memory := reg.MustGauge(prometheus.GaugeOpts{
 		Name: "crawler_worker_memory_bytes",
-		Help: "Память воркеров.",
+		Help: "Worker memory.",
 	})
 	memory.WithLabelValues().Set(1 << 20)
 
 	latency := reg.MustHistogram(prometheus.HistogramOpts{
 		Name:    "crawler_stage_seconds",
-		Help:    "Время обработки этапа.",
+		Help:    "The stage processing time.",
 		Buckets: []float64{0.1, 0.5, 1},
 	}, LabelStage)
 	latency.WithLabelValues("http").Observe(0.25)
 
 	errs := reg.MustCounter(prometheus.CounterOpts{
 		Name: "crawler_stage_errors_total",
-		Help: "Ошибки по типам.",
+		Help: "Errors by type.",
 	}, LabelStage, LabelType)
 	errs.WithLabelValues("dns", "timeout").Add(3)
 
@@ -150,7 +150,7 @@ func TestFactoryAutoServiceLabel(t *testing.T) {
 		`crawler_worker_memory_bytes{service="dns-worker"} 1.048576e+06`,
 		`crawler_stage_errors_total{service="dns-worker",stage="dns",type="timeout"} 3`,
 		// the metric documentation (HELP/TYPE) — from the Opts
-		`# HELP crawler_stage_tasks_total Обработанные домены по этапам конвейера.`,
+		`# HELP crawler_stage_tasks_total Pipeline domains processed, by stage.`,
 		`# TYPE crawler_stage_tasks_total counter`,
 		`# TYPE crawler_queue_depth gauge`,
 		`# TYPE crawler_stage_seconds histogram`,
@@ -159,7 +159,7 @@ func TestFactoryAutoServiceLabel(t *testing.T) {
 		`crawler_stage_seconds_count{service="dns-worker",stage="http"} 1`,
 	} {
 		if !strings.Contains(text, want) {
-			t.Errorf("в /metrics нет строки %q", want)
+			t.Errorf("the /metrics has no line %q", want)
 		}
 	}
 }
@@ -172,41 +172,41 @@ func TestReRegistrationSameCollector(t *testing.T) {
 	reg := New("test-svc")
 	counterOpts := prometheus.CounterOpts{
 		Name: "crawler_stage_tasks_total",
-		Help: "Обработанные домены по этапам конвейера.",
+		Help: "Pipeline domains processed, by stage.",
 	}
 	first := reg.MustCounter(counterOpts, LabelStage)
 	second, err := reg.Counter(counterOpts, LabelStage)
 	if err != nil {
-		t.Fatalf("дубль-регистрация counter: %v", err)
+		t.Fatalf("duplicate registration of a counter: %v", err)
 	}
 	first.WithLabelValues("dns").Inc()
 	second.WithLabelValues("dns").Add(2)
 
 	gaugeOpts := prometheus.GaugeOpts{
 		Name: "crawler_queue_depth",
-		Help: "Длина очереди задач.",
+		Help: "The task queue length.",
 	}
 	if _, err := reg.Gauge(gaugeOpts, LabelQueue); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := reg.Gauge(gaugeOpts, LabelQueue); err != nil {
-		t.Fatalf("дубль-регистрация gauge: %v", err)
+		t.Fatalf("duplicate registration of a gauge: %v", err)
 	}
 	histOpts := prometheus.HistogramOpts{
 		Name: "crawler_stage_seconds",
-		Help: "Время обработки этапа.",
+		Help: "The stage processing time.",
 	}
 	if _, err := reg.Histogram(histOpts, LabelStage); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := reg.Histogram(histOpts, LabelStage); err != nil {
-		t.Fatalf("дубль-регистрация histogram: %v", err)
+		t.Fatalf("duplicate registration of a histogram: %v", err)
 	}
 
 	text := scrape(t, reg)
 	want := `crawler_stage_tasks_total{service="test-svc",stage="dns"} 3`
 	if !strings.Contains(text, want) {
-		t.Errorf("в /metrics нет %q: дубли должны делить один коллектор", want)
+		t.Errorf("the /metrics has no %q: duplicates must share one collector", want)
 	}
 }
 
@@ -217,40 +217,40 @@ func TestRegistrationConflict(t *testing.T) {
 	reg := New("test-svc")
 	opts := prometheus.CounterOpts{
 		Name: "crawler_stage_tasks_total",
-		Help: "Обработанные домены по этапам конвейера.",
+		Help: "Pipeline domains processed, by stage.",
 	}
 	if _, err := reg.Counter(opts, LabelStage); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := reg.Counter(opts, LabelQueue); err == nil {
-		t.Error("другой набор метк: ожидалась ошибка")
+		t.Error("another label set: an error expected")
 	}
 	otherHelp := opts
-	otherHelp.Help = "Другой help."
+	otherHelp.Help = "Another help."
 	if _, err := reg.Counter(otherHelp, LabelStage); err == nil {
-		t.Error("другой help: ожидалась ошибка")
+		t.Error("another help: an error expected")
 	}
 	// the same name/help/labels but a gauge: an AlreadyRegisteredError
 	// with the same descriptor but a collector of another type
 	if _, err := reg.Gauge(prometheus.GaugeOpts{
 		Name: "crawler_stage_tasks_total",
-		Help: "Обработанные домены по этапам конвейера.",
+		Help: "Pipeline domains processed, by stage.",
 	}, LabelStage); err == nil {
-		t.Error("другой тип коллектора: ожидалась ошибка")
+		t.Error("another collector type: an error expected")
 	}
 	// histogram against counter — the same type conflict
 	if _, err := reg.Histogram(prometheus.HistogramOpts{
 		Name: "crawler_stage_tasks_total",
-		Help: "Обработанные домены по этапам конвейера.",
+		Help: "Pipeline domains processed, by stage.",
 	}, LabelStage); err == nil {
-		t.Error("histogram против counter: ожидалась ошибка")
+		t.Error("histogram against counter: an error expected")
 	}
 
 	// The Must variants panic on a conflict (a programming error)
 	mustPanic := func(name string, f func()) {
 		defer func() {
 			if recover() == nil {
-				t.Errorf("%s на конфликте: ожидалась паника", name)
+				t.Errorf("%s on a conflict: a panic expected", name)
 			}
 		}()
 		f()
@@ -258,19 +258,19 @@ func TestRegistrationConflict(t *testing.T) {
 	mustPanic("MustGauge", func() {
 		reg.MustGauge(prometheus.GaugeOpts{
 			Name: "crawler_stage_tasks_total",
-			Help: "Обработанные домены по этапам конвейера.",
+			Help: "Pipeline domains processed, by stage.",
 		}, LabelStage)
 	})
 	mustPanic("MustCounter", func() {
 		reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_stage_tasks_total",
-			Help: "Обработанные домены по этапам конвейера.",
+			Help: "Pipeline domains processed, by stage.",
 		}, LabelQueue)
 	})
 	mustPanic("MustHistogram", func() {
 		reg.MustHistogram(prometheus.HistogramOpts{
 			Name: "crawler_stage_tasks_total",
-			Help: "Обработанные домены по этапам конвейера.",
+			Help: "Pipeline domains processed, by stage.",
 		}, LabelQueue)
 	})
 }
@@ -281,30 +281,30 @@ func TestLabelValidation(t *testing.T) {
 	reg := New("test-svc")
 	if _, err := reg.Counter(prometheus.CounterOpts{
 		Name: "crawler_a_total",
-		Help: "Счётчик.",
+		Help: "A counter.",
 	}, LabelService); err == nil {
-		t.Error("LabelService: ожидалась ошибка")
+		t.Error("LabelService: an error expected")
 	}
 	if _, err := reg.Counter(prometheus.CounterOpts{
 		Name: "crawler_a_total",
-		Help: "Счётчик.",
+		Help: "A counter.",
 	}, LabelStage, LabelStage); err == nil {
-		t.Error("дубликат метки counter: ожидалась ошибка")
+		t.Error("a duplicate label of counter: an error expected")
 	}
 	if _, err := reg.Gauge(prometheus.GaugeOpts{
 		Name: "crawler_a",
-		Help: "Гейдж.",
+		Help: "A gauge.",
 	}, LabelQueue, LabelQueue); err == nil {
-		t.Error("дубликат метки gauge: ожидалась ошибка")
+		t.Error("a duplicate label of gauge: an error expected")
 	}
 	if _, err := reg.Histogram(prometheus.HistogramOpts{
 		Name: "crawler_a",
-		Help: "Гистограмма.",
+		Help: "A histogram.",
 	}, LabelType, LabelType); err == nil {
-		t.Error("дубликат метки histogram: ожидалась ошибка")
+		t.Error("a duplicate label of histogram: an error expected")
 	}
 	if text := scrape(t, reg); strings.Contains(text, "crawler_a") {
-		t.Error("метрика с невалидными метками не должна была зарегистрироваться")
+		t.Error("a metric with invalid labels must not have registered")
 	}
 }
 
@@ -316,16 +316,16 @@ func TestReRegistrationHistogramBuckets(t *testing.T) {
 	reg := New("test-svc")
 	first := reg.MustHistogram(prometheus.HistogramOpts{
 		Name:    "crawler_stage_seconds",
-		Help:    "Время обработки этапа.",
+		Help:    "The stage processing time.",
 		Buckets: []float64{0.5, 1},
 	}, LabelStage)
 	second, err := reg.Histogram(prometheus.HistogramOpts{
 		Name:    "crawler_stage_seconds",
-		Help:    "Время обработки этапа.",
+		Help:    "The stage processing time.",
 		Buckets: []float64{9, 99}, // ignored: the first call wins
 	}, LabelStage)
 	if err != nil {
-		t.Fatalf("дубль-регистрация histogram: %v", err)
+		t.Fatalf("duplicate registration of a histogram: %v", err)
 	}
 	first.WithLabelValues("http").Observe(0.75)
 	second.WithLabelValues("http").Observe(0.25)
@@ -336,11 +336,11 @@ func TestReRegistrationHistogramBuckets(t *testing.T) {
 		`crawler_stage_seconds_bucket{service="test-svc",stage="http",le="1"} 2`,
 	} {
 		if !strings.Contains(text, want) {
-			t.Errorf("в /metrics нет строки %q (корзины первого вызова)", want)
+			t.Errorf("the /metrics has no line %q (the first call's buckets)", want)
 		}
 	}
 	if strings.Contains(text, `le="9"`) || strings.Contains(text, `le="99"`) {
-		t.Error("корзины повторного вызова не должны попадать в экспорт")
+		t.Error("the repeated call's buckets must not get into the export")
 	}
 }
 
@@ -357,7 +357,7 @@ func TestConcurrentRegistration(t *testing.T) {
 			defer wg.Done()
 			vec, err := reg.Counter(prometheus.CounterOpts{
 				Name: "crawler_stage_tasks_total",
-				Help: "Обработанные домены по этапам конвейера.",
+				Help: "Pipeline domains processed, by stage.",
 			}, LabelStage)
 			if err != nil {
 				t.Error(err)
@@ -369,7 +369,7 @@ func TestConcurrentRegistration(t *testing.T) {
 	wg.Wait()
 	want := `crawler_stage_tasks_total{service="test-svc",stage="dns"} 16`
 	if text := scrape(t, reg); !strings.Contains(text, want) {
-		t.Errorf("в /metrics нет строки %q", want)
+		t.Errorf("the /metrics has no line %q", want)
 	}
 }
 
@@ -380,19 +380,19 @@ func TestRegistriesIndependent(t *testing.T) {
 	regDNS, regHTTP := New("dns-worker"), New("http-worker")
 	opts := prometheus.CounterOpts{
 		Name: "crawler_stage_tasks_total",
-		Help: "Обработанные домены по этапам конвейера.",
+		Help: "Pipeline domains processed, by stage.",
 	}
 	regDNS.MustCounter(opts, LabelStage).WithLabelValues("dns").Inc()
 	regHTTP.MustCounter(opts, LabelStage).WithLabelValues("http").Add(7)
 
 	dnsText := scrape(t, regDNS)
 	if want := `crawler_stage_tasks_total{service="dns-worker",stage="dns"} 1`; !strings.Contains(dnsText, want) {
-		t.Errorf("в /metrics dns-worker нет строки %q", want)
+		t.Errorf("the dns-worker /metrics has no line %q", want)
 	}
 	if strings.Contains(dnsText, `stage="http"`) {
-		t.Error("метрики http-worker попали в реестр dns-worker")
+		t.Error("the http-worker metrics got into the dns-worker registry")
 	}
 	if want := `crawler_stage_tasks_total{service="http-worker",stage="http"} 7`; !strings.Contains(scrape(t, regHTTP), want) {
-		t.Errorf("в /metrics http-worker нет строки %q", want)
+		t.Errorf("the http-worker /metrics has no line %q", want)
 	}
 }

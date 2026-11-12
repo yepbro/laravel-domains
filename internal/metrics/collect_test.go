@@ -83,13 +83,13 @@ func TestCollectQueueDepths(t *testing.T) {
 	gauge := NewQueueGauge(reg)
 	lenOf := &fakeLen{
 		lens:   map[string]int64{"q:dns": 42, "q:http": 7},
-		errLen: map[string]error{"q:render": errors.New("redis недоступен")},
+		errLen: map[string]error{"q:render": errors.New("redis unavailable")},
 	}
 
 	err := CollectQueueDepths(context.Background(), gauge, lenOf.Len,
 		[]string{"q:dns", "q:http", "q:render"})
 	if err == nil || !strings.Contains(err.Error(), "q:render") {
-		t.Fatalf("ошибка = %v, want сбой q:render", err)
+		t.Fatalf("the error = %v, want a q:render failure", err)
 	}
 
 	// The successful streams were recorded despite the failure of the
@@ -100,7 +100,7 @@ func TestCollectQueueDepths(t *testing.T) {
 		}
 	}
 	if _, ok := gaugeValue(t, reg, "crawler_queue_depth", "q:render"); ok {
-		t.Error("сбойный стрим не должен получать значение")
+		t.Error("the failing stream must not get a value")
 	}
 	// The service label is substituted by the factory.
 	if v, ok := gaugeValue(t, reg, "crawler_queue_depth", "q:dns"); ok && v == 42 {
@@ -115,7 +115,7 @@ func TestCollectQueueDepths(t *testing.T) {
 						}
 					}
 					if !found {
-						t.Error("метка service не подставлена фабрикой")
+						t.Error("the service label not substituted by the factory")
 					}
 				}
 			}
@@ -128,17 +128,17 @@ func TestCollectQueueDepths(t *testing.T) {
 		t.Fatal(err)
 	}
 	if v, _ := gaugeValue(t, reg, "crawler_queue_depth", "q:dns"); v != 43 {
-		t.Errorf("повторный проход: значение = %v, want 43", v)
+		t.Errorf("the repeated pass: the value = %v, want 43", v)
 	}
 }
 
 func TestCollectQueueDepthsValidation(t *testing.T) {
 	reg := New("test-svc")
 	if err := CollectQueueDepths(context.Background(), nil, func(context.Context, string) (int64, error) { return 0, nil }, nil); err == nil {
-		t.Error("gauge nil: ожидалась ошибка")
+		t.Error("a nil gauge: an error expected")
 	}
 	if err := CollectQueueDepths(context.Background(), NewQueueGauge(reg), nil, nil); err == nil {
-		t.Error("lenOf nil: ожидалась ошибка")
+		t.Error("a nil lenOf: an error expected")
 	}
 }
 
@@ -153,7 +153,7 @@ func waitForGauge(t *testing.T, g prometheus.Gatherer, queue string, want float6
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
-	t.Fatalf("crawler_queue_depth{queue=%q} не достигла %v за 2 с", queue, want)
+	t.Fatalf("crawler_queue_depth{queue=%q} did not reach %v within 2s", queue, want)
 }
 
 func TestCollectQueueLoop(t *testing.T) {
@@ -178,7 +178,7 @@ func TestCollectQueueLoop(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
-		t.Fatal("цикл не завершился после отмены ctx")
+		t.Fatal("the loop did not finish after the ctx cancel")
 	}
 }
 
@@ -192,23 +192,23 @@ func TestCollectQueueLoopNoop(t *testing.T) {
 		lenOf   LenFunc
 		streams []string
 	}{
-		{"реестр nil", nil, lenOf.Len, []string{"q:dns"}},
-		{"источник nil", New("test-svc"), nil, []string{"q:dns"}},
-		{"стримы пусты", New("test-svc"), lenOf.Len, nil},
+		{"nil registry", nil, lenOf.Len, []string{"q:dns"}},
+		{"nil source", New("test-svc"), nil, []string{"q:dns"}},
+		{"empty streams", New("test-svc"), lenOf.Len, nil},
 	} {
 		if err := CollectQueueLoop(context.Background(), tc.reg, tc.lenOf, tc.streams, time.Millisecond, nil); err != nil {
-			t.Errorf("%s: no-op вернул ошибку %v", tc.name, err)
+			t.Errorf("%s: the no-op returned an error %v", tc.name, err)
 		}
 	}
 	if len(lenOf.calls) != 0 {
-		t.Errorf("обращения к источнику = %v, want 0", lenOf.calls)
+		t.Errorf("source calls = %v, want 0", lenOf.calls)
 	}
 }
 
 // Surviving an error: the loop lives, the gauge keeps the last value.
 func TestCollectQueueLoopSurvivesError(t *testing.T) {
 	reg := New("render-worker")
-	boom := errors.New("redis недоступен")
+	boom := errors.New("redis unavailable")
 	lenOf := &fakeLen{lens: map[string]int64{"q:render": 9}, errLen: map[string]error{}}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -227,7 +227,7 @@ func TestCollectQueueLoopSurvivesError(t *testing.T) {
 		time.Sleep(2 * time.Millisecond)
 	}
 	if v, _ := gaugeValue(t, reg, "crawler_queue_depth", "q:render"); v != 9 {
-		t.Errorf("при сбоях XLEN значение = %v, want последнее известное 9", v)
+		t.Errorf("on XLEN failures the value = %v, want the last known 9", v)
 	}
 
 	// The source recovers — the value is updated.

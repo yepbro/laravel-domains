@@ -128,7 +128,7 @@ func (o RecoverOptions) withDefaults() RecoverOptions {
 // T-260/FR-6.2).
 func RecoverLoop(ctx context.Context, r *Reliab, process func(context.Context, Delivery) error, opt RecoverOptions) error {
 	if process == nil {
-		return errors.New("queue: цикл возврата зависших: обработчик не задан")
+		return errors.New("queue: stalled delivery recovery loop: handler not set")
 	}
 	return RecoverLoopAttempt(ctx, r, func(c context.Context, d Delivery, _ int) error {
 		return process(c, d)
@@ -155,17 +155,17 @@ func RecoverLoop(ctx context.Context, r *Reliab, process func(context.Context, D
 // not lost (at-least-once, spec 3.4).
 func RecoverLoopAttempt(ctx context.Context, r *Reliab, process func(context.Context, Delivery, int) error, opt RecoverOptions) error {
 	if r == nil {
-		return errors.New("queue: цикл возврата зависших: слой надёжности не задан (NewReliab)")
+		return errors.New("queue: stalled delivery recovery loop: reliability layer not set (NewReliab)")
 	}
 	if process == nil {
-		return errors.New("queue: цикл возврата зависших: обработчик не задан")
+		return errors.New("queue: stalled delivery recovery loop: handler not set")
 	}
 	o := opt.withDefaults()
 	log := o.Log
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	log.Info("цикл возврата зависших доставок",
+	log.Info("stalled delivery recovery loop",
 		"stream", o.Stream, "group", o.Group, "consumer", o.Consumer,
 		"batch", o.Batch, "interval", o.Interval.String())
 
@@ -191,10 +191,10 @@ func RecoverLoopAttempt(ctx context.Context, r *Reliab, process func(context.Con
 	// processing did not start gets the attempt back.
 	refund := func(rctx context.Context, rest []Claimed) {
 		if err := r.Refund(rctx, o.Group, o.Consumer, rest); err != nil {
-			log.Warn("возврат зависших доставок: попытки необработанного хвоста не возвращены — записи уязвимы к дожиганию до q:dead (T-222)",
+			log.Warn("stalled delivery recovery: unprocessed tail attempts not returned — entries are vulnerable to burning down to q:dead (T-222)",
 				"n", len(rest), "err", err)
 		} else {
-			log.Info("возврат зависших доставок: попытки необработанного хвоста возвращены", "n", len(rest))
+			log.Info("stalled delivery recovery: unprocessed tail attempts returned", "n", len(rest))
 		}
 	}
 	// refundUnclassified — returning attempts to entries without
@@ -208,10 +208,10 @@ func RecoverLoopAttempt(ctx context.Context, r *Reliab, process func(context.Con
 	// cancelled by then.
 	refundUnclassified := func(rctx context.Context, rest []Delivery) {
 		if err := r.RefundUnclassified(rctx, o.Group, o.Consumer, rest); err != nil {
-			log.Warn("возврат зависших доставок: попытки записей без классификации не возвращены — записи уязвимы к дожиганию до q:dead (T-260)",
+			log.Warn("stalled delivery recovery: unclassified entries' attempts not returned — entries are vulnerable to burning down to q:dead (T-260)",
 				"n", len(rest), "err", err)
 		} else {
-			log.Info("возврат зависших доставок: попытки записей без классификации возвращены", "n", len(rest))
+			log.Info("stalled delivery recovery: unclassified entries' attempts returned", "n", len(rest))
 		}
 	}
 	claim := func() int {
@@ -233,7 +233,7 @@ func RecoverLoopAttempt(ctx context.Context, r *Reliab, process func(context.Con
 		defer cancelRefunds()
 		claimed, unclassified, next, err := r.Claim(ctx, o.Stream, o.Group, o.Consumer, 0, o.Batch, cursor)
 		if err != nil && ctx.Err() == nil {
-			log.Warn("возврат зависших доставок: клейм", "err", err)
+			log.Warn("stalled delivery recovery: claim", "err", err)
 		}
 		cursor = next
 		if len(unclassified) > 0 {
@@ -246,7 +246,7 @@ func RecoverLoopAttempt(ctx context.Context, r *Reliab, process func(context.Con
 			if elapsed := time.Since(claimAt); elapsed < r.opt.MinIdle {
 				refundUnclassified(rctx, unclassified) // FR-6.2: classification not finished — attempt back
 			} else {
-				log.Warn("возврат зависших доставок: классификация дольше claim_min_idle — записи могли быть переклеймлены соседним воркером, возврат попыток пропущен (T-260)",
+				log.Warn("stalled delivery recovery: classification took longer than claim_min_idle — entries may have been re-claimed by a neighbouring worker, attempt refund skipped (T-260)",
 					"n", len(unclassified), "elapsed", elapsed.String(), "min_idle", r.opt.MinIdle.String())
 			}
 		}
@@ -264,13 +264,13 @@ func RecoverLoopAttempt(ctx context.Context, r *Reliab, process func(context.Con
 				if elapsed := time.Since(claimAt); elapsed < r.opt.MinIdle {
 					refund(rctx, claimed[i:]) // T-222: the tail did not start — attempt back
 				} else {
-					log.Warn("возврат зависших доставок: обход пачки дольше claim_min_idle — хвост мог быть переклеймлен соседним воркером, возврат попыток пропущен (T-222)",
+					log.Warn("stalled delivery recovery: batch traversal took longer than claim_min_idle — the tail may have been re-claimed by a neighbouring worker, attempt refund skipped (T-222)",
 						"n", len(claimed)-i, "elapsed", elapsed.String(), "min_idle", r.opt.MinIdle.String())
 				}
 				return len(claimed)
 			}
 			if err := r.ProcessAttempt(ctx, o.Group, c.Delivery, c.Attempts, process); err != nil && ctx.Err() == nil {
-				log.Warn("зависшая доставка не подтверждена — вернётся клеймом",
+				log.Warn("stalled delivery not acknowledged — it will come back via a claim",
 					"entry", c.ID, "attempts", c.Attempts, "err", err)
 			}
 		}
@@ -293,7 +293,7 @@ func RecoverLoopAttempt(ctx context.Context, r *Reliab, process func(context.Con
 		// SET (Reliab.Writable); if the probe is unsupported the gate is
 		// transparent (true — the pre-T-152 behavior).
 		if !r.Writable(ctx) {
-			log.Warn("возврат зависших доставок: Redis не доступен на запись (OOM/соединение) — клейм пропущен, попытки доставок не расходуются (T-152)")
+			log.Warn("stalled delivery recovery: Redis is not writable (OOM/connection) — claim skipped, delivery attempts are not spent (T-152)")
 			select {
 			case <-ctx.Done():
 				return nil

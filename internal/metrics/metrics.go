@@ -149,13 +149,13 @@ func New(name string) *Registry {
 
 	up := reg.MustGauge(prometheus.GaugeOpts{
 		Name: "crawler_service_up",
-		Help: "Сервис запущен и отвечает.",
+		Help: "The service is up and answering.",
 	})
 	up.WithLabelValues().Set(1)
 
 	build := reg.MustGauge(prometheus.GaugeOpts{
 		Name: "crawler_build_info",
-		Help: "Информация о сборке: mode — режим (dev-stub — dev/тесты, prod — боевые сборки через -ldflags -X), version — версия из git describe (dev — без инъекции), revision — короткий хеш коммита (пусто — без инъекции, в PromQL метка отсутствует).",
+		Help: "Build info: mode — the mode (dev-stub — dev/tests, prod — production builds via -ldflags -X), version — the version from git describe (dev — no injection), revision — the short commit hash (empty — no injection, the label is absent in PromQL).",
 	}, "mode", "version", "revision")
 	build.WithLabelValues(buildMode, buildVersion, buildRevision).Set(1)
 
@@ -168,7 +168,7 @@ func New(name string) *Registry {
 //
 //	tasks := reg.MustCounter(prometheus.CounterOpts{
 //		Name: "crawler_stage_tasks_total",
-//		Help: "Обработанные домены по этапам конвейера.",
+//		Help: "Pipeline domains processed, by stage.",
 //	}, LabelStage)
 //	tasks.WithLabelValues("dns").Inc() // the service is substituted automatically
 //
@@ -194,7 +194,7 @@ func (r *Registry) Counter(opts prometheus.CounterOpts, labelNames ...string) (*
 	}
 	vec, ok := c.(*prometheus.CounterVec)
 	if !ok {
-		return nil, fmt.Errorf("metrics: метрика %q уже зарегистрирована коллектором другого типа", name)
+		return nil, fmt.Errorf("metrics: metric %q is already registered by a collector of another type", name)
 	}
 	return vec.CurryWith(r.serviceLabels())
 }
@@ -215,7 +215,7 @@ func (r *Registry) Gauge(opts prometheus.GaugeOpts, labelNames ...string) (*prom
 	}
 	vec, ok := c.(*prometheus.GaugeVec)
 	if !ok {
-		return nil, fmt.Errorf("metrics: метрика %q уже зарегистрирована коллектором другого типа", name)
+		return nil, fmt.Errorf("metrics: metric %q is already registered by a collector of another type", name)
 	}
 	return vec.CurryWith(r.serviceLabels())
 }
@@ -241,7 +241,7 @@ func (r *Registry) Histogram(opts prometheus.HistogramOpts, labelNames ...string
 	}
 	vec, ok := c.(*prometheus.HistogramVec)
 	if !ok {
-		return nil, fmt.Errorf("metrics: метрика %q уже зарегистрирована коллектором другого типа", name)
+		return nil, fmt.Errorf("metrics: metric %q is already registered by a collector of another type", name)
 	}
 	return vec.CurryWith(r.serviceLabels())
 }
@@ -301,7 +301,7 @@ func (r *Registry) register(name string, c prometheus.Collector) (prometheus.Col
 		return nil, err
 	}
 	if !descEqual(are.ExistingCollector, c) {
-		return nil, fmt.Errorf("metrics: метрика %q уже зарегистрирована с другим описанием: %w", name, err)
+		return nil, fmt.Errorf("metrics: metric %q is already registered with another description: %w", name, err)
 	}
 	return are.ExistingCollector, nil
 }
@@ -315,7 +315,7 @@ func withServiceLabel(labelNames []string) ([]string, error) {
 	labels = append(labels, LabelService)
 	for _, l := range labelNames {
 		if slices.Contains(labels, l) {
-			return nil, fmt.Errorf("metrics: метка %q уже занята (LabelService добавляется автоматически)", l)
+			return nil, fmt.Errorf("metrics: label %q is already taken (LabelService is added automatically)", l)
 		}
 		labels = append(labels, l)
 	}

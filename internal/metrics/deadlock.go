@@ -36,6 +36,6 @@ func NewDBDeadlockRetried(reg *Registry) prometheus.Counter {
 	}
 	return reg.MustCounter(prometheus.CounterOpts{
 		Name: "crawler_db_deadlock_retried_total",
-		Help: "Повторы операторов БД после дедлока 40P01 (db.RetryDeadlock, T-268): страховка поверх инварианта порядка блокировок счётчиков (T-267) — повтор идемпотентной транзакции/команды в горячих точках конвейера (запись результата http-worker, решение ретрая scheduler, операторы записи DNS-эпизода), задача не уходит в ределивери полным эпизодом. Единичные события — норма (страховка работает); устойчивый рост — новый цикл блокировок, разбор runbooks.md §2.8.",
+		Help: "DB statement retries after the 40P01 deadlock (db.RetryDeadlock, T-268): a guard on top of the counter lock-order invariant (T-267) — a repeat of an idempotent transaction/statement in the pipeline's hot spots (the http-worker result write, the scheduler retry decision, the DNS-episode write statements), the task does not go to redelivery as a full episode. Single events — the norm (the guard works); sustained growth — a new lock cycle, triage in runbooks.md §2.8.",
 	}).WithLabelValues()
 }

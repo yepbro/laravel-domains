@@ -29,10 +29,10 @@ import (
 func TestRenderFallbackAllStreamsInvariant(t *testing.T) {
 	want := []string{StreamDNS, StreamHTTP, StreamRender, StreamRenderFallback, StreamAnalyze, StreamDead}
 	if !reflect.DeepEqual(allStreams, want) {
-		t.Errorf("allStreams = %v, хочу %v (новый стрим добавьте в allStreams — queue.go)", allStreams, want)
+		t.Errorf("allStreams = %v, want %v (add a new stream to allStreams — queue.go)", allStreams, want)
 	}
 	if !knownStream(StreamRenderFallback) {
-		t.Errorf("knownStream(%q) = false: стрим вне allStreams — Publish/Consume/Claim его отвергнут", StreamRenderFallback)
+		t.Errorf("knownStream(%q) = false: a stream outside allStreams — Publish/Consume/Claim reject it", StreamRenderFallback)
 	}
 	// A working stream (without q:dead): released by TrimLoop and cleaned
 	// up by groups — the fallback group exists (worker B, FR-12).
@@ -43,10 +43,10 @@ func TestRenderFallbackAllStreamsInvariant(t *testing.T) {
 		}
 	}
 	if !working {
-		t.Errorf("workingStreams = %v: нет %q — подтверждённый префикс не освобождается", workingStreams(), StreamRenderFallback)
+		t.Errorf("workingStreams = %v: %q missing — the acknowledged prefix is not released", workingStreams(), StreamRenderFallback)
 	}
 	if _, ok := WorkingGroups()[StreamRenderFallback]; !ok {
-		t.Errorf("WorkingGroups: нет пары для %q — консьюмеры группы не чистятся (T-155)", StreamRenderFallback)
+		t.Errorf("WorkingGroups: no pair for %q — the group's consumers are not cleaned (T-155)", StreamRenderFallback)
 	}
 }
 
@@ -57,10 +57,10 @@ func TestRenderFallbackAllStreamsInvariant(t *testing.T) {
 // with it (XADD MAXLEN ~).
 func TestRenderFallbackMaxLen(t *testing.T) {
 	if got := DefaultStreamMaxLen(StreamRenderFallback); got != defaultMaxLenRenderFallback {
-		t.Errorf("DefaultStreamMaxLen(%s) = %d, хочу %d (политика T-025)", StreamRenderFallback, got, defaultMaxLenRenderFallback)
+		t.Errorf("DefaultStreamMaxLen(%s) = %d, want %d (the T-025 policy)", StreamRenderFallback, got, defaultMaxLenRenderFallback)
 	}
 	if defaultMaxLenRenderFallback >= defaultMaxLenUnit {
-		t.Errorf("потолок фолбэка %d ≥ штучному %d — фолбэк обязан быть долей потока этапа (бюджет, ТЗ 3.2)",
+		t.Errorf("the fallback cap %d ≥ the unit cap %d — the fallback must be a share of the stage's flow (the budget, spec 3.2)",
 			defaultMaxLenRenderFallback, defaultMaxLenUnit)
 	}
 
@@ -68,14 +68,14 @@ func TestRenderFallbackMaxLen(t *testing.T) {
 	q := NewRedisQueue(fake, RedisOptions{})
 	res := Result{ZoneID: 3, DomainID: 42, SubdomainID: 1, Variant: 1, Name: "example.com"}
 	if _, err := q.Publish(context.Background(), StreamRenderFallback, res); err != nil {
-		t.Fatalf("Publish Result в %s: %v", StreamRenderFallback, err)
+		t.Fatalf("Publishing a Result to %s: %v", StreamRenderFallback, err)
 	}
 	add := fake.adds[0]
 	if add.Stream != StreamRenderFallback {
-		t.Errorf("XADD стрим %q, хочу %q", add.Stream, StreamRenderFallback)
+		t.Errorf("the XADD stream %q, want %q", add.Stream, StreamRenderFallback)
 	}
 	if want := DefaultStreamMaxLen(StreamRenderFallback); add.MaxLen != want || !add.Approx {
-		t.Errorf("XADD MAXLEN ~ %d не применён: MaxLen=%d Approx=%v, хочу %d (политика T-025)",
+		t.Errorf("XADD MAXLEN ~ %d not applied: MaxLen=%d Approx=%v, want %d (the T-025 policy)",
 			want, add.MaxLen, add.Approx, want)
 	}
 }
@@ -99,10 +99,10 @@ func TestRenderFallbackTrim(t *testing.T) {
 		t.Fatalf("TrimOnce: %v", err)
 	}
 	if n != 4 {
-		t.Errorf("удалено %d, хочу 4 (ответ XTRIM)", n)
+		t.Errorf("removed %d, want 4 (the XTRIM answer)", n)
 	}
 	if len(f.trims) != 1 || f.trims[0]["stream"] != StreamRenderFallback || f.trims[0]["minid"] != "201-0" {
-		t.Fatalf("XTRIM %+v, хочу MINID 201-0 в %s (старейшая pending группы)", f.trims, StreamRenderFallback)
+		t.Fatalf("XTRIM %+v, want MINID 201-0 in %s (the group's oldest pending)", f.trims, StreamRenderFallback)
 	}
 
 	covered := false
@@ -112,7 +112,7 @@ func TestRenderFallbackTrim(t *testing.T) {
 		}
 	}
 	if !covered {
-		t.Errorf("дефолтные Streams TrimOptions не покрывают %s (workingStreams)", StreamRenderFallback)
+		t.Errorf("the default TrimOptions Streams do not cover %s (workingStreams)", StreamRenderFallback)
 	}
 }
 
@@ -144,31 +144,31 @@ func TestRenderFallbackClaim(t *testing.T) {
 		t.Fatalf("Claim: %v", err)
 	}
 	if next != "303-0" {
-		t.Errorf("курсор = %q, хочу 303-0", next)
+		t.Errorf("the cursor = %q, want 303-0", next)
 	}
 	want := []Claimed{
 		{Delivery{StreamRenderFallback, "301-0", []byte(fresh)}, 2},
 	}
 	if !reflect.DeepEqual(got, want) {
-		t.Errorf("Claim:\n получил  %+v\n хочу     %+v", got, want)
+		t.Errorf("Claim:\n got  %+v\n want %+v", got, want)
 	}
 
 	// The exhausted one — q:dead: the fallback stream as the source, the
 	// subject from the Result body.
 	if len(fake.adds) != 1 || fake.adds[0].Stream != StreamDead {
-		t.Fatalf("публикаций в q:dead: %+v, хочу одну", fake.adds)
+		t.Fatalf("publications to q:dead: %+v, want one", fake.adds)
 	}
 	data := fake.adds[0].Values.(map[string]any)[fieldData].([]byte)
 	dead, err := Decode[Dead](Delivery{Stream: StreamDead, ID: fake.adds[0].ID, Payload: data})
 	if err != nil {
-		t.Fatalf("поле data не декодируется как Dead: %v\n%s", err, data)
+		t.Fatalf("the data field does not decode as Dead: %v\n%s", err, data)
 	}
 	wantDead := Dead{
 		TaskID:      "t2",
 		Stream:      StreamRenderFallback,
 		EntryID:     "302-0",
 		Attempts:    4,
-		Reason:      "исчерпан лимит попыток 3: доставок без подтверждения — 4",
+		Reason:      "attempt limit 3 exhausted: 4 deliveries without ack",
 		ZoneID:      3,
 		DomainID:    42,
 		SubdomainID: 1,
@@ -176,12 +176,12 @@ func TestRenderFallbackClaim(t *testing.T) {
 		Name:        "www.example.com",
 	}
 	if !reflect.DeepEqual(dead, wantDead) {
-		t.Errorf("Dead:\n получил  %+v\n хочу     %+v", dead, wantDead)
+		t.Errorf("Dead:\n got  %+v\n want %+v", dead, wantDead)
 	}
 
 	// The original entry leaves the pending: XACK from the fallback
 	// stream.
 	if want := []ackCall{{StreamRenderFallback, "render-fallback-worker", []string{"302-0"}}}; !reflect.DeepEqual(fake.acks, want) {
-		t.Errorf("XACK: %+v, хочу %+v", fake.acks, want)
+		t.Errorf("XACK: %+v, want %+v", fake.acks, want)
 	}
 }
