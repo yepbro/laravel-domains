@@ -1,74 +1,74 @@
-# Боевое развёртывание: systemd
+# Production deployment: systemd
 
-Инструкция по запуску Domain Crawler на целевом сервере (Ubuntu Server LTS,
-8 ГБ RAM, один IP — ТЗ 3.1) системными systemd-юнитами. Dev-окружение
-Docker — отдельный способ запуска ([`docker.md`](docker.md),
-[`dev-environment.md`](dev-environment.md)); соотношение способов — ниже.
+Instructions for running Domain Crawler on the target server (Ubuntu Server LTS,
+8 GB RAM, a single IP — spec 3.1) with systemd units. The Docker dev
+environment is a separate way to run the system ([`docker.md`](docker.md),
+[`dev-environment.md`](dev-environment.md)); how the two relate is covered below.
 
-Комплект юнитов: [`deploy/systemd/`](../deploy/systemd/) (этап 9, T-085).
-ТЗ: §10.1 (окружение), §3.2 (бюджет памяти), §4.1 (состав сервисов),
-§11.4 п. 7 (суточный прогон без OOM).
+Unit set: [`deploy/systemd/`](../deploy/systemd/) (stage 9, T-085).
+Specs: §10.1 (environment), §3.2 (memory budget), §4.1 (service composition),
+§11.4 item 7 (a 24-hour run without OOM).
 
-## 1. Способ развёртывания и отношение к Docker
+## 1. Deployment method and its relation to Docker
 
-ТЗ §10.1 задаёт боевой способ прямо: **systemd-юниты на каждый сервис**,
-PostgreSQL/Redis/Unbound — пакеты ОС, Go-сервисы — статические бинарники,
-Chromium — отдельный пакет/каталог. Docker Compose в репозитории —
-dev-окружение (hot reload, testbed, инструменты) и не является боевым
-деплоем. Решение зафиксировано:
+Spec §10.1 defines the production method explicitly: **a systemd unit per service**,
+PostgreSQL/Redis/Unbound — OS packages, Go services — static binaries,
+Chromium — a separate package/directory. Docker Compose in the repository is
+the dev environment (hot reload, testbed, tools) and is not the production
+deployment. The decision is fixed:
 
-| Слой | Боевой (systemd) | Dev (docker compose) |
+| Layer | Production (systemd) | Dev (docker compose) |
 |---|---|---|
-| PostgreSQL, Redis, Unbound | пакеты ОС + drop-in'ы бюджета (`deploy/systemd/*.service.d`) | контейнеры compose |
-| Go-сервисы (9 шт.: 7 конвейерных + web + dashboard) | статические бинарники `/opt/crawler/bin`, юниты `crawler-*.service` | образ `crawler/go-dev:local` + air |
-| Chromium | дистрибутив headless-shell в `/opt/crawler/chromium`, юнит `crawler-chromium.service` | образ `chromedp/headless-shell` (dev-профиль app) |
-| `crawlerctl` | CLI в `/opt/crawler/bin`, без юнита | контейнер tools |
+| PostgreSQL, Redis, Unbound | OS packages + budget drop-ins (`deploy/systemd/*.service.d`) | compose containers |
+| Go services (9 total: 7 pipeline + web + dashboard) | static binaries `/opt/crawler/bin`, units `crawler-*.service` | image `crawler/go-dev:local` + air |
+| Chromium | headless-shell distribution in `/opt/crawler/chromium`, unit `crawler-chromium.service` | image `chromedp/headless-shell` (dev app profile) |
+| `crawlerctl` | CLI in `/opt/crawler/bin`, no unit | tools container |
 
-Docker-профиль `runtime` (боевой render-контейнер, T-065) остаётся
-docker-вариантом рендера (воркер + собственный Chromium в одном контейнере,
-`mem_limit` 2048m) — для хостов с Docker; его связь с systemd-набором:
-`crawler-chromium.service` + `crawler-render-worker.service` дают ту же пару
-в нативном виде, но в двух cgroup (см. ниже).
+The Docker `runtime` profile (the production render container, T-065) remains
+the docker variant of rendering (worker + its own Chromium in one container,
+`mem_limit` 2048m) — for hosts with Docker; its relation to the systemd set:
+`crawler-chromium.service` + `crawler-render-worker.service` provide the same
+pair natively, but in two cgroups (see below).
 
-## 2. Бюджет памяти: MemoryMax по юнитам
+## 2. Memory budget: MemoryMax per unit
 
-Бюджет ТЗ 3.2 исполняется cgroup'ами `MemoryMax` (ТЗ 10.1: OOM-killer не
-затрагивает PostgreSQL — сработавший потолок убивает процесс внутри своей
-cgroup, systemd перезапускает юнит, остальные сервисы не затронуты).
+The spec 3.2 budget is enforced with per-cgroup `MemoryMax` (spec 10.1: the
+OOM killer does not touch PostgreSQL — a tripped cap kills the process inside
+its own cgroup, systemd restarts the unit, the other services are unaffected).
 
-| Юнит | MemoryMax | Строка бюджета ТЗ 3.2 |
+| Unit | MemoryMax | Spec 3.2 budget line |
 |---|---|---|
-| `postgresql@.service` + drop-in | **3072M** (бюджет ≈ 2,5 ГБ + запас на пики обслуживания) | PostgreSQL ≈ 2,5 ГБ |
-| `redis-server.service` + drop-in | **640M** (maxmemory 512mb + ~128 МБ служебных, docs/redis.md §7) | Redis ≤ 0,5 ГБ |
-| `unbound.service` + drop-in | **800M** (бюджет ≈ 0,7 ГБ + рост кэша на ≈47 млн имён: 733.9 MiB у старого потолка 700M, §12; +100M из MemAvailable 2.6 GiB) | Unbound ≈ 0,7 ГБ |
-| `crawler-*.service` (9 юнитов) | **2436M суммарно** (второй экземпляр render-worker@ добавляет свой 256M — §2.2; воркер B фолбэка — ещё +256M, §2.3) | Go-сервисы ≈ 1,3 ГБ (7 конвейерных) + web этапа 13 + dashboard этапа 15 |
-| `crawler-chromium.service` | **2048M** | Chromium ≈ 2 ГБ (шаблон второго инстанса chromium2 — ещё +2048M при включении, §2.2/T-209) |
+| `postgresql@.service` + drop-in | **3072M** (budget ≈ 2.5 GB + headroom for maintenance peaks) | PostgreSQL ≈ 2.5 GB |
+| `redis-server.service` + drop-in | **640M** (maxmemory 512mb + ~128 MB of overhead, docs/redis.md §7) | Redis ≤ 0.5 GB |
+| `unbound.service` + drop-in | **800M** (budget ≈ 0.7 GB + cache growth at ≈47M names: 733.9 MiB at the old 700M cap, §12; +100M taken from MemAvailable 2.6 GiB) | Unbound ≈ 0.7 GB |
+| `crawler-*.service` (9 units) | **2436M total** (a second render-worker@ instance adds its own 256M — §2.2; the fallback worker B adds another +256M, §2.3) | Go services ≈ 1.3 GB (7 pipeline) + web of stage 13 + dashboard of stage 15 |
+| `crawler-chromium.service` | **2048M** | Chromium ≈ 2 GB (the chromium2 second-instance template — another +2048M when enabled, §2.2/T-209) |
 
-Итого потолки 8996M при 8192M RAM — суммарно выше объёма памяти, и это
-допустимо: потолок — не резервация, одновременного касания всех потолков
-не бывает (по средним замеров §6/§11 весь набор ≈ 5.1–5.2 GiB, с пиком
-Chromium — ≈ 6 GiB; подъём T-160 — unbound +100M, dns-worker +128M —
-взят из фактического запаса MemAvailable 2.6 GiB замера §12;
-PostgreSQL у потолка 3 GiB держит page cache, отдаваемый при давлении;
-разделение OOM по cgroup — вводный абзац этого
-раздела, ТЗ 10.1, — сохраняется). Строка «Go-сервисы ≈ 1,3 ГБ» ТЗ
-покрывала семь конвейерных юнитов; публичный `web` лендинга — продуктовое
-расширение этапа 13 вне основного ТЗ — добавляет свою строку 256M,
-операторский `dashboard` — расширение этапа 15 (ТЗД) — 128M. MemoryMax выше плановой строки бюджета
-там, где над внутренним лимитом живут служебные памяти процесса или пики
-обслуживания — Redis (maxmemory 512mb + ~128 МБ, eviction раньше OOM —
-docs/redis.md §7), PostgreSQL (work_mem/maintenance/autovacuum поверх
-shared_buffers — docs/db.md, «Память»), http-worker (тела в полёте
-на 192 слота — T-143/T-157, ниже). Штатно инстансы живут в строках бюджета:
-плановые строки суммарно ≈ 7,4 ГБ, строка «Go-сервисы» по факту замера
-§11 ≈ 1.0–1.1 GiB; остаток ≈ 0,6 ГБ и незаполненность потолков — ОС
-и page cache (ТЗ 3.2).
+Total caps of 8996M with 8192M of RAM — above the physical memory in sum, and that
+is acceptable: a cap is not a reservation, all caps are never touched at the same
+time (per the averages of measurements §6/§11 the whole set is ≈ 5.1–5.2 GiB, with a Chromium
+peak — ≈ 6 GiB; the T-160 increase — unbound +100M, dns-worker +128M —
+was taken from the actual MemAvailable headroom of 2.6 GiB of measurement §12;
+PostgreSQL at its 3 GiB cap holds page cache that it yields under pressure;
+per-cgroup OOM isolation — the intro paragraph of this
+section, spec 10.1, — is preserved). The spec line "Go services ≈ 1.3 GB"
+covered seven pipeline units; the public landing `web` — a product
+extension of stage 13 outside the main spec — adds its own 256M line;
+the operator `dashboard` — an extension of stage 15 (dashboard spec) — 128M. MemoryMax sits above the planned budget line
+where process overhead or maintenance peaks live on top of the internal
+limit — Redis (maxmemory 512mb + ~128 MB, eviction before OOM —
+docs/redis.md §7), PostgreSQL (work_mem/maintenance/autovacuum on top of
+shared_buffers — docs/db.md, "Memory"), http-worker (bodies in flight
+across 192 slots — T-143/T-157, below). In normal operation the instances stay within the budget lines:
+the planned lines total ≈ 7.4 GB, the "Go services" line measured in fact
+(§11) is ≈ 1.0–1.1 GiB; the remaining ≈ 0.6 GB and the unfilled caps are the OS
+and page cache (spec 3.2).
 
-Потолки девяти юнитов Go-сервисов (строка «Go-сервисы ≈ 1,3 ГБ»
-исполняется фактическим потреблением ≈ 1.0–1.15 GiB, а не суммой
-потолков 2436M):
+The caps of the nine Go service units (the "Go services ≈ 1.3 GB" line
+is met by actual consumption of ≈ 1.0–1.15 GiB, not by the sum of
+the 2436M caps):
 
-| Юнит | MemoryMax |
+| Unit | MemoryMax |
 |---|---|
 | `crawler-http-worker.service` | 900M |
 | `crawler-dns-worker.service` | 384M |
@@ -80,79 +80,79 @@ shared_buffers — docs/db.md, «Память»), http-worker (тела в по�
 | `crawler-monitor.service` | 128M |
 | `crawler-dashboard.service` | 128M |
 
-- **http-worker — 900M**, самый тяжёлый: до `http.task_concurrency`
-  доменных задач на экземпляр (192 по умолчанию — T-157, возврат 256 —
-  по замеру после T-163; T-139 — скользящее потребление q:http);
-  тела страниц в слоте не удерживаются (ранний Put T-147 — каждая
-  страница сразу уходит в хранилище по хэшу), в задаче — метаданные и
-  ≤ `http.task_per_domain` транзитных буферов читаемых тел, плюс кэш
-  итоговых URL и пишущее хранилище контента; мягкий потолок кучи Go —
-  `http.mem_limit` (T-163, дефолт 768 MiB: GC у порога сам возвращает
-  страницы ОС, не доводя anon до MemoryHigh/MemoryMax — reclaim-штормы
-  и фаталы T-157), замер критерия — метрики слота на :9104. Потолок
-  поднят 384M → 900M по повторному замеру после
-  T-139 (load-measurements.md §11, T-143): 256 слотов держали anon
-  avg ≈ 855 MiB (834–873, oom=0 под потолком 900 MiB, заданным на
-  сервере `systemctl set-property` — персистентный drop-in, теперь
-  закреплён в юните), т.е. ≈ 3.34 MiB на слот — замер кода до T-147
-  (тогда тела записей-оригиналов, каждое ≤ 2 МиБ, держались до конца
-  задачи; типичная смесь, не верхняя граница: всплеск крупных страниц
-  может выйти выше — окно замера 12 мин).
-  Суточный прогон это подтвердил (§12, T-157): два фатала за сутки на
-  256 — 05:48 killed by OOM killer и 09:17 выход на пик 900.5 MiB =
-  MemoryMax, MemoryHigh 850M сработал 120 095 раз (reclaim-штормы,
-  swap) — дефолт понижен до 192, устойчиво по пропитке волны 21
-  (860–893 MiB, oom=0, NRestarts=0; скорость ≈17–19 дом/с).
-  384M подходили впритык уже на 128 слотах (anon ≈ 380 из 384 MiB).
-  Строка «Go-сервисы ≈ 1,3 ГБ» проходит: http 900M + прочие Go-сервисы
-  по замеру §6/§11 ≈ 130–160 MiB → суммарно ≈ 1.0–1.1 GiB (с
-  render-worker по avg §6 — ≈ 1.13 GiB); даже по максимумам §6 —
-  ≈ 1.2 GiB. Возврат к 256 — по замеру после T-163 (метрики слота
-  `crawler_http_*` на :9104: anon юнита / занятые слоты ≤ 1.5 MiB);
-- **dns-worker — 384M**: пул 2000 UDP-сокетов (`dns.udp_pool_size`) и
-  буферы обменов, TTL-кэш редиректных резолвов (T-047). Потолок поднят
-  256M → 384M по замеру §12 (T-160): на ≈47 млн доменов и глубоком q:dns
-  воркер периодически упирался в 256 MiB (в §6 на смеси ru/rf/su max был
-  141 MiB), запас — из MemAvailable 2.6 GiB;
-- **web — 256M** (этап 13, вне строки ТЗ): кроме лёгкой работы с БД живые
-  проверки формы гонят полный конвейер checker (T-123: DNS → HTTP с телами
-  страниц до `http.max_body_bytes` → рендер SPA → анализ) — сетевые буферы
-  одного доменного эпизода, паритет с dev-профилем app;
-- **render-worker — 256M** (T-169, было 128M): только Go-часть (Chromium —
-  в отдельной cgroup), но DOM в полёте ≤ `render.contexts` ×
-  `content.max_store_bytes` (8 × 2 МиБ + transient-копии сериализации) и
-  буферы pgx/очереди: замер T-092 §6 упирался в потолок 128 MiB
-  (23/116/128) уже при 4 контекстах, к 23.10 — 117–128 МБ + swap
-  (дефицит слот-времени, подъём в стиле T-160); дефолт `render.contexts`
-  8 (T-169) умножает окно DOM вдвое — потолок 256M, контроль после
-  деплоя: `memory.events oom=0`, NRestarts 0;
-- **ingest / scheduler / analyzer / monitor / dashboard — по 128M**:
-  пакетная работа с БД без больших буферов (потоковый разбор
-  файлов, SQL-пачки, разбор уже сжатого контента постранично, счётчики);
-  dashboard — read-only читатель БД/Redis (агрегаты считает SQL-движок,
-  в памяти — только снимок и HTML/JSON-артефакты embed);
-- `crawlerctl` — CLI без юнита (ТЗ 4.1), запускается оператором эпизодически
-  (`crawlerctl status/domain/zones/...`), его память не фиксируется
-  потолком — команда короткоживущая; эпизодические десятки MiB ложатся
-  в запас строки «Go-сервисы» по средним замера (факт конвейера
-  ≈ 1.0–1.15 GiB против ≈ 1,3 ГБ).
+- **http-worker — 900M**, the heaviest one: up to `http.task_concurrency`
+  domain tasks per instance (192 by default — T-157, returning to 256 —
+  based on a measurement after T-163; T-139 — the sliding consumption of q:http);
+  page bodies are not held in the slot (the early Put of T-147 — every
+  page goes straight to hash-addressed storage), a task carries metadata and
+  ≤ `http.task_per_domain` transit buffers of bodies being read, plus a cache
+  of final URLs and the content write storage; the soft Go heap cap is
+  `http.mem_limit` (T-163, default 768 MiB: GC at the threshold returns
+  pages to the OS on its own, keeping anon below MemoryHigh/MemoryMax — the reclaim
+  storms and fatals of T-157); the criterion is measured via the slot metrics on :9104. The cap
+  was raised 384M → 900M after a repeat measurement following
+  T-139 (load-measurements.md §11, T-143): 256 slots held anon
+  avg ≈ 855 MiB (834–873, oom=0 under the 900 MiB cap set on the
+  server with `systemctl set-property` — a persistent drop-in, now
+  pinned in the unit), i.e. ≈ 3.34 MiB per slot — a measurement of the code before T-147
+  (back then the bodies of original records, each ≤ 2 MiB, were held until the end
+  of the task; a typical mix, not an upper bound: a burst of large pages
+  can go higher — the measurement window is 12 min).
+  The 24-hour run confirmed it (§12, T-157): two fatals per day at 256 —
+  05:48 killed by OOM killer and 09:17 hitting the peak of 900.5 MiB =
+  MemoryMax, MemoryHigh 850M tripped 120,095 times (reclaim storms,
+  swap) — the default was lowered to 192, stable through the soak of wave 21
+  (860–893 MiB, oom=0, NRestarts=0; the rate ≈17–19 domains/s).
+  384M was already a tight fit at 128 slots (anon ≈ 380 of 384 MiB).
+  The "Go services ≈ 1.3 GB" line holds: http 900M + the other Go services
+  ≈ 130–160 MiB per measurement §6/§11 → ≈ 1.0–1.1 GiB in total (with
+  render-worker per the §6 avg — ≈ 1.13 GiB); even by the §6 maxima —
+  ≈ 1.2 GiB. Returning to 256 — based on a measurement after T-163 (the slot metrics
+  `crawler_http_*` on :9104: unit anon / busy slots ≤ 1.5 MiB);
+- **dns-worker — 384M**: a pool of 2000 UDP sockets (`dns.udp_pool_size`) and
+  exchange buffers, a TTL cache of redirect resolutions (T-047). The cap was raised
+  256M → 384M per measurement §12 (T-160): at ≈47M domains and a deep q:dns
+  the worker periodically hit 256 MiB (in §6 on a ru/rf/su mix the max was
+  141 MiB); the headroom came from MemAvailable 2.6 GiB;
+- **web — 256M** (stage 13, outside the spec line): besides light DB work, live
+  form checks run the full checker pipeline (T-123: DNS → HTTP with page
+  bodies up to `http.max_body_bytes` → SPA render → analysis) — the network buffers
+  of a single domain episode, parity with the dev app profile;
+- **render-worker — 256M** (T-169, was 128M): only the Go part (Chromium is
+  in a separate cgroup), but DOM in flight is ≤ `render.contexts` ×
+  `content.max_store_bytes` (8 × 2 MiB + transient serialization copies), plus
+  pgx/queue buffers: measurement T-092 §6 hit the 128 MiB cap
+  (23/116/128) already at 4 contexts, by 23.10 — 117–128 MB + swap
+  (a slot-time deficit, an increase in the T-160 style); the default `render.contexts`
+  8 (T-169) doubles the DOM window — cap 256M; control after
+  the deploy: `memory.events oom=0`, NRestarts 0;
+- **ingest / scheduler / analyzer / monitor / dashboard — 128M each**:
+  batch DB work without large buffers (streaming parsing
+  of files, SQL batches, page-by-page parsing of already compressed content, counters);
+  dashboard — a read-only reader of DB/Redis (aggregates are computed by the SQL engine,
+  in memory — only the snapshot and the embedded HTML/JSON artifacts);
+- `crawlerctl` — a CLI without a unit (spec 4.1), run by the operator
+  episodically (`crawlerctl status/domain/zones/...`); its memory is not pinned
+  by a cap — the command is short-lived; episodic tens of MiB fit
+  into the headroom of the "Go services" line per the measurement averages (the pipeline fact
+  is ≈ 1.0–1.15 GiB against ≈ 1.3 GB).
 
-Chromium отдельным юнитом, а не процессом воркера (решение): у строки
-бюджета своя cgroup — OOM вкладки браузера убивается внутри
-`crawler-chromium.service` и перезапускается, не затрагивая воркер;
-остановка/рестарт браузера не останавливает потребление q:render (воркер
-переживает — пауза потребления при мёртвом браузере, docs/render.md);
-профиль и `--no-sandbox` — от выделенного пользователя `crawler-chromium`.
-Воркер работает в remote-режиме (`render.remote_url = ws://127.0.0.1:9222`)
-— тот же контракт, что у dev-профиля app. Компенсация remote-режима:
-перезапуск по числу страниц/RSS изнутри воркера (T-065) невозможен для
-чужого процесса — потолок и перезапуск держит юнит (аналогия mem_limit
-dev-сервиса chromium, docs/docker.md §6); плановый ресайкл раз в 2 ч —
-таймер `crawler-chromium-recycle.timer` (§2.2 ниже, T-208).
+Chromium as a separate unit, not a worker process (a decision): the budget
+line gets its own cgroup — a browser tab killed by OOM dies inside
+`crawler-chromium.service` and is restarted without touching the worker;
+a browser stop/restart does not stop q:render consumption (the worker
+survives — it pauses consumption while the browser is dead, docs/render.md);
+the profile and `--no-sandbox` run under the dedicated `crawler-chromium` user.
+The worker runs in remote mode (`render.remote_url = ws://127.0.0.1:9222`)
+— the same contract as the dev app profile. The compensation for remote mode:
+a restart by page count/RSS from inside the worker (T-065) is impossible for
+a foreign process — the unit holds the cap and the restart (the analogy is the mem_limit
+of the dev chromium service, docs/docker.md §6); the scheduled recycle every 2 h is
+the `crawler-chromium-recycle.timer` timer (§2.2 below, T-208).
 
-Применение T-160 на живом сервере (unbound 700 → 800M, dns-worker
-256 → 384M) — **до деплоя**, по образцу §2.1 (T-158): значения те же,
-что в drop-in'е/юните, действуют сразу, персистентный drop-in пишется в
+Applying T-160 on the live server (unbound 700 → 800M, dns-worker
+256 → 384M) — **before the deploy**, following the §2.1 pattern (T-158): the values are the same
+as in the drop-in/unit, they take effect immediately, and the persistent drop-in is written to
 `/etc/systemd/system.control/`:
 
 ```bash
@@ -160,65 +160,66 @@ systemctl set-property unbound.service MemoryMax=800M
 systemctl set-property crawler-dns-worker.service MemoryMax=384M
 ```
 
-После деплоя — синхронизировать drop-in/юнит по §5 (п. 1) и снять
-персистентные set-property drop-in'ы (`systemctl revert <юнит>` +
-`daemon-reload` + `restart` — как в §2.1, образец T-143,
-load-measurements.md §3): единственный источник — файлы комплекта. Критерий T-160: `memory.events oom=0` у
-обоих юнитов, MemoryCurrent unbound < MemoryMax с запасом ≥ 50 MiB,
-median длительности DNS-задач в гистограммах 9103 не деградирует,
-`recursion.time.median` (`unbound-control stats`) не растёт.
+After the deploy — sync the drop-in/unit per §5 (item 1) and remove
+the persistent set-property drop-ins (`systemctl revert <unit>` +
+`daemon-reload` + `restart` — as in §2.1, the T-143 sample,
+load-measurements.md §3): the set's unit files are the single source of truth. The T-160 criterion: `memory.events oom=0` for
+both units, unbound MemoryCurrent < MemoryMax with a margin of ≥ 50 MiB,
+the median duration of DNS tasks in the 9103 histograms does not degrade,
+`recursion.time.median` (`unbound-control stats`) does not grow.
 
-Применение T-169 на живом сервере (render-worker 128 → 256M) — вместе
-со ступенью 1 (операционно `render.contexts 4 → 8` в
-`/etc/crawler/config.yaml` — явное значение в конфиге перебивает
-дефолты кода, §5 п. 2; замер комплектом T-092 до/после, 30–60 мин
-стационара):
+Applying T-169 on the live server (render-worker 128 → 256M) — together
+with step 1 (operationally `render.contexts 4 → 8` in
+`/etc/crawler/config.yaml` — an explicit value in the config overrides
+the code defaults, §5 item 2; measured with the T-092 kit before/after, 30–60 min
+of steady state):
 
 ```bash
 systemctl set-property crawler-render-worker.service MemoryMax=256M
 ```
 
-После деплоя — синхронизировать юнит по §5 (п. 1) и снять drop-in
-(`systemctl revert` + `daemon-reload` + `restart`). Критерий ступени 1
-(T-169): лаг q:render убывает ≥1,5 тыс./ч, PSI CPU some < 95 %,
-chromium RSS ниже порога `render.restart_memory_bytes` (1536 MiB —
-MemoryCurrent юнита chromium), гистограммы и память 9105, `q:dead` без
-роста, NRestarts 0; повторный замер после CPUWeight рендера (T-158) —
-ёмкость против приоритета. Ступени 2–3 — configuration.md (`render`,
-`timeout`) и §2.2 ниже.
+After the deploy — sync the unit per §5 (item 1) and remove the drop-in
+(`systemctl revert` + `daemon-reload` + `restart`). The criterion of step 1
+(T-169): the q:render backlog decreases by ≥1,500/h, PSI CPU some < 95%,
+chromium RSS below the `render.restart_memory_bytes` threshold (1536 MiB —
+the chromium unit's MemoryCurrent), the 9105 histograms and memory, `q:dead`
+not growing, NRestarts 0; a repeat measurement after the render CPUWeight (T-158) —
+capacity versus priority. Steps 2–3 — configuration.md (`render`,
+`timeout`) and §2.2 below.
 
-### 2.1. CPU-приоритеты: CPUWeight/CPUQuota (T-158)
+### 2.1. CPU priorities: CPUWeight/CPUQuota (T-158)
 
-Сервер один (4 vCPU, ТЗ 3.1), расширение недоступно (замер §12), поэтому
-CPU перераспределяется между юнитами относительными весами `CPUWeight`
-(cgroup v2, диапазон 1–10000, дефолт 100). Вес — не потолок: он действует
-только при конкуренции за CPU, применяется на лету и не требует рестарта
-юнита. Повод — контрольный замер 2026-10-23
+There is a single server (4 vCPU, spec 3.1), scaling out is unavailable (measurement §12), so
+CPU is redistributed between units with the relative `CPUWeight`
+weights (cgroup v2, range 1–10000, default 100). A weight is not a cap: it acts
+only under CPU contention, applies on the fly, and requires no unit
+restart. The trigger was the control measurement of 2026-10-23
 ([`load-measurements.md`](load-measurements.md) §12): PSI CPU some
-91–95%, load 25/4 vCPU; CPU в стационаре распределялся не в пользу
-проверки — postgres 177%, chromium 140%, analyzer 66% против ~90% одного
-ядра у http-worker (агрегаты мониторинга, рендер-яд и фоновый анализ
-отбирали CPU у конвейера). ТЗ: §3.2, §10.
+91–95%, load 25/4 vCPU; in steady state CPU was distributed against the
+checking — postgres 177%, chromium 140%, analyzer 66% versus ~90% of one
+core at http-worker (monitoring aggregates, render cores, and background analysis
+were taking CPU away from the pipeline). Specs: §3.2, §10.
 
-| Юнит | CPUWeight | CPUQuota | Обоснование |
+| Unit | CPUWeight | CPUQuota | Rationale |
 |---|---|---|---|
-| `crawler-http-worker.service` | **1000** | — | критический путь: HTTP-этап — узкое место конвейера (load-measurements §3) |
-| `crawler-dns-worker.service` | **1000** | — | критический путь: питает q:http, не должен отставать от HTTP (backpressure) |
-| `crawler-render-worker.service` | **300** | — | этап конвейера, не узкое место; тяжёлый CPU рендера — в chromium (см. ниже) |
-| `crawler-analyzer.service` | **200** | **150%** | фоновый анализ не отбирает CPU у проверки: квота не режет текущие 66% (§12), ограничивает всплески фоновых проходов |
-| `crawler-monitor.service` | **50** | — | обвязка: агрегаты по 47 млн строк (BacklogLoop/ZoneStats, §12) — не конкурент конвейеру |
-| `crawler-web.service` | **50** | — | обвязка: лендинг, живые проверки формы — разовые эпизоды |
-| `crawler-dashboard.service` | **50** | — | обвязка: read-only читатель БД/Redis (агрегаты — SQL-движок) |
-| `crawler-ingest.service`, `crawler-scheduler.service` | 100 (дефолт) | — | CPU-лёгкие постановщики: в замере §12 их CPU незначим |
-| `crawler-chromium.service` | 100 (дефолт) | — | приоритет связки рендера задаёт render-worker (300); дефолт 100 при весах 1000 у http/dns уже десятикратно понижает относительный приоритет браузера (140% CPU, §12) |
+| `crawler-http-worker.service` | **1000** | — | critical path: the HTTP stage is the pipeline bottleneck (load-measurements §3) |
+| `crawler-dns-worker.service` | **1000** | — | critical path: feeds q:http, must not lag behind HTTP (backpressure) |
+| `crawler-render-worker.service` | **300** | — | a pipeline stage, not the bottleneck; the CPU-heavy rendering lives in chromium (see below) |
+| `crawler-analyzer.service` | **200** | **150%** | background analysis must not take CPU from checking: the quota does not cut the current 66% (§12) and limits bursts of background passes |
+| `crawler-monitor.service` | **50** | — | auxiliary: aggregates over 47M rows (BacklogLoop/ZoneStats, §12) — no competition for the pipeline |
+| `crawler-web.service` | **50** | — | auxiliary: the landing page, live form checks — one-off episodes |
+| `crawler-dashboard.service` | **50** | — | auxiliary: a read-only reader of DB/Redis (aggregates are the SQL engine's job) |
+| `crawler-ingest.service`, `crawler-scheduler.service` | 100 (default) | — | CPU-light enqueuers: their CPU was negligible in measurement §12 |
+| `crawler-chromium.service` | 100 (default) | — | the render pair's priority is set by render-worker (300); the default 100 with http/dns at 1000 already lowers the browser's relative priority tenfold (140% CPU, §12) |
 
-Инфраструктура (postgresql/redis/unbound) не приоритизирована: их CPU
-обслуживает сам конвейер (запись результатов, очереди, резолвы) —
-понижение веса душило бы этапы; веса конвейера 1000 при их дефолте 100
-решают конкуренцию в пользу проверки без правок чужих юнитов.
+Infrastructure (postgresql/redis/unbound) is not prioritized: its CPU
+serves the pipeline itself (writing results, queues, resolutions) —
+lowering its weight would strangle the stages; the pipeline weights of 1000
+against their default of 100 resolve contention in favor of checking
+without editing foreign units.
 
-Применение на живом сервере — **до деплоя** (значения те же, что в
-юнитах; действуют сразу, персистентный drop-in в
+Applying on the live server — **before the deploy** (the values are the same
+as in the units; they take effect immediately, the persistent drop-in goes to
 `/etc/systemd/system.control/`):
 
 ```bash
@@ -231,357 +232,356 @@ systemctl set-property crawler-web.service CPUWeight=50
 systemctl set-property crawler-dashboard.service CPUWeight=50
 ```
 
-После деплоя (юниты несут те же значения): синхронизировать файлы юнитов
-по §5 («Обновление версий», п. 1) и снять персистентные drop-in'ы по
-образцу T-143 (load-measurements.md §3): `systemctl revert <юнит>` +
-`daemon-reload` + `restart` — иначе drop-in продолжает перекрывать
-юнит-файл; единственный источник — юнит-файл. Проверка:
+After the deploy (the units carry the same values): sync the unit files
+per §5 ("Version updates", item 1) and remove the persistent drop-ins following the
+T-143 pattern (load-measurements.md §3): `systemctl revert <unit>` +
+`daemon-reload` + `restart` — otherwise the drop-in keeps overriding the
+unit file; the unit file is the single source of truth. Verification:
 
 ```bash
 systemctl show crawler-http-worker -p CPUWeight        # 1000
 systemctl show crawler-analyzer -p CPUQuotaPerSecUSec  # 1s 500ms (= 150%)
 ```
 
-Критерий приёмки (замер комплектом T-092 до/после —
-load-measurements.md §10): PSI CPU some в стационаре < 80%, NRestarts
-юнитов 0, скорость HTTP не падает при фоновых проходах анализатора и
-пересчётах зон.
+Acceptance criterion (measured with the T-092 kit before/after —
+load-measurements.md §10): PSI CPU some in steady state < 80%, unit
+NRestarts 0, the HTTP rate does not drop during the analyzer's background passes
+and zone recomputations.
 
-### 2.2. Второй экземпляр render-worker (ступень 3 T-169)
+### 2.2. The second render-worker instance (step 3 of T-169)
 
-Юнит-шаблон [`deploy/systemd/crawler-render-worker@.service`](../deploy/systemd/crawler-render-worker@.service)
-поднимает второй и следующие экземпляры render-worker — ступень 3
-разгона дренажа q:render (постановка T-169), **после** ступени 1
-(`render.contexts 8` + MemoryMax 256M) и при недостатке ступени 2
-(`render.timeout` 25 → 15–20 с только по гистограмме —
-configuration.md, `render`): второй воркер оправдан, когда лаг q:render
-не убывает ≥1,5 тыс./ч при PSI CPU some < 95 % и гейте у watermark —
-значит, слоты/процессор первого воркера и его Chromium исчерпаны.
+The unit template [`deploy/systemd/crawler-render-worker@.service`](../deploy/systemd/crawler-render-worker@.service)
+brings up the second and further render-worker instances — step 3
+of speeding up q:render drainage (introduced by T-169), **after** step 1
+(`render.contexts 8` + MemoryMax 256M) and when step 2 is not enough
+(`render.timeout` 25 → 15–20 s, only per the histogram —
+configuration.md, `render`): a second worker is justified when the q:render backlog
+does not decrease by ≥1,500/h at PSI CPU some < 95% and is gated at the watermark —
+meaning the slots/CPU of the first worker and its Chromium are exhausted.
 
-Механика: тот же бинарник, та же группа потребителей `render-worker`
-(ТЗ 4.2 — консьюмерские группы масштабируют воркеров горизонтально);
-имя консьюмера per-process (`render-worker-<pid>`) — экземпляры не
-конфликтуют ни в XREADGROUP (доставки делятся между консьюмерами), ни
-в клеймах XAUTOCLAIM (живой воркер подтверждает раньше
-`redis.claim_min_idle`), пишут в общее хранилище контента (координация
-через БД — как http-worker с render-worker, ТЗ 5.7).
+Mechanics: the same binary, the same consumer group `render-worker`
+(spec 4.2 — consumer groups scale workers horizontally);
+the consumer name is per-process (`render-worker-<pid>`) — the instances do not
+conflict either in XREADGROUP (deliveries are split between consumers) or
+in XAUTOCLAIM claims (a live worker acknowledges before
+`redis.claim_min_idle`), and they write to the shared content storage (coordination
+via the DB — like http-worker with render-worker, spec 5.7).
 
-- **Метрики**: имя экземпляра = порт: `crawler-render-worker@9109` →
-  `METRICS_ADDR=127.0.0.1:9109` (9101–9108 заняты комплектом; свободны
-  9109+ кроме 9120 — фиксированный порт воркера B фолбэка, вынесен из
-  зоны роста экземпляров, §2.3).
-  `METRICS_ADDR` нельзя задавать в общем
-  `/etc/crawler/crawler.env` — EnvironmentFile переопределяет
-  `Environment` юнита и столкнёт порты всех экземпляров;
-- **память**: свой потолок 256M на экземпляр (cgroup отдельная от
-  первого), сумма §2 растёт на 256M; контроль — `memory.events oom=0`,
-  NRestarts 0, гистограммы 9105/9109;
-- **второй Chromium (:9223)** — только при насыщении первого
-  (MemoryCurrent юнита chromium у 2048M / стационарный потолок скорости
-  при свободных слотах): per-instance файл
-  `/etc/crawler/render-worker@9109.env` с
-  `CRAWLER_RENDER_REMOTE_URL=ws://127.0.0.1:9223` (шаблон подключает
-  его позже общего crawler.env — переопределяет), юнит — в комплекте:
+- **Metrics**: the instance name = the port: `crawler-render-worker@9109` →
+  `METRICS_ADDR=127.0.0.1:9109` (9101–9108 are taken by the set; free are
+  9109+ except 9120 — the fixed port of the fallback worker B, moved out of
+  the instance growth range, §2.3).
+  `METRICS_ADDR` must not be set in the shared
+  `/etc/crawler/crawler.env` — EnvironmentFile overrides the unit's
+  `Environment` and would collide the ports of all instances;
+- **memory**: its own 256M cap per instance (a cgroup separate from
+  the first one); the §2 total grows by 256M; control — `memory.events oom=0`,
+  NRestarts 0, the 9105/9109 histograms;
+- **the second Chromium (:9223)** — only at saturation of the first one
+  (the chromium unit's MemoryCurrent near 2048M / the steady-state rate cap
+  with free slots): a per-instance file
+  `/etc/crawler/render-worker@9109.env` with
+  `CRAWLER_RENDER_REMOTE_URL=ws://127.0.0.1:9223` (the template connects
+  it after the shared crawler.env — it overrides), the unit is in the set:
   [`crawler-chromium2.service`](../deploy/systemd/crawler-chromium2.service)
-  (порт 9223, отдельный профиль `/var/lib/crawler/chromium2/profile`;
-  установка и дефект ReadWritePaths — подраздел ниже, T-209); его
-  cgroup ≈2 ГБ — отдельная строка бюджета ТЗ 3.2, на сервере 8 ГБ —
-  только по замеру свободной памяти (MemAvailable, §12); ресайкл таймером
-  `crawler-chromium-recycle.timer` (см. ниже) не покрывается — имя юнита
-  зашито в `ExecStart=` ресайкл-сервиса, второму нужен свой таймер
-  по образцу.
+  (port 9223, a separate profile `/var/lib/crawler/chromium2/profile`;
+  installation and the ReadWritePaths defect — the subsection below, T-209); its
+  cgroup of ≈2 GB is a separate spec 3.2 budget line; on an 8 GB server —
+  only per a free-memory measurement (MemAvailable, §12); recycling with the
+  `crawler-chromium-recycle.timer` timer (see below) does not cover it — the unit name
+  is hard-coded in the `ExecStart=` of the recycle service; the second one needs its own timer
+  modeled on it.
 
-Запуск и контроль:
+Startup and control:
 
 ```bash
 systemctl enable --now crawler-render-worker@9109.service
-curl -fsS 127.0.0.1:9109/livez              # живость второго экземпляра
-journalctl -t crawler-render-worker@9109 -f # логи экземпляра
+curl -fsS 127.0.0.1:9109/livez              # liveness of the second instance
+journalctl -t crawler-render-worker@9109 -f # instance logs
 ```
 
-Откат — `systemctl disable --now crawler-render-worker@9109`: доставки
-экземпляра вернутся клеймом первому (окно удержания ≪
-`redis.claim_min_idle`). Копируется шаблон общим порядком установки
-(§4.6, `cp deploy/systemd/crawler*.service` — маска захватывает и
-шаблон).
+Rollback — `systemctl disable --now crawler-render-worker@9109`: the instance's
+deliveries return via claims to the first one (the hold window ≪
+`redis.claim_min_idle`). The template is copied by the standard installation
+procedure (§4.6, `cp deploy/systemd/crawler*.service` — the mask captures the
+template too).
 
-#### Второй Chromium: юнит crawler-chromium2 (T-209)
+#### The second Chromium: the crawler-chromium2 unit (T-209)
 
 [`crawler-chromium2.service`](../deploy/systemd/crawler-chromium2.service)
-— второй инстанс headless-shell (CDP `127.0.0.1:9223`, отдельный профиль
-`/var/lib/crawler/chromium2/profile`, своя cgroup с MemoryMax 2048M) для
-второго воркера ступени 3 (буллет выше). Перенесён из эксперимента 29.10
-(окно дренажа T-198), где получен sed-копией `crawler-chromium.service`
-(порт 9222→9223, user-data-dir, Description; остальные директивы — как у
-первого, кроме `ReadWritePaths` — фикс ниже), директивы сверены с сервером
-побайтово. Это конкретный юнит, а не `@.service`-шаблон: спецификаторы
-в путях изоляции (`ReadWritePaths=`) systemd раскрывает давно (с v233;
-на сервере Ubuntu 24.04 — systemd 255, работает), но пара «порт 9223 +
-профиль chromium2» из одного `%i` не выводится (9223 и 2 — разные
-числа) — шаблон потребовал бы переименования порта или каталога на
-сервере; конкретный юнит хранит серверные директивы буквально
-и сверяется md5. На сервере
-после эксперимента юнит **disable** (env-файл воркера удалён): в комплекте
-файл — шаблон на случай возврата к двум браузерам, состоянием
-сервера после установки комплекта не управляет — §4.6 копирует его маской
-`crawler*.service`, но в список `enable --now` он не входит.
+is the second headless-shell instance (CDP `127.0.0.1:9223`, a separate profile
+`/var/lib/crawler/chromium2/profile`, its own cgroup with MemoryMax 2048M) for
+the second worker of step 3 (the bullet above). It was carried over from the 29.10 experiment
+(the drainage window of T-198), where it was produced as a sed-copy of `crawler-chromium.service`
+(port 9222→9223, user-data-dir, Description; the other directives are as in
+the first one, except `ReadWritePaths` — the fix below); the directives were verified against the server
+byte by byte. This is a concrete unit, not an `@.service` template: systemd has long expanded
+specifiers in isolation paths (`ReadWritePaths=`) (since v233;
+Ubuntu 24.04 on the server has systemd 255 — it works), but the pair "port 9223 +
+chromium2 profile" cannot be derived from a single `%i` (9223 and 2 are different
+numbers) — a template would require renaming the port or the directory on the
+server; the concrete unit keeps the server directives literally
+and is verified by md5. On the server
+after the experiment the unit is **disabled** (the worker env file was removed): in the set
+the file is a template for a possible return to two browsers; installing the set does not change the server state through it — §4.6 copies it with the
+`crawler*.service` mask, but it is not in the `enable --now` list.
 
-Возврат к двум браузерам (насыщение первого + свободная память — критерии
-буллета выше; сумма потолков §2 8996M вырастет на 2048M до ≈11 ГБ при
-8 ГБ RAM — только по замеру MemAvailable, §12):
+Returning to two browsers (saturation of the first + free memory — the criteria
+of the bullet above; the §2 cap total of 8996M grows by 2048M to ≈11 GB with
+8 GB of RAM — only per a MemAvailable measurement, §12):
 
 ```bash
 install -d -o crawler-chromium -g crawler -m 0770 /var/lib/crawler/chromium2
 cp deploy/systemd/crawler-chromium2.service /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now crawler-chromium2.service
-curl -fsS 127.0.0.1:9223/json/version # CDP второго браузера отвечает
-journalctl -u crawler-chromium2 -f    # логи: SyslogIdentifier общий с первым, отличать по юниту
-# воркер → второй браузер: per-instance env (буллет выше). Файл создаём
-# с этой единственной строкой; появятся иные переопределения — дописывать
-# (`>>`), не затирая:
+curl -fsS 127.0.0.1:9223/json/version # the second browser's CDP responds
+journalctl -u crawler-chromium2 -f    # logs: the SyslogIdentifier is shared with the first one; tell them apart by unit
+# worker → second browser: per-instance env (the bullet above). Create the file
+# with this single line; if other overrides appear, append
+# (`>>`) instead of truncating:
 echo 'CRAWLER_RENDER_REMOTE_URL=ws://127.0.0.1:9223' \
   > /etc/crawler/render-worker@9109.env
 systemctl restart crawler-render-worker@9109
 ```
 
-Откат — `systemctl disable --now crawler-chromium2.service`, удалить
-`/etc/crawler/render-worker@9109.env` и перезапустить экземпляр воркера
-(вернётся к :9222 из общего crawler.env) — состояние сервера на 30.10.
+Rollback — `systemctl disable --now crawler-chromium2.service`, delete
+`/etc/crawler/render-worker@9109.env`, and restart the worker instance
+(it returns to :9222 from the shared crawler.env) — the server state as of 30.10.
 
-**Дефект ручного копирования** (найден 29.10): при копировании
-`crawler-chromium.service` sed'ом `ReadWritePaths` обязан быть заменён на
-каталог профиля этого инстанса — `/var/lib/crawler/chromium2`, именно
-заменён, не дополнен (каталог первого инстанса второму не нужен).
-Оставшийся от оригинала `ReadWritePaths=/var/lib/crawler/chromium` в
-паре с `ProtectSystem=strict` запрещает запись в `chromium2` —
-headless-shell не может создать профиль, exit → рестарт-луп до start-limit
-(10 стартов за 5 мин, юнит failed), а воркер на `:9223` в это время
-crash-loop «dial tcp 127.0.0.1:9223: connection refused». Симптом
-обманчив — выглядит как падение браузера, причина — путь в изоляции
-юнита (подробности — шапка юнита). Лечение: правка `ReadWritePaths`, затем
+**Manual-copy defect** (found 29.10): when copying
+`crawler-chromium.service` with sed, `ReadWritePaths` must be replaced with
+this instance's profile directory — `/var/lib/crawler/chromium2`; replaced, not
+appended to (the first instance's directory is not needed by the second one).
+The `ReadWritePaths=/var/lib/crawler/chromium` left over from the original,
+paired with `ProtectSystem=strict`, forbids writing to `chromium2` —
+headless-shell cannot create the profile, exits → a restart loop until start-limit
+(10 starts in 5 min, the unit failed), while the worker on `:9223` at that time
+crash-loops with "dial tcp 127.0.0.1:9223: connection refused". The symptom
+is misleading — it looks like a browser crash; the cause is a path in the unit's
+isolation (details in the unit header). The cure: fix `ReadWritePaths`, then
 `systemctl daemon-reload && systemctl reset-failed crawler-chromium2.service`
-(start-limit сам не отпускает) и старт.
+(start-limit does not release on its own) and start.
 
-**Итог эксперимента 29.10**: на 4 vCPU второй браузер конвейер не ускорил
-— 96 дом/мин против 112–144 у одного, два браузера суммарно ≈400 % CPU:
-узкое место — процессор, не слоты рендера. Возврат к двум браузерам
-оправдан только на расширенном железе (больше vCPU; память — вторая
-строка бюджета 2048M, ТЗ 3.2); ресайкл второму — свой таймер по образцу T-208 (имя юнита
-зашито в `ExecStart=` ресайкл-сервиса, не таймера).
+**Outcome of the 29.10 experiment**: on 4 vCPU the second browser did not speed up the pipeline
+— 96 domains/min versus 112–144 for one; the two browsers totaled ≈400% CPU:
+the bottleneck is the processor, not the render slots. Returning to two browsers
+is justified only on scaled-up hardware (more vCPU; memory — the second
+2048M budget line, spec 3.2); the second one's recycle — its own timer modeled on T-208 (the unit name
+is hard-coded in the `ExecStart=` of the recycle service, not the timer).
 
-#### Ресайкл Chromium: таймер crawler-chromium-recycle (T-208)
+#### Chromium recycle: the crawler-chromium-recycle timer (T-208)
 
-Пара [`crawler-chromium-recycle.service`](../deploy/systemd/crawler-chromium-recycle.service)
-и [`crawler-chromium-recycle.timer`](../deploy/systemd/crawler-chromium-recycle.timer)
-раз в 2 ч перезапускает `crawler-chromium` — анти-деградация
-remote-режима рендера. **Когда нужен**: боевой деплой по умолчанию
-работает в remote-режиме (§2, `render.remote_url = ws://127.0.0.1:9222`),
-где воркер не может перезапустить чужой браузер по числу страниц/RSS
-(T-065) — ресайкл держит systemd, а не воркер. Без него chromium копит
-память 400→950+ МиБ за ~2 ч, таймауты рендера удваиваются; замер 29.10
-(окно дренажа T-198): после ресайкла таймауты вдвое ниже, 227→110. В
-local-режиме (`render.remote_url` пуст — браузер как процесс воркера)
-таймер не нужен: воркер сам перезапускает браузер (T-065,
+The pair [`crawler-chromium-recycle.service`](../deploy/systemd/crawler-chromium-recycle.service)
+and [`crawler-chromium-recycle.timer`](../deploy/systemd/crawler-chromium-recycle.timer)
+restarts `crawler-chromium` every 2 h — anti-degradation for
+the remote render mode. **When it is needed**: the production deploy by default
+runs in remote mode (§2, `render.remote_url = ws://127.0.0.1:9222`),
+where the worker cannot restart a foreign browser by page count/RSS
+(T-065) — systemd holds the recycle, not the worker. Without it chromium accumulates
+memory 400→950+ MiB over ~2 h and render timeouts double; measurement 29.10
+(the drainage window of T-198): after a recycle the timeouts are twice as low, 227→110. In
+local mode (`render.remote_url` empty — the browser as a worker process)
+the timer is not needed: the worker restarts the browser itself (T-065,
 [`render.md`](render.md)).
 
-Цена рестарта — прерванные идущие рендеры (<1 мин каждый): доставки
-вернутся клеймом XAUTOCLAIM (идемпотентность ТЗ 3.4), воркер переживает
-паузу потребления при мёртвом браузере (docs/render.md). Период — по
-замеру деградации (~2 ч, `OnUnitActiveSec`), первый запуск через 30 мин
-после активации таймера (`OnActiveSec`) — после старта браузер свежий.
+The cost of a restart — interrupted in-flight renders (<1 min each): deliveries
+return via an XAUTOCLAIM claim (idempotency, spec 3.4), and the worker survives
+the consumption pause while the browser is dead (docs/render.md). The period follows the
+degradation measurement (~2 h, `OnUnitActiveSec`); the first run is 30 min
+after the timer is activated (`OnActiveSec`) — right after startup the browser is fresh.
 
-Установка — общим порядком §4.6 (маска `cp` захватывает `crawler*.timer`,
-таймер в списке `enable --now`); на уже развёрнутом хосте (пара
-установлена 29.10 вручную, вне комплекта) достаточно:
+Installation — the standard §4.6 procedure (the `cp` mask captures `crawler*.timer`,
+the timer is in the `enable --now` list); on an already deployed host (the pair
+was installed manually on 29.10, outside the set) this is enough:
 
 ```bash
 cp deploy/systemd/crawler-chromium-recycle.{service,timer} /etc/systemd/system/
 systemctl daemon-reload
-systemctl reenable --now crawler-chromium-recycle.timer # до T-215 был WantedBy=timers.target — симлинк переезжает в crawler.target.wants/
-systemctl list-timers 'crawler-chromium-recycle*' # контроль расписания
+systemctl reenable --now crawler-chromium-recycle.timer # before T-215 it was WantedBy=timers.target — the symlink moves to crawler.target.wants/
+systemctl list-timers 'crawler-chromium-recycle*' # schedule check
 ```
 
-Жизненный цикл пары — вместе с набором (T-215): `PartOf=crawler.target`
-в обоих юнитах гасит и сервис, и таймер при `systemctl stop
-crawler.target` — очередной тик (раз в 2 ч) не запустит остановленный
-chromium; `WantedBy=crawler.target` возвращает таймер при старте набора
-(`PartOf=` транслирует только stop/restart, не start — потому связка из
-двух директив). Отдельно гасить таймер при остановке набора больше не
-нужно; `systemctl disable --now crawler-chromium-recycle.timer` — только
-если ресайкл не нужен вовсе (local-режим; обратное включение — §4.6).
-Рестарт набора транслируется паре так же, как stop (`PartOf=` передаёт
-и restart): при `systemctl restart crawler.target` отработает и ресайкл —
-дополнительный рестарт chromium в той же транзакции (безвреден: рендеры
-вернутся клеймом; возможный транзиентный `failed` ресайкла при схлопывании
-job'ов снимется следующим тиком). После ручного рестарта набора полезен
-контроль `systemctl --failed`.
+The pair's lifecycle — together with the set (T-215): `PartOf=crawler.target`
+in both units shuts down both the service and the timer on `systemctl stop
+crawler.target` — the next tick (every 2 h) will not start the stopped
+chromium; `WantedBy=crawler.target` brings the timer back when the set starts
+(`PartOf=` propagates only stop/restart, not start — hence the pair of
+two directives). Stopping the timer separately when the set stops is no longer
+needed; `systemctl disable --now crawler-chromium-recycle.timer` — only
+if recycling is not needed at all (local mode; re-enabling — §4.6).
+A set restart propagates to the pair the same way as stop (`PartOf=` passes
+restart through too): on `systemctl restart crawler.target` the recycle also runs —
+an extra chromium restart in the same transaction (harmless: renders
+return via claims; a possible transient `failed` of the recycle when jobs collapse
+is cleared by the next tick). After a manual restart of the set it is useful to check
+`systemctl --failed`.
 
-### 2.3. Воркер B фолбэка рендера (T-240)
+### 2.3. The render-fallback worker B (T-240)
 
 [`crawler-render-fallback-worker.service`](../deploy/systemd/crawler-render-fallback-worker.service)
-— доработка на Chromium задач, не прошедших рендер на основном движке
-(ТЗР этапа 35 §4.5, очередь `q:render-fallback`): тот же бинарник, что
-`crawler-render-worker.service`, другой сборкой. Отличия сборки:
+is a Chromium rework pass for tasks that failed to render on the main engine
+(render spec, stage 35 §4.5, the `q:render-fallback` queue): the same binary as
+`crawler-render-worker.service`, a different build. Build differences:
 
-- **стрим потребления** — `RENDER_WORKER_STREAM=q:render-fallback` в
-  юните (параметр запуска, как `METRICS_ADDR`; стрим потребления —
-  параметр сборки воркера, не поля конфигурации, ТЗР §4.1 п.3). Группа
-  выводится канонической парой стрима (`queue.WorkingGroups`):
-  `render-fallback-worker`, отдельная от основной `render-worker` —
-  доставки фолбэка не делятся с основным конвейером;
-- **темп** (ФТ-13) — `render.fallback.worker_rate` записей за
-  скользящее окно 1 мин (`renderworker.RateWindow`) из общего
-  `/etc/crawler/config.yaml`: батч-режим «собрать и доработать» без
-  наращивания chromium-мощности. Действует и при выключенном
-  `render.fallback.enabled` — накопленное в очереди дорабатывается до
-  пуста (ФТ-14). Сам воркер B фолбэк не публикует — рекурсия запрещена
-  (ФТ-10);
-- **движок** — chromium закреплён за сборкой B юнит-локальным
-  `EnvironmentFile=-/etc/crawler/render-fallback-worker.env` (юнит читает
-  его **после** общего `crawler.env` — одноимённые переменные важнее, как
-  per-instance файл у `render-worker@`, §2.2). Содержимое боевого файла
-  (живёт на хосте, отдельного файла в `deploy/` нет):
+- **consumption stream** — `RENDER_WORKER_STREAM=q:render-fallback` in
+  the unit (a launch parameter, like `METRICS_ADDR`; the consumption stream is
+  a worker build parameter, not a configuration field — render spec §4.1 item 3). The group
+  is derived from the stream's canonical pair (`queue.WorkingGroups`):
+  `render-fallback-worker`, separate from the main `render-worker` —
+  fallback deliveries are not shared with the main pipeline;
+- **rate** (FR-13) — `render.fallback.worker_rate` records per
+  a 1 min sliding window (`renderworker.RateWindow`) from the shared
+  `/etc/crawler/config.yaml`: a batch mode of "collect and rework" without
+  scaling up chromium capacity. It also applies when
+  `render.fallback.enabled` is off — what has accumulated in the queue is reworked until
+  empty (FR-14). Worker B itself does not publish fallbacks — recursion is forbidden
+  (FR-10);
+- **engine** — chromium is pinned to build B by the unit-local
+  `EnvironmentFile=-/etc/crawler/render-fallback-worker.env` (the unit reads
+  it **after** the shared `crawler.env` — same-named variables win, like
+  the per-instance file of `render-worker@`, §2.2). The content of the production file
+  (it lives on the host; there is no separate file in `deploy/`):
 
   ```
   CRAWLER_RENDER_ENGINE=chromium
   CRAWLER_RENDER_REMOTE_URL=ws://127.0.0.1:9222
   ```
 
-  Вторая строка нужна не всегда: пока основной воркер на chromium,
-  значение и так приходит из общего `crawler.env`; после перевода основного
-  воркера на движка-кандидата (правка `render.engine`/`render.remote_url`
-  в общем конфиге или `crawler.env`, T-248/T-249) она возвращает воркер B
-  к chromium основного юнита (`:9222`; второй Chromium — `:9223`, §2.2).
-  Без закрепления воркер B уехал бы на кандидата вместе с общим конфигом —
-  дорабатывал бы фолбэк тем же лёгким движком, который задачи не осилил
-  (рекурсивный фолбэк запрещён, ФТ-10/§4.5 п.1), а метрики сборок
-  смешивались бы в `crawler_render_records_total{engine}`. Файл
-  необязателен (`-`): до его создания юнит стартует с движком из общего
-  конфига (без канарейки это тот же chromium);
-- **метрики** — `127.0.0.1:9120`: 9101–9108 заняты комплектом; 9120 —
-  фиксированный порт воркера B, вынесенный из зоны естественного роста
-  экземпляров `render-worker@` (§2.2: свободны 9109+, кроме 9120).
+  The second line is not always needed: while the main worker is on chromium,
+  the value comes from the shared `crawler.env` anyway; after the main
+  worker is switched to the candidate engine (editing `render.engine`/`render.remote_url`
+  in the shared config or `crawler.env`, T-248/T-249) it returns worker B
+  to the chromium of the main unit (`:9222`; the second Chromium — `:9223`, §2.2).
+  Without the pin, worker B would drift to the candidate together with the shared config —
+  it would rework the fallback with the same light engine that failed the tasks
+  (recursive fallback is forbidden, FR-10/§4.5 item 1), and the builds' metrics
+  would get mixed in `crawler_render_records_total{engine}`. The file
+  is optional (`-`): until it is created the unit starts with the engine from the shared
+  config (without the canary that is the same chromium);
+- **metrics** — `127.0.0.1:9120`: 9101–9108 are taken by the set; 9120 is
+  the fixed port of worker B, moved out of the natural growth range of
+  `render-worker@` instances (§2.2: 9109+ are free, except 9120).
 
-Chromium — общий с основным воркером (`render.remote_url` из
-`crawler.env` → `ws://127.0.0.1:9222`, юнит `crawler-chromium.service`):
-CDP-браузер держит нескольких консьюмеров, бюджет памяти юнита один на
-всех (§2.2). **Ресайкл-пара T-208 применима как есть, новых файлов не
-требуется**: `ExecStart` ресайкл-сервиса перезапускает именно
-`crawler-chromium.service` — общий браузер обоих воркеров; собственной
-пары воркеру B не нужно. Локальный headless-shell (без внешнего юнита) —
-режим docker-runtime: сервис `render-fallback` профиля `runtime`
-(`deploy/docker/compose.yaml`, образ — сегодняшний `Dockerfile.render`
-без изменений, конфигурация —
-[`deploy/docker/config.render-fallback.yaml`](../deploy/docker/config.render-fallback.yaml)),
-перезапуски браузера там делает сам воркер (T-065), как у `render`.
+Chromium is shared with the main worker (`render.remote_url` from
+`crawler.env` → `ws://127.0.0.1:9222`, the `crawler-chromium.service` unit):
+the CDP browser holds several consumers, and the unit's memory budget is one for
+all (§2.2). **The T-208 recycle pair applies as is, no new files are
+needed**: the `ExecStart` of the recycle service restarts exactly
+`crawler-chromium.service` — the browser shared by both workers; worker B
+does not need its own pair. A local headless-shell (without an external unit) is
+the docker-runtime mode: the `render-fallback` service of the `runtime` profile
+(`deploy/docker/compose.yaml`, the image is the current `Dockerfile.render`
+unchanged, the configuration is
+[`deploy/docker/config.render-fallback.yaml`](../deploy/docker/config.render-fallback.yaml));
+browser restarts there are done by the worker itself (T-065), as with `render`.
 
-Юнит копируется маской `crawler*.service` (§4.6), но **не входит в
-enable-список комплекта**: включение — осознанный шаг ввода фолбэка
-(строка бюджета §2 +256M; +5 соединений пула БД — пересчитать бюджет
-`postgres.pool_size`, §4.5). До готовности канарейки (ТЗР §4.5 п.3)
-воркер B может работать по пустой очереди — проверка проводки; на
-основном chromium публикаций нет вовсе — движковый guard (S-P1-1):
-фолбэк публикуют только движки-кандидаты, chromium сам себе не
-фолбэчится. Шаг 1 приёмки ТЗР §6.2 («включение фолбэка без смены
-движка»): очередь q:render-fallback остаётся пустой и при
-**включённом** `render.fallback.enabled`; при выключенном флаге
-публикаций тоже нет (ФТ-14). Откат ТЗР §6.4 п.1 — возврат воркеров на
-chromium гасит публикацию сам (без смены флага), воркер B дорабатывает
-накопленное до пуста.
+The unit is copied by the `crawler*.service` mask (§4.6), but is **not in
+the set's enable list**: enabling it is a deliberate step of rolling out the fallback
+(the §2 budget line +256M; +5 DB pool connections — recalculate the
+`postgres.pool_size` budget, §4.5). Until the canary is ready (render spec §4.5 item 3)
+worker B may run on an empty queue — wiring verification; on the
+main chromium there are no publications at all — the engine guard (S-P1-1):
+only candidate engines publish fallbacks, chromium does not
+fall back to itself. Step 1 of render spec §6.2 acceptance ("enabling the fallback without changing the
+engine"): the q:render-fallback queue stays empty even with
+`render.fallback.enabled` **on**; with the flag off there are no
+publications either (FR-14). The rollback of render spec §6.4 item 1 — returning workers to
+chromium stops the publication by itself (without changing the flag); worker B reworks
+what has accumulated until empty.
 
 ```bash
-# На уже развёрнутом хосте — сначала пользователь (§4.4 создаёт его на
-# свежих установках; воркер B — отдельный, не экземпляр шаблона):
+# On an already deployed host — the user first (§4.4 creates it on
+# fresh installs; worker B is separate, not a template instance):
 useradd -r -g crawler -d /var/lib/crawler -s /usr/sbin/nologin crawler-render-fallback-worker
-# Закрепление chromium за сборкой B (содержимое файла — выше, права как у
-# crawler.env, §4.5; юнит читает его после общего crawler.env):
+# Pinning chromium to build B (the file content is above, permissions as for
+# crawler.env, §4.5; the unit reads it after the shared crawler.env):
 printf '%s\n' 'CRAWLER_RENDER_ENGINE=chromium' \
   'CRAWLER_RENDER_REMOTE_URL=ws://127.0.0.1:9222' \
   > /etc/crawler/render-fallback-worker.env
 chown root:crawler /etc/crawler/render-fallback-worker.env
 chmod 0640 /etc/crawler/render-fallback-worker.env
 systemctl enable --now crawler-render-fallback-worker.service
-curl -fsS 127.0.0.1:9120/livez               # живость воркера B
+curl -fsS 127.0.0.1:9120/livez               # worker B liveness
 journalctl -t crawler-render-fallback-worker -f
-# темп действует: чтения пачками ≤ render.fallback.worker_rate за минуту
+# the rate is in effect: reads in batches of ≤ render.fallback.worker_rate per minute
 ```
 
-Откат (ФТ-14): `systemctl disable --now
-crawler-render-fallback-worker.service` останавливает потребление
-(доставки остаются в стриме, не в PEL) либо, наоборот, воркер оставляется
-до пуста очереди при выключенном флаге публикации в конфиге основного
-воркера. Отдельных миграций/очисток нет (ТЗР §4.8).
+Rollback (FR-14): `systemctl disable --now
+crawler-render-fallback-worker.service` stops consumption
+(deliveries stay in the stream, not in the PEL); or, conversely, the worker is left
+until the queue is empty with the publication flag off in the main
+worker's config. There are no separate migrations/cleanups (render spec §4.8).
 
-Наблюдаемость воркера B — шаг к канарейке (T-246, S-P2-5/S-P3-3):
-адрес его экспозиции `127.0.0.1:9120/metrics` добавляют в
-`dashboard.render_metrics_urls` (панель движков: потребление и глубина
-`q:render-fallback`; дефолт ключа — только основная сборка
-`127.0.0.1:9105`, согласован с `monitor.render_metrics_url`) и в скрейп
-Prometheus — боевой конфиг вне репозитория, target `127.0.0.1:9120` по
-образцу job `render-fallback` dev-конфига
+Worker B observability — a step toward the canary (T-246, S-P2-5/S-P3-3):
+its exposition address `127.0.0.1:9120/metrics` is added to
+`dashboard.render_metrics_urls` (the engines panel: consumption and depth of
+`q:render-fallback`; the key's default is only the main build
+`127.0.0.1:9105`, consistent with `monitor.render_metrics_url`) and to the Prometheus
+scrape — the production config lives outside the repository; the target `127.0.0.1:9120` follows the
+pattern of the `render-fallback` job of the dev config
 ([`deploy/docker/prometheus/prometheus.yml`](../deploy/docker/prometheus/prometheus.yml)):
-`crawler_service_up`, баланс published/consumed («Метрики рабочей
-логики» в [`services.md`](services.md)). Зонд `monitor.render_metrics_url`
-остаётся на основной сборке (9105) — алерты бюджета/гейта фолбэка читают
-экспозицию публикующего воркера.
+`crawler_service_up`, the published/consumed balance ("working-logic
+metrics" in [`services.md`](services.md)). The `monitor.render_metrics_url` probe
+stays on the main build (9105) — the budget/fallback gate alerts read the
+publishing worker's exposition.
 
-## 3. Пользователи: статические, по одному на сервис
+## 3. Users: static, one per service
 
-ТЗ §10.1 требует отдельных пользователей на сервис. Решение — **статические
-системные пользователи** `crawler-<сервис>` (без shell, home
-`/var/lib/crawler`) в общей группе `crawler`, а не `DynamicUser=yes`:
+Spec §10.1 requires a separate user per service. The solution is **static
+system users** `crawler-<service>` (no shell, home
+`/var/lib/crawler`) in the shared `crawler` group, rather than `DynamicUser=yes`:
 
-- хранилище контента пишут **три** юнита (http-worker, render-worker,
-  render-fallback-worker — §2.3) и
-  читают analyzer и `crawlerctl`: нужна стабильная принадлежность файлов
-  группе — setgid-каталог + фиксированные UID/GID; DynamicUser ротировал бы
-  владельца и требовал бы перекладки прав на каждый старт;
-- архив ingest (`incoming/processed|failed`) должен оставаться читаемым
-  оператору между запусками;
-- права на пак-файлы (0660, группа `crawler`) переживают рестарты без
-  systemd-механики StateDirectory.
+- the content storage is written by **three** units (http-worker, render-worker,
+  render-fallback-worker — §2.3) and
+  read by analyzer and `crawlerctl`: a stable group ownership of files is needed —
+  a setgid directory + fixed UID/GID; DynamicUser would rotate
+  the owner and require re-chmodding on every start;
+- the ingest archive (`incoming/processed|failed`) must stay readable
+  by the operator between runs;
+- pack file permissions (0660, group `crawler`) survive restarts without
+  the systemd StateDirectory machinery.
 
-Каталоги:
+Directories:
 
 ```
-/var/lib/crawler/            root:crawler 0755   — рабочая зона (WorkingDirectory)
-/var/lib/crawler/incoming/   crawler-ingest:crawler 0770 — наблюдаемая папка ingest (ТЗ 5.1)
-/var/lib/crawler/content/    root:crawler 02775  — пак-файлы контента (setgid: группа crawler)
-/var/lib/crawler/chromium/   crawler-chromium:crawler 0770 — служебный профиль браузера
-/var/lib/crawler/chromium2/  crawler-chromium:crawler 0770 — профиль второго Chromium (создаётся при его включении, §2.2/T-209)
+/var/lib/crawler/            root:crawler 0755   — work zone (WorkingDirectory)
+/var/lib/crawler/incoming/   crawler-ingest:crawler 0770 — the ingest watched folder (spec 5.1)
+/var/lib/crawler/content/    root:crawler 02775  — content pack files (setgid: group crawler)
+/var/lib/crawler/chromium/   crawler-chromium:crawler 0770 — the browser service profile
+/var/lib/crawler/chromium2/  crawler-chromium:crawler 0770 — the second Chromium's profile (created when it is enabled, §2.2/T-209)
 /etc/crawler/                root:crawler 0750 — config.yaml, crawler.env, rules/
-/opt/crawler/bin/            root:root 0755 — бинарники; /opt/crawler/chromium/ — headless-shell
+/opt/crawler/bin/            root:root 0755 — binaries; /opt/crawler/chromium/ — headless-shell
 ```
 
-Оператор, состоящий в группе `crawler`, кладёт файлы в `incoming/` без sudo.
+An operator in the `crawler` group drops files into `incoming/` without sudo.
 
-## 4. Установка
+## 4. Installation
 
-Команды ниже выполняются от root (`sudo -i` или с префиксом `sudo`);
-исключение — сборка бинарников (4.2): от обычного пользователя, установка
-в `/opt` — с `sudo`.
+The commands below run as root (`sudo -i` or with the `sudo` prefix);
+the exception is building the binaries (4.2): as a regular user, installing
+into `/opt` — with `sudo`.
 
-До пакетов и пользователей выполняется **раскладка дисков**
-([`disks.md`](disks.md) §4): тома `/var/lib/postgresql` и
-`/var/lib/crawler/content` монтируются до `apt install postgresql` —
-кластер пакета создаётся сразу в точке монтирования, а не на корневой ФС.
+Before packages and users, **disk layout** is done
+([`disks.md`](disks.md) §4): the `/var/lib/postgresql` and
+`/var/lib/crawler/content` volumes are mounted before `apt install postgresql` —
+the package cluster is created right at the mount point, not on the root filesystem.
 
-### 4.1. Пакеты ОС
+### 4.1. OS packages
 
 ```bash
 apt install postgresql redis-server unbound smartmontools jq
 ```
 
-`jq` нужен скрипту Telegram-доставки monitor (`/opt/crawler/bin/
-telegram-notify.sh`, T-162/T-173: алерты и отчёты нагрузки — сборка
-JSON-сообщения и маскировка секрета в логе; без него отправка молча
-падает exit 127 — замер 24.10 на боевой установке).
+`jq` is needed by monitor's Telegram delivery script (`/opt/crawler/bin/
+telegram-notify.sh`, T-162/T-173: alerts and load reports — building the
+JSON message and masking the secret in the log; without it sending silently
+fails with exit 127 — measured 24.10 on the production setup).
 
-Зависимости Chromium headless-shell (`libnspr4 libnss3 fontconfig` +
-шрифты) — отдельным списком при его установке: §4.3 ниже.
+The Chromium headless-shell dependencies (`libnspr4 libnss3 fontconfig` +
+fonts) are a separate list at its installation: §4.3 below.
 
-Drop-in'ы бюджета (копируются каталогами — имя каталога = имя юнита):
+Budget drop-ins (copied as directories — the directory name = the unit name):
 
 ```bash
 cp -r deploy/systemd/postgresql@.service.d /etc/systemd/system/
@@ -590,8 +590,8 @@ cp -r deploy/systemd/unbound.service.d /etc/systemd/system/
 systemctl daemon-reload
 ```
 
-Роль и БД приложения (аналог deploy/docker/postgres/init — туда смотрит
-dev; расширение pg_stat_statements и preload — postgresql-конфиг T-086):
+The application role and DB (an analog of deploy/docker/postgres/init — the dev
+setup points there; the pg_stat_statements extension and preload — the postgresql config of T-086):
 
 ```bash
 sudo -u postgres psql -c "CREATE ROLE crawler LOGIN PASSWORD '...';"
@@ -600,35 +600,35 @@ sudo -u postgres psql -d crawler -c "CREATE EXTENSION IF NOT EXISTS pg_stat_stat
 sudo -u postgres psql -d crawler -c "GRANT pg_read_all_stats TO crawler;"
 ```
 
-Грант `pg_read_all_stats` (T-177): без него `pg_stat_activity` прячет
-текст запросов чужих сессий от роли `crawler` — цикл медленных запросов
-monitor видит длительности, но не тексты (сообщения с пометкой «текст
-недоступен»); грант даёт чтение статистики (pg_stat_activity/
-pg_stat_statements), не прав.
+The `pg_read_all_stats` grant (T-177): without it `pg_stat_activity` hides
+the query text of other sessions from the `crawler` role — monitor's slow-query cycle
+sees the durations but not the texts (messages marked "text
+unavailable"); the grant gives access to statistics (pg_stat_activity/
+pg_stat_statements), not permissions.
 
-Unbound: конфиг рекурсии — `deploy/docker/unbound/unbound.internet.conf`
-(кэши под бюджет ≈ 0,7 ГБ уже рассчитаны в нём; копия в
-`/etc/unbound/unbound.conf.d/crawler.conf` с правками `interface:
-127.0.0.1` и `access-control` только для loopback — в нативной установке
-клиенты все локальные; DNSSEC-валидатор выключен в самом конфиге).
-Хостовому резолверу обязательного пути нет, но чтобы страницы рендера и
-прочий софт сервера ходили через локальный кэш (ТЗ 5.4), укажите unbound
-в `/etc/resolv.conf` (`nameserver 127.0.0.1`) или в systemd-resolved.
+Unbound: the recursion config is `deploy/docker/unbound/unbound.internet.conf`
+(the caches for a ≈ 0.7 GB budget are already computed in it; a copy goes to
+`/etc/unbound/unbound.conf.d/crawler.conf` with the `interface:
+127.0.0.1` and `access-control` edits for loopback only — in a native installation
+all clients are local; the DNSSEC validator is turned off in the config itself).
+There is no mandatory path for the host resolver, but so that render pages and
+the rest of the server software go through the local cache (spec 5.4), point to unbound
+in `/etc/resolv.conf` (`nameserver 127.0.0.1`) or in systemd-resolved.
 
-Redis слушает 127.0.0.1 по умолчанию пакета; maxmemory/eviction — конфиг
-T-087 (≤ 512M, под потолком MemoryMax).
+Redis listens on 127.0.0.1 by the package default; maxmemory/eviction — the config
+of T-087 (≤ 512M, under the MemoryMax cap).
 
-### 4.2. Бинарники Go
+### 4.2. Go binaries
 
-Статические сборки — как боевой образ рендера
+Static builds — like the production render image
 (`deploy/docker/Dockerfile.render`): `CGO_ENABLED=0`, `-trimpath -ldflags
-"-s -w"`. На машине с Go (или в контейнере tools: `make shell`):
+"-s -w"`. On a machine with Go (or in the tools container: `make shell`):
 
 ```bash
-# Бандл Tailwind лендинга (T-124): go:embed вбирает internal/web/static/
-# app.css; в git он не хранится (.gitignore), без этого шага лендинг
-# встанет без стилей. Собирается одноразовым контейнером (node не
-# нужен); боевая docker-сборка делает это сама (стадия css Dockerfile.go).
+# The landing page's Tailwind bundle (T-124): go:embed picks up internal/web/static/
+# app.css; it is not stored in git (.gitignore), and without this step the landing page
+# will come up unstyled. Built with a one-off container (node is
+# not needed); the production docker build does it itself (the css stage of Dockerfile.go).
 make web-css
 
 version="$(git describe --tags --always --dirty 2>/dev/null || echo unknown)"
@@ -642,56 +642,56 @@ done
 sudo install -D -t /opt/crawler/bin out/*
 ```
 
-`buildMode=prod` помечает боевые сборки в метрике `crawler_build_info`
-(метка `mode`); `buildVersion`/`buildRevision` (T-111) вычисляются из git —
-`version` = `git describe --tags --always --dirty` (тег либо хеш с пометкой
-несохранённых правок), `revision` = короткий хеш коммита; при недоступном
-git подставляется `unknown`. Dev-сборки без `-X` остаются на `dev-stub` /
-`dev` / пустой `revision`. В Docker-сборке значения передаются build-аргами
-`BUILD_VERSION`/`BUILD_REVISION`: `.git` исключён из контекста
-(`.dockerignore`), значения вычисляет вызывающая сторона — так делает
-`make build-runtime`; прямая `docker build` без арок получает `unknown`.
+`buildMode=prod` marks production builds in the `crawler_build_info` metric
+(the `mode` label); `buildVersion`/`buildRevision` (T-111) are computed from git —
+`version` = `git describe --tags --always --dirty` (a tag or a hash marked
+with unsaved edits), `revision` = the short commit hash; when git is unavailable
+`unknown` is substituted. Dev builds without `-X` stay at `dev-stub` /
+`dev` / an empty `revision`. In the Docker build the values are passed as build args
+`BUILD_VERSION`/`BUILD_REVISION`: `.git` is excluded from the context
+(`.dockerignore`), so the caller computes the values — that is what
+`make build-runtime` does; a direct `docker build` without args gets `unknown`.
 
-Миграции схем зашиты в бинарники (`migrations/embed.go`, golang-migrate).
+Schema migrations are embedded in the binaries (`migrations/embed.go`, golang-migrate).
 
 ### 4.3. Chromium
 
-Та же сборка headless-shell, что в dev/dev-runtime (версия —
-`CHROMEDP_HEADLESS_IMAGE` в `.env.example`, фиксируется): дистрибутив
-`chromedp/headless-shell` распаковывается в `/opt/crawler/chromium/`
-(исполняемый `headless-shell` в корне — путь в `ExecStart` юнита). Отдельный
-пакет/каталог вместо пакета ОС: версия браузера согласована с chromedp-стеком
-воркера, а Ubuntu-пакет chromium — snap-обёртка, непригодная для headless-CDP
-без user-data-dir ухищрений.
+The same headless-shell build as in dev/dev-runtime (the version —
+`CHROMEDP_HEADLESS_IMAGE` in `.env.example`, pinned): the
+`chromedp/headless-shell` distribution is unpacked into `/opt/crawler/chromium/`
+(the `headless-shell` executable in its root — the path in the unit's `ExecStart`). A separate
+package/directory instead of an OS package: the browser version is aligned with the worker's chromedp
+stack, and the Ubuntu chromium package is a snap wrapper, unfit for headless CDP
+without user-data-dir tricks.
 
-На хост переносится только бинарь, а рассчитан он на окружение образа —
-после распаковки дистрибутива установите недостающие библиотеки и
-шрифтовой стек (до первого старта юнита, §4.6):
+Only the binary is transferred to the host, but it is built for the image environment —
+after unpacking the distribution, install the missing libraries and
+font stack (before the unit's first start, §4.6):
 
 ```bash
 apt install libnspr4 libnss3 fontconfig fonts-liberation fonts-dejavu-core
-# библиотеки бинаря: libs ok — разрешаются; LIBS MISSING — not found/сбой ldd:
+# binary libraries: libs ok — resolved; LIBS MISSING — not found/ldd failure:
 ldd /opt/crawler/chromium/headless-shell 2>&1 \
   | grep -E 'not found|No such file|not a dynamic' \
   && echo "LIBS MISSING" || echo "libs ok"
-# шрифтовой стек: fonts ok — виден; FONTS MISSING — шрифтов нет:
+# font stack: fonts ok — visible; FONTS MISSING — no fonts:
 fc-list | grep -q . && echo "fonts ok" || echo "FONTS MISSING"
 ```
 
-- `libnspr4 libnss3` — обязательные библиотеки для запуска бинаря (ставились
-  при физическом деплое T-135, до T-140 в этом списке отсутствовали);
-- `fontconfig fonts-liberation fonts-dejavu-core` — шрифтовой стек Skia:
-  без fontconfig часть страниц (требующих шрифтового стека) роняет
-  Chromium FATAL `SkFontMgr_FontConfigInterface: Not implemented`
-  (SIGTRAP) → краш-луп до start-limit (10 рестартов за 5 минут, §5) →
-  юнит failed, q:render копит попытки. В dev дефект невидим — fontconfig
-  и шрифты уже внутри образа `chromedp/headless-shell`, на голом хосте
-  их нет. Инцидент боевого замера T-092 и операционное исправление —
-  [`load-measurements.md`](load-measurements.md) §4; юнит, уже ушедший
-  в failed, после установки пакетов поднимается руками: `systemctl
+- `libnspr4 libnss3` — libraries required to run the binary (installed
+  during the physical deploy of T-135; before T-140 they were missing from this list);
+- `fontconfig fonts-liberation fonts-dejavu-core` — the Skia font stack:
+  without fontconfig some pages (those requiring the font stack) crash
+  Chromium with FATAL `SkFontMgr_FontConfigInterface: Not implemented`
+  (SIGTRAP) → a crash loop until start-limit (10 restarts in 5 minutes, §5) →
+  the unit failed, q:render accumulates attempts. In dev the defect is invisible — fontconfig
+  and the fonts are already inside the `chromedp/headless-shell` image; on a bare host
+  they are absent. The incident of the production measurement T-092 and the operational fix —
+  [`load-measurements.md`](load-measurements.md) §4; a unit already gone
+  to failed comes back up manually after the packages are installed: `systemctl
   reset-failed crawler-chromium && systemctl start crawler-chromium` (§5).
 
-### 4.4. Пользователи и каталоги
+### 4.4. Users and directories
 
 ```bash
 groupadd -r crawler
@@ -705,116 +705,115 @@ install -d -o crawler-chromium -g crawler -m 0770 /var/lib/crawler/chromium
 install -d -o root -g crawler -m 0750 /etc/crawler
 ```
 
-### 4.5. Конфигурация
+### 4.5. Configuration
 
 ```bash
-cp config.example.yaml /etc/crawler/config.yaml   # правки — ниже
+cp config.example.yaml /etc/crawler/config.yaml   # edits below
 cp deploy/systemd/crawler.env.example /etc/crawler/crawler.env
 chmod 0640 /etc/crawler/crawler.env && chown root:crawler /etc/crawler/crawler.env
-cp -r rules /etc/crawler/rules                    # правила Laravel для analyzer
+cp -r rules /etc/crawler/rules                    # Laravel rules for analyzer
 ```
 
-Обязательные правки `config.yaml` относительно примера
-(полный справочник — [`configuration.md`](configuration.md)):
+Required edits to `config.yaml` relative to the example
+(the full reference — [`configuration.md`](configuration.md)):
 
-- `postgres.dsn`, `redis.addr` — заменить примеры на локальные значения
-  (или оставить как есть и задать точные в `crawler.env` — переменные
-  окружения важнее YAML, docs/configuration.md);
-- `postgres.pool_size` — на один сервис, а бюджет ТЗ §6.3 (20–50) —
-  суммарный на все: значение примера (5) даёт 8 × 5 + dashboard (2,
-  задаёт его юнит — девятый сервис по 5 не влезал в потолок;
-  предупреждение о глобальной переменной — ниже) +
-  `crawlerctl` (2) + админ ≈ 44–46 при `max_connections=50` (3 слота
-  резервирует `superuser_reserved_connections`). Менять — только
-  с пересчётом суммы; сразу всем сервисам —
-  `CRAWLER_POSTGRES_POOL_SIZE` в `crawler.env`
-  (docs/db.md, «Бюджет соединений»). Воркер B фолбэка (§2.3) — десятый
-  сервис со своим пулом: при его включении сумма растёт ещё на
-  `pool_size` (10 × 5 + 2 + админ ≈ 52 против 47 доступных слотов) —
-  пересчитывайте бюджет: глобально `CRAWLER_POSTGRES_POOL_SIZE=4`
-  (10 × 4 + 2 + админ ≈ 44) либо меньший пул одному воркеру B
-  переопределением в его юните. Внимание: EnvironmentFile
-  (crawler.env) переопределяет Environment юнита — включение глобальной
-  переменной затронет и пул дашборда (9 × 5 + 2 + админ ≈ 48 упрётся
-  в потолок доступных слотов); безопасный глобальный максимум — 4
-  (9 × 4 + 2 + админ ≈ 40), либо поднимайте `max_connections`,
-  либо снижайте пул отдельных сервисов;
+- `postgres.dsn`, `redis.addr` — replace the examples with local values
+  (or leave them as is and set the exact ones in `crawler.env` — environment
+  variables win over YAML, docs/configuration.md);
+- `postgres.pool_size` — per service, while the spec §6.3 budget (20–50) is
+  the total across all: the example value (5) gives 8 × 5 + dashboard (2,
+  set by its unit — the ninth service did not fit 5 under the cap;
+  the global-variable warning is below) +
+  `crawlerctl` (2) + admin ≈ 44–46 at `max_connections=50` (3 slots
+  are reserved by `superuser_reserved_connections`). Change it — only
+  with the total recomputed; for all services at once —
+  `CRAWLER_POSTGRES_POOL_SIZE` in `crawler.env`
+  (docs/db.md, "Connection budget"). The fallback worker B (§2.3) is the tenth
+  service with its own pool: when it is enabled the total grows by another
+  `pool_size` (10 × 5 + 2 + admin ≈ 52 against 47 available slots) —
+  recalculate the budget: globally `CRAWLER_POSTGRES_POOL_SIZE=4`
+  (10 × 4 + 2 + admin ≈ 44), or a smaller pool for the single worker B
+  via an override in its unit. Caution: EnvironmentFile
+  (crawler.env) overrides the unit's Environment — enabling the global
+  variable will also affect the dashboard pool (9 × 5 + 2 + admin ≈ 48 will hit
+  the cap of available slots); the safe global maximum is 4
+  (9 × 4 + 2 + admin ≈ 40), or raise `max_connections`,
+  or lower the pool of individual services;
 - `ingest.dir: /var/lib/crawler/incoming`, `content.dir:
   /var/lib/crawler/content`, `content.zstd_dictionary:
   /var/lib/crawler/content/dict.zst`, `analyzer.rules_dir: /etc/crawler/rules`;
-- `render.remote_url: "ws://127.0.0.1:9222"` — внешний браузер-юнит
-  (в примере пусто = собственный процесс воркера, это режим docker-runtime);
-- `monitor.listen` — в примере уже `127.0.0.1:9100`: метрики не
-  выставляются на боевой интерфейс (ТЗ §9); юнит monitor дополнительно
-  фиксирует loopback переменной `CRAWLER_MONITOR_LISTEN` (окружение важнее
-  YAML — страховка от config.yaml без правок), остальные сервисы слушают
-  loopback через `METRICS_ADDR` в юнитах (127.0.0.1:9101…9108);
-- `monitor.zone_stats_interval: "30m"` — в примере уже боевое значение
-  (совпадает с дефолтом, T-199): реконсиляция инкрементальных счётчиков
-  — единственный оставшийся полный проход `domains` (~40 с на 42 млн
-  строк); при интервале 5 минут она давала 48 % суммарного медленного
-  времени БД (замер окна медленных запросов после деплоя 3bffc62,
-  26.10: 100 событий >3 с, медиана 39 с, max 501 с) — оператор разредил
-  интервал до 30 минут по заготовке ТЗИ §7.1 (дрейф счётчиков в
-  стационаре обязан быть нулевым). Цикл алертов отвязан собственным
-  полем `monitor.alerts_interval` (T-206, дефолт 5 мин — прежняя
-  частота): окна детекции вернулись к прежним минутам (queue_dead
-  ≈15 мин, memory_high/render_debt — 10 мин, окно bad_hashes — 75 мин),
-  порог остановки прогресса остаётся в периодах реконсиляции —
-  `AlertStallFactor × zone_stats_interval`, 2,5 ч (метку
-  `zones.updated_at` пишет именно реконсиляция);
-- `web.listen` — публичный адрес лендинга: дефолт loopback
-  `127.0.0.1:8080` (рядом с nginx — §6 ниже), смена на unix-сокет —
-  абсолютным путём в значении;
-- `web.public_host` — домен публичного лендинга (например
-  `crawler.example.com`, при нестандартном порте — с портом): им
-  собираются абсолютные URL `sitemap.xml`. Без него за reverse-proxy
-  `<loc>` берётся из `Host`-заголовка посетителя (host-header
-  poisoning) — публикуемый наружу лендинг обязан задавать поле;
-  в примере оно закомментировано (T-227);
-- `dashboard.username` / `dashboard.password_hash` — креды оператора
-  дашборда (обязательны для запуска `crawler-dashboard`, ТЗД §7.7).
-  Хэш генерируется CLI (пароль — аргументом или stdin; stdin — не
-  остаётся в истории shell):
+- `render.remote_url: "ws://127.0.0.1:9222"` — an external browser unit
+  (empty in the example = the worker's own process, that is the docker-runtime mode);
+- `monitor.listen` — the example already has `127.0.0.1:9100`: metrics are not
+  exposed on a production-facing interface (spec §9); the monitor unit additionally
+  pins loopback with the `CRAWLER_MONITOR_LISTEN` variable (the environment wins over
+  YAML — a guard against an unedited config.yaml), the other services listen on
+  loopback via `METRICS_ADDR` in their units (127.0.0.1:9101…9108);
+- `monitor.zone_stats_interval: "30m"` — the example already has the production value
+  (it matches the default, T-199): the reconciliation of incremental counters
+  is the only remaining full pass over `domains` (~40 s per 42M
+  rows); at a 5-minute interval it contributed 48% of the total slow
+  DB time (measured over the slow-query window after the deploy of 3bffc62,
+  26.10: 100 events >3 s, median 39 s, max 501 s) — the operator spread the
+  interval to 30 minutes following the investigation spec §7.1 template (counter drift in
+  steady state must be zero). The alert cycle was decoupled with its own
+  `monitor.alerts_interval` field (T-206, default 5 min — the former
+  frequency): detection windows returned to their former minutes (queue_dead
+  ≈15 min, memory_high/render_debt — 10 min, the bad_hashes window — 75 min);
+  the progress-stall threshold remains in reconciliation periods —
+  `AlertStallFactor × zone_stats_interval`, 2.5 h (the
+  `zones.updated_at` label is written exactly by the reconciliation);
+- `web.listen` — the landing page's public address: the default is loopback
+  `127.0.0.1:8080` (next to nginx — §6 below); switching to a unix socket —
+  an absolute path as the value;
+- `web.public_host` — the public landing page's domain (for example
+  `crawler.example.com`, with the port if non-standard): absolute `sitemap.xml` URLs
+  are built with it. Without it, behind a reverse proxy
+  `<loc>` is taken from the visitor's `Host` header (host-header
+  poisoning) — a landing page published to the outside must set the field;
+  in the example it is commented out (T-227);
+- `dashboard.username` / `dashboard.password_hash` — the operator's dashboard
+  credentials (required to start `crawler-dashboard`, dashboard spec §7.7).
+  The hash is generated by the CLI (the password — as an argument or via stdin; stdin — does not
+  stay in shell history):
 
   ```bash
   /opt/crawler/bin/crawlerctl dashboard-secret < password.txt
-  printf 'пароль' | /opt/crawler/bin/crawlerctl dashboard-secret
+  printf 'password' | /opt/crawler/bin/crawlerctl dashboard-secret
   ```
 
-  Формат строки — `pbkdf2-sha256$<итерации>$<соль>$<ключ>` (600 000
-  итераций по умолчанию); открытый пароль в конфигурации и окружении
-  запрещён (ТЗД §7.2), смена `password_hash` инвалидирует все
-  cookie-сессии (docs/configuration.md, «dashboard»);
-  `dashboard.probes` — адреса `/livez` сервисов конвейера для секции
-  здоровья: в systemd-деплое это loopback-адреса метрик юнитов
+  The line format is `pbkdf2-sha256$<iterations>$<salt>$<key>` (600,000
+  iterations by default); a plaintext password in the configuration and the environment
+  is forbidden (dashboard spec §7.2); changing `password_hash` invalidates all
+  cookie sessions (docs/configuration.md, "dashboard");
+  `dashboard.probes` — the `/livez` addresses of the pipeline services for the
+  health section: in the systemd deploy these are the units' loopback metric addresses
   (`http://127.0.0.1:9100` monitor, `9101` ingest, `9102` scheduler,
   `9103` dns-worker, `9104` http-worker, `9105` render-worker,
   `9106` analyzer);
-- `http.user_agent` — реальные контакты оператора (если не задан в env);
-- `dns.ipv6: true` — если у сервера есть IPv6 (в docker-сети его нет).
+- `http.user_agent` — the operator's real contacts (if not set in env);
+- `dns.ipv6: true` — if the server has IPv6 (the docker network does not).
 
-Необязательная настройка после первого запуска — доставка алертов
-monitor и отчётов нагрузки в Telegram (T-162/T-173): **обязательны оба
-секрета `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID`** (тот же бот и группа,
-что у извещений CI/CD) в `/etc/crawler/crawler.env` — образец и где
-брать значения: `deploy/systemd/crawler.env.example`; доставить можно
-ops-workflow'ем `ops-telegram-env` (Actions → Run workflow: значения
-живут в секретах репозитория GitHub и оттуда не читаются — CI
-единственный держатель, workflow дописывает их в env-файл и
-перезапускает monitor). Скрипт отправки `telegram-notify.sh` едет в
-деплой-архиве вместе с бинарниками (deploy.yml кладёт
-`deploy/telegram-notify.sh` в архив, install распаковывает его в
-`/opt/crawler/bin` и chmod 0755) — отдельной установки не требует;
-скрипту нужен пакет `jq` (§4.1). Третье условие — сеть до
-`api.telegram.org`: с российских хостингов API Telegram часто
-недоступен (дроп TCP при живом интернете) — доставка тогда идёт
-через `https_proxy` в `crawler.env` и прокси на внешнем VPS.
-Пошагово — [`operations.md`](operations.md) §4.3 (секреты, скрипт,
-прокси) и §5 (запись 24.10 — установка прокси); без секретов алерты
-и отчёты остаются Warn/Info в journald monitor.
+An optional setup after the first start — delivering monitor alerts and load
+reports to Telegram (T-162/T-173): **both secrets `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` are required**
+(the same bot and group as the CI/CD notifications) in `/etc/crawler/crawler.env` — the sample and where
+to get the values: `deploy/systemd/crawler.env.example`; delivery is possible
+via the `ops-telegram-env` ops workflow (Actions → Run workflow: the values
+live in the GitHub repository secrets and are not read from there — CI
+is the sole holder; the workflow appends them to the env file and
+restarts monitor). The sending script `telegram-notify.sh` rides in the
+deploy archive together with the binaries (deploy.yml puts
+`deploy/telegram-notify.sh` into the archive, install unpacks it into
+`/opt/crawler/bin` and chmods it 0755) — no separate installation is needed;
+the script needs the `jq` package (§4.1). The third condition is network reachability of
+`api.telegram.org`: from Russian hostings the Telegram API is often
+unreachable (TCP drops while the internet is alive) — delivery then goes
+through `https_proxy` in `crawler.env` and a proxy on an external VPS.
+Step by step — [`operations.md`](operations.md) §4.3 (secrets, script,
+proxy) and §5 (the 24.10 entry — proxy installation); without the secrets, alerts
+and reports remain Warn/Info in monitor's journald.
 
-### 4.6. Юниты и запуск
+### 4.6. Units and startup
 
 ```bash
 cp deploy/systemd/crawler*.service deploy/systemd/crawler*.timer deploy/systemd/crawler.target /etc/systemd/system/
@@ -826,204 +825,201 @@ systemctl enable --now crawler.target \
     crawler-dashboard.service
 ```
 
-Инфраструктура включается пакетами: `systemctl enable --now postgresql
+Infrastructure is enabled as packages: `systemctl enable --now postgresql
 redis-server unbound`.
 
-### 4.7. Первый старт: миграции
+### 4.7. First start: migrations
 
-Отдельного шага миграций нет: каждый сервис применяет миграции PostgreSQL
-при старте под advisory-блокировкой (T-002, internal/migrate — docs/services.md,
-«Жизненный цикл»). Первым поднявшийся сервис накатывает схему, остальные
-ждут блокировку и видят актуальную версию. Порядок включения юнитов не важен.
+There is no separate migration step: every service applies the PostgreSQL
+migrations at startup under an advisory lock (T-002, internal/migrate — docs/services.md,
+"Lifecycle"). The service that comes up first applies the schema; the others
+wait for the lock and see the current version. The order of enabling units does not matter.
 
-### 4.8. Мониторинг SMART/TBW накопителя
+### 4.8. Drive SMART/TBW monitoring
 
-Комплект `deploy/smartd/` (T-089, ТЗ §10.3): конфиг smartd (critical
-warning, рост журнала ошибок, температура), обработчик предупреждений в
-syslog/journald и доступ алерту износа сервиса monitor к `/dev/nvme*`
-(udev-группа `nvme-smart` + drop-in юнита). Установка, проверка и откат —
-[`deploy/smartd/README.md`](../deploy/smartd/README.md); обоснование,
-оценка TBW от нагрузки и связь слоёв — [`disks.md`](disks.md).
+The `deploy/smartd/` set (T-089, spec §10.3): the smartd config (critical
+warning, error log growth, temperature), a warning handler in
+syslog/journald, and access for the monitor service's wear alert to `/dev/nvme*`
+(the `nvme-smart` udev group + a unit drop-in). Installation, verification, and rollback —
+[`deploy/smartd/README.md`](../deploy/smartd/README.md); the rationale,
+the TBW estimate from the load, and how the layers relate — [`disks.md`](disks.md).
 
-### 4.9. Входящий фид NRD smet.cz (cron)
+### 4.9. The inbound NRD smet.cz feed (cron)
 
-Комплект [`deploy/nrd/`](../deploy/nrd/): ежесуточная автоматическая
-подача списка новых доменов (NRD) smet.cz (~5·10⁵ доменов/день, разных
-зон) в наблюдаемую папку ingest. Cron запускает скрипт в **05:33 UTC**
-(перенос с 20:33 UTC 26.10, T-205: применение суточного файла шло
-минутами в вечернее окно CPU-голода и полуночный шторм суточной
-перепроверки; утро — вне часов голода, а день источника закрыт >9 ч —
-контракт закрытых дней сохранён), тот скачивает **закрытый день** —
-`https://smet.cz/nrd/data/daily/<дата
-вчерашняя по UTC>.txt.gz` (~2,6 МиБ) — в `<ingest.dir>/add/nrd-<дата>.txt.gz`
-по контракту доставки ([`incoming-files.md`](incoming-files.md) §2:
-временное имя `*.part`, наблюдателем игнорируется, + атомарное
-переименование). Список **зона-less**: зоны выводятся из самих доменов
-и создаются автоматически (`incoming-files.md` §1), разбивки по
-каталогам зон не требуется; `.gz` разбирается как архив (§9, один член).
+The [`deploy/nrd/`](../deploy/nrd/) set: a daily automatic feed of the new-domain list (NRD) of
+smet.cz (~5·10⁵ domains/day, various zones) into the ingest watched folder. Cron runs the script at **05:33 UTC**
+(moved from 20:33 UTC 26.10, T-205: applying the daily file took
+minutes in the evening CPU-starvation window and the midnight storm of the daily
+re-check; the morning is outside the starvation hours, and the source's day has been closed for >9 h —
+the closed-days contract is preserved); the script downloads the **closed day** —
+`https://smet.cz/nrd/data/daily/<yesterday's date in UTC>.txt.gz` (~2.6 MiB) — into `<ingest.dir>/add/nrd-<date>.txt.gz`
+following the delivery contract ([`incoming-files.md`](incoming-files.md) §2:
+the temporary `*.part` name is ignored by the watcher, + an atomic
+rename). The list is **zone-less**: zones are derived from the domains themselves
+and created automatically (`incoming-files.md` §1); splitting into
+zone directories is not required; `.gz` is parsed as an archive (§9, one member).
 
 ```bash
 install -m 0755 deploy/nrd/fetch-nrd.sh /usr/local/bin/crawler-fetch-nrd
 install -m 0644 deploy/nrd/crawler-nrd.cron /etc/cron.d/crawler-nrd
 ```
 
-Нюансы (подробно — [`deploy/nrd/README.md`](../deploy/nrd/README.md)):
+Nuances (details — [`deploy/nrd/README.md`](../deploy/nrd/README.md)):
 
-- **почему вчерашний день, а не `today.txt`**: дни у источника —
-  immutable-файлы `/daily/<дата>` («растёт до закрытия дня, затем не
-  меняется», хранятся 90 дней); генерация идёт ~20:10–20:19 UTC, файл
-  текущего дня до неё отсутствует (404), а сразу после — ещё растёт.
-  В 05:33 UTC файл вчерашнего дня закрыт > 9 ч (генерация предыдущих
-  суток) и неизменен — состав дня гарантированно полный, день читается
-  из имени. Справка источника сама рекомендует забирать только закрытые
-  дни;
-- **cron не умеет часовой пояс**: в `crawler-nrd.cron` часы переведены
-  в местное время сервера (Europe/Moscow, UTC+3 → 08:33); при смене
-  зоны сервера (`timedatectl`) пересчитать обратно в 05:33 UTC.
-  Файлы `/etc/cron.d` на сервере исполняет `systemd-cron` (классический
-  демон cron не установлен): таймер виден как
+- **why yesterday's day and not `today.txt`**: the source's days are
+  immutable `/daily/<date>` files ("it grows until the day is closed, then does not
+  change", kept for 90 days); generation runs ~20:10–20:19 UTC; the
+  current day's file is absent before it (404) and right after it is still growing.
+  At 05:33 UTC yesterday's file has been closed for > 9 h (the generation of the previous
+  day) and is unchanged — the day's composition is guaranteed complete; the day is read
+  from the name. The source's documentation itself recommends fetching only closed
+  days;
+- **cron has no time zone**: in `crawler-nrd.cron` the hours are converted
+  to the server's local time (Europe/Moscow, UTC+3 → 08:33); when the
+  server's zone changes (`timedatectl`), convert back to 05:33 UTC.
+  The `/etc/cron.d` files on the server are executed by `systemd-cron` (the classic
+  cron daemon is not installed): the timer is visible as
   `systemctl list-timers 'cron-*'` → `cron-crawler-nrd-root-0.timer`;
-- **отказы** (сеть/HTTP, не-gzip ответ): файл не ставится вовсе,
-  запись `СБОЙ: …` в `journalctl -t crawler-nrd-fetch`, повтор —
-  следующими сутками. День хранится 90 дней, пропущенный запуск
-  восстанавливается вручную: `/usr/local/bin/crawler-fetch-nrd` или
-  `CRAWLER_NRD_DAY=<дата> …` за любой день в глубину; массовая доливка
-  истории/пропусков — `deploy/nrd/backfill-nrd.sh` (все закрытые дни
-  раньше `NRD_BEFORE` по manifest.json, идемпотентен). Успех — строка
-  `OK: день … закрыт` с `sha256` байтов `.gz`, совпадающим с journal-полем
-  `ingest_files`. Повторная доставка того же дня — дубль по `sha256`,
-  не обрабатывается (`incoming-files.md` §5).
+- **failures** (network/HTTP, a non-gzip response): the file is not delivered at all,
+  a `FAILURE: …` entry in `journalctl -t crawler-nrd-fetch`; the retry —
+  the next day. A day is kept for 90 days; a missed run
+  is restored manually: `/usr/local/bin/crawler-fetch-nrd` or
+  `CRAWLER_NRD_DAY=<date> …` for any day in depth; bulk backfilling
+  of history/gaps — `deploy/nrd/backfill-nrd.sh` (all closed days
+  earlier than `NRD_BEFORE` per manifest.json, idempotent). Success — the line
+  `OK: day … closed` with the `sha256` of the `.gz` bytes matching the journal field
+  `ingest_files`. Redelivering the same day — a `sha256` duplicate,
+  not processed (`incoming-files.md` §5).
 
-Шаг — конфигурация оператора (как юниты и nginx, [`ci-cd.md`](ci-cd.md)):
-конвейер деплоя его не ставит и не обновляет.
+One more step — the operator's configuration (like the units and nginx, [`ci-cd.md`](ci-cd.md)):
+the deploy pipeline does not install or update it.
 
-## 5. Эксплуатация
+## 5. Operations
 
 ```bash
-systemctl list-units 'crawler-*'        # статус всех сервисов набора
-systemctl stop crawler.target           # весь набор (graceful: PartOf=);
-                                       # таймер ресайкла гасится вместе с набором (§2.2, T-215)
-journalctl -t crawler-scheduler -f      # логи по SyslogIdentifier
-curl -fsS 127.0.0.1:9102/livez         # liveness каждого сервиса
-curl -fsS 127.0.0.1:9102/healthz       # readiness (пул БД); /metrics — тот же порт
-systemctl kill -s HUP crawler-analyzer  # перезагрузка правил Laravel без рестарта
-/opt/crawler/bin/crawlerctl status      # CLI: статус, поиск, управление (ТЗ 4.1)
+systemctl list-units 'crawler-*'        # status of all services in the set
+systemctl stop crawler.target           # the whole set (graceful: PartOf=);
+                                       # the recycle timer is shut down with the set (§2.2, T-215)
+journalctl -t crawler-scheduler -f      # logs by SyslogIdentifier
+curl -fsS 127.0.0.1:9102/livez         # liveness of each service
+curl -fsS 127.0.0.1:9102/healthz       # readiness (DB pool); /metrics — same port
+systemctl kill -s HUP crawler-analyzer  # reload Laravel rules without a restart
+/opt/crawler/bin/crawlerctl status      # CLI: status, search, control (spec 4.1)
 ```
 
-- **Рестарты**: `Restart=on-failure`, `RestartSec=5s`, предел
-  `StartLimitIntervalSec=300` / `StartLimitBurst=10` — после 10 неудачных
-  запусков за 5 минут юнит переходит в failed и ждёт оператора
+- **Restarts**: `Restart=on-failure`, `RestartSec=5s`, the limits
+  `StartLimitIntervalSec=300` / `StartLimitBurst=10` — after 10 failed
+  starts within 5 minutes the unit goes to failed and waits for the operator
   (`journalctl -u …` + `systemctl reset-failed crawler-… && systemctl start
-  crawler-…`). Это защита от бесконечного цикла падений (например, недоступен
-  PostgreSQL), а не от штатных сбоев: разовый crash-рестарт в предел не
-  попадает (сбрасывается временем).
-- **Обновление версий: границы CD и ручные шаги.** Конвейер деплоя
-  ([`ci-cd.md`](ci-cd.md)) заменяет **только бинарники** `/opt/crawler/bin`.
-  Юниты systemd, `/etc/crawler/config.yaml` и конфиги инфраструктуры
-  (postgresql/redis/unbound) конвейер **не трогает** — при релизе, который
-  меняет `deploy/systemd/*` или дефолты конфигурации:
-  1. до/сразу после деплоя синхронизировать изменённые юниты:
-     `cp deploy/systemd/<юнит> /etc/systemd/system/ && systemctl
-     daemon-reload && systemctl restart <юнит>` (пример: MemoryMax=900M,
+  crawler-…`). This is protection against an endless crash loop (for example, PostgreSQL
+  unreachable), not against normal failures: a one-off crash restart does not
+  count toward the limit (it resets with time).
+- **Version updates: the CD boundaries and manual steps.** The deploy pipeline
+  ([`ci-cd.md`](ci-cd.md)) replaces **only the binaries** in `/opt/crawler/bin`.
+  The systemd units, `/etc/crawler/config.yaml`, and the infrastructure configs
+  (postgresql/redis/unbound) are **not touched** by the pipeline — for a release that
+  changes `deploy/systemd/*` or the configuration defaults:
+  1. before/right after the deploy, sync the changed units:
+     `cp deploy/systemd/<unit> /etc/systemd/system/ && systemctl
+     daemon-reload && systemctl restart <unit>` (examples: MemoryMax=900M,
      T-143; MemoryHigh=850M, T-145; CPUWeight/CPUQuota, T-158 — §2.1;
      MemoryMax unbound 800M / dns-worker 384M, T-160 — §2;
      MemoryMax render-worker 256M / contexts 8, T-169 — §2);
-     временные `systemctl set-property` drop-in'и
-     (`/etc/systemd/system.control/`) удалить, чтобы юнит-файл
-     был единственным источником;
-  2. сверить `/etc/crawler/config.yaml` с новыми дефолтами: **явные
-     значения в конфиге перебивают дефолты кода** (инцидент 22–23.10.2026:
-     `scheduler.batch_size: 5000` и `render.contexts: 3` перекрыли новые
-     дефолты 1000/4 волны 21 — эффект фикса не проявился до ручной правки);
-  3. повторный запуск деплоя после исправления причины провала —
-     `gh workflow run deploy.yml` (workflow_dispatch, катит текущий
-     `master`): автосворач. откат (healthcheck) уже вернул `bin.prev`,
-     сервер остаётся на прежней версии до повторного прогона.
-- **Откат версии** (последний успешный деплой — `/opt/crawler/bin.prev`):
-  `deploy/deploy-rollback.sh` — stop → восстановление `bin.prev` → start →
-  проверка юнитов; его же автоматически запускает конвейер при провале
-  healthcheck ([`ci-cd.md`](ci-cd.md)). Возвращаются только бинарники:
-  схема БД остаётся на версии нового релиза, релиз с миграцией откатом не
-  восстанавливается ([`operations.md`](operations.md) §4.1). Вручную — по
-  SSH из чекаута репозитория (`ssh root@<сервер> 'bash -s' -- <
-  deploy/deploy-rollback.sh`); на сервере скрипт не хранится — при
-  недоступности чекаута те же шаги руками: `systemctl stop
+     the temporary `systemctl set-property` drop-ins
+     (`/etc/systemd/system.control/`) must be removed so the unit file
+     is the single source of truth;
+  2. reconcile `/etc/crawler/config.yaml` with the new defaults: **explicit
+     values in the config override the code defaults** (incident 22–23.10.2026:
+     `scheduler.batch_size: 5000` and `render.contexts: 3` overrode the new
+     defaults of 1000/4 of wave 21 — the fix's effect did not show up until a manual edit);
+  3. re-running the deploy after fixing the failure cause —
+     `gh workflow run deploy.yml` (workflow_dispatch, deploys the current
+     `master`): the automatic rollback (healthcheck) has already restored `bin.prev`;
+     the server stays on the previous version until the next run.
+- **Version rollback** (the last successful deploy — `/opt/crawler/bin.prev`):
+  `deploy/deploy-rollback.sh` — stop → restoring `bin.prev` → start →
+  unit verification; the pipeline runs the same script automatically when the
+  healthcheck fails ([`ci-cd.md`](ci-cd.md)). Only the binaries are restored:
+  the DB schema stays at the new release's version; a release with a migration is not
+  restored by a rollback ([`operations.md`](operations.md) §4.1). Manually — over
+  SSH from a repository checkout (`ssh root@<server> 'bash -s' -- <
+  deploy/deploy-rollback.sh`); the script is not stored on the server — if the
+  checkout is unavailable, the same steps by hand: `systemctl stop
   crawler.target && rm -rf /opt/crawler/bin && cp -a
   /opt/crawler/bin.prev /opt/crawler/bin && systemctl start
   crawler.target`.
-- **Зависимости**: юниты приказаны `After=` инфраструктуре, но без
-  `Requires=`/остановочной связки — падение и рестарт PostgreSQL/Redis не
-  останавливает воркеры (пул pgx переподключается сам; очередь — Redis
-  Streams — переживает рестарт, потеря восстанавливается планировщиком,
-  ТЗ 3.4). Готовность БД при старте закрывается тем же restart-циклом
-  (миграции падают кодом 1 до её появления).
-- **Graceful shutdown** (ТЗ 3.4): SIGTERM от systemd → доработка текущей
-  задачи или возврат в очередь, бюджет каркаса 10 с (`ShutdownTimeout`,
-  docs/services.md), `TimeoutStopSec=30s` юнита даёт запас на закрытие пула
-  и HTTP-сервера метрик.
-- **Память**: `systemctl status crawler-http-worker` показывает
-  `Memory: …` (текущее потребление cgroup); потолок виден в
-  `systemctl show crawler-http-worker -p MemoryMax`. Проверка суточного
-  прогона без OOM — критерий приёмки ТЗ 11.4 п. 7 (задача T-093,
-  **выполнен** — окно 23–24.10 ≈25 ч: `journalctl -k --since
-  "2026-10-23 09:00" --grep 'oom'` пуст — `--since` обязателен:
-  без окна команда покажет записи инцидентов до окна, напр. cgroup-OOM
-  T-157 от 23.10 05:48; oom_kill/NRestarts юнитов нулевые, пики
-  в бюджетах MemoryMax —
+- **Dependencies**: the units are ordered `After=` the infrastructure, but without
+  `Requires=`/a stop binding — a PostgreSQL/Redis failure and restart does not
+  stop the workers (the pgx pool reconnects on its own; the queue — Redis
+  Streams — survives the restart, and loss is recovered by the scheduler,
+  spec 3.4). DB readiness at startup is handled by the same restart cycle
+  (migrations exit with code 1 until it appears).
+- **Graceful shutdown** (spec 3.4): SIGTERM from systemd → finishing the current
+  task or returning it to the queue, the framework's budget of 10 s (`ShutdownTimeout`,
+  docs/services.md); the unit's `TimeoutStopSec=30s` gives headroom for closing the pool
+  and the metrics HTTP server.
+- **Memory**: `systemctl status crawler-http-worker` shows
+  `Memory: …` (the current cgroup consumption); the cap is visible in
+  `systemctl show crawler-http-worker -p MemoryMax`. Verifying a 24-hour
+  run without OOM is the acceptance criterion of spec 11.4 item 7 (task T-093,
+  **done** — the 23–24.10 window of ≈25 h: `journalctl -k --since
+  "2026-10-23 09:00" --grep 'oom'` is empty — `--since` is mandatory:
+  without a window the command will show incident records from before the window, e.g. the cgroup OOM
+  of T-157 at 23.10 05:48; unit oom_kill/NRestarts are zero, the peaks
+  are within the MemoryMax budgets —
   [`load-measurements.md`](load-measurements.md) §13).
-- **Метрики**: `127.0.0.1:9100…9108/metrics` (monitor — 9100, web —
-  9107, dashboard — 9108; второй+ экземпляр render-worker — 9109 и
-  далее по имени экземпляра, §2.2). Скрейпит установленный на сервере
-  Prometheus (его юнит — инфраструктура оператора, вне комплекта; конфиг
-  джобов — как `deploy/docker/prometheus/prometheus.yml`, адреса
-  хостовые).
-- **Дашборд**: операторская сводка конвейера — напрямую на loopback
-  `curl -fsS -u <username>:<пароль> http://127.0.0.1:8090/api/status`
-  (Basic-креды из `dashboard.username`/`password_hash`; числа сходятся с
-  `crawlerctl status` — общий пакет `internal/status`); публикация для
-  браузера оператора — через reverse-proxy с TLS (§6).
-- **Лендинг**: публичный URL системы для посетителей — через
-  reverse-proxy с TLS (`curl -fsS https://<домен>/healthz` за nginx,
-  §6 ниже); операторский дашборд — отдельный вход того же прокси (§6).
-  Напрямую сервис отвечает на loopback `curl -fsS 127.0.0.1:8080/healthz`.
-- **SMART/TBW накопителя**: предупреждения smartd и алерта monitor — в
-  journald (`journalctl -t smartd -p warning`), живые показания —
-  `smartctl -H -A /dev/nvme0` (percentage_used, TBW). Детали —
-  [`disks.md`](disks.md) «Мониторинг SMART и TBW».
+- **Metrics**: `127.0.0.1:9100…9108/metrics` (monitor — 9100, web —
+  9107, dashboard — 9108; the second and further render-worker instances — 9109 and
+  on, by instance name, §2.2). Scraped by the Prometheus installed on the
+  server (its unit is the operator's infrastructure, outside the set; the job
+  config — like `deploy/docker/prometheus/prometheus.yml`, host addresses).
+- **Dashboard**: the operator's pipeline summary — directly on loopback
+  `curl -fsS -u <username>:<password> http://127.0.0.1:8090/api/status`
+  (Basic credentials from `dashboard.username`/`password_hash`; the numbers match
+  `crawlerctl status` — the shared `internal/status` package); publishing for
+  the operator's browser — via a reverse proxy with TLS (§6).
+- **Landing page**: the system's public URL for visitors — via a
+  reverse proxy with TLS (`curl -fsS https://<domain>/healthz` behind nginx,
+  §6 below); the operator dashboard — a separate entrance of the same proxy (§6).
+  Directly, the service answers on loopback at `curl -fsS 127.0.0.1:8080/healthz`.
+- **Drive SMART/TBW**: smartd and monitor alert warnings — in
+  journald (`journalctl -t smartd -p warning`); live readings —
+  `smartctl -H -A /dev/nvme0` (percentage_used, TBW). Details —
+  [`disks.md`](disks.md) "SMART and TBW monitoring".
 
-## 6. Публичный вход: nginx + TLS (T-124; дашборд — ТЗД §9.1)
+## 6. Public entrance: nginx + TLS (T-124; dashboard — dashboard spec §9.1)
 
-Лендинг (`crawler-web.service`) слушает loopback (`web.listen`, дефолт
-`127.0.0.1:8080`) — наружу систему публикует reverse-proxy,
-терминирующий TLS. Первый образец входа —
+The landing page (`crawler-web.service`) listens on loopback (`web.listen`, default
+`127.0.0.1:8080`) — a reverse proxy terminating TLS publishes the system
+to the outside. The first entrance sample is
 [`deploy/nginx/`](../deploy/nginx/) (`crawler.example.conf` + README:
-установка, заголовки, схема для sitemap.xml, вариант unix-сокета вместо
-TCP — `CRAWLER_WEB_LISTEN=/run/crawler-web/web.sock` в `crawler.env`).
-Через прокси наружу идёт только лендинг: метрики и пробы web
-(`127.0.0.1:9107`) не публикуются (ТЗ §9). HTTP→HTTPS, ACME-проверки
-certbot и заголовки безопасности — в образце; правки под конкретный
-домен — по месту деплоя. Канонический хост лендинга задаётся
-`web.public_host` (T-227, обязательная правка §4.5): sitemap.xml
-собирает абсолютные URL им, а не `Host` запроса (который прокси
-передаёт значением посетителя — без канона `<loc>` зависел бы от
-чужого заголовка; пустое поле — фолбэк на `Host`, для loopback/dev
-без публикации).
+installation, headers, the sitemap.xml scheme, a unix-socket variant instead of
+TCP — `CRAWLER_WEB_LISTEN=/run/crawler-web/web.sock` in `crawler.env`).
+Only the landing page goes out through the proxy: the web metrics and probes
+(`127.0.0.1:9107`) are not published (spec §9). HTTP→HTTPS, certbot's ACME
+checks, and the security headers are in the sample; edits for the specific
+domain are made at the deploy site. The landing page's canonical host is set by
+`web.public_host` (T-227, a required §4.5 edit): sitemap.xml
+builds the absolute URLs with it, not with the request's `Host` (which the proxy
+passes as the visitor's value — without the canon, `<loc>` would depend on a
+foreign header; an empty field — a fallback to `Host`, for loopback/dev
+without publication).
 
-Дашборд (`crawler-dashboard.service`) использует ту же схему (ТЗД §9.1):
-слушает loopback `127.0.0.1:8090`, наружу — отдельный server-блок nginx
-на свой домен/поддомен (например `dashboard.crawler.example.com`); блок
-ниже сокращён до специфичного — server для HTTP→HTTPS с ACME-проверками
-certbot и заголовок HSTS возьмите из блока лендинга выше. TLS обязателен:
-авторизация — HTTP Basic, креды нельзя передавать открытым текстом вне
-loopback (ТЗД §7.1); `X-Real-IP` нужен per-IP защите от подбора (ТЗД
-§7.6 — сервис доверяет заголовку от loopback-пира), `X-Forwarded-Proto` —
-флагу `Secure` cookie-сессии (сервис доверяет заголовку тому же пиру,
-T-227: за входом с TLS браузер не унесёт сессию по plaintext при прямом
-заходе мимо прокси). Флаг ставится в момент выдачи cookie: сессии,
-выданные до включения TLS/XFP, остаются без `Secure` до истечения TTL
-(24 ч) — закрыть их сразу можно сменой `dashboard.password_hash`
-(инвалидирует все сессии). Метрики и пробы
-дашборда (`127.0.0.1:9108`) через прокси не идут:
+The dashboard (`crawler-dashboard.service`) uses the same scheme (dashboard spec §9.1):
+it listens on loopback `127.0.0.1:8090`; to the outside — a separate nginx server block
+for its own domain/subdomain (for example `dashboard.crawler.example.com`); the block
+below is reduced to the specifics — take the server for HTTP→HTTPS with certbot's ACME
+checks and the HSTS header from the landing page block above. TLS is required:
+authorization is HTTP Basic; credentials must not be transmitted in plaintext outside
+loopback (dashboard spec §7.1); `X-Real-IP` is needed for the per-IP brute-force
+protection (dashboard spec §7.6 — the service trusts the header from a loopback peer),
+`X-Forwarded-Proto` — for the `Secure` flag of the cookie session (the service trusts the header from the same peer,
+T-227: behind a TLS entrance the browser will not carry the session over plaintext on a direct
+visit bypassing the proxy). The flag is set at cookie issue time: sessions
+issued before TLS/XFP is enabled stay without `Secure` until their TTL
+expires (24 h) — closing them immediately is possible by changing `dashboard.password_hash`
+(it invalidates all sessions). The dashboard metrics and probes
+(`127.0.0.1:9108`) do not go through the proxy:
 
 ```nginx
 server {
@@ -1043,18 +1039,18 @@ server {
 }
 ```
 
-## 7. Границы комплекта (смежные задачи этапа 9)
+## 7. Set boundaries (adjacent tasks of stage 9)
 
-- **T-086** — тюнинг postgresql-конфига под NVMe (docs/db.md): аллокации
-  сервера обязаны вписываться в `MemoryMax=3G` drop-in'а (включая пики
-  обслуживания — work_mem/maintenance/autovacuum поверх shared_buffers).
-- **T-087** — конфиг redis: `maxmemory` ≤ 512M и eviction — под потолком
-  drop-in'а (eviction раньше OOM).
-- **T-088** — sysctl ядра (`ip_local_port_range`, `tcp_tw_reuse`,
-  `fs.file-max`/`nr_open`, `nf_conntrack`, UDP-буферы). Юниты фиксируют
-  только per-process `LimitNOFILE=65535` — паритет с dev-окружением
-  (`deploy/docker/compose.yaml`, ulimits), потолок sysctl ведёт T-088.
-- **T-089** — диски и SMART — [`disks.md`](disks.md): тома PostgreSQL
-  (`/var/lib/postgresql`) и контента (`/var/lib/crawler/content`) —
-  LVM/ext4/`noatime`, шаг установки §4 выше; мониторинг износа NVMe —
-  smartd + доступ юнита monitor к `/dev/nvme*` (`deploy/smartd/`, §4.8).
+- **T-086** — postgresql config tuning for NVMe (docs/db.md): the server's
+  allocations must fit into the drop-in's `MemoryMax=3G` (including maintenance
+  peaks — work_mem/maintenance/autovacuum on top of shared_buffers).
+- **T-087** — the redis config: `maxmemory` ≤ 512M and eviction — under the
+  drop-in's cap (eviction before OOM).
+- **T-088** — kernel sysctls (`ip_local_port_range`, `tcp_tw_reuse`,
+  `fs.file-max`/`nr_open`, `nf_conntrack`, UDP buffers). The units pin
+  only the per-process `LimitNOFILE=65535` — parity with the dev environment
+  (`deploy/docker/compose.yaml`, ulimits); the sysctl cap is owned by T-088.
+- **T-089** — disks and SMART — [`disks.md`](disks.md): the PostgreSQL
+  volumes (`/var/lib/postgresql`) and content (`/var/lib/crawler/content`) —
+  LVM/ext4/`noatime`, installation step §4 above; NVMe wear monitoring —
+  smartd + the monitor unit's access to `/dev/nvme*` (`deploy/smartd/`, §4.8).
