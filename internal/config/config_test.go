@@ -572,7 +572,7 @@ func TestZoneNameErrorTexts(t *testing.T) {
 	for _, want := range []string{
 		"scheduler.zone_weights",
 		"render.requeue_deprioritized_zones",
-		"TLD в punycode нижним регистром",
+		"a TLD in lowercase punycode",
 		"in, uk; IDN — xn--p1ai",
 	} {
 		if !strings.Contains(msg, want) {

@@ -123,11 +123,11 @@ func TestUpdate_BuildValidation(t *testing.T) {
 		b        *UpdateBuilder
 		problems []string
 	}{
-		{"без ключей", Update("domains").SetExpr("a = 1"), []string{"ключи"}},
-		{"без присваиваний", Update("domains").Key(Column{Name: "id", Type: "int8"}), []string{"присваивания"}},
-		{"без таблицы", Update("").Key(Column{Name: "id", Type: "int8"}).SetExpr("a = 1"), []string{"таблица"}},
-		{"без типа колонки", Update("domains").Key(Column{Name: "id"}).SetExpr("a = 1"), []string{"SQL-тип"}},
-		{"без имени колонки", Update("domains").Key(Column{Name: "", Type: "int8"}).SetExpr("a = 1"), []string{"пустым именем"}},
+		{"без ключей", Update("domains").SetExpr("a = 1"), []string{"keys not set"}},
+		{"без присваиваний", Update("domains").Key(Column{Name: "id", Type: "int8"}), []string{"no assignments"}},
+		{"без таблицы", Update("").Key(Column{Name: "id", Type: "int8"}).SetExpr("a = 1"), []string{"table not set"}},
+		{"без типа колонки", Update("domains").Key(Column{Name: "id"}).SetExpr("a = 1"), []string{"SQL type not set"}},
+		{"без имени колонки", Update("domains").Key(Column{Name: "", Type: "int8"}).SetExpr("a = 1"), []string{"empty name"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

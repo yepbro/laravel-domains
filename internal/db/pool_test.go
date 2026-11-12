@@ -117,10 +117,10 @@ func TestBuildPoolConfig_Validation(t *testing.T) {
 		opts Options
 		want string // a substring of the expected error
 	}{
-		{"пустой DSN", Options{}, "пустой DSN"},
+		{"пустой DSN", Options{}, "empty PostgreSQL DSN"},
 		{"отрицательный pool_size", Options{DSN: testDSN, PoolSize: -1}, "out of range"},
 		{"pool_size больше лимита", Options{DSN: testDSN, PoolSize: MaxPoolSize + 1}, "out of range"},
-		{"битый DSN", Options{DSN: "://not-a-dsn"}, "разбор DSN"},
+		{"битый DSN", Options{DSN: "://not-a-dsn"}, "parsing DSN"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -85,7 +85,7 @@ func TestCopyFrom_Validation(t *testing.T) {
 		t.Errorf("пустая пачка привела к вызовам БД: %v", f.batches)
 	}
 
-	if _, err := CopyFrom(ctx, f, testTable, nil, simpleRows(1)); err == nil || !strings.Contains(err.Error(), "columns") {
+	if _, err := CopyFrom(ctx, f, testTable, nil, simpleRows(1)); err == nil || !strings.Contains(err.Error(), "column") {
 		t.Errorf("пустой список колонок: err = %v, want ошибка про колонки", err)
 	}
 
