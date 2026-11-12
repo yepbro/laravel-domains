@@ -5,6 +5,7 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -48,7 +49,7 @@ func TestSeedBulk(t *testing.T) {
 	if code := run(args, &stdout, &stderr); code != exitOK {
 		t.Fatalf("seed --bulk: code = %d, stderr:\n%s", code, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "bulk %d domains", bulk) {
+	if !strings.Contains(stdout.String(), fmt.Sprintf("bulk %d domains", bulk)) {
 		t.Errorf("stdout without the bulk total:\n%s", stdout.String())
 	}
 

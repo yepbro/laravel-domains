@@ -713,7 +713,7 @@ func TestWriteDomainText(t *testing.T) {
 		"  rules:       version 42, updated 2026-10-16 09:01:00\n",
 		"  firings (is_laravel = true):\n",
 		"    (apex) main  score 1.250, versions 11.0 – 11.4:\n",
-		"      cookie_xsrf (+0.500): \"Set-Cookie: XSRF-TOKEN=eyJ...\"\n",
+		"      cookie_xsrf (+0.500): \"Set-Cookie: XSRF-TOKEN=eyJ…\"\n",
 		"      header_laravel (+0.750): \"X-Laravel-Version: 11\"\n",
 		"  weak firings (is_laravel = false, score < 0.600):\n",
 		"    www main  score 0.250:\n",

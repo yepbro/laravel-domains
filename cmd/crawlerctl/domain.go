@@ -427,7 +427,7 @@ func writeDomainText(w io.Writer, info domainInfo, minScore float64) {
 
 	out(w, "domain:        %s\n", d.Name)
 	if u := idn.ToUnicode(d.Name); u != d.Name {
-		out(w, "unicode:      %s\n", u)
+		out(w, "unicode:       %s\n", u)
 	}
 	if z.NameUnicode != "" && z.NameUnicode != z.Name {
 		out(w, "zone:          %s (unicode: %s, id %d)\n", z.Name, z.NameUnicode, z.ID)
