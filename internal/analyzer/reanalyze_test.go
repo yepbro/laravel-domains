@@ -1389,36 +1389,36 @@ func TestReanalyzeNilArgs(t *testing.T) {
 		{"a pass without a pool", func() error {
 			_, err := ReanalyzeOnce(context.Background(), nil, &reanQueue{}, 1, nil, ReanalyzeOptions{})
 			return err
-		}, "the pool is not set"},
+		}, "pool is not set"},
 		{"a pass without a queue", func() error {
 			_, err := ReanalyzeOnce(context.Background(), newReanPool(), nil, 1, nil, ReanalyzeOptions{})
 			return err
-		}, "the queue is not set"},
+		}, "queue is not set"},
 		{"a drain without a pool", func() error {
 			_, err := ReanalyzeDrain(context.Background(), nil, &reanQueue{}, 1, nil, ReanalyzeOptions{})
 			return err
-		}, "the pool is not set"},
+		}, "pool is not set"},
 		{"a drain without a queue", func() error {
 			_, err := ReanalyzeDrain(context.Background(), newReanPool(), nil, 1, nil, ReanalyzeOptions{})
 			return err
-		}, "the queue is not set"},
+		}, "queue is not set"},
 		{"a loop without a pool", func() error {
 			return ReanalyzeLoop(context.Background(), nil, &reanQueue{}, newReanSource(1), ReanalyzeOptions{})
-		}, "the pool is not set"},
+		}, "pool is not set"},
 		{"a loop without a queue", func() error {
 			return ReanalyzeLoop(context.Background(), newReanPool(), nil, newReanSource(1), ReanalyzeOptions{})
-		}, "the queue is not set"},
+		}, "queue is not set"},
 		{"a loop without a rules source", func() error {
 			return ReanalyzeLoop(context.Background(), newReanPool(), &reanQueue{}, nil, ReanalyzeOptions{})
-		}, "the rule set source is not set"},
+		}, "rule set source is not set"},
 		{"a tick without a pool", func() error {
 			_, err := ReanalyzeTick(context.Background(), nil, &reanQueue{}, 1, &ReanalyzeCursor{}, ReanalyzeOptions{})
 			return err
-		}, "the pool is not set"},
+		}, "pool is not set"},
 		{"a tick without a queue", func() error {
 			_, err := ReanalyzeTick(context.Background(), newReanPool(), nil, 1, &ReanalyzeCursor{}, ReanalyzeOptions{})
 			return err
-		}, "the queue is not set"},
+		}, "queue is not set"},
 	} {
 		if err := check.call(); err == nil || !strings.Contains(err.Error(), check.want) {
 			t.Errorf("%s: the error = %v, want %q", check.name, err, check.want)
@@ -1510,7 +1510,7 @@ func TestZoneIDByName(t *testing.T) {
 	}
 
 	id, _, err = ZoneIDByName(context.Background(), nil, "x.test")
-	if err == nil || !strings.Contains(err.Error(), "the pool is not set") {
+	if err == nil || !strings.Contains(err.Error(), "pool is not set") {
 		t.Errorf("the error = %v, want «the pool is not set»", err)
 	}
 	if id != 0 {
