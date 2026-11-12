@@ -314,3 +314,11 @@ of scope (waiting for upstream #4151 — one browser context per connection).
   moli) the synchronous probes give false positives; keep the sync probe as
   an engine-branched case —
   [details](task/T-275-block-trackers-async-probes.md).
+
+## Этап 46: block_trackers — sync-зонд на exact-URL семантике moli #2729 (T-276)
+
+- **T-276** [новая] — P1, схлопнуть движко-ветвление sync-зонда после
+  мержа #2729: мейнтейнер ввёл точный матчинг URL для sync-XHR (совпадение
+  → блокировка, включая редиректы), tracker-зонд блокируется на обоих
+  движках — ожидание «moli: 200 в сеть» устарело —
+  [подробности](task/T-276-block-trackers-sync-exact-url.md).
