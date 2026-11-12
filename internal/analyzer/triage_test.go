@@ -277,7 +277,7 @@ func TestAggregateNoFindingsNoUpsert(t *testing.T) {
 // TestReanalyzeMatureTailsErrors — guard query errors: Query/Scan/Err
 // and an empty response — errors with zero values (a pin of zeros on
 // each branch); a connection drop before the first row is an
-// iteration error, not an "empty response".
+// iteration error, not an "empty aggregate response".
 func TestReanalyzeMatureTailsErrors(t *testing.T) {
 	// A Query error.
 	pool := newReanPool()
@@ -291,7 +291,7 @@ func TestReanalyzeMatureTailsErrors(t *testing.T) {
 	pool2.guardEmpty = true
 	if tails, hour, err := reanalyzeMatureTails(context.Background(), pool2); err == nil ||
 		tails != 0 || !hour.IsZero() ||
-		!strings.Contains(err.Error(), "empty response") {
+		!strings.Contains(err.Error(), "empty aggregate response") {
 		t.Errorf("the empty response: (%v/%v, %v), want zeros and «empty response»", tails, hour, err)
 	}
 	// A drop before the first row (rows.Err on an empty set) is an
