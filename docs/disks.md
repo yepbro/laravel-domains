@@ -1,151 +1,159 @@
-# Диски боевого сервера: тома PostgreSQL и контента, SMART/TBW (ТЗ §10.3)
+# Production server disks: the PostgreSQL and content volumes, SMART/TBW (spec §10.3)
 
-Раскладка дисков и мониторинг износа накопителя целевого сервера
-(Ubuntu Server LTS, systemd — ТЗ §10.1; одна NVMe с запасом места — §3.1).
-Комплект SMART-мониторинга — [`deploy/smartd/`](../deploy/smartd/)
-(конфиг smartd, обработчик предупреждений, udev-правило и drop-in юнита
-monitor); точки монтирования и права согласованы с юнитами T-085
-([`deploy.md`](deploy.md), [`deploy/systemd/`](../deploy/systemd/)).
-Смежное: тюнинг PostgreSQL, влияющий на запись WAL, — T-086
-([`db.md`](db.md)); отказ Redis от персистентности — T-087
-([`redis.md`](redis.md)); sysctl — T-088 ([`os-tuning.md`](os-tuning.md)).
+The disk layout and drive wear monitoring of the target server
+(Ubuntu Server LTS, systemd — spec §10.1; a single NVMe with spare
+capacity — §3.1). The SMART monitoring kit is
+[`deploy/smartd/`](../deploy/smartd/) (the smartd config, the warning
+handler, the udev rule and the monitor unit drop-in); the mount points
+and permissions are aligned with the T-085 units ([`deploy.md`](deploy.md),
+[`deploy/systemd/`](../deploy/systemd/)). Related: the PostgreSQL tuning
+that affects WAL writes — T-086 ([`db.md`](db.md)); Redis giving up
+persistence — T-087 ([`redis.md`](redis.md)); sysctl — T-088
+([`os-tuning.md`](os-tuning.md)).
 
-ТЗ §10.3 — два требования, оба закрыты здесь:
+Spec §10.3 — two requirements, both covered here:
 
-1. **Отдельные каталоги/тома для PostgreSQL и пак-файлов контента** —
-   раздел «Раскладка» ниже;
-2. **Мониторинг SMART и износа NVMe (TBW)** — оценка нагрузки записи
-   («Оценка TBW») и два слоя наблюдения («Мониторинг SMART и TBW»).
+1. **Separate directories/volumes for PostgreSQL and the content pack
+   files** — the "Layout" section below;
+2. **SMART and NVMe wear monitoring (TBW)** — the write load estimate
+   ("The TBW estimate") and the two observation layers ("SMART and TBW
+   monitoring").
 
-## 1. Зачем раздельные тома (и чего они не дают)
+## 1. Why separate volumes (and what they do not give)
 
-Сервер один и накопитель один (§3.1) — физически разнести запись WAL и
-контент по разным устройствам нельзя. Честная фиксация: **износ NVMe
-уменьшается не раскладкой, а объёмом записи** — wear-leveling
-перераспределяет записи по всей плашке независимо от номеров LBA, тома в
-этом плане ничего не меняют. Износ ограничивают конфигурации записи
-(checkpoint 15 мин и `wal_compression` — T-086; выключенная персистентность
-Redis — T-087) и наблюдается SMART-мониторингом ниже.
+There is one server and one drive (§3.1) — physically spreading the WAL
+writes and the content across different devices is impossible. An honest
+statement: **NVMe wear is reduced not by the layout but by the write
+volume** — wear-leveling redistributes writes across the whole die
+regardless of LBA numbers; volumes change nothing in this respect. Wear
+is limited by the write configurations (a 15 min checkpoint and
+`wal_compression` — T-086; Redis persistence turned off — T-087) and is
+observed by the SMART monitoring below.
 
-Что раздельные тома дают практически:
+What separate volumes give in practice:
 
-| Выгода | Механика |
+| Benefit | Mechanics |
 |---|---|
-| Изоляция заполнения | Контент — самый непредсказуемый потребитель места (жирные страницы, слабый дедуп отдельных зон, компактификация). Заполнив общий том с PGDATA, он остановил бы PostgreSQL: WAL не растёт, autovacuum и запись результатов встают — падает источник истины (§3.4). Раздельно заполнение тома контента включает штатную паузу `Put` (`content.disk_free_percent`, ТЗ §8): результаты пишутся, краулер деградирует проектным образом, а не аварией |
-| Точный порог диска | `statfs` каталога `content.dir` (пауза `Put` и алерт `disk_free` T-080) измеряет именно том контента. На общем томе предупреждение «мало места» срабатывало бы из-за чужого роста (WAL при массовом recheck, база) — рассинхрон с реальной паузой записи контента |
-| Независимые опции | `noatime`, проверки fsck, отдельный контроль заполнения и темп роста на том |
-| Эволюция | При добавлении второй NVMe том переносится целиком (`pvmove` или новый PV в группе) без перемонтажки путей и правок конфигурации сервисов |
+| Fill isolation | Content is the most unpredictable consumer of space (fat pages, weak dedup of individual zones, compaction). Having filled the volume shared with PGDATA, it would have stopped PostgreSQL: WAL does not grow, autovacuum and result writing stall — the source of truth goes down (§3.4). Separately, the content volume filling triggers the regular `Put` pause (`content.disk_free_percent`, spec §8): results are written, the crawler degrades as designed, not with a crash |
+| A precise disk threshold | `statfs` of the `content.dir` directory (the `Put` pause and the `disk_free` alert, T-080) measures exactly the content volume. On a shared volume the "low space" warning would fire because of someone else's growth (WAL during a mass recheck, the database) — a desync with the actual content write pause |
+| Independent options | `noatime`, fsck checks, separate fill monitoring and the growth rate per volume |
+| Evolution | When a second NVMe is added, the volume is moved as a whole (`pvmove` or a new PV in the group) without remounting paths or editing service configurations |
 
-Обратное верно и в другую сторону: разгон WAL (массовый recheck, ingest
-новых зон) не съедает место под пак-файлы.
+The converse holds the other way too: a WAL burst (a mass recheck, ingest
+of new zones) does not eat the space for pack files.
 
-## 2. Раскладка: LVM, ext4, noatime
+## 2. The layout: LVM, ext4, noatime
 
-### LVM, а не разделы
+### LVM, not partitions
 
-Решение: логические тома **LVM** поверх раздела NVMe с данными.
+The decision: **LVM** logical volumes on top of the NVMe data partition.
 
-- **online-resize**: контент растёт и растёт непредсказуемо (расчёт — §3);
-  расширение тома добавлением свободных экстентов (`lvextend -r`) — без
-  простоя; раздел на GPT растится только со свободным местом следом и с
-  вознёй с таблицей;
-- перенос на большее устройство: `pvmove` (даже по сети) либо новый PV в
-  ту же VG — пути и права не меняются;
-- LVM — стандарт установщика Ubuntu Server, ничего доустанавливать не
-  нужно.
+- **online-resize**: content grows and grows unpredictably (the estimate
+  — §3); extending a volume by adding free extents (`lvextend -r`) —
+  without downtime; a GPT partition grows only into free space right
+  next to it and with partition-table gymnastics;
+- moving to a larger device: `pvmove` (even over the network) or a new
+  PV in the same VG — the paths and permissions do not change;
+- LVM is the Ubuntu Server installer's default; nothing needs to be
+  installed on top.
 
-### ext4, а не XFS
+### ext4, not XFS
 
-Решение: **ext4** для обоих томов.
+The decision: **ext4** for both volumes.
 
-- дефолт дистрибутива, проверенная связка с пакетным PostgreSQL;
-- пак-файлы пишутся строго последовательно и единственным писателем в
-  момент времени (flock `.packs.lock`, [`content.md`](content.md)
-  «Конкурентная запись») — параллельные аллокации XFS не реализуются,
-  преимущества нечем монетизировать;
-- ext4 умеет online-shrink (XFS — нет): перебалансировка томов без
-  выноса данных;
-- XFS силён на десятках параллельных крупных файлов — не наш паттерн
-  (один активный пак + случайные чтения `ReadAt` из закрытых).
+- the distribution default, a proven pairing with the packaged
+  PostgreSQL;
+- pack files are written strictly sequentially and by a single writer at
+  a time (the flock `.packs.lock`, [`content.md`](content.md)
+  "Concurrent writing") — XFS's parallel allocations are not exercised,
+  there is nothing to monetize their advantage with;
+- ext4 can online-shrink (XFS cannot): volume rebalancing without moving
+  the data out;
+- XFS is strong on dozens of parallel large files — not our pattern (one
+  active pack + random `ReadAt` reads from closed ones).
 
-### Тома и точки монтирования
+### Volumes and mount points
 
-| Том LV | Точка монтирования | ФС, метка | Опции | Что живёт |
+| LV volume | Mount point | FS, label | Options | What lives there |
 |---|---|---|---|---|
-| `/dev/vg-crawler/pg` | `/var/lib/postgresql` | ext4, `crawler-pg` | `noatime` | PGDATA и `pg_wal` пакетного PG (`/var/lib/postgresql/<версия>/<кластер>`) |
-| `/dev/vg-crawler/content` | `/var/lib/crawler/content` | ext4, `crawler-content` | `noatime` | пак-файлы контента, словарь zstd (T-085 §3) |
+| `/dev/vg-crawler/pg` | `/var/lib/postgresql` | ext4, `crawler-pg` | `noatime` | PGDATA and `pg_wal` of the packaged PG (`/var/lib/postgresql/<version>/<cluster>`) |
+| `/dev/vg-crawler/content` | `/var/lib/crawler/content` | ext4, `crawler-content` | `noatime` | the content pack files, the zstd dictionary (T-085 §3) |
 
-Корневая ФС (система, `/opt/crawler`, `incoming/`) — отдельно; её не
-трогаем. Имена: VG `vg-crawler`, LV `pg` и `content`.
+The root FS (the system, `/opt/crawler`, `incoming/`) is separate; we do
+not touch it. The names: VG `vg-crawler`, LVs `pg` and `content`.
 
-**WAL не выносится в отдельный том**: на одном накопителе это не разделяет
-износ (wear-leveling устройства), а лишь добавляет точку заполнения и
-пересчёт размеров; объём WAL ограничен конфигом (`max_wal_size` 8 ГБ,
-T-086). Вынос `pg_wal` актуален со второй NVMe — тогда же, когда и контент.
+**WAL is not moved to a separate volume**: on a single drive it does not
+split the wear (wear-leveling is per device) and only adds another
+filling point and a size recalculation; the WAL volume is capped by
+config (`max_wal_size` 8 GB, T-086). Moving `pg_wal` out becomes
+relevant with a second NVMe — at the same time as content.
 
-`noatime` на оба тома: обращения к времени последнего чтения нет ни у
-PostgreSQL, ни у читателей паков (анализатор, `crawlerctl domain
---content`); дефолтный `relatime` пишет atime раз в сутки на файл — мелочь,
-но `noatime` бесплатен и убирает её целиком.
+`noatime` on both volumes: neither PostgreSQL nor the pack readers (the
+analyzer, `crawlerctl domain --content`) use the last-access time; the
+default `relatime` writes atime once a day per file — a trifle, but
+`noatime` is free and removes it entirely.
 
-TRIM: периодический `fstrim.timer` (включён в Ubuntu по умолчанию)
-сохраняется — через device-mapper discard проходит, сборщику мусора NVMe
-помогает. Непрерывный discard опцией монтирования не используется
-(периодического достаточно, меньше помех на горячей записи).
+TRIM: the periodic `fstrim.timer` (enabled in Ubuntu by default) is kept
+— discard passes through device-mapper and helps the NVMe garbage
+collector. Continuous discard as a mount option is not used (the
+periodic one is enough, fewer disturbances on hot writes).
 
-## 3. Размеры томов (расчёт от плановых объёмов)
+## 3. Volume sizes (estimated from the planned volumes)
 
-Оценки грубые (допущения — в скобках), точные значения даст эксплуатация
-первого цикла (замеры ТЗ §11.3); LVM выбран как раз затем, чтобы ошибку
-исправлял `lvextend`, а не переустановка.
+The estimates are rough (the assumptions are in parentheses); exact
+values will come from operating the first cycle (the spec §11.3
+measurements); LVM was chosen precisely so that a mistake is fixed by
+`lvextend`, not a reinstall.
 
-### PostgreSQL ≈ 0,3 ТБ живых данных
+### PostgreSQL ≈ 0.3 TB of live data
 
-| Составляющая | Расчёт | Объём |
+| Component | Estimate | Size |
 |---|---|---|
-| `domains` | 350 млн строк × ~190 Б (куча ~120 Б с fillfactor 85 + PK, уникальный `(zone_id, label)`, частичный `check_state=0`) | ≈ 65 ГБ |
-| `subdomain_results` | 350 млн × ~50 % делегированных × 2–3 записи (субдомены × варианты) × ~300 Б с индексами | ≈ 100–160 ГБ |
-| `contents` | 150–300 млн уникальных хэшей × ~80 Б | ≈ 12–25 ГБ |
-| `laravel_*` | единицы процентов доменов × ~300 Б | ≈ 5–15 ГБ |
-| WAL + bloat | ≤ 8 ГБ сегментов (T-086) + ~15 % мусора (автовакуум 0.02) | ≈ 30–50 ГБ |
-| **итого** | | **≈ 0,2–0,3 ТБ** |
+| `domains` | 350M rows × ~190 B (the heap ~120 B with fillfactor 85 + the PK, the unique `(zone_id, label)`, the partial `check_state=0`) | ≈ 65 GB |
+| `subdomain_results` | 350M × ~50% delegated × 2–3 records (subdomains × variants) × ~300 B with indexes | ≈ 100–160 GB |
+| `contents` | 150–300M unique hashes × ~80 B | ≈ 12–25 GB |
+| `laravel_*` | single-digit percents of domains × ~300 B | ≈ 5–15 GB |
+| WAL + bloat | ≤ 8 GB of segments (T-086) + ~15% junk (autovacuum 0.02) | ≈ 30–50 GB |
+| **total** | | **≈ 0.2–0.3 TB** |
 
-Том `pg`: **0,5–1 ТБ** — запас на рост справочника зон и статистику
-(`pg_stat_statements`).
+The `pg` volume: **0.5–1 TB** — headroom for the zone reference table's
+growth and statistics (`pg_stat_statements`).
 
-### Контент ≈ 5–15 ТБ живых блоков
+### Content ≈ 5–15 TB of live blocks
 
-350 млн × ~50 % доменов с контентом × ~2 страницы × 20–60 КБ блока zstd
-(сырой HTML 100–300 КБ × сжатие 4–6 со словарём) = 7–21 ТБ − ~20–30 %
-дедупликации парковок (ТЗ §8) ≈ **5–15 ТБ живых блоков на первый цикл**;
-в отдельных зонах дедуп бывает жирнее — оценка скорее верхняя. До первой
-компактификации место занимают и мёртвые блоки перепроверок (T-045).
+350M × ~50% of domains with content × ~2 pages × 20–60 KB per zstd block
+(raw HTML 100–300 KB × 4–6 compression with a dictionary) = 7–21 TB −
+~20–30% parking deduplication (spec §8) ≈ **5–15 TB of live blocks for
+the first cycle**; dedup can be fatter in individual zones — the
+estimate is rather an upper bound. Until the first compaction, the space
+is also taken by the dead blocks of rechecks (T-045).
 
-Том `content`: **весь остаток диска**. Примеры раскладок:
+The `content` volume: **the entire rest of the disk**. Layout examples:
 
 | NVMe | root | `pg` | `content` |
 |---|---|---|---|
-| 4 ТБ | 100 ГБ | 1 ТБ | ≈ 2,9 ТБ — впритык: расчётный контент не влезает, парирование — компактификация и `disk_free_percent` (пауза записи по ТЗ §8); брать такой диск только осознанно |
-| 8 ТБ | 100 ГБ | 1 ТБ | ≈ 6,9 ТБ — рабочий минимум «места много» (§3.1) |
-| 4 ТБ + вторая 4 ТБ | 100 ГБ | 1 ТБ | вторая NVMe — новый PV в VG, `content` переносится на него целиком (`pvmove`): тома не перемешиваются по накопителям, отказ одного затрагивает один том |
+| 4 TB | 100 GB | 1 TB | ≈ 2.9 TB — tight: the estimated content does not fit; the counter is compaction and `disk_free_percent` (the write pause per spec §8); take such a disk only deliberately |
+| 8 TB | 100 GB | 1 TB | ≈ 6.9 TB — the working minimum of "plenty of space" (§3.1) |
+| 4 TB + a second 4 TB | 100 GB | 1 TB | the second NVMe — a new PV in the VG, `content` moves onto it as a whole (`pvmove`): the volumes are not mixed across drives, one drive's failure affects one volume |
 
-## 4. Установка раскладки
+## 4. Setting up the layout
 
-Команды от root. Порядок с [`deploy.md`](deploy.md) §4: **сначала тома,
-потом пакеты** — PG-кластер создаётся при установке пакета прямо в
-`/var/lib/postgresql`, смонтированный позже том спрячет данные на корневой
-ФС.
+Commands run as root. The order per [`deploy.md`](deploy.md) §4:
+**volumes first, packages second** — the PG cluster is created at
+package installation directly in `/var/lib/postgresql`; a volume mounted
+later would hide the data on the root FS.
 
-### Свежий сервер (при установке ОС)
+### A fresh server (at OS installation)
 
-В разметке установщика Ubuntu: GPT, раздел EFI, `/` (root ~100 ГБ; swap
-по вкусу) — хвост диска не размечается. После установки на свободном месте
-создаётся раздел данных (в установщике как «без файловой системы» либо
-любым инструментом после; ниже предполагается `/dev/nvme0n1p4` — номер
-подставьте по факту, `lsblk`):
+In the Ubuntu installer's partitioning: GPT, an EFI partition, `/`
+(root ~100 GB; swap to taste) — the tail of the disk is left
+unpartitioned. After installation a data partition is created in the
+free space (in the installer as "without a file system", or with any
+tool afterwards; below `/dev/nvme0n1p4` is assumed — substitute the
+actual number, `lsblk`):
 
 ```bash
-pvcreate /dev/nvme0n1p4                     # раздел под данные
+pvcreate /dev/nvme0n1p4                     # the data partition
 vgcreate vg-crawler /dev/nvme0n1p4
 lvcreate -n pg -L 1T vg-crawler
 lvcreate -n content -l 100%FREE vg-crawler
@@ -153,49 +161,49 @@ mkfs.ext4 -L crawler-pg /dev/vg-crawler/pg
 mkfs.ext4 -L crawler-content /dev/vg-crawler/content
 ```
 
-`/etc/fstab` (путём меток — читаемо и переживает пересортировку имён):
+`/etc/fstab` (by labels — readable and survives name reordering):
 
 ```
 LABEL=crawler-pg       /var/lib/postgresql        ext4 noatime 0 2
 LABEL=crawler-content  /var/lib/crawler/content   ext4 noatime 0 2
 ```
 
-Точки монтирования и права (согласовано с T-085 §3–4):
+Mount points and permissions (aligned with T-085 §3–4):
 
 ```bash
 install -d /var/lib/postgresql /var/lib/crawler/content
-mount /var/lib/postgresql                  # по записям fstab
-mount /var/lib/crawler/content             # (или mount -a)
+mount /var/lib/postgresql                  # per the fstab entries
+mount /var/lib/crawler/content             # (or mount -a)
 chown postgres:postgres /var/lib/postgresql && chmod 0750 /var/lib/postgresql
 install -d -o root -g crawler -m 2775 /var/lib/crawler/content
 ```
 
-PGDATA внутри создаёт пакет при `apt install postgresql`
-(`pg_createcluster`); контент-каталог — setgid root:crawler, как в
-deploy.md §4.4: два юнита-писателя (http/render-worker) и читатели
-(analyzer, crawlerctl) работают без перекладки прав.
+The package creates the PGDATA inside at `apt install postgresql`
+(`pg_createcluster`); the content directory is setgid root:crawler, as
+in deploy.md §4.4: two writer units (http/render-worker) and the readers
+(analyzer, crawlerctl) work without permission juggling.
 
-### Существующий сервер
+### An existing server
 
-Свободные экстенты в группе томов (установщик Ubuntu при стандартной
-LVM-схеме часто оставляет место нераспределённым; имя VG покажет `vgs` —
-дефолт установщика `ubuntu-vg`):
+Free extents in the volume group (the Ubuntu installer with the standard
+LVM scheme often leaves space unallocated; the VG name is shown by
+`vgs` — the installer default `ubuntu-vg`):
 
 ```bash
-vgs                                       # VFree — сколько доступно
-lvcreate -n pg -L 1T ubuntu-vg            # VG боевого сервера
+vgs                                       # VFree — how much is available
+lvcreate -n pg -L 1T ubuntu-vg            # the production server's VG
 lvcreate -n content -l 100%FREE ubuntu-vg
 ```
 
-Без свободных экстентов — добавить раздел или вторую NVMe в VG:
+Without free extents — add a partition or a second NVMe to the VG:
 
 ```bash
 pvcreate /dev/nvme0n1p4 /dev/nvme1n1
 vgextend vg-crawler /dev/nvme0n1p4 /dev/nvme1n1
 ```
 
-Миграция данных (остановить сервисы; паки — обычные файлы, rsync по ним
-консистентен только при остановленных писателях):
+Data migration (stop the services; packs are regular files — rsync over
+them is consistent only with the writers stopped):
 
 ```bash
 systemctl stop postgresql crawler.target
@@ -203,154 +211,158 @@ mkfs.ext4 -L crawler-pg /dev/vg-crawler/pg
 mount /dev/vg-crawler/pg /mnt
 rsync -aHAX /var/lib/postgresql/ /mnt/
 umount /mnt
-mount -a                                  # поднимает тома по fstab
+mount -a                                  # brings the volumes up per fstab
 systemctl start postgresql crawler.target
 ```
 
-Старое содержимое `/var/lib/postgresql` остаётся на корневой ФС под точкой
-монтирования — удалить после проверки. Контент переносится так же
-(`/var/lib/crawler/content`).
+The old contents of `/var/lib/postgresql` remain on the root FS under
+the mount point — delete them after verification. Content is moved the
+same way (`/var/lib/crawler/content`).
 
-### Проверка
+### Verification
 
 ```bash
-findmnt /var/lib/postgresql /var/lib/crawler/content   # SOURCE, опции noatime
-lsblk -f                                                # тома, метки, точки
-df -T /var/lib/postgresql /var/lib/crawler/content      # отдельные ёмкости
-sudo -u postgres psql -c 'SHOW data_directory;'         # PGDATA на томе pg
+findmnt /var/lib/postgresql /var/lib/crawler/content   # SOURCE, the noatime options
+lsblk -f                                                # the volumes, labels, mount points
+df -T /var/lib/postgresql /var/lib/crawler/content      # the separate capacities
+sudo -u postgres psql -c 'SHOW data_directory;'         # PGDATA on the pg volume
 sudo -u crawler-http-worker test -w /var/lib/crawler/content && echo ok
 ```
 
-Последняя строка — запись контента доступна юниту-писателю (группа
-`crawler`, T-085); `data_directory` пакета Ubuntu —
-`/var/lib/postgresql/<версия>/<кластер>` (например `16/main`).
+The last line — content writing is available to the writer unit (the
+`crawler` group, T-085); the Ubuntu package's `data_directory` is
+`/var/lib/postgresql/<version>/<cluster>` (e.g. `16/main`).
 
-## 5. Оценка TBW по нагрузке краулера
+## 5. The TBW estimate from the crawler load
 
-ТЗ §10.3 требует мониторинга износа, «так как нагрузка записи высокая».
-Оценка снизу — по конфигурационным объёмам проекта.
+Spec §10.3 requires wear monitoring, "since the write load is high". The
+estimate is a lower bound based on the project's configured volumes.
 
 ### PostgreSQL
 
-Запись тома за первый цикл (350 млн доменов, недели — §3.3):
+The volume's writes over the first cycle (350M domains, weeks — §3.3):
 
-| Поток | Расчёт | Объём |
+| Stream | Estimate | Size |
 |---|---|---|
-| WAL: ingest | COPY 350 млн строк + индексы × ~1,5 | ≈ 45–70 ГБ |
-| WAL: статусы | 2–3 апдейта на домен (pending→queued→done) × ~150 Б новой версии (HOT, индексы не пишутся) | ≈ 100–160 ГБ |
-| WAL: результаты | вставки/обновления `subdomain_results`, `contents`, `laravel_*` | ≈ 100–170 ГБ |
-| full-page images | чекпойнты раз в 15 мин, `wal_compression=on` — +30–50 % к записи страниц после чекпойнта | ×1,3–1,5 к данным |
-| грязные страницы | данные пишутся и в файлы (двойная запись: WAL + checkpoint) | ≈ объём данных ≈ 0,3 ТБ |
-| **итого записи тома** | | **≈ 0,5–1 ТБ за первый цикл** |
+| WAL: ingest | the COPY of 350M rows + indexes × ~1.5 | ≈ 45–70 GB |
+| WAL: statuses | 2–3 updates per domain (pending→queued→done) × ~150 B per new version (HOT, indexes are not written) | ≈ 100–160 GB |
+| WAL: results | inserts/updates of `subdomain_results`, `contents`, `laravel_*` | ≈ 100–170 GB |
+| full-page images | checkpoints every 15 min, `wal_compression=on` — +30–50% to the page writes after a checkpoint | ×1.3–1.5 on data |
+| dirty pages | the data is written to the files too (a double write: WAL + checkpoint) | ≈ the data volume ≈ 0.3 TB |
+| **total volume writes** | | **≈ 0.5–1 TB over the first cycle** |
 
-Стеди-стейт (перепроверка раз в 6 месяцев — §3.3): те же потоки размазаны
-на ~180 дней → **~3–6 ГБ/день**. `synchronous_commit=off` объём не меняет —
-он режет число fsync, не байты (T-086).
+Steady state (a recheck every 6 months — §3.3): the same streams spread
+over ~180 days → **~3–6 GB/day**. `synchronous_commit=off` does not
+change the volume — it cuts the number of fsyncs, not the bytes (T-086).
 
-### Контент
+### Content
 
-| Поток | Расчёт | Объём |
+| Stream | Estimate | Size |
 |---|---|---|
-| заполнение | все живые страницы первого цикла (§3) | ≈ 5–15 ТБ |
-| churn перепроверок | неизменные страницы не пишутся вовсе (Put по тому же хэшу → `refcount+1`, `content.md`); меняются 20–40 % | ≈ 2–8 ТБ/полгода |
-| компактификация | переписывает живые блоки паков с долей живых < 50 % (T-045) | ≈ +50–100 % churn |
-| **итого записи** | | **≈ 5–15 ТБ/полгода** |
+| fill | all the live pages of the first cycle (§3) | ≈ 5–15 TB |
+| recheck churn | unchanged pages are not written at all (a Put by the same hash → `refcount+1`, `content.md`); 20–40% change | ≈ 2–8 TB per half a year |
+| compaction | rewrites the live blocks of packs whose live share is < 50% (T-045) | ≈ +50–100% churn |
+| **total writes** | | **≈ 5–15 TB per half a year** |
 
-Redis не пишет на диск вовсе (персистентность выключена — T-087), Unbound
-— кэш в памяти, journald — копейки.
+Redis does not write to disk at all (persistence is off — T-087),
+Unbound keeps a cache in memory, journald — pennies.
 
-### Вывод
+### Conclusion
 
-**Порядка 10–30 ТБ записи в год** против TBW типовых consumer NVMe
-2–4 ТБ (600–2400 ТБ) — запас в десятки раз. Износ не лимитирует срок
-службы при проектных объёмах, но контроль обязателен (§10.3): реальные
-страницы жирнее среднего, дешёвые OEM-накопители имеют кратно меньший
-TBW, а фактический износ — не расчётный. Контрольные точки:
-`percentage_used` ≥ 90 % (алерт monitor, T-080) и 95 % (smartd на
-smartmontools ≥ 7.5), критические состояния — critical warning/available
-spare (smartd `-H`).
+**On the order of 10–30 TB of writes per year** against the TBW of
+typical consumer NVMe drives — 600–2400 TB for 2–4 TB models — a margin
+of tens of times. Wear does not limit the service life at the designed
+volumes, but monitoring is mandatory (§10.3): real pages are fatter than
+average, cheap OEM drives have a multiple lower TBW, and actual wear is
+not the estimated one. Control points: `percentage_used` ≥ 90% (the
+monitor alert, T-080) and 95% (smartd on smartmontools ≥ 7.5); critical
+states — critical warning/available spare (smartd `-H`).
 
-## 6. Мониторинг SMART и TBW
+## 6. SMART and TBW monitoring
 
-Два слоя, дополняющие друг друга; предупреждающий канал один —
-syslog/journald, та же лента, что у всех сервисов (T-085): оператор читает
-один журнал.
+Two layers complementing each other; there is one warning channel —
+syslog/journald, the same feed as all services (T-085): the operator
+reads one journal.
 
-### Слой 1: smartd (демон пакета smartmontools)
+### Layer 1: smartd (the smartmontools package daemon)
 
-Конфиг — [`deploy/smartd/smartd.conf`](../deploy/smartd/smartd.conf),
-установка и проверка — [`deploy/smartd/README.md`](../deploy/smartd/README.md).
+The config is [`deploy/smartd/smartd.conf`](../deploy/smartd/smartd.conf);
+installation and verification —
+[`deploy/smartd/README.md`](../deploy/smartd/README.md).
 
-| Директива | Что ловит | Реакция |
+| Directive | What it catches | Reaction |
 |---|---|---|
-| `-H` | Critical Warning health-лога: available spare ниже порога, температура вне диапазона, деградация надёжности, read-only | LOG_CRIT в syslog + обработчик |
-| `-l error` | рост «Error Information Log Entries» — media/integrity-ошибки | LOG_CRIT/LOG_INFO + обработчик |
-| `-W 4,45,60` | Composite Temperature: изменение ≥4 °C, INFO ≥45 °C, CRIT ≥60 °C | syslog + обработчик |
-| `-f`, `-p` (7.5+, закомментированы) | Percentage Used > 95 %, рост Media Errors; изменение Available Spare | LOG_CRIT + обработчик |
+| `-H` | the health log's Critical Warning: available spare below the threshold, temperature out of range, reliability degradation, read-only | LOG_CRIT to syslog + the handler |
+| `-l error` | growth of "Error Information Log Entries" — media/integrity errors | LOG_CRIT/LOG_INFO + the handler |
+| `-W 4,45,60` | Composite Temperature: a change ≥4 °C, INFO ≥45 °C, CRIT ≥60 °C | syslog + the handler |
+| `-f`, `-p` (7.5+, commented out) | Percentage Used > 95%, Media Errors growth; an Available Spare change | LOG_CRIT + the handler |
 
-Что шлёт и кто подхватывает: smartd сам пишет срабатывания в syslog
-(LOG_CRIT/INFO, journald показывает их с идентификатором `smartd`);
-дополнительно при каждом срабатывании запускается обработчик
-`/usr/local/lib/crawler/smartd-warning.sh` (`-m <nomailer> -M exec` — почта
-не используется: MTA на сервере нет, ТЗ §5.9 каналом почту не требует).
-Обработчик пишет структурированную запись (устройство, тип события,
-первое срабатывание, счётчик повторов) тегом `smartd` и молчит в
-stdout/stderr (вывод smartd трактует как сбой обработчика). Итог:
+What it sends and who picks it up: smartd itself writes firings to
+syslog (LOG_CRIT/INFO; journald shows them with the identifier
+`smartd`); additionally, at each firing the handler
+`/usr/local/lib/crawler/smartd-warning.sh` is run (`-m <nomailer>
+-M exec` — mail is not used: there is no MTA on the server, spec §5.9
+does not require mail as a channel). The handler writes a structured
+record (the device, the event type, the first firing, the repeat
+counter) tagged `smartd` and stays silent on stdout/stderr (smartd
+treats output as a handler failure). The result:
 
 ```bash
-journalctl -t smartd -p warning        # предупреждения SMART
-journalctl -u smartmontools            # жизнь самого демона
+journalctl -t smartd -p warning        # SMART warnings
+journalctl -u smartmontools            # the daemon's own life
 ```
 
-Интервал проверок — дефолт пакета (30 мин); для износа и температуры
-достаточно с запасом.
+The check interval is the package default (30 min); for wear and
+temperature that is enough with a margin.
 
-### Слой 2: алерт monitor (T-080)
+### Layer 2: the monitor alert (T-080)
 
-`internal/monitor/alerts.go` читает health-лог ioctl-ом напрямую (без
-nvme-cli): `percentage_used` ≥ 90 % — Warn (алерт `nvme_wear`), в деталях —
-TBW устройства из `data_units_written`; период прохода —
-`monitor.alerts_interval` (по умолчанию 5 мин, T-206).
-В Docker-контейнере `/dev/nvme*` не
-проброшен — алерт честно «не измеряется» (без Warn и ложных срабатываний).
+`internal/monitor/alerts.go` reads the health log directly via ioctl
+(without nvme-cli): `percentage_used` ≥ 90% — a Warn (the `nvme_wear`
+alert), in the details — the device's TBW from `data_units_written`; the
+pass period is `monitor.alerts_interval` (5 min by default, T-206). In a
+Docker container `/dev/nvme*` is not passed through — the alert honestly
+reports "not measured" (no Warn, no false firings).
 
-На боевом systemd-хосте слой включается доступом юнита `crawler-monitor`
-к устройствам:
+On a production systemd host the layer is enabled by the
+`crawler-monitor` unit's access to the devices:
 
-- `deploy/smartd/99-crawler-nvme.rules` — udev отдаёт char-узлы
-  контроллеров (`/dev/nvme0`) группе `nvme-smart` с правами 0660: ioctl
-  admin-команд требует открытия узла на запись, отдельная группа вместо
-  `disk` даёт доступ ровно к NVMe, а не ко всем блочным устройствам
-  (право записи — требование ядра; фактически читаются только журналы);
-- `deploy/smartd/crawler-monitor.service.d/90-nvme-smart.conf` — drop-in
-  добавляет юниту `SupplementaryGroups=nvme-smart`.
+- `deploy/smartd/99-crawler-nvme.rules` — udev hands the controllers'
+  char nodes (`/dev/nvme0`) to the `nvme-smart` group with 0660
+  permissions: an ioctl admin command requires opening the node for
+  writing; a separate group instead of `disk` gives access exactly to
+  the NVMe, not to all block devices (the write permission is a kernel
+  requirement; only the logs are actually read);
+- `deploy/smartd/crawler-monitor.service.d/90-nvme-smart.conf` — the
+  drop-in adds `SupplementaryGroups=nvme-smart` to the unit.
 
-Итог доступа: срабатывание алерта (≥ 90 %) пишет Warn в общий journald
-рядом со smartd (`journalctl -t crawler-monitor | grep -i алерт`); порог
-90 % срабатывает раньше smartd-овских 95 % (на smartmontools ≥ 7.5) и
-загодя до исчерпания ресурса. Штатно состояние «ok» в журнал не пишется
-(сигнал фронтовой — только переходы, T-080): пропажа Debug-записей «алерт
-не измеряется» при `CRAWLER_LOG_LEVEL=debug` — признак, что доступ
-работает.
+The result of the access: an alert firing (≥ 90%) writes a Warn to the
+shared journald next to smartd (`journalctl -t crawler-monitor |
+grep -i alert`); the 90% threshold fires earlier than smartd's 95% (on
+smartmontools ≥ 7.5) and well before the resource is exhausted. Normally
+the "ok" state is not written to the journal (the frontend signal is
+transitions only, T-080): the disappearance of the "the alert is not
+measured" Debug records at `CRAWLER_LOG_LEVEL=debug` is the sign that
+the access works.
 
-**Зачем два слоя.** smartd работает от root независимо от краулера —
-ловит смерть накопителя, даже если весь набор `crawler.target` стоит;
-слой monitor связывает износ с остальными алертами ТЗ §5.9 и держит порог
-`percentage_used` там, где smartd его не умеет: в smartmontools 7.4
-(Ubuntu 24.04 LTS) для NVMe нет директив порога износа (`-f`/`-p` —
-экспериментальные функции 7.5, конфиг содержит их закомментированными).
-На 7.4 слой monitor обязателен для требования §10.3 (TBW), на 7.5 —
-дублирующий.
+**Why two layers.** smartd runs as root independently of the crawler —
+it catches the drive's death even if the whole `crawler.target` set is
+down; the monitor layer ties wear to the other spec §5.9 alerts and
+holds the `percentage_used` threshold where smartd cannot: in
+smartmontools 7.4 (Ubuntu 24.04 LTS) there are no wear-threshold
+directives for NVMe (`-f`/`-p` — experimental 7.5 features; the config
+carries them commented out). On 7.4 the monitor layer is mandatory for
+the §10.3 requirement (TBW); on 7.5 it is redundant.
 
-### Эксплуатация
+### Operations
 
 ```bash
-smartctl -H -A /dev/nvme0        # health: percentage_used, TBW, температура
-smartctl -l error /dev/nvme0     # журнал ошибок NVMe
-journalctl -t smartd -p warning  # предупреждения smartd (пусто = тишина)
+smartctl -H -A /dev/nvme0        # health: percentage_used, TBW, temperature
+smartctl -l error /dev/nvme0     # the NVMe error log
+journalctl -t smartd -p warning  # smartd warnings (empty = quiet)
 ```
 
-`percentage_used` монотонен (не восстанавливается): срабатывание ≥ 90 % —
-планирование замены накопителя; critical warning/available spare —
-немедленные меры (замена/перенос, данные восстановимы повторной проверкой
-— §6.3, но простой цикла недёшев).
+`percentage_used` is monotonic (it never recovers): a ≥ 90% firing means
+scheduling a drive replacement; critical warning/available spare —
+immediate measures (replacement/moving; the data is recoverable by
+re-checking — §6.3, but the cycle downtime is not cheap).
