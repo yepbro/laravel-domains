@@ -195,8 +195,8 @@ func TestUpdate_ExecArgsValidation(t *testing.T) {
 		columns [][]any
 		want    string
 	}{
-		{"мало массивов", [][]any{{}, {}}, "нужно 3"},
-		{"разная длина", [][]any{{1, 2}, {1}, {1, 2}}, "параллельными"},
+		{"мало массивов", [][]any{{}, {}}, "need 3"},
+		{"разная длина", [][]any{{1, 2}, {1}, {1, 2}}, "parallel"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
