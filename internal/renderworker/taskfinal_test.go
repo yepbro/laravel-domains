@@ -1,14 +1,14 @@
-// Юнит-тесты политики последней попытки × класс задачи (T-172): ошибка
-// рендера класса task (отказ соединения, load error — свойство хоста, не
-// инфраструктуры) на доставке с номером redis.max_attempts финализирует
-// запись без рендера по образцу тарпитов T-148 вместо захоронения в
-// q:dead: итог — честный сырой HTML HTTP-фазы (rendered = false),
-// публикация q:analyze (Fresh=true), подтверждение доставки. Ниже
-// последней попытки ошибка повторяема (восстановление хостов наблюдается:
-// замер T-172 — 6.6% ретраев ERR_CONNECTION_REFUSED успешны);
-// инфраструктурный класс (БД, хранилище, публикация, браузер, отмена ctx)
-// умирает прежним путём — q:dead остаётся настоящим инфраструктурным
-// ошибкам. Фейковое окружение — worker_test.go.
+// Unit tests of the last attempt × task class policy (T-172): a render error
+// of the task class (a connection refusal, a load error — a host property, not
+// infrastructure) on the delivery with the number redis.max_attempts finalizes
+// the entry without a render following the tarpit pattern T-148 instead of burying in
+// q:dead: the result is an honest raw HTML of the HTTP phase (rendered = false),
+// a q:analyze publication (Fresh=true), the delivery acknowledgment. Below
+// the last attempt the error is retryable (host recovery is observed:
+// the T-172 measurement — 6.6% of ERR_CONNECTION_REFUSED retries succeed);
+// the infrastructure class (DB, storage, publication, browser, ctx cancellation)
+// dies the former way — q:dead stays for real infrastructure
+// errors. The fake environment — worker_test.go.
 package renderworker
 
 import (
@@ -23,28 +23,28 @@ import (
 	"crawler/internal/render"
 )
 
-// TestRenderWorker_TaskFinalizedOnLastAttempt — суть T-172, сценарий
-// инцидента 23.10 (смешанная серия): таймаут на первой доставке (тарпит
-// ниже лимита T-148 — повторяемая ошибка), отказ соединения на второй
-// (ранняя попытка — повторяемая), отказ на третьей = последней
-// (redis.max_attempts) — финализация без рендера, не q:dead: обработка
-// успешна (Processing подтверждает доставку), строка остаётся с сырым
-// HTML (rendered = false, content_hash не меняется), публикуется
-// q:analyze (Fresh=true), Put/транзакция не выполняются.
+// TestRenderWorker_TaskFinalizedOnLastAttempt — the essence of T-172, the scenario
+// of the Oct 23 incident (a mixed series): a timeout on the first delivery (a tarpit
+// below the T-148 limit — a retryable error), a connection refusal on the second
+// (an early attempt — retryable), a refusal on the third = the last
+// (redis.max_attempts) — a finalization without a render, not q:dead: the processing
+// is successful (Processing acknowledges the delivery), the row stays with the raw
+// HTML (rendered = false, content_hash unchanged), q:analyze is
+// published (Fresh=true), Put/the transaction are not executed.
 func TestRenderWorker_TaskFinalizedOnLastAttempt(t *testing.T) {
 	f := newRWFixture(t)
 	raw := rwTestHash(1)
 	f.pool.seedRow(rwKey, "https://spa.example/", &raw)
 
-	// Доставка 1: таймаут страницы — тарпит ниже TimeoutAttempts (2),
-	// территория T-148: ошибка повторной доставки.
+	// Delivery 1: a page timeout — a tarpit below TimeoutAttempts (2),
+	// the T-148 territory: a re-delivery error.
 	f.renderer.err = rwTarpitErr("https://spa.example/")
 	if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 1); err == nil {
 		t.Fatal("таймаут ниже тарпит-лимита — ошибка повторной доставки (T-148)")
 	}
 
-	// Доставка 2: отказ соединения — ранняя попытка, хост может подняться
-	// (замер: восстановление наблюдается) — ошибка повторной доставки.
+	// Delivery 2: a connection refusal — an early attempt, the host may come up
+	// (the measurement: recovery is observed) — a re-delivery error.
 	f.renderer.err = rwCertErr("https://spa.example/", "net::ERR_CONNECTION_REFUSED")
 	if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 2); err == nil {
 		t.Fatal("отказ соединения до последней попытки — ошибка (хосту даётся шанс подняться)")
@@ -53,7 +53,7 @@ func TestRenderWorker_TaskFinalizedOnLastAttempt(t *testing.T) {
 		t.Fatalf("публикаций до финализации быть не должно: %+v", pubs)
 	}
 
-	// Доставка 3 = MaxAttempts: та же ошибка — финализация без рендера.
+	// Delivery 3 = MaxAttempts: the same error — a finalization without a render.
 	err := queue.ProcessingAttempt(context.Background(), f.q, "render-worker", rwDelivery("e1"), 3, f.w.processDelivery)
 	if err != nil {
 		t.Fatalf("ошибка класса задачи на последней попытке обязана финализироваться без ошибки (не q:dead): %v", err)
@@ -90,15 +90,15 @@ func TestRenderWorker_TaskFinalizedOnLastAttempt(t *testing.T) {
 	if i := f.pool.j.indexOf(rwEvBegin); i >= 0 {
 		t.Errorf("транзакция не должна открываться (событие на %d)", i)
 	}
-	// Refcount не тронут: сырой HTML остаётся итоговым контентом записи.
+	// The refcount is untouched: the raw HTML stays the entry's final content.
 	if refc := rwRefc(f.pool)[raw]; refc != 1 {
 		t.Errorf("refcount сырого HTML = %d, нужен 1 (ссылка жива)", refc)
 	}
 }
 
-// TestRenderWorker_TaskBelowLastAttemptRetries — ретраи на ранних
-// попытках не тронуты: ошибка класса задачи ниже MaxAttempts — обычная
-// повторимая ошибка (без XACK, вернётся клеймом), как до T-172.
+// TestRenderWorker_TaskBelowLastAttemptRetries — the retries on early
+// attempts are untouched: a task class error below MaxAttempts — an ordinary
+// retryable error (without an XACK, it will return with a claim), as before T-172.
 func TestRenderWorker_TaskBelowLastAttemptRetries(t *testing.T) {
 	f := newRWFixture(t)
 	raw := rwTestHash(1)
@@ -119,9 +119,9 @@ func TestRenderWorker_TaskBelowLastAttemptRetries(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_TaskFinalizeBoundary — граница настраивается полем
-// Options.MaxAttempts (боевая сборка передаёт redis.max_attempts): при 1
-// финализация уже на первой доставке, при 5 — четвёртая ещё повторяема.
+// TestRenderWorker_TaskFinalizeBoundary — the boundary is configured by the
+// Options.MaxAttempts field (the production build passes redis.max_attempts): at 1
+// the finalization is already on the first delivery, at 5 — the fourth is still retryable.
 func TestRenderWorker_TaskFinalizeBoundary(t *testing.T) {
 	newFix := func(t *testing.T, max int) *rwFixture {
 		t.Helper()
@@ -156,20 +156,20 @@ func TestRenderWorker_TaskFinalizeBoundary(t *testing.T) {
 	})
 }
 
-// TestRenderWorker_TaskFinalizeInfraStillDies — инфраструктурный класс
-// не финализируется и на последней попытке: умирает прежним путём
-// (без XACK → q:dead) — браузер, контекст, отмена вызывающего контекста
-// (не свойство хоста), ошибки БД/хранилища/публикации (не ошибки
-// рендера — render.Error в цепочке отсутствует), пустой результат
-// (нарушение контракта T-064 — на разбор оператору). Кейс публикации —
-// путь T-225 (Commit прошёл, Publish упал): строка записана, но задача
-// не завершена — обязана умереть ошибкой, без маркера render_failed_at.
+// TestRenderWorker_TaskFinalizeInfraStillDies — the infrastructure class
+// is not finalized on the last attempt either: it dies the former way
+// (without an XACK → q:dead) — the browser, the context, the caller context's
+// cancellation (not a host property), the DB/storage/publication errors (not render
+// errors — no render.Error in the chain), an empty result
+// (a T-064 contract violation — for the operator to triage). The publication case —
+// the T-225 path (Commit went through, Publish fell): the row is written, but the task
+// is not finished — it must die with an error, without a render_failed_at marker.
 func TestRenderWorker_TaskFinalizeInfraStillDies(t *testing.T) {
 	cases := []struct {
 		name string
 		set  func(f *rwFixture)
-		// pubAttempted — кейс сам пытается публиковать (фейк фиксирует
-		// даже неуспешную попытку): проверка «публикаций нет» не применима.
+		// pubAttempted — the case tries to publish itself (the fake records
+		// even a failed attempt): the "no publications" check does not apply.
 		pubAttempted bool
 	}{
 		{"браузер", func(f *rwFixture) {
@@ -190,7 +190,7 @@ func TestRenderWorker_TaskFinalizeInfraStillDies(t *testing.T) {
 			f.store.putErr = errors.New("диск полон")
 		}, false},
 		{"пустой результат рендера (контракт T-064)", func(f *rwFixture) {
-			f.renderer.output = render.RenderOutput{FinalURL: "https://spa.example/x"} // DOM пуст
+			f.renderer.output = render.RenderOutput{FinalURL: "https://spa.example/x"} // the DOM is empty
 		}, false},
 		{"сбой публикации q:analyze (Commit прошёл, T-225)", func(f *rwFixture) {
 			f.renderer.output = rwOutput("<html>dom</html>")
@@ -204,8 +204,8 @@ func TestRenderWorker_TaskFinalizeInfraStillDies(t *testing.T) {
 			f.pool.seedRow(rwKey, "https://spa.example/", &raw)
 			c.set(f)
 
-			// Последняя доставка (3 = MaxAttempts): инфраструктурный класс
-			// обязан возвращаться — путь q:dead прежний.
+			// The last delivery (3 = MaxAttempts): the infrastructure class
+			// must return — the q:dead path is the former one.
 			err := queue.ProcessingAttempt(context.Background(), f.q, "render-worker", rwDelivery("e9"), 3, f.w.processDelivery)
 			if err == nil {
 				t.Fatal("инфраструктурная ошибка обязана возвращаться и на последней попытке (путь q:dead)")
@@ -219,10 +219,10 @@ func TestRenderWorker_TaskFinalizeInfraStillDies(t *testing.T) {
 				}
 			}
 			if c.pubAttempted {
-				// Путь T-225: строка зафиксирована рендером (Commit до
-				// публикации), но не финализирована «без рендера» —
-				// маркера render_failed_at нет, повторная доставка
-				// перезапишет и опубликует заново.
+				// The T-225 path: the row is committed by the render (the Commit before
+				// the publication), but not finalized "without a render" —
+				// no render_failed_at marker, a re-delivery
+				// will rewrite and publish again.
 				row := rwRowSnapshot(f.pool, rwKey)
 				if !row.rendered {
 					t.Error("строка должна быть записана (Commit до сбоя публикации)")
@@ -235,18 +235,18 @@ func TestRenderWorker_TaskFinalizeInfraStillDies(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_TaskFinalizeNoRow — строки нет (перепроверка
-// перезаписала) или у неё нет итогового URL: финализация — штатный отказ
-// без публикации, доставка подтверждается (как ProcessResult).
+// TestRenderWorker_TaskFinalizeNoRow — there is no row (the recheck
+// rewrote it) or it has no final URL: the finalization — a regular
+// rejection without a publication, the delivery is acknowledged (like ProcessResult).
 func TestRenderWorker_TaskFinalizeNoRow(t *testing.T) {
 	f := newRWFixture(t)
 	f.renderer.err = rwCertErr("https://spa.example/", "net::ERR_CONNECTION_REFUSED")
 
-	// Строки нет вовсе.
+	// There is no row at all.
 	if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 3); err != nil {
 		t.Fatalf("строки нет — не ошибка: %v", err)
 	}
-	// Строка без итогового URL.
+	// A row without a final URL.
 	f.pool.seedRow(rwKey, "", nil)
 	if err := f.w.processDelivery(context.Background(), rwDelivery("e2"), 3); err != nil {
 		t.Fatalf("без итогового URL — не ошибка: %v", err)
@@ -256,10 +256,10 @@ func TestRenderWorker_TaskFinalizeNoRow(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_TaskFinalizePublishError — сбой публикации q:analyze
-// при финализации: ошибка без XACK — доставка вернётся и финализация
-// повторится (at-least-once, дубль публикации ограничен попытками,
-// анализатор идемпотентен по ключу).
+// TestRenderWorker_TaskFinalizePublishError — a q:analyze publication
+// failure during finalization: an error without an XACK — the delivery will return and the
+// finalization will repeat (at-least-once, a publication duplicate is bounded by the attempts,
+// the analyzer is idempotent by the key).
 func TestRenderWorker_TaskFinalizePublishError(t *testing.T) {
 	f := newRWFixture(t)
 	raw := rwTestHash(1)
@@ -273,7 +273,7 @@ func TestRenderWorker_TaskFinalizePublishError(t *testing.T) {
 	if acked := f.q.ackedSnapshot(); len(acked) != 0 {
 		t.Errorf("XACK = %v — подтверждения быть не должно", acked)
 	}
-	// Повтор идемпотентен: та же финализация, публикация проходит.
+	// The repeat is idempotent: the same finalization, the publication goes through.
 	if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 3); err != nil {
 		t.Fatalf("повторная доставка после сбоя публикации обязана финализироваться: %v", err)
 	}
@@ -289,10 +289,10 @@ func TestRenderWorker_TaskFinalizePublishError(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_TaskFinalizeMetrics — финализация на последней
-// попытке считается задачей этапа, ошибкой класса task и отдельным
-// счётчиком с меткой причины (код net::ERR_*); счётчики тарпитов и
-// сертификатов не задеты.
+// TestRenderWorker_TaskFinalizeMetrics — a finalization on the last
+// attempt is counted as a stage task, a task class error and a separate
+// counter with a reason label (the net::ERR_* code); the tarpit and
+// certificate counters are not touched.
 func TestRenderWorker_TaskFinalizeMetrics(t *testing.T) {
 	f := newRWFixture(t)
 	reg := metrics.New("render-worker")
@@ -336,10 +336,10 @@ func TestRenderWorker_TaskFinalizeMetrics(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_TaskFinalizeReason — метка причины: код ошибки
-// загрузки net::ERR_*, «other» для задачи без кода (сбой страницы),
-// «timeout» для таймаута, не пойманного тарпит-лимитом (страховка сборок
-// с TimeoutAttempts выше MaxAttempts — конфиг это запрещает).
+// TestRenderWorker_TaskFinalizeReason — the reason label: the
+// net::ERR_* load error code, "other" for a task without a code (a page failure),
+// "timeout" for a timeout not caught by the tarpit limit (the guard for builds
+// with TimeoutAttempts above MaxAttempts — the config forbids it).
 func TestRenderWorker_TaskFinalizeReason(t *testing.T) {
 	cases := []struct {
 		err  error
@@ -358,9 +358,9 @@ func TestRenderWorker_TaskFinalizeReason(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_TaskFinalizeTarpitPriority — тарпит на последней
-// попытке финализируется тарпит-веткой T-148 (счётчик тарпитов), а не
-// политикой T-172: порядок веток processDelivery сохраняется.
+// TestRenderWorker_TaskFinalizeTarpitPriority — a tarpit on the last
+// attempt is finalized by the T-148 tarpit branch (the tarpit counter), not by
+// the T-172 policy: the branch order of processDelivery is preserved.
 func TestRenderWorker_TaskFinalizeTarpitPriority(t *testing.T) {
 	f := newRWFixture(t)
 	reg := metrics.New("render-worker")
@@ -385,10 +385,10 @@ func TestRenderWorker_TaskFinalizeTarpitPriority(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_DateInvalidCertFromFirstDelivery — просроченный
-// сертификат (расширение T-172): финализируется cert-политикой с первой
-// доставки (замер: успешных ретраев 0 из 321), а не политикой последней
-// попытки и не q:dead.
+// TestRenderWorker_DateInvalidCertFromFirstDelivery — an expired
+// certificate (the T-172 extension): finalized by the cert policy from the first
+// delivery (the measurement: 0 successful retries of 321), not by the last
+// attempt policy and not q:dead.
 func TestRenderWorker_DateInvalidCertFromFirstDelivery(t *testing.T) {
 	f := newRWFixture(t)
 	reg := metrics.New("render-worker")
@@ -418,10 +418,10 @@ func TestRenderWorker_DateInvalidCertFromFirstDelivery(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_MaxAttemptsDefault — дефолт воркера согласован с
-// очередью (queue.DefaultMaxAttempts): боевая сборка передаёт
-// redis.max_attempts, расхождение дефолтов молча меняло бы границу
-// финализации против захоронения Reliab.
+// TestRenderWorker_MaxAttemptsDefault — the worker's default is consistent with
+// the queue's (queue.DefaultMaxAttempts): the production build passes
+// redis.max_attempts, a default mismatch would silently shift the boundary
+// of finalization against the Reliab burying.
 func TestRenderWorker_MaxAttemptsDefault(t *testing.T) {
 	o := Options{}.withDefaults()
 	if o.MaxAttempts != queue.DefaultMaxAttempts {

@@ -1,13 +1,13 @@
-// Юнит-тесты маркера «рендер невозможен» subdomain_results.render_failed_at
-// (T-210): финализации без рендера (тарпит T-148 / cert-класс T-159 /
-// класс задачи T-172) штампуют строку — до смены контента проход
-// доработки (httpworker/renderq.go) запись не переиздаёт. Сброс — сменой
-// контента: перезапись эпизода (DELETE + INSERT записи результата,
-// T-058 — в юнит-тестах httpworker колонка не входит в INSERT) и
-// успешный рендер (renderUpdateSQL). Охраны штампа — те же принципы,
-// что у renderUpdateSQL: оптимистическая по content_hash (строка ушла
-// из-под задачи — маркер не ставится) и rendered = false (конкурентный
-// рендер закрыл вопрос). Фейковое окружение — worker_test.go.
+// Unit tests of the "render impossible" marker subdomain_results.render_failed_at
+// (T-210): the finalizations without a render (the tarpit T-148 / the cert class T-159 /
+// the task class T-172) stamp the row — until the content changes the rework
+// pass (httpworker/renderq.go) does not re-publish the entry. The reset — by a
+// content change: an episode rewrite (DELETE + INSERT of the result record,
+// T-058 — in the httpworker unit tests the column is not in the INSERT) and
+// a successful render (renderUpdateSQL). The stamp guards — the same principles
+// as renderUpdateSQL's: the optimistic one on content_hash (the row slipped
+// out from under the task — no marker) and rendered = false (a concurrent
+// render settled the question). The fake environment — worker_test.go.
 package renderworker
 
 import (
@@ -19,17 +19,17 @@ import (
 	"crawler/internal/render"
 )
 
-// rwMarkErr — повторимая ошибка рендера класса task (не тарпит/cert —
-// ретраи решает processDelivery, здесь важна только финализация).
+// rwMarkErr — a retryable render error of the task class (not a tarpit/cert —
+// processDelivery decides the retries, only the finalization matters here).
 func rwMarkErr(url string) error {
 	return &render.Error{Class: render.ClassTask, URL: url,
 		Err: errors.New("net::ERR_CONNECTION_REFUSED")}
 }
 
-// TestRenderWorker_FinalizeMarksRenderFailed — все три политики
-// финализации ставят маркер: rendered = false, content_hash прежний,
-// штамп render_failed_at не nil, q:analyze опубликована, транзакция не
-// открывается (маркер — автокоммит-UPDATE, T-210).
+// TestRenderWorker_FinalizeMarksRenderFailed — all three finalization
+// policies set the marker: rendered = false, the content_hash is the old one,
+// the render_failed_at stamp is not nil, q:analyze is published, no
+// transaction is opened (the marker — an autocommit UPDATE, T-210).
 func TestRenderWorker_FinalizeMarksRenderFailed(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -70,10 +70,10 @@ func TestRenderWorker_FinalizeMarksRenderFailed(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_FinalizeMarkerStaleRow — охрана контента штампа:
-// перепроверка перезаписала строку между SELECT цели и маркером — штамп
-// НЕ ставится (новый эпизод имеет право на рендер), финализация
-// публикует q:analyze текущей строки и подтверждает доставку.
+// TestRenderWorker_FinalizeMarkerStaleRow — the stamp's content guard:
+// the recheck rewrote the row between the target SELECT and the marker — the stamp
+// is NOT set (the new episode has the right to a render), the finalization
+// publishes q:analyze of the current row and acknowledges the delivery.
 func TestRenderWorker_FinalizeMarkerStaleRow(t *testing.T) {
 	f := newRWFixture(t)
 	raw := rwTestHash(1)
@@ -82,9 +82,9 @@ func TestRenderWorker_FinalizeMarkerStaleRow(t *testing.T) {
 	fresh := rwTestHash(2)
 	f.pool.mutateBeforeMark = func(p *rwFakePool) {
 		if r, ok := p.rows[rwKey]; ok {
-			p.refc[raw]-- // DELETE старых строк эпизода (SwapRef, T-058)
+			p.refc[raw]-- // DELETE of the episode's old rows (SwapRef, T-058)
 			r.hash = fresh[:]
-			p.refc[fresh]++ // INSERT новых строк
+			p.refc[fresh]++ // INSERT of the new rows
 		}
 	}
 
@@ -106,17 +106,17 @@ func TestRenderWorker_FinalizeMarkerStaleRow(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_FinalizeMarkerRenderedRow — конкурентная повторная
-// доставка уже отрендерила строку: штамп ей не нужен (охрана
-// rendered = false), финализация публикует q:analyze — дубль анализа
-// тем же контентом безвреден (at-least-once, ТЗ 3.4).
+// TestRenderWorker_FinalizeMarkerRenderedRow — a concurrent re-delivery
+// has already rendered the row: it needs no stamp (the
+// rendered = false guard), the finalization publishes q:analyze — an analysis
+// duplicate with the same content is harmless (at-least-once, spec 3.4).
 func TestRenderWorker_FinalizeMarkerRenderedRow(t *testing.T) {
 	f := newRWFixture(t)
 	raw := rwTestHash(1)
 	f.pool.seedRow(rwKey, "https://spa.example/", &raw)
 	f.renderer.err = rwTarpitErr("https://spa.example/")
 	f.pool.mutateBeforeMark = func(p *rwFakePool) {
-		p.rows[rwKey].rendered = true // конкурентная доставка записала DOM
+		p.rows[rwKey].rendered = true // a concurrent delivery wrote the DOM
 	}
 
 	if err := f.w.processDelivery(context.Background(), rwDelivery("e2"), 2); err != nil {
@@ -134,9 +134,9 @@ func TestRenderWorker_FinalizeMarkerRenderedRow(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_FinalizeMarkerExecError — сбой UPDATE маркера: ошибка
-// без XACK — доставка вернётся и финализация повторится (штамп
-// переставится идемпотентно).
+// TestRenderWorker_FinalizeMarkerExecError — the marker UPDATE failure: an
+// error without an XACK — the delivery will return and the finalization will repeat (the
+// stamp will be re-set idempotently).
 func TestRenderWorker_FinalizeMarkerExecError(t *testing.T) {
 	f := newRWFixture(t)
 	raw := rwTestHash(1)
@@ -155,10 +155,10 @@ func TestRenderWorker_FinalizeMarkerExecError(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_FinalizeMarkerRepeatIdempotent — сбой публикации
-// после штампа: доставка возвращается, повторная финализация
-// переставляет штамп (UPDATE той же строки) и публикует снова —
-// дубль ограничен попытками, анализатор идемпотентен по ключу.
+// TestRenderWorker_FinalizeMarkerRepeatIdempotent — a publication failure
+// after the stamp: the delivery returns, the repeated finalization
+// re-sets the stamp (an UPDATE of the same row) and publishes again —
+// the duplicate is bounded by the attempts, the analyzer is idempotent by the key.
 func TestRenderWorker_FinalizeMarkerRepeatIdempotent(t *testing.T) {
 	f := newRWFixture(t)
 	raw := rwTestHash(1)
@@ -183,8 +183,8 @@ func TestRenderWorker_FinalizeMarkerRepeatIdempotent(t *testing.T) {
 	if !row.failedAt.Equal(*first.failedAt) {
 		t.Error("coalesce: штамп ПЕРВОЙ финализации не переставляется повтором (диагностика «как давно помечено», T-210)")
 	}
-	// Две записи публикации: первая (упавшая) тоже попадает в журнал
-	// фейка — доставка подтверждается только успешной.
+	// Two publication records: the first (the failed one) also lands in the
+	// fake's journal — the delivery is acknowledged only by the successful one.
 	if pubs := f.q.publishesSnapshot(); len(pubs) != 2 {
 		t.Errorf("публикаций q:analyze = %d, нужно 2 (сбойная + доставленная)", len(pubs))
 	}
@@ -193,11 +193,11 @@ func TestRenderWorker_FinalizeMarkerRepeatIdempotent(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_RenderClearsMarker — успешный рендер строки с
-// маркером (конкурентная доставка финализации): renderUpdateSQL снимает
-// render_failed_at вместе с rendered = true — выборка прохода
-// доработки видит запись отрендеренной независимо от маркера,
-// инвариант «маркер ⇒ rendered = false» сохраняется.
+// TestRenderWorker_RenderClearsMarker — a successful render of a marked
+// row (a concurrent finalization delivery): renderUpdateSQL removes
+// render_failed_at together with rendered = true — the rework pass
+// selection sees the entry as rendered regardless of the marker,
+// the invariant "marker ⇒ rendered = false" holds.
 func TestRenderWorker_RenderClearsMarker(t *testing.T) {
 	f := newRWFixture(t)
 	raw := rwTestHash(1)

@@ -1,111 +1,113 @@
-// Автомат политики исходов рендера (T-261, ТЗ tasks/TZ-fsm.md §3 ФТ-7):
-// единая точка правды о решении «чем заканчивается доставка q:render /
-// q:render-fallback с ошибкой рендера». Состояние закодировано классом
-// ошибки (классификаторы certError T-159 / dnsError T-211 / tarpitError
-// T-148 / isTaskRenderError T-172 / инфраструктура) и двумя бюджетами:
-// тарпит-бюджет эпизода — мощность прикладного множества Redis
-// render:tarpit:{task_id} (queue.TarpitCounter) — и общий бюджет доставок
-// — счётчик PEL записи (redis.max_attempts, автомат доставки —
-// internal/queue/deliverystate.go). Формализация не переписывает решение
-// на FSM-фреймворк (ТЗ-fsm §1): оно остаётся охранными предикатами
-// processDelivery; эта таблица — то, с чем сверяется единственный писатель
-// (processDelivery) и наблюдаемость (метрики исходов). Смежные автоматы:
-// рендер-состояние строки — worker.go (T-259), состояние проверки домена —
-// internal/scheduler/checkstate.go (T-255).
+// Render outcome policy FSM (T-261, spec tasks/TZ-fsm.md §3 FR-7): the
+// single source of truth for the decision of "how a q:render /
+// q:render-fallback delivery with a render error ends". The state is
+// encoded by the error class (the certError T-159 / dnsError T-211 /
+// tarpitError T-148 / isTaskRenderError T-172 / infrastructure
+// classifiers) and two budgets: the episode tarpit budget — the
+// cardinality of the application-level Redis set render:tarpit:{task_id}
+// (queue.TarpitCounter) — and the overall delivery budget — the entry's
+// PEL counter (redis.max_attempts, the delivery FSM —
+// internal/queue/deliverystate.go). The formalization does not rewrite
+// the decision on the FSM framework (TZ-fsm §1): it remains the guard
+// predicates of processDelivery; this table is what the single writer
+// (processDelivery) and the observability (outcome metrics) check
+// against. Related FSMs: the row's render state — worker.go (T-259), the
+// domain check state — internal/scheduler/checkstate.go (T-255).
 //
-// # Исходы доставки
+// # Delivery outcomes
 //
-//	повтор        ошибка без XACK — запись вернётся клеймом (Processing,
-//	              T-025): страница получает ещё одну доставку
-//	фолбэк        публикация q:render-fallback (publishFallback, T-238):
-//	              движко-зависимые причины при включённом
-//	              render.fallback.enabled и положительном решении
-//	              гейта/бюджета (T-239); маркер не ставится — доработка и
-//	              финализация за воркером B (ФТ-10)
-//	финализация   запись закрывается без рендера (finalizeNoRender):
-//	              итог — сырой HTML HTTP-фазы, маркер render_failed_at
-//	              (T-210), публикация q:analyze, XACK — конвейер доводит
-//	              запись анализом, q:dead не занимается
-//	q:dead        исчерпание общего лимита доставок инфраструктурным
-//              классом — карантин (T-025), разбор ручной
+//	retry         an error without XACK — the entry will come back with a claim (Processing,
+//	              T-025): the page gets one more delivery
+//	fallback      publishing to q:render-fallback (publishFallback, T-238):
+//	              engine-branched reasons with
+//	              render.fallback.enabled on and a positive
+//	              gate/budget decision (T-239); no marker is set — the rework and
+//	              finalization are up to worker B (FR-10)
+//	finalization  the entry is closed without a render (finalizeNoRender):
+//	              the result is the raw HTML of the HTTP phase, the render_failed_at
+//	              marker (T-210), publishing to q:analyze, XACK — the pipeline finishes
+//	              the entry with analysis, q:dead is not involved
+//	q:dead        exhaustion of the overall delivery limit by the infrastructure
+//              class — quarantine (T-025), triage is manual
 //
-// # Переходы: класс ошибки × охраны × исход × побочные действия
+// # Transitions: error class × guards × outcome × side effects
 //
-//	| № | Класс ошибки | Охраны финализации | Исход | Побочные действия |
-//	|---|--------------|--------------------|-------|-------------------|
-//	| Р1 | cert (certError, T-159) | всегда — свойство хоста не меняется между попытками | финализация с первой доставки | crawler_render_cert_finalized_total |
-//	| Р2 | DNS (dnsError, T-211) | всегда — возврат DNS масштаба дней | финализация с первой доставки | crawler_render_dns_finalized_total |
-//	| Р3 | тарпит (tarpitError, T-148) | тарпит-бюджет эпизода исчерпан: мощность render:tarpit:{task_id} ≥ render.timeout_attempts (tarpitsExhausted, T-261) | фолбэк (движко-зависимая причина) → финализация | SADD render:tarpit:{task_id}; crawler_render_tarpit_finalized_total / crawler_render_fallback_published_total{timeout} |
-//	| Р4 | класс задачи (isTaskRenderError, T-172) | номер доставки PEL ≥ redis.max_attempts — общий лимит | фолбэк (движко-зависимая причина) → финализация | crawler_render_task_finalized_total{reason} / crawler_render_fallback_published_total{reason} |
-//	| Р5 | инфраструктура (БД, хранилище, публикация, браузер, отмена ctx) | — | повтор; по исчерпании общего лимита — q:dead | crawler_stage_errors_total{class}; паузы читателя (T-152) |
-//	| Р6 | успех (или строка ушла из-под задачи) | — | renderUpdateSQL / штатный отказ без эффектов | crawler_render_records_total, q:analyze |
+//	| # | Error class | Finalization guards | Outcome | Side effects |
+//	|---|-------------|---------------------|---------|--------------|
+//	| R1 | cert (certError, T-159) | always — a host property does not change between attempts | finalization from the first delivery | crawler_render_cert_finalized_total |
+//	| R2 | DNS (dnsError, T-211) | always — DNS recovery takes days | finalization from the first delivery | crawler_render_dns_finalized_total |
+//	| R3 | tarpit (tarpitError, T-148) | the episode tarpit budget is exhausted: the cardinality of render:tarpit:{task_id} ≥ render.timeout_attempts (tarpitsExhausted, T-261) | fallback (an engine-branched reason) → finalization | SADD render:tarpit:{task_id}; crawler_render_tarpit_finalized_total / crawler_render_fallback_published_total{timeout} |
+//	| R4 | task class (isTaskRenderError, T-172) | the PEL delivery number ≥ redis.max_attempts — the overall limit | fallback (an engine-branched reason) → finalization | crawler_render_task_finalized_total{reason} / crawler_render_fallback_published_total{reason} |
+//	| R5 | infrastructure (DB, storage, publishing, browser, ctx cancellation) | — | retry; after the overall limit is exhausted — q:dead | crawler_stage_errors_total{class}; reader pauses (T-152) |
+//	| R6 | success (or the row slipped out from under the task) | — | renderUpdateSQL / a regular rejection without effects | crawler_render_records_total, q:analyze |
 //
-// Порядок строк — порядок проверки processDelivery: cert/DNS раньше
-// тарпита, тарпит раньше класса задачи (тарпит на последней доставке —
-// территория T-148, а не T-172, TestRenderWorker_TaskFinalizeTarpitPriority).
+// The row order is the check order of processDelivery: cert/DNS before
+// the tarpit, the tarpit before the task class (a tarpit on the last
+// delivery is the territory of T-148, not T-172,
+// TestRenderWorker_TaskFinalizeTarpitPriority).
 //
-// # Тарпит-бюджет эпизода (T-261, фикс смешанных серий)
+// # The episode tarpit budget (T-261, the mixed-series fix)
 //
-// Состояния счётчика задачи (ключ render:tarpit:{task_id}):
+// The states of a task's counter (the key render:tarpit:{task_id}):
 //
-//	ТС0 «пусто»     тарпит-классифицированных доставок нет (или ключ
-//	                потерян — деградация Д3): любая тарпит-доставка
-//	                повторяема
-//	ТС1 «считается» мощность n < render.timeout_attempts: тарпит-доставка
-//	                повторяема, n растёт только тарпитами
-//	ТС2 «исчерпан»  n ≥ render.timeout_attempts: переход Р3
-//	                (фолбэк/финализация); дальнейшие тарпиты того же
-//	                эпизода исчерпаны по построению
+//	TS0 "empty"     no tarpit-classified deliveries (or the key
+//	                is lost — degradation D3): any tarpit delivery
+//	                is retryable
+//	TS1 "counting"  cardinality n < render.timeout_attempts: a tarpit delivery
+//	                is retryable, n grows only from tarpits
+//	TS2 "exhausted" n ≥ render.timeout_attempts: transition R3
+//	                (fallback/finalization); further tarpits of the same
+//	                episode are exhausted by construction
 //
-//	Событие: доставка завершается таймаутом страницы (tarpitError) →
-//	SADD члена «{entry-id}#{номер доставки PEL}» (tarpitDeliveryID),
-//	TTL DefaultTarpitTTL (48 ч — 2× горизонт ретраев эпизода: окно
-//	доставок PEL ≈ max_attempts × claim_min_idle плюс очередь фолбэка,
-//	переиздания публикуют новый task_id со свежим бюджетом; освежается
-//	каждой отметкой — ключ умирает через 48 ч после последнего тарпита
-//	задачи, а не первого), решение — SCARD после отметки (пороговую
-//	доставку считает саму себя).
+//	Event: a delivery ends with a page timeout (tarpitError) →
+//	SADD of the member "{entry-id}#{PEL delivery number}" (tarpitDeliveryID),
+//	TTL DefaultTarpitTTL (48 h — 2× the episode's retry horizon: the window
+//	of PEL deliveries ≈ max_attempts × claim_min_idle plus the fallback queue,
+//	re-publications publish a new task_id with a fresh budget; refreshed
+//	by every mark — the key dies 48 h after the task's last tarpit,
+//	not the first one), the decision — SCARD after the mark (the threshold
+//	delivery counts itself).
 //
-// # Деградации (решение — по номеру доставки PEL, поведение до T-261)
+// # Degradations (the decision — by the PEL delivery number, the behavior before T-261)
 //
-//	Д1  ошибка Redis в счётчике (SADD/EXPIRE/SCARD) — Warn-лог, решение
-//	    по attempts ≥ render.timeout_attempts: то же условие, что до
-//	    T-261, — не раньше доставки с номером порога и не раньше общего
-//	    лимита; в окне деградации смешанные серии снова финализируют
-//	    «на попытку» — цена доступности Redis (ТЗ 3.4: потеря Redis не
-//	    фатальна).
-//	Д2  счётчик не смонтирован (Options.Tarpits = nil — изолированные
-//	    сборки/тесты без Redis-специфики) или сообщение без task_id
-//	    (форматы до T-024) — как Д1, без Warn.
-//	Д3  ключ потерян при живом Redis (очистка оператором, рестарт без
-//	    персистентности) — счёт начинается заново (ТС0): финализация
-//	    откладывается до нового порога тарпитов, раньше порога не
-//	    случается; страховка — общий лимит: тарпит на доставке №
-//	    redis.max_attempts финализируется классом задачи (Р4, метка
-//	    reason «timeout»), в q:dead тарпиты не попадают.
+//	D1  a Redis error in the counter (SADD/EXPIRE/SCARD) — a Warn log, the decision
+//	    by attempts ≥ render.timeout_attempts: the same condition as before
+//	    T-261 — no earlier than the delivery with the threshold number and no earlier than the overall
+//	    limit; in the degradation window mixed series are finalized again
+//	    "per attempt" — the price of Redis availability (spec 3.4: losing Redis is not
+//	    fatal).
+//	D2  the counter is not mounted (Options.Tarpits = nil — isolated
+//	    builds/tests without Redis specifics) or a message without a task_id
+//	    (formats before T-024) — as D1, without the Warn.
+//	D3  the key is lost with Redis alive (an operator cleanup, a restart without
+//	    persistence) — the counting starts over (TS0): finalization
+//	    is postponed until a new tarpit threshold and does not happen
+//	    before the threshold; the guard is the overall limit: a tarpit on delivery #
+//	    redis.max_attempts is finalized with the task class (R4, the label
+//	    reason "timeout"); tarpits do not reach q:dead.
 //
-// # Инварианты
+// # Invariants
 //
-//	И1  Тарпит-бюджет считают только тарпит-классифицированные доставки:
-//	    номер доставки PEL растёт от каждой (включая инфра-сбои, Р5),
-//	    множество — только от тарпитов; смешанные серии не финализируют
-//	    раньше порога тарпитов (фикс T-261).
-//	И2  Одна доставка — один член множества: SADD идемпотентен по
-//	    «{entry-id}#{номер}»; replay номера после возврата попытки
-//	    (T-222/ФТ-6.2) и повторная обработка зависшей доставки счётчик
-//	    не растят. Счётчик живёт в Redis — переживает рестарты воркеров
-//	    и согласован при многих воркерах/восстановителях.
-//	И3  Общий лимит redis.max_attempts работает по номеру доставки PEL
-//	    (Р4) и от тарпит-множества не зависит: max_attempts ≥
-//	    timeout_attempts (проверяет config.Validate), тарпит не минует
-//	    свой лимит финализацией чужого класса.
-//	И4  Бюджет — на задачу (task_id), не на стрим: публикация фолбэка
-//	    (T-238) переносит task_id в q:render-fallback, тарпиты воркера B
-//	    считаются в то же множество — эпизод, исчерпавший тарпиты на
-//	    движке A, на первом же тарпите движка B финализируется (второй
-//	    движок подтвердил тарпит страницы; члены различаются entry-id
-//	    стримов, двойного счёта одной доставки нет). Переиздания эпизода
-//	    (проход доработки T-066, поздний переиздатель T-259) публикуют
-//	    новый task_id — их бюджет начинается с нуля.
+//	I1  Only tarpit-classified deliveries count toward the tarpit budget:
+//	    the PEL delivery number grows from every delivery (including infra failures, R5),
+//	    the set — only from tarpits; mixed series are not finalized
+//	    before the tarpit threshold (the T-261 fix).
+//	I2  One delivery — one set member: SADD is idempotent by
+//	    "{entry-id}#{number}"; a replay of the number after an attempt refund
+//	    (T-222/FR-6.2) and repeated processing of a stuck delivery do not grow
+//	    the counter. The counter lives in Redis — it survives worker restarts
+//	    and stays consistent with many workers/recoverers.
+//	I3  The overall limit redis.max_attempts works by the PEL delivery number
+//	    (R4) and does not depend on the tarpit set: max_attempts ≥
+//	    timeout_attempts (checked by config.Validate), a tarpit does not bypass
+//	    its limit by finalizing with a foreign class.
+//	I4  The budget is per task (task_id), not per stream: a fallback publication
+//	    (T-238) moves the task_id into q:render-fallback, worker B's tarpits
+//	    count into the same set — an episode that exhausted tarpits on
+//	    engine A is finalized on the first tarpit of engine B (the second
+//	    engine confirmed the page tarpit; the members differ by the entry-id
+//	    of the streams, there is no double counting of one delivery). The episode's re-publications
+//	    (the rework pass T-066, the late re-publisher T-259) publish
+//	    a new task_id — their budget starts from zero.
 
 package renderworker

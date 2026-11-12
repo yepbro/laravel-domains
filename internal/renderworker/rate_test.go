@@ -1,10 +1,10 @@
-// Юнит-тесты темпа потребления воркера (T-240, ТЗР этапа 35 §4.5 п.1,
-// ФТ-13): скользящее окно rateWindow (потолок записей, выход меток по
-// времени, пустое чтение бюджета не расходует) и проводка потолка в цикл
-// Run — пачка чтения урезается до свободных слотов окна, исчерпанное окно
-// держит паузу чтения до выхода старейшей записи. Воркер B (сборка
-// q:render-fallback) ограничивается тем же параметром без ветвлений по
-// движку/стриму — потолок действует, когда задан (Options.Rate).
+// Unit tests of the worker's consumption rate (T-240, render spec stage 35 §4.5 item 1,
+// FR-13): the rateWindow sliding window (an entries cap, marks leaving by
+// time, an empty read not spending the budget) and the cap wiring into the
+// Run loop — the read chunk is trimmed to the window's free slots, an exhausted window
+// holds the read pause until the oldest entry leaves. Worker B (the
+// q:render-fallback build) is limited by the same parameter without branches by
+// engine/stream — the cap acts when set (Options.Rate).
 package renderworker
 
 import (
@@ -16,33 +16,33 @@ import (
 	"crawler/internal/queue"
 )
 
-// --- механика окна ------------------------------------------------------------
+// --- window mechanics ---------------------------------------------------------
 
-// TestRenderWorker_RateWindowMechanics — окно темпа чистыми метками
-// времени (без реальных пауз): бюджет, расход пачками, потолок, выход
-// меток по истечении окна, no-op пустого чтения.
+// TestRenderWorker_RateWindowMechanics — the rate window with pure timestamps
+// (no real pauses): the budget, spending in chunks, the cap, marks
+// leaving on the window's expiry, the no-op of an empty read.
 func TestRenderWorker_RateWindowMechanics(t *testing.T) {
 	start := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
 	w := newRateWindow(3, 10*time.Second)
 
-	// Пустое окно — полный бюджет.
+	// An empty window — the full budget.
 	if a := w.allowance(start); a != 3 {
 		t.Errorf("allowance пустого окна = %d, хочу 3", a)
 	}
-	// Пустое чтение — no-op: обращение к пустой очереди потолка не
-	// расходует (простой не жжёт бюджет).
+	// An empty read — a no-op: calling an empty queue does not spend the
+	// cap (idleness does not burn the budget).
 	w.record(start, 0)
 	if a := w.allowance(start); a != 3 {
 		t.Errorf("после record(0) allowance = %d, хочу 3 (пустое чтение — no-op)", a)
 	}
 
-	// Пачка из двух записей — слот один.
+	// A chunk of two entries — one slot.
 	w.record(start, 2)
 	if a := w.allowance(start); a != 1 {
 		t.Errorf("после record(2) allowance = %d, хочу 1", a)
 	}
 
-	// Ещё запись — потолок исчерпан, retry ведёт к старейшей метке окна.
+	// One more entry — the cap is exhausted, retry leads to the window's oldest mark.
 	w.record(start.Add(2*time.Second), 1)
 	now := start.Add(2 * time.Second)
 	if a := w.allowance(now); a != 0 {
@@ -52,8 +52,8 @@ func TestRenderWorker_RateWindowMechanics(t *testing.T) {
 		t.Errorf("retry = %v, хочу 8s (старейшая метка start + окно 10s − now)", d)
 	}
 
-	// Окно скользит: первая пачка (start) вышла по возрасту — слот
-	// освободился, жива только пачка start+2s.
+	// The window slides: the first chunk (start) left by age — the slot
+	// freed up, only the start+2s chunk is alive.
 	if a := w.allowance(start.Add(10 * time.Second)); a != 2 {
 		t.Errorf("через окно allowance = %d, хочу 2 (пачка start истекла, start+2s жива)", a)
 	}
@@ -61,15 +61,15 @@ func TestRenderWorker_RateWindowMechanics(t *testing.T) {
 		t.Errorf("retry = %v, хочу 2s (до выхода пачки start+2s)", d)
 	}
 
-	// Обе пачки вышли — окно пустое, полный бюджет.
+	// Both chunks left — the window is empty, the full budget.
 	if a := w.allowance(start.Add(12 * time.Second)); a != 3 {
 		t.Errorf("после выхода всех меток allowance = %d, хочу 3", a)
 	}
 }
 
-// TestRenderWorker_RateOptionsDefaults — Rate — параметр сборки, а не
-// этапа: дефолт 0 («без потолка», поведение основной сборки q:render не
-// меняется), заданное значение not затирается, отрицательный сбрасывается.
+// TestRenderWorker_RateOptionsDefaults — Rate is a build parameter, not a
+// stage one: the default 0 ("without a cap", the main q:render build's behavior does not
+// change), a set value is not wiped, a negative one is reset.
 func TestRenderWorker_RateOptionsDefaults(t *testing.T) {
 	if o := (Options{}).withDefaults(); o.Rate != 0 {
 		t.Errorf("дефолт Rate = %d, хочу 0 (основная сборка читает без потолка)", o.Rate)
@@ -82,14 +82,14 @@ func TestRenderWorker_RateOptionsDefaults(t *testing.T) {
 	}
 }
 
-// --- проводка потолка в цикл Run ----------------------------------------------
+// --- cap wiring into the Run loop ---------------------------------------------
 
-// rateQueue — queue.Queue для тестов темпа: фиксирует запрошенный размер
-// каждой пачки чтения, раздаёт доставки по n, первые emptyReads чтений
-// возвращают пусто без блока (пустая очередь снаружи XREADGROUP-блока —
-// для проверки, что простой не расходует бюджет), исчерпание — блок до
-// отмены ctx (как реальная очередь); Ack считает подтверждения и
-// сигнализирует.
+// rateQueue — a queue.Queue for the rate tests: records the requested size
+// of every read chunk, hands out deliveries by n, the first emptyReads reads
+// return empty without a block (an empty queue outside the XREADGROUP block —
+// to check that idleness does not spend the budget), exhaustion — a block until
+// ctx is cancelled (like a real queue); Ack counts acknowledgments and
+// signals.
 type rateQueue struct {
 	mu         sync.Mutex
 	deliveries []queue.Delivery
@@ -110,7 +110,7 @@ func newRateQueue(emptyReads int, ids ...string) *rateQueue {
 var _ queue.Queue = (*rateQueue)(nil)
 
 func (q *rateQueue) Publish(context.Context, string, queue.Message) (string, error) {
-	return "entry", nil // публикация тестам темпа не нужна (строк нет — успех без публикации)
+	return "entry", nil // the rate tests do not need a publication (no rows — a success without publication)
 }
 
 func (q *rateQueue) Consume(ctx context.Context, _, _, _ string, n int) ([]queue.Delivery, error) {
@@ -120,7 +120,7 @@ func (q *rateQueue) Consume(ctx context.Context, _, _, _ string, n int) ([]queue
 	served := false
 	if q.emptyReads > 0 {
 		q.emptyReads--
-		served = true // пустое чтение: возвращаемся сразу, блок не нужен
+		served = true // an empty read: we return immediately, no block needed
 	} else if n > 0 && len(q.deliveries) > 0 {
 		take := min(n, len(q.deliveries))
 		out = append(out, q.deliveries[:take]...)
@@ -129,7 +129,7 @@ func (q *rateQueue) Consume(ctx context.Context, _, _, _ string, n int) ([]queue
 	}
 	q.mu.Unlock()
 	if !served {
-		<-ctx.Done() // пустая очередь: блок XREADGROUP до отмены
+		<-ctx.Done() // an empty queue: an XREADGROUP block until cancellation
 		return nil, ctx.Err()
 	}
 	return out, nil
@@ -148,7 +148,7 @@ func (q *rateQueue) Ack(ctx context.Context, _, _ string, ids ...string) error {
 	return nil
 }
 
-// batchAt — запрошенный размер i-й пачки чтения (0 — чтения не было).
+// batchAt — the requested size of the i-th read chunk (0 — there was no read).
 func (q *rateQueue) batchAt(i int) int {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -158,21 +158,21 @@ func (q *rateQueue) batchAt(i int) int {
 	return q.batches[i]
 }
 
-// consumesCount — сколько чтений состоялось.
+// consumesCount — how many reads happened.
 func (q *rateQueue) consumesCount() int {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	return len(q.batches)
 }
 
-// left — нерозданных доставок.
+// left — the undelivered (unhanded-out) deliveries.
 func (q *rateQueue) left() int {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	return len(q.deliveries)
 }
 
-// waitConsume — ждать i-го по счёту чтения.
+// waitConsume — wait for the i-th read in order.
 func (q *rateQueue) waitConsume(t *testing.T, i int, d time.Duration) int {
 	t.Helper()
 	deadline := time.After(d)
@@ -188,7 +188,7 @@ func (q *rateQueue) waitConsume(t *testing.T, i int, d time.Duration) int {
 	}
 }
 
-// waitAcks — ждать want подтверждений.
+// waitAcks — wait for want acknowledgments.
 func (q *rateQueue) waitAcks(t *testing.T, want int, d time.Duration) {
 	t.Helper()
 	deadline := time.After(d)
@@ -207,8 +207,8 @@ func (q *rateQueue) waitAcks(t *testing.T, want int, d time.Duration) {
 	}
 }
 
-// newRateWorker — воркер на очереди темпа (строк в БД нет — обработки
-// быстрые: доставка подтверждается штатным отказом без рендера).
+// newRateWorker — a worker over the rate queue (no rows in the DB — processing
+// is fast: the delivery is acknowledged by a regular rejection without a render).
 func newRateWorker(t *testing.T, q *rateQueue) *Worker {
 	t.Helper()
 	pool := newRWFakePool()
@@ -221,12 +221,12 @@ func newRateWorker(t *testing.T, q *rateQueue) *Worker {
 	return w
 }
 
-// TestRenderWorker_RunRateCeiling — проводка потолка в Run (T-240, ФТ-13):
-// пачка чтения урезается до свободных слотов окна (первая — Rate, не
-// Consume), исчерпанное окно держит паузу чтения (внутри окна новых
-// чтений нет), после скольжения окна чтение возобновляется и дорабатывает
-// очередь. Окно сжато (renderRateWindow — тестовый шов, образец
-// renderFailWaitBase), реальная пауза — сотни миллисекунд.
+// TestRenderWorker_RunRateCeiling — the cap wiring into Run (T-240, FR-13):
+// the read chunk is trimmed to the window's free slots (the first — Rate, not
+// Consume), an exhausted window holds the read pause (inside the window there are no new
+// reads), after the window slides the reading resumes and finishes
+// the queue. The window is shrunk (renderRateWindow — a test seam, the
+// renderFailWaitBase pattern), the real pause is hundreds of milliseconds.
 func TestRenderWorker_RunRateCeiling(t *testing.T) {
 	oldWindow := renderRateWindow
 	renderRateWindow = 500 * time.Millisecond
@@ -239,21 +239,21 @@ func TestRenderWorker_RunRateCeiling(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- Run(ctx, w, Options{Rate: 3, Consume: 6}) }()
 
-	// Первая пачка урезана потолком: 3 записи, не Consume=6.
+	// The first chunk is trimmed by the cap: 3 entries, not Consume=6.
 	if got := q.waitConsume(t, 0, 5*time.Second); got != 3 {
 		t.Errorf("первая пачка чтения = %d, хочу 3 (потолок окна; не Consume=6)", got)
 	}
 	q.waitAcks(t, 3, 5*time.Second)
 
-	// Потолок исчерпан: до истечения окна (500 мс) чтений больше нет —
-	// за окно потреблено не больше потолка.
+	// The cap is exhausted: until the window expires (500 ms) there are no more reads —
+	// no more than the cap is consumed over the window.
 	time.Sleep(200 * time.Millisecond)
 	if n := q.consumesCount(); n != 1 {
 		t.Errorf("чтений внутри окна = %d, хочу 1 — потолок Rate=3 держит чтение до скольжения окна", n)
 	}
 
-	// Окно скользнуло — чтение возобновилось и дорабатывает остаток:
-	// все 6 доставок розданы и подтверждены.
+	// The window slid — the reading resumed and finishes the rest:
+	// all 6 deliveries are handed out and acknowledged.
 	q.waitAcks(t, 6, 10*time.Second)
 	if left := q.left(); left != 0 {
 		t.Errorf("нерозданных доставок %d, хочу 0 (воркер дорабатывает очередь в темпе потолка)", left)
@@ -261,16 +261,16 @@ func TestRenderWorker_RunRateCeiling(t *testing.T) {
 	rwStopLoop(t, cancel, done)
 }
 
-// TestRenderWorker_RunRateIdleKeepsBudget — пустая очередь не расходует
-// потолок (ФТ-13: батч-режим «собрать и доработать», простой — в блоке
-// XREADGROUP): после пустых чтений следующий запрос берёт полный бюджет
-// окна, без паузы на «потраченное» простое чтение.
+// TestRenderWorker_RunRateIdleKeepsBudget — an empty queue does not spend the
+// cap (FR-13: the "collect and rework" batch mode, idleness — in the
+// XREADGROUP block): after empty reads the next request takes the window's full
+// budget, without a pause for the "spent" idle read.
 func TestRenderWorker_RunRateIdleKeepsBudget(t *testing.T) {
 	oldWindow := renderRateWindow
 	renderRateWindow = 500 * time.Millisecond
 	t.Cleanup(func() { renderRateWindow = oldWindow })
 
-	// Два пустых чтения, потом три доставки: Rate=3, Consume=6.
+	// Two empty reads, then three deliveries: Rate=3, Consume=6.
 	q := newRateQueue(2, "r1", "r2", "r3")
 	w := newRateWorker(t, q)
 
@@ -278,9 +278,9 @@ func TestRenderWorker_RunRateIdleKeepsBudget(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- Run(ctx, w, Options{Rate: 3, Consume: 6}) }()
 
-	// Пустые чтения немедленно сменяются рабочим (бюджет цел — паузы
-	// темпа между ними нет); рабочий запрос берёт полный потолок, а не
-	// остаток «за вычетом пустых чтений».
+	// The empty reads are immediately replaced by a working one (the budget is intact — no
+	// rate pause between them); the working request takes the full cap, not
+	// the remainder "minus the empty reads".
 	if got := q.waitConsume(t, 0, 5*time.Second); got != 3 {
 		t.Errorf("первая пачка = %d, хочу 3 (урезана потолком, не Consume=6)", got)
 	}

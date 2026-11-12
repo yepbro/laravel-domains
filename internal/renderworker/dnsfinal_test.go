@@ -1,17 +1,17 @@
-// Юнит-тесты политики DNS-отказа на рендере (T-211, по итогам T-207):
-// ERR_NAME_NOT_RESOLVED — смерть хоста на уровне DNS. Запись попала в
-// q:render через живой HTTP-эпизод (HTTP-фаза сама резолвила имя), а
-// браузер резолвит тем же системным unbound — отказ на рендере значит,
-// DNS хоста умер между эпизодом и рендером; возврат DNS — масштаб дней,
-// окно ретраев (3 доставки, ~20 мин в PEL) его не покрывает (замер
-// T-207: 252 финализации за ~7 ч, каждая съедала все 3 доставки).
-// DNS-класс финализируется без рендера с первой же доставки — по
-// образцу cert-класса T-159 (без тарпит-лимита T-148): итог — сырой
-// HTML HTTP-фазы (rendered = false), публикация q:analyze,
-// подтверждение доставки — q:dead остаётся инфраструктурным ошибкам.
-// ERR_CONNECTION_REFUSED в класс не входит: восстановление наблюдается
-// (замер T-172: 6.6% ретраев успешны) — повторяем до последней доставки
-// (T-172). Фейковое окружение — worker_test.go.
+// Unit tests of the DNS refusal policy at render (T-211, from the T-207 outcomes):
+// ERR_NAME_NOT_RESOLVED — the death of the host at the DNS level. The entry got into
+// q:render through a live HTTP episode (the HTTP phase resolved the name itself), and
+// the browser resolves with the same system unbound — a refusal at render means
+// the host's DNS died between the episode and the render; DNS recovery is a scale of days,
+// the retry window (3 deliveries, ~20 min in the PEL) does not cover it (the
+// T-207 measurement: 252 finalizations per ~7 h, each ate all 3 deliveries).
+// The DNS class is finalized without a render from the very first delivery — following
+// the cert class T-159 pattern (without the T-148 tarpit limit): the result is the raw
+// HTML of the HTTP phase (rendered = false), a q:analyze publication,
+// the delivery acknowledgment — q:dead stays for infrastructure errors.
+// ERR_CONNECTION_REFUSED is not in the class: recovery is observed
+// (the T-172 measurement: 6.6% of retries succeed) — retryable until the last delivery
+// (T-172). The fake environment — worker_test.go.
 package renderworker
 
 import (
@@ -27,14 +27,14 @@ import (
 	"crawler/internal/render"
 )
 
-// TestRenderWorker_DNSFinalizedWithoutRender — суть T-211: DNS-отказ на
-// ПЕРВОЙ доставке финализирует запись без рендера (мёртвый хост не ест
-// 3 доставки и ~20 мин PEL): обработка успешна (Processing подтверждает
-// доставку), строка остаётся с сырым HTML (rendered = false,
-// content_hash не меняется), публикуется q:analyze (Fresh=true —
-// доработка текущего эпизода), Put/транзакция не выполняются; маркер
-// render_failed_at (T-210) закрывает переиздания прохода до смены
-// контента.
+// TestRenderWorker_DNSFinalizedWithoutRender — the essence of T-211: a DNS refusal on
+// the FIRST delivery finalizes the entry without a render (a dead host does not eat
+// 3 deliveries and ~20 min of PEL): the processing is successful (Processing acknowledges
+// the delivery), the row stays with the raw HTML (rendered = false,
+// content_hash unchanged), q:analyze is published (Fresh=true —
+// reworking the current episode), Put/the transaction are not executed; the
+// render_failed_at marker (T-210) closes the pass's re-publications until the
+// content changes.
 func TestRenderWorker_DNSFinalizedWithoutRender(t *testing.T) {
 	for _, code := range dnsErrorCodes {
 		t.Run(code, func(t *testing.T) {
@@ -43,9 +43,9 @@ func TestRenderWorker_DNSFinalizedWithoutRender(t *testing.T) {
 			f.pool.seedRow(rwKey, "https://spa.example/", &raw)
 			f.renderer.err = rwCertErr("https://spa.example/", code)
 
-			// Первая доставка (attempts=1) — финализация сразу, а не ошибка
-			// повторной доставки: ProcessingAttempt подтверждает после
-			// nil-возврата.
+			// The first delivery (attempts=1) — the finalization right away, not an
+			// error of a re-delivery: ProcessingAttempt acknowledges after
+			// a nil return.
 			err := queue.ProcessingAttempt(context.Background(), f.q, "render-worker", rwDelivery("e1"), 1, f.w.processDelivery)
 			if err != nil {
 				t.Fatalf("DNS-отказ первой доставки обязан финализироваться без ошибки (не q:dead): %v", err)
@@ -82,7 +82,7 @@ func TestRenderWorker_DNSFinalizedWithoutRender(t *testing.T) {
 			if i := f.pool.j.indexOf(rwEvBegin); i >= 0 {
 				t.Errorf("транзакция не должна открываться (событие на %d)", i)
 			}
-			// Refcount не тронут: сырой HTML остаётся итоговым контентом записи.
+			// The refcount is untouched: the raw HTML stays the entry's final content.
 			if refc := rwRefc(f.pool)[raw]; refc != 1 {
 				t.Errorf("refcount сырого HTML = %d, нужен 1 (ссылка жива)", refc)
 			}
@@ -90,10 +90,10 @@ func TestRenderWorker_DNSFinalizedWithoutRender(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_DNSFinalizeAnyAttempt — финализация не зависит от
-// номера доставки (как у cert-класса): клейм с большим attempts (поздний
-// деплой фикса, смешанная история доставок) тоже финализирует, а не
-// уводит в q:dead.
+// TestRenderWorker_DNSFinalizeAnyAttempt — the finalization does not depend on the
+// delivery number (like the cert class): a claim with a high attempts (a late
+// fix deploy, a mixed delivery history) also finalizes instead of
+// taking to q:dead.
 func TestRenderWorker_DNSFinalizeAnyAttempt(t *testing.T) {
 	f := newRWFixture(t)
 	raw := rwTestHash(1)
@@ -113,18 +113,18 @@ func TestRenderWorker_DNSFinalizeAnyAttempt(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_DNSFinalizeNoRow — строки нет (перепроверка
-// перезаписала) или у неё нет итогового URL: финализация — штатный отказ
-// без публикации, доставка подтверждается (как ProcessResult).
+// TestRenderWorker_DNSFinalizeNoRow — there is no row (the recheck
+// rewrote it) or it has no final URL: the finalization — a regular
+// rejection without a publication, the delivery is acknowledged (like ProcessResult).
 func TestRenderWorker_DNSFinalizeNoRow(t *testing.T) {
 	f := newRWFixture(t)
 	f.renderer.err = rwCertErr("https://spa.example/", "net::ERR_NAME_NOT_RESOLVED")
 
-	// Строки нет вовсе.
+	// There is no row at all.
 	if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 1); err != nil {
 		t.Fatalf("строки нет — не ошибка: %v", err)
 	}
-	// Строка без итогового URL.
+	// A row without a final URL.
 	f.pool.seedRow(rwKey, "", nil)
 	if err := f.w.processDelivery(context.Background(), rwDelivery("e2"), 1); err != nil {
 		t.Fatalf("без итогового URL — не ошибка: %v", err)
@@ -134,10 +134,10 @@ func TestRenderWorker_DNSFinalizeNoRow(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_DNSFinalizePublishError — сбой публикации q:analyze
-// при финализации: ошибка без XACK — доставка вернётся и финализация
-// повторится (at-least-once, дубль публикации ограничен попытками,
-// анализатор идемпотентен по ключу).
+// TestRenderWorker_DNSFinalizePublishError — a q:analyze publication
+// failure during finalization: an error without an XACK — the delivery will return and the
+// finalization will repeat (at-least-once, a publication duplicate is bounded by the attempts,
+// the analyzer is idempotent by the key).
 func TestRenderWorker_DNSFinalizePublishError(t *testing.T) {
 	f := newRWFixture(t)
 	raw := rwTestHash(1)
@@ -145,14 +145,14 @@ func TestRenderWorker_DNSFinalizePublishError(t *testing.T) {
 	f.renderer.err = rwCertErr("https://spa.example/", "net::ERR_NAME_NOT_RESOLVED")
 	f.q.publishErrs = []error{errors.New("redis недоступен")}
 
-	// Повторная доставка после сбоя публикации (клейм, attempts вырос).
+	// A re-delivery after the publication failure (a claim, attempts grew).
 	if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 2); err == nil {
 		t.Fatal("сбой публикации q:analyze при финализации — ошибка (повторная доставка)")
 	}
 	if acked := f.q.ackedSnapshot(); len(acked) != 0 {
 		t.Errorf("XACK = %v — подтверждения быть не должно", acked)
 	}
-	// Повтор идемпотентен: та же финализация, публикация проходит.
+	// The repeat is idempotent: the same finalization, the publication goes through.
 	if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 3); err != nil {
 		t.Fatalf("повторная доставка после сбоя публикации обязана финализироваться: %v", err)
 	}
@@ -168,15 +168,15 @@ func TestRenderWorker_DNSFinalizePublishError(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_DNSNotClassified — прежний путь сохраняется для
-// ошибок вне DNS-класса: отказ соединения (решение T-211 по замеру
-// T-172: 6.6% ретраев успешны — до последней доставки повторяем, на
-// последней финализирует политика T-172, не DNS), код нерезолва в
-// чужом классе (контекст умер — инфраструктура), таймаут страницы
-// (территория T-148).
+// TestRenderWorker_DNSNotClassified — the former path is preserved for
+// errors outside the DNS class: a connection refusal (the T-211 decision by the
+// T-172 measurement: 6.6% of retries succeed — retryable until the last delivery, on
+// the last one the T-172 policy finalizes them, not DNS), a non-resolve code in
+// a foreign class (the context died — infrastructure), a page
+// timeout (the T-148 territory).
 func TestRenderWorker_DNSNotClassified(t *testing.T) {
-	// Отказ соединения ниже последней попытки — повторяемая ошибка:
-	// именно решение T-211 — CONNECTION_REFUSED в DNS-класс не входит.
+	// A connection refusal below the last attempt — a retryable error:
+	// exactly the T-211 decision — CONNECTION_REFUSED is not in the DNS class.
 	t.Run("отказ соединения ниже последней попытки (решение T-211)", func(t *testing.T) {
 		f := newRWFixture(t)
 		raw := rwTestHash(1)
@@ -198,8 +198,8 @@ func TestRenderWorker_DNSNotClassified(t *testing.T) {
 		}
 	})
 
-	// Отказ соединения на последней попытке — финализирует политика
-	// T-172 (класс задачи), не DNS: счётчики различают политики.
+	// A connection refusal on the last attempt — the T-172 policy
+	// (the task class) finalizes it, not DNS: the counters distinguish the policies.
 	t.Run("отказ соединения на последней попытке — T-172, не DNS", func(t *testing.T) {
 		f := newRWFixture(t)
 		reg := metrics.New("render-worker")
@@ -224,8 +224,8 @@ func TestRenderWorker_DNSNotClassified(t *testing.T) {
 		}
 	})
 
-	// Код нерезолва в чужом классе не финализируется и на последней
-	// доставке: контекстный класс — инфраструктура (повтор осмыслен).
+	// A non-resolve code in a foreign class is not finalized on the last
+	// delivery either: the context class — infrastructure (a retry makes sense).
 	t.Run("код нерезолва в чужом классе", func(t *testing.T) {
 		f := newRWFixture(t)
 		raw := rwTestHash(1)
@@ -243,9 +243,9 @@ func TestRenderWorker_DNSNotClassified(t *testing.T) {
 		}
 	})
 
-	// Таймаут страницы остаётся территорией T-148: DNS-распознавание
-	// (ProcessResult проверяет его после cert, до тарпита) не должно
-	// глотать таймауты — ниже тарпит-лимита это повторяемая ошибка.
+	// A page timeout stays the territory of T-148: the DNS recognition
+	// (ProcessResult checks it after cert, before the tarpit) must not
+	// swallow timeouts — below the tarpit limit it is a retryable error.
 	t.Run("таймаут ниже тарпит-лимита (территория T-148)", func(t *testing.T) {
 		f := newRWFixture(t)
 		raw := rwTestHash(1)
@@ -262,9 +262,9 @@ func TestRenderWorker_DNSNotClassified(t *testing.T) {
 	})
 }
 
-// TestRenderWorker_DNSMetrics — финализация по DNS-отказу считается
-// задачей этапа, ошибкой класса task и отдельным счётчиком DNS-класса;
-// счётчики тарпитов, сертификатов и task-класса не задеты.
+// TestRenderWorker_DNSMetrics — a DNS refusal finalization is counted
+// as a stage task, a task class error and a separate DNS class counter;
+// the tarpit, certificate and task class counters are not touched.
 func TestRenderWorker_DNSMetrics(t *testing.T) {
 	f := newRWFixture(t)
 	reg := metrics.New("render-worker")

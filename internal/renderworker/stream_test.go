@@ -1,14 +1,14 @@
-// Юнит-тесты параметра стрима потребления воркера (T-236; ТЗ §4.1 п.3,
-// ФТ-12): Options.Stream — точка проводки потребления — чтение цикла Run
-// (XREADGROUP) и клейм RecoverLoop (XAUTOCLAIM) идут по значению поля,
-// дефолт — q:render (нулевые Options воспроизводят сегодняшнее поведение
-// основной сборки, ноль изменений). Переопределение — сборка воркера
-// фолбэка (ТЗ §4.5 п.1): тот же бинарь, другой стрим и отдельная группа.
-// Значение переопределения — существующий стрим q:analyze: транспорт
-// очереди пускает только известные стримы (knownStream), а контракт
-// Result допускает оба стрима формата — q:render и q:analyze (message.go);
-// живое потребление альтернативного стрима отдельной группой —
-// интеграционный тест test/integration/render_stream_test.go.
+// Unit tests of the worker's consumption stream parameter (T-236; spec §4.1 item 3,
+// FR-12): Options.Stream — the consumption wiring point — the Run loop's read
+// (XREADGROUP) and the RecoverLoop claim (XAUTOCLAIM) go by the field's value,
+// the default — q:render (zero Options reproduce today's behavior
+// of the main build, zero changes). The override — the fallback worker
+// build (spec §4.5 item 1): the same binary, a different stream and a separate group.
+// The override value — the existing q:analyze stream: the queue
+// transport lets only known streams through (knownStream), and the
+// Result contract allows both format streams — q:render and q:analyze (message.go);
+// the live consumption of an alternative stream by a separate group —
+// the integration test test/integration/render_stream_test.go.
 package renderworker
 
 import (
@@ -23,18 +23,18 @@ import (
 	"crawler/internal/queue"
 )
 
-// rwConsumeCall — аргументы одного вызова Consume (стрим/группа/
-// консьюмер): то, что цикл Run передаёт транспортy очереди.
+// rwConsumeCall — the arguments of one Consume call (stream/group/
+// consumer): what the Run loop passes to the queue transport.
 type rwConsumeCall struct {
 	stream   string
 	group    string
 	consumer string
 }
 
-// rwStreamQueue — queue.Queue, записывающий аргументы каждого Consume и
-// пустой на доставки: реальная очередь при отсутствии записей
-// блокируется в XREADGROUP до отмены ctx — фейк повторяет это, цикл Run
-// остаётся в читателе, обработки не происходит.
+// rwStreamQueue — a queue.Queue recording the arguments of every Consume and
+// empty on deliveries: the real queue with no entries
+// blocks in XREADGROUP until ctx is cancelled — the fake repeats this, the Run loop
+// stays in the reader, no processing happens.
 type rwStreamQueue struct {
 	mu    sync.Mutex
 	calls []rwConsumeCall
@@ -43,14 +43,14 @@ type rwStreamQueue struct {
 var _ queue.Queue = (*rwStreamQueue)(nil)
 
 func (q *rwStreamQueue) Publish(context.Context, string, queue.Message) (string, error) {
-	return "", nil // публикации нет: доставки не обрабатываются
+	return "", nil // no publication: deliveries are not processed
 }
 
 func (q *rwStreamQueue) Consume(ctx context.Context, stream, group, consumer string, _ int) ([]queue.Delivery, error) {
 	q.mu.Lock()
 	q.calls = append(q.calls, rwConsumeCall{stream: stream, group: group, consumer: consumer})
 	q.mu.Unlock()
-	<-ctx.Done() // пустое чтение: как XREADGROUP BLOCK без записей
+	<-ctx.Done() // an empty read: like XREADGROUP BLOCK without entries
 	return nil, ctx.Err()
 }
 
@@ -58,7 +58,7 @@ func (q *rwStreamQueue) Ack(context.Context, string, string, ...string) error {
 	return nil
 }
 
-// firstConsume — аргументы первого чтения (нулевые, если чтения не было).
+// firstConsume — the arguments of the first read (zero, if there was none).
 func (q *rwStreamQueue) firstConsume() rwConsumeCall {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -68,11 +68,11 @@ func (q *rwStreamQueue) firstConsume() rwConsumeCall {
 	return q.calls[0]
 }
 
-// rwClaimSpy — окно go-redis слоя надёжности (Reliab): записывает стрим
-// каждого клейма XAUTOCLAIM, отвечает пустым PEL — RecoverLoop делает
-// первый клейм немедленно (до первого тика), стрим поля виден без
-// ожиданий. Проба записи (T-152) не монтируется — гейт прозрачен, как у
-// юнит-фиков очереди.
+// rwClaimSpy — a go-redis window over the reliability layer (Reliab): records the
+// stream of every XAUTOCLAIM claim, answers with an empty PEL — RecoverLoop makes
+// the first claim immediately (before the first tick), the field's stream is visible without
+// waits. The write probe (T-152) is not mounted — the gate is transparent, like in
+// the queue's unit fixtures.
 type rwClaimSpy struct {
 	mu      sync.Mutex
 	streams []string
@@ -91,7 +91,7 @@ func (f *rwClaimSpy) XPendingExt(ctx context.Context, a *redis.XPendingExtArgs) 
 	return redis.NewXPendingExtCmd(ctx, "xpending")
 }
 
-// firstClaimStream — стрим первого клейма ("" — клейма не было).
+// firstClaimStream — the first claim's stream ("" — there was no claim).
 func (f *rwClaimSpy) firstClaimStream() string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -101,9 +101,9 @@ func (f *rwClaimSpy) firstClaimStream() string {
 	return f.streams[0]
 }
 
-// TestRenderWorker_StreamDefaults — дефолт стрима потребления (T-236,
-// ФТ-12): DefaultStream — q:render (нулевые Options воспроизводят
-// сегодняшнюю сборку), переопределение полем не затирается.
+// TestRenderWorker_StreamDefaults — the consumption stream default (T-236,
+// FR-12): DefaultStream — q:render (zero Options reproduce
+// today's build), the override is not wiped by the field.
 func TestRenderWorker_StreamDefaults(t *testing.T) {
 	if DefaultStream != queue.StreamRender {
 		t.Errorf("DefaultStream = %q, хочу %q (дефолт — q:render: ноль изменений поведения)",
@@ -118,15 +118,15 @@ func TestRenderWorker_StreamDefaults(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_RunConsumesConfiguredStream — проводка потребления
-// через Options.Stream (T-236, ФТ-12): читатель цикла Run открывает
-// чтение по стриму/группе/консьюмеру поля, RecoverLoop клеймит тот же
-// стрим (точки потребления — worker.go: Run/Consume и RecoverOptions);
-// дефолтные Options читают q:render группой DefaultGroup — сегодняшнее
-// поведение основной сборки.
+// TestRenderWorker_RunConsumesConfiguredStream — the consumption wiring
+// through Options.Stream (T-236, FR-12): the Run loop's reader opens
+// the read by the field's stream/group/consumer, RecoverLoop claims the same
+// stream (the consumption points — worker.go: Run/Consume and RecoverOptions);
+// default Options read q:render with the DefaultGroup group — today's
+// behavior of the main build.
 func TestRenderWorker_RunConsumesConfiguredStream(t *testing.T) {
-	// newStreamWorker — воркер на записывающей очереди (обработки нет:
-	// строки/рендер/хранилище — фейки фикстуры, до них дело не доходит).
+	// newStreamWorker — a worker over the recording queue (no processing:
+	// rows/render/storage — the fixture's fakes, the case never gets there).
 	newStreamWorker := func(t *testing.T, q queue.Queue) *Worker {
 		t.Helper()
 		pool := newRWFakePool()
@@ -138,8 +138,8 @@ func TestRenderWorker_RunConsumesConfiguredStream(t *testing.T) {
 		}
 		return w
 	}
-	// waitConsume — первый факт чтения (детерминированно: читатель Run
-	// обращается к очереди сразу на первой итерации).
+	// waitConsume — the first fact of a read (deterministically: the Run
+	// reader calls the queue right on the first iteration).
 	waitConsume := func(t *testing.T, q *rwStreamQueue) rwConsumeCall {
 		t.Helper()
 		deadline := time.After(5 * time.Second)
@@ -195,7 +195,7 @@ func TestRenderWorker_RunConsumesConfiguredStream(t *testing.T) {
 			t.Errorf("Consume: группа/консьюмер %q/%q, хочу %q/%q (Options.Group/Consumer)",
 				got.group, got.consumer, opts.Group, opts.Consumer)
 		}
-		// Клейм RecoverLoop — по тому же стриму (первый клейм до тика).
+		// The RecoverLoop claim — over the same stream (the first claim before the tick).
 		if s := waitClaim(t, spy); s != opts.Stream {
 			t.Errorf("клейм RecoverLoop: стрим %q, хочу %q (Options.Stream)", s, opts.Stream)
 		}

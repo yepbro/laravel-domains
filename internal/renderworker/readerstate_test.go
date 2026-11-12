@@ -2,13 +2,13 @@ package renderworker
 
 import "testing"
 
-// TestRenderWorker_ReaderDecide — таблица переходов автомата режимов
-// читателя (T-262, ТЗ-fsm §3 ФТ-8): полный набор наблюдений прохода →
-// режим. Строки идут в порядке приоритетов П1→П4 спецификации
-// readerstate.go: каждая строка предполагает, что наблюдения строк
-// выше не выполнены; несмонтированный датчик кодируется нулевым
-// значением его полей (решение значение не читает) — эти строки
-// фиксируют и недостижимость пауз без датчика.
+// TestRenderWorker_ReaderDecide — the transition table of the reader mode
+// FSM (T-262, TZ-fsm §3 FR-8): the full set of pass observations →
+// a mode. The rows follow the T1→T4 priority order of the
+// readerstate.go specification: each row assumes the observations of the rows
+// above did not hold; an unmounted sensor is encoded by the zero
+// values of its fields (the decision does not read the value) — these rows
+// also fix the unreachability of pauses without a sensor.
 func TestRenderWorker_ReaderDecide(t *testing.T) {
 	const batch = 4
 	for _, c := range []struct {

@@ -1,15 +1,15 @@
-// Юнит-тесты health-гейта и бюджета доли фолбэка (T-239, ТЗ §4.4
-// п.3–4, ФТ-9): стрик инфра-ошибок класса браузера (основной движок
-// недоступен) числом render.fallback.health_gate_streak приостанавливает
-// фолбэк-публикацию до восстановления движка — кандидат финализируется
-// по-сегодняшнему (маркер render_failed_at + q:analyze), без потерь;
-// доля публикаций за окно сверх render.fallback.share_percent
-// приостанавливает публикации до границы окна (маркер ставится);
-// события приостановок — crawler_render_fallback_suspended_total
-// {gate|budget}. Сценарий «движок лёг» — юнит-уровень через фейки:
-// живой прогон требует ПАДАЮЩЕГО движка по расписанию (детерминированный
-// стрик ClassBrowser), что даёт только фейк рендера — интеграционная
-// приёмка фолбэка (TestAccept03) использует тот же приём для воркера A.
+// Unit tests of the fallback health gate and share budget (T-239, spec §4.4
+// items 3–4, FR-9): a streak of infra errors of the browser class (the main engine
+// unavailable) reaching render.fallback.health_gate_streak suspends
+// the fallback publication until the engine recovers — the candidate is finalized
+// as today (the render_failed_at marker + q:analyze), without losses;
+// the share of publications over the window beyond render.fallback.share_percent
+// suspends the publications until the window boundary (the marker is set);
+// the suspension events — crawler_render_fallback_suspended_total
+// {gate|budget}. The "engine fell" scenario — the unit level through fakes:
+// a live run requires a FALLING engine on schedule (a deterministic
+// ClassBrowser streak), which only a render fake gives — the integration
+// acceptance of the fallback (TestAccept03) uses the same trick for worker A.
 package renderworker
 
 import (
@@ -24,13 +24,13 @@ import (
 	"crawler/internal/render"
 )
 
-// newRWGateFixture — фикстура с вооружённым фолбэком (Enabled + стрим
-// q:render + движок-кандидат сборки — S-P1-1: chromium фолбэк не
-// публикует) и подключёнными состояниями гейта/бюджета (T-239):
-// threshold — порог стрика инфра-ошибок (render.fallback
-// .health_gate_streak), ceiling — потолок доли публикаций за окно
-// (render.fallback.share_percent; 0 — без потолка). Реестр метрик —
-// для проверки событий приостановки.
+// newRWGateFixture — a fixture with the fallback armed (Enabled + the
+// q:render stream + the candidate engine of the build — S-P1-1: chromium does not
+// publish the fallback) and the gate/budget states connected (T-239):
+// threshold — the infra error streak threshold (render.fallback
+// .health_gate_streak), ceiling — the share cap of publications over the window
+// (render.fallback.share_percent; 0 — without a cap). The metrics registry —
+// for checking the suspension events.
 func newRWGateFixture(t *testing.T, threshold int, ceiling float64) (*rwFixture, *metrics.Registry) {
 	t.Helper()
 	f := newRWFixture(t)
@@ -42,7 +42,7 @@ func newRWGateFixture(t *testing.T, threshold int, ceiling float64) (*rwFixture,
 			Gate:    FallbackGate{Threshold: threshold},
 			Budget:  FallbackBudget{Ceiling: ceiling},
 		},
-		Engine:  rwFBCandidateEngine, // движок-кандидат: guard публикации (S-P1-1)
+		Engine:  rwFBCandidateEngine, // the candidate engine: the publication guard (S-P1-1)
 		Metrics: reg,
 	})
 	if err != nil {
@@ -51,42 +51,42 @@ func newRWGateFixture(t *testing.T, threshold int, ceiling float64) (*rwFixture,
 	return f, reg
 }
 
-// rwBrowserErr — ошибка рендера класса браузера (основной движок
-// недоступен): как ClassOf классифицирует сбои подключения/зонда
-// (T-065) — инфра-ошибка для стрика health-гейта (T-239).
+// rwBrowserErr — a render error of the browser class (the main engine
+// unavailable): how ClassOf classifies connection/probe failures
+// (T-065) — an infra error for the health gate streak (T-239).
 func rwBrowserErr(url string) error {
 	return &render.Error{Class: render.ClassBrowser, URL: url,
 		Err: errors.New("браузер недоступен: соединение потеряно")}
 }
 
-// rwGateSuspended — значение crawler_render_fallback_suspended_total
-// {reason=gate} (серия предсоздана нулём — S-P1-4: 0 — события не было).
+// rwGateSuspended — the value of crawler_render_fallback_suspended_total
+// {reason=gate} (the series is pre-created with a zero — S-P1-4: 0 — there was no event).
 func rwGateSuspended(t *testing.T, reg *metrics.Registry) float64 {
 	t.Helper()
 	return rwMetricValue(t, reg, "crawler_render_fallback_suspended_total",
 		map[string]string{"reason": fbReasonGate})
 }
 
-// rwBudgetSuspended — значение crawler_render_fallback_suspended_total
-// {reason=budget} (серия предсоздана нулём — S-P1-4: 0 — события не было).
+// rwBudgetSuspended — the value of crawler_render_fallback_suspended_total
+// {reason=budget} (the series is pre-created with a zero — S-P1-4: 0 — there was no event).
 func rwBudgetSuspended(t *testing.T, reg *metrics.Registry) float64 {
 	t.Helper()
 	return rwMetricValue(t, reg, "crawler_render_fallback_suspended_total",
 		map[string]string{"reason": fbReasonBudget})
 }
 
-// rwFBCount — записей в q:render-fallback (фикстура без очистки
-// публикаций — счётчик растёт по фазам теста).
+// rwFBCount — the entries in q:render-fallback (the fixture without
+// publication resets — the counter grows over the test's phases).
 func rwFBCount(t *testing.T, f *rwFixture) int {
 	t.Helper()
 	return len(rwFallbackPublishes(t, f))
 }
 
-// TestRenderWorker_FallbackDecision — таблица состояний функции-решения
-// (кандидат × гейт × бюджет, T-239; замена стаб-теста always-publish
-// T-238): здоровый движок публикует, стрик на/за порогом и приостановка
-// бюджета отказывают; нулевые пороги (сборки без конфигурации) — гейт и
-// бюджет выключены, поведение заглушки T-238.
+// TestRenderWorker_FallbackDecision — the state table of the decision function
+// (candidate × gate × budget, T-239; the replacement of the always-publish stub test
+// T-238): a healthy engine publishes, the streak on/beyond the threshold and a budget
+// suspension reject; zero thresholds (builds without configuration) — the gate and
+// budget are off, the T-238 stub behavior.
 func TestRenderWorker_FallbackDecision(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -114,21 +114,21 @@ func TestRenderWorker_FallbackDecision(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_FallbackGateBrowserStreakSuspends — стрик инфра-ошибок
-// ClassBrowser закрывает гейт (ФТ-9а): ниже порога публикации идут
-// (единичная инфра-ошибка — шум живого потока), ошибка класса задачи
-// стрик НЕ сбрасывает (свойство страницы, не движка — тарпиты есть и у
-// здорового), порог достигнут — событие приостановки, кандидат
-// финализируется по-сегодняшнему (маркер + q:analyze) БЕЗ публикации в
-// q:render-fallback; событие не плодится на инфра-ошибках за порогом.
+// TestRenderWorker_FallbackGateBrowserStreakSuspends — a streak of infra errors
+// of ClassBrowser closes the gate (FR-9a): below the threshold the publications go
+// (a single infra error — the live flow's noise), a task class error
+// does NOT reset the streak (a page property, not the engine's — even a
+// healthy one has tarpits), the threshold is reached — a suspension event, the candidate
+// is finalized as today (the marker + q:analyze) WITHOUT a publication to
+// q:render-fallback; the event is not multiplied on infra errors beyond the threshold.
 func TestRenderWorker_FallbackGateBrowserStreakSuspends(t *testing.T) {
 	f, reg := newRWGateFixture(t, 3, 30)
 	raw := rwTestHash(1)
 	f.pool.seedRow(rwKey, "https://spa.example/", &raw)
 	f.renderer.err = rwBrowserErr("https://spa.example/")
 
-	// Две инфра-ошибки: доставки возвращаются ошибкой (redelivery,
-	// browser-класс финализацией не покрывается), события нет.
+	// Two infra errors: the deliveries return with an error (a redelivery,
+	// the browser class is not covered by a finalization), no event.
 	for i := 1; i <= 2; i++ {
 		if err := f.w.processDelivery(context.Background(), rwDelivery(fmt.Sprintf("e%d", i)), 1); err == nil {
 			t.Fatalf("инфра-ошибка класса браузера — ошибка доставки (redelivery), доставка %d", i)
@@ -138,9 +138,9 @@ func TestRenderWorker_FallbackGateBrowserStreakSuspends(t *testing.T) {
 		t.Errorf("crawler_render_fallback_suspended_total{gate} до порога = %v, want 0 (серия предсоздана нулём, S-P1-4)", got)
 	}
 
-	// Кандидат между инфра-ошибками (стрик 2 < 3): публикация идёт,
-	// ошибка класса задачи стрик не сбрасывает — иначе тарпиты живого
-	// потока открывали бы гейт лежачего движка.
+	// A candidate between the infra errors (the streak 2 < 3): the publication goes,
+	// a task class error does not reset the streak — otherwise the live
+	// flow's tarpits would open the gate for a down engine.
 	f.renderer.err = rwTarpitErr("https://spa.example/")
 	if err := f.w.processDelivery(context.Background(), rwDelivery("t1"), 2); err != nil {
 		t.Fatalf("кандидат при открытом гейте — публикация, не ошибка: %v", err)
@@ -149,8 +149,8 @@ func TestRenderWorker_FallbackGateBrowserStreakSuspends(t *testing.T) {
 		t.Fatalf("публикаций q:render-fallback = %d, нужна 1 (гейт открыт)", n)
 	}
 
-	// Третья инфра-ошибка — порог (дефолт конфига 3): событие
-	// приостановки, одно на переход «открыт → закрыт».
+	// The third infra error — the threshold (the config default 3): the
+	// suspension event, one per the "open → closed" transition.
 	f.renderer.err = rwBrowserErr("https://spa.example/")
 	if err := f.w.processDelivery(context.Background(), rwDelivery("e3"), 1); err == nil {
 		t.Fatal("третья инфра-ошибка — ошибка доставки (redelivery)")
@@ -159,12 +159,12 @@ func TestRenderWorker_FallbackGateBrowserStreakSuspends(t *testing.T) {
 		t.Errorf("crawler_render_fallback_suspended_total{gate} = %v, want 1", got)
 	}
 
-	// Кандидат при закрытом гейте — ДРУГАЯ запись (не дубль уже
-	// опубликованной: дубль узнаётся до решения, см.
-	// TestRenderWorker_FallbackDuplicateDuringSuspension): финализация
-	// по-сегодняшнему — маркер
-	// и q:analyze, БЕЗ публикации (перелив потока на дорогой движок при
-	// нездоровом основном исключён, ФТ-9а), задача без потерь.
+	// A candidate with the gate closed — a DIFFERENT row (not a duplicate of the
+	// already published one: a duplicate is learned about before the decision, see
+	// TestRenderWorker_FallbackDuplicateDuringSuspension): the finalization
+	// as today — the marker
+	// and q:analyze, WITHOUT a publication (the flow overflow onto the expensive engine with
+	// an unhealthy main one is excluded, FR-9a), tasks without losses.
 	key2 := rwRowKey{zone: 3, domain: rwKey.domain + 100, subdomain: 1, variant: 0}
 	f.pool.seedRow(key2, "https://spa.example/", &raw)
 	f.renderer.err = rwTarpitErr("https://spa.example/")
@@ -183,7 +183,7 @@ func TestRenderWorker_FallbackGateBrowserStreakSuspends(t *testing.T) {
 		t.Error("маркер render_failed_at обязан ставиться (приостановка = сегодняшняя финализация, ТЗ §4.4 п.3)")
 	}
 
-	// Инфра-ошибка за порогом: событие не плодится (стрик 4).
+	// An infra error beyond the threshold: the event is not multiplied (the streak 4).
 	f.renderer.err = rwBrowserErr("https://spa.example/")
 	_ = f.w.processDelivery(context.Background(), rwDelivery("e4"), 1)
 	if got := rwGateSuspended(t, reg); got != 1 {
@@ -191,18 +191,18 @@ func TestRenderWorker_FallbackGateBrowserStreakSuspends(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_FallbackGateRecoversOnSuccess — восстановление движка
-// (ФТ-9а): успешный рендер обнуляет стрик (движок подал признак жизни,
-// образец renderFailBackoff — обнуление успехом), гейт открывается и
-// следующие кандидаты публикуются; события восстановления нет (метрика —
-// только приостановки).
+// TestRenderWorker_FallbackGateRecoversOnSuccess — the engine's recovery
+// (FR-9a): a successful render resets the streak (the engine showed a sign of life,
+// the renderFailBackoff pattern — a reset by success), the gate opens and
+// the following candidates are published; there is no recovery event (the metric is
+// only suspensions).
 func TestRenderWorker_FallbackGateRecoversOnSuccess(t *testing.T) {
 	f, reg := newRWGateFixture(t, 3, 30)
 	raw := rwTestHash(1)
 	f.pool.seedRow(rwKey, "https://spa.example/", &raw)
 	f.renderer.err = rwBrowserErr("https://spa.example/")
 
-	// Порог: гейт закрыт.
+	// The threshold: the gate is closed.
 	for i := 1; i <= 3; i++ {
 		_ = f.w.processDelivery(context.Background(), rwDelivery(fmt.Sprintf("e%d", i)), 1)
 	}
@@ -210,8 +210,8 @@ func TestRenderWorker_FallbackGateRecoversOnSuccess(t *testing.T) {
 		t.Fatalf("crawler_render_fallback_suspended_total{gate} = %v, want 1 (порог достигнут)", got)
 	}
 
-	// Восстановление: успешный рендер другой записи (менеджер
-	// перезапустил движок, T-065 — страница отрисовалась).
+	// The recovery: a successful render of another row (the manager
+	// restarted the engine, T-065 — the page rendered).
 	key2 := rwRowKey{zone: 3, domain: rwKey.domain + 1, subdomain: 1, variant: 0}
 	f.pool.seedRow(key2, "https://ok.example/", &raw)
 	f.renderer.err = nil
@@ -223,7 +223,7 @@ func TestRenderWorker_FallbackGateRecoversOnSuccess(t *testing.T) {
 		t.Fatal("успешный рендер обязан записать DOM (движок жив)")
 	}
 
-	// Гейт открыт: кандидат публикуется в фолбэк, маркера нет.
+	// The gate is open: the candidate is published to the fallback, no marker.
 	f.renderer.err = rwTarpitErr("https://spa.example/")
 	if err := f.w.processDelivery(context.Background(), rwDelivery("t1"), 2); err != nil {
 		t.Fatalf("кандидат после восстановления — публикация, не ошибка: %v", err)
@@ -239,21 +239,21 @@ func TestRenderWorker_FallbackGateRecoversOnSuccess(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_FallbackBudgetWindowSuspension — окно бюджета доли
-// (ФТ-9б): публикации копятся числителем, подтверждённые доставки —
-// знаменателем; заполненное окно с долей сверх потолка приостанавливает
-// публикации следующего окна — кандидат получает маркер (критерий
-// «после исчерпания бюджета — маркер ставится»), событие {budget};
-// приостановленное окно публикаций не набирает — следующая оценка
-// возвращает фолбэк (самовозврат).
+// TestRenderWorker_FallbackBudgetWindowSuspension — the share budget window
+// (FR-9b): the publications accumulate in the numerator, the acknowledged
+// deliveries — in the denominator; a filled window with a share beyond the cap suspends
+// the next window's publications — the candidate gets the marker (the criterion
+// "after the budget is exhausted — the marker is set"), the {budget} event;
+// the suspended window does not accumulate publications — the next estimate
+// returns the fallback (self-reset).
 func TestRenderWorker_FallbackBudgetWindowSuspension(t *testing.T) {
-	// Потолок 10%: 101 публикация на 1000 доставок окна (10,1%) —
-	// перерасход; 100 (ровно 10%) — нет («сверх потолка»).
+	// A cap of 10%: 101 publications per the window's 1000 deliveries (10.1%) —
+	// an overspend; 100 (exactly 10%) — no ("beyond the cap").
 	f, reg := newRWGateFixture(t, 0, 10)
 	raw := rwTestHash(1)
 
-	// Фаза A — 101 кандидат: каждый публикуется (гейт выключен
-	// порогом 0, бюджет до оценки окна не мешает).
+	// Phase A — 101 candidates: each is published (the gate is off
+	// by the threshold 0, the budget does not interfere before the window estimate).
 	f.renderer.err = rwTarpitErr("https://spa.example/")
 	pubs := 0
 	for i := 0; i < 101; i++ {
@@ -272,9 +272,9 @@ func TestRenderWorker_FallbackBudgetWindowSuspension(t *testing.T) {
 		t.Errorf("crawler_render_fallback_suspended_total{budget} до закрытия окна = %v, want 0 (серия предсоздана нулём)", got)
 	}
 
-	// Фаза B — наполнитель до 1000 подтверждённых доставок: доставки
-	// без строк подтверждаются штатным отказом. На тысячной окно
-	// закрывается: 10,1% > 10% — приостановка следующего окна.
+	// Phase B — filler up to 1000 acknowledged deliveries: deliveries
+	// without rows are acknowledged by a regular rejection. On the thousandth the window
+	// closes: 10.1% > 10% — the next window's suspension.
 	filler := func(from, n int) {
 		t.Helper()
 		for i := 0; i < n; i++ {
@@ -290,8 +290,8 @@ func TestRenderWorker_FallbackBudgetWindowSuspension(t *testing.T) {
 		t.Errorf("crawler_render_fallback_suspended_total{budget} = %v, want 1 (окно перерасходовало потолок)", got)
 	}
 
-	// Фаза C — кандидат в приостановленном окне: финализация с маркером
-	// (как при выключенном фолбэке), публикации нет.
+	// Phase C — a candidate in the suspended window: a finalization with the marker
+	// (like with the fallback off), no publication.
 	key := rwRowKey{zone: 3, domain: 3000, subdomain: 1, variant: 0}
 	f.pool.seedRow(key, "https://spa.example/", &raw)
 	if err := f.w.processDelivery(context.Background(),
@@ -309,15 +309,15 @@ func TestRenderWorker_FallbackBudgetWindowSuspension(t *testing.T) {
 		t.Errorf("crawler_render_fallback_published_total{timeout} = %v, want %d", got, pubs)
 	}
 
-	// Фаза D — приостановленное окно добирает 999 подтверждённых
-	// доставок (кандидат фазы C уже посчитан) и закрывается без
-	// публикаций: оценка возвращает фолбэк.
+	// Phase D — the suspended window collects the remaining 999 acknowledged
+	// deliveries (the phase C candidate is already counted) and closes without
+	// publications: the estimate returns the fallback.
 	filler(899, fallbackBudgetWindow-1)
 	if got := rwBudgetSuspended(t, reg); got != 1 {
 		t.Errorf("crawler_render_fallback_suspended_total{budget} = %v, want 1 (одно событие на защёлкивание)", got)
 	}
 
-	// Фаза E — следующее окно публикует снова (самовозврат).
+	// Phase E — the next window publishes again (self-reset).
 	key2 := rwRowKey{zone: 3, domain: 3001, subdomain: 1, variant: 0}
 	f.pool.seedRow(key2, "https://spa.example/", &raw)
 	if err := f.w.processDelivery(context.Background(),
@@ -332,15 +332,15 @@ func TestRenderWorker_FallbackBudgetWindowSuspension(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_FallbackBudgetExactCeilingNotSuspended — доля ровно
-// на потолке — не «сверх»: окно закрывается без приостановки (порог
-// отклонения ТЗ §5.3 — выше 30% — обнуляет экономику, ровно 30% —
-// рабочая точка).
+// TestRenderWorker_FallbackBudgetExactCeilingNotSuspended — the share exactly
+// at the cap — not "beyond": the window closes without a suspension (the spec
+// §5.3 deviation threshold — above 30% — zeroes the economics, exactly 30% —
+// the working point).
 func TestRenderWorker_FallbackBudgetExactCeilingNotSuspended(t *testing.T) {
 	f, reg := newRWGateFixture(t, 0, 10)
 	raw := rwTestHash(1)
 	f.renderer.err = rwTarpitErr("https://spa.example/")
-	// 100 публикаций из 1000 доставок = ровно 10%.
+	// 100 publications of 1000 deliveries = exactly 10%.
 	for i := 0; i < 100; i++ {
 		key := rwRowKey{zone: 3, domain: int64(30000 + i), subdomain: 1, variant: 0}
 		f.pool.seedRow(key, "https://spa.example/", &raw)
@@ -359,7 +359,7 @@ func TestRenderWorker_FallbackBudgetExactCeilingNotSuspended(t *testing.T) {
 	if got := rwBudgetSuspended(t, reg); got != 0 {
 		t.Errorf("crawler_render_fallback_suspended_total{budget} = %v, want 0 (доля на потолке, не сверх; серия предсоздана нулём)", got)
 	}
-	// Следующий кандидат публикуется: окно не приостанавливалось.
+	// The next candidate is published: the window was not suspended.
 	key := rwRowKey{zone: 3, domain: 31000, subdomain: 1, variant: 0}
 	f.pool.seedRow(key, "https://spa.example/", &raw)
 	if err := f.w.processDelivery(context.Background(),
@@ -371,36 +371,36 @@ func TestRenderWorker_FallbackBudgetExactCeilingNotSuspended(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_FallbackGateNoOpDoesNotReset — сброс стрика только
-// успешным рендером (ревью T-239, P1): штатный отказ без рендера
-// (строки нет / ушла из-под задачи — ProcessResult вернул nil, не
-// выполнив рендер) признаком жизни движка не считается — no-op между
-// инфра-ошибками стрик не обнуляет, гейт защёлкивается сквозь него.
+// TestRenderWorker_FallbackGateNoOpDoesNotReset — the streak reset only by
+// a successful render (the T-239 review, P1): a regular rejection without a
+// render (no row / it slipped out from under the task — ProcessResult returned nil without
+// rendering) does not count as a sign of the engine's life — a no-op between
+// infra errors does not reset the streak, the gate latches through it.
 func TestRenderWorker_FallbackGateNoOpDoesNotReset(t *testing.T) {
 	f, reg := newRWGateFixture(t, 3, 30)
 	raw := rwTestHash(1)
 	f.pool.seedRow(rwKey, "https://spa.example/", &raw)
 
-	// Две инфра-ошибки движка (доставка возвращается ошибкой — ред.)
+	// Two engine infra errors (the delivery returns with an error — ed.)
 	f.renderer.err = rwBrowserErr("https://spa.example/")
 	_ = f.w.processDelivery(context.Background(), rwDelivery("e1"), 1)
 	_ = f.w.processDelivery(context.Background(), rwDelivery("e2"), 1)
 
-	// No-op между ними: строки нет — успех без рендера; рендер не
-	// выполнялся, движок признака жизни не подал.
+	// A no-op between them: no row — a success without a render; no render
+	// was executed, the engine showed no sign of life.
 	missing := rwRowKey{zone: 9, domain: 99999, subdomain: 1, variant: 0}
 	if err := f.w.processDelivery(context.Background(),
 		rwKeyDelivery(t, "noop", missing, "missing.example"), 1); err != nil {
 		t.Fatalf("no-op — не ошибка: %v", err)
 	}
 
-	// Третья инфра-ошибка — порог достигнут (no-op стрик не сбросил).
+	// The third infra error — the threshold is reached (the no-op did not reset the streak).
 	_ = f.w.processDelivery(context.Background(), rwDelivery("e3"), 1)
 	if got := rwGateSuspended(t, reg); got != 1 {
 		t.Fatalf("crawler_render_fallback_suspended_total{gate} = %v, want 1 (no-op без рендера стрик не сбрасывает)", got)
 	}
 
-	// Кандидат при закрытом гейте — маркер, без публикации.
+	// A candidate with the gate closed — the marker, without a publication.
 	f.renderer.err = rwTarpitErr("https://spa.example/")
 	if err := f.w.processDelivery(context.Background(), rwDelivery("t1"), 2); err != nil {
 		t.Fatalf("кандидат при закрытом гейте — штатная финализация: %v", err)
@@ -413,17 +413,17 @@ func TestRenderWorker_FallbackGateNoOpDoesNotReset(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_FallbackDuplicateDuringSuspension — дубль доставки
-// опубликованной записи узнаётся ДО решения гейта/бюджета (ревью T-239,
-// P3): запись уже ждёт воркера B в q:render-fallback — приостановка
-// состоявшуюся публикацию не отменяет, дубль подтверждается без второй
-// записи в стриме, без маркера и без q:analyze (ФТ-11).
+// TestRenderWorker_FallbackDuplicateDuringSuspension — a delivery duplicate
+// of a published row is learned about BEFORE the gate/budget decision (the T-239
+// review, P3): the entry is already waiting for worker B in q:render-fallback — a suspension
+// does not cancel a publication that happened, the duplicate is acknowledged without a second
+// entry in the stream, without a marker and without q:analyze (FR-11).
 func TestRenderWorker_FallbackDuplicateDuringSuspension(t *testing.T) {
 	f, _ := newRWGateFixture(t, 3, 30)
 	raw := rwTestHash(1)
 	f.pool.seedRow(rwKey, "https://spa.example/", &raw)
 
-	// Публикация состоялась; XACK потерян — доставка вернётся дублем.
+	// The publication happened; the XACK was lost — the delivery will return as a duplicate.
 	f.renderer.err = rwTarpitErr("https://spa.example/")
 	if err := f.w.processDelivery(context.Background(), rwDelivery("t1"), 2); err != nil {
 		t.Fatalf("фолбэк-публикация: %v", err)
@@ -432,14 +432,14 @@ func TestRenderWorker_FallbackDuplicateDuringSuspension(t *testing.T) {
 		t.Fatalf("публикаций q:render-fallback = %d, нужна 1", n)
 	}
 
-	// Движок лёг: гейт закрыт стриком.
+	// The engine fell: the gate is closed by the streak.
 	f.renderer.err = rwBrowserErr("https://spa.example/")
 	for i := 0; i < 3; i++ {
 		_ = f.w.processDelivery(context.Background(), rwDelivery(fmt.Sprintf("e%d", i)), 1)
 	}
 
-	// Дубль при закрытом гейте: без второй публикации, без маркера,
-	// без q:analyze — запись дорабатывает воркер B.
+	// A duplicate with the gate closed: without a second publication, without a marker,
+	// without q:analyze — worker B reworks the entry.
 	f.renderer.err = rwTarpitErr("https://spa.example/")
 	if err := f.w.processDelivery(context.Background(), rwDelivery("t1dup"), 2); err != nil {
 		t.Fatalf("дубль в приостановке подтверждается без ошибки: %v", err)
@@ -457,12 +457,12 @@ func TestRenderWorker_FallbackDuplicateDuringSuspension(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_FallbackStatesParallel — параллельные доставки
-// (ревью T-239, P3: заявленная потокобезопасность fbMu): N кандидатов
-// одновременно публикуются — учёт числителя/знаменателя окна без потерь,
-// дедлоков нет; все доставки завершаются (Timeout через wait group).
+// TestRenderWorker_FallbackStatesParallel — parallel deliveries
+// (the T-239 review, P3: the declared thread safety of fbMu): N candidates
+// are published simultaneously — the window's numerator/denominator accounting without losses,
+// no deadlocks; all deliveries finish (a Timeout through the wait group).
 func TestRenderWorker_FallbackStatesParallel(t *testing.T) {
-	f, reg := newRWGateFixture(t, 1000, 30) // порог недостижим — гейт открыт
+	f, reg := newRWGateFixture(t, 1000, 30) // an unreachable threshold — the gate is open
 	raw := rwTestHash(1)
 	f.renderer.err = rwTarpitErr("https://spa.example/")
 
@@ -483,8 +483,8 @@ func TestRenderWorker_FallbackStatesParallel(t *testing.T) {
 	}
 	wg.Wait()
 
-	// Все публикации прошли: числитель = n (учёт без гонок), доля
-	// окна n/n ниже потолка 30% не защёлкивалась — окно ещё не закрыто.
+	// All the publications went through: the numerator = n (the accounting without races),
+	// the window's share n/n below the 30% cap never latched — the window is not closed yet.
 	if got := rwFBCount(t, f); got != n {
 		t.Errorf("публикаций q:render-fallback = %d, want %d", got, n)
 	}
@@ -501,11 +501,11 @@ func TestRenderWorker_FallbackStatesParallel(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_FallbackWorkerBNoState — изоляция воркера B (ревью
-// T-239, P3): тот же бинарь на стриме q:render-fallback наблюдений
-// гейта/бюджета не ведёт (fallbackArmed) и событий приостановки не
-// поднимает — его движок (chromium) не основной, алерты фолбэка не
-// его забота.
+// TestRenderWorker_FallbackWorkerBNoState — worker B's isolation (the
+// T-239 review, P3): the same binary on the q:render-fallback stream keeps no
+// gate/budget observations (fallbackArmed) and raises no suspension
+// events — its engine (chromium) is not the main one, the fallback alerts are not
+// its concern.
 func TestRenderWorker_FallbackWorkerBNoState(t *testing.T) {
 	f := newRWFixture(t)
 	reg := metrics.New("render-worker")
@@ -513,10 +513,10 @@ func TestRenderWorker_FallbackWorkerBNoState(t *testing.T) {
 	f.w, err = New(f.pool, f.q, f.store, f.renderer, Options{
 		Fallback: FallbackOptions{
 			Enabled: true,
-			Gate:    FallbackGate{Threshold: 1}, // порог 1: любая инфра-ошибка закрыла бы
+			Gate:    FallbackGate{Threshold: 1}, // a threshold of 1: any infra error would close it
 			Budget:  FallbackBudget{Ceiling: 30},
 		},
-		Stream:  queue.StreamRenderFallback, // сборка воркера B (T-236)
+		Stream:  queue.StreamRenderFallback, // the worker B build (T-236)
 		Metrics: reg,
 	})
 	if err != nil {
@@ -526,8 +526,8 @@ func TestRenderWorker_FallbackWorkerBNoState(t *testing.T) {
 	f.pool.seedRow(rwKey, "https://spa.example/", &raw)
 	f.renderer.err = rwBrowserErr("https://spa.example/")
 
-	// Инфра-ошибка и кандидат на воркере B: состояний нет, метрика
-	// приостановок не растёт.
+	// An infra error and a candidate on worker B: no states, the
+	// suspension metric does not grow.
 	_ = f.w.processDelivery(context.Background(), rwDelivery("e1"), 1)
 	f.renderer.err = rwTarpitErr("https://spa.example/")
 	if err := f.w.processDelivery(context.Background(), rwDelivery("t1"), 2); err != nil {
@@ -537,8 +537,8 @@ func TestRenderWorker_FallbackWorkerBNoState(t *testing.T) {
 	if gate.streak != 0 || budget.tasks != 0 || budget.published != 0 || budget.hold {
 		t.Errorf("состояния воркера B: gate=%+v budget=%+v, хочу нулевые (наблюдения только в вооружённой сборке)", gate, budget)
 	}
-	// Серии предсозданы нулевыми у всех сборок (S-P1-4): у воркера B
-	// семейство есть, но не растёт — событий приостановки нет.
+	// The series are pre-created with zeros in all builds (S-P1-4): worker B
+	// has the family, but it does not grow — no suspension events.
 	if got := rwMetricValue(t, reg, "crawler_render_fallback_suspended_total", nil); got != 0 {
 		t.Errorf("crawler_render_fallback_suspended_total = %v, want 0 (серии предсозданы нулями, не растут)", got)
 	}
@@ -547,22 +547,22 @@ func TestRenderWorker_FallbackWorkerBNoState(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_FallbackEngineDownScenario — сценарий «движок лёг»
-// (ТЗ §4.4 п.3, критерий T-239): основной движок отдаёт инфра-ошибки
-// класса браузера — публикации в q:render-fallback НЕТ (browser-класс —
-// не кандидат, инфраструктура), каждая доставка возвращается ошибкой
-// без XACK (задачи в redelivery q:render — клейм вернёт их после
-// восстановления); стрик закрывает гейт — смешанный кандидат
-// (движко-зависимая ошибка класса задачи) финализируется с маркером,
-// доставки без потерь. Живой движок, падающий по расписанию, даёт
-// только фейк (см. заголовок файла), проводка redelivery —
-// queue.ProcessingAttempt: ошибка ⇒ без XACK, nil ⇒ XACK.
+// TestRenderWorker_FallbackEngineDownScenario — the "engine fell" scenario
+// (spec §4.4 item 3, the T-239 criterion): the main engine returns infra errors
+// of the browser class — there is NO publication to q:render-fallback (the browser
+// class is not a candidate, infrastructure), every delivery returns an error
+// without an XACK (the tasks go to the q:render redelivery — a claim will return them after
+// recovery); the streak closes the gate — a mixed candidate
+// (an engine-branched task class error) is finalized with the marker,
+// the deliveries without losses. Only a fake gives a live engine falling on
+// schedule (see the file header), the redelivery wiring —
+// queue.ProcessingAttempt: an error ⇒ no XACK, nil ⇒ XACK.
 func TestRenderWorker_FallbackEngineDownScenario(t *testing.T) {
-	f, reg := newRWGateFixture(t, 3, 30) // дефолты конфигурации T-233
+	f, reg := newRWGateFixture(t, 3, 30) // the T-233 configuration defaults
 	raw := rwTestHash(1)
 
-	// Несколько записей живого потока; движок лёг — ClassBrowser на
-	// каждой задаче.
+	// Several rows of the live flow; the engine fell — ClassBrowser on
+	// every task.
 	keys := []rwRowKey{
 		rwKey,
 		{zone: 3, domain: rwKey.domain + 1, subdomain: 1, variant: 0},
@@ -575,8 +575,8 @@ func TestRenderWorker_FallbackEngineDownScenario(t *testing.T) {
 	}
 	f.renderer.err = rwBrowserErr("https://spa.example/")
 
-	// Все доставки — ошибки без XACK: задачи в redelivery, публикаций
-	// в фолбэк нет (класс браузера кандидатом не является, ФТ-7).
+	// All the deliveries — errors without an XACK: the tasks go to the redelivery, no
+	// fallback publications (the browser class is not a candidate, FR-7).
 	for i, k := range keys {
 		del := rwKeyDelivery(t, fmt.Sprintf("d%d", i), k, "spa.example")
 		if err := queue.ProcessingAttempt(context.Background(), f.q, "render-worker", del, 1, f.w.processDelivery); err == nil {
@@ -589,15 +589,15 @@ func TestRenderWorker_FallbackEngineDownScenario(t *testing.T) {
 	if n := rwFBCount(t, f); n != 0 {
 		t.Fatalf("публикаций q:render-fallback = %d, хочу 0 (движок лёг — перелива нет)", n)
 	}
-	// Стрик достиг порога — событие гейта (алерт деградации движка).
+	// The streak reached the threshold — the gate event (the engine degradation alert).
 	if got := rwGateSuspended(t, reg); got != 1 {
 		t.Errorf("crawler_render_fallback_suspended_total{gate} = %v, want 1 (стрик инфра-ошибок)", got)
 	}
 
-	// Смешанный кандидат при лежачем движке: движко-зависимая ошибка
-	// класса задачи дошла бы до фолбэка, но гейт закрыт — финализация
-	// по-сегодняшнему (маркер + q:analyze), доставка подтверждается:
-	// задач без потерь (redelivery либо штатная финализация).
+	// A mixed candidate with the engine down: the engine-branched task
+	// class error would reach the fallback, but the gate is closed — the finalization
+	// as today (the marker + q:analyze), the delivery is acknowledged:
+	// tasks without losses (a redelivery or a regular finalization).
 	f.renderer.err = rwTarpitErr("https://spa.example/")
 	del := rwKeyDelivery(t, "c1", keys[0], "spa.example")
 	if err := queue.ProcessingAttempt(context.Background(), f.q, "render-worker", del, 2, f.w.processDelivery); err != nil {

@@ -1,11 +1,11 @@
-// Юнит-тесты политики таймаутов рендера (T-148): таймаут страницы
-// (render.timeout, предсказуемый тарпит) не жжёт общий лимит доставок
-// redis.max_attempts как случайная ошибка. Пока номер доставки (счётчик
-// PEL) ниже render.timeout_attempts — тарпит живёт общим путём повторных
-// доставок (ошибка без XACK); на исчерпании лимита запись финализируется
-// без рендера: итог — сырой HTML HTTP-фазы (rendered = false), публикация
-// q:analyze, подтверждение доставки — q:dead остаётся инфраструктурным
-// ошибкам. Фейковое окружение — worker_test.go.
+// Unit tests of the render timeout policy (T-148): a page timeout
+// (render.timeout, a predictable tarpit) does not burn the overall redis.max_attempts
+// delivery limit like a random error. While the delivery number (the
+// PEL counter) is below render.timeout_attempts — a tarpit lives the common path of re-
+// deliveries (an error without XACK); on the limit's exhaustion the entry is finalized
+// without a render: the result is the raw HTML of the HTTP phase (rendered = false), a
+// q:analyze publication, the delivery acknowledgment — q:dead stays for infrastructure
+// errors. The fake environment — worker_test.go.
 package renderworker
 
 import (
@@ -21,37 +21,37 @@ import (
 	"crawler/internal/render"
 )
 
-// rwTarpitMetric — значение crawler_render_tarpit_finalized_total{engine}
-// сборки (S-P2-4): engine — движок сборки воркера (дефолт фикстур —
+// rwTarpitMetric — the value of crawler_render_tarpit_finalized_total{engine}
+// of the build (S-P2-4): engine — the worker build's engine (the fixture's default —
 // chromium, "" → chromium).
 func rwTarpitMetric(t *testing.T, reg *metrics.Registry, engine string) float64 {
 	t.Helper()
 	return rwMetricValue(t, reg, "crawler_render_tarpit_finalized_total", map[string]string{"engine": engine})
 }
 
-// rwTarpitErr — ошибка рендера, неотличимая от боевой по классификации
-// (session.wrap: ClassTask + context.DeadlineExceeded в цепочке — так
-// помечается истечение общего таймаута страницы render.timeout).
+// rwTarpitErr — a render error indistinguishable from the production one by classification
+// (session.wrap: ClassTask + context.DeadlineExceeded in the chain — that is how
+// the expiry of the overall page timeout render.timeout is marked).
 func rwTarpitErr(url string) error {
 	return &render.Error{Class: render.ClassTask, URL: url,
 		Err: fmt.Errorf("таймаут страницы %s: %w: %w",
 			25*time.Second, context.DeadlineExceeded, errors.New("navigation timeout"))}
 }
 
-// TestRenderWorker_TarpitFinalizedWithoutRender — суть T-148: таймаут
-// страницы на доставке с номером ≥ TimeoutAttempts финализирует запись
-// без рендера, а не уводит её в q:dead: обработка успешна (Processing
-// подтверждает доставку), строка остаётся с сырым HTML (rendered = false,
-// content_hash не меняется), публикуется q:analyze (Fresh=true —
-// доработка текущего эпизода), Put/транзакция не выполняются.
+// TestRenderWorker_TarpitFinalizedWithoutRender — the essence of T-148: a page
+// timeout on a delivery with a number ≥ TimeoutAttempts finalizes the entry
+// without a render instead of taking it to q:dead: the processing is successful (Processing
+// acknowledges the delivery), the row stays with the raw HTML (rendered = false,
+// content_hash unchanged), q:analyze is published (Fresh=true —
+// reworking the current episode), Put/the transaction are not executed.
 func TestRenderWorker_TarpitFinalizedWithoutRender(t *testing.T) {
 	f := newRWFixture(t)
 	raw := rwTestHash(1)
 	f.pool.seedRow(rwKey, "https://spa.example/", &raw)
 	f.renderer.err = rwTarpitErr("https://spa.example/")
 
-	// Доставка №2 из 2 (DefaultTimeoutAttempts): клейм после первого
-	// таймаута — ProcessingAttempt подтверждает после nil-возврата.
+	// Delivery #2 of 2 (DefaultTimeoutAttempts): a claim after the first
+	// timeout — ProcessingAttempt acknowledges after a nil return.
 	err := queue.ProcessingAttempt(context.Background(), f.q, "render-worker", rwDelivery("e1"), 2, f.w.processDelivery)
 	if err != nil {
 		t.Fatalf("тарпит на исчерпании лимита обязан финализироваться без ошибки (не q:dead): %v", err)
@@ -88,16 +88,16 @@ func TestRenderWorker_TarpitFinalizedWithoutRender(t *testing.T) {
 	if i := f.pool.j.indexOf(rwEvBegin); i >= 0 {
 		t.Errorf("транзакция не должна открываться (событие на %d)", i)
 	}
-	// Refcount не тронут: сырой HTML остаётся итоговым контентом записи.
+	// The refcount is untouched: the raw HTML stays the entry's final content.
 	if refc := rwRefc(f.pool)[raw]; refc != 1 {
 		t.Errorf("refcount сырого HTML = %d, нужен 1 (ссылка жива)", refc)
 	}
 }
 
-// TestRenderWorker_TarpitBelowLimitRetries — раздельные лимиты: тарпит
-// на доставке с номером ниже TimeoutAttempts — обычная повторимая
-// ошибка (без XACK, вернётся клеймом), как до T-148: первая попытка
-// может таймаутнуться от затора, повтор даёт странице шанс.
+// TestRenderWorker_TarpitBelowLimitRetries — separate limits: a tarpit
+// on a delivery with a number below TimeoutAttempts — an ordinary retryable
+// error (without an XACK, it will return with a claim), as before T-148: the first attempt
+// may time out because of a jam, the repeat gives the page a chance.
 func TestRenderWorker_TarpitBelowLimitRetries(t *testing.T) {
 	f := newRWFixture(t)
 	raw := rwTestHash(1)
@@ -116,10 +116,10 @@ func TestRenderWorker_TarpitBelowLimitRetries(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_RetryableErrorKeepsDeadPath — повторимые ошибки
-// (браузер, БД, хранилище, публикация) не финализируются никогда, на
-// любом номере доставки: прежний путь — без XACK, исчерпание
-// redis.max_attempts, q:dead (T-025).
+// TestRenderWorker_RetryableErrorKeepsDeadPath — retryable errors
+// (browser, DB, storage, publication) are never finalized, on
+// any delivery number: the former path — without an XACK, the
+// redis.max_attempts exhaustion, q:dead (T-025).
 func TestRenderWorker_RetryableErrorKeepsDeadPath(t *testing.T) {
 	cases := []struct {
 		name string
@@ -146,8 +146,8 @@ func TestRenderWorker_RetryableErrorKeepsDeadPath(t *testing.T) {
 			f.pool.seedRow(rwKey, "https://spa.example/", &raw)
 			c.set(f)
 
-			// Номер доставки выше лимита тарпитов (3 ≥ 2) — ошибка всё
-			// равно возвращается: финализация только для таймаутов.
+			// The delivery number is above the tarpit limit (3 ≥ 2) — the error is
+			// returned anyway: the finalization is only for timeouts.
 			err := queue.ProcessingAttempt(context.Background(), f.q, "render-worker", rwDelivery("e9"), 3, f.w.processDelivery)
 			if err == nil {
 				t.Fatal("повторимая ошибка обязана возвращаться (путь q:dead прежний)")
@@ -162,18 +162,18 @@ func TestRenderWorker_RetryableErrorKeepsDeadPath(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_TarpitFinalizeNoRow — строки нет (перепроверка
-// перезаписала) или у неё нет итогового URL: финализация — штатный отказ
-// без публикации, доставка подтверждается (как ProcessResult).
+// TestRenderWorker_TarpitFinalizeNoRow — there is no row (the recheck
+// rewrote it) or it has no final URL: the finalization — a regular
+// rejection without a publication, the delivery is acknowledged (like ProcessResult).
 func TestRenderWorker_TarpitFinalizeNoRow(t *testing.T) {
 	f := newRWFixture(t)
 	f.renderer.err = rwTarpitErr("https://spa.example/")
 
-	// Строки нет вовсе.
+	// There is no row at all.
 	if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 2); err != nil {
 		t.Fatalf("строки нет — не ошибка: %v", err)
 	}
-	// Строка без итогового URL.
+	// A row without a final URL.
 	f.pool.seedRow(rwKey, "", nil)
 	if err := f.w.processDelivery(context.Background(), rwDelivery("e2"), 2); err != nil {
 		t.Fatalf("без итогового URL — не ошибка: %v", err)
@@ -183,9 +183,9 @@ func TestRenderWorker_TarpitFinalizeNoRow(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_TarpitFinalizePublishError — сбой публикации q:analyze
-// при финализации: ошибка без XACK — доставка вернётся и финализация
-// повторится (at-least-once, дубль публикации ограничен попытками).
+// TestRenderWorker_TarpitFinalizePublishError — a q:analyze publication
+// failure during finalization: an error without an XACK — the delivery will return and the
+// finalization will repeat (at-least-once, a publication duplicate is bounded by the attempts).
 func TestRenderWorker_TarpitFinalizePublishError(t *testing.T) {
 	f := newRWFixture(t)
 	raw := rwTestHash(1)
@@ -201,10 +201,10 @@ func TestRenderWorker_TarpitFinalizePublishError(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_TarpitAttemptsBoundary — граница лимита тарпитов
-// настраивается раздельно (Options.TimeoutAttempts): при 1 — финализация
-// уже на первой доставке («1 попытка + сразу финализация»), при 3 —
-// вторая доставка ещё повторяема, третья финализирует.
+// TestRenderWorker_TarpitAttemptsBoundary — the tarpit limit boundary is
+// configured separately (Options.TimeoutAttempts): at 1 — the finalization
+// already on the first delivery ("1 attempt + immediate finalization"), at 3 —
+// the second delivery is still retryable, the third finalizes.
 func TestRenderWorker_TarpitAttemptsBoundary(t *testing.T) {
 	newFix := func(t *testing.T, limit int) *rwFixture {
 		t.Helper()
@@ -239,10 +239,10 @@ func TestRenderWorker_TarpitAttemptsBoundary(t *testing.T) {
 	})
 }
 
-// TestRenderWorker_TarpitMetrics — финализация без рендера считается
-// задачей этапа, ошибкой класса task и отдельным счётчиком тарпитов
-// с меткой engine сборки (S-P2-4: тарпит — движко-зависимый отказ,
-// серия чужого движка не создаётся).
+// TestRenderWorker_TarpitMetrics — a finalization without a render is counted
+// as a stage task, a task class error and a separate tarpit counter
+// with the build's engine label (S-P2-4: a tarpit is an engine-branched failure,
+// another engine's series is not created).
 func TestRenderWorker_TarpitMetrics(t *testing.T) {
 	f := newRWFixture(t)
 	reg := metrics.New("render-worker")
@@ -277,9 +277,9 @@ func TestRenderWorker_TarpitMetrics(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_TarpitTimeoutAttemptsDefault — дефолт воркера и
-// конфигурации согласованы (T-148): render.timeout_attempts по умолчанию
-// равен DefaultTimeoutAttempts.
+// TestRenderWorker_TarpitTimeoutAttemptsDefault — the worker's default and
+// the configuration are consistent (T-148): render.timeout_attempts by default
+// equals DefaultTimeoutAttempts.
 func TestRenderWorker_TarpitTimeoutAttemptsDefault(t *testing.T) {
 	o := Options{}.withDefaults()
 	if o.TimeoutAttempts != DefaultTimeoutAttempts {

@@ -1,68 +1,68 @@
-// Темп потребления воркера (T-240, ТЗР этапа 35 §4.5 п.1, ФТ-13): потолок
-// «не больше N записей за скользящее окно» — батч-режим воркера B
-// «собрать и доработать» без наращивания chromium-мощности. Очередь
-// фолбэка q:render-fallback копится сколько нужно (MAXLEN T-237), воркер B
-// дренирует её в настраиваемом темпе render.fallback.worker_rate (T-233):
-// chromium-мощность прода держится в объёме fallback-рейта, а не пикового
-// долга (ТЗ §3 п.3).
+// The worker's consumption rate (T-240, render spec stage 35 §4.5 item 1, FR-13): the cap
+// of "no more than N entries per sliding window" — the "collect and rework" batch mode
+// of worker B without scaling up chromium capacity. The fallback queue
+// q:render-fallback accumulates as much as needed (MAXLEN T-237), worker B
+// drains it at the configurable rate render.fallback.worker_rate (T-233):
+// production chromium capacity is kept at the fallback-rate volume, not the peak
+// debt (spec §3 item 3).
 //
-// Параметр темпа — общий, без привязки к движку и стриму (ФТ-4: ветвлений
-// по движку нет): Options.Rate применяется циклом Run всегда, когда задан;
-// боевая проводка cmd/render-worker ставит его на сборке воркера B
-// (стрим q:render-fallback), основная сборка q:render читает без потолка.
+// The rate parameter is shared, with no binding to an engine or a stream (FR-4: there are no
+// engine branches): Options.Rate is applied by the Run loop whenever it is set;
+// production wiring in cmd/render-worker sets it on the worker B build
+// (the q:render-fallback stream), the main q:render build reads without a cap.
 //
-// Ограничивается именно потребление (XREADGROUP), не обработка: клейм
-// RecoverLoop потолком не трогается — темп возврата зависших доставок
-// настраивает redis.recover_* (T-153), смешивать две ручки незачем.
+// It is the consumption (XREADGROUP) that is limited, not the processing: the
+// RecoverLoop claim is not touched by the cap — the return rate of stuck deliveries
+// is configured by redis.recover_* (T-153), there is no reason to mix the two knobs.
 
 package renderworker
 
 import "time"
 
-// RateWindow — окно скользящего потолка темпа потребления (T-240, ФТ-13):
-// минута. Дефолт потолка render.fallback.worker_rate — 100 записей (T-233):
-// 100/мин ≈ 1,7 стр/с — полная мощность одного chromium (8 контекстов ×
-// ~5 с/страница), значения ниже дефолта режут темп намеренно — воркер B
-// дорабатывает хвост, не забирая мощность у основного конвейера.
+// RateWindow — the sliding window of the consumption rate cap (T-240, FR-13):
+// a minute. The default cap of render.fallback.worker_rate is 100 entries (T-233):
+// 100/min ≈ 1.7 entries/s — the full capacity of one chromium (8 contexts ×
+// ~5 s/page), values below the default cut the rate intentionally — worker B
+// reworks the tail without taking capacity from the main pipeline.
 const RateWindow = time.Minute
 
-// renderRateWindow — окно темпа цикла Run: переменная, а не константа —
-// юнит-тесты сжимают окно до сотен миллисекунд, не выжидая минуту (образец
-// — renderFailWaitBase).
+// renderRateWindow — the window of the Run loop's rate: a variable, not a constant —
+// unit tests shrink the window to hundreds of milliseconds without waiting out a minute
+// (an example is renderFailWaitBase).
 var renderRateWindow = RateWindow
 
-// rateMark — пачка записей, потреблённых одним чтением: окно хранит метки
-// пачками (одно чтение — одна метка времени), а не отдельными записями —
-// память окна на потолке валидации worker_rate (до 1 млн записей, T-233)
-// остаётся тысячами меток, не миллионами.
+// rateMark — a chunk of entries consumed by one read: the window stores marks
+// in chunks (one read — one timestamp), not individual entries —
+// the window's memory at the worker_rate validation cap (up to 1 million entries, T-233)
+// stays in the thousands of marks, not millions.
 type rateMark struct {
 	at time.Time
 	n  int
 }
 
-// rateWindow — скользящее окно темпа потребления (T-240, ФТ-13): не больше
-// limit записей за window. Ведёт читатель цикла Run — одна горутина, без
-// мьютекса (стиль локальных счётчиков читателя failStreak/infraStreak).
-// Протокол: перед чтением — allowance (сколько записей можно взять сейчас;
-// пачка чтения Consume урезается до него), после — record (прочитанные
-// записи заходят в окно). Окно скользящее: метка покидает его через window
-// после чтения, освобождая слот темпа; пустое чтение (очередь пуста,
-// XREADGROUP блокируется) в окно не попадает — простой не расходует
-// потолок, после появления записей воркер сразу берёт полный бюджет.
+// rateWindow — the sliding window of the consumption rate (T-240, FR-13): no more than
+// limit entries per window. Maintained by the reader of the Run loop — a single goroutine, without
+// a mutex (the style of the reader's local counters failStreak/infraStreak).
+// Protocol: before a read — allowance (how many entries may be taken now;
+// the Consume read chunk is trimmed to it), after — record (the read
+// entries enter the window). The window is sliding: a mark leaves it after window
+// from the read, freeing a rate slot; an empty read (the queue is empty,
+// XREADGROUP blocks) does not enter the window — idleness does not spend
+// the cap, after entries appear the worker immediately takes the full budget.
 type rateWindow struct {
 	limit  int
 	window time.Duration
 	marks  []rateMark
 }
 
-// newRateWindow строит окно с потолком limit за window; limit обязан быть
-// > 0 (Run строит окно только для заданного Options.Rate).
+// newRateWindow builds a window with the cap limit per window; limit must be
+// > 0 (Run builds the window only for a set Options.Rate).
 func newRateWindow(limit int, window time.Duration) *rateWindow {
 	return &rateWindow{limit: limit, window: window}
 }
 
-// count выбрасывает метки, покинувшие окно (старше window относительно
-// now), и возвращает число записей в живом окне.
+// count drops the marks that left the window (older than window relative to
+// now) and returns the number of entries in the live window.
 func (w *rateWindow) count(now time.Time) int {
 	live := w.marks[:0]
 	n := 0
@@ -76,18 +76,18 @@ func (w *rateWindow) count(now time.Time) int {
 	return n
 }
 
-// allowance — свободные слоты темпа в момент now: limit минус записи,
-// прочитанные за последние window. ≤ 0 — потолок исчерпан, чтение обязано
-// подождать retry; положительное значение урезает пачку чтения, чтобы не
-// взять за раз больше потолка.
+// allowance — the free rate slots at the moment now: limit minus the entries
+// read during the last window. ≤ 0 — the cap is exhausted, the read must
+// wait for retry; a positive value trims the read chunk so as not to
+// take more than the cap at once.
 func (w *rateWindow) allowance(now time.Time) int {
 	return w.limit - w.count(now)
 }
 
-// retry — пауза до освобождения слота темпа: старейшая метка окна + window
-// − now. Достоверна при исчерпанном потолке (окно непусто — лимит
-// положителен); минимум 1 нс — защита от нулевой паузы на округлении
-// (иначе цикл читателя крутился бы вхолостую, образец — limitBucket
+// retry — the pause until a rate slot frees up: the window's oldest mark + window
+// − now. Reliable with the cap exhausted (the window is non-empty — the limit
+// is positive); a minimum of 1 ns — protection against a zero pause on rounding
+// (otherwise the reader loop would spin idle, an example is limitBucket
 // dnsclient).
 func (w *rateWindow) retry(now time.Time) time.Duration {
 	if len(w.marks) == 0 {
@@ -100,9 +100,9 @@ func (w *rateWindow) retry(now time.Time) time.Duration {
 	return d
 }
 
-// record фиксирует n записей, прочитанных в момент now. n ≤ 0 — no-op:
-// пустое чтение (очередь пуста) потолок не расходует — окно считает
-// потребление, а не обращения к очереди.
+// record records n entries read at the moment now. n ≤ 0 — a no-op:
+// an empty read (the queue is empty) does not spend the cap — the window counts
+// consumption, not queue requests.
 func (w *rateWindow) record(now time.Time, n int) {
 	if n <= 0 {
 		return

@@ -1,242 +1,242 @@
-// Package renderworker — этап рендера (T-067; ТЗ 5.6 «итоговый DOM заменяет
-// сырой HTML в хранилище; в результате выставляется rendered = true», §5.7,
-// §7 «render-worker → DOM + cookies → обновление результата → q:analyze»).
+// Package renderworker — the render stage (T-067; spec 5.6 "the final DOM replaces
+// the raw HTML in the storage; rendered = true is set in the result", §5.7,
+// §7 "render-worker → DOM + cookies → update of the result → q:analyze").
 //
-// Воркер потребляет стрим Options.Stream — по умолчанию q:render, воркер
-// фолбэка (ФТ-12, ТЗ §4.5) — тот же бинарь с другим стримом и отдельной
-// группой потребителей (сообщение Result — ключ строки
-// subdomain_results: домен, субдомен, вариант; формат T-024, публикуют
-// HTTP-этап T-066 при SPA-вердикте T-057 и проход доработки renderq.go).
-// Сам результат остаётся в БД, сообщение только указывает на запись —
-// итоговый URL для рендера читается из строки (сообщение несёт только
-// идентификаторы, ТЗ 4.2). Обработка одной доставки:
+// The worker consumes the Options.Stream stream — q:render by default; the
+// fallback worker (FR-12, spec §4.5) — the same binary with a different stream and a separate
+// consumer group (the Result message — the key of the row
+// subdomain_results: domain, subdomain, variant; the T-024 format, published by
+// the HTTP stage T-066 on an SPA verdict T-057 and by the rework pass of renderq.go).
+// The result itself stays in the DB, the message only points at the row —
+// the final URL for the render is read from the row (the message carries only
+// identifiers, spec 4.2). Processing of one delivery:
 //
-//	SELECT строки (final_url, content_hash — цель рендера и старая ссылка)
-//	→ render.Pool.Run (T-061…T-064: изолированный контекст, блокировка
-//	  ресурсов, ожидание готовности, DOM + cookies + заголовки)
-//	→ ContentStore.Put(DOM) — новая ссылка +1 (T-056/T-042, дедуп по хэшу)
-//	→ ОДНА транзакция: UPDATE строки (rendered = true, новый content_hash,
-//	  final_url/cookies/headers рендера, rules_version = NULL; RETURNING
-//	  checked_at — час корзин rendered-темпа и хвостов переанализа) +
-//	  −1 refcount старого хэша (SwapRefTx, T-044) + инкремент корзины
-//	  хвостов переанализа crawler_counters['reanalyze:…'] (T-204: NULL
-//	  вернул строку в неанализированные) и часовой корзины темпа
-//	  crawler_counters['rendered:YYYY-MM-DD"T"HH24'] (T-203: той же
-//	  транзакцией — флаг и корзина меняются только вместе)
-//	→ после фиксации — публикация q:analyze (Result, тот же ключ; §7)
-//	→ XACK (Processing, T-025: подтверждение только после записи в БД).
+//	SELECT of the row (final_url, content_hash — the render target and the old reference)
+//	→ render.Pool.Run (T-061…T-064: an isolated context, blocking
+//	  of resources, a readiness wait, DOM + cookies + headers)
+//	→ ContentStore.Put(DOM) — a new reference +1 (T-056/T-042, dedup by hash)
+//	→ ONE transaction: UPDATE of the row (rendered = true, a new content_hash,
+//	  final_url/cookies/headers of the render, rules_version = NULL; RETURNING
+//	  checked_at — the hour of the rendered-rate bucket and the reanalysis tails) +
+//	  −1 refcount of the old hash (SwapRefTx, T-044) + an increment of the
+//	  reanalysis tails bucket crawler_counters['reanalyze:…'] (T-204: NULL
+//	  returned the row to unanalyzed) and the hour bucket of the rate
+//	  crawler_counters['rendered:YYYY-MM-DD"T"HH24'] (T-203: in the same
+//	  transaction — the flag and the bucket change only together)
+//	→ after the commit — a q:analyze publication (Result, the same key; §7)
+//	→ XACK (Processing, T-025: an acknowledgment only after the write to the DB).
 //
-// Идемпотентность повторной доставки (ТЗ 3.4): перезапись без охраны
-// rendered — повторный рендер перезаписывает контент и refcount (баланс
-// в духе T-058: повторный Put даёт +1, UPDATE снимает старую ссылку).
-// От гонки со свежей перепроверкой домена (recheck T-030 перезаписывает
-// строки DELETE+INSERT, T-058) строка защищена оптимистической охраной
-// UPDATE по content_hash: изменившаяся строка не перезаписывается (0
-// строк — ссылка Put снимается, доставка подтверждается: задача была про
-// прошлый эпизод, у нового свои публикация и рендер).
+// Idempotency of a re-delivery (spec 3.4): a rewrite without the rendered guard —
+// a repeated render overwrites the content and the refcount (a balance
+// in the spirit of T-058: a repeated Put gives +1, the UPDATE removes the old reference).
+// Against the race with a fresh domain recheck (the recheck T-030 rewrites
+// rows DELETE+INSERT, T-058) the row is protected by an optimistic UPDATE
+// guard on content_hash: a changed row is not overwritten (0
+// rows — the Put reference is removed, the delivery is acknowledged: the task was about
+// the previous episode, the new one has its own publication and render).
 //
-// Флаг render_pending (T-066) render-worker не трогает: владелец флага —
-// HTTP-этап, его проход доработки снимает бит после публикации q:render;
-// рендер меняет только строку результата (§7 — домен уже done, рендер
-// асинхронное дополнение). Потребление q:render — скользящее (T-142,
-// образец T-139): чтение при освобождении слота доставки, без барьера
-// окна пачки.
+// The render_pending flag (T-066) is not touched by the render-worker: the flag's owner is
+// the HTTP stage, its rework pass clears the bit after a q:render publication;
+// the render changes only the result row (§7 — the domain is already done, the render
+// is an asynchronous addition). The q:render consumption is sliding (T-142,
+// the T-139 pattern): a read when a delivery slot frees up, without a
+// chunk window barrier.
 //
-// Политика таймаутов (T-148, счёт тарпитов — T-261): таймаут страницы
-// (render.timeout) — предсказуемый тарпит, а не случайная ошибка. Пока
-// число тарпит-классифицированных доставок эпизода (мощность множества
-// render:tarpit:{task_id}: SADD по id доставки — идемпотентно, TTL 48 ч)
-// не достигло Options.TimeoutAttempts (render.timeout_attempts), тарпит
-// живёт общим путём повторных доставок; на исчерпании запись
-// финализируется без рендера: итог — сырой HTML HTTP-фазы
-// (rendered = false), публикация q:analyze, XACK — работа не выпадает в
-// q:dead, q:dead остаётся инфраструктурным ошибкам (БД, браузер,
-// публикация; runbooks §2). Инфраструктурные сбои между тарпитами номер
-// доставки растят, множество — нет: смешанные серии не финализируют
-// раньше порога тарпитов. Потеря Redis-счётчика деградирует к решению по
-// номеру доставки PEL (поведение до T-261); общий лимит
-// redis.max_attempts работает по номеру доставки как раньше. Таблица
-// решений автомата политики исходов — outcomestate.go (T-261, ТЗ-fsm §3
-// ФТ-7).
+// The timeout policy (T-148, tarpit counting — T-261): a page timeout
+// (render.timeout) is a predictable tarpit, not a random error. Until
+// the number of the episode's tarpit-classified deliveries (the cardinality of the set
+// render:tarpit:{task_id}: SADD by the delivery id — idempotent, a 48 h TTL)
+// reaches Options.TimeoutAttempts (render.timeout_attempts), a tarpit
+// lives the common path of re-deliveries; on exhaustion the entry
+// is finalized without a render: the result is the raw HTML of the HTTP phase
+// (rendered = false), a q:analyze publication, XACK — work does not fall into
+// q:dead, q:dead stays for infrastructure errors (DB, browser,
+// publication; runbooks §2). Infrastructure failures between tarpits grow the
+// delivery number, not the set: mixed series are not finalized
+// before the tarpit threshold. Losing the Redis counter degrades to a decision by
+// the PEL delivery number (the behavior before T-261); the overall limit
+// redis.max_attempts works by the delivery number as before. The decision table
+// of the outcome policy FSM — outcomestate.go (T-261, TZ-fsm §3
+// FR-7).
 //
-// Политика постоянных ошибок сертификата хоста (T-159, расширение T-172):
-// ERR_CERT_AUTHORITY_INVALID / ERR_CERT_COMMON_NAME_INVALID — постоянные
-// свойства хоста (сертификат не издан доверенным ЦС / не покрывает имя),
-// ретрай бессмысленен; ERR_CERT_DATE_INVALID (просрочен/ещё не действует)
-// добавлен по замеру T-172: успешных ретраев 0 из 321 первых неудач за
-// сутки, 92% исчерпали попытки в q:dead — продление сертификата парковки
-// на масштабе дней не успевает за 3 доставки (~полчаса). Cert-класс
-// финализируется как тарпит, но с первой же доставки (без тарпит-лимита):
-// итог — сырой HTML HTTP-фазы, публикация q:analyze, XACK; суточный
-// прирост q:dead от cert-класса нулевой, очередь q:render не копит
-// попытки cert-хостов.
+// The permanent host certificate error policy (T-159, an extension of T-172):
+// ERR_CERT_AUTHORITY_INVALID / ERR_CERT_COMMON_NAME_INVALID — permanent
+// properties of the host (the certificate is not issued by a trusted CA / does not cover the name),
+// a retry is pointless; ERR_CERT_DATE_INVALID (expired/not yet valid)
+// was added by the T-172 measurement: 0 successful retries out of 321 first failures
+// per day, 92% exhausted the attempts in q:dead — a parked certificate's renewal
+// on a scale of days does not make it within 3 deliveries (~half an hour). The cert class
+// is finalized like a tarpit, but from the very first delivery (without the tarpit limit):
+// the result is the raw HTML of the HTTP phase, a q:analyze publication, XACK; the daily
+// q:dead growth from the cert class is zero, the q:render queue does not accumulate
+// the attempts of cert hosts.
 //
-// Политика DNS-отказа на рендере (T-211, по итогам T-207):
-// ERR_NAME_NOT_RESOLVED — смерть хоста на уровне DNS. Запись попала в
-// q:render через живой HTTP-эпизод (HTTP-фаза сама резолвила имя —
-// иначе эпизода и строки не было бы), а браузер резолвит системным
-// резолвером — тем же unbound, что обслуживает DNS-этап: отказ между
-// эпизодом и рендером значит, что DNS хоста умер; возврат DNS — событие
-// масштаба дней, окно ретраев (3 доставки, ~20 мин в PEL по claim_min_idle)
-// его не покрывает (замер T-207: 252 финализации NAME_NOT_RESOLVED за
-// ~7 ч, каждая съедала все 3 доставки). DNS-класс финализируется по
-// образцу cert-класса с первой же доставки: итог — сырой HTML
-// HTTP-фазы, публикация q:analyze, XACK; хост с вернувшимся DNS
-// отрендерится на следующем эпизоде перепроверки (T-030 — перезапись
-// строки сбрасывает маркер и публикует новую задачу). ERR_CONNECTION_REFUSED
-// в класс не входит: отказ соединения — свойство сервиса хоста (порт
-// закрыт/фильтр/перезапуск), восстановление наблюдается (замер T-172:
-// 6.6% ретраев успешны) — до последней доставки он повторяем (T-172).
+// The DNS refusal policy at render (T-211, from the T-207 outcomes):
+// ERR_NAME_NOT_RESOLVED — the death of the host at the DNS level. The entry got into
+// q:render through a live HTTP episode (the HTTP phase resolved the name itself —
+// otherwise there would be no episode and no row), while the browser resolves
+// with the system resolver — the same unbound that serves the DNS stage: a refusal between
+// the episode and the render means the host's DNS died; DNS recovery is an event
+// on a scale of days, the retry window (3 deliveries, ~20 min in the PEL by claim_min_idle)
+// does not cover it (the T-207 measurement: 252 NAME_NOT_RESOLVED finalizations per
+// ~7 h, each ate all 3 deliveries). The DNS class is finalized following
+// the cert class pattern from the very first delivery: the result is the raw HTML
+// of the HTTP phase, a q:analyze publication, XACK; a host with recovered DNS
+// will render on the next recheck episode (T-030 — the row rewrite
+// resets the marker and publishes a new task). ERR_CONNECTION_REFUSED
+// is not in the class: a connection refusal is a property of the host's service (the port
+// is closed/filtered/restarted), recovery is observed (the T-172 measurement:
+// 6.6% of retries succeed) — until the last delivery it is retryable (T-172).
 //
-// Политика последней попытки × класс задачи (T-172): прочие ошибки
-// рендера класса task (отказ соединения, load error — свойства
-// хоста, не инфраструктуры) живут общим путём повторных доставок, пока
-// номер доставки ниже redis.max_attempts (Options.MaxAttempts; отказ
-// соединения восстанавливается — замер T-172: 6.6% ретраев успешны), а
-// на последней доставке запись финализируется без рендера по образцу
-// тарпитов: итог — сырой HTML HTTP-фазы, публикация q:analyze, XACK.
-// Смерти q:render остаются только инфраструктурным сбоям (БД,
-// хранилище, публикация, браузер) — в духе T-148 «q:dead — настоящим
-// инфраструктурным ошибкам».
+// The last attempt × task class policy (T-172): other render errors
+// of the task class (a connection refusal, a load error — properties
+// of the host, not the infrastructure) live the common path of re-deliveries while
+// the delivery number is below redis.max_attempts (Options.MaxAttempts; a
+// connection refusal recovers — the T-172 measurement: 6.6% of retries succeed), and
+// on the last delivery the entry is finalized without a render following the
+// tarpit pattern: the result is the raw HTML of the HTTP phase, a q:analyze publication, XACK.
+// The q:render deaths are left only to infrastructure failures (DB,
+// storage, publication, browser) — in the spirit of T-148 "q:dead is for real
+// infrastructure errors".
 //
-// Публикация фолбэка (T-238, ТЗ §4.4): при включённом
-// render.fallback.enabled (Options.Fallback, T-233/ФТ-14) тарпит T-148
-// и класс задачи T-172 на последней попытке — движко-зависимые причины
-// (свойство пары «сайт × движок»: зависшая на лёгком движке страница
-// может открыться в chromium, ТЗ §4.4 п.2) — не финализируются, а
-// публикуются в q:render-fallback (publishFallback): запись остаётся
-// без маркера («ждёт фолбэка» — промежуточное состояние выражается
-// отсутствием маркера и глубиной очереди, ТЗ §4.4 п.1) и дорабатывается
-// chromium-воркером B — тем же бинарём на стриме фолбэка (ФТ-12,
-// T-236); рекурсивный фолбэк фолбэка запрещён: публикации идут только
-// из стрима q:render (ФТ-10). DNS-класс T-211 и cert-класс T-159 —
-// движко-независимые свойства хоста, фолбэка не получают при любом
-// флаге (ФТ-7: Chromium их не исправит). Идемпотентность публикации —
-// фильтр дубля по идентификатору записи результата (ключ строки +
-// checked_at эпизода, ТЗ §4.4 п.5); решение о публикации — чистая
-// функция fallbackPublishDecision (кандидат × гейт × бюджет, ФТ-9):
-// гейт по стрику инфра-ошибок ClassBrowser (render.fallback
-// .health_gate_streak — приостановка публикаций до восстановления
-// движка, T-239) и бюджет доли публикаций за окно (render.fallback
-// .share_percent — приостановка до границы окна, T-239); отказ
-// решения — финализация по-сегодняшнему (маркер), без потерь задач.
+// The fallback publication (T-238, spec §4.4): with
+// render.fallback.enabled on (Options.Fallback, T-233/FR-14) the tarpit T-148
+// and the task class T-172 on the last attempt are engine-branched reasons
+// (a property of the "site × engine" pair: a page stuck on a light engine
+// may open in chromium, spec §4.4 item 2) — they are not finalized but
+// published to q:render-fallback (publishFallback): the entry stays
+// without a marker ("awaiting fallback" — the intermediate state is expressed
+// by the absence of the marker and the queue depth, spec §4.4 item 1) and is reworked
+// by the chromium worker B — the same binary on the fallback stream (FR-12,
+// T-236); a recursive fallback of the fallback is forbidden: publications go only
+// from the q:render stream (FR-10). The DNS class T-211 and the cert class T-159 are
+// engine-independent host properties and get no fallback under any
+// flag (FR-7: Chromium will not fix them). The publication's idempotency —
+// a dedup filter by the result row identifier (the row key +
+// the episode's checked_at, spec §4.4 item 5); the publication decision is a pure
+// function, fallbackPublishDecision (candidate × gate × budget, FR-9):
+// the gate by the streak of infra errors of ClassBrowser (render.fallback
+// .health_gate_streak — publications suspended until the engine
+// recovers, T-239) and the share budget of publications over the window (render.fallback
+// .share_percent — suspended until the window boundary, T-239); a decision
+// rejection — finalization as today (the marker), no tasks lost.
 //
-// Все четыре финализации штампуют маркер «рендер невозможен»
-// subdomain_results.render_failed_at (T-210, миграция 000017) — кроме
-// путей с фолбэком выше: там маркер первичный воркер не ставит вовсе,
-// его ставит воркер B после исчерпания фолбэка (ФТ-10):
-// финализированная-без-рендера запись навсегда rendered = false и до
-// маркера была неотличима от «не пробовали» — проход доработки
-// (httpworker/renderq.go) переиздавал такие записи без разбора (замер
-// T-207: хвост ~180–220 тыс. битых записей). Маркер останавливает
-// ПОВТОРНЫЕ издания прохода — повторный проход по домену, чей флаг
-// пережил публикацию (частичный сбой публикации — опубликованная часть
-// финализируется за секунды, повтор прохода издал бы её снова; выход
-// Full после публикации соседей пачки; keep нечитаемого контента;
-// рестарт между публикацией и снятием); первая попытка свежего эпизода
-// легитимна: перезапись эпизода сбрасывает маркер, новый контент имеет
-// право на рендер — починившийся хост отрендерится на следующем
-// эпизоде перепроверки T-030; успешный рендер снимает маркер
-// renderUpdateSQL).
+// All four finalizations stamp the "render impossible" marker
+// subdomain_results.render_failed_at (T-210, migration 000017) — except
+// the fallback paths above: there the primary worker does not set the marker at all,
+// worker B sets it after the fallback is exhausted (FR-10):
+// an entry finalized without a render is forever rendered = false and before
+// the marker it was indistinguishable from "not tried" — the rework pass
+// (httpworker/renderq.go) re-published such rows indiscriminately (the
+// T-207 measurement: a tail of ~180–220 thousand broken rows). The marker stops the
+// REPEATED publications of the pass — a repeated pass over a domain whose flag
+// survived the publication (a partial publication failure — the published part
+// is finalized within seconds, a pass repeat would publish it again; the Full
+// exit after the publication of the chunk's neighbors; keeping unreadable content;
+// a restart between the publication and the removal); the first attempt of a fresh episode
+// is legitimate: an episode rewrite resets the marker, new content has
+// the right to a render — a recovered host will render on the next
+// recheck episode T-030; a successful render removes the marker
+// (renderUpdateSQL).
 //
-// # Автомат рендер-состояния строки subdomain_results (T-259, ТЗ-fsm §3 ФТ-5)
+// # The render-state FSM of the subdomain_results row (T-259, TZ-fsm §3 FR-5)
 //
-// Единая точка правды о состояниях и переходах рендер-жизни строки
-// результата. Состояние закодировано ТРЕМЯ носителями: колонками строки
-// (rendered, render_failed_at, final_url), битом render_pending домена
-// (flags бит 1, T-066 — «публикация отложена, долг») и сообщениями
-// стримов q:render/q:render-fallback (ключ строки, формат Result T-024).
-// Формализация не переписывает переходы на FSM-фреймворк (ТЗ-fsm §1):
-// они остаются SQL-охранами и публикациями; эта таблица — то, с чем
-// сверяются все писатели (перечислены ниже), писатели из других
-// пакетов ссылаются сюда одной строкой.
+// The single source of truth about the states and transitions of the row's
+// render life. The state is encoded by THREE carriers: the row's columns
+// (rendered, render_failed_at, final_url), the domain's render_pending bit
+// (flags bit 1, T-066 — "the publication is deferred, debt") and the
+// messages of the q:render/q:render-fallback streams (the row key, the Result format T-024).
+// The formalization does not rewrite the transitions on the FSM framework (TZ-fsm §1):
+// they remain SQL guards and publications; this table is what
+// all the writers (listed below) check against, writers from other
+// packages refer here in one line.
 //
-// ## Состояния
+// ## States
 //
-//		Э0 «новый эпизод»   строка записана HTTP-этапом (T-058, DELETE+INSERT):
+//		E0 "new episode"   the row is written by the HTTP stage (T-058, DELETE+INSERT):
 //		                    rendered = false, render_failed_at = NULL, final_url —
-//	                   итоговый URL проверки. SPA-вердикт — свойство
-//	                   КОНТЕНТА (T-057), в строке не хранится: не-SPA записи
-//	                   рендера не требуют вовсе и живут в Э0 до перезаписи
-//	                   эпизода.
-//		Э1 «в очереди»     сообщение Result строки в недоставленном хвосте
-//		                    q:render, ЛИБО домен несёт бит render_pending
-//		                    (очередь была полна — публикация отложена, T-066;
-//		                    держатель — бит, не стрим). Колонки неотличимы от Э0:
-//	                   различие живёт вне строки, переиздатели обязаны
-//	                   интерлокиться (инвариант И4).
-//		Э1ф «ждёт фолбэка» под-состояние Э1: воркер A опубликовал задачу в
-//		                    q:render-fallback (T-238), воркер B ещё не доработал.
-//		                    Бесколоночное — ОТДЕЛЬНОЙ КОЛОНКИ НЕТ (ТЗ §4.8):
-//		                    rendered = false, маркера нет, сообщений в q:render
-//		                    нет. Наблюдение — баланс фолбэка
+//	                   the final URL of the check. The SPA verdict is a property
+//	                   of the CONTENT (T-057), not stored in the row: non-SPA rows
+//	                   do not require a render at all and stay in E0 until the
+//	                   episode is rewritten.
+//		E1 "queued"        the Result message of the row in the undelivered tail
+//		                    of q:render, OR the domain carries the render_pending bit
+//		                    (the queue was full — the publication was deferred, T-066;
+//		                    the holder — the bit, not the stream). The columns are indistinguishable from E0:
+//	                   the difference lives outside the row, re-publishers must
+//	                   interlock (invariant I4).
+//		E1f "awaiting fallback" a sub-state of E1: worker A published the task to
+//		                    q:render-fallback (T-238), worker B has not reworked it yet.
+//		                    Column-free — THERE IS NO SEPARATE COLUMN (spec §4.8):
+//		                    rendered = false, no marker, no messages in q:render.
+//		                    The observation — the fallback balance
 //		                    crawler_render_fallback_published_total =
-//		                    crawler_render_fallback_consumed_total + глубина
-//		                    q:render-fallback (+ похороненные в q:dead, ФТ-11)
-//		                    и интерлок позднего переиздателя (П4 не трогает
-//		                    записи с живыми сообщениями стримов).
-//		Э2 «отрендерена»   rendered = true, render_failed_at = NULL
-//		                    (инвариант И1 — CHECK миграции 000018, ФТ-5.2).
-//		Э3 «невозможна»    rendered = false, render_failed_at NOT NULL — маркер
-//		                    T-210: финализация без рендера закрыла запись до
-//		                    смены контента; рендерные проходы её не переиздают.
-//		Э4 «ушла из-под
-//		   задачи»         строка перезаписана новым эпизодом ПОСЛЕ публикации
-//		                    сообщения: доставки старого эпизода видят чужой
-//		                    контент/checked_at и подтверждаются без эффектов
-//		                    (охраны ниже); новое состояние строки — снова Э0
-//		                    со своими публикациями.
+//		                    crawler_render_fallback_consumed_total + the depth
+//		                    of q:render-fallback (+ those buried in q:dead, FR-11)
+//		                    and the late re-publisher's interlock (T4 does not touch
+//		                    rows with live stream messages).
+//		E2 "rendered"      rendered = true, render_failed_at = NULL
+//		                    (invariant I1 — the CHECK of migration 000018, FR-5.2).
+//		E3 "impossible"    rendered = false, render_failed_at NOT NULL — the marker
+//		                    of T-210: a finalization without a render closed the row until
+//		                    the content changed; render passes do not re-publish it.
+//		E4 "slipped out from under the task"
+//		                    the row is rewritten by a new episode AFTER the publication
+//		                    of the message: the deliveries of the old episode see foreign
+//		                    content/checked_at and are acknowledged without effects
+//		                    (the guards below); the row's new state — E0 again
+//		                    with its own publications.
 //
-// ## Переходы: состояние × событие × охраны × цель × побочные действия
+// ## Transitions: state × event × guards × target × side effects
 //
-//	| № | Исходное | Событие | Охраны | Цель | Побочные действия | Писатель |
-//	|---|----------|---------|--------|------|-------------------|----------|
-//	| П1 | Э0 | публикация SPA-записи HTTP-этапом, очередь свободна | DetectSPA(тела) = SPA (T-057, детерминирован над теми же байтами) | Э1 | XADD q:render после фиксации транзакции результата (Result, T-024) | httpworker/record.go OnResult → renderSPAResults (T-066) |
-//	| П2 | Э0 | публикация SPA-записи HTTP-этапом, очередь полна | та же + глубина q:render ≥ render.queue_high_watermark (ошибка чтения = полна, консервативно) | Э1 (долг) | бит render_pending домена ТОЙ ЖЕ транзакцией результата (+1 счётчика долга T-175), публикация не выполняется | httpworker/renderq.go renderSetPendingSQL (автомат бита × счётчика — спецификация там же, T-258) |
-//	| П3 | Э1 (долг) | проход доработки | очередь свободна, домен не deleted, вердикт по сохранённому контенту = SPA | Э1 | публикация q:render → снятие бита (−1 счётчика) одной транзакцией; отмаркированные (Э3) не издаются; алиасы наследуют вердикт оригинала | httpworker/renderq.go RequeueOnce (T-066; переходы Д3/Д4 автомата бита, T-258) |
-//	| П4 | Э0/Э1 | поздний переиздатель | возраст (checked_at) > 6 ч, бита render_pending нет, непотреблённых сообщений q:render/q:render-fallback нет (снимок стримов, образец content/retentionpending.go), вердикт по контенту = SPA | Э1 | переиздание q:render (метрика crawler_render_late_republish_total); лечит MAXLEN-усечение фолбэк-задач и потерянные публикации — состояние записи перестаёт зависеть от выживания сообщения; дубли ограничены и гасятся идемпотентностью потребителя (ТЗ 3.4) | httpworker/renderlate.go LateOnce (T-259, ФТ-5.3) |
-//	| П5 | Э1 | воркер A: успешный рендер | охрана content_hash (строка того эпизода, чьё сообщение; перезапись T-058 уже сменила — 0 строк, ссылка Put снимается, XACK) | Э2 | замена контента DOM (Put +1 / SwapRefTx −1 старой), render_failed_at = NULL, rules_version = NULL, корзины rendered:/reanalyze: (T-203/T-204), публикация q:analyze, XACK | renderUpdateSQL (этот файл) |
-//	| П6 | Э1 | воркер A: финализация без рендера — движко-независимая причина (тарпит-бюджет T-148, cert T-159, DNS T-211, класс задачи T-172 на последней) ЛИБО фолбэк выключен/чужой стрим/движок chromium/отказ гейта-бюджета T-239 | rendered = false, охрана content_hash (coalesce — штамп первой) | Э3 | маркер render_failed_at, публикация q:analyze, XACK; q:dead — только инфраструктурным ошибкам | renderFailMarkerSQL, finalizeNoRender |
-//	| П7 | Э1 | воркер A: движко-зависимая причина, фолбэк включён, решение fallbackPublishDecision положительное | стрим потребления q:render (рекурсия фолбэка запрещена, ФТ-10), движок-кандидат, строки нет/rendered — не публикуем | Э1ф | публикация q:render-fallback (без маркера, без q:analyze), XACK; повторная доставка — фильтр дубля по ключу строки + checked_at эпизода | publishFallback (T-238) |
-//	| П8 | Э1ф | воркер B: успешный рендер | как П5 | Э2 | как П5 | renderUpdateSQL (сборка B, стрим q:render-fallback) |
-//	| П9 | Э1ф | воркер B: исчерпание фолбэка | rendered = false, охрана content_hash | Э3 | как П6 | finalizeNoRender (сборка B, ФТ-10) |
-//	| П10 | любое | перезапись эпизода перепроверкой | новый эпизод домена (T-030 → HTTP-этап T-058) | Э0 | DELETE + INSERT строк: rendered = false, маркер NULL (в INSERT не участвует), свежий checked_at; живые сообщения старого эпизода погасятся охранами П5/П6/фильтром дубля П7 | httpworker/record.go |
-//	| П11 | Э2 | успешный рендер повторной доставки (конкурентный дубль) | охрана content_hash пропускает перезапись тем же контентом | Э2 | повторная перезапись идемпотентна (ТЗ 3.4): повторный Put +1 / UPDATE снимает ту же ссылку | renderUpdateSQL |
+//	| # | Source | Event | Guards | Target | Side effects | Writer |
+//	|---|--------|-------|--------|--------|--------------|--------|
+//	| T1 | E0 | the HTTP stage publishes an SPA row, the queue has room | DetectSPA(body) = SPA (T-057, deterministic over the same bytes) | E1 | an XADD to q:render after the result transaction is committed (Result, T-024) | httpworker/record.go OnResult → renderSPAResults (T-066) |
+//	| T2 | E0 | the HTTP stage publishes an SPA row, the queue is full | the same + the q:render depth ≥ render.queue_high_watermark (a read error = full, conservatively) | E1 (debt) | the render_pending bit of the domain by THE SAME result transaction (+1 of the debt counter T-175), no publication happens | httpworker/renderq.go renderSetPendingSQL (the bit × counter FSM — specified there too, T-258) |
+//	| T3 | E1 (debt) | the rework pass | the queue has room, the domain is not deleted, the verdict over the stored content = SPA | E1 | a q:render publication → the bit removal (−1 of the counter) in one transaction; marked rows (E3) are not published; aliases inherit the original's verdict | httpworker/renderq.go RequeueOnce (T-066; the D3/D4 transitions of the bit FSM, T-258) |
+//	| T4 | E0/E1 | the late re-publisher | the age (checked_at) > 6 h, no render_pending bit, no unconsumed q:render/q:render-fallback messages (a stream snapshot, the pattern of content/retentionpending.go), the verdict over the content = SPA | E1 | a q:render re-publication (the crawler_render_late_republish_total metric); cures MAXLEN truncation of fallback tasks and lost publications — the row's state stops depending on the message's survival; duplicates are bounded and suppressed by the consumer's idempotency (spec 3.4) | httpworker/renderlate.go LateOnce (T-259, FR-5.3) |
+//	| T5 | E1 | worker A: a successful render | the content_hash guard (the row of that very episode whose message it is; a T-058 rewrite has already changed it — 0 rows, the Put reference is removed, XACK) | E2 | the content is replaced by the DOM (Put +1 / SwapRefTx −1 of the old one), render_failed_at = NULL, rules_version = NULL, the rendered:/reanalyze: buckets (T-203/T-204), a q:analyze publication, XACK | renderUpdateSQL (this file) |
+//	| T6 | E1 | worker A: a finalization without a render — an engine-independent reason (the tarpit budget T-148, cert T-159, DNS T-211, the task class T-172 on the last one) OR the fallback is off/another stream/the chromium engine/a T-239 gate-budget rejection | rendered = false, the content_hash guard (coalesce — the first one stamps) | E3 | the render_failed_at marker, a q:analyze publication, XACK; q:dead — only for infrastructure errors | renderFailMarkerSQL, finalizeNoRender |
+//	| T7 | E1 | worker A: an engine-branched reason, the fallback is on, the fallbackPublishDecision is positive | the consumption stream is q:render (fallback recursion is forbidden, FR-10), a candidate engine, no row/rendered — do not publish | E1f | a q:render-fallback publication (no marker, no q:analyze), XACK; a delivery duplicate — the dedup filter by the row key + the episode's checked_at | publishFallback (T-238) |
+//	| T8 | E1f | worker B: a successful render | as T5 | E2 | as T5 | renderUpdateSQL (the B build, the q:render-fallback stream) |
+//	| T9 | E1f | worker B: the fallback is exhausted | rendered = false, the content_hash guard | E3 | as T6 | finalizeNoRender (the B build, FR-10) |
+//	| T10 | any | the episode is rewritten by a recheck | a new episode of the domain (T-030 → the HTTP stage T-058) | E0 | DELETE + INSERT of rows: rendered = false, the marker NULL (does not take part in the INSERT), a fresh checked_at; live messages of the old episode are extinguished by the T5/T6 guards/the T7 dedup filter | httpworker/record.go |
+//	| T11 | E2 | a successful render of a re-delivery (a concurrent duplicate) | the content_hash guard lets a rewrite with the same content through | E2 | the repeated rewrite is idempotent (spec 3.4): a repeated Put +1 / the UPDATE removes the same reference | renderUpdateSQL |
 //
-// Э4 — не переход, а исход доставок: охраны content_hash
-// (renderUpdateSQL/renderFailMarkerSQL, IS NOT DISTINCT FROM — NULL
-// «контента нет» легален) и фильтр дубля фолбэка (checked_at эпизода)
-// опознают перезаписанную строку, доставка подтверждается без эффектов.
+// E4 is not a transition but an outcome of deliveries: the content_hash
+// guards (renderUpdateSQL/renderFailMarkerSQL, IS NOT DISTINCT FROM — NULL
+// "no content" is legal) and the fallback dedup filter (the episode's
+// checked_at) recognize the rewritten row, the delivery is acknowledged without effects.
 //
-// Не-переходы (состояние рендера не меняют): retention (T-166/T-167)
-// срезает контент/jsonb не-находок в Э0/Э3 — Э1/Э1ф защищает интерлок
-// (непотреблённые сообщения q:render/q:render-fallback + бит);
-// анализатор штампует rules_version; monitor читает. collapse
-// (moveResultsSQL — перенос строк при слиянии зон) и накат дампа
-// (cmd/crawlerctl fixtures_import, ON CONFLICT DO UPDATE) пишут строку
-// под инвариантом И1: рендер-колонки не меняют, но именно они первыми
-// встретят 23514, если источник строки — нарушитель (ручной SQL).
+// Non-transitions (they do not change the render state): retention (T-166/T-167)
+// trims the content/jsonb of non-finds in E0/E3 — E1/E1f is protected by the
+// interlock (unconsumed q:render/q:render-fallback messages + the bit);
+// the analyzer stamps rules_version; monitor reads. collapse
+// (moveResultsSQL — moving rows on a zone merge) and the dump import
+// (cmd/crawlerctl fixtures_import, ON CONFLICT DO UPDATE) write the row
+// under invariant I1: they do not change the render columns, but they are the first
+// to meet 23514 if the row's source is a violator (manual SQL).
 //
-// ## Инварианты
+// ## Invariants
 //
-//	И1  Э2 ⇒ render_failed_at IS NULL. Всегда держали SQL-охраны
-//	    (renderUpdateSQL пишет пару вместе, маркер — только при
-//	    rendered = false); с T-259 — CHECK subdomain_results_rendered_check
-//	    (миграция 000018, NOT VALID — без сканирования 40+ млн строк;
-//	    VALIDATE — по регламенту миграций, docs/schema.md).
-//	И2  маркер ⇒ rendered = false (Э3): финализации маркеруют только
-//	    не-отрендеренные строки (охрана rendered = false), успешный рендер
-//	    маркер снимает; выход из Э3 — только сменой контента (П10) или
-//	    успешным рендером свежего эпизода.
-//	И3  «ждёт фолбэка» (Э1ф) бесколоночна по построению (ТЗ §4.8):
-//	    наблюдаема балансом фолбэка (published = consumed + глубина
-//	    q:render-fallback + buried) и не мешает переиздателю — интерлок
-//	    П4 исключает запись по живому сообщению стрима.
-//	И4  Э0 и Э1 неразличимы по колонкам: каждый переиздатель обязан
-//	    интерлокиться по держателям задачи — проход долга П3 охраной бита,
-//	    поздний переиздатель П4 снимком непотреблённых сообщений; дубли
-//	    публикаций ограничены окном прохода и гасятся идемпотентностью
-//	    потребителя (ТЗ 3.4).
+//	I1  E2 ⇒ render_failed_at IS NULL. The SQL guards always held this
+//	    (renderUpdateSQL writes the pair together, the marker — only with
+//	    rendered = false); since T-259 — the CHECK subdomain_results_rendered_check
+//	    (migration 000018, NOT VALID — without scanning 40+ million rows;
+//	    VALIDATE — per the migration regulations, docs/schema.md).
+//	I2  the marker ⇒ rendered = false (E3): finalizations only mark
+//	    non-rendered rows (the rendered = false guard), a successful render
+//	    removes the marker; the exit from E3 — only by a content change (T10) or
+//	    a successful render of a fresh episode.
+//	I3  "awaiting fallback" (E1f) is column-free by construction (spec §4.8):
+//	    observable by the fallback balance (published = consumed + the depth
+//	    of q:render-fallback + buried) and does not bother the re-publisher — the
+//	    T4 interlock excludes writing over a live stream message.
+//	I4  E0 and E1 are indistinguishable by columns: every re-publisher must
+//	    interlock over the task holders — the debt pass T3 by the bit guard,
+//	    the late re-publisher T4 by a snapshot of unconsumed messages; publication
+//	    duplicates are bounded by the pass window and suppressed by the consumer's
+//	    idempotency (spec 3.4).
 package renderworker
 
 import (
@@ -263,45 +263,45 @@ import (
 	"crawler/internal/render"
 )
 
-// SQL этапа. rendered = true — литерал ТЗ 5.6; rules_version = NULL —
-// контент сменился, прошлое заключение анализатора (rules_version ставит
-// T-068+ при записи findings) новому контенту не соответствует: повторная
-// публикация q:analyze ниже переанализирует запись и проставит свежую
-// версию. Ключи — литералами типов (стиль record.go T-058).
+// Stage SQL. rendered = true — the literal of spec 5.6; rules_version = NULL —
+// the content changed, the analyzer's previous conclusion (rules_version is set
+// by T-068+ when writing findings) does not match the new content: the repeated
+// q:analyze publication below re-analyzes the row and sets a fresh
+// version. Keys — as literals of types (the record.go T-058 style).
 var (
-	// renderSelectSQL — цель рендера: итоговый URL строки результата, её
-	// текущая ссылка на контент (оспариваемая оптимистической охраной
-	// renderUpdateSQL), признак rendered (фолбэк-публикация T-238
-	// пропускает уже отрендеренные — дорабатывать нечего) и checked_at —
-	// час корзины rendered-темпа (T-203) и идентификатор эпизода записи
-	// для фильтра дубля фолбэка (T-238: перезапись эпизода T-058 пишет
-	// новый checked_at, повторные доставки эпизода читают тот же).
-	// Ведущие колонки PK — партиционирование LIST по zone_id и
-	// субпартиционирование HASH (T-005) режут поиск до листа.
+	// renderSelectSQL — the render target: the final URL of the result row, its
+	// current content reference (the one disputed by the optimistic
+	// renderUpdateSQL guard), the rendered flag (the fallback publication T-238
+	// skips already rendered rows — there is nothing to rework) and checked_at —
+	// the hour of the rendered-rate bucket (T-203) and the episode identifier
+	// of the row for the fallback dedup filter (T-238: an episode rewrite T-058 writes
+	// a new checked_at, the episode's re-deliveries read the same one).
+	// The leading PK columns — LIST partitioning by zone_id and
+	// HASH subpartitioning (T-005) cut the search down to a leaf.
 	renderSelectSQL = "SELECT final_url, content_hash, rendered, checked_at FROM subdomain_results " +
 		"WHERE zone_id = $1::int2 AND domain_id = $2::int8 " +
 		"AND subdomain_id = $3::int2 AND variant = $4::int2"
 
-	// renderUpdateSQL — замена сырого HTML на итоговый DOM (ТЗ 5.6, §5.7):
-	// rendered = true, content_hash — ссылка на DOM (Put выше уже дал ей
-	// +1, здесь строка переключается на неё), final_url/cookies/headers —
-	// данные рендера (JS-редиректи виден только рендеру — T-061; cookies —
-	// все, включая httpOnly и выставленные JS, ТЗ 5.6/§11.4 п. 3 — единый
-	// jsonb-контракт с T-058; заголовки — ответ итоговой навигации, ТЗ 5.8).
-	// render_failed_at = NULL — успешный рендер снимает маркер «рендер
-	// невозможен» (T-210): конкурентная повторная доставка отрендерила
-	// то, что другая финализация успела отмаркировать; инвариант маркера
-	// «установлен ⇒ rendered = false» сохраняется без опоры на порядок
-	// доставок.
-	// Охрана content_hash IS NOT DISTINCT FROM $9 — оптимистическая:
-	// строка перезаписывается, только пока её контент тот же, что прочитан
-	// (NULL сравнивается корректно — «контента нет» легально, T-056).
-	// RETURNING r.checked_at (T-203) — час часовой корзины rendered-темпа
-	// (renderBumpRenderedSQL той же транзакции): час ЭПИЗОДА строки, не
-	// часа рендера — так считало живое окно прежнего читателя темпа
-	// (доля rendered среди результатов окна по checked_at); пустой
-	// результат — охрана отсекла (прежний RowsAffected 0): строка ушла
-	// из-под задачи.
+	// renderUpdateSQL — replacing the raw HTML with the final DOM (spec 5.6, §5.7):
+	// rendered = true, content_hash — the reference to the DOM (Put above has already given it
+	// +1, here the row switches to it), final_url/cookies/headers —
+	// the render data (a JS redirect is visible only to the render — T-061; cookies —
+	// all of them, including httpOnly and those set by JS, spec 5.6/§11.4 item 3 — the single
+	// jsonb contract with T-058; headers — the response of the final navigation, spec 5.8).
+	// render_failed_at = NULL — a successful render removes the "render
+	// impossible" marker (T-210): a concurrent re-delivery rendered
+	// what another finalization had managed to mark; the marker invariant
+	// "set ⇒ rendered = false" holds without relying on the delivery
+	// order.
+	// The guard content_hash IS NOT DISTINCT FROM $9 — optimistic:
+	// the row is rewritten only while its content is the same as the one read
+	// (NULL compares correctly — "no content" is legal, T-056).
+	// RETURNING r.checked_at (T-203) — the hour of the rendered-rate hourly bucket
+	// (renderBumpRenderedSQL of the same transaction): the hour of the row's EPISODE, not
+	// the hour of the render — that is how the live window of the former rate reader
+	// counted (the rendered share among the window's results by checked_at); an empty
+	// result — the guard cut it off (the former RowsAffected 0): the row slipped
+	// out from under the task.
 	renderUpdateSQL = "UPDATE subdomain_results AS r " +
 		"SET rendered = true, final_url = $5::text, content_hash = $6::bytea, " +
 		"cookies = $7::jsonb, headers = $8::jsonb, rules_version = NULL, render_failed_at = NULL " +
@@ -310,40 +310,40 @@ var (
 		"AND r.content_hash IS NOT DISTINCT FROM $9::bytea " +
 		"RETURNING r.checked_at"
 
-	// renderFailMarkerSQL — маркер «рендер невозможен» (T-210):
-	// финализации без рендера (тарпит T-148 / cert-класс T-159 / класс
-	// задачи T-172 / DNS-класс T-211) штампуют строку render_failed_at —
-	// выборка прохода доработки (httpworker/renderq.go,
-	// renderPendingRowsSQL) исключает отмаркированные записи ДО СМЕНЫ
-	// КОНТЕНТА: cert-класс, DNS-класс и класс задачи — постоянные
-	// свойства хоста (замеры T-172/T-207), у тарпита бюджет render.timeout_attempts исчерпан —
-	// повторные издания прохода жгут доставки и слот-времени (замер
-	// T-207: хвост ~180–220 тыс. битых записей; маркер останавливает
-	// именно ПОВТОРНЫЕ издания прохода — повторный проход по домену,
-	// чей флаг пережил публикацию: частичный сбой публикации
-	// (опубликованная часть финализируется за секунды, повтор издал бы
-	// её снова), выход Full после публикации соседей пачки, keep
-	// нечитаемого контента, рестарт между публикацией и снятием;
-	// первая попытка свежего эпизода легитимна — перезапись эпизода
-	// сбрасывает маркер). coalesce — штамп
-	// ПЕРВОЙ финализации («как давно признан невозможным» в диагностике),
-	// повторная финализация той же строки (сбой публикации вернул
-	// доставку) значения не меняет, RowsAffected остаётся 1.
-	// Охраны — те же принципы, что у renderUpdateSQL:
-	// content_hash IS NOT DISTINCT FROM $5 — оптимистическая (маркуется
-	// только строка того контента, чей рендер не удался; перепроверка
-	// T-058 уже перезаписала — RowsAffected 0, штамп нового эпизода не
-	// ставится; известное окно: контент побайтово тот же — хэш
-	// дедуплицирован T-056, штамп ляжет на строку нового эпизода;
-	// цена — проход не переиздаст её до следующего эпизода, прямая
-	// публикация записи результата рендерит её и при штампе),
-	// rendered = false — успешный конкурентный рендер закрыл вопрос
-	// рендера, штамп ему не нужен. Сброс — сменой контента: запись
-	// результата HTTP-этапа (T-058) перезаписывает строки домена
-	// DELETE + INSERT — новые строки получают NULL (починившийся хост
-	// отрендерится на следующем эпизоде), успешный рендер снимает штамп
-	// renderUpdateSQL выше. Автокоммит без транзакции: оператор один,
-	// атомарен сам по себе (стиль точечных UPDATE record.go).
+	// renderFailMarkerSQL — the "render impossible" marker (T-210):
+	// the finalizations without a render (the tarpit T-148 / the cert class T-159 / the task
+	// class T-172 / the DNS class T-211) stamp the row's render_failed_at —
+	// the rework pass selection (httpworker/renderq.go,
+	// renderPendingRowsSQL) excludes marked rows UNTIL THE
+	// CONTENT CHANGES: the cert class, the DNS class and the task class are permanent
+	// host properties (the T-172/T-207 measurements), the tarpit's render.timeout_attempts budget is exhausted —
+	// the pass's repeated publications burn deliveries and slot-time (the
+	// T-207 measurement: a tail of ~180–220 thousand broken rows; the marker stops
+	// exactly the REPEATED publications of the pass — a repeated pass over a domain
+	// whose flag survived the publication: a partial publication failure
+	// (the published part is finalized within seconds, a repeat would publish
+	// it again), a Full exit after the publication of the chunk's neighbors, keeping
+	// unreadable content, a restart between the publication and the removal;
+	// the first attempt of a fresh episode is legitimate — an episode rewrite
+	// resets the marker). coalesce — the stamp
+	// of the FIRST finalization ("how long ago it was recognized as impossible" in diagnostics),
+	// a repeated finalization of the same row (a publication failure returned
+	// the delivery) does not change the value, RowsAffected stays 1.
+	// The guards — the same principles as renderUpdateSQL's:
+	// content_hash IS NOT DISTINCT FROM $5 — optimistic (only the row of that
+	// content whose render failed is marked; the recheck
+	// T-058 has already rewritten it — RowsAffected 0, the new episode's stamp is not
+	// set; a known window: the content is byte-identical — the hash
+	// was deduplicated T-056, the stamp will land on the new episode's row;
+	// the price — the pass will not re-publish it until the next episode, a direct
+	// publication of the result row renders it even with the stamp),
+	// rendered = false — a successful concurrent render has settled the render
+	// question, the stamp is not needed for it. The reset — by a content change: a
+	// result write of the HTTP stage (T-058) rewrites the domain's rows
+	// DELETE + INSERT — the new rows get NULL (a recovered host
+	// will render on the next episode), a successful render removes the stamp
+	// (renderUpdateSQL above). Autocommit without a transaction: the statement is single,
+	// atomic by itself (the style of targeted UPDATEs of record.go).
 	renderFailMarkerSQL = "UPDATE subdomain_results AS r " +
 		"SET render_failed_at = coalesce(r.render_failed_at, now()) " +
 		"WHERE r.zone_id = $1::int2 AND r.domain_id = $2::int8 " +
@@ -351,300 +351,300 @@ var (
 		"AND r.rendered = false " +
 		"AND r.content_hash IS NOT DISTINCT FROM $5::bytea"
 
-	// renderBumpReanalyzeSQL — инкремент корзины неанализированных хвостов
-	// crawler_counters['reanalyze:YYYY-MM-DD"T"HH24'] (T-204): замена
-	// контента ставит rules_version = NULL — прошлое заключение
-	// анализатора новому контенту не соответствует, строка снова хвост
-	// до штампа повторной публикации q:analyze ниже. $1 — checked_at
-	// строки из RETURNING renderUpdateSQL: час ЭПИЗОДА, не рендера —
-	// тот же ключ, что у инкремента записи (record.go: час now() =
-	// checked_at строк) и декремента штампа анализатора (worker.go:
-	// RETURNING checked_at) — рассинхрон ключей лишил бы декремент
-	// адресата. Guard тикового прохода переанализа
-	// (analyzer/reanalyze.go) суммирует корзины старше текущего часа:
-	// свежий рендер (эпизод текущего часа) попадает в незрелую корзину и
-	// guard не открывает; рендер-опоздание > 1 ч воскрешает корзину
-	// старого часа — guard открывается, тик вычитывает окно, хвост позади
-	// курсора не находит (строка за курсором — остаточный класс время-
-	// формы T-193 §4.2), проход monitor корзину удаляет. Рендер строки,
-	// ещё не проштампованной записью (гонка с анализатором: NULL →
-	// render(NULL) → первый штамп), даёт +1 без парного декремента —
-	// потоковая семантика событий (семейство T-202/T-203), абсолюты
-	// выравнивает реконсиляция. Upsert-паттерн renderBumpRenderedSQL;
-	// порядок блокировок — ПЕРЕД rendered: (проход реконсиляции ведёт
-	// семьи «retry_mature: → reanalyze: → rendered: → results:») — без
-	// циклов.
+	// renderBumpReanalyzeSQL — an increment of the unanalyzed tails bucket
+	// crawler_counters['reanalyze:YYYY-MM-DD"T"HH24'] (T-204): a content
+	// replacement sets rules_version = NULL — the analyzer's previous
+	// conclusion does not match the new content, the row is a tail again
+	// until the stamp of the repeated q:analyze publication below. $1 — the
+	// row's checked_at from RETURNING renderUpdateSQL: the hour of the EPISODE, not the render —
+	// the same key as the record increment (record.go: the hour of now() =
+	// the rows' checked_at) and the analyzer stamp decrement (worker.go:
+	// RETURNING checked_at) — a key desync would leave the decrement
+	// without a target. The guard of the reanalysis tick pass
+	// (analyzer/reanalyze.go) sums the buckets older than the current hour:
+	// a fresh render (an episode of the current hour) lands in the immature bucket and
+	// the guard does not open; a render lateness > 1 h resurrects the
+	// old hour's bucket — the guard opens, the tick reads the window out, no tail behind
+	// the cursor is found (the row behind the cursor — the residual time-shape
+	// class of T-193 §4.2), a monitor pass removes the bucket. Rendering a row
+	// not yet stamped by a record (a race with the analyzer: NULL →
+	// render(NULL) → the first stamp) gives +1 without a paired decrement —
+	// the streaming semantics of events (the T-202/T-203 family), the absolutes
+	// are aligned by reconciliation. The upsert pattern of renderBumpRenderedSQL;
+	// the lock order — BEFORE rendered: (the reconciliation pass holds
+	// the families "retry_mature: → reanalyze: → rendered: → results:") — without
+	// cycles.
 	renderBumpReanalyzeSQL = "INSERT INTO crawler_counters (name, value, updated_at) " +
 		"VALUES ('reanalyze:' || to_char(date_trunc('hour', $1::timestamptz), 'YYYY-MM-DD\"T\"HH24'), $2::int8, now()) " +
 		"ON CONFLICT (name) DO UPDATE " +
 		"SET value = crawler_counters.value + EXCLUDED.value, updated_at = now()"
 
-	// renderBumpRenderedSQL — инкремент часовой корзины rendered-темпа
-	// crawler_counters['rendered:YYYY-MM-DD"T"HH24'] (T-203): +1 на
-	// строку, переведённую этой транзакцией в rendered = true; $1 —
-	// checked_at строки из RETURNING renderUpdateSQL, час корзины
-	// вычисляет БД (date_trunc) — таймзона согласована с инкрементом
-	// записи результата (record.go), читателем темпа и реконсиляцией.
-	// Живой аналог — прежний подзапрос rendered_hour throughputSQL
-	// (count(*) по subdomain_results, checked_at >= now() − 1 ч AND
-	// rendered): index-only по свежим страницам деградировал
-	// heap-fetch'ами — контрольная точка этапа 27 (механизм суточного
-	// окна T-179). Повторный рендер уже rendered-строки (повторная
-	// доставка при потерянном XACK; охрана хэша пропускает перезапись
-	// тем же DOM) даёт +1 к живому нулю — потоковая семантика событий
-	// (как у суточных строк T-179), абсолюты выравнивает реконсиляция.
-	// Upsert-паттерн record.go; строка счётчика — ЕДИНСТВЕННАЯ точка
-	// блокировки транзакции после UPDATE строки: одна точка циклов
-	// блокировок не создаёт (порядок общий со всеми писателями
-	// crawler_counters — реконсиляция берёт rendered: после
-	// retry_mature: и до results:).
+	// renderBumpRenderedSQL — an increment of the rendered-rate hourly bucket
+	// crawler_counters['rendered:YYYY-MM-DD"T"HH24'] (T-203): +1 per
+	// row moved by this transaction to rendered = true; $1 —
+	// the row's checked_at from RETURNING renderUpdateSQL, the DB computes
+	// the bucket hour (date_trunc) — the timezone is consistent with the result
+	// record increment (record.go), the rate reader and the reconciliation.
+	// The live analog — the former rendered_hour subquery of throughputSQL
+	// (count(*) over subdomain_results, checked_at >= now() − 1 h AND
+	// rendered): index-only over fresh pages degraded
+	// by heap fetches — the checkpoint of stage 27 (the mechanism of the daily
+	// window T-179). A repeated render of an already rendered row (a re-delivery
+	// on a lost XACK; the hash guard lets a rewrite
+	// with the same DOM through) gives +1 to the live zero — the streaming semantics of events
+	// (like the daily rows of T-179), the absolutes are aligned by reconciliation.
+	// The upsert pattern of record.go; the counter row — the ONLY lock
+	// point of the transaction after the row's UPDATE: a single point does not create
+	// lock cycles (the order is common with all writers
+	// of crawler_counters — reconciliation takes rendered: after
+	// retry_mature: and before results:).
 	renderBumpRenderedSQL = "INSERT INTO crawler_counters (name, value, updated_at) " +
 		"VALUES ('rendered:' || to_char(date_trunc('hour', $1::timestamptz), 'YYYY-MM-DD\"T\"HH24'), $2::int8, now()) " +
 		"ON CONFLICT (name) DO UPDATE " +
 		"SET value = crawler_counters.value + EXCLUDED.value, updated_at = now()"
 )
 
-// RenderDB — пул для чтения цели и записи результата: db.DB с
-// транзакциями (стиль httpworker.RecordDB, content.RefDB). Замена строки
-// и своп ссылок идут одной транзакцией (ТЗ 3.4); *pgxpool.Pool
-// удовлетворяет интерфейсу.
+// RenderDB — the pool for reading the target and writing the result: a db.DB with
+// transactions (the httpworker.RecordDB, content.RefDB style). The row
+// replacement and the reference swap go in one transaction (spec 3.4);
+// *pgxpool.Pool satisfies the interface.
 type RenderDB interface {
 	db.DB
 	Begin(ctx context.Context) (pgx.Tx, error)
 }
 
-// ContentStore — шов хранилища контента (ТЗ 5.7): запись DOM и снятие
-// ссылки, когда строка ушла из-под задачи. Узкое подмножество контракта
-// content.ContentStore (Get этапу не нужен — DOM не читается обратно);
-// удовлетворяется *content.PackStore (T-042).
+// ContentStore — the content storage seam (spec 5.7): writing the DOM and removing
+// the reference when the row slipped out from under the task. A narrow subset of the contract of
+// content.ContentStore (the stage does not need Get — the DOM is not read back);
+// satisfied by *content.PackStore (T-042).
 type ContentStore interface {
 	Put(ctx context.Context, data []byte) (content.PutResult, error)
 	Delete(ctx context.Context, hash content.Hash) error
 }
 
-// Renderer — шов рендера: удовлетворяется *render.Manager (T-065 — боевая
-// сборка cmd/render-worker: живое поколение «браузер + пул», перезапуски
-// по страницам/памяти, реконнект и повтор задачи) и *render.Pool напрямую
-// (T-061 — интеграционные тесты). Одна задача — одна страница в свежем
-// изолированном контексте; параллелизм ограничен слотами самого пула
-// (render.contexts, ТЗ 5.6).
+// Renderer — the render seam: satisfied by *render.Manager (T-065 — the production
+// build of cmd/render-worker: the live "browser + pool" generation, restarts
+// per pages/memory, a reconnect and a task retry) and *render.Pool directly
+// (T-061 — the integration tests). One task — one page in a fresh
+// isolated context; the parallelism is limited by the pool's own slots
+// (render.contexts, spec 5.6).
 type Renderer interface {
 	Run(ctx context.Context, task render.RenderTask) (render.RenderOutput, error)
 }
 
-// Дефолты воркера.
+// Worker defaults.
 const (
-	// DefaultStream — стрим потребления воркера по умолчанию (q:render,
-	// ТЗ 4.2): чтение цикла Run и клейм RecoverLoop. Воркер фолбэка
-	// (ТЗ §4.5 п.1, ФТ-12) — тот же бинарь другой сборкой: Options.Stream
-	// переопределяется на стрим фолбэка (q:render-fallback, константа
-	// queue.StreamRenderFallback — задача T-237), Options.Group — на
-	// отдельную группу; второй код воркера не пишется.
+	// DefaultStream — the worker's default consumption stream (q:render,
+	// spec 4.2): the Run loop's read and the RecoverLoop claim. The fallback
+	// worker (spec §4.5 item 1, FR-12) — the same binary built differently: Options.Stream
+	// is overridden to the fallback stream (q:render-fallback, the constant
+	// queue.StreamRenderFallback — task T-237), Options.Group — to
+	// a separate group; no second worker code is written.
 	DefaultStream = queue.StreamRender
 
-	// DefaultGroup — группа потребителей стрима потребления воркера (ТЗ
-	// 4.2: consumer groups масштабируют воркеров горизонтально);
-	// дефолтная сборка — группа q:render, воркер фолбэка (ФТ-12)
-	// собирается с отдельной группой.
+	// DefaultGroup — the consumer group of the worker's consumption stream (spec
+	// 4.2: consumer groups scale the workers horizontally);
+	// the default build — the q:render group, the fallback worker (FR-12)
+	// is built with a separate group.
 	DefaultGroup = "render-worker"
 
-	// DefaultConcurrency — доставок q:render в работе одновременно.
-	// Выше render.contexts не ускоряет сам рендер (слоты пула — узкое
-	// горло этапа, ТЗ 5.6), но перекрывает его БД-часть (Put, транзакция,
-	// публикация) — берём по прежней верхней границе рекомендованных
-	// ТЗ контекстов (4; сама рекомендация ТЗ 5.6 — 2–4): значение —
-	// пол для изолированных сборок и тестов без конфига. Дефолт
-	// render.contexts с T-169 — 8, боевая сборка передаёт
-	// max(DefaultConcurrency, render.contexts): слоты пула не должны
-	// простаивать при contexts > 4 (cmd/render-worker).
+	// DefaultConcurrency — q:render deliveries in flight at once.
+	// Above render.contexts it does not speed up the render itself (the pool slots are the stage's
+	// bottleneck, spec 5.6), but it overlaps its DB part (Put, the transaction,
+	// the publication) — we take it by the former upper bound of the spec-recommended
+	// contexts (4; the recommendation itself, spec 5.6 — 2–4): the value is
+	// a floor for isolated builds and tests without a config. The default
+	// render.contexts since T-169 is 8, the production build passes
+	// max(DefaultConcurrency, render.contexts): the pool slots must not
+	// idle at contexts > 4 (cmd/render-worker).
 	DefaultConcurrency = 4
 
-	// DefaultConsume — записей q:render за одно чтение: размер пачки
-	// XREADGROUP и буфера предвыборки скользящего потребления (T-142,
-	// образец T-139) — чтение идёт вперёд обработки не глубже пары пачек
-	// (текущая в руке читателя + буфер), следующее чтение происходит при
-	// освобождении слотов доставок, окно чтения параллелизм не
-	// ограничивает; столько же доставок подряд без подтверждения — порог
-	// предохранителя паузы (renderFailWaitBase ниже).
+	// DefaultConsume — q:render entries per one read: the size of the XREADGROUP
+	// chunk and of the prefetch buffer of the sliding consumption (T-142,
+	// the T-139 pattern) — the read runs ahead of processing by no more than a couple of chunks
+	// (the current one in the reader's hands + the buffer), the next read happens when
+	// delivery slots free up, the read window does not limit the
+	// parallelism; the same number of deliveries in a row without an acknowledgment — the threshold
+	// of the pause fuse (renderFailWaitBase below).
 	DefaultConsume = 16
 
-	// DefaultTimeoutAttempts — попыток доставки, которые задача q:render
-	// может завершить таймаутом страницы (render.timeout), прежде чем
-	// запись финализируется без рендера (T-148): таймаут — предсказуемое
-	// свойство тяжёлой страницы, а не случайная ошибка, жечь на нём общий
-	// лимит redis.max_attempts (3 доставки → q:dead) — терять работу.
-	// Вторая попытка после claim_min_idle (10 мин) даёт странице шанс
-	// в изменившихся условиях (первая может таймаутнуться от затора —
-	// замер 2026-10-23: слоты заняты таймаутами, 0.34 стр/с), дальше
-	// повтор предсказуем. 2 из 3 доставок — тарпит-бюджет меньше общего,
-	// q:dead остаётся инфраструктурным ошибкам (БД, браузер, публикация).
+	// DefaultTimeoutAttempts — the number of delivery attempts a q:render task
+	// may end with a page timeout (render.timeout) before
+	// the entry is finalized without a render (T-148): a timeout is a predictable
+	// property of a heavy page, not a random error; burning the overall
+	// redis.max_attempts limit on it (3 deliveries → q:dead) means losing work.
+	// The second attempt after claim_min_idle (10 min) gives the page a chance
+	// in changed conditions (the first one may time out because of a jam —
+	// the 2026-10-23 measurement: the slots are busy with timeouts, 0.34 entries/s), after that
+	// the repeat is predictable. 2 of 3 deliveries — the tarpit budget is smaller than the overall one,
+	// q:dead stays for infrastructure errors (DB, browser, publication).
 	DefaultTimeoutAttempts = 2
 
-	// DefaultTarpitTTL — время жизни ключа тарпит-счётчика задачи
-	// render:tarpit:{task_id} (T-261, ФТ-7): 2× горизонт ретраев эпизода
-	// (ТЗ-fsm ФТ-7 фиксирует дефолт 48 ч). Горизонт — окно доставок PEL
-	// (max_attempts × claim_min_idle ≈ полчаса) плюс очередь фолбэка
-	// (часы — темп воркера B); переиздания эпизода публикуют новый
-	// task_id со свежим бюджетом и horizon старого ключа не продлевают.
-	// Счётчик обязан пережить все доставки эпизода (между отметками
-	// проходят клеймы и рестарты воркеров) и не копиться вечно: TTL
-	// освежается каждой отметкой, ключ умирает через 48 ч после
-	// последнего тарпита задачи (docs/redis.md §2).
+	// DefaultTarpitTTL — the lifetime of the task's tarpit counter key
+	// render:tarpit:{task_id} (T-261, FR-7): 2× the episode's retry horizon
+	// (TZ-fsm FR-7 fixes the 48 h default). The horizon — the window of PEL deliveries
+	// (max_attempts × claim_min_idle ≈ half an hour) plus the fallback queue
+	// (hours — worker B's rate); the episode's re-publications publish a new
+	// task_id with a fresh budget and do not extend the old key's horizon.
+	// The counter must survive all the episode's deliveries (claims and worker
+	// restarts happen between the marks) and must not accumulate forever: the TTL
+	// is refreshed by every mark, the key dies 48 h after
+	// the task's last tarpit (docs/redis.md §2).
 	DefaultTarpitTTL = 48 * time.Hour
 
-	// DefaultErrorWait — пауза после ошибок Redis и при недоступном
-	// браузере (стиль httpworker.DefaultErrorWait): холостые круги не
-	// греют логи, неподтверждённые доставки вернёт XAUTOCLAIM (T-025).
+	// DefaultErrorWait — the pause after Redis errors and with an unavailable
+	// browser (the httpworker.DefaultErrorWait style): idle circles do not
+	// heat the logs, unacknowledged deliveries will be returned by XAUTOCLAIM (T-025).
 	DefaultErrorWait = 30 * time.Second
 )
 
-// Options — параметры воркера; нулевые значения заменяются дефолтами
-// (withDefaults, стиль httpworker.Options).
+// Options — the worker's parameters; zero values are replaced by defaults
+// (withDefaults, the httpworker.Options style).
 type Options struct {
-	// Concurrency — доставок q:render в работе одновременно; 0 —
+	// Concurrency — q:render deliveries in flight at once; 0 —
 	// DefaultConcurrency.
 	Concurrency int
-	// Consume — записей q:render за одно чтение; 0 — DefaultConsume.
+	// Consume — q:render entries per one read; 0 — DefaultConsume.
 	Consume int
-	// Rate — потолок темпа потребления: не больше Rate записей за
-	// скользящее окно renderRateWindow (T-240, ФТ-13 — батч-режим
-	// «собрать и доработать» без наращивания chromium-мощности; окно —
-	// RateWindow = 1 мин). Параметр темпа общий, без привязки к движку
-	// и стриму (ФТ-4: ветвлений по движку нет) — применяется всегда,
-	// когда задан; ограничивается потребление (XREADGROUP), клейм
-	// RecoverLoop потолком не трогается (темп возврата зависших —
-	// redis.recover_*, T-153). Боевая проводка ставит потолок на сборке
-	// воркера B (render.fallback.worker_rate, стрим q:render-fallback,
-	// cmd/render-worker); пустое чтение потолок не расходует. ≤ 0 — без
-	// потолка (дефолт: основная сборка q:render читает как раньше).
+	// Rate — the consumption rate cap: no more than Rate entries per
+	// the sliding window renderRateWindow (T-240, FR-13 — the batch
+	// "collect and rework" mode without scaling up chromium capacity; the window is
+	// RateWindow = 1 min). The rate parameter is shared, with no binding to an engine
+	// or a stream (FR-4: there are no engine branches) — applied whenever
+	// set; the consumption is limited (XREADGROUP), the
+	// RecoverLoop claim is not touched by the cap (the return rate of stuck deliveries —
+	// redis.recover_*, T-153). The production wiring sets the cap on the
+	// worker B build (render.fallback.worker_rate, the q:render-fallback stream,
+	// cmd/render-worker); an empty read does not spend the cap. ≤ 0 — without
+	// a cap (the default: the main q:render build reads as before).
 	Rate int
-	// Stream — стрим потребления воркера: чтение цикла Run и клейм
-	// RecoverLoop (ФТ-12: воркер фолбэка — тот же бинарь со стримом
-	// q:render-fallback и отдельной группой); "" — DefaultStream (q:render,
-	// ноль изменений поведения основной сборки). Имя обязано быть рабочим
-	// стримом очереди (knownStream, internal/queue) — транспорт чужие
-	// отвергает; публикация q:analyze от стрима потребления не зависит
-	// (формат Result общий для обоих стримов).
+	// Stream — the worker's consumption stream: the Run loop's read and the
+	// RecoverLoop claim (FR-12: the fallback worker — the same binary with the
+	// q:render-fallback stream and a separate group); "" — DefaultStream (q:render,
+	// zero behavior change of the main build). The name must be a working
+	// queue stream (knownStream, internal/queue) — the transport rejects
+	// others; the q:analyze publication does not depend on the consumption stream
+	// (the Result format is shared by both streams).
 	Stream string
-	// Group — группа потребителей стрима Stream; "" — DefaultGroup.
+	// Group — the consumer group of the Stream stream; "" — DefaultGroup.
 	Group string
-	// Consumer — имя потребителя группы; "" — "render-worker-<pid>".
+	// Consumer — the group's consumer name; "" — "render-worker-<pid>".
 	Consumer string
-	// Alive — зонд браузера: false — очередь не читается (доставки
-	// остаются в стриме непрочитанными, а не в PEL без XACK — без
-	// клеймов запись в PEL зависает надолго). Ставится сборкой сервиса
-	// (render.Manager.Alive, T-061/T-065: мёртвое поколение зонд
-	// перезапускает сам — реконнект); nil — зонд отключён.
+	// Alive — the browser probe: false — the queue is not read (deliveries
+	// stay in the stream unread, not in the PEL without XACK — without
+	// claims an entry in the PEL hangs for a long time). Set by the service build
+	// (render.Manager.Alive, T-061/T-065: the probe restarts a dead
+	// generation itself — a reconnect); nil — the probe is off.
 	Alive func() bool
-	// Recover — слой возврата зависших доставок (Reliab, T-025): Run
-	// поднимает фоновый RecoverLoop (XAUTOCLAIM → та же обработка →
-	// XACK) с теми же Group/Consumer; nil — восстановления нет
-	// (изолированные сборки и тесты без Redis-специфики).
+	// Recover — the layer of returning stuck deliveries (Reliab, T-025): Run
+	// starts a background RecoverLoop (XAUTOCLAIM → the same processing →
+	// XACK) with the same Group/Consumer; nil — no recovery
+	// (isolated builds and tests without Redis specifics).
 	Recover *queue.Reliab
-	// TimeoutAttempts — сколько доставок задачи могут завершиться
-	// таймаутом страницы (render.timeout, предсказуемый тарпит), прежде
-	// чем запись финализируется без рендера — итогом остаётся сырой HTML
-	// HTTP-фазы, запись уходит в q:analyze, доставка подтверждается
-	// (T-148). С T-261 порог считается по числу тарпит-классифицированных
-	// доставок эпизода — мощности множества render:tarpit:{task_id}
-	// (tarpitsExhausted, Options.Tarpits): смешанные серии (инфра-сбой
-	// между тарпитами) не финализируют раньше порога; счётчик
-	// недоступен/не смонтирован — деградация к номеру доставки PEL
-	// (поведение до T-261). Обязан быть ≤ redis.max_attempts — иначе
-	// тарпит умер бы в q:dead до финализации (проверяет config.Validate).
+	// TimeoutAttempts — how many deliveries of a task may end
+	// with a page timeout (render.timeout, a predictable tarpit) before
+	// the entry is finalized without a render — the result stays the raw HTML
+	// of the HTTP phase, the entry goes to q:analyze, the delivery is acknowledged
+	// (T-148). Since T-261 the threshold is counted by the number of the episode's tarpit-classified
+	// deliveries — the cardinality of the render:tarpit:{task_id} set
+	// (tarpitsExhausted, Options.Tarpits): mixed series (an infra failure
+	// between tarpits) are not finalized before the threshold; the counter
+	// unavailable/not mounted — degradation to the PEL delivery number
+	// (the behavior before T-261). Must be ≤ redis.max_attempts — otherwise
+	// the tarpit would die in q:dead before finalization (checked by config.Validate).
 	// 0 — DefaultTimeoutAttempts.
 	TimeoutAttempts int
-	// MaxAttempts — максимум доставок задачи (redis.max_attempts,
-	// T-172): ошибка рендера класса task (отказ соединения, load error —
-	// свойство хоста) на доставке с этим номером финализирует запись без
-	// рендера (по образцу тарпитов T-148), а не уносит в q:dead; ниже
-	// номера — обычные повторяемые ошибки (восстановление хостов
-	// наблюдается: замер T-172 — 6.6% ретраев ERR_CONNECTION_REFUSED
-	// успешны). Должен равняться redis.max_attempts того же Reliab
-	// (боевая сборка передаёт cfg.Redis.MaxAttempts): меньше — записи
-	// финализировались бы раньше исчерпания, больше — политика не
-	// успевала бы до захоронения. 0 — queue.DefaultMaxAttempts.
+	// MaxAttempts — the maximum deliveries of a task (redis.max_attempts,
+	// T-172): a render error of the task class (a connection refusal, a load error —
+	// a host property) on the delivery with this number finalizes the entry without
+	// a render (following the tarpit pattern T-148) instead of taking it to q:dead; below
+	// the number — ordinary retryable errors (host recovery is
+	// observed: the T-172 measurement — 6.6% of ERR_CONNECTION_REFUSED retries
+	// succeed). Must equal redis.max_attempts of the same Reliab
+	// (the production build passes cfg.Redis.MaxAttempts): smaller — entries
+	// would be finalized before exhaustion, larger — the policy would not
+	// make it before the burying. 0 — queue.DefaultMaxAttempts.
 	MaxAttempts int
-	// Tarpits — счётчик тарпит-классифицированных доставок задач
-	// (T-261, ТЗ-fsm §3 ФТ-7): решение тарпит-финализации принимается
-	// по мощности множества render:tarpit:{task_id} (SCARD ≥
-	// TimeoutAttempts), а не по номеру доставки PEL — номер растят все
-	// доставки (включая инфра-сбои), множество только тарпиты. Боевая
-	// сборка передаёт queue.NewTarpitCounter(rdb) (тот же клиент Redis,
-	// что у очереди); nil — деградация к номеру доставки PEL,
-	// поведению до T-261 (изолированные сборки и тесты без
-	// Redis-специфики — как Recover/Metrics).
+	// Tarpits — the counter of tasks' tarpit-classified deliveries
+	// (T-261, TZ-fsm §3 FR-7): the tarpit-finalization decision is made
+	// by the cardinality of the render:tarpit:{task_id} set (SCARD ≥
+	// TimeoutAttempts), not by the PEL delivery number — the number is grown by all
+	// deliveries (including infra failures), the set only by tarpits. The production
+	// build passes queue.NewTarpitCounter(rdb) (the same Redis client
+	// as the queue's); nil — degradation to the PEL delivery number,
+	// the behavior before T-261 (isolated builds and tests without
+	// Redis specifics — like Recover/Metrics).
 	Tarpits TarpitStore
-	// RecoverBatch — пачка клейма RecoverLoop за проход; 0 — дефолт
-	// очереди (queue.DefaultRecoverBatch). Боевая сборка передаёт
-	// redis.recover_batch (T-153): темп возврата зависших — настраиваемая
-	// величина очереди, а не окно потребления этапа. Инвариант с
-	// claim_min_idle — queue.DefaultRecoverBatch (рендер — самый медленный
-	// последовательный обход: 5–25 с/запись).
+	// RecoverBatch — the RecoverLoop claim chunk per pass; 0 — the queue
+	// default (queue.DefaultRecoverBatch). The production build passes
+	// redis.recover_batch (T-153): the return rate of stuck deliveries is a
+	// queue-configurable value, not the stage's consumption window. The invariant with
+	// claim_min_idle — queue.DefaultRecoverBatch (the render is the slowest
+	// sequential crawl: 5–25 s/entry).
 	RecoverBatch int
-	// RecoverInterval — период опроса зависших записей RecoverLoop;
-	// 0 — дефолт очереди (queue.DefaultRecoverInterval). Конфиг —
+	// RecoverInterval — the poll period of RecoverLoop for stuck entries;
+	// 0 — the queue default (queue.DefaultRecoverInterval). The config —
 	// redis.recover_interval (T-153).
 	RecoverInterval time.Duration
-	// Fallback — публикация фолбэка из путей финализации без рендера
-	// (T-238, ТЗ §4.4, ФТ-8/ФТ-14): включение (render.fallback.enabled,
-	// T-233) переключает тарпит T-148 и класс задачи T-172 (последняя
-	// попытка) с проставления render_failed_at на публикацию задачи в
-	// q:render-fallback. Нулевое значение (дефолт) — фолбэка нет,
-	// поведение финализаций прежнее.
+	// Fallback — the fallback publication from the finalization paths without a render
+	// (T-238, spec §4.4, FR-8/FR-14): turning it on (render.fallback.enabled,
+	// T-233) switches the tarpit T-148 and the task class T-172 (the last
+	// attempt) from setting render_failed_at to publishing the task to
+	// q:render-fallback. The zero value (the default) — no fallback,
+	// the finalization behavior stays as before.
 	Fallback FallbackOptions
-	// Engine — движок рендера сборки (render.engine, T-234; словарь
-	// config.EngineChromium|EngineMoli|EngineLightpanda): значение метки
-	// engine метрик этапа (T-235, ТЗ §4.6 п.1, ФТ-15 — проводится в
-	// NewMetrics при инициализации приборов; кардинальность 3) и вход
-	// движкового guard'а публикации фолбэка (S-P1-1: chromium, включая
-	// пустое значение, фолбэк не публикует — fallbackArmed). На поведение
-	// самого рендера поле не влияет: движок видят только конфигурация и
-	// аллокатор (ФТ-4), здесь — наблюдаемость и guard фолбэка; словарь
-	// и связку «движок × remote_url × порог памяти» уже проверили
-	// config.Validate и render.Options.validate. "" — chromium (как у
-	// render.Options.Engine, сборки без конфигурации).
+	// Engine — the render engine of the build (render.engine, T-234; the vocabulary
+	// config.EngineChromium|EngineMoli|EngineLightpanda): the value of the
+	// engine label of the stage metrics (T-235, spec §4.6 item 1, FR-15 — wired in
+	// NewMetrics at metrics initialization; cardinality 3) and the input
+	// of the engine guard of the fallback publication (S-P1-1: chromium, including
+	// an empty value, does not publish the fallback — fallbackArmed). It does not affect
+	// the render's own behavior: only the configuration and the
+	// allocator see the engine (FR-4); here — observability and the fallback guard; the vocabulary
+	// and the "engine × remote_url × memory threshold" bundle were already checked by
+	// config.Validate and render.Options.validate. "" — chromium (like
+	// render.Options.Engine, builds without configuration).
 	Engine string
-	// Log — логгер; nil — записи подавлены (slog.DiscardHandler).
+	// Log — the logger; nil — records suppressed (slog.DiscardHandler).
 	Log *slog.Logger
-	// Metrics — реестр Prometheus сервиса (T-077, ТЗ 5.9): из него New
-	// строит приборы этапа (NewMetrics); nil — без метрик (изолированные
-	// сборки и тесты).
+	// Metrics — the service's Prometheus registry (T-077, spec 5.9): New
+	// builds the stage metrics from it (NewMetrics); nil — without metrics (isolated
+	// builds and tests).
 	Metrics *metrics.Registry
 }
 
-// FallbackOptions — параметры публикации фолбэка (T-238, ТЗ §4.4
-// п.1–2/п.5, ФТ-7/8/10/14). Поля конфигурации потолков (worker_rate,
-// share_percent, health_gate_streak — T-233) сюда не входят: они
-// принадлежат гейту/бюджету/воркеру B (T-239/T-240); здесь — только
-// включение, которым воркер обязан распоряжаться на путях финализации.
+// FallbackOptions — the fallback publication parameters (T-238, spec §4.4
+// items 1–2/5, FR-7/8/10/14). The cap configuration fields (worker_rate,
+// share_percent, health_gate_streak — T-233) are not here: they
+// belong to the gate/budget/worker B (T-239/T-240); here — only
+// the switch the worker must honor on the finalization paths.
 type FallbackOptions struct {
-	// Enabled — render.fallback.enabled (T-233, ФТ-14): false (дефолт,
-	// ноль изменений поведения и прод-контура до явного включения) —
-	// финализации без рендера работают как сегодня: тарпит T-148 и
-	// класс задачи T-172 на последней попытке штампуют маркер
-	// render_failed_at (T-210) и публикуют q:analyze; true — вместо
-	// маркера задача публикуется в q:render-fallback (publishFallback),
-	// запись дорабатывает chromium-воркер B (ТЗ §4.5). DNS-класс T-211
-	// и cert-класс T-159 не фолбэкаются при любом значении (ФТ-7).
-	// Выключение — без деплоя новых сущностей: накопленное в очереди
-	// дорабатывается воркером B до пуста (ФТ-14).
+	// Enabled — render.fallback.enabled (T-233, FR-14): false (the default,
+	// zero behavior change of the production circuit until explicitly enabled) —
+	// the finalizations without a render work as today: the tarpit T-148 and
+	// the task class T-172 on the last attempt stamp the
+	// render_failed_at marker (T-210) and publish to q:analyze; true — instead of
+	// the marker the task is published to q:render-fallback (publishFallback),
+	// the entry is reworked by the chromium worker B (spec §4.5). The DNS class T-211
+	// and the cert class T-159 are never fallbacked under any value (FR-7).
+	// Turning it off — without deploying new entities: what accumulated in the queue
+	// is reworked by worker B until empty (FR-14).
 	Enabled bool
-	// Gate — вход health-гейта функции-решения fallbackPublishDecision
-	// (ФТ-9а: стрик инфра-ошибок класса браузера — «основной движок
-	// недоступен» — приостанавливает фолбэк-публикацию до восстановления
-	// движка, перелив всего потока на дорогой chromium исключён).
-	// Порог — Threshold (render.fallback.health_gate_streak, T-233);
-	// стрик живого потока ведёт воркер (fbObserveOutcome), решение читает
-	// срез (T-239).
+	// Gate — the health gate input of the fallbackPublishDecision function
+	// (FR-9a: a streak of infra errors of the browser class — "the main engine
+	// is unavailable" — suspends the fallback publication until the engine
+	// recovers, the overflow of the whole flow onto the expensive chromium is excluded).
+	// The threshold — Threshold (render.fallback.health_gate_streak, T-233);
+	// the live streak is kept by the worker (fbObserveOutcome), the decision reads
+	// the snapshot (T-239).
 	Gate FallbackGate
-	// Budget — вход бюджета доли функции-решения
-	// (ФТ-9б: доля публикаций в фолбэк за окно сверх потолка
-	// share_percent приостанавливает фолбэк до конца окна — задачи
-	// финализируются штатно с маркером). Потолок — Ceiling
-	// (render.fallback.share_percent, T-233); окно и учёт доли ведёт
-	// воркер (fbObserveTask/fbRecordPublish), решение читает срез
-	// (T-239).
+	// Budget — the share budget input of the decision function
+	// (FR-9b: the share of fallback publications over the window beyond the
+	// share_percent cap suspends the fallback until the end of the window — tasks
+	// are finalized regularly with the marker). The cap — Ceiling
+	// (render.fallback.share_percent, T-233); the worker keeps the window and
+	// the share accounting (fbObserveTask/fbRecordPublish), the decision reads
+	// the snapshot (T-239).
 	Budget FallbackBudget
 }
 
@@ -670,16 +670,16 @@ func (o Options) withDefaults() Options {
 	if o.MaxAttempts <= 0 {
 		o.MaxAttempts = queue.DefaultMaxAttempts
 	}
-	// Rate отрицательным быть не может по смыслу (потолок потребления);
-	// withDefaults не подставляет дефолт: 0 — честное «без потолка»,
-	// дефолт ограничил бы основную сборку q:render (Rate — параметр
-	// сборки, а не этапа).
+	// Rate cannot be negative by meaning (a consumption cap);
+	// withDefaults does not substitute a default: 0 — an honest "without a cap",
+	// a default would limit the main q:render build (Rate is a build
+	// parameter, not a stage one).
 	if o.Rate < 0 {
 		o.Rate = 0
 	}
-	// Пустой Engine — chromium, как у render.Options.Engine (сборки без
-	// конфигурации): нормализация здесь держит движковый guard
-	// fallbackArmed (S-P1-1) и метки метрик на одном словаре из 3 движков.
+	// An empty Engine — chromium, like render.Options.Engine (builds without
+	// configuration): the normalization here keeps the engine guard
+	// fallbackArmed (S-P1-1) and the metric labels on one vocabulary of 3 engines.
 	if o.Engine == "" {
 		o.Engine = config.EngineChromium
 	}
@@ -693,29 +693,29 @@ func (o Options) log() *slog.Logger {
 	return o.Log
 }
 
-// Worker — рендер-воркер: обрабатывает задачи стрима потребления
-// Options.Stream (дефолт q:render; ключи строк subdomain_results) через
-// швы рендера и хранилища. Потокобезопасен: неизменно после New всё,
-// кроме fbDedup — фильтра дубля фолбэк-публикаций (T-238) — и состояний
-// гейта/бюджета фолбэка fbGate/fbBudget (T-239) под общим мьютексом
-// fbMu (доставки идут параллельно; приборы метрик — синхронизированные).
+// Worker — the render worker: processes the tasks of the consumption stream
+// Options.Stream (the default q:render; the subdomain_results row keys) through
+// the render and storage seams. Thread-safe: everything is immutable after New except
+// fbDedup — the dedup filter of fallback publications (T-238) — and the
+// fallback gate/budget states fbGate/fbBudget (T-239) under the shared
+// fbMu mutex (deliveries go in parallel; the metrics are synchronized).
 type Worker struct {
 	db       RenderDB
 	q        queue.Queue
 	contents ContentStore
 	renderer Renderer
 	opt      Options
-	met      *Metrics       // приборы этапа (T-077); nil — no-op
-	fbDedup  *fallbackDedup // фильтр дубля фолбэк-публикаций (T-238); строится в New
-	fbMu     sync.Mutex     // состояния гейта/бюджета фолбэка (T-239): стрик и окно под ним
-	fbGate   FallbackGate   // health-гейт (T-239): копия Options.Fallback.Gate с живым стриком
-	fbBudget FallbackBudget // бюджет доли (T-239): копия Options.Fallback.Budget со счётчиками окна
+	met      *Metrics       // stage metrics (T-077); nil — no-op
+	fbDedup  *fallbackDedup // the dedup filter of fallback publications (T-238); built in New
+	fbMu     sync.Mutex     // the fallback gate/budget states (T-239): the streak and the window under it
+	fbGate   FallbackGate   // the health gate (T-239): a copy of Options.Fallback.Gate with the live streak
+	fbBudget FallbackBudget // the share budget (T-239): a copy of Options.Fallback.Budget with the window counters
 }
 
-// New строит воркер поверх пула БД, очереди (публикация q:analyze — под
-// гейтом backpressure в сборке, T-026), хранилища контента и пула
-// рендера. nil-зависимости — ошибка: тихая потеря результата/публикации
-// незаметна для оператора (стиль T-058).
+// New builds the worker over the DB pool, the queue (the q:analyze publication — under
+// the backpressure gate in the build, T-026), the content storage and the render
+// pool. nil dependencies — an error: a silent loss of a result/publication
+// is invisible to the operator (the T-058 style).
 func New(db RenderDB, q queue.Queue, contents ContentStore, renderer Renderer, opts Options) (*Worker, error) {
 	if db == nil {
 		return nil, errors.New("renderworker: пул БД не задан")
@@ -734,27 +734,27 @@ func New(db RenderDB, q queue.Queue, contents ContentStore, renderer Renderer, o
 		fbGate: opts.Fallback.Gate, fbBudget: opts.Fallback.Budget}, nil
 }
 
-// renderTarget — прочитанная строка результата: цель рендера и старая
-// ссылка на контент; rendered/checkedAt — фильтры фолбэка (T-238):
-// отрендеренную строку в фолбэк не публикует никто, checked_at
-// идентифицирует эпизод записи (перезапись эпизода T-058 — новый).
+// renderTarget — the read result row: the render target and the old
+// content reference; rendered/checkedAt — the fallback filters (T-238):
+// nobody publishes a rendered row to the fallback, checked_at
+// identifies the row's episode (a T-058 episode rewrite — a new one).
 type renderTarget struct {
 	finalURL  string
-	hash      []byte    // nil — контента нет (NULL content_hash, T-056)
-	rendered  bool      // успешный рендер уже закрыл вопрос (T-238)
-	checkedAt time.Time // эпизод записи — ключ фильтра дубля (T-238), час корзины (T-203)
+	hash      []byte    // nil — no content (NULL content_hash, T-056)
+	rendered  bool      // a successful render has already settled the question (T-238)
+	checkedAt time.Time // the row's episode — the dedup filter key (T-238), the bucket hour (T-203)
 }
 
-// tarpitError — маркер таймаут-тарпита (T-148): ошибка рендера класса
-// task, чья причина — истечение общего таймаута страницы render.timeout
-// (session.wrap: «таймаут страницы …» → context.DeadlineExceeded в
-// цепочке). Такой таймаут — предсказуемое свойство тяжёлой страницы:
-// повтор на новом контексте почти наверняка даст тот же исход, а каждая
-// попытка стоит слоту полный таймаут (замер 2026-10-23: слоты заняты
-// таймаутами, эффективная скорость этапа 0.34 стр/с). Обёртка не меняет
-// текст ошибки (Error/Unwrap — исходной) и служит только меткой:
-// processDelivery выбирает по ней финализацию записи без рендера вместо
-// пережигания попыток доставки до q:dead.
+// tarpitError — the timeout-tarpit marker (T-148): a render error of the
+// task class whose cause is the overall page timeout render.timeout
+// expiring (session.wrap: "page timeout …" → context.DeadlineExceeded in
+// the chain). Such a timeout is a predictable property of a heavy page:
+// a retry on a new context almost surely gives the same outcome, and every
+// attempt costs a slot the full timeout (the 2026-10-23 measurement: the slots are busy
+// with timeouts, the stage's effective rate is 0.34 entries/s). The wrapper does not change
+// the error text (Error/Unwrap — the original's) and serves only as a label:
+// processDelivery uses it to choose finalizing the entry without a render instead of
+// burning the delivery attempts down to q:dead.
 type tarpitError struct {
 	err error
 }
@@ -762,50 +762,50 @@ type tarpitError struct {
 func (e *tarpitError) Error() string { return e.err.Error() }
 func (e *tarpitError) Unwrap() error { return e.err }
 
-// isPageTimeout — признак таймаута страницы: класс task (повтор на новом
-// контексте бессмысленен) и context.DeadlineExceeded в цепочке — так
-// помечает истечение render.timeout сам рендер (session.wrap). Отмена
-// вызывающего контекста (graceful shutdown → context.Canceled) тарпитом
-// не считается: это инфраструктурное событие, доставка вернётся
-// повторной доставкой после рестарта.
+// isPageTimeout — the page timeout sign: the task class (a retry on a new
+// context is pointless) and context.DeadlineExceeded in the chain — that is how
+// the render itself marks the render.timeout expiry (session.wrap). The
+// caller context's cancellation (graceful shutdown → context.Canceled) does not
+// count as a tarpit: it is an infrastructure event, the delivery will return
+// with a re-delivery after the restart.
 func isPageTimeout(err error) bool {
 	return render.ClassOf(err) == render.ClassTask && errors.Is(err, context.DeadlineExceeded)
 }
 
-// certErrorCodes — сетевые коды Chromium (net/base/net_error_list.h),
-// означающие постоянную ошибку TLS-сертификата хоста: свойство самого
-// хоста, а не сети или инфраструктуры. Список закрыт намеренно (T-159):
-// ERR_CONNECTION_REFUSED и прочие сетевые коды не входят (отказ
-// соединения может быть временным — хост поднимется; замер T-172: 6.6%
-// ретраев после отказа успешны); DNS-отказ — отдельный класс T-211
-// (dnsErrorCodes, финализируется так же с первой доставки). Время-зависимый код сертификата
-// ERR_CERT_DATE_INVALID (просрочен/ещё не действует) включён по замеру
-// T-172: доля успешных ретраев 0 из 321 первых неудач за сутки (92%
-// исчерпали попытки в q:dead) — окно продления сертификата (дни) много
-// шире окна ретраев (3 доставки, ~полчаса), а следующий эпизод
-// перепроверки (T-030) всё равно опубликует новую задачу q:render.
-// Расширение списка — только с обоснованием детерминированности
-// (замером) и тестом на код.
+// certErrorCodes — the Chromium network codes (net/base/net_error_list.h)
+// meaning a permanent TLS certificate error of the host: a property of the
+// host itself, not of the network or the infrastructure. The list is closed on purpose (T-159):
+// ERR_CONNECTION_REFUSED and other network codes are not included (a
+// connection refusal may be temporary — the host will come up; the T-172 measurement: 6.6%
+// of retries after a refusal succeed); a DNS refusal is a separate class T-211
+// (dnsErrorCodes, finalized the same way from the first delivery). The time-dependent certificate code
+// ERR_CERT_DATE_INVALID (expired/not yet valid) is included by the
+// T-172 measurement: the share of successful retries 0 of 321 first failures per day (92%
+// exhausted the attempts in q:dead) — the certificate renewal window (days) is much
+// wider than the retry window (3 deliveries, ~half an hour), and the next recheck
+// episode (T-030) will publish a new q:render task anyway.
+// Extending the list — only with a determinism justification
+// (by a measurement) and a test on the code.
 var certErrorCodes = []string{
-	// Сертификат не издан доверенным центром сертификации: самоподписан
-	// или неизвестный корень — замена сертификата на стороне хоста.
+	// The certificate is not issued by a trusted certification authority: self-signed
+	// or an unknown root — a certificate replacement on the host's side.
 	"net::ERR_CERT_AUTHORITY_INVALID",
-	// Сертификат не покрывает имя хоста (CN/SAN не совпадают) — ошибка
-	// конфигурации сертификата хоста.
+	// The certificate does not cover the host name (CN/SAN do not match) — a
+	// host certificate configuration error.
 	"net::ERR_CERT_COMMON_NAME_INVALID",
-	// Сертификат просрочен или ещё не действует. В T-159 был исключён
-	// как «время-зависимый»; замер T-172 показал стабильность на окне
-	// ретраев (0 успешных из 321) — включён.
+	// The certificate is expired or not yet valid. In T-159 it was excluded
+	// as "time-dependent"; the T-172 measurement showed stability over the retry
+	// window (0 successful of 321) — included.
 	"net::ERR_CERT_DATE_INVALID",
 }
 
-// isCertError — признак постоянной ошибки сертификата хоста (T-159,
-// T-172): класс task (свойство страницы — так classifyCtx маркирует сбои
-// загрузки net::ERR_*, а не умерший контекст/браузер, где повтор осмыслен)
-// и код ошибки загрузки из certErrorCodes. Сетевые коды (отказ
-// соединения — восстановление наблюдается) мимо: до исчерпания
-// детерминированности они — повторимые ошибки (T-172 финализирует их
-// только на последней доставке).
+// isCertError — the permanent host certificate error sign (T-159,
+// T-172): the task class (a page property — that is how classifyCtx marks load
+// failures of net::ERR_*, not a dead context/browser where a retry makes sense)
+// and a load error code from certErrorCodes. Network codes (a
+// connection refusal — recovery is observed) miss: until the
+// determinism is exhausted they are retryable errors (T-172 finalizes them
+// only on the last delivery).
 func isCertError(err error) bool {
 	if render.ClassOf(err) != render.ClassTask {
 		return false
@@ -813,18 +813,18 @@ func isCertError(err error) bool {
 	return slices.Contains(certErrorCodes, render.LoadErrorCode(err))
 }
 
-// certError — маркер постоянной ошибки сертификата хоста (T-159): ошибка
-// рендера класса task, чья причина — отказ Chromium грузить страницу из-за
-// сертификата хоста (isCertError: код net::ERR_CERT_* из certErrorCodes в
-// цепочке). Свойство постоянное: сертификат не издан доверенным ЦС или не
-// покрывает имя хоста — повтор на новом контексте (и вообще до смены
-// сертификата самим хостом) даст тот же исход, а каждая попытка жгла бы
-// слот рендера и общий лимит доставок redis.max_attempts до q:dead (замер
-// §12: ~27% попыток рендера — cert-ошибки, каждая до 4 доставок; 366
-// записей q:dead «исчерпан лимит попыток 3»). Обёртка не меняет текст
-// ошибки (Error/Unwrap — исходной) и служит только меткой:
-// processDelivery по ней финализирует запись без рендера с первой же
-// доставки — ждать попыток, в отличие от тарпитов T-148, незачем.
+// certError — the permanent host certificate error marker (T-159): an error
+// of the task class whose cause is Chromium refusing to load the page because of
+// the host certificate (isCertError: a net::ERR_CERT_* code from certErrorCodes in
+// the chain). The property is permanent: the certificate is not issued by a trusted CA or does not
+// cover the host name — a retry on a new context (and in general until the
+// host replaces the certificate itself) will give the same outcome, and every attempt would burn
+// a render slot and the overall redis.max_attempts delivery limit down to q:dead (the
+// §12 measurement: ~27% of render attempts are cert errors, each up to 4 deliveries; 366
+// q:dead entries "attempt limit 3 exhausted"). The wrapper does not change the
+// error text (Error/Unwrap — the original's) and serves only as a label:
+// processDelivery finalizes the entry without a render from the very
+// first delivery by it — waiting for attempts, unlike the tarpits T-148, is pointless.
 type certError struct {
 	err error
 }
@@ -832,38 +832,38 @@ type certError struct {
 func (e *certError) Error() string { return e.err.Error() }
 func (e *certError) Unwrap() error { return e.err }
 
-// dnsErrorCodes — сетевые коды Chromium (net/base/net_error_list.h),
-// означающие смерть хоста на уровне DNS. Запись q:render существует
-// только через недавний живой HTTP-эпизод (HTTP-фаза сама резолвила
-// имя — иначе эпизода и строки не было бы), а браузер резолвит
-// системным резолвером — тем же unbound, что обслуживает DNS-этап:
-// отказ на рендере значит, что DNS хоста умер МЕЖДУ эпизодом и
-// рендером. Возврат DNS — событие масштаба дней (перерегистрация,
-// восстановление делегирования), окно ретраев (3 доставки, ~20 мин в
-// PEL по claim_min_idle) его не покрывает — тот же аргумент
-// детерминированности, что у ERR_CERT_DATE_INVALID (T-172: окно
-// продления сертификата много шире окна ретраев). Замер T-207 (29.10):
-// 252 финализации NAME_NOT_RESOLVED за ~7 ч, каждая съедала все 3
-// доставки и ~20 мин PEL; DNS-отказ на рендере при живом HTTP-эпизоде
-// — редкость, класс мал. ERR_CONNECTION_REFUSED сюда НЕ входит: отказ
-// соединения — свойство сервиса хоста (порт закрыт, фильтр,
-// перезапуск), восстановление наблюдается (замер T-172: 6.6% ретраев
-// успешны) — он остаётся повторяемым до последней доставки (T-172).
-// Расширение списка — только с обоснованием детерминированности
-// (замером) и тестом на код, по образцу certErrorCodes.
+// dnsErrorCodes — the Chromium network codes (net/base/net_error_list.h)
+// meaning the death of the host at the DNS level. A q:render entry exists
+// only through a recent live HTTP episode (the HTTP phase resolved the
+// name itself — otherwise there would be no episode and no row), while the browser resolves
+// with the system resolver — the same unbound that serves the DNS stage:
+// a refusal at render means the host's DNS died BETWEEN the episode and
+// the render. DNS recovery is an event on a scale of days (re-registration,
+// delegation recovery), the retry window (3 deliveries, ~20 min in the
+// PEL by claim_min_idle) does not cover it — the same determinism
+// argument as for ERR_CERT_DATE_INVALID (T-172: the
+// certificate renewal window is much wider than the retry window). The T-207 measurement (Oct 29):
+// 252 NAME_NOT_RESOLVED finalizations per ~7 h, each ate all 3
+// deliveries and ~20 min of PEL; a DNS refusal at render with a live HTTP episode
+// is a rarity, the class is small. ERR_CONNECTION_REFUSED is NOT included here: a
+// connection refusal is a property of the host's service (the port is closed, a filter,
+// a restart), recovery is observed (the T-172 measurement: 6.6% of retries
+// succeed) — it stays retryable until the last delivery (T-172).
+// Extending the list — only with a determinism justification
+// (by a measurement) and a test on the code, following the certErrorCodes pattern.
 var dnsErrorCodes = []string{
-	// Имя хоста не резолвится вовсе: зона умерла/делегирование снято —
-	// событие масштаба дней, окно ретраев его не покрывает.
+	// The host name does not resolve at all: the zone died/the delegation is removed —
+	// an event on a scale of days, the retry window does not cover it.
 	"net::ERR_NAME_NOT_RESOLVED",
 }
 
-// isDNSError — признак DNS-отказа на рендере (T-211): класс task (сбой
-// загрузки страницы net::ERR_* — так classifyCtx маркирует их; умерший
-// контекст/браузер — инфраструктура, повтор осмыслен) и код ошибки
-// загрузки из dnsErrorCodes. Прочие сетевые коды (отказ соединения —
-// восстановление наблюдается, замер T-172: 6.6% ретраев успешны) мимо:
-// до исчерпания детерминированности они — повторимые ошибки (T-172
-// финализирует их только на последней доставке).
+// isDNSError — the DNS refusal at render sign (T-211): the task class (a
+// page load failure net::ERR_* — that is how classifyCtx marks them; a dead
+// context/browser — infrastructure, a retry makes sense) and a load error
+// code from dnsErrorCodes. Other network codes (a connection refusal —
+// recovery is observed, the T-172 measurement: 6.6% of retries succeed) miss:
+// until the determinism is exhausted they are retryable errors (T-172
+// finalizes them only on the last delivery).
 func isDNSError(err error) bool {
 	if render.ClassOf(err) != render.ClassTask {
 		return false
@@ -871,17 +871,17 @@ func isDNSError(err error) bool {
 	return slices.Contains(dnsErrorCodes, render.LoadErrorCode(err))
 }
 
-// dnsError — маркер DNS-отказа на рендере (T-211): ошибка класса task,
-// чья причина — имя хоста не резолвится (isDNSError: код
-// net::ERR_NAME_NOT_RESOLVED из dnsErrorCodes в цепочке). Свойство
-// постоянное на окне ретраев: запись попала в q:render через живой
-// HTTP-эпизод, DNS хоста умер между эпизодом и рендером — повтор
-// доставки пережигал бы ~20 мин PEL и 2 доставки на каждый мёртвый хост
-// (замер T-207: 252 хоста за ~7 ч). Обёртка не меняет текст ошибки
-// (Error/Unwrap — исходной) и служит только меткой: processDelivery по
-// ней финализирует запись без рендера с первой же доставки — по
-// образцу cert-класса T-159 (ожидание попыток бессмысленно: шанс
-// появится только на следующем эпизоде перепроверки T-030).
+// dnsError — the DNS refusal at render marker (T-211): an error of the task class,
+// whose cause is the host name not resolving (isDNSError: the
+// net::ERR_NAME_NOT_RESOLVED code from dnsErrorCodes in the chain). The
+// property is permanent over the retry window: the entry got into q:render through a live
+// HTTP episode, the host's DNS died between the episode and the render — a delivery
+// retry would burn ~20 min of PEL and 2 deliveries per every dead host
+// (the T-207 measurement: 252 hosts per ~7 h). The wrapper does not change the error text
+// (Error/Unwrap — the original's) and serves only as a label: processDelivery
+// finalizes the entry without a render from the very first delivery by it — following
+// the cert class T-159 pattern (waiting for attempts is pointless: the chance
+// appears only on the next recheck episode T-030).
 type dnsError struct {
 	err error
 }
@@ -889,16 +889,16 @@ type dnsError struct {
 func (e *dnsError) Error() string { return e.err.Error() }
 func (e *dnsError) Unwrap() error { return e.err }
 
-// isTaskRenderError — признак ошибки рендера класса задачи (T-172):
-// в цепочке есть *render.Error (сбой самого рендера, а не БД/хранилища/
-// публикации — те *render.Error не несут, но render.ClassOf молча трактует
-// посторонние ошибки как task, поэтому проверяется именно presence), класс
-// task (свойство хоста: таймаут/load error — повтор на новом контексте
-// бессмысленен) и это не отмена вызывающего контекста (graceful shutdown —
-// инфраструктурное событие, как у isPageTimeout). Такие ошибки до
-// исчерпания redis.max_attempts живут общим путём повторных доставок
-// (восстановление хостов наблюдается), на последней — финализируются
-// без рендера (processDelivery).
+// isTaskRenderError — the task class render error sign (T-172):
+// there is a *render.Error in the chain (a failure of the render itself, not of the DB/storage/
+// publication — those carry no *render.Error, but render.ClassOf silently treats
+// foreign errors as task, so it is the presence that is checked), the
+// task class (a host property: a timeout/load error — a retry on a new context
+// is pointless) and it is not the caller context's cancellation (a graceful shutdown —
+// an infrastructure event, like in isPageTimeout). Such errors until
+// redis.max_attempts is exhausted live the common path of re-deliveries
+// (host recovery is observed), on the last one they are finalized
+// without a render (processDelivery).
 func isTaskRenderError(err error) bool {
 	var re *render.Error
 	if !errors.As(err, &re) {
@@ -907,16 +907,16 @@ func isTaskRenderError(err error) bool {
 	return re.Class == render.ClassTask && !errors.Is(err, context.Canceled)
 }
 
-// taskFinalizeReason — метка причины финализации без рендера на последней
-// попытке (T-172, метрика crawler_render_task_finalized_total): код
-// ошибки загрузки net::ERR_* (структурно, render.LoadErrorCode — замкнутый
-// словарь Chromium, кардинальность метки ограничена самим списком),
-// «timeout» для таймаута, не пойманного тарпит-лимитом (штатный случай
-// с T-261 — смешанная серия: тарпитов меньше TimeoutAttempts, номер
-// доставки дорос до max_attempts на инфра-сбоях; страховка конфига
-// «TimeoutAttempts ≤ max_attempts» закрывает лишь случай нуля тарпитов
-// на последней доставке), «other» — прочее (сбой страницы без кода
-// загрузки).
+// taskFinalizeReason — the reason label of a finalization without a render on the last
+// attempt (T-172, the crawler_render_task_finalized_total metric): the
+// net::ERR_* load error code (structurally, render.LoadErrorCode — a closed
+// Chromium vocabulary, the label's cardinality is bounded by the list itself),
+// "timeout" for a timeout not caught by the tarpit limit (the regular
+// case since T-261 — a mixed series: fewer tarpits than TimeoutAttempts, the
+// delivery number grew to max_attempts on infra failures; the config guard
+// "TimeoutAttempts ≤ max_attempts" covers only the case of zero tarpits
+// on the last delivery), "other" — the rest (a page failure without a
+// load code).
 func taskFinalizeReason(err error) string {
 	if code := render.LoadErrorCode(err); code != "" {
 		return code
@@ -927,132 +927,132 @@ func taskFinalizeReason(err error) string {
 	return "other"
 }
 
-// --- фолбэк-публикация (T-238, ТЗ §4.4) --------------------------------------
+// --- fallback publication (T-238, spec §4.4) ----------------------------------
 
-// fallbackCandidate — кандидат на фолбэк (ФТ-7, ТЗ §4.4 п.1–2): задача
-// пути финализации без рендера по движко-зависимой причине — тарпит
-// T-148 (исчерпание render.timeout_attempts) или класс задачи T-172 на
-// последней попытке (redis.max_attempts): свойство пары «сайт ×
-// движок» — зависшая на лёгком движке страница может открыться в
-// chromium. reason — словарь taskFinalizeReason (метрика
-// crawler_render_fallback_published_total, ТЗ §4.6 п.2); эпизод записи
-// (идентификатор фильтра дубля) кандидату не нужен — его держит
-// вызывающий (checked_at строки, fallbackDedupKey).
+// fallbackCandidate — a fallback candidate (FR-7, spec §4.4 items 1–2): a task
+// of the finalization path without a render by an engine-branched reason — a tarpit
+// T-148 (the render.timeout_attempts exhaustion) or the task class T-172 on
+// the last attempt (redis.max_attempts): a property of the "site ×
+// engine" pair — a page stuck on a light engine may open in
+// chromium. reason — the taskFinalizeReason vocabulary (the
+// crawler_render_fallback_published_total metric, spec §4.6 item 2); the
+// row's episode (the dedup filter identifier) is not needed by the candidate — the caller
+// holds it (the row's checked_at, fallbackDedupKey).
 type fallbackCandidate struct {
 	task   queue.Result
 	reason string // taskFinalizeReason(cause)
 }
 
-// FallbackGate — состояние health-гейта фолбэка (ФТ-9а, ТЗ §4.4 п.3):
-// стрик инфра-ошибок рендера класса браузера (основной движок
-// недоступен) числом Threshold приостанавливает фолбэк-публикацию до
-// восстановления движка — перелив всего потока на дорогой chromium при
-// падении лёгкого исключён. Значение-срез читает функция-решение
-// (fallbackPublishDecision), живой стрик ведёт воркер
-// (fbObserveOutcome под fbMu — доставки параллельны; образец
-// стрик-логики renderFailBackoff: нарастание сбоем, обнуление
-// успехом). Threshold 0 — гейта нет (нулевые сборки без конфигурации:
-// поведение заглушки always-publish T-238); боевую сборку наполняет
-// cmd/render-worker из render.fallback.health_gate_streak (T-233,
-// диапазон проверяет config.Validate).
+// FallbackGate — the fallback health gate state (FR-9a, spec §4.4 item 3):
+// a streak of render infra errors of the browser class (the main engine
+// unavailable) reaching Threshold suspends the fallback publication until
+// the engine recovers — the overflow of the whole flow onto the expensive chromium
+// on a light engine's fall is excluded. The decision function reads the value
+// snapshot (fallbackPublishDecision), the worker keeps the live streak
+// (fbObserveOutcome under fbMu — deliveries are parallel; the
+// streak logic pattern is renderFailBackoff: growth by a failure, reset
+// by a success). Threshold 0 — no gate (zero builds without configuration:
+// the always-publish stub behavior of T-238); cmd/render-worker fills the production
+// build from render.fallback.health_gate_streak (T-233,
+// the range is checked by config.Validate).
 type FallbackGate struct {
-	// Threshold — порог стрика инфра-ошибок ClassBrowser
+	// Threshold — the ClassBrowser infra error streak threshold
 	// (render.fallback.health_gate_streak, T-233).
 	Threshold int
-	// streak — инфра-ошибки ClassBrowser с последнего успешного
-	// рендера (ProcessResult обработал запись целиком — DOM записан и
-	// q:analyze опубликован, T-225); успех обнуляет (движок подал
-	// признак жизни — образец renderFailBackoff: обнуление успехом,
-	// нарастание сбоем), ошибки классов задачи/контекста и штатные
-	// отказы без рендера (строки нет / ушла из-под задачи) не трогают
-	// — рендера не было, признака жизни движка нет (ревью T-239, P1).
+	// streak — the ClassBrowser infra errors since the last successful
+	// render (ProcessResult processed the entry entirely — the DOM written and
+	// q:analyze published, T-225); a success resets it (the engine showed
+	// a sign of life — the renderFailBackoff pattern: reset by a success,
+	// growth by failures), the task/context class errors and regular
+	// rejections without a render (no row / it slipped out from under the task) do not touch it
+	// — there was no render, no sign of the engine's life (the T-239 review, P1).
 	streak int
 }
 
-// suspended — гейт закрыт: стрик инфра-ошибок достиг порога, движок
-// считается нездоровым, фолбэк-публикация приостановлена до
-// восстановления (успешный рендер обнулит стрик).
+// suspended — the gate is closed: the infra error streak reached the threshold, the engine
+// is considered unhealthy, the fallback publication is suspended until
+// recovery (a successful render will reset the streak).
 func (g FallbackGate) suspended() bool {
 	return g.Threshold > 0 && g.streak >= g.Threshold
 }
 
-// fallbackBudgetWindow — окно бюджета доли фолбэка (ФТ-9б, ТЗ §4.4
-// п.4): подтверждённых доставок этапа в одном окне. Окна следуют
-// подряд без наложения: заполненное окно закрывается оценкой доли
-// (публикации/доставки сверх потолка share_percent приостанавливают
-// публикации следующего окна — «до конца окна», ФТ-9б), счётчики
-// сбрасываются; окно с нулём публикаций (приостановленное) оценку не
-// проходит, и фолбэк возобновляется — приостановка самовозвратная,
-// без ручного вмешательства. Размер — код, не конфигурация:
-// настраивается потолок (share_percent, T-233), окно — мера потока
-// этапа; 1000 ≈ 12 мин потока (замер 24.10: ≈5,1 тыс. задач/ч) —
-// достаточная статистика доли (меньше — шум живого потока мотал бы
-// приостановку), терпимая задержка реакции штормового размыкателя
-// (быстрые случаи закрывает health-гейт стриком за секунды).
+// fallbackBudgetWindow — the window of the fallback share budget (FR-9b, spec §4.4
+// item 4): the stage's acknowledged deliveries in one window. Windows follow
+// one after another without overlap: a filled window is closed by the share estimate
+// (publications/deliveries beyond the share_percent cap suspend
+// the next window's publications — "until the end of the window", FR-9b), the counters
+// are reset; a window with zero publications (a suspended one) does not pass
+// the estimate and the fallback resumes — the suspension is self-resetting,
+// without manual intervention. The size is code, not configuration:
+// the cap is configurable (share_percent, T-233), the window is a measure of the
+// stage's flow; 1000 ≈ 12 min of flow (the Oct 24 measurement: ≈5.1 thousand tasks/h) —
+// enough share statistics (less — the live flow's noise would flip the
+// suspension), a tolerable reaction delay of the storm breaker
+// (fast cases the health gate closes by the streak within seconds).
 const fallbackBudgetWindow = 1000
 
-// FallbackBudget — состояние бюджета доли фолбэка (ФТ-9б, ТЗ §4.4
-// п.4): доля публикаций за окно fallbackBudgetWindow сверх потолка
-// Ceiling приостанавливает фолбэк до конца следующего окна — задачи
-// финализируются с маркером как сегодня (ФТ-9б), поднимается событие
-// метрики (алерт — ТЗ §4.6 п.3). Значение-срез читает функция-решение,
-// счётчики окна ведёт воркер (fbObserveTask/fbRecordPublish под fbMu).
-// Ceiling 0 — без потолка (нулевые сборки, конфигурация «0 — без
-// потолка», T-233); боевую сборку наполняет cmd/render-worker из
-// render.fallback.share_percent.
+// FallbackBudget — the fallback share budget state (FR-9b, spec §4.4
+// item 4): the share of publications over the fallbackBudgetWindow window beyond the
+// Ceiling cap suspends the fallback until the end of the next window — tasks
+// are finalized with the marker as today (FR-9b), the metric event
+// is raised (the alert — spec §4.6 item 3). The decision function reads the value snapshot,
+// the worker keeps the window counters (fbObserveTask/fbRecordPublish under fbMu).
+// Ceiling 0 — without a cap (zero builds, the "0 — without a
+// cap" configuration, T-233); cmd/render-worker fills the production
+// build from render.fallback.share_percent.
 type FallbackBudget struct {
-	// Ceiling — потолок доли публикаций, % подтверждённых доставок
-	// окна (render.fallback.share_percent, T-233); 0 — без потолка.
+	// Ceiling — the publications share cap, % of the window's
+	// acknowledged deliveries (render.fallback.share_percent, T-233); 0 — without a cap.
 	Ceiling float64
-	// tasks — доставок в текущем окне, завершившихся обработкой без
-	// ошибки (знаменатель доли; поток этапа — те же единицы, что у
-	// crawler_stage_tasks_total: fallback-рейт = публикации/поток,
-	// ФТ-15; учёт — на выходе обработчика, до XACK уровнем очереди:
-	// сбой Ack или паника дают лишний +1, повторная доставка
-	// посчитается снова — допуск единиц, порядок доли не меняющий;
-	// допуск на границе окна ≤ Concurrency публикаций, ревью T-239).
+	// tasks — the deliveries in the current window that ended with processing
+	// without an error (the share's denominator; the stage's flow — the same units as
+	// crawler_stage_tasks_total: the fallback rate = publications/flow,
+	// FR-15; the accounting is at the handler's exit, before the XACK at the queue level:
+	// an Ack failure or a panic give an extra +1, a re-delivery
+	// will be counted again — a tolerance of a few units, not changing the share's order;
+	// the tolerance at the window boundary is ≤ Concurrency publications, the T-239 review).
 	tasks int
-	// published — публикаций в q:render-fallback в текущем окне
-	// (числитель доли; считаются состоявшиеся XADD — отказы решения
-	// и дубли доставок не тратят бюджет).
+	// published — the publications to q:render-fallback in the current window
+	// (the share's numerator; only the XADDs that happened are counted — decision
+	// rejections and delivery duplicates do not spend the budget).
 	published int
-	// hold — окно приостановлено: предыдущее окно перерасходовало
-	// потолок, публикации выключены до границы этого окна (сброс
-	// счётчиков при закрытии возвращает фолбэк).
+	// hold — the window is suspended: the previous window overspent
+	// the cap, the publications are off until this window's boundary (the counter
+	// reset at closing returns the fallback).
 	hold bool
 }
 
-// suspended — бюджет приостановлен: предыдущее окно ушло за потолок
-// доли, публикации текущего окна выключены («до конца окна», ФТ-9б).
+// suspended — the budget is suspended: the previous window went beyond the
+// share cap, the current window's publications are off ("until the end of the window", FR-9b).
 func (b FallbackBudget) suspended() bool {
 	return b.Ceiling > 0 && b.hold
 }
 
-// overCeiling — окно перерасходовало потолок: доля публикаций выше
-// Ceiling процентов (умножением, без деления — точность на границе).
+// overCeiling — the window overspent the cap: the publications share is above
+// Ceiling percent (by multiplication, without division — precision at the boundary).
 func (b FallbackBudget) overCeiling() bool {
 	return b.Ceiling > 0 && float64(b.published)*100 > float64(b.tasks)*b.Ceiling
 }
 
-// fallbackPublishDecision — чистая функция-решение о публикации
-// кандидата в q:render-fallback (ТЗ §4.4 п.3–4, ФТ-9): кандидат ×
-// health-гейт × бюджет доли. Отказ любого входа приостанавливает
-// публикацию — вызывающий финализирует задачу по-сегодняшнему (маркер
-// render_failed_at + q:analyze, ТЗ §4.4 п.3–4), без потерь:
+// fallbackPublishDecision — the pure decision function about publishing
+// a candidate to q:render-fallback (spec §4.4 items 3–4, FR-9): candidate ×
+// health gate × share budget. A rejection of any input suspends the
+// publication — the caller finalizes the task as today (the
+// render_failed_at marker + q:analyze, spec §4.4 items 3–4), without losses:
 //
-//   - гейт (ФТ-9а, T-239): стрик инфра-ошибок ClassBrowser достиг
-//     порога — основной движок нездоров, перелив потока на дорогой
-//     chromium запрещён до восстановления (browser-класс сам живёт в
-//     redelivery q:render — финализацией не покрывается);
-//   - бюджет (ФТ-9б, T-239): доля публикаций за окно ушла за потолок
-//     share_percent — окно приостановлено до своей границы.
+//   - the gate (FR-9a, T-239): the ClassBrowser infra error streak reached
+//     the threshold — the main engine is unhealthy, the flow overflow onto the expensive
+//     chromium is forbidden until recovery (the browser class itself lives in
+//     the q:render redelivery — not covered by a finalization);
+//   - the budget (FR-9b, T-239): the share of publications over the window went beyond the
+//     share_percent cap — the window is suspended until its boundary.
 //
-// Чистая и бессостоятельна нарочно: состояние стрика и окна ведёт
-// воркер (fbObserveOutcome/fbObserveTask/fbRecordPublish под fbMu),
-// функция сводит срезы состояния с кандидатом — тестируется таблицей
-// без окружения. Кандидат на решение не влияет: движко-зависимые
-// причины (тарпит T-148, класс задачи T-172) симметричны — в
-// сигнатуре по контракту T-238 «кандидат × гейт × бюджет».
+// Pure and stateless on purpose: the streak and window state is kept by
+// the worker (fbObserveOutcome/fbObserveTask/fbRecordPublish under fbMu),
+// the function folds the state snapshots with the candidate — tested by a table
+// without an environment. The candidate does not affect the decision: engine-branched
+// reasons (the tarpit T-148, the task class T-172) are symmetric — in
+// the signature by the T-238 contract "candidate × gate × budget".
 func fallbackPublishDecision(cand fallbackCandidate, gate FallbackGate, budget FallbackBudget) bool {
 	if gate.suspended() {
 		return false
@@ -1063,51 +1063,51 @@ func fallbackPublishDecision(cand fallbackCandidate, gate FallbackGate, budget F
 	return true
 }
 
-// fallbackDedupCap — ёмкость фильтра дубля фолбэк-публикаций: 32 768 —
-// с запасом выше потолка MAXLEN q:render-fallback (15 000, T-237):
-// интересующее окно дубля — записи, которые воркер B ещё не потребил
-// (глубина стрима ≤ потолка), всё старее либо потреблено, либо срезано
-// обрезкой — дубль тому лишняя работа консьюмера B, не потеря (ФТ-11).
-// Без ёмкости фильтр рос бы без предела (десятки тысяч ключей в сутки).
+// fallbackDedupCap — the capacity of the fallback publication dedup filter: 32,768 —
+// with a margin above the MAXLEN cap of q:render-fallback (15,000, T-237):
+// the dedup window of interest — entries worker B has not consumed yet
+// (the stream depth ≤ the cap), everything older is either consumed or trimmed
+// by the trim — a duplicate there is extra work of consumer B, not a loss (FR-11).
+// Without a capacity the filter would grow without a limit (tens of thousands of keys per day).
 const fallbackDedupCap = 1 << 15
 
-// fallbackDedup — фильтр дубля публикации в q:render-fallback по
-// идентификатору записи результата (ТЗ §4.4 п.5): повторная доставка
-// той же записи (сбой XACK после успешной публикации; конкурентный
-// дубль сообщения эпизода — источники перечислены в T-210) не даёт
-// вторую запись в стриме. Образец — parking-дедуп (бит render_pending
-// T-066/T-175: переход «опубликовано» фиксируется ровно один раз —
-// охрана UPDATE, — повторное исполнение видит «уже сделано» и
-// пропускает побочный эффект). Идентификатор — ключ строки +
-// checked_at эпизода (fallbackDedupKey): checked_at стабилен в жизни
-// эпизода (повторные доставки читают тот же) и меняется перезаписью
-// эпизода (перепроверка T-058) — новый эпизод легитимно переходит
-// фолбэк заново; контентный content_hash для идентификации эпизода НЕ
-// годится: хэш контентно-адресный (дедуп T-056), и новый эпизод с
-// побайтово тем же контентом совпал бы со старым — фильтр ложно гасил
-// бы фолбэк свежего эпизода (ревью T-238, P1).
+// fallbackDedup — the dedup filter of publications to q:render-fallback by
+// the result row identifier (spec §4.4 item 5): a re-delivery
+// of the same row (an XACK failure after a successful publication; a concurrent
+// duplicate of the episode's message — the sources are listed in T-210) does not give
+// a second entry in the stream. The pattern — the parking dedup (the render_pending bit
+// T-066/T-175: the "published" transition is recorded exactly once —
+// an UPDATE guard, — a repeated execution sees "already done" and
+// skips the side effect). The identifier — the row key +
+// the episode's checked_at (fallbackDedupKey): checked_at is stable over the
+// episode's life (re-deliveries read the same one) and changes on an episode
+// rewrite (the recheck T-058) — a new episode legitimately goes through
+// the fallback again; the content's content_hash does NOT
+// work for identifying the episode: the hash is content-addressed (the T-056 dedup), and a new episode with
+// byte-identical content would match the old one — the filter would falsely suppress
+// the fresh episode's fallback (the T-238 review, P1).
 //
-// Память процесса, не Redis/БД: состояние фолбэка живёт в очереди и
-// метриках (ТЗ §4.8 — схема БД без новых колонок/таблиц), а дедуп
-// обязан пережить лишь окно повторных доставок этой записи
-// (секунды–минуты PEL), не рестарты воркера — дубль после рестарта
-// или вытеснения из ёмкости допустим и гасится консьюмером B (ФТ-11).
-// Потокобезопасен: доставки обрабатываются параллельно.
+// Process memory, not Redis/DB: the fallback state lives in the queue and
+// the metrics (spec §4.8 — the DB schema without new columns/tables), and the dedup
+// must survive only the re-delivery window of that row
+// (seconds–minutes of PEL), not worker restarts — a duplicate after a restart
+// or an eviction from the capacity is allowed and is suppressed by consumer B (FR-11).
+// Thread-safe: deliveries are processed in parallel.
 type fallbackDedup struct {
 	mu    sync.Mutex
 	seen  map[string]struct{}
-	order []string // ключи в порядке вставки — вытеснение старейших (FIFO)
+	order []string // keys in insertion order — eviction of the oldest (FIFO)
 }
 
-// newFallbackDedup строит пустой фильтр.
+// newFallbackDedup builds an empty filter.
 func newFallbackDedup() *fallbackDedup {
 	return &fallbackDedup{seen: make(map[string]struct{})}
 }
 
-// claim фиксирует идентификатор как опубликованный: true — первая
-// фиксация (публикацию можно выполнять), false — уже фиксировался
-// (дубль: вторая запись в стриме не нужна). При превышении ёмкости
-// вытесняется старейший ключ (его дубль станет допустимым — ФТ-11).
+// claim records the identifier as published: true — the first
+// record (the publication may proceed), false — already recorded
+// (a duplicate: a second entry in the stream is not needed). Beyond the capacity
+// the oldest key is evicted (its duplicate becomes allowed — FR-11).
 func (d *fallbackDedup) claim(key string) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -1115,8 +1115,8 @@ func (d *fallbackDedup) claim(key string) bool {
 		return false
 	}
 	if len(d.order) >= fallbackDedupCap {
-		// Вытеснение старейшего: order — очередь вставки, seen держит
-		// ровно ключи order (release удаляет из обоих).
+		// Eviction of the oldest: order — the insertion queue, seen holds
+		// exactly the keys of order (release removes from both).
 		delete(d.seen, d.order[0])
 		d.order = d.order[1:]
 	}
@@ -1125,11 +1125,11 @@ func (d *fallbackDedup) claim(key string) bool {
 	return true
 }
 
-// known — уже фиксировался ли идентификатор (read-only, без фиксации):
-// повторная доставка уже опубликованной записи узнаёт об этом ДО
-// решения гейта/бюджета — приостановка не отменяет состоявшуюся
-// публикацию, дубль подтверждается без маркера и без q:analyze (ФТ-11;
-// ревью T-239, P3).
+// known — whether the identifier was already recorded (read-only, without recording):
+// a re-delivery of an already published row learns about it BEFORE
+// the gate/budget decision — a suspension does not cancel a publication that
+// happened, the duplicate is acknowledged without a marker and without q:analyze (FR-11;
+// the T-239 review, P3).
 func (d *fallbackDedup) known(key string) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -1137,12 +1137,12 @@ func (d *fallbackDedup) known(key string) bool {
 	return ok
 }
 
-// release снимает фиксацию идентификатора — публикация по нему НЕ
-// состоялась (сбой XADD): повторная доставка обязана иметь право на
-// новую попытку, иначе задача потерялась бы между фильтром и стримом
-// (claim без публикации навсегда закрывал бы фолбэк записи до смены
-// эпизода). Пары к claim того же ключа; незнакомый ключ — no-op
-// (симметрия вызовов при ошибках до claim).
+// release removes the identifier's record — the publication over it did NOT
+// happen (an XADD failure): a re-delivery must keep the right to
+// a new attempt, otherwise the task would be lost between the filter and the stream
+// (a claim without a publication would close the row's fallback forever until the
+// episode changes). The pair of the claim of the same key; an unknown key — a no-op
+// (call symmetry on errors before the claim).
 func (d *fallbackDedup) release(key string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -1158,58 +1158,58 @@ func (d *fallbackDedup) release(key string) {
 	}
 }
 
-// fallbackDedupKey — идентификатор записи результата для фильтра дубля:
-// ключ строки subdomain_results + checked_at эпизода (UnixNano —
-// компактная печать timestamptz; эпизод = запись строки T-058, все
-// доставки эпизода читают один и тот же checked_at, перезапись эпизода
-// пишет новый).
+// fallbackDedupKey — the result row identifier for the dedup filter:
+// the subdomain_results row key + the episode's checked_at (UnixNano —
+// a compact printing of timestamptz; the episode = the row's record T-058, all
+// of the episode's deliveries read the same checked_at, an episode rewrite
+// writes a new one).
 func fallbackDedupKey(task queue.Result, checkedAt time.Time) string {
 	return fmt.Sprintf("%d/%d/%d/%d/%d",
 		task.ZoneID, task.DomainID, task.SubdomainID, int16(task.Variant), checkedAt.UnixNano())
 }
 
-// --- состояния гейта и бюджета (T-239, ТЗ §4.4 п.3–4, ФТ-9) ------------------
+// --- gate and budget states (T-239, spec §4.4 items 3–4, FR-9) ----------------
 
-// fallbackArmed — сборка публикует фолбэк: включён render.fallback
-// .enabled, стрим потребления q:render (те же условия, что guard
-// publishFallback, ФТ-10/ФТ-12 — воркер B фолбэк не публикует) и движок
-// сборки — не chromium (S-P1-1, ТЗ §6.2 п.2/§6.4 п.1, ФТ-14):
-// публикации идут только с движка-кандидата — chromium сам себе не
-// фолбэчится (шаг 1 приёмки: включение фолбэка без смены движка
-// оставляет q:render-fallback пустой), при откате на chromium
-// публикация гаснет сама, без правки конфигурации флага.
-// Наблюдения состояний и события приостановки идут только в вооружённой
-// сборке: метрики лежачего движка воркера B (chromium) не должны
-// поднимать алерты фолбэка первичного.
+// fallbackArmed — the build publishes the fallback: render.fallback
+// .enabled is on, the consumption stream is q:render (the same conditions as the
+// publishFallback guard, FR-10/FR-12 — worker B does not publish the fallback) and the
+// build's engine is not chromium (S-P1-1, spec §6.2 item 2/§6.4 item 1, FR-14):
+// publications go only from the candidate engine — chromium does not
+// fallback itself (acceptance step 1: enabling the fallback without changing the engine
+// leaves q:render-fallback empty), on a rollback to chromium
+// the publication goes dark by itself, without editing the flag configuration.
+// The state observations and suspension events go only in the armed
+// build: the down engine's metrics (worker B, chromium) must not
+// raise the primary's fallback alerts.
 func (w *Worker) fallbackArmed() bool {
 	return w.opt.Fallback.Enabled &&
 		w.opt.Stream == queue.StreamRender &&
 		w.opt.Engine != config.EngineChromium
 }
 
-// fallbackStates — срезы состояний гейта и бюджета для функции-решения
-// (fallbackPublishDecision читает значения; живые счётчики — под fbMu,
-// доставки параллельны).
+// fallbackStates — the gate and budget state snapshots for the decision function
+// (fallbackPublishDecision reads the values; the live counters — under fbMu,
+// the deliveries are parallel).
 func (w *Worker) fallbackStates() (FallbackGate, FallbackBudget) {
 	w.fbMu.Lock()
 	defer w.fbMu.Unlock()
 	return w.fbGate, w.fbBudget
 }
 
-// fbObserveOutcome — исход доставки для health-гейта (T-239, ФТ-9а):
-// ошибка рендера класса браузера (основной движок недоступен) наращивает
-// стрик, успешный рендер (rendered — ProcessResult обработал запись
-// целиком: DOM записан и q:analyze опубликован, T-225) обнуляет — движок
-// подал признак жизни (образец renderFailBackoff: нарастание сбоем,
-// обнуление успехом); ошибки классов задачи/контекста и штатные отказы
-// без рендера (строки нет / ушла из-под задачи — rendered=false) стрик
-// не трогают — рендера не было, признака жизни движка нет (ревью T-239,
-// P1: no-op между браузерными ошибками открывал бы гейт лежачему).
-// Достижение порога — переход «открыт → закрыт» — событие приостановки
-// crawler_render_fallback_suspended_total{gate} (ТЗ §4.6 п.2) и Warn;
-// пока гейт закрыт, кандидаты фолбэка финализируются
-// по-сегодняшнему (маркер), browser-класс сам ждёт в redelivery
-// q:render — финализацией не покрывается, задачи без потерь.
+// fbObserveOutcome — the delivery outcome for the health gate (T-239, FR-9a):
+// a render error of the browser class (the main engine unavailable) grows the
+// streak, a successful render (rendered — ProcessResult processed the entry
+// entirely: the DOM written and q:analyze published, T-225) resets it — the engine
+// showed a sign of life (the renderFailBackoff pattern: growth by failures,
+// reset by a success); the task/context class errors and regular
+// rejections without a render (no row / it slipped out from under the task — rendered=false) do not touch the
+// streak — there was no render, no sign of the engine's life (the T-239 review,
+// P1: a no-op between browser errors would open the gate for a down engine).
+// Reaching the threshold — the "open → closed" transition — the suspension event
+// crawler_render_fallback_suspended_total{gate} (spec §4.6 item 2) and a Warn;
+// while the gate is closed, fallback candidates are finalized
+// as today (the marker), the browser class itself waits in the
+// q:render redelivery — not covered by a finalization, tasks without losses.
 func (w *Worker) fbObserveOutcome(err error, rendered bool) {
 	if !w.fallbackArmed() {
 		return
@@ -1229,17 +1229,17 @@ func (w *Worker) fbObserveOutcome(err error, rendered bool) {
 	}
 }
 
-// fbObserveTask — доставка, завершившаяся обработкой без ошибки, вошла
-// в поток этапа (T-239, ФТ-9б): окно бюджета доли считает её
-// знаменателем (доля = публикации/поток — тот же поток, что у
-// crawler_stage_tasks_total; повторные доставки считаются один раз —
-// при успешном завершении обработки). Заполненное окно закрывается
-// оценкой: перерасход над потолком приостанавливает публикации
-// следующего окна (событие crawler_render_fallback_suspended_total
-// {budget} и Warn — ТЗ §4.6 п.3), счётчики сбрасываются —
-// приостановленное окно публикаций не набирает, следующая оценка
-// возвращает фолбэк («до конца окна», самовозврат без ручного
-// вмешательства).
+// fbObserveTask — a delivery that ended with processing without an error entered
+// the stage's flow (T-239, FR-9b): the share budget window counts it
+// in the denominator (the share = publications/flow — the same flow as
+// crawler_stage_tasks_total; re-deliveries are counted once —
+// at the successful end of processing). A filled window is closed
+// by the estimate: an overspend beyond the cap suspends the next window's
+// publications (the crawler_render_fallback_suspended_total
+// {budget} event and a Warn — spec §4.6 item 3), the counters are reset —
+// a suspended window does not accumulate publications, the next estimate
+// returns the fallback ("until the end of the window", self-resetting without manual
+// intervention).
 func (w *Worker) fbObserveTask() {
 	if !w.fallbackArmed() {
 		return
@@ -1260,69 +1260,68 @@ func (w *Worker) fbObserveTask() {
 	}
 }
 
-// fbRecordPublish — публикация в q:render-fallback состоялась (T-239):
-// числитель доли бюджета. Вызывается после успешного XADD: отказы
-// решения (гейт/бюджет) и дубли доставок бюджет не тратят — доля
-// считается по записям, реально ушедшим в очередь.
+// fbRecordPublish — the publication to q:render-fallback happened (T-239):
+// the budget share's numerator. Called after a successful XADD: decision
+// rejections (the gate/budget) and delivery duplicates do not spend the budget — the
+// share is counted over the entries that actually went to the queue.
 func (w *Worker) fbRecordPublish() {
 	w.fbMu.Lock()
 	defer w.fbMu.Unlock()
 	w.fbBudget.published++
 }
 
-// fbConsuming — сборка потребляет фолбэк-очередь: стрим потребления —
-// q:render-fallback (воркер B, ФТ-12, T-236; Options.Stream). Учёт
-// потребления ведёт только сборка B — серии счётчика
-// crawler_render_fallback_consumed_total предсозданы нулевыми у всех
-// сборок (S-P1-4), растут только у B: потребление фолбэка — доработка
-// воркером B, не этап первичного воркера (взаимно исключающие стримы с
-// fallbackArmed — публикации и потребление считает каждый свою
-// сторону).
+// fbConsuming — the build consumes the fallback queue: the consumption stream is
+// q:render-fallback (worker B, FR-12, T-236; Options.Stream). Only the B build keeps the
+// consumption accounting — the counter series of
+// crawler_render_fallback_consumed_total are pre-created with zeros in all
+// builds (S-P1-4), only B's grow: the fallback consumption is the rework by
+// worker B, not a stage of the primary worker (the streams are mutually exclusive with
+// fallbackArmed — each build counts its own side of publications and consumption).
 func (w *Worker) fbConsuming() bool {
 	return w.opt.Stream == queue.StreamRenderFallback
 }
 
-// fbConsume — учёт исхода доставки фолбэка, завершившейся обработкой без
-// ошибки (T-245, ТЗ §4.6 п.2, ФТ-15): +1 в
-// crawler_render_fallback_consumed_total{result} — знаменатель баланса
-// published (воркер A, T-238) = consumed (воркер B) + остаток
-// q:render-fallback (crawler_queue_depth сборки B — лаг + PEL) +
-// похороненные (crawler_queue_dead_buried_total{queue="q:render-fallback"}
-// — ошибки классов браузера/инфраструктуры на исчерпании
-// redis.max_attempts) + неидентифицируемые
+// fbConsume — the accounting of a fallback delivery outcome that ended with processing
+// without an error (T-245, spec §4.6 item 2, FR-15): +1 into
+// crawler_render_fallback_consumed_total{result} — the denominator of the
+// published balance (worker A, T-238) = consumed (worker B) + the
+// q:render-fallback remainder (the B build's crawler_queue_depth — the lag + the PEL) +
+// the buried ones (crawler_queue_dead_buried_total{queue="q:render-fallback"}
+// — the browser/infrastructure class errors on the exhaustion of
+// redis.max_attempts) + the unidentifiable ones
 // (crawler_queue_dead_unidentified_total{queue="q:render-fallback"},
-// T-260 — записи без task_id, стационарно ноль; шаг 4 приёмки
-// ТЗ §6.2). Счёт — в обработчике, до
-// XACK уровнем очереди: сбой Ack или повторная доставка дают дубль —
-// допуск единиц at-least-once (как у окна бюджета T-239); ошибочные
-// доставки не считаются вовсе — остаются в PEL до возврата клеймом либо
-// bury в q:dead (третий член баланса).
+// T-260 — entries without a task_id, steadily zero; acceptance step 4
+// of spec §6.2). The count is in the handler, before the
+// XACK at the queue level: an Ack failure or a re-delivery give a duplicate — a tolerance of a few
+// at-least-once units (like the T-239 budget window); failed
+// deliveries are not counted at all — they stay in the PEL until a claim return or a
+// bury in q:dead (the third member of the balance).
 func (w *Worker) fbConsume(result string) {
 	if w.fbConsuming() {
 		w.met.FallbackConsumed(result)
 	}
 }
 
-// ProcessResult обрабатывает одну задачу q:render (§5.6, §7): рендер
-// итогового URL строки, DOM в хранилище, атомарная замена ссылки и
-// rendered = true, публикация q:analyze после фиксации. Возвращает false
-// без ошибки, когда задачи делать нечего: строки нет, у неё нет итогового
-// URL или она ушла из-под задачи (перепроверка перезаписала — охрана
-// UPDATE) — это успех, публикация не нужна, доставка подтверждается.
-// true возвращается только вместе с nil-ошибкой — запись обработана
-// целиком (DOM записан и q:analyze опубликован, T-225); каждый ошибочный
-// путь — false, ошибка. Ошибка — сбой любого шага (включая публикацию
-// после зафиксированной транзакции): доставка q:render не подтверждается
-// и вернётся повторной доставкой (Processing, T-025); повторная обработка
-// идемпотентна (перезапись, см. комментарий пакета).
+// ProcessResult processes one q:render task (§5.6, §7): rendering
+// the row's final URL, the DOM into the storage, an atomic reference replacement and
+// rendered = true, a q:analyze publication after the commit. Returns false
+// without an error when there is nothing to do for the task: no row, no final
+// URL or it slipped out from under the task (the recheck rewrote it — the
+// UPDATE guard) — that is a success, no publication needed, the delivery is acknowledged.
+// true is returned only together with a nil error — the entry is processed
+// entirely (the DOM written and q:analyze published, T-225); every failing
+// path — false, an error. An error — a failure of any step (including the publication
+// after the committed transaction): the q:render delivery is not acknowledged
+// and will return with a re-delivery (Processing, T-025); repeated processing
+// is idempotent (the rewrite, see the package comment).
 func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, error) {
 	target, found, err := w.selectTarget(ctx, task)
 	if err != nil {
 		return false, err
 	}
 	if !found || target.finalURL == "" {
-		// Строки нет (домен удалён/перепроверен без этого ключа) либо
-		// итогового URL нет — рендерить нечего; штатный отказ без ошибки.
+		// No row (the domain deleted/rechecked without this key) or
+		// no final URL — nothing to render; a regular rejection without an error.
 		w.opt.log().Debug("рендер не требуется — строки нет или без итогового URL",
 			"zone_id", task.ZoneID, "domain_id", task.DomainID,
 			"subdomain_id", task.SubdomainID, "variant", int16(task.Variant))
@@ -1332,14 +1331,14 @@ func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, er
 
 	out, err := w.renderer.Run(ctx, render.RenderTask{URL: target.finalURL})
 	if err != nil {
-		// Ошибка страницы (таймаут, net::ERR_*) или браузера — повторная
-		// доставка уровнем очереди (класс task) / ожидание или будущий
-		// перезапуск (класс browser, T-065); частичного результата по ТЗ §8
-		// не бывает (T-063). Постоянная ошибка сертификата хоста
-		// маркируется certError (T-159), DNS-отказ — dnsError (T-211),
-		// таймаут страницы — tarpitError (T-148): processDelivery по
-		// маркерам решает — финализировать запись без рендера или
-		// повторить доставкой.
+		// A page (timeout, net::ERR_*) or browser error — a re-delivery
+		// at the queue level (the task class) / a wait or a future
+		// restart (the browser class, T-065); there are no partial results per spec §8
+		// (T-063). A permanent host certificate error
+		// is marked certError (T-159), a DNS refusal — dnsError (T-211),
+		// a page timeout — tarpitError (T-148): processDelivery decides by the
+		// markers — finalize the entry without a render or
+		// retry with a delivery.
 		if isCertError(err) {
 			return false, fmt.Errorf("renderworker: %s: рендер: %w", name, &certError{err: err})
 		}
@@ -1352,15 +1351,15 @@ func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, er
 		return false, fmt.Errorf("renderworker: %s: рендер: %w", name, err)
 	}
 	if out.DOM == "" || out.FinalURL == "" {
-		// Страховка контракта T-064: живая страница всегда имеет
-		// documentElement и location; пустые значения — ненормальный
-		// результат, строку не трогаем.
+		// The T-064 contract guard: a live page always has
+		// documentElement and location; empty values are an abnormal
+		// result, the row is not touched.
 		return false, fmt.Errorf("renderworker: %s: пустой результат рендера (DOM %d байт, final_url %q)",
 			name, len(out.DOM), out.FinalURL)
 	}
-	// DOM — одной копией байтов (R-02): хэш и Put из одного среза, сам
-	// итоговый DOM уже ограничен рендером (render.Options.MaxDOMBytes);
-	// кратные полные копии строки не нужны.
+	// The DOM — a single copy of the bytes (R-02): the hash and Put from one slice, the
+	// final DOM itself is already bounded by the render (render.Options.MaxDOMBytes);
+	// multiple full copies of the row are not needed.
 	dom := []byte(out.DOM)
 	newHash := content.HashOf(dom)
 
@@ -1370,15 +1369,15 @@ func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, er
 		copy(oldHash[:], target.hash)
 	}
 
-	// Put до транзакции (порядок T-056 → T-058: новая ссылка обязана
-	// существовать до свопа, SwapRefTx требует живой newHash). Контент не
-	// сменился (DOM побайтово равен сохранённому) — Put пропускается:
-	// ссылка у строки уже есть, лишний +1 не нужен; охрана UPDATE ниже
-	// сравнивает с тем же хэшем и проходит.
-	// Ошибки: ErrStoreFull — временное (повтор доставки дождётся места),
-	// ErrTooLarge — постоянное свойство страницы (DOM раздут JS): попытки
-	// доставки исчерпаются и задача уйдёт в q:dead на ручной разбор
-	// (T-025) — оператору сигнал поднять content.max_store_bytes.
+	// Put before the transaction (the T-056 → T-058 order: the new reference must
+	// exist before the swap, SwapRefTx requires a live newHash). The content did not
+	// change (the DOM is byte-identical to the stored one) — Put is skipped:
+	// the row already has the reference, an extra +1 is not needed; the UPDATE guard below
+	// compares against the same hash and passes.
+	// Errors: ErrStoreFull — temporary (a delivery retry will wait for room),
+	// ErrTooLarge — a permanent page property (the DOM is bloated by JS): the delivery
+	// attempts will be exhausted and the task will go to q:dead for manual
+	// triage (T-025) — a signal to the operator to raise content.max_store_bytes.
 	if !hasOld || newHash != oldHash {
 		if _, err := w.contents.Put(ctx, dom); err != nil {
 			return false, fmt.Errorf("renderworker: %s: сохранение DOM: %w", name, err)
@@ -1397,26 +1396,26 @@ func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, er
 	if err != nil {
 		return false, fmt.Errorf("renderworker: %s: замена контента: транзакция: %w", name, err)
 	}
-	// Откат безусловно: после Commit — no-op (стиль T-044/T-058).
+	// Rollback unconditionally: after Commit — a no-op (the T-044/T-058 style).
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	// Замена контента: UPDATE с оптимистической охраной возвращает
-	// checked_at переведённой строки (T-203 — час корзины rendered-темпа);
-	// пустой результат (pgx.ErrNoRows) — охрана отсекла, строка не наша
-	// (прежний признак — RowsAffected 0).
+	// The content replacement: the UPDATE with the optimistic guard returns
+	// the checked_at of the moved row (T-203 — the hour of the rendered-rate bucket);
+	// an empty result (pgx.ErrNoRows) — the guard cut it off, the row is not ours
+	// (the former sign — RowsAffected 0).
 	var checkedAt time.Time
 	err = tx.QueryRow(ctx, renderUpdateSQL,
 		task.ZoneID, task.DomainID, task.SubdomainID, int16(task.Variant),
 		out.FinalURL, newHash[:], cookies, headers, target.hash).Scan(&checkedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			// Оптимистическая охрана: контент строки сменился после чтения
-			// (перепроверка домена перезаписала результат T-058, конкурентная
-			// доставка уже записала свой DOM) — строка не наша, транзакция
-			// откатывается отложенным Rollback. Ссылка Put снимается: без
-			// строки она повисла бы утечкой места (контент-то жив пока есть
-			// ссылки; Delete снимает ровно добавленную Put). Ошибка снятия —
-			// не ошибка задачи: Warn, доставка подтверждается.
+			// The optimistic guard: the row's content changed after the read
+			// (the domain recheck rewrote the result T-058, a concurrent
+			// delivery has already written its DOM) — the row is not ours, the transaction
+			// is rolled back by the deferred Rollback. The Put reference is removed: without
+			// a row it would hang as a space leak (the content lives while there are
+			// references; Delete removes exactly the one Put added). A removal error is
+			// not a task error: a Warn, the delivery is acknowledged.
 			_ = tx.Rollback(ctx)
 			if !hasOld || newHash != oldHash {
 				if err := w.contents.Delete(ctx, newHash); err != nil && !errors.Is(err, content.ErrNotFound) {
@@ -1432,53 +1431,53 @@ func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, er
 		return false, fmt.Errorf("renderworker: %s: замена контента: %w", name, err)
 	}
 
-	// −1 старому контенту (ТЗ 5.7 «при перезаписи результата счётчик
-	// ссылок старого контента уменьшается»): SwapRefTx(old, нулевой) —
-	// примитив «только −старому», новый уже имеет +1 от Put (T-058).
-	// Алиасные строки (hash NULL, T-055) попадают в hasOld=false — снимать
-	// нечего; DOM алиаса — его собственная ссылка.
+	// −1 to the old content (spec 5.7 "on a result rewrite the reference counter
+	// of the old content decreases"): SwapRefTx(old, zero) —
+	// the "only −to-the-old" primitive, the new one already has +1 from Put (T-058).
+	// Alias rows (a NULL hash, T-055) fall into hasOld=false — nothing
+	// to remove; an alias's DOM is its own reference.
 	if hasOld && newHash != oldHash {
 		if err := content.SwapRefTx(ctx, tx, oldHash, content.Hash{}); err != nil {
 			return false, fmt.Errorf("renderworker: %s: %w", name, err)
 		}
 	}
-	// Корзина хвостов переанализа (T-204) — перед корзиной rendered-темпа
-	// (порядок реконсиляции «reanalyze: → rendered:», комментарий
-	// renderBumpReanalyzeSQL): заменённый контент вернул строку в
-	// неанализированные до штампа повторной публикации; час — checked_at
-	// из RETURNING UPDATE выше (час эпизода).
+	// The reanalysis tails bucket (T-204) — before the rendered-rate bucket
+	// (the reconciliation order "reanalyze: → rendered:", the
+	// renderBumpReanalyzeSQL comment): the replaced content returned the row to
+	// unanalyzed before the repeated publication stamp; the hour — the checked_at
+	// from RETURNING UPDATE above (the episode's hour).
 	if err := renderBumpReanalyzeCounter(ctx, tx, checkedAt); err != nil {
 		return false, fmt.Errorf("renderworker: %s: %w", name, err)
 	}
-	// Корзина rendered-темпа (T-203) — последним шагом транзакции (та же
-	// фиксация: откат откатывает флаг и дельту вместе, §3.4; окно
-	// блокировки строки счётчика — минимум, стиль хвостовых дельт
-	// record.go). Дельта — 1 (одна строка переведена), час — checked_at
-	// из RETURNING UPDATE выше.
+	// The rendered-rate bucket (T-203) — the transaction's last step (the same
+	// commit: a rollback rolls back the flag and the delta together, §3.4; the
+	// lock window of the counter row — minimal, the style of the tail deltas
+	// of record.go). The delta is 1 (one row moved), the hour — the checked_at
+	// from RETURNING UPDATE above.
 	if err := renderBumpRenderedCounter(ctx, tx, checkedAt); err != nil {
 		return false, fmt.Errorf("renderworker: %s: %w", name, err)
 	}
 	if err := tx.Commit(ctx); err != nil {
-		// Откат вернёт строку; +1 от Put останется утечкой места —
-		// безопасная сторона (T-044), повторная доставка перезапишет.
+		// The rollback will return the row; the +1 from Put will remain a space leak —
+		// the safe side (T-044), a re-delivery will rewrite it.
 		return false, fmt.Errorf("renderworker: %s: замена контента: фиксация: %w", name, err)
 	}
 
-	// Публикация q:analyze после записи (§7): Result указывает на строку —
-	// она обязана существовать к моменту потребления анализатором в новом
-	// контенте. Сбой публикации → доставка q:render без XACK: повторная
-	// доставка перезапишет результат идемпотентно и опубликует заново
-	// (at-least-once, ТЗ 3.4; дубликаты ограничены попытками доставки).
-	// Fresh: рендер дорабатывает запись текущего HTTP-эпизода (T-066),
-	// а не переанализ — история детекции пишётся (T-118).
+	// The q:analyze publication after the write (§7): the Result points at the row —
+	// it must exist by the moment the analyzer consumes it in the new
+	// content. A publication failure → the q:render delivery without an XACK: a
+	// re-delivery will rewrite the result idempotently and publish again
+	// (at-least-once, spec 3.4; the duplicates are bounded by the delivery attempts).
+	// Fresh: the render reworks the current HTTP episode's entry (T-066),
+	// not a re-analysis — the detection history is written (T-118).
 	task.Fresh = true
 	if _, err := w.q.Publish(ctx, queue.StreamAnalyze, task); err != nil {
-		// Строка уже зафиксирована (Commit выше), но обработка не завершена:
-		// публикация — часть задачи, поэтому false, как у всех ошибочных
-		// путей (контракт «true = запись обработана целиком и err == nil»,
-		// T-225); доставка вернётся и опубликует заново. Факт записанного
-		// DOM — Warn-логом (метрика Rendered считает только полностью
-		// завершённые задачи, сбой уйдёт в счётчик ошибок этапа в
+		// The row is already committed (the Commit above), but the processing is not finished:
+		// the publication is part of the task, hence false, like on all failing
+		// paths (the contract "true = the entry processed entirely and err == nil",
+		// T-225); the delivery will return and publish again. The fact of the written
+		// DOM — by a Warn log (the Rendered metric counts only fully
+		// finished tasks, a failure will go into the stage error counter in
 		// processDelivery).
 		w.opt.log().Warn("DOM записан, публикация q:analyze не удалась — повторная доставка опубликует заново",
 			"domain", name, "final_url", out.FinalURL, "err", err)
@@ -1490,16 +1489,16 @@ func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, er
 	return true, nil
 }
 
-// renderBumpReanalyzeCounter — инкремент корзины неанализированных
-// хвостов в ОТКРЫТОЙ транзакции замены контента (T-204): checkedAt — час
-// корзины (RETURNING renderUpdateSQL), delta — 1 (одна строка вернулась
-// в неанализированные заменой контента). Upsert сам создаёт корзину часа
-// (или воскрешает устаревшую — рендер-опоздание, комментарий
-// renderBumpReanalyzeSQL) — RowsAffected гарантированно 1, проверка —
-// страховка прямых вызовов с чужим SQL (молчаливая потеря дельты
-// занижала бы окно guard'а тика). Возврат с ошибкой откатывает
-// транзакцию вызывающего — замена контента и корзина меняются только
-// вместе (§3.4).
+// renderBumpReanalyzeCounter — an increment of the unanalyzed
+// tails bucket in the OPEN transaction of the content replacement (T-204): checkedAt — the
+// bucket hour (RETURNING renderUpdateSQL), delta — 1 (one row returned
+// to unanalyzed by the content replacement). The upsert creates the hour bucket itself
+// (or resurrects an outdated one — a render lateness, the
+// renderBumpReanalyzeSQL comment) — RowsAffected is guaranteed 1, the check is the
+// guard for direct calls with foreign SQL (a silent loss of a delta
+// would understate the tick guard's window). A return with an error rolls back
+// the caller's transaction — the content replacement and the bucket change only
+// together (§3.4).
 func renderBumpReanalyzeCounter(ctx context.Context, tx pgx.Tx, checkedAt time.Time) error {
 	tag, err := tx.Exec(ctx, renderBumpReanalyzeSQL, checkedAt, int64(1))
 	if err != nil {
@@ -1512,14 +1511,14 @@ func renderBumpReanalyzeCounter(ctx context.Context, tx pgx.Tx, checkedAt time.T
 	return nil
 }
 
-// renderBumpRenderedCounter — инкремент корзины rendered-темпа в
-// ОТКРЫТОЙ транзакции замены контента (T-203): checkedAt — час корзины
-// (RETURNING renderUpdateSQL), delta — 1 (одна строка переведена в
-// rendered). Upsert сам создаёт корзину часа (первый rendered-эпизод
-// часа); RowsAffected гарантированно 1, проверка — страховка прямых
-// вызовов с чужим SQL (молчаливая потеря дельты занижала бы темп).
-// Возврат с ошибкой откатывает транзакцию вызывающего — флаг и корзина
-// меняются только вместе (§3.4).
+// renderBumpRenderedCounter — an increment of the rendered-rate bucket in
+// the OPEN transaction of the content replacement (T-203): checkedAt — the bucket
+// hour (RETURNING renderUpdateSQL), delta — 1 (one row moved to
+// rendered). The upsert creates the hour bucket itself (the first rendered episode
+// of the hour); RowsAffected is guaranteed 1, the check is the guard for direct
+// calls with foreign SQL (a silent loss of a delta would understate the rate).
+// A return with an error rolls back the caller's transaction — the flag and the bucket
+// change only together (§3.4).
 func renderBumpRenderedCounter(ctx context.Context, tx pgx.Tx, checkedAt time.Time) error {
 	tag, err := tx.Exec(ctx, renderBumpRenderedSQL, checkedAt, int64(1))
 	if err != nil {
@@ -1532,10 +1531,10 @@ func renderBumpRenderedCounter(ctx context.Context, tx pgx.Tx, checkedAt time.Ti
 	return nil
 }
 
-// selectTarget читает цель рендера по ключу задачи. SELECT вне транзакции:
-// конкурентная перезапись строки между чтением и UPDATE ловится охраной
-// renderUpdateSQL, повторное чтение даёт повторную попытку с актуальным
-// URL (идемпотентность доставки).
+// selectTarget reads the render target by the task key. The SELECT is outside a transaction:
+// a concurrent row rewrite between the read and the UPDATE is caught by the
+// renderUpdateSQL guard, a re-read gives a retry with an actual
+// URL (the delivery idempotency).
 func (w *Worker) selectTarget(ctx context.Context, task queue.Result) (renderTarget, bool, error) {
 	rows, err := w.db.Query(ctx, renderSelectSQL,
 		task.ZoneID, task.DomainID, task.SubdomainID, int16(task.Variant))
@@ -1553,7 +1552,7 @@ func (w *Worker) selectTarget(ctx context.Context, task queue.Result) (renderTar
 		if finalURL != nil {
 			t.finalURL = *finalURL
 		}
-		return t, true, nil // PK — не больше одной строки
+		return t, true, nil // the PK — no more than one row
 	}
 	if err := rows.Err(); err != nil {
 		return renderTarget{}, false, fmt.Errorf("renderworker: чтение строки результата: %w", err)
@@ -1561,8 +1560,8 @@ func (w *Worker) selectTarget(ctx context.Context, task queue.Result) (renderTar
 	return renderTarget{}, false, nil
 }
 
-// renderLogName — имя для логов: имя домена из сообщения, иначе ключ
-// строки с целевым URL (Name опционально, T-024).
+// renderLogName — the name for logs: the domain name from the message, otherwise the
+// row key with the target URL (Name is optional, T-024).
 func renderLogName(task queue.Result, finalURL string) string {
 	if task.Name != "" {
 		return task.Name
@@ -1570,9 +1569,9 @@ func renderLogName(task queue.Result, finalURL string) string {
 	return fmt.Sprintf("%d/%d/%d/%d → %s", task.ZoneID, task.DomainID, task.SubdomainID, int16(task.Variant), finalURL)
 }
 
-// renderCookiesJSON сериализует cookies рендера в jsonb (единый контракт
-// subdomain_results.cookies: ExtractCookie повторяет запись HTTP-этапа,
-// T-064/T-058); пустой набор — NULL.
+// renderCookiesJSON serializes the render cookies into jsonb (the single
+// subdomain_results.cookies contract: ExtractCookie repeats the HTTP stage's record,
+// T-064/T-058); an empty set — NULL.
 func renderCookiesJSON(cookies []render.ExtractCookie) (*string, error) {
 	if len(cookies) == 0 {
 		return nil, nil
@@ -1585,8 +1584,8 @@ func renderCookiesJSON(cookies []render.ExtractCookie) (*string, error) {
 	return &s, nil
 }
 
-// renderHeadersJSON сериализует заголовки итоговой навигации в jsonb
-// (канонические имена http.Header, как у T-058); пустой набор — NULL.
+// renderHeadersJSON serializes the final navigation's headers into jsonb
+// (canonical http.Header names, like T-058's); an empty set — NULL.
 func renderHeadersJSON(h http.Header) (*string, error) {
 	if len(h) == 0 {
 		return nil, nil
@@ -1599,24 +1598,24 @@ func renderHeadersJSON(h http.Header) (*string, error) {
 	return &s, nil
 }
 
-// --- рабочий цикл ------------------------------------------------------------
+// --- worker loop --------------------------------------------------------------
 
-// renderFailWaitBase — стартовая пауза предохранителя рабочего цикла
-// (Run): доставки, подряд оставшиеся без XACK числом в целую пачку чтения
-// (Consume) при систематическом сбое обработки — рендер/БД/публикация, —
-// приостанавливают чтение q:render с удвоением паузы до DefaultErrorWait
-// (образец — workerFailWaitBase httpworker, T-139). Без паузы цикл
-// продолжал бы черпать задачи: каждая доставка жгла попытку (XAUTOCLAIM
-// после DefaultClaimMinIdle, T-025) и уносила её в q:dead. Переменная, а
-// не константа: юнит-тесты сжимают паузу, не выжидая секунды.
+// renderFailWaitBase — the starting pause of the worker loop's fuse
+// (Run): deliveries left without an XACK in a row in the amount of a whole read
+// chunk (Consume) on a systematic processing failure — render/DB/publication —
+// suspend the q:render reading with the pause doubling up to DefaultErrorWait
+// (the pattern — workerFailWaitBase of httpworker, T-139). Without the pause the loop
+// would keep drawing tasks: every delivery would burn an attempt (XAUTOCLAIM
+// after DefaultClaimMinIdle, T-025) and take it to q:dead. A variable, not
+// a constant: unit tests shrink the pause without waiting out seconds.
 var renderFailWaitBase = time.Second
 
-// renderFailBackoff — пауза после streak подряд выдержанных пауз
-// предохранителя (серия нарастает, пока читатель не увидит ни одного
-// успеха — счётчик неудач обнуляется подтверждённой доставкой):
-// удвоение от renderFailWaitBase, потолок DefaultErrorWait (сдвиг
-// ограничен — переполнение Duration). streak < 1 ограничивается до 1 —
-// отрицательный сдвиг Duration паникует (ревью T-142).
+// renderFailBackoff — the pause after streak fuse pauses endured in a row
+// (the series grows until the reader sees not a single
+// success — the failure counter is reset by an acknowledged delivery):
+// doubling from renderFailWaitBase, the DefaultErrorWait cap (the shift is
+// bounded — a Duration overflow). streak < 1 is clamped to 1 —
+// a negative Duration shift panics (the T-142 review).
 func renderFailBackoff(streak int) time.Duration {
 	if streak < 1 {
 		streak = 1
@@ -1628,40 +1627,40 @@ func renderFailBackoff(streak int) time.Duration {
 	return d
 }
 
-// Run — рабочий цикл render-worker (ТЗ 4.2, §5.6, §7): читает задачи
-// стрима Options.Stream (дефолт q:render; воркер фолбэка — ФТ-12 —
-// собирается со стримом q:render-fallback) группой потребителей пачками
-// Consume и обрабатывает доставки
-// параллельно до Concurrency, каждую — паттерном Processing (T-025):
-// рендер → запись в БД → публикация q:analyze → XACK. Потребление
-// скользящее (T-142, образец T-139 httpworker): следующее чтение
-// происходит при освобождении слотов доставок (чтение идёт вперёд
-// обработки не глубже пары пачек Consume), цикл не ждёт завершения
-// пачки целиком — барьер окна на хвосте длительностей (страницы до
-// render.timeout, 20–25 с) держал бы слоты праздными и резал потолок
-// этапа поверх узкого горла Chromium (замер T-092 §4: 5.1 с/страница).
-// Живость браузера (Options.Alive) проверяется перед каждым чтением:
-// недоступный Chromium — пауза потребления, доставки остаются в стриме
-// непрочитанными (не в PEL), перезапуск браузера — T-065. Работает до
-// отмены ctx и возвращает nil — контракт OnRun каркаса (T-012; начатые
-// задачи дорабатывают или возвращаются очереди повторной доставкой,
-// ТЗ 3.4). Ошибка чтения или обработки не останавливает цикл:
-// логируется (Warn), неподтверждённая доставка вернётся XAUTOCLAIM
-// (ТЗ 4.2); Consume доставок подряд без единого подтверждения —
-// систематический сбой обработки — выдерживает паузу-предохранитель
-// (renderFailWaitBase): черпать новые задачи при лежащей обработке
-// бессмысленно, попытки доставок сгорают. Потолок темпа Options.Rate
-// (T-240, ФТ-13) — перед каждым чтением: пачка урезается до свободных
-// слотов скользящего окна (RateWindow), исчерпанное окно держит паузу до
-// выхода старейшей записи; пустое чтение потолок не расходует (очередь
-// пуста — воркер простаивает в блоке XREADGROUP с полным бюджетом).
-// Инфраструктурный сбой публикации (InfraError: OOM Redis/соединение,
-// T-152) останавливает чтение сразу и до восстановления записи
-// (Reliab.Writable). Режимы читателя (чтение | пауза-браузер |
-// пауза-инфра | пауза-предохранитель | пауза-темп) формализованы
-// автоматом readerstate.go (T-262, ТЗ-fsm §3 ФТ-8): режим прохода
-// выбирает одна функция над наблюдениями, порядок приоритетов пауз —
-// таблица переходов там же.
+// Run — the render-worker loop (spec 4.2, §5.6, §7): reads the tasks of the
+// Options.Stream stream (the default q:render; the fallback worker — FR-12 —
+// is built with the q:render-fallback stream) with a consumer group in chunks of
+// Consume and processes the deliveries
+// in parallel up to Concurrency, each — with the Processing pattern (T-025):
+// render → write to the DB → q:analyze publication → XACK. The consumption is
+// sliding (T-142, the T-139 pattern of httpworker): the next read
+// happens when delivery slots free up (the read runs ahead of
+// processing by no more than a couple of Consume chunks), the loop does not wait for the whole
+// chunk to finish — a window barrier on the duration tail (pages up to
+// render.timeout, 20–25 s) would keep the slots idle and cut the
+// stage's ceiling over the Chromium bottleneck (the T-092 §4 measurement: 5.1 s/page).
+// The browser's liveness (Options.Alive) is checked before every read:
+// an unavailable Chromium — a consumption pause, the deliveries stay in the stream
+// unread (not in the PEL), the browser restart is T-065. It runs until
+// ctx is cancelled and returns nil — the OnRun contract of the framework (T-012; the started
+// tasks finish or return to the queue with a re-delivery,
+// spec 3.4). A read or processing error does not stop the loop:
+// it is logged (Warn), the unacknowledged delivery will return by XAUTOCLAIM
+// (spec 4.2); Consume deliveries in a row without a single acknowledgment —
+// a systematic processing failure — endures a fuse pause
+// (renderFailWaitBase): drawing new tasks while the processing is down is
+// pointless, the delivery attempts burn. The Options.Rate rate cap
+// (T-240, FR-13) — before every read: the chunk is trimmed to the free slots of the
+// sliding window (RateWindow), an exhausted window holds a pause until
+// the oldest entry leaves; an empty read does not spend the cap (the queue
+// is empty — the worker idles in the XREADGROUP block with a full budget).
+// An infrastructure publication failure (InfraError: a Redis OOM/connection,
+// T-152) stops the reading immediately and until the write recovers
+// (Reliab.Writable). The reader modes (reading | browser pause |
+// infra pause | fuse pause | rate pause) are formalized
+// by the readerstate.go FSM (T-262, TZ-fsm §3 FR-8): one function over the observations
+// chooses the pass's mode, the pause priority order —
+// the transition table there.
 func Run(ctx context.Context, w *Worker, opts Options) error {
 	if w == nil {
 		return errors.New("renderworker: цикл воркера: воркер не задан")
@@ -1681,12 +1680,12 @@ func Run(ctx context.Context, w *Worker, opts Options) error {
 		}
 	}
 
-	// Возврат зависших доставок (T-025): фоновый RecoverLoop от имени
-	// того же потребителя — клейм XAUTOCLAIM и та же обработка задач.
-	// RecoverLoopAttempt (T-148): обработчик получает номер доставки
-	// (Claimed.Attempts) для политики таймаутов. Живёт до отмены ctx;
-	// Run дожидается его выхода (начатая задача дорабатывает или остаётся
-	// неподтверждённой, ТЗ 3.4).
+	// The return of stuck deliveries (T-025): a background RecoverLoop on behalf of
+	// the same consumer — an XAUTOCLAIM claim and the same task processing.
+	// RecoverLoopAttempt (T-148): the handler receives the delivery number
+	// (Claimed.Attempts) for the timeout policy. Lives until ctx is cancelled;
+	// Run waits for its exit (a started task finishes or stays
+	// unacknowledged, spec 3.4).
 	if o.Recover != nil {
 		recDone := make(chan struct{})
 		go func() {
@@ -1695,8 +1694,8 @@ func Run(ctx context.Context, w *Worker, opts Options) error {
 				Stream:   o.Stream,
 				Group:    o.Group,
 				Consumer: o.Consumer,
-				// Темп обхода PEL — очередь, не этап (redis.recover_*,
-				// T-153); нули — дефолты очереди.
+				// The PEL traversal rate — the queue's, not the stage's (redis.recover_*,
+				// T-153); zeros — the queue defaults.
 				Batch:    o.RecoverBatch,
 				Interval: o.RecoverInterval,
 				Log:      log,
@@ -1706,57 +1705,57 @@ func Run(ctx context.Context, w *Worker, opts Options) error {
 	}
 
 	sem := make(chan struct{}, o.Concurrency)
-	// Скользящее потребление (T-142, образец T-139): читатель держит
-	// впереди обработки не больше пары пачек Consume доставок (текущая
-	// пачка в руке + буфер pending), диспетчер ниже занимает слот
-	// семафора на время одной доставки и сразу берёт следующую —
-	// завершение задачи освобождает слот и двигает чтение, никто не
-	// ждёт пачку целиком. Прочитанные, но не начатые доставки (буфер
-	// полон, слоты заняты хвостом длительностей) на отмене ctx остаются
-	// без XACK и возвращаются очереди клеймом XAUTOCLAIM — как и не
-	// начатые доставки окна прежде (at-least-once, ТЗ 3.4).
+	// The sliding consumption (T-142, the T-139 pattern): the reader keeps
+	// ahead of the processing no more than a couple of Consume chunks of deliveries (the current
+	// chunk in hand + the pending buffer), the dispatcher below occupies a
+	// semaphore slot for one delivery and immediately takes the next —
+	// a task's completion frees a slot and moves the read, nobody
+	// waits for a whole chunk. The read but not started deliveries (the buffer
+	// is full, the slots are busy with the duration tail) stay without an XACK on ctx
+	// cancellation and return to the queue by an XAUTOCLAIM claim — just like the not
+	// started deliveries of the former window (at-least-once, spec 3.4).
 	//
-	// Окно удержания доставок живым воркером (прочитано и не
-	// подтверждено) — до 2×Consume + Concurrency ≈ 40 записей: оно
-	// обязано укладываться в redis.claim_min_idle с запасом (иначе
-	// клейм перехватывает живую работу); при дефолтных contexts=8
-	// (Concurrency 8) и render.timeout=25 с хвост ожидает ≤ ~2,1 мин
-	// против порога 10 мин, при Concurrency 1 окно растёт до ~13,8 мин —
-	// поднимайте claim_min_idle вместе с понижением параллелизма
-	// (ревью T-142; числа пересчитаны под дефолт 8, T-169).
+	// The window of deliveries held by the live worker (read and not
+	// acknowledged) — up to 2×Consume + Concurrency ≈ 40 entries: it
+	// must fit into redis.claim_min_idle with a margin (otherwise
+	// the claim intercepts live work); at the default contexts=8
+	// (Concurrency 8) and render.timeout=25 s the tail waits ≤ ~2.1 min
+	// against the 10 min threshold, at Concurrency 1 the window grows to ~13.8 min —
+	// raise claim_min_idle together with lowering the parallelism
+	// (the T-142 review; the numbers are recalculated for the default 8, T-169).
 	pending := make(chan queue.Delivery, o.Consume)
-	var failed atomic.Int64 // доставок подряд без подтверждения
-	// rateLim — скользящее окно темпа потребления (T-240, ФТ-13):
-	// Options.Rate > 0 — чтение ограничивается потолком записей за окно
-	// (батч-режим воркера B «собрать и доработать», render.fallback.
-	// worker_rate); nil — потолка нет, чтение как раньше. Ведёт только
-	// читатель ниже — без блокировок (локальные счётчики читателя).
+	var failed atomic.Int64 // deliveries in a row without an acknowledgment
+	// rateLim — the sliding consumption rate window (T-240, FR-13):
+	// Options.Rate > 0 — the read is limited by the cap of entries per window
+	// (worker B's "collect and rework" batch mode, render.fallback.
+	// worker_rate); nil — no cap, the read as before. Only
+	// the reader below keeps it — without locks (the reader's local counters).
 	var rateLim *rateWindow
 	if o.Rate > 0 {
 		rateLim = newRateWindow(o.Rate, renderRateWindow)
 		log.Info("потолок темпа потребления",
 			"stream", o.Stream, "rate", o.Rate, "window", renderRateWindow.String())
 	}
-	// infraDown — устойчивая инфраструктурная ошибка публикации
-	// (OOM/соединение Redis, T-152): чтение q:render приостанавливается
-	// до восстановления записи (Reliab.Writable) — публикации всё равно
-	// падают, новые доставки только копились бы в pending. Наблюдение
-	// infra автомата режимов читателя (readerstate.go, T-262): флаг
-	// ставит диспетчер ниже (queue.IsInfra), гасят проба записи или
-	// успех обработки.
+	// infraDown — a sustained infrastructure publication error
+	// (a Redis OOM/connection, T-152): the q:render reading is suspended
+	// until the write recovers (Reliab.Writable) — the publications fail
+	// anyway, new deliveries would only pile up in pending. The
+	// infra observation of the reader mode FSM (readerstate.go, T-262): the
+	// flag is set by the dispatcher below (queue.IsInfra), extinguished by a write probe or
+	// a processing success.
 	var infraDown atomic.Bool
 	readerDone := make(chan struct{})
 	go func() {
 		defer close(readerDone)
-		failStreak := 0  // подряд выдержанных пауз предохранителя
-		infraStreak := 0 // подряд выдержанных пауз инфраструктуры
+		failStreak := 0  // fuse pauses endured in a row
+		infraStreak := 0 // infra pauses endured in a row
 		for {
-			// Наблюдения прохода (ФТ-8, readerstate.go): датчики
-			// опрашиваются только смонтированными (Alive — зонд
-			// браузера; Writable — проба записи при горящем флаге
-			// T-152, один SET; allowance — окно темпа T-240), режим
-			// прохода выбирает readerDecide — порядок приоритетов пауз
-			// живёт в таблице переходов, а не в порядке if (И4).
+			// The pass's observations (FR-8, readerstate.go): the sensors
+			// are polled only when mounted (Alive — the
+			// browser probe; Writable — a write probe with the flag
+			// lit, T-152, one SET; allowance — the T-240 rate window), the pass's
+			// mode is chosen by readerDecide — the pause priority order
+			// lives in the transition table, not in the if order (I4).
 			obs := readerObs{
 				browser: o.Alive != nil,
 				infra:   infraDown.Load(),
@@ -1768,10 +1767,10 @@ func Run(ctx context.Context, w *Worker, opts Options) error {
 				obs.alive = o.Alive()
 			}
 			if obs.infra {
-				// Проба записи — только при горящем флаге (T-152):
-				// после восстановления записи чтение возобновляется
-				// немедленно. Датчика Recover нет — флаг гасится
-				// возобновлением ниже (успех обработки снимет и так).
+				// A write probe — only with the flag lit (T-152):
+				// after the write recovers the reading resumes
+				// immediately. There is no Recover sensor — the flag is extinguished
+				// by the resumption below (a processing success will remove it anyway).
 				obs.writable = o.Recover == nil || o.Recover.Writable(ctx)
 			}
 			if obs.rate {
@@ -1779,15 +1778,15 @@ func Run(ctx context.Context, w *Worker, opts Options) error {
 			}
 			switch readerDecide(obs) {
 			case modePauseBrowser:
-				// Живость браузера — перед каждым чтением: мёртвый
-				// Chromium задачи не принимает, новые чтения
-				// прекращаются — не прочитанные доставки остаются
-				// в стриме (не в PEL — клеймы не жгут попытки,
-				// T-025); уже прочитанные в буфер предвыборки
-				// дорабатываются диспетчером и при неудаче осядут
-				// в PEL до клейма — как и окно прежнего барьерного
-				// цикла, поведение не хуже. Поколение зонды менеджера
-				// заменяют сами (реконнект, T-065).
+				// The browser's liveness — before every read: a dead
+				// Chromium accepts no tasks, new reads
+				// stop — the unread deliveries stay
+				// in the stream (not in the PEL — claims do not burn attempts,
+				// T-025); the already read ones in the prefetch buffer
+				// are finished by the dispatcher and on a failure will settle
+				// in the PEL until a claim — like the window of the former barrier
+				// loop, the behavior is no worse. The manager's probes replace the generations
+				// themselves (a reconnect, T-065).
 				log.Warn("Chromium недоступен — стрим потребления не читается (перезапуск — менеджер, T-065)",
 					"stream", o.Stream)
 				wait(DefaultErrorWait)
@@ -1796,80 +1795,80 @@ func Run(ctx context.Context, w *Worker, opts Options) error {
 				}
 				continue
 			case modePauseInfra:
-				// Пауза потребления при устойчивой InfraError публикации
-				// (T-152): пока проба записи падает — чтение не ведётся
-				// (предохранитель ниже считал бы те же неудачи дольше и
-				// читал бы пачки между паузами).
+				// The consumption pause on a sustained InfraError of publication
+				// (T-152): while the write probe fails — no reading
+				// (the fuse below would count the same failures longer and
+				// would read chunks between pauses).
 				infraStreak++
 				pause := renderFailBackoff(infraStreak)
 				log.Warn("пауза чтения: публикация результатов падает об инфраструктуру Redis (OOM/соединение) — новые доставки не читаются (T-152)",
 					"stream", o.Stream, "streak", infraStreak, "wait", pause.String())
 				wait(pause)
 				if ctx.Err() != nil {
-					return // graceful shutdown: wait вышел по отмене
+					return // graceful shutdown: the wait exited on cancellation
 				}
 				continue
 			case modePauseFail:
-				// Предохранитель (renderFailWaitBase): доставки, подряд
-				// оставшиеся без подтверждения числом в целую пачку
-				// чтения (Consume) без единого успеха — систематический
-				// сбой обработки (рендер/БД/публикация); пауза с
-				// удвоением до DefaultErrorWait. После паузы проход
-				// читает (ФТ-8): предохранитель душит темп, но не
-				// блокирует чтение до нулевого счётчика. Подтверждённая
-				// доставка обнуляет счётчик неудач сразу, серия пауз
-				// сбрасывается на следующем проходе читателя, увидевшем
-				// счётчик нулевым.
+				// The fuse (renderFailWaitBase): deliveries left in a row
+				// without an acknowledgment in the amount of a whole read
+				// chunk (Consume) without a single success — a systematic
+				// processing failure (render/DB/publication); a pause with
+				// doubling up to DefaultErrorWait. After the pause the pass
+				// reads (FR-8): the fuse throttles the rate but does not
+				// block the reading until a zero counter. An acknowledged
+				// delivery resets the failure counter immediately, the pause series
+				// is reset on the next reader pass that sees
+				// the counter at zero.
 				if ctx.Err() != nil {
-					return // graceful shutdown: паузы не было и не будет
+					return // graceful shutdown: there was and will be no pause
 				}
 				failStreak++
 				pause := renderFailBackoff(failStreak)
-				// Наблюдаемость простоя: пауза останавливает чтение
-				// этапа — Warn с серией и числом неудач (частота
-				// ограничена удвоением паузы, не чаще ~2/мин на серии).
+				// The downtime observability: the pause stops the stage's reading
+				// — a Warn with the series and the failure count (the
+				// frequency is bounded by the pause doubling, no more often than ~2/min per series).
 				log.Warn("пауза предохранителя чтения: доставки падают подряд",
 					"stream", o.Stream, "failed", obs.failed, "streak", failStreak, "wait", pause.String())
 				wait(pause)
 				if ctx.Err() != nil {
-					return // graceful shutdown: wait вышел по отмене
+					return // graceful shutdown: the wait exited on cancellation
 				}
 			case modePauseRate:
-				// Пауза-темп выдерживается общим шагом темпа ниже —
-				// ПОСЛЕ сбросов серий: до T-262 проверка темпа шла
-				// после возобновления инфра-флага и сброса серии
-				// предохранителя (браузер/инфра-паузы сбросы и прежде
-				// не выполняли — уходят в continue). Шаг темпа и так
-				// обязан пере-наблюдать окно после паузы
-				// предохранителя (за ожидание окно могло исчерпаться),
-				// поэтому отдельной ветки паузы здесь нет — случай
-				// помечает проход без чтения по темпу.
+				// The rate pause is endured by the shared rate step below —
+				// AFTER the series resets: before T-262 the rate check ran
+				// after the infra flag resumption and the fuse series
+				// reset (the browser/infra pauses did not perform the resets even
+				// before — they go to continue). The rate step anyway
+				// must re-observe the window after a
+				// fuse pause (during the wait the window could have been exhausted),
+				// so there is no separate pause branch here — the case
+				// marks the pass as without reading by the rate.
 			}
-			// Возобновление после инфра-паузы (T-152): флаг горел
-			// в наблюдениях прохода, а режим — уже не пауза-инфра:
-			// проба записи прошла (или датчика нет — флаг гасит
-			// успех обработки). Флаг гасится, серия инфра-пауз
-			// начинается заново (погашенный успехом флаг серию не
-			// сбрасывает — как и до T-262).
+			// The resumption after an infra pause (T-152): the flag was lit
+			// in the pass's observations, but the mode is no longer the infra pause:
+			// the write probe passed (or there is no sensor — a processing
+			// success extinguishes the flag). The flag is extinguished, the infra pause series
+			// starts over (a flag extinguished by a success does not reset the
+			// series — as before T-262).
 			if obs.infra && infraDown.Swap(false) {
 				infraStreak = 0
 				if o.Recover != nil {
 					log.Info("запись в Redis восстановлена — чтение возобновляется", "stream", o.Stream)
 				}
 			}
-			// Серия пауз предохранителя сбрасывается наблюдением
-			// нулевого счётчика неудач (подтверждённая доставка).
+			// The fuse pause series is reset by the observation
+			// of a zero failure counter (an acknowledged delivery).
 			if failed.Load() == 0 {
 				failStreak = 0
 			}
-			// Темп потребления (T-240, ФТ-13): перед чтением пачка
-			// урезается до свободных слотов окна (не брать за раз
-			// больше потолка); исчерпанное окно — пауза до выхода
-			// старейшей записи (режим Т: свежий или пере-наблюденный
-			// после паузы предохранителя — стрим не читается, попытки
-			// не расходуются). Debug, не Warn: потолок — штатный
-			// режим сборки B (какие записи ждать — видно глубиной
-			// очереди), а не сбой; частота — раз-два за окно.
+			// The consumption rate (T-240, FR-13): before the read the chunk
+			// is trimmed to the window's free slots (do not take at once
+			// more than the cap); an exhausted window — a pause until
+			// the oldest entry leaves (mode R: a fresh one or re-observed
+			// after a fuse pause — the stream is not read, attempts
+			// are not spent). A Debug, not a Warn: the cap is a regular
+			// mode of the B build (which entries to wait for is visible from the
+			// queue depth), not a failure; the frequency — once or twice per window.
 			batch := o.Consume
 			if rateLim != nil {
 				now := time.Now()
@@ -1880,7 +1879,7 @@ func Run(ctx context.Context, w *Worker, opts Options) error {
 						"window", renderRateWindow.String(), "wait", pause.String())
 					wait(pause)
 					if ctx.Err() != nil {
-						return // graceful shutdown: wait вышел по отмене
+						return // graceful shutdown: the wait exited on cancellation
 					}
 					continue
 				} else if allow < batch {
@@ -1896,8 +1895,8 @@ func Run(ctx context.Context, w *Worker, opts Options) error {
 				wait(DefaultErrorWait)
 				continue
 			}
-			// Прочитанные записи входят в окно темпа (T-240): пустое
-			// чтение — no-op, простой бюджета не расходует
+			// The read entries enter the rate window (T-240): an empty
+			// read — a no-op, idleness does not spend the budget
 			// (rateWindow.record).
 			if rateLim != nil {
 				rateLim.record(time.Now(), len(deliveries))
@@ -1906,24 +1905,24 @@ func Run(ctx context.Context, w *Worker, opts Options) error {
 				select {
 				case pending <- d:
 				case <-ctx.Done():
-					return // буферные доставки без XACK вернёт XAUTOCLAIM
+					return // the buffered deliveries without XACK will be returned by XAUTOCLAIM
 				}
 			}
 		}
 	}()
 
-	// Диспетчер: ждёт свободный слот (или отмену) и запускает доставку.
-	// Слот семафора — с выходом по отмене: отмена ctx во время ожидания
-	// слота не должна запускать доставку с уже отменённым ctx (выбор
-	// канала select недетерминирован, поэтому отмена проверяется и после
-	// получения слота).
+	// The dispatcher: waits for a free slot (or cancellation) and starts the delivery.
+	// The semaphore slot — with an exit on cancellation: a ctx cancellation during the slot
+	// wait must not start a delivery with an already cancelled ctx (the select
+	// channel choice is non-deterministic, so the cancellation is checked after
+	// receiving the slot too).
 	var wg sync.WaitGroup
 dispatch:
 	for {
 		var d queue.Delivery
 		select {
 		case <-ctx.Done():
-			break dispatch // доставки буфера не начаты — без XACK
+			break dispatch // the buffered deliveries are not started — without XACK
 		case d = <-pending:
 		}
 		select {
@@ -1939,13 +1938,13 @@ dispatch:
 		go func(d queue.Delivery) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			// Паника доставки не должна ронять процесс без лога и
-			// очистки — тот же инвариант, что у горутины OnRun
-			// (internal/service): panic → Error-лог, доставка без
-			// XACK вернётся повторной доставкой (XAUTOCLAIM, T-025);
-			// in-flight соседей и graceful shutdown сохраняются.
-			// Для предохранителя паника — та же неподтверждённая
-			// доставка: серия паник пережигала бы попытки без паузы.
+			// A delivery panic must not crash the process without a log and
+			// cleanup — the same invariant as the OnRun goroutine's
+			// (internal/service): panic → an Error log, the delivery without
+			// XACK will return with a re-delivery (XAUTOCLAIM, T-025);
+			// the in-flight neighbors and the graceful shutdown are preserved.
+			// For the fuse a panic is the same unacknowledged
+			// delivery: a panic series would burn attempts without a pause.
 			defer func() {
 				if r := recover(); r != nil {
 					failed.Add(1)
@@ -1953,14 +1952,14 @@ dispatch:
 						"stream", o.Stream, "entry", d.ID, "panic", r, "stack", string(debug.Stack()))
 				}
 			}()
-			// Свежая доставка XREADGROUP — первая по счётчику PEL: attempts=1
-			// (T-148, политика таймаутов в processDelivery).
+			// A fresh XREADGROUP delivery — the first by the PEL counter: attempts=1
+			// (T-148, the timeout policy in processDelivery).
 			err := queue.ProcessingAttempt(ctx, w.q, o.Group, d, 1, w.processDelivery)
 			if err != nil {
 				failed.Add(1)
 				if queue.IsInfra(err) {
-					// Инфраструктурный сбой публикации (T-152):
-					// чтение останавливает ветка infraDown читателя.
+					// An infrastructure publication failure (T-152):
+					// the reader's infraDown branch stops the reading.
 					infraDown.Store(true)
 				}
 				if ctx.Err() == nil {
@@ -1969,63 +1968,63 @@ dispatch:
 				}
 			} else {
 				failed.Store(0)
-				// Успех означает состоявшуюся публикацию результата —
-				// запись Redis доступна, пауза снимается досрочно.
+				// A success means the result publication happened —
+				// the Redis write is available, the pause is lifted early.
 				infraDown.Store(false)
 			}
 		}(d)
 	}
-	wg.Wait()    // начатые доставки дорабатывают (graceful stop, ТЗ 3.4)
-	<-readerDone // читатель завершается той же отменой ctx (Consume/wait)
+	wg.Wait()    // the started deliveries finish (graceful stop, spec 3.4)
+	<-readerDone // the reader finishes with the same ctx cancellation (Consume/wait)
 	return nil
 }
 
-// TarpitStore — шов счётчика тарпит-классифицированных доставок задач
-// (T-261, ТЗ-fsm §3 ФТ-7): помечает доставку delivery задачи taskID
-// (идемпотентно — повторная отметка той же доставки мощность не растит)
-// и возвращает, сколько доставок задачи размечено, включая текущую.
-// ttl — время жизни ключа задачи, освежается каждой отметкой (эпизод не
-// может закончиться раньше). Боевая сборка — queue.TarpitCounter
-// (Redis-множество render:tarpit:{task_id}, спецификация —
-// outcomestate.go); nil — деградация решения к номеру доставки PEL
+// TarpitStore — the seam of the counter of tasks' tarpit-classified deliveries
+// (T-261, TZ-fsm §3 FR-7): marks delivery of task taskID
+// (idempotently — re-marking the same delivery does not grow the cardinality)
+// and returns how many of the task's deliveries are marked, including the current one.
+// ttl — the lifetime of the task's key, refreshed by every mark (the episode cannot
+// end earlier). The production build — queue.TarpitCounter
+// (the Redis set render:tarpit:{task_id}, the specification —
+// outcomestate.go); nil — the decision degrades to the PEL delivery number
 // (tarpitsExhausted).
 type TarpitStore interface {
 	Track(ctx context.Context, taskID, delivery string, ttl time.Duration) (int, error)
 }
 
-// tarpitDeliveryID — идентификатор доставки для тарпит-счётчика (T-261):
-// «запись стрима × номер доставки PEL» (del.ID#attempts). Номер входит в
-// член, чтобы повторные доставки одной записи различались (del.ID на
-// клеймах повторов один и тот же), а replay того же номера (возврат
-// попытки T-222/ФТ-6.2, повторная обработка зависшей) — нет: одна
-// доставка — один член множества. Записи q:render и q:render-fallback
-// несут разные entry-id, и в одном множестве они не пересекаются: entry-id
-// — «мс-секвенция» времени XADD, а публикация фолбэка (T-238) происходит
-// после доставок исходной записи (клеймы зреют claim_min_idle) — пары
-// записей одного task_id разнесены минимум на минуты, одинаковая
-// миллисекунда двух публикаций исключена; доставки воркеров A и B одного
-// task_id не смешиваются в один член.
+// tarpitDeliveryID — the delivery identifier for the tarpit counter (T-261):
+// "stream entry × PEL delivery number" (del.ID#attempts). The number is part of the
+// member so that re-deliveries of one entry differ (del.ID is the same
+// across the claims of repeats), while a replay of the same number (an attempt
+// refund T-222/FR-6.2, reprocessing of a stuck one) is not: one
+// delivery — one set member. The q:render and q:render-fallback entries
+// carry different entry-ids and do not intersect in one set: an entry-id
+// is the "ms-sequence" of the XADD time, and the fallback publication (T-238) happens
+// after the original entry's deliveries (the claims ripen over claim_min_idle) — the pairs
+// of entries of one task_id are spread by minutes at least, the same
+// millisecond of two publications is excluded; the deliveries of workers A and B of one
+// task_id do not mix into one member.
 func tarpitDeliveryID(del queue.Delivery, attempts int) string {
 	return fmt.Sprintf("%s#%d", del.ID, attempts)
 }
 
-// tarpitsExhausted — решение тарпит-финализации доставки (T-261,
-// ТЗ-fsm §3 ФТ-7): true — тарпит-бюджет эпизода исчерпан, доставка
-// финализируется (или публикуется в фолбэк, publishFallback). Счёт —
-// мощность множества render:tarpit:{task_id} ПОСЛЕ отметки текущей
-// доставки: порог ≥ Options.TimeoutAttempts. Истинные тарпиты (таймаут
-// каждой доставки) финализируют ровно на доставке TimeoutAttempts, как и
-// до T-261; смешанные серии (инфра-сбой между тарпитами) — только после
-// TimeoutAttempts тарпитов: номер доставки растят все доставки,
-// множество — только тарпит-классифицированные.
+// tarpitsExhausted — the tarpit finalization decision of a delivery (T-261,
+// TZ-fsm §3 FR-7): true — the episode's tarpit budget is exhausted, the delivery
+// is finalized (or published to the fallback, publishFallback). The count is the
+// cardinality of the render:tarpit:{task_id} set AFTER marking the current
+// delivery: the threshold ≥ Options.TimeoutAttempts. True tarpits (the timeout
+// of every delivery) finalize exactly on the TimeoutAttempts delivery, as
+// before T-261; mixed series (an infra failure between tarpits) — only after
+// TimeoutAttempts tarpits: all deliveries grow the delivery number,
+// the set — only tarpit-classified ones.
 //
-// Деградации (решение по номеру доставки PEL — поведение до T-261,
-// таблица Д1–Д3 outcomestate.go): счётчик не смонтирован (изолированные
-// сборки), сообщение без task_id (форматы до T-024 — идентификатора
-// множества нет), ошибка Redis (Warn: потеря счётчика не роняет
-// конвейер). Деградация не финализирует раньше доставки с номером
-// TimeoutAttempts и не трогает общий лимит redis.max_attempts — он
-// работает по номеру доставки (ветка класса задачи ниже).
+// Degradations (the decision by the PEL delivery number — the behavior before T-261,
+// the D1–D3 table of outcomestate.go): the counter is not mounted (isolated
+// builds), a message without a task_id (the formats before T-024 — no set
+// identifier), a Redis error (a Warn: losing the counter does not crash the
+// pipeline). A degradation does not finalize earlier than the delivery with the number
+// TimeoutAttempts and does not touch the overall redis.max_attempts limit — it
+// works by the delivery number (the task class branch below).
 func (w *Worker) tarpitsExhausted(ctx context.Context, task queue.Result, del queue.Delivery, attempts int) bool {
 	if w.opt.Tarpits == nil || task.TaskID == "" {
 		return attempts >= w.opt.TimeoutAttempts
@@ -2039,99 +2038,99 @@ func (w *Worker) tarpitsExhausted(ctx context.Context, task queue.Result, del qu
 	return n >= w.opt.TimeoutAttempts
 }
 
-// processDelivery обрабатывает одну доставку q:render: декодирование
-// Result-ключа и замена контента. attempts — номер доставки по счётчику
-// PEL (1 — свежая XREADGROUP, Claimed.Attempts — клейм; ProcessingAttempt/
-// RecoverLoopAttempt, T-148). Подтверждение (XACK) выполняет Processing
-// после nil-возврата — «XACK только после записи результата в БД»
-// (ТЗ 4.2); ядовитая запись (вне формата T-024) возвращается ошибкой —
-// очередь исчерпает попытки и унесёт её в q:dead (T-025).
+// processDelivery processes one q:render delivery: decoding
+// the Result key and the content replacement. attempts — the delivery number by the
+// PEL counter (1 — a fresh XREADGROUP, Claimed.Attempts — a claim; ProcessingAttempt/
+// RecoverLoopAttempt, T-148). The acknowledgment (XACK) is done by Processing
+// after a nil return — "XACK only after the result is written to the DB"
+// (spec 4.2); a poisoned entry (outside the T-024 format) returns an error —
+// the queue will exhaust the attempts and take it to q:dead (T-025).
 //
-// Политика таймаутов (T-148, счёт тарпитов — T-261/ФТ-7): таймаут
-// страницы (render.timeout, tarpitError) — предсказуемый тарпит, а не
-// случайная ошибка: пока число тарпит-классифицированных доставок
-// эпизода не достигло TimeoutAttempts (tarpitsExhausted: SADD
-// render:tarpit:{task_id} по id доставки, порог SCARD), доставка
-// возвращается ошибкой как любая повторимая (без XACK → клейм → новая
-// попытка), на исчерпании — запись финализируется без рендера
-// (finalizeSkipRender) и доставка подтверждается: работа не выпадает из
-// конвейера в q:dead, q:dead остаётся настоящим инфраструктурным
-// ошибкам (БД, браузер, публикация). До T-261 порогом служил номер
-// доставки PEL — смешанная последовательность (инфраструктурный сбой,
-// затем таймаут) финализировала на попытку раньше: номер доставки
-// растят все доставки, тарпит-множество — только тарпиты. Потеря
-// Redis-счётчика — деградация к номеру доставки (tarpitsExhausted),
-// таблица решений — outcomestate.go.
+// The timeout policy (T-148, tarpit counting — T-261/FR-7): a page
+// timeout (render.timeout, tarpitError) is a predictable tarpit, not a
+// random error: while the number of the episode's tarpit-classified deliveries
+// has not reached TimeoutAttempts (tarpitsExhausted: SADD
+// render:tarpit:{task_id} by the delivery id, the SCARD threshold), the delivery
+// returns an error like any retryable one (no XACK → claim → a new
+// attempt), on exhaustion — the entry is finalized without a render
+// (finalizeSkipRender) and the delivery is acknowledged: work does not fall out of the
+// pipeline into q:dead, q:dead stays for real infrastructure
+// errors (DB, browser, publication). Before T-261 the threshold was the
+// PEL delivery number — a mixed sequence (an infrastructure failure,
+// then a timeout) finalized on an attempt earlier: all deliveries
+// grow the delivery number, the tarpit set — only tarpits. Losing
+// the Redis counter — degradation to the delivery number (tarpitsExhausted),
+// the decision table — outcomestate.go.
 //
-// Постоянные ошибки сертификата хоста (T-159, certError) и DNS-отказ
-// хоста (T-211, dnsError) финализируются с первой же доставки —
-// независимо от номера и тарпит-лимита: свойство хоста не меняется
-// между попытками, ожидание бессмысленно.
+// Permanent host certificate errors (T-159, certError) and a host DNS
+// refusal (T-211, dnsError) are finalized from the very first delivery —
+// regardless of the number and the tarpit limit: a host property does not change
+// between attempts, waiting is pointless.
 //
-// Политика последней попытки × класс задачи (T-172): прочая ошибка
-// рендера класса task (isTaskRenderError — отказ соединения, load
-// error, свойство хоста) на доставке с номером redis.max_attempts
-// (Options.MaxAttempts) финализируется по образцу тарпитов вместо
-// захоронения — на ранних попытках ошибка повторяема (восстановление
-// хостов наблюдается), исчерпавший попытки хост получает честный сырой
-// HTML HTTP-фазы и анализ. Инфраструктурный класс (БД, хранилище,
-// публикация, браузер, отмена ctx) умирает прежним путём — q:dead
-// остаётся настоящим инфраструктурным ошибкам.
+// The last attempt × task class policy (T-172): another render error
+// of the task class (isTaskRenderError — a connection refusal, a
+// load error, a host property) on the delivery with the number redis.max_attempts
+// (Options.MaxAttempts) is finalized following the tarpit pattern instead of
+// burying — on early attempts the error is retryable (host recovery
+// is observed), a host that exhausted the attempts gets an honest raw
+// HTML of the HTTP phase and analysis. The infrastructure class (DB, storage,
+// publication, browser, ctx cancellation) dies the former way — q:dead
+// stays for real infrastructure errors.
 //
-// Успешная обработка идёт в приборы этапа (T-077): счётчик задач и
-// длительность, processed=true — запись обработана целиком (DOM записан
-// и q:analyze опубликован, T-225); ошибка — в счётчик
-// классов рендера (доставка вернётся повторной доставкой, ТЗ 3.4),
-// финализация без рендера — в crawler_render_tarpit_finalized_total /
+// A successful processing goes into the stage metrics (T-077): the task counter and
+// the duration, processed=true — the entry processed entirely (the DOM written
+// and q:analyze published, T-225); an error — into the
+// render class counter (the delivery will return with a re-delivery, spec 3.4),
+// a finalization without a render — into crawler_render_tarpit_finalized_total /
 // crawler_render_cert_finalized_total /
 // crawler_render_dns_finalized_total /
-// crawler_render_task_finalized_total{reason}, публикация фолбэка
-// (T-238, вместо финализации тарпита/класса задачи) — в
-// crawler_render_fallback_published_total{reason} (словарь
-// taskFinalizeReason; метрика не растёт на дубле доставки — публикация
-// не выполнялась), события приостановки фолбэка (T-239) — в
-// crawler_render_fallback_suspended_total{gate|budget} (стрик
-// ClassBrowser и перерасход окна бюджета), потребление фолбэка
-// (T-245, только сборка воркера B — стрим q:render-fallback) — в
+// crawler_render_task_finalized_total{reason}, a fallback publication
+// (T-238, instead of the tarpit/task class finalization) — into
+// crawler_render_fallback_published_total{reason} (the
+// taskFinalizeReason vocabulary; the metric does not grow on a delivery duplicate — no
+// publication happened), the fallback suspension events (T-239) — into
+// crawler_render_fallback_suspended_total{gate|budget} (the
+// ClassBrowser streak and the budget window overspend), the fallback consumption
+// (T-245, only the worker B build — the q:render-fallback stream) — into
 // crawler_render_fallback_consumed_total{rendered|finalized|skipped}
-// по исходу доставки, завершившейся обработкой без ошибки (баланс
-// published = consumed + остаток q:render-fallback + похороненные,
-// шаг 4 приёмки ТЗ §6.2).
+// by the outcome of the delivery that ended with processing without an error (the
+// published = consumed + the q:render-fallback remainder + the buried ones balance,
+// acceptance step 4 of spec §6.2).
 func (w *Worker) processDelivery(ctx context.Context, del queue.Delivery, attempts int) (err error) {
 	task, err := queue.Decode[queue.Result](del)
 	if err != nil {
 		return fmt.Errorf("renderworker: запись %s стрима %s: %w", del.ID, del.Stream, err)
 	}
 	start := time.Now()
-	// Бюджет доли фолбэка (T-239): знаменатель окна — доставки,
-	// завершившиеся обработкой без ошибки (err == nil на выходе
-	// обработчика — до XACK уровнем выше, ProcessingAttempt): сбой
-	// Ack или паника дают лишний +1, повторная доставка посчитается
-	// снова — допуск единиц на 1000-доставочном окне, порядок доли
-	// не меняющий (ревью T-239, P2).
+	// The fallback share budget (T-239): the window's denominator — deliveries
+	// that ended with processing without an error (err == nil at the
+	// handler's exit — before the XACK at the level above, ProcessingAttempt): an
+	// Ack failure or a panic give an extra +1, a re-delivery will be counted
+	// again — a tolerance of a few units over the 1000-delivery window, not changing the share's
+	// order (the T-239 review, P2).
 	defer func() {
 		if err == nil {
 			w.fbObserveTask()
 		}
 	}()
-	// processed (не «rendered»): true = запись обработана целиком,
-	// только при err == nil (T-225) — иначе расходится с метрикой
-	// Rendered() и колонкой rendered (DOM записан, публикация упала).
+	// processed (not "rendered"): true = the entry processed entirely,
+	// only with err == nil (T-225) — otherwise it would diverge from the
+	// Rendered() metric and the rendered column (the DOM written, the publication failed).
 	processed, err := w.ProcessResult(ctx, task)
-	// Health-гейт фолбэка (T-239): класс браузера — признак нездоровья
-	// движка (стрик растёт), успешный рендер (processed) — признак
-	// жизни (сброс); ошибки классов задачи/контекста и no-op стрик не
-	// трогают.
+	// The fallback health gate (T-239): the browser class — a sign of the engine's
+	// ill health (the streak grows), a successful render (processed) — a sign of
+	// life (a reset); the task/context class errors and a no-op do not touch the
+	// streak.
 	w.fbObserveOutcome(err, processed)
 	if err != nil {
 		var ce *certError
 		if errors.As(err, &ce) {
-			// Cert-класс финализируется с первой же доставки (T-159): ошибка
-			// сертификата — постоянное свойство хоста, ожидание попыток
-			// (тарпит-лимит T-148 даёт странице шанс в изменившихся условиях —
-			// здесь шанса нет) только жгло бы доставки к q:dead. Итог — сырой
-			// HTML HTTP-фазы, конвейер продолжается анализом (q:analyze),
-			// доставка подтверждается.
+			// The cert class is finalized from the very first delivery (T-159): a
+			// certificate error is a permanent host property, waiting for attempts
+			// (the T-148 tarpit limit gives the page a chance in changed conditions —
+			// there is no chance here) would only burn deliveries toward q:dead. The result is the raw
+			// HTML of the HTTP phase, the pipeline continues with analysis (q:analyze),
+			// the delivery is acknowledged.
 			if ferr := w.finalizeCertError(ctx, task, ce); ferr != nil {
 				return fmt.Errorf("renderworker: домен %s: %w", task.Name, ferr)
 			}
@@ -2143,13 +2142,13 @@ func (w *Worker) processDelivery(ctx context.Context, del queue.Delivery, attemp
 		}
 		var de *dnsError
 		if errors.As(err, &de) {
-			// DNS-класс финализируется с первой же доставки (T-211): имя
-			// хоста не резолвится, запись попала в q:render через живой
-			// HTTP-эпизод — DNS хоста умер между эпизодом и рендером,
-			// окно ретраев (~20 мин) на возврат DNS не влияет (масштаб
-			// дней), попытки только жгли бы доставки и PEL. Итог — сырой
-			// HTML HTTP-фазы, конвейер продолжается анализом (q:analyze),
-			// доставка подтверждается.
+			// The DNS class is finalized from the very first delivery (T-211): the
+			// host name does not resolve, the entry got into q:render through a live
+			// HTTP episode — the host's DNS died between the episode and the render,
+			// the retry window (~20 min) does not affect the DNS recovery (a scale
+			// of days), the attempts would only burn deliveries and PEL. The result is the raw
+			// HTML of the HTTP phase, the pipeline continues with analysis (q:analyze),
+			// the delivery is acknowledged.
 			if ferr := w.finalizeDNSError(ctx, task, de); ferr != nil {
 				return fmt.Errorf("renderworker: домен %s: %w", task.Name, ferr)
 			}
@@ -2161,10 +2160,10 @@ func (w *Worker) processDelivery(ctx context.Context, del queue.Delivery, attemp
 		}
 		var tp *tarpitError
 		if errors.As(err, &tp) && w.tarpitsExhausted(ctx, task, del, attempts) {
-			// Фолбэк (T-238, ФТ-8): тарпит — движко-зависимый кандидат,
-			// при включённом фолбэке задача публикуется в
-			// q:render-fallback вместо финализации (маркер не ставится —
-			// доработку и финализацию выполняет воркер B, ФТ-10).
+			// The fallback (T-238, FR-8): a tarpit is an engine-branched candidate,
+			// with the fallback on the task is published to
+			// q:render-fallback instead of a finalization (no marker —
+			// worker B does the rework and the finalization, FR-10).
 			fb, ferr := w.publishFallback(ctx, task, tp)
 			if ferr != nil {
 				return fmt.Errorf("renderworker: домен %s: %w", task.Name, ferr)
@@ -2172,11 +2171,11 @@ func (w *Worker) processDelivery(ctx context.Context, del queue.Delivery, attemp
 			if fb {
 				w.met.Task(time.Since(start))
 				w.met.Error(render.ClassTask)
-				return nil // в фолбэке: ни маркера, ни q:analyze (воркер B)
+				return nil // in the fallback: no marker, no q:analyze (worker B)
 			}
-			// Лимит таймаутов исчерпан (T-148): запись финализируется без
-			// рендера — итог сырой HTML HTTP-фазы, конвейер продолжается
-			// анализом (q:analyze), доставка подтверждается.
+			// The timeout limit is exhausted (T-148): the entry is finalized without
+			// a render — the result is the raw HTML of the HTTP phase, the pipeline continues
+			// with analysis (q:analyze), the delivery is acknowledged.
 			if ferr := w.finalizeSkipRender(ctx, task, tp, attempts); ferr != nil {
 				return fmt.Errorf("renderworker: домен %s: %w", task.Name, ferr)
 			}
@@ -2187,15 +2186,15 @@ func (w *Worker) processDelivery(ctx context.Context, del queue.Delivery, attemp
 			return nil
 		}
 		if attempts >= w.opt.MaxAttempts && isTaskRenderError(err) {
-			// Последняя попытка × класс задачи (T-172): ошибка — свойство
-			// хоста (отказ соединения, load error), дальше только q:dead;
-			// ретраи уже даны (восстановление наблюдается — замер T-172:
-			// 6.6% ретраев ERR_CONNECTION_REFUSED успешны), работу не
-			// теряем: итог — сырой HTML HTTP-фазы, конвейер продолжается
-			// анализом (q:analyze), доставка подтверждается.
-			// Фолбэк (T-238, ФТ-8): та же движко-зависимая причина —
-			// при включённом фолбэке публикация в q:render-fallback
-			// вместо финализации (маркер — воркеру B, ФТ-10).
+			// The last attempt × task class (T-172): the error is a
+			// host property (a connection refusal, a load error), ahead only q:dead;
+			// the retries were already given (recovery is observed — the T-172
+			// measurement: 6.6% of ERR_CONNECTION_REFUSED retries succeed), we do not
+			// lose the work: the result is the raw HTML of the HTTP phase, the pipeline continues
+			// with analysis (q:analyze), the delivery is acknowledged.
+			// The fallback (T-238, FR-8): the same engine-branched reason —
+			// with the fallback on a publication to q:render-fallback
+			// instead of a finalization (the marker — to worker B, FR-10).
 			fb, ferr := w.publishFallback(ctx, task, err)
 			if ferr != nil {
 				return fmt.Errorf("renderworker: домен %s: %w", task.Name, ferr)
@@ -2203,7 +2202,7 @@ func (w *Worker) processDelivery(ctx context.Context, del queue.Delivery, attemp
 			if fb {
 				w.met.Task(time.Since(start))
 				w.met.Error(render.ClassTask)
-				return nil // в фолбэке: ни маркера, ни q:analyze (воркер B)
+				return nil // in the fallback: no marker, no q:analyze (worker B)
 			}
 			if ferr := w.finalizeTaskError(ctx, task, err, attempts); ferr != nil {
 				return fmt.Errorf("renderworker: домен %s: %w", task.Name, ferr)
@@ -2220,54 +2219,54 @@ func (w *Worker) processDelivery(ctx context.Context, del queue.Delivery, attemp
 	w.met.Task(time.Since(start))
 	if processed {
 		w.met.Rendered()
-		// Фолбэк-потребление (T-245): успех доработки воркера B —
-		// rendered=true и публикация q:analyze (T-225: processed = запись
-		// обработана целиком).
+		// The fallback consumption (T-245): the success of worker B's rework —
+		// rendered=true and a q:analyze publication (T-225: processed = the entry
+		// processed entirely).
 		w.fbConsume(fbResultRendered)
 	} else {
-		// Штатный отказ без побочных эффектов (строки нет / нет итогового
-		// URL / охрана UPDATE отсекла — строка ушла из-под задачи):
-		// доставка закрывается — потребление фолбэка это учитывает
-		// (skipped), иначе баланс published = consumed + остаток
-		// расходился бы на «пустых» доставках.
+		// A regular rejection without side effects (no row / no final
+		// URL / the UPDATE guard cut it off — the row slipped out from under the task):
+		// the delivery is closed — the fallback consumption accounts for it
+		// (skipped), otherwise the published = consumed + remainder balance
+		// would diverge on the "empty" deliveries.
 		w.fbConsume(fbResultSkipped)
 	}
 	return nil
 }
 
-// finalizeNoRender — общая механика финализации записи без рендера
-// (T-148/T-159/T-172/T-211): строки нет (перепроверка перезаписала) или у неё
-// нет итогового URL — штатный отказ без публикации; иначе строка
-// получает маркер «рендер невозможен» render_failed_at (T-210 —
-// оптимистическая охрана по content_hash, до смены контента проход
-// доработки запись не переиздаёт) и уходит в q:analyze тем же ключом
-// (Fresh=true — доработка текущего эпизода, как у успешного рендера);
-// Warn-лог с деталями причины (msg и пары «ключ-значение» вызывающей
-// политики). Маркер — до публикации, публикация — до XACK: сбой любого
-// шага — ошибка, доставка вернётся и финализация повторится (дубликат
-// публикации ограничен попытками, анализатор идемпотентен по ключу —
-// тот же паттерн, что у рендера после сбоя публикации; штамп
-// переставляется идемпотентно). Уже отрендеренная конкурентной доставкой
-// строка не маркируется (охрана rendered = false) и анализируется
-// повторно — дубль анализа тем же контентом безвреден (at-least-once,
-// ТЗ 3.4).
+// finalizeNoRender — the common mechanics of finalizing an entry without a render
+// (T-148/T-159/T-172/T-211): no row (the recheck rewrote it) or no final
+// URL — a regular rejection without a publication; otherwise the row
+// gets the "render impossible" marker render_failed_at (T-210 —
+// an optimistic guard on content_hash, until the content changes the rework
+// pass does not re-publish the entry) and goes to q:analyze with the same key
+// (Fresh=true — reworking the current episode, like a successful render);
+// a Warn log with the reason details (msg and the "key-value" pairs of the calling
+// policy). The marker — before the publication, the publication — before the XACK: a failure of any
+// step — an error, the delivery will return and the finalization will repeat (a
+// publication duplicate is bounded by the attempts, the analyzer is idempotent by the key —
+// the same pattern as the render after a publication failure; the stamp
+// is re-set idempotently). A row already rendered by a concurrent delivery
+// is not marked (the rendered = false guard) and is analyzed
+// again — an analysis duplicate with the same content is harmless (at-least-once,
+// spec 3.4).
 func (w *Worker) finalizeNoRender(ctx context.Context, task queue.Result, msg string, fields ...any) error {
 	target, found, err := w.selectTarget(ctx, task)
 	if err != nil {
 		return fmt.Errorf("финализация без рендера: чтение строки результата: %w", err)
 	}
 	if !found || target.finalURL == "" {
-		// Рендерить/анализировать нечего: строки нет или она ушла из-под
-		// задачи (перепроверка) — успех без публикации.
+		// Nothing to render/analyze: no row or it slipped out from under
+		// the task (the recheck) — a success without a publication.
 		w.opt.log().Debug("финализация без рендера не требуется — строки нет или без итогового URL",
 			"zone_id", task.ZoneID, "domain_id", task.DomainID,
 			"subdomain_id", task.SubdomainID, "variant", int16(task.Variant))
 		return nil
 	}
-	// Маркер «рендер невозможен» (T-210): автокоммит-UPDATE до публикации.
-	// RowsAffected 0 — охрана отсекла (строку перезаписал новый эпизод
-	// либо конкурентный рендер): не ошибка, публикация q:analyze ниже
-	// адресуется текущей строке, штамп ей не принадлежит.
+	// The "render impossible" marker (T-210): an autocommit UPDATE before the publication.
+	// RowsAffected 0 — the guard cut it off (a new episode rewrote the row
+	// or a concurrent render): not an error, the q:analyze publication below
+	// addresses the current row, the stamp does not belong to it.
 	if tag, err := w.db.Exec(ctx, renderFailMarkerSQL,
 		task.ZoneID, task.DomainID, task.SubdomainID, int16(task.Variant), target.hash); err != nil {
 		return fmt.Errorf("финализация без рендера: маркер render_failed_at: %w", err)
@@ -2285,22 +2284,22 @@ func (w *Worker) finalizeNoRender(ctx context.Context, task queue.Result, msg st
 	return nil
 }
 
-// finalizeSkipRender — финализация записи без рендера по тарпиту (T-148,
-// зафиксированное решение): вызывается из processDelivery после того, как
-// publishFallback (T-238) отказал — фолбэк выключен, чужой стрим
-// потребления, rendered=true либо отказ решения гейта/бюджета (T-239 —
-// стрик инфра-ошибок ClassBrowser / перерасход доли за окно: публикация
-// приостановлена, задача без потерь):
-// тарпит — движко-зависимый кандидат, при включённом фолбэке он
-// публикуется в q:render-fallback вместо финализации. Страница раз за
-// разом не укладывается в
-// render.timeout, рендерные попытки исчерпаны — итогом записи остаётся
-// сырой HTML HTTP-фазы (rendered = false), строка получает маркер
-// «рендер невозможен» render_failed_at (T-210 — до смены контента проход
-// доработки её не переиздаёт), запись уходит в q:analyze, конвейер
-// доводит её анализом, работа не теряется. Доставка подтверждается
-// (nil вызывающему processDelivery) — в q:dead запись не попадает.
-// Механика и идемпотентность — finalizeNoRender.
+// finalizeSkipRender — the finalization of an entry without a render by a tarpit (T-148,
+// the fixed decision): called from processDelivery after
+// publishFallback (T-238) rejected — the fallback is off, another
+// consumption stream, rendered=true or a gate/budget decision rejection (T-239 —
+// a ClassBrowser infra error streak / a share overspend over the window: the
+// publication is suspended, the task without losses):
+// a tarpit is an engine-branched candidate, with the fallback on it
+// is published to q:render-fallback instead of a finalization. The page time after time
+// does not fit into
+// render.timeout, the render attempts are exhausted — the entry's result stays
+// the raw HTML of the HTTP phase (rendered = false), the row gets the
+// "render impossible" marker render_failed_at (T-210 — until the content changes the
+// rework pass does not re-publish it), the entry goes to q:analyze, the pipeline
+// finishes it with analysis, the work is not lost. The delivery is acknowledged
+// (nil to the calling processDelivery) — the entry does not reach q:dead.
+// The mechanics and idempotency — finalizeNoRender.
 func (w *Worker) finalizeSkipRender(ctx context.Context, task queue.Result, cause *tarpitError, attempts int) error {
 	return w.finalizeNoRender(ctx, task,
 		"рендер-тарпит: запись финализирована без рендера (итог — сырой HTML HTTP-фазы)",
@@ -2308,73 +2307,73 @@ func (w *Worker) finalizeSkipRender(ctx context.Context, task queue.Result, caus
 		"err", cause.Error())
 }
 
-// finalizeCertError — финализация записи без рендера по постоянной ошибке
-// сертификата хоста (T-159, зафиксированное решение): рендер этого URL
-// невозможен до смены сертификата самим хостом, ретраи бессмысленны и
-// пережигали бы общий лимит доставок до q:dead (замер §12). Итог записи —
-// сырой HTML HTTP-фазы (rendered = false), маркер «рендер невозможен»
-// render_failed_at (T-210) закрывает переиздания до смены контента
-// (колонку error не трогаем — она принадлежит HTTP-проверке, ErrorClass
-// T-058, перезапись лгала бы о ней; HTTP-результат домена уже сохранён,
-// ТЗ §8 — некорректный сертификат загрузке не мешает, InsecureSkipVerify).
-// Маркер живёт до смены контента строки, не вечно: следующий эпизод
-// перепроверки (T-030) перезаписывает строку (маркер — NULL) и публикует
-// новую задачу q:render — с исправленным сертификатом рендер пройдёт.
-// Доставка подтверждается (nil вызывающему processDelivery) — в q:dead
-// запись не попадает. Механика и идемпотентность — finalizeNoRender.
+// finalizeCertError — the finalization of an entry without a render by a permanent
+// host certificate error (T-159, the fixed decision): rendering this URL
+// is impossible until the host replaces the certificate itself, retries are pointless and
+// would burn the overall delivery limit down to q:dead (the §12 measurement). The entry's result is
+// the raw HTML of the HTTP phase (rendered = false), the "render impossible"
+// marker render_failed_at (T-210) closes the re-publications until the content changes
+// (we do not touch the error column — it belongs to the HTTP check, ErrorClass
+// T-058, a rewrite would lie about it; the domain's HTTP result is already saved,
+// spec §8 — a bad certificate does not hinder loading, InsecureSkipVerify).
+// The marker lives until the row's content changes, not forever: the next recheck
+// episode (T-030) rewrites the row (the marker — NULL) and publishes
+// a new q:render task — with the certificate fixed the render will pass.
+// The delivery is acknowledged (nil to the calling processDelivery) — the
+// entry does not reach q:dead. The mechanics and idempotency — finalizeNoRender.
 func (w *Worker) finalizeCertError(ctx context.Context, task queue.Result, cause *certError) error {
 	return w.finalizeNoRender(ctx, task,
 		"рендер невозможен: постоянная ошибка сертификата хоста — запись финализирована без рендера (итог — сырой HTML HTTP-фазы)",
 		"err", cause.Error())
 }
 
-// finalizeDNSError — финализация записи без рендера по DNS-отказу хоста
-// (T-211, по итогам T-207, зафиксированное решение): имя хоста не
-// резолвится, а запись попала в q:render через недавний живой HTTP-эпизод
-// (HTTP-фаза сама резолвила имя; браузер резолвит тем же системным
-// unbound) — DNS хоста умер между эпизодом и рендером, ретраи на окне
-// 3 доставок (~20 мин в PEL) бессмысленны: возврат DNS — масштаб дней
-// (замер T-207: 252 хоста за ~7 ч съедали по 3 доставки). Итог записи —
-// сырой HTML HTTP-фазы (rendered = false), маркер «рендер невозможен»
-// render_failed_at (T-210) закрывает переиздания прохода до смены
-// контента (колонку error не трогаем — она принадлежит HTTP-проверке,
-// ErrorClass T-058, перезапись лгала бы о ней). Маркер живёт до смены
-// контента строки, не вечно: следующий эпизод перепроверки (T-030)
-// перезаписывает строку (маркер — NULL) и публикует новую задачу q:render
-// — хост с вернувшимся DNS отрендерится. Доставка подтверждается (nil
-// вызывающему processDelivery) — в q:dead запись не попадает. Механика и
-// идемпотентность — finalizeNoRender.
+// finalizeDNSError — the finalization of an entry without a render by a host DNS
+// refusal (T-211, from the T-207 outcomes, the fixed decision): the host name does
+// not resolve, and the entry got into q:render through a recent live HTTP episode
+// (the HTTP phase resolved the name itself; the browser resolves with the same system
+// unbound) — the host's DNS died between the episode and the render, retries over the
+// 3-delivery window (~20 min in the PEL) are pointless: a DNS recovery is a scale of
+// days (the T-207 measurement: 252 hosts per ~7 h ate 3 deliveries each). The entry's result is
+// the raw HTML of the HTTP phase (rendered = false), the "render impossible"
+// marker render_failed_at (T-210) closes the pass's re-publications until the
+// content changes (we do not touch the error column — it belongs to the HTTP check,
+// ErrorClass T-058, a rewrite would lie about it). The marker lives until the
+// row's content changes, not forever: the next recheck episode (T-030)
+// rewrites the row (the marker — NULL) and publishes a new q:render task
+// — a host with recovered DNS will render. The delivery is acknowledged (nil
+// to the calling processDelivery) — the entry does not reach q:dead. The mechanics and
+// idempotency — finalizeNoRender.
 func (w *Worker) finalizeDNSError(ctx context.Context, task queue.Result, cause *dnsError) error {
 	return w.finalizeNoRender(ctx, task,
 		"рендер невозможен: DNS-отказ хоста (имя не резолвится) — запись финализирована без рендера (итог — сырой HTML HTTP-фазы)",
 		"err", cause.Error())
 }
 
-// finalizeTaskError — финализация записи без рендера по ошибке класса
-// задачи на последней попытке (T-172, зафиксированное решение):
-// вызывается из processDelivery после того, как publishFallback (T-238)
-// отказал — фолбэк выключен, чужой стрим потребления, rendered=true либо
-// отказ решения гейта/бюджета (T-239 — стрик инфра-ошибок ClassBrowser
-// / перерасход доли за окно: публикация приостановлена, задача без
-// потерь): движко-зависимая причина при
-// включённом фолбэке публикуется в q:render-fallback вместо
-// финализации. Хост
-// исчерпал доставки (redis.max_attempts) с ошибкой рендера класса task —
-// отказ соединения, load error (isTaskRenderError), — ретраи уже даны,
-// дальше путь только в q:dead; вместо захоронения итогом записи остаётся
-// честный сырой HTML HTTP-фазы (rendered = false), строка получает маркер
-// «рендер невозможен» render_failed_at (T-210 — до смены контента проход
-// доработки её не переиздаёт), запись уходит в q:analyze — конвейер
-// доводит её анализом, работа не теряется (инцидент 23.10: смешанная
-// серия таймаут→refused жгла все доставки и уносила 459 записей в q:dead
-// за 11 минут, каждая смерть ≈ 3 лишних слот-времени рендера).
-// Инфраструктурные ошибки (БД, хранилище, публикация, браузер) сюда не
-// попадают — классом не task они умирают прежним путём. Маркер живёт до
-// смены контента строки, не вечно: следующий эпизод перепроверки (T-030)
-// перезаписывает строку (маркер — NULL) и публикует новую задачу q:render
-// — поднявшийся хост отрендерится. Доставка подтверждается (nil
-// вызывающему processDelivery) — в q:dead запись не попадает. Механика и
-// идемпотентность — finalizeNoRender.
+// finalizeTaskError — the finalization of an entry without a render by a task class
+// error on the last attempt (T-172, the fixed decision):
+// called from processDelivery after publishFallback (T-238)
+// rejected — the fallback is off, another consumption stream, rendered=true or
+// a gate/budget decision rejection (T-239 — a ClassBrowser infra error streak
+// / a share overspend over the window: the publication is suspended, the task without
+// losses): an engine-branched reason with
+// the fallback on is published to q:render-fallback instead of
+// a finalization. The host
+// exhausted the deliveries (redis.max_attempts) with a render error of the task class —
+// a connection refusal, a load error (isTaskRenderError) — the retries were already given,
+// ahead the path only to q:dead; instead of burying the entry's result stays
+// an honest raw HTML of the HTTP phase (rendered = false), the row gets the
+// "render impossible" marker render_failed_at (T-210 — until the content changes the
+// rework pass does not re-publish it), the entry goes to q:analyze — the pipeline
+// finishes it with analysis, the work is not lost (the Oct 23 incident: a mixed
+// timeout→refused series burned all the deliveries and took 459 entries to q:dead
+// in 11 minutes, every death ≈ 3 extra render slot-times).
+// Infrastructure errors (DB, storage, publication, browser) do not get
+// here — not being the task class they die the former way. The marker lives until
+// the row's content changes, not forever: the next recheck episode (T-030)
+// rewrites the row (the marker — NULL) and publishes a new q:render task
+// — a host that came up will render. The delivery is acknowledged (nil
+// to the calling processDelivery) — the entry does not reach q:dead. The mechanics and
+// idempotency — finalizeNoRender.
 func (w *Worker) finalizeTaskError(ctx context.Context, task queue.Result, cause error, attempts int) error {
 	return w.finalizeNoRender(ctx, task,
 		"рендер невозможен: ошибка класса задачи исчерпала доставки — запись финализирована без рендера (итог — сырой HTML HTTP-фазы)",
@@ -2382,70 +2381,70 @@ func (w *Worker) finalizeTaskError(ctx context.Context, task queue.Result, cause
 		"err", cause.Error())
 }
 
-// publishFallback — попытка отправить задачу в q:render-fallback вместо
-// финализации записи без рендера (T-238, ТЗ §4.4 п.1/п.5, ФТ-7/8/10):
-// движко-зависимый кандидат (тарпит T-148 или класс задачи T-172 на
-// последней попытке — их общий признак «рендер финализировался бы без
-// результата», ФТ-7) дорабатывается chromium-воркером B (ТЗ §4.5), а
-// первичный воркер НЕ ставит маркер render_failed_at и НЕ публикует
-// q:analyze — и то и другое делает воркер B (успех — renderUpdateSQL
-// с NULL-маркером и публикация q:analyze; исчерпание фолбэка — маркер
-// finalizeNoRender, ФТ-10). Промежуточное состояние записи «ждёт
-// фолбэка» — отсутствие маркера и глубина q:render-fallback, отдельной
-// колонки нет (ТЗ §4.8 — схема БД не меняется, состояние фолбэка живёт
-// в очереди и метриках).
+// publishFallback — an attempt to send the task to q:render-fallback instead of
+// finalizing the entry without a render (T-238, spec §4.4 items 1/5, FR-7/8/10):
+// the engine-branched candidate (the tarpit T-148 or the task class T-172 on
+// the last attempt — their common sign "the render would be finalized without
+// a result", FR-7) is reworked by the chromium worker B (spec §4.5), and
+// the primary worker does NOT set the render_failed_at marker and does NOT publish
+// q:analyze — worker B does both (a success — renderUpdateSQL
+// with a NULL marker and a q:analyze publication; the fallback exhaustion — the
+// finalizeNoRender marker, FR-10). The entry's intermediate "awaiting
+// fallback" state — the marker's absence and the q:render-fallback depth, no separate
+// column (spec §4.8 — the DB schema does not change, the fallback state lives
+// in the queue and the metrics).
 //
-// Порядок «публикация до XACK» — по образцу связи финализации с
-// публикацией q:analyze (finalizeNoRender: штамп → публикация →
-// подтверждение, сбой любого шага — повтор всей попытки): здесь
-// публикация → подтверждение, сбой публикации — ошибка без маркера и
-// без XACK, доставка вернётся и разыграет попытку заново (запись не
-// менялась — повторять нечего, идемпотентность по построению).
+// The "publication before XACK" order — following the finalization connection with
+// the q:analyze publication pattern (finalizeNoRender: the stamp → the publication →
+// the acknowledgment, a failure of any step — a repeat of the whole attempt): here
+// the publication → the acknowledgment, a publication failure — an error without a marker and
+// without an XACK, the delivery will return and replay the attempt (the entry was not
+// changed — nothing to repeat, idempotent by construction).
 //
-// Фильтры до публикации:
-//   - Fallback.Enabled (render.fallback.enabled, ФТ-14), стрим
-//     потребления и движок сборки: публикации идут только из q:render и
-//     только с движка-кандидата — воркер B (тот же бинарь на
-//     q:render-fallback, ФТ-12) фолбэка не публикует: рекурсивный
-//     фолбэк фолбэка запрещён (ФТ-10), его движко-зависимые сбои
-//     финализируются finalizeNoRender (ТЗ §4.5 п.2); движок сборки
-//     chromium (включая пустое значение) тоже не публикует (S-P1-1,
-//     ТЗ §6.2 п.2/§6.4 п.1) — chromium сам себе не фолбэчится, откат
-//     на chromium гасит публикацию сам, без смены флага;
-//   - строки нет / нет итогового URL — фолбэку нечего дорабатывать:
-//     вызывающий финализирует запись (там тот же штатный отказ);
-//   - строка уже rendered=true (воркер B доработал её между
-//     публикацией и поздним дублем доставки, конкурентный рендер) —
-//     публикация не нужна: дорабатывать нечего, доставка подтверждается
-//     без публикаций (закрывает окно лишнего повторного рендера
-//     воркером B — ревью T-238, P3);
-//   - фильтр дубля fallbackDedup по идентификатору записи результата
-//     (ключ строки + checked_at эпизода): повторная доставка уже
-//     опубликованной записи (сбой XACK после публикации) не даёт
-//     вторую запись в стриме (ТЗ §4.4 п.5) — доставка подтверждается
-//     без публикаций. Проверка дубля стоит ДО решения гейта/бюджета:
-//     запись уже ждёт воркера B, приостановка её не отменяет и маркер
-//     ей не нужен (ревью T-239, P3); фиксация (claim) — после
-//     решения: claim при отказе без публикации закрыл бы фолбэк
-//     записи до смены эпизода;
-//   - решение fallbackPublishDecision (кандидат × гейт × бюджет,
-//     ФТ-9, T-239): health-гейт закрыт стриком инфра-ошибок
-//     ClassBrowser (движок нездоров — восстановление обнулит) или окно
-//     бюджета перерасходовало потолок доли — публикация приостановлена,
-//     задача финализируется по-сегодняшнему (маркер, ТЗ §4.4 п.3–4).
+// The filters before the publication:
+//   - Fallback.Enabled (render.fallback.enabled, FR-14), the
+//     consumption stream and the build's engine: publications go only from q:render and
+//     only from the candidate engine — worker B (the same binary on
+//     q:render-fallback, FR-12) does not publish the fallback: a recursive
+//     fallback of the fallback is forbidden (FR-10), its engine-branched failures
+//     are finalized by finalizeNoRender (spec §4.5 item 2); a chromium build engine
+//     (including an empty value) does not publish either (S-P1-1,
+//     spec §6.2 item 2/§6.4 item 1) — chromium does not fallback itself, a rollback
+//     to chromium puts the publication out by itself, without changing the flag;
+//   - no row / no final URL — the fallback has nothing to rework:
+//     the caller finalizes the entry (the same regular rejection there);
+//   - the row is already rendered=true (worker B reworked it between
+//     the publication and the late delivery duplicate, a concurrent render) —
+//     no publication needed: nothing to rework, the delivery is acknowledged
+//     without publications (closes the window of an extra repeated render
+//     by worker B — the T-238 review, P3);
+//   - the fallbackDedup dedup filter by the result row identifier
+//     (the row key + the episode's checked_at): a re-delivery of an already
+//     published row (an XACK failure after the publication) does not give
+//     a second entry in the stream (spec §4.4 item 5) — the delivery is acknowledged
+//     without publications. The duplicate check is BEFORE the gate/budget decision:
+//     the entry is already waiting for worker B, a suspension does not cancel it and no
+//     marker is needed for it (the T-239 review, P3); the claim — after
+//     the decision: a claim on a rejection without a publication would close the
+//     row's fallback until the episode changes;
+//   - the fallbackPublishDecision decision (candidate × gate × budget,
+//     FR-9, T-239): the health gate is closed by a ClassBrowser infra error
+//     streak (the engine is unhealthy — recovery will reset it) or the budget
+//     window overspent the share cap — the publication is suspended,
+//     the task is finalized as today (the marker, spec §4.4 items 3–4).
 //
-// Возвраты:
-//   - (true, nil): доставка подтверждается БЕЗ finalizeNoRender —
-//     успешная публикация (+1 метрика
-//     crawler_render_fallback_published_total{reason}), дубль (стрим
-//     уже ждёт запись, метрика не растёт) либо rendered=true (публиковать
-//     нечего);
-//   - (false, nil): публикация не выполнялась (фолбэк выключен / стрим
-//     потребления не q:render / движок chromium / строки нет / решение
-//     отказало) — вызывающий финализирует запись по-сегодняшнему;
-//   - (_, err): сбой чтения строки или публикации — вызывающий
-//     возвращает ошибку: доставка без XACK вернётся (redelivery),
-//     маркера нет, состояние записи не менялось.
+// The returns:
+//   - (true, nil): the delivery is acknowledged WITHOUT finalizeNoRender —
+//     a successful publication (+1 of the
+//     crawler_render_fallback_published_total{reason} metric), a duplicate (the
+//     stream already holds the entry, the metric does not grow) or rendered=true (nothing
+//     to publish);
+//   - (false, nil): no publication happened (the fallback is off / the
+//     consumption stream is not q:render / the chromium engine / no row / the
+//     decision rejected) — the caller finalizes the entry as today;
+//   - (_, err): a row read or publication failure — the caller
+//     returns the error: the delivery without an XACK will return (a redelivery),
+//     no marker, the entry's state did not change.
 func (w *Worker) publishFallback(ctx context.Context, task queue.Result, cause error) (bool, error) {
 	if !w.fallbackArmed() {
 		return false, nil
@@ -2455,25 +2454,25 @@ func (w *Worker) publishFallback(ctx context.Context, task queue.Result, cause e
 		return false, fmt.Errorf("фолбэк-публикация: чтение строки результата: %w", err)
 	}
 	if !found || target.finalURL == "" {
-		// Фолбэку нечего дорабатывать: вызывающий финализирует запись —
-		// там тот же штатный отказ без публикаций.
+		// The fallback has nothing to rework: the caller finalizes the entry —
+		// the same regular rejection without publications there.
 		return false, nil
 	}
 	if target.rendered {
-		// Строка уже отрендерена (воркер B доработал, конкурентный
-		// рендер): фолбэк и финализация не нужны — доставка
-		// подтверждается без публикаций и маркера.
+		// The row is already rendered (worker B reworked it, a concurrent
+		// render): neither the fallback nor the finalization is needed — the
+		// delivery is acknowledged without publications and a marker.
 		w.opt.log().Debug("фолбэк: строка уже отрендерена — публикация не требуется",
 			"zone_id", task.ZoneID, "domain_id", task.DomainID,
 			"subdomain_id", task.SubdomainID, "variant", int16(task.Variant))
 		return true, nil
 	}
 	cand := fallbackCandidate{task: task, reason: taskFinalizeReason(cause)}
-	// Дубль ДО решения гейта/бюджета (ревью T-239, P3): запись этого
-	// эпизода уже в стриме (сбой XACK после публикации) — приостановка
-	// состоявшуюся публикацию не отменяет, вторая запись и маркер не
-	// нужны; доставка подтверждается (ФТ-11). Фиксация (claim) — ниже,
-	// после решения: claim без публикации закрыл бы фолбэк записи.
+	// The duplicate BEFORE the gate/budget decision (the T-239 review, P3): the
+	// episode's entry is already in the stream (an XACK failure after the publication) — a suspension
+	// does not cancel a publication that happened, a second entry and a marker are not
+	// needed; the delivery is acknowledged (FR-11). The claim — below,
+	// after the decision: a claim without a publication would close the row's fallback.
 	key := fallbackDedupKey(task, target.checkedAt)
 	if w.fbDedup.known(key) {
 		w.opt.log().Debug("фолбэк: запись уже опубликована в q:render-fallback — дубль доставки подтверждается",
@@ -2483,33 +2482,33 @@ func (w *Worker) publishFallback(ctx context.Context, task queue.Result, cause e
 	}
 	gate, budget := w.fallbackStates()
 	if !fallbackPublishDecision(cand, gate, budget) {
-		// Гейт/бюджет приостановили публикацию (ФТ-9, T-239): задача
-		// финализируется по-сегодняшнему — маркер и q:analyze
-		// вызывающим, без потерь (ТЗ §4.4 п.3–4).
+		// The gate/budget suspended the publication (FR-9, T-239): the task
+		// is finalized as today — the marker and q:analyze
+		// by the caller, without losses (spec §4.4 items 3–4).
 		return false, nil
 	}
 	if !w.fbDedup.claim(key) {
-		// Дубль: запись этого эпизода уже в стриме (сбой XACK после
-		// публикации) — вторая запись не нужна (ТЗ §4.4 п.5), доставка
-		// подтверждается.
+		// A duplicate: the episode's entry is already in the stream (an XACK failure
+		// after the publication) — a second entry is not needed (spec §4.4 item 5), the
+		// delivery is acknowledged.
 		w.opt.log().Debug("фолбэк: запись уже опубликована в q:render-fallback — дубль доставки подтверждается",
 			"zone_id", task.ZoneID, "domain_id", task.DomainID,
 			"subdomain_id", task.SubdomainID, "variant", int16(task.Variant))
 		return true, nil
 	}
-	// Fresh=true — доработка текущего эпизода, как у финализации и
-	// успешного рендера: воркер B опубликует q:analyze тем же ключом.
+	// Fresh=true — reworking the current episode, like the finalization and
+	// a successful render: worker B will publish q:analyze with the same key.
 	task.Fresh = true
 	if _, err := w.q.Publish(ctx, queue.StreamRenderFallback, task); err != nil {
-		// Публикация не состоялась: фиксация дубля снимается — иначе
-		// повторная доставка увидела бы «уже опубликована» и потеряла
-		// задачу между фильтром и стримом; маркера нет, XACK не будет —
-		// состояние записи не менялось, повтор разыграет всё заново.
+		// The publication did not happen: the duplicate record is removed — otherwise
+		// a re-delivery would see "already published" and lose
+		// the task between the filter and the stream; no marker, no XACK —
+		// the entry's state did not change, a repeat replays everything.
 		w.fbDedup.release(key)
 		return false, fmt.Errorf("фолбэк-публикация q:render-fallback: %w", err)
 	}
 	w.met.FallbackPublished(cand.reason)
-	// Числитель доли бюджета (T-239): публикация реально ушла в очередь.
+	// The budget share's numerator (T-239): the publication actually went to the queue.
 	w.fbRecordPublish()
 	w.opt.log().Warn("рендер-фолбэк: задача опубликована в q:render-fallback — дорабатывает chromium-воркер B, запись без маркера",
 		"domain", renderLogName(task, target.finalURL), "final_url", target.finalURL,

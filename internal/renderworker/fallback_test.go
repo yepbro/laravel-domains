@@ -1,14 +1,14 @@
-// Юнит-тесты публикации фолбэка из путей финализации без рендера
-// (T-238, ТЗ §4.4 п.1–2/п.5, ФТ-7/8/10/11/14): тарпит T-148 и класс
-// задачи T-172 на последней попытке при включённом render.fallback
-// .enabled публикуют задачу в q:render-fallback вместо маркера
-// render_failed_at (маркер и q:analyze — воркеру B после исчерпания
-// фолбэка, ФТ-10); DNS-класс T-211 и cert-класс T-159 фолбэка не
-// получают (движко-независимые причины, ФТ-7); выключенный фолбэк —
-// вчерашнее поведение (маркер + q:analyze); сбой публикации — ошибка
-// без маркера, доставка в redelivery; повторная доставка уже
-// опубликованной записи не дублирует стрим (фильтр по идентификатору
-// записи результата). Фейковое окружение — worker_test.go.
+// Unit tests of the fallback publication from the finalization paths without a render
+// (T-238, spec §4.4 items 1–2/5, FR-7/8/10/11/14): the tarpit T-148 and the task
+// class T-172 on the last attempt with render.fallback.enabled on
+// publish the task to q:render-fallback instead of the
+// render_failed_at marker (the marker and q:analyze — to worker B after the fallback is
+// exhausted, FR-10); the DNS class T-211 and the cert class T-159 get no
+// fallback (engine-independent reasons, FR-7); the fallback off —
+// yesterday's behavior (the marker + q:analyze); a publication failure — an error
+// without a marker, the delivery to the redelivery; a re-delivery of an already
+// published row does not duplicate the stream (the filter by the result
+// row identifier). The fake environment — worker_test.go.
 package renderworker
 
 import (
@@ -26,19 +26,19 @@ import (
 	"crawler/internal/render"
 )
 
-// rwFBCandidateEngine — движок-кандидат сборки воркера A в тестах
-// фолбэка (S-P1-1): движковый guard fallbackArmed не публикует с
-// chromium (шаг 1 приёмки ТЗ §6.2, откат §6.4), поэтому фикстуры
-// вооружённого фолбэка собирают первичного воркера с движком-кандидатом
-// — движок здесь только поле, рендер решает фейк.
+// rwFBCandidateEngine — the candidate engine of the worker A build in the
+// fallback tests (S-P1-1): the fallbackArmed engine guard does not publish with
+// chromium (acceptance step 1, spec §6.2, the §6.4 rollback), so the
+// armed fallback fixtures build the primary worker with a candidate engine
+// — the engine here is only a field, the fake decides the render.
 const rwFBCandidateEngine = config.EngineMoli
 
-// newRWFallbackFixture — фикстура с включённым фолбэком
-// (FallbackOptions.Enabled, T-238) и движком-кандидатом сборки (S-P1-1):
-// остальные опции — дефолты (TimeoutAttempts 2, MaxAttempts 3, Stream
-// q:render); нулевые пороги гейта/бюджета (T-239) — состояния выключены,
-// решение публикует без потолков (поведение заглушки always-publish для
-// тестов T-238).
+// newRWFallbackFixture — a fixture with the fallback on
+// (FallbackOptions.Enabled, T-238) and the build's candidate engine (S-P1-1):
+// the other options — defaults (TimeoutAttempts 2, MaxAttempts 3, the Stream
+// q:render); the zero gate/budget thresholds (T-239) — the states are off,
+// the decision publishes without caps (the always-publish stub behavior for
+// the T-238 tests).
 func newRWFallbackFixture(t *testing.T) *rwFixture {
 	t.Helper()
 	f := newRWFixture(t)
@@ -50,8 +50,8 @@ func newRWFallbackFixture(t *testing.T) *rwFixture {
 	return f
 }
 
-// rwFallbackPublishes — публикации в q:render-fallback из всех
-// зафиксированных (подсобник проверок).
+// rwFallbackPublishes — the publications to q:render-fallback from all
+// recorded ones (the checks helper).
 func rwFallbackPublishes(t *testing.T, f *rwFixture) []rwPublishRec {
 	t.Helper()
 	var out []rwPublishRec
@@ -63,14 +63,14 @@ func rwFallbackPublishes(t *testing.T, f *rwFixture) []rwPublishRec {
 	return out
 }
 
-// TestRenderWorker_TarpitFallbackPublish — тарпит на исчерпании
-// лимита с включённым фолбэком: вместо маркера и q:analyze задача
-// публикуется в q:render-fallback (Fresh=true, ключ записи), строка не
-// тронута (rendered=false, прежний content_hash, render_failed_at
-// NULL — «ждёт фолбэка», ТЗ §4.4 п.1), доставка подтверждается,
-// Put/транзакция не выполняются, метрика
-// crawler_render_fallback_published_total{timeout} растёт, счётчики
-// финализаций — нет.
+// TestRenderWorker_TarpitFallbackPublish — a tarpit on the limit's
+// exhaustion with the fallback on: instead of the marker and q:analyze the task
+// is published to q:render-fallback (Fresh=true, the row key), the row is not
+// touched (rendered=false, the old content_hash, render_failed_at
+// NULL — "awaiting fallback", spec §4.4 item 1), the delivery is acknowledged,
+// Put/the transaction are not executed, the
+// crawler_render_fallback_published_total{timeout} metric grows, the
+// finalization counters — no.
 func TestRenderWorker_TarpitFallbackPublish(t *testing.T) {
 	f := newRWFallbackFixture(t)
 	reg := metrics.New("render-worker")
@@ -83,7 +83,7 @@ func TestRenderWorker_TarpitFallbackPublish(t *testing.T) {
 	f.pool.seedRow(rwKey, "https://spa.example/", &raw)
 	f.renderer.err = rwTarpitErr("https://spa.example/")
 
-	// Доставка №2 из 2 (DefaultTimeoutAttempts).
+	// Delivery #2 of 2 (DefaultTimeoutAttempts).
 	if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 2); err != nil {
 		t.Fatalf("тарпит с фолбэком — публикация, не ошибка: %v", err)
 	}
@@ -98,7 +98,7 @@ func TestRenderWorker_TarpitFallbackPublish(t *testing.T) {
 		pubs[0].msg.SubdomainID != rwTask.SubdomainID || pubs[0].msg.Variant != rwTask.Variant {
 		t.Errorf("фолбэк-ключ %+v не совпадает с задачей", pubs[0].msg)
 	}
-	// Ни q:analyze, ни маркера: запись ждёт воркера B (ФТ-10).
+	// Neither q:analyze nor a marker: the entry waits for worker B (FR-10).
 	for _, p := range f.q.publishesSnapshot() {
 		if p.stream == queue.StreamAnalyze {
 			t.Errorf("q:analyze публикует воркер B после фолбэка, не первичный: %+v", p)
@@ -123,7 +123,7 @@ func TestRenderWorker_TarpitFallbackPublish(t *testing.T) {
 	if refc := rwRefc(f.pool)[raw]; refc != 1 {
 		t.Errorf("refcount сырого HTML = %d, нужен 1 (ссылка жива)", refc)
 	}
-	// Метрики: публикация с причиной timeout, финализаций нет.
+	// The metrics: a publication with the timeout reason, no finalizations.
 	if got := rwMetricValue(t, reg, "crawler_render_fallback_published_total",
 		map[string]string{"reason": "timeout"}); got != 1 {
 		t.Errorf("crawler_render_fallback_published_total{timeout} = %v, want 1", got)
@@ -137,10 +137,10 @@ func TestRenderWorker_TarpitFallbackPublish(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_TaskFallbackPublish — класс задачи на последней
-// попытке с включённым фолбэком: та же публикация в q:render-fallback
-// вместо маркера, метка причины — код net::ERR_* (словарь
-// taskFinalizeReason, ТЗ §4.6 п.2).
+// TestRenderWorker_TaskFallbackPublish — the task class on the last
+// attempt with the fallback on: the same publication to q:render-fallback
+// instead of the marker, the reason label — the net::ERR_* code (the
+// taskFinalizeReason vocabulary, spec §4.6 item 2).
 func TestRenderWorker_TaskFallbackPublish(t *testing.T) {
 	f := newRWFallbackFixture(t)
 	reg := metrics.New("render-worker")
@@ -153,8 +153,8 @@ func TestRenderWorker_TaskFallbackPublish(t *testing.T) {
 	f.pool.seedRow(rwKey, "https://spa.example/", &raw)
 	f.renderer.err = rwCertErr("https://spa.example/", "net::ERR_CONNECTION_REFUSED")
 
-	// Доставка №3 из 3 (DefaultMaxAttempts): после тарпит-ветки —
-	// ветка последней попытки T-172.
+	// Delivery #3 of 3 (DefaultMaxAttempts): after the tarpit branch —
+	// the T-172 last attempt branch.
 	if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 3); err != nil {
 		t.Fatalf("класс задачи на последней попытке с фолбэком — публикация, не ошибка: %v", err)
 	}
@@ -177,12 +177,12 @@ func TestRenderWorker_TaskFallbackPublish(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_FallbackDisabledTodayBehavior — выключенный фолбэк
-// (дефолт, ФТ-14): финализации работают как сегодня — маркер
-// render_failed_at, публикация q:analyze, ни одной записи в
+// TestRenderWorker_FallbackDisabledTodayBehavior — the fallback off
+// (the default, FR-14): the finalizations work as today — the
+// render_failed_at marker, a q:analyze publication, not a single entry in
 // q:render-fallback.
 func TestRenderWorker_FallbackDisabledTodayBehavior(t *testing.T) {
-	f := newRWFixture(t) // Options{} — фолбэк выключен
+	f := newRWFixture(t) // Options{} — the fallback is off
 	raw := rwTestHash(1)
 	f.pool.seedRow(rwKey, "https://spa.example/", &raw)
 	f.renderer.err = rwTarpitErr("https://spa.example/")
@@ -202,16 +202,16 @@ func TestRenderWorker_FallbackDisabledTodayBehavior(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_FallbackChromiumEngineNotArmed — движковый guard
-// публикации (S-P1-1, ТЗ §6.2 п.2/§6.4 п.1, ФТ-14): на движке сборки
-// chromium — включая пустое значение Options.Engine (сборки без
-// конфигурации) — фолбэк не публикует и при включённом
-// render.fallback.enabled: тарпит T-148 и класс задачи T-172 на
-// последней доставке финализируются как при выключенном фолбэке
-// (маркер render_failed_at + q:analyze), метрика публикаций серий
-// не создаёт.
-// Шаг 1 приёмки (включение фолбэка без смены движка) оставляет
-// q:render-fallback пустой; откат на chromium гасит публикацию сам.
+// TestRenderWorker_FallbackChromiumEngineNotArmed — the engine guard
+// of the publication (S-P1-1, spec §6.2 item 2/§6.4 item 1, FR-14): on the build engine
+// chromium — including an empty Options.Engine value (builds without
+// configuration) — no fallback is published even with
+// render.fallback.enabled on: the tarpit T-148 and the task class T-172 on
+// the last delivery are finalized as with the fallback off
+// (the render_failed_at marker + q:analyze), the publications metric creates no
+// series.
+// Acceptance step 1 (enabling the fallback without changing the engine) leaves
+// q:render-fallback empty; a rollback to chromium puts the publication out by itself.
 func TestRenderWorker_FallbackChromiumEngineNotArmed(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -279,11 +279,11 @@ func TestRenderWorker_FallbackChromiumEngineNotArmed(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_DNSCertNoFallback — движко-независимые причины
-// (ФТ-7): DNS-класс T-211 и cert-класс T-159 финализируются как сегодня
-// — маркер + q:analyze, — фолбэка не получают и при включённом флаге:
-// Chromium DNS-отказ и ошибку сертификата хоста не исправит (ТЗ §4.4
-// п.2).
+// TestRenderWorker_DNSCertNoFallback — the engine-independent reasons
+// (FR-7): the DNS class T-211 and the cert class T-159 are finalized as today
+// — the marker + q:analyze — and get no fallback even with the flag on:
+// Chromium will not fix a host DNS refusal or certificate error (spec §4.4
+// item 2).
 func TestRenderWorker_DNSCertNoFallback(t *testing.T) {
 	cases := []struct {
 		name string
@@ -299,7 +299,7 @@ func TestRenderWorker_DNSCertNoFallback(t *testing.T) {
 			f.pool.seedRow(rwKey, "https://spa.example/", &raw)
 			f.renderer.err = c.err
 
-			// Оба класса финализируются с первой же доставки.
+			// Both classes are finalized from the very first delivery.
 			if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 1); err != nil {
 				t.Fatalf("движко-независимый класс — финализация с первой доставки: %v", err)
 			}
@@ -317,17 +317,17 @@ func TestRenderWorker_DNSCertNoFallback(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_FallbackNoRecursionWorkerB — запрет рекурсии
-// (ФТ-10, ТЗ §4.5 п.2): воркер B — тот же бинарь со стримом потребления
-// q:render-fallback; его движко-зависимый сбой на исчерпании попыток
-// финализируется маркером как сегодня, фолбэк фолбэка не публикуется —
-// стрим всегда один, движок всегда chromium.
+// TestRenderWorker_FallbackNoRecursionWorkerB — the recursion ban
+// (FR-10, spec §4.5 item 2): worker B — the same binary with the consumption
+// stream q:render-fallback; its engine-branched failure on the attempts' exhaustion
+// is finalized with the marker as today, a fallback of the fallback is not published —
+// the stream is always one, the engine is always chromium.
 func TestRenderWorker_FallbackNoRecursionWorkerB(t *testing.T) {
 	f := newRWFallbackFixture(t)
 	var err error
 	f.w, err = New(f.pool, f.q, f.store, f.renderer, Options{
 		Fallback: FallbackOptions{Enabled: true},
-		Stream:   queue.StreamRenderFallback, // сборка воркера B (T-236)
+		Stream:   queue.StreamRenderFallback, // the worker B build (T-236)
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -351,12 +351,12 @@ func TestRenderWorker_FallbackNoRecursionWorkerB(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_FallbackPublishErrorNoMarker — транзакционность
-// композиции «публикация → подтверждение» (ТЗ §4.4 п.1, ФТ-10): сбой
-// публикации q:render-fallback — ошибка без XACK (доставка в
-// redelivery), маркер НЕ стоит, строка не менялась; повторная доставка
-// публикует (фиксация дубля снимается провалом — задача не теряется
-// между фильтром и стримом).
+// TestRenderWorker_FallbackPublishErrorNoMarker — the transactionality
+// of the "publication → acknowledgment" composition (spec §4.4 item 1, FR-10): a
+// q:render-fallback publication failure — an error without an XACK (the delivery to
+// the redelivery), the marker is NOT set, the row did not change; a re-delivery
+// publishes (the duplicate record is removed on failure — the task is not lost
+// between the filter and the stream).
 func TestRenderWorker_FallbackPublishErrorNoMarker(t *testing.T) {
 	f := newRWFallbackFixture(t)
 	raw := rwTestHash(1)
@@ -364,7 +364,7 @@ func TestRenderWorker_FallbackPublishErrorNoMarker(t *testing.T) {
 	f.renderer.err = rwTarpitErr("https://spa.example/")
 	f.q.publishErrs = []error{errors.New("redis недоступен")}
 
-	// Сбой публикации: ошибка, доставка вернётся (redelivery).
+	// A publication failure: an error, the delivery will return (a redelivery).
 	if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 2); err == nil {
 		t.Fatal("сбой публикации q:render-fallback — ошибка (повторная доставка)")
 	}
@@ -375,7 +375,7 @@ func TestRenderWorker_FallbackPublishErrorNoMarker(t *testing.T) {
 		t.Error("rendered должен остаться false")
 	}
 
-	// Повторная доставка: публикация проходит, маркера по-прежнему нет.
+	// A re-delivery: the publication goes through, still no marker.
 	if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 2); err != nil {
 		t.Fatalf("повтор после сбоя публикации обязан опубликовать фолбэк: %v", err)
 	}
@@ -390,8 +390,8 @@ func TestRenderWorker_FallbackPublishErrorNoMarker(t *testing.T) {
 		}
 	}
 	if fb != 2 {
-		// Первая (неудачная) попытка тоже зафиксирована фейком: успешная
-		// публикация одна — фильтр дубля не съел повтор после сбоя.
+		// The first (failed) attempt is also recorded by the fake: there is one
+		// successful publication — the dedup filter did not eat the retry after the failure.
 		t.Errorf("попыток публикации q:render-fallback = %d, нужно 2 (сбой + успех), в стриме — одна", fb)
 	}
 	if row := rwRowSnapshot(f.pool, rwKey); row.failedAt != nil {
@@ -399,12 +399,12 @@ func TestRenderWorker_FallbackPublishErrorNoMarker(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_FallbackDuplicateDelivery — идемпотентность
-// публикации (ТЗ §4.4 п.5, ФТ-11): повторная доставка уже опубликованной
-// записи (сбой XACK после публикации) не даёт вторую запись в стриме —
-// фильтр по идентификатору записи результата; доставка подтверждается
-// без маркера и без q:analyze, метрика публикаций не растёт (публикации
-// не было).
+// TestRenderWorker_FallbackDuplicateDelivery — the publication
+// idempotency (spec §4.4 item 5, FR-11): a re-delivery of an already published
+// row (an XACK failure after the publication) does not give a second entry in the stream —
+// the filter by the result row identifier; the delivery is acknowledged
+// without a marker and without q:analyze, the publications metric does not grow (there
+// was no publication).
 func TestRenderWorker_FallbackDuplicateDelivery(t *testing.T) {
 	f := newRWFallbackFixture(t)
 	reg := metrics.New("render-worker")
@@ -417,11 +417,11 @@ func TestRenderWorker_FallbackDuplicateDelivery(t *testing.T) {
 	f.pool.seedRow(rwKey, "https://spa.example/", &raw)
 	f.renderer.err = rwTarpitErr("https://spa.example/")
 
-	// Первая доставка: публикация в фолбэк.
+	// The first delivery: a fallback publication.
 	if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 2); err != nil {
 		t.Fatalf("фолбэк-публикация: %v", err)
 	}
-	// Дубль: тот же ключ, тот же контент (XACK потерян после публикации).
+	// A duplicate: the same key, the same content (the XACK lost after the publication).
 	if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 2); err != nil {
 		t.Fatalf("дубль доставки подтверждается без ошибки: %v", err)
 	}
@@ -444,12 +444,12 @@ func TestRenderWorker_FallbackDuplicateDelivery(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_FallbackNewEpisodeNotFiltered — идентификатор
-// фильтра — ключ строки + checked_at эпизода: новый эпизод (перепроверка
-// T-058 перезаписала строку) — легитимный новый кандидат, фильтр его не
-// знает; в частности контентно-адресный content_hash НЕ идентифицирует
-// эпизод — новый эпизод с побайтово тем же контентом (хэш совпал,
-// ревью T-238 P1) обязан проходить фолбэк заново.
+// TestRenderWorker_FallbackNewEpisodeNotFiltered — the filter identifier —
+// the row key + the episode's checked_at: a new episode (the recheck
+// T-058 rewrote the row) — a legitimate new candidate, the filter does not
+// know it; in particular the content-addressed content_hash does NOT identify
+// the episode — a new episode with byte-identical content (the hash matched,
+// the T-238 P1 review) must go through the fallback again.
 func TestRenderWorker_FallbackNewEpisodeNotFiltered(t *testing.T) {
 	f := newRWFallbackFixture(t)
 	raw := rwTestHash(1)
@@ -459,9 +459,9 @@ func TestRenderWorker_FallbackNewEpisodeNotFiltered(t *testing.T) {
 	if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 2); err != nil {
 		t.Fatalf("фолбэк-публикация (эпизод 1): %v", err)
 	}
-	// Новый эпизод: перезапись строки T-058 — новый checked_at; контент
-	// побайтово тот же (content_hash совпал — контентный дедуп T-056):
-	// старый ключ фильтра обязан не узнать запись.
+	// A new episode: the T-058 row rewrite — a new checked_at; the content
+	// is byte-identical (the content_hash matched — the content dedup T-056):
+	// the old filter key must not recognize the row.
 	fresh := time.Now().Add(time.Hour)
 	f.pool.rows[rwKey].checkedAt = fresh
 
@@ -479,16 +479,16 @@ func TestRenderWorker_FallbackNewEpisodeNotFiltered(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_FallbackRenderedRowSkipsPublish — строка уже
-// отрендерена (воркер B доработал её между публикацией и поздним
-// дублем доставки; конкурентный рендер): публикация не нужна — доставка
-// подтверждается без маркера, без q:analyze и без второй записи в
-// фолбэке (окно лишнего повторного рендера закрыто, ревью T-238 P3).
+// TestRenderWorker_FallbackRenderedRowSkipsPublish — the row is already
+// rendered (worker B reworked it between the publication and the late
+// delivery duplicate; a concurrent render): no publication needed — the delivery
+// is acknowledged without a marker, without q:analyze and without a second entry in
+// the fallback (the window of an extra repeated render is closed, the T-238 P3 review).
 func TestRenderWorker_FallbackRenderedRowSkipsPublish(t *testing.T) {
 	f := newRWFallbackFixture(t)
 	raw := rwTestHash(1)
 	f.pool.seedRow(rwKey, "https://spa.example/", &raw)
-	f.pool.rows[rwKey].rendered = true // доработал воркер B
+	f.pool.rows[rwKey].rendered = true // worker B reworked it
 	f.renderer.err = rwTarpitErr("https://spa.example/")
 
 	if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 2); err != nil {
@@ -502,16 +502,16 @@ func TestRenderWorker_FallbackRenderedRowSkipsPublish(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_FallbackNoRowNoURL — строки нет или у неё нет
-// итогового URL: фолбэку нечего дорабатывать — штатный отказ без
-// публикаций (как у финализации), доставка подтверждается. Оба уровня:
-// композит processDelivery (ранний отказ ProcessResult) и прямые
-// guard'ы publishFallback (строка исчезла между рендером и публикацией).
+// TestRenderWorker_FallbackNoRowNoURL — there is no row or no final
+// URL: the fallback has nothing to rework — a regular rejection without
+// publications (like the finalization), the delivery is acknowledged. Both levels:
+// the processDelivery composite (the early ProcessResult rejection) and the direct
+// publishFallback guards (the row disappeared between the render and the publication).
 func TestRenderWorker_FallbackNoRowNoURL(t *testing.T) {
 	f := newRWFallbackFixture(t)
 	f.renderer.err = rwTarpitErr("https://spa.example/")
 
-	// Композит: ProcessResult выходит до рендера — не ошибка.
+	// The composite: ProcessResult exits before the render — not an error.
 	if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 2); err != nil {
 		t.Fatalf("строки нет — не ошибка: %v", err)
 	}
@@ -519,9 +519,9 @@ func TestRenderWorker_FallbackNoRowNoURL(t *testing.T) {
 	if err := f.w.processDelivery(context.Background(), rwDelivery("e2"), 2); err != nil {
 		t.Fatalf("без итогового URL — не ошибка: %v", err)
 	}
-	// Прямые guard'ы publishFallback (строку убрала перепроверка после
-	// ошибки рендера): (false, nil) — вызывающий финализирует, там тот
-	// же отказ.
+	// The direct publishFallback guards (the recheck removed the row after
+	// the render error): (false, nil) — the caller finalizes, the same
+	// rejection there.
 	delete(f.pool.rows, rwKey)
 	handled, err := f.w.publishFallback(context.Background(), rwTask, errors.New("тарпит"))
 	if err != nil || handled {
@@ -537,13 +537,13 @@ func TestRenderWorker_FallbackNoRowNoURL(t *testing.T) {
 	}
 }
 
-// Таблица состояний функции-решения (кандидат × гейт × бюджет) —
+// The state table of the decision function (candidate × gate × budget) —
 // TestRenderWorker_FallbackDecision, fallbackgate_test.go (T-239):
-// стаб-тест always-publish T-238 заменён реализацией гейта/бюджета.
+// the always-publish T-238 stub test is replaced by the gate/budget implementation.
 
-// TestRenderWorker_FallbackDedupEviction — ёмкость фильтра: при
-// превышении вытесняется старейший ключ (его дубль становится
-// допустимым — гасится консьюмером B, ФТ-11), недавние остаются.
+// TestRenderWorker_FallbackDedupEviction — the filter's capacity: beyond it
+// the oldest key is evicted (its duplicate becomes
+// allowed — suppressed by consumer B, FR-11), the recent ones stay.
 func TestRenderWorker_FallbackDedupEviction(t *testing.T) {
 	d := newFallbackDedup()
 	if !d.claim("a") {
@@ -565,13 +565,13 @@ func TestRenderWorker_FallbackDedupEviction(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_FallbackDedupRelease — release снимает фиксацию
-// неудавшейся публикации: повторная доставка сохраняет право на
-// публикацию (иначе задача терялась бы между фильтром и стримом);
-// незнакомый ключ — no-op.
+// TestRenderWorker_FallbackDedupRelease — release removes the record
+// of a failed publication: a re-delivery keeps the right to
+// a publication (otherwise the task would be lost between the filter and the stream);
+// an unknown key — a no-op.
 func TestRenderWorker_FallbackDedupRelease(t *testing.T) {
 	d := newFallbackDedup()
-	d.release("unknown") // no-op, не паникует
+	d.release("unknown") // a no-op, does not panic
 	if !d.claim("k") {
 		t.Fatal("первая фиксация обязана проходить")
 	}
@@ -584,9 +584,9 @@ func TestRenderWorker_FallbackDedupRelease(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_FallbackDedupKey — идентификатор записи результата:
-// ключ строки + checked_at эпизода (стабилен в жизни эпизода, меняется
-// перезаписью): разные записи, разные эпизоды — разные идентификаторы.
+// TestRenderWorker_FallbackDedupKey — the result row identifier:
+// the row key + the episode's checked_at (stable over the episode's life, changes
+// on a rewrite): different rows, different episodes — different identifiers.
 func TestRenderWorker_FallbackDedupKey(t *testing.T) {
 	ts := time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC)
 	other := rwTask
@@ -602,21 +602,21 @@ func TestRenderWorker_FallbackDedupKey(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_FallbackConsumedMetrics — учёт потребления фолбэка
-// воркером B (T-245, ТЗ §4.6 п.2, ФТ-15): счётчик
-// crawler_render_fallback_consumed_total растёт только у сборки со
-// стримом q:render-fallback (Options.Stream, ФТ-12) и только на
-// подтверждаемых доставках — по исходам: rendered (успешная доработка:
-// DOM записан, q:analyze), finalized (финализация с маркером —
-// исчерпание фолбэка, ФТ-10), skipped (строки нет — без побочных
-// эффектов). Основная сборка (q:render) счётчик не трогает: серии
-// замкнутого словаря предсозданы нулями у всех сборок (S-P1-4) и
-// остаются нулями — потребление фолбэка учитывает только дорабатывающий
-// воркер. Баланс
-// published = consumed + остаток q:render-fallback — шаг 4 приёмки
-// ТЗ §6.2 (интеграционная сверка — TestAccept03_RenderFallback).
+// TestRenderWorker_FallbackConsumedMetrics — the accounting of the fallback
+// consumption by worker B (T-245, spec §4.6 item 2, FR-15): the
+// crawler_render_fallback_consumed_total counter grows only in the build with
+// the q:render-fallback stream (Options.Stream, FR-12) and only on
+// ack-able deliveries — by the outcomes: rendered (a successful rework:
+// the DOM written, q:analyze), finalized (a finalization with the marker —
+// the fallback exhaustion, FR-10), skipped (no row — without side
+// effects). The main build (q:render) does not touch the counter: the
+// closed vocabulary's series are pre-created with zeros in all builds (S-P1-4) and
+// stay zeros — only the reworking
+// worker counts the fallback consumption. The balance
+// published = consumed + the q:render-fallback remainder — acceptance step 4
+// of spec §6.2 (the integration cross-check — TestAccept03_RenderFallback).
 func TestRenderWorker_FallbackConsumedMetrics(t *testing.T) {
-	// consumedSeries — значение серии исхода (-1 — серии нет).
+	// consumedSeries — the outcome series' value (-1 — no series).
 	consumedSeries := func(t *testing.T, g prometheus.Gatherer, result string) float64 {
 		t.Helper()
 		return rwMetricValue(t, g, "crawler_render_fallback_consumed_total", map[string]string{"result": result})
@@ -627,7 +627,7 @@ func TestRenderWorker_FallbackConsumedMetrics(t *testing.T) {
 		reg := metrics.New("render-fallback-worker")
 		var err error
 		f.w, err = New(f.pool, f.q, f.store, f.renderer, Options{
-			Stream:  queue.StreamRenderFallback, // сборка воркера B (T-236)
+			Stream:  queue.StreamRenderFallback, // the worker B build (T-236)
 			Metrics: reg,
 		})
 		if err != nil {
@@ -655,7 +655,7 @@ func TestRenderWorker_FallbackConsumedMetrics(t *testing.T) {
 		reg := metrics.New("render-fallback-worker")
 		var err error
 		f.w, err = New(f.pool, f.q, f.store, f.renderer, Options{
-			Stream:  queue.StreamRenderFallback, // сборка воркера B (T-236)
+			Stream:  queue.StreamRenderFallback, // the worker B build (T-236)
 			Metrics: reg,
 		})
 		if err != nil {
@@ -665,14 +665,14 @@ func TestRenderWorker_FallbackConsumedMetrics(t *testing.T) {
 		f.pool.seedRow(rwKey, "https://spa.example/", &raw)
 		f.renderer.err = rwTarpitErr("https://spa.example/")
 
-		// Тарпит на исчерпании: воркер B не публикует рекурсивный фолбэк
-		// (ФТ-10) — финализация с маркером (TestRenderWorker_
-		// FallbackNoRecursionWorkerB) = потребление finalized.
+		// A tarpit on exhaustion: worker B does not publish a recursive fallback
+		// (FR-10) — a finalization with the marker (TestRenderWorker_
+		// FallbackNoRecursionWorkerB) = the finalized consumption.
 		if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 2); err != nil {
 			t.Fatalf("processDelivery: %v", err)
 		}
-		// Cert-класс — другой вызов fbConsume в processDelivery (та же
-		// семантика finalized, путь T-159 с первой доставки).
+		// The cert class — another fbConsume call in processDelivery (the same
+		// finalized semantics, the T-159 path from the first delivery).
 		f.renderer.err = rwCertErr("https://spa.example/", "net::ERR_CERT_AUTHORITY_INVALID")
 		if err := f.w.processDelivery(context.Background(), rwDelivery("e2"), 1); err != nil {
 			t.Fatalf("processDelivery (cert): %v", err)
@@ -690,7 +690,7 @@ func TestRenderWorker_FallbackConsumedMetrics(t *testing.T) {
 		reg := metrics.New("render-fallback-worker")
 		var err error
 		f.w, err = New(f.pool, f.q, f.store, f.renderer, Options{
-			Stream:  queue.StreamRenderFallback, // сборка воркера B (T-236)
+			Stream:  queue.StreamRenderFallback, // the worker B build (T-236)
 			Metrics: reg,
 		})
 		if err != nil {
@@ -698,10 +698,10 @@ func TestRenderWorker_FallbackConsumedMetrics(t *testing.T) {
 		}
 		raw := rwTestHash(1)
 		f.pool.seedRow(rwKey, "https://spa.example/", &raw)
-		// Класс браузера (движок недоступен) — инфраструктурная ошибка:
-		// доставка без XACK остаётся в PEL (клейм/bury — очередь),
-		// потреблением не считается — ключевой инвариант баланса
-		// published = consumed + остаток (шаг 4 приёмки ТЗ §6.2).
+		// The browser class (the engine unavailable) — an infrastructure error:
+		// a delivery without an XACK stays in the PEL (a claim/bury — the queue),
+		// it is not counted as consumption — the key invariant of the
+		// published = consumed + remainder balance (acceptance step 4, spec §6.2).
 		f.renderer.err = &render.Error{Class: render.ClassBrowser, URL: "https://spa.example/",
 			Err: errors.New("chromium недоступен")}
 
@@ -720,15 +720,15 @@ func TestRenderWorker_FallbackConsumedMetrics(t *testing.T) {
 		reg := metrics.New("render-fallback-worker")
 		var err error
 		f.w, err = New(f.pool, f.q, f.store, f.renderer, Options{
-			Stream:  queue.StreamRenderFallback, // сборка воркера B (T-236)
+			Stream:  queue.StreamRenderFallback, // the worker B build (T-236)
 			Metrics: reg,
 		})
 		if err != nil {
 			t.Fatalf("New: %v", err)
 		}
-		// Строку не сеем: перепроверка переписала эпизод между публикацией
-		// и потреблением — доставка подтверждается без рендера и маркера,
-		// но потреблением считается (баланс не расходится).
+		// We do not seed the row: the recheck rewrote the episode between the publication
+		// and the consumption — the delivery is acknowledged without a render and a marker,
+		// but it is counted as consumption (the balance does not diverge).
 		if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 1); err != nil {
 			t.Fatalf("processDelivery: %v", err)
 		}
@@ -742,7 +742,7 @@ func TestRenderWorker_FallbackConsumedMetrics(t *testing.T) {
 		reg := metrics.New("render-worker")
 		var err error
 		f.w, err = New(f.pool, f.q, f.store, f.renderer, Options{
-			// Stream — дефолт q:render (основная сборка).
+			// Stream — the default q:render (the main build).
 			Metrics: reg,
 		})
 		if err != nil {

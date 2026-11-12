@@ -1,123 +1,123 @@
-// Автомат режимов читателя воркеров (T-262, ТЗ tasks/TZ-fsm.md §3 ФТ-8):
-// единая точка правды о дискретном режиме горутины чтения стрима
-// потребления цикла Run (q:render / q:render-fallback). До T-262 режим
-// был размазан по порядку if читателя (failed/infraDown/failStreak/
-// infraStreak/rateLim/Alive — шесть переменных кодировали пять
-// режимов, аудит §2 № 8): теперь режим — значение readerMode,
-// выбираемое единственной функцией readerDecide по наблюдениям
-// прохода; порядок приоритетов пауз фиксирует таблица ниже, а не
-// порядок if. Формализация не переписывает цикл на FSM-фреймворк
-// (ТЗ-fsm §1): паузы и чтение остаются шагами читателя, набору
-// наблюдений соответствует ровно один режим. Смежные автоматы:
-// политика исходов доставок — outcomestate.go (T-261), доставка
-// записи — internal/queue/deliverystate.go (T-260); тот же автомат
-// читателя q:http — internal/httpworker/readerstate.go (с общими
-// режимами; там же — recover-паритет паник доставки).
+// The worker reader's mode FSM (T-262, spec tasks/TZ-fsm.md §3 FR-8):
+// the single source of truth about the discrete mode of the stream-reading
+// goroutine of the Run consumption loop (q:render / q:render-fallback). Before T-262 the mode
+// was smeared over the reader's if order (failed/infraDown/failStreak/
+// infraStreak/rateLim/Alive — six variables encoded five
+// modes, audit §2 # 8): now the mode is a readerMode value,
+// chosen by the single readerDecide function from the pass's
+// observations; the pause priority order is fixed by the table below, not by the
+// if order. The formalization does not rewrite the loop on the FSM framework
+// (TZ-fsm §1): pauses and reading remain the reader's steps, exactly one mode
+// corresponds to the set of observations. Related FSMs:
+// the delivery outcome policy — outcomestate.go (T-261), the delivery
+// of an entry — internal/queue/deliverystate.go (T-260); the same FSM
+// of the q:http reader — internal/httpworker/readerstate.go (with shared
+// modes; the recover parity of delivery panics lives there too).
 //
-// # Режимы
+// # Modes
 //
-//	Ч  чтение          пачка доставок читается XREADGROUP (урезанная
-//	                   до слотов окна темпа); попытки доставок
-//	                   расходуются чтением (П1 deliverystate.go)
-//	Б  пауза-браузер   Chromium мёртв (Options.Alive): стрим НЕ
-//	                   читается — доставки остаются в стриме (не в
-//	                   PEL), попытки не горят; перезапуск — менеджер
-//	                   (T-065), читатель только ждёт
-//	И  пауза-инфра     устойчивый InfraError публикации (OOM/
-//	                   соединение Redis, T-152): стрим НЕ читается —
-//	                   попытки не горят; выход — проба записи
-//	                   (Reliab.Writable) или успех обработки
-//	Ф  пауза-          доставки падают подряд (failed ≥ Consume —
-//	   предохранитель  систематический сбой обработки): после паузы
-//	                   проход ЧИТАЕТ — предохранитель душит темп
-//	                   чтения, но не блокирует его до нулевого
-//	                   счётчика (иначе зависший сбой обработки
-//	                   останавливал бы этап навсегда); серию пауз
-//	                   сбрасывает наблюдение нулевого счётчика
-//	                   (подтверждённая доставка)
-//	Т  пауза-темп      потолок потребления исчерпан (окно T-240,
-//	                   ФТ-13 — батч-режим воркера B): стрим НЕ
-//	                   читается до освобождения слота окна
+//	C  reading         a chunk of deliveries is read by XREADGROUP (trimmed
+//	                   to the rate window's slots); delivery attempts
+//	                   are spent by the read (T1 of deliverystate.go)
+//	B  browser pause   Chromium is dead (Options.Alive): the stream is NOT
+//	                   read — deliveries stay in the stream (not in the
+//	                   PEL), attempts are not burned; the restart — the manager
+//	                   (T-065), the reader only waits
+//	I  infra pause     a sustained InfraError of publishing (OOM/
+//	                   the Redis connection, T-152): the stream is NOT read —
+//	                   attempts are not burned; the exit — a write probe
+//	                   (Reliab.Writable) or a processing success
+//	F  fuse            deliveries fail in a row (failed ≥ Consume —
+//	   pause           a systematic processing failure): after the pause
+//	                   the pass READS — the fuse throttles the read
+//	                   rate but does not block it until a zero
+//	                   counter (otherwise a stuck processing failure
+//	                   would stop the stage forever); the pause series
+//	                   is reset by the observation of a zero counter
+//	                   (an acknowledged delivery)
+//	R  rate pause      the consumption cap is exhausted (the T-240 window,
+//	                   FR-13 — worker B's batch mode): the stream is NOT
+//	                   read until a window slot frees up
 //
-// # Переходы: наблюдения прохода → режим (приоритет сверху вниз)
+// # Transitions: the pass's observations → a mode (priority top-down)
 //
-// Каждая строка предполагает, что наблюдения строк выше не выполнены;
-// «—» — значение не наблюдается (датчик не смонтирован) и решением не
-// читается.
+// Each row assumes the observations of the rows above did not hold;
+// "—" — the value is not observed (the sensor is not mounted) and is not read
+// by the decision.
 //
-//	| № | Браузер (browser × alive) | Инфра (infra × writable) | failed | Темп (rate × allowance) | Режим | Действия прохода |
-//	|---|---------------------------|--------------------------|--------|-------------------------|-------|------------------|
-//	| П1 | мёртв (alive=false) | — | — | — | Б | Warn, wait DefaultErrorWait, повторное наблюдение |
-//	| П2 | жив или нет датчика | флаг горит, проба падает (writable=false) | — | — | И | Warn, wait renderFailBackoff(infraStreak), повторное наблюдение |
-//	| П3 | жив или нет датчика | флага нет или проба прошла | > 0 и ≥ batch | — | Ф | Warn, wait renderFailBackoff(failStreak), затем чтение |
-//	| П4 | жив или нет датчика | флага нет или проба прошла | < batch | окно пусто (allowance ≤ 0) | Т | Debug, wait rateWindow.retry, повторное наблюдение |
-//	| П5 | жив или нет датчика | флага нет или проба прошла | < batch | слоты есть (или нет датчика) | Ч | пачка ≤ allowance, XREADGROUP, record в окно темпа |
+//	| # | Browser (browser × alive) | Infra (infra × writable) | failed | Rate (rate × allowance) | Mode | Pass actions |
+//	|---|---------------------------|--------------------------|--------|-------------------------|------|--------------|
+//	| T1 | dead (alive=false) | — | — | — | B | Warn, wait DefaultErrorWait, re-observation |
+//	| T2 | alive or no sensor | the flag is lit, the probe fails (writable=false) | — | — | I | Warn, wait renderFailBackoff(infraStreak), re-observation |
+//	| T3 | alive or no sensor | no flag or the probe passed | > 0 and ≥ batch | — | F | Warn, wait renderFailBackoff(failStreak), then a read |
+//	| T4 | alive or no sensor | no flag or the probe passed | < batch | the window has no free slots (allowance ≤ 0) | R | Debug, wait rateWindow.retry, re-observation |
+//	| T5 | alive or no sensor | no flag or the probe passed | < batch | slots are available (or no sensor) | C | a chunk ≤ allowance, XREADGROUP, record into the rate window |
 //
-// Порядок П1→П4 и есть приоритет: мёртвый браузер важнее инфра-сбоя
-// (без Chromium обработки нет вообще), инфра-сбой важнее предохранителя
-// (черпать пачки между паузами бессмысленно — публикации падают,
-// T-152), предохранитель важнее темпа (систематический сбой обработки
-// перекрывает плановое ограничение), темп — последнее ограничение
-// перед чтением. Пере-наблюдение после паузы предохранителя: за время
-// ожидания окно темпа могло исчерпаться — шаг темпа перед чтением
-// пере-наблюдается (та же пауза Т, попытки не расходуются).
+// The T1→T4 order is the priority itself: a dead browser matters more than an infra failure
+// (without Chromium there is no processing at all), an infra failure matters more than the
+// fuse (drawing chunks between pauses is pointless — publications fail,
+// T-152), the fuse matters more than the rate (a systematic processing failure
+// overrides the planned limitation), the rate is the last limitation
+// before a read. Re-observation after the fuse pause: during the
+// wait the rate window could have been exhausted — the rate step before a read
+// is re-observed (the same R pause, attempts are not spent).
 //
-// # Память и её сбросы
+// # Memory and its resets
 //
-// Режим — функция БЕЗ памяти: повторные наблюдения того же набора
-// дают тот же режим. Памятью обладают только длительности и счётчик:
+// The mode is a function WITHOUT memory: repeated observations of the same set
+// give the same mode. Only the durations and the counter hold memory:
 //
-//	failed       доставок подряд без подтверждения (диспетчер:
-//	             ошибка/паника +1, подтверждение — сброс в 0)
-//	infraStreak  подряд выдержанных пауз И (длительность — удвоение
-//	             renderFailBackoff); сбрасывается возобновлением:
-//	             флаг инфра-сбоя погашен пробой записи или успехом
-//	             обработки
-//	failStreak   подряд выдержанных пауз Ф; сбрасывается наблюдением
-//	             нулевого счётчика failed
+//	failed       deliveries in a row without an acknowledgment (dispatcher:
+//	             an error/panic +1, an acknowledgment — reset to 0)
+//	infraStreak  I pauses endured in a row (the duration — doubling
+//	             renderFailBackoff); reset by resumption:
+//	             the infra-failure flag is extinguished by a write probe or a processing
+//	             success
+//	failStreak   F pauses endured in a row; reset by the observation
+//	             of a zero failed counter
 //
-// # Инварианты
+// # Invariants
 //
-//	И1  Б и И не читают стрим: доставки остаются в стриме (не в PEL)
-//	    — попытки доставок не горят (попытка расходуется только
-//	    доставкой: чтение П1/клейм П4–П7 deliverystate.go).
-//	И2  Ф читает после паузы: предохранитель ограничивает темп
-//	    чтения, но не останавливает его — чтения продолжаются и
-//	    душатся удвоением (TestRenderWorker_RunBackoffOnFailures).
-//	И3  Паника обработки доставки — та же неподтверждённая доставка:
-//	    recover в горутине диспетчера учитывает её в failed (+1),
-//	    доставка без XACK вернётся повторной доставкой (XAUTOCLAIM,
-//	    T-025); серия паник душится предохранителем как серия ошибок
-//	    (TestRenderWorker_RunPanicBackoff), процесс не падает.
-//	И4  Режим прохода выбирает только readerDecide: порядок
-//	    приоритетов существует в одном месте (таблица выше и её
-//	    юнит-тест), собственных условий на паузы, дублирующих таблицу,
-//	    цикл не содержит. Единственная точка выдерживания вне веток
-//	    Б/И/Ф — единый шаг темпа перед чтением: он останавливает
-//	    проход с режимом Т и пере-наблюдает окно после паузы Ф (за
-//	    ожидание окно могло исчерпаться) — как до T-262, когда
-//	    проверка темпа шла после предохранителя; сбросы серий
-//	    выполняются до него (порядок прежний).
+//	I1  B and I do not read the stream: deliveries stay in the stream (not in the PEL)
+//	    — delivery attempts are not burned (an attempt is spent only
+//	    by a delivery: the T1 read / T4–T7 claim of deliverystate.go).
+//	I2  F reads after the pause: the fuse limits the read
+//	    rate but does not stop it — reads continue and
+//	    are throttled by doubling (TestRenderWorker_RunBackoffOnFailures).
+//	I3  A delivery processing panic is the same unacknowledged delivery:
+//	    the recover in the dispatcher goroutine counts it in failed (+1),
+//	    a delivery without XACK will come back with a re-delivery (XAUTOCLAIM,
+//	    T-025); a series of panics is throttled by the fuse as a series of errors
+//	    (TestRenderWorker_RunPanicBackoff), the process does not crash.
+//	I4  Only readerDecide chooses the pass's mode: the
+//	    priority order exists in one place (the table above and its
+//	    unit test), the loop contains no own conditions on pauses
+//	    duplicating the table. The single wait point outside the
+//	    B/I/F branches — the single rate step before a read: it stops
+//	    the pass with mode R and re-observes the window after the F pause (during
+//	    the wait the window could have been exhausted) — as before T-262, when
+//	    the rate check ran after the fuse; the series
+//	    resets run before it (the order is unchanged).
 
 package renderworker
 
 import "fmt"
 
-// readerMode — дискретный режим читателя (ФТ-8): значение автомата,
-// выбираемое readerDecide по наблюдениям прохода. Порядок констант —
-// приоритет пауз таблицы переходов (doc-комментарий файла).
+// readerMode — the reader's discrete mode (FR-8): the FSM value,
+// chosen by readerDecide from the pass's observations. The constant order —
+// the pause priority of the transition table (the file's doc comment).
 type readerMode int8
 
 const (
-	modeConsume      readerMode = iota // Ч: пачка доставок читается
-	modePauseBrowser                   // Б: мёртвый Chromium, стрим не читается
-	modePauseInfra                     // И: InfraError публикации, стрим не читается
-	modePauseFail                      // Ф: предохранитель, после паузы читает
-	modePauseRate                      // Т: потолок темпа, стрим не читается
+	modeConsume      readerMode = iota // C: a chunk of deliveries is read
+	modePauseBrowser                   // B: dead Chromium, the stream is not read
+	modePauseInfra                     // I: an InfraError of publishing, the stream is not read
+	modePauseFail                      // F: the fuse, after the pause it reads
+	modePauseRate                      // R: the rate cap, the stream is not read
 )
 
-// String — имя режима (термины таблицы переходов) для сообщений
-// тестов.
+// String — the mode name (the transition table's terms) for
+// test messages.
 func (m readerMode) String() string {
 	switch m {
 	case modeConsume:
@@ -134,29 +134,29 @@ func (m readerMode) String() string {
 	return fmt.Sprintf("readerMode(%d)", int8(m))
 }
 
-// readerObs — наблюдения одного прохода читателя (ФТ-8): вход
-// readerDecide. Поля идут парами «датчик × значение»: несмонтированный
-// датчик (browser — Options.Alive, rate — окно темпа T-240) не
-// опрашивается, его значение решением не читается; writable
-// наблюдается только при горящем флаге infra (проба записи — один SET,
-// T-152: здоровый цикл Redis не дёргает).
+// readerObs — the observations of one reader pass (FR-8): the input of
+// readerDecide. Fields go in "sensor × value" pairs: an unmounted
+// sensor (browser — Options.Alive, rate — the rate window T-240) is not
+// polled, its value is not read by the decision; writable
+// is observed only with the infra flag lit (the write probe is one SET,
+// T-152: a healthy Redis loop does not trigger it).
 type readerObs struct {
-	browser   bool  // смонтирован зонд браузера (Options.Alive)
-	alive     bool  // браузер жив (наблюдается при browser)
-	infra     bool  // горит флаг устойчивого инфра-сбоя публикации (T-152)
-	writable  bool  // проба записи Redis прошла (наблюдается при infra)
-	failed    int64 // доставок подряд без подтверждения (счётчик диспетчера)
-	batch     int   // пачка чтения (Options.Consume) — порог предохранителя
-	rate      bool  // смонтирован потолок темпа (Options.Rate > 0)
-	allowance int   // свободные слоты окна темпа (наблюдается при rate)
+	browser   bool  // the browser probe is mounted (Options.Alive)
+	alive     bool  // the browser is alive (observed with browser)
+	infra     bool  // the sustained infra failure flag of publishing is lit (T-152)
+	writable  bool  // the Redis write probe passed (observed with infra)
+	failed    int64 // deliveries in a row without an ack (the dispatcher's counter)
+	batch     int   // the read chunk (Options.Consume) — the fuse threshold
+	rate      bool  // the rate cap is mounted (Options.Rate > 0)
+	allowance int   // the free slots of the rate window (observed with rate)
 }
 
-// readerDecide — единственная функция переходов автомата режимов
-// (ФТ-8): наблюдения прохода → режим, приоритет П1→П4 таблицы
-// переходов (doc-комментарий файла), а не порядок if цикла. Без
-// памяти: серии пауз (длительности) и счётчик failed живут в цикле.
-// Условие предохранителя требует failed > 0: нулевой счётчик — не
-// пауза при любом batch (ветка сброса серии исходного читателя).
+// readerDecide — the single function of the mode FSM's
+// transitions (FR-8): the pass's observations → a mode, the priority T1→T4 of the
+// transition table (the file's doc comment), not the if order of the loop. Without
+// memory: the pause series (durations) and the failed counter live in the loop.
+// The fuse condition requires failed > 0: a zero counter — not
+// a pause with any batch (the branch resetting the series of the original reader).
 func readerDecide(o readerObs) readerMode {
 	switch {
 	case o.browser && !o.alive:

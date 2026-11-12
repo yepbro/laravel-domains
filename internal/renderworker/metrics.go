@@ -1,27 +1,27 @@
-// Приборы этапа рендера (T-077, ТЗ 5.9): пропускная способность (счётчик
-// задач и гистограмма длительностей), ошибки по классам render.Class
-// (task/context/browser — реакция этапа на сбой, T-061/T-063: повтор
-// страницы, контекста или перезапуск браузера), доля рендера — ветка
-// rendered=true счётчика crawler_render_records_total (ветку false
-// наращивает HTTP-этап после записи результата; доля — отношением rate
-// в PromQL), тарпит-финализации без рендера (T-148), финализации по
-// постоянной ошибке сертификата хоста (T-159), финализации по DNS-отказу
-// хоста (T-211), финализации ошибки класса задачи на последней попытке
-// с меткой причины (T-172), публикации в очередь фолбэка с меткой
-// причины (T-238, ТЗ §4.6 п.2 — числитель fallback-рейта, ФТ-15),
-// события приостановки фолбэк-публикации с меткой причины gate|budget
-// (T-239, ФТ-9, ТЗ §4.6 п.2), потребление фолбэка воркером B с меткой
-// исхода rendered|finalized|skipped (T-245, ТЗ §4.6 п.2, ФТ-11/ФТ-15 —
-// баланс published = consumed + остаток q:render-fallback, шаг 4
-// приёмки ТЗ §6.2); метка движка engine на доле рендера,
-// тарпит-финализациях (S-P2-4: тарпит — движко-зависимый отказ) и
-// финализациях класса задачи (T-235, ТЗ §4.6 п.1, ФТ-15:
-// кардинальность 3 — chromium/moli/lightpanda, значение — движок
-// сборки воркера, Options.Engine ← render.engine; существующие
-// агрегации без engine не меняются); предсоздание нулевых серий
-// замкнутых словарей suspended{gate,budget} и
-// consumed{rendered,finalized,skipped} (S-P1-4): семейства видны в
-// экспозиции с первого старта, первое событие счётчика не теряется.
+// Render stage metrics (T-077, spec 5.9): throughput (the task counter
+// and the duration histogram), errors by render.Class classes
+// (task/context/browser — the stage's reaction to a failure, T-061/T-063: a retry
+// of the page, of the context, or a browser restart), the render share — the
+// rendered=true branch of the crawler_render_records_total counter (the false branch
+// is incremented by the HTTP stage after writing the result; the share — by the rate ratio
+// in PromQL), tarpit finalizations without a render (T-148), finalizations on a
+// permanent host certificate error (T-159), finalizations on a host DNS
+// refusal (T-211), finalizations of a task-class error on the last attempt
+// with a reason label (T-172), publications to the fallback queue with a
+// reason label (T-238, spec §4.6 item 2 — the numerator of the fallback rate, FR-15),
+// fallback publication suspension events with a gate|budget reason label
+// (T-239, FR-9, spec §4.6 item 2), fallback consumption by worker B with an
+// outcome label rendered|finalized|skipped (T-245, spec §4.6 item 2, FR-11/FR-15 —
+// the balance published = consumed + the q:render-fallback remainder, step 4
+// of the spec acceptance §6.2); the engine label on the render share,
+// tarpit finalizations (S-P2-4: a tarpit is an engine-branched failure) and
+// task class finalizations (T-235, spec §4.6 item 1, FR-15:
+// cardinality 3 — chromium/moli/lightpanda, the value — the engine
+// of the worker's build, Options.Engine ← render.engine; existing
+// aggregations without engine do not change); pre-creation of zero series of
+// the closed vocabularies suspended{gate,budget} and
+// consumed{rendered,finalized,skipped} (S-P1-4): the families are visible in
+// the exposition from the first start, the counter's first event is not lost.
 package renderworker
 
 import (
@@ -34,46 +34,46 @@ import (
 	"crawler/internal/render"
 )
 
-// Package-уровневые константы ниже — словарь причин приостановки.
+// The package-level constants below — the vocabulary of suspension reasons.
 const (
-	// fbReasonGate — health-гейт (ФТ-9а): стрик инфра-ошибок класса
-	// браузера достиг render.fallback.health_gate_streak — основной
-	// движок нездоров, фолбэк-публикация приостановлена до
-	// восстановления (T-239).
+	// fbReasonGate — the health gate (FR-9a): the streak of infra errors of the
+	// browser class reached render.fallback.health_gate_streak — the main
+	// engine is unhealthy, the fallback publication is suspended until
+	// recovery (T-239).
 	fbReasonGate = "gate"
-	// fbReasonBudget — бюджет доли (ФТ-9б): доля публикаций за окно
-	// ушла за потолок render.fallback.share_percent — следующее окно
-	// без публикаций (T-239).
+	// fbReasonBudget — the share budget (FR-9b): the share of publications over the window
+	// went beyond the render.fallback.share_percent cap — the next window
+	// without publications (T-239).
 	fbReasonBudget = "budget"
 )
 
-// Словарь исходов потребления фолбэка (T-245, ФТ-15): метка result
-// счётчика crawler_render_fallback_consumed_total — чем закончилась
-// доставка q:render-fallback у воркера B.
+// The vocabulary of fallback consumption outcomes (T-245, FR-15): the result label
+// of the crawler_render_fallback_consumed_total counter — what the
+// q:render-fallback delivery ended with at worker B.
 const (
-	// fbResultRendered — доработка успешна (ТЗ §4.5 п.2): DOM записан,
-	// rendered = true, публикация q:analyze.
+	// fbResultRendered — the rework succeeded (spec §4.5 item 2): the DOM is written,
+	// rendered = true, a q:analyze publication.
 	fbResultRendered = "rendered"
-	// fbResultFinalized — фолбэк исчерпан (ФТ-10): запись финализирована
-	// с маркером render_failed_at, публикация q:analyze (пути тарпита
-	// T-148 / класса задачи T-172 / cert T-159 / DNS T-211 воркера B).
+	// fbResultFinalized — the fallback is exhausted (FR-10): the entry is finalized
+	// with the render_failed_at marker, a q:analyze publication (the tarpit paths
+	// T-148 / task class T-172 / cert T-159 / DNS T-211 of worker B).
 	fbResultFinalized = "finalized"
-	// fbResultSkipped — штатный отказ без побочных эффектов: строки нет
-	// или без итогового URL (перепроверка переписала эпизод) — доставка
-	// подтверждается без рендера и маркера.
+	// fbResultSkipped — a regular rejection without side effects: there is no row
+	// or no final URL (a recheck rewrote the episode) — the delivery
+	// is acknowledged without a render and a marker.
 	fbResultSkipped = "skipped"
 )
 
-// renderSecondsBuckets — корзины длительности задачи рендера: страница
-// рендерится в изолированном контексте с ожиданием готовности до
-// render.timeout (по умолчанию 25 с, ТЗ 5.6/5.10), быстрые статические
-// страницы — единицы секунд.
+// renderSecondsBuckets — the render task duration buckets: a page
+// renders in an isolated context with a readiness wait of up to
+// render.timeout (25 s by default, spec 5.6/5.10), fast static
+// pages — a few seconds.
 var renderSecondsBuckets = []float64{0.5, 1, 2.5, 5, 10, 15, 20, 25, 30}
 
-// Metrics — приборы этапа рендера; строится NewMetrics из реестра
-// сервиса, nil — все методы no-op (изолированные сборки).
-// Потокобезопасен: доставки идут параллельно, приборы prometheus
-// синхронизированы.
+// Metrics — the render stage metrics; built by NewMetrics from the registry
+// of the service, nil — all methods are no-ops (isolated builds).
+// Thread-safe: deliveries go in parallel, the prometheus metrics
+// are synchronized.
 type Metrics struct {
 	tasks    prometheus.Counter     // crawler_stage_tasks_total{stage="render"}
 	seconds  prometheus.Observer    // crawler_stage_seconds{stage="render"}
@@ -86,29 +86,29 @@ type Metrics struct {
 	fallback *prometheus.CounterVec // crawler_render_fallback_published_total{reason} (T-238)
 	suspend  *prometheus.CounterVec // crawler_render_fallback_suspended_total{reason} (T-239)
 	consumed *prometheus.CounterVec // crawler_render_fallback_consumed_total{result} (T-245)
-	engine   string                 // значение метки engine — движок сборки воркера (T-235)
+	engine   string                 // the engine label value — the engine of the worker's build (T-235)
 }
 
-// NewMetrics регистрирует приборы этапа в реестре reg (каррированные по
-// service и stage); nil — nil. Идемпотентен (T-076). engine — значение
-// метки движка (T-235, ТЗ §4.6 п.1, ФТ-15) на crawler_render_records_total
-// и crawler_render_task_finalized_total: движок сборки воркера
-// (Options.Engine ← render.engine, словарь config.Engine*), кардинальность
-// 3 — chromium/moli/lightpanda; словарь и связку «движок × remote_url ×
-// порог памяти» уже проверили config.Validate и render.Options.validate,
-// воркер значение не перепроверяет — неизвестный движок сборка рендера
-// отвергает раньше старта воркера. Пустое значение — chromium, как у
-// render.Options.Engine (сборки без конфигурации); нормализация здесь —
-// кардинальность метки держит владелец приборов. Замкнутые словари
-// событий приостановки (gate|budget) и потребления фолбэка
-// (rendered|finalized|skipped) предсоздаются нулевыми сериями (S-P1-4,
-// решение оператора): семейства видны в экспозиции с первого старта —
-// алерты/панель не ждут первого события и не теряют его (до
-// предсоздания первая точка ленивого счётчика базировала prev зонда и
-// событие 0→1 пропускалось); открытые словари (reason кодов net::ERR_* —
-// fallback{reason}, tasksFin{reason,engine}) предсоздать нельзя и не
-// нужно: коды не перечислимы, серия рождается первой финализацией с
-// этим кодом.
+// NewMetrics registers the stage metrics in the reg registry (curried by
+// service and stage); nil — nil. Idempotent (T-076). engine — the value
+// of the engine label (T-235, spec §4.6 item 1, FR-15) on crawler_render_records_total
+// and crawler_render_task_finalized_total: the engine of the worker's build
+// (Options.Engine ← render.engine, the config.Engine* vocabulary), cardinality
+// 3 — chromium/moli/lightpanda; the vocabulary and the "engine × remote_url ×
+// memory threshold" bundle were already checked by config.Validate and render.Options.validate,
+// the worker does not re-check the value — an unknown engine is rejected by the render build
+// before the worker starts. An empty value — chromium, like
+// render.Options.Engine (builds without configuration); the normalization here —
+// the label cardinality is owned by the metrics owner. The closed vocabularies
+// of suspension events (gate|budget) and fallback consumption
+// (rendered|finalized|skipped) are pre-created with zero series (S-P1-4,
+// an operator decision): the families are visible in the exposition from the first start —
+// alerts/the panel do not wait for the first event and do not lose it (before
+// pre-creation the first point of the lazy counter grounded the probe's prev and
+// the 0→1 event was missed); the open vocabularies (reason codes net::ERR_* —
+// fallback{reason}, tasksFin{reason,engine}) cannot and need not be pre-created:
+// the codes are not enumerable, a series is born by the first finalization with
+// that code.
 func NewMetrics(reg *metrics.Registry, engine string) *Metrics {
 	if reg == nil {
 		return nil
@@ -164,11 +164,11 @@ func NewMetrics(reg *metrics.Registry, engine string) *Metrics {
 			Help: "Задачи q:render-fallback, потреблённые chromium-воркером B (T-245, ТЗ 4.5/4.6 п.2, ФТ-11/ФТ-15), по исходу доставки, завершившейся обработкой без ошибки: result=rendered — доработка успешна (DOM записан, rendered=true, публикация q:analyze, ТЗ 4.5 п.2); result=finalized — фолбэк исчерпан, запись закрыта путём финализации (маркер render_failed_at + публикация q:analyze, ФТ-10: пути тарпита T-148 / класса задачи T-172 / cert T-159 / DNS T-211; маркер ставится, пока строка принадлежит эпизоду — гонка с перепроверкой T-058 закрывает запись без маркера); result=skipped — штатный отказ без побочных эффектов (строки нет, без итогового URL или охрана UPDATE отсекла — строка ушла из-под задачи). Счёт — в обработчике до XACK уровнем очереди: сбой Ack или повторная доставка дают дубль — допуск единиц at-least-once (как у окна бюджета T-239); ошибочные доставки не считаются — живут в PEL до клейма либо bury в q:dead. Баланс-чек приёмки (ТЗ 6.2 п.4): crawler_render_fallback_published_total (воркер A, T-238) = сумма этого счётчика + остаток q:render-fallback — crawler_queue_depth{queue=\"q:render-fallback\"} воркера B (backlog группы: непрочитанный лаг + PEL; держится до потолка MAXLEN стрима) + increase(crawler_queue_dead_buried_total{queue=\"q:render-fallback\"}) + increase(crawler_queue_dead_unidentified_total{queue=\"q:render-fallback\"}) (неидентифицируемые записи без task_id, T-260 — стационарно ноль). Считает только сборка воркера B (Options.Stream = q:render-fallback, ФТ-12): серии замкнутого словаря трёх исходов предсозданы нулевыми у всех сборок (S-P1-4 — семейство в экспозиции с первого старта), растут только у воркера B: у основной сборки живут нулями.",
 		}, "result"),
 	}
-	// Предсоздание нулевых серий замкнутых словарей (S-P1-4): оба
-	// семейства экспортируются с момента старта (нулями), алерт бюджета
-	// и панель не ждут первого события; растут серии только в
-	// вооружённой сборке (suspend — движок-кандидат, consumed — воркер
-	// B), у остальных сборок живут нулями.
+	// Pre-creation of zero series of the closed vocabularies (S-P1-4): both
+	// families are exported from the start (with zeros), the budget alert
+	// and the panel do not wait for the first event; the series grow only in
+	// the armed build (suspend — the candidate engine, consumed — worker
+	// B), the other builds keep them at zeros.
 	m.suspend.WithLabelValues(fbReasonGate).Add(0)
 	m.suspend.WithLabelValues(fbReasonBudget).Add(0)
 	m.consumed.WithLabelValues(fbResultRendered).Add(0)
@@ -177,9 +177,9 @@ func NewMetrics(reg *metrics.Registry, engine string) *Metrics {
 	return m
 }
 
-// Task — задача q:render обработана успешно (включая штатный отказ —
-// строки нет или ушла из-под задачи): +1 задача этапа, длительность
-// в гистограмму.
+// Task — the q:render task processed successfully (including a regular rejection —
+// no row or it slipped out from under the task): +1 stage task, the duration
+// into the histogram.
 func (m *Metrics) Task(d time.Duration) {
 	if m == nil {
 		return
@@ -188,8 +188,8 @@ func (m *Metrics) Task(d time.Duration) {
 	m.seconds.Observe(d.Seconds())
 }
 
-// Rendered — DOM записан в строку (rendered = true, ТЗ 5.6): +1 в ветку
-// rendered=true счётчика доли рендера (с меткой engine сборки, T-235).
+// Rendered — the DOM is written into the row (rendered = true, spec 5.6): +1 into the
+// rendered=true branch of the render share counter (with the build's engine label, T-235).
 func (m *Metrics) Rendered() {
 	if m == nil {
 		return
@@ -197,10 +197,10 @@ func (m *Metrics) Rendered() {
 	m.rendered.Inc()
 }
 
-// TarpitFinalized — запись финализирована без рендера по исчерпании
-// лимита таймаутов (T-148): +1 в счётчик тарпит-финализаций с меткой
-// engine сборки (S-P2-4) — движко-зависимый отказ атрибутируется
-// движку (материал тарпит-рейта движка на панели).
+// TarpitFinalized — the entry is finalized without a render after the
+// timeout limit is exhausted (T-148): +1 into the tarpit finalization counter with the
+// build's engine label (S-P2-4) — an engine-branched failure is attributed
+// to the engine (the material of the engine's tarpit rate on the panel).
 func (m *Metrics) TarpitFinalized() {
 	if m == nil {
 		return
@@ -208,10 +208,10 @@ func (m *Metrics) TarpitFinalized() {
 	m.tarpits.WithLabelValues(m.engine).Inc()
 }
 
-// CertFinalized — запись финализирована без рендера по постоянной ошибке
-// сертификата хоста (T-159): +1 в счётчик cert-финализаций — материал
-// критерия «суточный прирост q:dead от cert-класса = 0» (рост счётчика
-// при нулевом приросте q:dead — политика работает).
+// CertFinalized — the entry is finalized without a render on a permanent
+// host certificate error (T-159): +1 into the cert finalization counter — the material
+// of the criterion "the daily q:dead growth from the cert class = 0" (counter growth
+// with a zero q:dead growth — the policy works).
 func (m *Metrics) CertFinalized() {
 	if m == nil {
 		return
@@ -219,11 +219,11 @@ func (m *Metrics) CertFinalized() {
 	m.certs.Inc()
 }
 
-// DNSFinalized — запись финализирована без рендера по DNS-отказу хоста
-// (T-211): +1 в счётчик DNS-финализаций — материал критерия «−2
-// доставки и −20 мин PEL на мёртвом хосте» (замер T-207: 252+186
-// финализаций в сутки; рост счётчика при нулевом приросте q:dead —
-// политика работает).
+// DNSFinalized — the entry is finalized without a render on a host DNS refusal
+// (T-211): +1 into the DNS finalization counter — the material of the criterion "−2
+// deliveries and −20 min of PEL on a dead host" (the T-207 measurement: 252+186
+// finalizations per day; counter growth with a zero q:dead growth —
+// the policy works).
 func (m *Metrics) DNSFinalized() {
 	if m == nil {
 		return
@@ -231,12 +231,12 @@ func (m *Metrics) DNSFinalized() {
 	m.dns.Inc()
 }
 
-// TaskFinalized — запись финализирована без рендера по ошибке класса
-// задачи на последней доставке (T-172): +1 в счётчик финализаций с
-// меткой причины (код net::ERR_* / timeout / other) и меткой engine
-// сборки (T-235) — материал критерия «суточный прирост q:dead от
-// q:render = 0» и видимости состава причин (что именно доезжало до
-// q:dead прежде).
+// TaskFinalized — the entry is finalized without a render on a task class
+// error on the last delivery (T-172): +1 into the finalization counter with a
+// reason label (the net::ERR_* / timeout / other code) and the build's engine
+// label (T-235) — the material of the criterion "the daily q:dead growth from
+// q:render = 0" and the visibility of the reason composition (what exactly used to reach
+// q:dead before).
 func (m *Metrics) TaskFinalized(reason string) {
 	if m == nil {
 		return
@@ -244,13 +244,13 @@ func (m *Metrics) TaskFinalized(reason string) {
 	m.tasksFin.WithLabelValues(reason, m.engine).Inc()
 }
 
-// FallbackPublished — задача опубликована в q:render-fallback из пути
-// финализации без рендера (T-238): +1 с меткой причины (словарь
-// taskFinalizeReason — код net::ERR_* / timeout / other, тот же, что у
-// TaskFinalized). Числитель fallback-рейта (ФТ-15: доля публикаций
-// против потока этапа — штатный индикатор здоровья основного движка).
-// Дубль доставки (стрим уже ждёт запись) методом не считается —
-// публикация не выполнялась (publishFallback).
+// FallbackPublished — the task is published to q:render-fallback from the finalization
+// path without a render (T-238): +1 with a reason label (the vocabulary
+// taskFinalizeReason — the net::ERR_* / timeout / other code, the same as for
+// TaskFinalized). The numerator of the fallback rate (FR-15: the share of publications
+// against the stage flow — the regular health indicator of the main engine).
+// A delivery duplicate (the entry is already in the stream) is not counted by the method —
+// no publication happened (publishFallback).
 func (m *Metrics) FallbackPublished(reason string) {
 	if m == nil {
 		return
@@ -258,14 +258,14 @@ func (m *Metrics) FallbackPublished(reason string) {
 	m.fallback.WithLabelValues(reason).Inc()
 }
 
-// FallbackSuspended — событие приостановки фолбэк-публикации (T-239,
-// ФТ-9, ТЗ §4.6 п.2): +1 с меткой причины (замкнутый словарь
-// fbReasonGate/fbReasonBudget — «gate»/«budget»). Событие, не
-// состояние: одна точка на защёлкивание приостановки — гейт закрылся
-// стриком инфра-ошибок класса браузера (движок нездоров) или окно
-// бюджета перерасходовало потолок доли; пока приостановка держится,
-// кандидаты финализируются штатно с маркером. Материал алертов
-// деградации основного движка (ТЗ §4.6 п.3).
+// FallbackSuspended — a fallback publication suspension event (T-239,
+// FR-9, spec §4.6 item 2): +1 with a reason label (the closed vocabulary
+// fbReasonGate/fbReasonBudget — "gate"/"budget"). An event, not
+// a state: one point per suspension latching — the gate closed
+// on a streak of infra errors of the browser class (the engine is unhealthy) or the budget window
+// overspent the share cap; while the suspension holds,
+// candidates are finalized regularly with the marker. The material of the
+// main engine degradation alerts (spec §4.6 item 3).
 func (m *Metrics) FallbackSuspended(reason string) {
 	if m == nil {
 		return
@@ -273,17 +273,17 @@ func (m *Metrics) FallbackSuspended(reason string) {
 	m.suspend.WithLabelValues(reason).Inc()
 }
 
-// FallbackConsumed — доставка q:render-fallback обработана воркером B
-// без ошибки (T-245, ТЗ §4.6 п.2, ФТ-15): +1 с меткой исхода (замкнутый
-// словарь fbResult*): rendered — доработка успешна, finalized — запись
-// закрыта путём финализации после исчерпания фолбэка (ФТ-10), skipped —
-// штатный отказ без побочных эффектов. Знаменатель баланса published =
-// consumed + остаток q:render-fallback + похороненные в q:dead (шаг 4
-// приёмки ТЗ §6.2): доставка без ошибки уходит из PEL стрима XACK'ом
-// уровнем очереди (счёт до него — дубль от сбоя XACK допустим, единицы
-// at-least-once), ошибочная — живёт в PEL до клейма либо bury (в баланс
-// — членом crawler_queue_dead_buried_total). Вызывает только сборка
-// воркера B (Options.Stream = q:render-fallback, worker.fbConsume).
+// FallbackConsumed — the q:render-fallback delivery processed by worker B
+// without an error (T-245, spec §4.6 item 2, FR-15): +1 with an outcome label (the closed
+// vocabulary fbResult*): rendered — the rework succeeded, finalized — the entry
+// was closed by the finalization path after the fallback was exhausted (FR-10), skipped —
+// a regular rejection without side effects. The denominator of the balance published =
+// consumed + the q:render-fallback remainder + those buried in q:dead (step 4
+// of the spec acceptance §6.2): a delivery without an error leaves the stream's PEL with an XACK
+// at the queue level (counting before it — a duplicate from an XACK failure is allowed, a few
+// at-least-once units), a failed one — stays in the PEL until a claim or a bury (into the balance
+// as a member of crawler_queue_dead_buried_total). Called only by the worker B build
+// (Options.Stream = q:render-fallback, worker.fbConsume).
 func (m *Metrics) FallbackConsumed(result string) {
 	if m == nil {
 		return
@@ -291,8 +291,8 @@ func (m *Metrics) FallbackConsumed(result string) {
 	m.consumed.WithLabelValues(result).Inc()
 }
 
-// Error — задача рендера не подтверждена (вернётся повторной доставкой):
-// +1 в счётчик ошибок этапа по классу render.ClassOf.
+// Error — the render task is not acknowledged (it will come back with a re-delivery):
+// +1 into the stage error counter by the render.ClassOf class.
 func (m *Metrics) Error(class render.Class) {
 	if m == nil {
 		return

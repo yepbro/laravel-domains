@@ -1,14 +1,14 @@
-// Юнит-тесты render-worker (T-067; ТЗ 5.6, §5.7, §7, 3.4) на фейковых
-// пуле, хранилище, рендере и очереди — без БД, Redis, Chromium и сети.
-// Фейковый пул живёт семантикой subdomain_results (SELECT цели, UPDATE с
-// оптимистической охраной content_hash) и contents (refcount для
-// SwapRefTx, T-044); фейковое хранилище связано с пулом таблицей contents
-// (Put +1, Delete −1) — баланс ссылок проверяется сквозняком. Проверяются
-// точные SQL и параметры UPDATE, порядок «рендер → Put → транзакция →
-// публикация q:analyze → XACK», идемпотентность повторной доставки,
-// гонки (строка ушла из-под задачи), сбои шагов и отмена ctx; smoke —
-// цикл Run. Живой конвейер рендера (Chromium + БД + Redis) —
-// интеграционные тесты поздних задач.
+// Unit tests of the render-worker (T-067; spec 5.6, §5.7, §7, 3.4) over fake
+// pool, storage, render and queue — without a DB, Redis, Chromium and the network.
+// The fake pool lives the subdomain_results semantics (the target SELECT, an UPDATE with
+// the optimistic content_hash guard) and contents (the refcount for
+// SwapRefTx, T-044); the fake storage is linked with the pool by the contents table
+// (Put +1, Delete −1) — the reference balance is checked end-to-end. Checked:
+// the exact SQL and parameters of the UPDATE, the order "render → Put → transaction →
+// q:analyze publication → XACK", the re-delivery idempotency,
+// races (the row slipped out from under the task), step failures and ctx cancellation; smoke —
+// the Run loop. The live render pipeline (Chromium + DB + Redis) —
+// the integration tests of the later tasks.
 package renderworker
 
 import (
@@ -33,9 +33,9 @@ import (
 	"crawler/internal/render"
 )
 
-// --- протокол событий (порядок «рендер → Put → транзакция → публикация») -----
+// --- event protocol (the "render → Put → transaction → publication" order) ----
 
-// rwEventKind — тип события протокола; порядок проверяется индексами.
+// rwEventKind — the protocol event's kind; the order is checked by indexes.
 type rwEventKind string
 
 const (
@@ -45,19 +45,19 @@ const (
 	rwEvBegin   rwEventKind = "begin"
 	rwEvUpdate  rwEventKind = "update"
 	rwEvSwap    rwEventKind = "swapref"
-	rwEvTail    rwEventKind = "bump-tail"     // дельта корзины неанализированных хвостов (T-204)
-	rwEvBump    rwEventKind = "bump-rendered" // дельта корзины rendered-темпа (T-203)
+	rwEvTail    rwEventKind = "bump-tail"     // the delta of the unanalyzed tails bucket (T-204)
+	rwEvBump    rwEventKind = "bump-rendered" // the delta of the rendered-rate bucket (T-203)
 	rwEvCommit  rwEventKind = "commit"
 	rwEvPublish rwEventKind = "publish"
 	rwEvAck     rwEventKind = "ack"
 )
 
-// rwJournal — потокобезопасный протокол (цикл Run работает в горутине).
+// rwJournal — the thread-safe protocol (the Run loop runs in a goroutine).
 type rwJournal struct {
 	mu     sync.Mutex
 	events []rwEventKind
 
-	// ackNotify — неблокирующий сигнал на каждое Ack (синхронизация smoke).
+	// ackNotify — a non-blocking signal per every Ack (the smoke sync).
 	ackNotify chan struct{}
 }
 
@@ -86,7 +86,7 @@ func (j *rwJournal) indexOf(k rwEventKind) int {
 	return -1
 }
 
-// countEvents — число событий вида (фиксация факта «не ноль»).
+// countEvents — the number of events of the kind (fixing the "not zero" fact).
 func (j *rwJournal) countEvents(k rwEventKind) int {
 	j.mu.Lock()
 	defer j.mu.Unlock()
@@ -109,9 +109,9 @@ func (j *rwJournal) signalAck() {
 	}
 }
 
-// --- фейковый pgx-пул: subdomain_results + contents --------------------------
+// --- the fake pgx pool: subdomain_results + contents --------------------------
 
-// rwRowKey — PK subdomain_results в фейке.
+// rwRowKey — the subdomain_results PK in the fake.
 type rwRowKey struct {
 	zone      int16
 	domain    int64
@@ -119,54 +119,54 @@ type rwRowKey struct {
 	variant   int16
 }
 
-// rwRow — строка subdomain_results, которую читает renderSelectSQL и
-// меняют renderUpdateSQL (успешный рендер) и renderFailMarkerSQL
-// (маркер «рендер невозможен», T-210).
+// rwRow — a subdomain_results row read by renderSelectSQL and
+// changed by renderUpdateSQL (a successful render) and renderFailMarkerSQL
+// (the "render impossible" marker, T-210).
 type rwRow struct {
 	finalURL  *string
-	hash      []byte // nil — NULL (контента нет, T-056)
+	hash      []byte // nil — NULL (no content, T-056)
 	rendered  bool
-	failedAt  *time.Time // штамп «рендер невозможен» (T-210); nil — маркера нет
+	failedAt  *time.Time // the "render impossible" stamp (T-210); nil — no marker
 	cookies   *string
 	headers   *string
-	checkedAt time.Time // час корзины rendered-темпа (T-203)
+	checkedAt time.Time // the hour of the rendered-rate bucket (T-203)
 }
 
-// rwRowCheckedAt — фиксированный момент эпизода строк сида: корзина
-// rendered-темпа фейка — одно значение (имя часа вычисляет БД).
+// rwRowCheckedAt — a fixed moment of the seed rows' episode: the fake's
+// rendered-rate bucket is a single value (the DB computes the hour name).
 var rwRowCheckedAt = time.Date(2026, 10, 26, 12, 0, 0, 0, time.UTC)
 
-// rwFakePool — RenderDB без БД: живая семантика subdomain_results
-// (SELECT по PK, UPDATE с охраной content_hash IS NOT DISTINCT FROM,
-// RETURNING checked_at — T-203), contents (refcount с охраной > 0 —
-// sqlMetaDelRef из SwapRefTx, T-044) и корзины rendered-темпа
-// crawler_counters (renderBumpRenderedSQL, T-203 — имя часа вычисляет
-// БД, фейк ведёт одно значение). Транзакция работает на снапшоте:
-// Rollback восстанавливает состояние, Commit оставляет (конкурентные
-// транзакции не моделируются — их сериализует PostgreSQL).
+// rwFakePool — a RenderDB without a DB: the live subdomain_results semantics
+// (a SELECT by PK, an UPDATE with the content_hash IS NOT DISTINCT FROM guard,
+// RETURNING checked_at — T-203), contents (a refcount with a > 0 guard —
+// sqlMetaDelRef from SwapRefTx, T-044) and the rendered-rate buckets
+// crawler_counters (renderBumpRenderedSQL, T-203 — the DB computes the hour
+// name, the fake keeps one value). The transaction works on a snapshot:
+// Rollback restores the state, Commit keeps it (concurrent
+// transactions are not modeled — PostgreSQL serializes them).
 type rwFakePool struct {
 	j *rwJournal
 
 	rows      map[rwRowKey]*rwRow
 	refc      map[content.Hash]int32
-	rendered  int64 // корзина rendered-темпа часа строки сида (T-203)
-	reanalyze int64 // корзина неанализированных хвостов часа строки сида (T-204)
+	rendered  int64 // the rendered-rate bucket of the seed row's hour (T-203)
+	reanalyze int64 // the unanalyzed tails bucket of the seed row's hour (T-204)
 
 	queryErr  error
 	updateErr error
 	commitErr error
 	beginErr  error
-	bumpErr   error // сбой инкремента корзины rendered-темпа (T-203)
-	markErr   error // сбой маркера «рендер невозможен» (T-210)
-	bumpTag   int64 // RowsAffected upsert корзины (0 — честный ответ)
+	bumpErr   error // a failure of the rendered-rate bucket increment (T-203)
+	markErr   error // a failure of the "render impossible" marker (T-210)
+	bumpTag   int64 // the RowsAffected of the bucket upsert (0 — an honest answer)
 
-	// mutateBeforeUpdate — хук: вызывается перед UPDATE внутри транзакции
-	// (симуляция перезаписи строки перепроверкой между SELECT и UPDATE).
+	// mutateBeforeUpdate — a hook: called before the UPDATE inside the transaction
+	// (a simulation of the row being rewritten by a recheck between the SELECT and the UPDATE).
 	mutateBeforeUpdate func(p *rwFakePool)
 
-	// mutateBeforeMark — хук: вызывается перед маркером renderFailMarkerSQL
-	// (T-210, симуляция перезаписи строки перепроверкой между SELECT цели
-	// и штампом финализации).
+	// mutateBeforeMark — a hook: called before the renderFailMarkerSQL marker
+	// (T-210, a simulation of the row being rewritten by a recheck between the target SELECT
+	// and the finalization stamp).
 	mutateBeforeMark func(p *rwFakePool)
 
 	mu sync.Mutex
@@ -194,23 +194,23 @@ func (p *rwFakePool) seedRow(key rwRowKey, finalURL string, hash *content.Hash) 
 	p.rows[key] = r
 }
 
-// renderedValue — значение корзины rendered-темпа (T-203) под замком.
+// renderedValue — the value of the rendered-rate bucket (T-203) under the lock.
 func (p *rwFakePool) renderedValue() int64 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.rendered
 }
 
-// reanalyzeValue — значение корзины неанализированных хвостов (T-204)
-// под замком.
+// reanalyzeValue — the value of the unanalyzed tails bucket (T-204)
+// under the lock.
 func (p *rwFakePool) reanalyzeValue() int64 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.reanalyze
 }
 
-// seedRowMarked — сид строки с маркером «рендер невозможен» (T-210):
-// штамп уже стоит (финализация прежней доставки), контент тот же.
+// seedRowMarked — seeding a row with the "render impossible" marker (T-210):
+// the stamp is already set (a finalization of a previous delivery), the content is the same.
 func (p *rwFakePool) seedRowMarked(key rwRowKey, finalURL string, hash *content.Hash) {
 	p.seedRow(key, finalURL, hash)
 	now := time.Now()
@@ -221,10 +221,10 @@ func (p *rwFakePool) CopyFrom(context.Context, pgx.Identifier, []string, pgx.Cop
 	return 0, errors.New("rwFakePool: CopyFrom не должен вызываться")
 }
 
-// Exec — маркер «рендер невозможен» (T-210, renderFailMarkerSQL):
-// финализация штампует строку автокоммитом (без транзакции), охраны —
-// rendered = false и content_hash IS NOT DISTINCT FROM $5; прочий SQL
-// вне транзакции — ошибка (как раньше).
+// Exec — the "render impossible" marker (T-210, renderFailMarkerSQL):
+// the finalization stamps the row with an autocommit (without a transaction), the guards —
+// rendered = false and content_hash IS NOT DISTINCT FROM $5; other SQL
+// outside a transaction — an error (as before).
 func (p *rwFakePool) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
 	if err := ctx.Err(); err != nil {
 		return pgconn.CommandTag{}, err
@@ -256,12 +256,12 @@ func (p *rwFakePool) Exec(ctx context.Context, sql string, args ...any) (pgconn.
 	}
 	now := time.Now()
 	if r.failedAt == nil {
-		r.failedAt = &now // coalesce: штамп ПЕРВОЙ финализации (T-210)
+		r.failedAt = &now // coalesce: the stamp of the FIRST finalization (T-210)
 	}
 	return pgconn.NewCommandTag("UPDATE 1"), nil
 }
 
-// rwFakeRows — pgx.Rows с заготовленными строками SELECT (final_url,
+// rwFakeRows — pgx.Rows with prepared SELECT rows (final_url,
 // content_hash, rendered, checked_at).
 type rwFakeRows struct {
 	rows [][]any
@@ -285,8 +285,8 @@ func (r *rwFakeRows) Scan(dest ...any) error {
 		return fmt.Errorf("rwFakeRows: Scan без Next или приёмников %d (нужно 4)", len(dest))
 	}
 	row := r.rows[r.i-1]
-	// NULL-колонки оставляют приёмник нетронутым (семантика pgx:
-	// *string/*[]byte остаются nil) — final_url и content_hash.
+	// NULL columns leave the destination untouched (the pgx semantics:
+	// *string/*[]byte stay nil) — final_url and content_hash.
 	if row[0] != nil {
 		if d, ok := dest[0].(**string); ok {
 			*d = row[0].(*string)
@@ -354,8 +354,8 @@ func (p *rwFakePool) Begin(ctx context.Context) (pgx.Tx, error) {
 	if p.beginErr != nil {
 		return nil, p.beginErr
 	}
-	// Хук «перепроверка перезаписала строку» выполняется до снапшота:
-	// чужая транзакция уже зафиксирована — наш Rollback её не откатывает.
+	// The "the recheck rewrote the row" hook runs before the snapshot:
+	// the foreign transaction is already committed — our Rollback does not roll it back.
 	if p.mutateBeforeUpdate != nil {
 		p.mutateBeforeUpdate(p)
 	}
@@ -373,13 +373,13 @@ func (p *rwFakePool) Begin(ctx context.Context) (pgx.Tx, error) {
 		snapRendered: p.rendered, snapReanalyze: p.reanalyze}, nil
 }
 
-// rwDelRefSQLPrefix — префикс sqlMetaDelRef из content/pack.go (T-042):
-// константа не экспортирована, точный текст поддерживается вручную;
-// расхождение ломает тест громко — синхронизируйте с pack.go.
+// rwDelRefSQLPrefix — the prefix of sqlMetaDelRef from content/pack.go (T-042):
+// the constant is not exported, the exact text is maintained by hand;
+// a mismatch breaks the test loudly — sync it with pack.go.
 const rwDelRefSQLPrefix = "UPDATE contents SET refcount = refcount - 1"
 
 type rwFakeTx struct {
-	pgx.Tx // остальные методы pgx.Tx этап не использует
+	pgx.Tx // the stage uses no other pgx.Tx methods
 
 	pool          *rwFakePool
 	snapRows      map[rwRowKey]*rwRow
@@ -389,9 +389,9 @@ type rwFakeTx struct {
 	commit        bool
 }
 
-// rwUpdateRow — pgx.Row результата UPDATE (RETURNING checked_at, T-203):
-// один приёмник time.Time; err — ошибка оператора или pgx.ErrNoRows
-// (охрана отсекла — прежний RowsAffected 0).
+// rwUpdateRow — the pgx.Row of the UPDATE result (RETURNING checked_at, T-203):
+// one time.Time destination; err — a statement error or pgx.ErrNoRows
+// (the guard cut it off — the former RowsAffected 0).
 type rwUpdateRow struct {
 	checkedAt time.Time
 	err       error
@@ -411,9 +411,9 @@ func (r rwUpdateRow) Scan(dest ...any) error {
 	return fmt.Errorf("rwUpdateRow: приёмник %T, ожидается *time.Time", dest[0])
 }
 
-// QueryRow — UPDATE замены контента (renderUpdateSQL, T-203): живая
-// семантика охраны content_hash IS NOT DISTINCT FROM $9, RETURNING
-// checked_at переведённой строки; пустой результат — pgx.ErrNoRows.
+// QueryRow — the content replacement UPDATE (renderUpdateSQL, T-203): the live
+// semantics of the content_hash IS NOT DISTINCT FROM $9 guard, RETURNING
+// checked_at of the moved row; an empty result — pgx.ErrNoRows.
 func (t *rwFakeTx) QueryRow(_ context.Context, sql string, args ...any) pgx.Row {
 	t.pool.mu.Lock()
 	defer t.pool.mu.Unlock()
@@ -433,7 +433,7 @@ func (t *rwFakeTx) QueryRow(_ context.Context, sql string, args ...any) pgx.Row 
 	if !ok {
 		return rwUpdateRow{err: pgx.ErrNoRows}
 	}
-	// Охрана content_hash IS NOT DISTINCT FROM $9.
+	// The content_hash IS NOT DISTINCT FROM $9 guard.
 	same := (r.hash == nil && oldHash == nil) ||
 		(r.hash != nil && oldHash != nil && string(r.hash) == string(oldHash))
 	if !same {
@@ -441,7 +441,7 @@ func (t *rwFakeTx) QueryRow(_ context.Context, sql string, args ...any) pgx.Row 
 	}
 	checkedAt := r.checkedAt
 	r.rendered = true
-	r.failedAt = nil // успешный рендер снимает маркер «рендер невозможен» (T-210)
+	r.failedAt = nil // a successful render removes the "render impossible" marker (T-210)
 	r.finalURL = &finalURL
 	h := make([]byte, len(newHash))
 	copy(h, newHash)
@@ -459,17 +459,17 @@ func (t *rwFakeTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.Co
 	defer t.pool.mu.Unlock()
 	switch {
 	case sql == renderBumpReanalyzeSQL:
-		// Инкремент корзины неанализированных хвостов (T-204): параметр —
-		// checked_at строки (час корзины — час ЭПИЗОДА), дельта 1; фейк
-		// ведёт одно значение (имя часа вычисляет БД).
+		// An increment of the unanalyzed tails bucket (T-204): the parameter is
+		// the row's checked_at (the bucket hour — the EPISODE's hour), the delta is 1; the
+		// fake keeps one value (the DB computes the hour name).
 		t.pool.reanalyze += args[1].(int64)
 		t.pool.j.record(rwEvTail)
 		return pgconn.NewCommandTag("INSERT 0 1"), nil
 	case sql == renderBumpRenderedSQL:
-		// Инкремент корзины rendered-темпа (T-203): параметр — checked_at
-		// строки (час корзины), дельта 1; фейк ведёт одно значение
-		// (имя часа вычисляет БД). bumpTag — страховочная ветка
-		// RowsAffected ≠ 1.
+		// An increment of the rendered-rate bucket (T-203): the parameter is the
+		// row's checked_at (the bucket hour), the delta is 1; the fake keeps one value
+		// (the DB computes the hour name). bumpTag — the safety branch
+		// of RowsAffected ≠ 1.
 		if t.pool.bumpErr != nil {
 			return pgconn.CommandTag{}, t.pool.bumpErr
 		}
@@ -480,11 +480,11 @@ func (t *rwFakeTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.Co
 		}
 		return pgconn.NewCommandTag("INSERT 0 1"), nil
 	case strings.HasPrefix(sql, rwDelRefSQLPrefix):
-		// sqlMetaDelRef (SwapRefTx, T-044): −1 с охраной refcount > 0.
+		// sqlMetaDelRef (SwapRefTx, T-044): −1 with a refcount > 0 guard.
 		var h content.Hash
 		copy(h[:], args[0].([]byte))
 		if t.pool.refc[h] <= 0 {
-			return pgconn.NewCommandTag("UPDATE 0"), nil // ErrRefIntegrity у вызывающего
+			return pgconn.NewCommandTag("UPDATE 0"), nil // ErrRefIntegrity at the caller
 		}
 		t.pool.refc[h]--
 		t.pool.j.record(rwEvSwap)
@@ -509,7 +509,7 @@ func (t *rwFakeTx) Rollback(context.Context) error {
 	t.pool.mu.Lock()
 	defer t.pool.mu.Unlock()
 	if t.commit {
-		return nil // откат после Commit — no-op
+		return nil // a rollback after Commit — a no-op
 	}
 	t.pool.rows, t.pool.refc = t.snapRows, t.snapRefc
 	t.pool.rendered = t.snapRendered
@@ -517,10 +517,10 @@ func (t *rwFakeTx) Rollback(context.Context) error {
 	return nil
 }
 
-// --- фейковое хранилище контента (связано с contents пула) -------------------
+// --- the fake content storage (linked with the pool's contents) ---------------
 
-// rwFakeStore — ContentStore: Put и Delete живут общей с пулом таблицей
-// contents (refcount), моделируя PackStore над той же БД (T-042).
+// rwFakeStore — a ContentStore: Put and Delete live in the contents table
+// shared with the pool (the refcount), modeling a PackStore over the same DB (T-042).
 type rwFakeStore struct {
 	j *rwJournal
 	p *rwFakePool
@@ -593,18 +593,18 @@ func (s *rwFakeStore) deletesSnapshot() []content.Hash {
 	return out
 }
 
-// --- фейковый рендер ---------------------------------------------------------
+// --- the fake render ----------------------------------------------------------
 
-// rwFakeRenderer — Renderer: возвращает заготовленный вывод по URL.
+// rwFakeRenderer — a Renderer: returns a prepared output by URL.
 type rwFakeRenderer struct {
 	j *rwJournal
 
 	output  render.RenderOutput
 	err     error
-	panicOn string // URL задач, на которых Run паникует (тест R-04)
-	// blockOn — URL задач, висящих в рендере до отмены ctx («страница-
-	// тарпит» до render.timeout): держит слот доставки — для тестов
-	// скользящего потребления (T-142).
+	panicOn string // the URLs of tasks Run panics on (the R-04 test)
+	// blockOn — the URLs of tasks hanging in the render until ctx is cancelled ("page
+	// tarpits" up to render.timeout): holds a delivery slot — for the
+	// sliding consumption tests (T-142).
 	blockOn map[string]bool
 
 	mu    sync.Mutex
@@ -625,7 +625,7 @@ func (r *rwFakeRenderer) Run(ctx context.Context, task render.RenderTask) (rende
 		panic("фейк рендера: паника в задаче " + task.URL)
 	}
 	if r.blockOn[task.URL] {
-		<-ctx.Done() // слот занят до отмены — хвост длительностей этапа
+		<-ctx.Done() // the slot is busy until cancellation — the stage's duration tail
 		return render.RenderOutput{}, ctx.Err()
 	}
 	if r.err != nil {
@@ -642,8 +642,8 @@ func (r *rwFakeRenderer) tasksSnapshot() []render.RenderTask {
 	return out
 }
 
-// tasksCountURL — сколько раз рендер получил задачу с этим URL
-// (0 — доставка не начиналась: слоты заняты).
+// tasksCountURL — how many times the render got a task with this URL
+// (0 — the delivery did not start: the slots are busy).
 func (r *rwFakeRenderer) tasksCountURL(url string) int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -656,17 +656,17 @@ func (r *rwFakeRenderer) tasksCountURL(url string) int {
 	return n
 }
 
-// --- фейковая очередь --------------------------------------------------------
+// --- the fake queue -----------------------------------------------------------
 
-// rwPublishRec — записанная публикация.
+// rwPublishRec — a recorded publication.
 type rwPublishRec struct {
 	stream string
 	msg    queue.Result
 }
 
-// rwFakeQueue — queue.Queue: Publish фиксирует Result-сообщения (и может
-// падать по счётчику), Consume раздаёт заготовленные доставки один раз и
-// дальше паркуется до отмены ctx, Ack фиксируется и сигнализирует.
+// rwFakeQueue — a queue.Queue: Publish records the Result messages (and may
+// fail by the counter), Consume hands out the prepared deliveries once and
+// afterwards parks until ctx is cancelled, Ack is recorded and signals.
 type rwFakeQueue struct {
 	j *rwJournal
 
@@ -720,7 +720,7 @@ func (q *rwFakeQueue) Consume(ctx context.Context, _, _, _ string, n int) ([]que
 	if len(out) > 0 {
 		return out, nil
 	}
-	<-ctx.Done() // реальная очередь блокируется в XREADGROUP
+	<-ctx.Done() // a real queue blocks in XREADGROUP
 	return nil, ctx.Err()
 }
 
@@ -760,16 +760,16 @@ func (q *rwFakeQueue) consumesCount() int {
 	return q.consumes
 }
 
-// --- сборщики ----------------------------------------------------------------
+// --- builders -----------------------------------------------------------------
 
-// rwTestHash — различимые хэши: rwTestHash(1), (2), …
+// rwTestHash — distinguishable hashes: rwTestHash(1), (2), …
 func rwTestHash(n byte) content.Hash {
 	var h content.Hash
 	h[0] = n
 	return h
 }
 
-// rwFixture — собранный набор фейков и воркер.
+// rwFixture — the assembled set of fakes and the worker.
 type rwFixture struct {
 	pool     *rwFakePool
 	store    *rwFakeStore
@@ -791,16 +791,16 @@ func newRWFixture(t *testing.T) *rwFixture {
 	return &rwFixture{pool: pool, store: store, renderer: renderer, q: q, w: w}
 }
 
-// rwKey — ключ строки фикстуры.
+// rwKey — the fixture's row key.
 var rwKey = rwRowKey{zone: 3, domain: 42, subdomain: 1, variant: 0}
 
-// rwTask — задача q:render на ключ фикстуры.
+// rwTask — a q:render task on the fixture's key.
 var rwTask = queue.Result{
 	ZoneID: rwKey.zone, DomainID: rwKey.domain,
 	SubdomainID: rwKey.subdomain, Variant: 0, Name: "spa.example",
 }
 
-// rwDelivery — валидная доставка с Result-сообщением.
+// rwDelivery — a valid delivery with a Result message.
 func rwDelivery(id string) queue.Delivery {
 	payload, err := json.Marshal(rwTask)
 	if err != nil {
@@ -809,8 +809,8 @@ func rwDelivery(id string) queue.Delivery {
 	return queue.Delivery{Stream: queue.StreamRender, ID: id, Payload: payload}
 }
 
-// rwKeyDelivery — валидная доставка с Result-ключом произвольной строки
-// (variant 0, как у строк тестов цикла; T-142).
+// rwKeyDelivery — a valid delivery with the Result key of an arbitrary row
+// (variant 0, like the loop tests' rows; T-142).
 func rwKeyDelivery(t *testing.T, id string, key rwRowKey, name string) queue.Delivery {
 	t.Helper()
 	task := queue.Result{
@@ -824,7 +824,7 @@ func rwKeyDelivery(t *testing.T, id string, key rwRowKey, name string) queue.Del
 	return queue.Delivery{Stream: queue.StreamRender, ID: id, Payload: payload}
 }
 
-// rwOutput — типовой результат рендера.
+// rwOutput — a typical render result.
 func rwOutput(dom string) render.RenderOutput {
 	return render.RenderOutput{
 		FinalURL: "https://spa.example/home",
@@ -837,7 +837,7 @@ func rwOutput(dom string) render.RenderOutput {
 	}
 }
 
-// rwRefc — снапшот refcount пула.
+// rwRefc — a snapshot of the pool's refcounts.
 func rwRefc(p *rwFakePool) map[content.Hash]int32 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -848,7 +848,7 @@ func rwRefc(p *rwFakePool) map[content.Hash]int32 {
 	return out
 }
 
-// rwRowSnapshot — снапшот строки.
+// rwRowSnapshot — a snapshot of the row.
 func rwRowSnapshot(p *rwFakePool, key rwRowKey) rwRow {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -858,12 +858,12 @@ func rwRowSnapshot(p *rwFakePool, key rwRowKey) rwRow {
 	return rwRow{}
 }
 
-// --- ProcessResult -----------------------------------------------------------
+// --- ProcessResult ------------------------------------------------------------
 
-// TestRenderWorker_HappyPath — сквозной контракт: SELECT цели → рендер
-// итогового URL строки → Put DOM → транзакция (UPDATE + SwapRef старой
-// ссылки) → Commit → публикация q:analyze тем же ключом; баланс refcount:
-// старый контент −1, DOM +1.
+// TestRenderWorker_HappyPath — the end-to-end contract: the SELECT of the target → the render
+// of the row's final URL → the DOM Put → the transaction (an UPDATE + a SwapRef of the old
+// reference) → Commit → a q:analyze publication with the same key; the refcount balance:
+// the old content −1, the DOM +1.
 func TestRenderWorker_HappyPath(t *testing.T) {
 	f := newRWFixture(t)
 	raw := rwTestHash(1)
@@ -879,13 +879,13 @@ func TestRenderWorker_HappyPath(t *testing.T) {
 		t.Fatal("строка должна быть записана (written=true)")
 	}
 
-	// Рендер получил итоговый URL строки.
+	// The render got the row's final URL.
 	tasks := f.renderer.tasksSnapshot()
 	if len(tasks) != 1 || tasks[0].URL != "https://spa.example/" {
 		t.Fatalf("рендер: задачи %+v, нужен один URL https://spa.example/", tasks)
 	}
 
-	// Строка: rendered=true, DOM-хэш, итоговый URL и данные рендера.
+	// The row: rendered=true, the DOM hash, the final URL and the render data.
 	domHash := content.HashOf([]byte(dom))
 	row := rwRowSnapshot(f.pool, rwKey)
 	if !row.rendered {
@@ -904,7 +904,7 @@ func TestRenderWorker_HappyPath(t *testing.T) {
 		t.Errorf("headers = %v, нужны заголовки итоговой навигации (ТЗ 5.8)", row.headers)
 	}
 
-	// Баланс refcount: сырой HTML −1 (был 1 → 0), DOM +1.
+	// The refcount balance: the raw HTML −1 (was 1 → 0), the DOM +1.
 	refc := rwRefc(f.pool)
 	if refc[raw] != 0 {
 		t.Errorf("refcount сырого HTML = %d, нужен 0 (ссылка снята, ТЗ 5.7)", refc[raw])
@@ -913,7 +913,7 @@ func TestRenderWorker_HappyPath(t *testing.T) {
 		t.Errorf("refcount DOM = %d, нужен 1", refc[domHash])
 	}
 
-	// Публикация q:analyze — тем же ключом, после Commit.
+	// The q:analyze publication — with the same key, after the Commit.
 	pubs := f.q.publishesSnapshot()
 	if len(pubs) != 1 || pubs[0].stream != queue.StreamAnalyze {
 		t.Fatalf("публикации %+v, нужна одна q:analyze", pubs)
@@ -925,7 +925,7 @@ func TestRenderWorker_HappyPath(t *testing.T) {
 	if i, j := f.pool.j.indexOf(rwEvCommit), f.pool.j.indexOf(rwEvPublish); i < 0 || j < 0 || i > j {
 		t.Errorf("публикация до Commit: commit=%d publish=%d", i, j)
 	}
-	// Порядок: рендер → Put → транзакция.
+	// The order: render → Put → transaction.
 	ev := f.pool.j.snapshot()
 	wantOrder := []rwEventKind{rwEvRender, rwEvPut, rwEvBegin, rwEvUpdate, rwEvSwap, rwEvCommit, rwEvPublish}
 	last := -1
@@ -941,11 +941,11 @@ func TestRenderWorker_HappyPath(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_SQLContract — точный текст SELECT и UPDATE с
-// литералами ТЗ (rendered = true, rules_version = NULL; render_failed_at
-// = NULL — успешный рендер снимает маркер T-210; RETURNING checked_at —
-// час корзины rendered-темпа, T-203), маркера «рендер невозможен»
-// (T-210) и upsert корзины.
+// TestRenderWorker_SQLContract — the exact text of the SELECT and UPDATE with
+// the spec literals (rendered = true, rules_version = NULL; render_failed_at
+// = NULL — a successful render removes the T-210 marker; RETURNING checked_at —
+// the hour of the rendered-rate bucket, T-203), the "render impossible"
+// marker (T-210) and the bucket upsert.
 func TestRenderWorker_SQLContract(t *testing.T) {
 	selectWant := "SELECT final_url, content_hash, rendered, checked_at FROM subdomain_results " +
 		"WHERE zone_id = $1::int2 AND domain_id = $2::int8 " +
@@ -988,12 +988,12 @@ func TestRenderWorker_SQLContract(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_RenderedCounter — корзины rendered-темпа (T-203) и
-// неанализированных хвостов (T-204): +1 в той же транзакции, что и флаг
-// (сбой/откат — вместе, порядок «UPDATE → хвосты → rendered →
-// фиксация»); охрана (строка ушла) корзины не трогает; повторный рендер
-// той же строки — ещё событие обеих корзин (потоковая семантика,
-// абсолюты выравнивает реконсиляция).
+// TestRenderWorker_RenderedCounter — the rendered-rate buckets (T-203) and
+// the unanalyzed tails (T-204): +1 in the same transaction as the flag
+// (a failure/rollback — together, the order "UPDATE → tails → rendered →
+// commit"); a guard (the row slipped away) does not touch the buckets; a repeated render
+// of the same row — another event of both buckets (the streaming semantics,
+// reconciliation aligns the absolutes).
 func TestRenderWorker_RenderedCounter(t *testing.T) {
 	f := newRWFixture(t)
 	raw := rwTestHash(1)
@@ -1016,9 +1016,9 @@ func TestRenderWorker_RenderedCounter(t *testing.T) {
 			update, tail, bump, commit)
 	}
 
-	// Повторная доставка той же задачи: DOM тем же содержимым — охрана
-	// хэша пропускает перезапись, rendered уже true; событие +1 к живому
-	// нулю — разницу семантик сводит реконсиляция.
+	// A re-delivery of the same task: a DOM with the same content — the hash
+	// guard lets the rewrite through, rendered is already true; the +1 event to the
+	// live zero — reconciliation reconciles the semantic difference.
 	if written, err := f.w.ProcessResult(context.Background(), rwTask); err != nil || !written {
 		t.Fatalf("повтор ProcessResult: ok=%v err=%v", written, err)
 	}
@@ -1026,8 +1026,8 @@ func TestRenderWorker_RenderedCounter(t *testing.T) {
 		t.Fatalf("после повтора корзина = %d, want 2 (событие на каждую запись флага)", got)
 	}
 
-	// Сбой инкремента откатывает транзакцию: флаг и корзина меняются
-	// только вместе (§3.4).
+	// An increment failure rolls back the transaction: the flag and the bucket change
+	// only together (§3.4).
 	f2 := newRWFixture(t)
 	f2.pool.seedRow(rwKey, "https://spa.example/", &raw)
 	f2.renderer.output = rwOutput("<html><body>b</body></html>")
@@ -1045,7 +1045,7 @@ func TestRenderWorker_RenderedCounter(t *testing.T) {
 		t.Errorf("фиксаций = %d, want 0", n)
 	}
 
-	// Строка ушла из-под задачи (охрана): корзина не тронута.
+	// The row slipped out from under the task (the guard): the buckets are untouched.
 	f3 := newRWFixture(t)
 	f3.pool.seedRow(rwKey, "https://spa.example/", &raw)
 	f3.renderer.output = rwOutput("<html><body>c</body></html>")
@@ -1063,7 +1063,7 @@ func TestRenderWorker_RenderedCounter(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_NoRow — строки нет: успех без рендера, Put и публикации.
+// TestRenderWorker_NoRow — no row: a success without a render, Put and publications.
 func TestRenderWorker_NoRow(t *testing.T) {
 	f := newRWFixture(t)
 	written, err := f.w.ProcessResult(context.Background(), rwTask)
@@ -1084,11 +1084,11 @@ func TestRenderWorker_NoRow(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_NoFinalURL — итогового URL нет (NULL): рендерить
-// нечего, успех без записи.
+// TestRenderWorker_NoFinalURL — no final URL (NULL): nothing
+// to render, a success without a write.
 func TestRenderWorker_NoFinalURL(t *testing.T) {
 	f := newRWFixture(t)
-	f.pool.seedRow(rwKey, "", nil) // final_url NULL, контента нет
+	f.pool.seedRow(rwKey, "", nil) // a NULL final_url, no content
 	written, err := f.w.ProcessResult(context.Background(), rwTask)
 	if err != nil {
 		t.Fatalf("ProcessResult: %v", err)
@@ -1101,8 +1101,8 @@ func TestRenderWorker_NoFinalURL(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_SameContent — DOM побайтово равен сохранённому
-// контенту: Put и своп не выполняются, строка получает rendered=true.
+// TestRenderWorker_SameContent — the DOM is byte-identical to the stored
+// content: Put and the swap are not executed, the row gets rendered=true.
 func TestRenderWorker_SameContent(t *testing.T) {
 	f := newRWFixture(t)
 	dom := "<html><body>stable</body></html>"
@@ -1132,12 +1132,12 @@ func TestRenderWorker_SameContent(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_AliasRow — алиасная строка (content_hash NULL, контент
-// у оригинала, T-055): рендер по своему URL, DOM — своя ссылка, снимать
-// нечего.
+// TestRenderWorker_AliasRow — an alias row (a NULL content_hash, the content
+// at the original, T-055): a render by its own URL, the DOM — its own reference, nothing
+// to remove.
 func TestRenderWorker_AliasRow(t *testing.T) {
 	f := newRWFixture(t)
-	f.pool.seedRow(rwKey, "https://spa.example/", nil) // hash NULL
+	f.pool.seedRow(rwKey, "https://spa.example/", nil) // a NULL hash
 	dom := "<html>alias dom</html>"
 	f.renderer.output = rwOutput(dom)
 
@@ -1158,23 +1158,23 @@ func TestRenderWorker_AliasRow(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_StaleRow — строка перезаписана между SELECT и UPDATE
-// (перепроверка домена): охрана отсекает запись, ссылка Put снимается,
-// публикаций нет, доставка подтверждается (false, nil).
+// TestRenderWorker_StaleRow — the row was rewritten between the SELECT and the UPDATE
+// (a domain recheck): the guard cuts off the write, the Put reference is removed,
+// no publications, the delivery is acknowledged (false, nil).
 func TestRenderWorker_StaleRow(t *testing.T) {
 	f := newRWFixture(t)
 	raw := rwTestHash(1)
 	f.pool.seedRow(rwKey, "https://spa.example/", &raw)
 	dom := "<html>fresh dom</html>"
 	f.renderer.output = rwOutput(dom)
-	// Перепроверка T-058 переписала строку до нашей транзакции: старые
-	// ссылки сняты её DELETE, новая строка ссылается на свежий контент.
+	// The T-058 recheck rewrote the row before our transaction: the old
+	// references were removed by its DELETE, the new row references fresh content.
 	fresh := rwTestHash(2)
 	f.pool.mutateBeforeUpdate = func(p *rwFakePool) {
 		r := p.rows[rwKey]
-		p.refc[raw]-- // DELETE старых строк эпизода (SwapRef, T-058)
+		p.refc[raw]-- // DELETE of the episode's old rows (SwapRef, T-058)
 		r.hash = fresh[:]
-		p.refc[fresh]++ // INSERT новых строк
+		p.refc[fresh]++ // INSERT of the new rows
 	}
 
 	written, err := f.w.ProcessResult(context.Background(), rwTask)
@@ -1184,7 +1184,7 @@ func TestRenderWorker_StaleRow(t *testing.T) {
 	if written {
 		t.Error("written должен быть false")
 	}
-	// Ссылка Put снята: DOM не висит, чужой контент цел.
+	// The Put reference is removed: the DOM does not hang, the foreign content is intact.
 	refc := rwRefc(f.pool)
 	domHash := content.HashOf([]byte(dom))
 	if refc[domHash] != 0 {
@@ -1207,9 +1207,9 @@ func TestRenderWorker_StaleRow(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_RepeatDelivery — идемпотентность повторной доставки:
-// повторный рендер перезаписывает контент и refcount, баланс сходится
-// без утечек (ТЗ 3.4, стиль T-058).
+// TestRenderWorker_RepeatDelivery — the re-delivery idempotency:
+// a repeated render overwrites the content and the refcount, the balance converges
+// without leaks (spec 3.4, the T-058 style).
 func TestRenderWorker_RepeatDelivery(t *testing.T) {
 	f := newRWFixture(t)
 	raw := rwTestHash(1)
@@ -1249,8 +1249,8 @@ func TestRenderWorker_RepeatDelivery(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_RenderError — ошибка рендера: ничего не записано,
-// ошибка наружу (доставка без XACK вернётся повторной доставкой).
+// TestRenderWorker_RenderError — a render error: nothing written,
+// the error outward (a delivery without an XACK will return with a re-delivery).
 func TestRenderWorker_RenderError(t *testing.T) {
 	f := newRWFixture(t)
 	raw := rwTestHash(1)
@@ -1275,18 +1275,18 @@ func TestRenderWorker_RenderError(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_EmptyOutput — пустой DOM или итоговый URL —
-// страховка контракта T-064: строка не трогается, ошибка задачи.
+// TestRenderWorker_EmptyOutput — an empty DOM or final URL —
+// the T-064 contract guard: the row is not touched, a task error.
 func TestRenderWorker_EmptyOutput(t *testing.T) {
 	f := newRWFixture(t)
 	raw := rwTestHash(1)
 	f.pool.seedRow(rwKey, "https://spa.example/", &raw)
-	f.renderer.output = render.RenderOutput{FinalURL: "https://spa.example/x"} // DOM пуст
+	f.renderer.output = render.RenderOutput{FinalURL: "https://spa.example/x"} // the DOM is empty
 
 	if _, err := f.w.ProcessResult(context.Background(), rwTask); err == nil {
 		t.Fatal("пустой DOM — ошибка")
 	}
-	f.renderer.output = render.RenderOutput{DOM: "<html/>"} // FinalURL пуст
+	f.renderer.output = render.RenderOutput{DOM: "<html/>"} // the FinalURL is empty
 	if _, err := f.w.ProcessResult(context.Background(), rwTask); err == nil {
 		t.Fatal("пустой итоговый URL — ошибка")
 	}
@@ -1295,9 +1295,9 @@ func TestRenderWorker_EmptyOutput(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_PutError — сбой Put (ErrTooLarge): ошибка без
-// транзакции; повторная доставка разыграет сценарий заново, постоянные
-// ошибки исчерпают попытки и уйдут в q:dead (T-025).
+// TestRenderWorker_PutError — a Put failure (ErrTooLarge): an error without
+// a transaction; a re-delivery will replay the scenario, permanent
+// errors will exhaust the attempts and go to q:dead (T-025).
 func TestRenderWorker_PutError(t *testing.T) {
 	f := newRWFixture(t)
 	raw := rwTestHash(1)
@@ -1317,8 +1317,8 @@ func TestRenderWorker_PutError(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_UpdateError — сбой UPDATE: откат транзакции, ссылка
-// Put остаётся утечкой в безопасную сторону (T-044).
+// TestRenderWorker_UpdateError — an UPDATE failure: a transaction rollback, the
+// Put reference stays as a leak on the safe side (T-044).
 func TestRenderWorker_UpdateError(t *testing.T) {
 	f := newRWFixture(t)
 	raw := rwTestHash(1)
@@ -1345,13 +1345,13 @@ func TestRenderWorker_UpdateError(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_SwapIntegrity — расхождение учёта (у старого контента
-// нет живой ссылки): ErrRefIntegrity с откатом (T-044).
+// TestRenderWorker_SwapIntegrity — an accounting divergence (the old content
+// has no live reference): ErrRefIntegrity with a rollback (T-044).
 func TestRenderWorker_SwapIntegrity(t *testing.T) {
 	f := newRWFixture(t)
 	raw := rwTestHash(1)
 	f.pool.seedRow(rwKey, "https://spa.example/", &raw)
-	f.pool.refc[raw] = 0 // ссылка мертва — учёт разошёлся
+	f.pool.refc[raw] = 0 // the reference is dead — the accounting diverged
 	f.renderer.output = rwOutput("<html>dom</html>")
 
 	_, err := f.w.ProcessResult(context.Background(), rwTask)
@@ -1363,8 +1363,8 @@ func TestRenderWorker_SwapIntegrity(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_CommitError — сбой фиксации: ошибка, строка не
-// изменилась, ссылка Put — утечкой в безопасную сторону.
+// TestRenderWorker_CommitError — a commit failure: an error, the row did not
+// change, the Put reference — a leak on the safe side.
 func TestRenderWorker_CommitError(t *testing.T) {
 	f := newRWFixture(t)
 	raw := rwTestHash(1)
@@ -1387,11 +1387,11 @@ func TestRenderWorker_CommitError(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_PublishError — сбой публикации q:analyze при
-// зафиксированной строке: written=false + ошибка — публикация часть
-// задачи, запись не обработана целиком (контракт T-225); доставка
-// вернётся повторной доставкой и опубликует заново (at-least-once,
-// ТЗ 3.4). Факт записанного DOM виден по строке (Commit до публикации).
+// TestRenderWorker_PublishError — a q:analyze publication failure with
+// the row committed: written=false + an error — the publication is part
+// of the task, the row is not processed entirely (the T-225 contract); the delivery
+// will return with a re-delivery and publish again (at-least-once,
+// spec 3.4). The fact of the written DOM is visible in the row (the Commit before the publication).
 func TestRenderWorker_PublishError(t *testing.T) {
 	f := newRWFixture(t)
 	raw := rwTestHash(1)
@@ -1411,11 +1411,11 @@ func TestRenderWorker_PublishError(t *testing.T) {
 	}
 }
 
-// TestProcessResult_WrittenContract — контракт ProcessResult (T-225):
-// true возвращается только вместе с nil-ошибкой — запись обработана
-// целиком (DOM записан и q:analyze опубликован); каждый ошибочный путь —
-// false + ошибка (доставка вернётся повторной доставкой). Штатный отказ
-// (строки нет) — false без ошибки: обрабатывать нечего.
+// TestProcessResult_WrittenContract — the ProcessResult contract (T-225):
+// true is returned only together with a nil error — the row is processed
+// entirely (the DOM written and q:analyze published); every failing path —
+// false + an error (the delivery will return with a re-delivery). A regular rejection
+// (no row) — false without an error: nothing to process.
 func TestProcessResult_WrittenContract(t *testing.T) {
 	raw := rwTestHash(1)
 	seed := func(f *rwFixture) {
@@ -1488,7 +1488,7 @@ func TestProcessResult_WrittenContract(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_SelectError — сбой чтения цели: ошибка без рендера.
+// TestRenderWorker_SelectError — a target read failure: an error without a render.
 func TestRenderWorker_SelectError(t *testing.T) {
 	f := newRWFixture(t)
 	f.pool.queryErr = errors.New("база недоступна")
@@ -1500,7 +1500,7 @@ func TestRenderWorker_SelectError(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_NewValidation — nil-зависимости отклоняются.
+// TestRenderWorker_NewValidation — nil dependencies are rejected.
 func TestRenderWorker_NewValidation(t *testing.T) {
 	pool := newRWFakePool()
 	store := &rwFakeStore{j: pool.j, p: pool}
@@ -1525,11 +1525,11 @@ func TestRenderWorker_NewValidation(t *testing.T) {
 	}
 }
 
-// --- цикл Run ----------------------------------------------------------------
+// --- the Run loop -------------------------------------------------------------
 
-// TestRenderWorker_RunSmoke — цикл: доставки обрабатываются, XACK после
-// публикации; ядовитая запись — без XACK (вернётся повторной доставкой,
-// T-025); отмена ctx — чистый nil.
+// TestRenderWorker_RunSmoke — the loop: the deliveries are processed, an XACK after
+// the publication; a poisoned entry — without an XACK (it will return with a re-delivery,
+// T-025); a ctx cancellation — a clean nil.
 func TestRenderWorker_RunSmoke(t *testing.T) {
 	f := newRWFixture(t)
 	raw := rwTestHash(1)
@@ -1553,7 +1553,7 @@ func TestRenderWorker_RunSmoke(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- Run(ctx, f.w, Options{}) }()
 
-	// Ждём два XACK (e1, e3); e2 — ядовитая, не подтверждается.
+	// We wait for two XACKs (e1, e3); e2 — poisoned, not acknowledged.
 	for want := 2; want > 0; {
 		select {
 		case <-f.pool.j.ackNotify:
@@ -1589,9 +1589,9 @@ func TestRenderWorker_RunSmoke(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_RunBrowserDead — недоступный браузер: очередь не
-// читается (доставки остаются в стриме, не в PEL), цикл ждёт и чисто
-// завершается по отмене ctx.
+// TestRenderWorker_RunBrowserDead — an unavailable browser: the queue is not
+// read (the deliveries stay in the stream, not in the PEL), the loop waits and finishes
+// cleanly on the ctx cancellation.
 func TestRenderWorker_RunBrowserDead(t *testing.T) {
 	f := newRWFixture(t)
 	f.q.deliveries = []queue.Delivery{rwDelivery("e1")}
@@ -1619,14 +1619,14 @@ func TestRenderWorker_RunBrowserDead(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_RunPanicRecovered — паника обработки одной доставки
-// (рендер/ProcessResult) не роняет процесс (инвариант каркаса, R-04):
-// паникующая запись не подтверждается, соседние доставки окна
-// дорабатываются и подтверждаются.
+// TestRenderWorker_RunPanicRecovered — a panic while processing one delivery
+// (the render/ProcessResult) does not crash the process (the framework invariant, R-04):
+// the panicking entry is not acknowledged, the neighboring deliveries of the window
+// are finished and acknowledged.
 func TestRenderWorker_RunPanicRecovered(t *testing.T) {
 	f := newRWFixture(t)
-	// Две строки: рендер первой паникует (как CDP посреди страницы),
-	// вторая — обычная доставка того же окна.
+	// Two rows: the render of the first panics (like CDP mid-page),
+	// the second — an ordinary delivery of the same window.
 	f.pool.seedRow(rwKey, "https://spa.example/", nil)
 	key2 := rwRowKey{zone: rwKey.zone, domain: rwKey.domain, subdomain: 2, variant: 0}
 	f.pool.seedRow(key2, "https://two.example/", nil)
@@ -1646,14 +1646,14 @@ func TestRenderWorker_RunPanicRecovered(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- Run(ctx, f.w, Options{}) }()
 
-	// e1 обязан дойти до рендера ДО отмены (ревью T-142, P2-4): отмена
-	// сразу после XACK соседа оставляла панику недетерминированной —
-	// доставка могла не стартовать вовсе (ctx уже отменён), recover-ветка
-	// не выполнялась. Дошедшая до рендера с живым ctx доставка паникует
-	// неизбежно (между записью задачи и panicOn только проверка ctx).
+	// e1 must reach the render BEFORE the cancellation (the T-142 review, P2-4): a
+	// cancellation right after the neighbor's XACK left the panic non-deterministic —
+	// the delivery might not start at all (the ctx already cancelled), the recover branch
+	// not executed. A delivery that reached the render with a live ctx panics
+	// inevitably (between the task record and panicOn there is only the ctx check).
 	rwWaitURL(t, f.renderer, "https://spa.example/")
 
-	// e2 обязан доработать и подтвердиться, несмотря на панику e1.
+	// e2 must finish and be acknowledged, despite e1's panic.
 	select {
 	case <-f.pool.j.ackNotify:
 	case <-time.After(5 * time.Second):
@@ -1680,21 +1680,21 @@ func TestRenderWorker_RunPanicRecovered(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_RunValidation — nil-воркер отклоняется.
+// TestRenderWorker_RunValidation — a nil worker is rejected.
 func TestRenderWorker_RunValidation(t *testing.T) {
 	if err := Run(context.Background(), nil, Options{}); err == nil {
 		t.Fatal("Run должен отклонять nil-воркер")
 	}
 }
 
-// TestRenderWorker_RunCancelWhileWaitingSlot — отмена ctx во время
-// ожидания слота семафора не запускает доставку с уже отменённым ctx
-// (порт TestWorkerRunCancelWhileWaitingSlot httpworker, T-139; ревью
-// T-142, P3-2 r2): окно из двух задач при Concurrency=1, первая висит в
-// рендере до отмены — вторая обязана остаться не начатой (её URL не
-// доходит до рендера), окно возвращается очереди повторной доставкой.
+// TestRenderWorker_RunCancelWhileWaitingSlot — a ctx cancellation during
+// the semaphore slot wait does not start a delivery with an already cancelled ctx
+// (a port of TestWorkerRunCancelWhileWaitingSlot httpworker, T-139; the
+// T-142 review, P3-2 r2): a window of two tasks at Concurrency=1, the first hangs in
+// the render until the cancellation — the second must stay unstarted (its URL never
+// reaches the render), the window returns to the queue with a re-delivery.
 func TestRenderWorker_RunCancelWhileWaitingSlot(t *testing.T) {
-	s := rwSlidingSetup(t, 1, 1) // блокирующая держит единственный слот
+	s := rwSlidingSetup(t, 1, 1) // the blocking one holds the only slot
 	f := s.f
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1702,8 +1702,8 @@ func TestRenderWorker_RunCancelWhileWaitingSlot(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- Run(ctx, f.w, Options{Concurrency: 1, Consume: 2}) }()
 
-	// Блокирующая доставка в рендере (держит слот) — отменяем: быстрая
-	// в этот момент ждёт семафор.
+	// The blocking delivery is in the render (holding the slot) — we cancel: the fast
+	// one is waiting for the semaphore at this moment.
 	rwWaitURL(t, f.renderer, s.blockURLs[0])
 	cancel()
 
@@ -1723,15 +1723,15 @@ func TestRenderWorker_RunCancelWhileWaitingSlot(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_OptionsDefaults — дефолты цикла воркера и
-// конфигурации согласованы (образец TestWorkerOptionsDefaults T-139;
-// ревью T-142, P3-1 r2): DefaultConcurrency — пол параллелизма доставок
-// изолированных сборок (верхняя граница рекомендации ТЗ 5.6), боевая
-// сборка передаёт max(DefaultConcurrency, render.contexts). T-169 поднял
-// дефолт render.contexts (8) выше пола: инвариант — пол не выше
-// дефолтных контекстов (равенство max — документированному
-// параллелизму), расхождение вниз молча меняло бы поведение боевого
-// экземпляра против документации.
+// TestRenderWorker_OptionsDefaults — the worker loop's defaults and
+// the configuration are consistent (the TestWorkerOptionsDefaults T-139 pattern;
+// the T-142 review, P3-1 r2): DefaultConcurrency — the floor of the delivery parallelism
+// of isolated builds (the upper bound of the spec 5.6 recommendation), the production
+// build passes max(DefaultConcurrency, render.contexts). T-169 raised
+// the default render.contexts (8) above the floor: the invariant — the floor is no higher
+// than the default contexts (the max equality — the documented
+// parallelism), a downward mismatch would silently change the production
+// instance's behavior against the documentation.
 func TestRenderWorker_OptionsDefaults(t *testing.T) {
 	o := Options{}.withDefaults()
 	if o.Concurrency != DefaultConcurrency || o.Consume != DefaultConsume {
@@ -1749,10 +1749,10 @@ func TestRenderWorker_OptionsDefaults(t *testing.T) {
 	}
 }
 
-// --- скользящее потребление цикла (T-142) ------------------------------------
+// --- the loop's sliding consumption (T-142) -----------------------------------
 
-// rwSlidingFixture — строки и доставки тестов скользящего потребления:
-// ключи с разными subdomain_id, у каждой строки свой итоговый URL.
+// rwSlidingFixture — the rows and deliveries of the sliding consumption tests:
+// keys with different subdomain_ids, each row has its own final URL.
 type rwSlidingFixture struct {
 	f         *rwFixture
 	blockKeys []rwRowKey
@@ -1761,9 +1761,9 @@ type rwSlidingFixture struct {
 	bufURLs   []string
 }
 
-// rwSlidingSetup — N блокирующихся строк («страницы-тарпиты», держат
-// слоты до отмены ctx) и M быстрых; доставки — сначала блокирующиеся,
-// потом быстрые (хвост пачки — как в барьерном окне до T-142).
+// rwSlidingSetup — N blocking rows ("page tarpits", they hold the
+// slots until ctx is cancelled) and M fast ones; the deliveries — the blocking ones first,
+// then the fast ones (the chunk's tail — like in the barrier window before T-142).
 func rwSlidingSetup(t *testing.T, blocks, fasts int) *rwSlidingFixture {
 	t.Helper()
 	f := newRWFixture(t)
@@ -1792,7 +1792,7 @@ func rwSlidingSetup(t *testing.T, blocks, fasts int) *rwSlidingFixture {
 	return s
 }
 
-// rwWaitURL — ждёт, пока рендер получит задачу с URL.
+// rwWaitURL — waits until the render gets a task with the URL.
 func rwWaitURL(t *testing.T, r *rwFakeRenderer, url string) {
 	t.Helper()
 	deadline := time.After(5 * time.Second)
@@ -1805,7 +1805,7 @@ func rwWaitURL(t *testing.T, r *rwFakeRenderer, url string) {
 	}
 }
 
-// rwStopLoop — отмена ctx и ожидание чистого nil от Run.
+// rwStopLoop — the ctx cancellation and a wait for a clean nil from Run.
 func rwStopLoop(t *testing.T, cancel context.CancelFunc, done <-chan error) {
 	t.Helper()
 	cancel()
@@ -1819,15 +1819,15 @@ func rwStopLoop(t *testing.T, cancel context.CancelFunc, done <-chan error) {
 	}
 }
 
-// TestRenderWorker_RunSlidingConsumption — суть T-142: чтение q:render не
-// ждёт завершения пачки целиком. Первая доставка окна висит в рендере до
-// отмены ctx (хвост длительностей — страница до render.timeout); при
-// барьере окна (до T-142) wg.Wait держал бы цикл на ней — хвостовые
-// доставки пачки и следующее чтение не начинались. Скользящее потребление
-// обязано подтвердить все быстрые доставки, пока блокирующая в полёте:
-// слоты освобождаются завершившимися задачами, читатель двигается дальше.
+// TestRenderWorker_RunSlidingConsumption — the essence of T-142: the q:render read does
+// not wait for the whole chunk to finish. The window's first delivery hangs in the render until
+// ctx is cancelled (the duration tail — a page up to render.timeout); with
+// a window barrier (before T-142) wg.Wait would hold the loop on it — the chunk's
+// tail deliveries and the next read would not start. The sliding consumption
+// must acknowledge all the fast deliveries while the blocking one is in flight:
+// the slots are freed by the finished tasks, the reader moves on.
 func TestRenderWorker_RunSlidingConsumption(t *testing.T) {
-	s := rwSlidingSetup(t, 1, 4) // блокирующая + 4 быстрых
+	s := rwSlidingSetup(t, 1, 4) // a blocking one + 4 fast ones
 	f := s.f
 	f.pool.j.ackNotify = make(chan struct{}, 8)
 
@@ -1836,9 +1836,9 @@ func TestRenderWorker_RunSlidingConsumption(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- Run(ctx, f.w, Options{Concurrency: 2, Consume: 4}) }()
 
-	// Блокирующая доставка в рендере и держит слот — быстрые дорабатывают
-	// и подтверждаются мимо неё (пачка 4: b0 + f0..f2, чтение f3 —
-	// следующей пачкой, возможной только при скользящем потреблении).
+	// The blocking delivery is in the render and holds the slot — the fast ones finish
+	// and are acknowledged past it (the chunk 4: b0 + f0..f2, the read of f3 —
+	// by the next chunk, possible only with sliding consumption).
 	rwWaitURL(t, f.renderer, s.blockURLs[0])
 	deadline := time.After(5 * time.Second)
 	for acks := 0; acks < 4; {
@@ -1852,8 +1852,8 @@ func TestRenderWorker_RunSlidingConsumption(t *testing.T) {
 	}
 
 	rwStopLoop(t, cancel, done)
-	// Блокирующая доставка не подтверждена — вернётся повторной
-	// доставкой (at-least-once, ТЗ 3.4), быстрые подтверждены.
+	// The blocking delivery is not acknowledged — it will return with a
+	// re-delivery (at-least-once, spec 3.4), the fast ones are acknowledged.
 	acked := f.q.ackedSnapshot()
 	if len(acked) != 4 {
 		t.Fatalf("XACK = %v, нужны 4 быстрые (блокирующая — без XACK)", acked)
@@ -1874,33 +1874,33 @@ func TestRenderWorker_RunSlidingConsumption(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_RunCancelKeepsBufferUnacked — гарантия скользящего
-// буфера (T-142, по образцу httpworker T-139): прочитанные вперёд, но не
-// начатые доставки (слоты заняты блокирующимися задачами) при отмене ctx
-// НЕ запускаются и НЕ подтверждаются — вместе с текущими пачками читателя
-// они остаются в pending стрима и возвращаются клеймом XAUTOCLAIM
-// (at-least-once, ТЗ 3.4). Синхронизация — по факту предвыборки (второе
-// чтение состоялось, пока первая пачка ещё в работе): барьерный цикл до
-// T-142 вторую пачку не читал вовсе — ожидание чтений и есть
-// регрессионная часть (ревью T-142, P2-3), Sleep по времени не нужен.
+// TestRenderWorker_RunCancelKeepsBufferUnacked — the sliding
+// buffer guarantee (T-142, following the httpworker T-139 pattern): the read ahead but not
+// started deliveries (the slots are busy with the blocking tasks) are NOT started and NOT
+// acknowledged on a ctx cancellation — together with the reader's current chunks
+// they stay in the stream's pending and return by an XAUTOCLAIM claim
+// (at-least-once, spec 3.4). The sync — by the fact of the prefetch (the second
+// read happened while the first chunk was still in progress): a barrier loop before
+// T-142 would not read the second chunk at all — waiting for the reads is the
+// regression part (the T-142 review, P2-3), a time-based Sleep is not needed.
 func TestRenderWorker_RunCancelKeepsBufferUnacked(t *testing.T) {
-	s := rwSlidingSetup(t, 2, 4) // обе блокирующие держат слоты
+	s := rwSlidingSetup(t, 2, 4) // both blocking ones hold the slots
 	f := s.f
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
-	// Consume=4: пачка 1 = [b0, b1, f0, f1], пачка 2 = [f2, f3] —
-	// читатель обязан прочитать обе, пока b0/b1 держат оба слота.
+	// Consume=4: chunk 1 = [b0, b1, f0, f1], chunk 2 = [f2, f3] —
+	// the reader must read both while b0/b1 hold both slots.
 	go func() { done <- Run(ctx, f.w, Options{Concurrency: 2, Consume: 4}) }()
 
-	// Обе блокирующиеся в рендере (держат слоты).
+	// Both blocking ones are in the render (holding the slots).
 	for _, url := range s.blockURLs {
 		rwWaitURL(t, f.renderer, url)
 	}
-	// Предвыборка: вторая пачка прочитана до завершения первой —
-	// буфер f2/f3 реально существует (на барьерном цикле чтений
-	// осталось бы 1 и ожидание здесь падало).
+	// The prefetch: the second chunk is read before the first one finishes —
+	// the f2/f3 buffer really exists (on a barrier loop of reads
+	// there would be 1 left and the wait here would fail).
 	deadline := time.After(5 * time.Second)
 	for f.q.consumesCount() < 2 {
 		select {
@@ -1911,8 +1911,8 @@ func TestRenderWorker_RunCancelKeepsBufferUnacked(t *testing.T) {
 		}
 	}
 
-	// Быстрые прочитаны вперёд, но обязаны остаться не начатыми —
-	// не доходя до рендера, сколько бы цикл ни работал.
+	// The fast ones are read ahead but must stay unstarted —
+	// never reaching the render however long the loop runs.
 	for i, url := range s.bufURLs {
 		if n := f.renderer.tasksCountURL(url); n != 0 {
 			t.Errorf("буферная доставка f%d запущена при занятых слотах: рендер вызван %d раз", i, n)
@@ -1933,11 +1933,11 @@ func TestRenderWorker_RunCancelKeepsBufferUnacked(t *testing.T) {
 	}
 }
 
-// rwPoisonQueue — бесконечный источник ядовитых доставок: каждое чтение
-// немедленно возвращает пачку невалидных записей (Decode в
-// processDelivery падает, доставка остаётся без XACK). Скорость чтений
-// ограничивает только предохранитель цикла — идеальный измеритель его
-// работы без таймингов обработки (образец — workerPoisonQueue httpworker).
+// rwPoisonQueue — an endless source of poisoned deliveries: every read
+// immediately returns a chunk of invalid entries (Decode in
+// processDelivery fails, the delivery stays without an XACK). The read rate
+// is limited only by the loop's fuse — a perfect gauge of its work without
+// processing timings (the pattern — workerPoisonQueue httpworker).
 type rwPoisonQueue struct {
 	mu       sync.Mutex
 	consumes int
@@ -1981,20 +1981,20 @@ func (q *rwPoisonQueue) ackedCount() int {
 	return len(q.acked)
 }
 
-// TestRenderWorker_RunBackoffOnFailures — предохранитель скользящего
-// цикла (T-142): при систематическом сбое обработки (каждая доставка
-// падает — здесь ядовитые записи) чтение q:render приостанавливается с
-// удвоением паузы, иначе цикл пережигал бы попытки доставок (XAUTOCLAIM →
-// q:dead, T-025) в горячем режиме; чтения при этом продолжаются — счётчик
-// не блокирует цикл навсегда. Пауза сжата до 100 мс: секунды в юнит-тесте
-// не ждать, границы взяты с многократным запасом против джиттера CI.
+// TestRenderWorker_RunBackoffOnFailures — the sliding loop's fuse
+// (T-142): on a systematic processing failure (every delivery
+// fails — poisoned entries here) the q:render read is suspended with
+// the pause doubling, otherwise the loop would burn the delivery attempts (XAUTOCLAIM →
+// q:dead, T-025) in a hot mode; the reads continue — the counter
+// does not block the loop forever. The pause is shrunk to 100 ms: seconds are not
+// waited out in a unit test, the boundaries are taken with a multiple margin against CI jitter.
 func TestRenderWorker_RunBackoffOnFailures(t *testing.T) {
 	old := renderFailWaitBase
 	renderFailWaitBase = 100 * time.Millisecond
 	t.Cleanup(func() { renderFailWaitBase = old })
 
-	// Пачка чтения минимальна: порог предохранителя — Consume подряд
-	// неудач (1), конвейер чтения не глубже пары доставок.
+	// The read chunk is minimal: the fuse threshold — Consume failures
+	// in a row (1), the read pipeline is no deeper than a couple of deliveries.
 	f := newRWFixture(t)
 	q := &rwPoisonQueue{}
 	w, err := New(f.pool, q, f.store, f.renderer, Options{Concurrency: 1, Consume: 1})
@@ -2007,9 +2007,9 @@ func TestRenderWorker_RunBackoffOnFailures(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- Run(ctx, w, Options{Concurrency: 1, Consume: 1}) }()
 
-	// Первые чтения уходят до срабатывания счётчика (регистрация неудач
-	// асинхронна) — окно в 450 мс покрывает их с запасом; дальше паузы
-	// 100/200/400 мс душат темп чтений до единиц.
+	// The first reads happen before the counter trips (the failure
+	// registration is asynchronous) — a 450 ms window covers them with a margin; then the
+	// 100/200/400 ms pauses throttle the read rate to units.
 	deadline := time.After(5 * time.Second)
 	waitCount := func(n int) int {
 		for {
@@ -2031,8 +2031,8 @@ func TestRenderWorker_RunBackoffOnFailures(t *testing.T) {
 		t.Errorf("чтений %d за 450 мс — предохранитель не душит темп (ждалось ≤10)", first)
 	}
 
-	// Паузы удваиваются: следующий интервал добавляет считанные чтения,
-	// а не десятки. Рост между двумя замерами — не более пары чтений.
+	// The pauses double: the next interval adds a few reads,
+	// not tens. The growth between two measurements — no more than a couple of reads.
 	time.Sleep(450 * time.Millisecond)
 	if grew := q.consumeCount() - first; grew > 2 {
 		t.Errorf("за следующие 450 мс ещё %d чтений — пауза не растёт с серией неудач", grew)
@@ -2047,19 +2047,19 @@ func TestRenderWorker_RunBackoffOnFailures(t *testing.T) {
 	}
 }
 
-// rwPanicQueue — бесконечный источник валидных доставок паникующего
-// ключа: Decode проходит, строка есть, рендер паникует (recover в цикле,
-// ревью T-142 P2-4) — доставки без XACK; скорость чтений душит
-// предохранитель, паники учтены счётчиком failed как неудачи.
+// rwPanicQueue — an endless source of valid deliveries of a panicking
+// key: Decode passes, the row exists, the render panics (a recover in the loop,
+// the T-142 P2-4 review) — deliveries without an XACK; the read rate is throttled by
+// the fuse, the panics are counted by the failed counter as failures.
 type rwPanicQueue struct {
-	payload []byte // Result паникующего ключа (rwKey)
+	payload []byte // the Result of the panicking key (rwKey)
 
 	mu       sync.Mutex
 	consumes int
 }
 
 func (q *rwPanicQueue) Publish(context.Context, string, queue.Message) (string, error) {
-	return "", nil // до публикации паникующая доставка не доходит
+	return "", nil // a panicking delivery never reaches the publication
 }
 
 func (q *rwPanicQueue) Consume(_ context.Context, _, _, _ string, n int) ([]queue.Delivery, error) {
@@ -2086,11 +2086,11 @@ func (q *rwPanicQueue) consumeCount() int {
 	return q.consumes
 }
 
-// TestRenderWorker_RunPanicBackoff — паники в счётчике предохранителя
-// (T-142): серия паникующих доставок без единого подтверждения — та же
-// серия неудач, что и ошибки обработки: чтение q:render душится паузой
-// с удвоением (без учёта паник цикл пережигал бы попытки доставок на
-// полном ходу), процесс не падает.
+// TestRenderWorker_RunPanicBackoff — panics in the fuse counter
+// (T-142): a series of panicking deliveries without a single acknowledgment — the same
+// failure series as processing errors: the q:render read is throttled by a pause
+// with doubling (without counting the panics the loop would burn the delivery attempts
+// at full speed), the process does not crash.
 func TestRenderWorker_RunPanicBackoff(t *testing.T) {
 	old := renderFailWaitBase
 	renderFailWaitBase = 100 * time.Millisecond
@@ -2110,8 +2110,8 @@ func TestRenderWorker_RunPanicBackoff(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- Run(ctx, w, Options{Concurrency: 1, Consume: 1}) }()
 
-	// Паника случилась (доставка дошла до рендера), чтения душатся —
-	// те же границы, что у TestRenderWorker_RunBackoffOnFailures.
+	// The panic happened (the delivery reached the render), the reads are throttled —
+	// the same boundaries as TestRenderWorker_RunBackoffOnFailures.
 	rwWaitURL(t, f.renderer, "https://spa.example/")
 	deadline := time.After(5 * time.Second)
 	waitCount := func(n int) int {
@@ -2144,10 +2144,10 @@ func TestRenderWorker_RunPanicBackoff(t *testing.T) {
 	}
 }
 
-// rwInfraQueue — бесконечный источник валидных доставок q:render с
-// переключаемой ошибкой публикации q:analyze (T-152): в режиме OOM
-// Publish возвращает InfraError — модель ошибки записи результата,
-// обработка доставки падает уже после записи в БД.
+// rwInfraQueue — an endless source of valid q:render deliveries with
+// a switchable q:analyze publication error (T-152): in the OOM mode
+// Publish returns an InfraError — a model of the result write error,
+// the delivery processing fails already after the DB write.
 type rwInfraQueue struct {
 	mu       sync.Mutex
 	consumes int
@@ -2200,8 +2200,8 @@ func (q *rwInfraQueue) ackedCount() int {
 	return q.acked
 }
 
-// rwProbeRedis — клиент SET/XAUTOCLAIM/XPENDING для пробы записи
-// Reliab.Writable (T-152): переключаемая ошибка SET, клейм всегда пуст.
+// rwProbeRedis — a SET/XAUTOCLAIM/XPENDING client for the write probe
+// Reliab.Writable (T-152): a switchable SET error, the claim is always empty.
 type rwProbeRedis struct {
 	mu     sync.Mutex
 	setErr error
@@ -2230,11 +2230,11 @@ func (f *rwProbeRedis) XPendingExt(ctx context.Context, a *redis.XPendingExtArgs
 	return redis.NewXPendingExtCmd(ctx, "xpending")
 }
 
-// TestRenderWorker_RunInfraPause — пауза потребления при устойчивой
-// InfraError публикации (T-152, образец — httpworker): ошибка публикации
-// q:analyze (OOM Redis) — не ошибка рендера, чтение q:render
-// останавливается до восстановления записи (Reliab.Writable), после
-// восстановления — возобновляется и доводит доставки до XACK.
+// TestRenderWorker_RunInfraPause — the consumption pause on a sustained
+// InfraError of publication (T-152, the httpworker pattern): a publication error
+// of q:analyze (a Redis OOM) is not a render error, the q:render read
+// stops until the write recovers (Reliab.Writable), after the
+// recovery — resumes and brings the deliveries to XACK.
 func TestRenderWorker_RunInfraPause(t *testing.T) {
 	old := renderFailWaitBase
 	renderFailWaitBase = 5 * time.Millisecond
@@ -2264,8 +2264,8 @@ func TestRenderWorker_RunInfraPause(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- Run(ctx, w, opts) }()
 
-	// OOM-окно: первая пачка прочитана, публикация упала — чтение
-	// останавливается пробой записи.
+	// The OOM window: the first chunk is read, the publication failed — the read
+	// is stopped by the write probe.
 	deadline := time.After(5 * time.Second)
 	for q.consumeCount() == 0 {
 		select {
@@ -2282,8 +2282,8 @@ func TestRenderWorker_RunInfraPause(t *testing.T) {
 		t.Errorf("подтверждений %d при падающей публикации", q.ackedCount())
 	}
 
-	// Запись восстановлена: чтение возобновляется, доставки доводятся
-	// до XACK.
+	// The write recovered: the read resumes, the deliveries are brought
+	// to XACK.
 	probe.setProbeErr(nil)
 	q.setPublishErr(nil)
 	for q.ackedCount() < 2 {
@@ -2298,9 +2298,9 @@ func TestRenderWorker_RunInfraPause(t *testing.T) {
 	rwStopLoop(t, cancel, done)
 }
 
-// TestRenderFailBackoff — ряд пауз предохранителя: удвоение от базы,
-// потолок DefaultErrorWait, clamp отрицательной серии (ревью T-142,
-// P3-5: streak < 1 не должен паниковать сдвигом).
+// TestRenderFailBackoff — the fuse pause series: a doubling from the base,
+// the DefaultErrorWait cap, the clamp of a negative series (the T-142 review,
+// P3-5: streak < 1 must not panic with a shift).
 func TestRenderFailBackoff(t *testing.T) {
 	old := renderFailWaitBase
 	renderFailWaitBase = time.Second
@@ -2316,8 +2316,8 @@ func TestRenderFailBackoff(t *testing.T) {
 		{2, 2 * time.Second},
 		{3, 4 * time.Second},
 		{5, 16 * time.Second},
-		{6, 30 * time.Second},   // 32 с выше потолка DefaultErrorWait
-		{100, 30 * time.Second}, // серия не растёт выше потолка
+		{6, 30 * time.Second},   // 32 s above the DefaultErrorWait cap
+		{100, 30 * time.Second}, // the series does not grow beyond the cap
 	} {
 		if got := renderFailBackoff(c.streak); got != c.want {
 			t.Errorf("renderFailBackoff(%d) = %s, хочу %s", c.streak, got, c.want)

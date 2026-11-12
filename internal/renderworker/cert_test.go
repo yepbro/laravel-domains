@@ -1,14 +1,14 @@
-// Юнит-тесты политики постоянных ошибок сертификата хоста (T-159,
-// расширение T-172): ERR_CERT_AUTHORITY_INVALID /
-// ERR_CERT_COMMON_NAME_INVALID — свойства хоста, а не сети или
-// инфраструктуры, ретрай бессмысленен; ERR_CERT_DATE_INVALID добавлен по
-// замеру T-172 (0 успешных ретраев из 321 первых неудач за сутки — окно
-// продления сертификата много шире окна ретраев). Cert-класс
-// финализируется без рендера с первой же доставки (без тарпит-лимита
-// T-148, которому лимит даёт странице шанс в изменившихся условиях):
-// итог — сырой HTML HTTP-фазы (rendered = false), публикация q:analyze,
-// подтверждение доставки — q:dead остаётся инфраструктурным ошибкам,
-// очередь q:render не копит попытки cert-хостов. Фейковое окружение —
+// Unit tests of the permanent host certificate error policy (T-159,
+// the T-172 extension): ERR_CERT_AUTHORITY_INVALID /
+// ERR_CERT_COMMON_NAME_INVALID — host properties, not network or
+// infrastructure ones, a retry is pointless; ERR_CERT_DATE_INVALID was added by the
+// T-172 measurement (0 successful retries of 321 first failures per day — the
+// certificate renewal window is much wider than the retry window). The cert class
+// is finalized without a render from the very first delivery (without the T-148 tarpit
+// limit, which gives the page a chance in changed conditions):
+// the result is the raw HTML of the HTTP phase (rendered = false), a q:analyze publication,
+// the delivery acknowledgment — q:dead stays for infrastructure errors,
+// the q:render queue does not accumulate cert hosts' attempts. The fake environment —
 // worker_test.go.
 package renderworker
 
@@ -25,21 +25,21 @@ import (
 	"crawler/internal/render"
 )
 
-// rwCertErr — ошибка рендера, неотличимая от боевой по классификации
-// (classifyCtx: сбои загрузки страницы net::ERR_* — класс task, исходная
-// ошибка chromedp.LoadError с текстом браузера сохраняется в цепочке).
+// rwCertErr — a render error indistinguishable from the production one by classification
+// (classifyCtx: page load failures net::ERR_* — the task class, the original
+// chromedp.LoadError error with the browser text is kept in the chain).
 func rwCertErr(url, code string) error {
 	return &render.Error{Class: render.ClassTask, URL: url,
 		Err: &chromedp.LoadError{ErrorText: code}}
 }
 
-// TestRenderWorker_CertFinalizedWithoutRender — суть T-159: cert-ошибка
-// на ПЕРВОЙ доставке финализирует запись без рендера (тарпитам T-148 для
-// этого нужен номер ≥ TimeoutAttempts — здесь ожидание бессмысленно):
-// обработка успешна (Processing подтверждает доставку), строка остаётся
-// с сырым HTML (rendered = false, content_hash не меняется),
-// публикуется q:analyze (Fresh=true — доработка текущего эпизода),
-// Put/транзакция не выполняются.
+// TestRenderWorker_CertFinalizedWithoutRender — the essence of T-159: a cert error
+// on the FIRST delivery finalizes the entry without a render (the tarpits T-148 need
+// a number ≥ TimeoutAttempts for that — here waiting is pointless):
+// the processing is successful (Processing acknowledges the delivery), the row stays
+// with the raw HTML (rendered = false, content_hash unchanged),
+// q:analyze is published (Fresh=true — reworking the current episode),
+// Put/the transaction are not executed.
 func TestRenderWorker_CertFinalizedWithoutRender(t *testing.T) {
 	for _, code := range certErrorCodes {
 		t.Run(code, func(t *testing.T) {
@@ -48,9 +48,9 @@ func TestRenderWorker_CertFinalizedWithoutRender(t *testing.T) {
 			f.pool.seedRow(rwKey, "https://spa.example/", &raw)
 			f.renderer.err = rwCertErr("https://spa.example/", code)
 
-			// Первая доставка (attempts=1) — финализация сразу, а не ошибка
-			// повторной доставки: ProcessingAttempt подтверждает после
-			// nil-возврата.
+			// The first delivery (attempts=1) — the finalization right away, not an
+			// error of a re-delivery: ProcessingAttempt acknowledges after
+			// a nil return.
 			err := queue.ProcessingAttempt(context.Background(), f.q, "render-worker", rwDelivery("e1"), 1, f.w.processDelivery)
 			if err != nil {
 				t.Fatalf("cert-ошибка первой доставки обязана финализироваться без ошибки (не q:dead): %v", err)
@@ -87,7 +87,7 @@ func TestRenderWorker_CertFinalizedWithoutRender(t *testing.T) {
 			if i := f.pool.j.indexOf(rwEvBegin); i >= 0 {
 				t.Errorf("транзакция не должна открываться (событие на %d)", i)
 			}
-			// Refcount не тронут: сырой HTML остаётся итоговым контентом записи.
+			// The refcount is untouched: the raw HTML stays the entry's final content.
 			if refc := rwRefc(f.pool)[raw]; refc != 1 {
 				t.Errorf("refcount сырого HTML = %d, нужен 1 (ссылка жива)", refc)
 			}
@@ -95,10 +95,10 @@ func TestRenderWorker_CertFinalizedWithoutRender(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_CertFinalizeAnyAttempt — финализация не зависит от
-// номера доставки (противоположность тарпитам T-148): клейм с большим
-// attempts (поздний деплой фикса, смешанная история доставок) тоже
-// финализирует, а не уводит в q:dead.
+// TestRenderWorker_CertFinalizeAnyAttempt — the finalization does not depend on the
+// delivery number (the opposite of the tarpits T-148): a claim with a high
+// attempts (a late fix deploy, a mixed delivery history) also
+// finalizes instead of taking to q:dead.
 func TestRenderWorker_CertFinalizeAnyAttempt(t *testing.T) {
 	f := newRWFixture(t)
 	raw := rwTestHash(1)
@@ -118,18 +118,18 @@ func TestRenderWorker_CertFinalizeAnyAttempt(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_CertFinalizeNoRow — строки нет (перепроверка
-// перезаписала) или у неё нет итогового URL: финализация — штатный отказ
-// без публикации, доставка подтверждается (как ProcessResult).
+// TestRenderWorker_CertFinalizeNoRow — there is no row (the recheck
+// rewrote it) or it has no final URL: the finalization — a regular
+// rejection without a publication, the delivery is acknowledged (like ProcessResult).
 func TestRenderWorker_CertFinalizeNoRow(t *testing.T) {
 	f := newRWFixture(t)
 	f.renderer.err = rwCertErr("https://spa.example/", "net::ERR_CERT_AUTHORITY_INVALID")
 
-	// Строки нет вовсе.
+	// There is no row at all.
 	if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 1); err != nil {
 		t.Fatalf("строки нет — не ошибка: %v", err)
 	}
-	// Строка без итогового URL.
+	// A row without a final URL.
 	f.pool.seedRow(rwKey, "", nil)
 	if err := f.w.processDelivery(context.Background(), rwDelivery("e2"), 1); err != nil {
 		t.Fatalf("без итогового URL — не ошибка: %v", err)
@@ -139,10 +139,10 @@ func TestRenderWorker_CertFinalizeNoRow(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_CertFinalizePublishError — сбой публикации q:analyze
-// при финализации: ошибка без XACK — доставка вернётся и финализация
-// повторится (at-least-once, дубль публикации ограничен попытками,
-// анализатор идемпотентен по ключу).
+// TestRenderWorker_CertFinalizePublishError — a q:analyze publication
+// failure during finalization: an error without an XACK — the delivery will return and the
+// finalization will repeat (at-least-once, a publication duplicate is bounded by the attempts,
+// the analyzer is idempotent by the key).
 func TestRenderWorker_CertFinalizePublishError(t *testing.T) {
 	f := newRWFixture(t)
 	raw := rwTestHash(1)
@@ -150,14 +150,14 @@ func TestRenderWorker_CertFinalizePublishError(t *testing.T) {
 	f.renderer.err = rwCertErr("https://spa.example/", "net::ERR_CERT_AUTHORITY_INVALID")
 	f.q.publishErrs = []error{errors.New("redis недоступен")}
 
-	// Повторная доставка после сбоя публикации (клейм, attempts вырос).
+	// A re-delivery after the publication failure (a claim, attempts grew).
 	if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 2); err == nil {
 		t.Fatal("сбой публикации q:analyze при финализации — ошибка (повторная доставка)")
 	}
 	if acked := f.q.ackedSnapshot(); len(acked) != 0 {
 		t.Errorf("XACK = %v — подтверждения быть не должно", acked)
 	}
-	// Повтор идемпотентен: та же финализация, публикация проходит.
+	// The repeat is idempotent: the same finalization, the publication goes through.
 	if err := f.w.processDelivery(context.Background(), rwDelivery("e1"), 3); err != nil {
 		t.Fatalf("повторная доставка после сбоя публикации обязана финализироваться: %v", err)
 	}
@@ -173,13 +173,13 @@ func TestRenderWorker_CertFinalizePublishError(t *testing.T) {
 	}
 }
 
-// TestRenderWorker_CertNotClassified — прежний путь сохраняется для
-// ошибок вне cert-класса (ошибка без XACK → повторная доставка →
-// redis.max_attempts → q:dead, T-025): сетевые коды (refused может быть
-// временным — восстановление наблюдается, замер T-172: 6.6% ретраев
-// успешны; на последней доставке их финализирует политика T-172),
-// обычные net::ERR_*, ошибки других классов. Проверка на любой попытке:
-// финализация — только cert-класс.
+// TestRenderWorker_CertNotClassified — the former path is preserved for
+// errors outside the cert class (an error without an XACK → a re-delivery →
+// redis.max_attempts → q:dead, T-025): network codes (refused may be
+// temporary — recovery is observed, the T-172 measurement: 6.6% of retries
+// succeed; on the last delivery the T-172 policy finalizes them),
+// ordinary net::ERR_*, errors of other classes. The check on any attempt:
+// only the cert class is finalized.
 func TestRenderWorker_CertNotClassified(t *testing.T) {
 	cases := []struct {
 		name string
@@ -202,10 +202,10 @@ func TestRenderWorker_CertNotClassified(t *testing.T) {
 			f.pool.seedRow(rwKey, "https://spa.example/", &raw)
 			f.renderer.err = c.err
 
-			// Номер доставки ниже последней (MaxAttempts 3): не-cert
-			// ошибки не финализируются cert-политикой никогда — путь
-			// повторной доставки прежний (что с ними на последней
-			// доставке — политика T-172, taskfinal_test.go).
+			// The delivery number is below the last one (MaxAttempts 3): non-cert
+			// errors are never finalized by the cert policy — the
+			// re-delivery path is the former one (what happens to them on the last
+			// delivery is the T-172 policy, taskfinal_test.go).
 			err := queue.ProcessingAttempt(context.Background(), f.q, "render-worker", rwDelivery("e9"), 2, f.w.processDelivery)
 			if err == nil {
 				t.Fatal("ошибка вне cert-класса обязана возвращаться (путь q:dead прежний)")
@@ -222,9 +222,9 @@ func TestRenderWorker_CertNotClassified(t *testing.T) {
 		})
 	}
 
-	// Код сертификата в чужом классе не финализируется и на последней
-	// доставке: контекстный класс — инфраструктура (T-172 финализирует
-	// только класс task).
+	// A certificate code in a foreign class is not finalized on the last
+	// delivery either: the context class — infrastructure (T-172 finalizes
+	// only the task class).
 	t.Run("код сертификата в чужом классе на последней доставке", func(t *testing.T) {
 		f := newRWFixture(t)
 		raw := rwTestHash(1)
@@ -242,9 +242,9 @@ func TestRenderWorker_CertNotClassified(t *testing.T) {
 		}
 	})
 
-	// Таймаут страницы остаётся территорией T-148: cert-распознавание
-	// (ProcessResult проверяет его первым) не должно глотать таймауты —
-	// ниже тарпит-лимита это повторяемая ошибка.
+	// A page timeout stays the territory of T-148: the cert recognition
+	// (ProcessResult checks it first) must not swallow timeouts —
+	// below the tarpit limit it is a retryable error.
 	t.Run("таймаут ниже тарпит-лимита (территория T-148)", func(t *testing.T) {
 		f := newRWFixture(t)
 		raw := rwTestHash(1)
@@ -261,9 +261,9 @@ func TestRenderWorker_CertNotClassified(t *testing.T) {
 	})
 }
 
-// TestRenderWorker_CertMetrics — финализация по сертификату считается
-// задачей этапа, ошибкой класса task и отдельным счётчиком cert-класса;
-// тарпит-счётчик не задет.
+// TestRenderWorker_CertMetrics — a certificate finalization is counted
+// as a stage task, a task class error and a separate cert class counter;
+// the tarpit counter is not touched.
 func TestRenderWorker_CertMetrics(t *testing.T) {
 	f := newRWFixture(t)
 	reg := metrics.New("render-worker")
