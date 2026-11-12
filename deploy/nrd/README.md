@@ -1,123 +1,130 @@
-# Ежедневный входящий фид NRD smet.cz (cron)
+# The daily incoming NRD feed from smet.cz (cron)
 
-Автоматическая подача списка новых доменов в конвейер: cron раз в сутки
-скачивает список новых доменов smet.cz в наблюдаемую папку ingest — файл
-появляется в `<ingest.dir>/add/`, дальше его обрабатывает сервис
-`crawler-ingest` как обычную доставку ([`docs/incoming-files.md`](../../docs/incoming-files.md)).
+Automatic feeding of the new-domain list into the pipeline: once a day,
+cron downloads the smet.cz new-domain list into the watched ingest
+directory — the file appears in `<ingest.dir>/add/`, and the
+`crawler-ingest` service then processes it as a regular delivery
+([`docs/incoming-files.md`](../../docs/incoming-files.md)).
 
-Список — **зона-less**: домены разных зон (1807 зон по справке источника)
-в одном файле, зона каждой строки — последняя метка имени, TLD
-(`internal/idn`, ТЗТ tld-only-zones), недостающие зоны создаются
-автоматически (docs/incoming-files.md §1) — разбивать по каталогам зон
-не нужно.
+The list is **zone-less**: domains of different zones (1807 zones per the
+source's documentation) in one file; the zone of each line is the last
+label of the name, the TLD (`internal/idn`, the tld-only-zones spec);
+missing zones are created automatically (docs/incoming-files.md §1) —
+there is no need to split by zone directories.
 
-| Файл | Куда ставится | Назначение |
+| File | Installed to | Purpose |
 |---|---|---|
-| `fetch-nrd.sh` | `/usr/local/bin/crawler-fetch-nrd` (0755) | скрипт выгрузки: curl → `add/nrd-<дата>.txt.gz.part` → атомарное переименование в `.txt.gz` |
-| `crawler-nrd.cron` | `/etc/cron.d/crawler-nrd` (0644) | запуск ежедневно в **05:33 UTC** |
-| `backfill-nrd.sh` | — (запуск из чекаута, на сервер не ставится) | бэкфилл истории: все закрытые дни строго раньше `NRD_BEFORE` по manifest.json |
+| `fetch-nrd.sh` | `/usr/local/bin/crawler-fetch-nrd` (0755) | the fetch script: curl → `add/nrd-<date>.txt.gz.part` → an atomic rename to `.txt.gz` |
+| `crawler-nrd.cron` | `/etc/cron.d/crawler-nrd` (0644) | runs daily at **05:33 UTC** |
+| `backfill-nrd.sh` | — (run from a checkout, not installed on the server) | history backfill: all closed days strictly before `NRD_BEFORE`, per manifest.json |
 
-## Закрытый день вместо today.txt
+## A closed day instead of today.txt
 
-Источник (справка — <https://smet.cz/nrd/>) публикует каждый день
-отдельным immutable-файлом `/nrd/data/daily/<дата>.txt[.gz]`: файл дня
-«растёт до закрытия дня, затем не меняется», хранится 90 дней; `today.txt`
-— просто мутирующий псевдоним текущего дня. Скрипт берёт файл
-**вчерашней (UTC) даты** — закрытый день:
+The source (its documentation — <https://smet.cz/nrd/>) publishes each day
+as a separate immutable file `/nrd/data/daily/<date>.txt[.gz]`: a day's
+file "grows until the day closes, then never changes", kept for 90 days;
+`today.txt` is just a mutating alias of the current day. The script takes
+the file of **yesterday's (UTC) date** — a closed day:
 
-- генерация дня у источника идёт ~20:10–20:19 UTC; файл текущего дня до
-  неё отсутствует (404), а сразу после — ещё растёт, полного дня не даёт;
-- на момент запуска 05:33 UTC файл вчерашнего дня (по UTC) закрыт более
-  чем 9 часов назад (генерация 20:10–20:19 UTC предыдущих суток) и больше
-  не изменится — какой день скачан, известно из имени, состав
-  гарантированно полный (сам справочник источника рекомендует забирать
-  только закрытые дни);
-- датировка дня — UTC, файл в архиве `processed/` самодокументируется:
-  `nrd-2026-10-22.txt.gz` = регистрации дня 2026-10-22.
+- the source generates a day at ~20:10–20:19 UTC; the current day's file
+  is absent (404) until then, and right after that it is still growing
+  and does not give the complete day;
+- at the 05:33 UTC run time, yesterday's (UTC) file has been closed for
+  more than 9 hours (generation at 20:10–20:19 UTC of the previous
+  calendar day) and will not change again — which day was downloaded is
+  known from the name, and the content is guaranteed complete (the
+  source's own documentation recommends taking only closed days);
+- a day is dated in UTC; the file in the `processed/` archive documents
+  itself: `nrd-2026-10-22.txt.gz` = the registrations of the day
+  2026-10-22.
 
-Формат — `.txt.gz` (~2,6 МиБ вместо ~8 МиБ): ingest принимает `.gz`
-(docs/incoming-files.md §9, `.gz` — один член); производительность на
-этом проде уже подтверждена `30d.txt.gz` (12,3 млн строк, 22.10).
+The format is `.txt.gz` (~2.6 MiB instead of ~8 MiB): ingest accepts
+`.gz` (docs/incoming-files.md §9; a `.gz` — a single member);
+performance on this production is already proven by `30d.txt.gz`
+(12.3M lines, Oct 22).
 
-## Установка
+## Installation
 
 ```bash
 install -m 0755 fetch-nrd.sh /usr/local/bin/crawler-fetch-nrd
 install -m 0644 crawler-nrd.cron /etc/cron.d/crawler-nrd
 ```
 
-Зависимости — `curl` и `cron` (пакеты ОС, на боевом сервере есть).
-Права root: файл кладётся владельцем `crawler-ingest:crawler` 0640,
-как ручная доставка оператора.
+The dependencies — `curl` and `cron` (OS packages, present on the
+production server). Root permissions: the file is placed by the owner
+`crawler-ingest:crawler` with 0640, like the operator's manual delivery.
 
-Проверить прямо сейчас (не дожидаясь расписания):
+Check it right now (without waiting for the schedule):
 
 ```bash
 /usr/local/bin/crawler-fetch-nrd
-journalctl -t crawler-nrd-fetch --since -1d    # строка «OK: день … закрыт, … sha256 …»
+journalctl -t crawler-nrd-fetch --since -1d    # the line "OK: day … closed, … sha256 …"
 ```
 
-Дальнейшее — обычный жизненный цикл ingest: файл уходит в
-`incoming/processed/add/`, домены — в БД, строка — в журнал
-`ingest_files` (sha256 из лога = sha256 байтов `.gz`, как у всех
-архивов §9), зоны видны в `crawlerctl zones list`.
+From there it is the usual ingest lifecycle: the file goes to
+`incoming/processed/add/`, the domains go to the DB, and a row goes into
+the `ingest_files` journal (the sha256 from the log = the sha256 of the
+`.gz` bytes, as for all archives of §9); the zones are visible in
+`crawlerctl zones list`.
 
-## Поведение и отказы
+## Behavior and failures
 
-- **Расписание — 05:33 UTC** (перенос с 20:33 UTC 26.10, T-205:
-  применение суточного файла — один INSERT…SELECT на ~470 тыс. доменов —
-  попадал в вечернее окно CPU-голода (PSI ~80%) и полуночный шторм
-  суточной перепроверки; утро — вне часов голода, день источника закрыт
-  >9 ч, контракт закрытых дней сохранён). Cron не умеет часовой пояс в
-  строке: в `crawler-nrd.cron` часы переведены в местное время сервера
-  (Europe/Moscow, UTC+3 → `33 8 * * *`); при смене зоны сервера
-  (`timedatectl`) пересчитать обратно в 05:33 UTC.
-- **Сбой сети/HTTP** — `curl --fail --retry 3`; файл не ставится
-  вовсе (частично скачанный `.part` удаляется), запись `СБОЙ: …` в
-  `journalctl -t crawler-nrd-fetch`, код выхода 1 — на эти же сутки
-  других попыток нет. В отличие от `today.txt`, день в `/daily/`
-  хранится 90 дней: пропущенный запуск восстанавливается повторной
-  доставкой — `/usr/local/bin/crawler-fetch-nrd` вручную (тот же
-  закрытый день) или указанием даты:
+- **The schedule is 05:33 UTC** (moved from 20:33 UTC on Oct 26, T-205:
+  applying the daily file — a single INSERT…SELECT over ~470k domains —
+  landed in the evening CPU-starvation window (PSI ~80%) and the midnight
+  storm of the daily re-check; the morning is outside the starvation
+  hours, the source's day has been closed for >9 h, and the closed-day
+  contract is preserved). Cron cannot express a time zone in its line: in
+  `crawler-nrd.cron` the hours are converted to the server's local time
+  (Europe/Moscow, UTC+3 → `33 8 * * *`); when the server's zone changes
+  (`timedatectl`), convert them back to 05:33 UTC.
+- **Network/HTTP failure** — `curl --fail --retry 3`; the file is not
+  placed at all (a partially downloaded `.part` is removed), a
+  `FAILURE: …` entry goes to `journalctl -t crawler-nrd-fetch`, exit
+  code 1 — no further attempts on the same day. Unlike `today.txt`, a day
+  in `/daily/` is kept for 90 days: a missed run is recovered by
+  re-delivery — `/usr/local/bin/crawler-fetch-nrd` by hand (the same
+  closed day) or with a date specified:
   `CRAWLER_NRD_DAY=2026-10-22 /usr/local/bin/crawler-fetch-nrd`.
-- **Не-gzip ответ** (HTML-заглушка с HTTP 200, пустой/обрезанный файл)
-  отсекается санитарной проверкой магики gzip — файл не ставится,
-  `СБОЙ` в лог.
-- **Повторный запуск в тот же день** безвреден: URL и содержимое
-  закрытого дня неизменны → тот же `sha256` → дедуп `ingest_files`,
-  повторной обработки нет (docs/incoming-files.md §5).
-- Мусорные строки внутри списка фильтрует сам ingest (порог
-  `ingest.max_error_ratio`, docs/incoming-files.md §4).
+- **A non-gzip response** (an HTML stub with HTTP 200, an empty/truncated
+  file) is rejected by the sanity check of the gzip magic — the file is
+  not placed, `FAILURE` to the log.
+- **A re-run on the same day** is harmless: the closed day's URL and
+  content are unchanged → the same `sha256` → the `ingest_files` dedup,
+  no re-processing (docs/incoming-files.md §5).
+- Junk lines inside the list are filtered by ingest itself (the
+  `ingest.max_error_ratio` threshold, docs/incoming-files.md §4).
 
-## Бэкфилл истории (backfill-nrd.sh)
+## History backfill (backfill-nrd.sh)
 
-Доливка истории или пропущенных запусков пачкой: читает `manifest.json`,
-доставляет в `add/` все закрытые дни **строго раньше `NRD_BEFORE`**
-(дни у источника immutable, хранятся 90 дней). Идемпотентен — уже
-доставлявшиеся дни (файл в `add/` или `processed/add/`) пропускает,
-повторный запуск доливает только недостающее. Контракт доставки тот же,
-что у `fetch-nrd.sh`; пауза 2 с между запросами (рекомендация источника
-для исторических файлов); обработка — фоновым порядком ingest
-(~1 мин/день), скрипт только доставляет. Итог —
+A bulk top-up of history or missed runs: it reads `manifest.json` and
+delivers to `add/` all closed days **strictly before `NRD_BEFORE`**
+(the source's days are immutable, kept for 90 days). It is idempotent —
+days already delivered (a file in `add/` or `processed/add/`) are
+skipped; a re-run tops up only the missing ones. The delivery contract is
+the same as `fetch-nrd.sh`'s; a 2 s pause between requests (the source's
+recommendation for historical files); processing happens in ingest's
+background order (~1 min/day), the script only delivers. The result —
 `journalctl -t crawler-nrd-backfill`.
 
-Запуск на сервере от root; на сервер не устанавливается:
+Run on the server as root; not installed on the server:
 
 ```bash
-ssh root@<сервер> 'NRD_BEFORE=2026-09-21 bash -s' -- < deploy/nrd/backfill-nrd.sh
-# точечно один день — обычным фидом, без root-скрипта:
+ssh root@<server> 'NRD_BEFORE=2026-09-21 bash -s' -- < deploy/nrd/backfill-nrd.sh
+# a single day, point-wise — via the regular feed, without the root script:
 CRAWLER_NRD_DAY=2026-09-21 /usr/local/bin/crawler-fetch-nrd
 ```
 
-Применено 2026-10-23: `NRD_BEFORE=2026-09-21` (59 дней, 2026-07-24…20.09)
-и `NRD_BEFORE=2026-09-23` (долив дыры 21–22.09, остальные 59 SKIP) —
-история непрерывна с 2026-07-24.
+Applied 2026-10-23: `NRD_BEFORE=2026-09-21` (59 days,
+2026-07-24…Sep 20) and `NRD_BEFORE=2026-09-23` (topping up the hole of
+Sep 21–22, the other 59 SKIP) — the history is continuous from
+2026-07-24.
 
-## Отмена
+## Removal
 
 ```bash
 rm /etc/cron.d/crawler-nrd /usr/local/bin/crawler-fetch-nrd
 ```
 
-Уже обработанные файлы/домены остаются в БД — при необходимости
-вычистить список доставкой в `delete/` (docs/incoming-files.md §6).
+Already processed files/domains remain in the DB — if needed, purge the
+list by delivering to `delete/` (docs/incoming-files.md §6).

@@ -1,66 +1,69 @@
-# Публичный вход: nginx + TLS (образец, T-124)
+# Public entrance: nginx + TLS (sample, T-124)
 
-Лендинг (`cmd/web`, `web.listen`) — публичная точка входа системы для
-посетителей. Сервис слушает loopback (дефолт `127.0.0.1:8080`), наружу его
-публикует reverse-proxy, терминирующий TLS. До этапа 13 публичного входа
-в репозитории не было — этот каталог фиксирует первый образец.
-Операторский дашборд публикуется той же схемой отдельным server-блоком
-(docs/deploy.md §6, ТЗД §9.1).
+The landing page (`cmd/web`, `web.listen`) is the system's public entrance
+for visitors. The service listens on loopback (the default `127.0.0.1:8080`);
+a reverse proxy terminating TLS publishes it outward. Until stage 13 there
+was no public entrance in the repository — this directory records the first
+sample. The operator dashboard is published by the same scheme in a
+separate server block (docs/deploy.md §6, dashboard spec §9.1).
 
-| Файл | Назначение |
+| File | Purpose |
 |---|---|
-| `crawler.example.conf` | сервер nginx: HTTP→HTTPS, TLS, проксирование на `web.listen` |
+| `crawler.example.conf` | the nginx server: HTTP→HTTPS, TLS, proxying to `web.listen` |
 
-## Установка
+## Installation
 
 ```bash
 apt install nginx
 cp crawler.example.conf /etc/nginx/sites-available/crawler.conf
 ln -s /etc/nginx/sites-available/crawler.conf /etc/nginx/sites-enabled/
-# подставить server_name и пути сертификатов (например, certbot --nginx)
+# substitute server_name and the certificate paths (for example, certbot --nginx)
 nginx -t && systemctl reload nginx
 ```
 
-Модель доступа (ТЗ §9): наружу — только лендинг; метрики и пробы сервиса
-web живут на loopback `127.0.0.1:9107` (`METRICS_ADDR` юнита
-`crawler-web.service`, docs/deploy.md) и через прокси не публикуются.
-Рейт-лимит формы (`web.rate_limit`, токен-бакет на IP) держит сам сервис:
-`X-Real-IP` в образце передаёт ему адрес посетителя (сервис доверяет
-заголовку от loopback-пира TCP и от пира unix-сокета — nginx
-перезаписывает его `$remote_addr`), лимиты nginx не дублируют (одна
-точка учёта).
+The access model (spec §9): only the landing page goes outward; the web
+service's metrics and probes live on loopback `127.0.0.1:9107`
+(`METRICS_ADDR` of the `crawler-web.service` unit, docs/deploy.md) and are
+not published through the proxy. The form's rate limit (`web.rate_limit`,
+a token bucket per IP) is enforced by the service itself: `X-Real-IP` in
+the sample passes it the visitor's address (the service trusts the header
+from a TCP loopback peer and from a unix-socket peer — nginx overwrites it
+with `$remote_addr`); the nginx limits do not duplicate it (a single
+accounting point).
 
-## Вариант unix-сокета
+## The unix-socket variant
 
-Вместо TCP-loopback можно слушать unix-сокет (по месту деплоя): в
-`/etc/crawler/crawler.env` задать `CRAWLER_WEB_LISTEN=/run/crawler-web/web.sock`
-(юнит создаёт каталог `RuntimeDirectory=crawler-web`; конфиг принимает
-абсолютный путь как форму `web.listen`) и в nginx —
-`proxy_pass http://unix:/run/crawler-web/web.sock;`. Сокет создаётся с
-правами группы сервиса (`UMask=0007` юнита → `0770 crawler:crawler`),
-поэтому воркерам nginx нужен доступ: `usermod -aG crawler www-data &&
-systemctl reload nginx`. Разницы в
-безопасности нет (loopback и сокет — оба «только этот хост»), выбор —
-вкусовое предпочтение не занимать TCP-порт.
+Instead of TCP loopback, the service can listen on a unix socket (at the
+deploy site): set `CRAWLER_WEB_LISTEN=/run/crawler-web/web.sock` in
+`/etc/crawler/crawler.env` (the unit creates the directory
+`RuntimeDirectory=crawler-web`; the config accepts an absolute path as a
+form of `web.listen`) and in nginx —
+`proxy_pass http://unix:/run/crawler-web/web.sock;`. The socket is created
+with the service group's permissions (the unit's `UMask=0007` →
+`0770 crawler:crawler`), so the nginx workers need access:
+`usermod -aG crawler www-data && systemctl reload nginx`. There is no
+security difference (loopback and the socket are both "this host only");
+the choice is a matter of taste about not occupying a TCP port.
 
-Прокси обязан передавать `X-Real-IP` и на сокете: пир unix-сокета
-RemoteAddr IP не несёт («@» автобинда), без заголовка адрес посетителя
-неизвестен — рейт-лимит формы делит один бакет на всех таких клиентов,
-а журнал ручных проверок `web_checks` (`ip_address inet NOT NULL`)
-строку пропускает с Warn в journald (виден и счётчиком
-`crawler_web_check_errors_total{type="non_ip"}`). Запасной источник —
-`X-Forwarded-For` без `X-Real-IP`: адресом считается последняя позиция
-списка (её дописал этот прокси `$proxy_add_x_forwarded_for`; начало
-списка пришло от клиента и не доверено — иначе обходится рейт-лимит).
+The proxy must pass `X-Real-IP` on the socket too: a unix-socket peer's
+RemoteAddr carries no IP (the "@" of autobind), and without the header the
+visitor's address is unknown — the form's rate limit shares one bucket
+among all such clients, and the `web_checks` manual-check log
+(`ip_address inet NOT NULL`) skips the row with a Warn to journald (also
+visible as the `crawler_web_check_errors_total{type="non_ip"}` counter).
+The fallback source is `X-Forwarded-For` without `X-Real-IP`: the last
+position of the list is taken as the address (it was appended by this
+proxy, `$proxy_add_x_forwarded_for`; the head of the list came from the
+client and is not trusted — otherwise the rate limit is bypassed).
 
-## Схема и хост для sitemap.xml
+## The scheme and host for sitemap.xml
 
-`GET /sitemap.xml` лендинга собирает абсолютные URL: хост — канонический
-`web.public_host` из конфигурации (T-227: `Host` запроса за прокси — это
-`$host` посетителя, не настроив канон, `<loc>` зависел бы от чужого
-заголовка; пустое поле — фолбэк на `Host` запроса), схему за этим
-прокси передаёт `X-Forwarded-Proto` — сервис доверяет заголовку только
-от loopback-пира и пира unix-сокета (как `X-Real-IP`), чужое значение
-игнорируется и остаётся схема соединения. Публичный вход обязан
-передавать оба заголовка и задавать `web.public_host`, если меняете
-конфиг.
+The landing page's `GET /sitemap.xml` builds absolute URLs: the host is
+the canonical `web.public_host` from the configuration (T-227: behind the
+proxy the request's `Host` is the visitor's `$host`; without the canon
+set, `<loc>` would depend on a foreign header; an empty field — a fallback
+to the request's `Host`); behind this proxy the scheme is passed by
+`X-Forwarded-Proto` — the service trusts the header only from a loopback
+peer and a unix-socket peer (like `X-Real-IP`); a foreign value is ignored
+and the connection's scheme stays. The public entrance must pass both
+headers and set `web.public_host` if you change the config.

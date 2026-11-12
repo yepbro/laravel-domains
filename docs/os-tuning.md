@@ -1,264 +1,273 @@
-# Тюнинг ОС боевого сервера (ТЗ §10.2)
+# OS tuning of the production server (spec §10.2)
 
-Исходные величины — из конфигурации проекта и кода воркеров; файл настроек —
+The baseline values come from the project configuration and the worker code;
+the settings file is
 [`deploy/sysctl/99-crawler.conf`](../deploy/sysctl/99-crawler.conf),
-инструкция применения и проверки —
+the instructions for applying and verifying are in
 [`deploy/sysctl/README.md`](../deploy/sysctl/README.md).
 
-## 1. Нагрузка, под которую считается тюнинг
+## 1. The load the tuning is sized for
 
-Один сервер, один внешний IP (ТЗ §3.1). Плановые величины (дефолты
-конфига, ТЗ §5.10):
+One server, one external IP (spec §3.1). The planned values (config defaults,
+spec §5.10):
 
-| Величина | Значение | Где |
+| Parameter | Value | Where |
 |---|---|---|
-| dns.concurrency | 2000 | `internal/config`, ТЗ §5.4 |
-| dns.udp_pool_size | 2000 (= concurrency) | пул UDP-сокетов `internal/dnsclient` |
-| dns.max_qps | 10 000 | лимитёр QPS (к локальному unbound) |
-| http.concurrency | 2000 = глобальный потолок соединений | `internal/httpfetch` LimitOptions |
-| http.max_rps | 1000 | глобальный темп запросов |
-| http.per_ip_limit | 4 | соединений на один IP |
-| keep-alive | отключён | ТЗ §5.5, `DisableKeepAlives: true` |
+| dns.concurrency | 2000 | `internal/config`, spec §5.4 |
+| dns.udp_pool_size | 2000 (= concurrency) | the UDP socket pool of `internal/dnsclient` |
+| dns.max_qps | 10,000 | the QPS limiter (toward the local unbound) |
+| http.concurrency | 2000 = the global connection cap | the `internal/httpfetch` LimitOptions |
+| http.max_rps | 1000 | the global request rate |
+| http.per_ip_limit | 4 | connections per one IP |
+| keep-alive | disabled | spec §5.5, `DisableKeepAlives: true` |
 
-Ключевое следствие отключённого keep-alive (ТЗ §5.5 «keep-alive отключён
-или очень короткий idle»): **каждый HTTP-запрос — новое исходящее
-TCP-соединение**. При max_rps 1000 это до ~1000 установок и закрытий
-соединений в секунду с одного IP. DNS-этап идёт параллельно: до 2000
-одновременных UDP-обменов с локальным unbound (один сокет пула — один
-запрос в полёте, контракт `UDPPool`), TCP-fallback при TC=1 — до 2000
-одновременных коротких TCP-соединений тоже к unbound.
+The key consequence of keep-alive being disabled (spec §5.5: "keep-alive is
+disabled or has a very short idle"): **every HTTP request is a new outgoing
+TCP connection**. At max_rps 1000 this is up to ~1000 connection setups and
+closes per second from a single IP. The DNS stage runs in parallel: up to 2000
+concurrent UDP exchanges with the local unbound (one pool socket — one
+request in flight, the `UDPPool` contract), and on TC=1 the TCP fallback —
+up to 2000 concurrent short TCP connections to unbound as well.
 
-DNS-датаграммы малы: клиент `internal/dnsclient` не выставляет EDNS0 —
-запросы ≤ ~300 Б, ответы ≤ 512 Б (усечённый ответ уходит на TCP-fallback,
-где лимита на размер нет). Буфер чтения 64 КиБ (`dns.MaxMsgSize`) — это
-память приложения, не ядра.
+DNS datagrams are small: the `internal/dnsclient` client does not set EDNS0 —
+requests ≤ ~300 B, responses ≤ 512 B (a truncated response goes to the TCP
+fallback, where there is no size limit). The 64 KiB read buffer
+(`dns.MaxMsgSize`) is application memory, not kernel memory.
 
-## 2. Эфемерные порты и TIME_WAIT (ТЗ §10.2 п. 1)
+## 2. Ephemeral ports and TIME_WAIT (spec §10.2 item 1)
 
 ### net.ipv4.ip_local_port_range = 10240 65535
 
-Расчёт потребности в портах:
+Sizing the port demand:
 
-- активные исходящие HTTP-соединения: ≤ 2000 (http.concurrency);
-- TIME_WAIT: соединение, закрытое нашей стороной, живёт 2×MSL = 60 с.
-  Худший сценарий churn 1000/с × 60 с = **до ~60 000 одновременно
-  находящихся в TIME_WAIT четвёрок** (конечные хосты закрывают первыми не
-  всегда — таймауты и тарпиты закрываем мы).
+- active outgoing HTTP connections: ≤ 2000 (http.concurrency);
+- TIME_WAIT: a connection closed by our side lives 2×MSL = 60 s.
+  The worst-case churn of 1000/s × 60 s = **up to ~60,000 4-tuples
+  in TIME_WAIT at the same time** (remote hosts do not always close first —
+  timeouts and tarpits are closed by us).
 
-Уникальность требуется не для порта, а для четвёрки (локальный порт +
-удалённый адрес:порт): один и тот же локальный порт одновременно
-обслуживает разные адреса назначения. Жёсткая потребность — максимум
-одновременных четвёрок **на один адрес назначения** (активные +
-накопленный TIME_WAIT к нему): per_ip_limit 4 держит активные, а
-`tcp_tw_reuse=1` (ниже) позволяет переиспользовать TIME_WAIT-порты для
-новых исходящих. Поэтому диапазон шире жёсткой потребности и выбирается
-по верхняковой оценке: 55 296 портов (дефолт ядра 32768–60999 — 28 232)
-покрывает пик 60k TIME_WAIT + 2k активных с учётом переиспользования
-между назначениями.
+Uniqueness is required not for a port but for a 4-tuple (local port +
+remote address:port): the same local port serves different destination
+addresses at the same time. The hard demand is the maximum number of
+concurrent 4-tuples **to one destination address** (active + the TIME_WAIT
+accumulated toward it): per_ip_limit 4 keeps the active ones, and
+`tcp_tw_reuse=1` (below) allows TIME_WAIT ports to be reused for new
+outgoing connections. So the range is wider than the hard demand and is
+chosen by an upper-bound estimate: 55,296 ports (the kernel default
+32768–60999 — 28,232) covers the peak of 60k TIME_WAIT + 2k active, with
+the reuse between destinations taken into account.
 
-Нижняя граница 10240, а не 1024: все слушатели боевого сервера сидят
-ниже — sshd 22, unbound 53, postgres 5432, redis 6379 (локальный),
-метрики сервисов 9090+, DevTools Chromium 9222. Ядро не занимает
-ephemeral-портом порт действующего слушателя, но исходящее соединение,
-занявшее порт, мешает **подняться** сервису после рестарта (краулер
-работает неделями). Выше 10240 локальных слушателей нет.
+The lower bound is 10240, not 1024: all listeners of the production server
+sit below it — sshd 22, unbound 53, postgres 5432, redis 6379 (local),
+service metrics 9090+, DevTools Chromium 9222. The kernel does not point an
+ephemeral port at the port of an active listener, but an outgoing connection
+that has taken a port keeps the service from **coming up** after a restart
+(the crawler runs for weeks). There are no local listeners above 10240.
 
-Контейнеры dev-окружения задают себе `net.ipv4.ip_local_port_range
-= 1024 65535` в compose отдельно (netns контейнера изолирован); для
-боевого сервера выбран консервативный вариант без риска для слушателей.
+The dev-environment containers set `net.ipv4.ip_local_port_range
+= 1024 65535` for themselves in compose separately (the container's netns
+is isolated); for the production server the conservative option without
+risk to the listeners was chosen.
 
 ### net.ipv4.tcp_tw_reuse = 1
 
-Семантика значений на ядрах ≥ 4.12: 0 — запрет, 1 — глобально для
-исходящих, **2 — только loopback (дефолт современных ядер)**. DNS
-TCP-fallback ходит на loopback — его покрывает и дефолт, но HTTP-воркер
-подключается к удалённым сайтам → нужно 1.
+The semantics of the values on kernels ≥ 4.12: 0 — disabled, 1 — globally
+for outgoing, **2 — loopback only (the default of modern kernels)**. DNS
+TCP fallback goes to loopback — the default covers it too, but the HTTP
+worker connects to remote sites → 1 is needed.
 
-Переиспользование разрешено ядром только через ~1 RTO после входа в
-TIME_WAIT и только при включённых TCP-таймстампах (PAWS защищает от
-приёма старых сегментов прежнего соединения) — `tcp_timestamps = 1`
-зафиксирован явно. Риск для исходящих соединений минимален: механизм
-действует на active open и не затрагивает входящие.
+Reuse is allowed by the kernel only ~1 RTO after an entry into
+TIME_WAIT, and only with TCP timestamps enabled (PAWS protects against
+receiving stale segments of the previous connection) — `tcp_timestamps = 1`
+is pinned explicitly. The risk to outgoing connections is minimal: the
+mechanism acts on active open and does not touch incoming ones.
 
-`tcp_tw_recycle` **не применяется**: удалён из ядра в 4.12 именно за
-потери соединений за NAT — упоминание здесь, чтобы не «всплывал» в
-поиске; на целевом сервере его нет.
+`tcp_tw_recycle` **is not used**: it was removed from the kernel in 4.12
+precisely for breaking connections behind NAT — it is mentioned here so it
+does not "surface" in searches; it is absent on the target server.
 
 ### net.ipv4.tcp_max_tw_buckets = 262144
 
-Потолок числа TIME_WAIT-сокетов: ожидаемый пик ~60 000 (расчёт выше) —
-запас ×4. При переполнении ядро прибивает TIME_WAIT немедленно с записью
-`TCP: time wait bucket table overflow` в лог — для исходящих соединений
-это безопасно, но шумно и маскирует проблемы; дефолт на машине с 8 ГБ
-может оказаться близок к пику. Память на запись (~слот в ehash) мала.
+A cap on the number of TIME_WAIT sockets: the expected peak is ~60,000
+(the calculation above) — a ×4 margin. On overflow the kernel kills the
+TIME_WAIT entries immediately, logging
+`TCP: time wait bucket table overflow` to the log — for outgoing
+connections this is safe, but noisy and masks problems; the default on an
+8 GB machine may turn out to be close to the peak. The memory per entry
+(~a slot in the ehash) is small.
 
-## 3. Приёмные очереди: somaxconn, syn_backlog, backlog
+## 3. Receive queues: somaxconn, syn_backlog, backlog
 
-Слушающие сокеты боевого сервера — это не краулерные соединения, а
-локальные сервисы: unbound TCP 53 (принимает TCP-fallback DNS-воркера —
-до ~2000 одновременных), метрики каждого Go-сервиса, postgres, redis.
+The listening sockets of the production server are not the crawler's
+connections but local services: unbound TCP 53 (takes the DNS worker's
+TCP fallback — up to ~2000 concurrent), the metrics of every Go service,
+postgres, redis.
 
-- `net.core.somaxconn = 4096` — потолок accept-очереди слушателя
-  (cap `listen(backlog)`). Дефолт 128 у части дистрибутивов: всплеск
-  TC=1 (массовое усечение DNSSEC-ответов) может уронить часть
-  TCP-fallback по overflow.
-- `net.ipv4.tcp_max_syn_backlog = 4096` — SYN-очередь тех же слушателей;
-  синхронно с somaxconn.
-- `net.core.netdev_max_backlog = 4096` — очередь пакетов между мягким
-  IRQ и протоколом. RX-нагрузка краулера — скачивание тел до 2 МиБ ×
-  до 1000 RPS: гигабитные пики дропаются при дефолте 1000 (контроль —
-  вторая колонка `/proc/net/softnet_stat`), дроп = ретрансмиты.
-  4096 — с запасом; память на слот мала.
+- `net.core.somaxconn = 4096` — the cap on a listener's accept queue
+  (caps `listen(backlog)`). The default of 128 on some distributions: a
+  TC=1 burst (mass truncation of DNSSEC responses) can knock out part of
+  the TCP fallback by overflow.
+- `net.ipv4.tcp_max_syn_backlog = 4096` — the SYN queue of the same
+  listeners; kept in sync with somaxconn.
+- `net.core.netdev_max_backlog = 4096` — the packet queue between softirq
+  and the protocol. The crawler's RX load is downloading bodies of up to
+  2 MiB × up to 1000 RPS: gigabit peaks are dropped at the default of 1000
+  (the check is the second column of `/proc/net/softnet_stat`); a drop =
+  retransmissions. 4096 — with a margin; the memory per slot is small.
 
-Риски: длина очереди × `sk_buff` — копеечная память против 8 ГБ RAM;
-отдельные всплески будут попадать в очередь, а не в дроп.
+Risks: the queue length × `sk_buff` — negligible memory against 8 GB of
+RAM; individual bursts will land in the queue, not in a drop.
 
-## 4. Дескрипторы файлов: fs.file-max и nofile (ТЗ §10.2 п. 1)
+## 4. File descriptors: fs.file-max and nofile (spec §10.2 item 1)
 
-### nofile — лимит на процесс
+### nofile — the per-process limit
 
-Крупнейший потребитель — dns-worker:
+The largest consumer is dns-worker:
 
-| Составляющая | Расчёт |
+| Component | Calculation |
 |---|---|
-| пул UDP-сокетов | 2000 (dns.udp_pool_size) |
-| TCP-fallback | ≤ 2000 одновременных (каждый обмен с TC=1 — своё соединение; ограничен concurrency) |
-| пул БД + Redis + epfd/таймеры/метрики | ~100 |
-| **итого** | **~4100** |
+| UDP socket pool | 2000 (dns.udp_pool_size) |
+| TCP fallback | ≤ 2000 concurrent (each TC=1 exchange is its own connection; bounded by concurrency) |
+| DB pool + Redis + epfd/timers/metrics | ~100 |
+| **total** | **~4100** |
 
-http-worker: ≤ 2000 соединений (GlobalConns — редиректные ходы берутся из
-того же бюджета лимитёра) + ~200 (пулы, пак-файлы на запись) ≈ 2200.
+http-worker: ≤ 2000 connections (GlobalConns — redirect hops come out of
+the same limiter budget) + ~200 (pools, pack files being written) ≈ 2200.
 
-Отсюда **LimitNOFILE=65535** для каждого Go-сервиса — запас ×16 над
-крупнейшим процессом. В systemd его ставит T-085 (`deploy/systemd/`),
-в Docker он уже задан (`ulimits.nofile` в compose). Это не sysctl —
-в `99-crawler.conf` не входит; потолок nofile `fs.nr_open` (дефолт
-1 048 576) выше 65535 и не трогается.
+Hence **LimitNOFILE=65535** for every Go service — a ×16 margin over the
+largest process. In systemd it is set by T-085 (`deploy/systemd/`),
+in Docker it is already in place (`ulimits.nofile` in compose). It is not
+a sysctl — not part of `99-crawler.conf`; the nofile cap `fs.nr_open`
+(default 1,048,576) is above 65535 and is left untouched.
 
-### fs.file-max = 2097152 — системный потолок
+### fs.file-max = 2097152 — the system-wide cap
 
-Сумма по всем процессам (пик):
+The sum across all processes (peak):
 
-| Потребитель | Пик fd |
+| Consumer | fd peak |
 |---|---|
 | dns-worker | ~4100 |
 | http-worker | ~2200 |
-| unbound (TCP-fallback на приём) | ~2100 |
+| unbound (accepting the TCP fallback) | ~2100 |
 | render-worker + Chromium | ~1500 |
-| analyzer (чтение паков) | ~300 |
+| analyzer (reading packs) | ~300 |
 | scheduler, ingest, monitor | ~300 |
 | PostgreSQL (max_connections) | ~300 |
 | Redis, systemd/journald/sshd | ~700 |
-| **итого** | **~11 600** |
+| **total** | **~11,600** |
 
-Роль значения — не «бюджет» (лимит память не аллоцирует: `struct file`
-выделяется только под реально открытый файл), а общесистемная страховка
-от утечки дескрипторов: конечный потолок срабатывает раньше, чем утечка
-съест память. 2 097 152 — на два порядка выше планового пика. На новых
-ядрах дефолт — LONG_MAX («нет лимита»), на старых LTS — расчёт по RAM;
-в обоих случаях 2M достаточно и не занижает дефолт до опасной близости
-к пику: file-max — kill-switch уровня всей ОС (ENFILE блокирует sshd и
-postgres вместе с краулером).
+The role of the value is not a "budget" (the limit allocates no memory:
+a `struct file` is allocated only for a file actually open), but a
+system-wide guard against descriptor leaks: the finite cap trips before
+the leak eats the memory. 2,097,152 is two orders of magnitude above the
+planned peak. On new kernels the default is LONG_MAX ("no limit"), on
+older LTS ones it is computed from RAM; in both cases 2M is enough and
+does not lower the default to a dangerously close distance from the peak:
+file-max is a kill-switch at the whole-OS level (ENFILE blocks sshd and
+postgres together with the crawler).
 
-Проверка лимита процесса: `cat /proc/$(pidof dns-worker)/limits`;
-системного счётчика: `cat /proc/sys/fs/file-nr`.
+Checking the process limit: `cat /proc/$(pidof dns-worker)/limits`;
+the system-wide counter: `cat /proc/sys/fs/file-nr`.
 
-## 5. Conntrack (ТЗ §10.2 п. 2)
+## 5. Conntrack (spec §10.2 item 2)
 
-Если загружен модуль `nf_conntrack` (правила iptables/nftables, Docker),
-каждый поток занимает запись таблицы.
+If the `nf_conntrack` module is loaded (iptables/nftables rules, Docker),
+every flow takes a table entry.
 
-Расчёт: churn ~1000 закрытых TCP/с; conntrack держит запись ещё
-`nf_conntrack_tcp_timeout_time_wait` = 120 с после закрытия →
-**~120 000 записей в steady state** + ~4000 активных TCP + UDP-потоки
-(2000 подключённых сокетов пула к unbound — loopback-трафик тоже
-отслеживается, записи постоянно освежаются и не expire-ятся; плюс
-unbound → апстримы).
+Sizing: a churn of ~1000 closed TCP/s; conntrack keeps an entry for another
+`nf_conntrack_tcp_timeout_time_wait` = 120 s after closing →
+**~120,000 entries in steady state** + ~4000 active TCP + the UDP flows
+(2000 connected pool sockets to unbound — loopback traffic is tracked too:
+the entries are constantly refreshed and do not expire; plus
+unbound → upstreams).
 
-Дефолт `nf_conntrack_max` на машине с 8 ГБ — обычно 262 144: рабочий,
-но без запаса на пики и всплески. Переполнение роняет пакеты **всех**
-соединений сервера (`nf_conntrack: table full, dropping packet`) —
-включая postgres/unbound loopback. Отсюда:
+The default `nf_conntrack_max` on an 8 GB machine is usually 262,144:
+workable, but without a margin for peaks and bursts. Overflow drops packets
+of **all** of the server's connections
+(`nf_conntrack: table full, dropping packet`) — including postgres/unbound
+loopback. Hence:
 
-- `net.netfilter.nf_conntrack_max = 1048576` — запас ×8 над steady
-  state; память ленивая, ~320 Б × живая запись (120k ≈ 37 МиБ).
-- `net.netfilter.nf_conntrack_buckets = 262144` (хэш-таблица = max/4):
-  цепочки длиннее ~8 записей деградируют lookup в hot path каждого
-  пакета. Запись через sysctl с ядра 5.15; на старых — параметр модуля
-  `hashsize=262144` (см. deploy/sysctl/README.md).
+- `net.netfilter.nf_conntrack_max = 1048576` — a ×8 margin over steady
+  state; the memory is lazy, ~320 B × a live entry (120k ≈ 37 MiB).
+- `net.netfilter.nf_conntrack_buckets = 262144` (the hash table = max/4):
+  chains longer than ~8 entries degrade lookup in the hot path of every
+  packet. Writable via sysctl since kernel 5.15; on older ones — the
+  module parameter `hashsize=262144` (see deploy/sysctl/README.md).
 
-Ключи `net.netfilter.*` существуют только при загруженном модуле — без
-него systemd-sysctl пропускает строки с предупреждением. Для
-персистентности модуль включается в автозагрузку
-(`/etc/modules-load.d/nf_conntrack.conf` — `systemd-modules-load`
-отрабатывает до `systemd-sysctl`), иначе на перезагрузке значения
-потеряются: модуль, поднятый позже Docker'ом или правилами файрвола,
-получит дефолты. Изменение хэш-таблицы на лету на ядрах < 5.15 — записью
-в `/sys/module/nf_conntrack/parameters/hashsize` (выгрузка модуля на
-работающем сервере невозможна).
+The `net.netfilter.*` keys exist only when the module is loaded — without
+it systemd-sysctl skips the lines with a warning. For persistence the
+module is added to the autoload list
+(`/etc/modules-load.d/nf_conntrack.conf` — `systemd-modules-load` runs
+before `systemd-sysctl`), otherwise the values will be lost on reboot: a
+module raised later by Docker or by firewall rules will get the defaults.
+Changing the hash table on the fly on kernels < 5.15 — by writing to
+`/sys/module/nf_conntrack/parameters/hashsize` (unloading the module on a
+running server is impossible).
 
-Альтернатива из ТЗ («или исключить трафик краулера») — NOTRACK для
-исходящего HTTP-воркера:
+The alternative from the spec ("or exclude the crawler's traffic") —
+NOTRACK for the HTTP worker's outgoing traffic:
 
 ```
 iptables -t raw -A OUTPUT -m owner --uid-owner http-worker -j CT --notrack
 ```
 
-Плюс: записи вообще не создаются. Минусы: трафик выпадает из stateful
-фаервола (правила ESTABLISHED больше не матчатся — нужен отдельный
-allow), ломает NAT — несовместимо с Docker-хостами. Основной путь
-проекта — увеличенная таблица; NOTRACK оставлен как аварийный рычаг на
-случай узких мест, выявленных замерами (T-092).
+Pros: no entries are created at all. Cons: the traffic drops out of the
+stateful firewall (the ESTABLISHED rules no longer match — a separate
+allow is needed), breaks NAT — incompatible with Docker hosts. The
+project's main path is the enlarged table; NOTRACK is kept as an emergency
+lever for bottlenecks surfaced by measurements (T-092).
 
-## 6. UDP-буферы DNS (ТЗ §10.2 п. 3, §5.4)
+## 6. DNS UDP buffers (spec §10.2 item 3, §5.4)
 
 - `net.core.rmem_max = 16777216`, `net.core.wmem_max = 16777216` —
-  потолок `setsockopt(SO_RCVBUF/SO_SNDBUF)` для процессов без
-  CAP_NET_ADMIN. Поднимается прежде всего ради **unbound**: при высоком
-  QPS его `so-rcvbuf` упирается в rmem_max (ядерные датаграммы от
-  апстримов очередями на медленных зонах), без права CAP_NET_ADMIN
-  запрос молча обрезается. Запас есть и для будущего `SetReadBuffer`
-  пула `internal/dnsclient` (сейчас пул буферы не задаёт — работает
-  rmem_default).
-- `net.core.rmem_default` / `net.core.wmem_default` — сознательно **не
-  задаются** (в конфиге закомментированы с обоснованием). Значения по
-  умолчанию уже достаточны: на каждом сокете пула ровно один запрос в
-  полёте (контракт UDPPool), датаграммы ≤ 512 Б — 208 КиБ дефолта на
-  сокет даёт запас ×400. Явная фиксация дефолта ядра (212 992) перебивала
-  бы тюнинг дистрибутива/администратора: файлы `/etc/sysctl.d`
-  применяются в лексикографическом порядке, и `99-crawler.conf`
-  перекрыл бы любое ранее выставленное значение без функциональной
-  пользы.
-- TCP-fallback (ответы до 64 КиБ) и HTTP-тела (до 2 МиБ) живут на
-  `net.ipv4.tcp_rmem/tcp_wmem` с автотюнингом — дефолтного max
-  4–6 МиБ достаточно (тело читается потоково в пак-файлы, окно
-  ограничено BDP, а не размером тела). Не трогаем.
+  the cap on `setsockopt(SO_RCVBUF/SO_SNDBUF)` for processes without
+  CAP_NET_ADMIN. Raised primarily for the sake of **unbound**: at high
+  QPS its `so-rcvbuf` runs into rmem_max (kernel datagrams from the
+  upstreams queue up on slow zones), and without the CAP_NET_ADMIN
+  capability the request is silently clipped. The margin also covers a
+  future `SetReadBuffer` of the `internal/dnsclient` pool (the pool does
+  not set the buffers now — rmem_default applies).
+- `net.core.rmem_default` / `net.core.wmem_default` — deliberately **not
+  set** (commented out in the config, with the rationale). The defaults
+  are already sufficient: exactly one request in flight per pool socket
+  (the UDPPool contract), datagrams ≤ 512 B — the default 208 KiB per
+  socket gives a ×400 margin. Pinning the kernel default (212,992)
+  explicitly would override the distribution's/administrator's tuning:
+  the files in `/etc/sysctl.d` are applied in lexicographic order, and
+  `99-crawler.conf` would overwrite any value set earlier, with no
+  functional gain.
+- TCP fallback (responses up to 64 KiB) and HTTP bodies (up to 2 MiB) live
+  on `net.ipv4.tcp_rmem/tcp_wmem` with autotuning — the default max of
+  4–6 MiB suffices (the body is read streaming into the pack files; the
+  window is bounded by the BDP, not by the body size). Left alone.
 
-## 7. Что сознательно не настраивается
+## 7. What is deliberately not configured
 
-| Параметр | Причина |
+| Parameter | Reason |
 |---|---|
-| `net.ipv4.tcp_tw_recycle` | удалён из ядра (4.12); на целевом сервере отсутствует |
-| `net.ipv4.tcp_mem` | автотюн по RAM (на 8 ГБ ≈ 344/458/686 МиБ); тела читаются потоково, per-socket окно ограничено tcp_rmem — явное значение без замеров (T-092) закреплять рано; превышение маловероятно и не фатально (thrashing, не drop) |
-| `net.ipv4.udp_mem` | автотюн по RAM; датаграммы ≤ 512 Б × 2000 сокетов — на порядки ниже зоны давления |
-| `net.ipv4.ip_local_reserved_ports` | нижняя граница диапазона 10240 уже выводит всех локальных слушателей из зоны конфликтов |
-| `net.ipv4.tcp_fin_timeout` | FIN_WAIT-2-сироты краулера ограничены churn × 60 с ≈ в пределах 60k и убиваются таймером; отдельной проблемы нет |
-| `net.ipv4.tcp_syncookies` | защита входящих listen-сокетов; SYN-flood не сценарий внутреннего сервера |
+| `net.ipv4.tcp_tw_recycle` | removed from the kernel (4.12); absent on the target server |
+| `net.ipv4.tcp_mem` | autotuned from RAM (8 GB ≈ 344/458/686 MiB); the bodies are read streaming and the per-socket window is bounded by tcp_rmem — pinning an explicit value without measurements (T-092) is premature; exceeding it is unlikely and not fatal (thrashing, not drops) |
+| `net.ipv4.udp_mem` | autotuned from RAM; datagrams ≤ 512 B × 2000 sockets — orders of magnitude below the pressure zone |
+| `net.ipv4.ip_local_reserved_ports` | the range's lower bound of 10240 already takes all local listeners out of the conflict zone |
+| `net.ipv4.tcp_fin_timeout` | the crawler's FIN_WAIT-2 orphans are bounded by churn × 60 s ≈ within 60k and are killed by the timer; there is no separate problem |
+| `net.ipv4.tcp_syncookies` | protection of inbound listening sockets; a SYN flood is not a scenario for an internal server |
 
-## 8. Мониторинг после применения
+## 8. Monitoring after applying
 
-Контроль под нагрузкой (суточный прогон T-093 — выполнен, окно 23–24.10
-≈25 ч, OOM-событий нет — [load-measurements.md](load-measurements.md)
-§13; команды остаются штатным контрольным комплектом):
+Control under load (the daily run of T-093 — done, the window
+Oct 23–24 ≈25 h, no OOM events —
+[load-measurements.md](load-measurements.md)
+§13; the commands remain the standard control kit):
 
 ```bash
-ss -tan state time-wait | wc -l          # рост к tcp_max_tw_buckets — пересчитать churn
-cat /proc/sys/net/netfilter/nf_conntrack_count   # рост к max — пересчитать таблицу
-cat /proc/sys/fs/file-nr                 # first column → к fs.file-max
-journalctl -t smartd -p warning          # SMART/TBW накопителя (T-089, docs/disks.md)
-dmesg | grep -E "table full|time wait bucket"    # должно быть пусто
-awk '{print $2}' /proc/net/softnet_stat | sort | uniq -c | tail   # дропы RX = 0
+ss -tan state time-wait | wc -l          # growth toward tcp_max_tw_buckets — recompute the churn
+cat /proc/sys/net/netfilter/nf_conntrack_count   # growth toward max — recompute the table
+cat /proc/sys/fs/file-nr                 # first column → toward fs.file-max
+journalctl -t smartd -p warning          # the drive's SMART/TBW (T-089, docs/disks.md)
+dmesg | grep -E "table full|time wait bucket"    # must be empty
+awk '{print $2}' /proc/net/softnet_stat | sort | uniq -c | tail   # RX drops = 0
 ```
 
-Деградации лечатся точечно (значения — расчёты выше), а не возвратом
-всего файла: каждый параметр независим и обратим (`sysctl -w`).
+Degradations are fixed with targeted changes (the values are the
+calculations above), not by restoring the whole file: every parameter is
+independent and reversible (`sysctl -w`).

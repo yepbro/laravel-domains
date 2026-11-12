@@ -1,96 +1,101 @@
-# Применение мониторинга SMART/TBW NVMe (T-089)
+# Applying NVMe SMART/TBW monitoring (T-089)
 
-Комплект боевого мониторинга накопителя сервера (ТЗ §10.3: «мониторинг
-SMART и износа NVMe (TBW), так как нагрузка записи высокая»). Обоснование
-раскладки дисков, оценка TBW от нагрузки краулера и связь слоёв мониторинга —
-[`docs/disks.md`](../../docs/disks.md). Применять на боевом сервере
-(Ubuntu Server LTS, systemd; ТЗ §10.1).
+The production monitoring kit for the server's drive (spec §10.3:
+"monitoring of SMART and NVMe wear (TBW), since the write load is high").
+The rationale for the disk layout, the TBW estimate from the crawler's
+load, and how the monitoring layers relate —
+[`docs/disks.md`](../../docs/disks.md). Apply on the production server
+(Ubuntu Server LTS, systemd; spec §10.1).
 
-| Файл | Назначение |
+| File | Purpose |
 |---|---|
-| `smartd.conf` | конфиг smartd: NVMe-проверки, предупреждения в syslog/journald |
-| `smartd-warning.sh` | обработчик предупреждений smartd (ставится в `/usr/local/lib/crawler`) |
-| `99-crawler-nvme.rules` | udev: узлы `/dev/nvme*` — группе `nvme-smart` |
-| `crawler-monitor.service.d/` | drop-in юнита monitor: supplementary-группа `nvme-smart` |
+| `smartd.conf` | the smartd config: NVMe checks, warnings to syslog/journald |
+| `smartd-warning.sh` | the smartd warning handler (installed to `/usr/local/lib/crawler`) |
+| `99-crawler-nvme.rules` | udev: the `/dev/nvme*` nodes — to the `nvme-smart` group |
+| `crawler-monitor.service.d/` | a drop-in for the monitor unit: the supplementary group `nvme-smart` |
 
-Слои: smartd (демон пакета, root) — критические предупреждения здоровья,
-рост журнала ошибок, температура; алерт `nvme_wear` сервиса monitor
-(T-080) — percentage_used ≥ 90 % и TBW в деталях, работает после выдачи
-доступа к устройствам (правила + drop-in). Оба пишут в journald.
+The layers: smartd (the package daemon, root) — critical health warnings,
+growth of the error log, temperature; the `nvme_wear` alert of the monitor
+service (T-080) — percentage_used ≥ 90% and the TBW in the details; it
+works after access to the devices is granted (the rules + the drop-in).
+Both write to journald.
 
-## Установка
+## Installation
 
 ```bash
 apt install smartmontools
 
-# 1. smartd: наш конфиг вместо образца пакета (оригинал сохранить)
+# 1. smartd: our config instead of the package sample (keep the original)
 cp -a /etc/smartd.conf /etc/smartd.conf.orig
 install -m 0644 smartd.conf /etc/smartd.conf
 
-# 2. обработчик предупреждений (путь — из smartd.conf, -M exec)
+# 2. the warning handler (the path — from smartd.conf, -M exec)
 install -D -m 0755 smartd-warning.sh /usr/local/lib/crawler/smartd-warning.sh
 
-# 3. доступ алерта мониторинга к NVMe (слой 2, docs/disks.md)
+# 3. the monitoring alert's access to the NVMe (layer 2, docs/disks.md)
 groupadd -r nvme-smart
 install -m 0644 99-crawler-nvme.rules /etc/udev/rules.d/99-crawler-nvme.rules
 udevadm control --reload && udevadm trigger --subsystem-match=nvme
 cp -r crawler-monitor.service.d /etc/systemd/system/
 systemctl daemon-reload
 
-# 4. запуск
-systemctl enable --now smartmontools      # алиас юнита: smartd.service
+# 4. start
+systemctl enable --now smartmontools      # a unit alias: smartd.service
 systemctl restart crawler-monitor
 ```
 
-Шаг 3 и drop-in можно пропустить: алерт износа останется в честном
-«не измеряется», smartd продолжит работать (см. границы слоёв в
-docs/disks.md — на smartmontools 7.4 шаг 3 нужен для порога TBW).
+Step 3 and the drop-in can be skipped: the wear alert stays in the honest
+"not measured" state, and smartd keeps working (see the layer boundaries
+in docs/disks.md — on smartmontools 7.4, step 3 is needed for the TBW
+threshold).
 
-## Проверка
+## Verification
 
 ```bash
-systemctl status smartmontools            # активен; найдено устройств: 1
-journalctl -t smartd -b                   # регистрация NVMe без предупреждений
+systemctl status smartmontools            # active; devices found: 1
+journalctl -t smartd -b                   # NVMe registration without warnings
 
-# живые показания — те же страницы, что читают smartd и алерт monitor
+# live readings — the same pages smartd and the monitor alert read
 smartctl -H -A /dev/nvme0                 # health, percentage_used, TBW
-smartctl -l error /dev/nvme0              # журнал ошибок NVMe
+smartctl -l error /dev/nvme0              # the NVMe error log
 
-# доступ слоя monitor (алерт открывает узел на запись — ioctl admin)
+# the monitor layer's access (the alert opens the node for writing — ioctl admin)
 ls -l /dev/nvme0                          # root:nvme-smart 0660
-sudo -u crawler-monitor test -r /dev/nvme0 -a -w /dev/nvme0 && echo доступ есть
-journalctl -t crawler-monitor | grep -i алерт   # Warn при срабатывании (≥90 %)
+sudo -u crawler-monitor test -r /dev/nvme0 -a -w /dev/nvme0 && echo access ok
+journalctl -t crawler-monitor | grep -i alert   # Warn when it trips (≥90%)
 ```
 
-Состояние алерта «не измеряется» видно при `CRAWLER_LOG_LEVEL=debug`
-(env сервиса): до включения доступа каждая оценка пишет Debug «алерт не
-измеряется: износ NVMe», после — записи нет; срабатывание (≥ 90 % ресурса)
-пишется Warn всегда.
+The alert's "not measured" state is visible at `CRAWLER_LOG_LEVEL=debug`
+(the service's env): before access is enabled, every evaluation logs
+Debug "alert not measured: NVMe wear"; after — no entry. A trip
+(≥ 90% of the resource) is always logged as Warn.
 
-Тест обработчика: добавить в `/etc/smartd.conf` к строке DEVICESCAN
-директиву `-M test` и перечитать конфиг (`systemctl kill -s HUP
-smartmontools`) — в `journalctl -t smartd` появится запись EmailTest
-(info), затем директиву убрать. `smartd -d -q onecheck -c /etc/smartd.conf`
-выполняет один проход по устройствам и выходит — удобен для проверки
-правок конфига без перезапуска демона.
+Testing the handler: add the `-M test` directive to the DEVICESCAN line
+in `/etc/smartd.conf` and reload the config (`systemctl kill -s HUP
+smartmontools`) — an EmailTest entry (info) will appear in
+`journalctl -t smartd`; remove the directive afterwards.
+`smartd -d -q onecheck -c /etc/smartd.conf` performs one pass over the
+devices and exits — handy for checking config edits without restarting
+the daemon.
 
-## Откат
+## Rollback
 
 ```bash
 systemctl disable --now smartmontools
 mv /etc/smartd.conf.orig /etc/smartd.conf
 rm /usr/local/lib/crawler/smartd-warning.sh /etc/udev/rules.d/99-crawler-nvme.rules
-rm -r /etc/systemd/system/crawler-monitor.service.d   # если других drop-in'ов нет
+rm -r /etc/systemd/system/crawler-monitor.service.d   # if there are no other drop-ins
 udevadm control --reload && udevadm trigger --subsystem-match=nvme
 systemctl daemon-reload && systemctl restart crawler-monitor
 groupdel nvme-smart
 ```
 
-## Проверка синтаксиса конфигурации
+## Configuration syntax check
 
-На машине разработки (с NVMe) конфиг принят `smartd` (smartmontools 7.5):
-`smartd -d -q onecheck -c smartd.conf` — директивы принимаются, устройство
-регистрируется, предупреждений нет. Использованные директивы (`DEVICESCAN
--d nvme`, `-H`, `-l error`, `-W`) для NVMe одинаковы в 7.4 и 7.5 —
-целевой Ubuntu 24.04 LTS (7.4) конфиг подходит без правок; закомментированная
-строка с `-f`/`-p` — только для 7.5+ (см. примечания в `smartd.conf`).
+On the development machine (with an NVMe) the config was accepted by
+`smartd` (smartmontools 7.5): `smartd -d -q onecheck -c smartd.conf` —
+the directives are accepted, the device registers, no warnings. The
+directives used (`DEVICESCAN -d nvme`, `-H`, `-l error`, `-W`) are
+identical for NVMe in 7.4 and 7.5 — the target Ubuntu 24.04 LTS (7.4)
+takes the config without edits; the commented-out line with `-f`/`-p` is
+for 7.5+ only (see the notes in `smartd.conf`).
