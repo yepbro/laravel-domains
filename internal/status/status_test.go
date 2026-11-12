@@ -878,7 +878,7 @@ func TestFetchLaravelStatsDegradations(t *testing.T) {
 	// An error of the second query — the "recent" context.
 	pool = seeded(map[string]statusGlitch{laravelRecentSQL: {queryErr: errors.New("бд недоступна")}})
 	_, err = FetchLaravelStats(ctx, pool)
-	if err == nil || !strings.Contains(err.Error(), "status: laravel: последние: бд недоступна") {
+	if err == nil || !strings.Contains(err.Error(), "status: laravel: latest: бд недоступна") {
 		t.Fatalf("ошибка второго запроса: ошибка = %v, want «последние»", err)
 	}
 

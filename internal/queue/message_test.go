@@ -441,7 +441,7 @@ func TestValidateMessages(t *testing.T) {
 		{"результат domain_id 0", Result{ZoneID: 1, DomainID: 0, SubdomainID: 0, Variant: model.VariantMain}, "domain_id 0 ≤ 0"},
 		// Bit 63 of the mask is signed — the only invalidity of the
 		// message.
-		{"результат бит 63", Result{ZoneID: 1, DomainID: 1, SubdomainID: 63, Variant: model.VariantMain}, "вне диапазона"},
+		{"результат бит 63", Result{ZoneID: 1, DomainID: 1, SubdomainID: 63, Variant: model.VariantMain}, "out of range"},
 		{
 			"результат имя длиннее 253",
 			Result{ZoneID: 1, DomainID: 1, SubdomainID: 0, Variant: model.VariantMain, Name: strings.Repeat("a", 254)},
