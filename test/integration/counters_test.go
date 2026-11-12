@@ -605,7 +605,7 @@ func TestCounters_RetryMatureIncrementFailure(t *testing.T) {
 		SetStatus: true,
 		Status:    model.StatusTempError,
 	}, nil)
-	if err == nil || !strings.Contains(err.Error(), "инкремент корзины retry_mature") {
+	if err == nil || !strings.Contains(err.Error(), "retry_mature bucket increment") {
 		t.Fatalf("RecordEpisode = (%v, %v), want (true, ошибка инкремента)", recorded, err)
 	}
 	if !recorded {
