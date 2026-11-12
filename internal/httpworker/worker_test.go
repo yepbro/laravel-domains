@@ -1,13 +1,13 @@
-// Юнит-тесты http-worker (T-053): обработка задачи домена (пачка субдоменов,
-// обе проверки протоколов), кэш итоговых URL («двойной URL — одна
-// загрузка»), варианты/алиасы сквозью, SPA-флаг, ошибки субдомена не роняют
-// домен, отмена ctx, smoke цикла Run, адаптер DNS-резолвера. Загрузка
-// подменяется сценарием (шов FetchFunc), очередь — фейком queue.Queue;
-// сети и Redis нет — за единственным исключением: настоящий
-// *httpfetch.BodyLimiter собирает только реальный транспорт, поэтому
-// TestWorkerBodyLimiterCeiling работает с loopback-сервером httptest.
-// Идентификаторы с префиксом worker* против коллизий с соседними
-// пакетами.
+// Unit tests of the http-worker (T-053): the domain task processing (a chunk of subdomains,
+// both protocol checks), the final URLs' cache: one URL — one
+// download), the variants/aliases end-to-end, the SPA flag, subdomain errors do not drop
+// the domain, the ctx cancellation, the Run loop's smoke, the DNS resolver adapter. The load
+// is substituted by a scenario (the FetchFunc seam), the queue — by a queue.Queue fake;
+// no network and Redis — with a single exception: a real
+// *httpfetch.BodyLimiter is built only by the real transport, so
+// TestWorkerBodyLimiterCeiling works with an httptest loopback server.
+// The identifiers with the worker* prefix against collisions with the neighboring
+// packages.
 
 package httpworker
 
@@ -41,33 +41,33 @@ import (
 	"crawler/internal/queue"
 )
 
-// --- фейк загрузки (шов FetchFunc) ------------------------------------------
+// --- the load fake (the FetchFunc seam) ------------------------------------------
 
-// workerTimeoutErr — ошибка-таймаут (net.Error) для сценария тарпита/общего
-// таймаута: классифицируется httpfetch.IsTimeout → ErrTimeout.
+// workerTimeoutErr — a timeout error (net.Error) for the tarpit/overall
+// timeout scenario: classified by httpfetch.IsTimeout → ErrTimeout.
 type workerTimeoutErr struct{}
 
 func (workerTimeoutErr) Error() string   { return "i/o timeout" }
 func (workerTimeoutErr) Timeout() bool   { return true }
 func (workerTimeoutErr) Temporary() bool { return true }
 
-// workerPageScript — одна страница сценария. Один вызов фейка изображает
-// весь проход цепочки редиректов: steps — предыстория, финальный шаг
-// дописывается сам.
+// workerPageScript — one scenario page. One fake call depicts
+// the whole redirect chain pass: steps — the prehistory, the final step
+// is appended by the fake itself.
 type workerPageScript struct {
 	status    int
 	header    http.Header
 	body      string
-	final     string // итоговый URL; "" — как запрошенный
+	final     string // the final URL; "" — as requested
 	steps     []httpfetch.RedirectStep
-	err       error         // транспортная ошибка вместо ответа
+	err       error         // a transport error instead of an answer
 	tooMany   bool          // ErrTooManyRedirects (Result nil, Chain — steps)
-	blockCtx  bool          // ждать отмены ctx (тест отмены)
-	setCookie []string      // значения Set-Cookie, если header не задан
-	elapsed   time.Duration // Elapsed итогового Fetch (ResponseMS проверки)
+	blockCtx  bool          // wait for the ctx cancellation (the cancellation test)
+	setCookie []string      // the Set-Cookie values, if header is not set
+	elapsed   time.Duration // the final Fetch's Elapsed (the check's ResponseMS)
 }
 
-// workerFetchLog — журнал вызовов фейка: какие URL реально ушли «в сеть».
+// workerFetchLog — the fake's call journal: which URLs actually went "to the network".
 type workerFetchLog struct {
 	mu    sync.Mutex
 	calls []string
@@ -91,8 +91,8 @@ func (l *workerFetchLog) countHost(host string) int {
 	return n
 }
 
-// workerFakeFetch — сценарий «ключ → страница». Точный ключ
-// "схема://хост/" имеет приоритет, ключ-хост — fallback обеих схем.
+// workerFakeFetch — the "key → page" scenario. The exact key
+// "scheme://host/" has the priority, the host key — the fallback of both schemes.
 func workerFakeFetch(script map[string]*workerPageScript) (FetchFunc, *workerFetchLog) {
 	log := &workerFetchLog{}
 	lookup := func(scheme, host string) *workerPageScript {
@@ -145,9 +145,9 @@ func workerFakeFetch(script map[string]*workerPageScript) (FetchFunc, *workerFet
 	}, log
 }
 
-// workerWorker — сборка воркера над сценарием. Хранилище по умолчанию —
-// фейк (раннее сохранение тел T-147 обязательно; конкретный фейк —
-// newStoreFake из store_test.go, тем же пакетом).
+// workerWorker — the worker assembly over a scenario. The store by default —
+// a fake (the early body storing T-147 is mandatory; the concrete fake —
+// newStoreFake from store_test.go, the same package).
 func workerWorker(t *testing.T, fetch FetchFunc, mutate func(*Options)) *Worker {
 	t.Helper()
 	opt := Options{}
@@ -168,28 +168,28 @@ func workerSubMsg(id int16, label string) queue.HTTPSubdomain {
 	return queue.HTTPSubdomain{SubdomainID: id, Label: label, Addrs: []string{"192.0.2.1"}}
 }
 
-// --- сквозная обработка: варианты, алиасы, кэш -------------------------------
+// --- end-to-end processing: variants, aliases, the cache -------------------------------
 
-// TestWorkerProcessDomain — задача из трёх субдоменов:
+// TestWorkerProcessDomain — a task of three subdomains:
 //
-//   - апекс bare: https → редирект на https://www.example.com/ (тело home);
-//     http ведёт туда же — варианты сворачиваются в одну запись variant 0
+//   - the bare apex: https → a redirect to https://www.example.com/ (the home body);
+//     http leads there too — the variants fold into one variant 0 record
 //     (https);
-//   - www: https-проверка стартует на URL, который уже скачан проверкой
-//     bare (итог её цепочки) — кэш итоговых URL, БЕЗ сети (§5.5 п. 6);
-//     http ведёт на другой сайт (http://old.example.com/) → вторая запись
+//   - www: the https check starts at a URL already downloaded by the bare
+//     check (its chain's outcome) — the final URLs' cache, WITHOUT the network (§5.5 item 6);
+//     http leads to another site (http://old.example.com/) → the second
 //     variant 1;
-//   - api: https не отвечает (таймаут), http работает → единственная
-//     запись variant 0 со scheme http.
+//   - api: https does not answer (a timeout), http works → the only
+//     variant 0 record with scheme http.
 //
-// Алиасы (T-055): запись апекса и вариант 0 www сходятся на одном итоговом
-// URL → класс эквивалентности, оригинал — «домашняя» запись www, апекс
-// помечается редиректом на субдомен www.
+// The aliases (T-055): the apex's record and the www variant 0 converge on one final
+// URL → an equivalence class, the original — the www "home" record, the apex
+// is marked by a redirect to the www subdomain.
 func TestWorkerProcessDomain(t *testing.T) {
 	home := "<html><body>" + strings.Repeat("достаточно видимого текста главной страницы сайта ", 12) + "</body></html>"
 	old := "<html><body>совсем другой сайт на старом адресе, много текста</body></html>"
 	fetch, log := workerFakeFetch(map[string]*workerPageScript{
-		"example.com": { // обе проверки bare: редирект на www
+		"example.com": { // both bare checks: a redirect to www
 			status: 301, body: home, final: "https://www.example.com/",
 			steps: []httpfetch.RedirectStep{{URL: "https://example.com/", Status: 301}},
 		},
@@ -200,9 +200,9 @@ func TestWorkerProcessDomain(t *testing.T) {
 		"https://api.example.com/": {err: workerTimeoutErr{}},
 		"api.example.com":          {status: 200, body: "<html>api gateway page</html>"},
 	})
-	// PerDomain=1: проверки выполняются строго по порядку запуска —
-	// кэш-попадание www https (итог bare) детерминировано, без гонки
-	// «www стартовал раньше, чем bare закончил цепочку».
+	// PerDomain=1: the checks run strictly in the launch order —
+	// the www https cache hit (bare's outcome) is deterministic, without the race
+	// "www started earlier than bare finished the chain".
 	w := workerWorker(t, fetch, func(o *Options) { o.PerDomain = 1 })
 
 	res, err := w.ProcessDomain(context.Background(), queue.HTTPTask{
@@ -213,8 +213,8 @@ func TestWorkerProcessDomain(t *testing.T) {
 		t.Fatalf("ProcessDomain: %v", err)
 	}
 
-	// Сеть: bare обе проверки (2) + www http (1) + api обе (2); https www
-	// взят из кэша итоговых URL — скачиваний www по https нет.
+	// The network: bare both checks (2) + www http (1) + api both (2); the www https
+	// is taken from the final URLs' cache — there are no https www downloads.
 	for host, want := range map[string]int{
 		"example.com": 2, "www.example.com": 1, "api.example.com": 2,
 	} {
@@ -229,7 +229,7 @@ func TestWorkerProcessDomain(t *testing.T) {
 	}
 	bare, www, api := &res.Subdomains[0], &res.Subdomains[1], &res.Subdomains[2]
 
-	// Кэш-попадание помечено; итоговый URL и синтетическая цепочка на месте.
+	// The cache hit is marked; the final URL and the synthetic chain are in place.
 	if !www.HTTPS.Cached {
 		t.Error("https-проверка www не взята из кэша итоговых URL")
 	}
@@ -239,19 +239,19 @@ func TestWorkerProcessDomain(t *testing.T) {
 	if bare.HTTPS.FinalURL == nil || bare.HTTPS.FinalURL.String() != "https://www.example.com/" {
 		t.Errorf("итоговый URL bare https: %v", bare.HTTPS.FinalURL)
 	}
-	if len(bare.HTTPS.Redirects) != 2 { // старт + итог
+	if len(bare.HTTPS.Redirects) != 2 { // start + outcome
 		t.Errorf("цепочка bare https: %d шагов, ожидалось 2", len(bare.HTTPS.Redirects))
 	}
-	if len(www.HTTPS.Redirects) != 1 { // синтетический единственный шаг
+	if len(www.HTTPS.Redirects) != 1 { // a synthetic single step
 		t.Errorf("цепочка кэш-итога www https: %d шагов, ожидался 1", len(www.HTTPS.Redirects))
 	}
 
-	// bare: оба протокола — один сайт (тот же итоговый host+path) → 1 запись.
+	// bare: both protocols — one site (the same final host+path) → 1 record.
 	if len(bare.Records) != 1 || bare.Records[0].Variant != model.VariantMain ||
 		bare.Records[0].Scheme != model.SchemeHTTPS {
 		t.Fatalf("записи bare: %+v", bare.Records)
 	}
-	// www: два варианта — 0 (https, кэш-итог) и 1 (http, другой сайт).
+	// www: two variants — 0 (https, the cache outcome) and 1 (http, another site).
 	if len(www.Records) != 2 {
 		t.Fatalf("записи www: %d, ожидалось 2", len(www.Records))
 	}
@@ -264,7 +264,7 @@ func TestWorkerProcessDomain(t *testing.T) {
 	if www.Records[1].Host != "old.example.com" || www.Records[1].FinalURL != "http://old.example.com/" {
 		t.Errorf("итог варианта 1 www: host=%q url=%q", www.Records[1].Host, www.Records[1].FinalURL)
 	}
-	// api: только http → одна запись variant 0 scheme http.
+	// api: only http → one variant 0 scheme http record.
 	if len(api.Records) != 1 || api.Records[0].Scheme != model.SchemeHTTP ||
 		api.Records[0].Variant != model.VariantMain {
 		t.Fatalf("записи api: %+v", api.Records)
@@ -273,8 +273,8 @@ func TestWorkerProcessDomain(t *testing.T) {
 		t.Errorf("класс ошибки api https: %v", api.HTTPS.ErrClass)
 	}
 
-	// Алиасы: bare v0 и www v0 — один итоговый URL; оригинал — www
-	// («дома»), bare — редирект на субдомен www; контент хранит оригинал.
+	// The aliases: bare v0 and www v0 — one final URL; the original — www
+	// ("at home"), bare — a redirect to the www subdomain; the original stores the content.
 	bareRec, wwwMain := &bare.Records[0], &www.Records[0]
 	if bareRec.AliasKind != model.AliasRedirect || bareRec.AliasSubdomainID == nil || *bareRec.AliasSubdomainID != 1 {
 		t.Errorf("алиас bare: kind=%v id=%v", bareRec.AliasKind, bareRec.AliasSubdomainID)
@@ -288,23 +288,23 @@ func TestWorkerProcessDomain(t *testing.T) {
 	if !wwwMain.StoreContent || wwwMain.ContentHash == nil {
 		t.Error("оригинал класса обязан хранить контент с ненулевым хэшем")
 	}
-	// Хэш кэш-итога совпадает с хэшем первоисточника (то же тело).
+	// The cache outcome's hash matches the primary source's hash (the same body).
 	if bareRec.ContentHash == nil || *bareRec.ContentHash != *wwwMain.ContentHash {
 		t.Error("хэши одной страницы (первоисточник и кэш) расходятся")
 	}
-	// Вариант 1 www и api независимы.
+	// The www variant 1 and api are independent.
 	if www.Records[1].AliasKind != model.AliasNone || api.Records[0].AliasKind != model.AliasNone {
 		t.Error("чужие записи помечены алиасами")
 	}
-	// Данные DNS-этапа перенесены в результат (ТЗ 5.5 п. 7).
+	// The DNS stage's data carried into the result (spec 5.5 item 7).
 	if len(api.Addrs) != 1 || api.Addrs[0].String() != "192.0.2.1" {
 		t.Errorf("адреса api: %v", api.Addrs)
 	}
 }
 
-// TestWorkerCacheKey — нормализация ключа кэша: схема+хост+путь; query,
-// фрагмент и дефолтные порты схем (80/443) не входят, нестандартный порт
-// различает ключи, регистр хоста не важен (критерий T-054).
+// TestWorkerCacheKey — the cache key's normalization: scheme+host+path; the query,
+// the fragment and the schemes' default ports (80/443) are not included, a non-standard port
+// distinguishes the keys, the host case does not matter (the T-054 criterion).
 func TestWorkerCacheKey(t *testing.T) {
 	base, err := url.Parse("https://www.example.com/some/path")
 	if err != nil {
@@ -337,12 +337,12 @@ func TestWorkerCacheKey(t *testing.T) {
 		t.Error("ключ с явным дефолтным портом :80 ≠ ключу без порта")
 	}
 	for _, raw := range []string{
-		"http://www.example.com/some/path",          // другая схема
-		"https://old.example.com/some/path",         // другой хост
-		"https://www.example.com/other",             // другой путь
-		"https://www.example.com",                   // пустой путь — корень «/»
-		"https://www.example.com:8443/some/path",    // нестандартный порт — другой сервис
-		"https://www.example.com:444/some/path?q=1", // порт не глушится query
+		"http://www.example.com/some/path",          // another scheme
+		"https://old.example.com/some/path",         // another host
+		"https://www.example.com/other",             // another path
+		"https://www.example.com",                   // an empty path — the root "/"
+		"https://www.example.com:8443/some/path",    // a non-standard port — another service
+		"https://www.example.com:444/some/path?q=1", // the port is not muffled by a query
 	} {
 		u, err := url.Parse(raw)
 		if err != nil {
@@ -357,10 +357,10 @@ func TestWorkerCacheKey(t *testing.T) {
 	}
 }
 
-// TestWorkerCacheQueryAndTaskScope — итоговый URL с query кладётся в кэш
-// под ключом без query (согласовано с критерием вариантов T-054): старт
-// проверки park без query попадает в кэш. Кэш живёт одну задачу: вторая
-// задача того же домена качает заново.
+// TestWorkerCacheQueryAndTaskScope — a final URL with a query is put into the cache
+// under a key without the query (agreed with the T-054 variants criterion): the
+// park check's start without a query hits the cache. The cache lives one task: a second
+// task of the same domain downloads anew.
 func TestWorkerCacheQueryAndTaskScope(t *testing.T) {
 	body := "<html>" + strings.Repeat("текст парковочной страницы для проверки кэша ", 40) + "</html>"
 	fetch, log := workerFakeFetch(map[string]*workerPageScript{
@@ -369,7 +369,7 @@ func TestWorkerCacheQueryAndTaskScope(t *testing.T) {
 		"http://bare.test/":      {status: 301, body: body, final: "https://park.bare.test/?i=2"},
 		"http://park.bare.test/": {status: 200, body: body, final: "https://park.bare.test/"},
 	})
-	// PerDomain=1 — детерминированный порядок проверок (см. TestWorkerProcessDomain).
+	// PerDomain=1 — a deterministic check order (see TestWorkerProcessDomain).
 	w := workerWorker(t, fetch, func(o *Options) { o.PerDomain = 1 })
 	subs := []queue.HTTPSubdomain{workerSubMsg(0, ""), workerSubMsg(3, "park")}
 
@@ -379,10 +379,10 @@ func TestWorkerCacheQueryAndTaskScope(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ProcessDomain(1): %v", err)
 	}
-	// bare: обе проверки уводят на https://park.bare.test/?i=N — ключ
-	// https://park.bare.test/ (query не входит); проверка park https
-	// стартует ровно на нём → кэш, без сети. В сеть по park ходил
-	// только http-запрос.
+	// bare: both checks lead to https://park.bare.test/?i=N — the key
+	// https://park.bare.test/ (the query is not included); the park https check
+	// starts exactly at it → the cache, without the network. Only the http
+	// request went to the network over park.
 	if !res1.Subdomains[1].HTTPS.Cached {
 		t.Error("итог с query не найден в кэше по ключу без query")
 	}
@@ -390,9 +390,9 @@ func TestWorkerCacheQueryAndTaskScope(t *testing.T) {
 		t.Errorf("обращений к park в первой задаче: %d, ожидался 1 (только http)", got)
 	}
 
-	// Кэш per-задачи: вторая задача БЕЗ bare — её кэш пуст в момент старта,
-	// https park качается по-настоящему (если бы кэш пережил задачу,
-	// проверки park снова попали бы в записи первой задачи).
+	// A per-task cache: the second task WITHOUT bare — its cache is empty at the start,
+	// the https park is downloaded for real (if the cache survived the task,
+	// the park checks would again land in the first task's records).
 	res2, err := w.ProcessDomain(context.Background(), queue.HTTPTask{
 		ZoneID: 1, DomainID: 8, Name: "bare.test",
 		Subdomains: []queue.HTTPSubdomain{workerSubMsg(3, "park")},
@@ -403,25 +403,25 @@ func TestWorkerCacheQueryAndTaskScope(t *testing.T) {
 	if res2.Subdomains[0].HTTPS.Cached {
 		t.Error("кэш пережил задачу домена")
 	}
-	if got := log.countHost("park.bare.test"); got != 3 { // 1 (http первой) + https + http второй
+	if got := log.countHost("park.bare.test"); got != 3 { // 1 (the first's http) + https + http of the second
 		t.Errorf("обращений к park после второй задачи: %d, ожидалось 3", got)
 	}
 }
 
-// TestWorkerCacheHitKeepsErrorClass — обрезанная страница в кэше
-// отдаёт кэш-попаданию свой класс ошибки (ErrBody): один и тот же
-// контент не должен классифицироваться по-разному в зависимости от
-// попадания в кэш (запись-источник — error=body, запись кэша — NULL).
+// TestWorkerCacheHitKeepsErrorClass — a truncated page in the cache
+// gives its error class to the cache hit (ErrBody): the same
+// content must not be classified differently depending on
+// the cache hit (the source record — error=body, the cache record — NULL).
 func TestWorkerCacheHitKeepsErrorClass(t *testing.T) {
 	huge := strings.Repeat("a", int(workerBodyHardLimit)+128)
 	fetch, _ := workerFakeFetch(map[string]*workerPageScript{
-		// Обе проверки апекса сводятся к обрезанной странице www
-		// (https — скачивание, http — сбой сети).
+		// Both apex checks converge on the truncated www page
+		// (https — a download, http — a network failure).
 		"trunc.test":         {status: 200, body: huge, final: "https://www.trunc.test/"},
 		"http://trunc.test/": {err: errors.New("connection refused")},
 	})
-	// PerDomain=1 — детерминированный порядок: https апекса наполняет
-	// кэш до старта https www (см. TestWorkerProcessDomain).
+	// PerDomain=1 — a deterministic order: the apex's https fills the
+	// cache before the https www starts (see TestWorkerProcessDomain).
 	w := workerWorker(t, fetch, func(o *Options) { o.PerDomain = 1 })
 	res, err := w.ProcessDomain(context.Background(), queue.HTTPTask{
 		ZoneID: 9, DomainID: 21, Name: "trunc.test",
@@ -439,12 +439,12 @@ func TestWorkerCacheHitKeepsErrorClass(t *testing.T) {
 		t.Errorf("кэш-попадание потеряло класс ошибки обрезанной страницы: %v текст %q",
 			www.HTTPS.ErrClass, www.HTTPS.ErrText)
 	}
-	// Cached=true — сеть не трогалась вовсе (http-проверка www при
-	// сценарии-ошибке честно несёт ErrNetwork, не подменяясь кэшем).
+	// Cached=true — the network was not touched at all (the www http check at
+	// the error scenario honestly carries ErrNetwork, not substituted by the cache).
 	if www.HTTP.ErrClass != ErrNetwork {
 		t.Errorf("http www: класс %v (ожидался ErrNetwork)", www.HTTP.ErrClass)
 	}
-	// Класс доходит и до записи кэш-источника.
+	// The class reaches the cache source's record too.
 	if len(www.Records) == 0 {
 		t.Fatal("у www нет записей, хотя https-итог доступен")
 	}
@@ -453,16 +453,16 @@ func TestWorkerCacheHitKeepsErrorClass(t *testing.T) {
 	}
 }
 
-// TestWorkerCacheHitResponseMS — кэш-попадание переносит измеренное
-// первоисточником время ответа: кэш-итог часто становится записью-
-// оригиналом алиас-класса (bare→www), её response_ms не должен быть
-// нулём при живом измерении. Метрики кэш-попадания по-прежнему не
-// наблюдают (Cached).
+// TestWorkerCacheHitResponseMS — the cache hit carries the response
+// time measured by the primary source: the cache outcome often becomes the alias
+// class's original record (bare→www); its response_ms must not be
+// zero with a live measurement. The cache hit metrics still do not
+// observe it (Cached).
 func TestWorkerCacheHitResponseMS(t *testing.T) {
 	body := "<html>" + strings.Repeat("страница для теста времени ответа кэша ", 30) + "</html>"
 	fetch, _ := workerFakeFetch(map[string]*workerPageScript{
 		"rt.test": {status: 200, body: body, final: "https://www.rt.test/", elapsed: 150 * time.Millisecond},
-		// http-проверка апекса — другой итог (не кэш), своё время.
+		// the apex's http check — another outcome (not the cache), its own time.
 		"http://rt.test/": {status: 200, body: body, final: "http://old.rt.test/", elapsed: 40 * time.Millisecond},
 	})
 	w := workerWorker(t, fetch, func(o *Options) { o.PerDomain = 1 })
@@ -486,7 +486,7 @@ func TestWorkerCacheHitResponseMS(t *testing.T) {
 	if got := bare.HTTP.ResponseMS; got != 40 {
 		t.Errorf("ResponseMS собственной (некэшовой) проверки: %d, ожидалось 40", got)
 	}
-	// Запись кэш-источника несёт время ответа в subdomain_results.
+	// The cache source's record carries the response time into subdomain_results.
 	if len(www.Records) == 0 {
 		t.Fatal("у www нет записей")
 	}
@@ -495,11 +495,11 @@ func TestWorkerCacheHitResponseMS(t *testing.T) {
 	}
 }
 
-// --- ошибки и особые случаи ----------------------------------------------------
+// --- errors and special cases ----------------------------------------------------
 
-// TestWorkerErrorsClassified — ошибки субдоменов (цикл редиректов, отказ
-// сети, обрезанное тело) классифицируются в результат и не роняют домен
-// (§8): другой субдомен даёт записи.
+// TestWorkerErrorsClassified — the subdomains' errors (a redirect loop, a network
+// refusal, a truncated body) are classified into the result and do not drop the domain
+// (§8): another subdomain gives records.
 func TestWorkerErrorsClassified(t *testing.T) {
 	huge := strings.Repeat("a", int(httpfetch.DefaultLimitBodyBytes)+128)
 	fetch, _ := workerFakeFetch(map[string]*workerPageScript{
@@ -543,8 +543,8 @@ func TestWorkerErrorsClassified(t *testing.T) {
 	if !big.HTTP.Available || big.HTTP.Truncated {
 		t.Errorf("http big: available=%v truncated=%v", big.HTTP.Available, big.HTTP.Truncated)
 	}
-	// big: https — обрезанное тело, http — другой сайт → 2 записи; класс
-	// ошибки проверки-источника доходит до записи.
+	// big: https — a truncated body, http — another site → 2 records; the
+	// source check's error class reaches the record.
 	if len(big.Records) != 2 {
 		t.Fatalf("записей big: %d, ожидалось 2", len(big.Records))
 	}
@@ -560,12 +560,12 @@ func TestWorkerErrorsClassified(t *testing.T) {
 	}
 }
 
-// TestWorkerBodyLimiterCeiling — потолок тела задаёт BodyLimiter T-049
-// (http.max_body_bytes), а не страховочная константа воркера: страница
-// 3 МиБ при потолке 4 МиБ читается целиком (страховка 2 МиБ резала бы
-// её с ложным ErrBody); страница 5 МиБ при потолке 4 МиБ режется
-// лимитёром. Только реальный транспорт: настоящий BodyLimiter не
-// построить сценарием шва FetchFunc — loopback-сервер httptest.
+// TestWorkerBodyLimiterCeiling — the body cap is set by the BodyLimiter T-049
+// (http.max_body_bytes), not the worker's guard constant: a page
+// of 3 MiB at a 4 MiB cap is read entirely (the 2 MiB guard would cut
+// it with a false ErrBody); a page of 5 MiB at a 4 MiB cap is cut
+// by the limiter. Only the real transport: a real BodyLimiter cannot be
+// built by a FetchFunc seam scenario — an httptest loopback server.
 func TestWorkerBodyLimiterCeiling(t *testing.T) {
 	caseRun := func(t *testing.T, serve, ceiling int64) (*SchemeCheck, []byte) {
 		t.Helper()
@@ -591,13 +591,13 @@ func TestWorkerBodyLimiterCeiling(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ProcessDomain: %v", err)
 		}
-		// Тела ProcessDomain не удерживает (ранний Put T-147) —
-		// ожидаемые байты сравниваются хэшем.
+		// ProcessDomain holds no bodies (the early Put T-147) —
+		// the expected bytes are compared by hash.
 		wantLen := serve
 		if wantLen > ceiling {
 			wantLen = ceiling
 		}
-		return &res.Subdomains[0].HTTP, []byte(strings.Repeat("a", int(wantLen))) // сервер httptest — http
+		return &res.Subdomains[0].HTTP, []byte(strings.Repeat("a", int(wantLen))) // the httptest server is http
 	}
 	t.Run("3 МиБ при потолке 4 МиБ — целая", func(t *testing.T) {
 		check, want := caseRun(t, 3<<20, 4<<20)
@@ -621,11 +621,11 @@ func TestWorkerBodyLimiterCeiling(t *testing.T) {
 	})
 }
 
-// TestWorkerReadBody — предвыделение буфера чтения тела по Content-Length
-// (T-147): байты читаются целиком одним буфером, Content-Length без
-// Content-Encoding задаёт ёмкость (враньё сервера в обе стороны не
-// ломает чтение), сжатый ответ и отсутствие заголовка — обычный путь,
-// страховочный потолок без BodyLimiter режет чтение (workerBodyHardLimit).
+// TestWorkerReadBody — the preallocation of the body read buffer by Content-Length
+// (T-147): the bytes are read entirely by one buffer, a Content-Length without
+// Content-Encoding sets the capacity (a server's lie in both directions does not
+// break the read), a compressed answer and an absent header — the ordinary path,
+// the guard cap without a BodyLimiter cuts the read (workerBodyHardLimit).
 func TestWorkerReadBody(t *testing.T) {
 	mkRes := func(cl string, ce string, body string, limiter *httpfetch.BodyLimiter) *httpfetch.FetchResult {
 		h := http.Header{}
@@ -647,9 +647,9 @@ func TestWorkerReadBody(t *testing.T) {
 		ce     string
 		body   string
 		want   string
-		maxCap int // потолок ёмкости буфера (0 — не проверять): одно
-		// выделение по Content-Length плюс служебный slack ReadFrom
-		// (minRead 512), без удвоений io.ReadAll
+		maxCap int // the buffer capacity's cap (0 — do not check): one
+		// allocation by Content-Length plus the ReadFrom's service slack
+		// (minRead 512), without the io.ReadAll doublings
 	}{
 		{"Content-Length честен", "9", "", "123456789", "123456789", 9 + 512},
 		{"сервер недослал", "100", "", "коротко", "коротко", 100 + 512},
@@ -673,14 +673,14 @@ func TestWorkerReadBody(t *testing.T) {
 			}
 		})
 	}
-	// Гигантский Content-Length не резервирует гигабайт — потолок
-	// предвыделения workerPreallocMax, чтение идёт дальше ростом буфера.
+	// A giant Content-Length does not reserve a gigabyte — the
+	// workerPreallocMax preallocation cap, the read continues by the buffer growth.
 	res := mkRes("1073741824", "", strings.Repeat("x", 128), nil)
 	got, err := workerReadBody(res)
 	if err != nil || len(got) != 128 {
 		t.Fatalf("гигантский Content-Length: байтов %d, ошибка %v", len(got), err)
 	}
-	// Без BodyLimiter чтение ограничено страховочным потолком воркера.
+	// Without a BodyLimiter the read is bounded by the worker's guard cap.
 	big := strings.Repeat("y", int(workerBodyHardLimit)+64)
 	got, err = workerReadBody(mkRes("", "", big, nil))
 	if err != nil {
@@ -691,9 +691,9 @@ func TestWorkerReadBody(t *testing.T) {
 	}
 }
 
-// TestWorkerAllFailedNoHTTP — все субдомены ошибочны → записей нет («нет
-// ответа ни у кого» по §7 — статус присвоит T-058); таймаут-класс виден
-// через AnyTimeout (материал для temp_error, ТЗ 6.2).
+// TestWorkerAllFailedNoHTTP — all the subdomains are erroneous → no records ("no
+// one answered" by §7 — T-058 will assign the status); the timeout class is visible
+// via AnyTimeout (the material for temp_error, spec 6.2).
 func TestWorkerAllFailedNoHTTP(t *testing.T) {
 	fetch, _ := workerFakeFetch(map[string]*workerPageScript{
 		"dead.test":              {err: workerTimeoutErr{}},
@@ -719,9 +719,9 @@ func TestWorkerAllFailedNoHTTP(t *testing.T) {
 
 // --- dead-host cutoff (T-164) --------------------------------------------------
 
-// workerDialRefusedErr — ошибка connect-фазы в том виде, в каком её отдаёт
-// реальный диал net.Dialer (IsConnectFailure различает по
-// *net.OpError{Op:"dial"}): RST на SYN — порт закрыт.
+// workerDialRefusedErr — a connect-phase error in the form the real
+// net.Dialer dial returns it (IsConnectFailure distinguishes by
+// *net.OpError{Op:"dial"}): an RST on a SYN — the port is closed.
 func workerDialRefusedErr() error {
 	return &net.OpError{
 		Op: "dial", Net: "tcp",
@@ -730,8 +730,8 @@ func workerDialRefusedErr() error {
 	}
 }
 
-// workerDialTimeoutErr — connect-таймаут реального диала: дедлайн попытки
-// (poll.ErrDeadlineExceeded, net.Error с Timeout()).
+// workerDialTimeoutErr — a real dial's connect timeout: the attempt's
+// deadline (poll.ErrDeadlineExceeded, a net.Error with Timeout()).
 func workerDialTimeoutErr() error {
 	return &net.OpError{
 		Op: "dial", Net: "tcp",
@@ -740,9 +740,9 @@ func workerDialTimeoutErr() error {
 	}
 }
 
-// workerDeadDialScript — сценарий «мёртвая голова»: apex и www — отказ
-// connect-фазы на обоих протоколах; alive — живая страница для субдомена,
-// который cutoff обязан оставить без проверки.
+// workerDeadDialScript — the "dead head" scenario: apex and www — a
+// connect-phase refusal over both protocols; alive — a live page for the subdomain
+// the cutoff must leave unchecked.
 func workerDeadDialScript(deadErr func() error, alive string) map[string]*workerPageScript {
 	if deadErr == nil {
 		deadErr = workerDialRefusedErr
@@ -757,11 +757,11 @@ func workerDeadDialScript(deadErr func() error, alive string) map[string]*worker
 	return script
 }
 
-// TestWorkerDeadHostCutoff — сигнатура мёртвого хоста (оба головных имени
-// упали на connect-фазе по обоим протоколам) завершает задачу без проверки
-// остальных субдоменов: их сети не касаются, проверки — синтетический
-// ErrCutoff (наблюдаемость), записей нет (§8), домен — no_http; вариант с
-// connect-таймаутами сохраняет temp_error-семантику (AnyTimeout).
+// TestWorkerDeadHostCutoff — the dead host's signature (both head names
+// fell at the connect phase over both protocols) finishes the task without checking
+// the other subdomains: their network is not touched, the checks — the synthetic
+// ErrCutoff (observability), no records (§8), the domain — no_http; the variant with
+// connect timeouts keeps the temp_error semantics (AnyTimeout).
 func TestWorkerDeadHostCutoff(t *testing.T) {
 	t.Run("refused — no_http", func(t *testing.T) {
 		fetch, log := workerFakeFetch(workerDeadDialScript(nil, "blog.example.net"))
@@ -779,7 +779,7 @@ func TestWorkerDeadHostCutoff(t *testing.T) {
 		if !res.Cutoff {
 			t.Fatal("cutoff не сработал: оба головных хоста TCP-мёртвы")
 		}
-		// Сеть: только голова (4 проверки), хвост не проверялся.
+		// The network: only the head (4 checks), the tail was not checked.
 		for host, want := range map[string]int{
 			"example.net": 2, "www.example.net": 2,
 			"blog.example.net": 0, "shop.example.net": 0,
@@ -788,8 +788,8 @@ func TestWorkerDeadHostCutoff(t *testing.T) {
 				t.Errorf("загрузок %s: %d, ожидалось %d", host, got, want)
 			}
 		}
-		// Голова: настоящий класс ошибки (refused — network) + признак
-		// мёртвого диала.
+		// The head: the real error class (refused — network) + the dead
+		// dial sign.
 		for i := 0; i < 2; i++ {
 			sub := &res.Subdomains[i]
 			for _, c := range []SchemeCheck{sub.HTTPS, sub.HTTP} {
@@ -799,8 +799,8 @@ func TestWorkerDeadHostCutoff(t *testing.T) {
 				}
 			}
 		}
-		// Хвост: синтетические ErrCutoff, идентичность и адреса DNS-этапа
-		// сохранены, записей нет (§8).
+		// The tail: the synthetic ErrCutoff, the identity and the DNS stage's addresses
+		// preserved, no records (§8).
 		for i := 2; i < len(res.Subdomains); i++ {
 			sub := &res.Subdomains[i]
 			if sub.SubdomainID == 0 || sub.Hostname == "" || len(sub.Addrs) == 0 {
@@ -844,25 +844,25 @@ func TestWorkerDeadHostCutoff(t *testing.T) {
 			t.Errorf("apex https: класс=%v deadDial=%v, ожидался timeout/true",
 				apex.HTTPS.ErrClass, apex.HTTPS.DeadDial)
 		}
-		// Таймауты выполненных проверок решают повтор эпизода (T-031),
-		// ErrCutoff хвоста temp_error не даёт.
+		// The performed checks' timeouts decide the episode's repeat (T-031),
+		// the tail's ErrCutoff gives no temp_error.
 		if !res.AnyTimeout() {
 			t.Error("connect-таймауты головы не видны в AnyTimeout (temp_error)")
 		}
 	})
 }
 
-// TestWorkerDeadHostCutoffStrict — сигнатура строгая: любой итог головы
-// кроме мёртвого диала (живая проверка, TLS-сбой после connect, таймаут
-// заголовков, падение хоста редиректа) или отсутствие www в задаче —
-// домен проверается целиком, хвост сеть видит.
+// TestWorkerDeadHostCutoffStrict — the signature is strict: any head outcome
+// other than a dead dial (a live check, a TLS failure after connect, a headers
+// timeout, the redirect host's fall) or the www's absence in the task —
+// the domain is checked in full, the tail sees the network.
 func TestWorkerDeadHostCutoffStrict(t *testing.T) {
 	alive := "<html>страница живого апекса с достаточным текстом</html>"
 	cases := []struct {
 		name   string
 		script map[string]*workerPageScript
-		// heads: если true — проверяется и то, что признак DeadDial не
-		// ставится чужим классам (см. ветку редиректа).
+		// heads: if true — it is also checked that the DeadDial sign is not
+		// set by foreign classes (see the redirect branch).
 		checkApexDeadDialFalse bool
 	}{
 		{
@@ -895,8 +895,8 @@ func TestWorkerDeadHostCutoffStrict(t *testing.T) {
 			name: "падение хоста редиректа — выполненная часть цепочки не пуста",
 			script: func() map[string]*workerPageScript {
 				s := workerDeadDialScript(nil, "blog.example.net")
-				// apex https ответил 301 и вёл на мёртвый хост: сбой
-				// диала — цель перехода, не стартовый хост.
+				// the apex https answered 301 and led to a dead host: the dial
+				// failure — the hop's target, not the starting host.
 				s["https://example.net/"] = &workerPageScript{
 					err:   workerDialRefusedErr(),
 					steps: []httpfetch.RedirectStep{{URL: "https://example.net/", Status: 301}},
@@ -952,11 +952,11 @@ func TestWorkerDeadHostCutoffStrict(t *testing.T) {
 	})
 }
 
-// TestWorkerDeadHostCutoffDisabled — выключенный флаг: прежнее поведение,
-// мёртрые apex+www не мешают проверке остальных субдоменов.
+// TestWorkerDeadHostCutoffDisabled — the flag off: the former behavior,
+// dead apex+www do not hinder the other subdomains' check.
 func TestWorkerDeadHostCutoffDisabled(t *testing.T) {
 	fetch, log := workerFakeFetch(workerDeadDialScript(nil, "blog.example.net"))
-	w := workerWorker(t, fetch, nil) // DeadHostCutoff не задан — выключен
+	w := workerWorker(t, fetch, nil) // DeadHostCutoff not set — off
 	res, err := w.ProcessDomain(context.Background(), queue.HTTPTask{
 		ZoneID: 4, DomainID: 25, Name: "example.net",
 		Subdomains: []queue.HTTPSubdomain{
@@ -979,8 +979,8 @@ func TestWorkerDeadHostCutoffDisabled(t *testing.T) {
 	}
 }
 
-// TestWorkerDeadHostCutoffEmptyTail — задача из одних apex+www: проверять
-// нечего, cutoff не срабатывает (экономии нет — признак честно не ставится).
+// TestWorkerDeadHostCutoffEmptyTail — a task of apex+www only: nothing
+// to check, the cutoff does not fire (no saving — the sign is honestly not set).
 func TestWorkerDeadHostCutoffEmptyTail(t *testing.T) {
 	fetch, log := workerFakeFetch(workerDeadDialScript(nil, ""))
 	w := workerWorker(t, fetch, func(o *Options) { o.DeadHostCutoff = true })
@@ -999,8 +999,8 @@ func TestWorkerDeadHostCutoffEmptyTail(t *testing.T) {
 	}
 }
 
-// TestWorkerSPADetect — SPA-флаг по телу итоговой страницы (T-057):
-// оболочка с корневым контейнером и требованием JS получает SPA=true.
+// TestWorkerSPADetect — the SPA flag over the final page's body (T-057):
+// a shell with a root container and a JS requirement gets SPA=true.
 func TestWorkerSPADetect(t *testing.T) {
 	spa := `<!DOCTYPE html><html><head><title>x</title></head>` +
 		`<body><noscript>Для работы сайта включите JavaScript</noscript><div id="root"></div></body></html>`
@@ -1019,7 +1019,7 @@ func TestWorkerSPADetect(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ProcessDomain: %v", err)
 	}
-	// Оба протокола апекса — одно тело на одном host+path → 1 запись.
+	// Both apex protocols — one body at one host+path → 1 record.
 	if len(res.Subdomains[0].Records) != 1 {
 		t.Fatalf("записей spa: %d", len(res.Subdomains[0].Records))
 	}
@@ -1042,8 +1042,8 @@ func TestWorkerSPADetect(t *testing.T) {
 	}
 }
 
-// TestWorkerCookies — cookies итогового ответа разбираются в результат
-// (ТЗ 5.5 п. 7 «cookies»), заголовки итоговой страницы переносятся записью.
+// TestWorkerCookies — the final answer's cookies are parsed into the result
+// (spec 5.5 item 7 "cookies"), the final page's headers are carried by the record.
 func TestWorkerCookies(t *testing.T) {
 	page := "<html>магазин с сессией и достаточным текстом страницы</html>"
 	h := http.Header{}
@@ -1070,7 +1070,7 @@ func TestWorkerCookies(t *testing.T) {
 	if got := rec.Header.Get("Content-Type"); got != "text/html; charset=utf-8" {
 		t.Errorf("Content-Type записи: %q", got)
 	}
-	// Сценарий без TLS-соединения — TLSInfo записи nil (не ошибка, §8).
+	// A scenario without a TLS connection — the record's TLSInfo is nil (not an error, §8).
 	if rec.TLS != nil {
 		t.Errorf("TLS без TLS-соединения: %+v", rec.TLS)
 	}
@@ -1079,9 +1079,9 @@ func TestWorkerCookies(t *testing.T) {
 	}
 }
 
-// TestWorkerContextCancel — отмена ctx в полёте: ProcessDomain возвращает
-// ошибку (эпизод не завершён), результат не выдаётся — ложного «нет HTTP»
-// не будет; доставка вернётся повторной доставкой (ТЗ 3.4).
+// TestWorkerContextCancel — a ctx cancellation in flight: ProcessDomain returns
+// an error (the episode is not finished), no result is issued — no false "no HTTP"
+// will happen; the delivery will return with a repeated delivery (spec 3.4).
 func TestWorkerContextCancel(t *testing.T) {
 	fetch, _ := workerFakeFetch(map[string]*workerPageScript{
 		"slow.test": {blockCtx: true},
@@ -1107,7 +1107,7 @@ func TestWorkerContextCancel(t *testing.T) {
 	}
 }
 
-// TestWorkerTaskValidation — негодные задачи отвергаются до сети.
+// TestWorkerTaskValidation — unfit tasks are rejected before the network.
 func TestWorkerTaskValidation(t *testing.T) {
 	fetch, _ := workerFakeFetch(nil)
 	w := workerWorker(t, fetch, nil)
@@ -1146,17 +1146,17 @@ func TestWorkerTaskValidation(t *testing.T) {
 	}
 }
 
-// workerFakeFetchNoop — минимальный шов загрузки для проверок конструктора.
+// workerFakeFetchNoop — a minimal load seam for the constructor's checks.
 func workerFakeFetchNoop() FetchFunc {
 	return func(context.Context, httpfetch.FetchRequest, httpfetch.ChainOptions) (*httpfetch.ChainResult, error) {
 		return nil, errors.New("нет сценария")
 	}
 }
 
-// --- smoke цикла Run -----------------------------------------------------------
+// --- the Run loop's smoke -----------------------------------------------------------
 
-// workerFakeQueue — фейк queue.Queue: выдаёт доставки один раз, дальше
-// блокируется до отмены ctx; Ack и число чтений фиксируются.
+// workerFakeQueue — a queue.Queue fake: issues the deliveries once, then
+// blocks until the ctx cancellation; the Ack and the read count are recorded.
 type workerFakeQueue struct {
 	mu         sync.Mutex
 	deliveries []queue.Delivery
@@ -1200,7 +1200,7 @@ func (q *workerFakeQueue) ackedCount() int {
 	return len(q.acked)
 }
 
-// ackedSnapshot — копия подтверждённых ID (порядок сохранён).
+// ackedSnapshot — a copy of the acknowledged IDs (the order preserved).
 func (q *workerFakeQueue) ackedSnapshot() []string {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -1213,7 +1213,7 @@ func (q *workerFakeQueue) consumeCount() int {
 	return q.consumes
 }
 
-// workerDelivery — доставка с задачей домена.
+// workerDelivery — a delivery with a domain task.
 func workerDelivery(t *testing.T, task queue.HTTPTask) queue.Delivery {
 	t.Helper()
 	payload, err := json.Marshal(task)
@@ -1223,9 +1223,9 @@ func workerDelivery(t *testing.T, task queue.HTTPTask) queue.Delivery {
 	return queue.Delivery{Stream: queue.StreamHTTP, ID: "e1", Payload: payload}
 }
 
-// TestWorkerRunSmoke — цикл целиком: доставка q:http → обработка →
-// Options.OnResult (точка подключения записи T-058, до XACK) → Ack;
-// отмена ctx — чистый возврат nil.
+// TestWorkerRunSmoke — the loop in full: a q:http delivery → the processing →
+// Options.OnResult (the T-058 write's connection point, before the XACK) → Ack;
+// a ctx cancellation — a clean nil return.
 func TestWorkerRunSmoke(t *testing.T) {
 	body := "<html>" + strings.Repeat("страница для дымового теста цикла воркера http ", 30) + "</html>"
 	fetch, _ := workerFakeFetch(map[string]*workerPageScript{
@@ -1287,9 +1287,9 @@ func TestWorkerRunSmoke(t *testing.T) {
 	}
 }
 
-// TestWorkerRunOnResultError — ошибка обработчика результата (будущая
-// запись T-058) — доставка без XACK: вернётся повторной доставкой
-// (at-least-once, ТЗ 3.4).
+// TestWorkerRunOnResultError — the result handler's error (the future
+// T-058 write) — a delivery without an XACK: it will return with a repeated delivery
+// (at-least-once, spec 3.4).
 func TestWorkerRunOnResultError(t *testing.T) {
 	body := "<html>" + strings.Repeat("страница для проверки отказа обработки результата ", 30) + "</html>"
 	fetch, _ := workerFakeFetch(map[string]*workerPageScript{
@@ -1309,7 +1309,7 @@ func TestWorkerRunOnResultError(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- Run(ctx, q, w, opts) }()
 
-	// Окно с ошибочной доставкой завершено, когда цикл читает стрим снова.
+	// The window with an erroneous delivery is over when the loop reads the stream again.
 	deadline := time.After(5 * time.Second)
 	for q.consumeCount() < 2 {
 		select {
@@ -1332,11 +1332,11 @@ func TestWorkerRunOnResultError(t *testing.T) {
 	}
 }
 
-// workerPoisonQueue — бесконечный источник ядовитых доставок: каждое
-// чтение немедленно возвращает одну невалидную запись (Decode в
-// processDelivery падает, доставка остаётся без XACK). Скорость чтений
-// ограничивает только предохранитель цикла — идеальный измеритель его
-// работы без таймингов обработки.
+// workerPoisonQueue — an endless source of poison deliveries: every
+// read immediately returns one invalid record (Decode in
+// processDelivery fails, the delivery stays without an XACK). The read rate
+// is bounded only by the loop's fuse — a perfect meter of its
+// work without processing timings.
 type workerPoisonQueue struct {
 	mu       sync.Mutex
 	consumes int
@@ -1380,21 +1380,21 @@ func (q *workerPoisonQueue) ackedCount() int {
 	return len(q.acked)
 }
 
-// TestWorkerRunBackoffOnFailures — предохранитель скользящего цикла
-// (T-139): при систематическом сбое обработки (каждая доставка падает —
-// здесь ядовитые записи) чтение q:http приостанавливается с удвоением
-// паузы, иначе цикл пережигал бы попытки доставок (XAUTOCLAIM → q:dead,
-// T-025) в горячем режиме; чтения при этом продолжаются — счётчик не
-// блокирует цикл навсегда. Пауза сжата до 100 мс: секунды в юнит-тесте
-// не ждать, границы взяты с многократным запасом против джиттера CI.
+// TestWorkerRunBackoffOnFailures — the sliding loop's fuse
+// (T-139): at a systematic processing failure (every delivery falls —
+// here poison records) the q:http reading is suspended with a pause doubling,
+// otherwise the loop would burn the delivery attempts (XAUTOCLAIM → q:dead,
+// T-025) at full speed; the reads continue at that — the counter does not
+// block the loop forever. The pause is shrunk to 100 ms: seconds are not
+// waited in a unit test, the boundaries are taken with a multiple headroom against the CI jitter.
 func TestWorkerRunBackoffOnFailures(t *testing.T) {
 	old := workerFailWaitBase
 	workerFailWaitBase = 100 * time.Millisecond
 	t.Cleanup(func() { workerFailWaitBase = old })
 
-	// Пул и пачка чтения минимальны: порог предохранителя — Consume
-	// подряд неудач (1), конвейер чтения не глубже пары доставок. Шов
-	// загрузки не вызывается (декод падает раньше), но New требует его.
+	// The pool and the read chunk are minimal: the fuse threshold — Consume
+	// failures in a row (1), the read pipeline is no deeper than a couple of deliveries. The
+	// load seam is not called (the decode falls earlier), but New requires it.
 	dummyFetch, _ := workerFakeFetch(nil)
 	w := workerWorker(t, dummyFetch, nil)
 	q := &workerPoisonQueue{}
@@ -1405,9 +1405,9 @@ func TestWorkerRunBackoffOnFailures(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- Run(ctx, q, w, opts) }()
 
-	// Первые чтения уходят до срабатывания счётчика (регистрация неудач
-	// асинхронна) — окно в 450 мс покрывает их с запасом; дальше паузы
-	// 100/200/400 мс душат темп чтений до единиц.
+	// The first reads go before the counter fires (the failure
+	// registration is asynchronous) — a 450 ms window covers them with headroom; then the
+	// 100/200/400 ms pauses throttle the read rate to units.
 	deadline := time.After(5 * time.Second)
 	waitCount := func(n int) int {
 		for {
@@ -1429,8 +1429,8 @@ func TestWorkerRunBackoffOnFailures(t *testing.T) {
 		t.Errorf("чтений %d за 450 мс — предохранитель не душит темп (ждалось ≤10)", first)
 	}
 
-	// Паузы удваиваются: следующий интервал добавляет считанные чтения,
-	// а не десятки. Рост между двумя замерами — не более пары чтений.
+	// The pauses double: the next interval adds a few reads,
+	// not tens. The growth between the two measurements — no more than a couple of reads.
 	time.Sleep(450 * time.Millisecond)
 	if grew := q.consumeCount() - first; grew > 2 {
 		t.Errorf("за следующие 450 мс ещё %d чтений — пауза не растёт с серией неудач", grew)
@@ -1450,11 +1450,11 @@ func TestWorkerRunBackoffOnFailures(t *testing.T) {
 	}
 }
 
-// workerInfraQueue — бесконечный источник валидных задач q:http (T-152):
-// каждое чтение возвращает одну доставку, обработка доходит до
-// Options.OnResult (в этом тесте — падает InfraError, модель OOM
-// публикации результата). Скорость чтений ограничивает только
-// инфраструктурная пауза цикла — измеритель её работы.
+// workerInfraQueue — an endless source of valid q:http tasks (T-152):
+// every read returns one delivery, the processing reaches
+// Options.OnResult (in this test an InfraError falls — the model of the
+// result publication's OOM). The read rate is bounded only by
+// the loop's infrastructural pause — the meter of its work.
 type workerInfraQueue struct {
 	mu       sync.Mutex
 	consumes int
@@ -1505,9 +1505,9 @@ func (q *workerInfraQueue) ackedCount() int {
 	return q.acked
 }
 
-// workerProbeRedis — клиент SET/XAUTOCLAIM/XPENDING для пробы записи
-// Reliab.Writable (T-152): переключаемая ошибка SET; клейм всегда пуст
-// (гейт и не должен пускать его дальше).
+// workerProbeRedis — a SET/XAUTOCLAIM/XPENDING client for the Reliab.Writable
+// write probe (T-152): a switchable SET error; the claim is always empty
+// (the gate must not let it further anyway).
 type workerProbeRedis struct {
 	mu     sync.Mutex
 	setErr error
@@ -1536,11 +1536,11 @@ func (f *workerProbeRedis) XPendingExt(ctx context.Context, a *redis.XPendingExt
 	return redis.NewXPendingExtCmd(ctx, "xpending")
 }
 
-// TestWorkerRunInfraPause — пауза потребления при устойчивой InfraError
-// публикации (T-152): ошибка публикации результата (OOM Redis) — не
-// ошибка обработки, черпать новые доставки бессмысленно: чтение q:http
-// останавливается до восстановления записи (Reliab.Writable), после
-// восстановления — возобновляется и доводит доставки до XACK.
+// TestWorkerRunInfraPause — the consumption pause at a sustained InfraError
+// of publishing (T-152): a result publication error (the Redis OOM) is not
+// a processing error, drawing new deliveries is pointless: the q:http reading
+// stops until the write recovers (Reliab.Writable), after
+// the recovery — it resumes and brings the deliveries to the XACK.
 func TestWorkerRunInfraPause(t *testing.T) {
 	old := workerFailWaitBase
 	workerFailWaitBase = 5 * time.Millisecond
@@ -1563,8 +1563,8 @@ func TestWorkerRunInfraPause(t *testing.T) {
 	fetch, _ := workerFakeFetch(map[string]*workerPageScript{
 		"infra.test": {status: 200, body: "<html>страница инфраструктурной паузы</html>"},
 	})
-	// OnResult задан в опциях Run (не New): цикл передаёт свои opts
-	// в processDelivery — как сборка cmd/http-worker.
+	// OnResult is set in the Run options (not New): the loop passes its opts
+	// into processDelivery — as the cmd/http-worker build does.
 	w := workerWorker(t, fetch, nil)
 
 	q := &workerInfraQueue{}
@@ -1578,8 +1578,8 @@ func TestWorkerRunInfraPause(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- Run(ctx, q, w, opts) }()
 
-	// OOM-окно: первая пачка прочитана, её публикация упала — чтение
-	// останавливается пробой (без паузы чтения были бы сотнями за окно).
+	// The OOM window: the first chunk is read, its publication fell — the reading
+	// is stopped by the probe (without the pause there would be hundreds of reads per window).
 	deadline := time.After(5 * time.Second)
 	for q.consumeCount() == 0 {
 		select {
@@ -1596,8 +1596,8 @@ func TestWorkerRunInfraPause(t *testing.T) {
 		t.Errorf("подтверждений %d при падающей публикации", q.ackedCount())
 	}
 
-	// Запись восстановлена (дренаж памяти в инциденте): чтение
-	// возобновляется, доставки доводятся до XACK.
+	// The write recovered (the memory drainage in the incident): the reading
+	// resumes, the deliveries are brought to the XACK.
 	probe.setProbeErr(nil)
 	failMu.Lock()
 	failPublish = false
@@ -1622,15 +1622,15 @@ func TestWorkerRunInfraPause(t *testing.T) {
 	}
 }
 
-// TestWorkerRunPanicRecovered — recover-паритет паник доставки
-// (T-262, ТЗ-fsm §3 ФТ-8; образец — TestRenderWorker_RunPanicRecovered):
-// паника обработки одной доставки (Options.OnResult — точка записи
-// результата, синхронный стек горутины доставки) не роняет процесс —
-// паникующая запись не подтверждается, соседняя доставка окна
-// дорабатывается и подтверждается, цикл жив до отмены ctx. До T-262
-// паника в горутине доставки убивала юнит http-worker целиком.
-// (Паника в шве загрузки живёт в горутинах PerDomain — тех этот
-// recover и прежде не накрывал, здесь не моделируется.)
+// TestWorkerRunPanicRecovered — the delivery panics' recover parity
+// (T-262, TZ-fsm spec §3 FR-8; the model — TestRenderWorker_RunPanicRecovered):
+// one delivery's processing panic (Options.OnResult — the result write
+// point, the delivery goroutine's synchronous stack) does not drop the process —
+// the panicking write is not acknowledged, the window's neighboring delivery
+// finishes and is acknowledged, the loop lives until the ctx cancellation. Before T-262
+// a panic in the delivery goroutine killed the http-worker unit entirely.
+// (A panic in the load seam lives in the PerDomain goroutines — this
+// recover never covered those; not modeled here.)
 func TestWorkerRunPanicRecovered(t *testing.T) {
 	panicBody := "<html>" + strings.Repeat("страница паникующей доставки ", 30) + "</html>"
 	okBody := "<html>" + strings.Repeat("страница здоровой доставки цикла ", 30) + "</html>"
@@ -1653,9 +1653,9 @@ func TestWorkerRunPanicRecovered(t *testing.T) {
 		{Stream: queue.StreamHTTP, ID: "e2", Payload: payload2},
 	}}
 
-	// Паникующая доставка обязана дойти до обработки результата ДО
-	// отмены (по образцу ревью T-142 P2-4): отмена сразу после XACK
-	// соседа оставляла recover-ветку недетерминированной.
+	// The panicking delivery must reach the result processing BEFORE
+	// the cancellation (on the model of the T-142 P2-4 review): a cancellation right after the
+	// neighbor's XACK left the recover branch non-deterministic.
 	panicHit := make(chan struct{}, 1)
 	opts := Options{Concurrency: 2, Consume: 2, OnResult: func(_ context.Context, res *DomainResult) error {
 		if res.Name == "panic.test" {
@@ -1680,8 +1680,8 @@ func TestWorkerRunPanicRecovered(t *testing.T) {
 		t.Fatal("паникующая доставка не дошла до обработки результата")
 	}
 
-	// Соседняя доставка обязана доработать и подтвердиться, несмотря
-	// на панику первой.
+	// The neighboring delivery must finish and be acknowledged despite
+	// the first one's panic.
 	for q.ackedCount() == 0 {
 		select {
 		case <-deadline:
@@ -1704,20 +1704,20 @@ func TestWorkerRunPanicRecovered(t *testing.T) {
 	}
 }
 
-// workerPanicQueue — бесконечный источник валидных задач q:http
-// паникующего домена (T-262): Decode проходит, загрузка паникует
-// (recover в горутине доставки, паритет с renderworker) — доставки
-// без XACK; скорость чтений душит предохранитель, паники учтены
-// счётчиком failed как неудачи.
+// workerPanicQueue — an endless source of valid q:http tasks
+// of a panicking domain (T-262): Decode passes, the load panics
+// (a recover in the delivery goroutine, the parity with renderworker) — the deliveries
+// without an XACK; the read rate is throttled by the fuse, the panics are accounted
+// by the failed counter as failures.
 type workerPanicQueue struct {
-	payload []byte // задача паникующего домена
+	payload []byte // the panicking domain's task
 
 	mu       sync.Mutex
 	consumes int
 }
 
 func (q *workerPanicQueue) Publish(context.Context, string, queue.Message) (string, error) {
-	return "", nil // до публикации паникующая доставка не доходит
+	return "", nil // a panicking delivery does not reach the publication
 }
 
 func (q *workerPanicQueue) Consume(_ context.Context, _, _, _ string, n int) ([]queue.Delivery, error) {
@@ -1744,13 +1744,13 @@ func (q *workerPanicQueue) consumeCount() int {
 	return q.consumes
 }
 
-// TestWorkerRunPanicBackoff — паники в счётчике предохранителя
-// (T-262, паритет с TestRenderWorker_RunPanicBackoff): серия паникующих
-// доставок без единого подтверждения — та же серия неудач, что и
-// ошибки обработки (recover учитывает панику в failed): чтение q:http
-// душится паузой с удвоением, процесс не падает; без учёта паник цикл
-// пережигал бы попытки доставок (XAUTOCLAIM → q:dead, T-025) на полном
-// ходу.
+// TestWorkerRunPanicBackoff — the panics in the fuse counter
+// (T-262, the parity with TestRenderWorker_RunPanicBackoff): a series of panicking
+// deliveries without a single acknowledgment — the same failure series as
+// the processing errors (the recover accounts the panic in failed): the q:http reading
+// is throttled by a pause with a doubling, the process does not fall; without accounting the panics the loop
+// would burn the delivery attempts (XAUTOCLAIM → q:dead, T-025) at full
+// speed.
 func TestWorkerRunPanicBackoff(t *testing.T) {
 	old := workerFailWaitBase
 	workerFailWaitBase = 100 * time.Millisecond
@@ -1771,8 +1771,8 @@ func TestWorkerRunPanicBackoff(t *testing.T) {
 	}
 	q := &workerPanicQueue{payload: payload}
 
-	// Паникующая обработка результата (синхронный стек горутины
-	// доставки) — сигнал, что доставки доходят до сбоя.
+	// The panicking result processing (the delivery goroutine's
+	// synchronous stack) — the signal that the deliveries reach the failure.
 	panicHit := make(chan struct{}, 1)
 	opts := Options{Concurrency: 1, Consume: 1, OnResult: func(_ context.Context, res *DomainResult) error {
 		select {
@@ -1787,8 +1787,8 @@ func TestWorkerRunPanicBackoff(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- Run(ctx, q, w, opts) }()
 
-	// Паника случилась (доставка дошла до обработки), чтения душатся —
-	// те же границы, что у TestWorkerRunBackoffOnFailures.
+	// The panic happened (the delivery reached the processing), the reads are throttled —
+	// the same boundaries as at TestWorkerRunBackoffOnFailures.
 	select {
 	case <-panicHit:
 	case <-time.After(5 * time.Second):
@@ -1830,14 +1830,14 @@ func TestWorkerRunPanicBackoff(t *testing.T) {
 	}
 }
 
-// TestWorkerRunSlidingConsumption — суть T-139: чтение q:http не ждёт
-// завершения пачки целиком. Первая доставка окна блокируется в сети до
-// отмены ctx (хвост длительностей — тарпит до total_timeout); при
-// барьере окна (до T-139) wg.Wait держал бы цикл на ней — хвостовые
-// доставки пачки и следующее чтение не начинались. Скользящее
-// потребление обязано подтвердить все быстрые доставки, пока
-// блокирующая в полёте: слоты освобождаются завершившимися задачами,
-// читатель двигается дальше.
+// TestWorkerRunSlidingConsumption — the essence of T-139: the q:http reading does not wait
+// for the whole chunk's completion. The window's first delivery blocks in the network until
+// the ctx cancellation (the durations' tail — a tarpit up to total_timeout); at
+// a window barrier (before T-139) the wg.Wait would hold the loop on it — the chunk's
+// tail deliveries and the next read would not start. The sliding
+// consumption must acknowledge all the fast deliveries while
+// the blocking one is in flight: the slots are freed by the finished tasks,
+// the reader moves on.
 func TestWorkerRunSlidingConsumption(t *testing.T) {
 	fetch, log := workerFakeFetch(map[string]*workerPageScript{
 		"block.test": {blockCtx: true},
@@ -1862,8 +1862,8 @@ func TestWorkerRunSlidingConsumption(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- Run(ctx, q, w, opts) }()
 
-	// Блокирующая доставка ушла в сеть и держит слот — быстрые
-	// дорабатывают и подтверждаются мимо неё.
+	// The blocking delivery went to the network and holds a slot — the fast
+	// ones finish and are acknowledged past it.
 	deadline := time.After(5 * time.Second)
 	for log.countHost("block.test") == 0 {
 		select {
@@ -1891,21 +1891,21 @@ func TestWorkerRunSlidingConsumption(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("Run не завершился после отмены ctx")
 	}
-	// Блокирующая доставка не подтверждена — вернётся повторной
-	// доставкой (at-least-once, ТЗ 3.4), быстрые подтверждены ровно
-	// по одному разу.
+	// The blocking delivery is not acknowledged — it will return with a repeated
+	// delivery (at-least-once, spec 3.4), the fast ones are acknowledged exactly
+	// once each.
 	if got := q.ackedCount(); got != 4 {
 		t.Errorf("подтверждений %d, ожидалось 4 (блокирующая — без XACK)", got)
 	}
 }
 
-// TestWorkerRunCancelKeepsBufferUnacked — гарантия скользящего буфера
-// (T-139, ревью P3-3): прочитанные вперёд, но не начатые доставки (слоты
-// заняты блокирующимися задачами) при отмене ctx НЕ запускаются и НЕ
-// подтверждаются — вместе с текущими пачками читателя они остаются в
-// pending стрима и возвращаются клеймом XAUTOCLAIM (at-least-once,
-// ТЗ 3.4). Заодно — потолок слотов: третья и четвёртая задачи не
-// стартуют, пока обе блокирующиеся держат Concurrency=2.
+// TestWorkerRunCancelKeepsBufferUnacked — the sliding buffer's guarantee
+// (T-139, the P3-3 review): the read ahead but not started deliveries (the slots
+// taken by blocking tasks) at the ctx cancellation are NOT launched and NOT
+// acknowledged — together with the reader's current chunks they stay in
+// the stream's pending and return by an XAUTOCLAIM claim (at-least-once,
+// spec 3.4). At the same time — the slots' cap: the third and fourth tasks do
+// not start while both blocking ones hold Concurrency=2.
 func TestWorkerRunCancelKeepsBufferUnacked(t *testing.T) {
 	fetch, log := workerFakeFetch(map[string]*workerPageScript{
 		"block1.test": {blockCtx: true},
@@ -1918,9 +1918,9 @@ func TestWorkerRunCancelKeepsBufferUnacked(t *testing.T) {
 		return workerDelivery(t, queue.HTTPTask{ZoneID: 21, DomainID: id, Name: name,
 			Subdomains: []queue.HTTPSubdomain{workerSubMsg(0, "")}})
 	}
-	// Пачка больше параллелизма: buf1/buf2 прочитаны читателем вперёд
-	// (буфер + пачка в руке), но слотов для них нет, пока блокирующиеся
-	// задачи держат оба.
+	// The chunk is larger than the parallelism: buf1/buf2 are read by the reader ahead
+	// (the buffer + the chunk in hand), but there are no slots for them while the
+	// blocking tasks hold both.
 	q := &workerFakeQueue{deliveries: []queue.Delivery{
 		task(81, "block1.test"), task(82, "block2.test"),
 		task(83, "buf1.test"), task(84, "buf2.test"),
@@ -1932,9 +1932,9 @@ func TestWorkerRunCancelKeepsBufferUnacked(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- Run(ctx, q, w, opts) }()
 
-	// Обе блокирующиеся задачи в сети (держат слоты), буферные обязаны
-	// остаться не начатыми — не обращаясь к сети, сколько бы цикл ни
-	// работал.
+	// Both blocking tasks are in the network (they hold the slots), the buffer ones must
+	// stay unstarted — without touching the network, no matter how long the
+	// loop runs.
 	deadline := time.After(5 * time.Second)
 	for log.countHost("block1.test") == 0 || log.countHost("block2.test") == 0 {
 		select {
@@ -1944,7 +1944,7 @@ func TestWorkerRunCancelKeepsBufferUnacked(t *testing.T) {
 		case <-time.After(2 * time.Millisecond):
 		}
 	}
-	time.Sleep(50 * time.Millisecond) // цикл успевает прочитать пачку и упереться в слоты
+	time.Sleep(50 * time.Millisecond) // the loop has time to read the chunk and hit the slots
 
 	if got := log.countHost("buf1.test") + log.countHost("buf2.test"); got != 0 {
 		t.Errorf("буферные доставки запущены при занятых слотах: обращений %d", got)
@@ -1970,11 +1970,11 @@ func TestWorkerRunCancelKeepsBufferUnacked(t *testing.T) {
 	}
 }
 
-// TestWorkerOptionsDefaults — дефолты задачного параллелизма (T-139)
-// воркера и конфигурации совпадают: боевая сборка (cmd/http-worker)
-// передаёт http.task_* в Options, изолированные сборки берут
-// withDefaults — расхождение молча меняло бы поведение боевого
-// экземпляра против документации.
+// TestWorkerOptionsDefaults — the worker's task parallelism defaults (T-139)
+// and the configuration match: the production build (cmd/http-worker)
+// passes http.task_* into Options, the isolated builds take
+// withDefaults — a divergence would silently change the production
+// instance's behavior against the documentation.
 func TestWorkerOptionsDefaults(t *testing.T) {
 	o := Options{}.withDefaults()
 	if o.Concurrency != DefaultConcurrency || o.Consume != DefaultConsume || o.PerDomain != DefaultPerDomain {
@@ -1991,18 +1991,18 @@ func TestWorkerOptionsDefaults(t *testing.T) {
 	if cfg.HTTP.TaskPerDomain != DefaultPerDomain {
 		t.Errorf("http.task_per_domain=%d расходится с DefaultPerDomain=%d", cfg.HTTP.TaskPerDomain, DefaultPerDomain)
 	}
-	// Явные значения не перетираются дефолтами.
+	// Explicit values are not overwritten by the defaults.
 	o = Options{Concurrency: 3, Consume: 2, PerDomain: 1}.withDefaults()
 	if o.Concurrency != 3 || o.Consume != 2 || o.PerDomain != 1 {
 		t.Errorf("withDefaults перетёр явные значения: %+v", o)
 	}
 }
 
-// TestWorkerRunCancelWhileWaitingSlot — отмена ctx во время ожидания слота
-// семафора не запускает доставку с уже отменённым ctx: окно из двух задач
-// при Concurrency=1, первая блокируется в сети до отмены — вторая обязана
-// остаться не начатой (её хост не читается из сети), окно возвращается
-// очереди повторной доставкой.
+// TestWorkerRunCancelWhileWaitingSlot — a ctx cancellation during the semaphore
+// slot wait does not launch a delivery with an already cancelled ctx: a window of two tasks
+// at Concurrency=1, the first blocks in the network until the cancellation — the second must
+// stay unstarted (its host is not read from the network), the window returns
+// to the queue by a repeated delivery.
 func TestWorkerRunCancelWhileWaitingSlot(t *testing.T) {
 	fetch, log := workerFakeFetch(map[string]*workerPageScript{
 		"block.test": {blockCtx: true},
@@ -2015,7 +2015,7 @@ func TestWorkerRunCancelWhileWaitingSlot(t *testing.T) {
 		workerDelivery(t, queue.HTTPTask{ZoneID: 11, DomainID: 62, Name: "next.test",
 			Subdomains: []queue.HTTPSubdomain{workerSubMsg(0, "")}}),
 	}}
-	// Concurrency — параметр цикла Run (семафор окна), не воркера.
+	// Concurrency — the Run loop's parameter (the window's semaphore), not the worker's.
 	opts := Options{Concurrency: 1}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -2023,8 +2023,8 @@ func TestWorkerRunCancelWhileWaitingSlot(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- Run(ctx, q, w, opts) }()
 
-	// Первая доставка ушла в сеть (держит единственный слот) — отменяем:
-	// вторая в этот момент ждёт семафор.
+	// The first delivery went to the network (holds the only slot) — we cancel:
+	// the second is waiting for the semaphore at that moment.
 	deadline := time.After(5 * time.Second)
 	for log.countHost("block.test") == 0 {
 		select {
@@ -2051,9 +2051,9 @@ func TestWorkerRunCancelWhileWaitingSlot(t *testing.T) {
 	}
 }
 
-// --- адаптер DNS-резолвера (ТЗ 5.5 п. 2) ---------------------------------------
+// --- the DNS resolver adapter (spec 5.5 item 2) ---------------------------------------
 
-// workerAddr — парсинг адреса сценария (падение — ошибка теста).
+// workerAddr — a scenario address's parse (a fall — the test's error).
 func workerAddr(t *testing.T, s string) netip.Addr {
 	t.Helper()
 	a, err := netip.ParseAddr(s)
@@ -2063,10 +2063,10 @@ func workerAddr(t *testing.T, s string) netip.Addr {
 	return a
 }
 
-// workerFakeDNS — сценарный dnsclient.Resolver: отвечает на A/AAAA
-// заданными адресами; withCNAME подмешивает CNAME-запись в ответ A
-// (рекурсор отдаёт псевдоним и цель одним ответом); aErr/aaaaErr —
-// сбой обмена только по одному типу записи (транзиентный отказ AAAA).
+// workerFakeDNS — a scenario dnsclient.Resolver: answers A/AAAA
+// with the given addresses; withCNAME mixes a CNAME record into the A answer
+// (the recursors serve the alias and the target in one answer); aErr/aaaaErr —
+// an exchange failure over only one record type (a transient AAAA refusal).
 type workerFakeDNS struct {
 	mu        sync.Mutex
 	asks      []uint16
@@ -2124,11 +2124,11 @@ func (d *workerFakeDNS) asked() []uint16 {
 	return append([]uint16(nil), d.asks...)
 }
 
-// workerSlowDNS — резолвер с задержкой ответа по типам (T-101): обмен
-// A/AAAA «едёт» aDelay/aaaaDelay, моменты входа/выхода каждого обмена
-// записываются — по перекрытию интервалов тест доказывает параллельность
-// опроса без точной зависимости от общего времени. Сон — вне мьютекса:
-// параллельные горутины не сериализуются замком.
+// workerSlowDNS — a resolver with a per-type answer delay (T-101): the
+// A/AAAA exchange "rides" aDelay/aaaaDelay, each exchange's entry/exit moments
+// are recorded — by the intervals' overlap the test proves the polling's
+// concurrency without an exact dependence on the overall time. The sleep — outside the mutex:
+// the parallel goroutines are not serialized by the lock.
 type workerSlowDNS struct {
 	mu                sync.Mutex
 	entered, exited   map[uint16]time.Time
@@ -2173,9 +2173,9 @@ func (d *workerSlowDNS) Exchange(ctx context.Context, q dnsclient.Question) (*dn
 	return res, nil
 }
 
-// workerBlockDNS — резолвер, не отвечающий до отмены ctx (тест отмены
-// T-101): оба параллельных обмена обязаны вернуться ошибкой контекста,
-// а не ждать таймауты резолвера.
+// workerBlockDNS — a resolver not answering until the ctx cancellation (the
+// T-101 cancellation test): both parallel exchanges must return a context error,
+// not wait for the resolver's timeouts.
 type workerBlockDNS struct {
 	mu   sync.Mutex
 	asks int
@@ -2195,7 +2195,7 @@ func (d *workerBlockDNS) asked() int {
 	return d.asks
 }
 
-// sleepCtx — сон с выходом по отмене ctx (хелпер сценарных резолверов).
+// sleepCtx — a sleep with an exit by the ctx cancellation (the scenario resolvers' helper).
 func sleepCtx(ctx context.Context, d time.Duration) error {
 	t := time.NewTimer(d)
 	defer t.Stop()
@@ -2220,10 +2220,10 @@ func TestWorkerDNSLookup(t *testing.T) {
 		if len(got) != 2 || got[0].String() != "192.0.2.10" || got[1].String() != "2001:db8::1" {
 			t.Errorf("адреса: %v (порядок стабилен: A, затем AAAA — T-101)", got)
 		}
-		// Опрос параллельный (T-101): порядок прибытия вопросов к
-		// резолверу недетерминирован — проверяются оба типа как
-		// множество, а не последовательность (два разных из двух
-		// возможных = ровно A и AAAA).
+		// The polling is concurrent (T-101): the questions' arrival order at
+		// the resolver is non-deterministic — both types are checked as
+		// a set, not a sequence (two different of the two
+		// possible = exactly A and AAAA).
 		if asked := d.asked(); len(asked) != 2 || asked[0] == asked[1] {
 			t.Errorf("вопросы: %v (ожидались A и AAAA в любом порядке)", asked)
 		}
@@ -2331,12 +2331,12 @@ func TestWorkerDNSLookup(t *testing.T) {
 		}
 	})
 	t.Run("параллельный опрос — латентность max, не сумма", func(t *testing.T) {
-		// Медленный A + быстрый AAAA: при последовательном опросе
-		// интервалы обменов не пересекаются и сумма задержек съедается
-		// целиком; параллельный — обмены перекрываются, общее время ≈
-		// времени медленного типа. Перекрытие проверяется по moments
-		// входа/выхода (сна вне мьютекса фейка), а не по общему времени
-		// — момент надёжнее замера.
+		// A slow A + a fast AAAA: at a sequential polling
+		// the exchanges' intervals do not overlap and the delays' sum is eaten
+		// entirely; the concurrent one — the exchanges overlap, the overall time ≈
+		// the slow type's time. The overlap is checked by the entry/exit
+		// moments (the sleeps outside the fake's mutex), not by the overall time
+		// — the moment is more reliable than a measurement.
 		const (
 			aDelay    = 180 * time.Millisecond
 			aaaaDelay = 40 * time.Millisecond
@@ -2353,18 +2353,18 @@ func TestWorkerDNSLookup(t *testing.T) {
 		if err != nil {
 			t.Fatalf("LookupNetIP: %v", err)
 		}
-		// Порядок итога стабилен независимо от завершения: A первым,
-		// хоть он и отвечал дольше.
+		// The outcome's order is stable regardless of the completion: A first,
+		// even though it answered longer.
 		if len(got) != 2 || got[0].String() != "192.0.2.20" || got[1].String() != "2001:db8::20" {
 			t.Errorf("адреса: %v (порядок A, затем AAAA — как при последовательном опросе)", got)
 		}
-		// AAAA спросили, пока A ещё был в полёте — обмены параллельны.
+		// AAAA was asked while A was still in flight — the exchanges are concurrent.
 		if !(d.entered[dns.TypeAAAA].Before(d.exited[dns.TypeA])) {
 			t.Errorf("обмены не перекрываются: A [%v..%v], AAAA [%v..%v] — опрос последовательный",
 				d.entered[dns.TypeA], d.exited[dns.TypeA], d.entered[dns.TypeAAAA], d.exited[dns.TypeAAAA])
 		}
-		// Общее время ≈ max(A, AAAA), не сумма: не быстрее медленного
-		// типа (он обязан завершиться) и с запасом ниже суммы.
+		// The overall time ≈ max(A, AAAA), not the sum: not faster than the slow
+		// type (it must finish) and with headroom below the sum.
 		if elapsed < aDelay {
 			t.Errorf("время %v < задержки медленного типа %v — быстрый ответ не ждёт медленного соседа... или фейка", elapsed, aDelay)
 		}
@@ -2391,8 +2391,8 @@ func TestWorkerDNSLookup(t *testing.T) {
 		if n := d.asked(); n != 2 {
 			t.Errorf("обменов %d — опрошены оба типа с общим ctx", n)
 		}
-		// Возврат — по отмене, а не по чужому таймауту: с запасом ниже
-		// секунды против секунд таймаутов dnsclient (T-035).
+		// The return — by the cancellation, not a foreign timeout: with headroom below
+		// a second against the dnsclient timeouts (T-035).
 		if elapsed > time.Second {
 			t.Errorf("время %v — резолв не отменился сразу", elapsed)
 		}

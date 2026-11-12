@@ -1,8 +1,8 @@
-// Юнит-тесты приборов HTTP-этапа (T-077, ТЗ 5.9): nil-безопасность,
-// экспорт значений через Gather (счётчик задач и длительности, ошибки
-// по классам ErrorClass, финальный статус, время ответа без кэш-
-// попаданий, записи rendered=false), инкременты в типовом пути цикла
-// Run — на фейках шва загрузки и очереди из worker_test.go.
+// Unit tests of the HTTP stage's instruments (T-077, spec 5.9): nil safety,
+// exporting values via Gather (the task counter and durations, errors
+// by ErrorClass class, the final status, the response time without cache
+// hits, the rendered=false records), increments in the typical path of the Run
+// loop — on the load and queue seam fakes from worker_test.go.
 package httpworker
 
 import (
@@ -19,9 +19,9 @@ import (
 	"crawler/internal/queue"
 )
 
-// httpMetricValue — значение серии метрики name, все метки labels
-// совпадают (для гистограммы — счётчик наблюдений). Серия не найдена —
-// −1 (различимо от честного нуля).
+// httpMetricValue — the value of the metric name's series, all labels labels
+// matching (for a histogram — the observation count). The series is not found —
+// −1 (distinguishable from an honest zero).
 func httpMetricValue(t *testing.T, g prometheus.Gatherer, name string, labels map[string]string) float64 {
 	t.Helper()
 	families, err := g.Gather()
@@ -65,8 +65,8 @@ func TestMetricsNilSafe(t *testing.T) {
 		t.Fatal("NewMetrics(nil) != nil — изолированные сборки без реестра")
 	}
 	var m *Metrics
-	m.Episode(&DomainResult{Name: "x"}, time.Second) // no-op, не паникует
-	m.Episode(nil, time.Second)                      // защита прямых вызовов
+	m.Episode(&DomainResult{Name: "x"}, time.Second) // no-op, no panic
+	m.Episode(nil, time.Second)                      // the guard of direct calls
 	m.SlotEnter()
 	m.SlotLeave()
 	m.BodyHeld(1 << 20)
@@ -75,10 +75,10 @@ func TestMetricsNilSafe(t *testing.T) {
 	m.PerIPWait(time.Second)
 }
 
-// TestMetricsSlotBody — приборы памяти слота (T-163): занятость слота
-// парой вход/выход, транзитные байты тел сходимой парой ±n, размер
-// тела — наблюдение гистограммы. Пары обязаны сводить gauges к нулю —
-// иначе сэмплер намерил бы утечку там, где её нет.
+// TestMetricsSlotBody — the slot memory instruments (T-163): the slot occupancy
+// by an enter/exit pair, the transit body bytes by a converging ±n pair, the body
+// size — a histogram observation. The pairs must bring the gauges to zero —
+// otherwise the sampler would measure a leak where there is none.
 func TestMetricsSlotBody(t *testing.T) {
 	reg := metrics.New("http-worker")
 	m := NewMetrics(reg)
@@ -111,10 +111,10 @@ func TestMetricsSlotBody(t *testing.T) {
 	}
 }
 
-// TestMetricsPerIPWait — гистограмма ожидания per-IP семафора (T-165):
-// наблюдения ложатся в счётчик, корзина le=2 (граница критерия
-// «доля ожиданий > 2 с < 5%») отдает кумулятив ниже общего счётчика —
-// доля читается по корзинам без отдельного счётчика.
+// TestMetricsPerIPWait — the per-IP semaphore wait histogram (T-165):
+// observations land in the counter, the le=2 bucket (the boundary of the
+// "share of waits > 2 s < 5%" criterion) gives a cumulative below the overall counter —
+// the share is read from the buckets without a separate counter.
 func TestMetricsPerIPWait(t *testing.T) {
 	reg := metrics.New("http-worker")
 	m := NewMetrics(reg)
@@ -152,9 +152,9 @@ func TestMetricsPerIPWait(t *testing.T) {
 	}
 }
 
-// TestMetricsEpisode — один эпизод: две проверки с ошибками разных
-// классов, одна доступная некэшированная (время ответа), одна кэш-
-// попадание (без времени ответа), две записи результата → alive.
+// TestMetricsEpisode — one episode: two checks with errors of different
+// classes, one available non-cached (the response time), one cache
+// hit (no response time), two result records → alive.
 func TestMetricsEpisode(t *testing.T) {
 	reg := metrics.New("http-worker")
 	m := NewMetrics(reg)
@@ -199,12 +199,12 @@ func TestMetricsEpisode(t *testing.T) {
 	if got := httpMetricValue(t, reg, "crawler_domain_status_total", map[string]string{"type": model.StatusAlive.String()}); got != 1 {
 		t.Errorf("crawler_domain_status_total{alive} = %v, want 1 (записи есть)", got)
 	}
-	// Время ответа: только доступная некэшированная проверка (кэш сеть
-	// не трогал, ResponseMS = 0).
+	// The response time: only the available non-cached check (the cache did
+	// not touch the network, ResponseMS = 0).
 	if got := httpMetricValue(t, reg, "crawler_http_response_seconds", nil); got != 1 {
 		t.Errorf("crawler_http_response_seconds (count) = %v, want 1", got)
 	}
-	// Доля рендера: 2 записи с rendered=false.
+	// The render share: 2 records with rendered=false.
 	if got := httpMetricValue(t, reg, "crawler_render_records_total", map[string]string{"rendered": "false"}); got != 2 {
 		t.Errorf("crawler_render_records_total{rendered=\"false\"} = %v, want 2", got)
 	}
@@ -213,11 +213,11 @@ func TestMetricsEpisode(t *testing.T) {
 	}
 }
 
-// TestMetricsEpisodeCutoff — приборы dead-host cutoff (T-164): задача с
-// признаком Cutoff инкрементирует счётчик cutoff-задач, синтетические
-// ErrCutoff — счётчик сэкономленных проверок; ошибками этапа пропущенные
-// проверки не считаются (серии type=cutoff у crawler_stage_errors_total
-// нет), выполненные проверки головы считаются как обычно.
+// TestMetricsEpisodeCutoff — the dead-host cutoff instruments (T-164): a task with
+// the Cutoff sign increments the cutoff-task counter, synthetic
+// ErrCutoff — the saved checks counter; the skipped checks do not count
+// as stage errors (crawler_stage_errors_total has no type=cutoff
+// series), the performed head checks count as usual.
 func TestMetricsEpisodeCutoff(t *testing.T) {
 	reg := metrics.New("http-worker")
 	m := NewMetrics(reg)
@@ -260,8 +260,8 @@ func TestMetricsEpisodeCutoff(t *testing.T) {
 	}
 }
 
-// TestMetricsRunSmoke — приборы инкрементируются типовым путём цикла:
-// доставка q:http → проверки → OnResult → Episode (до XACK).
+// TestMetricsRunSmoke — the instruments are incremented by the typical path of the loop:
+// a q:http delivery → checks → OnResult → Episode (before the XACK).
 func TestMetricsRunSmoke(t *testing.T) {
 	body := "<html>" + strings.Repeat("страница для дымового теста метрик http ", 30) + "</html>"
 	fetch, _ := workerFakeFetch(map[string]*workerPageScript{
@@ -317,8 +317,8 @@ func TestMetricsRunSmoke(t *testing.T) {
 	if got := httpMetricValue(t, reg, "crawler_stage_seconds", stage); got != 1 {
 		t.Errorf("crawler_stage_seconds (count) = %v, want 1", got)
 	}
-	// Оба протокола отвечают одинаково → один вариант записи (T-054);
-	// статус домена — alive.
+	// Both protocols answer identically → one record variant (T-054);
+	// the domain status — alive.
 	mu.Lock()
 	recN := records
 	mu.Unlock()
@@ -328,21 +328,21 @@ func TestMetricsRunSmoke(t *testing.T) {
 	if got := httpMetricValue(t, reg, "crawler_domain_status_total", map[string]string{"type": model.StatusAlive.String()}); got != 1 {
 		t.Errorf("crawler_domain_status_total{alive} = %v, want 1", got)
 	}
-	// https и http — независимые проверки сети: два наблюдения времени
-	// ответа.
+	// https and http — independent network checks: two response time
+	// observations.
 	if got := httpMetricValue(t, reg, "crawler_http_response_seconds", nil); got != 2 {
 		t.Errorf("crawler_http_response_seconds (count) = %v, want 2", got)
 	}
 }
 
-// TestMetricsSlotMemoryRun — приборы памяти слота (T-163) в типовом
-// пути цикла: во время обработки (OnResult вызывается внутри
-// processDelivery — детерминированная точка) занят ровно один слот,
-// транзитные байты тел уже освобены (окно удержания закрывается в
-// checkScheme до возврата); после завершения цикла слоты и байты
-// сходятся к нулю, прочитанные тела — в гистограмме смеси (обе проверки
-// протоколов читают тело, кэш итоговых URL на разные схемы не
-// распространяется).
+// TestMetricsSlotMemoryRun — the slot memory instruments (T-163) in the typical
+// path of the loop: during processing (OnResult is called inside
+// processDelivery — a deterministic point) exactly one slot is busy,
+// the transit body bytes are already released (the hold window closes in
+// checkScheme before the return); after the loop completes the slots and bytes
+// converge to zero, the read bodies — in the mix histogram (both protocol
+// checks read the body, the final URLs' cache does not spread
+// across schemes).
 func TestMetricsSlotMemoryRun(t *testing.T) {
 	body := "<html>" + strings.Repeat("страница для замера памяти слота ", 30) + "</html>"
 	fetch, _ := workerFakeFetch(map[string]*workerPageScript{
@@ -388,8 +388,8 @@ func TestMetricsSlotMemoryRun(t *testing.T) {
 	if inSlots != 1 {
 		t.Errorf("crawler_http_tasks_inflight внутри обработки = %v, want 1", inSlots)
 	}
-	// Тела прочитаны и отпущены до OnResult (ранний Put T-147): окно
-	// удержания закрыто в checkScheme.
+	// The bodies are read and released before OnResult (the early Put of T-147): the
+	// hold window is closed in checkScheme.
 	if inBodyHeld != 0 {
 		t.Errorf("crawler_http_body_bytes_inflight внутри OnResult = %v, want 0 (тела уже отпущены)", inBodyHeld)
 	}

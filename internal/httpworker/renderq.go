@@ -1,107 +1,107 @@
-// Переполнение очереди рендера: флаг render_pending и доработка позже
-// (T-066; ТЗ 5.6 «если очередь рендера переполнена, домены получают
-// признак render_pending и дорабатываются позже; рендер не должен
-// задерживать остальные этапы», §7 «домен считается done после завершения
-// DNS/HTTP-этапа, а результаты рендера и анализа дополняют его
-// асинхронно»).
+// The render queue's overflow: the render_pending flag and the rework later
+// (T-066; spec 5.6 "if the render queue is full, the domains receive
+// the render_pending sign and are reworked later; the render must not
+// delay the other stages", §7 "a domain is considered done after the
+// DNS/HTTP stage completes, and the render and analysis results complement it
+// asynchronously").
 //
-// Штатный путь (§5.5 п. 8): SPA-записи результата (вердикт T-057 уже
-// в Record.SPA) публикуются в q:render — по Result-сообщению на запись
-// субдомен×вариант (формат T-024; потребитель T-067 заменит контент по
-// ключу). Публикация — после фиксации транзакции результата, как у
-// q:analyze (T-058): Result указывает на строку.
+// The graceful path (§5.5 item 8): the result's SPA records (the T-057 verdict is already
+// in Record.SPA) are published into q:render — one Result message per
+// subdomain×variant record (the T-024 format; the T-067 consumer will replace the content by
+// the key). The publication — after the result transaction's commit, as at
+// q:analyze (T-058): Result points to the row.
 //
-// Backpressure без блокировки. Гейт T-026 (WatermarkPublisher) ждёт
-// ёмкости перед публикацией — для q:render это запрещено: OnResult
-// выполняется до XACK задачи q:http (ТЗ 4.2), ожидание задержало бы
-// подтверждение домена, т.е. рендер задерживал бы остальные этапы —
-// против §5.6. Вместо ожидания — неблокирующая проверка глубины стрима
-// (BackpressureGate.Len, T-026: backlog группы потребления) ДО
-// транзакции результата:
+// Backpressure without blocking. The T-026 gate (WatermarkPublisher) waits
+// for the capacity before the publication — for q:render this is forbidden: OnResult
+// runs before the q:http task's XACK (spec 4.2), waiting would delay
+// the domain's acknowledgment, i.e. the render would delay the other stages —
+// against §5.6. Instead of waiting — a non-blocking check of the stream's depth
+// (BackpressureGate.Len, T-026: the consumption group's backlog) BEFORE
+// the result transaction:
 //
-//   - очередь свободна (depth < watermark, «строго ниже порога», ТЗ 4.2)
-//     — q:render публикуется сразу после фиксации, мимо
+//   - the queue is free (depth < watermark, "strictly below the threshold", spec 4.2)
+//     — q:render is published right after the commit, bypassing
 //     WatermarkPublisher;
-//   - очередь полна или глубина недоступна — публикация НЕ выполняется,
-//     домен получает флаг render_pending (бит 1 domains.flags, T-008) ТОЙ
-//     ЖЕ ТРАЗАКЦИЕЙ результата (§3.4: решение о рендере относится к этим
-//     строкам и фиксируется атомарно с ними) и завершается как обычно —
-//     check_state = done, XACK без задержки. Ошибка чтения глубины
-//     трактуется как переполнение (консервативно): флаг сохраняет задачи
-//     рендера от потери; настоящая недоступность Redis всё равно вернёт
-//     доставку на публикации q:analyze (T-058).
+//   - the queue is full or the depth is unavailable — the publication is NOT performed,
+//     the domain receives the render_pending flag (bit 1 of domains.flags, T-008) by THE
+//     SAME RESULT TRANSACTION (§3.4: the render decision belongs to these
+//     rows and is committed atomically with them) and finishes as usual —
+//     check_state = done, the XACK without a delay. A depth read error
+//     is treated as an overflow (conservatively): the flag saves the render
+//     tasks from loss; a real Redis unavailability will still return
+//     the delivery at the q:analyze publication (T-058).
 //
-// Порог — отдельный render.queue_high_watermark (T-174; расширение
-// ТЗ 5.10): общий scheduler.queue_high_watermark (T-026) при клампе
-// T-168 (min(lag, XLEN)+pending) держал ворота открытыми при лаге
-// 98,4 тыс. из 100 тыс. — приток равнялся потреблению, дренаж долга
-// нулевой (равновесие 24.10, этап 25 tasks.md). Дефолт 10 тыс. ≈ 2 ч
-// буфера потребления (замер 24.10: ≈5,1 тыс. задач/ч) закрывает
-// ворота на текущем долге и возвращает гистерезис «дренируем —
-// впускаем»; 0 — общий порог. Эффективное значение (кламп
-// min(watermark, MAXLEN/2), как у гейта T-026 — ворота обязаны
-// закрываться до обрезки) считает проводка cmd/http-worker
-// (renderQueueWatermark): сюда приходит готовое к сравнению число.
+// The threshold — a separate render.queue_high_watermark (T-174; an extension
+// of spec 5.10): the common scheduler.queue_high_watermark (T-026) at the
+// T-168 clamp (min(lag, XLEN)+pending) kept the gate open at a lag
+// of 98.4k of 100k — the inflow equaled the consumption, the debt
+// drainage was zero (the Oct 24 equilibrium, stage 25 of tasks.md). A default of 10k ≈ 2 h
+// of consumption buffer (the Oct 24 measurement: ≈5.1k tasks/h) closes
+// the gate at the current debt and returns the "draining —
+// letting in" hysteresis; 0 — the common threshold. The effective value (the clamp
+// min(watermark, MAXLEN/2), as at the T-026 gate — the gate must
+// close before the trimming) is computed by the cmd/http-worker wiring
+// (renderQueueWatermark): a ready-to-compare number arrives here.
 //
-// Проход доработки (§5.6 «дорабатываются позже»): фоновый цикл
-// RequeueRenderPending (стиль суточной перепроверки T-030 и очистки
-// T-020) подбирает домены с флагом и дорабатывает их, когда очередь
-// свободна. Выборка пачки — без PK-порядка, seq scan с ранним остановом
-// LIMIT и закреплением плана SET LOCAL + guard счётчиком долга (T-181:
-// index scan по PK вытаптывал дренированный «пустой» префикс — запрос №2
-// журнала медленных 24.10, медиана 44 с; закреплённый seq scan — десятки
-// мс, стационар без долга не трогает domains вовсе). Приоритет зон
-// (T-184, решение (а) T-176 — оператор 24.10: рендерим всё, ничего не
-// теряем; зоны с высоким DOM-вкладом — вперёд, парковочные .рф — по
-// остаточному принципу): непустой render.requeue_deprioritized_zones
-// делит выборку на две ступени БЕЗ сортировки — сначала домены зон НЕ
-// из списка, неполная пачка (исчерпание: LIMIT не сработал, скан дошёл
-// до конца таблицы) добирается зонами списка; обе ступени под теми же
-// закреплениями плана, очередь долга не теряет записей (всё
-// дорабатывается, зоны списка — последними), порожний проход исчерпанной
-// первой ступени цикл не повторяет (renderStage: память по счётчику
-// долга). SPA-вердикт берётся
-// из сохранённого контента записи:
-// DetectSPA (T-057) детерминирован над теми же байтами, что воркер
-// проверял при записи, — вердикт совпадает; алиасы (content_hash NULL,
-// alias_subdomain_id NOT NULL) наследуют вердикт субдомена-оригинала —
-// класс эквивалентности T-055 един по определению (один итоговый URL
-// или один контент), вердикты внутри класса совпадают. Порядок внутри
-// домена — «публикация q:render → снятие флага» (переходы бита ведут
-// счётчик рендер-долга одной транзакцией с битом, T-175; §3.4, в духе
+// The rework pass (§5.6 "are reworked later"): the background loop
+// RequeueRenderPending (the style of the daily recheck T-030 and the cleanup
+// T-020) picks up the domains with the flag and reworks them when the queue
+// is free. The chunk selection — without a PK order, a seq scan with an early
+// LIMIT stop and a pinned plan SET LOCAL + a debt counter guard (T-181:
+// the PK index scan trampled the drained "empty" prefix — query #2
+// of the Oct 24 slow-query log, a 44 s median; the pinned seq scan — tens of
+// ms, a debt-free steady state does not touch domains at all). The zones' priority
+// (T-184, the decision (a) of T-176 — the operator of Oct 24: we render everything, we
+// lose nothing; the zones with a high DOM contribution — first, the parking .rf —
+// the leftovers): a non-empty render.requeue_deprioritized_zones
+// divides the selection into two stages WITHOUT sorting — first the domains of the zones NOT
+// from the list, an incomplete batch (exhaustion: the LIMIT did not fire, the scan reached
+// the end of the table) is topped up by the list's zones; both stages under the same
+// plan pinning, the debt queue does not lose records (everything
+// is reworked, the list's zones — last), the exhausted
+// first stage's empty pass is not repeated by the loop (renderStage: the memory by the debt
+// counter). The SPA verdict is taken
+// from the record's stored content:
+// DetectSPA (T-057) is deterministic over the same bytes the worker
+// checked at the write — the verdict matches; the aliases (content_hash NULL,
+// alias_subdomain_id NOT NULL) inherit the original subdomain's verdict —
+// the T-055 equivalence class is one by definition (one final URL
+// or one content), the verdicts inside the class match. The order inside
+// the domain — "the q:render publication → the flag removal" (the bit's transitions keep
+// the render debt counter in one transaction with the bit, T-175; §3.4, in the spirit of
 // T-039:
-// сбой после публикации оставит флаг — повтор прохода опубликует снова,
-// дубликаты ограничены и гасятся идемпотентностью потребителя по ключу;
-// обратный порядок терял бы задачи навсегда — снятый флаг вернуть
-// некому).
+// a failure after the publication would leave the flag — a pass repeat will publish again,
+// the duplicates are bounded and extinguished by the consumer's key idempotency;
+// the reverse order would lose the tasks forever — nobody would return
+// the removed flag).
 //
-// Ограничения прохода (фиксируются сознательно):
-//   - записи без собственного контента и без алиаса (контент не сохранён
-//     — лимит/переполнение диска, T-056) не переиздаются: вердикт взять
-//     неоткуда; их доработает регулярная перепроверка (T-030);
-//   - отмаркированные render_failed_at записи (T-210 — финализации
-//     без рендера: тарпит T-148, cert T-159, DNS T-211, класс задачи
-//     T-172) не переиздаются вовсе (см. renderPendingRowsSQL): повторные издания
-//     — пустая трата доставок и слот-времени; их доработает следующий
-//     эпизод перепроверки (T-030) — перезапись строки сбрасывает маркер,
-//     первая попытка свежего эпизода легитимна, починившийся хост
-//     отрендерится;
-//   - сбой чтения блока (транзиентный сбой хранилища, гонка с
-//     компактификацией) флаг домена НЕ снимает: проход повторит чтение
-//     на следующем тике — цена минуты повтора против потери SPA-задачи
-//     до перепроверки T-030 (месяцы);
-//   - наследование алиаса — по субдомену-оригиналу без варианта
-//     (alias_subdomain_id ссылается на субдомен, T-055): у оригинала с
-//     двумя вариантами разных сайтов наследуются оба — редкий случай,
-//     цена — лишний рендер статической страницы, не потеря данных;
-//   - флаг не стирается записью нового эпизода: пока проход не снял,
-//     новый эпизод с SPA и свободной очередью публикует задачи сам
-//     (дубликаты ограничены), без SPA — проход снимет флаг, не найдя
-//     SPA-записей. Гонка «проход снимает флаг, а повторная доставка
-//     эпизода ставит его снова» сужена охраной бита в UPDATE снятия
-//     (RowsAffected = 0 — конкурент уже решил); окно требует доставки,
-//     не дошедшей до XACK, — попытки доставки исчерпываются за минуты
-//     (T-025), а самозалечивает остаток перепроверка T-030.
+// The pass's limitations (fixed deliberately):
+//   - the records without their own content and without an alias (the content is not stored
+//     — a limit/a disk overflow, T-056) are not re-published: there is nowhere
+//     to take the verdict from; the regular recheck will rework them (T-030);
+//   - the records marked by render_failed_at (T-210 — finalizations
+//     without a render: the tarpit T-148, cert T-159, DNS T-211, the task class
+//     T-172) are not re-published at all (see renderPendingRowsSQL): repeated editions
+//     — a waste of deliveries and slot time; the next
+//     recheck episode (T-030) will rework them — the row's rewrite resets the marker,
+//     the fresh episode's first attempt is legitimate, a host that fixed itself
+//     will render;
+//   - a block read failure (a transient store failure, a race with
+//     compaction) does NOT remove the domain's flag: the pass will repeat the read
+//     at the next tick — the price of a minute's repeat against losing the SPA task
+//     before the T-030 recheck (months);
+//   - the alias inheritance — by the original subdomain without a variant
+//     (alias_subdomain_id references the subdomain, T-055): at an original with
+//     two variants of different sites both are inherited — a rare case,
+//     the price — an extra render of a static page, not a data loss;
+//   - the flag is not erased by the new episode's write: while the pass has not cleared it,
+//     a new episode with SPA and a free queue publishes the tasks itself
+//     (the duplicates are bounded), without SPA — the pass will clear the flag, not finding
+//     SPA records. The race "the pass clears the flag, and a repeated delivery
+//     of the episode sets it again" is narrowed by the bit guard in the clear UPDATE
+//     (RowsAffected = 0 — a competitor has already decided); the window requires a delivery
+//     that did not reach the XACK — the delivery attempts are exhausted within minutes
+//     (T-025), and the T-030 recheck self-heals the remainder.
 package httpworker
 
 import (
@@ -121,298 +121,298 @@ import (
 	"crawler/internal/queue"
 )
 
-// Дефолты прохода доработки.
+// The rework pass's defaults.
 const (
-	// DefaultRenderRequeueInterval — период прохода доработки рендера.
-	// Минута, как DefaultCleanupInterval (T-020): переполнение — аварийный
-	// режим, «дорабатываются позже» не означает часы; при полной очереди
-	// проход стоит одно чтение глубины и не трогает БД. Отдельной опции
-	// конфига нет (§5.10 состав фиксирован) — интервал, как расписание
-	// T-030, живёт опцией цикла.
+	// DefaultRenderRequeueInterval — the render rework pass's period.
+	// A minute, like DefaultCleanupInterval (T-020): an overflow is an
+	// emergency mode, "are reworked later" does not mean hours; with a full queue
+	// the pass stands for one depth read and does not touch the DB. There is no separate
+	// config option (§5.10, the composition is fixed) — the interval, like the
+	// T-030 schedule, lives as a loop option.
 	DefaultRenderRequeueInterval = time.Minute
 
-	// DefaultRenderRequeueBatch — доменов в одной пачке прохода: проход
-	// читает контент записей для повторного SPA-вердикта (тела до 2 МиБ,
-	// ТЗ 5.5) — пачка умеренная против recheck-пачек T-030 (тем читать
-	// нечего); ёмкость q:render перепроверяется между доменами.
+	// DefaultRenderRequeueBatch — the domains in one pass chunk: the pass
+	// reads the records' content for the repeated SPA verdict (the bodies up to 2 MiB,
+	// spec 5.5) — a moderate batch against the T-030 recheck batches (they have nothing
+	// to read); the q:render capacity is re-checked between the domains.
 	DefaultRenderRequeueBatch = 100
 )
 
-// SQL прохода и флага. Коды схемы — литералами (стиль T-039); бит
-// render_pending — 2, маска снятия — 0xFFFD (все биты, кроме него).
-// T-175: переходы бита ведут инкрементальный счётчик рендер-долга
-// crawler_counters['render_pending'] — ±1 в той же транзакции, что и
-// переход (наблюдаемость долга без seq scan по 41,8 млн строк;
-// частичный индекс по flags отвергнут — ломает HOT, docs/schema.md
-// «HOT-апдейты», обоснование — миграция 000015).
+// The pass's and the flag's SQL. The schema codes — as literals (the T-039 style); the
+// render_pending bit — 2, the removal mask — 0xFFFD (all the bits except it).
+// T-175: the bit's transitions keep the render debt's incremental counter
+// crawler_counters['render_pending'] — ±1 in the same transaction as the
+// transition (the debt's observability without a seq scan over 41.8M rows;
+// a partial index over flags was rejected — it breaks HOT, docs/schema.md
+// "HOT updates", the justification — migration 000015).
 var (
-	// renderSetPendingSQL — флаг render_pending в транзакции записи
-	// результата (T-066): бит 1 через OR — is_idn (бит 0) и прочие биты
-	// сохраняются; колонка domains.flags — smallint, побитовые операторы
-	// PostgreSQL повышают smallint до int — возврат через ::int2.
-	// Охрана бита (T-175): семантика OR не меняется (повторная установка
-	// бита — тот же результат), но RowsAffected становится индикатором
-	// РЕАЛЬНОГО перехода 0→1 — по нему счётчик долга наращивается ровно
-	// на переходы, а не на каждую повторную доставку с уже стоящим
-	// флагом (зеркально охране снятия ниже).
+	// renderSetPendingSQL — the render_pending flag in the result write
+	// transaction (T-066): bit 1 via OR — is_idn (bit 0) and the other bits
+	// are preserved; the domains.flags column — smallint, the bitwise
+	// PostgreSQL operators promote smallint to int — the return via ::int2.
+	// The bit guard (T-175): the OR semantics does not change (a repeated
+	// bit setting — the same result), but RowsAffected becomes the indicator
+	// of a REAL 0→1 transition — by it the debt counter is incremented exactly
+	// by the transitions, not by every repeated delivery with an already set
+	// flag (mirroring the clear guard below).
 	//
-	// # Автомат бита render_pending × счётчика долга (T-258, ТЗ tasks/TZ-fsm.md §3 ФТ-4)
+	// # The render_pending bit × debt counter FSM (T-258, spec tasks/TZ-fsm.md §3 FR-4)
 	//
-	// Единая точка правды о жизненном цикле бита render_pending (бит 1
-	// domains.flags, model.FlagRenderPending — T-066) и его двойнике —
-	// счётчике рендер-долга crawler_counters['render_pending'] (T-175,
-	// миграция 000015). Долг домена кодируется ДВАЖДЫ — битом строки и
-	// вкладом +1 в счётчик (наблюдаемость долга без seq scan по всей
-	// domains), потому у автомата один стержневой инвариант (И1): пара
-	// «бит × счётчик» меняется только одной транзакцией, RowsAffected
-	// оператора бита — индикатор РЕАЛЬНОГО перехода (охрана бита: 0 —
-	// перехода не было, счётчик не трогается). Переходы остаются
-	// SQL-операторами с охранными предикатами (ТЗ-fsm §1); писатели
-	// (последняя колонка таблицы) сверяются с ней, не дублируют.
-	// Смежные автоматы: рендер-состояние строки
-	// (internal/renderworker/worker.go, T-259 — переходы П2/П3 владеют
-	// постановкой/снятием вместе с этим автоматом), check_state
+	// The single source of truth about the render_pending bit's life cycle (bit 1
+	// of domains.flags, model.FlagRenderPending — T-066) and its twin —
+	// the render debt counter crawler_counters['render_pending'] (T-175,
+	// migration 000015). A domain's debt is encoded TWICE — by the row's bit and
+	// the +1 contribution into the counter (the debt's observability without a seq scan over the whole
+	// domains), therefore the FSM has one core invariant (I1): the
+	// "bit × counter" pair changes only by one transaction, the bit operator's
+	// RowsAffected — the REAL transition indicator (the bit guard: 0 —
+	// there was no transition, the counter is not touched). The transitions remain
+	// SQL operators with guard predicates (TZ-fsm spec §1); the writers
+	// (the table's last column) are checked against it, not duplicating it.
+	// Adjacent FSMs: the row's render state
+	// (internal/renderworker/worker.go, T-259 — the T2/T3 transitions own the
+	// setting/removal together with this FSM), check_state
 	// (internal/scheduler/checkstate.go, T-255), status
-	// (internal/model/enums.go, T-256). Поздний переиздатель
-	// (renderlate.go, T-259 П4) бит НЕ пишет — интерлок исключает
-	// домены с битом из его выборки. Сценарная цепочка всех переходов
-	// на живых PostgreSQL/Redis — test/integration/renderbit_test.go
-	// (ТЗ-fsm §4). Формализация не меняет поведение.
+	// (internal/model/enums.go, T-256). The late re-publisher
+	// (renderlate.go, T-259 T4) does NOT write the bit — the interlock excludes
+	// the domains with the bit from its selection. The scenario chain of all the transitions
+	// on live PostgreSQL/Redis — test/integration/renderbit_test.go
+	// (TZ-fsm spec §4). The formalization does not change the behavior.
 	//
-	// ## Состояния (вклад домена: бит × счётчик)
+	// ## The states (the domain's contribution: the bit × the counter)
 	//
-	//	без-долга (0/+0)    публикации q:render за доменом нет и не
-	//	                     обещано: бит снят, вклад в счётчик нулевой.
-	//	                     Стационар конвейера — счётчик 0, guard
-	//	                     прохода (T-181) не трогает domains вовсе.
-	//	долг (1/+1)          публикация SPA-записей отложена: q:render
-	//	                     был полон в момент записи результата
-	//	                     (T-066). Держатель задач — бит, не стрим:
-	//	                     домена ждут выборка прохода доработки и
-	//	                     счётчик долга.
-	//	опубликован (1/+1)   сквозная точка прохода доработки: q:render
-	//	                     опубликован, бит ЕЩЁ стоит (порядок
-	//	                     «публикация → снятие», И3); отдельного
-	//	                     носителя нет — наблюдаем только дублем
-	//	                     публикации при сбое между шагами.
-	//	снят (0/+0)          долг закрыт: проходом доработки (после
-	//	                     публикации либо за ненадобностью — «черновой
-	//	                     флаг») либо delete-файлом (§13.1).
+	//	no-debt (0/+0)         the domain has no q:render publication and none
+	//	                       is promised: the bit is removed, the counter contribution is zero.
+	//	                       The pipeline's steady state — the counter 0, the
+	//	                       pass guard (T-181) does not touch domains at all.
+	//	debt (1/+1)            the SPA records' publication is postponed: q:render
+	//	                       was full at the moment of the result write
+	//	                       (T-066). The tasks' holder — the bit, not the stream:
+	//	                       the rework pass's selection and the
+	//	                       debt counter wait for the domain.
+	//	published (1/+1)       the rework pass's through point: q:render
+	//	                       is published, the bit is STILL set (the order
+	//	                       "publication → removal", I3); there is no
+	//	                       separate carrier — observable only by a
+	//	                       publication duplicate on a failure between the steps.
+	//	cleared (0/+0)         the debt is closed: by the rework pass (after
+	//	                       the publication or for the lack of need — a "draft
+	//	                       flag") or by the delete file (§13.1).
 	//
-	// ## Переходы: состояние × событие × охраны × цель × побочные действия
+	// ## Transitions: state × event × guards × target × side effects
 	//
-	//	| № | Исходное | Событие | Охраны | Цель | Побочные действия | Писатель |
+	//	| # | Source | Event | Guards | Target | Side effects | Writer |
 	//	|---|----------|---------|--------|------|-------------------|----------|
-	//	| Д1 | без-долга | запись результата HTTP-эпизода, q:render полон | есть SPA-записи (renderSPAResults непуст); HasCapacity = false — глубина ≥ watermark либо ошибка чтения (консервативно); статус <> deleted (UPDATE результата выше по транзакции) | долг | бит OR (прочие сохранены) и счётчик +1 ОДНОЙ транзакцией результата (RowsAffected 1 → renderBumpDebtCounter +1); публикация q:render не выполняется; эпизод завершается обычным done/XACK — рендер не задерживает этапы (§5.6) | record.go recordTx (renderSetPendingSQL) |
-	//	| Д2 | долг | повторная доставка эпизода, очередь всё ещё полна | охрана бита (flags & 2) = 0 → RowsAffected 0 | долг (без изменения) | счётчик НЕ трогается — второй +1 запрещён охраной (парность не двоится); строки перезаписываются идемпотентно (DELETE+INSERT, ТЗ 3.4) | record.go recordTx (bumpDebt = false) |
-	//	| Д3 | долг | проход доработки: контент читается, повторный вердикт SPA | очередь свободна (проверка до выборки и перед публикацией), домен не deleted (охрана выборки), записи не отмаркированы (T-210) | снят (через «опубликован») | публикация q:render → снятие бита и счётчик −1 одной транзакцией (renderClearPendingTx); сбой между шагами оставляет бит — повтор прохода опубликует дубль (ограничен, гасится идемпотентностью потребителя по ключу) | renderq.go RequeueOnce |
-	//	| Д4 | долг | проход доработки: SPA-записей нет (не-SPA контент, отмаркированы T-210, без контента и алиаса T-056) | как Д3 | снят | «черновой флаг»: снятие и −1 БЕЗ публикации — рендерить нечего | renderq.go RequeueOnce (пустой renderDomainKeys) |
-	//	| Д5 | долг | проход доработки: контент части записей нечитаем (транзиентный сбой хранилища, гонка компактификации) | как Д3 | долг (без изменения) | keep: бит и счётчик сохранены — следующий тик повторит домен (цена минуты повтора против потери SPA-задачи до перепроверки T-030) | renderq.go renderDomainKeys (keep) |
-	//	| Д6 | долг | delete-файл: домен покидает цикл проверок (§13.1) | охрана статуса <> deleted (повторное применение партии — no-op) | снят (строка deleted) | бит снят и счётчик −count(фактически снятых битов) ДВУМЯ операторами ОДНОЙ транзакции применения (applyDeleteSQL + applyClearRenderSQL, T-186/T-269: перевод статуса → охраняемая пара по ключам битовых строк, дельта — по факту перехода текущей версии, окно снимка T-186 закрыто инцидентом 08.11.2026): удаляемый выборку доработки уже не пройдёт, бит без владельца держал бы счётчик и порожний seq scan guard'а навсегда | ingest/apply_delete.go ApplyDelete |
-	//	| Д7 | долг | конкурентное снятие (второй экземпляр прохода, соседний инстанс) | охрана снятия (flags & 2) <> 0 → RowsAffected 0 | снят (без изменения) | счётчик НЕ трогается — переход уже учтён конкурентом (второй −1 запрещён); дубликаты публикации ограничены одним окном прохода | renderq.go renderClearPendingTx |
-	//	| Д8 | без-долга/долг | новый эпизод при свободной очереди | HasCapacity = true (при пустых renderSPAResults ёмкость не проверяется вовсе) | без изменения | запись результата бит НЕ ставит и НЕ стирает: у долга (ещё не снят проходом) свежий эпизод публикует q:render сам — дубль ограничен; без SPA — проход снимет по Д4 | record.go recordTx |
+	//	| D1 | no-debt | the HTTP episode's result write, q:render is full | there are SPA records (renderSPAResults non-empty); HasCapacity = false — the depth ≥ the watermark or a read error (conservatively); the status <> deleted (the result UPDATE above in the transaction) | debt | the bit OR (the others preserved) and the counter +1 by ONE result transaction (RowsAffected 1 → renderBumpDebtCounter +1); the q:render publication does not run; the episode finishes with the usual done/XACK — the render does not delay the stages (§5.6) | record.go recordTx (renderSetPendingSQL) |
+	//	| D2 | debt | a repeated episode delivery, the queue is still full | the bit guard (flags & 2) = 0 → RowsAffected 0 | debt (without change) | the counter is NOT touched — a second +1 is forbidden by the guard (the pairing is not doubled); the rows are rewritten idempotently (DELETE+INSERT, spec 3.4) | record.go recordTx (bumpDebt = false) |
+	//	| D3 | debt | the rework pass: the content is read, the repeated verdict SPA | the queue is free (the check before the selection and before the publication), the domain is not deleted (the selection guard), the records are not marked (T-210) | cleared (via "published") | a q:render publication → the bit clear and the counter −1 by one transaction (renderClearPendingTx); a failure between the steps leaves the bit — a pass repeat will publish a duplicate (bounded, extinguished by the consumer's key idempotency) | renderq.go RequeueOnce |
+	//	| D4 | debt | the rework pass: no SPA records (a non-SPA content, marked by T-210, without content and alias T-056) | as D3 | cleared | a "draft flag": the removal and −1 WITHOUT a publication — there is nothing to render | renderq.go RequeueOnce (an empty renderDomainKeys) |
+	//	| D5 | debt | the rework pass: the content part of the records is unreadable (a transient store failure, a compaction race) | as D3 | debt (without change) | keep: the bit and the counter are preserved — the next tick will repeat the domain (the price of a minute's repeat against losing the SPA task before the T-030 recheck) | renderq.go renderDomainKeys (keep) |
+	//	| D6 | debt | the delete file: the domain leaves the check cycle (§13.1) | the status <> deleted guard (a repeated batch application — a no-op) | cleared (the row deleted) | the bit cleared and the counter −count(the actually removed bits) by TWO operators of ONE application transaction (applyDeleteSQL + applyClearRenderSQL, T-186/T-269: the status translation → the guarded pair by the bit rows' keys, the delta — by the fact of the current version's transition, the T-186 snapshot window closed by the 08.11.2026 incident): the deleted would no longer pass the rework selection, a bit without an owner would keep the counter and the guard's empty seq scan forever | ingest/apply_delete.go ApplyDelete |
+	//	| D7 | debt | a concurrent clear (a second pass instance, a neighboring instance) | the clear guard (flags & 2) <> 0 → RowsAffected 0 | cleared (without change) | the counter is NOT touched — the transition is already accounted by the competitor (a second −1 is forbidden); the publication duplicates are bounded by one pass window | renderq.go renderClearPendingTx |
+	//	| D8 | no-debt/debt | a new episode with a free queue | HasCapacity = true (at empty renderSPAResults the capacity is not checked at all) | without change | the result write does NOT set and does NOT erase the bit: for a debt (not yet removed by the pass) the fresh episode publishes q:render itself — the duplicate is bounded; without SPA — the pass will remove it by D4 | record.go recordTx |
 	//
-	// ## Особые состояния
+	// ## Special states
 	//
-	//	черновой флаг   бит стоит, рендерных задач у домена нет (Д4):
-	//	                страница перестала быть SPA, записи отмаркированы
-	//	                либо контент не сохранён (T-056). Снимается
-	//	                проходом без публикации — не ошибка.
-	//	keep            контент части записей нечитаем (Д5): бит —
-	//	                держатель задачи, снятие теряло бы её до
-	//	                перепроверки T-030 (месяцы); закрывается чтением
-	//	                (Д3/Д4) либо удалением (Д6).
-	//	биты-сироты     счётчик видит долг, выборка — нет: остаток эпохи
-	//	                до T-186 (удалённые с флагом — выборка честно
-	//	                исключает deleted по §13.1) либо ручной SQL
-	//	                (runbooks §6). Штатный путь закрыт (Д6 атомарен);
-	//	                проход платит холостой seq scan за тик и Warn —
-	//	                оператор обязан это видеть. Парность при этом у
-	//	                сирот-deleted уже верна (И2 считает без фильтра
-	//	                статуса — реконсиляция её только подтверждает и
-	//	                фантомный долг не снимает): хвост чистится РАЗОВО
-	//	                парой «бит + счётчик» по status = deleted (runbooks
-	//	                §6); рассинхрон ручного SQL выравнивает
-	//	                реконсиляция monitor.
+	//	draft flag      the bit is set, the domain has no render tasks (D4):
+	//	                the page stopped being SPA, the records are marked
+	//	                or the content is not stored (T-056). Removed
+	//	                by the pass without a publication — not an error.
+	//	keep            the content part of the records is unreadable (D5): the bit —
+	//	                the task's holder, the removal would lose it before
+	//	                the T-030 recheck (months); closed by a read
+	//	                (D3/D4) or a deletion (D6).
+	//	orphan bits     the counter sees the debt, the selection — not: a remnant of the era
+	//	                before T-186 (the deleted with the flag — the selection honestly
+	//	                excludes deleted by §13.1) or a manual SQL
+	//	                (runbooks §6). The graceful path is closed (D6 is atomic);
+	//	                the pass pays an idle seq scan per tick and a Warn —
+	//	                the operator must see this. At that the pairing at
+	//	                the deleted-orphans is already correct (I2 counts without a status
+	//	                filter — the reconciliation only confirms it and
+	//	                does not remove the phantom debt): the tail is cleaned ONCE
+	//	                by the "bit + counter" pair over status = deleted (runbooks
+	//	                §6); a manual SQL desync is leveled by the
+	//	                monitor reconciliation.
 	//
-	// ## Инварианты
+	// ## The invariants
 	//
-	//	И1  Пара «бит × счётчик» меняется только одной транзакцией (±1
-	//	    вместе; откат откатывает обоих). RowsAffected 0 — перехода
-	//	    не было, счётчик не трогается: повторная постановка (Д2) и
-	//	    повторное снятие (Д7) идемпотентны парностью.
-	//	И2  Счётчик = число строк с битом, БЕЗ фильтра статуса — тот же
-	//	    предикат у бэкфилла миграции 000015 и реконсиляции monitor
-	//	    (VerifyCounters — авторитет парности; guard прохода T-181
-	//	    верит счётчику, долг обязан быть честным). Рассинхрон возможен
-	//	    только ручным SQL (runbooks §6) и окном «агрегат → перезапись»
-	//	    прохода реконсиляции при конкурирующих переходах между её
-	//	    операторами (устаревший АБСОЛЮТ, не дельта: каждая перезапись
-	//	    строки двигает updated_at — «немого» второго −n реконсиляция
-	//	    оставить не может, инцидент 08.11.2026 опроверг обратное;
-	//	    самолечится следующим проходом, ≤ zone_stats_interval). Окно
-	//	    снимка apply_delete (декремент по had_render до T-269) закрыто:
-	//	    дельта — по факту перехода, охрана текущей версии строки.
-	//	И3  Порядок «публикация q:render → снятие бита» (at-least-once,
-	//	    в духе T-039): обратный терял бы задачи навсегда — снятый
-	//	    флаг вернуть некому; дубли ограничены окном прохода и гасятся
-	//	    идемпотентностью потребителя по ключу (ТЗ 3.4).
-	//	И4  Строка счётчика обязательна (создаёт и бэкфиллит миграция
-	//	    000015): отсутствие — ошибка перехода/guard'а, а не молчаливый
-	//	    ноль (renderBumpDebtCounter/renderDebtCount): молчаливый
-	//	    рассинхрон сделал бы gauge долга ложью.
+	//	I1  The "bit × counter" pair changes only by one transaction (±1
+	//	    together; a rollback rolls back both). RowsAffected 0 — there
+	//	    was no transition, the counter is not touched: a repeated setting (D2) and
+	//	    a repeated clear (D7) are idempotent by pairing.
+	//	I2  The counter = the number of rows with the bit, WITHOUT a status filter — the same
+	//	    predicate at the migration 000015 backfill and the monitor reconciliation
+	//	    (VerifyCounters — the pairing authority; the pass guard T-181
+	//	    believes the counter, the debt must be honest). A desync is possible
+	//	    only by a manual SQL (runbooks §6) and by the "aggregate → rewrite"
+	//	    window of the reconciliation pass at competing transitions between its
+	//	    operators (a stale ABSOLUTE, not a delta: every row rewrite
+	//	    moves updated_at — a "slightly stale" second −n cannot be left
+	//	    by the reconciliation, the 08.11.2026 incident disproved the converse;
+	//	    it self-heals by the next pass, ≤ zone_stats_interval). The
+	//	    apply_delete snapshot window (the decrement by had_render before T-269) is closed:
+	//	    the delta — by the fact of the transition, the guard of the row's current version.
+	//	I3  The "q:render publication → the bit clear" order (at-least-once,
+	//	    in the spirit of T-039): the reverse would lose the tasks forever — nobody
+	//	    would return the removed flag; the duplicates are bounded by the pass window and extinguished
+	//	    by the consumer's key idempotency (spec 3.4).
+	//	I4  The counter's row is mandatory (created and backfilled by migration
+	//	    000015): an absence — a transition/guard error, not a silent
+	//	    zero (renderBumpDebtCounter/renderDebtCount): a silent
+	//	    desync would make the debt gauge a lie.
 	renderSetPendingSQL = "UPDATE domains AS t " +
 		"SET flags = (t.flags | " + fmt.Sprintf("%d", int16(model.FlagRenderPending)) + ")::int2 " +
 		"WHERE t.zone_id = $1::int2 AND t.id = $2::int8 " +
 		"AND (t.flags & " + fmt.Sprintf("%d", int16(model.FlagRenderPending)) + ") = 0"
 
-	// renderPendingDomainsSQL — пачка доменов, ждущих доработки рендера:
-	// бит render_pending выставлен, домен не удалён (§13.1 — вне цикла
-	// проверок). Имя — label || '.' || зона (стиль T-027) для Result.Name
-	// и логов; LIMIT — пачка. ORDER BY по PK отсутствует сознательно
-	// (T-181, решение оператора 24.10 — порядок доменов не важен): сортировка
-	// держала index scan по PK, который при живом долге вытаптывает
-	// дренированный «пустой» префикс PK-порядка (запрос №2 журнала
-	// медленных 24.10: 14,1 млн Rows Removed, ≈4,5 ГБ буферов за вызов,
-	// медиана 44 с); недетерминированные пачки корректны — снятие флага
-	// после публикации исключает повторы. Форма плана (seq scan с ранним
-	// остановом LIMIT) закреплена SET LOCAL в транзакции выборки —
-	// renderPlanNoIndexScanSQL/renderPlanNoBitmapScanSQL ниже. Это ступень
-	// без фильтра зон (пустой render.requeue_deprioritized_zones — T-184);
-	// приоритет зон строит renderPendingDomainsBaseSQL +
+	// renderPendingDomainsSQL — the chunk of domains waiting for the render rework:
+	// the render_pending bit is set, the domain is not deleted (§13.1 — outside the
+	// check cycle). The name — label || '.' || zone (the T-027 style) for Result.Name
+	// and the logs; LIMIT — the chunk. The ORDER BY over the PK is absent deliberately
+	// (T-181, the operator's Oct 24 decision — the domains' order does not matter): sorting
+	// kept a PK index scan which, with a live debt, tramples
+	// the drained "empty" prefix of the PK order (query #2 of the Oct 24
+	// slow-query log: 14.1M Rows Removed, ≈4.5 GB of buffers per call,
+	// a 44 s median); the non-deterministic chunks are correct — the flag clear
+	// after the publication excludes repeats. The plan shape (a seq scan with an early
+	// LIMIT stop) is pinned by SET LOCAL in the selection transaction —
+	// renderPlanNoIndexScanSQL/renderPlanNoBitmapScanSQL below. This is the stage
+	// without a zone filter (an empty render.requeue_deprioritized_zones — T-184);
+	// the zones' priority is built by renderPendingDomainsBaseSQL +
 	// renderPendingDomainsNotInSQL/…InSQL.
 	renderPendingDomainsSQL = renderPendingDomainsBaseSQL + "LIMIT $1"
 
-	// renderPendingDomainsBaseSQL — общая часть ступеней выборки (T-184):
-	// WHERE/JOIN как у прежнего renderPendingDomainsSQL (T-181), ступени
-	// дополняют фильтром зоны и LIMIT.
+	// renderPendingDomainsBaseSQL — the stages' common part (T-184):
+	// the WHERE/JOIN as at the former renderPendingDomainsSQL (T-181), the stages
+	// add the zone filter and the LIMIT.
 	renderPendingDomainsBaseSQL = "SELECT d.zone_id, d.id, d.label || '.' || z.name " +
 		"FROM domains AS d JOIN zones AS z ON z.id = d.zone_id " +
 		"WHERE (d.flags & " + fmt.Sprintf("%d", int16(model.FlagRenderPending)) + ") <> 0 " +
 		"AND d.status <> " + fmt.Sprintf("%d", int16(model.StatusDeleted)) + " "
 
-	// renderPendingDomainsNotInSQL / renderPendingDomainsInSQL — ступени
-	// приоритизации рендер-долга по зонам (T-184, решение (а) T-176):
-	// непустой render.requeue_deprioritized_zones делит выборку пачки на
-	// две ступени БЕЗ сортировки — первая берёт домены зон НЕ из списка
-	// (приоритет: зоны с высоким DOM-вкладом), вторая — домены зон списка
-	// (парковочные классы, по остаточному принципу). Фильтр по имени зоны
-	// в JOIN (справочник zones — мал, hash join; сопоставление живое:
-	// зоны создаёт ingest первым файлом, отдельного разрешения на старте
-	// нет), обе ступени идут в тех же транзакциях закрепления плана
-	// (T-181): seq scan по domains с ранним остановом LIMIT сохраняется —
-	// сортировка ступеней не вводится сознательно, она вернула бы
-	// вытаптывание префикса/полный проход сортировки. Очередь долга не
-	// теряет записей: исчерпание первой ступени (пачка неполная — LIMIT
-	// не сработал, скан дошёл до конца таблицы) добирается второй.
+	// renderPendingDomainsNotInSQL / renderPendingDomainsInSQL — the
+	// render debt's prioritization stages by zones (T-184, the decision (a) of T-176):
+	// a non-empty render.requeue_deprioritized_zones divides the chunk selection into
+	// two stages WITHOUT sorting — the first takes the domains of the zones NOT
+	// from the list (the priority: the zones with a high DOM contribution), the second — the list's zones'
+	// domains (parking classes — the leftovers). The zone name filter
+	// in the JOIN (the zones reference table — small, a hash join; the matching is live:
+	// the zones are created by ingest with the first file, there is no separate resolution at the start
+	//), both stages run in the same plan pinning
+	// transactions (T-181): the seq scan over domains with the early LIMIT stop is preserved —
+	// the stages' sorting is not introduced deliberately, it would return
+	// the prefix trampling/a full sorting pass. The debt queue does not
+	// lose records: the first stage's exhaustion (an incomplete chunk — the LIMIT
+	// did not fire, the scan reached the end of the table) is topped up by the second.
 	renderPendingDomainsNotInSQL = renderPendingDomainsBaseSQL +
 		"AND z.name <> ALL($2::text[]) LIMIT $1"
 	renderPendingDomainsInSQL = renderPendingDomainsBaseSQL +
 		"AND z.name = ANY($2::text[]) LIMIT $1"
 
 	// renderPlanNoIndexScanSQL/renderPlanNoBitmapScanSQL/renderPlanNoIOSQL —
-	// закрепление формы плана выборки пачки (T-181): SET LOCAL в транзакции
-	// renderSelectPending отключает index scan, bitmap scan и index-only
-	// scan до оператора выборки. Статистики выражения (flags & 2) <> 0 у
-	// планировщика нет (индекс по flags невозможен — HOT-инвариант, T-175),
-	// фильтр оценивается почти неселективным (41,6 из 41,6 млн строк), и без
-	// закрепления планировщик берёт index scan по PK даже без ORDER BY —
-	// то же вытаптывание префикса; закреплённый seq scan находит первую
-	// пачку флаговых строк ранним остановом LIMIT (флаговый долг .рф
-	// физически в начале кучи: ingest ru/rf/su шёл первым, HOT держит
-	// версии на родных страницах) — 43 мс против 30 с на замере 24.10
-	// (700×). Действие SET LOCAL — только эта транзакция, остальные
-	// запросы пула не затронуты; bitmap- и index-only-скан отключаются
-	// вслед за index-сканом — все индексные формы доступа к domains
-	// закрыты (index-only по PK повторил бы патологию, хоть ТЗ §4.2 и
-	// проверяло диагностикой только пару index/bitmap), по flags индексов
-	// не будет.
+	// pinning the plan shape of the batch selection (T-181): SET LOCAL in the
+	// renderSelectPending transaction disables the index scan, the bitmap scan and the index-only
+	// scan until the selection operator. The planner has no statistics for the
+	// (flags & 2) <> 0 expression (an index over flags is impossible — the HOT invariant, T-175),
+	// the filter is estimated almost non-selective (41.6M of 41.6M rows), and without
+	// the pinning the planner takes a PK index scan even without the ORDER BY —
+	// the same prefix trampling; the pinned seq scan finds the first
+	// chunk of flag rows by the early LIMIT stop (the .rf flag debt
+	// is physically at the heap's start: the ingest ru/rf/su went first, HOT keeps
+	// the versions on the native pages) — 43 ms against 30 s at the Oct 24 measurement
+	// (700×). The SET LOCAL action — only this transaction, the pool's other
+	// queries are unaffected; the bitmap and index-only scans are disabled
+	// following the index scan — all the index access forms to domains
+	// are closed (a PK index-only would repeat the pathology, though spec §4.2
+	// checked only the index/bitmap pair by diagnostics), there will be
+	// no indexes over flags.
 	renderPlanNoIndexScanSQL  = "SET LOCAL enable_indexscan = off"
 	renderPlanNoBitmapScanSQL = "SET LOCAL enable_bitmapscan = off"
 	renderPlanNoIOSQL         = "SET LOCAL enable_indexonlyscan = off"
 
-	// renderDebtCounterSQL — guard прохода точечным чтением счётчика
-	// рендер-долга (T-181; счётчик — T-175): value = 0 — тяжёлая выборка
-	// пачки не выполняется вовсе (стационар без долга стоит одно чтение
-	// строки за тик вместо seq scan по 41,8 млн строк); отсутствие строки —
-	// ошибка прохода (строку гарантирует миграция 000015; молчаливый
-	// рассинхрон сделал бы guard ложью — философия renderBumpDebtCounter,
+	// renderDebtCounterSQL — the pass guard by a point read of the
+	// render debt counter (T-181; the counter — T-175): value = 0 — the heavy
+	// batch selection does not run at all (the debt-free steady state pays one
+	// row read per tick instead of a seq scan over 41.8M rows); an absent row —
+	// a pass error (the row is guaranteed by migration 000015; a silent
+	// desync would make the guard a lie — the renderBumpDebtCounter philosophy,
 	// runbooks §6).
 	renderDebtCounterSQL = "SELECT value FROM crawler_counters WHERE name = 'render_pending'"
 
-	// renderPendingRowsSQL — записи домена для повторного SPA-вердикта:
-	// ещё не отрендеренные (rendered = false ставит запись результата
-	// T-058, true — рендер T-067) и с итоговым URL (цель рендера).
-	// render_failed_at IS NULL — маркер «рендер невозможен» (T-210):
-	// финализированные-без-рендера записи (тарпит T-148 / cert T-159 /
-	// DNS T-211 / класс задачи T-172 — cert-класс, DNS-класс и класс
-	// задачи постоянные, у тарпита бюджет попыток исчерпан; замеры
+	// renderPendingRowsSQL — the domain's records for the repeated SPA verdict:
+	// not yet rendered (rendered = false is set by the result record
+	// T-058, true — the render T-067) and with a final URL (the render's target).
+	// render_failed_at IS NULL — the "render impossible" marker (T-210):
+	// the finalized-without-render records (the tarpit T-148 / cert T-159 /
+	// DNS T-211 / the task class T-172 — the cert class, the DNS class and the task
+	// class are permanent, at the tarpit the attempts budget is exhausted; the
 	// T-172/T-207)
-	// не переиздаются — повторные издания (повторный проход по домену,
-	// чей флаг пережил публикацию: частичный сбой публикации, выход Full
-	// после публикации соседей пачки, keep нечитаемого контента, рестарт
-	// между публикацией и снятием) жгут доставки и слот-время рендера;
-	// маркер сбрасывается сменой контента (перезапись эпизода T-058 —
-	// первая попытка свежего эпизода легитимна), починившийся хост
-	// вернётся в выборку следующим эпизодом. Все записи домена
-	// отмаркированы — флаг снимается без публикации («черновой флаг»,
-	// как у страницы, переставшей быть SPA).
-	// content_hash — тело для DetectSPA (T-057/T-056), alias_subdomain_id
-	// — наследование вердикта оригинала (T-055). ORDER BY —
-	// детерминированный порядок публикации.
+	// are not re-published — the repeated editions (a repeated pass over a domain,
+	// whose flag survived the publication: a partial publication failure, a Full
+	// exit after the publication of the chunk's neighbors, keeping unreadable content, a restart
+	// between the publication and the removal) burn the deliveries and the render's slot time;
+	// the marker is reset by a content change (the episode's rewrite T-058 —
+	// the fresh episode's first attempt is legitimate), a host that fixed itself
+	// will return into the selection the next episode. All the domain's records
+	// marked — the flag is removed without a publication (a "draft flag",
+	// like at a page that stopped being SPA).
+	// content_hash — the body for DetectSPA (T-057/T-056), alias_subdomain_id
+	// — the original verdict's inheritance (T-055). The ORDER BY —
+	// a deterministic publication order.
 	renderPendingRowsSQL = "SELECT subdomain_id, variant, content_hash, alias_subdomain_id " +
 		"FROM subdomain_results " +
 		"WHERE zone_id = $1::int2 AND domain_id = $2::int8 " +
 		"AND rendered = false AND final_url IS NOT NULL AND render_failed_at IS NULL " +
 		"ORDER BY subdomain_id, variant"
 
-	// renderClearPendingSQL — снятие флага после публикации. Охрана бита:
-	// конкурентное снятие (второй экземпляр прохода, соседний инстанс
-	// сервиса) даёт RowsAffected = 0 без ошибки — дубликаты публикации
-	// ограничены одним окном прохода. Маска — знаковое ~бита (−3): биты
-	// smallint повышаются до int4 со знаковым расширением, беззнаковая
-	// маска 65533 не влезает в smallint по значению (проверено на живом
-	// PostgreSQL 16), знаковая очищает ровно бит render_pending и
-	// сохраняет остальные, включая старший.
+	// renderClearPendingSQL — the flag clear after the publication. The bit guard:
+	// a concurrent clear (a second pass instance, a neighboring service
+	// instance) gives RowsAffected = 0 without an error — the publication duplicates
+	// are bounded by one pass window. The mask — a signed ~of the bit (−3): the
+	// smallint bits are promoted to int4 with a sign extension, an unsigned
+	// mask 65533 does not fit into a smallint by value (checked on a live
+	// PostgreSQL 16), the signed one clears exactly the render_pending bit and
+	// preserves the others, including the senior one.
 	renderClearPendingSQL = "UPDATE domains AS t " +
 		"SET flags = (t.flags & " + fmt.Sprintf("%d", int16(^int16(model.FlagRenderPending))) + ")::int2 " +
 		"WHERE t.zone_id = $1::int2 AND t.id = $2::int8 " +
 		"AND (t.flags & " + fmt.Sprintf("%d", int16(model.FlagRenderPending)) + ") <> 0"
 
-	// renderCounterDeltaSQL — сдвиг счётчика рендер-долга (T-175):
-	// crawler_counters['render_pending'] ±1 В ТОЙ ЖЕ ТРАНЗАКЦИИ, что и
-	// переход бита (§3.4: бит и счётчик не расходятся — откат откатывает
-	// оба). Дельта — параметр (int8: +1 постановка флага в записи
-	// результата, −1 снятие проходом доработки), имя строки — литерал
-	// (стиль T-039). RowsAffected 0 — строки нет (возможна только ручная
-	// правка таблицы, runbooks §6): ошибка вызывающего откатывает
-	// транзакцию целиком — молчаливый рассинхрон счётчика недопустим,
-	// долг обязан быть виден честно (постановка T-175).
+	// renderCounterDeltaSQL — the render debt counter's shift (T-175):
+	// crawler_counters['render_pending'] ±1 IN THE SAME TRANSACTION as
+	// the bit transition (§3.4: the bit and the counter do not diverge — a rollback rolls back
+	// both). The delta — a parameter (int8: +1 the flag setting in the result
+	// write, −1 the removal by the rework pass), the row's name — a literal
+	// (the T-039 style). RowsAffected 0 — the row is absent (possible only by a manual
+	// edit of the table, runbooks §6): the caller's error rolls back
+	// the whole transaction — a silent counter desync is unacceptable,
+	// the debt must be visible honestly (the T-175 setting).
 	renderCounterDeltaSQL = "UPDATE crawler_counters AS c " +
 		"SET value = c.value + $1::int8 " +
 		"WHERE c.name = 'render_pending'"
 )
 
-// RenderLen — источник глубины стрима: удовлетворяется
-// *queue.BackpressureGate (T-026). Узкий интерфейс — httpworker не
-// зависит от Redis-специфики гейта, юнит-тесты подменяют фейком.
+// RenderLen — the stream depth's source: satisfied by
+// *queue.BackpressureGate (T-026). A narrow interface — httpworker does not
+// depend on the gate's Redis specifics, the unit tests substitute a fake.
 type RenderLen interface {
 	Len(ctx context.Context, stream string) (int64, error)
 }
 
-// RenderContent — чтение сохранённого контента для повторного
-// SPA-вердикта в проходе доработки; удовлетворяется *content.PackStore
+// RenderContent — reading the stored content for the repeated
+// SPA verdict in the rework pass; satisfied by *content.PackStore
 // (T-042).
 type RenderContent interface {
 	Get(ctx context.Context, hash content.Hash) ([]byte, error)
 }
 
-// RenderQueue — публикация q:render без ожидания ёмкости (§5.6: рендер
-// не задерживает остальные этапы). Очередь q — публикация мимо
-// WatermarkPublisher (T-026): его Publish ждал бы ёмкости и задержал XACK
-// задачи q:http; ёмкость проверяется отдельно (HasCapacity) — решением
-// «публиковать или флажить» распоряжается вызывающий. Потокобезопасен:
-// состояние неизменно после New.
+// RenderQueue — the q:render publication without waiting for the capacity (§5.6: the render
+// does not delay the other stages). The q queue — the publication bypassing
+// WatermarkPublisher (T-026): its Publish would wait for the capacity and delay the XACK
+// of the q:http task; the capacity is checked separately (HasCapacity) — the
+// "publish or flag" decision belongs to the caller. Concurrency-safe:
+// the state is immutable after New.
 type RenderQueue struct {
 	q         queue.Queue
 	lenner    RenderLen
@@ -420,13 +420,13 @@ type RenderQueue struct {
 	log       *slog.Logger
 }
 
-// NewRenderQueue строит очередь рендера поверх «сырой» очереди (без
-// гейта backpressure) и источника глубины стримов; watermark — порог
-// ёмкости q:render render.queue_high_watermark (T-174; 0 — общий
-// scheduler.queue_high_watermark; эффективное значение с клампом
-// MAXLEN/2 считает проводка cmd/http-worker — сюда приходит готовое
-// к сравнению число). nil-зависимости — ошибка: тихая потеря
-// публикаций незаметна для оператора.
+// NewRenderQueue builds the render queue over a "raw" queue (without
+// the backpressure gate) and the streams' depth source; watermark — the
+// q:render capacity threshold render.queue_high_watermark (T-174; 0 — the common
+// scheduler.queue_high_watermark; the effective value with the
+// MAXLEN/2 clamp is computed by the cmd/http-worker wiring — a ready-to-compare
+// number arrives here). nil dependencies — an error: a silent loss
+// of publications is invisible to the operator.
 func NewRenderQueue(q queue.Queue, lenner RenderLen, watermark int64, log *slog.Logger) (*RenderQueue, error) {
 	if q == nil {
 		return nil, errors.New("httpworker: очередь рендера: очередь не задана")
@@ -440,11 +440,11 @@ func NewRenderQueue(q queue.Queue, lenner RenderLen, watermark int64, log *slog.
 	return &RenderQueue{q: q, lenner: lenner, watermark: watermark, log: log}, nil
 }
 
-// HasCapacity — неблокирующая проверка ёмкости q:render: true, когда
-// глубина стрима строго ниже порога render.queue_high_watermark
-// (T-174; depth == watermark — уже переполнение, ТЗ 4.2). Watermark ≤ 0
-// отключает проверку (семантика T-026) — ёмкость есть всегда, без
-// обращения к Redis.
+// HasCapacity — a non-blocking q:render capacity check: true when
+// the stream's depth is strictly below the render.queue_high_watermark threshold
+// (T-174; depth == watermark — already an overflow, spec 4.2). A Watermark ≤ 0
+// disables the check (the T-026 semantics) — the capacity is always there, without
+// a Redis call.
 func (rq *RenderQueue) HasCapacity(ctx context.Context) (bool, error) {
 	if rq.watermark <= 0 {
 		return true, nil
@@ -456,9 +456,9 @@ func (rq *RenderQueue) HasCapacity(ctx context.Context) (bool, error) {
 	return n < rq.watermark, nil
 }
 
-// Publish публикует Result-сообщения в q:render без проверки ёмкости:
-// проверка всегда отдельным шагом (HasCapacity) — воркер записи решает
-// «публиковать или флажить» до транзакции, проход — «пора ли домен».
+// Publish publishes the Result messages into q:render without a capacity check:
+// the check is always a separate step (HasCapacity) — the write worker decides
+// "publish or flag" before the transaction, the pass — "is it the domain's turn".
 func (rq *RenderQueue) Publish(ctx context.Context, msgs []queue.Result) error {
 	for i := range msgs {
 		if _, err := rq.q.Publish(ctx, queue.StreamRender, msgs[i]); err != nil {
@@ -468,12 +468,12 @@ func (rq *RenderQueue) Publish(ctx context.Context, msgs []queue.Result) error {
 	return nil
 }
 
-// renderSPAResults — Result-сообщения q:render по SPA-записям результата
-// (§5.5 п. 8): по одному ключу субдомен×вариант на запись с вердиктом
-// SPA=true (T-057). Алиасные записи несут вердикт своей проверки-
-// источника — класс эквивалентности T-055 един, вердикты внутри класса
-// совпадают; потребитель T-067 видит alias_kind строки и сам решает,
-// что делать с алиасом. nil-вердикт (страницы нет) рендера не требует.
+// renderSPAResults — the q:render Result messages over the result's SPA records
+// (§5.5 item 8): one subdomain×variant key per record with the
+// SPA=true verdict (T-057). The alias records carry their source
+// check's verdict — the T-055 equivalence class is one, the verdicts inside the class
+// match; the T-067 consumer sees the row's alias_kind and decides itself,
+// what to do with the alias. A nil verdict (no page) requires no render.
 func renderSPAResults(res *DomainResult) []queue.Result {
 	var out []queue.Result
 	for i := range res.Subdomains {
@@ -495,12 +495,12 @@ func renderSPAResults(res *DomainResult) []queue.Result {
 	return out
 }
 
-// NewRenderRecorder — записатель результата с рендер-конвейером (T-066):
-// NewRecorder (T-058) + очередь рендера. Отдельный конструктор, а не
-// новый параметр NewRecorder: сигнатура T-058 была закреплена его
-// тестами, расширение (метрики этапа, T-268) прошло вместе с ними —
-// render = nil у NewRecorder сохраняет прежнее поведение (без q:render и
-// флага) для изолированных сборок.
+// NewRenderRecorder — the result writer with a render pipeline (T-066):
+// NewRecorder (T-058) + the render queue. A separate constructor, not
+// a new NewRecorder parameter: the T-058 signature was pinned by its
+// tests, the extension (the stage metrics, T-268) went together with them —
+// render = nil at NewRecorder preserves the former behavior (no q:render and
+// no flag) for the isolated builds.
 func NewRenderRecorder(pool RecordDB, q queue.Queue, render *RenderQueue, met *Metrics, log *slog.Logger) (*Recorder, error) {
 	r, err := NewRecorder(pool, q, met, log)
 	if err != nil {
@@ -510,27 +510,27 @@ func NewRenderRecorder(pool RecordDB, q queue.Queue, render *RenderQueue, met *M
 	return r, nil
 }
 
-// --- проход доработки ---------------------------------------------------------
+// --- the rework pass ---------------------------------------------------------
 
-// RequeueOptions — параметры прохода доработки рендера; нулевые значения
-// заменяются дефолтами (withDefaults, стиль RecheckOptions T-030).
+// RequeueOptions — the render rework pass's parameters; the zero values
+// are replaced by the defaults (withDefaults, the RecheckOptions T-030 style).
 type RequeueOptions struct {
-	// Interval — период цикла RequeueRenderPending
-	// (DefaultRenderRequeueInterval); на разовый RequeueOnce не влияет.
+	// Interval — the RequeueRenderPending loop's period
+	// (DefaultRenderRequeueInterval); does not affect a one-shot RequeueOnce.
 	Interval time.Duration
-	// BatchSize — максимум доменов в одной пачке
+	// BatchSize — the maximum of domains in one chunk
 	// (DefaultRenderRequeueBatch).
 	BatchSize int
-	// DeprioritizedZones — имена зон (punycode, как в справочнике zones),
-	// чей долг проход обслуживает по остаточному принципу (T-184, решение
-	// (а) T-176): пачка собирается двухступенчато — сначала домены зон
-	// НЕ из списка, при неполной пачке остаток добирается зонами списка.
-	// nil/пустой список — прежний порядок (одна ступень без фильтра,
-	// T-181). Источник — render.requeue_deprioritized_zones; память
-	// исчерпания первой ступени ведёт цикл RequeueRenderPending (разовый
-	// RequeueOnce исполняет обе ступени честно, без памяти между вызовами).
+	// DeprioritizedZones — the zones' names (punycode, as in the zones reference table),
+	// whose debt the pass serves by the leftovers (T-184, the
+	// decision (a) of T-176): the chunk is assembled two-stage — first the domains of the
+	// zones NOT from the list, at an incomplete chunk the remainder is topped up by the list's zones.
+	// A nil/empty list — the former order (one stage without a filter,
+	// T-181). The source — render.requeue_deprioritized_zones; the
+	// first stage's exhaustion memory is kept by the RequeueRenderPending loop (a one-shot
+	// RequeueOnce executes both stages honestly, without memory between the calls).
 	DeprioritizedZones []string
-	// Log — логгер цикла и Warn-и прохода; nil — записи подавлены
+	// Log — the loop's logger and the pass's Warns; nil — the records are suppressed
 	// (slog.DiscardHandler).
 	Log *slog.Logger
 }
@@ -545,58 +545,58 @@ func (o RequeueOptions) withDefaults() RequeueOptions {
 	return o
 }
 
-// RequeueResult — итог одного прохода RequeueOnce.
+// RequeueResult — the outcome of one RequeueOnce pass.
 type RequeueResult struct {
-	// Selected — доменов выбрано с флагом (размер пачки выбора).
+	// Selected — the domains selected with the flag (the selection chunk's size).
 	Selected int
-	// Cleared — доменов снят флаг (после публикации или за ненадобностью
-	// — SPA-записей не нашлось).
+	// Cleared — the domains whose flag was cleared (after the publication or for the lack of need
+	// — no SPA records were found).
 	Cleared int
-	// Published — опубликовано сообщений q:render.
+	// Published — the q:render messages published.
 	Published int
-	// Deprioritized — доменов пачки из зон render.requeue_deprioritized_zones
-	// (вторая ступень выборки, T-184): 0 — пачка целиком из приоритетных
-	// зон; рост поля в журнале прохода — первая ступень исчерпана, дренаж
-	// дошёл до отложенных зон (контроль порядка без ручного SQL).
+	// Deprioritized — the chunk's domains from the render.requeue_deprioritized_zones zones
+	// (the second selection stage, T-184): 0 — the chunk is entirely from the priority
+	// zones; the field's growth in the pass journal — the first stage is exhausted, the
+	// drainage reached the postponed zones (an order control without a manual SQL).
 	Deprioritized int
-	// Full — проход остановлен: q:render у порога; необработанные домены
-	// сохранили флаг, доработка продолжится следующим проходом.
+	// Full — the pass stopped: q:render is at the threshold; the unprocessed domains
+	// kept the flag, the rework will continue with the next pass.
 	Full bool
 }
 
-// renderPendingDomain — домен пачки прохода.
+// renderPendingDomain — a domain of the pass's chunk.
 type renderPendingDomain struct {
 	zone int16
 	id   int64
 	name string
 }
 
-// renderPendingRow — запись субдомен×вариант домена прохода.
+// renderPendingRow — a subdomain×variant record of the pass's domain.
 type renderPendingRow struct {
 	subdomain int16
 	variant   model.Variant
-	hash      []byte // nil — собственного контента нет (алиас либо не сохранён, T-056)
-	aliasSub  *int16 // не nil — алиас: вердикт наследуется от оригинала (T-055)
+	hash      []byte // nil — there is no own content (an alias or not stored, T-056)
+	aliasSub  *int16 // not nil — an alias: the verdict is inherited from the original (T-055)
 }
 
-// RequeueOnce — один проход доработки рендера (§5.6 «дорабатываются
-// позже»): до opts.BatchSize доменов с флагом render_pending. Ёмкость
-// q:render проверяется до выборки и перед публикацией каждого домена —
-// при переполнении проход останавливается (Full), флаги сохранены; при
-// нулевом счётчике долга (guard T-181) тяжёлая выборка не выполняется.
-// Для домена — ключи SPA-записей (повторный вердикт по сохранённому
-// контенту) → публикация q:render → снятие флага со счётчиком долга
-// одной транзакцией (T-175). Пустой набор ключей — флаг снимается без
-// публикации (черновой флаг: страница перестала быть SPA); нечитаемый
-// контент флаг сохраняет до следующего прохода (renderDomainKeys).
-// Пул с транзакциями (RecordDB): снятие бита и декремент счётчика
-// рендер-долга обязаны фиксироваться вместе (§3.4, T-175).
+// RequeueOnce — one render rework pass (§5.6 "are reworked
+// later"): up to opts.BatchSize domains with the render_pending flag. The
+// q:render capacity is checked before the selection and before each domain's publication —
+// on an overflow the pass stops (Full), the flags are preserved; at
+// a zero debt counter (the T-181 guard) the heavy selection does not run.
+// For a domain — the SPA records' keys (a repeated verdict over the stored
+// content) → the q:render publication → the flag clear with the debt
+// counter by one transaction (T-175). An empty key set — the flag is cleared without
+// a publication (a draft flag: the page stopped being SPA); unreadable
+// content keeps the flag until the next pass (renderDomainKeys).
+// A pool with transactions (RecordDB): the bit clear and the render debt
+// counter's decrement must commit together (§3.4, T-175).
 //
-// Приоритет зон (T-184): непустой opts.DeprioritizedZones делит выборку
-// на две ступени (зоны НЕ из списка, затем — при неполной пачке — зоны
-// списка); разовый вызов исполняет обе ступени без памяти между вызовами
-// — исчерпание первой ступени помнит только цикл RequeueRenderPending
-// (renderStage, экономия порожнего полного seq scan).
+// The zones' priority (T-184): a non-empty opts.DeprioritizedZones divides the selection
+// into two stages (the zones NOT from the list, then — at an incomplete chunk — the
+// list's zones); a one-shot call executes both stages without memory between the calls
+// — only the RequeueRenderPending loop remembers the first stage's exhaustion
+// (renderStage, saving an idle full seq scan).
 func RequeueOnce(ctx context.Context, pool RecordDB, contents RenderContent, render *RenderQueue, opts RequeueOptions) (RequeueResult, error) {
 	if pool == nil {
 		return RequeueResult{}, errors.New("httpworker: проход рендера: пул не задан")
@@ -614,47 +614,47 @@ func RequeueOnce(ctx context.Context, pool RecordDB, contents RenderContent, ren
 	return requeuePass(ctx, pool, contents, render, o, &renderStage{})
 }
 
-// renderStage — память переключения ступеней выборки долга (T-184).
-// Исчерпание первой ступени (зоны НЕ из списка) доказывается неполной
-// пачкой: LIMIT не сработал — seq scan дошёл до конца таблицы, значит
-// порожний проход первой ступени — ПОЛНЫЙ seq scan по domains (патология
-// запроса №2 журнала медленных 24.10, которую убрал T-181; хвост долга
-// зон списка тянулся бы часами, платя полный проход за каждый тик и
-// каждую итерацию стартового дренажа). Пока счётчик долга равен ожиданию
-// (значение на момент доказательства минус снятия флагов, выполненные
-// этим циклом после него), новых постановок бита не было (каждая — +1
-// счётчику, T-175) и чужих снятий тоже — первая ступень не выполняется
-// вовсе. Любое расхождение возобновляет её: рост счётчика — новой
-// постановке бита (любой зоны, в т.ч. зоны списка — отличить по одному
-// счётчику нельзя, перестраховка дешевле потерянной приоритетности),
-// убывание сверх своих снятий — второй экземпляр прохода либо ручной SQL
-// (runbooks §6). Доказательство снимается и без расхождения счётчика,
-// если хоть один домен первой ступени пачки остался с флагом (keep при
-// нечитаемом контенте, ранний выход Full/ошибка — requeuePass, firstLeft):
-// выборка видела эти строки, но проход их не доработал, а вторая ступень
-// (зоны списка) застрявший приоритетный долг не выберет никогда. Память
-// неточна только при точной компенсации «чужая постановка + чужое снятие»
-// между тиками — одиночный экземпляр цикла этого не порождает (T-181 §5.3).
+// renderStage — the debt selection stages' switching memory (T-184).
+// The first stage's (the zones NOT from the list) exhaustion is proven by an incomplete
+// chunk: the LIMIT did not fire — the seq scan reached the end of the table, so
+// an idle first-stage pass is a FULL seq scan over domains (the
+// pathology of query #2 of the Oct 24 slow-query log, removed by T-181; the debt tail
+// of the list's zones would drag for hours, paying a full pass per tick and
+// per iteration of the initial drainage). While the debt counter equals the
+// expectation (the value at the proof moment minus the flag withdrawals performed
+// by this loop after it), there were no new bit settings (each — +1
+// to the counter, T-175) and no foreign clears either — the first stage does not run
+// at all. Any divergence resumes it: a counter growth — a new
+// bit setting (any zone, including the list's — one counter cannot
+// distinguish them, the over-caution is cheaper than a lost priority),
+// a decrease beyond its own withdrawals — a second pass instance or a manual SQL
+// (runbooks §6). The proof is also removed without a counter divergence,
+// if at least one first-stage domain of the chunk stayed with the flag (a keep at
+// unreadable content, an early Full/error exit — requeuePass, firstLeft):
+// the selection saw these rows, but the pass did not rework them, and the second stage
+// (the list's zones) would never pick the stuck priority debt. The
+// memory is inexact only at an exact compensation "a foreign setting + a foreign clear"
+// between the ticks — a single loop instance does not produce this (T-181 §5.3).
 type renderStage struct {
-	known     bool  // первая ступень доказанно исчерпана
-	proofDebt int64 // счётчик рендер-долга в момент доказательства
-	ownClears int64 // снятия флагов этим циклом после доказательства
+	known     bool  // the first stage is provably exhausted
+	proofDebt int64 // the render debt counter at the proof moment
+	ownClears int64 // the flag withdrawals by this loop after the proof
 }
 
-// expectedDebt — ожидаемое циклом значение счётчика долга: совпадение с
-// прочитанным разрешает пропуск первой ступени.
+// expectedDebt — the loop's expected debt counter value: a match with the
+// read one allows skipping the first stage.
 func (s *renderStage) expectedDebt() int64 { return s.proofDebt - s.ownClears }
 
-// requeuePass — тело прохода доработки (RequeueOnce без валидаций);
-// stage — память ступеней цикла (T-184): known/proofDebt читаются и
-// пишутся только в двухступенчатом режиме, ownClears сдвигается и в
-// одноступенчатом (мёртвое состояние — память в нём не консультируется).
+// requeuePass — the rework pass's body (RequeueOnce without the validations);
+// stage — the loop stages' memory (T-184): known/proofDebt are read and
+// written only in the two-stage mode, ownClears is shifted in the
+// single-stage mode too (a dead state — the memory is not consulted in it).
 func requeuePass(ctx context.Context, pool RecordDB, contents RenderContent, render *RenderQueue, o RequeueOptions, stage *renderStage) (RequeueResult, error) {
 	out := RequeueResult{}
 
-	// Полная очередь — БД не читается (одно чтение глубины):
-	// переполнение и есть причина флагов; сигнал «стало свободно» —
-	// следующий тик цикла.
+	// A full queue — the DB is not read (one depth read):
+	// the overflow is the very reason of the flags; the "it freed up" signal —
+	// the loop's next tick.
 	free, err := render.HasCapacity(ctx)
 	if err != nil {
 		return out, fmt.Errorf("httpworker: проход рендера: ёмкость q:render: %w", err)
@@ -663,13 +663,13 @@ func requeuePass(ctx context.Context, pool RecordDB, contents RenderContent, ren
 		return RequeueResult{Full: true}, nil
 	}
 
-	// Guard счётчиком рендер-долга (T-181, счётчик — T-175): стационар без
-	// долга не платит за выборку пачки — точечное чтение строки счётчика
-	// вместо seq scan по всей domains раз в тик; 0 → пустая пачка (Selected
-	// = 0 — drain корректно останавливается). Отрицательное значение кодом
-	// не порождается (переходы бита ведут счётчик парой ±1, T-175) и
-	// трактуется так же — как «долга нет», но громко: тихий баг счётчика
-	// не должен прятаться за молчаливым простоем дренажа.
+	// A guard by the render debt counter (T-181, the counter — T-175): a debt-free
+	// steady state does not pay for the chunk selection — a point read of the counter's
+	// row instead of a seq scan over the whole domains once per tick; 0 → an empty chunk (Selected
+	// = 0 — the drain stops correctly). A negative value is not produced by the code (the bit
+	// transitions keep the counter by a ±1 pair, T-175) and
+	// is treated the same way — as "no debt", but loudly: a quiet counter bug
+	// must not hide behind a silent drainage idle.
 	debt, err := renderDebtCount(ctx, pool)
 	if err != nil {
 		return out, err
@@ -681,20 +681,20 @@ func requeuePass(ctx context.Context, pool RecordDB, contents RenderContent, ren
 		return out, nil
 	}
 
-	// Выборка пачки: одна ступень (T-181) либо приоритет зон (T-184).
+	// The chunk selection: one stage (T-181) or the zones' priority (T-184).
 	//
-	// firstLeft — домены ПЕРВОЙ ступени пачки, чей флаг ещё не снят
-	// (ревью T-184, P1): доказательство исчерпания переживает проход,
-	// только если к концу их ноль — keep (нечитаемый контент) или ранний
-	// выход (Full/ошибка/отмена, включая ошибку выборки второй ступени)
-	// оставляют флаг живым, а пропуск первой ступени зажал бы застрявший
-	// ПРИОРИТЕТНЫЙ долг навсегда: вторая ступень (зоны списка) его не
-	// видит, счётчик и ожидание не расходятся — Warn «биты-сироты» и
-	// полный seq scan каждый тик вместо доработки (контракт шапки:
-	// «проход повторит чтение на следующем тике»). Домены второй ступени
-	// не считаются: застрявшие в зонах списка подберёт сама вторая
-	// ступень следующего прохода — она выполняется при каждом пропуске
-	// первой. Снимается defer-ом на каждом выходе прохода.
+	// firstLeft — the FIRST stage's domains of the chunk whose flag is not yet cleared
+	// (the T-184 review, P1): the exhaustion proof survives the pass
+	// only if by the end there are zero of them — a keep (unreadable content) or an early
+	// exit (Full/error/cancellation, including the second stage's selection error)
+	// leaves the flag alive, and skipping the first stage would clamp the stuck
+	// PRIORITY debt forever: the second stage (the list's zones) does not
+	// see it, the counter and the expectation do not diverge — a Warn "orphan bits" and
+	// a full seq scan every tick instead of the rework (the header's contract:
+	// "the pass will repeat the read at the next tick"). The second stage's
+	// domains are not counted: the ones stuck in the list's zones will be picked by the second
+	// stage of the next pass itself — it runs at every first stage's
+	// skip. Removed by a defer at every pass exit.
 	var domains []renderPendingDomain
 	firstN, firstLeft := 0, 0
 	if len(o.DeprioritizedZones) == 0 {
@@ -704,42 +704,42 @@ func requeuePass(ctx context.Context, pool RecordDB, contents RenderContent, ren
 		}
 		out.Selected = len(domains)
 		if len(domains) == 0 {
-			// Счётчик видит долг, выборка — нет: рассинхрон ручного SQL
-			// (runbooks §6) либо биты-«сироты» — редкий остаток эпохи до
-			// T-186: удалённые с флагом домены (выборка честно исключает
-			// их по §13.1); штатный путь закрыт — применение delete снимает
-			// бит и декрементирует счётчик той же транзакцией (T-186),
-			// новые сироты не копятся, хвост до T-186 чистится разово
-			// (runbooks §6). Дренаж платит полный проход без раннего
-			// останова за каждый тик — оператор обязан это видеть.
+			// The counter sees the debt, the selection — not: a manual SQL
+			// desync (runbooks §6) or "orphan" bits — a rare remnant of the era before
+			// T-186: the domains deleted with the flag (the selection honestly excludes
+			// them by §13.1); the graceful path is closed — the delete application clears
+			// the bit and decrements the counter by the same transaction (T-186),
+			// new orphans do not accumulate, the tail before T-186 is cleaned once
+			// (runbooks §6). The drainage pays a full pass without an early
+			// stop per tick — the operator must see this.
 			o.Log.Warn("проход рендера: счётчик долга > 0, выборка пуста — биты-«сироты» либо рассинхрон счётчика (runbooks §6)",
 				"debt", debt)
 			return out, nil
 		}
 	} else {
-		// Первая ступень обязательна, пока память исчерпания нет или
-		// счётчик разошёлся с ожиданием (см. renderStage).
+		// The first stage is mandatory while there is no exhaustion memory
+		// or the counter diverged from the expectation (see renderStage).
 		if !stage.known || debt != stage.expectedDebt() {
 			first, err := renderSelectPending(ctx, pool, o.BatchSize, o.DeprioritizedZones, false)
 			if err != nil {
 				return out, err
 			}
 			if len(first) < o.BatchSize {
-				// Неполная пачка — ВЫБОРКА исчерпана (скан дошёл до конца);
-				// счётчик прочитан этим же проходом ДО выборки, своих
-				// снятий после чтения ещё не было. Доказательство переживёт
-				// проход, только если каждый домен первой ступени будет
-				// снят — счётчик firstLeft ниже.
+				// An incomplete chunk — the SELECTION is exhausted (the scan reached the end);
+				// the counter was read by this same pass BEFORE the selection, the own
+				// withdrawals after the read have not happened yet. The proof will survive
+				// the pass only if every first-stage domain will be
+				// cleared — the firstLeft counter below.
 				stage.known, stage.proofDebt, stage.ownClears = true, debt, 0
 			} else {
-				// Полная пачка — за LIMIT'ом могут оставаться домены:
-				// прежнее доказательство исчерпания недействительно.
+				// A full chunk — domains may remain beyond the LIMIT:
+				// the former exhaustion proof is invalid.
 				stage.known = false
 			}
 			domains = first
-			// Учёт неснятия — сразу за первой выборкой: ошибка второй
-			// ступени ниже тоже обязана снять доказательство (домены
-			// первой ступени остались с флагами).
+			// The non-clear accounting — right after the first selection: a second
+			// stage error below must also remove the proof (the
+			// first-stage domains stayed with the flags).
 			firstN, firstLeft = len(first), len(first)
 			if firstN > 0 {
 				defer func() {
@@ -750,8 +750,8 @@ func requeuePass(ctx context.Context, pool RecordDB, contents RenderContent, ren
 			}
 		}
 		if len(domains) < o.BatchSize {
-			// Исчерпание первой ступени (пустая пачка или добор остатка):
-			// вторая ступень — зоны списка, по остаточному принципу.
+			// The first stage's exhaustion (an empty chunk or a remainder top-up):
+			// the second stage — the list's zones, the leftovers.
 			second, err := renderSelectPending(ctx, pool, o.BatchSize-len(domains), o.DeprioritizedZones, true)
 			if err != nil {
 				return out, err
@@ -761,7 +761,7 @@ func requeuePass(ctx context.Context, pool RecordDB, contents RenderContent, ren
 		}
 		out.Selected = len(domains)
 		if len(domains) == 0 {
-			// Обе ступени пусты — та же диагностика, что и в одну ступень.
+			// Both stages are empty — the same diagnostics as in the one-stage mode.
 			o.Log.Warn("проход рендера: счётчик долга > 0, выборка пуста — биты-«сироты» либо рассинхрон счётчика (runbooks §6)",
 				"debt", debt)
 			return out, nil
@@ -792,49 +792,49 @@ func requeuePass(ctx context.Context, pool RecordDB, contents RenderContent, ren
 			out.Published += len(keys)
 		}
 		if keep {
-			// Контент части записей не прочитан (транзиентный сбой):
-			// флаг сохраняется — следующий проход повторит домен;
-			// снятие сняло бы SPA-задачу до перепроверки T-030.
-			// Домен первой ступени (i < firstN) при этом «застревает» —
-			// доказательство снимет defer.
+			// The content part of the records is not read (a transient failure):
+			// the flag is preserved — the next pass will repeat the domain;
+			// a clear would remove the SPA task before the T-030 recheck.
+			// A first-stage domain (i < firstN) at that "gets stuck" —
+			// the defer will remove the proof.
 			continue
 		}
-		// Снятие флага — после публикации (§3.4, порядок в шапке файла),
-		// со счётчиком долга одной транзакцией (T-175).
+		// The flag clear — after the publication (§3.4, the order in the file header),
+		// with the debt counter by one transaction (T-175).
 		cleared, err := renderClearPendingTx(ctx, pool, d.zone, d.id)
 		if err != nil {
 			return out, fmt.Errorf("httpworker: проход рендера: домен %s: снятие флага: %w", d.name, err)
 		}
 		if i < firstN {
-			// Флага больше нет (снято нами или конкурентом — охрана бита):
-			// домен первой ступени не застрял.
+			// There is no flag anymore (cleared by us or by a competitor — the bit guard):
+			// the first-stage domain did not get stuck.
 			firstLeft--
 		}
 		if cleared > 0 {
 			out.Cleared++
-			// Своё снятие сдвигает ожидание счётчика (память ступеней,
-			// T-184): приоритетная зона или списка — без разницы, любая
-			// новая постановка бита поверх всё равно разойдёт счётчик с
-			// ожиданием и возобновит первую ступень.
+			// Its own withdrawal shifts the counter's expectation (the stages' memory,
+			// T-184): a priority zone or a list one — no difference, any
+			// new bit setting on top will still diverge the counter from
+			// the expectation and resume the first stage.
 			stage.ownClears++
 		}
 	}
 	return out, nil
 }
 
-// renderClearPendingTx — снятие флага render_pending и декремент счётчика
-// рендер-долга одной транзакцией (T-175): возвращает RowsAffected снятия
-// (> 0 — бит был и снят, счётчик −1; 0 — бита уже не было (охрана бита:
-// конкурентное снятие вторым экземпляром прохода), счётчик не тронут).
-// Сбой любого шага откатывает пару целиком — бит и счётчик не
-// расходятся; повторная попытка (следующий тик прохода / повторная
-// доставка) выполнит пару заново.
+// renderClearPendingTx — the render_pending flag clear and the render debt
+// counter's decrement by one transaction (T-175): returns the clear's RowsAffected
+// (> 0 — the bit was there and is cleared, the counter −1; 0 — the bit was already gone (the bit
+// guard: a concurrent clear by a second pass instance), the counter not touched).
+// A failure of any step rolls back the pair entirely — the bit and the counter do
+// not diverge; a repeated attempt (the next pass tick / a repeated
+// delivery) will execute the pair anew.
 func renderClearPendingTx(ctx context.Context, pool RecordDB, zone int16, id int64) (int64, error) {
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("httpworker: транзакция снятия: %w", err)
 	}
-	// Откат безусловно: после Commit — no-op (стиль T-044).
+	// The rollback unconditionally: after the Commit — a no-op (the T-044 style).
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	tag, err := tx.Exec(ctx, renderClearPendingSQL, zone, id)
@@ -852,13 +852,13 @@ func renderClearPendingTx(ctx context.Context, pool RecordDB, zone int16, id int
 	return tag.RowsAffected(), nil
 }
 
-// renderBumpDebtCounter — сдвиг счётчика рендер-долга в ОТКРЫТОЙ
-// транзакции перехода бита render_pending (T-175): delta ±1. Возврат с
-// ошибкой откатывает транзакцию вызывающего — бит и счётчик меняются
-// только вместе (§3.4). RowsAffected != 1 — строки 'render_pending' нет
-// (создаёт и бэкфиллит миграция 000015; пропасть может только при ручной
-// правке таблицы, runbooks §6): молчаливый рассинхрон сделал бы gauge
-// долга ложью — ошибка громче.
+// renderBumpDebtCounter — the render debt counter's shift in the OPEN
+// render_pending bit transition transaction (T-175): delta ±1. Returning with
+// an error rolls back the caller's transaction — the bit and the counter change
+// only together (§3.4). RowsAffected != 1 — there is no 'render_pending' row
+// (created and backfilled by migration 000015; it can vanish only by a manual
+// table edit, runbooks §6): a silent desync would make the
+// debt gauge a lie — the error is louder.
 func renderBumpDebtCounter(ctx context.Context, tx pgx.Tx, delta int64) error {
 	tag, err := tx.Exec(ctx, renderCounterDeltaSQL, delta)
 	if err != nil {
@@ -871,13 +871,13 @@ func renderBumpDebtCounter(ctx context.Context, tx pgx.Tx, delta int64) error {
 	return nil
 }
 
-// renderDebtCount — guard прохода доработки (T-181): точечное чтение
-// счётчика рендер-долга crawler_counters['render_pending'] (T-175).
-// 0 — долга нет, тяжёлая выборка пачки (seq scan по domains) не
-// выполняется вовсе; отсутствие строки — ошибка: строку создаёт бэкфилл
-// миграции 000015, пропасть она может только при ручной правке таблицы
-// (runbooks §6) — молчаливый рассинхрон сделал бы guard ложью, громче
-// ошибкой (как у renderBumpDebtCounter).
+// renderDebtCount — the rework pass's guard (T-181): a point read of the
+// render debt counter crawler_counters['render_pending'] (T-175).
+// 0 — no debt, the heavy chunk selection (a seq scan over domains) does
+// not run at all; an absent row — an error: the row is created by the
+// migration 000015 backfill, it can vanish only by a manual table edit
+// (runbooks §6) — a silent desync would make the guard a lie, a louder
+// error (as at renderBumpDebtCounter).
 func renderDebtCount(ctx context.Context, pool RecordDB) (int64, error) {
 	rows, err := pool.Query(ctx, renderDebtCounterSQL)
 	if err != nil {
@@ -886,9 +886,9 @@ func renderDebtCount(ctx context.Context, pool RecordDB) (int64, error) {
 	defer rows.Close()
 	var n int64
 	if !rows.Next() {
-		// Сначала сбой чтения: обрыв соединения — не «строки нет»,
-		// диагноз отсутствия строки должен быть честным (runbooks §6
-		// ведёт оператора делать INSERT).
+		// First a read failure: a connection break is not "no row",
+		// the absence diagnosis must be honest (runbooks §6
+		// leads the operator to do an INSERT).
 		if err := rows.Err(); err != nil {
 			return 0, fmt.Errorf("httpworker: проход рендера: счётчик долга: %w", err)
 		}
@@ -903,28 +903,28 @@ func renderDebtCount(ctx context.Context, pool RecordDB) (int64, error) {
 	return n, nil
 }
 
-// renderSelectPending выбирает пачку доменов с флагом render_pending —
-// единая точка тяжёлой выборки прохода. Выборка идёт в явной транзакции с
+// renderSelectPending selects a chunk of domains with the render_pending flag —
+// the heavy pass selection's single point. The selection runs in an explicit transaction with
 // SET LOCAL enable_indexscan/bitmapscan/indexonlyscan = off (T-181):
-// закрепление формы плана (seq scan по domains + ранний останов LIMIT) —
-// см. комментарий к renderPlanNoIndexScanSQL; без закрепления планировщик
-// без статистики выражения (flags & 2) <> 0 берёт index scan по PK,
-// вытаптывающий дренированный «пустой» префикс (медиана 44 с на живом
-// долге, замер 24.10). Транзакция — только оболочка закрепления: SELECT
-// читает зафиксированные данные, фиксация/откат по содержанию равнозначны.
+// pinning the plan shape (a seq scan over domains + the early LIMIT stop) —
+// see the renderPlanNoIndexScanSQL comment; without the pinning the planner,
+// without the expression statistics, takes a PK index scan for (flags & 2) <> 0,
+// trampling the drained "empty" prefix (a 44 s median on a live
+// debt, the Oct 24 measurement). The transaction — only the pinning shell: SELECT
+// reads committed data, commit/rollback are equivalent by content.
 //
-// Ступени T-184: zoneNames пуст — базовая выборка без фильтра зон
-// (renderPendingDomainsSQL, порядок T-181); иначе имя зоны в JOIN —
-// первая ступень берёт зоны НЕ из списка (renderPendingDomainsNotInSQL),
-// вторая — зоны списка (renderPendingDomainsInSQL); фильтр не меняет
-// форму плана (малый справочник zones — hash join, сортировки нет),
-// ранний останов LIMIT сохраняется.
+// The T-184 stages: zoneNames empty — the base selection without a zone filter
+// (renderPendingDomainsSQL, the T-181 order); otherwise the zone name in the JOIN —
+// the first stage takes the zones NOT from the list (renderPendingDomainsNotInSQL),
+// the second — the list's zones (renderPendingDomainsInSQL); the filter does not change
+// the plan shape (a small zones reference table — a hash join, no sorting),
+// the early LIMIT stop is preserved.
 func renderSelectPending(ctx context.Context, pool RecordDB, limit int, zoneNames []string, inList bool) ([]renderPendingDomain, error) {
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("httpworker: проход рендера: транзакция выборки: %w", err)
 	}
-	// Откат безусловно: после Commit — no-op (стиль T-044).
+	// The rollback unconditionally: after the Commit — a no-op (the T-044 style).
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	if _, err := tx.Exec(ctx, renderPlanNoIndexScanSQL); err != nil {
@@ -969,17 +969,17 @@ func renderSelectPending(ctx context.Context, pool RecordDB, limit int, zoneName
 	return out, nil
 }
 
-// renderDomainKeys — ключи q:render домена прохода: повторный SPA-вердикт
-// по сохранённому контенту. Записи с content_hash читаются из хранилища
-// (DetectSPA детерминирован — тот же вердикт, что при записи, T-057);
-// алиасы наследуют вердикт субдомена-оригинала; записи без контента и
-// без алиаса пропускаются (контент не сохранён, T-056 — доработает
-// перепроверка T-030). Ошибка чтения блока — не ошибка прохода, но и не
-// повод снимать флаг: third возврат keep=true оставляет render_pending
-// (транзиентный сбой хранилища или гонка компактификации не должны
-// терять SPA-задачу до перепроверки T-030) — запись пропускается с Warn,
-// проход продолжается, следующий тик повторит домен; отмена ctx —
-// ошибка прохода.
+// renderDomainKeys — the pass's domain's q:render keys: a repeated SPA verdict
+// over the stored content. The records with content_hash are read from the store
+// (DetectSPA is deterministic — the same verdict as at the write, T-057);
+// the aliases inherit the original subdomain's verdict; the records without content and
+// without an alias are skipped (the content is not stored, T-056 — the T-030
+// recheck will rework them). A block read error is not a pass error, but not
+// a reason to clear the flag either: the third return keep=true leaves render_pending
+// (a transient store failure or a compaction race must not
+// lose the SPA task before the T-030 recheck) — the record is skipped with a Warn,
+// the pass continues, the next tick will repeat the domain; a ctx cancellation —
+// a pass error.
 func renderDomainKeys(ctx context.Context, pool db.DB, contents RenderContent, d *renderPendingDomain, log *slog.Logger) (keys []queue.Result, keep bool, err error) {
 	rows, err := pool.Query(ctx, renderPendingRowsSQL, d.zone, d.id)
 	if err != nil {
@@ -1005,8 +1005,8 @@ func renderDomainKeys(ctx context.Context, pool db.DB, contents RenderContent, d
 		return nil, false, fmt.Errorf("httpworker: проход рендера: домен %s: записи: %w", d.name, err)
 	}
 
-	// Свои вердикты — по контенту; порядок ключей детерминирован
-	// (ORDER BY запроса), алиасы — после своих.
+	// The own verdicts — by the content; the keys' order is deterministic
+	// (the query's ORDER BY), the aliases — after their own ones.
 	spa := make(map[int16]bool)
 	keys = make([]queue.Result, 0, len(recs))
 	var aliases []renderPendingRow
@@ -1016,8 +1016,8 @@ func renderDomainKeys(ctx context.Context, pool db.DB, contents RenderContent, d
 			continue
 		}
 		if len(r.hash) != content.HashLen {
-			// Контента нет (T-056) либо хэш недопустимой длины —
-			// страховка прямых вызовов; вердикт взять неоткуда.
+			// No content (T-056) or a hash of an invalid length —
+			// a guard for direct calls; there is nowhere to take the verdict from.
 			continue
 		}
 		var h content.Hash
@@ -1027,8 +1027,8 @@ func renderDomainKeys(ctx context.Context, pool db.DB, contents RenderContent, d
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return nil, false, fmt.Errorf("httpworker: проход рендера: домен %s: чтение контента: %w", d.name, err)
 			}
-			// Транзиентный сбой: флаг домена сохраняется (keep),
-			// следующий проход повторит чтение.
+			// A transient failure: the domain's flag is preserved (keep),
+			// the next pass will repeat the read.
 			log.Warn("проход рендера: контент записи недоступен — домен останется с флагом",
 				"domain", d.name, "subdomain_id", r.subdomain, "err", err)
 			keep = true
@@ -1059,17 +1059,17 @@ func renderDomainKeys(ctx context.Context, pool db.DB, contents RenderContent, d
 	return keys, keep, nil
 }
 
-// RequeueRenderPending — цикл проходов доработки рендера (§5.6
-// «дорабатываются позже»): стартовый дренаж пачками до исчерпания либо
-// до полного q:render (подбор флагов, накопленных за простоем, — стиль
-// CleanupDeleted T-020 / RecheckDaily T-030), далее тикер Interval.
-// Приоритет зон (T-184, opts.DeprioritizedZones): цикл держит память
-// исчерпания первой ступени (renderStage) — без неё хвост долга зон
-// списка платил бы порожний полный seq scan первой ступени за каждый
-// тик и итерацию дренажа. Ошибка прохода — Warn, цикл живёт (контракт
-// OnRun, T-012): очередной проход продолжит с того же места — снятое
-// не снимается дважды, неопубликованное сохраняет флаг. Отмена ctx —
-// чистый nil (graceful shutdown, §3.4).
+// RequeueRenderPending — the render rework passes' loop (§5.6
+// "are reworked later"): the initial drainage by chunks until exhaustion or
+// until a full q:render (picking up the flags accumulated over the idle time — the style of
+// CleanupDeleted T-020 / RecheckDaily T-030), then the Interval ticker.
+// The zones' priority (T-184, opts.DeprioritizedZones): the loop keeps the
+// first stage's exhaustion memory (renderStage) — without it the list's
+// zones' debt tail would pay the first stage's idle full seq scan per
+// tick and drainage iteration. A pass error — a Warn, the loop lives (the
+// OnRun contract, T-012): the next pass will continue from the same place — what is
+// cleared is not cleared twice, the unpublished keeps the flag. A ctx cancellation —
+// a clean nil (graceful shutdown, §3.4).
 func RequeueRenderPending(ctx context.Context, pool RecordDB, contents RenderContent, render *RenderQueue, opts RequeueOptions) error {
 	if pool == nil {
 		return errors.New("httpworker: проход рендера: пул не задан")
@@ -1082,8 +1082,8 @@ func RequeueRenderPending(ctx context.Context, pool RecordDB, contents RenderCon
 	}
 	o := opts.withDefaults()
 	if o.Log == nil {
-		// Дефолт логгера — здесь: drain зовёт requeuePass напрямую,
-		// минуя дефолт RequeueOnce.
+		// The logger's default — here: drain calls requeuePass directly,
+		// bypassing the RequeueOnce default.
 		o.Log = slog.New(slog.DiscardHandler)
 	}
 	log := o.Log
@@ -1091,36 +1091,36 @@ func RequeueRenderPending(ctx context.Context, pool RecordDB, contents RenderCon
 		"interval", o.Interval.String(), "batch", o.BatchSize,
 		"deprioritized_zones", o.DeprioritizedZones)
 
-	// Память ступеней приоритета (T-184) — на цикл: повторные проходы не
-	// повторяют порожний проход исчерпанной первой ступени.
+	// The priority stages' memory (T-184) — per loop: repeated passes do not
+	// repeat the exhausted first stage's empty pass.
 	stage := &renderStage{}
 
 	drain := func() {
 		for {
 			res, err := requeuePass(ctx, pool, contents, render, o, stage)
 			if err != nil {
-				// Отмена во время прохода — часть остановки, не тревога.
+				// A cancellation during the pass — part of the stop, not an alarm.
 				if ctx.Err() == nil {
 					log.Warn("проход доработки рендера", "err", err)
 				}
 				return
 			}
 			if res.Published > 0 || res.Cleared > 0 {
-				// deprioritized — домены пачки из зон списка (T-184):
-				// 0 в окне дренажа — приоритет работает, публикации идут
-				// зонами НЕ из списка вперёд (контроль порядка без
-				// ручного SQL).
+				// deprioritized — the chunk's domains from the list's zones (T-184):
+				// 0 in the drainage window — the priority works, the publications go
+				// by the zones NOT from the list first (an order control without
+				// a manual SQL).
 				log.Info("проход доработки рендера",
 					"domains", res.Cleared, "published", res.Published,
 					"deprioritized", res.Deprioritized, "full", res.Full)
 			}
-			// Полная пачка — возможно, остались домены; полная очередь —
-			// ждать тика (публикация «впритык к порогу» не нужна).
-			// Пачка БЕЗ снятых флагов — тоже ждать тика: контент не
-			// читается (keep), стартовый дренаж не крутится вхолостую —
-			// T-181 убрал естественный темпитель дорогой выборкой (замер
-			// 24.10: 137 срабатываний журнала за 2,7 ч ≈ темп drain),
-			// голый цикл по битым блокам молотил бы БД без останова.
+			// A full chunk — domains may remain; a full queue —
+			// wait for the tick (a publication "right up to the threshold" is not needed).
+			// A chunk WITHOUT cleared flags — also wait for the tick: the content is not
+			// read (keep), the initial drainage does not spin idle —
+			// T-181 removed the natural pacer by the expensive selection (the
+			// Oct 24 measurement: 137 log firings over 2.7 h ≈ the drain rate),
+			// a bare loop over the failing blocks would hammer the DB without a stop.
 			if res.Full || res.Selected < o.BatchSize || res.Cleared == 0 {
 				return
 			}

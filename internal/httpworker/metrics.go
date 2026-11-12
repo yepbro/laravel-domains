@@ -1,31 +1,31 @@
-// Приборы HTTP-этапа (T-077, ТЗ 5.9): пропускная способность (счётчик
-// задач и гистограмма длительностей), ошибки проверок по типам
+// The HTTP stage's instruments (T-077, spec 5.9): throughput (the task
+// counter and the duration histogram), check errors by type
 // (ErrorClass → LabelType: timeout/redirects/tls/body/network, §8),
-// финальные статусы доменов (alive/no_http/temp_error, §7), время
-// ответа (гистограмма ResponseMS итоговой страницы, ТЗ 5.5 п. 7) и доля
-// рендера — счётчик записей rendered=false (пишет HTTP-этап; ветку
-// rendered=true наращивает render-worker тем же счётчиком, доля —
-// отношением rate в PromQL). Счётчики статусов и записей считаются по
-// завершённому эпизоду (после успешного OnResult — записи зафиксированы
-// транзакцией T-058): гонка с удалением домена (§13.1) не различается,
-// at-least-once повторы учитываются как работа (ТЗ 3.4).
+// the final domain statuses (alive/no_http/temp_error, §7), the response
+// time (the ResponseMS histogram of the final page, spec 5.5 item 7) and the
+// render share — the rendered=false records counter (written by the HTTP stage; the
+// rendered=true branch is incremented by the render-worker with the same counter, the share —
+// as the rate ratio in PromQL). The status and record counters are counted over
+// a completed episode (after a successful OnResult — the records are committed
+// by the T-058 transaction): the race with domain deletion (§13.1) is not distinguished,
+// at-least-once repeats are counted as work (spec 3.4).
 //
-// Память слота (T-163, критерий ≤1.5 MiB/слот — docs/load-measurements.md
-// §12): тела в слоте не удерживаются (ранний Put T-147), остаток —
-// транзитные буферы читаемых тел и метаданные; приборы ниже делают
-// остаток измеримым сэмплером: занятые слоты (знаменатель «память/слот»),
-// байты тел в обработке прямо сейчас и распределение размеров тел (смесь,
-// определяющая пик). Мягкий потолок кучи — http.mem_limit (сборка
-// cmd/http-worker, debug.SetMemoryLimit): GC удерживает anon ниже
-// MemoryHigh юнита, не отдавая память reclaim-штормам ядра (фаталы
-// T-157 случились именно на границе потолков cgroup).
+// The slot memory (T-163, the ≤1.5 MiB/slot criterion — docs/load-measurements.md
+// §12): bodies are not held in the slot (the early Put of T-147), the remainder —
+// the transit buffers of the bodies being read and the metadata; the instruments
+// below make the remainder measurable by the sampler: the busy slots (the "memory/slot"
+// denominator), the body bytes in processing right now and the body size
+// distribution (the mix defining the peak). The soft heap cap — http.mem_limit (the
+// cmd/http-worker build, debug.SetMemoryLimit): the GC keeps anon below
+// the unit's MemoryHigh without giving the memory to the kernel's reclaim storms (the
+// T-157 fatals happened exactly at the boundary of the cgroup caps).
 //
-// Ожидание per-IP семафора (T-165): head-of-line парковочных IP
-// (per_ip_limit при FIFO-очереди растягивает задачи к 20 с, находка
-// T-092 §3) сделано измеримым — гистограмма ожидания слота
-// crawler_http_per_ip_wait_seconds (наблюдения подставляет сборка
-// сервиса как httpfetch.LimitOptions.OnPerIPWait); доля ожиданий > 2 с —
-// критерий активации мер против head-of-line (< 5 % — норма).
+// The per-IP semaphore wait (T-165): the head-of-line parking IPs
+// (per_ip_limit with a FIFO queue stretches tasks to 20 s, the finding
+// of T-092 §3) made measurable — the slot wait histogram
+// crawler_http_per_ip_wait_seconds (the observations are plugged in by the
+// service build as httpfetch.LimitOptions.OnPerIPWait); the share of waits > 2 s —
+// the activation criterion of the head-of-line countermeasures (< 5% — the norm).
 package httpworker
 
 import (
@@ -36,18 +36,18 @@ import (
 	"crawler/internal/metrics"
 )
 
-// Корзины гистограмм этапа. Время ответа — до заголовков итоговой
-// страницы (мс ResponseMS, ТЗ 5.5 п. 7): локальные сайты десятки
-// миллисекунд, таймауты этапа (connect 5 с, общий ~10 с, ТЗ 5.10)
-// обрезают хвост корзинами 5/10 с. Длительность задачи домена — до всех
-// проверок субдоменов параллельным пулом с per-IP-лимитами (T-049):
-// от долей секунды до десятков секунд на «молчащие» домены с таймаутами.
-// Размер тела (T-163) — от пустых страниц парковок до потолка
-// max_body_bytes (2 МиБ): корзины степеней четвёрки, хвост обрезан
-// лимитом чтения тела. Ожидание per-IP семафора (T-165) — от
-// микросекунд свободного слота до хвоста total_timeout (~20 с):
-// корзина le=2 выделена границей — доля ожиданий > 2 с (критерий
-// T-165: < 5 % на смеси боя) читается напрямую как
+// The stage histograms' buckets. The response time — up to the final
+// page's headers (the ResponseMS ms, spec 5.5 item 7): local sites are tens of
+// milliseconds, the stage timeouts (connect 5 s, the overall ~10 s, spec 5.10)
+// trim the tail with the 5/10 s buckets. The domain task duration — up to all
+// the subdomain checks by the parallel pool with per-IP limits (T-049):
+// from fractions of a second to tens of seconds on "silent" domains with timeouts.
+// The body size (T-163) — from the parkings' empty pages to the
+// max_body_bytes cap (2 MiB): the powers-of-four buckets, the tail truncated
+// by the body read limit. The per-IP semaphore wait (T-165) — from
+// the microseconds of a free slot to the total_timeout tail (~20 s):
+// the le=2 bucket is singled out by the boundary — the share of waits > 2 s (the
+// T-165 criterion: < 5% on the production mix) is read directly as
 // 1 − rate(…_bucket{le="2"})/rate(…_count).
 var (
 	httpResponseBuckets  = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10}
@@ -56,9 +56,9 @@ var (
 	httpPerIPWaitBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 30}
 )
 
-// Metrics — приборы HTTP-этапа; строится NewMetrics из реестра сервиса,
-// nil — все методы no-op (изолированные сборки). Потокобезопасен:
-// задачи идут параллельно, приборы prometheus синхронизированы.
+// Metrics — the HTTP stage's instruments; built by NewMetrics from the service's
+// registry, nil — all methods are no-ops (isolated builds). Concurrency-safe:
+// tasks run in parallel, the prometheus instruments are synchronized.
 type Metrics struct {
 	tasks     prometheus.Counter     // crawler_stage_tasks_total{stage="http"}
 	seconds   prometheus.Observer    // crawler_stage_seconds{stage="http"}
@@ -77,9 +77,9 @@ type Metrics struct {
 	lateErrs  prometheus.Counter     // crawler_render_late_errors_total (T-273)
 }
 
-// NewMetrics регистрирует приборы HTTP-этапа в реестре reg (каррированные
-// по service, фиксированные метки значений — по месту); nil — nil.
-// Идемпотентен (T-076): повторный вызов делит те же коллекторы.
+// NewMetrics registers the HTTP stage's instruments in the reg registry (carried
+// by service, the fixed label values — at the site); nil — nil.
+// Idempotent (T-076): a repeated call shares the same collectors.
 func NewMetrics(reg *metrics.Registry) *Metrics {
 	if reg == nil {
 		return nil
@@ -137,8 +137,8 @@ func NewMetrics(reg *metrics.Registry) *Metrics {
 			Name: "crawler_http_dead_host_cutoff_skipped_checks_total",
 			Help: "Проверки (субдомен × протокол), не выполненные из-за dead-host cutoff (T-164), — сэкономленный пул задачи. Доля ложных cutoff (<1%, критерий T-164) меряется контрольной выборкой по битам dead_host_cutoff в domains.flags.",
 		}).WithLabelValues(),
-		// Счётчик 40P01-повторов транзакции записи (T-268): единые
-		// имя/HELP для всех сервисов — конструктор internal/metrics.
+		//		// The 40P01 transaction-retry counter (T-268): the name/HELP
+		//		// shared by all services — the internal/metrics constructor.
 		dbRetried: metrics.NewDBDeadlockRetried(reg),
 		late: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_render_late_republish_total",
@@ -151,17 +151,17 @@ func NewMetrics(reg *metrics.Registry) *Metrics {
 	}
 }
 
-// Episode — задача q:http завершена успешно: +1 задача этапа и её
-// длительность; финальный статус домена (recordStatus, §7); ошибки
-// проверок по классам (§8), время ответа доступных некэшированных
-// проверок; записи результата — в счётчик rendered=false (доля рендера,
-// ТЗ 5.9). Кэш-попадания (Cached) временем ответа не наблюдаются — сеть
-// не трогалась (ResponseMS кэша — перенесённое измерение первоисточника);
-// суб-миллисекундные ответы честно ложатся в нижнюю корзину.
-// Dead-host cutoff (T-164): задача с признаком Cutoff — в отдельный
-// счётчик, пропущенные проверки (класс ErrCutoff) — в счётчик
-// сэкономленных проверок; ошибками этапа они не считаются — проверка
-// не выполнялась.
+// Episode — a q:http task completed successfully: +1 stage task and its
+// duration; the domain's final status (recordStatus, §7); the check
+// errors by class (§8), the response time of the available non-cached
+// checks; the result records — into the rendered=false counter (the render share,
+// spec 5.9). Cache hits (Cached) are not observed by the response time — the network
+// was not touched (the cache's ResponseMS — the primary source's measurement carried over);
+// sub-millisecond responses honestly land in the lowest bucket.
+// Dead-host cutoff (T-164): a task with the Cutoff sign — into a separate
+// counter, the skipped checks (the ErrCutoff class) — into the
+// saved checks counter; they do not count as stage errors — the check
+// was not performed.
 func (m *Metrics) Episode(res *DomainResult, d time.Duration) {
 	if m == nil || res == nil {
 		return
@@ -190,11 +190,11 @@ func (m *Metrics) Episode(res *DomainResult, d time.Duration) {
 	}
 }
 
-// SlotEnter/SlotLeave — занятость слота задачи (T-163): processDelivery
-// занимает слот на всё время обработки (обе точки входа — диспетчер Run
-// и клеймы RecoverLoop), пара метода обязана сходиться к нулю на пустом
-// конвейере. Счётчик — знаменатель «память юнита / слот» при замере
-// критерия сэмплером (docs/load-measurements.md §12, T-157/T-163).
+// SlotEnter/SlotLeave — the task slot occupancy (T-163): processDelivery
+// takes the slot for the whole processing time (both entry points — the Run dispatcher
+// and the RecoverLoop claims), the method pair must converge to zero on an idle
+// pipeline. The counter — the "unit memory / slot" denominator when measuring
+// the criterion by the sampler (docs/load-measurements.md §12, T-157/T-163).
 func (m *Metrics) SlotEnter() {
 	if m == nil {
 		return
@@ -202,7 +202,7 @@ func (m *Metrics) SlotEnter() {
 	m.slots.Inc()
 }
 
-// SlotLeave — освобождение слота (см. SlotEnter).
+// SlotLeave — the slot release (see SlotEnter).
 func (m *Metrics) SlotLeave() {
 	if m == nil {
 		return
@@ -210,10 +210,10 @@ func (m *Metrics) SlotLeave() {
 	m.slots.Dec()
 }
 
-// BodyHeld — байты тела, находящегося в обработке (T-163): checkScheme
-// держит прочитанное тело от завершения чтения до раннего Put
-// (UTF-8/хэш/SPA/сжатие); +n при входе в окно, −n на выходе. Плюс к
-// нулю сходится всегда (defer по выходу из окна удержания).
+// BodyHeld — the bytes of the body in processing (T-163): checkScheme
+// holds the read body from completing the read to the early Put
+// (UTF-8/hash/SPA/compression); +n on entering the window, −n on exiting. The
+// plus converges to zero always (defer on leaving the hold window).
 func (m *Metrics) BodyHeld(n int64) {
 	if m == nil {
 		return
@@ -221,9 +221,9 @@ func (m *Metrics) BodyHeld(n int64) {
 	m.bodyHold.Add(float64(n))
 }
 
-// BodySize — размер успешно прочитанного тела (T-163): распределение
-// смеси (парковки — десятки КиБ, тяжёлые страницы — до потолка
-// max_body_bytes) объясняет пики bodyHold при замере памяти слота.
+// BodySize — the size of a successfully read body (T-163): the distribution of
+// the mix (parkings — tens of KiB, heavy pages — up to the
+// max_body_bytes cap) explains the bodyHold peaks when measuring the slot memory.
 func (m *Metrics) BodySize(n int) {
 	if m == nil {
 		return
@@ -231,9 +231,9 @@ func (m *Metrics) BodySize(n int) {
 	m.bodySize.Observe(float64(n))
 }
 
-// PerIPWait — ожидание слота per-IP семафора (T-165): наблюдение
-// гистограммы после каждой успешной выдачи слота; подключается сборка
-// сервиса (cmd/http-worker) как httpfetch.LimitOptions.OnPerIPWait.
+// PerIPWait — the per-IP semaphore slot wait (T-165): the histogram
+// observation after each successful slot grant; wired by the
+// service build (cmd/http-worker) as httpfetch.LimitOptions.OnPerIPWait.
 func (m *Metrics) PerIPWait(wait time.Duration) {
 	if m == nil {
 		return
@@ -241,9 +241,9 @@ func (m *Metrics) PerIPWait(wait time.Duration) {
 	m.perIPWait.Observe(wait.Seconds())
 }
 
-// DBDeadlockRetried — транзакция БД повторена после дедлока 40P01
-// (T-268): +1 к счётчику; хук db.RetryDeadlock записателя результата
-// (attempt — номер повтора, ряд один, метка зарезервирована за сервисом).
+// DBDeadlockRetried — the DB transaction retried after a 40P01 deadlock
+// (T-268): +1 to the counter; the db.RetryDeadlock hook of the result
+// writer (attempt — the retry number, one row, the label reserved for the service).
 func (m *Metrics) DBDeadlockRetried(attempt int) {
 	if m == nil {
 		return
@@ -251,10 +251,10 @@ func (m *Metrics) DBDeadlockRetried(attempt int) {
 	m.dbRetried.Inc()
 }
 
-// LateRepublished — поздний переиздатель опубликовал n переизданий
-// q:render (T-259, ФТ-5.3): +n к crawler_render_late_republish_total;
-// вызывается проходом LateOnce по факту публикации (Full/ошибка не
-// считаются — издания не было).
+// LateRepublished — the late re-publisher published n q:render
+// re-publications (T-259, FR-5.3): +n to crawler_render_late_republish_total;
+// called by the LateOnce pass upon the fact of publication (Full/error do not
+// count — there was no publication).
 func (m *Metrics) LateRepublished(n int) {
 	if m == nil || n <= 0 {
 		return
@@ -262,9 +262,9 @@ func (m *Metrics) LateRepublished(n int) {
 	m.late.Add(float64(n))
 }
 
-// LateError — ошибочный проход позднего переиздателя (T-273): +1 к
-// crawler_render_late_errors_total; вызывается циклом RenderLateLoop
-// рядом с Warn (отмена ctx — штатная остановка, не считается).
+// LateError — an erroneous late re-publisher pass (T-273): +1 to
+// crawler_render_late_errors_total; called by the RenderLateLoop loop
+// next to the Warn (a ctx cancellation — a graceful stop, not counted).
 func (m *Metrics) LateError() {
 	if m == nil {
 		return

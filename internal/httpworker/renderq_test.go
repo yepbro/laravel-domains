@@ -1,11 +1,11 @@
-// Юнит-тесты переполнения очереди рендера (T-066; ТЗ 5.6, §7) на фейковых
-// пуле/очереди/хранилище — без БД, Redis и сети. Собственные фейковые пулы
-// с префиксом renderq (граница задачи: record_test.go T-058 не правится):
-// проверяются точные SQL и параметры прохода, флаг render_pending в той
-// же транзакции результата, порядок «фиксация → публикация q:render»,
-// неблокирующая публикация (XACK не ждёт ёмкости), повторный SPA-вердикт
-// по сохранённому контенту, алиасы, ошибки/отмена ctx, цикл прохода.
-// Поведение против живых PostgreSQL/Redis — интеграционные тесты.
+// Unit tests of the render queue's overflow (T-066; spec 5.6, §7) over fake
+// pool/queue/store — without a DB, Redis and the network. Own fake pools
+// with the renderq prefix (the task boundary: record_test.go T-058 is not touched):
+// the pass's exact SQL and parameters are checked, the render_pending flag in the
+// same result transaction, the "commit → q:render publication" order,
+// the non-blocking publication (the XACK does not wait for the capacity), the repeated SPA verdict
+// over the stored content, the aliases, errors/ctx cancellation, the pass's loop.
+// The behavior against live PostgreSQL/Redis — integration tests.
 package httpworker
 
 import (
@@ -29,14 +29,14 @@ import (
 	"crawler/internal/queue"
 )
 
-// --- протокол событий --------------------------------------------------------
+// --- the events' protocol --------------------------------------------------------
 
-// renderqJournal — потокобезопасный протокол операций (стиль recordJournal).
+// renderqJournal — a concurrency-safe operations protocol (the recordJournal style).
 type renderqJournal struct {
 	mu     sync.Mutex
 	events []string
-	// done — неблокируемый сигнал на каждое событие вида (синхронизация
-	// цикла прохода в горутине).
+	// done — a non-blocking signal per event of the kind (the
+	// pass loop's synchronization in a goroutine).
 	done chan string
 }
 
@@ -75,7 +75,7 @@ func (j *renderqJournal) count(e string) int {
 	return n
 }
 
-// snapshot — копия всех событий (проверка последовательностей шагов).
+// snapshot — a copy of all the events (the steps' sequences check).
 func (j *renderqJournal) snapshot() []string {
 	j.mu.Lock()
 	defer j.mu.Unlock()
@@ -84,10 +84,10 @@ func (j *renderqJournal) snapshot() []string {
 	return out
 }
 
-// --- фейковые RenderLen и очередь --------------------------------------------
+// --- the fake RenderLen and queue --------------------------------------------
 
-// renderqLen — RenderLen: длина по счётчику вызовов (seq — ответы по
-// порядку, дальше повторяется последний), настраиваемый сбой.
+// renderqLen — a RenderLen: the length by the calls counter (seq — the answers in
+// order, further the last one repeats), a configurable failure.
 type renderqLen struct {
 	mu    sync.Mutex
 	seq   []int64
@@ -124,14 +124,14 @@ func (l *renderqLen) callsCount() int {
 	return l.calls
 }
 
-// renderqPublish — записанная публикация.
+// renderqPublish — a recorded publication.
 type renderqPublish struct {
 	stream string
 	msg    queue.Result
 }
 
-// renderqQueue — queue.Queue: фиксирует публикации Result (сбои по
-// индексу), Consume паркуется до отмены ctx, Ack — заглушка.
+// renderqQueue — a queue.Queue: records the Result publications (failures by
+// index), Consume parks until the ctx cancellation, Ack — a stub.
 type renderqQueue struct {
 	j *renderqJournal
 
@@ -179,7 +179,7 @@ func (q *renderqQueue) snapshot() []renderqPublish {
 	return out
 }
 
-// renderqContent — RenderContent: тело по хэшу, настраиваемый сбой.
+// renderqContent — a RenderContent: a body by hash, a configurable failure.
 type renderqContent struct {
 	mu     sync.Mutex
 	bodies map[content.Hash][]byte
@@ -202,62 +202,62 @@ func (c *renderqContent) Get(ctx context.Context, hash content.Hash) ([]byte, er
 	return body, nil
 }
 
-// --- фейковый пул прохода (RecordDB): domains/zones/subdomain_results --------
+// --- the pass's fake pool (RecordDB): domains/zones/subdomain_results --------
 
-// renderqDomKey — ключ строки domains в фейке прохода.
+// renderqDomKey — the key of a domains row in the pass's fake.
 type renderqDomKey struct {
 	zone int16
 	id   int64
 }
 
-// renderqDomain — строка domains, которую читает и меняет проход.
+// renderqDomain — a domains row the pass reads and changes.
 type renderqDomain struct {
 	flags  model.Flags
 	status model.Status
 	label  string
 }
 
-// renderqRow — строка subdomain_results для прохода.
+// renderqRow — a subdomain_results row for the pass.
 type renderqRow struct {
 	subdomain int16
 	variant   model.Variant
 	hash      []byte // nil — content_hash NULL
 	aliasSub  *int16 // nil — alias_subdomain_id NULL
 	rendered  bool
-	finalURL  string // "" — NULL (фильтр final_url IS NOT NULL)
-	marked    bool   // штамп «рендер невозможен» (T-210; фильтр render_failed_at IS NULL)
+	finalURL  string // "" — NULL (the final_url IS NOT NULL filter)
+	marked    bool   // the "render impossible" stamp (T-210; the render_failed_at IS NULL filter)
 }
 
-// renderqPool — RecordDB прохода без БД: живая семантика фильтров SQL
-// (флаг render_pending, status <> deleted, rendered = false,
-// final_url IS NOT NULL, ступени зон T-184 — членство имени зоны в
-// списке render.requeue_deprioritized_zones), смена флага с охраной бита
-// и счётчик долга crawler_counters (T-175: строка render_pending, ±1 в
-// транзакции снятия — как в живом RequeueOnce); SQL сопоставляется ТОЧНО
-// (неожидаемый — ошибка, тест падает громко). RecordDB, а не db.DB
-// (T-175): проход снимает флаг транзакцией со счётчиком.
+// renderqPool — the pass's RecordDB without a DB: the live semantics of the SQL
+// filters (the render_pending flag, status <> deleted, rendered = false,
+// final_url IS NOT NULL, the T-184 zone stages — the zone name's membership in
+// the render.requeue_deprioritized_zones list), the flag change with the bit
+// guard and the debt counter crawler_counters (T-175: the render_pending row, ±1 in
+// the clear transaction — as in the live RequeueOnce); the SQL is matched EXACTLY
+// (an unexpected one — an error, the test falls loudly). A RecordDB, not a db.DB
+// (T-175): the pass clears the flag by a transaction with the counter.
 type renderqPool struct {
 	j *renderqJournal
 
 	zones   map[int16]string
 	domains map[renderqDomKey]*renderqDomain
 	rows    map[renderqDomKey][]renderqRow
-	// order — порядок вставки доменов: «физический порядок кучи» для
-	// выборки без ORDER BY (T-181) — seq scan возвращает строки
-	// раскладкой, а не PK; сид-порядок детерминирует пачки в тестах.
+	// order — the domains' insertion order: the "physical heap order" for
+	// the selection without an ORDER BY (T-181) — the seq scan returns rows
+	// by the layout, not the PK; the seed order determines the chunks in the tests.
 	order    []renderqDomKey
 	counters map[string]int64 // T-175: crawler_counters ('render_pending')
 
 	queryErrs    map[string]error
-	beforeHook   func() // вызывается перед первым Exec транзакции снятия (симуляция гонок)
-	counterNoRow bool   // строка счётчика отсутствует (guard и UPDATE 0 — ошибка вызывающего)
+	beforeHook   func() // called before the clear transaction's first Exec (a race simulation)
+	counterNoRow bool   // the counter row is absent (the guard and an UPDATE 0 — the caller's error)
 
 	mu           sync.Mutex
 	queries      int
 	clears       int
-	stage1Select int   // выборки первой ступени T-184 (зоны НЕ из списка)
-	stage2Select int   // выборки второй ступени T-184 (зоны списка)
-	clearTag     int64 // RowsAffected снятия флага (0 — честный ответ)
+	stage1Select int   // the T-184 first stage's selections (the zones NOT from the list)
+	stage2Select int   // the T-184 second stage's selections (the list's zones)
+	clearTag     int64 // the flag clear's RowsAffected (0 — an honest answer)
 }
 
 var _ RecordDB = (*renderqPool)(nil)
@@ -277,9 +277,9 @@ func (p *renderqPool) seedDomain(zone int16, id int64, label string, flags model
 	d := &renderqDomain{flags: flags, status: status, label: label}
 	p.domains[renderqDomKey{zone: zone, id: id}] = d
 	p.order = append(p.order, renderqDomKey{zone: zone, id: id})
-	// Инвариант счётчика (T-175): он равен числу строк с битом — как
-	// бэкфилл миграции 000015 (без фильтра по status: удалённый с битом
-	// домен в счётчике остаётся, снимает бит только проход доработки).
+	// The counter invariant (T-175): it equals the number of rows with the bit — like
+	// the migration 000015 backfill (without a status filter: a domain deleted with the
+	// bit stays in the counter, only the rework pass removes the bit).
 	if flags.Test(model.FlagRenderPending) {
 		p.counters["render_pending"]++
 	}
@@ -299,8 +299,8 @@ func (p *renderqPool) Exec(context.Context, string, ...any) (pgconn.CommandTag, 
 	return pgconn.CommandTag{}, errors.New("renderqPool: Exec вне транзакции не должен вызываться (снятие — транзакцией, T-175)")
 }
 
-// Begin — снапшот доменов и счётчика (стиль renderqRecPool): откат
-// возвращает оба, фиксация оставляет изменения.
+// Begin — a snapshot of the domains and the counter (the renderqRecPool style): a rollback
+// returns both, a commit keeps the changes.
 func (p *renderqPool) Begin(ctx context.Context) (pgx.Tx, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -323,8 +323,8 @@ func (p *renderqPool) Begin(ctx context.Context) (pgx.Tx, error) {
 	}, nil
 }
 
-// renderqTx — транзакция фейка прохода: снятие флага и сдвиг счётчика
-// долга (T-175), откат возвращает снапшот.
+// renderqTx — the pass fake's transaction: the flag clear and the debt
+// counter's shift (T-175), a rollback returns the snapshot.
 type renderqTx struct {
 	pgx.Tx
 
@@ -346,8 +346,8 @@ func (t *renderqTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.C
 	}
 	switch sql {
 	case renderPlanNoIndexScanSQL, renderPlanNoBitmapScanSQL, renderPlanNoIOSQL:
-		// Закрепление плана выборки (T-181): SET LOCAL ×3 до SELECT —
-		// последовательность проверяет TestRequeueOnceSelectPlan.
+		// The selection plan pinning (T-181): SET LOCAL ×3 before the SELECT —
+		// the sequence is checked by TestRequeueOnceSelectPlan.
 		t.j.record("plan")
 		return pgconn.NewCommandTag("SET"), nil
 	case renderClearPendingSQL:
@@ -366,7 +366,7 @@ func (t *renderqTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.C
 		t.pool.clears++
 		d, ok := t.pool.domains[renderqDomKey{zone: zone, id: id}]
 		if !ok || !d.flags.Test(model.FlagRenderPending) {
-			return pgconn.NewCommandTag("UPDATE 0"), nil // охрана бита
+			return pgconn.NewCommandTag("UPDATE 0"), nil // the bit guard
 		}
 		d.flags.Clear(model.FlagRenderPending)
 		t.j.record("clear")
@@ -383,7 +383,7 @@ func (t *renderqTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.C
 			return pgconn.CommandTag{}, fmt.Errorf("renderqPool: счётчик: параметр %T, нужно int64", args[0])
 		}
 		if t.pool.counterNoRow {
-			return pgconn.NewCommandTag("UPDATE 0"), nil // строки нет (ручная правка)
+			return pgconn.NewCommandTag("UPDATE 0"), nil // no row (a manual edit)
 		}
 		t.pool.counters["render_pending"] += delta
 		t.j.record("debtcount")
@@ -401,9 +401,9 @@ func (t *renderqTx) Commit(context.Context) error {
 	return nil
 }
 
-// Query — выборка пачки доменов ВНУТРИ транзакции закрепления плана
-// (T-181): renderSelectPending зовёт tx.Query, не пул — фейк повторяет
-// живую точку вызова (пул напрямую пачку не читает).
+// Query — the domains chunk's selection INSIDE the plan pinning's
+// transaction (T-181): renderSelectPending calls tx.Query, not the pool — the fake repeats
+// the live call point (the pool does not read the chunk directly).
 func (t *renderqTx) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -426,7 +426,7 @@ func (t *renderqTx) Query(ctx context.Context, sql string, args ...any) (pgx.Row
 		if !ok || limit <= 0 {
 			return nil, fmt.Errorf("renderqPool: домены: LIMIT %v (%T)", args[0], args[0])
 		}
-		// Ступени T-184: вторая колонка — имена зон (массив text[]).
+		// The T-184 stages: the second column — the zones' names (a text[] array).
 		var zoneNames []string
 		if sql != renderPendingDomainsSQL {
 			zoneNames, ok = args[1].([]string)
@@ -441,8 +441,8 @@ func (t *renderqTx) Query(ctx context.Context, sql string, args ...any) (pgx.Row
 		if sql == renderPendingDomainsInSQL {
 			t.pool.stage2Select++
 		}
-		// Порядок — «физический» (order, порядок вставки): SQL без
-		// ORDER BY, seq scan возвращает раскладку кучи (T-181).
+		// The order — "physical" (order, the insertion order): the SQL without
+		// an ORDER BY, the seq scan returns the heap's layout (T-181).
 		rows := make([][]any, 0, limit)
 		for _, k := range t.pool.order {
 			if len(rows) == limit {
@@ -450,10 +450,10 @@ func (t *renderqTx) Query(ctx context.Context, sql string, args ...any) (pgx.Row
 			}
 			d, ok := t.pool.domains[k]
 			if !ok || !d.flags.Test(model.FlagRenderPending) || d.status == model.StatusDeleted {
-				continue // WHERE бита и status <> deleted
+				continue // the bit's WHERE and status <> deleted
 			}
-			// Ступени T-184: членство имени зоны домена в списке
-			// (z.name <> ALL / = ANY — живая семантика фильтра).
+			// The T-184 stages: the domain's zone name's membership in the list
+			// (z.name <> ALL / = ANY — the filter's live semantics).
 			depr := false
 			for _, name := range zoneNames {
 				if t.pool.zones[k.zone] == name {
@@ -494,9 +494,9 @@ func (p *renderqPool) Query(ctx context.Context, sql string, args ...any) (pgx.R
 	p.queries++
 	switch sql {
 	case renderDebtCounterSQL:
-		// Guard прохода (T-181): точечное чтение счётчика долга; строка
-		// обязана быть (миграция 000015) — её отсутствие эмулируется
-		// пустым набором (renderDebtCount ошибается).
+		// The pass's guard (T-181): a point read of the debt counter; the row
+		// is mandatory (migration 000015) — its absence is emulated
+		// by an empty set (renderDebtCount errors).
 		if p.counterNoRow {
 			return renderqRowsOf(), nil
 		}
@@ -527,8 +527,8 @@ func (p *renderqPool) Query(ctx context.Context, sql string, args ...any) (pgx.R
 			}
 			rows = append(rows, []any{r.subdomain, int16(r.variant), hash, alias})
 		}
-		// ORDER BY subdomain_id, variant (src уже в порядке вставки —
-		// сортировка не зависит от него).
+		// ORDER BY subdomain_id, variant (src is already in the insertion order —
+		// the sort does not depend on it).
 		for i := 0; i < len(rows); i++ {
 			for j := i + 1; j < len(rows); j++ {
 				a, b := rows[i], rows[j]
@@ -543,8 +543,8 @@ func (p *renderqPool) Query(ctx context.Context, sql string, args ...any) (pgx.R
 	}
 }
 
-// renderqRows — pgx.Rows с заготовленными строками (Scan — позиционный,
-// типы int16/int64/string/[]byte/*int16).
+// renderqRows — pgx.Rows with preloaded rows (the Scan — positional,
+// the types int16/int64/string/[]byte/*int16).
 type renderqRows struct {
 	rows [][]any
 	i    int
@@ -608,10 +608,10 @@ func (r *renderqRows) Scan(dest ...any) error {
 	return nil
 }
 
-// --- фейковый RecordDB записи результата (с флагом) ---------------------------
+// --- the fake result write RecordDB (with the flag) ---------------------------
 
-// renderqRecDomain — строка domains фейка записи: как recordFakeDomain,
-// плюс flags (renderqRecPool применяет renderSetPendingSQL).
+// renderqRecDomain — the write fake's domains row: like recordFakeDomain,
+// plus flags (renderqRecPool applies renderSetPendingSQL).
 type renderqRecDomain struct {
 	status       model.Status
 	checkState   model.CheckState
@@ -621,12 +621,12 @@ type renderqRecDomain struct {
 	flags        model.Flags
 }
 
-// renderqRecPool — RecordDB без БД: семантика транзакции записи результата
-// (record.go) с флагом render_pending. Фейк T-058 (record_test.go) флаг не
-// отслеживает и править его нельзя (граница задачи) — потому собственная
-// копия: domains (UPDATE статуса, OR флага), subdomain_results (DELETE …
-// RETURNING, INSERT-пачка), contents (refcount, SwapRefTx T-044),
-// транзакции-снапшоты.
+// renderqRecPool — a RecordDB without a DB: the result write transaction's semantics
+// (record.go) with the render_pending flag. The T-058 fake (record_test.go) does not
+// track the flag and cannot be edited (the task boundary) — hence an own
+// copy: domains (the status UPDATE, the flag's OR), subdomain_results (DELETE …
+// RETURNING, the INSERT chunk), contents (the refcount, SwapRefTx T-044),
+// snapshot transactions.
 type renderqRecPool struct {
 	j *renderqJournal
 
@@ -636,7 +636,7 @@ type renderqRecPool struct {
 	counters map[string]int64 // T-175: crawler_counters ('render_pending')
 
 	failExec     map[string]error
-	counterNoRow bool // строки счётчика нет (UPDATE 0 — ошибка записи)
+	counterNoRow bool // the counter row is absent (an UPDATE 0 — a write error)
 	deleteErr    error
 	commitErr    error
 	beginErr     error
@@ -652,7 +652,7 @@ func newRenderqRecPool() *renderqRecPool {
 		domains:  make(map[recordDomainKey]*renderqRecDomain),
 		rows:     make(map[recordDomainKey][]recordFakeRow),
 		refc:     make(map[content.Hash]int32),
-		counters: map[string]int64{"render_pending": 0}, // строка миграции 000015
+		counters: map[string]int64{"render_pending": 0}, // the migration 000015 row
 		failExec: make(map[string]error),
 	}
 }
@@ -662,8 +662,8 @@ func (p *renderqRecPool) seedDomain(zone int16, id int64, status model.Status, f
 	now := time.Now()
 	d.queuedAt = &now
 	p.domains[recordDomainKey{zone: zone, id: id}] = d
-	// Инвариант счётчика (T-175): равен числу строк с битом (бэкфилл
-	// миграции 000015).
+	// The counter invariant (T-175): it equals the number of rows with the bit (the
+	// migration 000015 backfill).
 	if flags.Test(model.FlagRenderPending) {
 		p.counters["render_pending"]++
 	}
@@ -768,8 +768,8 @@ func (t *renderqRecTx) Exec(ctx context.Context, sql string, args ...any) (pgcon
 		if !ok {
 			return pgconn.NewCommandTag("UPDATE 0"), nil
 		}
-		// Охрана бита (T-175): RowsAffected — индикатор перехода 0→1,
-		// повторная установка (флаг уже стоит) переходом не считается.
+		// The bit guard (T-175): RowsAffected — the 0→1 transition indicator,
+		// a repeated setting (the flag is already set) does not count as a transition.
 		if d.flags.Test(model.FlagRenderPending) {
 			return pgconn.NewCommandTag("UPDATE 0"), nil
 		}
@@ -785,39 +785,39 @@ func (t *renderqRecTx) Exec(ctx context.Context, sql string, args ...any) (pgcon
 			return pgconn.CommandTag{}, fmt.Errorf("renderqRecPool: счётчик: параметр %T, нужно int64", args[0])
 		}
 		if t.pool.counterNoRow {
-			return pgconn.NewCommandTag("UPDATE 0"), nil // строки нет (ручная правка)
+			return pgconn.NewCommandTag("UPDATE 0"), nil // no row (a manual edit)
 		}
 		t.pool.counters["render_pending"] += delta
 		t.j.record("debtcount")
 		return pgconn.NewCommandTag("UPDATE 1"), nil
 	case recordZoneShiftSQL:
-		// Дельта счётчиков зоны (T-178): значения фейку не важны —
-		// запись сценария долга рендера их не проверяет; строка зоны
-		// «существует» всегда.
+		// The zone counters' delta (T-178): the values do not matter to the fake —
+		// the render debt scenario does not check them; the zone row
+		// "exists" always.
 		t.j.record("zoneshift")
 		return pgconn.NewCommandTag("UPDATE 1"), nil
 	case recordChecksBumpSQL:
-		// Суточный счётчик проверок (T-179): имя дня вычисляет БД —
-		// сценариям рендера значение не нужно, транзакция обязана
-		// пройти шаг (upsert всегда 1).
+		// The daily checks counter (T-179): the day name is computed by the DB —
+		// the render scenarios do not need the value, the transaction must
+		// pass the step (the upsert is always 1).
 		t.j.record("checks")
 		return pgconn.NewCommandTag("INSERT 0 1"), nil
 	case recordTempErrBumpSQL:
-		// Суточный числитель temp_error (T-182): выполняется только у
-		// temp_error-эпизодов — сценариям рендера значение не нужно,
-		// транзакция обязана пройти шаг.
+		// The daily temp_error numerator (T-182): runs only at
+		// temp_error episodes — the render scenarios do not need the value,
+		// the transaction must pass the step.
 		t.j.record("temp-err")
 		return pgconn.NewCommandTag("INSERT 0 1"), nil
 	case recordReanalyzeBumpSQL:
-		// Корзина неанализированных хвостов (T-204): имя часа вычисляет
-		// БД — сценариям рендера значение не нужно, транзакция обязана
-		// пройти шаг (upsert всегда 1).
+		// The unanalyzed tails bucket (T-204): the hour name is computed
+		// by the DB — the render scenarios do not need the value, the transaction must
+		// pass the step (the upsert is always 1).
 		t.j.record("reanalyze")
 		return pgconn.NewCommandTag("INSERT 0 1"), nil
 	case recordResultsBumpSQL:
-		// Часовая корзина темпа (T-203): имя часа вычисляет БД —
-		// сценариям рендера значение не нужно, транзакция обязана
-		// пройти шаг (upsert всегда 1).
+		// The hourly throughput bucket (T-203): the hour name is computed by the DB —
+		// the render scenarios do not need the value, the transaction must
+		// pass the step (the upsert is always 1).
 		t.j.record("results")
 		return pgconn.NewCommandTag("INSERT 0 1"), nil
 	case recordInsertSQL:
@@ -875,9 +875,9 @@ func (t *renderqRecTx) Exec(ctx context.Context, sql string, args ...any) (pgcon
 	}
 }
 
-// QueryRow — предчтение состояний строки домена (recordSelectStateSQL,
-// T-178): значения фейку не важны (сценарии долга статуса строки не
-// меняют), absent — ErrNoRows.
+// QueryRow — the domain row's states pre-read (recordSelectStateSQL,
+// T-178): the values do not matter to the fake (the debt scenarios do not
+// change the row's status), absent — ErrNoRows.
 func (t *renderqRecTx) QueryRow(_ context.Context, sql string, args ...any) pgx.Row {
 	t.pool.mu.Lock()
 	defer t.pool.mu.Unlock()
@@ -944,18 +944,18 @@ func (t *renderqRecTx) Rollback(context.Context) error {
 	return nil
 }
 
-// --- фикстуры -----------------------------------------------------------------
+// --- the fixtures -----------------------------------------------------------------
 
-// renderqSPABody — SPA-оболочка (T-057: мало видимого текста, корневой
-// контейнер, noscript с требованием JS).
+// renderqSPABody — an SPA shell (T-057: little visible text, a root
+// container, a noscript with a JS requirement).
 var renderqSPABody = []byte(`<html><head><title>x</title></head><body><div id="root"></div><noscript>please enable javascript</noscript></body></html>`)
 
-// renderqFlatBody — обычная страница: видимого текста много, признаков SPA нет.
+// renderqFlatBody — an ordinary page: much visible text, no SPA signs.
 var renderqFlatBody = []byte("<html><body><p>" + strings.Repeat("обычная страница с видимым текстом ", 30) + "</p></body></html>")
 
-// renderqResult — результат домена с тремя субдоменами: апекс — SPA
-// (публикация q:render), www — обычная страница (без публикации), api —
-// вердикта нет (nil). Возвращает хэши тел для фейка хранилища.
+// renderqResult — a domain result with three subdomains: the apex — SPA
+// (a q:render publication), www — an ordinary page (no publication), api —
+// no verdict (nil). Returns the bodies' hashes for the store fake.
 func renderqResult() (*DomainResult, content.Hash, content.Hash) {
 	hSPA := content.HashOf(renderqSPABody)
 	hFlat := content.HashOf(renderqFlatBody)
@@ -994,7 +994,7 @@ func renderqResult() (*DomainResult, content.Hash, content.Hash) {
 					SubdomainID: 2, Label: "api",
 					FinalURL: "https://api.spa.example/", Host: "api.spa.example", Path: "/",
 					HTTPStatus: 200,
-					// SPA nil — страница без вердикта (ошибка загрузки тела).
+					// SPA nil — a page without a verdict (a body load error).
 				}},
 			},
 		},
@@ -1002,7 +1002,7 @@ func renderqResult() (*DomainResult, content.Hash, content.Hash) {
 	return res, hSPA, hFlat
 }
 
-// renderqRecorder — записатель с очередью рендера над фейками.
+// renderqRecorder — the writer with a render queue over the fakes.
 func renderqRecorder(t *testing.T, pool *renderqRecPool, q *renderqQueue, ln *renderqLen) *Recorder {
 	t.Helper()
 	rq, err := NewRenderQueue(q, ln, 100, nil)
@@ -1016,11 +1016,11 @@ func renderqRecorder(t *testing.T, pool *renderqRecPool, q *renderqQueue, ln *re
 	return r
 }
 
-// --- чистая логика -------------------------------------------------------------
+// --- the pure logic -------------------------------------------------------------
 
-// TestRenderSPAResults — в q:render идут ключи только SPA-записей
-// (субдомен×вариант), включая алиас с собственным вердиктом; nil и
-// SPA=false не идут.
+// TestRenderSPAResults — only the SPA records' keys go into q:render
+// (subdomain×variant), including an alias with its own verdict; nil and
+// SPA=false do not.
 func TestRenderSPAResults(t *testing.T) {
 	spa := &httpfetch.SPAVerdict{SPA: true}
 	aliasSPA := &httpfetch.SPAVerdict{SPA: true}
@@ -1061,9 +1061,9 @@ func TestRenderSPAResults(t *testing.T) {
 	}
 }
 
-// TestRenderQueueHasCapacity — ёмкость: строго ниже порога (len ==
-// watermark — уже переполнение, ТЗ 4.2); watermark <= 0 отключает
-// проверку без обращения к Redis (семантика T-026).
+// TestRenderQueueHasCapacity — the capacity: strictly below the threshold (len ==
+// the watermark — already an overflow, spec 4.2); a watermark <= 0 disables
+// the check without a Redis call (the T-026 semantics).
 func TestRenderQueueHasCapacity(t *testing.T) {
 	q := &renderqQueue{}
 	cases := []struct {
@@ -1092,7 +1092,7 @@ func TestRenderQueueHasCapacity(t *testing.T) {
 		}
 	}
 
-	// Отключенный гейт — без XLEN.
+	// A disabled gate — without an XLEN.
 	ln := &renderqLen{}
 	rq, err := NewRenderQueue(q, ln, 0, nil)
 	if err != nil {
@@ -1106,7 +1106,7 @@ func TestRenderQueueHasCapacity(t *testing.T) {
 		t.Fatalf("watermark 0: обращений к XLEN %d, ожидалось 0", n)
 	}
 
-	// Ошибка XLEN — ошибка вызывающему (решение — за Recorder/проходом).
+	// An XLEN error — an error to the caller (the decision — at the Recorder/the pass).
 	lnErr := &renderqLen{err: errors.New("redis down")}
 	rq, err = NewRenderQueue(q, lnErr, 100, nil)
 	if err != nil {
@@ -1117,8 +1117,8 @@ func TestRenderQueueHasCapacity(t *testing.T) {
 	}
 }
 
-// TestRenderQueuePublish — публикация идёт в q:render без проверки
-// ёмкости; сбой возвращается вызывающему.
+// TestRenderQueuePublish — the publication goes into q:render without a
+// capacity check; a failure is returned to the caller.
 func TestRenderQueuePublish(t *testing.T) {
 	q := &renderqQueue{}
 	rq, err := NewRenderQueue(q, &renderqLen{}, 100, nil)
@@ -1158,8 +1158,8 @@ func TestRenderQueuePublish(t *testing.T) {
 	}
 }
 
-// TestNewRenderQueueValidation — nil-зависимости — ошибка (тихая потеря
-// публикаций незаметна для оператора).
+// TestNewRenderQueueValidation — nil dependencies — an error (a silent
+// publications loss is invisible to the operator).
 func TestNewRenderQueueValidation(t *testing.T) {
 	if _, err := NewRenderQueue(nil, &renderqLen{}, 100, nil); err == nil {
 		t.Fatal("очередь nil: ожидалась ошибка")
@@ -1169,11 +1169,11 @@ func TestNewRenderQueueValidation(t *testing.T) {
 	}
 }
 
-// --- Recorder + рендер-конвейер ----------------------------------------------
+// --- the Recorder + the render pipeline ----------------------------------------------
 
-// TestRecorderRenderPublishes — свободная очередь: q:render публикуется
-// по SPA-записям ПОСЛЕ фиксации транзакции; флаг не ставится; q:analyze —
-// по всем записям (контракт T-058 не меняется).
+// TestRecorderRenderPublishes — a free queue: q:render is published
+// over the SPA records AFTER the transaction's commit; the flag is not set; q:analyze —
+// over all the records (the T-058 contract unchanged).
 func TestRecorderRenderPublishes(t *testing.T) {
 	pool := newRenderqRecPool()
 	pool.seedDomain(5, 11, model.StatusNew, model.FlagIDN)
@@ -1205,7 +1205,7 @@ func TestRecorderRenderPublishes(t *testing.T) {
 		t.Fatalf("публикаций q:analyze=%d q:render=%d, ожидалось 3/1", analyze, render)
 	}
 
-	// Публикация q:render — после фиксации; флаг не ставится.
+	// The q:render publication — after the commit; the flag is not set.
 	if i := pool.j.indexOf("commit"); i < 0 || pool.j.indexOf("publish:"+queue.StreamRender) < i {
 		t.Fatalf("порядок нарушен: commit=%d publish:render=%d", pool.j.indexOf("commit"), pool.j.indexOf("publish:"+queue.StreamRender))
 	}
@@ -1217,15 +1217,15 @@ func TestRecorderRenderPublishes(t *testing.T) {
 	}
 }
 
-// TestRecorderRenderOverflowFlags — переполнение q:render: публикаций
-// q:render нет, флаг render_pending ставится ТОЙ ЖЕ транзакцией (между
-// UPDATE статуса и фиксацией), эпизод завершается успешно — XACK не
-// задерживается (§5.6); q:analyze публикуется как обычно.
+// TestRecorderRenderOverflowFlags — a q:render overflow: no
+// q:render publications, the render_pending flag is set by THE SAME transaction (between
+// the status UPDATE and the commit), the episode finishes successfully — the XACK is not
+// delayed (§5.6); q:analyze is published as usual.
 func TestRecorderRenderOverflowFlags(t *testing.T) {
 	pool := newRenderqRecPool()
 	pool.seedDomain(5, 11, model.StatusNew, model.FlagIDN)
 	q := &renderqQueue{j: pool.j}
-	ln := &renderqLen{seq: []int64{100}} // len == watermark — переполнение
+	ln := &renderqLen{seq: []int64{100}} // len == watermark — an overflow
 	res, _, _ := renderqResult()
 
 	ok, err := renderqRecorder(t, pool, q, ln).RecordAndPublish(context.Background(), res)
@@ -1240,9 +1240,9 @@ func TestRecorderRenderOverflowFlags(t *testing.T) {
 		t.Fatalf("публикаций q:analyze %d, ожидалось 3", c)
 	}
 
-	// Флаг — внутри транзакции: после UPDATE статуса, до фиксации.
-	// Сдвиг счётчика — последним оператором до Commit (T-175: окно
-	// блокировки строки счётчика минимально), +1 ровно на переход.
+	// The flag — inside the transaction: after the status UPDATE, before the commit.
+	// The counter's shift — the last operator before the Commit (T-175: the
+	// counter row's lock window is minimal), +1 exactly on the transition.
 	dom, set, commit := pool.j.indexOf("domains"), pool.j.indexOf("setflag"), pool.j.indexOf("commit")
 	if dom < 0 || set < dom || commit < set {
 		t.Fatalf("порядок нарушен: domains=%d setflag=%d commit=%d", dom, set, commit)
@@ -1261,8 +1261,8 @@ func TestRecorderRenderOverflowFlags(t *testing.T) {
 	}
 }
 
-// TestRecorderRenderLenError — недоступный XLEN трактуется как
-// переполнение: флаг спасает задачи рендера, эпизод не падает.
+// TestRecorderRenderLenError — an unavailable XLEN is treated as
+// an overflow: the flag saves the render tasks, the episode does not fall.
 func TestRecorderRenderLenError(t *testing.T) {
 	pool := newRenderqRecPool()
 	pool.seedDomain(5, 11, model.StatusNew, 0)
@@ -1285,11 +1285,11 @@ func TestRecorderRenderLenError(t *testing.T) {
 	}
 }
 
-// TestRecorderRenderNoSPA — без SPA-записей ёмкость не проверяется,
-// флаг не ставится и не стирается (черновой флаг снимет проход).
+// TestRecorderRenderNoSPA — without SPA records the capacity is not checked,
+// the flag is not set and not erased (the rework pass will clear the draft flag).
 func TestRecorderRenderNoSPA(t *testing.T) {
 	pool := newRenderqRecPool()
-	dom := pool.seedDomain(5, 11, model.StatusNew, model.FlagRenderPending) // черновой флаг
+	dom := pool.seedDomain(5, 11, model.StatusNew, model.FlagRenderPending) // a draft flag
 	q := &renderqQueue{j: pool.j}
 	ln := &renderqLen{}
 	res, _, _ := renderqResult()
@@ -1314,8 +1314,8 @@ func TestRecorderRenderNoSPA(t *testing.T) {
 	}
 }
 
-// TestRecorderWithoutRender — NewRecorder без очереди рендера (render
-// nil): поведение T-058 без изменений (обратная совместимость сборок).
+// TestRecorderWithoutRender — a NewRecorder without a render queue (render
+// nil): the T-058 behavior unchanged (the builds' backward compatibility).
 func TestRecorderWithoutRender(t *testing.T) {
 	pool := newRenderqRecPool()
 	pool.seedDomain(5, 11, model.StatusNew, 0)
@@ -1338,13 +1338,13 @@ func TestRecorderWithoutRender(t *testing.T) {
 	}
 }
 
-// TestRecorderRenderDeletedDomain — удалённому домену результат не
-// пишется (§8/§13.1): ни флага, ни публикаций.
+// TestRecorderRenderDeletedDomain — a deleted domain gets no
+// result written (§8/§13.1): neither the flag, nor publications.
 func TestRecorderRenderDeletedDomain(t *testing.T) {
 	pool := newRenderqRecPool()
 	pool.seedDomain(5, 11, model.StatusDeleted, 0)
 	q := &renderqQueue{j: pool.j}
-	ln := &renderqLen{seq: []int64{100}} // переполнение — флаг всё равно не ставится
+	ln := &renderqLen{seq: []int64{100}} // an overflow — the flag is not set anyway
 	res, _, _ := renderqResult()
 
 	ok, err := renderqRecorder(t, pool, q, ln).RecordAndPublish(context.Background(), res)
@@ -1356,8 +1356,8 @@ func TestRecorderRenderDeletedDomain(t *testing.T) {
 	}
 }
 
-// TestRecorderRenderSetFlagFailure — сбой оператора флага откатывает
-// транзакцию целиком: строк и флага нет, доставка вернётся.
+// TestRecorderRenderSetFlagFailure — a flag operator failure rolls back
+// the transaction entirely: no rows and no flag, the delivery will return.
 func TestRecorderRenderSetFlagFailure(t *testing.T) {
 	pool := newRenderqRecPool()
 	pool.seedDomain(5, 11, model.StatusNew, 0)
@@ -1382,15 +1382,15 @@ func TestRecorderRenderSetFlagFailure(t *testing.T) {
 	}
 }
 
-// TestRecorderRenderFlagAlreadySet — охрана бита в SET (T-175): повторная
-// доставка эпизода при уже стоящем флаге — RowsAffected 0 без ошибки
-// (семантика OR идемпотентна), счётчик долга не наращивается: только
-// реальные переходы 0→1.
+// TestRecorderRenderFlagAlreadySet — the bit guard in the SET (T-175): a repeated
+// episode delivery with the flag already set — RowsAffected 0 without an error
+// (the OR semantics is idempotent), the debt counter is not incremented: only
+// the real 0→1 transitions.
 func TestRecorderRenderFlagAlreadySet(t *testing.T) {
 	pool := newRenderqRecPool()
-	pool.seedDomain(5, 11, model.StatusNew, model.FlagRenderPending) // бит уже стоит
+	pool.seedDomain(5, 11, model.StatusNew, model.FlagRenderPending) // the bit is already set
 	q := &renderqQueue{j: pool.j}
-	ln := &renderqLen{seq: []int64{100}} // переполнение — флаг ставится снова
+	ln := &renderqLen{seq: []int64{100}} // an overflow — the flag is set again
 	res, _, _ := renderqResult()
 
 	ok, err := renderqRecorder(t, pool, q, ln).RecordAndPublish(context.Background(), res)
@@ -1408,9 +1408,9 @@ func TestRecorderRenderFlagAlreadySet(t *testing.T) {
 	}
 }
 
-// TestRecorderRenderCounterAtomic — счётчик долга в ТОЙ ЖЕ транзакции,
-// что и флаг (T-175, §3.4): сбой сдвига счётчика откатывает транзакцию
-// целиком — ни строк, ни флага, ни счётчика.
+// TestRecorderRenderCounterAtomic — the debt counter in THE SAME transaction
+// as the flag (T-175, §3.4): a counter shift failure rolls back the transaction
+// entirely — no rows, no flag, no counter.
 func TestRecorderRenderCounterAtomic(t *testing.T) {
 	pool := newRenderqRecPool()
 	pool.seedDomain(5, 11, model.StatusNew, 0)
@@ -1438,10 +1438,10 @@ func TestRecorderRenderCounterAtomic(t *testing.T) {
 	}
 }
 
-// TestRecorderRenderCounterMissingRow — строки 'render_pending' в
-// crawler_counters нет (возможна только ручная правка, runbooks §6):
-// ошибка откатывает транзакцию — молчаливый рассинхрон счётчика долга
-// недопустим, gauge не должен лгать.
+// TestRecorderRenderCounterMissingRow — there is no 'render_pending' row in
+// crawler_counters (possible only by a manual edit, runbooks §6):
+// the error rolls back the transaction — a silent debt counter
+// desync is unacceptable, the gauge must not lie.
 func TestRecorderRenderCounterMissingRow(t *testing.T) {
 	pool := newRenderqRecPool()
 	pool.seedDomain(5, 11, model.StatusNew, 0)
@@ -1462,9 +1462,9 @@ func TestRecorderRenderCounterMissingRow(t *testing.T) {
 	}
 }
 
-// TestRecorderRenderPublishFailure — сбой публикации q:render (после
-// фиксации): ошибка возвращает доставку — повторный эпизод переиграет
-// решение (ёмкость проверится заново), дубликаты ограничены попытками.
+// TestRecorderRenderPublishFailure — a q:render publication failure (after
+// the commit): the error returns the delivery — a repeated episode will replay
+// the decision (the capacity will be checked anew), the duplicates are bounded by the attempts.
 func TestRecorderRenderPublishFailure(t *testing.T) {
 	pool := newRenderqRecPool()
 	pool.seedDomain(5, 11, model.StatusNew, 0)
@@ -1484,9 +1484,9 @@ func TestRecorderRenderPublishFailure(t *testing.T) {
 	}
 }
 
-// --- проход доработки ---------------------------------------------------------
+// --- the rework pass ---------------------------------------------------------
 
-// renderqPassKit — набор фейков прохода: пул, контент, очередь рендера.
+// renderqPassKit — the pass's fakes set: the pool, the content, the render queue.
 func renderqPassKit(t *testing.T, lens ...int64) (*renderqPool, *renderqContent, *renderqQueue, *renderqLen, *RenderQueue) {
 	t.Helper()
 	pool := newRenderqPool()
@@ -1506,10 +1506,10 @@ func renderqPassKit(t *testing.T, lens ...int64) (*renderqPool, *renderqContent,
 	return pool, body, q, ln, rq
 }
 
-// TestRequeueOncePublishes — проход дорабатывает: SPA-контент → ключ
-// записи; алиас наследует вердикт оригинала; обычная страница и записи
-// без контента не переиздаются; отрендеренные исключаются; флаг снят
-// после публикации; is_idn сохраняется.
+// TestRequeueOncePublishes — the pass reworks: an SPA content → the
+// record's key; an alias inherits the original's verdict; an ordinary page and the
+// records without content are not re-published; the rendered ones are excluded; the flag is
+// cleared after the publication; is_idn is preserved.
 func TestRequeueOncePublishes(t *testing.T) {
 	hSPA := content.HashOf(renderqSPABody)
 	hFlat := content.HashOf(renderqFlatBody)
@@ -1522,10 +1522,10 @@ func TestRequeueOncePublishes(t *testing.T) {
 	pool.seedRow(5, 11, 0, model.VariantMain, hSPA[:], nil, false, "https://spa.example/")
 	pool.seedRow(5, 11, 1, model.VariantMain, nil, &aliasTo, false, "https://spa.example/")
 	pool.seedRow(5, 11, 2, model.VariantMain, hFlat[:], nil, false, "https://spa.example/")
-	pool.seedRow(5, 11, 3, model.VariantMain, nil, nil, false, "https://spa.example/") // контент не сохранён
+	pool.seedRow(5, 11, 3, model.VariantMain, nil, nil, false, "https://spa.example/") // the content is not stored
 	pool.seedRow(5, 11, 4, model.VariantMain, hSPA[:], nil, true, "https://spa.example/")
-	// Отмаркированная SPA-запись (T-210 — финализация без рендера):
-	// выборкой прохода не берётся, не переиздаётся (как rendered/flat).
+	// A marked SPA record (T-210 — a finalization without a render):
+	// not taken by the pass's selection, not re-published (like rendered/flat).
 	pool.seedRow(5, 11, 5, model.VariantMain, hSPA[:], nil, false, "https://spa.example/")
 	pool.rows[renderqDomKey{zone: 5, id: 11}][5].marked = true
 
@@ -1563,8 +1563,8 @@ func TestRequeueOncePublishes(t *testing.T) {
 	}
 }
 
-// TestRequeueOnceFullAtStart — полная очередь: проход не читает БД
-// (одно XLEN), флаги не трогает.
+// TestRequeueOnceFullAtStart — a full queue: the pass does not read the DB
+// (one XLEN), does not touch the flags.
 func TestRequeueOnceFullAtStart(t *testing.T) {
 	pool, body, q, ln, rq := renderqPassKit(t, 100) // len == watermark
 	pool.seedDomain(5, 11, "spa", model.FlagRenderPending, model.StatusAlive)
@@ -1587,11 +1587,11 @@ func TestRequeueOnceFullAtStart(t *testing.T) {
 	}
 }
 
-// TestRequeueOnceFullMidPass — очередь заполнилась между доменами:
-// обработанные доработаны, оставшиеся сохранили флаг.
+// TestRequeueOnceFullMidPass — the queue filled between the domains:
+// the processed ones are reworked, the rest kept the flag.
 func TestRequeueOnceFullMidPass(t *testing.T) {
 	hSPA := content.HashOf(renderqSPABody)
-	pool, body, q, _, rq := renderqPassKit(t, 0, 0, 100) // старт свободен, после первого домена — полна
+	pool, body, q, _, rq := renderqPassKit(t, 0, 0, 100) // the start is free, after the first domain — full
 	body.bodies[hSPA] = renderqSPABody
 	pool.seedDomain(5, 11, "spa", model.FlagRenderPending, model.StatusAlive)
 	pool.seedRow(5, 11, 0, model.VariantMain, hSPA[:], nil, false, "https://spa.example/")
@@ -1613,8 +1613,8 @@ func TestRequeueOnceFullMidPass(t *testing.T) {
 	}
 }
 
-// TestRequeueOnceNoSPA — SPA-записей не нашлось: публикаций нет, флаг
-// снят (черновой флаг).
+// TestRequeueOnceNoSPA — no SPA records found: no publications, the flag
+// cleared (a draft flag).
 func TestRequeueOnceNoSPA(t *testing.T) {
 	hFlat := content.HashOf(renderqFlatBody)
 	pool, body, q, _, rq := renderqPassKit(t, 0)
@@ -1634,18 +1634,18 @@ func TestRequeueOnceNoSPA(t *testing.T) {
 	}
 }
 
-// TestRequeueOnceRenderFailedMarker — маркер «рендер невозможен» (T-210):
-// отмаркированная финализацией SPA-запись выборкой прохода не берётся —
-// повторный эпизод битого хоста не переиздаёт её (публикаций нет, флаг
-// снят без публикации, как у чернового); повторный проход после нового
-// эпизода (перезапись строки сбросила маркер) переиздаёт запись снова.
+// TestRequeueOnceRenderFailedMarker — the "render impossible" marker (T-210):
+// a SPA record marked by a finalization is not taken by the pass's selection —
+// a repeated episode of the broken host does not re-publish it (no publications, the
+// flag cleared without a publication, like a draft's); a repeated pass after a new
+// episode (the row's rewrite reset the marker) re-publishes the record again.
 func TestRequeueOnceRenderFailedMarker(t *testing.T) {
 	hSPA := content.HashOf(renderqSPABody)
 	pool, body, q, _, rq := renderqPassKit(t, 0)
 	body.bodies[hSPA] = renderqSPABody
 	pool.seedDomain(5, 11, "spa", model.FlagRenderPending, model.StatusAlive)
 	pool.seedRow(5, 11, 0, model.VariantMain, hSPA[:], nil, false, "https://spa.example/")
-	pool.rows[renderqDomKey{zone: 5, id: 11}][0].marked = true // финализация T-148/T-159/T-172
+	pool.rows[renderqDomKey{zone: 5, id: 11}][0].marked = true // a T-148/T-159/T-172 finalization
 
 	res, err := RequeueOnce(context.Background(), pool, body, rq, RequeueOptions{})
 	if err != nil {
@@ -1658,9 +1658,9 @@ func TestRequeueOnceRenderFailedMarker(t *testing.T) {
 		t.Fatal("публикаций по отмаркированной записи быть не должно (T-210)")
 	}
 
-	// Новый эпизод: перезапись строки (DELETE + INSERT, T-058) сбросила
-	// маркер, запись результата нового эпизода снова поставила флаг
-	// переполнения (пара бит+счётчик — как seedDomain, без дубля в order).
+	// A new episode: the row's rewrite (DELETE + INSERT, T-058) reset
+	// the marker, the new episode's result write set the overflow
+	// flag again (the bit+counter pair — like seedDomain, without a duplicate in order).
 	pool.domains[renderqDomKey{zone: 5, id: 11}].flags.Set(model.FlagRenderPending)
 	pool.counters["render_pending"] = 1
 	pool.rows[renderqDomKey{zone: 5, id: 11}][0].marked = false
@@ -1674,10 +1674,10 @@ func TestRequeueOnceRenderFailedMarker(t *testing.T) {
 	}
 }
 
-// TestRequeueOnceContentError — недоступный блок: запись пропускается
-// (Warn), проход продолжается без ошибки, но флаг домена СОХРАНЯЕТСЯ:
-// транзиентный сбой чтения не должен терять SPA-задачу до перепроверки
-// T-030 — следующий тик прохода повторит домен.
+// TestRequeueOnceContentError — an unavailable block: the record is skipped
+// (a Warn), the pass continues without an error, but the domain's flag is PRESERVED:
+// a transient read failure must not lose the SPA task before the
+// T-030 recheck — the pass's next tick will repeat the domain.
 func TestRequeueOnceContentError(t *testing.T) {
 	hSPA := content.HashOf(renderqSPABody)
 	pool, body, _, _, rq := renderqPassKit(t, 0)
@@ -1697,9 +1697,9 @@ func TestRequeueOnceContentError(t *testing.T) {
 	}
 }
 
-// TestRequeueOnceContentErrorPartial — сбой чтения одной записи не мешает
-// остальным: читаемая SPA-запись публикуется, но флаг домена держится,
-// пока не прочитаны все (следующий проход доберёт нечитаемую).
+// TestRequeueOnceContentErrorPartial — one record's read failure does not hinder
+// the others: a readable SPA record is published, but the domain's flag is held,
+// until all are read (the next pass will pick up the unreadable one).
 func TestRequeueOnceContentErrorPartial(t *testing.T) {
 	hSPA := content.HashOf(renderqSPABody)
 	hDead := content.HashOf([]byte("блок, который не читается"))
@@ -1722,12 +1722,12 @@ func TestRequeueOnceContentErrorPartial(t *testing.T) {
 	}
 }
 
-// TestRequeueOnceSelection — выборка: только домены с флагом, удалённые
-// исключены (§13.1), LIMIT пачки; пустой набор — пустой итог.
+// TestRequeueOnceSelection — the selection: only the domains with the flag, the deleted
+// excluded (§13.1), the chunk's LIMIT; an empty set — an empty outcome.
 func TestRequeueOnceSelection(t *testing.T) {
 	pool, body, _, ln, rq := renderqPassKit(t, 0)
-	pool.seedDomain(5, 11, "spa", model.FlagRenderPending, model.StatusDeleted) // вне цикла
-	pool.seedDomain(5, 12, "live", 0, model.StatusAlive)                        // без флага
+	pool.seedDomain(5, 11, "spa", model.FlagRenderPending, model.StatusDeleted) // outside the cycle
+	pool.seedDomain(5, 12, "live", 0, model.StatusAlive)                        // without the flag
 
 	res, err := RequeueOnce(context.Background(), pool, body, rq, RequeueOptions{})
 	if err != nil {
@@ -1741,10 +1741,10 @@ func TestRequeueOnceSelection(t *testing.T) {
 	}
 }
 
-// TestRequeueOnceBatchLimit — LIMIT пачки без ORDER BY (T-181): выборка
-// берёт первые limit строк «физического» порядка, остальные домены
-// сохраняют флаг до следующего прохода (детерминизм пачек не нужен —
-// снятие флага исключает повторы).
+// TestRequeueOnceBatchLimit — the chunk's LIMIT without an ORDER BY (T-181): the selection
+// takes the first limit rows of the "physical" order, the other domains
+// keep the flag until the next pass (the chunks' determinism is not needed —
+// the flag clear excludes repeats).
 func TestRequeueOnceBatchLimit(t *testing.T) {
 	pool, body, _, _, rq := renderqPassKit(t, 0)
 	pool.seedDomain(5, 11, "one", model.FlagRenderPending, model.StatusAlive)
@@ -1758,8 +1758,8 @@ func TestRequeueOnceBatchLimit(t *testing.T) {
 	if res.Selected != 2 || res.Full {
 		t.Fatalf("итог %+v, ожидался selected=2 (LIMIT) full=false", res)
 	}
-	// Первые два по порядку вставки сняты (черновой флаг — без SPA-записей),
-	// третий ждёт следующего прохода.
+	// The first two in the insertion order are cleared (draft flags — without SPA records),
+	// the third waits for the next pass.
 	for _, id := range []int64{11, 12} {
 		if pool.domains[renderqDomKey{zone: 5, id: id}].flags.Test(model.FlagRenderPending) {
 			t.Fatalf("домен %d не снят первым проходом", id)
@@ -1770,11 +1770,11 @@ func TestRequeueOnceBatchLimit(t *testing.T) {
 	}
 }
 
-// TestRequeueOnceSelectPlan — закрепление формы плана выборки (T-181):
-// пачка читается в явной транзакции строго последовательностью
-// SET LOCAL ×3 → SELECT → COMMIT (реплика диаграммы §2 ТЗ: без
-// закрепления планировщик берёт index scan по PK — запрос №2 журнала
-// медленных 24.10); выборка идёт через транзакцию, не пул.
+// TestRequeueOnceSelectPlan — the selection plan shape's pinning (T-181):
+// the chunk is read in an explicit transaction strictly by the
+// SET LOCAL ×3 → SELECT → COMMIT sequence (a replica of spec §2's diagram: without
+// the pinning the planner takes a PK index scan — query #2 of the Oct 24
+// slow-query log); the selection goes via a transaction, not the pool.
 func TestRequeueOnceSelectPlan(t *testing.T) {
 	pool, body, _, _, rq := renderqPassKit(t, 0)
 	pool.seedDomain(5, 11, "spa", model.FlagRenderPending, model.StatusAlive)
@@ -1795,11 +1795,11 @@ func TestRequeueOnceSelectPlan(t *testing.T) {
 	}
 }
 
-// TestRequeueRenderPendingDrainNoProgress — стартовый дренаж не крутится
-// вхолостую по пачке без прогресса (T-181): контент не читается (keep),
-// флаги стоят — очередная выборка вернула бы те же домены; без остановки
-// цикл молотил бы БД без темпителя (дорогая выборка журнала медленных
-// больше не замедляет его сама).
+// TestRequeueRenderPendingDrainNoProgress — the initial drainage does not spin
+// idle over a chunk without progress (T-181): the content is not read (keep),
+// the flags are set — the next selection would return the same domains; without a stop
+// the loop would hammer the DB without a pacer (the slow-query log's
+// expensive selection no longer slows it down itself).
 func TestRequeueRenderPendingDrainNoProgress(t *testing.T) {
 	hSPA := content.HashOf(renderqSPABody)
 	pool := newRenderqPool()
@@ -1824,7 +1824,7 @@ func TestRequeueRenderPendingDrainNoProgress(t *testing.T) {
 			RequeueOptions{Interval: time.Hour, BatchSize: 1})
 	}()
 
-	// Ждём выборки стартового прохода.
+	// We wait for the initial pass's selection.
 	deadline := time.After(3 * time.Second)
 	for pool.j.count("select") == 0 {
 		select {
@@ -1834,8 +1834,8 @@ func TestRequeueRenderPendingDrainNoProgress(t *testing.T) {
 		case <-time.After(time.Millisecond):
 		}
 	}
-	// Пачка полная (BatchSize = 1), флаг не снят (контент не читается):
-	// дренаж обязан остановиться — следующий тик не раньше Interval.
+	// The chunk is full (BatchSize = 1), the flag is not cleared (the content is not read):
+	// the drainage must stop — the next tick no earlier than the Interval.
 	time.Sleep(50 * time.Millisecond)
 	if c := pool.j.count("select"); c != 1 {
 		t.Fatalf("выборок %d за стартовый проход, ожидалась 1 (пачка без прогресса — ждать тика)", c)
@@ -1854,17 +1854,17 @@ func TestRequeueRenderPendingDrainNoProgress(t *testing.T) {
 	}
 }
 
-// TestRequeueOnceGuardZeroDebt — guard счётчиком долга (T-181): при
-// нулевом счётчике тяжёлая выборка не выполняется вовсе — даже если
-// флаги живы (рассинхрон ручного SQL: дренаж стоит до пересчёта,
-// runbooks §6; честный стационар — то же поведение без чтения domains).
+// TestRequeueOnceGuardZeroDebt — the debt counter guard (T-181): at a
+// zero counter the heavy selection does not run at all — even if the
+// flags are alive (a manual SQL desync: the drainage stands until the recount,
+// runbooks §6; an honest steady state — the same behavior without reading domains).
 func TestRequeueOnceGuardZeroDebt(t *testing.T) {
 	hSPA := content.HashOf(renderqSPABody)
 	pool, body, q, ln, rq := renderqPassKit(t, 0)
 	body.bodies[hSPA] = renderqSPABody
 	pool.seedDomain(5, 11, "spa", model.FlagRenderPending, model.StatusAlive)
 	pool.seedRow(5, 11, 0, model.VariantMain, hSPA[:], nil, false, "https://spa.example/")
-	pool.counters["render_pending"] = 0 // ручной рассинхрон: флаг жив, счётчик нулевой
+	pool.counters["render_pending"] = 0 // a manual desync: the flag is alive, the counter is zero
 
 	res, err := RequeueOnce(context.Background(), pool, body, rq, RequeueOptions{})
 	if err != nil {
@@ -1889,9 +1889,9 @@ func TestRequeueOnceGuardZeroDebt(t *testing.T) {
 		t.Fatalf("обращений к XLEN %d, ожидалось 1 (guard — после проверки ёмкости)", n)
 	}
 
-	// Отрицательный счётчик (невозможен кодом — только ручная правка):
-	// тот же ранний возврат «долга нет» — тихий баг счётчика не должен
-	// запускать дренаж по отрицательному долгу.
+	// A negative counter (impossible by code — only a manual edit):
+	// the same early "no debt" return — a quiet counter bug must not
+	// launch a drainage over a negative debt.
 	pool.counters["render_pending"] = -1
 	res, err = RequeueOnce(context.Background(), pool, body, rq, RequeueOptions{})
 	if err != nil {
@@ -1905,9 +1905,9 @@ func TestRequeueOnceGuardZeroDebt(t *testing.T) {
 	}
 }
 
-// TestRequeueOnceGuardCounter — guard-чтение счётчика: строка есть —
-// точечный Lookup по имени; долг есть — выборка выполняется (счётчик
-// согласован с числом флагов: инвариант бэкфилла миграции 000015).
+// TestRequeueOnceGuardCounter — the counter's guard read: the row is there —
+// a point lookup by name; there is debt — the selection runs (the counter
+// is consistent with the flags count: the migration 000015 backfill's invariant).
 func TestRequeueOnceGuardCounter(t *testing.T) {
 	pool, body, _, _, rq := renderqPassKit(t, 0)
 	pool.seedDomain(5, 11, "spa", model.FlagRenderPending, model.StatusAlive)
@@ -1916,8 +1916,8 @@ func TestRequeueOnceGuardCounter(t *testing.T) {
 		t.Fatalf("сид счётчика = %d, ожидался 2", got)
 	}
 
-	// Два прохода: первый снимает оба флага (черновые — без SPA-записей),
-	// счётчик к нулю; второй — guard: тяжёлой выборки нет.
+	// Two passes: the first clears both flags (drafts — without SPA records),
+	// the counter to zero; the second — the guard: no heavy selection.
 	for i := 1; i <= 2; i++ {
 		res, err := RequeueOnce(context.Background(), pool, body, rq, RequeueOptions{})
 		if err != nil {
@@ -1939,15 +1939,15 @@ func TestRequeueOnceGuardCounter(t *testing.T) {
 	}
 }
 
-// TestRequeueOnceZonePriority — приоритет зон (T-184, решение (а) T-176):
-// домены зон НЕ из списка публикуются вперёд доменов зон списка, даже
-// когда те лежат раньше в «куче» (прод-раскладка: флаговый долг .рф —
-// физически в начале кучи); записи не теряются — долг зон списка
-// дорабатывается следующими проходами, последним.
+// TestRequeueOnceZonePriority — the zones' priority (T-184, the decision (a) of T-176):
+// the NOT-from-the-list zones' domains are published ahead of the list's zones' domains, even
+// when the latter lie earlier in the "heap" (the production layout: the .rf flag
+// debt is physically at the heap's start); no records are lost — the
+// list's zones' debt is reworked by the following passes, last.
 func TestRequeueOnceZonePriority(t *testing.T) {
 	hSPA := content.HashOf(renderqSPABody)
 	pool, body, q, _, rq := renderqPassKit(t, 0)
-	pool.zones[6] = "xn--p1ai" // деприоритизированная зона (прод — .рф)
+	pool.zones[6] = "xn--p1ai" // a deprioritized zone (production — .rf)
 	body.bodies[hSPA] = renderqSPABody
 	pool.seedDomain(6, 21, "rf1", model.FlagRenderPending, model.StatusAlive)
 	pool.seedRow(6, 21, 0, model.VariantMain, hSPA[:], nil, false, "https://rf1.xn--p1ai/")
@@ -1957,8 +1957,8 @@ func TestRequeueOnceZonePriority(t *testing.T) {
 	pool.seedRow(5, 11, 0, model.VariantMain, hSPA[:], nil, false, "https://prio.example/")
 
 	opts := RequeueOptions{BatchSize: 1, DeprioritizedZones: []string{"xn--p1ai"}}
-	// Проход 1: первая ступень берёт приоритетную зону, минуя .рф в
-	// начале «кучи».
+	// Pass 1: the first stage takes the priority zone, skipping the .rf at
+	// the "heap's" start.
 	res, err := RequeueOnce(context.Background(), pool, body, rq, opts)
 	if err != nil {
 		t.Fatalf("RequeueOnce: %v", err)
@@ -1973,9 +1973,9 @@ func TestRequeueOnceZonePriority(t *testing.T) {
 		t.Fatal("домен .рф доработан раньше приоритетного — приоритет не работает")
 	}
 
-	// Проходы 2–3: первая ступень исчерпана — вторая дорабатывает .рф
-	// (разовый RequeueOnce памяти ступеней не держит — первая ступень
-	// выполняется каждый проход, это цена разовости; цикл помнит).
+	// Passes 2–3: the first stage is exhausted — the second reworks the .rf
+	// (a one-shot RequeueOnce keeps no stages' memory — the first stage
+	// runs every pass, that is the price of one-shotness; the loop remembers).
 	for i, want := range []int64{21, 22} {
 		res, err := RequeueOnce(context.Background(), pool, body, rq, opts)
 		if err != nil {
@@ -1993,10 +1993,10 @@ func TestRequeueOnceZonePriority(t *testing.T) {
 	}
 }
 
-// TestRequeueOnceZoneBatchFill — неполная первая ступень добирается
-// второй до полной пачки (T-184): исчерпание доказано (LIMIT не
-// сработал — скан дошёл до конца таблицы), приоритетные домены идут в
-// начале пачки (порядок публикаций), очередь долга не теряет записей.
+// TestRequeueOnceZoneBatchFill — an incomplete first stage is topped up
+// by the second to a full chunk (T-184): the exhaustion is proven (the LIMIT did
+// not fire — the scan reached the table's end), the priority domains go at
+// the chunk's start (the publications' order), the debt queue loses no records.
 func TestRequeueOnceZoneBatchFill(t *testing.T) {
 	hSPA := content.HashOf(renderqSPABody)
 	pool, body, q, _, rq := renderqPassKit(t, 0)
@@ -2017,7 +2017,7 @@ func TestRequeueOnceZoneBatchFill(t *testing.T) {
 	if res.Selected != 3 || res.Deprioritized != 2 || res.Cleared != 3 || res.Published != 3 || res.Full {
 		t.Fatalf("итог %+v, ожидался selected=3 deprioritized=2 cleared=3 published=3 full=false", res)
 	}
-	// Порядок публикаций: приоритетная зона вперёд, дальше — зоны списка.
+	// The publications' order: the priority zone first, then — the list's zones.
 	pub := q.snapshot()
 	if len(pub) != 3 {
 		t.Fatalf("публикаций %d, ожидалось 3", len(pub))
@@ -2031,9 +2031,9 @@ func TestRequeueOnceZoneBatchFill(t *testing.T) {
 	}
 }
 
-// TestRequeueOnceZoneListEmpty — пустой список зон (умолчание):
-// единственная ступень без фильтра — базовая выборка T-181, ступенчатые
-// SQL не выполняются вовсе.
+// TestRequeueOnceZoneListEmpty — an empty zones list (the default):
+// the only stage without a filter — the T-181 base selection, the staged
+// SQL does not run at all.
 func TestRequeueOnceZoneListEmpty(t *testing.T) {
 	hSPA := content.HashOf(renderqSPABody)
 	pool, body, _, _, rq := renderqPassKit(t, 0)
@@ -2054,11 +2054,11 @@ func TestRequeueOnceZoneListEmpty(t *testing.T) {
 	}
 }
 
-// TestRequeueZoneStageMemory — память исчерпания первой ступени (T-184):
-// после доказательства (пустая/неполная пачка — seq scan дошёл до конца
-// таблицы) порожний полный проход первой ступени не повторяется, пока
-// счётчик долга сходится с ожиданием цикла; новая постановка бита (+1,
-// T-175) возобновляет первую ступень.
+// TestRequeueZoneStageMemory — the first stage's exhaustion memory (T-184):
+// after the proof (an empty/incomplete chunk — the seq scan reached the table's
+// end) the first stage's idle full pass is not repeated while
+// the debt counter matches the loop's expectation; a new bit setting (+1,
+// T-175) resumes the first stage.
 func TestRequeueZoneStageMemory(t *testing.T) {
 	hSPA := content.HashOf(renderqSPABody)
 	pool, body, q, _, rq := renderqPassKit(t, 0)
@@ -2073,8 +2073,8 @@ func TestRequeueZoneStageMemory(t *testing.T) {
 	stage := &renderStage{}
 	opts := RequeueOptions{BatchSize: 1, DeprioritizedZones: []string{"xn--p1ai"}, Log: slog.New(slog.DiscardHandler)}.withDefaults()
 
-	// Проход 1: первая ступень пуста (доказательство исчерпания при
-	// долге 2), вторая берёт первый домен .рф.
+	// Pass 1: the first stage is empty (the exhaustion proof at
+	// a debt of 2), the second takes the first .rf domain.
 	res, err := requeuePass(ctx, pool, body, rq, opts, stage)
 	if err != nil {
 		t.Fatalf("проход 1: %v", err)
@@ -2086,8 +2086,8 @@ func TestRequeueZoneStageMemory(t *testing.T) {
 		t.Fatalf("проход 1: выборок st1=%d st2=%d, ожидалось 1/1", pool.stage1Select, pool.stage2Select)
 	}
 
-	// Проход 2: долг 1 == ожидание (2 − своё снятие) — первая ступень
-	// пропущена, вторая дорабатывает .рф.
+	// Pass 2: the debt 1 == the expectation (2 − its own withdrawal) — the first stage
+	// is skipped, the second reworks the .rf.
 	res, err = requeuePass(ctx, pool, body, rq, opts, stage)
 	if err != nil {
 		t.Fatalf("проход 2: %v", err)
@@ -2100,7 +2100,7 @@ func TestRequeueZoneStageMemory(t *testing.T) {
 			pool.stage1Select, pool.stage2Select)
 	}
 
-	// Проход 3: долг 0 — guard, тяжёлых выборок нет вовсе.
+	// Pass 3: the debt 0 — the guard, no heavy selections at all.
 	res, err = requeuePass(ctx, pool, body, rq, opts, stage)
 	if err != nil {
 		t.Fatalf("проход 3: %v", err)
@@ -2112,8 +2112,8 @@ func TestRequeueZoneStageMemory(t *testing.T) {
 		t.Fatalf("проход 3: выборки при нулевом долге (st1=%d st2=%d)", pool.stage1Select, pool.stage2Select)
 	}
 
-	// Новая постановка бита в приоритетной зоне: счётчик 0 → 1 —
-	// расхождение с ожиданием возобновляет первую ступень.
+	// A new bit setting in the priority zone: the counter 0 → 1 —
+	// the divergence from the expectation resumes the first stage.
 	pool.seedDomain(5, 11, "prio", model.FlagRenderPending, model.StatusAlive)
 	pool.seedRow(5, 11, 0, model.VariantMain, hSPA[:], nil, false, "https://prio.example/")
 	res, err = requeuePass(ctx, pool, body, rq, opts, stage)
@@ -2131,9 +2131,9 @@ func TestRequeueZoneStageMemory(t *testing.T) {
 	}
 }
 
-// TestRequeueZoneStageFullBatchInvalidates — полная пачка первой ступени
-// лишает память доказательства (за LIMIT'ом могут оставаться домены):
-// следующий проход первую ступень выполняет (T-184).
+// TestRequeueZoneStageFullBatchInvalidates — a full first-stage chunk
+// strips the memory of the proof (domains may remain beyond the LIMIT):
+// the next pass runs the first stage (T-184).
 func TestRequeueZoneStageFullBatchInvalidates(t *testing.T) {
 	hSPA := content.HashOf(renderqSPABody)
 	pool, body, _, _, rq := renderqPassKit(t, 0)
@@ -2144,8 +2144,8 @@ func TestRequeueZoneStageFullBatchInvalidates(t *testing.T) {
 
 	ctx := context.Background()
 	stage := &renderStage{}
-	// «Чужое» доказательство исчерпания (как будто было раньше) — полная
-	// пачка обязана его сбросить.
+	// A "foreign" exhaustion proof (as if it was there before) — a full
+	// chunk must reset it.
 	stage.known, stage.proofDebt = true, 100
 	opts := RequeueOptions{BatchSize: 1, DeprioritizedZones: []string{"xn--p1ai"}, Log: slog.New(slog.DiscardHandler)}.withDefaults()
 
@@ -2164,12 +2164,12 @@ func TestRequeueZoneStageFullBatchInvalidates(t *testing.T) {
 	}
 }
 
-// TestRequeueZoneStageKeepInvalidates — неснятый домен первой ступени
-// снимает доказательство исчерпания (ревью T-184, P1): keep при
-// нечитаемом контенте оставляет флаг живым, счётчик и ожидание не
-// расходятся — без снятия доказательства первая ступень пропускалась бы
-// вечно, а вторая (зоны списка) приоритетный домен не видит: долг
-// застревал бы с Warn «биты-сироты» и полным seq scan каждый тик.
+// TestRequeueZoneStageKeepInvalidates — an uncleared first-stage domain
+// removes the exhaustion proof (the T-184 review, P1): a keep at
+// unreadable content leaves the flag alive, the counter and the expectation do
+// not diverge — without removing the proof the first stage would be skipped
+// forever, and the second (the list's zones) does not see the priority domain: the debt
+// would stick with a Warn "orphan bits" and a full seq scan every tick.
 func TestRequeueZoneStageKeepInvalidates(t *testing.T) {
 	hSPA := content.HashOf(renderqSPABody)
 	hDead := content.HashOf([]byte("приоритетный блок, который не читается"))
@@ -2181,15 +2181,15 @@ func TestRequeueZoneStageKeepInvalidates(t *testing.T) {
 	pool.seedRow(6, 21, 0, model.VariantMain, hSPA[:], nil, false, "https://rf.xn--p1ai/")
 	body.bodies[hSPA] = renderqSPABody
 	body.bodies[hDead] = renderqSPABody
-	// Контент приоритетного домена не читается — keep (транзиентный сбой).
+	// The priority domain's content is not read — a keep (a transient failure).
 	body.errOn[hDead] = errors.New("pack: блок не читается")
 
 	ctx := context.Background()
 	stage := &renderStage{}
 	opts := RequeueOptions{BatchSize: 2, DeprioritizedZones: []string{"xn--p1ai"}, Log: slog.New(slog.DiscardHandler)}.withDefaults()
 
-	// Проход 1: обе ступени дали по домену, приоритетный не снят (keep)
-	// — доказательство обязано быть снято, .рф доработан.
+	// Pass 1: both stages gave a domain each, the priority one not cleared (a keep)
+	// — the proof must be removed, the .rf reworked.
 	res, err := requeuePass(ctx, pool, body, rq, opts, stage)
 	if err != nil {
 		t.Fatalf("проход 1: %v", err)
@@ -2204,8 +2204,8 @@ func TestRequeueZoneStageKeepInvalidates(t *testing.T) {
 		t.Fatal("флаг приоритетного домена снят при нечитаемом контенте")
 	}
 
-	// Проход 2: контент читается (сбой транзиентный) — первая ступень
-	// выполняется снова и дорабатывает застрявший домен.
+	// Pass 2: the content is read (the failure was transient) — the first stage
+	// runs again and reworks the stuck domain.
 	delete(body.errOn, hDead)
 	res, err = requeuePass(ctx, pool, body, rq, opts, stage)
 	if err != nil {
@@ -2222,18 +2222,18 @@ func TestRequeueZoneStageKeepInvalidates(t *testing.T) {
 	}
 }
 
-// TestRequeueZoneStageFullMidBatchInvalidates — ранний выход по ёмкости
-// (Full) с непроработанными доменами первой ступени снимает доказательство
-// (ревью T-184, P1): счётчик и ожидание не расходятся (нет ни снятий, ни
-// постановок) — без снятия первая ступень пропускалась бы, а Full-хвост
-// остался бы с флагом навсегда.
+// TestRequeueZoneStageFullMidBatchInvalidates — an early exit by the capacity
+// (Full) with unprocessed first-stage domains removes the proof
+// (the T-184 review, P1): the counter and the expectation do not diverge (neither
+// clears nor settings) — without the removal the first stage would be skipped, and the Full tail
+// would stay with the flag forever.
 func TestRequeueZoneStageFullMidBatchInvalidates(t *testing.T) {
 	hSPA := content.HashOf(renderqSPABody)
-	pool, body, _, _, rq := renderqPassKit(t, 0, 0, 100) // после первого домена очередь полна
+	pool, body, _, _, rq := renderqPassKit(t, 0, 0, 100) // after the first domain the queue is full
 	pool.zones[6] = "xn--p1ai"
 	body.bodies[hSPA] = renderqSPABody
-	// Две приоритетные + .рф: первая ступень неполная (доказательство
-	// установлено), Full обрывает обработку на втором приоритетном.
+	// Two priority + the .rf: the first stage is incomplete (the proof
+	// set), Full cuts the processing at the second priority one.
 	pool.seedDomain(5, 11, "prio1", model.FlagRenderPending, model.StatusAlive)
 	pool.seedRow(5, 11, 0, model.VariantMain, hSPA[:], nil, false, "https://prio1.example/")
 	pool.seedDomain(5, 12, "prio2", model.FlagRenderPending, model.StatusAlive)
@@ -2260,10 +2260,10 @@ func TestRequeueZoneStageFullMidBatchInvalidates(t *testing.T) {
 	}
 }
 
-// TestRequeueZoneStageSecondSelectError — ошибка выборки второй ступени
-// снимает доказательство исчерпания (ревью T-184, раунд 2): домены
-// первой ступени пачки остались с флагами, а счётчик и ожидание не
-// расходились бы — без снятия первая ступень пропускалась бы вечно.
+// TestRequeueZoneStageSecondSelectError — the second stage's selection
+// error removes the exhaustion proof (the T-184 review, round 2): the
+// chunk's first-stage domains stayed with the flags, while the counter and the expectation would
+// not diverge — without the removal the first stage would be skipped forever.
 func TestRequeueZoneStageSecondSelectError(t *testing.T) {
 	hSPA := content.HashOf(renderqSPABody)
 	pool, body, _, _, rq := renderqPassKit(t, 0)
@@ -2287,11 +2287,11 @@ func TestRequeueZoneStageSecondSelectError(t *testing.T) {
 	}
 }
 
-// TestRequeueZoneStageSecondKeepKeepsProof — застрявший домен ВТОРОЙ
-// ступени (зоны списка) доказательства не снимает (ревью T-184, раунд 2):
-// его подберёт сама вторая ступень следующего прохода (она выполняется
-// при каждом пропуске первой) — ложные снятия возвращали бы порожний
-// полный seq scan первой ступени после каждого keep-эпизода хвоста.
+// TestRequeueZoneStageSecondKeepKeepsProof — a stuck SECOND-stage
+// domain (the list's zones) does not remove the proof (the T-184 review, round 2):
+// the second stage of the next pass will pick it up itself (it runs
+// at every first stage's skip) — false removals would return the first stage's
+// idle full seq scan after every tail keep episode.
 func TestRequeueZoneStageSecondKeepKeepsProof(t *testing.T) {
 	hSPA := content.HashOf(renderqSPABody)
 	hDead := content.HashOf([]byte("блок .рф, который не читается"))
@@ -2309,8 +2309,8 @@ func TestRequeueZoneStageSecondKeepKeepsProof(t *testing.T) {
 	stage := &renderStage{}
 	opts := RequeueOptions{BatchSize: 2, DeprioritizedZones: []string{"xn--p1ai"}, Log: slog.New(slog.DiscardHandler)}.withDefaults()
 
-	// Проход 1: приоритетный снят, .рф застрял (keep) — доказательство
-	// переживает: застрявший в зоне списка подоберёт вторая ступень.
+	// Pass 1: the priority one cleared, the .rf stuck (a keep) — the proof
+	// survives: the second stage will pick up the one stuck in a list zone.
 	res, err := requeuePass(ctx, pool, body, rq, opts, stage)
 	if err != nil {
 		t.Fatalf("проход 1: %v", err)
@@ -2325,8 +2325,8 @@ func TestRequeueZoneStageSecondKeepKeepsProof(t *testing.T) {
 		t.Fatalf("ожидание счётчика %d, фактический долг %d — рассинхрон памяти", got, want)
 	}
 
-	// Проход 2: счётчик сходится — первая ступень пропущена, вторая
-	// повторяет застрявший .рф (контент читается).
+	// Pass 2: the counter matches — the first stage is skipped, the second
+	// repeats the stuck .rf (the content is read).
 	delete(body.errOn, hDead)
 	res, err = requeuePass(ctx, pool, body, rq, opts, stage)
 	if err != nil {
@@ -2343,10 +2343,10 @@ func TestRequeueZoneStageSecondKeepKeepsProof(t *testing.T) {
 	}
 }
 
-// TestRequeueRenderPendingZoneCycle — цикл с приоритетом зон (T-184):
-// стартовый дренаж доводит весь долг (приоритетные зоны вперёд, зоны
-// списка — последними), память ступеней переживает проходы, отмена ctx —
-// чистый nil.
+// TestRequeueRenderPendingZoneCycle — the loop with the zones' priority (T-184):
+// the initial drainage brings the whole debt down (the priority zones first, the
+// list's zones — last), the stages' memory survives the passes, a ctx cancellation —
+// a clean nil.
 func TestRequeueRenderPendingZoneCycle(t *testing.T) {
 	hSPA := content.HashOf(renderqSPABody)
 	pool := newRenderqPool()
@@ -2359,7 +2359,7 @@ func TestRequeueRenderPendingZoneCycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewRenderQueue: %v", err)
 	}
-	// «Куча»: .рф первыми, приоритетные — за ними.
+	// The "heap": the .rf first, the priority ones — behind them.
 	pool.seedDomain(6, 21, "rf1", model.FlagRenderPending, model.StatusAlive)
 	pool.seedRow(6, 21, 0, model.VariantMain, hSPA[:], nil, false, "https://rf1.xn--p1ai/")
 	pool.seedDomain(5, 11, "prio1", model.FlagRenderPending, model.StatusAlive)
@@ -2374,7 +2374,7 @@ func TestRequeueRenderPendingZoneCycle(t *testing.T) {
 			RequeueOptions{Interval: time.Hour, BatchSize: 1, DeprioritizedZones: []string{"xn--p1ai"}})
 	}()
 
-	// Ждём полного дренажа: все три флага сняты.
+	// We wait for the full drainage: all three flags cleared.
 	deadline := time.After(3 * time.Second)
 	for {
 		pool.mu.Lock()
@@ -2396,8 +2396,8 @@ func TestRequeueRenderPendingZoneCycle(t *testing.T) {
 		}
 	}
 
-	// Порядок публикаций: приоритетные зоны вперёд (.рф в «куче» первым,
-	// но доработан последним).
+	// The publications' order: the priority zones first (the .rf first in the "heap",
+	// but reworked last).
 	pub := q.snapshot()
 	if len(pub) != 3 {
 		t.Fatalf("публикаций %d, ожидалось 3", len(pub))
@@ -2424,15 +2424,15 @@ func TestRequeueRenderPendingZoneCycle(t *testing.T) {
 	}
 }
 
-// TestRequeueOnceClearRace — охрана бита при снятии: конкурент уже снял
-// флаг — RowsAffected 0 без ошибки, домен не засчитан.
+// TestRequeueOnceClearRace — the bit guard at the clear: a competitor has already
+// cleared the flag — RowsAffected 0 without an error, the domain not counted.
 func TestRequeueOnceClearRace(t *testing.T) {
 	hSPA := content.HashOf(renderqSPABody)
 	pool, body, _, _, rq := renderqPassKit(t, 0)
 	body.bodies[hSPA] = renderqSPABody
 	pool.seedDomain(5, 11, "spa", model.FlagRenderPending, model.StatusAlive)
 	pool.seedRow(5, 11, 0, model.VariantMain, hSPA[:], nil, false, "https://spa.example/")
-	// Между выборкой и снятием конкурент снял флаг.
+	// Between the selection and the clear a competitor cleared the flag.
 	pool.beforeHook = func() {
 		pool.domains[renderqDomKey{zone: 5, id: 11}].flags.Clear(model.FlagRenderPending)
 	}
@@ -2446,11 +2446,11 @@ func TestRequeueOnceClearRace(t *testing.T) {
 	}
 }
 
-// TestRequeueOnceCounterInvariant — снятие флага декрементирует счётчик
-// долга той же транзакцией (T-175): после прохода счётчик равен числу
-// строк с битом (инвариант бэкфилла миграции 000015); домен с
-// нечитаемым контентом (флаг сохранён) и удалённый (вне цикла) в
-// счётчике остаются.
+// TestRequeueOnceCounterInvariant — the flag clear decrements the debt
+// counter by the same transaction (T-175): after the pass the counter equals the number
+// of rows with the bit (the migration 000015 backfill's invariant); a domain with
+// unreadable content (the flag kept) and a deleted one (outside the cycle) stay
+// in the counter.
 func TestRequeueOnceCounterInvariant(t *testing.T) {
 	hSPA := content.HashOf(renderqSPABody)
 	hDead := content.HashOf([]byte("блок, который не читается"))
@@ -2458,8 +2458,8 @@ func TestRequeueOnceCounterInvariant(t *testing.T) {
 	body.bodies[hSPA] = renderqSPABody
 	body.errOn[hDead] = errors.New("pack: блок не читается")
 
-	// Доработан (снятие −1), оставлен (контент не читается), удалён с
-	// битом (вне цикла — бит и счётчик держат).
+	// Reworked (a clear −1), left (the content is not read), deleted with
+	// the bit (outside the cycle — the bit and the counter hold).
 	pool.seedDomain(5, 11, "spa", model.FlagRenderPending, model.StatusAlive)
 	pool.seedRow(5, 11, 0, model.VariantMain, hSPA[:], nil, false, "https://spa.example/")
 	pool.seedDomain(5, 12, "stuck", model.FlagRenderPending, model.StatusAlive)
@@ -2476,8 +2476,8 @@ func TestRequeueOnceCounterInvariant(t *testing.T) {
 	if res.Cleared != 1 {
 		t.Fatalf("итог %+v, ожидался cleared=1", res)
 	}
-	// Инвариант: счётчик == число строк с битом (включая удалённую —
-	// бэкфилл миграции фильтра по status не имеет).
+	// The invariant: the counter == the number of rows with the bit (including the deleted —
+	// the migration backfill has no status filter).
 	want := int64(0)
 	for _, d := range pool.domains {
 		if d.flags.Test(model.FlagRenderPending) {
@@ -2492,9 +2492,9 @@ func TestRequeueOnceCounterInvariant(t *testing.T) {
 	}
 }
 
-// TestRequeueOnceCounterFailure — сбой сдвига счётчика откатывает и
-// снятие флага (одна транзакция, T-175): проход возвращает ошибку,
-// домен остаётся с битом и в счётчике — следующий тик повторит пару.
+// TestRequeueOnceCounterFailure — a counter shift failure rolls back the flag
+// clear too (one transaction, T-175): the pass returns an error,
+// the domain stays with the bit and in the counter — the next tick will repeat the pair.
 func TestRequeueOnceCounterFailure(t *testing.T) {
 	hSPA := content.HashOf(renderqSPABody)
 	pool, body, _, _, rq := renderqPassKit(t, 0)
@@ -2515,10 +2515,10 @@ func TestRequeueOnceCounterFailure(t *testing.T) {
 	}
 }
 
-// TestRequeueOnceCounterMissingRow — строки счётчика нет (ручная
-// правка): guard прохода (T-181) ошибается ДО выборки — молчаливый
-// рассинхрон сделал бы и gauge, и сам guard ложью; флаг не снят — пара
-// бит+счётчик не расходится.
+// TestRequeueOnceCounterMissingRow — there is no counter row (a manual
+// edit): the pass's guard (T-181) errors BEFORE the selection — a silent
+// desync would make both the gauge and the guard itself a lie; the flag is not cleared — the
+// bit+counter pair does not diverge.
 func TestRequeueOnceCounterMissingRow(t *testing.T) {
 	hSPA := content.HashOf(renderqSPABody)
 	pool, body, _, _, rq := renderqPassKit(t, 0)
@@ -2535,13 +2535,13 @@ func TestRequeueOnceCounterMissingRow(t *testing.T) {
 	}
 }
 
-// TestRequeueOnceErrors — ошибки выборки/снятия возвращаются вызывающему
-// (цикл.Warn), флаг домена остаётся.
+// TestRequeueOnceErrors — the selection/clear errors are returned to the caller
+// (the loop's Warn), the domain's flag stays.
 func TestRequeueOnceErrors(t *testing.T) {
 	hSPA := content.HashOf(renderqSPABody)
 
-	// Ошибка тяжёлой выборки: долг есть (флаг + счётчик) — guard
-	// пропускает к выборке, сбой SELECT возвращается вызывающему.
+	// A heavy selection error: there is debt (the flag + the counter) — the guard
+	// lets it through to the selection, the SELECT failure is returned to the caller.
 	pool, body, _, _, rq := renderqPassKit(t, 0)
 	pool.seedDomain(5, 11, "spa", model.FlagRenderPending, model.StatusAlive)
 	pool.queryErrs[renderPendingDomainsSQL] = errors.New("sql: select")
@@ -2549,7 +2549,7 @@ func TestRequeueOnceErrors(t *testing.T) {
 		t.Fatal("ошибка выборки не возвращена")
 	}
 
-	// Сбой закрепления плана (SET LOCAL) — ошибка прохода, без SELECT.
+	// A plan pinning failure (SET LOCAL) — a pass error, without a SELECT.
 	pool2, body2, _, _, rq2 := renderqPassKit(t, 0)
 	pool2.seedDomain(5, 11, "spa", model.FlagRenderPending, model.StatusAlive)
 	pool2.queryErrs[renderPlanNoIndexScanSQL] = errors.New("sql: set local")
@@ -2560,7 +2560,7 @@ func TestRequeueOnceErrors(t *testing.T) {
 		t.Fatalf("SELECT выполнен %d раз при сбое закрепления плана", c)
 	}
 
-	// Сбой guard-чтения счётчика — ошибка прохода, без выборки.
+	// A counter guard read failure — a pass error, without a selection.
 	pool3, body3, _, _, rq3 := renderqPassKit(t, 0)
 	pool3.seedDomain(5, 11, "spa", model.FlagRenderPending, model.StatusAlive)
 	pool3.queryErrs[renderDebtCounterSQL] = errors.New("sql: counter")
@@ -2590,7 +2590,7 @@ func TestRequeueOnceErrors(t *testing.T) {
 	}
 }
 
-// TestRequeueOnceValidation — nil-зависимости — ошибка.
+// TestRequeueOnceValidation — nil dependencies — an error.
 func TestRequeueOnceValidation(t *testing.T) {
 	pool := newRenderqPool()
 	body := &renderqContent{}
@@ -2609,8 +2609,8 @@ func TestRequeueOnceValidation(t *testing.T) {
 	}
 }
 
-// TestRequeueRenderPendingLoop — цикл: стартовый дренаж сразу (флаг
-// доработан до первого тика), отмена ctx — чистый nil.
+// TestRequeueRenderPendingLoop — the loop: the initial drainage immediately (the
+// flag reworked before the first tick), a ctx cancellation — a clean nil.
 func TestRequeueRenderPendingLoop(t *testing.T) {
 	hSPA := content.HashOf(renderqSPABody)
 	pool := newRenderqPool()
@@ -2631,7 +2631,7 @@ func TestRequeueRenderPendingLoop(t *testing.T) {
 		done <- RequeueRenderPending(ctx, pool, body, rq, RequeueOptions{Interval: 5 * time.Millisecond})
 	}()
 
-	// Ждём снятия флага (стартовый дренаж — до первого тика).
+	// We wait for the flag's clear (the initial drainage — before the first tick).
 	deadline := time.After(3 * time.Second)
 	for {
 		pool.mu.Lock()
@@ -2662,8 +2662,8 @@ func TestRequeueRenderPendingLoop(t *testing.T) {
 	}
 }
 
-// TestRenderSQLContract — литералы схемы и структура операторов (стиль
-// SQL-контракта record_test.go).
+// TestRenderSQLContract — the schema literals and the operators' structure (the
+// record_test.go SQL-contract style).
 func TestRenderSQLContract(t *testing.T) {
 	if !strings.Contains(renderSetPendingSQL, "SET flags = (t.flags | 2)::int2") ||
 		!strings.Contains(renderSetPendingSQL, "WHERE t.zone_id = $1::int2 AND t.id = $2::int8") ||
@@ -2676,8 +2676,8 @@ func TestRenderSQLContract(t *testing.T) {
 		strings.Contains(renderPendingDomainsSQL, "ORDER BY") {
 		t.Fatalf("renderPendingDomainsSQL разошёлся с контрактом T-181 (без PK-порядка, LIMIT — пачка):\n%s", renderPendingDomainsSQL)
 	}
-	// Ступени приоритета зон (T-184): фильтр по имени зоны в JOIN,
-	// LIMIT — пачка, сортировки нет (форма плана T-181 сохраняется).
+	// The zones' priority stages (T-184): the zone name filter in the JOIN,
+	// LIMIT — the chunk, no sorting (the T-181 plan shape preserved).
 	if !strings.Contains(renderPendingDomainsNotInSQL, "z.name <> ALL($2::text[])") ||
 		!strings.Contains(renderPendingDomainsNotInSQL, "LIMIT $1") ||
 		strings.Contains(renderPendingDomainsNotInSQL, "ORDER BY") {

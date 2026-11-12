@@ -1,16 +1,16 @@
-// Юнит-тесты позднего переиздателя рендера (T-259, ТЗ-fsm §3 ФТ-5.3)
-// на фейковых пуле/хранилище/очереди/снимке стримов — без БД, Redis и
-// сети (стиль renderq_test.go, чьи фейки очереди/хранилища/глубины и
-// pgx-строки переиспользуются). Проверяются: точные SQL и параметры
-// выборки (курсор PK, окно возраста, охраны бита/статуса/маркера),
-// интерлок снимком непотреблённых q:render/q:render-fallback (живая
-// задача не переиздаётся, ошибка снимка — консервативный пропуск),
-// SPA-вердикт по контенту и наследование алиасом, курсорная дисциплина
-// (пачка целиком — курсор вперёд, короткая — замыкание, Full/ошибка —
-// курсор на месте), метрика crawler_render_late_republish_total, цикл.
-// ТЗ T-271: tx-оболочка закрепления плана выборки (SET LOCAL ×4 →
-// SELECT → COMMIT), потолок SelectTimeout, гейт тяжёлых сканов и
-// backoff цикла после ошибки. Поведение против живых PostgreSQL/Redis —
+// Unit tests of the render late re-publisher (T-259, TZ-fsm spec §3 FR-5.3)
+// over a fake pool/store/queue/stream snapshot — without a DB, Redis and
+// the network (the renderq_test.go style, whose queue/store/depth fakes and
+// pgx rows are reused). Checked: the exact selection SQL and parameters
+// (the PK cursor, the age window, the bit/status/marker guards),
+// the interlock by the snapshot of the unconsumed q:render/q:render-fallback (a live
+// task is not re-published, a snapshot error — a conservative skip),
+// the SPA verdict over the content and the alias inheritance, the cursor discipline
+// (a whole chunk — the cursor forward, a short one — the wrap, Full/error —
+// the cursor in place), the crawler_render_late_republish_total metric, the loop.
+// The T-271 spec: the selection plan pinning's tx shell (SET LOCAL ×4 →
+// SELECT → COMMIT), the SelectTimeout cap, the heavy scans' gate and
+// the loop's backoff after an error. The behavior against live PostgreSQL/Redis —
 // test/integration render_late_test.go.
 package httpworker
 
@@ -35,10 +35,10 @@ import (
 	"crawler/internal/queue"
 )
 
-// --- фейковый источник непотреблённых ключей (интерлок) -----------------------
+// --- the fake unconsumed keys' source (the interlock) -----------------------
 
-// latePending — content.RetentionPending с заготовленными множествами
-// по стримам и настраиваемым сбоем.
+// latePending — a content.RetentionPending with preloaded sets
+// per stream and a configurable failure.
 type latePending struct {
 	mu    sync.Mutex
 	sets  map[string]map[content.RetentionPendingKey]struct{}
@@ -55,8 +55,8 @@ func newLatePending() *latePending {
 	}
 }
 
-// add вызывается из горутины теста, пока цикл читает снимки через
-// PendingKeys — доступ к sets строго под мьютексом (race-детектор).
+// add is called from the test's goroutine while the loop reads the snapshots via
+// PendingKeys — the sets access is strictly under the mutex (the race detector).
 func (p *latePending) add(stream string, k content.RetentionPendingKey) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -85,20 +85,20 @@ func (p *latePending) PendingKeys(ctx context.Context, stream string) (map[conte
 	return out, nil
 }
 
-// --- фейковый пул (db.DB): candidates/alias -----------------------------------
+// --- the fake pool (db.DB): candidates/alias -----------------------------------
 
-// lateSeedRow — строка subdomain_results фейка.
+// lateSeedRow — a subdomain_results row of the fake.
 type lateSeedRow struct {
 	key      lateKey
 	hash     []byte // nil — content_hash NULL
-	aliasSub *int16 // не nil — алиас (наследует вердикт оригинала)
+	aliasSub *int16 // not nil — an alias (inherits the original's verdict)
 	rendered bool
-	finalURL string // "" — NULL (фильтр final_url IS NOT NULL)
-	marked   bool   // штамп render_failed_at (фильтр IS NULL)
-	old      bool   // checked_at старше окна возраста (фильтр ФТ-5.3)
+	finalURL string // "" — NULL (the final_url IS NOT NULL filter)
+	marked   bool   // the render_failed_at stamp (the IS NULL filter)
+	old      bool   // checked_at older than the age window (the FR-5.3 filter)
 }
 
-// lateSeedDomain — строка domains фейка.
+// lateSeedDomain — a domains row of the fake.
 type lateSeedDomain struct {
 	zone   int16
 	id     int64
@@ -107,31 +107,31 @@ type lateSeedDomain struct {
 	status model.Status
 }
 
-// latePool — db.DB прохода без БД: живая семантика фильтров
-// lateRenderRowsSQL/lateRenderAliasSQL (rendered, final_url, маркер,
-// окно возраста, бит render_pending, status <> deleted, курсор PK,
-// LIMIT; алиасный запрос — предикаты renderPendingRowsSQL по субдоменам
-// ANY); SQL сопоставляется ТОЧНО (неожидаемый — ошибка, тест падает
-// громко, стиль renderqPool). С T-271 пул — RecordDB: тяжёлая выборка
-// идёт в транзакции закрепления плана (Begin → lateTx), алиасный запрос
-// остаётся точечным через пул.
+// latePool — the pass's db.DB without a DB: the live semantics of the
+// lateRenderRowsSQL/lateRenderAliasSQL filters (rendered, final_url, the marker,
+// the age window, the render_pending bit, status <> deleted, the PK cursor,
+// LIMIT; the alias query — the renderPendingRowsSQL predicates over the ANY
+// subdomains); the SQL is matched EXACTLY (an unexpected one — an error, the test
+// falls loudly, the renderqPool style). Since T-271 the pool is a RecordDB: the heavy selection
+// goes in the plan pinning's transaction (Begin → lateTx), the alias query
+// stays point through the pool.
 type latePool struct {
 	mu      sync.Mutex
-	domains map[lateKey]*lateSeedDomain // key.domain — идентификатор (sub/variant нулевые)
+	domains map[lateKey]*lateSeedDomain // key.domain — the identifier (sub/variant zero)
 	rows    []lateSeedRow
 
 	rowsErr   error
 	aliasErr  error
 	rowsCalls int
-	aliasLast []int16 // субдомены последнего алиасного запроса
+	aliasLast []int16 // the last alias query's subdomains
 	begins    int
 	txs       []*lateTx
-	// rowsBlock — «зависшая» выборка: ответ только по ctx-дедлайну
-	// (тест ctx-таймаута T-271).
+	// rowsBlock — a "stuck" selection: an answer only by the ctx deadline
+	// (the T-271 ctx timeout test).
 	rowsBlock bool
-	// rowsDelay — задержка тяжёлой выборки (тест семантики backoff
-	// T-273: проход длится дольше тика интервала); beginsAt — метки
-	// времени Begin (старты проходов).
+	// rowsDelay — the heavy selection's delay (the backoff semantics
+	// test of T-273: the pass lasts longer than the interval tick); beginsAt — the
+	// Begin time stamps (the pass starts).
 	rowsDelay time.Duration
 	beginsAt  []time.Time
 }
@@ -170,8 +170,8 @@ func (p *latePool) Query(ctx context.Context, sql string, args ...any) (pgx.Rows
 	}
 }
 
-// Begin — транзакция потолка выборки (T-271): тяжёлая выборка пачки
-// идёт через lateTx, точечные запросы остаются в пуле.
+// Begin — the selection cap's transaction (T-271): the heavy chunk
+// selection goes via lateTx, the point queries stay in the pool.
 func (p *latePool) Begin(context.Context) (pgx.Tx, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -182,12 +182,12 @@ func (p *latePool) Begin(context.Context) (pgx.Tx, error) {
 	return tx, nil
 }
 
-// lateTx — транзакция потолка выборки: единственный SET LOCAL —
-// statement_timeout до SELECT (закрепления плана сняты T-273), calls —
-// упорядоченный журнал операторов (контракт порядка, стиль
+// lateTx — the selection cap's transaction: the only SET LOCAL —
+// the statement_timeout before the SELECT (the plan pinnings removed by T-273), calls —
+// the ordered operators' journal (the order contract, the
 // retentionFakeTx.calls).
 type lateTx struct {
-	pgx.Tx // остальные методы pgx.Tx проход не использует
+	pgx.Tx // the pass does not use the other pgx.Tx methods
 
 	pool      *latePool
 	calls     []string
@@ -198,9 +198,9 @@ func (t *lateTx) Exec(_ context.Context, sql string, _ ...any) (pgconn.CommandTa
 	t.pool.mu.Lock()
 	defer t.pool.mu.Unlock()
 	t.calls = append(t.calls, sql)
-	// С T-273 оболочка — только потолок оператора: закрепления формы
-	// (SET LOCAL enable_*) разворачивали join от domains на прод-объёме
-	// (вечная петля за дедлайном) — неожидаемый Exec падает громко.
+	// Since T-273 the shell is only the operator's cap: the shape
+	// pinnings (SET LOCAL enable_*) unrolled the join from domains at the production volume
+	// (the eternal loop over the deadline) — an unexpected Exec falls loudly.
 	if strings.HasPrefix(sql, "SET LOCAL statement_timeout = ") {
 		return pgconn.NewCommandTag("SET"), nil
 	}
@@ -208,14 +208,14 @@ func (t *lateTx) Exec(_ context.Context, sql string, _ ...any) (pgconn.CommandTa
 }
 
 func (t *lateTx) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
-	// «Зависшая» выборка (тест ctx-таймаута T-271): ответ только по
-	// дедлайну, до журналов и семантики.
+	// A "stuck" selection (the T-271 ctx timeout test): an answer only by
+	// the deadline, before the journals and the semantics.
 	if sql == lateRenderRowsSQL && t.pool.rowsBlock {
 		<-ctx.Done()
 		return nil, ctx.Err()
 	}
-	// Задержка тяжёлой выборки (семантика backoff T-273): сон вне
-	// мьютекса — пул остаётся доступен тесту.
+	// The heavy selection's delay (the T-273 backoff semantics): the sleep outside
+	// the mutex — the pool stays available to the test.
 	if sql == lateRenderRowsSQL {
 		t.pool.mu.Lock()
 		delay := t.pool.rowsDelay
@@ -266,7 +266,7 @@ func (p *latePool) queryRows(args []any) (pgx.Rows, error) {
 	}
 	p.rowsCalls++
 
-	// Детерминированный PK-порядок (ORDER BY zone, domain, sub, variant).
+	// The deterministic PK order (ORDER BY zone, domain, sub, variant).
 	sorted := make([]lateSeedRow, len(p.rows))
 	copy(sorted, p.rows)
 	for i := 0; i < len(sorted); i++ {
@@ -280,17 +280,17 @@ func (p *latePool) queryRows(args []any) (pgx.Rows, error) {
 	for i := range sorted {
 		r := &sorted[i]
 		if r.rendered || r.finalURL == "" || r.marked || !r.old {
-			continue // предикаты строки
+			continue // the row's predicates
 		}
 		d := p.domains[lateKey{zone: r.key.zone, domain: r.key.domain}]
 		if d == nil {
-			continue // JOIN domains — строки нет
+			continue // the JOIN domains — no row
 		}
 		if d.flags.Test(model.FlagRenderPending) || d.status == model.StatusDeleted {
-			continue // бит render_pending / §13.1
+			continue // the render_pending bit / §13.1
 		}
 		if !lateKeyLess(cur, r.key) {
-			continue // курсор row-value >
+			continue // the row-value > cursor
 		}
 		var hash, alias any
 		if r.hash != nil {
@@ -330,9 +330,9 @@ func (p *latePool) queryAlias(args []any) (pgx.Rows, error) {
 	rows := make([]lateSeedRow, 0, 4)
 	for i := range p.rows {
 		r := p.rows[i]
-		// Предикат lateRenderAliasSQL: кандидаты (не отрендерено, есть
-		// цель, нет маркера) ПЛЮС отрендеренные (факт рендера — вердикт
-		// класса, ревью T-259 P2-1); отмаркированные — нет.
+		// The lateRenderAliasSQL predicate: the candidates (not rendered, there is
+		// a target, no marker) PLUS the rendered ones (the fact of the render — the
+		// class's verdict, the T-259 P2-1 review); the marked ones — no.
 		if r.key.zone == zone && r.key.domain == id && want[r.key.sub] &&
 			(r.rendered || (!r.marked && r.finalURL != "")) {
 			rows = append(rows, r)
@@ -358,7 +358,7 @@ func (p *latePool) queryAlias(args []any) (pgx.Rows, error) {
 	return renderqRowsOf(out...), nil
 }
 
-// lateKeyOf — курсор из параметров SQL (int16/int64/int16/int16).
+// lateKeyOf — the cursor from the SQL parameters (int16/int64/int16/int16).
 func lateKeyOf(zone, domain, sub, variant any) (lateKey, bool) {
 	z, ok1 := zone.(int16)
 	d, ok2 := domain.(int64)
@@ -383,11 +383,11 @@ func lateKeyLess(a, b lateKey) bool {
 	return a.variant < b.variant
 }
 
-// testLateAfter — окно возраста тестов (1 час: old=true — «старше окна»).
+// testLateAfter — the tests' age window (1 hour: old=true — "older than the window").
 const testLateAfter = time.Hour
 
-// lateFixture — сборка прохода: пул, контент (SPA/не-SPA тела), очередь,
-// глубина (свободна), снимок, метрики.
+// lateFixture — the pass's assembly: the pool, the content (SPA/non-SPA bodies), the queue,
+// the depth (free), the snapshot, the metrics.
 type lateFixture struct {
 	pool     *latePool
 	bodies   *renderqContent
@@ -401,7 +401,7 @@ type lateFixture struct {
 	rawHash  content.Hash
 }
 
-// newLateFixture — домен/зона сидированы отдельно тестом.
+// newLateFixture — the domain/zone are seeded separately by the test.
 func newLateFixture(t *testing.T) *lateFixture {
 	t.Helper()
 	f := &lateFixture{
@@ -413,10 +413,10 @@ func newLateFixture(t *testing.T) *lateFixture {
 		reg:     metrics.New("http-worker-test"),
 	}
 	f.met = NewMetrics(f.reg)
-	// SPA-тела (T-057) и статическое — те же, что в фикстурах renderq;
-	// второе SPA-тело — для многорядных сценариев с независимым сбоем
-	// чтения (копия тела с постфиксом — вердикт детерминирован). Хэши
-	// различаются старшим байтом: ключи карт тел/сбоев не сливаются.
+	// The SPA bodies (T-057) and the static one — the same as in the renderq fixtures;
+	// the second SPA body — for multi-row scenarios with an independent
+	// read failure (a body copy with a postfix — the verdict is deterministic). The hashes
+	// differ by the senior byte: the bodies/failures maps' keys do not merge.
 	f.spaHash[0] = 0x02
 	f.spaHash2[0] = 0x03
 	f.rawHash[0] = 0x01
@@ -435,20 +435,20 @@ func (f *lateFixture) renderQ(t *testing.T) *RenderQueue {
 	return rq
 }
 
-// published — снимок публикаций q:render.
+// published — the q:render publications' snapshot.
 func (f *lateFixture) published() []renderqPublish { return f.q.snapshot() }
 
-// lateOpts — опции тестов: окно 1 ч, пачка 100.
+// lateOpts — the tests' options: a 1 h window, a chunk of 100.
 func lateOpts() LateOptions { return LateOptions{BatchSize: 100, After: testLateAfter} }
 
-// --- выборка -------------------------------------------------------------------
+// --- the selection -------------------------------------------------------------------
 
-// TestRenderLateSelect — точный SQL выборки: курсор row-value > по PK,
-// ORDER BY PK, LIMIT, граница возраста параметром; предикаты (rendered,
-// final_url, маркер, возраст, бит render_pending, deleted) — живой
-// смысл фейка проверяется поведением ниже. Выборка идёт в tx-оболочке
-// потолка statement_timeout (T-271/T-273) — порядок операторов
-// проверяет TestRenderLateSelectShell.
+// TestRenderLateSelect — the exact selection SQL: a row-value > cursor over the PK,
+// the ORDER BY PK, the LIMIT, the age boundary as a parameter; the predicates (rendered,
+// final_url, the marker, the age, the render_pending bit, deleted) — the fake's
+// live meaning is checked by the behavior below. The selection goes in the tx shell
+// of the statement_timeout cap (T-271/T-273) — the operators' order
+// is checked by TestRenderLateSelectShell.
 func TestRenderLateSelect(t *testing.T) {
 	f := newLateFixture(t)
 	ctx := context.Background()
@@ -474,22 +474,22 @@ func TestRenderLateSelect(t *testing.T) {
 		t.Fatalf("hash/alias строки: %+v", rows[0])
 	}
 
-	// Курсор: строка за курсором не выбирается.
+	// The cursor: a row behind the cursor is not selected.
 	cur.key = rows[0].key
 	if rows, err = lateSelect(ctx, f.pool, lateOpts(), time.Now().Add(-testLateAfter), cur.key); err != nil || len(rows) != 0 {
 		t.Fatalf("выборка за курсором: %d строк (err=%v), хочу 0", len(rows), err)
 	}
 }
 
-// TestRenderLateSelectShell — tx-оболочка выборки (T-271 завёл
-// закрепление формы, T-273 снял его): пачка читается в явной
-// транзакции строго последовательностью SET LOCAL statement_timeout →
-// SELECT → COMMIT. Закрепления (SET LOCAL enable_seqscan/hashjoin/
-// mergejoin/bitmapscan = off) удалены сознательно — на прод-объёме
-// (domains 43 млн) пин оставлял планировщику только Nested Loop и
-// разворачивал join от domains, cost ≈157 млн при дедлайне 60 с —
-// вечная петля обречённых выборок (инцидент 09–10.11.2026); неожидаемый
-// enable_* в журнале падает громко (фейк не знает такой Exec).
+// TestRenderLateSelectShell — the selection's tx shell (T-271 introduced
+// the shape pinning, T-273 removed it): the chunk is read in an explicit
+// transaction strictly by the SET LOCAL statement_timeout →
+// SELECT → COMMIT sequence. The pinnings (SET LOCAL enable_seqscan/hashjoin/
+// mergejoin/bitmapscan = off) are removed deliberately — at the production volume
+// (domains 43M) the pin left the planner only the Nested Loop and
+// unrolled the join from domains, a cost ≈157M at the 60 s deadline —
+// the eternal loop of doomed selections (the Nov 9–10, 2026 incident); an unexpected
+// enable_* in the journal falls loudly (the fake knows no such Exec).
 func TestRenderLateSelectShell(t *testing.T) {
 	f := newLateFixture(t)
 	f.pool.seedDomain(1, 10, "spa", 0, model.StatusAlive)
@@ -502,8 +502,8 @@ func TestRenderLateSelectShell(t *testing.T) {
 		t.Fatalf("транзакций = %d, хочу 1 (tx-оболочка выборки)", len(f.pool.txs))
 	}
 	tx := f.pool.txs[0]
-	// Текст потолка — литерал (контракт интеграционного теста, стиль
-	// renderq_test.go); значение — дефолт 300 с T-273.
+	// The cap's text — a literal (the integration test's contract, the
+	// renderq_test.go style); the value — the T-273 default of 300 s.
 	if lateSelectTimeoutFmt != "SET LOCAL statement_timeout = '%dms'" {
 		t.Fatalf("текст потолка выборки изменён")
 	}
@@ -529,14 +529,14 @@ func TestRenderLateSelectShell(t *testing.T) {
 	}
 }
 
-// TestRenderLateSelectCtxTimeout — зависшая выборка режется клиентским
-// ctx-дедлайном SelectTimeout (T-271): обёрнутая ошибка с контекстом
-// «выборка», курсор на месте — пачка повторится (идемпотентность, ТЗ 3.4).
+// TestRenderLateSelectCtxTimeout — a stuck selection is cut by the client
+// ctx deadline SelectTimeout (T-271): a wrapped error with the
+// "selection" context, the cursor in place — the chunk will repeat (idempotency, spec 3.4).
 func TestRenderLateSelectCtxTimeout(t *testing.T) {
 	f := newLateFixture(t)
 	f.pool.seedDomain(1, 10, "spa", 0, model.StatusAlive)
 	f.pool.seedRow(lateSeedRow{key: lateKey{zone: 1, domain: 10}, old: true, finalURL: "https://x/", hash: f.spaHash[:]})
-	f.pool.rowsBlock = true // SELECT не отвечает до отмены ctx
+	f.pool.rowsBlock = true // the SELECT does not answer until the ctx cancellation
 
 	opts := lateOpts()
 	opts.SelectTimeout = 40 * time.Millisecond
@@ -553,9 +553,9 @@ func TestRenderLateSelectCtxTimeout(t *testing.T) {
 	}
 }
 
-// TestRenderLateSelectGate — тяжёлая выборка под общим гейтом сканов
-// (db.ScanGate, T-271): занятый гейт держит выборку ДО Begin, отпускание
-// пропускает её; взаимное исключение двух держателей — TestScanGate в
+// TestRenderLateSelectGate — the heavy selection under the scans' common gate
+// (db.ScanGate, T-271): a busy gate holds the selection BEFORE Begin,
+// the release lets it through; the two holders' mutual exclusion — TestScanGate in
 // internal/db.
 func TestRenderLateSelectGate(t *testing.T) {
 	f := newLateFixture(t)
@@ -595,9 +595,9 @@ func TestRenderLateSelectGate(t *testing.T) {
 	}
 }
 
-// TestRenderLateLostRowPublished — потерянная SPA-запись (старше окна,
-// без бита, без сообщений) переиздаётся; не-SPA, свежая, отмаркированная,
-// rendered, без контента — нет.
+// TestRenderLateLostRowPublished — a lost SPA record (older than the window,
+// without the bit, without messages) is re-published; a non-SPA, a fresh, a marked,
+// a rendered one, without content — is not.
 func TestRenderLateLostRowPublished(t *testing.T) {
 	f := newLateFixture(t)
 	ctx := context.Background()
@@ -620,9 +620,9 @@ func TestRenderLateLostRowPublished(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LateOnce: %v", err)
 	}
-	// Пачка — трое прошедших предикаты (потерянная SPA, без контента,
-	// не-SPA): свежая/отмаркированная/rendered отсечены SQL; из пачки
-	// издана одна, две пропущены вердиктом (нет тела / не-SPA).
+	// The chunk — three that passed the predicates (a lost SPA, without content,
+	// a non-SPA): the fresh/marked/rendered ones are cut off by the SQL; of the chunk
+	// one is published, two are skipped by the verdict (no body / non-SPA).
 	if res.Selected != 3 || res.Published != 1 || res.Skipped != 2 {
 		t.Fatalf("итог %+v, хочу selected=3 published=1 skipped=2", res)
 	}
@@ -642,8 +642,8 @@ func TestRenderLateLostRowPublished(t *testing.T) {
 	}
 }
 
-// TestRenderLateBitAndDeleted — домен под битом render_pending (долг —
-// владение прохода доработки) и deleted-домен не переиздаются.
+// TestRenderLateBitAndDeleted — a domain under the render_pending bit (the debt —
+// the rework pass's ownership) and a deleted domain are not re-published.
 func TestRenderLateBitAndDeleted(t *testing.T) {
 	f := newLateFixture(t)
 	ctx := context.Background()
@@ -664,9 +664,9 @@ func TestRenderLateBitAndDeleted(t *testing.T) {
 	}
 }
 
-// TestRenderLateInterlock — запись с живым сообщением q:render ИЛИ
-// q:render-fallback не переиздаётся (критерий приёмки ФТ-5.3); ошибка
-// снимка — консервативный пропуск прохода (курсор на месте).
+// TestRenderLateInterlock — a record with a live q:render message OR
+// q:render-fallback is not re-published (the FR-5.3 acceptance criterion); a snapshot
+// error — a conservative pass skip (the cursor in place).
 func TestRenderLateInterlock(t *testing.T) {
 	f := newLateFixture(t)
 	ctx := context.Background()
@@ -688,14 +688,14 @@ func TestRenderLateInterlock(t *testing.T) {
 	if len(f.published()) != 0 {
 		t.Fatalf("публикаций %d, хочу 0", len(f.published()))
 	}
-	// Пачка короче лимита — курсор замкнут (исключённые держателями
-	// решаются сами, следующий цикл вернётся к ним с начала).
+	// The chunk is shorter than the limit — the cursor is closed (the holders'
+	// excluded ones decide themselves, the next cycle will come back to them from the start).
 	if cur.key != (lateKey{}) || !res.Wrapped {
 		t.Fatalf("курсор = %+v wrapped=%v, хочу замыкание после короткой пачки", cur.key, res.Wrapped)
 	}
 
-	// Ошибка снимка — ошибка прохода, курсор на месте (следующий тик
-	// повторит), публикаций нет.
+	// A snapshot error — a pass error, the cursor in place (the next tick
+	// will repeat), no publications.
 	f.pending.errOn[queue.StreamRender] = errors.New("xinfo: connection reset")
 	cur2 := &RenderLateCursor{}
 	if _, err := LateOnce(ctx, f.pool, f.bodies, f.renderQ(t), f.pending, f.met, lateOpts(), cur2); err == nil {
@@ -706,9 +706,9 @@ func TestRenderLateInterlock(t *testing.T) {
 	}
 }
 
-// TestRenderLateAlias — алиас наследует SPA-вердикт субдомена-оригинала
-// (T-055): оригинал-кандидат с SPA-телом — алиас переиздаётся;
-// нечитаемый контент оригинала и не-SPA оригинал — алиас пропускается.
+// TestRenderLateAlias — an alias inherits the original subdomain's SPA verdict
+// (T-055): an original candidate with an SPA body — the alias is re-published;
+// an unreadable original content and a non-SPA original — the alias is skipped.
 func TestRenderLateAlias(t *testing.T) {
 	f := newLateFixture(t)
 	ctx := context.Background()
@@ -729,7 +729,7 @@ func TestRenderLateAlias(t *testing.T) {
 		t.Fatalf("публикации %+v, хочу оригинал (sub=5) и алиас (sub=7) по порядку PK", pub)
 	}
 
-	// Не-SPA оригинал — алиас без вердикта: обе строки пропускаются.
+	// A non-SPA original — an alias without a verdict: both rows are skipped.
 	f.resetPublishes()
 	f.pool.rows = nil
 	f.pool.seedRow(lateSeedRow{key: lateKey{zone: 1, domain: 10, sub: 5}, old: true, finalURL: "https://orig/", hash: f.rawHash[:]})
@@ -743,24 +743,24 @@ func TestRenderLateAlias(t *testing.T) {
 	}
 }
 
-// resetPublishes — сброс публикаций фикстуры (повторное использование).
+// resetPublishes — the fixture's publications reset (a reuse).
 func (f *lateFixture) resetPublishes() {
 	f.q.mu.Lock()
 	f.q.publishes = nil
 	f.q.mu.Unlock()
 }
 
-// TestRenderLateCursorDiscipline — курсор двигается только за пачку,
-// отработанную целиком: Full и ошибка публикации оставляют курсор
-// (следующий проход повторит пачку, дубль ограничен); длинная пачка
-// сохраняет курсор на последней строке (без замыкания).
+// TestRenderLateCursorDiscipline — the cursor moves only over a chunk
+// processed entirely: Full and a publication error leave the cursor
+// (the next pass will repeat the chunk, the duplicate is bounded); a long chunk
+// keeps the cursor at the last row (without the wrap).
 func TestRenderLateCursorDiscipline(t *testing.T) {
 	f := newLateFixture(t)
 	ctx := context.Background()
 	f.pool.seedDomain(1, 10, "spa", 0, model.StatusAlive)
 	f.pool.seedRow(lateSeedRow{key: lateKey{zone: 1, domain: 10}, old: true, finalURL: "https://spa/", hash: f.spaHash[:]})
 
-	// Full: очередь у порога при входе — БД не читается.
+	// Full: the queue is at the threshold at the entry — the DB is not read.
 	f.lenner.seq = []int64{1000}
 	rq, err := NewRenderQueue(f.q, f.lenner, 100, nil)
 	if err != nil {
@@ -778,9 +778,9 @@ func TestRenderLateCursorDiscipline(t *testing.T) {
 		t.Fatalf("выборок при полной очереди: %d, хочу 0", f.pool.rowsCalls)
 	}
 
-	// Ошибка публикации: курсор на месте, повторный проход переиздаёт
-	// пачку (дубль ограничен, гасится идемпотентностью).
-	f.lenner.seq = nil // ёмкость всегда есть
+	// A publication error: the cursor in place, a repeated pass re-publishes
+	// the chunk (the duplicate is bounded, extinguished by the idempotency).
+	f.lenner.seq = nil // the capacity is always there
 	f.q.errs = []error{errors.New("xadd: oops")}
 	res, err = LateOnce(ctx, f.pool, f.bodies, f.renderQ(t), f.pending, f.met, lateOpts(), cur)
 	if err == nil {
@@ -798,8 +798,8 @@ func TestRenderLateCursorDiscipline(t *testing.T) {
 		t.Fatalf("повторный проход: published=%d, хочу 1 (пачка повторена)", res.Published)
 	}
 
-	// Длинная пачка (LIMIT сработал): курсор за последней строкой,
-	// замыкания нет — следующая пачка продолжит с курсора.
+	// A long chunk (the LIMIT fired): the cursor behind the last row,
+	// no wrap — the next chunk will continue from the cursor.
 	f.resetPublishes()
 	f.pool.rows = nil
 	for i := int64(1); i <= 3; i++ {
@@ -830,8 +830,8 @@ func TestRenderLateCursorDiscipline(t *testing.T) {
 	}
 }
 
-// TestRenderLateMetricAndNil — метрика растёт числом изданий, nil-метрики
-// не паникуют; Full/ошибка метрику не трогают.
+// TestRenderLateMetricAndNil — the metric grows by the editions count, nil metrics
+// do not panic; Full/error do not touch the metric.
 func TestRenderLateMetricAndNil(t *testing.T) {
 	f := newLateFixture(t)
 	ctx := context.Background()
@@ -846,7 +846,7 @@ func TestRenderLateMetricAndNil(t *testing.T) {
 		t.Fatalf("метрика = %v, хочу 2", v)
 	}
 
-	// nil-метрики — no-op без паники.
+	// nil metrics — a no-op without a panic.
 	f.pool.rows = nil
 	f.pool.seedDomain(2, 10, "spa2", 0, model.StatusAlive)
 	f.pool.seedRow(lateSeedRow{key: lateKey{zone: 2, domain: 10}, old: true, finalURL: "https://c/", hash: f.spaHash[:]})
@@ -858,17 +858,17 @@ func TestRenderLateMetricAndNil(t *testing.T) {
 	}
 }
 
-// TestRenderLateAliasRenderedOrigin — отрендеренный оригинал доказывает
-// SPA-вердикт класса сам по себе (ревью T-259 P2-1): алиас с потерянным
-// сообщением переиздаётся и тогда, когда оригинал уже rendered=true
-// (контент оригинала — DOM, читаться не должен: хэш оригинала в
-// хранилище фейка отсутствует — попытка чтения провалила бы проход).
+// TestRenderLateAliasRenderedOrigin — a rendered original proves
+// the class's SPA verdict by itself (the T-259 P2-1 review): an alias with a lost
+// message is re-published even when the original is already rendered=true
+// (the original's content is a DOM, it must not be read: the original's hash is
+// absent from the fake's store — a read attempt would fail the pass).
 func TestRenderLateAliasRenderedOrigin(t *testing.T) {
 	f := newLateFixture(t)
 	ctx := context.Background()
 	f.pool.seedDomain(1, 10, "done", 0, model.StatusAlive)
 	orig := int16(5)
-	var missing content.Hash // есть только в строке, в хранилище нет
+	var missing content.Hash // it exists only in the row, not in the store
 	missing[0] = 0xEE
 	f.pool.seedRow(lateSeedRow{key: lateKey{zone: 1, domain: 10, sub: 5}, old: true, finalURL: "https://orig/", hash: missing[:], rendered: true})
 	f.pool.seedRow(lateSeedRow{key: lateKey{zone: 1, domain: 10, sub: 7}, old: true, finalURL: "https://alias/", aliasSub: &orig})
@@ -886,16 +886,16 @@ func TestRenderLateAliasRenderedOrigin(t *testing.T) {
 	}
 }
 
-// TestRenderLateSecondCapacityFull — первая проверка ёмкости свободна,
-// вторая (перед публикацией) — Full: публикаций нет, курсор на месте,
-// следующая пачка повторит (ревью T-259 P3-8).
+// TestRenderLateSecondCapacityFull — the first capacity check is free,
+// the second one (before the publication) — Full: no publications, the cursor in place,
+// the next chunk will repeat (the T-259 P3-8 review).
 func TestRenderLateSecondCapacityFull(t *testing.T) {
 	f := newLateFixture(t)
 	ctx := context.Background()
 	f.pool.seedDomain(1, 10, "spa", 0, model.StatusAlive)
 	f.pool.seedRow(lateSeedRow{key: lateKey{zone: 1, domain: 10}, old: true, finalURL: "https://spa/", hash: f.spaHash[:]})
-	// Глубина по вызовам: вход свободен (0), перед публикацией — полна
-	// (1000 при watermark 100; дальше повторяется последнее значение).
+	// The depth by calls: the entry is free (0), before the publication — full
+	// (1000 at a watermark of 100; further the last value repeats).
 	f.lenner.seq = []int64{0, 1000}
 	rq, err := NewRenderQueue(f.q, f.lenner, 100, nil)
 	if err != nil {
@@ -917,9 +917,9 @@ func TestRenderLateSecondCapacityFull(t *testing.T) {
 	}
 }
 
-// TestRenderLateTransientContentError — транзиентный сбой чтения тела:
-// строка пропускается (Skipped, Warn, не ошибка прохода), соседние
-// записи пачки издаются (ревью T-259 P3-8).
+// TestRenderLateTransientContentError — a transient body read failure:
+// the row is skipped (Skipped, a Warn, not a pass error), the neighboring
+// records of the chunk are published (the T-259 P3-8 review).
 func TestRenderLateTransientContentError(t *testing.T) {
 	f := newLateFixture(t)
 	ctx := context.Background()
@@ -942,7 +942,7 @@ func TestRenderLateTransientContentError(t *testing.T) {
 	}
 }
 
-// TestRenderLateValidation — швы прохода: nil-зависимости — ошибки.
+// TestRenderLateValidation — the pass's seams: nil dependencies — errors.
 func TestRenderLateValidation(t *testing.T) {
 	f := newLateFixture(t)
 	ctx := context.Background()
@@ -968,8 +968,8 @@ func TestRenderLateValidation(t *testing.T) {
 	}
 }
 
-// TestRenderLateDefaults — дефолты опций (интервал/пачка/окно/таймаут/
-// backoff) и состав стримов интерлока.
+// TestRenderLateDefaults — the options' defaults (the interval/chunk/window/timeout/
+// backoff) and the interlock streams' composition.
 func TestRenderLateDefaults(t *testing.T) {
 	o := LateOptions{}.withDefaults()
 	if o.Interval != DefaultRenderLateInterval || o.BatchSize != DefaultRenderLateBatch || o.After != DefaultRenderLateAfter {
@@ -999,11 +999,11 @@ func TestRenderLateDefaults(t *testing.T) {
 	}
 }
 
-// TestRenderLateLoop — цикл: тикер выполняет проходы, курсор цикла живёт
-// между тиками, интерлок собственных сообщений прекращает дубли, отмена
-// ctx — чистый nil. Без гонки на таймингах (ревью T-259 P3-10):
-// проверяется СТАБИЛИЗАЦИЯ числа публикаций после подстановки ключа в
-// снимок, а не точное число (дубль до подстановки ограничен и валиден).
+// TestRenderLateLoop — the loop: the ticker runs the passes, the loop's cursor lives
+// between the ticks, the own messages' interlock stops the duplicates, the ctx
+// cancellation — a clean nil. Without a race on the timings (the T-259 P3-10 review):
+// the STABILIZATION of the publications count after the key's insertion into the
+// snapshot is checked, not the exact count (a duplicate before the insertion is bounded and valid).
 func TestRenderLateLoop(t *testing.T) {
 	f := newLateFixture(t)
 	f.pool.seedDomain(1, 10, "spa", 0, model.StatusAlive)
@@ -1017,7 +1017,7 @@ func TestRenderLateLoop(t *testing.T) {
 			LateOptions{Interval: interval, BatchSize: 100, After: testLateAfter})
 	}()
 
-	// Первая публикация — за щедрый таймаут (CI-задержки).
+	// The first publication — within a generous timeout (the CI delays).
 	deadline := time.Now().Add(10 * time.Second)
 	for len(f.published()) == 0 {
 		if time.Now().After(deadline) {
@@ -1026,13 +1026,13 @@ func TestRenderLateLoop(t *testing.T) {
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
-	// Собственная публикация — живая задача: ключ в снимок, дальше
-	// тики видеть её обязаны; дубль до этого момента ограничен.
+	// The own publication — a live task: the key into the snapshot; further
+	// the ticks must see it; a duplicate before this moment is bounded.
 	pub := f.published()[0].msg
 	f.pending.add(queue.StreamRender, content.RetentionPendingKey{
 		Zone: pub.ZoneID, Domain: pub.DomainID, Sub: pub.SubdomainID, Variant: int16(pub.Variant)})
 
-	// Стабилизация: за 4+ тиков число публикаций не меняется.
+	// Stabilization: over 4+ ticks the publications count does not change.
 	time.Sleep(4 * interval)
 	n1 := len(f.published())
 	time.Sleep(4 * interval)
@@ -1049,11 +1049,11 @@ func TestRenderLateLoop(t *testing.T) {
 	}
 }
 
-// TestRenderLateLoop_Backoff — ошибка прохода переводит тикер в backoff
-// (T-271): тик 10-мс интервала не перезапускает проход немедленно
-// (инцидент 08–09.11.2026 — проход в только что поднятый после
-// OOM-килла PostgreSQL); тик паузы повторяет проход, дублей нет
-// (публикация не состоялась), Warn в журнале.
+// TestRenderLateLoop_Backoff — a pass error switches the ticker into the backoff
+// (T-271): a tick of the 10 ms interval does not restart the pass immediately
+// (the Nov 8–9, 2026 incident — a pass into a PostgreSQL just
+// raised after an OOM kill); the pause's tick repeats the pass, no duplicates
+// (the publication did not happen), a Warn in the journal.
 func TestRenderLateLoop_Backoff(t *testing.T) {
 	f := newLateFixture(t)
 	f.pool.seedDomain(1, 10, "spa", 0, model.StatusAlive)
@@ -1062,30 +1062,30 @@ func TestRenderLateLoop_Backoff(t *testing.T) {
 
 	var buf bytes.Buffer
 	opts := LateOptions{
-		Interval:     10 * time.Millisecond, // без backoff — ~10 проходов на 100 мс
+		Interval:     10 * time.Millisecond, // without the backoff — ~10 passes per 100 ms
 		BatchSize:    100,
 		After:        testLateAfter,
-		ErrorBackoff: 250 * time.Millisecond, // пауза ошибочного тика
+		ErrorBackoff: 250 * time.Millisecond, // the erroneous tick's pause
 		Log:          slog.New(slog.NewTextHandler(&buf, nil)),
 	}
 	attempts := func() int {
 		f.pool.mu.Lock()
 		defer f.pool.mu.Unlock()
-		return f.pool.begins // каждая попытка прохода открывает tx-оболочку выборки
+		return f.pool.begins // every pass attempt opens the selection's tx shell
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- RenderLateLoop(ctx, f.pool, f.bodies, f.renderQ(t), f.pending, f.met, opts) }()
 
-	// Первый тик ошибся; следующие тики интервала не перезапускают
-	// проход в пределах паузы backoff.
+	// The first tick failed; the following interval ticks do not restart
+	// the pass within the backoff pause.
 	time.Sleep(80 * time.Millisecond)
 	if n := attempts(); n != 1 {
 		cancel()
 		t.Fatalf("попыток за паузу backoff = %d, хочу 1 (без backoff ~8)", n)
 	}
-	// Тик паузы повторяет проход (ошибка держится — пауза сохраняется).
+	// The pause's tick repeats the pass (the error persists — the pause is kept).
 	deadline := time.Now().Add(3 * time.Second)
 	for attempts() < 2 && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
@@ -1098,8 +1098,8 @@ func TestRenderLateLoop_Backoff(t *testing.T) {
 		cancel()
 		t.Fatalf("публикаций = %d, хочу 0 (проходы ошибаются до издания)", pub)
 	}
-	// Лог читается только после остановки цикла: горутина цикла пишет в
-	// тот же буфер (ревью T-271 P2-1 — bytes.Buffer не потокобезопасен).
+	// The log is read only after the loop's stop: the loop's goroutine writes into
+	// the same buffer (the T-271 P2-1 review — bytes.Buffer is not concurrency-safe).
 	cancel()
 	select {
 	case <-done:
@@ -1111,18 +1111,18 @@ func TestRenderLateLoop_Backoff(t *testing.T) {
 	}
 }
 
-// TestRenderLateLoop_BackoffEveryErrorResetsTicker — семантика backoff
-// (T-273, главный диагностический пробел T-271): reset тикера после
-// КАЖДОЙ ошибки, пауза отсчитывается от конца ошибочного прохода.
-// До T-273 reset выполнялся только на первую ошибку (условие
-// !backoff): якорем тикера оставался конец первого прохода, повторные
-// ошибки шли паузой «backoff − длительность прохода» — каденс WARN-ов
-// маскировал длительность (инцидент 09–10.11.2026: «ровно 15 мин»
-// при 600-с проходах — реальная пауза 300 с). Проход здесь длится
-// дольше тика интервала (rowsDelay 150 мс > interval 40 мс) и
-// ошибается: старты проходов обязаны идти с паузой ≥ длительность
-// прохода + backoff. Здесь же — метрика ошибок (T-273): счётчик
-// crawler_render_late_errors_total растёт на каждом неудачном проходе.
+// TestRenderLateLoop_BackoffEveryErrorResetsTicker — the backoff
+// semantics (T-273, the T-271 main diagnostic gap): the ticker's reset after
+// EVERY error, the pause is counted from the erroneous pass's end.
+// Before T-273 the reset ran only for the first error (the
+// !backoff condition): the ticker's anchor stayed at the first pass's end, the repeated
+// errors went with a "backoff − the pass's duration" pause — the WARN cadence
+// masked the duration (the Nov 9–10, 2026 incident: "exactly 15 min"
+// at 600 s passes — the real pause 300 s). The pass here lasts
+// longer than the interval tick (rowsDelay 150 ms > interval 40 ms) and
+// fails: the pass starts must go with a pause ≥ the
+// pass's duration + the backoff. Here too — the errors metric (T-273): the
+// crawler_render_late_errors_total counter grows per every failed pass.
 func TestRenderLateLoop_BackoffEveryErrorResetsTicker(t *testing.T) {
 	f := newLateFixture(t)
 	f.pool.seedDomain(1, 10, "spa", 0, model.StatusAlive)
@@ -1143,9 +1143,9 @@ func TestRenderLateLoop_BackoffEveryErrorResetsTicker(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- RenderLateLoop(ctx, f.pool, f.bodies, f.renderQ(t), f.pending, f.met, opts) }()
 
-	// Три ЗАВЕРШЁННЫЕ ошибкой попытки за щедрый бюджет (пауза 650 мс:
-	// 150 проход + 500 backoff) — метрика растёт по факту ошибки, по ней
-	// и ждём: старт без ошибки (отмена в середине) не считается.
+	// Three attempts FINISHED with an error within a generous budget (a 650 ms pause:
+	// 150 pass + 500 backoff) — the metric grows by the fact of the error, by it
+	// we wait too: a start without an error (a cancellation mid-way) does not count.
 	deadline := time.Now().Add(5 * time.Second)
 	var starts []time.Time
 	for {
@@ -1167,9 +1167,9 @@ func TestRenderLateLoop_BackoffEveryErrorResetsTicker(t *testing.T) {
 	if len(starts) < 3 {
 		t.Fatalf("стартов прохода = %d, хочу ≥3", len(starts))
 	}
-	// Пауза между стартами ≥ проход (150 мс) + backoff (500 мс) − запас
-	// на планировщик (50 мс). Прошлая семантика давала ровно backoff
-	// между повторными ошибками — якорь тикера не переанкорился.
+	// The pause between the starts ≥ the pass (150 ms) + the backoff (500 ms) − headroom
+	// for the scheduler (50 ms). The former semantics gave exactly the backoff
+	// between the repeated errors — the ticker's anchor was not re-anchored.
 	const minGap = 150 + 500 - 50
 	for i := 1; i < len(starts); i++ {
 		if gap := starts[i].Sub(starts[i-1]); gap < minGap*time.Millisecond {
@@ -1177,9 +1177,9 @@ func TestRenderLateLoop_BackoffEveryErrorResetsTicker(t *testing.T) {
 				i-1, i, gap, minGap*time.Millisecond)
 		}
 	}
-	// Метрика ошибок (T-273): по одному инкременту на каждый неудачный
-	// проход (цикл остановлен — значение финально; последний старт мог
-	// быть прерван отменой, потому требование «≥3», а не равенство).
+	// The errors metric (T-273): one increment per every failed
+	// pass (the loop is stopped — the value is final; the last start could
+	// have been interrupted by the cancellation, hence the "≥3" requirement, not an equality).
 	if v := httpMetricValue(t, f.reg, "crawler_render_late_errors_total", nil); v < 3 {
 		t.Errorf("crawler_render_late_errors_total = %v, хочу ≥3 (по одному на каждый неудачный проход)", v)
 	}

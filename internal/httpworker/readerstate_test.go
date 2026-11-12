@@ -2,13 +2,13 @@ package httpworker
 
 import "testing"
 
-// TestWorkerReaderDecide — таблица переходов автомата режимов читателя
-// q:http (T-262, ТЗ-fsm §3 ФТ-8): наблюдения прохода → режим. Полная
-// таблица режимов (браузер/темп) — renderworker/readerstate.go; здесь
-// её q:http-проекция: датчиков браузера и темпа нет, режимы Б/Т
-// структурно недостижимы (browser=false, rate=false) — строки это
-// фиксируют, а две последние подтверждают тотальность функции на всех
-// пяти режимах enum'а (паритет автоматов воркеров).
+// TestWorkerReaderDecide — the mode automaton's transition table of the q:http
+// reader (T-262, TZ-fsm spec §3 FR-8): the pass's observations → a mode. The full
+// mode table (browser/rate) — renderworker/readerstate.go; here —
+// its q:http projection: there are no browser and rate sensors, the B/R modes
+// are structurally unreachable (browser=false, rate=false) — the rows fix
+// this, and the last two confirm the totality of the function on all
+// five modes of the enum (the workers' automaton parity).
 func TestWorkerReaderDecide(t *testing.T) {
 	const batch = 4
 	for _, c := range []struct {

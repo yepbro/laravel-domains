@@ -10,12 +10,12 @@ import (
 	"crawler/internal/model"
 )
 
-// Матричные тесты автомата состояния проверки схемы (T-266, ТЗ-fsm §3
-// ФТ-12): все легальные комбинации перечислены явно и принимаются
-// валидаторами; нелегальные — отвергаются. Матрицы и нумерация строк —
-// doc-комментарий schemestate.go.
+// Matrix tests of the scheme check state FSM (T-266, TZ-fsm spec §3
+// FR-12): all the legal combinations are listed explicitly and accepted
+// by the validators; the illegal ones are rejected. The matrices and the row numbering —
+// the schemestate.go doc comment.
 
-// matrixURL — URL фикстуры матрицы (валиден по построению).
+// matrixURL — a URL of the matrix fixture (valid by construction).
 func matrixURL(raw string) *url.URL {
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -24,8 +24,8 @@ func matrixURL(raw string) *url.URL {
 	return u
 }
 
-// TestSchemeCheckValidateMatrix — все 14 легальных состояний проверки
-// схемы (С1–С14): каждая строка матрицы принимается валидатором.
+// TestSchemeCheckValidateMatrix — all 14 legal check states
+// (S1–S14): every matrix row is accepted by the validator.
 func TestSchemeCheckValidateMatrix(t *testing.T) {
 	var (
 		h   = content.HashOf([]byte("matrix body"))
@@ -54,8 +54,8 @@ func TestSchemeCheckValidateMatrix(t *testing.T) {
 		{
 			"С4 кэш-попадание страницы С1",
 			SchemeCheck{Scheme: model.SchemeHTTPS, Available: true, Cached: true,
-				// FinalURL — стартовый URL проверки: осознанное
-				// искажение при кэш-попадании (schemestate.go).
+				//				// FinalURL — the check's starting URL: a deliberate
+				//				// distortion on a cache hit (schemestate.go).
 				FinalURL: matrixURL("https://x.example/"), Status: 200, ResponseMS: 40,
 				ContentHash: &h, ContentStored: true, SPA: &spa,
 				Redirects: []httpfetch.RedirectStep{{URL: "https://x.example/", Status: 200}}},
@@ -126,15 +126,15 @@ func TestSchemeCheckValidateMatrix(t *testing.T) {
 	}
 }
 
-// TestSchemeCheckValidateIllegal — нелегальные комбинации отклоняются
-// (метка — инвариант, чью ветку зажигает нарушение; порядок проверок в
-// validate() подобран так, чтобы каждая ветка была достижима).
+// TestSchemeCheckValidateIllegal — the illegal combinations are rejected
+// (the label — the invariant whose branch the violation ignites; the check order in
+// validate() is chosen so that every branch is reachable).
 func TestSchemeCheckValidateIllegal(t *testing.T) {
 	var (
 		h   = content.HashOf([]byte("matrix body"))
 		spa = httpfetch.SPAVerdict{}
 	)
-	// live — базовая живая проверка С1; dead — базовый мёртвый диал С7.
+	//	// live — the base live check S1; dead — the base dead dial S7.
 	live := func() SchemeCheck {
 		return SchemeCheck{Scheme: model.SchemeHTTPS, Available: true, FinalURL: matrixURL("https://x.example/"),
 			Status: 200, ResponseMS: 40, ContentHash: &h, ContentStored: true, SPA: &spa}
@@ -198,9 +198,9 @@ func TestSchemeCheckValidateIllegal(t *testing.T) {
 	}
 }
 
-// TestRecordValidateMatrix — контентная часть записи: все строки матрицы
-// Р1–Р8 на своих границах (до ContentSaver / после нормализации) плюс
-// минимальная запись прямого вызова newRecordBatch.
+// TestRecordValidateMatrix — the record's content part: all the matrix rows
+// R1–R8 at their boundaries (before ContentSaver / after the normalization) plus
+// a minimal direct newRecordBatch call record.
 func TestRecordValidateMatrix(t *testing.T) {
 	var (
 		h       = content.HashOf([]byte("record body"))
@@ -281,14 +281,14 @@ func TestRecordValidateMatrix(t *testing.T) {
 	}
 }
 
-// TestRecordValidateIllegal — нелегальные комбинации контентной части
-// отклоняются (по нарушению на инвариант П1–П7).
+// TestRecordValidateIllegal — the illegal combinations of the content part
+// are rejected (by the violation of a P1–P7 invariant).
 func TestRecordValidateIllegal(t *testing.T) {
 	var (
 		h       = content.HashOf([]byte("record body"))
 		aliasTo = int16(1)
 	)
-	// origin — Р1 (оригинал с контентом); alias — Р4 (алиас до Save).
+	//	// origin — R1 (an original with content); alias — R4 (an alias before Save).
 	origin := func() Record {
 		return Record{Variant: model.VariantMain, Scheme: model.SchemeHTTPS, SubdomainID: 0,
 			FinalURL: "https://x.example/", ContentHash: &h, ContentStored: true, StoreContent: true}
@@ -335,10 +335,10 @@ func TestRecordValidateIllegal(t *testing.T) {
 	}
 }
 
-// TestValidateResult — граница «перед ContentSaver» (конец ProcessDomain,
-// ФТ-12): валидатор результата домена принимает легальный результат
-// (живая проверка + запись Р1 + синтетика cutoff С14) и отвергает
-// нелегальные проверку/запись с контекстом субдомена.
+// TestValidateResult — the "before ContentSaver" boundary (the end of ProcessDomain,
+// FR-12): the domain result validator accepts a legal result
+// (a live check + an R1 record + the S14 cutoff synthetics) and rejects
+// an illegal check/record with the subdomain context.
 func TestValidateResult(t *testing.T) {
 	var (
 		h   = content.HashOf([]byte("result body"))
@@ -356,15 +356,15 @@ func TestValidateResult(t *testing.T) {
 					FinalURL: "https://ok.example/", ContentHash: &h, ContentStored: true, StoreContent: true}},
 			},
 			{
-				// Синтетика dead-host cutoff (С14): записей нет.
+				//			// The dead-host cutoff synthetics (S14): no records.
 				SubdomainID: 2, Label: "blog", Hostname: "blog.ok.example",
 				HTTPS: SchemeCheck{Scheme: model.SchemeHTTPS, ErrClass: ErrCutoff, ErrText: "dead-host cutoff (T-164)"},
 				HTTP:  SchemeCheck{Scheme: model.SchemeHTTP, ErrClass: ErrCutoff, ErrText: "dead-host cutoff (T-164)"},
 			},
 		},
 	}
-	// clone — копия результата с собственными срезами (мутации кейсов
-	// не должны протекать в базовый legal).
+	//	// clone — a copy of the result with its own slices (the cases' mutations
+	//	// must not leak into the base legal).
 	clone := func(res *DomainResult) *DomainResult {
 		out := *res
 		out.Subdomains = append([]SubdomainResult(nil), res.Subdomains...)
@@ -379,13 +379,13 @@ func TestValidateResult(t *testing.T) {
 	}
 
 	badCheck := clone(legal)
-	badCheck.Subdomains[0].HTTPS.ContentHash = nil // И4: Available без хэша
+	badCheck.Subdomains[0].HTTPS.ContentHash = nil // I4: Available without a hash
 	if err := validateResult(badCheck); err == nil || !strings.Contains(err.Error(), "ok.example") {
 		t.Fatalf("ожидалась ошибка валидации проверки с контекстом субдомена: %v", err)
 	}
 
 	badRecord := clone(legal)
-	badRecord.Subdomains[0].Records[0].ContentNotStored = true // П4: при живом хэше
+	badRecord.Subdomains[0].Records[0].ContentNotStored = true // P4: with a live hash
 	if err := validateResult(badRecord); err == nil || !strings.Contains(err.Error(), "T-056") {
 		t.Fatalf("ожидалась ошибка валидации записи: %v", err)
 	}

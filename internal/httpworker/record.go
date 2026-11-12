@@ -1,90 +1,90 @@
-// Запись результата HTTP-эпизода в subdomain_results и публикация q:analyze
-// (T-058; ТЗ 5.5 пп. 7, 9, §6.1, §7, §8, §3.4). Файл замыкает конвейер
-// этапа: DomainResult (T-053) после сохранения контента (ContentSaver,
-// T-056) превращается в строки subdomain_results одним пакетом, домен
-// получает итоговый статус и done, каждая запись публикуется в q:analyze
-// (Result, T-024). Точка вызова — Options.OnResult в сборке сервиса
-// (cmd/http-worker), вслед за ContentSaver и до XACK.
+// Writing the HTTP episode's result into subdomain_results and the q:analyze publication
+// (T-058; spec 5.5 items 7, 9, §6.1, §7, §8, §3.4). The file closes the
+// stage's pipeline: DomainResult (T-053) after storing the content (ContentSaver,
+// T-056) turns into subdomain_results rows by one batch, the domain
+// receives the final status and done, every record is published into q:analyze
+// (Result, T-024). The call point — Options.OnResult in the service build
+// (cmd/http-worker), right after ContentSaver and before the XACK.
 //
-// Статус домена (§5.5 п. 9, §7): есть записи (хоть один субдомен ответил
-// по хоть одному протоколу) → alive; записей нет и среди проверок есть
-// таймауты (ErrTimeout) → temp_error — «SERVFAIL, таймауты» (ТЗ 6.2),
-// повтор эпизода назначит планировщик (T-031); записей нет и веб молчит
-// постоянно → no_http. check_state = done — домен завершён после DNS/HTTP
-// (§7: «домен считается done после завершения DNS/HTTP-этапа, а
-// результаты рендера и анализа дополняют его асинхронно»); rendered =
-// false (DOM заменит сырой HTML рендер, T-067), rules_version = NULL
-// (проставит анализатор, T-068+), render_failed_at — DEFAULT NULL:
-// перезапись эпизода (DELETE + INSERT) сбрасывает маркер «рендер
-// невозможен» (T-210) — новый контент имеет право на рендер.
-// queued_at = NULL и last_checked_at =
-// now() — стиль T-039: lease завершён вместе с эпизодом (инвариант
-// T-018/T-029/T-030), время — сервер БД; temp_attempts сбрасывается на
-// каждом не-temp_error итоге (контракт T-031, как у DNS-этапа T-039).
+// The domain status (§5.5 item 9, §7): there are records (at least one subdomain answered
+// over at least one protocol) → alive; no records and among the checks there are
+// timeouts (ErrTimeout) → temp_error — "SERVFAIL, timeouts" (spec 6.2),
+// the scheduler will schedule the episode's repeat (T-031); no records and the web is silent
+// constantly → no_http. check_state = done — the domain is finished after DNS/HTTP
+// (§7: "a domain is considered done after the DNS/HTTP stage completes, and
+// the render and analysis results complement it asynchronously"); rendered =
+// false (the render will replace the raw HTML with the DOM, T-067), rules_version = NULL
+// (the analyzer will set it, T-068+), render_failed_at — DEFAULT NULL:
+// the episode's rewrite (DELETE + INSERT) resets the "render
+// impossible" marker (T-210) — the new content has the right to a render.
+// queued_at = NULL and last_checked_at =
+// now() — the T-039 style: the lease is finished together with the episode (the
+// T-018/T-029/T-030 invariant), the time — the DB server's; temp_attempts is reset at
+// every non-temp_error outcome (the T-031 contract, as at the DNS stage T-039).
 //
-// Порядок операций (ТЗ 3.4, §5.5 п. 9 «после записи результата
-// публикуется задача в q:analyze»; ТЗ 4.2 «XACK только после записи
-// результата в БД»):
+// The operation order (spec 3.4, §5.5 item 9 "after writing the result
+// a task is published into q:analyze"; spec 4.2 "the XACK only after writing
+// the result into the DB"):
 //
-//		запись в БД (одна транзакция) → публикация q:analyze → XACK
+//		the write into the DB (one transaction) → the q:analyze publication → the XACK
 //
-//	  - запись и своп ссылок на контент — ОДНА транзакция (SwapRefTx, T-044:
-//	    раздельные транзакции опасны в обе стороны — строка без ссылки или
-//	    ссылка без строки). Внутри: UPDATE domains (охрана удаления) →
-//	    DELETE старых строк субдомен×вариант с RETURNING content_hash →
-//	    −1 refcount каждого старого хэша → INSERT новых строк; хвостовыми
-//	    шагами — дельты счётчиков: зон (T-178), рендер-долга (T-175),
-//	    суточного счётчика проверок checks:YYYY-MM-DD, его числителя
-//	    temp_error:YYYY-MM-DD (T-179/T-182 — события записи, авторитет —
-//	    реконсиляция monitor), корзины зрелости ретрая
-//	    retry_mature:YYYY-MM-DD (T-202 — temp_error-эпизоды, зреющие к
-//	    полуночи; декремент — ретрай планировщика) и часовой корзины
-//	    темпа results:YYYY-MM-DD"T"HH24 (T-203 — вставленные строки
-//	    эпизода; корзину rendered-темпа ведёт render-worker);
-//	  - публикация q:analyze — ПОСЛЕ фиксации транзакции: потребитель Result
-//	    (анализатор, T-068+) читает запись из БД по ключу — сообщение раньше
-//	    строки смотрело бы в пустоту. Сбой публикации → доставка q:http без
-//	    XACK: повторная доставка перезапишет тот же результат (идемпотентно,
-//	    см. ниже) и опубликует q:analyze заново — дубликаты сообщений
-//	    ограничены попытками доставки (at-least-once, ТЗ 3.4; потребитель
-//	    обязан быть идемпотентным по ключу — тот же контракт, что у XACK,
-//	    потерявшего ответ);
-//	  - публикация q:render (SPA-вердикты T-057) — T-066, renderq.go:
-//	    неблокирующая проверка ёмкости q:render ДО транзакции; переполнение
-//	    — флаг render_pending ТОЙ ЖЕ транзакцией (§3.4), при свободной
-//	    очереди — публикация после фиксации мимо WatermarkPublisher
-//	    (§5.6: рендер не задерживает остальные этапы — XACK не ждёт
-//	    ёмкости).
+//	  - the write and the content reference swap — ONE transaction (SwapRefTx, T-044:
+//	    separate transactions are dangerous in both directions — a row without a reference or
+//	    a reference without a row). Inside: UPDATE domains (the deletion guard) →
+//	    DELETE of the old subdomain×variant rows with RETURNING content_hash →
+//	    −1 refcount of every old hash → INSERT of the new rows; the tail
+//	    steps — the counter deltas: the zones (T-178), the render debt (T-175),
+//	    the daily checks counter checks:YYYY-MM-DD, its numerator
+//	    temp_error:YYYY-MM-DD (T-179/T-182 — write events, the authority —
+//	    the monitor's reconciliation), the retry maturity
+//	    bucket retry_mature:YYYY-MM-DD (T-202 — temp_error episodes maturing toward
+//	    midnight; the decrement — the scheduler's retry) and the hourly
+//	    throughput bucket results:YYYY-MM-DD"T"HH24 (T-203 — the inserted rows
+//	    of the episode; the rendered-throughput bucket is kept by the render-worker);
+//	  - the q:analyze publication — AFTER the transaction commit: the Result
+//	    consumer (the analyzer, T-068+) reads the record from the DB by key — a message
+//	    earlier than the row would stare into the void. A publication failure → the q:http delivery
+//	    without an XACK: a repeated delivery will rewrite the same result (idempotently,
+//	    see below) and publish q:analyze again — the message duplicates
+//	    are bounded by the delivery attempts (at-least-once, spec 3.4; the consumer
+//	    must be idempotent by key — the same contract as an XACK
+//	    that lost its answer);
+//	  - the q:render publication (the SPA verdicts T-057) — T-066, renderq.go:
+//	    a non-blocking capacity check of q:render BEFORE the transaction; an overflow
+//	    — the render_pending flag by THE SAME transaction (§3.4), with a free
+//	    queue — the publication after the commit bypassing WatermarkPublisher
+//	    (§5.6: the render does not delay the other stages — the XACK does not wait
+//	    for the capacity).
 //
-// Идемпотентность повторной доставки (ТЗ 3.4): перезапись результата —
-// DELETE+INSERT строк домена (§3.5 «история проверок не хранится: только
-// последний результат» — удаляются ВСЕ строки домена, включая ключи,
-// которых нет в новом результате, например пропавший субдомен). Охрана
-// одна — status <> deleted (§8/§13.1: удалённому во время проверки домену
-// результат не записывается; строка блокируется UPDATE-ом и delete-файл
-// T-019 либо успевает раньше — запись пропускается, либо позже — статус
-// перетирается в deleted, оставшиеся строки вычистит T-020). Охраны
-// check_state <> done (как у T-039) НЕТ, и это осознанный выбор: порядок
-// «запись → публикация» оставляет окно «записано, q:analyze не
-// опубликовано» — повтор доставки обязан-publishнуть заново, а фильтр
-// done отбросил бы публикацию навсегда (анализ ждал бы перепроверки
-// T-030, ~полгода). Плата — теоретическая гонка со свежей перепроверкой
-// (зависшее без XACK сообщение пережило бы полный цикл recheck): попытки
-// доставки исчерпываются в q:dead за минуты (T-025), а recheck-интервал
-// измеряется месяцами (§3.3) — окно практически недостижимо. Ранний
-// recheck «статус повис» (T-270, Р15 спецификации check_state)
-// сокращает «месяцы» до суток: дубль задачи ожившего воркера (включая
-// полуночный борт когорты — комментарий stalerequeue.go) гасится этой
-// же идемпотентностью: перезапись эпизода DELETE+INSERT, переиздание
-// q:analyze (канонический текст асимметрии — internal/model/enums.go,
-// А3).
+// The idempotency of a repeated delivery (spec 3.4): the result's rewrite —
+// DELETE+INSERT of the domain's rows (§3.5 "the check history is not stored: only
+// the last result" — ALL the domain's rows are deleted, including the keys
+// absent from the new result, for example a vanished subdomain). The guard
+// is one — status <> deleted (§8/§13.1: a domain deleted during the check
+// gets no result written; the row is locked by the UPDATE and the delete
+// T-019 either makes it in time earlier — the write is skipped, or later — the status
+// is overwritten into deleted, T-020 will clean up the remaining rows). There is NO
+// check_state <> done guard (as at T-039), and this is a deliberate choice: the order
+// "write → publish" leaves the window "written, q:analyze not
+// published" — a delivery repeat must-publish again, and the done
+// filter would drop the publication forever (the analysis would wait for the
+// T-030 recheck, ~half a year). The price — a theoretical race with a fresh recheck
+// (a message stuck without an XACK would survive a full recheck cycle): the delivery
+// attempts are exhausted into q:dead within minutes (T-025), and the recheck interval
+// is measured in months (§3.3) — the window is practically unreachable. The early
+// recheck "the status hangs" (T-270, R15 of the check_state specification)
+// shortens the "months" to days: a duplicate task of a revived worker (including
+// the cohort's midnight boarding — the stalerequeue.go comment) is extinguished by this
+// same idempotency: the episode's rewrite DELETE+INSERT, the q:analyze
+// re-publication (the canonical asymmetry text — internal/model/enums.go,
+// A3).
 //
-// Учёт refcount (T-044/T-056): новые content_hash уже получили +1 от Put
-// ContentSaver-а (T-056, до записи) — здесь только −1 удаляемым строкам:
-// SwapRefTx(old, нулевой Hash) — примитив «новый нулевой → только −старому».
-// Повтор доставки сохраняет баланс: повторный Put даёт лишний +1 (безопасная
-// утечка места, T-056), DELETE той же строки — −1; уход в минус невозможен
-// (охрана refcount > 0, расхождение — ErrRefIntegrity с откатом, T-044).
+// The refcount accounting (T-044/T-056): the new content_hash values already received +1 from the
+// ContentSaver's Put (T-056, before the write) — here only −1 to the deleted rows:
+// SwapRefTx(old, a zero Hash) — the "a new zero → only −to the old" primitive.
+// A delivery repeat keeps the balance: a repeated Put gives an extra +1 (a safe
+// space leak, T-056), the DELETE of the same row — −1; going negative is impossible
+// (the refcount > 0 guard, a divergence — ErrRefIntegrity with a rollback, T-044).
 package httpworker
 
 import (
@@ -107,83 +107,83 @@ import (
 	"crawler/internal/queue"
 )
 
-// SQL записи результата. Коды схемы — литералами, а не данными (стиль
-// T-039); now() — время транзакции сервера БД: checked_at строк и
-// last_checked_at домена — один момент (transaction_timestamp стабилен
-// внутри транзакции).
+// The result write SQL. The schema codes — as literals, not data (the
+// T-039 style); now() — the DB server's transaction time: the rows' checked_at and
+// the domain's last_checked_at — one moment (transaction_timestamp is stable
+// inside a transaction).
 //
-// Переход check_state здесь — строка Р4 спецификации автомата (единая
-// точка правды: internal/scheduler/checkstate.go, T-255).
+// The check_state transition here — row R4 of the automaton specification (the
+// single source of truth: internal/scheduler/checkstate.go, T-255).
 //
-// # Таблица решений HTTP-этапа автомата status (T-256, ТЗ-fsm §3 ФТ-2)
+// # The HTTP stage's branch of the status automaton's decision table (T-256, TZ-fsm spec §3 FR-2)
 //
-// Общая часть (все этапы и писатели) — одной таблицей в
-// internal/model/enums.go у кодов model.Status; здесь — развёртка
-// HTTP-веток (О7–О9, строки А2/А3 асимметрий). Вердикт вычисляет чистая
-// функция recordStatus (внизу файла; контракт — юнит-тест таблицы
-// решений TestRecordStatusDecision), запись ведёт recordDomainSQL:
+// The common part (all the stages and writers) — one table in
+// internal/model/enums.go at the model.Status codes; here — the deployment of
+// the HTTP branches (O7–O9, the A2/A3 asymmetry rows). The verdict is computed by a pure
+// function recordStatus (at the bottom of the file; the contract — the decision
+// table's unit test TestRecordStatusDecision), the write is done by recordDomainSQL:
 //
-//	| Ветка | Условие эпизода (DomainResult) | Статус | Источник условия |
+//	| Branch | The episode's condition (DomainResult) | Status | The condition's source |
 //	|-------|-------------------------------|--------|------------------|
-//	| В1 (О7) | HasRecords: хоть один субдомен×протокол ответил (живая запись результата) | alive | записи DomainResult (вставляет recordInsertSQL) |
-//	| В2 (О8) | записей нет И AnyTimeout: среди проверок есть таймаут-класс ErrTimeout — connect-таймаут, TLS, заголовки, общий, анти-тарпит | temp_error | workerClassifyError → ErrTimeout (httpfetch.IsTimeout: net.Error.Timeout) |
-//	| В3 (О9) | записей нет, таймаутов нет — веб молчит постоянно: connection refused (ErrNetwork), сбой TLS-рукопожатия (ErrTLS), лимит редиректов (ErrRedirects), обрезка тела (ErrBody), dead-host cutoff синтетических проверок (ErrCutoff, IsTemp false) | no_http | workerClassifyError → прочие классы (IsTemp false) |
+//	| B1 (O7) | HasRecords: at least one subdomain×protocol answered (a live result record) | alive | the DomainResult records (recordInsertSQL inserts) |
+//	| B2 (O8) | no records AND AnyTimeout: among the checks there is the ErrTimeout timeout class — a connect timeout, TLS, headers, the overall, the anti-tarpit | temp_error | workerClassifyError → ErrTimeout (httpfetch.IsTimeout: net.Error.Timeout) |
+//	| B3 (O9) | no records, no timeouts — the web is silent constantly: connection refused (ErrNetwork), a TLS handshake failure (ErrTLS), the redirects limit (ErrRedirects), a body truncation (ErrBody), the dead-host cutoff of synthetic checks (ErrCutoff, IsTemp false) | no_http | workerClassifyError → the other classes (IsTemp false) |
 //
-// Осознанные асимметрии этапа (решения общей таблицы, НЕ меняются):
+// The stage's deliberate asymmetries (the common table's decisions, NOT changed):
 //
-//	А2  connect-refused → В3 (no_http), connect-таймаут → В2 (temp_error):
-//	    RST на SYN — порт закрыт, постоянное свойство хоста; молчание SYN —
-//	    транзиент сети/файрвола, повтор имеет смысл. Классы разведены
-//	    workerClassifyError (ECONNREFUSED не является net.Error-таймаутом
-//	    → ErrNetwork; таймаут диала → ErrTimeout).
-//	А3  recordDomainSQL пишет итог БЕЗ охраны check_state <> done (в
-//	    отличие от DNS-операторов): порядок «запись → публикация»
-//	    оставляет окно «записано, q:analyze не опубликовано» — повторная
-//	    доставка обязана переиздать публикацию, фильтр done отбросил бы
-//	    её навсегда (комментарий файла, идемпотентность ТЗ 3.4).
+//	A2  connect-refused → B3 (no_http), a connect timeout → B2 (temp_error):
+//	    an RST on a SYN — the port is closed, a permanent host property; a SYN silence —
+//	    a network/firewall transient, a repeat makes sense. The classes are separated by
+//	    workerClassifyError (ECONNREFUSED is not a net.Error timeout
+//	    → ErrNetwork; a dial timeout → ErrTimeout).
+//	A3  recordDomainSQL writes the outcome WITHOUT the check_state <> done guard (unlike
+//	    the DNS operators): the "write → publish" order
+//	    leaves the window "written, q:analyze not published" — a repeated
+//	    delivery must re-publish, the done filter would drop
+//	    it forever (the file comment, the spec 3.4 idempotency).
 var (
-	// recordDomainSQL — итоговый статус эпизода HTTP (alive/no_http/
-	// temp_error, §7), done, сброс lease и счётчика повторов (контракт
-	// T-031), бит dead_host_cutoff последнего эпизода (T-164). Охрана
-	// status <> deleted — §8/§13.1; UPDATE первым шагом транзакции
-	// блокирует строку домена: конкурентные записи эпизода
-	// сериализуются, решение об удалении принимается на актуальной
-	// версии строки. Охраны check_state <> done нет — повторная доставка
-	// перезаписывает результат (комментарий файла).
+	// recordDomainSQL — the HTTP episode's final status (alive/no_http/
+	// temp_error, §7), done, the lease and retry counter reset (the
+	// T-031 contract), the dead_host_cutoff bit of the last episode (T-164). The
+	// status <> deleted guard — §8/§13.1; the UPDATE as the transaction's first step
+	// locks the domain's row: the concurrent episode writes
+	// are serialized, the deletion decision is made on the current
+	// row version. There is no check_state <> done guard — a repeated delivery
+	// rewrites the result (the file comment).
 	recordDomainSQL = "UPDATE domains AS t " +
 		"SET status = $3::int2, " +
 		fmt.Sprintf("temp_attempts = CASE WHEN $3::int2 = %d THEN t.temp_attempts ELSE 0 END, ", int16(model.StatusTempError)) +
 		fmt.Sprintf("check_state = %d, queued_at = NULL, last_checked_at = now(), ", int16(model.CheckStateDone)) +
-		// Бит dead_host_cutoff (T-164) — признак ПОСЛЕДНЕГО эпизода:
-		// cutoff-эпизод ставит (контрольная выборка ложных cutoff-ов
-		// выбирает домены по маске бита), обычный снимает. Побитовые
-		// операторы PostgreSQL повышают smallint до int — возврат
-		// ::int2 (стиль renderq.go), маска снятия — знаковый ~бита.
+		// The dead_host_cutoff bit (T-164) — the sign of the LAST episode:
+		// a cutoff episode sets it (the control sample of false cutoffs
+		// selects the domains by the bit mask), a usual one removes it. The bitwise
+		// PostgreSQL operators promote smallint to int — the return
+		// ::int2 (the renderq.go style), the removal mask — a signed ~of the bit.
 		fmt.Sprintf("flags = CASE WHEN $4::bool THEN (t.flags | %d)::int2 ELSE (t.flags & %d)::int2 END ",
 			int16(model.FlagDeadHostCutoff), int16(^int16(model.FlagDeadHostCutoff))) +
 		fmt.Sprintf("WHERE t.zone_id = $1::int2 AND t.id = $2::int8 AND t.status <> %d", int16(model.StatusDeleted))
 
-	// recordSelectStateSQL — точечное предчтение старых значений строки
-	// домена перед UPDATE (T-178, ТЗИ §6.4): PG 16 без RETURNING OLD, а
-	// recordDomainSQL не пинирует старый check_state (охрана только по
-	// статусу). SELECT … FOR UPDATE первым шагом транзакции берёт на себя
-	// роль блокировки строки («UPDATE первым шагом блокирует строку»
-	// прежде): конкурентные записи эпизода сериализуются, решение об
-	// удалении принимается на актуальной версии строки. PK-лукап —
-	// дополнительная цена одна точечная PK-чтение на домен (темп
-	// завершений — десятки в секунду по замеру §12) против точных дельт
-	// счётчиков зон (дубль-доставка, возврат аренды посреди обработки).
+	// recordSelectStateSQL — a point pre-read of the domain row's old values
+	// before the UPDATE (T-178, incremental-counters spec §6.4): PG 16 has no RETURNING OLD, and
+	// recordDomainSQL does not pin the old check_state (the guard only by
+	// the status). SELECT … FOR UPDATE as the transaction's first step takes over
+	// the row locking role ("the UPDATE as the first step locks the row"
+	// formerly): the concurrent episode writes are serialized, the deletion
+	// decision is made on the current row version. A PK lookup —
+	// the extra price is one point PK read per domain (the
+	// completion rate — tens per second by the §12 measurement) against the exact
+	// zone counter deltas (a duplicate delivery, a lease return mid-processing).
 	recordSelectStateSQL = "SELECT status, check_state FROM domains " +
 		"WHERE zone_id = $1::int2 AND id = $2::int8 FOR UPDATE"
 
-	// recordZoneShiftSQL — дельта счётчиков зоны по старому состоянию
-	// переведённой строки (T-178): queued/…−1 (дельты параметрами:
-	// −1 старой колонки, +1 checked; старое done — дубль-доставка, дельты
-	// нулевые — повторная запись результата уже выводила домен из queued
-	// при первом проходе, ТЗИ §6.4). Той же транзакцией, что и запись
-	// результата: откат откатывает пару. RowsAffected != 1 — строка зоны
-	// отсутствует (возможна только при ручной правке справочника,
-	// runbooks §6): молчаливый дрейф недопустим, ошибка громче (стиль
+	// recordZoneShiftSQL — the zone counters' delta by the old state
+	// of the translated row (T-178): queued/…−1 (the deltas as parameters:
+	// −1 of the old column, +1 checked; an old done — a duplicate delivery, the deltas
+	// zero — a repeated result write already led the domain out of queued
+	// at the first pass, incremental-counters spec §6.4). By the same transaction as the result
+	// write: a rollback rolls back the pair. RowsAffected != 1 — the zone row
+	// is absent (possible only with a manual edit of the reference table,
+	// runbooks §6): a silent drift is unacceptable, the error is louder (the
 	// renderBumpDebtCounter, T-175).
 	recordZoneShiftSQL = "UPDATE zones " +
 		"SET domains_pending = domains_pending + $2::int8, " +
@@ -191,140 +191,140 @@ var (
 		"domains_checked = domains_checked + $4::int8 " +
 		"WHERE id = $1::int2"
 
-	// recordChecksBumpSQL — инкремент суточного счётчика проверок
+	// recordChecksBumpSQL — the daily checks counter increment
 	// crawler_counters['checks:YYYY-MM-DD'] (T-179, TZ_slow_done_today
-	// §5): upsert с наращиванием — строку нового дня создаёт первый
-	// инкремент после полуночи (ротация не создаёт работы, вчерашняя
-	// строка остаётся историей темпа — 365 строк/год, чистка не нужна).
-	// Имя дня вычисляет БД ('checks:' || current_date): таймзона
-	// согласована с now() записи last_checked_at (T-058) и с окном
-	// реконсиляции monitor — Go-часы в имени не участвуют. Счётчик
-	// считает события записи результата (§5.1): повтор эпизода того же
-	// домена в те же сутки даёт +1 при живом count(*), дающем 0 —
-	// расхождение восстанавливает реконсиляция (FILTER-позиция прохода
-	// T-178), дрейф — наблюдаемая метрика.
+	// §5): an upsert with an increment — the new day's row is created by the
+	// first increment after midnight (the rotation creates no work, the yesterday's
+	// row remains the throughput history — 365 rows/year, no cleaning needed).
+	// The day name is computed by the DB ('checks:' || current_date): the timezone
+	// is agreed with the last_checked_at write's now() (T-058) and with the
+	// monitor reconciliation window — the Go clocks do not participate in the name. The counter
+	// counts the result write events (§5.1): an episode repeat of the same
+	// domain on the same day gives +1 with a live count(*) giving 0 —
+	// the divergence is repaired by the reconciliation (the FILTER positions of the
+	// T-178 pass), the drift — an observable metric.
 	recordChecksBumpSQL = "INSERT INTO crawler_counters (name, value, updated_at) " +
 		"VALUES ('checks:' || to_char(current_date, 'YYYY-MM-DD'), $1::int8, now()) " +
 		"ON CONFLICT (name) DO UPDATE " +
 		"SET value = crawler_counters.value + EXCLUDED.value, updated_at = now()"
 
-	// recordTempErrBumpSQL — инкремент суточного числителя доли temp_error
+	// recordTempErrBumpSQL — the daily temp_error share numerator increment
 	// crawler_counters['temp_error:YYYY-MM-DD'] (T-182, TZ_slow_dns_share
-	// §5): тот же upsert-паттерн, что recordChecksBumpSQL (T-179); имя
-	// дня вычисляет БД — таймзона согласована с now() записи
-	// last_checked_at и окном реконсиляции. Дельта — 1 на эпизод,
-	// записанный с итоговым статусом temp_error (вердикт recordStatus —
-	// один на домен, не по числу строк субдомен×вариант); итоги без
-	// temp_error оператор не выполняют вовсе — строку нового дня создаёт
-	// первый temp_error-эпизод, до него читатель доли видит честный ноль.
-	// Семантика — события записей, как у знаменателя (§5.1): ретрай,
-	// закрывший ошибку, остаётся в истории событий — доля устойчива к
-	// дублям доставки (числитель и знаменатель растут вместе), абсолюты
-	// чинит реконсиляция.
+	// §5): the same upsert pattern as recordChecksBumpSQL (T-179); the
+	// day name is computed by the DB — the timezone is agreed with the
+	// last_checked_at write's now() and the reconciliation window. The delta — 1 per episode
+	// written with the final status temp_error (the recordStatus verdict —
+	// one per domain, not by the number of subdomain×variant rows); the outcomes without
+	// temp_error do not run the operator at all — the new day's row is created by
+	// the first temp_error episode, before it the share reader sees an honest zero.
+	// The semantics — the write events, as at the denominator (§5.1): a retry
+	// that closed the error stays in the events history — the share is resilient to
+	// the delivery duplicates (the numerator and the denominator grow together), the absolutes
+	// are fixed by the reconciliation.
 	recordTempErrBumpSQL = "INSERT INTO crawler_counters (name, value, updated_at) " +
 		"VALUES ('temp_error:' || to_char(current_date, 'YYYY-MM-DD'), $1::int8, now()) " +
 		"ON CONFLICT (name) DO UPDATE " +
 		"SET value = crawler_counters.value + EXCLUDED.value, updated_at = now()"
 
-	// recordRetryMatureBumpSQL — инкремент корзины зрелости temp_error
-	// crawler_counters['retry_mature:YYYY-MM-DD'] (T-202): эпизод,
-	// записанный сегодня с итогом temp_error, зреет к полуночи следующего
-	// дня (окно ретрая «старше 24 ч» по date-колонке last_checked_at —
-	// ключ корзины вычисляет БД из current_date, тот же ключ декремент
-	// ретрая выводит из last_checked_at, а реконсиляция — FILTER-позициями
-	// прохода; guard retryMatureSQL суммирует корзины прошедших суток и не
-	// пускает тяжёлую выборку кандидатов при нулевой сумме — актуализация
-	// guard T-191, отличавшая «temp_error есть» от «зрелые есть»).
-	// Upsert-паттерн recordChecksBumpSQL/recordTempErrBumpSQL: строку
-	// корзины создаёт первый эпизод суток, дельта — RowsAffected итогового
-	// UPDATE (1 на эпизод); выполняют только temp_error-итоги — событие
-	// зрелости порождает именно temp_error-эпизод, прочие итоги корзин не
-	// касаются. Дубль-доставки и повторные эпизоды тех же суток дают +1 к
-	// живому нулю — потоковая семантика событий (как у суточных строк,
-	// TZ_slow_done_today §5.1), абсолюты выравнивает реконсиляция.
+	// recordRetryMatureBumpSQL — the temp_error maturity bucket increment
+	// crawler_counters['retry_mature:YYYY-MM-DD'] (T-202): an episode
+	// written today with a temp_error outcome matures toward the next
+	// day's midnight (the "older than 24 h" retry window by the last_checked_at date column —
+	// the bucket key is computed by the DB from current_date, the same key the retry
+	// decrement derives from last_checked_at, and the reconciliation — by the FILTER
+	// positions of the pass; the retryMatureSQL guard sums the past day's buckets and does
+	// not let the heavy candidate selection run at a zero sum — the
+	// guard update of T-191, which used to distinguish "there are temp_errors" from "there are mature ones").
+	// The recordChecksBumpSQL/recordTempErrBumpSQL upsert pattern: the
+	// bucket's row is created by the first episode of the day, the delta — the final
+	// UPDATE's RowsAffected (1 per episode); only the temp_error outcomes run it — the
+	// maturity event is produced exactly by a temp_error episode, the other outcomes do not
+	// touch the buckets. Duplicate deliveries and repeated episodes of the same day give +1 to a
+	// live zero — the streaming event semantics (as at the daily rows,
+	// TZ_slow_done_today §5.1), the reconciliation levels the absolutes.
 	recordRetryMatureBumpSQL = "INSERT INTO crawler_counters (name, value, updated_at) " +
 		"VALUES ('retry_mature:' || to_char(current_date, 'YYYY-MM-DD'), $1::int8, now()) " +
 		"ON CONFLICT (name) DO UPDATE " +
 		"SET value = crawler_counters.value + EXCLUDED.value, updated_at = now()"
 
-	// recordReanalyzeBumpSQL — инкремент корзины неанализированных хвостов
-	// crawler_counters['reanalyze:YYYY-MM-DD"T"HH24'] (T-204): +N — строк
-	// subdomain_results, вставленных этой транзакцией с rules_version =
-	// NULL (дельта — RowsAffected recordInsertSQL; час —
-	// date_trunc('hour', now()) той же транзакции = час checked_at строк,
-	// имя корзины вычисляет БД). Корзину ведут и декремент штампа
-	// анализатора (worker.go, час эпизода строки), и инкремент замены
-	// контента рендером (renderworker, час эпизода из RETURNING);
-	// авторитет — реконсиляция monitor (FILTER-позиции prev/cur агрегата
-	// окна двух живых часов). Guard тикового прохода переанализа
-	// (analyzer/reanalyze.go, reanalyzeGuardSQL) суммирует корзины старше
-	// текущего часа — записанное сейчас попадает в незрелую корзину
-	// текущего часа и guard не открывает (in-flight-поток записи →
-	// q:analyze → штамп занимает секунды); переживший границу часа без
-	// штампа — потерянная публикация, зрелый хвост — открывает guard,
-	// тик вычитывает окно и публикует. Молчаливые эпизоды (без строк)
-	// дельту 0 не пишут вовсе. Перезапись эпизода удаляет старые строки
-	// без декремента — потоковая семантика событий против живых строк
-	// (как у results:, T-203), абсолюты выравнивает реконсиляция.
-	// Upsert-паттерн recordChecksBumpSQL; порядок блокировок — после
-	// retry_mature: и перед results: (проход реконсиляции ведёт семьи
-	// «… → retry_mature: → reanalyze: → rendered: → results:», rendered:
-	// этой транзакции не касается) — без циклов.
+	// recordReanalyzeBumpSQL — the unanalyzed tails bucket increment
+	// crawler_counters['reanalyze:YYYY-MM-DD"T"HH24'] (T-204): +N — the
+	// subdomain_results rows inserted by this transaction with rules_version =
+	// NULL (the delta — recordInsertSQL's RowsAffected; the hour —
+	// date_trunc('hour', now()) of the same transaction = the hour of the rows' checked_at,
+	// the bucket name is computed by the DB). The bucket is maintained by both the analyzer's stamp
+	// decrement (worker.go, the row's episode hour) and the render's content replacement
+	// increment (renderworker, the episode hour from RETURNING);
+	// the authority — the monitor reconciliation (the prev/cur FILTER positions of the
+	// two live hours' window aggregate). The reanalysis tick pass's guard
+	// (analyzer/reanalyze.go, reanalyzeGuardSQL) sums the buckets older than
+	// the current hour — what is written now lands in the immature
+	// current-hour bucket and the guard does not open (the write →
+	// q:analyze → stamp in-flight flow takes seconds); a survivor past the hour boundary without
+	// a stamp — a lost publication, a mature tail — opens the guard,
+	// the tick reads out the window and publishes. Silent episodes (without rows)
+	// do not write a zero delta at all. The episode's rewrite deletes the old rows
+	// without a decrement — the streaming event semantics against live rows
+	// (as at results:, T-203), the reconciliation levels the absolutes.
+	// The recordChecksBumpSQL upsert pattern; the lock order — after
+	// retry_mature: and before results: (the reconciliation pass keeps the families
+	// "… → retry_mature: → reanalyze: → rendered: → results:", rendered:
+	// is not touched by this transaction) — without cycles.
 	recordReanalyzeBumpSQL = "INSERT INTO crawler_counters (name, value, updated_at) " +
 		"VALUES ('reanalyze:' || to_char(date_trunc('hour', now()), 'YYYY-MM-DD\"T\"HH24'), $1::int8, now()) " +
 		"ON CONFLICT (name) DO UPDATE " +
 		"SET value = crawler_counters.value + EXCLUDED.value, updated_at = now()"
 
-	// recordResultsBumpSQL — инкремент часовой корзины темпа
-	// crawler_counters['results:YYYY-MM-DD"T"HH24'] (T-203): +N — строк
-	// subdomain_results, вставленных этой транзакцией (дельта —
-	// RowsAffected recordInsertSQL; checked_at строк = now() той же
-	// транзакции, потому date_trunc('hour', now()) — час строк, имя
-	// корзины вычисляет БД — таймзона согласована с now() записи,
-	// читателем и реконсиляцией). Живой аналог — прежний подзапрос
-	// results_hour throughputSQL (count(*) по subdomain_results,
-	// checked_at >= now() − 1 ч): index-only по свежим страницам окна
-	// деградировал heap-fetch'ами — контрольная точка этапа 27 (тот же
-	// механизм, что у суточного окна T-179). Корзина — календарный час:
-	// скользящее окно читатель собирает суммой двух живых корзин
-	// (status.go throughputSQL), авторитет — реконсиляция monitor
-	// (FILTER-позиции прохода по subdomain_results). Эпизоды без строк
-	// (temp_error/no_http) дельту 0 не пишут вовсе — корзину часа создаёт
-	// первая вставленная строка. Дубль-доставка перезаписывает строки
-	// эпизода: удалённые из окна строки не декрементируются — потоковая
-	// семантика событий (как у суточных строк, TZ_slow_done_today §5.1),
-	// абсолюты выравнивает реконсиляция. Upsert-паттерн
-	// recordChecksBumpSQL; порядок блокировок — последней среди строк
-	// счётчика транзакции (после retry_mature: и reanalyze:), общий с
-	// проходом реконсиляции «… → retry_mature: → reanalyze: → rendered:
-	// → results:» — без циклов (rendered: этой транзакции не касается —
-	// её ведёт renderworker).
+	// recordResultsBumpSQL — the hourly throughput bucket increment
+	// crawler_counters['results:YYYY-MM-DD"T"HH24'] (T-203): +N — the
+	// subdomain_results rows inserted by this transaction (the delta —
+	// recordInsertSQL's RowsAffected; the rows' checked_at = the same
+	// transaction's now(), therefore date_trunc('hour', now()) — the rows' hour, the
+	// bucket name is computed by the DB — the timezone is agreed with the write's now(),
+	// the reader and the reconciliation). The live analog — the former
+	// results_hour throughputSQL subquery (count(*) over subdomain_results,
+	// checked_at >= now() − 1 h): index-only over the window's fresh pages
+	// degraded by heap fetches — the stage 27 checkpoint (the same
+	// mechanism as the daily window of T-179). The bucket — a calendar hour:
+	// the sliding window is assembled by the reader as the sum of the two live buckets
+	// (status.go throughputSQL), the authority — the monitor reconciliation
+	// (the pass's FILTER positions over subdomain_results). The episodes without rows
+	// (temp_error/no_http) do not write a zero delta at all — the hour's bucket is created by
+	// the first inserted row. A duplicate delivery rewrites the
+	// episode's rows: the rows leaving the window are not decremented — the streaming
+	// event semantics (as at the daily rows, TZ_slow_done_today §5.1),
+	// the reconciliation levels the absolutes. The recordChecksBumpSQL upsert pattern;
+	// the lock order — the last among the transaction's counter rows
+	// (after retry_mature: and reanalyze:), shared with the
+	// reconciliation pass "… → retry_mature: → reanalyze: → rendered:
+	// → results:" — without cycles (rendered: is not touched by this transaction —
+	// it is kept by the renderworker).
 	recordResultsBumpSQL = "INSERT INTO crawler_counters (name, value, updated_at) " +
 		"VALUES ('results:' || to_char(date_trunc('hour', now()), 'YYYY-MM-DD\"T\"HH24'), $1::int8, now()) " +
 		"ON CONFLICT (name) DO UPDATE " +
 		"SET value = crawler_counters.value + EXCLUDED.value, updated_at = now()"
 
-	// recordDeleteSQL — перезапись результата (§3.5): удаляются все строки
-	// домена, RETURNING собирает content_hash для свопа ссылок (T-044).
-	// Ведущие колонки PK (zone_id, domain_id) — партиционирование LIST по
-	// zone_id и субпартиционирование HASH (T-005) режут поиск до листа.
+	// recordDeleteSQL — the result's rewrite (§3.5): all the domain's rows are deleted,
+	// RETURNING collects the content_hash values for the reference swap (T-044).
+	// The leading PK columns (zone_id, domain_id) — the LIST partitioning by
+	// zone_id and the HASH subpartitioning (T-005) cut the search down to a leaf.
 	recordDeleteSQL = "DELETE FROM subdomain_results " +
 		"WHERE zone_id = $1::int2 AND domain_id = $2::int8 " +
 		"RETURNING content_hash"
 
-	// recordInsertSQL — новые строки одним оператором: INSERT … SELECT
-	// FROM unnest($n::type[]…) — каждая колонка один параметр-массив
-	// (стиль db.Update, T-007), пачка ≤ 126 строк (субдомены ≤ 63 ×
-	// варианты ≤ 2) не упирается в лимит протокола. COPY отклонён:
-	// выигрыш копирования проявляется на тысячах строк, а unnest-INSERT —
-	// один оператор транзакции с точным SQL-контрактом в юнит-тестах
-	// (фантазировать с CopyFrom-источником поверх транзакции сложнее,
-	// чем массивы). rendered = false (рендер — T-067), rules_version =
-	// NULL (анализатор — T-068+), checked_at = now(). render_failed_at
-	// в список не входит — DEFAULT NULL: перезапись эпизода (DELETE +
-	// INSERT) сбрасывает маркер «рендер невозможен» (T-210) — новый
-	// контент имеет право на рендер, починившийся хост отрендерится на
-	// следующем эпизоде.
+	// recordInsertSQL — the new rows by one operator: INSERT … SELECT
+	// FROM unnest($n::type[]…) — every column is one array parameter
+	// (the db.Update style, T-007), a chunk ≤ 126 rows (subdomains ≤ 63 ×
+	// variants ≤ 2) does not hit the protocol limit. COPY is rejected:
+	// the copying win shows on thousands of rows, while the unnest-INSERT is
+	// one transaction operator with an exact SQL contract in the unit tests
+	// (fantasizing with a CopyFrom source over a transaction is harder
+	// than arrays). rendered = false (the render — T-067), rules_version =
+	// NULL (the analyzer — T-068+), checked_at = now(). render_failed_at
+	// is not in the list — DEFAULT NULL: the episode's rewrite (DELETE +
+	// INSERT) resets the "render impossible" marker (T-210) — the new
+	// content has the right to a render, a host that fixed itself will render at
+	// the next episode.
 	recordInsertSQL = "INSERT INTO subdomain_results (" +
 		"zone_id, domain_id, subdomain_id, variant, scheme, " +
 		"http_status, final_url, alias_kind, alias_subdomain_id, " +
@@ -345,40 +345,40 @@ var (
 		"content_hash, error, response_ms)"
 )
 
-// RecordDB — пул для записи результата: db.DB с транзакциями (стиль
-// content.RefDB, ingest.CleanupDB). Запись результата и своп ссылок идут
-// одной транзакцией (ТЗ 3.4); *pgxpool.Pool удовлетворяет интерфейсу.
+// RecordDB — the pool for writing the result: db.DB with transactions (the
+// content.RefDB, ingest.CleanupDB style). The result write and the reference swap go
+// in one transaction (spec 3.4); *pgxpool.Pool satisfies the interface.
 type RecordDB interface {
 	db.DB
 	Begin(ctx context.Context) (pgx.Tx, error)
 }
 
-// Recorder — записывает результат HTTP-эпизода в subdomain_results,
-// переводит домен в итоговый статус и публикует q:analyze (T-058), а при
-// подключённой очереди рендера — q:render по SPA-записям с флагом
-// render_pending при переполнении (T-066, renderq.go). Подключается
-// сборкой сервиса в Options.OnResult — вслед за ContentSaver (T-056:
-// новый контент уже имеет +1 refcount от Put) и до XACK (ТЗ 4.2).
-// Потокобезопасен: состояние неизменно после New.
+// Recorder — writes the HTTP episode's result into subdomain_results,
+// moves the domain into the final status and publishes q:analyze (T-058), and with
+// a render queue wired — q:render over the SPA records with the
+// render_pending flag on an overflow (T-066, renderq.go). Wired
+// by the service build into Options.OnResult — right after ContentSaver (T-056:
+// the new content already has +1 refcount from the Put) and before the XACK (spec 4.2).
+// Concurrency-safe: the state is immutable after New.
 type Recorder struct {
 	pool RecordDB
 	q    queue.Queue
-	// render — очередь рендера (T-066): nil у NewRecorder — этап рендера
-	// отключён (q:render не публикуется, флаг не ставится); ставится
+	// render — the render queue (T-066): nil at NewRecorder — the render
+	// stage is off (q:render is not published, the flag is not set); set by
 	// NewRenderRecorder.
 	render *RenderQueue
-	// met — приборы этапа (T-268): хук счётчика 40P01-повторов транзакции
-	// записи crawler_db_deadlock_retried_total; nil — no-op (изолированные
-	// сборки/тесты).
+	// met — the stage's instruments (T-268): the crawler_db_deadlock_retried_total write
+	// transaction 40P01-retry counter hook; nil — a no-op (isolated
+	// builds/tests).
 	met *Metrics
 	log *slog.Logger
 }
 
-// NewRecorder строит записатель поверх пула БД и очереди (продакшн —
-// *pgxpool.Pool и очередь под WatermarkPublisher, T-026). nil-зависимости
-// (пул/очередь) — ошибка: тихая потеря результата/публикации незаметна
-// для оператора; met может быть nil — без метрик. Боевой записатель
-// собирает NewRenderRecorder.
+// NewRecorder builds the writer over a DB pool and a queue (production —
+// *pgxpool.Pool and a queue under WatermarkPublisher, T-026). nil dependencies
+// (the pool/the queue) — an error: a silent loss of a result/publication is invisible
+// to the operator; met may be nil — without metrics. The production writer
+// is assembled by NewRenderRecorder.
 func NewRecorder(pool RecordDB, q queue.Queue, met *Metrics, log *slog.Logger) (*Recorder, error) {
 	if pool == nil {
 		return nil, errors.New("httpworker: запись результата: пул не задан")
@@ -392,24 +392,24 @@ func NewRecorder(pool RecordDB, q queue.Queue, met *Metrics, log *slog.Logger) (
 	return &Recorder{pool: pool, q: q, met: met, log: log}, nil
 }
 
-// RecordAndPublish записывает результат домена одной транзакцией (UPDATE
-// domains + флаг render_pending при переполнении q:render, T-066 + DELETE
-// старых строк + своп ссылок contents + INSERT новых, ТЗ 3.4/§5.5 п. 7)
-// и после фиксации публикует q:analyze по одному Result на запись
-// субдомен×вариант (формат T-024) и q:render по SPA-записям при
-// свободной очереди (T-066). Транзакция идёт под 40P01-ретраем (T-268,
-// recordTx): дедлок повторяется целиком — идемпотентность записи (ТЗ 3.4)
-// делает повтор безопасным, а ределивери q:http стоил бы полный
-// HTTP-эпизод (инцидент 07.11 — runbooks.md §2.8).
-// Возвращает false без ошибки, когда охрана отсекла запись (домен удалён
-// — §8/§13.1, или строки нет): это успех, публикация не нужна. Ошибка —
-// сбой любого шага: доставка q:http не подтверждается и вернётся
-// повторной доставкой (Processing, T-025); повторная доставка перезапишет
-// результат идемпотентно и заново решит вопрос рендера (флаг — CASE-free:
-// ставится только при переполнении, снимает проход доработки renderq.go).
+// RecordAndPublish writes the domain result by one transaction (UPDATE
+// domains + the render_pending flag on a q:render overflow, T-066 + DELETE
+// of the old rows + the contents reference swap + INSERT of the new, spec 3.4/§5.5 item 7)
+// and after the commit publishes q:analyze with one Result per
+// subdomain×variant record (the T-024 format) and q:render over the SPA records with
+// a free queue (T-066). The transaction runs under a 40P01 retry (T-268,
+// recordTx): a deadlock is repeated entirely — the write's idempotency (spec 3.4)
+// makes the repeat safe, and a q:http redelivery would cost a full
+// HTTP episode (the Nov 7 incident — runbooks.md §2.8).
+// Returns false without an error when the guard cut off the write (the domain is deleted
+// — §8/§13.1, or the row is absent): this is a success, no publication is needed. An error —
+// a failure of any step: the q:http delivery is not acknowledged and will come back
+// with a repeated delivery (Processing, T-025); the repeated delivery will rewrite
+// the result idempotently and decide the render question again (the flag is CASE-free:
+// it is set only on an overflow, the renderq.go rework pass removes it).
 func (r *Recorder) RecordAndPublish(ctx context.Context, res *DomainResult) (bool, error) {
 	if res == nil {
-		return false, nil // не бывает (processDelivery); защита прямых вызовов
+		return false, nil // does not happen (processDelivery); the guard of direct calls
 	}
 	batch, err := newRecordBatch(res)
 	if err != nil {
@@ -417,12 +417,12 @@ func (r *Recorder) RecordAndPublish(ctx context.Context, res *DomainResult) (boo
 	}
 	status := recordStatus(res)
 
-	// T-066: SPA-ключи q:render (§5.5 п. 8) и решение о ёмкости — ДО
-	// транзакции: при переполнении флаг render_pending фиксируется той же
-	// транзакцией результата (§3.4), потому решение нужно до её открытия.
-	// Проверка неблокирующая (HasCapacity, не WatermarkPublisher):
-	// ожидание ёмкости задержало бы XACK — рендер не должен задерживать
-	// остальные этапы (§5.6).
+	// T-066: the q:render SPA keys (§5.5 item 8) and the capacity decision — BEFORE
+	// the transaction: on an overflow the render_pending flag is committed by the same
+	// result transaction (§3.4), therefore the decision is needed before its opening.
+	// The check is non-blocking (HasCapacity, not WatermarkPublisher):
+	// waiting for the capacity would delay the XACK — the render must not delay
+	// the other stages (§5.6).
 	var renderKeys []queue.Result
 	renderPending := false
 	if r.render != nil {
@@ -430,10 +430,10 @@ func (r *Recorder) RecordAndPublish(ctx context.Context, res *DomainResult) (boo
 		if len(renderKeys) > 0 {
 			free, err := r.render.HasCapacity(ctx)
 			if err != nil {
-				// XLEN недоступен — консервативно «места нет»: флаг
-				// сохраняет задачи рендера, эпизод не задерживается;
-				// настоящая недоступность Redis всё равно вернёт
-				// доставку на публикации q:analyze ниже.
+				// XLEN is unavailable — conservatively "no room": the
+				// flag preserves the render tasks, the episode is not delayed;
+				// a real Redis unavailability will still return
+				// the delivery at the q:analyze publication below.
 				r.log.Warn("ёмкость q:render не проверена — домен помечен render_pending",
 					"domain", res.Name, "err", err)
 				free = false
@@ -442,13 +442,13 @@ func (r *Recorder) RecordAndPublish(ctx context.Context, res *DomainResult) (boo
 		}
 	}
 
-	// Транзакция записи — под 40P01-ретраем (T-268): повтор ЦЕЛИКОМ,
-	// транзакция идемпотентна (охрана удаления §8/§13.1, перезапись
-	// DELETE+INSERT — ТЗ 3.4), ределивери q:http стоил бы полный
-	// HTTP-эпизод (инцидент 07.11 — runbooks.md §2.8). Публикации —
-	// после фиксации ПОПЫТКИ и вне ретрая: у упавшей транзакции их не
-	// было, у зафиксированной повтор не выполняется (ошибка публикации —
-	// не дедлок).
+	// The write transaction — under a 40P01 retry (T-268): the repeat is WHOLE,
+	// the transaction is idempotent (the deletion guard §8/§13.1, the rewrite
+	// DELETE+INSERT — spec 3.4), a q:http redelivery would cost a full
+	// HTTP episode (the Nov 7 incident — runbooks.md §2.8). The publications —
+	// after the ATTEMPT's commit and outside the retry: the failed transaction had none,
+	// for the committed one the repeat does not run (a publication error is
+	// not a deadlock).
 	var (
 		recorded bool
 		swapped  int
@@ -464,11 +464,11 @@ func (r *Recorder) RecordAndPublish(ctx context.Context, res *DomainResult) (boo
 		return false, nil
 	}
 
-	// Публикация q:analyze после записи (§5.5 п. 9): Result указывает на
-	// строку — она обязана существовать к моменту потребления. Все записи
-	// домена: анализ идёт по каждому результату субдомен×вариант, рендер
-	// (T-067) позже заменит контент и опубликует заново — граница этапов,
-	// не фильтр здесь.
+	// The q:analyze publication after the write (§5.5 item 9): Result points to
+	// the row — it must exist by the moment of consumption. All the
+	// domain's records: the analysis goes over every subdomain×variant result, the
+	// render (T-067) will later replace the content and publish again — the stages' boundary,
+	// not a filter here.
 	for i := range batch.pub {
 		if _, err := r.q.Publish(ctx, queue.StreamAnalyze, batch.pub[i]); err != nil {
 			return true, fmt.Errorf("httpworker: домен %s: публикация q:analyze (запись %d/%d): %w",
@@ -476,11 +476,11 @@ func (r *Recorder) RecordAndPublish(ctx context.Context, res *DomainResult) (boo
 		}
 	}
 
-	// q:render по SPA-записям (T-066, §5.5 п. 8): после фиксации — как и
-	// q:analyze, Result указывает на строку. Только при свободной очереди:
-	// переполнение уже закрыто флагом в транзакции. Публикация мимо
-	// WatermarkPublisher (T-026) — ёмкость проверена выше, ожидание здесь
-	// задержало бы XACK (§5.6).
+	// q:render over the SPA records (T-066, §5.5 item 8): after the commit — as
+	// q:analyze, Result points to the row. Only with a free queue:
+	// the overflow is already closed by the flag in the transaction. The publication bypassing
+	// WatermarkPublisher (T-026) — the capacity was checked above, waiting here
+	// would delay the XACK (§5.6).
 	if len(renderKeys) > 0 && !renderPending {
 		if err := r.render.Publish(ctx, renderKeys); err != nil {
 			return true, fmt.Errorf("httpworker: домен %s: %w", res.Name, err)
@@ -494,31 +494,31 @@ func (r *Recorder) RecordAndPublish(ctx context.Context, res *DomainResult) (boo
 	return true, nil
 }
 
-// recordTx — ОДНА попытка транзакции записи результата (T-058; точка
-// повтора 40P01 — T-268): предчтение строки домена FOR UPDATE → UPDATE
-// итогового статуса (+ флаг render_pending при переполнении q:render,
-// T-066) → DELETE старых строк + своп ссылок contents (T-044) → INSERT
-// новых → хвостовые дельты счётчиков (зоны T-178, рендер-долг T-175,
-// сутки/корзины T-179/T-182/T-202/T-203/T-204) → Commit. Возвращает
-// false без ошибки, когда запись не нужна (строки нет или домен удалён —
-// §8/§13.1); swapped — число снятых ссылок на контент (для журнала).
-// Откат прерванной попытки — defer Rollback (после Commit — no-op):
-// повтор транзакции с чистого листа, половинчатых состояний нет.
+// recordTx — ONE attempt of the result write transaction (T-058; the 40P01
+// retry point — T-268): the FOR UPDATE pre-read of the domain's row → the UPDATE
+// of the final status (+ the render_pending flag on a q:render overflow,
+// T-066) → DELETE of the old rows + the contents reference swap (T-044) → INSERT
+// of the new → the tail counter deltas (the zones T-178, the render debt T-175,
+// the day/buckets T-179/T-182/T-202/T-203/T-204) → Commit. Returns
+// false without an error when the write is not needed (the row is absent or the domain is deleted —
+// §8/§13.1); swapped — the number of removed content references (for the journal).
+// The rollback of an interrupted attempt — a defer Rollback (after the Commit — a no-op):
+// the transaction is repeated from a clean slate, there are no half-done states.
 func (r *Recorder) recordTx(ctx context.Context, res *DomainResult, batch *recordBatch, status model.Status, renderPending bool) (bool, int, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return false, 0, fmt.Errorf("httpworker: домен %s: запись результата: транзакция: %w", res.Name, err)
 	}
-	// Откат безусловно: после Commit — no-op (стиль T-044).
+	// The rollback unconditionally: after the Commit — a no-op (the T-044 style).
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	// Старые значения строки первым шагом (T-178, ТЗИ §6.4): FOR UPDATE
-	// блокирует строку домена (роль, которую прежде выполнял UPDATE),
-	// статус/check_state дают дельты счётчиков зоны. Отсутствие строки и
-	// deleted — те же штатные исходы, что раньше давал RowsAffected = 0
-	// UPDATE: пустой результат — откат пустой транзакции, false без
-	// ошибки (§8/§13.1: удалённому во время проверки домену результат не
-	// записывается).
+	// The old row values as the first step (T-178, incremental-counters spec §6.4): FOR UPDATE
+	// locks the domain's row (the role the UPDATE used to play),
+	// the status/check_state give the zone counters' deltas. An absent row and
+	// deleted — the same graceful outcomes the UPDATE's RowsAffected = 0
+	// used to give: an empty result — a rollback of an empty transaction, false without
+	// an error (§8/§13.1: a domain deleted during the check gets no
+	// result written).
 	var oldStatus, oldState int16
 	err = tx.QueryRow(ctx, recordSelectStateSQL, res.ZoneID, res.DomainID).Scan(&oldStatus, &oldState)
 	if err != nil {
@@ -535,41 +535,41 @@ func (r *Recorder) recordTx(ctx context.Context, res *DomainResult, batch *recor
 		return false, 0, nil
 	}
 
-	// Итог домена: строка заблокирована предчтением и не удалена — охрана
-	// UPDATE по статусу сохранена (второй рубеж против ручных правок
-	// между операторами). Четвёртый параметр — бит dead_host_cutoff
-	// последнего эпизода (T-164).
+	// The domain's outcome: the row is locked by the pre-read and not deleted — the
+	// UPDATE's status guard is preserved (the second line of defense against manual
+	// edits between the operators). The fourth parameter — the dead_host_cutoff
+	// bit of the last episode (T-164).
 	tag, err := tx.Exec(ctx, recordDomainSQL, res.ZoneID, res.DomainID, int16(status), res.Cutoff)
 	if err != nil {
 		return false, 0, fmt.Errorf("httpworker: домен %s: запись результата: статус: %w", res.Name, err)
 	}
 	if tag.RowsAffected() != 1 {
-		// Строка заблокирована и не удалена — недостижимо (страховка
-		// прямых вызовов/ручных правок); тихий пропуск дельт сделал бы
-		// счётчики ложью.
+		// The row is locked and not deleted — unreachable (a guard
+		// for direct calls/manual edits); a silent skip of the deltas would make
+		// the counters a lie.
 		return false, 0, fmt.Errorf("httpworker: домен %s: запись результата: статус: затронуто %d строк", res.Name, tag.RowsAffected())
 	}
-	// RowsAffected итогового UPDATE — дельта суточного счётчика проверок
-	// (T-179, TZ_slow_done_today §5): не число записей subdomain_results
-	// пачки (домен с пятью субдомен×вариант — один эпизод, +1); охрана
-	// deleted/отсутствие строки отсекли запись выше — до сюда доходят
-	// только записанные результаты.
+	// The final UPDATE's RowsAffected — the daily checks counter's delta
+	// (T-179, TZ_slow_done_today §5): not the number of the chunk's
+	// subdomain_results records (a domain with five subdomain×variants — one episode, +1); the
+	// deleted guard/the absent row cut off the write above — only the written
+	// results reach this point.
 	recorded := tag.RowsAffected()
 
-	// Флаг render_pending — той же транзакцией (T-066, §5.6): решение
-	// относится к этому результату (переполнение q:render в момент
-	// записи), сбой фиксации откатывает и строки, и флаг. Охрана бита
-	// (T-175): RowsAffected 1 — реальный переход 0→1 (счётчик долга +1
-	// здесь же, той же транзакцией, renderBumpDebtCounter), 0 — флаг уже
-	// стоит (повторная доставка эпизода, пока проход доработки не
-	// снял): семантика OR идемпотентна, счётчик наращивается только на
-	// переходы. Домен заблокирован UPDATE выше — ноль у SET бывает
-	// только от уже стоящего бита; отсутствие строки счётчика — отдельная
-	// ошибка шага ниже, откатывающая транзакцию целиком.
-	// Сдвиг счётчика выполняется последним оператором перед фиксацией
-	// (bumpDebt ниже): строка счётчика — единая точка сериализации всех
-	// флажащих транзакций (ревью T-175, P3-4), держать её блокировку
-	// всю тяжёлую часть (DELETE/своп ссылок/INSERT) незачем.
+	// The render_pending flag — by the same transaction (T-066, §5.6): the decision
+	// belongs to this result (the q:render overflow at the moment
+	// of the write), a commit failure rolls back both the rows and the flag. The bit's
+	// guard
+	// (T-175): RowsAffected 1 — a real 0→1 transition (the debt counter +1
+	// here as well, by the same transaction, renderBumpDebtCounter), 0 — the flag is
+	// already set (a repeated episode delivery while the rework pass has
+	// not cleared it): the OR semantics is idempotent, the counter is incremented only on
+	// the transitions. The domain is locked by the UPDATE above — a zero from the SET
+	// happens only from an already set bit; an absent counter row — a separate
+	// step error below, rolling back the whole transaction.
+	// The counter shift runs as the last operator before the commit
+	// (bumpDebt below): the counter's row — the single serialization point of all
+	// flagging transactions (the T-175 review, P3-4); holding its lock through the
 	bumpDebt := false
 	if renderPending {
 		tag, err := tx.Exec(ctx, renderSetPendingSQL, res.ZoneID, res.DomainID)
@@ -582,8 +582,8 @@ func (r *Recorder) recordTx(ctx context.Context, res *DomainResult, batch *recor
 		bumpDebt = tag.RowsAffected() == 1
 	}
 
-	// Перезапись (§3.5): старые строки домена уходят целиком, их ссылки
-	// на контент снимаются здесь же — строка и счётчик не расходятся
+	// The rewrite (§3.5): the domain's old rows go entirely, their content
+	// references are removed right here — the row and the counter do not diverge (T-044).
 	// (T-044).
 	oldHashes, err := recordDeleteOld(ctx, tx, res.ZoneID, res.DomainID)
 	if err != nil {
@@ -595,9 +595,9 @@ func (r *Recorder) recordTx(ctx context.Context, res *DomainResult, batch *recor
 		}
 	}
 
-	// inserted — строки subdomain_results этой транзакции: дельта
-	// часовой корзины темпа results: (T-203); эпизоды без записей
-	// (молчаливые проверки) корзину не трогают.
+	// inserted — this transaction's subdomain_results rows: the delta
+	// of the results: hourly throughput bucket (T-203); the episodes without records
+	// (silent checks) do not touch the bucket.
 	var inserted int64
 
 	if len(batch.zone) > 0 {
@@ -608,15 +608,15 @@ func (r *Recorder) recordTx(ctx context.Context, res *DomainResult, batch *recor
 		if int(tag.RowsAffected()) != len(batch.zone) {
 			return false, 0, fmt.Errorf("httpworker: домен %s: вставлено %d строк из %d", res.Name, tag.RowsAffected(), len(batch.zone))
 		}
-		// Строки эпизода — дельта часовой корзины темпа (T-203): все
-		// вставленные строки несут checked_at = now() транзакции — час
-		// корзины один (date_trunc в инкременте ниже).
+		// The episode's rows — the hourly throughput bucket's delta (T-203): all
+		// the inserted rows carry checked_at = the transaction's now() — the
+		// bucket's hour is one (date_trunc in the increment below).
 		inserted = tag.RowsAffected()
 	}
-	// Дельта счётчиков зоны — той же транзакцией (T-178, ТЗИ §6.4): по
-	// старому check_state предчтения (старое done — дубль-доставка, нули).
-	// Последние шаги перед фиксацией — строка зоны блокируется на
-	// минимум (как строка счётчика долга ниже, ревью T-175, P3-4).
+	// The zone counters' delta — by the same transaction (T-178, incremental-counters spec §6.4): by
+	// the pre-read's old check_state (an old done — a duplicate delivery, zeros).
+	// The last steps before the commit — the zone's row is locked for
+	// a minimum (like the debt counter's row below, the T-175 review, P3-4).
 	shiftZone := func() error {
 		var dPending, dQueued, dChecked int64
 		switch model.CheckState(oldState) {
@@ -625,12 +625,12 @@ func (r *Recorder) recordTx(ctx context.Context, res *DomainResult, batch *recor
 		case model.CheckStateQueued:
 			dQueued, dChecked = -1, 1
 		case model.CheckStateDone:
-			// Дубль-доставка: повторная запись результата уже выводила
-			// домен из queued при первом проходе — без дельт (ТЗИ §6.4).
+			// A duplicate delivery: a repeated result write already led
+			// the domain out of queued at the first pass — no deltas (incremental-counters spec §6.4).
 			return nil
 		default:
-			// Код вне перечисления — мусор в схеме; молчаливый пропуск
-			// дельт сделал бы счётчики ложью, ошибка громче.
+			// A code outside the enum — garbage in the schema; a silent skip
+			// of the deltas would make the counters a lie, the error is louder.
 			return fmt.Errorf("старое состояние %d вне перечисления check_state", oldState)
 		}
 		tag, err := tx.Exec(ctx, recordZoneShiftSQL, res.ZoneID, dPending, dQueued, dChecked)
@@ -645,65 +645,65 @@ func (r *Recorder) recordTx(ctx context.Context, res *DomainResult, batch *recor
 	if err := shiftZone(); err != nil {
 		return false, 0, fmt.Errorf("httpworker: домен %s: %w", res.Name, err)
 	}
-	// Счётчик долга — последним шагом транзакции (та же фиксация, §3.4:
-	// откат откатывает пару; окно блокировки строки счётчика — минимум).
+	// The debt counter — the transaction's last step (the same commit, §3.4:
+	// a rollback rolls back the pair; the counter row's lock window — a minimum).
 	if bumpDebt {
 		if err := renderBumpDebtCounter(ctx, tx, 1); err != nil {
 			return false, 0, fmt.Errorf("httpworker: домен %s: %w", res.Name, err)
 		}
 	}
-	// Суточный счётчик проверок — тем же «хвостовым» шагом (T-179):
-	// последним оператором перед фиксацией, после зоны и рендер-долга —
-	// строка текущего дня сериализует все записи результатов (как
-	// render_pending, ревью T-175 P3-4), держать её блокировку всю
-	// тяжёлую часть транзакции незачем; порядок «render_pending →
-	// checks:» общий с реконсиляцией monitor (зоны → скаляры → строка
-	// дня) — без циклов блокировок. Дельта — RowsAffected UPDATE выше
-	// (проверка != 1 гарантирует 1; параметр сохранён по контракту
-	// «$1 — RowsAffected», ТЗ §5). Откат откатывает результат и дельту
-	// вместе (§3.4); сбой XACK вернёт доставку — повторная запись
-	// добавит ещё событие (§5.1, сводит реконсиляция).
+	// The daily checks counter — the same "tail" step (T-179):
+	// the last operator before the commit, after the zone and the render debt —
+	// the current day's row serializes all the result writes (like
+	// render_pending, the T-175 P3-4 review), holding its lock through the
+	// whole heavy part of the transaction is pointless; the "render_pending →
+	// checks:" order is shared with the monitor reconciliation (the zones → the scalars → the
+	// day row) — without lock cycles. The delta — the UPDATE's RowsAffected above
+	// (the != 1 check guarantees 1; the parameter kept by the contract
+	// "$1 — RowsAffected", spec §5). A rollback rolls back the result and the delta
+	// together (§3.4); an XACK failure will return the delivery — a repeated write
+	// will add one more event (§5.1, the reconciliation levels it out).
 	if err := recordBumpChecksCounter(ctx, tx, recorded); err != nil {
 		return false, 0, fmt.Errorf("httpworker: домен %s: %w", res.Name, err)
 	}
-	// Числитель доли temp_error (T-182) — следом за знаменателем checks:
-	// дельта — только у temp_error-эпизода (вердикт итогового UPDATE
-	// известен выше), прочие итоги строку дня не трогают — блокировки
-	// сериализации temp_error-транзакций не касаются alive/no_http-потока.
-	// Порядок «checks: → temp_error:» общий с проходом реконсиляции
-	// (зоны → скаляры → строки суток в этом же порядке) — без циклов
-	// блокировок; откат откатывает результат и обе дельты вместе (§3.4).
+	// The temp_error share numerator (T-182) — right after the checks denominator:
+	// the delta — only at a temp_error episode (the final UPDATE's
+	// verdict is known above), the other outcomes do not touch the day's row — the
+	// temp_error transactions' serialization locks do not touch the alive/no_http flow.
+	// The "checks: → temp_error:" order is shared with the reconciliation
+	// pass (the zones → the scalars → the day rows in this same order) — without lock
+	// cycles; a rollback rolls back the result and both deltas together (§3.4).
 	if status == model.StatusTempError {
 		if err := recordBumpTempErrCounter(ctx, tx, recorded); err != nil {
 			return false, 0, fmt.Errorf("httpworker: домен %s: %w", res.Name, err)
 		}
-		// Корзина зрелости (T-202) — замыкает цепочку дельт: последней
-		// среди строк счётчика (порядок реконсиляции «… → temp_error: →
-		// retry_mature:» — без циклов блокировок). Сегодняшний эпизод
-		// зреет к полуночи — корзину сегодняшнего дня инкрементируют и
-		// DNS-этап (dnsworker/result.go), и этот оператор: оба пишут
-		// одинаковое имя из current_date той же транзакции записи.
+		// The maturity bucket (T-202) — closes the delta chain: the last
+		// among the counter rows (the reconciliation order "… → temp_error: →
+		// retry_mature:" — without lock cycles). Today's episode
+		// matures toward midnight — today's bucket is incremented both by the
+		// DNS stage (dnsworker/result.go) and by this operator: both write
+		// the same name from current_date of the same write transaction.
 		if err := recordBumpRetryMatureCounter(ctx, tx, recorded); err != nil {
 			return false, 0, fmt.Errorf("httpworker: домен %s: %w", res.Name, err)
 		}
 	}
-	// Часовая корзина хвостов переанализа (T-204) — за корзиной ретрая,
-	// перед корзиной темпа (порядок реконсиляции, комментарий
-	// recordReanalyzeBumpSQL): все вставленные строки — неанализированные
-	// хвосты часа now() (= час checked_at строк); нулевую дельту (эпизод
-	// без записей) оператор не выполняет вовсе.
+	// The reanalysis tails' hourly bucket (T-204) — after the retry bucket,
+	// before the throughput bucket (the reconciliation order, the
+	// recordReanalyzeBumpSQL comment): all the inserted rows — the
+	// unanalyzed tails of the now() hour (= the hour of the rows' checked_at); a zero delta (an
+	// episode without records) — the operator does not run at all.
 	if inserted > 0 {
 		if err := recordBumpReanalyzeCounter(ctx, tx, inserted); err != nil {
 			return false, 0, fmt.Errorf("httpworker: домен %s: %w", res.Name, err)
 		}
 	}
-	// Часовая корзина темпа (T-203) — финал цепочки дельт счётчика:
-	// последняя строка транзакции (порядок реконсиляции
-	// «… → retry_mature: → reanalyze: → rendered: → results:», rendered:
-	// ведёт renderworker — здесь одна точка results:); дельта — вставленные
-	// строки эпизода, час — now() транзакции (= час checked_at строк).
-	// Нулевая дельта (эпизод без записей) оператор не выполняет вовсе —
-	// пустые upsert-проходы не греют блокировку корзины.
+	// The hourly throughput bucket (T-203) — the finale of the counter delta chain:
+	// the transaction's last row (the reconciliation order
+	// "… → retry_mature: → reanalyze: → rendered: → results:", rendered:
+	// is kept by the renderworker — here one results: point); the delta — the inserted
+	// episode rows, the hour — the transaction's now() (= the hour of the rows' checked_at).
+	// A zero delta (an episode without records) — the operator does not run at all —
+	// empty upsert passes do not warm the bucket's lock.
 	if inserted > 0 {
 		if err := recordBumpResultsCounter(ctx, tx, inserted); err != nil {
 			return false, 0, fmt.Errorf("httpworker: домен %s: %w", res.Name, err)
@@ -715,10 +715,10 @@ func (r *Recorder) recordTx(ctx context.Context, res *DomainResult, batch *recor
 	return true, len(oldHashes), nil
 }
 
-// recordDeleteOld удаляет старые строки домена и возвращает агрегированные
-// content_hash для свопа ссылок (сортировка — детерминированный порядок
-// операторов; кратность хэша = числу ссылающихся строк — повторное
-// вхождение даёт повторное −1, SwapRefTx вызывается на каждое).
+// recordDeleteOld deletes the domain's old rows and returns the aggregated
+// content_hash values for the reference swap (the sort — a deterministic
+// operator order; a hash's multiplicity = the number of referencing rows — a repeated
+// occurrence gives a repeated −1, SwapRefTx is called for each).
 func recordDeleteOld(ctx context.Context, tx pgx.Tx, zoneID int16, domainID int64) ([]content.Hash, error) {
 	rows, err := tx.Query(ctx, recordDeleteSQL, zoneID, domainID)
 	if err != nil {
@@ -733,7 +733,7 @@ func recordDeleteOld(ctx context.Context, tx pgx.Tx, zoneID int16, domainID int6
 			return nil, fmt.Errorf("httpworker: домен %d/%d: удаление старых строк: чтение: %w", zoneID, domainID, err)
 		}
 		if hash == nil {
-			continue // строка без контента — снимать нечего
+			continue // a row without content — nothing to remove
 		}
 		var h content.Hash
 		copy(h[:], hash)
@@ -753,13 +753,13 @@ func recordDeleteOld(ctx context.Context, tx pgx.Tx, zoneID int16, domainID int6
 	return out, nil
 }
 
-// recordBumpChecksCounter — инкремент суточного счётчика проверок в
-// ОТКРЫТОЙ транзакции записи результата (T-179): delta — RowsAffected
-// итогового UPDATE домена (1 на эпизод). Upsert сам создаёт строку дня
-// (первый инкремент после полуночи) — RowsAffected гарантированно 1,
-// проверка — страховка прямых вызовов с чужим SQL (молчаливая потеря
-// дельты занижала бы темп). Возврат с ошибкой откатывает транзакцию
-// вызывающего — результат и счётчик меняются только вместе (§3.4).
+// recordBumpChecksCounter — the daily checks counter increment in the
+// OPEN result write transaction (T-179): delta — the final
+// domain UPDATE's RowsAffected (1 per episode). The upsert creates the day's row
+// itself (the first increment after midnight) — RowsAffected is guaranteed 1,
+// the check — a guard for direct calls with someone else's SQL (a silent loss
+// of the delta would understate the throughput). Returning with an error rolls back
+// the caller's transaction — the result and the counter change only together (§3.4).
 func recordBumpChecksCounter(ctx context.Context, tx pgx.Tx, delta int64) error {
 	tag, err := tx.Exec(ctx, recordChecksBumpSQL, delta)
 	if err != nil {
@@ -772,14 +772,14 @@ func recordBumpChecksCounter(ctx context.Context, tx pgx.Tx, delta int64) error 
 	return nil
 }
 
-// recordBumpTempErrCounter — инкремент суточного числителя temp_error в
-// ОТКРЫТОЙ транзакции записи результата (T-182): delta — RowsAffected
-// итогового UPDATE домена (вызывающий гарантирует статус temp_error,
-// вердикт известен до транзакции). Upsert сам создаёт строку дня (первый
-// temp_error-эпизод после полуночи) — RowsAffected гарантированно 1,
-// проверка — страховка прямых вызовов с чужим SQL (молчаливая потеря
-// дельты занижала бы долю). Возврат с ошибкой откатывает транзакцию
-// вызывающего — результат и счётчик меняются только вместе (§3.4).
+// recordBumpTempErrCounter — the daily temp_error numerator increment in
+// the OPEN result write transaction (T-182): delta — the final
+// domain UPDATE's RowsAffected (the caller guarantees the temp_error status,
+// the verdict is known before the transaction). The upsert creates the day's row itself (the first
+// temp_error episode after midnight) — RowsAffected is guaranteed 1,
+// the check — a guard for direct calls with someone else's SQL (a silent loss
+// of the delta would understate the share). Returning with an error rolls back
+// the caller's transaction — the result and the counter change only together (§3.4).
 func recordBumpTempErrCounter(ctx context.Context, tx pgx.Tx, delta int64) error {
 	tag, err := tx.Exec(ctx, recordTempErrBumpSQL, delta)
 	if err != nil {
@@ -792,14 +792,14 @@ func recordBumpTempErrCounter(ctx context.Context, tx pgx.Tx, delta int64) error
 	return nil
 }
 
-// recordBumpRetryMatureCounter — инкремент корзины зрелости temp_error
-// в ОТКРЫТОЙ транзакции записи результата (T-202): delta — RowsAffected
-// итогового UPDATE домена (вызывающий гарантирует статус temp_error).
-// Upsert сам создаёт корзину суток (первый temp_error-эпизод после
-// полуночи) — RowsAffected гарантированно 1, проверка — страховка
-// прямых вызовов с чужим SQL (молчаливая потеря дельты держала бы guard
-// ретрая закрытым до реконсиляции). Возврат с ошибкой откатывает
-// транзакцию вызывающего — результат и корзина меняются только вместе
+// recordBumpRetryMatureCounter — the temp_error maturity bucket increment
+// in the OPEN result write transaction (T-202): delta — the final
+// domain UPDATE's RowsAffected (the caller guarantees the temp_error status).
+// The upsert creates the day's bucket itself (the first temp_error episode after
+// midnight) — RowsAffected is guaranteed 1, the check — a guard
+// for direct calls with someone else's SQL (a silent delta loss would keep the
+// retry guard closed until the reconciliation). Returning with an error rolls back
+// the caller's transaction — the result and the bucket change only together (§3.4).
 // (§3.4).
 func recordBumpRetryMatureCounter(ctx context.Context, tx pgx.Tx, delta int64) error {
 	tag, err := tx.Exec(ctx, recordRetryMatureBumpSQL, delta)
@@ -813,14 +813,14 @@ func recordBumpRetryMatureCounter(ctx context.Context, tx pgx.Tx, delta int64) e
 	return nil
 }
 
-// recordBumpReanalyzeCounter — инкремент корзины неанализированных
-// хвостов в ОТКРЫТОЙ транзакции записи результата (T-204): delta —
-// RowsAffected INSERT-пачки (все строки с rules_version = NULL).
-// Upsert сам создаёт корзину часа (первая вставленная строка после
-// границы часа) — RowsAffected гарантированно 1, проверка — страховка
-// прямых вызовов с чужим SQL (молчаливая потеря дельты занижала бы
-// окно guard'а тика). Возврат с ошибкой откатывает транзакцию
-// вызывающего — результат и корзина меняются только вместе (§3.4).
+// recordBumpReanalyzeCounter — the unanalyzed tails' bucket increment
+// in the OPEN result write transaction (T-204): delta —
+// the INSERT chunk's RowsAffected (all the rows with rules_version = NULL).
+// The upsert creates the hour's bucket itself (the first inserted row after
+// the hour boundary) — RowsAffected is guaranteed 1, the check — a guard
+// for direct calls with someone else's SQL (a silent delta loss would understate
+// the tick's guard window). Returning with an error rolls back
+// the caller's transaction — the result and the bucket change only together (§3.4).
 func recordBumpReanalyzeCounter(ctx context.Context, tx pgx.Tx, delta int64) error {
 	tag, err := tx.Exec(ctx, recordReanalyzeBumpSQL, delta)
 	if err != nil {
@@ -833,15 +833,15 @@ func recordBumpReanalyzeCounter(ctx context.Context, tx pgx.Tx, delta int64) err
 	return nil
 }
 
-// recordBumpResultsCounter — инкремент часовой корзины темпа results в
-// ОТКРЫТОЙ транзакции записи результата (T-203): delta — число строк
-// subdomain_results эпизода (RowsAffected INSERT-пачки; checked_at строк
-// — now() транзакции, час корзины вычисляет БД тем же now()). Upsert сам
-// создаёт корзину часа (первая вставленная строка после границы часа) —
-// RowsAffected гарантированно 1, проверка — страховка прямых вызовов с
-// чужим SQL (молчаливая потеря дельты занижала бы темп). Возврат с
-// ошибкой откатывает транзакцию вызывающего — результат и корзина
-// меняются только вместе (§3.4).
+// recordBumpResultsCounter — the results hourly throughput bucket increment in
+// the OPEN result write transaction (T-203): delta — the number of the
+// episode's subdomain_results rows (the INSERT chunk's RowsAffected; the rows' checked_at
+// — the transaction's now(), the bucket's hour is computed by the DB with the same now()). The upsert itself
+// creates the hour's bucket (the first inserted row after the hour boundary) —
+// RowsAffected is guaranteed 1, the check — a guard for direct calls with
+// someone else's SQL (a silent delta loss would understate the throughput). Returning with
+// an error rolls back the caller's transaction — the result and the bucket
+// change only together (§3.4).
 func recordBumpResultsCounter(ctx context.Context, tx pgx.Tx, delta int64) error {
 	tag, err := tx.Exec(ctx, recordResultsBumpSQL, delta)
 	if err != nil {
@@ -854,7 +854,7 @@ func recordBumpResultsCounter(ctx context.Context, tx pgx.Tx, delta int64) error
 	return nil
 }
 
-// recordStatus — итоговый статус домена HTTP-эпизода (§5.5 п. 9, §7).
+// recordStatus — the HTTP episode's final domain status (§5.5 item 9, §7).
 func recordStatus(res *DomainResult) model.Status {
 	switch {
 	case res.HasRecords():
@@ -866,11 +866,11 @@ func recordStatus(res *DomainResult) model.Status {
 	}
 }
 
-// recordBatch — unnest-пачка новых строк: параллельные массивы колонок
-// (одна колонка — один параметр recordInsertSQL, стиль T-007) и сообщения
-// q:analyze (по одному на запись). NULL-колонки — nil-элементы массивов
-// (pgx кодирует их в NULL); jsonb — текст JSON (text → jsonb приводится
-// на сервере; bytea в jsonb PostgreSQL не приводит).
+// recordBatch — the new rows' unnest chunk: the parallel column arrays
+// (one column — one recordInsertSQL parameter, the T-007 style) and the
+// q:analyze messages (one per record). The NULL columns — the arrays' nil elements
+// (pgx encodes them into NULL); jsonb — the JSON text (text → jsonb is cast
+// on the server; PostgreSQL does not cast bytea into jsonb).
 type recordBatch struct {
 	zone       []int16
 	domain     []int64
@@ -903,9 +903,9 @@ func (b *recordBatch) args() []any {
 	}
 }
 
-// newRecordBatch собирает пачку из результата домена и валидирует записи
-// (коды модели, уникальность PK субдомен×вариант): ошибка — до открытия
-// транзакции, БД не трогается.
+// newRecordBatch assembles the chunk from the domain result and validates the records
+// (the model codes, the subdomain×variant PK uniqueness): an error — before opening
+// the transaction, the DB is not touched.
 func newRecordBatch(res *DomainResult) (*recordBatch, error) {
 	if res.ZoneID <= 0 || res.DomainID <= 0 {
 		return nil, fmt.Errorf("httpworker: запись результата: зона %d, домен %d — идентификаторы положительны", res.ZoneID, res.DomainID)
@@ -934,11 +934,11 @@ func newRecordBatch(res *DomainResult) (*recordBatch, error) {
 				return nil, fmt.Errorf("httpworker: домен %s: субдомен %d, вариант %d: дубликат ключа subdomain_results", res.Name, sub.SubdomainID, int16(rec.Variant))
 			}
 			seen[key] = struct{}{}
-			// Граница этапа (T-266, ТЗ-fsm §3 ФТ-12): инварианты
-			// контентной части записи (AliasNone ⇔ alias_id,
-			// ContentNotStored ⇒ hash=nil и прочие — матрица Р1–Р8)
-			// проверяет централизованный валидатор автомата
-			// (schemestate.go), прежде — recordValidateRow.
+			// The stage boundary (T-266, TZ-fsm spec §3 FR-12): the record's content part
+			// invariants (AliasNone ⇔ alias_id,
+			// ContentNotStored ⇒ hash=nil and the others — the R1–R8 matrix)
+			// are checked by the automaton's centralized validator
+			// (schemestate.go), formerly — recordValidateRow.
 			if err := rec.validate(); err != nil {
 				return nil, fmt.Errorf("httpworker: домен %s: %w", res.Name, err)
 			}
@@ -1007,23 +1007,23 @@ func newRecordBatch(res *DomainResult) (*recordBatch, error) {
 				SubdomainID: sub.SubdomainID,
 				Variant:     rec.Variant,
 				Name:        res.Name,
-				Fresh:       true, // новый эпизод HTTP — история детекции пишётся (T-118)
+				Fresh:       true, // a new HTTP episode — the detection history is written (T-118)
 			})
 		}
 	}
 	return b, nil
 }
 
-// recordKey — ключ уникальности PK subdomain_results.
+// recordKey — the subdomain_results PK uniqueness key.
 type recordKey struct {
 	sub     int16
 	variant model.Variant
 }
 
-// recordJSON сериализует значение в jsonb-колонку, когда оно есть
-// (some — признак); nil-элемент массива → NULL. Значения с JSON-тегами:
-// TLSInfo (T-050), RedirectStep (T-048); http.Header — канонические имена
-// заголовков как есть.
+// recordJSON serializes a value into a jsonb column when it exists
+// (some — the sign); an array's nil element → NULL. The values with JSON tags:
+// TLSInfo (T-050), RedirectStep (T-048); http.Header — the canonical header
+// names as is.
 func recordJSON(some bool, value any) (*string, error) {
 	if !some {
 		return nil, nil
@@ -1036,10 +1036,10 @@ func recordJSON(some bool, value any) (*string, error) {
 	return &s, nil
 }
 
-// recordCookie — cookie итогового ответа для subdomain_results.cookies
-// (jsonb, ТЗ 5.5 п. 7): имя и значение — цели правил анализатора
-// (ТЗ 5.8: cookie имя/значение), атрибуты — домен/путь/срок — про запас;
-// теги snake_case (стиль TLSInfo).
+// recordCookie — a cookie of the final response for subdomain_results.cookies
+// (jsonb, spec 5.5 item 7): the name and the value — entirely at the analyzer rules' disposal
+// (spec 5.8: the cookie name/value), the attributes — the domain/path/expiry — for a rainy day;
+// the snake_case tags (the TLSInfo style).
 type recordCookie struct {
 	Name     string `json:"name"`
 	Value    string `json:"value,omitempty"`
@@ -1052,8 +1052,8 @@ type recordCookie struct {
 	SameSite string `json:"same_site,omitempty"`
 }
 
-// recordSameSite — имя атрибута SameSite (строковые коды jsonb): default
-// и нулевое значение — атрибут не выставлен (пустая строка, omitempty).
+// recordSameSite — the SameSite attribute's name (the jsonb string codes): the
+// default and the zero value — the attribute is not set (an empty string, omitempty).
 func recordSameSite(s http.SameSite) string {
 	switch s {
 	case http.SameSiteLaxMode:
@@ -1067,8 +1067,8 @@ func recordSameSite(s http.SameSite) string {
 	}
 }
 
-// recordCookies сериализует Set-Cookie итогового ответа (ТЗ 5.5 п. 7):
-// nil при пустом наборе → NULL.
+// recordCookies serializes the final response's Set-Cookie (spec 5.5 item 7):
+// nil at an empty set → NULL.
 func recordCookies(cookies []*http.Cookie) (*string, error) {
 	if len(cookies) == 0 {
 		return nil, nil
@@ -1093,12 +1093,12 @@ func recordCookies(cookies []*http.Cookie) (*string, error) {
 	return recordJSON(true, out)
 }
 
-// recordPackAddrs упаковывает адреса субдомена в bytea subdomain_results.
-// addrs (§6.1 «упакованные A/AAAA», формат — этап, кладущий строку):
-// 16 октетов на адрес, IPv4 — в v4-mapped форме (::ffff:a.b.c.d,
-// netip.Addr.As16) — состав смешанных A/AAAA не двусмысленен (сырые 4/16
-// октетов давали бы коллизии длин), длина bytea всегда кратна 16. Порядок
-// — задачи q:http (A, затем AAAA, порядок ответа DNS-этапа, T-037).
+// recordPackAddrs packs the subdomain's addresses into the subdomain_results bytea.
+// addrs (§6.1 "the packed A/AAAA", the format — the stage laying down the row):
+// 16 octets per address, IPv4 — in the v4-mapped form (::ffff:a.b.c.d,
+// netip.Addr.As16) — the mixed A/AAAA composition is not ambiguous (raw 4/16
+// octets would give length collisions), the bytea length is always a multiple of 16. The order
+// — the q:http tasks (A, then AAAA, the DNS stage's answer order, T-037).
 func recordPackAddrs(addrs []netip.Addr) []byte {
 	if len(addrs) == 0 {
 		return nil

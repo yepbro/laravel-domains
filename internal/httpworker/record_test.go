@@ -1,14 +1,14 @@
-// Юнит-тесты записи результата HTTP-эпизода и публикации q:analyze (T-058;
-// ТЗ 5.5 пп. 7, 9, §6.1, §7, §8, 3.4; ретрай 40P01 транзакции записи —
-// T-268) на фейковых пуле и очереди — без БД,
-// Redis и сети. Фейковый пул живёт семантикой таблиц (domains, contents,
-// subdomain_results) с транзакциями-снапшотами: проверяются точные SQL и
-// параметры, порядок «запись → публикация q:analyze», границы транзакции
-// со свопом ссылок (SwapRefTx, T-044), статусы alive/no_http/temp_error,
-// охрана deleted (§8/§13.1), идемпотентный повтор доставки, сбои шагов и
-// отмена ctx; smoke — цикл Run с цепочкой OnResult «ContentSaver →
-// запись → публикация» (сборка cmd/http-worker). Поведение против живых
-// PostgreSQL/Redis — интеграционные тесты (T-032, T-046).
+// Unit tests of the HTTP episode's result write and the q:analyze publication (T-058;
+// spec 5.5 items 7, 9, §6.1, §7, §8, 3.4; the write transaction's 40P01 retry —
+// T-268) over a fake pool and queue — without a DB,
+// Redis and the network. The fake pool lives by the tables' semantics (domains, contents,
+// subdomain_results) with snapshot transactions: the exact SQL and
+// parameters are checked, the "write → q:analyze publication" order, the transaction
+// boundaries with the reference swap (SwapRefTx, T-044), the alive/no_http/temp_error statuses,
+// the deleted guard (§8/§13.1), the idempotent delivery repeat, the step failures and
+// the ctx cancellation; the smoke — the Run loop with the OnResult chain "ContentSaver →
+// write → publication" (the cmd/http-worker build). The behavior against live
+// PostgreSQL/Redis — integration tests (T-032, T-046).
 package httpworker
 
 import (
@@ -34,9 +34,9 @@ import (
 	"crawler/internal/queue"
 )
 
-// --- протокол событий (порядок «запись → публикация → ack») -----------------
+// --- the event protocol (the "write → publication → ack" order) -----------------
 
-// recordEventKind — тип события протокола; порядок проверяется индексами.
+// recordEventKind — the protocol's event type; the order is checked by the indexes.
 type recordEventKind string
 
 const (
@@ -45,23 +45,23 @@ const (
 	recordEvDelete  recordEventKind = "delete"
 	recordEvSwap    recordEventKind = "swapref"
 	recordEvInsert  recordEventKind = "insert"
-	recordEvShift   recordEventKind = "zone-shift"     // дельта счётчиков зоны (T-178)
-	recordEvChecks  recordEventKind = "checks-bump"    // дельта суточного счётчика проверок (T-179)
-	recordEvTempErr recordEventKind = "temp-err-bump"  // дельта суточного числителя temp_error (T-182)
-	recordEvMature  recordEventKind = "mature-bump"    // дельта корзины зрелости ретрая (T-202)
-	recordEvRean    recordEventKind = "reanalyze-bump" // дельта корзины неанализированных хвостов (T-204)
-	recordEvResults recordEventKind = "results-bump"   // дельта часовой корзины темпа (T-203)
+	recordEvShift   recordEventKind = "zone-shift"     // the zone counters' delta (T-178)
+	recordEvChecks  recordEventKind = "checks-bump"    // the daily checks counter's delta (T-179)
+	recordEvTempErr recordEventKind = "temp-err-bump"  // the daily temp_error numerator's delta (T-182)
+	recordEvMature  recordEventKind = "mature-bump"    // the retry maturity bucket's delta (T-202)
+	recordEvRean    recordEventKind = "reanalyze-bump" // the unanalyzed tails bucket's delta (T-204)
+	recordEvResults recordEventKind = "results-bump"   // the hourly throughput bucket's delta (T-203)
 	recordEvCommit  recordEventKind = "commit"
 	recordEvPublish recordEventKind = "publish"
 	recordEvAck     recordEventKind = "ack"
 )
 
-// recordJournal — потокобезопасный протокол (цикл Run работает в горутине).
+// recordJournal — a concurrency-safe protocol (the Run loop runs in a goroutine).
 type recordJournal struct {
 	mu     sync.Mutex
 	events []recordEventKind
 
-	// ackNotify — неблокирующий сигнал на каждое Ack (синхронизация smoke).
+	// ackNotify — a non-blocking signal per Ack (the smoke's synchronization).
 	ackNotify chan struct{}
 }
 
@@ -91,7 +91,7 @@ func (j *recordJournal) count(k recordEventKind) int {
 	return n
 }
 
-// indexOf возвращает индекс первого события вида (0-based) или −1.
+// indexOf returns the index of the first event of the kind (0-based) or −1.
 func (j *recordJournal) indexOf(k recordEventKind) int {
 	j.mu.Lock()
 	defer j.mu.Unlock()
@@ -113,26 +113,26 @@ func (j *recordJournal) signalAck() {
 	}
 }
 
-// --- фейковый pgx-пул: три таблицы + транзакции-снапшоты --------------------
+// --- the fake pgx pool: three tables + snapshot transactions --------------------
 
-// recordDomainKey — ключ строки domains в фейке.
+// recordDomainKey — the key of a domains row in the fake.
 type recordDomainKey struct {
 	zone int16
 	id   int64
 }
 
-// recordFakeDomain — строка domains, которую меняет recordDomainSQL.
+// recordFakeDomain — the domains row recordDomainSQL changes.
 type recordFakeDomain struct {
 	status       model.Status
 	checkState   model.CheckState
 	queuedAt     *time.Time
 	lastChecked  bool
 	tempAttempts int16
-	cutoff       bool // бит dead_host_cutoff последнего эпизода (T-164)
+	cutoff       bool // the dead_host_cutoff bit of the last episode (T-164)
 	flags        model.Flags
 }
 
-// recordFakeRow — строка subdomain_results: колонки INSERT-пачки.
+// recordFakeRow — a subdomain_results row: the INSERT chunk's columns.
 type recordFakeRow struct {
 	subdomainID int16
 	variant     model.Variant
@@ -153,18 +153,18 @@ type recordFakeRow struct {
 	responseMS  *int32
 }
 
-// recordFakePool — RecordDB без БД: живая семантика domains (охрана
-// status <> deleted у UPDATE), subdomain_results (DELETE … RETURNING,
-// INSERT-пачка), contents (refcount с охраной > 0), счётчиков зон
-// (recordZoneShiftSQL, T-178), суточного счётчика проверок, его
-// temp_error-числителя (recordChecksBumpSQL/recordTempErrBumpSQL,
-// T-179/T-182), корзины зрелости ретрая (recordRetryMatureBumpSQL,
-// T-202) и часовой корзины темпа (recordResultsBumpSQL, T-203 — имена
-// дней/часов вычисляет БД, фейк ведёт по одному значению «строк текущих
-// суток/часа»). Транзакция работает
-// на снапшоте: Rollback восстанавливает состояние пула, Commit оставляет
-// (достаточно для последовательных вызовов записи; конкурентные
-// транзакции фейк не моделирует — их сериализует PostgreSQL).
+// recordFakePool — a RecordDB without a DB: the live semantics of domains (the
+// status <> deleted guard at the UPDATE), subdomain_results (DELETE … RETURNING,
+// the INSERT chunk), contents (a refcount with the > 0 guard), the zone
+// counters (recordZoneShiftSQL, T-178), the daily checks counter, its
+// temp_error numerator (recordChecksBumpSQL/recordTempErrBumpSQL,
+// T-179/T-182), the retry maturity bucket (recordRetryMatureBumpSQL,
+// T-202) and the hourly throughput bucket (recordResultsBumpSQL, T-203 — the
+// day/hour names are computed by the DB, the fake keeps one value of "the current
+// day/hour's rows"). The transaction runs
+// on a snapshot: Rollback restores the pool's state, Commit keeps
+// it (enough for sequential write calls; concurrent
+// transactions are not modeled by the fake — PostgreSQL serializes them).
 type recordFakePool struct {
 	j *recordJournal
 
@@ -174,34 +174,34 @@ type recordFakePool struct {
 	zones   map[int16]*recordFakeZone
 	checks  int64
 	tempErr int64
-	// retryMature — корзина зрелости ретрая текущих суток (T-202): имя
-	// вычисляет БД, фейк ведёт одно значение (стиль суточных строк).
+	// retryMature — the current day's retry maturity bucket (T-202): the
+	// name is computed by the DB, the fake keeps one value (the daily rows' style).
 	retryMature int64
-	// reanalyze — корзина неанализированных хвостов текущего часа
-	// (T-204): имя вычисляет БД, фейк ведёт одно значение.
+	// reanalyze — the current hour's unanalyzed tails bucket
+	// (T-204): the name is computed by the DB, the fake keeps one value.
 	reanalyze int64
-	// results — часовая корзина темпа текущего часа (T-203): имя
-	// вычисляет БД, фейк ведёт одно значение (стиль суточных строк).
+	// results — the current hour's hourly throughput bucket (T-203): the name
+	// is computed by the DB, the fake keeps one value (the daily rows' style).
 	results int64
 
 	begins   int
-	txs      int // создано транзакций
+	txs      int // transactions created
 	beginErr error
 
-	failExec     map[string]error // сбой Exec по точному SQL (все попытки)
-	failExecOnce map[string]error // сбой Exec по точному SQL — одна первая попытка (фолт-инъекция 40P01, T-268)
+	failExec     map[string]error // an Exec failure by the exact SQL (all the attempts)
+	failExecOnce map[string]error // an Exec failure by the exact SQL — only the first attempt (the 40P01 fault injection, T-268)
 	deleteErr    error
 	commitErr    error
-	insertTag    int64 // RowsAffected INSERT (0 — честный ответ)
-	matureTag    int64 // RowsAffected upsert корзины зрелости (0 — честный ответ)
-	reanTag      int64 // RowsAffected upsert корзины хвостов (0 — честный ответ)
-	resultsTag   int64 // RowsAffected upsert корзины темпа (0 — честный ответ)
+	insertTag    int64 // the INSERT's RowsAffected (0 — an honest answer)
+	matureTag    int64 // the maturity bucket upsert's RowsAffected (0 — an honest answer)
+	reanTag      int64 // the tails bucket upsert's RowsAffected (0 — an honest answer)
+	resultsTag   int64 // the throughput bucket upsert's RowsAffected (0 — an honest answer)
 
 	mu sync.Mutex
 }
 
-// recordFakeZone — строка zones: колонки инкрементальных счётчиков
-// (T-178); сдвигает recordZoneShiftSQL.
+// recordFakeZone — a zones row: the incremental counters' columns
+// (T-178); recordZoneShiftSQL shifts it.
 type recordFakeZone struct {
 	total, pending, queued, checked int64
 }
@@ -216,45 +216,45 @@ func newRecordFakePool() *recordFakePool {
 	}
 }
 
-// recordSeedZone — зона с заданными счётчиками (T-178); зоны без записи —
-// строка справочника отсутствует, сдвиг честно ответит UPDATE 0.
+// recordSeedZone — a zone with the given counters (T-178); a zone without a record —
+// the reference table row is absent, the shift will honestly answer UPDATE 0.
 func (p *recordFakePool) recordSeedZone(id int16, total, pending, queued, checked int64) *recordFakeZone {
 	z := &recordFakeZone{total: total, pending: pending, queued: queued, checked: checked}
 	p.zones[id] = z
 	return z
 }
 
-// checksValue — значение суточного счётчика проверок (T-179) под замком.
+// checksValue — the daily checks counter's value (T-179) under the lock.
 func (p *recordFakePool) checksValue() int64 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.checks
 }
 
-// tempErrValue — значение суточного числителя temp_error (T-182) под
-// замком.
+// tempErrValue — the daily temp_error numerator's value (T-182) under
+// the lock.
 func (p *recordFakePool) tempErrValue() int64 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.tempErr
 }
 
-// retryMatureValue — значение корзины зрелости ретрая (T-202) под замком.
+// retryMatureValue — the retry maturity bucket's value (T-202) under the lock.
 func (p *recordFakePool) retryMatureValue() int64 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.retryMature
 }
 
-// reanalyzeValue — значение корзины неанализированных хвостов (T-204)
-// под замком.
+// reanalyzeValue — the unanalyzed tails bucket's value (T-204)
+// under the lock.
 func (p *recordFakePool) reanalyzeValue() int64 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.reanalyze
 }
 
-// resultsValue — значение часовой корзины темпа (T-203) под замком.
+// resultsValue — the hourly throughput bucket's value (T-203) under the lock.
 func (p *recordFakePool) resultsValue() int64 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -263,15 +263,15 @@ func (p *recordFakePool) resultsValue() int64 {
 
 var _ RecordDB = (*recordFakePool)(nil)
 
-// recordSeedDomain — домен в очередном состоянии (перед записью эпизода).
+// recordSeedDomain — a domain in the queued state (before the episode's write).
 func (p *recordFakePool) recordSeedDomain(zone int16, id int64, status model.Status, tempAttempts int16) *recordFakeDomain {
 	d := &recordFakeDomain{status: status, checkState: model.CheckStateQueued, tempAttempts: tempAttempts}
 	now := time.Now()
 	d.queuedAt = &now
 	p.domains[recordDomainKey{zone: zone, id: id}] = d
 	if _, ok := p.zones[zone]; !ok {
-		// Зона справочника для дельт счётчиков (T-178): нулевые counters
-		// — тесты, которым нужны значения, сеют явно recordSeedZone.
+		// The reference-table zone for the counters' deltas (T-178): zero
+		// counters — the tests that need values seed them explicitly via recordSeedZone.
 		p.recordSeedZone(zone, 0, 0, 0, 0)
 	}
 	return d
@@ -299,9 +299,9 @@ func (p *recordFakePool) Begin(ctx context.Context) (pgx.Tx, error) {
 	if p.beginErr != nil {
 		return nil, p.beginErr
 	}
-	// Снапшот: значения-структуры копируются, слайсы строк разделяют
-	// указатели неизменяемых полей — транзакция только добавляет/удаляет
-	// элементы, не мутирует старые.
+	// The snapshot: the struct values are copied, the row slices share
+	// the pointers of the immutable fields — the transaction only adds/removes
+	// elements, it does not mutate the old ones.
 	snapDomains := make(map[recordDomainKey]*recordFakeDomain, len(p.domains))
 	for k, v := range p.domains {
 		c := *v
@@ -333,10 +333,10 @@ func (p *recordFakePool) Begin(ctx context.Context) (pgx.Tx, error) {
 	}, nil
 }
 
-// recordFakeTx — транзакция над фейком: операторы применяются к пулу
-// сразу, Rollback откатывает к снапшоту, Commit фиксирует.
+// recordFakeTx — a transaction over the fake: the operators apply to the pool
+// immediately, Rollback rolls back to the snapshot, Commit commits.
 type recordFakeTx struct {
-	pgx.Tx // остальные методы pgx.Tx запись не использует
+	pgx.Tx // the write does not use the other pgx.Tx methods
 
 	pool        *recordFakePool
 	j           *recordJournal
@@ -351,8 +351,8 @@ type recordFakeTx struct {
 	committed   bool
 }
 
-// recordFakeRow — pgx.Row предчтения состояний (T-178): два int16
-// (status, check_state) или ошибка (pgx.ErrNoRows — строки нет).
+// recordFakeRow — the pgx.Row of the states' pre-read (T-178): two int16
+// (status, check_state) or an error (pgx.ErrNoRows — no row).
 type recordStateRow struct {
 	status, state int16
 	err           error
@@ -370,9 +370,9 @@ func (r recordStateRow) Scan(dest ...any) error {
 	return nil
 }
 
-// QueryRow — точечное предчтение состояний FOR UPDATE (recordSelectStateSQL,
-// T-178): строка домена любой прозрачности статуса — блокировка «есть»;
-// отсутствующая строка — ErrNoRows.
+// QueryRow — the point pre-read of the FOR UPDATE states (recordSelectStateSQL,
+// T-178): a domain row of any status transparency — the lock "is there";
+// an absent row — ErrNoRows.
 func (t *recordFakeTx) QueryRow(_ context.Context, sql string, args ...any) pgx.Row {
 	t.pool.mu.Lock()
 	defer t.pool.mu.Unlock()
@@ -387,9 +387,9 @@ func (t *recordFakeTx) QueryRow(_ context.Context, sql string, args ...any) pgx.
 	return recordStateRow{status: int16(d.status), state: int16(d.checkState)}
 }
 
-// recordDelRefSQLPrefix — префикс sqlMetaDelRef из content/pack.go
-// (T-042): константа не экспортирована, точный текст поддерживается
-// вручную; расхождение ломает тест громко — синхронизируйте с pack.go.
+// recordDelRefSQLPrefix — the sqlMetaDelRef prefix from content/pack.go
+// (T-042): the constant is not exported, the exact text is maintained
+// manually; a divergence breaks the test loudly — sync it with pack.go.
 const recordDelRefSQLPrefix = "UPDATE contents SET refcount = refcount - 1"
 
 func (t *recordFakeTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
@@ -398,8 +398,8 @@ func (t *recordFakeTx) Exec(ctx context.Context, sql string, args ...any) (pgcon
 	}
 	t.pool.mu.Lock()
 	defer t.pool.mu.Unlock()
-	// Разовая фолт-инъекция (T-268): первая попытка оператора падает
-	// дедлоком 40P01, повтор (после отката транзакции-попытки) — проходит.
+	// A one-shot fault injection (T-268): the operator's first attempt fails
+	// with a 40P01 deadlock, the repeat (after the attempt transaction's rollback) — passes.
 	if err, ok := t.pool.failExecOnce[sql]; ok {
 		delete(t.pool.failExecOnce, sql)
 		return pgconn.CommandTag{}, err
@@ -412,23 +412,23 @@ func (t *recordFakeTx) Exec(ctx context.Context, sql string, args ...any) (pgcon
 		zone := args[0].(int16)
 		id := args[1].(int64)
 		status := model.Status(args[2].(int16))
-		cutoff := args[3].(bool) // бит dead_host_cutoff (T-164)
+		cutoff := args[3].(bool) // the dead_host_cutoff bit (T-164)
 		key := recordDomainKey{zone: zone, id: id}
 		d, ok := t.pool.domains[key]
 		if !ok || d.status == model.StatusDeleted {
-			return pgconn.NewCommandTag("UPDATE 0"), nil // охрана §8/§13.1
+			return pgconn.NewCommandTag("UPDATE 0"), nil // the §8/§13.1 guard
 		}
 		d.status = status
 		d.checkState = model.CheckStateDone
 		d.queuedAt = nil
 		d.lastChecked = true
 		if status == model.StatusTempError {
-			// CASE из recordDomainSQL: temp_error сохраняет счётчик.
+			// The CASE from recordDomainSQL: temp_error keeps the counter.
 		} else {
 			d.tempAttempts = 0
 		}
-		// CASE flags из recordDomainSQL (T-164): cutoff-эпизод ставит
-		// бит, обычный снимает; прочие биты не трогает.
+		// The recordDomainSQL CASE flags (T-164): a cutoff episode sets
+		// the bit, a usual one removes it; the other bits untouched.
 		if cutoff {
 			d.flags.Set(model.FlagDeadHostCutoff)
 		} else {
@@ -469,7 +469,7 @@ func (t *recordFakeTx) Exec(ctx context.Context, sql string, args ...any) (pgcon
 				finalURL: finalURL[i], aliasKind: model.AliasKind(aliasKind[i]),
 				aliasSub: aliasSub[i], addrs: addrs[i], cname: cname[i],
 				tls: tls[i], redirects: redirects[i], headers: headers[i],
-				cookies: cookies[i], rendered: false, // литерал false в SELECT
+				cookies: cookies[i], rendered: false, // the false literal in the SELECT
 				contentHash: hash[i], errCode: errCode[i], responseMS: responseMS[i],
 			})
 			if domain[i] == 0 {
@@ -484,13 +484,13 @@ func (t *recordFakeTx) Exec(ctx context.Context, sql string, args ...any) (pgcon
 		}
 		return pgconn.NewCommandTag(fmt.Sprintf("INSERT 0 %d", n)), nil
 	case recordZoneShiftSQL:
-		// Дельта счётчиков зоны по старому состоянию строки (T-178):
-		// зона + дельты pending/queued/checked (total запись результата
-		// не меняет; нулевые дельты — колонка не тронута).
+		// The zone counters' delta by the row's old state (T-178):
+		// the zone + the pending/queued/checked deltas (the result write
+		// does not change total; zero deltas — the column untouched).
 		zone := args[0].(int16)
 		z, ok := t.pool.zones[zone]
 		if !ok {
-			return pgconn.NewCommandTag("UPDATE 0"), nil // строка зоны обязательна
+			return pgconn.NewCommandTag("UPDATE 0"), nil // the zone row is mandatory
 		}
 		z.pending += args[1].(int64)
 		z.queued += args[2].(int64)
@@ -498,24 +498,24 @@ func (t *recordFakeTx) Exec(ctx context.Context, sql string, args ...any) (pgcon
 		t.j.record(recordEvShift)
 		return pgconn.NewCommandTag("UPDATE 1"), nil
 	case recordChecksBumpSQL:
-		// Инкремент суточного счётчика проверок (T-179): upsert строки
-		// дня — имя вычисляет БД, фейк ведёт одно значение. RowsAffected
-		// upsert'а всегда 1 (строку создаёт конфликт-ветвь).
+		// The daily checks counter's increment (T-179): the day row's
+		// upsert — the name is computed by the DB, the fake keeps one value. The
+		// upsert's RowsAffected is always 1 (the conflict branch creates the row).
 		t.pool.checks += args[0].(int64)
 		t.j.record(recordEvChecks)
 		return pgconn.NewCommandTag("INSERT 0 1"), nil
 	case recordTempErrBumpSQL:
-		// Инкремент суточного числителя temp_error (T-182): та же пара —
-		// оператор выполняют только temp_error-эпизоды (вызывающий
-		// гарантирует статус), фейк ведёт одно значение строки дня.
+		// The daily temp_error numerator's increment (T-182): the same pair —
+		// only temp_error episodes run the operator (the caller
+		// guarantees the status), the fake keeps one day row value.
 		t.pool.tempErr += args[0].(int64)
 		t.j.record(recordEvTempErr)
 		return pgconn.NewCommandTag("INSERT 0 1"), nil
 	case recordRetryMatureBumpSQL:
-		// Инкремент корзины зрелости ретрая (T-202): третья пара —
-		// выполняют только temp_error-эпизоды (статус гарантирует
-		// вызывающий), фейк ведёт одно значение корзины суток;
-		// matureTag — страховочная ветка RowsAffected ≠ 1.
+		// The retry maturity bucket's increment (T-202): the third pair —
+		// only temp_error episodes run it (the caller
+		// guarantees the status), the fake keeps one day bucket value;
+		// matureTag — the RowsAffected ≠ 1 guard branch.
 		t.pool.retryMature += args[0].(int64)
 		t.j.record(recordEvMature)
 		if t.pool.matureTag != 0 {
@@ -523,10 +523,10 @@ func (t *recordFakeTx) Exec(ctx context.Context, sql string, args ...any) (pgcon
 		}
 		return pgconn.NewCommandTag("INSERT 0 1"), nil
 	case recordReanalyzeBumpSQL:
-		// Инкремент корзины неанализированных хвостов (T-204): дельта —
-		// вставленные строки эпизода (0 — оператор не вызывается вовсе:
-		// все вставленные строки несут rules_version = NULL), фейк ведёт
-		// одно значение корзины часа; reanTag — страховочная ветка
+		// The unanalyzed tails bucket's increment (T-204): the delta —
+		// the episode's inserted rows (0 — the operator is not called at all:
+		// all the inserted rows carry rules_version = NULL), the fake keeps
+		// one hour bucket value; reanTag — the guard branch of
 		// RowsAffected ≠ 1.
 		t.pool.reanalyze += args[0].(int64)
 		t.j.record(recordEvRean)
@@ -535,10 +535,10 @@ func (t *recordFakeTx) Exec(ctx context.Context, sql string, args ...any) (pgcon
 		}
 		return pgconn.NewCommandTag("INSERT 0 1"), nil
 	case recordResultsBumpSQL:
-		// Инкремент часовой корзины темпа (T-203): финальная пара —
-		// дельта равна числу вставленных строк эпизода (0 — оператор не
-		// вызывается вовсе), фейк ведёт одно значение корзины часа;
-		// resultsTag — страховочная ветка RowsAffected ≠ 1.
+		// The hourly throughput bucket's increment (T-203): the final pair —
+		// the delta equals the episode's inserted rows count (0 — the operator is not
+		// called at all), the fake keeps one hour bucket value;
+		// resultsTag — the RowsAffected ≠ 1 guard branch.
 		t.pool.results += args[0].(int64)
 		t.j.record(recordEvResults)
 		if t.pool.resultsTag != 0 {
@@ -549,11 +549,11 @@ func (t *recordFakeTx) Exec(ctx context.Context, sql string, args ...any) (pgcon
 		if !strings.HasPrefix(sql, recordDelRefSQLPrefix) {
 			return pgconn.CommandTag{}, fmt.Errorf("recordFakePool: неожидаемый SQL: %s", sql)
 		}
-		// sqlMetaDelRef (SwapRefTx, T-044): −1 с охраной refcount > 0.
+		// sqlMetaDelRef (SwapRefTx, T-044): −1 with the refcount > 0 guard.
 		var h content.Hash
 		copy(h[:], args[0].([]byte))
 		if t.pool.refc[h] <= 0 {
-			return pgconn.NewCommandTag("UPDATE 0"), nil // ErrRefIntegrity у вызывающего
+			return pgconn.NewCommandTag("UPDATE 0"), nil // ErrRefIntegrity at the caller
 		}
 		t.pool.refc[h]--
 		t.j.record(recordEvSwap)
@@ -606,7 +606,7 @@ func (t *recordFakeTx) Rollback(context.Context) error {
 	t.pool.mu.Lock()
 	defer t.pool.mu.Unlock()
 	if t.committed {
-		return nil // откат после Commit — no-op
+		return nil // a rollback after the Commit — a no-op
 	}
 	t.pool.domains, t.pool.rows, t.pool.refc, t.pool.zones = t.snapDomains, t.snapRows, t.snapRefc, t.snapZones
 	t.pool.checks = t.snapChecks
@@ -616,8 +616,8 @@ func (t *recordFakeTx) Rollback(context.Context) error {
 	return nil
 }
 
-// recordFakeRows — pgx.Rows с заготовленными строками (одна колонка
-// content_hash); позиционный Scan в *[]byte (стиль resultFakeRows T-039).
+// recordFakeRows — pgx.Rows with preloaded rows (one
+// content_hash column); a positional Scan into *[]byte (the resultFakeRows T-039 style).
 type recordFakeRows struct {
 	rows [][]any
 	i    int
@@ -663,17 +663,17 @@ func (r *recordFakeRows) RawValues() [][]byte    { return nil }
 func (r *recordFakeRows) Conn() *pgx.Conn        { return nil }
 func (r *recordFakeRows) TypeMap() *pgtype.Map   { return nil }
 
-// --- фейковая очередь -------------------------------------------------------
+// --- the fake queue -------------------------------------------------------
 
-// recordPublishRec — записанная публикация.
+// recordPublishRec — a recorded publication.
 type recordPublishRec struct {
 	stream string
 	msg    queue.Result
 }
 
-// recordFakeQueue — queue.Queue: Publish фиксирует Result-сообщения (и
-// может падать по очереди), Consume раздаёт заготовленные доставки один
-// раз и дальше паркуется до отмены ctx, Ack фиксируется и сигнализирует.
+// recordFakeQueue — a queue.Queue: Publish records the Result messages (and
+// may fail by the queue), Consume hands out the preloaded deliveries once
+// and then parks until the ctx cancellation, Ack is recorded and signals.
 type recordFakeQueue struct {
 	j *recordJournal
 
@@ -725,7 +725,7 @@ func (q *recordFakeQueue) Consume(ctx context.Context, _, _, _ string, n int) ([
 	if len(out) > 0 {
 		return out, nil
 	}
-	<-ctx.Done() // реальная очередь блокируется в XREADGROUP
+	<-ctx.Done() // a real queue blocks in XREADGROUP
 	return nil, ctx.Err()
 }
 
@@ -759,20 +759,20 @@ func (q *recordFakeQueue) ackedSnapshot() []string {
 	return out
 }
 
-// --- сборщики ---------------------------------------------------------------
+// --- the builders ---------------------------------------------------------------
 
-// recordTestHash — различимые хэши: recordTestHash(1), (2), …
+// recordTestHash — distinguishable hashes: recordTestHash(1), (2), …
 func recordTestHash(n byte) content.Hash {
 	var h content.Hash
 	h[0] = n
 	return h
 }
 
-// recordRichResult — результат с двумя субдоменами и всеми полями записей
-// (§5.5 п. 7): апекс — полный набор (TLS, цепочка, заголовки, cookies,
-// хэш сохранённого контента), www — алиас-редирект на апекс с CNAME,
-// обрезанным телом (ErrBody при живом статусе) и NULL content_hash
-// (контент класса хранится у оригинала, T-055/T-056).
+// recordRichResult — a result with two subdomains and all the record fields
+// (§5.5 item 7): the apex — the full set (TLS, the chain, the headers, cookies,
+// the stored content's hash), www — an alias redirect to the apex with a CNAME,
+// a truncated body (ErrBody at a live status) and a NULL content_hash
+// (the class's content is stored at the original, T-055/T-056).
 func recordRichResult() (*DomainResult, map[string]content.Hash) {
 	hApex := recordTestHash(1)
 	final := "https://rich.example/"
@@ -831,9 +831,9 @@ func recordRichResult() (*DomainResult, map[string]content.Hash) {
 					ResponseMS: 456,
 					Redirects:  []httpfetch.RedirectStep{{URL: "https://www.rich.example/", Status: 301}, {URL: final, Status: 200}},
 					Truncated:  true,
-					// Алиас обрезанной страницы после Save: контент
-					// класса — у оригинала (T-055), ContentNotStored
-					// у алиасов не ставится (матрица Р8, T-266/T-056).
+					// The truncated page's alias after Save: the
+					// class's content — at the original (T-055), ContentNotStored
+					// is not set for aliases (the R8 matrix, T-266/T-056).
 					AliasKind:        model.AliasRedirect,
 					AliasSubdomainID: &aliasTo,
 					ErrClass:         ErrBody,
@@ -841,11 +841,11 @@ func recordRichResult() (*DomainResult, map[string]content.Hash) {
 			},
 		},
 	}
-	// Фейк-хэш: content.HashOf не нужен, важна различимость.
+	// A fake hash: content.HashOf is not needed, the distinguishability matters.
 	return res, map[string]content.Hash{"apex": hApex}
 }
 
-// recordSilentResult — домен без записей: все проверки промолчали.
+// recordSilentResult — a domain without records: all the checks were silent.
 func recordSilentResult(timeout bool) *DomainResult {
 	class := ErrNetwork
 	if timeout {
@@ -871,16 +871,16 @@ func recordRecorder(t *testing.T, pool *recordFakePool, q *recordFakeQueue) *Rec
 	return r
 }
 
-// --- полнота полей и порядок операций ----------------------------------------
+// --- the fields' completeness and the operation order ----------------------------------------
 
-// TestRecordWritesAllColumns — полный результат: строки subdomain_results
-// несут все колонки (§5.5 п. 7), домен — alive/done со сбросом lease и
-// temp_attempts, q:analyze — по Result на запись; порядок «запись →
-// фиксация → публикация»; адреса упакованы по 16 октетов.
+// TestRecordWritesAllColumns — the full result: the subdomain_results rows
+// carry all the columns (§5.5 item 7), the domain — alive/done with the lease reset and
+// temp_attempts, q:analyze — one Result per record; the "write →
+// commit → publication" order; the addresses are packed 16 octets each.
 func TestRecordWritesAllColumns(t *testing.T) {
 	pool := newRecordFakePool()
 	pool.recordSeedDomain(7, 91, model.StatusNew, 3)
-	zone := pool.recordSeedZone(7, 10, 2, 3, 5) // счётчики зоны до записи (T-178)
+	zone := pool.recordSeedZone(7, 10, 2, 3, 5) // the zone counters before the write (T-178)
 	q := &recordFakeQueue{j: pool.j}
 	res, hashes := recordRichResult()
 
@@ -889,18 +889,18 @@ func TestRecordWritesAllColumns(t *testing.T) {
 		t.Fatalf("RecordAndPublish: ok=%v err=%v", ok, err)
 	}
 
-	// Дельта счётчиков зоны той же транзакцией (T-178, ТЗИ §6.4): домен
-	// был queued → queued −1, checked +1, total/pending не тронуты.
+	// The zone counters' delta by the same transaction (T-178, incremental-counters spec §6.4): the domain
+	// was queued → queued −1, checked +1, total/pending untouched.
 	if zone.queued != 2 || zone.checked != 6 || zone.total != 10 || zone.pending != 2 {
 		t.Fatalf("счётчики зоны = %+v, want {10 2 2 6} (queued −1, checked +1)", *zone)
 	}
 
-	// Суточный счётчик проверок (T-179): один эпизод — +1, а не +2 по
-	// числу записей субдомен×вариант (дельта — RowsAffected UPDATE
-	// домена, не INSERT-пачки); дельта в той же транзакции — после
-	// сдвига зоны, до фиксации. Числитель temp_error (T-182) живым
-	// (alive) эпизодом не тронут — оператор выполняют только
-	// temp_error-итоги.
+	// The daily checks counter (T-179): one episode — +1, not +2 by
+	// the number of subdomain×variant records (the delta — the domain's UPDATE
+	// RowsAffected, not the INSERT chunk's); the delta in the same transaction — after
+	// the zone shift, before the commit. The temp_error numerator (T-182) is untouched by a
+	// live (alive) episode — only temp_error
+	// outcomes run the operator.
 	if got := pool.checksValue(); got != 1 {
 		t.Fatalf("суточный счётчик = %d, want 1 (один эпизод из двух записей)", got)
 	}
@@ -941,7 +941,7 @@ func TestRecordWritesAllColumns(t *testing.T) {
 	if apex.aliasKind != model.AliasNone || apex.aliasSub != nil {
 		t.Fatalf("апекс: алиасы %v/%v", apex.aliasKind, apex.aliasSub)
 	}
-	// addrs: v4-mapped (::ffff:192.0.2.1) + IPv6, по 16 октетов.
+	// addrs: v4-mapped (::ffff:192.0.2.1) + IPv6, 16 octets each.
 	if len(apex.addrs) != 32 {
 		t.Fatalf("апекс: addrs %d байт, ожидалось 32 (2×16)", len(apex.addrs))
 	}
@@ -984,8 +984,8 @@ func TestRecordWritesAllColumns(t *testing.T) {
 		t.Fatalf("апекс: response_ms=%v", apex.responseMS)
 	}
 
-	// www: алиас-редирект на апекс, CNAME, обрезанное тело — код ошибки
-	// и NULL-хэш (T-056).
+	// www: an alias redirect to the apex, a CNAME, a truncated body — the error
+	// code and the NULL hash (T-056).
 	if www.aliasKind != model.AliasRedirect || www.aliasSub == nil || *www.aliasSub != 0 {
 		t.Fatalf("www: алиас %v/%v", www.aliasKind, www.aliasSub)
 	}
@@ -1005,7 +1005,7 @@ func TestRecordWritesAllColumns(t *testing.T) {
 		t.Fatalf("www: addrs %d байт, ожидалось 16", len(www.addrs))
 	}
 
-	// SQL-контракт: литералы схемы и структура операторов.
+	// The SQL contract: the schema literals and the operators' structure.
 	if !strings.Contains(recordDomainSQL, "check_state = 2") ||
 		!strings.Contains(recordDomainSQL, "queued_at = NULL") ||
 		!strings.Contains(recordDomainSQL, "last_checked_at = now()") ||
@@ -1017,9 +1017,9 @@ func TestRecordWritesAllColumns(t *testing.T) {
 		!strings.Contains(recordInsertSQL, "::jsonb[]") || !strings.Contains(recordInsertSQL, "::bytea[]") {
 		t.Fatalf("recordInsertSQL разошёлся с колонками §6.1:\n%s", recordInsertSQL)
 	}
-	// T-210: render_failed_at в INSERT не входит — перезапись эпизода
-	// (DELETE + INSERT) сбрасывает маркер «рендер невозможен»: новый
-	// контент имеет право на рендер (DEFAULT NULL).
+	// T-210: render_failed_at is not in the INSERT — the episode's
+	// rewrite (DELETE + INSERT) resets the "render impossible" marker: the new
+	// content has the right to a render (DEFAULT NULL).
 	if strings.Contains(recordInsertSQL, "render_failed_at") {
 		t.Fatalf("recordInsertSQL пишет render_failed_at — маркер T-210 обязан сбрасываться перезаписью эпизода (DEFAULT NULL):\n%s", recordInsertSQL)
 	}
@@ -1027,7 +1027,7 @@ func TestRecordWritesAllColumns(t *testing.T) {
 		t.Fatalf("recordDeleteSQL без RETURNING content_hash (своп ссылок T-044):\n%s", recordDeleteSQL)
 	}
 
-	// Публикация: после фиксации транзакции, по сообщению на запись.
+	// The publication: after the transaction's commit, one message per record.
 	pubs := q.publishesSnapshot()
 	if len(pubs) != 2 {
 		t.Fatalf("публикаций q:analyze %d, ожидалось 2", len(pubs))
@@ -1056,10 +1056,10 @@ func TestRecordWritesAllColumns(t *testing.T) {
 	}
 }
 
-// --- статусы домена (§5.5 п. 9, §7) ------------------------------------------
+// --- the domain statuses (§5.5 item 9, §7) ------------------------------------------
 
-// recordClassSub — субдомен без записей с классами ошибок обоих
-// протоколов (чистая таблица решений recordStatus).
+// recordClassSub — a subdomain without records with both protocols'
+// error classes (the pure recordStatus decision table).
 func recordClassSub(https, http ErrorClass) SubdomainResult {
 	return SubdomainResult{
 		SubdomainID: 0, Label: "", Hostname: "t.example",
@@ -1069,12 +1069,12 @@ func recordClassSub(https, http ErrorClass) SubdomainResult {
 	}
 }
 
-// TestRecordStatusDecision — таблица решений HTTP-этапа автомата status
-// (T-256, ТЗ-fsm §3 ФТ-2; спецификация — doc-комментарий у
-// recordDomainSQL, общая часть — internal/model/enums.go): чистая
-// функция recordStatus по строкам В1–В3, включая асимметрию А2
-// (connect-refused → no_http против connect-таймаута → temp_error) и
-// не-temp классы В3 (cutoff-синтетика не порождает temp_error).
+// TestRecordStatusDecision — the HTTP stage's branch of the status automaton's decision table
+// (T-256, TZ-fsm spec §3 FR-2; the specification — the doc comment at
+// recordDomainSQL, the common part — internal/model/enums.go): the pure
+// function recordStatus over the B1–B3 rows, including the A2
+// asymmetry (connect-refused → no_http against a connect timeout → temp_error) and
+// the B3 non-temp classes (the cutoff synthetics do not breed temp_error).
 func TestRecordStatusDecision(t *testing.T) {
 	recorded := recordClassSub(ErrNone, ErrNone)
 	recorded.Records = []Record{{Variant: model.VariantMain, Scheme: model.SchemeHTTPS}}
@@ -1178,14 +1178,14 @@ func TestRecordStatuses(t *testing.T) {
 	})
 }
 
-// TestRecordCutoffFlag — бит dead_host_cutoff последнего эпизода (T-164):
-// cutoff-результат ставит бит, обычный снимает (контрольная выборка ложных
-// cutoff-ов выбирает домены по маске бита); прочие биты не затрагиваются.
+// TestRecordCutoffFlag — the dead_host_cutoff bit of the last episode (T-164):
+// a cutoff result sets the bit, a usual one removes it (the false
+// cutoffs' control sample selects the domains by the bit mask); the other bits untouched.
 func TestRecordCutoffFlag(t *testing.T) {
 	pool := newRecordFakePool()
 	key := recordDomainKey{zone: 7, id: 92}
 	dom := pool.recordSeedDomain(key.zone, key.id, model.StatusNew, 0)
-	dom.flags.Set(model.FlagRenderPending) // чужой бит обязан уцелеть
+	dom.flags.Set(model.FlagRenderPending) // a foreign bit must survive
 	q := &recordFakeQueue{j: pool.j}
 
 	cut := recordSilentResult(false)
@@ -1200,7 +1200,7 @@ func TestRecordCutoffFlag(t *testing.T) {
 		t.Fatalf("CASE flags снял чужой бит render_pending: flags=%s", dom.flags)
 	}
 
-	// Обычный эпизод (полная проверка при перепроверке T-030) снимает бит.
+	// A usual episode (a full check at the T-030 recheck) removes the bit.
 	full := recordSilentResult(false)
 	if _, err := recordRecorder(t, pool, q).RecordAndPublish(context.Background(), full); err != nil {
 		t.Fatalf("RecordAndPublish (полный эпизод): %v", err)
@@ -1212,29 +1212,29 @@ func TestRecordCutoffFlag(t *testing.T) {
 		t.Fatalf("CASE flags снял чужой бит render_pending: flags=%s", dom.flags)
 	}
 
-	// SQL-контракт: бит и маска — литералами модели.
+	// The SQL contract: the bit and the mask — as the model's literals.
 	if !strings.Contains(recordDomainSQL, fmt.Sprintf("(t.flags | %d)::int2", int16(model.FlagDeadHostCutoff))) ||
 		!strings.Contains(recordDomainSQL, fmt.Sprintf("(t.flags & %d)::int2", int16(^int16(model.FlagDeadHostCutoff)))) {
 		t.Fatalf("recordDomainSQL без CASE битa dead_host_cutoff (T-164):\n%s", recordDomainSQL)
 	}
 }
 
-// TestRecordTempErrCounter — суточный числитель temp_error (T-182) и
-// корзина зрелости ретрая (T-202): инкремент — только у temp_error-итога
-// эпизода (та же транзакция, после знаменателя checks:, до фиксации —
-// порядок общий с проходом реконсиляции); no_http-итог строку дня не
-// трогает; дубль-доставка temp_error-эпизода — ещё одно событие в
-// числителе, знаменателе и корзине одновременно (доля устойчива,
-// корзину между проходами выравнивает декремент ретрая, абсолюты чинит
-// реконсиляция, TZ_slow_dns_share §5 / T-202).
+// TestRecordTempErrCounter — the daily temp_error numerator (T-182) and
+// the retry maturity bucket (T-202): the increment — only at the episode's temp_error
+// outcome (the same transaction, after the checks: denominator, before the commit —
+// the order shared with the reconciliation pass); a no_http outcome does not
+// touch the day row; a temp_error episode's duplicate delivery — one more event in
+// the numerator, the denominator and the bucket at once (the share is resilient,
+// the retry decrement levels the bucket between the passes, the reconciliation
+// fixes the absolutes, TZ_slow_dns_share §5 / T-202).
 func TestRecordTempErrCounter(t *testing.T) {
 	pool := newRecordFakePool()
 	q := &recordFakeQueue{j: pool.j}
 	r := recordRecorder(t, pool, q)
 
-	// temp_error-эпизод: +1 знаменатель, +1 числитель, +1 корзина;
-	// инкременты — между знаменателем и фиксацией, корзина — за
-	// числителем (порядок блокировок прохода реконсиляции).
+	// A temp_error episode: +1 denominator, +1 numerator, +1 bucket;
+	// the increments — between the denominator and the commit, the bucket —
+	// after the numerator (the reconciliation pass's lock order).
 	temp := recordSilentResult(true)
 	pool.recordSeedDomain(temp.ZoneID, temp.DomainID, model.StatusNew, 1)
 	if ok, err := r.RecordAndPublish(context.Background(), temp); err != nil || !ok {
@@ -1256,8 +1256,8 @@ func TestRecordTempErrCounter(t *testing.T) {
 			checks, tempBump, matureBump, commit)
 	}
 
-	// no_http-эпизод: знаменатель растёт, числитель и корзина не тронуты —
-	// операторы выполняют только temp_error-итоги.
+	// A no_http episode: the denominator grows, the numerator and the bucket untouched —
+	// only temp_error outcomes run the operators.
 	silent := recordSilentResult(false)
 	pool.recordSeedDomain(silent.ZoneID, silent.DomainID, model.StatusNew, 0)
 	if ok, err := r.RecordAndPublish(context.Background(), silent); err != nil || !ok {
@@ -1279,9 +1279,9 @@ func TestRecordTempErrCounter(t *testing.T) {
 		t.Fatalf("инкрементов корзины = %d, want 1", n)
 	}
 
-	// Дубль-доставка temp_error-эпизода: +1 в числитель, знаменатель и
-	// корзину вместе — событие записи, дрейф с живым доменным счётом
-	// сводит реконсиляция (T-202).
+	// A temp_error episode's duplicate delivery: +1 into the numerator, the denominator and
+	// the bucket together — a write event; the reconciliation levels
+	// the drift against the live domain count (T-202).
 	if ok, err := r.RecordAndPublish(context.Background(), temp); err != nil || !ok {
 		t.Fatalf("повтор temp_error-эпизода: ok=%v err=%v", ok, err)
 	}
@@ -1296,19 +1296,19 @@ func TestRecordTempErrCounter(t *testing.T) {
 	}
 }
 
-// TestRecordResultsCounter — часовая корзина темпа (T-203): дельта —
-// вставленные строки эпизода (не эпизоды: домен с двумя записями даёт
-// +2, молчаливый — 0 и оператор не выполняется вовсе); порядок — финал
-// цепочки дельт счётчика (после retry_mature: и reanalyze:, перед
-// фиксацией), общий с проходом реконсиляции.
+// TestRecordResultsCounter — the hourly throughput bucket (T-203): the delta —
+// the episode's inserted rows (not episodes: a domain with two records gives
+// +2, a silent one — 0 and the operator does not run at all); the order — the
+// finale of the counter delta chain (after retry_mature: and reanalyze:, before
+// the commit), shared with the reconciliation pass.
 func TestRecordResultsCounter(t *testing.T) {
 	pool := newRecordFakePool()
 	q := &recordFakeQueue{j: pool.j}
 	r := recordRecorder(t, pool, q)
 
-	// Богатый эпизод: две записи субдомен×вариант → корзины +2/+2
-	// (хвосты переанализа T-204 — те же строки с rules_version = NULL,
-	// темп T-203 — те же строки как события вставки).
+	// A rich episode: two subdomain×variant records → the buckets +2/+2
+	// (the reanalysis tails T-204 — the same rows with rules_version = NULL,
+	// the T-203 throughput — the same rows as insertion events).
 	rich, _ := recordRichResult()
 	pool.recordSeedDomain(rich.ZoneID, rich.DomainID, model.StatusNew, 0)
 	if ok, err := r.RecordAndPublish(context.Background(), rich); err != nil || !ok {
@@ -1328,9 +1328,9 @@ func TestRecordResultsCounter(t *testing.T) {
 			matureBump, reanBump, resultsBump, commit)
 	}
 
-	// Молчаливый эпизод (temp_error, без записей): строк нет — операторы
-	// корзин не выполняются вовсе (нулевые upsert-проходы не греют
-	// блокировки часов).
+	// A silent episode (temp_error, without records): no rows — the
+	// bucket operators do not run at all (zero upsert passes do not warm
+	// the hours' locks).
 	silent := recordSilentResult(true)
 	pool.recordSeedDomain(silent.ZoneID, silent.DomainID, model.StatusNew, 1)
 	if ok, err := r.RecordAndPublish(context.Background(), silent); err != nil || !ok {
@@ -1349,11 +1349,11 @@ func TestRecordResultsCounter(t *testing.T) {
 		t.Fatalf("инкрементов корзины хвостов = %d, want 1 (нулевая дельта не выполняется)", n)
 	}
 
-	// Повтор богатого эпизода (дубль-доставка): ещё +2 события вставки в
-	// обе корзины — живое окно насчитало бы те же 2 строки, разницу
-	// семантик сводит реконсиляция (потоковая, как у суточных строк).
-	// Повторная доставка переигрывает и сохранение контента (стиль
-	// TestRecordIdempotentRepeat): повторный Put даёт +1 refcount.
+	// A rich episode repeat (a duplicate delivery): two more insertion events into
+	// both buckets — a live window would count the same 2 rows; the
+	// semantics' difference is leveled by the reconciliation (streaming, as at the daily rows).
+	// A repeated delivery replays the content storing too (the style of
+	// TestRecordIdempotentRepeat): a repeated Put gives +1 refcount.
 	_, hashes := recordRichResult()
 	pool.refc[hashes["apex"]] = 2
 	if ok, err := r.RecordAndPublish(context.Background(), rich); err != nil || !ok {
@@ -1367,12 +1367,12 @@ func TestRecordResultsCounter(t *testing.T) {
 	}
 }
 
-// TestRecordReanalyzeCounterErrors — страховочная ветка RowsAffected ≠ 1
-// upsert корзины хвостов (T-204): ошибка шага откатывает транзакцию
-// целиком (строк и статуса нет), доставка вернётся повтором.
+// TestRecordReanalyzeCounterErrors — the tails bucket upsert's RowsAffected ≠ 1
+// guard branch (T-204): a step error rolls back the transaction
+// entirely (no rows and no status), the delivery will return by a repeat.
 func TestRecordReanalyzeCounterErrors(t *testing.T) {
 	pool := newRecordFakePool()
-	pool.reanTag = 2 // чужой SQL: затронуто 2 строки
+	pool.reanTag = 2 // a foreign SQL: 2 rows affected
 	rich, _ := recordRichResult()
 	pool.recordSeedDomain(rich.ZoneID, rich.DomainID, model.StatusNew, 0)
 	q := &recordFakeQueue{j: pool.j}
@@ -1389,7 +1389,7 @@ func TestRecordReanalyzeCounterErrors(t *testing.T) {
 	}
 }
 
-// --- охрана deleted (§8/§13.1) ----------------------------------------------
+// --- the deleted guard (§8/§13.1) ----------------------------------------------
 
 func TestRecordDeletedGuard(t *testing.T) {
 	pool := newRecordFakePool()
@@ -1416,9 +1416,9 @@ func TestRecordDeletedGuard(t *testing.T) {
 	if pool.j.count(recordEvInsert) != 0 || pool.j.count(recordEvDelete) != 0 {
 		t.Fatal("транзакция обязана остановиться на охране UPDATE")
 	}
-	// Удалённому результат не пишется — суточный счётчик тоже не растёт
-	// (T-179: дельта только при RowsAffected > 0 UPDATE, ТЗИ §6.1.3);
-	// числитель temp_error — тем более (T-182).
+	// No result is written to the deleted — the daily counter does not grow either
+	// (T-179: the delta only at an UPDATE RowsAffected > 0, incremental-counters spec §6.1.3);
+	// the temp_error numerator — all the more (T-182).
 	if pool.j.count(recordEvChecks) != 0 || pool.checksValue() != 0 ||
 		pool.j.count(recordEvTempErr) != 0 || pool.tempErrValue() != 0 {
 		t.Fatal("суточные счётчики тронуты при охране deleted")
@@ -1441,7 +1441,7 @@ func TestRecordDeletedGuard(t *testing.T) {
 	})
 }
 
-// --- перезапись + SwapRef (T-044/T-056) ---------------------------------------
+// --- the rewrite + SwapRef (T-044/T-056) ---------------------------------------
 
 func TestRecordRewriteSwapsRefs(t *testing.T) {
 	pool := newRecordFakePool()
@@ -1449,17 +1449,17 @@ func TestRecordRewriteSwapsRefs(t *testing.T) {
 	key := recordDomainKey{zone: 7, id: 91}
 	pool.recordSeedDomain(7, 91, model.StatusAlive, 0)
 
-	// Старая проверка: апекс с контентом H1, www с контентом H2
-	// (у старой версии записи алиас мог хранить свой блок).
+	// The old check: the apex with content H1, www with content H2
+	// (an old record version's alias could have stored its own block).
 	h1, h2 := recordTestHash(1), recordTestHash(2)
 	pool.refc[h1], pool.refc[h2] = 1, 1
 	oldFinal := "https://old.rich.example/"
 	pool.rows[key] = []recordFakeRow{
 		{subdomainID: 0, variant: model.VariantMain, contentHash: h1[:], finalURL: &oldFinal},
 		{subdomainID: 1, variant: model.VariantMain, contentHash: h2[:]},
-		{subdomainID: 1, variant: model.VariantHTTP, scheme: model.SchemeHTTP}, // ключ, которого нет в новом итоге
+		{subdomainID: 1, variant: model.VariantHTTP, scheme: model.SchemeHTTP}, // a key absent from the new outcome
 	}
-	// Новый контент апекса уже записан Put-ом (T-056): +1 от Put.
+	// The apex's new content is already written by a Put (T-056): +1 from the Put.
 	h3 := recordTestHash(3)
 	pool.refc[h3] = 1
 
@@ -1484,7 +1484,7 @@ func TestRecordRewriteSwapsRefs(t *testing.T) {
 			t.Fatal("старая строка пережила перезапись")
 		}
 	}
-	// Порядок операторов: −1 старых — до INSERT, всё после UPDATE домена.
+	// The operator order: −1 of the old ones — before the INSERT, everything after the domain's UPDATE.
 	for _, pair := range [][2]recordEventKind{
 		{recordEvDomains, recordEvSwap}, {recordEvSwap, recordEvInsert}, {recordEvInsert, recordEvCommit},
 	} {
@@ -1500,8 +1500,8 @@ func TestRecordIdempotentRepeat(t *testing.T) {
 	hApex := hashes["apex"]
 	key := recordDomainKey{zone: 7, id: 91}
 	pool.recordSeedDomain(7, 91, model.StatusNew, 0)
-	// Повторная доставка переигрывает и сохранение (T-056): повторный Put
-	// того же контента даёт лишний +1.
+	// A repeated delivery replays the storing too (T-056): a repeated Put
+	// of the same content gives an extra +1.
 	pool.refc[hApex] = 1
 	q := &recordFakeQueue{j: pool.j}
 	r := recordRecorder(t, pool, q)
@@ -1513,8 +1513,8 @@ func TestRecordIdempotentRepeat(t *testing.T) {
 		t.Fatalf("после первой записи refcount=%d, ожидался 1", pool.refc[hApex])
 	}
 
-	// Recheck-сценарий: Put добавил ссылку заново (refcount 2), перезапись
-	// снимает ссылку старой строки — итог сбалансирован.
+	// The recheck scenario: the Put added the reference anew (refcount 2), the
+	// rewrite removes the old row's reference — the outcome is balanced.
 	pool.refc[hApex] = 2
 	if ok, err := r.RecordAndPublish(context.Background(), res); err != nil || !ok {
 		t.Fatalf("повторная запись: ok=%v err=%v (идемпотентность, ТЗ 3.4)", ok, err)
@@ -1525,21 +1525,21 @@ func TestRecordIdempotentRepeat(t *testing.T) {
 	if len(pool.rows[key]) != 2 {
 		t.Fatalf("строк %d — повтор обязан перезаписать, не дублировать", len(pool.rows[key]))
 	}
-	// Повтор после успешной записи публикует q:analyze заново: окно
-	// «записано, не опубликовано» закрывается повторной доставкой.
+	// A repeat after a successful write publishes q:analyze anew: the
+	// "written, not published" window is closed by the repeated delivery.
 	if got := len(q.publishesSnapshot()); got != 4 {
 		t.Fatalf("публикаций суммарно %d, ожидалось 4 (2×2)", got)
 	}
-	// Суточный счётчик считает события записи (T-179, TZ_slow_done_today
-	// §5.1): повторная доставка — ещё одно событие, +1 (не ×2 на
-	// доставку); сходят к живому окну реконсиляцией (интеграционный
-	// сценарий — TestCounters_RecordDoubleDelivery).
+	// The daily counter counts the write events (T-179, TZ_slow_done_today
+	// §5.1): a repeated delivery — one more event, +1 (not ×2 per
+	// delivery); they converge to the live window by the reconciliation (the
+	// integration scenario — TestCounters_RecordDoubleDelivery).
 	if got := pool.checksValue(); got != 2 {
 		t.Fatalf("суточный счётчик = %d, want 2 (по одному событию на запись)", got)
 	}
 }
 
-// --- транзакционность и сбои шагов -------------------------------------------
+// --- transactionality and step failures -------------------------------------------
 
 func TestRecordTransactionFailures(t *testing.T) {
 	res, _ := recordRichResult()
@@ -1548,8 +1548,8 @@ func TestRecordTransactionFailures(t *testing.T) {
 		pool.recordSeedDomain(7, 91, model.StatusNew, 0)
 		return pool, &recordFakeQueue{j: pool.j}
 	}
-	// assertRolledBack проверяет откат: домен в исходном состоянии, строк
-	// oldRows (сброс к снапшоту), публикаций нет.
+	// assertRolledBack checks the rollback: the domain in the initial state,
+	// oldRows rows (a reset to the snapshot), no publications.
 	assertRolledBack := func(t *testing.T, pool *recordFakePool, q *recordFakeQueue, err error, oldRows int) {
 		t.Helper()
 		if err == nil {
@@ -1592,8 +1592,8 @@ func TestRecordTransactionFailures(t *testing.T) {
 		assertRolledBack(t, pool, q, err, 0)
 	})
 	t.Run("суточный счётчик проверок", func(t *testing.T) {
-		// T-179: сбой инкремента откатывает транзакцию целиком —
-		// результат и счётчик меняются только вместе.
+		// T-179: an increment failure rolls back the transaction entirely —
+		// the result and the counter change only together.
 		pool, q := seed(t)
 		pool.failExec = map[string]error{recordChecksBumpSQL: errors.New("счётчики недоступны")}
 		_, err := recordRecorder(t, pool, q).RecordAndPublish(context.Background(), res)
@@ -1603,8 +1603,8 @@ func TestRecordTransactionFailures(t *testing.T) {
 		}
 	})
 	t.Run("суточный числитель temp_error", func(t *testing.T) {
-		// T-182: сбой инкремента числителя откатывает и результат, и
-		// знаменатель — пара счётчиков меняется только вместе с записью.
+		// T-182: a numerator increment failure rolls back both the result and
+		// the denominator — the counter pair changes only together with the write.
 		temp := recordSilentResult(true)
 		pool, q := seed(t)
 		pool.recordSeedDomain(temp.ZoneID, temp.DomainID, model.StatusNew, 1)
@@ -1624,8 +1624,8 @@ func TestRecordTransactionFailures(t *testing.T) {
 		}
 	})
 	t.Run("корзина зрелости ретрая", func(t *testing.T) {
-		// T-202: сбой инкремента корзины откатывает транзакцию целиком —
-		// эпизод без корзины открыл бы guard ретрая на сутки меньше.
+		// T-202: a bucket increment failure rolls back the transaction entirely —
+		// an episode without the bucket would open the retry guard a day less.
 		temp := recordSilentResult(true)
 		pool, q := seed(t)
 		pool.recordSeedDomain(temp.ZoneID, temp.DomainID, model.StatusNew, 1)
@@ -1642,13 +1642,13 @@ func TestRecordTransactionFailures(t *testing.T) {
 		}
 	})
 	t.Run("корзина зрелости: RowsAffected ≠ 1", func(t *testing.T) {
-		// T-202, ревью P3-2: страховочная ветка upsert'а — «молчаливая
-		// потеря дельты держала бы guard ретрая закрытым», ответ ≠ 1
-		// обязан ошибкой и откатом (молчание — баг счётчика).
+		// T-202, the P3-2 review: the upsert's guard branch — "a silent
+		// must be an error and a rollback (silence — a counter bug).
+		// must be an error and a rollback (silence — a counter bug).
 		temp := recordSilentResult(true)
 		pool, q := seed(t)
 		pool.recordSeedDomain(temp.ZoneID, temp.DomainID, model.StatusNew, 1)
-		pool.matureTag = 2 // INSERT 0 2 — чужой SQL/распад протокола
+		pool.matureTag = 2 // INSERT 0 2 — a foreign SQL/a protocol decay
 		_, err := recordRecorder(t, pool, q).RecordAndPublish(context.Background(), temp)
 		assertRolledBack(t, pool, q, err, 0)
 		if err == nil || !strings.Contains(err.Error(), "затронуто 2 строк (upsert корзины суток обязан 1)") {
@@ -1659,9 +1659,9 @@ func TestRecordTransactionFailures(t *testing.T) {
 		}
 	})
 	t.Run("часовая корзина темпа", func(t *testing.T) {
-		// T-203: сбой инкремента корзины откатывает транзакцию целиком —
-		// результат и корзина меняются только вместе (темп занижался бы
-		// молча).
+		// T-203: a bucket increment failure rolls back the transaction entirely —
+		// undercounted silently).
+		// undercounted silently).
 		pool, q := seed(t)
 		pool.failExec = map[string]error{recordResultsBumpSQL: errors.New("счётчики недоступны")}
 		_, err := recordRecorder(t, pool, q).RecordAndPublish(context.Background(), res)
@@ -1671,10 +1671,10 @@ func TestRecordTransactionFailures(t *testing.T) {
 		}
 	})
 	t.Run("часовая корзина темпа: RowsAffected ≠ 1", func(t *testing.T) {
-		// T-203: страховочная ветка upsert'а (стиль корзины зрелости,
-		// ревью T-202 P3-2) — молчаливая потеря дельты занижала бы темп.
+		// T-203: the upsert's guard branch (the maturity bucket's style,
+		// the T-202 P3-2 review) — a silent delta loss would understate the throughput.
 		pool, q := seed(t)
-		pool.resultsTag = 2 // INSERT 0 2 — чужой SQL/распад протокола
+		pool.resultsTag = 2 // INSERT 0 2 — a foreign SQL/a protocol decay
 		_, err := recordRecorder(t, pool, q).RecordAndPublish(context.Background(), res)
 		assertRolledBack(t, pool, q, err, 0)
 		if err == nil || !strings.Contains(err.Error(), "затронуто 2 строк (upsert корзины часа обязан 1)") {
@@ -1696,13 +1696,13 @@ func TestRecordTransactionFailures(t *testing.T) {
 		pool.rows[recordDomainKey{zone: 7, id: 91}] = []recordFakeRow{
 			{subdomainID: 0, variant: model.VariantMain, contentHash: h[:]},
 		}
-		// refcount хэша нулевой (мёртвая строка) — учёт разошёлся.
+		// The hash's refcount is zero (a dead row) — the accounting diverged.
 		_, err := recordRecorder(t, pool, q).RecordAndPublish(context.Background(), res)
 		if !errors.Is(err, content.ErrRefIntegrity) {
 			t.Fatalf("ожидался ErrRefIntegrity: %v", err)
 		}
 		assertRolledBack(t, pool, q, err, 1)
-		// Старая строка цела: удаление откатилось вместе с транзакцией.
+		// The old row is intact: the deletion rolled back together with the transaction.
 		if rows := pool.rows[recordDomainKey{zone: 7, id: 91}]; len(rows) != 1 || string(rows[0].contentHash) != string(h[:]) {
 			t.Fatalf("старая строка обязана пережить откат: %+v", rows)
 		}
@@ -1719,12 +1719,12 @@ func TestRecordTransactionFailures(t *testing.T) {
 	})
 }
 
-// TestRecordDeadlockRetry — фолт-инъекция 40P01 (T-268): дедлок внутри
-// транзакции записи повторяется ЦЕЛИКОМ (попытка откатывается и
-// исполняется заново — begin ×2, половинчатых состояний нет), публикация
-// q:analyze — одна (у упавшей попытки её не было); после исчерпания
-// повторов ошибка наружу (доставка без XACK, ТЗ 3.4), метрика
-// crawler_db_deadlock_retried_total растёт на каждый повтор.
+// TestRecordDeadlockRetry — the 40P01 fault injection (T-268): a deadlock inside
+// the write transaction is retried WHOLE (the attempt is rolled back and
+// executed anew — begin ×2, no half-done states), the
+// q:analyze publication — one (the failed attempt had none); after
+// the retries are exhausted the error goes out (a delivery without an XACK, spec 3.4), the
+// crawler_db_deadlock_retried_total metric grows per every repeat.
 func TestRecordDeadlockRetry(t *testing.T) {
 	deadlock := &pgconn.PgError{Code: "40P01", Message: "deadlock detected"}
 	res, _ := recordRichResult()
@@ -1746,9 +1746,9 @@ func TestRecordDeadlockRetry(t *testing.T) {
 		if err != nil || !ok {
 			t.Fatalf("RecordAndPublish = (%v, %v), want (true, nil) — дедлок поглощён", ok, err)
 		}
-		// Две попытки транзакции: первая откатилась на UPDATE, вторая
-		// прошла до Commit; публикации — после фиксации, одна пачка
-		// (по одной на запись субдомен×вариант, дубля от попытки нет).
+		// Two transaction attempts: the first rolled back at the UPDATE, the second
+		// passed to the Commit; the publications — after the commit, one
+		// chunk (one per subdomain×variant record, no attempt's duplicate).
 		if pool.begins != 2 {
 			t.Errorf("транзакций-попыток = %d, want 2 (повтор целиком)", pool.begins)
 		}
@@ -1758,7 +1758,7 @@ func TestRecordDeadlockRetry(t *testing.T) {
 		if got, want := len(q.publishesSnapshot()), res.RecordCount(); got != want {
 			t.Errorf("публикаций q:analyze = %d, want %d (одна пачка после фиксации)", got, want)
 		}
-		// Повтор честный: попытка 1 закоммитила ничего, счётчики не задвоены.
+		// An honest repeat: attempt 1 committed nothing, the counters are not doubled.
 		if got := pool.checksValue(); got != 1 {
 			t.Errorf("суточный счётчик = %d, want 1 (без задвоения дельт)", got)
 		}
@@ -1807,9 +1807,9 @@ func TestRecordDeadlockRetry(t *testing.T) {
 	})
 }
 
-// TestRecordDeadlockRunAck — критерий приёмки T-268 целиком: дедлок
-// транзакции записи в цепочке OnResult поглощён повтором — доставка
-// q:http подтверждается (XACK), задача не сгорает в ределивери.
+// TestRecordDeadlockRunAck — the T-268 acceptance criterion in full: the write
+// transaction's deadlock in the OnResult chain is absorbed by the repeat — the
+// q:http delivery is acknowledged (XACK), the task does not burn in the redelivery.
 func TestRecordDeadlockRunAck(t *testing.T) {
 	body := "<html>" + strings.Repeat("страница для проверки ретрая дедлока ", 30) + "</html>"
 	fetch, _ := workerFakeFetch(map[string]*workerPageScript{
@@ -1866,7 +1866,7 @@ func TestRecordDeadlockRunAck(t *testing.T) {
 	}
 }
 
-// --- публикация: после записи, ошибки не молчат -------------------------------
+// --- the publication: after the write, errors are not silent -------------------------------
 
 func TestRecordPublishFailures(t *testing.T) {
 	t.Run("сбой публикации — результат записан, доставка вернётся", func(t *testing.T) {
@@ -1897,7 +1897,7 @@ func TestRecordPublishFailures(t *testing.T) {
 	})
 }
 
-// --- валидация до транзакции ---------------------------------------------------
+// --- the validation before the transaction ---------------------------------------------------
 
 func TestRecordValidation(t *testing.T) {
 	newRes := func(mutate func(*Record)) *DomainResult {
@@ -1971,11 +1971,11 @@ func TestRecordValidation(t *testing.T) {
 	})
 }
 
-// --- smoke: цикл Run с цепочкой OnResult (сборка cmd/http-worker) --------------
+// --- the smoke: the Run loop with the OnResult chain (the cmd/http-worker build) --------------
 
-// TestRecordOnResultSmoke — доставка q:http → ProcessDomain → ContentSaver
-// (T-056) → запись результата + публикация q:analyze (T-058) → XACK:
-// порядок «публикация до ack», сообщения по записям, домен done.
+// TestRecordOnResultSmoke — a q:http delivery → ProcessDomain → ContentSaver
+// (T-056) → the result write + the q:analyze publication (T-058) → the XACK:
+// the "publication before ack" order, messages per records, the domain done.
 func TestRecordOnResultSmoke(t *testing.T) {
 	page := storePageBody("smoke")
 	fetch, _ := workerFakeFetch(map[string]*workerPageScript{
@@ -1997,8 +1997,8 @@ func TestRecordOnResultSmoke(t *testing.T) {
 	}
 	recorder := recordRecorder(t, pool, q)
 
-	// Цепочка сборки сервиса (cmd/http-worker): ContentSaver → запись →
-	// публикация; OnResult читается из опций Run (worker.go).
+	// The service build's chain (cmd/http-worker): ContentSaver → the write →
+	// the publication; OnResult is read from the Run options (worker.go).
 	opts := Options{OnResult: func(c context.Context, res *DomainResult) error {
 		if err := saver.Save(c, res); err != nil {
 			return err
@@ -2006,7 +2006,7 @@ func TestRecordOnResultSmoke(t *testing.T) {
 		_, err := recorder.RecordAndPublish(c, res)
 		return err
 	}}
-	opts.Store = st // ранние Put — в тот же фейк, что и сверка Save (T-147)
+	opts.Store = st // the early Puts go into the same fake as the Save reconciliation (T-147)
 	w, err := New(fetch, opts)
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -2046,8 +2046,8 @@ func TestRecordOnResultSmoke(t *testing.T) {
 	}
 }
 
-// TestRecordOnResultPublishErrorNoAck — сбой публикации оставляет доставку
-// без XACK: повторная доставка перезапишет результат и опубликует заново.
+// TestRecordOnResultPublishErrorNoAck — a publication failure leaves the delivery
+// without an XACK: a repeated delivery will rewrite the result and publish anew.
 func TestRecordOnResultPublishErrorNoAck(t *testing.T) {
 	page := storePageBody("pub-err")
 	fetch, _ := workerFakeFetch(map[string]*workerPageScript{
@@ -2066,7 +2066,7 @@ func TestRecordOnResultPublishErrorNoAck(t *testing.T) {
 		_, err := recorder.RecordAndPublish(c, res)
 		return err
 	}}
-	opts.Store = newStoreFake() // ранние Put T-147 — свежий фейк (Save в цепочке нет)
+	opts.Store = newStoreFake() // the early Puts T-147 — a fresh fake (no Save in the chain)
 	w, err := New(fetch, opts)
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -2085,7 +2085,7 @@ func TestRecordOnResultPublishErrorNoAck(t *testing.T) {
 		case <-time.After(10 * time.Millisecond):
 		}
 	}
-	// Доставка обязана остаться неподтверждённой.
+	// The delivery must stay unacknowledged.
 	time.Sleep(50 * time.Millisecond)
 	if got := q.j.count(recordEvAck); got != 0 {
 		t.Fatalf("XACK %d при сбое публикации — доставка обязана вернуться (ТЗ 3.4)", got)
@@ -2093,7 +2093,7 @@ func TestRecordOnResultPublishErrorNoAck(t *testing.T) {
 	if len(q.ackedSnapshot()) != 0 {
 		t.Fatal("ack зафиксирован при ошибке OnResult")
 	}
-	// Запись при этом состоялась: повтор только допубликует.
+	// The write did happen at that: the repeat will only finish publishing.
 	if len(pool.rows[recordDomainKey{zone: 5, id: 43}]) != 1 {
 		t.Fatal("результат не записан перед публикацией")
 	}

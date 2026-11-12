@@ -1,133 +1,133 @@
-// Автомат состояния проверки схемы (T-266, ТЗ tasks/TZ-fsm.md §3 ФТ-12):
-// единая точка правды о ДОПУСТИМЫХ комбинациях полей итога одной проверки
-// (SchemeCheck, worker.go) и контентной части записи субдомен-результата
-// (Record, worker.go). Состояние закодировано не отдельной колонкой, а
-// сочетанием значений полей структур — центром формализации являются
-// матрица легальных комбинаций и инварианты, а не таблица переходов
-// (ТЗ-fsm §1: спецификация живёт в doc-комментарии пакета рядом с кодом).
-// Писатели состояния — checkScheme и workerSkipSubdomain (worker.go),
-// вариант-логика ProcessDomain + DetectAliases (httpfetch, T-054/T-055) и
-// нормализация ContentSaver.Save (store.go, T-056); всё написанное ими
-// обязано укладываться в матрицы ниже.
+// The scheme check state FSM (T-266, spec tasks/TZ-fsm.md §3 FR-12):
+// the single source of truth about the LEGAL combinations of the fields of one
+// check's outcome (SchemeCheck, worker.go) and of the content part of a subdomain-result
+// record (Record, worker.go). The state is encoded not by a separate column, but
+// by the combination of the struct field values — the center of the formalization is
+// the matrix of legal combinations and the invariants, not a transition table
+// (TZ-fsm spec §1: the specification lives in the package doc comment next to the code).
+// The state writers — checkScheme and workerSkipSubdomain (worker.go),
+// the variant logic ProcessDomain + DetectAliases (httpfetch, T-054/T-055) and
+// the ContentSaver.Save normalization (store.go, T-056); everything they write
+// must fit the matrices below.
 //
-// Методы-валидаторы (ФТ-12) проверяют инварианты матриц на границах
-// этапов:
+// The validator methods (FR-12) check the matrices' invariants at the stage
+// boundaries:
 //
-//   - validateResult (SchemeCheck.validate + Record.validate по всем
-//     субдоменам) — конец ProcessDomain, до передачи результата в
-//     Options.OnResult (первое звено цепочки — ContentSaver, T-056):
-//     нелегальная комбинация — баг построения результата, задача q:http
-//     возвращается без XACK (ТЗ 3.4), мусор в БД не попадает;
-//   - Record.validate — newRecordBatch (record.go, T-058) перед
-//     транзакцией записи: записи после нормализации ContentSaver;
-//     инварианты ContentNotStored ⇒ hash = nil и AliasNone ⇔ alias_id,
-//     прежде проверявшиеся разрозненно (recordValidateRow), централизованы
-//     здесь (ФТ-12).
+//   - validateResult (SchemeCheck.validate + Record.validate over all
+//     subdomains) — the end of ProcessDomain, before passing the result to
+//     Options.OnResult (the first link of the chain — ContentSaver, T-056):
+//     an illegal combination — a result construction bug, the q:http task
+//     is returned without an XACK (spec 3.4), garbage does not reach the DB;
+//   - Record.validate — newRecordBatch (record.go, T-058) before
+//     the write transaction: the records after the ContentSaver normalization;
+//     the ContentNotStored ⇒ hash = nil and AliasNone ⇔ alias_id invariants,
+//     previously checked piecemeal (recordValidateRow), are centralized
+//     here (FR-12).
 //
-// # Состояние проверки схемы (SchemeCheck, 7 полей)
+// # The scheme check state (SchemeCheck, 7 fields)
 //
-// Вектор состояния: Available × Cached × ErrClass × DeadDial ×
-// ContentHash≠nil × ContentStored × Truncated. Матрица ниже — ПЕРЕЧЕНЬ
-// состояний писателей (все комбинации, которые пишет код); исполняемая
-// часть спецификации — инварианты И1–И8 (SchemeCheck.validate):
-// комбинации вне строк матрицы, не нарушающие инварианты (например,
-// частичные записи прямых вызовов), валидатором допускаются.
+// The state vector: Available × Cached × ErrClass × DeadDial ×
+// ContentHash≠nil × ContentStored × Truncated. The matrix below — a LIST
+// of the writers' states (all the combinations the code writes); the executable
+// part of the specification — the I1–I8 invariants (SchemeCheck.validate):
+// the combinations outside the matrix rows that do not violate the invariants (for example,
+// partial writes of direct calls) are admitted by the validator.
 //
-//	| № | Доступна | Кэш | ErrClass | DeadDial | Хэш | Сохранено | Обрезано | Пишет |
+//	| # | Available | Cache | ErrClass | DeadDial | Hash | Stored | Truncated | Written by |
 //	|---|----------|-----|----------|----------|-----|-----------|----------|-------|
-//	| С1 | да | — | ErrNone | — | ≠nil | да | — | checkScheme: ответ получен, ранний Put прошёл (T-147) |
-//	| С2 | да | — | ErrNone | — | ≠nil | — | — | checkScheme: ответ получен, Put в паузе записи контента (ErrStoreFull/ErrTooLarge, ТЗ 8); той же формы итог веток storeErr (хэш-рассинхрон, сбой Put) — эпизод падает в ProcessDomain до валидации |
-//	| С3 | да | — | ErrBody | — | ≠nil | — | да | checkScheme: тело обрезано потолком max_body_bytes (T-049), хэш — над обрезанными байтами |
-//	| С4 | да | да | ErrNone | — | ≠nil | да | — | checkScheme: кэш-попадание страницы С1 (ТЗ 5.5 п. 6), FinalURL — стартовый URL (см. ниже) |
-//	| С5 | да | да | ErrNone | — | ≠nil | — | — | checkScheme: кэш-попадание страницы С2 — пауза записи наследуется |
-//	| С6 | да | да | ErrBody | — | ≠nil | — | да | checkScheme: кэш-попадание страницы С3 — класс и обрезка переносятся кэш-итогом |
-//	| С7 | — | — | ErrNetwork | да | nil | — | — | checkScheme: connection refused стартового хоста, цепочка пуста (T-164) |
-//	| С8 | — | — | ErrTimeout | да | nil | — | — | checkScheme: connect-таймаут стартового хоста, цепочка пуста (T-164) |
-//	| С9 | — | — | ErrTimeout | — | nil | — | — | checkScheme: таймаут заголовков/общий/анти-тарпит/чтения тела; частичный итог (Status/Header/TLS/FinalURL/Redirects) может быть заполнен (§8) |
-//	| С10 | — | — | ErrTLS | — | nil | — | — | checkScheme: сбой TLS-рукопожатия (InsecureSkipVerify не спасает от отказа установить соединение) |
-//	| С11 | — | — | ErrNetwork | — | nil | — | — | checkScheme: прочие транспортные — обрыв, ошибка/резолв хоста редиректа (цепочка может быть непустой), unreachable/SSRF-фильтр диала (цепочка пуста); от С7/С8 отличает DeadDial=false — не отказ connect-фазы |
-//	| С12 | — | — | ErrRedirects | — | nil | — | — | checkScheme: лимит max_redirects или цикл (T-048), Redirects — выполненная часть |
-//	| С13 | — | — | ErrBody | — | nil | — | — | checkScheme: ошибка чтения тела после заголовков (битый Content-Encoding, zip-бомба — ErrDecompressTooLarge): протокол ответил, страницы нет |
-//	| С14 | — | — | ErrCutoff | — | nil | — | — | workerSkipSubdomain: синтетика субдомена, пропущенного dead-host cutoff (T-164); записей не создаёт (§8) |
+//	| S1 | yes | — | ErrNone | — | ≠nil | yes | — | checkScheme: the answer is received, the early Put passed (T-147) |
+//	| S2 | yes | — | ErrNone | — | ≠nil | — | — | checkScheme: the answer is received, the Put is in the content write pause (ErrStoreFull/ErrTooLarge, spec 8); the storeErr branches' outcome of the same shape (a hash desync, a Put failure) — the episode fails in ProcessDomain before the validation |
+//	| S3 | yes | — | ErrBody | — | ≠nil | — | yes | checkScheme: the body is truncated by the max_body_bytes cap (T-049), the hash — over the truncated bytes |
+//	| S4 | yes | yes | ErrNone | — | ≠nil | yes | — | checkScheme: the cache hit of page S1 (spec 5.5 item 6), FinalURL — the starting URL (see below) |
+//	| S5 | yes | yes | ErrNone | — | ≠nil | — | — | checkScheme: the cache hit of page S2 — the write pause is inherited |
+//	| S6 | yes | yes | ErrBody | — | ≠nil | — | yes | checkScheme: the cache hit of page S3 — the class and the truncation are carried by the cache outcome |
+//	| S7 | — | — | ErrNetwork | yes | nil | — | — | checkScheme: connection refused of the starting host, the chain is empty (T-164) |
+//	| S8 | — | — | ErrTimeout | yes | nil | — | — | checkScheme: the connect timeout of the starting host, the chain is empty (T-164) |
+//	| S9 | — | — | ErrTimeout | — | nil | — | — | checkScheme: the headers/overall/anti-tarpit/body-read timeout; a partial outcome (Status/Header/TLS/FinalURL/Redirects) may be filled (§8) |
+//	| S10 | — | — | ErrTLS | — | nil | — | — | checkScheme: a TLS handshake failure (InsecureSkipVerify does not save from a refusal to establish the connection) |
+//	| S11 | — | — | ErrNetwork | — | nil | — | — | checkScheme: the other transport ones — a disconnect, an error/resolution of the redirect host (the chain may be non-empty), a dial's unreachable/SSRF filter (the chain is empty); it differs from S7/S8 by DeadDial=false — not a connect-phase refusal |
+//	| S12 | — | — | ErrRedirects | — | nil | — | — | checkScheme: the max_redirects limit or a loop (T-048), Redirects — the performed part |
+//	| S13 | — | — | ErrBody | — | nil | — | — | checkScheme: a body read error after the headers (a broken Content-Encoding, a zip bomb — ErrDecompressTooLarge): the protocol answered, there is no page |
+//	| S14 | — | — | ErrCutoff | — | nil | — | — | workerSkipSubdomain: the synthetics of a subdomain skipped by the dead-host cutoff (T-164); creates no records (§8) |
 //
-// Инварианты (нумерация — логическая; порядок проверки в validate()
-// подобран так, чтобы каждая ветка была достижима: коды → кэш →
-// недоступность → доступность → сохранение → cutoff → dead dial):
+// The invariants (the numbering is logical; the check order in validate()
+// is chosen so that every branch is reachable: codes → cache →
+// unavailability → availability → storage → cutoff → dead dial):
 //
-//	И1  Scheme и ErrClass — коды перечислений модели (§6.1, ErrorClass).
-//	И2  DeadDial ⇒ недоступная, без кэша и хэша, с ПУСТОЙ цепочкой
-//	    редиректов и классом connect-фазы: ErrNetwork (connection
-//	    refused) или ErrTimeout (connect-таймаут) — сигнатура
-//	    мёртвого хоста T-164 (httpfetch.IsConnectFailure).
-//	И3  Cached ⇒ доступная с хэшем: кэш хранит только прочитанные
-//	    страницы (workerURLCache.put — конец успешного checkScheme).
-//	И4  Available ⇒ тело прочитано: ContentHash ≠ nil, FinalURL ≠ nil,
-//	    SPA ≠ nil; ErrBody ⟺ Truncated — обрезка единственный ErrBody
-//	    доступной проверки (ошибка чтения тела гасит Available, С13).
-//	И5  ¬Available ⇒ контентной части нет: хэш nil, ¬Truncated,
-//	    ¬ContentStored; частичные Status/Header/TLS/FinalURL — можно
-//	    (данные для разбора, §8); Cached исключён И3.
-//	И6  ContentStored ⇒ без обрезки (доступность и наличие хэша при
-//	    ContentStored требуют И5/И4; обрезанное тело раннего Put не
-//	    получает, T-049).
-//	И7  ErrCutoff ⇒ ¬Available: cutoff — «проверка не выполнялась».
-//	И8  ErrClass = ErrNone ⟺ ErrText = "" — ошибки всегда с текстом
-//	    для разбора, успех — без.
+//	I1  Scheme and ErrClass — the model enums' codes (§6.1, ErrorClass).
+//	I2  DeadDial ⇒ unavailable, without cache and hash, with an EMPTY chain
+//	    of redirects and a connect-phase class: ErrNetwork (connection
+//	    refused) or ErrTimeout (a connect timeout) — the signature
+//	    of the dead host T-164 (httpfetch.IsConnectFailure).
+//	I3  Cached ⇒ available with a hash: the cache stores only read
+//	    pages (workerURLCache.put — the end of a successful checkScheme).
+//	I4  Available ⇒ the body is read: ContentHash ≠ nil, FinalURL ≠ nil,
+//	    SPA ≠ nil; ErrBody ⟺ Truncated — truncation is the only ErrBody
+//	    of an available check (a body read error extinguishes Available, S13).
+//	I5  ¬Available ⇒ no content part: the hash nil, ¬Truncated,
+//	    ¬ContentStored; partial Status/Header/TLS/FinalURL — allowed
+//	    (the data for parsing, §8); Cached is excluded by I3.
+//	I6  ContentStored ⇒ without truncation (the availability and the hash presence at
+//	    ContentStored are required by I5/I4; a truncated body does not get the early
+//	    Put, T-049).
+//	I7  ErrCutoff ⇒ ¬Available: a cutoff is "the check was not performed".
+//	I8  ErrClass = ErrNone ⟺ ErrText = "" — errors are always with text
+//	    for parsing, a success — without.
 //
-// # Контентная часть записи (Record)
+// # The record's content part (Record)
 //
-// Запись создаётся ТОЛЬКО доступной проверкой (DecideVariants, T-054:
-// оба протокола молчат — записей нет), поэтому контентная часть записи —
-// проекция состояний С1–С3 (кэш-попадания С4–С6 дают те же значения), а
-// алиасная разметка — DetectAliases (T-055). Границы этапов несут две
-// формы записи (до/после нормализации ContentSaver, store.go); матрица —
-// перечень форм писателей, исполняемая часть — инварианты П1–П7
-// (Record.validate, действуют на ОБЕИХ границах — пересечение форм,
-// «—» = false):
+// A record is created ONLY by an available check (DecideVariants, T-054:
+// both protocols are silent — no records), therefore the record's content part —
+// a projection of the S1–S3 states (the cache hits S4–S6 give the same values), and
+// the alias marking — DetectAliases (T-055). The stage boundaries carry two
+// record shapes (before/after the ContentSaver normalization, store.go); the matrix —
+// a list of the writers' shapes, the executable part — the P1–P7 invariants
+// (Record.validate, valid at BOTH boundaries — the intersection of the shapes,
+// "—" = false):
 //
-//	| № | Граница | AliasKind | StoreContent | Хэш | ContentStored | ContentNotStored | Truncated | Пишет |
+//	| # | Boundary | AliasKind | StoreContent | Hash | ContentStored | ContentNotStored | Truncated | Written by |
 //	|---|---------|-----------|--------------|-----|---------------|------------------|-----------|-------|
-//	| Р1 | обе | None | да | ≠nil | да | — | — | ProcessDomain: оригинал, ранний Put прошёл; ContentSaver не меняет |
-//	| Р2 | до Save | None | да | ≠nil | — | — | — | ProcessDomain: оригинал, пауза записи контента → Save → Р6 |
-//	| Р3 | до Save | None | да | ≠nil | — | — | да | ProcessDomain: оригинал, обрезка → Save → Р7 |
-//	| Р4 | до Save | ≠None | — | ≠nil | да/— | — | — | DetectAliases: алиас — хэш своя копия проверки-источника, Save снимет → Р8 |
-//	| Р5 | до Save | ≠None | — | ≠nil | — | — | да | DetectAliases: алиас обрезанной страницы → Save → Р8 |
-//	| Р6 | после Save | None | да | nil | — | да | — | ContentSaver: контент не сохранён (пауза записи/лимит max_store_bytes), хэш снят |
-//	| Р7 | после Save | None | да | nil | — | да | да | ContentSaver: обрезанное тело не хранится, хэш снят |
-//	| Р8 | после Save | ≠None | — | nil | да/— | — | да/— | ContentSaver: алиас — контент у оригинала; Truncated/ContentStored — нетронутая копия src (Save их не меняет) |
+//	| R1 | both | None | yes | ≠nil | yes | — | — | ProcessDomain: the original, the early Put passed; ContentSaver does not change it |
+//	| R2 | before Save | None | yes | ≠nil | — | — | — | ProcessDomain: the original, a content write pause → Save → R6 |
+//	| R3 | before Save | None | yes | ≠nil | — | — | yes | ProcessDomain: the original, a truncation → Save → R7 |
+//	| R4 | before Save | ≠None | — | ≠nil | yes/— | — | — | DetectAliases: an alias — the hash is its own copy of the source check, Save will remove it → R8 |
+//	| R5 | before Save | ≠None | — | ≠nil | — | — | yes | DetectAliases: an alias of a truncated page → Save → R8 |
+//	| R6 | after Save | None | yes | nil | — | yes | — | ContentSaver: the content is not stored (a write pause/the max_store_bytes limit), the hash is removed |
+//	| R7 | after Save | None | yes | nil | — | yes | yes | ContentSaver: a truncated body is not stored, the hash is removed |
+//	| R8 | after Save | ≠None | — | nil | yes/— | — | yes/— | ContentSaver: an alias — the content is at the original; Truncated/ContentStored — an untouched copy of src (Save does not change them) |
 //
-// Инварианты:
+// The invariants:
 //
-//	П1  Variant/Scheme/AliasKind — коды перечислений модели (§6.1).
-//	П2  (AliasKind = AliasNone) ⟺ (AliasSubdomainID = nil) — контракт
-//	    T-055 (ФТ-12: прежде проверка recordValidateRow).
-//	П3  StoreContent ⇒ AliasKind = AliasNone: контент класса хранится
-//	    один раз у оригинала (T-055). Обратное не обязательно:
-//	    DetectAliases одиночке без хэша даёт StoreContent=false (в
-//	    реальном потоке воркера хэш есть всегда — И4; допущение — для
-//	    частичных записей прямых вызовов newRecordBatch).
-//	П4  ContentNotStored ⇒ хэш nil ∧ StoreContent ∧ ¬ContentStored —
-//	    признак только оригинала, чей контент не сохранён; у алиасов
-//	    не ставится (их контент — в записи-оригинале, T-055).
-//	П5  Хэш либо nil, либо полный content.HashLen; оригинал
-//	    (StoreContent) обязан нести хэш или признак ContentNotStored.
-//	П6  Truncated ⇒ ¬ContentStored (обрезанное не сохраняется, T-049).
-//	П7  ErrClass записи ∈ {ErrNone, ErrBody}, ErrBody ⟺ Truncated —
-//	    проекция И4 доступной проверки-источника.
+//	P1  Variant/Scheme/AliasKind — the model enums' codes (§6.1).
+//	P2  (AliasKind = AliasNone) ⟺ (AliasSubdomainID = nil) — the contract
+//	    of T-055 (FR-12: formerly the recordValidateRow check).
+//	P3  StoreContent ⇒ AliasKind = AliasNone: the class's content is stored
+//	    once, at the original (T-055). The converse is not required:
+//	    DetectAliases gives StoreContent=false to a lone record without a hash (in
+//	    the real worker flow the hash is always there — I4; the assumption — for
+//	    the partial writes of newRecordBatch's direct calls).
+//	P4  ContentNotStored ⇒ the hash nil ∧ StoreContent ∧ ¬ContentStored —
+//	    a sign of only an original whose content is not stored; it is not set
+//	    for aliases (their content — in the original record, T-055).
+//	P5  The hash is either nil or a full content.HashLen; an original
+//	    (StoreContent) must carry a hash or the ContentNotStored sign.
+//	P6  Truncated ⇒ ¬ContentStored (a truncated body is not stored, T-049).
+//	P7  A record's ErrClass ∈ {ErrNone, ErrBody}, ErrBody ⟺ Truncated —
+//	    a projection of I4 of the available source check.
 //
-// # Осознанное искажение final_url при кэш-попадании
+// # The deliberate distortion of final_url on a cache hit
 //
-// Кэш-попадание (С4–С6) заполняет FinalURL СТАРТОВЫМ URLом проверки, а
-// не итоговым URLом первоисточника (worker.go checkScheme, присвоение
-// check.FinalURL = start). Ключ кэша — схема+хост+порт+путь БЕЗ query и
-// фрагмента (workerCacheKey: счётчиковые параметры ?i=1 не должны
-// разваливать дедупликацию одной страницы, ТЗ 5.5 п. 6), поэтому итоговый
-// URL первоисточника с параметрами записывается своей без-запросной
-// формой, а Redirects — синтетический единственный шаг со стартовым URL.
-// Осознанное поведение, НЕ меняется (T-266, ТЗ-fsm §3 ФТ-12): хост и
-// путь — критерии вариантов (T-054) и алиасов (T-055) — совпадают с
-// первоисточником точно (входят в ключ), расхождение — только query
-// стартовой формы; кэш не хранит цепочку чужой проверки.
+// A cache hit (S4–S6) fills FinalURL with the check's STARTING URL, not
+// the primary source's final URL (worker.go checkScheme, the assignment
+// check.FinalURL = start). The cache key — scheme+host+port+path WITHOUT the query and
+// fragment (workerCacheKey: the counter parameters ?i=1 must not
+// break the deduplication of one page, spec 5.5 item 6), therefore the
+// primary source's final URL with parameters is written by its query-less
+// form, and Redirects — a synthetic single step with the starting URL.
+// Deliberate behavior, NOT changed (T-266, TZ-fsm spec §3 FR-12): the host and
+// path — the criteria of the variants (T-054) and aliases (T-055) — match
+// the primary source exactly (they enter the key), the divergence — only the query
+// of the starting form; the cache does not store the chain of another's check.
 
 package httpworker
 
@@ -138,38 +138,38 @@ import (
 	"crawler/internal/model"
 )
 
-// validate — централизованный валидатор состояния проверки схемы (ФТ-12,
-// T-266): комбинация 7 полей состояния обязана удовлетворять инвариантам
-// И1–И8 (матрица состояний писателей С1–С14 — doc-комментарий файла).
-// Вызывается из validateResult (граница «перед ContentSaver»).
+// validate — the centralized validator of the scheme check state (FR-12,
+// T-266): the combination of the 7 state fields must satisfy the invariants
+// I1–I8 (the writers' state matrix S1–S14 — the file's doc comment).
+// Called from validateResult (the "before ContentSaver" boundary).
 func (c *SchemeCheck) validate() error {
-	// И1: коды перечислений — схема модели и класс ошибки этапа.
+	//	// I1: the enum codes — the model's scheme and the stage error class.
 	if !c.Scheme.Valid() {
 		return fmt.Errorf("проверка: схема %d", int16(c.Scheme))
 	}
 	if c.ErrClass < ErrNone || c.ErrClass > ErrCutoff {
 		return fmt.Errorf("проверка %s: класс ошибки %d вне перечисления ErrorClass", c.Scheme, int16(c.ErrClass))
 	}
-	// И8: класс и текст ошибки согласованы — ошибка всегда с текстом
-	// (разбор §8), успех без.
+	//	// I8: the class and the error text agree — an error is always with text
+	//	// (the parsing §8), a success without.
 	if (c.ErrClass == ErrNone) != (c.ErrText == "") {
 		return fmt.Errorf("проверка %s: класс %s при тексте ошибки %q", c.Scheme, c.ErrClass, c.ErrText)
 	}
-	// И3 (проверяется раньше И5/И4 — единственный владелец ветки Cached):
-	// кэш-попадание — живая проверка с хэшем, кэш хранит только
-	// прочитанные страницы.
+	//	// I3 (checked before I5/I4 — the only owner of the Cached branch):
+	//	// a cache hit — a live check with a hash, the cache stores only
+	//	// read pages.
 	if c.Cached && (!c.Available || c.ContentHash == nil) {
 		return fmt.Errorf("проверка %s: кэш-попадание без тела страницы (available=%v hash=%v)",
 			c.Scheme, c.Available, c.ContentHash != nil)
 	}
-	// И5: контентная часть — только доступной проверки (ошибки загрузки
-	// и чтения тела её не заполняют; Cached исключён И3).
+	//	// I5: the content part — only of an available check (the load
+	//	// and body read errors do not fill it; Cached is excluded by I3).
 	if !c.Available && (c.ContentHash != nil || c.Truncated || c.ContentStored) {
 		return fmt.Errorf("проверка %s: недоступна, но несёт контентную часть (hash=%v truncated=%v stored=%v)",
 			c.Scheme, c.ContentHash != nil, c.Truncated, c.ContentStored)
 	}
-	// И4: доступная проверка прочитала тело — хэш, итоговый URL и
-	// SPA-вердикт есть; ErrBody ровно у обрезки.
+	//	// I4: an available check read the body — the hash, the final URL and
+	//	// the SPA verdict are there; ErrBody exactly at a truncation.
 	if c.Available {
 		if c.ContentHash == nil || c.FinalURL == nil || c.SPA == nil {
 			return fmt.Errorf("проверка %s: доступна без контентной части (hash=%v final_url=%v spa=%v)",
@@ -180,19 +180,19 @@ func (c *SchemeCheck) validate() error {
 				c.Scheme, c.ErrClass, c.Truncated)
 		}
 	}
-	// И6: сохранённое тело — без обрезки (недоступность и отсутствие
-	// хэша при ContentStored отсекают И5/И4; обрезанное тело раннего
-	// Put не получает, T-049).
+	//	// I6: a stored body — without truncation (the unavailability and the
+	//	// hash absence at ContentStored are cut off by I5/I4; a truncated body does
+	//	// not get the early Put, T-049).
 	if c.ContentStored && c.Truncated {
 		return fmt.Errorf("проверка %s: ContentStored при обрезанном теле (T-049)", c.Scheme)
 	}
-	// И7: cutoff — синтетика пропущенного субдомена (workerSkipSubdomain),
-	// доступной проверкой не бывает.
+	//	// I7: a cutoff — the synthetics of a skipped subdomain (workerSkipSubdomain),
+	//	// never an available check.
 	if c.ErrClass == ErrCutoff && c.Available {
 		return fmt.Errorf("проверка %s: ErrCutoff у доступной проверки", c.Scheme)
 	}
-	// И2: мёртвый диал — недоступная проверка с пустой цепочкой и классом
-	// отказа connect-фазы (T-164).
+	//	// I2: a dead dial — an unavailable check with an empty chain and a
+	//	// connect-phase refusal class (T-164).
 	if c.DeadDial && (c.Available || c.Cached || c.ContentHash != nil || len(c.Redirects) > 0 ||
 		(c.ErrClass != ErrNetwork && c.ErrClass != ErrTimeout)) {
 		return fmt.Errorf("проверка %s: DeadDial без сигнатуры мёртвого connect (класс %s, шагов цепочки %d)",
@@ -201,13 +201,13 @@ func (c *SchemeCheck) validate() error {
 	return nil
 }
 
-// validate — централизованный валидатор контентной части записи (ФТ-12,
-// T-266): инварианты П1–П7 действуют на обеих границах (матрица форм
-// писателей Р1–Р8 — doc-комментарий файла). Вызывается из validateResult
-// (записи до ContentSaver) и newRecordBatch перед транзакцией записи
-// (после нормализации).
+// validate — the centralized validator of the record's content part (FR-12,
+// T-266): the P1–P7 invariants are valid at both boundaries (the writers'
+// shape matrix R1–R8 — the file's doc comment). Called from validateResult
+// (the records before ContentSaver) and newRecordBatch before the write transaction
+// (after the normalization).
 func (r *Record) validate() error {
-	// П1: коды модели (§6.1).
+	//	// P1: the model codes (§6.1).
 	if !r.Variant.Valid() {
 		return fmt.Errorf("субдомен %d: вариант %d", r.SubdomainID, int16(r.Variant))
 	}
@@ -217,25 +217,25 @@ func (r *Record) validate() error {
 	if !r.AliasKind.Valid() {
 		return fmt.Errorf("субдомен %d: вид алиаса %d", r.SubdomainID, int16(r.AliasKind))
 	}
-	// П2: связь алиаса самосогласована (контракт T-055).
+	//	// P2: the alias link is self-consistent (the T-055 contract).
 	if (r.AliasKind == model.AliasNone) != (r.AliasSubdomainID == nil) {
 		return fmt.Errorf("субдомен %d: alias_kind %d ⟺ alias_subdomain_id (контракт T-055)",
 			r.SubdomainID, int16(r.AliasKind))
 	}
-	// П3: контент класса хранится один раз у оригинала — StoreContent
-	// только у независимой записи.
+	//	// P3: the class's content is stored once at the original — StoreContent
+	//	// only at an independent record.
 	if r.StoreContent && r.AliasKind != model.AliasNone {
 		return fmt.Errorf("субдомен %d: StoreContent у алиаса (контент класса — у оригинала, T-055)", r.SubdomainID)
 	}
-	// П4: признак «не сохранён» — только оригинала, только без хэша и
-	// без сохранённого тела (у алиасов не ставится).
+	//	// P4: the "not stored" sign — only of an original, only without a hash and
+	//	// without a stored body (it is not set for aliases).
 	if r.ContentNotStored && (r.ContentHash != nil || !r.StoreContent || r.ContentStored) {
 		return fmt.Errorf("субдомен %d: ContentNotStored при живом content_hash/алиасе/сохранённом теле (контракт T-056)",
 			r.SubdomainID)
 	}
-	// П5: хэш — полный content.Hash; оригинал несёт хэш или признак его
-	// отсутствия (типизирован content.Hash — проверка длины страховка
-	// прямых вызовов).
+	//	// P5: the hash — a full content.Hash; the original carries a hash or the sign of
+	//	// its absence (typed as content.Hash — the length check is a guard
+	//	// for direct calls).
 	if r.ContentHash != nil && len(*r.ContentHash) != content.HashLen {
 		return fmt.Errorf("субдомен %d: content_hash %d байт (нужно %d)",
 			r.SubdomainID, len(*r.ContentHash), content.HashLen)
@@ -244,12 +244,12 @@ func (r *Record) validate() error {
 		return fmt.Errorf("субдомен %d: оригинал без контента обязан нести хэш или ContentNotStored (контракт T-056)",
 			r.SubdomainID)
 	}
-	// П6: обрезанное тело не сохраняется (T-049).
+	//	// P6: a truncated body is not stored (T-049).
 	if r.Truncated && r.ContentStored {
 		return fmt.Errorf("субдомен %d: Truncated при ContentStored (обрезанное не сохраняется, T-049)", r.SubdomainID)
 	}
-	// П7: запись создаётся только доступной проверкой — класс ErrNone или
-	// ErrBody (обрезка), прочие классы живут в проверках, не в записях.
+	//	// P7: a record is created only by an available check — the class ErrNone or
+	//	// ErrBody (a truncation), the other classes live in the checks, not in the records.
 	if r.ErrClass != ErrNone && r.ErrClass != ErrBody {
 		return fmt.Errorf("субдомен %d: класс ошибки записи %s (запись создаётся только доступной проверкой)",
 			r.SubdomainID, r.ErrClass)
@@ -261,12 +261,12 @@ func (r *Record) validate() error {
 	return nil
 }
 
-// validateResult — граница этапа «перед ContentSaver» (ФТ-12, T-266):
-// все проверки и записи результата домена проходят валидаторы автомата.
-// Вызывается из ProcessDomain (worker.go) до передачи результата в
-// Options.OnResult; отдельная функция — для тестируемости границы
-// (внутри ProcessDomain нелегальное состояние построить нечем: все поля
-// собирают checkScheme/DetectAliases легально).
+// validateResult — the stage boundary "before ContentSaver" (FR-12, T-266):
+// all the checks and records of the domain's result pass the automaton's validators.
+// Called from ProcessDomain (worker.go) before passing the result to
+// Options.OnResult; a separate function — for the testability of the boundary
+// (inside ProcessDomain there is nothing to build an illegal state with: all the fields
+// are collected by checkScheme/DetectAliases legally).
 func validateResult(res *DomainResult) error {
 	for i := range res.Subdomains {
 		sub := &res.Subdomains[i]

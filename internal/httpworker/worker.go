@@ -1,48 +1,48 @@
-// Package httpworker — HTTP-этап проверки доменов (T-053; ТЗ 5.5 пп. 1, 6,
-// §4.2, §7). Задача q:http — домен целиком (формат T-024): воркер проверяет
-// каждый DNS-живой субдомен по обоим протоколам (https и http; редиректы,
-// лимиты, TLS и кодировки — цепочка httpfetch.FetchChain, T-048), параллельно
-// внутри задачи (пул горутин Options.PerDomain), с общим кэшем «итоговый URL
-// → результат» (ТЗ 5.5 п. 6: не скачивать одну и ту же страницу дважды —
-// alias bare→www после редиректа на тот же URL второй загрузкой не
-// скачивается). Результат домена собирается целиком: записи после
-// вариант-логики (DecideVariants, T-054), алиасов (DetectAliases, T-055) и
-// SPA-эвристики (DetectSPA, T-057) — и возвращается вызывающему.
+// Package httpworker — the HTTP stage of domain checking (T-053; spec 5.5 items 1, 6,
+// §4.2, §7). A q:http task — a domain in full (the T-024 format): the worker checks
+// every DNS-alive subdomain over both protocols (https and http; redirects,
+// limits, TLS and encodings — the httpfetch.FetchChain chain, T-048), in parallel
+// inside the task (the Options.PerDomain goroutine pool), with a shared "final
+// URL → result" cache (spec 5.5 item 6: do not download the same page twice —
+// the bare→www alias after a redirect to the same URL is not downloaded by a
+// second load). The domain result is assembled in full: the records after the
+// variant logic (DecideVariants, T-054), the aliases (DetectAliases, T-055) and
+// the SPA heuristic (DetectSPA, T-057) — and returned to the caller.
 //
-// Запись результата в БД (subdomain_results, статус домена) и публикация
-// q:analyze — Recorder (record.go, T-058), сборка сервиса ставит его в
-// Options.OnResult вслед за ContentSaver (T-056); хук вызывается в цикле
-// Run до подтверждения XACK — порядок «запись в БД → публикация → XACK»
-// (ТЗ 4.2, §5.5 п. 9) собирается без правки цикла. Публикация q:render по
-// SPA-записям и флаг render_pending при переполнении очереди рендера —
-// renderq.go (T-066), вызывается из Recorder.
+// Writing the result into the DB (subdomain_results, the domain status) and the
+// q:analyze publication — Recorder (record.go, T-058), the service build puts it into
+// Options.OnResult right after ContentSaver (T-056); the hook is called in the Run
+// loop before the XACK acknowledgment — the "write into the DB → publication → XACK"
+// order (spec 4.2, §5.5 item 9) is assembled without editing the loop. The q:render publication over
+// the SPA records and the render_pending flag on the render queue's overflow —
+// renderq.go (T-066), called from the Recorder.
 //
-// Тела страниц (UTF-8, T-051) в памяти не удерживаются (T-147): тело
-// читается с потолком, от него вычисляются хэш (критерий вариантов
-// T-054 и алиасов T-055 — сравнение всегда по хэшам) и SPA-вердикт
-// (T-057), затем немедленно сохраняется в ContentStore (Options.Store,
-// Put по хэшу) и отбрасывается — слот задачи не держит тела дольше
-// получения + Put (память слота: только метаданные и PerDomain
-// буферов читаемых тел). Ссылки, добавленные ранними Put, сверяются с
-// записями результата в ContentSaver (store.go): страница, не ставшая
-// чьей-либо строкой subdomain_results (свёрнутый вариант, проигравший
-// класс алиасов, повторное скачивание того же контента), отпускает
-// ссылку Delete; ставшая — переносится в строку записи (T-056).
+// The page bodies (UTF-8, T-051) are not held in memory (T-147): the body
+// is read with a cap, the hash is computed over it (the variants criterion
+// of T-054 and the aliases T-055 — the comparison is always by hashes) and the SPA verdict
+// (T-057), then it is immediately stored into the ContentStore (Options.Store,
+// a Put by hash) and discarded — the task slot does not hold bodies longer than
+// the receipt + the Put (the slot memory: only the metadata and PerDomain
+// buffers of the bodies being read). The references added by early Puts are reconciled with
+// the result records in ContentSaver (store.go): a page that did not become
+// anyone's subdomain_results row (a folded variant, a losing
+// alias class, a repeated download of the same content), releases
+// the reference by Delete; one that did — moves into the record's row (T-056).
 //
-// Память слота наблюдаема (T-163): занятые слоты, байты тел в обработке
-// и распределение размеров тел экспортируются в /metrics (метрики
+// The slot memory is observable (T-163): the busy slots, the body bytes in processing
+// and the body size distribution are exported into /metrics (the metrics
 // crawler_http_tasks_inflight / crawler_http_body_bytes_inflight /
-// crawler_http_body_bytes) — сэмплер считает «память юнита / слот» для
-// критерия возврата task_concurrency 256; мягкий потолок кучи
-// http.mem_limit (cmd/http-worker) удерживает anon ниже MemoryHigh
-// юнита вместо reclaim-штормов ядра.
+// crawler_http_body_bytes) — the sampler computes the "unit memory / slot" for
+// the task_concurrency 256 return criterion; the soft heap cap
+// http.mem_limit (cmd/http-worker) keeps anon below the unit's MemoryHigh
+// instead of the kernel's reclaim storms.
 //
-// Dead-host cutoff (T-164): apex и www, не прошедшие connect-фазу
-// (connection refused или connect-таймаут по обоим протоколам),
-// завершают задачу без проверки остальных субдоменов — мёртвые хосты
-// массовых зон перестают жечь слоты таймаутным хвостом (замер
-// docs/load-measurements.md §12: mean 11.5 с при транспорте
-// 0.54 с/запрос). Конфиг — http.dead_host_cutoff.
+// Dead-host cutoff (T-164): apex and www that did not pass the connect phase
+// (connection refused or a connect timeout over both protocols)
+// finish the task without checking the other subdomains — the dead hosts
+// of mass zones stop burning slots with the timeout tail (the
+// docs/load-measurements.md §12 measurement: a mean of 11.5 s at a transport
+// of 0.54 s/request). The config — http.dead_host_cutoff.
 package httpworker
 
 import (
@@ -72,69 +72,69 @@ import (
 	"crawler/internal/queue"
 )
 
-// FetchFunc — шов загрузки (стиль dnsclient.exchangeFunc): одна проверка
-// (субдомен × протокол) — один проход цепочки редиректов T-048.
-// Продакшн-реализация — ChainFetch; юнит-тесты подменяют сценарием без
-// сети.
+// FetchFunc — the load seam (the dnsclient.exchangeFunc style): one check
+// (subdomain × protocol) — one pass of the T-048 redirect chain.
+// The production implementation — ChainFetch; the unit tests substitute a scenario without
+// the network.
 type FetchFunc func(ctx context.Context, req httpfetch.FetchRequest, opts httpfetch.ChainOptions) (*httpfetch.ChainResult, error)
 
-// ChainFetch строит FetchFunc поверх транспорта этапа (*httpfetch.Fetcher):
-// обычный вызов httpfetch.FetchChainOpts. Отдельная обёртка, а не прямое
-// использование FetchChainOpts воркером — шов подмены в тестах.
+// ChainFetch builds a FetchFunc over the stage's transport (*httpfetch.Fetcher):
+// an ordinary httpfetch.FetchChainOpts call. A separate wrapper, not the direct
+// use of FetchChainOpts by the worker — the substitution seam in the tests.
 func ChainFetch(f *httpfetch.Fetcher) FetchFunc {
 	return func(ctx context.Context, req httpfetch.FetchRequest, opts httpfetch.ChainOptions) (*httpfetch.ChainResult, error) {
 		return httpfetch.FetchChainOpts(ctx, f, req, opts)
 	}
 }
 
-// --- классификация ошибок проверки (ТЗ §8 «фиксируется код ошибки») --------
+// --- the check error classification (spec §8 "an error code is recorded") --------
 
-// ErrorClass — класс ошибки проверки субдомена по протоколу. Коды стабильны:
-// T-058 кладёт класс в subdomain_results.error. Класс не роняет домен —
-// ошибка остаётся в результате субдомена, финальный статус решает агрегатор
-// эпизода (§7, T-058).
+// ErrorClass — the class of a subdomain check error over a protocol. The codes are stable:
+// T-058 puts the class into subdomain_results.error. A class does not drop the domain —
+// the error stays in the subdomain's result, the episode's aggregator
+// decides the final status (§7, T-058).
 type ErrorClass int16
 
 const (
-	// ErrNone — проверка без ошибки (обрезанное тело отмечается отдельно
-	// флагом Truncated, но тоже кодируется ErrBody — см. ниже).
+	// ErrNone — a check without an error (a truncated body is noted separately
+	// by the Truncated flag, but is also encoded as ErrBody — see below).
 	ErrNone ErrorClass = 0
-	// ErrTimeout — таймаут одного из слоёв (connect/TLS/заголовки/общий,
-	// анти-тарпит): httpfetch.IsTimeout. Временный класс (ТЗ 6.2:
-	// temp_error — «SERVFAIL, таймауты»), повтор проверки имеет смысл.
+	// ErrTimeout — a timeout of one of the layers (connect/TLS/headers/overall,
+	// the anti-tarpit): httpfetch.IsTimeout. A temporary class (spec 6.2:
+	// temp_error — "SERVFAIL, timeouts"), a check repeat makes sense.
 	ErrTimeout ErrorClass = 1
-	// ErrRedirects — цепочка прервана лимитом max_redirects или детектом
-	// цикла (httpfetch.ErrTooManyRedirects): постоянное свойство сайта,
-	// не temp_error (T-048).
+	// ErrRedirects — the chain interrupted by the max_redirects limit or a loop
+	// detection (httpfetch.ErrTooManyRedirects): a permanent site property,
+	// not a temp_error (T-048).
 	ErrRedirects ErrorClass = 2
-	// ErrTLS — сбой TLS-рукопожатия по вине сертификата/протокола сервера
-	// (httpfetch.IsTLSCertError): некорректный сертификат загрузке не
-	// мешает (InsecureSkipVerify, ТЗ 5.5 п. 3), это именно отказ
-	// установить соединение.
+	// ErrTLS — a TLS handshake failure due to the server's certificate/protocol
+	// (httpfetch.IsTLSCertError): an incorrect certificate does not
+	// hinder the load (InsecureSkipVerify, spec 5.5 item 3), this is exactly a refusal
+	// to establish the connection.
 	ErrTLS ErrorClass = 3
-	// ErrBody — тело ответа: неподдерживаемое/битое Content-Encoding,
-	// zip-бомба (httpfetch.ErrDecompressTooLarge) или обрезка потолком
-	// max_body_bytes (данные частичны, статус получен — Available при
-	// этом true, ТЗ 8 «огромные ответы прерываются по лимитам»).
+	// ErrBody — the response body: an unsupported/broken Content-Encoding,
+	// a zip bomb (httpfetch.ErrDecompressTooLarge) or a truncation by the
+	// max_body_bytes cap (the data is partial, the status is received — Available is
+	// true at that, spec 8 "huge responses are interrupted by the limits").
 	ErrBody ErrorClass = 4
-	// ErrNetwork — прочие транспортные ошибки: отказ соединения, обрыв,
-	// ошибка резолва хоста редиректа. Сюда же попадает отмена ctx в
-	// полёте (результат такой проверки всё равно отбрасывается — см.
+	// ErrNetwork — the other transport errors: a connection refusal, a disconnect,
+	// an error resolving the redirect's host. The ctx cancellation in
+	// flight also lands here (such a check's result is discarded anyway — see
 	// ProcessDomain).
 	ErrNetwork ErrorClass = 5
-	// ErrCutoff — проверка не выполнялась: задача завершена dead-host
-	// cutoff (T-164) — apex и www упали на connect-фазе (отказ или
-	// connect-таймаут соединения по обоим протоколам), остальные
-	// субдомены не проверялись. Класс ставится только синтетическим
-	// проверкам пропущенных субдоменов (workerSkipSubdomain): это не
-	// ошибка сети и не итог проверки — в subdomain_results класс не
-	// попадает (пропущенный субдомен записей не создаёт, §8), temp_error
-	// не даёт (IsTemp false — повтор эпизода решают таймауты apex/www,
-	// а не cutoff).
+	// ErrCutoff — the check was not performed: the task was finished by the
+	// dead-host cutoff (T-164) — apex and www fell at the connect phase
+	// (a refusal or a connect timeout over both protocols), the other
+	// subdomains were not checked. The class is set only to the synthetic
+	// checks of the skipped subdomains (workerSkipSubdomain): it is not
+	// a network error and not a check outcome — the class does not
+	// reach subdomain_results (a skipped subdomain creates no records, §8), it gives no
+	// temp_error (IsTemp false — the episode's repeat is decided by the apex/www timeouts,
+	// not by the cutoff).
 	ErrCutoff ErrorClass = 6
 )
 
-// String возвращает имя класса для логов.
+// String returns the class name for the logs.
 func (c ErrorClass) String() string {
 	switch c {
 	case ErrNone:
@@ -156,15 +156,15 @@ func (c ErrorClass) String() string {
 	}
 }
 
-// IsTemp сообщает, что класс ошибки временный и повтор проверки может
-// увенчаться успехом (ТЗ 6.2: temp_error — таймауты). Прочие классы —
-// свойства сайта или его окружения, повтор в ближнем горизонте смысла не
-// имеет (регулярная перепроверка — T-030).
+// IsTemp reports that the error class is temporary and the check repeat may
+// succeed (spec 6.2: temp_error — timeouts). The other classes —
+// properties of the site or its environment; a repeat in the near horizon is
+// pointless (the regular recheck — T-030).
 func (c ErrorClass) IsTemp() bool { return c == ErrTimeout }
 
-// workerClassifyError сводит ошибку загрузки к классу (порядок проверок
-// важен: TooManyRedirects не является net.Error, таймаут анти-тарпита —
-// является).
+// workerClassifyError reduces a load error to a class (the check order
+// matters: TooManyRedirects is not a net.Error, the anti-tarpit timeout —
+// is one).
 func workerClassifyError(err error) ErrorClass {
 	switch {
 	case err == nil:
@@ -182,20 +182,20 @@ func workerClassifyError(err error) ErrorClass {
 	}
 }
 
-// --- кэш «итоговый URL → результат» (ТЗ 5.5 п. 6) --------------------------
+// --- the "final URL → result" cache (spec 5.5 item 6) --------------------------
 
-// workerCacheKey — ключ кэша итоговых URL: схема + хост (нижний
-// регистр — punycode гарантирует цепочка T-048) + путь (пустой — корень
-// «/»). Согласован с критерием вариантов T-054 (NewVariantInput): query и
-// фрагмент НЕ входят — счётчиковые параметры (?i=1, ?i=2, …) не разваливают
-// дедупликацию одной страницы, а реальное различие контента при одном пути
-// ловит хэш. Схема входит: http и https одного адреса — разные скачивания,
-// подмена результата http-проверки https-страницей фабриковала бы
-// доступность протокола, который реально не проверялся. Явно указанный
-// нестандартный порт входит по той же причине: страница host:8443 —
-// ответ другого сервиса, кэш-попадание подменяло бы результат проверки
-// порта по умолчанию контентом непроверенного порта; дефолтные порты
-// схем (80/443) нормализуются away — явный :443 у https тот же адрес.
+// workerCacheKey — the final URLs' cache key: scheme + host (lower
+// case — the punycode is guaranteed by the T-048 chain) + path (empty — the root
+// "/"). Consistent with the variants criterion of T-054 (NewVariantInput): the query and
+// fragment are NOT included — the counter parameters (?i=1, ?i=2, …) do not break
+// the deduplication of one page, and the real content difference at one path
+// is caught by the hash. The scheme is included: http and https of one address are different downloads,
+// substituting the http check's result with an https page would fake
+// the availability of a protocol that was actually not checked. An explicitly specified
+// non-standard port is included for the same reason: the host:8443 page is
+// another service's answer, a cache hit would substitute the default
+// port's check result with the unchecked port's content; the schemes'
+// default ports (80/443) are normalized away — an explicit :443 at https is the same address.
 func workerCacheKey(u *url.URL) string {
 	if u == nil {
 		return ""
@@ -211,9 +211,9 @@ func workerCacheKey(u *url.URL) string {
 	return strings.ToLower(u.Scheme) + "://" + host + path
 }
 
-// workerSchemeDefaultPort — дефолтный порт схемы (нормализация ключа:
-// явный :443 у https — тот же адрес, что и без порта); прочие схемы в
-// конвейере не встречаются — дефолта нет.
+// workerSchemeDefaultPort — the scheme's default port (the key normalization:
+// an explicit :443 at https — the same address as without the port); the other schemes do
+// not occur in the pipeline — there is no default.
 func workerSchemeDefaultPort(scheme string) string {
 	if strings.ToLower(scheme) == "https" {
 		return "443"
@@ -221,13 +221,13 @@ func workerSchemeDefaultPort(scheme string) string {
 	return "80"
 }
 
-// workerPage — скачанная страница (итог цепочки) в кэше: хэш и SPA-вердикт
-// вычислены при чтении, тело сохранено ранним Put (T-147) и в памяти не
-// живёт — кэш-попадания делят хэш и признаки страницы, байты лежат в
-// хранилище (ContentStore.Get по хэшу). Класс/текст ошибки (ErrBody
-// обрезанной страницы) переносится кэш-попаданию: один и тот же контент
-// классифицируется одинаково независимо от того, скачала его проверка
-// или взяла из кэша.
+// workerPage — a downloaded page (the chain's outcome) in the cache: the hash and the SPA verdict
+// are computed at the read, the body is stored by the early Put (T-147) and does not
+// live in memory — the cache hits share the hash and the page's signs, the bytes lie in
+// the store (ContentStore.Get by hash). The error class/text (the ErrBody
+// of a truncated page) is carried to the cache hit: the same content
+// is classified identically regardless of whether the check downloaded it
+// or took it from the cache.
 type workerPage struct {
 	final      *url.URL
 	status     int
@@ -235,7 +235,7 @@ type workerPage struct {
 	cookies    []*http.Cookie
 	tls        *httpfetch.TLSInfo
 	hash       *content.Hash
-	stored     bool // ранний Put прошёл: ссылка в хранилище ждёт строку записи (T-147)
+	stored     bool // the early Put passed: the store reference waits for the record's row (T-147)
 	charset    string
 	truncated  bool
 	responseMS int
@@ -244,41 +244,41 @@ type workerPage struct {
 	errText    string
 }
 
-// workerPut — вход реестра ранних Put задачи (T-147): хэш сохранённой
-// страницы и факт записи новых байтов (для доли дедупликации, ТЗ 11.4
-// п. 3). Реестр собирается в кэше задачи (workerURLCache) по мере
-// скачиваний и передаётся в DomainResult: ContentSaver.Save сверяет его
-// с записями — ссылки, не ставшие строками, снимаются Delete.
+// workerPut — an entry of the task's early Put registry (T-147): the stored
+// page's hash and the fact of writing new bytes (for the dedup share, spec 11.4
+// item 3). The registry is assembled in the task's cache (workerURLCache) as the
+// downloads go and passed into DomainResult: ContentSaver.Save reconciles it
+// with the records — the references that did not become rows are removed by Delete.
 type workerPut struct {
 	hash    content.Hash
 	created bool
 }
 
-// workerURLCache — общий кэш задачи домена (ТЗ 5.5 п. 6 «внутри воркера
-// для задачи домена»): итоговые URL всех завершённых проверок и реестр
-// ранних Put (T-147). Живёт одну задачу: алиасы — свойство пары
-// субдоменов одного домена, между доменами итоговые URL не пересекаются
-// (внешние парковки не считаются — повторное использование чужого тела
-// подменяло бы TLS/заголовки чужого соединения). Потокобезопасен:
-// проверки субдоменов идут параллельно.
+// workerURLCache — the domain task's shared cache (spec 5.5 item 6 "inside the
+// worker for the domain task"): the final URLs of all the completed checks and the
+// early Put registry (T-147). It lives one task: the aliases are a property of a
+// pair of subdomains of one domain, between the domains the final URLs do not intersect
+// (foreign parkings do not count — reusing a foreign body
+// would substitute the TLS/headers of a foreign connection). Concurrency-safe:
+// the subdomain checks run in parallel.
 type workerURLCache struct {
 	mu    sync.Mutex
 	pages map[string]*workerPage
-	puts  []workerPut // ранние Put задачи в порядке скачиваний (T-147)
+	puts  []workerPut // the task's early Puts in the download order (T-147)
 }
 
 func workerNewURLCache() *workerURLCache {
 	return &workerURLCache{pages: make(map[string]*workerPage, 8)}
 }
 
-// get возвращает страницу по ключу или nil.
+// get returns the page by the key or nil.
 func (c *workerURLCache) get(key string) *workerPage {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.pages[key]
 }
 
-// put запоминает страницу по ключу итогового URL.
+// put remembers the page by the final URL key.
 func (c *workerURLCache) put(key string, p *workerPage) {
 	if key == "" || p == nil {
 		return
@@ -288,15 +288,15 @@ func (c *workerURLCache) put(key string, p *workerPage) {
 	c.pages[key] = p
 }
 
-// addPut дописывает успешный ранний Put в реестр задачи (T-147).
+// addPut appends a successful early Put into the task's registry (T-147).
 func (c *workerURLCache) addPut(h content.Hash, created bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.puts = append(c.puts, workerPut{hash: h, created: created})
 }
 
-// takePuts возвращает накопленный реестр ранних Put (вызывается один раз
-// в конце задачи — ProcessDomain переносит его в DomainResult).
+// takePuts returns the accumulated early Put registry (called once
+// at the task's end — ProcessDomain moves it into DomainResult).
 func (c *workerURLCache) takePuts() []workerPut {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -305,204 +305,204 @@ func (c *workerURLCache) takePuts() []workerPut {
 	return puts
 }
 
-// --- результат домена -------------------------------------------------------
+// --- the domain result -------------------------------------------------------
 
-// SchemeCheck — итог проверки субдомена по одному протоколу (ТЗ 5.5 пп. 1,
-// 7). Ошибка не роняет домен: доступность — Available, условие результата —
-// ErrClass (§8); тело в памяти не удерживается — от него остаются хэш,
-// кодировка и SPA-вердикт.
+// SchemeCheck — the outcome of a subdomain check over one protocol (spec 5.5 items 1,
+// 7). An error does not drop the domain: the availability — Available, the result condition —
+// ErrClass (§8); the body is not held in memory — the hash,
+// the encoding and the SPA verdict remain from it.
 type SchemeCheck struct {
-	// Scheme — протокол проверки (стартового запроса), не итогового URL.
+	// Scheme — the check's protocol (of the starting request), not the final URL.
 	Scheme model.Scheme
-	// Available — проверка дошла до итогового ответа: сервер ответил любым
-	// статусом, включая 4xx/5xx («протокол работает», критерий T-054).
+	// Available — the check reached the final answer: the server answered with any
+	// status, including 4xx/5xx ("the protocol works", the T-054 criterion).
 	Available bool
-	// Cached — итог взят из кэша итоговых URL без сети (ТЗ 5.5 п. 6):
-	// стартовый URL этой проверки совпал с итоговым URL другой проверки
-	// задачи (классика bare→www). Сеть не трогалась, но время ответа
-	// первоисточника (до его заголовков) переносится в ResponseMS —
-	// запись-оригинал алиас-класса несёт реальное время ответа страницы;
-	// метрики времени ответа кэш-попадания по-прежнему не наблюдают.
-	// Состояние кэш-попадания — строки С4–С6 матрицы автомата (T-266,
+	// Cached — the outcome is taken from the final URLs' cache without the network (spec 5.5 item 6):
+	// this check's starting URL matched another task check's final
+	// URL (the bare→www classic). The network was not touched, but the primary
+	// source's response time (up to its headers) is carried into ResponseMS —
+	// the alias class's original record carries the page's real response time;
+	// the response time metrics still do not observe the cache hits.
+	// The cache-hit state — the matrix rows S4–S6 of the FSM (T-266,
 	// schemestate.go).
 	Cached bool
-	// FinalURL — итоговый URL (страница в конце цепочки, ТЗ 5.5 п. 4);
-	// nil при ошибке загрузки. При кэш-попадании (Cached) поле несёт
-	// СТАРТОВЫЙ URL проверки, а не итоговый URL первоисточника:
-	// итоговый URL с query (?i=1 — ключ кэша query не включает,
-	// workerCacheKey) записывается своей без-запросной формой, Redirects —
-	// синтетический единственный шаг. Осознанное искажение, не меняется
-	// (T-266, ТЗ-fsm §3 ФТ-12; хост/путь — критерии T-054/T-055 —
-	// совпадают точно).
+	// FinalURL — the final URL (the page at the chain's end, spec 5.5 item 4);
+	// nil at a load error. At a cache hit (Cached) the field carries
+	// the check's STARTING URL, not the primary source's final URL:
+	// the final URL with a query (?i=1 — the cache key does not include the query,
+	// workerCacheKey) is written by its query-less form, Redirects —
+	// a synthetic single step. A deliberate distortion, not changed
+	// (T-266, TZ-fsm spec §3 FR-12; the host/path — the T-054/T-055 criteria —
+	// match exactly).
 	FinalURL *url.URL
-	// Status — код статуса итогового ответа.
+	// Status — the final answer's status code.
 	Status int
-	// Header — заголовки итогового ответа (выжимка обмена: только
-	// итоговая страница, промежуточные ответы цепочки представлены
-	// Redirects). T-058 сериализует в subdomain_results.headers.
+	// Header — the final answer's headers (a distillate of the exchange: only
+	// the final page, the chain's intermediate answers are represented
+	// by Redirects). T-058 serializes into subdomain_results.headers.
 	Header http.Header
-	// Cookies — Set-Cookie итогового ответа (ТЗ 5.5 п. 7 «cookies»).
+	// Cookies — the final answer's Set-Cookie (spec 5.5 item 7 "cookies").
 	Cookies []*http.Cookie
-	// TLS — разбор сертификата итогового соединения (T-050); nil для http
-	// и кэш-попаданий http-проверок (не ошибка, §8).
+	// TLS — the parse of the final connection's certificate (T-050); nil for http
+	// and the http checks' cache hits (not an error, §8).
 	TLS *httpfetch.TLSInfo
-	// ResponseMS — время до заголовков итогового ответа, мс (Elapsed
-	// последнего Fetch цепочки, ТЗ 5.5 п. 7 «время ответа»). Кэш-
-	// попадание переносит измерение первоисточника (его Elapsed):
-	// 0 — только у ошибок загрузки (заголовков не было).
+	// ResponseMS — the time up to the final answer's headers, ms (the
+	// last chain Fetch's Elapsed, spec 5.5 item 7 "the response time"). A cache
+	// hit carries the primary source's measurement (its Elapsed):
+	// 0 — only at load errors (there were no headers).
 	ResponseMS int
-	// Redirects — цепочка редиректов (T-048): URL и статус каждого шага,
-	// последний элемент — итоговая страница. При ошибке — выполненная
-	// часть; при кэш-попадании — синтетический единственный шаг.
+	// Redirects — the redirect chain (T-048): the URL and the status of every step,
+	// the last element — the final page. At an error — the performed
+	// part; at a cache hit — a synthetic single step.
 	Redirects []httpfetch.RedirectStep
-	// ContentHash — хэш UTF-8-нормализованного тела (content.HashOf,
-	// ТЗ 5.7): дедупликация парковок и критерий вариантов/алиасов
-	// (T-054/T-055). nil — тело не получено (ошибка); хэш пустого тела —
-	// валидное значение. Само хранение контента — T-056.
+	// ContentHash — the hash of the UTF-8-normalized body (content.HashOf,
+	// spec 5.7): the parkings' deduplication and the variants/aliases criterion
+	// (T-054/T-055). nil — the body was not received (an error); an empty body's hash is
+	// a valid value. The storing itself — T-056.
 	ContentHash *content.Hash
-	// Truncated — тело обрезано потолком max_body_bytes (T-049): данные
-	// частичны, не ошибка сети; хэш вычислен над обрезанными байтами.
+	// Truncated — the body is truncated by the max_body_bytes cap (T-049): the data
+	// is partial, not a network error; the hash is computed over the truncated bytes.
 	Truncated bool
-	// Charset — каноническое имя кодировки ответа (ToUTF8, T-051).
+	// Charset — the canonical name of the response's encoding (ToUTF8, T-051).
 	Charset string
-	// ContentStored — тело страницы сохранено ранним Put в ContentStore
-	// (T-147): хэш проверки — живая ссылка хранилища, кандидат на
-	// content_hash записи. false — обрезанное тело (не сохраняется
-	// вовсе), переполнение диска или лимит max_store_bytes (пауза
-	// записи контента, ТЗ 8: результат домена не роняется). Само тело
-	// в памяти не удерживается (T-147): байты — в хранилище, Get по
-	// хэшу; пустое тело — валидный сохранённый контент (T-138).
+	// ContentStored — the page body is stored by an early Put into the ContentStore
+	// (T-147): the check's hash is a live store reference, a candidate for the
+	// record's content_hash. false — a truncated body (not stored
+	// at all), a disk overflow or the max_store_bytes limit (the content
+	// write pause, spec 8: the domain result is not dropped). The body
+	// itself is not held in memory (T-147): the bytes are in the store, Get by
+	// hash; an empty body is valid stored content (T-138).
 	ContentStored bool
-	// SPA — вердикт эвристики по телу (DetectSPA, T-057); nil при ошибке
-	// загрузки. Публикацию q:render по нему делает рендер-конвейер
-	// T-066 (renderq.go) в цепочке записи результата — при переполнении
-	// очереди домен получает флаг render_pending и дорабатывается позже.
+	// SPA — the heuristic's verdict over the body (DetectSPA, T-057); nil at a load
+	// error. The q:render publication over it is done by the T-066 render pipeline
+	// (renderq.go) in the result write chain — on the queue's
+	// overflow the domain receives the render_pending flag and is reworked later.
 	SPA *httpfetch.SPAVerdict
-	// ErrClass — класс ошибки (ErrNone — без ошибки; обрезка тела — ErrBody
-	// при Available=true). ErrText — исходный текст для логов и разбора.
+	// ErrClass — the error class (ErrNone — no error; a body truncation — ErrBody
+	// at Available=true). ErrText — the original text for the logs and parsing.
 	ErrClass ErrorClass
 	ErrText  string
-	// DeadDial — проверка упала на connect-фазе стартового хоста:
-	// connection refused или connect-таймаут до первого ответа цепочки
-	// (httpfetch.IsConnectFailure; выполненная часть редиректов пуста —
-	// сбой на первом запросе к своему хосту, не на хопе редиректа,
-	// T-164). Сигнатура dead-host cutoff: соединения с хостом нет на
-	// уровне TCP — не сбой после установки (TLS, заголовки, тело — там
-	// соединение уже было). Доступной проверке не бывает.
+	// DeadDial — the check fell at the starting host's connect phase:
+	// connection refused or a connect timeout before the chain's first answer
+	// (httpfetch.IsConnectFailure; the performed part of the redirects is empty —
+	// a failure on the first request to its own host, not on a redirect hop,
+	// T-164). The dead-host cutoff signature: there is no connection to the host at
+	// the TCP level — not a failure after establishing (TLS, headers, body — there
+	// the connection already existed). Never at an available check.
 	DeadDial bool
-	// storeErr — сбой раннего Put, не являющийся паузой записи контента
-	// (T-147): странице не сопоставить ни «сохранено», ни «пропущено» —
-	// эпизод честно падает (ProcessDomain возвращает ошибку, повторная
-	// доставка, ТЗ 3.4). Поле внутреннее: заполняется checkScheme,
-	// читается ProcessDomain; кэш-попадания его не наследуют (ошибка
-	// относится к своей попытке записи).
+	// storeErr — an early Put failure that is not the content write pause
+	// (T-147): no "stored" nor "skipped" can be matched to the page —
+	// the episode honestly fails (ProcessDomain returns an error, a repeated
+	// delivery, spec 3.4). The field is internal: filled by checkScheme,
+	// read by ProcessDomain; the cache hits do not inherit it (the error
+	// belongs to its own write attempt).
 	storeErr error
 }
 
-// Record — сохраняемая запись субдомен-результата после вариант-логики и
-// алиасов: колонки subdomain_results (ТЗ 5.5 п. 7, §6.1). Данные записи —
-// из проверки-источника (Scheme; вариант 0 при свёрнутых протоколах несёт
-// данные https-проверки, T-054); записывает в БД T-058.
+// Record — the stored subdomain-result record after the variant logic and
+// the aliases: the subdomain_results columns (spec 5.5 item 7, §6.1). The record's data —
+// from the source check (Scheme; variant 0 at folded protocols carries the
+// https check's data, T-054); T-058 writes into the DB.
 type Record struct {
-	// Variant — 0 основной, 1 http (T-054).
+	// Variant — 0 main, 1 http (T-054).
 	Variant model.Variant
-	// Scheme — протокол проверки-источника записи.
+	// Scheme — the record's source check's protocol.
 	Scheme model.Scheme
-	// SubdomainID, Label — идентичность записи (справочно для потребителя).
+	// SubdomainID, Label — the record's identity (for the consumer's reference).
 	SubdomainID int16
 	Label       string
-	// FinalURL — итоговый URL записи (строкой, как в subdomain_results.
-	// final_url); Host/Path — его нормализованное представление для
-	// сравнений (критерии T-054/T-055).
+	// FinalURL — the record's final URL (as a string, as in subdomain_results.
+	// final_url); Host/Path — its normalized representation for
+	// comparisons (the T-054/T-055 criteria).
 	FinalURL string
 	Host     string
 	Path     string
-	// HTTPStatus, Header, Cookies, TLS, ResponseMS, Redirects — данные
-	// проверки-источника (см. SchemeCheck).
+	// HTTPStatus, Header, Cookies, TLS, ResponseMS, Redirects — the
+	// source check's data (see SchemeCheck).
 	HTTPStatus int
 	Header     http.Header
 	Cookies    []*http.Cookie
 	TLS        *httpfetch.TLSInfo
 	ResponseMS int
 	Redirects  []httpfetch.RedirectStep
-	// ContentHash, Truncated, Charset, SPA — контент проверки-источника.
+	// ContentHash, Truncated, Charset, SPA — the source check's content.
 	ContentHash *content.Hash
 	Truncated   bool
 	Charset     string
 	SPA         *httpfetch.SPAVerdict
-	// ContentStored — тело проверки-источника сохранено ранним Put
-	// (T-147): у записей-оригиналов с хэшем без обрезки ссылка из Put
-	// становится ссылкой строки subdomain_results (ContentSaver,
-	// T-056). false у оригинала — контент не сохранён (переполнение
-	// диска, лимит max_store_bytes): запись живёт с content_hash = nil
-	// и ContentNotStored. Тело в записи не хранится (T-147) — байты
-	// доступны хранилищем по хэшу; пустое тело — валидный контент
+	// ContentStored — the source check's body is stored by an early Put
+	// (T-147): at the originals with a hash without truncation the Put's
+	// reference becomes the subdomain_results row's reference (ContentSaver,
+	// T-056). false at an original — the content is not stored (a disk
+	// overflow, the max_store_bytes limit): the record lives with content_hash = nil
+	// and ContentNotStored. The body is not stored in the record (T-147) — the bytes
+	// are available by the store over the hash; an empty body is valid content
 	// (T-138).
 	ContentStored bool
-	// ContentNotStored — тело получено (хэш вычислен), но контент НЕ
-	// сохранён: переполнение диска (ErrStoreFull, ТЗ 8), лимит
-	// max_store_bytes (ТЗ 5.5) или обрезка тела потолком max_body_bytes.
-	// Запись живёт с content_hash = NULL: content_hash — ссылка на
-	// contents (§6.1), без блока в хранилище строки нет; повторная
-	// проверка домена (recheck, T-030) скачает страницу и сохранит.
-	// У алиасов не ставится: их контент — в записи-оригинале (T-055).
+	// ContentNotStored — the body was received (the hash computed), but the content is NOT
+	// stored: a disk overflow (ErrStoreFull, spec 8), the
+	// max_store_bytes limit (spec 5.5) or a body truncation by the max_body_bytes cap.
+	// The record lives with content_hash = NULL: content_hash is a reference into
+	// contents (§6.1), without a block in the store there is no row; a repeated
+	// domain check (recheck, T-030) will download the page and store it.
+	// Not set for aliases: their content — in the original record (T-055).
 	ContentNotStored bool
-	// AliasKind, AliasSubdomainID, StoreContent — решение DetectAliases
-	// (T-055): вид связи с субдоменом-оригиналом и признак «контент
-	// хранится один раз у оригинала» (само сохранение — T-056).
+	// AliasKind, AliasSubdomainID, StoreContent — the DetectAliases
+	// decision (T-055): the kind of the link with the original subdomain and the sign "the
+	// content is stored once at the original" (the storing itself — T-056).
 	AliasKind        model.AliasKind
 	AliasSubdomainID *int16
 	StoreContent     bool
-	// ErrClass — класс ошибки проверки-источника (ErrBody у обрезанного
-	// тела при живом статусе; для доступных записей обычно ErrNone).
+	// ErrClass — the source check's error class (ErrBody at a truncated
+	// body with a live status; usually ErrNone for available records).
 	ErrClass ErrorClass
 }
 
-// SubdomainResult — итог субдомена задачи: обе проверки протоколов и
-// записи, которые создала вариант-логика (T-054).
+// SubdomainResult — a task subdomain's outcome: both protocol checks and
+// the records the variant logic created (T-054).
 type SubdomainResult struct {
 	SubdomainID int16
 	Label       string
-	// Hostname — полное имя субдомена (label + "." + домен), punycode.
+	// Hostname — the subdomain's full name (label + "." + domain), punycode.
 	Hostname string
-	// Addrs, CNAME — данные DNS-этапа из задачи (ТЗ 5.4 п. 4), переносятся
-	// в результат (ТЗ 5.5 п. 7 «сохраняется всё: адреса, CNAME»).
+	// Addrs, CNAME — the DNS stage's data from the task (spec 5.4 item 4), carried
+	// into the result (spec 5.5 item 7 "everything is stored: the addresses, the CNAME").
 	Addrs []netip.Addr
 	CNAME string
-	// HTTPS, HTTP — проверки по протоколам (порядок полей — порядок
-	// запуска в пуле).
+	// HTTPS, HTTP — the checks over the protocols (the field order — the
+	// launch order in the pool).
 	HTTPS SchemeCheck
 	HTTP  SchemeCheck
-	// Records — записи после вариант-логики и алиасов; пусто — протоколы
-	// не ответили (вклад в «нет ответа ни у кого», §7).
+	// Records — the records after the variant logic and the aliases; empty — the
+	// protocols did not answer (a contribution into "no one answered", §7).
 	Records []Record
 }
 
-// DomainResult — полный итог HTTP-эпизода домена (ТЗ 5.5, §7): обобщённая
-// структура для записи T-058 — статус домена (alive/no_http/temp_error по
-// §6.2/§7), строки subdomain_results, постановка q:render.
+// DomainResult — the full outcome of the domain's HTTP episode (spec 5.5, §7): the generalized
+// structure for the T-058 write — the domain status (alive/no_http/temp_error by
+// §6.2/§7), the subdomain_results rows, the q:render enqueueing.
 type DomainResult struct {
 	ZoneID   int16
 	DomainID int64
 	Name     string
-	// Subdomains — порядок задачи q:http.
+	// Subdomains — the q:http task's order.
 	Subdomains []SubdomainResult
-	// Cutoff — задача завершена dead-host cutoff (T-164): apex и www
-	// упали на connect-фазу по обоим протоколам, прочие субдомены не
-	// проверялись (их синтетические проверки — класс ErrCutoff; записей
-	// нет, §8). Наблюдаемость: бит dead_host_cutoff в domains.flags
-	// (запись результата T-058), счётчики
-	// crawler_http_dead_host_cutoff_* (metrics.go) и лог воркера — по
-	// ним строится контрольная выборка ложных cutoff-ов (критерий T-164:
-	// доля < 1%, повторная полная проверка cutoff-доменов).
+	// Cutoff — the task was finished by the dead-host cutoff (T-164): apex and www
+	// fell at the connect phase over both protocols, the other subdomains were not
+	// checked (their synthetic checks — the ErrCutoff class; no
+	// records, §8). Observability: the dead_host_cutoff bit in domains.flags
+	// (the T-058 result write), the
+	// crawler_http_dead_host_cutoff_* counters (metrics.go) and the worker's log —
+	// the false cutoffs' control sample is built over them (the T-164 criterion:
+	// a share < 1%, a repeated full check of the cutoff domains).
 	Cutoff bool
-	// puts — реестр ранних Put задачи (T-147, не для потребителя):
-	// заполняется ProcessDomain, ContentSaver.Save сверяет его с
-	// записями — ссылки, не ставшие строками, снимаются Delete.
+	// puts — the task's early Put registry (T-147, not for the consumer):
+	// filled by ProcessDomain, ContentSaver.Save reconciles it with
+	// the records — the references that did not become rows are removed by Delete.
 	puts []workerPut
 }
 
-// RecordCount — число записей результата (субдомен × вариант).
+// RecordCount — the number of result records (subdomain × variant).
 func (r *DomainResult) RecordCount() int {
 	n := 0
 	for i := range r.Subdomains {
@@ -511,14 +511,14 @@ func (r *DomainResult) RecordCount() int {
 	return n
 }
 
-// HasRecords — ответил ли хоть один субдомен по хоть одному протоколу
-// (§7: «нет ответа ни у кого → status=no_http»; статус присвоит T-058).
+// HasRecords — whether at least one subdomain answered over at least one protocol
+// (§7: "no one answered → status=no_http"; T-058 will assign the status).
 func (r *DomainResult) HasRecords() bool { return r.RecordCount() > 0 }
 
-// AnyTimeout — есть ли среди проверок таймаут-класс (ErrTimeout): данные
-// для решения T-058 между no_http (веб молчит постоянно) и temp_error
-// («SERVFAIL, таймауты», ТЗ 6.2) — у целиком «замолчавшего» домена с
-// таймаутами повтор эпизода осмыслен.
+// AnyTimeout — whether there is a timeout class among the checks (ErrTimeout): the
+// data for the T-058 decision between no_http (the web is silent constantly) and temp_error
+// ("SERVFAIL, timeouts", spec 6.2) — for a domain that "went silent" entirely
+// with timeouts, the episode's repeat is meaningful.
 func (r *DomainResult) AnyTimeout() bool {
 	for i := range r.Subdomains {
 		if r.Subdomains[i].HTTPS.ErrClass == ErrTimeout || r.Subdomains[i].HTTP.ErrClass == ErrTimeout {
@@ -528,81 +528,81 @@ func (r *DomainResult) AnyTimeout() bool {
 	return false
 }
 
-// --- воркер ------------------------------------------------------------------
+// --- the worker ------------------------------------------------------------------
 
-// Дефолты воркера.
+// The worker's defaults.
 const (
-	// DefaultGroup — группа потребителей q:http (ТЗ 4.2: consumer groups
-	// масштабируют воркеров горизонтально).
+	// DefaultGroup — the q:http consumer group (spec 4.2: consumer groups
+	// scale the workers horizontally).
 	DefaultGroup = "http-worker"
 
-	// DefaultConcurrency — одновременных задач q:http (доменов) на
-	// экземпляр в цикле Run. Скромное число против http.concurrency=2000:
-	// глобальный потолок соединений и RPS держит транспорт (T-049,
-	// Options.Limits — семафор GlobalConns), задачи лишь заполняют его;
-	// каждая задача держит в памяти результат домена — заголовки, хэши и
-	// метаданные (тела страниц не удерживаются: ранний Put T-147),
-	// читаемые тела ограничены PerDomain × max_body_bytes — типичная
-	// задача единицы МиБ. Масштабирование нагрузки — инстансами (ТЗ 4.1
-	// «масштабируется количеством горутин и процессов»), потолок
-	// поднимается Options.Concurrency.
+	// DefaultConcurrency — concurrent q:http tasks (domains) per
+	// instance in the Run loop. A modest number against http.concurrency=2000:
+	// the global connection and RPS cap is held by the transport (T-049,
+	// Options.Limits — the GlobalConns semaphore), the tasks merely fill it;
+	// every task holds the domain result in memory — the headers, the hashes and
+	// the metadata (the page bodies are not held: the early Put T-147),
+	// the bodies being read are bounded by PerDomain × max_body_bytes — a typical
+	// task is a few MiB. The load scaling — by instances (spec 4.1
+	// "scales by the number of goroutines and processes"), the cap
+	// is raised by Options.Concurrency.
 	//
-	// Число — синхронно с дефолтом конфига http.task_concurrency
-	// (cmd/http-worker; тест TestWorkerOptionsDefaults ловит расхождение
-	// — молча разошедшийся дефолт менял бы поведение боевого экземпляра
-	// против документации). 192 (T-157; исходный 256 — замеры T-092
-	// §3/§11): сутки на 256 слотах — два фатала юнита
-	// (load-measurements.md §12: 05:48 OOM-kill, 09:17 выход на пик
-	// 900.5 MiB = MemoryMax; MemoryHigh 850M — 120 095
-	// reclaim-событий) при ≈3.3 MiB anon на слот (тела удерживались до
-	// конца задачи — до раннего Put T-147); 192 устойчивы (пропитка
-	// волны 21: 860–893 MiB, oom=0, NRestarts=0), скорость ≈17–19 дом/с.
-	// T-163 закрыл остаток профиля (метрики замера слота + мягкий
-	// потолок кучи http.mem_limit против reclaim-штормов MemoryHigh);
-	// возврат 256 — по замеру сэмплером после деплоя (критерий
-	// ≤1.5 MiB/слот и сутки без троттлинга MemoryHigh), не кодом.
+	// The number — in sync with the config default http.task_concurrency
+	// (cmd/http-worker; the TestWorkerOptionsDefaults test catches a divergence
+	// — a silently diverged default would change the production instance's behavior
+	// against the documentation). 192 (T-157; the original 256 — the T-092 measurements
+	// §3/§11): a day on 256 slots — two unit fatals
+	// (load-measurements.md §12: an OOM kill at 05:48, reaching the
+	// 900.5 MiB = MemoryMax peak at 09:17; MemoryHigh 850M — 120,095
+	// reclaim events) at ≈3.3 MiB anon per slot (the bodies were held until
+	// the task's end — until the early Put T-147); 192 are stable (the wave 21
+	// soak: 860–893 MiB, oom=0, NRestarts=0), the rate ≈17–19 domains/s.
+	// T-163 closed the profile's remainder (the slot measurement metrics + the soft
+	// heap cap http.mem_limit against the MemoryHigh reclaim storms);
+	// the return to 256 — by the sampler measurement after the deploy (the criterion
+	// ≤1.5 MiB/slot and a day without MemoryHigh throttling), not by code.
 	DefaultConcurrency = 192
 
-	// DefaultConsume — записей q:http за одно чтение: размер пачки
-	// XREADGROUP и буфера предвыборки скользящего потребления (T-139) —
-	// чтение идёт вперёд обработки не глубже пары пачек (текущая в руке
-	// читателя + буфер), следующее чтение происходит при освобождении
-	// слотов задач (диспетчер забирает доставку из буфера, только когда
-	// есть слот), окно чтения параллелизм не ограничивает.
+	// DefaultConsume — q:http records per one read: the size of the
+	// XREADGROUP chunk and of the sliding consumption's prefetch buffer (T-139) —
+	// the read runs ahead of the processing by no more than a couple of chunks (the current one
+	// in the reader's hand + the buffer), the next read happens upon freeing
+	// the task slots (the dispatcher takes a delivery from the buffer only when
+	// there is a slot), the read window does not bound the parallelism.
 	DefaultConsume = 16
 
-	// DefaultPerDomain — параллельных проверок внутри задачи домена
-	// (субдомен × протокол). Субдоменов ≤ 63 (§5.10), проверок вдвое
-	// больше — но умеренный пул: субдомены одного домена почти всегда
-	// живут на одних и тех же IP (один сервер, CNAME-хостинги), и
-	// реальный параллелизм подключения к одному IP уже ограничен
-	// семафором per-IP транспорта (3–4, ТЗ 5.5); 8 = удвоенный per-IP
-	// потолок покрывает домены с несколькими адресами (апекс/www
-	// отдельно, CNAME-цели) и две проверки одного субдомена, не выделяя
-	// одному домену несправедливую долю глобального бюджета.
+	// DefaultPerDomain — parallel checks inside a domain task
+	// (subdomain × protocol). Subdomains ≤ 63 (§5.10), twice as many
+	// checks — but a moderate pool: one domain's subdomains almost always
+	// live on the same IPs (one server, CNAME hostings), and
+	// the real parallelism of connecting to one IP is already bounded
+	// by the transport's per-IP semaphore (3–4, spec 5.5); 8 = the doubled per-IP
+	// cap covers the domains with several addresses (apex/www
+	// separately, CNAME targets) and two checks of one subdomain, without granting
+	// one domain an unfair share of the global budget.
 	DefaultPerDomain = 8
 
-	// DefaultErrorWait — пауза после ошибок Redis (стиль T-039):
-	// холостые круги не греют логи, неподтверждённые доставки вернёт
+	// DefaultErrorWait — the pause after Redis errors (the T-039 style):
+	// idle rounds do not warm the logs, the unacknowledged deliveries will be returned by
 	// XAUTOCLAIM (T-025).
 	DefaultErrorWait = 30 * time.Second
 )
 
-// workerFailWaitBase — стартовая пауза предохранителя рабочего цикла
-// (Run): доставки, подряд оставшиеся без XACK числом в целую пачку
-// чтения (Consume, T-139) при систематическом сбое обработки —
-// Options.OnResult/БД, — приостанавливают чтение q:http с удвоением
-// паузы до DefaultErrorWait. Без паузы цикл продолжал бы черпать
-// задачи: каждая доставка жгла попытку (XAUTOCLAIM после
-// DefaultClaimMinIdle, T-025) и уносила её в q:dead. Переменная, а не
-// константа: юнит-тесты сжимают паузу, не выжидая секунды.
+// workerFailWaitBase — the starting pause of the work loop's
+// fuse (Run): deliveries left in a row without an XACK in the number of a whole read
+// chunk (Consume, T-139) at a systematic processing failure —
+// Options.OnResult/the DB — suspend the q:http reading with a doubling
+// of the pause up to DefaultErrorWait. Without the pause the loop would keep drawing
+// tasks: every delivery burned an attempt (XAUTOCLAIM after
+// DefaultClaimMinIdle, T-025) and carried it into q:dead. A variable, not
+// a constant: the unit tests shrink the pause without waiting seconds.
 var workerFailWaitBase = time.Second
 
-// workerFailBackoff — пауза после streak подряд выдержанных пауз
-// предохранителя (серия нарастает, пока читатель не увидит ни одного
-// успеха — счётчик неудач обнуляется подтверждённой доставкой):
-// удвоение от workerFailWaitBase, потолок DefaultErrorWait (сдвиг
-// ограничен — переполнение Duration).
+// workerFailBackoff — the pause after a streak of endured fuse
+// pauses in a row (the series grows until the reader sees no
+// success — the failure counter is reset by an acknowledged delivery):
+// a doubling from workerFailWaitBase, the DefaultErrorWait cap (the
+// shift is bounded — a Duration overflow).
 func workerFailBackoff(streak int) time.Duration {
 	d := workerFailWaitBase << min(streak-1, 5)
 	if d > DefaultErrorWait {
@@ -611,75 +611,75 @@ func workerFailBackoff(streak int) time.Duration {
 	return d
 }
 
-// Options — параметры воркера; нулевые значения заменяются дефолтами
-// (withDefaults, стиль dnsworker.Options). Боевая сборка (cmd/http-worker)
-// берёт Concurrency/Consume/PerDomain из конфигурации http.task_*
-// (internal/config, T-139); здесь те же дефолты — для изолированных
-// сборок и тестов.
+// Options — the worker's parameters; the zero values are replaced by the defaults
+// (withDefaults, the dnsworker.Options style). The production build (cmd/http-worker)
+// takes Concurrency/Consume/PerDomain from the http.task_* configuration
+// (internal/config, T-139); here the same defaults — for the isolated
+// builds and tests.
 type Options struct {
-	// Concurrency — одновременных задач q:http в цикле Run; 0 —
-	// DefaultConcurrency. Конфиг: http.task_concurrency.
+	// Concurrency — concurrent q:http tasks in the Run loop; 0 —
+	// DefaultConcurrency. Config: http.task_concurrency.
 	Concurrency int
-	// Consume — записей q:http за одно чтение (пачка XREADGROUP и буфер
-	// предвыборки скользящего потребления, T-139); 0 — DefaultConsume.
-	// Конфиг: http.task_consume.
+	// Consume — q:http records per one read (the XREADGROUP chunk and the
+	// sliding consumption's prefetch buffer, T-139); 0 — DefaultConsume.
+	// Config: http.task_consume.
 	Consume int
-	// Group — группа потребителей q:http; "" — DefaultGroup.
+	// Group — the q:http consumer group; "" — DefaultGroup.
 	Group string
-	// Consumer — имя потребителя группы; "" — "http-worker-<pid>".
+	// Consumer — the group's consumer name; "" — "http-worker-<pid>".
 	Consumer string
-	// PerDomain — параллельных проверок (субдомен × протокол) внутри
-	// задачи домена; 0 — DefaultPerDomain. Конфиг: http.task_per_domain.
+	// PerDomain — parallel checks (subdomain × protocol) inside
+	// the domain task; 0 — DefaultPerDomain. Config: http.task_per_domain.
 	PerDomain int
-	// DeadHostCutoff — dead-host cutoff (T-164): apex и www, не прошедшие
-	// connect-фазу (connection refused или connect-таймаут — оба
-	// протокола), завершают задачу без проверки остальных субдоменов:
-	// мёртвые хосты массовых зон перестают жечь слоты таймаутным хвостом
-	// (замер §12: mean 11.5 с при транспорте 0.54 с/запрос, 60% задач в
-	// бакете 10–30 с). Записи пропущенных субдоменов — по §8 («нет
-	// ответа»: записей нет), их проверки — синтетический класс ErrCutoff.
-	// false — прежнее поведение: все субдомены задачи проверяются.
-	// Конфиг: http.dead_host_cutoff.
+	// DeadHostCutoff — the dead-host cutoff (T-164): apex and www that did not pass
+	// the connect phase (connection refused or a connect timeout — both
+	// protocols) finish the task without checking the other subdomains:
+	// the dead hosts of mass zones stop burning slots with the timeout tail
+	// (the §12 measurement: a mean of 11.5 s at a transport of 0.54 s/request, 60% of tasks in
+	// the 10–30 s bucket). The skipped subdomains' records — by §8 ("no
+	// answer": no records), their checks — the synthetic ErrCutoff class.
+	// false — the former behavior: all the task's subdomains are checked.
+	// Config: http.dead_host_cutoff.
 	DeadHostCutoff bool
-	// Store — хранилище контента для раннего сохранения тел (T-147):
-	// каждая скачанная страница уходит в Put по хэшу сразу по получении
-	// и не удерживается в памяти слота (дедупликация алиасов идёт по
-	// хэшам, T-055). Продакшн — *content.PackStore (тот же, что у
-	// ContentSaver); nil — ошибка: без раннего Put тела записей
-	// копились бы в памяти до конца задачи (≈3.34 МиБ/слот, замер
-	// T-092 §11) — тихий откат оптимизации хуже явного отказа старта.
+	// Store — the content store for the early body storing (T-147):
+	// every downloaded page goes into a Put by hash immediately on receipt
+	// and is not held in the slot's memory (the alias deduplication goes by
+	// the hashes, T-055). Production — *content.PackStore (the same as
+	// ContentSaver's); nil — an error: without the early Put the records'
+	// bodies would accumulate in memory until the task's end (≈3.34 MiB/slot, the
+	// T-092 §11 measurement) — a silent rollback of the optimization is worse than an explicit start refusal.
 	Store content.ContentStore
-	// MaxRedirects — лимит цепочки редиректов (http.max_redirects,
-	// T-048): 0 — не следовать вовсе; отрицательные значения — дефолт
-	// таблицы лимитов ТЗ 5.5 (httpfetch.DefaultMaxRedirects).
+	// MaxRedirects — the redirect chain's limit (http.max_redirects,
+	// T-048): 0 — do not follow at all; negative values — the default
+	// of the spec 5.5 limits table (httpfetch.DefaultMaxRedirects).
 	MaxRedirects int
-	// Recover — слой возврата зависших доставок (Reliab, T-025): Run
-	// поднимает фоновый RecoverLoop (XAUTOCLAIM → та же обработка →
-	// XACK) с теми же Group/Consumer; nil — восстановления нет
-	// (изолированные сборки и тесты без Redis-специфики).
+	// Recover — the stuck deliveries' return layer (Reliab, T-025): Run
+	// raises a background RecoverLoop (XAUTOCLAIM → the same processing →
+	// XACK) with the same Group/Consumer; nil — no recovery
+	// (isolated builds and tests without Redis specifics).
 	Recover *queue.Reliab
-	// RecoverBatch — пачка клейма RecoverLoop за проход; 0 — дефолт
-	// очереди (queue.DefaultRecoverBatch). Боевая сборка передаёт
-	// redis.recover_batch (T-153): темп возврата зависших — настраиваемая
-	// величина очереди, а не окно потребления этапа.
+	// RecoverBatch — the RecoverLoop's claim chunk per pass; 0 — the
+	// queue's default (queue.DefaultRecoverBatch). The production build passes
+	// redis.recover_batch (T-153): the stuck deliveries' return rate — a queue-configured
+	// value, not the stage's consumption window.
 	RecoverBatch int
-	// RecoverInterval — период опроса зависших записей RecoverLoop;
-	// 0 — дефолт очереди (queue.DefaultRecoverInterval). Конфиг —
+	// RecoverInterval — the RecoverLoop's stuck records polling period;
+	// 0 — the queue's default (queue.DefaultRecoverInterval). Config —
 	// redis.recover_interval (T-153).
 	RecoverInterval time.Duration
-	// Log — логгер; nil — записи подавлены (slog.DiscardHandler).
+	// Log — the logger; nil — the records are suppressed (slog.DiscardHandler).
 	Log *slog.Logger
-	// Metrics — реестр Prometheus сервиса (T-077, ТЗ 5.9): из него New
-	// строит приборы этапа (NewMetrics); nil — без метрик (изолированные
-	// сборки и тесты).
+	// Metrics — the service's Prometheus registry (T-077, spec 5.9): from it New
+	// builds the stage's instruments (NewMetrics); nil — without metrics (isolated
+	// builds and tests).
 	Metrics *metrics.Registry
-	// OnResult — обработчик готового результата домена, вызывается в
-	// цикле Run ПОСЛЕ обработки и ДО XACK. Сборка сервиса (cmd/http-worker)
-	// ставит сюда цепочку: ContentSaver (T-056) → Recorder — запись
-	// subdomain_results, статус домена и публикация q:analyze (T-058).
-	// nil — результат собирается и отбрасывается (изолированные тесты).
-	// Ошибка обработчика — доставка без XACK, вернётся повторной
-	// доставкой (at-least-once, ТЗ 3.4).
+	// OnResult — the ready domain result's handler, called in
+	// the Run loop AFTER the processing and BEFORE the XACK. The service build (cmd/http-worker)
+	// puts the chain here: ContentSaver (T-056) → Recorder — the write
+	// of subdomain_results, the domain status and the q:analyze publication (T-058).
+	// nil — the result is assembled and discarded (isolated tests).
+	// The handler's error — a delivery without an XACK, it will return with a repeated
+	// delivery (at-least-once, spec 3.4).
 	OnResult func(ctx context.Context, res *DomainResult) error
 }
 
@@ -712,15 +712,15 @@ func (o Options) log() *slog.Logger {
 	return o.Log
 }
 
-// Worker — HTTP-воркер: обрабатывает задачи q:http (домены) через шов
-// загрузки FetchFunc. Потокобезопасен: состояние неизменно после New.
+// Worker — the HTTP worker: processes the q:http tasks (domains) through the
+// FetchFunc load seam. Concurrency-safe: the state is immutable after New.
 type Worker struct {
 	fetch FetchFunc
 	opt   Options
-	met   *Metrics // приборы этапа (T-077); nil — no-op
+	met   *Metrics // the stage's instruments (T-077); nil — no-op
 }
 
-// New создаёт воркер поверх шва загрузки fetch (продакшн — ChainFetch).
+// New creates the worker over the fetch load seam (production — ChainFetch).
 func New(fetch FetchFunc, opts Options) (*Worker, error) {
 	if fetch == nil {
 		return nil, errors.New("httpworker: шов загрузки не задан (ChainFetch)")
@@ -731,7 +731,7 @@ func New(fetch FetchFunc, opts Options) (*Worker, error) {
 	return &Worker{fetch: fetch, opt: opts.withDefaults(), met: NewMetrics(opts.Metrics)}, nil
 }
 
-// workerSub — разобранный субдомен задачи: адреса распарсены один раз.
+// workerSub — a parsed task subdomain: the addresses are parsed once.
 type workerSub struct {
 	id    int16
 	label string
@@ -740,8 +740,8 @@ type workerSub struct {
 	cname string
 }
 
-// workerPrepareTask валидирует задачу (queue.Decode уже проверил её в
-// цикле — здесь защита прямых вызовов ProcessDomain) и парсит адреса.
+// workerPrepareTask validates the task (queue.Decode already checked it in
+// the loop — here the guard of direct ProcessDomain calls) and parses the addresses.
 func workerPrepareTask(task queue.HTTPTask) ([]workerSub, error) {
 	if strings.TrimSpace(task.Name) == "" {
 		return nil, errors.New("httpworker: задача без имени домена")
@@ -782,16 +782,16 @@ func workerPrepareTask(task queue.HTTPTask) ([]workerSub, error) {
 	return subs, nil
 }
 
-// ProcessDomain обрабатывает задачу q:http целиком (ТЗ 5.5 пп. 1, 6, §7):
-// проверки субдоменов по обоим протоколам параллельно (пул PerDomain) с
-// общим кэшем итоговых URL → вариант-логика (T-054) → алиасы (T-055).
-// При включённом dead-host cutoff (Options.DeadHostCutoff, T-164) проверки
-// идут двумя волнами: apex и www — первая волна, мёртвая connect-фаза
-// обоих по обоим протоколам (DeadDial) завершает задачу без проверки
-// остальных субдоменов (записи — по §8, наблюдаемость — Cutoff/ErrCutoff).
-// Ошибки отдельных проверок остаются в их результатах и не роняют домен
-// (§8); ошибка возврата — только негодная задача или отмена ctx (эпизод не
-// завершён, доставка q:http не подтверждается и повторится, ТЗ 3.4).
+// ProcessDomain processes the q:http task in full (spec 5.5 items 1, 6, §7):
+// the subdomain checks over both protocols in parallel (the PerDomain pool) with
+// a shared final URL cache → the variant logic (T-054) → the aliases (T-055).
+// With the dead-host cutoff on (Options.DeadHostCutoff, T-164) the checks
+// go in two waves: apex and www — the first wave, a dead connect phase
+// of both over both protocols (DeadDial) finishes the task without checking
+// the other subdomains (the records — by §8, observability — Cutoff/ErrCutoff).
+// The individual checks' errors stay in their results and do not drop the domain
+// (§8); a return error — only an unfit task or a ctx cancellation (the episode is not
+// finished, the q:http delivery is not acknowledged and will repeat, spec 3.4).
 func (w *Worker) ProcessDomain(ctx context.Context, task queue.HTTPTask) (*DomainResult, error) {
 	subs, err := workerPrepareTask(task)
 	if err != nil {
@@ -806,14 +806,14 @@ func (w *Worker) ProcessDomain(ctx context.Context, task queue.HTTPTask) (*Domai
 	}
 	cache := workerNewURLCache()
 
-	// Пул горутин: семафор PerDomain приобретается до запуска (очередь
-	// горутин не растёт, стиль dnsworker.processBatch); записи в разные
-	// поля SubdomainResult — разные ячейки памяти, гонки нет.
+	// The goroutine pool: the PerDomain semaphore is acquired before the launch (the
+	// goroutine queue does not grow, the dnsworker.processBatch style); the writes into different
+	// SubdomainResult fields — different memory cells, no race.
 	sem := make(chan struct{}, w.opt.PerDomain)
 	var wg sync.WaitGroup
-	// launch — запускает проверки субдомена задачи (https и http) в пуле;
-	// единственная точка запуска — работает и одной волной (cutoff
-	// выключен), и двумя (голова apex/www → хвост, T-164).
+	// launch — launches the task subdomain's checks (https and http) in the pool;
+	// the single launch point — works both in one wave (cutoff
+	// off) and in two (the apex/www head → the tail, T-164).
 	launch := func(i int, sub workerSub) {
 		res.Subdomains[i] = SubdomainResult{
 			SubdomainID: sub.id,
@@ -822,8 +822,8 @@ func (w *Worker) ProcessDomain(ctx context.Context, task queue.HTTPTask) (*Domai
 			Addrs:       sub.addrs,
 			CNAME:       sub.cname,
 		}
-		// https и http одного субдомена — независимые проверки; Scheme
-		// каждой проверки фиксируется в её результате самим checkScheme.
+		// https and http of one subdomain — independent checks; every check's
+		// Scheme is fixed into its result by checkScheme itself.
 		wg.Add(2)
 		sem <- struct{}{}
 		go func(dst *SchemeCheck, sub workerSub) {
@@ -840,10 +840,10 @@ func (w *Worker) ProcessDomain(ctx context.Context, task queue.HTTPTask) (*Domai
 	}
 
 	if w.opt.DeadHostCutoff {
-		// Две волны (T-164): apex и www летят первыми — их итог решает,
-		// проверять ли остальных. Мёртвая connect-фаза обоих по обоим
-		// протоколам — сигнатура мёртвого хоста: остальные субдомены не
-		// проверяются, задача завершается с имеющимся результатом.
+		// Two waves (T-164): apex and www fly first — their outcome decides
+		// whether to check the others. A dead connect phase of both over both
+		// protocols — the dead host's signature: the other subdomains are not
+		// checked, the task finishes with the available result.
 		head, rest := workerCutoffSplit(subs)
 		for _, i := range head {
 			launch(i, subs[i])
@@ -869,20 +869,20 @@ func (w *Worker) ProcessDomain(ctx context.Context, task queue.HTTPTask) (*Domai
 		wg.Wait()
 	}
 
-	// Отмена/дедлайн — эпизод не завершён: результат с провалившимися
-	// проверками выглядел бы «веб молчит» и дал бы ложный no_http;
-	// честный сбой вернёт задачу повторной доставкой (ТЗ 3.4).
+	// A cancellation/deadline — the episode is not finished: a result with the failed
+	// checks would look like "the web is silent" and give a false no_http;
+	// an honest failure will return the task with a repeated delivery (spec 3.4).
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("httpworker: домен %s: отмена: %w", task.Name, err)
 	}
 
-	// Сбой раннего Put, не являющийся паузой записи контента (ошибка
-	// БД/ФС, отмена), роняет задачу (T-147): контент ссылки не получил,
-	// молчание уронило бы его до перепроверки T-030 (месяцы); повторная
-	// доставка переиграет эпизод целиком (ТЗ 3.4). Ссылки Put-ов этой
-	// попытки, не снятые сверкой ContentSaver, остаются — утечка в
-	// безопасную сторону (тот же класс, что крах между Put и фиксацией
-	// строки у SwapRef, T-044).
+	// An early Put failure that is not the content write pause (a
+	// DB/FS error, a cancellation) drops the task (T-147): the content received no
+	// reference, silence would drop it until the T-030 recheck (months); a repeated
+	// delivery will replay the episode entirely (spec 3.4). The Put references of this
+	// attempt, not removed by the ContentSaver reconciliation, remain — a leak in
+	// the safe direction (the same class as a crash between the Put and the row's
+	// commit at SwapRef, T-044).
 	for i := range res.Subdomains {
 		for _, c := range []*SchemeCheck{&res.Subdomains[i].HTTPS, &res.Subdomains[i].HTTP} {
 			if c.storeErr != nil {
@@ -891,10 +891,10 @@ func (w *Worker) ProcessDomain(ctx context.Context, task queue.HTTPTask) (*Domai
 		}
 	}
 
-	// Вариант-логика (T-054) по каждому субдомену; алиасы (T-055) — по
-	// всем записям домена сразу (классы эквивалентности склеивают
-	// субдомены, §5.5 п. 6). Указатели записей берутся из уже собранного
-	// результата (append в локальный срез реаллокацией отрывал бы их от
+	// The variant logic (T-054) per every subdomain; the aliases (T-055) — over
+	// all the domain's records at once (the equivalence classes glue
+	// subdomains together, §5.5 item 6). The records' pointers are taken from the already assembled
+	// result (an append into a local slice with a reallocation would tear them away from
 	// SubdomainResult.Records).
 	var (
 		aliasIn  []httpfetch.AliasInput
@@ -953,7 +953,7 @@ func (w *Worker) ProcessDomain(ctx context.Context, task queue.HTTPTask) (*Domai
 		}
 	}
 
-	// DetectAliases возвращает решение параллельно входу.
+	// DetectAliases returns the decision parallel to the input.
 	for i, ar := range httpfetch.DetectAliases(task.Name, aliasIn) {
 		rec := aliasRec[i]
 		rec.AliasKind = ar.AliasKind
@@ -961,37 +961,37 @@ func (w *Worker) ProcessDomain(ctx context.Context, task queue.HTTPTask) (*Domai
 		rec.StoreContent = ar.StoreContent
 	}
 
-	// Граница этапа (T-266, ТЗ-fsm §3 ФТ-12): результат домена собран
-	// целиком — все проверки и записи прогоняются через централизованные
-	// валидаторы автомата состояния проверки схемы (schemestate.go,
-	// validateResult) до передачи в Options.OnResult (первое звено —
-	// ContentSaver, T-056). Нелегальная комбинация полей — баг
-	// построения результата: доставка q:http возвращается без XACK
-	// (ТЗ 3.4), мусор в БД не попадает.
+	// The stage boundary (T-266, TZ-fsm spec §3 FR-12): the domain result is assembled
+	// in full — all the checks and records are run through the scheme check state
+	// FSM's centralized validators (schemestate.go,
+	// validateResult) before passing into Options.OnResult (the first link —
+	// ContentSaver, T-056). An illegal field combination — a result
+	// construction bug: the q:http delivery returns without an XACK
+	// (spec 3.4), garbage does not reach the DB.
 	if err := validateResult(res); err != nil {
 		return nil, fmt.Errorf("httpworker: домен %s: %w", task.Name, err)
 	}
 
-	// Реестр ранних Put (T-147) — в результат: ContentSaver.Save сверит
-	// его с записями (ссылки, не ставшие строками, снимутся Delete).
-	// Тела проверок и записей к этому моменту в памяти уже нет (T-147):
-	// ранний Put освободил их при получении.
+	// The early Put registry (T-147) — into the result: ContentSaver.Save will reconcile
+	// it with the records (the references that did not become rows will be removed by Delete).
+	// The checks' and records' bodies are no longer in memory by this moment (T-147):
+	// the early Put released them at the receipt.
 	res.puts = cache.takePuts()
 	return res, nil
 }
 
-// workerCutoffHeadLabel — головной субдомен dead-host cutoff (T-164):
-// апекс (метка "") и www — главные имена сайта. Регистр DNS незначим —
-// сравнение без учёта регистра (метки задачи уже нижний регистр, сверка
-// страхует прямые вызовы ProcessDomain).
+// workerCutoffHeadLabel — the dead-host cutoff's head subdomain (T-164):
+// the apex (the "" label) and www — the site's main names. The DNS case is insignificant —
+// a case-insensitive comparison (the task's labels are already lower case, the
+// check guards the direct ProcessDomain calls).
 func workerCutoffHeadLabel(label string) bool {
 	return label == "" || strings.EqualFold(label, "www")
 }
 
-// workerCutoffSplit делит субдомены задачи на голову (апекс и www) и
-// хвост (остальные) для dead-host cutoff (T-164): голова проверяется
-// первой волной пула, хвост — второй либо не проверяется вовсе.
-// Порядок внутри частей — порядок задачи q:http.
+// workerCutoffSplit divides the task's subdomains into the head (the apex and www) and
+// the tail (the others) for the dead-host cutoff (T-164): the head is checked
+// by the pool's first wave, the tail — by the second or not checked at all.
+// The order inside the parts — the q:http task's order.
 func workerCutoffSplit(subs []workerSub) (head, rest []int) {
 	head = make([]int, 0, 2)
 	for i := range subs {
@@ -1008,16 +1008,16 @@ func workerCutoffSplit(subs []workerSub) (head, rest []int) {
 	return head, rest
 }
 
-// workerDeadHostHead — сигнатура мёртвого хоста (T-164): в задаче есть
-// ОБА головных имени (ровно два — дубли меток задача не содержит) и
-// каждая проверка головы (https и http) завершилась отказом connect-фазы
-// (DeadDial): оба главных хоста TCP-мёртвы по обоим протоколам — жечь
-// слоты задачи на остальных субдоменах бессмысленно. Любой итог кроме
-// мёртвого диала (живая проверка, TLS-сбой, таймаут заголовков/общий,
-// лимит редиректов) снимает сигнатуру — домен проверяется целиком.
+// workerDeadHostHead — the dead host's signature (T-164): the task has
+// BOTH head names (exactly two — the task contains no label duplicates) and
+// every head check (https and http) finished with a connect-phase refusal
+// (DeadDial): both main hosts are TCP-dead over both protocols — burning
+// the task's slots on the other subdomains is pointless. Any outcome other than
+// a dead dial (a live check, a TLS failure, a headers/overall timeout,
+// the redirects limit) removes the signature — the domain is checked in full.
 func workerDeadHostHead(res *DomainResult, head []int) bool {
 	if len(head) != 2 {
-		return false // нет пары апекс+www — сигнатура не собрана
+		return false // no apex+www pair — the signature is not assembled
 	}
 	for _, i := range head {
 		sub := &res.Subdomains[i]
@@ -1028,14 +1028,14 @@ func workerDeadHostHead(res *DomainResult, head []int) bool {
 	return true
 }
 
-// workerSkipSubdomain заполняет результат субдомена, не проверявшегося
-// из-за dead-host cutoff (T-164): заголовок задачи (идентичность,
-// адреса DNS-этапа) сохраняется, проверки — синтетические класса
-// ErrCutoff (наблюдаемость: Episode считает пропущенные проверки
-// отдельным счётчиком, текст — причина), записей нет — в точности как у
-// субдомена, чьи проверки прошли и промолчали (§8: оба протокола
-// недоступны → записей нет; вклад в статус домена — решает агрегатор
-// T-058 по выполненным проверкам apex/www).
+// workerSkipSubdomain fills the result of a subdomain that was not checked
+// because of the dead-host cutoff (T-164): the task's header (the identity,
+// the DNS stage's addresses) is preserved, the checks — synthetic of the
+// ErrCutoff class (observability: Episode counts the skipped checks
+// by a separate counter, the text — the reason), no records — exactly like at
+// a subdomain whose checks passed and were silent (§8: both protocols
+// unavailable → no records; the contribution into the domain's status — the T-058
+// aggregator decides over the performed apex/www checks).
 func workerSkipSubdomain(dst *SubdomainResult, sub workerSub) {
 	const note = "dead-host cutoff (T-164): apex и www не прошли connect-фазу — субдомен не проверялся"
 	dst.SubdomainID = sub.id
@@ -1048,8 +1048,8 @@ func workerSkipSubdomain(dst *SubdomainResult, sub workerSub) {
 	dst.Records = nil
 }
 
-// workerHashBytes — хэш как срез для AliasInput.ContentHash (nil — без
-// контента, контракт T-055); копия — запись в результате остаётся владыкой.
+// workerHashBytes — the hash as a slice for AliasInput.ContentHash (nil — without
+// content, the T-055 contract); a copy — the record in the result stays the owner.
 func workerHashBytes(h *content.Hash) []byte {
 	if h == nil {
 		return nil
@@ -1059,20 +1059,20 @@ func workerHashBytes(h *content.Hash) []byte {
 	return b
 }
 
-// workerBodyHardLimit — страховочный потолок чтения тела в самом воркере
-// на случай транспорта без лимитов T-049 (изолированные сборки и юнит-
-// тесты без Options.Limits): неограниченное чтение раздувало бы память
-// на злонамеренном ответе (§9 — недоверенный контент). С включёнными
-// лимитами (боевой сборщик NewOptions включает их всегда) тело уже
-// обёрнуто BodyLimiter с потолком http.max_body_bytes — сколь угодно
-// выше дефолта, — и чтение идёт под ним без собственного потолка
-// воркера: страховка не должна подменять настроенный лимит.
+// workerBodyHardLimit — the worker's own guard cap of the body read
+// for the case of a transport without the T-049 limits (isolated builds and
+// unit tests without Options.Limits): an unlimited read would bloat the memory
+// on a malicious answer (§9 — untrusted content). With the limits on
+// (the production NewOptions builder always includes them) the body is already
+// wrapped by the BodyLimiter with the http.max_body_bytes cap — arbitrarily
+// above the default, — and the read runs under it without the worker's own cap:
+// the guard must not substitute the configured limit.
 const workerBodyHardLimit = httpfetch.DefaultLimitBodyBytes
 
-// checkScheme — одна проверка (субдомен × протокол, ТЗ 5.5 п. 1): кэш
-// итоговых URL → цепочка редиректов (шов fetch) → чтение тела с потолком →
-// UTF-8 (T-051) → хэш и SPA-вердикт (T-057). Все ошибки — в результат
-// проверки; отмена ctx видна вызывающему через ctx.Err() после пула.
+// checkScheme — one check (subdomain × protocol, spec 5.5 item 1): the final
+// URLs' cache → the redirect chain (the fetch seam) → the body read with a cap →
+// UTF-8 (T-051) → the hash and the SPA verdict (T-057). All the errors — into the
+// check's result; the ctx cancellation is visible to the caller via ctx.Err() after the pool.
 func (w *Worker) checkScheme(
 	ctx context.Context,
 	host string,
@@ -1083,9 +1083,9 @@ func (w *Worker) checkScheme(
 	check := &SchemeCheck{Scheme: scheme}
 	start := &url.URL{Scheme: scheme.String(), Host: host, Path: "/"}
 
-	// Кэш итоговых URL (ТЗ 5.5 п. 6): стартовый URL этой проверки уже
-	// скачан другой проверкой задачи (bare→www) — вторая загрузка не
-	// нужна. Кэш-итог честно помечается Cached: сеть не трогалась.
+	// The final URLs' cache (spec 5.5 item 6): this check's starting URL is already
+	// downloaded by another task check (bare→www) — a second load is
+	// not needed. The cache outcome is honestly marked Cached: the network was not touched.
 	if page := cache.get(workerCacheKey(start)); page != nil {
 		check.Available = true
 		check.Cached = true
@@ -1101,10 +1101,10 @@ func (w *Worker) checkScheme(
 		check.Charset = page.charset
 		check.ContentStored = page.stored
 		check.SPA = page.spa
-		// Ошибка страницы (обрезка — ErrBody) переносится кэш-итогом:
-		// запись того же контента несёт тот же класс, что и у
-		// первоисточника (иначе subdomain_results.error расходился бы
-		// от попадания в кэш, метрики недосчитали бы ошибку).
+		// The page's error (a truncation — ErrBody) is carried by the cache outcome:
+		// a record of the same content carries the same class as the
+		// primary source's (otherwise subdomain_results.error would diverge
+		// from the cache hit, the metrics would undercount the error).
 		check.ErrClass = page.errClass
 		check.ErrText = page.errText
 		return check
@@ -1115,18 +1115,18 @@ func (w *Worker) checkScheme(
 		check.ErrClass = workerClassifyError(err)
 		check.ErrText = err.Error()
 		if chain != nil {
-			check.Redirects = chain.Chain // выполненная часть (T-048)
+			check.Redirects = chain.Chain // the performed part (T-048)
 		}
-		// Мёртвый connect стартового хоста (T-164): отказ connect-фазы И
-		// ни одного завершённого хода цепочки — до TCP не дошёл первый
-		// запрос к своему хосту. Отказ диала хоста редиректа (выполненная
-		// часть не пуста) сигнатурой не считается: стартовый хост отвечал,
-		// пала цель перехода.
+		// A dead connect of the starting host (T-164): a connect-phase refusal AND
+		// not a single completed chain step — the first request to its own host
+		// did not reach TCP. A dial refusal of the redirect's host (the performed
+		// part is not empty) does not count as the signature: the starting host answered,
+		// the hop's target fell.
 		check.DeadDial = len(check.Redirects) == 0 && httpfetch.IsConnectFailure(err)
 		return check
 	}
 	if chain == nil || chain.Result == nil {
-		// Редирект-лимит/цикл: Result nil, Chain — выполненная часть.
+		// A redirect limit/loop: Result nil, Chain — the performed part.
 		check.ErrClass = ErrRedirects
 		check.ErrText = httpfetch.ErrTooManyRedirects.Error()
 		if chain != nil {
@@ -1149,13 +1149,13 @@ func (w *Worker) checkScheme(
 		}
 	}
 
-	// Тело: читается целиком, закрывается всегда (общий таймаут
-	// запроса живёт до Close, T-047), приводится к UTF-8 (T-051);
-	// дальше нужны только хэш (T-054/T-055/T-056) и SPA-вердикт
-	// (T-057). Потолок — BodyLimiter T-049, когда лимиты включены:
-	// чтение режется по http.max_body_bytes (признак — Truncated),
-	// анти-тарпит там же; без лимитёра — страховочный
-	// workerBodyHardLimit от недоверенного ответа.
+	// The body: read entirely, closed always (the request's overall
+	// timeout lives until the Close, T-047), converted to UTF-8 (T-051);
+	// further only the hash (T-054/T-055/T-056) and the SPA verdict
+	// (T-057) are needed. The cap — the BodyLimiter T-049, when the limits are on:
+	// the read is cut by http.max_body_bytes (the sign — Truncated),
+	// the anti-tarpit is there too; without the limiter — the
+	// workerBodyHardLimit guard against an untrusted answer.
 	var (
 		body      []byte
 		readErr   error
@@ -1175,9 +1175,9 @@ func (w *Worker) checkScheme(
 		readErr = closeErr
 	}
 	if readErr != nil {
-		// Чтение сорвалось после заголовков (тарпит-таймаут, обрыв):
-		// протокол ответил, страницы нет — Available гасится, частичный
-		// статус/цепочка остаются для разбора (§8).
+		// The read broke after the headers (a tarpit timeout, a disconnect):
+		// the protocol answered, there is no page — Available is extinguished, the partial
+		// status/chain remain for parsing (§8).
 		check.Available = false
 		check.ErrClass = workerClassifyError(readErr)
 		check.ErrText = readErr.Error()
@@ -1189,13 +1189,13 @@ func (w *Worker) checkScheme(
 		check.ErrText = "тело обрезано потолком max_body_bytes (данные частичны)"
 	}
 
-	// Окно удержания тела (T-163): от завершения чтения до конца
-	// обработки (UTF-8 → хэш → SPA → ранний Put) байты живут в слоте —
-	// это транзитная составляющая памяти слота, её видит gauge
-	// crawler_http_body_bytes_inflight (замер критерия сэмплером);
-	// прочитанный размер — в гистограмму смеси (обрезанные тела входят
-	// как есть: потолок режет и их). Размер фиксируется до выхода из
-	// области видимости body (ниже body = nil).
+	// The body hold window (T-163): from completing the read to the end of the
+	// processing (UTF-8 → hash → SPA → the early Put) the bytes live in the slot —
+	// this is the slot memory's transit component, the
+	// crawler_http_body_bytes_inflight gauge sees it (the criterion's sampler measurement);
+	// the read size — into the mix histogram (truncated bodies enter
+	// as they are: the cap cuts them too). The size is fixed before leaving
+	// the body's scope (below body = nil).
 	held := int64(len(body))
 	w.met.BodyHeld(held)
 	defer func() { w.met.BodyHeld(-held) }()
@@ -1203,24 +1203,24 @@ func (w *Worker) checkScheme(
 
 	cs := httpfetch.ToUTF8(res.Header, body)
 	check.Charset = cs.Charset
-	// Исходные байты тела больше не нужны (T-163): при декодировании
-	// не-UTF-8 кодировки ToUTF8 вернула копию — сырые байты освобождаются
-	// здесь, до хэша/SPA/Put; быстрый путь без копии делит слайс с
-	// cs.UTF8, присваивание ничего не меняет. Учёт удержания выше ведётся
-	// по зафиксированному held, а не по слайсу.
+	// The body's original bytes are no longer needed (T-163): when decoding
+	// a non-UTF-8 encoding ToUTF8 returned a copy — the raw bytes are released
+	// here, before the hash/SPA/Put; the fast path without a copy shares the slice with
+	// cs.UTF8, the assignment changes nothing. The hold accounting above goes
+	// by the fixed held, not by the slice.
 	body = nil
 	hash := content.HashOf(cs.UTF8)
 	check.ContentHash = &hash
 	spa := httpfetch.DetectSPA(cs.UTF8)
 	check.SPA = &spa
 
-	// Раннее сохранение тела (T-147): байты уходят в хранилище сразу
-	// по получении — дедупликация алиасов (T-055) идёт по хэшам, слот
-	// не удерживает тела до конца задачи. Обрезанное тело не
-	// сохраняется вовсе (хэш усечённых байт врал бы при дедупе,
-	// T-049); ErrStoreFull/ErrTooLarge — пауза записи контента (ТЗ 8):
-	// страница помечается несохранённой, результат домена не роняется;
-	// прочие ошибки — storeErr, эпизод упадёт в ProcessDomain.
+	// The body's early storing (T-147): the bytes go into the store immediately
+	// on receipt — the alias deduplication (T-055) goes by the hashes, the slot
+	// does not hold bodies until the task's end. A truncated body is not
+	// stored at all (the truncated bytes' hash would lie at the dedup,
+	// T-049); ErrStoreFull/ErrTooLarge — the content write pause (spec 8):
+	// the page is marked unstored, the domain result is not dropped;
+	// the other errors — storeErr, the episode will fail in ProcessDomain.
 	if !truncated {
 		pr, err := w.opt.Store.Put(ctx, cs.UTF8)
 		switch {
@@ -1233,8 +1233,8 @@ func (w *Worker) checkScheme(
 			check.ContentStored = true
 			cache.addPut(hash, pr.Created)
 		case errors.Is(err, content.ErrStoreFull), errors.Is(err, content.ErrTooLarge):
-			// Контент не сохранён, запись результата живёт с
-			// content_hash = nil (нормализует ContentSaver, ТЗ 8).
+			// The content is not stored, the result record lives with
+			// content_hash = nil (ContentSaver normalizes it, spec 8).
 			w.opt.log().Warn("контент страницы не сохранён — запись будет без content_hash",
 				"url", res.FinalURL.String(), "err", err.Error())
 		default:
@@ -1243,8 +1243,8 @@ func (w *Worker) checkScheme(
 		}
 	}
 
-	// Итоговый URL — в кэш задачи: следующие проверки, начинающиеся на
-	// нём (www после редиректа bare), страницы повторно не скачивают.
+	// The final URL — into the task's cache: the following checks starting at
+	// it (www after the bare's redirect) do not re-download the page.
 	cache.put(workerCacheKey(res.FinalURL), &workerPage{
 		final:      res.FinalURL,
 		status:     check.Status,
@@ -1263,23 +1263,23 @@ func (w *Worker) checkScheme(
 	return check
 }
 
-// workerPreallocMax — потолок предвыделения буфера чтения тела по
-// Content-Length (T-147): враньё сервера (гигабайтный Content-Length) не
-// резервирует гигабайт — такие тела читаются обычным ростом буфера.
+// workerPreallocMax — the cap of preallocating the body read buffer by
+// Content-Length (T-147): a server's lie (a gigabyte Content-Length) does not
+// reserve a gigabyte — such bodies are read by the ordinary buffer growth.
 const workerPreallocMax = workerBodyHardLimit
 
-// workerReadBody читает тело ответа одним буфером с предвыделением по
-// Content-Length (T-147): io.ReadAll растит буфер от 512 байт удвоением
-// — на телах в десятки–сотни КиБ это два-три поколения копий на страницу
-// (× PerDomain одновременных проверок × Concurrency слотов — транзитный
-// мусор GC, входивший в пик памяти слота). Content-Length честен только
-// без Content-Encoding (транспорт T-048/ТЗ 5.5 отдаёт уже распакованный
-// поток, заголовок описывает сжатые байты): в этом случае буфер
-// выделяется ровно по заявленному размеру и наполняется io.ReadFull;
-// недосланное и пересланное сервером, сжатые ответы и кривой/отсутствующий
-// заголовок — обычное чтение с ростом. Без BodyLimiter чтение ограничено
-// страховочным потолком воркера (workerBodyHardLimit) — предвыделение
-// его не подменяет.
+// workerReadBody reads the response body by one buffer with a preallocation by
+// Content-Length (T-147): io.ReadAll grows the buffer from 512 bytes by doubling
+// — at bodies of tens–hundreds of KiB that is two-three generations of copies per page
+// (× PerDomain concurrent checks × Concurrency slots — the GC's transit
+// garbage that entered the slot memory's peak). Content-Length is honest only
+// without Content-Encoding (the T-048/spec 5.5 transport serves an already unpacked
+// stream, the header describes the compressed bytes): in that case the buffer
+// is allocated exactly by the declared size and filled by io.ReadFull;
+// the under-delivered and over-delivered by the server, the compressed answers and a broken/absent
+// header — the ordinary read with growth. Without a BodyLimiter the read is bounded by
+// the worker's guard cap (workerBodyHardLimit) — the preallocation
+// does not substitute it.
 func workerReadBody(res *httpfetch.FetchResult) ([]byte, error) {
 	rc := io.Reader(res.Body)
 	if res.BodyLimiter == nil {
@@ -1292,8 +1292,8 @@ func workerReadBody(res *httpfetch.FetchResult) ([]byte, error) {
 			if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
 				return nil, err
 			}
-			// Хвост за заявленным размером (сервер наврал в большую
-			// сторону) дочитывается ростом; у честного ответа пусто.
+			// The tail beyond the declared size (the server lied upward)
+			// is read on by growth; at an honest answer it is empty.
 			extra, err := io.ReadAll(rc)
 			if err != nil {
 				return nil, err
@@ -1304,33 +1304,33 @@ func workerReadBody(res *httpfetch.FetchResult) ([]byte, error) {
 	return io.ReadAll(rc)
 }
 
-// --- рабочий цикл ------------------------------------------------------------
+// --- the work loop ------------------------------------------------------------
 
-// Run — рабочий цикл http-worker (ТЗ 4.2, §5.5): читает задачи q:http
-// группой потребителей пачками Consume и обрабатывает доставки параллельно
-// до Concurrency доменов, каждую — паттерном Processing (T-025): обработка
-// (ProcessDomain + Options.OnResult) → XACK. Потребление скользящее
-// (T-139): следующее чтение происходит при освобождении слотов задач
-// (чтение идёт вперёд обработки не глубже пары пачек Consume), цикл не
-// ждёт завершения пачки целиком — барьер окна на хвосте длительностей
-// (тарпиты до total_timeout, 20–25 с) удерживал пропускную способность
-// этапа на уровне ≈2 дом/с при простаивающем транспорте (замер T-092).
-// Работает до отмены ctx и возвращает nil — контракт OnRun каркаса
-// (T-012: начатые задачи дорабатывают или возвращаются очереди повторной
-// доставкой). Ошибка чтения или обработки не останавливает цикл:
-// логируется (Warn), неподтверждённая доставка вернётся XAUTOCLAIM
-// (ТЗ 4.2); Consume доставок подряд без единого подтверждения —
-// систематический сбой обработки — выдерживает паузу-предохранитель
-// (workerFailWaitBase): черпать новые задачи при лежащей обработке
-// бессмысленно, попытки доставок сгорают. Инфраструктурный сбой
-// публикации (InfraError: OOM Redis/соединение, T-152) останавливает
-// чтение сразу и до восстановления записи (Reliab.Writable): публикации
-// всё равно падают, а обработки без шанса записать результат только
-// копят pending. Режимы читателя (чтение | пауза-браузер | пауза-инфра
-// | пауза-предохранитель | пауза-темп; браузер и темп в q:http
-// структурно недостижимы) формализованы автоматом readerstate.go
-// (T-262, ТЗ-fsm §3 ФТ-8): режим прохода выбирает одна функция над
-// наблюдениями, порядок приоритетов пауз — таблица переходов там же.
+// Run — the http-worker's work loop (spec 4.2, §5.5): reads the q:http tasks
+// by a consumer group in Consume chunks and processes the deliveries in parallel
+// up to Concurrency domains, each — by the Processing pattern (T-025): the processing
+// (ProcessDomain + Options.OnResult) → the XACK. The consumption is sliding
+// (T-139): the next read happens upon freeing the task slots
+// (the read runs ahead of the processing by no more than a couple of Consume chunks), the loop does
+// not wait for the whole chunk's completion — a window barrier on the durations' tail
+// (tarpits up to total_timeout, 20–25 s) held the stage's throughput
+// at ≈2 domains/s with an idling transport (the T-092 measurement).
+// It runs until the ctx cancellation and returns nil — the framework's OnRun contract
+// (T-012: the started tasks finish or return to the queue by a repeated
+// delivery). A read or processing error does not stop the loop:
+// it is logged (Warn), the unacknowledged delivery will return by XAUTOCLAIM
+// (spec 4.2); Consume deliveries in a row without a single acknowledgment —
+// a systematic processing failure — endures a fuse pause
+// (workerFailWaitBase): drawing new tasks while the processing lies broken
+// is pointless, the delivery attempts burn. An infrastructural publication
+// failure (InfraError: the Redis OOM/connection, T-152) stops
+// the reading immediately and until the write recovers (Reliab.Writable): the publications
+// fail anyway, and processings without a chance to write the result only
+// pile up pending. The reader's modes (reading | the browser pause | the infra pause
+// | the fuse pause | the rate pause; the browser and the rate in q:http
+// are structurally unreachable) are formalized by the readerstate.go automaton
+// (T-262, TZ-fsm spec §3 FR-8): the pass's mode is chosen by one function over
+// the observations, the pause priority order — by the transition table there.
 func Run(ctx context.Context, q queue.Queue, w *Worker, opts Options) error {
 	if q == nil {
 		return errors.New("httpworker: цикл воркера: очередь не задана")
@@ -1354,10 +1354,10 @@ func Run(ctx context.Context, q queue.Queue, w *Worker, opts Options) error {
 		}
 	}
 
-	// Возврат зависших доставок (T-025): фоновый RecoverLoop от имени
-	// того же потребителя — клейм XAUTOCLAIM и та же обработка задач.
-	// Живёт до отмены ctx; Run дожидается его выхода (начатая задача
-	// дорабатывает или остаётся неподтверждённой, ТЗ 3.4).
+	// The stuck deliveries' return (T-025): a background RecoverLoop on behalf of
+	// the same consumer — an XAUTOCLAIM claim and the same task processing.
+	// It lives until the ctx cancellation; Run waits for its exit (a started task
+	// finishes or stays unacknowledged, spec 3.4).
 	if o.Recover != nil {
 		recDone := make(chan struct{})
 		go func() {
@@ -1368,8 +1368,8 @@ func Run(ctx context.Context, q queue.Queue, w *Worker, opts Options) error {
 				Stream:   queue.StreamHTTP,
 				Group:    o.Group,
 				Consumer: o.Consumer,
-				// Темп обхода PEL — очередь, не этап (redis.recover_*,
-				// T-153); нули — дефолты очереди.
+				// The PEL traversal rate — the queue's, not the stage's (redis.recover_*,
+				// T-153); zeros — the queue's defaults.
 				Batch:    o.RecoverBatch,
 				Interval: o.RecoverInterval,
 				Log:      log,
@@ -1379,108 +1379,108 @@ func Run(ctx context.Context, q queue.Queue, w *Worker, opts Options) error {
 	}
 
 	sem := make(chan struct{}, o.Concurrency)
-	// Скользящее потребление (T-139): читатель держит впереди обработки
-	// не больше пары пачек Consume доставок (текущая пачка в руке +
-	// буфер pending), диспетчер ниже занимает слот семафора на время
-	// одной доставки и сразу берёт следующую — завершение задачи
-	// освобождает слот и двигает чтение, никто не ждёт пачку целиком.
-	// Прочитанные, но не начатые доставки (буфер полон, слоты заняты
-	// хвостом длительностей) на отмене ctx остаются без XACK и
-	// возвращаются очереди клеймом XAUTOCLAIM — как и не начатые
-	// доставки окна прежде (at-least-once, ТЗ 3.4).
+	// The sliding consumption (T-139): the reader keeps ahead of the processing
+	// no more than a couple of Consume delivery chunks (the current chunk in hand +
+	// the pending buffer), the dispatcher below takes a semaphore slot for the time
+	// of one delivery and immediately takes the next — a task's completion
+	// frees the slot and moves the reading, nobody waits for the chunk entirely.
+	// The read but not started deliveries (the buffer full, the slots taken
+	// by the durations' tail) at the ctx cancellation stay without an XACK and
+	// return to the queue by an XAUTOCLAIM claim — like the window's
+	// not started deliveries before (at-least-once, spec 3.4).
 	pending := make(chan queue.Delivery, o.Consume)
-	var failed atomic.Int64 // доставок подряд без подтверждения
-	// infraDown — устойчивая инфраструктурная ошибка публикации
-	// (OOM/соединение Redis, T-152): чтение q:http приостанавливается
-	// до восстановления записи (Reliab.Writable) — Redis всё равно
-	// отвергает XADD результатов, новые доставки только копились бы
-	// в pending без шанса опубликоваться. Наблюдение infra автомата
-	// режимов читателя (readerstate.go, T-262): флаг ставит диспетчер
-	// ниже (queue.IsInfra), гасят проба записи или успех обработки.
+	var failed atomic.Int64 // deliveries in a row without an acknowledgment
+	// infraDown — a sustained infrastructural publication error
+	// (the Redis OOM/connection, T-152): the q:http reading is suspended
+	// until the write recovers (Reliab.Writable) — Redis
+	// rejects the results' XADD anyway, new deliveries would only pile up
+	// in pending without a chance to publish. The reader modes automaton's
+	// infra observation (readerstate.go, T-262): the flag is set by the dispatcher
+	// below (queue.IsInfra), extinguished by the write probe or a processing success.
 	var infraDown atomic.Bool
 	readerDone := make(chan struct{})
 	go func() {
 		defer close(readerDone)
-		failStreak := 0  // подряд выдержанных пауз предохранителя
-		infraStreak := 0 // подряд выдержанных пауз инфраструктуры
+		failStreak := 0  // endured fuse pauses in a row
+		infraStreak := 0 // endured infra pauses in a row
 		for {
-			// Наблюдения прохода (ФТ-8, readerstate.go): датчики
-			// опрашиваются только смонтированными (Writable — проба
-			// записи при горящем флаге T-152, один SET), режим прохода
-			// выбирает readerDecide — порядок приоритетов пауз живёт
-			// в таблице переходов, а не в порядке if. Браузера
-			// (Options.Alive — зонд renderworker) и потолка темпа
-			// (Options.Rate, T-240) в q:http нет: режимы пауза-браузер
-			// и пауза-темп входят в enum для паритета автомата
-			// (ФТ-8) и структурно недостижимы — browser/rate нулевые.
+			// The pass's observations (FR-8, readerstate.go): the sensors
+			// are polled only mounted (Writable — the write
+			// probe at the lit T-152 flag, one SET), the pass's mode
+			// is chosen by readerDecide — the pause priority order lives
+			// in the transition table, not in the if order. There is no browser
+			// (Options.Alive — the renderworker probe) or rate cap
+			// (Options.Rate, T-240) in q:http: the browser pause
+			// and the rate pause modes enter the enum for the automaton's
+			// parity (FR-8) and are structurally unreachable — browser/rate are zero values.
 			obs := readerObs{
 				infra:  infraDown.Load(),
 				failed: failed.Load(),
 				batch:  o.Consume,
 			}
 			if obs.infra {
-				// Проба записи — только при горящем флаге (T-152):
-				// после восстановления записи чтение возобновляется
-				// немедленно. Датчика Recover нет — флаг гасится
-				// возобновлением ниже (успех обработки снимет и так).
+				// The write probe — only at the lit flag (T-152):
+				// after the write recovers the reading resumes
+				// immediately. There is no Recover sensor — the flag is
+				// extinguished by the resumption below (a processing success will extinguish it anyway).
 				obs.writable = o.Recover == nil || o.Recover.Writable(ctx)
 			}
 			switch readerDecide(obs) {
 			case modePauseInfra:
-				// Пауза потребления при устойчивой InfraError публикации
-				// (T-152): пока проба записи падает — чтение не ведётся
-				// (предохранитель ниже считал бы те же неудачи дольше и
-				// читал бы пачки между паузами).
+				// The consumption pause at a sustained InfraError of publishing
+				// (T-152): while the write probe fails — the reading does not run
+				// (the fuse below would count the same failures longer and
+				// would read chunks between the pauses).
 				infraStreak++
 				pause := workerFailBackoff(infraStreak)
 				log.Warn("пауза чтения q:http: публикация результатов падает об инфраструктуру Redis (OOM/соединение) — новые доставки не читаются (T-152)",
 					"streak", infraStreak, "wait", pause.String())
 				wait(pause)
 				if ctx.Err() != nil {
-					return // graceful shutdown: wait вышел по отмене
+					return // graceful shutdown: wait exited by the cancellation
 				}
 				continue
 			case modePauseFail:
-				// Предохранитель (workerFailWaitBase): доставки, подряд
-				// оставшиеся без подтверждения числом в целую пачку
-				// чтения (Consume) без единого успеха — систематический
-				// сбой обработки (Options.OnResult/БД); пауза с
-				// удвоением до DefaultErrorWait. После паузы проход
-				// читает (ФТ-8): предохранитель душит темп, но не
-				// блокирует чтение до нулевого счётчика. Подтверждённая
-				// доставка обнуляет счётчик неудач сразу, серия пауз
-				// сбрасывается на следующем проходе читателя, увидевшем
-				// счётчик нулевым.
+				// The fuse (workerFailWaitBase): deliveries left in a row
+				// without an acknowledgment in the number of a whole read
+				// chunk (Consume) without a single success — a systematic
+				// processing failure (Options.OnResult/the DB); a pause with
+				// a doubling up to DefaultErrorWait. After the pause the pass
+				// reads (FR-8): the fuse throttles the rate, but does not
+				// block the reading until a zero counter. An acknowledged
+				// delivery resets the failure counter immediately, the pause series
+				// is reset at the reader's next pass that sees the
+				// counter zero.
 				if ctx.Err() != nil {
-					return // graceful shutdown: паузы не было и не будет
+					return // graceful shutdown: there was and will be no pause
 				}
 				failStreak++
 				pause := workerFailBackoff(failStreak)
-				// Наблюдаемость простоя (ревью T-139): пауза до
-				// DefaultErrorWait останавливает чтение всего этапа —
-				// Warn с серией и числом неудач (частота ограничена
-				// удвоением паузы, не чаще ~2/мин на серии).
+				// The standstill's observability (the T-139 review): a pause up to
+				// DefaultErrorWait stops the whole stage's reading —
+				// a Warn with the series and the failure count (the frequency is bounded
+				// by the pause doubling, no more often than ~2/min on series).
 				log.Warn("пауза предохранителя чтения q:http: доставки падают подряд",
 					"failed", obs.failed, "streak", failStreak, "wait", pause.String())
 				wait(pause)
 				if ctx.Err() != nil {
-					return // graceful shutdown: wait вышел по отмене
+					return // graceful shutdown: wait exited by the cancellation
 				}
 			}
-			// Возобновление после инфра-паузы (T-152): флаг горел
-			// в наблюдениях прохода, а режим — уже не пауза-инфра:
-			// проба записи прошла (или датчика нет — флаг гасит
-			// успех обработки). Флаг гасится, серия инфра-пауз
-			// начинается заново (погашенный успехом флаг серию не
-			// сбрасывает — как и до T-262).
+			// The resumption after the infra pause (T-152): the flag was
+			// lit in the pass's observations, and the mode is already not the infra pause:
+			// the write probe passed (or there is no sensor — the processing
+			// success extinguishes the flag). The flag is extinguished, the infra pause
+			// series starts anew (a flag extinguished by a success does not
+			// reset the series — as before T-262).
 			if obs.infra && infraDown.Swap(false) {
 				infraStreak = 0
 				if o.Recover != nil {
 					log.Info("запись в Redis восстановлена — чтение q:http возобновляется")
 				}
 			}
-			// Серия пауз предохранителя сбрасывается наблюдением
-			// нулевого счётчика неудач (подтверждённая доставка).
+			// The fuse pause series is reset by the observation
+			// of a zero failure counter (an acknowledged delivery).
 			if failed.Load() == 0 {
 				failStreak = 0
 			}
@@ -1497,24 +1497,24 @@ func Run(ctx context.Context, q queue.Queue, w *Worker, opts Options) error {
 				select {
 				case pending <- d:
 				case <-ctx.Done():
-					return // буферные доставки без XACK вернёт XAUTOCLAIM
+					return // the buffer's deliveries without an XACK will be returned by XAUTOCLAIM
 				}
 			}
 		}
 	}()
 
-	// Диспетчер: ждёт свободный слот (или отмену) и запускает доставку.
-	// Слот семафора — с выходом по отмене: отмена ctx во время ожидания
-	// слота не должна запускать доставку с уже отменённым ctx (выбор
-	// канала select недетерминирован, поэтому отмена проверяется и после
-	// получения слота).
+	// The dispatcher: waits for a free slot (or a cancellation) and launches the delivery.
+	// The semaphore slot — with an exit by cancellation: a ctx cancellation during a slot
+	// wait must not launch a delivery with an already cancelled ctx (the select's
+	// channel choice is non-deterministic, therefore the cancellation is checked
+	// after receiving the slot too).
 	var wg sync.WaitGroup
 dispatch:
 	for {
 		var d queue.Delivery
 		select {
 		case <-ctx.Done():
-			break dispatch // доставки буфера не начаты — без XACK
+			break dispatch // the buffer's deliveries are not started — without an XACK
 		case d = <-pending:
 		}
 		select {
@@ -1530,16 +1530,16 @@ dispatch:
 		go func(d queue.Delivery) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			// Паника доставки не должна ронять процесс без лога и
-			// очистки — recover-паритет с renderworker (T-262,
-			// ТЗ-fsm §3 ФТ-8): panic → Error-лог, доставка без XACK
-			// вернётся повторной доставкой (XAUTOCLAIM, T-025);
-			// in-flight соседей и graceful shutdown сохраняются.
-			// Покрытие — горутина доставки; клейм-путь RecoverLoop —
-			// как в renderworker-образце, без recover (границы
-			// покрытия — readerstate.go). Для предохранителя паника —
-			// та же неподтверждённая доставка: серия паник пережигала
-			// бы попытки без паузы.
+			// A delivery panic must not drop the process without a log and
+			// a cleanup — the recover parity with renderworker (T-262,
+			// TZ-fsm spec §3 FR-8): a panic → an Error log, a delivery without an XACK
+			// will return with a repeated delivery (XAUTOCLAIM, T-025);
+			// the in-flight neighbors and the graceful shutdown are preserved.
+			// The coverage — the delivery goroutine; the RecoverLoop claim path —
+			// as in the renderworker model, without a recover (the coverage
+			// boundaries — readerstate.go). For the fuse a panic is
+			// the same unacknowledged delivery: a panic series would burn
+			// the attempts without a pause.
 			defer func() {
 				if r := recover(); r != nil {
 					failed.Add(1)
@@ -1553,8 +1553,8 @@ dispatch:
 			if err != nil {
 				failed.Add(1)
 				if queue.IsInfra(err) {
-					// Инфраструктурный сбой публикации (T-152):
-					// чтение останавливает ветка infraDown читателя.
+					// An infrastructural publication failure (T-152):
+					// the reader's infraDown branch stops the reading.
 					infraDown.Store(true)
 				}
 				if ctx.Err() == nil {
@@ -1563,35 +1563,35 @@ dispatch:
 				}
 			} else {
 				failed.Store(0)
-				// Успех означает состоявшуюся публикацию результата —
-				// записи Redis доступна, пауза снимается досрочно.
+				// A success means the result publication took place — the
+				// Redis records are available, the pause is lifted early.
 				infraDown.Store(false)
 			}
 		}(d)
 	}
-	wg.Wait()    // начатые доставки дорабатывают (graceful stop, ТЗ 3.4)
-	<-readerDone // читатель завершается той же отменой ctx (Consume/wait)
+	wg.Wait()    // the started deliveries finish (graceful stop, spec 3.4)
+	<-readerDone // the reader finishes by the same ctx cancellation (Consume/wait)
 	return nil
 }
 
-// processDelivery обрабатывает одну доставку q:http. Подтверждение (XACK)
-// выполняет Processing после nil-возврата — как требует ТЗ 4.2 («XACK
-// только после записи результата в БД»): запись результата и публикация
-// q:analyze идут в Options.OnResult (ContentSaver T-056 → Recorder T-058,
-// сборка cmd/http-worker) до возврата, и порядок «запись → публикация →
-// XACK» сохраняется без правки цикла. Успешно завершённая задача идёт
-// в приборы этапа (T-077): пропускная способность, длительность,
-// финальный статус, ошибки проверок, время ответа, записи rendered=false.
+// processDelivery processes one q:http delivery. The acknowledgment (XACK)
+// is done by Processing after a nil return — as spec 4.2 requires ("the XACK
+// only after writing the result into the DB"): the result write and the
+// q:analyze publication go in Options.OnResult (ContentSaver T-056 → Recorder T-058,
+// the cmd/http-worker build) before the return, and the "write → publication →
+// XACK" order is preserved without editing the loop. A successfully finished task goes
+// into the stage's instruments (T-077): the throughput, the duration,
+// the final status, the check errors, the response time, the rendered=false records.
 func (w *Worker) processDelivery(ctx context.Context, del queue.Delivery, o Options) error {
 	task, err := queue.Decode[queue.HTTPTask](del)
 	if err != nil {
-		// Ядовитая запись: повторная доставка бессмысленна, очередь
-		// исчерпает попытки и унесёт её в q:dead (T-025).
+		// A poison record: a repeated delivery is pointless, the queue
+		// will exhaust the attempts and carry it into q:dead (T-025).
 		return fmt.Errorf("httpworker: запись %s стрима %s: %w", del.ID, del.Stream, err)
 	}
-	// Слот занят до конца обработки (T-163): обе точки входа (диспетчер
-	// Run и клеймы RecoverLoop) идут через здесь — gauge занятости
-	// совпадает с множеством задач, держащих память юнита.
+	// The slot is taken until the end of the processing (T-163): both entry points (the Run
+	// dispatcher and the RecoverLoop claims) go through here — the occupancy
+	// gauge matches the set of tasks holding the unit's memory.
 	w.met.SlotEnter()
 	defer w.met.SlotLeave()
 	start := time.Now()
@@ -1610,39 +1610,39 @@ func (w *Worker) processDelivery(ctx context.Context, del queue.Delivery, o Opti
 	return nil
 }
 
-// --- резолв хостов редиректов «через тот же резолвер» (ТЗ 5.5 п. 2) --------
+// --- the redirect hosts' resolution "through the same resolver" (spec 5.5 item 2) --------
 
-// DNSLookup — адаптер DNS-этапа (dnsclient.Resolver с лимитами T-035) в
-// httpfetch.Resolver: хосты HTTP-редиректов и meta refresh резолвятся тем
-// же резолвером, что и DNS-этап («через тот же резолвер с кэшем», ТЗ 5.5
-// п. 2), а не системным /etc/resolv.conf. Кэш — обёртка
-// httpfetch.NewCachingResolver в сборке сервиса (cmd/http-worker).
+// DNSLookup — the DNS stage's adapter (dnsclient.Resolver with the T-035 limits) into
+// httpfetch.Resolver: the HTTP redirects' and meta refresh hosts are resolved by the
+// same resolver as the DNS stage ("through the same resolver with a cache", spec 5.5
+// item 2), not by the system /etc/resolv.conf. The cache — the
+// httpfetch.NewCachingResolver wrapper in the service build (cmd/http-worker).
 type DNSLookup struct {
 	resolve dnsclient.Resolver
 	ipv6    bool
 }
 
-// NewDNSLookup строит адаптер; ipv6 — dns.ipv6 (ТЗ 5.4: AAAA отключаются
-// конфигом без IPv6 — резолв редирект-хостов ищет только A).
+// NewDNSLookup builds the adapter; ipv6 — dns.ipv6 (spec 5.4: AAAA is disabled
+// by the config without IPv6 — the redirect-host resolution looks only for A).
 func NewDNSLookup(resolve dnsclient.Resolver, ipv6 bool) *DNSLookup {
 	return &DNSLookup{resolve: resolve, ipv6: ipv6}
 }
 
-// LookupNetIP резолвит хост для подключения (httpfetch.Resolver): A, при
-// ipv6 — и AAAA, опрос типов ОДНОВРЕМЕННЫЙ (T-101: резолв хоста
-// редиректа сидит в критическом пути подключения цепочки T-048 —
-// латентность max(A, AAAA), не сумма); IP-литералы (Location вида
-// http://192.0.2.1/) проходят без обмена. CNAME разворачивает сам
-// рекурсор (unbound, ТЗ 5.4) — в ответе на A лежат и записи цели
-// (RFC 1034 §4.3.2, T-037). Отрицание (NXDOMAIN) и пустой ответ —
-// ошибка: подключаться не к чему. Сбой или отказ одного типа не роняет
-// резолв, если другой дал адреса: транзиентный отказ AAAA не должен
-// ломать подключение по рабочему A (NODATA — не здесь: NOERROR без
-// записей просто ничего не добавляет); собранного нет вовсе —
-// возвращается первая по порядку типов ошибка обмена (A раньше AAAA —
-// детерминизм выбора, как при прежнем последовательном опросе).
-// Отмена ctx — общая для обоих обменов: Exchange получает тот же ctx,
-// отменённый резолв возвращается его ошибкой.
+// LookupNetIP resolves the host for connecting (httpfetch.Resolver): A, and
+// AAAA at ipv6, the type polling is CONCURRENT (T-101: the redirect host's
+// resolution sits in the T-048 chain connection's critical path —
+// the max(A, AAAA) latency, not the sum); IP literals (a Location like
+// http://192.0.2.1/) pass without an exchange. CNAME is unrolled by
+// the recursors themselves (unbound, spec 5.4) — the answer to A also contains the target's
+// records (RFC 1034 §4.3.2, T-037). A negation (NXDOMAIN) and an empty answer —
+// an error: there is nothing to connect to. One type's failure or refusal does not drop
+// the resolution if the other gave addresses: a transient AAAA refusal must not
+// break the connection over a working A (NODATA is not here: NOERROR without
+// records simply adds nothing); nothing collected at all —
+// the first type-order exchange error is returned (A before AAAA —
+// the choice's determinism, as at the former sequential polling).
+// A ctx cancellation — common to both exchanges: Exchange gets the same ctx,
+// a cancelled resolution is returned by its error.
 func (d *DNSLookup) LookupNetIP(ctx context.Context, host string) ([]netip.Addr, error) {
 	if ip, err := netip.ParseAddr(host); err == nil {
 		return []netip.Addr{ip}, nil
@@ -1651,15 +1651,15 @@ func (d *DNSLookup) LookupNetIP(ctx context.Context, host string) ([]netip.Addr,
 	if d.ipv6 {
 		types = append(types, dns.TypeAAAA)
 	}
-	// Обмены идут параллельно с общим ctx, но собираются по порядку
-	// types — итог стабилен: адреса A, за ними AAAA, независимо от того,
-	// какой тип ответил раньше (транспорт T-047 видит тот же порядок,
-	// что и при последовательном опросе). Горутины пишут в разные
-	// ячейки answers — гонки нет; WaitGroup, а не errgroup: ошибки
-	// типов не отменяют соседа (семантика HW-07), ошибка — не сигнал.
+	// The exchanges run in parallel with a common ctx, but are collected by the types
+	// order — the outcome is stable: the A addresses, then AAAA, regardless of which
+	// type answered earlier (the T-047 transport sees the same order
+	// as at the sequential polling). The goroutines write into different
+	// answers cells — no race; a WaitGroup, not an errgroup: the types'
+	// errors do not cancel the neighbor (the HW-07 semantics), an error is not a signal.
 	answers := make([]workerDNSAnswer, len(types))
 	if len(types) == 1 {
-		// dns.ipv6=false — один обмен, без горутин: параллелить нечего.
+		// dns.ipv6=false — one exchange, without goroutines: nothing to parallelize.
 		answers[0] = d.lookupType(ctx, host, types[0])
 	} else {
 		var wg sync.WaitGroup
@@ -1674,14 +1674,14 @@ func (d *DNSLookup) LookupNetIP(ctx context.Context, host string) ([]netip.Addr,
 	}
 	var (
 		out      []netip.Addr
-		firstErr error // первая по порядку типов ошибка — итог, если адресов нет
+		firstErr error // the first type-order exchange error — the outcome, if there are no addresses
 	)
 	for i := range answers {
 		if answers[i].err != nil {
 			if firstErr == nil {
 				firstErr = answers[i].err
 			}
-			continue // другой тип ещё может дать адреса
+			continue // the other type may still give addresses
 		}
 		out = append(out, answers[i].addrs...)
 	}
@@ -1694,15 +1694,15 @@ func (d *DNSLookup) LookupNetIP(ctx context.Context, host string) ([]netip.Addr,
 	return out, nil
 }
 
-// workerDNSAnswer — итог одного обмена A/AAAA: адреса этого типа или
-// ошибка (сбой обмена, отказ RCode); пустые адреса без ошибки — NOERROR
-// без записей (NODATA), резолву они ничего не добавляют.
+// workerDNSAnswer — one A/AAAA exchange's outcome: this type's addresses or
+// an error (an exchange failure, an RCode refusal); empty addresses without an error — NOERROR
+// without records (NODATA), they add nothing to the resolution.
 type workerDNSAnswer struct {
 	addrs []netip.Addr
 	err   error
 }
 
-// lookupType — один обмен по типу записи (общий ctx с соседним типом).
+// lookupType — one exchange by the record type (a common ctx with the neighboring type).
 func (d *DNSLookup) lookupType(ctx context.Context, host string, t uint16) workerDNSAnswer {
 	res, err := d.resolve.Exchange(ctx, dnsclient.Question{Name: host, Type: t})
 	switch {

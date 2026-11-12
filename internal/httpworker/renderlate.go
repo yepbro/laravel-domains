@@ -1,64 +1,64 @@
-// Поздний переиздатель рендера (T-259, ТЗ-fsm §3 ФТ-5.3; спецификация
-// автомата рендер-состояния строки — doc-комментарий
-// internal/renderworker/worker.go, этот файл — писатель перехода П4):
-// фоновый проход, переиздающий в q:render «вечно молодые» записи — rendered = false,
-// final_url IS NOT NULL, render_failed_at IS NULL — старше 6 ч, у домена
-// которых нет бита render_pending (ими занимается проход доработки
-// renderq.go) и нет непотреблённых сообщений q:render/q:render-fallback
-// (интерлок — снимок стримов по образцу content/retentionpending.go:
-// XRANGE недоставленного хвоста от last-delivered-id группы, адаптер —
-// cmd/http-worker retentionPending, тот же, что у защиты retention).
+// The late re-publisher of the render (T-259, TZ-fsm spec §3 FR-5.3; the
+// specification of the row's render-state automaton — the doc comment
+// of internal/renderworker/worker.go, this file — the writer of the T4 transition):
+// a background pass re-publishing "forever young" records into q:render — rendered = false,
+// final_url IS NOT NULL, render_failed_at IS NULL — older than 6 h, whose
+// domain has no render_pending bit (the renderq.go rework pass
+// deals with those) and no unconsumed q:render/q:render-fallback messages
+// (the interlock — a snapshot of the streams on the model of content/retentionpending.go:
+// an XRANGE of the undelivered tail from the group's last-delivered-id, the adapter —
+// the cmd/http-worker retentionPending, the same as the retention guard).
 //
-// Что лечит: потерю MAXLEN-усечённых фолбэк-задач (воркер A опубликовал
-// q:render-fallback, T-238; обрезка T-025 удалила запись до доставки —
-// запись без маркера и без сообщений неотличима от «не пробовали») и
-// потерянные публикации q:render (сбой/рестарт Redis между XADD и
-// доставкой). Состояние записи перестаёт зависеть от выживания сообщения
-// в стриме: пока запись не отрендерена и не отмаркирована, переиздатель
-// вернёт ей задачу. Дубли ограничены интервалом и гасятся
-// идемпотентностью потребителя (ТЗ 3.4, как у прохода доработки).
+// What it cures: the loss of MAXLEN-trimmed fallback tasks (worker A published
+// q:render-fallback, T-238; the T-025 trim removed the record before the delivery —
+// a record without a marker and without messages is indistinguishable from "not tried") and
+// the lost q:render publications (a Redis failure/restart between the XADD and
+// the delivery). The record's state stops depending on the message's survival
+// in the stream: while the record is not rendered and not marked, the re-publisher
+// will return its task. The duplicates are bounded by the interval and extinguished
+// by the consumer's idempotency (spec 3.4, as at the rework pass).
 //
-// SPA-вердикт — по сохранённому контенту (DetectSPA T-057, детерминирован
-// над теми же байтами, что HTTP-этап проверял при записи): предикат
-// возраста выбирает СУПЕРМНОЖЕСТВО (не-SPA записи подходят под колонки
-// неограниченно долго — рендер им не нужен, §5.5 п. 8 публикует только
-// SPA), издание без вердикта залило бы q:render перепроверкой всех
-// страниц датасета. Поэтому проход повторяет решение прохода доработки
-// (renderDomainKeys): своё тело — свой вердикт, алиас наследует вердикт
-// субдомена-оригинала (класс эквивалентности T-055), записи без
-// собственного контента и без алиаса не переиздаются вовсе — вердикт
-// взять неоткуда (контент срезан retention T-166 либо не сохранён,
-// T-056), их доработает следующий эпизод перепроверки T-030 (то же
-// осознанное ограничение, что у прохода доработки: старше окна retention
-// контента нет — ходить туда бессмысленно).
+// The SPA verdict — over the stored content (DetectSPA T-057, deterministic
+// over the same bytes the HTTP stage checked at the write): the age
+// predicate selects a SUPERSET (non-SPA records fit the columns
+// indefinitely long — the render is not needed for them, §5.5 item 8 publishes only
+// SPA), an edition without a verdict would flood q:render by the recheck of all
+// the dataset's pages. Therefore the pass repeats the rework pass's decision
+// (renderDomainKeys): its own body — its own verdict, an alias inherits the
+// original subdomain's verdict (the T-055 equivalence class), the records without
+// their own content and without an alias are not re-published at all — there is nowhere
+// to take the verdict from (the content was cut off by retention T-166 or not stored,
+// T-056), the next recheck episode T-030 will rework them (the same
+// deliberate limitation as at the rework pass: older than the retention window
+// there is no content — walking there is pointless).
 //
-// Курсорная пагинация по PK (стиль reanalyzeSelectSQL T-074/T-193:
-// row-value > по ключу строки + ORDER BY PK + LIMIT): проход обязан
-// ГАРАНТИРОВАННО продвигаться по всему множеству кандидатов — без
-// курсора LIMIT без сортировки (стиль T-181) возвращал бы первую пачку
-// кучи вечно (не-SPA кандидаты не покидают множество — проход не
-// дошёл бы до потерянных записей за ними). Курсор живёт в цикле
-// (RenderLateCursor), за пачкой обработанных — включая исключённых
-// интерлоком/вердиктом (их держатели/эпизоды решат сами, полный цикл
-// вернётся), короткая пачка замыкает цикл на начало. Полный цикл по
-// таблице (~40 млн строк) при пачке 1000/мин — порядка месяца,
-// быстрее естественной перепроверки доменов (scheduler.recheck_interval,
-// дефолт ~6 мес): потерянная задача восстанавливается задолго до
-// перезаписи эпизода; ход по строкам без контента (старее retention) —
-// дешёвый index-скан без чтения паков.
+// The cursor pagination over the PK (the reanalyzeSelectSQL T-074/T-193 style:
+// a row-value > over the row's key + ORDER BY PK + LIMIT): the pass must
+// GUARANTEED advance over the whole candidate set — without
+// the cursor a LIMIT without sorting (the T-181 style) would return the first chunk
+// of the heap forever (the non-SPA candidates do not leave the set — the pass
+// would not reach the lost records behind them). The cursor lives in the
+// loop (RenderLateCursor); per the chunk of the processed ones — including the ones excluded
+// by the interlock/verdict (their holders/episodes will decide themselves, the full
+// cycle will come back), a short chunk closes the cycle to the start. A full cycle over
+// the table (~40M rows) at a chunk of 1000/min — about a month,
+// faster than the domains' natural recheck (scheduler.recheck_interval,
+// the default ~6 months): a lost task is restored long before
+// the episode's rewrite; the walk over the rows without content (older than retention) —
+// a cheap index scan without reading the packs.
 //
-// Курсор не двигается за пачку, которую не удалось отработать целиком
-// (полная очередь — Full, ошибка публикации/снимка): следующий тик
-// повторит пачку; уже опубликованная часть повторится дублем —
-// ограничено пачкой, гасится идемпотентностью потребителя (ТЗ 3.4).
-// Ошибка чтения снимка стримов — консервативный пропуск прохода, как у
-// защиты retention: переиздавать «наугад» дороже, чем отложить на тик
-// (дубль живой задачи — именно то, что интерлок обязан исключать).
+// The cursor does not move over a chunk that failed to be processed entirely
+// (a full queue — Full, a publication/snapshot error): the next tick
+// will repeat the chunk; the already published part will repeat as a duplicate —
+// bounded by the chunk, extinguished by the consumer's idempotency (spec 3.4).
+// A stream snapshot read error — a conservative pass skip, as at the
+// retention guard: re-publishing "at random" is dearer than postponing to a tick
+// (a live task's duplicate is exactly what the interlock must exclude).
 //
-// Наблюдаемость: счётчик crawler_render_late_republish_total
-// (httpworker.Metrics.LateRepublished) — стационарно не растёт; рост
-// после инцидента (обрезка/потеря Redis) — переиздатель дренирует
-// потерянное, спад до нуля — дренаж завершён.
+// Observability: the crawler_render_late_republish_total counter
+// (httpworker.Metrics.LateRepublished) — does not grow in the steady state; growth
+// after an incident (a trim/a Redis loss) — the re-publisher drains
+// the losses, a fall to zero — the drainage is complete.
 package httpworker
 
 import (
@@ -75,106 +75,106 @@ import (
 	"crawler/internal/queue"
 )
 
-// Дефолты прохода (стиль T-066 renderq.go: константы, отдельной опции
-// конфига нет — ТЗ 5.10 состав фиксирован; рабочие значения цикл
-// получает опциями для тестов).
+// The pass's defaults (the T-066 renderq.go style: constants, no separate
+// config option — spec 5.10, the composition is fixed; the working values the
+// loop receives as options for the tests).
 const (
-	// DefaultRenderLateInterval — период тика цикла: минута, как
-	// DefaultRenderRequeueInterval. Проход — страховка потери (не штатный
-	// путь публикаций), чаще незачем: окно «старше 6 ч» переживает
-	// минутный тик с запасом; при полной очереди проход стоит одно чтение
-	// глубины.
+	// DefaultRenderLateInterval — the loop's tick period: a minute, like
+	// DefaultRenderRequeueInterval. The pass — a guard against loss (not the
+	// graceful publication path), more often is pointless: the "older than 6 h" window survives
+	// a minute tick with headroom; with a full queue the pass pays one depth
+	// read.
 	DefaultRenderLateInterval = time.Minute
 
-	// DefaultRenderLateBatch — строк в одной пачке. Курсор обязан пройти
-	// всё множество кандидатов (супермножество — почти вся таблица)
-	// быстрее естественного перепроверочного цикла доменов (дефолт
-	// ~6 мес): 1000/мин ≈ 1,4 млн строк/сутки. Вердикт читает тело из
-	// паков — только у строк с контентом (внутри окна retention; в
-	// среднем десятки КиБ — умеренный фоновый I/O рядом с
-	// retention-пачками того же сервиса); строки без контента фильтруются
-	// без чтения.
+	// DefaultRenderLateBatch — the rows in one chunk. The cursor must pass
+	// the whole candidate set (a superset — almost the whole table)
+	// faster than the domains' natural recheck cycle (the default
+	// ~6 months): 1000/min ≈ 1.4M rows/day. The verdict reads the body from
+	// the packs — only for the rows with content (inside the retention window; on
+	// average tens of KiB — a moderate background I/O next to the
+	// retention chunks of the same service); the rows without content are filtered
+	// without a read.
 	DefaultRenderLateBatch = 1000
 
-	// DefaultRenderLateAfter — возраст «вечно молодой» записи (ТЗ-fsm
-	// ФТ-5.3, дефолт 6 ч): моложе — задачу могли ещё не доставить
-	// (нормальный лаг очереди при глубине до порога T-174 ≈ 2 ч буфера),
-	// переиздание раньше срока плодило бы дубли живых задач. 6 ч — за
-	// пределами любых штатных окон доставки (ретраи PEL — минуты,
-	// T-025), до перезаписи эпизода перепроверкой (T-030,
-	// scheduler.recheck_interval) — месяцы запаса на полный курсорный
-	// цикл прохода.
+	// DefaultRenderLateAfter — the age of a "forever young" record (TZ-fsm
+	// spec FR-5.3, the default 6 h): younger — the task may have not been delivered yet
+	// (a normal queue lag at a depth up to the T-174 threshold ≈ 2 h of buffer),
+	// an early re-edition would breed duplicates of live tasks. 6 h — beyond
+	// any normal delivery windows (the PEL retries — minutes,
+	// T-025), before the episode's rewrite by the recheck (T-030,
+	// scheduler.recheck_interval) — months of headroom for the full cursor
+	// cycle of the pass.
 	DefaultRenderLateAfter = 6 * time.Hour
 
-	// DefaultRenderLateSelectTimeout — потолок одной выборки пачки
-	// (T-271): серверный statement_timeout в tx-оболочке выборки и
-	// клиентский ctx-дедлайн. 300 с (T-273, было 60): catch-up с нулевого
-	// курсора на прод-объёме (domains 43 млн) при любой форме плана
-	// дороже секунд, а дедлайн обязан давать проходу шанс завершиться
-	// и сдвинуть курсор — таймаут меньше реальной стоимости выборки
-	// превращает медленный дренаж в вечную петлю обречённых повторов
-	// (регрессия T-271, инцидент 09–10.11.2026: 60 с < cost закреплённой
-	// формы ≈157 млн — ни одного успешного прохода за 21 ч). Штатные
-	// пачки (курсор в середине таблицы) — секунды. Превышение — ошибка
-	// прохода, backoff и повтор пачки с того же курсора (публикация не
-	// состоялась — дубля нет, ТЗ 3.4). Рабочее значение передаёт
-	// конфигурация (render.late_select_timeout, T-274) — ручка на случай
-	// недооценки, дефолт остаётся этим.
+	// DefaultRenderLateSelectTimeout — the cap of one chunk selection
+	// (T-271): the server-side statement_timeout in the selection's tx shell and
+	// the client ctx deadline. 300 s (T-273, formerly 60): a catch-up from the zero
+	// cursor at the production volume (domains 43M) at any plan shape
+	// costs more than seconds, and the deadline must give the pass a chance to complete
+	// and move the cursor — a timeout smaller than the selection's real cost
+	// turns a slow drainage into an eternal loop of doomed retries
+	// (the T-271 regression, the Nov 9–10, 2026 incident: 60 s < the cost of the pinned
+	// shape ≈157M — not a single successful pass over 21 h). The normal
+	// chunks (the cursor mid-table) — seconds. An overrun — a pass
+	// error, a backoff and a chunk repeat from the same cursor (the publication
+	// did not happen — no duplicate, spec 3.4). The working value is passed by
+	// the configuration (render.late_select_timeout, T-274) — a knob for the case
+	// of underestimation, the default stays this one.
 	DefaultRenderLateSelectTimeout = 300 * time.Second
 
-	// DefaultRenderLateErrorBackoff — пауза тикера цикла после
-	// ошибочного прохода (T-271): тик, сработавший за время долгого
-	// ошибочного прохода, не перезапускает проход немедленно (рантайм
-	// хранит один недоставленный тик и отдаёт его по возврате цикла в
-	// select; инцидент 08–09.11.2026 — проход в только что поднятый
-	// после OOM-килла PostgreSQL); курсор на месте (пачка не отработана
-	// целиком), минутный темп возвращает первый успешный проход.
-	// 15 минут — на порядок дольше подъёма PG, для страховки потерь
-	// (окно 6 ч, полный цикл — месяц) незаметна.
+	// DefaultRenderLateErrorBackoff — the loop's ticker pause after
+	// an erroneous pass (T-271): a tick that fired during a long
+	// erroneous pass does not restart the pass immediately (the runtime
+	// keeps one undelivered tick and hands it over upon the loop's return to
+	// the select; the Nov 8–9, 2026 incident — a pass into a PostgreSQL just
+	// raised after an OOM kill); the cursor in place (the chunk not processed
+	// entirely), a minute rate returns the first successful pass.
+	// 15 minutes — an order of magnitude longer than the PG startup; for the loss
+	// guard (the 6 h window, the full cycle — a month) it is imperceptible.
 	DefaultRenderLateErrorBackoff = 15 * time.Minute
 )
 
-// SQL прохода. Коды схемы — литералами (стиль T-039/renderq.go); бит
-// render_pending — model.FlagRenderPending (бит 1), deleted —
+// The pass's SQL. The schema codes — as literals (the T-039/renderq.go style); the
+// render_pending bit — model.FlagRenderPending (bit 1), deleted —
 // model.StatusDeleted.
 var (
-	// lateRenderRowsSQL — пачка кандидатов после курсора (PK-курсор
-	// T-074/T-193): не отрендерено, есть цель рендера, нет маркера
-	// «рендер невозможен» (T-210 — финализации закрыли запись до смены
-	// контента), возраст за окном DefaultRenderLateAfter (checked_at —
-	// час эпизода, T-058; границу считает Go-часами — расхождение часов
-	// приложения и БД на фоне окна 6 ч несущественно, стиль якоря
-	// T-193 §4.2), домен без бита render_pending (долгом занимается
-	// проход доработки renderq.go — дубль изданий запрещён делением
-	// владения) и не deleted (§13.1 — вне цикла проверок). JOIN zones —
-	// имя для Result.Name (стиль T-027). Курсор row-value > по PK
-	// отсекает пройденное, ORDER BY по тому же ключу — детерминированные
-	// пачки и корректная пагинация; ведущие колонки PK — партиции
-	// LIST/HASH (T-005) режут поиск до листа.
+	// lateRenderRowsSQL — the chunk of candidates after the cursor (the PK cursor
+	// T-074/T-193): not rendered, there is a render target, no
+	// "render impossible" marker (T-210 — the finalizations closed the record before the content
+	// change), the age beyond the DefaultRenderLateAfter window (checked_at —
+	// the episode's hour, T-058; the boundary is computed by the Go clock — the
+	// clock divergence of the application and the DB against the 6 h window is insignificant, the
+	// T-193 §4.2 anchor style), the domain without the render_pending bit (the debt is the
+	// renderq.go rework pass's business — a duplicate of editions is forbidden by the
+	// ownership division) and not deleted (§13.1 — outside the check cycle). The JOIN zones —
+	// the name for Result.Name (the T-027 style). The cursor's row-value > over the PK
+	// cuts off the passed part, the ORDER BY over the same key — deterministic
+	// chunks and a correct pagination; the leading PK columns — the LIST/HASH
+	// partitions (T-005) cut the search down to a leaf.
 	//
-	// Форма плана НЕ закрепляется — сознательно, T-273 (возврат к
-	// решению T-251). Закрепление T-271 (SET LOCAL seq/hash/merge/bitmap
-	// off) оставляло планировщику только Nested Loop, и на прод-объёме
-	// он разворачивал join от domains (43,4 млн строк, cost ≈157 млн) —
-	// всегда за 60-с дедлайн, вечная петля обречённых выборок
-	// (инцидент 09–10.11.2026, расследование T-273). Непиненная форма
-	// работала в проде неделями до T-271 и адаптивна по замерам testbed
-	// (PG 16.15, 2 млн domains / 550 тыс. subdomain_results): нулевой
-	// курсор — Nested Loop от domains с ранним остановом Limit
-	// (19 мс), середина таблицы — Merge Join от subdomain_results по
-	// PK (42 мс), давление domains≫записей — r-driven Merge Join с
-	// хвостом domains (260 мс). Вариант «SET LOCAL join_collapse_limit
-	// = 1» отвергнут замером: GUC держит пары join в порядке FROM, но
-	// не запрещает разворот outer/inner ВНУТРИ пары — план всё равно
-	// разворачивается от domains. Возврат OOM-цикла не ожидается:
-	// рабочие структуры узлов зажаты work_mem 16 МБ (docs/db.md),
-	// совпадение тяжёлых сканов исключает общий гейт, каждая выборка
-	// — под statement_timeout. Потолок statement_timeout остаётся
-	// (tx-оболочка lateSelect), структурная фиксация формы — частичный
-	// индекс + персистентный курсор (follow-up, вариант C исследования).
-	// content_hash и
-	// alias_subdomain_id — вердикт (DetectSPA T-057 / наследование
-	// T-055); hash NULL — тела нет, alias NULL — наследовать не у кого.
+	// The plan shape is NOT pinned — deliberately, T-273 (a return to
+	// the T-251 decision). The T-271 pinning (SET LOCAL seq/hash/merge/bitmap
+	// off) left the planner only the Nested Loop, and at the production volume
+	// it unrolled the join from domains (43.4M rows, a cost ≈157M) —
+	// always over the 60 s deadline, the eternal loop of doomed selections
+	// (the Nov 9–10, 2026 incident, the T-273 investigation). The unpinned shape
+	// worked in production for weeks before T-271 and is adaptive by the testbed
+	// measurements (PG 16.15, 2M domains / 550k subdomain_results): a zero
+	// cursor — a Nested Loop from domains with an early Limit stop
+	// (19 ms), the table's middle — a Merge Join from subdomain_results over the
+	// PK (42 ms), the domains≫records pressure — an r-driven Merge Join with
+	// the domains tail (260 ms). The "SET LOCAL join_collapse_limit
+	// = 1" variant was rejected by the measurement: the GUC keeps the join pairs in the FROM order, but
+	// does not forbid unrolling the outer/inner INSIDE the pair — the plan
+	// unrolls from domains anyway. An OOM cycle's return is not expected:
+	// the nodes' working structures are clamped by work_mem 16 MB (docs/db.md),
+	// the heavy scans' coincidence excludes a common gate, every selection
+	// is under a statement_timeout. The statement_timeout cap stays
+	// (the lateSelect tx shell), the structural fix of the shape — a partial
+	// index + a persistent cursor (a follow-up, the research's variant C).
+	// content_hash and
+	// alias_subdomain_id — the verdict (DetectSPA T-057 / the inheritance
+	// T-055); a hash NULL — no body, an alias NULL — nobody to inherit from.
 	lateRenderRowsSQL = "SELECT r.zone_id, r.domain_id, r.subdomain_id, r.variant, " +
 		"r.content_hash, r.alias_subdomain_id, d.label || '.' || z.name " +
 		"FROM subdomain_results AS r " +
@@ -188,30 +188,30 @@ var (
 		"ORDER BY r.zone_id, r.domain_id, r.subdomain_id, r.variant " +
 		"LIMIT $6"
 
-	// lateSelectTimeoutFmt — серверный потолок выборки той же
-	// tx-оболочкой (T-271): формат '<N>ms' валиден парсеру GUC-времени
-	// при любой длительности (стиль db.lockTimeoutSQLFmt). Значение —
-	// LateOptions.SelectTimeout, текст закрепляется юнит-тестом
-	// (renderlate_test.go). Оболочка из одного SET LOCAL — закрепления
-	// плана сняты (T-273), остался потолок: сервер режет сам оператор,
-	// клиентский ctx-дедлайн — оболочку целиком.
+	// lateSelectTimeoutFmt — the server-side selection cap by the same
+	// tx shell (T-271): the '<N>ms' format is valid for the GUC time parser
+	// at any duration (the db.lockTimeoutSQLFmt style). The value —
+	// LateOptions.SelectTimeout, the text is pinned by a unit test
+	// (renderlate_test.go). A shell of one SET LOCAL — the plan
+	// pinnings are removed (T-273), the cap remains: the server cuts the operator itself,
+	// the client ctx deadline — the shell entirely.
 	lateSelectTimeoutFmt = "SET LOCAL statement_timeout = '%dms'"
 
-	// lateRenderAliasSQL — строки субдоменов-оригиналов для наследования
-	// вердикта алиасами пачки (T-055): кандидаты (не отрендерено, есть
-	// цель, нет маркера — те же охранные предикаты, что у
-	// renderPendingRowsSQL прохода доработки, вердикт по телу) ПЛЮС
-	// отрендеренные оригиналы: сам факт rendered = true доказывает
-	// SPA-вердикт класса (публикации q:render идут только по SPA —
-	// renderSPAResults/renderDomainKeys/наш вердикт), контент такого
-	// оригинала — уже DOM и DetectSPA по нему неверен; ревью T-259 P2-1:
-	// без отрендеренных оригиналов алиас с потерянным сообщением (ровно
-	// класс «потерянная фолбэк-задача», publishFallback публикует по
-	// строке) не восстанавливался вовсе. Отмаркированный оригинал
-	// (rendered = false + маркер) вердикта не даёт — отмаркированные
-	// записи не переиздаются (семантика T-210, как у прохода доработки).
-	// subdomain_id = ANY — пачка алиасов одной команды в один запрос;
-	// ORDER BY — детерминизм.
+	// lateRenderAliasSQL — the original subdomains' rows for the verdict
+	// inheritance by the chunk's aliases (T-055): the candidates (not rendered, there is
+	// a target, no marker — the same guard predicates as at the
+	// rework pass's renderPendingRowsSQL, the verdict over the body) PLUS
+	// the rendered originals: the very fact of rendered = true proves
+	// the class's SPA verdict (the q:render publications go only over SPA —
+	// renderSPAResults/renderDomainKeys/our verdict), such an original's
+	// content is already a DOM and DetectSPA over it is wrong; the T-259 P2-1 review:
+	// without the rendered originals an alias with a lost message (exactly
+	// the "lost fallback task" class, publishFallback publishes over the
+	// row) was not restored at all. A marked original
+	// (rendered = false + the marker) gives no verdict — the marked
+	// records are not re-published (the T-210 semantics, as at the rework pass).
+	// subdomain_id = ANY — the chunk of one command's aliases in one query;
+	// the ORDER BY — determinism.
 	lateRenderAliasSQL = "SELECT subdomain_id, variant, content_hash, rendered FROM subdomain_results " +
 		"WHERE zone_id = $1::int2 AND domain_id = $2::int8 " +
 		"AND subdomain_id = ANY($3::int2[]) " +
@@ -219,23 +219,23 @@ var (
 		"ORDER BY subdomain_id, variant"
 )
 
-// lateRenderStreams — стримы интерлока: непотреблённые сообщения любого
-// из них означают живую задачу записи (q:render — основной путь и
-// переиздания, q:render-fallback — «ждёт фолбэка», T-238) — запись не
-// переиздаётся. Имена — константы пакета очередей (единственный
-// источник, как retentionPendingStreams в content).
+// lateRenderStreams — the interlock's streams: unconsumed messages of any
+// of them mean a live record task (q:render — the main path and
+// the re-editions, q:render-fallback — "waiting for the fallback", T-238) — the record is
+// not re-published. The names — the queue package's constants (the single
+// source, like retentionPendingStreams in content).
 var lateRenderStreams = []string{queue.StreamRender, queue.StreamRenderFallback}
 
-// RenderLateCursor — курсор прохода по PK: последняя посещённая строка,
-// переживающая проходы цикла (образец ReanalyzeCursor T-193). Нулевое
-// значение — «с начала таблицы» (zone_id ≥ 1 больше нулевого ключа).
-// Поля не экспортированы: курсор двигает только LateOnce, владелец —
-// цикл RenderLateLoop; внешние вызовы держат значение целиком.
+// RenderLateCursor — the pass's cursor over the PK: the last visited row,
+// surviving the loop's passes (the ReanalyzeCursor T-193 model). The zero
+// value — "from the table's start" (zone_id ≥ 1 is greater than the zero key).
+// The fields are not exported: only LateOnce moves the cursor, the owner —
+// the RenderLateLoop loop; external calls keep the value entirely.
 type RenderLateCursor struct {
 	key lateKey
 }
 
-// lateKey — ключ строки subdomain_results (PK, ТЗ 6.1) и курсор.
+// lateKey — the key of a subdomain_results row (the PK, spec 6.1) and the cursor.
 type lateKey struct {
 	zone    int16
 	domain  int64
@@ -243,8 +243,8 @@ type lateKey struct {
 	variant model.Variant
 }
 
-// lateRow — строка пачки: ключ, тело для вердикта (nil — контента нет),
-// алиас (не nil — вердикт наследуется от оригинала), имя для сообщения.
+// lateRow — a chunk's row: the key, the body for the verdict (nil — no content),
+// the alias (not nil — the verdict is inherited from the original), the name for the message.
 type lateRow struct {
 	key      lateKey
 	hash     []byte
@@ -252,34 +252,34 @@ type lateRow struct {
 	name     string
 }
 
-// LateOptions — параметры позднего переиздателя; нулевые значения
-// заменяются дефолтами (withDefaults, стиль RequeueOptions T-066).
+// LateOptions — the late re-publisher's parameters; the zero values
+// are replaced by the defaults (withDefaults, the RequeueOptions T-066 style).
 type LateOptions struct {
-	// Interval — период цикла RenderLateLoop (DefaultRenderLateInterval);
-	// на разовый LateOnce не влияет.
+	// Interval — the RenderLateLoop loop's period (DefaultRenderLateInterval);
+	// does not affect a one-shot LateOnce.
 	Interval time.Duration
-	// BatchSize — максимум строк в одной пачке
+	// BatchSize — the maximum of rows in one chunk
 	// (DefaultRenderLateBatch).
 	BatchSize int
-	// After — возраст «вечно молодой» записи (DefaultRenderLateAfter).
+	// After — the age of a "forever young" record (DefaultRenderLateAfter).
 	After time.Duration
-	// SelectTimeout — потолок одной выборки пачки
-	// (DefaultRenderLateSelectTimeout, T-271): серверный
-	// statement_timeout tx-оболочки закрепления плана и клиентский
-	// ctx-дедлайн; превышение — ошибка прохода, пачка повторится с того
-	// же курсора.
+	// SelectTimeout — the cap of one chunk selection
+	// (DefaultRenderLateSelectTimeout, T-271): the server-side
+	// statement_timeout of the plan pinning's tx shell and the client
+	// ctx deadline; an overrun — a pass error, the chunk will repeat from the
+	// same cursor.
 	SelectTimeout time.Duration
-	// ErrorBackoff — пауза тикера после ошибочного прохода
-	// (DefaultRenderLateErrorBackoff, T-271): тик, сработавший за время
-	// долгого прохода, не перезапускает его немедленно (инцидент
-	// 08–09.11.2026).
+	// ErrorBackoff — the ticker's pause after an erroneous pass
+	// (DefaultRenderLateErrorBackoff, T-271): a tick that fired during a
+	// long pass does not restart it immediately (the
+	// Nov 8–9, 2026 incident).
 	ErrorBackoff time.Duration
-	// Gate — семафор единственности тяжёлых фоновых сканов http-worker
-	// (db.ScanGate, T-271): выборка позднего переиздателя и retention не
-	// совпадают в PostgreSQL; nil — без сериализации (изолированные
-	// сборки, юнит-тесты).
+	// Gate — the http-worker heavy background scans' uniqueness semaphore
+	// (db.ScanGate, T-271): the late re-publisher's selection and retention do
+	// not coincide in PostgreSQL; nil — without serialization (isolated
+	// builds, unit tests).
 	Gate db.ScanGate
-	// Log — логгер цикла и Warn-ы прохода; nil — записи подавлены
+	// Log — the loop's logger and the pass's Warns; nil — the records are suppressed
 	// (slog.DiscardHandler).
 	Log *slog.Logger
 }
@@ -303,44 +303,44 @@ func (o LateOptions) withDefaults() LateOptions {
 	return o
 }
 
-// LateResult — итог одного прохода LateOnce.
+// LateResult — the outcome of one LateOnce pass.
 type LateResult struct {
-	// Selected — строк выбрано пачкой (после курсора, под предикаты).
+	// Selected — the rows selected by the chunk (after the cursor, under the predicates).
 	Selected int
-	// Skipped — исключено без издания: живая задача (интерлок снимка
-	// стримов), не-SPA-вердикт, нет источника вердикта (контент срезан/
-	// не сохранён, алиас без оригинала-кандидата), нечитаемый блок.
-	// Курсор проходит мимо: их держатели и следующий цикл решат сами.
+	// Skipped — excluded without an edition: a live task (the stream
+	// snapshot's interlock), a non-SPA verdict, no verdict source (the content cut off/
+	// not stored, an alias without an original candidate), an unreadable block.
+	// The cursor passes them by: their holders and the next cycle will decide.
 	Skipped int
-	// Published — переиздано сообщений q:render (метрика
-	// crawler_render_late_republish_total растёт на это число). Счёт —
-	// пачки, подтверждённой целиком: сбой Publish посреди пачки оставляет
-	// опубликованный префикс в стриме неучтённым (дубль ограничен пачкой,
-	// гасится идемпотентностью, ТЗ 3.4; следующий тик опубликует пачку
-	// снова — тогда счёт честный).
+	// Published — the q:render messages re-published (the
+	// crawler_render_late_republish_total metric grows by this number). The count —
+	// of a chunk confirmed entirely: a Publish failure mid-chunk leaves
+	// the published prefix in the stream unaccounted (the duplicate is bounded by the chunk,
+	// extinguished by the idempotency, spec 3.4; the next tick will publish the chunk
+	// again — then the count is honest).
 	Published int
-	// Full — q:render у порога: проход остановлен ДО публикации, курсор
-	// не двигался — следующий тик повторит пачку.
+	// Full — q:render is at the threshold: the pass stopped BEFORE the publication, the
+	// cursor did not move — the next tick will repeat the chunk.
 	Full bool
-	// Wrapped — пачка короче лимита: множество за курсором исчерпано,
-	// курсор замкнут на начало таблицы (следующий проход — с нуля).
+	// Wrapped — the chunk is shorter than the limit: the set behind the cursor is exhausted,
+	// the cursor is closed to the table's start (the next pass — from zero).
 	Wrapped bool
 }
 
-// LateOnce — один проход позднего переиздателя: пачка кандидатов после
-// курсора (предикат lateRenderRowsSQL) → интерлок снимком непотреблённых
-// q:render/q:render-fallback (живая задача — не трогаем) → SPA-вердикт
-// по сохранённому контенту (своё тело / наследование алиаса) →
-// переиздание q:render при свободной очереди. Курсор двигается за пачку,
-// отработанную целиком (изданное + исключённое); короткая пачка замыкает
-// цикл. cursor nil — разовый вызов с нулевого ключа без сохранения.
+// LateOnce — one late re-publisher pass: a chunk of candidates after
+// the cursor (the lateRenderRowsSQL predicate) → the interlock by the snapshot of the unconsumed
+// q:render/q:render-fallback (a live task — do not touch) → the SPA verdict
+// over the stored content (its own body / the alias inheritance) →
+// the q:render re-edition with a free queue. The cursor moves over the chunk
+// processed entirely (the published + the excluded); a short chunk closes
+// the cycle. cursor nil — a one-shot call from the zero key without saving.
 //
-// Порядок «снимок → издание» держит окно гонки минимальным: публикация
-// после снимка (живая задача появилась между ними) даёт дубль —
-// ограничено пачкой, гасится идемпотентностью потребителя (ТЗ 3.4);
-// сообщение, доставленное группе ДО снимка, снимком не видно (хвост
-// читается от last-delivered-id, образец retention) — такая задача в
-// PEL воркера и вернётся клеймом/дублем в пределах минут (T-025).
+// The "snapshot → edition" order keeps the race window minimal: a publication
+// after the snapshot (a live task appeared between them) gives a duplicate —
+// bounded by the chunk, extinguished by the consumer's idempotency (spec 3.4);
+// a message delivered to the group BEFORE the snapshot is not seen by the snapshot (the
+// tail is read from the last-delivered-id, the retention model) — such a task is in
+// the worker's PEL and will return by a claim/duplicate within minutes (T-025).
 func LateOnce(ctx context.Context, pool RecordDB, contents RenderContent, render *RenderQueue,
 	pending content.RetentionPending, met *Metrics, opts LateOptions, cursor *RenderLateCursor) (LateResult, error) {
 	if pool == nil {
@@ -356,7 +356,7 @@ func LateOnce(ctx context.Context, pool RecordDB, contents RenderContent, render
 		return LateResult{}, errors.New("httpworker: поздний переиздатель: источник непотреблённых ключей стримов не задан (интерлок обязателен, образец retentionpending.go)")
 	}
 	if cursor == nil {
-		cursor = &RenderLateCursor{} // разовый вызов: курсор без сохранения
+		cursor = &RenderLateCursor{} // a one-shot call: the cursor without saving
 	}
 	o := opts.withDefaults()
 	if o.Log == nil {
@@ -364,9 +364,9 @@ func LateOnce(ctx context.Context, pool RecordDB, contents RenderContent, render
 	}
 	out := LateResult{}
 
-	// Полная очередь — БД не читается (одно чтение глубины): переиздание
-	// в полный стрим — усиление переполнения (записи рисковали бы
-	// MAXLEN-обрезкой снова); сигнал «стало свободно» — следующий тик.
+	// A full queue — the DB is not read (one depth read): a re-edition
+	// into a full stream — an overflow amplifier (the records would risk
+	// a MAXLEN trim again); the "it freed up" signal — the next tick.
 	free, err := render.HasCapacity(ctx)
 	if err != nil {
 		return out, fmt.Errorf("httpworker: поздний переиздатель: ёмкость q:render: %w", err)
@@ -380,18 +380,18 @@ func LateOnce(ctx context.Context, pool RecordDB, contents RenderContent, render
 		return out, err
 	}
 	if len(rows) == 0 {
-		// За курсором кандидатов нет — цикл замкнут: следующая пачка
-		// начнёт таблицу заново (за тик могли появиться новые потери
-		// позади курсора — им не ждать полного цикла).
+		// There are no candidates behind the cursor — the cycle is closed: the next chunk
+		// will start the table anew (new losses could appear behind the cursor
+		// during the tick — they do not wait for the full cycle).
 		cursor.key = lateKey{}
 		return LateResult{Wrapped: true}, nil
 	}
 	out.Selected = len(rows)
 
-	// Интерлок: снимок непотреблённых ключей защищаемых стримов — ОДИН
-	// на пачку (стиль retentionPendingSnapshot). Ошибка любого стрима —
-	// ошибка прохода целиком: частичная защита хуже пропуска (живая
-	// задача q:render-fallback без снимка была бы переиздана дублем).
+	// The interlock: a snapshot of the guarded streams' unconsumed keys — ONE
+	// per chunk (the retentionPendingSnapshot style). Any stream's error —
+	// the whole pass's error: a partial guard is worse than a skip (a live
+	// q:render-fallback task without a snapshot would be re-published as a duplicate).
 	keys := make(map[content.RetentionPendingKey]struct{})
 	for _, s := range lateRenderStreams {
 		ks, err := pending.PendingKeys(ctx, s)
@@ -404,23 +404,23 @@ func LateOnce(ctx context.Context, pool RecordDB, contents RenderContent, render
 	}
 
 	publish := make([]queue.Result, 0, len(rows))
-	// Кэш вердиктов по хэшу контента: записи класса эквивалентности
-	// T-055 делят тело — тело читается и вердиктится один раз на пачку.
+	// The verdicts' cache by the content hash: the T-055 equivalence
+	// class's records share the body — the body is read and verdicted once per chunk.
 	verdict := make(map[content.Hash]bool)
-	// Алиасы пачки — вердикт от оригиналов одним запросом на домен
-	// (lateRenderAliasSQL принимает пачку субдоменов ANY).
+	// The chunk's aliases — the verdict from the originals by one query per domain
+	// (lateRenderAliasSQL takes an ANY chunk of subdomains).
 	type aliasRef struct {
 		row  lateRow
 		orig int16
 	}
-	origSubs := make(map[lateKey][]int16) // key (zone, domain) → субдомены-оригиналы
+	origSubs := make(map[lateKey][]int16) // key (zone, domain) → the original subdomains
 	var aliases []aliasRef
 	for i := range rows {
 		r := &rows[i]
 		live := content.RetentionPendingKey{Zone: r.key.zone, Domain: r.key.domain, Sub: r.key.sub, Variant: int16(r.key.variant)}
 		if _, ok := keys[live]; ok {
-			// Живая задача: сообщение ждёт потребителя — запись не
-			// трогаем (критерий приёмки ФТ-5.3).
+			// A live task: the message waits for the consumer — the record is not
+			// touched (the FR-5.3 acceptance criterion).
 			out.Skipped++
 			continue
 		}
@@ -432,8 +432,8 @@ func LateOnce(ctx context.Context, pool RecordDB, contents RenderContent, render
 			continue
 		}
 		if len(r.hash) != content.HashLen {
-			// Контента нет (T-056 либо срезан retention T-166) — вердикт
-			// взять неоткуда; ограничение прохода доработки, шапка файла.
+			// No content (T-056 or cut off by retention T-166) — there is nowhere
+			// to take the verdict from; the rework pass's limitation, the file header.
 			out.Skipped++
 			continue
 		}
@@ -444,15 +444,15 @@ func LateOnce(ctx context.Context, pool RecordDB, contents RenderContent, render
 			return out, err
 		}
 		if !spa {
-			out.Skipped++ // не-SPA: рендер не требуется (§5.5 п. 8)
+			out.Skipped++ // non-SPA: the render is not required (§5.5 item 8)
 			continue
 		}
 		publish = append(publish, lateResult(*r))
 	}
 
-	// Вердикты оригиналов алиасов пачки: один запрос на домен, тела —
-	// через тот же кэш (оригинал и алиас делят класс T-055 — но контент
-	// у алиаса NULL, читается тело оригинала).
+	// The chunk aliases' originals' verdicts: one query per domain, the bodies —
+	// through the same cache (the original and the alias share the T-055 class — but the
+	// alias's content is NULL, the original's body is read).
 	origSPA := make(map[lateKey]bool) // (zone, domain, orig sub) → SPA
 	for dom, subs := range origSubs {
 		spa, err := lateOriginsSPA(ctx, pool, contents, verdict, dom, subs, o.Log)
@@ -468,14 +468,14 @@ func LateOnce(ctx context.Context, pool RecordDB, contents RenderContent, render
 			publish = append(publish, lateResult(a.row))
 			continue
 		}
-		out.Skipped++ // оригинал не кандидат/не SPA/не читается —
-		// наследовать нечего: следующий цикл/эпизод решат
+		out.Skipped++ // the original is not a candidate/not SPA/unreadable —
+		// nothing to inherit: the next cycle/episode will decide
 	}
 
 	if len(publish) > 0 {
-		// Ёмкость перед самой публикацией: снимок и вердикты пачки шли
-		// минуты — очередь могла наполниться (проход доработки
-		// проверяет так же перед каждым доменом).
+		// The capacity right before the publication: the snapshot and the chunk's
+		// verdicts took minutes — the queue could have filled (the rework
+		// pass checks the same way before every domain).
 		free, err := render.HasCapacity(ctx)
 		if err != nil {
 			return out, fmt.Errorf("httpworker: поздний переиздатель: ёмкость q:render: %w", err)
@@ -491,19 +491,19 @@ func LateOnce(ctx context.Context, pool RecordDB, contents RenderContent, render
 		met.LateRepublished(out.Published)
 	}
 
-	// Пачка отработана целиком — курсор за последнюю строку (включая
-	// исключённых: интерлок/вердикт решают их судьбу без прохода).
+	// The chunk is processed entirely — the cursor over the last row (including
+	// the excluded ones: the interlock/verdict decide their fate without the pass).
 	cursor.key = rows[len(rows)-1].key
 	if len(rows) < o.BatchSize {
-		cursor.key = lateKey{} // короткая пачка — множество исчерпано, цикл замкнут
+		cursor.key = lateKey{} // a short chunk — the set is exhausted, the cycle is closed
 		out.Wrapped = true
 	}
 	return out, nil
 }
 
-// lateResult — Result-сообщение переиздания (ключ строки + имя, T-024):
-// потребитель читает цель из строки (renderSelectSQL), свежесть
-// гарантируют охраны эпизода.
+// lateResult — the re-edition Result message (the row's key + the name, T-024):
+// the consumer reads the target from the row (renderSelectSQL), the
+// episode guards guarantee the freshness.
 func lateResult(r lateRow) queue.Result {
 	return queue.Result{
 		ZoneID: r.key.zone, DomainID: r.key.domain,
@@ -511,10 +511,10 @@ func lateResult(r lateRow) queue.Result {
 	}
 }
 
-// lateBodySPA — вердикт SPA по телу контента h с кэшем пачки: попадание
-// в кэш не читает хранилище (записи класса T-055 делят тело). Ошибка
-// чтения: отмена ctx — ошибка прохода; транзиентный сбой — false без
-// ошибки (строка пропускается, следующий цикл вернётся), Warn в лог.
+// lateBodySPA — the SPA verdict over the content body h with the chunk's cache:
+// a cache hit does not read the store (the T-055 class's records share the body). An
+// error: a ctx cancellation — a pass error; a transient failure — false without
+// an error (the row is skipped, the next cycle will come back), a Warn into the log.
 func lateBodySPA(ctx context.Context, contents RenderContent, cache map[content.Hash]bool, h content.Hash, r *lateRow, log *slog.Logger) (bool, error) {
 	if spa, ok := cache[h]; ok {
 		return spa, nil
@@ -526,10 +526,10 @@ func lateBodySPA(ctx context.Context, contents RenderContent, cache map[content.
 		}
 		log.Warn("поздний переиздатель: контент записи недоступен — строка пропущена",
 			"domain", r.name, "subdomain_id", r.key.sub, "err", err)
-		cache[h] = false // сбой не вердикт: не-читаемость не «не-SPA»,
-		// но повторное чтение в этой пачке бессмысленно; цена пропуска —
-		// весь курсорный цикл до возврата к строке (осознанно: ошибка
-		// прохода застопорила бы курсор на нечитаемом блоке навсегда)
+		cache[h] = false // a failure is not a verdict: unreadability is not "non-SPA",
+		// but a repeated read in this chunk is pointless; the skip's price —
+		// the whole cursor cycle until the return to the row (deliberate: a pass
+		// error would stall the cursor on an unreadable block forever)
 		return false, nil
 	}
 	spa := httpfetch.DetectSPA(body).SPA
@@ -537,15 +537,15 @@ func lateBodySPA(ctx context.Context, contents RenderContent, cache map[content.
 	return spa, nil
 }
 
-// lateOriginsSPA — вердикты субдоменов-оригиналов алиасов одного домена
-// (T-055): кандидаты (lateRenderAliasSQL — охранные предикаты прохода
-// доработки) вердиктятся по телу; отрендеренный оригинал — вердикт сам
-// по себе (факт рендера доказывает SPA класса, контент-то уже DOM —
-// ревью T-259 P2-1), без чтения хранилища. Любой вариант оригинала с
-// SPA-вердиктом делает класс эквивалентности SPA (у прохода доработки
-// та же семантика: наследуются оба варианта разных сайтов).
-// Возвращает карту субдомен → вердикт; пустая — наследовать нечего.
-// Ошибки чтения тел — как у lateBodySPA (пропуск оригинала).
+// lateOriginsSPA — the original subdomains' verdicts of one domain's
+// aliases (T-055): the candidates (lateRenderAliasSQL — the rework
+// pass's guard predicates) are verdicted over the body; a rendered original — the verdict
+// by itself (the fact of the render proves the class's SPA, the content is already a DOM —
+// the T-259 P2-1 review), without reading the store. Any original variant with
+// an SPA verdict makes the equivalence class SPA (the rework pass
+// has the same semantics: both variants of different sites are inherited).
+// Returns a subdomain → verdict map; an empty one — nothing to inherit.
+// The body read errors — as at lateBodySPA (an original skip).
 func lateOriginsSPA(ctx context.Context, pool db.DB, contents RenderContent, cache map[content.Hash]bool,
 	dom lateKey, subs []int16, log *slog.Logger) (map[int16]bool, error) {
 	rows, err := pool.Query(ctx, lateRenderAliasSQL, dom.zone, dom.domain, subs)
@@ -565,15 +565,15 @@ func lateOriginsSPA(ctx context.Context, pool db.DB, contents RenderContent, cac
 			return nil, fmt.Errorf("httpworker: поздний переиздатель: оригиналы алиасов: чтение: %w", err)
 		}
 		if rendered {
-			out[sub] = true // рендер состоялся — класс был SPA, тело не читаем
+			out[sub] = true // the render happened — the class was SPA, the body is not read
 			continue
 		}
 		if len(hash) != content.HashLen {
-			continue // вердикт взять неоткуда
+			continue // there is nowhere to take the verdict from
 		}
 		var h content.Hash
 		copy(h[:], hash)
-		row := lateRow{name: "origin"} // для Warn в lateBodySPA
+		row := lateRow{name: "origin"} // for the Warn in lateBodySPA
 		spa, err := lateBodySPA(ctx, contents, cache, h, &row, log)
 		if err != nil {
 			return nil, err
@@ -588,17 +588,17 @@ func lateOriginsSPA(ctx context.Context, pool db.DB, contents RenderContent, cac
 	return out, nil
 }
 
-// lateSelect — пачка кандидатов после курсора after (lateRenderRowsSQL).
-// Единая точка тяжёлой выборки: явная транзакция с серверным потолком
-// SET LOCAL statement_timeout до SELECT (T-271; закрепления плана сняты
-// T-273 — см. комментарий к lateRenderRowsSQL: непиненная форма
-// T-251), клиентский ctx-дедлайн SelectTimeout накрывает и оболочку
-// (BEGIN/SET LOCAL/COMMIT). Транзакция — только оболочка потолка:
-// SELECT читает зафиксированные данные, фиксация/откат по содержанию
-// равнозначны. Тяжёлый скан под общим гейтом http-worker (o.Gate,
-// T-271): выборка позднего переиздателя и retention не совпадают в
-// PostgreSQL («1+1 ГиБ» поверх shared_buffers — инцидент 08–09.11.2026);
-// гейт занимается ДО Begin — соединение пула не простаивает в очереди.
+// lateSelect — a chunk of candidates after the after cursor (lateRenderRowsSQL).
+// The heavy selection's single point: an explicit transaction with the server-side cap
+// SET LOCAL statement_timeout before the SELECT (T-271; the plan pinnings removed
+// by T-273 — see the lateRenderRowsSQL comment: the unpinned
+// T-251 shape), the client ctx deadline SelectTimeout covers the shell
+// too (BEGIN/SET LOCAL/COMMIT). The transaction — only the cap's shell:
+// SELECT reads committed data, commit/rollback are equivalent by content.
+// The heavy scan under the http-worker's common gate (o.Gate,
+// T-271): the late re-publisher's selection and retention do not coincide in
+// PostgreSQL ("1+1 GiB" over shared_buffers — the Nov 8–9, 2026 incident);
+// the gate is taken BEFORE Begin — the pool's connection does not idle in a queue.
 func lateSelect(ctx context.Context, pool RecordDB, o LateOptions, before time.Time, after lateKey) ([]lateRow, error) {
 	o = o.withDefaults()
 	if err := o.Gate.Acquire(ctx); err != nil {
@@ -613,12 +613,12 @@ func lateSelect(ctx context.Context, pool RecordDB, o LateOptions, before time.T
 	if err != nil {
 		return nil, fmt.Errorf("httpworker: поздний переиздатель: транзакция выборки: %w", err)
 	}
-	// Откат безусловно: после Commit — no-op (стиль T-044).
+	// The rollback unconditionally: after the Commit — a no-op (the T-044 style).
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	// Единственный SET LOCAL — потолок оператора (T-273): закрепление
-	// формы (seq/hash/merge/bitmap off, T-271) разворачивало join от
-	// domains на прод-объёме — вечная петля за дедлайном.
+	// The only SET LOCAL — the operator's cap (T-273): the shape
+	// pinning (seq/hash/merge/bitmap off, T-271) unrolled the join from
+	// domains at the production volume — the eternal loop over the deadline.
 	if _, err := tx.Exec(ctx, fmt.Sprintf(lateSelectTimeoutFmt, o.SelectTimeout.Milliseconds())); err != nil {
 		return nil, fmt.Errorf("httpworker: поздний переиздатель: потолок выборки: %w", err)
 	}
@@ -656,18 +656,18 @@ func lateSelect(ctx context.Context, pool RecordDB, o LateOptions, before time.T
 	return out, nil
 }
 
-// RenderLateLoop — цикл позднего переиздателя: тикер Interval, один
-// проход LateOnce на тик (полный курсорный цикл по таблице —
-// часы/дни; стартового дренажа сознательно нет: гонять всю таблицу
-// пачками подряд — часы фонового I/O на старте сервиса). Курсор —
-// состояние цикла (одна горутина, стиль retentionState T-185). Ошибка
-// прохода — Warn, метрика crawler_render_late_errors_total (T-273) и
-// тикер переводится в backoff DefaultRenderLateErrorBackoff после
-// КАЖДОЙ ошибки (T-271 завёл backoff, T-273 сделал reset на каждую —
-// пауза отсчитывается от конца ошибочного прохода): цикл живёт
-// (контракт OnRun, T-012), курсор стоит на месте, проход после паузы
-// повторит пачку, успех возвращает штатный интервал. Отмена ctx —
-// чистый nil (graceful shutdown, §3.4).
+// RenderLateLoop — the late re-publisher's loop: an Interval ticker, one
+// LateOnce pass per tick (a full cursor cycle over the table —
+// hours/days; there is deliberately no initial drainage: running the whole table
+// by chunks in a row — hours of background I/O at the service's start). The cursor —
+// the loop's state (one goroutine, the retentionState T-185 style). A pass
+// error — a Warn, the crawler_render_late_errors_total metric (T-273) and
+// the ticker is switched into the DefaultRenderLateErrorBackoff backoff after
+// EVERY error (T-271 introduced the backoff, T-273 made the reset per each —
+// the pause is counted from the erroneous pass's end): the loop lives
+// (the OnRun contract, T-012), the cursor stands in place, the pass after the pause
+// will repeat the chunk, a success returns the normal interval. A ctx cancellation —
+// a clean nil (graceful shutdown, §3.4).
 func RenderLateLoop(ctx context.Context, pool RecordDB, contents RenderContent, render *RenderQueue,
 	pending content.RetentionPending, met *Metrics, opts LateOptions) error {
 	if pool == nil {
@@ -701,20 +701,20 @@ func RenderLateLoop(ctx context.Context, pool RecordDB, contents RenderContent, 
 		case <-ticker.C:
 			res, err := LateOnce(ctx, pool, contents, render, pending, met, o, cursor)
 			if err != nil {
-				// Отмена во время прохода — часть остановки, не тревога.
+				// A cancellation during the pass — part of the stop, not an alarm.
 				if ctx.Err() == nil {
 					log.Warn("поздний переиздатель рендера", "err", err)
 					met.LateError()
 				}
-				// Backoff после КАЖДОЙ ошибки (T-271 завёл backoff,
-				// T-273 сделал reset на каждую — якорем тикера был конец
-				// первого ошибочного прохода, повторные ошибки оставляли
-				// паузу «проход минус период», каденс WARN-ов маскировал
-				// длительность): пауза отсчитывается от конца ошибочного
-				// прохода — минимум «проход + backoff» между стартами;
-				// повтор пачки — первым тиком паузы, дублей нет
-				// (публикация не состоялась), успех вернёт штатный
-				// интервал.
+				// A backoff after EVERY error (T-271 introduced the backoff,
+				// T-273 made the reset per each — the ticker's anchor was the end
+				// of the first erroneous pass, repeated errors left
+				// a "pass minus period" pause, the WARN cadence masked
+				// the duration): the pause is counted from the erroneous
+				// pass's end — a minimum of "pass + backoff" between the starts;
+				// the chunk's repeat — by the first tick of the pause, no duplicates
+				// (the publication did not happen), a success will return the normal
+				// interval.
 				if ctx.Err() == nil {
 					backoff = true
 					lateResetTicker(ticker, o.ErrorBackoff)
@@ -725,9 +725,9 @@ func RenderLateLoop(ctx context.Context, pool RecordDB, contents RenderContent, 
 				backoff = false
 				lateResetTicker(ticker, o.Interval)
 			}
-			// Wrapped на исчерпанном множестве — каждый тик стационара:
-			// строкой журнала не отмечается (ревью T-259 P3-2), только
-			// Debug; значимые события — публикации и стоящая очередь.
+			// Wrapped on an exhausted set — every steady-state tick:
+			// not noted by a log line (the T-259 P3-2 review), only
+			// Debug; the significant events — publications and a stalled queue.
 			if res.Published > 0 || res.Full {
 				log.Info("поздний переиздатель рендера",
 					"selected", res.Selected, "skipped", res.Skipped,
@@ -739,17 +739,17 @@ func RenderLateLoop(ctx context.Context, pool RecordDB, contents RenderContent, 
 	}
 }
 
-// lateResetTicker — сброс тикера цикла (T-271, стиль
-// retentionResetTicker — механика и обоснование там): тик, сработавший
-// за время прохода длиннее интервала, хранится рантаймом (Go ≥1.23 —
-// отложенный send на небуферизованном канале, cap(t.C) = 0; ранее —
-// буфер канала) и без сбора периода повторил бы ошибочный проход
-// немедленно; под текущей цепочкой Reset убирает отложенный тик сам,
-// слив — безвредная страховка под старые цепочки (ревью T-271, P3-1).
+// lateResetTicker — the loop ticker's reset (T-271, the
+// retentionResetTicker style — the mechanics and the justification there): a tick that fired
+// during a pass longer than the interval is kept by the runtime (Go ≥1.23 —
+// a deferred send into an unbuffered channel, cap(t.C) = 0; formerly —
+// a channel buffer) and without draining the period would repeat the erroneous pass
+// immediately; under the current Reset chain it removes the deferred tick itself,
+// the drain — a harmless guard under the old chains (the T-271 P3-1 review).
 func lateResetTicker(t *time.Ticker, d time.Duration) {
 	t.Reset(d)
 	select {
-	case <-t.C: // слив недоставленного тика старого периода
+	case <-t.C: // draining the old period's undelivered tick
 	default:
 	}
 }
