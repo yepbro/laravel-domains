@@ -1,26 +1,27 @@
-// Package watch — наблюдение за каталогом входных файлов ingest (ТЗ 5.1).
+// Package watch — monitoring of the ingest input file directory (spec 5.1).
 //
-// Два источника событий: fsnotify (создание/запись в наблюдаемом дереве
-// каталогов) и периодический полный обход как страховка — fsnotify может
-// потерять события при переполнении внутреннего буфера, а обход подхватывает
-// и файлы, существовавшие до старта наблюдателя. Каталог наблюдается
-// рекурсивно (<зона>/add|delete/…; смысл пути разбирает уже потребитель,
+// Two event sources: fsnotify (creation/writes in the watched directory
+// tree) and a periodic full pass as a safety net — fsnotify may lose events
+// when its internal buffer overflows, and the pass also picks up files that
+// existed before the watcher started. The directory is watched recursively
+// (<zone>/add|delete/…; the meaning of the path is parsed by the consumer,
 // T-014).
 //
-// Готовность файла (ТЗ 5.1): размер и mtime стабильны StableAfter секунд
-// (ingest.stable_seconds, по умолчанию 10 с). Дозаписываемые файлы не
-// выдаются: каждое событие записи начинает окно стабильности заново.
-// Отслеживаются только регулярные файлы *.txt и архивы поддерживаемых
-// форматов (.zip, .tar, .tar.gz, .tgz, .gz — T-133) — временные (*.tmp,
-// *.part), скрытые файлы и служебные каталоги processed/ и failed/
-// (архив ingest) игнорируются; переименование *.tmp → готовое имя по
-// ТЗ 5.1 означает готовность и приходит как событие создания нового имени.
+// File readiness (spec 5.1): size and mtime are stable for StableAfter
+// seconds (ingest.stable_seconds, 10 s by default). Files still being
+// appended to are not delivered: every write event restarts the stability
+// window. Only regular *.txt files and archives of supported formats
+// (.zip, .tar, .tar.gz, .tgz, .gz — T-133) are tracked — temporary files
+// (*.tmp, *.part), hidden files, and the processed/ and failed/ service
+// directories (the ingest archive) are ignored; a rename *.tmp → the final
+// name per spec 5.1 means readiness and arrives as a create event of the
+// new name.
 //
-// Готовые файлы отдаются в канал; повторная выдача одного файла исключена
-// (учёт в памяти; постоянная идемпотентность по sha256 — ingest_files,
-// T-021). Если потребитель не читает канал, наблюдатель блокируется —
-// файлы не теряются (backpressure), а копящиеся события fsnotify подберёт
-// очередной обход-страховка.
+// Ready files are pushed to a channel; redelivery of the same file is
+// excluded (in-memory accounting; permanent idempotency by sha256 —
+// ingest_files, T-021). If the consumer does not read the channel, the
+// watcher blocks — files are not lost (backpressure), and the accumulating
+// fsnotify events will be picked up by the next safety-net pass.
 package watch
 
 import (
@@ -37,61 +38,61 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
-// Значения по умолчанию — дублируют config.Default (ingest.*), чтобы пакет
-// работал и без конфигурации.
+// Defaults duplicate config.Default (ingest.*) so that the package
+// works without a configuration too.
 const (
-	// DefaultStableAfter — окно стабильности размера/mtime
-	// (ingest.stable_seconds, ТЗ 5.10).
+	// DefaultStableAfter is the size/mtime stability window
+	// (ingest.stable_seconds, spec 5.10).
 	DefaultStableAfter = 10 * time.Second
-	// DefaultScanInterval — интервал полного обхода-страховки
-	// (ingest.scan_interval, расширение к ТЗ 5.10).
+	// DefaultScanInterval is the interval of the full safety-net pass
+	// (ingest.scan_interval, an extension to spec 5.10).
 	DefaultScanInterval = 30 * time.Second
-	// DefaultQueueSize — буфер канала готовых файлов.
+	// DefaultQueueSize is the buffer of the ready-files channel.
 	DefaultQueueSize = 128
 )
 
-// File — входной файл с завершённой записью, готовый к обработке.
+// File is an input file with a completed record, ready for processing.
 type File struct {
-	// Path — путь файла (Options.Dir + относительный путь).
+	// Path is the file path (Options.Dir + relative path).
 	Path string
-	// Size и ModTime — размер и mtime на момент проверки стабильности.
+	// Size and ModTime are the size and mtime at the stability check moment.
 	Size    int64
 	ModTime time.Time
 }
 
-// Options — параметры наблюдателя; нулевые значения заменяются дефолтами.
+// Options is the watcher parameters; zero values are replaced with defaults.
 type Options struct {
-	// Dir — наблюдаемый каталог (ingest.dir). Отсутствующий каталог
-	// создаётся; исчезнувший на ходу восстанавливается очередным обходом.
+	// Dir is the watched directory (ingest.dir). A missing directory
+	// is created; one that disappears on the fly is restored by the next pass.
 	Dir string
-	// StableAfter — сколько размер и mtime файла должны быть неизменны,
-	// чтобы файл считался готовым (ingest.stable_seconds).
+	// StableAfter is how long the file size and mtime must remain unchanged
+	// for the file to be considered ready (ingest.stable_seconds).
 	StableAfter time.Duration
-	// ScanInterval — интервал периодического полного обхода каталога —
-	// страховка к fsnotify (ingest.scan_interval).
+	// ScanInterval is the interval of the periodic full directory pass —
+	// the safety net for fsnotify (ingest.scan_interval).
 	ScanInterval time.Duration
-	// QueueSize — буфер канала готовых файлов; при переполнении
-	// наблюдатель блокируется до чтения (backpressure без потерь).
+	// QueueSize is the buffer of the ready-files channel; on overflow
+	// the watcher blocks until a read (backpressure without losses).
 	QueueSize int
-	// Log — логгер событий наблюдения; nil — не логировать.
+	// Log is the logger of watch events; nil means no logging.
 	Log *slog.Logger
-	// Now — источник времени (заглушка в тестах); nil — time.Now.
+	// Now is the time source (a stub in tests); nil means time.Now.
 	Now func() time.Time
 }
 
-// Dir запускает наблюдение за opts.Dir и возвращает канал готовых файлов;
-// канал закрывается при отмене ctx. Ошибка возвращается только на старте
-// (каталог не удалось создать, fsnotify недоступен); дальнейшие проблемы —
-// потерянные события, отвалившийся каталог — логируются и переживаются
-// обходом-страховкой.
+// Dir starts watching opts.Dir and returns the channel of ready files;
+// the channel is closed when ctx is cancelled. An error is returned only at
+// start (the directory could not be created, fsnotify is unavailable);
+// further problems — lost events, a dropped directory — are logged and
+// survived via the safety-net pass.
 func Dir(ctx context.Context, opts Options) (<-chan File, error) {
 	if opts.Dir == "" {
 		return nil, errors.New("watch: watched directory not set (Options.Dir)")
 	}
 	o := opts.withDefaults()
 
-	// Каталога может не быть (том монтируется позже) — создаём и
-	// наблюдаем как обычно.
+	// The directory may not exist yet (the volume is mounted later) — create
+	// and watch it as usual.
 	if err := os.MkdirAll(o.Dir, 0o755); err != nil {
 		return nil, fmt.Errorf("watch: directory %s: %w", o.Dir, err)
 	}
@@ -140,20 +141,20 @@ func (o Options) withDefaults() Options {
 	return o
 }
 
-// watcher — состояние цикла наблюдения. Всё, кроме files, принадлежит
-// горутине run: гонок между fsnotify и обходом нет — оба источника
-// обрабатываются одним select.
+// watcher is the state of the watch loop. Everything except files belongs
+// to the run goroutine: there are no races between fsnotify and the pass —
+// both sources are processed by a single select.
 type watcher struct {
 	opts    Options
 	log     *slog.Logger
 	now     func() time.Time
 	fw      *fsnotify.Watcher
 	tracker *tracker
-	watched map[string]struct{} // каталоги с установленным watch
+	watched map[string]struct{} // directories with a watch installed
 }
 
-// checkInterval — период проверки готовности кандидатов: четверть окна
-// стабильности, в пределах 1 мс..250 мс.
+// checkInterval is the period of candidate readiness checks: a quarter of
+// the stability window, within 1 ms..250 ms.
 func (w *watcher) checkInterval() time.Duration {
 	d := w.opts.StableAfter / 4
 	switch {
@@ -175,7 +176,7 @@ func (w *watcher) run(ctx context.Context, files chan<- File) {
 	scan := time.NewTicker(w.opts.ScanInterval)
 	defer scan.Stop()
 
-	w.scan() // стартовый обход: каталоги и файлы, существовавшие до запуска
+	w.scan() // initial pass: directories and files that existed before the start
 
 	for {
 		select {
@@ -190,8 +191,8 @@ func (w *watcher) run(ctx context.Context, files chan<- File) {
 			if !ok {
 				return
 			}
-			// Чаще всего это переполнение буфера событий: часть событий
-			// потеряна, итог исправит очередной полный обход.
+			// Most often this is an event buffer overflow: part of the events
+			// is lost; the next full pass will fix the result.
 			w.log.Warn("fsnotify", "err", err)
 		case <-check.C:
 			w.emitReady(ctx, files)
@@ -201,15 +202,15 @@ func (w *watcher) run(ctx context.Context, files chan<- File) {
 	}
 }
 
-// handleEvent — событие fsnotify в наблюдаемом дереве. На Linux
-// переименование в наблюдаемый каталог (x.tmp → x.txt) приходит как
-// Create нового имени, уход из него — как Rename старого.
+// handleEvent is an fsnotify event in the watched tree. On Linux a rename
+// into the watched directory (x.tmp → x.txt) arrives as a Create of the new
+// name, and the move out of it as a Rename of the old one.
 func (w *watcher) handleEvent(ev fsnotify.Event) {
 	switch {
 	case ev.Has(fsnotify.Create) || ev.Has(fsnotify.Write):
 		fi, err := os.Lstat(ev.Name)
 		if err != nil {
-			w.tracker.forget(ev.Name) // исчез между событием и stat
+			w.tracker.forget(ev.Name) // vanished between the event and the stat
 			return
 		}
 		switch {
@@ -217,32 +218,34 @@ func (w *watcher) handleEvent(ev fsnotify.Event) {
 			if w.skipDir(ev.Name) {
 				return
 			}
-			// Новый каталог (зона, add/delete): наблюдаем и сразу
-			// обходим — файлы могли появиться раньше watch.
+			// A new directory (a zone, add/delete): watch it and walk it
+			// right away — files could have appeared before the watch.
 			w.addWatch(ev.Name)
 			w.walk(ev.Name)
 		case fi.Mode().IsRegular() && !w.skipDir(filepath.Dir(ev.Name)) && w.wantFile(ev.Name):
-			// Событие записи всегда начинает окно стабильности заново —
-			// на ФС с грубым mtime дозапись может не менять сигнатуру.
+			// A write event always restarts the stability window —
+			// on filesystems with coarse mtime an append may not
+			// change the signature.
 			w.tracker.observe(ev.Name, fi.Size(), fi.ModTime(), true)
 		}
 	case ev.Has(fsnotify.Remove) || ev.Has(fsnotify.Rename):
-		// Пути больше нет: забываем кандидата (удаление до стабильности,
-		// перенос в processed/) и watch каталога (ядро снимает его само).
+		// The path is gone: forget the candidate (a deletion before
+		// stability, a move to processed/) and the directory watch
+		// (the kernel removes it itself).
 		w.tracker.forget(ev.Name)
 		delete(w.watched, ev.Name)
 	default:
-		// Chmod: права доступа не меняют ни размер, ни mtime.
+		// Chmod: access rights change neither the size nor the mtime.
 	}
 }
 
-// emitReady выдаёт стабильно готовые файлы. Каждый кандидат перепроверяется
-// свежим stat: изменившийся или исчезнувший файл не выдаётся.
+// emitReady delivers stably ready files. Every candidate is re-checked with
+// a fresh stat: a changed or vanished file is not delivered.
 func (w *watcher) emitReady(ctx context.Context, files chan<- File) {
 	for _, path := range w.tracker.paths() {
 		fi, err := os.Lstat(path)
 		if err != nil {
-			w.tracker.forget(path) // удалён до стабильности
+			w.tracker.forget(path) // deleted before stability
 			continue
 		}
 		f, ok := w.tracker.ready(path, fi.Size(), fi.ModTime())
@@ -251,25 +254,25 @@ func (w *watcher) emitReady(ctx context.Context, files chan<- File) {
 		}
 		w.log.Debug("file is stable", "path", f.Path, "size", f.Size)
 		select {
-		case files <- f: // backpressure: ждём потребителя, ничего не теряем
+		case files <- f: // backpressure: waiting for the consumer, nothing is lost
 		case <-ctx.Done():
 			return
 		}
 	}
 }
 
-// scan — полный обход наблюдаемого каталога (страховка к fsnotify).
+// scan is a full pass over the watched directory (the safety net for fsnotify).
 func (w *watcher) scan() { w.walk(w.opts.Dir) }
 
-// walk обходит каталог root: обновляет watch подкаталогов и состояние
-// кандидатов. Скрытые каталоги и архив ingest processed/failed (ТЗ 5.1,
-// верхний уровень) не обходятся.
+// walk walks the root directory: updates the watches of subdirectories and
+// the candidate states. Hidden directories and the ingest archive
+// processed/failed (spec 5.1, top level) are not walked.
 func (w *watcher) walk(root string) {
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			if path == root {
-				// Наблюдаемый каталог исчез (том отвалился): вернём его
-				// и watch; обход повторится по следующему тику.
+				// The watched directory vanished (the volume dropped): restore
+				// it and the watch; the pass will repeat on the next tick.
 				w.log.Warn("watched directory unavailable", "dir", root, "err", err)
 				if mkErr := os.MkdirAll(root, 0o755); mkErr != nil {
 					w.log.Warn("creating directory", "dir", root, "err", mkErr)
@@ -279,15 +282,16 @@ func (w *watcher) walk(root string) {
 				return fs.SkipAll
 			}
 			w.log.Warn("directory walk", "path", path, "err", err)
-			return nil // пропустить запись, продолжить обход
+			return nil // skip the entry, continue the walk
 		}
 		if d.IsDir() {
-			// Корень обхода не фильтруется: скрытое имя наблюдаемого
-			// каталога (ingest.dir = /data/.incoming) — валидная
-			// конфигурация, skipDir на корне молча отключал наблюдение
-			// целиком (ING-P3-4). Подкаталоги фильтруются как раньше:
-			// walk вызывается и для нового подкаталога по событию —
-			// внутрь processed/failed и скрытых заходить не нужно.
+			// The walk root is not filtered: a hidden name of the watched
+			// directory (ingest.dir = /data/.incoming) is a valid
+			// configuration; skipDir on the root silently disabled the whole
+			// watch (ING-P3-4). Subdirectories are filtered as before:
+			// walk is also called for a new subdirectory by event —
+			// there is no need to descend into processed/failed and
+			// hidden ones.
 			if path != root && w.skipDir(path) {
 				return fs.SkipDir
 			}
@@ -306,8 +310,8 @@ func (w *watcher) walk(root string) {
 	}
 }
 
-// skipDir — каталоги без входных файлов: processed/ и failed/ верхнего
-// уровня (архив ingest, ТЗ 5.1) и скрытые каталоги.
+// skipDir — directories without input files: processed/ and failed/ at the
+// top level (the ingest archive, spec 5.1) and hidden directories.
 func (w *watcher) skipDir(path string) bool {
 	base := filepath.Base(path)
 	if strings.HasPrefix(base, ".") {
@@ -321,17 +325,17 @@ func (w *watcher) skipDir(path string) bool {
 	return top == "processed" || top == "failed"
 }
 
-// wantExts — отслеживаемые суффиксы имён (нижний регистр): *.txt (ТЗ 5.1)
-// и архивы поддерживаемых форматов (T-133); .tar.gz покрывается суффиксом
-// .gz, .tgz — отдельный суффикс. Список зеркалит приём: ParsePath
-// (internal/ingest) разбирает всё выданное наблюдателем.
+// wantExts is the tracked name suffixes (lower case): *.txt (spec 5.1)
+// and archives of supported formats (T-133); .tar.gz is covered by the
+// .gz suffix, .tgz is a separate suffix. The list mirrors ingest: ParsePath
+// (internal/ingest) parses everything the watcher delivers.
 var wantExts = []string{".txt", ".zip", ".tar", ".tgz", ".gz"}
 
-// wantFile — файлы, готовность которых отслеживается: не скрытые *.txt
-// и архивы поддерживаемых форматов (.zip, .tar, .tar.gz, .tgz, .gz —
-// T-133). Временные (*.tmp, *.part) и прочие расширения не
-// отслеживаются: по ТЗ 5.1 готовность — появление/переименование в
-// отслеживаемое имя.
+// wantFile is the files whose readiness is tracked: non-hidden *.txt
+// and archives of supported formats (.zip, .tar, .tar.gz, .tgz, .gz —
+// T-133). Temporary ones (*.tmp, *.part) and other extensions are not
+// tracked: per spec 5.1 readiness is the appearance/rename into a
+// tracked name.
 func (w *watcher) wantFile(path string) bool {
 	base := filepath.Base(path)
 	if strings.HasPrefix(base, ".") {
@@ -346,8 +350,8 @@ func (w *watcher) wantFile(path string) bool {
 	return false
 }
 
-// addWatch устанавливает watch каталога (идемпотентно); неудача не фатальна
-// — каталог появится в обходе, и watch будет повторен.
+// addWatch installs a directory watch (idempotent); a failure is not fatal
+// — the directory will appear in the pass and the watch will be retried.
 func (w *watcher) addWatch(dir string) {
 	if _, ok := w.watched[dir]; ok {
 		return

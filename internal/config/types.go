@@ -11,18 +11,18 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Duration — длительность в конфигурации: строка вида "5s", "30m", "24h"
-// (формат time.ParseDuration) и в YAML, и в переменных окружения. Число
-// без единицы измерения — ошибка: его значение было бы двусмысленным.
+// Duration is a duration in the configuration: a string like "5s", "30m",
+// "24h" (the time.ParseDuration format), both in YAML and in environment
+// variables. A number without a unit is an error: its meaning would be ambiguous.
 type Duration time.Duration
 
-// D возвращает значение как time.Duration.
+// D returns the value as a time.Duration.
 func (d Duration) D() time.Duration { return time.Duration(d) }
 
-// String возвращает каноничную форму time.Duration.
+// String returns the canonical time.Duration form.
 func (d Duration) String() string { return time.Duration(d).String() }
 
-// UnmarshalYAML разбирает длительность из YAML-скаляра.
+// UnmarshalYAML parses a duration from a YAML scalar.
 func (d *Duration) UnmarshalYAML(node *yaml.Node) error {
 	if node.Kind != yaml.ScalarNode {
 		return fmt.Errorf("duration: expected a string like \"30m\", not %s (line %d)", node.Tag, node.Line)
@@ -35,8 +35,8 @@ func (d *Duration) UnmarshalYAML(node *yaml.Node) error {
 	return nil
 }
 
-// ParseDuration разбирает длительность (обёртка над time.ParseDuration
-// с понятным сообщением об ошибке).
+// ParseDuration parses a duration (a wrapper over time.ParseDuration
+// with a clear error message).
 func ParseDuration(s string) (time.Duration, error) {
 	d, err := time.ParseDuration(strings.TrimSpace(s))
 	if err != nil {
@@ -45,15 +45,15 @@ func ParseDuration(s string) (time.Duration, error) {
 	return d, nil
 }
 
-// ByteSize — размер в конфигурации: количество байт (2097152) или строка
-// с единицей ("512MB", "1GiB"). Десятичные единицы (KB, MB, GB) — степени
-// 10³, двоичные (KiB, MiB, GiB) — степени 2¹⁰.
+// ByteSize is a size in the configuration: a byte count (2097152) or a string
+// with a unit ("512MB", "1GiB"). Decimal units (KB, MB, GB) are powers of
+// 10³, binary ones (KiB, MiB, GiB) are powers of 2¹⁰.
 type ByteSize int64
 
-// B возвращает значение в байтах.
+// B returns the value in bytes.
 func (b ByteSize) B() int64 { return int64(b) }
 
-// String возвращает человекочитаемую форму (кратная двоичная единица или байты).
+// String returns a human-readable form (a multiple binary unit or plain bytes).
 func (b ByteSize) String() string {
 	switch {
 	case b%(1<<30) == 0:
@@ -67,8 +67,8 @@ func (b ByteSize) String() string {
 	}
 }
 
-// UnmarshalYAML разбирает размер из YAML-скаляра: целое число или строка
-// с единицей измерения.
+// UnmarshalYAML parses a size from a YAML scalar: an integer or a string
+// with a unit.
 func (b *ByteSize) UnmarshalYAML(node *yaml.Node) error {
 	if node.Kind != yaml.ScalarNode {
 		return fmt.Errorf("size: expected a number or a string like \"512MB\", not %s (line %d)", node.Tag, node.Line)
@@ -94,8 +94,8 @@ var sizeUnits = map[string]int64{
 	"gib": 1 << 30,
 }
 
-// ParseSize разбирает размер: "2097152", "512MB", "1GiB" (единица нечувствительна
-// к регистру; между числом и единицей допустим пробел).
+// ParseSize parses a size: "2097152", "512MB", "1GiB" (the unit is case-
+// insensitive; a space between the number and the unit is allowed).
 func ParseSize(s string) (int64, error) {
 	m := sizeRe.FindStringSubmatch(strings.TrimSpace(s))
 	if m == nil {

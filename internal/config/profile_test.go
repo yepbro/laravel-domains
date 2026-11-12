@@ -1,15 +1,17 @@
-// Тесты профилей развёртывания (T-240, ТЗР этапа 35 §4.5): боевые
-// YAML-профили подключаются переменной CRAWLER_CONFIG (по образцу
-// config.render.yaml — сервис render профиля runtime) и обязаны проходить
-// сборку конфигурации целиком: строгий YAML (KnownFields) → окружение →
-// нормализация → Validate. Профиль воркера B —
-// deploy/docker/config.render-fallback.yaml: движок chromium, собственный
-// headless-shell, включённый фолбэк-контур, потолок темпа
-// render.fallback.worker_rate (ФТ-13); стрим потребления q:render-fallback
-// и группа — переменная сборки RENDER_WORKER_STREAM (cmd/render-worker),
-// не поля конфигурации (ТЗ §4.1 п.3, T-236). Профиль dev —
-// deploy/docker/config.dev.yaml: документированное переключение движка
-// (ФТ-16) правкой engine + remote_url обязано проходить валидацию.
+// Tests of the deployment profiles (T-240, the render spec stage 35
+// §4.5): the production YAML profiles are connected by the CRAWLER_CONFIG
+// variable (following the pattern of config.render.yaml — the render
+// service of the runtime profile) and must pass the whole configuration
+// build: strict YAML (KnownFields) → environment → normalization →
+// Validate. The worker B profile is
+// deploy/docker/config.render-fallback.yaml: the chromium engine, its own
+// headless-shell, the enabled fallback circuit, the rate ceiling
+// render.fallback.worker_rate (FR-13); the consumption stream
+// q:render-fallback and the group are the RENDER_WORKER_STREAM build
+// variable (cmd/render-worker), not configuration fields (the spec §4.1
+// item 3, T-236). The dev profile is deploy/docker/config.dev.yaml: the
+// documented engine switch (FR-16) by editing engine + remote_url must
+// pass validation.
 package config
 
 import (
@@ -17,13 +19,15 @@ import (
 	"testing"
 )
 
-// TestRenderFallbackProfileValid — профиль воркера B валиден и выражает
-// сборку ТЗ §4.5 п.1. DSN приходит окружением, как в развертывании
-// (APP_PG_DSN из compose.yaml; обязателен — Validate).
+// TestRenderFallbackProfileValid — the worker B profile is valid and
+// expresses the build of the spec §4.5 item 1. The DSN comes from the
+// environment, as in deployment (APP_PG_DSN from compose.yaml; required —
+// Validate).
 func TestRenderFallbackProfileValid(t *testing.T) {
 	path := filepath.Join("..", "..", "deploy", "docker", "config.render-fallback.yaml")
-	// Окружение детерминировано: кроме DSN — пусто, значения процесса
-	// теста профиль не перекрывают (как loadFrom).
+	// The environment is deterministic: except the DSN — empty; the
+	// values of the test process do not override the profile (like
+	// loadFrom).
 	cfg, err := loadPath(path, func(key string) string {
 		if key == "CRAWLER_POSTGRES_DSN" {
 			return "postgres://crawler:test@127.0.0.1:5432/crawler?sslmode=disable"
@@ -52,14 +56,14 @@ func TestRenderFallbackProfileValid(t *testing.T) {
 	}
 }
 
-// TestDevProfileEngineSwitch — документированное переключение движка
-// dev-воркера (ФТ-16, S-P1-2): правка engine + remote_url в
-// config.dev.yaml обязана проходить Validate. Профиль держит
-// render.restart_memory_bytes: 0 (браузер в dev всегда внешний, RSS
-// чужого процесса недоступен); без ключа профиль наследовал бы боевой
-// дефолт 1536MiB — и валидация отвергала бы moli/lightpanda ещё до
-// старта воркера, как и crawlerctl fixtures export/import/snapshot,
-// читающие тот же конфиг.
+// TestDevProfileEngineSwitch — the documented engine switch of the dev
+// worker (FR-16, S-P1-2): editing engine + remote_url in config.dev.yaml
+// must pass Validate. The profile keeps render.restart_memory_bytes: 0
+// (the browser in dev is always external, the RSS of a foreign process is
+// unavailable); without the key the profile would inherit the production
+// default of 1536MiB — and validation would reject moli/lightpanda even
+// before the worker starts, as it would crawlerctl fixtures
+// export/import/snapshot reading the same config.
 func TestDevProfileEngineSwitch(t *testing.T) {
 	path := filepath.Join("..", "..", "deploy", "docker", "config.dev.yaml")
 	for _, engine := range []struct{ name, remoteURL string }{

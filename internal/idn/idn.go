@@ -1,28 +1,30 @@
-// Package idn — нормализация доменных имён (ТЗ 5.2 основного ТЗ).
+// Package idn — domain name normalization (spec 5.2 of the main spec).
 //
-// Правило ТЗ 5.2: внутри системы везде хранится ASCII-форма (punycode,
-// xn--…); unicode-форма — производная для отображения. Конвейер
-// Normalize:
+// The rule of spec 5.2: the ASCII form (punycode, xn--…) is stored
+// everywhere inside the system; the unicode form is derived, for display.
+// The Normalize pipeline:
 //
-//   - нижний регистр, без пробелов и завершающей точки (п. 1);
-//   - punycode через профиль Lookup (UTS-46) из golang.org/x/net/idna
-//     (пп. 2–3): unicode-метки кодируются, метки xn-- проверяются
-//     декодированием, невалидные отклоняются;
-//   - длины в ASCII-форме: метка ≤ 63, полное имя ≤ 253 (п. 4);
-//   - отделение зоны по последней метке имени — TLD (п. 5 в редакции
-//     ТЗТ tld-only-zones): составные регистрации (co.uk, 5g.in) зоной
-//     не выделяются — всё до TLD становится меткой имени;
-//   - числовая зона отвергается: TLD из одних цифр не существует (IANA),
-//     иначе через вывод зоны прошли бы даты выгрузок и IPv4-литералы;
-//   - признак is_idn — метка имени содержит xn-- (п. 9): бит 0
-//     domains.flags (model.FlagIDN, ТЗ 5.2 п. 9).
+//   - lower case, no spaces and no trailing dot (item 1);
+//   - punycode via the Lookup profile (UTS-46) from golang.org/x/net/idna
+//     (items 2–3): unicode labels are encoded, xn-- labels are verified
+//     by decoding, invalid ones are rejected;
+//   - lengths in the ASCII form: a label ≤ 63, a full name ≤ 253 (item 4);
+//   - zone separation by the last label of the name — the TLD (item 5 as
+//     amended by the tld-only-zones spec): compound registrations (co.uk,
+//     5g.in) are not extracted as a zone — everything before the TLD
+//     becomes a name label;
+//   - a numeric zone is rejected: a TLD of digits only does not exist
+//     (IANA), otherwise export dates and IPv4 literals would pass the
+//     zone extraction;
+//   - the is_idn flag — a name label contains xn-- (item 9): bit 0 of
+//     domains.flags (model.FlagIDN, spec 5.2 item 9).
 //
-// Ошибки типизированы (*Error: класс, имя, причина): rejected-лог ingest
-// (ТЗ 5.1, задача T-016) использует класс как причину отклонения строки.
+// Errors are typed (*Error: kind, name, cause): the ingest rejected log
+// (spec 5.1, task T-016) uses the kind as the record rejection reason.
 //
-// Пакет не занимается ни приёмом файлов (этап ingest, T-013…T-021), ни
-// извлечением хостов из Location/meta refresh (T-047/T-048): сюда
-// приходят уже выделенные имена и хосты.
+// The package does neither file ingestion (the ingest stage, T-013…T-021)
+// nor host extraction from Location/meta refresh (T-047/T-048): already
+// extracted names and hosts arrive here.
 package idn
 
 import (
@@ -34,38 +36,38 @@ import (
 	"golang.org/x/net/idna"
 )
 
-// Лимиты DNS-имён (ТЗ 5.2 п. 4) и префикс A-метки (RFC 5890).
+// DNS name limits (spec 5.2 item 4) and the A-label prefix (RFC 5890).
 const (
-	maxLabelLen = 63  // метка ≤ 63 октет в ASCII-форме
-	maxNameLen  = 253 // полное имя ≤ 253 октет в ASCII-форме
+	maxLabelLen = 63  // a label ≤ 63 octets in the ASCII form
+	maxNameLen  = 253 // a full name ≤ 253 octets in the ASCII form
 	xnPrefix    = "xn--"
 )
 
-// ErrorKind — класс ошибки нормализации: устойчивая причина отклонения
-// для rejected-лога (ТЗ 5.1) и вывода crawlerctl.
+// ErrorKind is a normalization error kind: a stable rejection reason for
+// the rejected log (spec 5.1) and crawlerctl output.
 type ErrorKind string
 
 const (
-	// ErrEmpty — имя пусто (после уборки пробелов и завершающих точек).
+	// ErrEmpty — the name is empty (after removing spaces and trailing dots).
 	ErrEmpty ErrorKind = "empty"
-	// ErrInvalid — имя не проходит UTS-46/IDNA или содержит пустую метку
-	// (в том числе невалидный xn--: ТЗ 5.2 п. 3).
+	// ErrInvalid — the name fails UTS-46/IDNA or contains an empty label
+	// (including an invalid xn--: spec 5.2 item 3).
 	ErrInvalid ErrorKind = "invalid"
-	// ErrLabelLen — метка длиннее 63 октет (ASCII-форма).
+	// ErrLabelLen — a label longer than 63 octets (the ASCII form).
 	ErrLabelLen ErrorKind = "label_len"
-	// ErrNameLen — имя длиннее 253 октет (ASCII-форма).
+	// ErrNameLen — the name is longer than 253 octets (the ASCII form).
 	ErrNameLen ErrorKind = "name_len"
-	// ErrNoLabel — нет метки перед зоной: имя само — TLD (com, москва),
-	// домена из него не получается.
+	// ErrNoLabel — no label before the zone: the name itself is a TLD
+	// (com, москва), no domain can be made of it.
 	ErrNoLabel ErrorKind = "no_label"
-	// ErrNumericZone — последняя метка имени (зона) состоит только из
-	// цифр: числовых TLD не существует (IANA), а без этой проверки
-	// через вывод зоны проходят даты выгрузок («18.06.1999» → зона
-	// 1999) и IPv4-литералы («1.2.3.4» → зона 4).
+	// ErrNumericZone — the last label of the name (the zone) consists of
+	// digits only: numeric TLDs do not exist (IANA), and without this
+	// check export dates pass the zone extraction ("18.06.1999" → zone
+	// 1999) as do IPv4 literals ("1.2.3.4" → zone 4).
 	ErrNumericZone ErrorKind = "numeric_zone"
 )
 
-// kindDescriptions — тексты классов для Error() и String().
+// kindDescriptions — the kind texts for Error() and String().
 var kindDescriptions = map[ErrorKind]string{
 	ErrEmpty:       "empty name",
 	ErrInvalid:     "invalid domain name",
@@ -75,7 +77,7 @@ var kindDescriptions = map[ErrorKind]string{
 	ErrNumericZone: "numeric zone — no such TLDs exist",
 }
 
-// String возвращает текст класса (стиль model.Status.String).
+// String returns the kind text (the style of model.Status.String).
 func (k ErrorKind) String() string {
 	if d, ok := kindDescriptions[k]; ok {
 		return d
@@ -83,16 +85,16 @@ func (k ErrorKind) String() string {
 	return string(k)
 }
 
-// Error — ошибка нормализации: класс, исходное имя и причина. Имя
-// обрезается до maxErrNameLen рун: вход недоверенный и может быть
-// сколь угодно длинным, а rejected-логу длинный мусор не нужен.
+// Error — a normalization error: the kind, the original name and the cause.
+// The name is truncated to maxErrNameLen runes: the input is untrusted and
+// can be arbitrarily long, and the rejected log does not need long junk.
 type Error struct {
-	Kind ErrorKind // класс — причина отклонения
-	Name string    // исходное имя (обрезанное)
-	Err  error     // причина (например, ошибка idna); может быть nil
+	Kind ErrorKind // the kind — the rejection reason
+	Name string    // the original name (truncated)
+	Err  error     // the cause (for example, an idna error); may be nil
 }
 
-// maxErrNameLen — сколько рун исходного имени хранить в ошибке.
+// maxErrNameLen — how many runes of the original name to keep in the error.
 const maxErrNameLen = 255
 
 func newErr(kind ErrorKind, name string, cause error) *Error {
@@ -110,11 +112,11 @@ func (e *Error) Error() string {
 	return fmt.Sprintf("idn: %s: %q", desc, e.Name)
 }
 
-// Unwrap даёт доступ к причине (errors.Is/As по цепочке).
+// Unwrap gives access to the cause (errors.Is/As along the chain).
 func (e *Error) Unwrap() error { return e.Err }
 
-// KindOf возвращает класс ошибки нормализации; ok = false, если err —
-// не *Error (чужая ошибка).
+// KindOf returns the normalization error kind; ok = false if err is
+// not an *Error (a foreign error).
 func KindOf(err error) (ErrorKind, bool) {
 	var e *Error
 	if errors.As(err, &e) {
@@ -123,54 +125,58 @@ func KindOf(err error) (ErrorKind, bool) {
 	return "", false
 }
 
-// Result — нормализованное доменное имя.
+// Result — a normalized domain name.
 type Result struct {
-	// ASCII — полное имя в ASCII-форме (punycode), нижний регистр, без
-	// завершающей точки. Так имя хранится в системе (ТЗ 5.2).
+	// ASCII is the full name in the ASCII form (punycode), lower case, no
+	// trailing dot. This is how the name is stored in the system (spec 5.2).
 	ASCII string
-	// Unicode — unicode-форма для отображения (ТЗ 5.2 п. 7): ToUnicode
-	// на лету; для чисто ASCII-имени совпадает с ASCII.
+	// Unicode is the unicode form for display (spec 5.2 item 7): ToUnicode
+	// on the fly; for a purely ASCII name it equals ASCII.
 	Unicode string
-	// Zone — зона имени: TLD, последняя метка ASCII-формы (п. 5 в
-	// редакции ТЗТ tld-only-zones). Составные суффиксы (co.uk,
-	// github.io, 5g.in) зоной не выделяются: у example.co.uk зона uk,
-	// у example.5g.in — in. Зона incoming-каталога при проверке строк
-	// задаётся явно (T-014/T-016) и может быть глубже TLD (тестовые
-	// зоны); Zone — способ отделить зону, когда она не известна
-	// заранее (зона-less файлы, вывод).
+	// Zone is the zone of the name: the TLD, the last label of the ASCII
+	// form (item 5 as amended by the tld-only-zones spec). Compound
+	// suffixes (co.uk, github.io, 5g.in) are not extracted as a zone:
+	// example.co.uk has zone uk, example.5g.in has in. The zone of the
+	// incoming directory, when checking records, is given explicitly
+	// (T-014/T-016) and may be deeper than the TLD (test zones); Zone is
+	// the way to separate the zone when it is not known in advance
+	// (zone-less files, output).
 	Zone string
-	// Label — имя без зоны (колонка domains.label): левая часть до Zone.
-	// Составной label — норма для зон с регистрацией на втором уровне:
-	// example.5g.in → label example.5g (зона in), example.co.uk →
-	// example.co (зона uk).
+	// Label is the name without the zone (the domains.label column): the
+	// left part up to Zone. A compound label is the norm for zones with a
+	// second-level registration: example.5g.in → label example.5g (zone
+	// in), example.co.uk → example.co (zone uk).
 	Label string
-	// IsIDN — метка имени содержит xn-- (ТЗ 5.2 п. 9): бит 0
-	// domains.flags (model.FlagIDN). Проверяется метка домена, а не
-	// полное имя: example.рф (зона xn--p1ai) бита не получает — у самой
-	// метки нет punycode; всей зоне бит не принадлежит.
+	// IsIDN — a name label contains xn-- (spec 5.2 item 9): bit 0 of
+	// domains.flags (model.FlagIDN). The domain label is checked, not the
+	// full name: example.рф (zone xn--p1ai) does not get the bit — the
+	// label itself has no punycode; the bit does not belong to the whole
+	// zone.
 	IsIDN bool
 }
 
-// Normalize приводит полное доменное имя к ASCII-форме и раскладывает
-// его на зону и метку (ТЗ 5.2 пп. 1–5, 9). Так нормализуются строки
-// файлов incoming (ТЗ 5.1) и ввод оператора в crawlerctl (T-081).
+// Normalize converts the full domain name to the ASCII form and splits it
+// into the zone and the label (spec 5.2 items 1–5, 9). This is how records
+// of the incoming files (spec 5.1) and the operator input in crawlerctl
+// (T-081) are normalized.
 func Normalize(name string) (Result, error) {
 	ascii, err := normalizeASCII(name)
 	if err != nil {
 		return Result{}, err
 	}
-	// п. 5 (в редакции ТЗТ tld-only-zones): зона — последняя метка
-	// имени (TLD): у example.5g.in зона in, метка example.5g; точек
-	// нет — имя само TLD, метки перед зоной нет. Составные суффиксы
-	// (co.uk, github.io) зоной не выделяются — всё до TLD метка.
+	// Item 5 (as amended by the tld-only-zones spec): the zone is the last
+	// label of the name (the TLD): example.5g.in has zone in, label
+	// example.5g; no dots — the name itself is a TLD, there is no label
+	// before the zone. Compound suffixes (co.uk, github.io) are not
+	// extracted as a zone — everything before the TLD is the label.
 	i := strings.LastIndexByte(ascii, '.')
-	zone := ascii[i+1:] // i < 0 → зона — всё имя (голый TLD), случай ниже
-	// Числовая зона — не домен: даты выгрузок («18.06.1999») и
-	// IPv4-литералы («1.2.3.4») проходят UTS-46, а числовых TLD не
-	// существует (IANA) — последняя метка из цифр (1999, 4) зоной
-	// быть не может; проверка идёт до ErrNoLabel, чтобы голая числовая
-	// метка («1999») классифицировалась числовой зоной, как раньше.
-	// Числовая метка в буквенной зоне (123.com) — обычное имя.
+	zone := ascii[i+1:] // i < 0 → the zone is the whole name (a bare TLD), the case below
+	// A numeric zone is not a domain: export dates ("18.06.1999") and
+	// IPv4 literals ("1.2.3.4") pass UTS-46, and numeric TLDs do not
+	// exist (IANA) — a last label of digits (1999, 4) cannot be a zone;
+	// the check runs before ErrNoLabel so that a bare numeric label
+	// ("1999") is classified as a numeric zone, as before.
+	// A numeric label in an alphabetic zone (123.com) is a regular name.
 	if isNumericZone(zone) {
 		return Result{}, newErr(ErrNumericZone, name, nil)
 	}
@@ -178,12 +184,13 @@ func Normalize(name string) (Result, error) {
 		return Result{}, newErr(ErrNoLabel, name, nil)
 	}
 	label := ascii[:i]
-	// zone == "" и label == "" недостижимы: normalizeASCII гарантирует
-	// непустой ASCII без пустых меток и завершающих точек — точка не
-	// в начале и не в конце имени, метки с двух сторон непусты. Ветка —
-	// защита от будущих изменений конвейера, оба мутанта условия
-	// эквивалентны, аннотация глушит строку целиком: trade-off
-	// гранулярности, docs/mutation-testing.md §4.
+	// zone == "" and label == "" are unreachable: normalizeASCII guarantees
+	// a non-empty ASCII without empty labels and trailing dots — the dot is
+	// neither at the start nor at the end of the name, the labels on both
+	// sides are non-empty. The branch is a guard against future changes of
+	// the pipeline; both condition mutants are equivalent, the annotation
+	// silences the whole line: a granularity trade-off,
+	// docs/mutation-testing.md §4.
 	// mutator-disable-next-line expression/remove
 	if zone == "" || label == "" {
 		return Result{}, newErr(ErrNoLabel, name, nil)
@@ -197,13 +204,13 @@ func Normalize(name string) (Result, error) {
 	}, nil
 }
 
-// isNumericZone — все метки зоны состоят только из цифр ASCII: числовых
-// TLD не существует (IANA), поэтому последняя метка из цифр — не зона
-// имени: даты выгрузок («18.06.1999» — последняя метка 1999) и
-// IPv4-литералы («1.2.3.4» — 4) обязаны отвергаться выводом зоны. Зона —
-// одна метка (TLD), цикл по точкам оставлен для прямых вызовов и
-// страховки. Числовая метка в буквенной зоне (123.com) зоной не
-// является и имени не мешает.
+// isNumericZone — all labels of the zone consist of ASCII digits only:
+// numeric TLDs do not exist (IANA), so a last label of digits is not the
+// zone of the name: export dates ("18.06.1999" — the last label 1999) and
+// IPv4 literals ("1.2.3.4" — 4) must be rejected by the zone extraction.
+// The zone is a single label (the TLD); the loop over dots is kept for
+// direct calls and as a safety net. A numeric label in an alphabetic zone
+// (123.com) is not a zone and does not bother the name.
 func isNumericZone(zone string) bool {
 	if zone == "" {
 		return false
@@ -216,55 +223,55 @@ func isNumericZone(zone string) bool {
 	return true
 }
 
-// NormalizeZone нормализует имя зоны — каталог incoming/<зона> (ТЗ 5.1)
-// тем же конвейером, что и домен (ТЗ 5.2 п. 6: «зона тоже нормализуется
-// тем же способом»), но без отделения метки. Зона каталога не обязана
-// быть TLD (тестовые зоны вроде crawl.test, составные пути) —
-// принадлежность зоны никакому списку здесь не проверяется, только
-// синтаксис имени. Unicode-форма для zones.name_unicode — ToUnicode
-// зоны на лету.
+// NormalizeZone normalizes the name of a zone — the incoming/<zone>
+// directory (spec 5.1) — with the same pipeline as a domain (spec 5.2
+// item 6: "the zone is normalized the same way too"), but without label
+// separation. The zone of the directory does not have to be a TLD (test
+// zones like crawl.test, compound paths) — belonging of the zone to any
+// list is not checked here, only the name syntax. The unicode form for
+// zones.name_unicode is ToUnicode of the zone on the fly.
 func NormalizeZone(zone string) (string, error) {
 	return normalizeASCII(zone)
 }
 
-// HostToASCII приводит хост к ASCII-форме (ТЗ 5.2 п. 8): хосты из
-// Location и <meta http-equiv="refresh">, содержащие unicode,
-// кодируются в punycode перед DNS-запросом, Host и SNI (для DNS и SNI
-// всегда используется ASCII-форма). ASCII-хосты валидируются и
-// возвращаются в нижнем регистре; IPv4-литерал проходит как есть
-// (метки из цифр синтаксически валидны), IPv6-литералы не поддержаны —
-// это не имена, вызывающая сторона (T-047/T-048) обрабатывает их
-// отдельно через net.ParseIP. Хост передаётся без схемы, порта и пути
-// (url.URL.Hostname); сам перехват Location/meta refresh — задачи
-// T-047/T-048.
+// HostToASCII converts a host to the ASCII form (spec 5.2 item 8): hosts
+// from Location and <meta http-equiv="refresh"> containing unicode are
+// encoded to punycode before the DNS query, Host and SNI (the ASCII form
+// is always used for DNS and SNI). ASCII hosts are validated and returned
+// in lower case; an IPv4 literal passes as is (labels of digits are
+// syntactically valid), IPv6 literals are not supported — they are not
+// names, the caller (T-047/T-048) handles them separately via net.ParseIP.
+// The host is passed without scheme, port and path (url.URL.Hostname); the
+// Location/meta refresh interception itself — tasks T-047/T-048.
 func HostToASCII(host string) (string, error) {
 	return normalizeASCII(host)
 }
 
-// normalizeASCII — общий конвейер Normalize/NormalizeZone/HostToASCII:
-// очистка (п. 1), punycode и проверка xn-- (пп. 2–3), длины (п. 4).
+// normalizeASCII — the shared pipeline of Normalize/NormalizeZone/HostToASCII:
+// cleanup (item 1), punycode and xn-- verification (items 2–3), lengths (item 4).
 func normalizeASCII(name string) (string, error) {
 	s := cleanup(name)
 	if s == "" {
 		return "", newErr(ErrEmpty, name, nil)
 	}
-	// Профиль Lookup (UTS-46): маппинг регистра, кодирование unicode-меток
-	// в punycode, проверка A-меток xn-- декодированием, STD3, Bidi и
-	// контекстные правила (ТЗ 5.2 пп. 2–3).
+	// The Lookup profile (UTS-46): case mapping, encoding of unicode
+	// labels to punycode, verification of xn-- A-labels by decoding,
+	// STD3, Bidi and contextual rules (spec 5.2 items 2–3).
 	ascii, err := idna.Lookup.ToASCII(s)
 	if err != nil {
 		return "", newErr(ErrInvalid, name, err)
 	}
-	// idna.Lookup не отвергает пустые метки («a..b» проходит, «xn--»
-	// декодируется в пустоту — поведение golang.org/x/net v0.61) и не
-	// проверяет длины — контролируем сами (ТЗ 5.2 пп. 3–4); поведение
-	// закреплено тестами (TestNormalizeInvalid), здесь — страховка.
-	// Ветка достижима входом «xn--» (Lookup декодирует его в пустоту,
-	// ToASCII("xn--") = "", nil) и входом из полностью игнорируемых
-	// маппингом символов (BOM/U+00AD/U+200B/U+2060): в обоих случаях
-	// ascii == "" и Split("", ".") ниже даёт [""] — следующая проверка
-	// отвечает той же ошибкой «пустая метка» с теми же Kind/Name/
-	// причиной, мутант вырезания return эквивалентен.
+	// idna.Lookup does not reject empty labels ("a..b" passes, "xn--"
+	// decodes to empty — the behavior of golang.org/x/net v0.61) and does
+	// not check lengths — we control that ourselves (spec 5.2 items 3–4);
+	// the behavior is pinned by tests (TestNormalizeInvalid), this is a
+	// safety net. The branch is reachable with the input "xn--" (Lookup
+	// decodes it to empty, ToASCII("xn--") = "", nil) and with input made
+	// of characters fully ignored by the mapping (BOM/U+00AD/U+200B/
+	// U+2060): in both cases ascii == "" and Split("", ".") below gives
+	// [""] — the next check answers with the same "empty label" error
+	// with the same Kind/Name/cause, the return-removal mutant is
+	// equivalent.
 	// mutator-disable-next-line branch/if
 	if ascii == "" {
 		return "", newErr(ErrInvalid, name, errors.New("empty label"))
@@ -283,22 +290,22 @@ func normalizeASCII(name string) (string, error) {
 	return ascii, nil
 }
 
-// cleanup выполняет ТЗ 5.2 п. 1: нижний регистр, без пробельных
-// символов и без завершающих точек. Пробелы убираются все, не только
-// по краям («убрать пробелы» без уточнения в ТЗ): помарки ввода
-// («при мер.рф») не должны отправлять имя в rejected-лог. Скрытые
-// символы — не пробелы и остаются на усмотрение UTS-46: BOM (U+FEFF),
-// U+00AD, U+200B и U+2060 убираются маппингом idna.Lookup (ignored),
-// ZWNJ/ZWJ (U+200C/U+200D) проходят только по контекстным правилам
-// (CONTEXTJ), U+180E — disallowed; корпус — corpus_test.go (T-010).
+// cleanup performs spec 5.2 item 1: lower case, no whitespace characters
+// and no trailing dots. All spaces are removed, not only at the edges
+// ("remove spaces" without qualification in the spec): input typos
+// ("при мер.рф") must not send the name to the rejected log. Hidden
+// characters are not spaces and are left to UTS-46: BOM (U+FEFF),
+// U+00AD, U+200B and U+2060 are removed by the idna.Lookup mapping
+// (ignored), ZWNJ/ZWJ (U+200C/U+200D) pass only per the contextual rules
+// (CONTEXTJ), U+180E is disallowed; the corpus — corpus_test.go (T-010).
 func cleanup(name string) string {
-	// Быстрый путь — чистая оптимизация: IndexFunc для имени без пробелов
-	// отвечает -1, «< 0 → < -1» переводит безпробельное имя на медленный
-	// путь, который фильтрует только пробелы (их нет) и применяет тот же
-	// TrimRight(ToLower) — результат неотличим; вырезание return — то же
-	// самое в обратную сторону (branch/if ключуется строкой if). Grow —
-	// подсказка ёмкости, на результате не сказывается. Три эквивалентных
-	// мутанта.
+	// The fast path is a pure optimization: IndexFunc for a name without
+	// spaces answers -1, "< 0 → < -1" would send a space-free name to the
+	// slow path, which filters only spaces (there are none) and applies
+	// the same TrimRight(ToLower) — the result is indistinguishable; the
+	// return-removal mutant is the same in reverse (branch/if is keyed by
+	// the if string). Grow is a capacity hint, it does not affect the
+	// result. Three equivalent mutants.
 	// mutator-disable-next-line numbers/decrementer, branch/if
 	if strings.IndexFunc(name, unicode.IsSpace) < 0 {
 		return strings.TrimRight(strings.ToLower(name), ".")
@@ -314,25 +321,25 @@ func cleanup(name string) string {
 	return strings.TrimRight(strings.ToLower(b.String()), ".")
 }
 
-// ToUnicode возвращает unicode-форму ASCII-имени для отображения
-// (ТЗ 5.2 п. 7: поиск и вывод unicode-имён домена — idna.ToUnicode на
-// лету, без отдельного столбца в domains). Ошибок не возвращает
-// намеренно: если декодировать не удалось (имя не в punycode),
-// возвращается вход без изменений.
+// ToUnicode returns the unicode form of an ASCII name for display
+// (spec 5.2 item 7: search and output of the unicode names of a domain —
+// idna.ToUnicode on the fly, without a separate column in domains). It
+// deliberately returns no errors: if decoding failed (the name is not in
+// punycode), the input is returned unchanged.
 func ToUnicode(ascii string) string {
-	// Ошибка декодирования и пустой результат — один исход: вернуть вход
-	// (idna.ToUnicode("") даёт пустую строку без ошибки).
+	// A decoding error and an empty result are one outcome: return the
+	// input (idna.ToUnicode("") gives an empty string without an error).
 	if u, err := idna.ToUnicode(ascii); err == nil && u != "" {
 		return u
 	}
 	return ascii
 }
 
-// HasXNLabel сообщает, содержит ли имя хотя бы одну метку xn--
-// (A-метку punycode, ТЗ 5.2 п. 9). Имя — ASCII-форма с точками-
-// разделителями; регистр не важен. Normalize использует функцию для
-// метки домена (Result.IsIDN), но она применима к любому имени —
-// например к зоне (zones.name).
+// HasXNLabel reports whether the name contains at least one xn-- label
+// (a punycode A-label, spec 5.2 item 9). The name is the ASCII form with
+// dot separators; case does not matter. Normalize uses the function for
+// the domain label (Result.IsIDN), but it applies to any name — for
+// example, to a zone (zones.name).
 func HasXNLabel(name string) bool {
 	for _, label := range strings.Split(name, ".") {
 		if len(label) >= len(xnPrefix) && strings.EqualFold(label[:len(xnPrefix)], xnPrefix) {

@@ -1,30 +1,31 @@
-// Package bgjoin — структурная проверка инварианта остановки фоновых
-// циклов функции run сервисов (T-223 — http-worker; T-232 —
-// render-worker, analyzer, dns-worker): все фоновые циклы run
-// останавливаются и джойнятся до defer-закрытий ресурсов на любом
-// выходе — штатной отмене ctx, раннем возврате из конструктора, панике.
-// Схема — производная отмена (context.WithCancel) + sync.WaitGroup:
-// Add(1)/defer bg.Done() по месту запуска каждого цикла, джойн-defer
-// «cancel(); bg.Wait()» зарегистрирован последним из defer run →
-// исполняется первым (LIFO), до закрытий ресурсов. Прогнать run в
-// юнит-тесте нельзя (живые Postgres/Redis/Chromium), инвариант
-// закрепляется разбором main.go через go/ast (прецедент чтения
-// исходников тестами — test/integration/compose_test.go,
-// deploy/postgres/postgresql_conf_test.go). Разборщик извлечён из
-// TestRunBackgroundJoin http-worker (T-223) и усилен по ревью T-232
-// (порядок cancel-до-Wait, привязка производного ctx к циклам, сиротский
-// Add, defer во вложенных блоках).
+// Package bgjoin — a structural check of the invariant that background
+// loops of the service run function are stopped (T-223 — the http-worker;
+// T-232 — render-worker, analyzer, dns-worker): all background loops of
+// run are stopped and joined before the defer resource closings on any
+// exit — a normal ctx cancellation, an early return from the constructor,
+// a panic. The scheme is derived cancellation (context.WithCancel) +
+// sync.WaitGroup: Add(1)/defer bg.Done() at the launch site of each loop,
+// the join defer "cancel(); bg.Wait()" is registered last among run's
+// defers → executed first (LIFO), before the resource closings. Running
+// run in a unit test is impossible (live Postgres/Redis/Chromium), so the
+// invariant is enforced by parsing main.go via go/ast (a precedent of
+// tests reading sources — test/integration/compose_test.go,
+// deploy/postgres/postgresql_conf_test.go). The parser was extracted from
+// the TestRunBackgroundJoin of the http-worker (T-223) and hardened per
+// the T-232 review (cancel-before-Wait order, binding the derived ctx to
+// the loops, an orphan Add, defers in nested blocks).
 //
-// Контракт пакета (P3-2/P3-4 ревью T-232): пакет тестовый — импортировать
-// только из _test.go-файлов; имена идентификаторов bg (WaitGroup),
-// cancel (производная отмена) и ctx (производный контекст, пакет
-// context) — часть проверяемого контракта паттерна T-223, а не деталь
-// реализации: паттерн фиксирует их одинаково во всех сервисах, проверка
-// на имена ловит рефакторинги, молча отключающие фикс. Каждый go-запуск
-// в run — джойнимый ctx-цикл: func-литерал с безусловным defer bg.Done()
-// верхнего уровня, использующий производный ctx; одноразовые горутины в
-// run запрещены (запускать из джойнимого цикла), запуск именованной
-// функции оборачивается литералом с defer bg.Done().
+// Package contract (P3-2/P3-4 of the T-232 review): the package is a test
+// one — import only from _test.go files; the identifier names bg (the
+// WaitGroup), cancel (the derived cancellation) and ctx (the derived
+// context, package context) are part of the verifiable T-223 pattern
+// contract, not an implementation detail: the pattern fixes them
+// identically in all services, the name check catches refactors that
+// silently disable the fix. Every go launch in run is a joinable ctx
+// loop: a func literal with an unconditional top-level defer bg.Done(),
+// using the derived ctx; one-off goroutines in run are forbidden (launch
+// from a joinable loop), launching a named function is wrapped in a
+// literal with defer bg.Done().
 package bgjoin
 
 import (
@@ -34,27 +35,28 @@ import (
 	"testing"
 )
 
-// Check проверяет инвариант остановки run в исходнике file сервиса
-// (путь относительно каталога пакета: go test запускается с cwd =
-// каталог пакета, как у postgresql_conf_test.go):
+// Check verifies the run shutdown invariant in the source file of the
+// service (the path relative to the package directory: go test runs with
+// cwd = the package directory, as in postgresql_conf_test.go):
 //
-//   - run выводит ctx производной отменой (context.WithCancel) и
-//     передаёт производный ctx каждому циклу и главному циклу воркера:
-//     каркас отменяет ctx OnRun только после его возврата, ранний
-//     выход/паника обязаны гасить циклы сами; создание WithCancel без
-//     привязки (циклы на родительском ctx) отключало бы фикс молча
-//     (P2-2 ревью T-232);
-//   - джойн-defer (единственный defer с bg.Wait) — func-литерал с
-//     безусловным cancel() верхнего уровня ДО bg.Wait() (Wait-до-cancel
-//     и условный cancel — дедлок на раннем выходе, P2-1 ревью T-232),
-//     зарегистрирован последним из defer run → исполняется первым
-//     (LIFO), до закрытий ресурсов (включая defer во вложенных блоках,
-//     P3-3) и до первого запуска циклов;
-//   - каждый go-запуск в run обёрнут парой «bg.Add(1); go func(){ defer
-//     bg.Done(); … }()»: Add без пары к go — незаджойненный цикл
-//     (регрессия T-223/T-232), сиротский Add без go вешает Wait (P3-1),
-//     defer bg.Done обязан быть безусловным оператором верхнего уровня
-//     литерала — условный Done (внутри if) оставил бы Wait виснуть.
+//   - run derives the ctx via context.WithCancel and passes the derived
+//     ctx to every loop and to the worker's main loop: the framework
+//     cancels the ctx OnRun only after its return; an early exit/panic
+//     must stop the loops themselves; creating WithCancel without binding
+//     (loops on the parent ctx) would silently disable the fix
+//     (P2-2 of the T-232 review);
+//   - the join defer (the only defer with bg.Wait) is a func literal with
+//     an unconditional top-level cancel() BEFORE bg.Wait() (Wait-before-
+//     cancel and a conditional cancel mean a deadlock on early exit,
+//     P2-1 of the T-232 review), registered last among run's defers →
+//     executed first (LIFO), before the resource closings (including
+//     defers in nested blocks, P3-3) and before the first loop launch;
+//   - every go launch in run is wrapped in the pair "bg.Add(1); go
+//     func(){ defer bg.Done(); … }()": an Add without a go pair is an
+//     unjoined loop (a T-223/T-232 regression), an orphan Add without go
+//     hangs Wait (P3-1), defer bg.Done must be an unconditional
+//     top-level statement of the literal — a conditional Done (inside
+//     an if) would leave Wait hanging.
 func Check(t *testing.T, file string) {
 	t.Helper()
 	fset := token.NewFileSet()
@@ -74,19 +76,19 @@ func Check(t *testing.T, file string) {
 
 	var (
 		withCancel = token.NoPos // ctx, cancel := context.WithCancel(ctx)
-		ctxName    string        // идентификатор производного ctx (LHS[0])
-		cancelName = "cancel"    // the cancel identifier (LHS[1]; the pattern's contract)
+	ctxName    string        // identifier of the derived ctx (LHS[0])
+	cancelName = "cancel"    // identifier of the cancellation (LHS[1]; the pattern contract)
 		joinDefer  *ast.DeferStmt
-		waits      int // bg.Wait() в run — ровно один
+		waits      int // bg.Wait() in run — exactly one
 		launches   int
 		firstGo    = token.NoPos
-		allDefers  []*ast.DeferStmt // defer-ы run вне горутин циклов
+		allDefers  []*ast.DeferStmt // run's defers outside the loop goroutines
 		broken     []string
 	)
 
-	// Джойн-defer — по верхнему уровню run (контракт): defer-ы горутин
-	// циклов и замыканий-колбэков исполняются не на выходе run и в LIFO
-	// закрытий не участвуют.
+	// The join defer — by the top level of run (the contract): the defers
+	// of the loop goroutines and callback closures do not execute on
+	// run's exit and do not participate in the LIFO of closings.
 	for _, st := range run.Body.List {
 		if d, ok := st.(*ast.DeferStmt); ok {
 			if callsBgWait(d) {
@@ -98,21 +100,21 @@ func Check(t *testing.T, file string) {
 		}
 	}
 
-	// Порядок закрытий — по ВСЕМ defer-ам run вне горутин: defer во
-	// вложенном блоке (if/for/…) тоже исполняется на выходе из функции
-	// и по месту регистрации встаёт в тот же LIFO (P3-3 ревью T-232);
-	// тела func-литералов (джойн-defer, колбэки) не обходим — их
-	// внутренние операторы — не операторы run.
+	// The closing order — over ALL of run's defers outside goroutines: a
+	// defer in a nested block (if/for/…) also executes on function exit
+	// and, by registration site, joins the same LIFO (P3-3 of the T-232
+	// review); the bodies of func literals (the join defer, callbacks)
+	// are not walked — their inner statements are not run's statements.
 	walkStmts(run.Body.List, func(st ast.Stmt) {
 		if d, ok := st.(*ast.DeferStmt); ok {
 			allDefers = append(allDefers, d)
 		}
 	})
 
-	// Привязка производной отмены (P2-2) — отдельным обходом ДО разбора
-	// запусков: список операторов run посещается раньше дочерних
-	// операторов, в общем обходе проверка go-запусков шла бы с пустым
-	// ctxName.
+	// Binding of the derived cancellation (P2-2) — a separate walk BEFORE
+	// parsing the launches: run's statement list is visited earlier than
+	// the child statements; in a combined walk the go-launch checks would
+	// run with an empty ctxName.
 	ast.Inspect(run.Body, func(n ast.Node) bool {
 		if a, ok := n.(*ast.AssignStmt); ok && len(a.Lhs) == 2 && len(a.Rhs) == 1 && withCancel == token.NoPos {
 			if call, ok := a.Rhs[0].(*ast.CallExpr); ok && isPkgCall(call, "context", "WithCancel") {
@@ -131,9 +133,9 @@ func Check(t *testing.T, file string) {
 	ast.Inspect(run.Body, func(n ast.Node) bool {
 		switch n := n.(type) {
 		case *ast.BlockStmt:
-			// Пары «bg.Add(1); go …» и «go …; bg.Add(1)» — в каждом
-			// списке операторов (запуски циклов лежат на верхнем
-			// уровне run, но проверка не зависит от уровня).
+			// The pairs "bg.Add(1); go …" and "go …; bg.Add(1)" — in every
+			// statement list (the loop launches sit at the top level of
+			// run, but the check does not depend on the level).
 			for i, st := range n.List {
 				if goSt, ok := st.(*ast.GoStmt); ok {
 					launches++
@@ -151,9 +153,9 @@ func Check(t *testing.T, file string) {
 					}
 					continue
 				}
-				// Сиротский Add: Wait повиснет на «незавершённом»
-				// счётчике любого выхода, включая штатный (P3-1
-				// ревью T-232 — реалистично при удалении цикла).
+				// An orphan Add: Wait would hang on the "unfinished" counter
+				// on any exit, including the normal one (P3-1 of the
+				// T-232 review — realistic when a loop is removed).
 				if isBgAddOne(st) && (i+1 >= len(n.List) || !isGoStmt(n.List[i+1])) {
 					broken = append(broken, "bg.Add(1) without a go launch right after it — bg.Wait() will hang (T-232)")
 				}
@@ -172,10 +174,10 @@ func Check(t *testing.T, file string) {
 	if joinDefer == nil {
 		t.Fatalf("%s: run has no defer with bg.Wait() at the top level — the background loops are not joined before the defer resource closes", file)
 	}
-	// Джойн-defer: безусловный cancel() ДО bg.Wait() (P2-1 ревью
-	// T-232): Wait-до-cancel и условный cancel — дедлок на раннем
-	// выходе (циклы не отменены, Wait не вернётся; на штатной остановке
-	// замаскировано уже отменённым родителем).
+	// The join defer: an unconditional cancel() BEFORE bg.Wait() (P2-1 of
+	// the T-232 review): Wait-before-cancel and a conditional cancel mean
+	// a deadlock on early exit (the loops are not cancelled, Wait will not
+	// return; on a normal stop it is masked by the already-cancelled parent).
 	if err := joinDeferOrder(joinDefer, cancelName); err != "" {
 		t.Errorf("%s: join-defer: %s", file, err)
 	}
@@ -185,9 +187,9 @@ func Check(t *testing.T, file string) {
 	if launches == 0 {
 		t.Fatalf("%s: run has no go launches of background loops — nothing to check", file)
 	}
-	// Производный ctx — главному циклу воркера: финальный return с
-	// вызовом цикла обязан передавать его (P2-2 ревью T-232); return
-	// без вызова (return err/nil) — не финальный цикл, не проверяется.
+	// The derived ctx goes to the worker's main loop: the final return with
+	// a loop call must pass it (P2-2 of the T-232 review); a return without
+	// a call (return err/nil) is not the final loop, not checked.
 	if ctxName != "" {
 		if last := len(run.Body.List) - 1; last >= 0 {
 			if ret, ok := run.Body.List[last].(*ast.ReturnStmt); ok && hasCallExpr(ret) && !mentionsIdent(ret, ctxName) {
@@ -195,9 +197,9 @@ func Check(t *testing.T, file string) {
 			}
 		}
 	}
-	// Джойн-defer зарегистрирован последним из defer run → исполняется
-	// первым (LIFO): любой defer-закрытие ресурса (верхний уровень или
-	// вложенный блок) уже видит остановленные циклы.
+	// The join defer is registered last among run's defers → executed
+	// first (LIFO): any defer resource closing (top level or a nested
+	// block) already sees the stopped loops.
 	for _, d := range allDefers {
 		if d == joinDefer {
 			continue
@@ -217,10 +219,11 @@ func Check(t *testing.T, file string) {
 	}
 }
 
-// joinDeferOrder — структурная проверка тела джойн-defer (P2-1 ревью
-// T-232): defer func(){ … }() с безусловным «cancel()» и «bg.Wait()»
-// верхнего уровня литерала, cancel ДО Wait. Возвращает пустую строку,
-// если порядок верен, иначе — суть нарушения.
+// joinDeferOrder is a structural check of the join defer body (P2-1 of the
+// T-232 review): defer func(){ … }() with an unconditional "cancel()" and
+// a top-level "bg.Wait()" of the literal, cancel BEFORE Wait. Returns an
+// empty string when the order is correct, otherwise the essence of the
+// violation.
 func joinDeferOrder(d *ast.DeferStmt, cancelName string) string {
 	lit, ok := d.Call.Fun.(*ast.FuncLit)
 	if !ok {
@@ -238,7 +241,7 @@ func joinDeferOrder(d *ast.DeferStmt, cancelName string) string {
 		}
 		if id, ok := call.Fun.(*ast.Ident); ok && id.Name == cancelName {
 			if cancelPos == token.NoPos {
-				cancelPos = st.Pos() // первый безусловный cancel
+				cancelPos = st.Pos() // the first unconditional cancel
 			}
 		}
 		if isMethodCall(call, "bg", "Wait") && waitPos == token.NoPos {
@@ -256,10 +259,11 @@ func joinDeferOrder(d *ast.DeferStmt, cancelName string) string {
 	return ""
 }
 
-// walkStmts обходит операторы со спуском в тела блочных конструкций
-// (if/else, for, range, switch, select, case-ветки), не входя в тела
-// func-литералов: defer-ы замыканий и горутин исполняются не на выходе
-// из run и в LIFO закрытий run не участвуют.
+// walkStmts walks statements, descending into the bodies of block
+// constructs (if/else, for, range, switch, select, case branches), without
+// entering func literal bodies: the defers of closures and goroutines do
+// not execute on run's exit and do not participate in run's LIFO of
+// closings.
 func walkStmts(stmts []ast.Stmt, fn func(ast.Stmt)) {
 	for _, st := range stmts {
 		fn(st)
@@ -292,7 +296,7 @@ func walkStmts(stmts []ast.Stmt, fn func(ast.Stmt)) {
 	}
 }
 
-// callsBgWait — есть ли в поддереве вызов bg.Wait().
+// callsBgWait — is there a bg.Wait() call in the subtree?
 func callsBgWait(n ast.Node) bool {
 	found := false
 	ast.Inspect(n, func(m ast.Node) bool {
@@ -304,7 +308,7 @@ func callsBgWait(n ast.Node) bool {
 	return found
 }
 
-// mentionsIdent — упоминается ли идентификатор name в поддереве.
+// mentionsIdent — is the identifier name mentioned in the subtree?
 func mentionsIdent(n ast.Node, name string) bool {
 	found := false
 	ast.Inspect(n, func(m ast.Node) bool {
@@ -316,7 +320,7 @@ func mentionsIdent(n ast.Node, name string) bool {
 	return found
 }
 
-// hasCallExpr — есть ли в поддереве вызов функции.
+// hasCallExpr — is there a function call in the subtree?
 func hasCallExpr(n ast.Node) bool {
 	found := false
 	ast.Inspect(n, func(m ast.Node) bool {
@@ -328,13 +332,13 @@ func hasCallExpr(n ast.Node) bool {
 	return found
 }
 
-// isGoStmt — оператор запуска горутины.
+// isGoStmt — a goroutine launch statement.
 func isGoStmt(st ast.Stmt) bool {
 	_, ok := st.(*ast.GoStmt)
 	return ok
 }
 
-// isBgAddOne — оператор «bg.Add(1)».
+// isBgAddOne — a "bg.Add(1)" statement.
 func isBgAddOne(st ast.Stmt) bool {
 	expr, ok := st.(*ast.ExprStmt)
 	if !ok {
@@ -348,9 +352,9 @@ func isBgAddOne(st ast.Stmt) bool {
 	return ok && lit.Kind == token.INT && lit.Value == "1"
 }
 
-// defersBgDoneTopLevel — go-запуск обязан быть func-литералом с
-// безусловным оператором «defer bg.Done()» на верхнем уровне тела:
-// Done внутри if/for оставил бы Wait виснуть на «незавершённом» цикле.
+// defersBgDoneTopLevel — the go launch must be a func literal with an
+// unconditional "defer bg.Done()" statement at the top level of the body:
+// a Done inside if/for would leave Wait hanging on an "unfinished" loop.
 func defersBgDoneTopLevel(goSt *ast.GoStmt) bool {
 	lit, ok := goSt.Call.Fun.(*ast.FuncLit)
 	if !ok {
@@ -370,7 +374,7 @@ func defersBgDoneTopLevel(goSt *ast.GoStmt) bool {
 	return false
 }
 
-// isPkgCall — вызов pkg.Fn(…) по имени пакета и функции.
+// isPkgCall — a pkg.Fn(…) call by package and function name.
 func isPkgCall(call *ast.CallExpr, pkg, fn string) bool {
 	sel, ok := call.Fun.(*ast.SelectorExpr)
 	if !ok {
@@ -380,7 +384,7 @@ func isPkgCall(call *ast.CallExpr, pkg, fn string) bool {
 	return ok && id.Name == pkg && sel.Sel.Name == fn
 }
 
-// isMethodCall — вызов recv.Method(…) по именам получателя и метода.
+// isMethodCall — a recv.Method(…) call by receiver and method name.
 func isMethodCall(call *ast.CallExpr, recv, method string) bool {
 	sel, ok := call.Fun.(*ast.SelectorExpr)
 	if !ok {

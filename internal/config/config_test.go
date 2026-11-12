@@ -12,8 +12,9 @@ import (
 	"crawler/internal/queue"
 )
 
-// loadFrom собирает конфигурацию из YAML-текста и карты окружения
-// (в тестах окружение детерминировано и не зависит от процесса).
+// loadFrom assembles the configuration from a YAML text and an environment
+// map (in the tests the environment is deterministic and independent of the
+// process).
 func loadFrom(t *testing.T, yamlText string, env map[string]string) (*Config, error) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "config.yaml")
@@ -32,7 +33,7 @@ func mustLoad(t *testing.T, yamlText string, env map[string]string) *Config {
 	return cfg
 }
 
-// validDSN — окружение с единственным обязательным значением.
+// validDSN — the environment with the single mandatory value.
 func validDSN() map[string]string {
 	return map[string]string{"CRAWLER_POSTGRES_DSN": "postgres://u:p@127.0.0.1:5432/crawler"}
 }
@@ -149,10 +150,10 @@ func TestDefault(t *testing.T) {
 		{"dashboard.status_cache_ttl", c.Dashboard.StatusCacheTTL.D(), time.Minute},
 		{"dashboard.username", c.Dashboard.Username, ""},
 		{"dashboard.password_hash", c.Dashboard.PasswordHash, ""},
-		// Панель движков (T-246, S-P2-5): дефолт — экспозиция основной
-		// сборки на стандартном порте метрик 9105 (согласовано с
-		// monitor.render_metrics_url); воркер B фолбэка добавляют при
-		// включении фолбэка (deploy.md §2.3).
+		// The engines panel (T-246, S-P2-5): the default is the exposure
+		// of the main build on the standard metrics port 9105 (agreed with
+		// monitor.render_metrics_url); the fallback worker B is added when
+		// enabling the fallback (deploy.md §2.3).
 		{"dashboard.render_metrics_urls", strings.Join(c.Dashboard.RenderMetrics, ";"), "http://127.0.0.1:9105/metrics"},
 		{"log.level", c.Log.Level, "info"},
 	}
@@ -180,7 +181,7 @@ func TestDefault(t *testing.T) {
 		t.Errorf("ingest.allowed_zone_paths: по умолчанию пуст (рабочие каталоги только TLD, ТЗТ §6.1), получено %v", c.Ingest.AllowedZonePaths)
 	}
 
-	// Все значения по умолчанию проходят валидацию после задания dsn.
+	// All the default values pass validation after setting dsn.
 	c.Postgres.DSN = "postgres://u:p@127.0.0.1:5432/crawler"
 	if err := c.Validate(); err != nil {
 		t.Errorf("конфигурация по умолчанию должна быть валидна: %v", err)
@@ -440,16 +441,16 @@ log:
 	if w := cfg.Scheduler.ZoneWeights; len(w) != 3 || w["com"] != 5 || w["co.uk"] != 3 || w["xn--p1ai"] != 2 {
 		t.Errorf("scheduler.zone_weights: ожидается map[com:5 co.uk:3 xn--p1ai:2], получено %v", w)
 	}
-	// Allowlist каталогов зон (ТЗТ §6.1): дубли после приведения
-	// схлопываются при загрузке.
+	// The zone path allowlist (the tld-only-zones spec §6.1): duplicates
+	// after folding collapse at load.
 	if a := cfg.Ingest.AllowedZonePaths; strings.Join(a, ",") != "crawl.test" {
 		t.Errorf("ingest.allowed_zone_paths: ожидается [crawl.test] после дедупа, получено %v", a)
 	}
-	// Приоритет зон прохода доработки рендера (T-184): список как есть.
+	// The zone priority of the render finish pass (T-184): the list as is.
 	if z := cfg.Render.RequeueDeprioritizedZones; strings.Join(z, ",") != "xn--p1ai,net" {
 		t.Errorf("render.requeue_deprioritized_zones: ожидается [xn--p1ai net], получено %v", z)
 	}
-	// Префиксы парковщиков (T-165): карта CIDR → лимит как есть.
+	// The parker prefixes (T-165): the CIDR → limit map as is.
 	if o := cfg.HTTP.PerIPOverrides; len(o) != 2 || o["195.208.0.0/16"] != 12 || o["2a02:6b8::/32"] != 8 {
 		t.Errorf("http.per_ip_overrides: ожидается map[195.208.0.0/16:12 2a02:6b8::/32:8], получено %v", o)
 	}
@@ -458,7 +459,7 @@ log:
 	}
 }
 
-// Частичный YAML: отсутствующие ключи сохраняют значения по умолчанию.
+// A partial YAML: the missing keys keep the default values.
 func TestLoadYAMLPartial(t *testing.T) {
 	cfg := mustLoad(t, `
 postgres:
@@ -508,11 +509,12 @@ func TestLoadYAMLErrors(t *testing.T) {
 	}
 }
 
-// TestAllowedZonePaths — allowlist многоуровневых каталогов зон приёма
-// (ТЗТ §6.1): записи нормализуются при загрузке (punycode, нижний
-// регистр — idn.NormalizeZone, как каталоги приёма), дубли после
-// приведения схлопываются; TLD-зона и не-имя зоны — ошибки валидации,
-// сообщение указывает пример crawl.test.
+// TestAllowedZonePaths — the allowlist of the multi-level zone directories
+// of ingest (the tld-only-zones spec §6.1): the entries are normalized at
+// load (punycode, lower case — idn.NormalizeZone, like the ingest
+// directories); duplicates after folding collapse; a TLD zone and a
+// non-zone name are validation errors; the message cites the crawl.test
+// example.
 func TestAllowedZonePaths(t *testing.T) {
 	t.Run("нормализация и дедуп при загрузке", func(t *testing.T) {
 		cfg := mustLoad(t, `
@@ -555,13 +557,15 @@ ingest:
 	}
 }
 
-// TestZoneNameErrorTexts — тексты валидации имён зон-ключей (ТЗТ §6.2):
-// ключи zone_weights/requeue — TLD; упоминания составных зон («составные
-// — co.uk») убраны — откат к старым формулировкам тест ловит.
+// TestZoneNameErrorTexts — the validation texts of the zone key names
+// (the tld-only-zones spec §6.2): the keys of zone_weights/requeue are
+// TLDs; the mentions of compound zones ("compound — co.uk") are removed —
+// the test catches a rollback to the old wording.
 func TestZoneNameErrorTexts(t *testing.T) {
 	cfg := Default()
 	cfg.Postgres.DSN = "postgres://u:p@127.0.0.1:5432/crawler"
-	// Unicode-имя не проходит punycode-форму ключей (обе валидации).
+	// A unicode name does not pass the punycode form of the keys (both
+	// validations).
 	cfg.Scheduler.ZoneWeights = map[string]int{"рф": 1}
 	cfg.Render.RequeueDeprioritizedZones = []string{"рф"}
 	err := cfg.Validate()
@@ -853,37 +857,40 @@ func TestEnvOverrides(t *testing.T) {
 			t.Errorf("%s: ожидается %v, получено %v", ch.name, ch.want, ch.got)
 		}
 	}
-	// Список субдоменов из env заменяет список целиком (включая апекс).
+	// The subdomain list from env replaces the list entirely (including
+	// the apex).
 	if want := []string{"www", "mail"}; strings.Join(cfg.Subdomains, ",") != strings.Join(want, ",") {
 		t.Errorf("subdomains: ожидается %v (замена целиком, без апекса), получено %v", want, cfg.Subdomains)
 	}
-	// Карта весов зон из env: ключи приводятся к нижнему регистру.
+	// The zone weight map from env: the keys are lower-cased.
 	if w := cfg.Scheduler.ZoneWeights; len(w) != 2 || w["org"] != 7 || w["xn--p1ai"] != 2 {
 		t.Errorf("scheduler.zone_weights: ожидается map[org:7 xn--p1ai:2], получено %v", w)
 	}
-	// Приоритет зон прохода доработки рендера из env (T-184): список через
-	// запятую, имена приводятся к нижнему регистру, значение заменяет YAML.
+	// The zone priority of the render finish pass from env (T-184): a
+	// comma-separated list, the names are lower-cased, the value replaces
+	// the YAML.
 	if z := cfg.Render.RequeueDeprioritizedZones; strings.Join(z, ",") != "xn--p1ai,org" {
 		t.Errorf("render.requeue_deprioritized_zones: ожидается [xn--p1ai org], получено %v", z)
 	}
-	// Allowlist каталогов зон из env (ТЗТ §6.1): список через запятую,
-	// значение заменяет YAML (стиль имён зон).
+	// The zone path allowlist from env (the tld-only-zones spec §6.1): a
+	// comma-separated list, the value replaces the YAML (the style of the
+	// zone names).
 	if a := cfg.Ingest.AllowedZonePaths; strings.Join(a, ",") != "crawl.test,co.test" {
 		t.Errorf("ingest.allowed_zone_paths: ожидается [crawl.test co.test], получено %v", a)
 	}
-	// Карта override-лимитов per-IP из env (T-165): CIDR нормализуется
-	// маскированием, значение целиком заменяет карту из YAML.
+	// The per-IP override limits map from env (T-165): the CIDR is
+	// normalized by masking, the value replaces the YAML map entirely.
 	if o := cfg.HTTP.PerIPOverrides; len(o) != 2 || o["195.209.0.0/16"] != 9 || o["2a02:7b8::/32"] != 6 {
 		t.Errorf("http.per_ip_overrides: ожидается map[195.209.0.0/16:9 2a02:7b8::/32:6], получено %v", o)
 	}
-	// Карта проб из env: ключи приводятся к нижнему регистру, края
-	// значений обрезаются.
+	// The probes map from env: the keys are lower-cased, the value edges
+	// are trimmed.
 	if p := cfg.Dashboard.Probes; len(p) != 2 || p["mon"] != "http://mon:9100" || p["api"] != "http://api:9104" {
 		t.Errorf("dashboard.probes: ожидается map[api:http://api:9104 mon:http://mon:9100], получено %v", p)
 	}
-	// Список адресов панели движков из env (S-P2-2): элементы через
-	// запятую, значение заменяет YAML целиком; пустые элементы (лишние
-	// запятые) снимает normalize.
+	// The engines panel address list from env (S-P2-2): comma-separated
+	// elements, the value replaces the YAML entirely; the empty elements
+	// (extra commas) are removed by normalize.
 	if u := cfg.Dashboard.RenderMetrics; strings.Join(u, ";") != "http://env-render:9105/metrics;http://env-render-fb:9120/metrics" {
 		t.Errorf("dashboard.render_metrics_urls: ожидается [http://env-render:9105/metrics http://env-render-fb:9120/metrics], получено %v", u)
 	}
@@ -926,8 +933,8 @@ func TestEnvBadValues(t *testing.T) {
 	}
 }
 
-// Приоритет: переменные окружения > YAML > значение по умолчанию.
-// Пустое значение переменной считается незаданным.
+// The priority: environment variables > YAML > the default value.
+// An empty variable value counts as unset.
 func TestPriorityEnvYAMLDefault(t *testing.T) {
 	cfg := mustLoad(t, `
 postgres:
@@ -961,18 +968,19 @@ dashboard:
 	if cfg.Postgres.DSN != "postgres://yaml@db/crawler" {
 		t.Errorf("postgres.dsn должен прийти из YAML, получено %q", cfg.Postgres.DSN)
 	}
-	// Карта весов из env заменяет карту из YAML целиком (как списки).
+	// The weight map from env replaces the YAML map entirely (like the
+	// lists).
 	if w := cfg.Scheduler.ZoneWeights; len(w) != 1 || w["net"] != 9 {
 		t.Errorf("scheduler.zone_weights: ожидается map[net:9] (замена целиком), получено %v", w)
 	}
-	// Карта проб из env заменяет карту из YAML целиком (как списки
-	// и веса зон).
+	// The probes map from env replaces the YAML map entirely (like the
+	// lists and the zone weights).
 	if p := cfg.Dashboard.Probes; len(p) != 1 || p["live"] != "http://env-live:9100" {
 		t.Errorf("dashboard.probes: ожидается map[live:http://env-live:9100] (замена целиком), получено %v", p)
 	}
 }
 
-// Устаревшая APP_PG_DSN применяется, новая CRAWLER_POSTGRES_DSN важнее.
+// The deprecated APP_PG_DSN is applied; the new CRAWLER_POSTGRES_DSN wins.
 func TestLegacyPGDSN(t *testing.T) {
 	cfg := mustLoad(t, "", map[string]string{"APP_PG_DSN": "postgres://legacy@db/crawler"})
 	if cfg.Postgres.DSN != "postgres://legacy@db/crawler" {
@@ -998,7 +1006,7 @@ func TestConfigPath(t *testing.T) {
 		return func(k string) string { return m[k] }
 	}
 
-	// CRAWLER_CONFIG указывает на файл.
+	// CRAWLER_CONFIG points at the file.
 	cfg, err := LoadEnv(env(map[string]string{"CRAWLER_CONFIG": path}))
 	if err != nil {
 		t.Fatal(err)
@@ -1007,7 +1015,7 @@ func TestConfigPath(t *testing.T) {
 		t.Errorf("CRAWLER_CONFIG: файл не прочитан: %+v", cfg.Redis)
 	}
 
-	// Устаревшая APP_CONFIG работает как запасное имя.
+	// The deprecated APP_CONFIG works as the fallback name.
 	cfg, err = LoadEnv(env(map[string]string{"APP_CONFIG": path}))
 	if err != nil {
 		t.Fatal(err)
@@ -1016,13 +1024,13 @@ func TestConfigPath(t *testing.T) {
 		t.Errorf("APP_CONFIG: файл не прочитан")
 	}
 
-	// Явно заданный несуществующий файл — ошибка (а не молчаливые дефолты).
+	// An explicitly given missing file is an error (not silent defaults).
 	_, err = LoadEnv(env(map[string]string{"CRAWLER_CONFIG": filepath.Join(dir, "missing.yaml")}))
 	if err == nil || !strings.Contains(err.Error(), "missing.yaml") {
 		t.Errorf("ожидается ошибка с путём к файлу, получено %v", err)
 	}
 
-	// Без переменной и без ./config.yaml — только defaults + env.
+	// Without the variable and without ./config.yaml — defaults + env only.
 	cfg, err = LoadEnv(env(map[string]string{"CRAWLER_POSTGRES_DSN": "postgres://envonly@db/crawler"}))
 	if err != nil {
 		t.Fatal(err)
@@ -1038,7 +1046,8 @@ func TestEmptyYAMLFile(t *testing.T) {
 	if err := os.WriteFile(path, nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// LoadFile читает окружение процесса: DSN даём переменной через t.Setenv.
+	// LoadFile reads the process environment: the DSN is given to the
+	// variable via t.Setenv.
 	t.Setenv("CRAWLER_POSTGRES_DSN", "postgres://empty@db/crawler")
 	cfg, err := LoadFile(path)
 	if err != nil {
@@ -1049,17 +1058,18 @@ func TestEmptyYAMLFile(t *testing.T) {
 	}
 }
 
-// TestSchedulerBatchFitsStreamBudget — бюджетный инвариант стримов для
-// всей нормативной вилки пачек планировщика (T-141, ТЗ 3.2/5.3): потолок
-// q:dns пропорционален batch_size, и сумма потолков политики обязана
-// укладываться в бюджет Redis ≤ 512 МиБ даже при верхней границе вилки
-// (худший случай) — при noeviction потолок выше бюджета означал бы
-// отказ записи (OOM) раньше обрезки (инцидент T-093). Пин-тест
-// привязан к фактической границе валидации (maxSchedulerBatchSize):
-// расширение вилки обязано перепроверять бюджет (арифметика —
-// docs/redis.md §3.1; константы политики — queue.DefaultStreamMaxLen).
+// TestSchedulerBatchFitsStreamBudget — the stream budget invariant for
+// the whole normative range of the scheduler batches (T-141, spec
+// 3.2/5.3): the q:dns cap is proportional to batch_size, and the sum of
+// the policy caps must fit into the Redis budget ≤ 512 MiB even at the
+// upper bound of the range (the worst case) — with noeviction, a cap
+// above the budget would mean a write failure (OOM) before truncation
+// (the T-093 incident). The pin test is bound to the actual validation
+// boundary (maxSchedulerBatchSize): widening the range must re-check the
+// budget (the arithmetic — docs/redis.md §3.1; the policy constants —
+// queue.DefaultStreamMaxLen).
 func TestSchedulerBatchFitsStreamBudget(t *testing.T) {
-	const streamLimit = 480 << 20 // 512 МиБ ТЗ 3.2 − запас на служебную память
+	const streamLimit = 480 << 20 // 512 MiB of spec 3.2 − a margin for the service memory
 	total := queue.DefaultStreamMaxLen(queue.StreamDNS)*int64(maxSchedulerBatchSize)*queue.DNSStreamBytesPerDomain +
 		3*queue.DefaultStreamMaxLen(queue.StreamHTTP)*queue.UnitStreamBytesWorst +
 		queue.DefaultStreamMaxLen(queue.StreamRenderFallback)*queue.UnitStreamBytesWorst +
@@ -1326,29 +1336,29 @@ func TestValidate(t *testing.T) {
 		})
 	}
 
-	// Граничные корректные значения.
+	// Boundary-correct values.
 	c := valid()
 	c.Analyzer.LaravelMinScore = 1
 	c.HTTP.MaxRedirects = 0
-	c.HTTP.TaskConcurrency = 10000       // верхняя граница задачного параллелизма (T-139)
-	c.HTTP.TaskConsume = 1000            // верхняя граница пачки чтения
-	c.HTTP.TaskPerDomain = 126           // верхняя граница пула задачи: 2 × 63 субдомена (§5.10)
-	c.HTTP.MemLimit = ByteSize(16 << 30) // верхняя граница мягкого потолка кучи (T-163)
+	c.HTTP.TaskConcurrency = 10000       // the upper bound of the task parallelism (T-139)
+	c.HTTP.TaskConsume = 1000            // the upper bound of the read batch
+	c.HTTP.TaskPerDomain = 126           // the upper bound of the task pool: 2 × 63 subdomains (§5.10)
+	c.HTTP.MemLimit = ByteSize(16 << 30) // the upper bound of the soft heap ceiling (T-163)
 	c.Ingest.MaxErrorRatio = 1
-	c.Render.RestartMemoryBytes = 0                                                    // контроль памяти отключён — допустимо
-	c.Render.QueueHighWatermark = 100000000                                            // верхняя граница порога ёмкости q:render (T-174)
-	c.Render.RequeueDeprioritizedZones = []string{"com", "co.uk", "xn--p1ai"}          // границы имён зон (T-184)
-	c.Render.Fallback.WorkerRate = 1000000                                             // верхняя граница темпа воркера B (T-233)
-	c.Render.Fallback.SharePercent = 100                                               // верхняя граница бюджета доли фолбэка (T-233)
-	c.Render.Fallback.HealthGateStreak = 100                                           // верхняя граница стрика health-гейта (T-233)
-	c.Scheduler.BatchSize = 10000                                                      // верхняя граница пачек планировщика (ТЗ 5.3)
-	c.Scheduler.ZoneWeights = map[string]int{"com": 1, "co.uk": 500, "xn--p1ai": 1000} // границы весов
-	c.Web.Listen = "/run/crawler-web/web.sock"                                         // unix-сокет — вариант публичного входа web (T-124)
-	c.Web.PublicHost = "crawler.example.com:8443"                                      // канонический хост с портом (T-227)
-	c.Dashboard.Refresh = Duration(5 * time.Minute)                                    // верхняя граница периода снимков (ТЗД §8.3)
-	c.Dashboard.Probes = map[string]string{"dns-worker": "http://dns-worker:9102"}     // проба живости (ТЗД §5.8)
-	c.Monitor.SlowQueryInterval = 0                                                    // медленные запросы выключены — допустимо (T-177)
-	c.Monitor.SlowQueryMinDuration = 0                                                 // порог 0 — дефолт цикла (T-177)
+	c.Render.RestartMemoryBytes = 0                                                    // the memory control disabled — allowed
+	c.Render.QueueHighWatermark = 100000000                                            // the upper bound of the q:render capacity threshold (T-174)
+	c.Render.RequeueDeprioritizedZones = []string{"com", "co.uk", "xn--p1ai"}          // the bounds of the zone names (T-184)
+	c.Render.Fallback.WorkerRate = 1000000                                             // the upper bound of the worker B rate (T-233)
+	c.Render.Fallback.SharePercent = 100                                               // the upper bound of the fallback share budget (T-233)
+	c.Render.Fallback.HealthGateStreak = 100                                           // the upper bound of the health gate streak (T-233)
+	c.Scheduler.BatchSize = 10000                                                      // the upper bound of the scheduler batches (spec 5.3)
+	c.Scheduler.ZoneWeights = map[string]int{"com": 1, "co.uk": 500, "xn--p1ai": 1000} // the weight bounds
+	c.Web.Listen = "/run/crawler-web/web.sock"                                         // a unix socket — the public web entry variant (T-124)
+	c.Web.PublicHost = "crawler.example.com:8443"                                      // the canonical host with a port (T-227)
+	c.Dashboard.Refresh = Duration(5 * time.Minute)                                    // the upper bound of the snapshot period (the dashboard spec §8.3)
+	c.Dashboard.Probes = map[string]string{"dns-worker": "http://dns-worker:9102"}     // a liveness probe (the dashboard spec §5.8)
+	c.Monitor.SlowQueryInterval = 0                                                    // slow queries disabled — allowed (T-177)
+	c.Monitor.SlowQueryMinDuration = 0                                                 // a threshold of 0 — the loop default (T-177)
 	c.Subdomains = make([]string, maxSubdomains)
 	for i := range c.Subdomains {
 		c.Subdomains[i] = fmt.Sprintf("s%d", i)
@@ -1356,31 +1366,32 @@ func TestValidate(t *testing.T) {
 	if err := c.Validate(); err != nil {
 		t.Errorf("граничные значения должны быть валидны: %v", err)
 	}
-	c.Scheduler.BatchSize = 1000                             // нижняя граница пачек планировщика (ТЗ 5.3)
-	c.Dashboard.Refresh = Duration(time.Second)              // нижняя граница периода снимков (ТЗД §8.3)
-	c.Scheduler.BacklogInterval = Duration(30 * time.Second) // нижняя граница периода backlog (T-161)
-	c.Monitor.ZoneStatsInterval = Duration(30 * time.Second) // нижняя граница коридора ТЗ 5.9
-	c.Monitor.AlertsInterval = Duration(30 * time.Second)    // нижняя граница коридора T-206 (по образцу zone_stats_interval)
-	c.Dashboard.StatusCacheTTL = Duration(5 * time.Minute)   // верхняя граница коридора T-161
-	c.HTTP.MemLimit = 0                                      // мягкий потолок кучи выключен — допустимо (T-163)
-	c.Render.QueueHighWatermark = 1                          // нижняя граница явного порога q:render (T-174)
-	c.Render.Fallback.WorkerRate = 1                         // нижняя граница темпа воркера B (T-233)
-	c.Render.Fallback.SharePercent = 0                       // бюджет доли выключен — допустимо (T-233)
-	c.Render.Fallback.HealthGateStreak = 1                   // нижняя граница стрика health-гейта (T-233)
+	c.Scheduler.BatchSize = 1000                             // the lower bound of the scheduler batches (spec 5.3)
+	c.Dashboard.Refresh = Duration(time.Second)              // the lower bound of the snapshot period (the dashboard spec §8.3)
+	c.Scheduler.BacklogInterval = Duration(30 * time.Second) // the lower bound of the backlog period (T-161)
+	c.Monitor.ZoneStatsInterval = Duration(30 * time.Second) // the lower bound of the spec 5.9 corridor
+	c.Monitor.AlertsInterval = Duration(30 * time.Second)    // the lower bound of the T-206 corridor (following the zone_stats_interval pattern)
+	c.Dashboard.StatusCacheTTL = Duration(5 * time.Minute)   // the upper bound of the T-161 corridor
+	c.HTTP.MemLimit = 0                                      // the soft heap ceiling disabled — allowed (T-163)
+	c.Render.QueueHighWatermark = 1                          // the lower bound of the explicit q:render threshold (T-174)
+	c.Render.Fallback.WorkerRate = 1                         // the lower bound of the worker B rate (T-233)
+	c.Render.Fallback.SharePercent = 0                       // the share budget disabled — allowed (T-233)
+	c.Render.Fallback.HealthGateStreak = 1                   // the lower bound of the health gate streak (T-233)
 	if err := c.Validate(); err != nil {
 		t.Errorf("нижние границы должны быть валидны: %v", err)
 	}
-	c.Render.QueueHighWatermark = 0 // 0 — общий scheduler.queue_high_watermark, фолбэк (T-174)
+	c.Render.QueueHighWatermark = 0 // 0 — the shared scheduler.queue_high_watermark, the fallback (T-174)
 	if err := c.Validate(); err != nil {
 		t.Errorf("порог 0 (общий) должен быть валиден: %v", err)
 	}
 }
 
-// TestRenderEngineFallbackMatrix — матрица связки «движок × remote_url ×
-// restart_memory_bytes» (T-233, ТЗР §4.1 п.2, ФТ-2/ФТ-3): все комбинации
-// трёх движков и неизвестного значения с пустым/заданным remote_url и
-// нулевым/заданным порогом памяти; включённый фолбэк валиден на дефолтных
-// потолках. Границы диапазонов подсекции fallback — TestValidate.
+// TestRenderEngineFallbackMatrix — the matrix of the "engine × remote_url
+// × restart_memory_bytes" binding (T-233, the render spec §4.1 item 2,
+// FR-2/FR-3): all the combinations of the three engines and an unknown
+// value with an empty/set remote_url and a zero/set memory threshold; the
+// enabled fallback is valid at the default ceilings. The bounds of the
+// fallback subsection ranges — TestValidate.
 func TestRenderEngineFallbackMatrix(t *testing.T) {
 	const ws = "ws://10.0.0.9:9222"
 	tests := []struct {
@@ -1388,7 +1399,7 @@ func TestRenderEngineFallbackMatrix(t *testing.T) {
 		engine   string
 		remote   string
 		mem      ByteSize
-		wantErrs []string // пусто — конфиг валиден
+		wantErrs []string // empty — the config is valid
 	}{
 		{"chromium: собственный процесс (прод)", EngineChromium, "", ByteSize(1536 << 20), nil},
 		{"chromium: внешний CDP (dev-стек)", EngineChromium, ws, 0, nil},
@@ -1429,8 +1440,8 @@ func TestRenderEngineFallbackMatrix(t *testing.T) {
 			}
 		})
 	}
-	// Включённый фолбэк валиден на дефолтных потолках (enabled — не
-	// переключатель валидации, ФТ-14).
+	// The enabled fallback is valid at the default ceilings (enabled is
+	// not a validation switch, FR-14).
 	c := Default()
 	c.Postgres.DSN = "postgres://u:p@127.0.0.1:5432/crawler"
 	c.Render.Fallback.Enabled = true
@@ -1439,7 +1450,8 @@ func TestRenderEngineFallbackMatrix(t *testing.T) {
 	}
 }
 
-// Регистр субдоменов приводится к нижнему (normalize), «WWW» и «www» — дубль.
+// The subdomain case is reduced to lower (normalize); "WWW" and "www" are
+// a duplicate.
 func TestSubdomainsNormalize(t *testing.T) {
 	cfg := mustLoad(t, "subdomains:\n  - \"\"\n  - \" WWW \"\n  - \"Api\"\n", validDSN())
 	if want := []string{"", "www", "api"}; strings.Join(cfg.Subdomains, ",") != strings.Join(want, ",") {
@@ -1451,17 +1463,17 @@ func TestSubdomainsNormalize(t *testing.T) {
 	}
 }
 
-// Ключи весов зон приводятся к нижнему регистру без пробелов (normalize):
-// справочник зон хранит punycode-имена в нижнем регистре, «COM» и «com»
-// должны разрешаться одинаково.
+// The zone weight keys are lower-cased without spaces (normalize): the
+// zones reference table stores punycode names in lower case; "COM" and
+// "com" must resolve identically.
 func TestZoneWeightsNormalize(t *testing.T) {
 	cfg := mustLoad(t, "scheduler:\n  zone_weights:\n    \" COM \": 5\n    net: 2\n", validDSN())
 	if w := cfg.Scheduler.ZoneWeights; len(w) != 2 || w["com"] != 5 || w["net"] != 2 {
 		t.Errorf("scheduler.zone_weights после normalize: ожидается map[com:5 net:2], получено %v", w)
 	}
-	// Столкновение после приведения («Com» и «com») разрешается
-	// детерминированно — лексикографически больший ключ побеждает
-	// («com» > «Com»), независимо от порядка в YAML.
+	// A collision after folding ("Com" and "com") resolves
+	// deterministically — the lexicographically greater key wins
+	// ("com" > "Com"), regardless of the YAML order.
 	for _, yaml := range []string{
 		"scheduler:\n  zone_weights:\n    Com: 1\n    com: 2\n",
 		"scheduler:\n  zone_weights:\n    com: 2\n    Com: 1\n",
@@ -1473,26 +1485,27 @@ func TestZoneWeightsNormalize(t *testing.T) {
 	}
 }
 
-// Имена деприоритизированных зон приводятся к нижнему регистру без
-// пробелов (normalize, T-184): фильтр ступеней выборки сопоставляет по
-// zones.name — punycode нижним регистром; дубль после приведения ловит
-// валидация.
+// The names of the deprioritized zones are lower-cased without spaces
+// (normalize, T-184): the stage filter of the selection matches by
+// zones.name — lower-case punycode; a duplicate after folding is caught
+// by validation.
 func TestRequeueDeprioritizedZonesNormalize(t *testing.T) {
 	cfg := mustLoad(t, "render:\n  requeue_deprioritized_zones:\n    - \" XN--P1AI \"\n    - net\n", validDSN())
 	if z := cfg.Render.RequeueDeprioritizedZones; strings.Join(z, ",") != "xn--p1ai,net" {
 		t.Errorf("render.requeue_deprioritized_zones после normalize: ожидается [xn--p1ai net], получено %v", z)
 	}
-	// Дубль после приведения — ошибка валидации (как «WWW»/«www» у
-	// subdomains).
+	// A duplicate after folding is a validation error (like "WWW"/"www"
+	// for the subdomains).
 	_, err := loadFrom(t, "render:\n  requeue_deprioritized_zones:\n    - com\n    - \" COM \"\n", validDSN())
 	if err == nil || !strings.Contains(err.Error(), "duplicate") {
 		t.Errorf("com и COM после normalize — дубль, ожидается ошибка, получено %v", err)
 	}
 }
 
-// Env-список имён зон пропускает пустые элементы (хвостовая запятая,
-// шаблонные подстановки) — пустое имя зоны невозможно, отказ старта был
-// бы footgun (setZoneNames, по образцу пустых элементов карт).
+// The env list of zone names skips empty elements (a trailing comma,
+// templated substitutions) — an empty zone name is impossible; a startup
+// failure would be a footgun (setZoneNames, following the pattern of the
+// empty map elements).
 func TestRequeueDeprioritizedZonesEnvEmpty(t *testing.T) {
 	env := validDSN()
 	env["CRAWLER_RENDER_REQUEUE_DEPRIORITIZED_ZONES"] = " xn--p1ai , ,net, "
@@ -1502,17 +1515,17 @@ func TestRequeueDeprioritizedZonesEnvEmpty(t *testing.T) {
 	}
 }
 
-// Ключи проб дашборда приводятся к нижнему регистру без пробелов, края
-// URL обрезаются (normalize): имена сервисов — как в docker-сети и
-// заголовке секции здоровья дашборда.
+// The dashboard probe keys are lower-cased without spaces, the URL edges
+// are trimmed (normalize): the service names — as in the docker network
+// and the health section header of the dashboard.
 func TestDashboardProbesNormalize(t *testing.T) {
 	cfg := mustLoad(t, "dashboard:\n  probes:\n    \" DNS-Worker \": \" http://dns:9102 \"\n    mon: \"http://mon:9100\"\n", validDSN())
 	if p := cfg.Dashboard.Probes; len(p) != 2 || p["dns-worker"] != "http://dns:9102" || p["mon"] != "http://mon:9100" {
 		t.Errorf("dashboard.probes после normalize: ожидается map[dns-worker:http://dns:9102 mon:http://mon:9100], получено %v", p)
 	}
-	// Столкновение после приведения («Mon» и «mon») разрешается
-	// детерминированно — побеждает лексикографически больший ключ
-	// (как у весов зон), независимо от порядка в YAML.
+	// A collision after folding ("Mon" and "mon") resolves
+	// deterministically — the lexicographically greater key wins (like
+	// the zone weights), regardless of the YAML order.
 	for _, yaml := range []string{
 		"dashboard:\n  probes:\n    Mon: \"http://a:1\"\n    mon: \"http://b:1\"\n",
 		"dashboard:\n  probes:\n    mon: \"http://b:1\"\n    Mon: \"http://a:1\"\n",
@@ -1524,9 +1537,9 @@ func TestDashboardProbesNormalize(t *testing.T) {
 	}
 }
 
-// Адреса экспозиций панели движков чистятся от краевых пробелов и
-// пустых элементов (лишняя запятая в YAML не роняет секцию), порядок
-// сохраняется (T-246).
+// The panel exposure addresses of the engines are cleaned of edge spaces
+// and empty elements (an extra comma in the YAML does not bring the
+// section down); the order is preserved (T-246).
 func TestDashboardRenderMetricsNormalize(t *testing.T) {
 	cfg := mustLoad(t, "dashboard:\n  render_metrics_urls:\n    - \" http://render-worker:9105/metrics \"\n    - \"\"\n    - \"http://render-fallback:9110/metrics\"\n", validDSN())
 	want := []string{"http://render-worker:9105/metrics", "http://render-fallback:9110/metrics"}
@@ -1535,8 +1548,9 @@ func TestDashboardRenderMetricsNormalize(t *testing.T) {
 	}
 }
 
-// Регистр и пробелы log.level приводятся к каноничной форме (normalize);
-// уровень нужен каркасу сервисов (internal/service).
+// The case and spaces of log.level are reduced to the canonical form
+// (normalize); the level is needed by the service framework
+// (internal/service).
 func TestLogLevelNormalize(t *testing.T) {
 	cfg := mustLoad(t, "log:\n  level: \"  WARN \"\n", validDSN())
 	if cfg.Log.Level != "warn" {
@@ -1550,8 +1564,8 @@ func TestLogLevelNormalize(t *testing.T) {
 	}
 }
 
-// В таблице envSpecs нет повторов имён (рассинхронизация таблицы и
-// структуры ловится TestEnvOverrides, покрывающим каждую строку).
+// The envSpecs table has no duplicate names (a table/structure desync is
+// caught by TestEnvOverrides covering every row).
 func TestEnvSpecsNoDuplicates(t *testing.T) {
 	seen := map[string]bool{}
 	for _, s := range envSpecs() {

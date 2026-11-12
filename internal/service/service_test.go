@@ -25,7 +25,7 @@ import (
 	"crawler/internal/migrate"
 )
 
-// ---- Логирование ----
+// ---- Logging ----
 
 func TestLoggerServiceAttrAndAttrs(t *testing.T) {
 	var buf bytes.Buffer
@@ -48,7 +48,7 @@ func TestLoggerLevelFiltering(t *testing.T) {
 	}
 
 	buf.Reset()
-	logger := newLogger(&buf, "svc", logLevel("warn")) // уровень из значения конфига
+	logger := newLogger(&buf, "svc", logLevel("warn")) // the level from the config value
 	logger.Info("скрыто")
 	logger.Warn("видно")
 	if strings.Contains(buf.String(), "скрыто") {
@@ -60,12 +60,13 @@ func TestLoggerLevelFiltering(t *testing.T) {
 }
 
 func TestNewLoggerDefaultsToInfo(t *testing.T) {
-	// nil-конфиг (сервис без config.Load) — уровень info.
+	// A nil config (a service without config.Load) — the info level.
 	if got := NewLogger("svc", nil).Enabled(context.Background(), slog.LevelInfo); !got {
 		t.Error("NewLogger(nil-конфиг) должен включать уровень info")
 	}
 
-	// Уровень берётся из конфигурации: warn пропускает Warn и режет Info.
+	// The level comes from the configuration: warn lets Warn through and
+	// cuts Info.
 	cfg := &config.Config{}
 	cfg.Log.Level = "warn"
 	var buf bytes.Buffer
@@ -80,7 +81,7 @@ func TestNewLoggerDefaultsToInfo(t *testing.T) {
 	}
 }
 
-// NewLoggerForTest — NewLogger с подменой приёмника (stderr → буфер).
+// NewLoggerForTest — NewLogger with a substituted sink (stderr → a buffer).
 func NewLoggerForTest(w io.Writer, cfg *config.Config) *slog.Logger {
 	return newLogger(w, "svc", logLevel(cfg.Log.Level))
 }
@@ -92,9 +93,9 @@ func TestLogLevel(t *testing.T) {
 		"debug":       slog.LevelDebug,
 		"warn":        slog.LevelWarn,
 		"error":       slog.LevelError,
-		"WARN":        slog.LevelWarn, // регистр нормализован в config.normalize
+		"WARN":        slog.LevelWarn, // the case is normalized in config.normalize
 		" debug ":     slog.LevelDebug,
-		"трассировка": slog.LevelInfo, // недостижимо после валидации config
+		"трассировка": slog.LevelInfo, // unreachable after config validation
 	}
 	for in, want := range cases {
 		if got := logLevel(in); got != want {
@@ -103,10 +104,11 @@ func TestLogLevel(t *testing.T) {
 	}
 }
 
-// ---- Жизненный цикл (serve) ----
+// ---- Lifecycle (serve) ----
 
-// recorder — потокобезопасный журнал событий для проверки порядка
-// graceful shutdown (ТЗ 3.4: рабочая логика → HTTP метрик → пул БД).
+// recorder — a thread-safe event journal for checking the order of the
+// graceful shutdown (spec 3.4: the working logic → the HTTP metrics → the
+// DB pool).
 type recorder struct {
 	mu     sync.Mutex
 	events []string
@@ -135,7 +137,7 @@ func (r *recorder) snapshot() []string {
 	return append([]string(nil), r.events...)
 }
 
-// waitFor ждёт появления события: serve работает в горутинах.
+// waitFor waits for the event to appear: serve works in goroutines.
 func waitFor(t *testing.T, r *recorder, event string) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
@@ -148,18 +150,19 @@ func waitFor(t *testing.T, r *recorder, event string) {
 	t.Fatalf("событие %q не наступило за 2 с; события: %v", event, r.snapshot())
 }
 
-// lifecycle — один прогон serve: каналы сигналов, результат, события.
+// lifecycle — one serve run: the signal channels, the result, the events.
 type lifecycle struct {
 	rec      *recorder
-	finished chan struct{} // закрытие = serve вернулся; результат — в err
+	finished chan struct{} // closing = serve returned; the result is in err
 	err      error
 	term     chan os.Signal
 	hup      chan os.Signal
-	addr     string       // адрес HTTP-сервера метрик (127.0.0.1:порт)
-	ln       net.Listener // для имитации падения HTTP-сервера
+	addr     string       // the address of the metrics HTTP server (127.0.0.1:port)
+	ln       net.Listener // for simulating an HTTP server failure
 }
 
-// failHTTP имитирует падение HTTP-сервера: закрытие listener из-под Serve.
+// failHTTP simulates an HTTP server failure: closing the listener from
+// under Serve.
 func (lc *lifecycle) failHTTP(t *testing.T) {
 	t.Helper()
 	if err := lc.ln.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
@@ -167,9 +170,9 @@ func (lc *lifecycle) failHTTP(t *testing.T) {
 	}
 }
 
-// startServe запускает serve с тестовым Options; closePool фиксирует
-// закрытие пула БД, handler — хендлеры HTTP-сервера метрик теста,
-// rec — журнал событий теста (nil — свой).
+// startServe starts serve with the test Options; closePool records the
+// closing of the DB pool, handler — the metrics HTTP handlers of the
+// test, rec — the event journal of the test (nil — its own).
 func startServe(t *testing.T, opts Options, handler http.Handler, rec *recorder) *lifecycle {
 	t.Helper()
 	if rec == nil {
@@ -222,16 +225,16 @@ func (lc *lifecycle) waitDone(t *testing.T) error {
 	}
 }
 
-// TestServeShutdownOrder — §3.4: сигнал отменяет контекст OnRun, serve
-// ждёт завершения рабочей логики, HTTP-сервер дожидается начатого запроса,
-// пул БД закрывается последним.
+// TestServeShutdownOrder — §3.4: the signal cancels the OnRun context,
+// serve waits for the working logic to finish, the HTTP server waits for
+// the started request, the DB pool is closed last.
 func TestServeShutdownOrder(t *testing.T) {
 	rec := &recorder{}
 	ready := make(chan struct{})
 	mux := http.NewServeMux()
 	mux.HandleFunc("/slow", func(w http.ResponseWriter, _ *http.Request) {
 		rec.add("http-start")
-		time.Sleep(400 * time.Millisecond) // запрос в полёте в момент сигнала
+		time.Sleep(400 * time.Millisecond) // the request is in flight at the signal moment
 		rec.add("http-done")
 		_, _ = w.Write([]byte("ok"))
 	})
@@ -239,7 +242,7 @@ func TestServeShutdownOrder(t *testing.T) {
 		Name: "test",
 		OnRun: func(ctx context.Context) error {
 			close(ready)
-			<-ctx.Done() // «доработка текущей задачи» по отмене контекста
+			<-ctx.Done() // "finishing the current task" on the context cancellation
 			rec.add("onrun-done")
 			return nil
 		},
@@ -258,7 +261,7 @@ func TestServeShutdownOrder(t *testing.T) {
 	if err := lc.waitDone(t); err != nil {
 		t.Fatalf("serve: %v", err)
 	}
-	// http-start случился до сигнала; далее — строгий порядок §3.4.
+	// http-start happened before the signal; then — the strict order §3.4.
 	want := []string{"http-start", "onrun-done", "http-done", "pool-closed"}
 	got := rec.snapshot()
 	if len(got) != len(want) {
@@ -271,8 +274,8 @@ func TestServeShutdownOrder(t *testing.T) {
 	}
 }
 
-// TestServeOnRunCleanExit — самостоятельное завершение OnRun без сигнала
-// останавливает сервис (одноразовая задача), resources закрываются.
+// TestServeOnRunCleanExit — an independent OnRun completion without a
+// signal stops the service (a one-off task); the resources are closed.
 func TestServeOnRunCleanExit(t *testing.T) {
 	done := make(chan struct{})
 	lc := startServe(t, Options{
@@ -292,8 +295,8 @@ func TestServeOnRunCleanExit(t *testing.T) {
 	}
 }
 
-// TestServeOnRunError — ошибка рабочей логики останавливает сервис
-// и возвращается вызывающему (код выхода 1).
+// TestServeOnRunError — a working logic error stops the service
+// and is returned to the caller (the exit code 1).
 func TestServeOnRunError(t *testing.T) {
 	boom := errors.New("воркер сломался")
 	ready := make(chan struct{})
@@ -315,9 +318,9 @@ func TestServeOnRunError(t *testing.T) {
 	}
 }
 
-// TestServeShutdownTimeout — не остановившаяся за таймаут рабочая логика
-// не блокирует остановку навсегда: HTTP и пул закрываются, serve возвращает
-// ошибку таймаута.
+// TestServeShutdownTimeout — the working logic that did not stop within
+// the timeout does not block the shutdown forever: the HTTP and the pool
+// are closed; serve returns the timeout error.
 func TestServeShutdownTimeout(t *testing.T) {
 	rec := &recorder{}
 	ready := make(chan struct{})
@@ -327,7 +330,7 @@ func TestServeShutdownTimeout(t *testing.T) {
 		OnRun: func(ctx context.Context) error {
 			close(ready)
 			<-ctx.Done()
-			time.Sleep(500 * time.Millisecond) // игнорирует отмену
+			time.Sleep(500 * time.Millisecond) // ignores the cancellation
 			rec.add("late")
 			return nil
 		},
@@ -348,19 +351,20 @@ func TestServeShutdownTimeout(t *testing.T) {
 	}
 }
 
-// TestServeSecondSignalForcesExit — повторный сигнал в фазе ожидания OnRun
-// прерывает graceful shutdown (errForcedExit) без закрытия ресурсов.
+// TestServeSecondSignalForcesExit — a repeat signal in the OnRun waiting
+// phase interrupts the graceful shutdown (errForcedExit) without closing
+// the resources.
 func TestServeSecondSignalForcesExit(t *testing.T) {
 	rec := &recorder{}
 	ready := make(chan struct{})
 	lc := startServe(t, Options{
 		Name:            "test",
-		ShutdownTimeout: 10 * time.Second, // долго ждём OnRun — перебьём сигналом
+		ShutdownTimeout: 10 * time.Second, // we wait for OnRun long — interrupt with a signal
 		OnRun: func(ctx context.Context) error {
 			close(ready)
 			<-ctx.Done()
-			rec.add("stopping")          // serve вошёл в фазу остановки
-			block := make(chan struct{}) // «завис»: не завершается по отмене
+			rec.add("stopping")          // serve entered the shutdown phase
+			block := make(chan struct{}) // "stuck": does not finish on cancellation
 			<-block
 			return nil
 		},
@@ -384,7 +388,7 @@ func TestServeSecondSignalForcesExit(t *testing.T) {
 	}
 }
 
-// TestServeSIGHUP — SIGHUP до сигнала завершения доходит до OnSIGHUP.
+// TestServeSIGHUP — SIGHUP before the shutdown signal reaches OnSIGHUP.
 func TestServeSIGHUP(t *testing.T) {
 	rec := &recorder{}
 	ready := make(chan struct{})
@@ -408,9 +412,10 @@ func TestServeSIGHUP(t *testing.T) {
 	}
 }
 
-// TestServeHTTPServerError — падение HTTP-сервера останавливает сервис
-// с ошибкой; рабочая логика завершается по отмене контекста, ресурсы
-// закрываются (compose перезапустит сервис по restart-политике).
+// TestServeHTTPServerError — an HTTP server failure stops the service
+// with an error; the working logic finishes by the context cancellation;
+// the resources are closed (compose will restart the service per the
+// restart policy).
 func TestServeHTTPServerError(t *testing.T) {
 	rec := &recorder{}
 	ready := make(chan struct{})
@@ -418,14 +423,14 @@ func TestServeHTTPServerError(t *testing.T) {
 		Name: "test",
 		OnRun: func(ctx context.Context) error {
 			close(ready)
-			<-ctx.Done() // завершаемся по отмене после ошибки HTTP
+			<-ctx.Done() // finishing on the cancellation after the HTTP error
 			rec.add("onrun-done")
 			return nil
 		},
 	}, http.NewServeMux(), rec)
 
 	<-ready
-	lc.failHTTP(t) // «падение сервера»: закрытие listener из-под Serve
+	lc.failHTTP(t) // a "server failure": closing the listener from under Serve
 
 	err := lc.waitDone(t)
 	if err == nil || !strings.Contains(err.Error(), "metrics HTTP server") {
@@ -438,8 +443,9 @@ func TestServeHTTPServerError(t *testing.T) {
 	}
 }
 
-// TestServeOnRunPanic — паника рабочей логики не роняет процесс: serve
-// возвращает её как ошибку, ресурсы закрываются (graceful путь).
+// TestServeOnRunPanic — a panic of the working logic does not bring the
+// process down: serve returns it as an error, the resources are closed
+// (the graceful path).
 func TestServeOnRunPanic(t *testing.T) {
 	ready := make(chan struct{})
 	lc := startServe(t, Options{
@@ -462,15 +468,16 @@ func TestServeOnRunPanic(t *testing.T) {
 
 // ---- Run ----
 
-// TestRunValidation — имя сервиса обязательно.
+// TestRunValidation — the service name is mandatory.
 func TestRunValidation(t *testing.T) {
 	if err := Run(Options{}); err == nil || !strings.Contains(err.Error(), "service name") {
 		t.Fatalf("Run без Name = %v, хочу ошибку об обязательном имени", err)
 	}
 }
 
-// newDeadPool — пул на гарантированно закрытый порт для readiness-проверок:
-// Ping внутри пробы падает быстрее её секундного таймаута.
+// newDeadPool — a pool to a guaranteed closed port for the readiness
+// checks: the Ping inside the probe fails faster than its one-second
+// timeout.
 func newDeadPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	cfg, err := pgxpool.ParseConfig("postgres://nobody@127.0.0.1:1/crawler?sslmode=disable")
@@ -486,11 +493,11 @@ func newDeadPool(t *testing.T) *pgxpool.Pool {
 	return pool
 }
 
-// TestHealthzHandler — /healthz отражает готовность зависимостей:
-// без пула БД (сервис без OnDBPool/DSN) — 200; с пулом на недоступной
-// БД — 503: падение PostgreSQL видно readiness-пробой (потребитель —
-// оператор/мониторинг; compose-healthcheck сервисов приложения
-// с T-110 проверяет /livez).
+// TestHealthzHandler — /healthz reflects the dependency readiness:
+// without a DB pool (a service without OnDBPool/DSN) — 200; with a pool to
+// an unavailable DB — 503: the PostgreSQL failure is visible to the
+// readiness probe (the consumer is the operator/monitoring; the compose
+// healthchecks of the application services since T-110 check /livez).
 func TestHealthzHandler(t *testing.T) {
 	rec := httptest.NewRecorder()
 	healthzHandler(nil).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
@@ -507,10 +514,10 @@ func TestHealthzHandler(t *testing.T) {
 	}
 }
 
-// TestLivezHandler — liveness-проба всегда отвечает 200, пока процесс
-// жив: зависимостей не касается ни структурно (хендлер без параметров),
-// ни по смыслу — недоступные БД/Redis не повод считать процесс мёртвым
-// и требовать его рестарта.
+// TestLivezHandler — the liveness probe always answers 200 while the
+// process is alive: it does not touch the dependencies either structurally
+// (a handler without parameters) or by meaning — an unavailable DB/Redis
+// is not a reason to consider the process dead and demand its restart.
 func TestLivezHandler(t *testing.T) {
 	rec := httptest.NewRecorder()
 	livezHandler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/livez", nil))
@@ -519,10 +526,10 @@ func TestLivezHandler(t *testing.T) {
 	}
 }
 
-// TestRegisterProbes — маршрутизация проб на общем mux (путь Run):
-// ключевое разделение T-110 — живой процесс с мёртвой БД отвечает
-// /livez 200 (liveness) и /healthz 503 (readiness); посторонних
-// маршрутов пробы не занимают.
+// TestRegisterProbes — the probe routing on the shared mux (the Run path):
+// the key T-110 separation — a live process with a dead DB answers /livez
+// 200 (liveness) and /healthz 503 (readiness); the probes do not occupy
+// foreign routes.
 func TestRegisterProbes(t *testing.T) {
 	pool := newDeadPool(t)
 
@@ -541,26 +548,26 @@ func TestRegisterProbes(t *testing.T) {
 		t.Errorf("/healthz = %d, want 503 (readiness: БД недоступна)", got)
 	}
 	if got := get("/metrics"); got != http.StatusNotFound {
-		t.Errorf("/metrics = %d, want 404 (пробы не занимают чужие маршруты)", got)
+		t.Errorf("/metrics = %d, want 404 (the probes do not occupy foreign routes)", got)
 	}
 	if got := get("/nope"); got != http.StatusNotFound {
 		t.Errorf("/nope = %d, want 404", got)
 	}
 }
 
-// withMigrateUp подменяет применение миграций (шов migrateUp) и
-// возвращает функцию восстановления.
+// withMigrateUp substitutes the migration application (the migrateUp
+// seam) and returns the restore function.
 func withMigrateUp(f func(context.Context, string) error) func() {
 	old := migrateUp
 	migrateUp = f
 	return func() { migrateUp = old }
 }
 
-// TestRunSignalDuringMigrationWait — SIGTERM в фазе ожиданий миграций
-// (подключение к БД, advisory-блокировка) прерывает ожидание по
-// контексту и завершает сервис штатно: Run = nil, OnRun не запускался.
-// Обработчик обязан стоять раньше миграций: дефолтная реакция на сигнал
-// убила бы процесс здесь.
+// TestRunSignalDuringMigrationWait — SIGTERM in the migration waiting
+// phase (the DB connection, the advisory lock) interrupts the wait by the
+// context and finishes the service normally: Run = nil, OnRun was not
+// started. The handler must be installed before the migrations: the
+// default signal reaction would kill the process here.
 func TestRunSignalDuringMigrationWait(t *testing.T) {
 	prev := slog.Default()
 	defer slog.SetDefault(prev)
@@ -568,7 +575,7 @@ func TestRunSignalDuringMigrationWait(t *testing.T) {
 	started := make(chan struct{})
 	restore := withMigrateUp(func(ctx context.Context, _ string) error {
 		close(started)
-		<-ctx.Done() // фаза ожидания: прерывается отменой migCtx
+		<-ctx.Done() // the waiting phase: interrupted by the migCtx cancellation
 		return ctx.Err()
 	})
 	defer restore()
@@ -577,7 +584,7 @@ func TestRunSignalDuringMigrationWait(t *testing.T) {
 	go func() {
 		done <- Run(Options{
 			Name:        "run-test",
-			PGDSN:       "postgres://crawler@127.0.0.1:1/crawler", // маршрутизируется в заглушку
+			PGDSN:       "postgres://crawler@127.0.0.1:1/crawler", // routed into the stub
 			MetricsAddr: "127.0.0.1:0",
 			Logger:      newLogger(io.Discard, "run-test", slog.LevelError),
 			OnRun: func(context.Context) error {
@@ -601,10 +608,11 @@ func TestRunSignalDuringMigrationWait(t *testing.T) {
 	}
 }
 
-// TestRunSignalDuringMigrationInterrupted — сигнал в фазе применения
-// прерывает миграцию на стороне PostgreSQL (T-112): migrate.Up возвращает
-// ErrInterrupted (миграция откатана, версия — последняя применённая),
-// сервис завершается штатно (nil), не запуская рабочую логику.
+// TestRunSignalDuringMigrationInterrupted — a signal in the application
+// phase interrupts the migration on the PostgreSQL side (T-112):
+// migrate.Up returns ErrInterrupted (the migration rolled back, the
+// version is the last applied one); the service finishes normally (nil)
+// without starting the working logic.
 func TestRunSignalDuringMigrationInterrupted(t *testing.T) {
 	prev := slog.Default()
 	defer slog.SetDefault(prev)
@@ -612,7 +620,7 @@ func TestRunSignalDuringMigrationInterrupted(t *testing.T) {
 	started := make(chan struct{})
 	restore := withMigrateUp(func(ctx context.Context, _ string) error {
 		close(started)
-		<-ctx.Done() // «применение»: снято сигналом через pg_cancel_backend
+		<-ctx.Done() // "the application": cancelled by the signal via pg_cancel_backend
 		return fmt.Errorf("%w: миграция 8 отменена и откатана: %w",
 			migrate.ErrInterrupted, errors.New("canceling statement due to user request"))
 	})
@@ -646,10 +654,10 @@ func TestRunSignalDuringMigrationInterrupted(t *testing.T) {
 	}
 }
 
-// TestRunSignalDuringMigrationApply — запасной путь, когда снятие
-// применяющейся миграции невозможно (не-URL DSN, БД недоступна): миграция
-// дорабатывает до конца (C-04), затем сервис останавливается штатно,
-// не запуская рабочую логику.
+// TestRunSignalDuringMigrationApply — the fallback path when cancelling
+// the in-flight migration is impossible (a non-URL DSN, the DB
+// unavailable): the migration runs to the end (C-04), then the service
+// stops normally, without starting the working logic.
 func TestRunSignalDuringMigrationApply(t *testing.T) {
 	prev := slog.Default()
 	defer slog.SetDefault(prev)
@@ -659,7 +667,7 @@ func TestRunSignalDuringMigrationApply(t *testing.T) {
 		if err := syscall.Kill(syscall.Getpid(), syscall.SIGTERM); err != nil {
 			t.Error(err)
 		}
-		time.Sleep(150 * time.Millisecond) // «применение» продолжается после сигнала
+		time.Sleep(150 * time.Millisecond) // "the application" continues after the signal
 		close(applied)
 		return nil
 	})
@@ -687,16 +695,17 @@ func TestRunSignalDuringMigrationApply(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("Run не завершился после SIGTERM во время применения миграций")
 	}
-	select { // миграция реально доработала после сигнала, а не до него
+	select { // the migration really ran to the end after the signal, not before it
 	case <-applied:
 	default:
 		t.Error("миграция прервана сигналом (должна дорабатывать)")
 	}
 }
 
-// TestRunSecondSignalForcedExit — повторный сигнал в фазе ожидания OnRun
-// возвращает из Run ошибку принудительного выхода (раньше — os.Exit(1)
-// прямо в библиотеке: обход defer'ов, ветка не покрывалась тестами).
+// TestRunSecondSignalForcedExit — a repeat signal in the OnRun waiting
+// phase returns the forced exit error from Run (previously — os.Exit(1)
+// right in the library: bypassing the defers, the branch was not covered
+// by tests).
 func TestRunSecondSignalForcedExit(t *testing.T) {
 	prev := slog.Default()
 	defer slog.SetDefault(prev)
@@ -709,12 +718,12 @@ func TestRunSecondSignalForcedExit(t *testing.T) {
 			Name:            "run-test",
 			MetricsAddr:     "127.0.0.1:0",
 			Logger:          newLogger(io.Discard, "run-test", slog.LevelError),
-			ShutdownTimeout: 10 * time.Second, // фазу ожидания прерывает второй сигнал
+			ShutdownTimeout: 10 * time.Second, // the waiting phase is interrupted by the second signal
 			OnRun: func(ctx context.Context) error {
 				close(started)
 				<-ctx.Done()
 				close(stopping)
-				block := make(chan struct{}) // «зависает» в остановке
+				block := make(chan struct{}) // "hangs" in the shutdown
 				<-block
 				return nil
 			},
@@ -739,9 +748,9 @@ func TestRunSecondSignalForcedExit(t *testing.T) {
 	}
 }
 
-// TestNewRegistry — выбор реестра метрик: Options.Metrics (создан main-ом
-// под приборы рабочей логики, T-077) используется как есть, nil — каркас
-// строит собственный по имени сервиса.
+// TestNewRegistry — the metrics registry choice: Options.Metrics (created
+// by main for the instruments of the working logic, T-077) is used as is;
+// nil — the framework builds its own by the service name.
 func TestNewRegistry(t *testing.T) {
 	own := metrics.New("workers-svc")
 	if got := newRegistry(Options{Metrics: own}); got != own {
@@ -752,8 +761,9 @@ func TestNewRegistry(t *testing.T) {
 	if reg == nil {
 		t.Fatal("newRegistry без Metrics = nil, хочу собственный реестр каркаса")
 	}
-	// Собственный реестр каркаса инициализирован как metrics.New:
-	// прибор рабочей логики регистрируется фабрикой и виден в Gather.
+	// The framework's own registry is initialized as metrics.New: the
+	// instrument of the working logic is registered by the factory and
+	// visible in Gather.
 	tasks := reg.MustCounter(prometheus.CounterOpts{
 		Name: "crawler_stage_tasks_total",
 		Help: "Обработанные домены по этапам конвейера.",
@@ -774,9 +784,9 @@ func TestNewRegistry(t *testing.T) {
 	}
 }
 
-// TestRunWithOwnMetrics — Run принимает готовый реестр Options.Metrics
-// (T-077): сервис поднимается и завершается чисто, реестр остаётся
-// пригодным для приборов рабочей логики.
+// TestRunWithOwnMetrics — Run accepts the ready Options.Metrics registry
+// (T-077): the service comes up and finishes cleanly, the registry stays
+// fit for the instruments of the working logic.
 func TestRunWithOwnMetrics(t *testing.T) {
 	prev := slog.Default()
 	defer slog.SetDefault(prev)
@@ -799,8 +809,9 @@ func TestRunWithOwnMetrics(t *testing.T) {
 	}
 }
 
-// TestRunLifecycle — полный путь Run: инициализация, HTTP на свободном
-// порту, завершение OnRun без ошибки — nil; с ошибкой — она же наружу.
+// TestRunLifecycle — the full Run path: the initialization, the HTTP on a
+// free port, an OnRun completion without an error — nil; with an error —
+// it comes out as is.
 func TestRunLifecycle(t *testing.T) {
 	prev := slog.Default()
 	defer slog.SetDefault(prev)
@@ -828,8 +839,8 @@ func TestRunLifecycle(t *testing.T) {
 	}
 }
 
-// TestRunExtraMux — дополнительные хендлеры регистрируются до старта
-// рабочей логики (OnRun видит готовый mux-сервер).
+// TestRunExtraMux — the additional handlers are registered before the
+// working logic starts (OnRun sees the ready mux server).
 func TestRunExtraMux(t *testing.T) {
 	prev := slog.Default()
 	defer slog.SetDefault(prev)

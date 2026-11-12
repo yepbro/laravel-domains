@@ -1,6 +1,7 @@
-// Юнит-тесты миграционного раннера без БД: целостность встроенного
-// набора миграций (go:embed), разбор набора источником iofs, поведение
-// при недоступной БД и скрытие пароля в ошибках.
+// Unit tests of the migration runner without a DB: the integrity of the
+// embedded migration set (go:embed), the iofs source reading of the set,
+// the behavior with an unavailable DB and the password hiding in the
+// errors.
 package migrate
 
 import (
@@ -23,12 +24,12 @@ import (
 	"crawler/migrations"
 )
 
-// migrationName — формат golang-migrate: <версия>_<имя>.<up|down>.sql.
+// migrationName — the golang-migrate format: <version>_<name>.<up|down>.sql.
 var migrationName = regexp.MustCompile(`^(\d+)_(.+)\.(up|down)\.sql$`)
 
-// TestEmbeddedFiles_ValidPairs проверяет встроенный набор migrations/:
-// имена соответствуют формату golang-migrate, у каждой версии есть пара
-// up/down, версии идут с единицы без пропусков, файлы не пустые.
+// TestEmbeddedFiles_ValidPairs checks the embedded migrations/ set: the
+// names follow the golang-migrate format, every version has an up/down
+// pair, the versions start at 1 without gaps, the files are not empty.
 func TestEmbeddedFiles_ValidPairs(t *testing.T) {
 	entries, err := migrations.FS.ReadDir(".")
 	if err != nil {
@@ -78,9 +79,9 @@ func TestEmbeddedFiles_ValidPairs(t *testing.T) {
 	}
 }
 
-// TestSource_IOFS проверяет, что источник iofs читает встроенный набор
-// именно так, как его увидит golang-migrate при применении: версии по
-// возрастанию, у каждой читаются оба направления.
+// TestSource_IOFS checks that the iofs source reads the embedded set
+// exactly as golang-migrate will see it when applying: the versions in
+// ascending order, both directions readable for each.
 func TestSource_IOFS(t *testing.T) {
 	src, err := newSource()
 	if err != nil {
@@ -102,7 +103,8 @@ func TestSource_IOFS(t *testing.T) {
 		seen[next] = true
 		next, err = src.Next(next)
 	}
-	// iofs сообщает об окончании набора ошибкой fs.ErrNotExist, а не io.EOF.
+	// iofs reports the end of the set with an fs.ErrNotExist error, not
+	// io.EOF.
 	if err != nil && !errors.Is(err, fs.ErrNotExist) && !errors.Is(err, io.EOF) {
 		t.Fatalf("Next: неожиданная ошибка: %v", err)
 	}
@@ -134,7 +136,8 @@ func TestSource_IOFS(t *testing.T) {
 	}
 }
 
-// TestUp_EmptyDSN — раннер отказывается работать без DSN, не трогая сеть.
+// TestUp_EmptyDSN — the runner refuses to work without a DSN, without
+// touching the network.
 func TestUp_EmptyDSN(t *testing.T) {
 	if err := Up(t.Context(), ""); err == nil {
 		t.Fatal("Up с пустым DSN должен вернуть ошибку")
@@ -143,13 +146,14 @@ func TestUp_EmptyDSN(t *testing.T) {
 	}
 }
 
-// TestUp_ConnectTimeout — недоступная БД не подвешивает вызывающего
-// дольше настроенного таймаута подключения.
+// TestUp_ConnectTimeout — an unavailable DB does not hang the caller
+// longer than the configured connection timeout.
 func TestUp_ConnectTimeout(t *testing.T) {
 	restore := withConnectTimeout(300 * time.Millisecond)
 	defer restore()
 
-	// 127.0.0.1:1 — гарантированно закрытый порт, соединение падает сразу.
+	// 127.0.0.1:1 — a guaranteed closed port; the connection fails right
+	// away.
 	const dsn = "postgres://nobody:nopass@127.0.0.1:1/db?sslmode=disable"
 	start := time.Now()
 	err := Up(t.Context(), dsn)
@@ -164,9 +168,9 @@ func TestUp_ConnectTimeout(t *testing.T) {
 	}
 }
 
-// TestOpenAndWait_ClosesDBOnError — на путях ошибки (недоступная БД,
-// отмена контекста) *sql.DB закрывается: фейковый драйвер фиксирует
-// Close коннектора (database/sql вызывает его при db.Close()).
+// TestOpenAndWait_ClosesDBOnError — on the error paths (an unavailable
+// DB, a context cancellation) the *sql.DB is closed: the fake driver
+// records the connector Close (database/sql calls it at db.Close()).
 func TestOpenAndWait_ClosesDBOnError(t *testing.T) {
 	restore := withConnectTimeout(300 * time.Millisecond)
 	defer restore()
@@ -185,9 +189,9 @@ func TestOpenAndWait_ClosesDBOnError(t *testing.T) {
 	}
 }
 
-// failConnector — коннектор, чей Connect всегда падает; Close помечает
-// закрытие пула вызывающим кодом, connects считает попытки соединения
-// (каждая попытка cancelApplying обращается к БД минимум раз).
+// failConnector — a connector whose Connect always fails; Close marks the
+// pool closing by the calling code, connects counts the connection
+// attempts (every cancelApplying attempt touches the DB at least once).
 type failConnector struct {
 	closed   atomic.Bool
 	connects atomic.Int64
@@ -219,7 +223,7 @@ func registerFailDriver() {
 	failDriverOnce.Do(func() { sql.Register("failmigrate", failDriver{}) })
 }
 
-// TestRedactDSN — пароль не должен попадать в сообщения об ошибках.
+// TestRedactDSN — the password must not get into the error messages.
 func TestRedactDSN(t *testing.T) {
 	cases := []struct {
 		name, dsn, want string
@@ -262,10 +266,11 @@ func TestRedactDSN(t *testing.T) {
 	}
 }
 
-// TestWithRunnerTag — метка application_name адресует соединения раннера
-// для отмены применяющейся миграции (T-112): URL-DSN получает метку с
-// сохранением остальных параметров, не-URL DSN проходит без изменений
-// (отмена недоступна — работает поведение C-04 «дорабатывает»).
+// TestWithRunnerTag — the application_name label addresses the runner's
+// connections for cancelling an in-flight migration (T-112): a URL DSN
+// gets the label with the other parameters preserved; a non-URL DSN
+// passes unchanged (no cancellation available — the C-04 "runs to the
+// end" behavior works).
 func TestWithRunnerTag(t *testing.T) {
 	const tag = "crawler-migrations-123-1"
 	cases := []struct {
@@ -304,13 +309,14 @@ func TestWithRunnerTag(t *testing.T) {
 	}
 }
 
-// TestInterruptedInRun — якорь решения об откате версии (T-112): сброс
-// dirty-строки после отмены допустим только для ошибки из тела миграции
-// (драйвер pgx помечает её «migration failed») — тогда dirty-строка
-// гарантированно выставлена нашим прерванным применением.
+// TestInterruptedInRun — the anchor of the version rollback decision
+// (T-112): resetting the dirty row after the cancellation is allowed only
+// for an error from the migration body (the pgx driver marks it "migration
+// failed") — then the dirty row is guaranteed to have been set by our
+// interrupted application.
 func TestInterruptedInRun(t *testing.T) {
 	inRun := database.Error{OrigErr: errors.New("57014"), Err: "migration failed"}
-	// Форма PgError: драйвер дописывает текст сервера после метки.
+	// The PgError form: the driver appends the server text after the label.
 	inRunMsg := database.Error{OrigErr: errors.New("57014"), Err: "migration failed: canceling statement due to user request"}
 	lockWait := database.Error{OrigErr: errors.New("57014"), Err: "try lock failed"}
 	setVersion := database.Error{OrigErr: errors.New("57014")}
@@ -334,12 +340,13 @@ func TestInterruptedInRun(t *testing.T) {
 	}
 }
 
-// TestCancelApplying_RetriesUntilBudget — отмена применения не сдаётся
-// после первой неудачной попытки: одиночный запрос pg_cancel_backend
-// может попасть в зазор между пометкой dirty и началом файла миграции
-// (соединение раннера ещё idle — фильтру state='active' не соответствует)
-// или не выполниться. Фейковый драйвер считает попытки: после исчерпания
-// бюджета cancelApplying возвращает false, попыток больше одной.
+// TestCancelApplying_RetriesUntilBudget — the application cancellation
+// does not give up after the first failed attempt: a single
+// pg_cancel_backend query can land in the gap between marking dirty and
+// the start of the migration file (the runner's connection is still idle
+// — it does not match the state='active' filter) or fail to execute. The
+// fake driver counts the attempts: after the budget is exhausted
+// cancelApplying returns false; there is more than one attempt.
 func TestCancelApplying_RetriesUntilBudget(t *testing.T) {
 	restore := withCancelTimeout(300 * time.Millisecond)
 	defer restore()
@@ -355,7 +362,7 @@ func TestCancelApplying_RetriesUntilBudget(t *testing.T) {
 	}
 	defer func() { _ = db.Close() }()
 
-	done := make(chan struct{}) // не закрывается: бюджет — единственный выход
+	done := make(chan struct{}) // never closed: the budget is the only exit
 	before := failConnectorOf.connects.Load()
 	start := time.Now()
 	if cancelApplying(db, "crawler-migrations-test", done) {
@@ -369,11 +376,11 @@ func TestCancelApplying_RetriesUntilBudget(t *testing.T) {
 	}
 }
 
-// TestCancelApplying_StopsWhenUpDone — отмена прекращается, как только
-// завершилось само применение (upDone закрыт): дальше отменять нечего,
-// даже если бюджет не исчерпан и попытки не удаются.
+// TestCancelApplying_StopsWhenUpDone — the cancellation stops as soon as
+// the application itself finished (upDone closed): there is nothing left
+// to cancel, even if the budget is not exhausted and the attempts fail.
 func TestCancelApplying_StopsWhenUpDone(t *testing.T) {
-	restore := withCancelTimeout(10 * time.Second) // бюджет большой: выход только по done
+	restore := withCancelTimeout(10 * time.Second) // a large budget: the exit only by done
 	defer restore()
 	registerFailDriver()
 
@@ -414,16 +421,16 @@ func parseVersion(t *testing.T, s string) uint {
 	return v
 }
 
-// withConnectTimeout подменяет таймаут подключения для теста
-// и возвращает функцию восстановления.
+// withConnectTimeout substitutes the connection timeout for the test
+// and returns the restore function.
 func withConnectTimeout(d time.Duration) func() {
 	old := connectTimeout
 	connectTimeout = d
 	return func() { connectTimeout = old }
 }
 
-// withCancelTimeout подменяет бюджет отмены применения для теста
-// и возвращает функцию восстановления.
+// withCancelTimeout substitutes the application cancellation budget for
+// the test and returns the restore function.
 func withCancelTimeout(d time.Duration) func() {
 	old := cancelTimeout
 	cancelTimeout = d

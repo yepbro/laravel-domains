@@ -1,14 +1,15 @@
-// Тесты долгоживущего контура живой проверки (runtime.go, T-220).
-// Сети и БД нет: цепь резолверов подменяется швом newResolverChainFn
-// (счёт сборок и размеров пула без сокетов), пул БД — фейком с одной
-// строкой справочника субдоменов. Проверяются: контур собирает цепь
-// один раз с малым пулом UDP, Run переиспользует контур (параллельные
-// проверки не строят новых цепей), закрытие контура закрывает цепь
-// ровно раз и идемпотентно, фоновая перезагрузка правил останавливается
-// Close'ом, одноразовый Run (CLI) собирает и закрывает контур на вызов.
-// Прямой подсчёт fd не делается (недетерминирован в общем тест-раннере):
-// «fd не растут с числом запросов» следует из инварианта «все сокеты
-// открывает только сборка контура, контур один на сервис».
+// Tests of the long-lived live check circuit (runtime.go, T-220).
+// No network or DB: the resolver chain is substituted by the
+// newResolverChainFn seam (counting the builds and the pool sizes without
+// sockets), the DB pool — by a fake with one row of the subdomains
+// reference table. Checked: the circuit assembles the chain exactly once
+// with a small UDP pool, Run reuses the circuit (parallel checks build no
+// new chains), closing the circuit closes the chain exactly once and
+// idempotently, the background rules reload stops on Close, the one-off
+// Run (CLI) assembles and closes the circuit per call. A direct fd count
+// is not done (nondeterministic in a shared test runner): "the fds do not
+// grow with the request count" follows from the invariant "only the
+// circuit assembly opens sockets; the circuit is one per service".
 
 package checker
 
@@ -31,8 +32,8 @@ import (
 	"crawler/internal/dnsclient"
 )
 
-// chainSpy — шов сборки цепи: считает вызовы, запоминает размеры пула,
-// отдаёт фейковый резолвер; close считает закрытия цепи.
+// chainSpy — the chain assembly seam: counts the calls, remembers the
+// pool sizes, returns a fake resolver; close counts the chain closings.
 type chainSpy struct {
 	builds    atomic.Int32
 	closes    atomic.Int32
@@ -51,17 +52,17 @@ func (s *chainSpy) install(t *testing.T) {
 	t.Cleanup(func() { newResolverChainFn = prev })
 }
 
-// Exchange — «домена нет»: апекс сразу NXDOMAIN (терминальная ветка
-// конвейера, без HTTP-этапа), каждый вызов считается.
+// Exchange — "no such domain": the apex is NXDOMAIN right away (the
+// terminal branch of the pipeline, no HTTP stage); every call is counted.
 func (s *chainSpy) Exchange(context.Context, dnsclient.Question) (*dnsclient.Result, error) {
 	s.exchanges.Add(1)
 	return &dnsclient.Result{RCode: dnsclient.RCodeNXDOMAIN}, nil
 }
 
-// --- фейковый пул БД (справочник субдоменов) -----------------------------------
+// --- fake DB pool (the subdomains reference table) -----------------------------
 
-// rowsMini — pgx.Rows с заготовленными строками (позиционный Scan;
-// стиль webRows в internal/web).
+// rowsMini — pgx.Rows with pre-prepared rows (a positional Scan; the
+// style of webRows in internal/web).
 type rowsMini struct {
 	rows [][]any
 	i    int
@@ -106,7 +107,7 @@ func (r *rowsMini) RawValues() [][]byte    { return nil }
 func (r *rowsMini) Conn() *pgx.Conn        { return nil }
 func (r *rowsMini) TypeMap() *pgtype.Map   { return nil }
 
-// poolFake — db.DB для LoadSubdomains: одна строка (апекс, включён).
+// poolFake — a db.DB for LoadSubdomains: one row (the apex, enabled).
 type poolFake struct{}
 
 func (poolFake) Ping(context.Context) error { return nil }
@@ -120,8 +121,8 @@ func (poolFake) Query(context.Context, string, ...any) (pgx.Rows, error) {
 	return &rowsMini{rows: [][]any{{int16(0), "", true}}}, nil
 }
 
-// testCfg — конфиг контура без сети: правила во временном каталоге,
-// рендер выключен.
+// testCfg — a circuit config without a network: the rules in a temp
+// directory, the render disabled.
 func testCfg(t *testing.T) *config.Config {
 	t.Helper()
 	cfg := config.Default()
@@ -129,8 +130,8 @@ func testCfg(t *testing.T) *config.Config {
 	return cfg
 }
 
-// writeRules — минимальный валидный набор правил (смена id меняет
-// rules_version — для теста перезагрузки).
+// writeRules — a minimal valid rule set (a changed id changes
+// rules_version — for the reload test).
 func writeRules(t *testing.T, id string) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -141,9 +142,9 @@ func writeRules(t *testing.T, id string) string {
 	return dir
 }
 
-// TestNewRuntimeSmallPoolOnce — контур собирает цепь ровно раз с малым
-// пулом UDP (LiveUDPPoolSize по умолчанию, явное значение — как есть),
-// рендер без render.remote_url не создаётся.
+// TestNewRuntimeSmallPoolOnce — the circuit assembles the chain exactly
+// once with a small UDP pool (LiveUDPPoolSize by default, an explicit
+// value as is); the render is not created without render.remote_url.
 func TestNewRuntimeSmallPoolOnce(t *testing.T) {
 	spy := &chainSpy{}
 	spy.install(t)
@@ -164,8 +165,8 @@ func TestNewRuntimeSmallPoolOnce(t *testing.T) {
 	}
 }
 
-// TestNewRuntimeExplicitPool — явный UDPPoolSize доходит до клиентов
-// цепи (владелец может сузить пул сильнее нормы).
+// TestNewRuntimeExplicitPool — an explicit UDPPoolSize reaches the clients
+// of the chain (the owner may narrow the pool further than the norm).
 func TestNewRuntimeExplicitPool(t *testing.T) {
 	spy := &chainSpy{}
 	spy.install(t)
@@ -180,12 +181,12 @@ func TestNewRuntimeExplicitPool(t *testing.T) {
 	}
 }
 
-// TestRuntimeRunReusesCircuit — нагрузочный инвариант (T-220): 10
-// параллельных проверок на одном контуре не строят новых цепей — вся
-// сетевая сборка (сокеты UDP) сделана один раз на NewRuntime, Run
-// только гоняет конвейер. Каждый Run доходит до DNS-обмена фейка
-// (NXDOMAIN апекса — терминальная ветка без HTTP) и завершается без
-// ошибки.
+// TestRuntimeRunReusesCircuit — the load invariant (T-220): 10 parallel
+// checks on one circuit build no new chains — all the network assembly
+// (the UDP sockets) is done once at NewRuntime; Run only runs the
+// pipeline. Every Run reaches the DNS exchange of the fake (an NXDOMAIN
+// apex — the terminal branch without HTTP) and finishes without an
+// error.
 func TestRuntimeRunReusesCircuit(t *testing.T) {
 	spy := &chainSpy{}
 	spy.install(t)
@@ -222,8 +223,9 @@ func TestRuntimeRunReusesCircuit(t *testing.T) {
 	}
 }
 
-// TestRuntimeCloseClosesChainOnce — Close закрывает цепь ровно раз и
-// идемпотентен (защита от двойного Close владельцем и отложенным Run).
+// TestRuntimeCloseClosesChainOnce — Close closes the chain exactly once
+// and is idempotent (protection against a double Close by the owner and
+// a delayed Run).
 func TestRuntimeCloseClosesChainOnce(t *testing.T) {
 	spy := &chainSpy{}
 	spy.install(t)
@@ -243,9 +245,9 @@ func TestRuntimeCloseClosesChainOnce(t *testing.T) {
 	}
 }
 
-// TestRunOneShotBuildsAndCloses — свободная функция Run (CLI crawlerctl
-// check): контур на один вызов — цепь собрана и закрыта по разу, без
-// фоновой перезагрузки правил.
+// TestRunOneShotBuildsAndCloses — the free Run function (the CLI
+// crawlerctl check): a circuit for one call — the chain assembled and
+// closed once each, without the background rules reload.
 func TestRunOneShotBuildsAndCloses(t *testing.T) {
 	spy := &chainSpy{}
 	spy.install(t)
@@ -261,9 +263,9 @@ func TestRunOneShotBuildsAndCloses(t *testing.T) {
 	}
 }
 
-// TestRuntimeRulesReload — фоновая перезагрузка (T-220): смена набора
-// на диске подхватывается таймером без пересборки контура; Close
-// останавливает цикл (tickDone закрыт).
+// TestRuntimeRulesReload — the background reload (T-220): a set change on
+// the disk is picked up by the timer without rebuilding the circuit;
+// Close stops the loop (tickDone closed).
 func TestRuntimeRulesReload(t *testing.T) {
 	spy := &chainSpy{}
 	spy.install(t)
@@ -280,7 +282,7 @@ func TestRuntimeRulesReload(t *testing.T) {
 		t.Fatalf("начальный набор: %q, ожидался rule_one", got)
 	}
 
-	// Смена набора: другой id → другой rules_version.
+	// A set change: another id → another rules_version.
 	yaml := "rules:\n  - id: rule_two\n    target: cookie_name\n    match: app_session\n    weight: 0.2\n"
 	if err := os.WriteFile(filepath.Join(dir, "live.yaml"), []byte(yaml), 0o644); err != nil {
 		t.Fatal(err)
@@ -299,7 +301,7 @@ func TestRuntimeRulesReload(t *testing.T) {
 		t.Fatalf("перезагрузка правил пересобрала цепь (%d сборок)", got)
 	}
 
-	// Close останавливает цикл перезагрузки.
+	// Close stops the reload loop.
 	if err := rt.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -310,9 +312,10 @@ func TestRuntimeRulesReload(t *testing.T) {
 	}
 }
 
-// TestNewRuntimeRendererConfigured — render.remote_url настраивает
-// менеджер на контуре (без Start: поколение браузера поднимается лениво
-// первым рендером — старт не ходит в сеть и не деградирует сервис).
+// TestNewRuntimeRendererConfigured — render.remote_url configures the
+// manager on the circuit (no Start: the browser generation is raised
+// lazily by the first render — the start does not touch the network and
+// does not degrade the service).
 func TestNewRuntimeRendererConfigured(t *testing.T) {
 	spy := &chainSpy{}
 	spy.install(t)
@@ -329,8 +332,9 @@ func TestNewRuntimeRendererConfigured(t *testing.T) {
 	}
 }
 
-// TestNewRuntimeBadRules — сбой начальной загрузки правил: контур не
-// создаётся, частично собранные ресурсы (цепь) закрыты — утечки нет.
+// TestNewRuntimeBadRules — a failure of the initial rules load: the
+// circuit is not created, the partially assembled resources (the chain)
+// are closed — no leak.
 func TestNewRuntimeBadRules(t *testing.T) {
 	spy := &chainSpy{}
 	spy.install(t)

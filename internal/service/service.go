@@ -1,17 +1,18 @@
-// Package service — общий каркас Go-сервисов Domain Crawler.
+// Package service — the shared framework of the Domain Crawler Go
+// services.
 //
-// Каркас берёт на себя всё, что не относится к рабочей логике сервиса:
-// структурированное логирование (log/slog, уровень из конфигурации),
-// применение миграций и пул подключений PostgreSQL (internal/migrate,
-// internal/db), HTTP-сервер с пробами /livez + /healthz и метриками
-// /metrics (internal/metrics, ТЗ 4.1, 5.9; T-110) и graceful shutdown
-// по ТЗ 3.4: при SIGTERM/SIGINT сначала
-// отменяется контекст рабочей логики (Options.OnRun) и каркас ждёт её
-// завершения, затем останавливается HTTP-сервер метрик, последним
-// закрывается пул БД. Повторный сигнал прерывает ожидание — принудительный
-// выход. SIGHUP — перезагрузка правил без рестарта (ТЗ 5.8). Рабочая логика
-// подключается опцией OnRun (воркеры этапов 2+); сейчас сервисы-заглушки
-// живут до сигнала завершения.
+// The framework takes care of everything not related to the working logic
+// of a service: structured logging (log/slog, the level from the
+// configuration), applying the migrations and the PostgreSQL connection
+// pool (internal/migrate, internal/db), an HTTP server with the /livez +
+// /healthz probes and the /metrics metrics (internal/metrics, spec 4.1,
+// 5.9; T-110) and graceful shutdown per spec 3.4: on SIGTERM/SIGINT the
+// context of the working logic (Options.OnRun) is cancelled first and the
+// framework waits for it to finish, then the metrics HTTP server stops,
+// and the DB pool is closed last. A repeat signal interrupts the wait — a
+// forced exit. SIGHUP — a rules reload without a restart (spec 5.8). The
+// working logic is plugged in via the OnRun option (the workers of the
+// stages 2+); for now the stub services live until the shutdown signal.
 package service
 
 import (
@@ -36,87 +37,98 @@ import (
 	"crawler/internal/migrate"
 )
 
-// DefaultShutdownTimeout — бюджет graceful shutdown по умолчанию: время,
-// за которое рабочая логика обязана доработать текущую задачу или вернуть
-// её в очередь (ТЗ 3.4).
+// DefaultShutdownTimeout — the default graceful shutdown budget: the time
+// within which the working logic must finish the current task or return
+// it to the queue (spec 3.4).
 const DefaultShutdownTimeout = 10 * time.Second
 
-// Options — параметры запуска сервиса.
+// Options — the service startup parameters.
 type Options struct {
-	// Name — имя сервиса (ingest, analyzer, ...), используется в логах и метриках.
+	// Name — the service name (ingest, analyzer, ...), used in the logs
+	// and metrics.
 	Name string
-	// MetricsAddr — адрес HTTP-сервера метрик, например ":9101".
+	// MetricsAddr — the address of the metrics HTTP server, for example
+	// ":9101".
 	MetricsAddr string
-	// Config — конфигурация сервиса (internal/config, ТЗ 5.10): загружается
-	// в main через config.Load (приоритет: env > YAML > defaults). Если
-	// задан, DSN PostgreSQL берётся из него.
+	// Config — the service configuration (internal/config, spec 5.10):
+	// loaded in main via config.Load (the priority: env > YAML >
+	// defaults). If set, the PostgreSQL DSN is taken from it.
 	Config *config.Config
-	// PGDSN — DSN PostgreSQL напрямую; имеет приоритет над Config
-	// (используется утилитами, которым конфиг-файл не нужен). Если задан,
-	// сервис перед стартом применяет встроенные миграции схемы
-	// (internal/migrate): все долгоживущие сервисы проекта работают с БД
-	// (ТЗ 6.3), healthcheck отвечает только на актуальной схеме. Пустая
-	// строка вместе с пустым Config.Postgres.DSN — сервис без БД.
+	// PGDSN — the PostgreSQL DSN directly; it has priority over Config
+	// (used by utilities that do not need a config file). If set, the
+	// service applies the embedded schema migrations before start
+	// (internal/migrate): all the long-lived services of the project work
+	// with the DB (spec 6.3), the healthcheck answers only on the current
+	// schema. An empty string together with an empty Config.Postgres.DSN —
+	// a service without a DB.
 	PGDSN string
-	// OnDBPool — инициализация БД-части сервиса (T-007): если задан и DSN
-	// известен, каркас после применения миграций создаёт пул подключений
-	// internal/db (postgres.dsn + postgres.pool_size из Config, либо
-	// PGDSN с размером по умолчанию) и вызывает OnDBPool с готовым пулом.
-	// Пул закрывается каркасом при graceful shutdown — последним, после
-	// завершения OnRun и остановки HTTP-сервера метрик. nil — сервису пул
-	// не нужен (текущие заглушки): соединения не открываются.
+	// OnDBPool — the initialization of the DB part of the service (T-007):
+	// if set and the DSN is known, the framework creates the internal/db
+	// connection pool after applying the migrations (postgres.dsn +
+	// postgres.pool_size from Config, or PGDSN with a default size) and
+	// calls OnDBPool with the ready pool. The pool is closed by the
+	// framework at graceful shutdown — last, after OnRun finishes and the
+	// metrics HTTP server stops. nil — the service needs no pool (the
+	// current stubs): connections are not opened.
 	OnDBPool func(pool *pgxpool.Pool)
-	// DBAfterConnect — настройка каждого соединения пула БД
-	// (db.AfterConnectFunc, T-171): nil — по умолчанию. Хуки сессии:
-	// db.NoParallelGather — сервисы с агрегатными/сканирующими фоновыми
-	// проходами (T-171 — мониторинг; T-201 — http-worker:
-	// retention-дренаж), write-пулы конвейера (db.LockTimeout —
-	// потолок ожидания строковых блокировок, T-192); несколько хуков —
-	// композицией db.JoinHooks (перечень по сервисам — docs/db.md
-	// §«AfterConnect-хуки»).
+	// DBAfterConnect — the setup of every pool connection of the DB
+	// (db.AfterConnectFunc, T-171): nil — the default. The session hooks:
+	// db.NoParallelGather — services with aggregate/scanning background
+	// passes (T-171 — monitoring; T-201 — the http-worker retention
+	// drain), the pipeline write pools (db.LockTimeout — the ceiling of
+	// waiting for row locks, T-192); several hooks — via a composition of
+	// db.JoinHooks (the list per service — docs/db.md §"AfterConnect
+	// hooks").
 	DBAfterConnect db.AfterConnectFunc
-	// OnRun — рабочая логика сервиса (воркеры этапов 2+): вызывается после
-	// полной инициализации (миграции, пул, HTTP метрик). Полученный
-	// контекст отменяется при SIGTERM/SIGINT — по отмене воркер дорабатывает
-	// текущую задачу или возвращает её в очередь (ТЗ 3.4) и возвращается;
-	// каркас ждёт возврата в пределах ShutdownTimeout. Возврат без сигнала
-	// останавливает сервис: nil — чистое завершение (одноразовые задачи),
-	// ошибка — завершение с кодом 1. nil — заглушка без рабочей логики:
-	// сервис живёт до сигнала завершения.
+	// OnRun — the working logic of the service (the workers of the
+	// stages 2+): called after the full initialization (the migrations,
+	// the pool, the HTTP metrics). The received context is cancelled on
+	// SIGTERM/SIGINT — on cancellation the worker finishes the current
+	// task or returns it to the queue (spec 3.4) and returns; the
+	// framework waits for the return within ShutdownTimeout. A return
+	// without a signal stops the service: nil — a clean completion
+	// (one-off tasks), an error — a completion with exit code 1. nil — a
+	// stub without working logic: the service lives until the shutdown
+	// signal.
 	OnRun func(ctx context.Context) error
-	// OnSIGHUP вызывается при получении SIGHUP (перезагрузка правил Laravel).
+	// OnSIGHUP is called on receiving SIGHUP (a reload of the Laravel
+	// rules).
 	OnSIGHUP func()
-	// ExtraMux позволяет зарегистрировать дополнительные хендлеры.
+	// ExtraMux allows registering additional handlers.
 	ExtraMux func(mux *http.ServeMux)
-	// Metrics — реестр Prometheus сервиса (internal/metrics): если задан,
-	// каркас отдаёт через /metrics именно его вместо собственного
-	// metrics.New(Name). main создаёт реестр заранее, чтобы построить
-	// приборы рабочей логики до старта OnRun (воркеры и коллекторы
-	// получают его же, T-077); nil — каркас создаёт реестр сам
-	// (сервисам без собственных приборов).
+	// Metrics — the Prometheus registry of the service (internal/metrics):
+	// if set, the framework serves exactly it via /metrics instead of its
+	// own metrics.New(Name). main creates the registry in advance, to
+	// build the instruments of the working logic before OnRun starts (the
+	// workers and the collectors get the same one, T-077); nil — the
+	// framework creates the registry itself (for services without their
+	// own instruments).
 	Metrics *metrics.Registry
-	// Logger — структурированный логгер сервиса (см. NewLogger). nil —
-	// каркас создаёт логгер сам и делает его дефолтным (slog.SetDefault).
+	// Logger — the structured logger of the service (see NewLogger). nil —
+	// the framework creates the logger itself and makes it the default
+	// (slog.SetDefault).
 	Logger *slog.Logger
-	// ShutdownTimeout — бюджет graceful shutdown (ожидание OnRun и остановка
-	// HTTP-сервера метрик); 0 или отрицательное — DefaultShutdownTimeout.
+	// ShutdownTimeout — the graceful shutdown budget (waiting for OnRun
+	// and stopping the metrics HTTP server); 0 or negative —
+	// DefaultShutdownTimeout.
 	ShutdownTimeout time.Duration
 }
 
-// errForcedExit — повторный сигнал завершения во время graceful shutdown:
-// Run возвращает её вызывающему немедленно, не дожидаясь OnRun и очистки
-// ресурсов (HTTP-сервер метрик, пул) — main выходит с кодом 1, как и для
-// любой ошибки Run.
+// errForcedExit — a repeat shutdown signal during graceful shutdown: Run
+// returns it to the caller immediately, without waiting for OnRun and the
+// resource cleanup (the metrics HTTP server, the pool) — main exits with
+// code 1, as with any Run error.
 var errForcedExit = errors.New("second shutdown signal")
 
-// migrateUp — применение миграций при старте (internal/migrate.Up);
-// перемененная для подмены в тестах жизненного цикла (шов в духе
-// lockTimeout/connectTimeout в internal/migrate).
+// migrateUp — applying the migrations at start (internal/migrate.Up);
+// the variable is for substitution in the lifecycle tests (a seam in the
+// spirit of lockTimeout/connectTimeout in internal/migrate).
 var migrateUp = migrate.Up
 
-// newRegistry — реестр метрик сервиса: Options.Metrics, если main создал
-// его сам (приборы рабочей логики строятся до старта OnRun, T-077), иначе
-// собственный metrics.New по имени сервиса.
+// newRegistry — the metrics registry of the service: Options.Metrics if
+// main created it itself (the instruments of the working logic are built
+// before OnRun starts, T-077), otherwise its own metrics.New by the
+// service name.
 func newRegistry(opts Options) *metrics.Registry {
 	if opts.Metrics != nil {
 		return opts.Metrics
@@ -124,7 +136,7 @@ func newRegistry(opts Options) *metrics.Registry {
 	return metrics.New(opts.Name)
 }
 
-// EnvOr возвращает значение переменной окружения или defaultVal.
+// EnvOr returns the value of the environment variable or defaultVal.
 func EnvOr(key, defaultVal string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
@@ -132,27 +144,29 @@ func EnvOr(key, defaultVal string) string {
 	return defaultVal
 }
 
-// Run поднимает сервис (миграции → пул БД → HTTP метрик → OnRun) и
-// блокирует до завершения: SIGTERM/SIGINT (graceful shutdown), ошибка
-// рабочей логики или HTTP-сервера либо нормальное завершение OnRun.
-// Все ошибки Run логирует сам (уровень Error, с контекстом сервиса) и
-// возвращает вызывающему main — тому достаточно выйти с кодом 1:
+// Run brings up the service (the migrations → the DB pool → the HTTP
+// metrics → OnRun) and blocks until completion: SIGTERM/SIGINT (a graceful
+// shutdown), an error of the working logic or the HTTP server, or a normal
+// OnRun completion. Run logs all of its errors itself (at the Error level,
+// with the service context) and returns them to the calling main — it only
+// needs to exit with code 1:
 //
 //	if err := service.Run(opts); err != nil {
 //		os.Exit(1)
 //	}
 //
-// Сигнал завершения во время применения миграций не убивает процесс
-// посреди миграции: отменяются фазы ожидания, а применяющаяся миграция
-// прерывается снятием SQL-запроса на стороне PostgreSQL (internal/migrate,
-// T-112) — недоведённый файл откатывается целиком, версия схемы
-// возвращается к предыдущей, и сервис останавливается штатно (Run
-// возвращает nil); повторный старт доводит применение. Если снять запрос
-// не удалось, миграция дорабатывает до конца (поведение C-04).
+// A shutdown signal during the migration application does not kill the
+// process in the middle of the migration: the waiting phases are
+// cancelled, and the in-flight migration is interrupted by cancelling the
+// SQL query on the PostgreSQL side (internal/migrate, T-112) — the
+// unfinished file rolls back entirely, the schema version returns to the
+// previous one, and the service stops normally (Run returns nil); the next
+// start finishes the application. If the query could not be cancelled, the
+// migration runs to the end (the C-04 behavior).
 //
-// Повторный сигнал завершения во время graceful shutdown — Run немедленно
-// возвращает ошибку принудительного выхода без ожидания OnRun и очистки
-// ресурсов; main выходит с кодом 1, как и для любой ошибки Run.
+// A repeat shutdown signal during graceful shutdown — Run immediately
+// returns the forced exit error without waiting for OnRun and the resource
+// cleanup; main exits with code 1, as with any Run error.
 func Run(opts Options) error {
 	if opts.Name == "" {
 		return errors.New("service: service name is required")
@@ -166,22 +180,24 @@ func Run(opts Options) error {
 	if opts.Logger == nil {
 		opts.Logger = NewLogger(opts.Name, opts.Config)
 	}
-	// Дефолтный логгер — логгер сервиса: миграции (ниже) и код сервиса
-	// через slog.Default пишут с контекстом имени.
+	// The default logger is the service logger: the migrations (below) and
+	// the service code via slog.Default write with the name context.
 	slog.SetDefault(opts.Logger)
 
-	// Обработчики сигналов ставятся ДО миграций: дефолтная реакция на
-	// SIGTERM/SIGINT убила бы процесс посреди применения миграции, а
-	// golang-migrate помечает версию dirty до выполнения файла и снимает
-	// флаг только после успеха — следующий старт ВСЕХ сервисов упал бы
-	// на migrate.ErrDirty до ручного TRUNCATE schema_migrations. Сигнал
-	// во время миграций отменяет фазы ожидания (подключение к БД,
-	// advisory-блокировка) по контексту; применение прерывается снятием
-	// SQL-запроса на стороне PostgreSQL (internal/migrate, T-112):
-	// недоведённая миграция откатывается целиком, версия — к предыдущей.
-	// Если снятие невозможно (не-URL DSN, БД недоступна) — миграция
-	// дорабатывает (C-04). В обоих случаях сервис останавливается
-	// штатно, не запуская рабочую логику.
+	// The signal handlers are installed BEFORE the migrations: the default
+	// reaction to SIGTERM/SIGINT would kill the process in the middle of a
+	// migration, and golang-migrate marks the version dirty before
+	// executing the file and clears the flag only after success — the next
+	// start of ALL the services would fail on migrate.ErrDirty until a
+	// manual TRUNCATE schema_migrations. A signal during the migrations
+	// cancels the waiting phases (the DB connection, the advisory lock) by
+	// the context; the application is interrupted by cancelling the SQL
+	// query on the PostgreSQL side (internal/migrate, T-112): the
+	// unfinished migration rolls back entirely, the version — to the
+	// previous one. If the cancellation is impossible (a non-URL DSN, the
+	// DB unavailable) — the migration runs to the end (C-04). In both
+	// cases the service stops normally, without starting the working
+	// logic.
 	term := make(chan os.Signal, 1)
 	signal.Notify(term, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(term)
@@ -189,18 +205,20 @@ func Run(opts Options) error {
 	signal.Notify(hup, syscall.SIGHUP)
 	defer signal.Stop(hup)
 
-	// Схема БД применяется до старта HTTP-сервера: healthcheck отвечает
-	// только на актуальной схеме. Параллельный старт нескольких сервисов
-	// безопасен (advisory-блокировки в internal/migrate).
-	// DSN: явный Options.PGDSN > конфигурация (env-переопределения уже
-	// применены в config.Load: CRAWLER_POSTGRES_DSN/APP_PG_DSN > postgres.dsn).
+	// The DB schema is applied before the HTTP server starts: the
+	// healthcheck answers only on the current schema. A parallel start of
+	// several services is safe (the advisory locks in internal/migrate).
+	// The DSN: an explicit Options.PGDSN > the configuration (the env
+	// overrides are already applied in config.Load:
+	// CRAWLER_POSTGRES_DSN/APP_PG_DSN > postgres.dsn).
 	dsn := opts.PGDSN
 	if dsn == "" && opts.Config != nil {
 		dsn = opts.Config.Postgres.DSN
 	}
 	if dsn != "" {
-		// Отдельный канал для фазы миграций: term остаётся нетронутым
-		// для serve (сигнал доставляется во все зарегистрированные каналы).
+		// A separate channel for the migration phase: term stays untouched
+		// for serve (the signal is delivered to all the registered
+		// channels).
 		migTerm := make(chan os.Signal, 1)
 		signal.Notify(migTerm, os.Interrupt, syscall.SIGTERM)
 		defer signal.Stop(migTerm)
@@ -212,8 +230,9 @@ func Run(opts Options) error {
 		go func() {
 			select {
 			case <-migTerm:
-				// Флаг до cancelMig: миграция, вернувшаяся по отмене,
-				// уже видит его установленным — без гонки с проверкой ниже.
+				// The flag before cancelMig: a migration that returned by
+				// cancellation already sees it set — no race with the
+				// check below.
 				migSignalled.Store(true)
 				cancelMig()
 			case <-migDone:
@@ -224,9 +243,10 @@ func Run(opts Options) error {
 
 		switch {
 		case errors.Is(migErr, migrate.ErrInterrupted):
-			// Сигнал прервал применение: миграция откатана на стороне
-			// PostgreSQL, версия схемы — последняя применённая. Это
-			// штатная быстрая остановка, а не сбой (T-112).
+			// The signal interrupted the application: the migration rolled
+			// back on the PostgreSQL side, the schema version is the last
+			// applied one. This is a normal fast shutdown, not a failure
+			// (T-112).
 			opts.Logger.Info("shutdown signal during schema apply — the migration was interrupted and rolled back; the next start will finish it")
 			return nil
 		case migSignalled.Load():
@@ -238,10 +258,11 @@ func Run(opts Options) error {
 		}
 	}
 
-	// Пул подключений создаётся после миграций и только если сервис
-	// запросил его (OnDBPool): заглушки продолжают работать без БД.
-	// Размер — из конфигурации, если она есть (бюджет ТЗ 6.3 — суммарно
-	// 20–50 соединений на все сервисы; pool_size задаётся на сервис).
+	// The connection pool is created after the migrations and only if the
+	// service requested it (OnDBPool): the stubs keep working without a
+	// DB. The size — from the configuration if it exists (the budget of
+	// spec 6.3 is 20–50 connections in total for all the services;
+	// pool_size is set per service).
 	var pool *pgxpool.Pool
 	if dsn != "" && opts.OnDBPool != nil {
 		poolSize := 0
@@ -253,9 +274,9 @@ func Run(opts Options) error {
 			DSN:          dsn,
 			PoolSize:     poolSize,
 			AfterConnect: opts.DBAfterConnect,
-			// Метка сервиса в pg_stat_activity (T-177: цикл медленных
-			// запросов monitor исключает свои агрегаты и читает метку
-			// сервиса в сообщениях оператору).
+			// The service label in pg_stat_activity (T-177: the slow query
+			// loop of monitor excludes its own aggregates and reads the
+			// service label in the messages to the operator).
 			AppName: opts.Name,
 		})
 		cancel()
@@ -269,12 +290,13 @@ func Run(opts Options) error {
 
 	mux := http.NewServeMux()
 	registerProbes(mux, pool)
-	// /metrics — реестр Prometheus (internal/metrics): базовые метрики
-	// каркаса + коллекторы Go/runtime; метрики рабочей логики добавляются
-	// фабрикой реестра (Counter/Gauge/Histogram с автометкой service,
-	// T-076; приборы этапов — T-077). Options.Metrics — реестр, созданный
-	// main-ом для приборов рабочей логики; nil — собственный реестр
-	// каркаса (newRegistry).
+	// /metrics — the Prometheus registry (internal/metrics): the base
+	// framework metrics + the Go/runtime collectors; the working logic
+	// metrics are added by the registry factory (Counter/Gauge/Histogram
+	// with the automatic service label, T-076; the stage instruments —
+	// T-077). Options.Metrics — the registry created by main for the
+	// instruments of the working logic; nil — the framework's own
+	// registry (newRegistry).
 	registry := newRegistry(opts)
 	mux.Handle("/metrics", metrics.Handler(registry))
 	if opts.ExtraMux != nil {
@@ -288,9 +310,9 @@ func Run(opts Options) error {
 		ErrorLog:          slog.NewLogLogger(opts.Logger.Handler(), slog.LevelError),
 	}
 
-	// Пул закрывается каркасом при graceful shutdown — последним, после
-	// завершения OnRun и остановки HTTP-сервера метрик, а также на путях
-	// ошибки после его создания (занятый адрес метрик ниже).
+	// The pool is closed by the framework at graceful shutdown — last,
+	// after OnRun finishes and the metrics HTTP server stops, and also on
+	// the error paths after its creation (the busy metrics address below).
 	closePool := func() {}
 	if pool != nil {
 		closePool = func() {
@@ -299,43 +321,55 @@ func Run(opts Options) error {
 		}
 	}
 
-	// Listen отделён от Serve: ошибка занятого адреса — до старта OnRun.
+	// Listen is separated from Serve: a busy address error is before OnRun
+	// starts.
 	ln, err := net.Listen("tcp", opts.MetricsAddr)
 	if err != nil {
 		opts.Logger.Error("metrics HTTP server", "addr", opts.MetricsAddr, "err", err)
-		closePool() // пул уже создан — не оставлять его соединения
+		closePool() // the pool is already created — do not leave its connections
 		return err
 	}
 
 	err = serve(opts, srv, ln, closePool, term, hup)
 	if errors.Is(err, errForcedExit) {
+<<<<<<< HEAD
 		// Раньше здесь был прямой os.Exit(1) — обход defer'ов и
 		// непроверяемость в тестах. Ошибка доезжает до main: его реакция
 		// на любую ошибку Run и так os.Exit(1), код выхода не меняется.
 		opts.Logger.Warn("second signal — forcing exit without waiting for shutdown")
+=======
+		// Previously there was a direct os.Exit(1) here — bypassing the
+		// defers and untestable. The error reaches main: its reaction to
+		// any Run error is os.Exit(1) anyway; the exit code does not
+		// change.
+		opts.Logger.Warn("повторный сигнал — принудительное завершение без ожидания остановки")
+>>>>>>> 1588289 (docs: translate small internal package comments to English)
 	}
 	return err
 }
 
-// registerProbes — маршруты проб каркаса на общем mux (порт метрик; отдельного
-// слушателя для проб нет — ТЗ 5.9 один HTTP-эндпоинт на сервис). /livez —
-// liveness, /healthz — readiness (C-03 → T-110).
+// registerProbes — the framework probe routes on the shared mux (the
+// metrics port; there is no separate listener for the probes — spec 5.9,
+// one HTTP endpoint per service). /livez — liveness, /healthz — readiness
+// (C-03 → T-110).
 func registerProbes(mux *http.ServeMux, pool *pgxpool.Pool) {
 	mux.HandleFunc("/livez", livezHandler())
 	mux.HandleFunc("/healthz", healthzHandler(pool))
 }
 
-// livezHandler — liveness-проба: процесс жив и его HTTP-цикл отвечает.
-// Зависимости (БД, Redis) сознательно не проверяются: их недоступность —
-// не смерть процесса, 503 здесь говорил бы оркестратору «перезапусти»
-// при сбое PostgreSQL/Redis и маскировал бы причину рестартами воркеров.
+// livezHandler — the liveness probe: the process is alive and its HTTP
+// loop answers. The dependencies (the DB, Redis) are deliberately not
+// checked: their unavailability is not a process death; a 503 here would
+// tell the orchestrator "restart" on a PostgreSQL/Redis failure and would
+// mask the cause with worker restarts.
 //
-// Отдельный признак «фоновый цикл не паниковал» не нужен: в каркасе такое
-// состояние не живёт дольше бюджета остановки — паника/ошибка/завершение
-// OnRun перехватываются serve и останавливают весь процесс (Run
-// возвращается, main выходит, рестарт-политика оркестратора поднимает
-// сервис), поэтому ответ этой пробы уже означает «Run активен» (в окне
-// graceful shutdown, ≤ ShutdownTimeout, процесс и так останавливается).
+// A separate "the background loop has not panicked" sign is not needed: in
+// the framework such a state does not live longer than the shutdown
+// budget — a panic/error/completion of OnRun is intercepted by serve and
+// stops the whole process (Run returns, main exits, the orchestrator
+// restart policy brings the service up), so an answer of this probe
+// already means "Run is active" (in the graceful shutdown window, ≤
+// ShutdownTimeout, the process is stopping anyway).
 func livezHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -344,18 +378,20 @@ func livezHandler() http.HandlerFunc {
 	}
 }
 
-// healthzHandler — readiness-проба (зависимости; её проверяет оператор
-// и мониторинг): сервис с пулом БД проверяет PostgreSQL коротким Ping —
-// недоступная БД видна как 503/unhealthy, а не «готов» с бесконечными
-// ошибками в логе воркера (C-03). Сервис без пула (Options без
-// OnDBPool/DSN) всегда готов: зависимостей нет.
+// healthzHandler — the readiness probe (the dependencies; checked by the
+// operator and the monitoring): a service with a DB pool checks PostgreSQL
+// with a short Ping — an unavailable DB is visible as 503/unhealthy, not
+// as "ready" with endless errors in the worker log (C-03). A service
+// without a pool (Options without OnDBPool/DSN) is always ready: there are
+// no dependencies.
 //
-// Redis в пробу не входит (T-110): клиенты Redis живут внутри OnRun
-// воркеров — каркас их не видит, а втягивание зависимости в путь пробы
-// меняло бы готовность на «обе инфраструктуры ответили» ценой новой
-// связности в каркасе. Потребителя «впускать задачи» тоже нет — воркеры
-// тянут их из стримов сами; доступность Redis видна по метрикам очередей
-// (crawler_queue_depth) и логам.
+// Redis is not part of the probe (T-110): the Redis clients live inside
+// the OnRun of the workers — the framework does not see them, and pulling
+// the dependency into the probe path would change the readiness to "both
+// infrastructures answered" at the cost of new coupling in the framework.
+// There is no "admit tasks" consumer either — the workers pull them from
+// the streams themselves; the Redis availability is visible in the queue
+// metrics (crawler_queue_depth) and the logs.
 func healthzHandler(pool *pgxpool.Pool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if pool != nil {
@@ -372,21 +408,23 @@ func healthzHandler(pool *pgxpool.Pool) http.HandlerFunc {
 	}
 }
 
-// serve — жизненный цикл после инициализации: HTTP-сервер метрик на ln и
-// рабочая логика opts.OnRun. Завершается по первому из: сигнал term,
-// ошибка HTTP-сервера, возврат OnRun. Порядок остановки (ТЗ 3.4):
-//  1. рабочая логика: отмена контекста OnRun и ожидание её завершения
-//     в пределах ShutdownTimeout (повторный term прерывает ожидание);
-//  2. HTTP-сервер метрик — дожидается начатых запросов;
-//  3. пул БД (closePool).
+// serve — the lifecycle after initialization: the metrics HTTP server on
+// ln and the working logic opts.OnRun. It finishes on the first of: the
+// term signal, an HTTP server error, an OnRun return. The shutdown order
+// (spec 3.4):
+//  1. the working logic: cancelling the OnRun context and waiting for it
+//     to finish within ShutdownTimeout (a repeat term interrupts the
+//     wait);
+//  2. the metrics HTTP server — waits for the started requests;
+//  3. the DB pool (closePool).
 //
-// Ошибки остановки логируются, но не прерывают последовательность.
+// The shutdown errors are logged but do not interrupt the sequence.
 func serve(opts Options, srv *http.Server, ln net.Listener, closePool func(), term <-chan os.Signal, hup <-chan os.Signal) error {
 	logger := opts.Logger
 	runCtx, cancelRun := context.WithCancel(context.Background())
 	defer cancelRun()
 
-	// SIGHUP — перезагрузка правил без рестарта (make rules-reload).
+	// SIGHUP — a rules reload without a restart (make rules-reload).
 	hupDone := make(chan struct{})
 	defer close(hupDone)
 	go func() {
@@ -416,9 +454,10 @@ func serve(opts Options, srv *http.Server, ln net.Listener, closePool func(), te
 		onRunDone = done
 		go func() {
 			defer func() {
-				// Паника рабочей логики не должна ронять процесс без
-				// лога и очистки: превращаем в ошибку, дальше — обычный
-				// graceful shutdown (переведёт в код выхода 1).
+				// A panic of the working logic must not bring the process
+				// down without a log and cleanup: we turn it into an
+				// error; then — a regular graceful shutdown (it will
+				// convert it into exit code 1).
 				if r := recover(); r != nil {
 					logger.Error("panic in the working logic", "panic", r, "stack", string(debug.Stack()))
 					done <- fmt.Errorf("OnRun: panic: %v", r)
@@ -428,8 +467,8 @@ func serve(opts Options, srv *http.Server, ln net.Listener, closePool func(), te
 		}()
 	}
 
-	// Стадия ожидания: работаем до сигнала, ошибки HTTP/OnRun или
-	// самостоятельного завершения OnRun (одноразовая задача).
+	// The waiting stage: we run until a signal, an HTTP/OnRun error or an
+	// independent OnRun completion (a one-off task).
 	var (
 		onRunErr      error
 		onRunFinished = opts.OnRun == nil
@@ -452,9 +491,9 @@ func serve(opts Options, srv *http.Server, ln net.Listener, closePool func(), te
 	}
 	cancelRun()
 
-	// Стадия остановки. 1) Рабочая логика: доработать текущую задачу или
-	// вернуть её в очередь (ТЗ 3.4) в пределах общего бюджета остановки;
-	// повторный сигнал — принудительный выход.
+	// The shutdown stage. 1) The working logic: finish the current task or
+	// return it to the queue (spec 3.4) within the shared shutdown budget;
+	// a repeat signal — a forced exit.
 	deadline := time.Now().Add(opts.ShutdownTimeout)
 	timedOut := false
 	if !onRunFinished {
@@ -463,9 +502,10 @@ func serve(opts Options, srv *http.Server, ln net.Listener, closePool func(), te
 		select {
 		case err := <-onRunDone:
 			onRunErr = err
-			// Основной ошибкой выхода при httpFail остаётся сбой HTTP
-			// (именно он остановил сервис), но финализация воркера
-			// (возврат задач в очередь, ТЗ 3.4) тоже заслуживает лога.
+			// With httpFail the main exit error remains the HTTP failure
+			// (it is what stopped the service), but the worker
+			// finalization (returning the tasks to the queue, spec 3.4)
+			// also deserves a log.
 			if err != nil {
 				logger.Error("working logic during shutdown", "err", err)
 			}
@@ -478,9 +518,10 @@ func serve(opts Options, srv *http.Server, ln net.Listener, closePool func(), te
 		}
 	}
 
-	// 2) HTTP-сервер метрик: остаток бюджета — закончить начатые скрейпы
-	// /metrics; если бюджет исчерпан зависшей рабочей логикой, соединения
-	// закрываются немедленно (общий бюджет остановки не превышается).
+	// 2) The metrics HTTP server: the rest of the budget — finish the
+	// started /metrics scrapes; if the budget is exhausted by a stuck
+	// working logic, the connections are closed immediately (the shared
+	// shutdown budget is not exceeded).
 	if remain := time.Until(deadline); remain > 0 {
 		httpCtx, cancelHTTP := context.WithTimeout(context.Background(), remain)
 		defer cancelHTTP()
@@ -491,7 +532,7 @@ func serve(opts Options, srv *http.Server, ln net.Listener, closePool func(), te
 		logger.Warn("metrics HTTP server close", "err", err)
 	}
 
-	// 3) Пул БД — последним.
+	// 3) The DB pool — last.
 	closePool()
 
 	switch {

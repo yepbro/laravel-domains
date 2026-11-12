@@ -1,7 +1,7 @@
-// Юнит-тесты нормализации имён (ТЗ 5.2): конвейер Normalize, зоны,
-// HostToASCII, ToUnicode, HasXNLabel, типизированные ошибки — ядро пакета
-// (T-009). Исчерпывающий корпус по ТЗ 11.1 (ß/ς, эмодзи, нулевая ширина,
-// битые xn-- и т. д.) — corpus_test.go (T-010).
+// Unit tests of the name normalization (spec 5.2): the Normalize pipeline,
+// zones, HostToASCII, ToUnicode, HasXNLabel, the typed errors — the core
+// of the package (T-009). The exhaustive corpus per spec 11.1 (ß/ς, emoji,
+// zero width, broken xn-- etc.) — corpus_test.go (T-010).
 package idn
 
 import (
@@ -20,31 +20,34 @@ func TestNormalizeValid(t *testing.T) {
 		label string
 		isIDN bool
 	}{
-		// п. 1: регистр, пробелы, завершающая точка.
+		// Item 1: case, spaces, the trailing dot.
 		{name: "  Example.COM ", ascii: "example.com", uni: "example.com", zone: "com", label: "example"},
-		{name: "\uFEFFexample.com", ascii: "example.com", uni: "example.com", zone: "com", label: "example"}, // BOM убирается маппингом UTS-46
+		{name: "\uFEFFexample.com", ascii: "example.com", uni: "example.com", zone: "com", label: "example"}, // the BOM is removed by the UTS-46 mapping
 		{name: "пример.рф.", ascii: "xn--e1afmkfd.xn--p1ai", uni: "пример.рф", zone: "xn--p1ai", label: "xn--e1afmkfd", isIDN: true},
-		{name: "example.com...", ascii: "example.com", uni: "example.com", zone: "com", label: "example"}, // несколько завершающих точек
+		{name: "example.com...", ascii: "example.com", uni: "example.com", zone: "com", label: "example"}, // several trailing dots
 		{name: "при мер.рф", ascii: "xn--e1afmkfd.xn--p1ai", uni: "пример.рф", zone: "xn--p1ai", label: "xn--e1afmkfd", isIDN: true},
-		// п. 2: unicode → punycode.
+		// Item 2: unicode → punycode.
 		{name: "Bücher.de", ascii: "xn--bcher-kva.de", uni: "bücher.de", zone: "de", label: "xn--bcher-kva", isIDN: true},
-		// Вход уже в punycode — валиден и не меняется.
+		// The input is already in punycode — valid and unchanged.
 		{name: "XN--BCHER-KVA.com", ascii: "xn--bcher-kva.com", uni: "bücher.com", zone: "com", label: "xn--bcher-kva", isIDN: true},
-		// п. 5 (в редакции ТЗТ tld-only-zones): зона — последняя метка
-		// (TLD); 2LD-регистрация даёт составную метку.
+		// Item 5 (as amended by the tld-only-zones spec): the zone is the
+		// last label (the TLD); a 2LD registration gives a compound label.
 		{name: "example.co.uk", ascii: "example.co.uk", uni: "example.co.uk", zone: "uk", label: "example.co"},
 		{name: "магазин.рф.co.uk", ascii: "xn--80aairftm.xn--p1ai.co.uk", uni: "магазин.рф.co.uk", zone: "uk", label: "xn--80aairftm.xn--p1ai.co", isIDN: true},
-		// п. 9: бит is_idn — по метке домена, зона не считается.
+		// Item 9: the is_idn bit — by the domain label; the zone does not
+		// count.
 		{name: "example.xn--p1ai", ascii: "example.xn--p1ai", uni: "example.рф", zone: "xn--p1ai", label: "example", isIDN: false},
-		// Тестовая зона testbed: зона — последняя метка (TLD-only —
-		// теперь всегда), составная метка — норма.
+		// A testbed test zone: the zone is the last label (TLD-only — now
+		// always); a compound label is the norm.
 		{name: "example.crawl.test", ascii: "example.crawl.test", uni: "example.crawl.test", zone: "test", label: "example.crawl"},
-		// Частные суффиксы не выделяются: github.io — метка под TLD io.
+		// Private suffixes are not extracted: github.io is a label under
+		// the TLD io.
 		{name: "foo.github.io", ascii: "foo.github.io", uni: "foo.github.io", zone: "io", label: "foo.github"},
-		// Граница п. 4: метка ровно 63 октета — валидна.
+		// The boundary of item 4: a label of exactly 63 octets is valid.
 		{name: strings.Repeat("a", 63) + ".com", ascii: strings.Repeat("a", 63) + ".com", uni: strings.Repeat("a", 63) + ".com", zone: "com", label: strings.Repeat("a", 63)},
-		// Числовая метка в буквенной зоне — обычное имя: числовых TLD нет,
-		// но зона здесь буквенная (мешает только числовая зона).
+		// A numeric label in an alphabetic zone — a regular name: numeric
+		// TLDs do not exist, but the zone here is alphabetic (only a
+		// numeric zone is a problem).
 		{name: "123.com", ascii: "123.com", uni: "123.com", zone: "com", label: "123"},
 	}
 	for _, tc := range tests {
@@ -77,30 +80,30 @@ func TestNormalizeInvalid(t *testing.T) {
 		name string
 		kind ErrorKind
 	}{
-		// п. 1: пустые.
+		// Item 1: empty.
 		{"", ErrEmpty},
 		{"   ", ErrEmpty},
 		{".", ErrEmpty},
 		{"..", ErrEmpty},
-		// пп. 2–3: невалидные по UTS-46/IDNA.
-		{"xn--bcher--kva.com", ErrInvalid},      // битый punycode
-		{"xn--.com", ErrInvalid},                // xn-- без полезной нагрузки
-		{"example..com", ErrInvalid},            // пустая метка
-		{"-lead.example.com", ErrInvalid},       // дефис в начале метки
-		{"under_score.example.com", ErrInvalid}, // STD3: подчёркивание
-		{"плох_й.рф", ErrInvalid},               // STD3 в unicode-метке
-		{"\u200Cample.com", ErrInvalid},         // ZWNJ вне контекстных правил (U+200C)
-		// п. 4: длины (ASCII-форма).
-		{strings.Repeat("a", 64) + ".com", ErrLabelLen}, // метка 64
-		{"àéîõüßàéîõüßàéîõüßàéîõüßàéîõüßàéîõüßàéîõüßàéîõüßàéîõüß.com", ErrLabelLen},                                                           // punycode-метка 64
-		{strings.Repeat("a", 63) + "." + strings.Repeat("b", 63) + "." + strings.Repeat("c", 63) + "." + strings.Repeat("d", 62), ErrNameLen}, // имя 254
-		// п. 5: имя — сам TLD, метки нет.
+		// Items 2–3: invalid per UTS-46/IDNA.
+		{"xn--bcher--kva.com", ErrInvalid},      // broken punycode
+		{"xn--.com", ErrInvalid},                // xn-- without a payload
+		{"example..com", ErrInvalid},            // an empty label
+		{"-lead.example.com", ErrInvalid},       // a hyphen at the label start
+		{"under_score.example.com", ErrInvalid}, // STD3: an underscore
+		{"плох_й.рф", ErrInvalid},               // STD3 in a unicode label
+		{"\u200Cample.com", ErrInvalid},         // ZWNJ outside the contextual rules (U+200C)
+		// Item 4: lengths (the ASCII form).
+		{strings.Repeat("a", 64) + ".com", ErrLabelLen}, // a label of 64
+		{"àéîõüßàéîõüßàéîõüßàéîõüßàéîõüßàéîõüßàéîõüßàéîõüßàéîõüß.com", ErrLabelLen},                                                           // a punycode label of 64
+		{strings.Repeat("a", 63) + "." + strings.Repeat("b", 63) + "." + strings.Repeat("c", 63) + "." + strings.Repeat("d", 62), ErrNameLen}, // a name of 254
+		// Item 5: the name is a bare TLD, no label.
 		{"com", ErrNoLabel},
-		// п. 5: числовая последняя метка — таких TLD не существует
-		// (IANA): даты выгрузок и IPv4-литералы.
-		{"18.06.1999", ErrNumericZone}, // дата выгрузки регистратора
-		{"1.2.3.4", ErrNumericZone},    // IPv4-литерал
-		{"1999", ErrNumericZone},       // голый числовой TLD
+		// Item 5: a numeric last label — such TLDs do not exist
+		// (IANA): registrar export dates and IPv4 literals.
+		{"18.06.1999", ErrNumericZone}, // a registrar export date
+		{"1.2.3.4", ErrNumericZone},    // an IPv4 literal
+		{"1999", ErrNumericZone},       // a bare numeric TLD
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -119,7 +122,8 @@ func TestNormalizeInvalid(t *testing.T) {
 	}
 }
 
-// TestNormalizeBoundaryLengths — границы лимитов п. 4: 63/253 — валидны.
+// TestNormalizeBoundaryLengths — the bounds of the item 4 limits: 63/253
+// are valid.
 func TestNormalizeBoundaryLengths(t *testing.T) {
 	name := strings.Repeat("a", 63) + "." + strings.Repeat("b", 63) + "." + strings.Repeat("c", 63) + "." + strings.Repeat("d", 61)
 	if len(name) != 253 {
@@ -132,7 +136,7 @@ func TestNormalizeBoundaryLengths(t *testing.T) {
 	if got.ASCII != name {
 		t.Errorf("ASCII = %q, want имя без изменений", got.ASCII)
 	}
-	// Последняя метка — зона (TLD-only).
+	// The last label is the zone (TLD-only).
 	if want := strings.Repeat("d", 61); got.Zone != want {
 		t.Errorf("Zone = %q, want %q", got.Zone, want)
 	}
@@ -174,9 +178,9 @@ func TestHostToASCII(t *testing.T) {
 		in   string
 		want string
 	}{
-		{"Пример.РФ", "xn--e1afmkfd.xn--p1ai"}, // п. 8: unicode → punycode
-		{"Example.COM.", "example.com"},        // регистр и точка
-		{"192.0.2.1", "192.0.2.1"},             // IPv4-литерал
+		{"Пример.РФ", "xn--e1afmkfd.xn--p1ai"}, // item 8: unicode → punycode
+		{"Example.COM.", "example.com"},        // case and dot
+		{"192.0.2.1", "192.0.2.1"},             // an IPv4 literal
 	}
 	for _, tc := range tests {
 		got, err := HostToASCII(tc.in)
@@ -189,9 +193,9 @@ func TestHostToASCII(t *testing.T) {
 		}
 	}
 	for _, in := range []string{"xn--bcher--kva.com", "under_score.example.com", "xn--", "::1", "[::1]"} {
-		// IPv6-литералы — не имена: скобочная форма из URL и чистый
-		// адрес (двоеточие — STD3-нарушение); T-047/T-048 обрабатывает
-		// их отдельно через net.ParseIP.
+		// IPv6 literals are not names: the bracketed form from a URL and
+		// the bare address (a colon is an STD3 violation); T-047/T-048
+		// handles them separately via net.ParseIP.
 		if _, err := HostToASCII(in); err == nil {
 			t.Errorf("HostToASCII(%q): нет ошибки, want ошибка", in)
 		}
@@ -203,12 +207,12 @@ func TestToUnicode(t *testing.T) {
 		in   string
 		want string
 	}{
-		{"xn--e1afmkfd.xn--p1ai", "пример.рф"}, // п. 7: вывод на лету
+		{"xn--e1afmkfd.xn--p1ai", "пример.рф"}, // item 7: output on the fly
 		{"xn--bcher-kva.com", "bücher.com"},
-		{"example.com", "example.com"}, // без punycode — как есть
-		{"!!!garbage", "!!!garbage"},   // ошибка декодирования — вход
-		{"xn--", "xn--"},               // пустой результат декодирования — вход, не пустая строка
-		{"", ""},                       // пустая строка — пустой ответ
+		{"example.com", "example.com"}, // no punycode — as is
+		{"!!!garbage", "!!!garbage"},   // a decoding error — the input
+		{"xn--", "xn--"},               // an empty decoding result — the input, not an empty string
+		{"", ""},                       // an empty string — an empty answer
 	}
 	for _, tc := range tests {
 		if got := ToUnicode(tc.in); got != tc.want {
@@ -224,9 +228,9 @@ func TestHasXNLabel(t *testing.T) {
 	}{
 		{"xn--e1afmkfd.xn--p1ai", true},
 		{"example.com", false},
-		{"XN--BCHER-KVA.com", true},     // регистр не важен
-		{"axn--foo.example.com", false}, // префикс не в начале метки
-		{"xn--", true},                  // метка ровно «xn--»: префикс совпадает целиком
+		{"XN--BCHER-KVA.com", true},     // case does not matter
+		{"axn--foo.example.com", false}, // the prefix is not at the label start
+		{"xn--", true},                  // a label exactly "xn--": the prefix matches entirely
 		{"", false},
 	}
 	for _, tc := range tests {
@@ -236,29 +240,29 @@ func TestHasXNLabel(t *testing.T) {
 	}
 }
 
-// TestIsNumericZone — контракт isNumericZone прямыми вызовами: функция
-// неэкспортируемая, а случай zone == "" через Normalize недостижим
-// (зона — непустая последняя метка normalizeASCII-выхода, см.
-// комментарий перед страховочной проверкой zone == "" там), поэтому
-// поведение пустой зоны фиксируется здесь, а не через публичный API.
+// TestIsNumericZone — the isNumericZone contract by direct calls: the
+// function is unexported and the zone == "" case is unreachable through
+// Normalize (the zone is a non-empty last label of the normalizeASCII
+// output, see the comment before the zone == "" guard check there), so
+// the empty zone behavior is pinned here, not through the public API.
 func TestIsNumericZone(t *testing.T) {
 	tests := []struct {
 		in   string
 		want bool
 	}{
-		// Пустая зона зоной не является: мутант idn.go.8 (branch/if)
-		// вырезает return false для zone == "", после чего цикл по
-		// Split("", ".") = [""] не срабатывает и функция доходит до
-		// return true. Через Normalize ветка недостижима — контракт
-		// фиксируется прямым вызовом.
+		// An empty zone is not a zone: the mutant idn.go.8 (branch/if)
+		// removes the return false for zone == "", after which the loop
+		// over Split("", ".") = [""] does not fire and the function
+		// reaches return true. Through Normalize the branch is
+		// unreachable — the contract is pinned by a direct call.
 		{"", false},
-		// Числовые зоны — таких TLD не существует (IANA).
-		{"1999", true},       // голый числовой TLD
-		{"18.06.1999", true}, // дата выгрузки регистратора
-		{"1.2.3.4", true},    // IPv4-литерал
+		// Numeric zones — such TLDs do not exist (IANA).
+		{"1999", true},       // a bare numeric TLD
+		{"18.06.1999", true}, // a registrar export date
+		{"1.2.3.4", true},    // an IPv4 literal
 		{"0", true},
-		// Буквенные зоны — не числовые; числовая метка в буквенной
-		// зоне (123.com) — обычное имя, не числовая зона.
+		// Alphabetic zones are not numeric; a numeric label in an
+		// alphabetic zone (123.com) is a regular name, not a numeric zone.
 		{"123.com", false},
 		{"com", false},
 		{"co.uk", false},
@@ -270,8 +274,8 @@ func TestIsNumericZone(t *testing.T) {
 	}
 }
 
-// TestError — структура типизированной ошибки: класс, имя, причина,
-// оборачивание (rejected-лог T-016 обернёт её в свою ошибку).
+// TestError — the structure of the typed error: the kind, the name, the
+// cause, wrapping (the rejected log T-016 will wrap it in its own error).
 func TestError(t *testing.T) {
 	_, err := Normalize("xn--bcher--kva.com")
 	if err == nil {
@@ -294,8 +298,9 @@ func TestError(t *testing.T) {
 		t.Errorf("Error() = %q, want класс и имя", msg)
 	}
 
-	// Формат Error() — точные строки, с причиной и без (мутант
-	// вырезания return терял бы причину, оставляя формат «: %v»).
+	// The Error() format — exact strings, with a cause and without (a
+	// return-removal mutant would lose the cause, leaving the ": %v"
+	// format).
 	withCause := &Error{Kind: ErrNameLen, Name: "x", Err: errors.New("reason")}
 	if got, want := withCause.Error(), `idn: name longer than 253 characters: "x": reason`; got != want {
 		t.Errorf("Error() с причиной = %q, want %q", got, want)
@@ -305,7 +310,7 @@ func TestError(t *testing.T) {
 		t.Errorf("Error() без причины = %q, want %q", got, want)
 	}
 
-	// Класс извлекается из обёрнутой ошибки (fmt.Errorf %w).
+	// The kind is extracted from the wrapped error (fmt.Errorf %w).
 	wrapped := fmt.Errorf("строка 42: %w", err)
 	kind, ok := KindOf(wrapped)
 	if !ok || kind != ErrInvalid {
@@ -315,14 +320,14 @@ func TestError(t *testing.T) {
 		t.Error("KindOf(чужая ошибка) = true, want false")
 	}
 
-	// Причина доступна через Unwrap (ошибка idna).
+	// The cause is reachable via Unwrap (an idna error).
 	if errors.Unwrap(e) == nil {
 		t.Error("Unwrap(e) = nil, want причина")
 	}
 }
 
-// TestErrorNameTruncated — недоверенный вход не раздувает ошибку:
-// имя обрезается до maxErrNameLen рун.
+// TestErrorNameTruncated — untrusted input does not bloat the error:
+// the name is truncated to maxErrNameLen runes.
 func TestErrorNameTruncated(t *testing.T) {
 	long := strings.Repeat("р", 1000)
 	_, err := Normalize(long)
@@ -340,7 +345,8 @@ func TestErrorNameTruncated(t *testing.T) {
 		t.Errorf("Error() длиной %d, want ≤ 1024", len(msg))
 	}
 
-	// Граница: имя ровно maxErrNameLen рун не обрезается.
+	// The boundary: a name of exactly maxErrNameLen runes is not
+	// truncated.
 	boundary := strings.Repeat("р", maxErrNameLen)
 	_, err = Normalize(boundary)
 	if err == nil {
@@ -353,9 +359,9 @@ func TestErrorNameTruncated(t *testing.T) {
 		t.Errorf("Name обрезано: %d рун, want %d без обрезки", len([]rune(e.Name)), maxErrNameLen)
 	}
 
-	// Границы обрезки — литералами (проверки выше адаптивны через
-	// константу и мутанта ±1 не замечают): ровно 255 рун не режется,
-	// 256 — 255 рун + «…».
+	// The truncation bounds — by literals (the checks above are adaptive
+	// through the constant and would not notice a ±1 mutant): exactly
+	// 255 runes is not cut, 256 — 255 runes + "…".
 	exactly := strings.Repeat("р", 255)
 	_, err = Normalize(exactly)
 	if err == nil {

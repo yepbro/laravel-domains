@@ -9,16 +9,17 @@ import (
 	"crawler/internal/config"
 )
 
-// Логирование каркаса сервисов: единый структурированный логгер на stdlib
-// log/slog (без новых зависимостей). Уровень важности задаётся конфигурацией
-// (log.level, переопределение CRAWLER_LOG_LEVEL применяется внутри
-// config.Load), контекст имени сервиса — атрибут service в каждой записи.
+// Service framework logging: a single structured logger on the stdlib
+// log/slog package (no new dependencies). The severity level comes from the
+// configuration (log.level; the CRAWLER_LOG_LEVEL override is applied inside
+// config.Load), the service name context is the service attribute on each record.
 
-// NewLogger возвращает логгер сервиса name: текстовый формат на stderr
-// (читаемо в docker logs), уровень из cfg.Log.Level (nil-конфиг или пустой
-// уровень — info), каждая запись помечена атрибутом service=name.
-// Run устанавливает логгер дефолтным (slog.SetDefault): тогда и миграции,
-// и код сервисов через slog.Default пишут в общий поток с контекстом.
+// NewLogger returns the logger for service name: text format on stderr
+// (readable in docker logs), level from cfg.Log.Level (a nil config or an
+// empty level means info), each record tagged with the service=name attribute.
+// Run installs the logger as the default (slog.SetDefault): then both the
+// migrations and service code via slog.Default write to the shared stream
+// with context.
 func NewLogger(name string, cfg *config.Config) *slog.Logger {
 	level := slog.LevelInfo
 	if cfg != nil {
@@ -27,14 +28,14 @@ func NewLogger(name string, cfg *config.Config) *slog.Logger {
 	return newLogger(os.Stderr, name, level)
 }
 
-// newLogger — NewLogger с явным приёмником записи (юнит-тесты).
+// newLogger is NewLogger with an explicit write sink (unit tests).
 func newLogger(w io.Writer, name string, level slog.Level) *slog.Logger {
 	h := slog.NewTextHandler(w, &slog.HandlerOptions{Level: level})
 	return slog.New(h).With("service", name)
 }
 
-// logLevel переводит значение log.level в slog.Level. Неизвестное значение
-// после валидации config недостижимо; на всякий случай считаем его info.
+// logLevel maps the log.level value to slog.Level. An unknown value is
+// unreachable after config validation; just in case, treat it as info.
 func logLevel(s string) slog.Level {
 	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "debug":
@@ -43,7 +44,7 @@ func logLevel(s string) slog.Level {
 		return slog.LevelWarn
 	case "error":
 		return slog.LevelError
-	default: // "info" и ""
+	default: // "info" and ""
 		return slog.LevelInfo
 	}
 }

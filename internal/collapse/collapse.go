@@ -1,25 +1,27 @@
-// Package collapse — перенос данных 2LD-зон в TLD-зоны (ТЗТ §7, T-196):
-// зона системы — последняя метка имени (internal/idn, T-194), справочник
-// зон сворачивается к TLD переносом строк: `zone_id` → TLD, `label` →
-// `label || '.' || префикс`. Перенос — консольная команда обслуживания
-// окна простоя (crawlerctl zones collapse, прецедент zones sync: CLI,
-// а не миграция — тяжёлый перенос строк идёт батчами с отчётом,
-// предусловиями и dry-run, ТЗТ §12.4); логика вынесена в пакет, чтобы
-// интеграционные тесты прогоняли её против живой схемы.
+// Package collapse — moving the data of 2LD zones into TLD zones
+// (the tld-only-zones spec §7, T-196): the zone of the system is the last
+// label of the name (internal/idn, T-194), the reference table of zones is
+// collapsed to the TLD by moving rows: `zone_id` → TLD, `label` →
+// `label || '.' || prefix`. The move is a console maintenance command for
+// the downtime window (crawlerctl zones collapse, a precedent of zones
+// sync: a CLI, not a migration — the heavy row move goes in batches with
+// a report, preconditions and dry-run, the spec §12.4); the logic is moved
+// into a package so integration tests can run it against a live schema.
 //
-// Свойства (ТЗТ §7.1):
-//   - идемпотентность и возобновляемость: переносятся только строки, ещё
-//     лежащие в 2LD-зоне (батчи адресуют zone_id = <2LD>); повторный
-//     запуск продолжает с места остановки, отсутствие 2LD-зон — no-op;
-//   - батчи §7.3: окна по DefaultBatch id из temp-таблицы moving_ids
-//     (сессия одного соединения), каждый батч — отдельная транзакция
-//     (домены и их дети переезжают атомарно на батч); нарушение
-//     UNIQUE (zone_id, label) в батче невозможно (§12.5), аномальный
-//     конфликт откатывает батч и останавливает команду с именем зоны;
-//   - allowlist ingest.allowed_zone_paths — зоны-исключения (тестовые
-//     зоны testbed живут как зоны, §7.1);
-//   - предусловие: в затрагиваемых зонах нет доменов check_state = 1;
-//   - перенос необратим (§12.5): откат — восстановление бэкапа.
+// Properties (spec §7.1):
+//   - idempotency and resumability: only the rows still sitting in the
+//     2LD zone are moved (batches address zone_id = <2LD>); a rerun
+//     continues from the stop point, no 2LD zones — a no-op;
+//   - batches §7.3: windows of DefaultBatch ids from the temp table
+//     moving_ids (a single-connection session), each batch is a separate
+//     transaction (domains and their children move atomically per batch);
+//     a UNIQUE (zone_id, label) violation within a batch is impossible
+//     (§12.5); an anomalous conflict rolls the batch back and stops the
+//     command with the zone name;
+//   - the allowlist ingest.allowed_zone_paths — excluded zones (testbed
+//     test zones live as zones, §7.1);
+//   - precondition: no domains with check_state = 1 in the affected zones;
+//   - the move is irreversible (§12.5): rollback is a backup restore.
 package collapse
 
 import (
@@ -41,23 +43,25 @@ import (
 	"crawler/internal/monitor"
 )
 
-// DefaultBatch — окно батча переноса (§7.3): 50000 id, константа, не
-// конфиг; Options.Batch позволяет интеграционному тесту уменьшить окно
-// (проверка возобновления после сбоя на середине).
+// DefaultBatch — the batch window of the move (§7.3): 50000 ids, a
+// constant, not a config; Options.Batch lets the integration test shrink
+// the window (a resumption check after a failure in the middle).
 const DefaultBatch = 50000
 
 // ---------------------------------------------------------------- SQL
 //
-// Константы — контракты: юнит-тесты сверяют тексты и параметры (стиль
-// cmd/crawlerctl zonessync.go), имена таблиц/колонок — миграции схемы.
+// The constants are contracts: unit tests compare the texts and the
+// parameters (the style of cmd/crawlerctl zonessync.go); table/column
+// names belong to the schema migrations.
 
-// zonePartsFrom — общая часть выборки партиций зоны из каталога: прямые
-// LIST-дети корневых таблиц по границе «FOR VALUES IN (<zone_id>)»
-// (приём миграции 000003 create_zone_partitions; два варианта записи —
-// pg_get_expr печатает smallint-границу в кавычках, %L даёт именно её,
-// %s — страховка от смены формата). Для subdomain_results/laravel_*
-// выбранный ребёнок — промежуточный родитель hash-листьев: DROP TABLE
-// родителя уносит листья (§7.2 шаг 6).
+// zonePartsFrom — the shared part of selecting the zone partitions from
+// the catalog: the direct LIST children of the root tables by the
+// "FOR VALUES IN (<zone_id>)" boundary (the technique of migration 000003
+// create_zone_partitions; two spelling variants — pg_get_expr prints the
+// smallint boundary quoted, %L gives exactly that, %s is a safety net
+// against a format change). For subdomain_results/laravel_* the selected
+// child is the intermediate parent of the hash leaves: a DROP TABLE of
+// the parent takes the leaves with it (§7.2 step 6).
 const zonePartsFrom = "FROM pg_inherits i " +
 	"JOIN pg_class c ON c.oid = i.inhrelid " +
 	"JOIN pg_class p ON p.oid = i.inhparent " +
@@ -65,12 +69,14 @@ const zonePartsFrom = "FROM pg_inherits i " +
 	"WHERE n.nspname = current_schema() " +
 	"AND p.relname IN ('domains','subdomain_results','laravel_domains','laravel_findings') "
 
-// InventorySQL — инвентаризация 2LD-зон вне allowlist (§7.2): LIKE '%.%'
-// — составное имя; name <> ALL($1) — вычитание allowlist (NOT IN без
-// NULL-ловушек). Скалярные подзапросы — колонки отчёта §7.4 (domains_now
-// prescribed ТЗТ; счётчики зон-потомков и партиции — для плана), все —
-// точечные по префиксу PK zone_id. domains_total — кэш monitor (T-178)
-// до переноса, сверяется живым domains_now.
+// InventorySQL — an inventory of 2LD zones outside the allowlist (§7.2):
+// LIKE '%.%' is a compound name; name <> ALL($1) is the allowlist
+// subtraction (NOT IN without NULL traps). The scalar subqueries are the
+// report columns of §7.4 (domains_now prescribed by the spec; the counts
+// of the child zones and the partition — for the plan), all of them are
+// point reads by the zone_id PK prefix. domains_total is the monitor
+// cache (T-178) before the move, cross-checked against the live
+// domains_now.
 const InventorySQL = "SELECT z.id, z.name, z.domains_total, " +
 	"(SELECT count(*) FROM domains d WHERE d.zone_id = z.id) AS domains_now, " +
 	"(SELECT count(*) FROM subdomain_results r WHERE r.zone_id = z.id), " +
@@ -82,49 +88,49 @@ const InventorySQL = "SELECT z.id, z.name, z.domains_total, " +
 	"format('FOR VALUES IN (%s)', z.id), format('FOR VALUES IN (%L)', z.id::text))) " +
 	"FROM zones z WHERE z.name LIKE '%.%' AND z.name <> ALL($1) ORDER BY z.name"
 
-// QueuedSQL — предусловие §7.1: домены в очереди (check_state = 1) по
-// затрагиваемым зонам; код состояния — параметр (internal/model).
+// QueuedSQL — the §7.1 precondition: domains in the queue (check_state = 1)
+// over the affected zones; the state code is a parameter (internal/model).
 const QueuedSQL = "SELECT zone_id, count(*) FROM domains " +
 	"WHERE zone_id = ANY($1::int2[]) AND check_state = $2 GROUP BY zone_id"
 
-// ZoneIDByNameSQL / ZoneInsertSQL — шаг 1: зона TLD находится по имени,
-// отсутствующая создаётся включённой (стиль zones sync: unicode-форма
-// только для XN-зон, ASCII — NULL через nullif).
+// ZoneIDByNameSQL / ZoneInsertSQL — step 1: the TLD zone is found by name,
+// a missing one is created active (the style of zones sync: the unicode
+// form only for XN zones, ASCII — NULL via nullif).
 const ZoneIDByNameSQL = "SELECT id FROM zones WHERE name = $1"
 
 const ZoneInsertSQL = "INSERT INTO zones (name, name_unicode, is_active) " +
 	"VALUES ($1, nullif($2, ''), true) RETURNING id"
 
-// CallPartitionsSQL — шаг 2: выделенные партиции зоны TLD до переноса,
-// чтобы строки ложились сразу в них; идемпотентно (миграция 000003
-// пропускает существующие с NOTICE).
+// CallPartitionsSQL — step 2: dedicated partitions of the TLD zone before
+// the move, so the rows land right in them; idempotent (migration 000003
+// skips the existing ones with a NOTICE).
 const CallPartitionsSQL = "CALL create_zone_partitions($1)"
 
-// Шаг 3 — temp-таблица moving_ids на сессию соединения: замороженное
-// множество переносимых id (окна батчей §7.3 адресуют его границы).
-// Перед созданием — DROP IF EXISTS: повторный запуск зоны (возобновление)
-// пересобирает таблицу по остатку строк в 2LD-зоне.
+// Step 3 — the moving_ids temp table for the session of the connection:
+// the frozen set of ids being moved (the batch windows of §7.3 address its
+// bounds). Before creating it — DROP IF EXISTS: a rerun of the zone
+// (resumption) rebuilds the table from the remaining rows in the 2LD zone.
 const (
 	movingDropSQL   = "DROP TABLE IF EXISTS moving_ids"
 	movingCreateSQL = "CREATE TEMP TABLE moving_ids AS SELECT id FROM domains WHERE zone_id = $1"
 	movingIndexSQL  = "CREATE INDEX ON moving_ids (id)"
-	// movingChunkSQL — очередная пачка актуальных id переноса (keyset по
-	// id): батч §7.3 — пачка строк moving_ids, а не окно глобального
-	// id-пространства (домены зоны разрежены по всей последовательности
-	// domain_id_seq — окно 50k id почти пусто, боевые зоны давали сотни
-	// пустых батчей). Границы батча — [min, max] пачки, диапазон
-	// замкнутый.
+	// movingChunkSQL — the next chunk of live move ids (a keyset by id):
+	// a batch of §7.3 is a chunk of moving_ids rows, not a window of the
+	// global id space (the zone domains are sparse over the whole
+	// domain_id_seq — a 50k id window is almost empty; production zones
+	// gave hundreds of empty batches). The batch bounds are [min, max] of
+	// the chunk, the range is closed.
 	movingChunkSQL = "SELECT id FROM moving_ids WHERE id > $1 ORDER BY id LIMIT $2"
-	// spotLabelSQL — метка первого домена зоны до переноса: материал
-	// спот-чека §7.5 (domain_info после переноса).
+	// spotLabelSQL — the label of the first domain of the zone before the
+	// move: material for the spot check of §7.5 (domain_info after it).
 	spotLabelSQL = "SELECT label FROM domains WHERE zone_id = $1 ORDER BY id LIMIT 1"
 )
 
-// Шаг 4 — UPDATE с row movement (PG16 переносит строки между партициями
-// LIST при смене ключа): домены меняют зону и доклеивают префикс к label
-// (§7.2), дети адресуются диапазоном domain_id того же окна. Охрана
-// zone_id = $zid в WHERE — идемпотентность: уже перенесённые строки под
-// предикат не попадают.
+// Step 4 — an UPDATE with row movement (PG16 moves rows between LIST
+// partitions when the key changes): domains change the zone and append
+// the prefix to the label (§7.2), the children are addressed by the
+// domain_id range of the same window. The zone_id = $zid guard in WHERE is
+// the idempotency: already moved rows do not fall under the predicate.
 const (
 	moveDomainsSQL = "UPDATE domains " +
 		"SET zone_id = $1, label = label || '.' || $2 " +
@@ -132,15 +138,16 @@ const (
 	moveResultsSQL  = "UPDATE subdomain_results SET zone_id = $1 WHERE zone_id = $2 AND domain_id >= $3 AND domain_id <= $4"
 	moveLaravelSQL  = "UPDATE laravel_domains SET zone_id = $1 WHERE zone_id = $2 AND domain_id >= $3 AND domain_id <= $4"
 	moveFindingsSQL = "UPDATE laravel_findings SET zone_id = $1 WHERE zone_id = $2 AND domain_id >= $3 AND domain_id <= $4"
-	// laravel_history — без партиций, объём на порядки меньше (миграция
-	// 000011): одним оператором на зону (§7.2 шаг 4).
+	// laravel_history — without partitions, an order of magnitude smaller
+	// in volume (migration 000011): a single statement per zone
+	// (§7.2 step 4).
 	moveHistorySQL = "UPDATE laravel_history SET zone_id = $1 WHERE zone_id = $2"
 )
 
-// Шаг 5 — дедуп-журнал ingest_files: перепривязка к TLD сохраняет дедуп
-// точной повторной доставки (T-113); то же содержимое, уже доставлявшееся
-// в T — дубль удаляется (остаётся строка-владелец). NULL-семантика ключа
-// (ручные строки) — IS NOT DISTINCT FROM.
+// Step 5 — the ingest_files dedup journal: rebinding to the TLD keeps the
+// dedup exact for redelivery (T-113); the same content that was already
+// delivered to T is a duplicate and is deleted (the owner row remains).
+// The NULL semantics of the key (manual rows) — IS NOT DISTINCT FROM.
 const (
 	filesDedupeSQL = "DELETE FROM ingest_files a USING ingest_files b " +
 		"WHERE a.zone_id = $1 AND b.zone_id = $2 " +
@@ -148,17 +155,19 @@ const (
 	filesMoveSQL = "UPDATE ingest_files SET zone_id = $1 WHERE zone_id = $2"
 )
 
-// ZonePartsSQL — шаг 6: выборка партиций 2LD-зоны (parent — корневая
-// таблица, part — партиция зоны). DROP выполняется отдельно по каждой
-// строке: имя из каталога экранируется pgx.Identifier.
+// ZonePartsSQL — step 6: selecting the partitions of the 2LD zone
+// (parent — the root table, part — the zone partition). The DROP is
+// executed separately per row: the name from the catalog is escaped with
+// pgx.Identifier.
 const ZonePartsSQL = "SELECT p.relname AS parent, c.relname AS part " + zonePartsFrom +
 	"AND pg_get_expr(c.relpartbound, c.oid) IN (" +
 	"format('FOR VALUES IN (%s)', $1::smallint), format('FOR VALUES IN (%L)', $1::text))"
 
-// ZoneLeftSQL — страховка перед DROP: перенос обязан был опустошить зону
-// во всех таблицах с zone_id (батчи покрывают [min, max] moving_ids —
-// все дети зоны); остаток — аномалия данных (сирота вне диапазона),
-// DROP молча удалил бы строки — команда останавливается с ошибкой.
+// ZoneLeftSQL — the safety net before the DROP: the move must have emptied
+// the zone in all tables with a zone_id (the batches cover [min, max] of
+// moving_ids — all the children of the zone); a remainder is a data
+// anomaly (an orphan outside the range), a DROP would silently delete the
+// rows — the command stops with an error.
 const ZoneLeftSQL = "SELECT " +
 	"(SELECT count(*) FROM domains WHERE zone_id = $1), " +
 	"(SELECT count(*) FROM subdomain_results WHERE zone_id = $1), " +
@@ -167,11 +176,11 @@ const ZoneLeftSQL = "SELECT " +
 	"(SELECT count(*) FROM laravel_history WHERE zone_id = $1), " +
 	"(SELECT count(*) FROM ingest_files WHERE zone_id = $1)"
 
-// ZoneDeleteSQL — шаг 7: строка 2LD-зоны покидает справочник.
+// ZoneDeleteSQL — step 7: the 2LD zone row leaves the reference table.
 const ZoneDeleteSQL = "DELETE FROM zones WHERE id = $1"
 
-// Пост-проверки §7.5: 2LD-зон вне allowlist не осталось; сиротских
-// zone_id в таблицах с зоной нет.
+// Post-checks §7.5: no 2LD zones outside the allowlist remain; no orphan
+// zone_id in the tables with a zone.
 const (
 	CheckZonesLeftSQL = "SELECT count(*) FROM zones WHERE name LIKE '%.%' AND name <> ALL($1)"
 
@@ -183,72 +192,75 @@ const (
 		"(SELECT count(*) FROM laravel_history t WHERE NOT EXISTS (SELECT 1 FROM zones z WHERE z.id = t.zone_id))"
 )
 
-// SpotCheckSQL — спот-чек §7.5 через SQL-функцию домена (миграция
-// 000006): зона — самый длинный суффикс из справочника, после сворачивания
-// это T. Скалярная функция в FROM даёт ровно одну строку даже при NULL
-// (домен/зона не найдены) — WHERE di IS NOT NULL выжимает пустой ответ.
+// SpotCheckSQL — the spot check of §7.5 via the SQL function of a domain
+// (migration 000006): the zone is the longest suffix from the reference
+// table, after the collapse it is T. A scalar function in FROM gives
+// exactly one row even with NULL (the domain/zone not found) — WHERE
+// di IS NOT NULL squeezes out an empty answer.
 const SpotCheckSQL = "SELECT di->'zone'->>'name', di->'domain'->>'label' " +
 	"FROM domain_info($1) di WHERE di IS NOT NULL"
 
-// ---------------------------------------------------------------- типы
+// ---------------------------------------------------------------- types
 
-// Conn — соединение переноса: temp-таблица moving_ids живёт в сессии
-// одного соединения (шаг 3), батчи — транзакции того же соединения
-// (§7.3); *pgxpool.Conn и *pgx.Conn удовлетворяют интерфейсу.
+// Conn — a connection of the move: the moving_ids temp table lives in the
+// session of one connection (step 3), the batches are transactions of the
+// same connection (§7.3); *pgxpool.Conn and *pgx.Conn satisfy the
+// interface.
 type Conn interface {
 	db.DB
 	Begin(ctx context.Context) (pgx.Tx, error)
 }
 
-// Options — параметры Run; нулевые значения — дефолты. Поле Allowlist
-// заполняет CLI из ingest.allowed_zone_paths (валидация и нормализация —
-// internal/config, T-195).
+// Options — the parameters of Run; zero values mean defaults. The
+// Allowlist field is filled by the CLI from ingest.allowed_zone_paths
+// (validation and normalization — internal/config, T-195).
 type Options struct {
-	// Allowlist — многоуровневые зоны, не сворачиваемые (ТЗТ §7.1).
+	// Allowlist — multi-level zones that are not collapsed (spec §7.1).
 	Allowlist []string
-	// Apply — выполнить перенос; false — dry-run: инвентаризация и план,
-	// ничего не меняет.
+	// Apply — execute the move; false — dry-run: an inventory and a plan,
+	// changes nothing.
 	Apply bool
-	// Force — игнорировать предусловие check_state = 1 (после разбора
-	// оператором, runbook §8.2).
+	// Force — ignore the check_state = 1 precondition (after an operator
+	// triage, the runbook §8.2).
 	Force bool
-	// SkipReconcile — пропустить реконсиляцию счётчиков после переноса
-	// (её выполнит первый проход monitor, §7.2 шаг 8).
+	// SkipReconcile — skip the counter reconciliation after the move
+	// (the first monitor pass will do it, §7.2 step 8).
 	SkipReconcile bool
-	// Batch — размер окна id (§7.3); 0 — DefaultBatch. Не конфиг:
-	// уменьшение для интеграционного теста возобновления.
+	// Batch — the size of the id window (§7.3); 0 — DefaultBatch. Not a
+	// config: a reduction for the resumption integration test.
 	Batch int
-	// Log — логгер команды; nil — записи подавлены (slog.DiscardHandler,
-	// стиль RecoverOptions). Запись одна: Warn о неудачной финальной
-	// уборке moving_ids (dropMoving, T-229).
+	// Log — the command logger; nil — records suppressed
+	// (slog.DiscardHandler, the style of RecoverOptions). There is one
+	// record: a Warn about a failed final moving_ids cleanup
+	// (dropMoving, T-229).
 	Log *slog.Logger
 }
 
-// ZoneRow — строка инвентаризации: зона и объёмы переноса (отчёт §7.4).
+// ZoneRow — an inventory row: the zone and the move volumes (the report §7.4).
 type ZoneRow struct {
 	ID       int16
-	Name     string // punycode, составное имя (LIKE '%.%')
-	Total    int64  // zones.domains_total — кэш monitor до переноса
-	Domains  int64  // живой счёт (domains_now по ТЗТ)
+	Name     string // punycode, a compound name (LIKE '%.%')
+	Total    int64  // zones.domains_total — the monitor cache before the move
+	Domains  int64  // the live count (domains_now per the spec)
 	Results  int64  // subdomain_results
 	Findings int64  // laravel_findings
 	History  int64  // laravel_history
 	Files    int64  // ingest_files
-	Parts    bool   // есть выделенные партиции зоны
+	Parts    bool   // the zone has dedicated partitions
 }
 
-// Spec — зона переноса, вычисленная из имени (§7.2): `5g.in` →
-// TLD `in`, префикс `5g`; `city.kawasaki.jp` → TLD `jp`, префикс
-// `city.kawasaki`.
+// Spec — the zone of the move, computed from the name (§7.2): `5g.in` →
+// the TLD `in`, the prefix `5g`; `city.kawasaki.jp` → the TLD `jp`, the
+// prefix `city.kawasaki`.
 type Spec struct {
-	ID     int16  // id 2LD-зоны
-	Name   string // имя 2LD-зоны
-	TLD    string // целевая зона — последняя метка имени
-	Prefix string // имя без .TLD — доклейка к label
+	ID     int16  // the id of the 2LD zone
+	Name   string // the name of the 2LD zone
+	TLD    string // the target zone — the last label of the name
+	Prefix string // the name without .TLD — appended to the label
 }
 
-// SpecOf — Spec из строки инвентаризации: зона = последняя метка,
-// префикс = всё до неё (формула §4.1 ТЗТ).
+// SpecOf — a Spec from an inventory row: the zone = the last label, the
+// prefix = everything before it (the formula §4.1 of the spec).
 func SpecOf(z ZoneRow) (Spec, error) {
 	i := strings.LastIndexByte(z.Name, '.')
 	if i <= 0 || i == len(z.Name)-1 {
@@ -257,32 +269,34 @@ func SpecOf(z ZoneRow) (Spec, error) {
 	return Spec{ID: z.ID, Name: z.Name, TLD: z.Name[i+1:], Prefix: z.Name[:i]}, nil
 }
 
-// Result — итог переноса одной зоны (отчёт apply; счётчики — строки,
-// перенесённые этим запуском: возобновлённый запуск считает остаток).
+// Result — the outcome of moving one zone (the apply report; the counters
+// are the rows moved by this run: a resumed run counts the remainder).
 type Result struct {
-	Zone         string // имя 2LD-зоны
-	TLD          string // целевая зона
+	Zone         string // the name of the 2LD zone
+	TLD          string // the target zone
 	TLDZoneID    int16
-	TLDZoneNew   bool // зона TLD создана переносом
+	TLDZoneNew   bool // the TLD zone was created by the move
 	Domains      int64
 	Results      int64
 	Laravel      int64 // laravel_domains
 	Findings     int64
 	History      int64
 	Files        int64
-	FilesDupes   int64 // дублей ingest_files удалено (шаг 5)
+	FilesDupes   int64 // ingest_files duplicates deleted (step 5)
 	DroppedParts []string
 	Batches      int
-	// Спот-чек §7.5: полное имя первого домена зоны и ожидаемый label
-	// после переноса; пустое имя — доменов в зоне не было.
+	// The spot check §7.5: the full name of the first domain of the zone
+	// and the expected label after the move; an empty name — there were
+	// no domains in the zone.
 	SpotName  string
 	SpotLabel string
 }
 
-// ---------------------------------------------------------------- шаги
+// ---------------------------------------------------------------- steps
 
-// Inventory — инвентаризация 2LD-зон вне allowlist (InventorySQL):
-// список для dry-run, цикла переноса и предусловия.
+// Inventory — an inventory of the 2LD zones outside the allowlist
+// (InventorySQL): the list for the dry-run, the move loop and the
+// precondition.
 func Inventory(ctx context.Context, pool db.DB, allowlist []string) ([]ZoneRow, error) {
 	if pool == nil {
 		return nil, errors.New("collapse: inventory: pool not set")
@@ -307,8 +321,8 @@ func Inventory(ctx context.Context, pool db.DB, allowlist []string) ([]ZoneRow, 
 	return zones, nil
 }
 
-// allowlistArg — аргумент ALL($1): nil превращается в пустой массив
-// (ALL(NULL) — NULL, вышибающий весь предикат).
+// allowlistArg — the argument of ALL($1): nil becomes an empty array
+// (ALL(NULL) is NULL, which kills the whole predicate).
 func allowlistArg(allowlist []string) []string {
 	if allowlist == nil {
 		return []string{}
@@ -316,8 +330,8 @@ func allowlistArg(allowlist []string) []string {
 	return allowlist
 }
 
-// QueuedCounts — домены в очереди (check_state = 1) по зонам: предусловие
-// §7.1. Пустая карта — предусловие выполнено.
+// QueuedCounts — the domains in the queue (check_state = 1) by zones: the
+// §7.1 precondition. An empty map — the precondition holds.
 func QueuedCounts(ctx context.Context, pool db.DB, ids []int16) (map[int16]int64, error) {
 	if len(ids) == 0 {
 		return map[int16]int64{}, nil
@@ -342,10 +356,11 @@ func QueuedCounts(ctx context.Context, pool db.DB, ids []int16) (map[int16]int64
 	return queued, nil
 }
 
-// Zone — перенос одной 2LD-зоны в TLD (шаги 1–7 §7.2) по одному
-// соединению сессии (temp-таблица шага 3). Идемпотентно: каждый оператор
-// адресует остаток строк в 2LD-зоне; сбой на любом шаге оставляет базу
-// в состоянии, с которого повтор команды продолжается.
+// Zone — moves one 2LD zone into the TLD (steps 1–7 §7.2) over a single
+// session connection (the temp table of step 3). Idempotent: every
+// statement addresses the remaining rows in the 2LD zone; a failure at any
+// step leaves the base in a state from which a rerun of the command
+// continues.
 func Zone(ctx context.Context, conn Conn, spec Spec, batch int) (Result, error) {
 	if conn == nil {
 		return Result{}, fmt.Errorf("zone %s: connection not set", spec.Name)
@@ -355,19 +370,19 @@ func Zone(ctx context.Context, conn Conn, spec Spec, batch int) (Result, error) 
 	}
 	res := Result{Zone: spec.Name, TLD: spec.TLD}
 
-	// Шаг 1 — зона TLD.
+	// Step 1 — the TLD zone.
 	tid, created, err := ensureZone(ctx, conn, spec.TLD)
 	if err != nil {
 		return res, err
 	}
 	res.TLDZoneID, res.TLDZoneNew = tid, created
 
-	// Шаг 2 — партиции TLD до переноса (строки ложатся сразу в них).
+	// Step 2 — the TLD partitions before the move (the rows land right in them).
 	if _, err := conn.Exec(ctx, CallPartitionsSQL, tid); err != nil {
 		return res, fmt.Errorf("zone %s: partitions of zone %s (id %d): %w", spec.Name, spec.TLD, tid, err)
 	}
 
-	// Шаг 3 — moving_ids: замороженное множество переносимых id.
+	// Step 3 — moving_ids: the frozen set of ids being moved.
 	if _, err := conn.Exec(ctx, movingDropSQL); err != nil {
 		return res, fmt.Errorf("zone %s: recreating moving_ids: %w", spec.Name, err)
 	}
@@ -378,8 +393,8 @@ func Zone(ctx context.Context, conn Conn, spec Spec, batch int) (Result, error) 
 		return res, fmt.Errorf("zone %s: moving_ids index: %w", spec.Name, err)
 	}
 
-	// Спот-чек §7.5: первый домен зоны до переноса (после — пусто,
-	// проверка не выполняется).
+	// The spot check §7.5: the first domain of the zone before the move
+	// (after it — empty, the check is not executed).
 	if label, ok, err := firstZoneLabel(ctx, conn, spec.ID); err != nil {
 		return res, err
 	} else if ok {
@@ -387,9 +402,10 @@ func Zone(ctx context.Context, conn Conn, spec Spec, batch int) (Result, error) 
 		res.SpotLabel = label + "." + spec.Prefix
 	}
 
-	// Шаг 4 — перенос батчами (§7.3): пачки по batch актуальных id из
-	// moving_ids по возрастанию (keyset), границы батча — [min, max]
-	// пачки; домены и их дети одного диапазона едут атомарно.
+	// Step 4 — the move in batches (§7.3): chunks of batch live ids from
+	// moving_ids in ascending order (a keyset), the batch bounds are
+	// [min, max] of the chunk; the domains and their children of one
+	// range move atomically.
 	last := int64(0)
 	for {
 		ids, err := movingChunk(ctx, conn, last, batch)
@@ -414,15 +430,15 @@ func Zone(ctx context.Context, conn Conn, spec Spec, batch int) (Result, error) 
 		}
 	}
 
-	// laravel_history — одним оператором на зону (без партиций).
+	// laravel_history — one statement per zone (no partitions).
 	if tag, err := conn.Exec(ctx, moveHistorySQL, tid, spec.ID); err != nil {
 		return res, fmt.Errorf("zone %s: laravel_history: %w", spec.Name, err)
 	} else {
 		res.History = tag.RowsAffected()
 	}
 
-	// Шаг 5 — дедуп-журнал ingest_files: дубль содержимого в T удаляется,
-	// остаток перепривязывается.
+	// Step 5 — the ingest_files dedup journal: a duplicate of the content
+	// in T is deleted, the remainder is rebound.
 	if tag, err := conn.Exec(ctx, filesDedupeSQL, spec.ID, tid); err != nil {
 		return res, fmt.Errorf("zone %s: ingest_files dedup: %w", spec.Name, err)
 	} else {
@@ -434,14 +450,14 @@ func Zone(ctx context.Context, conn Conn, spec Spec, batch int) (Result, error) 
 		res.Files = tag.RowsAffected()
 	}
 
-	// Шаг 6 — партиции 2LD-зоны дропнуть (с страховкой ZoneLeftSQL).
+	// Step 6 — drop the partitions of the 2LD zone (with the ZoneLeftSQL guard).
 	parts, err := dropZonePartitions(ctx, conn, spec)
 	if err != nil {
 		return res, err
 	}
 	res.DroppedParts = parts
 
-	// Шаг 7 — строка зоны.
+	// Step 7 — the zone row.
 	if tag, err := conn.Exec(ctx, ZoneDeleteSQL, spec.ID); err != nil {
 		return res, fmt.Errorf("zone %s: row deletion: %w", spec.Name, err)
 	} else if tag.RowsAffected() != 1 {
@@ -450,9 +466,9 @@ func Zone(ctx context.Context, conn Conn, spec Spec, batch int) (Result, error) 
 	return res, nil
 }
 
-// ensureZone — шаг 1: id зоны по имени; отсутствующая создаётся
-// включённой (is_active = true — как автосоздание ingest'ом и zones
-// sync, unicode-форма только для XN-зон).
+// ensureZone — step 1: the zone id by name; a missing one is created
+// active (is_active = true — like the auto-creation by ingest and zones
+// sync, the unicode form only for XN zones).
 func ensureZone(ctx context.Context, conn db.DB, name string) (id int16, created bool, err error) {
 	rows, err := conn.Query(ctx, ZoneIDByNameSQL, name)
 	if err != nil {
@@ -468,7 +484,8 @@ func ensureZone(ctx context.Context, conn db.DB, name string) (id int16, created
 	if err := rows.Err(); err != nil {
 		return 0, false, fmt.Errorf("zone %s: reference table read: %w", name, err)
 	}
-	// unicode-форма (стиль zones sync): только отличающаяся от punycode.
+	// The unicode form (the style of zones sync): only when it differs
+	// from the punycode.
 	unicode := ""
 	if u := idn.ToUnicode(name); u != name {
 		unicode = u
@@ -487,8 +504,8 @@ func ensureZone(ctx context.Context, conn db.DB, name string) (id int16, created
 	return id, true, irows.Err()
 }
 
-// firstZoneLabel — метка первого (min id) домена зоны; ok = false —
-// доменов нет.
+// firstZoneLabel — the label of the first (min id) domain of the zone;
+// ok = false — no domains.
 func firstZoneLabel(ctx context.Context, conn db.DB, zoneID int16) (string, bool, error) {
 	rows, err := conn.Query(ctx, spotLabelSQL, zoneID)
 	if err != nil {
@@ -508,10 +525,10 @@ func firstZoneLabel(ctx context.Context, conn db.DB, zoneID int16) (string, bool
 	return "", false, nil
 }
 
-// movingChunk — очередная пачка id переноса (keyset: строго после
-// after, по возрастанию, не более limit строк); пустая пачка — перенос
-// исчерпан. Читается до конца (rows исчерпаны — соединение свободно
-// для транзакции батча).
+// movingChunk — the next chunk of move ids (a keyset: strictly after
+// after, ascending, at most limit rows); an empty chunk — the move is
+// exhausted. It is read to the end (the rows are exhausted — the
+// connection is free for the batch transaction).
 func movingChunk(ctx context.Context, conn db.DB, after int64, limit int) ([]int64, error) {
 	rows, err := conn.Query(ctx, movingChunkSQL, after, limit)
 	if err != nil {
@@ -529,23 +546,25 @@ func movingChunk(ctx context.Context, conn db.DB, after int64, limit int) ([]int
 	return ids, rows.Err()
 }
 
-// batchMoved — строки одного батча по таблицам.
+// batchMoved — the rows of one batch by tables.
 type batchMoved struct {
 	domains, results, laravel, findings int64
 }
 
-// moveBatch — один батч §7.3: транзакция с четырьмя UPDATE одного
-// диапазона (домены и их дети переезжают атомарно); откат по ошибке —
-// батч целиком. Нарушение UNIQUE (zone_id, label) невозможно (§12.5);
-// аномальный конфликт останавливает команду с именем зоны и диапазоном —
-// естественная защита, отдельный pre-check не нужен.
+// moveBatch — one batch of §7.3: a transaction with four UPDATEs of one
+// range (the domains and their children move atomically); a rollback on
+// error is the batch as a whole. A UNIQUE (zone_id, label) violation is
+// impossible (§12.5); an anomalous conflict stops the command with the
+// zone name and the range — a natural guard, a separate pre-check is not
+// needed.
 func moveBatch(ctx context.Context, conn Conn, spec Spec, tid int16, lo, hi int64) (batchMoved, error) {
 	var m batchMoved
 	tx, err := conn.Begin(ctx)
 	if err != nil {
 		return m, fmt.Errorf("zone %s: batch [%d, %d]: transaction: %w", spec.Name, lo, hi, err)
 	}
-	// Откат безусловно: после Commit — no-op (стиль monitor, T-044).
+	// The rollback unconditionally: after Commit — a no-op (the style of
+	// monitor, T-044).
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	steps := []struct {
@@ -571,9 +590,10 @@ func moveBatch(ctx context.Context, conn Conn, spec Spec, tid int16, lo, hi int6
 	return m, nil
 }
 
-// dropZonePartitions — шаг 6: страховка пустоты зоны (ZoneLeftSQL),
-// выборка партиций (ZonePartsSQL) и DROP по каждой. Имена — из каталога,
-// экранирование идентификатора — pgx.Identifier (ввод извне недопустим).
+// dropZonePartitions — step 6: the emptiness guard of the zone
+// (ZoneLeftSQL), the partition selection (ZonePartsSQL) and a DROP per
+// each. The names come from the catalog, identifier escaping —
+// pgx.Identifier (external input is unacceptable).
 func dropZonePartitions(ctx context.Context, conn db.DB, spec Spec) ([]string, error) {
 	what := fmt.Sprintf("zone %s: partitions: ", spec.Name)
 
@@ -613,10 +633,10 @@ func dropZonePartitions(ctx context.Context, conn db.DB, spec Spec) ([]string, e
 	return parts, nil
 }
 
-// zoneLeft — строка остатка ZoneLeftSQL. Чтение вынесено в хелпер:
-// однострочный агрегат обязан быть потреблён и закрыт (defer на выходе)
-// до следующего запроса — соединение переноса одно (temp-таблица
-// §7.3), открытый портал держит его занятым (conn busy).
+// zoneLeft — one row of the ZoneLeftSQL remainder. The read is extracted
+// into a helper: a single-row aggregate must be consumed and closed
+// (defer at the exit) before the next query — there is one move connection
+// (the temp table §7.3), an open portal keeps it busy (conn busy).
 func zoneLeft(ctx context.Context, conn db.DB, zoneID int16) (left [6]int64, err error) {
 	rows, err := conn.Query(ctx, ZoneLeftSQL, zoneID)
 	if err != nil {
@@ -632,25 +652,27 @@ func zoneLeft(ctx context.Context, conn db.DB, zoneID int16) (left [6]int64, err
 	return left, rows.Err()
 }
 
-// Orphans — счётчики сиротских zone_id пост-проверки §7.5 (ссылки на
-// отсутствующие зоны в таблицах с zone_id).
+// Orphans — the counts of orphan zone_id of the post-check §7.5 (links to
+// missing zones in the tables with a zone_id).
 type Orphans struct {
 	Domains, Results, Laravel, Findings, History int64
 }
 
-// Any — есть ли сироты хоть в одной таблице.
+// Any — are there orphans in at least one table?
 func (o Orphans) Any() bool {
 	return o.Domains != 0 || o.Results != 0 || o.Laravel != 0 || o.Findings != 0 || o.History != 0
 }
 
-// PostChecks — пост-проверки §7.5: 2LD-зон вне allowlist не осталось
-// (zonesLeft = 0) и сиротских zone_id нет.
+// PostChecks — the post-checks §7.5: no 2LD zones outside the allowlist
+// remain (zonesLeft = 0) and there are no orphan zone_id.
 //
-// Каждый агрегат читается своим хелпером: однострочный set закрывается
-// ДО следующего запроса пула (стиль zoneLeft и status.FetchLaravelStats)
-// — открытый set держит соединение до Close, а соединение переноса уже
-// занято Run на весь проход (temp-таблица §7.3): при pool_size CLI = 2
-// второй запрос пост-проверок ждал бы соединение вечно (дедлок T-217).
+// Every aggregate is read by its own helper: a single-row set is closed
+// BEFORE the next pool query (the style of zoneLeft and
+// status.FetchLaravelStats) — an open set holds the connection until
+// Close, and the move connection is already taken by Run for the whole
+// pass (the temp table §7.3): with pool_size of the CLI = 2 the second
+// post-check query would wait for a connection forever (the T-217
+// deadlock).
 func PostChecks(ctx context.Context, pool db.DB, allowlist []string) (zonesLeft int64, orphans Orphans, err error) {
 	zonesLeft, err = zonesLeftCount(ctx, pool, allowlist)
 	if err != nil {
@@ -663,9 +685,10 @@ func PostChecks(ctx context.Context, pool db.DB, allowlist []string) (zonesLeft 
 	return zonesLeft, orphans, nil
 }
 
-// zonesLeftCount — пост-проверка §7.5: 2LD-зоны вне allowlist. Чтение в
-// хелпере: rows закрываются (defer) до возврата — следующий запрос пула
-// не конкурирует за соединение с открытым set'ом (T-217).
+// zonesLeftCount — the post-check §7.5: 2LD zones outside the allowlist.
+// The read sits in a helper: rows are closed (defer) before returning —
+// the next pool query does not compete for a connection with an open set
+// (T-217).
 func zonesLeftCount(ctx context.Context, pool db.DB, allowlist []string) (int64, error) {
 	zrows, err := pool.Query(ctx, CheckZonesLeftSQL, allowlistArg(allowlist))
 	if err != nil {
@@ -673,8 +696,8 @@ func zonesLeftCount(ctx context.Context, pool db.DB, allowlist []string) (int64,
 	}
 	defer zrows.Close()
 	if !zrows.Next() {
-		// Сначала сбой чтения: обрыв соединения — не «пусто» (стиль
-		// monitor.readDailyValue, ревью T-217 P3-4).
+		// First a read failure: a dropped connection is not "empty" (the
+		// style of monitor.readDailyValue, the T-217 review P3-4).
 		if err := zrows.Err(); err != nil {
 			return 0, fmt.Errorf("collapse: 2LD zone post-check: %w", err)
 		}
@@ -690,8 +713,9 @@ func zonesLeftCount(ctx context.Context, pool db.DB, allowlist []string) (int64,
 	return zonesLeft, nil
 }
 
-// orphansCounts — пост-проверка §7.5: сиротские zone_id в таблицах с
-// зоной. Пара zonesLeftCount: set закрывается до возврата (T-217).
+// orphansCounts — the post-check §7.5: orphan zone_id in the tables with
+// a zone. A pair of zonesLeftCount: the set is closed before returning
+// (T-217).
 func orphansCounts(ctx context.Context, pool db.DB) (Orphans, error) {
 	orows, err := pool.Query(ctx, CheckOrphansSQL)
 	if err != nil {
@@ -699,8 +723,8 @@ func orphansCounts(ctx context.Context, pool db.DB) (Orphans, error) {
 	}
 	defer orows.Close()
 	if !orows.Next() {
-		// Сначала сбой чтения — не «пусто» (пара zonesLeftCount,
-		// ревью T-217 P3-4).
+		// First a read failure — not "empty" (a pair of zonesLeftCount,
+		// the T-217 review P3-4).
 		if err := orows.Err(); err != nil {
 			return Orphans{}, fmt.Errorf("collapse: orphan post-check: %w", err)
 		}
@@ -716,8 +740,8 @@ func orphansCounts(ctx context.Context, pool db.DB) (Orphans, error) {
 	return orphans, nil
 }
 
-// SpotCheck — спот-чек §7.5: domain_info(name) отвечает зону wantZone и
-// label wantLabel (доклеенный префикс).
+// SpotCheck — the spot check §7.5: domain_info(name) answers the zone
+// wantZone and the label wantLabel (the appended prefix).
 func SpotCheck(ctx context.Context, pool db.DB, name, wantZone, wantLabel string) error {
 	rows, err := pool.Query(ctx, SpotCheckSQL, name)
 	if err != nil {
@@ -741,22 +765,23 @@ func SpotCheck(ctx context.Context, pool db.DB, name, wantZone, wantLabel string
 	return nil
 }
 
-// ---------------------------------------------------------------- проход
+// ---------------------------------------------------------------- pass
 
-// movingDropTimeout — бюджет финальной уборки moving_ids (T-229):
-// отдельный контекст по образцу discardTimeout (ingest, pipeline.discard)
-// и refundTimeout (queue, recover) — уборка обязана переживать отмену ctx
-// команды (Ctrl-C в момент финиша: контекст уже отменён, а temp-таблица
-// пережила бы возврат соединения в пул), но не висеть неограниченно:
-// DROP без дедлайна на зависшем PostgreSQL удерживал бы соединение и
-// выход CLI сколь угодно долго.
+// movingDropTimeout — the budget of the final moving_ids cleanup (T-229):
+// a separate context following the pattern of discardTimeout (ingest,
+// pipeline.discard) and refundTimeout (queue, recover) — the cleanup must
+// survive the ctx cancellation of the command (Ctrl-C at the finish: the
+// context is already cancelled, while the temp table would survive the
+// connection returning to the pool) but must not hang indefinitely: a
+// DROP without a deadline on a stuck PostgreSQL would hold the connection
+// and the CLI exit for an arbitrary time.
 const movingDropTimeout = 5 * time.Second
 
-// dropMoving — финальная уборка temp-таблицы moving_ids: best-effort DROP
-// с собственным бюджетом времени, ошибка не затеняет результат команды —
-// Warn в лог (T-229). Пережившая уборку таблица не ломает следующие
-// запуски: шаг 3 Zone пересоздаёт её (DROP IF EXISTS) в той же сессии
-// соединения пула.
+// dropMoving — the final cleanup of the moving_ids temp table: a
+// best-effort DROP with its own time budget, an error does not shadow the
+// command result — a Warn to the log (T-229). A table that survived the
+// cleanup does not break the next runs: step 3 of Zone recreates it
+// (DROP IF EXISTS) in the same session of the pool connection.
 func dropMoving(conn Conn, timeout time.Duration, log *slog.Logger) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
@@ -766,14 +791,16 @@ func dropMoving(conn Conn, timeout time.Duration, log *slog.Logger) {
 	}
 }
 
-// Run — полный проход команды (§7.1–§7.5): инвентаризация и отчёт-план,
-// предусловие check_state = 1, по --apply — перенос зон по шагам §7.2,
-// реконсиляция счётчиков (общая с monitor/crawlerctl counters, T-178 —
-// она же авторитетно пересчитает колонки TLD-зон и глобальные кумулятивы),
-// пост-проверки и спот-чеки. Отчёт — в stdout (стиль zones sync).
+// Run — the full pass of the command (§7.1–§7.5): the inventory and the
+// plan report, the check_state = 1 precondition, with --apply — the zone
+// move by the steps §7.2, the counter reconciliation (shared with
+// monitor/crawlerctl counters, T-178 — it also authoritatively recomputes
+// the columns of the TLD zones and the global cumulatives), the
+// post-checks and the spot checks. The report goes to stdout (the style of
+// zones sync).
 //
-// Перенос идёт по одному соединению пула (temp-таблица moving_ids живёт
-// в его сессии), чтения — через пул.
+// The move goes over one pool connection (the moving_ids temp table lives
+// in its session), reads — through the pool.
 func Run(ctx context.Context, pool *pgxpool.Pool, opts Options, stdout io.Writer) error {
 	if pool == nil {
 		return errors.New("collapse: pool not set")
@@ -797,7 +824,7 @@ func Run(ctx context.Context, pool *pgxpool.Pool, opts Options, stdout io.Writer
 		return nil
 	}
 
-	// Отчёт-план §7.4 (dry-run и apply).
+	// The plan report §7.4 (dry-run and apply).
 	specs := make([]Spec, len(zones))
 	for i, z := range zones {
 		spec, err := SpecOf(z)
@@ -808,7 +835,7 @@ func Run(ctx context.Context, pool *pgxpool.Pool, opts Options, stdout io.Writer
 	}
 	printPlan(stdout, zones)
 
-	// Предусловие §7.1: домены в очереди затрагиваемых зон.
+	// The precondition §7.1: domains in the queue of the affected zones.
 	ids := make([]int16, len(zones))
 	for i, z := range zones {
 		ids[i] = z.ID
@@ -819,7 +846,7 @@ func Run(ctx context.Context, pool *pgxpool.Pool, opts Options, stdout io.Writer
 	}
 	if len(queued) > 0 {
 		parts := make([]string, 0, len(queued))
-		for _, z := range zones { // порядок инвентаризации (по имени)
+		for _, z := range zones { // the inventory order (by name)
 			if n, ok := queued[z.ID]; ok {
 				parts = append(parts, fmt.Sprintf("%s — %d", z.Name, n))
 			}
@@ -840,18 +867,19 @@ func Run(ctx context.Context, pool *pgxpool.Pool, opts Options, stdout io.Writer
 		return nil
 	}
 
-	// Перенос: одно соединение (temp-таблица §7.3), зоны по порядку
-	// инвентаризации; сбой останавливает команду с именем зоны.
+	// The move: one connection (the temp table §7.3), the zones in the
+	// inventory order; a failure stops the command with the zone name.
 	conn, err := pool.Acquire(ctx)
 	if err != nil {
 		return fmt.Errorf("collapse: move connection: %w", err)
 	}
 	defer func() {
-		// Финальная уборка moving_ids (§7.2): temp-таблица пережила бы
-		// возврат соединения в пул. Best-effort с собственным бюджетом
-		// времени (dropMoving, T-229): отмена ctx не мешает уборке, а
-		// зависший PostgreSQL не удерживает соединение и выход CLI;
-		// Release — на всех путях, независимо от исхода DROP.
+		// The final moving_ids cleanup (§7.2): the temp table would survive
+		// the connection returning to the pool. Best-effort with its own
+		// time budget (dropMoving, T-229): a ctx cancellation does not
+		// hinder the cleanup, and a stuck PostgreSQL does not hold the
+		// connection and the CLI exit; Release — on all paths, regardless
+		// of the DROP outcome.
 		dropMoving(conn, movingDropTimeout, log)
 		conn.Release()
 	}()
@@ -866,9 +894,10 @@ func Run(ctx context.Context, pool *pgxpool.Pool, opts Options, stdout io.Writer
 		printMoved(stdout, res)
 	}
 
-	// Шаг 8 — счётчики: колонки зон не мержатся вручную, общая
-	// реконсиляция (T-178) авторитетно пересчитывает TLD-зоны и
-	// глобальные кумулятивы; --skip-reconcile оставляет это monitor.
+	// Step 8 — the counters: the zone columns are not merged by hand, the
+	// shared reconciliation (T-178) authoritatively recomputes the TLD
+	// zones and the global cumulatives; --skip-reconcile leaves that to
+	// monitor.
 	if opts.SkipReconcile {
 		out(stdout, "counter reconciliation skipped (--skip-reconcile): the first monitor pass will recompute the zone columns\n")
 	} else {
@@ -887,7 +916,7 @@ func Run(ctx context.Context, pool *pgxpool.Pool, opts Options, stdout io.Writer
 		out(stdout, "counter reconciliation: %d zones rewritten, %d positions with drift\n", rec.Zones, drifted)
 	}
 
-	// Пост-проверки §7.5.
+	// The post-checks §7.5.
 	zonesLeft, orphans, err := PostChecks(ctx, pool, allow)
 	if err != nil {
 		return err
@@ -908,7 +937,7 @@ func Run(ctx context.Context, pool *pgxpool.Pool, opts Options, stdout io.Writer
 		out(stdout, "zone counters = the aggregate: no mismatches\n")
 	}
 
-	// Спот-чек §7.5: по одному перенесённому имени на зону с доменами.
+	// The spot check §7.5: one moved name per zone with domains.
 	for i := range results {
 		res := results[i]
 		if res.SpotName == "" {
@@ -923,14 +952,15 @@ func Run(ctx context.Context, pool *pgxpool.Pool, opts Options, stdout io.Writer
 	return nil
 }
 
-// out — печать отчёта (стиль cmd/crawlerctl: ошибка записи игнорируется,
-// поток — stdout процесса).
+// out — printing the report (the style of cmd/crawlerctl: a write error is
+// ignored, the stream is the stdout of the process).
 func out(w io.Writer, format string, a ...any) {
 	_, _ = fmt.Fprintf(w, format, a...)
 }
 
-// printPlan — таблица плана §7.4 в стиле zones list: числовые колонки
-// вправо, текстовые влево; итог — по каждой целевой TLD.
+// printPlan — the plan table §7.4 in the style of zones list: numeric
+// columns right-aligned, text ones left-aligned; the total — per each
+// target TLD.
 func printPlan(w io.Writer, zones []ZoneRow) {
 	head := []string{"zone", "TLD", "domains", "results", "findings", "history", "files", "partitions"}
 	rows := [][]string{head}
@@ -961,7 +991,7 @@ func printPlan(w io.Writer, zones []ZoneRow) {
 			if i > 0 {
 				b.WriteByte(' ')
 			}
-			if i >= 2 && i <= 6 { // числовые колонки — вправо
+			if i >= 2 && i <= 6 { // numeric columns — right-aligned
 				fmt.Fprintf(&b, "%*s", wmax[i], c)
 			} else {
 				fmt.Fprintf(&b, "%-*s", wmax[i], c)
@@ -969,7 +999,7 @@ func printPlan(w io.Writer, zones []ZoneRow) {
 		}
 		out(w, "%s\n", b.String())
 	}
-	// Итоги по целевым TLD (§7.4): несколько 2LD одной TLD суммируются.
+	// Totals per the target TLDs (§7.4): several 2LDs of one TLD are summed.
 	byTLD := make(map[string]int64)
 	for _, z := range zones {
 		byTLD[zoneTLD(z.Name)] += z.Domains
@@ -994,13 +1024,13 @@ func printPlan(w io.Writer, zones []ZoneRow) {
 	}
 }
 
-// zoneTLD — целевая зона имени: последняя метка (формула §4.1 ТЗТ);
-// вызывается только для составных имён инвентаризации.
+// zoneTLD — the target zone of a name: the last label (the formula §4.1
+// of the spec); called only for the compound names of the inventory.
 func zoneTLD(name string) string {
 	return name[strings.LastIndexByte(name, '.')+1:]
 }
 
-// printMoved — строка отчёта apply: фактический перенос зоны.
+// printMoved — a line of the apply report: the actual move of the zone.
 func printMoved(w io.Writer, r Result) {
 	newMark := ""
 	if r.TLDZoneNew {
@@ -1015,5 +1045,5 @@ func printMoved(w io.Writer, r Result) {
 		r.Laravel, r.Findings, r.History, r.Files, r.FilesDupes, parts)
 }
 
-// compile-time: соединение пула подходит под интерфейс переноса.
+// compile-time: the pool connection fits the move interface.
 var _ Conn = (*pgxpool.Conn)(nil)

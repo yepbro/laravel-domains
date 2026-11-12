@@ -1,12 +1,13 @@
-// Package checker — библиотечный конвейер живой проверки одного домена
-// (T-123, рефакторинг crawlerctl check из T-119): DNS всех субдоменов →
-// HTTP обоих схем живых (+ рендер SPA при настроенном render.remote_url)
-// → пассивный анализ правилами. Read-only к БД и очередям: ничего не
-// пишет и не публикует (публикацией владеет scheduler); из БД читается
-// только справочник subdomains. Потребители — CLI crawlerctl check
-// (отладка правил) и публичная форма лендинга (internal/web, T-123);
-// UA/таймауты/лимиты — из конфигурации, никаких активных зондов
-// (пассивная этика ТЗ §5.8/§9).
+// Package checker — the library pipeline of the live check of one domain
+// (T-123, a refactoring of the crawlerctl check from T-119): the DNS of
+// all the subdomains → the HTTP of both schemes of the live ones (+ an SPA
+// render with render.remote_url configured) → a passive analysis by the
+// rules. Read-only to the DB and the queues: it writes and publishes
+// nothing (the publication belongs to the scheduler); only the subdomains
+// reference table is read from the DB. The consumers — the crawlerctl
+// check CLI (debugging the rules) and the public landing form
+// (internal/web, T-123); the UA/timeouts/limits — from the configuration,
+// no active probes (the passive ethics of the spec §5.8/§9).
 package checker
 
 import (
@@ -30,15 +31,15 @@ import (
 	"crawler/internal/rules"
 )
 
-// SubRecord — итог одной записи (субдомен×вариант): то, что показывает
-// и CLI, и форма лендинга.
+// SubRecord — the outcome of one record (subdomain×variant): what both
+// the CLI and the landing form show.
 type SubRecord struct {
 	SubdomainID int16
-	Label       string // "" — апекс
+	Label       string // "" is the apex
 	Host        string // label.domain
 	Variant     string // main | http
 	Scheme      string // http | https
-	Status      string // HTTP-код или «ошибка <класс>»
+	Status      string // the HTTP code or "error <class>"
 	FinalURL    string
 	Redirects   []httpfetch.RedirectStep
 	TLSValid    bool
@@ -48,54 +49,55 @@ type SubRecord struct {
 	Score       float64
 	VerMin      string
 	VerMax      string
-	Rendered    bool // анализ по DOM рендера
+	Rendered    bool // the analysis by the render DOM
 }
 
-// Result — итог проверки домена.
+// Result — the outcome of the domain check.
 type Result struct {
 	Domain   string // punycode
 	Unicode  string
 	Zone     string
-	Apex     string // ветка апекса DNS (delegated/not_delegated/…)
-	Terminal string // терминальный статус DNS-этапа ("" — HTTP шёл)
+	Apex     string // the apex branch of the DNS (delegated/not_delegated/…)
+	Terminal string // the terminal status of the DNS stage ("" — the HTTP ran)
 	Records  []SubRecord
-	Found    bool // хоть одна запись с is_laravel
+	Found    bool // at least one record with is_laravel
 	Score    float64
 	VerMin   string
 	VerMax   string
-	DNSMS    int64 // длительность DNS-фазы, мс
-	TotalMS  int64 // длительность всей проверки, мс
+	DNSMS    int64 // the duration of the DNS phase, ms
+	TotalMS  int64 // the duration of the whole check, ms
 }
 
-// Logger — минимальный логгер конвейера (удовлетворяется *slog.Logger).
+// Logger — the minimal pipeline logger (satisfied by *slog.Logger).
 type Logger interface {
 	Info(msg string, args ...any)
 	Warn(msg string, args ...any)
 }
 
-// LiveFunc — шов конвейера для потребителей (форма лендинга T-123
-// подменяет в тестах без сети; продакшн-реализация — метод Run
-// долгоживущего контура Runtime, T-220, и одноразовая функция Run для
-// CLI).
+// LiveFunc — the pipeline seam for the consumers (the landing form T-123
+// substitutes it in tests without a network; the production implementation
+// is the Run method of the long-lived Runtime circuit, T-220, and the
+// one-off Run function for the CLI).
 type LiveFunc func(ctx context.Context, cfg *config.Config, pool Pool, domain string, log Logger) (*Result, error)
 
-// Pool — зависимость конвейера: справочник subdomains (db.DB).
+// Pool — the pipeline dependency: the subdomains reference table (db.DB).
 type Pool = db.DB
 
-// Run выполняет полный конвейер одного имени на готовом контуре (T-220):
-// метод совпадает с LiveFunc по сигнатуре — web передаёт его от контура,
-// собранного на время жизни сервиса; cfg-параметр игнорируется (контур
-// собран из своей конфигурации при NewRuntime, включая порог
-// analyzer.laravel_min_score). pool используется только чтением
-// справочника subdomains (LoadSubdomains). Ошибки сети/анализа не
-// возвращаются как отказ проверки — они отражаются в записях
-// (Status/Signals); возврат ошибки — только инфраструктурные сбои
-// (БД справочника, отмена ctx). Одноразовый вызов без своего контура —
-// свободная функция Run (CLI).
+// Run executes the full pipeline of one name on the ready circuit (T-220):
+// the method matches LiveFunc by signature — web passes it from the
+// circuit assembled for the lifetime of the service; the cfg parameter is
+// ignored (the circuit was assembled from its own configuration at
+// NewRuntime, including the analyzer.laravel_min_score threshold). The
+// pool is used only for reading the subdomains reference table
+// (LoadSubdomains). Network/analysis errors are not returned as a check
+// failure — they are reflected in the records (Status/Signals); returning
+// an error is only for infrastructure failures (the reference DB, a ctx
+// cancellation). A one-off call without its own circuit — the free Run
+// function (the CLI).
 func (rt *Runtime) Run(ctx context.Context, _ *config.Config, pool Pool, domain string, log Logger) (*Result, error) {
 	if log == nil {
-		// NewRuntime допускает nil-логгер — конвейер не должен
-		// паниковать на Warn (P3-1 ревью T-220).
+		// NewRuntime allows a nil logger — the pipeline must not panic
+		// on Warn (P3-1 of the T-220 review).
 		log = rt.log
 	}
 	start := time.Now()
@@ -110,9 +112,9 @@ func (rt *Runtime) Run(ctx context.Context, _ *config.Config, pool Pool, domain 
 		return nil, fmt.Errorf("checker: %w", err)
 	}
 
-	// DNS-этап как библиотека: цепь ручной проверки (resolve.go) под
-	// лимитами T-035 — цепь и лимитёр собраны на контуре один раз
-	// (NewRuntime), здесь только сам проход.
+	// The DNS stage as a library: the manual check chain (resolve.go)
+	// under the T-035 limits — the chain and the limiter are assembled on
+	// the circuit once (NewRuntime); here only the pass itself.
 	resolve := rt.resolve
 
 	dnsStart := time.Now()
@@ -153,14 +155,16 @@ func (rt *Runtime) Run(ctx context.Context, _ *config.Config, pool Pool, domain 
 	}
 	res.DNSMS = time.Since(dnsStart).Milliseconds()
 
-	// Транспорт как у боевого http-worker (T-049/T-050/T-047) — один на
-	// контур (NewRuntime) с общими limitState; здесь только сам проход.
+	// The transport like the production http-worker (T-049/T-050/T-047) —
+	// one per circuit (NewRuntime) with the shared limitState; here only
+	// the pass itself.
 	fetcher := rt.fetcher
 
-	// Живой проверке некуда (и незачем) писать боевой контент: воркер
-	// с T-147 сохраняет тела ранним Put и требует ContentStore — одноразовое
-	// хранилище в памяти принимает страницы, анализ читает их обратно по
-	// хэшу записи (render для SPA подменит HTML своим DOM ниже).
+	// The live check has nowhere (and no reason) to write production
+	// content: since T-147 the worker saves the bodies with an early Put
+	// and requires a ContentStore — a one-off in-memory store accepts the
+	// pages, the analysis reads them back by the record hash (the render
+	// will substitute its DOM for the HTML for SPA below).
 	mem := newCheckerStore()
 	worker, err := httpworker.New(httpworker.ChainFetch(fetcher), httpworker.Options{
 		MaxRedirects: rt.cfg.HTTP.MaxRedirects,
@@ -169,28 +173,29 @@ func (rt *Runtime) Run(ctx context.Context, _ *config.Config, pool Pool, domain 
 	if err != nil {
 		return nil, fmt.Errorf("checker: %w", err)
 	}
-	// Идентификаторы синтетические: ProcessDomain их не валидирует.
+	// The identifiers are synthetic: ProcessDomain does not validate them.
 	task := queue.HTTPTask{ZoneID: 1, DomainID: 1, Name: norm.ASCII, Subdomains: episode.HTTPSubdomains}
 	dom, err := worker.ProcessDomain(ctx, task)
 	if err != nil {
 		return nil, fmt.Errorf("checker: %s: HTTP: %w", norm.ASCII, err)
 	}
 
-	// Рендер SPA — внешний CDP-браузер (render.remote_url); менеджер
-	// собран на контуре, поколение браузера поднимается лениво первым
-	// рендером (недоступный Chromium — анализ по исходному HTML, как и
-	// при ошибке рендера записи). Первый отказ класса «браузер» гасит
-	// рендер до конца этой проверки (аналог renderer=nil одноразового
-	// Run до T-220): повторные попытки на общем менеджере стартуют
-	// поколение под его мьютексом и платят Dial+SessionStart таймауты
-	// на каждой SPA-записи (P2-3 ревью T-220), следующая проверка
-	// попробует снова.
+	// The SPA render — an external CDP browser (render.remote_url); the
+	// manager is assembled on the circuit, the browser generation is
+	// raised lazily by the first render (an unavailable Chromium — the
+	// analysis by the original HTML, as with a record render error too).
+	// The first failure of the "browser" class damps the render until the
+	// end of this check (the analog of renderer=nil of the one-off Run
+	// before T-220): retries on the shared manager would start the
+	// generation under its mutex and pay Dial+SessionStart timeouts on
+	// every SPA record (P2-3 of the T-220 review); the next check will
+	// try again.
 	renderer := rt.renderer
 	renderDown := false
 
-	// Снапшот правил — из Reloader контура: набор читается один раз на
-	// сборке и актуализируется фоновой перезагрузкой, а не с диска на
-	// каждый запрос (T-220).
+	// The rules snapshot — from the Reloader of the circuit: the set is
+	// read once at assembly and kept fresh by the background reload,
+	// rather than from the disk per each request (T-220).
 	set := rt.rules.Set()
 
 	for i := range dom.Subdomains {
@@ -263,7 +268,8 @@ func (rt *Runtime) Run(ctx context.Context, _ *config.Config, pool Pool, domain 
 	return res, nil
 }
 
-// wildSubs — вход wildcard-пометки T-038 (копия resultWildSubs dnsworker).
+// wildSubs — the input of the wildcard marking of T-038 (a copy of
+// resultWildSubs of dnsworker).
 func wildSubs(rep *dnsworker.SubdomReport) []dnsworker.WildSubdomain {
 	out := make([]dnsworker.WildSubdomain, 0, len(rep.Results))
 	for _, r := range rep.Results {
@@ -287,14 +293,15 @@ func ruleCookies(cs []*http.Cookie) []rules.Cookie {
 	return out
 }
 
-// checkerStore — одноразовое хранилище контента живой проверки в памяти
-// (T-147): http-worker сохраняет тела страниц ранним Put и работает без
-// удержания байтов в памяти, живой проверке некуда (и незачем) писать
-// боевые паки — страницы одной проверки оседают здесь и читаются назад
-// по хэшу записи для пассивного анализа (рендер SPA подменит HTML своим
-// DOM). Реализует content.ContentStore (Put/Get/Delete, контракт
-// T-041: дедуп по хэшу, Created, refcount); память ограничена задачей
-// одного домена (страниц ≤ 2 × субдомены, тело ≤ max_body_bytes).
+// checkerStore — the one-off in-memory content store of the live check
+// (T-147): the http-worker saves the page bodies with an early Put and
+// works without retaining bytes in memory; the live check has nowhere (and
+// no reason) to write the production packs — the pages of one check settle
+// here and are read back by the record hash for the passive analysis (the
+// SPA render substitutes its DOM for the HTML). It implements
+// content.ContentStore (Put/Get/Delete, the contract of T-041: a dedup by
+// hash, Created, a refcount); the memory is bounded by the task of one
+// domain (pages ≤ 2 × subdomains, a body ≤ max_body_bytes).
 type checkerStore struct {
 	mu     sync.Mutex
 	blocks map[content.Hash][]byte
@@ -343,10 +350,10 @@ func (s *checkerStore) Delete(_ context.Context, h content.Hash) error {
 	return nil
 }
 
-// body возвращает тело по хэшу записи (nil — контента нет: обрезка,
-// несохранённая страница, алиас без ссылки). Для живой проверки контент
-// алиаса доступен как собственный (класс T-055 един) — правила видят
-// реальные байты страницы записи.
+// body returns the body by the record hash (nil — no content: a
+// truncation, an unsaved page, an alias without a reference). For the
+// live check the alias content is available as its own (the T-055 class
+// is one) — the rules see the real bytes of the record page.
 func (s *checkerStore) body(h *content.Hash) []byte {
 	if h == nil {
 		return nil

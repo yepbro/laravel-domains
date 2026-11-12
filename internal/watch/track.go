@@ -5,26 +5,26 @@ import (
 	"time"
 )
 
-// fileSig — состояние файла, стабильность которого проверяется: пока
-// размер и mtime неизменны, запись считается завершённой (ТЗ 5.1).
+// fileSig is the state of a file whose stability is being checked: while
+// the size and mtime are unchanged, the record is considered complete (spec 5.1).
 type fileSig struct {
 	size    int64
 	modTime time.Time
 }
 
-// candidate — файл-кандидат: замечен в состоянии sig с момента since.
+// candidate is a candidate file: seen in state sig since moment since.
 type candidate struct {
 	sig   fileSig
 	since time.Time
 }
 
-// tracker решает, какие файлы готовы к выдаче: чистая логика без I/O,
-// время — через now (заглушка в тестах). Повторная выдача одного файла
-// исключена: выданный файл запоминается по пути и сигнатуре, пока путь
-// существует в incoming (исчезновение пути убирает запись — forget).
-// Если по тому же пути появляется файл с другим размером/mtime — это
-// новый файл, он будет выдан ещё раз; постоянная идемпотентность (по
-// содержимому, независимо от имени) — ingest_files в БД, задача T-021.
+// tracker decides which files are ready for delivery: pure logic without I/O,
+// time comes through now (a stub in tests). Redelivery of the same file is
+// excluded: a delivered file is remembered by path and signature while the
+// path exists in incoming (a missing path removes the entry — forget).
+// If a file with a different size/mtime appears at the same path — it is
+// a new file and will be delivered again; permanent idempotency (by
+// content, regardless of the name) is ingest_files in the DB, task T-021.
 type tracker struct {
 	stableAfter time.Duration
 	now         func() time.Time
@@ -42,15 +42,15 @@ func newTracker(stableAfter time.Duration, now func() time.Time) *tracker {
 	}
 }
 
-// observe фиксирует состояние файла (size/modTime). event=true — состояние
-// пришло из события записи (Create/Write): окно стабильности отсчитывается
-// заново всегда, даже при неизменной сигнатуре — на ФС с грубым mtime
-// дозапись может не поменять размер/mtime, а событие гарантирует, что файл
-// трогали. event=false — плановый обход: окно сбрасывается только когда
-// сигнатура изменилась.
+// observe records the file state (size/modTime). event=true means the state
+// came from a write event (Create/Write): the stability window restarts
+// always, even with an unchanged signature — on filesystems with coarse
+// mtime an append may not change the size/mtime, while the event guarantees
+// the file was touched. event=false means a scheduled pass: the window
+// resets only when the signature changed.
 //
-// false — файл с этим состоянием уже был выдан и повторно выдаваться не
-// должен; такой путь не отслеживается.
+// false — a file with this state has already been delivered and must not be
+// delivered again; such a path is no longer tracked.
 func (t *tracker) observe(path string, size int64, modTime time.Time, event bool) bool {
 	sig := fileSig{size: size, modTime: modTime}
 	if d, ok := t.delivered[path]; ok && d == sig {
@@ -67,10 +67,10 @@ func (t *tracker) observe(path string, size int64, modTime time.Time, event bool
 	return true
 }
 
-// ready проверяет кандидата path: если его состояние прямо сейчас (по
-// свежему stat) совпадает с наблюдаемым и живёт дольше stableAfter — файл
-// готов. Кандидат при этом потребляется и переходит в выданные: второй раз
-// тот же файл не выдаётся.
+// ready checks candidate path: if its state right now (by a fresh stat)
+// matches the observed one and has lived longer than stableAfter — the file
+// is ready. The candidate is then consumed and moves to delivered: the same
+// file is not delivered a second time.
 func (t *tracker) ready(path string, size int64, modTime time.Time) (File, bool) {
 	c, ok := t.candidates[path]
 	if !ok {
@@ -85,21 +85,21 @@ func (t *tracker) ready(path string, size int64, modTime time.Time) (File, bool)
 	return File{Path: path, Size: size, ModTime: modTime}, true
 }
 
-// forget убирает путь — файла больше нет (удалён до стабильности либо
-// ушёл из incoming: перенос в processed/failed, переименование). Вместе
-// с кандидатом убирается и память о выданном: она нужна, пока путь
-// существует в incoming, а хранимая навсегда карта delivered росла бы
-// неограниченно по числу различных путей у долгоживущего сервиса
-// (ING-P3-3). Повторно появившийся по тому же пути файл с той же
-// сигнатурой снова станет кандидатом — постоянная идемпотентность
-// обеспечивается ingest_files в БД (T-021): повторная выдача того же
-// содержимого завершится дублем по sha256.
+// forget removes the path — the file is gone (deleted before stability or
+// moved out of incoming: a transfer to processed/failed, a rename). Along
+// with the candidate, the memory of the delivered file is removed: it is
+// needed while the path exists in incoming, and a map kept forever would
+// grow unboundedly with the number of distinct paths of a long-lived
+// service (ING-P3-3). A file re-appearing at the same path with the same
+// signature becomes a candidate again — permanent idempotency is provided
+// by ingest_files in the DB (T-021): redelivery of the same content ends
+// with a duplicate by sha256.
 func (t *tracker) forget(path string) {
 	delete(t.candidates, path)
 	delete(t.delivered, path)
 }
 
-// paths возвращает пути кандидатов в детерминированном порядке.
+// paths returns candidate paths in a deterministic order.
 func (t *tracker) paths() []string {
 	out := make([]string, 0, len(t.candidates))
 	for p := range t.candidates {

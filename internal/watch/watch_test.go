@@ -8,17 +8,18 @@ import (
 	"time"
 )
 
-// Параметры наблюдателя в тестах: миллисекундные интервалы, чтобы проверка
-// стабильности и обход были быстрыми, но детерминизм обеспечивают запасы
-// между таймаутами (окно стабильности заметно больше периодов проверки).
+// The watcher parameters in the tests: millisecond intervals so the
+// stability check and the pass are fast; the determinism is provided by
+// the margins between the timeouts (the stability window is noticeably
+// larger than the check periods).
 const (
 	testStable = 120 * time.Millisecond
 	testScan   = 200 * time.Millisecond
-	testQuiet  = 60 * time.Millisecond // < testStable - интервал проверки
+	testQuiet  = 60 * time.Millisecond // < testStable - the check interval
 )
 
-// start запускает наблюдателя над dir и возвращает канал готовых файлов;
-// наблюдатель останавливается с тестом.
+// start starts the watcher over dir and returns the channel of ready
+// files; the watcher stops with the test.
 func start(t *testing.T, dir string, mutate func(*Options)) <-chan File {
 	t.Helper()
 	opts := Options{
@@ -39,7 +40,7 @@ func start(t *testing.T, dir string, mutate func(*Options)) <-chan File {
 	return files
 }
 
-// waitFor читает следующий готовый файл или падает по таймауту.
+// waitFor reads the next ready file or fails by timeout.
 func waitFor(t *testing.T, files <-chan File) File {
 	t.Helper()
 	select {
@@ -54,7 +55,7 @@ func waitFor(t *testing.T, files <-chan File) File {
 	}
 }
 
-// expectEmpty проверяет, что за quiet ничего не выдано.
+// expectEmpty checks that nothing was delivered within quiet.
 func expectEmpty(t *testing.T, files <-chan File, quiet time.Duration) {
 	t.Helper()
 	select {
@@ -97,8 +98,8 @@ func TestDir_GrowingFileNotDeliveredUntilQuiet(t *testing.T) {
 	name := filepath.Join(dir, "crawl.test", "add", "growing.txt")
 	writeFile(t, name, "example.com\n")
 
-	// Дозапись каждые 30 мс в течение ~360 мс: окна стабильности 120 мс
-	// не возникает, файл не выдаётся.
+	// Appends every 30 ms for ~360 ms: the 120 ms stability window never
+	// arises, the file is not delivered.
 	stop := time.After(360 * time.Millisecond)
 	for {
 		select {
@@ -115,8 +116,8 @@ func TestDir_GrowingFileNotDeliveredUntilQuiet(t *testing.T) {
 		}
 		break
 	}
-	expectEmpty(t, files, testQuiet) // запись только что шла — выдачи быть не должно
-	waitFor(t, files)                // после затишья файл готов
+	expectEmpty(t, files, testQuiet) // the writing just happened — there must be no delivery
+	waitFor(t, files)                // after the quiet the file is ready
 }
 
 func TestDir_TmpPartHiddenIgnored(t *testing.T) {
@@ -129,8 +130,8 @@ func TestDir_TmpPartHiddenIgnored(t *testing.T) {
 	writeFile(t, filepath.Join(sub, ".hidden.txt"), "x")
 	expectEmpty(t, files, 3*testScan)
 
-	// Переименование *.tmp → *.txt (ТЗ 5.1) — файл готов после окна
-	// стабильности.
+	// A rename *.tmp → *.txt (spec 5.1) — the file is ready after the
+	// stability window.
 	if err := os.Rename(filepath.Join(sub, "a.txt.tmp"), filepath.Join(sub, "a.txt")); err != nil {
 		t.Fatal(err)
 	}
@@ -139,9 +140,9 @@ func TestDir_TmpPartHiddenIgnored(t *testing.T) {
 	}
 }
 
-// TestDir_ArchiveExtensions — архивы поддерживаемых форматов (T-133)
-// отслеживаются наравне с *.txt: те же правила готовности; неподдерживаемые
-// форматы, временные и скрытые имена не выдаются.
+// TestDir_ArchiveExtensions — archives of supported formats (T-133) are
+// tracked on a par with *.txt: the same readiness rules; unsupported
+// formats, temporary and hidden names are not delivered.
 func TestDir_ArchiveExtensions(t *testing.T) {
 	dir := t.TempDir()
 	files := start(t, dir, nil)
@@ -151,10 +152,10 @@ func TestDir_ArchiveExtensions(t *testing.T) {
 	for _, name := range want {
 		writeFile(t, filepath.Join(sub, name), "example.com\n")
 	}
-	writeFile(t, filepath.Join(sub, "g.rar"), "x")     // не поддерживается
-	writeFile(t, filepath.Join(sub, "h.7z"), "x")      // не поддерживается
-	writeFile(t, filepath.Join(sub, "i.zip.tmp"), "x") // временное имя
-	writeFile(t, filepath.Join(sub, ".j.zip"), "x")    // скрытое
+	writeFile(t, filepath.Join(sub, "g.rar"), "x")     // not supported
+	writeFile(t, filepath.Join(sub, "h.7z"), "x")      // not supported
+	writeFile(t, filepath.Join(sub, "i.zip.tmp"), "x") // a temporary name
+	writeFile(t, filepath.Join(sub, ".j.zip"), "x")    // hidden
 
 	got := make(map[string]bool, len(want))
 	for range want {
@@ -166,13 +167,13 @@ func TestDir_ArchiveExtensions(t *testing.T) {
 			t.Errorf("архив %s не выдан (выданы %v)", name, got)
 		}
 	}
-	// Ничего лишнего (rar/7z/tmp/скрытые).
+	// Nothing extra (rar/7z/tmp/hidden).
 	expectEmpty(t, files, 3*testScan)
 }
 
-// TestDir_GrowingArchiveNotDeliveredUntilQuiet — дозаписываемый архив
-// (T-133) не выдаётся до окна стабильности: те же правила готовности,
-// что и у txt.
+// TestDir_GrowingArchiveNotDeliveredUntilQuiet — an archive being appended
+// (T-133) is not delivered until the stability window: the same readiness
+// rules as for txt.
 func TestDir_GrowingArchiveNotDeliveredUntilQuiet(t *testing.T) {
 	dir := t.TempDir()
 	files := start(t, dir, nil)
@@ -196,14 +197,14 @@ func TestDir_GrowingArchiveNotDeliveredUntilQuiet(t *testing.T) {
 		}
 		break
 	}
-	expectEmpty(t, files, testQuiet) // запись только что шла — выдачи быть не должно
-	waitFor(t, files)                // после затишья архив готов
+	expectEmpty(t, files, testQuiet) // the writing just happened — there must be no delivery
+	waitFor(t, files)                // after the quiet the archive is ready
 }
 
 func TestDir_ScanPicksPreExistingFile(t *testing.T) {
 	dir := t.TempDir()
-	// Файл существует до старта наблюдателя: событий fsnotify нет,
-	// выдаёт его только обход-страховка.
+	// The file existed before the watcher started: there are no fsnotify
+	// events; only the safety-net pass delivers it.
 	name := filepath.Join(dir, "crawl.test", "add", "old.txt")
 	writeFile(t, name, "example.com\n")
 
@@ -217,8 +218,9 @@ func TestDir_NewNestedDirsWatched(t *testing.T) {
 	dir := t.TempDir()
 	files := start(t, dir, nil)
 
-	// Каталоги зоны создаются после старта наблюдателя: watch добавляется
-	// на лету, файл глубине <зона>/add/ подхватывается.
+	// The zone directories are created after the watcher start: the watch
+	// is added on the fly, a file at the depth of <zone>/add/ is picked
+	// up.
 	name := filepath.Join(dir, "новая-зона.test", "add", "seed.txt")
 	writeFile(t, name, "example.com\n")
 	if f := waitFor(t, files); f.Path != name {
@@ -233,9 +235,9 @@ func TestDir_NoDuplicateButReplacedFileRedelivered(t *testing.T) {
 	name := filepath.Join(dir, "crawl.test", "add", "seed.txt")
 	writeFile(t, name, "one\n")
 	waitFor(t, files)
-	expectEmpty(t, files, 3*testScan) // повторная выдача исключена
+	expectEmpty(t, files, 3*testScan) // redelivery is excluded
 
-	// Тот же путь, новое содержимое — новый файл, выдаётся снова.
+	// The same path, new content — a new file, delivered again.
 	writeFile(t, name, "one\ntwo\n")
 	f := waitFor(t, files)
 	if f.Size != int64(len("one\ntwo\n")) {
@@ -264,15 +266,16 @@ func TestDir_ProcessedFailedSkipped(t *testing.T) {
 	writeFile(t, filepath.Join(dir, "failed", "bad.txt"), "x")
 	expectEmpty(t, files, 3*testScan)
 
-	// Контроль: файл в зоне после этого выдаётся — наблюдатель жив.
+	// The control: a file in a zone is delivered after this — the watcher
+	// is alive.
 	writeFile(t, filepath.Join(dir, "crawl.test", "add", "ok.txt"), "x")
 	waitFor(t, files)
 }
 
 func TestDir_BackpressureNoLoss(t *testing.T) {
 	dir := t.TempDir()
-	// Канал на 2 файла, файлов 5: наблюдатель обязан заблокироваться,
-	// но не потерять файлы.
+	// A channel of 2 files, 5 files: the watcher must block but not lose
+	// the files.
 	files := start(t, dir, func(o *Options) { o.QueueSize = 2 })
 
 	var want []string
@@ -281,7 +284,7 @@ func TestDir_BackpressureNoLoss(t *testing.T) {
 		writeFile(t, name, "example.com\n")
 		want = append(want, name)
 	}
-	time.Sleep(3 * testStable) // буфер заполнен и send заблокирован
+	time.Sleep(3 * testStable) // the buffer is full and the send is blocked
 
 	got := make(map[string]bool)
 	for i := 0; i < 5; i++ {
@@ -294,7 +297,7 @@ func TestDir_BackpressureNoLoss(t *testing.T) {
 		}
 	}
 
-	// Цикл наблюдения жив после разблокировки.
+	// The watch loop is alive after the unblocking.
 	name := filepath.Join(dir, "crawl.test", "add", "z.txt")
 	writeFile(t, name, "example.com\n")
 	if f := waitFor(t, files); f.Path != name {
@@ -340,10 +343,10 @@ func TestDir_MissingDirCreated(t *testing.T) {
 	}
 }
 
-// TestDir_HiddenRootWatched — скрытый ingest.dir (/data/.incoming) —
-// валидная конфигурация (config.Validate требует лишь непустоту):
-// скрытость корня не отключает наблюдение (ING-P3-4); скрытые
-// подкаталоги внутри корня по-прежнему игнорируются.
+// TestDir_HiddenRootWatched — a hidden ingest.dir (/data/.incoming) is a
+// valid configuration (config.Validate only requires non-emptiness): the
+// hiddenness of the root does not disable the watch (ING-P3-4); hidden
+// subdirectories inside the root are still ignored.
 func TestDir_HiddenRootWatched(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), ".incoming")
 	files := start(t, dir, nil)

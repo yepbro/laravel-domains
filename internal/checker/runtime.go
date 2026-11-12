@@ -1,21 +1,22 @@
-// Долгоживущий контур живой проверки (T-220). До T-220 конвейер Run
-// собирал всё окружение на каждый вызов: цепь резолверов (1 основной +
-// dns.fallback_resolvers клиентов, каждый с пулом udp_pool_size 2000 —
-// до 6000 UDP-сокетов на один запрос формы при LimitNOFILE=65535 юнита
-// crawler-web: ~10 параллельных проверок исчерпывали fd вместе с
-// /healthz), свой httpfetch.Fetcher с локальными limitState (потолки
-// секции http действовали только внутри одного конвейера — глобального
-// лимита на сервис не было), правила с диска и render.Manager со
-// Start() при настроенном render.remote_url.
+// The long-lived circuit of the live check (T-220). Before T-220 the Run
+// pipeline assembled the whole environment per call: a resolver chain
+// (1 primary + dns.fallback_resolvers clients, each with a udp_pool_size
+// pool of 2000 — up to 6000 UDP sockets per one form request at
+// LimitNOFILE=65535 of the crawler-web unit: ~10 parallel checks
+// exhausted the fds together with /healthz), its own httpfetch.Fetcher
+// with local limitState (the ceilings of the http section acted only
+// inside one pipeline — there was no service-wide limit), the rules from
+// the disk and a render.Manager with a Start() with render.remote_url
+// configured.
 //
-// Runtime собирает это окружение один раз на время жизни сервиса
-// (публичная форма web): одна цепь резолверов с малым пулом UDP
-// (LiveUDPPoolSize), один Fetcher с общими limitState, Reloader правил
-// с фоновой перезагрузкой и один render.Manager. Run гоняет конвейер
-// по готовому контуру и своего фонда не строит; владелец закрывает
-// контур Close'ом на остановке (web.Server.Run → closeLive). Одноразовый
-// потребитель (CLI crawlerctl check) собирает контур на один вызов
-// функцией Run.
+// Runtime assembles this environment once for the lifetime of the service
+// (the public web form): one resolver chain with a small UDP pool
+// (LiveUDPPoolSize), one Fetcher with shared limitState, a rules Reloader
+// with a background reload and one render.Manager. Run runs the pipeline
+// on the ready circuit and builds no fund of its own; the owner closes
+// the circuit with Close at shutdown (web.Server.Run → closeLive). A
+// one-off consumer (the CLI crawlerctl check) assembles the circuit for
+// one call with the Run function.
 package checker
 
 import (
@@ -35,82 +36,85 @@ import (
 	"crawler/internal/rules"
 )
 
-// LiveUDPPoolSize — пул UDP-сокетов каждого клиента цепи живой проверки:
-// параллелизм формы ограничен семафором web (единицы проверок), а DNS-фаза
-// одной проверки последовательна (CheckSubdomains идёт по субдоменам друг
-// за другом) — массовый фонд udp_pool_size боевого конвейера здесь не
-// нужен. 3 клиента цепи × 16 сокетов = 48 fd на сервис против 6000 на
-// запрос до T-220.
+// LiveUDPPoolSize — the UDP socket pool of each client of the live check
+// chain: the form parallelism is limited by the web semaphore (a few
+// checks), and the DNS phase of one check is sequential (CheckSubdomains
+// goes over the subdomains one by one) — the udp_pool_size fund of the
+// production pipeline is not needed here. 3 clients of the chain × 16
+// sockets = 48 fds per service vs 6000 per request before T-220.
 const LiveUDPPoolSize = 16
 
-// DefaultRulesReload — период фоновой перезагрузки правил контура.
-// Публичной формой никто не управляет (SIGHUP правил шлёт оператор
-// анализатору, make rules-reload), набор актуализируется таймером;
-// неизменный rules_version — no-op (контракт Reloader).
+// DefaultRulesReload — the period of the background rules reload of the
+// circuit. Nobody controls the public form (the rules SIGHUP is sent by
+// the operator to the analyzer, make rules-reload); the set is kept fresh
+// by a timer; an unchanged rules_version is a no-op (the Reloader
+// contract).
 const DefaultRulesReload = 5 * time.Minute
 
-// RuntimeOptions — параметры контура; нулевые значения — нормы живой
-// проверки формы.
+// RuntimeOptions — the circuit parameters; zero values are the norms of
+// the live form check.
 type RuntimeOptions struct {
-	// UDPPoolSize — пул UDP-сокетов каждого клиента цепи; 0 —
-	// LiveUDPPoolSize.
+	// UDPPoolSize — the UDP socket pool of each client of the chain;
+	// 0 — LiveUDPPoolSize.
 	UDPPoolSize int
-	// RulesReload — период фоновой перезагрузки правил; 0 —
-	// DefaultRulesReload; отрицательный — без таймера (одноразовый
-	// вызов Run: набор читается на сборке и не меняется).
+	// RulesReload — the period of the background rules reload;
+	// 0 — DefaultRulesReload; negative — without a timer (a one-off Run
+	// call: the set is read at assembly and does not change).
 	RulesReload time.Duration
 }
 
-// LiveCircuit — долгоживущий контур живой проверки для сервиса-владельца
-// (T-220): Run совместим по сигнатуре с LiveFunc (web в продакшн вызывает
-// метод контура, тесты подменяют поле liveCheck), Close останавливает
-// контур целиком. Удовлетворяется *Runtime.
+// LiveCircuit — the long-lived live check circuit for the owning service
+// (T-220): Run is signature-compatible with LiveFunc (web in production
+// calls the circuit method, the tests substitute the liveCheck field);
+// Close stops the circuit entirely. Satisfied by *Runtime.
 type LiveCircuit interface {
 	Run(ctx context.Context, cfg *config.Config, pool Pool, domain string, log Logger) (*Result, error)
 	Close() error
 }
 
-// Runtime — собранное один раз и переиспользуемое между проверками
-// окружение конвейера. Безопасен для одновременного использования из
-// горутин: цепь резолверов, Fetcher, Reloader и render.Manager
-// потокобезопасны; состояние отдельной проверки (справочник субдоменов,
-// хранилище страниц) живёт внутри Run.
+// Runtime — the pipeline environment assembled once and reused between
+// checks. Safe for concurrent use from goroutines: the resolver chain,
+// the Fetcher, the Reloader and the render.Manager are thread-safe; the
+// state of a separate check (the subdomains reference table, the page
+// store) lives inside Run.
 type Runtime struct {
 	cfg      *config.Config
 	log      Logger
 	resolve  dnsclient.Resolver
 	closeDNS func() error
 	fetcher  *httpfetch.Fetcher
-	// renderer — nil, если рендер не настроен (render.remote_url пуст).
+	// renderer is nil when the render is not configured
+	// (render.remote_url is empty).
 	renderer *render.Manager
 	rules    *rules.Reloader
 
-	life     context.Context // контекст жизни: фоновая перезагрузка, браузеры рендера
-	stopTick chan struct{}   // останавливает фоновую перезагрузку правил
-	tickDone chan struct{}   // закрыт по выходу фонового цикла (nil — цикла нет)
+	life     context.Context // the life context: the background reload, the render browsers
+	stopTick chan struct{}   // stops the background rules reload
+	tickDone chan struct{}   // closed when the background loop exits (nil — no loop)
 
 	closeOnce sync.Once
 	closeErr  error
 }
 
-// compile-time check: *Runtime — LiveCircuit.
+// compile-time check: *Runtime is a LiveCircuit.
 var _ LiveCircuit = (*Runtime)(nil)
 
-// newResolverChainFn — шов сборки цепи резолверов для тестов контура
-// (подсчёт клиентов и размеры пулов без реальных сокетов); продакшн —
-// newResolverChain (resolve.go).
+// newResolverChainFn — the seam of the resolver chain assembly for the
+// circuit tests (counting the clients and the pool sizes without real
+// sockets); production — newResolverChain (resolve.go).
 var newResolverChainFn = newResolverChain
 
-// NewRuntime собирает контур живой проверки: цепь резолверов с малым
-// пулом UDP под лимитёром T-035, один Fetcher с общими limitState
-// (лимиты секции http действуют на все проверки сервиса сразу), один
-// render.Manager при настроенном render.remote_url и Reloader правил.
-// Рендер стартует лениво — первым SPA-рендером (Manager.Run поднимает
-// поколение сам): недоступный на старте Chromium не деградирует сервис
-// навсегда, ошибка рендера оставляет анализ по исходному HTML (семантика
-// Run до T-220). ctx — контекст жизни контура (отмена останавливает
-// фоновую перезагрузку и браузеры рендера). Ошибка — контур не создан,
-// частично открытые ресурсы закрыты.
+// NewRuntime assembles the live check circuit: a resolver chain with a
+// small UDP pool under the T-035 limiter, one Fetcher with shared
+// limitState (the limits of the http section apply to all the checks of
+// the service at once), one render.Manager with render.remote_url
+// configured and a rules Reloader. The render starts lazily — by the first
+// SPA render (Manager.Run raises the generation itself): a Chromium
+// unavailable at start does not degrade the service forever, a render
+// error leaves the analysis by the original HTML (the Run semantics
+// before T-220). ctx is the life context of the circuit (a cancellation
+// stops the background reload and the render browsers). An error — the
+// circuit was not created, the partially open resources are closed.
 func NewRuntime(ctx context.Context, cfg *config.Config, log Logger, opts RuntimeOptions) (*Runtime, error) {
 	if cfg == nil {
 		return nil, errors.New("checker: live check runtime without configuration")
@@ -135,10 +139,11 @@ func NewRuntime(ctx context.Context, cfg *config.Config, log Logger, opts Runtim
 		return nil, fmt.Errorf("checker: %w", err)
 	}
 
-	// Транспорт как у боевого http-worker (T-049/T-050/T-047), но один
-	// на контур: общий limitState — глобальные потолки соединений/RPS
-	// на все живые проверки сервиса; кэш резолва хостов редиректов
-	// ограничен DefaultCacheEntries, общим на сервис.
+	// The transport like the production http-worker (T-049/T-050/T-047),
+	// but one per circuit: the shared limitState — global connection/RPS
+	// ceilings over all the live checks of the service; the resolve cache
+	// of the redirect hosts is limited by DefaultCacheEntries, shared per
+	// service.
 	hopts := httpfetch.NewOptions(cfg.HTTP)
 	hopts.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 	hopts.Resolver = httpfetch.NewCachingResolver(
@@ -181,9 +186,9 @@ func NewRuntime(ctx context.Context, cfg *config.Config, log Logger, opts Runtim
 	return rt, nil
 }
 
-// reloadLoop — фоновая перезагрузка правил: выход по Close (stopTick)
-// или отмене контекста жизни; ошибка загрузки не меняет текущий набор
-// (контракт Reloader — сервис работает на прежних правилах).
+// reloadLoop — the background rules reload: exit by Close (stopTick) or
+// the life context cancellation; a load error does not change the current
+// set (the Reloader contract — the service runs on the previous rules).
 func (rt *Runtime) reloadLoop(interval time.Duration) {
 	defer close(rt.tickDone)
 	t := time.NewTicker(interval)
@@ -200,10 +205,10 @@ func (rt *Runtime) reloadLoop(interval time.Duration) {
 	}
 }
 
-// Close останавливает контур: фоновая перезагрузка правил, рендер
-// (текущее поколение дорабатывает свои страницы — graceful, ТЗ 3.4),
-// соединения транспорта и пулы UDP-сокетов цепи. Идемпотентен;
-// повторные вызовы возвращают ошибку первого.
+// Close stops the circuit: the background rules reload, the render (the
+// current generation finishes its pages — graceful, spec 3.4), the
+// transport connections and the UDP socket pools of the chain. It is
+// idempotent; repeat calls return the first error.
 func (rt *Runtime) Close() error {
 	rt.closeOnce.Do(func() {
 		if rt.tickDone != nil {
@@ -219,14 +224,15 @@ func (rt *Runtime) Close() error {
 	return rt.closeErr
 }
 
-// ReloadRules перечитывает каталог правил (смена набора — например,
-// оператором по образцу анализатора); ошибка не меняет текущий набор.
-// Фоновому таймеру контура метод не нужен — точка входа для владельца.
+// ReloadRules re-reads the rules directory (a set change — for example,
+// by the operator following the analyzer pattern); an error does not
+// change the current set. The circuit background timer does not need the
+// method — an entry point for the owner.
 func (rt *Runtime) ReloadRules() error { return rt.rules.Reload() }
 
-// slogOf — *slog.Logger для Reloader (его поле — конкретный тип):
-// логгер контура, если он slog, иначе тихий — Reloader пишет свои
-// Info/Warn сам.
+// slogOf — a *slog.Logger for the Reloader (its field is a concrete
+// type): the circuit logger if it is slog, otherwise a silent one — the
+// Reloader writes its own Info/Warn.
 func slogOf(log Logger) *slog.Logger {
 	if l, ok := log.(*slog.Logger); ok {
 		return l
@@ -234,22 +240,22 @@ func slogOf(log Logger) *slog.Logger {
 	return slog.New(slog.DiscardHandler)
 }
 
-// nopLogger — тихий логгер контура при nil-параметре (NewRuntime
-// допускает nil, как httpfetch.NewOptions подставляет дефолты).
+// nopLogger — the silent circuit logger at a nil parameter (NewRuntime
+// allows nil, like httpfetch.NewOptions substitutes defaults).
 type nopLogger struct{}
 
 func (nopLogger) Info(string, ...any) {}
 func (nopLogger) Warn(string, ...any) {}
 
-// Run — одноразовый конвейер одного имени (CLI crawlerctl check):
-// контур собирается на вызов и закрывается по завершении — правилам
-// и сокетам одного домена долгая жизнь не нужна. Сервису-владельцу
-// (форма web) нужен долгоживущий контур: NewRuntime + Run + Close
+// Run — the one-off pipeline of one name (the CLI crawlerctl check): the
+// circuit is assembled per call and closed on completion — the rules and
+// sockets of one domain do not need a long life. The owning service (the
+// web form) needs the long-lived circuit: NewRuntime + Run + Close
 // (T-220).
 func Run(ctx context.Context, cfg *config.Config, pool Pool, domain string, log Logger) (*Result, error) {
 	rt, err := NewRuntime(ctx, cfg, log, RuntimeOptions{RulesReload: -1})
 	if err != nil {
-		return nil, err // ошибки NewRuntime уже с префиксом checker:
+		return nil, err // the NewRuntime errors already have the checker: prefix
 	}
 	defer func() { _ = rt.Close() }()
 	return rt.Run(ctx, cfg, pool, domain, log)

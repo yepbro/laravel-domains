@@ -13,26 +13,26 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Переменные окружения, задающие источник конфигурации.
+// Environment variables that set the configuration source.
 const (
-	// EnvConfigPath — путь к YAML-файлу конфигурации.
+	// EnvConfigPath is the path to the configuration YAML file.
 	EnvConfigPath = "CRAWLER_CONFIG"
-	// legacyEnvConfigPath — устаревшее имя переменной пути (dev-окружение).
+	// legacyEnvConfigPath is the deprecated name of the path variable (dev environment).
 	legacyEnvConfigPath = "APP_CONFIG"
-	// DefaultConfigPath — используется, когда переменная пути не задана
-	// и файл существует в текущем каталоге (удобно для локального запуска
-	// из корня репозитория рядом с config.example.yaml).
+	// DefaultConfigPath is used when the path variable is not set
+	// and the file exists in the current directory (handy for running locally
+	// from the repository root next to config.example.yaml).
 	DefaultConfigPath = "config.yaml"
 )
 
-// Load читает конфигурацию в окружении процесса: значения по умолчанию →
-// YAML-файл (CRAWLER_CONFIG/APP_CONFIG или config.yaml в текущем каталоге,
-// если существует) → переменные окружения; затем валидация.
+// Load reads the configuration into the process environment: defaults →
+// YAML file (CRAWLER_CONFIG/APP_CONFIG or config.yaml in the current directory,
+// if it exists) → environment variables; then validation.
 func Load() (*Config, error) {
 	return LoadEnv(os.Getenv)
 }
 
-// LoadEnv — как Load, но окружение читается через getenv (тесты и встраивание).
+// LoadEnv is like Load, but the environment is read via getenv (tests and embedding).
 func LoadEnv(getenv func(string) string) (*Config, error) {
 	path := firstNonEmpty(getenv(EnvConfigPath), getenv(legacyEnvConfigPath))
 	if path == "" {
@@ -46,8 +46,9 @@ func LoadEnv(getenv func(string) string) (*Config, error) {
 	return loadPath(path, getenv)
 }
 
-// LoadFile читает конфигурацию из явного пути; переопределения берутся из
-// окружения процесса (по ТЗ конфигурация едина: YAML + переменные сверху).
+// LoadFile reads the configuration from an explicit path; overrides are taken
+// from the process environment (per the spec, the configuration is unified:
+// YAML + variables on top).
 func LoadFile(path string) (*Config, error) {
 	return loadPath(path, os.Getenv)
 }
@@ -59,7 +60,7 @@ func loadPath(path string, getenv func(string) string) (*Config, error) {
 	}
 	cfg := Default()
 	dec := yaml.NewDecoder(bytes.NewReader(data))
-	dec.KnownFields(true) // опечатка в ключе — ошибка, а не молчаливо пропущенное значение
+	dec.KnownFields(true) // a typo in a key is an error, not a silently skipped value
 	if err := dec.Decode(cfg); err != nil && !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("config: parsing %s: %w", path, err)
 	}
@@ -86,15 +87,15 @@ func firstNonEmpty(vals ...string) string {
 	return ""
 }
 
-// envSpec — одна привязка «переменная окружения → поле». Таблица — единый
-// источник имён переопределений; её отражение — в docs/configuration.md.
+// envSpec is a single "environment variable → field" binding. The table is
+// the single source of override names; its mirror lives in docs/configuration.md.
 type envSpec struct {
 	key string
 	set func(c *Config, v string) error
 }
 
-// envSpecs возвращает все поддерживаемые переменные переопределения
-// (кроме CRAWLER_CONFIG — путь к файлу, и устаревших имён).
+// envSpecs returns all supported override variables
+// (except CRAWLER_CONFIG — the file path — and deprecated names).
 func envSpecs() []envSpec {
 	return []envSpec{
 		{"CRAWLER_POSTGRES_DSN", setString(func(c *Config) *string { return &c.Postgres.DSN })},
@@ -183,8 +184,8 @@ func envSpecs() []envSpec {
 		{"CRAWLER_MONITOR_LISTEN", setString(func(c *Config) *string { return &c.Monitor.Listen })},
 		{"CRAWLER_MONITOR_ZONE_STATS_INTERVAL", setDuration(func(c *Config) *Duration { return &c.Monitor.ZoneStatsInterval })},
 		{"CRAWLER_MONITOR_ALERTS_INTERVAL", setDuration(func(c *Config) *Duration { return &c.Monitor.AlertsInterval })},
-		// Пропущенное при T-173 отображение: переменная объявлена таблицей
-		// monitor в docs/configuration.md — docs и load.go расходились.
+		// Mapping missed at T-173: the variable was declared in the docs
+		// monitor table of docs/configuration.md — docs and load.go diverged.
 		{"CRAWLER_MONITOR_LOAD_REPORT_INTERVAL", setDuration(func(c *Config) *Duration { return &c.Monitor.LoadReportInterval })},
 		{"CRAWLER_MONITOR_SLOW_QUERY_INTERVAL", setDuration(func(c *Config) *Duration { return &c.Monitor.SlowQueryInterval })},
 		{"CRAWLER_MONITOR_SLOW_QUERY_MIN_DURATION", setDuration(func(c *Config) *Duration { return &c.Monitor.SlowQueryMinDuration })},
@@ -218,20 +219,20 @@ func envSpecs() []envSpec {
 	}
 }
 
-// applyEnv накладывает непустые значения переменных окружения поверх YAML.
+// applyEnv overlays non-empty environment variable values on top of the YAML.
 func (c *Config) applyEnv(getenv func(string) string) error {
 	var errs []error
 	for _, s := range envSpecs() {
 		v := getenv(s.key)
 		if v == "" {
-			continue // пустое значение переменной считается незаданным
+			continue // an empty variable value counts as unset
 		}
 		if err := s.set(c, v); err != nil {
 			errs = append(errs, fmt.Errorf("env var %s: %w", s.key, err))
 		}
 	}
-	// Устаревшая APP_PG_DSN (deploy/docker/compose.yaml, Makefile):
-	// применяется, только если не задана новая CRAWLER_POSTGRES_DSN.
+	// Deprecated APP_PG_DSN (deploy/docker/compose.yaml, Makefile):
+	// applied only when the new CRAWLER_POSTGRES_DSN is not set.
 	if getenv("CRAWLER_POSTGRES_DSN") == "" {
 		if v := getenv("APP_PG_DSN"); v != "" {
 			c.Postgres.DSN = v
@@ -310,9 +311,9 @@ func setSize(get func(*Config) *ByteSize) func(*Config, string) error {
 	}
 }
 
-// setStrings разбирает список через запятую; пробелы по краям элементов
-// обрезаются, пустые элементы сохраняются (для subdomains пустой элемент —
-// апекс домена). Значение целиком заменяет список из YAML.
+// setStrings parses a comma-separated list; leading/trailing spaces of the
+// elements are trimmed, empty elements are preserved (for subdomains an empty
+// element means the domain apex). The value replaces the YAML list entirely.
 func setStrings(get func(*Config) *[]string) func(*Config, string) error {
 	return func(c *Config, v string) error {
 		parts := strings.Split(v, ",")
@@ -324,13 +325,13 @@ func setStrings(get func(*Config) *[]string) func(*Config, string) error {
 	}
 }
 
-// setZoneNames разбирает список имён зон через запятую (xn--p1ai,net) —
-// по образцу пустых элементов карт (setZoneWeights): пустое имя зоны
-// невозможно по определению, хвостовая запятая и шаблонные
-// «${ZONES:-xn--p1ai,}» не должны валить старт; значение целиком
-// заменяет список из YAML. Приведение регистра — normalize, форму имени
-// и дубли проверяет валидация; зона не содержит запятой — разделитель
-// однозначен.
+// setZoneNames parses a comma-separated list of zone names (xn--p1ai,net) —
+// following the pattern of empty map elements (setZoneWeights): an empty zone
+// name is impossible by definition, a trailing comma and a templated
+// "${ZONES:-xn--p1ai,}" must not crash the start; the value replaces
+// the YAML list entirely. Case folding is normalize's job, the name shape
+// and duplicates are checked by validation; a zone contains no comma, so the
+// separator is unambiguous.
 func setZoneNames(get func(*Config) *[]string) func(*Config, string) error {
 	return func(c *Config, v string) error {
 		parts := make([]string, 0, 4)
@@ -344,12 +345,12 @@ func setZoneNames(get func(*Config) *[]string) func(*Config, string) error {
 	}
 }
 
-// setZoneWeights разбирает карту «имя зоны = вес» через запятую
-// (com=5, xn--p1ai=2); значение целиком заменяет карту из YAML (как
-// списки). Имя приводится к нижнему регистру, вес — целое; пустые
-// элементы (хвостовая запятая) пропускаются, диапазон веса и форму имени
-// проверяет валидация. Зона не содержит «=» и «,» (DNS-имя) —
-// разделители однозначны.
+// setZoneWeights parses a "zone name = weight" map, comma-separated
+// (com=5, xn--p1ai=2); the value replaces the YAML map entirely (like
+// the lists). The name is lower-cased, the weight is an integer; empty
+// elements (a trailing comma) are skipped, the weight range and the name
+// shape are checked by validation. A zone contains no "=" and no "," (a DNS
+// name), so the separators are unambiguous.
 func setZoneWeights(get func(*Config) *map[string]int) func(*Config, string) error {
 	return func(c *Config, v string) error {
 		m := make(map[string]int)
@@ -373,13 +374,14 @@ func setZoneWeights(get func(*Config) *map[string]int) func(*Config, string) err
 	}
 }
 
-// setPerIPOverrides разбирает карту «CIDR = лимит» через запятую
-// (195.208.0.0/16=12, 2a02:0000::/32=8) — по образцу весов зон
-// (T-106); значение целиком заменяет карту из YAML. Ключ
-// нормализуется маскированным каноническим CIDR (netip): «195.208.9.9/16»
-// и «195.208.0.0/16» — одна сеть; пустые элементы (хвостовая запятая)
-// пропускаются. Разбираемость CIDR и диапазон лимита проверяет
-// валидация; CIDR не содержит «=» и «,» — разделители однозначны.
+// setPerIPOverrides parses a "CIDR = limit" map, comma-separated
+// (195.208.0.0/16=12, 2a02:0000::/32=8) — following the pattern of the zone
+// weights (T-106); the value replaces the YAML map entirely. The key
+// is normalized to the masked canonical CIDR (netip): "195.208.9.9/16"
+// and "195.208.0.0/16" are one network; empty elements (a trailing comma)
+// are skipped. CIDR parseability and the limit range are checked by
+// validation; a CIDR contains no "=" and no ",", so the separators are
+// unambiguous.
 func setPerIPOverrides(get func(*Config) *map[string]int) func(*Config, string) error {
 	return func(c *Config, v string) error {
 		m := make(map[string]int)
@@ -407,15 +409,15 @@ func setPerIPOverrides(get func(*Config) *map[string]int) func(*Config, string) 
 	}
 }
 
-// setStringMap разбирает карту «имя = значение» через запятую
-// (mon=http://m:9101, api=http://a:9100) — по образцу весов зон
-// (T-106); значение целиком заменяет карту из YAML, имя приводится к
-// нижнему регистру, края значений обрезаются, пустые элементы (хвостовая
-// запятая) пропускаются, форму значений проверяет валидация. Разрез по
-// первому «=»: «=» в значении после него допустим (URL с запросом);
-// запятую значение содержать не может (разделитель элементов, то же
-// ограничение, что у весов зон) — базовые URL метрик запятых не
-// содержат.
+// setStringMap parses a "name = value" map, comma-separated
+// (mon=http://m:9101, api=http://a:9100) — following the pattern of the zone
+// weights (T-106); the value replaces the YAML map entirely, the name is
+// lower-cased, the value edges are trimmed, empty elements (a trailing
+// comma) are skipped, the value shape is checked by validation. The split is
+// on the first "=": an "=" in the value after it is allowed (a URL with a
+// query); the value cannot contain a comma (the element separator, the same
+// restriction as for the zone weights) — the base metric URLs contain no
+// commas.
 func setStringMap(get func(*Config) *map[string]string) func(*Config, string) error {
 	return func(c *Config, v string) error {
 		m := make(map[string]string)

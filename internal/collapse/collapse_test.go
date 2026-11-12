@@ -1,12 +1,13 @@
-// Юнит-тесты переноса 2LD → TLD (T-196, ТЗТ §7) на фейковом соединении
-// (Conn) без БД: точные SQL-тексты и параметры (контракт, стиль
-// zonessync_test.go), порядок шагов §7.2 по протоколу вызовов, батчинг
-// §7.3 (пачки id, транзакция на батч, 4 UPDATE пачки вместе),
-// идемпотентность/возобновление (сбой после N батчей — повтор
-// продолжается), ошибки батча (откат, остановка с именем зоны),
-// страховка остатка перед DROP, дедуп ingest_files, инвентаризация с
-// allowlist, предусловие check_state = 1 и пост-проверки §7.5.
-// Поведение против живого PostgreSQL — test/integration.
+// Unit tests of the 2LD → TLD move (T-196, spec §7) on a fake connection
+// (Conn) without a DB: the exact SQL texts and parameters (a contract, the
+// style of zonessync_test.go), the order of the steps §7.2 by the call
+// protocol, batching §7.3 (chunks of ids, a transaction per batch, the
+// 4 UPDATEs of a chunk together), idempotency/resumption (a failure after
+// N batches — the rerun continues), batch errors (a rollback, a stop with
+// the zone name), the remainder guard before the DROP, the ingest_files
+// dedup, the inventory with an allowlist, the check_state = 1
+// precondition and the post-checks §7.5. The behavior against a live
+// PostgreSQL — test/integration.
 package collapse
 
 import (
@@ -26,10 +27,10 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-// --- SQL-контракты -------------------------------------------------------------
+// --- SQL contracts -------------------------------------------------------------
 
-// want-тексты дублируют константы: изменение SQL без обновления ожиданий
-// (или наоборот) валит тест громко.
+// The want texts duplicate the constants: changing the SQL without
+// updating the expectations (or vice versa) fails the test loudly.
 func TestSQLContract(t *testing.T) {
 	cases := map[string]string{
 		InventorySQL: "SELECT z.id, z.name, z.domains_total, " +
@@ -129,12 +130,12 @@ func TestSpecOf(t *testing.T) {
 	}
 }
 
-// --- фейковое соединение ----------------------------------------------------------
+// --- fake connection ----------------------------------------------------------
 
-// fakeRows — pgx.Rows с заготовленными строками (позиционный Scan,
-// стиль statusRows в тестах cmd/crawlerctl). onClose — наблюдение
-// закрытия set'а пулом фейка (контракт T-217: set пост-проверки
-// закрывается до следующего запроса).
+// fakeRows — pgx.Rows with pre-prepared rows (a positional Scan, the style
+// of statusRows in the tests of cmd/crawlerctl). onClose — the observation
+// of the set closing by the pool of the fake (the T-217 contract: the
+// post-check set is closed before the next query).
 type fakeRows struct {
 	rows    [][]any
 	i       int
@@ -191,8 +192,9 @@ func (r *fakeRows) Scan(dest ...any) error {
 	return nil
 }
 
-// Модель данных фейка: справочник зон, домены, дети четырёх таблиц,
-// дедуп-журнал и партиции; moving — temp-таблица шага 3.
+// The data model of the fake: the zone reference table, the domains, the
+// children of the four tables, the dedup journal and the partitions;
+// moving is the temp table of step 3.
 type (
 	fZone struct {
 		id    int16
@@ -216,7 +218,7 @@ type (
 	}
 )
 
-// call — обращение к соединению/транзакции для контрактных проверок.
+// call — a use of the connection/transaction for contract checks.
 type call struct {
 	sql  string
 	args []any
@@ -224,20 +226,21 @@ type call struct {
 
 func (c call) String() string { return c.sql + " " + fmt.Sprint(c.args...) }
 
-// fakeConn — Conn без БД: живая семантика SQL переноса — ensure зоны
-// (SELECT/INSERT RETURNING), CALL партиций, temp-таблица moving_ids,
-// транзакции батчей (4 UPDATE окна: зона+доклейка label у доменов,
-// переброска детей по domain_id), history/files одним оператором,
-// выборка и DROP партиций, удаление строки зоны. Ошибки — инъекциями
-// errE (Exec), queryErr (Query), batchErrFrom (UPDATE доменов батча с
-// lo >= значения — имитация конфликта UNIQUE), beginErrAfter (Begin
-// после N успешных — имитация сбоя на середине).
+// fakeConn — a Conn without a DB: the live semantics of the move SQL — the
+// zone ensure (SELECT/INSERT RETURNING), the partition CALL, the moving_ids
+// temp table, the batch transactions (4 UPDATEs of a window: the zone + the
+// label append at the domains, the children re-zoning by domain_id),
+// history/files by one statement, the partition selection and DROP, the
+// zone row deletion. Errors — via the injections errE (Exec), queryErr
+// (Query), batchErrFrom (a domains UPDATE of a batch with lo >= the value —
+// a UNIQUE conflict simulation), beginErrAfter (Begin after N successful
+// ones — a mid-way failure simulation).
 type fakeConn struct {
 	zones    []fZone
 	nextZone int16
 	domains  []fDomain
-	// дети по таблицам: subdomain_results / laravel_domains /
-	// laravel_findings / laravel_history (ключ — константа UPDATE).
+	// The children by tables: subdomain_results / laravel_domains /
+	// laravel_findings / laravel_history (the key is the UPDATE constant).
 	children map[string][]fChild
 	files    []fFile
 	parts    map[int16][]string
@@ -248,8 +251,8 @@ type fakeConn struct {
 	execs   []call
 	queries []call
 	begins  int
-	// openSets — выданные Query и не закрытые set'ы: модель занятости
-	// соединений пула (T-217) — guard CheckOrphansSQL.
+	// openSets — the sets issued by Query and not closed: a model of the
+	// pool connection occupancy (T-217) — the CheckOrphansSQL guard.
 	openSets int
 
 	errE, queryErr error
@@ -273,8 +276,8 @@ func newFakeConn() *fakeConn {
 	}
 }
 
-// seed2LD — зона 5g.in с доменами ids и по одному ребёнку каждой таблицы
-// на домен; партиции по флагу. Возвращает id зоны.
+// seed2LD — the zone 5g.in with the domains ids and one child of each
+// table per domain; partitions per the flag. Returns the zone id.
 func (f *fakeConn) seed2LD(t *testing.T, ids []int64, withParts bool) int16 {
 	t.Helper()
 	f.mu.Lock()
@@ -295,8 +298,8 @@ func (f *fakeConn) seed2LD(t *testing.T, ids []int64, withParts bool) int16 {
 	return zid
 }
 
-// zonePartNames — имена партиций зоны во всех четырёх таблицах (формат
-// миграции 000003).
+// zonePartNames — the names of the zone partitions in all four tables
+// (the format of migration 000003).
 func zonePartNames(zid int16) []string {
 	s := strconv.Itoa(int(zid))
 	return []string{"domains_z" + s, "subdomain_results_z" + s, "laravel_domains_z" + s, "laravel_findings_z" + s}
@@ -311,7 +314,7 @@ func (f *fakeConn) zoneID(name string) (int16, bool) {
 	return 0, false
 }
 
-// zoneByID — существует ли строка зоны (сироты по zone_id).
+// zoneByID — does the zone row exist (orphans by zone_id)?
 func (f *fakeConn) zoneByID(id int16) bool {
 	for _, z := range f.zones {
 		if z.id == id {
@@ -325,7 +328,7 @@ func (f *fakeConn) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyF
 	return 0, errors.New("fakeConn: CopyFrom must not be called")
 }
 
-// op — протокол шагов (под мьютексом).
+// op — the protocol of the steps (under the mutex).
 func (f *fakeConn) op(op string) { f.ops = append(f.ops, op) }
 
 func (f *fakeConn) Exec(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
@@ -356,7 +359,7 @@ func (f *fakeConn) Exec(_ context.Context, sql string, args ...any) (pgconn.Comm
 	case CallPartitionsSQL:
 		f.op("call-partitions:" + fmt.Sprint(args[0]))
 		zid := args[0].(int16)
-		if len(f.parts[zid]) == 0 { // идемпотентность процедуры (NOTICE)
+		if len(f.parts[zid]) == 0 { // the idempotency of the procedure (NOTICE)
 			f.parts[zid] = zonePartNames(zid)
 		}
 		return pgconn.NewCommandTag("CALL"), nil
@@ -425,7 +428,8 @@ func (f *fakeConn) Exec(_ context.Context, sql string, args ...any) (pgconn.Comm
 	}
 }
 
-// moveChildren — семантика UPDATE детей окна (под мьютексом).
+// moveChildren — the semantics of the children UPDATE of a window (under
+// the mutex).
 func (f *fakeConn) moveChildren(table string, tid, zid int16, lo, hi int64) (pgconn.CommandTag, error) {
 	n := int64(0)
 	for i := range f.children[table] {
@@ -449,7 +453,7 @@ func (f *fakeConn) Query(_ context.Context, sql string, args ...any) (pgx.Rows, 
 	if err != nil {
 		return nil, err
 	}
-	// Выдача set'а: не закрытый set держит соединение пула (T-217).
+	// Set delivery: an unclosed set holds the pool connection (T-217).
 	f.openSets++
 	rows.onClose = func() {
 		f.mu.Lock()
@@ -459,7 +463,7 @@ func (f *fakeConn) Query(_ context.Context, sql string, args ...any) (pgx.Rows, 
 	return rows, nil
 }
 
-// query — семантика SQL переноса; mu фейка уже удерживается.
+// query — the semantics of the move SQL; the fake's mu is already held.
 func (f *fakeConn) query(sql string, args []any) (*fakeRows, error) {
 	switch sql {
 	case InventorySQL:
@@ -500,7 +504,7 @@ func (f *fakeConn) query(sql string, args []any) (*fakeRows, error) {
 			}
 			rows = append(rows, []any{z.id, z.name, z.total, d, r, lf, h, files, len(f.parts[z.id]) > 0})
 		}
-		// ORDER BY z.name — фейк зеркалит SQL.
+		// ORDER BY z.name — the fake mirrors the SQL.
 		sort.Slice(rows, func(i, j int) bool { return rows[i][1].(string) < rows[j][1].(string) })
 		return fakeRowsOf(rows...), nil
 	case QueuedSQL:
@@ -530,7 +534,7 @@ func (f *fakeConn) query(sql string, args []any) (*fakeRows, error) {
 		f.zones = append(f.zones, fZone{id: zid, name: args[0].(string)})
 		return fakeRowsOf([]any{zid}), nil
 	case movingChunkSQL:
-		// keyset-пачка: id > after, по возрастанию, не более limit.
+		// A keyset chunk: id > after, ascending, at most limit.
 		after := args[0].(int64)
 		limit := args[1].(int)
 		ids := append([]int64(nil), f.moving...)
@@ -605,9 +609,9 @@ func (f *fakeConn) query(sql string, args []any) (*fakeRows, error) {
 		}
 		return fakeRowsOf(rows...), nil
 	case CheckZonesLeftSQL:
-		// Симметричный guard (ревью T-217 P3-1): первый запрос
-		// пост-проверок тоже обязан приходить без открытых set'ов —
-		// перестановка хелперов местами на реальном пуле тот же дедлок.
+		// A symmetric guard (the T-217 review P3-1): the first post-check
+		// query must also arrive with no open sets — swapping the helpers
+		// places the same deadlock on a real pool.
 		if f.openSets > 0 {
 			return nil, fmt.Errorf("fakeConn: CheckZonesLeftSQL with an open set (%d) — post-checks must not issue queries while a set is open (the pool deadlock, T-217)", f.openSets)
 		}
@@ -623,11 +627,12 @@ func (f *fakeConn) query(sql string, args []any) (*fakeRows, error) {
 		}
 		return fakeRowsOf([]any{n}), nil
 	case CheckOrphansSQL:
-		// Модель пула CLI (T-217): запрос сирот пост-проверки обязан
-		// приходить после Close первого set'а — открытый set держит
-		// соединение, и при pool_size = 2 (соединение переноса + один
-		// set) Acquire второго запроса ждал бы вечно (дедлок
-		// пост-проверок инцидента 29.10). Стиль statusPool.
+		// A model of the CLI pool (T-217): the orphans query of the
+		// post-check must arrive after the Close of the first set — an
+		// open set holds the connection, and with pool_size = 2 (the move
+		// connection + one set) the Acquire of the second query would wait
+		// forever (the post-check deadlock of the 29.10 incident). The
+		// style of statusPool.
 		if f.openSets > 0 {
 			return nil, fmt.Errorf("fakeConn: CheckOrphansSQL with an open set (%d) — the first post-check set closes before the second query (the pool deadlock, T-217)", f.openSets)
 		}
@@ -648,8 +653,9 @@ func (f *fakeConn) query(sql string, args []any) (*fakeRows, error) {
 		}
 		return fakeRowsOf([]any{d, r, ld, lf, h}), nil
 	case SpotCheckSQL:
-		// Эмуляция domain_info: зона — самый длинный суффикс имени из
-		// справочника, label — оставшиеся метки; домен по (zone, label).
+		// A domain_info emulation: the zone is the longest suffix of the
+		// name from the reference table, the label is the remaining
+		// labels; the domain by (zone, label).
 		labels := strings.Split(args[0].(string), ".")
 		for k := 2; k <= len(labels); k++ {
 			zoneName := strings.Join(labels[k-1:], ".")
@@ -663,7 +669,7 @@ func (f *fakeConn) query(sql string, args []any) (*fakeRows, error) {
 					return fakeRowsOf([]any{zoneName, label}), nil
 				}
 			}
-			return fakeRowsOf(), nil // зона есть, домена нет — NULL
+			return fakeRowsOf(), nil // the zone exists, the domain does not — NULL
 		}
 		return fakeRowsOf(), nil
 	default:
@@ -685,9 +691,10 @@ func (f *fakeConn) Begin(ctx context.Context) (pgx.Tx, error) {
 	return &fakeTx{conn: f}, nil
 }
 
-// fakeTx — транзакция батча: 4 UPDATE окна, фиксация/откат по флагу.
+// fakeTx — the batch transaction: 4 UPDATEs of a window, commit/rollback
+// per the flag.
 type fakeTx struct {
-	pgx.Tx // остальные методы pgx.Tx перенос не использует
+	pgx.Tx // the move does not use the other methods of pgx.Tx
 	conn   *fakeConn
 	done   bool
 }
@@ -738,21 +745,22 @@ func (tx *fakeTx) Rollback(context.Context) error {
 	return nil
 }
 
-// spec5g — Spec зоны 5g.in по id.
+// spec5g — the Spec of the zone 5g.in by id.
 func spec5g(zid int16) Spec {
 	return Spec{ID: zid, Name: "5g.in", TLD: "in", Prefix: "5g"}
 }
 
-// --- Zone: шаги, батчи, идемпотентность -------------------------------------------
+// --- Zone: steps, batches, idempotency -------------------------------------------
 
-// TestZoneFullTransfer — полный перенос зоны с партициями: порядок шагов
-// §7.2, доклейка префикса, переброска всех детей, дедуп-журнал, дроп
-// партиций, удаление строки зоны, счётчики результата и спот-чек.
+// TestZoneFullTransfer — a full move of a zone with partitions: the order
+// of the steps §7.2, the prefix append, the re-zoning of all the children,
+// the dedup journal, the partition drop, the zone row deletion, the result
+// counters and the spot check.
 func TestZoneFullTransfer(t *testing.T) {
 	f := newFakeConn()
 	zid := f.seed2LD(t, []int64{10, 11, 12, 13, 14, 15, 16}, true)
 	in, _ := f.zoneID("in")
-	// Файлы: обычный + дубль содержимого, уже доставлявшегося в T.
+	// Files: a regular one + a duplicate of content already delivered to T.
 	f.files = []fFile{
 		{zone: zid, action: 1, sha256: "aa"},
 		{zone: zid, action: 1, sha256: "bb"},
@@ -760,16 +768,16 @@ func TestZoneFullTransfer(t *testing.T) {
 		{zone: 3, action: 2, sha256: "cc"},  // a foreign zone — not touched
 	}
 
-	res, err := Zone(context.Background(), f, spec5g(zid), 3) // batch = 3 → 3 батча
+	res, err := Zone(context.Background(), f, spec5g(zid), 3) // batch = 3 → 3 batches
 	if err != nil {
 		t.Fatalf("Zone: %v", err)
 	}
 
-	// Шаги §7.2 по протоколу вызовов.
+	// The steps §7.2 by the call protocol.
 	wantOps := []string{
 		"call-partitions:" + fmt.Sprint(in),
 		"moving-drop", "moving-create", "moving-index",
-		// батчи по 3 актуальных id: 10..16 → пачки [10,12], [13,15], [16,16]
+		// batches of 3 live ids: 10..16 → chunks [10,12], [13,15], [16,16]
 		"begin", "batch:[10,12]", "commit",
 		"begin", "batch:[13,15]", "commit",
 		"begin", "batch:[16,16]", "commit",
@@ -784,7 +792,7 @@ func TestZoneFullTransfer(t *testing.T) {
 		t.Errorf("the step protocol:\n got  %s\n want %s", got, strings.Join(wantOps, ","))
 	}
 
-	// Домены: зона in, label с доклейкой префикса.
+	// Domains: the zone in, the label with the appended prefix.
 	for _, d := range f.domains {
 		if d.zone != in {
 			t.Fatalf("domain %d stayed in zone %d, want %d (in)", d.id, d.zone, in)
@@ -793,7 +801,7 @@ func TestZoneFullTransfer(t *testing.T) {
 			t.Errorf("domain %d: label %q, want %q (the prefix appended)", d.id, d.label, want)
 		}
 	}
-	// Дети всех таблиц и история переехали.
+	// The children of all the tables and the history moved.
 	for table, rows := range f.children {
 		for _, c := range rows {
 			if c.zone != in {
@@ -801,7 +809,8 @@ func TestZoneFullTransfer(t *testing.T) {
 			}
 		}
 	}
-	// Файлы: дубль удалён, остальные перепривязаны; чужой не тронут.
+	// Files: the duplicate is deleted, the rest are rebound; the foreign
+	// one is untouched.
 	if len(f.files) != 3 {
 		t.Fatalf("ingest_files: %d rows, want 3 (the dupe removed)", len(f.files))
 	}
@@ -817,7 +826,8 @@ func TestZoneFullTransfer(t *testing.T) {
 			}
 		}
 	}
-	// Партиции 2LD дропнуты (партиции TLD созданы шагом 2).
+	// The 2LD partitions are dropped (the TLD partitions were created by
+	// step 2).
 	if len(f.parts[zid]) != 0 {
 		t.Errorf("the 2LD partitions remain: %v", f.parts[zid])
 	}
@@ -828,7 +838,7 @@ func TestZoneFullTransfer(t *testing.T) {
 		t.Error("the row of zone 5g.in not deleted")
 	}
 
-	// Счётчики результата (все строки — этим запуском).
+	// The result counters (all the rows — by this run).
 	if res.Domains != 7 || res.Results != 7 || res.Laravel != 7 || res.Findings != 7 || res.History != 7 {
 		t.Errorf("the result counters: %+v, want 7 rows in each table", res)
 	}
@@ -844,19 +854,20 @@ func TestZoneFullTransfer(t *testing.T) {
 	}
 }
 
-// TestZoneBatches — пачки батчей §7.3 по возрастанию фактических id из
-// moving_ids: разреженные id зоны — одна пачка [min, max] (а не окно
-// глобального id-пространства), каждый батч — 4 UPDATE одной пачки
-// в одной транзакции.
+// TestZoneBatches — the batch chunks §7.3 by the ascending actual ids from
+// moving_ids: the sparse ids of the zone are one chunk [min, max] (not a
+// window of the global id space), every batch is 4 UPDATEs of one chunk
+// in one transaction.
 func TestZoneBatches(t *testing.T) {
 	f := newFakeConn()
-	zid := f.seed2LD(t, []int64{5, 100, 9000}, false) // разреженные id
+	zid := f.seed2LD(t, []int64{5, 100, 9000}, false) // sparse ids
 
 	if _, err := Zone(context.Background(), f, spec5g(zid), 50000); err != nil {
 		t.Fatalf("Zone: %v", err)
 	}
-	// Одна пачка [5, 9000]: все 3 id — в одном батче (пачка строк,
-	// ширина id-пространства между ними не множит батчи).
+	// One chunk [5, 9000]: all 3 ids are in one batch (a chunk of rows,
+	// the width of the id space between them does not multiply the
+	// batches).
 	if f.begins != 1 {
 		t.Errorf("transactions %d, want 1 (all ids in one chunk)", f.begins)
 	}
@@ -874,12 +885,14 @@ func TestZoneBatches(t *testing.T) {
 		t.Fatalf("%d domain UPDATE batches, want 1", len(dom))
 	}
 	in, _ := f.zoneID("in")
-	// Параметры UPDATE доменов: tid, префикс, zid, lo, hi (контракт §7.3).
+	// The UPDATE parameters of the domains: tid, prefix, zid, lo, hi
+	// (the contract §7.3).
 	if got := dom[0].args; len(got) != 5 || got[0] != in || got[1] != "5g" ||
 		got[2] != zid || got[3] != int64(5) || got[4] != int64(9000) {
 		t.Errorf("the domain UPDATE args = %v, want [%d 5g %d 5 9000]", got, in, zid)
 	}
-	// Дети — тем же диапазоном, тем же батчем (4 UPDATE вместе).
+	// The children — with the same range, in the same batch (4 UPDATEs
+	// together).
 	if len(child) != 3 {
 		t.Fatalf("child UPDATEs in the batch: %d tables, want 3", len(child))
 	}
@@ -891,8 +904,8 @@ func TestZoneBatches(t *testing.T) {
 	}
 }
 
-// TestZoneEmpty — зона без доменов: батчей нет, остальные шаги идут
-// (свернуть пустую 2LD-зону — легальный случай, спот-чека нет).
+// TestZoneEmpty — a zone without domains: no batches, the other steps run
+// (collapsing an empty 2LD zone is a legal case, no spot check).
 func TestZoneEmpty(t *testing.T) {
 	f := newFakeConn()
 	zid := f.seed2LD(t, nil, false)
@@ -911,20 +924,22 @@ func TestZoneEmpty(t *testing.T) {
 	}
 }
 
-// TestZoneResume — возобновление: сбой после первого батча (имитация
-// прерывания команды) оставляет полуперенос; повтор Zone догоняет без
-// потерь и дублей; следующий повтор — пустой no-op.
+// TestZoneResume — resumption: a failure after the first batch (an
+// interruption of the command simulation) leaves a half-move; a rerun of
+// Zone catches up without losses or duplicates; the next rerun is an empty
+// no-op.
 func TestZoneResume(t *testing.T) {
 	f := newFakeConn()
 	zid := f.seed2LD(t, []int64{1, 2, 3, 4, 5}, false)
 	in, _ := f.zoneID("in")
 
-	f.beginErrAfter = 1 // первый батч commit, второй Begin — сбой
+	f.beginErrAfter = 1 // the first batch commits, the second Begin fails
 	_, err := Zone(context.Background(), f, spec5g(zid), 2)
 	if err == nil || !strings.Contains(err.Error(), "zone 5g.in") {
 		t.Fatalf("the interrupt error = %v, want the zone 5g.in context", err)
 	}
-	// Частичный перенос: пачка [1,2] уехала, файлы/партиции/зона на месте.
+	// A partial move: the chunk [1,2] left, the files/partitions/zone in
+	// place.
 	moved, left := 0, 0
 	for _, d := range f.domains {
 		switch d.zone {
@@ -941,8 +956,8 @@ func TestZoneResume(t *testing.T) {
 		t.Fatal("the zone's row deleted before the move finished")
 	}
 
-	// Повтор: moving_ids пересобран по остатку, пачки адресуют только
-	// оставшиеся строки.
+	// The rerun: moving_ids rebuilt from the remainder, the chunks address
+	// only the remaining rows.
 	f.beginErrAfter = 0
 	res, err := Zone(context.Background(), f, spec5g(zid), 2)
 	if err != nil {
@@ -963,10 +978,10 @@ func TestZoneResume(t *testing.T) {
 		t.Error("the zone's row not deleted by the rerun")
 	}
 
-	// Повтор по завершённой зоне: перенос не находит ни одной строки
-	// (moving_ids пуст, дети/файлы зоны отсутствуют) — все дельты нулевые,
-	// шаги идемпотентны (строка зоны восстановлена с новым id, как если бы
-	// инвентаризация увидела её повторно).
+	// A rerun over a finished zone: the move finds no rows (moving_ids
+	// empty, the zone children/files absent) — all deltas are zero, the
+	// steps are idempotent (the zone row is restored with a new id, as if
+	// the inventory had seen it again).
 	f2 := &fakeConn{zones: f.zones, nextZone: f.nextZone, domains: f.domains,
 		children: f.children, files: f.files, parts: f.parts}
 	zid2 := f2.nextZone
@@ -981,13 +996,13 @@ func TestZoneResume(t *testing.T) {
 	}
 }
 
-// TestZoneBatchConflict — аномальный конфликт UNIQUE в батче: транзакция
-// батча откатывается, команда останавливается с именем зоны и диапазоном;
-// последующие шаги (файлы, дроп, удаление зоны) не выполняются.
+// TestZoneBatchConflict — an anomalous UNIQUE conflict in a batch: the
+// batch transaction rolls back, the command stops with the zone name and
+// the range; the following steps (files, drop, zone deletion) do not run.
 func TestZoneBatchConflict(t *testing.T) {
 	f := newFakeConn()
 	zid := f.seed2LD(t, []int64{1, 2, 3, 4}, false)
-	f.batchErrFrom = 3 // второй батч [3,4]
+	f.batchErrFrom = 3 // the second batch [3,4]
 
 	_, err := Zone(context.Background(), f, spec5g(zid), 2)
 	if err == nil {
@@ -1007,7 +1022,7 @@ func TestZoneBatchConflict(t *testing.T) {
 			t.Errorf("after the batch failure step %q ran", late)
 		}
 	}
-	// Первый батч остался зафиксированным (возобновляемость).
+	// The first batch stayed committed (resumability).
 	in, _ := f.zoneID("in")
 	n := 0
 	for _, d := range f.domains {
@@ -1020,13 +1035,14 @@ func TestZoneBatchConflict(t *testing.T) {
 	}
 }
 
-// TestZoneLeftGuard — остаток строк зоны перед DROP (аномалия данных)
-// останавливает команду: партиции не дропаются, зона не удаляется.
+// TestZoneLeftGuard — a remainder of the zone rows before the DROP (a data
+// anomaly) stops the command: the partitions are not dropped, the zone is
+// not deleted.
 func TestZoneLeftGuard(t *testing.T) {
 	f := newFakeConn()
 	zid := f.seed2LD(t, []int64{1, 2}, true)
-	// Сирота: ребёнок вне окон батчей (domain_id за пределами
-	// [min, min+batch) — единственное окно при batch = 50000).
+	// An orphan: a child outside the batch windows (a domain_id beyond
+	// [min, min+batch) — the only window at batch = 50000).
 	f.children[moveResultsSQL] = append(f.children[moveResultsSQL], fChild{zid, 60000})
 
 	_, err := Zone(context.Background(), f, spec5g(zid), 50000)
@@ -1044,12 +1060,12 @@ func TestZoneLeftGuard(t *testing.T) {
 	}
 }
 
-// TestZoneNewTLDZone — целевой зоны нет: создаётся включённой, партиции
-// выделяются ей, домены едут в новую зону; вставка — ASCII-зона с
-// unicode-пустышкой (nullif → NULL).
+// TestZoneNewTLDZone — the target zone is missing: it is created active,
+// the partitions are allocated to it, the domains move into the new zone;
+// the insert is an ASCII zone with an empty unicode (nullif → NULL).
 func TestZoneNewTLDZone(t *testing.T) {
 	f := newFakeConn()
-	f.zones = nil // только 2LD-зона; TLD uk создаст перенос
+	f.zones = nil // only the 2LD zone; the TLD uk will be created by the move
 	f.nextZone = 1
 	zid := f.nextZone
 	f.nextZone++
@@ -1075,7 +1091,7 @@ func TestZoneNewTLDZone(t *testing.T) {
 	if d := f.domains[0]; d.zone != uk || d.label != "shop.co" {
 		t.Errorf("the domain: zone %d, label %q; want uk / shop.co", d.zone, d.label)
 	}
-	// Вставка зоны TLD — аргументы контракта шага 1.
+	// The TLD zone insert — the contract arguments of step 1.
 	var insert *call
 	for i := range f.queries {
 		if f.queries[i].sql == ZoneInsertSQL {
@@ -1087,8 +1103,8 @@ func TestZoneNewTLDZone(t *testing.T) {
 	}
 }
 
-// TestZoneExecError — отказ БД на подготовительных шагах: контекст зоны
-// в ошибке, ничего не переносится.
+// TestZoneExecError — a DB failure at the preparatory steps: the zone
+// context in the error, nothing is moved.
 func TestZoneExecError(t *testing.T) {
 	f := newFakeConn()
 	zid := f.seed2LD(t, []int64{1}, false)
@@ -1103,7 +1119,7 @@ func TestZoneExecError(t *testing.T) {
 	}
 }
 
-// TestZoneNilConn — отказ до обращения к БД.
+// TestZoneNilConn — a failure before any DB use.
 func TestZoneNilConn(t *testing.T) {
 	if _, err := Zone(context.Background(), nil, spec5g(1), 0); err == nil ||
 		!strings.Contains(err.Error(), "connection not set") {
@@ -1111,16 +1127,17 @@ func TestZoneNilConn(t *testing.T) {
 	}
 }
 
-// --- инвентаризация / предусловие / пост-проверки --------------------------------
+// --- inventory / precondition / post-checks --------------------------------------
 
 func TestInventory(t *testing.T) {
 	f := newFakeConn()
 	zid := f.seed2LD(t, []int64{1, 2}, true)
 	f.files = append(f.files, fFile{zone: zid, action: 1, sha256: "aa"})
 
-	// nil-allowlist нормализуется в пустой массив (ALL(NULL) — NULL);
-	// crawl.test — тоже составное имя: вне allowlist оно сворачивается
-	// наравне с 5g.in (защита allowlist — единственная, §7.1).
+	// A nil allowlist is normalized to an empty array (ALL(NULL) is NULL);
+	// crawl.test is a compound name too: outside the allowlist it is
+	// collapsed on a par with 5g.in (the allowlist protection is the only
+	// one, §7.1).
 	zones, err := Inventory(context.Background(), f, nil)
 	if err != nil {
 		t.Fatalf("Inventory: %v", err)
@@ -1134,7 +1151,7 @@ func TestInventory(t *testing.T) {
 		t.Errorf("the inventory row = %+v", z)
 	}
 
-	// Allowlist исключает свои зоны из сворачивания (§7.1).
+	// The allowlist excludes its zones from collapsing (§7.1).
 	zones, err = Inventory(context.Background(), f, []string{"5g.in", "crawl.test"})
 	if err != nil {
 		t.Fatalf("Inventory with an allowlist: %v", err)
@@ -1157,7 +1174,8 @@ func TestQueuedCounts(t *testing.T) {
 	if n := queued[zid]; n != 2 {
 		t.Errorf("queued domains %d, want 2", n)
 	}
-	// Аргументы контракта: массив зон и код check_state = 1 (queued).
+	// The contract arguments: the array of zones and the check_state = 1
+	// code (queued).
 	last := f.queries[len(f.queries)-1]
 	if ids := last.args[0].([]int16); len(ids) != 1 || ids[0] != zid {
 		t.Errorf("the zones argument = %v", last.args[0])
@@ -1174,12 +1192,13 @@ func TestQueuedCounts(t *testing.T) {
 func TestPostChecksAndSpot(t *testing.T) {
 	f := newFakeConn()
 	zid := f.seed2LD(t, []int64{1}, false)
-	// crawl.test — allowlist-зона (как в живом конфиге): пост-проверка
-	// «2LD-зон вне allowlist не осталось» её не считает.
+	// crawl.test is an allowlist zone (as in the live config): the
+	// post-check "no 2LD zones outside the allowlist remain" does not
+	// count it.
 	allow := []string{"crawl.test"}
 	in, _ := f.zoneID("in")
 
-	// До переноса: 2LD-зона есть — пост-проверка её видит.
+	// Before the move: the 2LD zone exists — the post-check sees it.
 	left, _, err := PostChecks(context.Background(), f, allow)
 	if err != nil {
 		t.Fatalf("PostChecks: %v", err)
@@ -1188,7 +1207,7 @@ func TestPostChecksAndSpot(t *testing.T) {
 		t.Errorf("%d 2LD zones, want 1 (no move yet)", left)
 	}
 
-	// Сироты: ребёнок в зоне без строки.
+	// Orphans: a child in a zone without a row.
 	f.children[moveResultsSQL] = append(f.children[moveResultsSQL], fChild{9999, 1})
 	_, orphans, err := PostChecks(context.Background(), f, allow)
 	if err != nil {
@@ -1198,8 +1217,9 @@ func TestPostChecksAndSpot(t *testing.T) {
 		t.Errorf("orphans = %+v, want 1 in subdomain_results", orphans)
 	}
 
-	// Чистое состояние: перенос руками фейка — зона удалена, домен
-	// и его дети в TLD с доклеенным label, сирота убрана.
+	// A clean state: the move by the fake's hands — the zone is deleted,
+	// the domain and its children in the TLD with the appended label, the
+	// orphan removed.
 	for i := range f.zones {
 		if f.zones[i].id == zid {
 			f.zones = append(f.zones[:i], f.zones[i+1:]...)
@@ -1225,7 +1245,8 @@ func TestPostChecksAndSpot(t *testing.T) {
 		t.Errorf("the clean state: left %d, orphans %+v", left, orphans)
 	}
 
-	// Спот-чек: эмуляция domain_info отвечает зону T и label с префиксом.
+	// The spot check: the domain_info emulation answers the zone T and the
+	// label with the prefix.
 	if err := SpotCheck(context.Background(), f, "example1.5g.in", "in", "example1.5g"); err != nil {
 		t.Fatalf("SpotCheck: %v", err)
 	}
@@ -1239,14 +1260,15 @@ func TestPostChecksAndSpot(t *testing.T) {
 	}
 }
 
-// TestPostChecksClosesSetBeforeOrphans — регрессия T-217: set'ы
-// пост-проверок закрываются до следующего запроса. Guard'ы фейка
-// (CheckZonesLeftSQL/CheckOrphansSQL при открытом set'е) моделируют пул
-// CLI из 2 соединений: соединение переноса + один открытый set — второй
-// запрос ждал бы третье соединение вечно (дедлок инцидента 29.10; живой
-// контур — интеграционный TestZonesCollapse_SmallPoolDeadlock).
-// Итоговое openSets == 0 закрывает и утечку второго set'а, и
-// перестановку хелперов (ревью T-217 P3-1).
+// TestPostChecksClosesSetBeforeOrphans — the T-217 regression: the
+// post-check sets are closed before the next query. The fake guards
+// (CheckZonesLeftSQL/CheckOrphansSQL with an open set) model the CLI pool
+// of 2 connections: the move connection + one open set — the second query
+// would wait forever for a third connection (the deadlock of the 29.10
+// incident; the live circuit — the integration
+// TestZonesCollapse_SmallPoolDeadlock). The final openSets == 0 covers
+// both the leak of the second set and the helper swap (the T-217 review
+// P3-1).
 func TestPostChecksClosesSetBeforeOrphans(t *testing.T) {
 	f := newFakeConn()
 	f.seed2LD(t, []int64{1}, false)
@@ -1261,7 +1283,7 @@ func TestPostChecksClosesSetBeforeOrphans(t *testing.T) {
 	}
 }
 
-// TestAllowlistArg — nil → пустой массив: ALL(NULL) вышибает предикат.
+// TestAllowlistArg — nil → an empty array: ALL(NULL) kills the predicate.
 func TestAllowlistArg(t *testing.T) {
 	if got := allowlistArg(nil); got == nil || len(got) != 0 {
 		t.Errorf("allowlistArg(nil) = %v, want an empty non-nil slice", got)
@@ -1271,8 +1293,8 @@ func TestAllowlistArg(t *testing.T) {
 	}
 }
 
-// TestPrintPlanFormat — таблица плана §7.4: заголовок, колонки зон,
-// выравнивание чисел вправо и итоги по TLD.
+// TestPrintPlanFormat — the plan table §7.4: the header, the zone columns,
+// the right alignment of the numbers and the totals per TLD.
 func TestPrintPlanFormat(t *testing.T) {
 	zones := []ZoneRow{
 		{ID: 5, Name: "5g.in", Domains: 12, Results: 34, Findings: 5, History: 6, Files: 2, Parts: true},
@@ -1293,8 +1315,9 @@ func TestPrintPlanFormat(t *testing.T) {
 			t.Errorf("the plan does not contain %q:\n%s", want, got)
 		}
 	}
-	// Числа вправо: колонка доменов выровнена по ширине максимального
-	// значения (3456789) — узкое 12 дополнено пробелами слева.
+	// Numbers right-aligned: the domains column is aligned by the width of
+	// the maximum value (3456789) — the narrow 12 is padded with spaces on
+	// the left.
 	for _, line := range strings.Split(got, "\n") {
 		switch {
 		case strings.HasPrefix(line, "5g.in"):
@@ -1309,10 +1332,11 @@ func TestPrintPlanFormat(t *testing.T) {
 	}
 }
 
-// hangDropConn — Conn для теста бюджета уборки moving_ids (T-229): Exec
-// DROP висит до отмены контекста (зависший PostgreSQL — команда принята,
-// ответа нет); отмену фиксирует закрытие канала. Прочие методы не
-// вызываются и падают при вызове.
+// hangDropConn — a Conn for the test of the moving_ids cleanup budget
+// (T-229): the DROP Exec hangs until the context cancellation (a stuck
+// PostgreSQL — the command accepted, no answer); the cancellation is
+// observed by the channel closing. The other methods are not called and
+// fail when called.
 type hangDropConn struct {
 	canceled chan struct{}
 	once     sync.Once
@@ -1341,10 +1365,10 @@ func (h *hangDropConn) Begin(context.Context) (pgx.Tx, error) {
 	return nil, errors.New("hangDropConn: Begin must not be called")
 }
 
-// TestDropMovingTimeout — уборка moving_ids обязана отменяться
-// собственным бюджетом времени (T-229): зависший DROP не удерживает
-// соединение и выход CLI неограниченно; ошибка логируется Warn, не
-// возвращаясь (затенять результат команды ей нечем).
+// TestDropMovingTimeout — the moving_ids cleanup must be cancellable by
+// its own time budget (T-229): a stuck DROP does not hold the connection
+// and the CLI exit indefinitely; the error is logged as a Warn, not
+// returned (it has nothing to shadow the command result with).
 func TestDropMovingTimeout(t *testing.T) {
 	if movingDropTimeout != 5*time.Second {
 		t.Errorf("movingDropTimeout = %s, want 5s (modeled on discardTimeout, ingest)", movingDropTimeout)
@@ -1353,8 +1377,9 @@ func TestDropMovingTimeout(t *testing.T) {
 	var logBuf strings.Builder
 	log := slog.New(slog.NewTextHandler(&logBuf, nil))
 
-	// Бюджет теста короткий: проверяется факт отмены контекста, а не
-	// величина продуктового бюджета (она — контрактом выше).
+	// The test budget is short: the fact of the context cancellation is
+	// checked, not the size of the production budget (that one is covered
+	// by the contract above).
 	const budget = 50 * time.Millisecond
 	started := time.Now()
 	dropMoving(conn, budget, log)

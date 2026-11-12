@@ -1,17 +1,18 @@
-// Цепь резолверов живой проверки одного домена (T-119/T-123) — своя
-// семантика отказа, отличная от массового конвейера. FallbackResolver
-// (internal/dnsclient, T-107) переключается только на транспортном
-// отказе: RCODE-ответ живого сервера (SERVFAIL) остаётся решением
-// потребителя — при деградации unbound массовый crawl не должен
-// обстреливать публичные DNS теми же вопросами. Ручная проверка —
-// единичный вопрос человека: он ждёт ответ, а не классификацию отказа,
-// поэтому цепь здесь эскалирует и на RCODE-отказах (SERVFAIL/REFUSED):
-// dev-testbed unbound на всё вне тестовых зон отвечает SERVFAIL
-// (намеренная герметичность окружения), прод-unbound так не отвечает;
-// резервы — dns.fallback_resolvers (dev-форма — публичные резолверы,
-// бой — по конфигурации). NXDOMAIN — законный итог «имени нет»,
-// эскалации не требует; массовый конвейер (dns-worker) этой цепью
-// не пользуется.
+// The resolver chain of the live check of one domain (T-119/T-123) — its
+// own failure semantics, different from the mass pipeline.
+// FallbackResolver (internal/dnsclient, T-107) switches only on a
+// transport failure: an RCODE answer of the live server (SERVFAIL) stays
+// the consumer's decision — with unbound degraded, the mass crawl must
+// not shoot the same questions at the public DNS. A manual check is a
+// single human question: the human waits for an answer, not a failure
+// classification, so the chain here escalates on RCODE failures too
+// (SERVFAIL/REFUSED): the dev-testbed unbound answers SERVFAIL for
+// everything outside the test zones (a deliberate hermeticity of the
+// environment); the production unbound does not answer like that; the
+// reserves are dns.fallback_resolvers (the dev form — public resolvers,
+// production — per configuration). NXDOMAIN is a legitimate "no such
+// name" outcome and needs no escalation; the mass pipeline (the
+// dns-worker) does not use this chain.
 package checker
 
 import (
@@ -24,34 +25,35 @@ import (
 	"crawler/internal/dnsclient"
 )
 
-// escalateTarget — элемент цепи: резолвер и его адрес (только
-// диагностика сообщений об ошибках).
+// escalateTarget — an element of the chain: the resolver and its address
+// (only for the diagnostics of error messages).
 type escalateTarget struct {
 	addr string
 	res  dnsclient.Resolver
 }
 
-// escalateResolver — цепь резолверов с эскалацией на отказ (см. комментарий
-// пакета). Первый элемент — основной (локальный unbound, dns.resolvers[0]),
-// остальные — dns.fallback_resolvers в порядке конфигурации. Безопасен для
-// одновременного использования из горутин (состояния нет).
+// escalateResolver — a resolver chain with escalation on failure (see the
+// package comment). The first element is the primary (the local unbound,
+// dns.resolvers[0]), the rest are dns.fallback_resolvers in configuration
+// order. Safe for concurrent use from goroutines (no state).
 type escalateResolver struct {
 	targets []escalateTarget
 }
 
-// compile-time check: *escalateResolver — dnsclient.Resolver.
+// compile-time check: *escalateResolver is a dnsclient.Resolver.
 var _ dnsclient.Resolver = (*escalateResolver)(nil)
 
-// Exchange идёт по цепи до первого полезного итога. Полезный итог — ответ
-// с любым RCODE, кроме SERVFAIL и REFUSED (NOERROR, NXDOMAIN, …): его
-// семантику интерпретирует потребитель (T-036/T-039), цепь не решает.
-// SERVFAIL/REFUSED и транспортный отказ — переход к следующему резолверу;
-// отмена ctx прерывает цепь сразу (shutdown не обстреливает резервы).
+// Exchange walks the chain until the first useful outcome. A useful
+// outcome is an answer with any RCODE except SERVFAIL and REFUSED
+// (NOERROR, NXDOMAIN, …): the consumer interprets its semantics
+// (T-036/T-039), the chain does not decide. SERVFAIL/REFUSED and a
+// transport failure — moving to the next resolver; a ctx cancellation
+// interrupts the chain right away (shutdown does not shoot the reserves).
 //
-// Если полезного итога не дал никто — возвращается последний RCODE-ответ
-// (честная классификация: SERVFAIL → temp_error у потребителя), а при
-// чисто транспортных отказах — ошибка, перечисляющая цепь и оборачивающая
-// причину последнего (errors.Is/As работают по нему).
+// If nobody gave a useful outcome — the last RCODE answer is returned
+// (an honest classification: SERVFAIL → temp_error at the consumer), and
+// with purely transport failures — an error listing the chain and
+// wrapping the last cause (errors.Is/As work through it).
 func (r *escalateResolver) Exchange(ctx context.Context, q dnsclient.Question) (*dnsclient.Result, error) {
 	var (
 		lastRes *dnsclient.Result
@@ -82,7 +84,7 @@ func (r *escalateResolver) Exchange(ctx context.Context, q dnsclient.Question) (
 		q.Name, len(fails), strings.Join(fails, "; "), lastErr)
 }
 
-// desc — диагностическое описание отказа одного элемента цепи.
+// desc — a diagnostic description of the failure of one chain element.
 func (t escalateTarget) desc(v any) string {
 	if t.addr == "" {
 		return fmt.Sprint(v)
@@ -90,15 +92,16 @@ func (t escalateTarget) desc(v any) string {
 	return t.addr + ": " + fmt.Sprint(v)
 }
 
-// newResolverChain собирает цепь для живой проверки: основной клиент
-// (dns.resolvers[0] — локальный unbound) плюс по клиенту на каждый
-// dns.fallback_resolvers. udpPoolSize — размер пула UDP-сокетов каждого
-// клиента (0 — udp_pool_size секции dns, массовый конвейер): долгоживущий
-// контур формы (T-220) передаёт малый LiveUDPPoolSize — параллелизм живой
-// проверки ограничен семафором web, фонд сокетов боевого размера не нужен.
-// Пустой список резервов вырождается в единственный основной клиент —
-// поведение до цепи (T-119). Возвращаемый close закрывает все клиенты
-// цепи (один вызов, ошибки объединены).
+// newResolverChain assembles the chain for the live check: the primary
+// client (dns.resolvers[0] — the local unbound) plus one client per
+// dns.fallback_resolvers entry. udpPoolSize is the size of the UDP socket
+// pool of each client (0 — the udp_pool_size of the dns section, the mass
+// pipeline): the long-lived circuit of the form (T-220) passes the small
+// LiveUDPPoolSize — the parallelism of the live check is limited by the
+// web semaphore; a production-sized socket fund is not needed. An empty
+// reserve list degenerates into the single primary client — the behavior
+// before the chain (T-119). The returned close closes all the clients of
+// the chain (one call, the errors joined).
 func newResolverChain(ctx context.Context, cfg config.DNS, udpPoolSize int) (dnsclient.Resolver, func() error, error) {
 	primaryOpts := dnsclient.NewOptions(cfg)
 	if udpPoolSize > 0 {

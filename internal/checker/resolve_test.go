@@ -1,10 +1,10 @@
-// Тесты цепи резолверов живой проверки (см. resolve.go): сети нет —
-// элементы цепи, как в fallback_test.go (dnsclient), фейки Resolver с
-// программируемым итогом и подсчётом вызовов. Проверяются: условие
-// эскалации (SERVFAIL/REFUSED и транспортный отказ — да; NOERROR и
-// NXDOMAIN — нет), порядок цепи, итог «никто не ответил полезным»
-// (последний RCODE либо агрегированная ошибка), отмена ctx и
-// конкурентность (гонки ловит -race).
+// Tests of the live check resolver chain (see resolve.go): no network —
+// the chain elements, like in fallback_test.go (dnsclient), are fake
+// Resolvers with a programmable outcome and call counting. Checked: the
+// escalation condition (SERVFAIL/REFUSED and a transport failure — yes;
+// NOERROR and NXDOMAIN — no), the chain order, the "nobody answered
+// usefully" outcome (the last RCODE or the aggregated error), the ctx
+// cancellation and concurrency (-race catches the races).
 
 package checker
 
@@ -20,8 +20,8 @@ import (
 	"crawler/internal/dnsclient"
 )
 
-// resFake — элемент цепи: возвращает заданный RCODE/ошибку; calls
-// (если задан) считает вызовы по имени.
+// resFake — a chain element: returns the given RCODE/error; calls
+// (if set) counts the calls by name.
 type resFake struct {
 	name  string
 	calls *sync.Map
@@ -67,10 +67,10 @@ func q() dnsclient.Question {
 	return dnsclient.Question{Name: "example.com.", Type: dns.TypeA}
 }
 
-// TestEscalateUsefulFirstAnswer — полезный итог первого элемента
-// возвращается как есть, резервы не опрашиваются: NOERROR (включая
-// пустой NODATA) и NXDOMAIN (имени нет — законный ответ, не отказ
-// сервера).
+// TestEscalateUsefulFirstAnswer — a useful outcome of the first element
+// is returned as is, the reserves are not polled: NOERROR (including an
+// empty NODATA) and NXDOMAIN (no such name — a legitimate answer, not a
+// server failure).
 func TestEscalateUsefulFirstAnswer(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -100,8 +100,9 @@ func TestEscalateUsefulFirstAnswer(t *testing.T) {
 	}
 }
 
-// TestEscalateOnRCODEFailure — SERVFAIL и REFUSED основного — отказ
-// сервера: цепь переходит к резерву, его полезный итог возвращается.
+// TestEscalateOnRCODEFailure — SERVFAIL and REFUSED of the primary are a
+// server failure: the chain moves to the reserve, its useful outcome is
+// returned.
 func TestEscalateOnRCODEFailure(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -132,8 +133,9 @@ func TestEscalateOnRCODEFailure(t *testing.T) {
 	}
 }
 
-// TestEscalateOnTransportError — транспортный отказ основного (error
-// после ретраев) — то же переключение, что и у FallbackResolver T-107.
+// TestEscalateOnTransportError — a transport failure of the primary (an
+// error after the retries) — the same switching as FallbackResolver
+// T-107.
 func TestEscalateOnTransportError(t *testing.T) {
 	calls := newCalls("p", "f")
 	r := chainOf(
@@ -152,9 +154,9 @@ func TestEscalateOnTransportError(t *testing.T) {
 	}
 }
 
-// TestEscalateAllFailedRCODE — все элементы ответали RCODE-отказом:
-// без ошибки возвращается последний RCODE-ответ (потребитель честно
-// классифицирует SERVFAIL → temp_error).
+// TestEscalateAllFailedRCODE — all the elements answered with an RCODE
+// failure: without an error the last RCODE answer is returned (the
+// consumer honestly classifies SERVFAIL → temp_error).
 func TestEscalateAllFailedRCODE(t *testing.T) {
 	calls := newCalls("p", "f1", "f2")
 	r := chainOf(
@@ -176,8 +178,8 @@ func TestEscalateAllFailedRCODE(t *testing.T) {
 	}
 }
 
-// TestEscalateAllTransportFailed — сплошные транспортные отказы:
-// ошибка перечисляет всю цепь и оборачивает причину последнего.
+// TestEscalateAllTransportFailed — solid transport failures: the error
+// lists the whole chain and wraps the last cause.
 func TestEscalateAllTransportFailed(t *testing.T) {
 	boom := errors.New("connection refused")
 	r := chainOf(
@@ -198,8 +200,9 @@ func TestEscalateAllTransportFailed(t *testing.T) {
 	}
 }
 
-// TestEscalateContextCancelled — отмена ctx между элементами цепи
-// прерывает её сразу (shutdown не обстреливает резервы).
+// TestEscalateContextCancelled — a ctx cancellation between the chain
+// elements interrupts it right away (shutdown does not shoot the
+// reserves).
 func TestEscalateContextCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -213,8 +216,8 @@ func TestEscalateContextCancelled(t *testing.T) {
 	}
 }
 
-// TestEscalateConcurrent — цепь без состояния: параллельные Exchange
-// не мешают друг другу (гонки ловит -race).
+// TestEscalateConcurrent — the chain is stateless: parallel Exchanges do
+// not interfere with each other (-race catches the races).
 func TestEscalateConcurrent(t *testing.T) {
 	r := chainOf(
 		escalateTarget{addr: "p", res: &resFake{name: "p", rcode: dnsclient.RCodeSERVFAIL}},
