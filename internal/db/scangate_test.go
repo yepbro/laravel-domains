@@ -9,12 +9,13 @@ import (
 	"time"
 )
 
-// TestScanGate — семафор единственности тяжёлых сканов (T-271):
-// взаимное исключение двух держателей (инцидент 08–09.11.2026 —
-// совпадение сканов retention ↔ render-late по ≈1 ГиБ клало PostgreSQL
-// OOM-киллом), отмена ctx прерывает ожидание, nil-гейт — no-op.
+// TestScanGate — the heavy-scan uniqueness semaphore (T-271): mutual
+// exclusion of two holders (the 08–09.11.2026 incident — the retention ↔
+// render-late scans coinciding at ≈1 GiB each brought PostgreSQL down with
+// an OOM kill), ctx cancellation interrupts the wait, a nil gate is a
+// no-op.
 func TestScanGate(t *testing.T) {
-	// nil — no-op: Acquire/Release без эффекта и без паники.
+	// nil — a no-op: Acquire/Release with no effect and no panic.
 	if err := ScanGate(nil).Acquire(context.Background()); err != nil {
 		t.Fatalf("nil-гейт Acquire: %v", err)
 	}
@@ -45,11 +46,11 @@ func TestScanGate(t *testing.T) {
 					break
 				}
 			}
-			<-hold // держать гейт дольше планировщика горутин
+			<-hold // hold the gate longer than the goroutine scheduler
 			inFlight.Add(-1)
 		}()
 	}
-	// Оба держателя обязаны выстроиться: пик одновременности — 1.
+	// Both holders must line up: the concurrency peak is 1.
 	time.Sleep(50 * time.Millisecond)
 	close(hold)
 	wg.Wait()
@@ -57,7 +58,8 @@ func TestScanGate(t *testing.T) {
 		t.Fatalf("пик одновременных держателей = %d, want 1 (взаимное исключение)", max)
 	}
 
-	// Отмена ctx в ожидании гейта: занятый гейт — ошибка ctx, не висение.
+	// ctx cancellation while waiting for the gate: a busy gate — a ctx
+	// error, not a hang.
 	if err := gate.Acquire(context.Background()); err != nil {
 		t.Fatalf("занятие свободного гейта: %v", err)
 	}

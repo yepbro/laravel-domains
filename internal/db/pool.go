@@ -14,66 +14,70 @@ import (
 	"crawler/internal/config"
 )
 
-// compile-time check: *pgxpool.Pool удовлетворяет интерфейсу DB
-// (хелперы пакета принимают его напрямую).
+// compile-time check: *pgxpool.Pool satisfies the DB interface
+// (the package helpers accept it directly).
 var _ DB = (*pgxpool.Pool)(nil)
 
-// Настройки пула по умолчанию. Значения консервативные: соединения в
-// dev-окружении и проде живут на одной машине с сервисами, длинные
-// простои и «вечные» соединения не нужны, а регулярная пересборка
-// соединений страхует от протухания TCP-сессий и накопления состояния.
+// Default pool settings. The values are conservative: connections in the
+// dev environment and production live on one machine with the services,
+// long idleness and "eternal" connections are not needed, and regular
+// connection rebuilding guards against stale TCP sessions and state
+// accumulation.
 const (
-	// DefaultPoolSize — лимит соединений пула, когда pool_size не задан
-	// (совпадает с config.Default().Postgres.PoolSize, ТЗ 5.10).
+	// DefaultPoolSize — the pool connection limit when pool_size is unset
+	// (matches config.Default().Postgres.PoolSize, spec 5.10).
 	DefaultPoolSize = 20
-	// DefaultMaxConnLifetime — переустановка соединения вне зависимости
-	// от активности (pgxpool default 1h).
+	// DefaultMaxConnLifetime — connection re-establishment regardless of
+	// activity (pgxpool default 1h).
 	DefaultMaxConnLifetime = 30 * time.Minute
-	// DefaultMaxConnIdleTime — закрытие простаивающего соединения
+	// DefaultMaxConnIdleTime — closing an idle connection
 	// (pgxpool default 30m).
 	DefaultMaxConnIdleTime = 5 * time.Minute
-	// DefaultHealthCheckPeriod — фоновая проверка простаивающих соединений
-	// перед выдачей из пула и по расписанию (значение pgxpool).
+	// DefaultHealthCheckPeriod — background check of idle connections
+	// before checkout from the pool and on a schedule (the pgxpool value).
 	DefaultHealthCheckPeriod = time.Minute
-	// DefaultConnectTimeout — установка одного соединения; обязан
-	// укладываться в стартовый контекст сервиса.
+	// DefaultConnectTimeout — establishing a single connection; must fit
+	// within the service's startup context.
 	DefaultConnectTimeout = 10 * time.Second
 )
 
-// MaxPoolSize — верхняя граница pool_size одного сервиса: бюджет ТЗ 6.3
-// (≤ 20–50 соединений на ВСЕ сервисы суммарно) не имеет смысла отдавать
-// одному пулу. config.Validate ограничивает то же поле диапазоном 1..100,
-// здесь граница жёстче и защищает вызовы мимо конфига.
+// MaxPoolSize — the upper bound of a single service's pool_size: the
+// spec 6.3 budget (≤ 20–50 connections across ALL services combined)
+// makes no sense to give to one pool. config.Validate limits the same
+// field to the 1..100 range; the bound here is stricter and protects
+// calls that bypass the config.
 const MaxPoolSize = 100
 
-// AfterConnectFunc — хук настройки нового соединения пула (пробрасывается
-// в pgxpool.Config.AfterConnect): выполняется один раз на каждое
-// открываемое соединение (включая переоткрытия по MaxConnLifetime),
-// до первого использования. Сбой хука — ошибка открытия соединения.
+// AfterConnectFunc — a hook configuring a new pool connection (passed
+// through to pgxpool.Config.AfterConnect): it runs once per opened
+// connection (including reopenings due to MaxConnLifetime), before first
+// use. A hook failure is a connection-open error.
 type AfterConnectFunc func(ctx context.Context, conn *pgx.Conn) error
 
-// noParallelGatherSQL — отключение параллельных воркеров запросов сессии.
+// noParallelGatherSQL — disables the session's parallel query workers.
 const noParallelGatherSQL = "SET max_parallel_workers_per_gather = 0"
 
-// NoParallelGather — AfterConnect-хук сервисов с агрегатными/сканирующими
-// фоновыми проходами (T-171 — мониторинг; T-201 — http-worker):
-// сессионный SET max_parallel_workers_per_gather = 0 — агрегатные проходы
-// (пересчёт зон, окна сводки, backlog, retention-дренаж) не разбирают
-// параллельные воркеры PostgreSQL и не забирают сразу все ядра поделимого
-// CPU у конвейера краулера (боевой инцидент 23–24.10: 4 ядра, load 21–23,
-// каждый параллельный агрегат занимал 3 ядра). Суммарная работа сессии та
-// же, wall-время прохода растёт — мониторингу свежесть в десятки секунд
-// не критична (порог алерта остановки прогресса — 5 периодов пересчёта
-// зон), фоновому дренажу — темп задаёт интервал цикла и размер пачки
-// (T-201), а воркеры и транспорт получают равные доли CPU вместо всплесков.
+// NoParallelGather — the AfterConnect hook for services with
+// aggregate/scan background passes (T-171 — monitoring; T-201 —
+// http-worker): the session-level SET max_parallel_workers_per_gather = 0
+// means aggregate passes (zone recalculation, summary windows, backlog,
+// retention drain) do not consume PostgreSQL parallel workers and do not
+// grab all cores of the shared CPU at once from the crawler pipeline
+// (production incident 23–24.10: 4 cores, load 21–23, each parallel
+// aggregate took 3 cores). The session's total work is the same, the wall
+// time of a pass grows — for monitoring a freshness of tens of seconds is
+// not critical (the stalled-progress alert threshold is 5 zone
+// recalculation periods), for background drain the pace is set by the loop
+// interval and chunk size (T-201), and workers and transport get even
+// shares of CPU instead of spikes.
 //
-// Применимо к пулам мониторинга (monitor, dashboard, коллекторы метрик),
-// scheduler (seq-проходы backlog/retry temp_error) и http-worker
-// (retention-дренаж T-201: время-форма T-185 собирала Gather Merge на
-// голодном CPU того же сервиса): путь OLTP-воркеров (выборка/запись пачек
-// по индексам) не использует параллельные планы, но фоновые seq-проходы
-// того же сервиса замедляются — решения по каждому сервису принимаются
-// осознанно.
+// Applicable to the monitoring pools (monitor, dashboard, metric
+// collectors), scheduler (seq passes over backlog/retry temp_error) and
+// http-worker (retention drain of T-201: the T-185 time-form collected
+// Gather Merge on the same service's starved CPU): the OLTP worker path
+// (chunk reads/writes by indexes) does not use parallel plans, but the
+// same service's background seq passes slow down — the decision is made
+// deliberately per service.
 func NoParallelGather(ctx context.Context, conn *pgx.Conn) error {
 	if _, err := conn.Exec(ctx, noParallelGatherSQL); err != nil {
 		return fmt.Errorf("db: %s: %w", noParallelGatherSQL, err)
@@ -81,32 +85,34 @@ func NoParallelGather(ctx context.Context, conn *pgx.Conn) error {
 	return nil
 }
 
-// DefaultLockTimeout — потолок ожидания строковых блокировок для
-// write-пулов конвейера (T-192). Боевой инцидент 25.10: длинная
-// транзакция держала строчные локи domains ≈37 мин, точечные write-операторы
-// (все — по PK, планы идеальны) стояли в очереди за ней до 39 мин без
-// потолка — конвейер молча замер на ≈55 минут (q:dns у watermark, XACK не
-// шёл). 30 с на три порядка выше штатных ожиданий (миллисекунды на запись
-// результата; максимум вне инцидента — enqueue 10,6 с) и на порядок ниже
-// инцидентных 15–39 мин: режет только конвой. Превышение — SQLSTATE 55P03,
-// откат транзакции записи и штатный повтор доставки (at-least-once, ТЗ §3.4),
-// а не немое ожидание. Потолок — инцидентная константа, не тюнинг: выноса
-// в конфиг не требуется.
+// DefaultLockTimeout — the cap on waiting for row locks in the pipeline's
+// write pools (T-192). Production incident 25.10: a long transaction held
+// row locks on domains for ≈37 min, point write statements (all by PK,
+// perfect plans) queued behind it for up to 39 min without a cap — the
+// pipeline silently stalled for ≈55 minutes (q:dns at the watermark, no
+// XACK). 30s is three orders of magnitude above normal waits
+// (milliseconds to write a result; the non-incident maximum — enqueue
+// 10.6s) and an order of magnitude below the incident's 15–39 min: it cuts
+// only a lock convoy. Exceeding it yields SQLSTATE 55P03, a rollback of
+// the write transaction and a normal delivery retry (at-least-once,
+// spec §3.4) instead of a silent wait. The cap is an incident constant,
+// not a knob: no need to move it to the config.
 const DefaultLockTimeout = 30 * time.Second
 
-// lockTimeoutSQLFmt — сессионный потолок ожидания чужих блокировок.
-// Форма <N>ms валидна для GUC-времени PostgreSQL при любой длительности;
-// Duration.String() не годится: 90 с он выводит как "1m30s", а "m" —
-// не единица парсера GUC (мс/с/мин/ч/д).
+// lockTimeoutSQLFmt — the session-level cap on waiting for foreign locks.
+// The <N>ms form is valid for PostgreSQL GUC time at any duration;
+// Duration.String() does not fit: it prints 90s as "1m30s", and "m" is
+// not a unit of the GUC parser (ms/s/min/h/d).
 const lockTimeoutSQLFmt = "SET lock_timeout = '%dms'"
 
-// LockTimeout — AfterConnect-хук write-пулов конвейера (T-192): сессионный
-// SET lock_timeout на каждом соединении пула (включая переоткрытия по
-// MaxConnLifetime). Включён у dns-worker, http-worker и scheduler — их
-// транзакции берут строчные локи domains; читатели (monitor, dashboard,
-// web) и анализатор не трогаются. Неположительная длительность — ошибка
-// хука (соединение не открывается, сервис падает на старте): потолок
-// обязан быть потолком, «0» здесь означал бы его тихое отключение.
+// LockTimeout — the AfterConnect hook of the pipeline's write pools
+// (T-192): a session-level SET lock_timeout on every pool connection
+// (including reopenings due to MaxConnLifetime). Enabled in dns-worker,
+// http-worker and scheduler — their transactions take row locks on
+// domains; readers (monitor, dashboard, web) and the analyzer are not
+// touched. A non-positive duration is a hook error (the connection does
+// not open, the service fails at startup): a cap must be a cap, "0" here
+// would mean silently disabling it.
 func LockTimeout(d time.Duration) AfterConnectFunc {
 	return func(ctx context.Context, conn *pgx.Conn) error {
 		if d <= 0 {
@@ -120,13 +126,13 @@ func LockTimeout(d time.Duration) AfterConnectFunc {
 	}
 }
 
-// JoinHooks — композиция AfterConnect-хуков (T-192): выполняет их по
-// порядку, сбой любого — ошибка открытия соединения (как у одиночного
-// хука); nil-элементы пропускаются (аналог nil AfterConnect — настройка
-// не задана). Нужна пулам с несколькими сессионными настройками:
+// JoinHooks — composition of AfterConnect hooks (T-192): runs them in
+// order, any failure is a connection-open error (as with a single hook);
+// nil elements are skipped (equivalent to a nil AfterConnect — the setting
+// is unset). Needed by pools with several session settings:
 // scheduler — NoParallelGather (T-171) + LockTimeout (T-192), http-worker
-// — те же два хука (T-201, retention-дренаж) одним проводником
-// Options.DBAfterConnect.
+// — the same two hooks (T-201, retention drain) through a single
+// Options.DBAfterConnect wiring.
 func JoinHooks(hooks ...AfterConnectFunc) AfterConnectFunc {
 	return func(ctx context.Context, conn *pgx.Conn) error {
 		for _, h := range hooks {
@@ -141,49 +147,50 @@ func JoinHooks(hooks ...AfterConnectFunc) AfterConnectFunc {
 	}
 }
 
-// Options — параметры пула подключений. Нулевые длительности и PoolSize
-// заменяются значениями по умолчанию; DSN обязателен.
+// Options — connection pool parameters. Zero durations and PoolSize are
+// replaced with defaults; DSN is required.
 type Options struct {
-	// DSN — строка подключения PostgreSQL (postgres.dsn конфигурации).
+	// DSN — the PostgreSQL connection string (the config's postgres.dsn).
 	DSN string
-	// PoolSize — максимум соединений пула: переопределяет pool_max_conns
-	// из DSN (источник истины — конфигурация сервиса). 0 — значение по
-	// умолчанию (DefaultPoolSize); лимит на все сервисы — ТЗ 6.3.
+	// PoolSize — the pool's maximum connections: overrides pool_max_conns
+	// from the DSN (the source of truth is the service configuration).
+	// 0 — the default (DefaultPoolSize); the all-services limit — spec 6.3.
 	PoolSize int
-	// MinPoolSize — соединения, держимые фоном (0 — ленивое открытие:
-	// простой не занимает соединений). По умолчанию 0.
+	// MinPoolSize — connections kept in the background (0 — lazy opening:
+	// idle time occupies no connections). Default 0.
 	MinPoolSize int
-	// MaxConnLifetime — время жизни соединения. По умолчанию 30m.
+	// MaxConnLifetime — connection lifetime. Default 30m.
 	MaxConnLifetime time.Duration
-	// MaxConnIdleTime — простой соединения до закрытия. По умолчанию 5m.
+	// MaxConnIdleTime — connection idle time before closing. Default 5m.
 	MaxConnIdleTime time.Duration
-	// HealthCheckPeriod — период фоновой проверки соединений. По умолчанию 1m.
+	// HealthCheckPeriod — background connection check period. Default 1m.
 	HealthCheckPeriod time.Duration
-	// ConnectTimeout — установка одного соединения. По умолчанию 10s.
+	// ConnectTimeout — establishing a single connection. Default 10s.
 	ConnectTimeout time.Duration
-	// AppName — application_name соединений пула: метка сервиса в
-	// pg_stat_activity (журнал сервера, мониторинг T-177 — цикл медленных
-	// запросов отличает по ней свои агрегаты от патологий конвейера).
-	// "" — не задаётся; явное application_name в DSN не перетирается
-	// (выбор оператора в строке подключения важнее).
+	// AppName — the pool connections' application_name: the service label
+	// in pg_stat_activity (server log; monitoring of T-177 — the
+	// slow-query loop uses it to tell its own aggregates from pipeline
+	// pathologies). "" — not set; an explicit application_name in the DSN
+	// is not overwritten (the operator's choice in the connection string
+	// wins).
 	AppName string
-	// AfterConnect — настройка каждого нового соединения (nil — нет):
-	// см. AfterConnectFunc. Значение применяется и к переоткрытиям
-	// по MaxConnLifetime — SET-подобные настройки сессии переживают
-	// пересборку соединений.
+	// AfterConnect — configuration of each new connection (nil — none):
+	// see AfterConnectFunc. The value also applies to reopenings due to
+	// MaxConnLifetime — SET-like session settings survive connection
+	// rebuilding.
 	AfterConnect AfterConnectFunc
 }
 
-// NewOptions собирает параметры пула из секции postgres конфигурации
-// (T-006): dsn и pool_size; служебные настройки — значения по умолчанию
-// (при необходимости задаются поверх явно).
+// NewOptions assembles pool parameters from the config's postgres section
+// (T-006): dsn and pool_size; the service settings take their defaults
+// (set explicitly on top when needed).
 func NewOptions(pg config.Postgres) Options {
 	return Options{DSN: pg.DSN, PoolSize: pg.PoolSize}
 }
 
-// buildPoolConfig разбирает DSN и накладывает параметры: pool_size задаёт
-// максимум соединений (явно перекрывает pool_max_conns из DSN), остальное —
-// health-check и время жизни соединений.
+// buildPoolConfig parses the DSN and applies the parameters: pool_size
+// sets the maximum connections (explicitly overriding pool_max_conns from
+// the DSN), the rest — health-check and connection lifetimes.
 func buildPoolConfig(opts Options) (*pgxpool.Config, error) {
 	if strings.TrimSpace(opts.DSN) == "" {
 		return nil, errors.New("db: пустой DSN PostgreSQL")
@@ -206,8 +213,9 @@ func buildPoolConfig(opts Options) (*pgxpool.Config, error) {
 	cfg.MaxConnIdleTime = defaultIfZero(opts.MaxConnIdleTime, DefaultMaxConnIdleTime)
 	cfg.HealthCheckPeriod = defaultIfZero(opts.HealthCheckPeriod, DefaultHealthCheckPeriod)
 	cfg.ConnConfig.ConnectTimeout = defaultIfZero(opts.ConnectTimeout, DefaultConnectTimeout)
-	// Метка сервиса в pg_stat_activity: только если DSN её не задал
-	// (явное значение в строке подключения — выбор оператора).
+	// The service label in pg_stat_activity: only if the DSN did not set
+	// it (an explicit value in the connection string — the operator's
+	// choice).
 	if opts.AppName != "" && cfg.ConnConfig.RuntimeParams["application_name"] == "" {
 		cfg.ConnConfig.RuntimeParams["application_name"] = opts.AppName
 	}
@@ -215,10 +223,10 @@ func buildPoolConfig(opts Options) (*pgxpool.Config, error) {
 	return cfg, nil
 }
 
-// Open создаёт пул подключений и проверяет доступность БД одним
-// подключением (fail-fast: сервис падает при старте с понятной ошибкой,
-// а не при первом запросе; проверочное соединение возвращается в пул).
-// Контекст ограничивает ожидание установки соединения.
+// Open creates a connection pool and checks DB availability with a single
+// connection (fail-fast: the service fails at startup with a clear error
+// instead of on the first query; the check connection is returned to the
+// pool). The context bounds the connection-establishment wait.
 func Open(ctx context.Context, opts Options) (*pgxpool.Pool, error) {
 	cfg, err := buildPoolConfig(opts)
 	if err != nil {
@@ -243,25 +251,28 @@ func defaultIfZero(v, def time.Duration) time.Duration {
 	return v
 }
 
-// RedactDSN скрывает секреты строки подключения для сообщений об ошибках:
-// пароль из userinfo и параметры password/sslpassword из query-строки
-// (pgx/pgconn, как libpq, принимает их и в URL-query — parseURLQueryParams
-// переносит значения в настройки подключения). Неразбораемый DSN
-// заменяется сообщением fallback: не раскрываем даже структуру.
-// Единая реализация для internal/db и internal/migrate (раньше это были
-// две разошедшиеся копии — в одной query-пароль не вырезался).
+// RedactDSN hides connection-string secrets for error messages: the
+// userinfo password and the password/sslpassword query parameters
+// (pgx/pgconn, like libpq, accepts them in the URL query too —
+// parseURLQueryParams moves the values into the connection settings).
+// An unparseable DSN is replaced with the fallback message: not even the
+// structure is disclosed. A single implementation for internal/db and
+// internal/migrate (previously two diverged copies — one did not strip
+// the query password).
 func RedactDSN(dsn, fallback string) string {
 	u, err := url.Parse(dsn)
 	if err != nil || u.User == nil {
 		return fallback
 	}
-	// url.UserPassword кодирует символы маски, поэтому пароль просто
-	// отбрасывается: важно, чтобы он не попал в лог, а не как выглядит замена.
+	// url.UserPassword encodes mask characters, so the password is simply
+	// dropped: what matters is that it never reaches the log, not what the
+	// replacement looks like.
 	u.User = url.User(u.User.Username())
-	// Секретные query-параметры маскируются (маска без спецсимволов —
-	// url.Values.Encode экранирует их); остальной запрос (sslmode,
-	// pool_max_conns, ...) сохраняется. RawQuery переписывается только
-	// при реальной замене — иначе Encode() переупорядочил бы параметры.
+	// Secret query parameters are masked (a mask without special
+	// characters — url.Values.Encode escapes them); the rest of the query
+	// (sslmode, pool_max_conns, ...) is preserved. RawQuery is rewritten
+	// only on an actual replacement — otherwise Encode() would reorder
+	// the parameters.
 	q := u.Query()
 	redacted := false
 	for _, k := range []string{"password", "sslpassword"} {
@@ -276,7 +287,7 @@ func RedactDSN(dsn, fallback string) string {
 	return u.String()
 }
 
-// redactDSN — RedactDSN с fallback-сообщением пакета db.
+// redactDSN — RedactDSN with the db package's fallback message.
 func redactDSN(dsn string) string {
 	return RedactDSN(dsn, "см. postgres.dsn (конфигурация)")
 }

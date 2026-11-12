@@ -9,38 +9,38 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// Column — колонка пакетного обновления: имя и SQL-тип PostgreSQL, которым
-// приводится массив-аргумент запроса ($n::type[]). Типы — как в DDL схемы:
-// int2, int4, int8, text, bool, timestamptz, bytea, ...
+// Column — a column of a batch update: a name and the PostgreSQL SQL type
+// the query's array argument is cast to ($n::type[]). Types are as in the
+// schema DDL: int2, int4, int8, text, bool, timestamptz, bytea, ...
 type Column struct {
-	Name string // имя колонки в unnest-псевдониме u и в SET
-	Type string // SQL-тип элементов массива: int8, text, ...
+	Name string // the column name in the unnest alias u and in SET
+	Type string // the SQL type of the array elements: int8, text, ...
 }
 
-// Update начинает построение пакетного UPDATE … FROM unnest(...) для
-// таблицы table (имя колонок и таблицы — из кода, не из пользовательского
-// ввода; экранируются как идентификаторы).
+// Update starts building a batch UPDATE … FROM unnest(...) for the table
+// table (column and table names come from code, not from user input;
+// they are quoted as identifiers).
 //
-// Форма запроса:
+// Query form:
 //
 //	UPDATE "domains" AS t
 //	SET "check_state" = u."check_state", queued_at = now()
 //	FROM unnest($1::int2[], $2::int8[], $3::int2[]) AS u("zone_id", "id", "check_state")
 //	WHERE t."zone_id" = u."zone_id" AND t."id" = u."id" AND t."check_state" = 0
 //
-// Каждый массив-колонка — один параметр запроса, поэтому число строк пачки
-// ограничено только разумным размером, а не лимитом протокола (65535
-// параметров). Значения в Exec/Query передаются колонками: сначала ключи
-// (Key), затем SET-колонки (Set); выражения SetExpr значений не принимают.
+// Each column array is a single query parameter, so the chunk row count is
+// limited only by a sane size, not by the protocol limit (65535
+// parameters). Values are passed to Exec/Query column-wise: keys first
+// (Key), then SET columns (Set); SetExpr expressions take no values.
 //
-// Предикат Where — охрана от гонок: массовый перевод состояний меняет
-// только строки в ожидаемом состоянии (scheduler, ТЗ 5.3).
+// The Where predicate is a race guard: a mass state transition changes
+// only rows in the expected state (scheduler, spec 5.3).
 func Update(table string) *UpdateBuilder {
 	return &UpdateBuilder{table: table}
 }
 
-// UpdateBuilder — конструктор одного пакетного UPDATE … FROM unnest(...).
-// Неизменяемость после сборки не требуется: один builder — один запрос.
+// UpdateBuilder — the builder of a single batch UPDATE … FROM unnest(...).
+// Immutability after assembly is not required: one builder — one query.
 type UpdateBuilder struct {
 	table     string
 	keys      []Column
@@ -50,46 +50,46 @@ type UpdateBuilder struct {
 	returning []string
 }
 
-// Key добавляет колонку-ключ: попадает в unnest и в соединение WHERE
-// (t.<имя> = u.<имя>). Ключи идентифицируют обновляемые строки — например,
-// zone_id и id для таблиц, партиционированных по zone_id.
+// Key adds a key column: it goes into unnest and into the WHERE join
+// (t.<name> = u.<name>). Keys identify the updated rows — for example,
+// zone_id and id for tables partitioned by zone_id.
 func (b *UpdateBuilder) Key(cols ...Column) *UpdateBuilder {
 	b.keys = append(b.keys, cols...)
 	return b
 }
 
-// Set добавляет колонку со значениями из unnest: каждой строке пачки —
-// своё значение (SET t.<имя> = u.<имя>).
+// Set adds a column with values from unnest: each chunk row gets its own
+// value (SET t.<name> = u.<name>).
 func (b *UpdateBuilder) Set(cols ...Column) *UpdateBuilder {
 	b.assigns = append(b.assigns, cols...)
 	return b
 }
 
-// SetExpr добавляет фиксированное SET-выражение на всю пачку — произвольный
-// SQL, например "queued_at = now()" или литерал "status = 5".
+// SetExpr adds a fixed SET expression for the whole chunk — arbitrary SQL,
+// e.g. "queued_at = now()" or the literal "status = 5".
 func (b *UpdateBuilder) SetExpr(exprs ...string) *UpdateBuilder {
 	b.exprs = append(b.exprs, exprs...)
 	return b
 }
 
-// Where добавляет предикат охраны (SQL-выражение над алиасами t и u),
-// объединяемый с соединением ключей и предыдущими предикатами по AND
-// (повторные вызовы накапливаются, а не перезаписываются: потеря
-// охраны в пакетном UPDATE — порча данных, а не неудобство).
+// Where adds a guard predicate (an SQL expression over the t and u
+// aliases), ANDed with the key join and previous predicates (repeated
+// calls accumulate instead of overwriting: losing a guard in a batch
+// UPDATE is data corruption, not an inconvenience).
 func (b *UpdateBuilder) Where(pred string) *UpdateBuilder {
 	b.wheres = append(b.wheres, pred)
 	return b
 }
 
-// Returning задаёт список колонок RETURNING (имена или выражения): строки,
-// реально обновлённые с учётом охраны, читаются через Query — например,
-// публикация в очередь ровно переведённых pending → queued доменов.
+// Returning sets the RETURNING column list (names or expressions): the
+// rows actually updated under the guard are read via Query — for example,
+// enqueueing exactly the domains transitioned pending → queued.
 func (b *UpdateBuilder) Returning(cols ...string) *UpdateBuilder {
 	b.returning = append(b.returning, cols...)
 	return b
 }
 
-// columns возвращает порядок колонок со значениями: ключи, затем SET-колонки.
+// columns returns the order of value columns: keys first, then SET columns.
 func (b *UpdateBuilder) columns() []Column {
 	cols := make([]Column, 0, len(b.keys)+len(b.assigns))
 	cols = append(cols, b.keys...)
@@ -97,8 +97,8 @@ func (b *UpdateBuilder) columns() []Column {
 	return cols
 }
 
-// build проверяет описание и возвращает текст запроса и порядок колонок
-// со значениями.
+// build validates the description and returns the query text and the
+// order of value columns.
 func (b *UpdateBuilder) build() (string, []Column, error) {
 	cols := b.columns()
 
@@ -133,8 +133,8 @@ func (b *UpdateBuilder) build() (string, []Column, error) {
 
 	set := make([]string, 0, len(b.assigns)+len(b.exprs))
 	for _, c := range b.assigns {
-		// В SET целевая колонка не квалифицируется алиасом таблицы:
-		// PostgreSQL требует `SET col = ...`, а не `SET t.col = ...`.
+		// In SET the target column is not qualified with the table alias:
+		// PostgreSQL requires `SET col = ...`, not `SET t.col = ...`.
 		set = append(set, fmt.Sprintf("%s = u.%s", quoteIdent(c.Name), quoteIdent(c.Name)))
 	}
 	set = append(set, b.exprs...)
@@ -155,9 +155,9 @@ func (b *UpdateBuilder) build() (string, []Column, error) {
 	return sql, cols, nil
 }
 
-// args проверяет колонки значений (параллельные массивы одинаковой длины,
-// порядок — ключи, затем SET-колонки) и собирает аргументы запроса.
-// Пачка из 0 строк — no-op: возвращает nil, nil.
+// args validates the value columns (parallel arrays of equal length,
+// ordered keys first, then SET columns) and assembles the query arguments.
+// A chunk of 0 rows is a no-op: returns nil, nil.
 func (b *UpdateBuilder) args(columns [][]any) ([]any, error) {
 	cols := b.columns()
 	if len(columns) != len(cols) {
@@ -191,20 +191,20 @@ func (b *UpdateBuilder) args(columns [][]any) ([]any, error) {
 	return args, nil
 }
 
-// SQL возвращает текст собранного запроса (для Query/Exec он строится
-// внутренне). Потребитель — обёртки переходов в CTE: дельты счётчиков
-// зон выполняются тем же оператором, что и перевод (T-178, ТЗИ §6.1:
-// «вторым оператором/CTE»), — текст перевода переиспользуется как CTE
-// без дублирования конструктора.
+// SQL returns the assembled query text (Query/Exec build it internally).
+// The consumer — CTE-based transition wrappers: zone counter deltas run in
+// the same statement as the transition (T-178, incremental-counters spec
+// §6.1: "a second statement/CTE") — the transition text is reused as a CTE
+// without duplicating the builder.
 func (b *UpdateBuilder) SQL() (string, error) {
 	sql, _, err := b.build()
 	return sql, err
 }
 
-// Exec выполняет пакетный UPDATE и возвращает число обновлённых строк
-// (с учётом предиката охраны — меньше или равно числу строк пачки).
-// Пачка из 0 строк — no-op без обращения к БД. Для запросов с Returning
-// используйте Query.
+// Exec runs the batch UPDATE and returns the number of updated rows
+// (under the guard predicate — less than or equal to the chunk row count).
+// A chunk of 0 rows is a no-op without touching the DB. For queries with
+// Returning use Query.
 func (b *UpdateBuilder) Exec(ctx context.Context, pool DB, columns ...[]any) (int64, error) {
 	if len(b.returning) > 0 {
 		return 0, fmt.Errorf("db: UPDATE %s: задан Returning — используйте Query", b.table)
@@ -227,8 +227,8 @@ func (b *UpdateBuilder) Exec(ctx context.Context, pool DB, columns ...[]any) (in
 	return tag.RowsAffected(), nil
 }
 
-// Query выполняет пакетный UPDATE с Returning и возвращает строки
-// результата (псевдоним таблицы — t). Вызовивший обязан закрыть pgx.Rows.
+// Query runs the batch UPDATE with Returning and returns the result rows
+// (the table alias is t). The caller must close pgx.Rows.
 func (b *UpdateBuilder) Query(ctx context.Context, pool DB, columns ...[]any) (pgx.Rows, error) {
 	if len(b.returning) == 0 {
 		return nil, fmt.Errorf("db: UPDATE %s: Returning не задан — используйте Exec", b.table)
@@ -251,8 +251,8 @@ func (b *UpdateBuilder) Query(ctx context.Context, pool DB, columns ...[]any) (p
 	return rows, nil
 }
 
-// quoteIdent экранирует имя как идентификатор PostgreSQL; поддерживает
-// схему через точку ("public.domains" → "public"."domains").
+// quoteIdent quotes a name as a PostgreSQL identifier; supports a
+// dot-separated schema ("public.domains" → "public"."domains").
 func quoteIdent(name string) string {
 	parts := strings.Split(name, ".")
 	return pgx.Identifier(parts).Sanitize()

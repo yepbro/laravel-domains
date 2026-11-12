@@ -2,31 +2,32 @@ package db
 
 import "context"
 
-// ScanGate — семафор единственности тяжёлых фоновых сканов сервиса
-// (T-271): буферизованный канал ёмкости 1, разделяемый независимыми
-// фоновыми циклами одного сервиса (http-worker: retention-дренаж ↔
-// поздний переиздатель рендера). Инцидент 08–09.11.2026: деградация
-// планов двух курсорных выборок до «seq scan + hash join + Sort» держала
-// по ≈1 ГиБ рабочих структур на скан; совпадение двух сканов поверх
-// shared_buffers 2 ГиБ — пять OOM-киллов PostgreSQL за ночь. Источник
-// деградации у каждой выборки закрыт своим способом (T-273):
-// retention — закрепление плана SET LOCAL у курсорного SELECT,
-// render-late — возврат к непиненной форме (закрепление T-271 само
-// разворачивало join от domains — вечная петля за дедлайном); гейт —
-// страховка от совпадения остаточно тяжёлых сканов (широкий
-// catch-up-круг retention, Sort среза): пока один цикл между
-// Acquire и Release, второй ждёт.
+// ScanGate — a uniqueness semaphore for a service's heavy background scans
+// (T-271): a buffered channel of capacity 1, shared by independent
+// background loops of one service (http-worker: retention drain ↔ the
+// render late re-publisher). Incident 08–09.11.2026: the degradation of
+// two cursor-selection plans to "seq scan + hash join + Sort" held ≈1 GiB
+// of working structures per scan; two scans coinciding on top of 2 GiB of
+// shared_buffers meant five PostgreSQL OOM kills overnight. Each
+// selection's degradation source is closed in its own way (T-273):
+// retention — pinning the plan with SET LOCAL on the cursor SELECT,
+// render-late — returning to the unpinned form (the T-271 pinning itself
+// unwound the join from domains — an endless loop past the deadline); the
+// gate is a guard against residual heavy scans coinciding (retention's
+// wide catch-up circle, the snapshot's Sort): while one loop is between
+// Acquire and Release, the other waits.
 //
-// Ёмкость 1 — «один тяжёлый скан на сервис»: точечные операторы (PK,
-// unnest-пачки) под гейт не ставятся и задержек не несут. nil-гейт —
-// no-op (изолированные сборки, юнит-тесты без шины), канал создаёт
-// сборка сервиса: make(db.ScanGate, 1).
+// Capacity 1 — "one heavy scan per service": point statements (PK,
+// unnest chunks) do not go under the gate and carry no delays. A nil gate
+// is a no-op (isolated builds, unit tests without the bus); the service
+// assembly creates the channel: make(db.ScanGate, 1).
 type ScanGate chan struct{}
 
-// Acquire занимает гейт; ожидание прерывается отменой ctx — остановка
-// сервиса не ждёт чужого фонового прохода. Парный Release — строго
-// после успешного Acquire (defer на месте вызова): Release без Acquire
-// завис бы на пустом канале.
+// Acquire takes the gate; the wait is interrupted by ctx cancellation — a
+// service shutdown does not wait for someone else's background pass. The
+// paired Release must come strictly after a successful Acquire (defer at
+// the call site): a Release without Acquire would block forever on an
+// empty channel.
 func (g ScanGate) Acquire(ctx context.Context) error {
 	if g == nil {
 		return nil
@@ -39,7 +40,7 @@ func (g ScanGate) Acquire(ctx context.Context) error {
 	}
 }
 
-// Release отпускает гейт; nil-гейт — no-op.
+// Release releases the gate; a nil gate is a no-op.
 func (g ScanGate) Release() {
 	if g == nil {
 		return

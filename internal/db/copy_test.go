@@ -1,6 +1,6 @@
-// Юнит-тесты хелперов COPY без БД: валидация аргументов, разбиение потока
-// на пачки, обработка ошибок источника и отмена контекста между пачками.
-// Реальное копирование — test/integration/db_test.go.
+// Unit tests of the COPY helpers without a DB: argument validation,
+// splitting the stream into chunks, source error handling and context
+// cancellation between chunks. Real copying — test/integration/db_test.go.
 package db
 
 import (
@@ -17,10 +17,10 @@ import (
 
 var testTable = pgx.Identifier{"public", "items"}
 
-// fakeCopier записывает размеры пачек, переданных в CopyFrom.
+// fakeCopier records the sizes of the chunks passed to CopyFrom.
 type fakeCopier struct {
 	batches []int
-	err     error // если задана — возвращается каждым вызовом CopyFrom
+	err     error // if set, returned by every CopyFrom call
 }
 
 func (f *fakeCopier) CopyFrom(_ context.Context, _ pgx.Identifier, _ []string, src pgx.CopyFromSource) (int64, error) {
@@ -47,11 +47,11 @@ func (f *fakeCopier) Exec(context.Context, string, ...any) (pgconn.CommandTag, e
 
 func (f *fakeCopier) Query(context.Context, string, ...any) (pgx.Rows, error) { return nil, nil }
 
-// rowsIter — итератор по готовым строкам с подсчётом вызовов.
+// rowsIter — an iterator over ready rows with call counting.
 type rowsIter struct {
 	rows    [][]any
 	nextIdx int
-	onNext  func(i int) // побочный эффект перед выдачей строки i (отмена и т.п.)
+	onNext  func(i int) // side effect before yielding row i (cancellation etc.)
 }
 
 func (it *rowsIter) next() ([]any, error) {
@@ -122,7 +122,7 @@ func TestCopyFromStream_Batching(t *testing.T) {
 	if n != 105 {
 		t.Errorf("скопировано %d, want 105", n)
 	}
-	// 10 полных пачок + хвост из 5 строк; память ограничена batchSize.
+	// 10 full chunks + a tail of 5 rows; memory is bounded by batchSize.
 	if strings.Join(ints(f.batches), ",") != "10,10,10,10,10,10,10,10,10,10,5" {
 		t.Errorf("пачки = %v, want 10×10 + 5", f.batches)
 	}
@@ -156,7 +156,7 @@ func TestCopyFromStream_SourceError(t *testing.T) {
 	f := &fakeCopier{}
 	boom := errors.New("источник сломался")
 	it := &rowsIter{rows: simpleRows(30)}
-	// Источник падает на строке 22, не дотянув до сброса третьей пачки.
+	// The source fails on row 22, short of the third chunk's flush.
 	next := func() ([]any, error) {
 		if it.nextIdx == 22 {
 			return nil, boom
@@ -181,7 +181,7 @@ func TestCopyFromStream_SourceError(t *testing.T) {
 
 func TestCopyFromStream_RowMismatch(t *testing.T) {
 	f := &fakeCopier{}
-	rows := [][]any{{1, 2, 3}, {1, 2}} // вторая строка короткая
+	rows := [][]any{{1, 2, 3}, {1, 2}} // the second row is short
 	n, err := CopyFromStream(context.Background(), f, testTable, []string{"a", "b", "c"}, 10, (&rowsIter{rows: rows}).next)
 	if err == nil || !strings.Contains(err.Error(), "строка 1") {
 		t.Errorf("err = %v, want ошибка про строку 1", err)
@@ -197,7 +197,7 @@ func TestCopyFromStream_CancelBetweenBatches(t *testing.T) {
 
 	it := &rowsIter{rows: simpleRows(100)}
 	it.onNext = func(i int) {
-		if i == 30 { // строка 31: пачки 1–3 (строки 0–29) уже закоммичены
+		if i == 30 { // row 31: chunks 1–3 (rows 0–29) are already committed
 			cancel()
 		}
 	}

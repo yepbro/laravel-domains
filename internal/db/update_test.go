@@ -1,7 +1,7 @@
-// Юнит-тесты конструктора пакетных UPDATE … FROM unnest(...): точный текст
-// SQL (ключи, SET из unnest, фиксированные выражения, охрана, RETURNING),
-// валидация параллельных массивов значений, пустая пачка, порядок
-// аргументов. Реальное выполнение — test/integration/db_test.go.
+// Unit tests of the batch UPDATE … FROM unnest(...) builder: the exact SQL
+// text (keys, SET from unnest, fixed expressions, guard, RETURNING),
+// validation of parallel value arrays, an empty chunk, argument order.
+// Real execution — test/integration/db_test.go.
 package db
 
 import (
@@ -16,11 +16,11 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
-// fakeExecer запоминает SQL и аргументы Exec.
+// fakeExecer remembers the SQL and arguments of Exec.
 type fakeExecer struct {
 	sql    string
 	args   []any
-	rows   int64 // RowsAffected для Exec
+	rows   int64 // RowsAffected for Exec
 	err    error
 	called bool
 }
@@ -41,8 +41,8 @@ func (f *fakeExecer) Exec(_ context.Context, sql string, args ...any) (pgconn.Co
 
 func (f *fakeExecer) Query(context.Context, string, ...any) (pgx.Rows, error) { return nil, nil }
 
-// schedulerUpdate — типовой запрос планировщика (ТЗ 5.3): перевод
-// выбранных доменов в queued с отметкой времени, только из pending.
+// schedulerUpdate — a typical scheduler query (spec 5.3): transitioning
+// the selected domains to queued with a timestamp, from pending only.
 func schedulerUpdate() *UpdateBuilder {
 	return Update("domains").
 		Key(Column{Name: "zone_id", Type: "int2"}).
@@ -85,9 +85,9 @@ func TestUpdate_SQLReturning(t *testing.T) {
 	}
 }
 
-// TestUpdate_MultipleWherePredicates — повторные Where накапливаются
-// (AND), а не перезаписывают друг друга: молчаливая потеря охраны
-// в пакетном UPDATE — порча данных.
+// TestUpdate_MultipleWherePredicates — repeated Where calls accumulate
+// (AND) instead of overwriting each other: silently losing a guard in a
+// batch UPDATE is data corruption.
 func TestUpdate_MultipleWherePredicates(t *testing.T) {
 	sql, _, err := Update("domains").
 		Key(Column{Name: "id", Type: "int8"}).
@@ -213,11 +213,11 @@ func TestUpdate_ExecArgsValidation(t *testing.T) {
 
 func TestUpdate_ExecReturningMismatch(t *testing.T) {
 	f := &fakeExecer{}
-	// Exec при заданном Returning — ошибка: строки результата потерялись бы.
+	// Exec with Returning set — an error: the result rows would be lost.
 	if _, err := schedulerUpdate().Returning("t.id").Exec(context.Background(), f, []any{1}, []any{1}, []any{1}); err == nil || !strings.Contains(err.Error(), "Query") {
 		t.Errorf("err = %v, want подсказка использовать Query", err)
 	}
-	// Query без Returning — ошибка.
+	// Query without Returning — an error.
 	if _, err := schedulerUpdate().Query(context.Background(), f, []any{1}, []any{1}, []any{1}); err == nil || !strings.Contains(err.Error(), "Returning") {
 		t.Errorf("err = %v, want подсказка задать Returning", err)
 	}

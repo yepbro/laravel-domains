@@ -9,16 +9,16 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// RowIter — источник строк для потокового COPY: каждый вызов возвращает
-// следующую строку (значения колонок по порядку columns) либо io.EOF в
-// конце. Другие ошибки прерывают копирование. Функция-источник позволяет
-// читать данные лениво (построчно из файла, из канала), не материализуя
-// их целиком — память определяется только размером пачки (ТЗ 3.5).
+// RowIter — a row source for streaming COPY: each call returns the next
+// row (column values in columns order) or io.EOF at the end. Other errors
+// interrupt the copy. The source function allows reading data lazily (line
+// by line from a file, from a channel) without materializing it entirely —
+// memory is bounded only by the chunk size (spec 3.5).
 type RowIter func() ([]any, error)
 
-// CopyFrom копирует готовую пачку строк одним вызовом COPY. Проверяет
-// соответствие строк списку колонок и оборачивает ошибку именем таблицы.
-// Пустая пачка — no-op без обращения к БД.
+// CopyFrom copies a ready chunk of rows with a single COPY call. Checks
+// rows against the column list and wraps the error with the table name.
+// An empty chunk is a no-op without touching the DB.
 func CopyFrom(ctx context.Context, pool DB, table pgx.Identifier, columns []string, rows [][]any) (int64, error) {
 	if len(columns) == 0 {
 		return 0, errors.New("db: COPY: список колонок пуст")
@@ -38,13 +38,14 @@ func CopyFrom(ctx context.Context, pool DB, table pgx.Identifier, columns []stri
 	return n, nil
 }
 
-// CopyFromStream копирует строки итератора в таблицу пачками по batchSize
-// строк: каждая пачка — отдельный вызов COPY, то есть отдельная транзакция.
-// Поэтому память ограничена batchSize (ТЗ 3.5), прогресс фиксируется в БД
-// пачками, а отмена контекста прерывает копирование до начала следующей
-// пачки — законченные пачки остаются в БД, и повтор безопасен при
-// идемпотентной записи (ТЗ 3.4). Возвращает суммарное число скопированных
-// строк (без строк пачки, на которой произошла ошибка).
+// CopyFromStream copies the iterator's rows into the table in chunks of
+// batchSize rows: each chunk is a separate COPY call, i.e. a separate
+// transaction. Memory is therefore bounded by batchSize (spec 3.5),
+// progress is committed to the DB in chunks, and context cancellation
+// interrupts the copy before the next chunk starts — completed chunks stay
+// in the DB, and a retry is safe with idempotent writes (spec 3.4).
+// Returns the total number of copied rows (excluding the rows of the chunk
+// that failed).
 func CopyFromStream(ctx context.Context, pool DB, table pgx.Identifier, columns []string, batchSize int, next RowIter) (int64, error) {
 	if len(columns) == 0 {
 		return 0, errors.New("db: COPY: список колонок пуст")

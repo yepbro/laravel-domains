@@ -1,8 +1,9 @@
-// Юнит-тесты обёртки ретрая 40P01 (T-268): распознавание SQLSTATE (сырой и
-// завёрнутый pgconn.PgError, чужие коды и ошибки — нет), границы
-// повторов (успех / дедлок-затем-успех / устойчивый дедлок / не-дедлок),
-// потолок Retries, потолок паузы, поведение хука повтора и отмена ctx.
-// Поведение против живой БД — интеграционные тесты (test/integration).
+// Unit tests of the 40P01 retry wrapper (T-268): SQLSTATE recognition
+// (raw and wrapped pgconn.PgError — yes; foreign codes and errors — no),
+// retry boundaries (success / deadlock-then-success / persistent deadlock
+// / non-deadlock), the Retries cap, the pause cap, retry hook behavior and
+// ctx cancellation. Behavior against a live DB — integration tests
+// (test/integration).
 package db
 
 import (
@@ -15,7 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
-// deadlockErr — литеральный 40P01, как его отдаёт pgx.
+// deadlockErr — a literal 40P01, as pgx returns it.
 func deadlockErr() error {
 	return &pgconn.PgError{Code: "40P01", Message: "deadlock detected"}
 }
@@ -44,7 +45,7 @@ func TestIsDeadlock(t *testing.T) {
 }
 
 func TestDeadlockRetryParams(t *testing.T) {
-	// Нулевые значения — дефолт, потолок Retries ужимается.
+	// Zero values — defaults; the Retries cap is clamped.
 	got := DeadlockRetry{}.withDefaults()
 	if got != DefaultDeadlockRetry {
 		t.Errorf("DeadlockRetry{} = %+v, want дефолт %+v", got, DefaultDeadlockRetry)
@@ -52,17 +53,17 @@ func TestDeadlockRetryParams(t *testing.T) {
 	if got := (DeadlockRetry{Retries: 9}).withDefaults(); got.Retries != MaxDeadlockRetries {
 		t.Errorf("Retries 9 = %d, want потолок %d", got.Retries, MaxDeadlockRetries)
 	}
-	// Потолок паузы: база часами, потолок миллисекундами — delay обязан
-	// упереться в потолок (иначе тест висел бы на паузе).
+	// Pause cap: a base of hours, a cap of milliseconds — delay must hit
+	// the cap (otherwise the test would hang on the pause).
 	d := DeadlockRetry{Base: time.Hour, Max: time.Millisecond}.withDefaults().delay()
 	if d != time.Millisecond {
 		t.Errorf("delay = %s, want потолок 1мс", d)
 	}
-	// Нулевая база — дефолт (нулевые значения заменяются).
+	// A zero base — the default (zero values are replaced).
 	if got := (DeadlockRetry{Base: 0}).withDefaults(); got.Base != DefaultDeadlockBase {
 		t.Errorf("Base 0 = %s, want дефолт %s", got.Base, DefaultDeadlockBase)
 	}
-	// Джиттер остаётся в [Base/2, Base].
+	// The jitter stays within [Base/2, Base].
 	for _, b := range []time.Duration{time.Millisecond, 50 * time.Millisecond, DefaultDeadlockBase} {
 		r := DeadlockRetry{Base: b, Max: time.Hour}.withDefaults()
 		for i := 0; i < 100; i++ {
@@ -91,7 +92,7 @@ func TestRetryDeadlock(t *testing.T) {
 		calls := 0
 		var attempts []int
 		err := RetryDeadlock(context.Background(),
-			DeadlockRetry{Base: time.Millisecond}, // пауза-минимум — тест не замечает сна
+			DeadlockRetry{Base: time.Millisecond}, // a minimal pause — the test does not notice the sleep
 			func(attempt int) { attempts = append(attempts, attempt) },
 			func() error {
 				calls++
@@ -164,7 +165,7 @@ func TestRetryDeadlock(t *testing.T) {
 			func(int) { hooks++ },
 			func() error {
 				calls++
-				cancel() // отмена пришла раньше повтора
+				cancel() // the cancellation arrived before the retry
 				return deadlockErr()
 			})
 		if !IsDeadlock(err) {

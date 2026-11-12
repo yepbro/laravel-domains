@@ -1,7 +1,7 @@
-// Юнит-тесты пула подключений без БД: сборка pgxpool.Config из Options
-// (дефолты, приоритет pool_size над DSN, метка application_name,
-// валидация), fail-fast Open на недоступном сервере, скрытие пароля в
-// ошибках.
+// Unit tests of the connection pool without a DB: assembling
+// pgxpool.Config from Options (defaults, pool_size priority over the DSN,
+// the application_name label, validation), fail-fast Open against an
+// unreachable server, password hiding in errors.
 package db
 
 import (
@@ -52,8 +52,9 @@ func TestBuildPoolConfig_Defaults(t *testing.T) {
 }
 
 func TestBuildPoolConfig_Overrides(t *testing.T) {
-	// pool_max_conns в DSN перекрывается pool_size: источник истины —
-	// конфигурация сервиса (ТЗ 5.10), а не строка подключения.
+	// pool_max_conns in the DSN is overridden by pool_size: the source of
+	// truth is the service configuration (spec 5.10), not the connection
+	// string.
 	dsn := "postgres://crawler:secret@127.0.0.1:5432/crawler?sslmode=disable&pool_max_conns=7&pool_max_conn_lifetime=1h"
 	cfg, err := buildPoolConfig(Options{
 		DSN:             dsn,
@@ -80,8 +81,9 @@ func TestBuildPoolConfig_Overrides(t *testing.T) {
 }
 
 func TestBuildPoolConfig_AppName(t *testing.T) {
-	// Метка сервиса: AppName задаёт application_name пула; явная метка
-	// в DSN важнее (T-177 — выбор оператора не перетирается).
+	// Service label: AppName sets the pool's application_name; an explicit
+	// label in the DSN wins (T-177 — the operator's choice is not
+	// overwritten).
 	cfg, err := buildPoolConfig(Options{DSN: testDSN, AppName: "monitor"})
 	if err != nil {
 		t.Fatal(err)
@@ -99,7 +101,7 @@ func TestBuildPoolConfig_AppName(t *testing.T) {
 		t.Errorf("application_name = %q, want ops-console (DSN важнее AppName)", got)
 	}
 
-	// Пустой AppName — параметр не задаётся вовсе.
+	// An empty AppName — the parameter is not set at all.
 	cfg, err = buildPoolConfig(Options{DSN: testDSN})
 	if err != nil {
 		t.Fatal(err)
@@ -113,7 +115,7 @@ func TestBuildPoolConfig_Validation(t *testing.T) {
 	cases := []struct {
 		name string
 		opts Options
-		want string // подстрока ожидаемой ошибки
+		want string // a substring of the expected error
 	}{
 		{"пустой DSN", Options{}, "пустой DSN"},
 		{"отрицательный pool_size", Options{DSN: testDSN, PoolSize: -1}, "вне диапазона"},
@@ -129,15 +131,15 @@ func TestBuildPoolConfig_Validation(t *testing.T) {
 		})
 	}
 
-	// Граница допустимого проходит.
+	// The boundary value passes.
 	if _, err := buildPoolConfig(Options{DSN: testDSN, PoolSize: MaxPoolSize}); err != nil {
 		t.Errorf("pool_size = %d должен быть допустим: %v", MaxPoolSize, err)
 	}
 }
 
-// TestLockTimeout_HookSQL — контракт хука LockTimeout (T-192): значение-
-// константа 30 с (инцидентный потолок) и текст SET в форме ms — валидной
-// для GUC-времени PostgreSQL при любой длительности.
+// TestLockTimeout_HookSQL — the LockTimeout hook contract (T-192): the
+// constant value of 30s (the incident cap) and the SET text in ms form,
+// valid for PostgreSQL GUC time at any duration.
 func TestLockTimeout_HookSQL(t *testing.T) {
 	if DefaultLockTimeout != 30*time.Second {
 		t.Errorf("DefaultLockTimeout = %s, want 30s (инцидентный потолок T-192)", DefaultLockTimeout)
@@ -145,8 +147,8 @@ func TestLockTimeout_HookSQL(t *testing.T) {
 	if got := fmt.Sprintf(lockTimeoutSQLFmt, DefaultLockTimeout.Milliseconds()); got != "SET lock_timeout = '30000ms'" {
 		t.Errorf("SET lock_timeout = %q, want \"SET lock_timeout = '30000ms'\"", got)
 	}
-	// Неположительная длительность — ошибка до обращения к соединению:
-	// fail-fast открытия пула, а не тихое отключение потолка.
+	// A non-positive duration is an error before touching the connection:
+	// a fail-fast pool open, not a silent disabling of the cap.
 	for _, d := range []time.Duration{0, -time.Second} {
 		if err := LockTimeout(d)(context.Background(), nil); err == nil {
 			t.Errorf("LockTimeout(%s): want ошибку неположительной длительности", d)
@@ -154,9 +156,10 @@ func TestLockTimeout_HookSQL(t *testing.T) {
 	}
 }
 
-// TestJoinHooks — композиция хуков (T-192): порядок сохраняется, nil
-// пропускается, сбой прерывает цепочку и возвращается как есть (scheduler:
-// NoParallelGather + LockTimeout одним Options.DBAfterConnect).
+// TestJoinHooks — hook composition (T-192): the order is preserved, nil is
+// skipped, a failure interrupts the chain and is returned as is
+// (scheduler: NoParallelGather + LockTimeout through one
+// Options.DBAfterConnect).
 func TestJoinHooks(t *testing.T) {
 	var calls []string
 	hook := func(name string, ret error) AfterConnectFunc {
@@ -184,8 +187,9 @@ func TestJoinHooks(t *testing.T) {
 }
 
 func TestOpen_UnreachableFailFast(t *testing.T) {
-	// Порт без слушателя: Open обязан упасть быстро с понятной ошибкой,
-	// не оставляя пул (соединение с секретом не попадает в сообщение).
+	// A port with no listener: Open must fail fast with a clear error,
+	// without leaving the pool behind (the connection with the secret does
+	// not reach the message).
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_, err := Open(ctx, Options{
@@ -220,7 +224,7 @@ func TestRedactDSN(t *testing.T) {
 		{
 			"sslpassword в query-строке, остальные параметры целы",
 			"postgres://crawler@127.0.0.1:5432/crawler?sslmode=disable&sslpassword=k&pool_max_conns=4",
-			// Encode() сортирует параметры по имени
+			// Encode() sorts the parameters by name
 			"postgres://crawler@127.0.0.1:5432/crawler?pool_max_conns=4&sslmode=disable&sslpassword=redacted",
 		},
 	}
@@ -234,5 +238,5 @@ func TestRedactDSN(t *testing.T) {
 	}
 }
 
-// Ошибка недоступного сервера — обёрнута, но первопричина доступна через
-// errors.Is/errors.As (проверяется в TestOpen_UnreachableFailFast).
+// The unreachable-server error is wrapped, but the root cause is reachable
+// through errors.Is/errors.As (checked in TestOpen_UnreachableFailFast).

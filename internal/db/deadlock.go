@@ -1,18 +1,19 @@
-// Прикладной ретрай тупика PostgreSQL (T-268). Дедлок 40P01 — штатный
-// исход конкурентных транзакций: сервер обнаруживает цикл блокировок сам
-// (deadlock_timeout, 1 с), жертва откатывается — данные не повреждаются,
-// операцию можно повторить. Структурный инвариант порядка блокировок
-// счётчиков (docs/schema.md, раздел crawler_counters; T-267) убирает
-// известные циклы, но не гарантирует отсутствия новых: обёртка поглощает
-// остаточные и будущие дедлоки в горячих точках конвейера, не отправляя
-// задачу в ределивери (каждый повтор доставки q:http — полный
-// HTTP-эпизод; инцидент 07.11 — runbooks.md §2.8).
+// Application-level retry for PostgreSQL deadlocks (T-268). A 40P01
+// deadlock is a normal outcome of concurrent transactions: the server
+// detects the lock cycle itself (deadlock_timeout, 1s), the victim rolls
+// back — data is not corrupted and the operation can be retried. The
+// structural lock-ordering invariant of counter updates (docs/schema.md,
+// crawler_counters section; T-267) removes the known cycles but does not
+// guarantee no new ones: the wrapper absorbs residual and future deadlocks
+// in pipeline hot spots without sending the task to redelivery (each
+// q:http delivery retry is a full HTTP episode; the 07.11 incident —
+// runbooks.md §2.8).
 //
-// Повторяются только идемпотентные операции (ТЗ 3.4): транзакция записи
-// результата http-worker (охраны/перезапись), autocommit-операторы записи
-// DNS-эпизода (охраны done/deleted), транзакция решения ретрая
-// планировщика (охраны обоих UPDATE). Диапазон паузы — джиттером, чтобы
-// пачки, столкнувшиеся одновременно, не повторялись синхронно.
+// Only idempotent operations are retried (spec 3.4): the http-worker
+// result-write transaction (guards/overwrite), the autocommit write
+// statements of a DNS episode (done/deleted guards), and the scheduler
+// decision-transaction retry (both UPDATE guards). The pause range is
+// jittered so chunks colliding at the same time do not retry in sync.
 package db
 
 import (
@@ -24,57 +25,58 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
-// SQLSTATE 40P01 — deadlock_detected (коды — литералами, стиль
-// resultUpdateStatusSQL T-039; pgerrcode не тянется ради одной константы).
+// SQLSTATE 40P01 — deadlock_detected (codes as literals, the
+// resultUpdateStatusSQL style of T-039; pgerrcode is not pulled in for a
+// single constant).
 const sqlstateDeadlock = "40P01"
 
-// Параметры повтора по умолчанию (T-268).
+// Default retry parameters (T-268).
 const (
-	// DefaultDeadlockRetries — повторные выполнения после первой неудачи:
-	// жертва дедлока уже прождала deadlock_timeout (1 с), повтор почти
-	// всегда успевает — двух хватает с запасом.
+	// DefaultDeadlockRetries — re-executions after the first failure: the
+	// deadlock victim has already waited out deadlock_timeout (1s), so a
+	// retry almost always makes it — two are enough with margin.
 	DefaultDeadlockRetries = 2
 
-	// DefaultDeadlockBase — база паузы повтора: миллисекунды против
-	// секунд обнаружения дедлока — конкурирующая транзакция успевает
-	// зафиксироваться и освободить строки.
+	// DefaultDeadlockBase — the base of the retry pause: milliseconds
+	// against the seconds of deadlock detection — the competing
+	// transaction has time to commit and release the rows.
 	DefaultDeadlockBase = 50 * time.Millisecond
 
-	// DefaultDeadlockMax — потолок паузы одного повтора: даже при
-	// длинном приступе дедлоков добавка к Latency транзакции — доли
-	// секунды, конвейер не замирает.
+	// DefaultDeadlockMax — the cap on a single retry's pause: even during
+	// a long deadlock bout the added transaction latency is fractions of
+	// a second, and the pipeline does not stall.
 	DefaultDeadlockMax = 250 * time.Millisecond
 )
 
-// MaxDeadlockRetries — жёсткий потолок повторов обёртки: ретрай —
-// страховка остаточных случаев, а не лечение постоянного цикла
-// блокировок (устойчивый 40P01 — инверсия порядка где-то в коде,
-// runbooks.md §2.8: чинить причину, а не глушить повторами).
+// MaxDeadlockRetries — a hard cap on the wrapper's retries: the retry is a
+// guard for residual cases, not a cure for a permanent lock cycle (a
+// persistent 40P01 means a lock-ordering inversion somewhere in the code,
+// runbooks.md §2.8: fix the cause, do not swallow it with retries).
 const MaxDeadlockRetries = 2
 
-// DeadlockRetry — параметры обёртки повтора; нулевые значения заменяются
-// дефолтами, Retries сверх MaxDeadlockRetries ужимается до потолка
-// (withDefaults). Тесты ускоряют паузу явным малым Base.
+// DeadlockRetry — retry wrapper parameters; zero values are replaced with
+// defaults, and Retries above MaxDeadlockRetries is clamped to the cap
+// (withDefaults). Tests speed up the pause with an explicitly small Base.
 type DeadlockRetry struct {
-	// Retries — повторные выполнения после первой неудачи (0 — дефолт;
-	// > MaxDeadlockRetries — потолок).
+	// Retries — re-executions after the first failure (0 — default;
+	// > MaxDeadlockRetries — clamped to the cap).
 	Retries int
-	// Base — база паузы перед повтором; фактическая пауза — джиттер
-	// [Base/2, Base].
+	// Base — the base pause before a retry; the actual pause is jittered
+	// within [Base/2, Base].
 	Base time.Duration
-	// Max — потолок паузы одного повтора.
+	// Max — the cap on a single retry's pause.
 	Max time.Duration
 }
 
-// DefaultDeadlockRetry — параметры горячих точек конвейера (T-268):
-// до двух повторов с паузой десятки миллисекунд.
+// DefaultDeadlockRetry — parameters for pipeline hot spots (T-268): up to
+// two retries with pauses of tens of milliseconds.
 var DefaultDeadlockRetry = DeadlockRetry{
 	Retries: DefaultDeadlockRetries,
 	Base:    DefaultDeadlockBase,
 	Max:     DefaultDeadlockMax,
 }
 
-// withDefaults нормализует параметры.
+// withDefaults normalizes the parameters.
 func (r DeadlockRetry) withDefaults() DeadlockRetry {
 	if r.Retries <= 0 {
 		r.Retries = DefaultDeadlockRetries
@@ -91,8 +93,8 @@ func (r DeadlockRetry) withDefaults() DeadlockRetry {
 	return r
 }
 
-// delay — пауза перед очередным повтором: джиттер [Base/2, Base],
-// потолок Max.
+// delay — the pause before the next retry: jitter [Base/2, Base],
+// cap Max.
 func (r DeadlockRetry) delay() time.Duration {
 	half := r.Base / 2
 	d := half + time.Duration(rand.Int63n(int64(half)+1))
@@ -102,23 +104,23 @@ func (r DeadlockRetry) delay() time.Duration {
 	return d
 }
 
-// IsDeadlock сообщает, является ли ошибка дедлоком PostgreSQL
-// (SQLSTATE 40P01): ошибки проводятся через errors.As — распознаётся и
-// завёрнутая fmt.Errorf("%w") вызывающими слоями.
+// IsDeadlock reports whether the error is a PostgreSQL deadlock
+// (SQLSTATE 40P01): errors go through errors.As — an error wrapped by
+// callers with fmt.Errorf("%w") is recognized too.
 func IsDeadlock(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == sqlstateDeadlock
 }
 
-// RetryDeadlock выполняет fn и повторяет её при дедлоке 40P01: до
-// r.Retries повторов (умолчание — DefaultDeadlockRetry), перед каждым —
-// пауза с джиттером и потолком, прерываемая отменой ctx. onRetry (может
-// быть nil) вызывается перед каждым фактическим повтором — точка метрики
-// crawler_db_deadlock_retried_total (T-268). Иные ошибки возвращаются
-// сразу; исчерпание повторов возвращает последнюю ошибку наружу —
-// вызывающий решает судьбу доставки (at-least-once, ТЗ 3.4). Отмена ctx
-// до повтора возвращает исходную ошибку дедлока: попытка прервана
-// остановкой, а не исчерпана.
+// RetryDeadlock runs fn and retries it on a 40P01 deadlock: up to
+// r.Retries retries (default — DefaultDeadlockRetry), each preceded by a
+// jittered, capped pause interruptible by ctx cancellation. onRetry (may
+// be nil) is called before each actual retry — the metric point of
+// crawler_db_deadlock_retried_total (T-268). Other errors are returned
+// immediately; exhausting the retries returns the last error to the
+// caller, which decides the delivery fate (at-least-once, spec 3.4).
+// Cancelling ctx before a retry returns the original deadlock error: the
+// attempt was interrupted by a shutdown, not exhausted.
 func RetryDeadlock(ctx context.Context, r DeadlockRetry, onRetry func(attempt int), fn func() error) error {
 	if fn == nil {
 		return errors.New("db: ретрай 40P01: повторяемая функция не задана")

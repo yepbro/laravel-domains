@@ -1,26 +1,26 @@
-// Package db — слой доступа к PostgreSQL: пул подключений pgx и хелперы
-// массовой записи (ТЗ 6.3, 3.5 основного ТЗ).
+// Package db — the PostgreSQL access layer: a pgx connection pool and
+// bulk-write helpers (spec 6.3, 3.5 of the main spec).
 //
-// Пул. Open создаёт pgxpool по параметрам секции postgres конфигурации
-// (internal/config). Лимит pool_size задаётся НА СЕРВИС, а бюджет ТЗ 6.3
-// (≤ 20–50 соединений) — суммарный на все сервисы: при восьми сервисах
-// задавайте 4–6 на сервис; соединения открываются лениво, простой не
-// держит соединений.
+// Pool. Open creates a pgxpool from the parameters of the postgres config
+// section (internal/config). The pool_size limit is set PER SERVICE, while
+// the spec 6.3 budget (≤ 20–50 connections) is shared across all services:
+// with eight services set 4–6 per service; connections open lazily, and
+// idle time holds no connections.
 //
-// Массовая запись (принципы ТЗ 6: «запись пачками COPY, UPDATE … FROM
-// unnest(...)», потоковость ТЗ 3.5):
+// Bulk write (principles of spec 6: "write in COPY chunks, UPDATE … FROM
+// unnest(...)", streaming per spec 3.5):
 //
-//   - CopyFrom / CopyFromStream — COPY в таблицу; потоковый вариант читает
-//     строки из итератора пачками ограниченного размера, память не зависит
-//     от объёма данных;
-//   - Update — типизированный конструктор пакетного UPDATE … FROM
-//     unnest($n::type[], …): массив значений каждой колонки — один
-//     параметр запроса, поэтому число строк пачки не упирается в лимит
-//     протокола (65535 параметров).
+//   - CopyFrom / CopyFromStream — COPY into a table; the streaming variant
+//     reads rows from the iterator in chunks of limited size, memory does
+//     not depend on the data volume;
+//   - Update — a typed constructor of a batch UPDATE … FROM
+//     unnest($n::type[], …): each column's value array is a single query
+//     parameter, so the chunk row count does not hit the protocol limit
+//     (65535 parameters).
 //
-// Все хелперы принимают контекст: отмена прерывает текущую операцию,
-// а потоковый COPY — между пачками (законченные пачки остаются в БД;
-// повтор безопасен при идемпотентной записи, ТЗ 3.4).
+// All helpers take a context: cancellation interrupts the current
+// operation, and a streaming COPY — between chunks (completed chunks stay
+// in the DB; a retry is safe with idempotent writes, spec 3.4).
 package db
 
 import (
@@ -30,9 +30,10 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
-// DB — часть API pgx-пула, необходимая хелперам пакета; *pgxpool.Pool
-// удовлетворяет интерфейсу. Выделен, чтобы юнит-тесты проверяли сборку
-// запросов и пачек без БД (реальное поведение — в test/integration).
+// DB — the part of the pgx pool API needed by the package helpers;
+// *pgxpool.Pool satisfies the interface. Extracted so unit tests can check
+// query and chunk assembly without a DB (real behavior lives in
+// test/integration).
 type DB interface {
 	CopyFrom(ctx context.Context, tableName pgx.Identifier, columnNames []string, rowSrc pgx.CopyFromSource) (int64, error)
 	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
