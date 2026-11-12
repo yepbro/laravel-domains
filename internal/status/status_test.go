@@ -885,7 +885,7 @@ func TestFetchLaravelStatsDegradations(t *testing.T) {
 	// An unreadable row of the recent finds.
 	pool = seeded(map[string]statusGlitch{laravelRecentSQL: {badRow: true}})
 	_, err = FetchLaravelStats(ctx, pool)
-	if err == nil || !strings.Contains(err.Error(), "status: laravel: последние: чтение:") {
+	if err == nil || !strings.Contains(err.Error(), "status: laravel: latest: reading:") {
 		t.Fatalf("нечитаемая строка последних: ошибка = %v, want «чтение»", err)
 	}
 
