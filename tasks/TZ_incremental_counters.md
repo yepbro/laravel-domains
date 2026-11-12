@@ -1,139 +1,139 @@
-# Техническое задание: инкрементальные счётчики конвейера Domain Crawler
+# Technical Specification: Incremental Counters of the Domain Crawler Pipeline
 
-Версия: 1.0 (дополнение к основному ТЗ [`TZ_domain_crawler.md`](./TZ_domain_crawler.md);
-оформлено по итогам анализа агрегатных запросов 2026-10-24 — реализация
-«системной альтернативы», заявленной постановкой T-161: *«инкрементальные
-счётчики зон на переходах статусов (отдельная волна)»*)
+Version: 1.0 (a supplement to the main spec [`TZ_domain_crawler.md`](./TZ_domain_crawler.md);
+prepared based on the analysis of the aggregate queries of 2026-10-24 — the implementation
+of the "system alternative" declared by the T-161 statement: *"incremental
+zone counters on status transitions (a separate wave)"*)
 
 ---
 
-## 1. Цель и общее описание
+## 1. Purpose and overview
 
-Убрать полные проходы большой таблицы `domains` (47 млн строк, замер §12
-`docs/load-measurements.md`) из путей чтения: счётчики состояний
-конвейера поддерживаются **инкрементами/декрементами в тех же
-транзакциях, что и переходы**, а точность восстанавливается периодической
-**реконсиляцией** — авторитетным пересчётом агрегатом. Управление
-пересчётом и сверкой — консольной командой `crawlerctl counters`.
+Remove the full passes over the large `domains` table (47M rows, the measurement of §12
+of `docs/load-measurements.md`) from the read paths: the pipeline state
+counters are maintained by **increments/decrements in the same
+transactions as the transitions**, and accuracy is restored by a periodic
+**reconciliation** — an authoritative recount by an aggregate. The recount and
+verification are managed by the `crawlerctl counters` console command.
 
-### 1.1. сегодняшнее состояние (что заменяем)
+### 1.1. Current state (what is being replaced)
 
-| Потребитель | Проход | Сегодня |
+| Consumer | Pass | Today |
 |---|---|---|
-| `internal/status` `zoneStatsSQL` (crawlerctl status, дашборд §5.1) | `zones LEFT JOIN domains` + `count FILTER ×3 GROUP BY z.id` | полный проход, дашборд смягчён TTL-кэшом 60 с (T-161) |
-| `internal/status` `domainStatusSQL` (дашборд §5.5) | `GROUP BY status` | полный проход, кэш T-161 |
-| `internal/status` `laravelTotalsSQL` (дашборд §5.6) | `count(*)` по `laravel_domains` | seq scan; окно 24 ч — по индексу T-120 |
-| `internal/scheduler` `backlogSQL` (T-077, gauge backlog) | `GROUP BY check_state` | 5 мин, 17+ с на 47 млн |
-| `internal/monitor` `historyStatsSQL` (T-118) | `count FILTER` по `laravel_history` | 1 ч, seq scan |
-| `internal/monitor` `zoneStatsSQL` (T-078/T-120) | `UPDATE zones FROM (агрегат)` | 5 мин — остаётся основой реконсиляции |
+| `internal/status` `zoneStatsSQL` (crawlerctl status, the dashboard §5.1) | `zones LEFT JOIN domains` + `count FILTER ×3 GROUP BY z.id` | a full pass, the dashboard mitigated by the 60 s TTL cache (T-161) |
+| `internal/status` `domainStatusSQL` (the dashboard §5.5) | `GROUP BY status` | a full pass, the T-161 cache |
+| `internal/status` `laravelTotalsSQL` (the dashboard §5.6) | `count(*)` over `laravel_domains` | a seq scan; the 24 h window — via the T-120 index |
+| `internal/scheduler` `backlogSQL` (T-077, the backlog gauge) | `GROUP BY check_state` | 5 min, 17+ s per 47M |
+| `internal/monitor` `historyStatsSQL` (T-118) | `count FILTER` over `laravel_history` | 1 h, a seq scan |
+| `internal/monitor` `zoneStatsSQL` (T-078/T-120) | `UPDATE zones FROM (aggregate)` | 5 min — remains the basis of the reconciliation |
 
-Замер §12: эти проходы вместе — большая часть CPU postgres (177 %).
-T-161 уже снял остроту (интервалы, single-flight, кэш); настоящая волна
-убирает сами проходы из путей чтения.
+The §12 measurement: these passes together are the bulk of the postgres CPU (177%).
+T-161 already removed the acuteness (intervals, single-flight, the cache); this wave
+removes the passes from the read paths altogether.
 
-### 1.2. целевое состояние
+### 1.2. Target state
 
-1. Читатели (статус-пакет, backlog-цикл, дашборд) читают только
-   материализованные счётчики: справочник `zones` (тысячи строк) и
-   таблицу `pipeline_counters` (десятки строк).
-2. Единственный полный проход `domains` в стационаре — реконсиляция
-   (один совмещённый проход раз в `monitor.zone_stats_interval`,
-   по умолчанию 5 мин).
-3. Дрейф инкрементов (расхождение счётчика с агрегатом) — наблюдаемая
-   величина: метрика + Warn; восстановление — сам реконсиляционный проход.
-4. Redis для счётчиков не используется (обоснование — §13.1).
+1. The readers (the status package, the backlog loop, the dashboard) read only
+   the materialized counters: the `zones` reference table (thousands of rows) and
+   the `pipeline_counters` table (dozens of rows).
+2. The only full `domains` pass in steady state is the reconciliation
+   (one combined pass per `monitor.zone_stats_interval`,
+   5 min by default).
+3. Increment drift (a counter deviating from the aggregate) is an observable
+   quantity: a metric + a Warn; the recovery — the reconciliation pass itself.
+4. Redis is not used for the counters (the rationale — §13.1).
 
 ---
 
-## 2. Термины
+## 2. Terms
 
-| Термин | Значение |
+| Term | Meaning |
 |---|---|
-| ТЗ | Основное ТЗ проекта (`TZ_domain_crawler.md`), если не указано иное |
-| ТЗИ | Настоящее ТЗ |
-| Инкремент | `UPDATE … SET v = v ± n` в транзакции перехода состояния |
-| Реконсиляция | авторитетный пересчёт счётчика агрегатом (`UPDATE … FROM (GROUP BY)`), восстанавливает значение целиком |
-| Дрейф | \|счётчик до реконсиляции − агрегат\| > 0 — признак пропущенного перехода или ручного SQL мимо кода |
-| Базовое множество | живые домены: `status <> deleted` (§13.1 основного ТЗ) |
-| Переход | изменение `domains.check_state` / `domains.status` / `domains.flags` (бит render_pending) |
+| Spec | The project's main spec (`TZ_domain_crawler.md`), unless stated otherwise |
+| This spec | The present specification |
+| Increment | `UPDATE … SET v = v ± n` in the transition transaction |
+| Reconciliation | an authoritative recount of a counter by an aggregate (`UPDATE … FROM (GROUP BY)`), restores the value wholesale |
+| Drift | \|the counter before the reconciliation − the aggregate\| > 0 — a sign of a missed transition or manual SQL bypassing the code |
+| Base set | live domains: `status <> deleted` (§13.1 of the main spec) |
+| Transition | a change of `domains.check_state` / `domains.status` / `domains.flags` (the render_pending bit) |
 
 ---
 
-## 3. Ограничения и рамки
+## 3. Constraints and scope
 
-### 3.1. Рамки (что не входит)
+### 3.1. Scope (what is not included)
 
-1. **Окна темпа остаются живыми запросами**: `throughputSQL`
-   (`last_checked_at = current_date`, часовые окна `subdomain_results`),
-   `laravelTotalsSQL` FILTER 24 ч, `last24hSQL` лендинга, `dnsShareSQL`
-   алертов — их обслуживают индексы окон T-171/T-118, цена пропорциональна
-   окну, а не таблице. Инкрементирование окон потребовало бы ротации
-   бакетов — не окупается (§13.7).
-2. **`nearStatsSQL` (серая зона T-115) не инкрементируется**: диапазон
-   score переписывается reanalyze при смене правил — принадлежность
-   находки диапазону не сохраняется на переходах. Остаётся периодическим
-   проходом (1 ч).
-3. Статус-распределение `domains.status` не инкрементируется на всех
-   переходах (§13.3): поддерживается реконсиляцией в её проходе —
-   бесплатно к существующему скану (те же FILTER-колонки).
-4. История точек (Prometheus) не меняется: существующие gauge сохраняют
-   имена и семантику.
+1. **The throughput windows remain live queries**: `throughputSQL`
+   (`last_checked_at = current_date`, the hourly windows of `subdomain_results`),
+   the 24 h `laravelTotalsSQL` FILTER, the landing's `last24hSQL`, the alerts'
+   `dnsShareSQL` — the T-171/T-118 window indexes serve them, the cost is proportional
+   to the window, not the table. Incrementing the windows would require bucket
+   rotation — it does not pay off (§13.7).
+2. **`nearStatsSQL` (the gray zone of T-115) is not incremented**: the score
+   range is rewritten by reanalyze when the rules change — a finding's membership
+   in the range is not preserved across transitions. It remains a periodic
+   pass (1 h).
+3. The status distribution of `domains.status` is not incremented on all
+   transitions (§13.3): it is maintained by the reconciliation within its pass —
+   at no extra cost to the existing scan (the same FILTER columns).
+4. The point history (Prometheus) does not change: the existing gauges keep
+   their names and semantics.
 
-### 3.2. Технические ограничения
+### 3.2. Technical constraints
 
-1. PostgreSQL 16: `RETURNING OLD.*` (появился в PG 18) недоступен —
-   старые значения строк добываются предикатами операторов и
+1. PostgreSQL 16: `RETURNING OLD.*` (introduced in PG 18) is unavailable —
+   old row values are obtained by statement predicates and
    `SELECT … FOR UPDATE` (§6).
-2. Новых зависимостей нет (go.mod не меняется), новых сервисов нет.
-3. Все инкременты выполняются в **уже существующих транзакциях**
-   переходов: сбой/откат транзакции откатывает и переход, и дельты —
-   отдельная согласованность не нужна.
-4. Миграции — чистый SQL, без вызовов кода (стиль 000001–000014).
+2. No new dependencies (go.mod is unchanged), no new services.
+3. All increments run in the **already existing** transition
+   transactions: a transaction failure/rollback rolls back both the transition and the deltas —
+   no separate consistency is needed.
+4. The migrations are pure SQL, without code calls (the style of 000001–000014).
 
 ---
 
-## 4. Номенклатура счётчиков и семантика
+## 4. Counter nomenclature and semantics
 
-### 4.1. Колонки `zones` (живое распределение состояний по зонам)
+### 4.1. The `zones` columns (the live per-zone state distribution)
 
-Существующие `domains_total`, `domains_checked`, `domains_laravel`
-(T-078/T-120) дополняются:
+The existing `domains_total`, `domains_checked`, `domains_laravel`
+(T-078/T-120) are supplemented with:
 
-| Колонка | Семантика (базовое множество — `status <> deleted`) |
+| Column | Semantics (the base set is `status <> deleted`) |
 |---|---|
-| `domains_pending` | `check_state = pending` — ждёт выборки планировщиком |
-| `domains_queued` | `check_state = queued` — в работе, действует lease |
+| `domains_pending` | `check_state = pending` — waiting to be selected by the scheduler |
+| `domains_queued` | `check_state = queued` — in progress, a lease is active |
 
-`domains_checked` остаётся счётчиком `check_state = done` (переименование
-не вводится — колонку читают лендинг, дашборд, crawlerctl, партиционирование).
+`domains_checked` remains the counter of `check_state = done` (no
+renaming is introduced — the column is read by the landing, the dashboard, crawlerctl, partitioning).
 
-**Унификация базового множества (§13.4):** все колонки зон считаются по
-`status <> deleted`, как у реконсиляции T-078. Сегодняшний живой
-`zoneStatsSQL` считает `pending` без deleted, но `queued`/`done` — без
-фильтра статуса (удалённый с зависшей арендой попадал в `queued`).
-После переключения читателей на счётчики `queued`/`done` исключают
-deleted — унификация в пользу семантики реконсиляции: удалённый домен
-не является ни работой, ни прогрессом.
+**Base set unification (§13.4):** all zone columns are counted over
+`status <> deleted`, as in the T-078 reconciliation. Today's live
+`zoneStatsSQL` counts `pending` without deleted, but `queued`/`done` — without
+a status filter (a deleted domain with a hung lease got into `queued`).
+After the readers switch to the counters, `queued`/`done` exclude
+deleted — unification in favor of the reconciliation semantics: a deleted domain
+is neither work nor progress.
 
-### 4.2. Таблица `pipeline_counters` (глобальные скаляры)
+### 4.2. The `pipeline_counters` table (global scalars)
 
-| `name` | Семантика |
+| `name` | Semantics |
 |---|---|
-| `status_<имя>` по `model.Statuses` | число доменов с данным статусом — **все** строки, включая deleted (легенда полная, как у `FetchDomainStatuses`); источником пишет реконсиляция (§7) |
-| `laravel_appeared_total` | появления `laravel_history` (кумулятив, монотонный) |
-| `laravel_lost_total` | исчезновения `laravel_history` (кумулятив, монотонный) |
-| `render_pending` | домены с битом `flags.render_pending` (живые) — закрывает потребность T-175 в счётчике рендер-долга |
+| `status_<name>` per `model.Statuses` | the number of domains with the given status — **all** rows, including deleted (the legend is complete, as with `FetchDomainStatuses`); written by the reconciliation as the source of truth (§7) |
+| `laravel_appeared_total` | appearances in `laravel_history` (cumulative, monotonic) |
+| `laravel_lost_total` | disappearances from `laravel_history` (cumulative, monotonic) |
+| `render_pending` | domains with the `flags.render_pending` bit (live) — closes the T-175 need for a render-debt counter |
 
-### 4.3. Выводимые, а не хранимые величины
+### 4.3. Derived, not stored, quantities
 
-Глобальные pending/queued/done = `sum(zones.domains_pending/…)` по всем
-зонам; `laravel_total` = `sum(zones.domains_laravel)` (так лендинг уже
-читает). Отдельных строк `check_state_*` в `pipeline_counters` не заводим —
-меньше строк и меньше инкрементов.
+The global pending/queued/done = `sum(zones.domains_pending/…)` over all
+zones; `laravel_total` = `sum(zones.domains_laravel)` (this is how the landing
+already reads it). No separate `check_state_*` rows are created in
+`pipeline_counters` — fewer rows and fewer increments.
 
 ---
 
-## 5. Схема (миграция счётчиков)
+## 5. Schema (the counters migration)
 
 ```sql
 ALTER TABLE zones
@@ -147,327 +147,324 @@ CREATE TABLE pipeline_counters (
 );
 ```
 
-COMMENT на колонки/таблицу — по образцу 000012 (владелец записи —
-инкременты переходов + реконсиляция monitor, читатели — read-only).
+The COMMENT on the columns/table — per the 000012 pattern (the record's owner is
+the transition increments + the monitor reconciliation, the readers are read-only).
 
-**Наполнение при миграции** — прецедент 000012 (`domains_laravel`):
-`DEFAULT 0` + первый проход реконсиляции сразу при старте monitor
-(стартовый проход цикла уже так устроен). Между миграцией и первым
-проходом (секунды — monitor стартует вместе со стеком) читатели видят
-нули; строки `pipeline_counters` (`status_*`, кумулятивы, render_pending)
-создаёт первая реконсиляция upsert'ом. Отдельного backfill-SQL в миграции
-не пишем (дубль текста агрегата миграция/код — источник расхождений).
+**Population at migration time** — the 000012 precedent (`domains_laravel`):
+`DEFAULT 0` + the first reconciliation pass right at monitor startup
+(the loop's startup pass is already built that way). Between the migration and the first
+pass (seconds — monitor starts together with the stack) readers see
+zeros; the `pipeline_counters` rows (`status_*`, the cumulatives, render_pending)
+are created by the first reconciliation with an upsert. No separate backfill SQL is written in the migration
+(duplicating the aggregate text between the migration and the code is a source of discrepancies).
 
-Миграция `down` — DROP COLUMN ×2 + DROP TABLE.
+The migration `down` — DROP COLUMN ×2 + DROP TABLE.
 
 ---
 
-## 6. Инкременты на переходах
+## 6. Increments on transitions
 
-### 6.1. Принципы
+### 6.1. Principles
 
-1. Дельта выполняется в **той же транзакции**, что и переход, — вторым
-   оператором/CTЕ. Батчевые переходы обновляют зоны одним оператором
-   `UPDATE zones … FROM (VALUES …)` / CTE — стиль `db.Update` (T-007),
+1. The delta runs in **the same transaction** as the transition — as a second
+   statement/CTE. Batch transitions update the zones with a single `UPDATE zones … FROM (VALUES …)` statement / CTE — the style of `db.Update` (T-007),
    `crawlerctl manage` (max(id)+1), `recheck`.
-2. **Старое состояние добывается одним из способов** (PG 16 без
+2. **The old state is obtained in one of the ways** (PG 16 without
    `RETURNING OLD`, §3.2):
-   - **предикат оператора пинирует** старое состояние (`WHERE
-     check_state = …`) — дельта считается по числу переведённых строк
+   - **the statement predicate pins** the old state (`WHERE
+     check_state = …`) — the delta is computed from the number of moved rows
      (`RETURNING zone_id` → GROUP BY);
-   - **оператор не меняет колонку** (`apply_delete` не трогает
-     `check_state`) — `RETURNING` возвращает текущее (= старое) значение;
-   - **ни то, ни другое** (`httpworker/record.go`) — точечный
-     `SELECT status, check_state … FOR UPDATE` перед UPDATE (§6.4).
-3. Инкремент выполняется только при `RowsAffected > 0` соответствующего
-   оператора (дубль-доставка, конкурентное снятие бита — без дельты).
-4. Захваченные из БД счётчики (`greatest(0, …)`) не применяются:
-   отрицательное значение — видимый дрейф, чинится реконсиляцией, а не
-   маскируется.
+   - **the statement does not change the column** (`apply_delete` does not touch
+     `check_state`) — `RETURNING` returns the current (= old) value;
+   - **neither** (`httpworker/record.go`) — a point
+     `SELECT status, check_state … FOR UPDATE` before the UPDATE (§6.4).
+3. The increment runs only when the corresponding statement reports `RowsAffected > 0`
+   (duplicate delivery, a concurrently cleared bit — no delta).
+4. Clamping to the DB values (`greatest(0, …)`) is not applied:
+   a negative value is a visible drift, fixed by the reconciliation, not
+   masked.
 
-### 6.2. Батчевые переходы планировщика и ingest
+### 6.2. Scheduler and ingest batch transitions
 
-| Переход | Владелец | Дельты зон (по `RETURNING zone_id` GROUP BY) |
+| Transition | Owner | Zone deltas (per `RETURNING zone_id` GROUP BY) |
 |---|---|---|
-| pending → queued (пачка выборки) | `scheduler/enqueue.go` (T-028) | `pending −n`, `queued +n`; охрана `check_state = pending AND status <> deleted` — гонка с delete-файлом (T-019) не даёт двойного `pending −n` (добавлено T-178) |
-| queued → pending (истёкшая аренда) | `scheduler/lease.go` (T-029) | `queued −n`, `pending +n` |
-| done → pending (возрастная перепроверка) | `scheduler/recheck.go` (T-030) | `checked −n`, `pending +n` |
-| done → pending (temp_error, повтор) | `scheduler/retry.go` (T-031) | `checked −n`, `pending +n` |
-| done → pending (принудительно, CLI) | `cmd/crawlerctl/recheck.go` | предчтение `FOR UPDATE`: `checked/queued −n`, `pending +n` |
-| done → pending (новый субдомен, CLI) | `cmd/crawlerctl/manage.go` (T-083) | `checked −n`, `pending +n` (добавлено T-178: перевод пачками done → pending) |
-| queued/pending → done (запись DNS-результата) | `dnsworker/result.go` (T-039) | предчтение `FOR UPDATE` в CTE: `queued −n`/`pending −n`, `checked +n` — главный переход конвейера (добавлено T-178: §6.4 покрывал только запись HTTP-результата, которая идёт уже поверх done) |
-| INSERT новых (status=new, pending) | `ingest/apply_add.go` | `total +n`, `pending +n` |
-| deleted → new/pending (revive) | `ingest/apply_add.go` | `total +n`, `pending +n` (домен был вне базового множества — декрементов нет) |
-| → deleted (по файлу удаления) | `ingest/apply_delete.go` | `total −n`; по `RETURNING check_state` (не меняется оператором): `pending −n` / `queued −n` / `checked −n` |
+| pending → queued (a selection batch) | `scheduler/enqueue.go` (T-028) | `pending −n`, `queued +n`; the guard `check_state = pending AND status <> deleted` — a race with the delete file (T-019) does not produce a double `pending −n` (added by T-178) |
+| queued → pending (an expired lease) | `scheduler/lease.go` (T-029) | `queued −n`, `pending +n` |
+| done → pending (an age-based recheck) | `scheduler/recheck.go` (T-030) | `checked −n`, `pending +n` |
+| done → pending (temp_error, retry) | `scheduler/retry.go` (T-031) | `checked −n`, `pending +n` |
+| done → pending (forced, CLI) | `cmd/crawlerctl/recheck.go` | a `FOR UPDATE` pre-read: `checked/queued −n`, `pending +n` |
+| done → pending (a new subdomain, CLI) | `cmd/crawlerctl/manage.go` (T-083) | `checked −n`, `pending +n` (added by T-178: moving batches of done → pending) |
+| queued/pending → done (a DNS result record) | `dnsworker/result.go` (T-039) | a `FOR UPDATE` pre-read in the CTE: `queued −n`/`pending −n`, `checked +n` — the pipeline's main transition (added by T-178: §6.4 covered only the HTTP result record, which lands on top of done already) |
+| INSERT of new rows (status=new, pending) | `ingest/apply_add.go` | `total +n`, `pending +n` |
+| deleted → new/pending (revive) | `ingest/apply_add.go` | `total +n`, `pending +n` (the domain was outside the base set — no decrements) |
+| → deleted (per the delete file) | `ingest/apply_delete.go` | `total −n`; per `RETURNING check_state` (not changed by the statement): `pending −n` / `queued −n` / `checked −n` |
 
-### 6.3. Рендер-долг (`render_pending`, синергия с T-175)
+### 6.3. Render debt (`render_pending`, synergy with T-175)
 
-| Переход | Владелец | Механика |
+| Transition | Owner | Mechanics |
 |---|---|---|
-| бит set (ворота закрыты, T-066/T-174) | `httpworker/renderq.go` `renderSetPendingSQL` | добавить охрану `AND (flags & 2) = 0` (сегодня WHERE только по PK) — `RowsAffected` различает «поставлен» от «уже стоит»; дельта `render_pending +1` только при 1 |
-| бит clear (публикация) | `renderq.go` `renderClearPendingSQL` | охрана бита уже есть — `RowsAffected = 1` → `render_pending −1` |
+| bit set (the gate closed, T-066/T-174) | `httpworker/renderq.go` `renderSetPendingSQL` | add the guard `AND (flags & 2) = 0` (today the WHERE is by PK only) — `RowsAffected` distinguishes "set" from "already set"; the `render_pending +1` delta only on 1 |
+| bit clear (publication) | `renderq.go` `renderClearPendingSQL` | the bit guard is already there — `RowsAffected = 1` → `render_pending −1` |
 
-Охрана в `renderSetPendingSQL` меняет наблюдаемое поведение только для
-конкурентного повторного set (второй экземпляр прохода) — сегодня бит
-безусловно перезаписывается тем же значением, семантика флага не меняется;
-инвариант бита фиксируется тестом (§12).
+The guard in `renderSetPendingSQL` changes the observable behavior only for
+a concurrent duplicate set (a second instance of the pass) — today the bit
+is unconditionally rewritten with the same value, the flag semantics do not change;
+the bit invariant is fixed by a test (§12).
 
-### 6.4. `httpworker/record.go` (queued → done + статус)
+### 6.4. `httpworker/record.go` (queued → done + status)
 
-Транзакция записи результата домена: перед `recordDomainSQL` — точечный
+The domain result recording transaction: before `recordDomainSQL` — a point
 `SELECT status, check_state FROM domains WHERE zone_id = $1 AND id = $2
-FOR UPDATE` (PK-лукап; блокировка строки берёт на себя роль «UPDATE
-первым шагом блокирует строку» — комментарий оператора). Затем UPDATE и
-дельты по фактическим старым значениям:
+FOR UPDATE` (a PK lookup; the row lock takes over the role of "an UPDATE as the
+first step locks the row" — the statement comment). Then the UPDATE and
+the deltas per the actual old values:
 
-- `check_state`: старое ≠ done → `queued/…−1`, `checked +1`; старое =
-  done (дубль-доставка) → без дельты (повторная запись результата уже
-  выводила домен из queued при первом проходе);
-- статус: **не инкрементируется** (§13.3) — распределение статусов
-  пишет реконсиляция.
+- `check_state`: old ≠ done → `queued/…−1`, `checked +1`; old =
+  done (duplicate delivery) → no delta (the first pass already moved
+  the domain out of queued);
+- status: **not incremented** (§13.3) — the status distribution is
+  written by the reconciliation.
 
-Стоимость: один дополнительный PK-чтение на домен (темп завершений —
-десятки в секунду по замерам §12) против точности дельт — принимается.
+The cost: one extra PK read per domain (the completion rate is
+tens per second per the §12 measurements) against the delta accuracy — accepted.
 
 ### 6.5. Analyzer
 
-| Событие | Владелец | Дельты |
+| Event | Owner | Deltas |
 |---|---|---|
-| строка `laravel_history` (appeared/lost) | `analyzer` | `laravel_appeared_total +1` / `laravel_lost_total +1` (upsert `pipeline_counters`) |
-| строка `laravel_domains` появилась/исчезла | `analyzer` (порог §13.1) | `zones.domains_laravel ±1` |
+| a `laravel_history` row (appeared/lost) | `analyzer` | `laravel_appeared_total +1` / `laravel_lost_total +1` (an upsert into `pipeline_counters`) |
+| a `laravel_domains` row appeared/disappeared | `analyzer` (the §13.1 threshold) | `zones.domains_laravel ±1` |
 
-Analyzer — единственный писатель обеих таблиц; инкременты сохраняют
-нулевую свежесть «последних находок» и кумулятивов (T-118), убирают
-часовой seq scan `historyStatsSQL` (§8.4).
+The analyzer is the only writer of both tables; the increments preserve
+the zero staleness of the "latest findings" and the cumulatives (T-118) and remove
+the hourly `historyStatsSQL` seq scan (§8.4).
 
 ---
 
-## 7. Реконсиляция
+## 7. Reconciliation
 
-### 7.1. Проход
+### 7.1. The pass
 
-`monitor.ZoneStatsOnce` расширяется до одного согласованного прохода
-(та же транзакция, тот же снапшот):
+`monitor.ZoneStatsOnce` is extended into one consistent pass
+(the same transaction, the same snapshot):
 
 1. `zones`: `domains_total`, `domains_pending`, `domains_queued`,
-   `domains_checked` — один FILTER-агрегат по `domains`
-   (`WHERE status <> deleted GROUP BY zone_id`, партиционный ключ —
-   partitionwise aggregate как сегодня), `domains_laravel` — агрегат
-   `laravel_domains` (существующий T-120);
-2. `pipeline_counters`: `status_<имя>` — FILTER по всем `model.Statuses`
-   тем же сканом `domains` (дополнительная цена — ноль: колонка статуса
-   уже читается проходом); `laravel_appeared_total`/`laravel_lost_total` —
-   агрегат `laravel_history` (существующий текст T-118); `render_pending`
-   — `count FILTER` по биту `flags` тем же сканом `domains`.
-3. **Дрейф**: до перезаписи читаются прежние значения; `|старое − новое|`
-   каждой позиции → gauge §11; Warn при ненулевом дрейфе любой позиции
-   (после стартового прохода цикла — первый проход после миграции дрейфом
-   не считается, заполняет нули §5).
+   `domains_checked` — one FILTER aggregate over `domains`
+   (`WHERE status <> deleted GROUP BY zone_id`, the partition key —
+   partitionwise aggregate as today), `domains_laravel` — an aggregate
+   over `laravel_domains` (the existing T-120);
+2. `pipeline_counters`: `status_<name>` — FILTER over all `model.Statuses`
+   by the same `domains` scan (the extra cost — zero: the status column
+   is already read by the pass); `laravel_appeared_total`/`laravel_lost_total` —
+   an aggregate over `laravel_history` (the existing T-118 text); `render_pending`
+   — a `count FILTER` over the `flags` bit by the same `domains` scan.
+3. **Drift**: the old values are read before the overwrite; `|old − new|`
+   of each position → the §11 gauge; a Warn on a non-zero drift of any position
+   (after the loop's startup pass — the first pass after the migration does not count
+   as drift, it fills the zeros of §5).
 
-Реконсиляция остаётся **авторитетной**: значение перезаписывается целиком,
-инкременты дают свежесть между проходами. Период — `monitor.
-zone_stats_interval` (5 мин); после приработки волны интервал можно
-разредить до 15–30 мин (решение оператора по замеру дрейфа — дрейф в
-стационаре обязан быть нулевым).
+The reconciliation remains **authoritative**: the value is overwritten wholesale,
+the increments provide the freshness between passes. The period is `monitor.
+zone_stats_interval` (5 min); after the wave's break-in the interval may be
+stretched to 15–30 min (an operator decision based on the drift measurement — drift in
+steady state must be zero).
 
-### 7.2. Цикл
+### 7.2. The loop
 
-`ZoneStatsLoop` сохраняет контракт (single-flight T-161, стартовый проход,
-метрики длительности/пропусков тиков); метрика `crawler_zonestats_pass_seconds`
-переименовывается в `crawler_counters_recount_seconds` (help — совмещённый
-проход) с сохранением корзин.
+`ZoneStatsLoop` keeps the contract (the T-161 single-flight, the startup pass,
+the duration/skipped-tick metrics); the `crawler_zonestats_pass_seconds` metric is renamed to `crawler_counters_recount_seconds` (the help — the combined
+pass) with the buckets kept.
 
 ---
 
-## 8. Переключение читателей
+## 8. Switching the readers
 
 1. `status.zoneStatsSQL` → `SELECT … domains_total, domains_pending,
    domains_queued, domains_checked, domains_laravel FROM zones ORDER BY
-   name` — без JOIN `domains`. `FetchZoneStats`/`ZoneStats` — без смены
-   полей (семантика pending — §4.1).
-2. `status.domainStatusSQL` → чтение `pipeline_counters` `status_*`
-   (полная легенда `model.Statuses` с нулями — как сегодня).
+   name` — without the `domains` JOIN. `FetchZoneStats`/`ZoneStats` — without field
+   changes (the pending semantics — §4.1).
+2. `status.domainStatusSQL` → reads the `pipeline_counters` `status_*`
+   (the full `model.Statuses` legend with zeros — as today).
 3. `status.laravelTotalsSQL`: `Total` → `sum(zones.domains_laravel)`
-   (лендинг уже так читает); FILTER 24 ч остаётся живым окном по индексу
-   T-120.
+   (the landing already reads it this way); the 24 h FILTER remains a live window over the
+   T-120 index.
 4. `scheduler.BacklogOnce` → `SELECT coalesce(sum(domains_pending), 0),
-   coalesce(sum(domains_queued), 0) FROM zones` — один дешёвый проход
-   справочника; полный проход `backlogSQL` удаляется (gauge
-   `crawler_backlog_domains`, семантика и help — без изменений).
-5. `monitor.HistoryStatsLoop` → читает `pipeline_counters` (дельты пишут
-   инкременты analyzer + реконсиляция); собственный seq scan
-   `historyStatsSQL` удаляется, gauge T-118 сохраняются.
-6. Дашбордный TTL-кэш `status.Cache` (T-161) сохраняется — теперь он
-   кэширует дешёвые чтения (защита от трафика между refresh-циклами),
-   а не полные проходы.
-7. Лендинг (`internal/web/data.go`) — без изменений: читает счётчики зон
-   с T-122.
-8. Выборка диспетчера (`scheduler.dispatchZonesSQL`, T-183): фильтр
-   `AND domains_pending > 0` — колонка становится критерием круга 1
-   (зоны без pending исключаются до пробы: её семантика — сам предикат
-   LATERAL-выборки). Свежость — дельты переходов (enqueue декрементирует
-   тем же оператором, `apply_add` открывает новую зону сразу); граница
-   доверия — дрейф §4.1 (скрытая зона с работой до ближайшей
-   реконсиляции, наблюдаема метрикой §11).
+   coalesce(sum(domains_queued), 0) FROM zones` — one cheap pass over the
+   reference table; the full `backlogSQL` pass is removed (the
+   `crawler_backlog_domains` gauge, semantics and help — unchanged).
+5. `monitor.HistoryStatsLoop` → reads `pipeline_counters` (the deltas are written by
+   the analyzer increments + the reconciliation); its own seq scan
+   `historyStatsSQL` is removed, the T-118 gauges are kept.
+6. The dashboard TTL cache `status.Cache` (T-161) is kept — now it
+   caches cheap reads (protection against traffic between refresh cycles),
+   not full passes.
+7. The landing (`internal/web/data.go`) — unchanged: it has been reading the zone
+   counters since T-122.
+8. The dispatcher selection (`scheduler.dispatchZonesSQL`, T-183): the filter
+   `AND domains_pending > 0` — the column becomes the round-1 criterion
+   (zones without pending are excluded before the probe: its semantics is the predicate
+   LATERAL selection). The freshness — the transition deltas (enqueue decrements
+   in the same statement, `apply_add` opens a new zone immediately); the
+   trust boundary — the §4.1 drift (a hidden zone with work until the nearest
+   reconciliation, observable via the §11 metric).
 
 ---
 
-## 9. Консольная команда `crawlerctl counters`
+## 9. The `crawlerctl counters` console command
 
-Реализация по образцу `cmd/crawlerctl/near.go` (config.Load → пул,
-`AppName "crawlerctl"`, `signalCtx`). Подкоманды:
+Implemented per the `cmd/crawlerctl/near.go` pattern (config.Load → pool,
+`AppName "crawlerctl"`, `signalCtx`). Subcommands:
 
 ```
 crawlerctl counters list
-    значения всех счётчиков (зоны — итогами, pipeline_counters — построчно)
-    + возраст (zones/counters updated_at); формат — таблица CLI.
+    the values of all counters (zones — as totals, pipeline_counters — row by row)
+    + the age (zones/counters updated_at); the format — a CLI table.
 
-crawlerctl counters recount [--zone ИМЯ]
-    один проход реконсиляции (те же Once-функции monitor — SQL в одной
-    точке правды, стиль ТЗД §4.5); вывод «до → после» по позициям с
-    ненулевым дрейфом; --zone — только выбранная зона (глобальные
-    счётчики пересчитываются всегда).
+crawlerctl counters recount [--zone NAME]
+    one reconciliation pass (the same monitor Once functions — the SQL in a single
+    point of truth, the TZ_dashboard.md §4.5 style); a "before → after" output for the positions with
+    a non-zero drift; --zone — only the selected zone (the global
+    counters are recounted always).
 
-crawlerctl counters verify [--zone ИМЯ] [--tolerance N]
-    сверка счётчиков с живыми агрегатами БЕЗ записи: вывод таблицы
-    расхождений; код возврата 0 — расхождений нет (в пределах N,
-    по умолчанию 0), 1 — есть дрейф, 2 — ошибка использования.
+crawlerctl counters verify [--zone NAME] [--tolerance N]
+    a check of the counters against the live aggregates WITHOUT writing: a table of
+    discrepancies; exit code 0 — no discrepancies (within N,
+    0 by default), 1 — there is drift, 2 — a usage error.
 ```
 
-Назначение: ручное восстановление после инцидентов, cron-пересчёт для
-малых корпусов без постоянного monitor, послеоперационная сверка
-(миграции, восстановление из бэкапа). Команда появляется в справке
-верхнего уровня (`usageText`) и README.
+Purpose: manual recovery after incidents, a cron recount for
+small corpora without a permanent monitor, post-operation verification
+(migrations, a restore from backup). The command appears in the top-level
+help (`usageText`) and the README.
 
 ---
 
-## 10. Конфигурация
+## 10. Configuration
 
-Новых полей нет: период реконсиляции — существующий
-`monitor.zone_stats_interval`; CLI конфигурацию не добавляет (DSN из
-общего конфига). `config.example.yaml` — обновить комментарий секции
-monitor (реконсиляция совмещённая, §7).
+No new fields: the reconciliation period is the existing
+`monitor.zone_stats_interval`; the CLI adds no configuration (the DSN from
+the shared config). `config.example.yaml` — update the comment of the
+monitor section (the reconciliation is combined, §7).
 
 ---
 
-## 11. Метрики
+## 11. Metrics
 
-| Метрика | Тип | Смысл |
+| Metric | Type | Meaning |
 |---|---|---|
-| `crawler_counters_drift{counter}` | gauge | \|старое − новое\| на проходе реконсиляции; метка counter — имя счётчика (`zone:<id>:pending`, `global:status_alive`, …); стационар — 0 |
-| `crawler_counters_recount_seconds` | histogram | длительность совмещённого прохода (переименование `crawler_zonestats_pass_seconds`, корзины прежние) |
-| `crawler_zonestats_skipped_ticks_total` | counter | без изменений (T-161) |
-| `crawler_backlog_domains`, `crawler_laravel_appeared_total`, `crawler_laravel_lost_total`, `crawler_laravel_near_findings` | gauge | имена/семантика без изменений — источник теперь счётчики (§8) |
+| `crawler_counters_drift{counter}` | gauge | \|old − new\| on the reconciliation pass; the counter label — the counter name (`zone:<id>:pending`, `global:status_alive`, …); steady state — 0 |
+| `crawler_counters_recount_seconds` | histogram | the duration of the combined pass (a renaming of `crawler_zonestats_pass_seconds`, the buckets unchanged) |
+| `crawler_zonestats_skipped_ticks_total` | counter | unchanged (T-161) |
+| `crawler_backlog_domains`, `crawler_laravel_appeared_total`, `crawler_laravel_lost_total`, `crawler_laravel_near_findings` | gauge | names/semantics unchanged — the source is now the counters (§8) |
 
-Алерт дрейфа: Warn в журнал monitor при ненулевом дрейфе (после стартового
-прохода); доставки в Telegram не требует (дрейф — диагностика, лечение —
-тот же проход); устойчивый ненулевой дрейф подряд ≥ 3 проходов —
-кандидат в алерты T-162 по итогам эксплуатации.
-
----
-
-## 12. Тестирование и приёмка
-
-1. **Юнит-тесты** (SQL-контракты по стилю проекта — точные тексты
-   операторов на фейковом `db.DB`):
-   - дельты каждого перехода (§6.2–6.5): параметры, батч-форма
-     `UPDATE … FROM (VALUES …)`, нулевые дельты при `RowsAffected = 0`;
-   - реконсиляция: текст совмещённого агрегата, upsert counters, расчёт
-     дрейфа, Warn-порог;
-   - читатели: новые тексты без `JOIN domains`/`GROUP BY status`;
-   - CLI: справка, коды возврата verify (0/1/2), вывод list/recount;
-   - охрана бита `renderSetPendingSQL` (инвариант §6.3).
-2. **Интеграционные тесты** (`test/integration`, skipUnlessIntegration):
-   после существующих эпизодов конвейера (ingest → dispatch → dns →
-   http → analyzer) сверять счётчики зон/counters с живыми агрегатами
-   (готовая `verify`-логика); сценарий дубль-доставки record (повторный
-   эпизод одного домена) — дельты не двоятся; сценарий удаления домена в
-   queued — декремент правильной колонки.
-3. **Приёмка**: `make test` + `make test-integration` зелёные; в
-   стационаре (прогон testbed ≥ 1 ч) `pg_stat_activity` не показывает
-   полных проходов `domains`, кроме реконсиляции раз в интервал;
-   `crawlerctl counters verify` — код 0; числа дашборда сходятся с
-   `crawlerctl status`; CPU postgres (top) ниже замера §12 минимум на
-   величину убранных проходов (backlog 17 с/5 мин + статус-агрегаты);
-   после искусственного дрейфа (ручной UPDATE zones) `verify` — код 1,
-   `recount` чинит, метрика дрейфа поднимается.
+The drift alert: a Warn to the monitor log on a non-zero drift (after the startup
+pass); it needs no Telegram delivery (drift is diagnostics, the cure is the
+same pass); a persistent non-zero drift ≥ 3 passes in a row is
+a candidate for the T-162 alerts based on operating experience.
 
 ---
 
-## 13. Принятые решения и отклонённые варианты
+## 12. Testing and acceptance
 
-1. **PostgreSQL, а не Redis.** Redis в проекте — эфемерный транспорт:
-   стримы усечены MAXLEN, потери при сбое восстанавливаются планировщиком
-   из БД (`scheduler/backlog.go`, ТЗ 3.4). Счётчик в Redis — вторая точка
-   правды: flush-цикл, дедупликация at-least-once, rebuild после потери —
-   машинерия сложнее дрейфа, который она лечит. Все переходы уже
-   происходят в транзакциях PG — дельта в той же транзакции атомарна
-   без новых семантик доставки. Redis остаётся у оперативных gauge
-   (глубина стримов).
-2. **Реконсиляция, а не триггеры / materialized views.** Триггеров в
-   миграциях нет — стиль проекта: явный SQL с контрактами в тестах;
-   триггер на 47-млн таблице — скрытая цена каждой записи и небьющийся
-   на фейках юнит-тестами. MV: `REFRESH` — тот же полный проход плюс
-   блокировки, инкрементальности не даёт.
-3. **Статус-распределение — реконсиляцией, не инкрементами.** Батчевые
-   `UPDATE … RETURNING` в PG 16 не возвращают старые значения (нет
-   `RETURNING OLD`), старые статусы transition'ов apply_delete/revive не
-   пинируются предикатами. Дополнительная цена FILTER-колонок статусов в
-   реконсиляционном скане — ноль; свежесть 5 мин для распределения
-   статусов (gauge-секция дашборда) достаточна — сегодня она и так
-   кэширована минутой T-161.
-4. **Унификация базового множества** (§4.1): расхождение живого
-   `zoneStatsSQL` (queued/done без фильтра статуса) с реконсиляцией
-   (все — `status <> deleted`) закрывается в пользу реконсиляции.
-5. **`SELECT … FOR UPDATE` в record.go** (§6.4): одна дополнительная
-   точечная PK-чтение на домен покупает точные дельты (дубль-доставка,
-   возврат аренды посреди обработки) — дешевле, чем лечить дрейф.
-6. **`render_pending`-счётчик на переходах бита** закрывает источник
-   «по стоимости» из T-175 (вариант «инкрементальный счётчик»): gauge
-   `crawler_render_pending_domains` читает `pipeline_counters`, частичный
-   индекс по биту не нужен.
-7. **Окна темпа не инкрементируются**: индексы T-171/T-118 держат цену
-   ∝ окну; ротация бакетов для календарных окон — усложнение без
-   измеримой выгоды (при необходимости — отдельная волна).
-   *Пересмотрено частично в T-179 (TZ_slow_done_today, живой замер
-   24.10)*: посыл «цена ∝ окну, индексы обслуживают» не подтвердился
-   для суточного окна — index-only scan по `last_checked_at =
-   current_date` деградировал heap-fetch'ами принципиально «грязных»
-   свежих страниц (676 тыс. на 815 тыс. строк окна, ≈1,1 ГБ чтений,
-   медиана 15 с при выключенном parallel gather пула dashboard):
-   done_today переведён на инкрементальный суточный счётчик
-   `checks:YYYY-MM-DD` (строка `crawler_counters`, инкремент в
-   транзакции записи результата, реконсиляция — FILTER-позицией этого
-   прохода). Часовые окна (`results_hour`/`rendered_hour`, 0,07 мс)
-   остались живыми — дорогое именно календарное окно суток.
-   *Пересмотрено далее в T-203 (контрольная точка этапа 27)*: часовые
-   окна `results_hour`/`rendered_hour` (`checked_at ≥ now()−1ч` по
-   `subdomain_results`) деградировали тем же механизмом на выросшем
-   темпе конвейера (медиана 6,0 с > 3 с, 108 событий) — переведены на
-   часовые корзины `results:`/`rendered:YYYY-MM-DD"T"HH24` (инкременты
-   в транзакциях записи результата и рендера, реконсиляция —
-   FILTER-позициями агрегата окна двух живых часов, читатель суммирует
-   prev+cur корзины с делителем-длиной окна).
-8. **Кэш `status.Cache` сохраняется** (§8.6): дешёвые чтения тоже
-   кэшируются — трафик между refresh-циклами дашборда не ходит в БД
-   вовсе.
+1. **Unit tests** (SQL contracts in the project style — exact statement
+   texts on a fake `db.DB`):
+   - the deltas of each transition (§6.2–6.5): parameters, the batch form
+     `UPDATE … FROM (VALUES …)`, zero deltas at `RowsAffected = 0`;
+   - the reconciliation: the combined aggregate text, the counters upsert, the drift
+     computation, the Warn threshold;
+   - the readers: the new texts without `JOIN domains`/`GROUP BY status`;
+   - the CLI: help, the verify exit codes (0/1/2), the list/recount output;
+   - the `renderSetPendingSQL` bit guard (the §6.3 invariant).
+2. **Integration tests** (`test/integration`, skipUnlessIntegration):
+   after the existing pipeline episodes (ingest → dispatch → dns →
+   http → analyzer) verify the zone counters/counters against the live aggregates
+   (the ready-made `verify` logic); a duplicate-delivery record scenario (a repeated
+   episode of one domain) — the deltas are not doubled; a scenario of deleting a domain in
+   queued — the decrement of the correct column.
+3. **Acceptance**: `make test` + `make test-integration` green; in
+   steady state (a testbed run ≥ 1 h) `pg_stat_activity` shows no
+   full `domains` passes except the reconciliation once per interval;
+   `crawlerctl counters verify` — code 0; the dashboard numbers match
+   `crawlerctl status`; postgres CPU (top) below the §12 measurement by at least
+   the size of the removed passes (backlog 17 s/5 min + the status aggregates);
+   after an artificial drift (a manual UPDATE zones) `verify` — code 1,
+   `recount` fixes it, the drift metric fires.
 
 ---
 
-## 14. Этапность внутри задачи
+## 13. Accepted decisions and rejected options
 
-Один коммит задачи покрывает ТЗ целиком; порядок внутри (каждый шаг —
-зелёные тесты):
+1. **PostgreSQL, not Redis.** Redis in this project is an ephemeral transport:
+   the streams are trimmed with MAXLEN, losses on failure are restored by the scheduler
+   from the DB (`scheduler/backlog.go`, spec 3.4). A counter in Redis is a second point
+   of truth: a flush cycle, at-least-once deduplication, a rebuild after a loss —
+   machinery more complex than the drift it cures. All transitions already
+   happen in PG transactions — a delta in the same transaction is atomic
+   with no new delivery semantics. Redis stays with the operational gauges
+   (the stream depths).
+2. **Reconciliation, not triggers / materialized views.** There are no triggers in
+   the migrations — the project style: explicit SQL with contracts in tests;
+   a trigger on the 47M-row table is a hidden cost of every write and cannot be
+   beaten by unit tests on fakes. An MV: `REFRESH` is the same full pass plus
+   locks; it provides no incrementality.
+3. **The status distribution — by reconciliation, not increments.** Batch
+   `UPDATE … RETURNING` in PG 16 does not return the old values (no
+   `RETURNING OLD`), the old statuses of the apply_delete/revive transitions are not
+   pinned by predicates. The extra cost of the status FILTER columns in
+   the reconciliation scan is zero; a 5 min freshness for the status
+   distribution (the dashboard's gauge section) is enough — today it is already
+   cached for a minute by T-161.
+4. **Base set unification** (§4.1): the discrepancy between the live
+   `zoneStatsSQL` (queued/done without a status filter) and the reconciliation
+   (all — `status <> deleted`) is resolved in favor of the reconciliation.
+5. **`SELECT … FOR UPDATE` in record.go** (§6.4): one extra
+   point PK read per domain buys exact deltas (duplicate delivery,
+   a lease returned mid-processing) — cheaper than curing drift.
+6. **The `render_pending` counter on the bit transitions** closes the
+   "by cost" source from T-175 (the "incremental counter" option): the
+   `crawler_render_pending_domains` gauge reads `pipeline_counters`, a partial
+   index over the bit is not needed.
+7. **Throughput windows are not incremented**: the T-171/T-118 indexes keep the cost
+   ∝ the window; bucket rotation for calendar windows is complexity without
+   measurable benefit (if needed — a separate wave).
+   *Partially revised in T-179 (TZ_slow_done_today, a live measurement of
+   24.10)*: the thesis "the cost ∝ the window, the indexes serve it" was not confirmed
+   for the daily window — the index-only scan over `last_checked_at =
+   current_date` degraded with heap fetches of the fundamentally "dirty"
+   fresh pages (676K per 815K rows of the window, ≈1.1 GB of reads,
+   a median of 15 s with the dashboard pool's parallel gather disabled):
+   done_today was moved to an incremental daily counter
+   `checks:YYYY-MM-DD` (a `crawler_counters` row, an increment in
+   the result recording transaction, the reconciliation — a FILTER position of that
+   pass). The hourly windows (`results_hour`/`rendered_hour`, 0.07 ms)
+   remained live — it is the calendar daily window that is expensive.
+   *Revised further in T-203 (the stage 27 checkpoint)*: the hourly
+   windows `results_hour`/`rendered_hour` (`checked_at ≥ now()−1h` over
+   `subdomain_results`) degraded by the same mechanism at the grown
+   pipeline rate (a median of 6.0 s > 3 s, 108 events) — they were moved to
+   hourly buckets `results:`/`rendered:YYYY-MM-DD"T"HH24` (increments
+   in the result recording and render transactions, the reconciliation —
+   FILTER positions of the two live hours' window aggregate, the reader sums the
+   prev+cur buckets with a window-length divisor).
+8. **The `status.Cache` cache is kept** (§8.6): cheap reads are cached too — dashboard traffic between refresh cycles does not hit the DB
+   at all.
 
-1. Миграция счётчиков (§5; номер/имя файла — следующая свободная на
-   момент реализации, решает исполнитель) + расширение `ZoneStatsOnce`/Loop до
-   реконсиляции (§7) с дрейф-метрикой — читатели не меняются, поведение
-   совместимо (колонки пишутся, никто не читает).
-2. Инкременты переходов (§6) — scheduler, ingest, httpworker (record,
+---
+
+## 14. Staging within the task
+
+One task commit covers the whole spec; the order within (each step —
+green tests):
+
+1. The counters migration (§5; the number/file name — the next free one at
+   implementation time, decided by the implementer) + extending `ZoneStatsOnce`/Loop into
+   the reconciliation (§7) with a drift metric — the readers are unchanged, the behavior is
+   compatible (the columns are written, nobody reads them).
+2. The transition increments (§6) — scheduler, ingest, httpworker (record,
    renderq), analyzer.
-3. Переключение читателей (§8) + удаление замещённых проходов
-   (`backlogSQL`, `historyStatsSQL`, старые тексты `status`).
-4. CLI `crawlerctl counters` (§9), конфиг-комментарий (§10).
-5. Документация: `docs/services.md` (перечень метрик, источник backlog),
-   `docs/schema.md` (колонки зон, pipeline_counters), `docs/runbooks.md`
-   (recount/verify после инцидентов), README (команда CLI).
+3. Switching the readers (§8) + removing the replaced passes
+   (`backlogSQL`, `historyStatsSQL`, the old `status` texts).
+4. The CLI `crawlerctl counters` (§9), the config comment (§10).
+5. Documentation: `docs/services.md` (the metric list, the backlog source),
+   `docs/schema.md` (the zone columns, pipeline_counters), `docs/runbooks.md`
+   (recount/verify after incidents), README (the CLI command).

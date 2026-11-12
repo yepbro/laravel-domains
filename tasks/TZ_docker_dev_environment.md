@@ -1,381 +1,381 @@
-# Техническое задание: Docker-конфигурация для разработки проекта «Domain Crawler»
+# Technical Specification: Docker Development Configuration for the Domain Crawler Project
 
-Версия: 1.1 (решения по допущениям и открытым вопросам подтверждены заказчиком)
-Связанный документ: `TZ_domain_crawler.md` (основное ТЗ на сервис)
-
----
-
-## 1. Цель
-
-Создать воспроизводимое окружение разработки на базе Docker Compose, которое:
-
-1. Поднимает всю инфраструктуру проекта одной командой: PostgreSQL, Redis, локальный DNS-резолвер (Unbound), Chromium для рендера, мониторинг.
-2. Содержит **изолированный тестовый стенд** (фейковые DNS и веб-серверы), чтобы разработка и тесты не зависели от реального интернета и не создавали нагрузку на чужие сайты.
-3. Позволяет запускать Go-сервисы проекта с горячей перезагрузкой кода и отладчиком.
-4. Приближено к боевым ограничениям (8 ГБ RAM, один IP, лимиты памяти по сервисам), чтобы проблемы с памятью и конкурентностью проявлялись на этапе разработки.
-5. Даёт единые команды (`make`) для миграций, тестов, наполнения тестовыми данными, просмотра очередей и логов.
+Version: 1.1 (the decisions on the assumptions and open questions are confirmed by the customer)
+Related document: `TZ_domain_crawler.md` (the main service spec)
 
 ---
 
-## 2. Область работ и результат
+## 1. Purpose
 
-Результат работы — набор файлов в репозитории проекта:
+Create a reproducible development environment based on Docker Compose that:
+
+1. Brings up the entire project infrastructure with one command: PostgreSQL, Redis, a local DNS resolver (Unbound), Chromium for rendering, monitoring.
+2. Contains an **isolated testbed** (fake DNS and web servers) so that development and tests do not depend on the real internet and do not load third-party sites.
+3. Allows running the project's Go services with hot code reload and a debugger.
+4. Is close to the production constraints (8 GB RAM, one IP, memory limits per service) so that memory and concurrency problems surface at the development stage.
+5. Provides unified commands (`make`) for migrations, tests, loading test data, inspecting queues and logs.
+
+---
+
+## 2. Scope of work and deliverable
+
+The deliverable is a set of files in the project repository:
 
 ```
 /deploy/docker/
-  compose.yaml                  # основной compose-файл
-  compose.override.example.yaml # шаблон локальных переопределений
-  .env.example                  # переменные окружения
+  compose.yaml                  # the main compose file
+  compose.override.example.yaml # a local overrides template
+  .env.example                  # environment variables
   Dockerfile.go                 # multi-stage: dev / build / runtime
-  Dockerfile.render             # образ рендера (Chromium)
+  Dockerfile.render             # the render image (Chromium)
   postgres/
     postgresql.dev.conf
-    init/                       # init-скрипты (расширения, роли, БД)
+    init/                       # init scripts (extensions, roles, DB)
   redis/redis.dev.conf
-  unbound/unbound.conf          # резолвер для dev
+  unbound/unbound.conf          # the dev resolver
   testbed/
-    coredns/Corefile            # фейковые зоны
+    coredns/Corefile            # fake zones
     coredns/zones/*.zone
-    web/                        # веб-сервер Caddy с виртуальными хостами
-    web/sites/<сценарий>/       # статические страницы-фикстуры
-    mockserver/                 # Go-приложение для «злых» сценариев
+    web/                        # a Caddy web server with virtual hosts
+    web/sites/<scenario>/       # static fixture pages
+    mockserver/                 # a Go application for "evil" scenarios
   prometheus/prometheus.yml
 /Makefile
-/.air.toml                      # конфиг hot reload (или аналог)
-/docs/dev-environment.md        # краткая инструкция запуска
+/.air.toml                      # hot reload config (or an equivalent)
+/docs/dev-environment.md        # a brief startup guide
 /.github/workflows/ci.yml       # CI (GitHub Actions)
-/testdata/laravel-samples/      # реальные образцы Laravel от заказчика + ожидаемые результаты
+/testdata/laravel-samples/      # real Laravel samples from the customer + expected results
 ```
 
 ---
 
-## 3. Требования к окружению хоста
+## 3. Host environment requirements
 
-- Docker Engine ≥ 24, Docker Compose v2 (команда `docker compose`).
-- Linux (Ubuntu LTS) — единственная поддерживаемая ОС разработки; macOS и Windows не поддерживаются.
-- Минимум 8 ГБ RAM на хосте (рекомендуется 16 ГБ) и ≥ 20 ГБ свободного места на диске для томов разработки.
-- Установка Go на хосте **не обязательна**: сборка, тесты и запуск выполняются в контейнерах; при желании разработчик может запускать сервисы с хоста.
+- Docker Engine ≥ 24, Docker Compose v2 (the `docker compose` command).
+- Linux (Ubuntu LTS) — the only supported development OS; macOS and Windows are not supported.
+- At least 8 GB of host RAM (16 GB recommended) and ≥ 20 GB of free disk space for the development volumes.
+- Installing Go on the host is **optional**: building, tests and running happen in containers; if desired, a developer may run the services from the host.
 
 ---
 
-## 4. Состав сервисов Compose
+## 4. The Compose service composition
 
-### 4.1. Инфраструктурные сервисы (всегда)
+### 4.1. Infrastructure services (always)
 
-| Сервис | Образ / базис | Назначение | Лимит памяти (dev) |
+| Service | Image / basis | Purpose | Memory limit (dev) |
 |---|---|---|---|
-| `postgres` | `postgres:16` (мажорная версия фиксируется в `.env`) | БД проекта | 1,5 ГБ |
-| `redis` | `redis:7-alpine` | Очереди (Streams) | 256 МБ |
-| `unbound` | образ на базе Alpine/Debian с Unbound | Локальный рекурсивный резолвер | 256 МБ |
+| `postgres` | `postgres:16` (the major version is pinned in `.env`) | The project DB | 1.5 GB |
+| `redis` | `redis:7-alpine` | Queues (Streams) | 256 MB |
+| `unbound` | an image based on Alpine/Debian with Unbound | Local recursive resolver | 256 MB |
 
-Требования:
+Requirements:
 
-- **postgres**: персистентный именованный том; конфиг `postgresql.dev.conf` (параметры уменьшены под dev, но сохраняют ключевые настройки боевой схемы: `synchronous_commit = off`, `random_page_cost = 1.1`, `effective_io_concurrency = 200`); init-скрипты создают БД, роль приложения и необходимые расширения (при необходимости, например `pg_stat_statements`); `healthcheck` через `pg_isready`.
-- **redis**: `maxmemory` и политика `noeviction`; `appendonly` отключён или `everysec` (в dev допустима потеря данных); `healthcheck` через `redis-cli ping`.
-- **unbound**: конфигурация, в которой:
-  - в режиме `testbed` (по умолчанию) домены тестовых зон пересылаются на `coredns` (через `forward-zone`/`stub-zone`), а всё остальное **не резолвится наружу** (возвращается `REFUSED`/`NXDOMAIN`), чтобы случайно не пойти в интернет;
-  - в режиме `internet` (профиль, см. 5) включается обычная рекурсия.
+- **postgres**: a persistent named volume; the `postgresql.dev.conf` config (parameters reduced for dev but keeping the key settings of the production schema: `synchronous_commit = off`, `random_page_cost = 1.1`, `effective_io_concurrency = 200`); the init scripts create the DB, the application role and the required extensions (if needed, e.g. `pg_stat_statements`); a `healthcheck` via `pg_isready`.
+- **redis**: `maxmemory` and the `noeviction` policy; `appendonly` disabled or `everysec` (data loss is acceptable in dev); a `healthcheck` via `redis-cli ping`.
+- **unbound**: a configuration in which:
+  - in `testbed` mode (the default) the test-zone domains are forwarded to `coredns` (via `forward-zone`/`stub-zone`), and everything else **is not resolved outward** (`REFUSED`/`NXDOMAIN` is returned), so as not to accidentally reach the internet;
+  - in `internet` mode (a profile, see 5) normal recursion is enabled.
 
-### 4.2. Приложения проекта
+### 4.2. Project applications
 
-Каждый Go-сервис из основного ТЗ — отдельный сервис Compose:
+Each Go service from the main spec is a separate Compose service:
 
-| Сервис | Команда запуска (dev) | Профиль | Порты |
+| Service | Run command (dev) | Profile | Ports |
 |---|---|---|---|
-| `ingest` | `air -c .air.toml` + `./cmd/ingest` | `app` | метрики `:9101` |
+| `ingest` | `air -c .air.toml` + `./cmd/ingest` | `app` | metrics `:9101` |
 | `scheduler` | `air` + `./cmd/scheduler` | `app` | `:9102` |
 | `dns-worker` | `air` + `./cmd/dns-worker` | `app` | `:9103` |
 | `http-worker` | `air` + `./cmd/http-worker` | `app` | `:9104` |
 | `render-worker` | `air` + `./cmd/render-worker` | `app` | `:9105` |
 | `analyzer` | `air` + `./cmd/analyzer` | `app` | `:9106` |
 | `monitor` | `air` + `./cmd/monitor` | `app` | `:9100` |
-| `tools` | контейнер с `crawlerctl`, `migrate` и вспомогательными утилитами (по запросу, `docker compose run`) | `tools` | — |
+| `tools` | a container with `crawlerctl`, `migrate` and helper utilities (on demand, `docker compose run`) | `tools` | — |
 
-Требования:
+Requirements:
 
-- Один общий образ `Dockerfile.go` с target `dev` (Go toolchain, `air`, `delve`, `golangci-lint`, `migrate`), исходный код монтируется bind-mount; кэш модулей (`GOMODCACHE`) и кэш сборки (`GOCACHE`) — в именованных томах для быстрой пересборки.
-- Каждый сервис получает свой лимит памяти (`mem_limit`), приближенный к боевому бюджету (см. ТЗ, п. 3.2), и `restart: unless-stopped`.
-- Сервисы используют `unbound` как DNS (`dns: [<ip unbound>]`), а не системный резолвер Docker.
-- Каталог `incoming/` для `ingest` — bind-mount с хоста (`./var/incoming`), чтобы разработчик мог просто класть файлы; каталоги `processed/` и `failed/` — рядом.
-- Каталог хранилища контента — именованный том (или bind-mount `./var/content`).
-- Каталог правил Laravel (`/rules`) монтируется с хоста; изменение правил подхватывается по `SIGHUP` (команда `make rules-reload`).
-- Возможность отладки: порт `2345` (delve) для выбранного сервиса через переопределение (`compose.override`), отладка запуском `make debug SERVICE=dns-worker`.
-- `healthcheck` для каждого сервиса: HTTP-эндпоинт `/healthz` на порту метрик.
+- One shared `Dockerfile.go` image with the `dev` target (the Go toolchain, `air`, `delve`, `golangci-lint`, `migrate`), the source code is mounted via bind-mount; the module cache (`GOMODCACHE`) and the build cache (`GOCACHE`) live in named volumes for fast rebuilds.
+- Each service gets its own memory limit (`mem_limit`) close to the production budget (see the spec, item 3.2) and `restart: unless-stopped`.
+- The services use `unbound` as DNS (`dns: [<unbound ip>]`), not the Docker system resolver.
+- The `incoming/` directory for `ingest` is a bind-mount from the host (`./var/incoming`) so that the developer can simply drop files in; the `processed/` and `failed/` directories sit alongside.
+- The content storage directory is a named volume (or a `./var/content` bind-mount).
+- The Laravel rules directory (`/rules`) is mounted from the host; rule changes are picked up on `SIGHUP` (the `make rules-reload` command).
+- Debugging capability: port `2345` (delve) for the selected service via an override (`compose.override`), debugging started by `make debug SERVICE=dns-worker`.
+- A `healthcheck` for each service: the `/healthz` HTTP endpoint on the metrics port.
 
-### 4.3. Рендер (Chromium)
+### 4.3. Render (Chromium)
 
-- Образ `Dockerfile.render`: базис с headless-Chromium (например, `chromedp/headless-shell`) + бинарник `render-worker`.
-- Параметры контейнера: `shm_size: 1gb` (или `--disable-dev-shm-usage` во флагах Chromium), `mem_limit` ≈ 2 ГБ (как в боевом бюджете), запуск не от root, `init: true` (корректная уборка zombie-процессов).
-- Chromium использует тот же DNS (`unbound`) и изолированную сеть; в режиме `testbed` не имеет доступа в интернет.
-- Включён перезапуск браузера по числу страниц и по превышению памяти (поведение из основного ТЗ).
+- The `Dockerfile.render` image: a base with headless-Chromium (e.g. `chromedp/headless-shell`) + the `render-worker` binary.
+- Container parameters: `shm_size: 1gb` (or `--disable-dev-shm-usage` in the Chromium flags), `mem_limit` ≈ 2 GB (as in the production budget), non-root run, `init: true` (correct zombie process cleanup).
+- Chromium uses the same DNS (`unbound`) and an isolated network; in `testbed` mode it has no internet access.
+- Browser restart by page count and on memory overage is enabled (the behavior from the main spec).
 
-### 4.4. Тестовый стенд (testbed)
+### 4.4. The testbed
 
-Назначение: полностью локальный «мини-интернет» с известными ответами для разработки и автотестов.
+Purpose: a fully local "mini-internet" with known answers for development and automated tests.
 
-| Сервис | Назначение |
+| Service | Purpose |
 |---|---|
-| `coredns` | Авторитативный DNS для фейковых зон (`*.test`-зоны, IDN-зоны) |
-| `testweb` | Веб-сервер **Caddy** с виртуальными хостами и самоподписанными сертификатами (HTTP и HTTPS) |
-| `mockserver` | Go-приложение для сценариев, которые нельзя описать статикой: тарпит, бесконечные и циклические редиректы, медленные ответы, огромные тела, обрыв соединений, неправильные кодировки, zip-бомба |
+| `coredns` | Authoritative DNS for the fake zones (`*.test` zones, IDN zones) |
+| `testweb` | A **Caddy** web server with virtual hosts and self-signed certificates (HTTP and HTTPS) |
+| `mockserver` | A Go application for scenarios that cannot be expressed statically: a tarpit, infinite and circular redirects, slow responses, huge bodies, dropped connections, wrong encodings, a zip bomb |
 
-**Тестовые зоны** (минимальный набор, расширяемый):
+**Test zones** (a minimal set, extendable):
 
-- `crawl.test`, `crawl2.test` и т. п. — обычные зоны;
-- IDN-зона и IDN-домены (например, `xn--…`-эквиваленты кириллической и иероглифической зон), чтобы проверять punycode-нормализацию и DNS/HTTP для IDN-имён;
-- составная зона (`co.test`-подобная публичного суффикса) — для проверки отделения зоны от домена (в тестовом списке суффиксов).
+- `crawl.test`, `crawl2.test` etc. — ordinary zones;
+- an IDN zone and IDN domains (e.g. `xn--…` equivalents of a Cyrillic and a hieroglyphic zone), to check punycode normalization and DNS/HTTP for IDN names;
+- a composite zone (`co.test`-like public suffix) — for checking the zone/domain split (in the test suffix list).
 
-**Обязательные сценарии доменов** (каждый — отдельный домен/субдомен с понятным именем, например `nxdomain-case`, `wildcard-case`):
+**Required domain scenarios** (each is a separate domain/subdomain with a descriptive name, e.g. `nxdomain-case`, `wildcard-case`):
 
-| Сценарий | Что проверяет |
+| Scenario | What it checks |
 |---|---|
-| NXDOMAIN апекса | статус `not_delegated`, пропуск субдоменов |
-| NS есть, A/AAAA нет | статус `delegated_no_address` |
-| SERVFAIL / таймаут DNS | статус `temp_error`, повторы |
-| Wildcard DNS | детект wildcard и пропуск лишних субдоменов |
-| CNAME-цепочки (в т. ч. зацикленная) | обработка цепочек и защита от циклов |
-| Адрес есть, порты закрыты | статус `no_http` |
-| Только http | один вариант, `scheme = http` |
-| Только https | один вариант, `scheme = https` |
-| http и https ведут на один сайт (http → https редирект) | единственная запись |
-| http и https — **разные** сайты | две записи (`variant` 0 и 1) |
-| `bare → www` и `www → bare` редиректы | `alias_kind = 2`, одно хранение контента |
-| `www` и без `www` — одинаковый контент без редиректа | `alias_kind = 1` |
-| Цепочка редиректов, `meta refresh`, JS-редирект | поиск финальной страницы |
-| Бесконечный и циклический редирект | срабатывание лимита |
-| Тарпит (медленное чтение/отдача) | минимальная скорость и таймауты |
-| Огромное тело, zip-бомба | лимиты размера и распаковки |
-| Некорректный сертификат, истёкший, не совпадающий SAN | сохранение результата, загрузка при `InsecureSkipVerify` |
-| Разные кодировки (UTF-8, windows-1251, ошибочный charset) | приведение к UTF-8 |
-| SPA-оболочка (`#root`/`#app`, `<noscript>`) | запуск рендера, получение DOM и cookies, выставленных JS |
-| Cookies и заголовки | корректное сохранение |
-| Парковка/одинаковые страницы на разных доменах | дедупликация по хэшу |
-| Домены на общем IP | ограничение числа соединений на IP |
-| Страницы **Laravel** — реальные образцы, предоставленные заказчиком (см. 4.4.2); при необходимости дополняются синтетическими для краевых случаев | положительные срабатывания анализатора и диапазоны версий |
-| Страницы **не Laravel** с похожими признаками (например, `XSRF-TOKEN` от другого фреймворка, `csrf-token` meta без Laravel) | отсутствие ложных срабатываний / низкий score |
+| NXDOMAIN at the apex | the `not_delegated` status, subdomain skipping |
+| NS present, no A/AAAA | the `delegated_no_address` status |
+| SERVFAIL / DNS timeout | the `temp_error` status, retries |
+| Wildcard DNS | wildcard detection and skipping extra subdomains |
+| CNAME chains (incl. a looped one) | chain handling and loop protection |
+| Address present, ports closed | the `no_http` status |
+| http only | one variant, `scheme = http` |
+| https only | one variant, `scheme = https` |
+| http and https lead to one site (an http → https redirect) | a single record |
+| http and https — **different** sites | two records (`variant` 0 and 1) |
+| `bare → www` and `www → bare` redirects | `alias_kind = 2`, a single content copy |
+| `www` and without `www` — the same content without a redirect | `alias_kind = 1` |
+| A redirect chain, `meta refresh`, a JS redirect | finding the final page |
+| An infinite and a circular redirect | the limit triggering |
+| A tarpit (slow read/serving) | minimum speed and timeouts |
+| A huge body, a zip bomb | size and decompression limits |
+| An invalid certificate, an expired one, a mismatching SAN | result recording, loading with `InsecureSkipVerify` |
+| Different encodings (UTF-8, windows-1251, a wrong charset) | conversion to UTF-8 |
+| An SPA shell (`#root`/`#app`, `<noscript>`) | render start, getting the DOM and the cookies set by JS |
+| Cookies and headers | correct recording |
+| Parking/the same pages on different domains | hash deduplication |
+| Domains on a shared IP | the per-IP connection cap |
+| **Laravel** pages — real samples provided by the customer (see 4.4.2); supplemented with synthetic ones for edge cases if needed | positive analyzer hits and version ranges |
+| **Non-Laravel** pages with similar traits (e.g. `XSRF-TOKEN` from another framework, a `csrf-token` meta without Laravel) | no false hits / a low score |
 
-Фикстуры лежат в `testbed/web/sites/<сценарий>/`; зоны — в `testbed/coredns/zones/`. Генерация зон из списка сценариев автоматизируется скриптом (`make testbed-gen`), чтобы не править вручную десятки записей.
+The fixtures live in `testbed/web/sites/<scenario>/`; the zones — in `testbed/coredns/zones/`. Generating the zones from the scenario list is automated by a script (`make testbed-gen`) so that dozens of records are not edited by hand.
 
-### 4.4.1. Сеть testbed
+### 4.4.1. The testbed network
 
-- Отдельная Docker-сеть `crawler_net` (bridge) со статическими IP для `coredns`, `unbound`, `testweb`, `mockserver`, чтобы DNS-зоны ссылались на стабильные адреса.
-- Для проверки «несколько доменов на одном IP» — все домены, указывающие на `testweb`, делят его адрес.
-- Для проверки ограничения по соединениям на IP допускается несколько дополнительных IP (алиасы) на `testweb`.
+- A separate `crawler_net` Docker network (bridge) with static IPs for `coredns`, `unbound`, `testweb`, `mockserver`, so that the DNS zones reference stable addresses.
+- To check "several domains on one IP" — all domains pointing to `testweb` share its address.
+- To check the per-IP connection cap, several extra IPs (aliases) on `testweb` are allowed.
 
-### 4.4.2. Образцы Laravel от заказчика
+### 4.4.2. Laravel samples from the customer
 
-Реальные образцы страниц Laravel предоставляются заказчиком и используются сразу в двух целях: для разработки правил анализатора и как фикстуры testbed.
+Real Laravel page samples are provided by the customer and are used for two purposes at once: for developing the analyzer rules and as testbed fixtures.
 
-Рекомендуемый формат — папка на каждый образец в `testdata/laravel-samples/<id>/`:
+The recommended format is a folder per sample in `testdata/laravel-samples/<id>/`:
 
 ```
-index.html      # итоговый HTML/DOM страницы в том виде, как он будет сохранён сервисом
-headers.json    # заголовки ответа
-cookies.json    # cookies (имя, значение, атрибуты)
-meta.yaml       # is_laravel: true|false, ожидаемый диапазон версий (если известен),
-                # примечание, источник и дата получения
+index.html      # the final HTML/DOM of the page as the service will save it
+headers.json    # the response headers
+cookies.json    # cookies (name, value, attributes)
+meta.yaml       # is_laravel: true|false, the expected version range (if known),
+                # a note, the source and the receipt date
 ```
 
-Использование:
+Usage:
 
-1. **Корпусные тесты анализатора** (`make test-rules`): правила прогоняются напрямую по образцам, без сети, и результат сверяется с `meta.yaml` (ожидаемые `is_laravel`, диапазон версий).
-2. **Фикстуры testbed** (`make testbed-gen`): для каждого образца генерируется тестовый домен вида `<id>.crawl.test`, который отдаёт `index.html` с сохранёнными заголовками и cookies через Caddy. Это позволяет проверять весь конвейер (DNS → HTTP → контент → анализатор), а не только правила.
-3. Образцы **не-Laravel** (в том числе на других фреймворках с похожими признаками, например `XSRF-TOKEN` или `csrf-token`) складываются в тот же каталог с `is_laravel: false` и используются для контроля ложных срабатываний.
+1. **Corpus tests of the analyzer** (`make test-rules`): the rules run directly over the samples, without the network, and the result is checked against `meta.yaml` (the expected `is_laravel`, the version range).
+2. **Testbed fixtures** (`make testbed-gen`): for each sample a test domain of the form `<id>.crawl.test` is generated, which serves `index.html` with the recorded headers and cookies via Caddy. This makes it possible to check the whole pipeline (DNS → HTTP → content → analyzer), not only the rules.
+3. **Non-Laravel** samples (including those on other frameworks with similar traits, e.g. `XSRF-TOKEN` or `csrf-token`) are placed in the same directory with `is_laravel: false` and are used to guard against false hits.
 
-Перед помещением в репозиторий образцы очищаются от персональных данных и секретов (e-mail, реальные токены, ключи); значения токенов и cookies заменяются структурно похожими (та же длина и формат, например `eyJpdiI6…`), чтобы признаки сохранились.
+Before entering the repository the samples are cleaned of personal data and secrets (e-mails, real tokens, keys); token and cookie values are replaced with structurally similar ones (the same length and format, e.g. `eyJpdiI6…`) so that the traits are preserved.
 
-### 4.5. Мониторинг и сервисные инструменты (по профилям)
+### 4.5. Monitoring and service tools (by profiles)
 
-| Сервис | Профиль | Назначение |
+| Service | Profile | Purpose |
 |---|---|---|
-| `prometheus` | `monitoring` | Сбор метрик всех сервисов (просмотр через UI Prometheus и CLI `crawlerctl status`; Grafana в dev не используется) |
-| `adminer` или `pgadmin` | `tools` | Просмотр БД |
-| `redisinsight` или `redis-commander` | `tools` | Просмотр стримов Redis |
+| `prometheus` | `monitoring` | Collecting the metrics of all services (viewed via the Prometheus UI and the `crawlerctl status` CLI; Grafana is not used in dev) |
+| `adminer` or `pgadmin` | `tools` | DB browsing |
+| `redisinsight` or `redis-commander` | `tools` | Redis stream browsing |
 
 ---
 
-## 5. Профили Compose
+## 5. Compose profiles
 
-Использование профилей для включения только нужного:
+Profiles are used to enable only what is needed:
 
-| Профиль | Что включает |
+| Profile | What it enables |
 |---|---|
-| (по умолчанию) | `postgres`, `redis`, `unbound` |
+| (default) | `postgres`, `redis`, `unbound` |
 | `testbed` | `coredns`, `testweb`, `mockserver` |
-| `app` | Go-сервисы проекта и `render-worker` |
+| `app` | the project's Go services and `render-worker` |
 | `monitoring` | `prometheus` |
-| `tools` | `adminer`/`pgadmin`, Redis-UI, контейнер `tools` |
-| `internet` | Unbound с реальной рекурсией и выходом наружу (**только по явному включению**) |
+| `tools` | `adminer`/`pgadmin`, a Redis UI, the `tools` container |
+| `internet` | Unbound with real recursion and outbound access (**only on explicit enablement**) |
 
-Ожидаемый стандартный сценарий разработчика: `make up` (инфраструктура + testbed + app).
+The expected standard developer scenario: `make up` (infrastructure + testbed + app).
 
-Профиль `internet` должен требовать явного подтверждения (переменная `ALLOW_INTERNET=1` в `.env`), чтобы исключить случайные массовые запросы во внешнюю сеть. В этом режиме действуют те же ограничения скорости, что и в боевой конфигурации, а `User-Agent` содержит пометку `dev`.
+The `internet` profile must require explicit confirmation (the `ALLOW_INTERNET=1` variable in `.env`) to rule out accidental mass requests to the external network. In this mode the same rate limits apply as in the production configuration, and the `User-Agent` carries a `dev` marker.
 
 ---
 
-## 6. Dockerfile и сборка
+## 6. The Dockerfile and the build
 
 ### 6.1. `Dockerfile.go` (multi-stage)
 
-- Stage `base`: образ Go (версия фиксируется в `.env`), настройка `GOFLAGS=-mod=readonly`.
-- Stage `dev`: `air`, `delve`, `golangci-lint`, `migrate` (golang-migrate), `crawlerctl`-зависимости; не запускается от root; рабочий каталог `/src`.
-- Stage `build`: сборка статических бинарников всех `cmd/*` (`CGO_ENABLED=0`, `-trimpath`, `-ldflags "-s -w"`).
-- Stage `runtime`: минимальный образ (distroless/alpine), только бинарники и пользователь без привилегий. Используется для проверки «боевого» образа (`make build-runtime`) и в CI.
+- The `base` stage: a Go image (the version is pinned in `.env`), setting `GOFLAGS=-mod=readonly`.
+- The `dev` stage: `air`, `delve`, `golangci-lint`, `migrate` (golang-migrate), the `crawlerctl` dependencies; does not run as root; the working directory `/src`.
+- The `build` stage: building the static binaries of all `cmd/*` (`CGO_ENABLED=0`, `-trimpath`, `-ldflags "-s -w"`).
+- The `runtime` stage: a minimal image (distroless/alpine), only the binaries and an unprivileged user. Used to verify the "production" image (`make build-runtime`) and in CI.
 
-### 6.2. Требования
+### 6.2. Requirements
 
-- Слои кэшируются: сначала `go.mod`/`go.sum` и загрузка модулей, затем код.
-- Версии базовых образов и инструментов фиксируются (не `latest`).
-- Пакеты Go не загружаются повторно при каждом запуске (кэш в томе).
+- Layers are cached: first `go.mod`/`go.sum` and the module download, then the code.
+- The versions of the base images and tools are pinned (not `latest`).
+- Go packages are not re-downloaded on every run (a cache in a volume).
 
 ---
 
-## 7. Сеть, ресурсы и приближение к боевым условиям
+## 7. Network, resources and proximity to production conditions
 
-### 7.1. Лимиты ресурсов
+### 7.1. Resource limits
 
-- У каждого сервиса задан `mem_limit` (и `cpus`, где применимо); суммарные лимиты не превышают 8 ГБ — это позволяет заранее ловить проблемы, которые возникнут на боевом сервере.
-- Переопределение лимитов — через `.env` или `compose.override.yaml` (для слабых машин разработчиков).
+- Every service has a `mem_limit` (and `cpus` where applicable); the total limits do not exceed 8 GB — this lets us catch in advance the problems that will appear on the production server.
+- Limit overrides — via `.env` or `compose.override.yaml` (for weaker developer machines).
 
 ### 7.2. DNS
 
-- Все сервисы приложения используют `unbound` как резолвер (явное `dns:`), системный Docker DNS для них не используется.
-- Для `render-worker` DNS-настройки Chromium также указывают на `unbound`.
+- All application services use `unbound` as the resolver (an explicit `dns:`), the Docker system DNS is not used for them.
+- For `render-worker` the Chromium DNS settings also point to `unbound`.
 
-### 7.3. Файловые лимиты и сетевые параметры
+### 7.3. File limits and network parameters
 
-- В compose задаются `ulimits` (`nofile`) для воркеров.
-- Для сервисов, создающих много соединений, документируются `sysctls` (в частности, `net.ipv4.ip_local_port_range`), доступные на уровне контейнера; настройки уровня хоста (conntrack и т. п.) описываются в `docs/dev-environment.md`.
+- The compose file sets `ulimits` (`nofile`) for the workers.
+- For the services that create many connections, the container-level `sysctls` (in particular, `net.ipv4.ip_local_port_range`) are documented; host-level settings (conntrack etc.) are described in `docs/dev-environment.md`.
 
-### 7.4. Права и пользователи
+### 7.4. Permissions and users
 
-- Bind-mount каталогов выполняется с корректными правами: `UID/GID` разработчика передаются через `.env` и параметр `user:`.
-
----
-
-## 8. Данные и миграции
-
-- Миграции хранятся в `/migrations` (формат `golang-migrate`); применяются командой `make migrate-up` (и `migrate-down`, `migrate-new NAME=…`).
-- При первом запуске окружения БД инициализируется автоматически (init-скрипты + опциональная автомиграция сервисом `migrate` с зависимостью `service_completed_successfully`).
-- `make seed` — загрузка тестовых данных: генерируются списки доменов для тестовых зон в `var/incoming/<зона>/add/*.txt` (в т. ч. IDN-имена и «плохие» строки для проверки отклонения), а также начальный набор `subdomains` (`''`, `www`, `admin`, `crm`, `api`, `app`).
-- `make seed-bulk N=1000000` — генерация большого синтетического набора доменов для замеров производительности и проверки партиционирования (без обращения к сети).
-- `make db-reset` — полное пересоздание БД и томов проекта (с подтверждением).
-- `make psql` — открыть консоль PostgreSQL в контейнере.
+- Bind-mounting the directories is done with correct permissions: the developer's `UID/GID` are passed via `.env` and the `user:` parameter.
 
 ---
 
-## 9. Команды разработчика (`Makefile`)
+## 8. Data and migrations
 
-Обязательный набор целей:
+- The migrations live in `/migrations` (the `golang-migrate` format); applied by `make migrate-up` (and `migrate-down`, `migrate-new NAME=…`).
+- On the first environment start the DB is initialized automatically (the init scripts + optional auto-migration by the `migrate` service with a `service_completed_successfully` dependency).
+- `make seed` — loading test data: domain lists for the test zones are generated into `var/incoming/<zone>/add/*.txt` (including IDN names and "bad" lines to check rejection), plus the initial `subdomains` set (`''`, `www`, `admin`, `crm`, `api`, `app`).
+- `make seed-bulk N=1000000` — generating a large synthetic domain set for performance measurements and partitioning checks (no network access).
+- `make db-reset` — a full recreation of the project DB and volumes (with confirmation).
+- `make psql` — open a PostgreSQL console in a container.
 
-| Команда | Действие |
+---
+
+## 9. Developer commands (the `Makefile`)
+
+The required set of targets:
+
+| Command | Action |
 |---|---|
-| `make up` | Запуск инфраструктуры, testbed и приложений (профили `testbed` + `app`) |
-| `make up-infra` | Только Postgres, Redis, Unbound |
-| `make down` | Остановка (тома сохраняются) |
-| `make clean` | Остановка с удалением томов (с подтверждением) |
-| `make logs SERVICE=…` | Логи сервиса |
-| `make ps` | Состояние сервисов |
-| `make build` / `make build-runtime` | Сборка dev- и боевых образов |
-| `make test` | Модульные тесты Go в контейнере |
-| `make test-integration` | Интеграционные тесты на testbed (поднимает всё необходимое, прогоняет, возвращает код выхода) |
+| `make up` | Bringing up the infrastructure, the testbed and the applications (the `testbed` + `app` profiles) |
+| `make up-infra` | Postgres, Redis, Unbound only |
+| `make down` | Stopping (the volumes are kept) |
+| `make clean` | Stopping with volume removal (with confirmation) |
+| `make logs SERVICE=…` | Service logs |
+| `make ps` | Service state |
+| `make build` / `make build-runtime` | Building the dev and production images |
+| `make test` | Go unit tests in a container |
+| `make test-integration` | Integration tests on the testbed (brings up everything needed, runs, returns the exit code) |
 | `make lint` | `golangci-lint` |
-| `make migrate-up` / `migrate-down` / `migrate-new` | Миграции |
-| `make seed` / `make seed-bulk N=…` | Тестовые данные |
-| `make testbed-gen` | Регенерация зон и фикстур testbed |
-| `make rules-reload` | `SIGHUP` анализатору для перезагрузки правил Laravel |
-| `make reanalyze` | Запуск переанализа (через `crawlerctl`) |
-| `make debug SERVICE=…` | Запуск сервиса под `delve` |
-| `make status` | Вызов `crawlerctl status` (прогресс по зонам, очереди) |
-| `make domain NAME=…` | Поиск домена по имени: статус и признаки Laravel (`crawlerctl domain`) |
-| `make test-rules` | Прогон правил Laravel по корпусу образцов `testdata/laravel-samples` без сети |
-| `make psql` / `make redis-cli` | Консоли БД и Redis |
-| `make shell SERVICE=…` | Оболочка в контейнере |
+| `make migrate-up` / `migrate-down` / `migrate-new` | Migrations |
+| `make seed` / `make seed-bulk N=…` | Test data |
+| `make testbed-gen` | Regenerating the testbed zones and fixtures |
+| `make rules-reload` | `SIGHUP` to the analyzer to reload the Laravel rules |
+| `make reanalyze` | Starting a re-analysis (via `crawlerctl`) |
+| `make debug SERVICE=…` | Running a service under `delve` |
+| `make status` | Calling `crawlerctl status` (zone progress, queues) |
+| `make domain NAME=…` | Searching a domain by name: status and Laravel traits (`crawlerctl domain`) |
+| `make test-rules` | Running the Laravel rules over the `testdata/laravel-samples` sample corpus without the network |
+| `make psql` / `make redis-cli` | The DB and Redis consoles |
+| `make shell SERVICE=…` | A shell in a container |
 
 ---
 
-## 10. Конфигурация и секреты
+## 10. Configuration and secrets
 
-- Все настраиваемые параметры — через `.env` (шаблон `.env.example` в репозитории; сам `.env` в `.gitignore`).
-- Содержимое `.env.example`: версии образов, пароли БД для dev, порты, лимиты памяти, `UID/GID`, `ALLOW_INTERNET`, пути к каталогам данных.
-- Файл конфигурации приложения (YAML из основного ТЗ) для dev лежит в `deploy/docker/config.dev.yaml`; значения (DSN, адрес Redis, резолвер `unbound`, пути) подставляются из окружения.
-- Секреты разработки (пароли) не используются в других окружениях; в репозиторий настоящие секреты не попадают.
-- Порты сервисов проброшены на `127.0.0.1` (а не на все интерфейсы).
-
----
-
-## 11. Тестирование окружения и CI
-
-- В репозитории — workflow **GitHub Actions** (`.github/workflows/ci.yml`), который запускается на push и pull request, собирает образы (с кэшем слоёв), выполняет `make lint`, `make test`, `make test-rules`, `make test-integration`. Окружение в CI поднимается теми же командами и compose-файлами, что и локально.
-- Интеграционные тесты выполняются против testbed и проверяют таблицу сценариев из п. 4.4 (ожидаемые статусы, варианты, алиасы, наличие контента в хранилище, результаты анализатора).
-- Проверка идемпотентности: повторный запуск `make up` и `make seed` не приводит к ошибкам.
-- Проверка холодного старта: на чистой машине (после `make clean`) окружение поднимается командой `make up` без ручных действий, кроме копирования `.env.example` в `.env`.
+- All configurable parameters — via `.env` (a `.env.example` template in the repository; `.env` itself is in `.gitignore`).
+- The contents of `.env.example`: image versions, dev DB passwords, ports, memory limits, `UID/GID`, `ALLOW_INTERNET`, the data directory paths.
+- The application configuration file (the YAML from the main spec) for dev lives in `deploy/docker/config.dev.yaml`; the values (the DSN, the Redis address, the `unbound` resolver, the paths) are substituted from the environment.
+- Development secrets (passwords) are not used in other environments; real secrets never enter the repository.
+- The service ports are published to `127.0.0.1` (not to all interfaces).
 
 ---
 
-## 12. Документация
+## 11. Environment testing and CI
 
-`docs/dev-environment.md` должен содержать:
-
-1. Требования к хосту и быстрый старт (5–7 шагов).
-2. Описание профилей и типовых сценариев работы.
-3. Структуру каталогов (`var/incoming`, `var/content`, тома).
-4. Как добавить новый сценарий в testbed (домен, зона, фикстура, ожидаемый результат в тесте).
-5. Как менять правила Laravel и применять их (`rules-reload`, `reanalyze`).
-6. Отладка (delve), просмотр метрик, БД, очередей.
-7. Диагностику частых проблем (нехватка памяти, права на bind-mount, конфликт портов, DNS-резолв).
-8. Рекомендации по настройке ядра/сети хоста для нагрузочных тестов.
+- The repository has a **GitHub Actions** workflow (`.github/workflows/ci.yml`) that runs on push and pull request, builds the images (with layer caching) and runs `make lint`, `make test`, `make test-rules`, `make test-integration`. The CI environment is brought up with the same commands and compose files as locally.
+- The integration tests run against the testbed and check the scenario table from item 4.4 (the expected statuses, variants, aliases, content present in the storage, analyzer results).
+- An idempotency check: a repeated `make up` and `make seed` produces no errors.
+- A cold start check: on a clean machine (after `make clean`) the environment is brought up by `make up` with no manual actions except copying `.env.example` to `.env`.
 
 ---
 
-## 13. Критерии приёмки
+## 12. Documentation
 
-1. После `cp .env.example .env && make up` на чистой машине поднимаются `postgres`, `redis`, `unbound`, тестовый стенд и все Go-сервисы; все `healthcheck` зелёные в течение разумного времени (≤ 3 минут при загруженных образах).
-2. Изменение Go-кода приводит к автоматической пересборке и перезапуску соответствующего сервиса (hot reload) без пересборки образа.
-3. Файл с доменами, положенный в `var/incoming/<зона>/add/`, обрабатывается и появляется в `processed/`; домены попадают в БД, для IDN-зон и доменов — в punycode-форме.
-4. Сквозная проверка тестовых доменов даёт результаты, соответствующие таблице сценариев (п. 4.4), в том числе: статусы, варианты http/https, алиасы www/без www, срабатывание Laravel-правил на реальных образцах заказчика с ожидаемыми версиями и отсутствие срабатывания на негативных; `make domain NAME=<домен>` показывает статус и признаки.
-5. Сервисы приложения **не имеют выхода в интернет** в режиме `testbed` (проверяется автотестом: запрос к внешнему домену не резолвится/не соединяется).
-6. Режим `internet` включается только явно (`ALLOW_INTERNET=1` + профиль).
-7. `make test` и `make test-integration` проходят в контейнерах без установки Go на хост; интеграционные тесты завершаются с кодом возврата, пригодным для CI.
-8. Суммарные лимиты памяти контейнеров не превышают 8 ГБ; при превышении лимита сервисом контейнер перезапускается без остановки остальных.
-9. `make clean && make up` воспроизводит окружение с нуля без ручных шагов.
-10. Документация (`docs/dev-environment.md`) позволяет новому разработчику запустить окружение без дополнительных пояснений.
+`docs/dev-environment.md` must contain:
+
+1. The host requirements and a quick start (5–7 steps).
+2. A description of the profiles and typical work scenarios.
+3. The directory structure (`var/incoming`, `var/content`, the volumes).
+4. How to add a new scenario to the testbed (a domain, a zone, a fixture, the expected result in a test).
+5. How to change the Laravel rules and apply them (`rules-reload`, `reanalyze`).
+6. Debugging (delve), viewing the metrics, the DB, the queues.
+7. Troubleshooting of common problems (memory shortage, bind-mount permissions, port conflicts, DNS resolution).
+8. Recommendations on host kernel/network tuning for load tests.
 
 ---
 
-## 14. Этапы выполнения
+## 13. Acceptance criteria
 
-| Этап | Содержание |
+1. After `cp .env.example .env && make up` on a clean machine, `postgres`, `redis`, `unbound`, the testbed and all the Go services come up; all `healthcheck`s are green within a reasonable time (≤ 3 minutes with warm images).
+2. A Go code change leads to an automatic rebuild and restart of the corresponding service (hot reload) without rebuilding the image.
+3. A file with domains dropped into `var/incoming/<zone>/add/` is processed and appears in `processed/`; the domains enter the DB, for IDN zones and domains — in punycode form.
+4. The end-to-end check of the test domains gives results matching the scenario table (item 4.4), including: the statuses, the http/https variants, the www/bare aliases, the Laravel rules hitting on the customer's real samples with the expected versions and not hitting on the negatives; `make domain NAME=<domain>` shows the status and the traits.
+5. The application services **have no internet access** in `testbed` mode (checked by an automated test: a request to an external domain does not resolve/connect).
+6. The `internet` mode is enabled only explicitly (`ALLOW_INTERNET=1` + the profile).
+7. `make test` and `make test-integration` pass in containers without installing Go on the host; the integration tests finish with an exit code usable in CI.
+8. The total memory limits of the containers do not exceed 8 GB; when a service exceeds its limit, its container restarts without stopping the others.
+9. `make clean && make up` reproduces the environment from scratch with no manual steps.
+10. The documentation (`docs/dev-environment.md`) lets a new developer bring up the environment without additional explanations.
+
+---
+
+## 14. Implementation stages
+
+| Stage | Content |
 |---|---|
-| 1 | `compose.yaml` с `postgres`, `redis`, `unbound`; `.env.example`; healthchecks; Makefile (базовые цели) |
-| 2 | `Dockerfile.go` (dev/build/runtime), hot reload, общий кэш модулей, запуск сервисов-заглушек |
-| 3 | Миграции, init-скрипты БД, `seed`, каталоги `incoming/`/`content` |
-| 4 | Testbed: `coredns`, `testweb`, `mockserver`; генерация зон; сценарии DNS/HTTP |
-| 5 | Образ и сервис рендера (Chromium), SPA-фикстуры |
-| 6 | Загрузка реальных образцов Laravel заказчика (`testdata/laravel-samples`), негативные образцы, подключение анализатора и правил (`rules-reload`), `make test-rules` |
-| 7 | Профили, мониторинг (Prometheus), инструменты (Adminer, Redis UI) |
-| 8 | Интеграционные тесты на testbed, workflow GitHub Actions |
-| 9 | Отладка (delve), нагрузочный профиль (`seed-bulk`), документация, финальная приёмка |
+| 1 | `compose.yaml` with `postgres`, `redis`, `unbound`; `.env.example`; healthchecks; the Makefile (the basic targets) |
+| 2 | `Dockerfile.go` (dev/build/runtime), hot reload, the shared module cache, starting the stub services |
+| 3 | Migrations, DB init scripts, `seed`, the `incoming/`/`content` directories |
+| 4 | The testbed: `coredns`, `testweb`, `mockserver`; zone generation; the DNS/HTTP scenarios |
+| 5 | The render image and service (Chromium), SPA fixtures |
+| 6 | Loading the customer's real Laravel samples (`testdata/laravel-samples`), negative samples, connecting the analyzer and the rules (`rules-reload`), `make test-rules` |
+| 7 | Profiles, monitoring (Prometheus), tools (Adminer, Redis UI) |
+| 8 | Integration tests on the testbed, the GitHub Actions workflow |
+| 9 | Debugging (delve), the load profile (`seed-bulk`), documentation, the final acceptance |
 
 ---
 
-## 15. Принятые решения и открытые вопросы
+## 15. Accepted decisions and open questions
 
-### 15.1. Решения, подтверждённые заказчиком
+### 15.1. Decisions confirmed by the customer
 
-- Среда разработки — только Linux.
-- CI — GitHub Actions.
-- Боевой сервер запускается через systemd; отдельный compose для production не создаётся.
-- Образцы Laravel для фикстур — реальные, предоставляются заказчиком (раздел 4.4.2).
-- Мониторинг в dev — Prometheus и CLI (`crawlerctl status`); Grafana не используется.
-- Инструменты testbed — CoreDNS и Caddy.
-- Очередь — Redis Streams (как в основном ТЗ).
+- The development environment is Linux only.
+- CI is GitHub Actions.
+- The production server runs under systemd; no separate compose for production is created.
+- The Laravel samples for the fixtures are real, provided by the customer (section 4.4.2).
+- Monitoring in dev is Prometheus and the CLI (`crawlerctl status`); Grafana is not used.
+- The testbed tools are CoreDNS and Caddy.
+- The queue is Redis Streams (as in the main spec).
 
-### 15.2. Остаётся на усмотрение разработки
+### 15.2. Left to the developers' discretion
 
-- Хот-релоад через `air` (допустима замена на аналог при сохранении поведения).
-- Конкретные значения лимитов памяти и параметров образцов уточняются замерами.
+- Hot reload via `air` (replacing it with an equivalent is allowed, keeping the behavior).
+- The specific memory limit values and sample parameters are refined by measurements.
 
-### 15.3. Открытые вопросы
+### 15.3. Open questions
 
-- Срок и формат передачи реальных образцов Laravel (рекомендуемый формат описан в 4.4.2) и наличие образцов не-Laravel страниц для проверки ложных срабатываний.
+- The timing and format of handing over the real Laravel samples (the recommended format is described in 4.4.2) and the availability of non-Laravel page samples for false-positive checks.
