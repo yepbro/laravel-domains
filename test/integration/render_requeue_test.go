@@ -267,9 +267,9 @@ func TestRenderRequeuePass(t *testing.T) {
 	})
 
 	t.Run("повторный проход не выбирает снятое", func(t *testing.T) {
-	// The counter desync > 0 with the flags cleared (the guard trust
-	// boundary, the T-181 §4.3 spec): one idle seq scan per pass — the
-	// selection is empty, the cleared ones are not re-published.
+		// The counter desync > 0 with the flags cleared (the guard trust
+		// boundary, the T-181 §4.3 spec): one idle seq scan per pass — the
+		// selection is empty, the cleared ones are not re-published.
 		if _, err := pool.Exec(ctx,
 			"UPDATE crawler_counters SET value = 1 WHERE name = 'render_pending'"); err != nil {
 			t.Fatal(err)
