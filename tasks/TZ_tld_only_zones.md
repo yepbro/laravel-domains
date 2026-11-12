@@ -1,279 +1,280 @@
-# Техническое задание: зоны только верхнего уровня (TLD-only)
+# Technical Specification: TLD-Only Zones
 
-Версия: 1.0 (дополнение к основному ТЗ [`TZ_domain_crawler.md`](./TZ_domain_crawler.md);
-**заменяет семантику ТЗ 5.2 п. 5** «зона — публичный суффикс по списку
-publicsuffix». Основное ТЗ не редактируется — управляет настоящее
-дополнение, по прецеденту [`TZ_incremental_counters.md`](./TZ_incremental_counters.md)).
+Version: 1.0 (a supplement to the main spec [`TZ_domain_crawler.md`](./TZ_domain_crawler.md);
+**it replaces the semantics of spec §5.2 item 5** "a zone is a public suffix
+from the publicsuffix list". The main spec is not edited — this supplement
+governs, following the precedent of [`TZ_incremental_counters.md`](./TZ_incremental_counters.md)).
 
 ---
 
-## 1. Цель и общее описание
+## 1. Purpose and Overview
 
-Зона домена в системе — **последняя метка имени (TLD)**, а не публичный
-суффикс по Mozilla PSL. `example.5g.in` → зона `in`, label `example.5g`.
-Существующие зоны-публичные-суффиксы (`5g.in`, `co.uk`, `net.in`, …)
-сворачиваются в свои TLD переносом данных; новые не возникают.
+A domain's zone in the system is the **last label of the name (TLD)**, not a
+public suffix per the Mozilla PSL. `example.5g.in` → zone `in`, label `example.5g`.
+The existing public-suffix zones (`5g.in`, `co.uk`, `net.in`, …)
+are collapsed into their TLDs by moving the data; no new ones appear.
 
-### 1.1. Сегодняшнее состояние (что заменяем)
+### 1.1. Current state (what is being replaced)
 
-Зону определяет `internal/idn` (`idn.go`, `Normalize`) вызовом
-`publicsuffix.PublicSuffix` из `golang.org/x/net/publicsuffix` — встроенный
-срез Mozilla PSL. PSL — список для изоляции cookies, куда **реестры сами
-добавляют вторые уровни**: только у `.in` (реестр NIXI) их ~44 — `5g.in`,
-`6g.in`, `ai.in`, `co.in`, `net.in`, `org.in`, …
+The zone is determined by `internal/idn` (`idn.go`, `Normalize`) calling
+`publicsuffix.PublicSuffix` from `golang.org/x/net/publicsuffix` — a bundled
+snapshot of the Mozilla PSL. The PSL is a list for cookie isolation, to which
+**registries themselves add second levels**: `.in` alone (the NIXI registry)
+has ~44 of them — `5g.in`, `6g.in`, `ai.in`, `co.in`, `net.in`, `org.in`, …
 
-Последствия:
+Consequences:
 
-| # | Проблема | Где |
+| # | Problem | Where |
 |---|---|---|
-| 1 | **Полный дамп `.in` через `incoming/in/` невозможен**: у `example.5g.in` суффикс `5g.in` ≠ зона пути `in`, `domainLabel` отвечает `wrong_zone` на каждой строке, файл падает по `ingest.max_error_ratio`. Дамп приходится вручную раскладывать по каталогам `incoming/5g.in/`, `incoming/co.in/`, … | `internal/ingest/validate.go`, `domainLabel` |
-| 2 | Каждая 2LD-зона — строка `zones` и потенциально свой набор партиций (4 таблицы × `hash_parts`): тысячи микрозон-«мусора», которых нет в срезе IANA | `zones`, `create_zone_partitions` |
-| 3 | Набор зон дрейфует с обновлением зависимости: PSL вшит в `golang.org/x/net` (сейчас v0.61.0), реестры добавляют суффиксы — новые «зоны» появляются вне контроля оператора | `go.mod` |
-| 4 | Справочник `zones` расходится с срезом IANA: `crawlerctl zones sync` (T-125) грузит только TLD, `zones --deactivate-missing` не осмыслен, пока в таблице 2LD | `cmd/crawlerctl/zonessync.go` |
+| 1 | **A full `.in` dump via `incoming/in/` is impossible**: for `example.5g.in` the suffix `5g.in` ≠ the path zone `in`, `domainLabel` answers `wrong_zone` on every line, and the file fails on `ingest.max_error_ratio`. The dump has to be manually sorted into the `incoming/5g.in/`, `incoming/co.in/`, … directories | `internal/ingest/validate.go`, `domainLabel` |
+| 2 | Each 2LD zone is a `zones` row and potentially its own set of partitions (4 tables × `hash_parts`): thousands of junk micro-zones absent from the IANA snapshot | `zones`, `create_zone_partitions` |
+| 3 | The zone set drifts with dependency updates: the PSL is embedded in `golang.org/x/net` (currently v0.61.0); registries add suffixes — new "zones" appear outside the operator's control | `go.mod` |
+| 4 | The `zones` reference diverges from the IANA snapshot: `crawlerctl zones sync` (T-125) loads only TLDs; `zones --deactivate-missing` is meaningless while the table has 2LDs | `cmd/crawlerctl/zonessync.go` |
 
-### 1.2. Целевое состояние
+### 1.2. Target state
 
-1. `idn.Normalize`: зона — **последняя метка** ASCII-формы; label — всё
-   до неё (составной label — норма, контракт уже допускал составные метки).
-2. Справочник `zones` = TLD (+ исключения-тестовые зоны из allowlist,
-   §5). `zones sync` — канонический источник справочника.
-3. Каталоги ingest: `incoming/<tld>/add|delete/`. Многоуровневые каталоги —
-   только из allowlist `ingest.allowed_zone_paths` (тестовые зоны testbed).
-4. Данные существующих 2LD-зон переносятся консольной командой
-   **`crawlerctl zones collapse`** (§7) в окне обслуживания по runbook §8.
-5. Зависимость от `golang.org/x/net/publicsuffix` удалена (`idna` остаётся).
+1. `idn.Normalize`: the zone is the **last label** of the ASCII form; the label is
+   everything before it (a composite label is the norm; the contract already
+   allowed composite labels).
+2. The `zones` reference = TLDs (+ exception test zones from the allowlist,
+   §5). `zones sync` is the canonical source of the reference.
+3. Ingest directories: `incoming/<tld>/add|delete/`. Multi-level directories —
+   only from the `ingest.allowed_zone_paths` allowlist (testbed test zones).
+4. The data of the existing 2LD zones is moved by the console command
+   **`crawlerctl zones collapse`** (§7) in a maintenance window per runbook §8.
+5. The dependency on `golang.org/x/net/publicsuffix` is removed (`idna` remains).
 
-### 1.3. Ключевые решения (обоснования — §12)
+### 1.3. Key decisions (rationale — §12)
 
-| Решение | Суть |
+| Decision | Essence |
 |---|---|
-| Голые публичные суффиксы в строках (`co.in` в дампе `.in`) | **Принимаются как мусор** — становятся доменами (`in`, `co`). Фильтрация требует списка суффиксов — возврат PSL, от которого уходим (§12.6) |
-| Селективное схлопывание («`*.in` свернуть, `co.uk` оставить») | Отклонено: две семантики зоны, вечный конфиг-патч за реестрами (§12.3) |
-| PSL только ICANN-секция | Не решает задачу: `5g.in`/`co.in` — ICANN-секция (§12.2) |
-| Перенос данных — CLI, а не файл миграции | Миграции при старте сервисов — только схема, «чистый SQL без кода» (стиль проекта); тяжёлый перенос строк — CLI с батчами, прецедент `zones sync` (§12.4) |
+| Bare public suffixes in the data (`co.in` in an `.in` dump) | **Accepted as junk** — they become domains (`in`, `co`). Filtering would require a suffix list — a return to the PSL we are moving away from (§12.6) |
+| Selective collapsing ("collapse `*.in`, keep `co.uk`") | Rejected: two zone semantics, an endless config chase after registries (§12.3) |
+| The PSL ICANN section only | Does not solve the problem: `5g.in`/`co.in` are in the ICANN section (§12.2) |
+| Data move via CLI, not a migration file | Migrations at service start are schema-only, "pure SQL without code" (project style); a heavy row move is a CLI with batches, the `zones sync` precedent (§12.4) |
 
 ---
 
-## 2. Термины
+## 2. Terms
 
-| Термин | Значение |
+| Term | Meaning |
 |---|---|
-| ТЗ | Основное ТЗ проекта (`TZ_domain_crawler.md`), если не указано иное |
-| ТЗТ | Настоящее ТЗ |
-| TLD | Последняя метка доменного имени (срез IANA `tlds-alpha-by-domain.txt`) |
-| 2LD-зона | Зона в `zones` из нескольких меток, совпадающая с публичным суффиксом PSL (`5g.in`, `co.uk`) — та, что сворачивается |
-| Префикс зоны | 2LD-зона без TLD-хвоста: у `5g.in` — `5g`, у `city.kawasaki.jp` — `city.kawasaki` |
-| Сворачивание (collapse) | Перенос строк 2LD-зоны в TLD-зону: `zone_id` → TLD, `label` → `label || '.' || префикс` |
-| Allowlist каталогов зон | `ingest.allowed_zone_paths` — многоуровневые имена зон, которым разрешено быть каталогами `incoming/<зона>/` (тестовые зоны testbed) |
+| The spec | The project's main spec (`TZ_domain_crawler.md`), unless stated otherwise |
+| This spec | The present specification |
+| TLD | The last label of a domain name (the IANA snapshot `tlds-alpha-by-domain.txt`) |
+| 2LD zone | A multi-label zone in `zones` that matches a PSL public suffix (`5g.in`, `co.uk`) — the kind being collapsed |
+| Zone prefix | A 2LD zone without its TLD tail: for `5g.in` it is `5g`, for `city.kawasaki.jp` it is `city.kawasaki` |
+| Collapse | Moving the rows of a 2LD zone into the TLD zone: `zone_id` → TLD, `label` → `label || '.' || prefix` |
+| Zone directory allowlist | `ingest.allowed_zone_paths` — multi-level zone names allowed to be `incoming/<zone>/` directories (testbed test zones) |
 
 ---
 
-## 3. Ограничения и рамки
+## 3. Constraints and Scope
 
-### 3.1. Рамки (что не входит)
+### 3.1. Scope (what is not included)
 
-1. **Фильтрация голых суффиксов не вводится** (решение §1.3): `co.in`
-   в дампе становится доменом `(in, co)` и живёт общей судьбой (проверки,
-   статусы). Объём — единицы строк на дамп.
-2. **Гранулярность 2LD не сохраняется**: алерты `zone_stats`
-   (доля ошибок DNS по зоне), веса `zone_weights`, приоритеты
-   `requeue_deprioritized_zones` становятся per-TLD. Сломанный реестр
-   `co.in` размажется по зоне `in`.
-3. Схема БД не меняется: партиционирование LIST по `zone_id`, ключи
-   `(zone_id, …)`, `UNIQUE (zone_id, label)` — как есть. Новых
-   SQL-миграций нет.
-4. Семантика `zones enable|disable`, `zones sync`, идемпотентность
-   ingest (T-097), дедуп файлов (T-113) — без изменений.
-5. Down-перенос (TLD → 2LD) не проектируется: миграция необратима
-   (§12.5), откат — восстановление из бэкапа (§8.5).
+1. **No bare-suffix filtering is introduced** (decision §1.3): `co.in`
+   in a dump becomes the domain `(in, co)` and shares the common fate
+   (checks, statuses). The volume is a handful of lines per dump.
+2. **2LD granularity is not preserved**: `zone_stats` alerts
+   (the DNS error share per zone), `zone_weights`,
+   `requeue_deprioritized_zones` priorities become per-TLD. A broken
+   `co.in` registry smears across the `in` zone.
+3. The DB schema does not change: LIST partitioning by `zone_id`, keys
+   `(zone_id, …)`, `UNIQUE (zone_id, label)` — as is. No new
+   SQL migrations.
+4. The semantics of `zones enable|disable`, `zones sync`, ingest
+   idempotency (T-097), file dedup (T-113) — unchanged.
+5. A down-move (TLD → 2LD) is not designed: the migration is irreversible
+   (§12.5); rollback is a restore from backup (§8.5).
 
-### 3.2. Технические ограничения
+### 3.2. Technical constraints
 
-1. Новых зависимостей нет; `go.mod` не меняется: из `golang.org/x/net`
-   уходит использование только `publicsuffix`, `idna` остаётся.
-2. Перенос данных выполняет CLI-команда `crawlerctl zones collapse`
-   (батчи, свой темп), а не авто-миграция при старте сервисов
-   («миграции — чистый SQL», ТЗИ инкрементальных счётчиков §3.2).
-3. PostgreSQL 16: перенос строк между партициями — штатный row movement
-   через `UPDATE` ключа партиционирования.
-4. Окно обслуживания обязательно: во время переноса сервисы остановлены
-   (§8) — иначе старый код пересоздаёт 2LD-зоны, новый пишет дубли до
-   переноса, сообщения очередей несут устаревший `zone_id`.
+1. No new dependencies; `go.mod` is unchanged: only the `publicsuffix`
+   usage leaves `golang.org/x/net`, `idna` remains.
+2. The data move is performed by the CLI command `crawlerctl zones collapse`
+   (batches, its own pace), not by an automatic migration at service start
+   ("migrations are pure SQL", the incremental counters spec §3.2).
+3. PostgreSQL 16: moving rows between partitions is native row movement
+   via an `UPDATE` of the partition key.
+4. A maintenance window is mandatory: during the move the services are stopped
+   (§8) — otherwise the old code recreates 2LD zones, the new code writes
+   duplicates before the move, and queue messages carry a stale `zone_id`.
 
 ---
 
-## 4. Контракт нормализации `internal/idn`
+## 4. `internal/idn` Normalization Contract
 
-### 4.1. Правило отделения зоны
+### 4.1. Zone splitting rule
 
-`Normalize` после `normalizeASCII` (пп. 1–4 конвейера — без изменений):
+`Normalize` after `normalizeASCII` (pipeline steps 1–4 — unchanged):
 
 ```
 i     := LastIndexByte(ascii, '.')
-zone  := ascii[i+1:]        // последняя метка — TLD
-label := ascii[:i]          // всё до неё; может быть составной
+zone  := ascii[i+1:]        // last label — the TLD
+label := ascii[:i]          // everything before it; may be composite
 ```
 
-- `i < 0` (точек нет, имя само TLD) → `ErrNoLabel` — как сегодня для `com`.
-- `isNumericZone(zone)` → `ErrNumericZone` — как сегодня: последняя метка
-  из одних цифр отсекает IPv4-литералы (`1.2.3.4` → зона `4`) и даты
-  выгрузок (`18.06.1999` → зона `1999`). Функция не меняется
-  (цикл по меткам одной метки — тот же результат).
-- `zone == ""` недостижим (normalizeASCII гарантирует непустой ASCII
-  без пустых меток) — существующая страховочная ветка сохраняется.
-- Вызов `publicsuffix.PublicSuffix` и импорт `golang.org/x/net/publicsuffix`
-  удаляются.
+- `i < 0` (no dots, the name is itself a TLD) → `ErrNoLabel` — as today for `com`.
+- `isNumericZone(zone)` → `ErrNumericZone` — as today: a last label
+  made of digits only cuts off IPv4 literals (`1.2.3.4` → zone `4`) and
+  dump dates (`18.06.1999` → zone `1999`). The function is unchanged
+  (iterating over the labels of a single label — the same result).
+- `zone == ""` is unreachable (normalizeASCII guarantees non-empty ASCII
+  without empty labels) — the existing guard branch is kept.
+- The `publicsuffix.PublicSuffix` call and the `golang.org/x/net/publicsuffix`
+  import are removed.
 
-`NormalizeZone` (имя зоны каталога) и `HostToASCII` — без изменений.
+`NormalizeZone` (the zone name of a directory) and `HostToASCII` — unchanged.
 
-### 4.2. Примеры (до → после)
+### 4.2. Examples (before → after)
 
-| Вход | Сегодня (PSL) | После (TLD-only) |
+| Input | Today (PSL) | After (TLD-only) |
 |---|---|---|
-| `example.com` | зона `com`, label `example` | без изменений |
-| `example.5g.in` | зона `5g.in`, label `example` | зона `in`, label `example.5g` |
-| `example.co.uk` | зона `co.uk`, label `example` | зона `uk`, label `example.co` |
-| `example.city.kawasaki.jp` | зона `kawasaki.jp` | зона `jp`, label `example.city.kawasaki` |
-| `example.github.io` | зона `github.io` (частный суффикс) | зона `io`, label `example.github` |
-| `магазин.рф` | зона `xn--p1ai`, label `xn--80adddb…` | без изменений |
-| `example.crawl.test` | зона `test`, label `example.crawl` (правило `*`) | без изменений (теперь всегда) |
-| `github.io` (голый суффикс) | `ErrNoLabel` | **валиден**: зона `io`, label `github` |
-| `co.in` (голый суффикс) | `ErrNoLabel` | **валиден**: зона `in`, label `co` (решение §12.6) |
-| `com` | `ErrNoLabel` | `ErrNoLabel` (без изменений) |
-| `1.2.3.4`, `18.06.1999` | `ErrNumericZone` | `ErrNumericZone` (без изменений) |
+| `example.com` | zone `com`, label `example` | unchanged |
+| `example.5g.in` | zone `5g.in`, label `example` | zone `in`, label `example.5g` |
+| `example.co.uk` | zone `co.uk`, label `example` | zone `uk`, label `example.co` |
+| `example.city.kawasaki.jp` | zone `kawasaki.jp` | zone `jp`, label `example.city.kawasaki` |
+| `example.github.io` | zone `github.io` (a private suffix) | zone `io`, label `example.github` |
+| `магазин.рф` | zone `xn--p1ai`, label `xn--80adddb…` | unchanged |
+| `example.crawl.test` | zone `test`, label `example.crawl` (the `*` rule) | unchanged (now always) |
+| `github.io` (a bare suffix) | `ErrNoLabel` | **valid**: zone `io`, label `github` |
+| `co.in` (a bare suffix) | `ErrNoLabel` | **valid**: zone `in`, label `co` (decision §12.6) |
+| `com` | `ErrNoLabel` | `ErrNoLabel` (unchanged) |
+| `1.2.3.4`, `18.06.1999` | `ErrNumericZone` | `ErrNumericZone` (unchanged) |
 
-### 4.3. Изменения в пакете
+### 4.3. Package changes
 
-| Место | Изменение |
+| Place | Change |
 |---|---|
-| `Normalize` | формула §4.1 вместо `publicsuffix.PublicSuffix` |
-| докстринг пакета (строки 12–13) | «отделение зоны по последней метке (TLD), п. 5 в редакции ТЗТ» |
-| `Result.Zone` (докстринг) | «TLD — последняя метка; составные зоны PSL не выделяются» |
-| `Result.Label` (докстринг) | «составной label — норма для зон с 2LD-регистрацией» |
-| `ErrNumericZone`, `ErrNoLabel` (докстринг) | формулировки без отсылки к PSL-правилу `*` |
-| импорт `golang.org/x/net/publicsuffix` | удалить |
+| `Normalize` | the §4.1 formula instead of `publicsuffix.PublicSuffix` |
+| the package docstring (lines 12–13) | "the zone is split off by the last label (TLD), item 5 as amended by this spec" |
+| `Result.Zone` (docstring) | "the TLD — the last label; composite PSL zones are not detected" |
+| `Result.Label` (docstring) | "a composite label is the norm for zones with 2LD registrations" |
+| `ErrNumericZone`, `ErrNoLabel` (docstrings) | wording without a reference to the PSL `*` rule |
+| the `golang.org/x/net/publicsuffix` import | remove |
 
-`IsIDN` семантики не меняется: `HasXNLabel(label)` по составному label
-даёт тот же результат, что раньше по метке домена (любая A-метка слева
-от зоны даёт бит).
+The `IsIDN` semantics is unchanged: `HasXNLabel(label)` over a composite label
+gives the same result as before over the domain's label (any A-label to the left
+of the zone sets the bit).
 
 ---
 
-## 5. Ingest: каталоги зон и валидация
+## 5. Ingest: Zone Directories and Validation
 
-### 5.1. Каталоги зон
+### 5.1. Zone directories
 
-- `incoming/<tld>/add|delete/` — рабочий путь; полный дамп TLD
-  (`incoming/in/` со строками `example.5g.in`) принимается целиком.
-- Зона-less файлы (`add|delete/<файл>`) — механика без изменений:
-  зона строки выводится из имени (`idn.Result.Zone`), теперь это TLD.
-- **Многоуровневый каталог** (`incoming/<зона с точкой>/`) — только если
-  зона входит в `ingest.allowed_zone_paths` (§6). Иначе `NewValidator`
-  возвращает ошибку уровня файла, watcher переносит файл в `failed/`
-  с причиной (семантика T-021), строки не разбираются.
-- Назначение allowlist — тестовые зоны testbed (`crawl.test`), которым
-  ТLD-семантика запрещает быть «зоной пути». Продуктовый конфиг — пуст.
+- `incoming/<tld>/add|delete/` — the working layout; a full TLD dump
+  (`incoming/in/` with `example.5g.in` lines) is accepted as a whole.
+- Zone-less files (`add|delete/<file>`) — the mechanics are unchanged:
+  a line's zone is derived from the name (`idn.Result.Zone`), which is now the TLD.
+- **A multi-level directory** (`incoming/<dotted zone>/`) — only if the
+  zone is listed in `ingest.allowed_zone_paths` (§6). Otherwise `NewValidator`
+  returns a file-level error and the watcher moves the file to `failed/`
+  with the reason (T-021 semantics); lines are not parsed.
+- The allowlist exists for testbed test zones (`crawl.test`) which
+  TLD semantics forbids from being a "path zone". The production config is empty.
 
 ### 5.2. `domainLabel`
 
-Логика структуры не меняется, меняются входные данные (`res.Zone` — TLD):
+The structural logic is unchanged; the inputs change (`res.Zone` — a TLD):
 
-1. `res.Zone == zone` (путь — TLD имени) → label `res.Label`
-   (составной — норма): `example.5g.in` в `incoming/in/` → `example.5g`.
-2. `res.ASCII == zone` → `ReasonNoLabel` (само имя — зона пути;
-   для TLD-путей раньше ловит `idn.Normalize`, ветка — страховка).
-3. Имя оканчивается на `.zone` **и** `zone` оканчивается на `.`+TLD
-   (путь глубже TLD — allowlisted тестовая зона) → label без хвоста:
-   `example.crawl.test` в `incoming/crawl.test/` → label `example`.
-   Иначе — `ReasonWrongZone`.
+1. `res.Zone == zone` (the path is the name's TLD) → label `res.Label`
+   (a composite one is the norm): `example.5g.in` in `incoming/in/` → `example.5g`.
+2. `res.ASCII == zone` → `ReasonNoLabel` (the name itself is the path zone;
+   for TLD paths `idn.Normalize` catches it earlier, the branch is a guard).
+3. The name ends with `.zone` **and** `zone` ends with `.`+TLD
+   (the path is deeper than the TLD — an allowlisted test zone) → the label without the tail:
+   `example.crawl.test` in `incoming/crawl.test/` → label `example`.
+   Otherwise — `ReasonWrongZone`.
 
-Ветка 3 для allowlisted зон — та же, что сегодня обслуживала не-PSL
-зоны путей: код `domainLabel` не меняется, проверка allowlist стоит
-раньше (в `NewValidator`).
+Branch 3 for allowlisted zones is the same one that today served non-PSL
+path zones: the `domainLabel` code is unchanged, the allowlist check happens
+earlier (in `NewValidator`).
 
-### 5.3. Ошибки
+### 5.3. Errors
 
-Новые причины строк не вводятся. Изменяется покрытие `wrong_zone`:
-- `example.co.uk` в `incoming/uk/`: сегодня reject → после accept.
-- `example.5g.in` в `incoming/in/`: сегодня reject → после accept.
+No new line reasons are introduced. The `wrong_zone` coverage changes:
+- `example.co.uk` in `incoming/uk/`: today reject → after: accept.
+- `example.5g.in` in `incoming/in/`: today reject → after: accept.
 
 ---
 
-## 6. Конфигурация
+## 6. Configuration
 
-### 6.1. Новое поле
+### 6.1. New field
 
 ```yaml
 ingest:
-  # Многоуровневые зоны, которым разрешено быть каталогами
-  # incoming/<зона>/ (тестовые зоны; пример — crawl.test в testbed).
-  # Продуктовое значение — пусто: рабочие каталоги только TLD.
+  # Multi-level zones allowed to be incoming/<zone>/ directories
+  # (test zones; example — crawl.test in the testbed).
+  # The production value is empty: working directories are TLDs only.
   allowed_zone_paths: []
 ```
 
 - `Ingest.AllowedZonePaths []string` (`yaml:"allowed_zone_paths"`),
-  дефолт `nil` (пусто).
-- Валидация: каждая запись — валидное имя зоны по `idn.NormalizeZone`,
-  нижний регистр punycode, **минимум одна точка** (TLD-зоне в allowlist
-  делать нечего). Нормализация и дедуп — при загрузке конфига
-  (стиль `ZoneWeights`, config.go `Validate`).
-- Сообщение об ошибке валидации указывает пример (`crawl.test`).
+  default `nil` (empty).
+- Validation: every entry is a valid zone name per `idn.NormalizeZone`,
+  lowercase punycode, **at least one dot** (a TLD zone has no business
+  in the allowlist). Normalization and dedup happen at config load
+  (the `ZoneWeights` style, config.go `Validate`).
+- The validation error message cites the example (`crawl.test`).
 
-### 6.2. Сопутствующие правки текстов
+### 6.2. Related text edits
 
-- `config.go`, валидация `scheduler.zone_weights` (строка ~1109) и
-  `render.requeue_deprioritized_zones` (~1302): убрать из текстов
-  «составные — co.uk» — ключи теперь TLD (`in`, `uk`, `xn--p1ai`).
-  Сам regex `zoneNameRe` не меняется (allowlist-имена с точками
-  валидируются отдельно).
-- `config.example.yaml`: комментарий к `zone_weights` — имена TLD;
-  новый блок §6.1.
+- `config.go`, the `scheduler.zone_weights` validation (line ~1109) and
+  `render.requeue_deprioritized_zones` (~1302): remove "composite — co.uk"
+  from the texts — the keys are now TLDs (`in`, `uk`, `xn--p1ai`).
+  The `zoneNameRe` regex itself is unchanged (allowlist names with dots
+  are validated separately).
+- `config.example.yaml`: the `zone_weights` comment — TLD names;
+  the new §6.1 block.
 
 ---
 
-## 7. CLI: `crawlerctl zones collapse` (миграция данных)
+## 7. CLI: `crawlerctl zones collapse` (data migration)
 
-### 7.1. Семантика
+### 7.1. Semantics
 
 ```
-crawlerctl zones collapse              # dry-run: инвентаризация и план, ничего не меняет
-crawlerctl zones collapse --apply      # выполнение переноса
-crawlerctl zones collapse --apply --skip-reconcile   # без реконсиляции счётчиков в конце
-crawlerctl zones collapse --force      # игнорировать предупреждение о check_state = 1
+crawlerctl zones collapse              # dry-run: inventory and plan, changes nothing
+crawlerctl zones collapse --apply      # performs the move
+crawlerctl zones collapse --apply --skip-reconcile   # without counter reconciliation at the end
+crawlerctl zones collapse --force      # ignore the check_state = 1 warning
 ```
 
-- Команда группы `zones` (прецедент — `zones sync`, T-125), DSN из
-  конфигурации, allowlist — из того же конфига (его зоны **не
-  сворачиваются** — `crawl.test` живёт как зона).
-- **Идемпотентна и возобновляема**: повторный запуск продолжает
-  с места остановки — переносятся только строки, ещё лежащие в 2LD-зоне
-  (батч §7.3 адресует `zone_id = <2LD>`; уже перенесённые строки под
-  предикат не попадают). Отсутствие 2LD-зон — no-op.
-- Предусловие: в затрагиваемых зонах нет доменов `check_state = 1`
-  (в очереди). Есть — отказ с перечнем зон (или `--force` после разбора
-  оператором, §8.2).
+- A command of the `zones` group (precedent — `zones sync`, T-125); the DSN comes
+  from the configuration, the allowlist from the same config (its zones are
+  **not collapsed** — `crawl.test` lives on as a zone).
+- **Idempotent and resumable**: a repeated run continues
+  from where it stopped — only rows still sitting in the 2LD zone
+  are moved (a §7.3 batch addresses `zone_id = <2LD>`; already moved rows do not
+  match the predicate). No 2LD zones — a no-op.
+- Precondition: no domains with `check_state = 1`
+  (queued) in the affected zones. If there are — refuse with the list of zones (or `--force` after
+  the operator's review, §8.2).
 
-### 7.2. Алгоритм (по каждой 2LD-зоне Z → TLD T)
+### 7.2. Algorithm (per 2LD zone Z → TLD T)
 
-Инвентаризация (список для dry-run и цикла):
+Inventory (the list for the dry-run and the loop):
 
 ```sql
 SELECT z.id, z.name, z.domains_total,
        (SELECT count(*) FROM domains d WHERE d.zone_id = z.id) AS domains_now
 FROM zones z
 WHERE z.name LIKE '%.%'
-  AND z.name <> ALL($1)      -- allowlist из конфига
+  AND z.name <> ALL($1)      -- allowlist from the config
 ORDER BY z.name;
 ```
 
-Для каждой зоны `Z` (id `zid`, name `zname`): `T` = последняя метка
-`zname` (Go: `LastIndexByte`), `prefix` = `zname` без `.{T}`
+For each zone `Z` (id `zid`, name `zname`): `T` = the last label
+of `zname` (Go: `LastIndexByte`), `prefix` = `zname` without `.{T}`
 (`5g.in` → `T=in`, `prefix=5g`; `city.kawasaki.jp` → `T=jp`,
 `prefix=city.kawasaki`).
 
-**Шаг 1 — зона T.** Найти `zones` по имени; нет — создать (unicode-форма
-для XN-зон — `idn.ToUnicode`, ASCII — NULL; `is_active = true`, стиль
-`zones sync`):
+**Step 1 — the T zone.** Look up `zones` by name; if absent — create it (the unicode form
+for XN zones — `idn.ToUnicode`, ASCII — NULL; `is_active = true`, the
+`zones sync` style):
 
 ```sql
 SELECT id FROM zones WHERE name = $t;
@@ -281,22 +282,22 @@ INSERT INTO zones (name, name_unicode, is_active)
 VALUES ($t, NULLIF($unicode, ''), true) RETURNING id;
 ```
 
-**Шаг 2 — партиции T** (до переноса, чтобы строки ложились сразу в
-выделенные партиции; идемпотентно — существующие пропускаются NOTICE):
+**Step 2 — the T partitions** (before the move, so that rows land directly in the
+dedicated partitions; idempotent — existing ones are skipped with a NOTICE):
 
 ```sql
 CALL create_zone_partitions($tid);
 ```
 
-**Шаг 3 — множество переносимых id** (temp-таблица на сессию команды):
+**Step 3 — the set of ids to move** (a temp table for the command's session):
 
 ```sql
 CREATE TEMP TABLE moving_ids AS SELECT id FROM domains WHERE zone_id = $zid;
 CREATE INDEX ON moving_ids (id);
 ```
 
-**Шаг 4 — перенос батчами** (§7.3): по каждой таблице — `UPDATE` с
-row movement (PG16 переносит строки в партиции T автоматически):
+**Step 4 — batched move** (§7.3): per table — an `UPDATE` with
+row movement (PG16 moves rows into the T partitions automatically):
 
 ```sql
 UPDATE domains
@@ -313,17 +314,17 @@ UPDATE laravel_findings  SET zone_id = $tid
 WHERE zone_id = $zid AND domain_id >= $lo AND domain_id < $hi;
 ```
 
-`laravel_history` (без партиций, объём на порядки меньше) — одним
-оператором на зону:
+`laravel_history` (no partitions, an order of magnitude smaller) — in one
+statement per zone:
 
 ```sql
 UPDATE laravel_history SET zone_id = $tid WHERE zone_id = $zid;
 ```
 
-**Шаг 5 — дедуп-журнал `ingest_files`** (перепривязка к T сохраняет
-дедуп точной повторной доставки, T-113; конфликт ключа
-`(zone_id, action, sha256)` возможен, если то же содержимое уже
-доставлялось в T — дубль удаляется, остаётся строка-владелец):
+**Step 5 — the `ingest_files` dedup journal** (rebinding to T keeps the dedup
+of exact redelivery accurate, T-113; a conflict of the key
+`(zone_id, action, sha256)` is possible if the same content was already
+delivered to T — the duplicate is deleted, the owning row remains):
 
 ```sql
 DELETE FROM ingest_files a
@@ -335,9 +336,9 @@ WHERE a.zone_id = $zid AND b.zone_id = $tid
 UPDATE ingest_files SET zone_id = $tid WHERE zone_id = $zid;
 ```
 
-**Шаг 6 — партиции Z дропнуть** (выборка из каталога по границе
-`FOR VALUES IN (zid)` — тот же приём, что в `create_zone_partitions`;
-`DROP TABLE` партиции-родителя зоны уносит её hash-листья):
+**Step 6 — drop the Z partitions** (a selection from the catalog by the
+`FOR VALUES IN (zid)` bound — the same technique as in `create_zone_partitions`;
+`DROP TABLE` of the zone's parent partition takes its hash leaves with it):
 
 ```sql
 SELECT p.relname AS parent, c.relname AS part
@@ -349,224 +350,224 @@ WHERE n.nspname = current_schema()
   AND p.relname IN ('domains','subdomain_results','laravel_domains','laravel_findings')
   AND pg_get_expr(c.relpartbound, c.oid) IN (
       format('FOR VALUES IN (%s)', $zid), format('FOR VALUES IN (%L)', $zid::text));
--- DROP TABLE <part> по каждой строке результата
+-- DROP TABLE <part> for each result row
 ```
 
-**Шаг 7 — строка зоны:**
+**Step 7 — the zone row:**
 
 ```sql
 DELETE FROM zones WHERE id = $zid;
 ```
 
-**Шаг 8 — счётчики.** Колонки `zones` (`domains_total`, `domains_checked`,
-`domains_pending`, `domains_queued`) не мержатся вручную: после всех зон
-команда вызывает общую реконсиляцию счётчиков (тот же агрегат, что
-`monitor` `ZoneStatsOnce` / `crawlerctl counters`, T-178) — она
-авторитетно пересчитает и T, и глобальные кумулятивы. `--skip-reconcile`
-оставляет это первому проходу monitor после старта.
+**Step 8 — counters.** The `zones` columns (`domains_total`, `domains_checked`,
+`domains_pending`, `domains_queued`) are not merged manually: after all zones
+the command runs the general counter reconciliation (the same aggregate as
+`monitor` `ZoneStatsOnce` / `crawlerctl counters`, T-178) — it
+authoritatively recomputes both T and the global cumulatives. `--skip-reconcile`
+leaves this to the first monitor pass after startup.
 
-`DROP TABLE moving_ids` — в конце команды.
+`DROP TABLE moving_ids` — at the end of the command.
 
-### 7.3. Батчинг
+### 7.3. Batching
 
-- Go перебирает `moving_ids` по возрастанию `id` окнами по
-  `batch = 50000` id (константа, не конфиг): `lo`/`hi` — границы окна.
-- Каждый батч — **отдельная транзакция** (4 `UPDATE` шага 4 одного
-  диапазона вместе: домены и их дети переезжают атомарно на батч).
-- Нарушение `UNIQUE (zone_id, label)` в батче невозможно (доказательство
-  §12.5); если аномальные данные всё же дают конфликт — транзакция батча
-  откатывается, команда останавливается с ошибкой и именем зоны
-  (естественная защита, отдельный pre-check не нужен).
-- Между батчами — пауза-троттлинг не вводится (окно обслуживания,
-  конкурентной записи нет); WAL/bloat закрываются `VACUUM (ANALYZE)`
-  затронутых таблиц в конце (шаг post, §8.4).
+- Go iterates over `moving_ids` in ascending `id` in windows of
+  `batch = 50000` ids (a constant, not config): `lo`/`hi` are the window bounds.
+- Each batch is a **separate transaction** (the 4 `UPDATE`s of step 4 for one
+  range together: domains and their children move atomically per batch).
+- A `UNIQUE (zone_id, label)` violation within a batch is impossible (proof in
+  §12.5); if anomalous data still produce a conflict — the batch transaction
+  rolls back and the command stops with an error and the zone name
+  (a natural safeguard; a separate pre-check is not needed).
+- No throttling pause between batches (a maintenance window,
+  no concurrent writes); WAL/bloat are handled by `VACUUM (ANALYZE)`
+  of the affected tables at the end (the post step, §8.4).
 
-### 7.4. Отчёт
+### 7.4. Report
 
-Dry-run и `--apply` печатают таблицу (стиль `zones sync`):
+Dry-run and `--apply` print a table (the `zones sync` style):
 
 ```
-зона        TLD   доменов  результатов  находок  история  файлов  партиции
-5g.in       in       12345       456789    12345     1234      12  есть
+zone        TLD   domains  results  findings  history  files  partitions
+5g.in       in       12345       456789    12345     1234      12  yes
 co.in       in      456789      1234567   456789    45678      3  default
 …           …           …           …        …        …       …  …
-итого: 2LD-зон 44, доменов 1 234 567 → зона in
+total: 44 2LD zones, 1,234,567 domains → zone in
 ```
 
-После `--apply` — сводка перенесённого по зонам и итог реконсиляции.
+After `--apply` — a per-zone summary of what was moved and the reconciliation result.
 
-### 7.5. Пост-проверки (команда, всегда)
+### 7.5. Post-checks (the command, always)
 
 ```sql
--- 2LD-зон вне allowlist не осталось
+-- no 2LD zones outside the allowlist remain
 SELECT count(*) FROM zones WHERE name LIKE '%.%' AND name <> ALL($1);            -- 0
 
--- сиротских zone_id в доменных таблицах нет
+-- no orphan zone_id in the domain tables
 SELECT count(*) FROM domains d
 WHERE NOT EXISTS (SELECT 1 FROM zones z WHERE z.id = d.zone_id);                 -- 0
--- (аналогично subdomain_results, laravel_domains, laravel_findings, laravel_history)
+-- (same for subdomain_results, laravel_domains, laravel_findings, laravel_history)
 
--- счётчики зон = агрегат (после реконсиляции)
+-- zone counters = the aggregate (after reconciliation)
 ```
 
-Плюс спот-чек одного перенесённого имени: `domain_info('<домен>.<Z>)`
-возвращает зону `T`, label с доклеенным префиксом.
+Plus a spot check of one moved name: `domain_info('<domain>.<Z>)`
+returns the zone `T`, a label with the appended prefix.
 
 ---
 
-## 8. Runbook окна обслуживания
+## 8. Maintenance Window Runbook
 
-Порядок обязателен: смешение старого/нового кода с наполовину
-перенесёнными данными даёт дубли и пересоздание зон.
+The order is mandatory: mixing old/new code with half-moved
+data produces duplicates and recreated zones.
 
-### 8.1. Подготовка
+### 8.1. Preparation
 
-1. Выкатить сборку с волнами 1–4 (код + collapse) **без запуска**
-   (образы собраны, стек остановлен — обновление не стартует сервисы
-   до команды оператора).
-2. Бэкап БД (`pg_dump` или снапшок тома) — единственный путь отката (§8.5).
-3. Зафиксировать инвентаризацию: `crawlerctl zones collapse` (dry-run).
+1. Ship the build with waves 1–4 (code + collapse) **without starting it**
+   (the images are built, the stack is stopped — the update does not start the services
+   until the operator's command).
+2. A DB backup (`pg_dump` or a volume snapshot) — the only rollback path (§8.5).
+3. Record the inventory: `crawlerctl zones collapse` (dry-run).
 
-### 8.2. Тишина
+### 8.2. Quiesce
 
-4. Остановить источники работы: ingest (watcher) и scheduler — новые
-   задачи не публикуются.
-5. Дождаться опустошения стримов `q:dns`, `q:http`, `q:analyze`,
-   `q:render` (воркеры добивают хвост; контроль — `crawlerctl status`
-   / `redis-cli XLEN`). Сообщения несут `zone_id` (queue/message.go) —
-   задачи удалённых зон, выполненные после переноса, записали бы
-   результаты с несуществующим `zone_id` в DEFAULT-партиции.
-6. Остановить воркеров, analyzer, monitor, render-worker, web.
-   Экстренный вариант (хвост не дренируется): `DEL` стримов и перевод
-   зависших задач в pending — `UPDATE domains SET check_state = 0,
-   queued_at = NULL WHERE check_state = 1`; идемпотентность конвейера
-   (T-097) гарантирует корректность повторной выборки.
+4. Stop the sources of work: ingest (the watcher) and the scheduler — no new
+   tasks are published.
+5. Wait for the `q:dns`, `q:http`, `q:analyze`,
+   `q:render` streams to drain (the workers finish the tail; the check — `crawlerctl status`
+   / `redis-cli XLEN`). Messages carry a `zone_id` (queue/message.go) —
+   tasks of removed zones executed after the move would write
+   results with a non-existent `zone_id` into the DEFAULT partitions.
+6. Stop the workers, analyzer, monitor, render-worker, web.
+   The emergency option (the tail does not drain): `DEL` the streams and return
+   stuck tasks to pending — `UPDATE domains SET check_state = 0,
+   queued_at = NULL WHERE check_state = 1`; the pipeline idempotency
+   (T-097) guarantees the correctness of the re-selection.
 
-### 8.3. Перенос
+### 8.3. Move
 
-7. `crawlerctl zones collapse --apply` (предусловие §7.1 проверит
-   `check_state = 1`; при `--force` из шага 6 — осознанно).
-8. Пост-проверки §7.5, спот-чек `domain_info('example.5g.in')` → зона
+7. `crawlerctl zones collapse --apply` (the §7.1 precondition will check
+   `check_state = 1`; with `--force` from step 6 — deliberate).
+8. The §7.5 post-checks, the spot check `domain_info('example.5g.in')` → zone
    `in`, label `example.5g`.
 
-### 8.4. Финал
+### 8.4. Finale
 
 9. `VACUUM (ANALYZE) domains, subdomain_results, laravel_domains,
-   laravel_findings;` (bloat после row movement).
-10. Стек со сборкой шага 1 — сервисы стартуют на новой схеме данных;
-    monitor первой реконсиляцией подтверждает счётчики.
-11. Почистить каталоги `var/incoming/<2LD>/` (если складывали дампы
-    по старой схеме) — с allowlist §5.1 файл оттуда упадёт в `failed/`,
-    но чистота лучше; при желании — `crawlerctl zones sync`.
+   laravel_findings;` (bloat after row movement).
+10. The stack with the step 1 build — the services start on the new data schema;
+    monitor confirms the counters with its first reconciliation.
+11. Clean up the `var/incoming/<2LD>/` directories (if dumps were sorted there
+    under the old scheme) — with the §5.1 allowlist a file from there would fall into `failed/`,
+    but cleanliness is better; optionally — `crawlerctl zones sync`.
 
-### 8.5. Откат
+### 8.5. Rollback
 
-Восстановление бэкапа шага 2 целиком. Частичный откат (вернуть одну
-зону) невозможен: отличить перенесённый составной label от исконного
-(`foo.bar.in` всегда жил в зоне `in` с label `foo.bar`) нельзя (§12.5).
+Restore the step 2 backup in full. A partial rollback (bringing back one
+zone) is impossible: a moved composite label cannot be distinguished from a
+native one (`foo.bar.in` always lived in the `in` zone with the label `foo.bar`) (§12.5).
 
 ---
 
-## 9. Тесты
+## 9. Tests
 
-| Слой | Что проверяется |
+| Layer | What is verified |
 |---|---|
-| `internal/idn` юнит + корпус (T-010) | таблица §4.2 целиком: `co.uk`/`5g.in`/`github.io`/`kawasaki.jp` → TLD-зоны и составные label; голые `github.io`/`co.in` валидны; `com` — `ErrNoLabel`; `1.2.3.4`/даты — `ErrNumericZone`; `IsIDN` на составных label |
-| `internal/ingest` | `incoming/in/` + `example.5g.in` → accept, label `example.5g` (бывший `wrong_zone`); мультилейбл-каталог без allowlist — ошибка файла; с allowlist `crawl.test` — accept по ветке 3 §5.2; `wrong_zone` на чужом TLD; зона-less файл со смешанными TLD |
-| `internal/config` | `allowed_zone_paths`: пусто по умолчанию, валидные/невалидные записи (без точки, не-зона), дедуп; тексты ошибок `zone_weights`/`requeue_deprioritized_zones` |
-| `crawlerctl zones collapse` интеграционный (`test/integration`) | на сидированной схеме: 2LD-зона с доменами/результатами/находками/history/ingest_files (+партиции и без) → `--apply` переносит всё, доклеивает label, дропает партиции, удаляет зону, перепривязывает ingest_files (включая конфликт дубля); повторный запуск — no-op; прерванный запуск (после N батчей) — продолжается; allowlist-зона не тронута; пост-проверки §7.5 зелёные |
-| testbed | конфиг testbed с `allowed_zone_paths: [crawl.test]`; e2e-сценарии ingest→check в зоне `crawl.test` проходят |
+| `internal/idn` unit + corpus (T-010) | the §4.2 table in full: `co.uk`/`5g.in`/`github.io`/`kawasaki.jp` → TLD zones and composite labels; bare `github.io`/`co.in` are valid; `com` — `ErrNoLabel`; `1.2.3.4`/dates — `ErrNumericZone`; `IsIDN` on composite labels |
+| `internal/ingest` | `incoming/in/` + `example.5g.in` → accept, label `example.5g` (the former `wrong_zone`); a multi-label directory without the allowlist — a file error; with the allowlist `crawl.test` — accept via branch 3 of §5.2; `wrong_zone` on a foreign TLD; a zone-less file with mixed TLDs |
+| `internal/config` | `allowed_zone_paths`: empty by default, valid/invalid entries (no dot, not a zone), dedup; the error texts of `zone_weights`/`requeue_deprioritized_zones` |
+| `crawlerctl zones collapse` integration (`test/integration`) | on a seeded schema: a 2LD zone with domains/results/findings/history/ingest_files (with and without partitions) → `--apply` moves everything, appends the label suffix, drops the partitions, deletes the zone, rebinds ingest_files (including the duplicate conflict); a repeated run — a no-op; an interrupted run (after N batches) — continues; the allowlist zone is untouched; the §7.5 post-checks are green |
+| testbed | the testbed config with `allowed_zone_paths: [crawl.test]`; the e2e ingest→check scenarios in the `crawl.test` zone pass |
 
-Общие критерии: `make test`, `make lint`, `make test-integration` — зелёные.
+General criteria: `make test`, `make lint`, `make test-integration` — green.
 
 ---
 
-## 10. Документация
+## 10. Documentation
 
-| Файл | Изменение |
+| File | Change |
 |---|---|
-| `docs/schema.md` | §«Обработка имени» (`domain_info`): зона — TLD, «самый длинный суффикс из `zones`» остаётся верным (справочник — TLD + allowlist); пример `site.co.uk` → зона `uk` |
-| `docs/incoming-files.md` | каталоги `incoming/<tld>/`, allowlist, запрет прочих многоуровневых каталогов |
-| `docs/configuration.md` + `config.example.yaml` | `ingest.allowed_zone_paths`; комментарии `zone_weights`/`requeue_deprioritized_zones` — имена TLD |
-| `docs/runbooks.md` | runbook §8 (окно сворачивания зон) |
-| `tasks.md` | указатель добавлен: этап 30, T-194…T-198 |
+| `docs/schema.md` | the "Name processing" section (`domain_info`): the zone is a TLD, "the longest suffix from `zones`" remains true (the reference is TLDs + the allowlist); the `site.co.uk` example → zone `uk` |
+| `docs/incoming-files.md` | the `incoming/<tld>/` directories, the allowlist, the prohibition of other multi-level directories |
+| `docs/configuration.md` + `config.example.yaml` | `ingest.allowed_zone_paths`; the `zone_weights`/`requeue_deprioritized_zones` comments — TLD names |
+| `docs/runbooks.md` | runbook §8 (the zone collapse window) |
+| `tasks.md` | the index entry added: stage 30, T-194…T-198 |
 
 ---
 
-## 11. Этапы реализации
+## 11. Implementation Stages
 
-Задачи заведены в [`tasks.md`](./tasks.md) этапом 30: T-194…T-198,
-одна задача на волну.
+Tasks are filed in [`tasks.md`](./tasks.md) as stage 30: T-194…T-198,
+one task per wave.
 
-| Волна | Задача | Содержимое | Критерий приёмки |
+| Wave | Task | Content | Acceptance criterion |
 |---|---|---|---|
-| 1 | T-194 | `internal/idn`: TLD-отделение, удаление `publicsuffix`, докстринги; корпус/юнит-тесты §9 | `make test` зелёный; таблица §4.2 зафиксирована тестами |
-| 2 | T-195 | `internal/ingest` + `internal/config`: allowlist каталогов, тексты; тесты §9 | `make test` зелёный |
-| 3 | T-196 | `crawlerctl zones collapse` + интеграционный тест §9 | `make test-integration` зелёный; dry-run на dev-стеке читаем |
-| 4 | T-197 | Документация §10, testbed-конфиг | ревью доков; testbed-сценарии проходят |
-| 5 | T-198 | Окно обслуживания по §8 на продуктивных данных | пост-проверки §7.5 зелёные; дамп `.in` принимается через `incoming/in/` одним файлом |
+| 1 | T-194 | `internal/idn`: TLD splitting, removal of `publicsuffix`, docstrings; corpus/unit tests §9 | `make test` green; the §4.2 table pinned by tests |
+| 2 | T-195 | `internal/ingest` + `internal/config`: the directory allowlist, the texts; tests §9 | `make test` green |
+| 3 | T-196 | `crawlerctl zones collapse` + the integration test §9 | `make test-integration` green; the dry-run on the dev stack is readable |
+| 4 | T-197 | Documentation §10, the testbed config | the doc review; the testbed scenarios pass |
+| 5 | T-198 | The maintenance window per §8 on production data | the §7.5 post-checks green; an `.in` dump is accepted via `incoming/in/` as a single file |
 
-Волны 1–4 — один PR/выпуск (код в репозитории до окна, но сервисы
-продолжают старую сборку до шага §8.1.1 — переключение атомарно).
-Допустимо последовательное тестирование на dev-стеке с переингестом
-тестовых данных вместо переноса.
+Waves 1–4 — one PR/release (the code is in the repository before the window, but the services
+keep running the old build until step §8.1.1 — the switch is atomic).
+Sequential testing on the dev stack with re-ingesting
+test data instead of the move is acceptable.
 
 ---
 
-## 12. Решения и альтернативы
+## 12. Decisions and Alternatives
 
-### 12.1. PSL → последняя метка
+### 12.1. PSL → the last label
 
-PSL решает задачу изоляции cookies (кто может ставить cookie на `*.in`),
-а не задачу «административной корзины» зоны в краулере. Свойства TLD-only:
-зона детерминирована именем (никаких внешних списков), стабильна
-(TLD-множество меняется единицами в год), совпадает со срезом IANA —
-каноном `zones sync`. Цена — гранулярность 2LD (§3.1.2).
+The PSL solves the cookie isolation problem (who may set a cookie on `*.in`),
+not the "administrative bucket" problem of a crawler zone. Properties of TLD-only:
+the zone is determined by the name (no external lists), it is stable
+(the TLD set changes by a handful per year), and it matches the IANA snapshot —
+the canon of `zones sync`. The price is 2LD granularity (§3.1.2).
 
-### 12.2. ICANN-секция PSL — не решение
+### 12.2. The PSL ICANN section — not a solution
 
-`5g.in`, `co.in` и пр. находятся в ICANN-секции (поданы реестром NIXI);
-фильтрация PRIVATE-секции убрала бы только `github.io`-подобные. Задачу
-не решает, зависимость сохраняет.
+`5g.in`, `co.in`, etc. are in the ICANN section (submitted by the NIXI registry);
+filtering the PRIVATE section would remove only `github.io`-like entries. It does not
+solve the problem and keeps the dependency.
 
-### 12.3. Селективное схлопывание отклонено
+### 12.3. Selective collapsing rejected
 
-«Свернуть `*.in`, оставить `co.uk`» требует конфига-перечня и его
-сопровождения за реестрами; даёт две семантики зоны (статистика, веса,
-ingest) и возвращается к исходной проблеме в урезанном виде. TLD-only —
-одна простая инвариантная семантика.
+"Collapse `*.in`, keep `co.uk`" requires a config list and maintaining it
+after the registries; it yields two zone semantics (statistics, weights,
+ingest) and returns to the original problem in a reduced form. TLD-only is
+one simple invariant semantics.
 
-### 12.4. Перенос данных — CLI, не миграция при старте
+### 12.4. Data move via CLI, not a migration at start
 
-Миграции проекта — чистый SQL-схема, применяются автоматически на старте
-всех сервисов (docs/migrations.md). Перенос миллионов строк — часы,
-батчи, отчёт, dry-run, предусловия — это CLI-команда обслуживания
-(прецедент `zones sync`, T-125), выполняемая в окне тишины; авто-миграция
-такого объёма в одной неявной транзакции стартующего сервиса — риск
-долгих транзакций и каскадных рестартов.
+The project's migrations are pure SQL schema, applied automatically at the start
+of all services (docs/migrations.md). Moving millions of rows — hours,
+batches, a report, a dry-run, preconditions — is a maintenance CLI command
+(the `zones sync` precedent, T-125) executed in a quiet window; an automatic migration
+of such a volume in a single implicit transaction of a starting service is a risk
+of long transactions and cascading restarts.
 
-### 12.5. Необратимость и отсутствие коллизий
+### 12.5. Irreversibility and the absence of collisions
 
-- **Коллизий `UNIQUE (zone_id, label)` нет**: пара `(T, label||префикс)`
-  биективно соответствует полному имени, а при старом коде имя
-  `example.5g.in` попадало **только** в зону `5g.in` — пары `(in,
-  example.5g)` в БД существовать не могло. `domains.id` — глобальная
-  последовательность (`domain_id_seq`), коллизий PK между зонами нет.
-- **Обратный перенос невозможен**: перенесённый label `example.5g` неотличим
-  от исконного составного `foo.bar` (домен `foo.bar.in` всегда жил в
-  зоне `in`). Поэтому down-механизма нет, откат — бэкап (§8.5).
+- **No `UNIQUE (zone_id, label)` collisions**: the pair `(T, label||prefix)`
+  maps bijectively to the full name, and under the old code the name
+  `example.5g.in` went **only** to the `5g.in` zone — the pair `(in,
+  example.5g)` could not exist in the DB. `domains.id` is a global
+  sequence (`domain_id_seq`); there are no PK collisions between zones.
+- **The reverse move is impossible**: a moved label `example.5g` is indistinguishable
+  from the native composite `foo.bar` (the domain `foo.bar.in` always lived in
+  the `in` zone). Hence there is no down mechanism; rollback is the backup (§8.5).
 
-### 12.6. Голые суффиксы — мусор без фильтра
+### 12.6. Bare suffixes — junk without a filter
 
-Отличить `co.in` (суффикс) от `nic.in` (домен) можно только списком
-суффиксов — это возврат PSL/ручного перечня. Объём шума: ~44 строки на
-дамп `.in` из миллионов; строки реально существуют в DNS, проходят
-проверки, портят статистику на доли процента. Точечный список
-`bare_suffixes` можно добавить позже, если когда-нибудь понадобится.
+Telling `co.in` (a suffix) from `nic.in` (a domain) is only possible with a suffix
+list — a return to the PSL/a manual list. The noise volume: ~44 lines per
+`.in` dump out of millions; the lines really exist in DNS, go through
+checks, and skew the statistics by fractions of a percent. A targeted
+`bare_suffixes` list can be added later, if ever needed.
 
-### 12.7. Составной label — не новинка
+### 12.7. A composite label is not new
 
-Контракт составных меток существовал с T-010 (не-PSL зоны:
-`example.crawl.test` → label `example.crawl`; `магазин.рф.co.uk` в зоне
-`co.uk`). TLD-only лишь делает составные label регулярным случаем;
-ни схема, ни индексы, ни идемпотентность ingest не меняются.
+The composite label contract existed since T-010 (non-PSL zones:
+`example.crawl.test` → label `example.crawl`; `магазин.рф.co.uk` in the
+`co.uk` zone). TLD-only merely makes composite labels a regular case;
+neither the schema, nor the indexes, nor ingest idempotency change.

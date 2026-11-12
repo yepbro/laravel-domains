@@ -1,78 +1,78 @@
-# Техническое задание: сервис массовой проверки доменов и поиска сайтов на Laravel
+# Technical Specification: Mass Domain Verification and Laravel Website Detection Service
 
-Версия: 1.2 (1.1 — решения по допущениям и открытым вопросам подтверждены заказчиком; 1.2 — добавлен §10.4 «Извещения Telegram (CI/CD)»)
-
----
-
-## 1. Цель и общее описание
-
-Разработать сервис, который:
-
-1. Хранит список зон и доменов (порядка **350 млн** доменов) и поддерживает его в актуальном состоянии по текстовым файлам, поступающим в наблюдаемую папку.
-2. Для каждого домена независимо проверяет набор субдоменов (по умолчанию: пустой префикс, `www`, `admin`, `crm`, `api`, `app`): DNS, доступность по HTTP/HTTPS, редиректы.
-3. Скачивает и хранит содержимое главной страницы (итоговый DOM, как его отображает браузер) и cookies.
-4. Анализирует сохранённый контент, cookies и заголовки и находит сайты на **Laravel** с оценкой версии (диапазон), уверенности (score) и списком сработавших признаков.
-5. Работает на **одном сервере** (8 ГБ RAM, 1 внешний IP, NVMe с большим запасом места) с максимально возможной скоростью при минимальном потреблении памяти.
-
-Стек: **Go** (бэкенд), **PostgreSQL** (метаданные и результаты), **Redis** (очереди), внешнее файловое хранилище для контента, Chromium (headless) для рендера.
+Version: 1.2 (1.1 — decisions on assumptions and open questions confirmed by the customer; 1.2 — added §10.4 "Telegram notifications (CI/CD)")
 
 ---
 
-## 2. Термины
+## 1. Purpose and Overview
 
-| Термин | Значение |
+Build a service that:
+
+1. Stores the list of zones and domains (about **350 million** domains) and keeps it up to date from text files arriving in a watched folder.
+2. For each domain, independently checks a set of subdomains (default: empty prefix, `www`, `admin`, `crm`, `api`, `app`): DNS, HTTP/HTTPS availability, redirects.
+3. Downloads and stores the content of the main page (the final DOM as displayed by the browser) and cookies.
+4. Analyzes the stored content, cookies and headers and detects **Laravel** websites with a version estimate (range), a confidence score, and a list of triggered signals.
+5. Runs on a **single server** (8 GB RAM, 1 external IP, NVMe with plenty of spare space) at the maximum achievable speed with minimal memory consumption.
+
+Stack: **Go** (backend), **PostgreSQL** (metadata and results), **Redis** (queues), external file storage for content, Chromium (headless) for rendering.
+
+---
+
+## 2. Terms
+
+| Term | Meaning |
 |---|---|
-| Зона | TLD или публичный суффикс (`com`, `ru`, `co.uk`, `xn--p1ai`) |
-| Домен | Регистрируемое имя в зоне (`example` в зоне `com`) |
-| Субдомен (в терминах сервиса) | Префикс перед доменом из настраиваемого списка; пустой префикс = сам домен (апекс) |
-| Вариант (variant) | Схема доступа к сайту: 0 = основной (https, если работает), 1 = http, если ведёт на другой сайт, чем https |
-| Алиас | Субдомен, идентичный другому субдомену того же домена или редиректящий на него |
-| Рендер | Загрузка страницы в headless-браузере с исполнением JS и получением итогового DOM |
-| Пак | Append-only файл внешнего хранилища контента |
+| Zone | TLD or public suffix (`com`, `ru`, `co.uk`, `xn--p1ai`) |
+| Domain | Registrable name within a zone (`example` in the `com` zone) |
+| Subdomain (in service terms) | A prefix before the domain from a configurable list; empty prefix = the domain itself (apex) |
+| Variant | Access scheme for the site: 0 = primary (https if it works), 1 = http if it leads to a different site than https |
+| Alias | A subdomain identical to another subdomain of the same domain or redirecting to it |
+| Render | Loading the page in a headless browser with JS execution and obtaining the final DOM |
+| Pack | Append-only file of the external content storage |
 
 ---
 
-## 3. Ограничения и нефункциональные требования
+## 3. Constraints and Non-Functional Requirements
 
-### 3.1. Ресурсы
+### 3.1. Resources
 
-- 1 сервер, **8 ГБ RAM**, 1 внешний IP, NVMe, свободного места много.
-- Всё работает на этом сервере. Масштабирование на несколько серверов не требуется, но интерфейсы между сервисами должны быть сетевыми (очередь, БД), чтобы оно не было закрыто.
+- 1 server, **8 GB RAM**, 1 external IP, NVMe, plenty of free space.
+- Everything runs on this server. Scaling to multiple servers is not required, but the interfaces between services must be network-based (queue, DB) so that scaling is not ruled out.
 
-### 3.2. Бюджет памяти (ориентир, настраивается)
+### 3.2. Memory budget (guideline, configurable)
 
-| Компонент | Лимит |
+| Component | Limit |
 |---|---|
-| PostgreSQL (`shared_buffers` ≈ 2 ГБ + бэкенды) | ≈ 2,5 ГБ |
-| Redis (`maxmemory`) | ≤ 0,5 ГБ |
-| Unbound (кэш) | ≈ 0,7 ГБ |
-| Go-сервисы (суммарно) | ≈ 1,3 ГБ |
-| Chromium (рендер, cgroup `MemoryMax`) | ≈ 2 ГБ |
-| Остаток — page cache ОС | — |
+| PostgreSQL (`shared_buffers` ≈ 2 GB + backends) | ≈ 2.5 GB |
+| Redis (`maxmemory`) | ≤ 0.5 GB |
+| Unbound (cache) | ≈ 0.7 GB |
+| Go services (total) | ≈ 1.3 GB |
+| Chromium (render, cgroup `MemoryMax`) | ≈ 2 GB |
+| Remainder — OS page cache | — |
 
-Каждый сервис запускается как systemd-юнит с `MemoryMax`, чтобы OOM-killer не затрагивал PostgreSQL.
+Each service runs as a systemd unit with `MemoryMax` so that the OOM killer does not hit PostgreSQL.
 
-### 3.3. Производительность
+### 3.3. Performance
 
-- Скорость не фиксируется: «максимальная при имеющихся ресурсах».
-- Первичный проход по 350 млн доменов — ориентировочно недели (DNS ≈ 1–2 суток, HTTP ≈ 1–2 недели). Фактические цифры определяются замерами (см. раздел 15).
-- Минимальный цикл повторной проверки домена: **6 месяцев** (настраивается).
+- Throughput is not fixed: "maximum within the available resources".
+- The initial pass over 350 million domains takes roughly weeks (DNS ≈ 1–2 days, HTTP ≈ 1–2 weeks). Actual figures are determined by measurements (see section 15).
+- Minimum domain recheck cycle: **6 months** (configurable).
 
-### 3.4. Надёжность
+### 3.4. Reliability
 
-- Источник истины — PostgreSQL. Потеря Redis не должна приводить к потере данных (задачи восстанавливаются планировщиком).
-- Доставка задач — at-least-once; все записи результатов идемпотентны.
-- Падение любого воркера не должно блокировать остальные.
-- Graceful shutdown: воркеры дорабатывают текущие задачи или возвращают их в очередь.
+- PostgreSQL is the source of truth. Losing Redis must not lead to data loss (tasks are recovered by the scheduler).
+- Task delivery is at-least-once; all result writes are idempotent.
+- A crash of any worker must not block the others.
+- Graceful shutdown: workers finish their current tasks or return them to the queue.
 
-### 3.5. Прочее
+### 3.5. Misc
 
-- Минимизация расхода памяти: потоковая обработка файлов и ответов, пакетная работа с БД, ограничение размеров всех буферов.
-- История проверок **не хранится**: только последний результат.
+- Minimize memory usage: streaming processing of files and responses, batched DB operations, bounded sizes for all buffers.
+- Check history is **not stored**: only the latest result.
 
 ---
 
-## 4. Архитектура
+## 4. Architecture
 
 ```
  incoming/ ──► [ingest] ──► PostgreSQL ◄──────────────┐
@@ -85,202 +85,202 @@
                        │                     │          │
                        └──────► PostgreSQL ◄─┴──────────┘
                                     │
-                              [analyzer] ──► laravel_* таблицы
+                              [analyzer] ──► laravel_* tables
                                     │
                               [monitor] ──► Prometheus / CLI
 
-   Контент (zstd, дедуп) ──► пак-файлы на NVMe + таблица contents
-   DNS: локальный Unbound
+   Content (zstd, dedup) ──► pack files on NVMe + the contents table
+   DNS: local Unbound
 ```
 
-### 4.1. Сервисы (отдельные Go-процессы, один репозиторий)
+### 4.1. Services (separate Go processes, one repository)
 
-| Сервис | Назначение |
+| Service | Purpose |
 |---|---|
-| `ingest` | Приём файлов с доменами (добавление/обновление/удаление) |
-| `scheduler` | Выборка доменов к проверке, постановка задач, возврат «зависших» задач, перевод просроченных доменов в `pending` |
-| `dns-worker` | DNS-проверка апекса и субдоменов |
-| `http-worker` | HTTP-загрузка, редиректы, определение алиасов, решение о рендере |
-| `render-worker` | Рендер в Chromium, получение DOM и cookies |
-| `analyzer` | Поиск Laravel по правилам |
-| `monitor` | Агрегация прогресса по зонам, экспорт метрик |
-| `crawlerctl` | CLI: статус, **поиск домена по имени** (5.11), управление зонами и субдоменами, переанализ, ручные задачи |
+| `ingest` | Ingesting files with domains (add/update/delete) |
+| `scheduler` | Selecting domains for checking, enqueueing tasks, recovering "stuck" tasks, moving overdue domains back to `pending` |
+| `dns-worker` | DNS check of the apex and subdomains |
+| `http-worker` | HTTP fetching, redirects, alias detection, render decision |
+| `render-worker` | Rendering in Chromium, obtaining DOM and cookies |
+| `analyzer` | Laravel detection by rules |
+| `monitor` | Aggregating per-zone progress, exporting metrics |
+| `crawlerctl` | CLI: status, **domain lookup by name** (5.11), zone and subdomain management, re-analysis, manual tasks |
 
-Каждый тип воркера масштабируется количеством горутин и (при необходимости) количеством процессов; независимость и параллельная обработка однотипных задач обязательны.
+Each worker type scales by goroutine count and (when needed) by process count; independence and parallel processing of same-type tasks are mandatory.
 
-### 4.2. Очередь
+### 4.2. Queue
 
-**Redis Streams** с consumer groups (допустима замена на RabbitMQ за интерфейсом `Queue`):
+**Redis Streams** with consumer groups (replacement with RabbitMQ behind the `Queue` interface is allowed):
 
-| Стрим | Единица задачи | Потребитель |
+| Stream | Task unit | Consumer |
 |---|---|---|
-| `q:dns` | пачка доменов (id + имя) | dns-worker |
-| `q:http` | один домен со списком DNS-живых субдоменов | http-worker |
-| `q:render` | один результат (домен, субдомен, вариант) | render-worker |
-| `q:analyze` | один результат (домен, субдомен, вариант) | analyzer |
-| `q:dead` | задачи, исчерпавшие число попыток | ручной разбор |
+| `q:dns` | a batch of domains (id + name) | dns-worker |
+| `q:http` | one domain with the list of DNS-alive subdomains | http-worker |
+| `q:render` | one result (domain, subdomain, variant) | render-worker |
+| `q:analyze` | one result (domain, subdomain, variant) | analyzer |
+| `q:dead` | tasks that exhausted their attempt count | manual triage |
 
-Требования:
+Requirements:
 
-- `MAXLEN` на каждом стриме; планировщик публикует новые задачи только когда длина очереди ниже порога (backpressure).
-- Подтверждение (`XACK`) только после записи результата в БД; зависшие сообщения забираются через `XAUTOCLAIM`.
-- Максимальное число попыток на задачу — настраивается (по умолчанию 3), далее `q:dead`.
-- Сообщение содержит только идентификаторы и минимально необходимые данные (имя домена).
-- *Дополнение 2026-10-23 (по итогам замеров T-092 и повторного после T-139):*
-  подтверждённый префикс стрима не должен накапливаться в памяти Redis —
-  `XACK` освобождает запись из PEL, но не из стрима, и история до `MAXLEN`
-  (единицы сотен МиБ) переполняет бюджет Redis §3.2. Обязательное
-  требование: освобождение подтверждённого префикса (`XDEL` после `Ack`
-  или периодический `XTRIM MINID` по старейшей неподтверждённой записи
-  группы — без потери необработанных задач). Пороги backpressure,
-  `MAXLEN` и размер пачек `q:dns` согласуются с бюджетом Redis по
-  фактическому размеру записей (замер 2026-10-22: запись `q:dns` ≈ 237 КиБ
-  ≈ 1000 доменов, штучные записи `q:http`/`q:analyze` ≈ 0.3–0.7 КиБ).
+- `MAXLEN` on each stream; the scheduler publishes new tasks only while the queue length is below the threshold (backpressure).
+- Acknowledgement (`XACK`) only after the result is written to the DB; stuck messages are reclaimed via `XAUTOCLAIM`.
+- Maximum attempts per task — configurable (default 3), after that `q:dead`.
+- A message contains only identifiers and the minimally necessary data (the domain name).
+- *Addendum 2026-10-23 (based on the T-092 measurements and the follow-up after T-139):*
+  the acknowledged prefix of a stream must not accumulate in Redis memory —
+  `XACK` releases the entry from the PEL but not from the stream, and the history up to `MAXLEN`
+  (hundreds of MiB) overflows the Redis budget of §3.2. Mandatory
+  requirement: release the acknowledged prefix (`XDEL` after `Ack`,
+  or a periodic `XTRIM MINID` at the group's oldest unacknowledged entry —
+  without losing unprocessed tasks). Backpressure thresholds,
+  `MAXLEN`, and `q:dns` batch sizes must be aligned with the Redis budget
+  based on actual entry sizes (measurement 2026-10-22: a `q:dns` entry ≈ 237 KiB
+  ≈ 1000 domains; individual `q:http`/`q:analyze` entries ≈ 0.3–0.7 KiB).
 
 ---
 
-## 5. Функциональные требования
+## 5. Functional Requirements
 
-### 5.1. Ingest (приём файлов)
+### 5.1. Ingest (file ingestion)
 
-**Источник.** Наблюдаемая папка (путь в конфиге). Структура:
+**Source.** A watched folder (the path is in config). Structure:
 
 ```
 incoming/
-  <зона>/
-    add/       *.txt   — добавить или обновить домены
-    delete/    *.txt   — удалить домены (зарегистрированные ранее)
-processed/     — успешно обработанные файлы
-failed/        — файлы с ошибкой (с лог-отчётом рядом)
+  <zone>/
+    add/       *.txt   — add or update domains
+    delete/    *.txt   — delete domains (registered earlier)
+processed/     — successfully processed files
+failed/        — files with an error (with a log report alongside)
 ```
 
-- Формат файла: UTF-8, один домен в строке — **полное имя домена** (`example.com`). Допустимы пустые строки и комментарии (`#`). Строки, не являющиеся полным именем домена из зоны, указанной в пути файла, отклоняются.
-- Имя каталога зоны может быть в unicode или punycode; обе формы нормализуются в одну зону.
-- Файл обрабатывается только после завершения записи: загрузка под временным именем (`*.tmp`, `*.part`) и переименование в `*.txt`, а также проверка, что размер/mtime стабильны N секунд. Режимы наблюдения: `fsnotify` + периодический опрос как страховка.
-- Обработка потоковая (построчно), память не зависит от размера файла. Загрузка в БД пачками (по умолчанию 50 000 строк) через `COPY` в staging-таблицу, затем:
-  - **add**: `INSERT … ON CONFLICT DO NOTHING`; существующий домен не меняется, кроме случая статуса `deleted` — он возвращается в `new`/`pending`;
-  - **delete**: статус домена переводится в `deleted`, связанные результаты и ссылки на контент удаляются фоновой задачей.
-- Учёт: после обработки файла пишется отчёт (кол-во строк, добавлено, уже было, удалено, отклонено, причины отклонения).
-- Отклонённые строки (невалидное имя, домен не из зоны, слишком длинное имя) пишутся в лог `rejected` с причиной; файл не считается ошибочным из-за единичных плохих строк (порог доли ошибок — в конфиге).
-- Повторная обработка того же файла безопасна (идемпотентность). Хэш файла фиксируется в таблице `ingest_files` для защиты от дублей.
-- Новая зона создаётся автоматически при первом файле (`is_active = true`).
+- File format: UTF-8, one domain per line — the **full domain name** (`example.com`). Empty lines and comments (`#`) are allowed. Lines that are not a full domain name of the zone specified by the file path are rejected.
+- The zone directory name may be in unicode or punycode; both forms are normalized to a single zone.
+- A file is processed only after writing completes: upload under a temporary name (`*.tmp`, `*.part`) followed by renaming to `*.txt`, plus a check that size/mtime remain stable for N seconds. Watching modes: `fsnotify` + periodic polling as a fallback.
+- Processing is streaming (line by line); memory usage does not depend on file size. Loading into the DB is done in batches (default 50,000 lines) via `COPY` into a staging table, then:
+  - **add**: `INSERT … ON CONFLICT DO NOTHING`; an existing domain is not changed, except for the `deleted` status — it is returned to `new`/`pending`;
+  - **delete**: the domain status is set to `deleted`; related results and content references are removed by a background task.
+- Accounting: after a file is processed, a report is written (line count, added, already existed, deleted, rejected, rejection reasons).
+- Rejected lines (invalid name, a domain outside the zone, a name too long) are written to the `rejected` log with the reason; the file is not considered failed because of isolated bad lines (the error share threshold is in config).
+- Reprocessing the same file is safe (idempotency). The file hash is recorded in the `ingest_files` table to guard against duplicates.
+- A new zone is created automatically on the first file (`is_active = true`).
 
-### 5.2. Нормализация имён (punycode / IDN)
+### 5.2. Name normalization (punycode / IDN)
 
-**Правило: внутри системы везде хранится ASCII-форма (punycode, `xn--…`); unicode-форма — только производная для отображения.**
+**Rule: the ASCII form (punycode, `xn--…`) is stored everywhere within the system; the unicode form is only a derivative for display.**
 
-1. Привести к нижнему регистру, убрать пробелы и завершающую точку.
-2. Если есть не-ASCII символы — преобразовать в punycode через `golang.org/x/net/idna` (профиль **Lookup**, UTS-46).
-3. Метки, начинающиеся с `xn--`, проверяются на корректное декодирование; невалидные отклоняются.
-4. Проверка длин: метка ≤ 63, полное имя ≤ 253 (в ASCII-форме).
-5. Отделение зоны от домена — по списку публичных суффиксов (`publicsuffix`), а не простым разбиением по точке.
-6. Домен должен принадлежать зоне, указанной в пути файла (зона тоже нормализуется тем же способом).
-7. Таблица `zones` содержит `name` (punycode) и `name_unicode` (только отображение). Поиск и вывод unicode-имён домена — функцией `idna.ToUnicode` на лету, без отдельного столбца в `domains`.
-8. Для DNS-запросов, `Host` и SNI всегда используется ASCII-форма. Хосты из `Location` и `<meta refresh>`, содержащие unicode, приводятся к punycode перед запросом.
-9. В `domains.flags` ставится бит `is_idn`, если метка содержит `xn--`.
+1. Convert to lowercase, strip whitespace and the trailing dot.
+2. If there are non-ASCII characters — convert to punycode via `golang.org/x/net/idna` (the **Lookup** profile, UTS-46).
+3. Labels starting with `xn--` are checked for correct decoding; invalid ones are rejected.
+4. Length checks: label ≤ 63, full name ≤ 253 (in ASCII form).
+5. The zone is split off from the domain by the public suffix list (`publicsuffix`), not by a simple split on dots.
+6. The domain must belong to the zone specified in the file path (the zone is normalized the same way).
+7. The `zones` table contains `name` (punycode) and `name_unicode` (display only). Looking up and outputting the unicode names of a domain is done by the `idna.ToUnicode` function on the fly, without a separate column in `domains`.
+8. The ASCII form is always used for DNS queries, `Host` and SNI. Hosts from `Location` and `<meta refresh>` that contain unicode are converted to punycode before the request.
+9. The `is_idn` bit is set in `domains.flags` if a label contains `xn--`.
 
 ### 5.3. Scheduler
 
-- Выбирает домены со `check_state = pending` пачками (по умолчанию 1000–10 000), по кругу между зонами (чтобы крупная зона не задерживала остальные; веса зон — опционально в конфиге).
-- Переводит выбранные домены в `queued` с отметкой времени (lease) и публикует в `q:dns`.
-- Домены в `queued`, у которых lease истёк (по умолчанию 30 мин) и результата нет, возвращаются в `pending`.
-- Раз в сутки (расписание в конфиге) переводит `done` → `pending` для доменов, у которых `last_checked_at` старше `recheck_interval` (по умолчанию 6 месяцев; минимум не менее заданного значения конфига).
-- Публикует новые задачи только если длина очереди ниже порога.
-- Для статуса `temp_error` — повторная проверка через `temp_error_retry_after` (по умолчанию 24 часа), не более N раз подряд; далее домен получает итоговый статус по результату последней проверки.
+- Selects domains with `check_state = pending` in batches (default 1,000–10,000), round-robin between zones (so that a large zone does not hold up the others; zone weights are optional in config).
+- Moves the selected domains to `queued` with a timestamp (lease) and publishes them to `q:dns`.
+- Domains in `queued` whose lease has expired (default 30 min) and that have no result are returned to `pending`.
+- Once a day (the schedule is in config), moves `done` → `pending` for domains whose `last_checked_at` is older than `recheck_interval` (default 6 months; at least the configured minimum).
+- Publishes new tasks only if the queue length is below the threshold.
+- For the `temp_error` status — recheck after `temp_error_retry_after` (default 24 hours), no more than N times in a row; after that the domain receives its final status based on the latest check result.
 
 ### 5.4. DNS-worker
 
-Для каждого домена:
+For each domain:
 
-1. Запрос A (и NS при необходимости) апекса.
-   - **NXDOMAIN** → статус `not_delegated`; субдомены не проверяются (RFC 8020).
-   - SERVFAIL/таймаут после ретраев → статус `temp_error`.
-2. Для каждого включённого субдомена из таблицы `subdomains` — запросы A, AAAA, CNAME (с разворачиванием цепочки CNAME).
-3. **Определение wildcard-DNS**: запрос случайной метки `<random>.<домен>`. Если резолвится — субдомены, чьи адреса совпадают с wildcard-ответом, помечаются как wildcard и далее не проверяются по HTTP (кроме апекса и `www`).
-4. Результат записывается: `domains.dns_mask` (бит = `subdomains.id` для каждого резолвящегося субдомена), `domains.status`; адреса и CNAME передаются в задачу `q:http`.
-5. Статус домена:
-   - есть NS/ответ, но нет A/AAAA у ни одного субдомена → `delegated_no_address`;
-   - есть адреса → задача в `q:http`.
+1. An A query (and NS if needed) for the apex.
+   - **NXDOMAIN** → status `not_delegated`; subdomains are not checked (RFC 8020).
+   - SERVFAIL/timeout after retries → status `temp_error`.
+2. For each enabled subdomain from the `subdomains` table — A, AAAA, CNAME queries (with CNAME chain expansion).
+3. **Wildcard DNS detection**: query a random label `<random>.<domain>`. If it resolves — subdomains whose addresses match the wildcard response are marked as wildcard and are no longer checked over HTTP (except the apex and `www`).
+4. The result is written: `domains.dns_mask` (bit = `subdomains.id` for each resolving subdomain), `domains.status`; addresses and CNAME are passed to the `q:http` task.
+5. Domain status:
+   - NS/response present, but no A/AAAA for any subdomain → `delegated_no_address`;
+   - addresses present → a task to `q:http`.
 
-Требования к реализации:
+Implementation requirements:
 
-- Библиотека `miekg/dns`; собственный пул UDP-сокетов, TCP-fallback при усечении (TC).
-- Резолвер — **локальный Unbound** (рекурсивный, prefetch, кэш ≈ 512–768 МБ). Публичные резолверы — только как fallback (список в конфиге).
-- Ограничение параллелизма и QPS настраивается; адаптивное снижение при росте доли таймаутов.
-- Если на сервере нет IPv6 — AAAA-запросы отключаются конфигом.
+- The `miekg/dns` library; an own pool of UDP sockets, TCP fallback on truncation (TC).
+- The resolver is **local Unbound** (recursive, prefetch, cache ≈ 512–768 MB). Public resolvers are only a fallback (the list is in config).
+- Concurrency and QPS limits are configurable; adaptive reduction as the timeout share grows.
+- If the server has no IPv6 — AAAA queries are disabled by config.
 
 ### 5.5. HTTP-worker
 
-Для каждого DNS-живого субдомена (задача на домен целиком; субдомены качаются параллельно внутри воркера):
+For each DNS-alive subdomain (one task per whole domain; subdomains are fetched in parallel inside the worker):
 
-1. Запрос `https://<хост>/` и `http://<хост>/` с учётом редиректов (до `max_redirects`, по умолчанию 8; детект циклов).
-2. Подключение к ранее резолвленному IP; для редиректов на другие хосты — резолв через тот же резолвер с кэшем.
-3. TLS: `InsecureSkipVerify = true` (нужен контент), но результат проверки сертификата, издатель, срок действия, SAN сохраняются.
-4. Запрашивается только главная страница (`/`); если были редиректы — берётся страница в конце цепочки (учитываются HTTP-редиректы и `<meta http-equiv="refresh">`).
-5. **Логика вариантов (http/https):**
-   - оба протокола ведут на один сайт (одинаковые итоговые хост и путь либо одинаковый хэш контента) → одна запись, `variant = 0`;
-   - работает только один протокол → одна запись с соответствующей `scheme`;
-   - протоколы ведут на **разные** сайты → две записи: `variant = 0` (https) и `variant = 1` (http).
-6. **Алиасы субдоменов** (`www` и без `www`, а также любые другие пары): если итоговый URL субдомена совпадает с итоговым URL другого субдомена этого домена или хэш контента совпадает — запись помечается `alias_kind` (0 — независим, 1 — идентичен, 2 — редирект на другой субдомен) и `alias_subdomain_id`; контент хранится один раз. Внутри воркера для задачи домена используется общий кэш «итоговый URL → результат», чтобы не скачивать одну и ту же страницу дважды.
-7. Сохраняется всё: адреса, CNAME, цепочка редиректов, статус, итоговый URL, TLS-информация, заголовки ответа, cookies, время ответа, код ошибки.
-8. Решение о рендере: если страница похожа на SPA-оболочку (мало видимого текста + корневой контейнер `#root`, `#app`, `#__next`, `#__nuxt` и т. п.; `<noscript>` с требованием JS; JS-редирект; `meta refresh`), публикуется задача в `q:render`. В остальных случаях сырой HTML считается итоговым и сохраняется в хранилище.
-9. После записи результата публикуется задача в `q:analyze`.
+1. Request `https://<host>/` and `http://<host>/` following redirects (up to `max_redirects`, default 8; loop detection).
+2. Connect to the previously resolved IP; for redirects to other hosts — resolve via the same resolver with cache.
+3. TLS: `InsecureSkipVerify = true` (the content is needed), but the certificate verification result, issuer, expiration and SAN are stored.
+4. Only the main page (`/`) is requested; if there were redirects — the page at the end of the chain is taken (both HTTP redirects and `<meta http-equiv="refresh">` are honored).
+5. **Variant logic (http/https):**
+   - both protocols lead to the same site (the same final host and path, or the same content hash) → one record, `variant = 0`;
+   - only one protocol works → one record with the corresponding `scheme`;
+   - the protocols lead to **different** sites → two records: `variant = 0` (https) and `variant = 1` (http).
+6. **Subdomain aliases** (`www` vs no `www`, as well as any other pairs): if the final URL of a subdomain matches the final URL of another subdomain of this domain, or the content hash matches — the record is marked with `alias_kind` (0 — independent, 1 — identical, 2 — redirect to another subdomain) and `alias_subdomain_id`; the content is stored once. Inside the worker, a domain task uses a shared "final URL → result" cache so that the same page is not downloaded twice.
+7. Everything is stored: addresses, CNAME, the redirect chain, status, final URL, TLS info, response headers, cookies, response time, error code.
+8. Render decision: if the page looks like an SPA shell (little visible text + a root container `#root`, `#app`, `#__next`, `#__nuxt` etc.; a `<noscript>` demanding JS; a JS redirect; `meta refresh`), a task is published to `q:render`. In all other cases the raw HTML is considered final and stored.
+9. After the result is written, a task is published to `q:analyze`.
 
-Лимиты и защита (все настраиваются; значения по умолчанию):
+Limits and safeguards (all configurable; default values):
 
-| Параметр | Значение |
+| Parameter | Value |
 |---|---|
-| connect timeout | 5 с |
-| TLS handshake timeout | 5 с |
-| ожидание заголовков | 10 с |
-| общий таймаут запроса | 20 с |
-| макс. число редиректов | 8 |
-| макс. размер читаемого тела | 2 МБ |
-| макс. размер хранимого HTML | 1–2 МБ (настраивается) |
-| защита от тарпитов | мин. скорость 2 КБ/с после первого байта |
-| одновременных соединений на один IP | 3–4 |
-| keep-alive | отключён или очень короткий idle |
+| connect timeout | 5 s |
+| TLS handshake timeout | 5 s |
+| header wait | 10 s |
+| total request timeout | 20 s |
+| max redirects | 8 |
+| max readable body size | 2 MB |
+| max stored HTML size | 1–2 MB (configurable) |
+| tarpit protection | min speed 2 KB/s after the first byte |
+| concurrent connections per IP | 3–4 |
+| keep-alive | disabled or a very short idle |
 
-- Кодировка ответа определяется (заголовок, `meta charset`, детект) и приводится к UTF-8.
-- Поддерживается `Accept-Encoding: gzip, br`; распаковка — с ограничением размера (защита от zip-бомб).
-- Применяется честный `User-Agent` с контактной информацией (в конфиге).
-- На один сайт выполняется минимум запросов; `robots.txt` не запрашивается (только главная страница).
-- Ограничение исходящей нагрузки по глобальному числу соединений и RPS; настройка ядра для одного IP (раздел 13.3).
+- The response encoding is detected (header, `meta charset`, sniffing) and converted to UTF-8.
+- `Accept-Encoding: gzip, br` is supported; decompression is size-limited (zip bomb protection).
+- An honest `User-Agent` with contact information is used (in config).
+- The minimum number of requests is made per site; `robots.txt` is not requested (main page only).
+- Outbound load is limited by the global connection count and RPS; kernel tuning for a single IP (section 13.3).
 
 ### 5.6. Render-worker
 
-- Chromium через `chromedp` (или `playwright-go`) — **один** браузер, несколько изолированных контекстов (по умолчанию 2–4 параллельно).
-- Блокировка загрузки изображений, шрифтов и медиа (экономия ресурсов).
-- Ожидание: событие загрузки + ограниченное ожидание «затишья» сети; общий таймаут (по умолчанию 25 с).
-- Результат: итоговый DOM (`document.documentElement.outerHTML`) и **все cookies** (включая выставленные JS) через CDP.
-- Перезапуск браузера каждые N страниц и при превышении порога памяти.
-- Если очередь рендера переполнена, домены получают признак `render_pending` и дорабатываются позже; рендер не должен задерживать остальные этапы.
-- Итоговый DOM заменяет сырой HTML в хранилище; в результате выставляется `rendered = true`.
+- Chromium via `chromedp` (or `playwright-go`) — **one** browser, several isolated contexts (default 2–4 in parallel).
+- Blocking the loading of images, fonts and media (resource saving).
+- Waiting: the load event + a bounded wait for network "quiescence"; a total timeout (default 25 s).
+- Result: the final DOM (`document.documentElement.outerHTML`) and **all cookies** (including JS-set ones) via CDP.
+- Browser restart every N pages and when the memory threshold is exceeded.
+- If the render queue is full, domains get the `render_pending` flag and are finished later; rendering must not delay the other stages.
+- The final DOM replaces the raw HTML in storage; `rendered = true` is set on the result.
 
-### 5.7. Хранилище контента
+### 5.7. Content storage
 
-Хранится: итоговый HTML (в виде DOM для отрендеренных страниц, сырой HTML для остальных). Скриншоты и внешние ресурсы **не хранятся**.
+Stored: the final HTML (as the DOM for rendered pages, raw HTML for the rest). Screenshots and external resources are **not stored**.
 
-- Хранение — **внешнее** (не в PostgreSQL): пак-файлы на NVMe, размер пака 512 МБ–1 ГБ, append-only.
-- Сжатие **zstd** с обученным словарём (словарь переобучается по требованию командой `crawlerctl`).
-- **Дедупликация** по 128-битному хэшу (например, на основе SHA-256 от нормализованного содержимого) — для парковок и заглушек хостингов.
-- Метаданные в PostgreSQL: `contents(hash, pack_id, offset, len, refcount)`.
-- При перезаписи результата счётчик ссылок старого контента уменьшается; фоновая **компактификация** паков при доле живых данных < 50%.
-- Доступ через интерфейс `ContentStore` (`Put`, `Get`, `Delete`), чтобы позднее можно было заменить реализацию (например, S3).
-- Контент хранится не менее времени, пока нужно переприменять правила анализа (по условию: пока домен не будет перепроверен или удалён).
+- Storage is **external** (not in PostgreSQL): pack files on NVMe, pack size 512 MB–1 GB, append-only.
+- Compression is **zstd** with a trained dictionary (the dictionary is retrained on demand by a `crawlerctl` command).
+- **Deduplication** by a 128-bit hash (e.g., based on SHA-256 of the normalized content) — for parking pages and hosting stubs.
+- Metadata in PostgreSQL: `contents(hash, pack_id, offset, len, refcount)`.
+- When a result is overwritten, the reference count of the old content is decremented; background **compaction** of packs when the share of live data < 50%.
+- Access via the `ContentStore` interface (`Put`, `Get`, `Delete`) so that the implementation can be replaced later (e.g., with S3).
+- Content is kept at least as long as analysis rules may need to be re-applied (condition: until the domain is rechecked or deleted).
 
-### 5.8. Анализатор Laravel
+### 5.8. Laravel analyzer
 
-Анализ **пассивный**: только по уже скачанному контенту, cookies и заголовкам. Дополнительные запросы к сайтам не выполняются.
+The analysis is **passive**: only over already downloaded content, cookies and headers. No additional requests to sites are made.
 
-**Правила** лежат в YAML-файлах (каталог в конфиге), перезагружаются по `SIGHUP` без перезапуска. Правило содержит:
+**Rules** live in YAML files (the directory is in config) and are reloaded on `SIGHUP` without a restart. A rule contains:
 
-- `id`, описание;
-- цель: имя или значение cookie, заголовок, регулярное выражение по HTML, `meta`-тег;
+- `id`, a description;
+- a target: a cookie name or value, a header, a regular expression over HTML, a `meta` tag;
 - `weight` (0..1);
-- опциональный диапазон версий Laravel, который подразумевает признак (`ver_min`, `ver_max`).
+- an optional Laravel version range implied by the signal (`ver_min`, `ver_max`).
 
-Пример (иллюстративный; конкретные версионные границы уточняются по документации Laravel при написании набора правил):
+Example (illustrative; specific version boundaries are refined against the Laravel documentation when writing the rule set):
 
 ```yaml
 rules:
@@ -294,7 +294,7 @@ rules:
     weight: 0.2
   - id: cookie_encrypted_payload
     target: cookie_value
-    regex: "^eyJpdiI6"          # base64 от {"iv":
+    regex: "^eyJpdiI6"          # base64 of {"iv":
     weight: 0.45
   - id: meta_csrf_token
     target: html
@@ -320,27 +320,27 @@ rules:
     weight: 0.3
 ```
 
-**Расчёт:**
+**Scoring:**
 
-- **Score** — «noisy-OR»: `1 − Π(1 − wᵢ)` по сработавшим правилам (слабые признаки накапливаются, но не дают 100%).
-- **Версия** — диапазон `[ver_min, ver_max]` как пересечение диапазонов сработавших правил; если пересечение пустое, фиксируется конфликт, диапазон помечается как неопределённый.
-- Порог попадания домена в таблицу `laravel_domains` — в конфиге (по умолчанию `score ≥ 0.6`).
-- В `laravel_findings` сохраняются **все срабатывания** (любая запись, где сработало хотя бы одно правило), независимо от порога; признак `is_laravel` (`score ≥ порога`) позволяет отделять уверенные срабатывания от слабых. Если ни одно правило не сработало, строка не пишется.
-- Результат: для каждого (домен, субдомен, вариант) — score, диапазон версий, список сработавших правил и краткое свидетельство (что именно найдено); на уровне домена — агрегат (максимальный score, объединённый диапазон, маска субдоменов).
+- **Score** — "noisy-OR": `1 − Π(1 − wᵢ)` over the triggered rules (weak signals accumulate but never reach 100%).
+- **Version** — the `[ver_min, ver_max]` range as the intersection of the ranges of the triggered rules; if the intersection is empty, a conflict is recorded and the range is marked as undetermined.
+- The threshold for a domain to enter the `laravel_domains` table is in config (default `score ≥ 0.6`).
+- `laravel_findings` stores **all hits** (any record where at least one rule triggered), regardless of the threshold; the `is_laravel` flag (`score ≥ threshold`) makes it possible to separate confident hits from weak ones. If no rule triggered, no row is written.
+- Result: for each (domain, subdomain, variant) — score, version range, list of triggered rules and brief evidence (what exactly was found); at the domain level — an aggregate (max score, merged range, subdomain mask).
 
-**Переанализ:** в результатах хранится `rules_version` (хэш набора правил). Фоновая задача находит записи с устаревшей версией правил и ставит их в `q:analyze`; повторное скачивание не требуется. Команда `crawlerctl reanalyze [--zone …]` запускает переанализ вручную.
+**Re-analysis:** results store `rules_version` (a hash of the rule set). A background task finds records with an outdated rules version and enqueues them into `q:analyze`; re-downloading is not required. The `crawlerctl reanalyze [--zone …]` command triggers re-analysis manually.
 
-### 5.9. Мониторинг
+### 5.9. Monitoring
 
-- Метрики Prometheus (HTTP-эндпоинт на каждом сервисе): пропускная способность по этапам, длины очередей, ошибки по типам, доля рендера, время ответа, глубина backlog, использование памяти воркерами.
-- **Прогресс по зонам:** `monitor` раз в 30–60 секунд обновляет `zones.domains_total` и `zones.domains_checked` (пакетно, без обновления счётчика на каждую строку).
-- CLI `crawlerctl status`: сводка по зонам, очередям, скорости, ожидаемому времени завершения цикла.
-- Визуализация: UI Prometheus и CLI `crawlerctl status`; Grafana не используется (ресурсоёмка).
-- Алерты (минимум): рост доли ошибок DNS, переполнение очередей, остановка прогресса, нехватка места на диске, износ NVMe (SMART).
+- Prometheus metrics (an HTTP endpoint on every service): throughput per stage, queue lengths, errors by type, render share, response time, backlog depth, worker memory usage.
+- **Per-zone progress:** `monitor` updates `zones.domains_total` and `zones.domains_checked` every 30–60 seconds (in batches, without updating the counters per row).
+- The CLI `crawlerctl status`: a summary of zones, queues, throughput, and the estimated time to complete the cycle.
+- Visualization: the Prometheus UI and the CLI `crawlerctl status`; Grafana is not used (too resource-hungry).
+- Alerts (minimum): growth of the DNS error share, queue overflow, stalled progress, disk space shortage, NVMe wear (SMART).
 
-### 5.10. Конфигурация
+### 5.10. Configuration
 
-Единый YAML-файл + переопределение через переменные окружения. Минимальный состав:
+A single YAML file + overrides via environment variables. Minimal set:
 
 ```yaml
 postgres:
@@ -353,7 +353,7 @@ ingest:
   batch_size: 50000
   stable_seconds: 10
 scheduler:
-  recheck_interval: "4380h"        # ≈ 6 месяцев
+  recheck_interval: "4380h"        # ≈ 6 months
   batch_size: 5000
   queue_high_watermark: 100000
   lease: "30m"
@@ -385,7 +385,7 @@ content:
 analyzer:
   rules_dir: "/etc/crawler/rules"
   laravel_min_score: 0.6
-subdomains:                          # начальное наполнение таблицы subdomains
+subdomains:                          # initial content of the subdomains table
   - ""
   - "www"
   - "admin"
@@ -397,41 +397,41 @@ monitor:
   zone_stats_interval: "60s"
 ```
 
-Список субдоменов — **настраиваемый и расширяемый**: хранится в таблице `subdomains` (управление через `crawlerctl subdomains add|disable`). Добавление нового субдомена (бит в `dns_mask`) не должно требовать миграции данных; проверка нового субдомена для уже проверенных доменов запускается отдельной командой по зоне/всем доменам. Максимум субдоменов — 63 (ограничение `int8` маски).
+The subdomain list is **configurable and extensible**: it is stored in the `subdomains` table (managed via `crawlerctl subdomains add|disable`). Adding a new subdomain (a bit in `dns_mask`) must not require a data migration; checking a new subdomain for already checked domains is started by a separate command per zone / for all domains. Maximum subdomains — 63 (an `int8` mask limitation).
 
-### 5.11. Поиск по имени домена
+### 5.11. Lookup by domain name
 
-Назначение: по имени домена быстро узнать его статус и признаки Laravel.
+Purpose: given a domain name, quickly learn its status and Laravel signals.
 
-- **Интерфейс:** CLI `crawlerctl domain <имя>` (флаг `--json` для машинного вывода) и SQL-функция `domain_info(text)` для прямого запроса из БД. Отдельный HTTP API и веб-интерфейс не требуются (возможны позже).
-- **Вход:** имя домена в любой форме — unicode или punycode, в любом регистре, с точкой на конце или без; нормализуется по правилам 5.2, зона отделяется по списку публичных суффиксов.
-- **Вывод:**
-  - зона, статус домена, состояние проверки, дата последней проверки;
-  - DNS-живые субдомены (расшифровка `dns_mask`);
-  - по каждому субдомену и варианту: схема, HTTP-статус, итоговый URL, тип алиаса, признак рендера, ошибка, время проверки;
-  - признаки Laravel: score, диапазон версий, список сработавших правил с подтверждающими фрагментами, субдомены, на которых найден Laravel (в том числе слабые срабатывания ниже порога, с пометкой `is_laravel`);
-  - по флагу `--content` — сохранённые HTML, cookies и заголовки (распаковываются из хранилища).
-- Если домен или зона не найдены, выводится понятное сообщение (с указанием, что именно не найдено).
-- Поиск идёт по уникальному ключу `(zone_id, label)`, без полного сканирования; целевое время ответа — не более 100 мс при прогретой БД.
+- **Interface:** the CLI `crawlerctl domain <name>` (the `--json` flag for machine-readable output) and the SQL function `domain_info(text)` for direct queries from the DB. A separate HTTP API and web UI are not required (possible later).
+- **Input:** a domain name in any form — unicode or punycode, any case, with or without a trailing dot; it is normalized per the rules of 5.2, and the zone is split off by the public suffix list.
+- **Output:**
+  - the zone, domain status, check state, last check date;
+  - DNS-alive subdomains (`dns_mask` decoded);
+  - per subdomain and variant: scheme, HTTP status, final URL, alias kind, render flag, error, check time;
+  - Laravel signals: score, version range, list of triggered rules with supporting fragments, subdomains where Laravel was found (including weak hits below the threshold, marked with `is_laravel`);
+  - with the `--content` flag — the stored HTML, cookies and headers (decompressed from storage).
+- If the domain or zone is not found, a clear message is printed (stating exactly what was not found).
+- The lookup goes by the unique key `(zone_id, label)`, without a full scan; the target response time is at most 100 ms with a warm DB.
 
 ---
 
-## 6. Модель данных (PostgreSQL)
+## 6. Data Model (PostgreSQL)
 
-Принципы:
+Principles:
 
-- Все таблицы с `domain_id` содержат также `zone_id`; партиционирование по `zone_id` (LIST), крупные зоны дополнительно по хэшу `id`, чтобы партиция не превышала ≈ 30–50 млн строк.
-- Минимум индексов; `last_checked_at` не индексируется (HOT-апдейты, пониженный `fillfactor`).
-- Размеры полей минимальные (`smallint`, `int4`, `bytea` для хэшей и адресов).
-- Запись пачками (`COPY`, `UPDATE … FROM unnest(...)`), `synchronous_commit = off` для данных краулера.
+- All tables with `domain_id` also contain `zone_id`; partitioning by `zone_id` (LIST), large zones additionally by a hash of `id`, so that a partition does not exceed ≈ 30–50 million rows.
+- A minimum of indexes; `last_checked_at` is not indexed (HOT updates, a reduced `fillfactor`).
+- Field sizes are minimal (`smallint`, `int4`, `bytea` for hashes and addresses).
+- Writes are batched (`COPY`, `UPDATE … FROM unnest(...)`), `synchronous_commit = off` for crawler data.
 
-### 6.1. Основные таблицы (эскиз DDL)
+### 6.1. Main tables (DDL sketch)
 
 ```sql
 CREATE TABLE zones (
     id              smallint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     name            text     NOT NULL UNIQUE,      -- punycode
-    name_unicode    text,                          -- для отображения
+    name_unicode    text,                          -- for display
     is_active       boolean  NOT NULL DEFAULT true,
     domains_total   bigint   NOT NULL DEFAULT 0,
     domains_checked bigint   NOT NULL DEFAULT 0,
@@ -439,8 +439,8 @@ CREATE TABLE zones (
 );
 
 CREATE TABLE subdomains (
-    id       smallint PRIMARY KEY,                 -- номер бита в dns_mask (0..62)
-    label    text     NOT NULL UNIQUE,             -- '' = апекс
+    id       smallint PRIMARY KEY,                 -- the bit number in dns_mask (0..62)
+    label    text     NOT NULL UNIQUE,             -- '' = apex
     enabled  boolean  NOT NULL DEFAULT true
 );
 
@@ -449,11 +449,11 @@ CREATE SEQUENCE domain_id_seq;
 CREATE TABLE domains (
     zone_id         smallint NOT NULL,
     id              bigint   NOT NULL DEFAULT nextval('domain_id_seq'),
-    label           text     NOT NULL,             -- без зоны, punycode
-    status          smallint NOT NULL DEFAULT 0,   -- см. 6.2
+    label           text     NOT NULL,             -- without the zone, punycode
+    status          smallint NOT NULL DEFAULT 0,   -- see 6.2
     check_state     smallint NOT NULL DEFAULT 0,   -- 0 pending, 1 queued, 2 done
-    flags           smallint NOT NULL DEFAULT 0,   -- бит0: is_idn, бит1: render_pending, …
-    dns_mask        bigint   NOT NULL DEFAULT 0,   -- резолвящиеся субдомены
+    flags           smallint NOT NULL DEFAULT 0,   -- bit0: is_idn, bit1: render_pending, …
+    dns_mask        bigint   NOT NULL DEFAULT 0,   -- resolving subdomains
     queued_at       timestamptz,
     last_checked_at date,
     PRIMARY KEY (zone_id, id),
@@ -461,26 +461,26 @@ CREATE TABLE domains (
 ) PARTITION BY LIST (zone_id) WITH (fillfactor = 85);
 
 CREATE INDEX domains_pending_idx
-    ON domains (zone_id, id) WHERE check_state = 0;   -- частичный индекс для планировщика
+    ON domains (zone_id, id) WHERE check_state = 0;   -- partial index for the scheduler
 
 CREATE TABLE subdomain_results (
     zone_id            smallint NOT NULL,
     domain_id          bigint   NOT NULL,
     subdomain_id       smallint NOT NULL,
-    variant            smallint NOT NULL DEFAULT 0,   -- 0 основной, 1 http (если отличается)
+    variant            smallint NOT NULL DEFAULT 0,   -- 0 primary, 1 http (if different)
     scheme             smallint NOT NULL,             -- 1 http, 2 https
     http_status        smallint,
     final_url          text,
-    alias_kind         smallint NOT NULL DEFAULT 0,   -- 0 нет, 1 идентичен, 2 редирект
+    alias_kind         smallint NOT NULL DEFAULT 0,   -- 0 none, 1 identical, 2 redirect
     alias_subdomain_id smallint,
-    addrs              bytea,                         -- упакованные A/AAAA
+    addrs              bytea,                         -- packed A/AAAA
     cname              text,
     tls                jsonb,
     redirects          jsonb,
     headers            jsonb,
     cookies            jsonb,
     rendered           boolean  NOT NULL DEFAULT false,
-    content_hash       bytea,                         -- 16 байт, ссылка на contents
+    content_hash       bytea,                         -- 16 bytes, a reference to contents
     error              smallint,
     response_ms        integer,
     checked_at         timestamptz NOT NULL,
@@ -489,7 +489,7 @@ CREATE TABLE subdomain_results (
 ) PARTITION BY LIST (zone_id);
 
 CREATE TABLE contents (
-    hash     bytea    PRIMARY KEY,                    -- 16 байт
+    hash     bytea    PRIMARY KEY,                    -- 16 bytes
     pack_id  integer  NOT NULL,
     off      bigint   NOT NULL,
     len      integer  NOT NULL,
@@ -503,7 +503,7 @@ CREATE TABLE laravel_domains (
     score          real     NOT NULL,
     ver_min        text,
     ver_max        text,
-    found_on_mask  bigint   NOT NULL,                 -- субдомены, где найден Laravel
+    found_on_mask  bigint   NOT NULL,                 -- subdomains where Laravel was found
     rules_version  integer  NOT NULL,
     updated_at     timestamptz NOT NULL,
     PRIMARY KEY (zone_id, domain_id)
@@ -518,7 +518,7 @@ CREATE TABLE laravel_findings (
     ver_min       text,
     ver_max       text,
     signals       jsonb    NOT NULL,                  -- [{rule, weight, evidence}, …]
-    is_laravel    boolean  NOT NULL,                  -- score >= порога из конфига
+    is_laravel    boolean  NOT NULL,                  -- score >= the config threshold
     PRIMARY KEY (zone_id, domain_id, subdomain_id, variant)
 ) PARTITION BY LIST (zone_id);
 
@@ -533,208 +533,208 @@ CREATE TABLE ingest_files (
 );
 ```
 
-Допускаются уточнения схемы при реализации, если сохраняются перечисленные принципы и поля.
+Schema refinements during implementation are allowed as long as the listed principles and fields are preserved.
 
-### 6.2. Статусы домена (`domains.status`)
+### 6.2. Domain statuses (`domains.status`)
 
-| Код | Статус | Значение |
+| Code | Status | Meaning |
 |---|---|---|
-| 0 | `new` | ещё не проверялся |
-| 1 | `not_delegated` | апекс NXDOMAIN |
-| 2 | `delegated_no_address` | делегирован, но ни у одного субдомена нет A/AAAA |
-| 3 | `no_http` | адреса есть, веб не отвечает ни по http, ни по https |
-| 4 | `alive` | хотя бы один субдомен ответил по HTTP(S) |
-| 5 | `temp_error` | временная ошибка (SERVFAIL, таймауты), требуется повтор |
-| 6 | `deleted` | удалён из зарегистрированных (по файлу удаления) |
+| 0 | `new` | not checked yet |
+| 1 | `not_delegated` | apex NXDOMAIN |
+| 2 | `delegated_no_address` | delegated, but no subdomain has A/AAAA |
+| 3 | `no_http` | addresses exist, but the web does not respond over http or https |
+| 4 | `alive` | at least one subdomain responded over HTTP(S) |
+| 5 | `temp_error` | a temporary error (SERVFAIL, timeouts), a retry is required |
+| 6 | `deleted` | removed from the registered list (by a deletion file) |
 
-Допускаются дополнительные статусы (например, `parked` по признакам заглушек), если они не ломают перечисленные.
+Additional statuses are allowed (e.g., `parked` based on stub signals) as long as they do not break the listed ones.
 
-### 6.3. Требования к PostgreSQL
+### 6.3. PostgreSQL requirements
 
-- Параметры для NVMe: `random_page_cost ≈ 1.1`, `effective_io_concurrency ≥ 200`.
-- Настроенный autovacuum для партиций `domains` и `subdomain_results` (частые апдейты).
-- Подключения через пул `pgx` (≤ 20–50 соединений суммарно).
-- Резервное копирование данных **не требуется** (данные восстановимы повторной проверкой). Схема БД и миграции хранятся в репозитории.
+- Parameters for NVMe: `random_page_cost ≈ 1.1`, `effective_io_concurrency ≥ 200`.
+- Configured autovacuum for the `domains` and `subdomain_results` partitions (frequent updates).
+- Connections through the `pgx` pool (≤ 20–50 connections in total).
+- Data backup is **not required** (the data is recoverable by re-checking). The DB schema and migrations are kept in the repository.
 
 ---
 
-## 7. Алгоритм проверки домена (сводка)
+## 7. Domain Check Algorithm (summary)
 
 ```
-домен pending
+domain pending
  └─ dns-worker
-     ├─ апекс NXDOMAIN → status=not_delegated, done
+     ├─ apex NXDOMAIN → status=not_delegated, done
      ├─ SERVFAIL/timeout → status=temp_error, retry later
-     ├─ wildcard-детект
-     ├─ A/AAAA/CNAME по субдоменам → dns_mask
-     ├─ нет адресов → status=delegated_no_address, done
-     └─ есть адреса → q:http
- └─ http-worker (параллельно по субдоменам, общий кэш итоговых URL)
-     ├─ https и http, редиректы, лимиты
-     ├─ variant 0/1 (только если разные сайты)
-     ├─ alias_kind (www ≡ без www и др.)
-     ├─ нет ответа ни у кого → status=no_http, done
-     ├─ SPA-оболочка → q:render
-     ├─ сохранение контента (zstd, дедуп) и результата
+     ├─ wildcard detection
+     ├─ A/AAAA/CNAME for subdomains → dns_mask
+     ├─ no addresses → status=delegated_no_address, done
+     └─ addresses present → q:http
+ └─ http-worker (parallel over subdomains, a shared final URL cache)
+     ├─ https and http, redirects, limits
+     ├─ variant 0/1 (only if different sites)
+     ├─ alias_kind (www ≡ no www, etc.)
+     ├─ no response from anyone → status=no_http, done
+     ├─ SPA shell → q:render
+     ├─ content (zstd, dedup) and result stored
      └─ q:analyze
- └─ render-worker → DOM + cookies → обновление результата → q:analyze
+ └─ render-worker → DOM + cookies → result updated → q:analyze
  └─ analyzer → laravel_findings / laravel_domains
-домен done, last_checked_at = сегодня
+domain done, last_checked_at = today
 ```
 
-Этапы независимы: задержка рендера или анализа не блокирует DNS и HTTP; домен считается `done` после завершения DNS/HTTP-этапа, а результаты рендера и анализа дополняют его асинхронно.
+The stages are independent: a rendering or analysis delay does not block DNS and HTTP; a domain counts as `done` after the DNS/HTTP stage completes, while render and analysis results are appended to it asynchronously.
 
 ---
 
-## 8. Обработка ошибок и особые случаи
+## 8. Error Handling and Special Cases
 
-- Тарпиты, бесконечные редиректы, огромные ответы, zip-бомбы — прерываются по лимитам из 5.5; фиксируется код ошибки.
-- Некорректные сертификаты — не препятствуют загрузке; данные о сертификате сохраняются.
-- Wildcard-DNS — см. 5.4.
-- Парковки и заглушки — естественная дедупликация по хэшу; опционально флаг по правилам.
-- Падение сервиса посреди пачки — зависшие задачи возвращаются по lease/`XAUTOCLAIM`.
-- Домен, удалённый файлом во время проверки: результат не записывается (проверка статуса при записи) либо удаляется фоновой очисткой.
-- Переполнение диска: сервисы приостанавливают запись контента и сигнализируют об этом алертом; порог настраивается.
-
----
-
-## 9. Безопасность и этика
-
-- Все исходящие запросы идут с идентифицируемым `User-Agent` и контактами.
-- Нагрузка на один хост/IP ограничена (раздел 5.5).
-- Анализатор пассивный; активного зондирования (пути вида `/.env`, `/_ignition` и т. п.) нет.
-- Рендер выполняется в изолированном профиле Chromium без сохранения состояния между страницами, под отдельным непривилегированным пользователем, с ограничением по сети и ресурсам.
-- Содержимое страниц считается недоверенным: все парсеры имеют ограничения размера и времени.
+- Tarpits, infinite redirects, huge responses, zip bombs — aborted per the limits of 5.5; the error code is recorded.
+- Invalid certificates — do not prevent fetching; the certificate data is stored.
+- Wildcard DNS — see 5.4.
+- Parking pages and hosting stubs — natural deduplication by hash; optionally a flag by rules.
+- A service crash in the middle of a batch — stuck tasks are recovered via lease/`XAUTOCLAIM`.
+- A domain deleted by a file during its check: the result is not written (a status check at write time) or is removed by background cleanup.
+- Disk overflow: services pause content writing and raise an alert about it; the threshold is configurable.
 
 ---
 
-## 10. Развёртывание и тюнинг
+## 9. Security and Ethics
 
-### 10.1. Окружение
+- All outgoing requests go out with an identifiable `User-Agent` and contact information.
+- The load on a single host/IP is limited (section 5.5).
+- The analyzer is passive; there is no active probing (paths like `/.env`, `/_ignition`, etc.).
+- Rendering runs in an isolated Chromium profile with no state kept between pages, under a separate unprivileged user, with network and resource limits.
+- Page content is treated as untrusted: all parsers have size and time limits.
 
-- Ubuntu Server (LTS), systemd-юниты на каждый сервис (`MemoryMax`, `Restart=on-failure`, отдельные пользователи).
-- Postgres, Redis, Unbound — пакеты ОС; Go-сервисы — статические бинарники; Chromium — отдельный пакет/каталог.
+---
 
-### 10.2. Тюнинг сети (один IP)
+## 10. Deployment and Tuning
 
-- Увеличить диапазон эфемерных портов (`net.ipv4.ip_local_port_range`), `tcp_tw_reuse`, лимиты `nofile`.
-- Настроить `nf_conntrack` (увеличить таблицу или исключить трафик краулера).
-- Настроить размеры UDP-буферов для DNS.
+### 10.1. Environment
 
-### 10.3. Диск
+- Ubuntu Server (LTS), a systemd unit per service (`MemoryMax`, `Restart=on-failure`, separate users).
+- Postgres, Redis, Unbound — OS packages; Go services — static binaries; Chromium — a separate package/directory.
 
-- Отдельные каталоги/тома для PostgreSQL и пак-файлов контента.
-- Мониторинг SMART и износа NVMe (TBW), так как нагрузка записи высокая.
+### 10.2. Network tuning (single IP)
 
-### 10.4. Извещения Telegram (CI/CD)
+- Increase the ephemeral port range (`net.ipv4.ip_local_port_range`), `tcp_tw_reuse`, the `nofile` limits.
+- Configure `nf_conntrack` (enlarge the table or exclude the crawler traffic).
+- Configure the UDP buffer sizes for DNS.
 
-О событиях конвейера GitHub Actions проект направляет извещения **Telegram-ботом в выделенную группу**. Отправляет сам конвейер (шаг уведомления в workflow); отдельный резидентный сервис и изменения в Go-коде не требуются. Извещения касаются только CI/CD; алерты рантайма сервиса остаются механизмом §5.9 (Prometheus).
+### 10.3. Disk
 
-События:
+- Separate directories/volumes for PostgreSQL and content pack files.
+- SMART and NVMe wear (TBW) monitoring, since the write load is high.
 
-| Событие | Условие отправки |
+### 10.4. Telegram notifications (CI/CD)
+
+For GitHub Actions pipeline events, the project sends notifications **via a Telegram bot to a dedicated group**. The pipeline itself sends them (a notification step in the workflow); no separate resident service or Go code changes are required. Notifications cover CI/CD only; the runtime alerts of the service remain the mechanism of §5.9 (Prometheus).
+
+Events:
+
+| Event | Send condition |
 |---|---|
-| Ошибка в коде | шаг линта (`golangci-lint`) или сборки (образов/бинарников) завершился ошибкой |
-| Ошибка тестов | провал модульных тестов, тестов правил по корпусу образцов или интеграционных тестов в GitHub Actions |
-| Успешный деплой | workflow деплоя дошёл до конца: установка на сервер и healthcheck прошли |
-| Неуспешный деплой | провал любого шага деплоя, в том числе healthcheck с автоматическим откатом |
+| Code error | the lint step (`golangci-lint`) or the build step (images/binaries) failed |
+| Test error | unit tests, rule tests against the sample corpus, or integration tests failed in GitHub Actions |
+| Successful deploy | the deploy workflow ran to completion: server installation and the healthcheck passed |
+| Failed deploy | any deploy step failed, including the healthcheck with automatic rollback |
 
-Требования к сообщениям:
+Message requirements:
 
-- состав: тип события, workflow и шаг, виновный коммит (короткий SHA и первая строка сообщения), ссылка на ран; для деплоев — дополнительно версия (`git describe`) и факт отката, если он был;
-- маркер результата в начале сообщения (успех/ошибка), чтобы группу можно было просматривать бегло;
-- одно событие — одно сообщение, без дублей и промежуточных статусов;
-- вспомогательные и ручные прогоны (например, mutation) извещений не порождают.
+- contents: the event type, the workflow and step, the offending commit (short SHA and the first line of its message), a link to the run; for deploys — additionally the version (`git describe`) and whether a rollback happened;
+- a result marker at the start of the message (success/failure) so that the group can be skimmed;
+- one event — one message, no duplicates or intermediate statuses;
+- auxiliary and manual runs (e.g., mutation) do not produce notifications.
 
-Секреты репозитория GitHub Actions: `TELEGRAM_BOT_TOKEN` (токен бота), `TELEGRAM_CHAT_ID` (id группы). Значения секретов не появляются в логах ранов и в извещениях.
+GitHub Actions repository secrets: `TELEGRAM_BOT_TOKEN` (the bot token), `TELEGRAM_CHAT_ID` (the group id). Secret values never appear in run logs or in notifications.
 
-Надёжность: сбой отправки извещения не влияет на результат конвейера — шаг уведомления выполняется по завершении рана независимо от его статуса, собственный провал шага не делает ран красным и фиксируется только в логе.
-
----
-
-## 11. Тестирование и приёмка
-
-### 11.1. Модульные тесты
-
-- Нормализация имён: смешанный регистр, `ß`/`ς`, эмодзи-домены, нулевой ширины символы, уже закодированные `xn--`, невалидные `xn--`, длинные метки, составные зоны (`co.uk`), unicode-имена каталогов зон.
-- Парсинг файлов: пустые строки, комментарии, CRLF, BOM, дубликаты, строки не из зоны.
-- Логика вариантов http/https и алиасов www/без www (в т. ч. редирект `bare → www`, `www → bare`, http → https, http ведёт на другой сайт).
-- Движок правил: score, пересечение диапазонов версий, конфликты; прогон по корпусу реальных образцов Laravel заказчика (`/testdata/laravel-samples`, с ожидаемыми `is_laravel` и диапазонами версий) и по негативным образцам.
-
-### 11.2. Интеграционные тесты
-
-- Тестовый стенд: локальные DNS и HTTP-серверы, эмулирующие NXDOMAIN, wildcard, тарпит, бесконечный редирект, гигантское тело, SPA-страницу, страницы Laravel разных версий.
-- Сквозной прогон: файл в `incoming` → записи в БД → результаты → `laravel_*`.
-- Устойчивость: остановка воркера посреди пачки, потеря Redis, перезапуск Postgres.
-
-### 11.3. Нагрузочные тесты и замеры
-
-- Замер реальной производительности на целевом сервере: DNS QPS, HTTP RPS, скорость рендера, расход памяти по сервисам, скорость записи в БД и в хранилище.
-- На основании замеров уточняются значения параметров по умолчанию и оценка длительности первого цикла.
-
-### 11.4. Критерии приёмки
-
-1. Файлы add/delete из наблюдаемой папки корректно применяются, в том числе для IDN-зон и доменов (без дублей зон в unicode/punycode формах).
-2. Проверка по каждому субдомену выполняется независимо; результаты соответствуют правилам вариантов и алиасов (раздел 5.5).
-3. Для SPA-страниц сохраняется итоговый DOM и cookies; для остальных — HTML; дедупликация и сжатие работают; контент можно прочитать обратно.
-4. Анализатор находит Laravel на тестовом наборе страниц разных версий с ожидаемыми диапазонами версий; список сработавших признаков и score сохраняются; изменение правил + `reanalyze` обновляет результаты без повторного скачивания.
-5. Таблица `laravel_domains` / `laravel_findings` позволяет получить: список доменов с Laravel, субдомены, версию (диапазон), признаки.
-6. Прогресс по зонам (всего / проверено) отображается и обновляется автоматически; метрики доступны в Prometheus.
-7. Сервис работает на целевом сервере в рамках бюджета памяти (раздел 3.2) без срабатывания OOM-killer при суточном прогоне.
-8. Повторная проверка домена происходит не чаще заданного интервала (по умолчанию 6 месяцев); значение меняется конфигом.
-9. Остановка/перезапуск любого сервиса не приводит к потере данных и «застрявшим» доменам (в течение времени lease).
-10. Поиск по имени (`crawlerctl domain`) для домена в любой форме записи (unicode/punycode) возвращает статус, результаты по субдоменам и признаки Laravel (если есть); для неизвестного домена выводится понятное сообщение.
-11. Анализатор на реальных образцах Laravel, предоставленных заказчиком, даёт ожидаемые срабатывания и диапазоны версий; в `laravel_findings` попадают все срабатывания, в `laravel_domains` — только со score не ниже порога.
+Reliability: a notification delivery failure does not affect the pipeline outcome — the notification step runs at the end of the run regardless of its status, and its own failure does not turn the run red and is only recorded in the log.
 
 ---
 
-## 12. Этапы разработки
+## 11. Testing and Acceptance
 
-| Этап | Содержание |
+### 11.1. Unit tests
+
+- Name normalization: mixed case, `ß`/`ς`, emoji domains, zero-width characters, already encoded `xn--`, invalid `xn--`, long labels, composite zones (`co.uk`), unicode names of zone directories.
+- File parsing: empty lines, comments, CRLF, BOM, duplicates, lines outside the zone.
+- The http/https variant logic and www/no-www aliases (including `bare → www`, `www → bare`, http → https redirects, and http leading to a different site).
+- The rules engine: score, version range intersection, conflicts; a run over the corpus of the customer's real Laravel samples (`/testdata/laravel-samples`, with expected `is_laravel` and version ranges) and over negative samples.
+
+### 11.2. Integration tests
+
+- Testbed: local DNS and HTTP servers emulating NXDOMAIN, wildcard, a tarpit, an infinite redirect, a giant body, an SPA page, Laravel pages of different versions.
+- An end-to-end run: a file in `incoming` → DB rows → results → `laravel_*`.
+- Resilience: a worker stopped mid-batch, Redis loss, a Postgres restart.
+
+### 11.3. Load tests and measurements
+
+- Measuring real performance on the target server: DNS QPS, HTTP RPS, render speed, memory usage per service, DB and storage write speed.
+- Based on the measurements, the default parameter values and the estimated duration of the first cycle are refined.
+
+### 11.4. Acceptance criteria
+
+1. add/delete files from the watched folder are applied correctly, including for IDN zones and domains (no duplicate zones in unicode/punycode forms).
+2. The check of each subdomain runs independently; the results follow the variant and alias rules (section 5.5).
+3. For SPA pages the final DOM and cookies are stored; for the rest — HTML; deduplication and compression work; the content can be read back.
+4. The analyzer detects Laravel on a test set of pages of different versions with the expected version ranges; the list of triggered signals and the score are stored; changing the rules + `reanalyze` updates the results without re-downloading.
+5. The `laravel_domains` / `laravel_findings` tables allow retrieving: the list of domains with Laravel, subdomains, the version (range), signals.
+6. Per-zone progress (total / checked) is displayed and updated automatically; the metrics are available in Prometheus.
+7. The service runs on the target server within the memory budget (section 3.2) without triggering the OOM killer during a daily run.
+8. A domain recheck happens no more often than the configured interval (default 6 months); the value is changed via config.
+9. Stopping/restarting any service does not lead to data loss or "stuck" domains (within the lease time).
+10. The lookup by name (`crawlerctl domain`) for a domain in any written form (unicode/punycode) returns the status, per-subdomain results, and Laravel signals (if any); for an unknown domain a clear message is printed.
+11. The analyzer on real Laravel samples provided by the customer gives the expected hits and version ranges; all hits go into `laravel_findings`, and only those with a score at or above the threshold go into `laravel_domains`.
+
+---
+
+## 12. Development Stages
+
+| Stage | Content |
 |---|---|
-| 1. Основа | Репозиторий, конфиг, схема БД и миграции, партиционирование, нормализация имён (IDN), CLI-скелет |
-| 2. Ingest | Наблюдение за папкой, потоковый разбор, `COPY` и add/delete, отчёты, тесты IDN |
-| 3. Очереди и планировщик | Redis Streams, scheduler, lease/recovery, backpressure |
-| 4. DNS-этап | Unbound, `dns-worker`, wildcard-детект, статусы, `dns_mask` |
-| 5. HTTP-этап | `http-worker`, редиректы, варианты, алиасы, лимиты, запись результатов |
-| 6. Хранилище контента | Паки, zstd-словарь, дедуп, компактификация, интерфейс `ContentStore` |
-| 7. Рендер | `render-worker`, эвристика SPA, cookies, управление памятью Chromium |
-| 8. Анализатор | Движок правил, YAML-правила Laravel на основе реальных образцов заказчика, `laravel_*`, переанализ |
-| 9. Мониторинг и поиск | Метрики, `monitor`, счётчики по зонам, `crawlerctl status`, `crawlerctl domain` (поиск по имени), алерты |
-| 10. Тюнинг и приёмка | Нагрузочные замеры, настройка ядра/Postgres, приёмочные тесты |
+| 1. Foundation | Repository, config, DB schema and migrations, partitioning, name normalization (IDN), CLI skeleton |
+| 2. Ingest | Folder watching, streaming parsing, `COPY` and add/delete, reports, IDN tests |
+| 3. Queues and scheduler | Redis Streams, scheduler, lease/recovery, backpressure |
+| 4. DNS stage | Unbound, `dns-worker`, wildcard detection, statuses, `dns_mask` |
+| 5. HTTP stage | `http-worker`, redirects, variants, aliases, limits, result writing |
+| 6. Content storage | Packs, the zstd dictionary, dedup, compaction, the `ContentStore` interface |
+| 7. Render | `render-worker`, the SPA heuristic, cookies, Chromium memory management |
+| 8. Analyzer | The rules engine, Laravel YAML rules based on the customer's real samples, `laravel_*`, re-analysis |
+| 9. Monitoring and lookup | Metrics, `monitor`, per-zone counters, `crawlerctl status`, `crawlerctl domain` (lookup by name), alerts |
+| 10. Tuning and acceptance | Load measurements, kernel/Postgres tuning, acceptance tests |
 
 ---
 
-## 13. Принятые решения и открытые вопросы
+## 13. Accepted Decisions and Open Questions
 
-### 13.1. Решения, подтверждённые заказчиком
+### 13.1. Decisions confirmed by the customer
 
-- Входные файлы содержат **полные имена доменов**; структура `incoming/<зона>/add|delete/*.txt` подтверждена.
-- Набор статусов домена (7 штук, раздел 6.2) подтверждён; отдельного статуса «парковка» нет.
-- Лимиты загрузки (раздел 5.5) подтверждены.
-- Удалённый домен остаётся в БД со статусом `deleted`; результаты и контент удаляются фоновой задачей.
-- Для отрендеренных страниц хранится только итоговый DOM.
-- Проверка нового субдомена для уже проверенных доменов запускается отдельной командой.
-- Очередь — Redis Streams.
-- Laravel: порог `laravel_domains` — `score ≥ 0.6`; в `laravel_findings` хранятся **все** срабатывания.
-- Реальные образцы страниц Laravel будут предоставлены заказчиком (используются для написания правил и тестов).
-- Доступ к данным: поиск по имени домена (статус и признаки), раздел 5.11; API и интерфейс поиска не требуются.
-- Резервное копирование не требуется.
-- Извещения о CI/CD (ошибки кода и тестов в GitHub Actions, результаты деплоев) отправляются Telegram-ботом в группу проекта (раздел 10.4).
+- Input files contain **full domain names**; the `incoming/<zone>/add|delete/*.txt` structure is confirmed.
+- The set of domain statuses (7 items, section 6.2) is confirmed; there is no separate "parked" status.
+- The fetch limits (section 5.5) are confirmed.
+- A deleted domain stays in the DB with the `deleted` status; results and content are removed by a background task.
+- For rendered pages only the final DOM is stored.
+- Checking a new subdomain for already checked domains is started by a separate command.
+- The queue is Redis Streams.
+- Laravel: the `laravel_domains` threshold is `score ≥ 0.6`; `laravel_findings` stores **all** hits.
+- Real Laravel page samples will be provided by the customer (used for writing rules and tests).
+- Data access: lookup by domain name (status and signals), section 5.11; a search API and UI are not required.
+- Backup is not required.
+- CI/CD notifications (code and test errors in GitHub Actions, deploy outcomes) are sent by a Telegram bot to the project group (section 10.4).
 
-### 13.2. Остаётся на усмотрение разработки
+### 13.2. Left to the development team
 
-- Эвристика определения SPA-оболочки, формат пак-файлов и параметры сжатия.
-- Конкретные значения конфигурации по умолчанию — уточняются нагрузочными замерами (раздел 11.3).
+- The SPA shell detection heuristic, the pack file format and compression parameters.
+- Specific default configuration values — refined by load measurements (section 11.3).
 
-### 13.3. Открытые вопросы
+### 13.3. Open questions
 
-- Формат и срок передачи образцов Laravel: рекомендуемый формат — для каждого образца папка с итоговым HTML, заголовками, cookies и файлом с ожидаемым результатом (версия или диапазон, если известна), см. `TZ_docker_dev_environment.md`, п. 4.4.2.
-- Желательно получить также образцы **не-Laravel** страниц (в том числе на других фреймворках, использующих похожие признаки) для проверки ложных срабатываний.
+- Format and timing for delivering the Laravel samples: the recommended format is a folder per sample with the final HTML, headers, cookies, and a file with the expected result (the version or range, if known); see `TZ_docker_dev_environment.md`, item 4.4.2.
+- It is desirable to also receive **non-Laravel** page samples (including pages on other frameworks with similar signals) to check for false positives.
 
 ---
 
-## Приложение А. Структура репозитория (рекомендация)
+## Appendix A. Repository Structure (recommendation)
 
 ```
 /cmd/
@@ -744,12 +744,12 @@ CREATE TABLE ingest_files (
   config/  db/  queue/  idn/  dnsclient/  httpfetch/  render/
   content/  rules/  metrics/  model/
 /migrations/
-/rules/                 # YAML-правила Laravel
-/deploy/                # systemd-юниты, конфиги Postgres/Redis/Unbound, sysctl
-/testdata/laravel-samples/   # реальные образцы страниц Laravel (предоставляет заказчик)
+/rules/                 # Laravel YAML rules
+/deploy/                # systemd units, Postgres/Redis/Unbound configs, sysctl
+/testdata/laravel-samples/   # real Laravel page samples (provided by the customer)
 /docs/
 ```
 
-## Приложение Б. Рекомендуемые Go-библиотеки
+## Appendix B. Recommended Go Libraries
 
 `github.com/jackc/pgx/v5`, `github.com/redis/go-redis/v9`, `github.com/miekg/dns`, `golang.org/x/net/idna`, `golang.org/x/net/publicsuffix`, `github.com/chromedp/chromedp`, `github.com/klauspost/compress/zstd`, `github.com/fsnotify/fsnotify`, `github.com/prometheus/client_golang`, `gopkg.in/yaml.v3`.
