@@ -359,7 +359,7 @@ func TestStage_BadRow(t *testing.T) {
 		row  Row
 		want string // a fragment of the expected error
 	}{
-		{"an empty label", Row{Label: "", LineNo: 1}, "an empty label"},
+		{"an empty label", Row{Label: "", LineNo: 1}, "an empty domain label"},
 		{"a non-ASCII label", Row{Label: "пример", LineNo: 1}, "punycode"},
 		{"a label longer than 63", Row{Label: strings.Repeat("a", 64), LineNo: 1}, "at most 63"},
 		{"an empty part of a composite label", Row{Label: "sub..example", LineNo: 1}, "non-empty"},

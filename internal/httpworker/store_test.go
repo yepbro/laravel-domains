@@ -359,7 +359,7 @@ func TestStoreFullResultAlive(t *testing.T) {
 	if _, _, _, refs := st.snapshot(); refs[content.HashOf([]byte(fresh))] != 0 {
 		t.Error("the fresh content got into the store at the overflow")
 	}
-	if msg := wlog.String(); !strings.Contains(msg, "not stored") || !strings.Contains(msg, "unavailable") {
+	if msg := wlog.String(); !strings.Contains(msg, "not stored") || !strings.Contains(msg, "store is full") {
 		t.Errorf("the worker overflow Warn is not written: %q", msg)
 	}
 	if msg := flog.String(); !strings.Contains(msg, "not stored") {

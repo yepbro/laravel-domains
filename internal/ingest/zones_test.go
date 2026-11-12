@@ -428,11 +428,11 @@ func TestSQLZoneQueryError(t *testing.T) {
 	store := NewZoneStore(pool)
 
 	if _, err := store.ZoneByName(context.Background(), "com"); err == nil ||
-		!strings.Contains(err.Error(), "db: zones: the zone com lookup:") || !strings.Contains(err.Error(), "the connection is closed") {
+		!strings.Contains(err.Error(), "db: zones: zone lookup com:") || !strings.Contains(err.Error(), "the connection is closed") {
 		t.Errorf("the error = %v, want wrapped «db: zones: the zone com lookup: … the connection is closed»", err)
 	}
 	if _, err := store.CreateZone(context.Background(), "com", nil); err == nil ||
-		!strings.Contains(err.Error(), "db: zones: the zone com creation:") {
+		!strings.Contains(err.Error(), "db: zones: zone creation com:") {
 		t.Errorf("the error = %v, want wrapped «db: zones: the zone com creation: …»", err)
 	}
 }
