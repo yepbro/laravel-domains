@@ -184,17 +184,17 @@ func aggregateDomain(ctx context.Context, tx pgx.Tx, zoneID int16, domainID int6
 	// The lock first: the recalculations of one domain line up in a queue,
 	// the second reads the findings after the first one's commit.
 	if _, err := tx.Exec(ctx, aggregateLockSQL, domainID); err != nil {
-		return false, fmt.Errorf("блокировка домена: %w", err)
+		return false, fmt.Errorf("domain lock: %w", err)
 	}
 
 	rows, err := tx.Query(ctx, aggregateSelectSQL, zoneID, domainID)
 	if err != nil {
-		return false, fmt.Errorf("чтение срабатываний: %w", err)
+		return false, fmt.Errorf("reading hits: %w", err)
 	}
 	agg, err := scanAggregate(rows)
 	rows.Close()
 	if err != nil {
-		return false, fmt.Errorf("чтение срабатываний: %w", err)
+		return false, fmt.Errorf("reading hits: %w", err)
 	}
 
 	// The row presence before the recalculation — for the appeared/lost
@@ -202,13 +202,13 @@ func aggregateDomain(ctx context.Context, tx pgx.Tx, zoneID int16, domainID int6
 	// will not change it between the check and the write.
 	var existed bool
 	if err := tx.QueryRow(ctx, aggregateExistsSQL, zoneID, domainID).Scan(&existed); err != nil {
-		return false, fmt.Errorf("чтение строки домена: %w", err)
+		return false, fmt.Errorf("reading domain row: %w", err)
 	}
 
 	if agg.findings == 0 {
 		tag, err := tx.Exec(ctx, aggregateDeleteSQL, zoneID, domainID)
 		if err != nil {
-			return false, fmt.Errorf("удаление строки домена: %w", err)
+			return false, fmt.Errorf("deleting domain row: %w", err)
 		}
 		// Equivalent mutants (T-M10): RowsAffected of a DELETE is 0 or 1,
 		// and existed is read under the advisory lock BEFORE the delete
@@ -227,7 +227,7 @@ func aggregateDomain(ctx context.Context, tx pgx.Tx, zoneID int16, domainID int6
 			}
 			if fresh {
 				if _, err := tx.Exec(ctx, aggregateHistorySQL, zoneID, domainID, false); err != nil {
-					return false, fmt.Errorf("запись истории (lost): %w", err)
+					return false, fmt.Errorf("history write (lost): %w", err)
 				}
 				if err := aggregateBumpHistoryCounter(ctx, tx, counterLaravelLost, 1); err != nil {
 					return false, err
@@ -243,10 +243,10 @@ func aggregateDomain(ctx context.Context, tx pgx.Tx, zoneID int16, domainID int6
 		zoneID, domainID, agg.score, agg.verMin, agg.verMax,
 		int64(agg.foundOnMask), version)
 	if err != nil {
-		return false, fmt.Errorf("запись строки домена: %w", err)
+		return false, fmt.Errorf("writing domain row: %w", err)
 	}
 	if tag.RowsAffected() != 1 {
-		return false, fmt.Errorf("запись строки домена: затронуто %d строк", tag.RowsAffected())
+		return false, fmt.Errorf("writing domain row: %d rows affected", tag.RowsAffected())
 	}
 	if existed {
 		return false, nil
@@ -259,7 +259,7 @@ func aggregateDomain(ctx context.Context, tx pgx.Tx, zoneID int16, domainID int6
 	}
 	if fresh {
 		if _, err := tx.Exec(ctx, aggregateHistorySQL, zoneID, domainID, true); err != nil {
-			return false, fmt.Errorf("запись истории (appeared): %w", err)
+			return false, fmt.Errorf("history write (appeared): %w", err)
 		}
 		if err := aggregateBumpHistoryCounter(ctx, tx, counterLaravelAppeared, 1); err != nil {
 			return false, err
@@ -273,10 +273,10 @@ func aggregateDomain(ctx context.Context, tx pgx.Tx, zoneID int16, domainID int6
 func aggregateShiftZoneLaravel(ctx context.Context, tx pgx.Tx, zoneID int16, delta int64) error {
 	tag, err := tx.Exec(ctx, aggregateZoneLaravelSQL, delta, zoneID)
 	if err != nil {
-		return fmt.Errorf("счётчик Laravel-зоны: %w", err)
+		return fmt.Errorf("Laravel zone counter: %w", err)
 	}
 	if tag.RowsAffected() != 1 {
-		return fmt.Errorf("счётчик Laravel-зоны: затронуто %d строк (строка зоны %d обязательна)", tag.RowsAffected(), zoneID)
+		return fmt.Errorf("Laravel zone counter: %d rows affected (zone row %d is required)", tag.RowsAffected(), zoneID)
 	}
 	return nil
 }
@@ -286,10 +286,10 @@ func aggregateShiftZoneLaravel(ctx context.Context, tx pgx.Tx, zoneID int16, del
 func aggregateBumpHistoryCounter(ctx context.Context, tx pgx.Tx, name string, delta int64) error {
 	tag, err := tx.Exec(ctx, aggregateCounterDeltaSQL, name, delta)
 	if err != nil {
-		return fmt.Errorf("счётчик истории (%s): %w", name, err)
+		return fmt.Errorf("history counter (%s): %w", name, err)
 	}
 	if tag.RowsAffected() != 1 {
-		return fmt.Errorf("счётчик истории (%s): затронуто %d строк", name, tag.RowsAffected())
+		return fmt.Errorf("history counter (%s): %d rows affected", name, tag.RowsAffected())
 	}
 	return nil
 }

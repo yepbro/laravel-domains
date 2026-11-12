@@ -21,15 +21,15 @@ const (
 
 func TestLaravelRulesetOnCorpus(t *testing.T) {
 	if _, err := os.Stat(laravelSamplesDir); err != nil {
-		t.Skipf("корпус образцов недоступен: %v", err)
+		t.Skipf("the sample corpus is unavailable: %v", err)
 	}
 	set, err := LoadDir(laravelRulesDir)
 	if err != nil {
-		t.Fatalf("набор правил не загружается: %v", err)
+		t.Fatalf("the rule set does not load: %v", err)
 	}
 	samples, err := LoadSamples(laravelSamplesDir)
 	if err != nil {
-		t.Fatalf("корпус не загружается: %v", err)
+		t.Fatalf("the corpus does not load: %v", err)
 	}
 
 	// The corpus must contain both positive and negative samples (spec §13.3).
@@ -44,7 +44,7 @@ func TestLaravelRulesetOnCorpus(t *testing.T) {
 		}
 	}
 	if positives < 5 || negatives < 4 {
-		t.Fatalf("корпус подозрительно мал: позитивных %d (нужно >=5), негативных %d (нужно >=4)",
+		t.Fatalf("the corpus is suspiciously small: positives %d (need >=5), negatives %d (need >=4)",
 			positives, negatives)
 	}
 
@@ -53,13 +53,13 @@ func TestLaravelRulesetOnCorpus(t *testing.T) {
 			res := set.Evaluate(s.Page())
 
 			if res.Conflict {
-				t.Errorf("неожиданный конфликт диапазонов версий: [%s..%s]", res.VerMin, res.VerMax)
+				t.Errorf("an unexpected version range conflict: [%s..%s]", res.VerMin, res.VerMax)
 			}
 			if isLaravel := res.Score >= laravelThreshold; s.Expect.IsLaravel != nil && isLaravel != *s.Expect.IsLaravel {
-				t.Errorf("is_laravel = %v (score %.3f), ожидалось %v", isLaravel, res.Score, *s.Expect.IsLaravel)
+				t.Errorf("is_laravel = %v (score %.3f), expected %v", isLaravel, res.Score, *s.Expect.IsLaravel)
 			}
 			if !res.Contains(s.Expect.VerMin, s.Expect.VerMax) {
-				t.Errorf("диапазон [%s..%s] не покрывает ожидание [%s..%s]",
+				t.Errorf("the range [%s..%s] does not cover the expectation [%s..%s]",
 					orQ(res.VerMin), orQ(res.VerMax), orQ(s.Expect.VerMin), orQ(s.Expect.VerMax))
 			}
 
@@ -73,7 +73,7 @@ func TestLaravelRulesetOnCorpus(t *testing.T) {
 				want := slices.Clone(s.Expect.Rules)
 				sort.Strings(want)
 				if !slices.Equal(fired, want) {
-					t.Errorf("сработали %v, в meta.yaml %v", fired, want)
+					t.Errorf("fired %v, in meta.yaml %v", fired, want)
 				}
 			}
 		})
@@ -82,11 +82,11 @@ func TestLaravelRulesetOnCorpus(t *testing.T) {
 
 func TestLaravelRulesetNoFalsePositiveOnPlainPage(t *testing.T) {
 	if _, err := os.Stat(laravelRulesDir); err != nil {
-		t.Skipf("набор правил недоступен: %v", err)
+		t.Skipf("the rule set is unavailable: %v", err)
 	}
 	set, err := LoadDir(laravelRulesDir)
 	if err != nil {
-		t.Fatalf("набор правил не загружается: %v", err)
+		t.Fatalf("the rule set does not load: %v", err)
 	}
 	// A page without framework signs (a typical hosting stub).
 	res := set.Evaluate(Page{
@@ -94,7 +94,7 @@ func TestLaravelRulesetNoFalsePositiveOnPlainPage(t *testing.T) {
 			"<body><h1>It works!</h1><p>This is the default web page.</p></body></html>"),
 	})
 	if res.Score != 0 || len(res.Signals) != 0 {
-		t.Errorf("ложные срабатывания на пустой странице: score=%v, сигналы=%v", res.Score, res.Signals)
+		t.Errorf("false hits on an empty page: score=%v, signals=%v", res.Score, res.Signals)
 	}
 }
 

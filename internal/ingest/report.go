@@ -104,11 +104,11 @@ func NewFileStore(pool db.DB) *SQLFileStore {
 func (s *SQLFileStore) FilesBySHA256(ctx context.Context, sha []byte) ([]model.IngestFile, error) {
 	rows, err := s.pool.Query(ctx, sqlFilesBySHA, sha)
 	if err != nil {
-		return nil, fmt.Errorf("db: ingest_files: поиск по sha256: %w", err)
+		return nil, fmt.Errorf("db: ingest_files: lookup by sha256: %w", err)
 	}
 	fs, err := pgx.CollectRows(rows, pgx.RowToStructByName[model.IngestFile])
 	if err != nil {
-		return nil, fmt.Errorf("db: ingest_files: поиск по sha256: %w", err)
+		return nil, fmt.Errorf("db: ingest_files: lookup by sha256: %w", err)
 	}
 	return fs, nil
 }
@@ -120,7 +120,7 @@ func (s *SQLFileStore) FilesBySHA256(ctx context.Context, sha []byte) ([]model.I
 // pipeline.
 func (s *SQLFileStore) RecordFile(ctx context.Context, rec FileRecord) error {
 	if len(rec.SHA256) != sha256.Size {
-		return fmt.Errorf("ingest: отчёт файла %s: sha256 — %d октетов, ожидается %d",
+		return fmt.Errorf("ingest: file %s report: sha256 — %d octets, want %d",
 			rec.Path, len(rec.SHA256), sha256.Size)
 	}
 	var zoneID any // nil → NULL: a zone-less file (add|delete/<file>)
@@ -132,7 +132,7 @@ func (s *SQLFileStore) RecordFile(ctx context.Context, rec FileRecord) error {
 		rec.LinesTotal, rec.Added, rec.Existed, rec.Deleted, rec.Rejected,
 		rec.ProcessedAt,
 	); err != nil {
-		return fmt.Errorf("db: ingest_files: отчёт %s: %w", rec.Path, err)
+		return fmt.Errorf("db: ingest_files: report %s: %w", rec.Path, err)
 	}
 	return nil
 }
@@ -211,41 +211,41 @@ func (r FileReport) record(at time.Time) FileRecord {
 // invalid — <reason>.
 func renderReport(rep FileReport, verdict string) string {
 	var b strings.Builder
-	b.WriteString("# лог-отчёт ingest (ТЗ 5.1)\n")
-	fmt.Fprintf(&b, "файл: %s\n", rep.Path)
+	b.WriteString("# ingest log report (spec 5.1)\n")
+	fmt.Fprintf(&b, "file: %s\n", rep.Path)
 	if rep.Zone != "" {
-		fmt.Fprintf(&b, "зона: %s (id %d)\n", rep.Zone, rep.ZoneID)
+		fmt.Fprintf(&b, "zone: %s (id %d)\n", rep.Zone, rep.ZoneID)
 	} else if rep.Action.Valid() {
-		b.WriteString("зона: по именам строк (файл без каталога зоны)\n")
+		b.WriteString("zone: from row names (a file without a zone directory)\n")
 	} else {
-		b.WriteString("зона: — (путь не разобран)\n")
+		b.WriteString("zone: — (the path was not parsed)\n")
 	}
-	fmt.Fprintf(&b, "действие: %s\n", actionName(rep.Action))
+	fmt.Fprintf(&b, "action: %s\n", actionName(rep.Action))
 	if len(rep.SHA256) > 0 {
 		fmt.Fprintf(&b, "sha256: %x\n", rep.SHA256)
 	}
-	fmt.Fprintf(&b, "итог: %s\n", verdict)
+	fmt.Fprintf(&b, "verdict: %s\n", verdict)
 
-	fmt.Fprintf(&b, "строк: %d\n", rep.LinesTotal)
+	fmt.Fprintf(&b, "lines: %d\n", rep.LinesTotal)
 	if rep.Members > 0 {
-		fmt.Fprintf(&b, "членов архива: %d\n", rep.Members)
+		fmt.Fprintf(&b, "archive members: %d\n", rep.Members)
 	}
-	fmt.Fprintf(&b, "  пропущено (пустые и комментарии): %d\n", rep.Skipped)
-	fmt.Fprintf(&b, "  отклонено: %d\n", rep.Rejected)
+	fmt.Fprintf(&b, "  skipped (blank and comments): %d\n", rep.Skipped)
+	fmt.Fprintf(&b, "  rejected: %d\n", rep.Rejected)
 	for _, r := range sortedReasons(rep.Reasons) {
 		// string(r), not %s: the report carries the stable reason name
 		// (as in the rejected log, T-016), not its text.
 		fmt.Fprintf(&b, "    %s: %d\n", string(r), rep.Reasons[r])
 	}
-	fmt.Fprintf(&b, "  валидных: %d\n", rep.Accepted)
+	fmt.Fprintf(&b, "  valid: %d\n", rep.Accepted)
 
 	switch rep.Action {
 	case model.ActionAdd:
-		fmt.Fprintf(&b, "добавлено: %d (в т.ч. возвращено из deleted: %d)\n", rep.Added, rep.Revived)
-		fmt.Fprintf(&b, "уже было: %d\n", rep.Existed)
+		fmt.Fprintf(&b, "added: %d (including revived from deleted: %d)\n", rep.Added, rep.Revived)
+		fmt.Fprintf(&b, "already existed: %d\n", rep.Existed)
 	case model.ActionDelete:
-		fmt.Fprintf(&b, "удалено: %d\n", rep.Deleted)
-		fmt.Fprintf(&b, "не найдено в БД: %d\n", rep.NotFound)
+		fmt.Fprintf(&b, "deleted: %d\n", rep.Deleted)
+		fmt.Fprintf(&b, "not found in the DB: %d\n", rep.NotFound)
 	}
 	return b.String()
 }

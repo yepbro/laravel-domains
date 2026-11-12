@@ -47,51 +47,51 @@ func scoreRulesCases() []struct {
 		conflict       bool
 	}{
 		{
-			name: "нет правил",
+			name: "no rules",
 		},
 		{
-			name:  "без границ — диапазон не ограничен",
+			name:  "no bounds — the range is unbounded",
 			rules: []Rule{{ID: "a", Weight: 0.25}, {ID: "b", Weight: 0.2}},
 		},
 		{
-			name:   "только ver_min — берётся максимум",
+			name:   "ver_min only — the maximum is taken",
 			rules:  []Rule{{ID: "a", Weight: 0.3, VerMin: "9.19"}, {ID: "b", Weight: 0.2, VerMin: "10"}, {ID: "c", Weight: 0.2}},
 			verMin: "10",
 		},
 		{
-			name:   "только ver_max — берётся минимум",
+			name:   "ver_max only — the minimum is taken",
 			rules:  []Rule{{ID: "a", Weight: 0.3, VerMax: "11.x"}, {ID: "b", Weight: 0.2, VerMax: "9.x"}},
 			verMax: "9.x",
 		},
 		{
-			name:   "пересечение [9.19,∞) и (−∞,9.x] = [9.19,9.x]",
+			name:   "the intersection [9.19,∞) ∩ (−∞,9.x] = [9.19,9.x]",
 			rules:  []Rule{{ID: "a", Weight: 0.15, VerMin: "9.19"}, {ID: "b", Weight: 0.15, VerMax: "9.x"}},
 			verMin: "9.19", verMax: "9.x",
 		},
 		{
-			name:   "равные границы — диапазон из одной версии, не конфликт",
+			name:   "equal bounds — a single-version range, not a conflict",
 			rules:  []Rule{{ID: "a", Weight: 0.3, VerMin: "9.19"}, {ID: "b", Weight: 0.3, VerMax: "9.19"}},
 			verMin: "9.19", verMax: "9.19",
 		},
 		{
-			name:   "равные границы в разной записи — 9.19 = 9.19.0",
+			name:   "equal bounds in a different notation — 9.19 = 9.19.0",
 			rules:  []Rule{{ID: "a", Weight: 0.3, VerMin: "9.19"}, {ID: "b", Weight: 0.3, VerMax: "9.19.0"}},
 			verMin: "9.19", verMax: "9.19.0",
 		},
 		{
-			name:   "пустое пересечение [10,∞) ∩ (−∞,9.x] — конфликт, диапазон сброшен",
+			name:   "an empty intersection [10,∞) ∩ (−∞,9.x] — a conflict, the range is reset",
 			rules:  []Rule{{ID: "a", Weight: 0.3, VerMin: "10"}, {ID: "b", Weight: 0.3, VerMax: "9.x"}},
 			verMin: "10", verMax: "9.x",
 			conflict: true,
 		},
 		{
-			name:   "точечный конфликт 9.19.1 < 10",
+			name:   "a point conflict 9.19.1 < 10",
 			rules:  []Rule{{ID: "a", Weight: 0.3, VerMin: "10"}, {ID: "b", Weight: 0.3, VerMax: "9.19.1"}},
 			verMin: "10", verMax: "9.19.1",
 			conflict: true,
 		},
 		{
-			name:   "некорректные версии игнорируются",
+			name:   "invalid versions are ignored",
 			rules:  []Rule{{ID: "a", Weight: 0.3, VerMin: "lts"}, {ID: "b", Weight: 0.3, VerMax: "9..1"}, {ID: "c", Weight: 0.3, VerMin: "9.19"}},
 			verMin: "9.19",
 		},
@@ -99,7 +99,7 @@ func scoreRulesCases() []struct {
 			// ver_min "0" — the first boundary is fixed even with a zero
 			// component: the comparison against the still empty accumulator
 			// must not discard it
-			name:   "ver_min «0» — нижняя граница фиксируется",
+			name:   "ver_min «0» — the lower bound is pinned",
 			rules:  []Rule{{ID: "a", Weight: 0.3, VerMin: "0"}},
 			verMin: "0",
 		},
@@ -107,7 +107,7 @@ func scoreRulesCases() []struct {
 			// ver_max with a negative component and no ver_min: no
 			// conflict — the empty left boundary is not substituted into
 			// the comparison
-			name:   "ver_max без ver_min — конфликта нет",
+			name:   "ver_max without ver_min — no conflict",
 			rules:  []Rule{{ID: "a", Weight: 0.3, VerMax: "-1"}},
 			verMax: "-1",
 		},
@@ -129,18 +129,18 @@ func TestScoreRules(t *testing.T) {
 		}
 		if c.conflict {
 			if !conflict {
-				t.Errorf("%s: ожидался конфликт диапазонов", c.name)
+				t.Errorf("%s: a range conflict was expected", c.name)
 			}
 			if verMin != "" || verMax != "" {
-				t.Errorf("%s: при конфликте диапазон должен сбрасываться, got [%s, %s]", c.name, verMin, verMax)
+				t.Errorf("%s: on a conflict the range must be reset, got [%s, %s]", c.name, verMin, verMax)
 			}
 			continue
 		}
 		if conflict {
-			t.Errorf("%s: неожиданный конфликт диапазонов", c.name)
+			t.Errorf("%s: an unexpected range conflict", c.name)
 		}
 		if verMin != c.verMin || verMax != c.verMax {
-			t.Errorf("%s: диапазон = [%s, %s], want [%s, %s]", c.name, verMin, verMax, c.verMin, c.verMax)
+			t.Errorf("%s: the range = [%s, %s], want [%s, %s]", c.name, verMin, verMax, c.verMin, c.verMax)
 		}
 	}
 }
@@ -151,20 +151,20 @@ func TestIsLaravel(t *testing.T) {
 		score, minScore float64
 		want            bool
 	}{
-		{"ровно порог", 0.6, 0.6, true}, // the comparison is non-strict: score >= the threshold
-		{"ниже порога", 0.59, 0.6, false},
-		{"выше порога", 0.61, 0.6, true},
-		{"порог из конфига", 0.75, 0.75, true},
-		{"максимальный порог", 1, 1, true},
-		{"нулевой порог — дефолт 0.6", 0.6, 0, true},
-		{"нулевой порог — дефолт 0.6, score ниже", 0.5, 0, false},
-		{"отрицательный порог — дефолт 0.6", 0.55, -1, false},
-		{"порог 1, score ниже — не заменяется дефолтом", 0.8, 1, false},
+		{"exactly the threshold", 0.6, 0.6, true}, // the comparison is non-strict: score >= the threshold
+		{"below the threshold", 0.59, 0.6, false},
+		{"above the threshold", 0.61, 0.6, true},
+		{"a threshold from the config", 0.75, 0.75, true},
+		{"the maximum threshold", 1, 1, true},
+		{"a zero threshold — the default 0.6", 0.6, 0, true},
+		{"a zero threshold — the default 0.6, the score below", 0.5, 0, false},
+		{"a negative threshold — the default 0.6", 0.55, -1, false},
+		{"the threshold 1, the score below — not replaced by the default", 0.8, 1, false},
 	}
 	for _, c := range cases {
 		res := Result{Score: c.score}
 		if got := res.IsLaravel(c.minScore); got != c.want {
-			t.Errorf("%s: IsLaravel(%v, порог %v) = %v, want %v", c.name, c.score, c.minScore, got, c.want)
+			t.Errorf("%s: IsLaravel(%v, threshold %v) = %v, want %v", c.name, c.score, c.minScore, got, c.want)
 		}
 	}
 }
@@ -231,7 +231,7 @@ func TestVersionCompare(t *testing.T) {
 	for _, c := range cases {
 		va, vb := parseVersion(c.a), parseVersion(c.b)
 		if va == nil || vb == nil {
-			t.Fatalf("parseVersion(%q или %q) вернул nil", c.a, c.b)
+			t.Fatalf("parseVersion(%q or %q) returned nil", c.a, c.b)
 		}
 		if got := va.less(vb); got != c.less {
 			t.Errorf("%s < %s = %v, want %v", c.a, c.b, got, c.less)
@@ -273,36 +273,36 @@ func TestCompareVersions(t *testing.T) {
 func TestResultContains(t *testing.T) {
 	res := Result{VerMin: "9.19", VerMax: ""}
 	if !res.Contains("9.19", "") {
-		t.Error("[9.19,∞) должен включать 9.19")
+		t.Error("[9.19,∞) must include 9.19")
 	}
 	if !res.Contains("10", "11") {
-		t.Error("[9.19,∞) должен включать [10,11]")
+		t.Error("[9.19,∞) must include [10,11]")
 	}
 	if res.Contains("9.18", "") {
-		t.Error("[9.19,∞) не должен включать 9.18")
+		t.Error("[9.19,∞) must not include 9.18")
 	}
 	res2 := Result{VerMin: "9.19", VerMax: "11.x"}
 	if !res2.Contains("10", "11") {
-		t.Error("[9.19,11.x] должен включать [10,11]")
+		t.Error("[9.19,11.x] must include [10,11]")
 	}
 	if res2.Contains("11", "12") {
-		t.Error("[9.19,11.x] не должен включать 12")
+		t.Error("[9.19,11.x] must not include 12")
 	}
 	res3 := Result{} // an unbounded range includes everything
 	if !res3.Contains("5", "12") {
-		t.Error("(−∞,∞) должен включать любой диапазон")
+		t.Error("(−∞,∞) must include any range")
 	}
 	if res3.Contains("lts", "") {
-		t.Error("некорректное ожидание не может входить ни в какой диапазон")
+		t.Error("an invalid expectation cannot fall into any range")
 	}
 	// A negative expected boundary in a range unbounded from below: the
 	// result's missing lower boundary is not compared against the
 	// expectation (lo == nil is not substituted into less).
 	if !res3.Contains("-1", "") {
-		t.Error("(−∞,∞) включает любое корректное ожидание, включая «-1»")
+		t.Error("(−∞,∞) includes any valid expectation, including «-1»")
 	}
 	// An invalid upper expectation — does not fit any range.
 	if res3.Contains("", "lts") {
-		t.Error("некорректное ожидание сверху не может входить ни в какой диапазон")
+		t.Error("an invalid upper expectation cannot fall into any range")
 	}
 }

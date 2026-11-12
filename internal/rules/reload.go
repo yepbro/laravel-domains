@@ -50,7 +50,7 @@ func NewReloader(dir string, logger *slog.Logger) (*Reloader, error) {
 		return nil, err
 	}
 	r.set = set
-	r.logger.Info("набор правил загружен", "rules_dir", dir, "rules", len(set.Rules), "rules_version", set.Version)
+	r.logger.Info("rule set loaded", "rules_dir", dir, "rules", len(set.Rules), "rules_version", set.Version)
 	return r, nil
 }
 
@@ -70,7 +70,7 @@ func (r *Reloader) Set() *Set {
 func (r *Reloader) Reload() error {
 	set, err := r.load(r.dir)
 	if err != nil {
-		r.logger.Warn("перезагрузка правил не удалась — работает прежний набор",
+		r.logger.Warn("rule reload failed — the previous set stays active",
 			"rules_dir", r.dir, "err", err)
 		return err
 	}
@@ -78,7 +78,7 @@ func (r *Reloader) Reload() error {
 	r.mu.Lock()
 	if set.Version == r.set.Version {
 		r.mu.Unlock()
-		r.logger.Info("набор правил не изменился", "rules_version", set.Version)
+		r.logger.Info("rule set unchanged", "rules_version", set.Version)
 		return nil
 	}
 	old := r.set
@@ -95,7 +95,7 @@ func (r *Reloader) Reload() error {
 	// the process.
 	resetCompileCache()
 
-	r.logger.Info("набор правил перезагружен",
+	r.logger.Info("rule set reloaded",
 		"rules_dir", r.dir, "rules", len(set.Rules),
 		"rules_version", set.Version, "prev_version", old.Version)
 	for _, ch := range chans {

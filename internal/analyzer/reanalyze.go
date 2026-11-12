@@ -307,10 +307,10 @@ type reanalyzeRow struct {
 // slice tick pass is ReanalyzeTick (T-193).
 func ReanalyzeOnce(ctx context.Context, pool db.DB, q queue.Queue, version int32, zone *int16, opts ReanalyzeOptions) (ReanalyzeResult, error) {
 	if pool == nil {
-		return ReanalyzeResult{}, errors.New("analyzer: переанализ: пул не задан")
+		return ReanalyzeResult{}, errors.New("analyzer: re-analysis: pool is not set")
 	}
 	if q == nil {
-		return ReanalyzeResult{}, errors.New("analyzer: переанализ: очередь не задана")
+		return ReanalyzeResult{}, errors.New("analyzer: re-analysis: queue is not set")
 	}
 	rows, err := reanalyzeSelect(ctx, pool, version, zone, resultKey{}, opts.withDefaults().BatchSize)
 	if err != nil {
@@ -332,17 +332,17 @@ func ReanalyzeOnce(ctx context.Context, pool db.DB, q queue.Queue, version int32
 // cursor passed can "ripen" into the next pass.
 func ReanalyzeDrain(ctx context.Context, pool db.DB, q queue.Queue, version int32, zone *int16, opts ReanalyzeOptions) (ReanalyzeResult, error) {
 	if pool == nil {
-		return ReanalyzeResult{}, errors.New("analyzer: переанализ: пул не задан")
+		return ReanalyzeResult{}, errors.New("analyzer: re-analysis: pool is not set")
 	}
 	if q == nil {
-		return ReanalyzeResult{}, errors.New("analyzer: переанализ: очередь не задана")
+		return ReanalyzeResult{}, errors.New("analyzer: re-analysis: queue is not set")
 	}
 	o := opts.withDefaults()
 	out := ReanalyzeResult{}
 	after := resultKey{} // the zero key is less than any real one (zone_id ≥ 1)
 	for {
 		if err := ctx.Err(); err != nil {
-			return out, fmt.Errorf("analyzer: переанализ: %w", err)
+			return out, fmt.Errorf("analyzer: re-analysis: %w", err)
 		}
 		rows, err := reanalyzeSelect(ctx, pool, version, zone, after, o.BatchSize)
 		if err != nil {
@@ -400,10 +400,10 @@ func ReanalyzeDrain(ctx context.Context, pool db.DB, q queue.Queue, version int3
 // failure is a Warn, the anchor is recreated by the next restart), and the first hour's losses are visible in the buckets.
 func ReanalyzeTick(ctx context.Context, pool db.DB, q queue.Queue, version int32, cursor *ReanalyzeCursor, opts ReanalyzeOptions) (ReanalyzeResult, error) {
 	if pool == nil {
-		return ReanalyzeResult{}, errors.New("analyzer: переанализ: пул не задан")
+		return ReanalyzeResult{}, errors.New("analyzer: re-analysis: pool is not set")
 	}
 	if q == nil {
-		return ReanalyzeResult{}, errors.New("analyzer: переанализ: очередь не задана")
+		return ReanalyzeResult{}, errors.New("analyzer: re-analysis: queue is not set")
 	}
 	if cursor == nil {
 		cursor = &ReanalyzeCursor{} // a one-off call: the anchor without saving
@@ -417,7 +417,7 @@ func ReanalyzeTick(ctx context.Context, pool db.DB, q queue.Queue, version int32
 	o := opts.withDefaults()
 	out := ReanalyzeResult{}
 	if err := ctx.Err(); err != nil {
-		return out, fmt.Errorf("analyzer: переанализ: %w", err)
+		return out, fmt.Errorf("analyzer: re-analysis: %w", err)
 	}
 	// The tail buckets guard (T-204): before the heavy select — the sum
 	// of mature buckets; ≤ 0 (zero — no tails, minus — a decrement drift,
@@ -434,7 +434,7 @@ func ReanalyzeTick(ctx context.Context, pool db.DB, q queue.Queue, version int32
 	}
 	for {
 		if err := ctx.Err(); err != nil {
-			return out, fmt.Errorf("analyzer: переанализ: %w", err)
+			return out, fmt.Errorf("analyzer: re-analysis: %w", err)
 		}
 		rows, err := reanalyzeTickSelect(ctx, pool, version, *cursor, o.BatchSize)
 		if err != nil {
@@ -470,7 +470,7 @@ func reanalyzeSelect(ctx context.Context, pool db.DB, version int32, zone *int16
 		limit,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("analyzer: переанализ: выборка: %w", err)
+		return nil, fmt.Errorf("analyzer: re-analysis: select: %w", err)
 	}
 	defer rows.Close()
 
@@ -479,13 +479,13 @@ func reanalyzeSelect(ctx context.Context, pool db.DB, version int32, zone *int16
 		var r reanalyzeRow
 		var variant int16
 		if err := rows.Scan(&r.key.zone, &r.key.domain, &r.key.sub, &variant, &r.name); err != nil {
-			return nil, fmt.Errorf("analyzer: переанализ: выборка: чтение: %w", err)
+			return nil, fmt.Errorf("analyzer: re-analysis: select: read: %w", err)
 		}
 		r.key.variant = model.Variant(variant)
 		out = append(out, r)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("analyzer: переанализ: выборка: %w", err)
+		return nil, fmt.Errorf("analyzer: re-analysis: select: %w", err)
 	}
 	return out, nil
 }
@@ -504,7 +504,7 @@ func reanalyzeTickSelect(ctx context.Context, pool db.DB, version int32, after R
 		limit,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("analyzer: переанализ: выборка тика: %w", err)
+		return nil, fmt.Errorf("analyzer: re-analysis: tick select: %w", err)
 	}
 	defer rows.Close()
 
@@ -513,13 +513,13 @@ func reanalyzeTickSelect(ctx context.Context, pool db.DB, version int32, after R
 		var r reanalyzeRow
 		var variant int16
 		if err := rows.Scan(&r.key.zone, &r.key.domain, &r.key.sub, &variant, &r.name, &r.checkedAt); err != nil {
-			return nil, fmt.Errorf("analyzer: переанализ: выборка тика: чтение: %w", err)
+			return nil, fmt.Errorf("analyzer: re-analysis: tick select: read: %w", err)
 		}
 		r.key.variant = model.Variant(variant)
 		out = append(out, r)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("analyzer: переанализ: выборка тика: %w", err)
+		return nil, fmt.Errorf("analyzer: re-analysis: tick select: %w", err)
 	}
 	return out, nil
 }
@@ -532,22 +532,22 @@ func reanalyzeTickSelect(ctx context.Context, pool db.DB, version int32, after R
 func reanalyzeMatureTails(ctx context.Context, pool db.DB) (tails int64, hourStart time.Time, err error) {
 	rows, err := pool.Query(ctx, reanalyzeGuardSQL)
 	if err != nil {
-		return 0, time.Time{}, fmt.Errorf("analyzer: переанализ: корзины хвостов: %w", err)
+		return 0, time.Time{}, fmt.Errorf("analyzer: re-analysis: tail buckets: %w", err)
 	}
 	defer rows.Close()
 	if !rows.Next() {
 		// The read failure first: a connection drop is not an "empty sum"
 		// (the SQL coalesce always answers with a row).
 		if err := rows.Err(); err != nil {
-			return 0, time.Time{}, fmt.Errorf("analyzer: переанализ: корзины хвостов: %w", err)
+			return 0, time.Time{}, fmt.Errorf("analyzer: re-analysis: tail buckets: %w", err)
 		}
-		return 0, time.Time{}, fmt.Errorf("analyzer: переанализ: корзины хвостов: пустой ответ агрегата")
+		return 0, time.Time{}, fmt.Errorf("analyzer: re-analysis: tail buckets: empty aggregate response")
 	}
 	if err := rows.Scan(&tails, &hourStart); err != nil {
-		return 0, time.Time{}, fmt.Errorf("analyzer: переанализ: корзины хвостов: чтение: %w", err)
+		return 0, time.Time{}, fmt.Errorf("analyzer: re-analysis: tail buckets: read: %w", err)
 	}
 	if err := rows.Err(); err != nil {
-		return 0, time.Time{}, fmt.Errorf("analyzer: переанализ: корзины хвостов: %w", err)
+		return 0, time.Time{}, fmt.Errorf("analyzer: re-analysis: tail buckets: %w", err)
 	}
 	return tails, hourStart, nil
 }
@@ -564,7 +564,7 @@ func reanalyzePublish(ctx context.Context, q queue.Queue, rows []reanalyzeRow, o
 			Name:        rows[i].name,
 		}
 		if _, err := q.Publish(ctx, queue.StreamAnalyze, msg); err != nil {
-			return fmt.Errorf("analyzer: переанализ: публикация q:analyze (домен %s, запись %d/%d): %w",
+			return fmt.Errorf("analyzer: re-analysis: q:analyze publish (domain %s, record %d/%d): %w",
 				rows[i].name, i+1, len(rows), err)
 		}
 		out.Published++
@@ -594,13 +594,13 @@ func reanalyzePublish(ctx context.Context, q queue.Queue, rows []reanalyzeRow, o
 // (a graceful shutdown, §3.4). Only the loop touches the cursor (one goroutine) — no locks are needed (the retentionState T-185 style).
 func ReanalyzeLoop(ctx context.Context, pool db.DB, q queue.Queue, src RulesSource, opts ReanalyzeOptions) error {
 	if pool == nil {
-		return errors.New("analyzer: переанализ: пул не задан")
+		return errors.New("analyzer: re-analysis: pool is not set")
 	}
 	if q == nil {
-		return errors.New("analyzer: переанализ: очередь не задана")
+		return errors.New("analyzer: re-analysis: queue is not set")
 	}
 	if src == nil {
-		return errors.New("analyzer: переанализ: источник набора правил не задан (rules.Reloader)")
+		return errors.New("analyzer: re-analysis: rule set source is not set (rules.Reloader)")
 	}
 	o := opts.withDefaults()
 	log := o.Log
@@ -609,7 +609,7 @@ func ReanalyzeLoop(ctx context.Context, pool db.DB, q queue.Queue, src RulesSour
 	}
 	sets, cancelSub := src.Subscribe()
 	defer cancelSub()
-	log.Info("цикл переанализа запущен",
+	log.Info("re-analysis loop started",
 		"interval", o.Interval.String(), "batch", o.BatchSize,
 		"lookback", DefaultReanalyzeLookback.String())
 
@@ -626,20 +626,20 @@ func ReanalyzeLoop(ctx context.Context, pool db.DB, q queue.Queue, src RulesSour
 	tick := func() {
 		set := src.Set()
 		if set == nil {
-			log.Warn("проход переанализа: набор правил не загружен — пропуск")
+			log.Warn("re-analysis pass: rule set not loaded — skipping")
 			return
 		}
 		res, err := ReanalyzeTick(ctx, pool, q, set.Version, &cursor, o)
 		if err != nil {
 			// A cancellation during a pass is part of the stop, not an alarm.
 			if ctx.Err() == nil {
-				log.Warn("проход переанализа", "err", err,
+				log.Warn("re-analysis pass", "err", err,
 					"selected", res.Selected, "published", res.Published)
 			}
 			return
 		}
 		if res.Published > 0 {
-			log.Info("проход переанализа",
+			log.Info("re-analysis pass",
 				"rules_version", set.Version,
 				"selected", res.Selected, "published", res.Published)
 		}
@@ -650,20 +650,20 @@ func ReanalyzeLoop(ctx context.Context, pool db.DB, q queue.Queue, src RulesSour
 	drain := func() {
 		set := src.Set()
 		if set == nil {
-			log.Warn("проход переанализа: набор правил не загружен — пропуск")
+			log.Warn("re-analysis pass: rule set not loaded — skipping")
 			return
 		}
 		res, err := ReanalyzeDrain(ctx, pool, q, set.Version, nil, o)
 		if err != nil {
 			// A cancellation during a pass is part of the stop, not an alarm.
 			if ctx.Err() == nil {
-				log.Warn("проход переанализа", "err", err,
+				log.Warn("re-analysis pass", "err", err,
 					"selected", res.Selected, "published", res.Published)
 			}
 			return
 		}
 		if res.Published > 0 {
-			log.Info("проход переанализа",
+			log.Info("re-analysis pass",
 				"rules_version", set.Version,
 				"selected", res.Selected, "published", res.Published)
 		}
@@ -696,7 +696,7 @@ func ReanalyzeLoop(ctx context.Context, pool db.DB, q queue.Queue, src RulesSour
 				// mutator-disable-next-line loop/break
 				continue
 			}
-			log.Info("смена набора правил — внеочередной переанализ",
+			log.Info("rule set change — out-of-turn re-analysis",
 				"rules_version", set.Version)
 			drain()
 		case <-ticker.C:
@@ -710,21 +710,21 @@ func ReanalyzeLoop(ctx context.Context, pool db.DB, q queue.Queue, src RulesSour
 // reference table (ingest creates zones on the first file, T-014).
 func ZoneIDByName(ctx context.Context, pool db.DB, name string) (id int16, found bool, err error) {
 	if pool == nil {
-		return 0, false, errors.New("analyzer: зона по имени: пул не задан")
+		return 0, false, errors.New("analyzer: zone by name: pool is not set")
 	}
 	rows, err := pool.Query(ctx, zoneIDByNameSQL, name)
 	if err != nil {
-		return 0, false, fmt.Errorf("analyzer: зона по имени: %w", err)
+		return 0, false, fmt.Errorf("analyzer: zone by name: %w", err)
 	}
 	defer rows.Close()
 	if rows.Next() {
 		if err := rows.Scan(&id); err != nil {
-			return 0, false, fmt.Errorf("analyzer: зона по имени: чтение: %w", err)
+			return 0, false, fmt.Errorf("analyzer: zone by name: read: %w", err)
 		}
 		return id, true, nil
 	}
 	if err := rows.Err(); err != nil {
-		return 0, false, fmt.Errorf("analyzer: зона по имени: %w", err)
+		return 0, false, fmt.Errorf("analyzer: zone by name: %w", err)
 	}
 	return 0, false, nil
 }

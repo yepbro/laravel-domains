@@ -56,7 +56,7 @@ const DefaultArchiveMaxFiles = 1000
 // ingest.max_error_ratio (spec 5.1); the wrapped reasons are available
 // via the chain (errors.Is/As). The text — without repeating "bad":
 // failFile appends its own verdict.
-var errArchiveRejected = errors.New("архив не принят")
+var errArchiveRejected = errors.New("archive rejected")
 
 // archiveKind — the format of the input archive by the name extension
 // (T-133).
@@ -154,9 +154,9 @@ func isCorruptRead(err error) bool {
 // members).
 func archiveOpenErr(f File, err error) error {
 	if isCorruptRead(err) || errors.Is(err, io.EOF) {
-		return fmt.Errorf("%w: архив %s не читается: %w", errArchiveRejected, f.Path, err)
+		return fmt.Errorf("%w: the archive %s is unreadable: %w", errArchiveRejected, f.Path, err)
 	}
-	return fmt.Errorf("ingest: чтение архива %s: %w", f.Path, err)
+	return fmt.Errorf("ingest: reading the archive %s: %w", f.Path, err)
 }
 
 // --- member sources ---------------------------------------------------------
@@ -201,19 +201,19 @@ func (it *zipIter) next() (member, error) {
 		e := it.files[it.i]
 		it.i++
 		if strings.HasSuffix(e.Name, "/") {
-			it.p.log.Warn("запись архива пропущена (каталог)",
+			it.p.log.Warn("archive entry skipped (a directory)",
 				"archive", it.f.Path, "entry", e.Name)
 			continue
 		}
 		name := path.Clean(e.Name)
 		if junkMember(name) {
-			it.p.log.Warn("запись архива пропущена (скрытая или мусор macOS)",
+			it.p.log.Warn("archive entry skipped (hidden or macOS junk)",
 				"archive", it.f.Path, "entry", e.Name)
 			continue
 		}
 		if e.UncompressedSize64 > uint64(it.budget.left) {
 			return member{}, fmt.Errorf(
-				"%w: архив %s: несжатый объём члена %s (%d байт) не укладывается в остаток ingest.archive_max_uncompressed (%d байт)",
+				"%w: the archive %s: the uncompressed size of member %s (%d bytes) does not fit into the remaining ingest.archive_max_uncompressed (%d bytes)",
 				errArchiveRejected, it.f.Path, name, e.UncompressedSize64, it.budget.left)
 		}
 		rc, err := e.Open()
@@ -223,10 +223,10 @@ func (it *zipIter) next() (member, error) {
 			// failure is unlikely, but we classify it as infrastructure
 			// (spec 3.4).
 			if isCorruptRead(err) {
-				return member{}, fmt.Errorf("%w: архив %s: член %s: %w",
+				return member{}, fmt.Errorf("%w: the archive %s: member %s: %w",
 					errArchiveRejected, it.f.Path, name, err)
 			}
-			return member{}, fmt.Errorf("ingest: архив %s: член %s: %w", it.f.Path, name, err)
+			return member{}, fmt.Errorf("ingest: the archive %s: member %s: %w", it.f.Path, name, err)
 		}
 		return member{name: name, r: it.budget.reader(rc), closer: rc}, nil
 	}
@@ -257,9 +257,9 @@ func (it *tarIter) next() (member, error) {
 			case errors.Is(err, errArchiveRejected): // the stream budget
 				return member{}, err
 			case isCorruptRead(err):
-				return member{}, fmt.Errorf("%w: архив %s повреждён: %w", errArchiveRejected, it.f.Path, err)
+				return member{}, fmt.Errorf("%w: the archive %s is corrupt: %w", errArchiveRejected, it.f.Path, err)
 			default:
-				return member{}, fmt.Errorf("ingest: чтение архива %s: %w", it.f.Path, err)
+				return member{}, fmt.Errorf("ingest: reading the archive %s: %w", it.f.Path, err)
 			}
 		}
 		// The entry limit — before the filters: directories and junk are
@@ -267,23 +267,23 @@ func (it *tarIter) next() (member, error) {
 		// by the same number.
 		it.entries++
 		if it.entries > it.p.opts.ArchiveMaxFiles {
-			return member{}, fmt.Errorf("%w: архив %s: записей %d больше ingest.archive_max_files (%d)",
+			return member{}, fmt.Errorf("%w: the archive %s: %d entries exceed ingest.archive_max_files (%d)",
 				errArchiveRejected, it.f.Path, it.entries, it.p.opts.ArchiveMaxFiles)
 		}
 		switch hdr.Typeflag {
 		case tar.TypeDir:
-			it.p.log.Warn("запись архива пропущена (каталог)",
+			it.p.log.Warn("archive entry skipped (a directory)",
 				"archive", it.f.Path, "entry", hdr.Name)
 			continue
 		case tar.TypeReg: // regular files (TypeRegA is normalized to TypeReg when reading)
 		default:
-			it.p.log.Warn("запись архива пропущена (не файл)",
+			it.p.log.Warn("archive entry skipped (not a file)",
 				"archive", it.f.Path, "entry", hdr.Name)
 			continue
 		}
 		name := path.Clean(hdr.Name)
 		if junkMember(name) {
-			it.p.log.Warn("запись архива пропущена (скрытая или мусор macOS)",
+			it.p.log.Warn("archive entry skipped (hidden or macOS junk)",
 				"archive", it.f.Path, "entry", hdr.Name)
 			continue
 		}
@@ -346,7 +346,7 @@ func (l *budgetReader) Read(p []byte) (int, error) {
 			return 0, l.err
 		}
 		return 0, fmt.Errorf(
-			"%w: архив %s: несжатый объём потока превысил ingest.archive_max_uncompressed (%d байт)",
+			"%w: the archive %s: the uncompressed stream size exceeded ingest.archive_max_uncompressed (%d bytes)",
 			errArchiveRejected, l.b.arch, l.b.limit)
 	}
 	n, err := l.r.Read(p)
@@ -425,11 +425,11 @@ func (p *Pipeline) streamArchive(ctx context.Context, fh *os.File, f File, kind 
 	switch kind {
 	case archiveZip:
 		if _, err := io.Copy(h, fh); err != nil {
-			return archiveResult{}, fmt.Errorf("ingest: чтение архива %s: %w", f.Path, err)
+			return archiveResult{}, fmt.Errorf("ingest: reading the archive %s: %w", f.Path, err)
 		}
 		fi, err := fh.Stat()
 		if err != nil {
-			return archiveResult{}, fmt.Errorf("ingest: архив %s: %w", f.Path, err)
+			return archiveResult{}, fmt.Errorf("ingest: the archive %s: %w", f.Path, err)
 		}
 		zr, err := zip.NewReader(fh, fi.Size())
 		if err != nil {
@@ -442,7 +442,7 @@ func (p *Pipeline) streamArchive(ctx context.Context, fh *os.File, f File, kind 
 		// responsibility, spec 5.1).
 		if len(zr.File) > p.opts.ArchiveMaxFiles {
 			return archiveResult{SHA256: h.Sum(nil)}, fmt.Errorf(
-				"%w: архив %s: записей %d больше ingest.archive_max_files (%d)",
+				"%w: the archive %s: %d entries exceed ingest.archive_max_files (%d)",
 				errArchiveRejected, f.Path, len(zr.File), p.opts.ArchiveMaxFiles)
 		}
 		it = &zipIter{p: p, f: f, files: zr.File, budget: budget}
@@ -467,7 +467,7 @@ func (p *Pipeline) streamArchive(ctx context.Context, fh *os.File, f File, kind 
 		it = &gzIter{m: member{name: gzMemberName(f.Path), r: counted}}
 		drain = counted
 	default:
-		return archiveResult{}, fmt.Errorf("ingest: архив %s: неподдерживаемый формат (%d)", f.Path, kind)
+		return archiveResult{}, fmt.Errorf("ingest: the archive %s: an unsupported format (%d)", f.Path, kind)
 	}
 
 	var (
@@ -505,7 +505,7 @@ func (p *Pipeline) streamArchive(ctx context.Context, fh *os.File, f File, kind 
 				if m.closer != nil {
 					_ = m.closer.Close()
 				}
-				return fmt.Errorf("ingest: архив %s: %w", f.Path, verr)
+				return fmt.Errorf("ingest: the archive %s: %w", f.Path, verr)
 			}
 			prejects := make(map[Reason]int)
 			mst, perr := Parse(m.r, Options{
@@ -518,7 +518,7 @@ func (p *Pipeline) streamArchive(ctx context.Context, fh *os.File, f File, kind 
 				},
 				OnReject: func(rj Reject) error {
 					prejects[rj.Reason]++
-					rejectLog.Warn("строка отклонена",
+					rejectLog.Warn("line rejected",
 						"file", f.Path+"!"+m.name,
 						"line", rj.Num,
 						"text", rj.Text,
@@ -539,15 +539,15 @@ func (p *Pipeline) streamArchive(ctx context.Context, fh *os.File, f File, kind 
 					return perr // the stream size limit (budgetReader)
 				}
 				if isCorruptRead(perr) {
-					return fmt.Errorf("%w: архив %s повреждён при чтении члена %s: %w",
+					return fmt.Errorf("%w: the archive %s is corrupt while reading member %s: %w",
 						errArchiveRejected, f.Path, m.name, perr)
 				}
-				return fmt.Errorf("член %s: %w", m.name, perr) // infrastructure
+				return fmt.Errorf("member %s: %w", m.name, perr) // infrastructure
 			}
 			res := v.Finish()
 			agg.add(mst, res, prejects)
 			if overErrorRatio(p.opts.MaxErrorRatio, res.Total, res.Rejected, mst.Rejected) {
-				return fmt.Errorf("%w: %s!%s: доля отклонённых строк %d из %d выше ingest.max_error_ratio (%g)",
+				return fmt.Errorf("%w: %s!%s: the share of rejected lines %d of %d is above ingest.max_error_ratio (%g)",
 					errArchiveRejected, f.Path, m.name, res.Rejected+mst.Rejected, res.Total+mst.Rejected, p.opts.MaxErrorRatio)
 			}
 		}
@@ -567,9 +567,9 @@ func (p *Pipeline) streamArchive(ctx context.Context, fh *os.File, f File, kind 
 			case errors.Is(derr, errArchiveRejected): // the stream budget
 				perr = derr
 			case isCorruptRead(derr):
-				perr = fmt.Errorf("%w: архив %s повреждён: %w", errArchiveRejected, f.Path, derr)
+				perr = fmt.Errorf("%w: the archive %s is corrupt: %w", errArchiveRejected, f.Path, derr)
 			default:
-				perr = fmt.Errorf("ingest: чтение архива %s: %w", f.Path, derr)
+				perr = fmt.Errorf("ingest: reading the archive %s: %w", f.Path, derr)
 			}
 		}
 	}
@@ -593,7 +593,7 @@ func (p *Pipeline) streamArchive(ctx context.Context, fh *os.File, f File, kind 
 		if errors.Is(perr, errArchiveRejected) {
 			return out, perr
 		}
-		return out, fmt.Errorf("ingest: разбор архива %s: %w", f.Path, perr)
+		return out, fmt.Errorf("ingest: parsing the archive %s: %w", f.Path, perr)
 	}
 	return out, nil
 }

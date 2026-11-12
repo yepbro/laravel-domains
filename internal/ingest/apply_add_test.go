@@ -69,18 +69,18 @@ type applyAddPool struct {
 var _ ApplyDB = (*applyAddPool)(nil)
 
 func (p *applyAddPool) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFromSource) (int64, error) {
-	return 0, errors.New("applyAddPool: CopyFrom не должен вызываться")
+	return 0, errors.New("applyAddPool: CopyFrom must not be called")
 }
 
 // Exec and Query of the pool are not needed by the application
 // (everything is in the transaction): fail if something is called past
 // Begin.
 func (p *applyAddPool) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
-	return pgconn.CommandTag{}, errors.New("applyAddPool: Exec вне транзакции не должен вызываться")
+	return pgconn.CommandTag{}, errors.New("applyAddPool: Exec outside a transaction must not be called")
 }
 
 func (p *applyAddPool) Query(context.Context, string, ...any) (pgx.Rows, error) {
-	return nil, errors.New("applyAddPool: Query вне транзакции не должен вызываться")
+	return nil, errors.New("applyAddPool: Query outside a transaction must not be called")
 }
 
 // stageRange — the batch rows of the staging model with line_no in
@@ -162,7 +162,7 @@ func (t *applyAddTx) Query(ctx context.Context, sql string, args ...any) (pgx.Ro
 		}
 		return cleanupRows([]any{p.uniques}), nil
 	}
-	return nil, errors.New("applyAddPool: неожидаемый запрос: " + sql)
+	return nil, errors.New("applyAddPool: unexpected query: " + sql)
 }
 
 func (t *applyAddTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
@@ -186,7 +186,7 @@ func (t *applyAddTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.
 		}
 		return pgconn.NewCommandTag("DELETE 0"), nil
 	}
-	return pgconn.CommandTag{}, errors.New("applyAddPool: неожиданный Exec: " + sql)
+	return pgconn.CommandTag{}, errors.New("applyAddPool: unexpected Exec: " + sql)
 }
 
 func (t *applyAddTx) Commit(context.Context) error {
@@ -252,7 +252,7 @@ func TestApplyAdd(t *testing.T) {
 		t.Fatal(err)
 	}
 	if res.Inserted != 5 || res.Revived != 3 || res.Existing != 2 {
-		t.Errorf("результат = %+v, want Inserted 5, Revived 3, Existing 2 (уникальные 10)", res)
+		t.Errorf("the result = %+v, want Inserted 5, Revived 3, Existing 2 (10 uniques)", res)
 	}
 	if res.Total() != 10 {
 		t.Errorf("Total() = %d, want 10", res.Total())
@@ -262,25 +262,25 @@ func TestApplyAdd(t *testing.T) {
 	// (empty) → the zone deltas → the revive → the count → the cleanup →
 	// the commit.
 	if got, want := strings.Join(pool.ops, "\n"), strings.Join(applyAddOps(1), "\n"); got != want {
-		t.Errorf("порядок операций:\n%s\nwant:\n%s", got, want)
+		t.Errorf("the operation order:\n%s\nwant:\n%s", got, want)
 	}
 	if pool.begins != 1 || pool.commits != 1 || pool.rollbacks != 0 {
-		t.Errorf("транзакций: begin %d, commit %d, rollback %d, want 1/1/0", pool.begins, pool.commits, pool.rollbacks)
+		t.Errorf("transactions: begin %d, commit %d, rollback %d, want 1/1/0", pool.begins, pool.commits, pool.rollbacks)
 	}
 
 	// The chunk addresses its own batch and the cursor range from zero
 	// to the bound.
 	wantArgs := []any{[]byte(b.ID[:]), int16(model.ActionAdd), int64(0), int64(10)}
 	if !reflect.DeepEqual(pool.args[1], wantArgs) {
-		t.Errorf("аргументы вставки = %v, want [batch_id, action=%d, line_no > 0, line_no <= 10]", pool.args[1], int16(model.ActionAdd))
+		t.Errorf("the insert arguments = %v, want [batch_id, action=%d, line_no > 0, line_no <= 10]", pool.args[1], int16(model.ActionAdd))
 	}
 	// The zone deltas — one final statement over the accumulated
 	// zone_id→n.
 	if !pool.zoneCalled {
-		t.Fatal("итоговый UPDATE дельт зон не выполнен")
+		t.Fatal("the final zone-delta UPDATE did not run")
 	}
 	if !reflect.DeepEqual(pool.txArgs[pool.zoneCall], []any{[]int16{7}, []int64{5}}) {
-		t.Errorf("аргументы дельт зон = %v, want зоны [7] × 5", pool.txArgs[pool.zoneCall])
+		t.Errorf("the zone-delta arguments = %v, want zone [7] × 5", pool.txArgs[pool.zoneCall])
 	}
 }
 
@@ -303,10 +303,10 @@ func TestApplyAdd_Chunks(t *testing.T) {
 		t.Fatal(err)
 	}
 	if res.Inserted != 12 || res.Revived != 0 || res.Existing != 0 {
-		t.Errorf("результат = %+v, want Inserted 12 (сумма пачек), Revived/Existing 0", res)
+		t.Errorf("the result = %+v, want Inserted 12 (the chunk sum), Revived/Existing 0", res)
 	}
 	if got, want := strings.Join(pool.ops, "\n"), strings.Join(applyAddOps(3), "\n"); got != want {
-		t.Errorf("порядок операций:\n%s\nwant:\n%s", got, want)
+		t.Errorf("the operation order:\n%s\nwant:\n%s", got, want)
 	}
 
 	// The chunk ranges continue one another over the staging PK.
@@ -315,7 +315,7 @@ func TestApplyAdd_Chunks(t *testing.T) {
 		args := pool.args[1+2*i] // inserts alternate with bounds
 		got := [2]int64{args[2].(int64), args[3].(int64)}
 		if got != want {
-			t.Errorf("пачка %d: диапазон (курсор, граница] = %v, want %v", i+1, got, want)
+			t.Errorf("chunk %d: the (cursor, bound] range = %v, want %v", i+1, got, want)
 		}
 	}
 
@@ -323,10 +323,10 @@ func TestApplyAdd_Chunks(t *testing.T) {
 	// applied by one statement: zone 7 × 6, zone 9 × 6, the zone_id order
 	// is deterministic.
 	if !pool.zoneCalled {
-		t.Fatal("итоговый UPDATE дельт зон не выполнен")
+		t.Fatal("the final zone-delta UPDATE did not run")
 	}
 	if !reflect.DeepEqual(pool.txArgs[pool.zoneCall], []any{[]int16{7, 9}, []int64{6, 6}}) {
-		t.Errorf("аргументы дельт зон = %v, want зоны [7 9] × [6 6]", pool.txArgs[pool.zoneCall])
+		t.Errorf("the zone-delta arguments = %v, want zones [7 9] × [6 6]", pool.txArgs[pool.zoneCall])
 	}
 }
 
@@ -347,7 +347,7 @@ func TestApplyAdd_ConflictChunkAdvances(t *testing.T) {
 		t.Fatal(err)
 	}
 	if res.Inserted != 0 || res.Revived != 0 || res.Existing != 8 {
-		t.Errorf("результат = %+v, want конфликтная партия: Inserted/Revived 0, Existing 8", res)
+		t.Errorf("the result = %+v, want a conflicting batch: Inserted/Revived 0, Existing 8", res)
 	}
 	// Three chunks over the ranges (0,3], (3,6], (6,8] — the cursor
 	// reached the end; no inserts — the zone deltas are not applied at
@@ -363,10 +363,10 @@ func TestApplyAdd_ConflictChunkAdvances(t *testing.T) {
 		"commit",
 	)
 	if got := strings.Join(pool.ops, "\n"); got != strings.Join(want, "\n") {
-		t.Errorf("порядок операций:\n%s\nwant:\n%s", got, strings.Join(want, "\n"))
+		t.Errorf("the operation order:\n%s\nwant:\n%s", got, strings.Join(want, "\n"))
 	}
 	if pool.zoneCalled {
-		t.Error("итоговый UPDATE дельт зон выполнен без вставок, want no-op")
+		t.Error("the final zone-delta UPDATE ran without inserts, want a no-op")
 	}
 }
 
@@ -381,7 +381,7 @@ func TestApplyAdd_EmptyBatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	if res != (AddResult{}) {
-		t.Errorf("результат = %+v, want нулевой", res)
+		t.Errorf("the result = %+v, want zero", res)
 	}
 	want := []string{
 		"begin",
@@ -392,10 +392,10 @@ func TestApplyAdd_EmptyBatch(t *testing.T) {
 		"commit",
 	}
 	if got := strings.Join(pool.ops, "\n"); got != strings.Join(want, "\n") {
-		t.Errorf("порядок операций:\n%s\nwant:\n%s", got, strings.Join(want, "\n"))
+		t.Errorf("the operation order:\n%s\nwant:\n%s", got, strings.Join(want, "\n"))
 	}
 	if pool.zoneCalled {
-		t.Error("пустая партия не трогает счётчики зон")
+		t.Error("an empty batch does not touch the zone counters")
 	}
 }
 
@@ -412,7 +412,7 @@ func TestApplyAdd_Reapply(t *testing.T) {
 		t.Fatal(err)
 	}
 	if first.Inserted != 10 || first.Existing != 0 {
-		t.Fatalf("первое применение = %+v, want Inserted 10", first)
+		t.Fatalf("the first apply = %+v, want Inserted 10", first)
 	}
 
 	// The batch is loaded again with the same batch_id (Stage wipes its
@@ -424,7 +424,7 @@ func TestApplyAdd_Reapply(t *testing.T) {
 		t.Fatal(err)
 	}
 	if second.Inserted != 0 || second.Revived != 0 || second.Existing != 10 {
-		t.Errorf("повторное применение = %+v, want no-op: Inserted/Revived 0, Existing 10", second)
+		t.Errorf("the repeated apply = %+v, want a no-op: Inserted/Revived 0, Existing 10", second)
 	}
 }
 
@@ -438,19 +438,19 @@ func TestApplyAdd_Validation(t *testing.T) {
 		batch     Batch
 		batchSize int
 	}{
-		{"нулевой идентификатор", Batch{ZoneID: 1, Action: model.ActionAdd}, DefaultBatchSize},
-		{"партия delete", Batch{ID: id, ZoneID: 1, Action: model.ActionDelete}, DefaultBatchSize},
-		{"неизвестная операция", Batch{ID: id, ZoneID: 1, Action: model.Action(3)}, DefaultBatchSize},
-		{"нулевой размер пачки", Batch{ID: id, ZoneID: 1, Action: model.ActionAdd}, 0},
+		{"a zero identifier", Batch{ZoneID: 1, Action: model.ActionAdd}, DefaultBatchSize},
+		{"a delete batch", Batch{ID: id, ZoneID: 1, Action: model.ActionDelete}, DefaultBatchSize},
+		{"an unknown action", Batch{ID: id, ZoneID: 1, Action: model.Action(3)}, DefaultBatchSize},
+		{"a zero chunk size", Batch{ID: id, ZoneID: 1, Action: model.ActionAdd}, 0},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			pool := &applyAddPool{}
 			if _, err := ApplyAdd(context.Background(), pool, tc.batch, tc.batchSize); err == nil {
-				t.Fatal("ожидалась ошибка валидации")
+				t.Fatal("a validation error is expected")
 			}
 			if len(pool.ops) != 0 || pool.begins != 0 {
-				t.Errorf("невалидная партия дошла до БД: %v", pool.ops)
+				t.Errorf("an invalid batch reached the DB: %v", pool.ops)
 			}
 		})
 	}
@@ -461,21 +461,21 @@ func TestApplyAdd_Validation(t *testing.T) {
 // repeated application is safe, spec 3.4), the cleanup and the commit do
 // not run.
 func TestApplyAdd_StepErrors(t *testing.T) {
-	boom := errors.New("соединение потеряно")
+	boom := errors.New("connection lost")
 	cases := []struct {
 		name    string
 		set     func(*applyAddPool)
 		wantOps int    // calls up to and including the failure
 		want    string // a fragment of the expected error
 	}{
-		{"сбой транзакции", func(p *applyAddPool) { p.beginErr = boom }, 0, "транзакция"},
-		{"сбой границы пачки", func(p *applyAddPool) { p.boundErr = boom }, 2, "граница пачки"},
-		{"сбой вставки", func(p *applyAddPool) { p.insertErr = boom }, 3, "вставка новых доменов"},
-		{"сбой дельт зон", func(p *applyAddPool) { p.zoneDeltaErr = boom }, 5, "дельты счётчиков зон"},
-		{"сбой возврата", func(p *applyAddPool) { p.reviveErr = boom }, 6, "возврат удалённых"},
-		{"сбой подсчёта", func(p *applyAddPool) { p.countErr = boom }, 7, "подсчёт доменов"},
-		{"сбой очистки", func(p *applyAddPool) { p.clearErr = boom }, 8, "очистка партии"},
-		{"сбой фиксации", func(p *applyAddPool) { p.commitErr = boom }, 8, "фиксация"},
+		{"the transaction failure", func(p *applyAddPool) { p.beginErr = boom }, 0, "transaction"},
+		{"the chunk boundary failure", func(p *applyAddPool) { p.boundErr = boom }, 2, "chunk boundary"},
+		{"the insert failure", func(p *applyAddPool) { p.insertErr = boom }, 3, "inserting new domains"},
+		{"the zone deltas failure", func(p *applyAddPool) { p.zoneDeltaErr = boom }, 5, "zone counter deltas"},
+		{"the revive failure", func(p *applyAddPool) { p.reviveErr = boom }, 6, "reviving deleted"},
+		{"the count failure", func(p *applyAddPool) { p.countErr = boom }, 7, "counting domains"},
+		{"the cleanup failure", func(p *applyAddPool) { p.clearErr = boom }, 8, "the batch cleanup"},
+		{"the commit failure", func(p *applyAddPool) { p.commitErr = boom }, 8, "commit"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -484,19 +484,19 @@ func TestApplyAdd_StepErrors(t *testing.T) {
 
 			_, err := ApplyAdd(context.Background(), pool, validBatch(t), DefaultBatchSize)
 			if err == nil || !strings.Contains(err.Error(), tc.want) || !errors.Is(err, boom) {
-				t.Fatalf("err = %v, want обёрнутая ошибка с %q", err, tc.want)
+				t.Fatalf("err = %v, want a wrapped error with %q", err, tc.want)
 			}
 			if len(pool.ops) != tc.wantOps {
-				t.Errorf("обращений к БД %d (%v), want %d — после сбоя продолжения нет", len(pool.ops), pool.ops, tc.wantOps)
+				t.Errorf("DB calls %d (%v), want %d — there is no continuation after a failure", len(pool.ops), pool.ops, tc.wantOps)
 			}
 			if pool.commits != 0 {
-				t.Error("сбойный шаг зафиксировал транзакцию")
+				t.Error("the failing step committed the transaction")
 			}
 			if pool.begins > 0 && pool.rollbacks != 1 {
-				t.Errorf("откатов %d, want 1 (открытая транзакция откатывается)", pool.rollbacks)
+				t.Errorf("rollbacks %d, want 1 (the open transaction is rolled back)", pool.rollbacks)
 			}
 			if strings.Contains(strings.Join(pool.ops, "\n"), "commit") {
-				t.Error("сбой применения завершился фиксацией")
+				t.Error("the apply failure ended with a commit")
 			}
 		})
 	}
@@ -513,11 +513,11 @@ func TestApplyAdd_CountInvariant(t *testing.T) {
 	}
 
 	_, err := ApplyAdd(context.Background(), pool, validBatch(t), DefaultBatchSize)
-	if err == nil || !strings.Contains(err.Error(), "счётчики расходятся") {
-		t.Fatalf("err = %v, want инвариант счётчиков", err)
+	if err == nil || !strings.Contains(err.Error(), "the counters diverge") {
+		t.Fatalf("err = %v, want the counters invariant", err)
 	}
 	if pool.commits != 0 || pool.rollbacks != 1 {
-		t.Errorf("транзакция: commit %d, rollback %d, want 0/1", pool.commits, pool.rollbacks)
+		t.Errorf("the transaction: commit %d, rollback %d, want 0/1", pool.commits, pool.rollbacks)
 	}
 }
 
@@ -533,7 +533,7 @@ func TestApplyAdd_ContextCanceled(t *testing.T) {
 		t.Fatalf("err = %v, want context.Canceled", err)
 	}
 	if len(pool.ops) != 0 {
-		t.Errorf("обращений к БД быть не должно, got %v", pool.ops)
+		t.Errorf("there must be no DB calls, got %v", pool.ops)
 	}
 }
 
@@ -603,20 +603,20 @@ func TestApplyAdd_SQLContract(t *testing.T) {
 	// literal.
 	if int16(model.StatusNew) != 0 || int16(model.StatusDeleted) != 6 ||
 		int16(model.CheckStatePending) != 0 || int16(model.FlagIDN) != 1 {
-		t.Errorf("коды модели изменились (new=%d deleted=%d pending=%d is_idn=%d): обновите литералы в wantAdd*SQL",
+		t.Errorf("the model codes changed (new=%d deleted=%d pending=%d is_idn=%d): update the literals in wantAdd*SQL",
 			int16(model.StatusNew), int16(model.StatusDeleted), int16(model.CheckStatePending), int16(model.FlagIDN))
 	}
 
 	up := readMigration(t, "000001_init.up.sql")
 	if !strings.Contains(up, "UNIQUE (zone_id, label)") {
-		t.Error("в миграции 000001 нет UNIQUE (zone_id, label) — ON CONFLICT DO NOTHING нечему конфликтовать (ТЗ 5.1)")
+		t.Error("migration 000001 has no UNIQUE (zone_id, label) — ON CONFLICT DO NOTHING has nothing to conflict with (spec 5.1)")
 	}
 	// The chunk cursor — the staging PK: without it the ORDER BY line_no
 	// is not served by an index and the chunk bound would read the whole
 	// batch (T-205).
 	stage := readMigration(t, "000004_ingest_staging.up.sql")
 	if !strings.Contains(stage, "PRIMARY KEY (batch_id, line_no)") {
-		t.Error("в миграции 000004 нет PRIMARY KEY (batch_id, line_no) — курсор пачек применения не обслуживается ключом (T-205)")
+		t.Error("migration 000004 has no PRIMARY KEY (batch_id, line_no) — the apply-chunk cursor is not served by the key (T-205)")
 	}
 }
 
@@ -640,7 +640,7 @@ func TestInsertAddIDNConditionEquivalent(t *testing.T) {
 	}
 	for _, label := range labels {
 		if got, want := ilike(label), idn.HasXNLabel(label); got != want {
-			t.Errorf("условие is_idn(%q) = %v, want %v (idn.HasXNLabel)", label, got, want)
+			t.Errorf("the is_idn(%q) condition = %v, want %v (idn.HasXNLabel)", label, got, want)
 		}
 	}
 }

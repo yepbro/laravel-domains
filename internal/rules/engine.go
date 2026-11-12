@@ -54,7 +54,7 @@ var metaTagRe = regexp.MustCompile(`(?is)<meta\b(?:[^>"']|"[^"]*"|'[^']*')*>`)
 // (spec §9: untrusted input is bounded; the rule is skipped silently, just
 // like a non-compilable one — set validation at load time is T-068, the
 // engine guards itself as well).
-var errPatternTooLong = errors.New("rules: паттерн длиннее лимита")
+var errPatternTooLong = errors.New("rules: pattern is longer than the limit")
 
 // Evaluate applies all the rules of the set to a page with the default
 // limits (DefaultLimits, spec §9). The analyzer's main entry point.

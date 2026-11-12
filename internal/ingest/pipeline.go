@@ -57,7 +57,7 @@ const stageChanSize = 1024
 
 // errStopped — the line producer was stopped by the consumer (the load
 // was interrupted by a DB error): the parser finishes early.
-var errStopped = errors.New("ingest: загрузка партии остановлена")
+var errStopped = errors.New("ingest: the batch load was stopped")
 
 // PipelineOptions — pipeline parameters; zero values are replaced by
 // defaults (the watch.Options style, T-013).
@@ -113,10 +113,10 @@ type Pipeline struct {
 // staging and applying (the add apply is in one transaction, T-205).
 func NewPipeline(zones ZoneStore, files FileStore, pool ApplyDB, opts PipelineOptions) (*Pipeline, error) {
 	if zones == nil || files == nil || pool == nil {
-		return nil, errors.New("ingest: конвейер: обязательны ZoneStore, FileStore и пул БД")
+		return nil, errors.New("ingest: pipeline: ZoneStore, FileStore and a DB pool are required")
 	}
 	if opts.Dir == "" {
-		return nil, errors.New("ingest: конвейер: не задан каталог incoming (PipelineOptions.Dir)")
+		return nil, errors.New("ingest: pipeline: the incoming directory is not set (PipelineOptions.Dir)")
 	}
 	if opts.BatchSize <= 0 {
 		opts.BatchSize = DefaultBatchSize
@@ -216,7 +216,7 @@ func (p *Pipeline) process(ctx context.Context, abs string) Outcome {
 	// The same check stands in NewValidator (a guard for direct
 	// validator calls outside the pipeline).
 	if err := checkZonePath(f.Zone, p.opts.AllowedZonePaths); err != nil {
-		return p.failFile(abs, rep, fmt.Errorf("ingest: файл %s: %w", f.Path, err))
+		return p.failFile(abs, rep, fmt.Errorf("ingest: the file %s: %w", f.Path, err))
 	}
 
 	// The zone of a zone directory is found or created automatically on
@@ -244,7 +244,7 @@ func (p *Pipeline) process(ctx context.Context, abs string) Outcome {
 
 	fh, err := os.Open(abs)
 	if err != nil {
-		return Outcome{Kind: OutcomeLeft, Report: rep, Err: fmt.Errorf("ingest: чтение файла %s: %w", abs, err)}
+		return Outcome{Kind: OutcomeLeft, Report: rep, Err: fmt.Errorf("ingest: reading the file %s: %w", abs, err)}
 	}
 	// The file is opened read-only: a close error is harmless.
 	defer func() { _ = fh.Close() }()
@@ -316,7 +316,7 @@ func (p *Pipeline) process(ctx context.Context, abs string) Outcome {
 		rejectedAll := int64(st.Rejected) + int64(vres.Rejected)
 		contentAll := int64(vres.Total) + int64(st.Rejected)
 		return p.failFile(abs, rep, fmt.Errorf(
-			"доля отклонённых строк %d из %d выше ingest.max_error_ratio (%g)",
+			"the share of rejected lines %d of %d is above ingest.max_error_ratio (%g)",
 			rejectedAll, contentAll, p.opts.MaxErrorRatio))
 	}
 
@@ -330,7 +330,7 @@ func (p *Pipeline) process(ctx context.Context, abs string) Outcome {
 	if err != nil {
 		p.discard(id)
 		return Outcome{Kind: OutcomeLeft, Report: rep,
-			Err: fmt.Errorf("ingest: проверка дубля файла %s: %w", f.Path, err)}
+			Err: fmt.Errorf("ingest: the file %s duplicate check: %w", f.Path, err)}
 	}
 	var dup, crossZone, crossAction *model.IngestFile
 	for i := range known {
@@ -363,7 +363,7 @@ func (p *Pipeline) process(ctx context.Context, abs string) Outcome {
 		if _, merr := p.moveFile(DirProcessed, f.Path, abs); merr != nil {
 			return Outcome{Kind: OutcomeLeft, Report: rep, Err: merr}
 		}
-		p.log.Info("файл уже обработан (дубль — та же зона, действие и sha256) — перемещён в processed",
+		p.log.Info("the file is already processed (a duplicate — the same zone, action and sha256) — moved to processed",
 			"path", f.Path, "sha256", fmt.Sprintf("%x", rep.SHA256),
 			"first_path", derefString(dup.Path),
 			"first_processed_at", derefTime(dup.ProcessedAt))
@@ -376,13 +376,13 @@ func (p *Pipeline) process(ctx context.Context, abs string) Outcome {
 	// that zone's domains), but it is useful for the operator to see it
 	// (Warn, ING-P2-5); another action — a planned undo (Info).
 	if crossZone != nil {
-		p.log.Warn("дубль по sha256 в другой зоне при том же действии — обрабатывается",
+		p.log.Warn("a sha256 duplicate in another zone under the same action — processing it",
 			"path", f.Path, "action", f.Action.String(), "zone_id", zoneID,
 			"first_path", derefString(crossZone.Path),
 			"first_zone_id", derefInt16(crossZone.ZoneID),
 			"first_processed_at", derefTime(crossZone.ProcessedAt))
 	} else if crossAction != nil {
-		p.log.Info("то же содержимое уже доставлялось другим действием — обрабатывается (undo)",
+		p.log.Info("the same content was already delivered under another action — processing it (undo)",
 			"path", f.Path, "action", f.Action.String(), "zone_id", zoneID,
 			"first_path", derefString(crossAction.Path),
 			"first_action", derefAction(crossAction.Action),
@@ -421,7 +421,7 @@ func (p *Pipeline) process(ctx context.Context, abs string) Outcome {
 	// (sqlFileRecord).
 	if rerr := p.files.RecordFile(ctx, rep.record(p.now())); rerr != nil {
 		return Outcome{Kind: OutcomeLeft, Report: rep,
-			Err: fmt.Errorf("ingest: отчёт файла %s: %w", f.Path, rerr)}
+			Err: fmt.Errorf("ingest: the file %s report: %w", f.Path, rerr)}
 	}
 
 	if _, merr := p.moveFile(DirProcessed, f.Path, abs); merr != nil {
@@ -431,7 +431,7 @@ func (p *Pipeline) process(ctx context.Context, abs string) Outcome {
 		return Outcome{Kind: OutcomeLeft, Report: rep, Err: merr}
 	}
 
-	p.log.Info("файл обработан",
+	p.log.Info("the file is processed",
 		"path", f.Path, "zone", f.Zone, "zones", len(zoneIDs),
 		"action", f.Action.String(),
 		"lines", rep.LinesTotal, "added", rep.Added, "revived", rep.Revived,
@@ -453,7 +453,7 @@ func (p *Pipeline) emitRow(ctx context.Context, cache map[string]int16, emit fun
 	if !ok {
 		z, err := EnsureZone(ctx, p.zones, e.Zone)
 		if err != nil {
-			return fmt.Errorf("ingest: зона строки %s: %w", e.Zone, err)
+			return fmt.Errorf("ingest: the line zone %s: %w", e.Zone, err)
 		}
 		id = z.ID
 		cache[e.Zone] = id
@@ -481,7 +481,7 @@ func (p *Pipeline) streamStage(ctx context.Context, r io.Reader, f File, batch B
 		RejectLog:        p.opts.RejectLog,
 	})
 	if err != nil {
-		return Stats{}, FileResult{}, 0, fmt.Errorf("ingest: файл %s: %w", f.Path, err)
+		return Stats{}, FileResult{}, 0, fmt.Errorf("ingest: the file %s: %w", f.Path, err)
 	}
 	// Per-line parser rejections are written to the same rejected log
 	// as the validator rejections (the format — Validator.reject):
@@ -508,7 +508,7 @@ func (p *Pipeline) streamStage(ctx context.Context, r io.Reader, f File, batch B
 			},
 			OnReject: func(rj Reject) error {
 				prejects[rj.Reason]++
-				rejectLog.Warn("строка отклонена",
+				rejectLog.Warn("line rejected",
 					"file", f.Path,
 					"line", rj.Num,
 					"text", rj.Text,
@@ -524,7 +524,7 @@ func (p *Pipeline) streamStage(ctx context.Context, r io.Reader, f File, batch B
 		return st, FileResult{}, staged, serr
 	}
 	if perr != nil && !errors.Is(perr, errStopped) {
-		return st, FileResult{}, staged, fmt.Errorf("ingest: разбор файла %s: %w", f.Path, perr)
+		return st, FileResult{}, staged, fmt.Errorf("ingest: parsing the file %s: %w", f.Path, perr)
 	}
 	res := v.Finish()
 	res.Reasons = mergeReasons(prejects, res.Reasons)
@@ -590,7 +590,7 @@ func (p *Pipeline) stageStream(ctx context.Context, batch Batch, produce func(em
 // batch).
 func (p *Pipeline) clearBatch(ctx context.Context, id BatchID) error {
 	if _, err := ClearBatch(ctx, p.pool, id); err != nil {
-		return fmt.Errorf("ingest: отбрасывание партии в %s: %w", StageTable, err)
+		return fmt.Errorf("ingest: discarding the batch in %s: %w", StageTable, err)
 	}
 	return nil
 }
@@ -614,7 +614,7 @@ func (p *Pipeline) discard(id BatchID) {
 	ctx, cancel := context.WithTimeout(context.Background(), discardTimeout)
 	defer cancel()
 	if err := p.clearBatch(ctx, id); err != nil {
-		p.log.Warn("очистка отброшенной партии", "err", err)
+		p.log.Warn("the discarded batch cleanup", "err", err)
 	}
 }
 
@@ -633,11 +633,11 @@ func (p *Pipeline) failFile(abs string, rep FileReport, reason error) Outcome {
 	// The file is already out of incoming: a report write failure does
 	// not bring it back — the error reason is preserved in the service
 	// log.
-	if werr := os.WriteFile(dst+".report", []byte(renderReport(rep, "ошибочен — "+reason.Error())), 0o644); werr != nil {
-		p.log.Warn("лог-отчёт рядом с файлом не записан",
+	if werr := os.WriteFile(dst+".report", []byte(renderReport(rep, "bad — "+reason.Error())), 0o644); werr != nil {
+		p.log.Warn("the log report next to the file was not written",
 			"path", dst+".report", "err", werr)
 	}
-	p.log.Warn("файл ошибочен — перемещён в failed",
+	p.log.Warn("the file is bad — moved to failed",
 		"path", rep.Path, "failed", dst, "err", reason)
 	return Outcome{Kind: OutcomeFailed, Report: rep, Err: reason}
 }
@@ -653,7 +653,7 @@ func (p *Pipeline) failFile(abs string, rep FileReport, reason error) Outcome {
 func (p *Pipeline) moveFile(archive, rel, abs string) (string, error) {
 	dst := filepath.Join(p.opts.Dir, archive, filepath.FromSlash(rel))
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		return "", fmt.Errorf("ingest: каталог архива %s: %w", filepath.Dir(dst), err)
+		return "", fmt.Errorf("ingest: the archive directory %s: %w", filepath.Dir(dst), err)
 	}
 	ext := filepath.Ext(dst)
 	stem := strings.TrimSuffix(dst, ext)
@@ -665,10 +665,10 @@ func (p *Pipeline) moveFile(archive, rel, abs string) (string, error) {
 		if _, err := os.Lstat(target); err == nil {
 			continue // the name is taken by another instance
 		} else if !errors.Is(err, fs.ErrNotExist) {
-			return "", fmt.Errorf("ingest: архив %s: %w", target, err)
+			return "", fmt.Errorf("ingest: the archive %s: %w", target, err)
 		}
 		if err := os.Rename(abs, target); err != nil {
-			return "", fmt.Errorf("ingest: перемещение %s → %s: %w", abs, target, err)
+			return "", fmt.Errorf("ingest: moving %s → %s: %w", abs, target, err)
 		}
 		return target, nil
 	}

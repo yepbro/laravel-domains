@@ -64,7 +64,7 @@ func newBatchIDAt(t time.Time) (BatchID, error) {
 	var id BatchID
 	binary.BigEndian.PutUint64(id[:batchTimeLen], uint64(t.UnixMicro()))
 	if _, err := rand.Read(id[batchTimeLen:]); err != nil {
-		return BatchID{}, fmt.Errorf("ingest: генерация идентификатора партии: %w", err)
+		return BatchID{}, fmt.Errorf("ingest: generating the batch identifier: %w", err)
 	}
 	return id, nil
 }
@@ -149,16 +149,16 @@ var clearStageSQL = "DELETE FROM " + StageTable.Sanitize() + " WHERE batch_id = 
 // Foreign batches (other batch_id) are not touched.
 func Stage(ctx context.Context, pool db.DB, b Batch, batchSize int, next RowIter) (int64, error) {
 	if b.ID == (BatchID{}) {
-		return 0, errors.New("ingest: партия без идентификатора (ingest.NewBatchID)")
+		return 0, errors.New("ingest: batch without an identifier (ingest.NewBatchID)")
 	}
 	if b.ZoneID < 0 {
-		return 0, fmt.Errorf("ingest: зона партии %d: ожидается идентификатор zones.id (>= 1) либо 0 (зона-less файл)", b.ZoneID)
+		return 0, fmt.Errorf("ingest: the batch zone %d: a zones.id identifier (>= 1) or 0 (a zone-less file) is expected", b.ZoneID)
 	}
 	if !b.Action.Valid() {
-		return 0, fmt.Errorf("ingest: операция партии %d: ожидается 1 add / 2 delete (ТЗ 5.1)", int16(b.Action))
+		return 0, fmt.Errorf("ingest: the batch action %d: 1 add / 2 delete is expected (spec 5.1)", int16(b.Action))
 	}
 	if batchSize < 1 {
-		return 0, fmt.Errorf("ingest: размер пачки %d, минимум 1 (ingest.batch_size)", batchSize)
+		return 0, fmt.Errorf("ingest: chunk size %d, minimum 1 (ingest.batch_size)", batchSize)
 	}
 
 	// Retry idempotency (spec 3.4): the source of truth is the input
@@ -171,7 +171,7 @@ func Stage(ctx context.Context, pool db.DB, b Batch, batchSize int, next RowIter
 
 	staged, err := db.CopyFromStream(ctx, pool, StageTable, StageColumns, batchSize, b.rowIter(next))
 	if err != nil {
-		return staged, fmt.Errorf("ingest: загрузка партии в %s: %w", StageTable, err)
+		return staged, fmt.Errorf("ingest: loading the batch into %s: %w", StageTable, err)
 	}
 	return staged, nil
 }
@@ -182,11 +182,11 @@ func Stage(ctx context.Context, pool db.DB, b Batch, batchSize int, next RowIter
 // staging does not grow from file to file.
 func ClearBatch(ctx context.Context, pool db.DB, id BatchID) (int64, error) {
 	if id == (BatchID{}) {
-		return 0, errors.New("ingest: партия без идентификатора (ingest.NewBatchID)")
+		return 0, errors.New("ingest: batch without an identifier (ingest.NewBatchID)")
 	}
 	tag, err := pool.Exec(ctx, clearStageSQL, id[:])
 	if err != nil {
-		return 0, fmt.Errorf("ingest: очистка партии в %s: %w", StageTable, err)
+		return 0, fmt.Errorf("ingest: cleaning the batch in %s: %w", StageTable, err)
 	}
 	return tag.RowsAffected(), nil
 }
@@ -212,22 +212,22 @@ func (b Batch) rowIter(next RowIter) db.RowIter {
 		}
 		switch {
 		case row.Label == "":
-			return nil, fmt.Errorf("ingest: строка %d: пустая метка домена", row.LineNo)
+			return nil, fmt.Errorf("ingest: line %d: an empty domain label", row.LineNo)
 		case !isASCII(row.Label):
-			return nil, fmt.Errorf("ingest: строка %d: %q — не-ASCII в метке: ожидается punycode (ТЗ 5.2)", row.LineNo, row.Label)
+			return nil, fmt.Errorf("ingest: line %d: %q — non-ASCII in the label: punycode is expected (spec 5.2)", row.LineNo, row.Label)
 		case !validLabelParts(row.Label):
-			return nil, fmt.Errorf("ingest: строка %d: %q — каждая метка без зоны непустая и не длиннее %d октетов (ТЗ 5.2 п. 4)", row.LineNo, row.Label, MaxLabelLen)
+			return nil, fmt.Errorf("ingest: line %d: %q — each zone-less label is non-empty and at most %d octets (spec 5.2 item 4)", row.LineNo, row.Label, MaxLabelLen)
 		case row.LineNo < 1:
-			return nil, fmt.Errorf("ingest: номер строки %d: нумерация с единицы", row.LineNo)
+			return nil, fmt.Errorf("ingest: line number %d: numbering starts at one", row.LineNo)
 		case row.LineNo <= lastLine:
-			return nil, fmt.Errorf("ingest: номер строки %d не растёт (предыдущий %d): строки партии уникальны по line_no", row.LineNo, lastLine)
+			return nil, fmt.Errorf("ingest: the line number %d does not grow (the previous %d): the batch's lines are unique by line_no", row.LineNo, lastLine)
 		}
 		zone := row.ZoneID
 		if zone == 0 {
 			zone = b.ZoneID
 		}
 		if zone < 1 {
-			return nil, fmt.Errorf("ingest: строка %d: зона строки не определена: ожидается zones.id (>= 1) в строке или партии", row.LineNo)
+			return nil, fmt.Errorf("ingest: line %d: the line zone is undefined: a zones.id (>= 1) in the line or the batch is expected", row.LineNo)
 		}
 		lastLine = row.LineNo
 		return []any{b.ID[:], zone, row.Label, int16(b.Action), row.LineNo}, nil

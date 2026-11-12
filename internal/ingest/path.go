@@ -56,9 +56,9 @@ const (
 
 // pathKindDescriptions — class texts for Error() and String().
 var pathKindDescriptions = map[PathErrorKind]string{
-	ErrPathStructure: "структура пути не <зона>/add|delete/<файл> и не add|delete/<файл>",
-	ErrPathNotTXT:    "имя файла не *.txt и не архив поддерживаемого формата",
-	ErrPathZone:      "невалидное имя каталога зоны",
+	ErrPathStructure: "the path structure is not <zone>/add|delete/<file> and not add|delete/<file>",
+	ErrPathNotTXT:    "the file name is not *.txt and not an archive of a supported format",
+	ErrPathZone:      "an invalid zone directory name",
 }
 
 // String returns the class text (the idn.ErrorKind.String style).

@@ -57,7 +57,7 @@ func anMetricValue(t *testing.T, g prometheus.Gatherer, name string, labels map[
 
 func TestMetricsNilSafe(t *testing.T) {
 	if NewMetrics(nil) != nil {
-		t.Fatal("NewMetrics(nil) != nil — изолированные сборки без реестра")
+		t.Fatal("NewMetrics(nil) != nil — isolated builds without a registry")
 	}
 	var m *Metrics
 	m.Task(time.Millisecond) // a no-op, does not panic
@@ -81,7 +81,7 @@ func TestMetricsTask(t *testing.T) {
 	// same-named metrics of other stages must not appear in this registry.
 	for _, name := range []string{"crawler_stage_errors_total", "crawler_domain_status_total"} {
 		if got := anMetricValue(t, reg, name, nil); got != -1 {
-			t.Errorf("%s = %v, want серия отсутствует (не этап-источник)", name, got)
+			t.Errorf("%s = %v, want the series absent (not a stage source)", name, got)
 		}
 	}
 }
@@ -163,15 +163,15 @@ func TestMetricsBuckets(t *testing.T) {
 			}
 			got = append(got, math.Inf(1))
 			if len(got) != len(want) {
-				t.Fatalf("корзины = %v, want %v", got, want)
+				t.Fatalf("the buckets = %v, want %v", got, want)
 			}
 			for i := range want {
 				if got[i] != want[i] {
-					t.Fatalf("корзина[%d] = %v, want %v (весь список: %v)", i, got[i], want[i], got)
+					t.Fatalf("bucket[%d] = %v, want %v (the whole list: %v)", i, got[i], want[i], got)
 				}
 			}
 			return
 		}
 	}
-	t.Fatal("серия crawler_stage_seconds не найдена в реестре")
+	t.Fatal("the crawler_stage_seconds series is not found in the registry")
 }

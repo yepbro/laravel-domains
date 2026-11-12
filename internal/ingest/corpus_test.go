@@ -122,29 +122,29 @@ func TestCorpusFile(t *testing.T) {
 	tests := []corpusCase{
 		// Spec 11.1: an empty file.
 		{
-			name: "пустой файл",
+			name: "an empty file",
 			zone: "com",
 		},
 		// Spec 11.1: a file of only comments (including ones with leading
 		// spaces — the first meaningful character "#").
 		{
-			name:  "файл только из комментариев",
+			name:  "a file of comments only",
 			zone:  "com",
-			in:    "# домены зоны com\r\n  # комментарий с ведущими пробелами\n#\n",
+			in:    "# domains of the com zone\r\n  # a comment with leading spaces\n#\n",
 			stats: Stats{Total: 3, Skipped: 3},
 		},
 		// Spec 11.1: empty rows.
 		{
-			name:  "файл из пустых строк",
+			name:  "a file of blank lines",
 			zone:  "com",
 			in:    "\n\r\n \t \n",
 			stats: Stats{Total: 3, Skipped: 3},
 		},
 		// Spec 11.1: a CRLF file.
 		{
-			name:   "CRLF-файл",
+			name:   "a CRLF file",
 			zone:   "com",
-			in:     "# зона com\r\nexample.com\r\nshop.com\r\n",
+			in:     "# the com zone\r\nexample.com\r\nshop.com\r\n",
 			stats:  Stats{Total: 3, Skipped: 1, Data: 2},
 			vstats: ValidatorStats{Total: 2, Accepted: 2},
 			entries: []corpusEntry{
@@ -154,7 +154,7 @@ func TestCorpusFile(t *testing.T) {
 		},
 		// Spec 11.1: a BOM file — the BOM is stripped at the file start.
 		{
-			name:   "BOM-файл",
+			name:   "a BOM file",
 			zone:   "com",
 			in:     "\ufeffexample.com\nshop.com\n",
 			stats:  Stats{Total: 2, Data: 2},
@@ -168,7 +168,7 @@ func TestCorpusFile(t *testing.T) {
 		// does not touch it) and is removed by the UTS-46 normalization —
 		// separating the stages' roles.
 		{
-			name:   "BOM в середине файла — в данных, убирает нормализация",
+			name:   "a BOM mid-file — in the data, normalization strips it",
 			zone:   "com",
 			in:     "a.com\n\ufeffb.com\n",
 			stats:  Stats{Total: 2, Data: 2},
@@ -183,7 +183,7 @@ func TestCorpusFile(t *testing.T) {
 		// one label); the dedup is the DB's job (T-018), the pipeline does
 		// not drop the repeat.
 		{
-			name:   "дубликаты строк — дедуп на БД (T-018), не на конвейере",
+			name:   "duplicate lines — the DB dedup (T-018), not the pipeline's",
 			zone:   "com",
 			in:     "example.com\nexample.com\nEXAMPLE.com.\n",
 			stats:  Stats{Total: 3, Data: 3},
@@ -199,7 +199,7 @@ func TestCorpusFile(t *testing.T) {
 		// a whole (the failed/ signal for T-021), but the rows are parsed
 		// and counted.
 		{
-			name:   "файл не из зоны пути — доля ошибок роняет файл",
+			name:   "a file not from the path zone — the error ratio fails the file",
 			zone:   "com",
 			in:     "example.com\nexample.org\nsub.example.net\nпример.рф\n",
 			stats:  Stats{Total: 4, Data: 4},
@@ -219,7 +219,7 @@ func TestCorpusFile(t *testing.T) {
 		// now an accept with the composite label example.co (the name's
 		// zone — the TLD uk).
 		{
-			name:   "2LD-регистрация в TLD-зоне пути: example.co.uk в зоне uk",
+			name:   "a 2LD registration in the path's TLD zone: example.co.uk in the uk zone",
 			zone:   "uk",
 			in:     "good.uk\nexample.co.uk\n",
 			stats:  Stats{Total: 2, Data: 2},
@@ -232,7 +232,7 @@ func TestCorpusFile(t *testing.T) {
 		// A composite path zone and a composite label (the idn contract,
 		// T-010).
 		{
-			name:   "составная зона пути co.uk",
+			name:   "the composite path zone co.uk",
 			zone:   "co.uk",
 			ratio:  1,
 			in:     "example.co.uk\nмагазин.рф.co.uk\nexample.com.au\n",
@@ -252,7 +252,7 @@ func TestCorpusFile(t *testing.T) {
 		// duplicates: a record per occurrence, folding the forms is the
 		// DB's job (T-018).
 		{
-			name:   "IDN: unicode и punycode формы одного домена — одна запись",
+			name:   "IDN: the unicode and punycode forms of one domain — one record",
 			zone:   "рф",
 			in:     "пример.рф\nxn--e1afmkfd.xn--p1ai\nПРИМЕР.РФ.\n",
 			stats:  Stats{Total: 3, Data: 3},
@@ -267,7 +267,7 @@ func TestCorpusFile(t *testing.T) {
 		// Line — the T-132 extraction (a field separator) or the single
 		// name normalization (spec 5.2 item 1) deals with them next.
 		{
-			name:   "пробелы вокруг строки",
+			name:   "spaces around a line",
 			zone:   "com",
 			in:     "  \texample.com \t \nshop.com\n",
 			stats:  Stats{Total: 2, Data: 2},
@@ -284,7 +284,7 @@ func TestCorpusFile(t *testing.T) {
 		// the parser, inner ones stay in the Line (the stages' role
 		// separation unchanged).
 		{
-			name:   "внутренние пробелы — извлечение токена с точкой (T-132)",
+			name:   "inner spaces — the dotted token extraction (T-132)",
 			zone:   "рф",
 			in:     "при мер.рф\n",
 			stats:  Stats{Total: 1, Data: 1},
@@ -300,7 +300,7 @@ func TestCorpusFile(t *testing.T) {
 		// of 6 at the default would sink the file — no_domain counts into
 		// the error share).
 		{
-			name:  "смешанные строки: извлечение домена (T-132)",
+			name:  "mixed lines: the domain extraction (T-132)",
 			zone:  "com",
 			ratio: 1,
 			in: "xxx.com 2029-11-11 TIMEWEB\n" + // the customer's example
@@ -326,7 +326,7 @@ func TestCorpusFile(t *testing.T) {
 		// spec 5.2 (punycode, label, the is_idn bit) on the extracted
 		// token.
 		{
-			name:  "IDN в смешанной строке и URL (T-132)",
+			name:  "an IDN in a mixed line and a URL (T-132)",
 			zone:  "рф",
 			ratio: 1,
 			in: "пример.рф 2029-11-11 TIMEWEB\n" +
@@ -340,7 +340,7 @@ func TestCorpusFile(t *testing.T) {
 		},
 		// Spec 5.2 item 3: broken punycode is rejected as an invalid name.
 		{
-			name:   "битый punycode",
+			name:   "broken punycode",
 			zone:   "com",
 			ratio:  1,
 			in:     "xn--bcher--kva.com\nxn--zzzzzz.com\nok.com\n",
@@ -357,7 +357,7 @@ func TestCorpusFile(t *testing.T) {
 		// Long names (spec 5.2 item 4): a 64-octet label and a 254-octet
 		// name.
 		{
-			name:   "длинные имена: метка длиннее 63 и имя длиннее 253",
+			name:   "long names: a label longer than 63 and a name longer than 253",
 			zone:   "com",
 			ratio:  1,
 			in:     "ok.com\n" + strings.Repeat("a", 64) + ".com\n" + corpusLongName + "\n",
@@ -378,13 +378,13 @@ func TestCorpusFile(t *testing.T) {
 		// exactly the 0.5 threshold: the file is not sunk (a strict
 		// comparison).
 		{
-			name:  "смешанный файл: BOM, CRLF, мусор, дубликаты, порог на грани",
+			name:  "a mixed file: BOM, CRLF, junk, duplicates, the threshold on the edge",
 			zone:  "com",
 			ratio: 0.5,
-			in: "\ufeff# зона com: смешанный файл\r\n" +
+			in: "\ufeff# the com zone: a mixed file\r\n" +
 				"example.com\r\n" +
 				"\n" +
-				"  # отступ-комментарий\n" +
+				"  # an indented comment\n" +
 				"под_чёркивание.com\n" +
 				"example.org\n" +
 				"пример.рф\r\n" +
@@ -419,7 +419,7 @@ func TestCorpusFile(t *testing.T) {
 				t.Errorf("Stats = %+v, want %+v", got.stats, tc.stats)
 			}
 			if got.stats.Total != got.stats.Skipped+got.stats.Rejected+got.stats.Data {
-				t.Errorf("инвариант Total != Skipped+Rejected+Data: %+v", got.stats)
+				t.Errorf("the invariant Total != Skipped+Rejected+Data: %+v", got.stats)
 			}
 			// Every meaningful parser row reaches the validator, the ones
 			// rejected by the parser do not: both counters are chained.
@@ -484,10 +484,10 @@ func TestCorpusErrorRatio(t *testing.T) {
 		good, bad int
 		failed    bool
 	}{
-		{"доля равна порогу 0.5 — файл не ошибочен", 0.5, 2, 2, false},
-		{"доля выше порога 0.5 — файл ошибочен", 0.5, 1, 3, true},
-		{"1 из 10 при пороге по умолчанию 0.1 — файл не ошибочен", 0, 9, 1, false},
-		{"2 из 10 при пороге по умолчанию 0.1 — файл ошибочен", 0, 8, 2, true},
+		{"the share equals the 0.5 threshold — the file is not bad", 0.5, 2, 2, false},
+		{"the share is above the 0.5 threshold — the file is bad", 0.5, 1, 3, true},
+		{"1 of 10 at the default 0.1 threshold — the file is not bad", 0, 9, 1, false},
+		{"2 of 10 at the default 0.1 threshold — the file is bad", 0, 8, 2, true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -500,15 +500,15 @@ func TestCorpusErrorRatio(t *testing.T) {
 				t.Errorf("Stats = %+v, want Total=Data=%d", got.stats, tc.good+tc.bad)
 			}
 			if len(got.parsed) != 0 {
-				t.Errorf("отклонения парсера = %+v, want нет", got.parsed)
+				t.Errorf("the parser rejections = %+v, want none", got.parsed)
 			}
 			want := ValidatorStats{Total: tc.good + tc.bad, Accepted: tc.good, Rejected: tc.bad}
 			if got.res.Total != want.Total || got.res.Accepted != want.Accepted ||
 				got.res.Rejected != want.Rejected {
-				t.Errorf("ValidatorStats = %+v, want %+v (без Reasons)", got.res.ValidatorStats, want)
+				t.Errorf("ValidatorStats = %+v, want %+v (without Reasons)", got.res.ValidatorStats, want)
 			}
 			if len(got.entries) != tc.good || len(got.rejects) != tc.bad {
-				t.Errorf("записей %d (want %d), отклонений %d (want %d)",
+				t.Errorf("records %d (want %d), rejections %d (want %d)",
 					len(got.entries), tc.good, len(got.rejects), tc.bad)
 			}
 			if got.res.Failed != tc.failed {
@@ -522,11 +522,11 @@ func TestCorpusErrorRatio(t *testing.T) {
 func corpusCompareEntries(t *testing.T, got, want []corpusEntry) {
 	t.Helper()
 	if len(got) != len(want) {
-		t.Fatalf("записи = %+v, want %+v", got, want)
+		t.Fatalf("the records = %+v, want %+v", got, want)
 	}
 	for i := range want {
 		if got[i] != want[i] {
-			t.Errorf("запись[%d] = %+v, want %+v", i, got[i], want[i])
+			t.Errorf("record[%d] = %+v, want %+v", i, got[i], want[i])
 		}
 	}
 }
@@ -535,11 +535,11 @@ func corpusCompareEntries(t *testing.T, got, want []corpusEntry) {
 func corpusCompareRejects(t *testing.T, got, want []corpusReject) {
 	t.Helper()
 	if len(got) != len(want) {
-		t.Fatalf("отклонения валидатора = %+v, want %+v", got, want)
+		t.Fatalf("the validator rejections = %+v, want %+v", got, want)
 	}
 	for i := range want {
 		if got[i] != want[i] {
-			t.Errorf("отклонение[%d] = %+v, want %+v", i, got[i], want[i])
+			t.Errorf("rejection[%d] = %+v, want %+v", i, got[i], want[i])
 		}
 	}
 }

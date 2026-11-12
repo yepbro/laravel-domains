@@ -47,41 +47,41 @@ func TestLineValid(t *testing.T) {
 	}{
 		// A domain from the path zone; input blemishes are forgiven by
 		// normalization (spec 5.2 item 1: case, spaces, the trailing dot).
-		{"простой", "com", "example.com", "com", "example", false},
-		{"регистр и точка", "com", "  EXAMPLE.Com. ", "com", "example", false},
+		{"plain", "com", "example.com", "com", "example", false},
+		{"case and a dot", "com", "  EXAMPLE.Com. ", "com", "example", false},
 		// IDN: a line in unicode, the path zone in punycode — and vice versa.
-		{"unicode строка в punycode зоне", "xn--p1ai", "пример.рф", "xn--p1ai", "xn--e1afmkfd", true},
-		{"punycode строка в punycode зоне", "xn--p1ai", "xn--e1afmkfd.xn--p1ai", "xn--p1ai", "xn--e1afmkfd", true},
-		{"unicode зона каталога", "РФ.", "пример.рф", "xn--p1ai", "xn--e1afmkfd", true},
+		{"a unicode name in a punycode zone", "xn--p1ai", "пример.рф", "xn--p1ai", "xn--e1afmkfd", true},
+		{"a punycode name in a punycode zone", "xn--p1ai", "xn--e1afmkfd.xn--p1ai", "xn--p1ai", "xn--e1afmkfd", true},
+		{"a unicode directory zone", "РФ.", "пример.рф", "xn--p1ai", "xn--e1afmkfd", true},
 		// the is_idn bit — by the domain label, not by the zone (spec 5.2 item 9).
-		{"ascii метка в idn зоне", "xn--p1ai", "example.xn--p1ai", "xn--p1ai", "example", false},
+		{"an ASCII label in an idn zone", "xn--p1ai", "example.xn--p1ai", "xn--p1ai", "example", false},
 		// The path zone is a compound name deeper than the name TLD (branch 3
 		// of domainLabel: the directory sets the zone explicitly, the T-014
 		// test zones).
-		{"составная зона пути", "co.uk", "example.co.uk", "co.uk", "example", false},
-		{"составная метка", "co.uk", "магазин.рф.co.uk", "co.uk", "xn--80aairftm.xn--p1ai", true},
+		{"a composite path zone", "co.uk", "example.co.uk", "co.uk", "example", false},
+		{"a composite label", "co.uk", "магазин.рф.co.uk", "co.uk", "xn--80aairftm.xn--p1ai", true},
 		// A 2LD registration in a TLD path zone: the name zone is the TLD
 		// (idn, TLD-only), a compound label is the norm (the tld-only-zones
 		// spec §5.3: formerly wrong_zone).
-		{"2LD-регистрация в TLD-зоне", "uk", "example.co.uk", "uk", "example.co", false},
-		{"частный суффикс в TLD-зоне", "io", "foo.github.io", "io", "foo.github", false},
-		{"5g.in в зоне in", "in", "example.5g.in", "in", "example.5g", false},
+		{"a 2LD registration in a TLD zone", "uk", "example.co.uk", "uk", "example.co", false},
+		{"a private suffix in a TLD zone", "io", "foo.github.io", "io", "foo.github", false},
+		{"5g.in in the in zone", "in", "example.5g.in", "in", "example.5g", false},
 		// The path zone deeper than the name TLD — the test zones (T-014):
 		// for example.crawl.test the name zone is test, the path zone is
 		// crawl.test.
-		{"зона пути глубже TLD", "crawl.test", "example.crawl.test", "crawl.test", "example", false},
-		{"составная метка вне списка", "crawl.test", "sub.example.crawl.test", "crawl.test", "sub.example", false},
-		{"последняя метка как зона", "test", "crawl.test", "test", "crawl", false},
+		{"a path zone deeper than the TLD", "crawl.test", "example.crawl.test", "crawl.test", "example", false},
+		{"a composite label outside the list", "crawl.test", "sub.example.crawl.test", "crawl.test", "sub.example", false},
+		{"the last label as the zone", "test", "crawl.test", "test", "crawl", false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			v, _ := newValidator(t, tc.zone, 0)
 			entry, reason, ok := v.Line(1, tc.line)
 			if !ok {
-				t.Fatalf("Line(%q) отклонена: %s", tc.line, reason)
+				t.Fatalf("Line(%q) rejected: %s", tc.line, reason)
 			}
 			if reason != "" {
-				t.Errorf("причина валидной строки: %q", reason)
+				t.Errorf("the reason of a valid line: %q", reason)
 			}
 			if entry.Zone != tc.wantZone {
 				t.Errorf("Zone = %q, want %q", entry.Zone, tc.wantZone)
@@ -106,39 +106,39 @@ func TestLineRejected(t *testing.T) {
 		reason Reason
 	}{
 		// A domain from another zone (spec 5.2 item 6).
-		{"другая зона", "com", "example.org", ReasonWrongZone},
-		{"субдомен другой зоны", "com", "sub.example.org", ReasonWrongZone},
-		{"валидный idn не из зоны", "com", "пример.рф", ReasonWrongZone},
+		{"another zone", "com", "example.org", ReasonWrongZone},
+		{"a subdomain of another zone", "com", "sub.example.org", ReasonWrongZone},
+		{"a valid idn not from the zone", "com", "пример.рф", ReasonWrongZone},
 		// A bare suffix — a valid name of another zone (TLD-only: the zone
 		// uk, the label co): in a foreign directory — wrong_zone (the
 		// tld-only-zones spec §12.6).
-		{"голый суффикс другой зоны", "com", "co.uk", ReasonWrongZone},
+		{"a bare suffix of another zone", "com", "co.uk", ReasonWrongZone},
 		// The idn.Error classes (spec 5.2).
-		{"пустая строка", "com", "", ReasonEmpty},
-		{"только пробелы", "com", "   ", ReasonEmpty},
-		{"только точка", "com", ".", ReasonEmpty},
-		{"мусор", "com", "под_чёркивание.com", ReasonInvalid},
-		{"битый punycode", "com", "xn--bcher--kva.com", ReasonInvalid},
-		{"пустая метка", "com", "example..com", ReasonInvalid},
-		{"метка длиннее 63", "com", strings.Repeat("a", 64) + ".com", ReasonLabelLen},
-		{"имя длиннее 253", "com", longName, ReasonNameLen},
+		{"an empty line", "com", "", ReasonEmpty},
+		{"spaces only", "com", "   ", ReasonEmpty},
+		{"a dot only", "com", ".", ReasonEmpty},
+		{"junk", "com", "под_чёркивание.com", ReasonInvalid},
+		{"broken punycode", "com", "xn--bcher--kva.com", ReasonInvalid},
+		{"an empty label", "com", "example..com", ReasonInvalid},
+		{"a label longer than 63", "com", strings.Repeat("a", 64) + ".com", ReasonLabelLen},
+		{"a name longer than 253", "com", longName, ReasonNameLen},
 		// There is no label before the zone: the name is the TLD itself.
-		{"голый TLD", "com", "com", ReasonNoLabel},
+		{"a bare TLD", "com", "com", ReasonNoLabel},
 		// A path zone that is not a TLD: the name coincides with the zone.
-		{"имя равно зоне пути", "crawl.test", "crawl.test", ReasonNoLabel},
+		{"the name equals the path zone", "crawl.test", "crawl.test", ReasonNoLabel},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			v, _ := newValidator(t, tc.zone, 0)
 			entry, reason, ok := v.Line(7, tc.line)
 			if ok {
-				t.Fatalf("Line(%q) принята: %+v", tc.line, entry)
+				t.Fatalf("Line(%q) accepted: %+v", tc.line, entry)
 			}
 			if reason != tc.reason {
-				t.Errorf("причина = %s, want %s", reason, tc.reason)
+				t.Errorf("the reason = %s, want %s", reason, tc.reason)
 			}
 			if entry != (Entry{}) {
-				t.Errorf("отклонённая строка вернула запись: %+v", entry)
+				t.Errorf("a rejected line returned an entry: %+v", entry)
 			}
 		})
 	}
@@ -150,11 +150,11 @@ func TestLineRejected(t *testing.T) {
 func TestRejectedLogFormat(t *testing.T) {
 	v, buf := newValidator(t, "com", 0)
 	if _, _, ok := v.Line(3, "example.org"); ok {
-		t.Fatal("example.org в зоне com должна быть отклонена")
+		t.Fatal("example.org in the com zone must be rejected")
 	}
 	out := buf.String()
 	for _, want := range []string{
-		`msg="строка отклонена"`,
+		`msg="line rejected"`,
 		`service=rejected`,
 		`file=incoming/example.com/add/list.txt`,
 		`line=3`,
@@ -162,7 +162,7 @@ func TestRejectedLogFormat(t *testing.T) {
 		`reason=wrong_zone`,
 	} {
 		if !strings.Contains(out, want) {
-			t.Errorf("запись лога rejected не содержит %s:\n%s", want, out)
+			t.Errorf("the rejected log record does not contain %s:\n%s", want, out)
 		}
 	}
 }
@@ -173,7 +173,7 @@ func TestRejectedLogTruncates(t *testing.T) {
 	v.Line(1, strings.Repeat("ё", 300)+".com") // an invalid label of any length
 	want := "text=" + strings.Repeat("ё", maxLoggedRunes) + "…"
 	if !strings.Contains(buf.String(), want) {
-		t.Errorf("строка в логе не обрезана до %d рун", maxLoggedRunes)
+		t.Errorf("the line in the log is not truncated to %d runes", maxLoggedRunes)
 	}
 }
 
@@ -192,28 +192,28 @@ func TestErrorRatioBoundary(t *testing.T) {
 		}
 		return v.Finish()
 	}
-	t.Run("доля равна порогу", func(t *testing.T) {
+	t.Run("the share equals the threshold", func(t *testing.T) {
 		if res := run(t, 0.5, 2, 2); res.Failed {
-			t.Errorf("2 из 4 при пороге 0.5: файл не должен быть ошибочным: %+v", res)
+			t.Errorf("2 of 4 at the 0.5 threshold: the file must not be bad: %+v", res)
 		}
 	})
-	t.Run("доля выше порога", func(t *testing.T) {
+	t.Run("the share is above the threshold", func(t *testing.T) {
 		if res := run(t, 0.5, 3, 1); !res.Failed {
-			t.Errorf("3 из 4 при пороге 0.5: файл должен быть ошибочным: %+v", res)
+			t.Errorf("3 of 4 at the 0.5 threshold: the file must be bad: %+v", res)
 		}
 	})
-	t.Run("порог по умолчанию 10 процентов", func(t *testing.T) {
+	t.Run("the default threshold of 10 percent", func(t *testing.T) {
 		if res := run(t, 0, 1, 9); res.Failed {
-			t.Errorf("1 из 10 при пороге 0.1: файл не должен быть ошибочным: %+v", res)
+			t.Errorf("1 of 10 at the 0.1 threshold: the file must not be bad: %+v", res)
 		}
 		if res := run(t, 0, 2, 8); !res.Failed {
-			t.Errorf("2 из 10 при пороге 0.1: файл должен быть ошибочным: %+v", res)
+			t.Errorf("2 of 10 at the 0.1 threshold: the file must be bad: %+v", res)
 		}
 	})
-	t.Run("файл без строк", func(t *testing.T) {
+	t.Run("a file without lines", func(t *testing.T) {
 		v, _ := newValidator(t, "com", 0.5)
 		if res := v.Finish(); res.Failed || res.Total != 0 {
-			t.Errorf("пустой файл не ошибочен, получено %+v", res)
+			t.Errorf("an empty file is not bad, got %+v", res)
 		}
 	})
 }
@@ -228,48 +228,48 @@ func TestFinishStats(t *testing.T) {
 	}
 	res := v.Finish()
 	if res.Total != 5 || res.Accepted != 2 || res.Rejected != 3 {
-		t.Errorf("счётчики: total=%d accepted=%d rejected=%d, want 5/2/3",
+		t.Errorf("the counters: total=%d accepted=%d rejected=%d, want 5/2/3",
 			res.Total, res.Accepted, res.Rejected)
 	}
 	wantReasons := map[Reason]int{ReasonWrongZone: 1, ReasonEmpty: 1, ReasonInvalid: 1}
 	if len(res.Reasons) != len(wantReasons) {
-		t.Fatalf("причины %+v, want %+v", res.Reasons, wantReasons)
+		t.Fatalf("the reasons %+v, want %+v", res.Reasons, wantReasons)
 	}
 	for r, n := range wantReasons {
 		if res.Reasons[r] != n {
-			t.Errorf("причина %s: %d, want %d", r, res.Reasons[r], n)
+			t.Errorf("the reason %s: %d, want %d", r, res.Reasons[r], n)
 		}
 	}
 }
 
 func TestNewValidator(t *testing.T) {
-	t.Run("зона каталога нормализуется", func(t *testing.T) {
+	t.Run("the directory zone is normalized", func(t *testing.T) {
 		v, err := NewValidator(ValidatorOptions{Zone: "РФ"})
 		if err != nil {
 			t.Fatal(err)
 		}
 		if v.zone != "xn--p1ai" {
-			t.Errorf("зона = %q, want xn--p1ai", v.zone)
+			t.Errorf("the zone = %q, want xn--p1ai", v.zone)
 		}
 	})
-	t.Run("кривая зона каталога", func(t *testing.T) {
+	t.Run("a broken directory zone", func(t *testing.T) {
 		if _, err := NewValidator(ValidatorOptions{Zone: "под_чёркивание.рф"}); err == nil {
-			t.Error("невалидная зона должна давать ошибку")
+			t.Error("an invalid zone must give an error")
 		}
 	})
 	// The gate of multi-level directories (the tld-only-zones spec §5.1):
 	// working directories are TLDs, a zone with a dot — from the allowlist
 	// only; the file-level error is identified by errors.Is (the pipeline →
 	// failed/, T-021).
-	t.Run("многоуровневая зона без allowlist", func(t *testing.T) {
+	t.Run("a multi-level zone without an allowlist", func(t *testing.T) {
 		for _, zone := range []string{"co.uk", "crawl.test", "a.b.c"} {
 			_, err := NewValidator(ValidatorOptions{Zone: zone})
 			if !errors.Is(err, errZoneNotAllowed) {
-				t.Errorf("зона %s без allowlist: ожидается errZoneNotAllowed, получено %v", zone, err)
+				t.Errorf("the zone %s without an allowlist: errZoneNotAllowed is expected, got %v", zone, err)
 			}
 		}
 	})
-	t.Run("многоуровневая зона из allowlist", func(t *testing.T) {
+	t.Run("a multi-level zone from the allowlist", func(t *testing.T) {
 		v, err := NewValidator(ValidatorOptions{
 			Zone:             "Crawl.Test",
 			AllowedZonePaths: []string{"crawl.test", "co.uk"},
@@ -278,10 +278,10 @@ func TestNewValidator(t *testing.T) {
 			t.Fatal(err)
 		}
 		if v.zone != "crawl.test" {
-			t.Errorf("зона = %q, want crawl.test", v.zone)
+			t.Errorf("the zone = %q, want crawl.test", v.zone)
 		}
 	})
-	t.Run("allowlist-запись в верхнем регистре", func(t *testing.T) {
+	t.Run("an uppercase allowlist entry", func(t *testing.T) {
 		// The entry is normalized inside checkZonePath: direct calls with an
 		// unnormalized list work too (the config canonicalizes the entries at
 		// load — this is that guard here).
@@ -293,32 +293,32 @@ func TestNewValidator(t *testing.T) {
 			t.Fatal(err)
 		}
 		if v.zone != "crawl.test" {
-			t.Errorf("зона = %q, want crawl.test", v.zone)
+			t.Errorf("the zone = %q, want crawl.test", v.zone)
 		}
 	})
-	t.Run("чужая многоуровневая зона при непустом allowlist", func(t *testing.T) {
+	t.Run("a foreign multi-level zone with a non-empty allowlist", func(t *testing.T) {
 		_, err := NewValidator(ValidatorOptions{
 			Zone:             "other.test",
 			AllowedZonePaths: []string{"crawl.test"},
 		})
 		if !errors.Is(err, errZoneNotAllowed) {
-			t.Errorf("ожидается errZoneNotAllowed, получено %v", err)
+			t.Errorf("errZoneNotAllowed is expected, got %v", err)
 		}
 	})
-	t.Run("порог вне диапазона", func(t *testing.T) {
+	t.Run("a threshold outside the range", func(t *testing.T) {
 		for _, ratio := range []float64{-0.1, 1.0001} {
 			if _, err := NewValidator(ValidatorOptions{Zone: "com", MaxErrorRatio: ratio}); err == nil {
-				t.Errorf("порог %v должен отклоняться", ratio)
+				t.Errorf("the threshold %v must be rejected", ratio)
 			}
 		}
 	})
-	t.Run("без логгера", func(t *testing.T) {
+	t.Run("without a logger", func(t *testing.T) {
 		v, err := NewValidator(ValidatorOptions{Zone: "com"})
 		if err != nil {
 			t.Fatal(err)
 		}
 		if _, _, ok := v.Line(1, "example.org"); ok {
-			t.Fatal("строка не из зоны должна отклоняться и без логгера")
+			t.Fatal("a line not from the zone must be rejected without a logger too")
 		}
 	})
 }
@@ -346,30 +346,30 @@ func TestValidatorZoneless(t *testing.T) {
 	for i, tc := range cases {
 		e, reason, ok := v.Line(i+1, tc.line)
 		if !ok {
-			t.Fatalf("Line(%d, %q) отклонена: %s", i+1, tc.line, reason)
+			t.Fatalf("Line(%d, %q) rejected: %s", i+1, tc.line, reason)
 		}
 		if e.Zone != tc.zone || e.Label != tc.label {
-			t.Errorf("Line(%q) = зона %q метка %q, want %q/%q", tc.line, e.Zone, e.Label, tc.zone, tc.label)
+			t.Errorf("Line(%q) = zone %q label %q, want %q/%q", tc.line, e.Zone, e.Label, tc.zone, tc.label)
 		}
 	}
 	// An IDN label: the flag by the punycode label.
 	e, _, ok := v.Line(len(cases)+1, "тест.рф")
 	if !ok || e.Zone != "xn--p1ai" || !e.IsIDN || !strings.HasPrefix(e.Label, "xn--") {
-		t.Errorf("IDN-строка = %+v ok=%v, want зона xn--p1ai, IsIDN, punycode-метка", e, ok)
+		t.Errorf("the IDN line = %+v ok=%v, want the zone xn--p1ai, IsIDN, a punycode label", e, ok)
 	}
 
 	// A bare TLD — no label before the zone: a no_label rejection.
 	if _, reason, ok := v.Line(len(cases)+2, "com"); ok || reason != ReasonNoLabel {
-		t.Errorf("строка \"com\" = ok=%v причина %s, want no_label", ok, reason)
+		t.Errorf("the line \"com\" = ok=%v reason %s, want no_label", ok, reason)
 	}
 	// Foreign data without a domain — no_domain (T-132).
 	if _, reason, ok := v.Line(len(cases)+3, "hello world"); ok || reason != ReasonNoDomain {
-		t.Errorf("строка без домена = ok=%v причина %s, want no_domain", ok, reason)
+		t.Errorf("a line without a domain = ok=%v reason %s, want no_domain", ok, reason)
 	}
 
 	res := v.Finish()
 	if res.Accepted != len(cases)+1 || res.Rejected != 2 || res.Failed {
-		t.Errorf("Finish = %+v, want принято %d, отклонено 2, не failed", res, len(cases)+1)
+		t.Errorf("Finish = %+v, want %d accepted, 2 rejected, not failed", res, len(cases)+1)
 	}
 }
 
@@ -387,13 +387,13 @@ func TestValidatorZonelessNumericZone(t *testing.T) {
 		t.Fatalf("NewValidator: %v", err)
 	}
 	if _, reason, ok := v.Line(1, "18.06.1999"); ok || reason != ReasonNumericZone {
-		t.Errorf("строка-дата = ok=%v причина %s, want numeric_zone", ok, reason)
+		t.Errorf("the dump-date line = ok=%v reason %s, want numeric_zone", ok, reason)
 	}
 	if _, reason, ok := v.Line(2, "1.2.3.4"); ok || reason != ReasonNumericZone {
-		t.Errorf("IPv4-литерал = ok=%v причина %s, want numeric_zone", ok, reason)
+		t.Errorf("the IPv4 literal = ok=%v reason %s, want numeric_zone", ok, reason)
 	}
 	if e, _, ok := v.Line(3, "123.com"); !ok || e.Zone != "com" || e.Label != "123" {
-		t.Errorf("числовая метка в буквенной зоне = %+v ok=%v, want com/123", e, ok)
+		t.Errorf("a numeric label in a letter zone = %+v ok=%v, want com/123", e, ok)
 	}
 	// A .SU dump line: the first candidate sochi.su is a bare suffix, valid
 	// as a domain (the zone su, the label sochi) — junk without the filter
@@ -401,17 +401,17 @@ func TestValidatorZonelessNumericZone(t *testing.T) {
 	// check.
 	const line = "SOCHI.SU\tRUCENTER-SU\t18.06.1999\t01.10.2027\t01.11.2027\t1"
 	if e, _, ok := v.Line(4, line); !ok || e.Zone != "su" || e.Label != "sochi" {
-		t.Errorf("строка дампа = %+v ok=%v, want su/sochi (голый суффикс валиден)", e, ok)
+		t.Errorf("the dump line = %+v ok=%v, want su/sochi (a bare suffix is valid)", e, ok)
 	}
 	// A registrar export line without a domain: the candidate dates are
 	// numeric_zone, none passes — no_domain.
 	const datesOnly = "RUCENTER-SU\t18.06.1999\t01.10.2027\t01.11.2027\t1"
 	if _, reason, ok := v.Line(5, datesOnly); ok || reason != ReasonNoDomain {
-		t.Errorf("строка из дат = ok=%v причина %s, want no_domain", ok, reason)
+		t.Errorf("the line of dates = ok=%v reason %s, want no_domain", ok, reason)
 	}
 	res := v.Finish()
 	if res.Accepted != 2 || res.Rejected != 3 || res.Failed {
-		t.Errorf("Finish = %+v, want принято 2, отклонено 3, не failed", res)
+		t.Errorf("Finish = %+v, want 2 accepted, 3 rejected, not failed", res)
 	}
 	if res.Reasons[ReasonNumericZone] != 2 || res.Reasons[ReasonNoDomain] != 1 || len(res.Reasons) != 2 {
 		t.Errorf("Reasons = %+v, want numeric_zone: 2, no_domain: 1", res.Reasons)

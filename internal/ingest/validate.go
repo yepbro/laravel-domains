@@ -92,14 +92,14 @@ const (
 
 // reasonDescriptions — reason texts for String (the idn.ErrorKind style).
 var reasonDescriptions = map[Reason]string{
-	ReasonEmpty:       "пустое имя",
-	ReasonInvalid:     "невалидное имя домена",
-	ReasonLabelLen:    "метка длиннее 63 символов",
-	ReasonNameLen:     "имя длиннее 253 символов",
-	ReasonNoLabel:     "нет метки перед зоной",
-	ReasonNumericZone: "числовая зона — таких TLD не существует",
-	ReasonWrongZone:   "домен не из зоны пути",
-	ReasonNoDomain:    "домен в строке не найден",
+	ReasonEmpty:       "an empty name",
+	ReasonInvalid:     "an invalid domain name",
+	ReasonLabelLen:    "a label longer than 63 characters",
+	ReasonNameLen:     "a name longer than 253 characters",
+	ReasonNoLabel:     "no label before the zone",
+	ReasonNumericZone: "a numeric zone — such TLDs do not exist",
+	ReasonWrongZone:   "the domain is not from the path zone",
+	ReasonNoDomain:    "no domain found in the line",
 }
 
 // String returns the reason text (the model.Status.String style).
@@ -177,7 +177,7 @@ type Validator struct {
 // a file-level error — the pipeline moves the file to failed/ with the
 // reason, its lines are not parsed (T-021); identified via errors.Is
 // (the errArchiveRejected style).
-var errZoneNotAllowed = errors.New("многоуровневая зона каталога вне ingest.allowed_zone_paths")
+var errZoneNotAllowed = errors.New("a multi-level directory zone outside ingest.allowed_zone_paths")
 
 // checkZonePath checks the file directory zone after normalization
 // (the tld-only-zones spec §5.1): working directories are TLDs (a name
@@ -200,7 +200,7 @@ func checkZonePath(zone string, allowed []string) error {
 			return nil
 		}
 	}
-	return fmt.Errorf("зона %s: %w", zone, errZoneNotAllowed)
+	return fmt.Errorf("the zone %s: %w", zone, errZoneNotAllowed)
 }
 
 // NewValidator prepares file validation: the zone is normalized by the
@@ -216,10 +216,10 @@ func NewValidator(opts ValidatorOptions) (*Validator, error) {
 		var err error
 		zone, err = idn.NormalizeZone(opts.Zone)
 		if err != nil {
-			return nil, fmt.Errorf("ingest: зона файла %s: %w", opts.File, err)
+			return nil, fmt.Errorf("ingest: the file %s zone: %w", opts.File, err)
 		}
 		if err := checkZonePath(zone, opts.AllowedZonePaths); err != nil {
-			return nil, fmt.Errorf("ingest: файл %s: %w", opts.File, err)
+			return nil, fmt.Errorf("ingest: the file %s: %w", opts.File, err)
 		}
 	}
 	ratio := opts.MaxErrorRatio
@@ -227,7 +227,7 @@ func NewValidator(opts ValidatorOptions) (*Validator, error) {
 		ratio = DefaultMaxErrorRatio
 	}
 	if ratio < 0 || ratio > 1 {
-		return nil, fmt.Errorf("ingest: порог доли ошибок %v вне диапазона (0, 1]", ratio)
+		return nil, fmt.Errorf("ingest: the error ratio threshold %v is outside (0, 1]", ratio)
 	}
 	log := opts.RejectLog
 	if log == nil {
@@ -350,7 +350,7 @@ func domainLabel(res idn.Result, zone string) (string, Reason) {
 // reason.
 func (v *Validator) reject(n int, line string, reason Reason) {
 	v.reasons[reason]++
-	v.log.Warn("строка отклонена",
+	v.log.Warn("line rejected",
 		"file", v.file,
 		"line", n,
 		"text", truncate(line),

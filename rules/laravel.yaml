@@ -53,37 +53,37 @@ rules:
   # XSRF-TOKEN выставляет VerifyCsrfToken, имя сессии по умолчанию —
   # laravel_session (Str::slug(APP_NAME)+'_session', Laravel 5+).
   - id: cookie_xsrf_token
-    description: Кука XSRF-TOKEN (VerifyCsrfToken; имя встречается и вне Laravel — средний вес)
+    description: XSRF-TOKEN cookie (VerifyCsrfToken; the name also occurs outside Laravel — medium weight)
     target: cookie_name
     match: "XSRF-TOKEN"
     weight: 0.25
 
   - id: cookie_laravel_session
-    description: Кука laravel_session — имя сессии по умолчанию (Laravel 4+)
+    description: laravel_session cookie — the default session name (Laravel 4+)
     target: cookie_name
     match: "laravel_session"
     weight: 0.35
 
   - id: cookie_cms_session
-    description: Кука сессии Laravel-CMS с собственным именем — october/winter/bagisto _session (проверено по исходникам CMS; префиксы __Secure-/__Host- — October ≥1.1 автоматически на https)
+    description: Session cookie of a Laravel CMS with its own name — october/winter/bagisto _session (verified against the CMS sources; __Secure-/__Host- prefixes — October ≥1.1 adds them automatically on https)
     target: cookie_name
     regex: '^(?:__Secure-|__Host-)?(?:october|winter|bagisto)_session$'
     weight: 0.35
 
   - id: cookie_session_suffix
-    description: Кука <имя_приложения>_session, опционально с префиксом __Secure-/__Host- (слабый признак — ci_session у CodeIgniter, _<app>_session у Rails)
+    description: <app_name>_session cookie, optionally with the __Secure-/__Host- prefix (weak sign — ci_session in CodeIgniter, _<app>_session in Rails)
     target: cookie_name
     regex: '^(?:__Secure-|__Host-)?[a-z0-9_\-]+_session$'
     weight: 0.15
 
   - id: cookie_encrypted_payload
-    description: Зашифрованное Laravel-значение куки (base64 от {"iv":…} — EncryptCookies; префикс eyJpdiI6 вне Laravel не встречается)
+    description: Encrypted Laravel cookie value (base64 of {"iv":…} — EncryptCookies; the eyJpdiI6 prefix does not occur outside Laravel)
     target: cookie_value
     regex: '^eyJpdiI6'
     weight: 0.5
 
   - id: cookie_remember_guard
-    description: Кука remember_<guard>_<sha1> — «запомнить меня» (SessionGuard; вне Laravel не встречается)
+    description: remember_<guard>_<sha1> cookie — "remember me" (SessionGuard; does not occur outside Laravel)
     target: cookie_name
     regex: '^remember_[a-z0-9]+_[0-9a-f]{32,40}$'
     weight: 0.35
@@ -95,42 +95,42 @@ rules:
   # приложений. Обычные PHP-хостинги (X-Powered-By, Server: PHP/…) не берём —
   # это признак PHP вообще, а не Laravel, и шумел бы на каждом WordPress.
   - id: header_php_cli_server
-    description: Заголовок Host в ответе — PHP built-in server (php artisan serve)
+    description: Host header in a response — PHP built-in server (php artisan serve)
     target: header_name
     match: "Host"
     weight: 0.2
 
   # ------------------------------------------------------------ meta
   - id: meta_csrf_token
-    description: meta csrf-token (слабый признак — те же мета-теги генерируют Rails и Symfony-шаблоны)
+    description: csrf-token meta (weak sign — Rails and Symfony templates generate the same meta tags)
     target: meta
     regex: 'name=["'']csrf-token["'']'
     weight: 0.2
 
   # ------------------------------------------------------------ HTML: формы
   - id: form_csrf_input
-    description: Скрытое поле _token — вывод csrf_field() (Symfony пишет form[_token], CakePHP — _csrfToken)
+    description: Hidden _token field — csrf_field() output (Symfony writes form[_token], CakePHP — _csrfToken)
     target: html
     regex: '<input[^>]+name="_token"'
     weight: 0.25
 
   # ------------------------------------------------------------ HTML: сборка
   - id: vite_assets
-    description: Сборка Vite — laravel-vite-plugin по умолчанию (/build/assets/ + 8-символьный хэш)
+    description: Vite build — the laravel-vite-plugin default (/build/assets/ + an 8-character hash)
     target: html
     regex: '/build/assets/[^"'']+-[A-Za-z0-9_-]{8}\.(js|css)'
     weight: 0.2
     ver_min: "9.19"
 
   - id: vite_dev_client
-    description: Vite dev-сервер (@vite/client при npm run dev; сам Vite не только про Laravel)
+    description: Vite dev server (@vite/client under npm run dev; Vite itself is not Laravel-only)
     target: html
     regex: '@vite/client'
     weight: 0.1
     ver_min: "9.19"
 
   - id: mix_assets
-    description: Сборка Laravel Mix (?id= с 20 hex из mix-manifest.json)
+    description: Laravel Mix build (?id= with 20 hex chars from mix-manifest.json)
     target: html
     regex: '\.(css|js)\?id=[0-9a-f]{20}'
     weight: 0.15
@@ -138,56 +138,56 @@ rules:
 
   # ------------------------------------------------------------ HTML: стек
   - id: inertia
-    description: Inertia.js (атрибут data-page; экосистема Laravel-first, но есть адаптеры и для Rails)
+    description: Inertia.js (the data-page attribute; a Laravel-first ecosystem, but there are adapters for Rails too)
     target: html
     regex: 'data-page=["'']'
     weight: 0.2
 
   - id: livewire_attrs
-    description: Livewire — атрибуты wire:* (Livewire работает только поверх Laravel)
+    description: Livewire — wire:* attributes (Livewire runs only on top of Laravel)
     target: html
     regex: '\swire:[a-z]+'
     weight: 0.5
 
   - id: livewire_script
-    description: Livewire — клиентский скрипт livewire*.js
+    description: Livewire — the livewire*.js client script
     target: html
     regex: 'livewire[^"'']{0,40}\.js'
     weight: 0.25
 
   - id: ziggy_routes
-    description: Ziggy — маршруты Laravel в JS (const Ziggy = ...; пакет Laravel-экосистемы)
+    description: Ziggy — Laravel routes in JS (const Ziggy = ...; a package of the Laravel ecosystem)
     target: html
     regex: 'const Ziggy\s*='
     weight: 0.35
 
   - id: sanctum_csrf_cookie
-    description: Sanctum SPA-аутентификация (запрос /sanctum/csrf-cookie во inline-скрипте)
+    description: Sanctum SPA authentication (the /sanctum/csrf-cookie request in an inline script)
     target: html
     regex: '/sanctum/csrf-cookie'
     weight: 0.3
 
   - id: laravel_debugbar
-    description: Laravel Debugbar (barryvdh; голый phpdebugbar вне Laravel встречается редко)
+    description: Laravel Debugbar (barryvdh; bare phpdebugbar is rare outside Laravel)
     target: html
     regex: 'phpdebugbar|laravel-debugbar'
     weight: 0.3
 
   - id: window_laravel
-    description: window.Laravel = {...} — дефолтные layout'ы Laravel (5.3+; вне Laravel не встречается)
+    description: window.Laravel = {...} — the default Laravel layouts (5.3+; does not occur outside Laravel)
     target: html
     regex: 'window\.Laravel\s*='
     weight: 0.4
 
   - id: json_message_key
-    description: JSON-ответ {"message":"…"} — обработка ошибок Laravel (API-роуты/JSON-запросы; в larasites добывалось активным зондом 404 — здесь пассивно, T-117)
+    description: JSON response {"message":"…"} — Laravel error handling (API routes/JSON requests; in larasites it was harvested by an active 404 probe — here passively, T-117)
     target: html
     regex: '\{"message":"[^"]{1,120}"\}'
     weight: 0.25
 
   # --------------------------------------- HTML: страницы/виды по умолчанию
   - id: welcome_classic
-    description: Классическая welcome-страница Laravel 5.3–7.x (position-ref / title m-b-md)
+    description: Classic Laravel 5.3–7.x welcome page (position-ref / title m-b-md)
     target: html
     regex: 'position-ref full-height|title m-b-md'
     weight: 0.45
@@ -195,13 +195,13 @@ rules:
     ver_max: "7.x"
 
   - id: laravel_docs_link
-    description: Ссылка на https://laravel.com/docs (welcome-страницы Laravel; иногда — обзоры и блоги)
+    description: A link to https://laravel.com/docs (Laravel welcome pages; sometimes reviews and blogs)
     target: html
     regex: 'https://laravel\.com/docs'
     weight: 0.3
 
   - id: pagination_aria
-    description: Пагинация по умолчанию — Tailwind-вид (aria-label="Pagination Navigation")
+    description: Default pagination — the Tailwind look (aria-label="Pagination Navigation")
     target: html
     regex: 'aria-label="Pagination Navigation"'
     weight: 0.25

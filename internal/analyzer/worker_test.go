@@ -235,11 +235,11 @@ func (p *anFakePool) seedResult(key anRowKey, headers, cookies *string, hash []b
 }
 
 func (p *anFakePool) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFromSource) (int64, error) {
-	return 0, errors.New("anFakePool: CopyFrom не должен вызываться")
+	return 0, errors.New("anFakePool: CopyFrom must not be called")
 }
 
 func (p *anFakePool) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
-	return pgconn.CommandTag{}, errors.New("anFakePool: Exec вне транзакции")
+	return pgconn.CommandTag{}, errors.New("anFakePool: Exec outside a transaction")
 }
 
 // anFakeRows is pgx.Rows with prepared SELECT rows (headers, cookies,
@@ -270,7 +270,7 @@ func (r *anFakeRows) Scan(dest ...any) error {
 		return r.scanErr
 	}
 	if r.i == 0 || r.i > len(r.rows) || len(dest) != 3 {
-		return fmt.Errorf("anFakeRows: Scan без Next или приёмников %d (нужно 3)", len(dest))
+		return fmt.Errorf("anFakeRows: Scan without Next or %d destinations (need 3)", len(dest))
 	}
 	row := r.rows[r.i-1]
 	// NULL → the nil destination stays untouched (the pgx semantics:
@@ -285,7 +285,7 @@ func (r *anFakeRows) Scan(dest ...any) error {
 		case *[]byte:
 			*d = v.([]byte)
 		default:
-			return fmt.Errorf("anFakeRows: приёмник[%d] %T", i, dest[i])
+			return fmt.Errorf("anFakeRows: destination[%d] %T", i, dest[i])
 		}
 	}
 	return nil
@@ -303,7 +303,7 @@ func (p *anFakePool) Query(ctx context.Context, sql string, args ...any) (pgx.Ro
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if sql != analyzeSelectSQL {
-		return nil, fmt.Errorf("anFakePool: неожидаемый SQL: %s", sql)
+		return nil, fmt.Errorf("anFakePool: unexpected SQL: %s", sql)
 	}
 	if p.queryErr != nil {
 		return nil, p.queryErr
@@ -397,7 +397,7 @@ func (t *anFakeTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.Co
 		}
 		at, ok := args[0].(time.Time)
 		if !ok {
-			return pgconn.CommandTag{}, fmt.Errorf("anFakePool: consume: параметр %T, нужен time.Time", args[0])
+			return pgconn.CommandTag{}, fmt.Errorf("anFakePool: consume: the argument %T, want time.Time", args[0])
 		}
 		t.pool.counters["reanalyze:"+at.Truncate(time.Hour).Format("2006-01-02T15")] += args[1].(int64)
 		t.pool.j.record(anEvConsume)
@@ -437,7 +437,7 @@ func (t *anFakeTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.Co
 			return pgconn.CommandTag{}, t.pool.lockErr
 		}
 		if args[0].(int64) == 0 {
-			return pgconn.CommandTag{}, errors.New("anFakePool: ключ блокировки не задан")
+			return pgconn.CommandTag{}, errors.New("anFakePool: the lock key is not set")
 		}
 		t.pool.j.record(anEvLock)
 		return pgconn.NewCommandTag("SELECT 1"), nil
@@ -514,7 +514,7 @@ func (t *anFakeTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.Co
 		return pgconn.NewCommandTag("INSERT 0 1"), nil
 
 	default:
-		return pgconn.CommandTag{}, fmt.Errorf("anFakePool: неожидаемый SQL: %s", sql)
+		return pgconn.CommandTag{}, fmt.Errorf("anFakePool: unexpected SQL: %s", sql)
 	}
 }
 
@@ -530,7 +530,7 @@ func (r anFakeRow) Scan(dest ...any) error {
 		return r.err
 	}
 	if len(dest) != 1 {
-		return fmt.Errorf("anFakeRow: приёмников %d, нужно 1", len(dest))
+		return fmt.Errorf("anFakeRow: %d destinations, need 1", len(dest))
 	}
 	switch d := dest[0].(type) {
 	case *bool:
@@ -538,11 +538,11 @@ func (r anFakeRow) Scan(dest ...any) error {
 	case *time.Time:
 		at, ok := r.v.(time.Time)
 		if !ok {
-			return fmt.Errorf("anFakeRow: значение %T, нужен time.Time", r.v)
+			return fmt.Errorf("anFakeRow: the value %T, want time.Time", r.v)
 		}
 		*d = at
 	default:
-		return fmt.Errorf("anFakeRow: приёмник %T (нужен *bool или *time.Time)", dest[0])
+		return fmt.Errorf("anFakeRow: the destination %T (want *bool or *time.Time)", dest[0])
 	}
 	return nil
 }
@@ -596,7 +596,7 @@ func (t *anFakeTx) QueryRow(ctx context.Context, sql string, args ...any) pgx.Ro
 		t.pool.j.record(anEvAggExists)
 		return anFakeRow{v: exists}
 	default:
-		return anFakeRow{err: fmt.Errorf("anFakeTx: неожидаемый SQL QueryRow: %s", sql)}
+		return anFakeRow{err: fmt.Errorf("anFakeTx: unexpected SQL QueryRow: %s", sql)}
 	}
 }
 
@@ -695,7 +695,7 @@ type anFakeQueue struct {
 var _ queue.Queue = (*anFakeQueue)(nil)
 
 func (q *anFakeQueue) Publish(context.Context, string, queue.Message) (string, error) {
-	return "", errors.New("anFakeQueue: Publish не должен вызываться (analyzer не публикует)")
+	return "", errors.New("anFakeQueue: Publish must not be called (analyzer does not publish)")
 }
 
 // Consume reads a q:analyze window. The call counter is kept BEFORE the
@@ -710,15 +710,15 @@ func (q *anFakeQueue) Consume(ctx context.Context, stream, group, consumer strin
 	}
 	if stream != queue.StreamAnalyze {
 		q.mu.Unlock()
-		return nil, fmt.Errorf("anFakeQueue: неожидаемый стрим %s", stream)
+		return nil, fmt.Errorf("anFakeQueue: unexpected stream %s", stream)
 	}
 	if group != DefaultGroup {
 		q.mu.Unlock()
-		return nil, fmt.Errorf("anFakeQueue: неожидаемая группа %s", group)
+		return nil, fmt.Errorf("anFakeQueue: unexpected group %s", group)
 	}
 	if consumer == "" {
 		q.mu.Unlock()
-		return nil, errors.New("anFakeQueue: пустой consumer")
+		return nil, errors.New("anFakeQueue: empty consumer")
 	}
 	var out []queue.Delivery
 	if q.consumeErr != nil {
@@ -950,7 +950,7 @@ func TestAnalyzer_HappyPath(t *testing.T) {
 		t.Fatalf("ProcessResult: %v", err)
 	}
 	if !wrote {
-		t.Fatal("ожидана запись findings")
+		t.Fatal("findings written expected")
 	}
 
 	// The order: content → transaction → stamp → findings → commit.
@@ -959,17 +959,17 @@ func TestAnalyzer_HappyPath(t *testing.T) {
 		{anEvGet, anEvBegin}, {anEvBegin, anEvMark}, {anEvMark, anEvUpsert}, {anEvUpsert, anEvCommit},
 	} {
 		if f.pool.j.indexOf(pair[0]) > f.pool.j.indexOf(pair[1]) {
-			t.Fatalf("порядок событий %v после %v нарушен: %v", pair[1], pair[0], events)
+			t.Fatalf("the event order %v after %v is broken: %v", pair[1], pair[0], events)
 		}
 	}
 
 	// The rule set version stamp on the result row.
 	row, ok := anResultSnapshot(f.pool, anKey)
 	if !ok {
-		t.Fatal("строка результата исчезла")
+		t.Fatal("the result row is gone")
 	}
 	if row.rulesVersion == nil || *row.rulesVersion != 1001 {
-		t.Fatalf("rules_version строки = %v, нужно 1001", row.rulesVersion)
+		t.Fatalf("the row's rules_version = %v, want 1001", row.rulesVersion)
 	}
 
 	// Findings: all hits (three rules), the noisy-OR score
@@ -977,33 +977,33 @@ func TestAnalyzer_HappyPath(t *testing.T) {
 	// the [5.3, 7.x] range from the html rule.
 	finding, ok := anFindingSnapshot(f.pool, anKey)
 	if !ok {
-		t.Fatal("строка laravel_findings не записана")
+		t.Fatal("the laravel_findings row was not written")
 	}
 	wantScore := float32(1 - (1-0.25)*(1-0.35)*(1-0.45))
 	if finding.score != wantScore {
-		t.Fatalf("score = %v, нужно %v", finding.score, wantScore)
+		t.Fatalf("score = %v, want %v", finding.score, wantScore)
 	}
 	if !finding.isLaravel {
-		t.Fatalf("is_laravel = false при score %v ≥ 0.6", finding.score)
+		t.Fatalf("is_laravel = false at score %v ≥ 0.6", finding.score)
 	}
 	if finding.verMin == nil || *finding.verMin != "5.3" {
-		t.Fatalf("ver_min = %v, нужно 5.3", finding.verMin)
+		t.Fatalf("ver_min = %v, want 5.3", finding.verMin)
 	}
 	if finding.verMax == nil || *finding.verMax != "7.x" {
-		t.Fatalf("ver_max = %v, нужно 7.x", finding.verMax)
+		t.Fatalf("ver_max = %v, want 7.x", finding.verMax)
 	}
 	if finding.rulesVersion != 1001 {
-		t.Fatalf("rules_version findings = %d, нужно 1001", finding.rulesVersion)
+		t.Fatalf("the findings rules_version = %d, want 1001", finding.rulesVersion)
 	}
 
 	// signals: [{rule, weight, evidence}, …] — all three hits, the
 	// T-069 format evidence.
 	var sigs []map[string]any
 	if err := json.Unmarshal([]byte(finding.signals), &sigs); err != nil {
-		t.Fatalf("signals не JSON: %v\n%s", err, finding.signals)
+		t.Fatalf("signals is not JSON: %v\n%s", err, finding.signals)
 	}
 	if len(sigs) != 3 {
-		t.Fatalf("signals: %d записей, нужно 3 (%s)", len(sigs), finding.signals)
+		t.Fatalf("signals: %d entries, want 3 (%s)", len(sigs), finding.signals)
 	}
 	byRule := make(map[string]map[string]any, len(sigs))
 	for _, s := range sigs {
@@ -1011,11 +1011,11 @@ func TestAnalyzer_HappyPath(t *testing.T) {
 	}
 	for _, id := range []string{"cookie_xsrf_token", "cookie_session_suffix", "html_welcome"} {
 		if _, ok := byRule[id]; !ok {
-			t.Fatalf("в signals нет правила %s: %s", id, finding.signals)
+			t.Fatalf("signals has no rule %s: %s", id, finding.signals)
 		}
 	}
 	if ev := byRule["cookie_xsrf_token"]["evidence"]; ev != "cookie XSRF-TOKEN" {
-		t.Fatalf("свидетельство cookie_xsrf_token = %v", ev)
+		t.Fatalf("the cookie_xsrf_token evidence = %v", ev)
 	}
 }
 
@@ -1025,44 +1025,44 @@ func TestAnalyzer_HappyPath(t *testing.T) {
 // text, signals jsonb, is_laravel boolean, rules_version integer NOT NULL).
 func TestAnalyzer_SQLContract(t *testing.T) {
 	if !strings.Contains(analyzeSelectSQL, "SELECT headers, cookies, content_hash FROM subdomain_results") {
-		t.Error("select: не читает вход анализа (headers/cookies/content_hash)")
+		t.Error("select: does not read the analysis input (headers/cookies/content_hash)")
 	}
 	if !strings.Contains(analyzeMarkSQL, "SET rules_version = $5::int4") {
-		t.Error("mark: нет штампа rules_version")
+		t.Error("mark: no rules_version stamp")
 	}
 	if !strings.Contains(analyzeMarkSQL, "content_hash IS NOT DISTINCT FROM $6::bytea") {
-		t.Error("mark: нет охраны актуальности content_hash")
+		t.Error("mark: no content_hash freshness guard")
 	}
 	if !strings.Contains(analyzeMarkSQL, "rules_version IS DISTINCT FROM $5::int4") {
-		t.Error("mark: нет охраны актуальности версии (штамп — только устаревшим, T-204)")
+		t.Error("mark: no version freshness guard (the stamp is for stale rows only, T-204)")
 	}
 	if !strings.Contains(analyzeMarkSQL, "RETURNING r.checked_at") {
-		t.Error("mark: нет RETURNING checked_at (час корзины хвостов, T-204)")
+		t.Error("mark: no RETURNING checked_at (the tail bucket hour, T-204)")
 	}
 	if !strings.Contains(analyzeMarkSQL, fmt.Sprintf("d.status = %d", int16(model.StatusDeleted))) {
-		t.Error("mark: нет охраны «домен не deleted» (§8/§13.1)")
+		t.Error("mark: no «domain is not deleted» guard (§8/§13.1)")
 	}
 	if !strings.Contains(analyzeReanalyzeConsumeSQL,
 		"'reanalyze:' || to_char(date_trunc('hour', $1::timestamptz), 'YYYY-MM-DD\"T\"HH24')") {
-		t.Error("consume: нет имени корзины хвостов от БД (T-204)")
+		t.Error("consume: no tail bucket name from the DB (T-204)")
 	}
 	if !strings.Contains(findingUpsertSQL,
 		"ON CONFLICT (zone_id, domain_id, subdomain_id, variant) DO UPDATE") {
-		t.Error("upsert: нет конфликта по PK laravel_findings (§3.5 перезапись)")
+		t.Error("upsert: no conflict on the laravel_findings PK (§3.5 rewrite)")
 	}
 	for _, col := range []string{"score", "ver_min", "ver_max", "signals", "is_laravel", "rules_version"} {
 		if !strings.Contains(findingUpsertSQL, col) {
-			t.Errorf("upsert: нет колонки %s (§6.1)", col)
+			t.Errorf("upsert: no %s column (§6.1)", col)
 		}
 	}
 	if !strings.Contains(findingUpsertSQL, "$5::float4") {
-		t.Error("upsert: score не приводится к real (float4)")
+		t.Error("upsert: score is not cast to real (float4)")
 	}
 	if !strings.Contains(findingUpsertSQL, "$8::jsonb") {
-		t.Error("upsert: signals не приводятся к jsonb")
+		t.Error("upsert: signals are not cast to jsonb")
 	}
 	if !strings.Contains(findingDeleteSQL, "DELETE FROM laravel_findings") {
-		t.Error("delete: не удаляет строку laravel_findings")
+		t.Error("delete: does not delete the laravel_findings row")
 	}
 }
 
@@ -1079,16 +1079,16 @@ func TestAnalyzer_AllMatchesBelowThreshold(t *testing.T) {
 	}
 	finding, ok := anFindingSnapshot(f.pool, anKey)
 	if !ok {
-		t.Fatal("слабые срабатывания обязаны записываться независимо от порога")
+		t.Fatal("weak hits must be written regardless of the threshold")
 	}
 	if finding.isLaravel {
-		t.Fatal("is_laravel = true при score 0.25 < 0.6")
+		t.Fatal("is_laravel = true at score 0.25 < 0.6")
 	}
 	if finding.score != 0.25 {
-		t.Fatalf("score = %v, нужно 0.25", finding.score)
+		t.Fatalf("score = %v, want 0.25", finding.score)
 	}
 	if !strings.Contains(finding.signals, "cookie_xsrf_token") {
-		t.Fatalf("signals не содержат сработавшее правило: %s", finding.signals)
+		t.Fatalf("signals do not contain the hit rule: %s", finding.signals)
 	}
 }
 
@@ -1101,9 +1101,9 @@ func TestAnalyzer_ThresholdBoundary(t *testing.T) {
 		minScore float64
 		want     bool
 	}{
-		{"равенство на границе", 0.25, true},
-		{"чуть выше score", 0.26, false},
-		{"нулевая опция — дефолт 0.6", 0, false},
+		{"equality at the boundary", 0.25, true},
+		{"score slightly above", 0.26, false},
+		{"the zero option — the default 0.6", 0, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newANFixture(t, anSet(1001), Options{MinScore: tc.minScore})
@@ -1113,10 +1113,10 @@ func TestAnalyzer_ThresholdBoundary(t *testing.T) {
 			}
 			finding, ok := anFindingSnapshot(f.pool, anKey)
 			if !ok {
-				t.Fatal("строка findings не записана")
+				t.Fatal("the findings row was not written")
 			}
 			if finding.isLaravel != tc.want {
-				t.Fatalf("is_laravel = %v при score 0.25, min %v", finding.isLaravel, tc.minScore)
+				t.Fatalf("is_laravel = %v at score 0.25, min %v", finding.isLaravel, tc.minScore)
 			}
 		})
 	}
@@ -1135,13 +1135,13 @@ func TestAnalyzer_VersionConflict(t *testing.T) {
 	}
 	finding, ok := anFindingSnapshot(f.pool, anKey)
 	if !ok {
-		t.Fatal("строка findings не записана (оба правила сработали)")
+		t.Fatal("the findings row was not written (both rules hit)")
 	}
 	if finding.score != 0.75 { // noisy-OR(0.5, 0.5)
-		t.Fatalf("score = %v, нужно 0.75", finding.score)
+		t.Fatalf("score = %v, want 0.75", finding.score)
 	}
 	if finding.verMin != nil || finding.verMax != nil {
-		t.Fatalf("конфликт диапазонов: границы обязаны быть NULL, получены %v/%v", finding.verMin, finding.verMax)
+		t.Fatalf("a range conflict: the bounds must be NULL, got %v/%v", finding.verMin, finding.verMax)
 	}
 }
 
@@ -1160,11 +1160,11 @@ func TestAnalyzer_TailBasket(t *testing.T) {
 		t.Fatalf("ProcessResult: %v", err)
 	}
 	if got := f.pool.counters[anTailBasket()]; got != -1 {
-		t.Fatalf("корзина хвостов = %d, нужно −1 (штамп устаревшей строки)", got)
+		t.Fatalf("the tail bucket = %d, want −1 (a stale row's stamp)", got)
 	}
 	// The order: the decrement after the domain aggregation, before the commit.
 	if c, k, m := f.pool.j.indexOf(anEvConsume), f.pool.j.indexOf(anEvAggUpsert), f.pool.j.indexOf(anEvCommit); c < k || c > m {
-		t.Errorf("порядок: consume=%d agg_upsert=%d commit=%d (агрегация → декремент → фиксация)",
+		t.Errorf("the order: consume=%d agg_upsert=%d commit=%d (aggregation → decrement → commit)",
 			c, k, m)
 	}
 
@@ -1175,14 +1175,14 @@ func TestAnalyzer_TailBasket(t *testing.T) {
 	f2.pool.seedResult(anKey, anHeaders(t), anCookies(t, "XSRF-TOKEN"), hash[:])
 	f2.pool.consumeErr = errors.New("consume boom")
 	if _, err := f2.w.ProcessResult(context.Background(), anTask); err == nil ||
-		!strings.Contains(err.Error(), "корзина хвостов переанализа: consume boom") {
-		t.Fatalf("ошибка = %v, want контекст корзины и исходная", err)
+		!strings.Contains(err.Error(), "re-analysis tail bucket: consume boom") {
+		t.Fatalf("the error = %v, want the bucket context and the original", err)
 	}
 	if row, ok := anResultSnapshot(f2.pool, anKey); ok && row.rulesVersion != nil {
-		t.Fatal("штамп поставлен при сбое декремента (откат §3.4)")
+		t.Fatal("the stamp was put on the decrement failure (the §3.4 rollback)")
 	}
 	if _, ok := anFindingSnapshot(f2.pool, anKey); ok {
-		t.Fatal("findings записаны при сбое декремента (откат §3.4)")
+		t.Fatal("findings were written on the decrement failure (the §3.4 rollback)")
 	}
 }
 
@@ -1194,23 +1194,23 @@ func TestAnalyzer_NoSignalsDeletesRow(t *testing.T) {
 	stale := "stale"
 	f.pool.findings[anKey] = &anFinding{score: 0.9, verMin: &stale, isLaravel: true, rulesVersion: 999}
 	hash := anTestHash(5)
-	f.store.blocks[hash] = []byte("<html><body>чужой фреймворк без признаков</body></html>")
+	f.store.blocks[hash] = []byte("<html><body>a foreign framework without signs</body></html>")
 	f.pool.seedResult(anKey, anHeaders(t), anCookies(t, "PHPSESSID"), hash[:])
 
 	// An "empty" outcome is still an outcome: the transaction commits
 	// (the stamp + the DELETE), but the findings row is not written.
 	if wrote, err := f.w.ProcessResult(context.Background(), anTask); err != nil || !wrote {
-		t.Fatalf("ProcessResult = %v, %v; нужен успех с записью (штамп/удаление)", wrote, err)
+		t.Fatalf("ProcessResult = %v, %v; want success with a write (stamp/delete)", wrote, err)
 	}
 	if _, ok := anFindingSnapshot(f.pool, anKey); ok {
-		t.Fatal("прошлая строка findings не удалена (§3.5 перезапись)")
+		t.Fatal("the past findings row was not deleted (§3.5 rewrite)")
 	}
 	if f.pool.j.indexOf(anEvDelete) == -1 {
-		t.Fatal("DELETE laravel_findings не выполнялся")
+		t.Fatal("DELETE laravel_findings did not run")
 	}
 	row, _ := anResultSnapshot(f.pool, anKey)
 	if row.rulesVersion == nil || *row.rulesVersion != 1001 {
-		t.Fatalf("rules_version строки = %v, нужен штамп 1001 и на пустом итоге", row.rulesVersion)
+		t.Fatalf("the row's rules_version = %v, the 1001 stamp is needed on an empty outcome too", row.rulesVersion)
 	}
 }
 
@@ -1224,9 +1224,9 @@ func TestAnalyzer_NoContent(t *testing.T) {
 		block []byte // nil — no content in the store (ErrNotFound)
 	}{
 		{"NULL content_hash", nil, nil},
-		{"контент потерян", anTestHashN(3), nil},
-		{"пустой DOM", anTestHashN(4), []byte{}},
-		{"урезанный хэш", []byte{1, 2, 3}, []byte("ignored")},
+		{"content lost", anTestHashN(3), nil},
+		{"an empty DOM", anTestHashN(4), []byte{}},
+		{"a truncated hash", []byte{1, 2, 3}, []byte("ignored")},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1243,13 +1243,13 @@ func TestAnalyzer_NoContent(t *testing.T) {
 			}
 			finding, ok := anFindingSnapshot(f.pool, anKey)
 			if !ok {
-				t.Fatal("куки обязаны срабатывать без контента")
+				t.Fatal("cookies must hit without content")
 			}
 			if !strings.Contains(finding.signals, "cookie_xsrf_token") {
-				t.Fatalf("куки не проанализированы: %s", finding.signals)
+				t.Fatalf("cookies were not analyzed: %s", finding.signals)
 			}
 			if strings.Contains(finding.signals, "html_welcome") {
-				t.Fatalf("html-правило сработало без контента: %s", finding.signals)
+				t.Fatalf("the html rule hit without content: %s", finding.signals)
 			}
 		})
 	}
@@ -1267,16 +1267,16 @@ func TestAnalyzer_RowMissing(t *testing.T) {
 		t.Fatalf("ProcessResult: %v", err)
 	}
 	if wrote {
-		t.Fatal("без строки findings не пишутся")
+		t.Fatal("without a row no findings are written")
 	}
 	if _, ok := anFindingSnapshot(f.pool, anKey); ok {
-		t.Fatal("findings записаны без строки результата")
+		t.Fatal("findings were written without a result row")
 	}
 	if f.pool.j.indexOf(anEvBegin) != -1 {
-		t.Fatal("без строки транзакция не открывается")
+		t.Fatal("without a row no transaction is opened")
 	}
-	if !strings.Contains(buf.String(), "анализ не требуется — строки нет") {
-		t.Errorf("Debug о пропуске не записан:\n%s", buf.String())
+	if !strings.Contains(buf.String(), "analysis not needed — no row") {
+		t.Errorf("the skip Debug was not written:\n%s", buf.String())
 	}
 }
 
@@ -1295,20 +1295,20 @@ func TestAnalyzer_NoRulesSet(t *testing.T) {
 		t.Fatalf("ProcessResult: %v", err)
 	}
 	if wrote {
-		t.Fatal("без набора правил запись невозможна")
+		t.Fatal("without a rule set no write is possible")
 	}
 	if _, ok := anFindingSnapshot(f.pool, anKey); ok {
-		t.Fatal("findings записаны без набора правил")
+		t.Fatal("findings were written without a rule set")
 	}
 	if f.pool.j.indexOf(anEvBegin) != -1 {
-		t.Fatal("без набора правил транзакция не открывается")
+		t.Fatal("without a rule set no transaction is opened")
 	}
 	row, _ := anResultSnapshot(f.pool, anKey)
 	if row.rulesVersion != nil {
-		t.Fatal("штамп без анализа ставить нельзя — переанализ вернётся к строке")
+		t.Fatal("no stamp without analysis — re-analysis will return to the row")
 	}
-	if !strings.Contains(buf.String(), "набор правил не загружен — анализ пропущен") {
-		t.Errorf("Warn о пропуске не записан:\n%s", buf.String())
+	if !strings.Contains(buf.String(), "rule set not loaded — analysis skipped") {
+		t.Errorf("the skip Warn was not written:\n%s", buf.String())
 	}
 }
 
@@ -1354,17 +1354,17 @@ func TestAnalyzer_PartialResultNotRecorded(t *testing.T) {
 		t.Fatalf("ProcessResult: %v", err)
 	}
 	if wrote {
-		t.Fatal("неполный результат не записывается")
+		t.Fatal("a partial result is not written")
 	}
 	if _, ok := anFindingSnapshot(f.pool, anKey); ok {
-		t.Fatal("усечённые findings записаны как полные")
+		t.Fatal("truncated findings were written as full")
 	}
 	if f.pool.j.indexOf(anEvBegin) != -1 {
-		t.Fatal("для неполного результата транзакция не открывается")
+		t.Fatal("no transaction is opened for a partial result")
 	}
 	row, _ := anResultSnapshot(f.pool, anKey)
 	if row.rulesVersion != nil {
-		t.Fatal("штамп rules_version на неполном результате ставить нельзя")
+		t.Fatal("no rules_version stamp on a partial result")
 	}
 }
 
@@ -1393,20 +1393,20 @@ func TestAnalyzer_StaleRow(t *testing.T) {
 		t.Fatalf("ProcessResult: %v", err)
 	}
 	if wrote {
-		t.Fatal("ушедшая из-под задачи строка не перезаписывается")
+		t.Fatal("a row slipped out from under the task is not rewritten")
 	}
 	if _, ok := anFindingSnapshot(f.pool, anKey); ok {
-		t.Fatal("findings записаны по неактуальной строке")
+		t.Fatal("findings were written over a stale row")
 	}
 	row, _ := anResultSnapshot(f.pool, anKey)
 	if row.rulesVersion != nil {
-		t.Fatalf("штамп поставлен неактуальному эпизоду: %v", row.rulesVersion)
+		t.Fatalf("the stamp was put on a stale episode: %v", row.rulesVersion)
 	}
 	if f.pool.j.indexOf(anEvCommit) != -1 {
-		t.Fatal("0 строк — транзакция откатывается без фиксации")
+		t.Fatal("0 rows — the transaction rolls back without a commit")
 	}
-	if !strings.Contains(buf.String(), "findings не записаны — строка перезаписана") {
-		t.Errorf("Debug о незаписи не записан:\n%s", buf.String())
+	if !strings.Contains(buf.String(), "findings not written — the row was rewritten") {
+		t.Errorf("the no-write Debug was not written:\n%s", buf.String())
 	}
 }
 
@@ -1426,10 +1426,10 @@ func TestAnalyzer_DomainDeleted(t *testing.T) {
 		t.Fatalf("ProcessResult: %v", err)
 	}
 	if wrote {
-		t.Fatal("удалённому домену результат не записывается (§8)")
+		t.Fatal("no result is written for a deleted domain (§8)")
 	}
 	if _, ok := anFindingSnapshot(f.pool, anKey); ok {
-		t.Fatal("findings записаны удалённому домену")
+		t.Fatal("findings were written for a deleted domain")
 	}
 }
 
@@ -1448,28 +1448,28 @@ func TestAnalyzer_RepeatDelivery(t *testing.T) {
 
 	for i := 0; i < 2; i++ {
 		if _, err := f.w.ProcessResult(context.Background(), anTask); err != nil {
-			t.Fatalf("доставка №%d: %v", i+1, err)
+			t.Fatalf("delivery #%d: %v", i+1, err)
 		}
 	}
 	finding, ok := anFindingSnapshot(f.pool, anKey)
 	if !ok {
-		t.Fatal("строка findings не записана")
+		t.Fatal("the findings row was not written")
 	}
 	if finding.rulesVersion != 1001 {
-		t.Fatalf("rules_version = %d, нужно 1001", finding.rulesVersion)
+		t.Fatalf("rules_version = %d, want 1001", finding.rulesVersion)
 	}
 	row, _ := anResultSnapshot(f.pool, anKey)
 	if row.rulesVersion == nil || *row.rulesVersion != 1001 {
-		t.Fatalf("rules_version строки = %v, нужно 1001", row.rulesVersion)
+		t.Fatalf("the row's rules_version = %v, want 1001", row.rulesVersion)
 	}
 	if n := countEvents(f.pool.j.snapshot(), anEvUpsert); n != 1 {
-		t.Fatalf("upsert выполнен %d раз (нужно 1 — повтор той же версии no-op, T-204)", n)
+		t.Fatalf("the upsert ran %d times (want 1 — a same-version repeat is a no-op, T-204)", n)
 	}
 	if n := countEvents(f.pool.j.snapshot(), anEvMark); n != 1 {
-		t.Fatalf("штамп выполнен %d раз (нужно 1 — повтор той же версии no-op)", n)
+		t.Fatalf("the stamp ran %d times (want 1 — a same-version repeat is a no-op)", n)
 	}
 	if got := f.pool.counters[anTailBasket()]; got != -1 {
-		t.Fatalf("корзина хвостов = %d, нужно −1 (декремент без дубля, T-204)", got)
+		t.Fatalf("the tail bucket = %d, want −1 (a decrement without a duplicate, T-204)", got)
 	}
 }
 
@@ -1485,7 +1485,7 @@ func TestAnalyzer_RulesReload(t *testing.T) {
 		t.Fatalf("ProcessResult: %v", err)
 	}
 	if _, ok := anFindingSnapshot(f.pool, anKey); ok {
-		t.Fatal("по старому набору срабатываний нет")
+		t.Fatal("no hits under the old set")
 	}
 
 	// SIGHUP: a set with an extra rule and a new version.
@@ -1496,21 +1496,21 @@ func TestAnalyzer_RulesReload(t *testing.T) {
 	f.sets.swap(reloaded)
 
 	if _, err := f.w.ProcessResult(context.Background(), anTask); err != nil {
-		t.Fatalf("ProcessResult после релоада: %v", err)
+		t.Fatalf("ProcessResult after the reload: %v", err)
 	}
 	finding, ok := anFindingSnapshot(f.pool, anKey)
 	if !ok {
-		t.Fatal("после релоада правило обязано срабатывать")
+		t.Fatal("after the reload the rule must hit")
 	}
 	if !strings.Contains(finding.signals, "cookie_php_sessid") {
-		t.Fatalf("сработало не новое правило: %s", finding.signals)
+		t.Fatalf("not the new rule fired: %s", finding.signals)
 	}
 	if finding.rulesVersion != 2002 {
-		t.Fatalf("rules_version findings = %d, нужно 2002 (актуальный набор)", finding.rulesVersion)
+		t.Fatalf("the findings rules_version = %d, want 2002 (the current set)", finding.rulesVersion)
 	}
 	row, _ := anResultSnapshot(f.pool, anKey)
 	if row.rulesVersion == nil || *row.rulesVersion != 2002 {
-		t.Fatalf("rules_version строки = %v, нужно 2002", row.rulesVersion)
+		t.Fatalf("the row's rules_version = %v, want 2002", row.rulesVersion)
 	}
 }
 
@@ -1530,34 +1530,34 @@ func TestAnalyzer_Errors(t *testing.T) {
 		inj  func(f *anFixture)
 		want string
 	}{
-		{"чтение строки", func(f *anFixture) { f.pool.queryErr = errors.New("select boom") },
-			"analyzer: чтение строки результата"},
-		{"чтение строки (Scan)", func(f *anFixture) { f.pool.resultScanErr = errors.New("scan boom") },
-			"analyzer: чтение строки результата"},
-		{"чтение строки (Err строк)", func(f *anFixture) {
+		{"reading the row", func(f *anFixture) { f.pool.queryErr = errors.New("select boom") },
+			"analyzer: reading the result row"},
+		{"reading the row (Scan)", func(f *anFixture) { f.pool.resultScanErr = errors.New("scan boom") },
+			"analyzer: reading the result row"},
+		{"reading the row (rows Err)", func(f *anFixture) {
 			f.pool.resultRowsErr = errors.New("rows boom")
 			delete(f.pool.results, anKey) // the rows Err is checked after an empty Next
-		}, "analyzer: чтение строки результата"},
-		{"чтение контента", func(f *anFixture) { f.store.getErr = errors.New("disk boom") }, ""},
-		{"открытие транзакции", func(f *anFixture) { f.pool.beginErr = errors.New("begin boom") }, ""},
-		{"штамп rules_version", func(f *anFixture) { f.pool.markErr = errors.New("mark boom") }, ""},
-		{"корзина хвостов переанализа", func(f *anFixture) { f.pool.consumeErr = errors.New("consume boom") },
-			"корзина хвостов переанализа: consume boom"},
-		{"запись findings", func(f *anFixture) { f.pool.upsertErr = errors.New("upsert boom") },
-			"запись findings: upsert boom"},
-		{"удаление findings", func(f *anFixture) {
-			f.pool.upsertErr = errors.New("не должен вызываться")
+		}, "analyzer: reading the result row"},
+		{"reading content", func(f *anFixture) { f.store.getErr = errors.New("disk boom") }, ""},
+		{"opening the transaction", func(f *anFixture) { f.pool.beginErr = errors.New("begin boom") }, ""},
+		{"the rules_version stamp", func(f *anFixture) { f.pool.markErr = errors.New("mark boom") }, ""},
+		{"the re-analysis tail bucket", func(f *anFixture) { f.pool.consumeErr = errors.New("consume boom") },
+			"re-analysis tail bucket: consume boom"},
+		{"findings write", func(f *anFixture) { f.pool.upsertErr = errors.New("upsert boom") },
+			"findings write: upsert boom"},
+		{"findings delete", func(f *anFixture) {
+			f.pool.upsertErr = errors.New("must not be called")
 			f.pool.deleteErr = errors.New("delete boom")
 			f.sets.swap(&rules.Set{Rules: []rules.Rule{anSet(1).Rules[0]}, Version: 1})
 			f.pool.seedResult(anKey, nil, anCookies(t, "PHPSESSID"), nil) // not a single hit
 		}, ""},
-		{"фиксация", func(f *anFixture) { f.pool.commitErr = errors.New("commit boom") }, ""},
-		{"битый jsonb заголовков", func(f *anFixture) {
-			bad := "{не-json"
+		{"commit", func(f *anFixture) { f.pool.commitErr = errors.New("commit boom") }, ""},
+		{"a broken headers jsonb", func(f *anFixture) {
+			bad := "{not-json"
 			f.pool.results[anKey] = &anResultRow{headers: &bad}
 		}, ""},
-		{"битый jsonb cookies", func(f *anFixture) {
-			bad := "[не-json"
+		{"a broken cookies jsonb", func(f *anFixture) {
+			bad := "[not-json"
 			f.pool.results[anKey] = &anResultRow{cookies: &bad}
 		}, ""},
 	}
@@ -1567,17 +1567,17 @@ func TestAnalyzer_Errors(t *testing.T) {
 			tc.inj(f)
 			_, err := f.w.ProcessResult(context.Background(), anTask)
 			if err == nil {
-				t.Fatal("ожидана ошибка доставки")
+				t.Fatal("a delivery error is expected")
 			}
 			if tc.want != "" && !strings.Contains(err.Error(), tc.want) {
-				t.Fatalf("ошибка = %v, нужна подстрока %q", err, tc.want)
+				t.Fatalf("err = %v, want the substring %q", err, tc.want)
 			}
 			// The state rolled back: no findings, no stamp.
 			if _, ok := anFindingSnapshot(f.pool, anKey); ok {
-				t.Fatal("findings записаны при сбое")
+				t.Fatal("findings were written on failure")
 			}
 			if row, ok := anResultSnapshot(f.pool, anKey); ok && row.rulesVersion != nil {
-				t.Fatal("штамп поставлен при сбое")
+				t.Fatal("the stamp was put on failure")
 			}
 		})
 	}
@@ -1594,11 +1594,11 @@ func TestAnalyzer_UpsertRowsAffected(t *testing.T) {
 	f.pool.upsertRowsAff = 2
 
 	_, err := f.w.ProcessResult(context.Background(), anTask)
-	if err == nil || !strings.Contains(err.Error(), "запись findings: затронуто 2 строк") {
-		t.Fatalf("ошибка = %v, нужна «запись findings: затронуто 2 строк»", err)
+	if err == nil || !strings.Contains(err.Error(), "findings write: 2 rows affected") {
+		t.Fatalf("the error = %v, want «findings write: 2 rows affected»", err)
 	}
 	if f.pool.j.indexOf(anEvCommit) != -1 {
-		t.Fatal("транзакция не должна фиксироваться при нестандартном RowsAffected")
+		t.Fatal("the transaction must not commit on a non-standard RowsAffected")
 	}
 }
 
@@ -1613,13 +1613,13 @@ func TestAnalyzer_NaNWeightNotRecorded(t *testing.T) {
 	_, err := f.w.ProcessResult(context.Background(), anTask)
 	if err == nil || !strings.Contains(err.Error(), "analyzer: laravel.example:") ||
 		!strings.Contains(err.Error(), "json: unsupported value") {
-		t.Fatalf("ошибка = %v, нужна обёртка имени домена и причина NaN", err)
+		t.Fatalf("the error = %v, want the domain name wrap and the NaN cause", err)
 	}
 	if f.pool.j.indexOf(anEvBegin) != -1 {
-		t.Fatal("транзакция не открывается до успешной сериализации signals")
+		t.Fatal("no transaction is opened before the successful signals serialization")
 	}
 	if _, ok := anFindingSnapshot(f.pool, anKey); ok {
-		t.Fatal("findings записаны при несериализуемых signals")
+		t.Fatal("findings were written with non-serializable signals")
 	}
 }
 
@@ -1634,10 +1634,10 @@ func TestAnalyzer_CtxCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if _, err := f.w.ProcessResult(ctx, anTask); err == nil {
-		t.Fatal("отменённый ctx — ошибка")
+		t.Fatal("a cancelled ctx — an error")
 	}
 	if _, ok := anFindingSnapshot(f.pool, anKey); ok {
-		t.Fatal("findings записаны при отменённом ctx")
+		t.Fatal("findings were written on a cancelled ctx")
 	}
 }
 
@@ -1649,19 +1649,19 @@ func TestParseHeadersJSON(t *testing.T) {
 	}
 	empty := ""
 	if h, err := parseHeadersJSON(&empty); err != nil || h != nil {
-		t.Fatalf("пусто: %v %v", h, err)
+		t.Fatalf("empty: %v %v", h, err)
 	}
 	in := `{"X-Laravel": ["yes"], "Set-Cookie": ["a=1", "b=2"]}`
 	h, err := parseHeadersJSON(&in)
 	if err != nil {
-		t.Fatalf("разбор: %v", err)
+		t.Fatalf("parse: %v", err)
 	}
 	if len(h) != 2 || len(h["Set-Cookie"]) != 2 || h["X-Laravel"][0] != "yes" {
-		t.Fatalf("значения: %v", h)
+		t.Fatalf("the values: %v", h)
 	}
 	bad := "{"
 	if _, err := parseHeadersJSON(&bad); err == nil {
-		t.Fatal("битый JSON — ошибка")
+		t.Fatal("broken JSON — an error")
 	}
 }
 
@@ -1673,29 +1673,29 @@ func TestParseCookiesJSON(t *testing.T) {
 	// parsing and without an empty slice (the "*s == \"\"" and "len(raw) == 0" mutants, T-M10).
 	empty := ""
 	if c, err := parseCookiesJSON(&empty); err != nil || c != nil {
-		t.Fatalf("пусто: %v %v", c, err)
+		t.Fatalf("empty: %v %v", c, err)
 	}
 	arr := "[]"
 	if c, err := parseCookiesJSON(&arr); err != nil || c != nil {
-		t.Fatalf("пустой массив: %v %v", c, err)
+		t.Fatalf("an empty array: %v %v", c, err)
 	}
 	in := `[{"name":"a","value":"1","path":"/","http_only":true}]`
 	c, err := parseCookiesJSON(&in)
 	if err != nil {
-		t.Fatalf("разбор: %v", err)
+		t.Fatalf("parse: %v", err)
 	}
 	if len(c) != 1 || c[0].Name != "a" || c[0].Value != "1" {
 		t.Fatalf("cookies: %v", c)
 	}
 	bad := "["
 	if _, err := parseCookiesJSON(&bad); err == nil {
-		t.Fatal("битый JSON — ошибка")
+		t.Fatal("broken JSON — an error")
 	}
 }
 
 func TestMarshalSignals(t *testing.T) {
 	if s, err := marshalSignals(nil); err != nil || s != "" {
-		t.Fatalf("пустой набор: %q %v", s, err)
+		t.Fatalf("an empty set: %q %v", s, err)
 	}
 	in := []rules.Evidence{{Rule: "r", Weight: 0.5, Evidence: "e"}}
 	s, err := marshalSignals(in)
@@ -1704,12 +1704,12 @@ func TestMarshalSignals(t *testing.T) {
 	}
 	want := `[{"rule":"r","weight":0.5,"evidence":"e"}]`
 	if s != want {
-		t.Fatalf("формат signals = %s, нужно %s (эскиз §6.1: нижний регистр)", s, want)
+		t.Fatalf("the signals format = %s, want %s (the §6.1 sketch: lowercase)", s, want)
 	}
 	// A NaN weight is not serialized into jsonb — an error before any
 	// write (the return-cut mutant, T-M10; the scenario is TestAnalyzer_NaNWeightNotRecorded).
 	if _, err := marshalSignals([]rules.Evidence{{Rule: "r", Weight: math.NaN(), Evidence: "e"}}); err == nil {
-		t.Fatal("NaN-вес — ошибка сериализации")
+		t.Fatal("a NaN weight — a serialization error")
 	}
 }
 
@@ -1717,11 +1717,11 @@ func TestMarshalSignals(t *testing.T) {
 // message, otherwise the row key (Name is optional, T-024; the return-cut mutant, T-M10).
 func TestAnalyzerLogName(t *testing.T) {
 	if got := analyzeLogName(queue.Result{Name: "laravel.example"}); got != "laravel.example" {
-		t.Fatalf("analyzeLogName(с именем) = %q, нужно имя сообщения", got)
+		t.Fatalf("analyzeLogName(with a name) = %q, want the message's name", got)
 	}
 	key := queue.Result{ZoneID: 3, DomainID: 42, SubdomainID: 1, Variant: 1}
 	if got := analyzeLogName(key); got != "3/42/1/1" {
-		t.Fatalf("analyzeLogName(без имени) = %q, нужно 3/42/1/1", got)
+		t.Fatalf("analyzeLogName(without a name) = %q, want 3/42/1/1", got)
 	}
 }
 
@@ -1733,19 +1733,19 @@ func TestNewValidation(t *testing.T) {
 	sets := &anFakeSets{set: anSet(1)}
 	q := &anFakeQueue{j: pool.j}
 	if _, err := New(nil, q, store, sets, Options{}); err == nil {
-		t.Fatal("без БД: ожидана ошибка")
+		t.Fatal("without a DB: an error is expected")
 	}
 	if _, err := New(pool, nil, store, sets, Options{}); err == nil {
-		t.Fatal("без очереди: ожидана ошибка")
+		t.Fatal("without a queue: an error is expected")
 	}
 	if _, err := New(pool, q, nil, sets, Options{}); err == nil {
-		t.Fatal("без хранилища: ожидана ошибка")
+		t.Fatal("without a content store: an error is expected")
 	}
 	if _, err := New(pool, q, store, nil, Options{}); err == nil {
-		t.Fatal("без набора правил: ожидана ошибка")
+		t.Fatal("without a rule set: an error is expected")
 	}
 	if _, err := New(pool, q, store, sets, Options{}); err != nil {
-		t.Fatalf("полный набор: %v", err)
+		t.Fatalf("the full set: %v", err)
 	}
 }
 
@@ -1754,29 +1754,29 @@ func TestOptionsDefaults(t *testing.T) {
 	// Default* constants would change with the mutant and mask it.
 	o := Options{Consumer: "c"}.withDefaults()
 	if o.Concurrency != 8 || o.Consume != 16 || o.Group != DefaultGroup {
-		t.Fatalf("дефолты: %+v", o)
+		t.Fatalf("the defaults: %+v", o)
 	}
 	if DefaultErrorWait != 30*time.Second {
-		t.Fatalf("DefaultErrorWait = %v, нужно 30s", DefaultErrorWait)
+		t.Fatalf("DefaultErrorWait = %v, want 30s", DefaultErrorWait)
 	}
 	if o.Consumer != "c" {
-		t.Fatalf("явный Consumer затёрт: %s", o.Consumer)
+		t.Fatalf("the explicit Consumer overwritten: %s", o.Consumer)
 	}
 	o = Options{}.withDefaults()
 	if !strings.HasPrefix(o.Consumer, "analyzer-") {
-		t.Fatalf("Consumer по умолчанию: %s", o.Consumer)
+		t.Fatalf("the default Consumer: %s", o.Consumer)
 	}
 	if o.Log != nil {
-		t.Fatal("нулевой Log остаётся nil (log() подставляет Discard)")
+		t.Fatal("a nil Log stays nil (log() substitutes Discard)")
 	}
 	if o.log() == nil {
-		t.Fatal("log() обязан возвращать логгер")
+		t.Fatal("log() must return a logger")
 	}
 	// Unit values are valid and are not replaced by the defaults (the
 	// "<= 0 → <= 1" bound, T-M10): Concurrency 1 and Consume 1 are working settings.
 	o = Options{Concurrency: 1, Consume: 1}.withDefaults()
 	if o.Concurrency != 1 || o.Consume != 1 {
-		t.Fatalf("единичные значения: %+v, нужно 1/1", o)
+		t.Fatalf("the unit values: %+v, want 1/1", o)
 	}
 }
 
@@ -1784,9 +1784,9 @@ func TestOptionsDefaults(t *testing.T) {
 
 func TestProcessDelivery_PoisonMessage(t *testing.T) {
 	f := newANFixture(t, anSet(1), Options{})
-	del := queue.Delivery{Stream: queue.StreamAnalyze, ID: "bad", Payload: []byte("{не-json")}
+	del := queue.Delivery{Stream: queue.StreamAnalyze, ID: "bad", Payload: []byte("{not-json")}
 	if err := f.w.processDelivery(context.Background(), del); err == nil {
-		t.Fatal("ядовитая запись — ошибка (queue.dead через попытки, T-025)")
+		t.Fatal("a poison record — an error (queue.dead via attempts, T-025)")
 	}
 }
 
@@ -1809,7 +1809,7 @@ func TestRun_Smoke(t *testing.T) {
 		select {
 		case <-f.q.j.ackNotify:
 		case <-time.After(5 * time.Second):
-			t.Fatal("доставка не подтверждена")
+			t.Fatal("the delivery was not acknowledged")
 		}
 	}
 	cancel()
@@ -1819,19 +1819,19 @@ func TestRun_Smoke(t *testing.T) {
 			t.Fatalf("Run: %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("Run не завершился после отмены ctx")
+		t.Fatal("Run did not finish after the ctx cancellation")
 	}
 	if got := f.q.ackedSnapshot(); len(got) != 2 || got[0] == got[1] {
-		t.Fatalf("подтверждены %v, нужно e1 и e2 (порядок параллелен — не важен)", got)
+		t.Fatalf("acknowledged %v, want e1 and e2 (the parallel order does not matter)", got)
 	}
 	// The DB write strictly before the XACK: mark precedes ack. A second
 	// delivery of the same key (a duplicate) is a no-op of the mark
 	// version guard (T-204): the findings are not rewritten, the ack goes through.
 	if f.pool.j.indexOf(anEvMark) > f.pool.j.indexOf(anEvAck) {
-		t.Fatal("XACK раньше записи в БД")
+		t.Fatal("XACK before the DB write")
 	}
 	if n := countEvents(f.pool.j.snapshot(), anEvUpsert); n != 1 {
-		t.Fatalf("upsert выполнен %d раз, нужно 1 (дубль той же версии — no-op, T-204)", n)
+		t.Fatalf("the upsert ran %d times, want 1 (a same-version duplicate is a no-op, T-204)", n)
 	}
 }
 
@@ -1856,12 +1856,12 @@ func TestRun_FailingDelivery(t *testing.T) {
 	for f.q.consumesCount() < 2 {
 		select {
 		case <-deadline:
-			t.Fatal("цикл не продолжил чтение после ошибки доставки")
+			t.Fatal("the loop did not keep reading after a delivery error")
 		case <-time.After(time.Millisecond):
 		}
 	}
-	reanWait(t, "Warn о неподтверждённой задаче", func() bool {
-		return strings.Contains(buf.String(), "задача q:analyze не подтверждена")
+	reanWait(t, "the unacknowledged-task Warn", func() bool {
+		return strings.Contains(buf.String(), "q:analyze task not acknowledged")
 	})
 	cancel()
 	select {
@@ -1870,16 +1870,16 @@ func TestRun_FailingDelivery(t *testing.T) {
 			t.Fatalf("Run: %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("Run не завершился после отмены ctx")
+		t.Fatal("Run did not finish after the ctx cancellation")
 	}
 	if got := f.q.ackedSnapshot(); len(got) != 0 {
-		t.Fatalf("упавшая доставка подтверждена: %v", got)
+		t.Fatalf("the failed delivery acknowledged: %v", got)
 	}
 }
 
 func TestRun_Validation(t *testing.T) {
 	if err := Run(context.Background(), nil, Options{}); err == nil {
-		t.Fatal("Run без воркера — ошибка")
+		t.Fatal("Run without a worker — an error")
 	}
 }
 
@@ -1899,13 +1899,13 @@ func TestRun_CtxCancelledBeforeConsume(t *testing.T) {
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Fatalf("Run: %v, нужен nil при отменённом ctx", err)
+			t.Fatalf("Run: %v, want nil on a cancelled ctx", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("Run не завершился на отменённом ctx (зациклился без graceful shutdown)")
+		t.Fatal("Run did not finish on the cancelled ctx (it looped without a graceful shutdown)")
 	}
-	if !strings.Contains(buf.String(), "цикл analyzer") {
-		t.Errorf("Info запуска не записан:\n%s", buf.String())
+	if !strings.Contains(buf.String(), "analyzer loop") {
+		t.Errorf("the startup Info was not written:\n%s", buf.String())
 	}
 }
 
@@ -1916,7 +1916,7 @@ func TestRun_CtxCancelledBeforeConsume(t *testing.T) {
 func TestRun_ErrorWait(t *testing.T) {
 	var buf reanBuf
 	f := newANFixture(t, anSet(1), Options{})
-	f.q.consumeErr = errors.New("redis ушёл")
+	f.q.consumeErr = errors.New("redis went away")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -1924,15 +1924,15 @@ func TestRun_ErrorWait(t *testing.T) {
 		done <- Run(ctx, f.w, Options{Consumer: "test", Log: slog.New(slog.NewTextHandler(&buf, nil))})
 	}()
 
-	reanWait(t, "первое чтение", func() bool { return f.q.consumesCount() >= 1 })
-	reanWait(t, "Warn об ошибке чтения", func() bool {
-		return strings.Contains(buf.String(), "цикл analyzer: чтение q:analyze")
+	reanWait(t, "the first read", func() bool { return f.q.consumesCount() >= 1 })
+	reanWait(t, "the read-error Warn", func() bool {
+		return strings.Contains(buf.String(), "analyzer loop: reading q:analyze")
 	})
 	// A 30s pause: within a short window there must be no re-reads — a
 	// wait or shutdown branch cut gives a hot loop.
 	time.Sleep(150 * time.Millisecond)
 	if n := f.q.consumesCount(); n != 1 {
-		t.Fatalf("чтений очереди за паузу = %d, нужно 1 (пауза после ошибки)", n)
+		t.Fatalf("queue reads per pause = %d, want 1 (the pause after an error)", n)
 	}
 	cancel()
 	select {
@@ -1941,7 +1941,7 @@ func TestRun_ErrorWait(t *testing.T) {
 			t.Fatalf("Run: %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("Run не завершился после отмены ctx")
+		t.Fatal("Run did not finish after the ctx cancellation")
 	}
 }
 
@@ -1978,7 +1978,7 @@ func TestRun_SemaphoreReleased(t *testing.T) {
 		select {
 		case <-f.q.j.ackNotify:
 		case <-time.After(5 * time.Second):
-			t.Fatalf("доставка №%d не подтверждена (слот семафора не вернулся)", i+1)
+			t.Fatalf("delivery #%d not acknowledged (the semaphore slot did not return)", i+1)
 		}
 	}
 	cancel()
@@ -1988,10 +1988,10 @@ func TestRun_SemaphoreReleased(t *testing.T) {
 			t.Fatalf("Run: %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("Run не завершился после отмены ctx")
+		t.Fatal("Run did not finish after the ctx cancellation")
 	}
 	if got := f.q.ackedSnapshot(); len(got) != 2 {
-		t.Fatalf("подтверждены %v, нужно обе доставки", got)
+		t.Fatalf("acknowledged %v, want both deliveries", got)
 	}
 }
 
@@ -2016,11 +2016,11 @@ func TestRun_NoWarnOnSuccess(t *testing.T) {
 		select {
 		case <-f.q.j.ackNotify:
 		case <-time.After(5 * time.Second):
-			t.Fatalf("доставка №%d не подтверждена", i+1)
+			t.Fatalf("delivery #%d not acknowledged", i+1)
 		}
 	}
-	if strings.Contains(buf.String(), "не подтверждена") {
-		t.Fatalf("успешные доставки пишут Warn:\n%s", buf.String())
+	if strings.Contains(buf.String(), "not acknowledged") {
+		t.Fatalf("successful deliveries write a Warn:\n%s", buf.String())
 	}
 	cancel()
 	select {
@@ -2029,7 +2029,7 @@ func TestRun_NoWarnOnSuccess(t *testing.T) {
 			t.Fatalf("Run: %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("Run не завершился после отмены ctx")
+		t.Fatal("Run did not finish after the ctx cancellation")
 	}
 }
 
@@ -2066,7 +2066,7 @@ func TestRun_NoWarnOnShutdown(t *testing.T) {
 	select {
 	case <-started:
 	case <-time.After(5 * time.Second):
-		t.Fatal("доставка не дошла до транзакции")
+		t.Fatal("the delivery did not reach the transaction")
 	}
 	cancel() // stopping: the delivery is in flight, an error is inevitable — but not an alarm
 	close(gate)
@@ -2076,10 +2076,10 @@ func TestRun_NoWarnOnShutdown(t *testing.T) {
 			t.Fatalf("Run: %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("Run не завершился после отмены ctx")
+		t.Fatal("Run did not finish after the ctx cancellation")
 	}
-	if strings.Contains(buf.String(), "не подтверждена") {
-		t.Fatalf("ошибка остановки пишется Warn:\n%s", buf.String())
+	if strings.Contains(buf.String(), "not acknowledged") {
+		t.Fatalf("the stop error is written as a Warn:\n%s", buf.String())
 	}
 }
 
@@ -2112,7 +2112,7 @@ func TestRun_WindowShutdown(t *testing.T) {
 	select {
 	case <-started:
 	case <-time.After(5 * time.Second):
-		t.Fatal("доставка не дошла до транзакции")
+		t.Fatal("the delivery did not reach the transaction")
 	}
 	cancel()    // the window is in flight: wg.Wait holds the loop
 	close(gate) // the started delivery finishes (and fails on the cancelled ctx)
@@ -2122,10 +2122,10 @@ func TestRun_WindowShutdown(t *testing.T) {
 			t.Fatalf("Run: %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("Run не завершился после отмены ctx")
+		t.Fatal("Run did not finish after the ctx cancellation")
 	}
 	if n := f.q.consumesCount(); n != 1 {
-		t.Fatalf("чтений очереди = %d, нужно 1 (повторное чтение после остановки окна)", n)
+		t.Fatalf("queue reads = %d, want 1 (a re-read after the window stop)", n)
 	}
 }
 
@@ -2176,7 +2176,7 @@ func TestRun_WaitsRecoverLoop(t *testing.T) {
 	select {
 	case <-gate.entered:
 	case <-time.After(5 * time.Second):
-		t.Fatal("RecoverLoop не дошёл до клейма")
+		t.Fatal("RecoverLoop did not reach the claim")
 	}
 	cancel()
 	// The claim holds Run: a return before the release is the no-wait
@@ -2184,7 +2184,7 @@ func TestRun_WaitsRecoverLoop(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	select {
 	case err := <-done:
-		t.Fatalf("Run вернулся раньше RecoverLoop: %v", err)
+		t.Fatalf("Run returned before RecoverLoop: %v", err)
 	default:
 	}
 	close(gate.gate)
@@ -2194,6 +2194,6 @@ func TestRun_WaitsRecoverLoop(t *testing.T) {
 			t.Fatalf("Run: %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("Run не дождался RecoverLoop после освобождения клейма")
+		t.Fatal("Run did not wait for RecoverLoop after the claim was released")
 	}
 }

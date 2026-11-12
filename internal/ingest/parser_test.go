@@ -59,18 +59,18 @@ func TestParse(t *testing.T) {
 	}{
 		// Spec 11.1: an empty file.
 		{
-			name:  "пустой файл",
+			name:  "an empty file",
 			in:    "",
 			stats: Stats{},
 		},
 		// Spec 11.1: comments only.
 		{
-			name:  "только комментарии",
+			name:  "comments only",
 			in:    "# список доменов\n  # отступ-комментарий\r\n#\n",
 			stats: Stats{Total: 3, Skipped: 3},
 		},
 		{
-			name:  "файл из одних пустых строк",
+			name:  "a file of blank lines only",
 			in:    "\n\r\n \t \n",
 			stats: Stats{Total: 3, Skipped: 3},
 		},
@@ -85,7 +85,7 @@ func TestParse(t *testing.T) {
 			},
 		},
 		{
-			name:  "одиночный CR",
+			name:  "a lone CR",
 			in:    "a.com\rb.com\r",
 			stats: Stats{Total: 2, Data: 2},
 			lines: []gotLine{
@@ -95,7 +95,7 @@ func TestParse(t *testing.T) {
 		},
 		// Spec 11.1: BOM — stripped only at the start of the file.
 		{
-			name:  "BOM в начале",
+			name:  "a BOM at the start",
 			in:    "\ufeffa.com\nb.com\n",
 			stats: Stats{Total: 2, Data: 2},
 			lines: []gotLine{
@@ -104,12 +104,12 @@ func TestParse(t *testing.T) {
 			},
 		},
 		{
-			name:  "файл из одного BOM",
+			name:  "a file of a single BOM",
 			in:    "\ufeff",
 			stats: Stats{},
 		},
 		{
-			name:  "BOM в середине файла не снимается",
+			name:  "a BOM mid-file is not stripped",
 			in:    "a.com\n\ufeffb.com\n",
 			stats: Stats{Total: 2, Data: 2},
 			lines: []gotLine{
@@ -119,7 +119,7 @@ func TestParse(t *testing.T) {
 		},
 		// Spec 11.1: empty lines between data lines.
 		{
-			name:  "пустые строки между данными",
+			name:  "blank lines between data",
 			in:    "\na.com\n\n\nb.com\n",
 			stats: Stats{Total: 5, Skipped: 3, Data: 2},
 			lines: []gotLine{
@@ -132,27 +132,27 @@ func TestParse(t *testing.T) {
 		// down they are parsed by extraction (T-132, the field delimiter) or
 		// by normalization of a single name.
 		{
-			name:  "крайние пробелы снимаются",
+			name:  "leading/trailing spaces are stripped",
 			in:    "  \texample.com \t \n",
 			stats: Stats{Total: 1, Data: 1},
 			lines: []gotLine{{1, "example.com"}},
 		},
 		{
-			name:  "внутренние пробелы остаются",
+			name:  "inner spaces stay",
 			in:    "при мер.рф\n",
 			stats: Stats{Total: 1, Data: 1},
 			lines: []gotLine{{1, "при мер.рф"}},
 		},
 		// A comment — "#" as the first significant character only.
 		{
-			name:  "решётка не в начале — не комментарий",
+			name:  "a hash not at the start — not a comment",
 			in:    "a.com#x\n",
 			stats: Stats{Total: 1, Data: 1},
 			lines: []gotLine{{1, "a.com#x"}},
 		},
 		// A file without the trailing newline.
 		{
-			name:  "без завершающего перевода строки",
+			name:  "without a trailing newline",
 			in:    "a.com\nb.com",
 			stats: Stats{Total: 2, Data: 2},
 			lines: []gotLine{
@@ -163,13 +163,13 @@ func TestParse(t *testing.T) {
 		// A too long line: rejection, parsing continues
 		// (the limit is MaxLineLen; the rationale is there too).
 		{
-			name:  "строка ровно MaxLineLen — ещё валидна",
+			name:  "a line exactly MaxLineLen — still valid",
 			in:    strings.Repeat("a", MaxLineLen),
 			stats: Stats{Total: 1, Data: 1},
 			lines: []gotLine{{1, strings.Repeat("a", MaxLineLen)}},
 		},
 		{
-			name:  "строка MaxLineLen+1 — отклонение",
+			name:  "a line of MaxLineLen+1 — a rejection",
 			in:    strings.Repeat("a", MaxLineLen+1) + "\nb.com\n",
 			stats: Stats{Total: 2, Rejected: 1, Data: 1},
 			rejects: []gotReject{
@@ -179,7 +179,7 @@ func TestParse(t *testing.T) {
 		},
 		// Invalid UTF-8: the line is rejected, the file does not fail.
 		{
-			name:  "невалидный UTF-8",
+			name:  "invalid UTF-8",
 			in:    "ok\xff.com\nb.com\n",
 			stats: Stats{Total: 2, Rejected: 1, Data: 1},
 			rejects: []gotReject{
@@ -189,7 +189,7 @@ func TestParse(t *testing.T) {
 		},
 		// Everything mixed: physical line numbering is continuous.
 		{
-			name: "смешанный файл",
+			name: "a mixed file",
 			in: "\ufeff# заголовок\r\n" +
 				"example.com\r\n" +
 				"\n" +
@@ -212,13 +212,13 @@ func TestParse(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			st, lines, rejects, err := parseString(tc.in)
 			if err != nil {
-				t.Fatalf("Parse = %v, want без ошибки", err)
+				t.Fatalf("Parse = %v, want no error", err)
 			}
 			if st != tc.stats {
 				t.Errorf("Stats = %+v, want %+v", st, tc.stats)
 			}
 			if st.Total != st.Skipped+st.Rejected+st.Data {
-				t.Errorf("инвариант Total != Skipped+Rejected+Data: %+v", st)
+				t.Errorf("the invariant Total != Skipped+Rejected+Data: %+v", st)
 			}
 			compareLines(t, lines, tc.lines)
 			compareRejects(t, rejects, tc.rejects)
@@ -229,11 +229,11 @@ func TestParse(t *testing.T) {
 func compareLines(t *testing.T, got, want []gotLine) {
 	t.Helper()
 	if len(got) != len(want) {
-		t.Fatalf("строки = %v, want %v", got, want)
+		t.Fatalf("the lines = %v, want %v", got, want)
 	}
 	for i := range want {
 		if got[i] != want[i] {
-			t.Errorf("строка[%d] = %+v, want %+v", i, got[i], want[i])
+			t.Errorf("line[%d] = %+v, want %+v", i, got[i], want[i])
 		}
 	}
 }
@@ -241,11 +241,11 @@ func compareLines(t *testing.T, got, want []gotLine) {
 func compareRejects(t *testing.T, got, want []gotReject) {
 	t.Helper()
 	if len(got) != len(want) {
-		t.Fatalf("отклонения = %v, want %v", got, want)
+		t.Fatalf("the rejections = %v, want %v", got, want)
 	}
 	for i := range want {
 		if got[i] != want[i] {
-			t.Errorf("отклонение[%d] = %+v, want %+v", i, got[i], want[i])
+			t.Errorf("rejection[%d] = %+v, want %+v", i, got[i], want[i])
 		}
 	}
 }
@@ -255,7 +255,7 @@ func compareRejects(t *testing.T, got, want []gotReject) {
 func TestParseNilCallbacks(t *testing.T) {
 	st, err := Parse(strings.NewReader("a.com\n# комментарий\n\n"), Options{})
 	if err != nil {
-		t.Fatalf("Parse = %v, want без ошибки", err)
+		t.Fatalf("Parse = %v, want no error", err)
 	}
 	want := Stats{Total: 3, Skipped: 2, Data: 1}
 	if st != want {
@@ -264,7 +264,7 @@ func TestParseNilCallbacks(t *testing.T) {
 }
 
 // errStop — the sentinel of callback errors.
-var errStop = errors.New("остановка потребителем")
+var errStop = errors.New("stopped by the consumer")
 
 // TestParseCallbackError — a callback error stops parsing and is returned
 // wrapped; what was yielded stays with the consumer.
@@ -281,13 +281,13 @@ func TestParseCallbackError(t *testing.T) {
 		},
 	})
 	if !errors.Is(err, errStop) {
-		t.Fatalf("Parse = %v, want обёрнутый errStop", err)
+		t.Fatalf("Parse = %v, want the wrapped errStop", err)
 	}
-	if !strings.Contains(err.Error(), "строка 2") {
-		t.Errorf("ошибка без номера строки: %v", err)
+	if !strings.Contains(err.Error(), "line 2") {
+		t.Errorf("the error without a line number: %v", err)
 	}
 	if st != (Stats{Total: 2, Data: 2}) {
-		t.Errorf("Stats = %+v, want Total=2 Data=2 (до остановки)", st)
+		t.Errorf("Stats = %+v, want Total=2 Data=2 (before the stop)", st)
 	}
 	compareLines(t, got, []gotLine{{1, "a.com"}, {2, "stop.com"}})
 
@@ -296,7 +296,7 @@ func TestParseCallbackError(t *testing.T) {
 		OnReject: func(Reject) error { return errStop },
 	})
 	if !errors.Is(err, errStop) {
-		t.Fatalf("Parse (OnReject) = %v, want обёрнутый errStop", err)
+		t.Fatalf("Parse (OnReject) = %v, want the wrapped errStop", err)
 	}
 	if st != (Stats{Total: 1, Rejected: 1}) {
 		t.Errorf("Stats (OnReject) = %+v, want Total=1 Rejected=1", st)
@@ -326,7 +326,7 @@ func (f *failReader) Read(p []byte) (int, error) {
 // TestParseReadError — a read failure: the complete lines have been yielded,
 // Parse returns an error, the unread tail is not emitted.
 func TestParseReadError(t *testing.T) {
-	errDisk := errors.New("диск отвалился")
+	errDisk := errors.New("the disk went away")
 	var got []gotLine
 	st, err := Parse(
 		&failReader{r: strings.NewReader("a.com\nb.com\n"), n: len("a.com\nb."), fail: errDisk},
@@ -336,10 +336,10 @@ func TestParseReadError(t *testing.T) {
 		}},
 	)
 	if !errors.Is(err, errDisk) {
-		t.Fatalf("Parse = %v, want обёрнутая ошибка чтения", err)
+		t.Fatalf("Parse = %v, want the wrapped read error", err)
 	}
 	if st != (Stats{Total: 1, Data: 1}) {
-		t.Errorf("Stats = %+v, want Total=1 Data=1 (полная строка до сбоя)", st)
+		t.Errorf("Stats = %+v, want Total=1 Data=1 (the full line before the failure)", st)
 	}
 	compareLines(t, got, []gotLine{{1, "a.com"}})
 }
@@ -364,11 +364,11 @@ func TestParseShortReads(t *testing.T) {
 	in := "\ufeff# комментарий\r\na.com\r\nb.com\rc.com\n#\n"
 	wantStats, wantLines, wantRejects, err := parseString(in)
 	if err != nil {
-		t.Fatalf("эталон: %v", err)
+		t.Fatalf("the reference: %v", err)
 	}
 	st, lines, rejects, err := parse(shortReader{r: strings.NewReader(in), max: 3})
 	if err != nil {
-		t.Fatalf("Parse = %v, want без ошибки", err)
+		t.Fatalf("Parse = %v, want no error", err)
 	}
 	if st != wantStats {
 		t.Errorf("Stats = %+v, want %+v", st, wantStats)
@@ -387,19 +387,19 @@ func TestScannerWindowBoundaries(t *testing.T) {
 		in    string
 		lines []string
 	}{
-		{"CRLF пересекает край окна", "xxx\r\nyyy", []string{"xxx", "yyy"}},
-		{"CR пересекает край окна", "xxx\ryyy", []string{"xxx", "yyy"}},
-		{"строка пересекает окно", "abcdefg\r\nh", []string{"abcdefg", "h"}},
-		{"BOM и CRLF в окне 3", "\ufeffab\r\nc", []string{"ab", "c"}},
-		{"CRLF в конце файла", "ab\r\n", []string{"ab"}},
-		{"одиночный CR в конце файла", "ab\r", []string{"ab"}},
-		{"только концы строк", "\r\n\r\nx", []string{"", "", "x"}},
-		{"файл из одного BOM", "\ufeff", nil},
-		{"пустой файл", "", nil},
+		{"CRLF crosses the window edge", "xxx\r\nyyy", []string{"xxx", "yyy"}},
+		{"CR crosses the window edge", "xxx\ryyy", []string{"xxx", "yyy"}},
+		{"a line crosses the window", "abcdefg\r\nh", []string{"abcdefg", "h"}},
+		{"a BOM and CRLF in window 3", "\ufeffab\r\nc", []string{"ab", "c"}},
+		{"CRLF at the end of the file", "ab\r\n", []string{"ab"}},
+		{"a lone CR at the end of the file", "ab\r", []string{"ab"}},
+		{"only line endings", "\r\n\r\nx", []string{"", "", "x"}},
+		{"a file of a single BOM", "\ufeff", nil},
+		{"an empty file", "", nil},
 	}
 	for _, tc := range tests {
 		for _, window := range []int{3, 4, 5, 7, 16, 64} {
-			t.Run(fmt.Sprintf("%s/окно_%d", tc.name, window), func(t *testing.T) {
+			t.Run(fmt.Sprintf("%s/window_%d", tc.name, window), func(t *testing.T) {
 				sc := newScannerWindow(strings.NewReader(tc.in), window)
 				var got []string
 				for {
@@ -411,16 +411,16 @@ func TestScannerWindowBoundaries(t *testing.T) {
 						break
 					}
 					if size != len(line) {
-						t.Fatalf("size = %d, len(line) = %d (короткая строка: %q)", size, len(line), line)
+						t.Fatalf("size = %d, len(line) = %d (a short line: %q)", size, len(line), line)
 					}
 					got = append(got, string(line))
 				}
 				if len(got) != len(tc.lines) {
-					t.Fatalf("строки = %q, want %q", got, tc.lines)
+					t.Fatalf("the lines = %q, want %q", got, tc.lines)
 				}
 				for i := range tc.lines {
 					if got[i] != tc.lines[i] {
-						t.Errorf("строка[%d] = %q, want %q", i, got[i], tc.lines[i])
+						t.Errorf("line[%d] = %q, want %q", i, got[i], tc.lines[i])
 					}
 				}
 			})
@@ -437,13 +437,13 @@ func TestScannerOverlongLine(t *testing.T) {
 
 	line, size, ok, err := sc.readLine()
 	if err != nil || !ok {
-		t.Fatalf("readLine = (%q, %d, %v, %v), want первая строка", line, size, ok, err)
+		t.Fatalf("readLine = (%q, %d, %v, %v), want the first line", line, size, ok, err)
 	}
 	if size != MaxLineLen+5 {
 		t.Errorf("size = %d, want %d", size, MaxLineLen+5)
 	}
 	if len(line) != MaxLineLen {
-		t.Errorf("накопитель = %d байт, want не больше MaxLineLen", len(line))
+		t.Errorf("the buffer = %d bytes, want no more than MaxLineLen", len(line))
 	}
 
 	line, size, ok, err = sc.readLine()
@@ -451,7 +451,7 @@ func TestScannerOverlongLine(t *testing.T) {
 		t.Fatalf("readLine = (%q, %d, %v, %v), want (\"ok\", 2, true, nil)", line, size, ok, err)
 	}
 	if _, _, ok, err := sc.readLine(); ok || err != nil {
-		t.Errorf("readLine после конца = (%v, %v), want (false, nil)", ok, err)
+		t.Errorf("readLine after the end = (%v, %v), want (false, nil)", ok, err)
 	}
 
 	// The same without a line ending — the file ended together with the junk.
@@ -526,24 +526,24 @@ func TestParseMemoryConstant(t *testing.T) {
 		},
 	})
 	if err != nil {
-		t.Fatalf("Parse = %v, want без ошибки", err)
+		t.Fatalf("Parse = %v, want no error", err)
 	}
 	if st != (Stats{Total: lines, Data: lines}) {
 		t.Errorf("Stats = %+v, want Total=Data=%d", st, lines)
 	}
 	if count != lines {
-		t.Errorf("отдано %d строк, want %d", count, lines)
+		t.Errorf("%d lines yielded, want %d", count, lines)
 	}
 	if want := "d00000000.crawl.test"; first != want {
-		t.Errorf("первая строка = %q, want %q", first, want)
+		t.Errorf("the first line = %q, want %q", first, want)
 	}
 	if want := fmt.Sprintf("d%08d.crawl.test", lines-1); last != want {
-		t.Errorf("последняя строка = %q, want %q", last, want)
+		t.Errorf("the last line = %q, want %q", last, want)
 	}
 
 	afterLive = heapLive(t)
 	if maxLive > base+limit || afterLive > base+limit {
-		t.Errorf("живая куча: во время %d, после %d, база %d — файл буферизуется?",
+		t.Errorf("live heap: during %d, after %d, base %d — is the file being buffered?",
 			maxLive, afterLive, base)
 	}
 }

@@ -64,11 +64,11 @@ func (r *cleanupFakeRows) Next() bool {
 
 func (r *cleanupFakeRows) Scan(dest ...any) error {
 	if r.closed || r.i == 0 || r.i > len(r.rows) {
-		return errors.New("cleanupFakeRows: Scan без Next")
+		return errors.New("cleanupFakeRows: Scan without Next")
 	}
 	row := r.rows[r.i-1]
 	if len(dest) != len(row) {
-		return fmt.Errorf("cleanupFakeRows: приёмников %d, колонок %d", len(dest), len(row))
+		return fmt.Errorf("cleanupFakeRows: %d destinations, %d columns", len(dest), len(row))
 	}
 	for i, d := range dest {
 		target := reflect.ValueOf(d).Elem()
@@ -114,7 +114,7 @@ type cleanupFakePool struct {
 }
 
 func (p *cleanupFakePool) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFromSource) (int64, error) {
-	return 0, errors.New("CopyFrom не должен вызываться")
+	return 0, errors.New("CopyFrom must not be called")
 }
 
 // Exec serves the cleanup of orphaned batches (CleanupStaleBatches,
@@ -304,13 +304,13 @@ func TestCleanupOnceEmpty(t *testing.T) {
 		t.Fatalf("CleanupOnce: %v", err)
 	}
 	if res != (CleanupResult{}) {
-		t.Errorf("итог = %+v, want нулевой: чистить нечего", res)
+		t.Errorf("the outcome = %+v, want zero: nothing to clean", res)
 	}
 	if len(pool.queries) != 1 || pool.queries[0].sql != wantCleanupSelect {
-		t.Errorf("SELECT = %v, want один запрос кандидатов", pool.queries)
+		t.Errorf("the SELECT = %v, want a single candidate query", pool.queries)
 	}
 	if pool.begins != 0 {
-		t.Errorf("транзакций = %d, want 0: пустой набор не открывает транзакцию", pool.begins)
+		t.Errorf("transactions = %d, want 0: an empty set opens no transaction", pool.begins)
 	}
 }
 
@@ -338,28 +338,28 @@ func TestCleanupOnceSQLAndFlow(t *testing.T) {
 
 	// Candidate selection: the deleted status and the chunk limit.
 	if len(pool.queries) != 1 {
-		t.Fatalf("SELECT'ов = %d, want 1", len(pool.queries))
+		t.Fatalf("SELECTs = %d, want 1", len(pool.queries))
 	}
 	if pool.queries[0].sql != wantCleanupSelect {
-		t.Errorf("SQL выборки:\n%s\nwant:\n%s", pool.queries[0].sql, wantCleanupSelect)
+		t.Errorf("the select SQL:\n%s\nwant:\n%s", pool.queries[0].sql, wantCleanupSelect)
 	}
 	if want := []any{7}; !reflect.DeepEqual(pool.queries[0].args, want) {
-		t.Errorf("аргументы выборки = %v, want %v (лимит пачки; статус deleted — литерал в SQL, T-170)", pool.queries[0].args, want)
+		t.Errorf("the select arguments = %v, want %v (the chunk limit; the deleted status is a literal in SQL, T-170)", pool.queries[0].args, want)
 	}
 
 	// Transaction: deleting the results + decreasing the refcount.
 	if pool.begins != 1 || len(pool.txs) != 1 {
-		t.Fatalf("транзакций = %d, want 1", pool.begins)
+		t.Fatalf("transactions = %d, want 1", pool.begins)
 	}
 	tx := pool.txs[0]
 	if len(tx.calls) != 2 {
-		t.Fatalf("вызовов в транзакции = %d, want 2 (DELETE + UPDATE)", len(tx.calls))
+		t.Fatalf("calls in the transaction = %d, want 2 (DELETE + UPDATE)", len(tx.calls))
 	}
 	if tx.calls[0].sql != wantCleanupDelete {
-		t.Errorf("SQL удаления:\n%s\nwant:\n%s", tx.calls[0].sql, wantCleanupDelete)
+		t.Errorf("the delete SQL:\n%s\nwant:\n%s", tx.calls[0].sql, wantCleanupDelete)
 	}
 	if want := []any{[]int16{1, 1, 2}, []int64{10, 11, 20}}; !reflect.DeepEqual(tx.calls[0].args, want) {
-		t.Errorf("аргументы удаления = %v, want %v (статус deleted — литерал в SQL, T-170)", tx.calls[0].args, want)
+		t.Errorf("the delete arguments = %v, want %v (the deleted status is a literal in SQL, T-170)", tx.calls[0].args, want)
 	}
 	if tx.calls[1].sql != wantCleanupUpdate {
 		t.Errorf("SQL refcount:\n%s\nwant:\n%s", tx.calls[1].sql, wantCleanupUpdate)
@@ -367,20 +367,20 @@ func TestCleanupOnceSQLAndFlow(t *testing.T) {
 	// The hashes are aggregated by the number of deleted references, the
 	// NULL is skipped, the order is deterministic.
 	if want := []any{[][]byte{hashA, hashB}, []int32{2, 1}}; !reflect.DeepEqual(tx.calls[1].args, want) {
-		t.Errorf("аргументы refcount = %v, want %v", tx.calls[1].args, want)
+		t.Errorf("the refcount arguments = %v, want %v", tx.calls[1].args, want)
 	}
 
 	want := CleanupResult{Domains: 3, Results: 4, Contents: 2}
 	if res != want {
-		t.Errorf("итог = %+v, want %+v", res, want)
+		t.Errorf("the outcome = %+v, want %+v", res, want)
 	}
 	if !tx.committed || tx.rolledBack {
-		t.Errorf("транзакция: committed=%v rolledBack=%v, want фиксация без отката", tx.committed, tx.rolledBack)
+		t.Errorf("the transaction: committed=%v rolledBack=%v, want a commit without a rollback", tx.committed, tx.rolledBack)
 	}
 	// The domain cleanup pass does not write to the pool directly: Exec
 	// is only the channel of the orphaned batch cleanup (T-098).
 	if len(pool.execCalls) != 0 {
-		t.Errorf("Exec'ы через пул = %v, want нет: CleanupOnce работает в транзакции", pool.execCalls)
+		t.Errorf("Execs through the pool = %v, want none: CleanupOnce works in a transaction", pool.execCalls)
 	}
 }
 
@@ -394,7 +394,7 @@ func TestCleanupOnceDefaultBatch(t *testing.T) {
 	}
 	got := pool.queries[0].args[0]
 	if got != DefaultCleanupBatch {
-		t.Errorf("лимит пачки = %v, want дефолт %d", got, DefaultCleanupBatch)
+		t.Errorf("the chunk limit = %v, want the default %d", got, DefaultCleanupBatch)
 	}
 }
 
@@ -408,24 +408,24 @@ func TestCleanupOnceRepeatPasses(t *testing.T) {
 
 	first, err := CleanupOnce(context.Background(), pool, CleanupOptions{})
 	if err != nil {
-		t.Fatalf("первый проход: %v", err)
+		t.Fatalf("the first pass: %v", err)
 	}
 	if first.Domains != 1 || first.Results != 1 {
-		t.Fatalf("первый проход = %+v, want 1 домен и 1 результат", first)
+		t.Fatalf("the first pass = %+v, want 1 domain and 1 result", first)
 	}
 
 	second, err := CleanupOnce(context.Background(), pool, CleanupOptions{})
 	if err != nil {
-		t.Fatalf("второй проход: %v", err)
+		t.Fatalf("the second pass: %v", err)
 	}
 	if second != (CleanupResult{}) {
-		t.Errorf("второй проход = %+v, want нулевой", second)
+		t.Errorf("the second pass = %+v, want zero", second)
 	}
 	if len(pool.queries) != 2 {
-		t.Errorf("SELECT'ов = %d, want 2 (по одному на проход)", len(pool.queries))
+		t.Errorf("SELECTs = %d, want 2 (one per pass)", len(pool.queries))
 	}
 	if pool.begins != 1 {
-		t.Errorf("транзакций = %d, want 1: повторный проход не открывает", pool.begins)
+		t.Errorf("transactions = %d, want 1: a repeated pass opens no new one", pool.begins)
 	}
 }
 
@@ -435,7 +435,7 @@ func TestCleanupOnceRepeatPasses(t *testing.T) {
 // transaction is committed, and the anomaly is visible in
 // CleanupResult.BadHashes.
 func TestCleanupOnceBadHash(t *testing.T) {
-	t.Run("мусорный хэш рядом с корректным", func(t *testing.T) {
+	t.Run("a junk hash next to a correct one", func(t *testing.T) {
 		pool := &cleanupFakePool{
 			selects: []*cleanupFakeRows{cleanupRows([]any{int16(1), int64(10)})},
 			deletes: []*cleanupFakeRows{cleanupRows(
@@ -446,23 +446,23 @@ func TestCleanupOnceBadHash(t *testing.T) {
 
 		res, err := CleanupOnce(context.Background(), pool, CleanupOptions{})
 		if err != nil {
-			t.Fatalf("CleanupOnce: %v, want проход без ошибки", err)
+			t.Fatalf("CleanupOnce: %v, want a pass without an error", err)
 		}
 		if res.BadHashes != 1 || res.Domains != 1 || res.Results != 2 || res.Contents != 1 {
-			t.Errorf("итог = %+v, want bad_hashes 1, domains 1, results 2, contents 1", res)
+			t.Errorf("the outcome = %+v, want bad_hashes 1, domains 1, results 2, contents 1", res)
 		}
 		tx := pool.txs[0]
 		if len(tx.calls) != 2 {
-			t.Fatalf("вызовов в транзакции %d, want 2 (DELETE + UPDATE по корректному хэшу)", len(tx.calls))
+			t.Fatalf("calls in the transaction %d, want 2 (DELETE + UPDATE for the correct hash)", len(tx.calls))
 		}
 		if want := []any{[][]byte{cleanupHash16(0xaa)}, []int32{1}}; !reflect.DeepEqual(tx.calls[1].args, want) {
-			t.Errorf("аргументы refcount = %v, want только корректный хэш", tx.calls[1].args)
+			t.Errorf("the refcount arguments = %v, want the correct hash only", tx.calls[1].args)
 		}
 		if !tx.committed || tx.rolledBack {
-			t.Errorf("транзакция: committed=%v rolledBack=%v, want фиксация без отката", tx.committed, tx.rolledBack)
+			t.Errorf("the transaction: committed=%v rolledBack=%v, want a commit without a rollback", tx.committed, tx.rolledBack)
 		}
 	})
-	t.Run("все хэши некорректны — проход продолжается", func(t *testing.T) {
+	t.Run("all hashes are malformed — the pass continues", func(t *testing.T) {
 		pool := &cleanupFakePool{
 			selects: []*cleanupFakeRows{cleanupRows(
 				[]any{int16(1), int64(10)},
@@ -476,20 +476,20 @@ func TestCleanupOnceBadHash(t *testing.T) {
 
 		res, err := CleanupOnce(context.Background(), pool, CleanupOptions{})
 		if err != nil {
-			t.Fatalf("CleanupOnce: %v, want проход без ошибки", err)
+			t.Fatalf("CleanupOnce: %v, want a pass without an error", err)
 		}
 		if res.BadHashes != 1 || res.Domains != 2 || res.Contents != 0 {
-			t.Errorf("итог = %+v, want bad_hashes 1, domains 2, contents 0", res)
+			t.Errorf("the outcome = %+v, want bad_hashes 1, domains 2, contents 0", res)
 		}
 		// No references for the refcount — the UPDATE does not run, but
 		// the pass is committed: the domains are cleaned, the next passes
 		// will not select them.
 		tx := pool.txs[0]
 		if len(tx.calls) != 1 {
-			t.Fatalf("вызовов в транзакции %d, want 1 (только DELETE)", len(tx.calls))
+			t.Fatalf("calls in the transaction %d, want 1 (DELETE only)", len(tx.calls))
 		}
 		if !tx.committed {
-			t.Error("транзакция не зафиксирована — кандидаты выберутся снова")
+			t.Error("the transaction was not committed — the candidates will be selected again")
 		}
 	})
 }
@@ -507,42 +507,42 @@ func TestCleanupOnceErrors(t *testing.T) {
 		pool    *cleanupFakePool
 		context string // the expected fragment of the message
 	}{
-		{"ошибка SELECT", &cleanupFakePool{selectErrs: []error{errors.New("бд недоступна")}}, "выборка кандидатов"},
-		{"ошибка Begin", func() *cleanupFakePool {
+		{"a SELECT error", &cleanupFakePool{selectErrs: []error{errors.New("db unavailable")}}, "the candidate selection"},
+		{"a Begin error", func() *cleanupFakePool {
 			p := newPool()
-			p.beginErr = errors.New("бд недоступна")
+			p.beginErr = errors.New("db unavailable")
 			return p
-		}(), "транзакция"},
-		{"ошибка DELETE", func() *cleanupFakePool {
+		}(), "transaction"},
+		{"a DELETE error", func() *cleanupFakePool {
 			p := newPool()
-			p.deleteErr = errors.New("бд недоступна")
+			p.deleteErr = errors.New("db unavailable")
 			return p
-		}(), "удаление результатов"},
-		{"ошибка UPDATE", func() *cleanupFakePool {
+		}(), "deleting the results"},
+		{"an UPDATE error", func() *cleanupFakePool {
 			p := newPool()
-			p.updateErr = errors.New("бд недоступна")
+			p.updateErr = errors.New("db unavailable")
 			return p
 		}(), "refcount"},
-		{"ошибка Commit", func() *cleanupFakePool {
+		{"a Commit error", func() *cleanupFakePool {
 			p := newPool()
-			p.commitErr = errors.New("бд недоступна")
+			p.commitErr = errors.New("db unavailable")
 			return p
-		}(), "фиксация"},
+		}(), "commit"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			_, err := CleanupOnce(context.Background(), tt.pool, CleanupOptions{})
 			if err == nil {
-				t.Fatal("ожидалась ошибка")
+				t.Fatal("an error is expected")
 			}
-			if !strings.Contains(err.Error(), "ingest: очистка удалённых доменов") ||
+			if !strings.Contains(err.Error(), "ingest: deleted-domains cleanup") ||
 				!strings.Contains(err.Error(), tt.context) ||
-				!strings.Contains(err.Error(), "бд недоступна") {
-				t.Errorf("сообщение = %q, want контекст %q и исходная ошибка", err, tt.context)
+				!strings.Contains(err.Error(), "db unavailable") {
+				t.Errorf("the message = %q, want the context %q and the original error", err, tt.context)
 			}
 			for _, tx := range tt.pool.txs {
 				if tx.committed {
-					t.Errorf("транзакция закоммичена при ошибке %q", tt.name)
+					t.Errorf("the transaction committed on the %q error", tt.name)
 				}
 			}
 		})
@@ -555,7 +555,7 @@ func TestCleanupOnceErrors(t *testing.T) {
 func TestCleanupOnceCtxCanceled(t *testing.T) {
 	selectPool := &cleanupFakePool{selectErrs: []error{context.Canceled}}
 	if _, err := CleanupOnce(context.Background(), selectPool, CleanupOptions{}); !errors.Is(err, context.Canceled) {
-		t.Errorf("ошибка выборки = %v, want context.Canceled", err)
+		t.Errorf("the select error = %v, want context.Canceled", err)
 	}
 
 	deletePool := &cleanupFakePool{
@@ -564,17 +564,17 @@ func TestCleanupOnceCtxCanceled(t *testing.T) {
 	}
 	deletePool.deleteErr = context.Canceled
 	if _, err := CleanupOnce(context.Background(), deletePool, CleanupOptions{}); !errors.Is(err, context.Canceled) {
-		t.Errorf("ошибка удаления = %v, want context.Canceled", err)
+		t.Errorf("the delete error = %v, want context.Canceled", err)
 	}
 	if deletePool.txs[0].committed {
-		t.Error("транзакция закоммичена при отмене контекста")
+		t.Error("the transaction committed on a context cancellation")
 	}
 }
 
 func TestCleanupOnceNilPool(t *testing.T) {
 	if _, err := CleanupOnce(context.Background(), nil, CleanupOptions{}); err == nil ||
-		!strings.Contains(err.Error(), "пул не задан") {
-		t.Errorf("ошибка = %v, want «пул не задан»", err)
+		!strings.Contains(err.Error(), "the pool is not set") {
+		t.Errorf("the error = %v, want «the pool is not set»", err)
 	}
 }
 
@@ -595,18 +595,18 @@ func TestCleanupStaleBatchesSQLAndArg(t *testing.T) {
 		t.Fatalf("CleanupStaleBatches: %v", err)
 	}
 	if rows != 7 {
-		t.Errorf("удалено строк = %d, want 7 (из CommandTag)", rows)
+		t.Errorf("deleted rows = %d, want 7 (from CommandTag)", rows)
 	}
 	if len(pool.execCalls) != 1 {
-		t.Fatalf("Exec'ов = %d, want 1", len(pool.execCalls))
+		t.Fatalf("Execs = %d, want 1", len(pool.execCalls))
 	}
 	call := pool.execCalls[0]
 	if call.sql != wantStaleStageSQL {
-		t.Errorf("SQL зачистки:\n%s\nwant:\n%s", call.sql, wantStaleStageSQL)
+		t.Errorf("the sweep SQL:\n%s\nwant:\n%s", call.sql, wantStaleStageSQL)
 	}
 	wantArg := batchIDBefore(now.Add(-StaleBatchAge))
 	if !reflect.DeepEqual(call.args, []any{wantArg[:]}) {
-		t.Errorf("граница зачистки = %x, want %x (batch_idBefore(now − %s))",
+		t.Errorf("the sweep boundary = %x, want %x (batch_idBefore(now − %s))",
 			call.args[0], wantArg[:], StaleBatchAge)
 	}
 }
@@ -621,32 +621,32 @@ func TestCleanupStaleBatchesNoop(t *testing.T) {
 		t.Fatalf("CleanupStaleBatches: %v", err)
 	}
 	if rows != 0 {
-		t.Errorf("удалено строк = %d, want 0: чистить нечего", rows)
+		t.Errorf("deleted rows = %d, want 0: nothing to clean", rows)
 	}
 	if len(pool.execCalls) != 1 || pool.begins != 0 {
-		t.Errorf("обращений = %v (транзакций %d), want один Exec без транзакции",
+		t.Errorf("calls = %v (transactions %d), want a single Exec without a transaction",
 			pool.execCalls, pool.begins)
 	}
 }
 
 func TestCleanupStaleBatchesErrors(t *testing.T) {
 	if _, err := CleanupStaleBatches(context.Background(), nil, time.Now()); err == nil ||
-		!strings.Contains(err.Error(), "пул не задан") {
-		t.Errorf("ошибка = %v, want «пул не задан»", err)
+		!strings.Contains(err.Error(), "the pool is not set") {
+		t.Errorf("the error = %v, want «the pool is not set»", err)
 	}
 
-	boom := &cleanupFakePool{execs: []pipeExec{{err: errors.New("бд недоступна")}}}
+	boom := &cleanupFakePool{execs: []pipeExec{{err: errors.New("db unavailable")}}}
 	if _, err := CleanupStaleBatches(context.Background(), boom, time.Now()); err == nil ||
-		!strings.Contains(err.Error(), "ingest: зачистка осиротевших партий") ||
-		!strings.Contains(err.Error(), "бд недоступна") {
-		t.Errorf("ошибка = %v, want контекст зачистки и исходная ошибка", err)
+		!strings.Contains(err.Error(), "ingest: purging orphaned") ||
+		!strings.Contains(err.Error(), "db unavailable") {
+		t.Errorf("the error = %v, want the sweep context and the original error", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	canceled := &cleanupFakePool{}
 	if _, err := CleanupStaleBatches(ctx, canceled, time.Now()); !errors.Is(err, context.Canceled) {
-		t.Errorf("ошибка = %v, want context.Canceled", err)
+		t.Errorf("the error = %v, want context.Canceled", err)
 	}
 
 	// An age bound before 1970 — a failure before the DB call: the uint64
@@ -656,15 +656,15 @@ func TestCleanupStaleBatchesErrors(t *testing.T) {
 	// with a positive now).
 	preEpoch := &cleanupFakePool{}
 	if _, err := CleanupStaleBatches(context.Background(), preEpoch, time.Unix(0, 0)); err == nil ||
-		!strings.Contains(err.Error(), "до 1970 года") {
-		t.Errorf("ошибка = %v, want отказ «граница до 1970 года» для эпохи Unix", err)
+		!strings.Contains(err.Error(), "before 1970") {
+		t.Errorf("the error = %v, want the «the age bound is before 1970» rejection for the Unix epoch", err)
 	}
 	if _, err := CleanupStaleBatches(context.Background(), preEpoch, time.Date(1969, 12, 31, 23, 0, 0, 0, time.UTC)); err == nil ||
-		!strings.Contains(err.Error(), "до 1970 года") {
-		t.Errorf("ошибка = %v, want отказ «граница до 1970 года»", err)
+		!strings.Contains(err.Error(), "before 1970") {
+		t.Errorf("the error = %v, want the «the age bound is before 1970» rejection", err)
 	}
 	if len(preEpoch.execCalls) != 0 {
-		t.Errorf("Exec'ы = %v, want нет: отказ до обращения к БД", preEpoch.execCalls)
+		t.Errorf("Execs = %v, want none: the rejection happens before any DB call", preEpoch.execCalls)
 	}
 
 	// A day after the epoch the bound is positive — the cleanup works
@@ -673,14 +673,14 @@ func TestCleanupStaleBatchesErrors(t *testing.T) {
 	now := time.Unix(2*86400+3600, 0) // 1970-01-03 01:00 UTC
 	rows, err := CleanupStaleBatches(context.Background(), epochPlus, now)
 	if err != nil {
-		t.Fatalf("CleanupStaleBatches(эпоха+2 суток): %v", err)
+		t.Fatalf("CleanupStaleBatches(epoch+2 days): %v", err)
 	}
 	if rows != 2 {
-		t.Errorf("удалено строк = %d, want 2", rows)
+		t.Errorf("deleted rows = %d, want 2", rows)
 	}
 	wantArg := batchIDBefore(now.Add(-StaleBatchAge))
 	if want := []any{wantArg[:]}; !reflect.DeepEqual(epochPlus.execCalls[0].args, want) {
-		t.Errorf("граница = %x, want %x", epochPlus.execCalls[0].args[0], want[0])
+		t.Errorf("the boundary = %x, want %x", epochPlus.execCalls[0].args[0], want[0])
 	}
 }
 
@@ -697,12 +697,12 @@ func TestCleanupOptionsDefaults(t *testing.T) {
 
 	set := CleanupOptions{BatchSize: 5, Interval: time.Second}.withDefaults()
 	if set.BatchSize != 5 || set.Interval != time.Second {
-		t.Errorf("withDefaults затирает заданные значения: %+v", set)
+		t.Errorf("withDefaults overwrites the given values: %+v", set)
 	}
 
 	neg := CleanupOptions{BatchSize: -1, Interval: -time.Second}.withDefaults()
 	if !reflect.DeepEqual(neg, want) {
-		t.Errorf("withDefaults(отрицательные) = %+v, want дефолты %+v", neg, want)
+		t.Errorf("withDefaults(negative) = %+v, want the defaults %+v", neg, want)
 	}
 }
 
@@ -725,7 +725,7 @@ func TestCleanupDeletedLoop(t *testing.T) {
 			cleanupRows([]any{int16(1), int64(10)}),
 			cleanupRows(),
 		},
-		selectErrs: []error{nil, errors.New("бд недоступна")},
+		selectErrs: []error{nil, errors.New("db unavailable")},
 		deletes: []*cleanupFakeRows{cleanupRows(
 			[]any{int16(1), int64(10), cleanupHash16(0xaa)},
 			[]any{int16(1), int64(10), make([]byte, 9)}, // poison pill: a Warn, the pass is alive
@@ -734,7 +734,7 @@ func TestCleanupDeletedLoop(t *testing.T) {
 		// then — DELETE 0 (the queue is exhausted).
 		execs: []pipeExec{
 			{tag: pgconn.NewCommandTag("DELETE 5")},
-			{err: errors.New("бд недоступна")},
+			{err: errors.New("db unavailable")},
 		},
 	}
 
@@ -752,19 +752,19 @@ func TestCleanupDeletedLoop(t *testing.T) {
 	for pool.stats().selects < 3 {
 		if time.Now().After(deadline) {
 			cancel()
-			t.Fatalf("цикл не дошёл до третьего прохода: %+v", pool.stats())
+			t.Fatalf("the loop did not reach the third pass: %+v", pool.stats())
 		}
 		time.Sleep(time.Millisecond)
 	}
 	cancel()
 
 	if err := <-done; err != nil {
-		t.Fatalf("CleanupDeleted: %v, want nil при отмене ctx", err)
+		t.Fatalf("CleanupDeleted: %v, want nil on the ctx cancellation", err)
 	}
 
 	st := pool.stats()
 	if st.begins != 1 || st.commits != 1 {
-		t.Errorf("транзакций %d, коммитов %d, want 1 и 1: ошибочный и пустые проходы не открывают", st.begins, st.commits)
+		t.Errorf("transactions %d, commits %d, want 1 and 1: the failed and empty passes open none", st.begins, st.commits)
 	}
 	// Each pass is one staging cleanup; its errors do not interrupt the
 	// passes.
@@ -772,31 +772,31 @@ func TestCleanupDeletedLoop(t *testing.T) {
 	sweeps := len(pool.execCalls)
 	pool.mu.Unlock()
 	if sweeps != st.selects {
-		t.Errorf("зачисток staging = %d, want = проходам цикла (%d)", sweeps, st.selects)
+		t.Errorf("staging sweeps = %d, want = the loop's passes (%d)", sweeps, st.selects)
 	}
 
 	log := buf.String()
 	for _, want := range []string{
-		"фоновая очистка удалённых доменов", // start
-		"проход очистки удалённых доменов",  // the first pass's result
+		"the deleted-domains background cleanup", // start
+		"the deleted-domains cleanup pass",  // the first pass's result
 		"domains=1",                 // pass counters
-		"некорректным content_hash", // poison pill — a Warn (ING-P2-4)
-		"бд недоступна",             // the second pass's error
-		"удалены осиротевшие строки staging", // the cleanup: a Warn with the row count (T-098)
+		"malformed content_hash", // poison pill — a Warn (ING-P2-4)
+		"db unavailable",             // the second pass's error
+		"orphaned staging rows were deleted", // the cleanup: a Warn with the row count (T-098)
 		"rows=5",                               // the cleanup counter
 		"older_than=" + StaleBatchAge.String(), // the age threshold
-		"зачистка осиротевших партий staging", // the cleanup error — a Warn, the loop is alive
+		"purging orphaned staging batches", // the cleanup error — a Warn, the loop is alive
 	} {
 		if !strings.Contains(log, want) {
-			t.Errorf("лог не содержит %q:\n%s", want, log)
+			t.Errorf("the log does not contain %q:\n%s", want, log)
 		}
 	}
 }
 
 func TestCleanupDeletedNilPool(t *testing.T) {
 	err := CleanupDeleted(context.Background(), nil, CleanupOptions{})
-	if err == nil || !strings.Contains(err.Error(), "пул не задан") {
-		t.Errorf("ошибка = %v, want «пул не задан»", err)
+	if err == nil || !strings.Contains(err.Error(), "the pool is not set") {
+		t.Errorf("the error = %v, want «the pool is not set»", err)
 	}
 }
 

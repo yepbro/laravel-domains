@@ -45,24 +45,24 @@ func NewMetrics(reg *metrics.Registry) *Metrics {
 	return &Metrics{
 		tasks: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_stage_tasks_total",
-			Help: "Обработанные задачи этапов конвейера: dns — домены, http — домены, render/analyze — записи субдомен×вариант.",
+			Help: "Pipeline stage tasks processed: dns — domains, http — domains, render/analyze — subdomain×variant rows.",
 		}, metrics.LabelStage).WithLabelValues(metrics.StageAnalyze),
 		seconds: reg.MustHistogram(prometheus.HistogramOpts{
 			Name:    "crawler_stage_seconds",
-			Help:    "Длительность обработки одной задачи этапа (эпизод домена/записи).",
+			Help:    "Duration of processing one stage task (a domain/row episode).",
 			Buckets: analyzeSecondsBuckets,
 		}, metrics.LabelStage).WithLabelValues(metrics.StageAnalyze),
 		unfound: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_analyzer_laravel_unfound_total",
-			Help: "Снятия Laravel-находки переанализом (доставка без fresh, T-187): домен покинул laravel_domains без свежего эпизода HTTP; каждому отвечает точечный дренаж контента домена (content.DrainDomain).",
+			Help: "Laravel finds removed by re-analysis (a delivery without fresh, T-187): the domain left laravel_domains without a fresh HTTP episode; each is answered by the domain content point drain (content.DrainDomain).",
 		}).WithLabelValues(),
 		unfoundRows: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_analyzer_unfound_drained_rows_total",
-			Help: "Строки subdomain_results, очищенные точечным дренажом при снятии находки переанализом (T-187): без дренажа остались бы позади курсора retention до редких catch-up-кругов.",
+			Help: "subdomain_results rows cleaned by the point drain on a find removal by re-analysis (T-187): without the drain they would stay behind the retention cursor until rare catch-up circles.",
 		}).WithLabelValues(),
 		unfoundErrors: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_analyzer_unfound_drain_errors_total",
-			Help: "Неудачи точечного дренажа контента домена (T-187): записи остались позади курсора retention (подберут редкие catch-up-круги T-185 либо перепроверка T-030); рост = разбирать Warn в логе analyzer.",
+			Help: "Domain content point drain failures (T-187): the rows stayed behind the retention cursor (rare T-185 catch-up circles or the T-030 recheck will pick them up); growth = investigate the analyzer Warn in the log.",
 		}).WithLabelValues(),
 	}
 }

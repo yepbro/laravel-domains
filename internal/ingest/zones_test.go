@@ -84,10 +84,10 @@ func TestEnsureZoneExisting(t *testing.T) {
 		t.Fatalf("EnsureZone: %v", err)
 	}
 	if z != existing {
-		t.Errorf("зона = %+v, want существующая %+v", z, existing)
+		t.Errorf("the zone = %+v, want the existing %+v", z, existing)
 	}
 	if want := []string{"byName:com"}; !reflect.DeepEqual(store.calls, want) {
-		t.Errorf("вызовы = %v, want только поиск %v", store.calls, want)
+		t.Errorf("the calls = %v, want the lookup only %v", store.calls, want)
 	}
 }
 
@@ -99,13 +99,13 @@ func TestEnsureZoneCreates(t *testing.T) {
 		t.Fatalf("EnsureZone: %v", err)
 	}
 	if z.Name != "com" || !z.IsActive {
-		t.Errorf("зона = %+v, want name=com, is_active=true (ТЗ 5.1)", z)
+		t.Errorf("the zone = %+v, want name=com, is_active=true (spec 5.1)", z)
 	}
 	if z.NameUnicode != nil {
-		t.Errorf("name_unicode = %v, want nil: ASCII-зона совпадает с name (ТЗ 5.2 п. 7)", *z.NameUnicode)
+		t.Errorf("name_unicode = %v, want nil: an ASCII zone equals name (spec 5.2 item 7)", *z.NameUnicode)
 	}
 	if want := []string{"byName:com", "create:com"}; !reflect.DeepEqual(store.calls, want) {
-		t.Errorf("вызовы = %v, want %v", store.calls, want)
+		t.Errorf("the calls = %v, want %v", store.calls, want)
 	}
 }
 
@@ -117,23 +117,23 @@ func TestEnsureZoneUnicodePunycode(t *testing.T) {
 
 	fromUni, err := EnsureZone(context.Background(), store, "москва")
 	if err != nil {
-		t.Fatalf("unicode-имя: %v", err)
+		t.Fatalf("the unicode name: %v", err)
 	}
 	fromPuny, err := EnsureZone(context.Background(), store, "xn--80adxhks")
 	if err != nil {
-		t.Fatalf("punycode-имя: %v", err)
+		t.Fatalf("the punycode name: %v", err)
 	}
 	if fromUni.ID != fromPuny.ID || fromUni.Name != "xn--80adxhks" {
-		t.Errorf("зоны %d/%s и %d/…: want одна зона xn--80adxhks", fromUni.ID, fromUni.Name, fromPuny.ID)
+		t.Errorf("the zones %d/%s and %d/…: want one zone xn--80adxhks", fromUni.ID, fromUni.Name, fromPuny.ID)
 	}
 	if fromPuny.NameUnicode == nil || *fromPuny.NameUnicode != "москва" {
-		t.Errorf("name_unicode = %v, want «москва» (ТЗ 5.2 п. 7)", fromPuny.NameUnicode)
+		t.Errorf("name_unicode = %v, want «москва» (spec 5.2 item 7)", fromPuny.NameUnicode)
 	}
 	if want := []string{
 		"byName:xn--80adxhks", "create:xn--80adxhks", // the first name — created
 		"byName:xn--80adxhks", // the second — found, without creation
 	}; !reflect.DeepEqual(store.calls, want) {
-		t.Errorf("вызовы = %v, want %v", store.calls, want)
+		t.Errorf("the calls = %v, want %v", store.calls, want)
 	}
 }
 
@@ -165,10 +165,10 @@ func TestEnsureZoneCreateResolvesRace(t *testing.T) {
 		t.Fatalf("EnsureZone: %v", err)
 	}
 	if z.ID != winner.ID {
-		t.Errorf("зона = %+v, want строка конкурента %+v", z, winner)
+		t.Errorf("the zone = %+v, want the concurrent winner's row %+v", z, winner)
 	}
 	if len(store.zones) != 1 {
-		t.Errorf("зон в хранилище = %d, want 1 (без дублей)", len(store.zones))
+		t.Errorf("zones in the store = %d, want 1 (no duplicates)", len(store.zones))
 	}
 }
 
@@ -176,22 +176,22 @@ func TestEnsureZoneStoreErrors(t *testing.T) {
 	ctx := context.Background()
 
 	store := newFakeZoneStore()
-	store.byNameErr = errors.New("бд недоступна")
+	store.byNameErr = errors.New("db unavailable")
 	if _, err := EnsureZone(ctx, store, "com"); err == nil || !errors.Is(err, store.byNameErr) {
-		t.Errorf("ошибка поиска: %v, want обёрнутая «бд недоступна»", err)
+		t.Errorf("the lookup error: %v, want wrapped «db unavailable»", err)
 	}
 	if want := []string{"byName:com"}; !reflect.DeepEqual(store.calls, want) {
-		t.Errorf("вызовы = %v, want только поиск: при ошибке хранилища зона не создаётся", store.calls)
+		t.Errorf("the calls = %v, want the lookup only: on a store error the zone is not created", store.calls)
 	}
 
 	store = newFakeZoneStore()
-	store.createErr = errors.New("бд недоступна")
+	store.createErr = errors.New("db unavailable")
 	_, err := EnsureZone(ctx, store, "com")
 	if err == nil || !errors.Is(err, store.createErr) {
-		t.Fatalf("ошибка создания: %v, want обёрнутая «бд недоступна»", err)
+		t.Fatalf("the creation error: %v, want wrapped «db unavailable»", err)
 	}
-	if !strings.Contains(err.Error(), "ingest: создание зоны com:") {
-		t.Errorf("сообщение = %q, want контекст «ingest: создание зоны com:»", err)
+	if !strings.Contains(err.Error(), "ingest: the zone com creation:") {
+		t.Errorf("the message = %q, want the context «ingest: the zone com creation:»", err)
 	}
 }
 
@@ -199,13 +199,13 @@ func TestEnsureZoneInvalidName(t *testing.T) {
 	store := newFakeZoneStore()
 	_, err := EnsureZone(context.Background(), store, "не%зона")
 	if err == nil {
-		t.Fatal("ожидалась ошибка нормализации")
+		t.Fatal("a normalization error is expected")
 	}
-	if !strings.Contains(err.Error(), "ingest: зона") {
-		t.Errorf("сообщение = %q, want контекст «ingest: зона …»", err)
+	if !strings.Contains(err.Error(), "ingest: the zone") {
+		t.Errorf("the message = %q, want the context «ingest: the zone …»", err)
 	}
 	if len(store.calls) != 0 {
-		t.Errorf("обращений к хранилищу быть не должно, got %v", store.calls)
+		t.Errorf("there must be no store calls, got %v", store.calls)
 	}
 }
 
@@ -249,11 +249,11 @@ func (r *fakeRows) Next() bool {
 
 func (r *fakeRows) Scan(dest ...any) error {
 	if r.closed || r.i == 0 || r.i > len(r.rows) {
-		return errors.New("fakeRows: Scan без Next")
+		return errors.New("fakeRows: Scan without Next")
 	}
 	row := r.rows[r.i-1]
 	if len(dest) != len(row) {
-		return errors.New("fakeRows: число приёмников не равно числу колонок")
+		return errors.New("fakeRows: the destination count does not match the column count")
 	}
 	for i, d := range dest {
 		target := reflect.ValueOf(d).Elem()
@@ -296,11 +296,11 @@ type zoneQuery struct {
 }
 
 func (p *fakeZonePool) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFromSource) (int64, error) {
-	return 0, errors.New("CopyFrom не должен вызываться")
+	return 0, errors.New("CopyFrom must not be called")
 }
 
 func (p *fakeZonePool) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
-	return pgconn.CommandTag{}, errors.New("Exec не должен вызываться")
+	return pgconn.CommandTag{}, errors.New("Exec must not be called")
 }
 
 func (p *fakeZonePool) Query(_ context.Context, sql string, args ...any) (pgx.Rows, error) {
@@ -337,12 +337,12 @@ func TestSQLZoneByName(t *testing.T) {
 		t.Errorf("SQL = %v, want SELECT … WHERE name = $1", pool.queries[0].sql)
 	}
 	if !reflect.DeepEqual(pool.queries[0].args, []any{"com"}) {
-		t.Errorf("аргументы = %v, want [com]", pool.queries[0].args)
+		t.Errorf("the arguments = %v, want [com]", pool.queries[0].args)
 	}
 	if z.ID != 3 || z.Name != "com" || z.NameUnicode != nil || !z.IsActive ||
 		z.DomainsTotal != 10 || z.DomainsChecked != 4 ||
 		z.UpdatedAt == nil || !z.UpdatedAt.Equal(updated) {
-		t.Errorf("зона = %+v, want строка zones как есть", z)
+		t.Errorf("the zone = %+v, want the zones row as-is", z)
 	}
 }
 
@@ -366,7 +366,7 @@ func TestSQLZoneByNameNotFound(t *testing.T) {
 	store := NewZoneStore(pool)
 
 	if _, err := store.ZoneByName(context.Background(), "net"); !errors.Is(err, ErrZoneNotFound) {
-		t.Errorf("ошибка = %v, want ErrZoneNotFound", err)
+		t.Errorf("the error = %v, want ErrZoneNotFound", err)
 	}
 }
 
@@ -385,10 +385,10 @@ func TestSQLCreateZone(t *testing.T) {
 		t.Errorf("SQL = %v, want INSERT … ON CONFLICT DO NOTHING RETURNING …", pool.queries[0].sql)
 	}
 	if !reflect.DeepEqual(pool.queries[0].args, []any{"xn--80adxhks", &uni}) {
-		t.Errorf("аргументы = %v, want [xn--80adxhks, &москва]", pool.queries[0].args)
+		t.Errorf("the arguments = %v, want [xn--80adxhks, &москва]", pool.queries[0].args)
 	}
 	if z.ID != 5 || !z.IsActive || z.NameUnicode == nil || *z.NameUnicode != uni {
-		t.Errorf("зона = %+v, want созданная строка", z)
+		t.Errorf("the zone = %+v, want the created row", z)
 	}
 }
 
@@ -407,33 +407,33 @@ func TestSQLCreateZoneConflict(t *testing.T) {
 		t.Fatalf("CreateZone: %v", err)
 	}
 	if z.ID != 5 || z.Name != "xn--p1ai" {
-		t.Errorf("зона = %+v, want строка конкурента", z)
+		t.Errorf("the zone = %+v, want the concurrent winner's row", z)
 	}
 	if len(pool.queries) != 2 {
-		t.Fatalf("запросов = %d, want 2 (INSERT + повторный SELECT)", len(pool.queries))
+		t.Fatalf("queries = %d, want 2 (an INSERT + a repeated SELECT)", len(pool.queries))
 	}
 	if pool.queries[0].sql != wantZoneInsert {
-		t.Errorf("первый SQL = %s, want INSERT", pool.queries[0].sql)
+		t.Errorf("the first SQL = %s, want an INSERT", pool.queries[0].sql)
 	}
 	if pool.queries[1].sql != wantZoneSelect {
-		t.Errorf("второй SQL = %s, want повторный SELECT", pool.queries[1].sql)
+		t.Errorf("the second SQL = %s, want a repeated SELECT", pool.queries[1].sql)
 	}
 	if !reflect.DeepEqual(pool.queries[1].args, []any{"xn--p1ai"}) {
-		t.Errorf("аргументы SELECT = %v, want [xn--p1ai]", pool.queries[1].args)
+		t.Errorf("the SELECT arguments = %v, want [xn--p1ai]", pool.queries[1].args)
 	}
 }
 
 func TestSQLZoneQueryError(t *testing.T) {
-	pool := &fakeZonePool{err: errors.New("соединение закрыто")}
+	pool := &fakeZonePool{err: errors.New("the connection is closed")}
 	store := NewZoneStore(pool)
 
 	if _, err := store.ZoneByName(context.Background(), "com"); err == nil ||
-		!strings.Contains(err.Error(), "db: zones: поиск зоны com:") || !strings.Contains(err.Error(), "соединение закрыто") {
-		t.Errorf("ошибка = %v, want обёрнутая «db: zones: поиск зоны com: … соединение закрыто»", err)
+		!strings.Contains(err.Error(), "db: zones: the zone com lookup:") || !strings.Contains(err.Error(), "the connection is closed") {
+		t.Errorf("the error = %v, want wrapped «db: zones: the zone com lookup: … the connection is closed»", err)
 	}
 	if _, err := store.CreateZone(context.Background(), "com", nil); err == nil ||
-		!strings.Contains(err.Error(), "db: zones: создание зоны com:") {
-		t.Errorf("ошибка = %v, want обёрнутая «db: zones: создание зоны com: …»", err)
+		!strings.Contains(err.Error(), "db: zones: the zone com creation:") {
+		t.Errorf("the error = %v, want wrapped «db: zones: the zone com creation: …»", err)
 	}
 }
 

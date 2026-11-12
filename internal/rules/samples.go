@@ -94,7 +94,7 @@ func loadSample(dir, id string) (Sample, error) {
 	if raw, err := os.ReadFile(filepath.Join(dir, "index.html")); err == nil {
 		s.HTML = raw
 	} else {
-		return s, fmt.Errorf("samples/%s: нет index.html", id)
+		return s, fmt.Errorf("samples/%s: no index.html", id)
 	}
 
 	if raw, err := os.ReadFile(filepath.Join(dir, "headers.json")); err == nil {
@@ -146,7 +146,7 @@ func loadSample(dir, id string) (Sample, error) {
 			Source:     m.Source,
 		}
 	} else {
-		return s, fmt.Errorf("samples/%s: нет meta.yaml", id)
+		return s, fmt.Errorf("samples/%s: no meta.yaml", id)
 	}
 
 	return s, nil

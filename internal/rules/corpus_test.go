@@ -50,11 +50,11 @@ const (
 func corpusSet(t *testing.T) *Set {
 	t.Helper()
 	if _, err := os.Stat(corpusRulesDir); err != nil {
-		t.Skipf("набор правил недоступен: %v", err)
+		t.Skipf("the rule set is unavailable: %v", err)
 	}
 	set, err := LoadDir(corpusRulesDir)
 	if err != nil {
-		t.Fatalf("набор правил не загружается: %v", err)
+		t.Fatalf("the rule set does not load: %v", err)
 	}
 	return set
 }
@@ -63,11 +63,11 @@ func corpusSet(t *testing.T) *Set {
 func corpusSamples(t *testing.T) []Sample {
 	t.Helper()
 	if _, err := os.Stat(corpusSamplesDir); err != nil {
-		t.Skipf("корпус образцов недоступен: %v", err)
+		t.Skipf("the sample corpus is unavailable: %v", err)
 	}
 	samples, err := LoadSamples(corpusSamplesDir)
 	if err != nil {
-		t.Fatalf("корпус не загружается: %v", err)
+		t.Fatalf("the corpus does not load: %v", err)
 	}
 	return samples
 }
@@ -80,7 +80,7 @@ func corpusSampleByID(t *testing.T, id string) Sample {
 			return s
 		}
 	}
-	t.Fatalf("образец %s отсутствует в корпусе", id)
+	t.Fatalf("the sample %s is missing from the corpus", id)
 	return Sample{}
 }
 
@@ -136,13 +136,13 @@ func TestCorpusSamplesFullHistory(t *testing.T) {
 	var positives, negatives, weakNegatives int
 	for _, s := range samples {
 		if s.Expect.IsLaravel == nil {
-			t.Fatalf("samples/%s/meta.yaml: нужно ожидание is_laravel", s.ID)
+			t.Fatalf("samples/%s/meta.yaml: an is_laravel expectation is needed", s.ID)
 		}
 		if s.Expect.Score == nil || s.Expect.CalcVerMin == nil || s.Expect.CalcVerMax == nil {
-			t.Fatalf("samples/%s/meta.yaml: нужны точные ожидания движка score/calc_ver_min/calc_ver_max", s.ID)
+			t.Fatalf("samples/%s/meta.yaml: exact engine expectations score/calc_ver_min/calc_ver_max are needed", s.ID)
 		}
 		if s.Expect.Rules == nil {
-			t.Fatalf("samples/%s/meta.yaml: нужен полный состав сработавших правил (rules)", s.ID)
+			t.Fatalf("samples/%s/meta.yaml: the full set of fired rules (rules) is needed", s.ID)
 		}
 		if *s.Expect.IsLaravel {
 			positives++
@@ -154,7 +154,7 @@ func TestCorpusSamplesFullHistory(t *testing.T) {
 		}
 	}
 	if positives < 5 || negatives < 4 || weakNegatives < 1 {
-		t.Fatalf("корпус подозрительно мал: позитивных %d (нужно >=5), негативных %d (нужно >=4), из них со слабыми срабатываниями %d (нужно >=1)",
+		t.Fatalf("the corpus is suspiciously small: positives %d (need >=5), negatives %d (need >=4), among them weak hits %d (need >=1)",
 			positives, negatives, weakNegatives)
 	}
 
@@ -164,12 +164,12 @@ func TestCorpusSamplesFullHistory(t *testing.T) {
 
 			// Contents: complete and exact.
 			if fired := corpusFired(res); !slices.Equal(fired, corpusSortedIDs(s.Expect.Rules)) {
-				t.Errorf("сработали %v, в meta.yaml %v", fired, s.Expect.Rules)
+				t.Errorf("fired %v, in meta.yaml %v", fired, s.Expect.Rules)
 			}
 
 			// Score — an exact expectation (± corpusScoreTol).
 			if d := diff(res.Score, *s.Expect.Score); d > corpusScoreTol {
-				t.Errorf("score = %.6f, в meta.yaml %.3f (расхождение %.6f > %g)",
+				t.Errorf("score = %.6f, in meta.yaml %.3f (the drift %.6f > %g)",
 					res.Score, *s.Expect.Score, d, corpusScoreTol)
 			}
 
@@ -177,31 +177,31 @@ func TestCorpusSamplesFullHistory(t *testing.T) {
 			// outcome EvaluateCtx assembled.
 			score2, verMin2, verMax2, conflict2 := ScoreRules(corpusMatchedRules(t, set, res))
 			if score2 != res.Score || verMin2 != res.VerMin || verMax2 != res.VerMax || conflict2 != res.Conflict {
-				t.Errorf("ScoreRules не сходится с EvaluateCtx: (%v, %q, %q, %v) против (%v, %q, %q, %v)",
+				t.Errorf("ScoreRules does not agree with EvaluateCtx: (%v, %q, %q, %v) against (%v, %q, %q, %v)",
 					score2, verMin2, verMax2, conflict2, res.Score, res.VerMin, res.VerMax, res.Conflict)
 			}
 
 			// The version range — the exact boundary strings from the rules
 			// ("" — no boundary; written to the DB as NULL).
 			if res.VerMin != *s.Expect.CalcVerMin || res.VerMax != *s.Expect.CalcVerMax {
-				t.Errorf("диапазон = [%q..%q], в meta.yaml [%q..%q]",
+				t.Errorf("the range = [%q..%q], in meta.yaml [%q..%q]",
 					res.VerMin, res.VerMax, *s.Expect.CalcVerMin, *s.Expect.CalcVerMax)
 			}
 			if res.Conflict != s.Expect.Conflict {
-				t.Errorf("conflict = %v, в meta.yaml %v", res.Conflict, s.Expect.Conflict)
+				t.Errorf("conflict = %v, in meta.yaml %v", res.Conflict, s.Expect.Conflict)
 			}
 			if res.Conflict && (res.VerMin != "" || res.VerMax != "") {
-				t.Errorf("при конфликте диапазон неопределён (обе границы NULL), got [%q..%q]", res.VerMin, res.VerMax)
+				t.Errorf("on a conflict the range is undefined (both bounds NULL), got [%q..%q]", res.VerMin, res.VerMax)
 			}
 
 			// The is_laravel threshold (spec §13.1: 0.6); a zero threshold
 			// must substitute the same default.
 			if got := res.IsLaravel(DefaultMinScore); got != *s.Expect.IsLaravel {
-				t.Errorf("IsLaravel(0.6) = %v (score %.3f), в meta.yaml %v",
+				t.Errorf("IsLaravel(0.6) = %v (score %.3f), in meta.yaml %v",
 					got, res.Score, *s.Expect.IsLaravel)
 			}
 			if res.IsLaravel(0) != res.IsLaravel(DefaultMinScore) {
-				t.Error("нулевой порог должен подставлять DefaultMinScore")
+				t.Error("a zero threshold must substitute DefaultMinScore")
 			}
 		})
 	}
@@ -228,16 +228,16 @@ func TestCorpusJSONAPIEmptyHTML(t *testing.T) {
 		"cookie_xsrf_token",
 	}
 	if fired := corpusFired(res); !slices.Equal(fired, want) {
-		t.Fatalf("сработали %v, ожидались только куки %v", fired, want)
+		t.Fatalf("fired %v, want the cookies only %v", fired, want)
 	}
 	if wantScore := ScoreFixed([]float64{0.5, 0.35, 0.15, 0.25}); diff(res.Score, wantScore) > 1e-9 {
-		t.Errorf("score = %v, want %v (куки без JSON-признака)", res.Score, wantScore)
+		t.Errorf("score = %v, want %v (cookies without the JSON sign)", res.Score, wantScore)
 	}
 	if !res.IsLaravel(DefaultMinScore) {
-		t.Errorf("куки одни дают уверенное срабатывание: score %.3f ≥ 0.6", res.Score)
+		t.Errorf("the cookies alone give a confident hit: score %.3f ≥ 0.6", res.Score)
 	}
 	if res.VerMin != "" || res.VerMax != "" || res.Conflict {
-		t.Errorf("диапазон без версионных правил должен быть пуст: [%q..%q] conflict=%v",
+		t.Errorf("the range without versioned rules must be empty: [%q..%q] conflict=%v",
 			res.VerMin, res.VerMax, res.Conflict)
 	}
 }
@@ -258,13 +258,13 @@ func TestCorpusJSONMessageKey(t *testing.T) {
 	} {
 		res := set.EvaluateCtx(context.Background(), Page{HTML: []byte(body)}, DefaultLimits())
 		if fired := corpusFired(res); !slices.Equal(fired, []string{"json_message_key"}) {
-			t.Errorf("тело %q: сработали %v, хочу ровно json_message_key (без дублей)", body, fired)
+			t.Errorf("the body %q: fired %v, want exactly json_message_key (no duplicates)", body, fired)
 		}
 		if res.Score != 0.25 {
-			t.Errorf("тело %q: score = %v, want 0.25", body, res.Score)
+			t.Errorf("the body %q: score = %v, want 0.25", body, res.Score)
 		}
 		if res.IsLaravel(DefaultMinScore) {
-			t.Errorf("тело %q: одиночное правило 0.25 не должно достигать порога %.2f", body, DefaultMinScore)
+			t.Errorf("the body %q: a single 0.25 rule must not reach the threshold %.2f", body, DefaultMinScore)
 		}
 	}
 
@@ -278,7 +278,7 @@ func TestCorpusJSONMessageKey(t *testing.T) {
 	} {
 		res := set.EvaluateCtx(context.Background(), Page{HTML: []byte(body)}, DefaultLimits())
 		if len(res.Signals) != 0 {
-			t.Errorf("тело %.40q…: неожиданные срабатывания %v", body, corpusFired(res))
+			t.Errorf("the body %.40q…: unexpected hits %v", body, corpusFired(res))
 		}
 	}
 
@@ -288,7 +288,7 @@ func TestCorpusJSONMessageKey(t *testing.T) {
 	nest := set.EvaluateCtx(context.Background(),
 		Page{HTML: []byte(`{"message":"Cannot GET /"}`)}, DefaultLimits())
 	if nest.IsLaravel(DefaultMinScore) || nest.Score != 0.25 {
-		t.Errorf("NestJS-ответ: score %.3f — одиночное правило ниже порога, не Laravel", nest.Score)
+		t.Errorf("the NestJS response: score %.3f — a single rule below the threshold, not Laravel", nest.Score)
 	}
 }
 
@@ -315,13 +315,13 @@ func TestCorpusCMSSession(t *testing.T) {
 		res := set.EvaluateCtx(context.Background(), corpusSampleByID(t, id).Page(), DefaultLimits())
 		want := []string{"cookie_cms_session", "cookie_encrypted_payload", "cookie_session_suffix"}
 		if fired := corpusFired(res); !slices.Equal(fired, want) {
-			t.Errorf("%s: сработали %v, ожидались %v", id, fired, want)
+			t.Errorf("%s: fired %v, expected %v", id, fired, want)
 		}
 		if wantScore := ScoreFixed([]float64{0.35, 0.15, 0.5}); diff(res.Score, wantScore) > 1e-9 {
 			t.Errorf("%s: score = %v, want %v (0.35+0.15+0.5)", id, res.Score, wantScore)
 		}
 		if !res.IsLaravel(DefaultMinScore) {
-			t.Errorf("%s: score %.3f ≥ порога — пропуск T-134 закрыт", id, res.Score)
+			t.Errorf("%s: score %.3f ≥ the threshold — the T-134 gap is closed", id, res.Score)
 		}
 	}
 
@@ -339,7 +339,7 @@ func TestCorpusCMSSession(t *testing.T) {
 		"__Secure-october_session", "__Host-winter_session", "__Secure-bagisto_session",
 	} {
 		if !fires(name) {
-			t.Errorf("кука %s: правило cookie_cms_session должно срабатывать", name)
+			t.Errorf("the cookie %s: the cookie_cms_session rule must fire", name)
 		}
 	}
 	// No match: no confirmed names (botble/pyrocms/asgard — the contents
@@ -355,7 +355,7 @@ func TestCorpusCMSSession(t *testing.T) {
 		"__secure-october_session", // the prefix is case-sensitive (RFC 6265bis)
 	} {
 		if fires(name) {
-			t.Errorf("кука %s: правило cookie_cms_session срабатывать не должно", name)
+			t.Errorf("the cookie %s: the cookie_cms_session rule must not fire", name)
 		}
 	}
 
@@ -364,7 +364,7 @@ func TestCorpusCMSSession(t *testing.T) {
 	res := set.EvaluateCtx(context.Background(),
 		Page{Cookies: []Cookie{{Name: "laravel_session", Value: "plain"}}}, DefaultLimits())
 	if fired := corpusFired(res); !slices.Equal(fired, []string{"cookie_laravel_session", "cookie_session_suffix"}) {
-		t.Errorf("laravel_session: сработали %v, ожидались cookie_laravel_session и cookie_session_suffix", fired)
+		t.Errorf("laravel_session: fired %v, expected cookie_laravel_session and cookie_session_suffix", fired)
 	}
 
 	// The *_session suffix with prefixes: __Secure-myapp_session (an
@@ -374,10 +374,10 @@ func TestCorpusCMSSession(t *testing.T) {
 	res = set.EvaluateCtx(context.Background(),
 		Page{Cookies: []Cookie{{Name: "__Secure-myapp_session", Value: "plain"}}}, DefaultLimits())
 	if fired := corpusFired(res); !slices.Equal(fired, []string{"cookie_session_suffix"}) {
-		t.Errorf("__Secure-myapp_session: сработали %v, ожидался только cookie_session_suffix", fired)
+		t.Errorf("__Secure-myapp_session: fired %v, expected the cookie_session_suffix only", fired)
 	}
 	if diff(res.Score, 0.15) > 1e-9 || res.IsLaravel(DefaultMinScore) {
-		t.Errorf("__Secure-myapp_session: score %.3f — суффикс один ниже порога", res.Score)
+		t.Errorf("__Secure-myapp_session: score %.3f — the suffix alone is below the threshold", res.Score)
 	}
 
 	// The gray zone (the T-115 control: the new pairs add no noise):
@@ -393,15 +393,15 @@ func TestCorpusCMSSession(t *testing.T) {
 	res = set.EvaluateCtx(context.Background(),
 		Page{Cookies: []Cookie{{Name: "october_session", Value: "plain"}}}, DefaultLimits())
 	if want := 1 - 0.65*0.85; diff(res.Score, want) > 1e-9 || res.IsLaravel(DefaultMinScore) {
-		t.Errorf("CMS-имя без конверта: score %.4f, want %v, ниже порога", res.Score, want)
+		t.Errorf("a CMS name without the envelope: score %.4f, want %v, below the threshold", res.Score, want)
 	}
 	res = set.EvaluateCtx(context.Background(),
 		Page{Cookies: []Cookie{{Name: "ci_session", Value: "eyJpdiI6Y2k6MTY6e30="}}}, DefaultLimits())
 	if fired := corpusFired(res); !slices.Equal(fired, []string{"cookie_encrypted_payload", "cookie_session_suffix"}) {
-		t.Fatalf("ci_session с конвертом: сработали %v, ожидались cookie_encrypted_payload и cookie_session_suffix", fired)
+		t.Fatalf("ci_session with the envelope: fired %v, expected cookie_encrypted_payload and cookie_session_suffix", fired)
 	}
 	if want := 1 - 0.85*0.5; diff(res.Score, want) > 1e-9 || res.IsLaravel(DefaultMinScore) {
-		t.Errorf("ci_session с конвертом: score %.4f, want %v — ниже порога", res.Score, want)
+		t.Errorf("ci_session with the envelope: score %.4f, want %v — below the threshold", res.Score, want)
 	}
 }
 
@@ -420,16 +420,16 @@ func TestCorpusNegativesWeakSignals(t *testing.T) {
 			res := set.EvaluateCtx(context.Background(), s.Page(), DefaultLimits())
 
 			if res.IsLaravel(DefaultMinScore) {
-				t.Fatalf("ложноположительное срабатывание: score %.3f ≥ порога %.2f", res.Score, DefaultMinScore)
+				t.Fatalf("a false-positive hit: score %.3f ≥ the threshold %.2f", res.Score, DefaultMinScore)
 			}
 			if s.Expect.Score == nil {
-				t.Fatal("нет ожидания score")
+				t.Fatal("no score expectation")
 			}
 			if d := diff(res.Score, *s.Expect.Score); d > corpusScoreTol {
-				t.Errorf("score = %.6f, в meta.yaml %.3f (расхождение %.6f)", res.Score, *s.Expect.Score, d)
+				t.Errorf("score = %.6f, in meta.yaml %.3f (the drift %.6f)", res.Score, *s.Expect.Score, d)
 			}
 			if fired := corpusFired(res); !slices.Equal(fired, corpusSortedIDs(s.Expect.Rules)) {
-				t.Errorf("сработали %v, в meta.yaml %v", fired, s.Expect.Rules)
+				t.Errorf("fired %v, in meta.yaml %v", fired, s.Expect.Rules)
 			}
 
 			// Why below the threshold: every individual sign is weak — no
@@ -440,7 +440,7 @@ func TestCorpusNegativesWeakSignals(t *testing.T) {
 			// hit lands in laravel_findings but not in laravel_domains.
 			for _, ev := range res.Signals {
 				if ev.Weight >= DefaultMinScore {
-					t.Errorf("правило %s одним весом %.2f достигает порога: для похожего не-Laravel признака вес завышен",
+					t.Errorf("the rule %s reaches the threshold with the single weight %.2f: for a similar non-Laravel sign the weight is too high",
 						ev.Rule, ev.Weight)
 				}
 			}
@@ -460,13 +460,13 @@ func TestCorpusNegativesWeakSignals(t *testing.T) {
 			weights[ev.Rule] = ev.Weight
 		}
 		if len(weights) != 2 || weights["meta_csrf_token"] != 0.2 || weights["cookie_session_suffix"] != 0.15 {
-			t.Fatalf("сработали %v, ожидались meta_csrf_token (0.2) и cookie_session_suffix (0.15)", weights)
+			t.Fatalf("fired %v, expected meta_csrf_token (0.2) and cookie_session_suffix (0.15)", weights)
 		}
 		if want := 1 - (1-0.2)*(1-0.15); diff(res.Score, want) > 1e-9 {
 			t.Errorf("score = %v, want %v", res.Score, want)
 		}
 		if res.IsLaravel(DefaultMinScore) {
-			t.Errorf("score %.3f не должен достигать порога %.2f", res.Score, DefaultMinScore)
+			t.Errorf("score %.3f must not reach the threshold %.2f", res.Score, DefaultMinScore)
 		}
 	})
 }
@@ -517,17 +517,17 @@ rules:
 			remain *= 0.8
 		}
 		if want := 1 - remain; diff(res.Score, want) > 1e-9 {
-			t.Errorf("%d маркера: score = %v, want %v", n, res.Score, want)
+			t.Errorf("%d markers: score = %v, want %v", n, res.Score, want)
 		}
 		if got := res.IsLaravel(DefaultMinScore); got != (n == 5) {
-			t.Errorf("%d маркера: IsLaravel = %v (score %.4f)", n, got, res.Score)
+			t.Errorf("%d markers: IsLaravel = %v (score %.4f)", n, got, res.Score)
 		}
 	}
 	// The accumulation exceeds any single component but stays below one.
 	five := set.EvaluateCtx(context.Background(),
 		Page{HTML: []byte("MARK1 MARK2 MARK3 MARK4 MARK5")}, DefaultLimits())
 	if five.Score <= 0.2 || five.Score >= 1 {
-		t.Errorf("накопление пяти по 0.2 вне (0.2, 1): %v", five.Score)
+		t.Errorf("the accumulation of five 0.2s outside (0.2, 1): %v", five.Score)
 	}
 
 	// A single weight: the score equals the weight (a tolerance for the operation order).
@@ -535,7 +535,7 @@ rules:
 		set := evalSet(t, fmt.Sprintf("rules:\n  - id: solo\n    target: html\n    regex: MARK\n    weight: %v\n", w))
 		res := set.EvaluateCtx(context.Background(), Page{HTML: []byte("MARK")}, DefaultLimits())
 		if diff(res.Score, w) > 1e-9 {
-			t.Errorf("одиночный вес %v: score = %v", w, res.Score)
+			t.Errorf("a single weight %v: score = %v", w, res.Score)
 		}
 	}
 
@@ -545,10 +545,10 @@ rules:
 	set = evalSet(t, "rules:\n  - id: edge\n    target: html\n    regex: MARK\n    weight: 0.6\n")
 	res := set.EvaluateCtx(context.Background(), Page{HTML: []byte("MARK")}, DefaultLimits())
 	if diff(res.Score, 0.6) > 1e-12 {
-		t.Fatalf("вес 0.6: score = %.17g, want ровно 0.6", res.Score)
+		t.Fatalf("the weight 0.6: score = %.17g, want exactly 0.6", res.Score)
 	}
 	if !res.IsLaravel(DefaultMinScore) {
-		t.Error("score ровно на пороге: нестрогое ≥ должно давать is_laravel")
+		t.Error("the score exactly at the threshold: the non-strict ≥ must give is_laravel")
 	}
 
 	// The real pair cookie_xsrf_token (0.25) + cookie_encrypted_payload
@@ -574,7 +574,7 @@ rules:
 		t.Errorf("score = %v, want %v", res.Score, want)
 	}
 	if !res.IsLaravel(DefaultMinScore) {
-		t.Errorf("score %.4f обязан достигать порога %v (T-116: stateless API)", res.Score, DefaultMinScore)
+		t.Errorf("score %.4f must reach the threshold %v (T-116: a stateless API)", res.Score, DefaultMinScore)
 	}
 
 	// The weakening did not bring in noisy pairs (a T-116 check by the gray
@@ -606,21 +606,21 @@ rules:
 	}
 	res = set.EvaluateCtx(context.Background(), ciPage, DefaultLimits())
 	if want := 1 - 0.85*0.8*0.75; diff(res.Score, want) > 1e-9 {
-		t.Errorf("score шумовой тройки = %v, want %v", res.Score, want)
+		t.Errorf("the noise trio's score = %v, want %v", res.Score, want)
 	}
 	if res.IsLaravel(DefaultMinScore) {
-		t.Errorf("шумовая тройка без шифрованной куки: %.4f не должна достигать порога", res.Score)
+		t.Errorf("the noise trio without the encrypted cookie: %.4f must not reach the threshold", res.Score)
 	}
 	ciPage.Cookies[0].Name = "__Secure-ci_session"
 	res = set.EvaluateCtx(context.Background(), ciPage, DefaultLimits())
 	if want := 1 - 0.85*0.8*0.75; diff(res.Score, want) > 1e-9 {
-		t.Errorf("score тройки с __Secure-ci_session = %v, want %v (префикс вес не меняет)", res.Score, want)
+		t.Errorf("the trio with __Secure-ci_session's score = %v, want %v (the prefix does not change the weight)", res.Score, want)
 	}
 
 	// Weight 1 — a confident sign closes the score up to one.
 	set = evalSet(t, "rules:\n  - id: sure\n    target: html\n    regex: MARK\n    weight: 1\n")
 	if res := set.EvaluateCtx(context.Background(), Page{HTML: []byte("MARK")}, DefaultLimits()); res.Score != 1 {
-		t.Errorf("вес 1: score = %v, want 1", res.Score)
+		t.Errorf("the weight 1: score = %v, want 1", res.Score)
 	}
 }
 
@@ -638,7 +638,7 @@ func TestCorpusVersionRanges(t *testing.T) {
 		conflict         bool
 	}{
 		{
-			name: "пересечение: нижняя = max(ver_min), верхняя = min(ver_max)",
+			name: "the intersection: the lower = max(ver_min), the upper = min(ver_max)",
 			body: `
 rules:
   - id: a_welcome
@@ -668,7 +668,7 @@ rules:
 			conflict: false,
 		},
 		{
-			name: "равные границы в разной записи — диапазон из одной версии, не конфликт",
+			name: "equal bounds in a different notation — a single-version range, not a conflict",
 			body: `
 rules:
   - id: a_low
@@ -688,7 +688,7 @@ rules:
 			conflict: false,
 		},
 		{
-			name: "строки границ сохраняются из правил как есть",
+			name: "the bound strings are kept from the rules as-is",
 			body: `
 rules:
   - id: a_new
@@ -713,7 +713,7 @@ rules:
 			res := evalSet(t, c.body).EvaluateCtx(context.Background(),
 				Page{HTML: []byte(c.page)}, DefaultLimits())
 			if res.VerMin != c.wantMin || res.VerMax != c.wantMax || res.Conflict != c.conflict {
-				t.Errorf("диапазон = [%q..%q] conflict=%v, want [%q..%q] conflict=%v",
+				t.Errorf("the range = [%q..%q] conflict=%v, want [%q..%q] conflict=%v",
 					res.VerMin, res.VerMax, res.Conflict, c.wantMin, c.wantMax, c.conflict)
 			}
 		})
@@ -724,7 +724,7 @@ rules:
 	// the range is reset (both boundaries NULL), but the score is computed
 	// over all hits and the confident detection stays confident: a version
 	// conflict is not a "Laravel / not Laravel" conflict.
-	t.Run("конфликт: [10,∞) ∩ (−∞,9.x] — диапазон сброшен, порог в силе", func(t *testing.T) {
+	t.Run("a conflict: [10,∞) ∩ (−∞,9.x] — the range is reset, the threshold holds", func(t *testing.T) {
 		set := evalSet(t, `
 rules:
   - id: a_new
@@ -741,26 +741,26 @@ rules:
 		res := set.EvaluateCtx(context.Background(),
 			Page{HTML: []byte("NEW OLD")}, DefaultLimits())
 		if !res.Conflict {
-			t.Fatal("ожидался конфликт диапазонов")
+			t.Fatal("a range conflict was expected")
 		}
 		if res.VerMin != "" || res.VerMax != "" {
-			t.Errorf("при конфликте границы сбрасываются, got [%q..%q]", res.VerMin, res.VerMax)
+			t.Errorf("on a conflict the bounds are reset, got [%q..%q]", res.VerMin, res.VerMax)
 		}
 		if len(res.Signals) != 2 {
-			t.Errorf("оба срабатывания сохраняются (в laravel_findings пишутся все), got %d", len(res.Signals))
+			t.Errorf("both hits are kept (all are written to laravel_findings), got %d", len(res.Signals))
 		}
 		if want := 1 - 0.55*0.5; diff(res.Score, want) > 1e-9 {
-			t.Errorf("score = %v, want %v (конфликт не меняет score)", res.Score, want)
+			t.Errorf("score = %v, want %v (a conflict does not change the score)", res.Score, want)
 		}
 		if !res.IsLaravel(DefaultMinScore) {
-			t.Errorf("score %.3f ≥ порога: конфликт версий не отменяет детекцию", res.Score)
+			t.Errorf("score %.3f ≥ the threshold: a version conflict does not cancel the detection", res.Score)
 		}
 	})
 
 	// A conflict on the production set: a Laravel 12 page with inherited
 	// classic welcome markup — Vite (≥9.19) and welcome_classic (≤7.x)
 	// cannot coexist in any version.
-	t.Run("рабочий набор: vite (≥9.19) + welcome_classic (≤7.x) — конфликт", func(t *testing.T) {
+	t.Run("the production set: vite (≥9.19) + welcome_classic (≤7.x) — a conflict", func(t *testing.T) {
 		set := corpusSet(t)
 		res := set.EvaluateCtx(context.Background(), Page{HTML: []byte(`<!DOCTYPE html>
 <html><head>
@@ -774,19 +774,19 @@ rules:
 </body></html>`)}, DefaultLimits())
 		if fired := corpusFired(res); !slices.Equal(fired,
 			[]string{"laravel_docs_link", "vite_assets", "welcome_classic"}) {
-			t.Fatalf("сработали %v, ожидались laravel_docs_link, vite_assets, welcome_classic", fired)
+			t.Fatalf("fired %v, expected laravel_docs_link, vite_assets, welcome_classic", fired)
 		}
 		if !res.Conflict {
-			t.Fatal("ожидался конфликт: [9.19,∞) ∩ [5.3,7.x] пусто")
+			t.Fatal("a conflict was expected: [9.19,∞) ∩ [5.3,7.x] is empty")
 		}
 		if res.VerMin != "" || res.VerMax != "" {
-			t.Errorf("при конфликте границы сбрасываются, got [%q..%q]", res.VerMin, res.VerMax)
+			t.Errorf("on a conflict the bounds are reset, got [%q..%q]", res.VerMin, res.VerMax)
 		}
 		if want := 1 - 0.7*0.8*0.55; diff(res.Score, want) > 1e-9 {
 			t.Errorf("score = %v, want %v", res.Score, want)
 		}
 		if !res.IsLaravel(DefaultMinScore) {
-			t.Errorf("score %.3f ≥ порога несмотря на конфликт диапазона", res.Score)
+			t.Errorf("score %.3f ≥ the threshold despite the range conflict", res.Score)
 		}
 	})
 }
@@ -800,7 +800,7 @@ func TestCorpusHTMLTailLimit(t *testing.T) {
 	// DefaultLimits().MaxHTMLBytes and do not hit; cookies are not touched
 	// by the HTML limit — they are enough for the threshold
 	// (0.772 ≥ 0.6), is_laravel is preserved.
-	t.Run("образец с хвостом за 2 MiB: HTML-признаки не видны, куки работают", func(t *testing.T) {
+	t.Run("a sample with a tail beyond 2 MiB: the HTML signs are invisible, the cookies work", func(t *testing.T) {
 		set := corpusSet(t)
 		page := corpusSampleByID(t, "laravel-11-vite").Page()
 		padded := make([]byte, DefaultLimits().MaxHTMLBytes+len(page.HTML))
@@ -816,20 +816,20 @@ func TestCorpusHTMLTailLimit(t *testing.T) {
 			"cookie_xsrf_token",
 		}
 		if fired := corpusFired(res); !slices.Equal(fired, want) {
-			t.Fatalf("сработали %v, ожидались только куки %v", fired, want)
+			t.Fatalf("fired %v, want the cookies only %v", fired, want)
 		}
 		if wantScore := ScoreFixed([]float64{0.5, 0.35, 0.15, 0.25}); diff(res.Score, wantScore) > 1e-9 {
 			t.Errorf("score = %v, want %v", res.Score, wantScore)
 		}
 		if !res.IsLaravel(DefaultMinScore) {
-			t.Errorf("куки дают уверенное срабатывание даже с обрезанным HTML: %.3f", res.Score)
+			t.Errorf("the cookies give a confident hit even with truncated HTML: %.3f", res.Score)
 		}
 	})
 
 	// The truncation boundary byte by byte: a sign whose last byte is
 	// exactly at the limit is still visible; one byte further — it is not.
 	// The sign weight of 0.6 — the truncation directly decides is_laravel.
-	t.Run("маркер на границе лимита", func(t *testing.T) {
+	t.Run("a marker at the limit boundary", func(t *testing.T) {
 		set := evalSet(t, "rules:\n  - id: needle\n    target: html\n    regex: NEEDLE\n    weight: 0.6\n")
 		lim := DefaultLimits()
 		lim.MaxHTMLBytes = 100
@@ -838,14 +838,14 @@ func TestCorpusHTMLTailLimit(t *testing.T) {
 		in := append([]byte(strings.Repeat(" ", 100-6)), []byte("NEEDLE")...)
 		res := set.EvaluateCtx(context.Background(), Page{HTML: in}, lim)
 		if len(res.Signals) != 1 || !res.IsLaravel(DefaultMinScore) {
-			t.Errorf("признак целиком в пределах лимита должен срабатывать: %+v", res)
+			t.Errorf("a sign entirely within the limit must fire: %+v", res)
 		}
 
 		// NEEDLE's trailing byte beyond the limit — no match.
 		out := append([]byte(strings.Repeat(" ", 101-6)), []byte("NEEDLE")...)
 		res = set.EvaluateCtx(context.Background(), Page{HTML: out}, lim)
 		if len(res.Signals) != 0 || res.Score != 0 || res.IsLaravel(DefaultMinScore) {
-			t.Errorf("признак за пределами лимита не должен находиться: %+v", res)
+			t.Errorf("a sign beyond the limit must not be found: %+v", res)
 		}
 	})
 }

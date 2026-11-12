@@ -73,33 +73,33 @@ func TestReloaderLogging(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s := logs.String(); !strings.Contains(s, `msg="набор правил загружен"`) ||
+	if s := logs.String(); !strings.Contains(s, `msg="rule set loaded"`) ||
 		!strings.Contains(s, "rules=1") || !strings.Contains(s, "rules_version=") {
-		t.Errorf("лог начальной загрузки неполон:\n%s", s)
+		t.Errorf("the initial-load log is incomplete:\n%s", s)
 	}
 
 	if err := r.Reload(); err != nil {
 		t.Fatal(err)
 	}
-	if s := logs.String(); !strings.Contains(s, `msg="набор правил не изменился"`) {
-		t.Errorf("лог no-op перезагрузки отсутствует:\n%s", s)
+	if s := logs.String(); !strings.Contains(s, `msg="rule set unchanged"`) {
+		t.Errorf("the no-op reload log is missing:\n%s", s)
 	}
 
 	rewriteRules(t, dir, reloadRulesV2)
 	if err := r.Reload(); err != nil {
 		t.Fatal(err)
 	}
-	if s := logs.String(); !strings.Contains(s, `msg="набор правил перезагружен"`) ||
+	if s := logs.String(); !strings.Contains(s, `msg="rule set reloaded"`) ||
 		!strings.Contains(s, "prev_version=") {
-		t.Errorf("лог замены набора неполон (нужен prev_version):\n%s", s)
+		t.Errorf("the set-replacement log is incomplete (prev_version is needed):\n%s", s)
 	}
 
 	rewriteRules(t, dir, "rules: [\n")
 	if err := r.Reload(); err == nil {
-		t.Fatal("ожидалась ошибка перезагрузки")
+		t.Fatal("a reload error is expected")
 	}
-	if s := logs.String(); !strings.Contains(s, "перезагрузка правил не удалась") {
-		t.Errorf("лог ошибки перезагрузки отсутствует:\n%s", s)
+	if s := logs.String(); !strings.Contains(s, "rule reload failed") {
+		t.Errorf("the reload-error log is missing:\n%s", s)
 	}
 }
 
@@ -111,16 +111,16 @@ func TestReloaderInitialLoad(t *testing.T) {
 	}
 	set := r.Set()
 	if set == nil || len(set.Rules) != 1 || set.Rules[0].ID != "a_cookie" {
-		t.Fatalf("начальный набор не загружен: %+v", set)
+		t.Fatalf("the initial set was not loaded: %+v", set)
 	}
 	if r.Set() != set {
-		t.Error("Set должен возвращать один и тот же снапшот между перезагрузками")
+		t.Error("Set must return the same snapshot between reloads")
 	}
 }
 
 func TestReloaderNewError(t *testing.T) {
 	if _, err := NewReloader(filepath.Join(t.TempDir(), "нет-такого"), nil); err == nil {
-		t.Error("ожидалась ошибка начальной загрузки")
+		t.Error("an initial load error is expected")
 	}
 }
 
@@ -138,13 +138,13 @@ func TestReloaderReloadReplacesSet(t *testing.T) {
 	}
 	got := r.Set()
 	if got == old {
-		t.Fatal("набор не заменён")
+		t.Fatal("the set was not replaced")
 	}
 	if got.Rules[0].Weight != 0.4 {
-		t.Errorf("после перезагрузки weight = %v, want 0.4", got.Rules[0].Weight)
+		t.Errorf("after the reload weight = %v, want 0.4", got.Rules[0].Weight)
 	}
 	if got.Version == old.Version {
-		t.Error("смена набора должна менять rules_version")
+		t.Error("a set change must change rules_version")
 	}
 }
 
@@ -159,10 +159,10 @@ func TestReloaderReloadFailureKeepsOldSet(t *testing.T) {
 	// A broken set: the reload fails, the service runs on the previous one.
 	rewriteRules(t, dir, "rules: [\n")
 	if err := r.Reload(); err == nil {
-		t.Error("ожидалась ошибка перезагрузки")
+		t.Error("a reload error is expected")
 	}
 	if r.Set() != old {
-		t.Error("при ошибке перезагрузки набор должен сохраниться")
+		t.Error("on a reload error the set must survive")
 	}
 
 	// The directory disappeared entirely — the same thing.
@@ -170,10 +170,10 @@ func TestReloaderReloadFailureKeepsOldSet(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := r.Reload(); err == nil {
-		t.Error("ожидалась ошибка перезагрузки (нет каталога)")
+		t.Error("a reload error is expected (no directory)")
 	}
 	if r.Set() != old {
-		t.Error("при ошибке перезагрузки набор должен сохраниться")
+		t.Error("on a reload error the set must survive")
 	}
 }
 
@@ -190,12 +190,12 @@ func TestReloaderHandleSIGHUP(t *testing.T) {
 	rewriteRules(t, dir, reloadRulesV2)
 	r.HandleSIGHUP()
 	if r.Set() == old {
-		t.Error("HandleSIGHUP должен перезагружать набор")
+		t.Error("HandleSIGHUP must reload the set")
 	}
 	rewriteRules(t, dir, "rules: [\n")
 	r.HandleSIGHUP()
 	if r.Set().Rules[0].Weight != 0.4 {
-		t.Error("ошибка в HandleSIGHUP не должна трогать рабочий набор")
+		t.Error("an error in HandleSIGHUP must not touch the working set")
 	}
 }
 
@@ -217,11 +217,11 @@ rules:
 		t.Fatal(err)
 	}
 	if _, ok := compileCache.Load(probe); ok {
-		t.Fatalf("кэш загрязнён до теста: %s", probe)
+		t.Fatalf("the cache is polluted before the test: %s", probe)
 	}
 	r.Set().Evaluate(Page{HTML: []byte("x " + probe)}) // compile and cache
 	if _, ok := compileCache.Load(probe); !ok {
-		t.Fatal("паттерн не попал в кэш компиляции")
+		t.Fatal("the pattern did not get into the compile cache")
 	}
 
 	// The same set (a no-op by version) — the cache is not cleared.
@@ -229,7 +229,7 @@ rules:
 		t.Fatal(err)
 	}
 	if _, ok := compileCache.Load(probe); !ok {
-		t.Fatal("no-op перезагрузка не должна чистить кэш")
+		t.Fatal("a no-op reload must not clear the cache")
 	}
 
 	rewriteRules(t, dir, `
@@ -243,7 +243,7 @@ rules:
 		t.Fatal(err)
 	}
 	if _, ok := compileCache.Load(probe); ok {
-		t.Error("смена rules_version должна очищать кэш компиляции")
+		t.Error("a rules_version change must clear the compile cache")
 	}
 }
 
@@ -261,11 +261,11 @@ func TestReloaderReloadSameSetIsNoop(t *testing.T) {
 		t.Fatal(err)
 	}
 	if r.Set() != old {
-		t.Error("перечтение того же набора — no-op, снапшот менять не нужно")
+		t.Error("re-reading the same set is a no-op, the snapshot need not change")
 	}
 	select {
 	case <-sub:
-		t.Error("уведомление при неизменившемся rules_version не нужно")
+		t.Error("no notification is needed when rules_version did not change")
 	default:
 	}
 }
@@ -287,10 +287,10 @@ func TestReloaderSubscribe(t *testing.T) {
 	select {
 	case got := <-sub:
 		if got != r.Set() {
-			t.Error("подписчик должен получить новый снапшот")
+			t.Error("the subscriber must receive the new snapshot")
 		}
 	case <-time.After(time.Second):
-		t.Fatal("уведомление о смене набора не пришло")
+		t.Fatal("the set-change notification did not arrive")
 	}
 }
 
@@ -310,7 +310,7 @@ func TestReloaderSubscribeCancel(t *testing.T) {
 	}
 	select {
 	case <-sub:
-		t.Error("после cancel уведомления не приходят")
+		t.Error("after cancel no notifications arrive")
 	default:
 	}
 }
@@ -344,10 +344,10 @@ rules:
 	select {
 	case got := <-sub:
 		if got.Rules[0].Weight != 0.6 {
-			t.Errorf("в канале должно быть свежее уведомление, weight = %v", got.Rules[0].Weight)
+			t.Errorf("there must be a fresh notification in the channel, weight = %v", got.Rules[0].Weight)
 		}
 	default:
-		t.Error("уведомление потеряно")
+		t.Error("the notification is lost")
 	}
 }
 
@@ -361,13 +361,13 @@ func TestReloaderLoadSeam(t *testing.T) {
 	}
 	old := r.Set()
 
-	boom := errors.New("сбой диска")
+	boom := errors.New("a disk failure")
 	r.load = func(string) (*Set, error) { return nil, boom }
 	if err := r.Reload(); !errors.Is(err, boom) {
-		t.Errorf("Reload должен вернуть ошибку шва, got %v", err)
+		t.Errorf("Reload must return the seam error, got %v", err)
 	}
 	if r.Set() != old {
-		t.Error("ошибка шва не должна менять набор")
+		t.Error("a seam error must not change the set")
 	}
 }
 
@@ -387,7 +387,7 @@ func TestReloaderConcurrent(t *testing.T) {
 			defer wg.Done()
 			for range 100 {
 				if s := r.Set(); s == nil || len(s.Rules) != 1 {
-					t.Error("неконсистентный снапшот")
+					t.Error("an inconsistent snapshot")
 					return
 				}
 			}

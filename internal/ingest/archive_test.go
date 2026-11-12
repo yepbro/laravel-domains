@@ -192,17 +192,17 @@ func TestArchiveKindOf(t *testing.T) {
 	}{
 		{"txt", "list.txt", archiveNone},
 		{"zip", "zone.zip", archiveZip},
-		{"zip верхний регистр", "ZONE.ZIP", archiveZip},
+		{"an uppercase zip", "ZONE.ZIP", archiveZip},
 		{"tar", "plain.tar", archiveTar},
 		{"tar.gz", "wrapped.tar.gz", archiveTarGz},
-		{"tar.gz верхний регистр", "WRAPPED.TAR.GZ", archiveTarGz},
+		{"an uppercase tar.gz", "WRAPPED.TAR.GZ", archiveTarGz},
 		{"tgz", "short.tgz", archiveTarGz},
 		{"gz", "list.gz", archiveGz},
-		{"gz верхний регистр", "LIST.GZ", archiveGz},
-		{"rar не поддерживается", "zone.rar", archiveNone},
-		{"7z не поддерживается", "zone.7z", archiveNone},
-		{"полный путь", "com/add/zone.tar.gz", archiveTarGz},
-		{"zip.tmp не архив", "zone.zip.tmp", archiveNone},
+		{"an uppercase gz", "LIST.GZ", archiveGz},
+		{"rar is not supported", "zone.rar", archiveNone},
+		{"7z is not supported", "zone.7z", archiveNone},
+		{"a full path", "com/add/zone.tar.gz", archiveTarGz},
+		{"zip.tmp is not an archive", "zone.zip.tmp", archiveNone},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -236,14 +236,14 @@ func TestJunkMember(t *testing.T) {
 		"__MACOSX/three.txt", "x/__MACOSX/._y",
 	} {
 		if !junkMember(name) {
-			t.Errorf("junkMember(%q) = false, want пропуск", name)
+			t.Errorf("junkMember(%q) = false, want a skip", name)
 		}
 	}
 	for _, name := range []string{
 		"one.txt", "sub/one.txt", "ru/two.txt", "list", "data-2026.txt.gz",
 	} {
 		if junkMember(name) {
-			t.Errorf("junkMember(%q) = true, want обрабатывается", name)
+			t.Errorf("junkMember(%q) = true, want it processed", name)
 		}
 	}
 }
@@ -291,34 +291,34 @@ func TestPipelineArchiveZip(t *testing.T) {
 		t.Fatalf("Process: %v", err)
 	}
 	if out.Kind != OutcomeApplied {
-		t.Fatalf("итог = %s, want applied", out.Kind)
+		t.Fatalf("the outcome = %s, want applied", out.Kind)
 	}
 
 	rep := out.Report
 	if rep.Zone != "com" || rep.ZoneID != 1 || rep.Action != model.ActionAdd {
-		t.Errorf("отчёт = %+v, want зона com (id 1), действие add", rep)
+		t.Errorf("the report = %+v, want the zone com (id 1), the action add", rep)
 	}
 	// 7 physical rows (2+2+3), 2 skipped (a comment, an empty one),
 	// 5 valid, 0 rejected: the member path ru/ did not affect the zone.
 	if rep.LinesTotal != 7 || rep.Skipped != 2 || rep.Accepted != 5 || rep.Rejected != 0 {
-		t.Errorf("счётчики строк = %+v, want 7/2/5/0", rep)
+		t.Errorf("the line counters = %+v, want 7/2/5/0", rep)
 	}
 	if rep.Members != 3 {
-		t.Errorf("членов = %d, want 3 (мусор не в счёте)", rep.Members)
+		t.Errorf("members = %d, want 3 (junk not counted)", rep.Members)
 	}
 	if rep.Added != 4 || rep.Existed != 0 {
-		t.Errorf("счётчики применения = %+v, want added 4, existed 0", rep)
+		t.Errorf("the apply counters = %+v, want added 4, existed 0", rep)
 	}
 	if string(rep.SHA256) != string(sha[:]) {
-		t.Errorf("sha256 = %x, want хэш байтов архива %x", rep.SHA256, sha)
+		t.Errorf("sha256 = %x, want the hash of the archive bytes %x", rep.SHA256, sha)
 	}
 
 	if len(pt.files.records) != 1 {
-		t.Fatalf("записей в журнале = %d, want 1 (единица учёта — архив)", len(pt.files.records))
+		t.Fatalf("journal records = %d, want 1 (the accounting unit is the archive)", len(pt.files.records))
 	}
 	rec := pt.files.records[0]
 	if rec.Path != "com/add/zone.zip" || rec.LinesTotal != 7 || rec.Added != 4 || rec.Rejected != 0 {
-		t.Errorf("запись журнала = %+v, want суммы по членам архива", rec)
+		t.Errorf("the journal record = %+v, want the sums over the archive members", rec)
 	}
 
 	want := []string{
@@ -335,27 +335,27 @@ func TestPipelineArchiveZip(t *testing.T) {
 		"commit",
 	}
 	if got := strings.Join(pt.pool.ops, "\n"); got != strings.Join(want, "\n") {
-		t.Errorf("порядок обращений =\n%s\nwant:\n%s", got, strings.Join(want, "\n"))
+		t.Errorf("the call order =\n%s\nwant:\n%s", got, strings.Join(want, "\n"))
 	}
 
 	if exists(t, abs) || !exists(t, filepath.Join(pt.dir, DirProcessed, "com/add/zone.zip")) {
-		t.Error("архив должен уйти в processed/com/add/zone.zip")
+		t.Error("the archive must go to processed/com/add/zone.zip")
 	}
 
 	// The junk is skipped with a Warn (spec 5.1: the observable part of
 	// the behavior).
 	log := logBuf.String()
 	for _, frag := range []string{
-		"запись архива пропущена (каталог)",
+		"archive entry skipped (a directory)",
 		"entry=data/",
-		"запись архива пропущена (скрытая или мусор macOS)",
+		"archive entry skipped (hidden or macOS junk)",
 		"entry=__MACOSX/three.txt",
 		"entry=._one.txt",
 		"entry=.DS_Store",
 		"entry=.hidden/x.txt",
 	} {
 		if !strings.Contains(log, frag) {
-			t.Errorf("лог не содержит %q:\n%s", frag, log)
+			t.Errorf("the log does not contain %q:\n%s", frag, log)
 		}
 	}
 }
@@ -390,17 +390,17 @@ func TestPipelineArchiveTarGzTgz(t *testing.T) {
 				t.Fatalf("Process: %v", err)
 			}
 			if out.Kind != OutcomeApplied {
-				t.Fatalf("итог = %s, want applied", out.Kind)
+				t.Fatalf("the outcome = %s, want applied", out.Kind)
 			}
 			rep := out.Report
 			if rep.LinesTotal != 2 || rep.Accepted != 2 || rep.Rejected != 0 || rep.Members != 1 {
-				t.Errorf("счётчики = %+v, want 2 строки, 2 валидных, 1 член", rep)
+				t.Errorf("the counters = %+v, want 2 lines, 2 valid, 1 member", rep)
 			}
 			if len(pt.files.records) != 1 || pt.files.records[0].Path != tc.file {
-				t.Errorf("журнал = %+v, want одна запись %s", pt.files.records, tc.file)
+				t.Errorf("the journal = %+v, want one record %s", pt.files.records, tc.file)
 			}
 			if !exists(t, filepath.Join(pt.dir, DirProcessed, filepath.FromSlash(tc.file))) {
-				t.Errorf("архив не перемещён в processed/%s", tc.file)
+				t.Errorf("the archive was not moved to processed/%s", tc.file)
 			}
 		})
 	}
@@ -439,17 +439,17 @@ func TestPipelineArchiveGz(t *testing.T) {
 		t.Fatalf("Process: %v", err)
 	}
 	if out.Kind != OutcomeApplied {
-		t.Fatalf("итог = %s, want applied", out.Kind)
+		t.Fatalf("the outcome = %s, want applied", out.Kind)
 	}
 	rep := out.Report
 	if rep.LinesTotal != 13 || rep.Accepted != 12 || rep.Rejected != 1 || rep.Members != 1 {
-		t.Errorf("счётчики = %+v, want 13 строк, 12 валидных, 1 отклон, 1 член", rep)
+		t.Errorf("the counters = %+v, want 13 lines, 12 valid, 1 rejected, 1 member", rep)
 	}
 	if rep.Reasons[ReasonInvalid] != 1 {
-		t.Errorf("причины = %v, want invalid: 1", rep.Reasons)
+		t.Errorf("the reasons = %v, want invalid: 1", rep.Reasons)
 	}
 	if string(rep.SHA256) != string(sha[:]) {
-		t.Errorf("sha256 = %x, want хэш байтов архива", rep.SHA256)
+		t.Errorf("sha256 = %x, want the hash of the archive bytes", rep.SHA256)
 	}
 	if rep.Added != 12 {
 		t.Errorf("added = %d, want 12", rep.Added)
@@ -462,11 +462,11 @@ func TestPipelineArchiveGz(t *testing.T) {
 		"line=2",
 	} {
 		if !strings.Contains(logged, want) {
-			t.Errorf("rejected-лог = %q, want %q", logged, want)
+			t.Errorf("the rejected log = %q, want %q", logged, want)
 		}
 	}
 	if !exists(t, filepath.Join(pt.dir, DirProcessed, "com/add/list.gz")) {
-		t.Error("архив не перемещён в processed/")
+		t.Error("the archive was not moved to processed/")
 	}
 }
 
@@ -489,13 +489,13 @@ func TestPipelineArchiveDelete(t *testing.T) {
 		t.Fatalf("Process: %v", err)
 	}
 	if out.Kind != OutcomeApplied {
-		t.Fatalf("итог = %s, want applied", out.Kind)
+		t.Fatalf("the outcome = %s, want applied", out.Kind)
 	}
 	if rep := out.Report; rep.Action != model.ActionDelete || rep.Deleted != 1 {
-		t.Errorf("счётчики удаления = %+v, want deleted 1", rep)
+		t.Errorf("the delete counters = %+v, want deleted 1", rep)
 	}
 	if len(pt.files.records) != 1 || pt.files.records[0].Deleted != 1 {
-		t.Errorf("журнал = %+v, want deleted 1", pt.files.records)
+		t.Errorf("the journal = %+v, want deleted 1", pt.files.records)
 	}
 }
 
@@ -514,20 +514,20 @@ func TestPipelineArchiveMemberErrorRatio(t *testing.T) {
 
 	out, err := pt.pipe.Process(context.Background(), abs)
 	if err != nil {
-		t.Fatalf("Process: %v (ошибочный архив — не ошибка сервиса)", err)
+		t.Fatalf("Process: %v (a bad archive is not a service error)", err)
 	}
 	if out.Kind != OutcomeFailed {
-		t.Fatalf("итог = %s, want failed", out.Kind)
+		t.Fatalf("the outcome = %s, want failed", out.Kind)
 	}
 	if out.Err == nil || !strings.Contains(out.Err.Error(), "com/add/bad.zip!bad.txt") ||
-		!strings.Contains(out.Err.Error(), "доля отклонённых строк 3 из 3 выше ingest.max_error_ratio (0.1)") {
-		t.Errorf("причина = %v, want доля отказов члена bad.txt 3 из 3", out.Err)
+		!strings.Contains(out.Err.Error(), "the share of rejected lines 3 of 3 is above ingest.max_error_ratio (0.1)") {
+		t.Errorf("the reason = %v, want the bad.txt member's rejection share 3 of 3", out.Err)
 	}
 	if out.Report.Rejected != 3 || out.Report.Accepted != 2 || out.Report.Members != 2 {
-		t.Errorf("счётчики = %+v, want rejected 3, accepted 2, членов 2", out.Report)
+		t.Errorf("the counters = %+v, want rejected 3, accepted 2, 2 members", out.Report)
 	}
 	if len(pt.files.records) != 0 {
-		t.Error("отчёт ошибочного архива не пишется в журнал")
+		t.Error("the bad archive's report is not written to the journal")
 	}
 	// The loading happened (the hash is known after reading), the
 	// application — no.
@@ -537,21 +537,21 @@ func TestPipelineArchiveMemberErrorRatio(t *testing.T) {
 		"exec:" + clearStageSQL,
 	}
 	if got := strings.Join(pt.pool.ops, "\n"); got != strings.Join(want, "\n") {
-		t.Errorf("обращения =\n%s\nwant:\n%s", got, strings.Join(want, "\n"))
+		t.Errorf("the calls =\n%s\nwant:\n%s", got, strings.Join(want, "\n"))
 	}
 	failed := filepath.Join(pt.dir, DirFailed, "com/add/bad.zip")
 	if exists(t, abs) || !exists(t, failed) {
-		t.Fatalf("архив должен лежать в %s", failed)
+		t.Fatalf("the archive must be in %s", failed)
 	}
 	report := readFile(t, failed+".report")
 	for _, frag := range []string{
-		"файл: com/add/bad.zip",
-		"членов архива: 2",
-		"итог: ошибочен —",
+		"file: com/add/bad.zip",
+		"archive members: 2",
+		"verdict: bad —",
 		"wrong_zone: 3",
 	} {
 		if !strings.Contains(report, frag) {
-			t.Errorf("лог-отчёт не содержит %q:\n%s", frag, report)
+			t.Errorf("the log report does not contain %q:\n%s", frag, report)
 		}
 	}
 }
@@ -566,37 +566,37 @@ func TestPipelineArchiveBroken(t *testing.T) {
 		reason  string
 	}{
 		{
-			name: "zip мусорные байты",
+			name: "zip junk bytes",
 			rel:  "com/add/g.zip",
 			content: func(t *testing.T, path string) {
 				if err := os.WriteFile(path, []byte("это не zip, совсем не zip"), 0o644); err != nil {
 					t.Fatal(err)
 				}
 			},
-			reason: "не читается",
+			reason: "unreadable",
 		},
 		{
-			name: "gz мусорные байты",
+			name: "gz junk bytes",
 			rel:  "com/add/g.gz",
 			content: func(t *testing.T, path string) {
 				if err := os.WriteFile(path, []byte("garbage"), 0o644); err != nil {
 					t.Fatal(err)
 				}
 			},
-			reason: "не читается",
+			reason: "unreadable",
 		},
 		{
-			name: "пустой gz",
+			name: "an empty gz",
 			rel:  "com/add/empty.gz",
 			content: func(t *testing.T, path string) {
 				if err := os.WriteFile(path, nil, 0o644); err != nil {
 					t.Fatal(err)
 				}
 			},
-			reason: "не читается",
+			reason: "unreadable",
 		},
 		{
-			name: "обрезанный tar.gz",
+			name: "a truncated tar.gz",
 			rel:  "com/add/cut.tar.gz",
 			content: func(t *testing.T, path string) {
 				full := tarBytes(t, true, archEntry{"list", strings.Repeat("a.com\n", 40)})
@@ -604,10 +604,10 @@ func TestPipelineArchiveBroken(t *testing.T) {
 					t.Fatal(err)
 				}
 			},
-			reason: "повреждён",
+			reason: "corrupt",
 		},
 		{
-			name: "битый CRC tar.gz",
+			name: "a tar.gz with a broken CRC",
 			rel:  "com/add/badcrc.tar.gz",
 			content: func(t *testing.T, path string) {
 				// The data is intact, the CRC32 in the gzip trailer is
@@ -619,7 +619,7 @@ func TestPipelineArchiveBroken(t *testing.T) {
 					t.Fatal(err)
 				}
 			},
-			reason: "повреждён",
+			reason: "corrupt",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -632,23 +632,23 @@ func TestPipelineArchiveBroken(t *testing.T) {
 
 			out, err := pt.pipe.Process(context.Background(), abs)
 			if err != nil {
-				t.Fatalf("Process: %v (битый архив — не ошибка сервиса)", err)
+				t.Fatalf("Process: %v (a corrupt archive is not a service error)", err)
 			}
 			if out.Kind != OutcomeFailed {
-				t.Fatalf("итог = %s, want failed", out.Kind)
+				t.Fatalf("the outcome = %s, want failed", out.Kind)
 			}
 			if out.Err == nil || !strings.Contains(out.Err.Error(), tc.reason) {
-				t.Errorf("причина = %v, want %q", out.Err, tc.reason)
+				t.Errorf("the reason = %v, want %q", out.Err, tc.reason)
 			}
 			if len(pt.files.records) != 0 {
-				t.Error("журнал не пишется для битого архива")
+				t.Error("no journal record is written for a corrupt archive")
 			}
 			failed := filepath.Join(pt.dir, DirFailed, filepath.FromSlash(tc.rel))
 			if exists(t, abs) || !exists(t, failed) {
-				t.Fatalf("архив должен лежать в %s", failed)
+				t.Fatalf("the archive must be in %s", failed)
 			}
 			if !exists(t, failed+".report") {
-				t.Error("лог-отчёт не записан рядом с битым архивом")
+				t.Error("the log report was not written next to the corrupt archive")
 			}
 		})
 	}
@@ -659,7 +659,7 @@ func TestPipelineArchiveBroken(t *testing.T) {
 // checked before reading by the header, for tar/gz — by a counter over
 // the stream; exceeding — failed.
 func TestPipelineArchiveLimits(t *testing.T) {
-	t.Run("zip записей больше archive_max_files", func(t *testing.T) {
+	t.Run("a zip with more entries than archive_max_files", func(t *testing.T) {
 		pt := newPipeTest(t)
 		abs := filepath.Join(pt.dir, "com", "add", "many.zip")
 		buildZip(t, abs,
@@ -674,23 +674,23 @@ func TestPipelineArchiveLimits(t *testing.T) {
 			t.Fatalf("Process: %v", err)
 		}
 		if out.Kind != OutcomeFailed {
-			t.Fatalf("итог = %s, want failed", out.Kind)
+			t.Fatalf("the outcome = %s, want failed", out.Kind)
 		}
 		if out.Err == nil || !strings.Contains(out.Err.Error(), "ingest.archive_max_files (2)") {
-			t.Errorf("причина = %v, want превышение archive_max_files", out.Err)
+			t.Errorf("the reason = %v, want the archive_max_files excess", out.Err)
 		}
 		// The check over the central directory — before loading: the only
 		// staging access is the cleanup of the discarded batch, no
 		// application.
 		if got := strings.Join(pt.pool.ops, "\n"); got != "exec:"+clearStageSQL {
-			t.Errorf("обращения = %s, want одна очистка партии", got)
+			t.Errorf("the calls = %s, want a single batch cleanup", got)
 		}
 		if !exists(t, filepath.Join(pt.dir, DirFailed, "com/add/many.zip")) {
-			t.Error("архив не перемещён в failed/")
+			t.Error("the archive was not moved to failed/")
 		}
 	})
 
-	t.Run("tar записей больше archive_max_files", func(t *testing.T) {
+	t.Run("a tar with more entries than archive_max_files", func(t *testing.T) {
 		pt := newPipeTest(t)
 		abs := filepath.Join(pt.dir, "com", "add", "many.tar")
 		buildTar(t, abs, false,
@@ -706,11 +706,11 @@ func TestPipelineArchiveLimits(t *testing.T) {
 		}
 		if out.Kind != OutcomeFailed || out.Err == nil ||
 			!strings.Contains(out.Err.Error(), "ingest.archive_max_files (2)") {
-			t.Fatalf("итог = %s (%v), want failed по archive_max_files", out.Kind, out.Err)
+			t.Fatalf("the outcome = %s (%v), want failed by archive_max_files", out.Kind, out.Err)
 		}
 	})
 
-	t.Run("zip объём по заголовку до чтения", func(t *testing.T) {
+	t.Run("a zip's size by the header before reading", func(t *testing.T) {
 		pt := newPipeTest(t)
 		abs := filepath.Join(pt.dir, "com", "add", "big.zip")
 		buildZip(t, abs, archEntry{"big.txt", strings.Repeat("a.com\n", 20)}) // 120 bytes
@@ -721,21 +721,21 @@ func TestPipelineArchiveLimits(t *testing.T) {
 			t.Fatalf("Process: %v", err)
 		}
 		if out.Kind != OutcomeFailed {
-			t.Fatalf("итог = %s, want failed", out.Kind)
+			t.Fatalf("the outcome = %s, want failed", out.Kind)
 		}
 		if out.Err == nil || !strings.Contains(out.Err.Error(), "ingest.archive_max_uncompressed") ||
 			!strings.Contains(out.Err.Error(), "big.txt") {
-			t.Errorf("причина = %v, want превышение несжатого объёма члена big.txt", out.Err)
+			t.Errorf("the reason = %v, want the member big.txt's uncompressed size excess", out.Err)
 		}
 		// The header is checked before reading the member: no rows in
 		// staging — the batch cleanup by the loading and the discard, no
 		// COPY.
 		if got := strings.Join(pt.pool.ops, "\n"); got != "exec:"+clearStageSQL+"\nexec:"+clearStageSQL {
-			t.Errorf("обращения = %s, want две очистки партии без COPY", got)
+			t.Errorf("the calls = %s, want two batch cleanups without COPY", got)
 		}
 	})
 
-	t.Run("tar.gz объём счётчиком по потоку", func(t *testing.T) {
+	t.Run("a tar.gz's size counted over the stream", func(t *testing.T) {
 		pt := newPipeTest(t)
 		abs := filepath.Join(pt.dir, "com", "add", "stream.tar.gz")
 		buildTar(t, abs, true, archEntry{"list", strings.Repeat("a.com\n", 60)}) // 360 bytes
@@ -746,17 +746,17 @@ func TestPipelineArchiveLimits(t *testing.T) {
 			t.Fatalf("Process: %v", err)
 		}
 		if out.Kind != OutcomeFailed {
-			t.Fatalf("итог = %s, want failed", out.Kind)
+			t.Fatalf("the outcome = %s, want failed", out.Kind)
 		}
-		if out.Err == nil || !strings.Contains(out.Err.Error(), "превысил ingest.archive_max_uncompressed (100 байт)") {
-			t.Errorf("причина = %v, want превышение счётчиком по потоку", out.Err)
+		if out.Err == nil || !strings.Contains(out.Err.Error(), "exceeded ingest.archive_max_uncompressed (100 bytes)") {
+			t.Errorf("the reason = %v, want the excess counted over the stream", out.Err)
 		}
 		if !exists(t, filepath.Join(pt.dir, DirFailed, "com/add/stream.tar.gz")) {
-			t.Error("архив не перемещён в failed/")
+			t.Error("the archive was not moved to failed/")
 		}
 	})
 
-	t.Run("лимит записей считает каталоги", func(t *testing.T) {
+	t.Run("the entry limit counts directories", func(t *testing.T) {
 		pt := newPipeTest(t)
 		// A metadata bomb: a tar.gz of thousands of empty directories
 		// compresses by orders of magnitude — directory entries must
@@ -774,17 +774,17 @@ func TestPipelineArchiveLimits(t *testing.T) {
 			t.Fatalf("Process: %v", err)
 		}
 		if out.Kind != OutcomeFailed {
-			t.Fatalf("итог = %s, want failed", out.Kind)
+			t.Fatalf("the outcome = %s, want failed", out.Kind)
 		}
 		if out.Err == nil || !strings.Contains(out.Err.Error(), "ingest.archive_max_files (1000)") {
-			t.Errorf("причина = %v, want превышение числа записей", out.Err)
+			t.Errorf("the reason = %v, want the entry count excess", out.Err)
 		}
 		if !exists(t, filepath.Join(pt.dir, DirFailed, "com/add/bomb.tar.gz")) {
-			t.Error("архив не перемещён в failed/")
+			t.Error("the archive was not moved to failed/")
 		}
 	})
 
-	t.Run("лимит объёма считает заголовки потока", func(t *testing.T) {
+	t.Run("the size limit counts stream headers", func(t *testing.T) {
 		pt := newPipeTest(t)
 		entries := make([]archEntry, 0, 3000)
 		for i := 0; i < 3000; i++ {
@@ -802,10 +802,10 @@ func TestPipelineArchiveLimits(t *testing.T) {
 			t.Fatalf("Process: %v", err)
 		}
 		if out.Kind != OutcomeFailed {
-			t.Fatalf("итог = %s, want failed", out.Kind)
+			t.Fatalf("the outcome = %s, want failed", out.Kind)
 		}
-		if out.Err == nil || !strings.Contains(out.Err.Error(), "превысил ingest.archive_max_uncompressed (4096 байт)") {
-			t.Errorf("причина = %v, want превышение объёма потока (заголовки включительно)", out.Err)
+		if out.Err == nil || !strings.Contains(out.Err.Error(), "exceeded ingest.archive_max_uncompressed (4096 bytes)") {
+			t.Errorf("the reason = %v, want the stream size excess (headers included)", out.Err)
 		}
 	})
 }
@@ -831,10 +831,10 @@ func TestPipelineArchiveDuplicate(t *testing.T) {
 
 	out, err := pt.pipe.Process(context.Background(), abs)
 	if err != nil || out.Kind != OutcomeApplied {
-		t.Fatalf("первая обработка: %v, итог %s", err, out.Kind)
+		t.Fatalf("the first processing: %v, the outcome %s", err, out.Kind)
 	}
 	if !reflect.DeepEqual(pt.files.records[0].SHA256, sha[:]) {
-		t.Fatalf("журнал = %x, want sha256 архива %x", pt.files.records[0].SHA256, sha)
+		t.Fatalf("the journal = %x, want the archive's sha256 %x", pt.files.records[0].SHA256, sha)
 	}
 
 	// A repeated delivery of the same content (the file came back to
@@ -855,10 +855,10 @@ func TestPipelineArchiveDuplicate(t *testing.T) {
 		t.Fatalf("Process: %v", err)
 	}
 	if out.Kind != OutcomeDuplicate {
-		t.Fatalf("итог = %s, want duplicate", out.Kind)
+		t.Fatalf("the outcome = %s, want duplicate", out.Kind)
 	}
 	if len(pt.files.records) != 0 {
-		t.Errorf("записей в журнале = %d, want 0 (дубль не дублирует отчёт)", len(pt.files.records))
+		t.Errorf("journal records = %d, want 0 (a duplicate does not duplicate the report)", len(pt.files.records))
 	}
 	// The loading happened (the hash is known after reading), the
 	// application — no.
@@ -869,13 +869,13 @@ func TestPipelineArchiveDuplicate(t *testing.T) {
 	}
 	tail := pt.pool.ops[len(pt.pool.ops)-len(want):]
 	if strings.Join(tail, "\n") != strings.Join(want, "\n") {
-		t.Errorf("обращения повторной обработки = %v, want очистка → COPY → отбрасывание", pt.pool.ops)
+		t.Errorf("the reprocessing calls = %v, want cleanup → COPY → discard", pt.pool.ops)
 	}
 	// Both copies — in the processed/ archive (a name collision — the -2
 	// suffix).
 	if !exists(t, filepath.Join(pt.dir, DirProcessed, "com/add/zone.zip")) ||
 		!exists(t, filepath.Join(pt.dir, DirProcessed, "com/add/zone-2.zip")) {
-		t.Error("обе доставки должны лежать в processed/ (вторая — с суффиксом)")
+		t.Error("both deliveries must be in processed/ (the second one with a suffix)")
 	}
 }
 
@@ -890,8 +890,8 @@ func TestPipelineArchiveEmpty(t *testing.T) {
 		rel   string
 		build func(t *testing.T, path string)
 	}{
-		{"пустой zip", "com/add/empty.zip", func(t *testing.T, p string) { buildZip(t, p) }},
-		{"пустой tar", "com/add/empty.tar", func(t *testing.T, p string) { buildTar(t, p, false) }},
+		{"an empty zip", "com/add/empty.zip", func(t *testing.T, p string) { buildZip(t, p) }},
+		{"an empty tar", "com/add/empty.tar", func(t *testing.T, p string) { buildTar(t, p, false) }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			pt := newPipeTest(t)
@@ -905,14 +905,14 @@ func TestPipelineArchiveEmpty(t *testing.T) {
 				t.Fatalf("Process: %v", err)
 			}
 			if out.Kind != OutcomeApplied {
-				t.Fatalf("итог = %s, want applied", out.Kind)
+				t.Fatalf("the outcome = %s, want applied", out.Kind)
 			}
 			rep := out.Report
 			if rep.LinesTotal != 0 || rep.Accepted != 0 || rep.Members != 0 || rep.Added != 0 {
-				t.Errorf("счётчики = %+v, want нули (пустой архив)", rep)
+				t.Errorf("the counters = %+v, want zeros (an empty archive)", rep)
 			}
 			if len(pt.files.records) != 1 {
-				t.Error("отчёт пустого архива должен записаться в журнал")
+				t.Error("the empty archive's report must be written to the journal")
 			}
 			// COPY with an empty chunk does not run (db.CopyFrom: an empty
 			// chunk is a no-op); applying an empty batch — the bound and
@@ -927,7 +927,7 @@ func TestPipelineArchiveEmpty(t *testing.T) {
 				"commit",
 			}
 			if got := strings.Join(pt.pool.ops, "\n"); got != strings.Join(want, "\n") {
-				t.Errorf("обращения =\n%s\nwant:\n%s", got, strings.Join(want, "\n"))
+				t.Errorf("the calls =\n%s\nwant:\n%s", got, strings.Join(want, "\n"))
 			}
 		})
 	}
@@ -960,13 +960,13 @@ func TestPipelineArchivePaddedTarSHA(t *testing.T) {
 
 	out, err := pt.pipe.Process(context.Background(), abs)
 	if err != nil || out.Kind != OutcomeApplied {
-		t.Fatalf("обработка: %v, итог %s", err, out.Kind)
+		t.Fatalf("processing: %v, the outcome %s", err, out.Kind)
 	}
 	if string(out.Report.SHA256) != string(sha[:]) {
-		t.Errorf("sha256 = %x, want хэш файла целиком %x", out.Report.SHA256, sha)
+		t.Errorf("sha256 = %x, want the hash of the whole file %x", out.Report.SHA256, sha)
 	}
 	if !reflect.DeepEqual(pt.files.records[0].SHA256, sha[:]) {
-		t.Errorf("журнал: sha256 = %x, want %x", pt.files.records[0].SHA256, sha)
+		t.Errorf("the journal: sha256 = %x, want %x", pt.files.records[0].SHA256, sha)
 	}
 }
 
@@ -981,20 +981,20 @@ func TestPipelineArchiveNestedNotUnpacked(t *testing.T) {
 
 	out, err := pt.pipe.Process(context.Background(), abs)
 	if err != nil {
-		t.Fatalf("Process: %v (ошибочный архив — не ошибка сервиса)", err)
+		t.Fatalf("Process: %v (a bad archive is not a service error)", err)
 	}
 	if out.Kind != OutcomeFailed {
-		t.Fatalf("итог = %s, want failed", out.Kind)
+		t.Fatalf("the outcome = %s, want failed", out.Kind)
 	}
 	if out.Err == nil || !strings.Contains(out.Err.Error(), "inner.zip") ||
 		!strings.Contains(out.Err.Error(), "ingest.max_error_ratio") {
-		t.Errorf("причина = %v, want доля отказов члена inner.zip", out.Err)
+		t.Errorf("the reason = %v, want the inner.zip member's rejection share", out.Err)
 	}
 	if out.Report.Accepted != 0 { // the inner archive's domains were not applied
-		t.Errorf("accepted = %d, want 0 (вложенный архив — мусор, не список)", out.Report.Accepted)
+		t.Errorf("accepted = %d, want 0 (a nested archive is junk, not a list)", out.Report.Accepted)
 	}
 	if !exists(t, filepath.Join(pt.dir, DirFailed, "com/add/outer.zip")) {
-		t.Error("архив не перемещён в failed/")
+		t.Error("the archive was not moved to failed/")
 	}
 }
 
@@ -1005,19 +1005,19 @@ func TestPipelineArchiveStageError(t *testing.T) {
 	pt := newPipeTest(t)
 	abs := filepath.Join(pt.dir, "com", "add", "zone.zip")
 	buildZip(t, abs, archEntry{"one.txt", "a.com\n"})
-	pt.pool.copyErr = errors.New("COPY отвергнут")
+	pt.pool.copyErr = errors.New("COPY rejected")
 
 	out, err := pt.pipe.Process(context.Background(), abs)
 	if err == nil || !errors.Is(err, pt.pool.copyErr) {
-		t.Fatalf("err = %v, want ошибка COPY вызывающему", err)
+		t.Fatalf("err = %v, want the COPY error to the caller", err)
 	}
 	if out.Kind != OutcomeLeft {
-		t.Errorf("итог = %s, want left", out.Kind)
+		t.Errorf("the outcome = %s, want left", out.Kind)
 	}
 	if !exists(t, abs) {
-		t.Error("архив должен остаться в incoming")
+		t.Error("the archive must stay in incoming")
 	}
 	if len(pt.files.records) != 0 {
-		t.Error("журнал не пишется при сбое загрузки")
+		t.Error("no journal record is written on a load failure")
 	}
 }

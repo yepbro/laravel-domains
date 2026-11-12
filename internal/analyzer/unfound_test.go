@@ -79,28 +79,28 @@ func TestUnfoundDrain_ControlScenario(t *testing.T) {
 	f.w.opt.Retention = 6 * time.Hour
 
 	if wrote, err := f.w.ProcessResult(context.Background(), anTask); err != nil || !wrote {
-		t.Fatalf("ProcessResult = %v, %v; нужен успех с записью", wrote, err)
+		t.Fatalf("ProcessResult = %v, %v; want success with a write", wrote, err)
 	}
 	if _, ok := anDomainSnapshot(f.pool, anKey.zone, anKey.domain); ok {
-		t.Fatal("строка laravel_domains не снята — события нет")
+		t.Fatal("the laravel_domains row was not removed — no event")
 	}
 	if rec.count() != 1 {
-		t.Fatalf("вызовов дренажа = %d, want 1", rec.count())
+		t.Fatalf("drain calls = %d, want 1", rec.count())
 	}
 	call := rec.last()
 	if call.zone != anKey.zone || call.domain != anKey.domain {
-		t.Errorf("ключ дренажа = %d/%d, want %d/%d", call.zone, call.domain, anKey.zone, anKey.domain)
+		t.Errorf("the drain key = %d/%d, want %d/%d", call.zone, call.domain, anKey.zone, anKey.domain)
 	}
 	if call.retention != 6*time.Hour {
-		t.Errorf("окно дренажа = %v, want 6h (retention воркера)", call.retention)
+		t.Errorf("the drain window = %v, want 6h (the worker's retention)", call.retention)
 	}
 	if p, ok := call.pool.(*anFakePool); !ok || p != f.pool {
-		t.Error("дренажу передан не пул воркера")
+		t.Error("the drain was not passed the worker's pool")
 	}
 	// The order: the drain strictly after the commit — the event has
 	// already happened, a drain failure must not fail the delivery (TestUnfoundDrain_Error).
 	if f.pool.j.indexOf(anEvCommit) > f.pool.j.indexOf(anEvDrain) {
-		t.Fatalf("дренаж до фиксации: %v", f.pool.j.snapshot())
+		t.Fatalf("the drain before the commit: %v", f.pool.j.snapshot())
 	}
 }
 
@@ -116,10 +116,10 @@ func TestUnfoundDrain_EventBounds(t *testing.T) {
 		confident bool // the delivery finds confident signs
 		want      int
 	}{
-		{"свежая потеря находки — впереди курсора", true, true, false, 0},
-		{"перехода нет (строки не было)", false, false, false, 0},
-		{"находка осталась (уверенные признаки)", false, true, true, 0},
-		{"повтор пустого переанализа после снятия", false, false, false, 0},
+		{"a fresh find loss — ahead of the cursor", true, true, false, 0},
+		{"no transition (there was no row)", false, false, false, 0},
+		{"the find remains (confident signs)", false, true, true, 0},
+		{"a repeat empty re-analysis after the removal", false, false, false, 0},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -146,7 +146,7 @@ func TestUnfoundDrain_EventBounds(t *testing.T) {
 				t.Fatalf("ProcessResult: %v", err)
 			}
 			if rec.count() != tc.want {
-				t.Fatalf("вызовов дренажа = %d, want %d (событие = переход без fresh)", rec.count(), tc.want)
+				t.Fatalf("drain calls = %d, want %d (the event = a transition without fresh)", rec.count(), tc.want)
 			}
 		})
 	}
@@ -167,13 +167,13 @@ func TestUnfoundDrain_Error(t *testing.T) {
 
 	wrote, err := f.w.ProcessResult(context.Background(), anTask)
 	if err != nil || !wrote {
-		t.Fatalf("ProcessResult = %v, %v; доставка обязана удаться (анализ зафиксирован)", wrote, err)
+		t.Fatalf("ProcessResult = %v, %v; the delivery must succeed (the analysis is committed)", wrote, err)
 	}
 	if rec.count() != 1 {
-		t.Fatalf("вызовов дренажа = %d, want 1 (попытка была)", rec.count())
+		t.Fatalf("drain calls = %d, want 1 (the attempt was made)", rec.count())
 	}
 	if _, ok := anDomainSnapshot(f.pool, anKey.zone, anKey.domain); ok {
-		t.Fatal("строка laravel_domains не снята при сбое дренажа")
+		t.Fatal("the laravel_domains row was not removed on the drain failure")
 	}
 }
 
@@ -185,8 +185,8 @@ func TestUnfoundDrain_Disabled(t *testing.T) {
 		name string
 		opts Options
 	}{
-		{"retention выключен", Options{MinScore: 0.6, Retention: 0, DrainDomain: (&anDrainRecorder{}).drain}},
-		{"шов не задан", Options{MinScore: 0.6, Retention: 6 * time.Hour}},
+		{"retention off", Options{MinScore: 0.6, Retention: 0, DrainDomain: (&anDrainRecorder{}).drain}},
+		{"the seam is not set", Options{MinScore: 0.6, Retention: 6 * time.Hour}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newANFixture(t, anSet(1001), tc.opts)
@@ -198,7 +198,7 @@ func TestUnfoundDrain_Disabled(t *testing.T) {
 				t.Fatalf("ProcessResult: %v", err)
 			}
 			if _, ok := anDomainSnapshot(f.pool, anKey.zone, anKey.domain); ok {
-				t.Fatal("строка laravel_domains не снята")
+				t.Fatal("the laravel_domains row was not removed")
 			}
 		})
 	}

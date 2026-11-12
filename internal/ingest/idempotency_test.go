@@ -49,17 +49,17 @@ func TestPipelineReapplyAfterLostReport(t *testing.T) {
 		{tag: pgconn.NewCommandTag("DELETE 2")}, // the cleanup after the application
 	}
 	pt.pool.uniques = 2
-	pt.files.recErr = errors.New("журнал недоступен")
+	pt.files.recErr = errors.New("the journal is unavailable")
 
 	out, err := pt.pipe.Process(context.Background(), abs)
 	if err == nil || !errors.Is(err, pt.files.recErr) {
-		t.Fatalf("первая попытка: err = %v, want ошибка журнала", err)
+		t.Fatalf("the first attempt: err = %v, want the journal error", err)
 	}
 	if out.Kind != OutcomeLeft || !exists(t, abs) {
-		t.Fatalf("первая попытка: итог = %s, want left и файл в incoming", out.Kind)
+		t.Fatalf("the first attempt: the outcome = %s, want left and the file in incoming", out.Kind)
 	}
 	if len(pt.files.records) != 0 {
-		t.Fatal("отчёт не должен был записаться (сбой журнала)")
+		t.Fatal("the report must not have been written (the journal failed)")
 	}
 
 	// Reprocessing the same file (at-least-once, spec 3.4): the domains
@@ -85,21 +85,21 @@ func TestPipelineReapplyAfterLostReport(t *testing.T) {
 
 	out, err = pipe.Process(context.Background(), abs)
 	if err != nil {
-		t.Fatalf("повторная обработка: %v", err)
+		t.Fatalf("the reprocessing: %v", err)
 	}
 	if out.Kind != OutcomeApplied {
-		t.Fatalf("повторная обработка: итог = %s, want applied", out.Kind)
+		t.Fatalf("the reprocessing: the outcome = %s, want applied", out.Kind)
 	}
 	// The domain state is unchanged: nothing to add, everything "already
 	// existed" (the retry counters reflect the current state, spec 3.4).
 	if out.Report.Added != 0 || out.Report.Revived != 0 || out.Report.Existed != 2 {
-		t.Errorf("счётчики повтора = added %d, revived %d, existed %d; want 0/0/2",
+		t.Errorf("the repeat counters = added %d, revived %d, existed %d; want 0/0/2",
 			out.Report.Added, out.Report.Revived, out.Report.Existed)
 	}
 
 	// The report — exactly one, the retry does not duplicate the journal.
 	if len(pt.files.records) != 1 {
-		t.Fatalf("записей в журнале = %d, want 1", len(pt.files.records))
+		t.Fatalf("journal records = %d, want 1", len(pt.files.records))
 	}
 	rec := pt.files.records[0]
 	wantRec := FileRecord{
@@ -107,10 +107,10 @@ func TestPipelineReapplyAfterLostReport(t *testing.T) {
 		LinesTotal: 2, Existed: 2, ProcessedAt: pt.now,
 	}
 	if !reflect.DeepEqual(rec, wantRec) {
-		t.Errorf("запись журнала = %+v, want %+v", rec, wantRec)
+		t.Errorf("the journal record = %+v, want %+v", rec, wantRec)
 	}
 	if !exists(t, filepath.Join(pt.dir, DirProcessed, "com/add/list.txt")) {
-		t.Error("файл не перемещён в processed")
+		t.Error("the file was not moved to processed")
 	}
 }
 
@@ -132,7 +132,7 @@ func TestPipelineDuplicateClearFailureDiscards(t *testing.T) {
 		SHA256: sha[:], ProcessedAt: &processed,
 	})
 
-	boom := errors.New("очистка партии не прошла")
+	boom := errors.New("the batch cleanup failed")
 	pt.pool.execs = []pipeExec{
 		{tag: pgconn.NewCommandTag("DELETE 0")}, // the cleanup before loading (Stage)
 		{err: boom},                             // the duplicate's batch cleanup — a failure
@@ -147,13 +147,13 @@ func TestPipelineDuplicateClearFailureDiscards(t *testing.T) {
 
 	out, err := pipe.Process(context.Background(), abs)
 	if err == nil || !errors.Is(err, boom) {
-		t.Fatalf("err = %v, want ошибка очистки партии", err)
+		t.Fatalf("err = %v, want the batch cleanup error", err)
 	}
 	if out.Kind != OutcomeLeft || !exists(t, abs) {
-		t.Fatalf("итог = %s, want left и файл в incoming", out.Kind)
+		t.Fatalf("the outcome = %s, want left and the file in incoming", out.Kind)
 	}
 	if len(pt.files.records) != 0 {
-		t.Error("дубль не должен писать второй отчёт")
+		t.Error("a duplicate must not write a second report")
 	}
 
 	// The cleanup → COPY → the duplicate's cleanup failure → a discard
@@ -165,7 +165,7 @@ func TestPipelineDuplicateClearFailureDiscards(t *testing.T) {
 		"exec:" + clearStageSQL,
 	}
 	if !reflect.DeepEqual(pt.pool.ops, want) {
-		t.Errorf("порядок обращений =\n%s\nwant:\n%s",
+		t.Errorf("the call order =\n%s\nwant:\n%s",
 			strings.Join(pt.pool.ops, "\n"), strings.Join(want, "\n"))
 	}
 }
@@ -177,7 +177,7 @@ func TestPipelineFailedRatioClearFailureDiscards(t *testing.T) {
 	pt := newPipeTest(t)
 	abs := pt.addFile(t, "com/add/list.txt", "a.org\nb.org\nc.com\n") // 2/3 > 0.1
 
-	boom := errors.New("очистка партии не прошла")
+	boom := errors.New("the batch cleanup failed")
 	pt.pool.execs = []pipeExec{
 		{tag: pgconn.NewCommandTag("DELETE 0")}, // the cleanup before loading (Stage)
 		{err: boom},                             // the batch discard — a failure
@@ -186,13 +186,13 @@ func TestPipelineFailedRatioClearFailureDiscards(t *testing.T) {
 
 	out, err := pt.pipe.Process(context.Background(), abs)
 	if err == nil || !errors.Is(err, boom) {
-		t.Fatalf("err = %v, want ошибка отбрасывания партии", err)
+		t.Fatalf("err = %v, want the batch discard error", err)
 	}
 	if out.Kind != OutcomeLeft || !exists(t, abs) {
-		t.Fatalf("итог = %s, want left и файл в incoming", out.Kind)
+		t.Fatalf("the outcome = %s, want left and the file in incoming", out.Kind)
 	}
 	if len(pt.files.records) != 0 {
-		t.Error("отчёт ошибочного файла не пишется в журнал")
+		t.Error("the bad file's report is not written to the journal")
 	}
 
 	want := []string{
@@ -202,7 +202,7 @@ func TestPipelineFailedRatioClearFailureDiscards(t *testing.T) {
 		"exec:" + clearStageSQL,
 	}
 	if !reflect.DeepEqual(pt.pool.ops, want) {
-		t.Errorf("порядок обращений =\n%s\nwant:\n%s",
+		t.Errorf("the call order =\n%s\nwant:\n%s",
 			strings.Join(pt.pool.ops, "\n"), strings.Join(want, "\n"))
 	}
 }

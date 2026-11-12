@@ -60,7 +60,7 @@ func (q *reanQueue) Publish(ctx context.Context, stream string, msg queue.Messag
 	}
 	res, ok := msg.(queue.Result)
 	if !ok || stream != queue.StreamAnalyze {
-		return "", fmt.Errorf("reanQueue: публикация %T в %s (нужен queue.Result в %s)",
+		return "", fmt.Errorf("reanQueue: publishing %T into %s (want queue.Result into %s)",
 			msg, stream, queue.StreamAnalyze)
 	}
 	q.mu.Lock()
@@ -231,11 +231,11 @@ func (p *reanPool) queryCount() int {
 }
 
 func (p *reanPool) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFromSource) (int64, error) {
-	return 0, errors.New("reanPool: CopyFrom не должен вызываться")
+	return 0, errors.New("reanPool: CopyFrom must not be called")
 }
 
 func (p *reanPool) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
-	return pgconn.CommandTag{}, errors.New("reanPool: Exec не должен вызываться")
+	return pgconn.CommandTag{}, errors.New("reanPool: Exec must not be called")
 }
 
 func (p *reanPool) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
@@ -258,7 +258,7 @@ func (p *reanPool) Query(ctx context.Context, sql string, args ...any) (pgx.Rows
 		return p.tickSelectRows(args)
 	case reanalyzeGuardSQL:
 		if len(args) != 0 {
-			return nil, fmt.Errorf("reanPool: guard корзин: параметров %d, нужно 0", len(args))
+			return nil, fmt.Errorf("reanPool: the bucket guard: %d arguments, want 0", len(args))
 		}
 		if p.guardEmpty {
 			// A protocol break (the aggregate must be a row): an empty set;
@@ -273,11 +273,11 @@ func (p *reanPool) Query(ctx context.Context, sql string, args ...any) (pgx.Rows
 			scanErr: p.guardScanErr, err: p.guardRowsErr}, nil
 	case zoneIDByNameSQL:
 		if len(args) != 1 {
-			return nil, fmt.Errorf("reanPool: зона по имени: параметров %d, нужно 1", len(args))
+			return nil, fmt.Errorf("reanPool: zone by name: %d arguments, want 1", len(args))
 		}
 		name, ok := args[0].(string)
 		if !ok {
-			return nil, fmt.Errorf("reanPool: зона по имени: параметр %T, нужен string", args[0])
+			return nil, fmt.Errorf("reanPool: zone by name: the argument %T, want string", args[0])
 		}
 		id, found := p.zoneByName[name]
 		if !found {
@@ -285,29 +285,29 @@ func (p *reanPool) Query(ctx context.Context, sql string, args ...any) (pgx.Rows
 		}
 		return &reanRows{rows: [][]any{{id}}, scanErr: p.zoneScanErr, err: p.zoneRowsErr}, nil
 	default:
-		return nil, fmt.Errorf("reanPool: неожидаемый SQL Query: %s", sql)
+		return nil, fmt.Errorf("reanPool: unexpected SQL Query: %s", sql)
 	}
 }
 
 // selectRows applies the reanalyzeSelectSQL semantics to the seeds.
 func (p *reanPool) selectRows(args []any) (pgx.Rows, error) {
 	if len(args) != 8 {
-		return nil, fmt.Errorf("reanPool: выборка: параметров %d, нужно 8", len(args))
+		return nil, fmt.Errorf("reanPool: the select: %d arguments, want 8", len(args))
 	}
 	version, okV := args[0].(int32)
 	deleted, okD := args[1].(int16)
 	if !okV || !okD {
-		return nil, fmt.Errorf("reanPool: выборка: версия %T (%v), статус %T (%v)", args[0], args[0], args[1], args[1])
+		return nil, fmt.Errorf("reanPool: the select: version %T (%v), status %T (%v)", args[0], args[0], args[1], args[1])
 	}
 	if deleted != int16(model.StatusDeleted) {
-		return nil, fmt.Errorf("reanPool: выборка: статус-охрана %d, нужен код deleted %d (§13.1)",
+		return nil, fmt.Errorf("reanPool: the select: the status guard %d, want the deleted code %d (§13.1)",
 			deleted, model.StatusDeleted)
 	}
 	var zone *int16
 	if z, ok := args[2].(int16); ok {
 		zone = &z
 	} else if args[2] != nil {
-		return nil, fmt.Errorf("reanPool: выборка: зона %T (%v), нужен int16 или nil", args[2], args[2])
+		return nil, fmt.Errorf("reanPool: the select: zone %T (%v), want int16 or nil", args[2], args[2])
 	}
 	cz, ok1 := args[3].(int16)
 	cd, ok2 := args[4].(int64)
@@ -315,10 +315,10 @@ func (p *reanPool) selectRows(args []any) (pgx.Rows, error) {
 	cv, ok4 := args[6].(int16)
 	limit, ok5 := args[7].(int)
 	if !ok1 || !ok2 || !ok3 || !ok4 || !ok5 {
-		return nil, fmt.Errorf("reanPool: выборка: курсор/LIMIT %v", args[3:])
+		return nil, fmt.Errorf("reanPool: the select: cursor/LIMIT %v", args[3:])
 	}
 	if limit <= 0 {
-		return nil, fmt.Errorf("reanPool: выборка: LIMIT %d ≤ 0", limit)
+		return nil, fmt.Errorf("reanPool: the select: LIMIT %d ≤ 0", limit)
 	}
 	cursor := resultKey{zone: cz, domain: cd, sub: cs, variant: model.Variant(cv)}
 
@@ -393,22 +393,22 @@ func reanCursorGreater(r reanRow, after ReanalyzeCursor) bool {
 // (T-193): the same selection as the PK form, but the cursor and order go by (checked_at, PK).
 func (p *reanPool) tickSelectRows(args []any) (pgx.Rows, error) {
 	if len(args) != 9 {
-		return nil, fmt.Errorf("reanPool: выборка тика: параметров %d, нужно 9", len(args))
+		return nil, fmt.Errorf("reanPool: the tick select: %d arguments, want 9", len(args))
 	}
 	version, okV := args[0].(int32)
 	deleted, okD := args[1].(int16)
 	if !okV || !okD {
-		return nil, fmt.Errorf("reanPool: выборка тика: версия %T (%v), статус %T (%v)", args[0], args[0], args[1], args[1])
+		return nil, fmt.Errorf("reanPool: the tick select: version %T (%v), status %T (%v)", args[0], args[0], args[1], args[1])
 	}
 	if deleted != int16(model.StatusDeleted) {
-		return nil, fmt.Errorf("reanPool: выборка тика: статус-охрана %d, нужен код deleted %d (§13.1)",
+		return nil, fmt.Errorf("reanPool: the tick select: the status guard %d, want the deleted code %d (§13.1)",
 			deleted, model.StatusDeleted)
 	}
 	var zone *int16
 	if z, ok := args[2].(int16); ok {
 		zone = &z
 	} else if args[2] != nil {
-		return nil, fmt.Errorf("reanPool: выборка тика: зона %T (%v), нужен int16 или nil", args[2], args[2])
+		return nil, fmt.Errorf("reanPool: the tick select: zone %T (%v), want int16 or nil", args[2], args[2])
 	}
 	afterAt, okT := args[3].(time.Time)
 	cz, ok1 := args[4].(int16)
@@ -417,10 +417,10 @@ func (p *reanPool) tickSelectRows(args []any) (pgx.Rows, error) {
 	cv, ok4 := args[7].(int16)
 	limit, ok5 := args[8].(int)
 	if !okT || !ok1 || !ok2 || !ok3 || !ok4 || !ok5 {
-		return nil, fmt.Errorf("reanPool: выборка тика: курсор/LIMIT %v", args[3:])
+		return nil, fmt.Errorf("reanPool: the tick select: cursor/LIMIT %v", args[3:])
 	}
 	if limit <= 0 {
-		return nil, fmt.Errorf("reanPool: выборка тика: LIMIT %d ≤ 0", limit)
+		return nil, fmt.Errorf("reanPool: the tick select: LIMIT %d ≤ 0", limit)
 	}
 	after := ReanalyzeCursor{
 		checkedAt: afterAt,
@@ -509,11 +509,11 @@ func (r *reanRows) Scan(dest ...any) error {
 		return r.scanErr
 	}
 	if r.i == 0 || r.i > len(r.rows) {
-		return errors.New("reanRows: Scan без Next")
+		return errors.New("reanRows: Scan without Next")
 	}
 	row := r.rows[r.i-1]
 	if len(dest) != len(row) {
-		return fmt.Errorf("reanRows: приёмников %d, колонок %d", len(dest), len(row))
+		return fmt.Errorf("reanRows: %d destinations, %d columns", len(dest), len(row))
 	}
 	for i, d := range dest {
 		v := row[i]
@@ -527,7 +527,7 @@ func (r *reanRows) Scan(dest ...any) error {
 		case *time.Time:
 			*dst = v.(time.Time)
 		default:
-			return fmt.Errorf("reanRows: приёмник %T не поддерживается", d)
+			return fmt.Errorf("reanRows: the destination %T is not supported", d)
 		}
 	}
 	return nil
@@ -648,13 +648,13 @@ func TestReanalyzeOnceSQL(t *testing.T) {
 
 	calls := pool.calls()
 	if len(calls) != 1 {
-		t.Fatalf("выборок = %d, want 1", len(calls))
+		t.Fatalf("selects = %d, want 1", len(calls))
 	}
 	if calls[0].sql != wantReanalyzeSelect {
-		t.Errorf("SQL выборки:\n%s\nwant:\n%s", calls[0].sql, wantReanalyzeSelect)
+		t.Errorf("the select SQL:\n%s\nwant:\n%s", calls[0].sql, wantReanalyzeSelect)
 	}
 	if reanalyzeSelectSQL != wantReanalyzeSelect {
-		t.Errorf("константа разошлась с контрактом теста")
+		t.Errorf("the constant diverged from the test contract")
 	}
 	wantArgs := []any{
 		int32(42),                              // the set version
@@ -664,22 +664,22 @@ func TestReanalyzeOnceSQL(t *testing.T) {
 		100, // the batch LIMIT
 	}
 	if !reflect.DeepEqual(calls[0].args, wantArgs) {
-		t.Errorf("аргументы = %#v, want %#v", calls[0].args, wantArgs)
+		t.Errorf("the arguments = %#v, want %#v", calls[0].args, wantArgs)
 	}
 
 	if res.Selected != 1 || res.Published != 1 {
-		t.Errorf("итог = %+v, want 1/1", res)
+		t.Errorf("the outcome = %+v, want 1/1", res)
 	}
 	pubs := q.snapshot()
 	if len(pubs) != 1 {
-		t.Fatalf("публикаций = %d, want 1", len(pubs))
+		t.Fatalf("publications = %d, want 1", len(pubs))
 	}
 	want := queue.Result{
 		ZoneID: 3, DomainID: 7, SubdomainID: 0,
 		Variant: model.VariantHTTP, Name: "example.crawl.test",
 	}
 	if pubs[0].stream != queue.StreamAnalyze || pubs[0].msg != want {
-		t.Errorf("публикация = %s %+v, want %s %+v", pubs[0].stream, pubs[0].msg, queue.StreamAnalyze, want)
+		t.Errorf("the publication = %s %+v, want %s %+v", pubs[0].stream, pubs[0].msg, queue.StreamAnalyze, want)
 	}
 }
 
@@ -701,13 +701,13 @@ func TestReanalyzeOnceZoneParam(t *testing.T) {
 		t.Fatalf("ReanalyzeOnce: %v", err)
 	}
 	if args := pool.calls()[0].args; args[2] != int16(2) {
-		t.Errorf("параметр зоны = %v (%T), want int16(2)", args[2], args[2])
+		t.Errorf("the zone argument = %v (%T), want int16(2)", args[2], args[2])
 	}
 	if res.Selected != 1 || res.Published != 1 {
-		t.Fatalf("итог = %+v, want только строка зоны 2", res)
+		t.Fatalf("the outcome = %+v, want only the zone 2 row", res)
 	}
 	if msg := q.snapshot()[0].msg; msg.ZoneID != 2 || msg.Name != "two.b.test" {
-		t.Errorf("публикация = %+v, want строка зоны 2", msg)
+		t.Errorf("the publication = %+v, want the zone 2 row", msg)
 	}
 }
 
@@ -734,11 +734,11 @@ func TestReanalyzeOnceFilters(t *testing.T) {
 		t.Fatalf("ReanalyzeOnce: %v", err)
 	}
 	if res.Selected != 2 || res.Published != 2 {
-		t.Fatalf("итог = %+v, want 2/2 (NULL + устаревшая)", res)
+		t.Fatalf("the outcome = %+v, want 2/2 (NULL + stale)", res)
 	}
 	for i, want := range []string{"never.test", "stale.test"} {
 		if got := q.snapshot()[i].msg.Name; got != want {
-			t.Errorf("публикация[%d] = %s, want %s", i, got, want)
+			t.Errorf("publication[%d] = %s, want %s", i, got, want)
 		}
 	}
 }
@@ -758,10 +758,10 @@ func TestReanalyzeOnceBatchLimit(t *testing.T) {
 		t.Fatalf("ReanalyzeOnce: %v", err)
 	}
 	if res.Selected != 3 || res.Published != 3 {
-		t.Fatalf("итог = %+v, want пачка 3", res)
+		t.Fatalf("the outcome = %+v, want batch 3", res)
 	}
 	if got := q.snapshot()[2].msg.Name; got != "d3.test" {
-		t.Errorf("третья публикация = %s, want d3.test (порядок ключа)", got)
+		t.Errorf("the third publication = %s, want d3.test (the key order)", got)
 	}
 }
 
@@ -776,10 +776,10 @@ func TestReanalyzeOnceEmpty(t *testing.T) {
 		t.Fatalf("ReanalyzeOnce: %v", err)
 	}
 	if res != (ReanalyzeResult{}) {
-		t.Errorf("итог = %+v, want нулевой", res)
+		t.Errorf("the outcome = %+v, want zero", res)
 	}
 	if n := q.count(); n != 0 {
-		t.Errorf("публикаций = %d, want 0", n)
+		t.Errorf("publications = %d, want 0", n)
 	}
 }
 
@@ -792,7 +792,7 @@ func TestReanalyzeOnceDefaults(t *testing.T) {
 		t.Fatalf("ReanalyzeOnce: %v", err)
 	}
 	if got := pool.calls()[0].args[7]; got != 5000 {
-		t.Errorf("LIMIT = %v, want дефолт 5000", got)
+		t.Errorf("LIMIT = %v, want the default 5000", got)
 	}
 }
 
@@ -815,29 +815,29 @@ func TestReanalyzeDrainBatches(t *testing.T) {
 		t.Fatalf("ReanalyzeDrain: %v", err)
 	}
 	if res.Selected != 7 || res.Published != 7 {
-		t.Fatalf("итог = %+v, want 7/7", res)
+		t.Fatalf("the outcome = %+v, want 7/7", res)
 	}
 
 	calls := pool.calls()
 	if len(calls) != 3 { // 3 + 3 + 1 (a short one — stop)
-		t.Fatalf("выборок = %d, want 3", len(calls))
+		t.Fatalf("selects = %d, want 3", len(calls))
 	}
 	// The 2nd batch's cursor is the last row of the 1st, the 3rd's is the
 	// last of the 2nd: the row-value parameters grow.
 	if got := calls[1].args[4]; got != int64(3) {
-		t.Errorf("курсор 2-й пачки domain = %v, want 3", got)
+		t.Errorf("the batch 2 cursor's domain = %v, want 3", got)
 	}
 	if got := calls[2].args[4]; got != int64(6) {
-		t.Errorf("курсор 3-й пачки domain = %v, want 6", got)
+		t.Errorf("the batch 3 cursor's domain = %v, want 6", got)
 	}
 
 	pubs := q.snapshot()
 	if len(pubs) != 7 {
-		t.Fatalf("публикаций = %d, want 7 (без повторов)", len(pubs))
+		t.Fatalf("publications = %d, want 7 (no repeats)", len(pubs))
 	}
 	for i, p := range pubs {
 		if want := int64(i + 1); p.msg.DomainID != want {
-			t.Errorf("публикация[%d].DomainID = %d, want %d (порядок ключа)", i, p.msg.DomainID, want)
+			t.Errorf("publication[%d].DomainID = %d, want %d (the key order)", i, p.msg.DomainID, want)
 		}
 	}
 }
@@ -859,10 +859,10 @@ func TestReanalyzeDrainExactBatch(t *testing.T) {
 		t.Fatalf("ReanalyzeDrain: %v", err)
 	}
 	if res.Selected != 6 || res.Published != 6 {
-		t.Fatalf("итог = %+v, want 6/6", res)
+		t.Fatalf("the outcome = %+v, want 6/6", res)
 	}
 	if n := len(pool.calls()); n != 3 {
-		t.Errorf("выборок = %d, want 3 (2 полные + контрольная)", n)
+		t.Errorf("selects = %d, want 3 (2 full + the check one)", n)
 	}
 }
 
@@ -879,23 +879,23 @@ func TestReanalyzeIdempotent(t *testing.T) {
 
 	first, err := ReanalyzeDrain(context.Background(), pool, q, 42, nil, ReanalyzeOptions{})
 	if err != nil {
-		t.Fatalf("первый дренаж: %v", err)
+		t.Fatalf("the first drain: %v", err)
 	}
 	if first.Published != 2 {
-		t.Fatalf("первый дренаж = %+v, want 2", first)
+		t.Fatalf("the first drain = %+v, want 2", first)
 	}
 
 	pool.markAnalyzed(42) // the worker committed the version for both rows
 	q2 := &reanQueue{}
 	second, err := ReanalyzeDrain(context.Background(), pool, q2, 42, nil, ReanalyzeOptions{})
 	if err != nil {
-		t.Fatalf("второй дренаж: %v", err)
+		t.Fatalf("the second drain: %v", err)
 	}
 	if second != (ReanalyzeResult{}) {
-		t.Errorf("повторный дренаж = %+v, want нулевой (идемпотентность)", second)
+		t.Errorf("the repeated drain = %+v, want zero (idempotency)", second)
 	}
 	if n := q2.count(); n != 0 {
-		t.Errorf("публикаций повторно = %d, want 0", n)
+		t.Errorf("re-publications = %d, want 0", n)
 	}
 }
 
@@ -925,55 +925,55 @@ func TestReanalyzeTickSQL(t *testing.T) {
 
 	calls := pool.calls()
 	if len(calls) != 2 { // the guard + one batch (1 < 100) — short, stop
-		t.Fatalf("выборок = %d, want 2 (guard + пачка)", len(calls))
+		t.Fatalf("selects = %d, want 2 (the guard + a batch)", len(calls))
 	}
 	if calls[0].sql != wantReanalyzeGuardSQL {
-		t.Errorf("SQL guard'а:\n%s\nwant:\n%s", calls[0].sql, wantReanalyzeGuardSQL)
+		t.Errorf("the guard SQL:\n%s\nwant:\n%s", calls[0].sql, wantReanalyzeGuardSQL)
 	}
 	if reanalyzeGuardSQL != wantReanalyzeGuardSQL {
-		t.Errorf("константа guard'а разошлась с контрактом теста")
+		t.Errorf("the guard constant diverged from the test contract")
 	}
 	if len(calls[0].args) != 0 {
-		t.Errorf("аргументы guard'а = %#v, want без параметров", calls[0].args)
+		t.Errorf("the guard's arguments = %#v, want none", calls[0].args)
 	}
 	if calls[1].sql != wantReanalyzeTickSQL {
-		t.Errorf("SQL выборки тика:\n%s\nwant:\n%s", calls[1].sql, wantReanalyzeTickSQL)
+		t.Errorf("the tick select SQL:\n%s\nwant:\n%s", calls[1].sql, wantReanalyzeTickSQL)
 	}
 	if reanalyzeTickSQL != wantReanalyzeTickSQL {
-		t.Errorf("константа разошлась с контрактом теста")
+		t.Errorf("the constant diverged from the test contract")
 	}
 	args := calls[1].args
 	if args[0] != int32(42) || args[1] != int16(model.StatusDeleted) || args[2] != nil {
-		t.Errorf("аргументы отбора = %#v, want версия 42, deleted, зона nil", args[:3])
+		t.Errorf("the selection arguments = %#v, want version 42, deleted, zone nil", args[:3])
 	}
 	anchor, ok := args[3].(time.Time)
 	if !ok {
-		t.Fatalf("курсор времени = %T (%v), нужен time.Time", args[3], args[3])
+		t.Fatalf("the time cursor = %T (%v), want time.Time", args[3], args[3])
 	}
 	// The anchor = now − lookback (a minute of slack for a slow test).
 	if d := anchor.Sub(before); d < -time.Minute || d > time.Minute {
-		t.Errorf("якорь = %v, want now − %v (±1 мин, расхождение %v)",
+		t.Errorf("the anchor = %v, want now − %v (±1 min, the drift %v)",
 			anchor, DefaultReanalyzeLookback, d)
 	}
 	if args[4] != int16(0) || args[5] != int64(0) || args[6] != int16(0) || args[7] != int16(0) {
-		t.Errorf("PK-часть якоря = %v, want нули", args[4:8])
+		t.Errorf("the anchor's PK part = %v, want zeros", args[4:8])
 	}
 	if args[8] != 100 {
 		t.Errorf("LIMIT = %v, want 100", args[8])
 	}
 
 	if res.Selected != 1 || res.Published != 1 {
-		t.Fatalf("итог = %+v, want 1/1", res)
+		t.Fatalf("the outcome = %+v, want 1/1", res)
 	}
 	pubs := q.snapshot()
 	if len(pubs) != 1 || pubs[0].stream != queue.StreamAnalyze {
-		t.Fatalf("публикации = %+v, want одна в q:analyze", pubs)
+		t.Fatalf("the publications = %+v, want one into q:analyze", pubs)
 	}
 	if want := (queue.Result{
 		ZoneID: 3, DomainID: 7, SubdomainID: 0,
 		Variant: model.VariantHTTP, Name: "example.crawl.test",
 	}); pubs[0].msg != want {
-		t.Errorf("публикация = %+v, want %+v", pubs[0].msg, want)
+		t.Errorf("the publication = %+v, want %+v", pubs[0].msg, want)
 	}
 }
 
@@ -1000,13 +1000,13 @@ func TestReanalyzeTickAnchorWindow(t *testing.T) {
 		t.Fatalf("ReanalyzeTick: %v", err)
 	}
 	if res.Selected != 2 || res.Published != 2 {
-		t.Fatalf("итог = %+v, want 2/2 (NULL + устаревшая в окне)", res)
+		t.Fatalf("the outcome = %+v, want 2/2 (NULL + stale in the window)", res)
 	}
 	// The batch order is by (checked_at, PK): the stale one (2h) ahead of
 	// the fresh one (1h).
 	for i, want := range []string{"stale.test", "fresh.test"} {
 		if got := q.snapshot()[i].msg.Name; got != want {
-			t.Errorf("публикация[%d] = %s, want %s", i, got, want)
+			t.Errorf("publication[%d] = %s, want %s", i, got, want)
 		}
 	}
 }
@@ -1037,29 +1037,29 @@ func TestReanalyzeTickCursor(t *testing.T) {
 		t.Fatalf("ReanalyzeTick: %v", err)
 	}
 	if res.Selected != 5 || res.Published != 5 {
-		t.Fatalf("итог = %+v, want 5/5", res)
+		t.Fatalf("the outcome = %+v, want 5/5", res)
 	}
 	calls := pool.calls()
 	if len(calls) != 4 { // the guard + 2 + 2 + 1 (a short one — stop)
-		t.Fatalf("выборок = %d, want 4", len(calls))
+		t.Fatalf("selects = %d, want 4", len(calls))
 	}
 	// The 2nd batch's cursor is the 1st's last row (d2, the base+1m mark),
 	// the 3rd's is the 2nd's last (d4).
 	if gotAt, _ := calls[2].args[3].(time.Time); !gotAt.Equal(base.Add(time.Minute)) {
-		t.Errorf("курсор 2-й пачки checked_at = %v, want %v", gotAt, base.Add(time.Minute))
+		t.Errorf("the batch 2 cursor's checked_at = %v, want %v", gotAt, base.Add(time.Minute))
 	}
 	if calls[2].args[5] != int64(2) {
-		t.Errorf("курсор 2-й пачки domain = %v, want 2", calls[2].args[5])
+		t.Errorf("the batch 2 cursor's domain = %v, want 2", calls[2].args[5])
 	}
 	if gotAt, _ := calls[3].args[3].(time.Time); !gotAt.Equal(base.Add(4 * time.Minute)) {
-		t.Errorf("курсор 3-й пачки checked_at = %v, want %v", gotAt, base.Add(4*time.Minute))
+		t.Errorf("the batch 3 cursor's checked_at = %v, want %v", gotAt, base.Add(4*time.Minute))
 	}
 	if calls[3].args[5] != int64(4) {
-		t.Errorf("курсор 3-й пачки domain = %v, want 4", calls[3].args[5])
+		t.Errorf("the batch 3 cursor's domain = %v, want 4", calls[3].args[5])
 	}
 	// The cursor after the pass is the last row of the last batch.
 	if !cur.checkedAt.Equal(base.Add(5*time.Minute)) || cur.key.domain != 5 {
-		t.Errorf("курсор после прохода = %v/%d, want %v/5",
+		t.Errorf("the cursor after the pass = %v/%d, want %v/5",
 			cur.checkedAt, cur.key.domain, base.Add(5*time.Minute))
 	}
 
@@ -1067,34 +1067,34 @@ func TestReanalyzeTickCursor(t *testing.T) {
 	// select with the last row's cursor (an empty batch does not move it).
 	res2, err := ReanalyzeTick(context.Background(), pool, q, 1, &cur, ReanalyzeOptions{BatchSize: 2})
 	if err != nil {
-		t.Fatalf("повторный ReanalyzeTick: %v", err)
+		t.Fatalf("the repeated ReanalyzeTick: %v", err)
 	}
 	if res2 != (ReanalyzeResult{}) {
-		t.Errorf("повторный тик = %+v, want нулевой (окно исчерпано)", res2)
+		t.Errorf("the repeated tick = %+v, want zero (the window is exhausted)", res2)
 	}
 	calls2 := pool.calls()[4:]
 	if len(calls2) != 2 {
-		t.Fatalf("выборок повторного тика = %d, want 2 (guard + пустая)", len(calls2))
+		t.Fatalf("the repeated tick's selects = %d, want 2 (the guard + an empty one)", len(calls2))
 	}
 	if gotAt, _ := calls2[1].args[3].(time.Time); !gotAt.Equal(base.Add(5 * time.Minute)) {
-		t.Errorf("курсор пустого тика checked_at = %v, want прежний %v",
+		t.Errorf("the empty tick's cursor checked_at = %v, want the previous %v",
 			gotAt, base.Add(5*time.Minute))
 	}
 	if calls2[1].args[5] != int64(5) {
-		t.Errorf("курсор пустого тика domain = %v, want 5", calls2[1].args[5])
+		t.Errorf("the empty tick's cursor domain = %v, want 5", calls2[1].args[5])
 	}
 	// A new row ahead of the cursor — the next tick will pick it up.
 	pool.seedDomain(1, 6, "d6", model.StatusAlive)
 	pool.seedRowAt(1, 6, 0, model.VariantMain, nil, base.Add(time.Hour))
 	res3, err := ReanalyzeTick(context.Background(), pool, q, 1, &cur, ReanalyzeOptions{BatchSize: 2})
 	if err != nil {
-		t.Fatalf("тик после свежей строки: %v", err)
+		t.Fatalf("the tick after a fresh row: %v", err)
 	}
 	if res3.Selected != 1 || res3.Published != 1 {
-		t.Fatalf("итог = %+v, want 1/1 (свежий эпизод впереди курсора)", res3)
+		t.Fatalf("the outcome = %+v, want 1/1 (a fresh episode ahead of the cursor)", res3)
 	}
 	if msg := q.snapshot()[5].msg; msg.DomainID != 6 {
-		t.Errorf("публикация свежего эпизода = %+v, want домен 6", msg)
+		t.Errorf("the fresh episode's publication = %+v, want domain 6", msg)
 	}
 }
 
@@ -1124,22 +1124,22 @@ func TestReanalyzeTickGuard(t *testing.T) {
 	pool, q, cur := seed()
 	res, err := ReanalyzeTick(context.Background(), pool, q, 1, cur, ReanalyzeOptions{})
 	if err != nil {
-		t.Fatalf("ReanalyzeTick (guard закрыт): %v", err)
+		t.Fatalf("ReanalyzeTick (the guard closed): %v", err)
 	}
 	if res != (ReanalyzeResult{}) {
-		t.Errorf("итог = %+v, want нулевой (тяжёлая выборка не выполняется)", res)
+		t.Errorf("the outcome = %+v, want zero (the heavy select does not run)", res)
 	}
 	if n := q.count(); n != 0 {
-		t.Errorf("публикаций = %d, want 0", n)
+		t.Errorf("publications = %d, want 0", n)
 	}
 	calls := pool.calls()
 	if len(calls) != 1 || calls[0].sql != reanalyzeGuardSQL {
-		t.Fatalf("выборок = %d, want 1 (только guard)", len(calls))
+		t.Fatalf("selects = %d, want 1 (the guard only)", len(calls))
 	}
 	// The cursor jumped to the hour bound with a zero PK part: the
 	// immature area (the current hour) stays ahead.
 	if !cur.checkedAt.Equal(hour) || cur.key != (resultKey{}) {
-		t.Errorf("курсор = %v/%+v, want граница часа %v с нулевым PK", cur.checkedAt, cur.key, hour)
+		t.Errorf("the cursor = %v/%+v, want the hour boundary %v with a zero PK", cur.checkedAt, cur.key, hour)
 	}
 
 	// A negative sum — the same outcome: a decrement drift does not hammer the DB.
@@ -1147,28 +1147,28 @@ func TestReanalyzeTickGuard(t *testing.T) {
 	pool.guardTails = -5
 	res, err = ReanalyzeTick(context.Background(), pool, q, 1, cur, ReanalyzeOptions{})
 	if err != nil {
-		t.Fatalf("ReanalyzeTick (отрицательная сумма): %v", err)
+		t.Fatalf("ReanalyzeTick (a negative sum): %v", err)
 	}
 	if res != (ReanalyzeResult{}) || q.count() != 0 || len(pool.calls()) != 1 {
-		t.Errorf("отрицательная сумма: итог %+v, публикаций %d, выборок %d — want тихий пропуск",
+		t.Errorf("a negative sum: the outcome %+v, publications %d, selects %d — want a silent skip",
 			res, q.count(), len(pool.calls()))
 	}
 
 	// A guard error — a pass error (no tick select).
 	pool, q, cur = seed()
-	pool.setQueryErr(errors.New("бд недоступна"))
+	pool.setQueryErr(errors.New("db unavailable"))
 	if _, err := ReanalyzeTick(context.Background(), pool, q, 1, cur, ReanalyzeOptions{}); err == nil ||
-		!strings.Contains(err.Error(), "analyzer: переанализ: корзины хвостов") ||
-		!strings.Contains(err.Error(), "бд недоступна") {
-		t.Errorf("ошибка guard'а = %v, want контекст корзин и исходная", err)
+		!strings.Contains(err.Error(), "analyzer: re-analysis: tail buckets") ||
+		!strings.Contains(err.Error(), "db unavailable") {
+		t.Errorf("the guard error = %v, want the buckets context and the original", err)
 	}
 
 	// An empty aggregate response — a protocol break, an error.
 	pool, q, cur = seed()
 	pool.guardEmpty = true
 	if _, err := ReanalyzeTick(context.Background(), pool, q, 1, cur, ReanalyzeOptions{}); err == nil ||
-		!strings.Contains(err.Error(), "пустой ответ агрегата") {
-		t.Errorf("пустой ответ guard'а = %v, want обрыв протокола", err)
+		!strings.Contains(err.Error(), "empty aggregate response") {
+		t.Errorf("the guard's empty response = %v, want a protocol break", err)
 	}
 }
 
@@ -1185,17 +1185,17 @@ func TestReanalyzeTickPublishError(t *testing.T) {
 	}
 	var cur ReanalyzeCursor
 	res, err := ReanalyzeTick(context.Background(), pool,
-		&reanQueue{errs: []error{nil, errors.New("redis ушёл")}}, 1, &cur, ReanalyzeOptions{BatchSize: 3})
-	if err == nil || !strings.Contains(err.Error(), "redis ушёл") {
-		t.Fatalf("ошибка = %v, want причину публикации", err)
+		&reanQueue{errs: []error{nil, errors.New("redis went away")}}, 1, &cur, ReanalyzeOptions{BatchSize: 3})
+	if err == nil || !strings.Contains(err.Error(), "redis went away") {
+		t.Fatalf("the error = %v, want the publish cause", err)
 	}
 	if res.Selected != 3 || res.Published != 1 {
-		t.Errorf("итог = %+v, want 3/1 (до сбоя)", res)
+		t.Errorf("the outcome = %+v, want 3/1 (before the failure)", res)
 	}
 	// The cursor did not advance: the first batch was not published in full.
 	anchor := time.Now().Add(-DefaultReanalyzeLookback)
 	if d := cur.checkedAt.Sub(anchor); d < -time.Minute || d > time.Minute {
-		t.Errorf("курсор после сбоя публикации = %v, want якорь %v (пачка не продвинута)",
+		t.Errorf("the cursor after the publish failure = %v, want the anchor %v (the batch not advanced)",
 			cur.checkedAt, anchor)
 	}
 
@@ -1203,10 +1203,10 @@ func TestReanalyzeTickPublishError(t *testing.T) {
 	q2 := &reanQueue{}
 	res2, err := ReanalyzeTick(context.Background(), pool, q2, 1, &cur, ReanalyzeOptions{BatchSize: 3})
 	if err != nil {
-		t.Fatalf("повторный тик: %v", err)
+		t.Fatalf("the repeated tick: %v", err)
 	}
 	if res2.Selected != 3 || res2.Published != 3 {
-		t.Fatalf("повторный итог = %+v, want 3/3 (пачка повторена)", res2)
+		t.Fatalf("the repeated outcome = %+v, want 3/3 (the batch repeated)", res2)
 	}
 }
 
@@ -1219,13 +1219,13 @@ func TestReanalyzeTickCancel(t *testing.T) {
 
 	res, err := ReanalyzeTick(ctx, pool, &reanQueue{}, 1, &ReanalyzeCursor{}, ReanalyzeOptions{})
 	if !errors.Is(err, context.Canceled) {
-		t.Errorf("ошибка = %v, want context.Canceled", err)
+		t.Errorf("the error = %v, want context.Canceled", err)
 	}
-	if err != nil && err.Error() != "analyzer: переанализ: context canceled" {
-		t.Errorf("ошибка = %q, want точная обёртка «analyzer: переанализ: context canceled»", err)
+	if err != nil && err.Error() != "analyzer: re-analysis: context canceled" {
+		t.Errorf("the error = %q, want the exact wrap «analyzer: re-analysis: context canceled»", err)
 	}
 	if res.Published != 0 {
-		t.Errorf("итог = %+v, want без публикаций", res)
+		t.Errorf("the outcome = %+v, want no publications", res)
 	}
 }
 
@@ -1243,7 +1243,7 @@ func TestReanalyzeTickNilCursor(t *testing.T) {
 		t.Fatalf("ReanalyzeTick(nil): %v", err)
 	}
 	if res.Selected != 1 || res.Published != 1 {
-		t.Fatalf("итог = %+v, want 1/1", res)
+		t.Fatalf("the outcome = %+v, want 1/1", res)
 	}
 }
 
@@ -1260,18 +1260,18 @@ func TestReanalyzePublishError(t *testing.T) {
 		pool.seedDomain(1, i, fmt.Sprintf("d%d", i), model.StatusAlive)
 		pool.seedRow(1, i, 0, model.VariantMain, nil)
 	}
-	q := &reanQueue{errs: []error{nil, errors.New("redis ушёл")}}
+	q := &reanQueue{errs: []error{nil, errors.New("redis went away")}}
 
 	res, err := ReanalyzeOnce(context.Background(), pool, q, 1, nil, ReanalyzeOptions{})
 	if err == nil ||
-		!strings.Contains(err.Error(), "analyzer: переанализ: публикация q:analyze") ||
-		!strings.Contains(err.Error(), "запись 2/2") ||
+		!strings.Contains(err.Error(), "analyzer: re-analysis: q:analyze publish") ||
+		!strings.Contains(err.Error(), "record 2/2") ||
 		!strings.Contains(err.Error(), "d2.test") ||
-		!strings.Contains(err.Error(), "redis ушёл") {
-		t.Errorf("ошибка = %v, want контекст публикации, позицию 2/2, домен и причину", err)
+		!strings.Contains(err.Error(), "redis went away") {
+		t.Errorf("the error = %v, want the publish context, the position 2/2, the domain and the cause", err)
 	}
 	if res.Selected != 2 || res.Published != 1 {
-		t.Errorf("итог = %+v, want 2/1 (до сбоя)", res)
+		t.Errorf("the outcome = %+v, want 2/1 (before the failure)", res)
 	}
 
 	// The drain does not swallow its batch's publish error (its own
@@ -1284,12 +1284,12 @@ func TestReanalyzePublishError(t *testing.T) {
 		drainPool.seedRow(1, i, 0, model.VariantMain, nil)
 	}
 	drainRes, err := ReanalyzeDrain(context.Background(), drainPool,
-		&reanQueue{errs: []error{nil, errors.New("redis ушёл")}}, 1, nil, ReanalyzeOptions{})
-	if err == nil || !strings.Contains(err.Error(), "redis ушёл") {
-		t.Errorf("дренаж: ошибка = %v, want причину публикации (не глотается)", err)
+		&reanQueue{errs: []error{nil, errors.New("redis went away")}}, 1, nil, ReanalyzeOptions{})
+	if err == nil || !strings.Contains(err.Error(), "redis went away") {
+		t.Errorf("the drain: the error = %v, want the publish cause (not swallowed)", err)
 	}
 	if drainRes.Selected != 2 || drainRes.Published != 1 {
-		t.Errorf("дренаж: итог = %+v, want 2/1 (до сбоя)", drainRes)
+		t.Errorf("the drain: the outcome = %+v, want 2/1 (before the failure)", drainRes)
 	}
 }
 
@@ -1297,26 +1297,26 @@ func TestReanalyzePublishError(t *testing.T) {
 // cancellation is preserved via errors.Is.
 func TestReanalyzeSelectError(t *testing.T) {
 	pool := newReanPool()
-	pool.setQueryErr(errors.New("бд недоступна"))
+	pool.setQueryErr(errors.New("db unavailable"))
 	_, err := ReanalyzeOnce(context.Background(), pool, &reanQueue{}, 1, nil, ReanalyzeOptions{})
 	if err == nil ||
-		!strings.Contains(err.Error(), "analyzer: переанализ: выборка") ||
-		!strings.Contains(err.Error(), "бд недоступна") {
-		t.Errorf("ошибка = %v, want контекст выборки и исходная ошибка", err)
+		!strings.Contains(err.Error(), "analyzer: re-analysis: select") ||
+		!strings.Contains(err.Error(), "db unavailable") {
+		t.Errorf("the error = %v, want the select context and the original error", err)
 	}
 
 	// The drain does not swallow a select error (a return-cut mutant, T-M10):
 	// the outcome is "as is", the error goes out.
 	pool2 := newReanPool()
-	pool2.setQueryErr(errors.New("бд недоступна"))
+	pool2.setQueryErr(errors.New("db unavailable"))
 	if _, err := ReanalyzeDrain(context.Background(), pool2, &reanQueue{}, 1, nil, ReanalyzeOptions{}); err == nil ||
-		!strings.Contains(err.Error(), "analyzer: переанализ: выборка") {
-		t.Errorf("дренаж: ошибка = %v, want контекст выборки (не глотается)", err)
+		!strings.Contains(err.Error(), "analyzer: re-analysis: select") {
+		t.Errorf("the drain: the error = %v, want the select context (not swallowed)", err)
 	}
 
 	pool.setQueryErr(context.Canceled)
 	if _, err := ReanalyzeOnce(context.Background(), pool, &reanQueue{}, 1, nil, ReanalyzeOptions{}); !errors.Is(err, context.Canceled) {
-		t.Errorf("ошибка = %v, want context.Canceled", err)
+		t.Errorf("the error = %v, want context.Canceled", err)
 	}
 }
 
@@ -1331,24 +1331,24 @@ func TestReanalyzeRowErrors(t *testing.T) {
 		return pool
 	}
 	pool := seed()
-	pool.selectScanErr = errors.New("скан-бум")
+	pool.selectScanErr = errors.New("scan boom")
 	q := &reanQueue{}
 	if _, err := ReanalyzeOnce(context.Background(), pool, q, 1, nil, ReanalyzeOptions{}); err == nil ||
-		!strings.Contains(err.Error(), "analyzer: переанализ: выборка: чтение: скан-бум") {
-		t.Errorf("Scan: ошибка = %v, want «выборка: чтение: скан-бум»", err)
+		!strings.Contains(err.Error(), "analyzer: re-analysis: select: read: scan boom") {
+		t.Errorf("the Scan: the error = %v, want «select: read: scan boom»", err)
 	}
 	if n := q.count(); n != 0 {
-		t.Errorf("публикаций при сбое Scan = %d, want 0", n)
+		t.Errorf("publications on the Scan failure = %d, want 0", n)
 	}
 
 	pool = seed()
-	pool.selectRowsErr = errors.New("строк-бум")
+	pool.selectRowsErr = errors.New("rows boom")
 	if _, err := ReanalyzeOnce(context.Background(), pool, q, 1, nil, ReanalyzeOptions{}); err == nil ||
-		!strings.Contains(err.Error(), "analyzer: переанализ: выборка: строк-бум") {
-		t.Errorf("Err: ошибка = %v, want «выборка: строк-бум» (без «чтение»)", err)
+		!strings.Contains(err.Error(), "analyzer: re-analysis: select: rows boom") {
+		t.Errorf("the Err: the error = %v, want «select: rows boom» (without «read»)", err)
 	}
 	if n := q.count(); n != 0 {
-		t.Errorf("публикаций при сбое Err = %d, want 0", n)
+		t.Errorf("publications on the Err failure = %d, want 0", n)
 	}
 }
 
@@ -1368,13 +1368,13 @@ func TestReanalyzeDrainCancel(t *testing.T) {
 
 	res, err := ReanalyzeDrain(ctx, pool, q, 1, nil, ReanalyzeOptions{})
 	if !errors.Is(err, context.Canceled) {
-		t.Errorf("ошибка = %v, want context.Canceled", err)
+		t.Errorf("the error = %v, want context.Canceled", err)
 	}
-	if err != nil && err.Error() != "analyzer: переанализ: context canceled" {
-		t.Errorf("ошибка = %q, want точная обёртка «analyzer: переанализ: context canceled»", err)
+	if err != nil && err.Error() != "analyzer: re-analysis: context canceled" {
+		t.Errorf("the error = %q, want the exact wrap «analyzer: re-analysis: context canceled»", err)
 	}
 	if res.Published != 0 {
-		t.Errorf("итог = %+v, want без публикаций", res)
+		t.Errorf("the outcome = %+v, want no publications", res)
 	}
 }
 
@@ -1386,42 +1386,42 @@ func TestReanalyzeNilArgs(t *testing.T) {
 		call func() error
 		want string
 	}{
-		{"проход без пула", func() error {
+		{"a pass without a pool", func() error {
 			_, err := ReanalyzeOnce(context.Background(), nil, &reanQueue{}, 1, nil, ReanalyzeOptions{})
 			return err
-		}, "пул не задан"},
-		{"проход без очереди", func() error {
+		}, "the pool is not set"},
+		{"a pass without a queue", func() error {
 			_, err := ReanalyzeOnce(context.Background(), newReanPool(), nil, 1, nil, ReanalyzeOptions{})
 			return err
-		}, "очередь не задана"},
-		{"дренаж без пула", func() error {
+		}, "the queue is not set"},
+		{"a drain without a pool", func() error {
 			_, err := ReanalyzeDrain(context.Background(), nil, &reanQueue{}, 1, nil, ReanalyzeOptions{})
 			return err
-		}, "пул не задан"},
-		{"дренаж без очереди", func() error {
+		}, "the pool is not set"},
+		{"a drain without a queue", func() error {
 			_, err := ReanalyzeDrain(context.Background(), newReanPool(), nil, 1, nil, ReanalyzeOptions{})
 			return err
-		}, "очередь не задана"},
-		{"цикл без пула", func() error {
+		}, "the queue is not set"},
+		{"a loop without a pool", func() error {
 			return ReanalyzeLoop(context.Background(), nil, &reanQueue{}, newReanSource(1), ReanalyzeOptions{})
-		}, "пул не задан"},
-		{"цикл без очереди", func() error {
+		}, "the pool is not set"},
+		{"a loop without a queue", func() error {
 			return ReanalyzeLoop(context.Background(), newReanPool(), nil, newReanSource(1), ReanalyzeOptions{})
-		}, "очередь не задана"},
-		{"цикл без источника правил", func() error {
+		}, "the queue is not set"},
+		{"a loop without a rules source", func() error {
 			return ReanalyzeLoop(context.Background(), newReanPool(), &reanQueue{}, nil, ReanalyzeOptions{})
-		}, "источник набора правил не задан"},
-		{"тик без пула", func() error {
+		}, "the rule set source is not set"},
+		{"a tick without a pool", func() error {
 			_, err := ReanalyzeTick(context.Background(), nil, &reanQueue{}, 1, &ReanalyzeCursor{}, ReanalyzeOptions{})
 			return err
-		}, "пул не задан"},
-		{"тик без очереди", func() error {
+		}, "the pool is not set"},
+		{"a tick without a queue", func() error {
 			_, err := ReanalyzeTick(context.Background(), newReanPool(), nil, 1, &ReanalyzeCursor{}, ReanalyzeOptions{})
 			return err
-		}, "очередь не задана"},
+		}, "the queue is not set"},
 	} {
 		if err := check.call(); err == nil || !strings.Contains(err.Error(), check.want) {
-			t.Errorf("%s: ошибка = %v, want %q", check.name, err, check.want)
+			t.Errorf("%s: the error = %v, want %q", check.name, err, check.want)
 		}
 	}
 }
@@ -1436,18 +1436,18 @@ func TestReanalyzeOptionsDefaults(t *testing.T) {
 	}
 	got = ReanalyzeOptions{Interval: -time.Minute, BatchSize: -1}.withDefaults()
 	if got.Interval != DefaultReanalyzeInterval || got.BatchSize != DefaultReanalyzeBatch {
-		t.Errorf("withDefaults(отрицательные) = %v/%v, want дефолты",
+		t.Errorf("withDefaults(negative) = %v/%v, want the defaults",
 			got.Interval, got.BatchSize)
 	}
 	keep := ReanalyzeOptions{Interval: time.Minute, BatchSize: 10}.withDefaults()
 	if keep.Interval != time.Minute || keep.BatchSize != 10 {
-		t.Errorf("withDefaults затирает заданные значения: %v/%v", keep.Interval, keep.BatchSize)
+		t.Errorf("withDefaults overwrites the given values: %v/%v", keep.Interval, keep.BatchSize)
 	}
 	// Unit values are valid and are not replaced by the defaults (the
 	// "<= 0 → <= 1" bound, T-M10): 1ns and 1 row are working settings.
 	unit := ReanalyzeOptions{Interval: 1, BatchSize: 1}.withDefaults()
 	if unit.Interval != 1 || unit.BatchSize != 1 {
-		t.Errorf("withDefaults(единичные) = %v/%v, want 1/1", unit.Interval, unit.BatchSize)
+		t.Errorf("withDefaults(unit) = %v/%v, want 1/1", unit.Interval, unit.BatchSize)
 	}
 }
 
@@ -1463,36 +1463,36 @@ func TestZoneIDByName(t *testing.T) {
 	}
 	calls := pool.calls()
 	if len(calls) != 1 || calls[0].sql != wantZoneIDByName {
-		t.Fatalf("SQL = %v, want точный контракт %s", calls, wantZoneIDByName)
+		t.Fatalf("the SQL = %v, want the exact contract %s", calls, wantZoneIDByName)
 	}
 	if zoneIDByNameSQL != wantZoneIDByName {
-		t.Errorf("константа разошлась с контрактом теста")
+		t.Errorf("the constant diverged from the test contract")
 	}
 
 	// No zone: id is exactly 0 and found=false (the "return 0" → ±1 mutants, T-M10).
 	id, found, err = ZoneIDByName(context.Background(), pool, "nope.test")
 	if err != nil || found || id != 0 {
-		t.Errorf("несуществующая зона = %d, %v, %v; want 0, false, nil", id, found, err)
+		t.Errorf("a missing zone = %d, %v, %v; want 0, false, nil", id, found, err)
 	}
 
 	fail := newReanPool()
-	fail.setQueryErr(errors.New("бд недоступна"))
+	fail.setQueryErr(errors.New("db unavailable"))
 	id, _, err = ZoneIDByName(context.Background(), fail, "x.test")
-	if err == nil || !strings.Contains(err.Error(), "analyzer: зона по имени") {
-		t.Errorf("ошибка = %v, want контекст задачи", err)
+	if err == nil || !strings.Contains(err.Error(), "analyzer: zone by name") {
+		t.Errorf("the error = %v, want the task context", err)
 	}
 	if id != 0 {
-		t.Errorf("id при ошибке = %d, want 0 (мутанты «return 0» → ±1, T-M10)", id)
+		t.Errorf("the id on error = %d, want 0 (the «return 0» mutants → ±1, T-M10)", id)
 	}
 
 	// A Scan failure of a found zone: a "reading" error, found=false,
 	// id=0 (the return-cut and "return 0" → ±1 mutants, T-M10).
 	scan := newReanPool()
 	scan.seedZone(3, "crawl.test")
-	scan.zoneScanErr = errors.New("скан-бум")
+	scan.zoneScanErr = errors.New("scan boom")
 	id, found, err = ZoneIDByName(context.Background(), scan, "crawl.test")
-	if err == nil || !strings.Contains(err.Error(), "analyzer: зона по имени: чтение: скан-бум") {
-		t.Errorf("Scan: ошибка = %v, want «зона по имени: чтение: скан-бум»", err)
+	if err == nil || !strings.Contains(err.Error(), "analyzer: zone by name: read: scan boom") {
+		t.Errorf("the Scan: the error = %v, want «zone by name: read: scan boom»", err)
 	}
 	if found || id != 0 {
 		t.Errorf("Scan: id/found = %d, %v; want 0, false", id, found)
@@ -1500,21 +1500,21 @@ func TestZoneIDByName(t *testing.T) {
 
 	// An Err failure of an empty select's rows: a task context error, id=0.
 	rows := newReanPool()
-	rows.zoneRowsErr = errors.New("строк-бум")
+	rows.zoneRowsErr = errors.New("rows boom")
 	id, found, err = ZoneIDByName(context.Background(), rows, "x.test")
-	if err == nil || !strings.Contains(err.Error(), "analyzer: зона по имени: строк-бум") {
-		t.Errorf("Err: ошибка = %v, want «зона по имени: строк-бум»", err)
+	if err == nil || !strings.Contains(err.Error(), "analyzer: zone by name: rows boom") {
+		t.Errorf("the Err: the error = %v, want «zone by name: rows boom»", err)
 	}
 	if found || id != 0 {
 		t.Errorf("Err: id/found = %d, %v; want 0, false", id, found)
 	}
 
 	id, _, err = ZoneIDByName(context.Background(), nil, "x.test")
-	if err == nil || !strings.Contains(err.Error(), "пул не задан") {
-		t.Errorf("ошибка = %v, want «пул не задан»", err)
+	if err == nil || !strings.Contains(err.Error(), "the pool is not set") {
+		t.Errorf("the error = %v, want «the pool is not set»", err)
 	}
 	if id != 0 {
-		t.Errorf("id без пула = %d, want 0", id)
+		t.Errorf("the id without a pool = %d, want 0", id)
 	}
 }
 
@@ -1526,7 +1526,7 @@ func reanWait(t *testing.T, what string, cond func() bool) {
 	deadline := time.Now().Add(2 * time.Second)
 	for !cond() {
 		if time.Now().After(deadline) {
-			t.Fatalf("цикл не дошёл: %s", what)
+			t.Fatalf("the loop did not reach: %s", what)
 		}
 		time.Sleep(time.Millisecond)
 	}
@@ -1554,23 +1554,23 @@ func TestReanalyzeLoopImmediateDrain(t *testing.T) {
 		})
 	}()
 
-	reanWait(t, "стартовый дренаж", func() bool { return q.count() >= 1 })
+	reanWait(t, "the startup drain", func() bool { return q.count() >= 1 })
 	if n := pool.queryCount(); n != 1 {
-		t.Errorf("выборок = %d, want 1: без тика повторных проходов нет", n)
+		t.Errorf("selects = %d, want 1: without a tick there are no repeat passes", n)
 	}
 	call := pool.calls()[0]
 	if call.sql != reanalyzeSelectSQL {
-		t.Errorf("SQL стартового прохода — PK-форма дренажа:\n%s\nwant:\n%s",
+		t.Errorf("the startup pass SQL — the drain PK form:\n%s\nwant:\n%s",
 			call.sql, reanalyzeSelectSQL)
 	}
 	// The drain cursor is a zero PK (from the beginning of the set).
 	if call.args[3] != int16(0) || call.args[4] != int64(0) {
-		t.Errorf("курсор стартового дренажа = %v, want нулевой PK", call.args[3:5])
+		t.Errorf("the startup drain's cursor = %v, want a zero PK", call.args[3:5])
 	}
 
 	cancel()
 	if err := <-done; err != nil {
-		t.Fatalf("ReanalyzeLoop: %v, want nil при отмене ctx", err)
+		t.Fatalf("ReanalyzeLoop: %v, want nil on the ctx cancellation", err)
 	}
 }
 
@@ -1605,12 +1605,12 @@ func TestReanalyzeLoopTickAndTrigger(t *testing.T) {
 	}()
 
 	// The startup drain: both rows published exactly once.
-	reanWait(t, "стартовый дренаж", func() bool { return q.count() >= 2 })
+	reanWait(t, "the startup drain", func() bool { return q.count() >= 2 })
 
 	// The first tick pass in the time form: the anchor window (24h) fits
 	// both unstamped rows — an in-flight re-publish (at-least-once), the
 	// cursor moves past the last one (b).
-	reanWait(t, "тиковый проход", func() bool { return q.count() >= 4 })
+	reanWait(t, "the tick pass", func() bool { return q.count() >= 4 })
 	var tickSeen bool
 	for _, c := range pool.calls() {
 		if c.sql == reanalyzeTickSQL {
@@ -1618,24 +1618,24 @@ func TestReanalyzeLoopTickAndTrigger(t *testing.T) {
 		}
 	}
 	if !tickSeen {
-		t.Errorf("тиковый проход не ходил время-формой (SQL не замечен)")
+		t.Errorf("the tick pass did not walk the time form (its SQL was not seen)")
 	}
 
 	// Later ticks: both rows are BEHIND the cursor — no re-selection
 	// (the time cursor, not a full by-version circle).
-	reanWait(t, "тиковые выборки после исчерпания окна", func() bool { return pool.queryCount() >= 4 })
+	reanWait(t, "the tick selects after the window is exhausted", func() bool { return pool.queryCount() >= 4 })
 	if n := q.count(); n != 4 {
-		t.Errorf("публикаций после исчерпания окна = %d, want 4 (без переизбрания)", n)
+		t.Errorf("publications after the window is exhausted = %d, want 4 (no re-election)", n)
 	}
 
 	src.switchTo(2) // SIGHUP: an out-of-turn FULL drain with the new version
-	reanWait(t, "внеочередной проход по смене правил", func() bool {
-		return strings.Contains(buf.String(), "внеочередной переанализ") &&
+	reanWait(t, "the out-of-turn pass on a rule change", func() bool {
+		return strings.Contains(buf.String(), "out-of-turn re-analysis") &&
 			strings.Contains(buf.String(), "rules_version=2")
 	})
 	// The drain is the PK form from the zero cursor: both rows (stale
 	// against version 2) are published again.
-	reanWait(t, "публикации дренажа", func() bool { return q.count() >= 6 })
+	reanWait(t, "the drain publications", func() bool { return q.count() >= 6 })
 	drained := false
 	for _, c := range pool.calls() {
 		if c.sql != reanalyzeSelectSQL {
@@ -1643,16 +1643,16 @@ func TestReanalyzeLoopTickAndTrigger(t *testing.T) {
 		}
 		drained = true
 		if c.args[3] != int16(0) || c.args[4] != int64(0) {
-			t.Errorf("курсор дренажа = %v, want нулевой PK (форма с нуля)", c.args[3:5])
+			t.Errorf("the drain's cursor = %v, want a zero PK (the from-scratch form)", c.args[3:5])
 		}
 	}
 	if !drained {
-		t.Errorf("среди выборок нет PK-формы: смена правил обязана идти дренажом с нуля")
+		t.Errorf("no PK-form select among the selects: a rule change must go as a from-scratch drain")
 	}
 
 	cancel()
 	if err := <-done; err != nil {
-		t.Fatalf("ReanalyzeLoop: %v, want nil при отмене ctx", err)
+		t.Fatalf("ReanalyzeLoop: %v, want nil on the ctx cancellation", err)
 	}
 }
 
@@ -1670,7 +1670,7 @@ func TestReanalyzeLoopErrorSurvives(t *testing.T) {
 	pool.seedRowAt(1, 1, 0, model.VariantMain, nil, time.Now().Add(-time.Minute))
 	q := &reanQueue{}
 
-	pool.setQueryErr(errors.New("бд недоступна")) // the startup pass fails
+	pool.setQueryErr(errors.New("db unavailable")) // the startup pass fails
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1682,17 +1682,17 @@ func TestReanalyzeLoopErrorSurvives(t *testing.T) {
 		})
 	}()
 
-	reanWait(t, "Warn об ошибке прохода", func() bool {
+	reanWait(t, "the pass-error Warn", func() bool {
 		return strings.Contains(buf.String(), "level=WARN") &&
-			strings.Contains(buf.String(), "бд недоступна")
+			strings.Contains(buf.String(), "db unavailable")
 	})
 
 	pool.setQueryErr(nil) // the DB is back
-	reanWait(t, "проход после восстановления", func() bool { return q.count() >= 1 })
+	reanWait(t, "the pass after the recovery", func() bool { return q.count() >= 1 })
 
 	cancel()
 	if err := <-done; err != nil {
-		t.Fatalf("ReanalyzeLoop: %v, want nil при отмене ctx", err)
+		t.Fatalf("ReanalyzeLoop: %v, want nil on the ctx cancellation", err)
 	}
 }
 
@@ -1713,10 +1713,10 @@ func TestReanalyzeLoopCancelDuringDrain(t *testing.T) {
 	}()
 
 	if err := <-done; err != nil {
-		t.Fatalf("ReanalyzeLoop: %v, want nil при отмене ctx", err)
+		t.Fatalf("ReanalyzeLoop: %v, want nil on the ctx cancellation", err)
 	}
 	if strings.Contains(buf.String(), "level=WARN") {
-		t.Errorf("отмена во время прохода — Warn:\n%s", buf.String())
+		t.Errorf("a cancellation during a pass — a Warn:\n%s", buf.String())
 	}
 }
 
@@ -1743,16 +1743,16 @@ func TestReanalyzeLoopNilSet(t *testing.T) {
 		})
 	}()
 
-	reanWait(t, "Warn о пустом наборе", func() bool {
-		return strings.Contains(buf.String(), "набор правил не загружен")
+	reanWait(t, "the empty-set Warn", func() bool {
+		return strings.Contains(buf.String(), "rule set not loaded")
 	})
 	if n := q.count(); n != 0 {
-		t.Errorf("публикаций = %d, want 0 без набора", n)
+		t.Errorf("publications = %d, want 0 without a set", n)
 	}
 
 	cancel()
 	if err := <-done; err != nil {
-		t.Fatalf("ReanalyzeLoop: %v, want nil при отмене ctx", err)
+		t.Fatalf("ReanalyzeLoop: %v, want nil on the ctx cancellation", err)
 	}
 }
 
@@ -1762,7 +1762,7 @@ func TestReanalyzeLoopNilSet(t *testing.T) {
 // the Info itself, T-M10). The second select proves the first pass
 // finished (drains are sequential); by the check time the log is already settled.
 func TestReanalyzeLoopPassInfo(t *testing.T) {
-	t.Run("пустой проход молчит", func(t *testing.T) {
+	t.Run("an empty pass is silent", func(t *testing.T) {
 		var buf reanBuf
 		pool := newReanPool() // empty: a drain without publishes
 		q := &reanQueue{}
@@ -1777,9 +1777,9 @@ func TestReanalyzeLoopPassInfo(t *testing.T) {
 			})
 		}()
 
-		reanWait(t, "второй проход", func() bool { return pool.queryCount() >= 2 })
-		if strings.Contains(buf.String(), `msg="проход переанализа"`) {
-			t.Errorf("Info о пустом проходе записан:\n%s", buf.String())
+		reanWait(t, "the second pass", func() bool { return pool.queryCount() >= 2 })
+		if strings.Contains(buf.String(), `msg="re-analysis pass"`) {
+			t.Errorf("the empty-pass Info was written:\n%s", buf.String())
 		}
 		cancel()
 		if err := <-done; err != nil {
@@ -1787,7 +1787,7 @@ func TestReanalyzeLoopPassInfo(t *testing.T) {
 		}
 	})
 
-	t.Run("проход с публикациями пишет Info", func(t *testing.T) {
+	t.Run("a pass with publications writes Info", func(t *testing.T) {
 		var buf reanBuf
 		pool := newReanPool()
 		pool.seedZone(1, "test")
@@ -1805,9 +1805,9 @@ func TestReanalyzeLoopPassInfo(t *testing.T) {
 			})
 		}()
 
-		reanWait(t, "второй проход", func() bool { return pool.queryCount() >= 2 })
-		if log := buf.String(); !strings.Contains(log, `msg="проход переанализа"`) || !strings.Contains(log, "published=1") {
-			t.Errorf("Info о проходе с публикацией не записан:\n%s", log)
+		reanWait(t, "the second pass", func() bool { return pool.queryCount() >= 2 })
+		if log := buf.String(); !strings.Contains(log, `msg="re-analysis pass"`) || !strings.Contains(log, "published=1") {
+			t.Errorf("the pass-with-publication Info was not written:\n%s", log)
 		}
 		cancel()
 		if err := <-done; err != nil {
@@ -1840,9 +1840,9 @@ func TestReanalyzeLoopClosedSets(t *testing.T) {
 		})
 	}()
 
-	reanWait(t, "стартовый проход", func() bool { return pool.queryCount() >= 1 })
-	if !strings.Contains(buf.String(), "цикл переанализа запущен") {
-		t.Errorf("Info запуска не записан:\n%s", buf.String())
+	reanWait(t, "the startup pass", func() bool { return pool.queryCount() >= 1 })
+	if !strings.Contains(buf.String(), "re-analysis loop started") {
+		t.Errorf("the startup Info was not written:\n%s", buf.String())
 	}
 	close(src.next) // the Reloader is gone without cancelling the subscription
 
@@ -1851,18 +1851,18 @@ func TestReanalyzeLoopClosedSets(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	select {
 	case err := <-done:
-		t.Fatalf("цикл завершился по закрытому каналу: %v", err)
+		t.Fatalf("the loop finished on the closed channel: %v", err)
 	default:
 	}
-	if strings.Contains(buf.String(), "внеочередной переанализ") {
-		t.Errorf("закрытый канал трактован как смена набора:\n%s", buf.String())
+	if strings.Contains(buf.String(), "out-of-turn re-analysis") {
+		t.Errorf("the closed channel treated as a set change:\n%s", buf.String())
 	}
 	if n := pool.queryCount(); n != 1 {
-		t.Fatalf("выборок после закрытия канала = %d, want 1 (без внеочередных проходов)", n)
+		t.Fatalf("selects after the channel closed = %d, want 1 (no out-of-turn passes)", n)
 	}
 
 	cancel()
 	if err := <-done; err != nil {
-		t.Fatalf("ReanalyzeLoop: %v, want nil при отмене ctx", err)
+		t.Fatalf("ReanalyzeLoop: %v, want nil on the ctx cancellation", err)
 	}
 }

@@ -40,7 +40,7 @@ func NewCleanupMetrics(reg *metrics.Registry) *CleanupMetrics {
 	return &CleanupMetrics{
 		badHashes: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_ingest_bad_hashes_total",
-			Help: "Удалённые очисткой deleted-доменов результаты с content_hash неверной длины (16 октет, ТЗ 6.1): refcount по ним не менялся, рост — ошибка писателя результатов (T-056); алерт ingest_bad_hashes мониторит всплески.",
+			Help: "Results with a malformed content_hash (16 octets, spec 6.1) deleted by the deleted-domains cleanup: their refcount was not changed, growth is a results-writer bug (T-056); the ingest_bad_hashes alert watches the spikes.",
 		}).WithLabelValues(),
 	}
 }

@@ -130,7 +130,7 @@ func (r *oneRowRows) Next() bool {
 
 func (r *oneRowRows) Scan(dest ...any) error {
 	if r.closed || !r.next || len(dest) > len(r.vals) {
-		return errors.New("oneRowRows: Scan без Next")
+		return errors.New("oneRowRows: Scan without Next")
 	}
 	for i, d := range dest {
 		if err := scanAny(d, r.vals[i]); err != nil {
@@ -209,7 +209,7 @@ func (p *pipePool) Query(ctx context.Context, sql string, args ...any) (pgx.Rows
 		// no flagged rows — the second pair is not executed).
 		return &oneRowRows{vals: []any{p.delDeleted, p.delMissing, []int16{}, []string{}}}, nil
 	}
-	return nil, fmt.Errorf("pipePool: неожидаемый запрос: %s", sql)
+	return nil, fmt.Errorf("pipePool: unexpected query: %s", sql)
 }
 
 // stagedRow — a batch row in the fake's staging model.
@@ -343,7 +343,7 @@ func readFile(t *testing.T, path string) string {
 // structure.
 func TestPipelineAdd(t *testing.T) {
 	pt := newPipeTest(t)
-	content := "example.com\n# комментарий\n\nfoo.com\nexample.com\n"
+	content := "example.com\n# comment\n\nfoo.com\nexample.com\n"
 	abs := pt.addFile(t, "com/add/list.txt", content)
 	sha := sha256.Sum256([]byte(content))
 
@@ -360,28 +360,28 @@ func TestPipelineAdd(t *testing.T) {
 		t.Fatalf("Process: %v", err)
 	}
 	if out.Kind != OutcomeApplied {
-		t.Fatalf("итог = %s, want applied", out.Kind)
+		t.Fatalf("the outcome = %s, want applied", out.Kind)
 	}
 
 	rep := out.Report
 	if rep.Zone != "com" || rep.ZoneID != 1 || rep.Action != model.ActionAdd {
-		t.Errorf("файл отчёта = %+v, want зона com (id 1), действие add", rep)
+		t.Errorf("the file report = %+v, want the zone com (id 1), the action add", rep)
 	}
 	// 5 physical lines: 3 significant (a duplicate example is a line too),
 	// 1 comment, 1 empty; 3 valid.
 	if rep.LinesTotal != 5 || rep.Skipped != 2 || rep.Accepted != 3 || rep.Rejected != 0 {
-		t.Errorf("счётчики строк = %+v, want 5/2/3/0", rep)
+		t.Errorf("the line counters = %+v, want 5/2/3/0", rep)
 	}
 	if rep.Added != 2 || rep.Revived != 1 || rep.Existed != 0 {
-		t.Errorf("счётчики применения = %+v, want added 2 (revived 1), existed 0", rep)
+		t.Errorf("the apply counters = %+v, want added 2 (revived 1), existed 0", rep)
 	}
 	if !reflect.DeepEqual(rep.SHA256, sha[:]) {
-		t.Errorf("sha256 = %x, want хэш содержимого %x", rep.SHA256, sha)
+		t.Errorf("sha256 = %x, want the content hash %x", rep.SHA256, sha)
 	}
 
 	// The report in the journal: the file counters as one ingest_files row (spec 6.1).
 	if len(pt.files.records) != 1 {
-		t.Fatalf("записей в журнале = %d, want 1", len(pt.files.records))
+		t.Fatalf("journal records = %d, want 1", len(pt.files.records))
 	}
 	rec := pt.files.records[0]
 	wantRec := FileRecord{
@@ -389,7 +389,7 @@ func TestPipelineAdd(t *testing.T) {
 		LinesTotal: 5, Added: 2, ProcessedAt: pt.now,
 	}
 	if !reflect.DeepEqual(rec, wantRec) {
-		t.Errorf("запись журнала = %+v, want %+v", rec, wantRec)
+		t.Errorf("the journal record = %+v, want %+v", rec, wantRec)
 	}
 
 	// DB calls: cleanup → COPY → the apply in one transaction (the batch
@@ -410,16 +410,16 @@ func TestPipelineAdd(t *testing.T) {
 		"commit",
 	}
 	if !reflect.DeepEqual(pt.pool.ops, want) {
-		t.Errorf("порядок обращений =\n%s\nwant:\n%s",
+		t.Errorf("the call order =\n%s\nwant:\n%s",
 			strings.Join(pt.pool.ops, "\n"), strings.Join(want, "\n"))
 	}
 
 	// The file goes to processed/ keeping the structure (spec 5.1).
 	if exists(t, abs) {
-		t.Error("файл остался в incoming")
+		t.Error("the file stayed in incoming")
 	}
 	if !exists(t, filepath.Join(pt.dir, DirProcessed, "com/add/list.txt")) {
-		t.Error("файл не перемещён в processed/com/add/list.txt")
+		t.Error("the file was not moved to processed/com/add/list.txt")
 	}
 }
 
@@ -446,55 +446,55 @@ func TestPipelineZonelessAdd(t *testing.T) {
 		t.Fatalf("Process: %v", err)
 	}
 	if out.Kind != OutcomeApplied {
-		t.Fatalf("итог = %s, want applied", out.Kind)
+		t.Fatalf("the outcome = %s, want applied", out.Kind)
 	}
 
 	rep := out.Report
 	if rep.Zone != "" || rep.ZoneID != 0 || rep.Action != model.ActionAdd {
-		t.Errorf("файл отчёта = %+v, want зона \"\" (id 0), действие add", rep)
+		t.Errorf("the file report = %+v, want the zone \"\" (id 0), the action add", rep)
 	}
 	if rep.LinesTotal != 3 || rep.Accepted != 3 || rep.Rejected != 0 {
-		t.Errorf("счётчики строк = %+v, want 3/3/0", rep)
+		t.Errorf("the line counters = %+v, want 3/3/0", rep)
 	}
 	if rep.Added != 3 {
-		t.Errorf("добавлено = %d, want 3", rep.Added)
+		t.Errorf("added = %d, want 3", rep.Added)
 	}
 	if !reflect.DeepEqual(rep.SHA256, sha[:]) {
-		t.Errorf("sha256 = %x, want хэш содержимого %x", rep.SHA256, sha)
+		t.Errorf("sha256 = %x, want the content hash %x", rep.SHA256, sha)
 	}
 
 	// The zones are created lazily by the first lines: com (the first line), ru.
 	wantCalls := []string{"byName:com", "create:com", "byName:ru", "create:ru"}
 	if !reflect.DeepEqual(pt.zones.calls, wantCalls) {
-		t.Errorf("обращения к зонам = %v, want %v (кэш: com повторно не ищется)", pt.zones.calls, wantCalls)
+		t.Errorf("the zone calls = %v, want %v (the cache: com is not looked up again)", pt.zones.calls, wantCalls)
 	}
 
 	// The COPY rows each carry a zone: example→com(1), foo→ru(2), bar→com(1).
 	wantZone := []int16{1, 2, 1}
 	if len(pt.pool.copyVals) != len(wantZone) {
-		t.Fatalf("строк COPY = %d, want %d", len(pt.pool.copyVals), len(wantZone))
+		t.Fatalf("COPY rows = %d, want %d", len(pt.pool.copyVals), len(wantZone))
 	}
 	for i, vals := range pt.pool.copyVals {
 		if z, ok := vals[1].(int16); !ok || z != wantZone[i] {
-			t.Errorf("строка COPY %d: zone_id = %v, want %d", i, vals[1], wantZone[i])
+			t.Errorf("COPY row %d: zone_id = %v, want %d", i, vals[1], wantZone[i])
 		}
 	}
 
 	// The report in the journal: a zone-less file writes ZoneID 0 (NULL in the DB).
 	if len(pt.files.records) != 1 {
-		t.Fatalf("записей в журнале = %d, want 1", len(pt.files.records))
+		t.Fatalf("journal records = %d, want 1", len(pt.files.records))
 	}
 	rec := pt.files.records[0]
 	if rec.ZoneID != 0 || rec.Path != "add/list.txt" || rec.Added != 3 {
-		t.Errorf("запись журнала = %+v, want ZoneID 0, путь add/list.txt, added 3", rec)
+		t.Errorf("the journal record = %+v, want ZoneID 0, the path add/list.txt, added 3", rec)
 	}
 
 	// The file goes to processed/ keeping the structure (no zone directory).
 	if exists(t, abs) {
-		t.Error("файл остался в incoming")
+		t.Error("the file stayed in incoming")
 	}
 	if !exists(t, filepath.Join(pt.dir, DirProcessed, "add/list.txt")) {
-		t.Error("файл не перемещён в processed/add/list.txt")
+		t.Error("the file was not moved to processed/add/list.txt")
 	}
 }
 
@@ -538,32 +538,32 @@ func TestPipelineZonelessNumericZone(t *testing.T) {
 		t.Fatalf("Process: %v", err)
 	}
 	if out.Kind != OutcomeApplied {
-		t.Fatalf("итог = %s, want applied", out.Kind)
+		t.Fatalf("the outcome = %s, want applied", out.Kind)
 	}
 	rep := out.Report
 	if rep.LinesTotal != 3 || rep.Accepted != 2 || rep.Rejected != 1 || rep.Added != 2 {
-		t.Errorf("счётчики = %+v, want 3 строки, 2 валидных/добавлено, 1 отклонение", rep)
+		t.Errorf("the counters = %+v, want 3 lines, 2 valid/added, 1 rejection", rep)
 	}
 	if rep.Reasons[ReasonNoDomain] != 1 || len(rep.Reasons) != 1 {
-		t.Errorf("Reasons = %+v, want ровно no_domain: 1", rep.Reasons)
+		t.Errorf("Reasons = %+v, want exactly no_domain: 1", rep.Reasons)
 	}
 
 	// The file's only zone is su: the fictitious "1999" is not created.
 	if want := []string{"byName:su", "create:su"}; !reflect.DeepEqual(pt.zones.calls, want) {
-		t.Errorf("обращения к зонам = %v, want %v", pt.zones.calls, want)
+		t.Errorf("the zone calls = %v, want %v", pt.zones.calls, want)
 	}
 	// Two su domains went into staging — not dates: an ordinary label and
 	// the bare suffix sochi (valid junk, the tld-only-zones spec §12.6).
 	if len(pt.pool.copyVals) != 2 {
-		t.Fatalf("строк COPY = %d, want 2", len(pt.pool.copyVals))
+		t.Fatalf("COPY rows = %d, want 2", len(pt.pool.copyVals))
 	}
 	for i, want := range []string{"0-0", "sochi"} {
 		if vals := pt.pool.copyVals[i]; vals[2] != want {
-			t.Errorf("метка COPY[%d] = %v, want %s (не дата)", i, vals[2], want)
+			t.Errorf("the COPY[%d] label = %v, want %s (not a date)", i, vals[2], want)
 		}
 	}
 	if !exists(t, filepath.Join(pt.dir, DirProcessed, "add/su_dump.txt")) {
-		t.Error("файл не перемещён в processed/")
+		t.Error("the file was not moved to processed/")
 	}
 }
 
@@ -597,13 +597,13 @@ func TestPipelineZonelessDuplicate(t *testing.T) {
 		t.Fatalf("Process: %v", err)
 	}
 	if out.Kind != OutcomeDuplicate {
-		t.Fatalf("итог = %s, want duplicate", out.Kind)
+		t.Fatalf("the outcome = %s, want duplicate", out.Kind)
 	}
 	if len(pt.files.records) != 0 {
-		t.Errorf("записей в журнале = %d, want 0 (дубль не пишет отчёт)", len(pt.files.records))
+		t.Errorf("journal records = %d, want 0 (a duplicate writes no report)", len(pt.files.records))
 	}
 	if !exists(t, filepath.Join(pt.dir, DirProcessed, "add/list.txt")) {
-		t.Error("дубль не перемещён в processed/")
+		t.Error("the duplicate was not moved to processed/")
 	}
 }
 
@@ -627,23 +627,23 @@ func TestPipelineDelete(t *testing.T) {
 		t.Fatalf("Process: %v", err)
 	}
 	if out.Kind != OutcomeApplied {
-		t.Fatalf("итог = %s, want applied", out.Kind)
+		t.Fatalf("the outcome = %s, want applied", out.Kind)
 	}
 	rep := out.Report
 	if rep.Action != model.ActionDelete || rep.Deleted != 1 || rep.NotFound != 1 {
-		t.Errorf("счётчики удаления = %+v, want deleted 1, not_found 1", rep)
+		t.Errorf("the delete counters = %+v, want deleted 1, not_found 1", rep)
 	}
 
 	if len(pt.files.records) != 1 {
-		t.Fatalf("записей в журнале = %d, want 1", len(pt.files.records))
+		t.Fatalf("journal records = %d, want 1", len(pt.files.records))
 	}
 	rec := pt.files.records[0]
 	if rec.Deleted != 1 || rec.Action != model.ActionDelete || !reflect.DeepEqual(rec.SHA256, sha[:]) {
-		t.Errorf("запись журнала = %+v, want deleted 1, sha256 содержимого", rec)
+		t.Errorf("the journal record = %+v, want deleted 1, the sha256 of the content", rec)
 	}
 	// NotFound — the log report only: there is no column in ingest_files (spec 6.1).
 	if rec.Added != 0 || rec.Existed != 0 || rec.Rejected != 0 {
-		t.Errorf("запись журнала = %+v, want нулевые add-счётчики", rec)
+		t.Errorf("the journal record = %+v, want zero add-counters", rec)
 	}
 
 	want := []string{
@@ -656,11 +656,11 @@ func TestPipelineDelete(t *testing.T) {
 		"exec:" + clearStageSQL,
 	}
 	if !reflect.DeepEqual(pt.pool.ops, want) {
-		t.Errorf("порядок обращений =\n%s\nwant:\n%s",
+		t.Errorf("the call order =\n%s\nwant:\n%s",
 			strings.Join(pt.pool.ops, "\n"), strings.Join(want, "\n"))
 	}
 	if !exists(t, filepath.Join(pt.dir, DirProcessed, "net/delete/x.txt")) {
-		t.Error("файл не перемещён в processed/net/delete/x.txt")
+		t.Error("the file was not moved to processed/net/delete/x.txt")
 	}
 }
 
@@ -702,20 +702,20 @@ func TestPipelineExtractLines(t *testing.T) {
 		t.Fatalf("Process: %v", err)
 	}
 	if out.Kind != OutcomeApplied {
-		t.Fatalf("итог = %s, want applied", out.Kind)
+		t.Fatalf("the outcome = %s, want applied", out.Kind)
 	}
 	rep := out.Report
 	if rep.LinesTotal != 4 || rep.Accepted != 3 || rep.Rejected != 1 || rep.Added != 3 {
-		t.Errorf("счётчики = %+v, want 4 строки, 3 валидных/добавлено, 1 отклонение", rep)
+		t.Errorf("the counters = %+v, want 4 lines, 3 valid/added, 1 rejection", rep)
 	}
 	if rep.Reasons[ReasonNoDomain] != 1 || len(rep.Reasons) != 1 {
-		t.Errorf("Reasons = %+v, want ровно no_domain: 1", rep.Reasons)
+		t.Errorf("Reasons = %+v, want exactly no_domain: 1", rep.Reasons)
 	}
 	if !reflect.DeepEqual(rep.SHA256, sha[:]) {
-		t.Errorf("sha256 = %x, want хэш содержимого", rep.SHA256)
+		t.Errorf("sha256 = %x, want the content hash", rep.SHA256)
 	}
 	if len(pt.files.records) != 1 || pt.files.records[0].Rejected != 1 || pt.files.records[0].Added != 3 {
-		t.Errorf("журнал = %+v, want rejected 1, added 3", pt.files.records)
+		t.Errorf("the journal = %+v, want rejected 1, added 3", pt.files.records)
 	}
 	// Three extracted domains went into staging (not the original lines).
 	want := []string{
@@ -732,7 +732,7 @@ func TestPipelineExtractLines(t *testing.T) {
 		"commit",
 	}
 	if !reflect.DeepEqual(pt.pool.ops, want) {
-		t.Errorf("порядок обращений =\n%s\nwant:\n%s",
+		t.Errorf("the call order =\n%s\nwant:\n%s",
 			strings.Join(pt.pool.ops, "\n"), strings.Join(want, "\n"))
 	}
 	// The line without a domain — in the rejected log with the original text
@@ -745,11 +745,11 @@ func TestPipelineExtractLines(t *testing.T) {
 		"reason=no_domain",
 	} {
 		if !strings.Contains(logged, wantFrag) {
-			t.Errorf("rejected-лог = %q, want запись с %q", logged, wantFrag)
+			t.Errorf("the rejected log = %q, want a record with %q", logged, wantFrag)
 		}
 	}
 	if !exists(t, filepath.Join(pt.dir, DirProcessed, "com/add/list.txt")) {
-		t.Error("файл не перемещён в processed/")
+		t.Error("the file was not moved to processed/")
 	}
 }
 
@@ -794,10 +794,10 @@ func TestPipelineDuplicate(t *testing.T) {
 		t.Fatalf("Process: %v", err)
 	}
 	if out.Kind != OutcomeDuplicate {
-		t.Fatalf("итог = %s, want duplicate", out.Kind)
+		t.Fatalf("the outcome = %s, want duplicate", out.Kind)
 	}
 	if len(pt.files.records) != 0 {
-		t.Errorf("записей в журнале = %d, want 0 (дубль не перезаписывает отчёт)", len(pt.files.records))
+		t.Errorf("journal records = %d, want 0 (a duplicate does not overwrite the report)", len(pt.files.records))
 	}
 
 	// The loading happened (the hash is known only after reading), the apply
@@ -808,11 +808,11 @@ func TestPipelineDuplicate(t *testing.T) {
 		"exec:" + clearStageSQL,
 	}
 	if !reflect.DeepEqual(pt.pool.ops, want) {
-		t.Errorf("порядок обращений =\n%s\nwant:\n%s",
+		t.Errorf("the call order =\n%s\nwant:\n%s",
 			strings.Join(pt.pool.ops, "\n"), strings.Join(want, "\n"))
 	}
 	if !exists(t, filepath.Join(pt.dir, DirProcessed, "com/add/list.txt")) {
-		t.Error("дубль не перемещён в processed/")
+		t.Error("the duplicate was not moved to processed/")
 	}
 }
 
@@ -859,20 +859,20 @@ func TestPipelineDuplicateOtherZoneWarn(t *testing.T) {
 		t.Fatalf("Process: %v", err)
 	}
 	if out.Kind != OutcomeApplied {
-		t.Fatalf("итог = %s, want applied (другая зона — не дубль, T-113)", out.Kind)
+		t.Fatalf("the outcome = %s, want applied (another zone — not a duplicate, T-113)", out.Kind)
 	}
 	if len(pt.files.records) != 1 {
-		t.Error("повторная обработка в другой зоне пишет свой отчёт")
+		t.Error("a reprocessing in another zone writes its own report")
 	}
 	log := buf.String()
 	for _, want := range []string{
-		"дубль по sha256 в другой зоне при том же действии",
+		"a sha256 duplicate in another zone under the same action",
 		"zone_id=1",
 		"first_zone_id=9",
 		"first_path=net/add/list.txt",
 	} {
 		if !strings.Contains(log, want) {
-			t.Errorf("лог = %q, want запись с %q", log, want)
+			t.Errorf("the log = %q, want a record with %q", log, want)
 		}
 	}
 }
@@ -919,19 +919,19 @@ func TestPipelineUndoSameContentApplied(t *testing.T) {
 		t.Fatalf("Process: %v", err)
 	}
 	if out.Kind != OutcomeApplied {
-		t.Fatalf("итог = %s, want applied (другое действие — не дубль, undo)", out.Kind)
+		t.Fatalf("the outcome = %s, want applied (another action — not a duplicate, undo)", out.Kind)
 	}
 	if out.Report.Deleted != 1 {
 		t.Errorf("undo: deleted = %d, want 1", out.Report.Deleted)
 	}
 	if len(pt.files.records) != 1 || pt.files.records[0].Action != model.ActionDelete {
-		t.Errorf("журнал = %+v, want строка delete для undo-файла", pt.files.records)
+		t.Errorf("the journal = %+v, want a delete row for the undo file", pt.files.records)
 	}
-	if !strings.Contains(buf.String(), "уже доставлялось другим действием") {
-		t.Errorf("лог = %q, want Info об undo (ранее — Warn о пропуске, ING-P2-5)", buf.String())
+	if !strings.Contains(buf.String(), "already delivered under another action") {
+		t.Errorf("the log = %q, want the undo Info (previously — a skip Warn, ING-P2-5)", buf.String())
 	}
 	if !exists(t, filepath.Join(pt.dir, DirProcessed, "com/delete/x.txt")) {
-		t.Error("undo-файл не перемещён в processed/")
+		t.Error("the undo file was not moved to processed/")
 	}
 }
 
@@ -948,24 +948,24 @@ func TestPipelineErrorRatio(t *testing.T) {
 
 	out, err := pt.pipe.Process(context.Background(), abs)
 	if err != nil {
-		t.Fatalf("Process: %v (ошибочный файл — не ошибка сервиса)", err)
+		t.Fatalf("Process: %v (a bad file is not a service error)", err)
 	}
 	if out.Kind != OutcomeFailed {
-		t.Fatalf("итог = %s, want failed", out.Kind)
+		t.Fatalf("the outcome = %s, want failed", out.Kind)
 	}
 	if out.Err == nil || !strings.Contains(out.Err.Error(), "ingest.max_error_ratio") {
-		t.Errorf("причина = %v, want доля отклонённых строк выше порога", out.Err)
+		t.Errorf("the reason = %v, want the share of rejected lines above the threshold", out.Err)
 	}
 
 	rep := out.Report
 	if rep.Rejected != 2 || rep.Accepted != 1 || rep.Added != 0 {
-		t.Errorf("счётчики = %+v, want rejected 2, accepted 1, применения нет", rep)
+		t.Errorf("the counters = %+v, want rejected 2, accepted 1, no apply", rep)
 	}
 	if !reflect.DeepEqual(rep.SHA256, sha[:]) {
-		t.Errorf("sha256 = %x, want хэш содержимого", rep.SHA256)
+		t.Errorf("sha256 = %x, want the content hash", rep.SHA256)
 	}
 	if len(pt.files.records) != 0 {
-		t.Errorf("записей в журнале = %d, want 0", len(pt.files.records))
+		t.Errorf("journal records = %d, want 0", len(pt.files.records))
 	}
 
 	// The loading happened, the apply did not; the batch was discarded.
@@ -975,25 +975,25 @@ func TestPipelineErrorRatio(t *testing.T) {
 		"exec:" + clearStageSQL,
 	}
 	if !reflect.DeepEqual(pt.pool.ops, want) {
-		t.Errorf("порядок обращений =\n%s\nwant:\n%s",
+		t.Errorf("the call order =\n%s\nwant:\n%s",
 			strings.Join(pt.pool.ops, "\n"), strings.Join(want, "\n"))
 	}
 
 	// The file — in failed/ with a log report next to it (spec 5.1).
 	failed := filepath.Join(pt.dir, DirFailed, "com/add/list.txt")
 	if exists(t, abs) || !exists(t, failed) {
-		t.Fatalf("файл должен лежать в %s, исходный удалён", failed)
+		t.Fatalf("the file must be in %s, the original removed", failed)
 	}
 	report := readFile(t, failed+".report")
 	for _, frag := range []string{
-		"файл: com/add/list.txt",
-		"итог: ошибочен — доля отклонённых строк 2 из 3 выше ingest.max_error_ratio (0.1)",
+		"file: com/add/list.txt",
+		"verdict: bad — the share of rejected lines 2 of 3 is above ingest.max_error_ratio (0.1)",
 		"    wrong_zone: 2",
-		"  валидных: 1",
+		"  valid: 1",
 		fmt.Sprintf("sha256: %x", sha[:]),
 	} {
 		if !strings.Contains(report, frag) {
-			t.Errorf("лог-отчёт не содержит %q:\n%s", frag, report)
+			t.Errorf("the log report does not contain %q:\n%s", frag, report)
 		}
 	}
 }
@@ -1006,7 +1006,7 @@ func TestPipelineErrorRatio(t *testing.T) {
 func TestPipelineParserRejectsFailFile(t *testing.T) {
 	// 1 non-UTF-8 line + 8 valid ones: the validator alone does not fail
 	// 0/8, the combined ratio 1/9 > 0.1 — the file is failed.
-	t.Run("мусор плюс валидные строки", func(t *testing.T) {
+	t.Run("junk plus valid lines", func(t *testing.T) {
 		pt := newPipeTest(t)
 		var b strings.Builder
 		b.WriteString("\xff\xfe\n")
@@ -1017,23 +1017,23 @@ func TestPipelineParserRejectsFailFile(t *testing.T) {
 
 		out, err := pt.pipe.Process(context.Background(), abs)
 		if err != nil {
-			t.Fatalf("Process: %v (ошибочный файл — не ошибка сервиса)", err)
+			t.Fatalf("Process: %v (a bad file is not a service error)", err)
 		}
 		if out.Kind != OutcomeFailed {
-			t.Fatalf("итог = %s, want failed", out.Kind)
+			t.Fatalf("the outcome = %s, want failed", out.Kind)
 		}
-		if out.Err == nil || !strings.Contains(out.Err.Error(), "доля отклонённых строк 1 из 9 выше ingest.max_error_ratio (0.1)") {
-			t.Errorf("причина = %v, want объединённая доля 1 из 9", out.Err)
+		if out.Err == nil || !strings.Contains(out.Err.Error(), "the share of rejected lines 1 of 9 is above ingest.max_error_ratio (0.1)") {
+			t.Errorf("the reason = %v, want the merged share 1 of 9", out.Err)
 		}
 		rep := out.Report
 		if rep.Rejected != 1 || rep.Accepted != 8 || rep.Reasons[ReasonUTF8] != 1 {
-			t.Errorf("счётчики = %+v, want rejected 1 (invalid_utf8), accepted 8", rep)
+			t.Errorf("the counters = %+v, want rejected 1 (invalid_utf8), accepted 8", rep)
 		}
 		if len(pt.files.records) != 0 {
-			t.Error("отчёт ошибочного файла не пишется в журнал")
+			t.Error("the bad file's report is not written to the journal")
 		}
 		if !exists(t, filepath.Join(pt.dir, DirFailed, "com/add/list.txt")) {
-			t.Error("файл не перемещён в failed/")
+			t.Error("the file was not moved to failed/")
 		}
 	})
 
@@ -1041,7 +1041,7 @@ func TestPipelineParserRejectsFailFile(t *testing.T) {
 	// validator saw none (total = 0) — without counting the parser's
 	// rejections the ratio would be computed as 0/0 and the file would go to
 	// processed/.
-	t.Run("файл целиком из не-UTF-8", func(t *testing.T) {
+	t.Run("a file entirely of non-UTF-8", func(t *testing.T) {
 		pt := newPipeTest(t)
 		abs := pt.addFile(t, "com/add/dump.txt", "\xff\xfe\xff\n\xff\xfe\n")
 
@@ -1050,21 +1050,21 @@ func TestPipelineParserRejectsFailFile(t *testing.T) {
 			t.Fatalf("Process: %v", err)
 		}
 		if out.Kind != OutcomeFailed {
-			t.Fatalf("итог = %s, want failed", out.Kind)
+			t.Fatalf("the outcome = %s, want failed", out.Kind)
 		}
-		if out.Err == nil || !strings.Contains(out.Err.Error(), "доля отклонённых строк 2 из 2 выше ingest.max_error_ratio (0.1)") {
-			t.Errorf("причина = %v, want объединённая доля 2 из 2", out.Err)
+		if out.Err == nil || !strings.Contains(out.Err.Error(), "the share of rejected lines 2 of 2 is above ingest.max_error_ratio (0.1)") {
+			t.Errorf("the reason = %v, want the merged share 2 of 2", out.Err)
 		}
 		if rep := out.Report; rep.Rejected != 2 || rep.Accepted != 0 {
-			t.Errorf("счётчики = %+v, want rejected 2, accepted 0", rep)
+			t.Errorf("the counters = %+v, want rejected 2, accepted 0", rep)
 		}
 		// The zero-row batch was discarded, the apply did not run.
 		want := []string{"exec:" + clearStageSQL, "exec:" + clearStageSQL}
 		if !reflect.DeepEqual(pt.pool.ops, want) {
-			t.Errorf("обращения = %v, want очистка → отбрасывание партии без COPY", pt.pool.ops)
+			t.Errorf("the calls = %v, want cleanup → a batch discard without COPY", pt.pool.ops)
 		}
 		if len(pt.files.records) != 0 {
-			t.Error("отчёт ошибочного файла не пишется в журнал")
+			t.Error("the bad file's report is not written to the journal")
 		}
 	})
 }
@@ -1081,21 +1081,21 @@ func TestPipelineBadPath(t *testing.T) {
 		t.Fatalf("Process: %v", err)
 	}
 	if out.Kind != OutcomeFailed {
-		t.Fatalf("итог = %s, want failed", out.Kind)
+		t.Fatalf("the outcome = %s, want failed", out.Kind)
 	}
 	if kind, ok := PathKindOf(out.Err); !ok || kind != ErrPathStructure {
-		t.Errorf("причина = %v, want ErrPathStructure", out.Err)
+		t.Errorf("the reason = %v, want ErrPathStructure", out.Err)
 	}
 	if len(pt.pool.ops) != 0 || len(pt.files.records) != 0 || len(pt.zones.calls) != 0 {
-		t.Error("при ошибке пути обращений к БД быть не должно")
+		t.Error("on a path error there must be no DB calls")
 	}
 	failed := filepath.Join(pt.dir, DirFailed, "com/list.txt")
 	if !exists(t, failed) {
-		t.Fatalf("файл не перемещён в %s", failed)
+		t.Fatalf("the file was not moved to %s", failed)
 	}
 	report := readFile(t, failed+".report")
-	if !strings.Contains(report, "итог: ошибочен — ingest: структура пути не <зона>/add|delete/<файл>") {
-		t.Errorf("лог-отчёт без причины:\n%s", report)
+	if !strings.Contains(report, "verdict: bad — ingest: the path structure is not <zone>/add|delete/<file>") {
+		t.Errorf("the log report without the reason:\n%s", report)
 	}
 }
 
@@ -1110,16 +1110,16 @@ func TestPipelineBadZoneDir(t *testing.T) {
 		t.Fatalf("Process: %v", err)
 	}
 	if out.Kind != OutcomeFailed {
-		t.Fatalf("итог = %s, want failed", out.Kind)
+		t.Fatalf("the outcome = %s, want failed", out.Kind)
 	}
 	if kind, ok := PathKindOf(out.Err); !ok || kind != ErrPathZone {
-		t.Errorf("причина = %v, want ErrPathZone", out.Err)
+		t.Errorf("the reason = %v, want ErrPathZone", out.Err)
 	}
 	if len(pt.zones.calls) != 0 {
-		t.Errorf("зона не должна создаваться, calls = %v", pt.zones.calls)
+		t.Errorf("the zone must not be created, the calls = %v", pt.zones.calls)
 	}
 	if !exists(t, filepath.Join(pt.dir, DirFailed, "не%зона/add/list.txt")) {
-		t.Error("файл не перемещён в failed/")
+		t.Error("the file was not moved to failed/")
 	}
 }
 
@@ -1131,31 +1131,31 @@ func TestPipelineBadZoneDir(t *testing.T) {
 // processed normally by branch 3 of domainLabel (the tld-only-zones
 // spec §5.2).
 func TestPipelineZonePathAllowlist(t *testing.T) {
-	t.Run("вне allowlist — failed", func(t *testing.T) {
+	t.Run("outside the allowlist — failed", func(t *testing.T) {
 		pt := newPipeTest(t)
 		abs := pt.addFile(t, "crawl.test/add/list.txt", "example.crawl.test\n")
 
 		out, err := pt.pipe.Process(context.Background(), abs)
 		if err != nil {
-			t.Fatalf("Process: %v (ошибочный файл — не ошибка сервиса)", err)
+			t.Fatalf("Process: %v (a bad file is not a service error)", err)
 		}
 		if out.Kind != OutcomeFailed {
-			t.Fatalf("итог = %s, want failed", out.Kind)
+			t.Fatalf("the outcome = %s, want failed", out.Kind)
 		}
 		if !errors.Is(out.Err, errZoneNotAllowed) {
-			t.Errorf("причина = %v, want errZoneNotAllowed", out.Err)
+			t.Errorf("the reason = %v, want errZoneNotAllowed", out.Err)
 		}
 		// The lines are not parsed, the zone is not created, the batch is not loaded.
 		if len(pt.pool.ops) != 0 || len(pt.files.records) != 0 || len(pt.zones.calls) != 0 {
-			t.Errorf("при запрете зоны обращений к БД быть не должно: ops=%v records=%d zones=%v",
+			t.Errorf("on a zone denial there must be no DB calls: ops=%v records=%d zones=%v",
 				pt.pool.ops, len(pt.files.records), pt.zones.calls)
 		}
 		failed := filepath.Join(pt.dir, DirFailed, "crawl.test/add/list.txt")
 		if !exists(t, failed) {
-			t.Fatalf("файл не перемещён в %s", failed)
+			t.Fatalf("the file was not moved to %s", failed)
 		}
 		if report := readFile(t, failed+".report"); !strings.Contains(report, "ingest.allowed_zone_paths") {
-			t.Errorf("лог-отчёт без причины allowlist:\n%s", report)
+			t.Errorf("the log report without the allowlist reason:\n%s", report)
 		}
 	})
 	t.Run("allowlist — applied", func(t *testing.T) {
@@ -1183,23 +1183,23 @@ func TestPipelineZonePathAllowlist(t *testing.T) {
 			t.Fatalf("Process: %v", err)
 		}
 		if out.Kind != OutcomeApplied {
-			t.Fatalf("итог = %s, want applied", out.Kind)
+			t.Fatalf("the outcome = %s, want applied", out.Kind)
 		}
 		// Branch 3 of domainLabel (the tld-only-zones spec §5.2):
 		// example.crawl.test in the crawl.test directory — the label example,
 		// the path zone crawl.test. The line label is checked against the
 		// staging batch (COPY: batch, zone, label, …).
 		if rep := out.Report; rep.Zone != "crawl.test" || rep.Added != 1 {
-			t.Errorf("отчёт = %+v, want зона crawl.test, added 1", rep)
+			t.Errorf("the report = %+v, want the zone crawl.test, added 1", rep)
 		}
 		if len(pt.pool.copyVals) != 1 {
-			t.Fatalf("строк в staging = %d, want 1", len(pt.pool.copyVals))
+			t.Fatalf("rows in staging = %d, want 1", len(pt.pool.copyVals))
 		}
 		if label := pt.pool.copyVals[0][2].(string); label != "example" {
-			t.Errorf("метка строки = %q, want example (ветка 3 domainLabel)", label)
+			t.Errorf("the row label = %q, want example (the branch 3 domainLabel)", label)
 		}
 		if !exists(t, filepath.Join(pt.dir, DirProcessed, "crawl.test/add/list.txt")) {
-			t.Error("файл не перемещён в processed/crawl.test/")
+			t.Error("the file was not moved to processed/crawl.test/")
 		}
 	})
 }
@@ -1221,21 +1221,21 @@ func TestPipelineFailFileOutsideIncoming(t *testing.T) {
 
 	out, err := pt.pipe.Process(context.Background(), abs)
 	if err != nil {
-		t.Fatalf("Process: %v (ошибочный файл — не ошибка сервиса)", err)
+		t.Fatalf("Process: %v (a bad file is not a service error)", err)
 	}
 	if out.Kind != OutcomeFailed {
-		t.Fatalf("итог = %s, want failed", out.Kind)
+		t.Fatalf("the outcome = %s, want failed", out.Kind)
 	}
 	failed := filepath.Join(pt.dir, DirFailed, "list.txt")
 	if exists(t, abs) || !exists(t, failed) {
-		t.Fatalf("файл должен лежать в %s, исходный удалён", failed)
+		t.Fatalf("the file must be in %s, the original removed", failed)
 	}
 	if !exists(t, failed+".report") {
-		t.Error("лог-отчёт не записан рядом с файлом")
+		t.Error("the log report was not written next to the file")
 	}
 	// The archive did not leave failed/ (and did not "fall through" into ../).
 	if exists(t, filepath.Join(pt.dir, "escape", "com", "list.txt")) {
-		t.Error("файл оказался снаружи failed/ — путь назначения не санирован")
+		t.Error("the file ended up outside failed/ — the destination path is not sanitized")
 	}
 }
 
@@ -1245,20 +1245,20 @@ func TestPipelineFailFileOutsideIncoming(t *testing.T) {
 func TestPipelineZoneDBError(t *testing.T) {
 	pt := newPipeTest(t)
 	abs := pt.addFile(t, "com/add/list.txt", "example.com\n")
-	pt.zones.byNameErr = errors.New("бд недоступна")
+	pt.zones.byNameErr = errors.New("db unavailable")
 
 	out, err := pt.pipe.Process(context.Background(), abs)
 	if err == nil || !errors.Is(err, pt.zones.byNameErr) {
-		t.Fatalf("err = %v, want ошибка БД вызывающему", err)
+		t.Fatalf("err = %v, want the DB error to the caller", err)
 	}
 	if out.Kind != OutcomeLeft {
-		t.Errorf("итог = %s, want left", out.Kind)
+		t.Errorf("the outcome = %s, want left", out.Kind)
 	}
 	if !exists(t, abs) {
-		t.Error("файл должен остаться в incoming для повтора (ТЗ 3.4)")
+		t.Error("the file must stay in incoming for a retry (spec 3.4)")
 	}
 	if len(pt.pool.ops) != 0 || len(pt.files.records) != 0 {
-		t.Error("после сбоя зоны обращений к staging/журналу быть не должно")
+		t.Error("after the zone failure there must be no staging/journal calls")
 	}
 }
 
@@ -1267,25 +1267,25 @@ func TestPipelineZoneDBError(t *testing.T) {
 func TestPipelineStageError(t *testing.T) {
 	pt := newPipeTest(t)
 	abs := pt.addFile(t, "com/add/list.txt", "example.com\n")
-	pt.pool.copyErr = errors.New("COPY отвергнут")
+	pt.pool.copyErr = errors.New("COPY rejected")
 
 	out, err := pt.pipe.Process(context.Background(), abs)
 	if err == nil || !errors.Is(err, pt.pool.copyErr) {
-		t.Fatalf("err = %v, want ошибка COPY вызывающему", err)
+		t.Fatalf("err = %v, want the COPY error to the caller", err)
 	}
 	if out.Kind != OutcomeLeft {
-		t.Errorf("итог = %s, want left", out.Kind)
+		t.Errorf("the outcome = %s, want left", out.Kind)
 	}
 	if !exists(t, abs) {
-		t.Error("файл должен остаться в incoming")
+		t.Error("the file must stay in incoming")
 	}
 	// cleanup (Stage) → COPY (failure) → the batch discard (best effort)
 	if len(pt.pool.ops) != 3 || pt.pool.ops[0] != "exec:"+clearStageSQL ||
 		!strings.HasPrefix(pt.pool.ops[1], "copy:") || pt.pool.ops[2] != "exec:"+clearStageSQL {
-		t.Errorf("обращения = %v, want очистка, COPY, отбрасывание партии", pt.pool.ops)
+		t.Errorf("the calls = %v, want cleanup, COPY, a batch discard", pt.pool.ops)
 	}
 	if len(pt.files.records) != 0 {
-		t.Error("журнал не пишется при сбое загрузки")
+		t.Error("no journal record is written on a load failure")
 	}
 }
 
@@ -1295,7 +1295,7 @@ func TestPipelineStageError(t *testing.T) {
 func TestPipelineApplyError(t *testing.T) {
 	pt := newPipeTest(t)
 	abs := pt.addFile(t, "com/add/list.txt", "example.com\n")
-	boom := errors.New("сервер закрыл соединение")
+	boom := errors.New("the server closed the connection")
 	pt.pool.execs = []pipeExec{
 		{tag: pgconn.NewCommandTag("DELETE 0")}, // Stage
 		{err: boom},                             // the insert
@@ -1303,20 +1303,20 @@ func TestPipelineApplyError(t *testing.T) {
 
 	out, err := pt.pipe.Process(context.Background(), abs)
 	if err == nil || !errors.Is(err, boom) {
-		t.Fatalf("err = %v, want ошибка применения", err)
+		t.Fatalf("err = %v, want the apply error", err)
 	}
 	if out.Kind != OutcomeLeft || !exists(t, abs) {
-		t.Fatalf("итог = %s, файл на месте = %v, want left и файл в incoming", out.Kind, exists(t, abs))
+		t.Fatalf("the outcome = %s, the file in place = %v, want left and the file in incoming", out.Kind, exists(t, abs))
 	}
 	if len(pt.files.records) != 0 {
-		t.Error("отчёт не пишется при сбое применения")
+		t.Error("no report is written on an apply failure")
 	}
 	// the insert without the ApplyAdd cleanup (failure) → the pipeline discard
 	if !strings.Contains(strings.Join(pt.pool.ops, "\n"), "query:"+insertAddSQL) {
-		t.Errorf("обращения = %v, want попытка вставки", pt.pool.ops)
+		t.Errorf("the calls = %v, want an insert attempt", pt.pool.ops)
 	}
 	if pt.pool.ops[len(pt.pool.ops)-1] != "exec:"+clearStageSQL {
-		t.Errorf("последнее обращение = %v, want отбрасывание партии", pt.pool.ops[len(pt.pool.ops)-1])
+		t.Errorf("the last call = %v, want a batch discard", pt.pool.ops[len(pt.pool.ops)-1])
 	}
 }
 
@@ -1334,23 +1334,23 @@ func TestPipelineRecordError(t *testing.T) {
 	pt.pool.inserted = 1
 	pt.pool.revived = 0
 	pt.pool.uniques = 1
-	pt.files.recErr = errors.New("журнал недоступен")
+	pt.files.recErr = errors.New("the journal is unavailable")
 
 	out, err := pt.pipe.Process(context.Background(), abs)
 	if err == nil || !errors.Is(err, pt.files.recErr) {
-		t.Fatalf("err = %v, want ошибка журнала", err)
+		t.Fatalf("err = %v, want the journal error", err)
 	}
 	if out.Kind != OutcomeLeft || !exists(t, abs) {
-		t.Fatalf("итог = %s, want left и файл в incoming", out.Kind)
+		t.Fatalf("the outcome = %s, want left and the file in incoming", out.Kind)
 	}
 	// The apply happened fully (the transaction: the batch boundaries/insert,
 	// the zone deltas, the revive, the count, the cleanup, the commit) — on
 	// a retry the sha256 duplicate will only move the file.
 	if len(pt.pool.ops) != 11 {
-		t.Errorf("обращений к БД = %d (%v), want 11 — применение завершено", len(pt.pool.ops), pt.pool.ops)
+		t.Errorf("DB calls = %d (%v), want 11 — the apply finished", len(pt.pool.ops), pt.pool.ops)
 	}
 	if pt.pool.commits != 1 {
-		t.Errorf("фиксаций = %d, want 1", pt.pool.commits)
+		t.Errorf("commits = %d, want 1", pt.pool.commits)
 	}
 }
 
@@ -1359,18 +1359,18 @@ func TestPipelineRecordError(t *testing.T) {
 func TestPipelineDuplicateCheckError(t *testing.T) {
 	pt := newPipeTest(t)
 	abs := pt.addFile(t, "com/add/list.txt", "example.com\n")
-	pt.files.bySAErr = errors.New("журнал недоступен")
+	pt.files.bySAErr = errors.New("the journal is unavailable")
 
 	out, err := pt.pipe.Process(context.Background(), abs)
 	if err == nil || !errors.Is(err, pt.files.bySAErr) {
-		t.Fatalf("err = %v, want ошибка журнала", err)
+		t.Fatalf("err = %v, want the journal error", err)
 	}
 	if out.Kind != OutcomeLeft || !exists(t, abs) {
-		t.Fatalf("итог = %s, want left и файл в incoming", out.Kind)
+		t.Fatalf("the outcome = %s, want left and the file in incoming", out.Kind)
 	}
 	for _, op := range pt.pool.ops {
 		if strings.Contains(op, insertAddSQL) || strings.Contains(op, applyDeleteSQL) {
-			t.Errorf("применение выполнено несмотря на сбой проверки дубля: %v", pt.pool.ops)
+			t.Errorf("the apply ran despite the duplicate-check failure: %v", pt.pool.ops)
 		}
 	}
 }
@@ -1389,13 +1389,13 @@ func TestPipelineContextCanceled(t *testing.T) {
 		t.Fatalf("err = %v, want context.Canceled", err)
 	}
 	if out.Kind != OutcomeLeft {
-		t.Errorf("итог = %s, want left", out.Kind)
+		t.Errorf("the outcome = %s, want left", out.Kind)
 	}
 	if !exists(t, abs) {
-		t.Error("файл должен остаться в incoming")
+		t.Error("the file must stay in incoming")
 	}
 	if len(pt.files.records) != 0 {
-		t.Error("журнал не пишется при отмене")
+		t.Error("no journal record is written on cancellation")
 	}
 	// The batch is cleared after the ctx cancellation too: discard cleans
 	// staging with its own context (ING-P2-3) — the rows do not pile up in
@@ -1403,7 +1403,7 @@ func TestPipelineContextCanceled(t *testing.T) {
 	// canceled ctx did not reach the DB — the fake, like pgx, refuses before
 	// recording the call.)
 	if len(pt.pool.ops) != 1 || pt.pool.ops[0] != "exec:"+clearStageSQL {
-		t.Errorf("обращения = %v, want одна очистка отброшенной партии", pt.pool.ops)
+		t.Errorf("the calls = %v, want a single discarded-batch cleanup", pt.pool.ops)
 	}
 }
 
@@ -1436,13 +1436,13 @@ func TestPipelineMoveCollision(t *testing.T) {
 		t.Fatalf("Process: %v", err)
 	}
 	if out.Kind != OutcomeApplied {
-		t.Fatalf("итог = %s, want applied", out.Kind)
+		t.Fatalf("the outcome = %s, want applied", out.Kind)
 	}
 	if !exists(t, older) || readFile(t, older) != "older\n" {
-		t.Error("существующий файл архива затёрт")
+		t.Error("an existing archive file was overwritten")
 	}
 	if !exists(t, filepath.Join(pt.dir, DirProcessed, "com/add/list-2.txt")) {
-		t.Error("новый файл не получил суффикс коллизии list-2.txt")
+		t.Error("the new file did not get the collision suffix list-2.txt")
 	}
 }
 
@@ -1451,21 +1451,21 @@ func TestPipelineMoveCollision(t *testing.T) {
 // applied as an empty batch, the report is written.
 func TestPipelineEmptyFile(t *testing.T) {
 	pt := newPipeTest(t)
-	abs := pt.addFile(t, "com/add/empty.txt", "# только комментарий\n\n")
+	abs := pt.addFile(t, "com/add/empty.txt", "# a comment only\n\n")
 
 	out, err := pt.pipe.Process(context.Background(), abs)
 	if err != nil {
 		t.Fatalf("Process: %v", err)
 	}
 	if out.Kind != OutcomeApplied {
-		t.Fatalf("итог = %s, want applied", out.Kind)
+		t.Fatalf("the outcome = %s, want applied", out.Kind)
 	}
 	rep := out.Report
 	if rep.LinesTotal != 2 || rep.Skipped != 2 || rep.Accepted != 0 || rep.Added != 0 {
-		t.Errorf("счётчики = %+v, want 2 строки, 2 пропущено, применения нет", rep)
+		t.Errorf("the counters = %+v, want 2 lines, 2 skipped, no apply", rep)
 	}
 	if len(pt.files.records) != 1 {
-		t.Error("отчёт пустого файла должен записаться в журнал")
+		t.Error("the empty file's report must be written to the journal")
 	}
 	// A COPY with an empty batch does not run (db.CopyFrom: an empty batch is
 	// a no-op); the apply of an empty batch — the boundaries and the count
@@ -1479,7 +1479,7 @@ func TestPipelineEmptyFile(t *testing.T) {
 		"exec:" + clearStageSQL,
 		"commit",
 	}, "\n") {
-		t.Errorf("обращения = %v, want очистка → пустое применение → очистка", pt.pool.ops)
+		t.Errorf("the calls = %v, want cleanup → an empty apply → cleanup", pt.pool.ops)
 	}
 }
 
@@ -1507,7 +1507,7 @@ func TestPipelineRejectLogPassed(t *testing.T) {
 	if !strings.Contains(logged, "service=rejected") ||
 		!strings.Contains(logged, "file=com/add/list.txt") ||
 		!strings.Contains(logged, "reason=wrong_zone") {
-		t.Errorf("rejected-лог = %q, want запись об отклонённой строке", logged)
+		t.Errorf("the rejected log = %q, want a rejected-line record", logged)
 	}
 }
 
@@ -1544,7 +1544,7 @@ func TestPipelineParserRejectLog(t *testing.T) {
 		"text=" + strings.Repeat("a", maxRejectText), // the parser's truncation, bytes
 	} {
 		if !strings.Contains(logged, want) {
-			t.Errorf("rejected-лог = %q, want запись с %q", logged, want)
+			t.Errorf("the rejected log = %q, want a record with %q", logged, want)
 		}
 	}
 }
@@ -1553,16 +1553,16 @@ func TestPipelineParserRejectLog(t *testing.T) {
 func TestNewPipelineValidation(t *testing.T) {
 	opts := PipelineOptions{Dir: "/tmp"}
 	if _, err := NewPipeline(nil, newFakeFileStore(), &pipePool{}, opts); err == nil {
-		t.Error("хранилище зон обязательно")
+		t.Error("the zone store is required")
 	}
 	if _, err := NewPipeline(newFakeZoneStore(), nil, &pipePool{}, opts); err == nil {
-		t.Error("журнал файлов обязателен")
+		t.Error("the file journal is required")
 	}
 	if _, err := NewPipeline(newFakeZoneStore(), newFakeFileStore(), nil, opts); err == nil {
-		t.Error("пул обязателен")
+		t.Error("the pool is required")
 	}
 	if _, err := NewPipeline(newFakeZoneStore(), newFakeFileStore(), &pipePool{}, PipelineOptions{}); err == nil {
-		t.Error("каталог incoming обязателен")
+		t.Error("the incoming directory is required")
 	}
 
 	// The defaults: the batch size and the error ratio threshold (the T-016 style).
@@ -1572,7 +1572,7 @@ func TestNewPipelineValidation(t *testing.T) {
 		t.Fatal(err)
 	}
 	if p.opts.BatchSize != DefaultBatchSize || p.opts.MaxErrorRatio != DefaultMaxErrorRatio {
-		t.Errorf("дефолты = %d/%v, want %d/%v",
+		t.Errorf("the defaults = %d/%v, want %d/%v",
 			p.opts.BatchSize, p.opts.MaxErrorRatio, DefaultBatchSize, DefaultMaxErrorRatio)
 	}
 }

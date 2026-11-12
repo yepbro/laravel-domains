@@ -135,7 +135,7 @@ func Parse(r io.Reader, opts Options) (Stats, error) {
 	for {
 		raw, size, ok, err := sc.readLine()
 		if err != nil {
-			return st, fmt.Errorf("ingest: чтение входа: %w", err)
+			return st, fmt.Errorf("ingest: reading the input: %w", err)
 		}
 		if !ok {
 			return st, nil
@@ -171,7 +171,7 @@ func Parse(r io.Reader, opts Options) (Stats, error) {
 			st.Data++
 			if opts.OnLine != nil {
 				if err := opts.OnLine(Line{Num: st.Total, Text: string(text)}); err != nil {
-					return st, fmt.Errorf("ingest: строка %d: %w", st.Total, err)
+					return st, fmt.Errorf("ingest: line %d: %w", st.Total, err)
 				}
 			}
 		}
@@ -184,7 +184,7 @@ func (o Options) emitReject(rj Reject) error {
 		return nil
 	}
 	if err := o.OnReject(rj); err != nil {
-		return fmt.Errorf("ingest: строка %d (отклонение): %w", rj.Num, err)
+		return fmt.Errorf("ingest: line %d (rejected): %w", rj.Num, err)
 	}
 	return nil
 }

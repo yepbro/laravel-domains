@@ -236,15 +236,15 @@ type DeleteResult struct {
 // happened, the report on it is valid.
 func ApplyDelete(ctx context.Context, pool ApplyDB, b Batch) (DeleteResult, error) {
 	if b.ID == (BatchID{}) {
-		return DeleteResult{}, errors.New("ingest: партия без идентификатора (ingest.NewBatchID)")
+		return DeleteResult{}, errors.New("ingest: batch without an identifier (ingest.NewBatchID)")
 	}
 	if b.Action != model.ActionDelete {
-		return DeleteResult{}, fmt.Errorf("ingest: операция партии %s: применение delete ожидает партию delete (ТЗ 5.1)", b.Action)
+		return DeleteResult{}, fmt.Errorf("ingest: batch action %s: applying delete expects a delete batch (spec 5.1)", b.Action)
 	}
 
 	tx, err := pool.Begin(ctx)
 	if err != nil {
-		return DeleteResult{}, fmt.Errorf("ingest: применение delete по партии в %s: транзакция: %w", StageTable, err)
+		return DeleteResult{}, fmt.Errorf("ingest: applying delete to the batch in %s: transaction: %w", StageTable, err)
 	}
 	// Rollback unconditionally: after Commit it is a no-op (the T-044
 	// style).
@@ -260,7 +260,7 @@ func ApplyDelete(ctx context.Context, pool ApplyDB, b Batch) (DeleteResult, erro
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return DeleteResult{}, fmt.Errorf("ingest: применение delete по партии в %s: фиксация: %w", StageTable, err)
+		return DeleteResult{}, fmt.Errorf("ingest: applying delete to the batch in %s: commit: %w", StageTable, err)
 	}
 
 	// Applied — the batch leaves staging: cleanup after the application,
@@ -279,7 +279,7 @@ func ApplyDelete(ctx context.Context, pool ApplyDB, b Batch) (DeleteResult, erro
 func applyDeleteCounters(ctx context.Context, tx pgx.Tx, b Batch) (DeleteResult, []int16, []string, error) {
 	rows, err := tx.Query(ctx, applyDeleteSQL, b.ID[:], int16(model.StatusDeleted), int16(model.ActionDelete))
 	if err != nil {
-		return DeleteResult{}, nil, nil, fmt.Errorf("ingest: применение delete по партии в %s: %w", StageTable, err)
+		return DeleteResult{}, nil, nil, fmt.Errorf("ingest: applying delete to the batch in %s: %w", StageTable, err)
 	}
 	defer rows.Close()
 
@@ -288,18 +288,18 @@ func applyDeleteCounters(ctx context.Context, tx pgx.Tx, b Batch) (DeleteResult,
 	var labels []string
 	if !rows.Next() {
 		if err := rows.Err(); err != nil {
-			return DeleteResult{}, nil, nil, fmt.Errorf("ingest: применение delete по партии в %s: %w", StageTable, err)
+			return DeleteResult{}, nil, nil, fmt.Errorf("ingest: applying delete to the batch in %s: %w", StageTable, err)
 		}
-		return DeleteResult{}, nil, nil, fmt.Errorf("ingest: применение delete по партии в %s: счётчики не возвращены", StageTable)
+		return DeleteResult{}, nil, nil, fmt.Errorf("ingest: applying delete to the batch in %s: the counters were not returned", StageTable)
 	}
 	if err := rows.Scan(&res.Deleted, &res.NotFound, &zones, &labels); err != nil {
-		return DeleteResult{}, nil, nil, fmt.Errorf("ingest: применение delete по партии в %s: %w", StageTable, err)
+		return DeleteResult{}, nil, nil, fmt.Errorf("ingest: applying delete to the batch in %s: %w", StageTable, err)
 	}
 	if err := rows.Err(); err != nil {
-		return DeleteResult{}, nil, nil, fmt.Errorf("ingest: применение delete по партии в %s: %w", StageTable, err)
+		return DeleteResult{}, nil, nil, fmt.Errorf("ingest: applying delete to the batch in %s: %w", StageTable, err)
 	}
 	if len(zones) != len(labels) {
-		return DeleteResult{}, nil, nil, fmt.Errorf("ingest: применение delete по партии в %s: битовые массивы разошлись (%d зон, %d меток)", StageTable, len(zones), len(labels))
+		return DeleteResult{}, nil, nil, fmt.Errorf("ingest: applying delete to the batch in %s: the bit arrays diverged (%d zones, %d labels)", StageTable, len(zones), len(labels))
 	}
 	return res, zones, labels, nil
 }
@@ -313,21 +313,21 @@ func applyDeleteCounters(ctx context.Context, tx pgx.Tx, b Batch) (DeleteResult,
 func applyDeleteClearRender(ctx context.Context, tx pgx.Tx, zones []int16, labels []string) error {
 	rows, err := tx.Query(ctx, applyClearRenderSQL, zones, labels)
 	if err != nil {
-		return fmt.Errorf("ingest: применение delete: снятие бита render_pending: %w", err)
+		return fmt.Errorf("ingest: applying delete: clearing the render_pending bit: %w", err)
 	}
 	defer rows.Close()
 	if !rows.Next() {
 		if err := rows.Err(); err != nil {
-			return fmt.Errorf("ingest: применение delete: снятие бита render_pending: %w", err)
+			return fmt.Errorf("ingest: applying delete: clearing the render_pending bit: %w", err)
 		}
-		return fmt.Errorf("ingest: применение delete: снятие бита render_pending: строка счётчика 'render_pending' отсутствует (миграция 000015, runbooks §6)")
+		return fmt.Errorf("ingest: applying delete: clearing the render_pending bit: the 'render_pending' counter row is missing (migration 000015, runbooks §6)")
 	}
 	var discarded int64
 	if err := rows.Scan(&discarded); err != nil {
-		return fmt.Errorf("ingest: применение delete: снятие бита render_pending: чтение: %w", err)
+		return fmt.Errorf("ingest: applying delete: clearing the render_pending bit: read: %w", err)
 	}
 	if err := rows.Err(); err != nil {
-		return fmt.Errorf("ingest: применение delete: снятие бита render_pending: %w", err)
+		return fmt.Errorf("ingest: applying delete: clearing the render_pending bit: %w", err)
 	}
 	return nil
 }

@@ -111,7 +111,7 @@ func LoadDir(dir string) (*Set, error) {
 	// mutator-disable-next-line statement/remove
 	sort.Strings(names)
 	if len(names) == 0 {
-		return nil, fmt.Errorf("rules: в каталоге %s нет yaml-файлов", dir)
+		return nil, fmt.Errorf("rules: no yaml files in directory %s", dir)
 	}
 
 	set := &Set{}
@@ -165,52 +165,52 @@ func LoadDir(dir string) (*Set, error) {
 // the weight range and the validity of the version bounds.
 func (s *Set) validate() error {
 	if len(s.Rules) == 0 {
-		return fmt.Errorf("rules: набор правил пуст (нужен хотя бы один файл с rules:)")
+		return fmt.Errorf("rules: rule set is empty (at least one file with rules: is required)")
 	}
 	seen := map[string]bool{}
 	for _, r := range s.Rules {
 		where := fmt.Sprintf("rules: %s", r.ID)
 		switch {
 		case r.ID == "":
-			return fmt.Errorf("rules: правило без id: %+v", r)
+			return fmt.Errorf("rules: rule without id: %+v", r)
 		case seen[r.ID]:
-			return fmt.Errorf("rules: повтор id %q", r.ID)
+			return fmt.Errorf("rules: duplicate id %q", r.ID)
 		case !targets[r.Target]:
-			return fmt.Errorf("%s: неизвестный target %q (допустимы %s)",
+			return fmt.Errorf("%s: unknown target %q (allowed: %s)",
 				where, r.Target, strings.Join(targetNames(), ", "))
 		case r.Match != "" && r.Regex != "":
-			return fmt.Errorf("%s: match и regex одновременно — задайте одно", where)
+			return fmt.Errorf("%s: match and regex together — set only one", where)
 		case r.Match == "" && r.Regex == "":
-			return fmt.Errorf("%s: нужен match или regex", where)
+			return fmt.Errorf("%s: match or regex is required", where)
 		case regexOnlyTargets[r.Target] && r.Regex == "":
-			return fmt.Errorf("%s: для target %s требуется regex", where, r.Target)
+			return fmt.Errorf("%s: target %s requires regex", where, r.Target)
 		case math.IsNaN(r.Weight) || r.Weight <= 0 || r.Weight > 1:
-			return fmt.Errorf("%s: weight должен быть числом в (0, 1], задан %v", where, r.Weight)
+			return fmt.Errorf("%s: weight must be a number in (0, 1], got %v", where, r.Weight)
 		}
 		if r.Regex != "" {
 			if max := DefaultLimits().MaxPatternBytes; len(r.Regex) > max {
-				return fmt.Errorf("%s: regex длиннее лимита %d байт (MaxPatternBytes), задан %d байт",
+				return fmt.Errorf("%s: regex longer than the %d byte limit (MaxPatternBytes), got %d bytes",
 					where, max, len(r.Regex))
 			}
 			re, err := regexp.Compile(r.Regex)
 			if err != nil {
-				return fmt.Errorf("%s: некорректный regex: %w", where, err)
+				return fmt.Errorf("%s: invalid regex: %w", where, err)
 			}
 			// A pattern like ^ / x* / (?:) would hit on any input with an
 			// empty evidence — an "always-true rule" invisible in the
 			// evidence (AN-07). Rejected at load time.
 			if re.MatchString("") {
-				return fmt.Errorf("%s: regex матчит пустую строку — правило срабатывало бы на любом входе", where)
+				return fmt.Errorf("%s: regex matches the empty string — the rule would hit on any input", where)
 			}
 		}
 		if r.VerMin != "" && parseVersion(r.VerMin) == nil {
-			return fmt.Errorf("%s: некорректный ver_min %q", where, r.VerMin)
+			return fmt.Errorf("%s: invalid ver_min %q", where, r.VerMin)
 		}
 		if r.VerMax != "" && parseVersion(r.VerMax) == nil {
-			return fmt.Errorf("%s: некорректный ver_max %q", where, r.VerMax)
+			return fmt.Errorf("%s: invalid ver_max %q", where, r.VerMax)
 		}
 		if vmin, vmax := parseVersion(r.VerMin), parseVersion(r.VerMax); vmin != nil && vmax != nil && vmax.less(vmin) {
-			return fmt.Errorf("%s: ver_min %q больше ver_max %q", where, r.VerMin, r.VerMax)
+			return fmt.Errorf("%s: ver_min %q is greater than ver_max %q", where, r.VerMin, r.VerMax)
 		}
 		seen[r.ID] = true
 	}

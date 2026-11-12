@@ -48,14 +48,14 @@ func TestCleanupMetricsObserve(t *testing.T) {
 
 	m.Observe(CleanupResult{Domains: 3, Results: 10}) // BadHashes 0 — no growth
 	if got := cleanupCounterValue(t, reg, "crawler_ingest_bad_hashes_total"); got != 0 {
-		t.Fatalf("после нулевого BadHashes счётчик = %v, want 0", got)
+		t.Fatalf("after a zero BadHashes the counter = %v, want 0", got)
 	}
 
 	m.Observe(CleanupResult{BadHashes: 3})
 	m.Observe(CleanupResult{BadHashes: 0})
 	m.Observe(CleanupResult{BadHashes: 2})
 	if got := cleanupCounterValue(t, reg, "crawler_ingest_bad_hashes_total"); got != 5 {
-		t.Errorf("счётчик = %v, want 5 (3 + 2, нулевые итоги не меняют)", got)
+		t.Errorf("the counter = %v, want 5 (3 + 2, zero outcomes change nothing)", got)
 	}
 }
 
@@ -75,7 +75,7 @@ func TestCleanupMetricsNoRegistry(t *testing.T) {
 	}
 	for _, mf := range families {
 		if mf.GetName() == "crawler_ingest_bad_hashes_total" {
-			t.Fatalf("прибор зарегистрирован без реестра: %s", mf.GetName())
+			t.Fatalf("the instrument registered without a registry: %s", mf.GetName())
 		}
 	}
 }
@@ -91,7 +91,7 @@ func TestCleanupMetricsIdempotent(t *testing.T) {
 	first.Observe(CleanupResult{BadHashes: 4})
 	second.Observe(CleanupResult{BadHashes: 6})
 	if got := cleanupCounterValue(t, reg, "crawler_ingest_bad_hashes_total"); got != 10 {
-		t.Errorf("счётчик = %v, want 10 (один прибор на оба экземпляра)", got)
+		t.Errorf("the counter = %v, want 10 (one instrument for both instances)", got)
 	}
 }
 
@@ -110,7 +110,7 @@ func TestCleanupDeletedOnPass(t *testing.T) {
 			cleanupRows([]any{int16(1), int64(10)}),
 			cleanupRows(),
 		},
-		selectErrs: []error{nil, errors.New("бд недоступна")},
+		selectErrs: []error{nil, errors.New("db unavailable")},
 		deletes: []*cleanupFakeRows{cleanupRows(
 			[]any{int16(1), int64(10), cleanupHash16(0xaa)},
 			[]any{int16(1), int64(10), make([]byte, 9)},
@@ -134,7 +134,7 @@ func TestCleanupDeletedOnPass(t *testing.T) {
 	for pool.stats().selects < 3 {
 		if time.Now().After(deadline) {
 			cancel()
-			t.Fatalf("цикл не дошёл до третьего прохода: %+v", pool.stats())
+			t.Fatalf("the loop did not reach the third pass: %+v", pool.stats())
 		}
 		time.Sleep(time.Millisecond)
 	}
@@ -150,15 +150,15 @@ func TestCleanupDeletedOnPass(t *testing.T) {
 	// the failed pass's data are deterministic: all passes after the
 	// first are zero.
 	if len(passes) < 2 {
-		t.Fatalf("проходов в хуке = %d (%+v), want ≥2", len(passes), passes)
+		t.Fatalf("passes in the hook = %d (%+v), want ≥2", len(passes), passes)
 	}
 	wantFirst := CleanupResult{Domains: 1, Results: 2, Contents: 1, BadHashes: 1}
 	if passes[0] != wantFirst {
-		t.Errorf("итог первого прохода = %+v, want %+v", passes[0], wantFirst)
+		t.Errorf("the first pass's outcome = %+v, want %+v", passes[0], wantFirst)
 	}
 	for i, p := range passes[1:] {
 		if p != (CleanupResult{}) {
-			t.Errorf("проход %d после первого = %+v, want нулевой (ошибочный проход хуку не отдаётся)", i+1, p)
+			t.Errorf("pass %d after the first = %+v, want zero (a failed pass is not given to the hook)", i+1, p)
 		}
 	}
 }

@@ -92,11 +92,11 @@ func (r *fileRows) Next() bool {
 
 func (r *fileRows) Scan(dest ...any) error {
 	if r.closed || r.i == 0 || r.i > len(r.rows) {
-		return errors.New("fileRows: Scan без Next")
+		return errors.New("fileRows: Scan without Next")
 	}
 	row := r.rows[r.i-1]
 	if len(dest) != len(row) {
-		return errors.New("fileRows: число приёмников не равно числу колонок")
+		return errors.New("fileRows: the destination count does not match the column count")
 	}
 	for i, d := range dest {
 		target := reflect.ValueOf(d).Elem()
@@ -139,7 +139,7 @@ type fakeFilePool struct {
 var _ db.DB = (*fakeFilePool)(nil)
 
 func (p *fakeFilePool) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFromSource) (int64, error) {
-	return 0, errors.New("fakeFilePool: CopyFrom не должен вызываться")
+	return 0, errors.New("fakeFilePool: CopyFrom must not be called")
 }
 
 func (p *fakeFilePool) Exec(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
@@ -194,10 +194,10 @@ func TestSQLFilesBySHA256(t *testing.T) {
 		t.Errorf("SQL = %v, want SELECT … WHERE sha256 = $1 ORDER BY id", pool.queries)
 	}
 	if !reflect.DeepEqual(pool.queries[0].args, []any{sha}) {
-		t.Errorf("аргументы = %v, want [sha256]", pool.queries[0].args)
+		t.Errorf("the arguments = %v, want [sha256]", pool.queries[0].args)
 	}
 	if len(fs) != 2 {
-		t.Fatalf("строк журнала = %d, want 2 (add и undo-delete одного содержимого)", len(fs))
+		t.Fatalf("journal rows = %d, want 2 (add and undo-delete of the same content)", len(fs))
 	}
 	f := fs[0]
 	if f.ID != 9 || f.ZoneID == nil || *f.ZoneID != 7 ||
@@ -210,10 +210,10 @@ func TestSQLFilesBySHA256(t *testing.T) {
 		f.Deleted != nil ||
 		f.Rejected == nil || *f.Rejected != 10 ||
 		f.ProcessedAt == nil || !f.ProcessedAt.Equal(when) {
-		t.Errorf("строка журнала = %+v, want как есть из ingest_files", f)
+		t.Errorf("the journal row = %+v, want as-is from ingest_files", f)
 	}
 	if d := fs[1]; d.ID != 11 || d.Action == nil || *d.Action != model.ActionDelete {
-		t.Errorf("вторая строка журнала = %+v, want undo-delete того же sha256", d)
+		t.Errorf("the second journal row = %+v, want the undo-delete of the same sha256", d)
 	}
 }
 
@@ -225,7 +225,7 @@ func TestSQLFilesBySHA256None(t *testing.T) {
 
 	fs, err := store.FilesBySHA256(context.Background(), []byte{9})
 	if err != nil || len(fs) != 0 {
-		t.Errorf("результат = %v, %v; want пустой срез без ошибки", fs, err)
+		t.Errorf("the result = %v, %v; want an empty slice without an error", fs, err)
 	}
 }
 
@@ -259,7 +259,7 @@ func TestSQLRecordFile(t *testing.T) {
 		int64(10), int64(0), int64(0), int64(8), int64(2), at,
 	}
 	if !reflect.DeepEqual(pool.execArgs[0], want) {
-		t.Errorf("аргументы = %v, want %v", pool.execArgs[0], want)
+		t.Errorf("the arguments = %v, want %v", pool.execArgs[0], want)
 	}
 }
 
@@ -272,30 +272,30 @@ func TestSQLRecordFileBadSHA(t *testing.T) {
 
 	err := store.RecordFile(context.Background(), FileRecord{Path: "x", SHA256: []byte{1}})
 	if err == nil || !strings.Contains(err.Error(), "sha256") {
-		t.Fatalf("err = %v, want ошибка длины sha256", err)
+		t.Fatalf("err = %v, want the sha256 length error", err)
 	}
 	if len(pool.execSQL) != 0 {
-		t.Error("запрос не должен выполняться при невалидном sha256")
+		t.Error("the query must not run on an invalid sha256")
 	}
 }
 
 // TestSQLFileStoreErrors — store errors are wrapped with the "db:
 // ingest_files" context (the SQLZoneStore style).
 func TestSQLFileStoreErrors(t *testing.T) {
-	boom := errors.New("соединение потеряно")
+	boom := errors.New("connection lost")
 
 	pool := &fakeFilePool{queryErr: boom}
 	store := NewFileStore(pool)
 	_, err := store.FilesBySHA256(context.Background(), []byte{1})
-	if err == nil || !strings.Contains(err.Error(), "db: ingest_files: поиск по sha256:") || !errors.Is(err, boom) {
-		t.Errorf("ошибка поиска = %v, want обёрнутая", err)
+	if err == nil || !strings.Contains(err.Error(), "db: ingest_files: lookup by sha256:") || !errors.Is(err, boom) {
+		t.Errorf("the lookup error = %v, want wrapped", err)
 	}
 
 	pool = &fakeFilePool{execErr: boom}
 	store = NewFileStore(pool)
 	err = store.RecordFile(context.Background(), FileRecord{Path: "x", SHA256: make([]byte, 32)})
-	if err == nil || !strings.Contains(err.Error(), "db: ingest_files: отчёт x:") || !errors.Is(err, boom) {
-		t.Errorf("ошибка записи = %v, want обёрнутая", err)
+	if err == nil || !strings.Contains(err.Error(), "db: ingest_files: report x:") || !errors.Is(err, boom) {
+		t.Errorf("the write error = %v, want wrapped", err)
 	}
 }
 
@@ -321,24 +321,24 @@ func TestRenderReport(t *testing.T) {
 		Existed:    3,
 	}
 	want := strings.Join([]string{
-		"# лог-отчёт ingest (ТЗ 5.1)",
-		"файл: com/add/list.txt",
-		"зона: com (id 7)",
-		"действие: add",
+		"# ingest log report (spec 5.1)",
+		"file: com/add/list.txt",
+		"zone: com (id 7)",
+		"action: add",
 		"sha256: abcd",
-		"итог: применён",
-		"строк: 6",
-		"  пропущено (пустые и комментарии): 2",
-		"  отклонено: 3",
+		"verdict: applied",
+		"lines: 6",
+		"  skipped (blank and comments): 2",
+		"  rejected: 3",
 		"    invalid: 1",
 		"    wrong_zone: 2",
-		"  валидных: 1",
-		"добавлено: 2 (в т.ч. возвращено из deleted: 1)",
-		"уже было: 3",
+		"  valid: 1",
+		"added: 2 (including revived from deleted: 1)",
+		"already existed: 3",
 		"",
 	}, "\n")
-	if got := renderReport(rep, "применён"); got != want {
-		t.Errorf("лог-отчёт =\n%s\nwant:\n%s", got, want)
+	if got := renderReport(rep, "applied"); got != want {
+		t.Errorf("the log report =\n%s\nwant:\n%s", got, want)
 	}
 }
 
@@ -354,22 +354,22 @@ func TestRenderReportDeleteFailed(t *testing.T) {
 		Reasons:    map[Reason]int{ReasonWrongZone: 4},
 	}
 	want := strings.Join([]string{
-		"# лог-отчёт ingest (ТЗ 5.1)",
-		"файл: net/delete/y.txt",
-		"зона: net (id 0)",
-		"действие: delete",
-		"итог: ошибочен — доля отклонённых строк выше порога",
-		"строк: 4",
-		"  пропущено (пустые и комментарии): 0",
-		"  отклонено: 4",
+		"# ingest log report (spec 5.1)",
+		"file: net/delete/y.txt",
+		"zone: net (id 0)",
+		"action: delete",
+		"verdict: bad — the share of rejected lines is above the threshold",
+		"lines: 4",
+		"  skipped (blank and comments): 0",
+		"  rejected: 4",
 		"    wrong_zone: 4",
-		"  валидных: 0",
-		"удалено: 0",
-		"не найдено в БД: 0",
+		"  valid: 0",
+		"deleted: 0",
+		"not found in the DB: 0",
 		"",
 	}, "\n")
-	if got := renderReport(rep, "ошибочен — доля отклонённых строк выше порога"); got != want {
-		t.Errorf("лог-отчёт =\n%s\nwant:\n%s", got, want)
+	if got := renderReport(rep, "bad — the share of rejected lines is above the threshold"); got != want {
+		t.Errorf("the log report =\n%s\nwant:\n%s", got, want)
 	}
 }
 
@@ -377,21 +377,21 @@ func TestRenderReportDeleteFailed(t *testing.T) {
 // log report): the zone and action are dashes, no sha256.
 func TestRenderReportNoPath(t *testing.T) {
 	want := strings.Join([]string{
-		"# лог-отчёт ingest (ТЗ 5.1)",
-		"файл: com/list.txt",
-		"зона: — (путь не разобран)",
-		"действие: —",
-		"итог: ошибочен — структура пути не <зона>/add|delete/*.txt",
-		"строк: 0",
-		"  пропущено (пустые и комментарии): 0",
-		"  отклонено: 0",
-		"  валидных: 0",
+		"# ingest log report (spec 5.1)",
+		"file: com/list.txt",
+		"zone: — (the path was not parsed)",
+		"action: —",
+		"verdict: bad — the path structure is not <zone>/add|delete/*.txt",
+		"lines: 0",
+		"  skipped (blank and comments): 0",
+		"  rejected: 0",
+		"  valid: 0",
 		"",
 	}, "\n")
 	got := renderReport(FileReport{Path: "com/list.txt"},
-		"ошибочен — структура пути не <зона>/add|delete/*.txt")
+		"bad — the path structure is not <zone>/add|delete/*.txt")
 	if got != want {
-		t.Errorf("лог-отчёт =\n%s\nwant:\n%s", got, want)
+		t.Errorf("the log report =\n%s\nwant:\n%s", got, want)
 	}
 }
 
@@ -411,7 +411,7 @@ func TestFileReportRecord(t *testing.T) {
 		Added: 5, Existed: 1, ProcessedAt: at,
 	}
 	if !reflect.DeepEqual(rec, want) {
-		t.Errorf("record = %+v, want %+v (revived — в added, not_found — без колонки)", rec, want)
+		t.Errorf("record = %+v, want %+v (revived is part of added, not_found has no column)", rec, want)
 	}
 }
 

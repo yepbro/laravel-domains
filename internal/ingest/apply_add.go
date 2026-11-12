@@ -205,18 +205,18 @@ func (r AddResult) Total() int64 { return r.Inserted + r.Existing + r.Revived }
 func ApplyAdd(ctx context.Context, pool ApplyDB, batch Batch, batchSize int) (AddResult, error) {
 	var res AddResult
 	if batch.ID == (BatchID{}) {
-		return res, errors.New("ingest: партия без идентификатора (ingest.NewBatchID)")
+		return res, errors.New("ingest: batch without an identifier (ingest.NewBatchID)")
 	}
 	if batch.Action != model.ActionAdd {
-		return res, fmt.Errorf("ingest: операция партии %s: применение add — только для партии add (ТЗ 5.1)", batch.Action)
+		return res, fmt.Errorf("ingest: batch action %s: applying add — only for an add batch (spec 5.1)", batch.Action)
 	}
 	if batchSize < 1 {
-		return res, fmt.Errorf("ingest: размер пачки %d, минимум 1 (ingest.batch_size)", batchSize)
+		return res, fmt.Errorf("ingest: chunk size %d, minimum 1 (ingest.batch_size)", batchSize)
 	}
 
 	tx, err := pool.Begin(ctx)
 	if err != nil {
-		return res, fmt.Errorf("ingest: применение партии add: транзакция: %w", err)
+		return res, fmt.Errorf("ingest: applying the add batch: transaction: %w", err)
 	}
 	// Rollback unconditionally: after Commit it is a no-op. An interrupted
 	// application leaves no half-done changes (spec 3.4).
@@ -234,18 +234,18 @@ func ApplyAdd(ctx context.Context, pool ApplyDB, batch Batch, batchSize int) (Ad
 		return res, err
 	}
 
-	n, err := applyAddCount(ctx, tx, reviveAddSQL, args, "возврат удалённых доменов партии add")
+	n, err := applyAddCount(ctx, tx, reviveAddSQL, args, "reviving deleted domains of the add batch")
 	if err != nil {
 		return res, err
 	}
 	res.Revived = n
 
-	uniques, err := applyAddCount(ctx, tx, countAddSQL, args, "подсчёт доменов партии add")
+	uniques, err := applyAddCount(ctx, tx, countAddSQL, args, "counting the add batch's domains")
 	if err != nil {
 		return res, err
 	}
 	if uniques < res.Inserted+res.Revived {
-		return res, fmt.Errorf("ingest: применение партии add: уникальных доменов %d меньше вставленных и возвращённых %d — счётчики расходятся",
+		return res, fmt.Errorf("ingest: applying the add batch: %d unique domains is less than the inserted and revived %d — the counters diverge",
 			uniques, res.Inserted+res.Revived)
 	}
 	res.Existing = uniques - res.Inserted - res.Revived
@@ -257,7 +257,7 @@ func ApplyAdd(ctx context.Context, pool ApplyDB, batch Batch, batchSize int) (Ad
 		return res, err
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return res, fmt.Errorf("ingest: применение партии add: фиксация: %w", err)
+		return res, fmt.Errorf("ingest: applying the add batch: commit: %w", err)
 	}
 	return res, nil
 }
@@ -280,11 +280,11 @@ func applyAddInsert(ctx context.Context, tx pgx.Tx, b Batch, batchSize int) (int
 	for {
 		rows, err := tx.Query(ctx, addChunkBoundSQL, b.ID[:], int16(model.ActionAdd), cursor, batchSize)
 		if err != nil {
-			return 0, nil, fmt.Errorf("ingest: граница пачки вставки новых доменов партии add: %w", err)
+			return 0, nil, fmt.Errorf("ingest: the add batch's new-domain insert chunk boundary: %w", err)
 		}
 		bound, err := pgx.CollectOneRow(rows, pgx.RowTo[int64])
 		if err != nil {
-			return 0, nil, fmt.Errorf("ingest: граница пачки вставки новых доменов партии add: %w", err)
+			return 0, nil, fmt.Errorf("ingest: the add batch's new-domain insert chunk boundary: %w", err)
 		}
 		if bound == 0 {
 			return inserted, zones, nil // the batch is exhausted
@@ -292,20 +292,20 @@ func applyAddInsert(ctx context.Context, tx pgx.Tx, b Batch, batchSize int) (int
 
 		rows, err = tx.Query(ctx, insertAddSQL, b.ID[:], int16(model.ActionAdd), cursor, bound)
 		if err != nil {
-			return 0, nil, fmt.Errorf("ingest: вставка новых доменов партии add: %w", err)
+			return 0, nil, fmt.Errorf("ingest: inserting the add batch's new domains: %w", err)
 		}
 		for rows.Next() {
 			var zone int16
 			if err := rows.Scan(&zone); err != nil {
 				rows.Close()
-				return 0, nil, fmt.Errorf("ingest: вставка новых доменов партии add: %w", err)
+				return 0, nil, fmt.Errorf("ingest: inserting the add batch's new domains: %w", err)
 			}
 			inserted++
 			zones[zone]++
 		}
 		if err := rows.Err(); err != nil {
 			rows.Close()
-			return 0, nil, fmt.Errorf("ingest: вставка новых доменов партии add: %w", err)
+			return 0, nil, fmt.Errorf("ingest: inserting the add batch's new domains: %w", err)
 		}
 		rows.Close()
 
@@ -333,7 +333,7 @@ func applyAddZoneDeltas(ctx context.Context, tx pgx.Tx, zones map[int16]int64) e
 		ns[i] = zones[id]
 	}
 	if _, err := tx.Exec(ctx, zoneDeltaAddSQL, ids, ns); err != nil {
-		return fmt.Errorf("ingest: дельты счётчиков зон партии add: %w", err)
+		return fmt.Errorf("ingest: the add batch's zone counter deltas: %w", err)
 	}
 	return nil
 }

@@ -59,7 +59,7 @@ func (t *anFakeTx) Query(ctx context.Context, sql string, args ...any) (pgx.Rows
 	t.pool.mu.Lock()
 	defer t.pool.mu.Unlock()
 	if sql != aggregateSelectSQL {
-		return nil, fmt.Errorf("anFakeTx: неожидаемый SQL: %s", sql)
+		return nil, fmt.Errorf("anFakeTx: unexpected SQL: %s", sql)
 	}
 	if t.pool.aggSelectErr != nil {
 		return nil, t.pool.aggSelectErr
@@ -121,7 +121,7 @@ func (r *anAggRows) Scan(dest ...any) error {
 		return r.scanErr
 	}
 	if r.i == 0 || r.i > len(r.rows) || len(dest) != 4 {
-		return fmt.Errorf("anAggRows: Scan без Next или приёмников %d (нужно 4)", len(dest))
+		return fmt.Errorf("anAggRows: Scan without Next or %d destinations (need 4)", len(dest))
 	}
 	row := r.rows[r.i-1]
 	// NULL → the nil destination stays untouched (the pgx semantics: a
@@ -138,7 +138,7 @@ func (r *anAggRows) Scan(dest ...any) error {
 		case **string:
 			*d = v.(*string)
 		default:
-			return fmt.Errorf("anAggRows: приёмник[%d] %T", i, dest[i])
+			return fmt.Errorf("anAggRows: destination[%d] %T", i, dest[i])
 		}
 	}
 	return nil
@@ -176,34 +176,34 @@ func anStr(s string) *string { return &s }
 // integer NOT NULL, updated_at timestamptz NOT NULL) and §13.1 (the is_laravel threshold).
 func TestAggregate_SQLContract(t *testing.T) {
 	if !strings.Contains(aggregateLockSQL, "pg_advisory_xact_lock($1::int8)") {
-		t.Error("lock: нет advisory-блокировки домена до конца транзакции")
+		t.Error("lock: no domain advisory lock until the end of the transaction")
 	}
 	if !strings.Contains(aggregateSelectSQL, "FROM laravel_findings") {
-		t.Error("select: агрегат читается из laravel_findings")
+		t.Error("select: the aggregate reads from laravel_findings")
 	}
 	if !strings.Contains(aggregateSelectSQL, "AND is_laravel") {
-		t.Error("select: нет фильтра уверенных срабатываний (§13.1 порог laravel_domains)")
+		t.Error("select: no confident-hits filter (the laravel_domains §13.1 threshold)")
 	}
 	if !strings.Contains(aggregateUpsertSQL,
 		"ON CONFLICT (zone_id, domain_id) DO UPDATE") {
-		t.Error("upsert: нет конфликта по PK laravel_domains (§3.5 перезапись)")
+		t.Error("upsert: no conflict on the laravel_domains PK (§3.5 rewrite)")
 	}
 	for _, col := range []string{"score", "ver_min", "ver_max", "found_on_mask", "rules_version", "updated_at"} {
 		if !strings.Contains(aggregateUpsertSQL, col) {
-			t.Errorf("upsert: нет колонки %s (§6.1)", col)
+			t.Errorf("upsert: no %s column (§6.1)", col)
 		}
 	}
 	if !strings.Contains(aggregateUpsertSQL, "$3::float4") {
-		t.Error("upsert: score не приводится к real (float4)")
+		t.Error("upsert: score is not cast to real (float4)")
 	}
 	if !strings.Contains(aggregateUpsertSQL, "$6::int8") {
-		t.Error("upsert: found_on_mask не приводится к bigint (маска DNSMask)")
+		t.Error("upsert: found_on_mask is not cast to bigint (the DNSMask mask)")
 	}
 	if !strings.Contains(aggregateUpsertSQL, "now()") {
-		t.Error("upsert: updated_at не из времени транзакции сервера (стиль record.go)")
+		t.Error("upsert: updated_at is not the server transaction time (the record.go style)")
 	}
 	if !strings.Contains(aggregateDeleteSQL, "DELETE FROM laravel_domains") {
-		t.Error("delete: не удаляет строку laravel_domains")
+		t.Error("delete: does not delete the laravel_domains row")
 	}
 }
 
@@ -216,13 +216,13 @@ func TestAggregate_ScanSemantics(t *testing.T) {
 		want domainAggregate
 	}{
 		{
-			name: "единственное срабатывание — диапазон как есть",
+			name: "a single hit — the range as is",
 			rows: [][]any{{int16(1), float32(0.7), anStr("5.3"), anStr("7.x")}},
 			want: domainAggregate{score: 0.7, verMin: anStr("5.3"), verMax: anStr("7.x"),
 				foundOnMask: mustMask(t, 1)},
 		},
 		{
-			name: "числовой порядок версий: min(10,5.3)=5.3, max(9.x,11)=11",
+			name: "numeric version order: min(10,5.3)=5.3, max(9.x,11)=11",
 			rows: [][]any{
 				{int16(1), float32(0.7), anStr("10"), anStr("9.x")},
 				{int16(2), float32(0.6), anStr("5.3"), anStr("11")},
@@ -231,7 +231,7 @@ func TestAggregate_ScanSemantics(t *testing.T) {
 				foundOnMask: mustMask(t, 1, 2)},
 		},
 		{
-			name: "максимальный score не у нижней границы диапазона",
+			name: "the maximum score is not at the range's lower bound",
 			rows: [][]any{
 				{int16(1), float32(0.9), anStr("9.19"), anStr("11")},
 				{int16(2), float32(0.95), anStr("5.3"), anStr("7.x")},
@@ -240,7 +240,7 @@ func TestAggregate_ScanSemantics(t *testing.T) {
 				foundOnMask: mustMask(t, 1, 2)},
 		},
 		{
-			name: "NULL верхней границы распространяется: объединение неограничено сверху",
+			name: "a NULL upper bound propagates: the union is unbounded above",
 			rows: [][]any{
 				{int16(1), float32(0.7), anStr("9.19"), nil},
 				{int16(2), float32(0.6), anStr("5.3"), anStr("7.x")},
@@ -249,7 +249,7 @@ func TestAggregate_ScanSemantics(t *testing.T) {
 				foundOnMask: mustMask(t, 1, 2)},
 		},
 		{
-			name: "конфликт отдельного срабатывания (обе NULL, T-070) — диапазон домена неопределён",
+			name: "a single hit's conflict (both NULL, T-070) — the domain range is undefined",
 			rows: [][]any{
 				{int16(1), float32(0.7), nil, nil},
 				{int16(2), float32(0.6), anStr("9.19"), anStr("11")},
@@ -257,7 +257,7 @@ func TestAggregate_ScanSemantics(t *testing.T) {
 			want: domainAggregate{score: 0.7, foundOnMask: mustMask(t, 1, 2)},
 		},
 		{
-			name: "все срабатывания без границ — обе границы NULL",
+			name: "all hits without bounds — both bounds NULL",
 			rows: [][]any{
 				{int16(1), float32(0.7), nil, nil},
 				{int16(2), float32(0.6), nil, anStr("7.x")},
@@ -265,7 +265,7 @@ func TestAggregate_ScanSemantics(t *testing.T) {
 			want: domainAggregate{score: 0.7, foundOnMask: mustMask(t, 1, 2)},
 		},
 		{
-			name: "равные границы в разной записи — первая по PK",
+			name: "equal bounds in a different notation — the first by PK",
 			rows: [][]any{
 				{int16(1), float32(0.7), anStr("9.19"), anStr("9.19.0")},
 			},
@@ -273,7 +273,7 @@ func TestAggregate_ScanSemantics(t *testing.T) {
 				foundOnMask: mustMask(t, 1)},
 		},
 		{
-			name: "численно равные границы соседних строк — первая по PK (min и max)",
+			name: "numerically equal bounds of neighboring rows — the first by PK (min and max)",
 			rows: [][]any{
 				{int16(1), float32(0.7), anStr("9.19"), anStr("9.19.0")},
 				{int16(2), float32(0.6), anStr("9.19.0"), anStr("9.19")},
@@ -282,14 +282,14 @@ func TestAggregate_ScanSemantics(t *testing.T) {
 				foundOnMask: mustMask(t, 1, 2)},
 		},
 		{
-			name: "отрицательный score (мусор в БД) — первая строка задаёт максимум",
+			name: "a negative score (junk in the DB) — the first row sets the maximum",
 			rows: [][]any{
 				{int16(1), float32(-0.5), nil, nil},
 			},
 			want: domainAggregate{score: -0.5, foundOnMask: mustMask(t, 1)},
 		},
 		{
-			name: "варианты одного субдомена схлопываются в бит; бит 62 допустим",
+			name: "variants of one subdomain collapse into a bit; bit 62 is allowed",
 			rows: [][]any{
 				{int16(5), float32(0.61), anStr("10"), anStr("11")},
 				{int16(5), float32(0.62), anStr("10"), anStr("11")},
@@ -299,7 +299,7 @@ func TestAggregate_ScanSemantics(t *testing.T) {
 				foundOnMask: mustMask(t, 5, 62)},
 		},
 		{
-			name: "пустой набор — пустой агрегат",
+			name: "an empty set — an empty aggregate",
 			rows: nil,
 			want: domainAggregate{},
 		},
@@ -311,21 +311,21 @@ func TestAggregate_ScanSemantics(t *testing.T) {
 				t.Fatalf("scanAggregate: %v", err)
 			}
 			if got.findings != len(tc.rows) {
-				t.Fatalf("findings = %d, нужно %d", got.findings, len(tc.rows))
+				t.Fatalf("findings = %d, want %d", got.findings, len(tc.rows))
 			}
 			if got.score != tc.want.score {
-				t.Errorf("score = %v, нужно %v (максимум)", got.score, tc.want.score)
+				t.Errorf("score = %v, want %v (the maximum)", got.score, tc.want.score)
 			}
 			if got.foundOnMask != tc.want.foundOnMask {
-				t.Errorf("found_on_mask = %d (%v), нужно %d (%v)",
+				t.Errorf("found_on_mask = %d (%v), want %d (%v)",
 					int64(got.foundOnMask), got.foundOnMask.IDs(),
 					int64(tc.want.foundOnMask), tc.want.foundOnMask.IDs())
 			}
 			if !anStrEq(got.verMin, tc.want.verMin) {
-				t.Errorf("ver_min = %v, нужно %v", anStrDeref(got.verMin), anStrDeref(tc.want.verMin))
+				t.Errorf("ver_min = %v, want %v", anStrDeref(got.verMin), anStrDeref(tc.want.verMin))
 			}
 			if !anStrEq(got.verMax, tc.want.verMax) {
-				t.Errorf("ver_max = %v, нужно %v", anStrDeref(got.verMax), anStrDeref(tc.want.verMax))
+				t.Errorf("ver_max = %v, want %v", anStrDeref(got.verMax), anStrDeref(tc.want.verMax))
 			}
 		})
 	}
@@ -336,7 +336,7 @@ func TestAggregate_ScanSemantics(t *testing.T) {
 func TestAggregate_InvalidSubdomainID(t *testing.T) {
 	_, err := scanAggregate(&anAggRows{rows: [][]any{{int16(63), float32(0.7), nil, nil}}})
 	if err == nil {
-		t.Fatal("subdomain_id 63 (бит 63 знаковый) — ожидана ошибка")
+		t.Fatal("subdomain_id 63 (bit 63 is the sign bit) — an error is expected")
 	}
 }
 
@@ -376,36 +376,36 @@ func TestAggregate_ThroughWorker(t *testing.T) {
 		{anEvAggUpsert, anEvCommit},
 	} {
 		if f.pool.j.indexOf(pair[0]) > f.pool.j.indexOf(pair[1]) {
-			t.Fatalf("порядок %v после %v нарушен: %v", pair[1], pair[0], f.pool.j.snapshot())
+			t.Fatalf("the order %v after %v is broken: %v", pair[1], pair[0], f.pool.j.snapshot())
 		}
 	}
 
 	row, ok := anDomainSnapshot(f.pool, anKey.zone, anKey.domain)
 	if !ok {
-		t.Fatal("строка laravel_domains не записана")
+		t.Fatal("the laravel_domains row was not written")
 	}
 	// The maximum score: noisy-OR(0.25, 0.35, 0.45) ≈ 0.7231 > 0.7.
 	wantScore := float32(1 - (1-0.25)*(1-0.35)*(1-0.45))
 	if row.score != wantScore {
-		t.Errorf("score = %v, нужно максимум %v", row.score, wantScore)
+		t.Errorf("score = %v, want the maximum %v", row.score, wantScore)
 	}
 	// The union [5.3, 7.x] ∪ [9.19, NULL) = [5.3, NULL).
 	if row.verMin == nil || *row.verMin != "5.3" {
-		t.Errorf("ver_min = %v, нужно 5.3 (min нижних границ)", anStrDeref(row.verMin))
+		t.Errorf("ver_min = %v, want 5.3 (the min of the lower bounds)", anStrDeref(row.verMin))
 	}
 	if row.verMax != nil {
-		t.Errorf("ver_max = %v, нужно NULL (объединение неограничено сверху)", *row.verMax)
+		t.Errorf("ver_max = %v, want NULL (the union is unbounded above)", *row.verMax)
 	}
 	// The mask: subdomains 1 (the delivery) and 2 (earlier); 3 — weak, 43 — foreign.
 	if want := mustMask(t, 1, 2); row.foundOnMask != want {
-		t.Errorf("found_on_mask = %d (%v), нужно %d (%v)",
+		t.Errorf("found_on_mask = %d (%v), want %d (%v)",
 			int64(row.foundOnMask), row.foundOnMask.IDs(), int64(want), want.IDs())
 	}
 	if row.rulesVersion != 1001 {
-		t.Errorf("rules_version = %d, нужно 1001 (версия набора пересчёта)", row.rulesVersion)
+		t.Errorf("rules_version = %d, want 1001 (the recalculation's set version)", row.rulesVersion)
 	}
 	if row.updatedAt.IsZero() {
-		t.Error("updated_at не проставлен")
+		t.Error("updated_at is not set")
 	}
 }
 
@@ -418,8 +418,8 @@ func TestAggregate_NoConfidentDeletesRow(t *testing.T) {
 		cookies *string
 		content []byte
 	}{
-		{"слабое срабатывание ниже порога", anCookies(t, "XSRF-TOKEN"), nil}, // 0.25 < 0.6
-		{"ни одного срабатывания", anCookies(t, "PHPSESSID"), nil},
+		{"a weak hit below the threshold", anCookies(t, "XSRF-TOKEN"), nil}, // 0.25 < 0.6
+		{"no hits at all", anCookies(t, "PHPSESSID"), nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newANFixture(t, anSet(1001), Options{MinScore: 0.6})
@@ -434,10 +434,10 @@ func TestAggregate_NoConfidentDeletesRow(t *testing.T) {
 				t.Fatalf("ProcessResult: %v", err)
 			}
 			if _, ok := anDomainSnapshot(f.pool, anKey.zone, anKey.domain); ok {
-				t.Fatal("строка laravel_domains не удалена (нет уверенных срабатываний)")
+				t.Fatal("the laravel_domains row was not deleted (no confident hits)")
 			}
 			if f.pool.j.indexOf(anEvAggDelete) == -1 {
-				t.Fatal("DELETE laravel_domains не выполнялся")
+				t.Fatal("DELETE laravel_domains did not run")
 			}
 		})
 	}
@@ -454,22 +454,22 @@ func TestAggregate_RepeatDelivery(t *testing.T) {
 
 	for i := 0; i < 2; i++ {
 		if _, err := f.w.ProcessResult(context.Background(), anTask); err != nil {
-			t.Fatalf("доставка №%d: %v", i+1, err)
+			t.Fatalf("delivery #%d: %v", i+1, err)
 		}
 	}
 	row, ok := anDomainSnapshot(f.pool, anKey.zone, anKey.domain)
 	if !ok {
-		t.Fatal("строка laravel_domains не записана")
+		t.Fatal("the laravel_domains row was not written")
 	}
 	if want := mustMask(t, 1, 2); row.foundOnMask != want {
-		t.Fatalf("found_on_mask = %d, нужно %d", int64(row.foundOnMask), int64(want))
+		t.Fatalf("found_on_mask = %d, want %d", int64(row.foundOnMask), int64(want))
 	}
 	if row.verMin == nil || *row.verMin != "5.3" || row.verMax == nil || *row.verMax != "11" {
-		t.Fatalf("диапазон = [%v, %v], нужно [5.3, 11]",
+		t.Fatalf("the range = [%v, %v], want [5.3, 11]",
 			anStrDeref(row.verMin), anStrDeref(row.verMax))
 	}
 	if n := countEvents(f.pool.j.snapshot(), anEvAggUpsert); n != 1 {
-		t.Fatalf("agg upsert выполнен %d раз (нужно 1 — повтор той же версии no-op mark, T-204)", n)
+		t.Fatalf("agg upsert ran %d times (want 1 — a same-version no-op mark repeat, T-204)", n)
 	}
 }
 
@@ -490,13 +490,13 @@ func TestAggregate_DomainDeleted(t *testing.T) {
 
 	wrote, err := f.w.ProcessResult(context.Background(), anTask)
 	if err != nil || wrote {
-		t.Fatalf("ProcessResult = %v, %v; нужен успех без записи", wrote, err)
+		t.Fatalf("ProcessResult = %v, %v; want success without a write", wrote, err)
 	}
 	if f.pool.j.indexOf(anEvLock) != -1 || f.pool.j.indexOf(anEvAggUpsert) != -1 || f.pool.j.indexOf(anEvAggDelete) != -1 {
-		t.Fatal("агрегация выполнялась для удалённого домена")
+		t.Fatal("the aggregation ran for a deleted domain")
 	}
 	if row, ok := anDomainSnapshot(f.pool, anKey.zone, anKey.domain); !ok || row.rulesVersion != 999 {
-		t.Fatal("существующая строка laravel_domains затронута при удалённом домене")
+		t.Fatal("the existing laravel_domains row was touched for a deleted domain")
 	}
 }
 
@@ -522,36 +522,36 @@ func TestAggregate_Errors(t *testing.T) {
 		fresh  bool
 		hadRow bool // whether the domain row existed before the failure (the appeared branch starts without it)
 	}{
-		{"блокировка домена", func(f *anFixture) { f.pool.lockErr = errors.New("lock boom") }, "", false, true},
-		{"чтение срабатываний", func(f *anFixture) { f.pool.aggSelectErr = errors.New("select boom") }, "", false, true},
-		{"чтение срабатываний (Scan строк)", func(f *anFixture) { f.pool.aggScanErr = errors.New("scan boom") },
-			"чтение срабатываний", false, true},
-		{"чтение срабатываний (Err строк)", func(f *anFixture) { f.pool.aggRowsErr = errors.New("rows boom") },
-			"чтение срабатываний", false, true},
-		{"мусорный субдомен в findings", func(f *anFixture) {
+		{"domain lock", func(f *anFixture) { f.pool.lockErr = errors.New("lock boom") }, "", false, true},
+		{"reading hits", func(f *anFixture) { f.pool.aggSelectErr = errors.New("select boom") }, "", false, true},
+		{"reading hits (row Scan)", func(f *anFixture) { f.pool.aggScanErr = errors.New("scan boom") },
+			"reading hits", false, true},
+		{"reading hits (rows Err)", func(f *anFixture) { f.pool.aggRowsErr = errors.New("rows boom") },
+			"reading hits", false, true},
+		{"junk subdomain in findings", func(f *anFixture) {
 			anSeedFinding(f.pool, anRowKey{3, 42, 63, 0}, 0.7, nil, nil, true)
-		}, "чтение срабатываний", false, true},
-		{"чтение строки домена", func(f *anFixture) { f.pool.existsErr = errors.New("exists boom") },
-			"чтение строки домена", false, true},
-		{"запись строки домена", func(f *anFixture) { f.pool.aggUpsertErr = errors.New("agg boom") },
-			"запись строки домена: agg boom", false, true},
-		{"запись строки домена: RowsAffected", func(f *anFixture) { f.pool.aggUpsertRowsAff = 2 },
-			"запись строки домена: затронуто 2 строк", false, true},
-		{"удаление строки домена", func(f *anFixture) {
+		}, "reading hits", false, true},
+		{"reading domain row", func(f *anFixture) { f.pool.existsErr = errors.New("exists boom") },
+			"reading domain row", false, true},
+		{"writing domain row", func(f *anFixture) { f.pool.aggUpsertErr = errors.New("agg boom") },
+			"writing domain row: agg boom", false, true},
+		{"writing domain row: RowsAffected", func(f *anFixture) { f.pool.aggUpsertRowsAff = 2 },
+			"writing domain row: 2 rows affected", false, true},
+		{"deleting domain row", func(f *anFixture) {
 			// A delivery outcome without hits → the delete branch.
 			f.pool.seedResult(anKey, anHeaders(t), anCookies(t, "PHPSESSID"), nil)
-			f.pool.aggUpsertErr = errors.New("не должен вызываться")
+			f.pool.aggUpsertErr = errors.New("must not be called")
 			f.pool.aggDeleteErr = errors.New("agg del boom")
 		}, "", false, true},
-		{"запись истории (lost)", func(f *anFixture) {
+		{"history write (lost)", func(f *anFixture) {
 			f.pool.seedResult(anKey, anHeaders(t), anCookies(t, "PHPSESSID"), nil) // no signs
 			f.pool.aggHistErr = errors.New("hist boom")
-		}, "запись истории (lost)", true, true},
-		{"запись истории (appeared)", func(f *anFixture) {
+		}, "history write (lost)", true, true},
+		{"history write (appeared)", func(f *anFixture) {
 			delete(f.pool.domains, anDomainKey{anKey.zone, anKey.domain}) // there was no row
 			f.pool.aggHistErr = errors.New("hist boom")
-		}, "запись истории (appeared)", true, false},
-		{"фиксация", func(f *anFixture) { f.pool.commitErr = errors.New("commit boom") }, "", false, true},
+		}, "history write (appeared)", true, false},
+		{"commit", func(f *anFixture) { f.pool.commitErr = errors.New("commit boom") }, "", false, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -560,17 +560,17 @@ func TestAggregate_Errors(t *testing.T) {
 			task := anTask
 			task.Fresh = tc.fresh
 			if _, err := f.w.ProcessResult(context.Background(), task); err == nil {
-				t.Fatal("ожидана ошибка доставки")
+				t.Fatal("a delivery error is expected")
 			} else if tc.want != "" && !strings.Contains(err.Error(), tc.want) {
-				t.Fatalf("ошибка = %v, нужна подстрока %q", err, tc.want)
+				t.Fatalf("err = %v, want the substring %q", err, tc.want)
 			}
 			// The rollback: the domain row's previous state survived.
 			row, ok := anDomainSnapshot(f.pool, anKey.zone, anKey.domain)
 			if tc.hadRow != ok || (ok && row.rulesVersion != 999) {
-				t.Fatalf("строка домена изменилась при сбое: %+v (ok=%v)", row, ok)
+				t.Fatalf("the domain row changed on failure: %+v (ok=%v)", row, ok)
 			}
 			if _, ok := anFindingSnapshot(f.pool, anKey); ok {
-				t.Fatal("findings записаны при сбое агрегации")
+				t.Fatal("findings were written on aggregation failure")
 			}
 		})
 	}
@@ -590,10 +590,10 @@ func TestAggregate_CtxCancelled(t *testing.T) {
 	cancel()
 	unfound, err := aggregateDomain(ctx, tx, anKey.zone, anKey.domain, 1001, false)
 	if err == nil {
-		t.Fatal("отменённый ctx — ошибка агрегации")
+		t.Fatal("a cancelled ctx — an aggregation error")
 	}
 	if unfound {
-		t.Error("сбой агрегации не может сигнализировать снятие находки (T-187)")
+		t.Error("an aggregation failure cannot signal a find removal (T-187)")
 	}
 }
 
@@ -642,13 +642,13 @@ func TestAggregate_History(t *testing.T) {
 
 	hist := anHistorySnapshot(f.pool)
 	if len(hist) != 1 || !hist[0].appeared || hist[0].domain != anKey.domain {
-		t.Fatalf("история после появления = %+v, хочу одну запись appeared=true", hist)
+		t.Fatalf("the history after the appearance = %+v, want one appeared=true record", hist)
 	}
 
 	// Episode 2 (fresh): the same signs — the row exists, no transition.
 	runTask(task)
 	if hist = anHistorySnapshot(f.pool); len(hist) != 1 {
-		t.Fatalf("повторный пересчёт без смены наличия: история = %+v, хочу без изменений", hist)
+		t.Fatalf("a recalculation without a presence change: the history = %+v, want no change", hist)
 	}
 
 	// Episode 3 (fresh): a page without signs — the findings are empty,
@@ -660,10 +660,10 @@ func TestAggregate_History(t *testing.T) {
 
 	hist = anHistorySnapshot(f.pool)
 	if len(hist) != 2 || hist[1].appeared {
-		t.Fatalf("история после исчезновения = %+v, хочу вторую запись appeared=false", hist)
+		t.Fatalf("the history after the disappearance = %+v, want a second appeared=false record", hist)
 	}
 	if _, ok := anDomainSnapshot(f.pool, anKey.zone, anKey.domain); ok {
-		t.Fatal("строка laravel_domains не удалена")
+		t.Fatal("the laravel_domains row was not deleted")
 	}
 
 	// A re-analysis of the appearance (fresh=false): the findings will
@@ -676,10 +676,10 @@ func TestAggregate_History(t *testing.T) {
 	}
 	runTask(rTask)
 	if _, ok := anDomainSnapshot(f.pool, rKey.zone, rKey.domain); !ok {
-		t.Fatal("строка переанализированного домена не записана")
+		t.Fatal("the re-analyzed domain's row was not written")
 	}
 	if hist = anHistorySnapshot(f.pool); len(hist) != 2 {
-		t.Fatalf("переанализ-появление пишeт историю: %+v, хочу без изменений (fresh=false)", hist)
+		t.Fatalf("the re-analysis appearance writes history: %+v, want no change (fresh=false)", hist)
 	}
 
 	// A re-analysis of the disappearance (fresh=false): the findings are
@@ -687,16 +687,16 @@ func TestAggregate_History(t *testing.T) {
 	f.pool.seedResult(rKey, anHeaders(t), anCookies(t), plainHash[:])
 	runTask(rTask)
 	if _, ok := anDomainSnapshot(f.pool, rKey.zone, rKey.domain); ok {
-		t.Fatal("строка переанализированного домена не удалена")
+		t.Fatal("the re-analyzed domain's row was not deleted")
 	}
 	if hist = anHistorySnapshot(f.pool); len(hist) != 2 {
-		t.Fatalf("переанализ-исчезновение пишет историю: %+v, хочу без изменений (fresh=false)", hist)
+		t.Fatalf("the re-analysis disappearance writes history: %+v, want no change (fresh=false)", hist)
 	}
 
 	// An empty fresh episode without a row (DELETE 0): no transition — no record.
 	runTask(task)
 	if hist = anHistorySnapshot(f.pool); len(hist) != 2 {
-		t.Fatalf("удаление отсутствующей строки пишет историю: %+v, хочу без изменений", hist)
+		t.Fatalf("deleting a missing row writes history: %+v, want no change", hist)
 	}
 }
 
@@ -729,30 +729,30 @@ func TestAggregate_Counters(t *testing.T) {
 	f.pool.seedResult(anKey, anHeaders(t), anCookies(t, "XSRF-TOKEN", "laravel_session"), laravelHash[:])
 	runTask(task)
 	if got := f.pool.zoneLaravel[anKey.zone]; got != 1 {
-		t.Fatalf("domains_laravel зоны после появления = %d, хочу 1", got)
+		t.Fatalf("domains_laravel of the zone after the appearance = %d, want 1", got)
 	}
 	if got := f.pool.counters["laravel_appeared_total"]; got != 1 {
-		t.Fatalf("laravel_appeared_total = %d, хочу 1", got)
+		t.Fatalf("laravel_appeared_total = %d, want 1", got)
 	}
 	if got := f.pool.counters["laravel_lost_total"]; got != 0 {
-		t.Fatalf("laravel_lost_total = %d, хочу 0", got)
+		t.Fatalf("laravel_lost_total = %d, want 0", got)
 	}
 
 	// A disappearance (fresh): zone −1, lost +1.
 	f.pool.seedResult(anKey, anHeaders(t), anCookies(t), plainHash[:])
 	runTask(task)
 	if got := f.pool.zoneLaravel[anKey.zone]; got != 0 {
-		t.Fatalf("domains_laravel зоны после исчезновения = %d, хочу 0", got)
+		t.Fatalf("domains_laravel of the zone after the disappearance = %d, want 0", got)
 	}
 	if got := f.pool.counters["laravel_lost_total"]; got != 1 {
-		t.Fatalf("laravel_lost_total = %d, хочу 1", got)
+		t.Fatalf("laravel_lost_total = %d, want 1", got)
 	}
 
 	// A repeated episode without a presence change — no deltas.
 	f.pool.seedResult(anKey, anHeaders(t), anCookies(t, "XSRF-TOKEN", "laravel_session"), laravelHash[:])
 	runTask(task)
 	if got := f.pool.zoneLaravel[anKey.zone]; got != 1 {
-		t.Fatalf("domains_laravel после повторного появления = %d, хочу 1", got)
+		t.Fatalf("domains_laravel after the repeated appearance = %d, want 1", got)
 	}
 
 	// A re-analysis of the disappearance (fresh=false): the row is
@@ -762,10 +762,10 @@ func TestAggregate_Counters(t *testing.T) {
 	f.pool.seedResult(anKey, anHeaders(t), anCookies(t), plainHash[:])
 	runTask(rTask)
 	if got := f.pool.zoneLaravel[anKey.zone]; got != 0 {
-		t.Fatalf("domains_laravel после переанализа-исчезновения = %d, хочу 0 (переход без fresh)", got)
+		t.Fatalf("domains_laravel after the re-analysis disappearance = %d, want 0 (a transition without fresh)", got)
 	}
 	if got := f.pool.counters["laravel_lost_total"]; got != 1 {
-		t.Fatalf("laravel_lost_total после переанализа = %d, хочу 1 (история не пишется)", got)
+		t.Fatalf("laravel_lost_total after the re-analysis = %d, want 1 (no history is written)", got)
 	}
 
 	// The cumulatives match the history journal (the incremental-counters spec §6.5 invariant).
@@ -779,7 +779,7 @@ func TestAggregate_Counters(t *testing.T) {
 		}
 	}
 	if appeared != f.pool.counters["laravel_appeared_total"] || lost != f.pool.counters["laravel_lost_total"] {
-		t.Fatalf("кумулятивы (%d/%d) разошлись с журналом истории (%d/%d)",
+		t.Fatalf("the cumulatives (%d/%d) diverged from the history journal (%d/%d)",
 			f.pool.counters["laravel_appeared_total"], f.pool.counters["laravel_lost_total"], appeared, lost)
 	}
 
@@ -787,8 +787,8 @@ func TestAggregate_Counters(t *testing.T) {
 	// fails loudly — silent drift is unacceptable.
 	f.pool.zoneNoRow = true
 	f.pool.seedResult(anKey, anHeaders(t), anCookies(t, "XSRF-TOKEN", "laravel_session"), laravelHash[:])
-	if _, err := f.w.ProcessResult(ctx, anTask); err == nil || !strings.Contains(err.Error(), "счётчик Laravel-зоны") {
-		t.Fatalf("отсутствующая строка зоны: err = %v, хочу ошибку счётчика зоны", err)
+	if _, err := f.w.ProcessResult(ctx, anTask); err == nil || !strings.Contains(err.Error(), "Laravel zone counter") {
+		t.Fatalf("missing zone row: err = %v, want a zone counter error", err)
 	}
 	f.pool.zoneNoRow = false
 }

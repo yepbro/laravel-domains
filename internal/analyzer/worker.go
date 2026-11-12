@@ -300,16 +300,16 @@ type Worker struct {
 // of analysis is invisible to the operator (the T-058/renderworker style).
 func New(db AnalyzerDB, q queue.Queue, contents ContentGetter, sets SetSource, opts Options) (*Worker, error) {
 	if db == nil {
-		return nil, errors.New("analyzer: пул БД не задан")
+		return nil, errors.New("analyzer: DB pool is not set")
 	}
 	if q == nil {
-		return nil, errors.New("analyzer: очередь не задана")
+		return nil, errors.New("analyzer: queue is not set")
 	}
 	if contents == nil {
-		return nil, errors.New("analyzer: хранилище контента не задано")
+		return nil, errors.New("analyzer: content store is not set")
 	}
 	if sets == nil {
-		return nil, errors.New("analyzer: источник набора правил не задан")
+		return nil, errors.New("analyzer: rule set source is not set")
 	}
 	return &Worker{db: db, q: q, contents: contents, sets: sets, opt: opts.withDefaults(), met: NewMetrics(opts.Metrics)}, nil
 }
@@ -344,7 +344,7 @@ func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, er
 		return false, err
 	}
 	if !found {
-		w.opt.log().Debug("анализ не требуется — строки нет",
+		w.opt.log().Debug("analysis not needed — no row",
 			"zone_id", task.ZoneID, "domain_id", task.DomainID,
 			"subdomain_id", task.SubdomainID, "variant", int16(task.Variant))
 		return false, nil
@@ -364,7 +364,7 @@ func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, er
 		// Symmetric to ReanalyzeLoop: a nil snapshot of an alternative
 		// SetSource is a skip, not a panic. The delivery is acknowledged:
 		// without the version stamp the row stays stale, re-analysis (T-074)
-		w.opt.log().Warn("набор правил не загружен — анализ пропущен, строка останется для переанализа",
+		w.opt.log().Warn("rule set not loaded — analysis skipped, the row stays for re-analysis",
 			"domain", name, "zone_id", task.ZoneID, "domain_id", task.DomainID)
 		return false, nil
 	}
@@ -379,7 +379,7 @@ func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, er
 		// and stamped as full rules_version. The delivery is acknowledged:
 		// the row stays stale, re-analysis (T-074) will return to it
 		// (practically unreachable with RE2 on a bounded input).
-		w.opt.log().Warn("анализ прерван до полного просмотра правил — findings не записаны, строка останется для переанализа",
+		w.opt.log().Warn("analysis interrupted before the full rule scan — findings not written, the row stays for re-analysis",
 			"domain", name, "signals", len(res.Signals), "rules_version", set.Version)
 		return false, nil
 	}
@@ -392,7 +392,7 @@ func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, er
 
 	tx, err := w.db.Begin(ctx)
 	if err != nil {
-		return false, fmt.Errorf("analyzer: %s: запись findings: транзакция: %w", name, err)
+		return false, fmt.Errorf("analyzer: %s: findings write: transaction: %w", name, err)
 	}
 	// Rollback unconditionally: after Commit it is a no-op (the T-044/T-058 style).
 	defer func() { _ = tx.Rollback(ctx) }()
@@ -408,12 +408,12 @@ func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, er
 		set.Version, row.hash).Scan(&stampedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			w.opt.log().Debug("findings не записаны — строка перезаписана другим эпизодом, домен удалён или уже проанализирована этой версией",
+			w.opt.log().Debug("findings not written — the row was rewritten by another episode, the domain is deleted, or it is already analyzed by this version",
 				"domain", name, "zone_id", task.ZoneID, "domain_id", task.DomainID,
 				"subdomain_id", task.SubdomainID, "variant", int16(task.Variant))
 			return false, nil
 		}
-		return false, fmt.Errorf("analyzer: %s: штамп rules_version: %w", name, err)
+		return false, fmt.Errorf("analyzer: %s: rules_version stamp: %w", name, err)
 	}
 
 	if len(res.Signals) > 0 {
@@ -424,10 +424,10 @@ func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, er
 			float32(res.Score), nullStr(res.VerMin), nullStr(res.VerMax),
 			signals, isLaravel, set.Version)
 		if err != nil {
-			return false, fmt.Errorf("analyzer: %s: запись findings: %w", name, err)
+			return false, fmt.Errorf("analyzer: %s: findings write: %w", name, err)
 		}
 		if tag.RowsAffected() != 1 {
-			return false, fmt.Errorf("analyzer: %s: запись findings: затронуто %d строк", name, tag.RowsAffected())
+			return false, fmt.Errorf("analyzer: %s: findings write: %d rows affected", name, tag.RowsAffected())
 		}
 	} else {
 		// No rule hit — the row is not written (spec 5.8); an existing one
@@ -435,7 +435,7 @@ func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, er
 		// current episode (§3.5).
 		if _, err := tx.Exec(ctx, findingDeleteSQL,
 			task.ZoneID, task.DomainID, task.SubdomainID, int16(task.Variant)); err != nil {
-			return false, fmt.Errorf("analyzer: %s: удаление findings: %w", name, err)
+			return false, fmt.Errorf("analyzer: %s: findings delete: %w", name, err)
 		}
 	}
 
@@ -460,7 +460,7 @@ func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, er
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return false, fmt.Errorf("analyzer: %s: запись findings: фиксация: %w", name, err)
+		return false, fmt.Errorf("analyzer: %s: findings write: commit: %w", name, err)
 	}
 
 	// The find removal by re-analysis (T-187) — after the commit: the
@@ -469,7 +469,7 @@ func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, er
 	// happen; without the drain the domain's rows would stay behind the
 	w.drainUnfound(ctx, task, name, unfound)
 
-	w.opt.log().Debug("анализ записан",
+	w.opt.log().Debug("analysis written",
 		"domain", name, "signals", len(res.Signals), "score", res.Score,
 		"is_laravel", isLaravel, "ver_min", res.VerMin, "ver_max", res.VerMax,
 		"conflict", res.Conflict, "rules_version", set.Version)
@@ -489,10 +489,10 @@ func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, er
 func analyzeConsumeTail(ctx context.Context, tx pgx.Tx, stampedAt time.Time) error {
 	tag, err := tx.Exec(ctx, analyzeReanalyzeConsumeSQL, stampedAt, int64(-1))
 	if err != nil {
-		return fmt.Errorf("корзина хвостов переанализа: %w", err)
+		return fmt.Errorf("re-analysis tail bucket: %w", err)
 	}
 	if tag.RowsAffected() != 1 {
-		return fmt.Errorf("корзина хвостов переанализа: затронуто %d строк (upsert корзины часа обязан 1)",
+		return fmt.Errorf("re-analysis tail bucket: %d rows affected (the hour bucket upsert must affect 1)",
 			tag.RowsAffected())
 	}
 	return nil
@@ -521,14 +521,14 @@ func (w *Worker) drainUnfound(ctx context.Context, task queue.Result, name strin
 		// is kept forever (no retention cycle at all, nothing piles up
 		// behind the cursor); the seam is not set — an isolated build.
 		// The event is observable via the metric and the log.
-		w.opt.log().Info("снятие находки переанализом — точечный дренаж контента выключен",
+		w.opt.log().Info("find removed by re-analysis — the point content drain is off",
 			"domain", name, "zone_id", task.ZoneID, "domain_id", task.DomainID)
 		return
 	}
 	stats, err := w.opt.DrainDomain(ctx, w.db, w.opt.Retention, task.ZoneID, task.DomainID)
 	if err != nil {
 		if ctx.Err() == nil {
-			w.opt.log().Warn("снятие находки переанализом: точечный дренаж контента домена не выполнен — записи останутся позади курсора retention",
+			w.opt.log().Warn("find removed by re-analysis: the domain content point drain did not run — the rows will stay behind the retention cursor",
 				"domain", name, "zone_id", task.ZoneID, "domain_id", task.DomainID, "err", err)
 		}
 		w.met.UnfoundDrainError()
@@ -536,7 +536,7 @@ func (w *Worker) drainUnfound(ctx context.Context, task queue.Result, name strin
 	}
 	w.met.UnfoundDrain(stats.Rows)
 	if stats.Rows > 0 {
-		w.opt.log().Info("снятие находки переанализом — контент домена дренирован точечно",
+		w.opt.log().Info("find removed by re-analysis — domain content point-drained",
 			"domain", name, "zone_id", task.ZoneID, "domain_id", task.DomainID,
 			"rows", stats.Rows, "refs", stats.Refs, "contents", stats.Contents,
 			"freed_bytes", stats.FreedBytes)
@@ -552,7 +552,7 @@ func (w *Worker) selectResult(ctx context.Context, task queue.Result) (analyzeRo
 	rows, err := w.db.Query(ctx, analyzeSelectSQL,
 		task.ZoneID, task.DomainID, task.SubdomainID, int16(task.Variant))
 	if err != nil {
-		return analyzeRow{}, false, fmt.Errorf("analyzer: чтение строки результата: %w", err)
+		return analyzeRow{}, false, fmt.Errorf("analyzer: reading the result row: %w", err)
 	}
 	defer rows.Close()
 
@@ -560,19 +560,19 @@ func (w *Worker) selectResult(ctx context.Context, task queue.Result) (analyzeRo
 		var headers, cookies *string
 		var hash []byte
 		if err := rows.Scan(&headers, &cookies, &hash); err != nil {
-			return analyzeRow{}, false, fmt.Errorf("analyzer: чтение строки результата: %w", err)
+			return analyzeRow{}, false, fmt.Errorf("analyzer: reading the result row: %w", err)
 		}
 		row := analyzeRow{hash: hash}
 		if row.headers, err = parseHeadersJSON(headers); err != nil {
-			return analyzeRow{}, false, fmt.Errorf("analyzer: заголовки строки результата: %w", err)
+			return analyzeRow{}, false, fmt.Errorf("analyzer: result row headers: %w", err)
 		}
 		if row.cookies, err = parseCookiesJSON(cookies); err != nil {
-			return analyzeRow{}, false, fmt.Errorf("analyzer: cookies строки результата: %w", err)
+			return analyzeRow{}, false, fmt.Errorf("analyzer: result row cookies: %w", err)
 		}
 		return row, true, nil // by PK — at most one row
 	}
 	if err := rows.Err(); err != nil {
-		return analyzeRow{}, false, fmt.Errorf("analyzer: чтение строки результата: %w", err)
+		return analyzeRow{}, false, fmt.Errorf("analyzer: reading the result row: %w", err)
 	}
 	return analyzeRow{}, false, nil
 }
@@ -595,7 +595,7 @@ func (w *Worker) fetchContent(ctx context.Context, hash []byte) ([]byte, error) 
 		return nil, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("чтение контента %s: %w", h.String(), err)
+		return nil, fmt.Errorf("reading content %s: %w", h.String(), err)
 	}
 	return data, nil
 }
@@ -701,11 +701,11 @@ func parseCookiesJSON(s *string) ([]rules.Cookie, error) {
 // for a repeated delivery, spec 3.4). A read or processing error does
 func Run(ctx context.Context, w *Worker, opts Options) error {
 	if w == nil {
-		return errors.New("analyzer: цикл воркера: воркер не задан")
+		return errors.New("analyzer: worker loop: worker is not set")
 	}
 	o := opts.withDefaults()
 	log := o.log()
-	log.Info("цикл analyzer",
+	log.Info("analyzer loop",
 		"group", o.Group, "consumer", o.Consumer,
 		"concurrency", o.Concurrency, "consume", o.Consume,
 		"min_score", w.opt.MinScore)
@@ -750,7 +750,7 @@ func Run(ctx context.Context, w *Worker, opts Options) error {
 			if ctx.Err() != nil {
 				return nil // graceful shutdown
 			}
-			log.Warn("цикл analyzer: чтение q:analyze", "err", err)
+			log.Warn("analyzer loop: reading q:analyze", "err", err)
 			wait(DefaultErrorWait)
 			continue
 		}
@@ -779,7 +779,7 @@ func Run(ctx context.Context, w *Worker, opts Options) error {
 				defer func() { <-sem }()
 				err := queue.Processing(ctx, w.q, o.Group, d, w.processDelivery)
 				if err != nil && ctx.Err() == nil {
-					log.Warn("задача q:analyze не подтверждена — вернётся повторной доставкой",
+					log.Warn("q:analyze task not acknowledged — it will come back as a repeated delivery",
 						"entry", d.ID, "err", err)
 				}
 			}(d)
@@ -801,11 +801,11 @@ func Run(ctx context.Context, w *Worker, opts Options) error {
 func (w *Worker) processDelivery(ctx context.Context, del queue.Delivery) error {
 	task, err := queue.Decode[queue.Result](del)
 	if err != nil {
-		return fmt.Errorf("analyzer: запись %s стрима %s: %w", del.ID, del.Stream, err)
+		return fmt.Errorf("analyzer: record %s of stream %s: %w", del.ID, del.Stream, err)
 	}
 	start := time.Now()
 	if _, err := w.ProcessResult(ctx, task); err != nil {
-		return fmt.Errorf("analyzer: домен %s: анализ: %w", task.Name, err)
+		return fmt.Errorf("analyzer: domain %s: analysis: %w", task.Name, err)
 	}
 	w.met.Task(time.Since(start))
 	return nil

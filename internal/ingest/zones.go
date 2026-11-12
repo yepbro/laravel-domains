@@ -20,7 +20,7 @@ import (
 // ErrZoneNotFound — no zone with the given punycode name exists in the
 // zones table. Returned by ZoneStore.ZoneByName; for EnsureZone this is
 // the signal to create the zone (spec 5.1: automatically on the first file).
-var ErrZoneNotFound = errors.New("ingest: зоны нет в таблице zones")
+var ErrZoneNotFound = errors.New("ingest: the zone is not in the zones table")
 
 // ZoneStore — access to the zones table required by file ingest: find a
 // zone by name or create one. The interface is deliberately small:
@@ -53,7 +53,7 @@ type ZoneStore interface {
 func EnsureZone(ctx context.Context, store ZoneStore, zone string) (model.Zone, error) {
 	ascii, err := idn.NormalizeZone(zone)
 	if err != nil {
-		return model.Zone{}, fmt.Errorf("ingest: зона %q: %w", zone, err)
+		return model.Zone{}, fmt.Errorf("ingest: the zone %q: %w", zone, err)
 	}
 
 	z, err := store.ZoneByName(ctx, ascii)
@@ -61,12 +61,12 @@ func EnsureZone(ctx context.Context, store ZoneStore, zone string) (model.Zone, 
 		return z, nil
 	}
 	if !errors.Is(err, ErrZoneNotFound) {
-		return model.Zone{}, fmt.Errorf("ingest: поиск зоны %s: %w", ascii, err)
+		return model.Zone{}, fmt.Errorf("ingest: the zone %s lookup: %w", ascii, err)
 	}
 
 	z, err = store.CreateZone(ctx, ascii, displayUnicode(ascii))
 	if err != nil {
-		return model.Zone{}, fmt.Errorf("ingest: создание зоны %s: %w", ascii, err)
+		return model.Zone{}, fmt.Errorf("ingest: the zone %s creation: %w", ascii, err)
 	}
 	return z, nil
 }
@@ -112,7 +112,7 @@ func NewZoneStore(pool db.DB) *SQLZoneStore {
 
 // ZoneByName looks up the zone by punycode name; a missing one — ErrZoneNotFound.
 func (s *SQLZoneStore) ZoneByName(ctx context.Context, name string) (model.Zone, error) {
-	z, err := s.queryZone(ctx, sqlZoneByName, "поиск зоны "+name, name)
+	z, err := s.queryZone(ctx, sqlZoneByName, "zone lookup "+name, name)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return model.Zone{}, ErrZoneNotFound
 	}
@@ -125,7 +125,7 @@ func (s *SQLZoneStore) ZoneByName(ctx context.Context, name string) (model.Zone,
 // the zone is read by a repeated lookup: two files of one zone give one
 // zones row.
 func (s *SQLZoneStore) CreateZone(ctx context.Context, name string, nameUnicode *string) (model.Zone, error) {
-	z, err := s.queryZone(ctx, sqlZoneCreate, "создание зоны "+name, name, nameUnicode)
+	z, err := s.queryZone(ctx, sqlZoneCreate, "zone creation "+name, name, nameUnicode)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return s.ZoneByName(ctx, name)
 	}

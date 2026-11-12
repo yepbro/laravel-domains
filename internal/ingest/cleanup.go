@@ -228,7 +228,7 @@ type cleanupHash [contentHashLen]byte
 // actually deleted.
 func CleanupOnce(ctx context.Context, pool CleanupDB, opts CleanupOptions) (CleanupResult, error) {
 	if pool == nil {
-		return CleanupResult{}, errors.New("ingest: очистка удалённых доменов: пул не задан")
+		return CleanupResult{}, errors.New("ingest: deleted-domains cleanup: the pool is not set")
 	}
 	o := opts.withDefaults()
 
@@ -243,7 +243,7 @@ func CleanupOnce(ctx context.Context, pool CleanupDB, opts CleanupOptions) (Clea
 
 	tx, err := pool.Begin(ctx)
 	if err != nil {
-		return CleanupResult{}, fmt.Errorf("ingest: очистка удалённых доменов: транзакция: %w", err)
+		return CleanupResult{}, fmt.Errorf("ingest: deleted-domains cleanup: transaction: %w", err)
 	}
 	// Rollback unconditionally: after Commit it is a no-op. An interrupted
 	// pass leaves no half-done changes (spec 3.4).
@@ -261,7 +261,7 @@ func CleanupOnce(ctx context.Context, pool CleanupDB, opts CleanupOptions) (Clea
 		res.Contents = n
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return CleanupResult{}, fmt.Errorf("ingest: очистка удалённых доменов: фиксация: %w", err)
+		return CleanupResult{}, fmt.Errorf("ingest: deleted-domains cleanup: commit: %w", err)
 	}
 	return res, nil
 }
@@ -272,7 +272,7 @@ func CleanupOnce(ctx context.Context, pool CleanupDB, opts CleanupOptions) (Clea
 func cleanupCandidates(ctx context.Context, pool CleanupDB, limit int) ([]int16, []int64, error) {
 	rows, err := pool.Query(ctx, cleanupSelectSQL, limit)
 	if err != nil {
-		return nil, nil, fmt.Errorf("ingest: очистка удалённых доменов: выборка кандидатов: %w", err)
+		return nil, nil, fmt.Errorf("ingest: deleted-domains cleanup: the candidate selection: %w", err)
 	}
 	defer rows.Close()
 
@@ -284,13 +284,13 @@ func cleanupCandidates(ctx context.Context, pool CleanupDB, limit int) ([]int16,
 			domainID int64
 		)
 		if err := rows.Scan(&zoneID, &domainID); err != nil {
-			return nil, nil, fmt.Errorf("ingest: очистка удалённых доменов: чтение кандидатов: %w", err)
+			return nil, nil, fmt.Errorf("ingest: deleted-domains cleanup: reading the candidates: %w", err)
 		}
 		zoneIDs = append(zoneIDs, zoneID)
 		domainIDs = append(domainIDs, domainID)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, nil, fmt.Errorf("ingest: очистка удалённых доменов: выборка кандидатов: %w", err)
+		return nil, nil, fmt.Errorf("ingest: deleted-domains cleanup: the candidate selection: %w", err)
 	}
 	return zoneIDs, domainIDs, nil
 }
@@ -301,7 +301,7 @@ func cleanupCandidates(ctx context.Context, pool CleanupDB, limit int) ([]int16,
 func cleanupResults(ctx context.Context, tx pgx.Tx, zoneIDs []int16, domainIDs []int64) (CleanupResult, map[cleanupHash]int32, error) {
 	rows, err := tx.Query(ctx, cleanupDeleteSQL, zoneIDs, domainIDs)
 	if err != nil {
-		return CleanupResult{}, nil, fmt.Errorf("ingest: очистка удалённых доменов: удаление результатов: %w", err)
+		return CleanupResult{}, nil, fmt.Errorf("ingest: deleted-domains cleanup: deleting the results: %w", err)
 	}
 	defer rows.Close()
 
@@ -315,7 +315,7 @@ func cleanupResults(ctx context.Context, tx pgx.Tx, zoneIDs []int16, domainIDs [
 			hash     []byte
 		)
 		if err := rows.Scan(&zoneID, &domainID, &hash); err != nil {
-			return CleanupResult{}, nil, fmt.Errorf("ingest: очистка удалённых доменов: чтение удалённых результатов: %w", err)
+			return CleanupResult{}, nil, fmt.Errorf("ingest: deleted-domains cleanup: reading the deleted results: %w", err)
 		}
 		domains[cleanupKey{zoneID: zoneID, id: domainID}] = struct{}{}
 		res.Results++
@@ -337,7 +337,7 @@ func cleanupResults(ctx context.Context, tx pgx.Tx, zoneIDs []int16, domainIDs [
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return CleanupResult{}, nil, fmt.Errorf("ingest: очистка удалённых доменов: удаление результатов: %w", err)
+		return CleanupResult{}, nil, fmt.Errorf("ingest: deleted-domains cleanup: deleting the results: %w", err)
 	}
 	res.Domains = len(domains)
 	return res, refs, nil
@@ -364,7 +364,7 @@ func cleanupRefcounts(ctx context.Context, tx pgx.Tx, refs map[cleanupHash]int32
 
 	tag, err := tx.Exec(ctx, cleanupUpdateSQL, hashes, counts)
 	if err != nil {
-		return 0, fmt.Errorf("ingest: очистка удалённых доменов: уменьшение refcount contents: %w", err)
+		return 0, fmt.Errorf("ingest: deleted-domains cleanup: decrementing the contents refcount: %w", err)
 	}
 	return tag.RowsAffected(), nil
 }
@@ -409,7 +409,7 @@ const StaleBatchAge = 24 * time.Hour
 // than the threshold are not touched; an empty staging — DELETE 0.
 func CleanupStaleBatches(ctx context.Context, pool db.DB, now time.Time) (int64, error) {
 	if pool == nil {
-		return 0, errors.New("ingest: зачистка осиротевших партий staging: пул не задан")
+		return 0, errors.New("ingest: purging orphaned staging batches: the pool is not set")
 	}
 	// The age bound must be expressible as positive microseconds: before
 	// 1970 (a clock on the Unix epoch — a dead RTC battery, a start
@@ -419,12 +419,12 @@ func CleanupStaleBatches(ctx context.Context, pool db.DB, now time.Time) (int64,
 	// the now−StaleBatchAge bound that is checked, not now itself: a
 	// clock on the 1970-01-01 epoch gives a negative bound.
 	if cutoff := now.Add(-StaleBatchAge); cutoff.UnixMicro() < 0 {
-		return 0, errors.New("ingest: зачистка осиротевших партий staging: граница возраста до 1970 года — системные часы не синхронизированы")
+		return 0, errors.New("ingest: purging orphaned staging batches: the age bound is before 1970 — the system clock is not synchronized")
 	}
 	cutoff := batchIDBefore(now.Add(-StaleBatchAge))
 	tag, err := pool.Exec(ctx, staleStageSQL, cutoff[:])
 	if err != nil {
-		return 0, fmt.Errorf("ingest: зачистка осиротевших партий %s: %w", StageTable, err)
+		return 0, fmt.Errorf("ingest: purging orphaned %s batches: %w", StageTable, err)
 	}
 	return tag.RowsAffected(), nil
 }
@@ -439,14 +439,14 @@ func CleanupStaleBatches(ctx context.Context, pool db.DB, now time.Time) (int64,
 // passes are idempotent (spec 3.4).
 func CleanupDeleted(ctx context.Context, pool CleanupDB, opts CleanupOptions) error {
 	if pool == nil {
-		return errors.New("ingest: очистка удалённых доменов: пул не задан")
+		return errors.New("ingest: deleted-domains cleanup: the pool is not set")
 	}
 	o := opts.withDefaults()
 	log := o.Log
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	log.Info("фоновая очистка удалённых доменов",
+	log.Info("the deleted-domains background cleanup",
 		"interval", o.Interval.String(), "batch", o.BatchSize)
 
 	pass := func() {
@@ -456,16 +456,16 @@ func CleanupDeleted(ctx context.Context, pool CleanupDB, opts CleanupOptions) er
 			// A cancel during the pass is part of the shutdown, not an
 			// alarm.
 		case err != nil:
-			log.Warn("проход очистки удалённых доменов", "err", err)
+			log.Warn("the deleted-domains cleanup pass", "err", err)
 		default:
 			if res.BadHashes > 0 {
 				// The poison pill is defused (ING-P2-4): the anomaly is
 				// visible to the operator, the cleanup continues.
-				log.Warn("удалены результаты с некорректным content_hash — refcount не менялся",
+				log.Warn("results with a malformed content_hash were deleted — the refcount was not changed",
 					"bad_hashes", res.BadHashes)
 			}
 			if res.Domains > 0 {
-				log.Info("проход очистки удалённых доменов",
+				log.Info("the deleted-domains cleanup pass",
 					"domains", res.Domains, "results", res.Results, "contents", res.Contents)
 			}
 			// The pass result — to the consumers (the T-099 metric):
@@ -483,10 +483,10 @@ func CleanupDeleted(ctx context.Context, pool CleanupDB, opts CleanupOptions) er
 		// retry; a zero result is not logged.
 		if rows, err := CleanupStaleBatches(ctx, pool, time.Now()); err != nil {
 			if ctx.Err() == nil {
-				log.Warn("зачистка осиротевших партий staging", "err", err)
+				log.Warn("purging orphaned staging batches", "err", err)
 			}
 		} else if rows > 0 {
-			log.Warn("удалены осиротевшие строки staging",
+			log.Warn("orphaned staging rows were deleted",
 				"rows", rows, "older_than", StaleBatchAge.String())
 		}
 	}

@@ -49,20 +49,20 @@ type applyDeletePool struct {
 var _ ApplyDB = (*applyDeletePool)(nil)
 
 func (p *applyDeletePool) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFromSource) (int64, error) {
-	return 0, errors.New("CopyFrom не должен вызываться")
+	return 0, errors.New("CopyFrom must not be called")
 }
 
 // The pool's Query is not needed by the application (the statements are
 // in the transaction): fail.
 func (p *applyDeletePool) Query(context.Context, string, ...any) (pgx.Rows, error) {
-	return nil, errors.New("applyDeletePool: Query вне транзакции не должен вызываться")
+	return nil, errors.New("applyDeletePool: Query outside a transaction must not be called")
 }
 
 func (p *applyDeletePool) Exec(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
 	p.ops = append(p.ops, "exec:"+sql)
 	p.args = append(p.args, args)
 	if sql != clearStageSQL {
-		return pgconn.CommandTag{}, errors.New("applyDeletePool: неожиданный Exec: " + sql)
+		return pgconn.CommandTag{}, errors.New("applyDeletePool: unexpected Exec: " + sql)
 	}
 	if p.clearErr != nil {
 		return pgconn.CommandTag{}, p.clearErr
@@ -104,7 +104,7 @@ func (t *applyDeleteTx) Query(ctx context.Context, sql string, args ...any) (pgx
 			return nil, p.applyErr
 		}
 		if p.applyRows == nil {
-			return nil, errors.New("applyDeletePool: не задан ответ applyDeleteSQL")
+			return nil, errors.New("applyDeletePool: the applyDeleteSQL response is not set")
 		}
 		return p.applyRows, nil
 	case applyClearRenderSQL:
@@ -112,15 +112,15 @@ func (t *applyDeleteTx) Query(ctx context.Context, sql string, args ...any) (pgx
 			return nil, p.clearRendErr
 		}
 		if p.clearRows == nil {
-			return nil, errors.New("applyDeletePool: не задан ответ applyClearRenderSQL")
+			return nil, errors.New("applyDeletePool: the applyClearRenderSQL response is not set")
 		}
 		return p.clearRows, nil
 	}
-	return nil, errors.New("applyDeletePool: неожиданный Query: " + sql)
+	return nil, errors.New("applyDeletePool: unexpected Query: " + sql)
 }
 
 func (t *applyDeleteTx) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
-	return pgconn.CommandTag{}, errors.New("applyDeletePool: Exec в транзакции не должен вызываться")
+	return pgconn.CommandTag{}, errors.New("applyDeletePool: Exec inside a transaction must not be called")
 }
 
 func (t *applyDeleteTx) Commit(context.Context) error {
@@ -178,23 +178,23 @@ func TestApplyDelete(t *testing.T) {
 		t.Fatal(err)
 	}
 	if res != (DeleteResult{Deleted: 5, NotFound: 2}) {
-		t.Errorf("счётчики = %+v, want {5 2}", res)
+		t.Errorf("the counters = %+v, want {5 2}", res)
 	}
 
 	// The order: begin → the application → the bit clearing → commit →
 	// the cleanup.
 	want := []string{"begin", "query:" + applyDeleteSQL, "query:" + applyClearRenderSQL, "commit", "exec:" + clearStageSQL}
 	if !reflect.DeepEqual(pool.ops, want) {
-		t.Fatalf("порядок обращений = %v, want %v", pool.ops, want)
+		t.Fatalf("the call order = %v, want %v", pool.ops, want)
 	}
 	if !reflect.DeepEqual(pool.args[0], wantApplyArgs(b)) {
-		t.Errorf("аргументы применения = %#v, want %#v", pool.args[0], wantApplyArgs(b))
+		t.Errorf("the apply arguments = %#v, want %#v", pool.args[0], wantApplyArgs(b))
 	}
 	if !reflect.DeepEqual(pool.args[1], []any{zones, labels}) {
-		t.Errorf("аргументы снятия бита = %#v, want [%v %v]", pool.args[1], zones, labels)
+		t.Errorf("the bit-clear arguments = %#v, want [%v %v]", pool.args[1], zones, labels)
 	}
 	if !reflect.DeepEqual(pool.args[2], []any{b.ID[:]}) {
-		t.Errorf("аргументы очистки = %#v, want идентификатор партии", pool.args[2])
+		t.Errorf("the cleanup arguments = %#v, want the batch identifier", pool.args[2])
 	}
 	if pool.commits != 1 || pool.rollbacks != 0 {
 		t.Errorf("commit=%d rollback=%d, want 1/0", pool.commits, pool.rollbacks)
@@ -216,11 +216,11 @@ func TestApplyDeleteNoRenderRows(t *testing.T) {
 		t.Fatal(err)
 	}
 	if res != (DeleteResult{Deleted: 4, NotFound: 1}) {
-		t.Errorf("счётчики = %+v, want {4 1}", res)
+		t.Errorf("the counters = %+v, want {4 1}", res)
 	}
 	want := []string{"begin", "query:" + applyDeleteSQL, "commit", "exec:" + clearStageSQL}
 	if !reflect.DeepEqual(pool.ops, want) {
-		t.Fatalf("порядок обращений = %v, want %v (без applyClearRenderSQL)", pool.ops, want)
+		t.Fatalf("the call order = %v, want %v (no applyClearRenderSQL)", pool.ops, want)
 	}
 }
 
@@ -283,35 +283,35 @@ SELECT
 	(SELECT coalesce(array_agg(m.zone_id ORDER BY m.zone_id, m.label), '{}'::int2[]) FROM moved AS m WHERE m.had_render) AS render_zones,
 	(SELECT coalesce(array_agg(m.label ORDER BY m.zone_id, m.label), '{}'::text[]) FROM moved AS m WHERE m.had_render) AS render_labels`
 	if applyDeleteSQL != want {
-		t.Errorf("applyDeleteSQL = %q, want точное совпадение", applyDeleteSQL)
+		t.Errorf("applyDeleteSQL = %q, want an exact match", applyDeleteSQL)
 	}
 
 	// The staging table — from StageTable, like the COPY and the batch
 	// cleanup.
 	if !strings.Contains(applyDeleteSQL, `FROM `+StageTable.Sanitize()+` AS s`) {
-		t.Errorf("SQL = %q, want обращение к staging через StageTable", applyDeleteSQL)
+		t.Errorf("the SQL = %q, want staging addressed via StageTable", applyDeleteSQL)
 	}
 	// Only the status move: the domain stays in the DB (spec 13.1); the
 	// results and content are cleaned by T-020 — they are not here. The
 	// move statement does not clear the render_pending bit (T-269) —
 	// only status is in SET.
 	if !strings.Contains(applyDeleteSQL, "UPDATE domains") || strings.Contains(applyDeleteSQL, "DELETE FROM domains") {
-		t.Errorf("SQL = %q, want только UPDATE domains", applyDeleteSQL)
+		t.Errorf("the SQL = %q, want only an UPDATE of domains", applyDeleteSQL)
 	}
 	if strings.Contains(applyDeleteSQL, "SET flags") || strings.Contains(applyDeleteSQL, "CASE WHEN") {
-		t.Errorf("SQL = %q, want перевод статуса БЕЗ касания flags (снятие бита — applyClearRenderSQL, T-269)", applyDeleteSQL)
+		t.Errorf("the SQL = %q, want a status change WITHOUT touching flags (the bit clear is applyClearRenderSQL, T-269)", applyDeleteSQL)
 	}
 	// The status guard pins the move for the deltas (T-178): the
 	// statement does not change check_state — RETURNING yields the old
 	// value (incremental-counters spec §6.1.2).
 	if !strings.Contains(applyDeleteSQL, "AND d.status <> $2") {
-		t.Errorf("SQL = %q, want охрана «ещё не deleted» для дельт счётчиков", applyDeleteSQL)
+		t.Errorf("the SQL = %q, want a «not yet deleted» guard for the counter deltas", applyDeleteSQL)
 	}
 	// The report: a domain already deleted before the statement counts
 	// as "deleted"
 	// (EXISTS over domains with the old status — the statement snapshot).
 	if !strings.Contains(applyDeleteSQL, "OR EXISTS") {
-		t.Errorf("SQL = %q, want альтернативу «уже был deleted» в счётчике deleted", applyDeleteSQL)
+		t.Errorf("the SQL = %q, want an «already deleted» alternative in the deleted counter", applyDeleteSQL)
 	}
 	// The bit row fact — by the RETURNING column (the base version, not
 	// the pre snapshot) and the parallel arrays for the second pair; the
@@ -321,7 +321,7 @@ SELECT
 	if !strings.Contains(applyDeleteSQL, "(d.flags & 2) <> 0 AS had_render") ||
 		!strings.Contains(applyDeleteSQL, "array_agg(m.zone_id ORDER BY m.zone_id, m.label)") ||
 		!strings.Contains(applyDeleteSQL, "array_agg(m.label ORDER BY m.zone_id, m.label)") {
-		t.Errorf("SQL = %q, want had_render по версии-основанию и согласованно упорядоченные массивы ключей", applyDeleteSQL)
+		t.Errorf("the SQL = %q, want had_render by the base version and consistently ordered key arrays", applyDeleteSQL)
 	}
 }
 
@@ -348,18 +348,18 @@ SET value = value - (SELECT count(*) FROM cleared)
 WHERE name = 'render_pending' AND (SELECT count(*) FROM cleared) > 0
 RETURNING value`
 	if applyClearRenderSQL != want {
-		t.Errorf("applyClearRenderSQL = %q, want точное совпадение", applyClearRenderSQL)
+		t.Errorf("applyClearRenderSQL = %q, want an exact match", applyClearRenderSQL)
 	}
 	// The bit guard — over the row's current version (the
 	// renderClearPendingSQL style of httpworker: RowsAffected 0 — no
 	// transition, the counter is not touched).
 	if !strings.Contains(applyClearRenderSQL, "AND (d.flags & 2) <> 0") {
-		t.Errorf("SQL = %q, want охрану бита текущей версии", applyClearRenderSQL)
+		t.Errorf("the SQL = %q, want a guard of the current version's bit", applyClearRenderSQL)
 	}
 	// The delta — only by the rows actually cleared (the count from
 	// RETURNING), not by a prepared number.
 	if !strings.Contains(applyClearRenderSQL, "value - (SELECT count(*) FROM cleared)") {
-		t.Errorf("SQL = %q, want декремент по факту снятых", applyClearRenderSQL)
+		t.Errorf("the SQL = %q, want a decrement by the actually cleared", applyClearRenderSQL)
 	}
 }
 
@@ -375,13 +375,13 @@ func TestApplyDeleteEmptyBatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	if res != (DeleteResult{}) {
-		t.Errorf("счётчики = %+v, want нулевые", res)
+		t.Errorf("the counters = %+v, want zero", res)
 	}
 	if len(pool.ops) != 4 {
-		t.Errorf("обращений = %d (%v), want 4 — без второй пары", len(pool.ops), pool.ops)
+		t.Errorf("calls = %d (%v), want 4 — no second pair", len(pool.ops), pool.ops)
 	}
 	if pool.commits != 1 {
-		t.Errorf("commit = %d, want 1 (транзакция выполняется и пустой)", pool.commits)
+		t.Errorf("commit = %d, want 1 (the transaction runs even when empty)", pool.commits)
 	}
 }
 
@@ -404,18 +404,18 @@ func TestApplyDeleteIdempotentRepeat(t *testing.T) {
 		t.Fatal(err)
 	}
 	if first != (DeleteResult{Deleted: 3, NotFound: 0}) {
-		t.Fatalf("первое применение = %+v, want {3 0}", first)
+		t.Fatalf("the first apply = %+v, want {3 0}", first)
 	}
 
 	second, err := ApplyDelete(context.Background(), pool2, b)
 	if err != nil {
-		t.Fatalf("повторное применение: %v", err)
+		t.Fatalf("the repeated apply: %v", err)
 	}
 	if second != (DeleteResult{}) {
-		t.Errorf("повтор = %+v, want нулевые счётчики (no-op)", second)
+		t.Errorf("the repeat = %+v, want zero counters (a no-op)", second)
 	}
 	if len(pool2.ops) != 4 || strings.Join(pool2.ops, ";") != strings.Join([]string{"begin", "query:" + applyDeleteSQL, "commit", "exec:" + clearStageSQL}, ";") {
-		t.Errorf("повтор: обращения = %v, want без второй пары", pool2.ops)
+		t.Errorf("the repeat: the calls = %v, want no second pair", pool2.ops)
 	}
 }
 
@@ -432,19 +432,19 @@ func TestApplyDeleteValidation(t *testing.T) {
 		name string
 		b    Batch
 	}{
-		{"нулевой идентификатор", Batch{ZoneID: 1, Action: model.ActionDelete}},
-		{"партия add", Batch{ID: id, ZoneID: 1, Action: model.ActionAdd}},
-		{"нулевой код операции", Batch{ID: id, ZoneID: 1, Action: 0}},
-		{"неизвестный код операции", Batch{ID: id, ZoneID: 1, Action: model.Action(9)}},
+		{"a zero identifier", Batch{ZoneID: 1, Action: model.ActionDelete}},
+		{"an add batch", Batch{ID: id, ZoneID: 1, Action: model.ActionAdd}},
+		{"a zero action code", Batch{ID: id, ZoneID: 1, Action: 0}},
+		{"an unknown action code", Batch{ID: id, ZoneID: 1, Action: model.Action(9)}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			pool := &applyDeletePool{}
 			if _, err := ApplyDelete(context.Background(), pool, tc.b); err == nil {
-				t.Fatal("ожидалась ошибка валидации")
+				t.Fatal("a validation error is expected")
 			}
 			if len(pool.ops) != 0 {
-				t.Errorf("невалидная партия дошла до БД: %v", pool.ops)
+				t.Errorf("an invalid batch reached the DB: %v", pool.ops)
 			}
 		})
 	}
@@ -458,8 +458,8 @@ func TestApplyDeleteApplyError(t *testing.T) {
 		name string
 		err  error
 	}{
-		{"отмена контекста", context.Canceled},
-		{"ошибка запроса", errors.New("connection refused")},
+		{"a context cancellation", context.Canceled},
+		{"a query error", errors.New("connection refused")},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -470,16 +470,16 @@ func TestApplyDeleteApplyError(t *testing.T) {
 
 			_, err := ApplyDelete(context.Background(), pool, validDeleteBatch(t))
 			if err == nil || !errors.Is(err, tc.err) {
-				t.Fatalf("err = %v, want обёрнутая %v", err, tc.err)
+				t.Fatalf("err = %v, want wrapped %v", err, tc.err)
 			}
-			if !strings.Contains(err.Error(), "применение delete") {
-				t.Errorf("err = %v, want контекст «применение delete»", err)
+			if !strings.Contains(err.Error(), "applying delete") {
+				t.Errorf("err = %v, want the «applying delete» context", err)
 			}
 			if pool.commits != 0 || pool.rollbacks != 1 {
-				t.Errorf("commit=%d rollback=%d, want 0/1 (откат)", pool.commits, pool.rollbacks)
+				t.Errorf("commit=%d rollback=%d, want 0/1 (a rollback)", pool.commits, pool.rollbacks)
 			}
 			if len(pool.ops) != 2 { // begin + query:<the application>
-				t.Errorf("обращения = %v, want применение без пары и очистки", pool.ops)
+				t.Errorf("the calls = %v, want the apply without the pair and the cleanup", pool.ops)
 			}
 		})
 	}
@@ -490,33 +490,33 @@ func TestApplyDeleteApplyError(t *testing.T) {
 // application (a silent desync "the bit cleared — the counter not
 // moved" is unacceptable, the renderBumpDebtCounter philosophy).
 func TestApplyDeleteClearRenderError(t *testing.T) {
-	t.Run("сбой оператора", func(t *testing.T) {
+	t.Run("an operator failure", func(t *testing.T) {
 		pool := &applyDeletePool{
 			applyRows:    cleanupRows([]any{int64(2), int64(0), []int16{7}, []string{"a"}}),
 			clearRendErr: errors.New("deadlock detected"),
 		}
 		_, err := ApplyDelete(context.Background(), pool, validDeleteBatch(t))
-		if err == nil || !strings.Contains(err.Error(), "снятие бита render_pending") {
-			t.Fatalf("err = %v, want ошибку второй пары", err)
+		if err == nil || !strings.Contains(err.Error(), "clearing the render_pending bit") {
+			t.Fatalf("err = %v, want the second pair's error", err)
 		}
 		if pool.commits != 0 || pool.rollbacks != 1 {
-			t.Errorf("commit=%d rollback=%d, want 0/1 (откат)", pool.commits, pool.rollbacks)
+			t.Errorf("commit=%d rollback=%d, want 0/1 (a rollback)", pool.commits, pool.rollbacks)
 		}
 		if len(pool.ops) > 3 {
-			t.Errorf("обращения = %v, want без commit/очистки", pool.ops)
+			t.Errorf("the calls = %v, want no commit/cleanup", pool.ops)
 		}
 	})
-	t.Run("строки счётчика нет", func(t *testing.T) {
+	t.Run("the counter row is missing", func(t *testing.T) {
 		pool := &applyDeletePool{
 			applyRows: cleanupRows([]any{int64(2), int64(0), []int16{7}, []string{"a"}}),
 			clearRows: cleanupRows(), // the RETURNING is empty — the row is missing
 		}
 		_, err := ApplyDelete(context.Background(), pool, validDeleteBatch(t))
-		if err == nil || !strings.Contains(err.Error(), "'render_pending' отсутствует") {
-			t.Fatalf("err = %v, want ошибку отсутствия строки счётчика", err)
+		if err == nil || !strings.Contains(err.Error(), "'render_pending' is missing") {
+			t.Fatalf("err = %v, want the missing counter-row error", err)
 		}
 		if pool.commits != 0 || pool.rollbacks != 1 {
-			t.Errorf("commit=%d rollback=%d, want 0/1 (откат)", pool.commits, pool.rollbacks)
+			t.Errorf("commit=%d rollback=%d, want 0/1 (a rollback)", pool.commits, pool.rollbacks)
 		}
 	})
 }
@@ -531,9 +531,9 @@ func TestApplyDeleteBadCounters(t *testing.T) {
 		want     string
 		rollback bool
 	}{
-		{"нет строки", cleanupRows(), "счётчики не возвращены", true},
-		{"лишняя колонка", cleanupRows([]any{int64(1), int64(2), []int16{}, []string{}, int64(9)}), "применение delete", true},
-		{"массивы разошлись", cleanupRows([]any{int64(1), int64(0), []int16{7, 8}, []string{"a"}}), "битовые массивы разошлись", true},
+		{"no row", cleanupRows(), "the counters were not returned", true},
+		{"an extra column", cleanupRows([]any{int64(1), int64(2), []int16{}, []string{}, int64(9)}), "applying delete", true},
+		{"the arrays diverged", cleanupRows([]any{int64(1), int64(0), []int16{7, 8}, []string{"a"}}), "the bit arrays diverged", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -541,7 +541,7 @@ func TestApplyDeleteBadCounters(t *testing.T) {
 
 			_, err := ApplyDelete(context.Background(), pool, validDeleteBatch(t))
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
-				t.Fatalf("err = %v, want ошибку с %q", err, tc.want)
+				t.Fatalf("err = %v, want an error with %q", err, tc.want)
 			}
 			if tc.rollback && pool.rollbacks != 1 {
 				t.Errorf("rollback = %d, want 1", pool.rollbacks)
@@ -558,11 +558,11 @@ func TestApplyDeleteBadCounters(t *testing.T) {
 func TestApplyDeleteTxErrors(t *testing.T) {
 	t.Run("begin", func(t *testing.T) {
 		pool := &applyDeletePool{beginErr: errors.New("pool closed")}
-		if _, err := ApplyDelete(context.Background(), pool, validDeleteBatch(t)); err == nil || !strings.Contains(err.Error(), "транзакция") {
-			t.Fatalf("err = %v, want ошибку транзакции", err)
+		if _, err := ApplyDelete(context.Background(), pool, validDeleteBatch(t)); err == nil || !strings.Contains(err.Error(), "transaction") {
+			t.Fatalf("err = %v, want the transaction error", err)
 		}
 		if len(pool.ops) != 0 {
-			t.Errorf("обращения = %v, want пусто", pool.ops)
+			t.Errorf("the calls = %v, want empty", pool.ops)
 		}
 	})
 	t.Run("commit", func(t *testing.T) {
@@ -570,11 +570,11 @@ func TestApplyDeleteTxErrors(t *testing.T) {
 			applyRows: cleanupRows([]any{int64(1), int64(0), []int16{}, []string{}}),
 			commitErr: errors.New("connection reset"),
 		}
-		if _, err := ApplyDelete(context.Background(), pool, validDeleteBatch(t)); err == nil || !strings.Contains(err.Error(), "фиксация") {
-			t.Fatalf("err = %v, want ошибку фиксации", err)
+		if _, err := ApplyDelete(context.Background(), pool, validDeleteBatch(t)); err == nil || !strings.Contains(err.Error(), "commit") {
+			t.Fatalf("err = %v, want the commit error", err)
 		}
 		if len(pool.ops) != 3 { // begin, the application, commit (the failing one)
-			t.Errorf("обращения = %v, want без очистки партии", pool.ops)
+			t.Errorf("the calls = %v, want no batch cleanup", pool.ops)
 		}
 	})
 }
@@ -590,15 +590,15 @@ func TestApplyDeleteClearError(t *testing.T) {
 
 	res, err := ApplyDelete(context.Background(), pool, validDeleteBatch(t))
 	if err == nil || !strings.Contains(err.Error(), "deadlock detected") {
-		t.Fatalf("err = %v, want ошибка очистки", err)
+		t.Fatalf("err = %v, want the cleanup error", err)
 	}
-	if !strings.Contains(err.Error(), "ingest: очистка партии") {
-		t.Errorf("err = %v, want контекст очистки партии", err)
+	if !strings.Contains(err.Error(), "ingest: cleaning the batch") {
+		t.Errorf("err = %v, want the batch cleanup context", err)
 	}
 	if res != (DeleteResult{Deleted: 4, NotFound: 1}) {
-		t.Errorf("счётчики = %+v, want {4 1}: применение состоялось", res)
+		t.Errorf("the counters = %+v, want {4 1}: the apply did happen", res)
 	}
 	if pool.commits != 1 {
-		t.Errorf("commit = %d, want 1 (применение зафиксировано до очистки)", pool.commits)
+		t.Errorf("commit = %d, want 1 (the apply is committed before the cleanup)", pool.commits)
 	}
 }

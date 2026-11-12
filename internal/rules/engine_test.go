@@ -60,7 +60,7 @@ rules:
 	res := set.Evaluate(page)
 
 	if len(res.Signals) != 6 {
-		t.Fatalf("сработало %d правил, want 6: %+v", len(res.Signals), res.Signals)
+		t.Fatalf("%d rules fired, want 6: %+v", len(res.Signals), res.Signals)
 	}
 	want := ScoreFixed([]float64{0.25, 0.45, 0.9, 0.3, 0.2, 0.15})
 	if diff(res.Score, want) > 1e-9 {
@@ -84,7 +84,7 @@ rules:
 		}
 	}
 	if res.VerMin != "9.19" || res.VerMax != "" || res.Conflict {
-		t.Errorf("версии: [%s..%s] conflict=%v", res.VerMin, res.VerMax, res.Conflict)
+		t.Errorf("the versions: [%s..%s] conflict=%v", res.VerMin, res.VerMax, res.Conflict)
 	}
 }
 
@@ -110,11 +110,11 @@ rules:
 	first := set.Evaluate(page).Signals[0].Evidence
 	for i := 0; i < 50; i++ {
 		if ev := set.Evaluate(page).Signals[0].Evidence; ev != first {
-			t.Fatalf("недетерминированное свидетельство: %q против %q", ev, first)
+			t.Fatalf("a non-deterministic evidence: %q against %q", ev, first)
 		}
 	}
 	if first != "header Aa-first" {
-		t.Errorf("ожидалось первое имя по сортировке, получено %q", first)
+		t.Errorf("the first name by sort order was expected, got %q", first)
 	}
 }
 
@@ -159,13 +159,13 @@ rules:
 	// treated as complete, AN-09)
 	res := set.EvaluateCtx(&countingCtx{left: 4}, Page{HTML: []byte("MARK MARK MARK")}, lim)
 	if len(res.Signals) != 2 || res.Signals[1].Rule != "r2" {
-		t.Fatalf("ожидались r1,r2 до отмены, получено %+v", res.Signals)
+		t.Fatalf("r1,r2 were expected before the cancellation, got %+v", res.Signals)
 	}
 	if res.Score == 0 {
-		t.Error("score должен учитывать сработавшее до отмены")
+		t.Error("the score must count what fired before the cancellation")
 	}
 	if !res.Partial {
-		t.Error("прерванный просмотр обязан помечаться Partial")
+		t.Error("an interrupted scan must be marked Partial")
 	}
 }
 
@@ -181,10 +181,10 @@ rules:
 	cancel()
 	res := set.EvaluateCtx(ctx, Page{HTML: []byte("MARK")}, DefaultLimits())
 	if len(res.Signals) != 0 || res.Score != 0 {
-		t.Errorf("отменённый контекст: ожидался пустой результат, получено %+v", res)
+		t.Errorf("a cancelled context: an empty result was expected, got %+v", res)
 	}
 	if !res.Partial {
-		t.Error("отменённый контекст: результат неполон (Partial)")
+		t.Error("a cancelled context: the result is incomplete (Partial)")
 	}
 }
 
@@ -200,7 +200,7 @@ rules:
 	html := append(make([]byte, DefaultLimits().MaxHTMLBytes), []byte("NEEDLE")...)
 	res := set.EvaluateCtx(context.Background(), Page{HTML: html}, Limits{})
 	if len(res.Signals) != 0 {
-		t.Error("нулевые Limits должны включать DefaultLimits (обрезка до 2 MiB)")
+		t.Error("zero Limits must include DefaultLimits (the 2 MiB bound)")
 	}
 }
 
@@ -223,7 +223,7 @@ func TestEvaluateCtxNanoBudget(t *testing.T) {
 	lim.EvalTimeout = 1 // ns
 	res := set.EvaluateCtx(context.Background(), Page{HTML: []byte("MARK")}, lim)
 	if !res.Partial {
-		t.Error("бюджет 1 нс должен прерывать просмотр (Partial)")
+		t.Error("a 1 ns budget must interrupt the scan (Partial)")
 	}
 }
 
@@ -237,31 +237,31 @@ func TestMatchRuleCtxStopsMidScan(t *testing.T) {
 	t.Run("cookie_name", func(t *testing.T) {
 		page := Page{Cookies: []Cookie{{Name: "a"}, {Name: "hit"}}}
 		if _, ok := matchRule(&countingCtx{left: 2}, Rule{Target: TargetCookieName, Match: "hit"}, page, DefaultLimits()); ok {
-			t.Error("перебор cookies обязан остановиться до совпадающей куки")
+			t.Error("the cookie iteration must stop before the matching cookie")
 		}
 	})
 	t.Run("cookie_value", func(t *testing.T) {
 		page := Page{Cookies: []Cookie{{Name: "a", Value: "1"}, {Name: "b", Value: "hit"}}}
 		if _, ok := matchRule(&countingCtx{left: 2}, Rule{Target: TargetCookieValue, Match: "hit"}, page, DefaultLimits()); ok {
-			t.Error("перебор значений cookies обязан остановиться до совпадающего")
+			t.Error("the cookie value iteration must stop before the matching one")
 		}
 	})
 	t.Run("header_name", func(t *testing.T) {
 		page := Page{Headers: map[string][]string{"A": {"1"}, "B": {"2"}}}
 		if _, ok := matchRule(&countingCtx{left: 2}, Rule{Target: TargetHeaderName, Match: "B"}, page, DefaultLimits()); ok {
-			t.Error("перебор имён заголовков обязан остановиться до совпадающего")
+			t.Error("the header name iteration must stop before the matching one")
 		}
 	})
 	t.Run("header_value", func(t *testing.T) {
 		page := Page{Headers: map[string][]string{"H": {"1", "hit"}}}
 		if _, ok := matchRule(&countingCtx{left: 2}, Rule{Target: TargetHeaderValue, Match: "hit"}, page, DefaultLimits()); ok {
-			t.Error("перебор значений заголовка обязан остановиться до совпадающего")
+			t.Error("the header value iteration must stop before the matching one")
 		}
 	})
 	t.Run("meta", func(t *testing.T) {
 		page := Page{HTML: []byte(`x<meta a="1"><meta b="1">`)}
 		if _, ok := matchRule(&countingCtx{left: 2}, Rule{Target: TargetMeta, Regex: `b=`}, page, DefaultLimits()); ok {
-			t.Error("скан meta-тегов обязан остановиться до совпадающего тега")
+			t.Error("the meta tag scan must stop before the matching tag")
 		}
 	})
 }
@@ -275,10 +275,10 @@ func TestMatchRuleMetaAdvance(t *testing.T) {
 	page := Page{HTML: []byte(`xx<meta a="1"><meta b="1"><meta c="1">`)}
 	ev, ok := matchRule(bgCtx(), Rule{Target: TargetMeta, Regex: `c="1"`}, page, DefaultLimits())
 	if !ok {
-		t.Fatal("третий meta-тег должен найтись")
+		t.Fatal("the third meta tag must be found")
 	}
 	if ev != `<meta c="1">` {
-		t.Errorf("свидетельство = %q, want третий тег", ev)
+		t.Errorf("the evidence = %q, want the third tag", ev)
 	}
 }
 
@@ -292,7 +292,7 @@ rules:
 `)
 	res := set.Evaluate(Page{}) // nil HTML, nil cookies, nil headers
 	if len(res.Signals) != 0 || res.Score != 0 || res.Conflict {
-		t.Errorf("пустая страница: неожиданный результат %+v", res)
+		t.Errorf("an empty page: an unexpected result %+v", res)
 	}
 }
 
@@ -326,16 +326,16 @@ rules:
 		for _, s := range res.Signals {
 			ev := s.Evidence
 			if len(ev) > lim.MaxSnippetBytes+len("…") {
-				t.Errorf("%s: свидетельство длиннее лимита: %d байт", name, len(ev))
+				t.Errorf("%s: the evidence is longer than the limit: %d bytes", name, len(ev))
 			}
 			if !utf8.ValidString(ev) {
-				t.Errorf("%s: свидетельство не является валидным UTF-8: %q", name, ev)
+				t.Errorf("%s: the evidence is not valid UTF-8: %q", name, ev)
 			}
 			if strings.ContainsAny(ev, "\x00\x01\x1b\x7f") {
-				t.Errorf("%s: управляющие символы не sanitized: %q", name, ev)
+				t.Errorf("%s: control characters are not sanitized: %q", name, ev)
 			}
 			if len(ev) == lim.MaxSnippetBytes+len("…") && !strings.HasSuffix(ev, "…") {
-				t.Errorf("%s: обрезанное свидетельство без многоточия: %q", name, ev)
+				t.Errorf("%s: a truncated evidence without the ellipsis: %q", name, ev)
 			}
 		}
 	}
@@ -343,7 +343,7 @@ rules:
 	// exactly 64 bytes — no ellipsis
 	res := set.EvaluateCtx(context.Background(), Page{HTML: []byte("LONG-" + strings.Repeat("a", 59))}, lim)
 	if ev := res.Signals[0].Evidence; len(ev) != 64 || strings.HasSuffix(ev, "…") {
-		t.Errorf("свидетельство ровно в лимит должно оставаться целиком: %q (%d)", ev, len(ev))
+		t.Errorf("an evidence exactly at the limit must stay whole: %q (%d)", ev, len(ev))
 	}
 }
 
@@ -352,13 +352,13 @@ func TestEvaluateMultibyteRuneNotSplit(t *testing.T) {
 	s := strings.Repeat("тест", 100)
 	got := truncateUTF8(s, 5) // 5 bytes = "te" (2+2) + the first byte of the next rune
 	if got != "те" {
-		t.Errorf("truncateUTF8 рвёт руну: %q", got)
+		t.Errorf("truncateUTF8 tears a rune: %q", got)
 	}
 	if got := truncateUTF8("abcd", 4); got != "abcd" {
-		t.Errorf("строка в лимите должна возвращаться целиком: %q", got)
+		t.Errorf("a string within the limit must be returned whole: %q", got)
 	}
 	if got := truncateUTF8("abcd", 0); got != "" {
-		t.Errorf("нулевой лимит: %q", got)
+		t.Errorf("a zero limit: %q", got)
 	}
 }
 
@@ -385,10 +385,10 @@ rules:
 		byRule[s.Rule] = true
 	}
 	if byRule["redos"] {
-		t.Error("(a+)+b не должен находить совпадение на a…aTAIL (нет b)")
+		t.Error("(a+)+b must not match on a…aTAIL (no b)")
 	}
 	if byRule["tail"] {
-		t.Error("совпадение за пределами лимита HTML найдено")
+		t.Error("a match beyond the HTML limit was found")
 	}
 }
 
@@ -396,9 +396,9 @@ func TestDefaultLimitsGuard(t *testing.T) {
 	// the guard values are the spec §9 contract; changing them must be deliberate
 	lim := DefaultLimits()
 	if lim.MaxHTMLBytes != 2<<20 || lim.MaxValueBytes != 64<<10 || lim.MaxPatternBytes != 4<<10 {
-		t.Errorf("размерные лимиты изменились: %+v", lim)
+		t.Errorf("the size limits changed: %+v", lim)
 	}
 	if lim.MaxSnippetBytes != 64 || lim.EvalTimeout != 5*time.Second {
-		t.Errorf("свидетельство/таймаут изменились: %+v", lim)
+		t.Errorf("the evidence/timeout changed: %+v", lim)
 	}
 }

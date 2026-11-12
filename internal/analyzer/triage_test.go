@@ -46,7 +46,7 @@ func TestUnfoundDrain_MetricsAndRetentionBoundaries(t *testing.T) {
 		t.Fatalf("ProcessResult: %v", err)
 	}
 	if rec.count() != 1 {
-		t.Fatalf("дренаж с retention=1: вызовов = %d, want 1 (минимальное рабочее окно)", rec.count())
+		t.Fatalf("the drain with retention=1: calls = %d, want 1 (the minimal working window)", rec.count())
 	}
 	if got := anMetricValue(t, reg, "crawler_analyzer_laravel_unfound_total", nil); got != 1 {
 		t.Errorf("unfound_total = %v, want 1", got)
@@ -68,7 +68,7 @@ func TestUnfoundDrain_ErrorMetrics(t *testing.T) {
 	rec := &anDrainRecorder{j: f.pool.j, err: errors.New("drain boom")}
 	f.w.opt.DrainDomain = rec.drain
 	if _, err := f.w.ProcessResult(context.Background(), anTask); err != nil {
-		t.Fatalf("ProcessResult: %v (сбой дренажа не роняет доставку)", err)
+		t.Fatalf("ProcessResult: %v (a drain failure does not fail the delivery)", err)
 	}
 	if got := anMetricValue(t, reg, "crawler_analyzer_unfound_drain_errors_total", nil); got != 1 {
 		t.Errorf("drain_errors = %v, want 1", got)
@@ -77,7 +77,7 @@ func TestUnfoundDrain_ErrorMetrics(t *testing.T) {
 		t.Errorf("unfound_total = %v, want 1", got)
 	}
 	if _, ok := anDomainSnapshot(f.pool, anKey.zone, anKey.domain); ok {
-		t.Error("строка laravel_domains не снята")
+		t.Error("the laravel_domains row was not removed")
 	}
 }
 
@@ -97,7 +97,7 @@ func TestUnfoundDrain_NotUnfoundNoMetric(t *testing.T) {
 		"crawler_analyzer_unfound_drain_errors_total",
 	} {
 		if got := anMetricValue(t, reg, name, nil); got > 0 {
-			t.Errorf("%s = %v, want 0/нет серии (без события)", name, got)
+			t.Errorf("%s = %v, want 0/no series (no event)", name, got)
 		}
 	}
 }
@@ -114,7 +114,7 @@ func TestMetricsUnfoundDrainRowOne(t *testing.T) {
 	m.UnfoundDrain(0)
 	m.UnfoundDrain(-3)
 	if got := anMetricValue(t, reg, "crawler_analyzer_unfound_drained_rows_total", nil); got != 1 {
-		t.Errorf("нулевые/отрицательные меняли значение: %v, want 1", got)
+		t.Errorf("zero/negative changed the value: %v, want 1", got)
 	}
 }
 
@@ -128,11 +128,11 @@ func TestAggregateZoneCounterErrors(t *testing.T) {
 	f := newANFixture(t, anSet(1001), Options{MinScore: 0.6})
 	f.store.blocks[hash] = anPageHTML()
 	f.pool.seedResult(anKey, anHeaders(t), anCookies(t, "XSRF-TOKEN", "laravel_session"), hash[:])
-	f.pool.zoneLaravelErr = errors.New("зона: бум")
+	f.pool.zoneLaravelErr = errors.New("zone: boom")
 	_, err := f.w.ProcessResult(context.Background(), anTask)
-	if err == nil || !strings.Contains(err.Error(), "счётчик Laravel-зоны") ||
-		!strings.Contains(err.Error(), "зона: бум") {
-		t.Errorf("сбой дельты зоны = %v, want контекст счётчика зоны и исходную", err)
+	if err == nil || !strings.Contains(err.Error(), "Laravel zone counter") ||
+		!strings.Contains(err.Error(), "zone: boom") {
+		t.Errorf("the zone delta failure = %v, want the zone counter context and the original", err)
 	}
 
 	// The zone row is missing (UPDATE 0) — the mandatory-row error.
@@ -141,21 +141,21 @@ func TestAggregateZoneCounterErrors(t *testing.T) {
 	f2.pool.seedResult(anKey, anHeaders(t), anCookies(t, "XSRF-TOKEN", "laravel_session"), hash[:])
 	f2.pool.zoneNoRow = true
 	if _, err := f2.w.ProcessResult(context.Background(), anTask); err == nil ||
-		!strings.Contains(err.Error(), "затронуто 0 строк") {
-		t.Errorf("UPDATE 0 зоны = %v, want «затронуто 0 строк»", err)
+		!strings.Contains(err.Error(), "0 rows affected") {
+		t.Errorf("the zone UPDATE 0 = %v, want «0 rows affected»", err)
 	}
 
 	// A history cumulative failure (appeared: a fresh confident find).
 	f3 := newANFixture(t, anSet(1001), Options{MinScore: 0.6})
 	f3.store.blocks[hash] = anPageHTML()
 	f3.pool.seedResult(anKey, anHeaders(t), anCookies(t, "XSRF-TOKEN", "laravel_session"), hash[:])
-	f3.pool.counterDeltaErr = errors.New("кумулятив: бум")
+	f3.pool.counterDeltaErr = errors.New("cumulative: boom")
 	task := anTask
 	task.Fresh = true
 	if _, err := f3.w.ProcessResult(context.Background(), task); err == nil ||
-		!strings.Contains(err.Error(), "счётчик истории") ||
-		!strings.Contains(err.Error(), "кумулятив: бум") {
-		t.Errorf("сбой кумулятива = %v, want контекст счётчика истории и исходную", err)
+		!strings.Contains(err.Error(), "history counter") ||
+		!strings.Contains(err.Error(), "cumulative: boom") {
+		t.Errorf("the cumulative failure = %v, want the history counter context and the original", err)
 	}
 
 	// A cumulative without a row (INSERT 0 0) — the mandatory-row error.
@@ -164,8 +164,8 @@ func TestAggregateZoneCounterErrors(t *testing.T) {
 	f4.pool.seedResult(anKey, anHeaders(t), anCookies(t, "XSRF-TOKEN", "laravel_session"), hash[:])
 	f4.pool.counterNoRow = true
 	if _, err := f4.w.ProcessResult(context.Background(), task); err == nil ||
-		!strings.Contains(err.Error(), "счётчик истории") {
-		t.Errorf("кумулятив UPDATE 0 = %v, want ошибка обязательности", err)
+		!strings.Contains(err.Error(), "history counter") {
+		t.Errorf("the cumulative UPDATE 0 = %v, want the mandatory-row error", err)
 	}
 }
 
@@ -174,19 +174,19 @@ func TestAggregateZoneCounterErrors(t *testing.T) {
 func TestAggregateLostPathCounterErrors(t *testing.T) {
 	// A zone delta failure (−1) on the find removal.
 	f, _ := seedUnfoundFixture(t, Options{MinScore: 0.6, Retention: time.Hour})
-	f.pool.zoneLaravelErr = errors.New("зона: бум")
+	f.pool.zoneLaravelErr = errors.New("zone: boom")
 	if _, err := f.w.ProcessResult(context.Background(), anTask); err == nil ||
-		!strings.Contains(err.Error(), "зона: бум") {
-		t.Errorf("потеря: сбой дельты зоны = %v, want исходную причину", err)
+		!strings.Contains(err.Error(), "zone: boom") {
+		t.Errorf("the loss: the zone delta failure = %v, want the original cause", err)
 	}
 	// A lost cumulative failure (a fresh find loss writes lost history).
 	f2, _ := seedUnfoundFixture(t, Options{MinScore: 0.6, Retention: time.Hour})
-	f2.pool.counterDeltaErr = errors.New("кумулятив: бум")
+	f2.pool.counterDeltaErr = errors.New("cumulative: boom")
 	task := anTask
 	task.Fresh = true
 	if _, err := f2.w.ProcessResult(context.Background(), task); err == nil ||
-		!strings.Contains(err.Error(), "кумулятив: бум") {
-		t.Errorf("потеря: сбой кумулятива = %v, want исходную причину", err)
+		!strings.Contains(err.Error(), "cumulative: boom") {
+		t.Errorf("the loss: the cumulative failure = %v, want the original cause", err)
 	}
 }
 
@@ -201,23 +201,23 @@ func TestAggregateRepeatDeliveryNoShift(t *testing.T) {
 	f.pool.seedResult(anKey, anHeaders(t), anCookies(t, "XSRF-TOKEN", "laravel_session"), hash[:])
 	// The first delivery — the row appeared.
 	if _, err := f.w.ProcessResult(context.Background(), anTask); err != nil {
-		t.Fatalf("первая доставка: %v", err)
+		t.Fatalf("the first delivery: %v", err)
 	}
 	if got := f.pool.zoneLaravel[anKey.zone]; got != 1 {
-		t.Fatalf("после первой доставки счётчик зоны = %d, want 1", got)
+		t.Fatalf("after the first delivery the zone counter = %d, want 1", got)
 	}
 	// A rule version change: the row went stale, the repeated confident
 	// delivery reaches the aggregation with existed=true — no deltas, no history.
 	f.sets.swap(anSet(1002))
 	historyBefore := len(f.pool.history)
 	if _, err := f.w.ProcessResult(context.Background(), anTask); err != nil {
-		t.Fatalf("повторная доставка: %v", err)
+		t.Fatalf("the repeated delivery: %v", err)
 	}
 	if got := f.pool.zoneLaravel[anKey.zone]; got != 1 {
-		t.Errorf("повторная доставка сдвинула счётчик зоны: %d, want 1", got)
+		t.Errorf("the repeated delivery moved the zone counter: %d, want 1", got)
 	}
 	if len(f.pool.history) != historyBefore {
-		t.Errorf("повторная доставка записала историю: %d → %d", historyBefore, len(f.pool.history))
+		t.Errorf("the repeated delivery wrote history: %d → %d", historyBefore, len(f.pool.history))
 	}
 }
 
@@ -228,8 +228,8 @@ func TestAnalyzeConsumeTailRowsAffected(t *testing.T) {
 	f.pool.seedResult(anKey, anHeaders(t), anCookies(t, "PHPSESSID"), nil)
 	f.pool.consumeRowsAff = 2
 	if _, err := f.w.ProcessResult(context.Background(), anTask); err == nil ||
-		!strings.Contains(err.Error(), "корзина хвостов переанализа: затронуто 2") {
-		t.Errorf("RowsAffected корзины = %v, want «затронуто 2 строк»", err)
+		!strings.Contains(err.Error(), "re-analysis tail bucket: 2 rows affected") {
+		t.Errorf("the bucket's RowsAffected = %v, want «2 rows affected»", err)
 	}
 }
 
@@ -244,13 +244,13 @@ func TestUnfoundDrain_RetentionZeroNoCall(t *testing.T) {
 		t.Fatalf("ProcessResult: %v", err)
 	}
 	if rec.count() != 0 {
-		t.Errorf("вызовов дренажа при retention=0 = %d, want 0 (хранение всегда)", rec.count())
+		t.Errorf("drain calls with retention=0 = %d, want 0 (kept forever)", rec.count())
 	}
 	if _, ok := anDomainSnapshot(f.pool, anKey.zone, anKey.domain); ok {
-		t.Error("строка laravel_domains не снята")
+		t.Error("the laravel_domains row was not removed")
 	}
 	if got := anMetricValue(t, reg, "crawler_analyzer_laravel_unfound_total", nil); got != 1 {
-		t.Errorf("unfound_total = %v, want 1 (событие зафиксировано)", got)
+		t.Errorf("unfound_total = %v, want 1 (the event is recorded)", got)
 	}
 }
 
@@ -265,11 +265,11 @@ func TestAggregateNoFindingsNoUpsert(t *testing.T) {
 		t.Fatalf("ProcessResult: %v", err)
 	}
 	if rec.count() != 0 {
-		t.Errorf("дренаж без перехода = %d, want 0", rec.count())
+		t.Errorf("the drain without a transition = %d, want 0", rec.count())
 	}
 	for _, ev := range f.pool.j.snapshot() {
 		if ev == anEvAggUpsert {
-			t.Error("upsert laravel_domains при нулевых findings без перехода")
+			t.Error("the laravel_domains upsert with zero findings without a transition")
 		}
 	}
 }
@@ -281,42 +281,42 @@ func TestAggregateNoFindingsNoUpsert(t *testing.T) {
 func TestReanalyzeMatureTailsErrors(t *testing.T) {
 	// A Query error.
 	pool := newReanPool()
-	pool.setQueryErr(errors.New("бд недоступна"))
+	pool.setQueryErr(errors.New("db unavailable"))
 	if tails, hour, err := reanalyzeMatureTails(context.Background(), pool); err == nil ||
 		tails != 0 || !hour.IsZero() {
-		t.Errorf("Query-сбой: (%v/%v, %v), want нули и ошибка", tails, hour, err)
+		t.Errorf("the Query failure: (%v/%v, %v), want zeros and an error", tails, hour, err)
 	}
 	// An empty response — a protocol break, the values are zero.
 	pool2 := newReanPool()
 	pool2.guardEmpty = true
 	if tails, hour, err := reanalyzeMatureTails(context.Background(), pool2); err == nil ||
 		tails != 0 || !hour.IsZero() ||
-		!strings.Contains(err.Error(), "пустой ответ") {
-		t.Errorf("пустой ответ: (%v/%v, %v), want нули и «пустой ответ»", tails, hour, err)
+		!strings.Contains(err.Error(), "empty response") {
+		t.Errorf("the empty response: (%v/%v, %v), want zeros and «empty response»", tails, hour, err)
 	}
 	// A drop before the first row (rows.Err on an empty set) is an
 	// iteration error, NOT an "empty aggregate response".
 	pool3 := newReanPool()
 	pool3.guardEmpty = true
-	pool3.guardRowsErr = errors.New("обрыв соединения")
+	pool3.guardRowsErr = errors.New("connection drop")
 	if tails, hour, err := reanalyzeMatureTails(context.Background(), pool3); err == nil ||
-		tails != 0 || !hour.IsZero() || !strings.Contains(err.Error(), "обрыв соединения") {
-		t.Errorf("обрыв до строки: (%v/%v, %v), want нули и исходную", tails, hour, err)
+		tails != 0 || !hour.IsZero() || !strings.Contains(err.Error(), "connection drop") {
+		t.Errorf("the drop before the row: (%v/%v, %v), want zeros and the original", tails, hour, err)
 	}
 	// A Scan error — the "reading" context, the values are zero.
 	pool4 := newReanPool()
-	pool4.guardScanErr = errors.New("скан-бум")
+	pool4.guardScanErr = errors.New("scan boom")
 	if tails, hour, err := reanalyzeMatureTails(context.Background(), pool4); err == nil ||
 		tails != 0 || !hour.IsZero() ||
-		!strings.Contains(err.Error(), "чтение") {
-		t.Errorf("Scan-сбой: (%v/%v, %v), want нули и контекст чтения", tails, hour, err)
+		!strings.Contains(err.Error(), "read") {
+		t.Errorf("the Scan failure: (%v/%v, %v), want zeros and the read context", tails, hour, err)
 	}
 	// rows.Err after a row — the original error, the values are zero.
 	pool5 := newReanPool()
-	pool5.guardRowsErr = errors.New("обрыв")
+	pool5.guardRowsErr = errors.New("drop")
 	if tails, hour, err := reanalyzeMatureTails(context.Background(), pool5); err == nil ||
-		tails != 0 || !hour.IsZero() || !strings.Contains(err.Error(), "обрыв") {
-		t.Errorf("rows.Err после строки: (%v/%v, %v), want нули и исходную", tails, hour, err)
+		tails != 0 || !hour.IsZero() || !strings.Contains(err.Error(), "drop") {
+		t.Errorf("rows.Err after a row: (%v/%v, %v), want zeros and the original", tails, hour, err)
 	}
 }
 
@@ -335,24 +335,24 @@ func TestReanalyzeTickSelectErrors(t *testing.T) {
 	}
 	// A Query error of the tick select.
 	pool := seed()
-	pool.tickQueryErr = errors.New("бд недоступна")
+	pool.tickQueryErr = errors.New("db unavailable")
 	if _, err := ReanalyzeTick(context.Background(), pool, &reanQueue{}, 1, &ReanalyzeCursor{}, ReanalyzeOptions{}); err == nil ||
-		!strings.Contains(err.Error(), "выборка тика") {
-		t.Errorf("Query тика = %v, want контекст «выборка тика»", err)
+		!strings.Contains(err.Error(), "tick select") {
+		t.Errorf("the tick Query = %v, want the «tick select» context", err)
 	}
 	// A row Scan error.
 	pool2 := seed()
-	pool2.tickScanErr = errors.New("скан-бум")
+	pool2.tickScanErr = errors.New("scan boom")
 	if _, err := ReanalyzeTick(context.Background(), pool2, &reanQueue{}, 1, &ReanalyzeCursor{}, ReanalyzeOptions{}); err == nil ||
-		!strings.Contains(err.Error(), "чтение") {
-		t.Errorf("Scan тика = %v, want контекст чтения", err)
+		!strings.Contains(err.Error(), "read") {
+		t.Errorf("the tick Scan = %v, want the read context", err)
 	}
 	// rows.Err.
 	pool3 := seed()
-	pool3.tickRowsErr = errors.New("обрыв")
+	pool3.tickRowsErr = errors.New("drop")
 	if _, err := ReanalyzeTick(context.Background(), pool3, &reanQueue{}, 1, &ReanalyzeCursor{}, ReanalyzeOptions{}); err == nil ||
-		!strings.Contains(err.Error(), "обрыв") {
-		t.Errorf("rows.Err тика = %v, want исходная", err)
+		!strings.Contains(err.Error(), "drop") {
+		t.Errorf("the tick rows.Err = %v, want the original", err)
 	}
 }
 
@@ -390,11 +390,11 @@ func TestReanalyzeTickCancelMidBatch(t *testing.T) {
 	defer cancel()
 	q := &cancelQueue{cancel: cancel}
 	res, err := ReanalyzeTick(ctx, pool, q, 1, &ReanalyzeCursor{}, ReanalyzeOptions{BatchSize: 1})
-	if err == nil || err.Error() != "analyzer: переанализ: context canceled" {
-		t.Fatalf("ошибка = %v, want точная обёртка «analyzer: переанализ: context canceled»", err)
+	if err == nil || err.Error() != "analyzer: re-analysis: context canceled" {
+		t.Fatalf("the error = %v, want the exact wrap «analyzer: re-analysis: context canceled»", err)
 	}
 	if res.Selected == 0 || res.Published == 0 {
-		t.Errorf("итог = %+v, want хотя бы одна пачка до отмены", res)
+		t.Errorf("the outcome = %+v, want at least one batch before the cancel", res)
 	}
 }
 
@@ -430,9 +430,9 @@ func TestReanalyzeLoopNilRulesNoPanic(t *testing.T) {
 			t.Fatalf("ReanalyzeLoop: %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("цикл не вышел по отмене")
+		t.Fatal("the loop did not exit on cancellation")
 	}
 	if n := q.count(); n != 0 {
-		t.Errorf("публикаций без набора правил = %d, want 0", n)
+		t.Errorf("publications without a rule set = %d, want 0", n)
 	}
 }
