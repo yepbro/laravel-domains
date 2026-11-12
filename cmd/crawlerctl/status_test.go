@@ -138,7 +138,7 @@ func TestWriteStatusTable(t *testing.T) {
 		"доменов/с          1.0   (3600 проверено с начала суток, прошло 1h 00m)",
 		"HTTP-результатов/с 2.0   (7200 за окно темпа 1h 00m)",
 		"рендеров/с         1.0   (3600 с итоговым DOM за то же окно)",
-		"цикл: осталось 62 (pending+queued); ETA ≈ 1м (по 1.0 дом./с)",
+		"цикл: осталось 62 (pending+queued); ETA ≈ 1m (по 1.0 дом./с)",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("таблица не содержит %q:\n%s", want, got)
@@ -187,7 +187,7 @@ func TestWriteStatusTableDegraded(t *testing.T) {
 	writeStatusTable(&b, nil, status.Totals{}, thr, rates, nil)
 	got = b.String()
 	for _, want := range []string{
-		"н/д   (окно с начала суток короче 10м)",
+		"н/д   (окно с начала суток короче 10m)",
 		"ETA н/д (скорость неизвестна или 0)",
 	} {
 		if !strings.Contains(got, want) {

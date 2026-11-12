@@ -381,8 +381,8 @@ func TestSubdomainsAddRunMax63(t *testing.T) {
 		pool.subs = append(pool.subs, subdomainRow{id, fmt.Sprintf("s%d", id), true})
 	}
 	err := subdomainsAddRun(context.Background(), pool, "shop", &bytes.Buffer{})
-	if err == nil || !strings.Contains(err.Error(), "вне диапазона 0..62") {
-		t.Fatalf("ошибка = %v, хочу отказ диапазона 0..62", err)
+	if err == nil || !strings.Contains(err.Error(), "out of range 0..62") {
+		t.Fatalf("ошибка = %v, хочу отказ диапазона 0..62 (out of range)", err)
 	}
 	if len(pool.subs) != 63 {
 		t.Errorf("справочник изменился: %d строк, хочу 63", len(pool.subs))
