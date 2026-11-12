@@ -146,7 +146,7 @@ func (s *PackStore) PutBatch(ctx context.Context, items [][]byte) ([]PutResult, 
 	byHash := make(map[Hash]*batchItem, len(items))
 	for i, data := range items {
 		if s.opts.MaxStoreBytes > 0 && int64(len(data)) > s.opts.MaxStoreBytes {
-			errs[i] = fmt.Errorf("%w: %d байт при лимите %d",
+			errs[i] = fmt.Errorf("%w: %d bytes, limit %d",
 				ErrTooLarge, len(data), s.opts.MaxStoreBytes)
 			continue
 		}
@@ -241,19 +241,19 @@ func (s *PackStore) addRefBatch(ctx context.Context, items []*batchItem) (map[Ha
 	}
 	rows, err := s.pool.Query(ctx, sqlMetaAddRefBatch, hashes, counts)
 	if err != nil {
-		return nil, fmt.Errorf("content: метаданные пачки (%d хэшей): %w", len(hashes), err)
+		return nil, fmt.Errorf("content: batch metadata (%d hashes): %w", len(hashes), err)
 	}
 	defer rows.Close()
 	live := make(map[Hash]bool, len(items))
 	for rows.Next() {
 		h, err := scanHashRow(rows)
 		if err != nil {
-			return nil, fmt.Errorf("content: метаданные пачки: %w", err)
+			return nil, fmt.Errorf("content: batch metadata: %w", err)
 		}
 		live[h] = true
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("content: метаданные пачки: %w", err)
+		return nil, fmt.Errorf("content: batch metadata: %w", err)
 	}
 	return live, nil
 }
@@ -266,7 +266,7 @@ func scanHashRow(rows rowScanner) (Hash, error) {
 		return Hash{}, err
 	}
 	if len(hb) != HashLen {
-		return Hash{}, fmt.Errorf("хэш %x: %d октетов, ожидается %d", hb, len(hb), HashLen)
+		return Hash{}, fmt.Errorf("hash %x: %d octets, want %d", hb, len(hb), HashLen)
 	}
 	var h Hash
 	copy(h[:], hb)
@@ -333,7 +333,7 @@ func (s *PackStore) putBatchCommit(ctx context.Context, items []*batchItem, bloc
 	}
 	rows, err := s.pool.Query(ctx, sqlMetaPutBatch, hashes, packs, offs, clens, rawLens, counts)
 	if err != nil {
-		return nil, fmt.Errorf("content: метаданные пачки (%d строк): %w", len(written), err)
+		return nil, fmt.Errorf("content: batch metadata (%d rows): %w", len(written), err)
 	}
 	defer rows.Close()
 	created := make(map[Hash]bool, len(written))
@@ -341,10 +341,10 @@ func (s *PackStore) putBatchCommit(ctx context.Context, items []*batchItem, bloc
 		var hb []byte
 		var cr bool
 		if err := rows.Scan(&hb, &cr); err != nil {
-			return nil, fmt.Errorf("content: метаданные пачки: %w", err)
+			return nil, fmt.Errorf("content: batch metadata: %w", err)
 		}
 		if len(hb) != HashLen {
-			return nil, fmt.Errorf("content: метаданные пачки: хэш %x: %d октетов, ожидается %d",
+			return nil, fmt.Errorf("content: batch metadata: hash %x: %d octets, want %d",
 				hb, len(hb), HashLen)
 		}
 		var h Hash
@@ -352,10 +352,10 @@ func (s *PackStore) putBatchCommit(ctx context.Context, items []*batchItem, bloc
 		created[h] = cr
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("content: метаданные пачки: %w", err)
+		return nil, fmt.Errorf("content: batch metadata: %w", err)
 	}
 	if len(created) != len(written) {
-		return nil, fmt.Errorf("content: метаданные пачки: RETURNING дал %d строк, ожидалось %d",
+		return nil, fmt.Errorf("content: batch metadata: RETURNING returned %d rows, want %d",
 			len(created), len(written))
 	}
 	return created, nil

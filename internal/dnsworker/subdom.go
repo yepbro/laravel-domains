@@ -46,10 +46,10 @@ const subdomMaxChain = 10
 var (
 	// ErrSubdomCNAMELoop — the CNAME chain looped (A→B→A): the zone is
 	// broken, the terminal name does not exist.
-	ErrSubdomCNAMELoop = errors.New("dnsworker: цикл в цепочке CNAME")
+	ErrSubdomCNAMELoop = errors.New("dnsworker: a loop in the CNAME chain")
 	// ErrSubdomCNAMEDepth — the CNAME chain is longer than subdomMaxChain
 	// (a ladder of unique names); continuing is pointless and expensive.
-	ErrSubdomCNAMEDepth = errors.New("dnsworker: цепочка CNAME длиннее предела")
+	ErrSubdomCNAMEDepth = errors.New("dnsworker: the CNAME chain is longer than the limit")
 )
 
 // SubdomResult — the outcome of checking a single subdomain. "Addresses
@@ -163,7 +163,7 @@ func CheckSubdomains(
 	askAAAA bool,
 ) (*SubdomReport, error) {
 	if strings.TrimSpace(domain) == "" {
-		return nil, errors.New("dnsworker: пустое имя домена")
+		return nil, errors.New("dnsworker: empty domain name")
 	}
 
 	// Input validation before the first exchange: reference table errors
@@ -175,7 +175,7 @@ func CheckSubdomains(
 		return nil, err
 	}
 	if len(enabled) == 0 {
-		return nil, errors.New("dnsworker: нет включённых субдоменов — проверять нечего")
+		return nil, errors.New("dnsworker: no enabled subdomains — nothing to check")
 	}
 
 	report := &SubdomReport{Domain: domain, Results: make([]SubdomResult, 0, len(enabled))}
@@ -219,18 +219,18 @@ func filterEnabledSubdomains(subs []model.Subdomain) ([]model.Subdomain, error) 
 			continue
 		}
 		if err := model.ValidateSubdomainID(int(s.ID)); err != nil {
-			return nil, fmt.Errorf("dnsworker: субдомен id %d: %w", s.ID, err)
+			return nil, fmt.Errorf("dnsworker: subdomain id %d: %w", s.ID, err)
 		}
 		// A label is a single DNS label (as in the T-006 config and the
 		// q:http task); punycode labels (xn--…) pass as ordinary octets.
 		if len(s.Label) > 63 || strings.ContainsAny(s.Label, ". ") {
-			return nil, fmt.Errorf("dnsworker: субдомен id %d: метка %q — одна DNS-метка до 63 октетов без точек и пробелов (пустая строка — апекс)", s.ID, s.Label)
+			return nil, fmt.Errorf("dnsworker: subdomain id %d: label %q — a single DNS label of up to 63 octets without dots or spaces (an empty string is the apex)", s.ID, s.Label)
 		}
 		if _, dup := seenIDs[int(s.ID)]; dup {
-			return nil, fmt.Errorf("dnsworker: субдомен id %d повторяется во входе", s.ID)
+			return nil, fmt.Errorf("dnsworker: the subdomain id %d repeats in the input", s.ID)
 		}
 		if _, dup := seenLabels[s.Label]; dup {
-			return nil, fmt.Errorf("dnsworker: метка субдомена %q повторяется во входе", s.Label)
+			return nil, fmt.Errorf("dnsworker: the subdomain label %q repeats in the input", s.Label)
 		}
 		seenIDs[int(s.ID)] = struct{}{}
 		seenLabels[s.Label] = struct{}{}
@@ -269,7 +269,7 @@ func subdomCheckOne(ctx context.Context, resolve dnsclient.Resolver, name string
 				if ctxErr := ctx.Err(); ctxErr != nil {
 					return out, ctxErr
 				}
-				out.Err = fmt.Errorf("запрос A %s: %w", cur, err)
+				out.Err = fmt.Errorf("A query %s: %w", cur, err)
 				return out, nil
 			}
 			res = r
@@ -299,7 +299,7 @@ func subdomCheckOne(ctx context.Context, resolve dnsclient.Resolver, name string
 			break
 		}
 		if len(out.Chain) >= subdomMaxChain {
-			out.Err = fmt.Errorf("%w: %d переходов от %s", ErrSubdomCNAMEDepth, subdomMaxChain, subdomCanon(name))
+			out.Err = fmt.Errorf("%w: %d hops from %s", ErrSubdomCNAMEDepth, subdomMaxChain, subdomCanon(name))
 			return out, nil
 		}
 		if visited[target] {
@@ -328,7 +328,7 @@ func subdomCheckOne(ctx context.Context, resolve dnsclient.Resolver, name string
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return out, ctxErr
 			}
-			out.Err = fmt.Errorf("запрос AAAA %s: %w", cur, err)
+			out.Err = fmt.Errorf("AAAA query %s: %w", cur, err)
 			return out, nil
 		}
 		out.RCode = r.RCode

@@ -52,52 +52,52 @@ func NewRetentionMetrics(reg *metrics.Registry) *RetentionMetrics {
 	return &RetentionMetrics{
 		rows: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_content_retention_rows_total",
-			Help: "Строки subdomain_results, очищенные retention (T-166): срезаны content_hash и/или тяжёлые jsonb не-находок старше content.retention; паспорт строки остаётся.",
+			Help: "subdomain_results rows purged by retention (T-166): the content_hash and/or the heavy jsonb of non-findings older than content.retention are trimmed; the row passport stays.",
 		}).WithLabelValues(),
 		refs: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_content_retention_refs_total",
-			Help: "Срезанные ссылки content_hash (T-166): каждой соответствует −1 contents.refcount той же транзакцией.",
+			Help: "Trimmed content_hash references (T-166): each corresponds to −1 contents.refcount in the same transaction.",
 		}).WithLabelValues(),
 		contents: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_content_retention_contents_total",
-			Help: "Удалённые строки contents, лишившиеся последней ссылки (T-166); физическое место блоков возвращает компактификация паков — сходимость видно по crawler_content_* / disk_avail.",
+			Help: "contents rows deleted after losing their last reference (T-166); the physical block space is reclaimed by pack compaction — convergence is visible via crawler_content_* / disk_avail.",
 		}).WithLabelValues(),
 		freed: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_content_retention_freed_bytes_total",
-			Help: "Место (сжатые байты) блоков, лишившихся ссылок (T-166): счётчик права на место, фактическое освобождение — компактификация паков (T-045).",
+			Help: "Space (compressed bytes) of blocks that lost their references (T-166): a counter of the claim to the space, the actual freeing is pack compaction (T-045).",
 		}).WithLabelValues(),
 		skips: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_content_retention_skips_total",
-			Help: "Пропуски retention по интерлоку: глубина q:analyze у порога content.retention_analyze_watermark — анализатор не успевает, тела и headers/cookies ещё нужны; рост = анализ отстаёт, диск продолжает расти.",
+			Help: "Retention skips by interlock: the q:analyze depth is at the content.retention_analyze_watermark threshold — the analyzer cannot keep up, the bodies and headers/cookies are still needed; growth = analysis falls behind, the disk keeps growing.",
 		}).WithLabelValues(),
 		pendingErrors: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_content_retention_pending_errors_total",
-			Help: "Пропуски retention по ошибке чтения непотреблённых ключей q:render/q:analyze (консервативно: записи очередей не тронуты, проход отложен); рост = защита не может прочитать стримы — Redis/доступ, разбираться сразу: без защиты окно чистки ждущих записей открыто.",
+			Help: "Retention skips by an error reading the unconsumed q:render/q:analyze keys (conservatively: the queue records are untouched, the pass is postponed); growth = the guard cannot read the streams — Redis/access, investigate immediately: without the guard the purge window for waiting records is open.",
 		}).WithLabelValues(),
 		badHashes: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_content_retention_bad_hashes_total",
-			Help: "Срезанные retention ссылки с content_hash неверной длины (16 октет, ТЗ 6.1): refcount по ним не менялся; в норме не растёт вовсе — рост = ошибка писателя результатов (T-056), аналог crawler_ingest_bad_hashes_total.",
+			Help: "References trimmed by retention with a wrong-length content_hash (16 octets, spec 6.1): their refcount was never changed; must not grow at all — growth = a result writer bug (T-056), an analogue of crawler_ingest_bad_hashes_total.",
 		}).WithLabelValues(),
 		missing: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_content_retention_missing_refs_total",
-			Help: "Срезанные retention ссылки без строки contents — расхождение учёта refcount (T-044); в норме не растёт: рост = баг учёта, разбираться по инвариантам T-044.",
+			Help: "References trimmed by retention without a contents row — a refcount accounting divergence (T-044); must not grow in a healthy system: growth = an accounting bug, investigate via the T-044 invariants.",
 		}).WithLabelValues(),
 		errors: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_content_retention_errors_total",
-			Help: "Ошибочные проходы retention (T-273): проход прерван на ошибке — пачки, зафиксированные до неё, остаются в силе (курсор продвинулся частично), остаток множества повторится после backoff. До T-273 ошибки были видны только в журнале (инцидент 09–10.11.2026: сутки WARN-ов при нулевых метриках проходов); рост серии = дренаж стоит, контролировать диск контента и заголовок Warn в journalctl.",
+			Help: "Failed retention passes (T-273): the pass aborted on an error — batches committed before it stay in force (the cursor advanced partially), the rest of the set repeats after a backoff. Before T-273 errors were visible only in the journal (the 2026-11-09–10 incident: a day of WARNs with zero pass metrics); a growing series = the drain stands still, watch the content disk and the Warn heading in journalctl.",
 		}).WithLabelValues(),
 		seconds: reg.MustHistogram(prometheus.HistogramOpts{
 			Name:    "crawler_content_retention_pass_seconds",
-			Help:    "Длительность одного прохода retention (дренаж пачками, T-166).",
+			Help:    "Duration of one retention pass (drain in batches, T-166).",
 			Buckets: retentionSecondsBuckets,
 		}).WithLabelValues(),
 		passes: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_content_retention_passes_total",
-			Help: "Проходы retention по итогам: ok — дренаж выполнен (в т.ч. пустой), skipped — интерлок q:analyze (тела ещё нужны), skipped_pending — ошибка чтения непотреблённых q:render/q:analyze (проход отложен); error-проходы здесь не считаются — их считает crawler_content_retention_errors_total (T-273).",
+			Help: "Retention passes by outcome: ok — the drain completed (including an empty one), skipped — the q:analyze interlock (the bodies are still needed), skipped_pending — an error reading the unconsumed q:render/q:analyze (the pass is postponed); error passes are not counted here — crawler_content_retention_errors_total counts them (T-273).",
 		}, "result"),
 		deferred: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_content_retention_deferred_total",
-			Help: "Записи, исключённые retention из чистки: сообщения ждут потребителей стрима (q:render — рендер SPA, q:analyze — анализ; запись может ждать оба — считается в каждом). Растёт при застое очередей рядом с queue-метриками — сигнал дренировать потребителей (runbooks §5.2).",
+			Help: "Records excluded by retention from the purge: the messages wait for stream consumers (q:render — SPA rendering, q:analyze — analysis; a record can wait for both and is counted in each). Grows when the queues stall, alongside the queue metrics — a signal to drain the consumers (runbooks §5.2).",
 		}, "stream"),
 	}
 }

@@ -64,12 +64,12 @@ const (
 
 // errPackClosed — write operations after Close: a programming error,
 // not part of the ContentStore contract.
-var errPackClosed = errors.New("content: хранилище паков закрыто")
+var errPackClosed = errors.New("content: the pack store is closed")
 
 // errReadOnly — writing to a store opened with PackOptions.ReadOnly:
 // a read-only reader (crawlerctl domain --content) must change neither the
 // FS nor the metadata; a programming error of the caller.
-var errReadOnly = errors.New("content: хранилище паков открыто только для чтения")
+var errReadOnly = errors.New("content: the pack store is opened read-only")
 
 // The refcount automaton of content (T-265, spec tasks/TZ-fsm.md §3 FR-11): the
 // single source of truth about the states and transitions of a contents row —
@@ -278,19 +278,19 @@ type packHeader struct {
 // a reader: without creating a directory or a lock (see the field).
 func OpenPackStore(pool db.DB, opts PackOptions) (*PackStore, error) {
 	if pool == nil {
-		return nil, errors.New("content: пул БД не задан")
+		return nil, errors.New("content: the DB pool is not set")
 	}
 	if opts.Dir == "" {
-		return nil, errors.New("content: каталог паков не задан (content.dir)")
+		return nil, errors.New("content: the packs directory is not set (content.dir)")
 	}
 	if opts.PackSize < 0 {
-		return nil, fmt.Errorf("content: pack_size %d отрицателен", opts.PackSize)
+		return nil, fmt.Errorf("content: pack_size %d is negative", opts.PackSize)
 	}
 	if opts.PackSize == 0 {
 		opts.PackSize = DefaultPackSize
 	}
 	if opts.MaxStoreBytes < 0 {
-		return nil, fmt.Errorf("content: max_store_bytes %d отрицателен", opts.MaxStoreBytes)
+		return nil, fmt.Errorf("content: max_store_bytes %d is negative", opts.MaxStoreBytes)
 	}
 	if opts.ReadOnly {
 		// A reader needs neither the directory nor the lock: the FS is not
@@ -299,15 +299,15 @@ func OpenPackStore(pool db.DB, opts PackOptions) (*PackStore, error) {
 		// store.
 		st, err := os.Stat(opts.Dir)
 		if err != nil {
-			return nil, fmt.Errorf("content: каталог паков %s: %w", opts.Dir, err)
+			return nil, fmt.Errorf("content: packs directory %s: %w", opts.Dir, err)
 		}
 		if !st.IsDir() {
-			return nil, fmt.Errorf("content: каталог паков %s: не каталог", opts.Dir)
+			return nil, fmt.Errorf("content: packs directory %s: not a directory", opts.Dir)
 		}
 		return &PackStore{pool: pool, opts: opts, stat: OSStatfs{}}, nil
 	}
 	if err := os.MkdirAll(opts.Dir, 0o755); err != nil {
-		return nil, fmt.Errorf("content: каталог паков %s: %w", opts.Dir, err)
+		return nil, fmt.Errorf("content: packs directory %s: %w", opts.Dir, err)
 	}
 	// 0o660: the lock and the packs are opened for writing by several units of
 	// the crawler group (http-worker, render-worker, analyzer — flock;
@@ -316,7 +316,7 @@ func OpenPackStore(pool db.DB, opts PackOptions) (*PackStore, error) {
 	// (a separate user per service).
 	lock, err := os.OpenFile(filepath.Join(opts.Dir, packLockFile), os.O_CREATE|os.O_RDWR, 0o660)
 	if err != nil {
-		return nil, fmt.Errorf("content: файл блокировки %s: %w", filepath.Join(opts.Dir, packLockFile), err)
+		return nil, fmt.Errorf("content: lock file %s: %w", filepath.Join(opts.Dir, packLockFile), err)
 	}
 	return &PackStore{pool: pool, opts: opts, lock: lock, stat: OSStatfs{}}, nil
 }
@@ -362,7 +362,7 @@ func (s *PackStore) Put(ctx context.Context, data []byte) (PutResult, error) {
 		return PutResult{}, errReadOnly
 	}
 	if s.opts.MaxStoreBytes > 0 && int64(len(data)) > s.opts.MaxStoreBytes {
-		return PutResult{}, fmt.Errorf("%w: %d байт при лимите %d",
+		return PutResult{}, fmt.Errorf("%w: %d bytes, limit %d",
 			ErrTooLarge, len(data), s.opts.MaxStoreBytes)
 	}
 	h := HashOf(data)
@@ -370,7 +370,7 @@ func (s *PackStore) Put(ctx context.Context, data []byte) (PutResult, error) {
 	// 1) dedup: live content is a reference only.
 	tag, err := s.pool.Exec(ctx, sqlMetaAddRef, h[:])
 	if err != nil {
-		return PutResult{}, fmt.Errorf("content: метаданные %s: %w", h, err)
+		return PutResult{}, fmt.Errorf("content: metadata %s: %w", h, err)
 	}
 	if tag.RowsAffected() == 1 {
 		return PutResult{Hash: h}, nil
@@ -445,19 +445,19 @@ func (s *PackStore) appendAndMeta(ctx context.Context, h Hash, block []byte, raw
 	}
 	rows, err := s.pool.Query(ctx, sqlMetaPut, h[:], packID, off, int32(len(block)), int32(rawLen))
 	if err != nil {
-		return false, fmt.Errorf("content: метаданные %s: %w", h, err)
+		return false, fmt.Errorf("content: metadata %s: %w", h, err)
 	}
 	defer rows.Close()
 	if !rows.Next() {
 		err := rows.Err()
 		if err == nil {
-			err = errors.New("upsert не вернул строки RETURNING")
+			err = errors.New("the upsert returned no RETURNING rows")
 		}
-		return false, fmt.Errorf("content: метаданные %s: %w", h, err)
+		return false, fmt.Errorf("content: metadata %s: %w", h, err)
 	}
 	var created bool
 	if err := rows.Scan(&created); err != nil {
-		return false, fmt.Errorf("content: метаданные %s: %w", h, err)
+		return false, fmt.Errorf("content: metadata %s: %w", h, err)
 	}
 	return created, nil
 }
@@ -491,10 +491,10 @@ func (s *PackStore) Get(ctx context.Context, hash Hash) ([]byte, error) {
 	}
 	raw, err := DecompressWithDict(block)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %s: распаковка блока пака %d: %w", ErrCorrupted, hash, packID, err)
+		return nil, fmt.Errorf("%w: %s: decompressing a pack %d block: %w", ErrCorrupted, hash, packID, err)
 	}
 	if int32(len(raw)) != rawLen {
-		return nil, fmt.Errorf("%w: %s: блок пака %d повреждён: распаковано %d байт, в метаданных %d",
+		return nil, fmt.Errorf("%w: %s: pack %d block corrupted: decompressed %d bytes, metadata says %d",
 			ErrCorrupted, hash, packID, len(raw), rawLen)
 	}
 	return raw, nil
@@ -505,7 +505,7 @@ func (s *PackStore) Get(ctx context.Context, hash Hash) ([]byte, error) {
 func (s *PackStore) meta(ctx context.Context, hash Hash) (int32, int64, int32, int32, error) {
 	rows, err := s.pool.Query(ctx, sqlMetaGet, hash[:])
 	if err != nil {
-		return 0, 0, 0, 0, fmt.Errorf("content: метаданные %s: %w", hash, err)
+		return 0, 0, 0, 0, fmt.Errorf("content: metadata %s: %w", hash, err)
 	}
 	defer rows.Close()
 	var packID int32
@@ -514,10 +514,10 @@ func (s *PackStore) meta(ctx context.Context, hash Hash) (int32, int64, int32, i
 	switch {
 	case rows.Next():
 		if err := rows.Scan(&packID, &off, &clen, &rawLen); err != nil {
-			return 0, 0, 0, 0, fmt.Errorf("content: метаданные %s: %w", hash, err)
+			return 0, 0, 0, 0, fmt.Errorf("content: metadata %s: %w", hash, err)
 		}
 	case rows.Err() != nil:
-		return 0, 0, 0, 0, fmt.Errorf("content: метаданные %s: %w", hash, rows.Err())
+		return 0, 0, 0, 0, fmt.Errorf("content: metadata %s: %w", hash, rows.Err())
 	default:
 		return 0, 0, 0, 0, ErrNotFound
 	}
@@ -535,7 +535,7 @@ func (s *PackStore) Delete(ctx context.Context, hash Hash) error {
 	}
 	tag, err := s.pool.Exec(ctx, sqlMetaDelRef, hash[:])
 	if err != nil {
-		return fmt.Errorf("content: метаданные %s: %w", hash, err)
+		return fmt.Errorf("content: metadata %s: %w", hash, err)
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrNotFound
@@ -620,7 +620,7 @@ func (s *PackStore) appendBlockLocked(block []byte) (int32, int64, error) {
 		// Another process may have appended to the pack since the last call.
 		st, err := s.active.f.Stat()
 		if err != nil {
-			return 0, 0, fmt.Errorf("content: пак %d: %w", s.active.id, err)
+			return 0, 0, fmt.Errorf("content: pack %d: %w", s.active.id, err)
 		}
 		s.active.size = st.Size()
 	}
@@ -689,7 +689,7 @@ func (s *PackStore) newestPackIDLocked() (int32, error) {
 	// stat before ReadDir: events in between just invalidate the cache once more.
 	st, err := os.Stat(s.opts.Dir)
 	if err != nil {
-		return 0, fmt.Errorf("content: каталог паков %s: %w", s.opts.Dir, err)
+		return 0, fmt.Errorf("content: packs directory %s: %w", s.opts.Dir, err)
 	}
 	if s.dirCache.valid && !s.dirCache.modTime.Equal(st.ModTime()) {
 		s.dirCache.valid = false // the pack registry changed — rebuild
@@ -702,7 +702,7 @@ func (s *PackStore) newestPackIDLocked() (int32, error) {
 		case errors.Is(err, fs.ErrNotExist):
 			return s.dirCache.maxID, nil
 		default:
-			return 0, fmt.Errorf("content: каталог паков %s: %w", s.opts.Dir, err)
+			return 0, fmt.Errorf("content: packs directory %s: %w", s.opts.Dir, err)
 		}
 	}
 	maxID, err := s.scanPackIDs()
@@ -762,7 +762,7 @@ func (s *PackStore) createPackLocked(id int32) (*packFile, error) {
 	}
 	if pf.size != packHeaderLen {
 		_ = pf.f.Close()
-		return nil, fmt.Errorf("content: пак %d: файл уже содержит %d байт, ожидался только заголовок",
+		return nil, fmt.Errorf("content: pack %d: the file already holds %d bytes, only the header was expected",
 			id, pf.size)
 	}
 	return pf, nil
@@ -779,12 +779,12 @@ func (s *PackStore) openPackForWrite(id int32) (*packFile, error) {
 	// to the active pack (docs/deploy.md §3).
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o660)
 	if err != nil {
-		return nil, fmt.Errorf("content: пак %d: %w", id, err)
+		return nil, fmt.Errorf("content: pack %d: %w", id, err)
 	}
 	st, err := f.Stat()
 	if err != nil {
 		_ = f.Close()
-		return nil, fmt.Errorf("content: пак %d: %w", id, err)
+		return nil, fmt.Errorf("content: pack %d: %w", id, err)
 	}
 	hdr := packHeader{id: id, maxSize: s.opts.PackSize, dictID: activeDictID()}
 	if st.Size() < packHeaderLen {
@@ -798,7 +798,7 @@ func (s *PackStore) openPackForWrite(id int32) (*packFile, error) {
 		if st.Size() > 0 {
 			if err := f.Truncate(0); err != nil {
 				_ = f.Close()
-				return nil, fmt.Errorf("content: пак %d: %w", id, err)
+				return nil, fmt.Errorf("content: pack %d: %w", id, err)
 			}
 		}
 		if _, err := f.Write(hdr.bytes()); err != nil {
@@ -822,11 +822,11 @@ func (s *PackStore) openPackForWrite(id int32) (*packFile, error) {
 	got, err := readPackHeader(f)
 	if err != nil {
 		_ = f.Close()
-		return nil, fmt.Errorf("content: пак %d: %w", id, err)
+		return nil, fmt.Errorf("content: pack %d: %w", id, err)
 	}
 	if got.id != id {
 		_ = f.Close()
-		return nil, fmt.Errorf("content: пак %d: заголовок называет пак %d", id, got.id)
+		return nil, fmt.Errorf("content: pack %d: the header names pack %d", id, got.id)
 	}
 	return &packFile{id: id, f: f, size: st.Size()}, nil
 }
@@ -835,7 +835,7 @@ func (s *PackStore) openPackForWrite(id int32) (*packFile, error) {
 func (s *PackStore) scanPackIDs() (int32, error) {
 	ents, err := os.ReadDir(s.opts.Dir)
 	if err != nil {
-		return 0, fmt.Errorf("content: каталог паков %s: %w", s.opts.Dir, err)
+		return 0, fmt.Errorf("content: packs directory %s: %w", s.opts.Dir, err)
 	}
 	var max int32
 	for _, e := range ents {
@@ -900,12 +900,12 @@ func readPackHeader(f *os.File) (packHeader, error) {
 // docs/content.md); an hdrLen smaller than the mandatory v1 fields is
 // corruption.
 func parsePackHeader(b []byte) (packHeader, error) {
-	bad := errors.New("заголовок пака нечитаем")
+	bad := errors.New("the pack header is unreadable")
 	if len(b) < packHeaderLen || string(b[:len(packMagic)]) != packMagic {
 		return packHeader{}, bad
 	}
 	if b[4] != packVersion {
-		return packHeader{}, fmt.Errorf("версия пака %d не поддерживается (поддерживается %d)", b[4], packVersion)
+		return packHeader{}, fmt.Errorf("pack version %d is not supported (supported: %d)", b[4], packVersion)
 	}
 	if hdrLen := binary.LittleEndian.Uint16(b[5:7]); hdrLen < packHeaderLen {
 		return packHeader{}, bad
@@ -923,12 +923,12 @@ func parsePackHeader(b []byte) (packHeader, error) {
 func readPackBlock(dir string, packID int32, off int64, clen int32) ([]byte, error) {
 	f, err := os.Open(filepath.Join(dir, packFileName(packID)))
 	if err != nil {
-		return nil, fmt.Errorf("content: пак %d: %w", packID, err)
+		return nil, fmt.Errorf("content: pack %d: %w", packID, err)
 	}
 	defer func() { _ = f.Close() }() // read-only
 	st, err := f.Stat()
 	if err != nil {
-		return nil, fmt.Errorf("content: пак %d: %w", packID, err)
+		return nil, fmt.Errorf("content: pack %d: %w", packID, err)
 	}
 	return readPackBlockAt(f, st.Size(), packID, off, clen)
 }
@@ -940,12 +940,12 @@ func readPackBlock(dir string, packID int32, off int64, clen int32) ([]byte, err
 // check as in the CompactScan scan.
 func readPackBlockAt(f *os.File, size int64, packID int32, off int64, clen int32) ([]byte, error) {
 	if clen < 0 || off < packHeaderLen+4 || off+int64(clen) > size {
-		return nil, fmt.Errorf("content: пак %d, смещение %d, длина %d: блок вне файла (%d байт)",
+		return nil, fmt.Errorf("content: pack %d, offset %d, length %d: block outside the file (%d bytes)",
 			packID, off, clen, size)
 	}
 	buf := make([]byte, clen)
 	if _, err := f.ReadAt(buf, off); err != nil {
-		return nil, fmt.Errorf("content: пак %d, смещение %d: %w", packID, off, err)
+		return nil, fmt.Errorf("content: pack %d, offset %d: %w", packID, off, err)
 	}
 	return buf, nil
 }
@@ -970,16 +970,16 @@ func syncDir(dir string) error {
 // the original error is kept for errors.Is.
 func wrapPackWriteErr(err error, packID int32) error {
 	if errors.Is(err, syscall.ENOSPC) {
-		return fmt.Errorf("%w: пак %d: %w", ErrStoreFull, packID, err)
+		return fmt.Errorf("%w: pack %d: %w", ErrStoreFull, packID, err)
 	}
-	return fmt.Errorf("content: запись пака %d: %w", packID, err)
+	return fmt.Errorf("content: writing pack %d: %w", packID, err)
 }
 
 // flockDir/unlockDir — acquiring/releasing the inter-process lock of the
 // packs directory: writers (T-042) and compaction (T-045).
 func flockDir(f *os.File) error {
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-		return fmt.Errorf("content: блокировка каталога паков: %w", err)
+		return fmt.Errorf("content: locking the packs directory: %w", err)
 	}
 	return nil
 }

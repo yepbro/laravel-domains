@@ -194,7 +194,7 @@ func (t *compactFakeTx) Exec(_ context.Context, sql string, args ...any) (pgconn
 		}
 		return pgconn.NewCommandTag(fmt.Sprintf("UPDATE %d", n)), nil
 	default:
-		return pgconn.CommandTag{}, fmt.Errorf("compactFakeTx: неожидаемый SQL: %s", sql)
+		return pgconn.CommandTag{}, fmt.Errorf("compactFakeTx: unexpected SQL: %s", sql)
 	}
 }
 
@@ -273,7 +273,7 @@ func compactCraftPack(t *testing.T, dir string, id int32, blocks [][]byte) []int
 		buf.Write(b)
 	}
 	if err := os.WriteFile(filepath.Join(dir, packFileName(id)), buf.Bytes(), 0o644); err != nil {
-		t.Fatalf("сборка пака %d: %v", id, err)
+		t.Fatalf("building pack %d: %v", id, err)
 	}
 	return offs
 }
@@ -310,7 +310,7 @@ func compactWaitFor(t *testing.T, cond func() bool, what string) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("не дождались: %s", what)
+	t.Fatalf("did not wait for: %s", what)
 }
 
 // --- SQL contract ------------------------------------------------------------
@@ -339,7 +339,7 @@ func TestCompactSQLContract(t *testing.T) {
 	if sqlCompactRows != wantCompactRows || sqlCompactMove != wantCompactMove ||
 		sqlCompactDead != wantCompactDead || sqlCompactLive != wantCompactLive ||
 		sqlCompactAll != wantCompactAll || sqlCompactDeadPack != wantCompactDeadPack {
-		t.Fatal("SQL компактификации изменился — обновите контракт и schema_test")
+		t.Fatal("the compaction SQL changed — update the contract and schema_test")
 	}
 }
 
@@ -361,19 +361,19 @@ func TestPackShortHeaderRecovered(t *testing.T) {
 	}
 	defer st.Close() //nolint:errcheck // the test closes the store in cleanup
 	ctx := context.Background()
-	d := []byte("контент в пак с обрывом заголовка")
+	d := []byte("content into a pack with a truncated header")
 	if _, err := st.Put(ctx, d); err != nil {
-		t.Fatalf("Put в пак с обрывом заголовка: %v", err)
+		t.Fatalf("Put into a pack with a truncated header: %v", err)
 	}
 	if got, err := st.Get(ctx, HashOf(d)); err != nil || string(got) != string(d) {
-		t.Errorf("Get после восстановления заголовка: %v", err)
+		t.Errorf("Get after the header recovery: %v", err)
 	}
 	raw, err := os.ReadFile(filepath.Join(dir, packFileName(1)))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := parsePackHeader(raw); err != nil {
-		t.Errorf("заголовок не восстановлен: %v", err)
+		t.Errorf("the header not recovered: %v", err)
 	}
 }
 
@@ -399,20 +399,20 @@ func TestCompactShortPackSwept(t *testing.T) {
 
 	info, err := st.CompactScan(ctx, 1)
 	if err != nil {
-		t.Fatalf("скан пака без заголовка: %v", err)
+		t.Fatalf("scan of a headerless pack: %v", err)
 	}
 	if info.Ratio != 0 || info.LiveBytes != 0 {
-		t.Errorf("скан «пустого» пака: %+v, want нулевые живые байты", info)
+		t.Errorf("scan of an \"empty\" pack: %+v, want zero live bytes", info)
 	}
 	stats, err := CompactOnce(ctx, st, CompactOptions{})
 	if err != nil {
 		t.Fatalf("CompactOnce: %v", err)
 	}
 	if stats.Compacted != 1 {
-		t.Errorf("итог прохода %+v, want 1 удалённый пак-пустышка", stats)
+		t.Errorf("pass result %+v, want 1 removed dummy pack", stats)
 	}
 	if got := compactPackSize(t, dir, 1); got != 0 {
-		t.Errorf("пак-пустышка не удалён: %d байт", got)
+		t.Errorf("the dummy pack not removed: %d bytes", got)
 	}
 
 	// Rows on a headerless pack mean corruption: the scan refuses.
@@ -421,7 +421,7 @@ func TestCompactShortPackSwept(t *testing.T) {
 	}
 	compactCraftRow(t, pool, "orphan", 3, 0, 8, 1)
 	if _, err := st.CompactScan(ctx, 3); err == nil {
-		t.Error("скан пака без заголовка со строками: ожидалась ошибка")
+		t.Error("scan of a headerless pack with rows: an error expected")
 	}
 }
 
@@ -430,7 +430,7 @@ func TestCompactShortPackSwept(t *testing.T) {
 func TestGetCorrupted(t *testing.T) {
 	st, pool := newCompactTestStore(t, nil)
 	ctx := context.Background()
-	d := []byte("контент, чьи байты сейчас испортим")
+	d := []byte("content whose bytes we corrupt next")
 	res, err := st.Put(ctx, d)
 	if err != nil {
 		t.Fatal(err)
@@ -448,10 +448,10 @@ func TestGetCorrupted(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := st.Get(ctx, res.Hash); !errors.Is(err, ErrCorrupted) {
-		t.Errorf("Get испорченного блока: %v, want ErrCorrupted", err)
+		t.Errorf("Get of the corrupted block: %v, want ErrCorrupted", err)
 	}
-	if _, err := st.Get(ctx, HashOf([]byte("никогда не писали"))); !errors.Is(err, ErrNotFound) {
-		t.Errorf("Get отсутствующего: %v, want ErrNotFound", err)
+	if _, err := st.Get(ctx, HashOf([]byte("never written"))); !errors.Is(err, ErrNotFound) {
+		t.Errorf("Get of an absent one: %v, want ErrNotFound", err)
 	}
 }
 
@@ -463,7 +463,7 @@ func TestCompactCorruptBlock(t *testing.T) {
 	ctx := context.Background()
 	var hashes []Hash
 	for i := 0; i < 3; i++ {
-		d := []byte(strings.Repeat(fmt.Sprintf("<p>сосед %d для порчи</p>", i), 10))
+		d := []byte(strings.Repeat(fmt.Sprintf("<p>neighbor %d for corruption</p>", i), 10))
 		res, err := st.Put(ctx, d)
 		if err != nil {
 			t.Fatal(err)
@@ -480,26 +480,26 @@ func TestCompactCorruptBlock(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := st.Get(ctx, hashes[2]); !errors.Is(err, ErrCorrupted) {
-		t.Errorf("Get блока за концом файла: %v, want ErrCorrupted", err)
+		t.Errorf("Get of a block past the end of the file: %v, want ErrCorrupted", err)
 	}
 
 	res, err := st.CompactPack(ctx, 1)
 	if err == nil {
-		t.Fatal("компактификация с нечитаемым блоком: ожидалась ошибка целостности")
+		t.Fatal("compaction with an unreadable block: an integrity error expected")
 	}
-	if !strings.Contains(err.Error(), "блок нечитаем") {
-		t.Errorf("ошибка не называет нечитаемый блок: %v", err)
+	if !strings.Contains(err.Error(), "unreadable block") {
+		t.Errorf("the error does not name the unreadable block: %v", err)
 	}
 	if !res.Removed || res.Corrupted != 1 || res.CopiedBlocks != 2 || res.Tombstones != 1 {
-		t.Errorf("итог %+v, want удалённый пак, 1 порченая и 2 переписанные строки", res)
+		t.Errorf("result %+v, want a removed pack, 1 corrupted and 2 rewritten rows", res)
 	}
 	// The corrupted row is dead (removed by compaction), the neighbors moved.
 	if _, ok := pool.row(hashes[2]); ok {
-		t.Error("строка нечитаемого блока не помечена мёртвой")
+		t.Error("the unreadable block's row not marked dead")
 	}
 	for _, h := range []Hash{hashes[0], hashes[1]} {
 		if r, _ := pool.row(h); r.packID != 2 {
-			t.Errorf("живой сосед %s не переехал: %+v", h, r)
+			t.Errorf("the live neighbor %s did not move: %+v", h, r)
 		}
 	}
 }
@@ -511,7 +511,7 @@ func TestCompactCorruptBlock(t *testing.T) {
 func TestGetRetryAfterCompaction(t *testing.T) {
 	st, pool := newCompactTestStore(t, nil)
 	ctx := context.Background()
-	d := []byte("контент, чей пак уходит под компактификацией")
+	d := []byte("content whose pack goes under compaction")
 	res, err := st.Put(ctx, d)
 	if err != nil {
 		t.Fatal(err)
@@ -545,13 +545,13 @@ func TestGetRetryAfterCompaction(t *testing.T) {
 
 	got, err := st2.Get(ctx, res.Hash)
 	if err != nil {
-		t.Fatalf("Get в гонке с компактификацией: %v", err)
+		t.Fatalf("Get in a race with compaction: %v", err)
 	}
 	if string(got) != string(d) {
-		t.Error("Get после переезда вернул чужие байты")
+		t.Error("Get after the move returned foreign bytes")
 	}
 	if !rp.moved {
-		t.Error("повторного чтения метаданных не было — гонка не смоделирована")
+		t.Error("no second metadata read — the race not modeled")
 	}
 }
 
@@ -586,7 +586,7 @@ func (p *getRacePool) Query(ctx context.Context, sql string, args ...any) (pgx.R
 func TestCompactOrphanDeadRowsSwept(t *testing.T) {
 	st, pool := newCompactTestStore(t, nil)
 	ctx := context.Background()
-	d := []byte("контент, чья ссылка умрёт во время прохода")
+	d := []byte("content whose reference dies during the pass")
 	res, err := st.Put(ctx, d)
 	if err != nil {
 		t.Fatal(err)
@@ -608,10 +608,10 @@ func TestCompactOrphanDeadRowsSwept(t *testing.T) {
 		t.Fatalf("CompactPack: %v", err)
 	}
 	if compactPackSize(t, st.opts.Dir, 1) != 0 {
-		t.Error("файл пака 1 не удалён")
+		t.Error("the pack 1 file not removed")
 	}
 	if _, ok := pool.row(res.Hash); ok {
-		t.Error("осиротевшая мёртвая строка осталась в contents (утечка строк C-13)")
+		t.Error("an orphaned dead row stayed in contents (a row leak, C-13)")
 	}
 }
 
@@ -641,9 +641,9 @@ func (p *killOnRowsPool) Query(ctx context.Context, sql string, args ...any) (pg
 func TestCompactScanMixed(t *testing.T) {
 	st, pool := newCompactTestStore(t, nil)
 	ctx := context.Background()
-	live := []byte("<html>живой контент пака</html>")
-	dead := []byte("<html>мёртвый контент пака</html>")
-	orphan := []byte("<html>контент, чьи метаданные не закоммитятся</html>")
+	live := []byte("<html>live pack content</html>")
+	dead := []byte("<html>dead pack content</html>")
+	orphan := []byte("<html>content whose metadata will not commit</html>")
 
 	for _, d := range [][]byte{live, dead} {
 		if _, err := st.Put(ctx, d); err != nil {
@@ -658,7 +658,7 @@ func TestCompactScanMixed(t *testing.T) {
 	// a block without a row.
 	pool.failOnQuery = 3
 	if _, err := st.Put(ctx, orphan); err == nil {
-		t.Fatal("Put с упавшей фиксацией метаданных должен вернуть ошибку")
+		t.Fatal("Put with a failing metadata commit must return an error")
 	}
 	// An unterminated tail: a length prefix of 255 and one data byte.
 	f, err := os.OpenFile(filepath.Join(st.opts.Dir, packFileName(1)), os.O_WRONLY|os.O_APPEND, 0)
@@ -678,11 +678,11 @@ func TestCompactScanMixed(t *testing.T) {
 	}
 	lr, ok := pool.row(HashOf(live))
 	if !ok {
-		t.Fatal("нет строки живого контента")
+		t.Fatal("no live content row")
 	}
 	dr, ok := pool.row(HashOf(dead))
 	if !ok {
-		t.Fatal("нет мёртвой строки")
+		t.Fatal("no dead row")
 	}
 	wantLive := int64(4 + lr.clen)
 	wantDead := int64(4 + dr.clen)
@@ -695,25 +695,25 @@ func TestCompactScanMixed(t *testing.T) {
 		t.Errorf("DataBytes = %d, want %d", info.DataBytes, size-packHeaderLen)
 	}
 	if info.LiveBytes != wantLive || info.LiveBlocks != 1 {
-		t.Errorf("живые: %d байт / %d блоков, want %d / 1", info.LiveBytes, info.LiveBlocks, wantLive)
+		t.Errorf("live: %d bytes / %d blocks, want %d / 1", info.LiveBytes, info.LiveBlocks, wantLive)
 	}
 	if info.DeadBytes != wantDead || info.DeadBlocks != 1 {
-		t.Errorf("мёртвые: %d байт / %d блоков, want %d / 1", info.DeadBytes, info.DeadBlocks, wantDead)
+		t.Errorf("dead: %d bytes / %d blocks, want %d / 1", info.DeadBytes, info.DeadBlocks, wantDead)
 	}
 	// Garbage: the crash-window block (4+len) and the 5-byte tail — one whole
 	// block.
 	orphanRow, ok := pool.row(HashOf(orphan))
 	if ok {
-		t.Fatalf("строка orphan не должна была зафиксироваться: %+v", orphanRow)
+		t.Fatalf("the orphan row must not have committed: %+v", orphanRow)
 	}
 	if want := size - packHeaderLen - wantLive - wantDead; info.GarbageBytes != want {
 		t.Errorf("GarbageBytes = %d, want %d", info.GarbageBytes, want)
 	}
 	if info.GarbageBlocks != 1 {
-		t.Errorf("GarbageBlocks = %d, want 1 (хвост — не блок)", info.GarbageBlocks)
+		t.Errorf("GarbageBlocks = %d, want 1 (the tail is not a block)", info.GarbageBlocks)
 	}
 	if !info.Truncated {
-		t.Error("Truncated = false, want true (недописанный хвост)")
+		t.Error("Truncated = false, want true (an unfinished tail)")
 	}
 	if want := float64(wantLive) / float64(size-packHeaderLen); info.Ratio != want {
 		t.Errorf("Ratio = %v, want %v", info.Ratio, want)
@@ -726,7 +726,7 @@ func TestCompactScanMixed(t *testing.T) {
 func TestCompactScanValidation(t *testing.T) {
 	st, pool := newCompactTestStore(t, nil)
 	ctx := context.Background()
-	d := []byte("<html>контент с битой строкой</html>")
+	d := []byte("<html>content with a broken row</html>")
 	if _, err := st.Put(ctx, d); err != nil {
 		t.Fatal(err)
 	}
@@ -734,15 +734,15 @@ func TestCompactScanValidation(t *testing.T) {
 	row, _ := pool.row(h)
 
 	for name, mutate := range map[string]func(){
-		"блок за концом файла": func() { pool.contents[h].off = row.off + 1<<20 },
-		"смещение в заголовке": func() { pool.contents[h].off = 4 },
-		"чужой префикс длины":  func() { pool.contents[h].clen = row.clen + 1 },
+		"a block past the end of the file": func() { pool.contents[h].off = row.off + 1<<20 },
+		"the offset in the header": func() { pool.contents[h].off = 4 },
+		"a foreign length prefix":  func() { pool.contents[h].clen = row.clen + 1 },
 	} {
 		t.Run(name, func(t *testing.T) {
 			pool.contents[h].off, pool.contents[h].clen = row.off, row.clen
 			mutate()
 			if _, err := st.CompactScan(ctx, 1); err == nil {
-				t.Error("скан битой строки: ожидалась ошибка")
+				t.Error("scan of a broken row: an error expected")
 			}
 		})
 	}
@@ -775,7 +775,7 @@ func TestCompactThreshold49(t *testing.T) {
 		t.Fatalf("CompactScan: %v", err)
 	}
 	if info.Ratio >= 0.5 {
-		t.Fatalf("доля живых %v — тест рассчитан на строго меньше 0.5", info.Ratio)
+		t.Fatalf("the live share %v — the test assumes strictly below 0.5", info.Ratio)
 	}
 
 	stats, err := CompactOnce(context.Background(), st, CompactOptions{})
@@ -783,27 +783,27 @@ func TestCompactThreshold49(t *testing.T) {
 		t.Fatalf("CompactOnce: %v", err)
 	}
 	if stats.Compacted != 1 || stats.FreedBytes != oldSize {
-		t.Fatalf("итог прохода %+v, want 1 пак / %d байт", stats, oldSize)
+		t.Fatalf("pass result %+v, want 1 pack / %d bytes", stats, oldSize)
 	}
 	if got := compactPackSize(t, dir, 1); got != 0 {
-		t.Errorf("старый пак существует (%d байт), want удалён", got)
+		t.Errorf("the old pack exists (%d bytes), want removed", got)
 	}
 	row, ok := pool.row(hLive)
 	if !ok {
-		t.Fatal("живая строка исчезла")
+		t.Fatal("the live row disappeared")
 	}
 	if row.packID != 2 || row.off != packHeaderLen+4 {
-		t.Errorf("живая строка: пак %d смещение %d, want пак 2 смещение %d",
+		t.Errorf("the live row: pack %d offset %d, want pack 2 offset %d",
 			row.packID, row.off, packHeaderLen+4)
 	}
 	if row.refc != 2 || row.clen != int32(len(liveBlock)) {
-		t.Errorf("живая строка изменила refcount/len: %+v", row)
+		t.Errorf("the live row changed refcount/len: %+v", row)
 	}
 	if _, ok := pool.row(hDead); ok {
-		t.Error("мёртвая строка не удалена")
+		t.Error("the dead row not removed")
 	}
 	if got := compactPackSize(t, dir, 2); got != packHeaderLen+4+int64(len(liveBlock)) {
-		t.Errorf("новейший пак %d байт, want %d (заголовок + живой блок)",
+		t.Errorf("the newest pack %d bytes, want %d (header + live block)",
 			got, packHeaderLen+4+int64(len(liveBlock)))
 	}
 }
@@ -832,19 +832,19 @@ func TestCompactThreshold51(t *testing.T) {
 		t.Fatalf("CompactOnce: %v", err)
 	}
 	if stats != (CompactStats{Packs: 1}) {
-		t.Errorf("итог прохода %+v, want только просмотр одного пака", stats)
+		t.Errorf("pass result %+v, want only one pack visited", stats)
 	}
 	if got := compactPackSize(t, dir, 1); got != oldSize {
-		t.Errorf("пак изменён: %d байт, want %d", got, oldSize)
+		t.Errorf("the pack changed: %d bytes, want %d", got, oldSize)
 	}
 	if row, _ := pool.row(hLive); row.packID != 1 || row.off != offs[0] {
-		t.Errorf("живая строка переехала: %+v", row)
+		t.Errorf("the live row moved: %+v", row)
 	}
 	if _, ok := pool.row(hDead); !ok {
-		t.Error("мёртвая строка удалена преждевременно")
+		t.Error("the dead row removed prematurely")
 	}
 	if got := compactPackSize(t, dir, 2); got != packHeaderLen {
-		t.Errorf("новейший пак дописан: %d байт, want только заголовок", got)
+		t.Errorf("the newest pack appended: %d bytes, want the header only", got)
 	}
 }
 
@@ -859,7 +859,7 @@ func TestCompactPackRewrites(t *testing.T) {
 	pages := make(map[Hash][]byte)
 	var hashes []Hash
 	for i := 0; i < 5; i++ {
-		d := []byte(strings.Repeat(fmt.Sprintf("<p>страница %d прогона компактификации</p>", i), 8))
+		d := []byte(strings.Repeat(fmt.Sprintf("<p>page %d of the compaction run</p>", i), 8))
 		res, err := st.Put(ctx, d)
 		if err != nil {
 			t.Fatalf("Put(%d): %v", i, err)
@@ -880,13 +880,13 @@ func TestCompactPackRewrites(t *testing.T) {
 		t.Fatalf("CompactPack: %v", err)
 	}
 	if !res.Removed || res.FreedBytes != oldSize {
-		t.Errorf("итог %+v, want Removed и FreedBytes = %d", res, oldSize)
+		t.Errorf("result %+v, want Removed and FreedBytes = %d", res, oldSize)
 	}
 	if res.CopiedBlocks != 2 || res.Tombstones != 3 {
-		t.Errorf("итог %+v, want 2 переписанных блока и 3 мёртвые строки", res)
+		t.Errorf("result %+v, want 2 rewritten blocks and 3 dead rows", res)
 	}
 	if got := compactPackSize(t, st.opts.Dir, 1); got != 0 {
-		t.Errorf("старый пак существует (%d байт)", got)
+		t.Errorf("the old pack exists (%d bytes)", got)
 	}
 
 	var copiedBytes int64
@@ -897,17 +897,17 @@ func TestCompactPackRewrites(t *testing.T) {
 	for _, h := range hashes[:2] {
 		row, ok := pool.row(h)
 		if !ok {
-			t.Fatalf("живая строка %s исчезла", h)
+			t.Fatalf("the live row %s disappeared", h)
 		}
 		if row.packID != 2 {
 			t.Fatalf("%s: pack_id = %d, want 2", h, row.packID)
 		}
 		if prefix := binary.LittleEndian.Uint32(pack2[row.off-4 : row.off]); int32(prefix) != row.clen {
-			t.Errorf("%s: префикс длины %d не сходится с len %d", h, prefix, row.clen)
+			t.Errorf("%s: the length prefix %d does not match len %d", h, prefix, row.clen)
 		}
 		got, err := st.Get(ctx, h)
 		if err != nil || string(got) != string(pages[h]) {
-			t.Errorf("Get(%s) после компактификации: %v, совпадение = %v", h, err, string(got) == string(pages[h]))
+			t.Errorf("Get(%s) after compaction: %v, match = %v", h, err, string(got) == string(pages[h]))
 		}
 		copiedBytes += 4 + int64(row.clen)
 	}
@@ -916,23 +916,23 @@ func TestCompactPackRewrites(t *testing.T) {
 	}
 	for _, h := range hashes[2:] {
 		if _, ok := pool.row(h); ok {
-			t.Errorf("мёртвая строка %s не удалена", h)
+			t.Errorf("the dead row %s not removed", h)
 		}
 	}
 
 	// Writing after compaction goes into the newest pack, on top of the
 	// rewritten one.
-	after := []byte("<html>контент после компактификации</html>")
+	after := []byte("<html>content after compaction</html>")
 	ares, err := st.Put(ctx, after)
 	if err != nil {
-		t.Fatalf("Put после компактификации: %v", err)
+		t.Fatalf("Put after compaction: %v", err)
 	}
 	row, _ := pool.row(ares.Hash)
 	if row.packID != 2 {
-		t.Errorf("запись после компактификации пошла в пак %d, want 2", row.packID)
+		t.Errorf("the record after compaction went to pack %d, want 2", row.packID)
 	}
 	if got, err := st.Get(ctx, ares.Hash); err != nil || string(got) != string(after) {
-		t.Errorf("Get нового контента: %v", err)
+		t.Errorf("Get of the new content: %v", err)
 	}
 }
 
@@ -944,9 +944,9 @@ func TestCompactPackRewrites(t *testing.T) {
 // finishes the compaction.
 func TestCompactCrashBeforeCommit(t *testing.T) {
 	for name, fail := range map[string]func(*compactFakePool){
-		"Begin":  func(p *compactFakePool) { p.beginErr = errors.New("сбой Begin") },
-		"Exec":   func(p *compactFakePool) { p.txExecErr = errors.New("сбой Exec") },
-		"Commit": func(p *compactFakePool) { p.commitErr = errors.New("сбой Commit") },
+		"Begin":  func(p *compactFakePool) { p.beginErr = errors.New("Begin failure") },
+		"Exec":   func(p *compactFakePool) { p.txExecErr = errors.New("Exec failure") },
+		"Commit": func(p *compactFakePool) { p.commitErr = errors.New("Commit failure") },
 	} {
 		t.Run(name, func(t *testing.T) {
 			st, pool := newCompactTestStore(t, nil)
@@ -954,7 +954,7 @@ func TestCompactCrashBeforeCommit(t *testing.T) {
 			var hashes []Hash
 			pages := make(map[Hash][]byte)
 			for i := 0; i < 4; i++ {
-				d := []byte(strings.Repeat(fmt.Sprintf("<p>краш-окно %d</p>", i), 12))
+				d := []byte(strings.Repeat(fmt.Sprintf("<p>crash window %d</p>", i), 12))
 				res, err := st.Put(ctx, d)
 				if err != nil {
 					t.Fatal(err)
@@ -970,40 +970,40 @@ func TestCompactCrashBeforeCommit(t *testing.T) {
 
 			fail(pool)
 			if _, err := st.CompactPack(ctx, 1); err == nil {
-				t.Fatal("компактификация с упавшей транзакцией должна вернуть ошибку")
+				t.Fatal("compaction with a failing transaction must return an error")
 			}
 
 			// The state did not change: the old pack is intact, the rows are in
 			// place.
 			if got := compactPackSize(t, st.opts.Dir, 1); got == 0 {
-				t.Fatal("старый пак удалён при упавшей транзакции")
+				t.Fatal("the old pack removed with a failing transaction")
 			}
 			for _, h := range hashes[1:] {
 				if row, _ := pool.row(h); row.packID != 1 {
-					t.Fatalf("строка %s переехала без коммита", h)
+					t.Fatalf("row %s moved without a commit", h)
 				}
 				if got, err := st.Get(ctx, h); err != nil || string(got) != string(pages[h]) {
-					t.Fatalf("Get(%s) в краш-окне: %v", h, err)
+					t.Fatalf("Get(%s) in the crash window: %v", h, err)
 				}
 			}
 			if got := compactPackSize(t, st.opts.Dir, 2); got <= sizeBefore {
-				t.Errorf("новейший пак не вырос (%d ≤ %d) — блоки не переписывались", got, sizeBefore)
+				t.Errorf("the newest pack did not grow (%d ≤ %d) — no blocks were rewritten", got, sizeBefore)
 			}
 
 			// A repeated pass finishes the compaction.
 			pool.beginErr, pool.txExecErr, pool.commitErr = nil, nil, nil
 			res, err := st.CompactPack(ctx, 1)
 			if err != nil || !res.Removed {
-				t.Fatalf("повторная компактификация: %v, %+v", err, res)
+				t.Fatalf("a repeated compaction: %v, %+v", err, res)
 			}
 			for _, h := range hashes[1:] {
 				got, err := st.Get(ctx, h)
 				if err != nil || string(got) != string(pages[h]) {
-					t.Errorf("Get(%s) после повтора: %v", h, err)
+					t.Errorf("Get(%s) after the retry: %v", h, err)
 				}
 			}
 			if got := compactPackSize(t, st.opts.Dir, 1); got != 0 {
-				t.Errorf("старый пак не удалён: %d байт", got)
+				t.Errorf("the old pack not removed: %d bytes", got)
 			}
 		})
 	}
@@ -1018,7 +1018,7 @@ func TestCompactCrashAfterCommitBeforeDelete(t *testing.T) {
 	var hashes []Hash
 	pages := make(map[Hash][]byte)
 	for i := 0; i < 3; i++ {
-		d := []byte(strings.Repeat(fmt.Sprintf("<p>хвост коммита %d</p>", i), 15))
+		d := []byte(strings.Repeat(fmt.Sprintf("<p>commit tail %d</p>", i), 15))
 		res, err := st.Put(ctx, d)
 		if err != nil {
 			t.Fatal(err)
@@ -1044,10 +1044,10 @@ func TestCompactCrashAfterCommitBeforeDelete(t *testing.T) {
 	for _, h := range hashes {
 		got, err := st.Get(ctx, h)
 		if err != nil || string(got) != string(pages[h]) {
-			t.Fatalf("Get(%s) в состоянии «после коммита»: %v", h, err)
+			t.Fatalf("Get(%s) in the \"after commit\" state: %v", h, err)
 		}
 		if row, _ := pool.row(h); row.packID != 2 {
-			t.Fatalf("строка %s не на новых местах", h)
+			t.Fatalf("row %s is not at the new placements", h)
 		}
 	}
 
@@ -1056,14 +1056,14 @@ func TestCompactCrashAfterCommitBeforeDelete(t *testing.T) {
 		t.Fatalf("CompactOnce: %v", err)
 	}
 	if stats.Compacted != 1 {
-		t.Fatalf("итог прохода %+v, want 1 пак (файл-мусор удалён)", stats)
+		t.Fatalf("pass result %+v, want 1 pack (the junk file removed)", stats)
 	}
 	if got := compactPackSize(t, st.opts.Dir, 1); got != 0 {
-		t.Errorf("файл-мусор не удалён: %d байт", got)
+		t.Errorf("the junk file not removed: %d bytes", got)
 	}
 	for _, h := range hashes {
 		if got, err := st.Get(ctx, h); err != nil || string(got) != string(pages[h]) {
-			t.Errorf("Get(%s) после повтора: %v", h, err)
+			t.Errorf("Get(%s) after the retry: %v", h, err)
 		}
 	}
 }
@@ -1078,7 +1078,7 @@ func TestCompactConcurrentWriter(t *testing.T) {
 	ctx := context.Background()
 	var hashes []Hash
 	for i := 0; i < 10; i++ {
-		d := []byte(strings.Repeat(fmt.Sprintf("<p>старый контент %02d</p>", i), 10))
+		d := []byte(strings.Repeat(fmt.Sprintf("<p>old content %02d</p>", i), 10))
 		res, err := st.Put(ctx, d)
 		if err != nil {
 			t.Fatal(err)
@@ -1109,7 +1109,7 @@ func TestCompactConcurrentWriter(t *testing.T) {
 				return
 			default:
 			}
-			d := []byte(strings.Repeat(fmt.Sprintf("<p>горячая запись %05d</p>", i), 6))
+			d := []byte(strings.Repeat(fmt.Sprintf("<p>hot record %05d</p>", i), 6))
 			res, err := st.Put(wctx, d)
 			// Sending with an exit on cancellation: the main test reads the
 			// channel only after the writer stops.
@@ -1129,10 +1129,10 @@ func TestCompactConcurrentWriter(t *testing.T) {
 	wg.Wait()
 	close(puts)
 	if err != nil {
-		t.Fatalf("CompactPack с конкурентным писателем: %v", err)
+		t.Fatalf("CompactPack with a concurrent writer: %v", err)
 	}
 	if !res.Removed || res.CopiedBlocks != 2 {
-		t.Fatalf("итог %+v, want 2 переписанных блока и удалённый пак", res)
+		t.Fatalf("result %+v, want 2 rewritten blocks and a removed pack", res)
 	}
 
 	for p := range puts {
@@ -1142,11 +1142,11 @@ func TestCompactConcurrentWriter(t *testing.T) {
 			if errors.Is(p.err, context.Canceled) {
 				continue
 			}
-			t.Fatalf("конкурентный Put: %v", p.err)
+			t.Fatalf("concurrent Put: %v", p.err)
 		}
 		got, err := st.Get(ctx, p.h)
 		if err != nil || string(got) != string(p.d) {
-			t.Fatalf("Get конкурентного контента %s: %v", p.h, err)
+			t.Fatalf("Get of the concurrent content %s: %v", p.h, err)
 		}
 	}
 	// Old contents: the dead ones are invisible, the live ones are readable
@@ -1155,12 +1155,12 @@ func TestCompactConcurrentWriter(t *testing.T) {
 		_, err := st.Get(ctx, h)
 		if i < 8 {
 			if !errors.Is(err, ErrNotFound) {
-				t.Errorf("Get мёртвого %s: %v, want ErrNotFound", h, err)
+				t.Errorf("Get of the dead %s: %v, want ErrNotFound", h, err)
 			}
 			continue
 		}
 		if err != nil {
-			t.Errorf("Get живого %s: %v", h, err)
+			t.Errorf("Get of the live %s: %v", h, err)
 		}
 	}
 }
@@ -1186,7 +1186,7 @@ func TestCompactWriterSyncsToNewest(t *testing.T) {
 
 	// A writes first: pack 1; the content dies right away (compaction will
 	// take the whole pack).
-	x := []byte("<html>первый контент писателя A</html>")
+	x := []byte("<html>writer A first content</html>")
 	if _, err := a.Put(ctx, x); err != nil {
 		t.Fatal(err)
 	}
@@ -1197,16 +1197,16 @@ func TestCompactWriterSyncsToNewest(t *testing.T) {
 	compactCraftPack(t, dir, 2, nil)
 
 	// The lagging A must switch to pack 2.
-	z := []byte("<html>запись отстающего писателя</html>")
+	z := []byte("<html>a lagging writer record</html>")
 	zres, err := a.Put(ctx, z)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if row, _ := pool.row(zres.Hash); row.packID != 2 {
-		t.Fatalf("отстающий писатель дописал в пак %d, want 2 (всегда новейший)", row.packID)
+		t.Fatalf("the lagging writer appended to pack %d, want 2 (always the newest)", row.packID)
 	}
 
-	if _, err := b.Put(ctx, []byte("<html>контент писателя B</html>")); err != nil {
+	if _, err := b.Put(ctx, []byte("<html>writer B content</html>")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1215,13 +1215,13 @@ func TestCompactWriterSyncsToNewest(t *testing.T) {
 	if err != nil || !res.Removed {
 		t.Fatalf("CompactPack(1): %v, %+v", err, res)
 	}
-	w := []byte("<html>запись после удаления старого пака</html>")
+	w := []byte("<html>a record after the old pack removal</html>")
 	wres, err := a.Put(ctx, w)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if row, _ := pool.row(wres.Hash); row.packID != 2 {
-		t.Errorf("запись после удаления пошла в пак %d, want 2", row.packID)
+		t.Errorf("the record after the removal went to pack %d, want 2", row.packID)
 	}
 	for _, d := range [][]byte{z, w} {
 		if got, err := a.Get(ctx, HashOf(d)); err != nil || string(got) != string(d) {
@@ -1229,7 +1229,7 @@ func TestCompactWriterSyncsToNewest(t *testing.T) {
 		}
 	}
 	if _, err := a.Get(ctx, HashOf(x)); !errors.Is(err, ErrNotFound) {
-		t.Errorf("Get мёртвого контента: %v, want ErrNotFound", err)
+		t.Errorf("Get of the dead content: %v, want ErrNotFound", err)
 	}
 }
 
@@ -1240,18 +1240,18 @@ func TestCompactWriterSyncsToNewest(t *testing.T) {
 func TestCompactNewestNotCompacted(t *testing.T) {
 	st, _ := newCompactTestStore(t, nil)
 	ctx := context.Background()
-	if _, err := st.Put(ctx, []byte("единственный пак")); err != nil {
+	if _, err := st.Put(ctx, []byte("the only pack")); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := st.CompactPack(ctx, 1); !errors.Is(err, errCompactNewest) {
-		t.Errorf("CompactPack новейшего: %v, want errCompactNewest", err)
+		t.Errorf("CompactPack of the newest: %v, want errCompactNewest", err)
 	}
 	stats, err := CompactOnce(ctx, st, CompactOptions{})
 	if err != nil || stats != (CompactStats{}) {
-		t.Errorf("CompactOnce одного пака: %+v, %v, want пустой итог", stats, err)
+		t.Errorf("CompactOnce of one pack: %+v, %v, want an empty result", stats, err)
 	}
 	if got := compactPackSize(t, st.opts.Dir, 1); got == 0 {
-		t.Error("единственный пак удалён проходом")
+		t.Error("the only pack removed by the pass")
 	}
 }
 
@@ -1277,22 +1277,22 @@ func TestCompactOnceErrors(t *testing.T) {
 
 	stats, err := CompactOnce(context.Background(), st, CompactOptions{})
 	if err == nil {
-		t.Fatal("CompactOnce с битым паком: ожидалась ошибка")
+		t.Fatal("CompactOnce with a broken pack: an error expected")
 	}
 	if stats.Compacted != 1 || stats.Packs != 2 {
-		t.Fatalf("итог прохода %+v, want Packs 2 / Compacted 1 (битой пропущен)", stats)
+		t.Fatalf("pass result %+v, want Packs 2 / Compacted 1 (the broken one skipped)", stats)
 	}
 	if got := compactPackSize(t, dir, 1); got != 0 {
-		t.Errorf("пак 1 не удалён: %d", got)
+		t.Errorf("pack 1 not removed: %d", got)
 	}
 	if _, ok := pool.row(hDead); ok {
-		t.Error("мёртвая строка пака 1 не удалена")
+		t.Error("the pack 1 dead row not removed")
 	}
 	if got := compactPackSize(t, dir, 2); got == 0 {
-		t.Error("битый пак 2 удалён несмотря на ошибку скана")
+		t.Error("broken pack 2 removed despite the scan error")
 	}
 	if row, ok := pool.row(hLive); !ok || row.packID != 2 {
-		t.Errorf("живая строка битого пака изменена: %+v", row)
+		t.Errorf("the broken pack's live row changed: %+v", row)
 	}
 }
 
@@ -1323,45 +1323,45 @@ func TestCompactOnceFullDiskSkipsLivePacks(t *testing.T) {
 		bytes.Repeat([]byte("l"), 40),  // a live block
 		bytes.Repeat([]byte("d"), 400), // a dead block
 	})
-	compactCraftRow(t, pool, "живой контент полного диска", 1, offs[0], 40, 1)
-	compactCraftRow(t, pool, "мёртвый наполнитель", 1, offs[1], 400, 0)
+	compactCraftRow(t, pool, "full-disk live content", 1, offs[0], 40, 1)
+	compactCraftRow(t, pool, "dead filler", 1, offs[1], 400, 0)
 	compactCraftPack(t, dir, 2, nil) // pack 2 is the newest, pack 1 is closed
 	fullDisk(st)
 
 	stats, err := CompactOnce(ctx, st, CompactOptions{})
 	if err == nil {
-		t.Fatal("CompactOnce ниже порога места: ожидалась ошибка отложенного пака")
+		t.Fatal("CompactOnce below the space threshold: a postponed-pack error expected")
 	}
-	if !strings.Contains(err.Error(), "отложена") {
-		t.Errorf("ошибка прохода не про отложенный пак: %v", err)
+	if !strings.Contains(err.Error(), "postponed") {
+		t.Errorf("the pass error is not about the postponed pack: %v", err)
 	}
 	if stats.Compacted != 0 {
 		t.Errorf("Compacted = %d, want 0", stats.Compacted)
 	}
 	if got := compactPackSize(t, dir, 1); got == 0 {
-		t.Error("пак с живыми блоками тронут на полном диске")
+		t.Error("a pack with live blocks touched on a full disk")
 	}
 
 	// A pack of pure garbage is processed even on a full disk.
 	st2, pool2, dir2 := newStore(t)
 	fullDisk(st2)
-	h := HashOf([]byte("мёртвый контент полного диска"))
+	h := HashOf([]byte("full-disk dead content"))
 	offs2 := compactCraftPack(t, dir2, 1, [][]byte{bytes.Repeat([]byte("d"), 30)})
-	compactCraftRow(t, pool2, "мёртвый контент полного диска", 1, offs2[0], 30, 0)
+	compactCraftRow(t, pool2, "full-disk dead content", 1, offs2[0], 30, 0)
 	compactCraftPack(t, dir2, 2, nil)
 
 	stats2, err2 := CompactOnce(ctx, st2, CompactOptions{})
 	if err2 != nil {
-		t.Fatalf("CompactOnce пака без живых блоков на полном диске: %v", err2)
+		t.Fatalf("CompactOnce of a pack without live blocks on a full disk: %v", err2)
 	}
 	if stats2.Compacted != 1 {
-		t.Errorf("Compacted = %d, want 1 (мусор удаляется без копирования)", stats2.Compacted)
+		t.Errorf("Compacted = %d, want 1 (garbage removed without copying)", stats2.Compacted)
 	}
 	if got := compactPackSize(t, dir2, 1); got != 0 {
-		t.Error("пак без живых блоков не удалён на полном диске")
+		t.Error("a pack without live blocks was not removed on a full disk")
 	}
 	if _, ok := pool2.row(h); ok {
-		t.Error("мёртвая строка не удалена")
+		t.Error("the dead row not removed")
 	}
 }
 
@@ -1373,7 +1373,7 @@ func TestCompactLoop(t *testing.T) {
 	ctx := context.Background()
 	var hashes []Hash
 	for i := 0; i < 4; i++ {
-		d := []byte(strings.Repeat(fmt.Sprintf("<p>цикл компактификации %d</p>", i), 9))
+		d := []byte(strings.Repeat(fmt.Sprintf("<p>compaction loop %d</p>", i), 9))
 		res, err := st.Put(ctx, d)
 		if err != nil {
 			t.Fatal(err)
@@ -1392,7 +1392,7 @@ func TestCompactLoop(t *testing.T) {
 	// The first pass fails (a DB scan failure); after 30 ms the failure is
 	// lifted — the cycle's tick retries and succeeds: a pass error does not
 	// stop the cycle.
-	pool.queryErr = errors.New("сбой БД")
+	pool.queryErr = errors.New("DB failure")
 	time.AfterFunc(30*time.Millisecond, func() {
 		pool.mu.Lock()
 		defer pool.mu.Unlock()
@@ -1402,22 +1402,22 @@ func TestCompactLoop(t *testing.T) {
 		done <- CompactLoop(lctx, st, CompactOptions{Interval: 10 * time.Millisecond})
 	}()
 	compactWaitFor(t, func() bool { return compactPackSize(t, st.opts.Dir, 1) == 0 },
-		"компактификация в цикле")
+		"compaction in the loop")
 	if _, ok := pool.row(hashes[3]); !ok {
-		t.Fatal("живая строка потеряна циклом")
+		t.Fatal("the live row lost by the loop")
 	}
 	if got, err := st.Get(ctx, hashes[3]); err != nil || len(got) == 0 {
-		t.Errorf("Get живого контента после цикла: %v", err)
+		t.Errorf("Get of the live content after the loop: %v", err)
 	}
 
 	cancel()
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Errorf("CompactLoop после отмены: %v, want nil", err)
+			t.Errorf("CompactLoop after the cancel: %v, want nil", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("CompactLoop не завершился после отмены ctx")
+		t.Fatal("CompactLoop did not finish after the ctx cancel")
 	}
 }
 
@@ -1426,15 +1426,15 @@ func TestCompactLoop(t *testing.T) {
 func TestCompactOptionsDefaults(t *testing.T) {
 	o := CompactOptions{}.withDefaults()
 	if o.Interval != DefaultCompactInterval || o.Threshold != DefaultCompactThreshold {
-		t.Errorf("дефолты: %+v", o)
+		t.Errorf("defaults: %+v", o)
 	}
 	o = CompactOptions{Interval: -time.Second, Threshold: 2}.withDefaults()
 	if o.Interval != DefaultCompactInterval || o.Threshold != DefaultCompactThreshold {
-		t.Errorf("некорректные значения не заменены: %+v", o)
+		t.Errorf("malformed values not replaced: %+v", o)
 	}
 	o = CompactOptions{Interval: time.Minute, Threshold: 0.3}.withDefaults()
 	if o.Interval != time.Minute || o.Threshold != 0.3 {
-		t.Errorf("явные значения искажены: %+v", o)
+		t.Errorf("explicit values distorted: %+v", o)
 	}
 }
 
@@ -1444,6 +1444,6 @@ func TestCompactEmptyDir(t *testing.T) {
 	st, _ := newCompactTestStore(t, nil)
 	stats, err := CompactOnce(context.Background(), st, CompactOptions{})
 	if err != nil || stats != (CompactStats{}) {
-		t.Errorf("CompactOnce пустого каталога: %+v, %v", stats, err)
+		t.Errorf("CompactOnce of an empty directory: %+v, %v", stats, err)
 	}
 }

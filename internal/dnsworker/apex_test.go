@@ -66,7 +66,7 @@ func (f *apexFakeResolver) Exchange(ctx context.Context, q dnsclient.Question) (
 		f.onCall(len(f.calls))
 	}
 	if len(f.steps) == 0 {
-		return nil, fmt.Errorf("apexFakeResolver: сценарий исчерпан (вызов №%d: %s)", len(f.calls), q.Name)
+		return nil, fmt.Errorf("apexFakeResolver: the script exhausted (call #%d: %s)", len(f.calls), q.Name)
 	}
 	st := f.steps[0]
 	f.steps = f.steps[1:]
@@ -128,14 +128,14 @@ func TestCheckApexClassification(t *testing.T) {
 		wantNS     bool
 	}{
 		{
-			name:       "NXDOMAIN → not_delegated, субдомены не проверяются (RFC 8020)",
+			name:       "NXDOMAIN → not_delegated, subdomains are not checked (RFC 8020)",
 			steps:      []apexStep{apexReply(dnsclient.RCodeNXDOMAIN)},
 			wantStatus: ApexNotDelegated,
 			wantStop:   true,
 			wantCalls:  1,
 		},
 		{
-			name: "NOERROR с A — делегирован, адреса возвращены",
+			name: "NOERROR with A — delegated, the addresses returned",
 			steps: []apexStep{apexReply(dnsclient.RCodeNOERROR,
 				apexARR("example.com.", "192.0.2.10"),
 				apexARR("example.com.", "192.0.2.11"))},
@@ -145,7 +145,7 @@ func TestCheckApexClassification(t *testing.T) {
 			wantCalls:  1,
 		},
 		{
-			name: "NOERROR с CNAME и A (цепочку развернул рекурсор) — адреса есть",
+			name: "NOERROR with CNAME and A (the recursor expanded the chain) — addresses present",
 			steps: []apexStep{apexReply(dnsclient.RCodeNOERROR,
 				apexCNAME("example.com.", "edge.example.net."),
 				apexARR("edge.example.net.", "192.0.2.20"))},
@@ -155,7 +155,7 @@ func TestCheckApexClassification(t *testing.T) {
 			wantCalls:  1,
 		},
 		{
-			name: "NOERROR только CNAME без A — адресов нет, NS подтверждает зону",
+			name: "NOERROR with CNAME only, no A — no addresses, the NS confirms the zone",
 			steps: []apexStep{
 				apexReply(dnsclient.RCodeNOERROR, apexCNAME("example.com.", "edge.example.net.")),
 				apexReply(dnsclient.RCodeNOERROR, apexNSRR("example.com.", "ns1.example.com."))},
@@ -165,7 +165,7 @@ func TestCheckApexClassification(t *testing.T) {
 			wantNS:     true,
 		},
 		{
-			name: "NODATA + NS с записями — делегирован без адресов",
+			name: "NODATA + NS with records — delegated without addresses",
 			steps: []apexStep{
 				apexReply(dnsclient.RCodeNOERROR),
 				apexReply(dnsclient.RCodeNOERROR,
@@ -177,7 +177,7 @@ func TestCheckApexClassification(t *testing.T) {
 			wantNS:     true,
 		},
 		{
-			name: "NODATA + NS NODATA — имя существует (NOERROR), not_delegated только для NXDOMAIN",
+			name: "NODATA + NS NODATA — the name exists (NOERROR), not_delegated is for NXDOMAIN only",
 			steps: []apexStep{
 				apexReply(dnsclient.RCodeNOERROR),
 				apexReply(dnsclient.RCodeNOERROR)},
@@ -187,7 +187,7 @@ func TestCheckApexClassification(t *testing.T) {
 			wantNS:     true,
 		},
 		{
-			name: "NODATA + NS NXDOMAIN — свежий отказ, домена нет",
+			name: "NODATA + NS NXDOMAIN — a fresh denial, the domain does not exist",
 			steps: []apexStep{
 				apexReply(dnsclient.RCodeNOERROR),
 				apexReply(dnsclient.RCodeNXDOMAIN)},
@@ -207,7 +207,7 @@ func TestCheckApexClassification(t *testing.T) {
 			wantNS:     true,
 		},
 		{
-			name: "NODATA + NS сеть — temp_error",
+			name: "NODATA + NS network — temp_error",
 			steps: []apexStep{
 				apexReply(dnsclient.RCodeNOERROR),
 				apexFail(apexTimeoutErr{})},
@@ -217,42 +217,42 @@ func TestCheckApexClassification(t *testing.T) {
 			wantNS:     true,
 		},
 		{
-			name:       "SERVFAIL на A — temp_error, NS не запрашивается",
+			name:       "SERVFAIL on A — temp_error, NS is not queried",
 			steps:      []apexStep{apexReply(dnsclient.RCodeSERVFAIL)},
 			wantStatus: ApexTempError,
 			wantStop:   true,
 			wantCalls:  1,
 		},
 		{
-			name:       "REFUSED на A — заявление резолвера о себе, temp_error",
+			name:       "REFUSED on A — the resolver talking about itself, temp_error",
 			steps:      []apexStep{apexReply(dnsclient.RCodeREFUSED)},
 			wantStatus: ApexTempError,
 			wantStop:   true,
 			wantCalls:  1,
 		},
 		{
-			name:       "FORMERR на A — temp_error",
+			name:       "FORMERR on A — temp_error",
 			steps:      []apexStep{apexReply(dnsclient.RCodeFORMERR)},
 			wantStatus: ApexTempError,
 			wantStop:   true,
 			wantCalls:  1,
 		},
 		{
-			name:       "NOTIMP на A — temp_error",
+			name:       "NOTIMP on A — temp_error",
 			steps:      []apexStep{apexReply(dnsclient.RCodeNOTIMP)},
 			wantStatus: ApexTempError,
 			wantStop:   true,
 			wantCalls:  1,
 		},
 		{
-			name:       "неизвестный RCODE 11 на A — temp_error",
+			name:       "unknown RCODE 11 on A — temp_error",
 			steps:      []apexStep{apexReply(dnsclient.RCode(11))},
 			wantStatus: ApexTempError,
 			wantStop:   true,
 			wantCalls:  1,
 		},
 		{
-			name:       "таймаут на A после ретраев dnsclient — temp_error",
+			name:       "a timeout on A after the dnsclient retries — temp_error",
 			steps:      []apexStep{apexFail(apexTimeoutErr{})},
 			wantStatus: ApexTempError,
 			wantStop:   true,
@@ -264,28 +264,28 @@ func TestCheckApexClassification(t *testing.T) {
 			fake := &apexFakeResolver{steps: tc.steps}
 			res, err := CheckApex(context.Background(), fake, "example.com")
 			if err != nil {
-				t.Fatalf("CheckApex: неожиданная ошибка: %v", err)
+				t.Fatalf("CheckApex: an unexpected error: %v", err)
 			}
 			if res.Status != tc.wantStatus {
-				t.Errorf("Status = %v, ожидалось %v", res.Status, tc.wantStatus)
+				t.Errorf("Status = %v, expected %v", res.Status, tc.wantStatus)
 			}
 			if got := res.Status.Stop(); got != tc.wantStop {
-				t.Errorf("Stop = %v, ожидалось %v", got, tc.wantStop)
+				t.Errorf("Stop = %v, expected %v", got, tc.wantStop)
 			}
 			if res.NSQueried != tc.wantNS {
-				t.Errorf("NSQueried = %v, ожидалось %v", res.NSQueried, tc.wantNS)
+				t.Errorf("NSQueried = %v, expected %v", res.NSQueried, tc.wantNS)
 			}
 			if len(fake.calls) != tc.wantCalls {
-				t.Fatalf("обращений к резолверу %d, ожидалось %d (вопросы: %v)",
+				t.Fatalf("%d resolver calls, expected %d (questions: %v)",
 					len(fake.calls), tc.wantCalls, fake.calls)
 			}
 			want := tc.wantAddrs
 			if len(res.Addresses) != len(want) {
-				t.Fatalf("Addresses = %v, ожидалось %v", res.Addresses, want)
+				t.Fatalf("Addresses = %v, expected %v", res.Addresses, want)
 			}
 			for i := range want {
 				if res.Addresses[i] != want[i] {
-					t.Errorf("Addresses[%d] = %v, ожидалось %v", i, res.Addresses[i], want[i])
+					t.Errorf("Addresses[%d] = %v, expected %v", i, res.Addresses[i], want[i])
 				}
 			}
 		})
@@ -295,7 +295,7 @@ func TestCheckApexClassification(t *testing.T) {
 // --- question format: FQDN and types -------------------------------------------
 
 func TestCheckApexQuestionFormat(t *testing.T) {
-	t.Run("имя с точкой и без — один и тот же FQDN-вопрос A", func(t *testing.T) {
+	t.Run("a name with and without a dot — the same A FQDN question", func(t *testing.T) {
 		for _, name := range []string{"example.com", "example.com."} {
 			fake := &apexFakeResolver{steps: []apexStep{
 				apexReply(dnsclient.RCodeNOERROR, apexARR("example.com.", "192.0.2.1"))}}
@@ -303,18 +303,18 @@ func TestCheckApexQuestionFormat(t *testing.T) {
 				t.Fatalf("CheckApex(%q): %v", name, err)
 			}
 			if len(fake.calls) != 1 {
-				t.Fatalf("CheckApex(%q): обращений %d, ожидалось 1", name, len(fake.calls))
+				t.Fatalf("CheckApex(%q): %d calls, expected 1", name, len(fake.calls))
 			}
 			q := fake.calls[0]
 			if q.Name != "example.com." {
-				t.Errorf("CheckApex(%q): имя вопроса %q, ожидался FQDN \"example.com.\"", name, q.Name)
+				t.Errorf("CheckApex(%q): the question name %q, expected the FQDN \"example.com.\"", name, q.Name)
 			}
 			if q.Type != dns.TypeA {
-				t.Errorf("CheckApex(%q): тип вопроса %v, ожидался A", name, q.Type)
+				t.Errorf("CheckApex(%q): the question type %v, expected A", name, q.Type)
 			}
 		}
 	})
-	t.Run("NODATA — второй вопрос NS с тем же FQDN", func(t *testing.T) {
+	t.Run("NODATA — a second NS question with the same FQDN", func(t *testing.T) {
 		fake := &apexFakeResolver{steps: []apexStep{
 			apexReply(dnsclient.RCodeNOERROR),
 			apexReply(dnsclient.RCodeNOERROR, apexNSRR("example.com.", "ns1.example.com."))}}
@@ -322,24 +322,24 @@ func TestCheckApexQuestionFormat(t *testing.T) {
 			t.Fatalf("CheckApex: %v", err)
 		}
 		if len(fake.calls) != 2 {
-			t.Fatalf("обращений %d, ожидалось 2", len(fake.calls))
+			t.Fatalf("%d calls, expected 2", len(fake.calls))
 		}
 		q := fake.calls[1]
 		if q.Name != "example.com." {
-			t.Errorf("имя NS-вопроса %q, ожидался FQDN \"example.com.\"", q.Name)
+			t.Errorf("the NS question name %q, expected the FQDN \"example.com.\"", q.Name)
 		}
 		if q.Type != dns.TypeNS {
-			t.Errorf("тип вопроса %v, ожидался NS", q.Type)
+			t.Errorf("the question type %v, expected NS", q.Type)
 		}
 	})
-	t.Run("IDN-имя в punycode — без перекодирования", func(t *testing.T) {
+	t.Run("an IDN name in punycode — no re-encoding", func(t *testing.T) {
 		fake := &apexFakeResolver{steps: []apexStep{
 			apexReply(dnsclient.RCodeNOERROR, apexARR("xn--80adxhks.", "192.0.2.1"))}}
 		if _, err := CheckApex(context.Background(), fake, "xn--80adxhks"); err != nil {
 			t.Fatalf("CheckApex: %v", err)
 		}
 		if got := fake.calls[0].Name; got != "xn--80adxhks." {
-			t.Errorf("имя вопроса %q, ожидался punycode FQDN", got)
+			t.Errorf("the question name %q, expected a punycode FQDN", got)
 		}
 	})
 }
@@ -347,7 +347,7 @@ func TestCheckApexQuestionFormat(t *testing.T) {
 // --- addresses: composition and order ------------------------------------------
 
 func TestCheckApexAddresses(t *testing.T) {
-	t.Run("только валидные IPv4 из A, порядок ответа сохранён", func(t *testing.T) {
+	t.Run("only valid IPv4 from A, the answer order preserved", func(t *testing.T) {
 		bad := &dns.A{Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60}}
 		fake := &apexFakeResolver{steps: []apexStep{
 			apexReply(dnsclient.RCodeNOERROR,
@@ -361,18 +361,18 @@ func TestCheckApexAddresses(t *testing.T) {
 		}
 		want := apexAddrs("192.0.2.2", "192.0.2.1")
 		if len(res.Addresses) != len(want) {
-			t.Fatalf("Addresses = %v, ожидалось %v", res.Addresses, want)
+			t.Fatalf("Addresses = %v, expected %v", res.Addresses, want)
 		}
 		for i := range want {
 			if res.Addresses[i] != want[i] {
-				t.Errorf("Addresses[%d] = %v, ожидалось %v", i, res.Addresses[i], want[i])
+				t.Errorf("Addresses[%d] = %v, expected %v", i, res.Addresses[i], want[i])
 			}
 		}
 		if !res.Addresses[0].Is4() {
-			t.Errorf("адрес апекса обязан быть IPv4 (A-запись), получен %v", res.Addresses[0])
+			t.Errorf("the apex address must be IPv4 (an A record), got %v", res.Addresses[0])
 		}
 	})
-	t.Run("ветки без адресов возвращают пустой список", func(t *testing.T) {
+	t.Run("the no-address branches return an empty list", func(t *testing.T) {
 		for _, tc := range []struct {
 			name  string
 			steps []apexStep
@@ -387,7 +387,7 @@ func TestCheckApexAddresses(t *testing.T) {
 				t.Fatalf("%s: CheckApex: %v", tc.name, err)
 			}
 			if len(res.Addresses) != 0 {
-				t.Errorf("%s: Addresses = %v, ожидалось пусто", tc.name, res.Addresses)
+				t.Errorf("%s: Addresses = %v, expected empty", tc.name, res.Addresses)
 			}
 		}
 	})
@@ -410,53 +410,53 @@ func TestApexStatusStopAndDomainStatus(t *testing.T) {
 	}
 	for _, tc := range cases {
 		if got := tc.status.Stop(); got != tc.wantStop {
-			t.Errorf("%v.Stop() = %v, ожидалось %v", tc.status, got, tc.wantStop)
+			t.Errorf("%v.Stop() = %v, expected %v", tc.status, got, tc.wantStop)
 		}
 		dom, ok := tc.status.DomainStatus()
 		if ok != tc.wantDomOK || dom != tc.wantDom {
-			t.Errorf("%v.DomainStatus() = (%v, %v), ожидалось (%v, %v)",
+			t.Errorf("%v.DomainStatus() = (%v, %v), expected (%v, %v)",
 				tc.status, dom, ok, tc.wantDom, tc.wantDomOK)
 		}
 		if got := tc.status.String(); got != tc.wantStr {
-			t.Errorf("%v.String() = %q, ожидалось %q", tc.status, got, tc.wantStr)
+			t.Errorf("%v.String() = %q, expected %q", tc.status, got, tc.wantStr)
 		}
 	}
 	if got := ApexStatus(7).String(); got != "ApexStatus(7)" {
-		t.Errorf("String() неизвестного кода = %q", got)
+		t.Errorf("String() of an unknown code = %q", got)
 	}
 }
 
 // --- context cancellation -------------------------------------------------------
 
 func TestCheckApexContext(t *testing.T) {
-	t.Run("отмена до запроса — ошибка, резолвер не зовётся", func(t *testing.T) {
+	t.Run("a cancel before the query — an error, the resolver not called", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 		fake := &apexFakeResolver{}
 		res, err := CheckApex(ctx, fake, "example.com")
 		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("ошибка = %v, ожидалась context.Canceled", err)
+			t.Fatalf("error = %v, expected context.Canceled", err)
 		}
 		if res != nil {
-			t.Errorf("результат = %v, ожидался nil", res)
+			t.Errorf("the result = %v, expected nil", res)
 		}
 		if len(fake.calls) != 0 {
-			t.Errorf("обращений к резолверу %d, ожидалось 0", len(fake.calls))
+			t.Errorf("%d resolver calls, expected 0", len(fake.calls))
 		}
 	})
-	t.Run("прошедший дедлайн — DeadlineExceeded", func(t *testing.T) {
+	t.Run("a passed deadline — DeadlineExceeded", func(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 0)
 		defer cancel()
 		fake := &apexFakeResolver{}
 		res, err := CheckApex(ctx, fake, "example.com")
 		if !errors.Is(err, context.DeadlineExceeded) {
-			t.Fatalf("ошибка = %v, ожидалась context.DeadlineExceeded", err)
+			t.Fatalf("error = %v, expected context.DeadlineExceeded", err)
 		}
 		if res != nil {
-			t.Errorf("результат = %v, ожидался nil", res)
+			t.Errorf("the result = %v, expected nil", res)
 		}
 	})
-	t.Run("отмена на NS-запросе — ошибка, не temp_error", func(t *testing.T) {
+	t.Run("a cancel on the NS query — an error, not temp_error", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		fake := &apexFakeResolver{steps: []apexStep{
@@ -469,13 +469,13 @@ func TestCheckApexContext(t *testing.T) {
 		}
 		res, err := CheckApex(ctx, fake, "example.com")
 		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("ошибка = %v, ожидалась context.Canceled", err)
+			t.Fatalf("error = %v, expected context.Canceled", err)
 		}
 		if res != nil {
-			t.Errorf("результат = %v, ожидался nil", res)
+			t.Errorf("the result = %v, expected nil", res)
 		}
 	})
-	t.Run("ошибка Exchange без отмены ctx — temp_error, не ошибка", func(t *testing.T) {
+	t.Run("an Exchange error without a ctx cancel — temp_error, not an error", func(t *testing.T) {
 		// The resolver returned context.Canceled, but the caller's own
 		// ctx is alive: the classification goes by the state of the
 		// caller's context.
@@ -485,7 +485,7 @@ func TestCheckApexContext(t *testing.T) {
 			t.Fatalf("CheckApex: %v", err)
 		}
 		if res.Status != ApexTempError {
-			t.Errorf("Status = %v, ожидался ApexTempError", res.Status)
+			t.Errorf("Status = %v, expected ApexTempError", res.Status)
 		}
 	})
 }
@@ -497,13 +497,13 @@ func TestCheckApexEmptyDomain(t *testing.T) {
 		fake := &apexFakeResolver{}
 		res, err := CheckApex(context.Background(), fake, name)
 		if err == nil {
-			t.Errorf("CheckApex(%q): ожидалась ошибка, получен результат %v", name, res)
+			t.Errorf("CheckApex(%q): an error expected, got the result %v", name, res)
 		}
 		if res != nil {
-			t.Errorf("CheckApex(%q): результат = %v, ожидался nil", name, res)
+			t.Errorf("CheckApex(%q): the result = %v, expected nil", name, res)
 		}
 		if len(fake.calls) != 0 {
-			t.Errorf("CheckApex(%q): обращений к резолверу %d, ожидалось 0", name, len(fake.calls))
+			t.Errorf("CheckApex(%q): %d resolver calls, expected 0", name, len(fake.calls))
 		}
 	}
 }

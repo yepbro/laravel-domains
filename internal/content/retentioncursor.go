@@ -80,12 +80,12 @@ var (
 	// not exist (SQLSTATE 42P01, DB before migration 000020): a normal
 	// transient state of an old bench — persistence is disabled for the
 	// process.
-	errRetentionNoCursorTable = errors.New("content: retention: таблицы персистентного курсора нет (миграция 000020 не применена)")
+	errRetentionNoCursorTable = errors.New("content: retention: the persistent cursor table is missing (migration 000020 not applied)")
 
 	// errRetentionCursorInvalid — the saved state is invalid (a stamp in
 	// the future beyond the hourly allowance — a desync of manual SQL):
 	// start from the zero cursor, a Warn to the journal.
-	errRetentionCursorInvalid = errors.New("content: retention: сохранённый курсор некорректен (отметка в будущем)")
+	errRetentionCursorInvalid = errors.New("content: retention: the saved cursor is malformed (the stamp is in the future)")
 )
 
 // retentionCursorSkew — the allowed clock skew between the application and
@@ -112,24 +112,24 @@ func retentionLoadCursor(ctx context.Context, pool RetentionDB) (cur retentionCu
 		if retentionNoTable(err) {
 			return retentionCursor{}, false, errRetentionNoCursorTable
 		}
-		return retentionCursor{}, false, fmt.Errorf("content: retention: чтение персистентного курсора: %w", err)
+		return retentionCursor{}, false, fmt.Errorf("content: retention: reading the persistent cursor: %w", err)
 	}
 	defer rows.Close()
 	if !rows.Next() {
 		// A read failure first: a dropped connection is not "no row"
 		// (the retentionDebt style).
 		if err := rows.Err(); err != nil {
-			return retentionCursor{}, false, fmt.Errorf("content: retention: чтение персистентного курсора: %w", err)
+			return retentionCursor{}, false, fmt.Errorf("content: retention: reading the persistent cursor: %w", err)
 		}
 		return retentionCursor{}, false, nil
 	}
 	var variant int16
 	if err := rows.Scan(&cur.checkedAt, &cur.key.zone, &cur.key.domain, &cur.key.sub, &variant); err != nil {
-		return retentionCursor{}, false, fmt.Errorf("content: retention: чтение персистентного курсора: строка: %w", err)
+		return retentionCursor{}, false, fmt.Errorf("content: retention: reading the persistent cursor: row: %w", err)
 	}
 	cur.key.variant = variant
 	if err := rows.Err(); err != nil {
-		return retentionCursor{}, false, fmt.Errorf("content: retention: чтение персистентного курсора: %w", err)
+		return retentionCursor{}, false, fmt.Errorf("content: retention: reading the persistent cursor: %w", err)
 	}
 	if cur.checkedAt.IsZero() {
 		return retentionCursor{}, false, nil
@@ -149,7 +149,7 @@ func retentionSaveCursorTx(ctx context.Context, tx pgx.Tx, cur retentionCursor) 
 		if retentionNoTable(err) {
 			return errRetentionNoCursorTable
 		}
-		return fmt.Errorf("content: retention: сохранение курсора дренажа: %w", err)
+		return fmt.Errorf("content: retention: saving the drain cursor: %w", err)
 	}
 	return nil
 }
@@ -162,17 +162,17 @@ func retentionSaveCursorTx(ctx context.Context, tx pgx.Tx, cur retentionCursor) 
 func retentionResetCursor(ctx context.Context, pool RetentionDB) error {
 	tx, err := pool.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("content: retention: транзакция сброса курсора: %w", err)
+		return fmt.Errorf("content: retention: cursor reset transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	if _, err := tx.Exec(ctx, retentionCursorDeleteSQL); err != nil {
 		if retentionNoTable(err) {
 			return errRetentionNoCursorTable
 		}
-		return fmt.Errorf("content: retention: сброс персистентного курсора: %w", err)
+		return fmt.Errorf("content: retention: resetting the persistent cursor: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("content: retention: фиксация сброса курсора: %w", err)
+		return fmt.Errorf("content: retention: committing the cursor reset: %w", err)
 	}
 	return nil
 }

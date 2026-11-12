@@ -53,17 +53,17 @@ func HashOf(data []byte) Hash {
 var (
 	// ErrNotFound — Get/Delete: no content with this Hash exists — it was
 	// never written, or all references have already been removed by Delete.
-	ErrNotFound = errors.New("content: контент не найден")
+	ErrNotFound = errors.New("content: content not found")
 
 	// ErrStoreFull — Put: the store has reached its limit (disk overflow,
 	// spec 8). The data is neither written nor corrupted: the worker pauses
 	// content writing and raises an alert (T-046, T-080), retrying later.
-	ErrStoreFull = errors.New("content: хранилище переполнено")
+	ErrStoreFull = errors.New("content: the store is full")
 
 	// ErrTooLarge — Put: content larger than the max_store_bytes limit —
 	// "max stored HTML size" (spec 5.5, 5.10). Rejected as a whole;
 	// the worker keeps the result without content (T-056).
-	ErrTooLarge = errors.New("content: контент больше лимита хранения")
+	ErrTooLarge = errors.New("content: content exceeds the storage limit")
 
 	// ErrCorrupted — Get: the metadata row is alive but its block is
 	// unreadable (loss/corruption of pack bytes: disk failure, interrupted
@@ -71,7 +71,7 @@ var (
 	// reading does not mask corruption as "never written", and compaction
 	// purges such blocks (the row is marked dead, the pack is freed) —
 	// after that Get answers ErrNotFound.
-	ErrCorrupted = errors.New("content: контент повреждён")
+	ErrCorrupted = errors.New("content: content corrupted")
 )
 
 // PutResult is the outcome of Put: the key for subdomain_results.content_hash

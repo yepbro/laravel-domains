@@ -69,11 +69,11 @@ func (r *retentionRows) Next() bool {
 
 func (r *retentionRows) Scan(dest ...any) error {
 	if r.closed || r.i == 0 || r.i > len(r.rows) {
-		return errors.New("retentionRows: Scan без Next")
+		return errors.New("retentionRows: Scan without Next")
 	}
 	row := r.rows[r.i-1]
 	if len(dest) != len(row) {
-		return fmt.Errorf("retentionRows: приёмников %d, колонок %d", len(dest), len(row))
+		return fmt.Errorf("retentionRows: %d destinations, %d columns", len(dest), len(row))
 	}
 	for i, d := range dest {
 		target := reflect.ValueOf(d).Elem()
@@ -210,13 +210,13 @@ func newRetentionFakePool(now time.Time) *retentionFakePool {
 var _ RetentionDB = (*retentionFakePool)(nil)
 
 func (p *retentionFakePool) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFromSource) (int64, error) {
-	return 0, errors.New("CopyFrom не должен вызываться")
+	return 0, errors.New("CopyFrom must not be called")
 }
 
 // The retention pool path uses no Exec — all statements go inside a
 // transaction.
 func (p *retentionFakePool) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
-	return pgconn.CommandTag{}, errors.New("Exec через пул не должен вызываться")
+	return pgconn.CommandTag{}, errors.New("Exec via the pool must not be called")
 }
 
 // cutoff — the aging boundary "now() − interval" (Duration.String()
@@ -224,7 +224,7 @@ func (p *retentionFakePool) Exec(context.Context, string, ...any) (pgconn.Comman
 func (p *retentionFakePool) cutoff(interval string) time.Time {
 	d, err := time.ParseDuration(interval)
 	if err != nil {
-		panic("retention fake: некорректный interval " + interval)
+		panic("retention fake: malformed interval " + interval)
 	}
 	return p.now.Add(-d)
 }
@@ -347,7 +347,7 @@ func (p *retentionFakePool) Query(_ context.Context, sql string, args ...any) (p
 		return retentionResultRows(rows...), nil
 
 	default:
-		return nil, fmt.Errorf("retention fake: неожидаемый SELECT %q", sql)
+		return nil, fmt.Errorf("retention fake: unexpected SELECT %q", sql)
 	}
 }
 
@@ -573,7 +573,7 @@ func (t *retentionFakeTx) Query(ctx context.Context, sql string, args ...any) (p
 		return retentionResultRows(out...), nil
 
 	default:
-		return nil, fmt.Errorf("retention fake: неожидаемый tx-SELECT %q", sql)
+		return nil, fmt.Errorf("retention fake: unexpected tx-SELECT %q", sql)
 	}
 }
 
@@ -637,7 +637,7 @@ func (t *retentionFakeTx) Exec(_ context.Context, sql string, args ...any) (pgco
 		t.deletedCursor = true
 		return pgconn.NewCommandTag("DELETE 1"), nil
 	default:
-		return pgconn.CommandTag{}, fmt.Errorf("retention fake: неожидаемый tx-Exec %q", sql)
+		return pgconn.CommandTag{}, fmt.Errorf("retention fake: unexpected tx-Exec %q", sql)
 	}
 }
 
@@ -783,34 +783,34 @@ func TestRetentionOnce_Selection(t *testing.T) {
 		t.Fatalf("RetentionOnce: %v", err)
 	}
 	if stats.Rows != 2 || stats.Refs != 2 || stats.Contents != 2 || stats.FreedBytes != 2*7000 {
-		t.Fatalf("stats = %+v, want Rows=2 Refs=2 Contents=2 FreedBytes=14000 (домены 10 и 40)", stats)
+		t.Fatalf("stats = %+v, want Rows=2 Refs=2 Contents=2 FreedBytes=14000 (domains 10 and 40)", stats)
 	}
 	if stats.BadHashes != 0 || stats.Missing != 0 || stats.Skipped {
-		t.Errorf("аномалий быть не должно: %+v", stats)
+		t.Errorf("there must be no anomalies: %+v", stats)
 	}
 	for _, dom := range []int64{10, 40} {
 		r := pool.row(retentionKey{zone: 1, domain: dom, sub: 0, variant: 0})
 		if r == nil || r.hash != nil || r.jsonb {
-			t.Errorf("домен %d: запись не очищена: %+v", dom, r)
+			t.Errorf("domain %d: the record not purged: %+v", dom, r)
 		}
 	}
 	for _, dom := range []int64{20, 30, 50, 60} {
 		r := pool.row(retentionKey{zone: 1, domain: dom, sub: 0, variant: 0})
 		if r == nil || r.hash == nil || !r.jsonb {
-			t.Errorf("домен %d: запись обязана остаться нетронутой: %+v", dom, r)
+			t.Errorf("domain %d: the record must stay untouched: %+v", dom, r)
 		}
 	}
 	if _, ok := pool.contents[retentionHash(0xAA)]; ok {
-		t.Error("contents 0xAA (refcount 1 → 0) обязан быть удалён")
+		t.Error("contents 0xAA (refcount 1 → 0) must be removed")
 	}
 	if c, ok := pool.contents[retentionHash(0xBB)]; !ok || c.refc != 1 {
-		t.Errorf("contents 0xBB (находка) тронут: %+v", c)
+		t.Errorf("contents 0xBB (a find) touched: %+v", c)
 	}
 	if c, ok := pool.contents[retentionHash(0xCC)]; !ok || c.refc != 1 {
-		t.Errorf("contents 0xCC (render_pending) тронут: %+v", c)
+		t.Errorf("contents 0xCC (render_pending) touched: %+v", c)
 	}
 	if c, ok := pool.contents[retentionHash(0xFF)]; !ok || c.refc != 1 {
-		t.Errorf("contents 0xFF (свежая) тронут: %+v", c)
+		t.Errorf("contents 0xFF (fresh) touched: %+v", c)
 	}
 }
 
@@ -827,11 +827,11 @@ func TestRetentionOnce_OnlyJSONB(t *testing.T) {
 	}
 	r := pool.row(retentionKey{zone: 1, domain: 10, sub: 0, variant: 0})
 	if r == nil || r.jsonb {
-		t.Errorf("запись без контента: jsonb не зачищен: %+v", r)
+		t.Errorf("a record without content: the jsonb not trimmed: %+v", r)
 	}
 	for h, c := range pool.contents {
 		if c.refc != 1 {
-			t.Errorf("contents %x: refcount изменился без ссылки: %+v", h[:2], c)
+			t.Errorf("contents %x: the refcount changed without a reference: %+v", h[:2], c)
 		}
 	}
 }
@@ -849,10 +849,10 @@ func TestRetentionOnce_AlreadyClean(t *testing.T) {
 		t.Fatalf("RetentionOnce: %v", err)
 	}
 	if stats.Rows != 0 || stats.Batches != 0 {
-		t.Errorf("stats = %+v, want пустой проход", stats)
+		t.Errorf("stats = %+v, want an empty pass", stats)
 	}
 	if len(pool.queries) != 1 || pool.begins != 1 {
-		t.Errorf("обращений = %d (транзакций %d), want один SELECT в tx-оболочке закрепления", len(pool.queries), pool.begins)
+		t.Errorf("calls = %d (transactions %d), want one SELECT in the pinning tx wrapper", len(pool.queries), pool.begins)
 	}
 }
 
@@ -878,11 +878,11 @@ func TestRetentionOnce_SQLContract(t *testing.T) {
 		t.Fatalf("RetentionOnce: %v", err)
 	}
 	if len(pool.queries) != 1 {
-		t.Fatalf("SELECT'ов дренажа = %d, want 1 (одна неполная пачка; чтение счётчика долга не в счёт)", len(pool.queries))
+		t.Fatalf("drain SELECTs = %d, want 1 (one incomplete batch; the debt counter read does not count)", len(pool.queries))
 	}
 	sel := pool.queries[0]
 	if sel.sql != retentionSelectSQL {
-		t.Errorf("SQL выборки изменён")
+		t.Errorf("the selection SQL changed")
 	}
 	wantArgs := []any{
 		DefaultRetention.String(),
@@ -890,7 +890,7 @@ func TestRetentionOnce_SQLContract(t *testing.T) {
 		100,
 	}
 	if !reflect.DeepEqual(sel.args, wantArgs) {
-		t.Errorf("args выборки = %v, want %v", sel.args, wantArgs)
+		t.Errorf("selection args = %v, want %v", sel.args, wantArgs)
 	}
 
 	// The pinning wrapper (T-271): the first transaction is SET LOCAL ×5 +
@@ -905,10 +905,10 @@ func TestRetentionOnce_SQLContract(t *testing.T) {
 		retentionPlanNoMergeJoinSQL != "SET LOCAL enable_mergejoin = off" ||
 		retentionPlanNoBitmapScanSQL != "SET LOCAL enable_bitmapscan = off" ||
 		retentionSelectTimeoutFmt != "SET LOCAL statement_timeout = '%dms'" {
-		t.Fatalf("тексты закрепления плана изменены (контракт интеграционного EXPLAIN-теста)")
+		t.Fatalf("the plan pinning texts changed (the integration EXPLAIN test contract)")
 	}
 	if len(pool.txs) != 2 {
-		t.Fatalf("транзакций = %d, want 2 (tx-оболочка выборки + tx чистки пачки)", len(pool.txs))
+		t.Fatalf("transactions = %d, want 2 (the selection tx wrapper + the batch purge tx)", len(pool.txs))
 	}
 	pin := pool.txs[0]
 	wantOrder := []string{
@@ -920,56 +920,56 @@ func TestRetentionOnce_SQLContract(t *testing.T) {
 		retentionSelectSQL,
 	}
 	if len(pin.calls) != len(wantOrder) {
-		t.Fatalf("операторов tx-оболочки = %d, want %d (SET LOCAL ×5 + SELECT): %v", len(pin.calls), len(wantOrder), pin.calls)
+		t.Fatalf("tx wrapper statements = %d, want %d (SET LOCAL ×5 + SELECT): %v", len(pin.calls), len(wantOrder), pin.calls)
 	}
 	for i, sql := range wantOrder {
 		if pin.calls[i].sql != sql {
-			t.Errorf("шаг %d tx-оболочки = %s, want %s (порядок SET LOCAL ×5 → SELECT)", i, pin.calls[i].sql, sql)
+			t.Errorf("tx wrapper step %d = %s, want %s (the SET LOCAL ×5 → SELECT order)", i, pin.calls[i].sql, sql)
 		}
 	}
 	if !pin.committed || pin.rolledBack {
-		t.Errorf("tx-оболочка: committed=%v rolledBack=%v, want фиксация без отката", pin.committed, pin.rolledBack)
+		t.Errorf("tx wrapper: committed=%v rolledBack=%v, want a commit without rollback", pin.committed, pin.rolledBack)
 	}
 	if pool.txs[1].committed != true {
-		t.Error("транзакция чистки пачки не зафиксирована")
+		t.Error("the batch purge transaction not committed")
 	}
 
 	if len(pool.txCalls) != 3 {
-		t.Fatalf("операторов транзакции = %d, want 3 (purge, decref, delete)", len(pool.txCalls))
+		t.Fatalf("transaction statements = %d, want 3 (purge, decref, delete)", len(pool.txCalls))
 	}
 	purge := pool.txCalls[0]
 	if purge.sql != retentionPurgeSQL {
-		t.Errorf("SQL purge изменён")
+		t.Errorf("the purge SQL changed")
 	}
 	if !reflect.DeepEqual(purge.args[:5], []any{
 		[]int16{1, 1}, []int64{10, 40}, []int16{0, 0}, []int16{0, 0},
 		[][]byte{retentionHash16(0xAA), retentionHash16(0xDD)},
 	}) {
-		t.Errorf("args purge (ключи/хэши) = %v", purge.args[:5])
+		t.Errorf("purge args (keys/hashes) = %v", purge.args[:5])
 	}
 	if purge.args[5] != DefaultRetention.String() {
-		t.Errorf("граница purge = %v, want %s", purge.args[5], DefaultRetention)
+		t.Errorf("the purge boundary = %v, want %s", purge.args[5], DefaultRetention)
 	}
 
 	decref := pool.txCalls[1]
 	if decref.sql != retentionDecrefSQL {
-		t.Errorf("SQL decref изменён")
+		t.Errorf("the decref SQL changed")
 	}
 	if !reflect.DeepEqual(decref.args, []any{
 		[][]byte{retentionHash16(0xAA), retentionHash16(0xDD)},
 		[]int32{1, 1},
 	}) {
-		t.Errorf("args decref = %v (хэши отсортированы, счётчики по ссылкам)", decref.args)
+		t.Errorf("decref args = %v (hashes sorted, counters per reference)", decref.args)
 	}
 
 	del := pool.txCalls[2]
 	if del.sql != retentionDeleteSQL {
-		t.Errorf("SQL delete изменён")
+		t.Errorf("the delete SQL changed")
 	}
 	if !reflect.DeepEqual(del.args, []any{
 		[][]byte{retentionHash16(0xAA), retentionHash16(0xDD)},
 	}) {
-		t.Errorf("args delete = %v (оба refcount дошли до нуля)", del.args)
+		t.Errorf("delete args = %v (both refcounts reached zero)", del.args)
 	}
 }
 
@@ -982,17 +982,17 @@ func TestRetentionOnce_SQLContract(t *testing.T) {
 func TestRetentionOnce_PlanError(t *testing.T) {
 	now := time.Date(2026, 11, 8, 20, 43, 0, 0, time.UTC)
 	pool := retentionSeedPool(now)
-	pool.planErr = errors.New("потеря соединения: unexpected EOF")
+	pool.planErr = errors.New("connection loss: unexpected EOF")
 
 	if _, err := RetentionOnce(context.Background(), pool, retentionDefaultOpts()); err == nil ||
-		!strings.Contains(err.Error(), "закрепление плана") {
-		t.Fatalf("ошибка = %v, want контекст закрепления плана", err)
+		!strings.Contains(err.Error(), "pinning the plan") {
+		t.Fatalf("error = %v, want the plan pinning context", err)
 	}
 	if len(pool.queries) != 0 {
-		t.Errorf("SELECT'ов = %d, want 0 (закрепление упало до выборки)", len(pool.queries))
+		t.Errorf("SELECTs = %d, want 0 (the pinning failed before the selection)", len(pool.queries))
 	}
 	if len(pool.txCalls) != 0 {
-		t.Errorf("операторов чистки = %d, want 0", len(pool.txCalls))
+		t.Errorf("purge statements = %d, want 0", len(pool.txCalls))
 	}
 }
 
@@ -1008,8 +1008,8 @@ func TestRetentionOnce_SelectCtxTimeout(t *testing.T) {
 	opts.SelectTimeout = 40 * time.Millisecond
 	if _, err := RetentionOnce(context.Background(), pool, opts); err == nil ||
 		!errors.Is(err, context.DeadlineExceeded) ||
-		!strings.Contains(err.Error(), "выборка кандидатов") {
-		t.Fatalf("ошибка = %v, want обёрнутый context.DeadlineExceeded «выборка кандидатов»", err)
+		!strings.Contains(err.Error(), "candidate selection") {
+		t.Fatalf("error = %v, want a wrapped context.DeadlineExceeded \"candidate selection\"", err)
 	}
 }
 
@@ -1022,7 +1022,7 @@ func TestRetentionSelectGate(t *testing.T) {
 	pool := retentionSeedPool(time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC))
 	gate := make(db.ScanGate, 1)
 	if err := gate.Acquire(context.Background()); err != nil {
-		t.Fatalf("занятие гейта тестом: %v", err)
+		t.Fatalf("the test holding the gate: %v", err)
 	}
 	opts := retentionDefaultOpts()
 	opts.Gate = gate
@@ -1034,23 +1034,23 @@ func TestRetentionSelectGate(t *testing.T) {
 	}()
 	select {
 	case err := <-done:
-		t.Fatalf("выборка прошла под занятым гейтом: %v", err)
+		t.Fatalf("the selection proceeded under a held gate: %v", err)
 	case <-time.After(50 * time.Millisecond):
 	}
 	pool.mu.Lock()
 	begins := pool.begins
 	pool.mu.Unlock()
 	if begins != 0 {
-		t.Fatalf("Begin под занятым гейтом: транзакций %d, want 0 (гейт до Begin)", begins)
+		t.Fatalf("Begin under a held gate: %d transactions, want 0 (the gate before Begin)", begins)
 	}
 	gate.Release()
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Fatalf("выборка после освобождения гейта: %v", err)
+			t.Fatalf("the selection after the gate release: %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("выборка не прошла после освобождения гейта")
+		t.Fatal("the selection did not proceed after the gate release")
 	}
 }
 
@@ -1063,7 +1063,7 @@ func TestRetentionLoop_Backoff(t *testing.T) {
 	var buf bytes.Buffer
 	pool := retentionSeedPool(time.Date(2026, 11, 8, 20, 43, 0, 0, time.UTC))
 	pool.mu.Lock()
-	pool.selectErr = errors.New("потеря соединения: unexpected EOF")
+	pool.selectErr = errors.New("connection loss: unexpected EOF")
 	pool.mu.Unlock()
 	opts := RetentionOptions{
 		Retention:    DefaultRetention,
@@ -1087,7 +1087,7 @@ func TestRetentionLoop_Backoff(t *testing.T) {
 	time.Sleep(80 * time.Millisecond)
 	if n := passes(); n != 1 {
 		cancel()
-		t.Fatalf("проходов за паузу backoff = %d, want 1 (только стартовый; без backoff ~8)", n)
+		t.Fatalf("passes during the backoff pause = %d, want 1 (the starting one only; ~8 without the backoff)", n)
 	}
 	// The error is lifted: the pause tick retries the pass, and a success
 	// returns the regular interval — the passes continue.
@@ -1100,7 +1100,7 @@ func TestRetentionLoop_Backoff(t *testing.T) {
 	}
 	if n := passes(); n < 3 {
 		cancel()
-		t.Fatalf("проходов после паузы = %d, want ≥3 (успех возвращает штатный интервал)", n)
+		t.Fatalf("passes after the pause = %d, want ≥3 (success restores the regular interval)", n)
 	}
 	// The log is read only after the cycle stops: the cycle goroutine
 	// writes into the same buffer (review of T-271 P2-1 — bytes.Buffer is
@@ -1109,10 +1109,10 @@ func TestRetentionLoop_Backoff(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
-		t.Fatal("цикл не завершился после отмены ctx")
+		t.Fatal("the loop did not finish after the ctx cancel")
 	}
 	if !strings.Contains(buf.String(), "level=WARN") {
-		t.Errorf("лог = %q, want Warn ошибочного прохода", buf.String())
+		t.Errorf("log = %q, want the failed pass Warn", buf.String())
 	}
 }
 
@@ -1129,7 +1129,7 @@ func TestRetentionLoop_Backoff(t *testing.T) {
 func TestRetentionLoop_BackoffEveryErrorResetsTicker(t *testing.T) {
 	pool := retentionSeedPool(time.Date(2026, 11, 9, 14, 13, 0, 0, time.UTC))
 	pool.mu.Lock()
-	pool.selectErr = errors.New("content: retention: выборка кандидатов: timeout: context deadline exceeded")
+	pool.selectErr = errors.New("content: retention: candidate selection: timeout: context deadline exceeded")
 	pool.selectDelay = 150 * time.Millisecond
 	pool.mu.Unlock()
 	opts := RetentionOptions{
@@ -1163,10 +1163,10 @@ func TestRetentionLoop_BackoffEveryErrorResetsTicker(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
-		t.Fatal("цикл не завершился после отмены ctx")
+		t.Fatal("the loop did not finish after the ctx cancel")
 	}
 	if len(starts) < 3 {
-		t.Fatalf("стартов прохода = %d, want ≥3 (стартовый + два повторных)", len(starts))
+		t.Fatalf("pass starts = %d, want ≥3 (the starting one + two retries)", len(starts))
 	}
 	// The gap between the starts ≥ pass (150 ms) + backoff (500 ms) − a
 	// scheduler margin (50 ms). The old semantics gave exactly the backoff
@@ -1175,7 +1175,7 @@ func TestRetentionLoop_BackoffEveryErrorResetsTicker(t *testing.T) {
 	const minGap = 150 + 500 - 50
 	for i := 1; i < len(starts); i++ {
 		if gap := starts[i].Sub(starts[i-1]); gap < minGap*time.Millisecond {
-			t.Errorf("пауза между проходами %d→%d = %v, want ≥ %v (проход + backoff: reset после каждой ошибки)",
+			t.Errorf("the pause between passes %d→%d = %v, want ≥ %v (pass + backoff: reset after each error)",
 				i-1, i, gap, minGap*time.Millisecond)
 		}
 	}
@@ -1189,7 +1189,7 @@ func TestRetentionLoop_BackoffEveryErrorResetsTicker(t *testing.T) {
 func TestRetentionLoop_OnError(t *testing.T) {
 	pool := retentionSeedPool(time.Date(2026, 11, 9, 14, 13, 0, 0, time.UTC))
 	pool.mu.Lock()
-	pool.selectErr = errors.New("потеря соединения: unexpected EOF")
+	pool.selectErr = errors.New("connection loss: unexpected EOF")
 	pool.mu.Unlock()
 
 	errs := make(chan error, 16)
@@ -1229,7 +1229,7 @@ func TestRetentionLoop_OnError(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
-		t.Fatal("цикл не завершился после отмены ctx")
+		t.Fatal("the loop did not finish after the ctx cancel")
 	}
 	close(errs)
 	n := 0
@@ -1242,10 +1242,10 @@ func TestRetentionLoop_OnError(t *testing.T) {
 	// error active (+1 — a pass that started before the error was lifted
 	// but read it later); successful passes add no hook calls.
 	if n < errored || n > errored+1 {
-		t.Fatalf("вызовов OnError = %d, want %d..%d (по одному на каждый неудачный проход)", n, errored, errored+1)
+		t.Fatalf("OnError calls = %d, want %d..%d (one per failed pass)", n, errored, errored+1)
 	}
 	if last == nil || !strings.Contains(last.Error(), "unexpected EOF") {
-		t.Errorf("OnError получил %v, want ошибку прохода", last)
+		t.Errorf("OnError received %v, want the pass error", last)
 	}
 }
 
@@ -1271,7 +1271,7 @@ func TestRetentionOnce_DedupAggregation(t *testing.T) {
 		t.Fatalf("stats = %+v, want Refs=2 Contents=1 FreedBytes=5000", stats)
 	}
 	if _, ok := pool.contents[retentionHash(0x11)]; ok {
-		t.Error("contents с refcount 2 и двумя срезанными ссылками обязан быть удалён")
+		t.Error("contents with refcount 2 and two trimmed references must be removed")
 	}
 }
 
@@ -1301,18 +1301,18 @@ func TestRetentionOnce_ClampDesync(t *testing.T) {
 
 	stats, err := RetentionOnce(context.Background(), pool, retentionDefaultOpts())
 	if err != nil {
-		t.Fatalf("RetentionOnce при рассинхроне: %v", err)
+		t.Fatalf("RetentionOnce on a desync: %v", err)
 	}
 	if stats.Refs != 2 || stats.Contents != 1 || stats.FreedBytes != 5000 {
-		t.Fatalf("stats = %+v, want Refs=2 Contents=1 FreedBytes=5000 (клэмп 1−2 → 0, строка удалена)", stats)
+		t.Fatalf("stats = %+v, want Refs=2 Contents=1 FreedBytes=5000 (clamp 1−2 → 0, the row removed)", stats)
 	}
 	if c, ok := pool.contents[retentionHash(0x22)]; ok {
-		t.Errorf("contents после клэмпа = %+v, want удалена (refcount дошёл до нуля)", c)
+		t.Errorf("contents after the clamp = %+v, want removed (the refcount reached zero)", c)
 	}
 	for _, sub := range []int16{0, 1} {
 		r := pool.row(retentionKey{zone: 1, domain: 10, sub: sub, variant: 0})
 		if r == nil || r.hash != nil {
-			t.Errorf("запись sub=%d не очищена: %+v", sub, r)
+			t.Errorf("record sub=%d not purged: %+v", sub, r)
 		}
 	}
 }
@@ -1331,10 +1331,10 @@ func TestRetentionOnce_SharedContentLives(t *testing.T) {
 		t.Fatalf("RetentionOnce: %v", err)
 	}
 	if stats.Contents != 1 {
-		t.Fatalf("Contents = %d, want 1 (только 0xDD домена 40)", stats.Contents)
+		t.Fatalf("Contents = %d, want 1 (only 0xDD of domain 40)", stats.Contents)
 	}
 	if c, ok := pool.contents[retentionHash(0xAA)]; !ok || c.refc != 1 {
-		t.Errorf("contents 0xAA после decref = %+v (ok=%v), want refcount 1 (ссылка свежей записи жива)", c, ok)
+		t.Errorf("contents 0xAA after the decref = %+v (ok=%v), want refcount 1 (the fresh record's reference is alive)", c, ok)
 	}
 }
 
@@ -1353,18 +1353,18 @@ func TestRetentionOnce_BadHashes(t *testing.T) {
 		t.Fatalf("RetentionOnce: %v", err)
 	}
 	if stats.BadHashes != 1 || stats.Refs != 2 || stats.Rows != 2 {
-		t.Fatalf("stats = %+v, want BadHashes=1 при Rows=Refs=2", stats)
+		t.Fatalf("stats = %+v, want BadHashes=1 with Rows=Refs=2", stats)
 	}
 	if len(pool.txCalls) != 3 {
-		t.Fatalf("операторов = %d, want 3 (purge, decref и delete только по валидному 0xDD)", len(pool.txCalls))
+		t.Fatalf("statements = %d, want 3 (purge, decref and delete only for the valid 0xDD)", len(pool.txCalls))
 	}
 	decref := pool.txCalls[1]
 	hashes := decref.args[0].([][]byte)
 	if len(hashes) != 1 || !retentionBytesEqual(hashes[0], retentionHash16(0xDD)) {
-		t.Errorf("decref по хэшам %v, want только валидный 0xDD", hashes)
+		t.Errorf("decref over hashes %v, want only the valid 0xDD", hashes)
 	}
 	if r := pool.row(retentionKey{zone: 1, domain: 10, sub: 0, variant: 0}); r.hash != nil {
-		t.Errorf("строка с кривым хэшем не очищена: %+v", r)
+		t.Errorf("the row with a malformed hash not purged: %+v", r)
 	}
 }
 
@@ -1409,17 +1409,17 @@ func TestRetentionOnce_FailureRollback(t *testing.T) {
 		decrefd int // contents with a decreased refcount
 		deleted int // contents slated for deletion
 	}{
-		{"сбой purge", func(p *retentionFakePool) { p.purgeErr = errors.New("бд") }, 0, 0, 0},
-		{"сбой между UPDATE и decref", func(p *retentionFakePool) { p.decrefErr = errors.New("бд") }, 2, 0, 0},
-		{"сбой между decref и delete", func(p *retentionFakePool) { p.deleteErr = errors.New("бд") }, 2, 2, 0},
-		{"сбой фиксации", func(p *retentionFakePool) { p.commitErr = errors.New("бд") }, 2, 2, 2},
+		{"purge failure", func(p *retentionFakePool) { p.purgeErr = errors.New("db") }, 0, 0, 0},
+		{"a failure between UPDATE and decref", func(p *retentionFakePool) { p.decrefErr = errors.New("db") }, 2, 0, 0},
+		{"a failure between decref and delete", func(p *retentionFakePool) { p.deleteErr = errors.New("db") }, 2, 2, 0},
+		{"commit failure", func(p *retentionFakePool) { p.commitErr = errors.New("db") }, 2, 2, 2},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			pool := retentionSeedPool(now)
 			tc.mut(pool)
 			if _, err := RetentionOnce(context.Background(), pool, retentionDefaultOpts()); err == nil {
-				t.Fatalf("ожидается ошибка прохода")
+				t.Fatalf("a pass error expected")
 			}
 			// The pass structure (T-271): the selection tx wrapper, then
 			// the purge transaction; the purge injections (review P2-2)
@@ -1427,31 +1427,31 @@ func TestRetentionOnce_FailureRollback(t *testing.T) {
 			// leave the purge unopened and the checks below trivially
 			// empty.
 			if len(pool.txs) != 2 {
-				t.Fatalf("транзакций прохода = %d, want 2 (оболочка выборки + чистка)", len(pool.txs))
+				t.Fatalf("pass transactions = %d, want 2 (the selection wrapper + the purge)", len(pool.txs))
 			}
 			tx := pool.txs[1]
 			if len(tx.purged) != tc.purged || len(tx.updated) != tc.decrefd || len(tx.deleted) != tc.deleted {
-				t.Fatalf("overlay чистки = purge:%d decref:%d delete:%d, want %d/%d/%d — сбой не в шаге кейса",
+				t.Fatalf("purge overlay = purge:%d decref:%d delete:%d, want %d/%d/%d — the failure is not in the case's step",
 					len(tx.purged), len(tx.updated), len(tx.deleted), tc.purged, tc.decrefd, tc.deleted)
 			}
 			if !tx.rolledBack {
-				t.Fatal("транзакция чистки не откачена после сбоя")
+				t.Fatal("the purge transaction not rolled back after the failure")
 			}
 			// Invariant: nothing changed — the rows are intact (content and
 			// jsonb in place), the refcount is intact, the contents are
 			// alive.
 			for _, r := range pool.results {
 				if r.hash == nil || !r.jsonb {
-					t.Fatalf("строка %v очищена при откаченной транзакции", r.key)
+					t.Fatalf("row %v purged with a rolled-back transaction", r.key)
 				}
 			}
 			for h, c := range pool.contents {
 				if c.refc != 1 {
-					t.Fatalf("contents %x: refcount = %d, want 1 (откат decref)", h[:2], c.refc)
+					t.Fatalf("contents %x: refcount = %d, want 1 (the decref rollback)", h[:2], c.refc)
 				}
 			}
 			if len(pool.contents) != 6 {
-				t.Fatalf("contents = %d строк, want 6 (ничего не удалено)", len(pool.contents))
+				t.Fatalf("contents = %d rows, want 6 (nothing removed)", len(pool.contents))
 			}
 		})
 	}
@@ -1464,7 +1464,7 @@ func TestRetentionOnce_RaceRewritten(t *testing.T) {
 	fresh := func(r *retentionRow) { // the DELETE+INSERT rewrite (T-058)
 		r.checkedAt = r.checkedAt.Add(3 * DefaultRetention) // a fresh now()
 	}
-	t.Run("свежий эпизод", func(t *testing.T) {
+	t.Run("a fresh episode", func(t *testing.T) {
 		now := time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)
 		pool := retentionSeedPool(now)
 		pool.results = pool.results[:1]
@@ -1474,13 +1474,13 @@ func TestRetentionOnce_RaceRewritten(t *testing.T) {
 			t.Fatalf("RetentionOnce: %v", err)
 		}
 		if stats.Rows != 0 || stats.Refs != 0 || stats.Batches != 1 {
-			t.Fatalf("stats = %+v, want пустая зафиксированная пачка", stats)
+			t.Fatalf("stats = %+v, want an empty committed batch", stats)
 		}
 		if r := pool.row(retentionKey{zone: 1, domain: 10, sub: 0, variant: 0}); r.hash == nil || !r.jsonb {
-			t.Fatalf("перезаписанная строка тронута: %+v", r)
+			t.Fatalf("the overwritten row touched: %+v", r)
 		}
 	})
-	t.Run("контент сменился", func(t *testing.T) {
+	t.Run("the content changed", func(t *testing.T) {
 		now := time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)
 		pool := retentionSeedPool(now)
 		pool.results = pool.results[:1]
@@ -1490,7 +1490,7 @@ func TestRetentionOnce_RaceRewritten(t *testing.T) {
 			t.Fatalf("RetentionOnce: %v", err)
 		}
 		if stats.Rows != 0 || stats.Refs != 0 {
-			t.Fatalf("stats = %+v, want 0 строк (охрана content_hash)", stats)
+			t.Fatalf("stats = %+v, want 0 rows (the content_hash guard)", stats)
 		}
 	})
 }
@@ -1529,10 +1529,10 @@ func TestRetentionOnce_Interlock(t *testing.T) {
 		t.Fatalf("RetentionOnce: %v", err)
 	}
 	if !stats.Skipped || stats.Depth != 100 || stats.Rows != 0 {
-		t.Fatalf("stats = %+v, want Skipped с Depth=100 без работы", stats)
+		t.Fatalf("stats = %+v, want Skipped with Depth=100 and no work", stats)
 	}
 	if len(pool.queries) != 0 || pool.begins != 0 {
-		t.Fatalf("пропущенный проход обязан не трогать БД: SELECT'ов %d, транзакций %d", len(pool.queries), pool.begins)
+		t.Fatalf("a skipped pass must leave the DB alone: %d SELECTs, %d transactions", len(pool.queries), pool.begins)
 	}
 
 	pool = retentionSeedPool(now)
@@ -1541,18 +1541,18 @@ func TestRetentionOnce_Interlock(t *testing.T) {
 	if stats, err := RetentionOnce(context.Background(), pool, opts); err != nil {
 		t.Fatalf("RetentionOnce: %v", err)
 	} else if stats.Skipped || stats.Rows != 2 {
-		t.Fatalf("stats = %+v, want работа при глубине ниже порога", stats)
+		t.Fatalf("stats = %+v, want work at a depth below the threshold", stats)
 	}
 
 	pool = retentionSeedPool(now)
-	depth = &fakeDepth{err: errors.New("redis недоступен")}
+	depth = &fakeDepth{err: errors.New("redis unavailable")}
 	opts.Depth = depth
 	if _, err := RetentionOnce(context.Background(), pool, opts); err == nil ||
-		!strings.Contains(err.Error(), "интерлок q:analyze") {
-		t.Fatalf("ошибка = %v, want контекст интерлока", err)
+		!strings.Contains(err.Error(), "the q:analyze interlock") {
+		t.Fatalf("error = %v, want the interlock context", err)
 	}
 	if len(pool.queries) != 0 {
-		t.Fatalf("ошибка глубины: БД не трогать (SELECT'ов %d)", len(pool.queries))
+		t.Fatalf("depth error: leave the DB alone (%d SELECTs)", len(pool.queries))
 	}
 
 	// The interlock off: a threshold ≤ 0 — the source is not polled at all.
@@ -1564,7 +1564,7 @@ func TestRetentionOnce_Interlock(t *testing.T) {
 		t.Fatalf("RetentionOnce: %v", err)
 	}
 	if depth.calls != 0 {
-		t.Fatalf("выключенный интерлок не опрашивает глубину (вызовов %d)", depth.calls)
+		t.Fatalf("a disabled interlock does not poll the depth (%d calls)", depth.calls)
 	}
 }
 
@@ -1594,7 +1594,7 @@ func TestRetentionOnce_InterlockMidDrain(t *testing.T) {
 		t.Fatalf("RetentionOnce: %v", err)
 	}
 	if stats.Rows != 1 || !stats.Skipped || stats.Depth != 150 {
-		t.Fatalf("stats = %+v, want одна пачка до интерлока", stats)
+		t.Fatalf("stats = %+v, want one batch before the interlock", stats)
 	}
 }
 
@@ -1625,10 +1625,10 @@ func TestRetentionOnce_Drain(t *testing.T) {
 		t.Fatalf("RetentionOnce: %v", err)
 	}
 	if stats.Rows != 3 || stats.Batches != 2 {
-		t.Fatalf("stats = %+v, want 3 строки двумя пачками", stats)
+		t.Fatalf("stats = %+v, want 3 rows in two batches", stats)
 	}
 	if len(pool.queries) != 2 {
-		t.Fatalf("SELECT'ов = %d, want 2", len(pool.queries))
+		t.Fatalf("SELECTs = %d, want 2", len(pool.queries))
 	}
 	// The second batch's cursor — (checked_at, PK) past the last row of the
 	// first (sub=1): time leads, the PK determines the order of equal
@@ -1636,7 +1636,7 @@ func TestRetentionOnce_Drain(t *testing.T) {
 	second := pool.queries[1]
 	want := []any{DefaultRetention.String(), old, int16(1), int64(10), int16(1), int16(0), 2}
 	if !reflect.DeepEqual(second.args, want) {
-		t.Errorf("args второй пачки = %v, want %v", second.args, want)
+		t.Errorf("second batch args = %v, want %v", second.args, want)
 	}
 }
 
@@ -1644,16 +1644,16 @@ func TestRetentionOnce_Drain(t *testing.T) {
 
 func TestRetentionOnceErrors(t *testing.T) {
 	if _, err := RetentionOnce(context.Background(), nil, retentionDefaultOpts()); err == nil ||
-		!strings.Contains(err.Error(), "пул не задан") {
-		t.Errorf("ошибка = %v, want «пул не задан»", err)
+		!strings.Contains(err.Error(), "the pool is not set") {
+		t.Errorf("error = %v, want \"the pool is not set\"", err)
 	}
 
 	now := time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)
 	boom := retentionSeedPool(now)
-	boom.selectErr = errors.New("бд недоступна")
+	boom.selectErr = errors.New("db unavailable")
 	if _, err := RetentionOnce(context.Background(), boom, retentionDefaultOpts()); err == nil ||
-		!strings.Contains(err.Error(), "выборка кандидатов") {
-		t.Errorf("ошибка = %v, want контекст выборки", err)
+		!strings.Contains(err.Error(), "candidate selection") {
+		t.Errorf("error = %v, want the selection context", err)
 	}
 
 	// The Begin failure of the PURGE transaction (the second transaction of
@@ -1664,38 +1664,38 @@ func TestRetentionOnceErrors(t *testing.T) {
 	// Russian word for "transaction") masked which of the transactions
 	// failed.
 	boom = retentionSeedPool(now)
-	boom.beginErr = errors.New("бд недоступна")
+	boom.beginErr = errors.New("db unavailable")
 	if _, err := RetentionOnce(context.Background(), boom, retentionDefaultOpts()); err == nil ||
-		!strings.HasPrefix(err.Error(), "content: retention: транзакция: ") {
-		t.Errorf("ошибка = %v, want отказ Begin транзакции чистки («retention: транзакция:»)", err)
+		!strings.HasPrefix(err.Error(), "content: retention: transaction: ") {
+		t.Errorf("error = %v, want the purge transaction Begin rejection (\"content: retention: transaction:\")", err)
 	}
 
 	// The Begin failure of the selection tx wrapper (the first transaction
 	// of a pass, T-271).
 	boom = retentionSeedPool(now)
-	boom.selectBeginErr = errors.New("бд недоступна")
+	boom.selectBeginErr = errors.New("db unavailable")
 	if _, err := RetentionOnce(context.Background(), boom, retentionDefaultOpts()); err == nil ||
-		!strings.Contains(err.Error(), "транзакция выборки") {
-		t.Errorf("ошибка = %v, want «транзакция выборки»", err)
+		!strings.Contains(err.Error(), "selection transaction") {
+		t.Errorf("error = %v, want \"selection transaction\"", err)
 	}
 
 	// The wrapper's Commit failure: the batch is not committed and no purge
 	// is opened — the retry is idempotent (the cursor did not move).
 	boom = retentionSeedPool(now)
-	boom.selectCommitErr = errors.New("бд недоступна")
+	boom.selectCommitErr = errors.New("db unavailable")
 	if _, err := RetentionOnce(context.Background(), boom, retentionDefaultOpts()); err == nil ||
-		!strings.Contains(err.Error(), "фиксация выборки") {
-		t.Errorf("ошибка = %v, want «фиксация выборки»", err)
+		!strings.Contains(err.Error(), "committing the selection") {
+		t.Errorf("error = %v, want \"committing the selection\"", err)
 	}
 	if len(boom.txs) != 1 || len(boom.txCalls) != 0 {
-		t.Errorf("после сбоя фиксации оболочки: транзакций = %d, операторов чистки = %d, want 1/0", len(boom.txs), len(boom.txCalls))
+		t.Errorf("after the wrapper commit failure: transactions = %d, purge statements = %d, want 1/0", len(boom.txs), len(boom.txCalls))
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	canceled := retentionSeedPool(now)
 	if _, err := RetentionOnce(ctx, canceled, retentionDefaultOpts()); !errors.Is(err, context.Canceled) {
-		t.Errorf("ошибка = %v, want context.Canceled", err)
+		t.Errorf("error = %v, want context.Canceled", err)
 	}
 }
 
@@ -1713,16 +1713,16 @@ func TestRetentionOptionsDefaults(t *testing.T) {
 		t.Errorf("withDefaults = %+v, want %+v", got, want)
 	}
 	if DefaultRetentionSelectTimeout != 7200*time.Second {
-		t.Errorf("DefaultRetentionSelectTimeout = %s, want 7200s (T-274: удвоенный запас над прод-замерами 10–11.11.2026 первого catch-up-прохода под нагрузкой; 3600 с T-273 хватило только спокойной системе — три прохода под фронтом упёрлись)", DefaultRetentionSelectTimeout)
+		t.Errorf("DefaultRetentionSelectTimeout = %s, want 7200s (T-274: double the margin over the production measurements of 2026-11-10–11 of the first catch-up pass under load; the T-273 3600s only sufficed for a quiet system — three passes under the full front hit the wall)", DefaultRetentionSelectTimeout)
 	}
 	if DefaultRetentionErrorBackoff != 15*time.Minute {
-		t.Errorf("DefaultRetentionErrorBackoff = %s, want 15m (инцидентный backoff T-271)", DefaultRetentionErrorBackoff)
+		t.Errorf("DefaultRetentionErrorBackoff = %s, want 15m (the T-271 incident backoff)", DefaultRetentionErrorBackoff)
 	}
 	set := RetentionOptions{Interval: time.Minute, BatchSize: 5,
 		SelectTimeout: time.Minute, ErrorBackoff: time.Hour}.withDefaults()
 	if set.Interval != time.Minute || set.BatchSize != 5 ||
 		set.SelectTimeout != time.Minute || set.ErrorBackoff != time.Hour {
-		t.Errorf("withDefaults затирает заданные значения: %+v", set)
+		t.Errorf("withDefaults overwrites the given values: %+v", set)
 	}
 }
 
@@ -1735,10 +1735,10 @@ func TestRetentionLoop_Disabled(t *testing.T) {
 		t.Fatalf("RetentionLoop: %v", err)
 	}
 	if len(pool.queries) != 0 {
-		t.Fatalf("SELECT'ов = %d, want 0 (retention выключен)", len(pool.queries))
+		t.Fatalf("SELECTs = %d, want 0 (retention disabled)", len(pool.queries))
 	}
-	if !strings.Contains(buf.String(), "retention контента выключен") {
-		t.Errorf("лог = %q, want запись о выключенном retention", buf.String())
+	if !strings.Contains(buf.String(), "content retention disabled") {
+		t.Errorf("log = %q, want the retention-disabled entry", buf.String())
 	}
 }
 
@@ -1765,23 +1765,23 @@ func TestRetentionLoop(t *testing.T) {
 	select {
 	case s := <-passed:
 		if s.Rows != 2 {
-			t.Fatalf("итог стартового прохода = %+v, want 2 строки", s)
+			t.Fatalf("the starting pass result = %+v, want 2 rows", s)
 		}
 	case <-time.After(10 * time.Second):
-		t.Fatal("стартовый проход не завершился")
+		t.Fatal("the starting pass did not finish")
 	}
 	cancel()
 	if err := <-done; err != nil {
 		t.Fatalf("RetentionLoop: %v", err)
 	}
-	if !strings.Contains(buf.String(), "цикл retention контента запущен") ||
-		!strings.Contains(buf.String(), "проход retention контента") {
-		t.Errorf("лог = %q, want старт цикла и итог прохода", buf.String())
+	if !strings.Contains(buf.String(), "content retention loop started") ||
+		!strings.Contains(buf.String(), "content retention pass") {
+		t.Errorf("log = %q, want the loop start and the pass result", buf.String())
 	}
 	// Two commits: the plan-pinning tx wrapper of the selection (T-271) +
 	// the purge tx.
 	if pool.commits != 2 {
-		t.Errorf("фиксаций = %d, want 2 (закрепление + чистка)", pool.commits)
+		t.Errorf("commits = %d, want 2 (pinning + purge)", pool.commits)
 	}
 }
 
@@ -1789,7 +1789,7 @@ func TestRetentionLoop(t *testing.T) {
 // build must fail loudly, not silently).
 func TestRetentionLoop_NilPool(t *testing.T) {
 	if err := RetentionLoop(context.Background(), nil, RetentionOptions{}); err == nil ||
-		!strings.Contains(err.Error(), "пул не задан") {
-		t.Errorf("ошибка = %v, want «пул не задан»", err)
+		!strings.Contains(err.Error(), "the pool is not set") {
+		t.Errorf("error = %v, want \"the pool is not set\"", err)
 	}
 }

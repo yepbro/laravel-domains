@@ -133,7 +133,7 @@ func (st *retentionState) limit() int {
 // from the stop point.
 func retentionPass(ctx context.Context, pool RetentionDB, opts RetentionOptions, st *retentionState) (RetentionStats, error) {
 	if pool == nil {
-		return RetentionStats{}, errors.New("content: retention: пул не задан")
+		return RetentionStats{}, errors.New("content: retention: the pool is not set")
 	}
 	if st == nil {
 		st = &retentionState{}
@@ -173,7 +173,7 @@ func retentionPass(ctx context.Context, pool RetentionDB, opts RetentionOptions,
 		// every batch — a long drain sees the fresh depth.
 		n, blocked, err := retentionBlocked(ctx, o)
 		if err != nil {
-			return out, fmt.Errorf("content: retention: интерлок q:analyze: %w", err)
+			return out, fmt.Errorf("content: retention: the q:analyze interlock: %w", err)
 		}
 		if blocked {
 			out.Skipped = true
@@ -187,7 +187,7 @@ func retentionPass(ctx context.Context, pool RetentionDB, opts RetentionOptions,
 			p, err := retentionPendingSnapshot(ctx, o.Pending)
 			if err != nil {
 				if ctx.Err() != nil {
-					return out, fmt.Errorf("content: retention: снимок очередей: %w", ctx.Err())
+					return out, fmt.Errorf("content: retention: the queue snapshot: %w", ctx.Err())
 				}
 				out.SkippedPending = true
 				return out, nil
@@ -248,7 +248,7 @@ func retentionPass(ctx context.Context, pool RetentionDB, opts RetentionOptions,
 				// by the next pass (the cursor did not move — no loss).
 				if errors.Is(err, errRetentionNoCursorTable) {
 					st.persist = false
-					log.Info("retention: таблицы персистентного курсора нет — работаем без сохранения (миграция 000020 не применена?)")
+					log.Info("retention: the persistent cursor table is missing — running without saving (migration 000020 not applied?)")
 					return out, nil
 				}
 				return out, err
@@ -267,7 +267,7 @@ func retentionPass(ctx context.Context, pool RetentionDB, opts RetentionOptions,
 			p, err := retentionPendingSnapshot(ctx, o.Pending)
 			if err != nil {
 				if ctx.Err() != nil {
-					return out, fmt.Errorf("content: retention: снимок очередей: %w", ctx.Err())
+					return out, fmt.Errorf("content: retention: the queue snapshot: %w", ctx.Err())
 				}
 				out.SkippedPending = true
 				return out, nil
@@ -302,12 +302,12 @@ func (st *retentionState) catchUp(ctx context.Context, pool RetentionDB, log *sl
 		// first circle).
 		if !st.noCounterTable {
 			st.noCounterTable = true
-			log.Info("retention: таблицы счётчика рендер-долга нет — работаем fallback-сутками (миграция 000015 не применена?)")
+			log.Info("retention: the render debt counter table is missing — running on the fallback day (migration 000015 not applied?)")
 		}
 		st.fallbackCircle(ctx, pool, log)
 	} else if err != nil {
 		if ctx.Err() == nil {
-			log.Warn("retention: счётчик рендер-долга не прочитан — состояние долга держится, страховка fallback-суток",
+			log.Warn("retention: the render debt counter was not read — the debt state is kept, the fallback-day guard applies",
 				"err", err)
 		}
 		st.fallbackCircle(ctx, pool, log)
@@ -321,7 +321,7 @@ func (st *retentionState) catchUp(ctx context.Context, pool RetentionDB, log *sl
 			// Not produced by code (the bit transitions are a ±1 pair,
 			// T-175) — a manual SQL desync (runbooks §6); treated as "no
 			// debt", but loudly (the renderDebtCount style, T-181).
-			log.Warn("retention: отрицательный счётчик рендер-долга — рассинхрон (runbooks §6)", "debt", debt)
+			log.Warn("retention: a negative render debt counter — desync (runbooks §6)", "debt", debt)
 		}
 		if debt > 0 {
 			st.debtSeen = true
@@ -329,7 +329,7 @@ func (st *retentionState) catchUp(ctx context.Context, pool RetentionDB, log *sl
 			// The transition to 0: all render protection is lifted — one
 			// full circle catches up everything that accumulated over the
 			// debt era behind the cursor.
-			st.planCircle(ctx, pool, log, "счётчик рендер-долга обнулился — рендер-защита снята")
+			st.planCircle(ctx, pool, log, "the render debt counter dropped to zero — the render guard lifted")
 		}
 	}
 
@@ -350,10 +350,10 @@ func (st *retentionState) catchUp(ctx context.Context, pool RetentionDB, log *sl
 	st.lastCircle = time.Now()
 	st.circle, st.circleWhy = false, ""
 	if noop {
-		log.Debug("retention: catch-up-круг уже на месте (нулевой курсор)", "reason", why)
+		log.Debug("retention: a catch-up circle is already in place (the zero cursor)", "reason", why)
 		return
 	}
-	log.Info("retention: catch-up-круг с нулевого курсора", "reason", why)
+	log.Info("retention: a catch-up circle from the zero cursor", "reason", why)
 }
 
 // fallbackCircle — the guard day when the debt counter is unavailable
@@ -364,7 +364,7 @@ func (st *retentionState) catchUp(ctx context.Context, pool RetentionDB, log *sl
 // deliberately not introduced (a config knob is forbidden by the spec).
 func (st *retentionState) fallbackCircle(ctx context.Context, pool RetentionDB, log *slog.Logger) {
 	if time.Since(st.lastCircle) >= DefaultRetentionFallbackCircle {
-		st.planCircle(ctx, pool, log, "счётчик рендер-долга недоступен (нет строки/таблицы — миграция 000015) — fallback-сутки")
+		st.planCircle(ctx, pool, log, "the render debt counter is unavailable (no row/table — migration 000015) — the fallback day")
 	}
 }
 
@@ -390,11 +390,11 @@ func (st *retentionState) planCircle(ctx context.Context, pool RetentionDB, log 
 	if err := retentionResetCursor(ctx, pool); err != nil {
 		if errors.Is(err, errRetentionNoCursorTable) {
 			st.persist = false
-			log.Info("retention: таблицы персистентного курсора нет — работаем без сохранения (миграция 000020 не применена?)")
+			log.Info("retention: the persistent cursor table is missing — running without saving (migration 000020 not applied?)")
 			return
 		}
 		if ctx.Err() == nil {
-			log.Warn("retention: план catch-up-круга не отражён в БД — рестарт в окне продолжит со старого курсора",
+			log.Warn("retention: the catch-up circle plan is not reflected in the DB — a restart within the window would continue from the old cursor",
 				"reason", why, "err", err)
 		}
 	}
@@ -427,10 +427,10 @@ func (st *retentionState) deferRetries(ctx context.Context, pool RetentionDB, ba
 			// overflow (review of T-185, P3-1 — do not be noisy with every
 			// standstill batch).
 			if !st.circle {
-				log.Warn("retention: список ретраев защиты очередей переполнен — следующий проход catch-up-кругом",
+				log.Warn("retention: the queue-guard retry list overflowed — the next pass runs as a catch-up circle",
 					"limit", st.limit())
 			}
-			st.planCircle(ctx, pool, log, "список ретраев защиты очередей переполнен — круг пересоберёт множество")
+			st.planCircle(ctx, pool, log, "the queue-guard retry list overflowed — the circle will rebuild the set")
 			return
 		}
 		st.retries[c.key] = struct{}{}
@@ -495,7 +495,7 @@ func retentionRetryPass(ctx context.Context, pool RetentionDB, o RetentionOption
 // (SQLSTATE 42P01, the DB before the migration 000015 deploy): a sentinel
 // for catchUp — handled as "no counter" with one Info per process, not as a
 // read failure with a Warn (review of T-185, P3-2/P3-4 R3).
-var errRetentionNoCounterTable = errors.New("content: retention: таблицы счётчика рендер-долга нет (миграция 000015 не применена)")
+var errRetentionNoCounterTable = errors.New("content: retention: the render debt counter table is missing (migration 000015 not applied)")
 
 // retentionDebt — a point read of the render-debt counter
 // crawler_counters['render_pending'] (retentionDebtSQL, T-175).
@@ -530,7 +530,7 @@ func retentionDebt(ctx context.Context, pool RetentionDB) (n int64, ok bool, err
 		return 0, false, nil
 	}
 	if err := rows.Scan(&n); err != nil {
-		return 0, false, fmt.Errorf("content: retention: счётчик рендер-долга: чтение: %w", err)
+		return 0, false, fmt.Errorf("content: retention: the render debt counter: read: %w", err)
 	}
 	if err := rows.Err(); err != nil {
 		return 0, false, fmt.Errorf("content: retention: %w", err)

@@ -57,18 +57,18 @@ func newRefcountFakePool(seed map[Hash]int32) *refcountFakePool {
 }
 
 func (p *refcountFakePool) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFromSource) (int64, error) {
-	return 0, errors.New("CopyFrom не должен вызываться")
+	return 0, errors.New("CopyFrom must not be called")
 }
 
 func (p *refcountFakePool) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.poolExecs++
-	return pgconn.CommandTag{}, errors.New("refcountFakePool: Exec вне транзакции")
+	return pgconn.CommandTag{}, errors.New("refcountFakePool: Exec outside a transaction")
 }
 
 func (p *refcountFakePool) Query(context.Context, string, ...any) (pgx.Rows, error) {
-	return nil, errors.New("refcountFakePool: Query не должен вызываться")
+	return nil, errors.New("refcountFakePool: Query must not be called")
 }
 
 func (p *refcountFakePool) Begin(context.Context) (pgx.Tx, error) {
@@ -138,7 +138,7 @@ func (t *refcountFakeTx) Exec(ctx context.Context, sql string, args ...any) (pgc
 		t.overlay[h] = cur - 1
 		return pgconn.NewCommandTag("UPDATE 1"), nil
 	default:
-		return pgconn.CommandTag{}, fmt.Errorf("refcountFakePool: неожидаемый SQL: %s", sql)
+		return pgconn.CommandTag{}, fmt.Errorf("refcountFakePool: unexpected SQL: %s", sql)
 	}
 }
 
@@ -184,10 +184,10 @@ func TestSwapRefOrderAndTransaction(t *testing.T) {
 		t.Fatalf("SwapRef: %v", err)
 	}
 	if pool.begins != 1 {
-		t.Fatalf("транзакций открыто %d, ожидалась 1 — своп атомарен", pool.begins)
+		t.Fatalf("%d transactions opened, expected 1 — the swap is atomic", pool.begins)
 	}
 	if pool.poolExecs != 0 {
-		t.Fatalf("Exec вне транзакции: %d — операторы обязаны идти через транзакцию", pool.poolExecs)
+		t.Fatalf("Exec outside a transaction: %d — the statements must go through a transaction", pool.poolExecs)
 	}
 	tx := pool.txs[0]
 	want := []refcountCall{
@@ -195,16 +195,16 @@ func TestSwapRefOrderAndTransaction(t *testing.T) {
 		{sql: wantSQLDelRef, args: []any{oldH[:]}}, // …then −1 to the old one
 	}
 	if !reflect.DeepEqual(tx.calls, want) {
-		t.Fatalf("операторы свопа:\nполучено  %v\nожидалось %v", tx.calls, want)
+		t.Fatalf("swap statements:\ngot      %v\nexpected %v", tx.calls, want)
 	}
 	if !tx.committed || tx.rolledBack {
-		t.Fatalf("транзакция: committed=%v rolledBack=%v, ожидался чистый commit", tx.committed, tx.rolledBack)
+		t.Fatalf("transaction: committed=%v rolledBack=%v, want a clean commit", tx.committed, tx.rolledBack)
 	}
 	if got := pool.count(oldH); got != 0 {
-		t.Fatalf("refcount старого = %d, ожидался 0 (строка мёртвая, остаётся — контракт T-042)", got)
+		t.Fatalf("the old one's refcount = %d, expected 0 (the row is dead and stays — contract T-042)", got)
 	}
 	if got := pool.count(newH); got != 2 {
-		t.Fatalf("refcount нового = %d, ожидался 2", got)
+		t.Fatalf("the new one's refcount = %d, expected 2", got)
 	}
 }
 
@@ -220,12 +220,12 @@ func TestSwapRefScenarios(t *testing.T) {
 		wantCalls  int   // statements in the transaction
 		wantBegins int   // transactions opened
 	}{
-		{"контент не сменился (old == new)", b, b, map[Hash]int32{b: 3}, 3, 3, 0, 0},
-		{"обе ссылки нулевые", zero, zero, nil, 0, 0, 0, 0},
-		{"первый контент (старый нулевой)", zero, b, map[Hash]int32{b: 2}, 0, 3, 1, 1},
-		{"очистка результата (новый нулевой)", a, zero, map[Hash]int32{a: 2}, 1, 0, 1, 1},
-		{"очистка до мёртвой строки (refcount 0)", a, zero, map[Hash]int32{a: 1}, 0, 0, 1, 1},
-		{"своп со сменой контента", a, b, map[Hash]int32{a: 5, b: 7}, 4, 8, 2, 1},
+		{"the content did not change (old == new)", b, b, map[Hash]int32{b: 3}, 3, 3, 0, 0},
+		{"both references are zero", zero, zero, nil, 0, 0, 0, 0},
+		{"the first content (a zero old one)", zero, b, map[Hash]int32{b: 2}, 0, 3, 1, 1},
+		{"result cleanup (a zero new one)", a, zero, map[Hash]int32{a: 2}, 1, 0, 1, 1},
+		{"the cleanup of a dead row (refcount 0)", a, zero, map[Hash]int32{a: 1}, 0, 0, 1, 1},
+		{"a swap with a content change", a, b, map[Hash]int32{a: 5, b: 7}, 4, 8, 2, 1},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -234,20 +234,20 @@ func TestSwapRefScenarios(t *testing.T) {
 				t.Fatalf("SwapRef: %v", err)
 			}
 			if pool.begins != tc.wantBegins {
-				t.Fatalf("транзакций %d, ожидалось %d", pool.begins, tc.wantBegins)
+				t.Fatalf("%d transactions, expected %d", pool.begins, tc.wantBegins)
 			}
 			calls := 0
 			if len(pool.txs) == 1 {
 				calls = len(pool.txs[0].calls)
 			}
 			if calls != tc.wantCalls {
-				t.Fatalf("операторов %d, ожидалось %d", calls, tc.wantCalls)
+				t.Fatalf("%d statements, expected %d", calls, tc.wantCalls)
 			}
 			if tc.oldH != zero && pool.count(tc.oldH) != tc.wantOld {
-				t.Fatalf("refcount старого = %d, ожидался %d", pool.count(tc.oldH), tc.wantOld)
+				t.Fatalf("the old one's refcount = %d, expected %d", pool.count(tc.oldH), tc.wantOld)
 			}
 			if tc.newH != zero && pool.count(tc.newH) != tc.wantNew {
-				t.Fatalf("refcount нового = %d, ожидался %d", pool.count(tc.newH), tc.wantNew)
+				t.Fatalf("the new one's refcount = %d, expected %d", pool.count(tc.newH), tc.wantNew)
 			}
 		})
 	}
@@ -256,138 +256,138 @@ func TestSwapRefScenarios(t *testing.T) {
 func TestSwapRefIntegrity(t *testing.T) {
 	a, b := refcountHash(1), refcountHash(2)
 
-	t.Run("новый контент не записан Put-ом", func(t *testing.T) {
+	t.Run("the new content was not written by Put", func(t *testing.T) {
 		pool := newRefcountFakePool(map[Hash]int32{a: 1})
 		err := SwapRef(context.Background(), pool, a, b)
 		if !errors.Is(err, ErrRefIntegrity) {
-			t.Fatalf("ошибка %v, ожидалась ErrRefIntegrity", err)
+			t.Fatalf("error %v, expected ErrRefIntegrity", err)
 		}
 		if got := pool.count(a); got != 1 {
-			t.Fatalf("refcount старого = %d, ожидался 1 — транзакция откатилась целиком", got)
+			t.Fatalf("the old one's refcount = %d, expected 1 — the transaction rolled back entirely", got)
 		}
 		if !pool.txs[0].rolledBack {
-			t.Fatal("транзакция не откачена")
+			t.Fatal("the transaction not rolled back")
 		}
 	})
-	t.Run("новый мёртв (refcount = 0)", func(t *testing.T) {
+	t.Run("the new one dead (refcount = 0)", func(t *testing.T) {
 		pool := newRefcountFakePool(map[Hash]int32{a: 1, b: 0})
 		if err := SwapRef(context.Background(), pool, a, b); !errors.Is(err, ErrRefIntegrity) {
-			t.Fatalf("ошибка %v, ожидалась ErrRefIntegrity", err)
+			t.Fatalf("error %v, expected ErrRefIntegrity", err)
 		}
 		if !pool.txs[0].rolledBack {
-			t.Fatal("транзакция не откачена")
+			t.Fatal("the transaction not rolled back")
 		}
 	})
-	t.Run("у старого нет живой ссылки", func(t *testing.T) {
+	t.Run("the old one has no live reference", func(t *testing.T) {
 		pool := newRefcountFakePool(map[Hash]int32{b: 1})
 		err := SwapRef(context.Background(), pool, a, b)
 		if !errors.Is(err, ErrRefIntegrity) {
-			t.Fatalf("ошибка %v, ожидалась ErrRefIntegrity", err)
+			t.Fatalf("error %v, expected ErrRefIntegrity", err)
 		}
 		// Rollback atomicity: the +1 to the new one that did happen was not applied.
 		if got := pool.count(b); got != 1 {
-			t.Fatalf("refcount нового = %d, ожидался 1 — добавление откачено вместе со снятием", got)
+			t.Fatalf("the new one's refcount = %d, expected 1 — the addition rolled back along with the removal", got)
 		}
 		if !pool.txs[0].rolledBack {
-			t.Fatal("транзакция не откачена")
+			t.Fatal("the transaction not rolled back")
 		}
 	})
-	t.Run("старый мёртв (refcount = 0)", func(t *testing.T) {
+	t.Run("the old one dead (refcount = 0)", func(t *testing.T) {
 		pool := newRefcountFakePool(map[Hash]int32{a: 0, b: 1})
 		if err := SwapRef(context.Background(), pool, a, b); !errors.Is(err, ErrRefIntegrity) {
-			t.Fatalf("ошибка %v, ожидалась ErrRefIntegrity", err)
+			t.Fatalf("error %v, expected ErrRefIntegrity", err)
 		}
 		if got := pool.count(b); got != 1 {
-			t.Fatalf("refcount нового = %d, ожидался 1", got)
+			t.Fatalf("the new one's refcount = %d, expected 1", got)
 		}
 	})
-	t.Run("повторный своп той же пары — двойное снятие отвергнуто", func(t *testing.T) {
+	t.Run("a repeated swap of the same pair — a double removal rejected", func(t *testing.T) {
 		pool := newRefcountFakePool(map[Hash]int32{a: 1, b: 1})
 		if err := SwapRef(context.Background(), pool, a, b); err != nil {
-			t.Fatalf("первый своп: %v", err)
+			t.Fatalf("the first swap: %v", err)
 		}
 		// A repeat of the idempotent result write yields old == new (a no-op);
 		// a direct repeated swap is a double removal of the old one: A's reference
 		// is already removed, the refcount > 0 guard refuses, there is no minus.
 		err := SwapRef(context.Background(), pool, a, b)
 		if !errors.Is(err, ErrRefIntegrity) {
-			t.Fatalf("ошибка %v, ожидалась ErrRefIntegrity", err)
+			t.Fatalf("error %v, expected ErrRefIntegrity", err)
 		}
 		if got := pool.count(b); got != 2 {
-			t.Fatalf("refcount нового = %d, ожидался 2 — второй +1 откачен", got)
+			t.Fatalf("the new one's refcount = %d, expected 2 — the second +1 rolled back", got)
 		}
 	})
 }
 
 func TestSwapRefFailures(t *testing.T) {
 	a, b := refcountHash(1), refcountHash(2)
-	boom := errors.New("сбой БД")
+	boom := errors.New("DB failure")
 
-	t.Run("пул не задан", func(t *testing.T) {
+	t.Run("the pool is not set", func(t *testing.T) {
 		if err := SwapRef(context.Background(), nil, a, b); err == nil {
-			t.Fatal("ожидалась ошибка")
+			t.Fatal("an error expected")
 		}
 	})
-	t.Run("отмена ctx до свопа", func(t *testing.T) {
+	t.Run("ctx cancel before the swap", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 		pool := newRefcountFakePool(map[Hash]int32{a: 1, b: 1})
 		if err := SwapRef(ctx, pool, a, b); !errors.Is(err, context.Canceled) {
-			t.Fatalf("ошибка %v, ожидалась отмена контекста", err)
+			t.Fatalf("error %v, expected a context cancellation", err)
 		}
 		if pool.begins != 0 {
-			t.Fatalf("транзакций %d, ожидалось 0 — операция несостоявшаяся", pool.begins)
+			t.Fatalf("%d transactions, expected 0 — the operation did not happen", pool.begins)
 		}
 	})
-	t.Run("ошибка Begin", func(t *testing.T) {
+	t.Run("Begin error", func(t *testing.T) {
 		pool := newRefcountFakePool(map[Hash]int32{a: 1, b: 1})
 		pool.beginErr = boom
 		if err := SwapRef(context.Background(), pool, a, b); !errors.Is(err, boom) {
-			t.Fatalf("ошибка %v, ожидалась оборачивающая boom", err)
+			t.Fatalf("error %v, expected the wrapping boom", err)
 		}
 	})
-	t.Run("ошибка оператора +1 новому", func(t *testing.T) {
+	t.Run("the +1-to-new statement error", func(t *testing.T) {
 		pool := newRefcountFakePool(map[Hash]int32{a: 1, b: 1})
 		pool.execErr, pool.transOnStep = boom, 1
 		if err := SwapRef(context.Background(), pool, a, b); !errors.Is(err, boom) {
-			t.Fatalf("ошибка %v, ожидалась оборачивающая boom", err)
+			t.Fatalf("error %v, expected the wrapping boom", err)
 		}
 		if !pool.txs[0].rolledBack {
-			t.Fatal("транзакция не откачена")
+			t.Fatal("the transaction not rolled back")
 		}
 		if got := pool.count(a); got != 1 {
-			t.Fatalf("refcount старого = %d, ожидался 1", got)
+			t.Fatalf("the old one's refcount = %d, expected 1", got)
 		}
 	})
-	t.Run("ошибка оператора −1 старому", func(t *testing.T) {
+	t.Run("the −1-from-old statement error", func(t *testing.T) {
 		pool := newRefcountFakePool(map[Hash]int32{a: 1, b: 1})
 		pool.execErr, pool.transOnStep = boom, 2
 		if err := SwapRef(context.Background(), pool, a, b); !errors.Is(err, boom) {
-			t.Fatalf("ошибка %v, ожидалась оборачивающая boom", err)
+			t.Fatalf("error %v, expected the wrapping boom", err)
 		}
 		if !pool.txs[0].rolledBack {
-			t.Fatal("транзакция не откачена")
+			t.Fatal("the transaction not rolled back")
 		}
 		// The +1 to the new one that did happen is rolled back with the transaction.
 		if got := pool.count(b); got != 1 {
-			t.Fatalf("refcount нового = %d, ожидался 1 — добавление откачено", got)
+			t.Fatalf("the new one's refcount = %d, expected 1 — the addition rolled back", got)
 		}
 		if got := pool.count(a); got != 1 {
-			t.Fatalf("refcount старого = %d, ожидался 1", got)
+			t.Fatalf("the old one's refcount = %d, expected 1", got)
 		}
 	})
-	t.Run("ошибка Commit", func(t *testing.T) {
+	t.Run("Commit error", func(t *testing.T) {
 		pool := newRefcountFakePool(map[Hash]int32{a: 1, b: 1})
 		pool.commitErr = boom
 		if err := SwapRef(context.Background(), pool, a, b); !errors.Is(err, boom) {
-			t.Fatalf("ошибка %v, ожидалась оборачивающая boom", err)
+			t.Fatalf("error %v, expected the wrapping boom", err)
 		}
 		// The uncommitted state was not applied: the counters are untouched.
 		if got := pool.count(a); got != 1 {
-			t.Fatalf("refcount старого = %d, ожидался 1", got)
+			t.Fatalf("the old one's refcount = %d, expected 1", got)
 		}
 		if got := pool.count(b); got != 1 {
-			t.Fatalf("refcount нового = %d, ожидался 1", got)
+			t.Fatalf("the new one's refcount = %d, expected 1", got)
 		}
 	})
 }
@@ -397,7 +397,7 @@ func TestSwapRefFailures(t *testing.T) {
 func TestSwapRefTx(t *testing.T) {
 	a, b := refcountHash(1), refcountHash(2)
 
-	t.Run("в транзакции вызывающего", func(t *testing.T) {
+	t.Run("in the caller's transaction", func(t *testing.T) {
 		pool := newRefcountFakePool(map[Hash]int32{a: 1, b: 1})
 		tx, err := pool.Begin(context.Background())
 		if err != nil {
@@ -411,16 +411,16 @@ func TestSwapRefTx(t *testing.T) {
 		}
 		// SwapRefTx does not open transactions of its own.
 		if pool.begins != 1 {
-			t.Fatalf("транзакций %d, ожидалась 1 (только вызывающего)", pool.begins)
+			t.Fatalf("%d transactions, expected 1 (the caller's only)", pool.begins)
 		}
 		if got := pool.count(a); got != 0 {
-			t.Fatalf("refcount старого = %d, ожидался 0", got)
+			t.Fatalf("the old one's refcount = %d, expected 0", got)
 		}
 		if got := pool.count(b); got != 2 {
-			t.Fatalf("refcount нового = %d, ожидался 2", got)
+			t.Fatalf("the new one's refcount = %d, expected 2", got)
 		}
 	})
-	t.Run("no-op без операторов", func(t *testing.T) {
+	t.Run("a no-op without statements", func(t *testing.T) {
 		pool := newRefcountFakePool(map[Hash]int32{b: 3})
 		tx, _ := pool.Begin(context.Background())
 		ftx := tx.(*refcountFakeTx)
@@ -428,25 +428,25 @@ func TestSwapRefTx(t *testing.T) {
 			t.Fatalf("SwapRefTx: %v", err)
 		}
 		if len(ftx.calls) != 0 {
-			t.Fatalf("операторов %d, ожидалось 0", len(ftx.calls))
+			t.Fatalf("%d statements, expected 0", len(ftx.calls))
 		}
 	})
-	t.Run("транзакция не задана", func(t *testing.T) {
+	t.Run("the transaction is not set", func(t *testing.T) {
 		if err := SwapRefTx(context.Background(), nil, a, b); err == nil {
-			t.Fatal("ожидалась ошибка")
+			t.Fatal("an error expected")
 		}
 	})
-	t.Run("отмена ctx", func(t *testing.T) {
+	t.Run("ctx cancel", func(t *testing.T) {
 		pool := newRefcountFakePool(map[Hash]int32{a: 1, b: 1})
 		tx, _ := pool.Begin(context.Background())
 		ftx := tx.(*refcountFakeTx)
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 		if err := SwapRefTx(ctx, tx, a, b); !errors.Is(err, context.Canceled) {
-			t.Fatalf("ошибка %v, ожидалась отмена контекста", err)
+			t.Fatalf("error %v, expected a context cancellation", err)
 		}
 		if len(ftx.calls) != 0 {
-			t.Fatalf("операторов %d, ожидалось 0 — операция несостоявшаяся", len(ftx.calls))
+			t.Fatalf("%d statements, expected 0 — the operation did not happen", len(ftx.calls))
 		}
 	})
 }
@@ -457,7 +457,7 @@ func TestPackStoreSwapRef(t *testing.T) {
 	a, b := refcountHash(1), refcountHash(2)
 	dir := t.TempDir()
 
-	t.Run("через пул хранилища", func(t *testing.T) {
+	t.Run("via the store pool", func(t *testing.T) {
 		pool := newRefcountFakePool(map[Hash]int32{a: 1, b: 1})
 		st, err := OpenPackStore(pool, PackOptions{Dir: dir})
 		if err != nil {
@@ -467,22 +467,22 @@ func TestPackStoreSwapRef(t *testing.T) {
 
 		// A no-op through the method: no transaction is opened.
 		if err := st.SwapRef(context.Background(), b, b); err != nil {
-			t.Fatalf("no-op своп: %v", err)
+			t.Fatalf("the no-op swap: %v", err)
 		}
 		if pool.begins != 0 {
-			t.Fatalf("транзакций %d, ожидалось 0", pool.begins)
+			t.Fatalf("%d transactions, expected 0", pool.begins)
 		}
 		if err := st.SwapRef(context.Background(), a, b); err != nil {
-			t.Fatalf("своп: %v", err)
+			t.Fatalf("the swap: %v", err)
 		}
 		if got := pool.count(a); got != 0 {
-			t.Fatalf("refcount старого = %d, ожидался 0", got)
+			t.Fatalf("the old one's refcount = %d, expected 0", got)
 		}
 		if got := pool.count(b); got != 2 {
-			t.Fatalf("refcount нового = %d, ожидался 2", got)
+			t.Fatalf("the new one's refcount = %d, expected 2", got)
 		}
 	})
-	t.Run("пул без Begin отвергается", func(t *testing.T) {
+	t.Run("a pool without Begin is rejected", func(t *testing.T) {
 		// packFakePool (pack_test.go) is only a db.DB, without Begin.
 		st, err := OpenPackStore(newPackFakePool(), PackOptions{Dir: dir})
 		if err != nil {
@@ -492,7 +492,7 @@ func TestPackStoreSwapRef(t *testing.T) {
 
 		err = st.SwapRef(context.Background(), a, b)
 		if err == nil || !strings.Contains(err.Error(), "RefDB") {
-			t.Fatalf("ошибка %v, ожидался отказ с указанием RefDB", err)
+			t.Fatalf("error %v, expected a rejection naming RefDB", err)
 		}
 	})
 }

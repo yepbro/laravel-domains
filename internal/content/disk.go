@@ -130,7 +130,7 @@ func (s *PackStore) diskFull() (sp SpaceStat, full bool, err error) {
 	}
 	sp, err = s.spaceChecker().Space(s.opts.Dir)
 	if err != nil {
-		return SpaceStat{}, false, fmt.Errorf("content: свободное место %s: %w", s.opts.Dir, err)
+		return SpaceStat{}, false, fmt.Errorf("content: free space %s: %w", s.opts.Dir, err)
 	}
 	if sp.Total == 0 {
 		return sp, false, nil
@@ -152,7 +152,7 @@ func (s *PackStore) pauseIfDiskFull() error {
 		return nil
 	}
 	s.fireStoreFull(StoreFullEvent{Space: sp, Source: StoreFullPut})
-	return fmt.Errorf("%w: свободно %s из %s (%.1f%%) — ниже порога %.1f%% (content.disk_free_percent)",
+	return fmt.Errorf("%w: %s free of %s (%.1f%%) — below the %.1f%% threshold (content.disk_free_percent)",
 		ErrStoreFull, humanBytes(sp.Avail), humanBytes(sp.Total),
 		100*float64(sp.Avail)/float64(sp.Total), s.opts.DiskFreePercent)
 }
@@ -193,7 +193,7 @@ type DiskWatchOptions struct {
 // framework (the CompactLoop style).
 func DiskWatchLoop(ctx context.Context, st *PackStore, opts DiskWatchOptions) error {
 	if st == nil {
-		return errors.New("content: контроль диска: хранилище не задано")
+		return errors.New("content: disk check: the store is not set")
 	}
 	interval := opts.Interval
 	if interval <= 0 {
@@ -210,19 +210,19 @@ func DiskWatchLoop(ctx context.Context, st *PackStore, opts DiskWatchOptions) er
 		switch {
 		case err != nil:
 			if ctx.Err() == nil {
-				log.Warn("контроль свободного места каталога контента", "err", err)
+				log.Warn("content directory free space check", "err", err)
 			}
 			return
 		case isFull && !full:
 			full = true
 			st.fireStoreFull(StoreFullEvent{Space: sp, Source: StoreFullWatch})
-			log.Warn("пауза записи контента: свободное место ниже порога",
+			log.Warn("content writing paused: free space below the threshold",
 				"avail", humanBytes(sp.Avail), "total", humanBytes(sp.Total),
 				"threshold_percent", st.opts.DiskFreePercent)
 		case !isFull && full:
 			full = false
 			st.fireStoreFull(StoreFullEvent{Space: sp, Source: StoreFullWatch, Recovered: true})
-			log.Info("запись контента возобновлена: свободное место вернулось за порог",
+			log.Info("content writing resumed: free space is back above the threshold",
 				"avail", humanBytes(sp.Avail), "total", humanBytes(sp.Total))
 		}
 	}

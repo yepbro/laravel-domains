@@ -43,12 +43,12 @@ func TestDrainDomain_SQLContract(t *testing.T) {
 		"ORDER BY r.zone_id, r.domain_id, r.subdomain_id, r.variant",
 	} {
 		if !strings.Contains(retentionDomainSQL, frag) {
-			t.Errorf("выборка дренажа домена: нет фрагмента %q (фильтры отбора T-166)", frag)
+			t.Errorf("domain drain selection: the fragment %q missing (the T-166 selection filters)", frag)
 		}
 	}
 	for _, bad := range []string{"LIMIT", "> ($2::timestamptz"} {
 		if strings.Contains(retentionDomainSQL, bad) {
-			t.Errorf("выборка дренажа домена: лишний фрагмент %q (точечная по PK, без курсора/лимита)", bad)
+			t.Errorf("domain drain selection: an extra fragment %q (point-by-PK, no cursor/limit)", bad)
 		}
 	}
 }
@@ -89,27 +89,27 @@ func TestDrainDomain_ControlScenario(t *testing.T) {
 	for _, sub := range []int16{0, 1, 2} {
 		r := pool.row(retentionKey{zone: 1, domain: 10, sub: sub, variant: map[int16]int16{0: 0, 1: 0, 2: 1}[sub]})
 		if r == nil || r.hash != nil || r.jsonb {
-			t.Errorf("домен 10, sub=%d: запись не очищена: %+v", sub, r)
+			t.Errorf("domain 10, sub=%d: the record not purged: %+v", sub, r)
 		}
 	}
 	if _, ok := pool.contents[retentionHash(0x11)]; ok {
-		t.Error("contents 0x11 (обе ссылки срезаны) обязан быть удалён")
+		t.Error("contents 0x11 (both references trimmed) must be removed")
 	}
 	if r := pool.row(retentionKey{zone: 1, domain: 20, sub: 0, variant: 0}); r == nil || r.hash == nil || !r.jsonb {
-		t.Errorf("чужой домен 20 тронут: %+v", r)
+		t.Errorf("foreign domain 20 touched: %+v", r)
 	}
 	if c, ok := pool.contents[retentionHash(0x33)]; !ok || c.refc != 1 {
-		t.Errorf("contents 0x33 (чужой домен) тронут: %+v", c)
+		t.Errorf("contents 0x33 (a foreign domain) touched: %+v", c)
 	}
 	// Control criterion: the domain has no candidates left AT ALL —
 	// a repeated drain is empty, no transaction is opened.
 	pool.queries, pool.txCalls = nil, nil
 	stats, err = DrainDomain(context.Background(), pool, DefaultRetention, 1, 10)
 	if err != nil {
-		t.Fatalf("повторный DrainDomain: %v", err)
+		t.Fatalf("a repeated DrainDomain: %v", err)
 	}
 	if stats.Rows != 0 || pool.begins != 1 {
-		t.Fatalf("повтор = %+v (транзакций %d), want пустой итог без новой транзакции", stats, pool.begins)
+		t.Fatalf("repeat = %+v (transactions %d), want an empty result without a new transaction", stats, pool.begins)
 	}
 }
 
@@ -125,11 +125,11 @@ func TestDrainDomain_Filters(t *testing.T) {
 		name   string
 		domain int64
 	}{
-		{"домен снова находка (переанализ вернул)", 20},
-		{"render_pending, не rendered", 30},
-		{"deleted — чистит T-020", 50},
-		{"свежая запись — не остарела", 60},
-		{"уже очищенная — чистить нечего", 70},
+		{"the domain is a find again (re-analysis returned it)", 20},
+		{"render_pending, not rendered", 30},
+		{"deleted — T-020 purges it", 50},
+		{"a fresh record — not aged out", 60},
+		{"already purged — nothing to purge", 70},
 	}
 	pool := retentionSeedPool(now)
 	// 70: an aged record without a reference and jsonb (e.g. a previous
@@ -146,7 +146,7 @@ func TestDrainDomain_Filters(t *testing.T) {
 				t.Fatalf("DrainDomain: %v", err)
 			}
 			if stats.Rows != 0 || stats.Batches != 0 {
-				t.Fatalf("stats = %+v, want пустой итог (записи защищены фильтрами отбора)", stats)
+				t.Fatalf("stats = %+v, want an empty result (the records protected by the selection filters)", stats)
 			}
 		})
 	}
@@ -163,22 +163,22 @@ func TestDrainDomain_ArgsAndNoCursor(t *testing.T) {
 		t.Fatalf("DrainDomain: %v", err)
 	}
 	if len(pool.queries) != 1 {
-		t.Fatalf("SELECT'ов = %d, want 1", len(pool.queries))
+		t.Fatalf("SELECTs = %d, want 1", len(pool.queries))
 	}
 	want := []any{int16(1), int64(10), DefaultRetention.String()}
 	if !reflect.DeepEqual(pool.queries[0].args, want) {
-		t.Fatalf("args = %v, want %v (зона, домен, окно)", pool.queries[0].args, want)
+		t.Fatalf("args = %v, want %v (zone, domain, window)", pool.queries[0].args, want)
 	}
 	// The purge batch — the domain keys in PK order, the same boundary.
 	if len(pool.txCalls) == 0 || pool.txCalls[0].sql != retentionPurgeSQL {
-		t.Fatalf("первый оператор транзакции = %+v, want purge", pool.txCalls[0])
+		t.Fatalf("the transaction's first statement = %+v, want purge", pool.txCalls[0])
 	}
 	purge := pool.txCalls[0].args
 	if !reflect.DeepEqual(purge[:4], []any{[]int16{1, 1}, []int64{10, 10}, []int16{0, 1}, []int16{0, 0}}) {
-		t.Errorf("ключи purge = %v, want строки домена в порядке PK", purge[:4])
+		t.Errorf("purge keys = %v, want the domain rows in PK order", purge[:4])
 	}
 	if purge[5] != DefaultRetention.String() {
-		t.Errorf("граница purge = %v, want %s", purge[5], DefaultRetention)
+		t.Errorf("the purge boundary = %v, want %s", purge[5], DefaultRetention)
 	}
 }
 
@@ -197,10 +197,10 @@ func TestDrainDomain_EmptyNoTx(t *testing.T) {
 		t.Fatalf("DrainDomain: %v", err)
 	}
 	if stats.Rows != 0 || stats.Batches != 0 {
-		t.Fatalf("stats = %+v, want пустой итог", stats)
+		t.Fatalf("stats = %+v, want an empty result", stats)
 	}
 	if len(pool.queries) != 1 || pool.begins != 0 {
-		t.Fatalf("обращений = %d (транзакций %d), want один SELECT без транзакции", len(pool.queries), pool.begins)
+		t.Fatalf("calls = %d (transactions %d), want one SELECT without a transaction", len(pool.queries), pool.begins)
 	}
 }
 
@@ -211,28 +211,28 @@ func TestDrainDomain_Errors(t *testing.T) {
 	now := time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
 
 	if _, err := DrainDomain(context.Background(), nil, DefaultRetention, 1, 10); err == nil {
-		t.Error("nil-пул: ожидана ошибка")
+		t.Error("nil pool: an error expected")
 	}
 	if _, err := DrainDomain(context.Background(), retentionSeedPool(now), 0, 1, 10); err == nil {
-		t.Error("retention = 0: ожидана ошибка (контент хранится всегда)")
+		t.Error("retention = 0: an error expected (content is kept forever)")
 	}
 
 	pool := retentionSeedPool(now)
 	pool.selectErr = errors.New("select boom")
 	if _, err := DrainDomain(context.Background(), pool, DefaultRetention, 1, 10); err == nil ||
-		!strings.Contains(err.Error(), "дренаж домена") {
-		t.Fatalf("ошибка выборки = %v, want контекст дренажа", err)
+		!strings.Contains(err.Error(), "domain drain") {
+		t.Fatalf("selection error = %v, want the drain context", err)
 	}
 
 	pool = retentionSeedPool(now)
 	pool.purgeErr = errors.New("purge boom")
 	_, err := DrainDomain(context.Background(), pool, DefaultRetention, 1, 10)
-	if err == nil || !strings.Contains(err.Error(), "дренаж домена 1/10") {
-		t.Fatalf("ошибка чистки = %v, want контекст с ключом домена", err)
+	if err == nil || !strings.Contains(err.Error(), "domain drain 1/10") {
+		t.Fatalf("purge error = %v, want the context with the domain key", err)
 	}
 	// The T-044 guards: the purge failure rolled the transaction back —
 	// the rows are untouched.
 	if r := pool.row(retentionKey{zone: 1, domain: 10, sub: 0, variant: 0}); r == nil || r.hash == nil {
-		t.Error("сбой пачки оставил изменения в строках (транзакция не откатилась)")
+		t.Error("the batch failure left changes in the rows (the transaction did not roll back)")
 	}
 }

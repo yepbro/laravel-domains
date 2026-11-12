@@ -55,13 +55,13 @@ func trainTwoDicts(t *testing.T) (oldD, newD *Dict) {
 	t.Helper()
 	var err error
 	if oldD, err = TrainDict(dictCorpus(12, 2048), TrainOptions{DictSize: 16 << 10}); err != nil {
-		t.Fatalf("TrainDict (старый): %v", err)
+		t.Fatalf("TrainDict (old): %v", err)
 	}
 	if newD, err = TrainDict(dictCorpusAlt(12, 2048), TrainOptions{DictSize: 16 << 10}); err != nil {
-		t.Fatalf("TrainDict (новый): %v", err)
+		t.Fatalf("TrainDict (new): %v", err)
 	}
 	if oldD.ID() == newD.ID() {
-		t.Fatalf("корпуса разных шаблонов дали одинаковый ID %08x — тест не проверяет реестр", oldD.ID())
+		t.Fatalf("corpora of different templates produced the same ID %08x — the test does not exercise the registry", oldD.ID())
 	}
 	return oldD, newD
 }
@@ -91,15 +91,15 @@ func TestFrameDictID(t *testing.T) {
 	}
 	page := dictCorpus(1, 2048)[0]
 	if got := frameDictID(d.Compress(page)); got != d.ID() {
-		t.Errorf("frameDictID(кадр со словарём) = %08x, хочу %08x", got, d.ID())
+		t.Errorf("frameDictID(a dictionary frame) = %08x, want %08x", got, d.ID())
 	}
 	if got := frameDictID(Compress(page)); got != 0 {
-		t.Errorf("frameDictID(кадр без словаря) = %08x, хочу 0", got)
+		t.Errorf("frameDictID(a dictionary-less frame) = %08x, want 0", got)
 	}
 	frame := d.Compress(page)
-	for _, bad := range [][]byte{nil, []byte("мусор"), frame[:6]} {
+	for _, bad := range [][]byte{nil, []byte("junk"), frame[:6]} {
 		if got := frameDictID(bad); got != 0 {
-			t.Errorf("frameDictID(%d байт) = %08x, хочу 0", len(bad), got)
+			t.Errorf("frameDictID(%d bytes) = %08x, want 0", len(bad), got)
 		}
 	}
 }
@@ -117,28 +117,28 @@ func TestDictRegistryOldPacksReadable(t *testing.T) {
 
 	// Episode 1: the old dictionary is active, the content is written with it.
 	if err := oldD.Save(dictPath); err != nil {
-		t.Fatalf("Save (старый): %v", err)
+		t.Fatalf("Save (old): %v", err)
 	}
 	if ok, err := SetDictFile(dictPath, nil); err != nil || !ok {
-		t.Fatalf("SetDictFile (старый): ok=%v err=%v", ok, err)
+		t.Fatalf("SetDictFile (old): ok=%v err=%v", ok, err)
 	}
 	page1 := dictCorpus(1, 2048)[0]
 	put1, err := st.Put(ctx, page1)
 	if err != nil {
-		t.Fatalf("Put (старым словарём): %v", err)
+		t.Fatalf("Put (with the old dictionary): %v", err)
 	}
 	// The block is really compressed with the old dictionary — otherwise the
 	// registry is not the point.
 	if row, ok := pool.row(put1.Hash); ok {
 		frame, err := readPackBlock(dir, row.packID, row.off, row.clen)
 		if err != nil {
-			t.Fatalf("чтение блока: %v", err)
+			t.Fatalf("reading the block: %v", err)
 		}
 		if id := frameDictID(frame); id != oldD.ID() {
-			t.Fatalf("блок сжат словарём %08x, хочу старый %08x", id, oldD.ID())
+			t.Fatalf("the block compressed with dictionary %08x, want the old %08x", id, oldD.ID())
 		}
 	} else {
-		t.Fatal("строка метаданных не найдена")
+		t.Fatal("the metadata row not found")
 	}
 
 	// Retraining: the retired dictionary goes to the registry (RetireDict, as
@@ -147,10 +147,10 @@ func TestDictRegistryOldPacksReadable(t *testing.T) {
 		t.Fatalf("RetireDict: %v", err)
 	}
 	if err := newD.Save(dictPath); err != nil {
-		t.Fatalf("Save (новый): %v", err)
+		t.Fatalf("Save (new): %v", err)
 	}
 	if ok, err := SetDictFile(dictPath, nil); err != nil || !ok {
-		t.Fatalf("SetDictFile (новый): ok=%v err=%v", ok, err)
+		t.Fatalf("SetDictFile (new): ok=%v err=%v", ok, err)
 	}
 
 	// New content is written with the new dictionary; the old one is read
@@ -158,22 +158,22 @@ func TestDictRegistryOldPacksReadable(t *testing.T) {
 	page2 := dictCorpusAlt(1, 2048)[0]
 	put2, err := st.Put(ctx, page2)
 	if err != nil {
-		t.Fatalf("Put (новым словарём): %v", err)
+		t.Fatalf("Put (with the new dictionary): %v", err)
 	}
 	for _, tc := range []struct {
 		name string
 		h    Hash
 		want []byte
 	}{
-		{"старый контент через реестр", put1.Hash, page1},
-		{"новый контент активным", put2.Hash, page2},
+		{"the old content via the registry", put1.Hash, page1},
+		{"the new content with the active one", put2.Hash, page2},
 	} {
 		got, err := st.Get(ctx, tc.h)
 		if err != nil {
 			t.Fatalf("%s: %v", tc.name, err)
 		}
 		if !bytes.Equal(got, tc.want) {
-			t.Errorf("%s: байты изменились", tc.name)
+			t.Errorf("%s: the bytes changed", tc.name)
 		}
 	}
 
@@ -183,7 +183,7 @@ func TestDictRegistryOldPacksReadable(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got, err := st.Get(ctx, put1.Hash); err != nil || !bytes.Equal(got, page1) {
-		t.Errorf("чтение после удаления файла реестра: %v (memoизация не сработала)", err)
+		t.Errorf("reading after the registry file removal: %v (the memoization did not work)", err)
 	}
 	// The file is returned: the next scenario re-installs the dictionary
 	// (SetDictFile resets the memoization — like a process restart).
@@ -198,14 +198,14 @@ func TestDictRegistryOldPacksReadable(t *testing.T) {
 		t.Fatal(err)
 	}
 	if ok, err := SetDictFile(dictPath, nil); err != nil || ok {
-		t.Fatalf("SetDictFile без файла: ok=%v err=%v, хочу (false, nil)", ok, err)
+		t.Fatalf("SetDictFile without a file: ok=%v err=%v, want (false, nil)", ok, err)
 	}
 	if got, err := st.Get(ctx, put1.Hash); err != nil || !bytes.Equal(got, page1) {
-		t.Errorf("чтение старого контента без активного словаря: %v", err)
+		t.Errorf("reading the old content without the active dictionary: %v", err)
 	}
 	_, err = st.Get(ctx, put2.Hash)
 	if !errors.Is(err, zstd.ErrUnknownDictionary) {
-		t.Errorf("новый словарь не в реестре: err = %v, хочу zstd.ErrUnknownDictionary", err)
+		t.Errorf("the new dictionary not in the registry: err = %v, want zstd.ErrUnknownDictionary", err)
 	}
 }
 
@@ -241,17 +241,17 @@ func TestDictRegistryMissingDict(t *testing.T) {
 
 	_, err = st.Get(ctx, put.Hash)
 	if err == nil {
-		t.Fatal("чтение без словаря в реестре: ожидалась ошибка")
+		t.Fatal("reading without the dictionary in the registry: an error expected")
 	}
 	if !errors.Is(err, zstd.ErrUnknownDictionary) {
-		t.Errorf("err = %v, хочу обёртку zstd.ErrUnknownDictionary", err)
+		t.Errorf("err = %v, want a zstd.ErrUnknownDictionary wrapping", err)
 	}
 	if !errors.Is(err, ErrCorrupted) {
-		t.Errorf("err = %v, прежняя обёртка ErrCorrupted потеряна", err)
+		t.Errorf("err = %v, the previous ErrCorrupted wrapping lost", err)
 	}
 	msg := err.Error()
-	if !strings.Contains(msg, "реестр") || !strings.Contains(msg, DictRegistryPath(dir, oldD.ID())) {
-		t.Errorf("ошибка не называет реестр: %s", msg)
+	if !strings.Contains(msg, "the registry") || !strings.Contains(msg, DictRegistryPath(dir, oldD.ID())) {
+		t.Errorf("the error does not name the registry: %s", msg)
 	}
 
 	// A file placed into the registry on a live process is picked up without
@@ -260,7 +260,7 @@ func TestDictRegistryMissingDict(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got, err := st.Get(ctx, put.Hash); err != nil || !bytes.Equal(got, page) {
-		t.Errorf("чтение после возврата файла в реестр: %v", err)
+		t.Errorf("reading after the file returned to the registry: %v", err)
 	}
 }
 
@@ -299,10 +299,10 @@ func TestDictRegistryNameMismatch(t *testing.T) {
 
 	_, err = st.Get(ctx, put.Hash)
 	if !errors.Is(err, zstd.ErrUnknownDictionary) {
-		t.Fatalf("err = %v, хочу zstd.ErrUnknownDictionary", err)
+		t.Fatalf("err = %v, want zstd.ErrUnknownDictionary", err)
 	}
-	if !strings.Contains(err.Error(), "имя файла не соответствует") {
-		t.Errorf("ошибка не объясняет несоответствие файла реестра: %v", err)
+	if !strings.Contains(err.Error(), "the file name does not match") {
+		t.Errorf("the error does not explain the registry file mismatch: %v", err)
 	}
 }
 
@@ -337,15 +337,15 @@ func TestDictRegistryLazyLoadOnce(t *testing.T) {
 	}
 
 	if got, err := st.Get(ctx, put.Hash); err != nil || !bytes.Equal(got, page) {
-		t.Fatalf("первое чтение через реестр: %v", err)
+		t.Fatalf("the first read via the registry: %v", err)
 	}
 	// Corrupting the registry file is invisible to the process: the dictionary
 	// is already loaded.
-	if err := os.WriteFile(DictRegistryPath(dir, oldD.ID()), []byte("мусор"), 0o644); err != nil {
+	if err := os.WriteFile(DictRegistryPath(dir, oldD.ID()), []byte("junk"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if got, err := st.Get(ctx, put.Hash); err != nil || !bytes.Equal(got, page) {
-		t.Errorf("повторное чтение при испорченном файле реестра: %v (загрузка не memoизирована?)", err)
+		t.Errorf("a repeated read with the registry file corrupted: %v (the load not memoized?)", err)
 	}
 }
 
@@ -355,6 +355,6 @@ func dictCraftHeaderPack(t *testing.T, dir string, id int32, dictID uint32) {
 	t.Helper()
 	hdr := packHeader{id: id, maxSize: 1 << 20, dictID: dictID}
 	if err := os.WriteFile(filepath.Join(dir, packFileName(id)), hdr.bytes(), 0o644); err != nil {
-		t.Fatalf("сборка пака %d: %v", id, err)
+		t.Fatalf("building pack %d: %v", id, err)
 	}
 }

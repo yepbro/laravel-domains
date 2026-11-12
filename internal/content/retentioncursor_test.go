@@ -43,13 +43,13 @@ func runLoopPass(t *testing.T, pool *retentionFakePool, opts RetentionOptions) R
 	case stats = <-passed:
 	case <-time.After(10 * time.Second):
 		cancel()
-		t.Fatal("стартовый проход цикла не завершился")
+		t.Fatal("the loop's starting pass did not finish")
 	}
 	cancel()
 	select {
 	case <-done:
 	case <-time.After(10 * time.Second):
-		t.Fatal("цикл не завершился после отмены ctx")
+		t.Fatal("the loop did not finish after the ctx cancel")
 	}
 	return stats
 }
@@ -63,14 +63,14 @@ func TestRetentionPass_CursorSavedInBatchTx(t *testing.T) {
 	pool := drainPool(now)
 	st := &retentionState{persist: true}
 	if _, err := retentionPass(context.Background(), pool, retentionDefaultOpts(), st); err != nil {
-		t.Fatalf("проход: %v", err)
+		t.Fatalf("pass: %v", err)
 	}
 	want := retentionCursor{checkedAt: pool.results[1].checkedAt, key: retentionKey{zone: 1, domain: 10, sub: 1, variant: 0}}
 	if pool.cursorRow == nil || *pool.cursorRow != want {
-		t.Fatalf("строка курсора = %+v, want %+v (последняя строка прохода)", pool.cursorRow, want)
+		t.Fatalf("cursor row = %+v, want %+v (the pass's last row)", pool.cursorRow, want)
 	}
 	if pool.cursorSaves != 1 || pool.begins != 2 {
-		t.Fatalf("upsert'ов = %d (транзакций %d), want 1 upsert в tx пачки (2 транзакции: оболочка + чистка)",
+		t.Fatalf("upserts = %d (transactions %d), want 1 upsert in the batch tx (2 transactions: wrapper + purge)",
 			pool.cursorSaves, pool.begins)
 	}
 	// Atomicity: the upsert is in the PURGE TRANSACTION, as the last
@@ -78,10 +78,10 @@ func TestRetentionPass_CursorSavedInBatchTx(t *testing.T) {
 	tx := pool.txs[1]
 	n := len(tx.calls)
 	if n < 2 || tx.calls[n-1].sql != retentionCursorSaveSQL {
-		t.Fatalf("последний оператор tx чистки = %v, want upsert курсора", tx.calls[n-1].sql)
+		t.Fatalf("the purge tx last statement = %v, want the cursor upsert", tx.calls[n-1].sql)
 	}
 	if !tx.committed {
-		t.Fatal("tx пачки не зафиксирована")
+		t.Fatal("the batch tx not committed")
 	}
 }
 
@@ -91,22 +91,22 @@ func TestRetentionPass_CursorSavedInBatchTx(t *testing.T) {
 func TestRetentionPass_CursorSaveFailsWithBatch(t *testing.T) {
 	now := retentionTestNow()
 	pool := drainPool(now)
-	pool.cursorSaveErr = errors.New("бд недоступна")
+	pool.cursorSaveErr = errors.New("db unavailable")
 	st := &retentionState{persist: true}
 	if _, err := retentionPass(context.Background(), pool, retentionDefaultOpts(), st); err == nil ||
-		!strings.Contains(err.Error(), "сохранение курсора") {
-		t.Fatalf("ошибка = %v, want сбой сохранения курсора", err)
+		!strings.Contains(err.Error(), "saving the cursor") {
+		t.Fatalf("error = %v, want the cursor save failure", err)
 	}
 	if pool.cursorRow != nil || pool.cursorSaves != 0 {
-		t.Fatalf("курсор = %+v (saves=%d), want не зафиксирован", pool.cursorRow, pool.cursorSaves)
+		t.Fatalf("cursor = %+v (saves=%d), want not committed", pool.cursorRow, pool.cursorSaves)
 	}
 	for _, r := range pool.results {
 		if r.hash == nil || !r.jsonb {
-			t.Fatalf("строка %v очищена при откаченной пачке", r.key)
+			t.Fatalf("row %v purged with a rolled-back batch", r.key)
 		}
 	}
 	if st.cursor != (retentionCursor{}) {
-		t.Fatalf("in-memory курсор = %+v, want нулевой (пачка не зафиксирована)", st.cursor)
+		t.Fatalf("in-memory cursor = %+v, want zero (the batch not committed)", st.cursor)
 	}
 }
 
@@ -126,22 +126,22 @@ func TestRetentionPass_DeferredBatchKeepsCursor(t *testing.T) {
 	st := &retentionState{persist: true}
 	stats, err := retentionPass(context.Background(), pool, opts, st)
 	if err != nil {
-		t.Fatalf("проход: %v", err)
+		t.Fatalf("pass: %v", err)
 	}
 	if stats.Rows != 0 {
-		t.Fatalf("Rows = %d, want 0 (вся пачка отложена)", stats.Rows)
+		t.Fatalf("Rows = %d, want 0 (the whole batch deferred)", stats.Rows)
 	}
 	// The persistent position is in place (no state — as before the pass):
 	// a restart will re-read the window and defer the keys again. The
 	// in-memory cursor moves as before — the probe returns the keys within
 	// the process.
 	if pool.cursorRow != nil || pool.cursorSaves != 0 {
-		t.Fatalf("строка курсора = %+v (saves=%d), want нет фиксации за отложенной пачкой",
+		t.Fatalf("cursor row = %+v (saves=%d), want no commit beyond the deferred batch",
 			pool.cursorRow, pool.cursorSaves)
 	}
 	want := retentionCursor{checkedAt: pool.results[1].checkedAt, key: retentionKey{zone: 1, domain: 10, sub: 1, variant: 0}}
 	if st.cursor != want {
-		t.Fatalf("in-memory курсор = %+v, want %+v (двигается и без чистки)", st.cursor, want)
+		t.Fatalf("in-memory cursor = %+v, want %+v (it advances even without purging)", st.cursor, want)
 	}
 
 	// Partial deferral: the purge proceeds but the position in the DB does
@@ -155,13 +155,13 @@ func TestRetentionPass_DeferredBatchKeepsCursor(t *testing.T) {
 	st2 := &retentionState{persist: true}
 	stats2, err := retentionPass(context.Background(), pool2, opts2, st2)
 	if err != nil {
-		t.Fatalf("проход (частичная отложка): %v", err)
+		t.Fatalf("pass (a partial deferral): %v", err)
 	}
 	if stats2.Rows != 1 {
-		t.Fatalf("Rows = %d, want 1 (sub=1 очищена, sub=0 отложена)", stats2.Rows)
+		t.Fatalf("Rows = %d, want 1 (sub=1 purged, sub=0 deferred)", stats2.Rows)
 	}
 	if pool2.cursorRow != nil || pool2.cursorSaves != 0 {
-		t.Fatalf("строка курсора = %+v (saves=%d), want нет фиксации: пачка перешагнула отложенный ключ",
+		t.Fatalf("cursor row = %+v (saves=%d), want no commit: the batch stepped over a deferred key",
 			pool2.cursorRow, pool2.cursorSaves)
 	}
 
@@ -172,16 +172,16 @@ func TestRetentionPass_DeferredBatchKeepsCursor(t *testing.T) {
 	pool.queries = nil
 	statsRestart, err := retentionPass(context.Background(), pool, retentionDefaultOpts(), &retentionState{persist: true})
 	if err != nil {
-		t.Fatalf("проход восстановления: %v", err)
+		t.Fatalf("the recovery pass: %v", err)
 	}
 	if statsRestart.Rows != 2 {
-		t.Fatalf("Rows = %d, want 2 (обе отложенные строки вычищены «рестартом»)", statsRestart.Rows)
+		t.Fatalf("Rows = %d, want 2 (both deferred rows purged by the \"restart\")", statsRestart.Rows)
 	}
 	if r := pool.row(retentionKey{zone: 1, domain: 10, sub: 0, variant: 0}); r.hash != nil {
-		t.Fatal("отложенная запись не вычищена после «рестарта» — потеря за курсором")
+		t.Fatal("the deferred record not purged after the \"restart\" — a loss behind the cursor")
 	}
 	if pool.cursorRow == nil || pool.cursorSaves != 1 {
-		t.Fatalf("строка курсора = %+v (saves=%d), want фиксация пачки без отложек",
+		t.Fatalf("cursor row = %+v (saves=%d), want the batch commit with no deferrals",
 			pool.cursorRow, pool.cursorSaves)
 	}
 }
@@ -209,10 +209,10 @@ func TestRetentionPass_CircleResetsPersistedCursor(t *testing.T) {
 
 	st := &retentionState{persist: true}
 	if _, err := retentionPass(context.Background(), pool, retentionDefaultOpts(), st); err != nil {
-		t.Fatalf("проход 1 (эпоха долга): %v", err)
+		t.Fatalf("pass 1 (the debt epoch): %v", err)
 	}
 	if pool.cursorRow == nil {
-		t.Fatal("проход 1 не зафиксировал курсор")
+		t.Fatal("pass 1 did not commit the cursor")
 	}
 
 	// The debt is lifted: the counter reset — pass 2 applies the catch-up
@@ -222,23 +222,23 @@ func TestRetentionPass_CircleResetsPersistedCursor(t *testing.T) {
 	pool.queries = nil
 	stats, err := retentionPass(context.Background(), pool, retentionDefaultOpts(), st)
 	if err != nil {
-		t.Fatalf("проход 2 (снятие долга): %v", err)
+		t.Fatalf("pass 2 (the debt lift): %v", err)
 	}
 	if stats.Rows != 1 {
-		t.Fatalf("проход 2: Rows = %d, want 1 (догнали запись эпохи долга)", stats.Rows)
+		t.Fatalf("pass 2: Rows = %d, want 1 (caught up with the debt-epoch record)", stats.Rows)
 	}
 	if len(pool.queries) != 1 || !reflect.DeepEqual(pool.queries[0].args, zeroArgs(100)) {
-		t.Fatalf("args прохода 2 = %v, want catch-up-круг с нулевого курсора", pool.queries[0].args)
+		t.Fatalf("pass 2 args = %v, want a catch-up circle from the zero cursor", pool.queries[0].args)
 	}
 	// The state was reset (DELETE) and rewritten by the circle batch: the
 	// circle went from zero; the last visited row is the domain 10 record
 	// (domain 20 is already clean from pass 1, outside the set).
 	if pool.cursorDelete != 1 {
-		t.Fatalf("удалений строки курсора = %d, want 1 (круг чистит персистентное состояние)", pool.cursorDelete)
+		t.Fatalf("cursor row deletes = %d, want 1 (the circle cleans the persistent state)", pool.cursorDelete)
 	}
 	want := retentionCursor{checkedAt: old, key: retentionKey{zone: 1, domain: 10, sub: 0, variant: 0}}
 	if pool.cursorRow == nil || *pool.cursorRow != want {
-		t.Fatalf("строка курсора после круга = %+v, want %+v (позиция круговой пачки)", pool.cursorRow, want)
+		t.Fatalf("cursor row after the circle = %+v, want %+v (the circle batch position)", pool.cursorRow, want)
 	}
 }
 
@@ -256,20 +256,20 @@ func TestRetentionLoop_ResumesFromPersistedCursor(t *testing.T) {
 
 	stats := runLoopPass(t, pool, RetentionOptions{BatchSize: 100})
 	if stats.Rows != 1 {
-		t.Fatalf("стартовый проход = %+v, want 1 строка (только sub=1 впереди курсора)", stats)
+		t.Fatalf("the starting pass = %+v, want 1 row (only sub=1 ahead of the cursor)", stats)
 	}
 	wantArgs := []any{DefaultRetention.String(), saved.checkedAt, saved.key.zone, saved.key.domain, saved.key.sub, saved.key.variant, 100}
 	if !reflect.DeepEqual(pool.queries[0].args, wantArgs) {
-		t.Fatalf("первая выборка = %v, want продолжение от сохранённого курсора %v", pool.queries[0].args, wantArgs)
+		t.Fatalf("the first selection = %v, want continuing from the saved cursor %v", pool.queries[0].args, wantArgs)
 	}
 	// sub=0 is behind the cursor — untouched; after the pass the cursor is
 	// on sub=1.
 	if r := pool.row(retentionKey{zone: 1, domain: 10, sub: 0, variant: 0}); r.hash == nil {
-		t.Fatal("запись позади курсора очищена вопреки продолжению с курсора")
+		t.Fatal("a record behind the cursor purged despite continuing from the cursor")
 	}
 	after := retentionCursor{checkedAt: pool.results[1].checkedAt, key: retentionKey{zone: 1, domain: 10, sub: 1, variant: 0}}
 	if pool.cursorRow == nil || *pool.cursorRow != after {
-		t.Fatalf("строка курсора после прохода = %+v, want %+v", pool.cursorRow, after)
+		t.Fatalf("cursor row after the pass = %+v, want %+v", pool.cursorRow, after)
 	}
 }
 
@@ -286,17 +286,17 @@ func TestRetentionLoop_InvalidPersistedCursor(t *testing.T) {
 	opts := RetentionOptions{BatchSize: 100, Log: retentionTestLogger(&buf)}
 	stats := runLoopPass(t, pool, opts)
 	if stats.Rows != 2 {
-		t.Fatalf("стартовый проход = %+v, want 2 строки (полный catch-up с нуля)", stats)
+		t.Fatalf("the starting pass = %+v, want 2 rows (a full catch-up from zero)", stats)
 	}
 	if !reflect.DeepEqual(pool.queries[0].args, zeroArgs(100)) {
-		t.Fatalf("первая выборка = %v, want нулевой курсор", pool.queries[0].args)
+		t.Fatalf("the first selection = %v, want the zero cursor", pool.queries[0].args)
 	}
-	if !strings.Contains(buf.String(), "некорректен") {
-		t.Errorf("лог = %q, want Warn о некорректном состоянии", buf.String())
+	if !strings.Contains(buf.String(), "malformed") {
+		t.Errorf("log = %q, want the malformed-state Warn", buf.String())
 	}
 	// The invalid row is overwritten by the very first batch commit.
 	if pool.cursorRow == nil || pool.cursorRow.checkedAt.Equal(bad.checkedAt) {
-		t.Fatalf("строка курсора после прохода = %+v, want перезаписана пачкой", pool.cursorRow)
+		t.Fatalf("cursor row after the pass = %+v, want overwritten by the batch", pool.cursorRow)
 	}
 }
 
@@ -313,13 +313,13 @@ func TestRetentionLoop_NoCursorTable(t *testing.T) {
 	opts := RetentionOptions{BatchSize: 100, Log: retentionTestLogger(&buf)}
 	stats := runLoopPass(t, pool, opts)
 	if stats.Rows != 2 {
-		t.Fatalf("стартовый проход = %+v, want 2 строки (дренаж работает без таблицы)", stats)
+		t.Fatalf("the starting pass = %+v, want 2 rows (the drain works without the table)", stats)
 	}
 	if pool.cursorSaves != 0 {
-		t.Fatalf("upsert'ов курсора = %d, want 0 (персистентность выключена)", pool.cursorSaves)
+		t.Fatalf("cursor upserts = %d, want 0 (persistence disabled)", pool.cursorSaves)
 	}
-	if !strings.Contains(buf.String(), "таблицы персистентного курсора нет") {
-		t.Errorf("лог = %q, want Info об отсутствующей таблице", buf.String())
+	if !strings.Contains(buf.String(), "the persistent cursor table is missing") {
+		t.Errorf("log = %q, want the missing-table Info", buf.String())
 	}
 }
 
@@ -336,18 +336,18 @@ func TestRetentionLoop_NoCursorTableMidRun(t *testing.T) {
 	opts := RetentionOptions{BatchSize: 100, Log: retentionTestLogger(&buf)}
 	stats := runLoopPass(t, pool, opts)
 	if stats.Rows != 0 {
-		t.Fatalf("стартовый проход = %+v, want 0 строк (пачка откатана целиком)", stats)
+		t.Fatalf("the starting pass = %+v, want 0 rows (the batch rolled back entirely)", stats)
 	}
 	if pool.cursorSaves != 0 {
-		t.Fatalf("upsert'ов = %d, want 0", pool.cursorSaves)
+		t.Fatalf("upserts = %d, want 0", pool.cursorSaves)
 	}
 	// Persistence is off, the rows are intact — a repeated pass purges.
 	pool.queries = nil
 	if _, err := retentionPass(context.Background(), pool, retentionDefaultOpts(), &retentionState{}); err != nil {
-		t.Fatalf("повторный проход: %v", err)
+		t.Fatalf("a repeated pass: %v", err)
 	}
-	if !strings.Contains(buf.String(), "таблицы персистентного курсора нет") {
-		t.Errorf("лог = %q, want Info об отсутствующей таблице", buf.String())
+	if !strings.Contains(buf.String(), "the persistent cursor table is missing") {
+		t.Errorf("log = %q, want the missing-table Info", buf.String())
 	}
 }
 
@@ -365,11 +365,11 @@ func TestRetentionOnce_DoesNotTouchCursor(t *testing.T) {
 		t.Fatalf("RetentionOnce: %v", err)
 	}
 	if pool.cursorSaves != 0 || pool.cursorDelete != 0 {
-		t.Fatalf("upsert'ов=%d удалений=%d, want 0/0 (разовый проход без персистентности)",
+		t.Fatalf("upserts=%d deletes=%d, want 0/0 (a one-off pass without persistence)",
 			pool.cursorSaves, pool.cursorDelete)
 	}
 	if pool.cursorRow == nil || *pool.cursorRow != saved {
-		t.Fatalf("строка курсора = %+v, want нетронутой %+v", pool.cursorRow, saved)
+		t.Fatalf("cursor row = %+v, want untouched %+v", pool.cursorRow, saved)
 	}
 }
 
@@ -378,7 +378,7 @@ func TestRetentionOnce_DoesNotTouchCursor(t *testing.T) {
 // an upsert by PK, a DELETE on circles).
 func TestRetentionCursorLoadContract(t *testing.T) {
 	if retentionCursorLoadSQL != "SELECT checked_at, zone_id, domain_id, subdomain_id, variant FROM retention_drain_cursor WHERE id = 1" {
-		t.Fatalf("retentionCursorLoadSQL разошёлся с контрактом миграции 000020:\n%s", retentionCursorLoadSQL)
+		t.Fatalf("retentionCursorLoadSQL diverged from the migration 000020 contract:\n%s", retentionCursorLoadSQL)
 	}
 	for _, want := range []string{
 		"INSERT INTO retention_drain_cursor",
@@ -386,11 +386,11 @@ func TestRetentionCursorLoadContract(t *testing.T) {
 		"updated_at = EXCLUDED.updated_at",
 	} {
 		if !strings.Contains(retentionCursorSaveSQL, want) {
-			t.Errorf("retentionCursorSaveSQL потерял фрагмент %q:\n%s", want, retentionCursorSaveSQL)
+			t.Errorf("retentionCursorSaveSQL lost the fragment %q:\n%s", want, retentionCursorSaveSQL)
 		}
 	}
 	if retentionCursorDeleteSQL != "DELETE FROM retention_drain_cursor WHERE id = 1" {
-		t.Fatalf("retentionCursorDeleteSQL разошёлся с контрактом:\n%s", retentionCursorDeleteSQL)
+		t.Fatalf("retentionCursorDeleteSQL diverged from the contract:\n%s", retentionCursorDeleteSQL)
 	}
 }
 
@@ -401,7 +401,7 @@ func TestRetentionLoadCursor_ZeroRow(t *testing.T) {
 	pool.cursorRow = &retentionCursor{}
 	cur, ok, err := retentionLoadCursor(context.Background(), pool)
 	if err != nil || ok || cur != (retentionCursor{}) {
-		t.Fatalf("load = (%+v, %v, %v), want пустое состояние без ошибки", cur, ok, err)
+		t.Fatalf("load = (%+v, %v, %v), want an empty state without an error", cur, ok, err)
 	}
 }
 
@@ -441,22 +441,22 @@ func TestRetentionPass_OverflowPlanResetsCursorAndSuppressesSaves(t *testing.T) 
 	st := &retentionState{persist: true, retryLimit: 1}
 	stats, err := retentionPass(context.Background(), pool, opts, st)
 	if err != nil {
-		t.Fatalf("проход: %v", err)
+		t.Fatalf("pass: %v", err)
 	}
 	// A is deferred (the list), B overflowed (the circle plan), C is also
 	// protected in the snapshot: Rows=0, the plan is set, applying — the
 	// next pass.
 	if stats.Rows != 0 || !st.circle {
-		t.Fatalf("проход = %+v (circle=%v), want 0 строк и план круга", stats, st.circle)
+		t.Fatalf("pass = %+v (circle=%v), want 0 rows and a circle plan", stats, st.circle)
 	}
 	if pool.cursorDelete != 1 {
-		t.Fatalf("удалений строки курсора = %d, want 1 (план круга чистит БД в момент плана)", pool.cursorDelete)
+		t.Fatalf("cursor row deletes = %d, want 1 (the circle plan cleans the DB at plan time)", pool.cursorDelete)
 	}
 	if pool.cursorRow != nil || pool.cursorSaves != 0 {
-		t.Fatalf("строка курсора = %+v (saves=%d), want подавлено до применения круга", pool.cursorRow, pool.cursorSaves)
+		t.Fatalf("cursor row = %+v (saves=%d), want suppressed until the circle applies", pool.cursorRow, pool.cursorSaves)
 	}
-	if !strings.Contains(buf.String(), "переполнен") {
-		t.Errorf("лог = %q, want Warn о переполнении", buf.String())
+	if !strings.Contains(buf.String(), "overflowed") {
+		t.Errorf("log = %q, want the overflow Warn", buf.String())
 	}
 
 	// The next pass applies the circle from the zero cursor: all three
@@ -464,10 +464,10 @@ func TestRetentionPass_OverflowPlanResetsCursorAndSuppressesSaves(t *testing.T) 
 	// deferred anew; the circle rebuilds the set).
 	pool.queries = nil
 	if _, err := retentionPass(context.Background(), pool, opts, st); err != nil {
-		t.Fatalf("проход 2 (круг): %v", err)
+		t.Fatalf("pass 2 (the circle): %v", err)
 	}
 	if len(pool.queries) == 0 || !reflect.DeepEqual(pool.queries[0].args, zeroArgs(1)) {
-		t.Fatalf("args прохода 2 = %v, want catch-up-круг с нулевого курсора", pool.queries[0].args)
+		t.Fatalf("pass 2 args = %v, want a catch-up circle from the zero cursor", pool.queries[0].args)
 	}
 }
 
@@ -497,21 +497,21 @@ func TestRetentionPass_PlanResetFailureWarns(t *testing.T) {
 	}
 	// The commit of the reset fails (commitErr hits non-select
 	// transactions — the circle plan's reset tx).
-	pool.commitErr = errors.New("бд недоступна")
+	pool.commitErr = errors.New("db unavailable")
 
 	var buf bytes.Buffer
 	opts.Log = retentionTestLogger(&buf)
 	st := &retentionState{persist: true, retryLimit: 1}
 	if _, err := retentionPass(context.Background(), pool, opts, st); err != nil {
-		t.Fatalf("сбой отражения плана — не ошибка прохода: %v", err)
+		t.Fatalf("the plan reflection failure is not a pass error: %v", err)
 	}
 	if !st.circle {
-		t.Fatal("план круга потерян при сбое отражения в БД")
+		t.Fatal("the circle plan lost on the DB reflection failure")
 	}
 	if pool.cursorRow != nil || pool.cursorSaves != 0 {
-		t.Fatalf("строка курсора = %+v (saves=%d), want без воскресения (сохранение подавлено)", pool.cursorRow, pool.cursorSaves)
+		t.Fatalf("cursor row = %+v (saves=%d), want no resurrection (the save suppressed)", pool.cursorRow, pool.cursorSaves)
 	}
-	if !strings.Contains(buf.String(), "не отражён в БД") {
-		t.Errorf("лог = %q, want Warn о неотражённом плане", buf.String())
+	if !strings.Contains(buf.String(), "not reflected in the DB") {
+		t.Errorf("log = %q, want the unreflected-plan Warn", buf.String())
 	}
 }

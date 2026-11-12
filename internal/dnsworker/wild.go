@@ -127,16 +127,16 @@ func (r WildcardResult) IDs() []int { return r.Mask.IDs() }
 // questions; normalization (spec 5.2) is the caller's responsibility.
 func DetectWildcard(ctx context.Context, res dnsclient.Resolver, domain string) (WildcardInfo, error) {
 	if strings.TrimSpace(domain) == "" {
-		return WildcardInfo{}, fmt.Errorf("dnsworker: wildcard-детект: пустое имя домена")
+		return WildcardInfo{}, fmt.Errorf("dnsworker: wildcard detect: empty domain name")
 	}
 	label, err := wildRandomLabel()
 	if err != nil {
-		return WildcardInfo{}, fmt.Errorf("dnsworker: wildcard-детект %s: %w", domain, err)
+		return WildcardInfo{}, fmt.Errorf("dnsworker: wildcard detect %s: %w", domain, err)
 	}
 	name := label + "." + domain
 	r, err := res.Exchange(ctx, dnsclient.Question{Name: name, Type: dns.TypeA})
 	if err != nil {
-		return WildcardInfo{Label: label}, fmt.Errorf("dnsworker: wildcard-детект %s: %w", name, err)
+		return WildcardInfo{Label: label}, fmt.Errorf("dnsworker: wildcard detect %s: %w", name, err)
 	}
 	switch r.RCode {
 	case dnsclient.RCodeNXDOMAIN:
@@ -160,7 +160,7 @@ func DetectWildcard(ctx context.Context, res dnsclient.Resolver, domain string) 
 		// policy is in the function comment). The RCODE stays in the
 		// message for diagnostics.
 		return WildcardInfo{Label: label}, fmt.Errorf(
-			"dnsworker: wildcard-детект %s: неавторитетный ответ %s", name, r.RCode)
+			"dnsworker: wildcard detect %s: a non-authoritative answer %s", name, r.RCode)
 	}
 }
 
@@ -206,7 +206,7 @@ func MarkWildcardSubdomains(wildAddrs []net.IP, subs []WildSubdomain) (WildcardR
 			continue
 		}
 		if err := mask.Set(sub.ID); err != nil {
-			return WildcardResult{}, fmt.Errorf("dnsworker: wildcard-пометка субдомена %d (%q): %w",
+			return WildcardResult{}, fmt.Errorf("dnsworker: wildcard marking of subdomain %d (%q): %w",
 				sub.ID, sub.Label, err)
 		}
 	}
@@ -265,7 +265,7 @@ func wildContainsIP(addrs []net.IP, ip net.IP) bool {
 func wildRandomLabel() (string, error) {
 	buf := make([]byte, wildLabelLength)
 	if _, err := rand.Read(buf); err != nil {
-		return "", fmt.Errorf("случайная метка: %w", err)
+		return "", fmt.Errorf("random label: %w", err)
 	}
 	label := make([]byte, wildLabelLength)
 	for i, b := range buf {

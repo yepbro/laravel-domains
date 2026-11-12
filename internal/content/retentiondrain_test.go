@@ -64,14 +64,14 @@ func TestRetentionPass_CursorAcrossPasses(t *testing.T) {
 	st := &retentionState{}
 	stats, err := retentionPass(context.Background(), pool, retentionDefaultOpts(), st)
 	if err != nil {
-		t.Fatalf("проход 1: %v", err)
+		t.Fatalf("pass 1: %v", err)
 	}
 	if stats.Rows != 2 {
-		t.Fatalf("проход 1: Rows = %d, want 2 (sub=0, sub=1)", stats.Rows)
+		t.Fatalf("pass 1: Rows = %d, want 2 (sub=0, sub=1)", stats.Rows)
 	}
 	want := retentionCursor{checkedAt: pool.results[1].checkedAt, key: retentionKey{zone: 1, domain: 10, sub: 1, variant: 0}}
 	if st.cursor != want {
-		t.Fatalf("курсор после прохода 1 = %+v, want %+v (последняя строка окна)", st.cursor, want)
+		t.Fatalf("cursor after pass 1 = %+v, want %+v (the last row of the window)", st.cursor, want)
 	}
 
 	// An hour later sub=2 has aged (5.5 h > 6 h − 1 h of the window) — the
@@ -80,17 +80,17 @@ func TestRetentionPass_CursorAcrossPasses(t *testing.T) {
 	pool.queries = nil
 	stats, err = retentionPass(context.Background(), pool, retentionDefaultOpts(), st)
 	if err != nil {
-		t.Fatalf("проход 2: %v", err)
+		t.Fatalf("pass 2: %v", err)
 	}
 	if stats.Rows != 1 {
-		t.Fatalf("проход 2: Rows = %d, want 1 (только состаревшаяся sub=2)", stats.Rows)
+		t.Fatalf("pass 2: Rows = %d, want 1 (only the aged-out sub=2)", stats.Rows)
 	}
 	if len(pool.queries) != 1 {
-		t.Fatalf("SELECT'ов прохода 2 = %d, want 1", len(pool.queries))
+		t.Fatalf("pass 2 SELECTs = %d, want 1", len(pool.queries))
 	}
 	wantArgs := []any{DefaultRetention.String(), want.checkedAt, want.key.zone, want.key.domain, want.key.sub, want.key.variant, 100}
 	if !reflect.DeepEqual(pool.queries[0].args, wantArgs) {
-		t.Fatalf("args прохода 2 = %v, want курсор прохода 1 %v", pool.queries[0].args, wantArgs)
+		t.Fatalf("pass 2 args = %v, want the pass 1 cursor %v", pool.queries[0].args, wantArgs)
 	}
 }
 
@@ -124,14 +124,14 @@ func TestRetentionPass_InterlockKeepsCursor(t *testing.T) {
 	st := &retentionState{}
 	stats, err := retentionPass(context.Background(), pool, opts, st)
 	if err != nil {
-		t.Fatalf("проход 1: %v", err)
+		t.Fatalf("pass 1: %v", err)
 	}
 	if stats.Rows != 1 || !stats.Skipped {
-		t.Fatalf("проход 1 = %+v, want одна пачка и пропуск интерлоком", stats)
+		t.Fatalf("pass 1 = %+v, want one batch and an interlock skip", stats)
 	}
 	want := retentionCursor{checkedAt: pool.results[0].checkedAt, key: retentionKey{zone: 1, domain: 10, sub: 0, variant: 0}}
 	if st.cursor != want {
-		t.Fatalf("курсор после остановки = %+v, want %+v (первая строка)", st.cursor, want)
+		t.Fatalf("cursor after the stop = %+v, want %+v (the first row)", st.cursor, want)
 	}
 
 	// The depth dipped: the drain continues from the cursor — rows 1 and 2.
@@ -142,14 +142,14 @@ func TestRetentionPass_InterlockKeepsCursor(t *testing.T) {
 	pool.queries = nil
 	stats, err = retentionPass(context.Background(), pool, opts, st)
 	if err != nil {
-		t.Fatalf("проход 2: %v", err)
+		t.Fatalf("pass 2: %v", err)
 	}
 	if stats.Rows != 2 || stats.Skipped {
-		t.Fatalf("проход 2 = %+v, want 2 строки без пропуска", stats)
+		t.Fatalf("pass 2 = %+v, want 2 rows without a skip", stats)
 	}
 	wantArgs := []any{DefaultRetention.String(), want.checkedAt, want.key.zone, want.key.domain, want.key.sub, want.key.variant, 1}
 	if !reflect.DeepEqual(pool.queries[0].args, wantArgs) {
-		t.Fatalf("args прохода 2 = %v, want продолжение от курсора %v", pool.queries[0].args, wantArgs)
+		t.Fatalf("pass 2 args = %v, want continuing from the cursor %v", pool.queries[0].args, wantArgs)
 	}
 }
 
@@ -178,10 +178,10 @@ func TestRetentionPass_RewrittenReEnters(t *testing.T) {
 	st := &retentionState{}
 	stats, err := retentionPass(context.Background(), pool, retentionDefaultOpts(), st)
 	if err != nil {
-		t.Fatalf("проход 1: %v", err)
+		t.Fatalf("pass 1: %v", err)
 	}
 	if stats.Rows != 0 {
-		t.Fatalf("проход 1: Rows = %d, want 0 (охрана возраста)", stats.Rows)
+		t.Fatalf("pass 1: Rows = %d, want 0 (the age guard)", stats.Rows)
 	}
 
 	// Six hours later the rewrite has aged — the drain picks it up.
@@ -189,10 +189,10 @@ func TestRetentionPass_RewrittenReEnters(t *testing.T) {
 	pool.onSelect = nil
 	stats, err = retentionPass(context.Background(), pool, retentionDefaultOpts(), st)
 	if err != nil {
-		t.Fatalf("проход 2: %v", err)
+		t.Fatalf("pass 2: %v", err)
 	}
 	if stats.Rows != 1 || stats.FreedBytes != 1500 {
-		t.Fatalf("проход 2 = %+v, want чистка перезаписанной строки (новый контент 0x99)", stats)
+		t.Fatalf("pass 2 = %+v, want the overwritten row purged (new content 0x99)", stats)
 	}
 }
 
@@ -217,16 +217,16 @@ func TestRetentionPass_RetryOffer(t *testing.T) {
 	st := &retentionState{}
 	stats, err := retentionPass(context.Background(), pool, opts, st)
 	if err != nil {
-		t.Fatalf("проход 1: %v", err)
+		t.Fatalf("pass 1: %v", err)
 	}
 	if stats.Rows != 1 || stats.Deferred[queue.StreamRender] != 1 {
-		t.Fatalf("проход 1 = %+v, want sub=1 очищена, sub=0 отложена", stats)
+		t.Fatalf("pass 1 = %+v, want sub=1 purged, sub=0 deferred", stats)
 	}
 	if len(st.retries) != 1 {
-		t.Fatalf("список ретраев = %d ключей, want 1", len(st.retries))
+		t.Fatalf("the retry list = %d keys, want 1", len(st.retries))
 	}
 	if r := pool.row(retentionKey{zone: 1, domain: 10, sub: 0, variant: 0}); r.hash == nil {
-		t.Fatal("защищённая запись очищена в проходе 1")
+		t.Fatal("a protected record purged in pass 1")
 	}
 
 	// Pass 2: the probe offered the key, the protection is gone — purged
@@ -234,25 +234,25 @@ func TestRetentionPass_RetryOffer(t *testing.T) {
 	pool.queries = nil
 	stats, err = retentionPass(context.Background(), pool, opts, st)
 	if err != nil {
-		t.Fatalf("проход 2: %v", err)
+		t.Fatalf("pass 2: %v", err)
 	}
 	if stats.Rows != 1 {
-		t.Fatalf("проход 2: Rows = %d, want 1 (зонд очистил sub=0)", stats.Rows)
+		t.Fatalf("pass 2: Rows = %d, want 1 (the probe cleared sub=0)", stats.Rows)
 	}
 	if len(pool.queries) != 2 || pool.queries[0].sql != retentionProbeSQL || pool.queries[1].sql != retentionSelectSQL {
-		t.Fatalf("обращения прохода 2: %d (первый = %q), want зонд THEN выборка", len(pool.queries), pool.queries[0].sql)
+		t.Fatalf("pass 2 calls: %d (the first = %q), want probe THEN selection", len(pool.queries), pool.queries[0].sql)
 	}
 	probe := pool.queries[0]
 	if !reflect.DeepEqual(probe.args[:4], []any{
 		[]int16{1}, []int64{10}, []int16{0}, []int16{0},
 	}) || probe.args[4] != DefaultRetention.String() {
-		t.Errorf("args зонда = %v, want ключ sub=0 с границей старения", probe.args)
+		t.Errorf("probe args = %v, want the sub=0 key with the aging boundary", probe.args)
 	}
 	if len(st.retries) != 0 {
-		t.Fatalf("список ретраев после прохода 2 = %d ключей, want 0", len(st.retries))
+		t.Fatalf("the retry list after pass 2 = %d keys, want 0", len(st.retries))
 	}
 	if r := pool.row(retentionKey{zone: 1, domain: 10, sub: 0, variant: 0}); r.hash != nil {
-		t.Fatal("запись не очищена зондом прохода 2")
+		t.Fatal("the record not purged by the pass 2 probe")
 	}
 }
 
@@ -272,23 +272,23 @@ func TestRetentionPass_RetryStillProtected(t *testing.T) {
 
 	st := &retentionState{}
 	if _, err := retentionPass(context.Background(), pool, opts, st); err != nil {
-		t.Fatalf("проход 1: %v", err)
+		t.Fatalf("pass 1: %v", err)
 	}
 	stats, err := retentionPass(context.Background(), pool, opts, st)
 	if err != nil {
-		t.Fatalf("проход 2: %v", err)
+		t.Fatalf("pass 2: %v", err)
 	}
 	if stats.Rows != 0 {
-		t.Fatalf("проход 2: Rows = %d, want 0 (ключ всё ещё защищён)", stats.Rows)
+		t.Fatalf("pass 2: Rows = %d, want 0 (the key still protected)", stats.Rows)
 	}
 	if stats.Deferred[queue.StreamRender] != 1 {
-		t.Fatalf("Deferred = %v, want повторное исключение ключа зонда", stats.Deferred)
+		t.Fatalf("Deferred = %v, want the probe key excluded again", stats.Deferred)
 	}
 	if len(st.retries) != 1 {
-		t.Fatalf("список ретраев = %d, want 1 (ключ держится до снятия защиты)", len(st.retries))
+		t.Fatalf("the retry list = %d, want 1 (the key held until the protection lifts)", len(st.retries))
 	}
 	if r := pool.row(retentionKey{zone: 1, domain: 10, sub: 0, variant: 0}); r.hash == nil {
-		t.Fatal("защищённая запись очищена вопреки защите")
+		t.Fatal("a protected record purged despite the protection")
 	}
 }
 
@@ -308,10 +308,10 @@ func TestRetentionPass_RetryEviction(t *testing.T) {
 
 	st := &retentionState{}
 	if _, err := retentionPass(context.Background(), pool, opts, st); err != nil {
-		t.Fatalf("проход 1: %v", err)
+		t.Fatalf("pass 1: %v", err)
 	}
 	if len(st.retries) != 1 {
-		t.Fatalf("список ретраев = %d, want 1 после прохода 1", len(st.retries))
+		t.Fatalf("the retry list = %d, want 1 after pass 1", len(st.retries))
 	}
 
 	// The domain became a find: the probe will not return the key —
@@ -319,16 +319,16 @@ func TestRetentionPass_RetryEviction(t *testing.T) {
 	pool.laravel[retentionDomKey{zone: 1, id: 10}] = true
 	stats, err := retentionPass(context.Background(), pool, opts, st)
 	if err != nil {
-		t.Fatalf("проход 2: %v", err)
+		t.Fatalf("pass 2: %v", err)
 	}
 	if stats.Rows != 0 || stats.Batches != 0 {
-		t.Fatalf("проход 2 = %+v, want пусто (находка — не кандидат)", stats)
+		t.Fatalf("pass 2 = %+v, want empty (a find is not a candidate)", stats)
 	}
 	if len(st.retries) != 0 {
-		t.Fatalf("список ретраев = %d, want 0 (эвикция не-кандидата)", len(st.retries))
+		t.Fatalf("the retry list = %d, want 0 (eviction of a non-candidate)", len(st.retries))
 	}
 	if r := pool.row(retentionKey{zone: 1, domain: 10, sub: 0, variant: 0}); r.hash == nil || !r.jsonb {
-		t.Fatal("запись находки затронута чисткой")
+		t.Fatal("a find record touched by the purge")
 	}
 }
 
@@ -359,19 +359,19 @@ func TestRetentionPass_RetryBound(t *testing.T) {
 	st := &retentionState{retryLimit: 1}
 	opts.BatchSize = 1 // a batch = a row: the overflow is met across several batches
 	if _, err := retentionPass(context.Background(), pool, opts, st); err != nil {
-		t.Fatalf("проход 1: %v", err)
+		t.Fatalf("pass 1: %v", err)
 	}
 	if !st.circle || len(st.retries) != 1 {
-		t.Fatalf("после прохода 1: circle=%v, retries=%d (want запланированный круг, предел 1)", st.circle, len(st.retries))
+		t.Fatalf("after pass 1: circle=%v, retries=%d (want the scheduled circle, the limit 1)", st.circle, len(st.retries))
 	}
 	// The Warn — exactly one per overflow episode (review of T-185, P3-1
 	// R2): the second and third batches with waiting keys stay silent, the
 	// plan is already set. Counted is the Warn text: the circle reason in
 	// the Info line of pass 2 quotes the same overflow word (see
 	// warnOverflow below) — that is not a Warn.
-	const warnOverflow = "переполнен — следующий проход catch-up-кругом"
+	const warnOverflow = "overflowed — the next pass runs as a catch-up circle"
 	if got := strings.Count(buf.String(), warnOverflow); got != 1 {
-		t.Fatalf("Warn о переполнении = %d за проход 1, want 1", got)
+		t.Fatalf("the overflow Warn = %d over pass 1, want 1", got)
 	}
 
 	// The next pass — a catch-up circle from the zero cursor: the list is
@@ -381,19 +381,19 @@ func TestRetentionPass_RetryBound(t *testing.T) {
 	// new Warn.
 	pool.queries = nil
 	if _, err := retentionPass(context.Background(), pool, opts, st); err != nil {
-		t.Fatalf("проход 2: %v", err)
+		t.Fatalf("pass 2: %v", err)
 	}
 	if len(pool.queries) < 1 || pool.queries[0].sql != retentionSelectSQL {
-		t.Fatalf("обращения прохода 2 = %d, want выборки круга (зонд не звать: список очищен)", len(pool.queries))
+		t.Fatalf("pass 2 calls = %d, want the circle selection (no probe: the list cleared)", len(pool.queries))
 	}
 	if !reflect.DeepEqual(pool.queries[0].args, zeroArgs(1)) {
-		t.Fatalf("args прохода 2 = %v, want нулевой курсор catch-up-круга", pool.queries[0].args)
+		t.Fatalf("pass 2 args = %v, want the catch-up circle zero cursor", pool.queries[0].args)
 	}
 	if len(st.retries) != 1 {
-		t.Fatalf("список ретраев круга = %d, want 1 (переполнение на прежнем пределе)", len(st.retries))
+		t.Fatalf("the circle retry list = %d, want 1 (an overflow at the previous limit)", len(st.retries))
 	}
 	if got := strings.Count(buf.String(), warnOverflow); got != 2 {
-		t.Fatalf("Warn о переполнении = %d за два прохода, want 2 (по одному на эпизод)", got)
+		t.Fatalf("the overflow Warn = %d over two passes, want 2 (one per episode)", got)
 	}
 }
 
@@ -425,10 +425,10 @@ func TestRetentionPass_DebtCatchUp(t *testing.T) {
 	st := &retentionState{}
 	stats, err := retentionPass(context.Background(), pool, opts, st)
 	if err != nil {
-		t.Fatalf("проход 1 (эпоха долга): %v", err)
+		t.Fatalf("pass 1 (the debt epoch): %v", err)
 	}
 	if stats.Rows != 1 || !st.debtSeen || st.circle {
-		t.Fatalf("проход 1 = %+v (debtSeen=%v): только домен 20, круг не планируется", stats, st.debtSeen)
+		t.Fatalf("pass 1 = %+v (debtSeen=%v): only domain 20, no circle planned", stats, st.debtSeen)
 	}
 
 	// The debt has been drained: the flag is lifted, the counter reset to
@@ -438,19 +438,19 @@ func TestRetentionPass_DebtCatchUp(t *testing.T) {
 	pool.queries = nil
 	stats, err = retentionPass(context.Background(), pool, opts, st)
 	if err != nil {
-		t.Fatalf("проход 2 (снятие долга): %v", err)
+		t.Fatalf("pass 2 (the debt lift): %v", err)
 	}
 	if stats.Rows != 1 {
-		t.Fatalf("проход 2: Rows = %d, want 1 (догнали запись домена 10)", stats.Rows)
+		t.Fatalf("pass 2: Rows = %d, want 1 (caught up with the domain 10 record)", stats.Rows)
 	}
 	if len(pool.queries) != 1 || !reflect.DeepEqual(pool.queries[0].args, zeroArgs(100)) {
-		t.Fatalf("args прохода 2 = %v, want catch-up-круг с нулевого курсора", pool.queries[0].args)
+		t.Fatalf("pass 2 args = %v, want a catch-up circle from the zero cursor", pool.queries[0].args)
 	}
 	if r := pool.row(retentionKey{zone: 1, domain: 10, sub: 0, variant: 0}); r.hash != nil {
-		t.Fatal("запись эпохи долга не очищена catch-up-кругом")
+		t.Fatal("the debt-epoch record not purged by the catch-up circle")
 	}
-	if !strings.Contains(buf.String(), "обнулился") {
-		t.Errorf("лог = %q, want причина круга — обнуление счётчика", buf.String())
+	if !strings.Contains(buf.String(), "dropped to zero") {
+		t.Errorf("log = %q, want the circle reason — the counter dropping to zero", buf.String())
 	}
 }
 
@@ -473,10 +473,10 @@ func TestRetentionPass_DebtFallback(t *testing.T) {
 
 	st := &retentionState{}
 	if _, err := retentionPass(context.Background(), pool, retentionDefaultOpts(), st); err != nil {
-		t.Fatalf("проход 1: %v", err)
+		t.Fatalf("pass 1: %v", err)
 	}
 	if st.lastCircle.IsZero() {
-		t.Fatal("стартовый круг не зафиксирован якорем fallback-суток")
+		t.Fatal("the starting circle not anchored by the fallback day")
 	}
 
 	// An hour later: there is no new record, a circle is NOT planned (the
@@ -492,13 +492,13 @@ func TestRetentionPass_DebtFallback(t *testing.T) {
 	pool.queries = nil
 	stats, err := retentionPass(context.Background(), pool, retentionDefaultOpts(), st)
 	if err != nil {
-		t.Fatalf("проход 2: %v", err)
+		t.Fatalf("pass 2: %v", err)
 	}
 	if stats.Rows != 0 || len(pool.queries) != 1 {
-		t.Fatalf("проход 2 = %+v (%d SELECT'ов), want пустой проход от курсора без круга", stats, len(pool.queries))
+		t.Fatalf("pass 2 = %+v (%d SELECTs), want an empty pass from the cursor without a circle", stats, len(pool.queries))
 	}
 	if reflect.DeepEqual(pool.queries[0].args, zeroArgs(100)) {
-		t.Fatal("проход 2 пошёл с нулевого курсора вопреки неистёкшим суткам fallback")
+		t.Fatal("pass 2 went from the zero cursor despite the unexpired fallback day")
 	}
 
 	// A day later — the fallback circle from the zero cursor picks up the
@@ -507,10 +507,10 @@ func TestRetentionPass_DebtFallback(t *testing.T) {
 	pool.queries = nil
 	stats, err = retentionPass(context.Background(), pool, retentionDefaultOpts(), st)
 	if err != nil {
-		t.Fatalf("проход 3: %v", err)
+		t.Fatalf("pass 3: %v", err)
 	}
 	if stats.Rows != 1 || !reflect.DeepEqual(pool.queries[0].args, zeroArgs(100)) {
-		t.Fatalf("проход 3 = %+v, args=%v: want fallback-круг, подбирающий sub=2", stats, pool.queries[0].args)
+		t.Fatalf("pass 3 = %+v, args=%v: want the fallback circle picking up sub=2", stats, pool.queries[0].args)
 	}
 }
 
@@ -521,7 +521,7 @@ func TestRetentionPass_DebtReadError(t *testing.T) {
 	now := retentionTestNow()
 	pool := drainPool(now)
 	pool.counters["render_pending"] = 5
-	pool.debtErr = errors.New("бд недоступна")
+	pool.debtErr = errors.New("db unavailable")
 
 	var buf bytes.Buffer
 	opts := retentionDefaultOpts()
@@ -533,19 +533,19 @@ func TestRetentionPass_DebtReadError(t *testing.T) {
 	st := &retentionState{debtSeen: true}
 	stats, err := retentionPass(context.Background(), pool, opts, st)
 	if err != nil {
-		t.Fatalf("проход: %v", err)
+		t.Fatalf("pass: %v", err)
 	}
 	if stats.Rows != 2 {
-		t.Fatalf("stats = %+v, want штатный дренаж при ошибке счётчика", stats)
+		t.Fatalf("stats = %+v, want a regular drain with the counter error", stats)
 	}
 	if !st.debtSeen || st.circle {
-		t.Fatalf("состояние долга: debtSeen=%v circle=%v, want держится без круга", st.debtSeen, st.circle)
+		t.Fatalf("the debt state: debtSeen=%v circle=%v, want kept without a circle", st.debtSeen, st.circle)
 	}
 	if st.lastCircle.IsZero() {
-		t.Fatal("якорь fallback-суток не поставлен при создании состояния")
+		t.Fatal("the fallback-day anchor not set at state creation")
 	}
-	if !strings.Contains(buf.String(), "не прочитан") {
-		t.Errorf("лог = %q, want Warn о нечитаемом счётчике", buf.String())
+	if !strings.Contains(buf.String(), "not read") {
+		t.Errorf("log = %q, want the unreadable-counter Warn", buf.String())
 	}
 }
 
@@ -564,20 +564,20 @@ func TestRetentionPass_DebtAnchorRefresh(t *testing.T) {
 		lastCircle: time.Now().Add(-DefaultRetentionFallbackCircle - time.Hour), // "the day has elapsed"
 	}
 	if _, err := retentionPass(context.Background(), pool, retentionDefaultOpts(), st); err != nil {
-		t.Fatalf("проход 1: %v", err)
+		t.Fatalf("pass 1: %v", err)
 	}
 	if st.circle || st.cursor != anchor {
-		t.Fatalf("после прохода 1: circle=%v cursor=%+v — успешное чтение обязано обновить якорь, круг не поднимается", st.circle, st.cursor)
+		t.Fatalf("after pass 1: circle=%v cursor=%+v — a successful read must refresh the anchor, no circle raised", st.circle, st.cursor)
 	}
 
 	// The next hour — a read failure: the anchor is fresh, no circle is
 	// raised.
-	pool.debtErr = errors.New("бд недоступна")
+	pool.debtErr = errors.New("db unavailable")
 	if _, err := retentionPass(context.Background(), pool, retentionDefaultOpts(), st); err != nil {
-		t.Fatalf("проход 2: %v", err)
+		t.Fatalf("pass 2: %v", err)
 	}
 	if st.circle || st.cursor != anchor {
-		t.Fatalf("транзиентный сбой чтения поднял круг: circle=%v cursor=%+v", st.circle, st.cursor)
+		t.Fatalf("a transient read failure raised the circle: circle=%v cursor=%+v", st.circle, st.cursor)
 	}
 }
 
@@ -591,10 +591,10 @@ func TestRetentionPass_DebtReadErrorFallback(t *testing.T) {
 
 	st := &retentionState{}
 	if _, err := retentionPass(context.Background(), pool, retentionDefaultOpts(), st); err != nil {
-		t.Fatalf("проход 1: %v", err)
+		t.Fatalf("pass 1: %v", err)
 	}
 	if st.cursor == (retentionCursor{}) {
-		t.Fatal("проход 1 не продвинул курсор")
+		t.Fatal("pass 1 did not advance the cursor")
 	}
 
 	// A row behind the cursor (the P1-1 leak class): the guard circle must
@@ -606,24 +606,24 @@ func TestRetentionPass_DebtReadErrorFallback(t *testing.T) {
 	})
 	pool.contents[retentionHash(0x33)] = retentionFakeContent{refc: 1, clen: 3000}
 
-	pool.debtErr = errors.New("бд недоступна")
+	pool.debtErr = errors.New("db unavailable")
 	st.lastCircle = time.Now().Add(-DefaultRetentionFallbackCircle - time.Hour)
 	pool.queries = nil
 	stats, err := retentionPass(context.Background(), pool, retentionDefaultOpts(), st)
 	if err != nil {
-		t.Fatalf("проход 2: %v", err)
+		t.Fatalf("pass 2: %v", err)
 	}
 	if stats.Rows != 1 || stats.FreedBytes != 3000 {
-		t.Fatalf("проход 2 = %+v, want вычищена утраченная за курсором строка", stats)
+		t.Fatalf("pass 2 = %+v, want the row lost behind the cursor purged", stats)
 	}
 	if len(pool.queries) != 1 || !reflect.DeepEqual(pool.queries[0].args, zeroArgs(100)) {
-		t.Fatalf("args прохода 2 = %v, want выборка fallback-круга с нулевого курсора", pool.queries[0].args)
+		t.Fatalf("pass 2 args = %v, want the fallback circle selection from the zero cursor", pool.queries[0].args)
 	}
 	// The cursor after the circle — on the picked-up row (the drain
 	// continued normally from the zero point).
 	want := retentionCursor{checkedAt: pool.results[2].checkedAt, key: retentionKey{zone: 1, domain: 10, sub: 2, variant: 0}}
 	if st.cursor != want {
-		t.Fatalf("курсор после прохода 2 = %+v, want %+v (подобранная строка круга)", st.cursor, want)
+		t.Fatalf("cursor after pass 2 = %+v, want %+v (the circle's picked-up row)", st.cursor, want)
 	}
 }
 
@@ -642,20 +642,20 @@ func TestRetentionPass_DebtTableMissing(t *testing.T) {
 	st := &retentionState{}
 	stats, err := retentionPass(context.Background(), pool, opts, st)
 	if err != nil {
-		t.Fatalf("проход 1: %v", err)
+		t.Fatalf("pass 1: %v", err)
 	}
 	if stats.Rows != 2 {
-		t.Fatalf("проход 1: stats = %+v, want штатный дренаж", stats)
+		t.Fatalf("pass 1: stats = %+v, want a regular drain", stats)
 	}
 	// The second pass of the same bench — the Info is not repeated.
 	if _, err := retentionPass(context.Background(), pool, opts, st); err != nil {
-		t.Fatalf("проход 2: %v", err)
+		t.Fatalf("pass 2: %v", err)
 	}
-	if strings.Contains(buf.String(), "не прочитан") {
-		t.Errorf("лог = %q: absent-table обязан молчать (Warn только для сбоев)", buf.String())
+	if strings.Contains(buf.String(), "not read") {
+		t.Errorf("log = %q: the absent table must stay silent (Warn only for failures)", buf.String())
 	}
-	if got := strings.Count(buf.String(), "таблицы счётчика рендер-долга нет"); got != 1 {
-		t.Errorf("Info об отсутствующей таблице = %d, want 1 (один раз на процесс)", got)
+	if got := strings.Count(buf.String(), "the render debt counter table is missing"); got != 1 {
+		t.Errorf("the missing-table Info = %d, want 1 (once per process)", got)
 	}
 }
 
@@ -667,7 +667,7 @@ func TestRetentionPass_DebtTableMissing(t *testing.T) {
 // divergence is caught here.
 func TestRetentionDebtSQLContract(t *testing.T) {
 	if retentionDebtSQL != "SELECT value FROM crawler_counters WHERE name = 'render_pending'" {
-		t.Fatalf("retentionDebtSQL разошёлся с контрактом T-175/T-181:\n%s", retentionDebtSQL)
+		t.Fatalf("retentionDebtSQL diverged from the T-175/T-181 contract:\n%s", retentionDebtSQL)
 	}
 }
 
@@ -680,10 +680,10 @@ func TestRetentionOnce_EachFromZero(t *testing.T) {
 	opts := retentionDefaultOpts()
 	for pass := 1; pass <= 2; pass++ {
 		if _, err := RetentionOnce(context.Background(), pool, opts); err != nil {
-			t.Fatalf("проход %d: %v", pass, err)
+			t.Fatalf("pass %d: %v", pass, err)
 		}
 		if !reflect.DeepEqual(pool.queries[0].args, zeroArgs(100)) {
-			t.Fatalf("проход %d: первая выборка = %v, want нулевой курсор (разовый проход)", pass, pool.queries[0].args)
+			t.Fatalf("pass %d: the first selection = %v, want the zero cursor (a one-off pass)", pass, pool.queries[0].args)
 		}
 		pool.queries = nil
 	}
@@ -704,12 +704,12 @@ func TestRetentionSQLShape(t *testing.T) {
 		"LIMIT $7",
 	} {
 		if !strings.Contains(retentionSelectSQL, want) {
-			t.Errorf("retentionSelectSQL потерял фрагмент дренажа по времени:\n%s\n--- нет:\n%s", retentionSelectSQL, want)
+			t.Errorf("retentionSelectSQL lost the time-based drain fragment:\n%s\n--- missing:\n%s", retentionSelectSQL, want)
 		}
 	}
 	// The PK cursor (the old order) must be gone.
 	if strings.Contains(retentionSelectSQL, "ORDER BY r.zone_id, r.domain_id") {
-		t.Errorf("retentionSelectSQL вернул PK-порядок (диагноз запроса №13):\n%s", retentionSelectSQL)
+		t.Errorf("retentionSelectSQL returned a PK order (query diagnosis #13):\n%s", retentionSelectSQL)
 	}
 	for _, want := range []string{
 		"JOIN LATERAL (",
@@ -718,11 +718,11 @@ func TestRetentionSQLShape(t *testing.T) {
 		"LIMIT 1) AS r ON true",
 	} {
 		if !strings.Contains(retentionProbeSQL, want) {
-			t.Errorf("retentionProbeSQL потерял фрагмент точечного зонда:\n%s\n--- нет:\n%s", retentionProbeSQL, want)
+			t.Errorf("retentionProbeSQL lost the point-probe fragment:\n%s\n--- missing:\n%s", retentionProbeSQL, want)
 		}
 	}
 	if strings.Contains(retentionProbeSQL, "ORDER BY") {
-		t.Errorf("retentionProbeSQL не нуждается в порядке:\n%s", retentionProbeSQL)
+		t.Errorf("retentionProbeSQL needs no order:\n%s", retentionProbeSQL)
 	}
 }
 
@@ -749,13 +749,13 @@ func TestRetentionPass_EqualTimestampsBoundary(t *testing.T) {
 	st := &retentionState{}
 	stats, err := retentionPass(context.Background(), pool, opts, st)
 	if err != nil {
-		t.Fatalf("проход: %v", err)
+		t.Fatalf("pass: %v", err)
 	}
 	if stats.Rows != 3 {
-		t.Fatalf("Rows = %d, want 3 (все строки равной отметки подобраны)", stats.Rows)
+		t.Fatalf("Rows = %d, want 3 (all rows of equal stamp picked up)", stats.Rows)
 	}
 	if len(pool.queries) != 4 { // three batches + the empty end selection
-		t.Fatalf("SELECT'ов = %d, want 4", len(pool.queries))
+		t.Fatalf("SELECTs = %d, want 4", len(pool.queries))
 	}
 	// The cursors of batches 2 and 3 — the same stamp, the key strictly
 	// grows: the cursor of selection i+1 is the last row of batch i
@@ -763,10 +763,10 @@ func TestRetentionPass_EqualTimestampsBoundary(t *testing.T) {
 	for i := 1; i < 3; i++ {
 		args := pool.queries[i].args
 		if !args[1].(time.Time).Equal(old) {
-			t.Fatalf("пачка %d: курсор-время = %v, want общая отметка %v", i+1, args[1], old)
+			t.Fatalf("batch %d: the time cursor = %v, want the common stamp %v", i+1, args[1], old)
 		}
 		if args[4].(int16) != int16(i-1) {
-			t.Fatalf("пачка %d: курсор sub = %v, want %d (PK-хвост за последней строкой предыдущей)", i+1, args[4], i-1)
+			t.Fatalf("batch %d: the sub cursor = %v, want %d (the PK tail past the previous batch's last row)", i+1, args[4], i-1)
 		}
 	}
 }
@@ -786,19 +786,19 @@ func TestRetentionPass_RetryPurgeFailureKeepsList(t *testing.T) {
 
 	st := &retentionState{}
 	if _, err := retentionPass(context.Background(), pool, opts, st); err != nil {
-		t.Fatalf("проход 1: %v", err)
+		t.Fatalf("pass 1: %v", err)
 	}
 	if len(st.retries) != 1 {
-		t.Fatalf("список ретраев = %d, want 1 после прохода 1", len(st.retries))
+		t.Fatalf("the retry list = %d, want 1 after pass 1", len(st.retries))
 	}
 
 	// The probe purge fails: the list must survive until the next pass.
-	pool.purgeErr = errors.New("бд недоступна")
+	pool.purgeErr = errors.New("db unavailable")
 	if _, err := retentionPass(context.Background(), pool, opts, st); err == nil {
-		t.Fatal("проход 2 обязан упасть ошибкой чистки")
+		t.Fatal("pass 2 must fail with a purge error")
 	}
 	if len(st.retries) != 1 {
-		t.Fatalf("список ретраев после сбоя чистки = %d, want 1 (ключи не теряются)", len(st.retries))
+		t.Fatalf("the retry list after the purge failure = %d, want 1 (keys are not lost)", len(st.retries))
 	}
 }
 
@@ -817,14 +817,14 @@ func TestRetentionPass_NoMidPassProbe(t *testing.T) {
 
 	st := &retentionState{}
 	if _, err := retentionPass(context.Background(), pool, opts, st); err != nil {
-		t.Fatalf("проход: %v", err)
+		t.Fatalf("pass: %v", err)
 	}
 	if len(st.retries) != 1 {
-		t.Fatalf("список ретраев = %d, want 1 (ключ отложен текущим проходом)", len(st.retries))
+		t.Fatalf("the retry list = %d, want 1 (the key deferred by the current pass)", len(st.retries))
 	}
 	for i, q := range pool.queries {
 		if q.sql == retentionProbeSQL {
-			t.Fatalf("зонд выполнен среди дренажа (обращение %d) вопреки «один раз за проход, до дренажа»", i)
+			t.Fatalf("the probe ran amid the drain (call %d) despite \"once per pass, before the drain\"", i)
 		}
 	}
 }

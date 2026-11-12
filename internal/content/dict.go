@@ -81,16 +81,16 @@ type Dict struct {
 func NewDict(raw []byte) (*Dict, error) {
 	insp, err := zstd.InspectDictionary(raw)
 	if err != nil {
-		return nil, fmt.Errorf("словарь zstd некорректен: %w", err)
+		return nil, fmt.Errorf("the zstd dictionary is malformed: %w", err)
 	}
 	enc, err := zstd.NewWriter(nil, zstd.WithEncoderDict(raw))
 	if err != nil {
-		return nil, fmt.Errorf("энкодер со словарём: %w", err)
+		return nil, fmt.Errorf("encoder with the dictionary: %w", err)
 	}
 	dec, err := zstd.NewReader(nil, zstd.WithDecoderDicts(raw))
 	if err != nil {
 		_ = enc.Close() // best-effort cleanup: the primary error is the decoder
-		return nil, fmt.Errorf("декодер со словарём: %w", err)
+		return nil, fmt.Errorf("decoder with the dictionary: %w", err)
 	}
 	return &Dict{raw: raw, id: insp.ID(), enc: enc, dec: dec}, nil
 }
@@ -126,30 +126,30 @@ func (d *Dict) Save(path string) error {
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".*")
 	if err != nil {
-		return fmt.Errorf("словарь: временный файл: %w", err)
+		return fmt.Errorf("dictionary: temporary file: %w", err)
 	}
 	name := tmp.Name()
 	if _, err := tmp.Write(d.raw); err != nil {
 		_ = tmp.Close() // best-effort cleanup: the primary error is the write
 		_ = os.Remove(name)
-		return fmt.Errorf("словарь: запись: %w", err)
+		return fmt.Errorf("dictionary: write: %w", err)
 	}
 	if err := tmp.Sync(); err != nil {
 		_ = tmp.Close()
 		_ = os.Remove(name)
-		return fmt.Errorf("словарь: синхронизация: %w", err)
+		return fmt.Errorf("dictionary: sync: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
 		_ = os.Remove(name)
-		return fmt.Errorf("словарь: запись: %w", err)
+		return fmt.Errorf("dictionary: write: %w", err)
 	}
 	if err := os.Chmod(name, 0o644); err != nil {
 		_ = os.Remove(name)
-		return fmt.Errorf("словарь: права: %w", err)
+		return fmt.Errorf("dictionary: permissions: %w", err)
 	}
 	if err := os.Rename(name, path); err != nil {
 		_ = os.Remove(name)
-		return fmt.Errorf("словарь: переименование: %w", err)
+		return fmt.Errorf("dictionary: rename: %w", err)
 	}
 	// The name-to-file link lives in the directory — best effort: a failure here
 	// is rare, and the dictionary is reproducible by retraining (train).
@@ -201,7 +201,7 @@ func TrainDict(samples [][]byte, opts TrainOptions) (*Dict, error) {
 		dictSize = DefaultDictSize
 	}
 	if dictSize < MinDictSize || dictSize > MaxDictSize {
-		return nil, fmt.Errorf("dict train: размер словаря %d вне диапазона %d..%d байт",
+		return nil, fmt.Errorf("dict train: the dictionary size %d is outside the %d..%d byte range",
 			dictSize, MinDictSize, MaxDictSize)
 	}
 	contents := make([][]byte, 0, len(samples))
@@ -213,12 +213,12 @@ func TrainDict(samples [][]byte, opts TrainOptions) (*Dict, error) {
 		contents = append(contents, s)
 	}
 	if len(contents) == 0 {
-		return nil, errors.New("dict train: корпус образцов пуст")
+		return nil, errors.New("dict train: the sample corpus is empty")
 	}
 
 	history := trainHistory(contents, dictSize)
 	if len(history) < 8 {
-		return nil, errors.New("dict train: в корпусе нет повторяющихся фрагментов — словарь не обучается")
+		return nil, errors.New("dict train: the corpus has no repeated fragments — the dictionary is not trained")
 	}
 
 	// The dictionary ID is a deterministic function of the contents: the same
@@ -239,7 +239,7 @@ func TrainDict(samples [][]byte, opts TrainOptions) (*Dict, error) {
 		Level:    zstd.SpeedDefault,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("dict train: построение словаря: %w", err)
+		return nil, fmt.Errorf("dict train: building the dictionary: %w", err)
 	}
 	return NewDict(raw)
 }
@@ -391,21 +391,21 @@ func SetDictFile(path string, log *slog.Logger) (bool, error) {
 	raw, err := os.ReadFile(path)
 	if errors.Is(err, fs.ErrNotExist) {
 		if log != nil {
-			log.Info("словарь zstd не найден, сжатие контента без словаря", "path", path)
+			log.Info("zstd dictionary not found, compressing content without a dictionary", "path", path)
 		}
 		SetDict(nil)
 		return false, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("словарь zstd: %w", err)
+		return false, fmt.Errorf("zstd dictionary: %w", err)
 	}
 	d, err := NewDict(raw)
 	if err != nil {
-		return false, fmt.Errorf("словарь zstd %s: %w", path, err)
+		return false, fmt.Errorf("zstd dictionary %s: %w", path, err)
 	}
 	SetDict(d)
 	if log != nil {
-		log.Info("словарь zstd загружен", "path", path, "id", d.ID(), "size", len(raw))
+		log.Info("zstd dictionary loaded", "path", path, "id", d.ID(), "size", len(raw))
 	}
 	return true, nil
 }
@@ -454,12 +454,12 @@ func WarnDictMismatch(dir string, log *slog.Logger) {
 			// Checking file existence is cheaper than loading codecs at startup:
 			// the lazy late registration itself happens on the first read.
 			if _, err := os.Stat(DictRegistryPath(reg, hdr.dictID)); err == nil {
-				log.Info("словарь zstd новее пака — кадры прежнего словаря читаются через реестр",
+				log.Info("the zstd dictionary is newer than the pack — frames of the previous dictionary are read via the registry",
 					"pack", max, "pack_dict_id", packDict, "active_dict_id", actDict, "registry", reg)
 				return
 			}
 		}
-		log.Warn("словарь zstd не соответствует новейшему паку и не найден в реестре прежних словарей — кадры этого словаря нечитаемы (верните файл словаря в реестр, runbooks.md §1)",
+		log.Warn("the zstd dictionary does not match the newest pack and is not found in the previous-dictionary registry — frames of this dictionary are unreadable (return the dictionary file to the registry, runbooks.md §1)",
 			"pack", max, "pack_dict_id", packDict, "active_dict_id", actDict)
 	}
 }
@@ -548,21 +548,21 @@ func dictFromRegistry(id uint32) (*Dict, error) {
 		return d, nil
 	}
 	if dir == "" {
-		return nil, fmt.Errorf("%w: %08x — реестр прежних словарей не подключён (каталог задаётся content.zstd_dictionary)",
+		return nil, fmt.Errorf("%w: %08x — the previous-dictionary registry is not mounted (the directory is set by content.zstd_dictionary)",
 			zstd.ErrUnknownDictionary, id)
 	}
 	path := DictRegistryPath(dir, id)
 	d, err := LoadDict(path)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			return nil, fmt.Errorf("%w: словарь %08x отсутствует в реестре (%s) — кадры этого словаря нечитаемы, верните файл в реестр (runbooks.md §1)",
+			return nil, fmt.Errorf("%w: dictionary %08x is missing from the registry (%s) — frames of this dictionary are unreadable, return the file to the registry (runbooks.md §1)",
 				zstd.ErrUnknownDictionary, id, path)
 		}
-		return nil, fmt.Errorf("%w: словарь %08x из реестра %s: %s",
+		return nil, fmt.Errorf("%w: dictionary %08x from the registry %s: %s",
 			zstd.ErrUnknownDictionary, id, path, err)
 	}
 	if d.ID() != id {
-		return nil, fmt.Errorf("%w: файл реестра %s содержит словарь %08x, кадр требует %08x (имя файла не соответствует содержимому)",
+		return nil, fmt.Errorf("%w: the registry file %s carries dictionary %08x, the frame requires %08x (the file name does not match the contents)",
 			zstd.ErrUnknownDictionary, path, d.ID(), id)
 	}
 	dictMu.Lock()

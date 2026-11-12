@@ -129,7 +129,7 @@ func retentionPendingSnapshot(ctx context.Context, src RetentionPending) (*reten
 	for _, s := range retentionPendingStreams {
 		keys, err := src.PendingKeys(ctx, s)
 		if err != nil {
-			return nil, fmt.Errorf("content: retention: непотреблённые %s: %w", s, err)
+			return nil, fmt.Errorf("content: retention: unconsumed %s: %w", s, err)
 		}
 		sets[s] = keys
 	}

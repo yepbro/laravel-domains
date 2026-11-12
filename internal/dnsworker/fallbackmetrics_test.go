@@ -63,11 +63,11 @@ func TestCollectFallbackLoopNoop(t *testing.T) {
 	// Without a registry or a source — a no-op: no panic, no
 	// registration.
 	if err := CollectFallbackLoop(context.Background(), nil, func() dnsclient.FallbackStats { return dnsclient.FallbackStats{} }, time.Millisecond, nil); err != nil {
-		t.Fatalf("nil-реестр: %v", err)
+		t.Fatalf("a nil registry: %v", err)
 	}
 	reg := metrics.New("dns-worker")
 	if err := CollectFallbackLoop(context.Background(), reg, nil, time.Millisecond, nil); err != nil {
-		t.Fatalf("nil-источник: %v", err)
+		t.Fatalf("a nil source: %v", err)
 	}
 	families, err := reg.Gather()
 	if err != nil {
@@ -75,7 +75,7 @@ func TestCollectFallbackLoopNoop(t *testing.T) {
 	}
 	for _, mf := range families {
 		if strings.HasPrefix(mf.GetName(), "crawler_dns_fallback_") {
-			t.Fatalf("приборы переключений зарегистрированы без источника: %s", mf.GetName())
+			t.Fatalf("switchover instruments registered without a source: %s", mf.GetName())
 		}
 	}
 }
@@ -111,7 +111,7 @@ func TestCollectFallbackLoopExportsAndDeltas(t *testing.T) {
 			t.Fatalf("CollectFallbackLoop: %v", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("коллектор не завершился после отмены ctx")
+		t.Fatal("the collector did not finish after the ctx cancel")
 	}
 }
 
@@ -151,6 +151,6 @@ func waitFor(t *testing.T, cond func() bool) {
 		time.Sleep(time.Millisecond)
 	}
 	if !cond() {
-		t.Fatal("условие коллектора не выполнено за 2 с")
+		t.Fatal("the collector condition not met within 2s")
 	}
 }

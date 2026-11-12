@@ -664,7 +664,7 @@ func retentionBlocked(ctx context.Context, o RetentionOptions) (int64, bool, err
 func retentionSelect(ctx context.Context, pool RetentionDB, o RetentionOptions, after retentionCursor) ([]retentionCandidate, error) {
 	o = o.withDefaults()
 	if err := o.Gate.Acquire(ctx); err != nil {
-		return nil, fmt.Errorf("content: retention: выборка кандидатов: %w", err)
+		return nil, fmt.Errorf("content: retention: candidate selection: %w", err)
 	}
 	defer o.Gate.Release()
 
@@ -673,7 +673,7 @@ func retentionSelect(ctx context.Context, pool RetentionDB, o RetentionOptions, 
 
 	tx, err := pool.Begin(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("content: retention: транзакция выборки: %w", err)
+		return nil, fmt.Errorf("content: retention: selection transaction: %w", err)
 	}
 	// Rollback unconditionally: after Commit it is a no-op (the T-020/T-044
 	// style).
@@ -687,7 +687,7 @@ func retentionSelect(ctx context.Context, pool RetentionDB, o RetentionOptions, 
 		fmt.Sprintf(retentionSelectTimeoutFmt, o.SelectTimeout.Milliseconds()),
 	} {
 		if _, err := tx.Exec(ctx, pin); err != nil {
-			return nil, fmt.Errorf("content: retention: закрепление плана: %w", err)
+			return nil, fmt.Errorf("content: retention: pinning the plan: %w", err)
 		}
 	}
 
@@ -697,7 +697,7 @@ func retentionSelect(ctx context.Context, pool RetentionDB, o RetentionOptions, 
 		o.BatchSize,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("content: retention: выборка кандидатов: %w", err)
+		return nil, fmt.Errorf("content: retention: candidate selection: %w", err)
 	}
 	defer rows.Close()
 
@@ -708,16 +708,16 @@ func retentionSelect(ctx context.Context, pool RetentionDB, o RetentionOptions, 
 			variant int16
 		)
 		if err := rows.Scan(&c.key.zone, &c.key.domain, &c.key.sub, &variant, &c.hash, &c.checkedAt); err != nil {
-			return nil, fmt.Errorf("content: retention: выборка кандидатов: чтение: %w", err)
+			return nil, fmt.Errorf("content: retention: candidate selection: read: %w", err)
 		}
 		c.key.variant = variant
 		out = append(out, c)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("content: retention: выборка кандидатов: %w", err)
+		return nil, fmt.Errorf("content: retention: candidate selection: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return nil, fmt.Errorf("content: retention: фиксация выборки: %w", err)
+		return nil, fmt.Errorf("content: retention: committing the selection: %w", err)
 	}
 	return out, nil
 }
@@ -740,7 +740,7 @@ func retentionProbe(ctx context.Context, pool RetentionDB, o RetentionOptions, k
 		zones, domains, subs, variants, o.Retention.String(),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("content: retention: зонд ретраев: %w", err)
+		return nil, fmt.Errorf("content: retention: retry probe: %w", err)
 	}
 	defer rows.Close()
 
@@ -751,13 +751,13 @@ func retentionProbe(ctx context.Context, pool RetentionDB, o RetentionOptions, k
 			variant int16
 		)
 		if err := rows.Scan(&c.key.zone, &c.key.domain, &c.key.sub, &variant, &c.hash); err != nil {
-			return nil, fmt.Errorf("content: retention: зонд ретраев: чтение: %w", err)
+			return nil, fmt.Errorf("content: retention: retry probe: read: %w", err)
 		}
 		c.key.variant = variant
 		out = append(out, c)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("content: retention: зонд ретраев: %w", err)
+		return nil, fmt.Errorf("content: retention: retry probe: %w", err)
 	}
 	return out, nil
 }
@@ -784,7 +784,7 @@ func retentionPurge(ctx context.Context, pool RetentionDB, o RetentionOptions, b
 
 	tx, err := pool.Begin(ctx)
 	if err != nil {
-		return st, fmt.Errorf("content: retention: транзакция: %w", err)
+		return st, fmt.Errorf("content: retention: transaction: %w", err)
 	}
 	// Rollback unconditionally: after Commit it is a no-op (the T-020/T-044
 	// style). An interrupted batch leaves no half-changes.
@@ -793,7 +793,7 @@ func retentionPurge(ctx context.Context, pool RetentionDB, o RetentionOptions, b
 	rows, err := tx.Query(ctx, retentionPurgeSQL,
 		zones, domains, subs, variants, hashes, o.Retention.String())
 	if err != nil {
-		return st, fmt.Errorf("content: retention: очистка строк: %w", err)
+		return st, fmt.Errorf("content: retention: row purge: %w", err)
 	}
 	defer rows.Close()
 
@@ -804,7 +804,7 @@ func retentionPurge(ctx context.Context, pool RetentionDB, o RetentionOptions, b
 	for rows.Next() {
 		var hash []byte
 		if err := rows.Scan(&hash); err != nil {
-			return st, fmt.Errorf("content: retention: очистка строк: чтение: %w", err)
+			return st, fmt.Errorf("content: retention: row purge: read: %w", err)
 		}
 		st.Rows++
 		if hash == nil {
@@ -826,7 +826,7 @@ func retentionPurge(ctx context.Context, pool RetentionDB, o RetentionOptions, b
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return st, fmt.Errorf("content: retention: очистка строк: %w", err)
+		return st, fmt.Errorf("content: retention: row purge: %w", err)
 	}
 
 	if len(refs) > 0 {
@@ -842,7 +842,7 @@ func retentionPurge(ctx context.Context, pool RetentionDB, o RetentionOptions, b
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return st, fmt.Errorf("content: retention: фиксация: %w", err)
+		return st, fmt.Errorf("content: retention: commit: %w", err)
 	}
 	st.Batches = 1
 	return st, nil
@@ -872,7 +872,7 @@ func retentionDecrease(ctx context.Context, tx pgx.Tx, refs map[Hash]int32, st *
 
 	rows, err := tx.Query(ctx, retentionDecrefSQL, hashes, counts)
 	if err != nil {
-		return fmt.Errorf("content: retention: уменьшение refcount: %w", err)
+		return fmt.Errorf("content: retention: refcount decrement: %w", err)
 	}
 	defer rows.Close()
 	updated := make(map[Hash]struct{}, len(list))
@@ -884,7 +884,7 @@ func retentionDecrease(ctx context.Context, tx pgx.Tx, refs map[Hash]int32, st *
 			clen int32
 		)
 		if err := rows.Scan(&hash, &refc, &clen); err != nil {
-			return fmt.Errorf("content: retention: уменьшение refcount: чтение: %w", err)
+			return fmt.Errorf("content: retention: refcount decrement: read: %w", err)
 		}
 		var h Hash
 		copy(h[:], hash)
@@ -895,7 +895,7 @@ func retentionDecrease(ctx context.Context, tx pgx.Tx, refs map[Hash]int32, st *
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return fmt.Errorf("content: retention: уменьшение refcount: %w", err)
+		return fmt.Errorf("content: retention: refcount decrement: %w", err)
 	}
 	// Cut references not found in contents: a bookkeeping divergence (a
 	// reference without a counter would break the T-044 invariant) — the
@@ -906,7 +906,7 @@ func retentionDecrease(ctx context.Context, tx pgx.Tx, refs map[Hash]int32, st *
 	if len(dead) > 0 {
 		tag, err := tx.Exec(ctx, retentionDeleteSQL, dead)
 		if err != nil {
-			return fmt.Errorf("content: retention: удаление contents: %w", err)
+			return fmt.Errorf("content: retention: deleting contents: %w", err)
 		}
 		st.Contents += tag.RowsAffected()
 	}
@@ -950,7 +950,7 @@ func compareHash(a, b Hash) int {
 // (a single ticker goroutine) — no locks are needed.
 func RetentionLoop(ctx context.Context, pool RetentionDB, opts RetentionOptions) error {
 	if pool == nil {
-		return errors.New("content: retention: пул не задан")
+		return errors.New("content: retention: the pool is not set")
 	}
 	o := opts.withDefaults()
 	log := o.Log
@@ -958,10 +958,10 @@ func RetentionLoop(ctx context.Context, pool RetentionDB, opts RetentionOptions)
 		log = slog.New(slog.DiscardHandler)
 	}
 	if o.Retention <= 0 {
-		log.Info("retention контента выключен (content.retention = 0)")
+		log.Info("content retention is disabled (content.retention = 0)")
 		return nil
 	}
-	log.Info("цикл retention контента запущен",
+	log.Info("content retention loop started",
 		"retention", o.Retention.String(),
 		"interval", o.Interval.String(),
 		"batch", o.BatchSize,
@@ -983,14 +983,14 @@ func RetentionLoop(ctx context.Context, pool RetentionDB, opts RetentionOptions)
 	switch cur, ok, err := retentionLoadCursor(ctx, pool); {
 	case err != nil && errors.Is(err, errRetentionNoCursorTable):
 		state.persist = false
-		log.Info("retention: таблицы персистентного курсора нет — рестарты дают полный catch-up (миграция 000020 не применена?)")
+		log.Info("retention: the persistent cursor table is missing — restarts give a full catch-up (migration 000020 not applied?)")
 	case err != nil && errors.Is(err, errRetentionCursorInvalid):
-		log.Warn("retention: сохранённый курсор дренажа некорректен — старт с нулевого (полный catch-up)", "err", err)
+		log.Warn("retention: the saved drain cursor is malformed — starting from zero (a full catch-up)", "err", err)
 	case err != nil:
-		log.Warn("retention: персистентный курсор не прочитан — старт с нулевого (полный catch-up)", "err", err)
+		log.Warn("retention: the persistent cursor was not read — starting from zero (a full catch-up)", "err", err)
 	case ok:
 		state.cursor = cur
-		log.Info("retention: дренаж продолжается с персистентного курсора",
+		log.Info("retention: the drain continues from the persistent cursor",
 			"checked_at", cur.checkedAt.Format(time.RFC3339),
 			"zone_id", cur.key.zone, "domain_id", cur.key.domain)
 	}
@@ -1001,7 +1001,7 @@ func RetentionLoop(ctx context.Context, pool RetentionDB, opts RetentionOptions)
 			// A cancellation during the pass is part of the stop, not an
 			// alarm.
 			if ctx.Err() == nil {
-				log.Warn("проход retention контента", "err", err)
+				log.Warn("content retention pass", "err", err)
 				if o.OnError != nil {
 					o.OnError(err)
 				}
@@ -1012,7 +1012,7 @@ func RetentionLoop(ctx context.Context, pool RetentionDB, opts RetentionOptions)
 			// The interlock: the analyzer cannot keep up, the bodies are
 			// still needed — the alert is on the skip metric
 			// (retentionmetrics.go).
-			log.Warn("проход retention контента пропущен: глубина q:analyze у порога",
+			log.Warn("content retention pass skipped: the q:analyze depth is at the watermark",
 				"depth", stats.Depth, "watermark", o.AnalyzeWatermark)
 		}
 		if stats.SkippedPending {
@@ -1023,21 +1023,21 @@ func RetentionLoop(ctx context.Context, pool RetentionDB, opts RetentionOptions)
 			// rows_done — the batches committed before the error point
 			// (the skip concerns the pass remainder; what was done stays
 			// in the DB).
-			log.Warn("проход retention контента пропущен: ошибка чтения q:render/q:analyze",
+			log.Warn("content retention pass skipped: an error reading q:render/q:analyze",
 				"rows_done", stats.Rows)
 		}
 		if n := stats.Deferred[queue.StreamRender]; n > 0 {
-			log.Warn("retention: записи ожидают q:render — не тронуты", "deferred", n)
+			log.Warn("retention: rows waiting for q:render — untouched", "deferred", n)
 		}
 		if n := stats.Deferred[queue.StreamAnalyze]; n > 0 {
-			log.Warn("retention: записи ожидают q:analyze — не тронуты", "deferred", n)
+			log.Warn("retention: rows waiting for q:analyze — untouched", "deferred", n)
 		}
 		if stats.BadHashes > 0 || stats.Missing > 0 {
-			log.Warn("retention: аномалии учёта контента",
+			log.Warn("retention: content accounting anomalies",
 				"bad_hashes", stats.BadHashes, "missing_refs", stats.Missing)
 		}
 		if stats.Rows > 0 {
-			log.Info("проход retention контента",
+			log.Info("content retention pass",
 				"rows", stats.Rows, "refs", stats.Refs,
 				"contents", stats.Contents, "freed_bytes", stats.FreedBytes,
 				"batches", stats.Batches)

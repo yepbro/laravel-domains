@@ -51,11 +51,11 @@ func newFallbackCounters(reg *metrics.Registry) *fallbackCounters {
 	return &fallbackCounters{
 		switches: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_dns_fallback_switches_total",
-			Help: "DNS-обменов, отвеченных резервным резолвером: основной не ответил транспортно, сработало переключение dns.fallback_resolvers (T-107).",
+			Help: "DNS exchanges answered by the fallback resolver: the primary failed on transport, the dns.fallback_resolvers switchover fired (T-107).",
 		}).WithLabelValues(),
 		exhausted: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_dns_fallback_exhausted_total",
-			Help: "DNS-обменов, провалившихся на всей цепи резолверов (основной + резервные): каждый — будущий temp_error (T-036/T-039).",
+			Help: "DNS exchanges that failed on the whole resolver chain (primary + fallbacks): each is a future temp_error (T-036/T-039).",
 		}).WithLabelValues(),
 	}
 }
@@ -106,7 +106,7 @@ func CollectFallbackLoop(
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	log.Info("коллектор переключений DNS на резерв", "interval", interval.String())
+	log.Info("DNS fallback switchover collector", "interval", interval.String())
 
 	var prev dnsclient.FallbackStats
 	pass := func() { collectFallbackPass(c, stats, &prev) }

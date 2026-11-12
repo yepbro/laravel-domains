@@ -112,11 +112,11 @@ func subdomIPs(addrs []netip.Addr) []string {
 func subdomEqualIPs(t *testing.T, got []netip.Addr, want ...string) {
 	t.Helper()
 	if gotS, wantS := subdomIPs(got), want; len(gotS) != len(wantS) {
-		t.Fatalf("адреса: получено %v, ожидалось %v", gotS, wantS)
+		t.Fatalf("addresses: got %v, expected %v", gotS, wantS)
 	} else {
 		for i := range gotS {
 			if gotS[i] != wantS[i] {
-				t.Fatalf("адрес №%d: получено %s, ожидалось %s", i+1, gotS[i], wantS[i])
+				t.Fatalf("address #%d: got %s, expected %s", i+1, gotS[i], wantS[i])
 			}
 		}
 	}
@@ -140,7 +140,7 @@ func subdomAssertNoCNAMEQuestions(t *testing.T, f *subdomFakeResolver) {
 	t.Helper()
 	for _, q := range f.calls {
 		if q.Type == dns.TypeCNAME {
-			t.Fatalf("выдан отдельный вопрос CNAME %q — записи CNAME приходят в ответах A/AAAA", q.Name)
+			t.Fatalf("a separate CNAME question %q issued — CNAME records arrive in the A/AAAA answers", q.Name)
 		}
 	}
 }
@@ -172,23 +172,23 @@ func TestSubdomDirectA(t *testing.T) {
 		t.Fatalf("CheckSubdomains: %v", err)
 	}
 	if len(rep.Results) != 2 {
-		t.Fatalf("результатов %d, ожидалось 2 (апекс + www)", len(rep.Results))
+		t.Fatalf("%d results, expected 2 (apex + www)", len(rep.Results))
 	}
 
 	apex := rep.Results[0]
 	if apex.Label != "" || apex.ID != 0 {
-		t.Fatalf("апекс: label=%q id=%d, ожидалось \"\" и 0", apex.Label, apex.ID)
+		t.Fatalf("apex: label=%q id=%d, expected \"\" and 0", apex.Label, apex.ID)
 	}
 	subdomEqualIPs(t, apex.A, "192.0.2.10", "192.0.2.11")
 	subdomEqualIPs(t, apex.AAAA) // the AAAA question was asked, the answer is empty (NODATA)
 	if apex.HasAddrs() != true {
-		t.Fatal("апекс: HasAddrs = false при найденных A")
+		t.Fatal("apex: HasAddrs = false with A records found")
 	}
 	if apex.Chain != nil || apex.CNAME() != "" || apex.Target() != "" {
-		t.Fatalf("апекс: цепочка %#v у имени без CNAME", apex.Chain)
+		t.Fatalf("apex: the chain %#v for a name without a CNAME", apex.Chain)
 	}
 	if apex.RCode != dnsclient.RCodeNOERROR || apex.Err != nil {
-		t.Fatalf("апекс: RCode=%v Err=%v", apex.RCode, apex.Err)
+		t.Fatalf("apex: RCode=%v Err=%v", apex.RCode, apex.Err)
 	}
 
 	www := rep.Results[1]
@@ -198,19 +198,19 @@ func TestSubdomDirectA(t *testing.T) {
 	// the AAAA questions are asked of both, and there are no CNAME
 	// questions.
 	if q := f.calls[0]; subdomCanon(q.Name) != "example.com." || q.Type != dns.TypeA {
-		t.Fatalf("первый вопрос %q %v, ожидался A example.com.", q.Name, dns.TypeToString[q.Type])
+		t.Fatalf("the first question %q %v, expected A example.com.", q.Name, dns.TypeToString[q.Type])
 	}
 	if n := subdomCallCount(f, "example.com", dns.TypeAAAA); n != 1 {
-		t.Fatalf("вопросов AAAA апексу: %d, ожидался 1", n)
+		t.Fatalf("AAAA questions to the apex: %d, expected 1", n)
 	}
 	if n := subdomCallCount(f, "www.example.com", dns.TypeAAAA); n != 1 {
-		t.Fatalf("вопросов AAAA www: %d, ожидался 1", n)
+		t.Fatalf("AAAA questions to www: %d, expected 1", n)
 	}
 	subdomAssertNoCNAMEQuestions(t, f)
 
 	// The mask: both subdomains have addresses (bits 0 and 1).
 	if want := model.DNSMask(0b11); rep.Mask != want {
-		t.Fatalf("маска %v (%05b), ожидалось %v", rep.Mask, int64(rep.Mask), want)
+		t.Fatalf("the mask %v (%05b), expected %v", rep.Mask, int64(rep.Mask), want)
 	}
 }
 
@@ -235,24 +235,24 @@ func TestSubdomCNAMEOneHopInAnswer(t *testing.T) {
 	}
 	r := rep.Results[0]
 	if len(r.Chain) != 1 || r.Chain[0] != "example.com." {
-		t.Fatalf("цепочка %v, ожидалась [example.com.]", r.Chain)
+		t.Fatalf("chain %v, expected [example.com.]", r.Chain)
 	}
 	if r.CNAME() != "example.com." || r.Target() != "example.com." {
-		t.Fatalf("CNAME=%q Target=%q, ожидалась цель example.com.", r.CNAME(), r.Target())
+		t.Fatalf("CNAME=%q Target=%q, expected the target example.com.", r.CNAME(), r.Target())
 	}
 	subdomEqualIPs(t, r.A, "192.0.2.1")
 	subdomEqualIPs(t, r.AAAA, "2001:db8::1") // AAAA — by the terminal name
 	if !r.HasAddrs() || !rep.Mask.Test(0) {
-		t.Fatal("www с адресами: бит маски не поставлен")
+		t.Fatal("www with addresses: the mask bit not set")
 	}
 	if n := subdomCallCount(f, "www.example.com", dns.TypeA); n != 1 {
-		t.Fatalf("A-обменов с www: %d, ожидался 1 (цепочка в одном ответе)", n)
+		t.Fatalf("A exchanges with www: %d, expected 1 (the chain in one answer)", n)
 	}
 	if n := subdomCallCount(f, "example.com", dns.TypeA); n != 0 {
-		t.Fatalf("повторный A-обмен с целью: %d, ожидался 0", n)
+		t.Fatalf("a repeated A exchange with the target: %d, expected 0", n)
 	}
 	if n := subdomCallCount(f, "example.com", dns.TypeAAAA); n != 1 {
-		t.Fatalf("AAAA-обменов с терминалом: %d, ожидался 1", n)
+		t.Fatalf("AAAA exchanges with the terminal: %d, expected 1", n)
 	}
 	subdomAssertNoCNAMEQuestions(t, f)
 }
@@ -275,17 +275,17 @@ func TestSubdomCNAMEFollowUpExchanges(t *testing.T) {
 	}
 	r := rep.Results[0]
 	if len(r.Chain) != 1 || r.Chain[0] != "cdn.example.net." {
-		t.Fatalf("цепочка %v, ожидалась [cdn.example.net.]", r.Chain)
+		t.Fatalf("chain %v, expected [cdn.example.net.]", r.Chain)
 	}
 	subdomEqualIPs(t, r.A, "203.0.113.5")
 	if r.RCode != dnsclient.RCodeNOERROR || r.Err != nil {
 		t.Fatalf("RCode=%v Err=%v", r.RCode, r.Err)
 	}
 	if n := subdomCallCount(f, "cdn.example.net", dns.TypeA); n != 1 {
-		t.Fatalf("A-обменов с терминалом: %d, ожидался 1", n)
+		t.Fatalf("A exchanges with the terminal: %d, expected 1", n)
 	}
 	if !rep.Mask.Test(0) {
-		t.Fatal("бит маски не поставлен")
+		t.Fatal("the mask bit not set")
 	}
 }
 
@@ -310,14 +310,14 @@ func TestSubdomLongChainInOneAnswer(t *testing.T) {
 	}
 	r := rep.Results[0]
 	if len(r.Chain) != 5 {
-		t.Fatalf("длина цепочки %d, ожидалась 5 (звенья c1..c5): %v", len(r.Chain), r.Chain)
+		t.Fatalf("the chain length %d, expected 5 (the links c1..c5): %v", len(r.Chain), r.Chain)
 	}
 	if r.CNAME() != "c1.example.net." || r.Target() != "c5.example.net." {
 		t.Fatalf("CNAME=%q Target=%q", r.CNAME(), r.Target())
 	}
 	subdomEqualIPs(t, r.A, "203.0.113.9")
 	if len(f.calls) != 1 {
-		t.Fatalf("обменов %d, ожидался 1 (цепочка в одном ответе)", len(f.calls))
+		t.Fatalf("%d exchanges, expected 1 (the chain in one answer)", len(f.calls))
 	}
 }
 
@@ -337,19 +337,19 @@ func TestSubdomCNAMELoop(t *testing.T) {
 	}
 	r := rep.Results[0]
 	if !errors.Is(r.Err, ErrSubdomCNAMELoop) {
-		t.Fatalf("Err %v, ожидался ErrSubdomCNAMELoop", r.Err)
+		t.Fatalf("Err %v, expected ErrSubdomCNAMELoop", r.Err)
 	}
 	if r.HasAddrs() || len(r.A) != 0 {
-		t.Fatal("цикл: адресов быть не должно")
+		t.Fatal("a loop: there must be no addresses")
 	}
 	if len(r.Chain) != 1 || r.Chain[0] != "a.example.com." {
-		t.Fatalf("цепочка %v, ожидалось единственное звено a.example.com.", r.Chain)
+		t.Fatalf("chain %v, expected the single link a.example.com.", r.Chain)
 	}
 	if rep.Mask.Test(0) {
-		t.Fatal("цикл: бит маски поставлен")
+		t.Fatal("a loop: the mask bit set")
 	}
 	if len(f.calls) != 2 {
-		t.Fatalf("обменов %d, ожидалось 2 (www и a), AAAA не спрашивается", len(f.calls))
+		t.Fatalf("%d exchanges, expected 2 (www and a), AAAA not queried", len(f.calls))
 	}
 }
 
@@ -372,13 +372,13 @@ func TestSubdomCNAMEDepthExceeded(t *testing.T) {
 	}
 	r := rep.Results[0]
 	if !errors.Is(r.Err, ErrSubdomCNAMEDepth) {
-		t.Fatalf("Err %v, ожидался ErrSubdomCNAMEDepth", r.Err)
+		t.Fatalf("Err %v, expected ErrSubdomCNAMEDepth", r.Err)
 	}
 	if len(r.Chain) != subdomMaxChain {
-		t.Fatalf("длина цепочки %d, ожидался предел %d", len(r.Chain), subdomMaxChain)
+		t.Fatalf("the chain length %d, expected the limit %d", len(r.Chain), subdomMaxChain)
 	}
 	if r.HasAddrs() || rep.Mask.Test(0) {
-		t.Fatal("превышение глубины: адресов и бита быть не должно")
+		t.Fatal("a depth overrun: there must be no addresses and no bit")
 	}
 }
 
@@ -406,22 +406,22 @@ func TestSubdomCNAMETargetNXDOMAIN(t *testing.T) {
 	}
 	r := rep.Results[0]
 	if r.Err != nil {
-		t.Fatalf("CNAME→NXDOMAIN — не ошибка субдомена, получен %v", r.Err)
+		t.Fatalf("CNAME→NXDOMAIN — not a subdomain error, got %v", r.Err)
 	}
 	if r.RCode != dnsclient.RCodeNXDOMAIN {
-		t.Fatalf("RCode %v, ожидался NXDOMAIN", r.RCode)
+		t.Fatalf("RCode %v, expected NXDOMAIN", r.RCode)
 	}
 	if r.HasAddrs() || len(r.A) != 0 {
-		t.Fatal("цели нет — адресов быть не должно")
+		t.Fatal("no target — there must be no addresses")
 	}
 	if len(r.Chain) != 1 || r.Chain[0] != "gone.example.net." {
-		t.Fatalf("цепочка %v, ожидалась [gone.example.net.]", r.Chain)
+		t.Fatalf("chain %v, expected [gone.example.net.]", r.Chain)
 	}
 	if rep.Mask.Test(0) {
-		t.Fatal("бит маски поставлен у субдомена без адресов")
+		t.Fatal("the mask bit set for a subdomain without addresses")
 	}
 	if n := subdomCallCount(f, "gone.example.net", dns.TypeAAAA); n != 0 {
-		t.Fatalf("AAAA после NXDOMAIN: %d вопросов, ожидалось 0", n)
+		t.Fatalf("AAAA after NXDOMAIN: %d questions, expected 0", n)
 	}
 }
 
@@ -439,11 +439,11 @@ func TestSubdomAAAAFlag(t *testing.T) {
 		t.Fatalf("CheckSubdomains: %v", err)
 	}
 	if n := subdomCallCount(f, "example.com", dns.TypeAAAA); n != 0 {
-		t.Fatalf("askAAAA=false: вопросов AAAA %d, ожидалось 0", n)
+		t.Fatalf("askAAAA=false: %d AAAA questions, expected 0", n)
 	}
 	subdomEqualIPs(t, rep.Results[0].AAAA)
 	if !rep.Mask.Test(0) {
-		t.Fatal("бит по A-адресам не поставлен")
+		t.Fatal("the bit not set from the A addresses")
 	}
 
 	// On, and the name only lives over IPv6: A — NODATA, AAAA gives the
@@ -460,7 +460,7 @@ func TestSubdomAAAAFlag(t *testing.T) {
 	subdomEqualIPs(t, r.A)
 	subdomEqualIPs(t, r.AAAA, "2001:db8::3")
 	if !r.HasAddrs() || !rep2.Mask.Test(0) {
-		t.Fatal("v6-only субдомен: бит не поставлен")
+		t.Fatal("a v6-only subdomain: the bit not set")
 	}
 }
 
@@ -474,7 +474,7 @@ func TestSubdomAAAATransportError(t *testing.T) {
 			subdomKey("www.example.com", dns.TypeA): {subdomA("www.example.com.", "192.0.2.7")},
 		},
 		errs: map[string]error{
-			subdomKey("www.example.com", dns.TypeAAAA): errors.New("сеть недоступна"),
+			subdomKey("www.example.com", dns.TypeAAAA): errors.New("network unavailable"),
 		},
 	}
 	f := z.resolver()
@@ -484,15 +484,15 @@ func TestSubdomAAAATransportError(t *testing.T) {
 		t.Fatalf("CheckSubdomains: %v", err)
 	}
 	r := rep.Results[0]
-	if r.Err == nil || !strings.Contains(r.Err.Error(), "запрос AAAA") {
-		t.Fatalf("Err %v, ожидалась ошибка запроса AAAA", r.Err)
+	if r.Err == nil || !strings.Contains(r.Err.Error(), "AAAA query") {
+		t.Fatalf("Err %v, expected an AAAA query error", r.Err)
 	}
 	subdomEqualIPs(t, r.A, "192.0.2.7")
 	if !r.HasAddrs() || !rep.Mask.Test(0) {
-		t.Fatal("A найдены — бит обязан стоять")
+		t.Fatal("A found — the bit must be set")
 	}
 	if r.RCode != dnsclient.RCodeNOERROR {
-		t.Fatalf("RCode %v, ожидался NOERROR последнего успешного обмена", r.RCode)
+		t.Fatalf("RCode %v, expected the NOERROR of the last successful exchange", r.RCode)
 	}
 }
 
@@ -512,7 +512,7 @@ func TestSubdomMaskAggregatesAndErrorsIsolated(t *testing.T) {
 			subdomKey("admin.example.com", dns.TypeA): dnsclient.RCodeNXDOMAIN,
 		},
 		errs: map[string]error{
-			subdomKey("api.example.com", dns.TypeA): errors.New("истекли попытки"),
+			subdomKey("api.example.com", dns.TypeA): errors.New("attempts exhausted"),
 		},
 	}
 	f := z.resolver()
@@ -529,20 +529,20 @@ func TestSubdomMaskAggregatesAndErrorsIsolated(t *testing.T) {
 		t.Fatalf("CheckSubdomains: %v", err)
 	}
 	if len(rep.Results) != 5 {
-		t.Fatalf("результатов %d, ожидалось 5 — ошибки субдоменов не роняют пачку", len(rep.Results))
+		t.Fatalf("%d results, expected 5 — subdomain errors do not crash the batch", len(rep.Results))
 	}
 
 	www := rep.Results[1]
 	if www.RCode != dnsclient.RCodeSERVFAIL || www.Err != nil || www.HasAddrs() {
-		t.Fatalf("www: RCode=%v Err=%v HasAddrs=%v — ожидался голый SERVFAIL", www.RCode, www.Err, www.HasAddrs())
+		t.Fatalf("www: RCode=%v Err=%v HasAddrs=%v — expected a bare SERVFAIL", www.RCode, www.Err, www.HasAddrs())
 	}
 	admin := rep.Results[2]
 	if admin.RCode != dnsclient.RCodeNXDOMAIN || admin.Err != nil {
-		t.Fatalf("admin: RCode=%v Err=%v — NXDOMAIN без Err", admin.RCode, admin.Err)
+		t.Fatalf("admin: RCode=%v Err=%v — NXDOMAIN without Err", admin.RCode, admin.Err)
 	}
 	api := rep.Results[3]
 	if api.Err == nil || api.RCode != dnsclient.RCodeNOERROR {
-		t.Fatalf("api: Err=%v RCode=%v — транспортный сбой в Err", api.Err, api.RCode)
+		t.Fatalf("api: Err=%v RCode=%v — a transport failure in Err", api.Err, api.RCode)
 	}
 
 	// Bits 0 and 4 — only the subdomains with addresses.
@@ -551,10 +551,10 @@ func TestSubdomMaskAggregatesAndErrorsIsolated(t *testing.T) {
 		t.Fatalf("NewDNSMask: %v", errW)
 	}
 	if rep.Mask != want {
-		t.Fatalf("маска %v (%b), ожидалась %v (биты 0 и 4)", int64(rep.Mask), int64(rep.Mask), int64(want))
+		t.Fatalf("the mask %v (%b), expected %v (bits 0 and 4)", int64(rep.Mask), int64(rep.Mask), int64(want))
 	}
 	if rep.Mask.Test(1) || rep.Mask.Test(2) || rep.Mask.Test(3) {
-		t.Fatal("биты субдоменов без адресов поставлены")
+		t.Fatal("the bits of address-less subdomains set")
 	}
 }
 
@@ -577,10 +577,10 @@ func TestSubdomDisabledSkipped(t *testing.T) {
 		t.Fatalf("CheckSubdomains: %v", err)
 	}
 	if len(rep.Results) != 1 || rep.Results[0].Label != "www" {
-		t.Fatalf("результаты %v, ожидался только www", rep.Results)
+		t.Fatalf("results %v, expected only www", rep.Results)
 	}
 	if n := subdomCallCount(f, "admin.example.com", dns.TypeA); n != 0 {
-		t.Fatalf("отключённый субдомен опрошен: %d обменов", n)
+		t.Fatalf("a disabled subdomain queried: %d exchanges", n)
 	}
 }
 
@@ -593,32 +593,32 @@ func TestSubdomValidationErrors(t *testing.T) {
 		domain string
 		subs   []model.Subdomain
 	}{
-		{"пустой домен", "", subdomSubs("")},
-		{"домен из пробелов", "  ", subdomSubs("")},
-		{"id вне диапазона 0..62", "example.com", []model.Subdomain{{ID: 63, Label: "www", Enabled: true}}},
-		{"отрицательный id", "example.com", []model.Subdomain{{ID: -1, Label: "www", Enabled: true}}},
-		{"дубль id", "example.com", []model.Subdomain{
+		{"an empty domain", "", subdomSubs("")},
+		{"a domain of spaces", "  ", subdomSubs("")},
+		{"an id outside the 0..62 range", "example.com", []model.Subdomain{{ID: 63, Label: "www", Enabled: true}}},
+		{"a negative id", "example.com", []model.Subdomain{{ID: -1, Label: "www", Enabled: true}}},
+		{"a duplicate id", "example.com", []model.Subdomain{
 			{ID: 1, Label: "www", Enabled: true}, {ID: 1, Label: "api", Enabled: true}}},
-		{"дубль метки", "example.com", []model.Subdomain{
+		{"a duplicate label", "example.com", []model.Subdomain{
 			{ID: 0, Label: "www", Enabled: true}, {ID: 1, Label: "www", Enabled: true}}},
-		{"метка с точкой", "example.com", subdomSubs("a.b")},
-		{"метка с пробелом", "example.com", subdomSubs("a b")},
-		{"метка длиннее 63 октетов", "example.com", subdomSubs(long)},
-		{"нет включённых", "example.com", []model.Subdomain{{ID: 0, Label: "", Enabled: false}}},
-		{"пустой список", "example.com", nil},
+		{"a label with a dot", "example.com", subdomSubs("a.b")},
+		{"a label with a space", "example.com", subdomSubs("a b")},
+		{"a label longer than 63 octets", "example.com", subdomSubs(long)},
+		{"none enabled", "example.com", []model.Subdomain{{ID: 0, Label: "", Enabled: false}}},
+		{"an empty list", "example.com", nil},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			f := subdomZone{}.resolver()
 			rep, err := CheckSubdomains(context.Background(), f, tc.domain, tc.subs, true)
 			if err == nil {
-				t.Fatalf("ожидалась ошибка валидации, получен отчёт %+v", rep)
+				t.Fatalf("a validation error expected, got the report %+v", rep)
 			}
 			if rep != nil {
-				t.Fatal("при ошибке входа отчёт не выдаётся")
+				t.Fatal("no report on an input error")
 			}
 			if len(f.calls) != 0 {
-				t.Fatalf("валидация обязана отсечь обмены, было %d", len(f.calls))
+				t.Fatalf("validation must cut off the exchanges, got %d", len(f.calls))
 			}
 		})
 	}
@@ -637,10 +637,10 @@ func TestSubdomContextCanceled(t *testing.T) {
 
 	rep, err := CheckSubdomains(ctx, f, "example.com", subdomSubs(""), false)
 	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("err %v, ожидалась context.Canceled", err)
+		t.Fatalf("err %v, expected context.Canceled", err)
 	}
 	if rep != nil {
-		t.Fatal("отчёт при отмене не выдаётся")
+		t.Fatal("no report on cancellation")
 	}
 
 	// A cancellation in the middle of the batch: the first subdomain is
@@ -659,9 +659,9 @@ func TestSubdomContextCanceled(t *testing.T) {
 	}}
 	rep2, err2 := CheckSubdomains(ctx2, f2, "example.com", subdomSubs("", "www"), false)
 	if !errors.Is(err2, context.Canceled) {
-		t.Fatalf("err %v, ожидалась context.Canceled", err2)
+		t.Fatalf("err %v, expected context.Canceled", err2)
 	}
 	if rep2 != nil {
-		t.Fatal("частичный отчёт при отмене не выдаётся")
+		t.Fatal("no partial report on cancellation")
 	}
 }

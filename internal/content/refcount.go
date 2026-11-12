@@ -37,7 +37,7 @@ var refNoHash Hash
 // get into this branch; silently going negative or skipping a step is
 // worse than failing — the transaction is rolled back in full, and the
 // redelivery is handled by the caller.
-var ErrRefIntegrity = errors.New("content: нарушен учёт ссылок на контент")
+var ErrRefIntegrity = errors.New("content: content reference accounting violated")
 
 // RefDB — a pool for reference swaps: a db.DB from which a transaction
 // can be started (the ingest.CleanupDB, scheduler.RetryDB style). Both
@@ -89,7 +89,7 @@ var _ RefDB = (*pgxpool.Pool)(nil)
 // transaction rollback: better to fail than to silently corrupt the counter.
 func SwapRef(ctx context.Context, pool RefDB, oldHash, newHash Hash) error {
 	if pool == nil {
-		return errors.New("content: своп ссылок: пул не задан")
+		return errors.New("content: reference swap: the pool is not set")
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -101,7 +101,7 @@ func SwapRef(ctx context.Context, pool RefDB, oldHash, newHash Hash) error {
 	}
 	tx, err := pool.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("content: своп ссылок %s → %s: транзакция: %w", oldHash, newHash, err)
+		return fmt.Errorf("content: reference swap %s → %s: transaction: %w", oldHash, newHash, err)
 	}
 	// Rollback unconditionally: after Commit — a no-op. An interrupted swap leaves
 	// no half-applied changes (spec 3.4).
@@ -110,7 +110,7 @@ func SwapRef(ctx context.Context, pool RefDB, oldHash, newHash Hash) error {
 		return err
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("content: своп ссылок %s → %s: фиксация: %w", oldHash, newHash, err)
+		return fmt.Errorf("content: reference swap %s → %s: commit: %w", oldHash, newHash, err)
 	}
 	return nil
 }
@@ -125,7 +125,7 @@ func SwapRefTx(ctx context.Context, tx pgx.Tx, oldHash, newHash Hash) error {
 		return err
 	}
 	if tx == nil {
-		return errors.New("content: своп ссылок: транзакция не задана")
+		return errors.New("content: reference swap: the transaction is not set")
 	}
 	if oldHash == newHash {
 		return nil // the content did not change (including both references zero)
@@ -133,20 +133,20 @@ func SwapRefTx(ctx context.Context, tx pgx.Tx, oldHash, newHash Hash) error {
 	if newHash != refNoHash {
 		tag, err := tx.Exec(ctx, sqlMetaAddRef, newHash[:])
 		if err != nil {
-			return fmt.Errorf("content: своп ссылок %s → %s: ссылка новому контенту: %w", oldHash, newHash, err)
+			return fmt.Errorf("content: reference swap %s → %s: referencing the new content: %w", oldHash, newHash, err)
 		}
 		if tag.RowsAffected() == 0 {
-			return fmt.Errorf("%w: %s не записан в хранилище (Put) или мёртв — сначала Put, затем результат",
+			return fmt.Errorf("%w: %s is not stored (Put) or is dead — Put first, then the result",
 				ErrRefIntegrity, newHash)
 		}
 	}
 	if oldHash != refNoHash {
 		tag, err := tx.Exec(ctx, sqlMetaDelRef, oldHash[:])
 		if err != nil {
-			return fmt.Errorf("content: своп ссылок %s → %s: снятие ссылки старого контента: %w", oldHash, newHash, err)
+			return fmt.Errorf("content: reference swap %s → %s: removing the old content reference: %w", oldHash, newHash, err)
 		}
 		if tag.RowsAffected() == 0 {
-			return fmt.Errorf("%w: у %s нет живой ссылки — учёт результата расходится с contents",
+			return fmt.Errorf("%w: %s has no live reference — the result accounting diverges from contents",
 				ErrRefIntegrity, oldHash)
 		}
 	}
@@ -162,7 +162,7 @@ func SwapRefTx(ctx context.Context, tx pgx.Tx, oldHash, newHash Hash) error {
 func (s *PackStore) SwapRef(ctx context.Context, oldHash, newHash Hash) error {
 	pool, ok := s.pool.(RefDB)
 	if !ok {
-		return fmt.Errorf("content: своп ссылок: пул %T не открывает транзакций (нужен RefDB, например *pgxpool.Pool)", s.pool)
+		return fmt.Errorf("content: reference swap: the %T pool does not open transactions (a RefDB is needed, e.g. *pgxpool.Pool)", s.pool)
 	}
 	return SwapRef(ctx, pool, oldHash, newHash)
 }

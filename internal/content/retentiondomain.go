@@ -70,12 +70,12 @@ import (
 // is not an error; no transaction is opened.
 func DrainDomain(ctx context.Context, pool RetentionDB, retention time.Duration, zoneID int16, domainID int64) (RetentionStats, error) {
 	if pool == nil {
-		return RetentionStats{}, errors.New("content: retention: дренаж домена: пул не задан")
+		return RetentionStats{}, errors.New("content: retention: domain drain: the pool is not set")
 	}
 	if retention <= 0 {
 		// retention = 0 — content is kept forever (RetentionLoop never
 		// fires): point purging would contradict the mode.
-		return RetentionStats{}, errors.New("content: retention: дренаж домена: окно retention не задано (retention выключен?)")
+		return RetentionStats{}, errors.New("content: retention: domain drain: the retention window is not set (retention disabled?)")
 	}
 	o := RetentionOptions{Retention: retention}.withDefaults()
 	batch, err := retentionDomainSelect(ctx, pool, o, zoneID, domainID)
@@ -89,7 +89,7 @@ func DrainDomain(ctx context.Context, pool RetentionDB, retention time.Duration,
 	// the PK prefix (T-274 — nil, as with the retry probe).
 	st, err := retentionPurge(ctx, pool, o, batch, nil)
 	if err != nil {
-		return st, fmt.Errorf("content: retention: дренаж домена %d/%d: %w", zoneID, domainID, err)
+		return st, fmt.Errorf("content: retention: domain %d/%d drain: %w", zoneID, domainID, err)
 	}
 	return st, nil
 }
@@ -100,7 +100,7 @@ func DrainDomain(ctx context.Context, pool RetentionDB, retention time.Duration,
 func retentionDomainSelect(ctx context.Context, pool RetentionDB, o RetentionOptions, zoneID int16, domainID int64) ([]retentionCandidate, error) {
 	rows, err := pool.Query(ctx, retentionDomainSQL, zoneID, domainID, o.Retention.String())
 	if err != nil {
-		return nil, fmt.Errorf("content: retention: дренаж домена: выборка: %w", err)
+		return nil, fmt.Errorf("content: retention: domain drain: selection: %w", err)
 	}
 	defer rows.Close()
 
@@ -111,13 +111,13 @@ func retentionDomainSelect(ctx context.Context, pool RetentionDB, o RetentionOpt
 			variant int16
 		)
 		if err := rows.Scan(&c.key.zone, &c.key.domain, &c.key.sub, &variant, &c.hash, &c.checkedAt); err != nil {
-			return nil, fmt.Errorf("content: retention: дренаж домена: выборка: чтение: %w", err)
+			return nil, fmt.Errorf("content: retention: domain drain: selection: read: %w", err)
 		}
 		c.key.variant = variant
 		out = append(out, c)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("content: retention: дренаж домена: выборка: %w", err)
+		return nil, fmt.Errorf("content: retention: domain drain: selection: %w", err)
 	}
 	return out, nil
 }

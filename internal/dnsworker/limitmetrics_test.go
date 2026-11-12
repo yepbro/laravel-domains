@@ -41,11 +41,11 @@ func TestCollectLimitLoopNoop(t *testing.T) {
 	// Without a registry or a source — a no-op: no panic, no
 	// registration.
 	if err := CollectLimitLoop(context.Background(), nil, func() dnsclient.LimitStats { return dnsclient.LimitStats{} }, time.Millisecond, nil); err != nil {
-		t.Fatalf("nil-реестр: %v", err)
+		t.Fatalf("a nil registry: %v", err)
 	}
 	reg := metrics.New("dns-worker")
 	if err := CollectLimitLoop(context.Background(), reg, nil, time.Millisecond, nil); err != nil {
-		t.Fatalf("nil-источник: %v", err)
+		t.Fatalf("a nil source: %v", err)
 	}
 	// The service framework's base metrics (service_up, build_info,
 	// Go/runtime) are in the registry; there must be no limiter
@@ -56,7 +56,7 @@ func TestCollectLimitLoopNoop(t *testing.T) {
 	}
 	for _, mf := range families {
 		if strings.HasPrefix(mf.GetName(), "crawler_dns_") {
-			t.Fatalf("приборы лимитёра зарегистрированы без источника: %s", mf.GetName())
+			t.Fatalf("limiter instruments registered without a source: %s", mf.GetName())
 		}
 	}
 }
@@ -96,7 +96,7 @@ func TestCollectLimitLoopExportsStats(t *testing.T) {
 			t.Fatalf("CollectLimitLoop: %v", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("коллектор не завершился после отмены ctx")
+		t.Fatal("the collector did not finish after the ctx cancel")
 	}
 
 	if got := dnsMetricValue(t, reg, "crawler_dns_limit_concurrency", limitKindEffective); got != 2 {
@@ -141,6 +141,6 @@ func TestCollectLimitLoopRatioEmptyWindow(t *testing.T) {
 	<-done
 
 	if got := limitGaugeValue(t, reg, "crawler_dns_limit_timeout_ratio"); got != 0 {
-		t.Errorf("crawler_dns_limit_timeout_ratio пустого окна = %v, want 0", got)
+		t.Errorf("the crawler_dns_limit_timeout_ratio of an empty window = %v, want 0", got)
 	}
 }

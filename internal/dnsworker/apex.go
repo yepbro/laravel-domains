@@ -54,7 +54,7 @@ import (
 // with the terminal invalid diagnosis (RecordInvalid, T-109) instead of
 // dropping the batch (DNS-03): the row leaves the re-publication loop
 // instead of coming back with every lease pass.
-var ErrEmptyDomain = errors.New("dnsworker: пустое имя домена — апекс обязателен")
+var ErrEmptyDomain = errors.New("dnsworker: empty domain name — the apex is required")
 
 // ApexStatus — a branch of the apex response classification (spec 5.4
 // item 1, §6.2, §7). Branch names that coincide with the domain statuses

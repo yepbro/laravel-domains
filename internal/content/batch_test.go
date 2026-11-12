@@ -84,61 +84,61 @@ const (
 // and one commit per batch.
 func TestPutBatchSQLContract(t *testing.T) {
 	if sqlMetaAddRefBatch != wantSQLAddRefBatch || sqlMetaPutBatch != wantSQLPutBatch {
-		t.Fatal("SQL групповой фиксации изменился — обновите контракт и schema_test")
+		t.Fatal("the group commit SQL changed — update the contract and schema_test")
 	}
 
 	st, pool := newPackTestStore(t, nil)
 	ctx := context.Background()
-	d1 := []byte("<html>первый контент пачки SQL-контракта</html>")
-	d2 := []byte("<html>второй контент пачки SQL-контракта</html>")
+	d1 := []byte("<html>first content of the SQL-contract batch</html>")
+	d2 := []byte("<html>second content of the SQL-contract batch</html>")
 
 	if _, _, err := st.PutBatch(ctx, [][]byte{d1, d2}); err != nil {
 		t.Fatalf("PutBatch: %v", err)
 	}
 	calls := pool.snapshotCalls()
 	if len(calls) != 2 {
-		t.Fatalf("вызовов БД %d, want 2 (addRefBatch, putBatch)", len(calls))
+		t.Fatalf("%d DB calls, want 2 (addRefBatch, putBatch)", len(calls))
 	}
 	if calls[0].sql != sqlMetaAddRefBatch || calls[1].sql != sqlMetaPutBatch {
-		t.Fatalf("порядок SQL: %q, %q — want addRefBatch, putBatch", calls[0].sql, calls[1].sql)
+		t.Fatalf("SQL order: %q, %q — want addRefBatch, putBatch", calls[0].sql, calls[1].sql)
 	}
 	if len(calls[0].args) != 2 {
-		t.Fatalf("addRefBatch: аргументов %d, want 2 (хэши, счётчики копий)", len(calls[0].args))
+		t.Fatalf("addRefBatch: %d arguments, want 2 (hashes, copy counters)", len(calls[0].args))
 	}
 	if hashes, ok := calls[0].args[0].([][]byte); !ok || len(hashes) != 2 {
-		t.Errorf("addRefBatch: аргумент %T(%d), want [][]byte(2)", calls[0].args[0], len(hashes))
+		t.Errorf("addRefBatch: argument %T(%d), want [][]byte(2)", calls[0].args[0], len(hashes))
 	}
 	if counts, ok := calls[0].args[1].([]int32); !ok || len(counts) != 2 {
-		t.Errorf("addRefBatch: счётчики %T(%d), want []int32(2)", calls[0].args[1], len(counts))
+		t.Errorf("addRefBatch: counters %T(%d), want []int32(2)", calls[0].args[1], len(counts))
 	} else {
 		for i, c := range counts {
 			if c != 1 {
-				t.Errorf("addRefBatch: счётчик %d = %d, want 1 (в пачке без дублей)", i, c)
+				t.Errorf("addRefBatch: counter %d = %d, want 1 (a batch without duplicates)", i, c)
 			}
 		}
 	}
 	args := calls[1].args
 	if len(args) != 6 {
-		t.Fatalf("putBatch: аргументов %d, want 6", len(args))
+		t.Fatalf("putBatch: %d arguments, want 6", len(args))
 	}
 	hashes, ok := args[0].([][]byte)
 	if !ok || len(hashes) != 2 {
-		t.Fatalf("putBatch: хэши %T, want [][]byte(2)", args[0])
+		t.Fatalf("putBatch: hashes %T, want [][]byte(2)", args[0])
 	}
 	for _, hb := range hashes {
 		if len(hb) != HashLen {
-			t.Errorf("putBatch: хэш %x: %d октетов, want %d", hb, len(hb), HashLen)
+			t.Errorf("putBatch: hash %x: %d octets, want %d", hb, len(hb), HashLen)
 		}
 	}
 	if packs, ok := args[1].([]int32); !ok || len(packs) != 2 {
-		t.Errorf("putBatch: паки %T(%d), want []int32(2)", args[1], len(packs))
+		t.Errorf("putBatch: packs %T(%d), want []int32(2)", args[1], len(packs))
 	}
 	if offs, ok := args[2].([]int64); !ok || len(offs) != 2 {
-		t.Errorf("putBatch: смещения %T(%d), want []int64(2)", args[2], len(offs))
+		t.Errorf("putBatch: offsets %T(%d), want []int64(2)", args[2], len(offs))
 	}
 	for _, sl := range []any{args[3], args[4], args[5]} {
 		if v, ok := sl.([]int32); !ok || len(v) != 2 {
-			t.Errorf("putBatch: массив %T, want []int32(2)", sl)
+			t.Errorf("putBatch: array %T, want []int32(2)", sl)
 		}
 	}
 }
@@ -153,62 +153,62 @@ func TestPutBatchGroupCommit(t *testing.T) {
 	ctx := context.Background()
 
 	// Warm-up: creates the pack and the active file for the counter wrapper.
-	if _, err := st.Put(ctx, []byte("прогрев")); err != nil {
+	if _, err := st.Put(ctx, []byte("warmup")); err != nil {
 		t.Fatal(err)
 	}
 	syncs := wrapActiveSyncs(t, st)
 
 	items := [][]byte{
 		nil, // empty content is valid (T-041)
-		[]byte("<html>страница 1 групповой фиксации</html>"),
-		[]byte("<html>страница 2 групповой фиксации</html>"),
-		[]byte("<html>страница 3 групповой фиксации</html>"),
-		[]byte("<html>страница 4 групповой фиксации</html>"),
+		[]byte("<html>page 1 of the group commit</html>"),
+		[]byte("<html>page 2 of the group commit</html>"),
+		[]byte("<html>page 3 of the group commit</html>"),
+		[]byte("<html>page 4 of the group commit</html>"),
 	}
 	results, errs, err := st.PutBatch(ctx, items)
 	if err != nil {
 		t.Fatalf("PutBatch: %v", err)
 	}
 	if len(results) != len(items) || len(errs) != len(items) {
-		t.Fatalf("размеры итогов: %d/%d, want %d", len(results), len(errs), len(items))
+		t.Fatalf("result sizes: %d/%d, want %d", len(results), len(errs), len(items))
 	}
 	offs := make(map[int64]bool, len(items))
 	for i, d := range items {
 		if errs[i] != nil {
-			t.Fatalf("элемент %d: %v", i, errs[i])
+			t.Fatalf("item %d: %v", i, errs[i])
 		}
 		want := HashOf(d)
 		if results[i].Hash != want {
-			t.Errorf("элемент %d: хэш %s, want HashOf(data) = %s (контракт T-041)", i, results[i].Hash, want)
+			t.Errorf("item %d: hash %s, want HashOf(data) = %s (contract T-041)", i, results[i].Hash, want)
 		}
 		if !results[i].Created {
-			t.Errorf("элемент %d: Created = false, want true (новые байты)", i)
+			t.Errorf("item %d: Created = false, want true (new bytes)", i)
 		}
 		got, err := st.Get(ctx, want)
 		if err != nil || string(got) != string(d) {
-			t.Errorf("Get(%d): %v (совпадение = %v)", i, err, string(got) == string(d))
+			t.Errorf("Get(%d): %v (match = %v)", i, err, string(got) == string(d))
 		}
 		row, ok := pool.row(want)
 		if !ok {
-			t.Fatalf("элемент %d: нет строки метаданных", i)
+			t.Fatalf("item %d: no metadata row", i)
 		}
 		if int(row.rawLen) != len(d) {
-			t.Errorf("элемент %d: raw_len = %d, want %d", i, row.rawLen, len(d))
+			t.Errorf("item %d: raw_len = %d, want %d", i, row.rawLen, len(d))
 		}
 		if offs[row.off] {
-			t.Errorf("элемент %d: смещение %d повторяется — блоки пачки перекрываются", i, row.off)
+			t.Errorf("item %d: offset %d repeats — the batch blocks overlap", i, row.off)
 		}
 		offs[row.off] = true
 	}
 
 	if got := syncs.Load(); got != 1 {
-		t.Errorf("fsync на пачку из %d элементов: %d, want 1", len(items), got)
+		t.Errorf("fsyncs for a batch of %d items: %d, want 1", len(items), got)
 	}
 	if n := countSQL(pool.snapshotCalls(), sqlMetaAddRefBatch); n != 1 {
-		t.Errorf("дедуп-команд на пачку: %d, want 1", n)
+		t.Errorf("dedup commands per batch: %d, want 1", n)
 	}
 	if n := countSQL(pool.snapshotCalls(), sqlMetaPutBatch); n != 1 {
-		t.Errorf("пакетных INSERT на пачку: %d, want 1", n)
+		t.Errorf("batch INSERTs per batch: %d, want 1", n)
 	}
 }
 
@@ -220,37 +220,37 @@ func TestPutBatchDuplicatesAndDedup(t *testing.T) {
 	st, pool := newPackTestStore(t, func(o *PackOptions) { o.PackSize = 1 << 20 })
 	ctx := context.Background()
 
-	a := []byte("<html>уже живой в хранилище контент</html>")
+	a := []byte("<html>content already live in the store</html>")
 	if _, err := st.Put(ctx, a); err != nil {
 		t.Fatal(err)
 	}
 	sizeBefore := compactPackSize(t, st.opts.Dir, 1)
 
-	b := []byte("<html>новый контент, повторённый в пачке дважды</html>")
-	c := []byte("<html>просто новый контент пачки</html>")
+	b := []byte("<html>new content, repeated twice in the batch</html>")
+	c := []byte("<html>just new batch content</html>")
 	results, errs, err := st.PutBatch(ctx, [][]byte{a, b, b, c})
 	if err != nil {
 		t.Fatalf("PutBatch: %v", err)
 	}
 	for i, e := range errs {
 		if e != nil {
-			t.Fatalf("элемент %d: %v", i, e)
+			t.Fatalf("item %d: %v", i, e)
 		}
 	}
 	if results[0].Created {
-		t.Error("живой контент: Created = true, want false (дедуп)")
+		t.Error("live content: Created = true, want false (dedup)")
 	}
 	if !results[1].Created || results[2].Created {
-		t.Errorf("повтор в пачке: Created = %v/%v, want true/false (байты один раз)", results[1].Created, results[2].Created)
+		t.Errorf("in-batch repeat: Created = %v/%v, want true/false (bytes once)", results[1].Created, results[2].Created)
 	}
 	if !results[3].Created {
-		t.Error("новый контент: Created = false")
+		t.Error("new content: Created = false")
 	}
 
 	for h, want := range map[Hash]int32{HashOf(a): 2, HashOf(b): 2, HashOf(c): 1} {
 		row, ok := pool.row(h)
 		if !ok {
-			t.Fatalf("%s: нет строки", h)
+			t.Fatalf("%s: no row", h)
 		}
 		if row.refc != want {
 			t.Errorf("%s: refcount = %d, want %d", h, row.refc, want)
@@ -261,11 +261,11 @@ func TestPutBatchDuplicatesAndDedup(t *testing.T) {
 	rowC, _ := pool.row(HashOf(c))
 	wantGrow := int64(4+rowB.clen) + int64(4+rowC.clen)
 	if got := compactPackSize(t, st.opts.Dir, 1) - sizeBefore; got != wantGrow {
-		t.Errorf("рост пака: %d байт, want %d (только новые блоки b и c)", got, wantGrow)
+		t.Errorf("pack growth: %d bytes, want %d (only the new blocks b and c)", got, wantGrow)
 	}
 	for _, d := range [][]byte{a, b, c} {
 		if got, err := st.Get(ctx, HashOf(d)); err != nil || string(got) != string(d) {
-			t.Errorf("Get: %v (совпадение = %v)", err, string(got) == string(d))
+			t.Errorf("Get: %v (match = %v)", err, string(got) == string(d))
 		}
 	}
 }
@@ -286,11 +286,11 @@ func TestPutBatchDuplicateRefsBothPaths(t *testing.T) {
 	st, pool := newPackTestStore(t, func(o *PackOptions) { o.PackSize = 1 << 20 })
 	ctx := context.Background()
 
-	live := []byte("<html>живой до пачки, в пачке трижды</html>")
+	live := []byte("<html>live before the batch, three times in the batch</html>")
 	if _, err := st.Put(ctx, live); err != nil {
 		t.Fatal(err)
 	}
-	fresh := []byte("<html>новый контент, в пачке трижды</html>")
+	fresh := []byte("<html>new content, three times in the batch</html>")
 
 	results, errs, err := st.PutBatch(ctx, [][]byte{live, live, live, fresh, fresh, fresh})
 	if err != nil {
@@ -298,51 +298,51 @@ func TestPutBatchDuplicateRefsBothPaths(t *testing.T) {
 	}
 	for i, e := range errs {
 		if e != nil {
-			t.Fatalf("элемент %d: %v", i, e)
+			t.Fatalf("item %d: %v", i, e)
 		}
 	}
 	// Created: live is a dedup (no bytes), the first fresh item writes the
 	// bytes, the hash repeats do not.
 	for i, want := range []bool{false, false, false, true, false, false} {
 		if results[i].Created != want {
-			t.Errorf("элемент %d: Created = %v, want %v", i, results[i].Created, want)
+			t.Errorf("item %d: Created = %v, want %v", i, results[i].Created, want)
 		}
 	}
 	for h, want := range map[Hash]int32{HashOf(live): 4, HashOf(fresh): 3} {
 		row, ok := pool.row(h)
 		if !ok {
-			t.Fatalf("%s: нет строки", h)
+			t.Fatalf("%s: no row", h)
 		}
 		if row.refc != want {
-			t.Errorf("%s: refcount = %d, want %d (каждая копия в пачке — ссылка)", h, row.refc, want)
+			t.Errorf("%s: refcount = %d, want %d (every copy in the batch is a reference)", h, row.refc, want)
 		}
 	}
 
 	// The references are real, not a number: exhausting Delete × refcount.
 	for i := 0; i < 3; i++ {
 		if err := st.Delete(ctx, HashOf(live)); err != nil {
-			t.Fatalf("Delete живого %d из 4: %v", i+1, err)
+			t.Fatalf("Delete of the live one, %d of 4: %v", i+1, err)
 		}
 		if _, err := st.Get(ctx, HashOf(live)); err != nil {
-			t.Fatalf("Get живого после Delete %d из 4: %v (контент ещё нужен)", i+1, err)
+			t.Fatalf("Get of the live one after Delete %d of 4: %v (the content is still needed)", i+1, err)
 		}
 	}
 	if err := st.Delete(ctx, HashOf(live)); err != nil {
-		t.Fatal("Delete четвёртой ссылки живого")
+		t.Fatal("Delete of the live one's fourth reference")
 	}
 	if _, err := st.Get(ctx, HashOf(live)); !errors.Is(err, ErrNotFound) {
-		t.Errorf("Get живого после 4 Delete: %v, want ErrNotFound", err)
+		t.Errorf("Get of the live one after 4 Deletes: %v, want ErrNotFound", err)
 	}
 	for i := 0; i < 2; i++ {
 		if err := st.Delete(ctx, HashOf(fresh)); err != nil {
-			t.Fatalf("Delete свежего %d из 3: %v", i+1, err)
+			t.Fatalf("Delete of the fresh one, %d of 3: %v", i+1, err)
 		}
 	}
 	if err := st.Delete(ctx, HashOf(fresh)); err != nil {
-		t.Fatal("Delete третьей ссылки свежего")
+		t.Fatal("Delete of the fresh one's third reference")
 	}
 	if _, err := st.Get(ctx, HashOf(fresh)); !errors.Is(err, ErrNotFound) {
-		t.Errorf("Get свежего после 3 Delete: %v, want ErrNotFound", err)
+		t.Errorf("Get of the fresh one after 3 Deletes: %v, want ErrNotFound", err)
 	}
 }
 
@@ -353,7 +353,7 @@ func TestPutBatchResurrectDeadRow(t *testing.T) {
 	st, pool := newPackTestStore(t, func(o *PackOptions) { o.PackSize = 1 << 20 })
 	ctx := context.Background()
 
-	x := []byte("<html>контент, умирающий до пачки</html>")
+	x := []byte("<html>content dying before the batch</html>")
 	if _, err := st.Put(ctx, x); err != nil {
 		t.Fatal(err)
 	}
@@ -368,21 +368,21 @@ func TestPutBatchResurrectDeadRow(t *testing.T) {
 	}
 	for i, e := range errs {
 		if e != nil {
-			t.Fatalf("элемент %d: %v", i, e)
+			t.Fatalf("item %d: %v", i, e)
 		}
 	}
 	if results[0].Created || results[1].Created {
-		t.Error("воскрешение: Created = true, want false (конфликт идёт веткой DO UPDATE)")
+		t.Error("resurrection: Created = true, want false (the conflict goes through the DO UPDATE branch)")
 	}
 	row, _ := pool.row(HashOf(x))
 	if row.refc != 2 {
-		t.Errorf("refcount после воскрешения двумя копиями: %d, want 2", row.refc)
+		t.Errorf("the refcount after the resurrection by two copies: %d, want 2", row.refc)
 	}
 	if row.off == oldRow.off {
-		t.Error("размещение не переведено на свежий блок (воскрешение пишет новые байты)")
+		t.Error("the placement was not moved to a fresh block (resurrection writes new bytes)")
 	}
 	if got, err := st.Get(ctx, HashOf(x)); err != nil || string(got) != string(x) {
-		t.Errorf("Get воскрешённого: %v (совпадение = %v)", err, string(got) == string(x))
+		t.Errorf("Get of the resurrected: %v (match = %v)", err, string(got) == string(x))
 	}
 }
 
@@ -395,32 +395,32 @@ func TestPutBatchEmptyAndTooLarge(t *testing.T) {
 
 	callsBefore := len(pool.snapshotCalls())
 	if res, errs, err := st.PutBatch(ctx, nil); err != nil || len(res) != 0 || len(errs) != 0 {
-		t.Errorf("пустая пачка: %v / %d / %d, want nil/0/0", err, len(res), len(errs))
+		t.Errorf("empty batch: %v / %d / %d, want nil/0/0", err, len(res), len(errs))
 	}
 	if got := len(pool.snapshotCalls()) - callsBefore; got != 0 {
-		t.Errorf("пустая пачка сделала %d обращений к БД, want 0", got)
+		t.Errorf("the empty batch made %d DB calls, want 0", got)
 	}
 
-	small := []byte("маленький контент")
-	big := []byte("элемент пачки, заведомо превышающий лимит max_store_bytes в 64 байта")
-	alsoSmall := []byte("тоже маленький")
+	small := []byte("small content")
+	big := []byte("a batch item deliberately exceeding the 64-byte max_store_bytes limit")
+	alsoSmall := []byte("also small")
 	_, errs, err := st.PutBatch(ctx, [][]byte{small, big, alsoSmall})
 	if err != nil {
 		t.Fatalf("PutBatch: %v", err)
 	}
 	if !errors.Is(errs[1], ErrTooLarge) {
-		t.Fatalf("сверхлимитный элемент: %v, want ErrTooLarge", errs[1])
+		t.Fatalf("the over-limit item: %v, want ErrTooLarge", errs[1])
 	}
 	if errs[0] != nil || errs[2] != nil {
-		t.Fatalf("обычные элементы отвергнуты: %v, %v", errs[0], errs[2])
+		t.Fatalf("the regular items rejected: %v, %v", errs[0], errs[2])
 	}
 	for _, d := range [][]byte{small, alsoSmall} {
 		if got, err := st.Get(ctx, HashOf(d)); err != nil || string(got) != string(d) {
-			t.Errorf("Get: %v (совпадение = %v)", err, string(got) == string(d))
+			t.Errorf("Get: %v (match = %v)", err, string(got) == string(d))
 		}
 	}
 	if _, err := st.Get(ctx, HashOf(big)); !errors.Is(err, ErrNotFound) {
-		t.Errorf("Get сверхлимитного: %v, want ErrNotFound", err)
+		t.Errorf("Get of the over-limit: %v, want ErrNotFound", err)
 	}
 }
 
@@ -439,39 +439,39 @@ func TestPutBatchStoreFullPause(t *testing.T) {
 	fake.set(50, 100)
 	st.stat = fake
 
-	live := []byte("<html>живой до переполнения</html>")
+	live := []byte("<html>live before the overflow</html>")
 	if _, err := st.Put(ctx, live); err != nil {
 		t.Fatal(err)
 	}
 	sizeBefore := compactPackSize(t, st.opts.Dir, 1)
 
 	fake.set(4, 100) // 4% < the 5% threshold
-	fresh := []byte("<html>новый контент в полный диск</html>")
+	fresh := []byte("<html>new content into a full disk</html>")
 	results, errs, err := st.PutBatch(ctx, [][]byte{live, fresh})
 	if err != nil {
-		t.Fatalf("PutBatch на полном диске: %v (по-элементные отказы — не сбой пачки)", err)
+		t.Fatalf("PutBatch on a full disk: %v (per-item failures are not a batch failure)", err)
 	}
 	if !errors.Is(errs[1], ErrStoreFull) {
-		t.Fatalf("новый элемент: %v, want ErrStoreFull", errs[1])
+		t.Fatalf("the new item: %v, want ErrStoreFull", errs[1])
 	}
 	if errs[0] != nil {
-		t.Fatalf("дедуп живого контента отвергнут: %v", errs[0])
+		t.Fatalf("the live content dedup rejected: %v", errs[0])
 	}
 	if results[0].Created {
-		t.Error("дедуп на полном диске: Created = true")
+		t.Error("dedup on a full disk: Created = true")
 	}
 	if row, _ := pool.row(HashOf(live)); row.refc != 2 {
-		t.Errorf("refcount живого: %d, want 2 (дедуп-ссылка прошла)", row.refc)
+		t.Errorf("the live one's refcount: %d, want 2 (the dedup reference went through)", row.refc)
 	}
 	if got := compactPackSize(t, st.opts.Dir, 1) - sizeBefore; got != 0 {
-		t.Errorf("на полном диске записано %d байт, want 0", got)
+		t.Errorf("%d bytes written on a full disk, want 0", got)
 	}
 	if n := countSQL(pool.snapshotCalls(), sqlMetaPutBatch); n != 0 {
-		t.Errorf("пакетных INSERT на полном диске: %d, want 0", n)
+		t.Errorf("batch INSERTs on a full disk: %d, want 0", n)
 	}
 	events := sink.snapshot()
 	if len(events) != 1 || events[0].Source != StoreFullPut {
-		t.Errorf("события алерта: %+v, want один Source=put", events)
+		t.Errorf("alert events: %+v, want one Source=put", events)
 	}
 }
 
@@ -484,16 +484,16 @@ func TestPutBatchStoreFullPause(t *testing.T) {
 func TestPutBatchCommitFailureIdempotent(t *testing.T) {
 	st, pool := newCompactTestStore(t, nil)
 	ctx := context.Background()
-	a := []byte("<html>контент сбойной фиксации A</html>")
-	b := []byte("<html>контент сбойной фиксации B</html>")
+	a := []byte("<html>content of failed commit A</html>")
+	b := []byte("<html>content of failed commit B</html>")
 
 	pool.failSQL, pool.failN = sqlMetaPutBatch, 1
 	if _, _, err := st.PutBatch(ctx, [][]byte{a, b}); err == nil {
-		t.Fatal("сбой пакетного INSERT не возвращён ошибкой")
+		t.Fatal("the batch INSERT failure is not returned as an error")
 	}
 	for _, d := range [][]byte{a, b} {
 		if _, ok := pool.row(HashOf(d)); ok {
-			t.Errorf("строка %s зафиксирована несмотря на сбой INSERT", HashOf(d))
+			t.Errorf("row %s committed despite the INSERT failure", HashOf(d))
 		}
 	}
 	info, err := st.CompactScan(ctx, 1)
@@ -501,26 +501,26 @@ func TestPutBatchCommitFailureIdempotent(t *testing.T) {
 		t.Fatalf("CompactScan: %v", err)
 	}
 	if info.GarbageBlocks != 2 || info.LiveBlocks != 0 {
-		t.Errorf("блоки сбойной пачки: мусора %d, живых %d — want 2/0", info.GarbageBlocks, info.LiveBlocks)
+		t.Errorf("blocks of the failed batch: %d garbage, %d live — want 2/0", info.GarbageBlocks, info.LiveBlocks)
 	}
 
 	// The retry (the failure lifted) is idempotent: the rows are in place,
 	// the bytes are readable.
 	results, errs, err := st.PutBatch(ctx, [][]byte{a, b})
 	if err != nil {
-		t.Fatalf("повтор PutBatch: %v", err)
+		t.Fatalf("PutBatch retry: %v", err)
 	}
 	for i, e := range errs {
 		if e != nil {
-			t.Fatalf("элемент %d повтора: %v", i, e)
+			t.Fatalf("retry item %d: %v", i, e)
 		}
 	}
 	if !results[0].Created || !results[1].Created {
-		t.Error("повтор после сбоя: Created = false, want true (строк не было)")
+		t.Error("retry after the failure: Created = false, want true (there were no rows)")
 	}
 	for _, d := range [][]byte{a, b} {
 		if got, err := st.Get(ctx, HashOf(d)); err != nil || string(got) != string(d) {
-			t.Errorf("Get после повтора: %v (совпадение = %v)", err, string(got) == string(d))
+			t.Errorf("Get after the retry: %v (match = %v)", err, string(got) == string(d))
 		}
 	}
 
@@ -528,12 +528,12 @@ func TestPutBatchCommitFailureIdempotent(t *testing.T) {
 	// change.
 	pool.failSQL, pool.failN = sqlMetaAddRefBatch, 1
 	sizeBefore := compactPackSize(t, st.opts.Dir, 1)
-	c := []byte("<html>контент сбойного дедупа</html>")
+	c := []byte("<html>content of the failed dedup</html>")
 	if _, _, err := st.PutBatch(ctx, [][]byte{c}); err == nil {
-		t.Fatal("сбой дедуп-команды не возвращён ошибкой")
+		t.Fatal("the dedup command failure is not returned as an error")
 	}
 	if got := compactPackSize(t, st.opts.Dir, 1) - sizeBefore; got != 0 {
-		t.Errorf("при сбое дедупа записано %d байт, want 0 (дедуп раньше блокировок)", got)
+		t.Errorf("%d bytes written on the dedup failure, want 0 (dedup before the locks)", got)
 	}
 }
 
@@ -543,12 +543,12 @@ func TestPutBatchCtxCanceled(t *testing.T) {
 	st, pool := newPackTestStore(t, nil)
 	canceled, cancel := context.WithCancel(context.Background())
 	cancel()
-	d := []byte("контент отменённой пачки")
+	d := []byte("content of the canceled batch")
 	if _, _, err := st.PutBatch(canceled, [][]byte{d}); !errors.Is(err, context.Canceled) {
-		t.Fatalf("PutBatch с отменённым ctx: %v, want context.Canceled", err)
+		t.Fatalf("PutBatch with a canceled ctx: %v, want context.Canceled", err)
 	}
 	if _, ok := pool.row(HashOf(d)); ok {
-		t.Error("строка зафиксирована отменённой пачкой")
+		t.Error("a row committed by the canceled batch")
 	}
 }
 
@@ -584,7 +584,7 @@ func (p *probeBatchPool) Query(ctx context.Context, sql string, args ...any) (pg
 		// LOCK_EX|LOCK_NB must run into PutBatch's lock.
 		lf, err := os.OpenFile(filepath.Join(p.st.opts.Dir, packLockFile), os.O_RDWR, 0o644)
 		if err != nil {
-			return nil, fmt.Errorf("зонд блокировки каталога: %w", err)
+			return nil, fmt.Errorf("directory lock probe: %w", err)
 		}
 		err = syscall.Flock(int(lf.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
 		p.probe.flockHeld = errors.Is(err, syscall.EWOULDBLOCK)
@@ -615,7 +615,7 @@ func TestPutBatchInvariantFsyncAndFlock(t *testing.T) {
 	ctx := context.Background()
 
 	// Pack 1: the content dies (live share 0 — compactable).
-	x := []byte("<html>контент умирающего пака</html>")
+	x := []byte("<html>content of the dying pack</html>")
 	if _, err := st.Put(ctx, x); err != nil {
 		t.Fatal(err)
 	}
@@ -625,41 +625,41 @@ func TestPutBatchInvariantFsyncAndFlock(t *testing.T) {
 	// Pack 2 — the newest: the warm-up creates its active file for the
 	// counter.
 	compactCraftPack(t, st.opts.Dir, 2, nil)
-	if _, err := st.Put(ctx, []byte("прогрев пака 2")); err != nil {
+	if _, err := st.Put(ctx, []byte("pack 2 warmup")); err != nil {
 		t.Fatal(err)
 	}
 	probePool.syncs = wrapActiveSyncs(t, st)
 
-	y := []byte("<html>страница пачки A</html>")
-	z := []byte("<html>страница пачки B</html>")
+	y := []byte("<html>batch page A</html>")
+	z := []byte("<html>batch page B</html>")
 	if _, _, err := st.PutBatch(ctx, [][]byte{y, z}); err != nil {
 		t.Fatalf("PutBatch: %v", err)
 	}
 	if !probe.fired {
-		t.Fatal("зонд не сработал — пакетный INSERT не выполнялся")
+		t.Fatal("the probe did not fire — the batch INSERT never ran")
 	}
 	if probe.syncs < 1 {
-		t.Errorf("fsync к моменту INSERT: %d, want >= 1 (байты раньше строк, C-1)", probe.syncs)
+		t.Errorf("fsyncs by the INSERT time: %d, want >= 1 (bytes before rows, C-1)", probe.syncs)
 	}
 	if !probe.muHeld {
-		t.Error("мьютекс хранилища не удержан в момент фиксации строк пачки")
+		t.Error("the store mutex is not held while the batch rows commit")
 	}
 	if !probe.flockHeld {
-		t.Error("flock каталога паков не удержан в момент фиксации строк пачки — компактификация могла бы удалить пак")
+		t.Error("the packs directory flock is not held while the batch rows commit — compaction could have removed the pack")
 	}
 
 	// After the commit: the compaction pass over the old pack succeeds, the
 	// batch's content is alive.
 	stats, err := CompactOnce(ctx, st, CompactOptions{})
 	if err != nil || stats.Compacted != 1 {
-		t.Fatalf("CompactOnce старого пака: %+v, %v", stats, err)
+		t.Fatalf("CompactOnce of the old pack: %+v, %v", stats, err)
 	}
 	if got := compactPackSize(t, st.opts.Dir, 1); got != 0 {
-		t.Errorf("старый пак не удалён: %d байт", got)
+		t.Errorf("the old pack was not removed: %d bytes", got)
 	}
 	for _, d := range [][]byte{y, z} {
 		if got, err := st.Get(ctx, HashOf(d)); err != nil || string(got) != string(d) {
-			t.Errorf("Get после компактификации: %v (совпадение = %v)", err, string(got) == string(d))
+			t.Errorf("Get after compaction: %v (match = %v)", err, string(got) == string(d))
 		}
 	}
 }
@@ -672,15 +672,15 @@ func TestPutBatchWithConcurrentCompaction(t *testing.T) {
 	st, pool := newCompactTestStore(t, nil)
 	ctx := context.Background()
 
-	live := []byte("<html>живой контент компактифицируемого пака</html>")
+	live := []byte("<html>live content of the pack being compacted</html>")
 	lres, err := st.Put(ctx, live)
 	if err != nil {
 		t.Fatal(err)
 	}
 	compactCraftPack(t, st.opts.Dir, 2, nil) // pack 2 is the newest
 
-	m := []byte("<html>страница пачки против компактификации M</html>")
-	n := []byte("<html>страница пачки против компактификации N</html>")
+	m := []byte("<html>batch page racing compaction M</html>")
+	n := []byte("<html>batch page racing compaction N</html>")
 
 	var wg sync.WaitGroup
 	compactErr := make(chan error, 1)
@@ -700,26 +700,26 @@ func TestPutBatchWithConcurrentCompaction(t *testing.T) {
 	}
 	for i, e := range berrs {
 		if e != nil {
-			t.Fatalf("элемент %d: %v", i, e)
+			t.Fatalf("item %d: %v", i, e)
 		}
 	}
 
 	if got := compactPackSize(t, st.opts.Dir, 1); got != 0 {
-		t.Errorf("компактифицируемый пак не удалён: %d байт", got)
+		t.Errorf("the pack being compacted was not removed: %d bytes", got)
 	}
 	if row, _ := pool.row(lres.Hash); row.packID != 2 {
-		t.Errorf("живой блок старого пака не переехал: пак %d, want 2", row.packID)
+		t.Errorf("the old pack's live block did not move: pack %d, want 2", row.packID)
 	}
 	for i, d := range [][]byte{m, n} {
 		if !bres[i].Created {
-			t.Errorf("элемент %d: Created = false", i)
+			t.Errorf("item %d: Created = false", i)
 		}
 		if got, err := st.Get(ctx, HashOf(d)); err != nil || string(got) != string(d) {
-			t.Errorf("Get(%d): %v (совпадение = %v)", i, err, string(got) == string(d))
+			t.Errorf("Get(%d): %v (match = %v)", i, err, string(got) == string(d))
 		}
 	}
 	if got, err := st.Get(ctx, lres.Hash); err != nil || string(got) != string(live) {
-		t.Errorf("Get живого блока после переезда: %v (совпадение = %v)", err, string(got) == string(live))
+		t.Errorf("Get of the live block after the move: %v (match = %v)", err, string(got) == string(live))
 	}
 }
 
@@ -732,14 +732,14 @@ func TestPutBatchRotation(t *testing.T) {
 	ctx := context.Background()
 	var items [][]byte
 	for i := 0; i < 5; i++ {
-		items = append(items, []byte(fmt.Sprintf("<html>страница %d ротации внутри пачки — pad-pad-pad</html>", i)))
+		items = append(items, []byte(fmt.Sprintf("<html>page %d of in-batch rotation — pad-pad-pad</html>", i)))
 	}
 	if _, errs, err := st.PutBatch(ctx, items); err != nil {
 		t.Fatalf("PutBatch: %v", err)
 	} else {
 		for i, e := range errs {
 			if e != nil {
-				t.Fatalf("элемент %d: %v", i, e)
+				t.Fatalf("item %d: %v", i, e)
 			}
 		}
 	}
@@ -747,13 +747,13 @@ func TestPutBatchRotation(t *testing.T) {
 	for _, d := range items {
 		h := HashOf(d)
 		if got, err := st.Get(ctx, h); err != nil || string(got) != string(d) {
-			t.Errorf("Get: %v (совпадение = %v)", err, string(got) == string(d))
+			t.Errorf("Get: %v (match = %v)", err, string(got) == string(d))
 		}
 		row, _ := pool.row(h)
 		packs[row.packID]++
 	}
 	if len(packs) < 2 {
-		t.Errorf("блоки пачки легли в один пак (%v) при пороге ротации 256 байт", packs)
+		t.Errorf("the batch blocks landed in one pack (%v) at the rotation threshold of 256 bytes", packs)
 	}
 }
 
@@ -764,12 +764,12 @@ func TestPutBatchRotation(t *testing.T) {
 // benchmark.
 func benchPage(i int) []byte {
 	buf := make([]byte, 0, 32<<10)
-	buf = append(buf, "<html><head><title>парковка "...)
+	buf = append(buf, "<html><head><title>parking "...)
 	buf = strconv.AppendInt(buf, int64(i), 10)
 	buf = append(buf, "</title></head><body>"...)
 	for j := 0; j < 200; j++ {
 		buf = append(buf, fmt.Sprintf(
-			"<div class=\"row-%d\"><a href=\"/p/%d\">пункт №%d — типовая страница для бенчмарка хранилища контента</a></div>", j, i, j)...)
+			"<div class=\"row-%d\"><a href=\"/p/%d\">item #%d — a typical page for the content store benchmark</a></div>", j, i, j)...)
 	}
 	buf = append(buf, "</body></html>"...)
 	return buf

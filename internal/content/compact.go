@@ -136,7 +136,7 @@ const (
 
 // errCompactNewest — an attempt to compact the newest pack: it is open for
 // writing (T-042), only closed packs are compacted.
-var errCompactNewest = errors.New("content: новейший пак не компактифицируется")
+var errCompactNewest = errors.New("content: the newest pack is never compacted")
 
 // CompactDB — a pool for compaction: a db.DB from which a transaction can be
 // started (moving placements and deleting dead rows are atomic).
@@ -237,7 +237,7 @@ func (s *PackStore) CompactScan(ctx context.Context, packID int32) (CompactInfo,
 	path := filepath.Join(s.opts.Dir, packFileName(packID))
 	st, err := os.Stat(path)
 	if err != nil {
-		return info, fmt.Errorf("content: скан пака %d: %w", packID, err)
+		return info, fmt.Errorf("content: pack %d scan: %w", packID, err)
 	}
 	if st.Size() < packHeaderLen {
 		// A file shorter than the header (a torn header write on failure, C-7):
@@ -247,10 +247,10 @@ func (s *PackStore) CompactScan(ctx context.Context, packID int32) (CompactInfo,
 		// corruption.
 		n, err := s.allContents(ctx, packID)
 		if err != nil {
-			return info, fmt.Errorf("content: скан пака %d: %w", packID, err)
+			return info, fmt.Errorf("content: pack %d scan: %w", packID, err)
 		}
 		if n > 0 {
-			return info, fmt.Errorf("content: скан пака %d: файл %d байт короче заголовка при %d строках contents",
+			return info, fmt.Errorf("content: pack %d scan: the file is %d bytes, shorter than the header with %d contents rows",
 				packID, st.Size(), n)
 		}
 		info.Size = st.Size()
@@ -261,13 +261,13 @@ func (s *PackStore) CompactScan(ctx context.Context, packID int32) (CompactInfo,
 
 	f, err := os.Open(path)
 	if err != nil {
-		return info, fmt.Errorf("content: скан пака %d: %w", packID, err)
+		return info, fmt.Errorf("content: pack %d scan: %w", packID, err)
 	}
 	defer func() { _ = f.Close() }() // read-only
 
 	rows, err := s.pool.Query(ctx, sqlCompactRows, packID)
 	if err != nil {
-		return info, fmt.Errorf("content: скан пака %d: метаданные: %w", packID, err)
+		return info, fmt.Errorf("content: pack %d scan: metadata: %w", packID, err)
 	}
 	defer rows.Close()
 	var (
@@ -282,23 +282,23 @@ func (s *PackStore) CompactScan(ctx context.Context, packID int32) (CompactInfo,
 			clen, refc int32
 		)
 		if err := rows.Scan(&hash, &off, &clen, &refc); err != nil {
-			return info, fmt.Errorf("content: скан пака %d: чтение метаданных: %w", packID, err)
+			return info, fmt.Errorf("content: pack %d scan: metadata read: %w", packID, err)
 		}
 		if len(hash) != HashLen {
-			return info, fmt.Errorf("content: скан пака %d: хэш %x: %d октетов, ожидается %d",
+			return info, fmt.Errorf("content: pack %d scan: hash %x: %d octets, want %d",
 				packID, hash, len(hash), HashLen)
 		}
 		// The row must point at a whole record of the file: after the
 		// header, within the file, with a matching length prefix.
 		if off < packHeaderLen+4 || off+int64(clen) > st.Size() {
-			return info, fmt.Errorf("content: скан пака %d: %x: блок [%d, %d) вне файла (%d байт)",
+			return info, fmt.Errorf("content: pack %d scan: %x: block [%d, %d) outside the file (%d bytes)",
 				packID, hash, off, off+int64(clen), st.Size())
 		}
 		if _, err := f.ReadAt(prefix[:], off-4); err != nil {
-			return info, fmt.Errorf("content: скан пака %d: %x: префикс длины: %w", packID, hash, err)
+			return info, fmt.Errorf("content: pack %d scan: %x: length prefix: %w", packID, hash, err)
 		}
 		if got := int32(binary.LittleEndian.Uint32(prefix[:])); got != clen {
-			return info, fmt.Errorf("content: скан пака %d: %x: префикс длины %d не сходится с len %d",
+			return info, fmt.Errorf("content: pack %d scan: %x: length prefix %d does not match len %d",
 				packID, hash, got, clen)
 		}
 		if refc > 0 {
@@ -310,7 +310,7 @@ func (s *PackStore) CompactScan(ctx context.Context, packID int32) (CompactInfo,
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return info, fmt.Errorf("content: скан пака %d: метаданные: %w", packID, err)
+		return info, fmt.Errorf("content: pack %d scan: metadata: %w", packID, err)
 	}
 
 	// Traversing the records: the header, then [u32 len][block] until the
@@ -323,7 +323,7 @@ func (s *PackStore) CompactScan(ctx context.Context, packID int32) (CompactInfo,
 	for pos < st.Size() {
 		if _, err := f.ReadAt(prefix[:], pos); err != nil {
 			if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
-				return info, fmt.Errorf("content: скан пака %d: обход записей: %w", packID, err)
+				return info, fmt.Errorf("content: pack %d scan: row iteration: %w", packID, err)
 			}
 			info.Truncated = true
 			break
@@ -347,7 +347,7 @@ func (s *PackStore) CompactScan(ctx context.Context, packID int32) (CompactInfo,
 	// corrupted, such a pack cannot be compacted.
 	if info.GarbageBytes < 0 || info.GarbageBlocks < 0 {
 		return CompactInfo{PackID: packID}, fmt.Errorf(
-			"content: скан пака %d: строки перекрывают друг друга (живые %d, мёртвые %d байт при данных %d)",
+			"content: pack %d scan: rows overlap each other (%d live, %d dead bytes with %d bytes of data)",
 			packID, liveBytes, deadBytes, info.DataBytes)
 	}
 	if info.DataBytes > 0 {
@@ -371,7 +371,7 @@ type compactLiveRow struct {
 func (s *PackStore) CompactPack(ctx context.Context, packID int32) (CompactResult, error) {
 	cdb, ok := s.pool.(CompactDB)
 	if !ok {
-		return CompactResult{}, errors.New("content: компактификация: пул БД не поддерживает транзакции")
+		return CompactResult{}, errors.New("content: compaction: the DB pool does not support transactions")
 	}
 	if err := s.checkNotNewest(packID); err != nil {
 		return CompactResult{}, err
@@ -379,7 +379,7 @@ func (s *PackStore) CompactPack(ctx context.Context, packID int32) (CompactResul
 	path := filepath.Join(s.opts.Dir, packFileName(packID))
 	st, err := os.Stat(path)
 	if err != nil {
-		return CompactResult{}, fmt.Errorf("content: компактификация пака %d: %w", packID, err)
+		return CompactResult{}, fmt.Errorf("content: pack %d compaction: %w", packID, err)
 	}
 	size := st.Size()
 	// A pack shorter than the header is legitimate to remove (the C-7 scan
@@ -389,13 +389,13 @@ func (s *PackStore) CompactPack(ctx context.Context, packID int32) (CompactResul
 	// read with ReadAt by offsets — no open/close per block.
 	src, err := os.Open(path)
 	if err != nil {
-		return CompactResult{}, fmt.Errorf("content: компактификация пака %d: %w", packID, err)
+		return CompactResult{}, fmt.Errorf("content: pack %d compaction: %w", packID, err)
 	}
 	defer func() { _ = src.Close() }() // read-only
 
 	rows, err := s.pool.Query(ctx, sqlCompactRows, packID)
 	if err != nil {
-		return CompactResult{}, fmt.Errorf("content: компактификация пака %d: метаданные: %w", packID, err)
+		return CompactResult{}, fmt.Errorf("content: pack %d compaction: metadata: %w", packID, err)
 	}
 	defer rows.Close()
 
@@ -434,7 +434,7 @@ func (s *PackStore) CompactPack(ctx context.Context, packID int32) (CompactResul
 					// integrity discrepancy goes into the pass result (the
 					// cycle's Warn).
 					corrupt = append(corrupt, fmt.Errorf(
-						"content: компактификация пака %d: %x: блок нечитаем, строка помечена мёртвой: %w",
+						"content: pack %d compaction: %x: unreadable block, row marked dead: %w",
 						packID, r.hash, err))
 					corruptHashes = append(corruptHashes, r.hash[:])
 					res.Corrupted++
@@ -459,7 +459,7 @@ func (s *PackStore) CompactPack(ctx context.Context, packID int32) (CompactResul
 		}
 		tx, err := cdb.Begin(ctx)
 		if err != nil {
-			return fmt.Errorf("content: компактификация пака %d: транзакция: %w", packID, err)
+			return fmt.Errorf("content: pack %d compaction: transaction: %w", packID, err)
 		}
 		// Rollback unconditionally: after Commit — a no-op (the T-020 style).
 		defer func() { _ = tx.Rollback(ctx) }()
@@ -469,25 +469,25 @@ func (s *PackStore) CompactPack(ctx context.Context, packID int32) (CompactResul
 			// marking).
 			for _, hb := range corruptHashes {
 				if _, err := tx.Exec(ctx, sqlCompactCorrupt, hb, packID); err != nil {
-					return fmt.Errorf("content: компактификация пака %d: пометка нечитаемого блока: %w", packID, err)
+					return fmt.Errorf("content: pack %d compaction: marking the unreadable block: %w", packID, err)
 				}
 			}
 			dead = append(dead, corruptHashes...)
 		}
 		if len(hashes) > 0 {
 			if _, err := tx.Exec(ctx, sqlCompactMove, hashes, packs, offs, packID); err != nil {
-				return fmt.Errorf("content: компактификация пака %d: перенос размещений: %w", packID, err)
+				return fmt.Errorf("content: pack %d compaction: placement relocation: %w", packID, err)
 			}
 		}
 		if len(dead) > 0 {
 			tag, err := tx.Exec(ctx, sqlCompactDead, dead, packID)
 			if err != nil {
-				return fmt.Errorf("content: компактификация пака %d: удаление мёртвых строк: %w", packID, err)
+				return fmt.Errorf("content: pack %d compaction: deleting dead rows: %w", packID, err)
 			}
 			res.Tombstones += tag.RowsAffected()
 		}
 		if err := tx.Commit(ctx); err != nil {
-			return fmt.Errorf("content: компактификация пака %d: фиксация: %w", packID, err)
+			return fmt.Errorf("content: pack %d compaction: commit: %w", packID, err)
 		}
 		live, dead = live[:0], dead[:0]
 		return nil
@@ -503,10 +503,10 @@ func (s *PackStore) CompactPack(ctx context.Context, packID int32) (CompactResul
 			clen, refc int32
 		)
 		if err := rows.Scan(&hash, &off, &clen, &refc); err != nil {
-			return res, fmt.Errorf("content: компактификация пака %d: чтение метаданных: %w", packID, err)
+			return res, fmt.Errorf("content: pack %d compaction: metadata read: %w", packID, err)
 		}
 		if len(hash) != HashLen {
-			return res, fmt.Errorf("content: компактификация пака %d: хэш %x: %d октетов, ожидается %d",
+			return res, fmt.Errorf("content: pack %d compaction: hash %x: %d octets, want %d",
 				packID, hash, len(hash), HashLen)
 		}
 		var h Hash
@@ -523,7 +523,7 @@ func (s *PackStore) CompactPack(ctx context.Context, packID int32) (CompactResul
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return res, fmt.Errorf("content: компактификация пака %d: метаданные: %w", packID, err)
+		return res, fmt.Errorf("content: pack %d compaction: metadata: %w", packID, err)
 	}
 	if err := flush(); err != nil {
 		return res, err
@@ -532,7 +532,7 @@ func (s *PackStore) CompactPack(ctx context.Context, packID int32) (CompactResul
 	// Final sweep of the pack's dead rows (C-13): see sqlCompactDeadPack.
 	tag, err := s.pool.Exec(ctx, sqlCompactDeadPack, packID)
 	if err != nil {
-		return res, fmt.Errorf("content: компактификация пака %d: зачистка мёртвых строк: %w", packID, err)
+		return res, fmt.Errorf("content: pack %d compaction: dead row cleanup: %w", packID, err)
 	}
 	res.Tombstones += tag.RowsAffected()
 
@@ -545,7 +545,7 @@ func (s *PackStore) CompactPack(ctx context.Context, packID int32) (CompactResul
 		return res, err
 	}
 	if n > 0 {
-		return res, fmt.Errorf("content: компактификация пака %d: живых строк %d — файл не удаляется",
+		return res, fmt.Errorf("content: pack %d compaction: %d live rows — the file is not removed",
 			packID, n)
 	}
 
@@ -566,15 +566,15 @@ func (s *PackStore) CompactPack(ctx context.Context, packID int32) (CompactResul
 			res.FreedBytes = size
 			return res, nil
 		}
-		return res, fmt.Errorf("content: компактификация пака %d: %w", packID, err)
+		return res, fmt.Errorf("content: pack %d compaction: %w", packID, err)
 	}
 	if st.Size() != size {
 		return res, fmt.Errorf(
-			"content: компактификация пака %d: файл изменился с момента скана (%d → %d байт) — удаление пропущено",
+			"content: pack %d compaction: the file changed since the scan (%d → %d bytes) — removal skipped",
 			packID, size, st.Size())
 	}
 	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return res, fmt.Errorf("content: компактификация пака %d: удаление: %w", packID, err)
+		return res, fmt.Errorf("content: pack %d compaction: removal: %w", packID, err)
 	}
 	res.Removed = true
 	res.FreedBytes = size
@@ -604,7 +604,7 @@ func (s *PackStore) checkNotNewest(packID int32) error {
 	case packID == maxID:
 		return errCompactNewest
 	case packID > maxID:
-		return fmt.Errorf("content: компактификация: пак %d не существует (новейший %d)", packID, maxID)
+		return fmt.Errorf("content: compaction: pack %d does not exist (newest %d)", packID, maxID)
 	}
 	return nil
 }
@@ -614,17 +614,17 @@ func (s *PackStore) checkNotNewest(packID int32) error {
 func (s *PackStore) liveContents(ctx context.Context, packID int32) (int64, error) {
 	rows, err := s.pool.Query(ctx, sqlCompactLive, packID)
 	if err != nil {
-		return 0, fmt.Errorf("content: контроль живых строк пака %d: %w", packID, err)
+		return 0, fmt.Errorf("content: pack %d live row check: %w", packID, err)
 	}
 	defer rows.Close()
 	var n int64
 	switch {
 	case rows.Next():
 		if err := rows.Scan(&n); err != nil {
-			return 0, fmt.Errorf("content: контроль живых строк пака %d: %w", packID, err)
+			return 0, fmt.Errorf("content: pack %d live row check: %w", packID, err)
 		}
 	case rows.Err() != nil:
-		return 0, fmt.Errorf("content: контроль живых строк пака %d: %w", packID, rows.Err())
+		return 0, fmt.Errorf("content: pack %d live row check: %w", packID, rows.Err())
 	}
 	return n, nil
 }
@@ -634,17 +634,17 @@ func (s *PackStore) liveContents(ctx context.Context, packID int32) (int64, erro
 func (s *PackStore) allContents(ctx context.Context, packID int32) (int64, error) {
 	rows, err := s.pool.Query(ctx, sqlCompactAll, packID)
 	if err != nil {
-		return 0, fmt.Errorf("content: контроль строк пака %d: %w", packID, err)
+		return 0, fmt.Errorf("content: pack %d row check: %w", packID, err)
 	}
 	defer rows.Close()
 	var n int64
 	switch {
 	case rows.Next():
 		if err := rows.Scan(&n); err != nil {
-			return 0, fmt.Errorf("content: контроль строк пака %d: %w", packID, err)
+			return 0, fmt.Errorf("content: pack %d row check: %w", packID, err)
 		}
 	case rows.Err() != nil:
-		return 0, fmt.Errorf("content: контроль строк пака %d: %w", packID, rows.Err())
+		return 0, fmt.Errorf("content: pack %d row check: %w", packID, rows.Err())
 	}
 	return n, nil
 }
@@ -655,7 +655,7 @@ func (s *PackStore) allContents(ctx context.Context, packID int32) (int64, error
 func compactPackList(dir string) ([]int32, int32, error) {
 	ents, err := os.ReadDir(dir)
 	if err != nil {
-		return nil, 0, fmt.Errorf("content: каталог паков %s: %w", dir, err)
+		return nil, 0, fmt.Errorf("content: packs directory %s: %w", dir, err)
 	}
 	var ids []int32
 	for _, e := range ents {
@@ -678,7 +678,7 @@ func compactPackList(dir string) ([]int32, int32, error) {
 // processed.
 func CompactOnce(ctx context.Context, st *PackStore, opts CompactOptions) (CompactStats, error) {
 	if st == nil {
-		return CompactStats{}, errors.New("content: компактификация: хранилище не задано")
+		return CompactStats{}, errors.New("content: compaction: the store is not set")
 	}
 	o := opts.withDefaults()
 	ids, newest, err := compactPackList(st.opts.Dir)
@@ -718,7 +718,7 @@ func CompactOnce(ctx context.Context, st *PackStore, opts CompactOptions) (Compa
 				continue
 			} else if full {
 				errs = append(errs, fmt.Errorf(
-					"content: компактификация пака %d отложена: свободное место ниже порога, живые байты (%d) копировались бы поверх старого пака",
+					"content: pack %d compaction postponed: free space below the threshold, live bytes (%d) would be copied over the old pack",
 					id, info.LiveBytes))
 				continue
 			}
@@ -747,14 +747,14 @@ func CompactOnce(ctx context.Context, st *PackStore, opts CompactOptions) (Compa
 // idempotent (spec 3.4).
 func CompactLoop(ctx context.Context, st *PackStore, opts CompactOptions) error {
 	if st == nil {
-		return errors.New("content: компактификация: хранилище не задано")
+		return errors.New("content: compaction: the store is not set")
 	}
 	o := opts.withDefaults()
 	log := o.Log
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	log.Info("фоновая компактификация паков",
+	log.Info("background pack compaction",
 		"interval", o.Interval.String(),
 		"threshold", o.Threshold)
 
@@ -764,9 +764,9 @@ func CompactLoop(ctx context.Context, st *PackStore, opts CompactOptions) error 
 		case err != nil && ctx.Err() != nil:
 			// Cancellation during a pass is part of shutdown, not an alarm.
 		case err != nil:
-			log.Warn("проход компактификации паков", "err", err)
+			log.Warn("pack compaction pass", "err", err)
 		case stats.Compacted > 0:
-			log.Info("проход компактификации паков",
+			log.Info("pack compaction pass",
 				"packs", stats.Compacted, "freed_bytes", stats.FreedBytes)
 		}
 	}

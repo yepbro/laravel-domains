@@ -10,7 +10,7 @@ func TestCompressRoundTrip(t *testing.T) {
 	cases := [][]byte{
 		nil,
 		{},
-		[]byte("<html><body>привет, мир</body></html>"),
+		[]byte("<html><body>hello, world</body></html>"),
 		[]byte(strings.Repeat("<div class=\"row\">hosting parking</div>\n", 1000)),
 	}
 	for _, src := range cases {
@@ -20,7 +20,7 @@ func TestCompressRoundTrip(t *testing.T) {
 			t.Fatalf("Decompress: %v", err)
 		}
 		if !bytes.Equal(got, src) {
-			t.Errorf("round-trip изменил данные: got %d байт, want %d", len(got), len(src))
+			t.Errorf("round-trip changed the data: got %d bytes, want %d", len(got), len(src))
 		}
 	}
 }
@@ -28,12 +28,12 @@ func TestCompressRoundTrip(t *testing.T) {
 func TestCompressReducesRepetitive(t *testing.T) {
 	src := []byte(strings.Repeat("laravel", 10000))
 	if compressed := Compress(src); len(compressed) >= len(src) {
-		t.Errorf("zstd не сжал повторяющиеся данные: %d -> %d байт", len(src), len(compressed))
+		t.Errorf("zstd did not compress the repetitive data: %d -> %d bytes", len(src), len(compressed))
 	}
 }
 
 func TestDecompressGarbage(t *testing.T) {
-	if _, err := Decompress([]byte("это не zstd-поток")); err == nil {
-		t.Error("ожидалась ошибка распаковки мусора")
+	if _, err := Decompress([]byte("this is not a zstd stream")); err == nil {
+		t.Error("expected a garbage-decompression error")
 	}
 }

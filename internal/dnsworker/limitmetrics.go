@@ -68,19 +68,19 @@ func newLimitGauges(reg *metrics.Registry) *limitGauges {
 	return &limitGauges{
 		concurrency: reg.MustGauge(prometheus.GaugeOpts{
 			Name: "crawler_dns_limit_concurrency",
-			Help: "Потолок параллелизма DNS-обменов: effective — действующий после адаптивного снижения (T-035), configured — dns.concurrency.",
+			Help: "The DNS exchange concurrency cap: effective — in force after the adaptive reduction (T-035), configured — dns.concurrency.",
 		}, metrics.LabelKind),
 		qps: reg.MustGauge(prometheus.GaugeOpts{
 			Name: "crawler_dns_limit_qps",
-			Help: "Средний темп DNS-обменов в секунду: effective — действующий после адаптивного снижения (T-035), configured — dns.max_qps.",
+			Help: "The average DNS exchange rate per second: effective — in force after the adaptive reduction (T-035), configured — dns.max_qps.",
 		}, metrics.LabelKind),
 		ratio: reg.MustGauge(prometheus.GaugeOpts{
 			Name: "crawler_dns_limit_timeout_ratio",
-			Help: "Доля таймаутов в скользящем окне адаптива лимитёра DNS (0, пока окно наполняется).",
+			Help: "The timeout share in the sliding window of the DNS limiter adaptive logic (0 while the window fills).",
 		}).WithLabelValues(),
 		inflight: reg.MustGauge(prometheus.GaugeOpts{
 			Name: "crawler_dns_inflight",
-			Help: "DNS-обменов в нижнем резолвере прямо сейчас (занятые слоты параллелизма).",
+			Help: "DNS exchanges in the bottom-priority resolver right now (busy concurrency slots).",
 		}).WithLabelValues(),
 	}
 }
@@ -127,7 +127,7 @@ func CollectLimitLoop(
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	log.Info("коллектор лимитёра DNS", "interval", interval.String())
+	log.Info("DNS limiter collector", "interval", interval.String())
 
 	pass := func() { collectLimitPass(g, stats) }
 	pass()

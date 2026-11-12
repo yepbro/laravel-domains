@@ -431,7 +431,7 @@ var (
 // with a Warn (the lease pass of T-029/T-030 will bring the domains
 // back after the reference table is fixed) instead of spinning retries
 // until q:dead (DNS-03).
-var ErrSubdomainsEmpty = errors.New("dnsworker: справочник subdomains пуст — нужен хотя бы апекс (ТЗ 5.10)")
+var ErrSubdomainsEmpty = errors.New("dnsworker: the subdomains reference table is empty — at least the apex is required (spec 5.10)")
 
 // EpisodeResult — the DNS episode decision for one domain: what to write
 // into domains and what to publish into q:http (spec 5.4 items 4–5,
@@ -475,7 +475,7 @@ func (r EpisodeResult) HasHTTPTask() bool { return len(r.HTTPSubdomains) > 0 }
 // The status rules are in the file comment.
 func DecideEpisode(apex *ApexResult, rep *SubdomReport, wild WildcardResult) (EpisodeResult, error) {
 	if apex == nil {
-		return EpisodeResult{}, errors.New("dnsworker: решение эпизода: нет результата апекса (T-036)")
+		return EpisodeResult{}, errors.New("dnsworker: episode decision: no apex result (T-036)")
 	}
 	var out EpisodeResult
 
@@ -490,7 +490,7 @@ func DecideEpisode(apex *ApexResult, rep *SubdomReport, wild WildcardResult) (Ep
 	}
 
 	if rep == nil {
-		return EpisodeResult{}, errors.New("dnsworker: решение эпизода: нет отчёта субдоменов (T-037)")
+		return EpisodeResult{}, errors.New("dnsworker: episode decision: no subdomain report (T-037)")
 	}
 	out.Mask = rep.Mask
 
@@ -592,21 +592,21 @@ func resultCNAME(c string) string {
 // is success, not an error.
 func RecordEpisode(ctx context.Context, pool db.DB, zoneID int16, domainID int64, res EpisodeResult, met *Metrics) (bool, error) {
 	if pool == nil {
-		return false, errors.New("dnsworker: запись результата: пул не задан")
+		return false, errors.New("dnsworker: result recording: the pool is not set")
 	}
 	if res.SetStatus && !res.Status.Valid() {
-		return false, fmt.Errorf("dnsworker: запись результата домена %d/%d: недопустимый статус %d", zoneID, domainID, int16(res.Status))
+		return false, fmt.Errorf("dnsworker: result recording of domain %d/%d: invalid status %d", zoneID, domainID, int16(res.Status))
 	}
 
 	var sql, what string
 	args := []any{zoneID, domainID}
 	if res.SetStatus {
 		sql = resultUpdateStatusSQL
-		what = "запись результата"
+		what = "result recording"
 		args = append(args, int64(res.Mask), int16(res.Status))
 	} else {
 		sql = resultUpdateKeepStatusSQL
-		what = "запись результата"
+		what = "result recording"
 		args = append(args, int64(res.Mask))
 	}
 	var n int64
@@ -630,7 +630,7 @@ func RecordEpisode(ctx context.Context, pool db.DB, zoneID int16, domainID int64
 			_, err := pool.Exec(ctx, resultMatureIncSQL)
 			return err
 		}); err != nil {
-			return true, fmt.Errorf("dnsworker: инкремент корзины retry_mature домена %d/%d: %w", zoneID, domainID, err)
+			return true, fmt.Errorf("dnsworker: retry_mature bucket increment of domain %d/%d: %w", zoneID, domainID, err)
 		}
 	}
 	return n > 0, nil
@@ -654,11 +654,11 @@ func resultRetry(ctx context.Context, met *Metrics, fn func() error) error {
 // success.
 func MarkHTTPPublished(ctx context.Context, pool db.DB, zoneID int16, domainID int64) (bool, error) {
 	if pool == nil {
-		return false, errors.New("dnsworker: пометка публикации: пул не задан")
+		return false, errors.New("dnsworker: publication mark: the pool is not set")
 	}
 	tag, err := pool.Exec(ctx, resultMarkPublishedSQL, zoneID, domainID)
 	if err != nil {
-		return false, fmt.Errorf("dnsworker: пометка публикации домена %d/%d: %w", zoneID, domainID, err)
+		return false, fmt.Errorf("dnsworker: publication mark of domain %d/%d: %w", zoneID, domainID, err)
 	}
 	return tag.RowsAffected() > 0, nil
 }
@@ -676,12 +676,12 @@ func MarkHTTPPublished(ctx context.Context, pool db.DB, zoneID int16, domainID i
 // is success, not an error.
 func RecordInvalid(ctx context.Context, pool db.DB, zoneID int16, domainID int64, met *Metrics) (bool, error) {
 	if pool == nil {
-		return false, errors.New("dnsworker: диагноз invalid: пул не задан")
+		return false, errors.New("dnsworker: invalid diagnosis: the pool is not set")
 	}
 	var n int64
 	if err := resultRetry(ctx, met, func() error {
 		var err error
-		n, err = resultCount(ctx, pool, resultInvalidSQL, []any{zoneID, domainID}, zoneID, domainID, "диагноз invalid")
+		n, err = resultCount(ctx, pool, resultInvalidSQL, []any{zoneID, domainID}, zoneID, domainID, "invalid diagnosis")
 		return err
 	}); err != nil {
 		return false, err
@@ -696,11 +696,11 @@ func RecordInvalid(ctx context.Context, pool db.DB, zoneID int16, domainID int64
 func resultCount(ctx context.Context, pool db.DB, sql string, args []any, zoneID int16, domainID int64, what string) (int64, error) {
 	rows, err := pool.Query(ctx, sql, args...)
 	if err != nil {
-		return 0, fmt.Errorf("dnsworker: %s домена %d/%d: %w", what, zoneID, domainID, err)
+		return 0, fmt.Errorf("dnsworker: %s of domain %d/%d: %w", what, zoneID, domainID, err)
 	}
 	n, err := pgx.CollectOneRow(rows, pgx.RowTo[int64])
 	if err != nil {
-		return 0, fmt.Errorf("dnsworker: %s домена %d/%d: %w", what, zoneID, domainID, err)
+		return 0, fmt.Errorf("dnsworker: %s of domain %d/%d: %w", what, zoneID, domainID, err)
 	}
 	return n, nil
 }
@@ -739,15 +739,15 @@ func ProcessDomain(
 		log = slog.New(slog.DiscardHandler)
 	}
 	if q == nil {
-		return fmt.Errorf("dnsworker: домен %s: очередь не задана", dom.Name)
+		return fmt.Errorf("dnsworker: domain %s: the queue is not set", dom.Name)
 	}
 	if resolve == nil {
-		return fmt.Errorf("dnsworker: домен %s: резолвер не задан", dom.Name)
+		return fmt.Errorf("dnsworker: domain %s: the resolver is not set", dom.Name)
 	}
 
 	apex, err := CheckApex(ctx, resolve, dom.Name)
 	if err != nil {
-		return fmt.Errorf("dnsworker: домен %s: апекс: %w", dom.Name, err)
+		return fmt.Errorf("dnsworker: domain %s: apex: %w", dom.Name, err)
 	}
 
 	var (
@@ -757,30 +757,30 @@ func ProcessDomain(
 	if !apex.Status.Stop() {
 		rep, err = CheckSubdomains(ctx, resolve, dom.Name, subs, askAAAA)
 		if err != nil {
-			return fmt.Errorf("dnsworker: домен %s: субдомены: %w", dom.Name, err)
+			return fmt.Errorf("dnsworker: domain %s: subdomains: %w", dom.Name, err)
 		}
 		info, werr := DetectWildcard(ctx, resolve, dom.Name)
 		switch {
 		case werr != nil && ctx.Err() != nil:
 			// A cancellation/deadline — the episode did not finish (not
 			// "the detection failed").
-			return fmt.Errorf("dnsworker: домен %s: wildcard-детект: %w", dom.Name, werr)
+			return fmt.Errorf("dnsworker: domain %s: wildcard detect: %w", dom.Name, werr)
 		case werr != nil:
 			// The T-038 policy: continue without filtering — all
 			// DNS-live subdomains go to HTTP.
-			log.Warn("wildcard-детект не удался — продолжаю без фильтрации",
+			log.Warn("the wildcard detect failed — continuing without filtering",
 				"domain", dom.Name, "err", werr)
 		case info.Detected:
 			wild, err = MarkWildcardSubdomains(info.Addrs, resultWildSubs(rep))
 			if err != nil {
-				return fmt.Errorf("dnsworker: домен %s: wildcard-пометка: %w", dom.Name, err)
+				return fmt.Errorf("dnsworker: domain %s: wildcard marking: %w", dom.Name, err)
 			}
 		}
 	}
 
 	res, err := DecideEpisode(apex, rep, wild)
 	if err != nil {
-		return fmt.Errorf("dnsworker: домен %s: %w", dom.Name, err)
+		return fmt.Errorf("dnsworker: domain %s: %w", dom.Name, err)
 	}
 
 	// First the q:http publication, then the done write (the order is in
@@ -792,7 +792,7 @@ func ProcessDomain(
 	case !res.HasHTTPTask():
 		// A terminal branch — nothing to publish.
 	case dom.HTTPPublished:
-		log.Debug("q:http уже опубликована предыдущей попыткой — публикация пропущена",
+		log.Debug("q:http was already published by a previous attempt — publication skipped",
 			"domain", dom.Name, "zone_id", dom.ZoneID, "domain_id", dom.DomainID)
 	default:
 		task := queue.HTTPTask{
@@ -802,7 +802,7 @@ func ProcessDomain(
 			Subdomains: res.HTTPSubdomains,
 		}
 		if _, err := q.Publish(ctx, queue.StreamHTTP, task); err != nil {
-			return fmt.Errorf("dnsworker: домен %s: публикация q:http: %w", dom.Name, err)
+			return fmt.Errorf("dnsworker: domain %s: q:http publication: %w", dom.Name, err)
 		}
 		// The staging mark (T-108): a failsafe for the "published, not
 		// recorded" window. Non-fatal: a mark failure does not drop the
@@ -812,10 +812,10 @@ func ProcessDomain(
 		marked, merr := MarkHTTPPublished(ctx, pool, dom.ZoneID, dom.DomainID)
 		switch {
 		case merr != nil:
-			log.Warn("пометка http_published не записана — повторная доставка может опубликовать дубль q:http",
+			log.Warn("the http_published mark was not written — redelivery may publish a duplicate q:http",
 				"domain", dom.Name, "zone_id", dom.ZoneID, "domain_id", dom.DomainID, "err", merr)
 		case !marked:
-			log.Debug("пометка http_published не поставлена — домен удалён или уже done",
+			log.Debug("the http_published mark was not set — the domain is deleted or already done",
 				"domain", dom.Name, "zone_id", dom.ZoneID, "domain_id", dom.DomainID)
 		}
 	}
@@ -827,7 +827,7 @@ func ProcessDomain(
 	if !recorded {
 		// A race with a delete (§13.1) or a redelivery of an already
 		// recorded outcome — both cases are normal.
-		log.Debug("результат не записан — домен удалён или уже done",
+		log.Debug("the result was not recorded — the domain is deleted or already done",
 			"domain", dom.Name, "zone_id", dom.ZoneID, "domain_id", dom.DomainID)
 		return nil
 	}
@@ -838,7 +838,7 @@ func ProcessDomain(
 		// increment), the monitor reconciliation will catch the bucket
 		// up — the episode is finished, non-fatal (the T-108 mark
 		// style).
-		log.Warn("инкремент корзины retry_mature не записан — корзину догонит реконсиляция",
+		log.Warn("the retry_mature bucket increment was not written — reconciliation will catch up the bucket",
 			"domain", dom.Name, "zone_id", dom.ZoneID, "domain_id", dom.DomainID, "err", err)
 	}
 	if res.SetStatus {
@@ -847,7 +847,7 @@ func ProcessDomain(
 		// status.
 		met.DomainStatus(res.Status)
 	}
-	log.Debug("DNS-эпизод записан",
+	log.Debug("DNS episode recorded",
 		"domain", dom.Name, "mask", int64(res.Mask), "http_subs", len(res.HTTPSubdomains),
 		"status", res.Status.String(), "set_status", res.SetStatus)
 	return nil
@@ -879,11 +879,11 @@ func resultWildSubs(rep *SubdomReport) []WildSubdomain {
 // worker restart.
 func LoadSubdomains(ctx context.Context, pool db.DB) ([]model.Subdomain, error) {
 	if pool == nil {
-		return nil, errors.New("dnsworker: справочник субдоменов: пул не задан")
+		return nil, errors.New("dnsworker: the subdomain reference table: the pool is not set")
 	}
 	rows, err := pool.Query(ctx, subdomainsSelectSQL)
 	if err != nil {
-		return nil, fmt.Errorf("dnsworker: справочник субдоменов: %w", err)
+		return nil, fmt.Errorf("dnsworker: the subdomain reference table: %w", err)
 	}
 	defer rows.Close()
 
@@ -891,12 +891,12 @@ func LoadSubdomains(ctx context.Context, pool db.DB) ([]model.Subdomain, error) 
 	for rows.Next() {
 		var s model.Subdomain
 		if err := rows.Scan(&s.ID, &s.Label, &s.Enabled); err != nil {
-			return nil, fmt.Errorf("dnsworker: справочник субдоменов: чтение: %w", err)
+			return nil, fmt.Errorf("dnsworker: the subdomain reference table: read: %w", err)
 		}
 		subs = append(subs, s)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("dnsworker: справочник субдоменов: %w", err)
+		return nil, fmt.Errorf("dnsworker: the subdomain reference table: %w", err)
 	}
 	if len(subs) == 0 {
 		return nil, ErrSubdomainsEmpty
@@ -931,7 +931,7 @@ type PendingDomain struct {
 // already done, the delivery is simply acknowledged.
 func PendingDomains(ctx context.Context, pool db.DB, batch []queue.DNSDomain) ([]PendingDomain, error) {
 	if pool == nil {
-		return nil, errors.New("dnsworker: фильтр пачки: пул не задан")
+		return nil, errors.New("dnsworker: the batch filter: the pool is not set")
 	}
 	if len(batch) == 0 {
 		return nil, nil
@@ -947,7 +947,7 @@ func PendingDomains(ctx context.Context, pool db.DB, batch []queue.DNSDomain) ([
 
 	rows, err := pool.Query(ctx, resultPendingSQL, zones, ids)
 	if err != nil {
-		return nil, fmt.Errorf("dnsworker: фильтр пачки (%d доменов): %w", len(batch), err)
+		return nil, fmt.Errorf("dnsworker: the batch filter (%d domains): %w", len(batch), err)
 	}
 	defer rows.Close()
 
@@ -958,7 +958,7 @@ func PendingDomains(ctx context.Context, pool db.DB, batch []queue.DNSDomain) ([
 			flags int16
 		)
 		if err := rows.Scan(&k.zone, &k.id, &flags); err != nil {
-			return nil, fmt.Errorf("dnsworker: фильтр пачки: чтение: %w", err)
+			return nil, fmt.Errorf("dnsworker: the batch filter: read: %w", err)
 		}
 		if d, ok := byKey[k]; ok {
 			pending = append(pending, PendingDomain{
@@ -968,7 +968,7 @@ func PendingDomains(ctx context.Context, pool db.DB, batch []queue.DNSDomain) ([
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("dnsworker: фильтр пачки: %w", err)
+		return nil, fmt.Errorf("dnsworker: the batch filter: %w", err)
 	}
 	return pending, nil
 }
@@ -1069,13 +1069,13 @@ func (o Options) withDefaults() Options {
 // (spec 4.2).
 func Run(ctx context.Context, pool db.DB, q queue.Queue, resolve dnsclient.Resolver, opts Options) error {
 	if pool == nil {
-		return errors.New("dnsworker: цикл воркера: пул не задан")
+		return errors.New("dnsworker: the worker loop: the pool is not set")
 	}
 	if q == nil {
-		return errors.New("dnsworker: цикл воркера: очередь не задана")
+		return errors.New("dnsworker: the worker loop: the queue is not set")
 	}
 	if resolve == nil {
-		return errors.New("dnsworker: цикл воркера: резолвер не задан")
+		return errors.New("dnsworker: the worker loop: the resolver is not set")
 	}
 	o := opts.withDefaults()
 	log := o.Log
@@ -1083,7 +1083,7 @@ func Run(ctx context.Context, pool db.DB, q queue.Queue, resolve dnsclient.Resol
 		log = slog.New(slog.DiscardHandler)
 	}
 	met := NewMetrics(o.Metrics) // nil without a registry — the instruments are no-ops (T-077)
-	log.Info("цикл dns-worker",
+	log.Info("dns-worker loop",
 		"group", o.Group, "consumer", o.Consumer,
 		"concurrency", o.Concurrency, "consume", o.Consume, "ask_aaaa", o.AskAAAA)
 
@@ -1127,7 +1127,7 @@ func Run(ctx context.Context, pool db.DB, q queue.Queue, resolve dnsclient.Resol
 			if ctx.Err() != nil {
 				return nil // graceful shutdown
 			}
-			log.Warn("цикл dns-worker: чтение q:dns", "err", err)
+			log.Warn("dns-worker loop: q:dns read", "err", err)
 			wait(DefaultErrorWait)
 			continue
 		}
@@ -1144,7 +1144,7 @@ func Run(ctx context.Context, pool db.DB, q queue.Queue, resolve dnsclient.Resol
 			if ctx.Err() != nil {
 				return nil // a cancellation mid-work — a redelivery, not an alarm
 			}
-			log.Warn("пачка q:dns не подтверждена — вернётся повторной доставкой",
+			log.Warn("the q:dns batch was not acknowledged — it will return via redelivery",
 				"entry", d.ID, "err", err)
 		}
 	}
@@ -1191,12 +1191,12 @@ func processBatch(
 	if err != nil {
 		// A poison record: a redelivery is pointless, but the queue will
 		// try — exhaust the attempts and go to q:dead (T-025).
-		return fmt.Errorf("dnsworker: запись %s стрима %s: %w", del.ID, del.Stream, err)
+		return fmt.Errorf("dnsworker: record %s of stream %s: %w", del.ID, del.Stream, err)
 	}
 	subs, err := LoadSubdomains(ctx, pool)
 	if err != nil {
 		if errors.Is(err, ErrSubdomainsEmpty) {
-			log.Warn("справочник subdomains пуст — пачка q:dns подтверждена без обработки",
+			log.Warn("the subdomains reference table is empty — the q:dns batch acknowledged without processing",
 				"entry", del.ID, "batch", len(batch.Domains), "err", err)
 			return nil
 		}
@@ -1208,10 +1208,10 @@ func processBatch(
 		// subdomains disable operation) — configuration: a delivery
 		// repeat will not change the outcome.
 		if err != nil {
-			log.Warn("справочник subdomains некорректен — пачка q:dns подтверждена без обработки",
+			log.Warn("the subdomains reference table is malformed — the q:dns batch acknowledged without processing",
 				"entry", del.ID, "batch", len(batch.Domains), "err", err)
 		} else {
-			log.Warn("нет включённых субдоменов — пачка q:dns подтверждена без обработки",
+			log.Warn("no enabled subdomains — the q:dns batch acknowledged without processing",
 				"entry", del.ID, "batch", len(batch.Domains))
 		}
 		return nil
@@ -1221,7 +1221,7 @@ func processBatch(
 		return err
 	}
 	if len(pending) == 0 {
-		log.Debug("пачка q:dns уже обработана или исключена (done/deleted)",
+		log.Debug("the q:dns batch was already processed or excluded (done/deleted)",
 			"entry", del.ID, "batch", len(batch.Domains))
 		return nil
 	}
@@ -1273,23 +1273,23 @@ func processBatch(
 				case rerr != nil:
 					mu.Lock()
 					if firstErr == nil {
-						firstErr = fmt.Errorf("домен %s: %w", dom.Name, rerr)
+						firstErr = fmt.Errorf("domain %s: %w", dom.Name, rerr)
 					}
 					mu.Unlock()
 				case recorded:
 					met.DomainStatus(model.StatusInvalid)
-					log.Warn("домен с пустым именем — зафиксирован диагноз invalid, строка выведена из цикла переиздания",
+					log.Warn("a domain with an empty name — the invalid diagnosis recorded, the row is taken out of the re-publishing loop",
 						"entry", del.ID, "zone_id", dom.ZoneID, "domain_id", dom.DomainID)
 				default:
 					// The guards cut it off (deleted/already done) — a
 					// redelivery or a concurrent delete: normal.
-					log.Debug("диагноз invalid не записан — домен удалён или уже done",
+					log.Debug("the invalid diagnosis was not recorded — the domain is deleted or already done",
 						"entry", del.ID, "zone_id", dom.ZoneID, "domain_id", dom.DomainID)
 				}
 			default:
 				mu.Lock()
 				if firstErr == nil {
-					firstErr = fmt.Errorf("домен %s: %w", dom.Name, err)
+					firstErr = fmt.Errorf("domain %s: %w", dom.Name, err)
 				}
 				mu.Unlock()
 			}
@@ -1298,9 +1298,9 @@ func processBatch(
 	wg.Wait()
 
 	if firstErr != nil {
-		return fmt.Errorf("dnsworker: пачка %s: %d/%d доменов: %w", del.ID, len(pending), len(batch.Domains), firstErr)
+		return fmt.Errorf("dnsworker: batch %s: %d/%d domains: %w", del.ID, len(pending), len(batch.Domains), firstErr)
 	}
-	log.Debug("пачка q:dns обработана", "entry", del.ID,
+	log.Debug("the q:dns batch processed", "entry", del.ID,
 		"batch", len(batch.Domains), "pending", len(pending))
 	return nil
 }

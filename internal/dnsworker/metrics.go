@@ -48,16 +48,16 @@ func NewMetrics(reg *metrics.Registry) *Metrics {
 	return &Metrics{
 		tasks: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_stage_tasks_total",
-			Help: "Обработанные задачи этапов конвейера: dns — домены, http — домены, render/analyze — записи субдомен×вариант.",
+			Help: "Pipeline stage tasks processed: dns — domains, http — domains, render/analyze — subdomain×variant rows.",
 		}, metrics.LabelStage).WithLabelValues(metrics.StageDNS),
 		seconds: reg.MustHistogram(prometheus.HistogramOpts{
 			Name:    "crawler_stage_seconds",
-			Help:    "Длительность обработки одной задачи этапа (эпизод домена/записи).",
+			Help:    "Duration of processing one stage task (a domain/record episode).",
 			Buckets: dnsSecondsBuckets,
 		}, metrics.LabelStage).WithLabelValues(metrics.StageDNS),
 		statuses: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_domain_status_total",
-			Help: "Финальные статусы доменов по итогам эпизодов (ТЗ 6.2): DNS-этап — not_delegated/delegated_no_address/temp_error/invalid (диагноз ядовитой строки, T-109), HTTP-этап — alive/no_http/temp_error.",
+			Help: "Final domain statuses by episode outcomes (spec 6.2): the DNS stage — not_delegated/delegated_no_address/temp_error/invalid (the poison-row diagnosis, T-109), the HTTP stage — alive/no_http/temp_error.",
 		}, metrics.LabelType),
 		// The 40P01 retry counter (T-268): a single name/HELP for all
 		// services — the internal/metrics constructor.

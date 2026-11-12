@@ -50,7 +50,7 @@ func (f *fakePending) PendingKeys(_ context.Context, stream string) (map[Retenti
 		f.snap++
 	}
 	if f.errFrom > 0 && f.snap >= f.errFrom {
-		return nil, errors.New("redis недоступен")
+		return nil, errors.New("redis unavailable")
 	}
 	seq := &f.analyze
 	switch stream {
@@ -114,14 +114,14 @@ func TestRetentionOnce_PendingExclude(t *testing.T) {
 		t.Fatalf("RetentionOnce: %v", err)
 	}
 	if stats.Rows != 2 || stats.Refs != 2 {
-		t.Fatalf("stats = %+v, want Rows=Refs=2 (только не-ожидающие: 10 и 40)", stats)
+		t.Fatalf("stats = %+v, want Rows=Refs=2 (only the non-waiting: 10 and 40)", stats)
 	}
 	if stats.Deferred[queue.StreamRender] != 1 || stats.Deferred[queue.StreamRenderFallback] != 1 ||
 		stats.Deferred[queue.StreamAnalyze] != 2 {
-		t.Fatalf("Deferred = %v, want q:render=1 (10/1/0), q:render-fallback=1 (10/3/0), q:analyze=2 (10/1/0 и 10/2/1)", stats.Deferred)
+		t.Fatalf("Deferred = %v, want q:render=1 (10/1/0), q:render-fallback=1 (10/3/0), q:analyze=2 (10/1/0 and 10/2/1)", stats.Deferred)
 	}
 	if stats.Skipped || stats.SkippedPending {
-		t.Fatalf("stats = %+v, want проход без пропусков", stats)
+		t.Fatalf("stats = %+v, want a pass without skips", stats)
 	}
 	// Records waiting on the queues are untouched: the content and jsonb
 	// are in place, the refcount of the live rows did not change.
@@ -131,22 +131,22 @@ func TestRetentionOnce_PendingExclude(t *testing.T) {
 		{zone: 1, domain: 10, sub: 3, variant: 0},
 	} {
 		if r := pool.row(key); r == nil || r.hash == nil || !r.jsonb {
-			t.Errorf("запись %v, ждущая очередей, очищена: %+v", key, r)
+			t.Errorf("record %v waiting for the queues purged: %+v", key, r)
 		}
 	}
 	if _, ok := pool.contents[retentionHash(0x11)]; !ok {
-		t.Error("contents 0x11 (ждёт очередей) удалён")
+		t.Error("contents 0x11 (waiting for the queues) removed")
 	}
 	if _, ok := pool.contents[retentionHash(0x22)]; !ok {
-		t.Error("contents 0x22 (ждёт очередей) удалён")
+		t.Error("contents 0x22 (waiting for the queues) removed")
 	}
 	if _, ok := pool.contents[retentionHash(0x33)]; !ok {
-		t.Error("contents 0x33 (ждёт q:render-fallback) удалён")
+		t.Error("contents 0x33 (waiting for q:render-fallback) removed")
 	}
 	// The SQL returned the waiting records as candidates — the exclusion
 	// was done by the protection.
 	if len(pool.queries) == 0 {
-		t.Fatal("выборок нет — тест не проверил исключение кандидатов")
+		t.Fatal("no selections — the test did not check candidate exclusion")
 	}
 }
 
@@ -168,7 +168,7 @@ func TestRetentionOnce_PendingAllExcluded(t *testing.T) {
 		t.Fatalf("RetentionOnce: %v", err)
 	}
 	if stats.Rows != 0 || stats.Batches != 0 {
-		t.Fatalf("stats = %+v, want пустой дренаж без транзакций", stats)
+		t.Fatalf("stats = %+v, want an empty drain without transactions", stats)
 	}
 	if stats.Deferred[queue.StreamRender] != 1 {
 		t.Fatalf("Deferred = %v, want q:render=1", stats.Deferred)
@@ -176,10 +176,10 @@ func TestRetentionOnce_PendingAllExcluded(t *testing.T) {
 	// The only transaction is the selection pinning wrapper tx (T-271);
 	// there is no purge transaction: nothing to purge.
 	if pool.begins != 1 {
-		t.Fatalf("транзакций = %d, want 1 (только tx-оболочка выборки, чистки нет)", pool.begins)
+		t.Fatalf("transactions = %d, want 1 (the selection tx wrapper only, no purge)", pool.begins)
 	}
 	if r := pool.row(retentionKey{zone: 1, domain: 10, sub: 0, variant: 0}); r.hash == nil || !r.jsonb {
-		t.Fatalf("ждущая запись тронута: %+v", r)
+		t.Fatalf("a waiting record touched: %+v", r)
 	}
 }
 
@@ -220,19 +220,19 @@ func TestRetentionOnce_PendingRefresh(t *testing.T) {
 	// — the refreshed one (its message was published after the first
 	// snapshot).
 	if stats.Rows != 24 {
-		t.Fatalf("Rows = %d, want 24 (исключены sub=0 и sub=25)", stats.Rows)
+		t.Fatalf("Rows = %d, want 24 (sub=0 and sub=25 excluded)", stats.Rows)
 	}
 	for _, sub := range []int16{0, 25} {
 		if r := pool.row(retentionKey{zone: 1, domain: 10, sub: sub, variant: 0}); r.hash == nil || !r.jsonb {
-			t.Errorf("запись sub=%d, защищённая обновлением снимка, очищена", sub)
+			t.Errorf("record sub=%d protected by the snapshot refresh purged", sub)
 		}
 	}
 	if r := pool.row(retentionKey{zone: 1, domain: 10, sub: 12, variant: 0}); r.hash != nil {
-		t.Errorf("запись sub=12 без защиты не очищена")
+		t.Errorf("record sub=12 without protection not purged")
 	}
 	p := opts.Pending.(*fakePending)
 	if len(p.calls) != 6 {
-		t.Fatalf("обращений к стримам = %v, want 6 (два снимка × q:render+q:render-fallback+q:analyze)", p.calls)
+		t.Fatalf("stream calls = %v, want 6 (two snapshots × q:render+q:render-fallback+q:analyze)", p.calls)
 	}
 }
 
@@ -256,13 +256,13 @@ func TestRetentionOnce_PendingAfterInterlock(t *testing.T) {
 		t.Fatalf("RetentionOnce: %v", err)
 	}
 	if !stats.Skipped || stats.SkippedPending {
-		t.Fatalf("stats = %+v, want Skipped интерлока (не SkippedPending)", stats)
+		t.Fatalf("stats = %+v, want the interlock Skipped (not SkippedPending)", stats)
 	}
 	if len(pending.calls) != 0 {
-		t.Fatalf("снимок при закрытом интерлоке читался: %v", pending.calls)
+		t.Fatalf("the snapshot read with the interlock closed: %v", pending.calls)
 	}
 	if len(pool.queries) != 0 {
-		t.Fatalf("SELECT'ов = %d, want 0", len(pool.queries))
+		t.Fatalf("SELECTs = %d, want 0", len(pool.queries))
 	}
 }
 
@@ -279,13 +279,13 @@ func TestRetentionOnce_PendingReadError(t *testing.T) {
 
 	stats, err := RetentionOnce(context.Background(), pool, opts)
 	if err != nil {
-		t.Fatalf("RetentionOnce: %v, want консервативный пропуск без ошибки", err)
+		t.Fatalf("RetentionOnce: %v, want a conservative skip without an error", err)
 	}
 	if !stats.SkippedPending || stats.Rows != 0 {
-		t.Fatalf("stats = %+v, want SkippedPending без работы", stats)
+		t.Fatalf("stats = %+v, want SkippedPending with no work", stats)
 	}
 	if len(pool.queries) != 0 || pool.begins != 0 {
-		t.Fatalf("пропущенный проход обязан не трогать БД: SELECT'ов %d, транзакций %d", len(pool.queries), pool.begins)
+		t.Fatalf("a skipped pass must leave the DB alone: %d SELECTs, %d transactions", len(pool.queries), pool.begins)
 	}
 }
 
@@ -313,15 +313,15 @@ func TestRetentionOnce_PendingRefreshError(t *testing.T) {
 
 	stats, err := RetentionOnce(context.Background(), pool, opts)
 	if err != nil {
-		t.Fatalf("RetentionOnce: %v, want отложенный остаток без ошибки", err)
+		t.Fatalf("RetentionOnce: %v, want a deferred remainder without an error", err)
 	}
 	if stats.Rows != 25 || !stats.SkippedPending {
-		t.Fatalf("stats = %+v, want 25 зафиксированных пачек и SkippedPending", stats)
+		t.Fatalf("stats = %+v, want 25 committed batches and SkippedPending", stats)
 	}
 	// The 25th record (sub=24) was purged; the 26th (sub=25) is untouched —
 	// the pass was stopped before its batch.
 	if r := pool.row(retentionKey{zone: 1, domain: 10, sub: 25, variant: 0}); r.hash == nil {
-		t.Error("запись после точки ошибки очищена — остаток обязан ждать следующего прохода")
+		t.Error("a record past the error point purged — the remainder must wait for the next pass")
 	}
 }
 
@@ -335,7 +335,7 @@ func TestRetentionOnce_PendingDisabled(t *testing.T) {
 		t.Fatalf("RetentionOnce: %v", err)
 	}
 	if stats.Rows != 2 || len(stats.Deferred) != 0 {
-		t.Fatalf("stats = %+v, want прежние 2 строки без Deferred", stats)
+		t.Fatalf("stats = %+v, want the previous 2 rows without Deferred", stats)
 	}
 }
 

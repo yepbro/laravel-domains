@@ -91,7 +91,7 @@ func TestRetentionMetricsObserve(t *testing.T) {
 		"crawler_content_retention_missing_refs_total",
 	} {
 		if got := retentionCounterValue(t, reg, name); got != 0 {
-			t.Fatalf("%s после нулевого итога = %v, want 0", name, got)
+			t.Fatalf("%s after a zero result = %v, want 0", name, got)
 		}
 	}
 
@@ -110,13 +110,13 @@ func TestRetentionMetricsObserve(t *testing.T) {
 		t.Errorf("freed = %v, want 63000", got)
 	}
 	if got := retentionCounterValue(t, reg, "crawler_content_retention_bad_hashes_total"); got != 1 {
-		t.Errorf("bad_hashes = %v, want 1 (растёт только при аномалии)", got)
+		t.Errorf("bad_hashes = %v, want 1 (grows only on an anomaly)", got)
 	}
 	if got := retentionCounterValue(t, reg, "crawler_content_retention_missing_refs_total"); got != 2 {
 		t.Errorf("missing = %v, want 2", got)
 	}
 	if got := retentionCounterByLabels(t, reg, "crawler_content_retention_passes_total", map[string]string{"result": "ok"}); got != 3 {
-		t.Errorf("passes{ok} = %v, want 3 (включая пустой)", got)
+		t.Errorf("passes{ok} = %v, want 3 (including the empty one)", got)
 	}
 	if got := retentionCounterValue(t, reg, "crawler_content_retention_skips_total"); got != 0 {
 		t.Errorf("skips = %v, want 0", got)
@@ -126,7 +126,7 @@ func TestRetentionMetricsObserve(t *testing.T) {
 	// skips and the skipped label.
 	m.Observe(RetentionStats{Skipped: true, Depth: 150}, time.Second)
 	if got := retentionCounterValue(t, reg, "crawler_content_retention_rows_total"); got != 15 {
-		t.Errorf("rows после пропуска = %v, want прежние 15", got)
+		t.Errorf("rows after the skip = %v, want the previous 15", got)
 	}
 	if got := retentionCounterValue(t, reg, "crawler_content_retention_skips_total"); got != 1 {
 		t.Errorf("skips = %v, want 1", got)
@@ -140,7 +140,7 @@ func TestRetentionMetricsObserve(t *testing.T) {
 	// some batches — the work counters are credited in the skipped pass too.
 	m.Observe(RetentionStats{Skipped: true, Depth: 150, Rows: 7, Refs: 7, Contents: 5, FreedBytes: 1000}, time.Second)
 	if got := retentionCounterValue(t, reg, "crawler_content_retention_rows_total"); got != 22 {
-		t.Errorf("rows = %v, want 22 (15 + 7 из пропущенного посреди дренажа)", got)
+		t.Errorf("rows = %v, want 22 (15 + 7 from the one skipped mid-drain)", got)
 	}
 	if got := retentionCounterValue(t, reg, "crawler_content_retention_contents_total"); got != 15 {
 		t.Errorf("contents = %v, want 15 (10 + 5)", got)
@@ -158,7 +158,7 @@ func TestRetentionMetricsObserve(t *testing.T) {
 		t.Errorf("passes{skipped_pending} = %v, want 1", got)
 	}
 	if got := retentionCounterValue(t, reg, "crawler_content_retention_skips_total"); got != 2 {
-		t.Errorf("skips = %v, want прежние 2 (интерлок ни при чём)", got)
+		t.Errorf("skips = %v, want the previous 2 (the interlock not involved)", got)
 	}
 
 	// Records excluded by the guard — per stream: a record waiting on both
@@ -174,7 +174,7 @@ func TestRetentionMetricsObserve(t *testing.T) {
 		t.Errorf("deferred{q:analyze} = %v, want 2", got)
 	}
 	if got := retentionCounterValue(t, reg, "crawler_content_retention_rows_total"); got != 24 {
-		t.Errorf("rows = %v, want 24 (чистка шла вместе с исключениями)", got)
+		t.Errorf("rows = %v, want 24 (the purge went along with the exclusions)", got)
 	}
 }
 
@@ -192,7 +192,7 @@ func TestRetentionMetricsNoRegistry(t *testing.T) {
 	}
 	for _, mf := range families {
 		if mf.GetName() == "crawler_content_retention_rows_total" {
-			t.Fatalf("прибор зарегистрирован без реестра: %s", mf.GetName())
+			t.Fatalf("an instrument registered without a registry: %s", mf.GetName())
 		}
 	}
 }
@@ -206,7 +206,7 @@ func TestRetentionMetricsIdempotent(t *testing.T) {
 	first.Observe(RetentionStats{Rows: 3}, time.Second)
 	second.Observe(RetentionStats{Rows: 4}, time.Second)
 	if got := retentionCounterValue(t, reg, "crawler_content_retention_rows_total"); got != 7 {
-		t.Errorf("rows = %v, want 7 (один коллектор на два конструктора)", got)
+		t.Errorf("rows = %v, want 7 (one collector for two constructors)", got)
 	}
 }
 
@@ -224,12 +224,12 @@ func TestRetentionMetricsErrorsCounter(t *testing.T) {
 	m.Observe(RetentionStats{}, time.Second)              // successful (empty) pass
 	m.Observe(RetentionStats{Skipped: true}, time.Second) // interlock skip
 	if got := retentionCounterValue(t, reg, name); got != 0 {
-		t.Fatalf("%s до ошибок = %v, want 0 (успех/пропуск не считаются)", name, got)
+		t.Fatalf("%s before the errors = %v, want 0 (success/skips do not count)", name, got)
 	}
 	m.ObserveError(nil)
 	m.ObserveError(nil)
 	if got := retentionCounterValue(t, reg, name); got != 2 {
-		t.Fatalf("%s после двух ошибочных проходов = %v, want 2", name, got)
+		t.Fatalf("%s after two failed passes = %v, want 2", name, got)
 	}
 
 	// A nil receiver (a service without a registry) — a no-op, no panic.

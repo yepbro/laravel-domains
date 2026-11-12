@@ -68,7 +68,7 @@ func newPackFakePool() *packFakePool {
 }
 
 func (p *packFakePool) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFromSource) (int64, error) {
-	return 0, errors.New("CopyFrom не должен вызываться")
+	return 0, errors.New("CopyFrom must not be called")
 }
 
 func (p *packFakePool) record(ctx context.Context, sql string, args []any) error {
@@ -91,7 +91,7 @@ func (p *packFakePool) Exec(ctx context.Context, sql string, args ...any) (pgcon
 	if p.failOnExec == p.execSeq {
 		err := p.execErr
 		if err == nil {
-			err = errors.New("packFakePool: сбой БД")
+			err = errors.New("packFakePool: DB failure")
 		}
 		return pgconn.CommandTag{}, err
 	}
@@ -111,7 +111,7 @@ func (p *packFakePool) Exec(ctx context.Context, sql string, args ...any) (pgcon
 		}
 		return pgconn.NewCommandTag("UPDATE 0"), nil
 	default:
-		return pgconn.CommandTag{}, fmt.Errorf("packFakePool: неожидаемый SQL: %s", sql)
+		return pgconn.CommandTag{}, fmt.Errorf("packFakePool: unexpected SQL: %s", sql)
 	}
 }
 
@@ -125,7 +125,7 @@ func (p *packFakePool) Query(ctx context.Context, sql string, args ...any) (pgx.
 	if p.failOnQuery == p.querySeq {
 		err := p.queryErr
 		if err == nil {
-			err = errors.New("packFakePool: сбой БД")
+			err = errors.New("packFakePool: DB failure")
 		}
 		return nil, err
 	}
@@ -134,7 +134,7 @@ func (p *packFakePool) Query(ctx context.Context, sql string, args ...any) (pgx.
 	}
 	if p.failSQL != "" && sql == p.failSQL && p.failN > 0 {
 		p.failN--
-		return nil, errors.New("packFakePool: сбой пачки")
+		return nil, errors.New("packFakePool: batch failure")
 	}
 	switch sql {
 	case sqlMetaPut:
@@ -169,7 +169,7 @@ func (p *packFakePool) Query(ctx context.Context, sql string, args ...any) (pgx.
 			var h [HashLen]byte
 			copy(h[:], hb)
 			if seen[h] {
-				return nil, fmt.Errorf("packFakePool: дубликат хэша %x в дедуп-пачке — нарушен инвариант PutBatch (byHash)", h)
+				return nil, fmt.Errorf("packFakePool: duplicate hash %x in the dedup batch — the PutBatch invariant (byHash) violated", h)
 			}
 			seen[h] = true
 			if r := p.contents[h]; r != nil && r.refc > 0 {
@@ -213,7 +213,7 @@ func (p *packFakePool) Query(ctx context.Context, sql string, args ...any) (pgx.
 		}
 		return &packRows{}, nil // pgx: zero rows → ErrNoRows at the caller
 	default:
-		return nil, fmt.Errorf("packFakePool: неожидаемый SQL: %s", sql)
+		return nil, fmt.Errorf("packFakePool: unexpected SQL: %s", sql)
 	}
 }
 
@@ -267,11 +267,11 @@ func (r *packRows) Next() bool {
 
 func (r *packRows) Scan(dest ...any) error {
 	if r.closed || r.i == 0 || r.i > len(r.rows) {
-		return errors.New("packRows: Scan без Next")
+		return errors.New("packRows: Scan without Next")
 	}
 	row := r.rows[r.i-1]
 	if len(dest) != len(row) {
-		return fmt.Errorf("packRows: приёмников %d, колонок %d", len(dest), len(row))
+		return fmt.Errorf("packRows: %d destinations, %d columns", len(dest), len(row))
 	}
 	for i, d := range dest {
 		target := reflect.ValueOf(d).Elem()
@@ -341,12 +341,12 @@ const (
 func TestPackSQLContract(t *testing.T) {
 	if sqlMetaAddRef != wantSQLAddRef || sqlMetaPut != wantSQLPut ||
 		sqlMetaGet != wantSQLGet || sqlMetaDelRef != wantSQLDelRef {
-		t.Fatal("SQL метаданных изменился — обновите контракт и schema_test")
+		t.Fatal("the metadata SQL changed — update the contract and schema_test")
 	}
 
 	st, pool := newPackTestStore(t, nil)
 	ctx := context.Background()
-	data := []byte("<html>контент для SQL-контракта</html>")
+	data := []byte("<html>content for the SQL contract</html>")
 	h := HashOf(data)
 
 	res, err := st.Put(ctx, data)
@@ -354,7 +354,7 @@ func TestPackSQLContract(t *testing.T) {
 		t.Fatalf("Put: %v", err)
 	}
 	if !res.Created {
-		t.Fatal("первый Put: Created = false")
+		t.Fatal("the first Put: Created = false")
 	}
 	if _, err := st.Get(ctx, h); err != nil {
 		t.Fatalf("Get: %v", err)
@@ -365,23 +365,23 @@ func TestPackSQLContract(t *testing.T) {
 
 	calls := pool.snapshotCalls()
 	if len(calls) != 4 {
-		t.Fatalf("вызовов БД %d, want 4 (addRef, put, get, delRef)", len(calls))
+		t.Fatalf("%d DB calls, want 4 (addRef, put, get, delRef)", len(calls))
 	}
 	wantSQL := []string{sqlMetaAddRef, sqlMetaPut, sqlMetaGet, sqlMetaDelRef}
 	for i, want := range wantSQL {
 		if calls[i].sql != want {
-			t.Errorf("вызов %d: SQL %q, want %q", i, calls[i].sql, want)
+			t.Errorf("call %d: SQL %q, want %q", i, calls[i].sql, want)
 		}
 	}
 	if got := calls[0].args[0].([]byte); string(got) != string(h[:]) {
-		t.Errorf("addRef: хэш-аргумент %x, want %x", got, h)
+		t.Errorf("addRef: hash argument %x, want %x", got, h)
 	}
 	putArgs := calls[1].args
 	if len(putArgs) != 5 {
-		t.Fatalf("sqlMetaPut: аргументов %d, want 5", len(putArgs))
+		t.Fatalf("sqlMetaPut: %d arguments, want 5", len(putArgs))
 	}
 	if got := putArgs[0].([]byte); string(got) != string(h[:]) {
-		t.Errorf("sqlMetaPut: хэш %x, want %x", got, h)
+		t.Errorf("sqlMetaPut: hash %x, want %x", got, h)
 	}
 	if pid, ok := putArgs[1].(int32); !ok || pid != 1 {
 		t.Errorf("sqlMetaPut: pack_id = %v (%T), want int32(1)", putArgs[1], putArgs[1])
@@ -391,10 +391,10 @@ func TestPackSQLContract(t *testing.T) {
 		t.Fatalf("sqlMetaPut: off = %v (%T), want int64", putArgs[2], putArgs[2])
 	}
 	if off != int64(packHeaderLen+4) {
-		t.Errorf("sqlMetaPut: off = %d, want %d (заголовок + префикс длины)", off, packHeaderLen+4)
+		t.Errorf("sqlMetaPut: off = %d, want %d (header + length prefix)", off, packHeaderLen+4)
 	}
 	if clen, ok := putArgs[3].(int32); !ok || clen <= 0 {
-		t.Errorf("sqlMetaPut: len = %v (%T), want положительный int32", putArgs[3], putArgs[3])
+		t.Errorf("sqlMetaPut: len = %v (%T), want a positive int32", putArgs[3], putArgs[3])
 	}
 	if rl, ok := putArgs[4].(int32); !ok || int(rl) != len(data) {
 		t.Errorf("sqlMetaPut: raw_len = %v (%T), want int32(%d)", putArgs[4], putArgs[4], len(data))
@@ -412,7 +412,7 @@ func TestPackHeaderAndOffsets(t *testing.T) {
 	ctx := context.Background()
 	byHash := make(map[Hash][]byte)
 	for i := 0; i < 3; i++ {
-		d := []byte(strings.Repeat(fmt.Sprintf("<p>страница %d</p>", i), 40))
+		d := []byte(strings.Repeat(fmt.Sprintf("<p>page %d</p>", i), 40))
 		if _, err := st.Put(ctx, d); err != nil {
 			t.Fatalf("Put(%d): %v", i, err)
 		}
@@ -421,26 +421,26 @@ func TestPackHeaderAndOffsets(t *testing.T) {
 
 	raw, err := os.ReadFile(filepath.Join(st.opts.Dir, packFileName(1)))
 	if err != nil {
-		t.Fatalf("чтение пака: %v", err)
+		t.Fatalf("reading the pack: %v", err)
 	}
 	hdr, err := parsePackHeader(raw)
 	if err != nil {
-		t.Fatalf("заголовок: %v", err)
+		t.Fatalf("the header: %v", err)
 	}
 	if hdr.id != 1 {
-		t.Errorf("заголовок: id = %d, want 1", hdr.id)
+		t.Errorf("the header: id = %d, want 1", hdr.id)
 	}
 	if hdr.maxSize != 1<<20 {
-		t.Errorf("заголовок: maxSize = %d, want %d", hdr.maxSize, 1<<20)
+		t.Errorf("the header: maxSize = %d, want %d", hdr.maxSize, 1<<20)
 	}
 	if hdr.dictID != 0 {
-		t.Errorf("заголовок: dictID = %d, want 0 (словарь не установлен)", hdr.dictID)
+		t.Errorf("the header: dictID = %d, want 0 (no dictionary set)", hdr.dictID)
 	}
 	if string(raw[:4]) != packMagic || raw[4] != packVersion {
-		t.Errorf("заголовок: magic/версия = %q/%d", raw[:4], raw[4])
+		t.Errorf("the header: magic/version = %q/%d", raw[:4], raw[4])
 	}
 	if ln := binary.LittleEndian.Uint16(raw[5:7]); int(ln) != packHeaderLen {
-		t.Errorf("заголовок: hdrLen = %d, want %d", ln, packHeaderLen)
+		t.Errorf("the header: hdrLen = %d, want %d", ln, packHeaderLen)
 	}
 
 	// Each block: the offset from the metadata, with the length prefix in
@@ -449,21 +449,21 @@ func TestPackHeaderAndOffsets(t *testing.T) {
 	for h, d := range byHash {
 		row, ok := pool.row(h)
 		if !ok {
-			t.Fatalf("нет метаданных для %s", h)
+			t.Fatalf("no metadata for %s", h)
 		}
 		if row.packID != 1 {
 			t.Errorf("%s: pack_id = %d, want 1", h, row.packID)
 		}
 		prefix := binary.LittleEndian.Uint32(raw[row.off-4 : row.off])
 		if int32(prefix) != row.clen {
-			t.Errorf("%s: префикс длины %d не сходится с len метаданных %d", h, prefix, row.clen)
+			t.Errorf("%s: the length prefix %d does not match the metadata len %d", h, prefix, row.clen)
 		}
 		got, err := DecompressWithDict(raw[row.off : row.off+int64(row.clen)])
 		if err != nil {
-			t.Fatalf("%s: распаковка блока: %v", h, err)
+			t.Fatalf("%s: block decompression: %v", h, err)
 		}
 		if string(got) != string(d) {
-			t.Errorf("%s: блок не совпал с записанным контентом", h)
+			t.Errorf("%s: the block did not match the written content", h)
 		}
 		if int32(len(d)) != row.rawLen {
 			t.Errorf("%s: raw_len = %d, want %d", h, row.rawLen, len(d))
@@ -471,7 +471,7 @@ func TestPackHeaderAndOffsets(t *testing.T) {
 		seen++
 	}
 	if seen != 3 {
-		t.Errorf("проверено блоков %d, want 3", seen)
+		t.Errorf("%d blocks checked, want 3", seen)
 	}
 }
 
@@ -487,7 +487,7 @@ func TestPackRotation(t *testing.T) {
 	var maxClen int32
 	hashes := make([]Hash, 0, 10)
 	for i := 0; i < 10; i++ {
-		d := []byte(strings.Repeat(fmt.Sprintf("байт контента %02d;", i), 30))
+		d := []byte(strings.Repeat(fmt.Sprintf("content bytes %02d;", i), 30))
 		res, err := st.Put(ctx, d)
 		if err != nil {
 			t.Fatalf("Put(%d): %v", i, err)
@@ -511,10 +511,10 @@ func TestPackRotation(t *testing.T) {
 				t.Fatal(err)
 			}
 			if bound := int64(packSize) + 4 + int64(maxClen); fi.Size() > bound {
-				t.Errorf("пак %d: размер %d > порог+первый блок %d", id, fi.Size(), bound)
+				t.Errorf("pack %d: size %d > threshold + first block %d", id, fi.Size(), bound)
 			}
 			if fi.Size() <= packHeaderLen {
-				t.Errorf("пак %d: размер %d — только заголовок, ротация создала пустой пак", id, fi.Size())
+				t.Errorf("pack %d: size %d — header only, the rotation created an empty pack", id, fi.Size())
 			}
 			raw, err := os.ReadFile(filepath.Join(st.opts.Dir, e.Name()))
 			if err != nil {
@@ -522,20 +522,20 @@ func TestPackRotation(t *testing.T) {
 			}
 			hdr, err := parsePackHeader(raw)
 			if err != nil {
-				t.Errorf("пак %d: %v", id, err)
+				t.Errorf("pack %d: %v", id, err)
 				continue
 			}
 			if hdr.id != id {
-				t.Errorf("пак %d: заголовок называет %d", id, hdr.id)
+				t.Errorf("pack %d: the header names %d", id, hdr.id)
 			}
 		}
 	}
 	if len(ids) < 2 {
-		t.Fatalf("ротация не сработала: паков %d при пороге %d байт", len(ids), packSize)
+		t.Fatalf("the rotation did not fire: %d packs at the %d-byte threshold", len(ids), packSize)
 	}
 	for i, id := range ids {
 		if id != i+1 {
-			t.Fatalf("pack_id с дырами: %v", ids)
+			t.Fatalf("pack_id with holes: %v", ids)
 		}
 	}
 
@@ -545,9 +545,9 @@ func TestPackRotation(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Get(%d): %v", i, err)
 		}
-		want := []byte(strings.Repeat(fmt.Sprintf("байт контента %02d;", i), 30))
+		want := []byte(strings.Repeat(fmt.Sprintf("content bytes %02d;", i), 30))
 		if string(got) != string(want) {
-			t.Errorf("Get(%d): контент не совпал", i)
+			t.Errorf("Get(%d): the content did not match", i)
 		}
 	}
 }
@@ -557,11 +557,11 @@ func TestPackRotation(t *testing.T) {
 func TestPackDedupNoBytes(t *testing.T) {
 	st, pool := newPackTestStore(t, func(o *PackOptions) { o.PackSize = 1 << 20 })
 	ctx := context.Background()
-	d := []byte("парковочная страница для дедупликации")
+	d := []byte("a parking page for deduplication")
 
 	first, err := st.Put(ctx, d)
 	if err != nil {
-		t.Fatalf("первый Put: %v", err)
+		t.Fatalf("the first Put: %v", err)
 	}
 	path := filepath.Join(st.opts.Dir, packFileName(1))
 	before, err := os.ReadFile(path)
@@ -572,24 +572,24 @@ func TestPackDedupNoBytes(t *testing.T) {
 
 	second, err := st.Put(ctx, append([]byte(nil), d...))
 	if err != nil {
-		t.Fatalf("второй Put: %v", err)
+		t.Fatalf("the second Put: %v", err)
 	}
 	if second.Created {
-		t.Error("второй Put: Created = true, want false")
+		t.Error("the second Put: Created = true, want false")
 	}
 	if second.Hash != first.Hash {
-		t.Error("второй Put: другой хэш")
+		t.Error("the second Put: a different hash")
 	}
 	after, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(after) != len(before) {
-		t.Errorf("повторный Put дописал байты: было %d, стало %d", len(before), len(after))
+		t.Errorf("the repeated Put appended bytes: was %d, now %d", len(before), len(after))
 	}
 	calls := pool.snapshotCalls()
 	if len(calls) != callsBefore+1 || calls[len(calls)-1].sql != sqlMetaAddRef {
-		t.Errorf("повторный Put: ожидался только %s, вызовы %v", sqlMetaAddRef, calls[callsBefore:])
+		t.Errorf("the repeated Put: only %s expected, calls %v", sqlMetaAddRef, calls[callsBefore:])
 	}
 	if row, _ := pool.row(first.Hash); row.refc != 2 {
 		t.Errorf("refcount = %d, want 2", row.refc)
@@ -602,38 +602,38 @@ func TestPackDedupNoBytes(t *testing.T) {
 func TestPackCrashWindow(t *testing.T) {
 	st, pool := newPackTestStore(t, func(o *PackOptions) { o.PackSize = 1 << 20 })
 	ctx := context.Background()
-	d := []byte("контент, чьи метаданные не закоммитятся")
+	d := []byte("content whose metadata will not commit")
 	pool.failOnQuery = 1 // the first Exec (addRef) passes, the metadata commit (Query 1) fails
 
 	if _, err := st.Put(ctx, d); err == nil {
-		t.Fatal("Put с упавшей БД метаданных должен вернуть ошибку")
+		t.Fatal("Put with a failing metadata DB must return an error")
 	}
 	h := HashOf(d)
 	if _, err := st.Get(ctx, h); !errors.Is(err, ErrNotFound) {
-		t.Errorf("Get после краш-окна: %v, want ErrNotFound (блок без метаданных невидим)", err)
+		t.Errorf("Get after the crash window: %v, want ErrNotFound (a block without metadata is invisible)", err)
 	}
 	raw, err := os.ReadFile(filepath.Join(st.opts.Dir, packFileName(1)))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if int64(len(raw)) <= packHeaderLen {
-		t.Fatal("мусорный блок не дописан в пак")
+		t.Fatal("a garbage block was not appended to the pack")
 	}
 	if row, ok := pool.row(h); ok {
-		t.Fatalf("метаданные всё же появились: %+v", row)
+		t.Fatalf("the metadata appeared anyway: %+v", row)
 	}
 
 	// Writing the same content again fixes the situation.
 	res, err := st.Put(ctx, d)
 	if err != nil {
-		t.Fatalf("повторный Put: %v", err)
+		t.Fatalf("the repeated Put: %v", err)
 	}
 	if !res.Created {
-		t.Error("повторный Put после краш-окна: Created = false, want true")
+		t.Error("the repeated Put after the crash window: Created = false, want true")
 	}
 	got, err := st.Get(ctx, h)
 	if err != nil || string(got) != string(d) {
-		t.Errorf("Get после повторной записи: %v, совпадение = %v", err, string(got) == string(d))
+		t.Errorf("Get after the rewrite: %v, match = %v", err, string(got) == string(d))
 	}
 }
 
@@ -643,7 +643,7 @@ func TestPackCrashWindow(t *testing.T) {
 func TestPackDeadRowInvisible(t *testing.T) {
 	st, pool := newPackTestStore(t, func(o *PackOptions) { o.PackSize = 1 << 20 })
 	ctx := context.Background()
-	d := []byte("контент с умирающей ссылкой")
+	d := []byte("content with a dying reference")
 
 	res, err := st.Put(ctx, d)
 	if err != nil {
@@ -654,15 +654,15 @@ func TestPackDeadRowInvisible(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := st.Get(ctx, res.Hash); !errors.Is(err, ErrNotFound) {
-		t.Errorf("Get мёртвой строки: %v, want ErrNotFound", err)
+		t.Errorf("Get of a dead row: %v, want ErrNotFound", err)
 	}
 	if err := st.Delete(ctx, res.Hash); !errors.Is(err, ErrNotFound) {
-		t.Errorf("Delete мёртвой строки: %v, want ErrNotFound", err)
+		t.Errorf("Delete of a dead row: %v, want ErrNotFound", err)
 	}
 	if row, ok := pool.row(res.Hash); !ok {
-		t.Fatal("мёртвая строка должна остаться в contents до компактификации (T-045)")
+		t.Fatal("the dead row must stay in contents until compaction (T-045)")
 	} else if row.refc != 0 {
-		t.Fatalf("refcount мёртвой строки = %d, want 0", row.refc)
+		t.Fatalf("the dead row refcount = %d, want 0", row.refc)
 	}
 
 	again, err := st.Put(ctx, d)
@@ -673,14 +673,14 @@ func TestPackDeadRowInvisible(t *testing.T) {
 	// Created = false (RETURNING (xmax = 0)) although a fresh block is
 	// written and the placement is moved onto it.
 	if again.Created {
-		t.Error("Put после исчерпания ссылок: Created = true, want false (конфликт мёртвой строки)")
+		t.Error("Put after the references are exhausted: Created = true, want false (a dead-row conflict)")
 	}
 	newRow, _ := pool.row(res.Hash)
 	if newRow.off == oldRow.off && newRow.packID == oldRow.packID {
-		t.Error("новый Put оставил размещение мёртвой строки — ожидались свежие байты")
+		t.Error("the new Put kept the dead row's placement — fresh bytes expected")
 	}
 	if got, err := st.Get(ctx, res.Hash); err != nil || string(got) != string(d) {
-		t.Errorf("Get воскрешённого контента: %v", err)
+		t.Errorf("Get of the resurrected content: %v", err)
 	}
 }
 
@@ -697,81 +697,81 @@ func TestPackDeadRowInvisible(t *testing.T) {
 func TestPackRefcountFSM(t *testing.T) {
 	st, pool := newPackTestStore(t, func(o *PackOptions) { o.PackSize = 1 << 20 })
 	ctx := context.Background()
-	d := []byte("автомат refcount: absent → live(n) → dead → deleted")
+	d := []byte("the refcount state machine: absent → live(n) → dead → deleted")
 
 	// T1: S0 absent → S1(1) by insert, Created = true.
 	res, err := st.Put(ctx, d)
 	if err != nil {
-		t.Fatalf("Put нового контента: %v", err)
+		t.Fatalf("Put of the new content: %v", err)
 	}
 	if !res.Created {
-		t.Error("первый Put: Created = false, want true (П1 — вставка)")
+		t.Error("the first Put: Created = false, want true (P1 — insert)")
 	}
 	live1, ok := pool.row(res.Hash)
 	if !ok || live1.refc != 1 {
-		t.Fatalf("после П1: строка %+v (found=%v), want refcount 1", live1, ok)
+		t.Fatalf("after P1: row %+v (found=%v), want refcount 1", live1, ok)
 	}
 
 	// T2: S1(1) → S1(2) by dedup, no bytes written.
 	dup, err := st.Put(ctx, append([]byte(nil), d...))
 	if err != nil {
-		t.Fatalf("Put-дедуп: %v", err)
+		t.Fatalf("Put-dedup: %v", err)
 	}
 	if dup.Created {
-		t.Error("Put-дедуп: Created = true, want false (П2)")
+		t.Error("Put-dedup: Created = true, want false (P2)")
 	}
 	if row, _ := pool.row(res.Hash); row.refc != 2 {
-		t.Errorf("после П2: refcount = %d, want 2", row.refc)
+		t.Errorf("after P2: refcount = %d, want 2", row.refc)
 	}
 
 	// T4: S1(2) → S1(1) — one reference removed.
 	if err := st.Delete(ctx, res.Hash); err != nil {
-		t.Fatalf("Delete при двух ссылках: %v", err)
+		t.Fatalf("Delete with two references: %v", err)
 	}
 	if row, _ := pool.row(res.Hash); row.refc != 1 {
-		t.Errorf("после П4: refcount = %d, want 1", row.refc)
+		t.Errorf("after P4: refcount = %d, want 1", row.refc)
 	}
 
 	// T5: S1(1) → S2 dead·tombstone — the row remains with refcount = 0.
 	if err := st.Delete(ctx, res.Hash); err != nil {
-		t.Fatalf("Delete последней ссылки: %v", err)
+		t.Fatalf("Delete of the last reference: %v", err)
 	}
 	row, ok := pool.row(res.Hash)
 	if !ok {
-		t.Fatal("П5: мёртвая строка обязана остаться в contents до компактификации (tombstone)")
+		t.Fatal("P5: the dead row must stay in contents until compaction (tombstone)")
 	}
 	if row.refc != 0 {
-		t.Fatalf("П5: refcount = %d, want 0", row.refc)
+		t.Fatalf("P5: refcount = %d, want 0", row.refc)
 	}
 
 	// I2: the dead row is invisible to Get; dedup does not see it (the next
 	// Put goes into the upsert, not AddRef); I4: a double removal —
 	// ErrNotFound.
 	if _, err := st.Get(ctx, res.Hash); !errors.Is(err, ErrNotFound) {
-		t.Errorf("Get мёртвой (И2): %v, want ErrNotFound", err)
+		t.Errorf("Get of a dead one (I2): %v, want ErrNotFound", err)
 	}
 	if err := st.Delete(ctx, res.Hash); !errors.Is(err, ErrNotFound) {
-		t.Errorf("повторный Delete (И4): %v, want ErrNotFound", err)
+		t.Errorf("a repeated Delete (I4): %v, want ErrNotFound", err)
 	}
 
 	// T6: S2 → S1(1) resurrection — DO UPDATE from zero, the placement
 	// is moved onto the fresh block (EXCLUDED), Created = false.
 	res2, err := st.Put(ctx, d)
 	if err != nil {
-		t.Fatalf("Put воскрешения: %v", err)
+		t.Fatalf("Put of the resurrection: %v", err)
 	}
 	if res2.Created {
-		t.Error("воскрешение tombstone: Created = true, want false (П6 — DO UPDATE)")
+		t.Error("tombstone resurrection: Created = true, want false (P6 — DO UPDATE)")
 	}
 	rised, ok := pool.row(res.Hash)
 	if !ok || rised.refc != 1 {
-		t.Fatalf("после П6: строка %+v (found=%v), want refcount 1", rised, ok)
+		t.Fatalf("after P6: row %+v (found=%v), want refcount 1", rised, ok)
 	}
 	if rised.packID == live1.packID && rised.off == live1.off {
-		t.Error("П6: размещение не переведено на свежий блок (EXCLUDED)")
+		t.Error("P6: the placement was not moved to a fresh block (EXCLUDED)")
 	}
 	if got, err := st.Get(ctx, res.Hash); err != nil || string(got) != string(d) {
-		t.Errorf("Get воскрешённого: %v", err)
+		t.Errorf("Get of the resurrected: %v", err)
 	}
 
 	// T7 (the "no row" reading): deleting the row by hand — the retention/
@@ -780,20 +780,20 @@ func TestPackRefcountFSM(t *testing.T) {
 	// indistinguishable from new content.
 	pool.dropRow(res.Hash)
 	if _, err := st.Get(ctx, res.Hash); !errors.Is(err, ErrNotFound) {
-		t.Errorf("Get отсутствующей строки: %v, want ErrNotFound", err)
+		t.Errorf("Get of an absent row: %v, want ErrNotFound", err)
 	}
 	if err := st.Delete(ctx, res.Hash); !errors.Is(err, ErrNotFound) {
-		t.Errorf("Delete отсутствующей строки (И4): %v, want ErrNotFound", err)
+		t.Errorf("Delete of an absent row (I4): %v, want ErrNotFound", err)
 	}
 	res3, err := st.Put(ctx, d)
 	if err != nil {
-		t.Fatalf("Put после удаления строки: %v", err)
+		t.Fatalf("Put after the row deletion: %v", err)
 	}
 	if !res3.Created {
-		t.Error("воскрешение отсутствующей строки: Created = false, want true (П7 — INSERT)")
+		t.Error("absent-row resurrection: Created = false, want true (P7 — INSERT)")
 	}
 	if row, ok := pool.row(res.Hash); !ok || row.refc != 1 {
-		t.Errorf("после П7: строка %+v (found=%v), want refcount 1", row, ok)
+		t.Errorf("after P7: row %+v (found=%v), want refcount 1", row, ok)
 	}
 }
 
@@ -808,7 +808,7 @@ func TestPackTooLarge(t *testing.T) {
 	ctx := context.Background()
 
 	if _, err := st.Put(ctx, make([]byte, 33)); !errors.Is(err, ErrTooLarge) {
-		t.Errorf("Put сверх лимита: %v, want ErrTooLarge", err)
+		t.Errorf("Put over the limit: %v, want ErrTooLarge", err)
 	}
 	ents, err := os.ReadDir(st.opts.Dir)
 	if err != nil {
@@ -816,21 +816,21 @@ func TestPackTooLarge(t *testing.T) {
 	}
 	for _, e := range ents {
 		if _, ok := packIDFromName(e.Name()); ok {
-			t.Errorf("после отвергнутого Put существует пак %s", e.Name())
+			t.Errorf("pack %s exists after the rejected Put", e.Name())
 		}
 	}
 	if calls := pool.snapshotCalls(); len(calls) != 0 {
-		t.Errorf("после отвергнутого Put были вызовы БД: %v", calls)
+		t.Errorf("there were DB calls after the rejected Put: %v", calls)
 	}
 	if _, err := st.Get(ctx, HashOf(make([]byte, 33))); !errors.Is(err, ErrNotFound) {
-		t.Errorf("Get отвергнутого контента: %v, want ErrNotFound", err)
+		t.Errorf("Get of the rejected content: %v, want ErrNotFound", err)
 	}
 
 	if res, err := st.Put(ctx, nil); err != nil || !res.Created {
-		t.Errorf("Put пустого контента: %v, Created = %v", err, res.Created)
+		t.Errorf("Put of the empty content: %v, Created = %v", err, res.Created)
 	}
 	if got, err := st.Get(ctx, HashOf(nil)); err != nil || len(got) != 0 {
-		t.Errorf("Get пустого контента: %v, длина %d", err, len(got))
+		t.Errorf("Get of the empty content: %v, length %d", err, len(got))
 	}
 }
 
@@ -846,7 +846,7 @@ func TestPackReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	d := []byte("контент первого запуска")
+	d := []byte("first-run content")
 	h := HashOf(d)
 	if _, err := st1.Put(ctx, d); err != nil {
 		t.Fatal(err)
@@ -861,9 +861,9 @@ func TestPackReopen(t *testing.T) {
 	}
 	defer st2.Close() //nolint:errcheck // the test closes the store in cleanup
 	if got, err := st2.Get(ctx, h); err != nil || string(got) != string(d) {
-		t.Fatalf("Get после переоткрытия: %v", err)
+		t.Fatalf("Get after the reopen: %v", err)
 	}
-	if _, err := st2.Put(ctx, []byte("контент второго запуска")); err != nil {
+	if _, err := st2.Put(ctx, []byte("second-run content")); err != nil {
 		t.Fatal(err)
 	}
 	ents, err := os.ReadDir(dir)
@@ -877,7 +877,7 @@ func TestPackReopen(t *testing.T) {
 		}
 	}
 	if len(packs) != 1 || packs[0] != packFileName(1) {
-		t.Errorf("после переоткрытия паки %v, want [%s] (запись продолжает тот же пак)", packs, packFileName(1))
+		t.Errorf("after the reopen the packs are %v, want [%s] (writing continues the same pack)", packs, packFileName(1))
 	}
 }
 
@@ -903,7 +903,7 @@ func TestPackDictOnOff(t *testing.T) {
 	}
 	got, err := st.Get(ctx, res.Hash)
 	if err != nil || string(got) != string(d) {
-		t.Fatalf("Get со словарём: %v, совпадение = %v", err, string(got) == string(d))
+		t.Fatalf("Get with the dictionary: %v, match = %v", err, string(got) == string(d))
 	}
 	raw, err := os.ReadFile(filepath.Join(st.opts.Dir, packFileName(1)))
 	if err != nil {
@@ -914,7 +914,7 @@ func TestPackDictOnOff(t *testing.T) {
 		t.Fatal(err)
 	}
 	if hdr.dictID != dict.ID() {
-		t.Errorf("заголовок пака: dictID = %d, want %d", hdr.dictID, dict.ID())
+		t.Errorf("the pack header: dictID = %d, want %d", hdr.dictID, dict.ID())
 	}
 
 	// The dictionary is off: a new directory, a dictionary-less roundtrip,
@@ -922,13 +922,13 @@ func TestPackDictOnOff(t *testing.T) {
 	SetDict(nil)
 	st2, _ := newPackTestStore(t, func(o *PackOptions) { o.PackSize = 1 << 20 })
 	d2 := append([]byte(nil), d...)
-	d2 = append(d2, "без словаря"...)
+	d2 = append(d2, "without the dictionary"...)
 	res2, err := st2.Put(ctx, d2)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got, err := st2.Get(ctx, res2.Hash); err != nil || string(got) != string(d2) {
-		t.Fatalf("Get без словаря: %v", err)
+		t.Fatalf("Get without the dictionary: %v", err)
 	}
 	raw2, err := os.ReadFile(filepath.Join(st2.opts.Dir, packFileName(1)))
 	if err != nil {
@@ -939,7 +939,7 @@ func TestPackDictOnOff(t *testing.T) {
 		t.Fatal(err)
 	}
 	if hdr2.dictID != 0 {
-		t.Errorf("заголовок пака без словаря: dictID = %d, want 0", hdr2.dictID)
+		t.Errorf("the pack header without a dictionary: dictID = %d, want 0", hdr2.dictID)
 	}
 }
 
@@ -951,7 +951,7 @@ func TestPackConcurrent(t *testing.T) {
 	st, pool := newPackTestStore(t, func(o *PackOptions) { o.PackSize = 8 << 10 })
 	ctx := context.Background()
 	const workers = 16
-	same := []byte("общий контент всех горутин")
+	same := []byte("the shared content of all goroutines")
 
 	var wg sync.WaitGroup
 	for i := 0; i < workers; i++ {
@@ -959,28 +959,28 @@ func TestPackConcurrent(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			if _, err := st.Put(ctx, same); err != nil {
-				t.Errorf("Put общего: %v", err)
+				t.Errorf("Put of the shared one: %v", err)
 				return
 			}
-			uniq := []byte(strings.Repeat(fmt.Sprintf("уникальный контент горутины %02d;", i), 50))
+			uniq := []byte(strings.Repeat(fmt.Sprintf("goroutine %02d unique content;", i), 50))
 			if _, err := st.Put(ctx, uniq); err != nil {
-				t.Errorf("Put уникального %d: %v", i, err)
+				t.Errorf("Put of the unique %d: %v", i, err)
 			}
 			if _, err := st.Get(ctx, HashOf(same)); err != nil {
-				t.Errorf("Get общего из горутины %d: %v", i, err)
+				t.Errorf("Get of the shared one from goroutine %d: %v", i, err)
 			}
 		}(i)
 	}
 	wg.Wait()
 
 	if row, ok := pool.row(HashOf(same)); !ok || row.refc != workers {
-		t.Errorf("refcount общего контента = %v, want %d", row.refc, workers)
+		t.Errorf("the shared content refcount = %v, want %d", row.refc, workers)
 	}
 	for i := 0; i < workers; i++ {
-		uniq := []byte(strings.Repeat(fmt.Sprintf("уникальный контент горутины %02d;", i), 50))
+		uniq := []byte(strings.Repeat(fmt.Sprintf("goroutine %02d unique content;", i), 50))
 		got, err := st.Get(ctx, HashOf(uniq))
 		if err != nil || string(got) != string(uniq) {
-			t.Fatalf("Get уникального %d: %v", i, err)
+			t.Fatalf("Get of the unique %d: %v", i, err)
 		}
 	}
 }
@@ -990,18 +990,18 @@ func TestPackConcurrent(t *testing.T) {
 func TestPackClosed(t *testing.T) {
 	st, _ := newPackTestStore(t, nil)
 	ctx := context.Background()
-	res, err := st.Put(ctx, []byte("до закрытия"))
+	res, err := st.Put(ctx, []byte("before closing"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := st.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.Put(ctx, []byte("после закрытия")); !errors.Is(err, errPackClosed) {
-		t.Errorf("Put после Close: %v, want errPackClosed", err)
+	if _, err := st.Put(ctx, []byte("after closing")); !errors.Is(err, errPackClosed) {
+		t.Errorf("Put after Close: %v, want errPackClosed", err)
 	}
-	if got, err := st.Get(ctx, res.Hash); err != nil || string(got) != "до закрытия" {
-		t.Errorf("Get после Close: %v", err)
+	if got, err := st.Get(ctx, res.Hash); err != nil || string(got) != "before closing" {
+		t.Errorf("Get after Close: %v", err)
 	}
 }
 
@@ -1012,16 +1012,16 @@ func TestPackClosed(t *testing.T) {
 func TestPackStaleCacheSyncsToNewest(t *testing.T) {
 	st, pool := newPackTestStore(t, func(o *PackOptions) { o.PackSize = 1 << 20 })
 	ctx := context.Background()
-	if _, err := st.Put(ctx, []byte("контент до появления нового пака")); err != nil {
+	if _, err := st.Put(ctx, []byte("content from before the new pack appeared")); err != nil {
 		t.Fatal(err)
 	}
 	// The second Put re-reads the directory (the pack creation changed the
 	// mtime) — the cache records maxID 1.
-	if _, err := st.Put(ctx, []byte("контент для прогрева кэша")); err != nil {
+	if _, err := st.Put(ctx, []byte("content to warm the cache")); err != nil {
 		t.Fatal(err)
 	}
 	if !st.dirCache.valid || st.dirCache.maxID != 1 {
-		t.Fatalf("кэш реестра после Put: %+v", st.dirCache)
+		t.Fatalf("the registry cache after Put: %+v", st.dirCache)
 	}
 
 	// "Another process" created pack 2 within the mtime granularity:
@@ -1032,15 +1032,15 @@ func TestPackStaleCacheSyncsToNewest(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	res, err := st.Put(ctx, []byte("контент отстающего писателя"))
+	res, err := st.Put(ctx, []byte("lagging writer content"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if row, _ := pool.row(res.Hash); row.packID != 2 {
-		t.Errorf("допись при протухшем кэше ушла в пак %d, want 2 (новейший)", row.packID)
+		t.Errorf("the append with a stale cache went to pack %d, want 2 (the newest)", row.packID)
 	}
 	if !st.dirCache.valid || st.dirCache.maxID != 2 {
-		t.Errorf("кэш реестра не пересобран: %+v", st.dirCache)
+		t.Errorf("the registry cache not rebuilt: %+v", st.dirCache)
 	}
 }
 
@@ -1058,7 +1058,7 @@ func TestPackCreatePackClosesOnSize(t *testing.T) {
 		t.Helper()
 		ents, err := os.ReadDir("/proc/self/fd")
 		if err != nil {
-			t.Skipf("/proc/self/fd недоступен: %v", err)
+			t.Skipf("/proc/self/fd unavailable: %v", err)
 		}
 		n := 0
 		for _, e := range ents {
@@ -1070,14 +1070,14 @@ func TestPackCreatePackClosesOnSize(t *testing.T) {
 		return n
 	}
 	if before := openPacks(); before != 0 {
-		t.Fatalf("пак 2 уже открыт до вызова: %d fd", before)
+		t.Fatalf("pack 2 already open before the call: %d fds", before)
 	}
 	for i := 0; i < 3; i++ {
 		if _, err := st.createPackLocked(2); err == nil {
-			t.Fatal("createPackLocked поверх непустого пака: ожидалась ошибка")
+			t.Fatal("createPackLocked over a non-empty pack: an error expected")
 		}
 		if n := openPacks(); n != 0 {
-			t.Fatalf("после ошибки createPackLocked открытых fd пака 2: %d, want 0 (утечка)", n)
+			t.Fatalf("after the createPackLocked error, pack 2 open fds: %d, want 0 (a leak)", n)
 		}
 	}
 }
@@ -1086,30 +1086,30 @@ func TestPackCreatePackClosesOnSize(t *testing.T) {
 func TestPackOpenValidation(t *testing.T) {
 	pool := newPackFakePool()
 	if _, err := OpenPackStore(nil, PackOptions{Dir: t.TempDir()}); err == nil {
-		t.Error("nil пул: ожидалась ошибка")
+		t.Error("nil pool: an error expected")
 	}
 	if _, err := OpenPackStore(pool, PackOptions{}); err == nil {
-		t.Error("пустой каталог: ожидалась ошибка")
+		t.Error("an empty directory: an error expected")
 	}
 	dir := t.TempDir()
 	if _, err := OpenPackStore(pool, PackOptions{Dir: dir, PackSize: -1}); err == nil {
-		t.Error("отрицательный pack_size: ожидалась ошибка")
+		t.Error("a negative pack_size: an error expected")
 	}
 	if _, err := OpenPackStore(pool, PackOptions{Dir: dir, MaxStoreBytes: -1}); err == nil {
-		t.Error("отрицательный max_store_bytes: ожидалась ошибка")
+		t.Error("a negative max_store_bytes: an error expected")
 	}
 	// A zero pack_size means DefaultPackSize; the directory and the lock are
 	// created.
 	st, err := OpenPackStore(pool, PackOptions{Dir: dir})
 	if err != nil {
-		t.Fatalf("нули в опциях: %v", err)
+		t.Fatalf("zeroes in the options: %v", err)
 	}
 	defer st.Close() //nolint:errcheck // the test closes the store in cleanup
 	if st.opts.PackSize != DefaultPackSize {
-		t.Errorf("pack_size по умолчанию = %d, want %d", st.opts.PackSize, DefaultPackSize)
+		t.Errorf("the default pack_size = %d, want %d", st.opts.PackSize, DefaultPackSize)
 	}
 	if _, err := os.Stat(filepath.Join(dir, packLockFile)); err != nil {
-		t.Errorf("файл блокировки не создан: %v", err)
+		t.Errorf("the lock file not created: %v", err)
 	}
 }
 
@@ -1125,10 +1125,10 @@ func TestPackReadOnly(t *testing.T) {
 	// must not silently look like an empty store).
 	missing := filepath.Join(t.TempDir(), "missing")
 	if _, err := OpenPackStore(pool, PackOptions{Dir: missing, ReadOnly: true}); err == nil {
-		t.Fatal("ReadOnly на отсутствующем каталоге: ожидалась ошибка")
+		t.Fatal("ReadOnly on an absent directory: an error expected")
 	}
 	if _, err := os.Stat(missing); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("ReadOnly не должен создавать каталог: %v", err)
+		t.Errorf("ReadOnly must not create the directory: %v", err)
 	}
 
 	// An empty existing directory — the reader's open and close leave no
@@ -1136,13 +1136,13 @@ func TestPackReadOnly(t *testing.T) {
 	clean := t.TempDir()
 	roClean, err := OpenPackStore(pool, PackOptions{Dir: clean, ReadOnly: true})
 	if err != nil {
-		t.Fatalf("OpenPackStore ReadOnly на пустом каталоге: %v", err)
+		t.Fatalf("OpenPackStore ReadOnly on an empty directory: %v", err)
 	}
 	if err := roClean.Close(); err != nil {
-		t.Errorf("Close читателем: %v", err)
+		t.Errorf("Close by the reader: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(clean, packLockFile)); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("читатель не создаёт файл блокировки: %v", err)
+		t.Errorf("the reader does not create the lock file: %v", err)
 	}
 
 	// Filling via a regular store (the lock and the pack in place) — reading
@@ -1152,13 +1152,13 @@ func TestPackReadOnly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenPackStore: %v", err)
 	}
-	data := []byte("<html>контент для читателя</html>")
+	data := []byte("<html>content for the reader</html>")
 	res, err := wr.Put(ctx, data)
 	if err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 	if err := wr.Close(); err != nil {
-		t.Fatalf("Close писателя: %v", err)
+		t.Fatalf("Close by the writer: %v", err)
 	}
 
 	ro, err := OpenPackStore(pool, PackOptions{Dir: dir, ReadOnly: true})
@@ -1167,22 +1167,22 @@ func TestPackReadOnly(t *testing.T) {
 	}
 	got, err := ro.Get(ctx, res.Hash)
 	if err != nil {
-		t.Fatalf("Get читателем: %v", err)
+		t.Fatalf("Get by the reader: %v", err)
 	}
 	if !bytes.Equal(got, data) {
-		t.Errorf("Get читателем = %q, want исходный контент", got)
+		t.Errorf("Get by the reader = %q, want the original content", got)
 	}
 	if _, err := ro.Put(ctx, []byte("x")); !errors.Is(err, errReadOnly) {
-		t.Errorf("Put читателем: err = %v, want errReadOnly", err)
+		t.Errorf("Put by the reader: err = %v, want errReadOnly", err)
 	}
 	if err := ro.Delete(ctx, res.Hash); !errors.Is(err, errReadOnly) {
-		t.Errorf("Delete читателем: err = %v, want errReadOnly", err)
+		t.Errorf("Delete by the reader: err = %v, want errReadOnly", err)
 	}
 	if _, err := ro.beginAppend(); !errors.Is(err, errReadOnly) {
-		t.Errorf("beginAppend читателем: err = %v, want errReadOnly", err)
+		t.Errorf("beginAppend by the reader: err = %v, want errReadOnly", err)
 	}
 	if err := ro.Close(); err != nil { // Close without the lock does not fail
-		t.Errorf("Close читателем: %v", err)
+		t.Errorf("Close by the reader: %v", err)
 	}
 }
 
@@ -1197,15 +1197,15 @@ func TestParsePackHeaderHdrLen(t *testing.T) {
 	binary.LittleEndian.PutUint16(b[5:7], 40)
 	hdr, err := parsePackHeader(b)
 	if err != nil {
-		t.Fatalf("заголовок будущей версии отвергнут: %v", err)
+		t.Fatalf("a future-version header rejected: %v", err)
 	}
 	if hdr.id != 7 || hdr.maxSize != 1<<20 || hdr.dictID != 0xABCD {
-		t.Errorf("поля v1 искажены: %+v", hdr)
+		t.Errorf("the v1 fields distorted: %+v", hdr)
 	}
 	// An hdrLen smaller than the mandatory fields — unreadable.
 	binary.LittleEndian.PutUint16(b[5:7], packHeaderLen-4)
 	if _, err := parsePackHeader(b); err == nil {
-		t.Error("укороченный hdrLen принят")
+		t.Error("a truncated hdrLen accepted")
 	}
 }
 
@@ -1235,7 +1235,7 @@ func TestPackIDFromNameCanonical(t *testing.T) {
 		".packs.lock",
 	} {
 		if _, valid := packIDFromName(bad); valid {
-			t.Errorf("packIDFromName(%q) принял чужое имя", bad)
+			t.Errorf("packIDFromName(%q) accepted a foreign name", bad)
 		}
 	}
 }
@@ -1254,19 +1254,19 @@ func TestPackReadBlockBounds(t *testing.T) {
 		off  int64
 		clen int32
 	}{
-		{"len из повреждённой строки", packHeaderLen + 4, 1 << 30},
-		{"отрицательный len", packHeaderLen + 4, -1},
-		{"смещение мимо файла", size, 4},
-		{"блок длиннее файла", packHeaderLen + 4, 41},
+		{"len from a corrupted row", packHeaderLen + 4, 1 << 30},
+		{"a negative len", packHeaderLen + 4, -1},
+		{"an offset past the file", size, 4},
+		{"a block longer than the file", packHeaderLen + 4, 41},
 	} {
 		if _, err := readPackBlock(dir, 1, tc.off, tc.clen); err == nil {
-			t.Errorf("%s: readPackBlock принял (%d, %d)", tc.name, tc.off, tc.clen)
+			t.Errorf("%s: readPackBlock accepted (%d, %d)", tc.name, tc.off, tc.clen)
 		}
 	}
 	// A live placement is read as before.
 	block, err := readPackBlock(dir, 1, packHeaderLen+4, 40)
 	if err != nil || len(block) != 40 {
-		t.Errorf("чтение целого блока: %v, длина %d", err, len(block))
+		t.Errorf("reading a whole block: %v, length %d", err, len(block))
 	}
 }
 
@@ -1276,13 +1276,13 @@ func TestPackWriteErrENOSPC(t *testing.T) {
 	diskFull := &os.PathError{Op: "write", Path: "pack-000001.pack", Err: syscall.ENOSPC}
 	err := wrapPackWriteErr(diskFull, 1)
 	if !errors.Is(err, ErrStoreFull) {
-		t.Errorf("ENOSPC не отображён в ErrStoreFull: %v", err)
+		t.Errorf("ENOSPC is not mapped to ErrStoreFull: %v", err)
 	}
 	if !errors.Is(err, syscall.ENOSPC) {
-		t.Errorf("исходный ENOSPC потерян: %v", err)
+		t.Errorf("the original ENOSPC lost: %v", err)
 	}
 	other := &os.PathError{Op: "write", Path: "pack-000001.pack", Err: syscall.EIO}
 	if errors.Is(wrapPackWriteErr(other, 1), ErrStoreFull) {
-		t.Error("прочая ошибка записи попала в ErrStoreFull")
+		t.Error("a random write error landed in ErrStoreFull")
 	}
 }

@@ -52,7 +52,7 @@ func dnsMetricValue(t *testing.T, g prometheus.Gatherer, name, label string) flo
 
 func TestMetricsNilSafe(t *testing.T) {
 	if NewMetrics(nil) != nil {
-		t.Fatal("NewMetrics(nil) != nil — изолированные сборки без реестра")
+		t.Fatal("NewMetrics(nil) != nil — isolated builds without a registry")
 	}
 	var m *Metrics
 	m.Episode(time.Second)             // a no-op, no panic
@@ -64,7 +64,7 @@ func TestMetricsRegistered(t *testing.T) {
 	reg := metrics.New("dns-worker")
 	m := NewMetrics(reg)
 	if m == nil {
-		t.Fatal("NewMetrics с реестром = nil")
+		t.Fatal("NewMetrics with a registry = nil")
 	}
 
 	m.Episode(150 * time.Millisecond)
@@ -90,7 +90,7 @@ func TestMetricsRegistered(t *testing.T) {
 		t.Errorf("crawler_domain_status_total{temp_error} = %v, want 2", got)
 	}
 	if got := dnsMetricValue(t, reg, "crawler_domain_status_total", model.StatusAlive.String()); got != -1 {
-		t.Errorf("crawler_domain_status_total{alive} = %v, want серия отсутствует (живой статус пишет HTTP-этап)", got)
+		t.Errorf("crawler_domain_status_total{alive} = %v, want the series absent (the HTTP stage writes the alive status)", got)
 	}
 	if got := dnsMetricValue(t, reg, "crawler_db_deadlock_retried_total", "dns-worker"); got != 2 {
 		t.Errorf("crawler_db_deadlock_retried_total = %v, want 2 (T-268)", got)
@@ -124,7 +124,7 @@ func TestMetricsRunSmoke(t *testing.T) {
 
 	if !resultWaitAck(j, 5*time.Second) {
 		cancel()
-		t.Fatal("XACK не дождались: доставка не обработана")
+		t.Fatal("XACK not awaited: the delivery not processed")
 	}
 	cancel()
 	select {
@@ -133,11 +133,11 @@ func TestMetricsRunSmoke(t *testing.T) {
 			t.Fatalf("Run: %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("Run не завершился после отмены ctx")
+		t.Fatal("Run did not finish after the ctx cancel")
 	}
 
 	if got := dnsMetricValue(t, reg, "crawler_stage_tasks_total", metrics.StageDNS); got != 2 {
-		t.Errorf("crawler_stage_tasks_total = %v, want 2 эпизода", got)
+		t.Errorf("crawler_stage_tasks_total = %v, want 2 episodes", got)
 	}
 	if got := dnsMetricValue(t, reg, "crawler_stage_seconds", metrics.StageDNS); got != 2 {
 		t.Errorf("crawler_stage_seconds (count) = %v, want 2", got)
