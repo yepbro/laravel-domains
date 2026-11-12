@@ -1,79 +1,83 @@
-// Package analyzer — анализ сохранённого контента по правилам Laravel
-// (ТЗ 5.8): пассивный, по уже скачанным страницам, cookies и заголовкам.
-// Потребление q:analyze и запись laravel_findings — T-071 (worker.go).
+// Package analyzer analyzes saved content against the Laravel rules
+// (spec 5.8): passive, over already downloaded pages, cookies and headers.
+// Consuming q:analyze and writing laravel_findings — T-071 (worker.go).
 //
-// Этот файл — переанализ (T-074, ТЗ 5.8 «Переанализ»: «фоновая задача
-// находит записи с устаревшей версией правил и ставит их в q:analyze;
-// повторное скачивание не требуется»; приёмка §11.4 п. 4 — «изменение
-// правил + reanalyze обновляет результаты без повторного скачивания»).
+// This file is re-analysis (T-074, spec 5.8 "Re-analysis": "a background
+// task finds rows with a stale rule version and puts them into q:analyze;
+// no re-downloading is needed"; the §11.4 item 4 acceptance — "a rule
+// change + reanalyze updates the results without re-downloading").
 //
-// Критерий устаревания — rules_version IS DISTINCT FROM текущей версии
-// набора (rules.Set.Version, T-068), а не «<>»: NULL («никогда не
-// анализировалась» — строки, записанные до T-071, и новые эпизоды
-// проверки T-058) выпадали бы из сравнения NULL <> x = NULL. Охрана
-// §13.1 — deleted-домены вне цикла (status <> deleted, стиль выборок
-// scheduler T-030; их результаты чистит T-020). Отключённые зоны не
-// фильтруются: §5.10/§4.1 выключение зоны останавливает новые проверки,
-// переанализ уже сохранённых результатов сеть не трогает и правил не
-// нарушает.
+// The staleness criterion is rules_version IS DISTINCT FROM the current
+// set version (rules.Set.Version, T-068), not "<>": NULL ("never
+// analyzed" — rows written before T-071 and new T-058 check episodes)
+// would drop out of the comparison NULL <> x = NULL. The §13.1 guard
+// keeps deleted domains out of the loop (status <> deleted, the
+// scheduler T-030 select style; T-020 purges their results). Disabled
+// zones are not filtered: per §5.10/§4.1 disabling a zone stops new
+// checks; re-analysis of already saved results touches no network and
+// breaks no rules.
 //
-// Повторное скачивание не выполняется: сообщение Result (T-024) несёт
-// только ключ строки (домен, субдомен, вариант) и имя для логов; воркер
-// T-071 берёт контент из хранилища по ключу.
+// No re-downloading happens: a Result message (T-024) carries only the
+// row key (domain, subdomain, variant) and the name for logs; the
+// T-071 worker takes the content from the store by the key.
 //
-// Дренаж пачками с курсорной пагинацией — ДВЕ формы (T-193, диагноз
-// записи №12 журнала медленных 25.10: часовой тик с нулевым PK-курсором
-// гнал Parallel Seq Scan всей subdomain_results — 4,8 млн строк, 19,9 с —
-// ради горстки свежих хвостов). Публикация q:analyze строку не меняет:
-// rules_version зафиксирует воркер, асинхронно; повторная выборка «с
-// начала» брала бы ту же пачку in-flight строк и дублировала её с каждой
-// итерацией. Поэтому:
+// Draining in batches with cursor pagination — TWO forms (T-193, the
+// diagnosis of slow-query log record #12 of 10/25: an hourly tick with
+// a zero PK cursor ran a Parallel Seq Scan of the whole
+// subdomain_results — 4.8M rows, 19.9s — for a handful of fresh tails).
+// A q:analyze publish does not change the row: the worker commits
+// rules_version asynchronously; a "from the beginning" re-select would
+// take the same batch of in-flight rows and duplicate it on every
+// iteration. Therefore:
 //
-//   - PK-форма (reanalyzeSelectSQL) — ПОЛНЫЙ дренаж устаревшего множества
-//     (ReanalyzeDrain): смена правил (Subscribe, T-068) и crawlerctl
-//     reanalyze; редкий, обязан пройти всё множество с нуля, seq scan по
-//     неиндексируемому rules_version (HOT-инвариант, класс T-104/T-175)
-//     осознанно полон;
-//   - время-форма (reanalyzeTickSQL) — часовой тик: множество кандидатов
-//     тика — свежий срез (новые эпизоды T-058 со свежим checked_at и
-//     NULL-версией; хвосты, чья публикация отстала/потерялась),
-//     композитный курсор (checked_at, PK) опирается на индекс
-//     subdomain_results_checked_idx (T-171) — проход читает только окно
-//     вперёд курсора, стоимость ∝ притоку, а не размеру таблицы
-//     (прецедент — курсор retention T-185).
+//   - the PK form (reanalyzeSelectSQL) — the FULL drain of the stale set
+//     (ReanalyzeDrain): a rule change (Subscribe, T-068) and crawlerctl
+//     reanalyze; it is rare and must cover the whole set from scratch —
+//     the seq scan over the non-indexable rules_version (the HOT
+//     invariant, the T-104/T-175 class) is deliberately complete;
+//   - the time form (reanalyzeTickSQL) — the hourly tick: the candidate
+//     set is a fresh slice (new T-058 episodes with a fresh checked_at
+//     and a NULL version; tails whose publish lagged or got lost),
+//     the composite (checked_at, PK) cursor relies on the
+//     subdomain_results_checked_idx index (T-171) — a pass reads only
+//     the window ahead of the cursor; the cost is ∝ the inflow, not
+//     the table size (the precedent is the T-185 retention cursor).
 //
-// Guard тика корзинами хвостов (T-204, reanalyzeGuardSQL): даже окно
-// часа — 84 тыс. строк (приток 2–3 млн/сут, TZ T-201 §2.1) с heap-визитом
-// каждой ради неиндексируемого rules_version стоило 5–12 с стационарно и
-// 86–94 с в полуночном шторме (множитель CPU/IO-голода, PSI ~80 %) —
-// критерий приёмки T-193 «тик исчезает из журнала медленных» не
-// достигнут. Как и у ретрая (T-191 → T-202: счётчик status_temp_error не
-// отличал зрелых кандидатов от незрелых), наивный счётчик «записано без
-// анализа» не отличает ХВОСТЫ (потерянные публикации) от НЕЗРЕЛОГО
-// in-flight-потока (запись → q:analyze → штамп занимает секунды, приток
-// 23–35 строк/с держит его ненулевым всегда) — guard по нему был бы
-// открыт каждый тик. Зрелость дают ЧАСОВЫЕ корзины crawler_counters
-// ['reanalyze:YYYY-MM-DD"T"HH24'] (семья T-202/T-203): guard суммирует
-// корзины СТАРШЕ текущего часа — свежий in-flight-поток живёт в корзине
-// текущего часа и guard не открывает; хвост, переживший границу часа,
-// виден. Нулевая сумма ⇒ тяжёлая выборка не выполняется вовсе (стиль
-// retryMatureSQL); отрицательная — дрейф событий против строк (декременты
-// штампов старых версий при дренаже, дубль-доставки) — guard молчит,
-// реконсиляция monitor выровняет корзины своим проходом.
+// The tick guard by tail buckets (T-204, reanalyzeGuardSQL): even an
+// hour is 84k rows (an inflow of 2–3M/day, the T-201 spec §2.1) and a
+// heap visit of each for the non-indexable rules_version cost 5–12s
+// in steady state and 86–94s in the midnight storm (a CPU/IO starvation
+// multiplier, PSI ~80%) — the T-193 acceptance criterion "the tick
+// disappears from the slow-query log" was not met. As with the retry
+// (T-191 → T-202: the status_temp_error counter did not tell mature
+// candidates from immature ones), a naive "written without analysis"
+// counter does not tell TAILS (lost publishes) from the IMMATURE
+// in-flight flow (a write → q:analyze → stamp takes seconds, an
+// inflow of 23–35 rows/s keeps it non-zero always) — a guard over it
+// would be open on every tick. Maturity comes from the HOURLY
+// crawler_counters ['reanalyze:YYYY-MM-DD"T"HH24'] buckets (the
+// T-202/T-203 family): the guard sums the buckets OLDER than the
+// current hour — a fresh in-flight flow lives in the current hour's
+// bucket and does not open the guard; a tail that survived the hour
+// boundary is visible. A zero sum ⇒ the heavy select does not run at
+// all (the retryMatureSQL style); a negative one is an event-vs-rows
+// drift (decrements of old-version stamps during a drain, duplicate
+// deliveries) — the guard stays silent; the monitor reconciliation evens the buckets out with its own pass.
 //
-// Дубликаты между проходами ограничены (in-flight окно) и гасятся
-// идемпотентностью потребителя по ключу — как у T-066.
+// Duplicates between passes are bounded (the in-flight window) and are
+// absorbed by the consumer's per-key idempotency — like T-066.
 //
-// Backpressure — WatermarkPublisher (T-026): публикация ждёт ёмкости
-// q:analyze (единый порог scheduler.queue_high_watermark), отмена ctx —
-// чистый выход. Опубликованное до сбоя не откатывается (at-least-once,
-// §3.4): повторный проход опубликует снова — дубликат ограничен.
+// Backpressure — WatermarkPublisher (T-026): a publish waits for the
+// q:analyze capacity (the shared scheduler.queue_high_watermark
+// threshold); a ctx cancellation is a clean exit. What was published
+// before a failure is not rolled back (at-least-once, §3.4): a
+// repeated pass publishes it again — the duplicate is bounded.
 //
-// Контракт с воркером T-071: по каждому обработанному Result воркер
-// фиксирует subdomain_results.rules_version = версия набора — в том
-// числе строкам без сохранённого контента («анализировать нечего» —
-// тоже результат с версией), иначе фоновый проход возвращался бы к ним
-// бесконечно.
+// The contract with the T-071 worker: for every processed Result the
+// worker commits subdomain_results.rules_version = the set version —
+// including rows without saved content ("nothing to analyze" is also
+// a result with a version), otherwise the background pass would keep
+// coming back to them forever.
 package analyzer
 
 import (
@@ -89,63 +93,64 @@ import (
 	"crawler/internal/rules"
 )
 
-// Дефолты прохода (стиль T-020/T-030/T-066: константы, отдельной опции
-// конфига нет — ТЗ 5.10 состав фиксирован; рабочие значения цикл
-// получает опциями для тестов и вызова из CLI).
+// Pass defaults (the T-020/T-030/T-066 style: constants, no separate
+// config knob — spec 5.10 fixes the set; the loop receives the
+// working values as options for tests and CLI calls).
 const (
-	// DefaultReanalyzeInterval — период тикового прохода. Смена правил
-	// обрабатывается немедленно — по уведомлению Reloader (Subscribe,
-	// T-068); тикер — страховка: потерянные сообщения (усечение
-	// MAXLEN ~, T-025), сбой воркера, строки новых эпизодов проверки.
-	// Час, а не минута (стиль T-020/T-030/T-066): тиковый проход —
-	// время-форма по свежему срезу (T-193), но каждый проход всё же
-	// перечитывает окно вперёд курсора и перепубликует ещё не
-	// проштампованные строки новых эпизодов (дубликаты гасятся
-	// идемпотентностью воркера) — учащать незачем; и не сутки (стиль
-	// T-030): страховка не должна ждать перепроверочного интервала.
+	// DefaultReanalyzeInterval is the tick pass period. A rule change is
+	// handled immediately — via the Reloader notification (Subscribe,
+	// T-068); the ticker is the safety net: lost messages (a MAXLEN ~
+	// trim, T-025), a worker crash, rows of new check episodes.
+	// An hour, not a minute (the T-020/T-030/T-066 style): a tick pass
+	// is the time form over a fresh slice (T-193), but every pass still
+	// re-reads the window ahead of the cursor and re-publishes rows of
+	// new episodes not yet stamped (duplicates are absorbed by the
+	// worker idempotency) — no need to go more often; and not a day (the
+	// T-030 style): the safety net must not wait for the recheck interval.
 	DefaultReanalyzeInterval = time.Hour
 
-	// DefaultReanalyzeBatch — строк в одной пачке: проход читает только
-	// ключи (контент берёт воркер по ключу), 5000 совпадает с пачками
-	// планировщика (DefaultRecheckBatch, T-030) — короткая выборка и
-	// ограниченная серия публикаций до проверки ёмкости гейтом.
+	// DefaultReanalyzeBatch is the rows per batch: a pass reads only the
+	// keys (the worker takes the content by the key); 5000 matches the
+	// scheduler batches (DefaultRecheckBatch, T-030) — a short select and
+	// a bounded publish series before the capacity gate check.
 	DefaultReanalyzeBatch = 5000
 
-	// DefaultReanalyzeLookback — окно якоря курсора тикового прохода
-	// (T-193 §4.2): курсор тика стартует с now() − lookback, а не с
-	// эпохи (полный дренаж старта цикла покрывает всё устаревшее на
-	// момент запуска — тику остаются только свежие хвосты). 24 ч:
-	// страховка тика обслуживает СВЕЖИЕ потери (основной путь —
-	// немедленная публикация record.go и дренаж по Subscribe), всё
-	// старше либо проанализировано (rules_version меняется только
-	// записью анализа воркером T-071 или сменой правил; новый эпизод
-	// даёт свежий checked_at, T-058), либо это остаточный класс —
-	// потерянное старше окна без смены правил, территория следующего
-	// полного дренажа и наблюдаемости q:dead/q:analyze (T-162;
-	// docs/analyzer.md). Окно переживает тиковый интервал с запасом
-	// (простой цикла до суток между тиками/рестартами) и суточный ритм
-	// смен правил; дороже оно — только первому проходу после потери
-	// курсора (одно окно ∝ притоку, не размеру таблицы). Якорь считается
-	// по часам процесса (Go now()): расхождение часов приложения и БД
-	// на фоне окна 24 ч несущественно, дальше курсор ведут сами
-	// значения checked_at (их пишет now() сервера БД, T-058).
-	// Персистентность курсора в БД отклонена сознательно (ТЗ T-193
-	// §6.5): якорь делает потерю курсора дешёвой.
+	// DefaultReanalyzeLookback is the anchor window of the tick pass
+	// cursor (T-193 §4.2): the tick cursor starts from now() − lookback,
+	// not from the epoch (the loop startup full drain covers everything
+	// stale at the start moment — only fresh tails are left to the tick).
+	// 24h: the tick safety net serves FRESH losses (the main path is the
+	// immediate record.go publish and the Subscribe drain); everything
+	// older is either analyzed (rules_version changes only by the T-071
+	// worker's analysis write or a rule change; a new episode gives a
+	// fresh checked_at, T-058) or it is the residual class — lost and
+	// older than the window with no rule change, the territory of the
+	// next full drain and of the q:dead/q:analyze observability (T-162;
+	// docs/analyzer.md). The window survives a tick interval with slack
+	// (loop downtime up to a day between ticks/restarts) and the daily
+	// rule change rhythm; it costs more only to the first pass after a
+	// cursor loss (one window ∝ the inflow, not the table size). The
+	// anchor is computed by the process clock (the Go now()): an
+	// app-vs-DB clock skew is immaterial against a 24h window; further
+	// on the cursor is led by the checked_at values themselves (the
+	// DB server's now() writes them, T-058). Cursor persistence in the
+	// DB was deliberately rejected (the T-193 spec §6.5): the anchor makes a cursor loss cheap.
 	DefaultReanalyzeLookback = 24 * time.Hour
 )
 
-// reanalyzeSelectSQL — пачка устаревших строк PK-ФОРМЫ — ПОЛНЫЙ ДРЕНАЖ
-// (ReanalyzeDrain: Subscribe при смене правил T-068, crawlerctl
-// reanalyze; разовая пачка — ReanalyzeOnce): версия отлична от текущей
-// (IS DISTINCT FROM: NULL — никогда не анализировалась), домен не
-// удалён (§13.1), зона — опционально (NULL параметр — все). Курсор
-// row-value > по ключу строки (PK) отсекает уже пройденное дренажем;
-// ORDER BY по тому же ключу — детерминированные пачки и корректная
-// пагинация. Дренаж редок и обязан пройти всё устаревшее множество с
-// нуля: seq scan по неиндексируемому rules_version (HOT-инвариант,
-// класс T-104/T-175) осознанно полон — часовой тик ходит время-формой
-// reanalyzeTickSQL (T-193). Имя — label || '.' || зона (стиль T-027)
-// для Result.Name и логов (ТЗ 4.2).
+// reanalyzeSelectSQL is a batch of stale rows, the PK FORM — the FULL
+// DRAIN (ReanalyzeDrain: Subscribe on a rule change T-068, crawlerctl
+// reanalyze; a one-off batch — ReanalyzeOnce): the version differs
+// from the current one (IS DISTINCT FROM: NULL — never analyzed), the
+// domain is not deleted (§13.1), the zone is optional (a NULL
+// parameter — all). The row-value > cursor by the row key (the PK)
+// cuts off what the drain already covered; the ORDER BY by the same
+// key gives deterministic batches and correct pagination. The drain
+// is rare and must cover the whole stale set from scratch: the seq
+// scan over the non-indexable rules_version (the HOT invariant, the
+// T-104/T-175 class) is deliberately complete — the hourly tick walks
+// the time form, reanalyzeTickSQL (T-193). The name is label || '.' ||
+// zone (the T-027 style) for Result.Name and logs (spec 4.2).
 const reanalyzeSelectSQL = "SELECT r.zone_id, r.domain_id, r.subdomain_id, r.variant, d.label || '.' || z.name " +
 	"FROM subdomain_results AS r " +
 	"JOIN domains AS d ON d.zone_id = r.zone_id AND d.id = r.domain_id " +
@@ -157,21 +162,22 @@ const reanalyzeSelectSQL = "SELECT r.zone_id, r.domain_id, r.subdomain_id, r.var
 	"ORDER BY r.zone_id, r.domain_id, r.subdomain_id, r.variant " +
 	"LIMIT $8"
 
-// reanalyzeTickSQL — пачка устаревших строк ВРЕМЯ-ФОРМЫ — ЧАСОВОЙ ТИК
-// цикла (ReanalyzeTick, T-193 §4.1): тот же отбор, что
-// reanalyzeSelectSQL (версия, охрана §13.1, фильтр зоны — паритет форм;
-// тик ходит по всем зонам, параметр NULL), но курсор row-value > и
-// ORDER BY — по композитному ключу (checked_at, PK): нижнюю границу
-// checked_at планировщик PG16 выводит из row-value сам и обслуживает
-// индексом subdomain_results_checked_idx (T-171) — тик читает только
-// свежий срез вперёд курсора (окно ~ часа), а не heap всей таблицы
-// (диагноз записи №12 журнала медленных 25.10: нулевой PK-курсор —
-// Parallel Seq Scan 4,8 млн строк, 19,9 с, ради 56 строк). PK в хвосте
-// ключа детерминирует пачки внутри одинаковых отметок (now() стабильна
-// в транзакции записи — пачки строк делят отметку, T-058) — корректная
-// пагинация без пропусков; checked_at в списке колонок — курсор
-// следующей пачки (стиль retentionSelectSQL T-185; тайпкаст параметра
-// времени — как там же).
+// reanalyzeTickSQL is a batch of stale rows, the TIME FORM — the
+// HOURLY TICK of the loop (ReanalyzeTick, T-193 §4.1): the same
+// selection as reanalyzeSelectSQL (the version, the §13.1 guard, the
+// zone filter — form parity; the tick walks all zones, a NULL
+// parameter), but the row-value > cursor and the ORDER BY go by the
+// composite (checked_at, PK) key: PG16 derives the checked_at lower
+// bound from the row-value itself and serves it with the
+// subdomain_results_checked_idx index (T-171) — the tick reads only
+// the fresh slice ahead of the cursor (a window of ~an hour), not the
+// heap of the whole table (the slow-query log record #12 diagnosis of
+// 10/25: a zero PK cursor — a Parallel Seq Scan of 4.8M rows, 19.9s,
+// for 56 rows). The PK at the key's tail decides the batches within
+// equal marks (now() is stable in the write transaction — rows of a
+// batch share the mark, T-058) — correct pagination without skips;
+// checked_at in the column list is the next batch's cursor (the
+// retentionSelectSQL T-185 style; the time parameter typecast is the same as there).
 const reanalyzeTickSQL = "SELECT r.zone_id, r.domain_id, r.subdomain_id, r.variant, d.label || '.' || z.name, r.checked_at " +
 	"FROM subdomain_results AS r " +
 	"JOIN domains AS d ON d.zone_id = r.zone_id AND d.id = r.domain_id " +
@@ -183,56 +189,59 @@ const reanalyzeTickSQL = "SELECT r.zone_id, r.domain_id, r.subdomain_id, r.varia
 	"ORDER BY r.checked_at, r.zone_id, r.domain_id, r.subdomain_id, r.variant " +
 	"LIMIT $9"
 
-// reanalyzeGuardSQL — guard тикового прохода (T-204): сумма корзин хвостов
-// reanalyze:YYYY-MM-DD"T"HH24 старше текущего часа + граница текущего
-// часа от БД (двойное назначение: зрелая область корзин и цель прыжка
-// курсора закрытого guard'а — см. ReanalyzeTick). Корзины ведут
-// инкременты записи результата (record.go, час now() транзакции =
-// checked_at строк) и замены контента рендером (renderworker, час
-// ЭПИЗОДА из RETURNING), декремент — штамп анализатора (worker.go, час
-// эпизода строки), авторитет — реконсиляция monitor (FILTER-позиции
-// prev/cur агрегата окна двух живых часов, T-203-стиль). Диапазон по
-// PK-префиксу 'reanalyze:' лексикографически отсекает корзину текущего
-// часа (незрелый in-flight-поток: запись → штамп занимает секунды,
-// корзина часа ещё дорабатывается декрементами) — имя часа вычисляет БД,
-// Go-часы в границе не участвуют (стиль T-179/T-202). coalesce — корзин
-// может не быть вовсе (до первого инкремента или прохода): честный ноль,
-// «зрелых хвостов нет», а не ошибка — в отличие от статусных строк,
-// корзины никто не гарантирует (семантика retryMatureSQL). Скалярный
-// агрегат без GROUP BY отвечает ровно одной строкой всегда: пустой набор
-// — обрыв протокола, ошибка. Хвосты декрементов и воскрешённые рендером
-// опоздания > 1 ч корзины старых часов попадают в сумму с минусом/плюсом
-// до ближайшего прохода monitor (rewrite/cleanup живых корзин) —
-// потоковая семантика событий против живых строк, семейство T-202/T-203.
+// reanalyzeGuardSQL is the tick pass guard (T-204): the sum of the tail
+// buckets reanalyze:YYYY-MM-DD"T"HH24 older than the current hour +
+// the current hour bound from the DB (a double duty: the buckets'
+// mature area and the closed guard's cursor jump target — see
+// ReanalyzeTick). The buckets collect the result write increments
+// (record.go, the hour of the transaction now() = the rows' checked_at)
+// and the render content replacement (renderworker, the EPISODE hour
+// from the RETURNING); the decrement is the analyzer stamp (worker.go,
+// the row's episode hour), the authority is the monitor reconciliation
+// (the prev/cur FILTER positions of the two live hours' window
+// aggregate, the T-203 style). The range over the 'reanalyze:' PK
+// prefix lexicographically cuts off the current hour's bucket (the
+// immature in-flight flow: a write → stamp takes seconds, the hour
+// bucket is still being worked off by decrements) — the DB computes
+// the hour name, no Go clocks in the bound (the T-179/T-202 style).
+// coalesce — the buckets may not exist at all (before the first
+// increment or pass): an honest zero, "no mature tails", not an error —
+// unlike the status rows, nobody guarantees the buckets (the
+// retryMatureSQL semantics). A scalar aggregate without GROUP BY
+// always answers exactly one row: an empty set is a protocol break, an
+// error. Decrement tails and render-resurrected lateness of >1h old-hour
+// buckets land in the sum with a minus/plus until the nearest monitor
+// pass (the rewrite/cleanup of the live buckets) — the streaming
+// semantics of events against live rows, the T-202/T-203 family.
 var reanalyzeGuardSQL = "SELECT coalesce(sum(value), 0), date_trunc('hour', now()) FROM crawler_counters " +
 	"WHERE name >= 'reanalyze:' " +
 	"AND name < 'reanalyze:' || to_char(date_trunc('hour', now()), 'YYYY-MM-DD\"T\"HH24')"
 
-// zoneIDByNameSQL — идентификатор зоны по имени для фильтра команды
-// crawlerctl reanalyze --zone: имя хранится в punycode (EnsureZone,
-// T-014), UNIQUE — не больше одной строки.
+// zoneIDByNameSQL is the zone id by name for the crawlerctl reanalyze
+// --zone filter: the name is stored in punycode (EnsureZone, T-014),
+// UNIQUE — at most one row.
 const zoneIDByNameSQL = "SELECT id FROM zones WHERE name = $1"
 
-// RulesSource — источник набора правил для фонового цикла; удо­влетворяется
-// *rules.Reloader (T-068). Узкий интерфейс — цикл не знает о SIGHUP и
-// файлах, юнит-тесты подменяют фейком.
+// RulesSource is the rule set source of the background loop; satisfied
+// by *rules.Reloader (T-068). A narrow interface — the loop knows
+// nothing about SIGHUP or files; unit tests substitute a fake.
 type RulesSource interface {
-	// Set — текущий неизменяемый снапшот (nil не бывает у Reloader;
-	// фейк без набора — проход пропускается с Warn).
+	// Set is the current immutable snapshot (a Reloader never returns nil;
+	// a fake without a set — the pass is skipped with a Warn).
 	Set() *rules.Set
-	// Subscribe — уведомления о смене набора: внеочередной проход.
+	// Subscribe is the set change notification: an out-of-turn pass.
 	Subscribe() (<-chan *rules.Set, func())
 }
 
-// ReanalyzeOptions — параметры переанализа; нулевые значения заменяются
-// дефолтами (withDefaults, стиль RecheckOptions T-030).
+// ReanalyzeOptions holds the re-analysis parameters; zero values are
+// replaced with the defaults (withDefaults, the RecheckOptions T-030 style).
 type ReanalyzeOptions struct {
-	// Interval — период цикла ReanalyzeLoop (DefaultReanalyzeInterval);
-	// на разовые проходы не влияет.
+	// Interval is the ReanalyzeLoop period (DefaultReanalyzeInterval);
+	// it does not affect one-off passes.
 	Interval time.Duration
-	// BatchSize — максимум строк в одной пачке (DefaultReanalyzeBatch).
+	// BatchSize is the maximum rows in one batch (DefaultReanalyzeBatch).
 	BatchSize int
-	// Log — логгер цикла; nil — записи подавлены (slog.DiscardHandler).
+	// Log is the loop logger; nil — records are dropped (slog.DiscardHandler).
 	Log *slog.Logger
 }
 
@@ -246,16 +255,16 @@ func (o ReanalyzeOptions) withDefaults() ReanalyzeOptions {
 	return o
 }
 
-// ReanalyzeResult — итог прохода: строки выбраны/опубликованы. Разница
-// Published < Selected — ошибка публикации посреди пачки (проход
-// остановлен).
+// ReanalyzeResult is a pass outcome: rows selected/published. A
+// Published < Selected difference is a publish failure in the middle
+// of a batch (the pass stopped).
 type ReanalyzeResult struct {
 	Selected  int
 	Published int
 }
 
-// resultKey — ключ строки subdomain_results (PK, ТЗ 6.1) и курсор
-// пагинации дренажа.
+// resultKey is the subdomain_results row key (the PK, spec 6.1) and
+// the drain pagination cursor.
 type resultKey struct {
 	zone    int16
 	domain  int64
@@ -263,39 +272,39 @@ type resultKey struct {
 	variant model.Variant
 }
 
-// ReanalyzeCursor — курсор тикового прохода по времени (T-193): последняя
-// посещённая строка (checked_at, PK), переживающая проходы цикла —
-// образец retentionCursor (T-185). Время ведёт (свежие эпизоды впереди:
-// T-058 пишет now() сервера БД), PK детерминирует порядок внутри
-// одинаковых отметок. Нулевое значение — «с якоря»: проход стартует с
-// now() − DefaultReanalyzeLookback (§4.2: цикл заякоривает курсор при
-// старте, ReanalyzeTick страхует нулевой; потеря курсора — рестарт —
-// дёшева, одно окно). Поля не экспортированы: курсор двигает только
-// ReanalyzeTick, владелец — цикл ReanalyzeLoop (одна горутина,
-// блокировки не нужны — стиль retentionState T-185); внешние вызовы
-// держат значение целиком (нулевая структура-литерал доступна и без
-// полей).
+// ReanalyzeCursor is the tick pass cursor by time (T-193): the last
+// visited row (checked_at, PK), surviving the loop passes — the
+// retentionCursor sample (T-185). Time leads (fresh episodes ahead:
+// the T-058 writes the DB server's now()), the PK decides the order
+// within equal marks. The zero value means "from the anchor": a pass
+// starts from now() − DefaultReanalyzeLookback (§4.2: the loop anchors
+// the cursor at the start, ReanalyzeTick guards the zero one; a
+// cursor loss — a restart — is cheap, one window). The fields are
+// not exported: only ReanalyzeTick moves the cursor, the owner is the
+// ReanalyzeLoop loop (one goroutine, no locks needed — the
+// retentionState T-185 style); external calls hold the value whole
+// (a zero struct literal is available without the fields too).
 type ReanalyzeCursor struct {
 	checkedAt time.Time
 	key       resultKey
 }
 
-// reanalyzeRow — строка пачки: ключ, имя домена для сообщения и отметка
-// checked_at — курсор следующей пачки время-формы (время-форма читает
-// её из строки; PK-форма дренажа колонку не выбирает — нулевая).
+// reanalyzeRow is a batch row: the key, the domain name for the
+// message and the checked_at mark — the next time-form batch's cursor
+// (the time form reads it from the row; the drain PK form does not select the column — zero).
 type reanalyzeRow struct {
 	key       resultKey
 	name      string
 	checkedAt time.Time
 }
 
-// ReanalyzeOnce — один проход ПЕРВОЙ ПАЧКИ PK-формы (с нулевого
-// ключа): выборка до opts.BatchSize устаревших строк и публикация
-// Result в q:analyze по каждой (ТЗ 5.8 «Переанализ»). Повторное
-// скачивание не выполняется. Проход идемпотентен на уровне «выборка+
-// публикация»: после фиксации воркером T-071 новой rules_version строки
-// перестают отбираться. Полный дренаж — ReanalyzeDrain, тиковый проход
-// свежего среза — ReanalyzeTick (T-193).
+// ReanalyzeOnce is one pass of the FIRST BATCH of the PK form (from
+// the zero key): a select of up to opts.BatchSize stale rows and a
+// publish of a Result into q:analyze per row (spec 5.8 "Re-analysis").
+// No re-downloading. The pass is idempotent at the "select+publish"
+// level: after the T-071 worker commits the new rules_version, rows
+// stop being selected. The full drain is ReanalyzeDrain, the fresh
+// slice tick pass is ReanalyzeTick (T-193).
 func ReanalyzeOnce(ctx context.Context, pool db.DB, q queue.Queue, version int32, zone *int16, opts ReanalyzeOptions) (ReanalyzeResult, error) {
 	if pool == nil {
 		return ReanalyzeResult{}, errors.New("analyzer: переанализ: пул не задан")
@@ -314,13 +323,13 @@ func ReanalyzeOnce(ctx context.Context, pool db.DB, q queue.Queue, version int32
 	return out, nil
 }
 
-// ReanalyzeDrain — ПОЛНЫЙ дренаж устаревшего множества пачками
-// (DefaultReanalyzeBatch, PK-форма с нулевого курсора): выборка →
-// публикация → курсор за последнюю строку пачки, до первой неполной
-// пачки. Так смена правил (Subscribe цикла, T-068) и команда
-// crawlerctl reanalyze проходят всё множество без повторов внутри
-// прохода; «дорасти» до следующего прохода могут только строки, ставшие
-// устаревшими после прохождения курсора.
+// ReanalyzeDrain is the FULL drain of the stale set in batches
+// (DefaultReanalyzeBatch, the PK form from the zero cursor): a select
+// → a publish → the cursor past the batch's last row, until the
+// first short batch. This way a rule change (the loop's Subscribe,
+// T-068) and the crawlerctl reanalyze command cover the whole set
+// without repeats within a pass; only rows that went stale after the
+// cursor passed can "ripen" into the next pass.
 func ReanalyzeDrain(ctx context.Context, pool db.DB, q queue.Queue, version int32, zone *int16, opts ReanalyzeOptions) (ReanalyzeResult, error) {
 	if pool == nil {
 		return ReanalyzeResult{}, errors.New("analyzer: переанализ: пул не задан")
@@ -330,7 +339,7 @@ func ReanalyzeDrain(ctx context.Context, pool db.DB, q queue.Queue, version int3
 	}
 	o := opts.withDefaults()
 	out := ReanalyzeResult{}
-	after := resultKey{} // нулевой ключ меньше любого реального (zone_id ≥ 1)
+	after := resultKey{} // the zero key is less than any real one (zone_id ≥ 1)
 	for {
 		if err := ctx.Err(); err != nil {
 			return out, fmt.Errorf("analyzer: переанализ: %w", err)
@@ -344,48 +353,51 @@ func ReanalyzeDrain(ctx context.Context, pool db.DB, q queue.Queue, version int3
 			return out, err
 		}
 		if len(rows) < o.BatchSize {
-			return out, nil // множество исчерпано
+			return out, nil // the set is exhausted
 		}
 		after = rows[len(rows)-1].key
 	}
 }
 
-// ReanalyzeTick — тиковый проход цикла: дренаж СВЕЖЕГО СРЕЗА пачками
-// (время-форма, T-193 §4.1) от курсора cursor до исчерпания окна —
-// короткая или пустая пачка значит, что устаревшего вперёд курсора нет;
-// пустая пачка окно исчерпала, курсор ждёт следующего тика. Курсор —
-// состояние цикла, переживающее проходы (образец retentionCursor
-// T-185): продвигается за последнюю строку каждой ОПУБЛИКОВАННОЙ пачки
-// и только вперёд по (checked_at, PK) — стоимость прохода ∝ притоку с
-// момента прошлого тика, а не размеру таблицы. Нулевой курсор — якорь
-// now() − DefaultReanalyzeLookback (§4.2 — восстановление после потери
-// курсора; цикл заякоривает курсор сам при старте, здесь — страховка
-// разовых вызовов); nil — якорь без сохранения (разовый вызов без
-// состояния). Ошибка публикации останавливает проход, не двигая курсор
-// за сбойную пачку: повторный тик опубликует её строки снова
-// (at-least-once, §3.4; дубликат ограничен пачкой, гасится
-// идемпотентностью воркера T-071 по ключу). Отмена ctx — ошибка
-// контекста с итогом опубликованного (стиль ReanalyzeDrain).
+// ReanalyzeTick is the loop's tick pass: draining the FRESH SLICE in
+// batches (the time form, T-193 §4.1) from the cursor up to the
+// window being exhausted — a short or empty batch means there is
+// nothing stale ahead of the cursor; an empty batch exhausted the
+// window, the cursor waits for the next tick. The cursor is loop
+// state surviving the passes (the retentionCursor sample, T-185): it
+// advances past the last row of every PUBLISHED batch and only
+// forward by (checked_at, PK) — a pass costs ∝ the inflow since the
+// previous tick, not the table size. A zero cursor means the
+// now() − DefaultReanalyzeLookback anchor (§4.2 — recovery after a
+// cursor loss; the loop anchors the cursor itself at startup, this is
+// the safety net for one-off calls); nil — the anchor without saving
+// (a one-off call without state). A publish failure stops the pass
+// without moving the cursor past the failed batch: a repeated tick
+// publishes its rows again (at-least-once, §3.4; the duplicate is
+// bounded by the batch, absorbed by the T-071 worker per-key
+// idempotency). A ctx cancellation is a context error with the published outcome (the ReanalyzeDrain style).
 //
-// Guard корзин хвостов (T-204, reanalyzeGuardSQL) — ДО тяжёлой выборки:
-// сумма корзин reanalyze: старше текущего часа — зрелые хвосты без
-// in-flight-потока. Сумма ≤ 0 — тяжёлая выборка окна (heap-визит каждой
-// строки ради rules_version, 84 тыс./ч) не выполняется вовсе, а курсор
-// ПРЫГАЕТ на границу текущего часа (дата из той же строки guard'а):
-// зрелая область объявлена корзинами пустой, незрелая (текущий час,
-// корзина дорабатывается декрементами штампов) остаётся впереди курсора.
-// Без прыжка курсор замерзал бы на последней публикации (пустая пачка
-// его не двигает), и первый хвост после тихих часов стоил бы проход по
-// многочасовому окну — прыжок держит каждое guard-открытое окно ≤ 2 ч
-// притока. Прыжок опирается на зрелость корзин там же, где и пропуск
-// выборки: граница часа от БД (не Go-часы), транзакции записи коротки
-// (мс) — опоздавшие коммиты позади границы единственны и требуют вдобавок
-// потерянной публикации, чтобы стать хвостом: остаточный класс той же
-// природы, что и якорь §4.2 (подбирается рестартом с якорем 24 ч или
-// полным дренажом смены правил). Первый тик после старта цикла при
-// закрытом guard не вычитывает якорное окно 24 ч: стартовый дренаж уже
-// прошёл всё устаревшее (его неудача — Warn, воссоздание якоря —
-// следующим рестартом), а потери первого часа видны корзинами.
+// The tail buckets guard (T-204, reanalyzeGuardSQL) — BEFORE the heavy
+// select: the sum of reanalyze: buckets older than the current hour
+// — mature tails without the in-flight flow. A sum ≤ 0 — the heavy
+// window select (a heap visit of each row for rules_version, 84k/h)
+// does not run at all and the cursor JUMPS to the current hour bound
+// (the date from the same guard row): the mature area is declared
+// empty by the buckets, the immature one (the current hour, the
+// bucket is still worked off by stamp decrements) stays ahead of the
+// cursor. Without the jump the cursor would freeze at the last
+// publish (an empty batch does not move it), and the first tail after
+// quiet hours would cost a pass over a many-hour window — the jump
+// keeps every guard-opened window ≤ 2h of inflow. The jump relies on
+// the buckets' maturity in the same place as the select skip: the
+// hour bound from the DB (not Go clocks), write transactions are short
+// (ms) — late commits behind the bound are unique and additionally
+// require a lost publish to become a tail: a residual class of the
+// same nature as the §4.2 anchor (picked up by a restart with the 24h
+// anchor or by the full drain of a rule change). The first tick after
+// the loop startup with a closed guard does not read the 24h anchor
+// window: the startup drain already covered everything stale (its
+// failure is a Warn, the anchor is recreated by the next restart), and the first hour's losses are visible in the buckets.
 func ReanalyzeTick(ctx context.Context, pool db.DB, q queue.Queue, version int32, cursor *ReanalyzeCursor, opts ReanalyzeOptions) (ReanalyzeResult, error) {
 	if pool == nil {
 		return ReanalyzeResult{}, errors.New("analyzer: переанализ: пул не задан")
@@ -394,12 +406,12 @@ func ReanalyzeTick(ctx context.Context, pool db.DB, q queue.Queue, version int32
 		return ReanalyzeResult{}, errors.New("analyzer: переанализ: очередь не задана")
 	}
 	if cursor == nil {
-		cursor = &ReanalyzeCursor{} // разовый вызов: якорь без сохранения
+		cursor = &ReanalyzeCursor{} // a one-off call: the anchor without saving
 	}
 	if cursor.checkedAt.IsZero() {
-		// Якорь старта/восстановления (§4.2): now() − lookback, не эпоха —
-		// страховка тика обслуживает свежие потери, старее — территория
-		// полного дренажа (DefaultReanalyzeLookback, обоснование).
+		// The start/recovery anchor (§4.2): now() − lookback, not the epoch —
+		// the tick safety net serves fresh losses, anything older is the
+		// full drain territory (DefaultReanalyzeLookback, the rationale).
 		cursor.checkedAt = time.Now().Add(-DefaultReanalyzeLookback)
 	}
 	o := opts.withDefaults()
@@ -407,10 +419,10 @@ func ReanalyzeTick(ctx context.Context, pool db.DB, q queue.Queue, version int32
 	if err := ctx.Err(); err != nil {
 		return out, fmt.Errorf("analyzer: переанализ: %w", err)
 	}
-	// Guard корзин хвостов (T-204): до тяжёлой выборки — сумма зрелых
-	// корзин; ≤ 0 (ноль — хвостов нет, минус — дрейф декрементов, молчит
-	// по наследию T-202) — окно не вычитывается, курсор прыгает на
-	// границу текущего часа (обоснование — комментарий ReanalyzeTick).
+	// The tail buckets guard (T-204): before the heavy select — the sum
+	// of mature buckets; ≤ 0 (zero — no tails, minus — a decrement drift,
+	// silent per the T-202 legacy) — the window is not read, the cursor
+	// jumps to the current hour bound (the rationale is the ReanalyzeTick comment).
 	tails, hourStart, err := reanalyzeMatureTails(ctx, pool)
 	if err != nil {
 		return out, err
@@ -429,24 +441,24 @@ func ReanalyzeTick(ctx context.Context, pool db.DB, q queue.Queue, version int32
 			return out, err
 		}
 		if len(rows) == 0 {
-			return out, nil // окно исчерпано — курсор ждёт следующего тика
+			return out, nil // the window is exhausted — the cursor waits for the next tick
 		}
 		out.Selected += len(rows)
 		if err := reanalyzePublish(ctx, q, rows, &out); err != nil {
 			return out, err
 		}
-		// Курсор — за последнюю строку опубликованной пачки.
+		// The cursor — past the last row of the published batch.
 		cursor.checkedAt, cursor.key = rows[len(rows)-1].checkedAt, rows[len(rows)-1].key
 		if len(rows) < o.BatchSize {
-			return out, nil // короткая пачка — устаревшее вперёд курсора кончилось
+			return out, nil // a short batch — nothing stale ahead of the cursor anymore
 		}
 	}
 }
 
-// reanalyzeSelect — пачка устаревших строк после курсора after
-// (PK-форма, reanalyzeSelectSQL).
+// reanalyzeSelect selects a batch of stale rows after the after cursor
+// (the PK form, reanalyzeSelectSQL).
 func reanalyzeSelect(ctx context.Context, pool db.DB, version int32, zone *int16, after resultKey, limit int) ([]reanalyzeRow, error) {
-	var zoneArg any // nil → NULL параметр → фильтр зоны выключен
+	var zoneArg any // nil → a NULL parameter → the zone filter is off
 	if zone != nil {
 		zoneArg = *zone
 	}
@@ -478,15 +490,15 @@ func reanalyzeSelect(ctx context.Context, pool db.DB, version int32, zone *int16
 	return out, nil
 }
 
-// reanalyzeTickSelect — пачка устаревших строк после курсора after
-// (время-форма, reanalyzeTickSQL). Тик ходит по всем зонам — параметр
-// зоны SQL всегда NULL (фильтр в форме сохранён для паритета с
-// PK-формой, T-193 §4.1).
+// reanalyzeTickSelect selects a batch of stale rows after the after
+// cursor (the time form, reanalyzeTickSQL). The tick walks all zones —
+// the SQL zone parameter is always NULL (the filter is kept in the
+// form for parity with the PK one, T-193 §4.1).
 func reanalyzeTickSelect(ctx context.Context, pool db.DB, version int32, after ReanalyzeCursor, limit int) ([]reanalyzeRow, error) {
 	rows, err := pool.Query(ctx, reanalyzeTickSQL,
 		version,
 		int16(model.StatusDeleted),
-		nil, // зона не фильтруется — все
+		nil, // no zone filtering — all
 		after.checkedAt,
 		int16(after.key.zone), int64(after.key.domain), int16(after.key.sub), int16(after.key.variant),
 		limit,
@@ -512,11 +524,11 @@ func reanalyzeTickSelect(ctx context.Context, pool db.DB, version int32, after R
 	return out, nil
 }
 
-// reanalyzeMatureTails — guard тикового прохода (T-204): сумма корзин
-// хвостов reanalyze: старше текущего часа и граница текущего часа от БД
-// (reanalyzeGuardSQL). coalesce в SQL гарантирует одну строку даже без
-// строк корзин (честный ноль): пустой набор — обрыв протокола, а не
-// «корзин нет», и обязан быть ошибкой (стиль retryMatureCount).
+// reanalyzeMatureTails is the tick pass guard (T-204): the sum of the
+// reanalyze: tail buckets older than the current hour and the current
+// hour bound from the DB (reanalyzeGuardSQL). The SQL coalesce
+// guarantees one row even without bucket rows (an honest zero): an
+// empty set is a protocol break, not "no buckets", and must be an error (the retryMatureCount style).
 func reanalyzeMatureTails(ctx context.Context, pool db.DB) (tails int64, hourStart time.Time, err error) {
 	rows, err := pool.Query(ctx, reanalyzeGuardSQL)
 	if err != nil {
@@ -524,8 +536,8 @@ func reanalyzeMatureTails(ctx context.Context, pool db.DB) (tails int64, hourSta
 	}
 	defer rows.Close()
 	if !rows.Next() {
-		// Сначала сбой чтения: обрыв соединения — не «пустая сумма»
-		// (coalesce в SQL отвечает строкой всегда).
+		// The read failure first: a connection drop is not an "empty sum"
+		// (the SQL coalesce always answers with a row).
 		if err := rows.Err(); err != nil {
 			return 0, time.Time{}, fmt.Errorf("analyzer: переанализ: корзины хвостов: %w", err)
 		}
@@ -540,8 +552,8 @@ func reanalyzeMatureTails(ctx context.Context, pool db.DB) (tails int64, hourSta
 	return tails, hourStart, nil
 }
 
-// reanalyzePublish публикует Result по каждой строке пачки (q:analyze,
-// формат T-024): только ключ и имя — контент воркер возьмёт из хранилища.
+// reanalyzePublish publishes a Result per batch row (q:analyze, the
+// T-024 format): only the key and the name — the worker will take the content from the store.
 func reanalyzePublish(ctx context.Context, q queue.Queue, rows []reanalyzeRow, out *ReanalyzeResult) error {
 	for i := range rows {
 		msg := queue.Result{
@@ -560,25 +572,26 @@ func reanalyzePublish(ctx context.Context, q queue.Queue, rows []reanalyzeRow, o
 	return nil
 }
 
-// ReanalyzeLoop — фоновый цикл переанализа (ТЗ 5.8 «Фоновая задача»):
-// стартовый ПОЛНЫЙ дренаж пачками (подбирает устаревшее за простоем —
-// стиль T-020/T-030/T-066; в том числе сменившиеся за простоем правила —
-// Subscribe уведомляет только работающий процесс, T-068), далее тикер
-// Interval — тиковые проходы время-формой: курсор заякоривается при
-// старте цикла на now() − DefaultReanalyzeLookback (T-193 §4.2 — не с
-// эпохи: первый тик не должен вычитывать всю историю) и переживает
-// проходы, каждый тик продолжает с места остановки, а не сканирует
-// таблицу с нуля; смена набора правил (Reloader.Subscribe, T-068:
-// SIGHUP без рестарта) — внеочередной ПОЛНЫЙ дренаж, PK-курсор с нуля.
-// Каждый проход берёт актуальную версию из src.Set(). Тик и дренаж
-// идут в одной горутине select — пересечение множеств (смена правил во
-// время тика) безопасно: оба идемпотентны на уровне «выборка+
-// публикация» (T-071). Ошибка прохода — Warn, цикл живёт (контракт
-// OnRun, T-012): опубликованное не теряется; неопубликованное дренажом
-// вернёт следующая смена правил, тиком — повторный проход курсора
-// (at-least-once, §3.4). Отмена ctx — чистый nil (graceful shutdown,
-// §3.4). Курсор трогает только цикл (одна горутина) — блокировки не
-// нужны (стиль retentionState T-185).
+// ReanalyzeLoop is the background re-analysis loop (spec 5.8
+// "Background task"): a startup FULL drain in batches (it picks up
+// what went stale during the downtime — the T-020/T-030/T-066 style;
+// including rules that changed during it — Subscribe notifies only a
+// running process, T-068), then the Interval ticker — tick passes in
+// the time form: the cursor is anchored at the loop start to now() −
+// DefaultReanalyzeLookback (T-193 §4.2 — not from the epoch: the
+// first tick must not read the whole history) and survives the
+// passes, each tick continues from where it stopped instead of
+// scanning the table from scratch; a rule set change
+// (Reloader.Subscribe, T-068: an SIGHUP without a restart) — an
+// out-of-turn FULL drain, a PK cursor from scratch. Every pass takes
+// the current version from src.Set(). The tick and the drain run in
+// one goroutine's select — the sets overlapping (a rule change during
+// a tick) is safe: both are idempotent at the "select+publish" level
+// (T-071). A pass error is a Warn, the loop lives (the OnRun contract,
+// T-012): what was published is not lost; a next rule change will
+// return the unpublished via the drain, a tick will via a repeated
+// cursor pass (at-least-once, §3.4). A ctx cancellation is a clean nil
+// (a graceful shutdown, §3.4). Only the loop touches the cursor (one goroutine) — no locks are needed (the retentionState T-185 style).
 func ReanalyzeLoop(ctx context.Context, pool db.DB, q queue.Queue, src RulesSource, opts ReanalyzeOptions) error {
 	if pool == nil {
 		return errors.New("analyzer: переанализ: пул не задан")
@@ -600,16 +613,16 @@ func ReanalyzeLoop(ctx context.Context, pool db.DB, q queue.Queue, src RulesSour
 		"interval", o.Interval.String(), "batch", o.BatchSize,
 		"lookback", DefaultReanalyzeLookback.String())
 
-	// Курсор тика — состояние цикла, переживающее проходы (T-193): якорь
-	// ставится здесь, при старте цикла (§4.2 — «старт цикла — курсор
-	// now() − lookback», не с эпохи: первый тик не вычитывает всю
-	// историю); потеря курсора (рестарт) — тот же якорь в новом цикле,
-	// ReanalyzeTick дополнительно якорит нулевой курсор сам.
+	// The tick cursor is loop state surviving the passes (T-193): the
+	// anchor is set here, at the loop start (§4.2 — "the loop start is
+	// the cursor now() − lookback", not from the epoch: the first tick
+	// does not read the whole history); a cursor loss (a restart) is
+	// the same anchor in the new loop; ReanalyzeTick additionally anchors the zero cursor itself.
 	var cursor ReanalyzeCursor
 	cursor.checkedAt = time.Now().Add(-DefaultReanalyzeLookback)
 
-	// tick — тиковый проход: свежий срез от живого курсора (время-форма),
-	// версия — актуальная на момент прохода.
+	// tick is the tick pass: the fresh slice from the live cursor (the
+	// time form); the version is the current one at the pass moment.
 	tick := func() {
 		set := src.Set()
 		if set == nil {
@@ -618,7 +631,7 @@ func ReanalyzeLoop(ctx context.Context, pool db.DB, q queue.Queue, src RulesSour
 		}
 		res, err := ReanalyzeTick(ctx, pool, q, set.Version, &cursor, o)
 		if err != nil {
-			// Отмена во время прохода — часть остановки, не тревога.
+			// A cancellation during a pass is part of the stop, not an alarm.
 			if ctx.Err() == nil {
 				log.Warn("проход переанализа", "err", err,
 					"selected", res.Selected, "published", res.Published)
@@ -632,8 +645,8 @@ func ReanalyzeLoop(ctx context.Context, pool db.DB, q queue.Queue, src RulesSour
 		}
 	}
 
-	// drain — полный дренаж: всё устаревшее множество пачками с нулевого
-	// PK-курсора (смена правил — редкий, осознанно полный проход).
+	// drain is the full drain: the whole stale set in batches from the
+	// zero PK cursor (a rule change — a rare, deliberately full pass).
 	drain := func() {
 		set := src.Set()
 		if set == nil {
@@ -642,7 +655,7 @@ func ReanalyzeLoop(ctx context.Context, pool db.DB, q queue.Queue, src RulesSour
 		}
 		res, err := ReanalyzeDrain(ctx, pool, q, set.Version, nil, o)
 		if err != nil {
-			// Отмена во время прохода — часть остановки, не тревога.
+			// A cancellation during a pass is part of the stop, not an alarm.
 			if ctx.Err() == nil {
 				log.Warn("проход переанализа", "err", err,
 					"selected", res.Selected, "published", res.Published)
@@ -656,9 +669,9 @@ func ReanalyzeLoop(ctx context.Context, pool db.DB, q queue.Queue, src RulesSour
 		}
 	}
 
-	drain() // стартовый дренаж: устаревшее за простоем, включая сменившиеся
-	// за простоем правила (осознанно полный проход — §4.3); первый
-	// тикер-тик продолжит курсором от якоря, поставленного выше.
+	drain() // the startup drain: what went stale during the downtime,
+	// including rules that changed during it (a deliberately full pass —
+	// §4.3); the first ticker tick continues with the cursor from the anchor set above.
 	ticker := time.NewTicker(o.Interval)
 	defer ticker.Stop()
 	for {
@@ -667,19 +680,19 @@ func ReanalyzeLoop(ctx context.Context, pool db.DB, q queue.Queue, src RulesSour
 			return nil
 		case set, ok := <-sets:
 			if !ok {
-				// Эквивалентный мутант (T-M10): вырезание sets = nil
-				// оставляет в select закрытый канал — он по-прежнему
-				// немедленно готов, ok=false и continue вращают цикл
-				// вхолостую без drain и логов, состояние и дальнейшие
-				// развилки те же (различие только в нагрузке CPU —
-				// детерминированно не наблюдаемо). Вырезание ветки
-				// целиком закрыто тестом TestReanalyzeLoopClosedSets
-				// (поток drain/логов по закрытому каналу).
+				// An equivalent mutant (T-M10): cutting the sets = nil out
+				// leaves a closed channel in the select — it is still
+				// immediately ready; ok=false and continue spin the loop
+				// idly without drain and logs, the state and the further
+				// branches are the same (the only difference is CPU load —
+				// deterministically unobservable). Cutting the whole branch
+				// out is covered by the TestReanalyzeLoopClosedSets test
+				// (the drain/log flow over the closed channel).
 				// mutator-disable-next-line statement/remove
-				sets = nil // закрытый канал не должен зациклить select
-				// Эквивалентный мутант (T-M10): continue → break лишь
-				// выходит из select — цикл for продолжает следующей
-				// итерацией, а тело ветки и так исчерпано: неразличимо.
+				sets = nil // a closed channel must not loop the select
+				// An equivalent mutant (T-M10): continue → break only exits
+				// the select — the for loop continues with the next iteration,
+				// and the branch body is exhausted anyway: indistinguishable.
 				// mutator-disable-next-line loop/break
 				continue
 			}
@@ -692,9 +705,9 @@ func ReanalyzeLoop(ctx context.Context, pool db.DB, q queue.Queue, src RulesSour
 	}
 }
 
-// ZoneIDByName — идентификатор зоны по punycode-имени для фильтра
-// команды crawlerctl reanalyze --zone. found = false — зоны в
-// справочнике нет (ingest создаёт зоны при первом файле, T-014).
+// ZoneIDByName is the zone id by punycode name for the crawlerctl
+// reanalyze --zone filter. found = false — the zone is not in the
+// reference table (ingest creates zones on the first file, T-014).
 func ZoneIDByName(ctx context.Context, pool db.DB, name string) (id int16, found bool, err error) {
 	if pool == nil {
 		return 0, false, errors.New("analyzer: зона по имени: пул не задан")

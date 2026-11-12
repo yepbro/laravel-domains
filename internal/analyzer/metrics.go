@@ -1,10 +1,10 @@
-// Приборы этапа анализа (T-077, ТЗ 5.9): пропускная способность — счётчик
-// задач и гистограмма длительностей. Отдельных счётчиков ошибок/статусов
-// этап не имеет: анализ пассивен (запросов наружу нет, ТЗ 5.8), сбой
-// доставки — повтор уровня очереди, а его результаты (findings,
-// is_laravel) — данные БД, не метрики процесса. Исключение — снятие
-// находки переанализом и точечный дренаж контента (T-187): событие
-// меняет пожизненное состояние retention (диск), наблюдаемость обязательна.
+// Instruments of the analyze stage (T-077, spec 5.9): throughput is a
+// task counter and a duration histogram. There are no separate
+// error/status counters: the analysis is passive (no outbound requests,
+// spec 5.8), a delivery failure is a queue-level retry, and its results
+// (findings, is_laravel) are DB data, not process metrics. The exception
+// is a find removal by re-analysis and the point content drain (T-187):
+// the event changes the lifetime retention state (disk), observability is mandatory.
 package analyzer
 
 import (
@@ -15,29 +15,29 @@ import (
 	"crawler/internal/metrics"
 )
 
-// analyzeSecondsBuckets — корзины длительности задачи анализа: RE2-матчинг
-// по ограниченному входу — микросекунды (T-069), пара операторов БД —
-// миллисекунды; корзины покрывают и аномалии (контент на пределе
-// лимитов, медленная БД).
+// analyzeSecondsBuckets is the analyze task duration buckets: RE2 matching
+// over a bounded input takes microseconds (T-069), a couple of DB
+// operators take milliseconds; the buckets also cover anomalies (content
+// at the limit bounds, a slow DB).
 var analyzeSecondsBuckets = []float64{0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5}
 
-// Metrics — приборы этапа анализа; строится NewMetrics из реестра
-// сервиса, nil — все методы no-op (изолированные сборки).
-// Потокобезопасен: доставки идут параллельно, приборы prometheus
-// синхронизированы.
+// Metrics holds the analyze stage instruments; NewMetrics builds it from
+// the service registry; nil — all methods are no-ops (isolated builds).
+// Thread-safe: deliveries run in parallel, the prometheus instruments
+// are synchronized.
 type Metrics struct {
 	tasks   prometheus.Counter  // crawler_stage_tasks_total{stage="analyze"}
 	seconds prometheus.Observer // crawler_stage_seconds{stage="analyze"}
-	// Снятия находки переанализом и точечный дренаж контента (T-187):
-	// события редки (волны смены правил), наблюдаемость — «механизм
-	// работает» и «сколько контента вернулось в чистку».
+	// Find removals by re-analysis and point content drains (T-187):
+	// the events are rare (rule change waves); observability covers "the
+	// mechanism works" and "how much content returned for cleanup".
 	unfound       prometheus.Counter // crawler_analyzer_laravel_unfound_total
 	unfoundRows   prometheus.Counter // crawler_analyzer_unfound_drained_rows_total
 	unfoundErrors prometheus.Counter // crawler_analyzer_unfound_drain_errors_total
 }
 
-// NewMetrics регистрирует приборы этапа в реестре reg (каррированные по
-// service и stage); nil — nil. Идемпотентен (T-076).
+// NewMetrics registers the stage instruments in the reg registry
+// (curried by service and stage); nil — nil. Idempotent (T-076).
 func NewMetrics(reg *metrics.Registry) *Metrics {
 	if reg == nil {
 		return nil
@@ -67,9 +67,9 @@ func NewMetrics(reg *metrics.Registry) *Metrics {
 	}
 }
 
-// Task — задача q:analyze обработана успешно (включая штатный отказ —
-// строки нет или она ушла из-под задачи): +1 задача этапа, длительность
-// в гистограмму.
+// Task — a q:analyze task was processed successfully (including an
+// orderly refusal — the row is gone or slipped out from under the task):
+// +1 stage task, the duration into the histogram.
 func (m *Metrics) Task(d time.Duration) {
 	if m == nil {
 		return
@@ -78,7 +78,7 @@ func (m *Metrics) Task(d time.Duration) {
 	m.seconds.Observe(d.Seconds())
 }
 
-// Unfound — снятие находки переанализом (T-187): событие перехода.
+// Unfound — a find removal by re-analysis (T-187): a transition event.
 func (m *Metrics) Unfound() {
 	if m == nil {
 		return
@@ -86,7 +86,7 @@ func (m *Metrics) Unfound() {
 	m.unfound.Inc()
 }
 
-// UnfoundDrain — строки, очищенные точечным дренажом (T-187).
+// UnfoundDrain — rows cleaned by the point drain (T-187).
 func (m *Metrics) UnfoundDrain(rows int64) {
 	if m == nil || rows <= 0 {
 		return
@@ -94,7 +94,7 @@ func (m *Metrics) UnfoundDrain(rows int64) {
 	m.unfoundRows.Add(float64(rows))
 }
 
-// UnfoundDrainError — точечный дренаж не выполнен (T-187).
+// UnfoundDrainError — the point drain did not happen (T-187).
 func (m *Metrics) UnfoundDrainError() {
 	if m == nil {
 		return

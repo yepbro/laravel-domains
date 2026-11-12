@@ -1,29 +1,31 @@
-// Стартовая синтетическая проба резолвера (T-107, закрытие находки DNS-12:
-// «fail-fast на мёртвом резолвере не работает»). Пул UDP-сокетов
-// подключается connect(2) без пакетов (T-034) — набор пула ловит только
-// кривой адрес/маршрут, но не мёртвый сервер: отказ проявляется первым
-// же боевым обменом (ECONNREFUSED/таймаут → temp_error), когда домены
-// уже едут по конвейеру. Проба закрывает дыру одним дешёвым вопросом
-// на старте dns-worker.
+// Startup synthetic probe of a resolver (T-107, closing the DNS-12 find:
+// "fail-fast on a dead resolver does not work"). The UDP socket pool
+// is connected via connect(2) without packets (T-034) — population
+// only catches a bad address/route, but not a dead server: the failure
+// shows up on the first production exchange (ECONNREFUSED/timeout →
+// temp_error), when domains are already moving down the pipeline. The
+// probe closes the gap with one cheap question at dns-worker startup.
 //
-// Вопрос — NS корня («.»): рекурсивный резолвер отвечает на него всегда
-// (кэш/хинты корня), внешний смысл вопроса не меняется десятилетиями.
-// Критерий жизни — любой ответ: RCODE (включая SERVFAIL) означает, что
-// сервер отвечает, и это не ошибка пробы; ошибкой считается только
-// транспортный отказ (в терминах контракта T-034 — error Exchange после
-// ретраев). Проба идёт в сами клиентов цепи напрямую, минуя лимитёр
-// T-035: служебный обмен не занимает слот параллелизма, не тратит токен
-// QPS и не разбавляет окно адаптива фиктивным успехом.
+// The question is the root NS ("."): a recursive resolver always answers
+// it (root cache/hints); the external meaning of the question has not
+// changed in decades. The liveness criterion is any response: an RCODE
+// (including SERVFAIL) means the server responds, and that is not a
+// probe error; only a transport failure counts as an error (in the
+// terms of the T-034 contract — an Exchange error after retries). The
+// probe goes to the chain clients directly, bypassing the T-035 limiter:
+// the service exchange takes no concurrency slot, spends no QPS token,
+// and does not dilute the adaptive window with a bogus success.
 //
-// Политика уровней (cmd/dns-worker): отвечает часть цепи — Warn по каждому
-// молчащему (конвейер дорабатывает переключением на резерв, но деградация
-// видна с первой строки лога); не отвечает никто — ошибка старта: воркер
-// без единого резолвера превращает каждый эпизод в temp_error (повтор
-// через temp_error_retry_after, T-031) — заметнее и дешевле упасть на
-// старте (systemd перезапустит с Restart=on-failure), чем тихо портить
-// статусами домены. Побочный эффект: изолированные окружения без
-// исходящего трафика обязаны держать пустой dns.fallback_resolvers
-// (dev-конфиг так и делает) — иначе проба резерва честно скажет Warn.
+// Level policy (cmd/dns-worker): part of the chain responds — a Warn for
+// each silent one (the pipeline keeps running by switching to the backup,
+// but the degradation is visible from the first log line); nobody
+// responds — a startup error: a worker without a single resolver turns
+// every episode into temp_error (retried after temp_error_retry_after,
+// T-031) — falling at startup (systemd restarts with Restart=on-failure)
+// is more visible and cheaper than silently poisoning domains with
+// statuses. Side effect: isolated environments without outbound traffic
+// must keep dns.fallback_resolvers empty (the dev config does just that),
+// otherwise the backup probe will honestly report Warn.
 
 package dnsclient
 
@@ -37,12 +39,13 @@ import (
 	"github.com/miekg/dns"
 )
 
-// probeQuestion — вопрос стартовой пробы: NS корня (см. комментарий пакета).
+// probeQuestion is the startup probe question: the root NS (see the package comment).
 var probeQuestion = Question{Name: ".", Type: dns.TypeNS}
 
-// Probe выполняет одну синтетическую пробу резолвера: nil — резолвер
-// отвечает (любой RCODE), ошибка — транспортный отказ. Ошибка отмены ctx
-// возвращается как есть (проба на shutdown — не приговор резолверу).
+// Probe performs a single synthetic probe of a resolver: nil means the
+// resolver responds (any RCODE), an error means a transport failure. A ctx
+// cancellation error is returned as is (a probe at shutdown does not
+// sentence the resolver).
 func Probe(ctx context.Context, r Resolver) error {
 	if r == nil {
 		return errors.New("dnsclient: Probe: резолвер не задан")
@@ -51,12 +54,13 @@ func Probe(ctx context.Context, r Resolver) error {
 	return err
 }
 
-// ProbeChain опрашивает стартовой пробой цепь резолверов (порядок — как
-// в цепи переключения: основной, затем резервы) и пишет результат каждого
-// в лог: успех — Info, отказ — Warn с причиной. Возвращает ошибку только
-// если не ответил никто (ошибка старта сервиса-носителя, см. комментарий
-// пакета) либо отменён ctx (возвращается как есть). Пустая цепь —
-// программная ошибка (конфиг гарантирует основной резолвер, ТЗ 5.10).
+// ProbeChain polls the resolver chain with the startup probe (the order
+// matches the failover chain: primary first, then backups) and logs the
+// result of each: success — Info, failure — Warn with the reason. It
+// returns an error only if nobody responded (a startup error of the
+// hosting service, see the package comment) or ctx is cancelled
+// (returned as is). An empty chain is a programming error (the config
+// guarantees a primary resolver, spec 5.10).
 func ProbeChain(ctx context.Context, targets []FallbackTarget, log *slog.Logger) error {
 	if len(targets) == 0 {
 		return errors.New("dnsclient: ProbeChain: цепь резолверов пуста")
@@ -72,7 +76,7 @@ func ProbeChain(ctx context.Context, targets []FallbackTarget, log *slog.Logger)
 			log.Info("стартовая проба резолвера: отвечает", "resolver", t.Addr)
 			continue
 		}
-		// Отмена ctx — не «все мертвы»: проба прерывается ошибкой отмены.
+		// A ctx cancellation is not "all dead": the probe aborts with that error.
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
 		}

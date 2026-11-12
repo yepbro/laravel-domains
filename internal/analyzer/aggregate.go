@@ -1,65 +1,68 @@
-// Package analyzer — анализ сохранённого контента по правилам Laravel
-// (ТЗ 5.8): пассивный, по уже скачанным страницам, cookies и заголовкам.
-// Потребление q:analyze и запись laravel_findings — T-071 (worker.go),
-// переанализ — T-074 (reanalyze.go).
+// Package analyzer analyzes saved content against the Laravel rules
+// (spec 5.8): passive, over already downloaded pages, cookies and headers.
+// Consuming q:analyze and writing laravel_findings — T-071 (worker.go),
+// re-analysis — T-074 (reanalyze.go).
 //
-// Этот файл — агрегация на уровне домена (T-072; ТЗ 5.8: «на уровне
-// домена — агрегат (максимальный score, объединённый диапазон, маска
-// субдоменов)», таблица laravel_domains — §6.1). Пересчёт выполняется в
-// транзакции воркера сразу после записи findings домена: каждое
-// зафиксированное состояние согласовано — findings и агрегат не
-// расходятся (ТЗ 3.4).
+// This file is the domain-level aggregation (T-072; spec 5.8: "at the
+// domain level — an aggregate (the maximum score, the union range, the
+// subdomain mask)", the laravel_domains table — §6.1). The recalculation
+// runs in the worker transaction right after the domain findings are
+// written: every committed state is consistent — findings and the
+// aggregate do not diverge (spec 3.4).
 //
-// Состав агрегата — по уверенным срабатываниям домена (laravel_findings
-// с is_laravel; §13.1: порог попадания в laravel_domains «score ≥ 0.6»
-// и есть определение уверенности, слабые срабатывания остаются только в
-// findings):
+// The aggregate is built from the domain's confident hits (the
+// laravel_findings with is_laravel; §13.1: the laravel_domains entry
+// threshold "score ≥ 0.6" is the definition of confidence; weak hits
+// remain only in findings):
 //
-//   - score — максимум: порога мог достичь только максимум, поэтому
-//     значение совпадает с максимумом по всем findings домена;
-//   - диапазон версий — объединение диапазонов уверенных срабатываний:
-//     нижняя граница — min(ver_min), верхняя — max(ver_max) (ТЗ 5.8
-//     «объединённый диапазон» — не пересечение: пересечение считает сам
-//     findings по правилам одной страницы). Сравнение — числовыми
-//     компонентами (rules.CompareVersions): текстовое MIN/MAX в SQL
-//     упорядочило бы «10» раньше «5.3». Граница NULL у любого срабатывания
-//     (нет границы или конфликт T-070) распространяется на домен:
-//     объединение с этой стороны неограничено; инверсия границ невозможна
-//     — у каждого срабатывания ver_min ≤ ver_max (T-070);
-//   - found_on_mask — биты субдоменов с is_laravel-срабатыванием (любого
-//     варианта — варианты одного субдомена схлопываются в бит), семантика
-//     model.DNSMask: бит № = subdomains.id, биты 0..62;
-//   - rules_version — версия набора, которым выполнен пересчёт: в
-//     переходный период переанализа (T-074) findings домена смешанных
-//     версий, строка перезаписывается каждой доставкой — после последнего
-//     обновления findings домена версия свежая;
-//   - updated_at — now() сервера БД: время транзакции (стиль record.go).
+//   - score — the maximum: only the maximum could reach the threshold, so
+//     the value equals the maximum over all the domain's findings;
+//   - the version range — the union of the confident hits' ranges: the
+//     lower bound is min(ver_min), the upper is max(ver_max) (spec 5.8
+//     "union range" — not the intersection: the intersection is computed
+//     by the findings themselves against the rules of one page). The
+//     comparison is numeric by components (rules.CompareVersions): a
+//     textual MIN/MAX in SQL would order "10" before "5.3". A NULL bound
+//     on any hit (no bound or a T-070 conflict) propagates to the domain:
+//     the union is unbounded on that side; a bound inversion is impossible
+//     — every hit has ver_min ≤ ver_max (T-070);
+//   - found_on_mask — the bits of subdomains with an is_laravel hit (any
+//     variant — the variants of one subdomain collapse into a bit), the
+//     model.DNSMask semantics: bit # = subdomains.id, bits 0..62;
+//   - rules_version — the version of the rule set the recalculation ran
+//     with: during the re-analysis transition period (T-074) the domain
+//     findings are of mixed versions, the row is rewritten by every
+//     delivery — after the last update of the domain findings the version
+//     is fresh;
+//   - updated_at — the DB server's now(): the transaction time (the record.go style).
 //
-// Домен без is_laravel-строк не попадает в laravel_domains (порог §13.1):
-// пересчёт удаляет существующую строку — прежние признаки в текущем
-// эпизоде не подтвердились (§3.5: хранится только последний результат).
-// Переходы наличия строки пишутся в append-only журнал laravel_history
-// (T-118, appeared/lost) — только по свежим эпизодам HTTP
-// (queue.Result.Fresh): переанализ (T-074) пересчитывает тот же
-// скачанный контент по новым правилам и фактом о сайте не является;
-// детали семантики — в комментарии aggregateDomain. Снятие находки
-// переанализом (не-fresh) — сигнал точечного дренажа контента домена
-// (T-187, content.DrainDomain): возвращаемое значение aggregateDomain.
+// A domain without is_laravel rows does not enter laravel_domains (the
+// §13.1 threshold): the recalculation deletes an existing row — the
+// earlier signs were not confirmed in the current episode (§3.5: only
+// the last result is kept). Row presence transitions are written to the
+// append-only laravel_history journal (T-118, appeared/lost) — only for
+// fresh HTTP episodes (queue.Result.Fresh): re-analysis (T-074)
+// recalculates the same downloaded content against new rules and is not
+// a fact about the site; the semantics details are in the
+// aggregateDomain comment. A find removal by re-analysis (non-fresh) is
+// the signal for the domain content point drain (T-187,
+// content.DrainDomain): the return value of aggregateDomain.
 //
-// Согласование параллельных доставок домена: воркер обрабатывает до
-// Concurrency доставок одновременно, инстансов может быть несколько
-// (ТЗ 4.2), а HTTP-этап публикует q:analyze пачкой по строкам домена.
-// Два пересчёта, читающие findings до фиксации друг друга, породили бы
-// агрегат без вклада соседней доставки (поздняя запись затёрла бы раннюю
-// — до следующей доставки домена). Поэтому пересчёт сначала берёт
-// pg_advisory_xact_lock по domain_id (глобально уникален — sequence
-// domain_id_seq, T-003): второй пересчёт домена ждёт фиксации первого и
-// читает уже полные findings. Advisory, а не блокировка строки domains:
-// воркер к этому моменту держит блокировку строки subdomain_results
-// (штамп T-071), и цепочка «штамп → domains» замкнулась бы в цикл с
-// транзакцией перепроверки T-058 (UPDATE domains → DELETE
-// subdomain_results); advisory-ключ этого класса берут только пересчёты
-// анализатора — циклов ожидания нет.
+// Reconciling parallel deliveries of a domain: the worker processes up
+// to Concurrency deliveries at once, there can be several instances
+// (spec 4.2), and the HTTP stage publishes q:analyze in a batch over a domain's rows.
+// Two recalculations reading the findings before each other's commit
+// would produce an aggregate without the neighbor delivery's contribution
+// (the later write would erase the earlier one — until the domain's next
+// delivery). Therefore the recalculation first takes a
+// pg_advisory_xact_lock on domain_id (globally unique — the
+// domain_id_seq sequence, T-003): a second recalculation of the domain
+// waits for the first one's commit and reads already complete findings.
+// An advisory lock, not a domains row lock: by that moment the worker
+// holds the subdomain_results row lock (the T-071 stamp), and the
+// "stamp → domains" chain would close into a cycle with the T-058
+// recheck transaction (UPDATE domains → DELETE subdomain_results);
+// only analyzer recalculations take an advisory key of this class — no wait cycles.
 package analyzer
 
 import (
@@ -72,26 +75,26 @@ import (
 	"crawler/internal/rules"
 )
 
-// SQL агрегации. Ключи — литералами типов (стиль worker.go); now() —
-// время транзакции сервера БД (record.go).
+// The aggregation SQL. Keys are type literals (the worker.go style);
+// now() is the DB server transaction time (record.go).
 var (
-	// aggregateLockSQL — сериализация пересчётов одного домена до конца
-	// транзакции (см. док-комментарий пакета). Транзакционная —
-	// освобождается фиксацией/откатом, отдельного unlock нет.
+	// aggregateLockSQL — serializes the recalculations of one domain until
+	// the end of the transaction (see the package doc comment). It is
+	// transaction-scoped — released by commit/rollback, there is no separate unlock.
 	aggregateLockSQL = "SELECT pg_advisory_xact_lock($1::int8)"
 
-	// aggregateSelectSQL — вход пересчёта: уверенные срабатывания домена.
-	// Читается в транзакции воркера — видит собственную запись findings
-	// этой доставки. Порядок — по PK (сортировка ключей листа партиции),
-	// детерминирован: равные в разной записи границы («9.19» и «9.19.0»)
-	// дают в агрегате первую.
+	// aggregateSelectSQL — the recalculation input: the domain's confident hits.
+	// Read in the worker transaction — it sees this delivery's own findings
+	// write. The order is by PK (the leaf partition key sort), deterministic:
+	// equal bounds written differently ("9.19" and "9.19.0") put the first
+	// one into the aggregate.
 	aggregateSelectSQL = "SELECT subdomain_id, score, ver_min, ver_max FROM laravel_findings " +
 		"WHERE zone_id = $1::int2 AND domain_id = $2::int8 AND is_laravel"
 
-	// aggregateUpsertSQL — запись агрегата: upsert по PK laravel_domains
-	// (§3.5 перезапись, §6.1): повторные доставки и переанализ
-	// перезаписывают строку начисто. ver_min/ver_max NULL — объединение
-	// неограничено с этой стороны (включая конфликт T-070).
+	// aggregateUpsertSQL — writing the aggregate: an upsert by the
+	// laravel_domains PK (§3.5 rewrite, §6.1): repeated deliveries and
+	// re-analysis rewrite the row from scratch. NULL ver_min/ver_max —
+	// the union is unbounded on that side (including a T-070 conflict).
 	aggregateUpsertSQL = "INSERT INTO laravel_domains (" +
 		"zone_id, domain_id, score, ver_min, ver_max, found_on_mask, rules_version, updated_at) " +
 		"VALUES ($1::int2, $2::int8, $3::float4, $4::text, $5::text, $6::int8, $7::int4, now()) " +
@@ -99,84 +102,87 @@ var (
 		"score = $3::float4, ver_min = $4::text, ver_max = $5::text, " +
 		"found_on_mask = $6::int8, rules_version = $7::int4, updated_at = now()"
 
-	// aggregateDeleteSQL — уверенных срабатываний нет: строки домена не
-	// существует (порог §13.1), существующая удаляется (§3.5). Отсутствие
-	// строки — не ошибка (DELETE 0).
+	// aggregateDeleteSQL — no confident hits: the domain row does not exist
+	// (the §13.1 threshold), an existing one is deleted (§3.5). A missing
+	// row is not an error (DELETE 0).
 	aggregateDeleteSQL = "DELETE FROM laravel_domains " +
 		"WHERE zone_id = $1::int2 AND domain_id = $2::int8"
 
-	// aggregateExistsSQL — была ли строка домена до пересчёта: переход
-	// appeared/lost — сравнение «было» и «стало» (T-118). По PK —
-	// индексный lookup; выполняется под advisory-блокировкой домена,
-	// параллельный пересчёт не вставит между проверкой и записью.
+	// aggregateExistsSQL — whether the domain row existed before the
+	// recalculation: the appeared/lost transition compares "before" and
+	// "after" (T-118). By PK — an index lookup; it runs under the domain's
+	// advisory lock, a parallel recalculation will not slip in between the check and the write.
 	aggregateExistsSQL = "SELECT EXISTS (" +
 		"SELECT 1 FROM laravel_domains WHERE zone_id = $1::int2 AND domain_id = $2::int8)"
 
-	// aggregateHistorySQL — журнал переходов appeared/lost (T-118,
-	// аналог laravel_histories larasites): append-only, changed_at —
-	// время транзакции (now() сервера БД). Пишется только при fresh —
-	// свежем эпизоде HTTP (queue.Result.Fresh): переанализ того же
-	// контента по новым правилам — не факт о сайте (см. док-комментарий
-	// пакета).
+	// aggregateHistorySQL — the appeared/lost transition journal (T-118,
+	// the larasites laravel_histories analog): append-only, changed_at is
+	// the transaction time (the DB server now()). Written only on fresh —
+	// a fresh HTTP episode (queue.Result.Fresh): re-analysis of the same
+	// content against new rules is not a fact about the site (see the
+	// package doc comment).
 	aggregateHistorySQL = "INSERT INTO laravel_history (zone_id, domain_id, appeared) " +
 		"VALUES ($1::int2, $2::int8, $3)"
 
-	// aggregateZoneLaravelSQL — дельта Laravel-счётчика зоны при
-	// переходе наличия строки laravel_domains (T-178, ТЗИ §6.5):
-	// выполняется в транзакции пересчёта — откат откатывает пару
-	// «строка + счётчик». Переходы считаются по факту (existed против
-	// результата), а не только по fresh: переанализ тоже меняет
-	// множество laravel_domains, реконсиляция (агрегат count(*)) считает
-	// строки независимо от их происхождения. RowsAffected != 1 — строки
-	// зоны нет (ручная правка справочника): молчаливый дрейф недопустим.
+	// aggregateZoneLaravelSQL — the delta of the zone Laravel counter on a
+	// laravel_domains row presence transition (T-178, the incremental-counters spec §6.5):
+	// it runs in the recalculation transaction — a rollback rolls back the
+	// "row + counter" pair. Transitions are counted by fact (existed vs
+	// the result), not only by fresh: re-analysis also changes the
+	// laravel_domains set, the reconciliation (the count(*) aggregate)
+	// counts rows regardless of their origin. RowsAffected != 1 — the
+	// zone row is gone (a manual reference-table edit): silent drift is unacceptable.
 	aggregateZoneLaravelSQL = "UPDATE zones " +
 		"SET domains_laravel = domains_laravel + $1::int8 WHERE id = $2::int2"
 
-	// aggregateCounterDeltaSQL — дельта кумулятива истории appeared/lost
-	// в crawler_counters (T-178, ТЗИ §6.5): upsert с наращиванием —
-	// строку создаёт первая реконсиляция (ТЗИ §5), инкремент до неё
-	// сам себе гарантирует строку (в отличие от render_pending T-175,
-	// чью строку бэкфиллит миграция 000015). Той же транзакцией, что и
-	// строка laravel_history: откат откатывает пару.
+	// aggregateCounterDeltaSQL — the delta of the appeared/lost history
+	// cumulative in crawler_counters (T-178, the incremental-counters spec §6.5):
+	// an upsert with accumulation — the first reconciliation creates the
+	// row (the incremental-counters spec §5), the increment before it
+	// guarantees the row itself (unlike render_pending T-175, whose row is
+	// backfilled by migration 000015). The same transaction as the
+	// laravel_history row: a rollback rolls back the pair.
 	aggregateCounterDeltaSQL = "INSERT INTO crawler_counters (name, value, updated_at) " +
 		"VALUES ($1, $2::int8, now()) " +
 		"ON CONFLICT (name) DO UPDATE " +
 		"SET value = crawler_counters.value + EXCLUDED.value, updated_at = now()"
 )
 
-// Имена строк кумулятивов истории (crawler_counters, T-178).
+// The row names of the history cumulatives (crawler_counters, T-178).
 const (
 	counterLaravelAppeared = "laravel_appeared_total"
 	counterLaravelLost     = "laravel_lost_total"
 )
 
-// aggregateDomain пересчитывает строку laravel_domains домена по его
-// findings. Вызывается из транзакции воркера (T-071) после записи
-// findings: SELECT видит записи этой транзакции, сбой любого шага
-// откатывает findings и агрегат вместе. version — версия набора доставки
-// (rules.Set.Version): ей штампуется пересчёт.
+// aggregateDomain recalculates the domain's laravel_domains row from
+// its findings. It is called from the worker transaction (T-071) after
+// the findings are written: the SELECT sees this transaction's writes,
+// a failure of any step rolls back the findings and the aggregate
+// together. version is the delivery rule set version (rules.Set.Version):
+// the recalculation is stamped with it.
 //
-// fresh — доставка свежего эпизода HTTP (queue.Result.Fresh: публикация
-// HTTP/рендер-этапа; переанализ T-074 — false). При смене наличия строки
-// laravel_domains и fresh в laravel_history пишется переход (T-118):
-// появление — appeared=true, исчезновение — false. Без fresh история не
-// пишется: пересчёт по новому набору правил и флап borderline-скоров
-// вокруг порога (T-116) — не события о сайте. Семантика привязана к
-// строке, а не к сайту: «ушёл при переанализе, вернулся свежим
-// эпизодом» оставит один appeared (появление) без парного lost —
-// плата за защиту от шума правил, тренд по множеству доменов верен.
+// fresh is the delivery of a fresh HTTP episode (queue.Result.Fresh: a
+// publication of the HTTP/render stage; re-analysis T-074 — false). When
+// the laravel_domains row presence changes and fresh, a transition is
+// written to laravel_history (T-118): appearance — appeared=true,
+// disappearance — false. Without fresh no history is written: a
+// recalculation under a new rule set and the flapping of borderline
+// scores around the threshold (T-116) are not site events. The
+// semantics are tied to the row, not the site: "left during re-analysis,
+// came back with a fresh episode" leaves a single appeared (appearance)
+// without a paired lost — the price of protection against rule noise; the trend over a set of domains is correct.
 //
-// Возврат unfound — сигнал снятия находки переанализом (T-187): строка
-// laravel_domains существовала и удалена доставкой БЕЗ fresh
-// (RowsAffected > 0 ∧ ¬fresh ∧ existed). Старые записи домена
-// subdomain_results такой доставкой не переписываются и возвращаются в
-// множество кандидатов retention позади курсора дренажа (T-185) —
-// вызывающий отвечает точечным дренажем контента домена
-// (content.DrainDomain, worker.drainUnfound). При fresh сигнал ложен:
-// свежий эпизод переписал строки отметками впереди курсора (T-058).
+// The unfound return is the signal of a find removal by re-analysis
+// (T-187): the laravel_domains row existed and was removed by a
+// delivery WITHOUT fresh (RowsAffected > 0 ∧ ¬fresh ∧ existed). The
+// domain's old subdomain_results rows are not rewritten by such a
+// delivery and return to the retention candidate set behind the drain
+// cursor (T-185) — the caller answers with the domain content point
+// drain (content.DrainDomain, worker.drainUnfound). On fresh the signal
+// is false: the fresh episode rewrote the rows with marks ahead of the cursor (T-058).
 func aggregateDomain(ctx context.Context, tx pgx.Tx, zoneID int16, domainID int64, version int32, fresh bool) (unfound bool, err error) {
-	// Сначала блокировка: пересчёты одного домена выстраиваются в очередь,
-	// второй читает findings после фиксации первого.
+	// The lock first: the recalculations of one domain line up in a queue,
+	// the second reads the findings after the first one's commit.
 	if _, err := tx.Exec(ctx, aggregateLockSQL, domainID); err != nil {
 		return false, fmt.Errorf("блокировка домена: %w", err)
 	}
@@ -191,9 +197,9 @@ func aggregateDomain(ctx context.Context, tx pgx.Tx, zoneID int16, domainID int6
 		return false, fmt.Errorf("чтение срабатываний: %w", err)
 	}
 
-	// Наличие строки до пересчёта — для перехода appeared/lost (T-118);
-	// под advisory-блокировкой конкурентный пересчёт не изменит его
-	// между проверкой и записью.
+	// The row presence before the recalculation — for the appeared/lost
+	// transition (T-118); under the advisory lock a concurrent recalculation
+	// will not change it between the check and the write.
 	var existed bool
 	if err := tx.QueryRow(ctx, aggregateExistsSQL, zoneID, domainID).Scan(&existed); err != nil {
 		return false, fmt.Errorf("чтение строки домена: %w", err)
@@ -204,18 +210,18 @@ func aggregateDomain(ctx context.Context, tx pgx.Tx, zoneID int16, domainID int6
 		if err != nil {
 			return false, fmt.Errorf("удаление строки домена: %w", err)
 		}
-		// Эквивалентные мутанты (T-M10): RowsAffected у DELETE — 0 или 1,
-		// а existed читается под advisory-блокировкой ДО удаления
-		// (laravel_domains пишут только пересчёты, они сериализованы) —
-		// existed=true ⟺ DELETE затронет 1: ослабление «> 0» до «>= 0» /
-		// «> -1» и вырезание existed различимы лишь при RowsAffected == 0
-		// ∧ existed — недостижимо. Строчная гранулярность гасит и убиваемое
-		// вырезание fresh — оно прикрыто TestAggregate_History (переанализ
-		// не пишет историю); trade-off §4 docs/mutation-testing.md.
+		// Equivalent mutants (T-M10): RowsAffected of a DELETE is 0 or 1,
+		// and existed is read under the advisory lock BEFORE the delete
+		// (only recalculations write laravel_domains, they are serialized) —
+		// existed=true ⟺ the DELETE will affect 1: weakening "> 0" to ">= 0" /
+		// "> -1" and cutting out existed are distinguishable only at
+		// RowsAffected == 0 ∧ existed — unreachable. Row granularity also kills
+		// the killable fresh cut — it is covered by TestAggregate_History
+		// (re-analysis writes no history); trade-off §4 docs/mutation-testing.md.
 		// mutator-disable-next-line expression/comparison, expression/remove, numbers/decrementer
 		if tag.RowsAffected() > 0 && existed {
-			// Строка была и исчезла — счётчик зоны −1 (переход наличия,
-			// T-178); при fresh — lost в журнале и кумулятиве (T-118).
+			// The row existed and disappeared — the zone counter −1 (a presence
+			// transition, T-178); on fresh — lost in the journal and the cumulative (T-118).
 			if err := aggregateShiftZoneLaravel(ctx, tx, zoneID, -1); err != nil {
 				return false, err
 			}
@@ -227,8 +233,8 @@ func aggregateDomain(ctx context.Context, tx pgx.Tx, zoneID int16, domainID int6
 					return false, err
 				}
 			}
-			// Сигнал T-187: переход без fresh — переанализ снял находку,
-			// не переписав записи домена (см. док-комментарий функции).
+			// The T-187 signal: a transition without fresh — re-analysis removed
+			// the find without rewriting the domain's rows (see the function doc comment).
 			return !fresh, nil
 		}
 		return false, nil
@@ -245,9 +251,9 @@ func aggregateDomain(ctx context.Context, tx pgx.Tx, zoneID int16, domainID int6
 	if existed {
 		return false, nil
 	}
-	// Строки не было и появилась — счётчик зоны +1 (переход наличия,
-	// T-178; независимо от fresh — переанализ тоже меняет множество);
-	// при fresh — appeared в журнале и кумулятиве (T-118).
+	// There was no row and one appeared — the zone counter +1 (a presence
+	// transition, T-178; regardless of fresh — re-analysis also changes the
+	// set); on fresh — appeared in the journal and the cumulative (T-118).
 	if err := aggregateShiftZoneLaravel(ctx, tx, zoneID, 1); err != nil {
 		return false, err
 	}
@@ -262,8 +268,8 @@ func aggregateDomain(ctx context.Context, tx pgx.Tx, zoneID int16, domainID int6
 	return false, nil
 }
 
-// aggregateShiftZoneLaravel — дельта zones.domains_laravel в транзакции
-// пересчёта (aggregateZoneLaravelSQL, T-178).
+// aggregateShiftZoneLaravel — the zones.domains_laravel delta in the
+// recalculation transaction (aggregateZoneLaravelSQL, T-178).
 func aggregateShiftZoneLaravel(ctx context.Context, tx pgx.Tx, zoneID int16, delta int64) error {
 	tag, err := tx.Exec(ctx, aggregateZoneLaravelSQL, delta, zoneID)
 	if err != nil {
@@ -275,8 +281,8 @@ func aggregateShiftZoneLaravel(ctx context.Context, tx pgx.Tx, zoneID int16, del
 	return nil
 }
 
-// aggregateBumpHistoryCounter — инкремент кумулятива appeared/lost в
-// транзакции пересчёта (aggregateCounterDeltaSQL, T-178).
+// aggregateBumpHistoryCounter — the increment of the appeared/lost
+// cumulative in the recalculation transaction (aggregateCounterDeltaSQL, T-178).
 func aggregateBumpHistoryCounter(ctx context.Context, tx pgx.Tx, name string, delta int64) error {
 	tag, err := tx.Exec(ctx, aggregateCounterDeltaSQL, name, delta)
 	if err != nil {
@@ -288,7 +294,7 @@ func aggregateBumpHistoryCounter(ctx context.Context, tx pgx.Tx, name string, de
 	return nil
 }
 
-// aggRow — уверенное срабатывание домена, вход пересчёта.
+// aggRow is a confident hit of the domain, the recalculation input.
 type aggRow struct {
 	subdomainID int16
 	score       float32
@@ -296,9 +302,9 @@ type aggRow struct {
 	verMax      *string
 }
 
-// domainAggregate — агрегат признаков Laravel по домену (ТЗ 5.8): поля
-// строки laravel_domains; findings — число учтённых срабатываний
-// (0 — строки домена нет).
+// domainAggregate is the aggregate of the domain's Laravel signs (spec
+// 5.8): the fields of the laravel_domains row; findings is the number
+// of counted hits (0 — no domain row).
 type domainAggregate struct {
 	score       float32
 	verMin      *string
@@ -307,11 +313,11 @@ type domainAggregate struct {
 	findings    int
 }
 
-// scanAggregate сводит уверенные срабатывания домена в агрегат:
-// максимальный score, объединённый диапазон версий и маска субдоменов
-// (решения — в док-комментарии пакета). Некорректный номер субдомена —
-// ошибка: биты маски 0..62 (model.DNSMask), молчаливо потерянный субдомен
-// исказил бы found_on_mask.
+// scanAggregate folds the domain's confident hits into the aggregate:
+// the maximum score, the union version range and the subdomain mask
+// (the decisions are in the package doc comment). A bad subdomain
+// number is an error: the mask bits are 0..62 (model.DNSMask), a silently
+// lost subdomain would corrupt found_on_mask.
 func scanAggregate(rows pgx.Rows) (domainAggregate, error) {
 	var (
 		agg                   domainAggregate
@@ -324,12 +330,12 @@ func scanAggregate(rows pgx.Rows) (domainAggregate, error) {
 		if err := rows.Scan(&r.subdomainID, &r.score, &r.verMin, &r.verMax); err != nil {
 			return domainAggregate{}, err
 		}
-		// Эквивалентный мутант (T-M10): «>» → «>=» отличается только
-		// переприсвоением равного score (значение и тип те же); ±0.0
-		// в данных этапа не возникает — score срабатываний считается
-		// ScoreRules как noisy-OR из весов [0, 1]. Вырезание guard'а
-		// «findings == 0» и «== -1» закрыты тестом (отрицательный
-		// мусорный score первой строки).
+		// An equivalent mutant (T-M10): ">" → ">=" differs only by
+		// reassigning an equal score (the value and type are the same); ±0.0
+		// does not arise in the stage data — the hit score is computed by
+		// ScoreRules as a noisy-OR of weights [0, 1]. Cutting the guard out:
+		// "findings == 0" and "== -1" are covered by the test (a negative
+		// junk score of the first row).
 		// mutator-disable-next-line expression/comparison
 		if agg.findings == 0 || r.score > agg.score {
 			agg.score = r.score
@@ -338,10 +344,10 @@ func scanAggregate(rows pgx.Rows) (domainAggregate, error) {
 		if err := agg.foundOnMask.Set(int(r.subdomainID)); err != nil {
 			return domainAggregate{}, fmt.Errorf("found_on_mask: %w", err)
 		}
-		// Границы: NULL (нет границы/конфликт) запоминается флагом —
-		// объединение неограничено с этой стороны; из известных границ
-		// берётся экстремум (min для нижней, max для верхней), равные в
-		// разной записи оставляют первую (порядок PK детерминирован).
+		// Bounds: a NULL (no bound/conflict) is remembered as a flag — the
+		// union is unbounded on that side; from the known bounds the
+		// extreme is taken (min for the lower, max for the upper); equal
+		// bounds written differently keep the first (the PK order is deterministic).
 		if r.verMin == nil {
 			unboundedMin = true
 		} else if !haveMin || rules.CompareVersions(*r.verMin, minStr) < 0 {
@@ -356,24 +362,24 @@ func scanAggregate(rows pgx.Rows) (domainAggregate, error) {
 	if err := rows.Err(); err != nil {
 		return domainAggregate{}, err
 	}
-	// Эквивалентные мутанты (T-M10): на пустом входе цикл не выполнялся
-	// ни разу — haveMin/haveMax и unbounded* ложны, хвост функции не
-	// меняет агрегат; ранний возврат и проваливание сквозь него дают
-	// одинаковый результат («== -1» и вырезание return — одна ветка).
+	// Equivalent mutants (T-M10): on empty input the loop never ran —
+	// haveMin/haveMax and unbounded* are false, the function tail does not
+	// change the aggregate; the early return and falling through it give
+	// the same result ("== -1" and cutting the return are one branch).
 	// mutator-disable-next-line numbers/decrementer, branch/if
 	if agg.findings == 0 {
 		return agg, nil
 	}
-	// Эквивалентный мутант (T-M10): «haveMin → true» различим только при
-	// haveMin=false ∧ unboundedMin=false — на непустом входе каждая строка
-	// выставляет хотя бы один из флагов, а пустой отсечён возвратом выше.
+	// An equivalent mutant (T-M10): "haveMin → true" is distinguishable only
+	// at haveMin=false ∧ unboundedMin=false — on non-empty input every row
+	// sets at least one of the flags, and empty input is cut off by the return above.
 	// mutator-disable-next-line expression/remove
 	if haveMin && !unboundedMin {
 		agg.verMin = &minStr
 	}
-	// Эквивалентный мутант (T-M10): симметрично verMin — «haveMax → true»
-	// различим только при haveMax=false ∧ unboundedMax=false, что на
-	// непустом входе недостижимо.
+	// An equivalent mutant (T-M10): symmetric to verMin — "haveMax → true"
+	// is distinguishable only at haveMax=false ∧ unboundedMax=false, which
+	// is unreachable on non-empty input.
 	// mutator-disable-next-line expression/remove
 	if haveMax && !unboundedMax {
 		agg.verMax = &maxStr

@@ -1,23 +1,23 @@
-// Пакет dnsclient — DNS-клиент этапа проверки доменов (ТЗ 5.4): обмен
-// с локальным Unbound поверх github.com/miekg/dns, собственный пул
-// UDP-сокетов, TCP-fallback при усечении ответа (TC=1, RFC 1035 §4.2.1)
-// и ретраи на таймаут/ошибку сети.
+// Package dnsclient is the DNS client of the domain check stage (spec 5.4):
+// exchanges with a local Unbound on top of github.com/miekg/dns, an own
+// pool of UDP sockets, TCP fallback on truncated responses (TC=1,
+// RFC 1035 §4.2.1), and retries on timeout/network error.
 //
-// Контракт результата принципиален для потребителя (T-036…T-039): RCODE —
-// не ошибка. NXDOMAIN, SERVFAIL, REFUSED и прочие коды — легальные ответы
-// сервера и возвращаются в Result.RCode без error; error — только сеть
-// (таймаут, обрыв, отказ транспорта) после исчерпания попыток. ТЗ 5.4
-// различает эти ветки явно: NXDOMAIN → not_delegated (RFC 8020),
-// SERVFAIL/таймаут после ретраев → temp_error.
+// The result contract matters to the consumer (T-036…T-039): an RCODE is
+// not an error. NXDOMAIN, SERVFAIL, REFUSED and other codes are legal
+// server responses returned in Result.RCode without an error; an error is
+// only the network (timeout, disconnect, transport refusal) after the
+// attempts are exhausted. Spec 5.4 separates the branches explicitly:
+// NXDOMAIN → not_delegated (RFC 8020), SERVFAIL/timeout after retries → temp_error.
 //
-// Записи возвращаются сырыми ([]dns.RR секций Answer/Ns): разворачивание
-// цепочек CNAME и выборка A/AAAA/CNAME/NS — задача потребителя (T-037,
-// ТЗ 5.4 п. 2); RecordsOf фильтрует по типу, не интерпретируя.
+// Records are returned raw (the []dns.RR of the Answer/Ns sections):
+// unwinding CNAME chains and picking A/AAAA/CNAME/NS is the consumer's
+// job (T-037, spec 5.4 item 2); RecordsOf filters by type without interpretation.
 //
-// Точка расширения T-035 (параллелизм/QPS, адаптивное снижение, отказ
-// AAAA) — интерфейс Resolver: лимитёр оборачивает Exchange декоратором,
-// не меняя контракт; пул сокетов сам по себе ограничивает число
-// одновременно висящих UDP-запросов размером UDPPoolSize.
+// The T-035 extension point (concurrency/QPS, adaptive load shedding,
+// AAAA refusal) is the Resolver interface: the limiter wraps Exchange
+// with a decorator without changing the contract; the socket pool by
+// itself bounds the number of in-flight UDP requests with UDPPoolSize.
 package dnsclient
 
 import (
@@ -34,82 +34,82 @@ import (
 	"crawler/internal/config"
 )
 
-// Значения по умолчанию. Таймауты посчитаны от локального Unbound
-// (ТЗ 5.4: рекурсивный, кэш 512–768 МБ): горячие ответы — микросекунды,
-// холодные упираются в апстрим-резолвер, 2 с на UDP-попытку хватает с
-// запасом; TCP-fallback реже и дороже (установка соединения) — 5 с.
+// Default values. The timeouts are computed for a local Unbound
+// (spec 5.4: recursive, 512–768 MB cache): hot answers take microseconds,
+// cold ones bottom out at the upstream resolver; 2s per UDP attempt is
+// enough with margin; the TCP fallback is rarer and costlier (connection setup) — 5s.
 const (
-	// DefaultTimeout — таймаут одной UDP-попытки (запрос + ожидание
-	// ответа, включая ожидание сокета из пула).
+	// DefaultTimeout is the timeout of one UDP attempt (the question plus
+	// waiting for the answer, including waiting for a socket from the pool).
 	DefaultTimeout = 2 * time.Second
-	// DefaultTCPTimeout — таймаут TCP-fallback: установка соединения,
-	// обмен, чтение усечённого ответа целиком.
+	// DefaultTCPTimeout is the TCP fallback timeout: connection setup,
+	// the exchange, reading the truncated response in full.
 	DefaultTCPTimeout = 5 * time.Second
-	// DefaultRetryDelay — пауза между попытками: даёт резолверу
-	// разгрести очередь/восстановиться, не разбирая ошибку немедленно.
+	// DefaultRetryDelay is the pause between attempts: it gives the resolver
+	// time to work off its queue/recover instead of diagnosing the error at once.
 	DefaultRetryDelay = 200 * time.Millisecond
 
-	// DefaultEDNS0UDPSize — advertised размер UDP-буфера в OPT RR
-	// (RFC 6891, EDNS0): 1232 байта — безопасный размер DNS flag day
-	// 2020 (влезает в транзитный MTU 1280 без фрагментации). Без OPT
-	// резолвер обязан укладываться в исторические 512 байт и режет
-	// всё крупнее до TC=1 — такой ответ в каждой попытке уходил бы в
-	// дорогой TCP-fallback (DNS-07).
+	// DefaultEDNS0UDPSize is the advertised UDP buffer size in the OPT RR
+	// (RFC 6891, EDNS0): 1232 bytes — the DNS flag day 2020 safe size (it fits
+	// into the transit MTU of 1280 without fragmentation). Without an OPT
+	// the resolver must fit the historical 512 bytes and truncates anything
+	// larger to TC=1 — such a response would go to the costly TCP fallback in
+	// every attempt (DNS-07).
 	DefaultEDNS0UDPSize = 1232
 )
 
-// DefaultRetries — повторы сверх первой попытки (итого до 3 обменов).
-// ТЗ число не задаёт; 3 попытки — политика повторов системы (доставка
-// очередей T-025, перепроверки temp_error T-031). Ограничение попыток
-// одного запроса и повторные эпизоды проверки (T-031) — разные уровни:
-// здесь гасим секундные сбои, там — устойчивые проблемы резолвера.
+// DefaultRetries is the retries beyond the first attempt (up to 3 exchanges total).
+// The spec sets no number; 3 attempts match the system retry policy (queue
+// delivery T-025, temp_error rechecks T-031). The per-request attempt cap
+// and repeated check episodes (T-031) are different levels: here we absorb
+// second-scale failures, there — persistent resolver problems.
 const DefaultRetries = 2
 
-// MaxRetries — верхняя граница ретраев: 10 попыток × 2 с = 20 с на
-// мёртвом резолвере; больше — работа для планировщика (T-031), а не
-// для одного запроса.
+// MaxRetries is the upper bound of retries: 10 attempts × 2s = 20s on a
+// dead resolver; more than that is a job for the scheduler (T-031), not
+// for a single request.
 const MaxRetries = 10
 
-// DefaultUDPPoolSize — размер пула UDP-сокетов по умолчанию. Равен
-// dns.concurrency из ТЗ 5.10 (2000): пул обязан вмещать плановый
-// параллелизм, иначе сам становится ограничителем ниже настроенного
-// (ждущие Get съедают таймаут попытки). 2000 файловых дескрипторов на
-// воркер — обычная величина для Linux (no_file в Docker ≥ 1M).
+// DefaultUDPPoolSize is the default UDP socket pool size. It equals
+// dns.concurrency from spec 5.10 (2000): the pool must hold the planned
+// concurrency, otherwise it becomes a limiter below the configured one
+// (waiting Get calls eat into the attempt timeout). 2000 file descriptors
+// per worker is a normal value for Linux (no_file in Docker ≥ 1M).
 const DefaultUDPPoolSize = 2000
 
-// Question — один DNS-вопрос (ТЗ 5.4 пп. 1–3: A, AAAA, CNAME, NS).
+// Question is one DNS question (spec 5.4 items 1–3: A, AAAA, CNAME, NS).
 type Question struct {
-	// Name — полное имя домена (апекс или субдомен) в punycode.
-	// Нормализация имени — зона ответственности потребителя (internal/idn,
-	// ТЗ 5.2); здесь имя только дополняется завершающей точкой.
+	// Name is the full domain name (apex or subdomain) in punycode.
+	// Name normalization is the consumer's responsibility (internal/idn,
+	// spec 5.2); here the name only gets the trailing dot appended.
 	Name string
-	// Type — тип записи (dns.TypeA, dns.TypeAAAA, dns.TypeCNAME,
-	// dns.TypeNS); один вопрос — один тип, смешанные запросы DNS
-	// не использует.
+	// Type is the record type (dns.TypeA, dns.TypeAAAA, dns.TypeCNAME,
+	// dns.TypeNS); one question — one type,
+	// DNS does not use mixed queries.
 	Type uint16
 }
 
-// validate проверяет вопрос до любых сетевых попыток: ошибка упаковки
-// детерминирована, гонять её по ретраям бессмысленно.
+// validate checks the question before any network attempts: a packing
+// error is deterministic, retrying it is pointless.
 func (q Question) validate() error {
 	if strings.TrimSpace(q.Name) == "" {
 		return errors.New("dnsclient: имя вопроса пусто")
 	}
-	// Признак рабочего типа — наличие RR-реализации в miekg/dns: у
-	// псевдотипов из TypeToString (None, Reserved) записей нет, как и у
-	// сервисных (AXFR/IXFR); заодно гарантируется разбор ответа.
+	// The sign of a working type is an RR implementation in miekg/dns:
+	// pseudo-types from TypeToString (None, Reserved) have no records, and
+	// neither do service ones (AXFR/IXFR); this also guarantees the response parses.
 	if dns.TypeToRR[q.Type] == nil {
 		return fmt.Errorf("dnsclient: неизвестный тип записи %d (ожидаются dns.TypeA/AAAA/CNAME/NS/…)", q.Type)
 	}
 	return nil
 }
 
-// RCode — код ответа сервера (RFC 1035 §4.1.1; расширенные коды —
-// числом). Часть Result, не ошибка: см. комментарий пакета.
+// RCode is a server response code (RFC 1035 §4.1.1; extended codes are
+// a number). Part of Result, not an error: see the package comment.
 type RCode int
 
-// Стандартные коды (младшие 4 бита заголовка). Значения совпадают с
-// константами dns.Rcode* miekg/dns.
+// Standard codes (the low 4 bits of the header). The values match the
+// dns.Rcode* constants of miekg/dns.
 const (
 	RCodeNOERROR  RCode = dns.RcodeSuccess
 	RCodeFORMERR  RCode = dns.RcodeFormatError
@@ -119,7 +119,7 @@ const (
 	RCodeREFUSED  RCode = dns.RcodeRefused
 )
 
-// String возвращает мнемонику кода (NOERROR, NXDOMAIN, …) либо RCODEn.
+// String returns the code mnemonic (NOERROR, NXDOMAIN, …) or RCODEn.
 func (r RCode) String() string {
 	if s, ok := dns.RcodeToString[int(r)]; ok {
 		return s
@@ -127,32 +127,32 @@ func (r RCode) String() string {
 	return fmt.Sprintf("RCODE%d", int(r))
 }
 
-// Result — итог одного Exchange: код ответа, сырые записи и метрики
-// обмена. Поля Answer/Ns переносятся из ответа как есть (владение
-// передаётся вызывающему).
+// Result is the outcome of one Exchange: the response code, raw records
+// and exchange metrics. The Answer/Ns fields are carried over from the
+// response as is (ownership passes to the caller).
 type Result struct {
-	// RCode — код ответа сервера (NOERROR у пустого ответа — NODATA,
-	// легальный итог «имя есть, записей этого типа нет»).
+	// RCode is the server response code (NOERROR with an empty answer is
+	// NODATA, the legal outcome of "the name exists, no records of this type").
 	RCode RCode
-	// Answer — секция answer: A/AAAA/CNAME/NS вперемешку с прочими
-	// (например, CNAME-цепочка тянется перед целевым A). Сырые записи —
-	// интерпретация (цепочки CNAME, wildcard-сравнение T-038) за
-	// потребителем.
+	// Answer is the answer section: A/AAAA/CNAME/NS mixed with everything
+	// else (for example, a CNAME chain comes before the target A). Raw
+	// records — interpretation (CNAME chains, wildcard matching T-038) is
+	// up to the consumer.
 	Answer []dns.RR
-	// Ns — секция authority (SOA при NXDOMAIN, NS делегирования при
-	// рефералах) — нужна потребителю T-036 («NS при необходимости»).
+	// Ns is the authority section (the SOA on NXDOMAIN, delegation NS on
+	// referrals) — needed by the T-036 consumer ("NS when necessary").
 	Ns []dns.RR
-	// Elapsed — время Exchange целиком: все попытки и паузы между ними.
+	// Elapsed is the whole Exchange time: all attempts and the pauses between them.
 	Elapsed time.Duration
-	// Attempts — число сетевых обменов (каждая UDP-попытка и каждый
-	// TCP-fallback считаются отдельно).
+	// Attempts is the number of network exchanges (each UDP attempt and
+	// each TCP fallback counts separately).
 	Attempts int
-	// TCP — итоговый ответ получен по TCP (сработал fallback по TC=1).
+	// TCP — the final answer arrived over TCP (the TC=1 fallback fired).
 	TCP bool
 }
 
-// RecordsOf возвращает записи секции answer указанного типа
-// (dns.TypeA, dns.TypeAAAA, …) — фильтр без интерпретации.
+// RecordsOf returns the records of the answer section of the given type
+// (dns.TypeA, dns.TypeAAAA, …) — a filter without interpretation.
 func (r *Result) RecordsOf(t uint16) []dns.RR {
 	var out []dns.RR
 	for _, rr := range r.Answer {
@@ -163,45 +163,46 @@ func (r *Result) RecordsOf(t uint16) []dns.RR {
 	return out
 }
 
-// Resolver — точка интеграции DNS-этапа: потребитель (dns-worker,
-// T-036…T-039) зависит от интерфейса, а не от реализации. T-035
-// оборачивает его декоратором с лимитами параллелизма/QPS и фильтром
-// AAAA (dns.ipv6), не меняя контракт.
+// Resolver is the integration point of the DNS stage: the consumer
+// (dns-worker, T-036…T-039) depends on the interface, not the
+// implementation. T-035 wraps it in a decorator with concurrency/QPS
+// limits and an AAAA filter (dns.ipv6), without changing the contract.
 type Resolver interface {
-	// Exchange выполняет вопрос к резолверу. Ошибка — только сеть
-	// (после исчерпания ретраев) или отмена ctx; RCODE — в Result.
+	// Exchange performs the question against the resolver. An error means
+	// only the network (after retries are exhausted) or ctx cancellation;
+	// the RCODE is in Result.
 	Exchange(ctx context.Context, q Question) (*Result, error)
 }
 
 // compile-time check: *Client — Resolver.
 var _ Resolver = (*Client)(nil)
 
-// Options — параметры клиента. Нулевые значения заменяются дефолтами
-// (withDefaults); Addr обязателен.
+// Options holds the client parameters. Zero values are replaced with the
+// defaults (withDefaults); Addr is required.
 type Options struct {
-	// Addr — адрес резолвера host:port (первый из dns.resolvers —
-	// локальный Unbound, ТЗ 5.4). Один клиент — один резолвер:
-	// публичные fallback-резолверы (dns.fallback_resolvers) — цепочка
-	// FallbackResolver выше транспорта (fallback.go, T-107).
+	// Addr is the resolver address host:port (the first of dns.resolvers —
+	// the local Unbound, spec 5.4). One client — one resolver: the public
+	// fallback resolvers (dns.fallback_resolvers) are the FallbackResolver
+	// chain above the transport (fallback.go, T-107).
 	Addr string
-	// Timeout — таймаут одной UDP-попытки. По умолчанию 2s.
+	// Timeout is the timeout of one UDP attempt. Defaults to 2s.
 	Timeout time.Duration
-	// TCPTimeout — таймаут TCP-fallback (соединение + обмен).
-	// По умолчанию 5s.
+	// TCPTimeout is the TCP fallback timeout (connection + exchange).
+	// Defaults to 5s.
 	TCPTimeout time.Duration
-	// Retries — повторы сверх первой попытки при таймауте/ошибке сети.
-	// По умолчанию 2 (итого до 3 обменов); 0/отрицательное — тоже
-	// дефолт: режима «без ретраев» нет (ТЗ 5.4 ретраи требует).
+	// Retries are the retries beyond the first attempt on timeout/network error.
+	// Defaults to 2 (up to 3 exchanges total); 0/negative means the default
+	// too: there is no "no retries" mode (spec 5.4 requires retries).
 	Retries int
-	// RetryDelay — пауза между попытками. По умолчанию 200ms.
+	// RetryDelay is the pause between attempts. Defaults to 200ms.
 	RetryDelay time.Duration
-	// UDPPoolSize — размер пула UDP-сокетов (см. DefaultUDPPoolSize).
+	// UDPPoolSize is the UDP socket pool size (see DefaultUDPPoolSize).
 	UDPPoolSize int
 }
 
-// NewOptions собирает параметры из секции dns конфигурации (T-006):
-// адрес — первый резолвер (клиент работает с одним сервером — Unbound);
-// таймауты/ретраи/пул — собственные поля секции.
+// NewOptions assembles the parameters from the dns section of the config (T-006):
+// the address is the first resolver (the client works with one server — Unbound);
+// timeouts/retries/pool are the section's own fields.
 func NewOptions(cfg config.DNS) Options {
 	addr := ""
 	if len(cfg.Resolvers) > 0 {
@@ -217,10 +218,10 @@ func NewOptions(cfg config.DNS) Options {
 	}
 }
 
-// withDefaults заменяет нулевые и отрицательные значения дефолтами
-// (репо-стиль db.Options: «0 — значение по умолчанию»). Отдельного
-// режима «без ретраев» нет: ТЗ 5.4 ретраи требует, минимум — один
-// повтор; «без паузы» аналогично не нужен.
+// withDefaults replaces zero and negative values with the defaults
+// (the db.Options repo style: "0 means the default value"). There is no
+// separate "no retries" mode: spec 5.4 requires retries, the minimum is
+// one retry; a "no pause" mode is not needed either.
 func (o Options) withDefaults() Options {
 	if o.Timeout <= 0 {
 		o.Timeout = DefaultTimeout
@@ -240,9 +241,9 @@ func (o Options) withDefaults() Options {
 	return o
 }
 
-// validate проверяет значения после подстановки дефолтов. Проверки
-// таймаутов/пула избыточны (withDefaults уже нормализовала) и здесь не
-// повторяются; ловится то, что нормализация не исправляет осмысленно.
+// validate checks the values after the defaults are applied. The
+// timeout/pool checks are redundant (withDefaults has already normalized)
+// and are not repeated here; only what normalization cannot sensibly fix is caught.
 func (o Options) validate() error {
 	if _, _, err := net.SplitHostPort(o.Addr); err != nil {
 		return fmt.Errorf("dnsclient: адрес резолвера: %w", err)
@@ -250,40 +251,40 @@ func (o Options) validate() error {
 	if o.Retries > MaxRetries {
 		return fmt.Errorf("dnsclient: retries %d: максимум %d", o.Retries, MaxRetries)
 	}
-	// Защита от прямого конструирования мимо NewClient.
+	// Guard against direct construction bypassing NewClient.
 	if o.UDPPoolSize < 1 {
 		return fmt.Errorf("dnsclient: udp_pool_size %d: ожидается ≥ 1", o.UDPPoolSize)
 	}
 	return nil
 }
 
-// exchangeFunc — транспорт одного сетевого обмена: отправить сообщение,
-// прочитать ответ (tcp — TCP-fallback по TC=1). Отдельный тип — шов
-// подмены транспорта в юнит-тестах без сети; продакшн-реализация —
-// exchangeNet: пул UDP-сокетов и TCP-соединение на запрос.
+// exchangeFunc is the transport of one network exchange: send the message,
+// read the response (tcp — the TC=1 TCP fallback). A separate type is the
+// seam for swapping the transport in unit tests without a network; the
+// production implementation is exchangeNet: the UDP socket pool and a TCP connection per request.
 type exchangeFunc func(ctx context.Context, m *dns.Msg, tcp bool) (*dns.Msg, error)
 
-// Client — DNS-клиент над одним резолвером. Безопасен для одновременного
-// использования из горутин (пул сокетов — единственное разделяемое
-// состояние); лимит одновременных Exchange — размер пула: ждущие
-// организуются в очередь Get.
+// Client is a DNS client over one resolver. Safe for concurrent use from
+// goroutines (the socket pool is the only shared state); the cap on
+// concurrent Exchange calls is the pool size: waiters line up in the Get
+// queue.
 type Client struct {
 	opt      Options
 	pool     *UDPPool
-	bufs     sync.Pool // *[]byte: UDP-буферы чтения (64 КиБ) между попытками
+	bufs     sync.Pool // *[]byte: UDP read buffers (64 KiB) carried between attempts
 	exchange exchangeFunc
 }
 
-// NewClient создаёт клиента и заранее открывает пул UDP-сокетов.
-// fail-fast старта ограничен самим адресом: ошибка набора (кривой адрес,
-// порт, маршрут) — ошибка создания пула на старте; доступность самого
-// резолвера UDP connect не проверяет (пакетов не шлёт) — мёртвый сервер
-// проявляется в первом же обмене (ECONNREFUSED/таймаут → temp_error)
-// и виден в метриках лимитёра (crawler_dns_limit_timeout_ratio, DNS-06),
-// а не ошибкой старта. Стартовая синтетическая проба резолвера и
-// переключение на dns.fallback_resolvers — декораторы выше клиента
-// (probe.go, fallback.go, T-107).
-// Контекст ограничивает открытие сокетов.
+// NewClient creates the client and opens the UDP socket pool in advance.
+// The startup fail-fast is limited to the address itself: a dial error (a
+// bad address, port, route) is a pool creation error at startup; resolver
+// availability is not checked by the UDP connect (it sends no packets) — a
+// dead server shows up in the very first exchange (ECONNREFUSED/timeout →
+// temp_error) and is visible in the limiter metrics
+// (crawler_dns_limit_timeout_ratio, DNS-06), not as a startup error. The
+// startup synthetic probe of the resolver and the switch to
+// dns.fallback_resolvers are decorators above the client (probe.go,
+// fallback.go, T-107). The context bounds the socket opening.
 func NewClient(ctx context.Context, opts Options) (*Client, error) {
 	opts = opts.withDefaults()
 	if err := opts.validate(); err != nil {
@@ -302,31 +303,31 @@ func NewClient(ctx context.Context, opts Options) (*Client, error) {
 	return c, nil
 }
 
-// Close закрывает пул сокетов; клиент после этого непригоден.
+// Close closes the socket pool; the client is unusable afterwards.
 func (c *Client) Close() error { return c.pool.Close() }
 
-// Exchange выполняет вопрос к резолверу с ретраями (ТЗ 5.4).
+// Exchange performs the question against the resolver with retries (spec 5.4).
 //
-// Попытка = UDP-обмен; ответ с TC=1 повторяется по TCP (свой таймаут)
-// тем же вопросом — TCP-ошибка делает попытку неудачной целиком, цикл
-// начинается заново с UDP. Ошибки сети — до Retries повторов с паузой
-// RetryDelay; отмена ctx проверяется до попытки, после каждой неудачи и
-// в паузе (между попытками Exchange прерывается сразу).
+// An attempt = a UDP exchange; a TC=1 response is retried over TCP (its
+// own timeout) with the same question — a TCP error fails the whole
+// attempt and the cycle starts over with UDP. Network errors are retried
+// up to Retries times with a RetryDelay pause; ctx cancellation is checked
+// before an attempt, after each failure and during the pause (between attempts Exchange aborts at once).
 func (c *Client) Exchange(ctx context.Context, q Question) (*Result, error) {
 	if err := q.validate(); err != nil {
 		return nil, err
 	}
 	msg := new(dns.Msg)
-	msg.SetQuestion(dns.Fqdn(q.Name), q.Type) // Id и RD выставляет SetQuestion
-	// EDNS0 (RFC 6891): OPT RR с advertised размером DefaultEDNS0UDPSize —
-	// резолвер отвечает до 1232 байт по UDP, длинные CNAME-цепочки и
-	// большие RRset не уходят на TC=1/TCP-fallback в каждой попытке.
-	// DO не выставляется: DNSSEC не запрашивается (ТЗ 5.4 не требует);
-	// OPT придёт в Additional ответа и на разбор Answer/Ns не влияет.
+	msg.SetQuestion(dns.Fqdn(q.Name), q.Type) // SetQuestion sets Id and RD
+	// EDNS0 (RFC 6891): an OPT RR with the advertised DefaultEDNS0UDPSize —
+	// the resolver answers up to 1232 bytes over UDP, so long CNAME chains
+	// and large RRsets do not go to TC=1/TCP fallback on every attempt.
+	// DO is not set: DNSSEC is not requested (spec 5.4 does not require it);
+	// the OPT comes in the response Additional and does not affect Answer/Ns parsing.
 	msg.SetEdns0(DefaultEDNS0UDPSize, false)
 	if _, err := msg.Pack(); err != nil {
-		// Ошибка упаковки детерминирована (длина/символы имени) —
-		// ретраи не изменят исход.
+		// The packing error is deterministic (name length/characters) —
+		// retries will not change the outcome.
 		return nil, fmt.Errorf("dnsclient: некорректное имя вопроса %q: %w", q.Name, err)
 	}
 
@@ -351,8 +352,8 @@ func (c *Client) Exchange(ctx context.Context, q Question) (*Result, error) {
 		}
 		lastErr = err
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			// Отмена/дедлайн самого вызова — не сетевая неудача,
-			// ретраев не полагается.
+			// A cancellation/deadline of the call itself is not a network failure,
+			// no retries are due.
 			return nil, ctxErr
 		}
 		if attempt >= c.opt.Retries {
@@ -372,7 +373,7 @@ func (c *Client) Exchange(ctx context.Context, q Question) (*Result, error) {
 		qTypeName(q.Type), q.Name, attempts, lastErr)
 }
 
-// qTypeName возвращает мнемонику типа записи (A, AAAA, …).
+// qTypeName returns the record type mnemonic (A, AAAA, …).
 func qTypeName(t uint16) string {
 	if s, ok := dns.TypeToString[t]; ok {
 		return s
@@ -380,17 +381,18 @@ func qTypeName(t uint16) string {
 	return fmt.Sprintf("TYPE%d", t)
 }
 
-// attempt — одна попытка цикла ретраев: UDP-обмен и, при усечении
-// ответа (TC=1), повтор того же вопроса по TCP. Возвращает ответ,
-// число сетевых обменов (1 или 2), признак «итог по TCP» и ошибку.
+// attempt is one attempt of the retry loop: a UDP exchange and, if the
+// response is truncated (TC=1), a retry of the same question over TCP.
+// Returns the response, the number of network exchanges (1 or 2), the
+// "final over TCP" flag and the error.
 func (c *Client) attempt(ctx context.Context, msg *dns.Msg) (*dns.Msg, int, bool, error) {
 	actx, cancel := context.WithTimeout(ctx, c.opt.Timeout)
 	defer cancel()
 
-	// Копия с новым Id на каждый обмен: у сокета один запрос в полёте,
-	// но сокеты возвращаются в пул, и поздний ответ прежнего обмена
-	// может прийти в начале следующего — свежий Id отбрасывает его
-	// на проверке в udpExchange.
+	// A copy with a fresh Id per exchange: a socket has one request in
+	// flight, but sockets return to the pool and a late response of the
+	// previous exchange may arrive at the start of the next one — the fresh
+	// Id drops it in the udpExchange check.
 	m := *msg
 	m.Id = dns.Id()
 	resp, err := c.exchange(actx, &m, false)
@@ -401,10 +403,10 @@ func (c *Client) attempt(ctx context.Context, msg *dns.Msg) (*dns.Msg, int, bool
 		return resp, 1, false, nil
 	}
 
-	// TC=1: сервер усёк ответ (UDP-датаграмма мала) — тот же вопрос
-	// по TCP, где ограничения на размер датаграммы нет (RFC 1035
-	// §4.2.2). Таймаут свой: TCP-fallback дороже (установка соединения,
-	// передача полного ответа).
+	// TC=1: the server truncated the response (the UDP datagram is too
+	// small) — the same question over TCP, where there is no datagram size
+	// limit (RFC 1035 §4.2.2). Its own timeout: the TCP fallback is costlier
+	// (connection setup, transferring the full response).
 	tctx, tcancel := context.WithTimeout(ctx, c.opt.TCPTimeout)
 	defer tcancel()
 	m.Id = dns.Id()
@@ -415,8 +417,8 @@ func (c *Client) attempt(ctx context.Context, msg *dns.Msg) (*dns.Msg, int, bool
 	return tresp, 2, true, nil
 }
 
-// exchangeNet — сетевой транспорт: UDP через пул сокетов, TCP —
-// соединение на запрос.
+// exchangeNet is the network transport: UDP via the socket pool, TCP —
+// a connection per request.
 func (c *Client) exchangeNet(ctx context.Context, m *dns.Msg, tcp bool) (*dns.Msg, error) {
 	if tcp {
 		return c.tcpExchange(ctx, m)
@@ -424,12 +426,12 @@ func (c *Client) exchangeNet(ctx context.Context, m *dns.Msg, tcp bool) (*dns.Ms
 	return c.udpExchange(ctx, m)
 }
 
-// udpExchange выполняет обмен через пул подключённых UDP-сокетов.
-// Дедлайн попытки берётся из ctx (таймаут уже учтён в attempt).
+// udpExchange performs the exchange via the pool of connected UDP sockets.
+// The attempt deadline is taken from ctx (the timeout is already accounted for in attempt).
 //
-// Ответы с чужим Id и не разбираемые датаграммы пропускаются: сокет
-// переиспользуется, и после таймаута на нём может лежать поздний ответ
-// прежнего запроса; чтение продолжается до дедлайна собственного.
+// Responses with a foreign Id and unparseable datagrams are skipped: the
+// socket is reused and after a timeout a late response of the previous
+// request may sit on it; reading continues until the own deadline.
 func (c *Client) udpExchange(ctx context.Context, m *dns.Msg) (*dns.Msg, error) {
 	conn, err := c.pool.Get(ctx)
 	if err != nil {
@@ -443,7 +445,7 @@ func (c *Client) udpExchange(ctx context.Context, m *dns.Msg) (*dns.Msg, error) 
 	}
 	dl, ok := ctx.Deadline()
 	if !ok {
-		dl = time.Now().Add(c.opt.Timeout) // страховка: транспорт обязан быть ограничен по времени
+		dl = time.Now().Add(c.opt.Timeout) // guard: the transport must be time-bounded
 	}
 	_ = conn.SetDeadline(dl)
 	if _, err := conn.Write(wire); err != nil {
@@ -460,24 +462,24 @@ func (c *Client) udpExchange(ctx context.Context, m *dns.Msg) (*dns.Msg, error) 
 		}
 		resp := new(dns.Msg)
 		if err := resp.Unpack(buf[:n]); err != nil {
-			continue // битый датаграмм — ждём свой ответ до дедлайна
+			continue // a broken datagram — keep waiting for the own response until the deadline
 		}
 		if resp.Id != m.Id {
-			continue // поздний ответ прежнего обмена на этом сокете
+			continue // a late response of the previous exchange on this socket
 		}
 		return resp, nil
 	}
 }
 
-// tcpExchange — TCP-fallback: соединение на запрос, без пула.
+// tcpExchange is the TCP fallback: a connection per request, no pool.
 //
-// Обоснование: TC=1 — редкое событие (обычные ответы A/AAAA/CNAME/NS
-// помещаются в 512-байтовый датаграмм), держать постоянный пул
-// TCP-соединений ради редкой ветки — постоянные издержки (keepalive,
-// переустановка после idle-таймаута резолвера) без выигрыша.
-// Стоимость установки соединения к локальному Unbound — доли
-// миллисекунды; свежее соединение к тому же не таит состояния,
-// оставшегося от чужих запросов.
+// Rationale: TC=1 is a rare event (regular A/AAAA/CNAME/NS answers fit
+// into a 512-byte datagram), so keeping a permanent pool of TCP
+// connections for a rare branch is a constant cost (keepalive,
+// re-establishing after the resolver idle timeout) with no gain.
+// The cost of establishing a connection to the local Unbound is
+// fractions of a millisecond; a fresh connection also carries no state
+// left over from foreign requests.
 func (c *Client) tcpExchange(ctx context.Context, m *dns.Msg) (*dns.Msg, error) {
 	var d net.Dialer
 	conn, err := d.DialContext(ctx, "tcp", c.opt.Addr)
@@ -502,10 +504,11 @@ func (c *Client) tcpExchange(ctx context.Context, m *dns.Msg) (*dns.Msg, error) 
 	return resp, nil
 }
 
-// IsTimeout сообщает, вызвана ли ошибка Exchange таймаутом (дедлайн
-// попытки, ожидание сокета из пула), а не отказом сети/протокола.
-// Различение нужно адаптивному снижению нагрузки T-035 (ТЗ 5.4: доля
-// таймаутов) и диагностике потребителя (T-036: SERVFAIL/таймаут).
+// IsTimeout reports whether an Exchange error was caused by a timeout (an
+// attempt deadline, waiting for a socket from the pool) rather than a
+// network/protocol refusal. The distinction is needed by the T-035
+// adaptive load shedding (spec 5.4: the timeout share) and consumer
+// diagnostics (T-036: SERVFAIL/timeout).
 func IsTimeout(err error) bool {
 	if err == nil {
 		return false

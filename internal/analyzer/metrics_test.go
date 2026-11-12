@@ -1,7 +1,7 @@
-// Юнит-тесты приборов этапа анализа (T-077, ТЗ 5.9): nil-безопасность,
-// экспорт значений через Gather (счётчик задач и гистограмма
-// длительностей), инкременты в типовом пути processDelivery — на фейках
-// пула, хранилища и набора правил из worker_test.go.
+// Unit tests of the analyze stage instruments (T-077, spec 5.9):
+// nil safety, value export via Gather (the task counter and the
+// duration histogram), increments along the typical processDelivery
+// path — on the pool, store and rule set fakes from worker_test.go.
 package analyzer
 
 import (
@@ -15,8 +15,8 @@ import (
 	"crawler/internal/metrics"
 )
 
-// anMetricValue — значение серии метрики name, все метки labels совпадают
-// (для гистограммы — счётчик наблюдений). Серия не найдена — −1.
+// anMetricValue is the value of the name metric series with all the
+// labels matching (for a histogram — the observation count). No series found — −1.
 func anMetricValue(t *testing.T, g prometheus.Gatherer, name string, labels map[string]string) float64 {
 	t.Helper()
 	families, err := g.Gather()
@@ -60,7 +60,7 @@ func TestMetricsNilSafe(t *testing.T) {
 		t.Fatal("NewMetrics(nil) != nil — изолированные сборки без реестра")
 	}
 	var m *Metrics
-	m.Task(time.Millisecond) // no-op, не паникует
+	m.Task(time.Millisecond) // a no-op, does not panic
 }
 
 func TestMetricsTask(t *testing.T) {
@@ -77,8 +77,8 @@ func TestMetricsTask(t *testing.T) {
 	if got := anMetricValue(t, reg, "crawler_stage_seconds", stage); got != 2 {
 		t.Errorf("crawler_stage_seconds (count) = %v, want 2", got)
 	}
-	// Этап не имеет своих счётчиков ошибок/статусов (пассивный анализ):
-	// одноимённые метрики других этапов в этом реестре не появляются.
+	// The stage has no error/status counters of its own (passive analysis):
+	// same-named metrics of other stages must not appear in this registry.
 	for _, name := range []string{"crawler_stage_errors_total", "crawler_domain_status_total"} {
 		if got := anMetricValue(t, reg, name, nil); got != -1 {
 			t.Errorf("%s = %v, want серия отсутствует (не этап-источник)", name, got)
@@ -86,8 +86,8 @@ func TestMetricsTask(t *testing.T) {
 	}
 }
 
-// TestMetricsProcessDelivery — прибор инкрементируется типовым путём:
-// доставка q:analyze → анализ → Task (до XACK).
+// TestMetricsProcessDelivery — the instrument is incremented the typical way:
+// a q:analyze delivery → analysis → Task (before the XACK).
 func TestMetricsProcessDelivery(t *testing.T) {
 	reg := metrics.New("analyzer")
 	f := newANFixture(t, anSet(7), Options{Metrics: reg})
@@ -108,9 +108,9 @@ func TestMetricsProcessDelivery(t *testing.T) {
 	}
 }
 
-// TestMetricsUnfound — приборы снятия находки переанализом (T-187):
-// событие, срезанные строки и ошибки дренажа — счётчики растут
-// независимо (nil-приёмник — no-op).
+// TestMetricsUnfound — the find removal by re-analysis instruments (T-187):
+// the event, the drained rows and the drain errors — the counters grow
+// independently (a nil receiver is a no-op).
 func TestMetricsUnfound(t *testing.T) {
 	var nilMetrics *Metrics
 	nilMetrics.Unfound()
@@ -121,7 +121,7 @@ func TestMetricsUnfound(t *testing.T) {
 	m := NewMetrics(reg)
 	m.Unfound()
 	m.UnfoundDrain(5)
-	m.UnfoundDrain(0) // нулевой итог значения не меняет
+	m.UnfoundDrain(0) // a zero total does not change the value
 	m.UnfoundDrainError()
 
 	if got := anMetricValue(t, reg, "crawler_analyzer_laravel_unfound_total", nil); got != 1 {
@@ -135,11 +135,11 @@ func TestMetricsUnfound(t *testing.T) {
 	}
 }
 
-// TestMetricsBuckets — корзины гистограммы длительностей зарегистрированы
-// ровно заданным списком (литерал — пин против мутантов ±1/сдвигов
-// элементов analyzeSecondsBuckets, T-M10). Prometheus-клиент не отдаёт
-// +Inf в GetBucket — тест дописывает его сам, сравнивая полный список
-// границ.
+// TestMetricsBuckets — the duration histogram buckets are registered
+// exactly as the given list (the literal is a pin against ±1 mutants and
+// element shifts of analyzeSecondsBuckets, T-M10). The Prometheus client
+// does not return +Inf in GetBucket — the test appends it itself,
+// comparing the full list of bounds.
 func TestMetricsBuckets(t *testing.T) {
 	reg := metrics.New("analyzer")
 	NewMetrics(reg)
@@ -155,8 +155,8 @@ func TestMetricsBuckets(t *testing.T) {
 		}
 		for _, m := range mf.GetMetric() {
 			buckets := m.GetHistogram().GetBucket()
-			// +Inf живёт в sample_count, dto-корзины его не содержат —
-			// дописываем сами для полного сравнения границ.
+			// +Inf lives in sample_count, the dto buckets do not contain it —
+			// we append it ourselves for a full comparison of the bounds.
 			got := make([]float64, 0, len(buckets)+1)
 			for _, b := range buckets {
 				got = append(got, b.GetUpperBound())

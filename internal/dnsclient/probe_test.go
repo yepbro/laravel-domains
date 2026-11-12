@@ -1,7 +1,8 @@
-// Тесты стартовой синтетической пробы резолвера (T-107): критерий жизни
-// (любой RCODE), вопрос пробы, уровни лога ProbeChain (Warn по молчащим
-// при живой цепи, ошибка только когда мертвы все), отмена ctx и защита
-// от пустой цепи. Лог перехватывается записывающим slog-хендлером.
+// Tests of the resolver startup synthetic probe (T-107): the liveness
+// criterion (any RCODE), the probe question, the ProbeChain log levels
+// (a Warn for silent ones while the chain is alive, an error only when
+// all are dead), ctx cancellation, and the empty chain guard. The log is
+// intercepted by a recording slog handler.
 
 package dnsclient
 
@@ -16,7 +17,7 @@ import (
 	"github.com/miekg/dns"
 )
 
-// probeRecorder — записывающий slog-хендлер: уровни и сообщения записей.
+// probeRecorder is a recording slog handler: record levels and messages.
 type probeRecorder struct {
 	mu      sync.Mutex
 	records []slog.Record
@@ -34,7 +35,7 @@ func (h *probeRecorder) Handle(_ context.Context, r slog.Record) error {
 func (h *probeRecorder) WithAttrs([]slog.Attr) slog.Handler { return h }
 func (h *probeRecorder) WithGroup(string) slog.Handler      { return h }
 
-// entries — снимок записей (уровень, сообщение).
+// entries is a snapshot of the records (level, message).
 func (h *probeRecorder) entries() []struct {
 	level   slog.Level
 	message string
@@ -66,8 +67,8 @@ func (h *probeRecorder) entries() []struct {
 
 // --- Probe -------------------------------------------------------------------
 
-// TestProbeAliveOnAnyRCode — критерий жизни — любой ответ: NOERROR и
-// SERVFAIL одинаково «резолвер отвечает» (RCODE — не ошибка пробы).
+// TestProbeAliveOnAnyRCode — the liveness criterion is any response: NOERROR
+// and SERVFAIL alike mean "the resolver responds" (an RCODE is not a probe error).
 func TestProbeAliveOnAnyRCode(t *testing.T) {
 	for _, rcode := range []RCode{RCodeNOERROR, RCodeSERVFAIL, RCodeNXDOMAIN} {
 		t.Run(rcode.String(), func(t *testing.T) {
@@ -79,8 +80,8 @@ func TestProbeAliveOnAnyRCode(t *testing.T) {
 	}
 }
 
-// TestProbeDeadOnTransportError — транспортный отказ (после ретраев
-// нижнего клиента) — провал пробы, причина оборачивается.
+// TestProbeDeadOnTransportError — a transport failure (after the retries of
+// the lower client) fails the probe, the cause is wrapped.
 func TestProbeDeadOnTransportError(t *testing.T) {
 	sentinel := errors.New("udp: connection refused")
 	if err := Probe(context.Background(), &fbFake{err: sentinel}); !errors.Is(err, sentinel) {
@@ -88,8 +89,8 @@ func TestProbeDeadOnTransportError(t *testing.T) {
 	}
 }
 
-// TestProbeQuestionIsRootNS — проба задаёт простой известный вопрос:
-// NS корня; рекурсивный резолвер отвечает на него всегда (кэш/хинты).
+// TestProbeQuestionIsRootNS — the probe asks one simple well-known
+// question: the root NS; a recursive resolver always answers it (cache/hints).
 func TestProbeQuestionIsRootNS(t *testing.T) {
 	var got Question
 	r := &fbFake{fn: func(_ context.Context, q Question) (*Result, error) {
@@ -104,7 +105,7 @@ func TestProbeQuestionIsRootNS(t *testing.T) {
 	}
 }
 
-// TestProbeNilResolver — защита от программной ошибки.
+// TestProbeNilResolver — a guard against a programming error.
 func TestProbeNilResolver(t *testing.T) {
 	if err := Probe(context.Background(), nil); err == nil {
 		t.Fatal("nil-резолвер: ожидается ошибка")
@@ -113,7 +114,7 @@ func TestProbeNilResolver(t *testing.T) {
 
 // --- ProbeChain --------------------------------------------------------------
 
-// TestProbeChainAllAlive — все отвечают: ошибки нет, каждая цель — Info.
+// TestProbeChainAllAlive — everyone answers: no error, every target is Info.
 func TestProbeChainAllAlive(t *testing.T) {
 	rec := &probeRecorder{}
 	log := slog.New(rec)
@@ -135,8 +136,8 @@ func TestProbeChainAllAlive(t *testing.T) {
 	}
 }
 
-// TestProbeChainPrimaryDeadReserveAlive — провал локального при живом
-// резерве — Warn (конвейер работает переключением), ошибки старта нет.
+// TestProbeChainPrimaryDeadReserveAlive — the local one failing while the
+// backup is alive is a Warn (the pipeline works via switching), no startup error.
 func TestProbeChainPrimaryDeadReserveAlive(t *testing.T) {
 	rec := &probeRecorder{}
 	log := slog.New(rec)
@@ -163,8 +164,8 @@ func TestProbeChainPrimaryDeadReserveAlive(t *testing.T) {
 	}
 }
 
-// TestProbeChainPrimaryAliveReserveDead — мёртвый резерв при живом
-// локальном — тоже Warn (потерянная избыточность), не ошибка старта.
+// TestProbeChainPrimaryAliveReserveDead — a dead backup while the local one
+// is alive is also a Warn (lost redundancy), not a startup error.
 func TestProbeChainPrimaryAliveReserveDead(t *testing.T) {
 	rec := &probeRecorder{}
 	log := slog.New(rec)
@@ -182,8 +183,8 @@ func TestProbeChainPrimaryAliveReserveDead(t *testing.T) {
 	}
 }
 
-// TestProbeChainAllDead — не отвечает никто: ошибка старта со списком
-// адресов цепи (fail-fast, DNS-12/T-107).
+// TestProbeChainAllDead — nobody responds: a startup error listing the
+// chain addresses (fail-fast, DNS-12/T-107).
 func TestProbeChainAllDead(t *testing.T) {
 	targets := []FallbackTarget{
 		{Addr: "127.0.0.1:53", Resolver: &fbFake{err: errors.New("down")}},
@@ -200,15 +201,15 @@ func TestProbeChainAllDead(t *testing.T) {
 	}
 }
 
-// TestProbeChainEmpty — пустая цепь — программная ошибка (конфиг
-// гарантирует основной резолвер, ТЗ 5.10).
+// TestProbeChainEmpty — an empty chain is a programming error (the config
+// guarantees a primary resolver, spec 5.10).
 func TestProbeChainEmpty(t *testing.T) {
 	if err := ProbeChain(context.Background(), nil, nil); err == nil {
 		t.Fatal("пустая цепь: ожидается ошибка")
 	}
 }
 
-// TestProbeChainNilLog — nil-логгер — не паника (записи подавлены).
+// TestProbeChainNilLog — a nil logger is not a panic (records are dropped).
 func TestProbeChainNilLog(t *testing.T) {
 	targets := []FallbackTarget{{Addr: "127.0.0.1:53", Resolver: &fbFake{}}}
 	if err := ProbeChain(context.Background(), targets, nil); err != nil {
@@ -216,8 +217,8 @@ func TestProbeChainNilLog(t *testing.T) {
 	}
 }
 
-// TestProbeChainCancelled — отмена ctx среди пробы — ошибка отмены,
-// а не «все мертвы» (проба на shutdown не приговор резолверам).
+// TestProbeChainCancelled — a ctx cancellation mid-probe is the
+// cancellation error, not "all dead" (a probe at shutdown does not sentence resolvers).
 func TestProbeChainCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	dead := &fbFake{fn: func(ctx context.Context, q Question) (*Result, error) {

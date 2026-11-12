@@ -1,51 +1,53 @@
-// Package analyzer — этап анализа Laravel (T-071; ТЗ 5.8 «Анализатор
-// Laravel», §7 «analyzer → laravel_findings / laravel_domains», §13.1).
+// Package analyzer is the Laravel analysis stage (T-071; spec 5.8 "Laravel
+// analyzer", §7 "analyzer → laravel_findings / laravel_domains", §13.1).
 //
-// Воркер потребляет q:analyze (сообщение Result — ключ строки
-// subdomain_results: домен, субдомен, вариант; формат T-024; публикуют
-// HTTP-этап T-058 после записи результата и render-worker T-067 после
-// замены контента на итоговый DOM). Анализ пассивный (ТЗ 5.8): только уже
-// скачанный контент, cookies и заголовки — новых запросов к сайтам нет.
-// Обработка одной доставки:
+// The worker consumes q:analyze (a Result message is the key of a
+// subdomain_results row: domain, subdomain, variant; the T-024 format;
+// published by the HTTP stage T-058 after writing the result and by the
+// render worker T-067 after replacing the content with the final DOM).
+// The analysis is passive (spec 5.8): only already downloaded content,
+// cookies and headers — no new requests to sites.
+// Processing one delivery:
 //
-//	SELECT строки (headers/cookies jsonb, content_hash — ТЗ 4.2: сообщение
-//	несёт только идентификаторы, данные читаются из БД; после рендера
-//	заголовки/cookies — данные итоговой навигации, T-067) → контент из
-//	ContentStore по content_hash (нет хэша или контента — анализ по
-//	заголовкам и кукам; HTML/DOM — материал целей html/meta, T-069)
-//	→ Set.EvaluateCtx с DefaultLimits: снапшот набора правил берётся на
-//	  каждую доставку (Reloader.Set; SIGHUP меняет набор без рестарта —
-//	  подписка на смену не нужна, следующая доставка видит свежий)
-//	→ ОДНА транзакция (ТЗ 3.4): UPDATE subdomain_results.rules_version —
-//	  штамп «строка проанализирована набором версии N» (переанализ T-074
-//	  находит записи с устаревшей версией; T-067 ставит NULL при смене
-//	  контента) с охраной актуальности: content_hash IS NOT DISTINCT FROM
-//	  прочитанного (строку перезаписал другой эпизод — перепроверка
-//	  DELETE+INSERT T-058, рендер T-067), версия отлична от текущей
-//	  (повторная доставка уже проштампованной строки — no-op, T-204) и
-//	  домен не deleted (§8/§13.1); 0 строк — строка ушла из-под задачи:
-//	  успех без записи (стиль renderworker), у нового эпизода свои
-//	  публикация и анализ; RETURNING checked_at — декремент корзины
-//	  хвостов reanalyze: (T-204) тем же шагом транзакции
-//	→ запись laravel_findings по этому же ключу: ВСЕ срабатывания любого
-//	  правила независимо от порога, is_laravel = score ≥ порога
-//	  (§13.1/ТЗ 5.8); нет срабатываний — строка не пишется, существующая
-//	  удаляется (§3.5: история не хранится, переанализ перезаписывает
-//	  результат начисто)
-//	→ XACK (Processing, T-025: подтверждение только после записи в БД).
+//	SELECT of the row (headers/cookies jsonb, content_hash — spec 4.2: the
+//	message carries only identifiers, the data is read from the DB; after
+//	a render the headers/cookies are the final navigation data, T-067) →
+//	content from the ContentStore by content_hash (no hash or content —
+//	analysis by headers and cookies; HTML/DOM is the material of the
+//	html/meta targets, T-069) → Set.EvaluateCtx with DefaultLimits: a
+//	  rule set snapshot is taken per delivery (Reloader.Set; SIGHUP
+//	  changes the set without a restart — no change subscription is needed,
+//	  the next delivery sees the fresh one) → ONE transaction (spec 3.4):
+//	UPDATE subdomain_results.rules_version — the stamp "the row was
+//	  analyzed by the rule set version N" (re-analysis T-074 finds rows
+//	  with a stale version; T-067 sets NULL on content change) with
+//	  freshness guards: content_hash IS NOT DISTINCT FROM the read value
+//	  (another episode rewrote the row — the T-058 recheck DELETE+INSERT,
+//	  the T-067 render), the version differs from the current one
+//	  (a repeated delivery of an already stamped row is a no-op, T-204) and
+//	  the domain is not deleted (§8/§13.1); 0 rows — the row slipped
+//	  out from under the task: success without a write (the renderworker
+//	  style), the new episode has its own publication and analysis;
+//	  RETURNING checked_at — the reanalyze tail bucket decrement (T-204)
+//	  in the same transaction step → writing laravel_findings by the
+//	  same key: ALL hits of any rule regardless of the threshold,
+//	  is_laravel = score ≥ the threshold (§13.1/spec 5.8); no hits — the
+//	  row is not written, an existing one is deleted (§3.5: no history is
+//	  kept, re-analysis rewrites the result from scratch) → XACK
+//	  (Processing, T-025: the acknowledgment only after the DB write).
 //
-// Идемпотентность повторной доставки (ТЗ 3.4): upsert по PK
-// laravel_findings и повторный штамп rules_version тем же набором —
-// состояние не меняется; сбой между шагами откатывает транзакцию целиком,
-// повторная доставка проходит заново.
+// Idempotency of a repeated delivery (spec 3.4): an upsert by the
+// laravel_findings PK and a repeated rules_version stamp by the same
+// set do not change the state; a failure between the steps rolls back
+// the whole transaction, and the repeated delivery runs again.
 //
-// Агрегация на уровне домена — T-072 (aggregate.go): той же транзакцией,
-// сразу после findings, пересчитывается строка laravel_domains (§6.1:
-// максимальный score, объединённый диапазон версий, found_on_mask,
-// rules_version; ТЗ 5.8 «на уровне домена — агрегат»). Снятие находки
-// переанализом (не-fresh) после фиксации запускает точечный дренаж
-// контента домена (T-187, drainUnfound → content.DrainDomain): записи
-// домена вернулись в кандидаты retention позади курсора дренажа (T-185).
+// Domain-level aggregation — T-072 (aggregate.go): in the same
+// transaction, right after the findings, the laravel_domains row is
+// recalculated (§6.1: the maximum score, the union version range,
+// found_on_mask, rules_version; spec 5.8 "at the domain level — an
+// aggregate"). A find removal by re-analysis (non-fresh) after the
+// commit starts the domain content point drain (T-187, drainUnfound →
+// content.DrainDomain): the domain's rows returned to the retention candidates behind the drain cursor (T-185).
 package analyzer
 
 import (
@@ -68,40 +70,41 @@ import (
 	"crawler/internal/rules"
 )
 
-// SQL этапа. Коды схемы — литералами, а не данными (стиль record.go
-// T-058); ключи строки — литералами типов. Ведущие колонки PK —
-// партиционирование LIST по zone_id и субпартиционирование HASH (T-005)
-// режут поиск до листа.
+// Stage SQL. Schema codes are literals, not data (the record.go style,
+// T-058); row keys are type literals. The leading PK columns — LIST
+// partitioning by zone_id with HASH subpartitioning (T-005) — cut the
+// search down to the leaf.
 var (
-	// analyzeSelectSQL — вход анализа: заголовки и cookies итогового
-	// ответа (после рендера — итоговой навигации, T-067/T-058 — единый
-	// jsonb-контракт) и ссылка на контент (HTML/DOM).
+	// analyzeSelectSQL — the analysis input: the headers and cookies of
+	// the final response (after a render — the final navigation,
+	// T-067/T-058 — one jsonb contract) and the content reference (HTML/DOM).
 	analyzeSelectSQL = "SELECT headers, cookies, content_hash FROM subdomain_results " +
 		"WHERE zone_id = $1::int2 AND domain_id = $2::int8 " +
 		"AND subdomain_id = $3::int2 AND variant = $4::int2"
 
-	// analyzeMarkSQL — штамп rules_version первой командой транзакции:
-	// блокирует строку и решает судьбу записи (стиль recordDomainSQL
-	// T-058). Охрана content_hash IS NOT DISTINCT FROM $6 —
-	// оптимистическая (как renderUpdateSQL T-067): строка перезаписывается,
-	// только пока её контент тот же, что прочитан (NULL сравнивается
-	// корректно — «контента нет» легально, T-056). Охрана актуальности
-	// версии rules_version IS DISTINCT FROM $5 (T-204): штамп ставится
-	// только устаревшим строкам — NULL («никогда не анализировалась»)
-	// и старой версии набора (дренаж смены правил T-074); уже
-	// проштампованная текущей версией строка не затрагивается (no-op:
-	// та же версия × тот же контент ⇒ детерминированно те же findings,
-	// повторная доставка перезаписывала бы их байт-в-байт) — до T-204
-	// повторный штамп выполнялся и давал ложный декремент корзине хвостов
-	// reanalyze: (RETURNING ниже): у повторных доставок (републикации
-	// тика, XAUTOCLAIM) нет парного инкремента записи. Охрана «домен не
-	// deleted» — §8/§13.1: удалённому домену результат не записывается,
-	// оставшиеся строки и findings вычистит фоновая очистка (T-020).
-	// RETURNING r.checked_at (T-204) — час корзины хвостов для декремента
-	// (analyzeReanalyzeConsumeSQL): час ЭПИЗОДА строки, как у инкрементов
-	// записи/рендера; пустой результат (pgx.ErrNoRows) — охраны отсекли
-	// (строки нет, контент сменился, домен удалён, версия уже актуальна):
-	// успех без записи (стиль renderworker).
+	// analyzeMarkSQL — the rules_version stamp as the transaction's first
+	// command: it locks the row and decides the write's fate (the
+	// recordDomainSQL T-058 style). The content_hash IS NOT DISTINCT
+	// FROM $6 guard is optimistic (like renderUpdateSQL T-067): the row is
+	// rewritten only while its content is the same as what was read (NULL
+	// compares correctly — "no content" is legal, T-056). The freshness
+	// guard rules_version IS DISTINCT FROM $5 (T-204): the stamp is put
+	// only on stale rows — NULL ("never analyzed") and an old rule set
+	// version (the T-074 rule change drain); a row already stamped with
+	// the current version is not touched (a no-op: the same version ×
+	// the same content ⇒ deterministically the same findings; a repeated
+	// delivery would rewrite them byte-for-byte) — before T-204 a
+	// repeated stamp ran and gave a false decrement to the tail bucket
+	// reanalyze: (the RETURNING below): repeated deliveries (tick
+	// republications, XAUTOCLAIM) have no paired write increment. The
+	// "domain is not deleted" guard — §8/§13.1: no result is written for a
+	// deleted domain, the leftover rows and findings will be cleaned by
+	// the background cleanup (T-020). RETURNING r.checked_at (T-204) is
+	// the tail bucket hour for the decrement (analyzeReanalyzeConsumeSQL):
+	// the hour of the row's EPISODE, like the write/render increments; an
+	// empty result (pgx.ErrNoRows) means the guards cut it off (no row,
+	// the content changed, the domain is deleted, the version is already
+	// current): success without a write (the renderworker style).
 	analyzeMarkSQL = "UPDATE subdomain_results AS r SET rules_version = $5::int4 " +
 		"WHERE r.zone_id = $1::int2 AND r.domain_id = $2::int8 " +
 		"AND r.subdomain_id = $3::int2 AND r.variant = $4::int2 " +
@@ -111,37 +114,37 @@ var (
 			"AND d.id = r.domain_id AND d.status = %d)", int16(model.StatusDeleted)) +
 		" RETURNING r.checked_at"
 
-	// analyzeReanalyzeConsumeSQL — декремент корзины неанализированных
-	// хвостов crawler_counters['reanalyze:YYYY-MM-DD"T"HH24'] (T-204) в
-	// транзакции штампа: −1 на переведённую устаревшей→текущей строку;
-	// $1 — checked_at строки из RETURNING analyzeMarkSQL, час корзины
-	// вычисляет БД (date_trunc) — тот же ключ, что у инкрементов записи
-	// результата (record.go, час now() = checked_at строк) и замены
-	// контента рендером (renderworker, час эпизода из RETURNING). Guard
-	// тикового прохода (reanalyzeGuardSQL) суммирует корзины старше
-	// текущего часа: опубликованный и проштампованный хвост возвращает
-	// корзине ноль, следующий тик не вычитывает окно. Штампы строк СТАРОЙ
-	// версии (дренаж смены правил, републикации тика) декрементируют без
-	// парного инкремента — отрицательный дрейф до прохода реконсиляции
-	// (FILTER-позиции prev/cur агрегата окна, monitor): держит guard
-	// закрытым на время дренажа — у тика там своя работа пересекается
-	// только дублями, семантика потоковая (семейство T-202/T-203).
-	// Upsert-паттерн record.go; порядок блокировок — единственная строка
-	// счётчика транзакции, после зон/скаляров агрегации: общий с проходом
-	// реконсиляции (reanalyze: после retry_mature:, перед rendered:) —
-	// без циклов.
+	// analyzeReanalyzeConsumeSQL — the decrement of the unanalyzed tails
+	// bucket crawler_counters['reanalyze:YYYY-MM-DD"T"HH24'] (T-204) in
+	// the stamp transaction: −1 per row moved stale→current; $1 is the
+	// row's checked_at from RETURNING analyzeMarkSQL, the bucket hour is
+	// computed by the DB (date_trunc) — the same key as the write
+	// increments (record.go, the hour of now() = the rows' checked_at) and
+	// the render content replacement (renderworker, the episode hour from
+	// the RETURNING). The tick pass guard (reanalyzeGuardSQL) sums the
+	// buckets older than the current hour: a published and stamped tail
+	// returns the bucket to zero, the next tick does not re-read the
+	// window. Stamps of OLD-version rows (the rule change drain, tick
+	// republications) decrement without a paired increment — a negative
+	// drift until the reconciliation pass (the prev/cur FILTER positions
+	// of the window aggregate, monitor): it keeps the guard closed during
+	// the drain — the tick's own work there overlaps only with duplicates,
+	// streaming semantics (the T-202/T-203 family). The record.go upsert
+	// pattern; the lock order is the transaction's single counter row,
+	// after the zones/aggregation scalars: shared with the reconciliation
+	// pass (reanalyze: after retry_mature:, before rendered:) — no cycles.
 	analyzeReanalyzeConsumeSQL = "INSERT INTO crawler_counters (name, value, updated_at) " +
 		"VALUES ('reanalyze:' || to_char(date_trunc('hour', $1::timestamptz), 'YYYY-MM-DD\"T\"HH24'), $2::int8, now()) " +
 		"ON CONFLICT (name) DO UPDATE " +
 		"SET value = crawler_counters.value + EXCLUDED.value, updated_at = now()"
 
-	// findingUpsertSQL — запись срабатываний: все правила независимо от
-	// порога (§13.1), is_laravel отделяет уверенные срабатывания от слабых.
-	// Upsert по PK: повторная доставка и переанализ перезаписывают строку
-	// (§3.5 — только последний результат). ver_min/ver_max NULL при
-	// отсутствии границы и при конфликте диапазонов (T-070: неопределённый
-	// диапазон — обе границы пустые); signals — jsonb-текст, приводится на
-	// сервере (стиль record.go: bytea в jsonb PostgreSQL не приводит).
+	// findingUpsertSQL — writing the hits: all rules regardless of the
+	// threshold (§13.1), is_laravel separates confident hits from weak ones.
+	// An upsert by PK: a repeated delivery and re-analysis rewrite the
+	// row (§3.5 — only the last result). NULL ver_min/ver_max when there
+	// is no bound and on a range conflict (T-070: an undefined range — both
+	// bounds are empty); signals is jsonb text, cast on the server (the
+	// record.go style: PostgreSQL does not cast bytea into jsonb).
 	findingUpsertSQL = "INSERT INTO laravel_findings (" +
 		"zone_id, domain_id, subdomain_id, variant, " +
 		"score, ver_min, ver_max, signals, is_laravel, rules_version) " +
@@ -151,109 +154,109 @@ var (
 		"score = $5::float4, ver_min = $6::text, ver_max = $7::text, " +
 		"signals = $8::jsonb, is_laravel = $9::bool, rules_version = $10::int4"
 
-	// findingDeleteSQL — ни одно правило не сработало: строка не пишется,
-	// существующая (прошлый анализ находил признаки) удаляется — §3.5
-	// перезапись: результат текущего эпизода «признаков нет».
+	// findingDeleteSQL — no rule hit: the row is not written, an existing
+	// one (a past analysis found signs) is deleted — §3.5 rewrite: the
+	// result of the current episode "no signs".
 	findingDeleteSQL = "DELETE FROM laravel_findings " +
 		"WHERE zone_id = $1::int2 AND domain_id = $2::int8 " +
 		"AND subdomain_id = $3::int2 AND variant = $4::int2"
 )
 
-// AnalyzerDB — пул для чтения строки результата и записи findings:
-// db.DB с транзакциями (стиль httpworker.RecordDB, renderworker.RenderDB).
-// Штамп и findings идут одной транзакцией (ТЗ 3.4); *pgxpool.Pool
-// удовлетворяет интерфейсу.
+// AnalyzerDB is a pool for reading the result row and writing findings:
+// a db.DB with transactions (the httpworker.RecordDB,
+// renderworker.RenderDB style). The stamp and the findings go in one
+// transaction (spec 3.4); *pgxpool.Pool satisfies the interface.
 type AnalyzerDB interface {
 	db.DB
 	Begin(ctx context.Context) (pgx.Tx, error)
 }
 
-// ContentGetter — шов хранилища контента (ТЗ 5.7): чтение HTML/DOM для
-// матчинга. Узкое подмножество контракта content.ContentStore (этапу
-// нужен только Get); удовлетворяется *content.PackStore (T-042).
+// ContentGetter is the content store seam (spec 5.7): reading HTML/DOM
+// for matching. A narrow subset of the content.ContentStore contract
+// (the stage needs only Get); satisfied by *content.PackStore (T-042).
 type ContentGetter interface {
 	Get(ctx context.Context, hash content.Hash) ([]byte, error)
 }
 
-// SetSource — текущий снапшот набора правил (ТЗ 5.8: перезагрузка по
-// SIGHUP без перезапуска). Удовлетворяется *rules.Reloader (T-068);
-// каждая доставка берёт актуальный набор — подписка на смену не нужна.
-// nil-снапшот (у Reloader не бывает) — доставка пропускается с Warn,
-// строка остаётся без штампа и вернётся переанализом (T-074).
+// SetSource is the current rule set snapshot (spec 5.8: reload on
+// SIGHUP without a restart). Satisfied by *rules.Reloader (T-068);
+// every delivery takes the current set — no change subscription is needed.
+// A nil snapshot (a Reloader never has one) skips the delivery with a
+// Warn, the row stays unstamped and will come back via re-analysis (T-074).
 type SetSource interface {
 	Set() *rules.Set
 }
 
-// Дефолты воркера.
+// Worker defaults.
 const (
-	// DefaultGroup — группа потребителей q:analyze (ТЗ 4.2: consumer
-	// groups масштабируют воркеров горизонтально).
+	// DefaultGroup is the q:analyze consumer group (spec 4.2: consumer
+	// groups scale the workers horizontally).
 	DefaultGroup = "analyzer"
 
-	// DefaultConcurrency — доставок q:analyze в работе одновременно.
-	// Анализ лёгок (RE2-матчинг по ограниченному входу — микросекунды,
-	// T-069; пара операторов БД), окно держит конвейер непрерывным, не
-	// создавая очереди к пулу соединений; масштабирование — инстансами
-	// (ТЗ 4.1), потолок поднимается Options.Concurrency.
+	// DefaultConcurrency is the q:analyze deliveries in flight at once.
+	// The analysis is light (RE2 matching over a bounded input takes
+	// microseconds, T-069; a couple of DB operators), the window keeps the
+	// pipeline continuous without queueing at the connection pool; scaling
+	// is by instances (spec 4.1), the cap is raised via Options.Concurrency.
 	DefaultConcurrency = 8
 
-	// DefaultConsume — записей q:analyze за одно чтение: окно чтения не
-	// глубже запаса обработки (стиль httpworker/renderworker).
+	// DefaultConsume is the q:analyze records per one read: the read window
+	// is no deeper than the processing headroom (the httpworker/renderworker style).
 	DefaultConsume = 16
 
-	// DefaultErrorWait — пауза после ошибок Redis и БД (стиль
-	// httpworker.DefaultErrorWait): холостые круги не греют логи,
-	// неподтверждённые доставки вернёт XAUTOCLAIM (T-025).
+	// DefaultErrorWait is the pause after Redis and DB errors (the
+	// httpworker.DefaultErrorWait style): idle rounds do not heat up the
+	// logs, XAUTOCLAIM will return the unacknowledged deliveries (T-025).
 	DefaultErrorWait = 30 * time.Second
 )
 
-// Options — параметры воркера; нулевые значения заменяются дефолтами
-// (withDefaults, стиль renderworker.Options).
+// Options holds the worker parameters; zero values are replaced with
+// the defaults (withDefaults, the renderworker.Options style).
 type Options struct {
-	// Concurrency — доставок q:analyze в работе одновременно; 0 —
+	// Concurrency is the q:analyze deliveries in flight at once; 0 —
 	// DefaultConcurrency.
 	Concurrency int
-	// Consume — записей q:analyze за одно чтение; 0 — DefaultConsume.
+	// Consume is the q:analyze records per one read; 0 — DefaultConsume.
 	Consume int
-	// Group — группа потребителей q:analyze; "" — DefaultGroup.
+	// Group is the q:analyze consumer group; "" — DefaultGroup.
 	Group string
-	// Consumer — имя потребителя группы; "" — "analyzer-<pid>".
+	// Consumer is the group consumer name; "" — "analyzer-<pid>".
 	Consumer string
-	// MinScore — порог is_laravel (analyzer.laravel_min_score, ТЗ 5.8/
-	// §13.1: score ≥ 0.6). Неположительное значение заменяется
-	// DefaultMinScore внутри Result.IsLaravel (T-070) — валидация конфига
-	// допускает только (0, 1], защита для прямых вызовов.
+	// MinScore is the is_laravel threshold (analyzer.laravel_min_score,
+	// spec 5.8/§13.1: score ≥ 0.6). A non-positive value is replaced with
+	// DefaultMinScore inside Result.IsLaravel (T-070) — config validation
+	// allows only (0, 1], this is a guard for direct calls.
 	MinScore float64
-	// Recover — слой возврата зависших доставок (Reliab, T-025): Run
-	// поднимает фоновый RecoverLoop (XAUTOCLAIM → та же обработка →
-	// XACK) с теми же Group/Consumer; nil — восстановления нет
-	// (изолированные сборки и тесты без Redis-специфики).
+	// Recover is the stuck delivery recovery layer (Reliab, T-025): Run
+	// starts a background RecoverLoop (XAUTOCLAIM → the same processing →
+	// XACK) with the same Group/Consumer; nil — no recovery (isolated
+	// builds and tests without Redis specifics).
 	Recover *queue.Reliab
-	// RecoverBatch — пачка клейма RecoverLoop за проход; 0 — дефолт
-	// очереди (queue.DefaultRecoverBatch). Боевая сборка передаёт
-	// redis.recover_batch (T-153): темп возврата зависших — настраиваемая
-	// величина очереди, а не окно потребления этапа.
+	// RecoverBatch is the RecoverLoop claim batch per pass; 0 — the queue
+	// default (queue.DefaultRecoverBatch). The production build passes
+	// redis.recover_batch (T-153): the rate of returning stuck deliveries
+	// is a queue knob, not the stage's consumption window.
 	RecoverBatch int
-	// RecoverInterval — период опроса зависших записей RecoverLoop;
-	// 0 — дефолт очереди (queue.DefaultRecoverInterval). Конфиг —
+	// RecoverInterval is the RecoverLoop polling period for stuck records;
+	// 0 — the queue default (queue.DefaultRecoverInterval). The config is
 	// redis.recover_interval (T-153).
 	RecoverInterval time.Duration
-	// Retention — окно жизни контента не-находок (content.retention,
-	// T-166): им точечный дренаж DrainDomain чистит контент домена при
-	// снятии находки переанализом (T-187). ≤ 0 — retention выключен
-	// (контент хранится всегда) — дренажа нет, событие только считается.
+	// Retention is the content lifetime window of non-finds (content.retention,
+	// T-166): the DrainDomain point drain uses it to clean a domain's
+	// content on a find removal by re-analysis (T-187). ≤ 0 — retention
+	// is off (content is kept forever) — no drain, the event is only counted.
 	Retention time.Duration
-	// DrainDomain — шов точечного дренажа контента домена (T-187):
-	// удовлетворяется content.DrainDomain (пул воркера —
-	// content.RetentionDB); nil — дренаж выключен (изолированные сборки,
-	// юнит-тесты без контентной семантики) — событие только считается.
+	// DrainDomain is the domain content point drain seam (T-187):
+	// satisfied by content.DrainDomain (the worker's pool is
+	// content.RetentionDB); nil — the drain is off (isolated builds, unit
+	// tests without content semantics) — the event is only counted.
 	DrainDomain func(ctx context.Context, pool content.RetentionDB,
 		retention time.Duration, zoneID int16, domainID int64) (content.RetentionStats, error)
-	// Log — логгер; nil — записи подавлены (slog.DiscardHandler).
+	// Log is the logger; nil — records are dropped (slog.DiscardHandler).
 	Log *slog.Logger
-	// Metrics — реестр Prometheus сервиса (T-077, ТЗ 5.9): из него New
-	// строит приборы этапа (NewMetrics); nil — без метрик (изолированные
-	// сборки и тесты).
+	// Metrics is the service Prometheus registry (T-077, spec 5.9): New
+	// builds the stage instruments from it (NewMetrics); nil — no metrics
+	// (isolated builds and tests).
 	Metrics *metrics.Registry
 }
 
@@ -280,21 +283,21 @@ func (o Options) log() *slog.Logger {
 	return o.Log
 }
 
-// Worker — анализатор Laravel: обрабатывает задачи q:analyze (ключи строк
-// subdomain_results) через швы БД, хранилища контента и набора правил.
-// Потокобезопасен: состояние неизменно после New.
+// Worker is the Laravel analyzer: it processes q:analyze tasks (the
+// keys of subdomain_results rows) through the DB, content store and
+// rule set seams. Thread-safe: the state is immutable after New.
 type Worker struct {
 	db       AnalyzerDB
 	q        queue.Queue
 	contents ContentGetter
 	sets     SetSource
 	opt      Options
-	met      *Metrics // приборы этапа (T-077); nil — no-op
+	met      *Metrics // the stage instruments (T-077); nil — no-op
 }
 
-// New строит воркер поверх пула БД, очереди, хранилища контента и
-// источника набора правил. nil-зависимости — ошибка: тихая потеря
-// анализа незаметна для оператора (стиль T-058/renderworker).
+// New builds the worker on top of a DB pool, a queue, a content store
+// and a rule set source. nil dependencies are an error: a silent loss
+// of analysis is invisible to the operator (the T-058/renderworker style).
 func New(db AnalyzerDB, q queue.Queue, contents ContentGetter, sets SetSource, opts Options) (*Worker, error) {
 	if db == nil {
 		return nil, errors.New("analyzer: пул БД не задан")
@@ -311,28 +314,30 @@ func New(db AnalyzerDB, q queue.Queue, contents ContentGetter, sets SetSource, o
 	return &Worker{db: db, q: q, contents: contents, sets: sets, opt: opts.withDefaults(), met: NewMetrics(opts.Metrics)}, nil
 }
 
-// analyzeRow — прочитанная строка subdomain_results: вход пассивного
-// анализа (ТЗ 5.8) — заголовки, cookies и контент.
+// analyzeRow is a read subdomain_results row: the input of the passive
+// analysis (spec 5.8) — headers, cookies and content.
 type analyzeRow struct {
 	headers map[string][]string
 	cookies []rules.Cookie
-	hash    []byte // nil — контента нет (NULL content_hash, T-056)
+	hash    []byte // nil — no content (NULL content_hash, T-056)
 }
 
-// ProcessResult обрабатывает одну задачу q:analyze (§5.8, §7): пассивный
-// анализ строки по текущему набору правил, запись laravel_findings и
-// пересчёт агрегата домена laravel_domains (T-072) в одной транзакции со
-// штампом rules_version. Возвращает true, когда транзакция зафиксирована —
-// findings записаны (все срабатывания независимо от порога) и агрегат
-// домена пересчитан, либо при пустом итоге удалена прошлая строка и
-// поставлен штамп (§3.5: «признаков нет» — тоже результат анализа).
-// false без ошибки — задачи делать нечего: строки нет (домен удалён/
-// перепроверен без этого ключа) или она ушла из-под задачи (контент
-// сменился после чтения — охрана UPDATE; рендер/перепроверка опубликуют
-// свой q:analyze) — это успех, ничего не пишется, доставка подтверждается.
-// Ошибка — сбой любого шага: доставка не подтверждается и вернётся
-// повторной доставкой (Processing, T-025); повторная обработка
-// идемпотентна (upsert).
+// ProcessResult processes one q:analyze task (§5.8, §7): the passive
+// analysis of the row against the current rule set, writing
+// laravel_findings and recalculating the laravel_domains domain
+// aggregate (T-072) in one transaction with the rules_version stamp.
+// It returns true when the transaction committed — the findings are
+// written (all hits regardless of the threshold) and the domain
+// aggregate is recalculated, or, on an empty outcome, the old row is
+// deleted and the stamp is put (§3.5: "no signs" is also an analysis
+// result). false without an error — there is nothing to do: the row
+// is gone (the domain was deleted/rechecked without this key) or it
+// slipped out from under the task (the content changed after the read
+// — the UPDATE guard; the render/recheck will publish their own
+// q:analyze) — that is a success, nothing is written, the delivery is
+// acknowledged. An error is a failure of any step: the delivery is not
+// acknowledged and will come back as a repeated delivery (Processing,
+// T-025); repeated processing is idempotent (upsert).
 func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, error) {
 	row, found, err := w.selectResult(ctx, task)
 	if err != nil {
@@ -351,14 +356,14 @@ func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, er
 		return false, fmt.Errorf("analyzer: %s: %w", name, err)
 	}
 
-	// Снапшот набора на доставку: Reloader.Set() атомарен, EvaluateCtx
-	// работает с иммутабельным Set; смена набора посреди страницы
-	// невозможна, следующая доставка возьмёт свежий.
+	// A rule set snapshot per delivery: Reloader.Set() is atomic,
+	// EvaluateCtx works with an immutable Set; the set cannot change
+	// mid-page, the next delivery takes the fresh one.
 	set := w.sets.Set()
 	if set == nil {
-		// Симметрично ReanalyzeLoop: nil-снапшот альтернативного SetSource —
-		// пропуск, не паника. Доставка подтверждается: без штампа версии
-		// строка остаётся устаревшей, переанализ (T-074) к ней вернётся.
+		// Symmetric to ReanalyzeLoop: a nil snapshot of an alternative
+		// SetSource is a skip, not a panic. The delivery is acknowledged:
+		// without the version stamp the row stays stale, re-analysis (T-074)
 		w.opt.log().Warn("набор правил не загружен — анализ пропущен, строка останется для переанализа",
 			"domain", name, "zone_id", task.ZoneID, "domain_id", task.DomainID)
 		return false, nil
@@ -367,13 +372,13 @@ func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, er
 		HTML:    html,
 		Cookies: row.cookies,
 		Headers: row.headers,
-	}, rules.Limits{}) // нулевые Limits → DefaultLimits (T-069)
+	}, rules.Limits{}) // zero Limits → DefaultLimits (T-069)
 	if res.Partial {
-		// Бюджет времени исчерпан (EvalTimeout) или ctx отменён — правила
-		// просмотрены не все: усечённый результат нельзя записывать и
-		// штамповать rules_version как полный. Доставка подтверждается:
-		// строка остаётся устаревшей, переанализ (T-074) вернётся к ней
-		// (практически недостижимо при RE2 на ограниченном входе).
+		// The time budget is exhausted (EvalTimeout) or ctx is cancelled —
+		// not all rules were scanned: a truncated result must not be written
+		// and stamped as full rules_version. The delivery is acknowledged:
+		// the row stays stale, re-analysis (T-074) will return to it
+		// (practically unreachable with RE2 on a bounded input).
 		w.opt.log().Warn("анализ прерван до полного просмотра правил — findings не записаны, строка останется для переанализа",
 			"domain", name, "signals", len(res.Signals), "rules_version", set.Version)
 		return false, nil
@@ -389,13 +394,14 @@ func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, er
 	if err != nil {
 		return false, fmt.Errorf("analyzer: %s: запись findings: транзакция: %w", name, err)
 	}
-	// Откат безусловно: после Commit — no-op (стиль T-044/T-058).
+	// Rollback unconditionally: after Commit it is a no-op (the T-044/T-058 style).
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	// Штамп первым шагом: охраны актуальности решают, писать ли findings
-	// (нет строки — строка ушла из-под задачи, домен удалён, контент
-	// сменился или версия уже текущая — повторная доставка, T-204).
-	// RETURNING checked_at — час корзины хвостов для декремента ниже.
+	// The stamp as the first step: the freshness guards decide whether
+	// to write the findings (no row — it slipped out from under the task,
+	// the domain is deleted, the content changed, or the version is
+	// already current — a repeated delivery, T-204).
+	// RETURNING checked_at — the tail bucket hour for the decrement below.
 	var stampedAt time.Time
 	err = tx.QueryRow(ctx, analyzeMarkSQL,
 		task.ZoneID, task.DomainID, task.SubdomainID, int16(task.Variant),
@@ -411,8 +417,8 @@ func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, er
 	}
 
 	if len(res.Signals) > 0 {
-		// Все срабатывания независимо от порога (§13.1); повторная
-		// доставка и переанализ перезаписывают (ON CONFLICT, §3.5).
+		// All hits regardless of the threshold (§13.1); a repeated
+		// delivery and re-analysis rewrite (ON CONFLICT, §3.5).
 		tag, err := tx.Exec(ctx, findingUpsertSQL,
 			task.ZoneID, task.DomainID, task.SubdomainID, int16(task.Variant),
 			float32(res.Score), nullStr(res.VerMin), nullStr(res.VerMax),
@@ -424,30 +430,31 @@ func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, er
 			return false, fmt.Errorf("analyzer: %s: запись findings: затронуто %d строк", name, tag.RowsAffected())
 		}
 	} else {
-		// Ни одно правило не сработало — строка не пишется (ТЗ 5.8);
-		// существующая удаляется: прошлый анализ видел признаки, которых
-		// в текущем эпизоде нет (§3.5).
+		// No rule hit — the row is not written (spec 5.8); an existing one
+		// is deleted: the past analysis saw signs that are absent in the
+		// current episode (§3.5).
 		if _, err := tx.Exec(ctx, findingDeleteSQL,
 			task.ZoneID, task.DomainID, task.SubdomainID, int16(task.Variant)); err != nil {
 			return false, fmt.Errorf("analyzer: %s: удаление findings: %w", name, err)
 		}
 	}
 
-	// Агрегация домена — T-072: пересчёт laravel_domains по findings
-	// домена той же транзакцией (решения и согласование параллельных
-	// доставок — aggregate.go); fresh — признак свежего эпизода HTTP
-	// в задаче: при переходе пишет историю appeared/lost (T-118);
-	// unfound — сигнал снятия находки переанализом (T-187).
+	// Domain aggregation — T-072: recalculating laravel_domains from
+	// the domain's findings in the same transaction (the decisions and
+	// the parallel delivery reconciliation are in aggregate.go); fresh
+	// is the fresh HTTP episode sign in the task: on a transition it
+	// writes the appeared/lost history (T-118); unfound is the re-analysis
 	unfound, err := aggregateDomain(ctx, tx, task.ZoneID, task.DomainID, set.Version, task.Fresh)
 	if err != nil {
 		return false, fmt.Errorf("analyzer: %s: %w", name, err)
 	}
 
-	// Декремент корзины хвостов reanalyze: (T-204) — последним шагом
-	// транзакции (хвостовая дельта, стиль record.go): строка переведена
-	// устаревшей→текущей — опубликованный хвост возвращает корзине ноль,
-	// guard следующего тика закрывается. Откат откатывает штамп и дельту
-	// вместе (§3.4).
+	// find removal signal (T-187).
+	// The reanalyze: tail bucket decrement (T-204) — the last step of
+	// the transaction (the tail delta, the record.go style): the row was
+	// moved stale→current — the published tail returns the bucket to zero,
+	// the next tick's guard closes. A rollback rolls back the stamp and
+	// the delta together (§3.4).
 	if err := analyzeConsumeTail(ctx, tx, stampedAt); err != nil {
 		return false, fmt.Errorf("analyzer: %s: %w", name, err)
 	}
@@ -456,10 +463,10 @@ func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, er
 		return false, fmt.Errorf("analyzer: %s: запись findings: фиксация: %w", name, err)
 	}
 
-	// Снятие находки переанализом (T-187) — после фиксации: событие уже
-	// состоялось, ошибки дренажа не роняют доставку (findings и агрегат
-	// зафиксированы, XACK состоится; записи домена без дренажа остались
-	// бы позади курсора retention — класс до T-187, см. drainUnfound).
+	// The find removal by re-analysis (T-187) — after the commit: the
+	// event has already happened, drain errors do not fail the delivery
+	// (the findings and the aggregate are committed, the XACK will
+	// happen; without the drain the domain's rows would stay behind the
 	w.drainUnfound(ctx, task, name, unfound)
 
 	w.opt.log().Debug("анализ записан",
@@ -469,16 +476,16 @@ func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, er
 	return true, nil
 }
 
-// analyzeConsumeTail — декремент корзины неанализированных хвостов
-// reanalyze: в ОТКРЫТОЙ транзакции штампа (T-204): stampedAt — час
-// корзины (RETURNING analyzeMarkSQL), дельта — −1 (одна строка
-// переведена устаревшей→текущей). Upsert сам создаёт корзину часа
-// (декремент теоретически может опередить инкремент — дубль-доставка
-// после потери строки эпизода) — RowsAffected гарантированно 1,
-// проверка — страховка прямых вызовов с чужим SQL (молчаливая потеря
-// дельты держала бы guard тика открытым до реконсиляции). Возврат с
-// ошибкой откатывает транзакцию вызывающего — штамп и корзина меняются
-// только вместе (§3.4).
+// analyzeConsumeTail — the decrement of the unanalyzed tails bucket
+// reanalyze: in the OPEN stamp transaction (T-204): stampedAt is the
+// bucket hour (RETURNING analyzeMarkSQL), the delta is −1 (one row
+// moved stale→current). The upsert creates the hour bucket itself
+// (the decrement can theoretically outrun the increment — a duplicate
+// delivery after the episode row is lost) — RowsAffected is
+// guaranteed to be 1, the check is a guard for direct calls with
+// foreign SQL (a silent delta loss would keep the tick guard open
+// until the reconciliation). Returning an error rolls back the
+// caller's transaction — the stamp and the bucket change only together (§3.4).
 func analyzeConsumeTail(ctx context.Context, tx pgx.Tx, stampedAt time.Time) error {
 	tag, err := tx.Exec(ctx, analyzeReanalyzeConsumeSQL, stampedAt, int64(-1))
 	if err != nil {
@@ -491,28 +498,29 @@ func analyzeConsumeTail(ctx context.Context, tx pgx.Tx, stampedAt time.Time) err
 	return nil
 }
 
-// drainUnfound — точечный дренаж контента домена при снятии находки
-// переанализом (T-187): сигнал unfound агрегации (aggregateDomain,
-// переход строки laravel_domains доставкой без fresh) означает, что
-// старые записи домена subdomain_results вернулись в множество
-// кандидатов retention позади курсора дренажа (T-185) — часовой проход
-// их больше не увидит. Дренаж — content.DrainDomain: те же фильтры
-// отбора и purge-механика T-166 по префиксу PK (zone_id, domain_id).
-// Вызывается после фиксации транзакции доставки: сбой дренажа — Warn и
-// метрика, доставка подтверждается (анализ — ядро работы; записи без
-// дренажа остаются в классе до T-187, их подберут редкие catch-up-круги
-// T-185 либо перепроверка T-030). Идемпотентен: повтор не найдёт
-// кандидатов. Отмена ctx — часть остановки, не тревога.
+// drainUnfound — the domain content point drain on a find removal by
+// re-analysis (T-187): the aggregation's unfound signal (aggregateDomain,
+// a laravel_domains row transition by a delivery without fresh) means
+// the domain's old subdomain_results rows returned to the retention
+// candidate set behind the drain cursor (T-185) — the hourly pass will
+// not see them anymore. The drain is content.DrainDomain: the same
+// selection filters and the T-166 purge mechanics over the PK prefix
+// (zone_id, domain_id). It is called after the delivery transaction
+// commits: a drain failure is a Warn and a metric, the delivery is
+// acknowledged (the analysis is the core work; rows without a drain
+// stay in the pre-T-187 class, the rare T-185 catch-up circles or the
+// T-030 recheck will pick them up). Idempotent: a repeat finds no
+// candidates. A ctx cancellation is part of the stop, not an alarm.
 func (w *Worker) drainUnfound(ctx context.Context, task queue.Result, name string, unfound bool) {
 	if !unfound {
 		return
 	}
 	w.met.Unfound()
 	if w.opt.DrainDomain == nil || w.opt.Retention <= 0 {
-		// Минимум T-187 при выключенном дренаже: retention = 0 — контент
-		// хранится всегда (цикла retention нет вовсе, позади курсора ничего
-		// не копится); шов не задан — изолированная сборка. Событие
-		// наблюдаемо метрикой и логом.
+		// The T-187 minimum with the drain off: retention = 0 — content
+		// is kept forever (no retention cycle at all, nothing piles up
+		// behind the cursor); the seam is not set — an isolated build.
+		// The event is observable via the metric and the log.
 		w.opt.log().Info("снятие находки переанализом — точечный дренаж контента выключен",
 			"domain", name, "zone_id", task.ZoneID, "domain_id", task.DomainID)
 		return
@@ -535,10 +543,11 @@ func (w *Worker) drainUnfound(ctx context.Context, task queue.Result, name strin
 	}
 }
 
-// selectResult читает вход анализа по ключу задачи: заголовки, cookies и
-// ссылку на контент. SELECT вне транзакции: конкурентная перезапись
-// строки между чтением и UPDATE ловится охраной analyzeMarkSQL (стиль
-// renderworker.selectTarget).
+// selectResult reads the analysis input by the task key: headers,
+// cookies and the content reference. The SELECT is outside a
+// transaction: a concurrent rewrite of the row between the read and
+// the UPDATE is caught by the analyzeMarkSQL guard (the
+// renderworker.selectTarget style).
 func (w *Worker) selectResult(ctx context.Context, task queue.Result) (analyzeRow, bool, error) {
 	rows, err := w.db.Query(ctx, analyzeSelectSQL,
 		task.ZoneID, task.DomainID, task.SubdomainID, int16(task.Variant))
@@ -560,7 +569,7 @@ func (w *Worker) selectResult(ctx context.Context, task queue.Result) (analyzeRo
 		if row.cookies, err = parseCookiesJSON(cookies); err != nil {
 			return analyzeRow{}, false, fmt.Errorf("analyzer: cookies строки результата: %w", err)
 		}
-		return row, true, nil // PK — не больше одной строки
+		return row, true, nil // by PK — at most one row
 	}
 	if err := rows.Err(); err != nil {
 		return analyzeRow{}, false, fmt.Errorf("analyzer: чтение строки результата: %w", err)
@@ -568,12 +577,13 @@ func (w *Worker) selectResult(ctx context.Context, task queue.Result) (analyzeRo
 	return analyzeRow{}, false, nil
 }
 
-// fetchContent достаёт контент для матчинга целей html/meta (T-069):
-// NULL/урезанный content_hash и отсутствующий контент (ссылки сняты) —
-// контента нет, анализ продолжается по заголовкам и кукам (ТЗ 5.8:
-// правила по шести целям, html/meta — часть набора, не весь анализ).
-// Пустой DOM — тот же исход: движок по пустому входу не найдёт html/
-// meta-признаков, куки и заголовки продолжают работать.
+// fetchContent fetches the content for matching the html/meta targets
+// (T-069): a NULL/truncated content_hash and missing content (the
+// references are gone) mean no content, the analysis continues by
+// headers and cookies (spec 5.8: rules over six targets, html/meta is
+// part of the set, not the whole analysis). An empty DOM is the same
+// outcome: the engine finds no html/meta signs on an empty input,
+// cookies and headers keep working.
 func (w *Worker) fetchContent(ctx context.Context, hash []byte) ([]byte, error) {
 	if len(hash) != content.HashLen {
 		return nil, nil
@@ -590,8 +600,8 @@ func (w *Worker) fetchContent(ctx context.Context, hash []byte) ([]byte, error) 
 	return data, nil
 }
 
-// analyzeLogName — имя для логов: имя домена из сообщения, иначе ключ
-// строки (Name опционально, T-024).
+// analyzeLogName is the name for logs: the domain name from the
+// message, otherwise the row key (Name is optional, T-024).
 func analyzeLogName(task queue.Result) string {
 	if task.Name != "" {
 		return task.Name
@@ -599,7 +609,7 @@ func analyzeLogName(task queue.Result) string {
 	return fmt.Sprintf("%d/%d/%d/%d", task.ZoneID, task.DomainID, task.SubdomainID, int16(task.Variant))
 }
 
-// nullStr — пустая граница диапазона → NULL (отсутствует или конфликт,
+// nullStr — an empty version bound → NULL (absent or a conflict,
 // T-070).
 func nullStr(s string) *string {
 	if s == "" {
@@ -608,18 +618,19 @@ func nullStr(s string) *string {
 	return &s
 }
 
-// signalJSON — свидетельство в формате колонки laravel_findings.signals
-// (миграция 000001: [{rule, weight, evidence}, …]). Теги нижним
-// регистром по эскизу схемы §6.1; rules.Evidence тегов не имеет — формат
-// jsonb вводит этап записи.
+// signalJSON is an evidence in the format of the
+// laravel_findings.signals column (migration 000001:
+// [{rule, weight, evidence}, …]). The tags are lowercase per the §6.1
+// schema sketch; rules.Evidence has no tags — the writing stage
 type signalJSON struct {
 	Rule     string  `json:"rule"`
 	Weight   float64 `json:"weight"`
 	Evidence string  `json:"evidence"`
 }
 
-// marshalSignals сериализует срабатывания; пустой набор — пустая строка
-// (вызов не делается: строка findings не пишется вовсе).
+// introduces the jsonb format.
+// marshalSignals serializes the hits; an empty set is an empty string
+// (the call is not made: the findings row is not written at all).
 func marshalSignals(sigs []rules.Evidence) (string, error) {
 	if len(sigs) == 0 {
 		return "", nil
@@ -635,11 +646,11 @@ func marshalSignals(sigs []rules.Evidence) (string, error) {
 	return string(b), nil
 }
 
-// parseHeadersJSON разбирает jsonb subdomain_results.headers: контракт
-// T-058 (http.Header — канонические имена MIME, значения массивы) и T-067
-// (заголовки итоговой навигации рендера). Разбор в map[string][]string,
-// а не http.Header: канонизация уже выполнена пишущим этапом, а
-// rules.Page.Headers ждёт именно map (T-069).
+// parseHeadersJSON parses the subdomain_results.headers jsonb: the
+// T-058 contract (http.Header — canonical MIME names, array values)
+// and T-067 (the render's final navigation headers). Parsing into
+// map[string][]string, not http.Header: the writing stage has already
+// canonicalized, and rules.Page.Headers expects exactly a map (T-069).
 func parseHeadersJSON(s *string) (map[string][]string, error) {
 	if s == nil || *s == "" {
 		return nil, nil
@@ -651,10 +662,10 @@ func parseHeadersJSON(s *string) (map[string][]string, error) {
 	return h, nil
 }
 
-// cookieJSON — запись jsonb subdomain_results.cookies: контракт T-058
-// (recordCookie) и T-067 (render.ExtractCookie) — {name, value} плюс
-// атрибуты; движку правил нужны имя и значение (ТЗ 5.8), атрибуты
-// игнорируются (неизвестные поля JSON пропускаются).
+// cookieJSON is a record of the subdomain_results.cookies jsonb: the
+// T-058 (recordCookie) and T-067 (render.ExtractCookie) contracts —
+// {name, value} plus attributes; the rule engine needs the name and
+// the value (spec 5.8), the attributes are ignored (unknown JSON fields are skipped).
 type cookieJSON struct {
 	Name  string `json:"name"`
 	Value string `json:"value"`
@@ -678,16 +689,16 @@ func parseCookiesJSON(s *string) ([]rules.Cookie, error) {
 	return out, nil
 }
 
-// --- рабочий цикл ------------------------------------------------------------
+// --- work loop --------------------------------------------------------------
 
-// Run — рабочий цикл analyzer (ТЗ 4.2, §5.8, §7): читает задачи q:analyze
-// группой потребителей окном Consume и обрабатывает доставки параллельно
-// до Concurrency, каждую — паттерном Processing (T-025): анализ → запись
-// findings и штампа rules_version в БД → XACK. Работает до отмены ctx и
-// возвращает nil — контракт OnRun каркаса (T-012; начатые доставки
-// дорабатывают или возвращаются очереди повторной доставкой, ТЗ 3.4).
-// Ошибка чтения или обработки не останавливает цикл: логируется (Warn),
-// неподтверждённая доставка вернётся XAUTOCLAIM (ТЗ 4.2).
+// Run is the analyzer work loop (spec 4.2, §5.8, §7): it reads
+// q:analyze tasks with the consumer group in a Consume window and
+// processes deliveries in parallel up to Concurrency, each with the
+// Processing pattern (T-025): analysis → writing the findings and the
+// rules_version stamp to the DB → XACK. It runs until ctx is
+// cancelled and returns nil — the OnRun contract of the framework
+// (T-012; started deliveries finish their work or return to the queue
+// for a repeated delivery, spec 3.4). A read or processing error does
 func Run(ctx context.Context, w *Worker, opts Options) error {
 	if w == nil {
 		return errors.New("analyzer: цикл воркера: воркер не задан")
@@ -708,10 +719,12 @@ func Run(ctx context.Context, w *Worker, opts Options) error {
 		}
 	}
 
-	// Возврат зависших доставок (T-025): фоновый RecoverLoop от имени
-	// того же потребителя — клейм XAUTOCLAIM и та же обработка задач.
-	// Живёт до отмены ctx; Run дожидается его выхода (начатая задача
-	// дорабатывает или остаётся неподтверждённой, ТЗ 3.4).
+	// not stop the loop: it is logged (a Warn), an unacknowledged delivery
+	// will come back via XAUTOCLAIM (spec 4.2).
+	// Returning stuck deliveries (T-025): a background RecoverLoop on
+	// behalf of the same consumer — an XAUTOCLAIM claim and the same task
+	// processing. It lives until ctx is cancelled; Run waits for its exit
+	// (a started task finishes or stays unacknowledged, spec 3.4).
 	if o.Recover != nil {
 		recDone := make(chan struct{})
 		go func() {
@@ -720,8 +733,8 @@ func Run(ctx context.Context, w *Worker, opts Options) error {
 				Stream:   queue.StreamAnalyze,
 				Group:    o.Group,
 				Consumer: o.Consumer,
-				// Темп обхода PEL — очередь, не этап (redis.recover_*,
-				// T-153); нули — дефолты очереди.
+				// The PEL traversal rate is a queue knob, not a stage one
+				// (redis.recover_*, T-153); zeros — the queue defaults.
 				Batch:    o.RecoverBatch,
 				Interval: o.RecoverInterval,
 				Log:      log,
@@ -744,19 +757,20 @@ func Run(ctx context.Context, w *Worker, opts Options) error {
 
 		var wg sync.WaitGroup
 		for _, d := range deliveries {
-			// Эквивалентный мутант (T-M10): вырезание break запускает
-			// оставшиеся доставки окна и после отмены ctx, но их обработка
-			// целиком падает на отменённом контексте (SELECT/транзакция/XACK
-			// отклоняют ctx и у драйверов, и у фейков) без записей в БД и без
-			// подтверждения — запись остаётся в pending, как и при невызове;
-			// Warn погашен условием ctx.Err() == nil ниже.
+			// An equivalent mutant (T-M10): cutting the break out starts the
+			// remaining window deliveries even after ctx is cancelled, but
+			// their processing fails entirely on the cancelled context
+			// (SELECT/transaction/XACK reject ctx both in the drivers and the
+			// fakes) with no DB writes and no acknowledgment — the record stays
+			// in pending, as with not calling it at all; the Warn is gated by
 			// mutator-disable-next-line branch/if
 			if ctx.Err() != nil {
-				// Эквивалентный мутант (T-M10): break → continue проходит
-				// остаток окна, не запуская доставки, и выходит на
-				// пост-проверку ctx за wg.Wait — то же состояние и возврат nil.
+				// ctx.Err() == nil below.
+				// An equivalent mutant (T-M10): break → continue walks the rest
+				// of the window without starting deliveries and reaches the
+				// post-check of ctx after wg.Wait — the same state and a nil return.
 				// mutator-disable-next-line loop/break
-				break // не начатые доставки окна не подтверждены
+				break // the window deliveries not started stay unacknowledged
 			}
 			sem <- struct{}{}
 			wg.Add(1)
@@ -772,17 +786,18 @@ func Run(ctx context.Context, w *Worker, opts Options) error {
 		}
 		wg.Wait()
 		if ctx.Err() != nil {
-			return nil // остановка: окно доработано или возвращено очереди
+			return nil // stopping: the window is drained or returned to the queue
 		}
 	}
 }
 
-// processDelivery обрабатывает одну доставку q:analyze: декодирование
-// Result-ключа и анализ. Подтверждение (XACK) выполняет Processing после
-// nil-возврата — «XACK только после записи результата в БД» (ТЗ 4.2);
-// ядовитая запись (вне формата T-024) возвращается ошибкой — очередь
-// исчерпает попытки и унесёт её в q:dead (T-025). Успешная обработка
-// идёт в приборы этапа (T-077): счётчик задач и длительность.
+// processDelivery processes one q:analyze delivery: decoding the
+// Result key and the analysis. Processing does the acknowledgment
+// (XACK) after a nil return — "XACK only after the result is written
+// to the DB" (spec 4.2); a poison row (outside the T-024 format) is
+// returned as an error — the queue will exhaust the attempts and move
+// it to q:dead (T-025). A successful processing goes into the stage
+// instruments (T-077): the task counter and the duration.
 func (w *Worker) processDelivery(ctx context.Context, del queue.Delivery) error {
 	task, err := queue.Decode[queue.Result](del)
 	if err != nil {

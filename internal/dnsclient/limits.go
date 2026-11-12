@@ -1,35 +1,35 @@
-// Лимиты DNS-этапа (ТЗ 5.4: «Ограничение параллелизма и QPS настраивается;
-// адаптивное снижение при росте доли таймаутов», «Если на сервере нет IPv6 —
-// AAAA-запросы отключаются конфигом») — декоратор LimitResolver над
-// интерфейсом Resolver — точкой расширения, оставленной T-034. Контракт
-// Exchange не меняется: потребитель (T-036…T-039) получает те же Result и
-// ошибки, что и без обёртки; RCODE по-прежнему не ошибка.
+// DNS stage limits (spec 5.4: "Concurrency and QPS limits are configurable;
+// adaptive shedding when the timeout share grows", "If the server has no
+// IPv6 — AAAA queries are disabled by config") — the LimitResolver
+// decorator over the Resolver interface — the extension point left by
+// T-034. The Exchange contract does not change: the consumer (T-036…T-039)
+// gets the same Result and errors as without the wrapper; an RCODE is still not an error.
 //
-// Три механизма:
+// Three mechanisms:
 //
-//   - параллелизм — семафор limitSemaphore с изменяемым потолком: адаптив
-//     опускает потолок для новых обменов, не отбирая слоты у летящих
-//     (снижение мягкое: очередь дренируется естественным темпом ответов);
-//   - темп — токен-ведро limitBucket со средним темпом dns.max_qps и
-//     короткими всплесками до burst (обоснование выбора — у limitBucket);
-//   - адаптив — доля таймаутов (IsTimeout) в скользящем окне последних
-//     обменов; выше порога оба лимита снижаются, ниже порога восстановления
-//     растут (гистерезис; механика и направления — у limitAdaptive).
+//   - concurrency — the limitSemaphore semaphore with a mutable cap: the
+//     adaptive lowers the cap for new exchanges without taking slots from
+//     in-flight ones (the shedding is soft: the queue drains at the natural pace of responses);
+//   - rate — the limitBucket token bucket with the average rate dns.max_qps
+//     and short bursts up to burst (the rationale is at limitBucket);
+//   - adaptive — the share of timeouts (IsTimeout) in the sliding window of
+//     recent exchanges; above the threshold both limits go down, below the
+//     recovery threshold they grow (hysteresis; the mechanics and directions are at limitAdaptive).
 //
-// Порядок ожиданий в Exchange: сначала семафор, затем токен. Токен берётся
-// вплотную к отправке: возьми горутины токены заранее и выстройся в очередь
-// слотов — накопленное ведро позволяло бы всплеск мимо сниженного QPS.
-// Обратная цена (слот занят на время ожидания токена) не страшна: когда темп
-// ограничен QPS, реальная параллельность обменов и так ниже потолка.
+// The waiting order in Exchange: the semaphore first, then the token. The
+// token is taken right before the send: if goroutines took tokens in
+// advance and then queued for slots, the accumulated bucket would allow a
+// burst past the lowered QPS. The reverse price (a slot held while waiting
+// for the token) is not scary: when the rate is QPS-bound, the actual exchange parallelism is below the cap anyway.
 //
-// Отключение AAAA (dns.ipv6=false) — локальный пустой NOERROR-ответ без
-// похода к резолверу и без участия лимитов и окна адаптива: резолвер не
-// нагружается, а доля таймаутов не разбавляется фиктивными успехами.
+// AAAA disabling (dns.ipv6=false) — a local empty NOERROR response without
+// going to the resolver and without the limits and the adaptive window:
+// the resolver is not loaded and the timeout share is not diluted with bogus successes.
 //
-// Семафор — защита от перерасхода, а не очередь на тысячи горутин:
-// потребитель T-036+ держит воркеров не больше concurrency, поэтому у
-// limitSemaphore широковещательное пробуждение (редкие изменения состояния),
-// а не хитрые схемы «разбудить одного».
+// The semaphore guards against overspend, it is not a queue for thousands
+// of goroutines: the T-036+ consumer keeps no more than concurrency
+// workers, so limitSemaphore uses broadcast wakeup (rare state changes),
+// not clever "wake one" schemes.
 
 package dnsclient
 
@@ -47,86 +47,86 @@ import (
 	"crawler/internal/config"
 )
 
-// Значения по умолчанию. Плановые лимиты — из ТЗ 5.10 (dns.concurrency 2000,
-// dns.max_qps 10000); механика адаптива в ТЗ числами не задана — дефолты
-// выведены из свойств этапа и переопределяются в LimitOptions.
+// Default values. The planned limits are from spec 5.10 (dns.concurrency
+// 2000, dns.max_qps 10000); the adaptive mechanics are not numerically set
+// in the spec — the defaults are derived from the stage properties and can be overridden in LimitOptions.
 const (
-	// DefaultLimitConcurrency — плановый параллелизм DNS-этапа
-	// (dns.concurrency, ТЗ 5.10). Совпадает с DefaultUDPPoolSize: пул
-	// сокетов не должен резать плановый параллелизм (T-034).
+	// DefaultLimitConcurrency is the planned concurrency of the DNS stage
+	// (dns.concurrency, spec 5.10). It matches DefaultUDPPoolSize: the
+	// socket pool must not cut the planned concurrency (T-034).
 	DefaultLimitConcurrency = 2000
-	// DefaultLimitQPS — плановый темп обменов (dns.max_qps, ТЗ 5.10).
+	// DefaultLimitQPS is the planned exchange rate (dns.max_qps, spec 5.10).
 	DefaultLimitQPS = 10000
-	// DefaultLimitWindow — окно доли таймаутов: 200 обменов. При плановых
-	// 10000 QPS окно собирается за ~20 мс — быстрее одного цикла ретраев
-	// (2 с × 3 попытки), при этом единичные таймауты не качают решение.
+	// DefaultLimitWindow is the timeout share window: 200 exchanges. At the
+	// planned 10000 QPS the window fills in ~20 ms — faster than one retry
+	// loop (2s × 3 attempts), while single timeouts do not swing the decision.
 	DefaultLimitWindow = 200
-	// DefaultLimitHighRatio — порог снижения: доля таймаутов ≥ 10 %.
-	// У здорового рекурсивного резолвера с тёплым кэшем (ТЗ 5.4) таймауты —
-	// доли процента; 10 % — однозначно аномалия.
+	// DefaultLimitHighRatio is the shedding threshold: the timeout share ≥ 10%.
+	// For a healthy recursive resolver with a warm cache (spec 5.4) timeouts
+	// are fractions of a percent; 10% is unambiguously an anomaly.
 	DefaultLimitHighRatio = 0.10
-	// DefaultLimitLowRatio — порог восстановления: доля ≤ 2 % (гистерезис
-	// с зоной нечувствительности 2…10 % — устойчивое «чуть плохо» не
-	// раскачивает лимиты туда-сюда).
+	// DefaultLimitLowRatio is the recovery threshold: the share ≤ 2% (a
+	// hysteresis with a 2…10% deadband — a steady "slightly bad" does not
+	// swing the limits back and forth).
 	DefaultLimitLowRatio = 0.02
-	// DefaultLimitDownFactor — множитель снижения ×0.5: пока резолвер
-	// таймаутит, каждый обмен жжёт бюджет попыток и держит слот — снижать
-	// надо решительно (мультипликативно, как AIMD-уменьшение).
+	// DefaultLimitDownFactor is the shedding multiplier ×0.5: while the
+	// resolver times out, every exchange burns the attempt budget and holds a
+	// slot — shedding must be decisive (multiplicative, like an AIMD decrease).
 	DefaultLimitDownFactor = 0.5
-	// DefaultLimitUpFactor — множитель восстановления ×1.25: подъём
-	// медленнее снижения — резолвер только что показал перегрузку, быстрый
-	// возврат даёт осцилляции «снизили → вернули → снова перегруз».
+	// DefaultLimitUpFactor is the recovery multiplier ×1.25: raising goes
+	// slower than shedding — the resolver has just shown overload, a fast
+	// return gives "shed → restored → overload again" oscillations.
 	DefaultLimitUpFactor = 1.25
-	// DefaultLimitFloorDivisor — пол лимитов: base/делитель, но не меньше 1
-	// (для 2000/10000 — 20/100): на «дне» конвейер продолжает работать,
-	// полный останов (лимит 1/1) зарезал бы пропускную способность ради
-	// резолвера, который и так лежит.
+	// DefaultLimitFloorDivisor is the limit floor: base/divisor, but at
+	// least 1 (for 2000/10000 — 20/100): at the floor the pipeline keeps
+	// running; a full stop (a 1/1 limit) would cut the throughput for the
+	// sake of a resolver that is down anyway.
 	DefaultLimitFloorDivisor = 100
 )
 
-// LimitOptions — параметры LimitResolver. Нулевые значения заменяются
-// дефолтами (withDefaults, стиль Options клиента).
+// LimitOptions holds the LimitResolver parameters. Zero values are
+// replaced with the defaults (withDefaults, the client Options style).
 type LimitOptions struct {
-	// Concurrency — потолок одновременных Exchange нижнего резолвера
-	// (dns.concurrency). По умолчанию 2000.
+	// Concurrency is the cap on concurrent Exchange calls to the lower
+	// resolver (dns.concurrency). Defaults to 2000.
 	Concurrency int
-	// MaxQPS — средний темп обменов в секунду (dns.max_qps).
-	// По умолчанию 10000.
+	// MaxQPS is the average exchange rate per second (dns.max_qps).
+	// Defaults to 10000.
 	MaxQPS int
-	// Burst — ёмкость токен-ведра: сколько обменов разрешено подряд без
-	// ожидания (короткие всплески конвейера). По умолчанию равен
-	// Concurrency — «полная волна» всех слотов разом; больше бессмысленно:
-	// одновременно летит не больше Concurrency обменов. Эффективная
-	// ёмкость дополнительно ограничивается секундой темпа (см.
-	// newLimitBucket): всплеск дольше секунды бюджета max_qps —
-	// перегрузка резолвера, а не всплеск (DNS-10).
+	// Burst is the token bucket capacity: how many exchanges may go in a row
+	// without waiting (short pipeline bursts). It defaults to Concurrency —
+	// a "full wave" of all slots at once; more is pointless: no more than
+	// Concurrency exchanges fly at once. The effective capacity is further
+	// capped by one second of rate (see newLimitBucket): a burst longer
+	// than the max_qps second budget is resolver overload, not a burst
+	// (DNS-10).
 	Burst int
-	// DisableAAAA — отвечать на AAAA-вопросы локальным пустым NOERROR
-	// без похода в резолвер. Ставится из dns.ipv6=false (NewLimitOptions):
-	// «Если на сервере нет IPv6 — AAAA-запросы отключаются конфигом»
-	// (ТЗ 5.4); без IPv6 краулер не проверяет AAAA-адреса и по HTTP.
+	// DisableAAAA — answer AAAA questions with a local empty NOERROR
+	// without going to the resolver. Set from dns.ipv6=false (NewLimitOptions):
+	// "If the server has no IPv6 — AAAA queries are disabled by config"
+	// (spec 5.4); without IPv6 the crawler does not check AAAA addresses over HTTP either.
 	DisableAAAA bool
 
-	// AdaptiveWindow — окно доли таймаутов, обменов. По умолчанию 200.
+	// AdaptiveWindow is the timeout share window, in exchanges. Defaults to 200.
 	AdaptiveWindow int
-	// AdaptiveHighRatio — порог снижения (доля ∈ (0, 1]). По умолчанию 0.10.
+	// AdaptiveHighRatio is the shedding threshold (share ∈ (0, 1]). Defaults to 0.10.
 	AdaptiveHighRatio float64
-	// AdaptiveLowRatio — порог восстановления (доля ∈ (0, high)).
-	// По умолчанию 0.02.
+	// AdaptiveLowRatio is the recovery threshold (share ∈ (0, high)).
+	// Defaults to 0.02.
 	AdaptiveLowRatio float64
-	// AdaptiveDownFactor — множитель снижения (∈ (0, 1)). По умолчанию 0.5.
+	// AdaptiveDownFactor is the shedding multiplier (∈ (0, 1)). Defaults to 0.5.
 	AdaptiveDownFactor float64
-	// AdaptiveUpFactor — множитель восстановления (∈ (1, 10]).
-	// По умолчанию 1.25.
+	// AdaptiveUpFactor is the recovery multiplier (∈ (1, 10]).
+	// Defaults to 1.25.
 	AdaptiveUpFactor float64
-	// AdaptiveFloorDivisor — пол лимитов: base/делитель, не меньше 1.
-	// По умолчанию 100.
+	// AdaptiveFloorDivisor is the limit floor: base/divisor, at least 1.
+	// Defaults to 100.
 	AdaptiveFloorDivisor int
 }
 
-// NewLimitOptions собирает параметры из секции dns: concurrency и max_qps —
-// плановые лимиты (ТЗ 5.10, есть с T-006), ipv6=false — отключение
-// AAAA-вопросов. Механика адаптива — дефолты LimitOptions (константы).
+// NewLimitOptions assembles the parameters from the dns section:
+// concurrency and max_qps are the planned limits (spec 5.10, present since
+// T-006), ipv6=false disables AAAA questions. The adaptive mechanics are the LimitOptions defaults (constants).
 func NewLimitOptions(cfg config.DNS) LimitOptions {
 	return LimitOptions{
 		Concurrency: cfg.Concurrency,
@@ -135,8 +135,8 @@ func NewLimitOptions(cfg config.DNS) LimitOptions {
 	}
 }
 
-// withDefaults заменяет нулевые и отрицательные значения дефолтами
-// (стиль Options.withDefaults: «0 — значение по умолчанию»).
+// withDefaults replaces zero and negative values with the defaults
+// (the Options.withDefaults style: "0 means the default value").
 func (o LimitOptions) withDefaults() LimitOptions {
 	if o.Concurrency <= 0 {
 		o.Concurrency = DefaultLimitConcurrency
@@ -168,9 +168,9 @@ func (o LimitOptions) withDefaults() LimitOptions {
 	return o
 }
 
-// validate проверяет значения после подстановки дефолтов. Ловит то, что
-// нормализация не исправляет осмысленно: перевёрнутый гистерезис,
-// немультипликативные факторы.
+// validate checks the values after the defaults are applied. It catches
+// what normalization cannot sensibly fix: inverted hysteresis,
+// non-multiplicative factors.
 func (o LimitOptions) validate() error {
 	if o.Concurrency < 1 {
 		return fmt.Errorf("dnsclient: лимит concurrency %d: ожидается ≥ 1", o.Concurrency)
@@ -202,16 +202,16 @@ func (o LimitOptions) validate() error {
 	return nil
 }
 
-// limitClock — время для лимитёра: продакшн — реальные часы и таймер,
-// юнит-тесты подставляют фальшивые (детерминированный темп без реальных
-// пауз). Тот же приём, что exchangeFunc у клиента: шов без зависимости
-// от интерфейса снаружи пакета.
+// limitClock is time for the limiter: production uses the real clock and
+// timers, unit tests inject fakes (a deterministic rate without real
+// pauses). The same trick as the client's exchangeFunc: a seam with no
+// dependency on interfaces outside the package.
 type limitClock struct {
 	now   func() time.Time
 	sleep func(ctx context.Context, d time.Duration) error
 }
 
-// limitRealClock — реальные часы: sleep прерывается отменой ctx.
+// limitRealClock is the real clock: sleep is interrupted by ctx cancellation.
 func limitRealClock() limitClock {
 	return limitClock{
 		now: func() time.Time { return time.Now() },
@@ -231,26 +231,26 @@ func limitRealClock() limitClock {
 	}
 }
 
-// limitSemaphore — счётный семафор параллелизма с изменяемым потолком
-// (потолок опускает адаптив). Пробуждение ждущих — close канала поколения
-// («разбудить всех»): см. комментарий пакета — массовых очередей тут не
-// планируется, а широковещательное пробуждение не теряет событий.
+// limitSemaphore is a counting concurrency semaphore with a mutable cap
+// (the adaptive lowers the cap). Waiters are woken by closing the
+// generation channel ("wake everyone"): see the package comment — no mass
+// queues are expected here, and broadcast wakeup loses no events.
 type limitSemaphore struct {
 	mu      sync.Mutex
-	cur     int // выдано слотов
-	max     int // текущий потолок
-	waiters int // ждущих acquire (чтобы не будить зря)
+	cur     int // slots issued
+	max     int // current cap
+	waiters int // acquire waiters (to avoid pointless wakeups)
 	change  chan struct{}
 }
 
-// newLimitSemaphore создаёт семафор с потолком max.
+// newLimitSemaphore creates a semaphore with the max cap.
 func newLimitSemaphore(max int) *limitSemaphore {
 	return &limitSemaphore{max: max, change: make(chan struct{})}
 }
 
-// acquire занимает слот; при исчерпании потолка ждёт освобождения,
-// изменения потолка или отмены ctx (отменившийся не занимает слот —
-// «не терять слот навсегда»).
+// acquire takes a slot; when the cap is exhausted it waits for a release,
+// a cap change or ctx cancellation (a cancelled caller takes no slot —
+// "never lose a slot forever").
 func (s *limitSemaphore) acquire(ctx context.Context) error {
 	for {
 		s.mu.Lock()
@@ -278,11 +278,11 @@ func (s *limitSemaphore) acquire(ctx context.Context) error {
 	}
 }
 
-// release возвращает слот и будит ждущих.
+// release returns the slot and wakes waiters.
 func (s *limitSemaphore) release() {
 	s.mu.Lock()
-	// Страховка от неспаренного release: отрицательный cur сломал бы
-	// инвариант cur ≤ max (потолок перестал бы ограничивать).
+	// A guard against an unpaired release: a negative cur would break the
+	// cur ≤ max invariant (the cap would stop bounding).
 	if s.cur > 0 {
 		s.cur--
 	}
@@ -290,8 +290,8 @@ func (s *limitSemaphore) release() {
 	s.mu.Unlock()
 }
 
-// setMax меняет потолок: повышение и понижение будят ждущих (при понижении
-// летящие обмены завершаются как есть — слоты не отбираются).
+// setMax changes the cap: raising and lowering both wake waiters (on
+// lowering, in-flight exchanges finish as they are — slots are not taken away).
 func (s *limitSemaphore) setMax(max int) {
 	s.mu.Lock()
 	if max != s.max {
@@ -301,14 +301,14 @@ func (s *limitSemaphore) setMax(max int) {
 	s.mu.Unlock()
 }
 
-// state возвращает текущие cur и max (снимок для Stats).
+// state returns the current cur and max (a snapshot for Stats).
 func (s *limitSemaphore) state() (cur, max int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.cur, s.max
 }
 
-// wake закрывает канал поколения; вызывающий обязан держать s.mu.
+// wake closes the generation channel; the caller must hold s.mu.
 func (s *limitSemaphore) wake() {
 	if s.waiters > 0 {
 		ch := s.change
@@ -317,39 +317,39 @@ func (s *limitSemaphore) wake() {
 	}
 }
 
-// limitBucket — токен-ведро темпа QPS с ленивым пополнением: токены
-// начисляются в момент обращения за (now−last)×rate, без фоновых горутин.
+// limitBucket is a QPS-rate token bucket with lazy refill: tokens are
+// accrued at access time for (now−last)×rate, with no background goroutines.
 //
-// Выбор против альтернатив: фиксированное окно «N в секунду» режет
-// естественные всплески конвейера (пачка субдоменов домена) и добавляет
-// джиттер на границах окон; скользящее окно честнее, но требует памяти на
-// метки времени и даёт ту же жёсткость. Токен-ведро держит средний темп
-// max_qps и допускает короткий всплеск до burst — ровно режим «пачка
-// уходит сразу, дальше темп выравнивается».
+// The choice against alternatives: a fixed "N per second" window cuts the
+// natural pipeline bursts (a domain's chunk of subdomains) and adds
+// jitter at window boundaries; a sliding window is fairer but needs memory
+// for timestamps and gives the same rigidity. A token bucket holds the
+// average max_qps rate and allows a short burst up to burst — exactly the
+// "the chunk goes out at once, then the rate evens out" mode.
 //
-// Ожидание токена — резервирование, а не поллинг: нехватка списывается с
-// баланса сразу (баланс уходит в минус — это долг перед ведром), момент
-// своей выдачи ждущий вычисляет один раз под мьютексом и спит до него
-// без пробуждений. Поллинг «проснуться к токену всем и пересчитать паузу»
-// стоил бы ~N пробуждений на каждый выданный токен (N — очередь ждущих,
-// до concurrency=2000): при 10000 QPS — миллионы пустых таймеров в
-// секунду плюс джиттер выдачи (свежепришедший перехватывает токен у
-// разбуженного).
+// Waiting for a token is reservation, not polling: a shortage is charged
+// to the balance right away (the balance goes negative — a debt to the
+// bucket), the waiter computes its own issue moment once under the mutex
+// and sleeps until it with no wakeups. Polling "everyone wakes up for the
+// token and recomputes the pause" would cost ~N wakeups per issued token
+// (N is the waiter queue, up to concurrency=2000): at 10000 QPS that is
+// millions of empty timers per second plus issue jitter (a newcomer
+// steals the token from the woken one).
 type limitBucket struct {
 	mu       sync.Mutex
 	clock    limitClock
-	rate     float64 // токенов в секунду (эффективный QPS)
-	burst    float64 // текущая ёмкость ведра (следует за темпом, ≤ maxBurst)
-	maxBurst float64 // исходная ёмкость (потолок восстановления)
+	rate     float64 // tokens per second (the effective QPS)
+	burst    float64 // current bucket capacity (follows the rate, ≤ maxBurst)
+	maxBurst float64 // original capacity (the recovery cap)
 	tokens   float64
-	last     time.Time // момент последнего начисления
+	last     time.Time // moment of the last accrual
 }
 
-// newLimitBucket создаёт полное ведро (ёмкость токенов): плановая волна
-// старта конвейера уходит без ожидания. Ёмкость не выше секундного
-// бюджета темпа: при типовом тюнинге слабого резолвера
-// (max_qps ≪ concurrency) «полная волна» слотов — секунды обмена залпом
-// мимо настроенного темпа (DNS-10).
+// newLimitBucket creates a full bucket (the token capacity): the planned
+// pipeline startup wave goes out without waiting. The capacity is no
+// higher than the one-second rate budget: with the typical tuning for a
+// weak resolver (max_qps ≪ concurrency), a "full wave" of slots would be
+// seconds of exchanges fired past the configured rate at once (DNS-10).
 func newLimitBucket(qps float64, burst int, clock limitClock) *limitBucket {
 	cap := math.Min(float64(burst), qps)
 	if cap < 1 {
@@ -365,13 +365,13 @@ func newLimitBucket(qps float64, burst int, clock limitClock) *limitBucket {
 	}
 }
 
-// take забирает токен; при пустом ведре ждёт начисления «своего» токена
-// или отмены ctx (ожидающий токен не занимает его навсегда — семафор
-// возвращается вызывающим по ошибке). Момент выдачи резервируется до
-// ожидания (см. комментарий limitBucket): каждый ждущий спит ровно до
-// своей метки и просыпается один раз. Отмена возвращает резерв —
-// отменённое ожидание не тратит пропускную способность и не удлиняет
-// ожидание очереди за ним.
+// take takes a token; with an empty bucket it waits for its own token to
+// be accrued or for ctx cancellation (a token waiter does not hold the
+// token forever — the semaphore is released by the caller on error). The
+// issue moment is reserved before the wait (see the limitBucket comment):
+// every waiter sleeps exactly until its mark and wakes once. Cancellation
+// returns the reservation — a cancelled wait spends no capacity and does
+// not lengthen the wait of the queue behind it.
 func (b *limitBucket) take(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -384,21 +384,21 @@ func (b *limitBucket) take(ctx context.Context) error {
 		b.unreserve()
 		return err
 	}
-	// К пробуждению собственный долг погашен начислением (момент выдачи
-	// вычислен под мьютексом по балансу с учётом всех предыдущих
-	// резервов): ждущий проходит без повторной проверки общего баланса —
-	// в нём остались долги очереди за ним, и такая проверка отправила бы
-	// его в конец общего ожидания, ссыпая пачку в один всплеск. Темп,
-	// сниженный адаптивом за время ожидания, даёт одноразовый допуск
-	// одному ждущему — дешевле, чем повторные пробуждения.
+	// By the wakeup the own debt is paid off by accrual (the issue moment
+	// was computed under the mutex from the balance including all previous
+	// reservations): the waiter passes without re-checking the common
+	// balance — it still holds the queue debts behind it, and such a check
+	// would send it to the end of the common wait, collapsing the chunk into
+	// one burst. The rate lowered by the adaptive during the wait gives a
+	// one-time allowance to one waiter — cheaper than repeated wakeups.
 	return nil
 }
 
-// reserve списывает токен без ожидания: при нехватке баланс уходит в
-// минус (резерв будущего начисления); ok=false — токена нет, wait —
-// время до начисления «своего» токена по текущему темпу (учтены резервы
-// всех вставших в очередь раньше — выдача в порядке прихода, без
-// перехвата токена свежепришедшим).
+// reserve charges a token without waiting: on shortage the balance goes
+// negative (a reservation of a future accrual); ok=false — no token, wait
+// is the time until its own token accrues at the current rate (the
+// reservations of everyone queued earlier are accounted — issue in arrival
+// order, no token stealing by newcomers).
 func (b *limitBucket) reserve() (time.Duration, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -407,9 +407,9 @@ func (b *limitBucket) reserve() (time.Duration, bool) {
 	if b.tokens >= 0 {
 		return 0, true
 	}
-	// (−tokens)/rate секунд до начисления «своего» токена; минимум 1 нс —
-	// защита от нулевого ожидания на округлении (иначе take крутился бы
-	// вхолостую).
+	// (−tokens)/rate seconds until its own token accrues; a minimum of 1 ns —
+	// a guard against zero wait from rounding (otherwise take would spin
+	// idly).
 	wait := time.Duration(-b.tokens / b.rate * float64(time.Second))
 	if wait < 1 {
 		wait = 1
@@ -417,9 +417,9 @@ func (b *limitBucket) reserve() (time.Duration, bool) {
 	return wait, false
 }
 
-// unreserve возвращает резерв отменённого ожидания: баланс растёт на
-// один токен (не выше ёмкости ведра) — отмена не оставляет долг, который
-// иначе удлинял бы ожидание очереди за отменённым.
+// unreserve returns the reservation of a cancelled wait: the balance grows
+// by one token (no higher than the bucket capacity) — cancellation leaves
+// no debt that would otherwise lengthen the queue wait behind the cancelled one.
 func (b *limitBucket) unreserve() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -427,12 +427,12 @@ func (b *limitBucket) unreserve() {
 	b.tokens = math.Min(b.burst, b.tokens+1)
 }
 
-// setRate меняет темп (адаптив): сначала начисляет токены по старому
-// темпу. Ёмкость следует за темпом — не выше исходной (maxBurst):
-// всплеск после простоя обязан вписываться в секундный бюджет
-// действующего QPS, иначе накопленный до снижения burst уходил бы
-// залпом мимо сниженного темпа (DNS-10); накопленные токены подрезаются
-// до новой ёмкости. Восстановление темпа возвращает ёмкость до исходной.
+// setRate changes the rate (the adaptive): it first accrues tokens at the
+// old rate. The capacity follows the rate — no higher than the original
+// (maxBurst): a burst after an idle must fit into the per-second budget
+// of the active QPS, otherwise the burst accumulated before the shedding
+// would fire past the lowered rate at once (DNS-10); the accrued tokens
+// are trimmed to the new capacity. Rate recovery returns the capacity to the original.
 func (b *limitBucket) setRate(qps float64) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -445,7 +445,7 @@ func (b *limitBucket) setRate(qps float64) {
 	b.tokens = math.Min(b.tokens, b.burst)
 }
 
-// refill начисляет токены по прошедшему времени; вызывающий держит b.mu.
+// refill accrues tokens for the elapsed time; the caller holds b.mu.
 func (b *limitBucket) refill() {
 	if now := b.clock.now(); now.After(b.last) {
 		b.tokens = math.Min(b.burst, b.tokens+now.Sub(b.last).Seconds()*b.rate)
@@ -453,31 +453,31 @@ func (b *limitBucket) refill() {
 	}
 }
 
-// limitAdaptive — адаптивное снижение нагрузки по доле таймаутов (ТЗ 5.4)
-// в скользящем окне последних AdaptiveWindow обменов.
+// limitAdaptive is adaptive load shedding by the timeout share (spec 5.4)
+// in the sliding window of the last AdaptiveWindow exchanges.
 //
-// Механика: кольцевой буфер исходов (таймаут/нет) со счётчиками — доля
-// считается за O(1). Решение принимается после каждого обмена, но только
-// когда окно заполнено (иначе первый же таймаут на старте урезал бы лимиты
-// по статистике из одного события).
+// Mechanics: a ring buffer of outcomes (timeout/not) with counters — the
+// share is computed in O(1). The decision is made after every exchange,
+// but only when the window is full (otherwise the first timeout at startup
+// would cut the limits based on a one-event statistic).
 //
-// Направления (обоснование): снижение мультипликативное и решительное
-// (×0.5) — пока резолвер таймаутит, каждый обмен жжёт бюджет попыток и
-// держит слот, вялое снижение растягивает аварию; восстановление осторожнее
-// (×1.25) — резолвер только что был перегружен, быстрый возврат даёт
-// осцилляцию. Между порогами — зона нечувствительности (гистерезис).
+// Directions (rationale): shedding is multiplicative and decisive (×0.5)
+// — while the resolver times out, every exchange burns the attempt budget
+// and holds a slot, a sluggish shed stretches the incident; recovery is
+// more careful (×1.25) — the resolver has just been overloaded, a fast
+// return gives oscillation. Between the thresholds is a deadband (hysteresis).
 //
-// Пол: base/DefaultLimitFloorDivisor (не меньше 1) — на «дне» конвейер
-// продолжает работать, пока резолвер восстанавливается.
+// The floor: base/DefaultLimitFloorDivisor (at least 1) — at the floor the
+// pipeline keeps running while the resolver recovers.
 //
-// Таймауты считаются только IsTimeout: отказы протокола/соединения — другая
-// семантика (резолвер не «не успевает», а недоступен/бит), ТЗ 5.4 привязывает
-// снижение именно к доле таймаутов.
+// Only IsTimeout counts as a timeout: protocol/connection refusals are a
+// different semantics (the resolver is not "slow" but unreachable/broken);
+// spec 5.4 ties the shedding specifically to the timeout share.
 type limitAdaptive struct {
 	mu              sync.Mutex
-	window          []bool // кольцо исходов: true — таймаут
-	next            int    // позиция старейшей записи
-	filled          bool   // окно заполнено целиком
+	window          []bool // the outcome ring: true — a timeout
+	next            int    // position of the oldest record
+	filled          bool   // the window is filled completely
 	timeouts, total int
 
 	baseConc int
@@ -491,7 +491,7 @@ type limitAdaptive struct {
 	down, up  float64
 }
 
-// newLimitAdaptive готовит адаптив с базовыми лимитами (пол — base/div).
+// newLimitAdaptive prepares the adaptive with base limits (the floor is base/div).
 func newLimitAdaptive(o LimitOptions) *limitAdaptive {
 	minConc := o.Concurrency / o.AdaptiveFloorDivisor
 	if minConc < 1 {
@@ -516,19 +516,19 @@ func newLimitAdaptive(o LimitOptions) *limitAdaptive {
 	}
 }
 
-// record добавляет исход обмена и возвращает эффективные лимиты.
-// Изменившиеся лимиты применяются колбэком apply под тем же мьютексом
-// (DNS-11): применение вне блокировки позволяло параллельным
-// наблюдателям окна наложить значения в произвольном порядке —
-// устаревший больший лимит ложился последним и на один шаг возвращал
-// нагрузку резолверу в момент аварии. Порядок блокировок
-// a.mu → семафор/ведро обратных путей не имеет: те об адаптиве не знают.
+// record adds an exchange outcome and returns the effective limits.
+// Changed limits are applied by the apply callback under the same mutex
+// (DNS-11): applying outside the lock let parallel window observers apply
+// the values in arbitrary order — a stale larger limit applied last
+// would, for one step, hand the load back to the resolver right in the
+// middle of the incident. The lock order a.mu → semaphore/bucket does not
+// matter on the reverse paths: those know nothing about the adaptive.
 func (a *limitAdaptive) record(timedOut bool, apply func(conc int, qps float64)) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
 	if a.filled {
-		// Окно заполнено: вытесняем старейшую запись.
+		// The window is full: evict the oldest record.
 		if a.window[a.next] {
 			a.timeouts--
 		}
@@ -553,7 +553,7 @@ func (a *limitAdaptive) record(timedOut bool, apply func(conc int, qps float64))
 	ratio := float64(a.timeouts) / float64(a.total)
 	switch {
 	case ratio >= a.high:
-		// Снижение: вниз с округлением к меньшему, пол держит.
+		// Shedding: down, rounded toward zero; the floor holds.
 		newConc := max(a.minConc, int(float64(a.conc)*a.down))
 		newQPS := math.Max(a.minQPS, a.qps*a.down)
 		if newConc != a.conc || newQPS != a.qps {
@@ -563,8 +563,8 @@ func (a *limitAdaptive) record(timedOut bool, apply func(conc int, qps float64))
 			}
 		}
 	case ratio <= a.low && (a.conc < a.baseConc || a.qps < a.baseQPS):
-		// Восстановление: вверх с округлением к большему (ceil даёт рост
-		// даже с 1), потолок — настроенные лимиты.
+		// Recovery: up with rounding up (ceil gives growth even from 1), the
+		// cap is the configured limits.
 		newConc := min(a.baseConc, int(math.Ceil(float64(a.conc)*a.up)))
 		newQPS := math.Min(a.baseQPS, a.qps*a.up)
 		if newConc != a.conc || newQPS != a.qps {
@@ -576,35 +576,35 @@ func (a *limitAdaptive) record(timedOut bool, apply func(conc int, qps float64))
 	}
 }
 
-// snapshot возвращает текущее состояние (Stats): эффективные и базовые
-// лимиты, состояние окна.
+// snapshot returns the current state (Stats): the effective and base
+// limits, the window state.
 func (a *limitAdaptive) snapshot() (conc, baseConc int, qps, baseQPS float64, windowSize, windowTimeouts int, filled bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.conc, a.baseConc, a.qps, a.baseQPS, a.total, a.timeouts, a.filled
 }
 
-// LimitStats — снимок состояния лимитёра для мониторинга (экспорт метрик —
-// T-077; здесь только данные, без зависимости от внутреннего/metrics).
+// LimitStats is a snapshot of the limiter state for monitoring (metric
+// export — T-077; only data here, no dependency on internal/metrics).
 type LimitStats struct {
-	Concurrency    int     // эффективный потолок параллелизма (после адаптива)
-	ConcurrencyCfg int     // настроенный потолок (dns.concurrency)
-	QPS            float64 // эффективный темп (после адаптива)
-	QPSCfg         float64 // настроенный темп (dns.max_qps)
-	InFlight       int     // обменов в нижнем резолвере сейчас
-	WindowFilled   bool    // окно адаптива заполнено
-	WindowSize     int     // обменов в окне (пока наполняется — меньше)
-	WindowTimeouts int     // таймаутов в окне
-	Exchanges      int64   // завершено обменов через лимитёр
-	Timeouts       int64   // из них — таймауты
-	Errors         int64   // из них — прочие ошибки
-	AAAAIgnored    int64   // AAAA-вопросов отвечено локально (без резолвера)
+	Concurrency    int     // the effective concurrency cap (after the adaptive)
+	ConcurrencyCfg int     // the configured cap (dns.concurrency)
+	QPS            float64 // the effective rate (after the adaptive)
+	QPSCfg         float64 // the configured rate (dns.max_qps)
+	InFlight       int     // exchanges in the lower resolver right now
+	WindowFilled   bool    // the adaptive window is full
+	WindowSize     int     // exchanges in the window (fewer while filling)
+	WindowTimeouts int     // timeouts in the window
+	Exchanges      int64   // exchanges completed through the limiter
+	Timeouts       int64   // of them — timeouts
+	Errors         int64   // of them — other errors
+	AAAAIgnored    int64   // AAAA questions answered locally (no resolver)
 }
 
-// LimitResolver — декоратор Resolver с лимитами параллелизма/QPS,
-// адаптивным снижением по доле таймаутов и отключением AAAA (ТЗ 5.4,
-// dns.concurrency/max_qps/ipv6 из ТЗ 5.10). Безопасен для одновременного
-// использования из горутин.
+// LimitResolver is a Resolver decorator with concurrency/QPS limits,
+// adaptive shedding by the timeout share and AAAA disabling (spec 5.4,
+// dns.concurrency/max_qps/ipv6 from spec 5.10). Safe for concurrent use
+// from goroutines.
 type LimitResolver struct {
 	next     Resolver
 	opt      LimitOptions
@@ -621,14 +621,14 @@ type LimitResolver struct {
 // compile-time check: *LimitResolver — Resolver.
 var _ Resolver = (*LimitResolver)(nil)
 
-// NewLimitResolver оборачивает next лимитами по opts (см. NewLimitOptions
-// для сборки из конфигурации). Ошибка — nil next или бессмысленные
-// параметры (после подстановки дефолтов).
+// NewLimitResolver wraps next with the limits from opts (see
+// NewLimitOptions for assembling from the configuration). An error is a
+// nil next or meaningless parameters (after the defaults are applied).
 func NewLimitResolver(next Resolver, opts LimitOptions) (*LimitResolver, error) {
 	return newLimitResolver(next, opts, limitRealClock())
 }
 
-// newLimitResolver — общая часть с инъекцией часов (тесты).
+// newLimitResolver is the common part with clock injection (tests).
 func newLimitResolver(next Resolver, opts LimitOptions, clock limitClock) (*LimitResolver, error) {
 	if next == nil {
 		return nil, errors.New("dnsclient: NewLimitResolver: нижний резолвер не задан")
@@ -646,13 +646,13 @@ func newLimitResolver(next Resolver, opts LimitOptions, clock limitClock) (*Limi
 	}, nil
 }
 
-// Exchange выполняет вопрос через лимиты: слот параллелизма → токен темпа →
-// нижний резолвер. Отмена ctx прерывает ожидание в любой очереди; занятые
-// к этому моменту слоты возвращаются (defer), токен в очередь не ставится.
+// Exchange performs the question through the limits: a concurrency slot →
+// a rate token → the lower resolver. A ctx cancellation aborts the wait in
+// any queue; slots held by then are returned (defer), the token is not queued.
 //
-// AAAA при DisableAAAA — локальный пустой NOERROR (NODATA: «имя есть,
-// записей этого типа нет»): без похода в сеть, без лимитов и окна адаптива.
-// Attempts 0, TCP false, Elapsed 0 — обмена не было.
+// AAAA with DisableAAAA — a local empty NOERROR (NODATA: "the name exists,
+// no records of this type"): no trip to the network, no limits, no
+// adaptive window. Attempts 0, TCP false, Elapsed 0 — no exchange happened.
 func (r *LimitResolver) Exchange(ctx context.Context, q Question) (*Result, error) {
 	if r.opt.DisableAAAA && q.Type == dns.TypeAAAA {
 		r.aaaaIgnored.Add(1)
@@ -670,9 +670,9 @@ func (r *LimitResolver) Exchange(ctx context.Context, q Question) (*Result, erro
 	return res, err
 }
 
-// observe учитывает исход обмена: счётчики и адаптив; изменившиеся
-// эффективные лимиты применяются к семафору и ведру под блокировкой
-// адаптива (см. limitAdaptive.record — DNS-11).
+// observe accounts for the exchange outcome: the counters and the adaptive;
+// changed effective limits are applied to the semaphore and the bucket
+// under the adaptive lock (see limitAdaptive.record — DNS-11).
 func (r *LimitResolver) observe(err error) {
 	r.exchanges.Add(1)
 	timedOut := IsTimeout(err)
@@ -689,8 +689,8 @@ func (r *LimitResolver) observe(err error) {
 	})
 }
 
-// Stats возвращает снимок состояния (точки для мониторинга T-077:
-// эффективные лимиты, окно адаптива, счётчики).
+// Stats returns a state snapshot (monitoring points for T-077: the
+// effective limits, the adaptive window, the counters).
 func (r *LimitResolver) Stats() LimitStats {
 	conc, baseConc, qps, baseQPS, windowSize, windowTimeouts, filled := r.adaptive.snapshot()
 	cur, _ := r.sem.state()

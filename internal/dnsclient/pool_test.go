@@ -1,6 +1,6 @@
-// Тесты пула UDP-сокетов. Сокеты — настоящие, на петле 127.0.0.1
-// (копятся в буфере приёмника, без внешнего стека); сетевого обмена
-// нет: проверяется только выдача/возврат/параллельность.
+// Tests of the UDP socket pool. The sockets are real, on the 127.0.0.1
+// loopback (they pile up in the receiver buffer, no external stack); no
+// network exchange: only issue/return/parallelism are checked.
 
 package dnsclient
 
@@ -14,9 +14,9 @@ import (
 	"time"
 )
 
-// loopUDPAddr открывает свободный UDP-адрес на петле: подключённым
-// сокетам пула нужен валидный партнёр, чтобы отправка не порождала
-// ICMP и ошибок — пул тестируется без обмена.
+// loopUDPAddr opens a free UDP address on the loopback: the pool's
+// connected sockets need a valid peer so that sends do not generate
+// ICMP and errors — the pool is tested without exchanges.
 func loopUDPAddr(t *testing.T) string {
 	t.Helper()
 	c, err := net.ListenPacket("udp", "127.0.0.1:0")
@@ -27,8 +27,8 @@ func loopUDPAddr(t *testing.T) string {
 	return c.LocalAddr().String()
 }
 
-// assertConnClosed проверяет, что сокет закрыт (чтение возвращает ошибку
-// «использовано закрытое соединение», а не таймаут).
+// assertConnClosed checks that the socket is closed (reading returns the
+// "use of closed connection" error, not a timeout).
 func assertConnClosed(t *testing.T, conn *net.UDPConn) {
 	t.Helper()
 	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
@@ -45,9 +45,9 @@ func TestUDPPoolReuseSocket(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = p.Close() })
 
-	// Пул одного сокета: возвращённый сокет обязан выдаваться снова,
-	// новых Dial не появляется (канал free — FIFO, переиспользование
-	// проверяется на размере 1, где сокет единственный).
+	// A one-socket pool: the returned socket must be issued again, no new
+	// Dials appear (the free channel is FIFO; reuse is checked at size 1,
+	// where the socket is the only one).
 	c1, err := p.Get(context.Background())
 	if err != nil {
 		t.Fatalf("get: %v", err)
@@ -76,14 +76,14 @@ func TestUDPPoolGetWaitsForFreeSocket(t *testing.T) {
 		t.Fatalf("get: %v", err)
 	}
 
-	// Пул исчерпан: ждущий Get укладывается в свой таймаут ожидания.
+	// The pool is exhausted: a waiting Get fits into its own wait timeout.
 	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
 	defer cancel()
 	if c, err := p.Get(ctx); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("ожидается DeadlineExceeded, получены %v, %v", c, err)
 	}
 
-	// Освобождение будит ждущего.
+	// A release wakes the waiter.
 	got := make(chan *net.UDPConn, 1)
 	errCh := make(chan error, 1)
 	go func() {
@@ -94,7 +94,7 @@ func TestUDPPoolGetWaitsForFreeSocket(t *testing.T) {
 		}
 		got <- c
 	}()
-	// Дать ждущему время встать в select, затем вернуть сокет.
+	// Give the waiter time to enter the select, then return the socket.
 	time.Sleep(30 * time.Millisecond)
 	p.Put(c1)
 	select {
@@ -142,9 +142,9 @@ func TestUDPPoolGetCancelledWhileWaiting(t *testing.T) {
 	}
 }
 
-// TestUDPPoolParallelInvariants — конкурентная работа (гонки ловит
-// -race): сокет никогда не выдаётся двум владельцам одновременно,
-// всего сокетов не больше размера пула.
+// TestUDPPoolParallelInvariants — concurrent work (the -race run catches
+// races): a socket is never issued to two owners at once, and the total
+// number of sockets never exceeds the pool size.
 func TestUDPPoolParallelInvariants(t *testing.T) {
 	addr := loopUDPAddr(t)
 	const size = 4
@@ -185,7 +185,7 @@ func TestUDPPoolParallelInvariants(t *testing.T) {
 				seenAll[conn] = true
 				mu.Unlock()
 
-				time.Sleep(time.Millisecond) // «работа» с сокетом
+				time.Sleep(time.Millisecond) // "work" with the socket
 
 				mu.Lock()
 				delete(inUse, conn)
@@ -214,8 +214,8 @@ func TestUDPPoolDiscardReplacedLazily(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = p.Close() })
 
-	// Считаем наборы после стартового eager-набора (DNS-08): рядом со
-	// свободным сокетом Get не открывает новый.
+	// Count dials after the initial eager dial (DNS-08): Get does not open
+	// a new socket while a free one is around.
 	var dials atomic.Int32
 	old := p.dial
 	p.dial = func(ctx context.Context) (*net.UDPConn, error) {
@@ -230,8 +230,8 @@ func TestUDPPoolDiscardReplacedLazily(t *testing.T) {
 	p.Discard(c1)
 	assertConnClosed(t, c1)
 
-	// Место освободилось, но в канале лежит свободный eager-сокет —
-	// Get отдаёт его, а не набирает замещающий.
+	// Room freed up, but a free eager socket sits in the channel — Get
+	// hands it out instead of dialing a replacement.
 	c2, err := p.Get(context.Background())
 	if err != nil {
 		t.Fatalf("get после discard: %v", err)
@@ -243,7 +243,7 @@ func TestUDPPoolDiscardReplacedLazily(t *testing.T) {
 		t.Fatalf("наборов %d рядом со свободным сокетом, want 0", n)
 	}
 
-	// Канал пуст, место есть — теперь Get лениво набирает замещающий.
+	// The channel is empty and there is room — now Get lazily dials a replacement.
 	c3, err := p.Get(context.Background())
 	if err != nil {
 		t.Fatalf("get: %v", err)
@@ -265,7 +265,7 @@ func TestUDPPoolClose(t *testing.T) {
 		t.Fatalf("NewUDPPool: %v", err)
 	}
 
-	// Один сокет выдан, второй свободен.
+	// One socket is issued, the other is free.
 	held, err := p.Get(context.Background())
 	if err != nil {
 		t.Fatalf("get: %v", err)
@@ -273,8 +273,8 @@ func TestUDPPoolClose(t *testing.T) {
 	if err := p.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
-	assertConnClosed(t, held) // выданный закрывается при возврате…
-	p.Put(held)               // …и не возвращается в закрытый пул
+	assertConnClosed(t, held) // the issued socket is closed on return…
+	p.Put(held)               // …and does not go back into the closed pool
 	if _, err := p.Get(context.Background()); !errors.Is(err, ErrPoolClosed) {
 		t.Fatalf("get после close: ожидается ErrPoolClosed, получено %v", err)
 	}
@@ -283,9 +283,9 @@ func TestUDPPoolClose(t *testing.T) {
 	}
 }
 
-// TestUDPPoolCloseWakesWaiters — Close будит ждущих Get (done-канал):
-// без дедлайна собственного ctx ждущий получает ErrPoolClosed, а не
-// висит до конца процесса (DNS-09).
+// TestUDPPoolCloseWakesWaiters — Close wakes waiting Get calls (the done
+// channel): without a deadline of its own ctx a waiter gets ErrPoolClosed,
+// not hangs until the end of the process (DNS-09).
 func TestUDPPoolCloseWakesWaiters(t *testing.T) {
 	addr := loopUDPAddr(t)
 	p, err := NewUDPPool(context.Background(), addr, 1)
@@ -293,16 +293,16 @@ func TestUDPPoolCloseWakesWaiters(t *testing.T) {
 		t.Fatalf("NewUDPPool: %v", err)
 	}
 
-	held, err := p.Get(context.Background()) // единственный сокет занят
+	held, err := p.Get(context.Background()) // the only socket is taken
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
 	res := make(chan error, 1)
 	go func() {
-		_, err := p.Get(context.Background()) // ctx без дедлайна
+		_, err := p.Get(context.Background()) // a ctx with no deadline
 		res <- err
 	}()
-	time.Sleep(30 * time.Millisecond) // ждущий встал в select
+	time.Sleep(30 * time.Millisecond) // the waiter has entered the select
 	if err := p.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
@@ -324,15 +324,15 @@ func TestUDPPoolBadArguments(t *testing.T) {
 	if _, err := NewUDPPool(context.Background(), "nohostport", 1); err == nil {
 		t.Fatal("кривой адрес: ожидается ошибка")
 	}
-	// Порт вне диапазона: разберётся SplitHostPort, но не DialContext —
-	// eager-набор обязан упасть, а не отдать мёртвый пул.
+	// A port out of range: SplitHostPort will parse it, DialContext will
+	// not — the eager dial must fail, not hand out a dead pool.
 	if _, err := NewUDPPool(context.Background(), "127.0.0.1:99999", 1); err == nil {
 		t.Fatal("недоступный порт: ожидается ошибка eager-набора")
 	}
 }
 
-// TestUDPPoolDialFailureAtGet — ленивый набор после Discard ошибкой не
-// ломает счётчик: следующая попытка снова набирает сокет.
+// TestUDPPoolDialFailureAtGet — a lazy dial failing after Discard does not
+// break the counter: the next attempt dials the socket again.
 func TestUDPPoolDialFailureAtGet(t *testing.T) {
 	addr := loopUDPAddr(t)
 	p, err := NewUDPPool(context.Background(), addr, 1)
@@ -358,7 +358,7 @@ func TestUDPPoolDialFailureAtGet(t *testing.T) {
 	if _, err := p.Get(context.Background()); err == nil {
 		t.Fatal("первый (падающий) набор: ожидается ошибка")
 	}
-	// Счётчик места освобождён: повторный Get снова набирает сокет.
+	// The room counter is freed: a repeated Get dials the socket again.
 	c2, err := p.Get(context.Background())
 	if err != nil {
 		t.Fatalf("get после неудачного набора: %v", err)

@@ -1,13 +1,13 @@
-// Юнит-тесты агрегации на уровне домена (T-072; ТЗ 5.8 «на уровне домена
-// — агрегат (максимальный score, объединённый диапазон, маска
-// субдоменов)», §6.1 laravel_domains, §13.1, 3.4, 3.5) — на фейковом
-// пуле worker_test.go, расширенном живой семантикой laravel_domains
-// (SELECT уверенных срабатываний домена, upsert/DELETE по PK). Проверяются
-// SQL-контракты и типы параметров, максимальный score, объединение
-// диапазонов версий (NULL-границы и конфликт T-070, числовой порядок
-// версий), маска битов субдоменов, upsert/удаление строки домена,
-// идемпотентность повторной доставки, deleted-домен, сбои шагов и отмена
-// ctx, «нет уверенных срабатываний — нет строки».
+// Unit tests of the domain-level aggregation (T-072; spec 5.8 "at the
+// domain level — an aggregate (the maximum score, the union range, the
+// subdomain mask)", §6.1 laravel_domains, §13.1, 3.4, 3.5) — on the
+// worker_test.go fake pool extended with live laravel_domains semantics
+// (the SELECT of the domain's confident hits, upsert/DELETE by PK).
+// Checked: the SQL contracts and parameter types, the maximum score, the
+// version range union (NULL bounds and the T-070 conflict, the numeric
+// version order), the subdomain bit mask, the domain row upsert/delete,
+// repeat delivery idempotency, a deleted domain, step failures and ctx
+// cancellation, "no confident hits — no row".
 package analyzer
 
 import (
@@ -27,15 +27,15 @@ import (
 	"crawler/internal/queue"
 )
 
-// --- фейковый пул: laravel_domains (расширение anFakePool) ----------------------
+// --- fake pool: laravel_domains (anFakePool extension) ---------------------
 
-// anDomainKey — PK laravel_domains в фейке.
+// anDomainKey is the laravel_domains PK in the fake.
 type anDomainKey struct {
 	zone   int16
 	domain int64
 }
 
-// anDomain — строка laravel_domains, которую пишет aggregateUpsertSQL.
+// anDomain is a laravel_domains row written by aggregateUpsertSQL.
 type anDomain struct {
 	score        float32
 	verMin       *string
@@ -45,12 +45,13 @@ type anDomain struct {
 	updatedAt    time.Time
 }
 
-// Query реализует aggregateSelectSQL в транзакции фейка: уверенные
-// срабатывания (is_laravel) домена в порядке PK — детерминированно, как
-// лист партиции PostgreSQL; собственные записи транзакции (findings этой
-// доставки) видны — Exec фейка меняет состояние напрямую, Rollback
-// восстанавливает снапшот. Инъекции aggScanErr/aggRowsErr и onClose —
-// мутационные тесты T-M10 (сбой Scan/Err строк, контроль Close).
+// Query implements aggregateSelectSQL in the fake transaction: the
+// domain's confident hits (is_laravel) in PK order — deterministically,
+// like a PostgreSQL partition leaf; the transaction's own writes (this
+// delivery's findings) are visible — the fake's Exec changes the state
+// directly, Rollback restores the snapshot. The aggScanErr/aggRowsErr
+// and onClose injections are for the T-M10 mutation tests (row
+// Scan/Err failures, Close control).
 func (t *anFakeTx) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -86,8 +87,8 @@ func (t *anFakeTx) Query(ctx context.Context, sql string, args ...any) (pgx.Rows
 		onClose: func() { t.pool.j.record(anEvAggClose) }}, nil
 }
 
-// anAggRows — pgx.Rows с уверенными срабатываниями домена (subdomain_id,
-// score, ver_min, ver_max); scanErr/err/onClose — инъекции T-M10.
+// anAggRows is pgx.Rows with the domain's confident hits (subdomain_id,
+// score, ver_min, ver_max); scanErr/err/onClose are T-M10 injections.
 type anAggRows struct {
 	rows    [][]any
 	i       int
@@ -123,8 +124,8 @@ func (r *anAggRows) Scan(dest ...any) error {
 		return fmt.Errorf("anAggRows: Scan без Next или приёмников %d (нужно 4)", len(dest))
 	}
 	row := r.rows[r.i-1]
-	// NULL → nil-приёмник остаётся нетронутым (семантика pgx: *string
-	// для границ остаётся nil).
+	// NULL → the nil destination stays untouched (the pgx semantics: a
+	// *string for a bound stays nil).
 	for i, v := range row {
 		if v == nil {
 			continue
@@ -148,7 +149,7 @@ func (r *anAggRows) RawValues() [][]byte    { return nil }
 func (r *anAggRows) Conn() *pgx.Conn        { return nil }
 func (r *anAggRows) TypeMap() *pgtype.Map   { return nil }
 
-// anDomainSnapshot — снапшот строки laravel_domains.
+// anDomainSnapshot is a snapshot of the laravel_domains row.
 func anDomainSnapshot(p *anFakePool, zone int16, domain int64) (anDomain, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -158,21 +159,21 @@ func anDomainSnapshot(p *anFakePool, zone int16, domain int64) (anDomain, bool) 
 	return anDomain{}, false
 }
 
-// anSeedFinding — готовое срабатывание чужого (уже зафиксированного)
-// эпизода: у старых findings своей строки subdomain_results не требуется.
+// anSeedFinding is a ready-made hit of a foreign (already committed)
+// episode: old findings need no subdomain_results row of their own.
 func anSeedFinding(p *anFakePool, key anRowKey, score float32, verMin, verMax *string, isLaravel bool) {
 	p.findings[key] = &anFinding{score: score, verMin: verMin, verMax: verMax, isLaravel: isLaravel, rulesVersion: 999}
 }
 
-// anStr — указатель на строку (граница диапазона фикстуры).
+// anStr is a pointer to a string (a fixture range bound).
 func anStr(s string) *string { return &s }
 
-// --- SQL-контракт --------------------------------------------------------------
+// --- SQL contract ----------------------------------------------------------
 
-// TestAggregate_SQLContract — точный текст SQL агрегации против миграции
-// 000001 (laravel_domains: PK (zone_id, domain_id), score real, ver_min/
-// ver_max text, found_on_mask bigint, rules_version integer NOT NULL,
-// updated_at timestamptz NOT NULL) и §13.1 (порог is_laravel).
+// TestAggregate_SQLContract — the exact aggregation SQL text against
+// migration 000001 (laravel_domains: PK (zone_id, domain_id), score
+// real, ver_min/ver_max text, found_on_mask bigint, rules_version
+// integer NOT NULL, updated_at timestamptz NOT NULL) and §13.1 (the is_laravel threshold).
 func TestAggregate_SQLContract(t *testing.T) {
 	if !strings.Contains(aggregateLockSQL, "pg_advisory_xact_lock($1::int8)") {
 		t.Error("lock: нет advisory-блокировки домена до конца транзакции")
@@ -206,7 +207,7 @@ func TestAggregate_SQLContract(t *testing.T) {
 	}
 }
 
-// --- scanAggregate: объединение диапазонов, маска, максимум ---------------------
+// --- scanAggregate: range union, mask, maximum -----------------------------
 
 func TestAggregate_ScanSemantics(t *testing.T) {
 	cases := []struct {
@@ -330,8 +331,8 @@ func TestAggregate_ScanSemantics(t *testing.T) {
 	}
 }
 
-// TestAggregate_InvalidSubdomainID — номер бита вне 0..62 (мусор в БД)
-// — ошибка, маска не искажается молча (model.DNSMask).
+// TestAggregate_InvalidSubdomainID — a bit number outside 0..62 (junk in
+// the DB) is an error, the mask is not silently corrupted (model.DNSMask).
 func TestAggregate_InvalidSubdomainID(t *testing.T) {
 	_, err := scanAggregate(&anAggRows{rows: [][]any{{int16(63), float32(0.7), nil, nil}}})
 	if err == nil {
@@ -339,36 +340,36 @@ func TestAggregate_InvalidSubdomainID(t *testing.T) {
 	}
 }
 
-// --- через воркер: транзакция, upsert/удаление, идемпотентность -----------------
+// --- through the worker: transaction, upsert/delete, idempotency -----------
 
-// TestAggregate_ThroughWorker — сквозной контракт: findings домена
-// (написанные доставкой + зафиксированные раньше) → advisory-блокировка →
-// SELECT уверенных срабатываний → upsert laravel_domains (максимальный
-// score, объединённый диапазон, маска, версия набора) → COMMIT; порядок —
-// по журналу. Чужой домен и слабые срабатывания в агрегат не входят.
+// TestAggregate_ThroughWorker — the end-to-end contract: the domain
+// findings (written by the delivery + committed earlier) → an advisory
+// lock → the SELECT of confident hits → the laravel_domains upsert
+// (the maximum score, the union range, the mask, the set version) →
+// COMMIT; the order is per the journal. A foreign domain and weak hits do not enter the aggregate.
 func TestAggregate_ThroughWorker(t *testing.T) {
 	f := newANFixture(t, anSet(1001), Options{MinScore: 0.6})
 	hash := anTestHash(7)
 	f.store.blocks[hash] = anPageHTML()
-	// Доставка: субдомен 1 (XSRF + session + welcome) → score ≈ 0.7231,
-	// диапазон [5.3, 7.x], is_laravel.
+	// The delivery: subdomain 1 (XSRF + session + welcome) → score ≈ 0.7231,
+	// the range [5.3, 7.x], is_laravel.
 	f.pool.seedResult(anKey, anHeaders(t), anCookies(t, "XSRF-TOKEN", "laravel_session"), hash[:])
 
-	// Зафиксированное раньше уверенное срабатывание субдомена 2: верхняя
-	// граница неопределена — объединение неограничено сверху.
+	// An earlier committed confident hit of subdomain 2: the upper bound
+	// is undefined — the union is unbounded above.
 	anSeedFinding(f.pool, anRowKey{3, 42, 2, 0}, 0.7, anStr("9.19"), nil, true)
-	// Слабое срабатывание субдомена 3 — ниже порога, вне агрегата (§13.1).
+	// A weak hit of subdomain 3 — below the threshold, outside the aggregate (§13.1).
 	anSeedFinding(f.pool, anRowKey{3, 42, 3, 0}, 0.3, anStr("4.0"), anStr("4.1"), false)
-	// Уверенное срабатывание чужого домена — не входит.
+	// A confident hit of a foreign domain — not included.
 	anSeedFinding(f.pool, anRowKey{3, 43, 1, 0}, 0.99, anStr("1.0"), anStr("2.0"), true)
 
 	if _, err := f.w.ProcessResult(context.Background(), anTask); err != nil {
 		t.Fatalf("ProcessResult: %v", err)
 	}
 
-	// Порядок: findings → блокировка → чтение → агрегат → фиксация;
-	// строки агрегации закрываются после чтения (мутант вырезания
-	// rows.Close, T-M10).
+	// The order: findings → lock → read → aggregate → commit; the
+	// aggregation rows are closed after the read (the rows.Close cut
+	// mutant, T-M10).
 	for _, pair := range [][2]anEventKind{
 		{anEvUpsert, anEvLock}, {anEvLock, anEvAggSelect},
 		{anEvAggSelect, anEvAggClose}, {anEvAggClose, anEvAggUpsert},
@@ -383,19 +384,19 @@ func TestAggregate_ThroughWorker(t *testing.T) {
 	if !ok {
 		t.Fatal("строка laravel_domains не записана")
 	}
-	// Максимальный score: noisy-OR(0.25, 0.35, 0.45) ≈ 0.7231 > 0.7.
+	// The maximum score: noisy-OR(0.25, 0.35, 0.45) ≈ 0.7231 > 0.7.
 	wantScore := float32(1 - (1-0.25)*(1-0.35)*(1-0.45))
 	if row.score != wantScore {
 		t.Errorf("score = %v, нужно максимум %v", row.score, wantScore)
 	}
-	// Объединение [5.3, 7.x] ∪ [9.19, NULL) = [5.3, NULL).
+	// The union [5.3, 7.x] ∪ [9.19, NULL) = [5.3, NULL).
 	if row.verMin == nil || *row.verMin != "5.3" {
 		t.Errorf("ver_min = %v, нужно 5.3 (min нижних границ)", anStrDeref(row.verMin))
 	}
 	if row.verMax != nil {
 		t.Errorf("ver_max = %v, нужно NULL (объединение неограничено сверху)", *row.verMax)
 	}
-	// Маска: субдомены 1 (доставка) и 2 (раньше); 3 — слабое, 43 — чужой.
+	// The mask: subdomains 1 (the delivery) and 2 (earlier); 3 — weak, 43 — foreign.
 	if want := mustMask(t, 1, 2); row.foundOnMask != want {
 		t.Errorf("found_on_mask = %d (%v), нужно %d (%v)",
 			int64(row.foundOnMask), row.foundOnMask.IDs(), int64(want), want.IDs())
@@ -408,9 +409,9 @@ func TestAggregate_ThroughWorker(t *testing.T) {
 	}
 }
 
-// TestAggregate_NoConfidentDeletesRow — уверенных срабатываний нет:
-// строки домена не должно быть (порог §13.1), существующая удаляется
-// (§3.5) — и от слабого итога доставки, и от пустого (finding удалён).
+// TestAggregate_NoConfidentDeletesRow — no confident hits: the domain
+// row must be gone (the §13.1 threshold), an existing one is deleted
+// (§3.5) — both from a weak delivery outcome and from an empty one (the finding removed).
 func TestAggregate_NoConfidentDeletesRow(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -423,7 +424,7 @@ func TestAggregate_NoConfidentDeletesRow(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newANFixture(t, anSet(1001), Options{MinScore: 0.6})
 			f.pool.seedResult(anKey, anHeaders(t), tc.cookies, nil)
-			// Прежний эпизод находил Laravel — строка домена существует.
+			// A past episode found Laravel — the domain row exists.
 			f.pool.domains[anDomainKey{anKey.zone, anKey.domain}] = &anDomain{
 				score: 0.9, verMin: anStr("5.3"), verMax: anStr("7.x"),
 				foundOnMask: mustMask(t, 1, 2), rulesVersion: 999, updatedAt: time.Now(),
@@ -442,8 +443,8 @@ func TestAggregate_NoConfidentDeletesRow(t *testing.T) {
 	}
 }
 
-// TestAggregate_RepeatDelivery — повторная доставка идемпотентна (ТЗ
-// 3.4): upsert перезаписывает ту же строку теми же значениями.
+// TestAggregate_RepeatDelivery — a repeated delivery is idempotent
+// (spec 3.4): the upsert rewrites the same row with the same values.
 func TestAggregate_RepeatDelivery(t *testing.T) {
 	f := newANFixture(t, anSet(1001), Options{MinScore: 0.6})
 	hash := anTestHash(7)
@@ -472,10 +473,10 @@ func TestAggregate_RepeatDelivery(t *testing.T) {
 	}
 }
 
-// TestAggregate_DomainDeleted — домен удалён (§8/§13.1): охрана штампа →
-// 0 строк → без записи; агрегация не выполняется вовсе, существующая
-// строка домена не трогается (вычистит фоновая очистка laravel_*,
-// план после T-020).
+// TestAggregate_DomainDeleted — the domain is deleted (§8/§13.1): the
+// stamp guard → 0 rows → no write; the aggregation does not run at
+// all, the existing domain row is untouched (the laravel_* background
+// cleanup will purge it, the post-T-020 plan).
 func TestAggregate_DomainDeleted(t *testing.T) {
 	f := newANFixture(t, anSet(1001), Options{MinScore: 0.6})
 	hash := anTestHash(7)
@@ -499,11 +500,11 @@ func TestAggregate_DomainDeleted(t *testing.T) {
 	}
 }
 
-// TestAggregate_Errors — сбой каждого шага агрегации: ошибка доставки
-// (без XACK), состояние откатывается — findings и строка домена;
-// want — точная подстрока обёртки (пины текстов против мутантов
-// вырезания return, T-M10), fresh — доставка свежего эпизода HTTP
-// (ветки истории appeared/lost, T-118).
+// TestAggregate_Errors — a failure of each aggregation step: a delivery
+// error (no XACK), the state rolls back — the findings and the domain
+// row; want is the exact wrap substring (text pins against the
+// return-cut mutants, T-M10); fresh is the delivery of a fresh HTTP
+// episode (the appeared/lost history branches, T-118).
 func TestAggregate_Errors(t *testing.T) {
 	seed := func(t *testing.T) *anFixture {
 		f := newANFixture(t, anSet(1001), Options{MinScore: 0.6})
@@ -519,7 +520,7 @@ func TestAggregate_Errors(t *testing.T) {
 		inj    func(f *anFixture)
 		want   string
 		fresh  bool
-		hadRow bool // была ли строка домена до сбоя (appeared-ветка стартует без неё)
+		hadRow bool // whether the domain row existed before the failure (the appeared branch starts without it)
 	}{
 		{"блокировка домена", func(f *anFixture) { f.pool.lockErr = errors.New("lock boom") }, "", false, true},
 		{"чтение срабатываний", func(f *anFixture) { f.pool.aggSelectErr = errors.New("select boom") }, "", false, true},
@@ -537,17 +538,17 @@ func TestAggregate_Errors(t *testing.T) {
 		{"запись строки домена: RowsAffected", func(f *anFixture) { f.pool.aggUpsertRowsAff = 2 },
 			"запись строки домена: затронуто 2 строк", false, true},
 		{"удаление строки домена", func(f *anFixture) {
-			// Итог доставки без срабатываний → ветка удаления.
+			// A delivery outcome without hits → the delete branch.
 			f.pool.seedResult(anKey, anHeaders(t), anCookies(t, "PHPSESSID"), nil)
 			f.pool.aggUpsertErr = errors.New("не должен вызываться")
 			f.pool.aggDeleteErr = errors.New("agg del boom")
 		}, "", false, true},
 		{"запись истории (lost)", func(f *anFixture) {
-			f.pool.seedResult(anKey, anHeaders(t), anCookies(t, "PHPSESSID"), nil) // признаков нет
+			f.pool.seedResult(anKey, anHeaders(t), anCookies(t, "PHPSESSID"), nil) // no signs
 			f.pool.aggHistErr = errors.New("hist boom")
 		}, "запись истории (lost)", true, true},
 		{"запись истории (appeared)", func(f *anFixture) {
-			delete(f.pool.domains, anDomainKey{anKey.zone, anKey.domain}) // строки не было
+			delete(f.pool.domains, anDomainKey{anKey.zone, anKey.domain}) // there was no row
 			f.pool.aggHistErr = errors.New("hist boom")
 		}, "запись истории (appeared)", true, false},
 		{"фиксация", func(f *anFixture) { f.pool.commitErr = errors.New("commit boom") }, "", false, true},
@@ -563,7 +564,7 @@ func TestAggregate_Errors(t *testing.T) {
 			} else if tc.want != "" && !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("ошибка = %v, нужна подстрока %q", err, tc.want)
 			}
-			// Откат: прежнее состояние строки домена сохранилось.
+			// The rollback: the domain row's previous state survived.
 			row, ok := anDomainSnapshot(f.pool, anKey.zone, anKey.domain)
 			if tc.hadRow != ok || (ok && row.rulesVersion != 999) {
 				t.Fatalf("строка домена изменилась при сбое: %+v (ok=%v)", row, ok)
@@ -575,8 +576,8 @@ func TestAggregate_Errors(t *testing.T) {
 	}
 }
 
-// TestAggregate_CtxCancelled — отмена ctx прерывает агрегацию: ошибка,
-// ничего не пишется (graceful shutdown, ТЗ 3.4).
+// TestAggregate_CtxCancelled — a ctx cancellation aborts the aggregation:
+// an error, nothing is written (a graceful shutdown, spec 3.4).
 func TestAggregate_CtxCancelled(t *testing.T) {
 	f := newANFixture(t, anSet(1001), Options{})
 	tx, err := f.pool.Begin(context.Background())
@@ -596,7 +597,7 @@ func TestAggregate_CtxCancelled(t *testing.T) {
 	}
 }
 
-// mustMask — маска фикстуры (падение — ошибка теста, не бизнеса).
+// mustMask is the fixture mask (a failure is a test error, not a business one).
 func mustMask(t *testing.T, ids ...int) model.DNSMask {
 	t.Helper()
 	m, err := model.NewDNSMask(ids...)
@@ -606,20 +607,20 @@ func mustMask(t *testing.T, ids ...int) model.DNSMask {
 	return m
 }
 
-// --- история детекции appeared/lost (T-118) -----------------------------------
+// --- the appeared/lost detection history (T-118) ---------------------------
 
-// anHistorySnapshot — снапшот журнала переходов фикстуры.
+// anHistorySnapshot is a snapshot of the fixture transition journal.
 func anHistorySnapshot(p *anFakePool) []anHistoryRec {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return append([]anHistoryRec(nil), p.history...)
 }
 
-// TestAggregate_History — семантика журнала переходов laravel_history
-// (T-118): запись только при свежем эпизоде HTTP (queue.Result.Fresh) —
-// появление строки → appeared=true, исчезновение → false; повторный
-// пересчёт без смены наличия строки историю не пишет; переанализ
-// (fresh=false) не пишет ничего — смена правил не факт о сайте.
+// TestAggregate_History — the laravel_history transition journal
+// semantics (T-118): a record only on a fresh HTTP episode
+// (queue.Result.Fresh) — a row appears → appeared=true, disappears →
+// false; a recalculation without a presence change writes no history;
+// re-analysis (fresh=false) writes nothing — a rule change is not a fact about the site.
 func TestAggregate_History(t *testing.T) {
 	f := newANFixture(t, anSet(1001), Options{MinScore: 0.6})
 	ctx := context.Background()
@@ -631,7 +632,7 @@ func TestAggregate_History(t *testing.T) {
 		}
 	}
 
-	// Эпизод 1 (fresh): страница с признаками → строка появилась.
+	// Episode 1 (fresh): a page with signs → the row appeared.
 	laravelHash := anTestHash(7)
 	f.store.blocks[laravelHash] = anPageHTML()
 	f.pool.seedResult(anKey, anHeaders(t), anCookies(t, "XSRF-TOKEN", "laravel_session"), laravelHash[:])
@@ -644,14 +645,14 @@ func TestAggregate_History(t *testing.T) {
 		t.Fatalf("история после появления = %+v, хочу одну запись appeared=true", hist)
 	}
 
-	// Эпизод 2 (fresh): те же признаки — строка есть, перехода нет.
+	// Episode 2 (fresh): the same signs — the row exists, no transition.
 	runTask(task)
 	if hist = anHistorySnapshot(f.pool); len(hist) != 1 {
 		t.Fatalf("повторный пересчёт без смены наличия: история = %+v, хочу без изменений", hist)
 	}
 
-	// Эпизод 3 (fresh): страница без признаков — findings пусты, строка
-	// удалена → appeared=false.
+	// Episode 3 (fresh): a page without signs — the findings are empty,
+	// the row is deleted → appeared=false.
 	plainHash := anTestHash(8)
 	f.store.blocks[plainHash] = []byte(`<html><body>nothing here</body></html>`)
 	f.pool.seedResult(anKey, anHeaders(t), anCookies(t), plainHash[:])
@@ -665,8 +666,8 @@ func TestAggregate_History(t *testing.T) {
 		t.Fatal("строка laravel_domains не удалена")
 	}
 
-	// Переанализ появления (fresh=false): findings появятся, строка
-	// запишется — история не растёт (смена правил не факт о сайте).
+	// A re-analysis of the appearance (fresh=false): the findings will
+	// appear, the row will be written — the history does not grow (a rule change is not a fact about the site).
 	rKey := anRowKey{zone: 3, domain: 43, subdomain: 1, variant: 0}
 	f.pool.seedResult(rKey, anHeaders(t), anCookies(t, "XSRF-TOKEN", "laravel_session"), laravelHash[:])
 	rTask := queue.Result{
@@ -681,8 +682,8 @@ func TestAggregate_History(t *testing.T) {
 		t.Fatalf("переанализ-появление пишeт историю: %+v, хочу без изменений (fresh=false)", hist)
 	}
 
-	// Переанализ исчезновения (fresh=false): findings пусты, строка
-	// удалена — история не растёт.
+	// A re-analysis of the disappearance (fresh=false): the findings are
+	// empty, the row is deleted — the history does not grow.
 	f.pool.seedResult(rKey, anHeaders(t), anCookies(t), plainHash[:])
 	runTask(rTask)
 	if _, ok := anDomainSnapshot(f.pool, rKey.zone, rKey.domain); ok {
@@ -692,19 +693,20 @@ func TestAggregate_History(t *testing.T) {
 		t.Fatalf("переанализ-исчезновение пишет историю: %+v, хочу без изменений (fresh=false)", hist)
 	}
 
-	// Пустой fresh-эпизод без строки (DELETE 0): перехода нет — записи нет.
+	// An empty fresh episode without a row (DELETE 0): no transition — no record.
 	runTask(task)
 	if hist = anHistorySnapshot(f.pool); len(hist) != 2 {
 		t.Fatalf("удаление отсутствующей строки пишет историю: %+v, хочу без изменений", hist)
 	}
 }
 
-// TestAggregate_Counters — инкрементальные счётчики переходов строки
-// laravel_domains (T-178, ТЗИ §6.5): zones.domains_laravel ±1 на КАЖДОМ
-// переходе наличия (включая переанализ — реконсиляция считает строки
-// независимо от происхождения), кумулятивы crawler_counters appeared/
-// lost — только при fresh (строки кумулятивов соответствуют записям
-// laravel_history). Инварианты сверяются с журналом истории фейка.
+// TestAggregate_Counters — the incremental counters of the
+// laravel_domains row transitions (T-178, the incremental-counters spec
+// §6.5): zones.domains_laravel ±1 on EVERY presence transition
+// (including re-analysis — the reconciliation counts rows regardless of
+// origin), the crawler_counters appeared/lost cumulatives — only on
+// fresh (the cumulative values match the laravel_history records).
+// The invariants are checked against the fake's history journal.
 func TestAggregate_Counters(t *testing.T) {
 	f := newANFixture(t, anSet(1001), Options{MinScore: 0.6})
 	ctx := context.Background()
@@ -721,8 +723,8 @@ func TestAggregate_Counters(t *testing.T) {
 	plainHash := anTestHash(8)
 	f.store.blocks[plainHash] = []byte(`<html><body>nothing here</body></html>`)
 
-	// Появление (fresh): домен 3 → зона +1, appeared +1.
-	task := anTask // зона anKey (3)
+	// An appearance (fresh): domain 3 → zone +1, appeared +1.
+	task := anTask // the anKey zone (3)
 	task.Fresh = true
 	f.pool.seedResult(anKey, anHeaders(t), anCookies(t, "XSRF-TOKEN", "laravel_session"), laravelHash[:])
 	runTask(task)
@@ -736,7 +738,7 @@ func TestAggregate_Counters(t *testing.T) {
 		t.Fatalf("laravel_lost_total = %d, хочу 0", got)
 	}
 
-	// Исчезновение (fresh): зона −1, lost +1.
+	// A disappearance (fresh): zone −1, lost +1.
 	f.pool.seedResult(anKey, anHeaders(t), anCookies(t), plainHash[:])
 	runTask(task)
 	if got := f.pool.zoneLaravel[anKey.zone]; got != 0 {
@@ -746,15 +748,15 @@ func TestAggregate_Counters(t *testing.T) {
 		t.Fatalf("laravel_lost_total = %d, хочу 1", got)
 	}
 
-	// Повторный эпизод без смены наличия — дельт нет.
+	// A repeated episode without a presence change — no deltas.
 	f.pool.seedResult(anKey, anHeaders(t), anCookies(t, "XSRF-TOKEN", "laravel_session"), laravelHash[:])
 	runTask(task)
 	if got := f.pool.zoneLaravel[anKey.zone]; got != 1 {
 		t.Fatalf("domains_laravel после повторного появления = %d, хочу 1", got)
 	}
 
-	// Переанализ исчезновения (fresh=false): строка удаляется — зона −1
-	// (множество меняется), кумулятив lost не растёт (записи истории нет).
+	// A re-analysis of the disappearance (fresh=false): the row is
+	// deleted — zone −1 (the set changes), the lost cumulative does not grow (no history record).
 	rTask := task
 	rTask.Fresh = false
 	f.pool.seedResult(anKey, anHeaders(t), anCookies(t), plainHash[:])
@@ -766,7 +768,7 @@ func TestAggregate_Counters(t *testing.T) {
 		t.Fatalf("laravel_lost_total после переанализа = %d, хочу 1 (история не пишется)", got)
 	}
 
-	// Кумулятивы соответствуют журналу истории (инвариант ТЗИ §6.5).
+	// The cumulatives match the history journal (the incremental-counters spec §6.5 invariant).
 	hist := anHistorySnapshot(f.pool)
 	var appeared, lost int64
 	for _, h := range hist {
@@ -781,8 +783,8 @@ func TestAggregate_Counters(t *testing.T) {
 			f.pool.counters["laravel_appeared_total"], f.pool.counters["laravel_lost_total"], appeared, lost)
 	}
 
-	// Строка зоны отсутствует (ручная правка справочника): сдвиг громко
-	// падает — молчаливый дрейф недопустим.
+	// The zone row is missing (a manual reference-table edit): the shift
+	// fails loudly — silent drift is unacceptable.
 	f.pool.zoneNoRow = true
 	f.pool.seedResult(anKey, anHeaders(t), anCookies(t, "XSRF-TOKEN", "laravel_session"), laravelHash[:])
 	if _, err := f.w.ProcessResult(ctx, anTask); err == nil || !strings.Contains(err.Error(), "счётчик Laravel-зоны") {
@@ -791,7 +793,7 @@ func TestAggregate_Counters(t *testing.T) {
 	f.pool.zoneNoRow = false
 }
 
-// anStrEq / anStrDeref — сравнение и печать NULL-границ.
+// anStrEq / anStrDeref — comparison and printing of NULL bounds.
 func anStrEq(a, b *string) bool {
 	if a == nil || b == nil {
 		return a == b

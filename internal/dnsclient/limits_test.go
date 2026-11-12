@@ -1,7 +1,7 @@
-// Тесты лимитёра DNS-этапа (T-035). Сети нет: нижний резолвер — фейк,
-// часы — фальшивые (темп QPS детерминирован без реальных пауз). Проверяется
-// каждый механизм по отдельности (семафор, ведро, адаптив) и сквозной
-// декоратор Exchange над фейком.
+// Tests of the DNS stage limiter (T-035). No network: the lower resolver
+// is a fake, the clock is fake (the QPS rate is deterministic without real
+// pauses). Each mechanism is checked separately (the semaphore, the
+// bucket, the adaptive) and the end-to-end Exchange decorator over the fake.
 
 package dnsclient
 
@@ -18,11 +18,11 @@ import (
 	"crawler/internal/config"
 )
 
-// --- вспомогательные фейки ---------------------------------------------------
+// --- helper fakes ----------------------------------------------------------
 
-// limitFakeResolver — нижний резолвер: считает вызовы и параллельность,
-// возвращает заданный результат/ошибку; при заданном hold каждый обмен
-// ждёт его закрытия (управление параллельностью в тестах).
+// limitFakeResolver is the lower resolver: it counts calls and
+// parallelism and returns the given result/error; when hold is set, every
+// exchange waits for it to close (parallelism control in tests).
 type limitFakeResolver struct {
 	mu          sync.Mutex
 	calls       int
@@ -87,9 +87,9 @@ func (f *limitFakeResolver) stats() (calls, maxInflight, inflight int) {
 	return f.calls, f.maxInflight, f.inflight
 }
 
-// limitManualClock — часы без собственного хода: время двигают только
-// Sleep (мгновенно, с записью паузы) и advance. Темп QPS проверяется по
-// записанным паузам — без реального ожидания.
+// limitManualClock is a clock with no motion of its own: time moves only
+// via Sleep (instant, recording the pause) and advance. The QPS rate is
+// checked from the recorded pauses — without real waiting.
 type limitManualClock struct {
 	mu     sync.Mutex
 	now    time.Time
@@ -130,8 +130,8 @@ func (c *limitManualClock) slept() []time.Duration {
 	return append([]time.Duration(nil), c.sleeps...)
 }
 
-// limitGatedClock — Sleep висит до закрытия gate (продвигая время на d)
-// или отмены ctx: отмена в очереди токенов без хода времени.
+// limitGatedClock — Sleep hangs until the gate is closed (advancing the
+// time by d) or ctx cancellation: cancellation in the token queue with no time motion.
 type limitGatedClock struct {
 	sleeps atomic.Int64
 	mu     sync.Mutex
@@ -153,7 +153,7 @@ func (c *limitGatedClock) Sleep(ctx context.Context, d time.Duration) error {
 	c.sleeps.Add(1)
 	select {
 	case <-c.gate:
-		// Время продвинулось ровно на ожидание — токен начисляется.
+		// The time advanced exactly by the wait — the token accrues.
 		c.mu.Lock()
 		c.now = c.now.Add(d)
 		c.mu.Unlock()
@@ -163,9 +163,9 @@ func (c *limitGatedClock) Sleep(ctx context.Context, d time.Duration) error {
 	}
 }
 
-// limitCountingClock — реальные часы со счётчиком вызовов Sleep: резервирование
-// токена обязано давать ровно один sleep на ждущего (поллинг «проснуться и
-// пересчитать» плодил бы десятки пробуждений на пачку).
+// limitCountingClock is a real clock with a Sleep call counter: reserving
+// a token must give exactly one sleep per waiter (polling "wake up and
+// recompute" would breed dozens of wakeups per chunk).
 type limitCountingClock struct {
 	sleeps atomic.Int64
 }
@@ -187,7 +187,7 @@ func (c *limitCountingClock) clock() limitClock {
 	}
 }
 
-// newTestLimit — лимитёр над фейком с фальшивыми часами.
+// newTestLimit is a limiter over a fake with a fake clock.
 func newTestLimit(t *testing.T, modify func(*LimitOptions), clock limitClock, next Resolver) *LimitResolver {
 	t.Helper()
 	var opts LimitOptions
@@ -201,12 +201,12 @@ func newTestLimit(t *testing.T, modify func(*LimitOptions), clock limitClock, ne
 	return r
 }
 
-// limitTimeoutErr — ошибка-таймаут (IsTimeout истинен, как у клиента
-// при исчерпании попыток на дедлайне).
+// limitTimeoutErr is a timeout error (IsTimeout is true, like the
+// client's error when attempts run out on a deadline).
 var limitTimeoutErr = fakeNetErr{timeout: true}
 
-// limitPollCond ждёт условия с пределом по времени (горутины и каналы в
-// тестах асинхронны, но обязаны успевать за секунды).
+// limitPollCond waits for a condition with a time limit (goroutines and
+// channels in tests are asynchronous, but must keep up within seconds).
 func limitPollCond(t *testing.T, cond func() bool, msg string) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
@@ -218,7 +218,7 @@ func limitPollCond(t *testing.T, cond func() bool, msg string) {
 	}
 }
 
-// --- опции --------------------------------------------------------------------
+// --- options ----------------------------------------------------------------
 
 func TestLimitOptionsDefaults(t *testing.T) {
 	got := LimitOptions{}.withDefaults()
@@ -237,8 +237,8 @@ func TestLimitOptionsDefaults(t *testing.T) {
 		t.Fatalf("withDefaults() = %+v, want %+v", got, want)
 	}
 
-	// Явные значения не затираются; burst по умолчанию следует за
-	// concurrency, если не задан отдельно.
+	// Explicit values are not overwritten; the default burst follows
+	// concurrency when not set separately.
 	got = LimitOptions{Concurrency: 42, MaxQPS: 4200}.withDefaults()
 	if got.Burst != 42 {
 		t.Fatalf("burst = %d, want 42 (= concurrency)", got.Burst)
@@ -294,7 +294,7 @@ func TestNewLimitResolverNilNext(t *testing.T) {
 	}
 }
 
-// --- семафор ------------------------------------------------------------------
+// --- semaphore -------------------------------------------------------------
 
 func TestLimitSemaphore(t *testing.T) {
 	s := newLimitSemaphore(2)
@@ -306,14 +306,14 @@ func TestLimitSemaphore(t *testing.T) {
 		t.Fatalf("acquire: %v", err)
 	}
 
-	// Потолок исчерпан: ждущий acquire прерывается дедлайном ctx.
+	// The cap is exhausted: a waiting acquire is interrupted by the ctx deadline.
 	ctx, cancel := context.WithTimeout(bg, 40*time.Millisecond)
 	defer cancel()
 	if err := s.acquire(ctx); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("acquire за потолком: %v, want DeadlineExceeded", err)
 	}
 
-	// Освободившийся слот получает следующий ждущий.
+	// The freed slot goes to the next waiter.
 	s.release()
 	if err := s.acquire(bg); err != nil {
 		t.Fatalf("acquire после release: %v", err)
@@ -329,7 +329,7 @@ func TestLimitSemaphoreShrink(t *testing.T) {
 	_ = s.acquire(bg)
 	_ = s.acquire(bg)
 
-	// Потолок опущен ниже занятого: летящие не отбираются, новые ждут.
+	// The cap is lowered below the taken level: in-flight ones are not taken away, new ones wait.
 	s.setMax(1)
 
 	ctx, cancel := context.WithCancel(bg)
@@ -342,7 +342,7 @@ func TestLimitSemaphoreShrink(t *testing.T) {
 	default:
 	}
 
-	s.release() // cur 1 == max 1: ждущий всё ещё стоит
+	s.release() // cur 1 == max 1: the waiter is still standing
 	time.Sleep(30 * time.Millisecond)
 	select {
 	case err := <-done:
@@ -350,7 +350,7 @@ func TestLimitSemaphoreShrink(t *testing.T) {
 	default:
 	}
 
-	s.release() // cur 0 < max 1: ждущий проходит
+	s.release() // cur 0 < max 1: the waiter goes through
 	select {
 	case err := <-done:
 		if err != nil {
@@ -361,21 +361,21 @@ func TestLimitSemaphoreShrink(t *testing.T) {
 	}
 	cancel()
 
-	// Рост потолка: новые слоты раздаются без ожидания.
+	// Raising the cap: new slots are handed out without waiting.
 	s.setMax(3)
 	if err := s.acquire(bg); err != nil {
 		t.Fatalf("acquire после роста потолка: %v", err)
 	}
 }
 
-// --- токен-ведро ----------------------------------------------------------------
+// --- token bucket ----------------------------------------------------------
 
 func TestLimitBucket(t *testing.T) {
 	fc := newLimitManualClock()
 	b := newLimitBucket(10, 5, fc.clock()) // 10 QPS, burst 5
 	bg := context.Background()
 
-	// Всплеск: burst обменов подряд без ожидания.
+	// Burst: burst exchanges in a row without waiting.
 	for i := 0; i < 5; i++ {
 		if err := b.take(bg); err != nil {
 			t.Fatalf("take %d: %v", i+1, err)
@@ -385,7 +385,7 @@ func TestLimitBucket(t *testing.T) {
 		t.Fatalf("в пределах burst не ждём, паузы: %v", sleeps)
 	}
 
-	// Дальше — темп: по 100 мс на токен (1/10 с).
+	// Then the rate: 100 ms per token (1/10 s).
 	for i := 0; i < 2; i++ {
 		if err := b.take(bg); err != nil {
 			t.Fatalf("take %d: %v", i+3, err)
@@ -396,7 +396,7 @@ func TestLimitBucket(t *testing.T) {
 		t.Fatalf("паузы: %v, want %v", sleeps, want)
 	}
 
-	// Долгий простой не переполняет ведро: пополнение капится burst.
+	// A long idle does not overflow the bucket: the refill is capped at burst.
 	fc.advance(10 * time.Second)
 	for i := 0; i < 5; i++ {
 		if err := b.take(bg); err != nil {
@@ -417,8 +417,8 @@ func TestLimitBucketRateChange(t *testing.T) {
 	bg := context.Background()
 
 	_ = b.take(bg)
-	_ = b.take(bg) // ведро пусто
-	b.setRate(2)   // адаптив опустил темп с 10 до 2 QPS — ждём 500 мс на токен
+	_ = b.take(bg) // the bucket is empty
+	b.setRate(2)   // the adaptive lowered the rate from 10 to 2 QPS — 500 ms per token
 	if err := b.take(bg); err != nil {
 		t.Fatal(err)
 	}
@@ -427,13 +427,13 @@ func TestLimitBucketRateChange(t *testing.T) {
 	}
 }
 
-// TestLimitBucketSingleWakePerToken — резервирование вместо поллинга:
-// очередь ждущих расходится по персональным меткам, каждый ждущий спит
-// один раз. Поллинг будил бы всех к каждому токену: при 9 ждущих и темпе
-// 100 QPS — 45 пауз вместо 9 (DNS-01).
+// TestLimitBucketSingleWakePerToken — reservation instead of polling: the
+// waiter queue disperses by personal marks, each waiter sleeps once.
+// Polling would wake everyone per token: with 9 waiters at a rate of
+// 100 QPS — 45 pauses instead of 9 (DNS-01).
 func TestLimitBucketSingleWakePerToken(t *testing.T) {
 	cc := &limitCountingClock{}
-	b := newLimitBucket(100, 1, cc.clock()) // burst 1: один сразу, ждут все прочие
+	b := newLimitBucket(100, 1, cc.clock()) // burst 1: one goes at once, all others wait
 	const total = 10
 	start := time.Now()
 	var wg sync.WaitGroup
@@ -450,16 +450,16 @@ func TestLimitBucketSingleWakePerToken(t *testing.T) {
 	if n := cc.sleeps.Load(); n != total-1 {
 		t.Fatalf("пауз %d, want %d (по одной на ждущего — шторма пробуждений нет)", n, total-1)
 	}
-	// Последний ждущий встал в очередь ~сразу после старта: его метка —
-	// 9/100 с. Реальные таймеры спят не меньше запроса, нижняя граница
-	// надёжна.
+	// The last waiter entered the queue ~right after the start: its mark is
+	// 9/100 s. Real timers sleep no less than requested, so the lower
+	// bound is reliable.
 	if since := time.Since(start); since < 9*10*time.Millisecond {
 		t.Fatalf("итоговое время %s < 90 мс — темп очереди не выдержан", since)
 	}
 }
 
-// TestLimitBucketUnreserve — отмена ждущего возвращает резерв: отменённое
-// ожидание не оставляет долг, удлиняющий ожидание очереди за ним.
+// TestLimitBucketUnreserve — cancelling a waiter returns the reservation: a
+// cancelled wait leaves no debt that would lengthen the queue wait behind it.
 func TestLimitBucketUnreserve(t *testing.T) {
 	fc := newLimitManualClock()
 	b := newLimitBucket(1, 1, fc.clock())
@@ -467,17 +467,17 @@ func TestLimitBucketUnreserve(t *testing.T) {
 	if _, ok := b.reserve(); !ok {
 		t.Fatal("первый токен обязан пройти без ожидания")
 	}
-	wait, ok := b.reserve() // баланс −1: ждём 1 с
+	wait, ok := b.reserve() // balance −1: waiting 1s
 	if ok || wait != time.Second {
 		t.Fatalf("reserve = (%v, %v), want (1s, false)", wait, ok)
 	}
-	b.unreserve() // отмена ждущего: долг снят
+	b.unreserve() // the waiter is cancelled: the debt is removed
 	wait, ok = b.reserve()
 	if ok || wait != time.Second {
 		t.Fatalf("reserve после unreserve = (%v, %v), want (1s, false) — долг не накопился", wait, ok)
 	}
 
-	// Долг двух ждущих без отмены — третий метки дальше: 3 с, не 2 с.
+	// The debt of two waiters without cancellation — the third one's mark is farther: 3s, not 2s.
 	b.unreserve()
 	_, _ = b.reserve()
 	_, _ = b.reserve()
@@ -487,12 +487,12 @@ func TestLimitBucketUnreserve(t *testing.T) {
 	}
 }
 
-// TestLimitBucketBurstCappedByQPS — типовой тюнинг слабого резолвера
-// (max_qps ≪ concurrency): начальная ёмкость не выше секунды темпа —
-// «полная волна» слотов не уходит залпом секунд бюджета (DNS-10).
+// TestLimitBucketBurstCappedByQPS — the typical tuning for a weak resolver
+// (max_qps ≪ concurrency): the initial capacity is no higher than a second
+// of rate — a "full wave" of slots does not fire a second of budget at once (DNS-10).
 func TestLimitBucketBurstCappedByQPS(t *testing.T) {
 	fc := newLimitManualClock()
-	b := newLimitBucket(50, 2000, fc.clock()) // темп 50/с, затрошено 2000
+	b := newLimitBucket(50, 2000, fc.clock()) // rate 50/s, 2000 thrown in
 	took := 0
 	for i := 0; i < 60; i++ {
 		if _, ok := b.reserve(); ok {
@@ -506,15 +506,15 @@ func TestLimitBucketBurstCappedByQPS(t *testing.T) {
 	}
 }
 
-// TestLimitBucketBurstFollowsRate — ёмкость следует за темпом адаптива:
-// после снижения всплеск ограничен секундой нового темпа (и накопленные
-// токены подрезаны), восстановление темпа возвращает ёмкость до исходной
-// (DNS-10).
+// TestLimitBucketBurstFollowsRate — the capacity follows the adaptive rate:
+// after a shed the burst is bounded by a second of the new rate (and the
+// accrued tokens are trimmed); rate recovery returns the capacity to the
+// original (DNS-10).
 func TestLimitBucketBurstFollowsRate(t *testing.T) {
 	fc := newLimitManualClock()
 	b := newLimitBucket(1000, 100, fc.clock())
 
-	// Ведро полно (100), темп упали на два порядка.
+	// The bucket is full (100); the rate was dropped by two orders of magnitude.
 	fc.advance(time.Second)
 	b.setRate(10)
 	took := 0
@@ -529,7 +529,7 @@ func TestLimitBucketBurstFollowsRate(t *testing.T) {
 		t.Fatalf("мгновенно взято %d токенов после снижения, want 10 (секунда нового темпа)", took)
 	}
 
-	// Темп восстановлен — ёмкость вернулась к исходной.
+	// The rate is restored — the capacity is back to the original.
 	b.setRate(1000)
 	fc.advance(time.Second)
 	took = 0
@@ -545,7 +545,7 @@ func TestLimitBucketBurstFollowsRate(t *testing.T) {
 	}
 }
 
-// --- декоратор: семафор ----------------------------------------------------------
+// --- decorator: semaphore --------------------------------------------------
 
 func TestLimitResolverConcurrency(t *testing.T) {
 	next := &limitFakeResolver{}
@@ -554,7 +554,7 @@ func TestLimitResolverConcurrency(t *testing.T) {
 	r := newTestLimit(t, func(o *LimitOptions) {
 		o.Concurrency = 3
 		o.MaxQPS = 1000
-		o.AdaptiveWindow = 100 // не наполняется — адаптив не мешает
+		o.AdaptiveWindow = 100 // never fills — the adaptive stays out of the way
 	}, newLimitManualClock().clock(), next)
 
 	const total = 8
@@ -571,7 +571,7 @@ func TestLimitResolverConcurrency(t *testing.T) {
 	}
 	close(start)
 
-	// К резолверу пробились ровно ceiling-обмена: 3.
+	// Exactly cap exchanges got through to the resolver: 3.
 	limitPollCond(t, func() bool { c, _, _ := next.stats(); return c == 3 }, "3 обмена до резолвера")
 	time.Sleep(30 * time.Millisecond)
 	if c, _, _ := next.stats(); c != 3 {
@@ -600,19 +600,19 @@ func TestLimitResolverConcurrency(t *testing.T) {
 	}
 }
 
-// --- декоратор: темп QPS ---------------------------------------------------------
+// --- decorator: QPS rate ---------------------------------------------------
 
 func TestLimitResolverQPSPacing(t *testing.T) {
 	next := &limitFakeResolver{}
 	fc := newLimitManualClock()
 	r := newTestLimit(t, func(o *LimitOptions) {
 		o.Concurrency = 10
-		o.MaxQPS = 5 // 200 мс на обмен
+		o.MaxQPS = 5 // 200 ms per exchange
 		o.Burst = 2
 		o.AdaptiveWindow = 100
 	}, fc.clock(), next)
 
-	// Последовательные обмены: 2 сразу (burst), дальше по 200 мс.
+	// Sequential exchanges: 2 at once (burst), then 200 ms each.
 	q := Question{Name: "example.com", Type: dns.TypeA}
 	for i := 0; i < 6; i++ {
 		if _, err := r.Exchange(context.Background(), q); err != nil {
@@ -643,7 +643,7 @@ func equalDurations(a, b []time.Duration) bool {
 	return true
 }
 
-// --- декоратор: адаптив ----------------------------------------------------------
+// --- decorator: adaptive ---------------------------------------------------
 
 func TestLimitResolverAdaptiveDecrease(t *testing.T) {
 	next := &limitFakeResolver{err: limitTimeoutErr}
@@ -655,7 +655,7 @@ func TestLimitResolverAdaptiveDecrease(t *testing.T) {
 	}, newLimitManualClock().clock(), next)
 	q := Question{Name: "example.com", Type: dns.TypeA}
 
-	// Окно ещё не заполнено — лимиты не двигаются.
+	// The window is not full yet — the limits do not move.
 	for i := 0; i < 9; i++ {
 		if _, err := r.Exchange(context.Background(), q); !errors.Is(err, limitTimeoutErr) {
 			t.Fatalf("Exchange %d: %v", i+1, err)
@@ -665,7 +665,7 @@ func TestLimitResolverAdaptiveDecrease(t *testing.T) {
 		t.Fatalf("до заполнения окна: %+v", st)
 	}
 
-	// 10-й таймаут заполняет окно (доля 1.0 ≥ 0.5): первое снижение ×0.5.
+	// The 10th timeout fills the window (share 1.0 ≥ 0.5): the first shed ×0.5.
 	if _, err := r.Exchange(context.Background(), q); !errors.Is(err, limitTimeoutErr) {
 		t.Fatal(err)
 	}
@@ -673,7 +673,7 @@ func TestLimitResolverAdaptiveDecrease(t *testing.T) {
 		t.Fatalf("после заполнения: %+v", st)
 	}
 
-	// Дальше — до пола: base/100 = 1 (пол держит и concurrency, и QPS).
+	// Then down to the floor: base/100 = 1 (the floor holds both concurrency and QPS).
 	for i := 0; i < 10; i++ {
 		if _, err := r.Exchange(context.Background(), q); !errors.Is(err, limitTimeoutErr) {
 			t.Fatal(err)
@@ -698,7 +698,7 @@ func TestLimitResolverAdaptiveRecover(t *testing.T) {
 	q := Question{Name: "example.com", Type: dns.TypeA}
 	bg := context.Background()
 
-	// Снизили до пола.
+	// Shed down to the floor.
 	for i := 0; i < 20; i++ {
 		_, _ = r.Exchange(bg, q)
 	}
@@ -706,8 +706,8 @@ func TestLimitResolverAdaptiveRecover(t *testing.T) {
 		t.Fatalf("после снижения: %+v", st)
 	}
 
-	// Резолвер ожил: окно очищается от таймаутов, доля доходит до 0 —
-	// начинается восстановление (×1.25 за обмен, потолок — base).
+	// The resolver came back: the window clears of timeouts, the share
+	// reaches 0 — recovery starts (×1.25 per exchange, the cap is base).
 	next.setErr(nil)
 	for i := 0; i < 10; i++ {
 		if _, err := r.Exchange(bg, q); err != nil {
@@ -733,8 +733,8 @@ func TestLimitResolverAdaptiveRecover(t *testing.T) {
 }
 
 func TestLimitResolverAdaptiveIgnoresOtherErrors(t *testing.T) {
-	// Не-таймаутные ошибки (отказ соединения/протокола) снижения не
-	// запускают: ТЗ 5.4 привязывает его к доле таймаутов.
+	// Non-timeout errors (connection/protocol refusal) do not trigger
+	// shedding: spec 5.4 ties it to the timeout share.
 	next := &limitFakeResolver{err: fakeNetErr{timeout: false}}
 	r := newTestLimit(t, func(o *LimitOptions) {
 		o.Concurrency = 100
@@ -751,10 +751,10 @@ func TestLimitResolverAdaptiveIgnoresOtherErrors(t *testing.T) {
 	}
 }
 
-// TestLimitAdaptiveAppliesUnderLock — применение изменившихся лимитов
-// происходит под мьютексом адаптива (DNS-11): параллельные наблюдения
-// окна не могут наложить устаревший больший лимит последним. Детектор —
-// TryLock из apply: под блокировкой записи он обязан отказывать.
+// TestLimitAdaptiveAppliesUnderLock — applying the changed limits happens
+// under the adaptive mutex (DNS-11): parallel window observations cannot
+// apply a stale larger limit last. The detector is TryLock from apply:
+// under the write lock it must refuse.
 func TestLimitAdaptiveAppliesUnderLock(t *testing.T) {
 	a := newLimitAdaptive(LimitOptions{
 		Concurrency: 100, MaxQPS: 100, AdaptiveWindow: 2,
@@ -768,15 +768,15 @@ func TestLimitAdaptiveAppliesUnderLock(t *testing.T) {
 		applied++
 		if a.mu.TryLock() {
 			a.mu.Unlock()
-			inLock = false // применено вне блокировки адаптива
+			inLock = false // applied outside the adaptive lock
 		}
 	}
 
-	a.record(true, apply) // окно ещё не заполнено — изменений нет
+	a.record(true, apply) // the window is not full yet — no changes
 	if applied != 0 {
 		t.Fatalf("применений до заполнения окна: %d, want 0", applied)
 	}
-	a.record(true, apply) // окно заполнено таймаутами: снижение ×0.5
+	a.record(true, apply) // the window is full of timeouts: shed ×0.5
 	if applied != 1 {
 		t.Fatalf("применений: %d, want 1", applied)
 	}
@@ -789,8 +789,8 @@ func TestLimitAdaptiveAppliesUnderLock(t *testing.T) {
 }
 
 func TestLimitResolverAdaptiveShrinksLiveSemaphore(t *testing.T) {
-	// Снижение обязано действовать, а не только лежать в Stats: после
-	// урезки потолка к резолверу пробивается не больше нового потолка.
+	// The shed must take effect, not just sit in Stats: after the cap is
+	// cut, no more than the new cap gets through to the resolver.
 	next := &limitFakeResolver{err: limitTimeoutErr}
 	r := newTestLimit(t, func(o *LimitOptions) {
 		o.Concurrency = 4
@@ -801,7 +801,7 @@ func TestLimitResolverAdaptiveShrinksLiveSemaphore(t *testing.T) {
 	q := Question{Name: "example.com", Type: dns.TypeA}
 	bg := context.Background()
 
-	// 10 таймаутов: 4 → 2.
+	// 10 timeouts: 4 → 2.
 	for i := 0; i < 10; i++ {
 		_, _ = r.Exchange(bg, q)
 	}
@@ -835,7 +835,7 @@ func TestLimitResolverAdaptiveShrinksLiveSemaphore(t *testing.T) {
 	}
 }
 
-// --- декоратор: отключение AAAA ---------------------------------------------------
+// --- decorator: AAAA disabling ---------------------------------------------
 
 func TestLimitResolverDisableAAAA(t *testing.T) {
 	next := &limitFakeResolver{}
@@ -846,7 +846,7 @@ func TestLimitResolverDisableAAAA(t *testing.T) {
 		o.DisableAAAA = true
 	}, fc.clock(), next)
 
-	// AAAA — локально: пустой NOERROR (NODATA), без резолвера, без лимитов.
+	// AAAA — local: an empty NOERROR (NODATA), no resolver, no limits.
 	aaaa := Question{Name: "example.com", Type: dns.TypeAAAA}
 	for i := 0; i < 3; i++ {
 		res, err := r.Exchange(context.Background(), aaaa)
@@ -873,7 +873,7 @@ func TestLimitResolverDisableAAAA(t *testing.T) {
 		t.Fatalf("Stats: %+v", st)
 	}
 
-	// Реальные вопросы идут как обычно: через резолвер и с лимитами.
+	// Real questions go as usual: through the resolver and with limits.
 	a := Question{Name: "example.com", Type: dns.TypeA}
 	if _, err := r.Exchange(context.Background(), a); err != nil {
 		t.Fatal(err)
@@ -881,8 +881,8 @@ func TestLimitResolverDisableAAAA(t *testing.T) {
 	if c, _, _ := next.stats(); c != 1 {
 		t.Fatalf("обменов A: %d, want 1", c)
 	}
-	// Темп 1 QPS при burst 1: второй обмен ждёт секунду — ведро AAAA
-	// не разбавляло.
+	// A rate of 1 QPS with burst 1: the second exchange waits a second — the
+	// AAAA exchanges did not dilute the bucket.
 	if _, err := r.Exchange(context.Background(), a); err != nil {
 		t.Fatal(err)
 	}
@@ -890,7 +890,7 @@ func TestLimitResolverDisableAAAA(t *testing.T) {
 		t.Fatalf("паузы: %v, want [1s]", sleeps)
 	}
 
-	// Без отключения AAAA идёт к резолверу как обычный вопрос.
+	// Without AAAA disabling it goes to the resolver as an ordinary question.
 	next2 := &limitFakeResolver{}
 	r2 := newTestLimit(t, func(o *LimitOptions) { o.DisableAAAA = false }, newLimitManualClock().clock(), next2)
 	if _, err := r2.Exchange(context.Background(), aaaa); err != nil {
@@ -901,7 +901,7 @@ func TestLimitResolverDisableAAAA(t *testing.T) {
 	}
 }
 
-// --- декоратор: отмена ctx в очередях -------------------------------------------
+// --- decorator: ctx cancellation in queues ---------------------------------
 
 func TestLimitResolverCancelWaitingSlot(t *testing.T) {
 	next := &limitFakeResolver{}
@@ -915,7 +915,7 @@ func TestLimitResolverCancelWaitingSlot(t *testing.T) {
 	q := Question{Name: "example.com", Type: dns.TypeA}
 	bg := context.Background()
 
-	// Первый обмен занял единственный слот и висит в резолвере.
+	// The first exchange took the only slot and hangs in the resolver.
 	done1 := make(chan error, 1)
 	go func() {
 		_, err := r.Exchange(bg, q)
@@ -923,14 +923,14 @@ func TestLimitResolverCancelWaitingSlot(t *testing.T) {
 	}()
 	limitPollCond(t, func() bool { c, _, _ := next.stats(); return c == 1 }, "первый обмен дошёл до резолвера")
 
-	// Второй ждёт слот; отмена вынимает его из очереди семафора.
+	// The second waits for a slot; the cancellation removes it from the semaphore queue.
 	ctx, cancel := context.WithCancel(bg)
 	done2 := make(chan error, 1)
 	go func() {
 		_, err := r.Exchange(ctx, q)
 		done2 <- err
 	}()
-	time.Sleep(30 * time.Millisecond) // встал в очередь
+	time.Sleep(30 * time.Millisecond) // entered the queue
 	cancel()
 	select {
 	case err := <-done2:
@@ -944,7 +944,7 @@ func TestLimitResolverCancelWaitingSlot(t *testing.T) {
 		t.Fatalf("обменов: %d, want 1 (отменённый не дошёл)", c)
 	}
 
-	// Слот не потерян: первый завершается, следующий проходит.
+	// The slot is not lost: the first one finishes, the next one goes through.
 	close(hold)
 	if err := <-done1; err != nil {
 		t.Fatal(err)
@@ -969,12 +969,12 @@ func TestLimitResolverCancelWaitingToken(t *testing.T) {
 	q := Question{Name: "example.com", Type: dns.TypeA}
 	bg := context.Background()
 
-	// Первый обмен забрал единственный токен.
+	// The first exchange took the only token.
 	if _, err := r.Exchange(bg, q); err != nil {
 		t.Fatal(err)
 	}
 
-	// Второй ждёт токен (время не идёт); отмена прерывает ожидание.
+	// The second waits for the token (time is not moving); the cancellation interrupts the wait.
 	ctx, cancel := context.WithCancel(bg)
 	done := make(chan error, 1)
 	go func() {
@@ -991,12 +991,12 @@ func TestLimitResolverCancelWaitingToken(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("отмена не вынула из очереди токенов")
 	}
-	// Слот параллелизма не потерян (возвращён по ошибке токена).
+	// The concurrency slot is not lost (returned on the token error).
 	if st := r.Stats(); st.InFlight != 0 {
 		t.Fatalf("InFlight = %d, want 0 (слот возвращён)", st.InFlight)
 	}
 
-	// Время пошло — обмены продолжаются, ведро не «сломано».
+	// Time is moving — exchanges continue, the bucket is not "broken".
 	close(gc.gate)
 	if _, err := r.Exchange(bg, q); err != nil {
 		t.Fatalf("Exchange после открытия gate: %v", err)
@@ -1006,7 +1006,7 @@ func TestLimitResolverCancelWaitingToken(t *testing.T) {
 	}
 }
 
-// --- декоратор: сквозной проход ----------------------------------------------
+// --- decorator: end-to-end pass --------------------------------------------
 
 func TestLimitResolverPassThrough(t *testing.T) {
 	want := &Result{
@@ -1029,7 +1029,7 @@ func TestLimitResolverPassThrough(t *testing.T) {
 		t.Fatalf("результат изменён декоратором: %+v, want %+v", got, want)
 	}
 
-	// Ошибка нижнего резолвера возвращается как есть.
+	// The lower resolver's error is returned as is.
 	sentinel := errors.New("dnsclient: сеть отвалилась")
 	next.setErr(sentinel)
 	if _, err := r.Exchange(context.Background(), Question{Name: "example.com", Type: dns.TypeA}); !errors.Is(err, sentinel) {
@@ -1037,7 +1037,7 @@ func TestLimitResolverPassThrough(t *testing.T) {
 	}
 }
 
-// --- реальный sleep -----------------------------------------------------------
+// --- real sleep ------------------------------------------------------------
 
 func TestLimitSleepRealClock(t *testing.T) {
 	bg := context.Background()

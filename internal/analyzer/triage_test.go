@@ -1,10 +1,10 @@
-// Тесты триажа мутантов CI-прогона 09.11.2026 (половина A): добивки
-// analyzer — ошибки счётчиков агрегации (зона/кумулятив истории, включая
-// RowsAffected 0), путь findings=0 без перехода (upsert не зовётся),
-// границы дренажа unfound (retention=1, метрики события/строк/сбоя),
-// границы метрики UnfoundDrain (rows=1), ошибки выборки тика и корзин
-// переанализа (нулевые значения на ошибках), якорь lookback и проход
-// цикла без загруженных правил (без паники на nil-наборе).
+// Tests of the mutants triaged in the CI run of 11/09/2026 (half A):
+// analyzer additions — aggregation counter errors (zone/history
+// cumulative, including RowsAffected 0), the findings=0 path without a
+// transition (no upsert call), the unfound drain bounds (retention=1,
+// the event/rows/failure metrics), the UnfoundDrain metric bounds
+// (rows=1), tick select and re-analysis bucket errors (zero values on
+// errors), the lookback anchor and the loop pass without loaded rules (no panic on a nil set).
 package analyzer
 
 import (
@@ -21,8 +21,8 @@ import (
 	"crawler/internal/queue"
 )
 
-// seedUnfoundFixture — фикстура снятия находки переанализом: строка
-// laravel_domains есть, доставка разбирает страницу без признаков.
+// seedUnfoundFixture is the find removal by re-analysis fixture: the
+// laravel_domains row exists, the delivery analyzes a page without signs.
 func seedUnfoundFixture(t *testing.T, opts Options) (*anFixture, *anDrainRecorder) {
 	t.Helper()
 	f := newANFixture(t, anSet(1001), opts)
@@ -35,9 +35,9 @@ func seedUnfoundFixture(t *testing.T, opts Options) (*anFixture, *anDrainRecorde
 	return f, rec
 }
 
-// TestUnfoundDrain_MetricsAndRetentionBoundaries — событие unfound
-// бьёт метрику, дренаж с retention=1 выполняется (граница «≤ 0»),
-// строки дренажа суммируются метрикой.
+// TestUnfoundDrain_MetricsAndRetentionBoundaries — the unfound event
+// hits the metric, the drain with retention=1 runs (the "≤ 0" bound),
+// the drained rows are summed into the metric.
 func TestUnfoundDrain_MetricsAndRetentionBoundaries(t *testing.T) {
 	reg := metrics.New("analyzer")
 	f, rec := seedUnfoundFixture(t, Options{MinScore: 0.6, Retention: 1})
@@ -59,8 +59,8 @@ func TestUnfoundDrain_MetricsAndRetentionBoundaries(t *testing.T) {
 	}
 }
 
-// TestUnfoundDrain_ErrorMetrics — сбой дренажа бьёт метрику ошибки,
-// событие и снятие строки зафиксированы.
+// TestUnfoundDrain_ErrorMetrics — a drain failure hits the error
+// metric, the event and the row removal are committed.
 func TestUnfoundDrain_ErrorMetrics(t *testing.T) {
 	reg := metrics.New("analyzer")
 	f, _ := seedUnfoundFixture(t, Options{MinScore: 0.6, Retention: time.Hour})
@@ -81,8 +81,8 @@ func TestUnfoundDrain_ErrorMetrics(t *testing.T) {
 	}
 }
 
-// TestUnfoundDrain_NotUnfoundNoMetric — без события unfound метрики не
-// трогаются (вырезание w.met.Unfound() наблюдаемо).
+// TestUnfoundDrain_NotUnfoundNoMetric — without an unfound event the
+// metrics are not touched (cutting w.met.Unfound() out is observable).
 func TestUnfoundDrain_NotUnfoundNoMetric(t *testing.T) {
 	reg := metrics.New("analyzer")
 	f := newANFixture(t, anSet(1001), Options{MinScore: 0.6, Retention: time.Hour})
@@ -102,8 +102,8 @@ func TestUnfoundDrain_NotUnfoundNoMetric(t *testing.T) {
 	}
 }
 
-// TestMetricsUnfoundDrainRowOne — строка дренажа 1 — валидный инкремент
-// (граница rows ≤ 0); ноль на нетронутом реестре НЕ создаёт серию.
+// TestMetricsUnfoundDrainRowOne — a drained rows value of 1 is a valid
+// increment (the rows ≤ 0 bound); zero on a clean registry does NOT create a series.
 func TestMetricsUnfoundDrainRowOne(t *testing.T) {
 	reg := metrics.New("analyzer")
 	m := NewMetrics(reg)
@@ -118,13 +118,13 @@ func TestMetricsUnfoundDrainRowOne(t *testing.T) {
 	}
 }
 
-// TestAggregateZoneCounterErrors — сбои дельты зоны и кумулятива
-// истории (включая RowsAffected 0) роняют доставку с контекстом и
-// исходной причиной.
+// TestAggregateZoneCounterErrors — zone delta and history cumulative
+// failures (including RowsAffected 0) fail the delivery with context
+// and the original cause.
 func TestAggregateZoneCounterErrors(t *testing.T) {
 	hash := anTestHash(7)
-	// Сбой дельты зоны на появлении строки (исходная причина в ошибке —
-	// мутант вырезания return даёт только хвост «затронуто 0 строк»).
+	// A zone delta failure on row appearance (the original cause in the
+	// error — the return-cut mutant would give only the "affects 0 rows" tail).
 	f := newANFixture(t, anSet(1001), Options{MinScore: 0.6})
 	f.store.blocks[hash] = anPageHTML()
 	f.pool.seedResult(anKey, anHeaders(t), anCookies(t, "XSRF-TOKEN", "laravel_session"), hash[:])
@@ -135,7 +135,7 @@ func TestAggregateZoneCounterErrors(t *testing.T) {
 		t.Errorf("сбой дельты зоны = %v, want контекст счётчика зоны и исходную", err)
 	}
 
-	// Строка зоны отсутствует (UPDATE 0) — ошибка обязательности.
+	// The zone row is missing (UPDATE 0) — the mandatory-row error.
 	f2 := newANFixture(t, anSet(1001), Options{MinScore: 0.6})
 	f2.store.blocks[hash] = anPageHTML()
 	f2.pool.seedResult(anKey, anHeaders(t), anCookies(t, "XSRF-TOKEN", "laravel_session"), hash[:])
@@ -145,7 +145,7 @@ func TestAggregateZoneCounterErrors(t *testing.T) {
 		t.Errorf("UPDATE 0 зоны = %v, want «затронуто 0 строк»", err)
 	}
 
-	// Сбой кумулятива истории (appeared: свежая уверенная находка).
+	// A history cumulative failure (appeared: a fresh confident find).
 	f3 := newANFixture(t, anSet(1001), Options{MinScore: 0.6})
 	f3.store.blocks[hash] = anPageHTML()
 	f3.pool.seedResult(anKey, anHeaders(t), anCookies(t, "XSRF-TOKEN", "laravel_session"), hash[:])
@@ -158,7 +158,7 @@ func TestAggregateZoneCounterErrors(t *testing.T) {
 		t.Errorf("сбой кумулятива = %v, want контекст счётчика истории и исходную", err)
 	}
 
-	// Кумулятив без строки (INSERT 0 0) — ошибка обязательности.
+	// A cumulative without a row (INSERT 0 0) — the mandatory-row error.
 	f4 := newANFixture(t, anSet(1001), Options{MinScore: 0.6})
 	f4.store.blocks[hash] = anPageHTML()
 	f4.pool.seedResult(anKey, anHeaders(t), anCookies(t, "XSRF-TOKEN", "laravel_session"), hash[:])
@@ -169,17 +169,17 @@ func TestAggregateZoneCounterErrors(t *testing.T) {
 	}
 }
 
-// TestAggregateLostPathCounterErrors — сбои дельты зоны и кумулятива на
-// пути ПОТЕРИ находки (переход без fresh): ошибки роняют доставку.
+// TestAggregateLostPathCounterErrors — zone delta and cumulative
+// failures on the find LOSS path (a transition without fresh): errors fail the delivery.
 func TestAggregateLostPathCounterErrors(t *testing.T) {
-	// Сбой дельты зоны (−1) при снятии находки.
+	// A zone delta failure (−1) on the find removal.
 	f, _ := seedUnfoundFixture(t, Options{MinScore: 0.6, Retention: time.Hour})
 	f.pool.zoneLaravelErr = errors.New("зона: бум")
 	if _, err := f.w.ProcessResult(context.Background(), anTask); err == nil ||
 		!strings.Contains(err.Error(), "зона: бум") {
 		t.Errorf("потеря: сбой дельты зоны = %v, want исходную причину", err)
 	}
-	// Сбой кумулятива lost (свежая потеря находки пишет lost-историю).
+	// A lost cumulative failure (a fresh find loss writes lost history).
 	f2, _ := seedUnfoundFixture(t, Options{MinScore: 0.6, Retention: time.Hour})
 	f2.pool.counterDeltaErr = errors.New("кумулятив: бум")
 	task := anTask
@@ -190,24 +190,24 @@ func TestAggregateLostPathCounterErrors(t *testing.T) {
 	}
 }
 
-// TestAggregateRepeatDeliveryNoShift — повторная уверенная доставка при
-// существующей строке (смена версии правил — строка переведена в
-// устаревшие и доставлена заново): перехода нет — счётчик зоны и
-// история не трогаются (мутант вырезания return звал бы дельту).
+// TestAggregateRepeatDeliveryNoShift — a repeated confident delivery
+// with an existing row (a rule version change — the row was moved to
+// stale and delivered again): no transition — the zone counter and
+// the history are untouched (the return-cut mutant would call the delta).
 func TestAggregateRepeatDeliveryNoShift(t *testing.T) {
 	hash := anTestHash(7)
 	f := newANFixture(t, anSet(1001), Options{MinScore: 0.6})
 	f.store.blocks[hash] = anPageHTML()
 	f.pool.seedResult(anKey, anHeaders(t), anCookies(t, "XSRF-TOKEN", "laravel_session"), hash[:])
-	// Первая доставка — строка появилась.
+	// The first delivery — the row appeared.
 	if _, err := f.w.ProcessResult(context.Background(), anTask); err != nil {
 		t.Fatalf("первая доставка: %v", err)
 	}
 	if got := f.pool.zoneLaravel[anKey.zone]; got != 1 {
 		t.Fatalf("после первой доставки счётчик зоны = %d, want 1", got)
 	}
-	// Смена версии правил: строка устарела, повторная уверенная доставка
-	// доходит до агрегации с existed=true — без дельт и истории.
+	// A rule version change: the row went stale, the repeated confident
+	// delivery reaches the aggregation with existed=true — no deltas, no history.
 	f.sets.swap(anSet(1002))
 	historyBefore := len(f.pool.history)
 	if _, err := f.w.ProcessResult(context.Background(), anTask); err != nil {
@@ -221,8 +221,8 @@ func TestAggregateRepeatDeliveryNoShift(t *testing.T) {
 	}
 }
 
-// TestAnalyzeConsumeTailRowsAffected — декремент корзины хвостов с
-// нестандартным RowsAffected — ошибка обязательности.
+// TestAnalyzeConsumeTailRowsAffected — a tail bucket decrement with a
+// non-standard RowsAffected — the mandatory-row error.
 func TestAnalyzeConsumeTailRowsAffected(t *testing.T) {
 	f := newANFixture(t, anSet(1001), Options{MinScore: 0.6})
 	f.pool.seedResult(anKey, anHeaders(t), anCookies(t, "PHPSESSID"), nil)
@@ -233,9 +233,9 @@ func TestAnalyzeConsumeTailRowsAffected(t *testing.T) {
 	}
 }
 
-// TestUnfoundDrain_RetentionZeroNoCall — retention=0 при заданном шве:
-// дренаж ВООБЩЕ не вызывается (контент хранится всегда), событие
-// отмечается метрикой.
+// TestUnfoundDrain_RetentionZeroNoCall — retention=0 with the seam set:
+// the drain is NOT called at all (content is kept forever), the
+// event is recorded by the metric.
 func TestUnfoundDrain_RetentionZeroNoCall(t *testing.T) {
 	reg := metrics.New("analyzer")
 	f, rec := seedUnfoundFixture(t, Options{MinScore: 0.6, Retention: 0})
@@ -254,12 +254,12 @@ func TestUnfoundDrain_RetentionZeroNoCall(t *testing.T) {
 	}
 }
 
-// TestAggregateNoFindingsNoUpsert — findings=0 без перехода (строки не
-// было): upsert агрегата не выполняется (мутант вырезания return звал
-// бы запись с пустым агрегатом).
+// TestAggregateNoFindingsNoUpsert — findings=0 without a transition (no
+// row existed): the aggregate upsert does not run (the return-cut
+// mutant would write with an empty aggregate).
 func TestAggregateNoFindingsNoUpsert(t *testing.T) {
 	f, rec := seedUnfoundFixture(t, Options{MinScore: 0.6, Retention: time.Hour})
-	// Перехода нет: строку laravel_domains убираем — DELETE 0.
+	// No transition: remove the laravel_domains row — DELETE 0.
 	delete(f.pool.domains, anDomainKey{anKey.zone, anKey.domain})
 	if _, err := f.w.ProcessResult(context.Background(), anTask); err != nil {
 		t.Fatalf("ProcessResult: %v", err)
@@ -274,19 +274,19 @@ func TestAggregateNoFindingsNoUpsert(t *testing.T) {
 	}
 }
 
-// TestReanalyzeMatureTailsErrors — ошибки guard-запроса: Query/Scan/Err
-// и пустой ответ — ошибки с нулевыми значениями (пин нулей на каждой
-// ветке); обрыв соединения до первой строки — ошибка итерации, не
-// «пустой ответ».
+// TestReanalyzeMatureTailsErrors — guard query errors: Query/Scan/Err
+// and an empty response — errors with zero values (a pin of zeros on
+// each branch); a connection drop before the first row is an
+// iteration error, not an "empty response".
 func TestReanalyzeMatureTailsErrors(t *testing.T) {
-	// Query-ошибка.
+	// A Query error.
 	pool := newReanPool()
 	pool.setQueryErr(errors.New("бд недоступна"))
 	if tails, hour, err := reanalyzeMatureTails(context.Background(), pool); err == nil ||
 		tails != 0 || !hour.IsZero() {
 		t.Errorf("Query-сбой: (%v/%v, %v), want нули и ошибка", tails, hour, err)
 	}
-	// Пустой ответ — обрыв протокола, значения нулевые.
+	// An empty response — a protocol break, the values are zero.
 	pool2 := newReanPool()
 	pool2.guardEmpty = true
 	if tails, hour, err := reanalyzeMatureTails(context.Background(), pool2); err == nil ||
@@ -294,8 +294,8 @@ func TestReanalyzeMatureTailsErrors(t *testing.T) {
 		!strings.Contains(err.Error(), "пустой ответ") {
 		t.Errorf("пустой ответ: (%v/%v, %v), want нули и «пустой ответ»", tails, hour, err)
 	}
-	// Обрыв до первой строки (rows.Err при пустом наборе) — ошибка
-	// итерации, НЕ «пустой ответ агрегата».
+	// A drop before the first row (rows.Err on an empty set) is an
+	// iteration error, NOT an "empty aggregate response".
 	pool3 := newReanPool()
 	pool3.guardEmpty = true
 	pool3.guardRowsErr = errors.New("обрыв соединения")
@@ -303,7 +303,7 @@ func TestReanalyzeMatureTailsErrors(t *testing.T) {
 		tails != 0 || !hour.IsZero() || !strings.Contains(err.Error(), "обрыв соединения") {
 		t.Errorf("обрыв до строки: (%v/%v, %v), want нули и исходную", tails, hour, err)
 	}
-	// Scan-ошибка — контекст «чтение», значения нулевые.
+	// A Scan error — the "reading" context, the values are zero.
 	pool4 := newReanPool()
 	pool4.guardScanErr = errors.New("скан-бум")
 	if tails, hour, err := reanalyzeMatureTails(context.Background(), pool4); err == nil ||
@@ -311,7 +311,7 @@ func TestReanalyzeMatureTailsErrors(t *testing.T) {
 		!strings.Contains(err.Error(), "чтение") {
 		t.Errorf("Scan-сбой: (%v/%v, %v), want нули и контекст чтения", tails, hour, err)
 	}
-	// rows.Err после строки — исходная ошибка, значения нулевые.
+	// rows.Err after a row — the original error, the values are zero.
 	pool5 := newReanPool()
 	pool5.guardRowsErr = errors.New("обрыв")
 	if tails, hour, err := reanalyzeMatureTails(context.Background(), pool5); err == nil ||
@@ -320,27 +320,27 @@ func TestReanalyzeMatureTailsErrors(t *testing.T) {
 	}
 }
 
-// TestReanalyzeTickSelectErrors — ошибка выборки тика (guard прошёл):
-// контекст «выборка тика», Scan/Err строк — с контекстами.
+// TestReanalyzeTickSelectErrors — a tick select error (the guard passed):
+// the "tick select" context; row Scan/Err — with their contexts.
 func TestReanalyzeTickSelectErrors(t *testing.T) {
 	hour := time.Now().Truncate(time.Hour)
 	seed := func() *reanPool {
 		pool := newReanPool()
-		pool.guardTails = 1000 // guard открыт — выборка выполняется
+		pool.guardTails = 1000 // the guard is open — the select runs
 		pool.guardHour = hour
 		pool.seedZone(1, "test")
-		pool.seedDomain(1, 1, "a", 1) // статус new — не deleted
+		pool.seedDomain(1, 1, "a", 1) // status new — not deleted
 		pool.seedRowAt(1, 1, 0, 0, nil, hour.Add(-2*time.Hour))
 		return pool
 	}
-	// Query-ошибка выборки тика.
+	// A Query error of the tick select.
 	pool := seed()
 	pool.tickQueryErr = errors.New("бд недоступна")
 	if _, err := ReanalyzeTick(context.Background(), pool, &reanQueue{}, 1, &ReanalyzeCursor{}, ReanalyzeOptions{}); err == nil ||
 		!strings.Contains(err.Error(), "выборка тика") {
 		t.Errorf("Query тика = %v, want контекст «выборка тика»", err)
 	}
-	// Scan-ошибка строки.
+	// A row Scan error.
 	pool2 := seed()
 	pool2.tickScanErr = errors.New("скан-бум")
 	if _, err := ReanalyzeTick(context.Background(), pool2, &reanQueue{}, 1, &ReanalyzeCursor{}, ReanalyzeOptions{}); err == nil ||
@@ -356,8 +356,8 @@ func TestReanalyzeTickSelectErrors(t *testing.T) {
 	}
 }
 
-// cancelQueue — очередь, отменяющая ctx при первой публикации (отмена
-// посреди пачки тика).
+// cancelQueue is a queue that cancels ctx on the first publish (a
+// cancellation in the middle of a tick batch).
 type cancelQueue struct {
 	reanQueue
 	cancel context.CancelFunc
@@ -365,17 +365,17 @@ type cancelQueue struct {
 }
 
 func (q *cancelQueue) Publish(ctx context.Context, stream string, msg queue.Message) (string, error) {
-	id, err := q.reanQueue.Publish(ctx, stream, msg) // публикация живым ctx
+	id, err := q.reanQueue.Publish(ctx, stream, msg) // a publish with the live ctx
 	if !q.done {
 		q.done = true
-		q.cancel() // отмена ПОСЛЕ успешной публикации — следом цикл
+		q.cancel() // the cancellation AFTER a successful publish — the loop follows
 	}
 	return id, err
 }
 
-// TestReanalyzeTickCancelMidBatch — отмена между пачками: точная
-// обёртка «analyzer: переанализ: context canceled» (мутант вырезания
-// re-check давал бы «выборка тика: …»), итог — пачка до отмены.
+// TestReanalyzeTickCancelMidBatch — a cancellation between batches: the
+// exact wrap "analyzer: re-analysis: context canceled" (the re-check
+// cut mutant would give "tick select: …"), the outcome is a batch before the cancel.
 func TestReanalyzeTickCancelMidBatch(t *testing.T) {
 	pool := newReanPool()
 	pool.guardTails = 1000
@@ -398,30 +398,30 @@ func TestReanalyzeTickCancelMidBatch(t *testing.T) {
 	}
 }
 
-// TestReanalyzeLookbackPin — якорь окна — сутки.
+// TestReanalyzeLookbackPin — the window anchor is a day.
 func TestReanalyzeLookbackPin(t *testing.T) {
 	if DefaultReanalyzeLookback != 24*time.Hour {
 		t.Errorf("DefaultReanalyzeLookback = %v, want 24h", DefaultReanalyzeLookback)
 	}
 }
 
-// TestReanalyzeLoopNilRulesNoPanic — цикл без загруженного набора правил
-// пропускает стартовый проход без паники (мутант вырезания
-// Warn+return разыменовал бы nil-набор) и выходит по отмене; после
-// загрузки набора проходы идут.
+// TestReanalyzeLoopNilRulesNoPanic — the loop without a loaded rule set
+// skips the startup pass without a panic (the Warn+return cut mutant
+// would dereference a nil set) and exits on cancellation; after the
+// set is loaded the passes run.
 func TestReanalyzeLoopNilRulesNoPanic(t *testing.T) {
 	pool := newReanPool()
-	pool.guardTails = 0 // guard закрыт — тяжёлой выборки нет
+	pool.guardTails = 0 // the guard is closed — no heavy select
 	q := &reanQueue{}
-	sets := &reanSource{set: nil} // набор не загружен
+	sets := &reanSource{set: nil} // the set is not loaded
 	done := make(chan error, 1)
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
 		done <- ReanalyzeLoop(ctx, pool, q, sets, ReanalyzeOptions{Interval: time.Nanosecond})
 	}()
-	// Стартовый drain И тики тикера обязаны выполниться с nil-набором
-	// без паники (мутант вырезания Warn+return в tick разыменовал бы
-	// nil-набор); ждём несколько тиков и отменяем.
+	// The startup drain AND the ticker ticks must run with a nil set
+	// without a panic (the Warn+return cut mutant in tick would
+	// dereference a nil set); wait a few ticks and cancel.
 	time.Sleep(100 * time.Millisecond)
 	cancel()
 	select {

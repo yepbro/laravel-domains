@@ -1,10 +1,10 @@
-// Тесты клиента. Два уровня, как требует задача:
+// Client tests. Two levels, as the task requires:
 //
-//   - транспортный шов exchangeFunc — ретраи, TC→TCP-fallback, маппинг
-//     RCODE, отмена ctx, счётчики попыток (сети нет вообще);
-//   - локальный DNS-сервер miekg/dns на 127.0.0.1:0 (петля, не внешний
-//     стек) — реальный провод UDP и TCP: упаковка, чтение, пропуск
-//     мусора и поздних ответов, дедлайны.
+//   - the exchangeFunc transport seam — retries, TC→TCP fallback, RCODE
+//     mapping, ctx cancellation, attempt counters (no network at all);
+//   - a local miekg/dns DNS server on 127.0.0.1:0 (loopback, not an
+//     external stack) — real UDP and TCP wiring: packing, reading,
+//     skipping garbage and late answers, deadlines.
 
 package dnsclient
 
@@ -24,16 +24,16 @@ import (
 	"crawler/internal/config"
 )
 
-// --- вспомогательные конструкторы ------------------------------------------
+// --- helper constructors ---------------------------------------------------
 
-// fakeCall — зафиксированный вызов транспорта.
+// fakeCall is a recorded transport call.
 type fakeCall struct {
 	m   *dns.Msg
 	tcp bool
 }
 
-// newFakeClient — клиент с подменённым транспортом: без сети и пула.
-// modify накладывает параметры поверх нулевых (потом withDefaults).
+// newFakeClient is a client with the transport swapped out: no network,
+// no pool. modify layers parameters on top of zero values (then withDefaults).
 func newFakeClient(t *testing.T, modify func(*Options), fn exchangeFunc) (*Client, *[]fakeCall) {
 	t.Helper()
 	var calls []fakeCall
@@ -53,7 +53,7 @@ func newFakeClient(t *testing.T, modify func(*Options), fn exchangeFunc) (*Clien
 	return c, &calls
 }
 
-// fakeNetErr — сетевая ошибка с управляемым признаком таймаута.
+// fakeNetErr is a network error with a controllable timeout flag.
 type fakeNetErr struct{ timeout bool }
 
 func (fakeNetErr) Error() string   { return "fake network error" }
@@ -88,7 +88,7 @@ func nsRR(name, host string) dns.RR {
 	}
 }
 
-// makeReply — ответ на запрос q с кодом и секцией answer.
+// makeReply is a reply to the request q with the code and an answer section.
 func makeReply(q *dns.Msg, rcode int, an ...dns.RR) *dns.Msg {
 	m := new(dns.Msg)
 	m.SetReply(q)
@@ -97,7 +97,7 @@ func makeReply(q *dns.Msg, rcode int, an ...dns.RR) *dns.Msg {
 	return m
 }
 
-// --- транспортный шов: контракт Exchange -----------------------------------
+// --- transport seam: the Exchange contract ---------------------------------
 
 func TestExchangeReturnsAnswerRecords(t *testing.T) {
 	c, calls := newFakeClient(t, nil, func(_ context.Context, m *dns.Msg, tcp bool) (*dns.Msg, error) {
@@ -128,7 +128,7 @@ func TestExchangeReturnsAnswerRecords(t *testing.T) {
 		t.Fatalf("попытки/TCP: attempts=%d tcp=%v", res.Attempts, res.TCP)
 	}
 
-	// Вопрос ушёл на транспорт каноничным: FQDN, тип, класс, рекурсия.
+	// The question reached the transport canonical: FQDN, type, class, recursion.
 	if len(*calls) != 1 {
 		t.Fatalf("вызовов транспорта: %d", len(*calls))
 	}
@@ -174,7 +174,7 @@ func TestExchangeRCodeIsResultNotError(t *testing.T) {
 			}
 		})
 	}
-	// Расширенный код — числом с говорящей мнемоникой.
+	// An extended code is a number with a speaking mnemonic.
 	if got := RCode(42).String(); got != "RCODE42" {
 		t.Fatalf("неизвестный код: %q", got)
 	}
@@ -207,7 +207,7 @@ func TestExchangeTCFallbackToTCP(t *testing.T) {
 	if len(*calls) != 2 || (*calls)[0].tcp || !(*calls)[1].tcp {
 		t.Fatalf("порядок обменов: сначала UDP, затем TCP; получено %+v", *calls)
 	}
-	// TCP повторяет тот же вопрос (имя и тип), а не что-то иное.
+	// TCP repeats the same question (name and type), nothing else.
 	q1 := (*calls)[0].m.Question[0]
 	q2 := (*calls)[1].m.Question[0]
 	if q1 != q2 {
@@ -239,8 +239,8 @@ func TestExchangeTCPFailureFailsAttempt(t *testing.T) {
 	if !strings.Contains(err.Error(), "tcp-fallback") {
 		t.Fatalf("в сообщении нет ветки tcp-fallback: %v", err)
 	}
-	// Две попытки × (UDP + TCP) = 4 обмена: TCP-ошибка роняет попытку
-	// целиком, цикл начинается заново с UDP.
+	// Two attempts × (UDP + TCP) = 4 exchanges: a TCP error fails the
+	// attempt entirely, the cycle starts over with UDP.
 	if n := len(*calls); n != 4 {
 		t.Fatalf("обменов: %d, ожидалось 4", n)
 	}
@@ -267,7 +267,7 @@ func TestExchangeRetriesThenSucceeds(t *testing.T) {
 	if res.Attempts != 3 {
 		t.Fatalf("обменов: %d, ожидалось 3", res.Attempts)
 	}
-	// Две паузы по 25 мс между тремя попытками обязаны быть в Elapsed.
+	// The two 25 ms pauses between the three attempts must show up in Elapsed.
 	if min := 50 * time.Millisecond; res.Elapsed < min {
 		t.Fatalf("Elapsed %s меньше суммы пауз %s", res.Elapsed, min)
 	}
@@ -295,7 +295,7 @@ func TestExchangeRetriesExhausted(t *testing.T) {
 	if !strings.Contains(err.Error(), "исчерпаны попытки") || !strings.Contains(err.Error(), "example.com") {
 		t.Fatalf("сообщение без контекста: %v", err)
 	}
-	if n := len(*calls); n != 3 { // первая + 2 повтора
+	if n := len(*calls); n != 3 { // the first + 2 retries
 		t.Fatalf("обменов: %d, ожидалось 3", n)
 	}
 }
@@ -304,10 +304,10 @@ func TestExchangeCancelledDuringRetryDelay(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	c, calls := newFakeClient(t, func(o *Options) {
 		o.Retries = 2
-		o.RetryDelay = 10 * time.Second // пауза, в которой придёт отмена
+		o.RetryDelay = 10 * time.Second // a pause long enough for the cancellation to arrive
 	}, func(_ context.Context, _ *dns.Msg, _ bool) (*dns.Msg, error) {
-		// Первая попытка падает и одновременно отменяет внешний ctx:
-		// Exchange обязан выйти в паузе, не делая вторую попытку.
+		// The first attempt fails and cancels the outer ctx at the same time:
+		// Exchange must exit during the pause without making the second attempt.
 		time.AfterFunc(10*time.Millisecond, cancel)
 		return nil, fakeNetErr{timeout: true}
 	})
@@ -369,8 +369,8 @@ func TestExchangeQuestionValidation(t *testing.T) {
 }
 
 func TestExchangeBadNameFailsPack(t *testing.T) {
-	// Метка длиннее 63 октетов не упаковывается в wire-формат — ошибка
-	// детерминирована, до сети дело не доходит.
+	// A label longer than 63 octets does not pack into the wire format — the
+	// error is deterministic, the network is never reached.
 	long := strings.Repeat("a", 64) + ".example.com"
 	c, calls := newFakeClient(t, nil, func(_ context.Context, _ *dns.Msg, _ bool) (*dns.Msg, error) {
 		t.Error("транспорт не должен вызываться для неупаковываемого имени")
@@ -390,7 +390,7 @@ func TestExchangeQuestionFqdnPassthrough(t *testing.T) {
 	c, calls := newFakeClient(t, nil, func(_ context.Context, m *dns.Msg, _ bool) (*dns.Msg, error) {
 		return makeReply(m, dns.RcodeSuccess, nsRR("example.com.", "ns1.example.com.")), nil
 	})
-	// Имя без завершающей точки дополняется, с точкой — не меняется.
+	// A name without the trailing dot gets it appended, with the dot it is unchanged.
 	for _, name := range []string{"example.com", "example.com."} {
 		if _, err := c.Exchange(context.Background(), Question{Name: name, Type: dns.TypeNS}); err != nil {
 			t.Fatalf("Exchange(%q): %v", name, err)
@@ -403,9 +403,9 @@ func TestExchangeQuestionFqdnPassthrough(t *testing.T) {
 	}
 }
 
-// TestExchangeEDNS0 — запрос несёт OPT RR (RFC 6891) с advertised
-// размером DefaultEDNS0UDPSize и без DO-бита: большие ответы приходят
-// целиком по UDP, а не с TC=1 и TCP-fallback в каждой попытке (DNS-07).
+// TestExchangeEDNS0 — the request carries an OPT RR (RFC 6891) with the
+// advertised DefaultEDNS0UDPSize and without the DO bit: large answers
+// arrive in full over UDP, not with TC=1 and a TCP fallback on every attempt (DNS-07).
 func TestExchangeEDNS0(t *testing.T) {
 	c, calls := newFakeClient(t, nil, func(_ context.Context, m *dns.Msg, _ bool) (*dns.Msg, error) {
 		return makeReply(m, dns.RcodeSuccess, aRR("example.com.", "192.0.2.1")), nil
@@ -434,7 +434,7 @@ func TestExchangeEDNS0(t *testing.T) {
 	}
 }
 
-// --- конфигурация -----------------------------------------------------------
+// --- configuration ---------------------------------------------------------
 
 func TestOptionsDefaultsAndValidation(t *testing.T) {
 	def := Options{Addr: "127.0.0.1:53"}.withDefaults()
@@ -451,12 +451,12 @@ func TestOptionsDefaultsAndValidation(t *testing.T) {
 		t.Fatalf("дефолты обязаны проходить валидацию: %v", err)
 	}
 
-	// Нормализация не исправляет осмысленно: кривой адрес и перебор
-	// ретраев остаются ошибками (отрицательный размер пула и таймауты
-	// withDefaults заменяет дефолтами — как db.Options).
+	// What normalization cannot sensibly fix: a bad address and too many
+	// retries stay errors (a negative pool size and timeouts are replaced
+	// with defaults by withDefaults — like db.Options).
 	bad := []Options{
-		{},                  // пустой адрес
-		{Addr: "127.0.0.1"}, // без порта
+		{},                  // an empty address
+		{Addr: "127.0.0.1"}, // no port
 		{Addr: "127.0.0.1:53", Retries: MaxRetries + 1},
 	}
 	for i, o := range bad {
@@ -493,7 +493,7 @@ func TestNewOptionsFromConfig(t *testing.T) {
 	}
 	got := NewOptions(cfg)
 	want := Options{
-		Addr:        "10.0.0.2:5353", // первый резолвер (unbound)
+		Addr:        "10.0.0.2:5353", // the first resolver (unbound)
 		Timeout:     3 * time.Second,
 		TCPTimeout:  7 * time.Second,
 		Retries:     4,
@@ -503,8 +503,8 @@ func TestNewOptionsFromConfig(t *testing.T) {
 	if got != want {
 		t.Fatalf("NewOptions: %+v, ожидалось %+v", got, want)
 	}
-	// Пустой список резолверов — пустой адрес: валидацию поймает
-	// NewClient (конфиг гарантирует непустоту, ТЗ 5.10).
+	// An empty resolver list is an empty address: NewClient will catch the
+	// validation (the config guarantees a non-empty list, spec 5.10).
 	if got := (NewOptions(config.DNS{})).Addr; got != "" {
 		t.Fatalf("без резолверов Addr обязан быть пустым, получен %q", got)
 	}
@@ -519,18 +519,18 @@ func TestNewClientValidation(t *testing.T) {
 	}
 }
 
-// --- локальный DNS-сервер (петля) ------------------------------------------
+// --- local DNS server (loopback) -------------------------------------------
 
-// isTCPWriter определяет протокол запроса по адресу клиента: у UDP это
-// *net.UDPAddr, у TCP — *net.TCPAddr (другого способа узнать протокол
-// из Handler в miekg/dns нет).
+// isTCPWriter determines the request protocol from the client address:
+// for UDP it is *net.UDPAddr, for TCP — *net.TCPAddr (there is no other
+// way to learn the protocol from a Handler in miekg/dns).
 func isTCPWriter(w dns.ResponseWriter) bool {
 	_, ok := w.RemoteAddr().(*net.TCPAddr)
 	return ok
 }
 
-// spinLocalDNS поднимает DNS-сервер на 127.0.0.1:0, UDP и TCP на одном
-// порту (как настоящий резолвер), и возвращает адрес.
+// spinLocalDNS brings up a DNS server on 127.0.0.1:0, UDP and TCP on the
+// same port (like a real resolver), and returns the address.
 func spinLocalDNS(t *testing.T, h dns.Handler) string {
 	t.Helper()
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
@@ -553,14 +553,14 @@ func spinLocalDNS(t *testing.T, h dns.Handler) string {
 	return pc.LocalAddr().String()
 }
 
-// newLocalClient — настоящий клиент (пул сокетов) к локальному серверу.
+// newLocalClient is a real client (a socket pool) to the local server.
 func newLocalClient(t *testing.T, addr string, modify func(*Options)) *Client {
 	t.Helper()
 	opts := Options{
 		Addr:        addr,
 		Timeout:     time.Second,
 		TCPTimeout:  time.Second,
-		Retries:     1, // без ретраев по умолчанию: детерминированное время теста
+		Retries:     1, // no retries by default: deterministic test timing
 		RetryDelay:  5 * time.Millisecond,
 		UDPPoolSize: 4,
 	}
@@ -606,7 +606,7 @@ func TestLocalTCFallback(t *testing.T) {
 	}
 	addr := spinLocalDNS(t, dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
 		if !isTCPWriter(w) {
-			// UDP: короткий ответ с флагом усечения (TC=1).
+			// UDP: a short response with the truncation flag (TC=1).
 			m := makeReply(r, dns.RcodeSuccess)
 			m.Truncated = true
 			_ = w.WriteMsg(m)
@@ -667,10 +667,10 @@ func TestLocalRCodes(t *testing.T) {
 	}
 }
 
-// TestLocalTimeout — молчащий сервер: попытка истекает по таймауту,
-// ретраи отрабатывают, итог — ошибка с признаком таймаута.
+// TestLocalTimeout — a silent server: the attempt times out, the retries
+// run their course, the outcome is an error with the timeout flag.
 func TestLocalTimeout(t *testing.T) {
-	addr := loopUDPAddr(t) // приёмник читает и молчит
+	addr := loopUDPAddr(t) // the receiver reads and stays silent
 	c := newLocalClient(t, addr, func(o *Options) {
 		o.Timeout = 80 * time.Millisecond
 		o.Retries = 1
@@ -690,9 +690,9 @@ func TestLocalTimeout(t *testing.T) {
 	}
 }
 
-// TestLocalSkipsGarbageAndStaleAnswers — кривые датаграммы и ответы с
-// чужим Id не роняют обмен и не выдаются за ответ: чтение продолжается
-// до собственного дедлайна.
+// TestLocalSkipsGarbageAndStaleAnswers — broken datagrams and responses
+// with a foreign Id neither fail the exchange nor pass for the answer:
+// reading continues until the own deadline.
 func TestLocalSkipsGarbageAndStaleAnswers(t *testing.T) {
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
@@ -707,15 +707,15 @@ func TestLocalSkipsGarbageAndStaleAnswers(t *testing.T) {
 			if err != nil {
 				return
 			}
-			// На каждый запрос: мусор, затем валидное сообщение с чужим
-			// Id (поздний ответ прежнего обмена), затем тишина.
+			// Per request: garbage, then a valid message with a foreign Id (a
+			// late response of the previous exchange), then silence.
 			if _, err := pc.WriteTo([]byte("this is not a dns message"), peer); err != nil {
 				return
 			}
 			reqID := binary.BigEndian.Uint16(buf[:2])
 			stale := new(dns.Msg)
 			stale.SetQuestion("stale.example.com.", dns.TypeA)
-			stale.Id = reqID ^ 0xFFFF // гарантированно чужой
+			stale.Id = reqID ^ 0xFFFF // guaranteed foreign
 			wire, err := stale.Pack()
 			if err != nil {
 				return
@@ -728,7 +728,7 @@ func TestLocalSkipsGarbageAndStaleAnswers(t *testing.T) {
 
 	c := newLocalClient(t, pc.LocalAddr().String(), func(o *Options) {
 		o.Timeout = 150 * time.Millisecond
-		o.Retries = 1 // две попытки — обе с мусором вместо ответа
+		o.Retries = 1 // two attempts — both get garbage instead of an answer
 	})
 
 	_, err = c.Exchange(context.Background(), Question{Name: "example.com", Type: dns.TypeA})
@@ -740,11 +740,11 @@ func TestLocalSkipsGarbageAndStaleAnswers(t *testing.T) {
 	}
 }
 
-// TestLocalConcurrentExchange — несколько Exchange одновременно на
-// одном клиенте (пул раздаёт сокеты; гонки ловит -race).
+// TestLocalConcurrentExchange — several Exchange calls at once on one
+// client (the pool hands out sockets; the -race run catches races).
 func TestLocalConcurrentExchange(t *testing.T) {
 	addr := spinLocalDNS(t, dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
-		// Ответ зависит от имени: каждая горутина проверяет свой адрес.
+		// The answer depends on the name: each goroutine checks its own address.
 		ip := fmt.Sprintf("192.0.2.%d", 1+len(r.Question[0].Name)%98)
 		_ = w.WriteMsg(makeReply(r, dns.RcodeSuccess, aRR(r.Question[0].Name, ip)))
 	}))

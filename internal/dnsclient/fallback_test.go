@@ -1,8 +1,8 @@
-// Тесты переключения на резервные резолверы (T-107). Сети нет: элементы
-// цепи — фейки Resolver с записью порядка вызовов и программируемым
-// итогом. Проверяются: условие переключения (только транспортный отказ,
-// RCODE — нет), порядок цепи, счётчики Stats, агрегированная ошибка
-// исчерпания, отмена ctx и конкурентность (гонки ловит -race).
+// Tests of switching to backup resolvers (T-107). No network: chain
+// elements are Resolver fakes with call-order recording and a
+// programmable outcome. Checked: the switch condition (only a transport
+// failure, not an RCODE), the chain order, the Stats counters, the
+// aggregated exhaustion error, ctx cancellation, and concurrency (the -race run catches races).
 
 package dnsclient
 
@@ -18,10 +18,10 @@ import (
 	"github.com/miekg/dns"
 )
 
-// --- вспомогательные фейки ---------------------------------------------------
+// --- helper fakes ----------------------------------------------------------
 
-// fbCalls — разделяемая запись порядка вызовов цепи (потокобезопасна:
-// конкурентный тест гоняет Exchange из горутин).
+// fbCalls is a shared record of the chain call order (thread-safe:
+// the concurrent test runs Exchange from goroutines).
 type fbCalls struct {
 	mu    sync.Mutex
 	order []string
@@ -39,8 +39,8 @@ func (c *fbCalls) snapshot() []string {
 	return append([]string(nil), c.order...)
 }
 
-// fbFake — элемент цепи: считает вызовы, возвращает заданный итог;
-// fn (если задана) полностью заменяет поведение (отмена ctx, паузы).
+// fbFake is a chain element: it counts calls and returns the given
+// outcome; fn (when set) fully replaces the behavior (ctx cancellation, pauses).
 type fbFake struct {
 	name  string
 	calls *fbCalls
@@ -50,7 +50,7 @@ type fbFake struct {
 }
 
 func (f *fbFake) Exchange(ctx context.Context, q Question) (*Result, error) {
-	if f.calls != nil { // фейки вне цепи (пробы) не регистрируются
+	if f.calls != nil { // fakes outside the chain (probes) are not recorded
 		f.calls.add(f.name)
 	}
 	if f.fn != nil {
@@ -65,7 +65,7 @@ func (f *fbFake) Exchange(ctx context.Context, q Question) (*Result, error) {
 	return &Result{RCode: RCodeNOERROR, Answer: []dns.RR{aRR(dns.Fqdn(q.Name), "192.0.2.1")}}, nil
 }
 
-// newFallback — цепь из фейков с общим регистратором вызовов.
+// newFallback is a chain of fakes with a shared call recorder.
 func newFallback(t *testing.T, fakes ...*fbFake) (*FallbackResolver, *fbCalls) {
 	t.Helper()
 	if len(fakes) == 0 {
@@ -85,10 +85,10 @@ func newFallback(t *testing.T, fakes ...*fbFake) (*FallbackResolver, *fbCalls) {
 	return r, calls
 }
 
-// --- условие переключения ----------------------------------------------------
+// --- switch condition ------------------------------------------------------
 
-// TestFallbackPrimaryAnswers — основной ответил: резервы не опрашиваются,
-// итог — результат основного, счётчики молчат.
+// TestFallbackPrimaryAnswers — the primary answered: the backups are not
+// polled, the outcome is the primary's result, the counters stay silent.
 func TestFallbackPrimaryAnswers(t *testing.T) {
 	primary := &fbFake{res: &Result{RCode: RCodeNOERROR, Answer: []dns.RR{aRR("example.com.", "192.0.2.7")}}}
 	r, calls := newFallback(t, primary, &fbFake{}, &fbFake{})
@@ -108,9 +108,9 @@ func TestFallbackPrimaryAnswers(t *testing.T) {
 	}
 }
 
-// TestFallbackRCODEIsNotASwitch — RCODE (включая SERVFAIL/NXDOMAIN) —
-// ответ сервера, а не транспортный отказ: переключения нет, семантика
-// классификации ответов (T-036/T-039) не меняется.
+// TestFallbackRCODEIsNotASwitch — an RCODE (including SERVFAIL/NXDOMAIN) is
+// a server answer, not a transport failure: no switching, the response
+// classification semantics (T-036/T-039) do not change.
 func TestFallbackRCODEIsNotASwitch(t *testing.T) {
 	for _, rcode := range []RCode{RCodeSERVFAIL, RCodeNXDOMAIN, RCodeREFUSED} {
 		t.Run(rcode.String(), func(t *testing.T) {
@@ -133,13 +133,13 @@ func TestFallbackRCODEIsNotASwitch(t *testing.T) {
 	}
 }
 
-// TestFallbackSwitchOnPrimaryFailure — основной исчерпал попытки на
-// сетевой ошибке: вопрос уходит на резерв, итог — результат резерва
-// (любой RCODE), Switches растёт, Elapsed — время всего обмена
-// (включая цикл отказавшего).
+// TestFallbackSwitchOnPrimaryFailure — the primary ran out of attempts on
+// a network error: the question goes to the backup, the outcome is the
+// backup's result (any RCODE), Switches grows, Elapsed is the whole
+// exchange time (including the failed one's loop).
 func TestFallbackSwitchOnPrimaryFailure(t *testing.T) {
 	primary := &fbFake{fn: func(ctx context.Context, q Question) (*Result, error) {
-		time.Sleep(25 * time.Millisecond) // цикл ретраев мёртвого основного
+		time.Sleep(25 * time.Millisecond) // the dead primary's retry loop
 		return nil, fakeNetErr{timeout: true}
 	}}
 	reserve := &fbFake{res: &Result{RCode: RCodeNXDOMAIN, Ns: []dns.RR{nsRR("example.com.", "ns1.example.com.")}}}
@@ -163,8 +163,8 @@ func TestFallbackSwitchOnPrimaryFailure(t *testing.T) {
 	}
 }
 
-// TestFallbackSecondReserveAnswers — резервы опрашиваются по порядку
-// до первого ответа.
+// TestFallbackSecondReserveAnswers — the backups are polled in order
+// until the first answer.
 func TestFallbackSecondReserveAnswers(t *testing.T) {
 	r, calls := newFallback(t,
 		&fbFake{err: fakeNetErr{timeout: true}},
@@ -187,11 +187,11 @@ func TestFallbackSecondReserveAnswers(t *testing.T) {
 	}
 }
 
-// --- исчерпание цепи ---------------------------------------------------------
+// --- chain exhaustion ------------------------------------------------------
 
-// TestFallbackAllDead — не ответил никто: ошибка перечисляет все адреса
-// цепи, оборачивает причину последнего (errors.Is, IsTimeout) и растит
-// Exhausted — каждый такой обмен у потребителя станет temp_error.
+// TestFallbackAllDead — nobody answered: the error lists all chain
+// addresses, wraps the last one's cause (errors.Is, IsTimeout) and bumps
+// Exhausted — each such exchange becomes a consumer temp_error.
 func TestFallbackAllDead(t *testing.T) {
 	first := errors.New("wire cut")
 	last := fmt.Errorf("udp: %w", fakeNetErr{timeout: true})
@@ -221,8 +221,8 @@ func TestFallbackAllDead(t *testing.T) {
 	}
 }
 
-// TestFallbackNoReserves — цепь из одного основного (пустой
-// dns.fallback_resolvers): деградирует в обычный резолвер.
+// TestFallbackNoReserves — a chain with the primary only (an empty
+// dns.fallback_resolvers): it degrades into an ordinary resolver.
 func TestFallbackNoReserves(t *testing.T) {
 	r, _ := newFallback(t, &fbFake{err: errors.New("down")})
 	if _, err := r.Exchange(context.Background(), Question{Name: "example.com", Type: dns.TypeA}); err == nil {
@@ -233,15 +233,15 @@ func TestFallbackNoReserves(t *testing.T) {
 	}
 }
 
-// --- отмена ctx --------------------------------------------------------------
+// --- ctx cancellation ------------------------------------------------------
 
-// TestFallbackCancelledNoReserves — отмена ctx (shutdown) — не отказ
-// резолвера: резервы не опрашиваются, возвращается ошибка отмены,
-// счётчики чисты (деградацией не считается).
+// TestFallbackCancelledNoReserves — a ctx cancellation (shutdown) is not
+// a resolver refusal: the backups are not polled, the cancellation error
+// is returned, the counters stay clean (not counted as degradation).
 func TestFallbackCancelledNoReserves(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	primary := &fbFake{fn: func(ctx context.Context, q Question) (*Result, error) {
-		cancel() // Client при отмене возвращает raw ctx-ошибку
+		cancel() // Client returns the raw ctx error on cancellation
 		return nil, ctx.Err()
 	}}
 	r, calls := newFallback(t, primary, &fbFake{})
@@ -258,8 +258,8 @@ func TestFallbackCancelledNoReserves(t *testing.T) {
 	}
 }
 
-// TestFallbackCancelledMidChain — отмена пришла на резерве: цепь
-// прерывается сразу, без опроса остальных.
+// TestFallbackCancelledMidChain — the cancellation arrived at a backup:
+// the chain aborts at once, without polling the rest.
 func TestFallbackCancelledMidChain(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	r, calls := newFallback(t,
@@ -280,10 +280,10 @@ func TestFallbackCancelledMidChain(t *testing.T) {
 	}
 }
 
-// --- сборка и конкурентность -------------------------------------------------
+// --- assembly and concurrency ----------------------------------------------
 
-// TestNewFallbackResolverValidation — nil-элементы цепи — программная
-// ошибка сборки.
+// TestNewFallbackResolverValidation — nil chain elements are a
+// programming error of the assembly.
 func TestNewFallbackResolverValidation(t *testing.T) {
 	if _, err := NewFallbackResolver(FallbackTarget{Addr: "a"}); err == nil {
 		t.Fatal("nil-основной: ожидается ошибка")
@@ -296,9 +296,9 @@ func TestNewFallbackResolverValidation(t *testing.T) {
 	}
 }
 
-// TestFallbackConcurrentStats — параллельные обмены через одну цепь
-// (основной отказывает, резерв отвечает) дают согласованные счётчики;
-// порядок вызовов не детерминирован — важны суммы (гонки ловит -race).
+// TestFallbackConcurrentStats — concurrent exchanges through one chain
+// (the primary fails, the backup answers) give consistent counters; the
+// call order is not deterministic — the sums matter (the -race run catches races).
 func TestFallbackConcurrentStats(t *testing.T) {
 	r, calls := newFallback(t,
 		&fbFake{err: fakeNetErr{timeout: true}},

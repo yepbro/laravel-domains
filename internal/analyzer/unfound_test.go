@@ -1,12 +1,13 @@
-// Юнит-тесты точечного дренажа контента домена при снятии находки
-// переанализом (T-187): сигнал aggregateDomain (строка laravel_domains
-// существовала и удалена доставкой без fresh) → после фиксации доставки
-// воркер зовёт шов DrainDomain с ключом домена и окном retention —
-// закрывается остаточный класс потери за курсором дренажа T-185
-// (docs/content.md). Контрольный сценарий, границы события (fresh,
-// отсутствие перехода, оставшаяся находка) и отказоустойчивость (сбой
-// дренажа не роняет доставку). Шов подменяется рекордером — контентная
-// семантика DrainDomain покрыта тестами internal/content
+// Unit tests of the domain content point drain on a find removal by
+// re-analysis (T-187): the aggregateDomain signal (the laravel_domains
+// row existed and was removed by a delivery without fresh) → after the
+// delivery commits, the worker calls the DrainDomain seam with the
+// domain key and the retention window — the residual loss class
+// behind the T-185 drain cursor (docs/content.md) is closed. The
+// control scenario, the event bounds (fresh, no transition, a
+// remaining find) and fault tolerance (a drain failure does not fail
+// the delivery). The seam is replaced by a recorder — the DrainDomain
+// content semantics is covered by the internal/content tests
 // (retentiondomain_test.go).
 package analyzer
 
@@ -20,7 +21,7 @@ import (
 	"crawler/internal/content"
 )
 
-// anDrainCall — зафиксированный вызов шва дренажа (T-187).
+// anDrainCall is a recorded drain seam call (T-187).
 type anDrainCall struct {
 	pool      content.RetentionDB
 	retention time.Duration
@@ -28,9 +29,9 @@ type anDrainCall struct {
 	domain    int64
 }
 
-// anDrainRecorder — подмена Options.DrainDomain: пишет вызовы в журнал
-// фикстуры (событие anEvDrain — порядок против commit) и отвечает
-// заготовленным итогом/ошибкой.
+// anDrainRecorder replaces Options.DrainDomain: it writes calls into
+// the fixture journal (the anEvDrain event — the order against commit)
+// and answers with the prepared stats/error.
 type anDrainRecorder struct {
 	j     *anJournal
 	stats content.RetentionStats
@@ -61,14 +62,14 @@ func (r *anDrainRecorder) last() anDrainCall {
 	return r.calls[len(r.calls)-1]
 }
 
-// TestUnfoundDrain_ControlScenario — переанализ (fresh=false) снял
-// находку: сигнал агрегации становится точечным дренажом домена — шов
-// вызван ПОСЛЕ фиксации транзакции (findings и агрегат уже в БД) с
-// ключом домена и окном retention воркера.
+// TestUnfoundDrain_ControlScenario — re-analysis (fresh=false) removed
+// the find: the aggregation signal becomes a domain point drain —
+// the seam is called AFTER the transaction commits (the findings and
+// the aggregate are already in the DB) with the domain key and the worker's retention window.
 func TestUnfoundDrain_ControlScenario(t *testing.T) {
 	f := newANFixture(t, anSet(1001), Options{MinScore: 0.6})
-	// Прошлый эпизод находил признаки — строка laravel_domains есть;
-	// доставка разбирает страницу без признаков (fresh=false — переанализ).
+	// A past episode found signs — the laravel_domains row exists; the
+	// delivery analyzes a page without signs (fresh=false — re-analysis).
 	f.pool.seedResult(anKey, anHeaders(t), anCookies(t, "PHPSESSID"), nil)
 	f.pool.domains[anDomainKey{anKey.zone, anKey.domain}] = &anDomain{
 		score: 0.9, foundOnMask: mustMask(t, 1), rulesVersion: 999, updatedAt: time.Now(),
@@ -96,23 +97,23 @@ func TestUnfoundDrain_ControlScenario(t *testing.T) {
 	if p, ok := call.pool.(*anFakePool); !ok || p != f.pool {
 		t.Error("дренажу передан не пул воркера")
 	}
-	// Порядок: дренаж строго после фиксации — событие уже состоялось,
-	// сбой дренажа не должен ронять доставку (TestUnfoundDrain_Error).
+	// The order: the drain strictly after the commit — the event has
+	// already happened, a drain failure must not fail the delivery (TestUnfoundDrain_Error).
 	if f.pool.j.indexOf(anEvCommit) > f.pool.j.indexOf(anEvDrain) {
 		t.Fatalf("дренаж до фиксации: %v", f.pool.j.snapshot())
 	}
 }
 
-// TestUnfoundDrain_EventBounds — дренаж только на переходе без fresh:
-// свежая потеря находки переписывает записи впереди курсора (T-058),
-// отсутствие перехода (строки не было — DELETE 0) и оставшаяся находка
-// дренажа не требуют.
+// TestUnfoundDrain_EventBounds — the drain only on a transition without fresh:
+// a fresh find loss rewrites the rows ahead of the cursor (T-058),
+// no transition (the row did not exist — DELETE 0) and a remaining
+// find need no drain.
 func TestUnfoundDrain_EventBounds(t *testing.T) {
 	cases := []struct {
 		name      string
 		fresh     bool
-		laravel   bool // сеять ли строку laravel_domains (был ли переход)
-		confident bool // доставка находит уверенные признаки
+		laravel   bool // whether to seed the laravel_domains row (was there a transition)
+		confident bool // the delivery finds confident signs
 		want      int
 	}{
 		{"свежая потеря находки — впереди курсора", true, true, false, 0},
@@ -151,10 +152,10 @@ func TestUnfoundDrain_EventBounds(t *testing.T) {
 	}
 }
 
-// TestUnfoundDrain_Error — сбой дренажа не роняет доставку: findings,
-// агрегат и снятие строки зафиксированы, ProcessResult отвечает успехом
-// (XACK состоится; записи домена остаются позади курсора — класс до
-// T-187, Warn в логе воркера).
+// TestUnfoundDrain_Error — a drain failure does not fail the delivery:
+// the findings, the aggregate and the row removal are committed,
+// ProcessResult answers success (the XACK will happen; the domain's
+// rows stay behind the cursor — the pre-T-187 class, a Warn in the worker log).
 func TestUnfoundDrain_Error(t *testing.T) {
 	f := newANFixture(t, anSet(1001), Options{MinScore: 0.6, Retention: 6 * time.Hour})
 	f.pool.seedResult(anKey, anHeaders(t), anCookies(t, "PHPSESSID"), nil)
@@ -176,9 +177,9 @@ func TestUnfoundDrain_Error(t *testing.T) {
 	}
 }
 
-// TestUnfoundDrain_Disabled — выключенный дренаж (retention = 0 — контент
-// хранится всегда; шов не задан — изолированная сборка): событие
-// происходит, вызова нет, доставка не падает.
+// TestUnfoundDrain_Disabled — the drain disabled (retention = 0 — content
+// is kept forever; the seam is not set — an isolated build): the event
+// happens, there is no call, the delivery does not fail.
 func TestUnfoundDrain_Disabled(t *testing.T) {
 	for _, tc := range []struct {
 		name string
