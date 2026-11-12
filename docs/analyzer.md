@@ -1,397 +1,436 @@
-# Анализатор Laravel: движок правил, воркер и переанализ (ТЗ 5.8, §9)
+# The Laravel analyzer: the rules engine, the worker, and re-analysis (spec 5.8, §9)
 
-Пакет `internal/rules` — пассивный анализ уже скачанного контента
-(ТЗ 5.8: «только по уже скачанному контенту, cookies и заголовкам,
-дополнительные запросы к сайтам не выполняются»). Загрузка YAML-набора,
-`SIGHUP`-перезагрузка и `rules_version` — T-068 (`rules.go`/`reload.go`);
-набор правил Laravel — T-073 (`rules/laravel.yaml`); расчёт score и
-версионных диапазонов (noisy-OR, пересечение `[ver_min, ver_max]`,
-конфликт) — T-070 (`score.go`). Этот документ — движок матчинга по целям
-и свидетельства срабатываний (T-069), воркер этапа и запись
-`laravel_findings` (`internal/analyzer`, T-071), агрегация на уровне
-домена в `laravel_domains` (T-072, `aggregate.go`), точечный дренаж
-контента домена при снятии находки переанализом (T-187, там же), а
-также переанализ по устаревшей версии правил (T-074,
-`internal/analyzer/reanalyze.go`).
+The `internal/rules` package — the passive analysis of
+already-downloaded content (spec 5.8: "only over the already
+downloaded content, cookies, and headers; no additional requests to
+the sites are made"). The YAML ruleset loading, the `SIGHUP` reload,
+and `rules_version` — T-068 (`rules.go`/`reload.go`); the Laravel
+ruleset — T-073 (`rules/laravel.yaml`); the score and version-range
+computation (noisy-OR, the intersection of `[ver_min, ver_max]`,
+a conflict) — T-070 (`score.go`). This document — the matching engine
+over targets and the hit evidence (T-069), the stage worker and the
+writing of `laravel_findings` (`internal/analyzer`, T-071), the
+domain-level aggregation into `laravel_domains` (T-072,
+`aggregate.go`), the point drain of a domain's content when a find is
+removed by re-analysis (T-187, same place), and the re-analysis under
+a stale rules version (T-074, `internal/analyzer/reanalyze.go`).
 
-## Вход движка
+## The engine's input
 
-`rules.Page` — то, что лежит о странице в `subdomain_results` и хранилище
-контента (ТЗ 5.7):
+`rules.Page` — what is stored about a page in `subdomain_results` and
+the content storage (spec 5.7):
 
-| Поле | Откуда | Контракт |
+| Field | Source | Contract |
 |---|---|---|
-| `HTML []byte` | хранилище контента: сырой HTTP-ответ или итоговый DOM после рендера (T-067) | DOM — текстуальный HTML-сериализатор Chrome, преобразований не нужно (T-064) |
-| `Cookies []Cookie` | jsonb `subdomain_results.cookies` (HTTP-этап T-058 / рендер T-064) | `{name, value}` — цели правил; атрибуты движку не нужны |
-| `Headers map[string][]string` | jsonb `subdomain_results.headers` | канонические имена MIME-заголовка (`http.Header`), порядок значений сохранён |
+| `HTML []byte` | the content storage: the raw HTTP response or the final DOM after the render (T-067) | the DOM — Chrome's textual HTML serializer, no transformations needed (T-064) |
+| `Cookies []Cookie` | the jsonb `subdomain_results.cookies` (the HTTP stage T-058 / the render T-064) | `{name, value}` — the rule targets; the attributes are not needed by the engine |
+| `Headers map[string][]string` | the jsonb `subdomain_results.headers` | canonical MIME header names (`http.Header`), the order of the values is preserved |
 
-## Цели и режимы матчинга
+## Targets and matching modes
 
-Цель правила (`rule.target`) задаёт, где ищется признак; режим — поле
-`match` (точное совпадение) или `regex` (регулярное выражение):
+A rule's target (`rule.target`) sets where the trait is searched for;
+the mode — the `match` field (exact match) or `regex` (a regular
+expression):
 
-| target | match | regex | Обход |
+| target | match | regex | Traversal |
 |---|---|---|---|
-| `cookie_name` | да | да | cookies в порядке записи |
-| `cookie_value` | да | да | cookies в порядке записи |
-| `header_name` | да | да | имена заголовков **по сортировке** |
-| `header_value` | да | да | имена по сортировке, значения в порядке среза |
-| `html` | — | да | первый совпавший фрагмент |
-| `meta` | — | да | meta-теги по порядку в HTML |
+| `cookie_name` | yes | yes | the cookies in recording order |
+| `cookie_value` | yes | yes | the cookies in recording order |
+| `header_name` | yes | yes | the header names **sorted** |
+| `header_value` | yes | yes | the names sorted, the values in slice order |
+| `html` | — | yes | the first matched fragment |
+| `meta` | — | yes | the meta tags in HTML order |
 
-`html`/`meta` принимают только `regex` (ТЗ 5.8: «регулярное выражение по
-HTML»; точное совпадение с целым документом смысла не имеет) — правило с
-`match` по этим целям не срабатывает. Срабатывает **первое** совпадение —
-одно свидетельство на правило.
+`html`/`meta` accept only `regex` (spec 5.8: "a regular expression
+over the HTML"; an exact match against the whole document makes no
+sense) — a rule with `match` over these targets never fires. The
+**first** match fires — one piece of evidence per rule.
 
-Порядок обхода детерминирован: cookies — порядок записи (HTTP-этап
-сохраняет порядок ответа, рендер сортирует по имени), имена заголовков
-сортируются лексикографически (обход map в Go случайный). Результат
-переанализа обязан быть воспроизводимым байт-в-байт.
+The traversal order is deterministic: cookies — the recording order
+(the HTTP stage preserves the response order, the render sorts by
+name), header names are sorted lexicographically (a Go map traversal
+is random). The re-analysis result must be reproducible byte for byte.
 
-Паттерны компилируются один раз и кэшируются (`sync.Map` по строке
-паттерна): наборы перезагружаются по SIGHUP без перезапуска, `Evaluate`
-зовут параллельные горутины воркера; кэш живёт вместе с набором — смена
-`rules_version` очищает его. Некомпилируемый или сверхлимитный
-(`MaxPatternBytes`) паттерн отвергается валидацией при загрузке (T-068);
-движок подстраховывается сам и молча пропускает такое правило — оно не
-должно ронять анализ страницы. Паттерн, матчащий пустую строку (`^`,
-`x*`, `(?:)`), валидация тоже отвергает: такое правило срабатывало бы на
-любом входе с пустым свидетельством.
+Patterns are compiled once and cached (a `sync.Map` keyed by the
+pattern string): rulesets reload on SIGHUP without a restart,
+`Evaluate` is called by the worker's parallel goroutines; the cache
+lives together with the ruleset — a `rules_version` change clears it.
+A non-compilable or over-limit (`MaxPatternBytes`) pattern is rejected
+by the validation at load (T-068); the engine protects itself as well
+and silently skips such a rule — it must not fail a page's analysis.
+The validation also rejects a pattern matching the empty string (`^`,
+`x*`, `(?:)`): such a rule would fire on any input, with empty
+evidence.
 
-## Свидетельства (evidence)
+## Evidence
 
-`laravel_findings.signals` (jsonb, миграция 000001) — массив
-`[{rule, weight, evidence}, …]` по каждому срабатыванию. Свидетельство —
-краткая строка «что именно найдено»:
+`laravel_findings.signals` (jsonb, migration 000001) — an array
+`[{rule, weight, evidence}, …]` for every hit. The evidence — a brief
+string of "what exactly was found":
 
-| target | Формат | Пример |
+| target | Format | Example |
 |---|---|---|
-| `cookie_name` | `cookie <имя>` | `cookie XSRF-TOKEN` |
-| `cookie_value` | `cookie <имя>=<префикс значения>` | `cookie laravel_session=eyJpdiI6…` |
-| `header_name` | `header <имя>` | `header X-Laravel` |
-| `header_value` | `header <имя>: <значение>` | `header X-Powered-By: PHP/8.2.8` |
-| `html` | совпавший фрагмент regex | `/build/assets/app-DJIrOSj4.js` |
-| `meta` | весь meta-тег | `<meta name="csrf-token" content="eyJ…` |
+| `cookie_name` | `cookie <name>` | `cookie XSRF-TOKEN` |
+| `cookie_value` | `cookie <name>=<value prefix>` | `cookie laravel_session=eyJpdiI6…` |
+| `header_name` | `header <name>` | `header X-Laravel` |
+| `header_value` | `header <name>: <value>` | `header X-Powered-By: PHP/8.2.8` |
+| `html` | the regex-matched fragment | `/build/assets/app-DJIrOSj4.js` |
+| `meta` | the whole meta tag | `<meta name="csrf-token" content="eyJ…` |
 
-Контент недоверенный (ТЗ §9), свидетельство доводится до хранимого вида
-(`finalizeEvidence`):
+The content is untrusted (spec §9); the evidence is brought to its
+storable form (`finalizeEvidence`):
 
-- **обрезка** до `max_snippet_bytes` (по умолчанию 64) байт **по границе
-  руны** UTF-8, при обрезке добавляется `…`; имя cookie/заголовка внутри
-  свидетельства дополнительно ужимается до 32 байт, чтобы враждебно
-  длинное имя не вытеснило значение из окна обрезки;
-- **невалидный UTF-8** → U+FFFD (свидетельство валидно ещё в памяти, а не
-  только после `json.Marshal`);
-- **управляющие символы** (C0, DEL, включая табуляцию и переводы строк) →
-  `·` — одна строка без терминальных escape-последовательностей при
-  чтении оператором.
+- **trimming** to `max_snippet_bytes` (64 by default) bytes **at a
+  UTF-8 rune boundary**, adding `…` when trimmed; a cookie/header name
+  inside the evidence is additionally compressed to 32 bytes so that a
+  hostile long name does not push the value out of the trim window;
+- **invalid UTF-8** → U+FFFD (the evidence is valid already in
+  memory, not only after `json.Marshal`);
+- **control characters** (C0, DEL, including tabs and line breaks) →
+  `·` — a single line without terminal escape sequences when read by
+  an operator.
 
-## Ограничения на недоверенном контенте (ТЗ §9)
+## Limits on untrusted content (spec §9)
 
-ТЗ §9: «содержимое страниц считается недоверенным: все парсеры имеют
-ограничения размера и времени». Формат входов ограничен ещё до движка
-(HTTP: пределы тела/заголовков; хранилище: `content.max_store_bytes`,
-рекомендация 1–2 МБ) — лимиты движка это защита в глубину: `Evaluate`
-завершается за конечное время на любом входе.
+Spec §9: "page content is considered untrusted: all parsers have size
+and time limits". The inputs are bounded even before the engine (HTTP:
+body/header limits; the storage: `content.max_store_bytes`, the 1–2 MB
+recommendation) — the engine limits are defense in depth: `Evaluate`
+terminates in finite time on any input.
 
-`rules.Limits` (нулевое значение целиком включает `DefaultLimits`;
-`Set.Evaluate` всегда зовёт с дефолтами, `Set.EvaluateCtx` принимает
-явные):
+`rules.Limits` (the zero value fully enables `DefaultLimits`;
+`Set.Evaluate` always calls with the defaults, `Set.EvaluateCtx` takes
+explicit ones):
 
-| Лимит | Значение | Что ограничивает |
+| Limit | Value | What it bounds |
 |---|---|---|
-| `MaxHTMLBytes` | 2 MiB | просматриваемый HTML/DOM: обрезка **до** матчинга (html- и meta-цели) |
-| `MaxValueBytes` | 64 KiB | одно значение cookie/заголовка (и имена заголовков) |
-| `MaxPatternBytes` | 4 KiB | длина regex-паттерна одного правила |
-| `MaxSnippetBytes` | 64 | свидетельство (см. выше) |
-| `EvalTimeout` | 5 с | бюджет на всю страницу (через контекст) |
+| `MaxHTMLBytes` | 2 MiB | the inspected HTML/DOM: trimmed **before** matching (the html and meta targets) |
+| `MaxValueBytes` | 64 KiB | one cookie/header value (and the header names) |
+| `MaxPatternBytes` | 4 KiB | the length of one rule's regex pattern |
+| `MaxSnippetBytes` | 64 | the evidence (see above) |
+| `EvalTimeout` | 5 s | the budget for the whole page (through the context) |
 
-Решения по защите от ReDoS-подобных зависаний:
+Decisions on protection against ReDoS-like hangs:
 
-- Go `regexp` — реализация **RE2**: матчинг линеен по длине входа,
-  катастрофического бэктрекинга вида `(a+)+$` против `aaaa…b` нет.
-  Остаются два вектора — раздутый вход (линейное время всё равно растёт)
-  и раздутый паттерн (стоимость компиляции и число состояний). Оба
-  закрываются лимитами размера выше, а не таймерами на каждый матч.
-- `EvalTimeout` реализован через `context.WithTimeout` внутри
-  `EvaluateCtx`: контекст проверяется между правилами и между значениями
-  cookie/заголовков (и на входе `matchRule`). Одиночный матч прервать
-  нельзя, но он линеен по уже ограниченному входу — отмена срабатывает
-  за время одного матча. При отмене просмотр прекращается, результат
-  содержит сработавшее до отмены и помечается `Result.Partial`; воркер
-  неполный результат не записывает и не штампует — строка остаётся
-  устаревшей, переанализ (T-074) вернётся к ней.
-- Плата за `MaxValueBytes`: правило с якорем по концу (`…$`) на значении
-  длиннее лимита не сработает — сознательный размен полноты на гарантию
-  времени; правила Laravel по значениям якорены по началу (`^eyJ…`).
-- Признаки Laravel (meta csrf-token, пути сборки vite/mix, `data-page`,
-  `wire:*`) живут в head-части документа — первых десятках килобайт;
-  обрезка хвоста сверх 2 MiB на реальных страницах не теряет сигналов.
+- Go `regexp` — an **RE2** implementation: matching is linear in the
+  input length, there is no catastrophic backtracking like `(a+)+$`
+  against `aaaa…b`. Two vectors remain — a bloated input (linear time
+  still grows) and a bloated pattern (the compilation cost and the
+  number of states). Both are closed by the size limits above, not by
+  per-match timers.
+- `EvalTimeout` is implemented via `context.WithTimeout` inside
+  `EvaluateCtx`: the context is checked between rules and between
+  cookie/header values (and at the input of `matchRule`). A single
+  match cannot be interrupted, but it is linear over the already
+  bounded input — the cancellation takes effect within one match. On
+  cancellation the scan stops, the result contains what fired before
+  the cancellation and is marked `Result.Partial`; the worker neither
+  records nor stamps an incomplete result — the row stays stale, and
+  the re-analysis (T-074) will return to it.
+- The price of `MaxValueBytes`: a rule with an end anchor (`…$`) will
+  not fire on a value longer than the limit — a deliberate trade of
+  completeness for a time guarantee; the Laravel rules are anchored at
+  the start over values (`^eyJ…`).
+- The Laravel traits (the meta csrf-token, the vite/mix build paths,
+  `data-page`, `wire:*`) live in the head part of the document — the
+  first tens of kilobytes; trimming the tail beyond 2 MiB loses no
+  signals on real pages.
 
-## Воркер analyzer и запись laravel_findings (T-071)
+## The analyzer worker and the writing of laravel_findings (T-071)
 
-`internal/analyzer` — сервис `cmd/analyzer` (этап 8 ТЗ §12): потребляет
-`q:analyze` группой потребителей `analyzer` (окно чтения 16, параллельно
-8 доставок), каждую доставку — паттерном `queue.Processing` (T-025:
-XACK только после записи в БД). Публикуют стрим HTTP-этап (T-058, после
-записи результата) и render-worker (T-067, после замены контента на
-итоговый DOM) — сообщение `Result` несёт только ключ строки
-`subdomain_results` (ТЗ 4.2), вход анализа читается из БД.
+`internal/analyzer` — the `cmd/analyzer` service (stage 8 of spec
+§12): it consumes `q:analyze` with the `analyzer` consumer group (a
+read window of 16, 8 deliveries in parallel), every delivery — with
+the `queue.Processing` pattern (T-025: XACK only after the database
+write). The HTTP stage (T-058, after recording the result) and the
+render-worker (T-067, after replacing the content with the final DOM)
+publish the stream — the `Result` message carries only the
+`subdomain_results` row key (spec 4.2); the analysis input is read
+from the database.
 
-Обработка одной доставки:
+Processing one delivery:
 
-1. **SELECT строки** — `headers`/`cookies` jsonb (после рендера — данные
-   итоговой навигации, T-067/T-058) и `content_hash`. Строки нет —
-   успех без записи (0 rows → успех, стиль render-worker): домен
-   перепроверен без этого ключа или вычищен.
-2. **Контент** — `ContentStore.Get` по `content_hash` (тот же PackStore
-   и словарь zstd, что у пишущих этапов): HTML/DOM — материал целей
-   `html`/`meta`. Нет хэша, контент потерян (`ErrNotFound`) или DOM
-   пуст — анализ продолжается по заголовкам и кукам (правила по шести
-   целям, ТЗ 5.8, — html/meta лишь часть набора).
-3. **Матчинг** — `Set.EvaluateCtx` c `DefaultLimits` (бюджет отмены —
-   контекст доставки): снапшот набора берётся на каждую доставку из
-   `Reloader.Set()` (T-068), SIGHUP меняет набор без рестарта — хук
-   `service.Options.OnSIGHUP`, подписка на смену не нужна.
-4. **Одна транзакция** (ТЗ 3.4):
-   - `UPDATE subdomain_results SET rules_version = <версия набора>` —
-     штамп «строка проанализирована набором N»: его читает переанализ
-     (T-074 находит записи с устаревшей версией; T-067 при смене
-     контента сбрасывает в NULL). UPDATE первой командой — охрана
-     актуальности: `content_hash IS NOT DISTINCT FROM прочитанного`
-     (строку перезаписал другой эпизод — перепроверка DELETE+INSERT
-     T-058, рендер T-067) и домен не `deleted` (§8/§13.1). 0 строк —
-     строка ушла из-под задачи: успех без записи, у нового эпизода своя
-     публикация `q:analyze`;
-   - `laravel_findings` по тому же ключу: **все срабатывания любого
-     правила независимо от порога**, `is_laravel = score ≥ порога`
-     (`analyzer.laravel_min_score`, по умолчанию 0.6, §13.1);
-     `ver_min`/`ver_max` — пересечение диапазонов сработавших правил
-     (NULL при отсутствии границы; конфликт диапазонов — обе границы
-     NULL, T-070); `signals` — `[{rule, weight, evidence}, …]`;
-     `rules_version` — версия набора. Upsert по PK — повторная доставка
-     и переанализ перезаписывают (§3.5);
-   - ни одно правило не сработало — строка не пишется (ТЗ 5.8), а
-     существующая удаляется: прошлый анализ находил признаки, которых в
-     текущем эпизоде нет (§3.5 перезапись результатов); штамп
-     `rules_version` ставится и на «пустой» итог;
-    - пересчёт строки `laravel_domains` — агрегат домена по его
-      findings (T-072, следующий раздел): той же транзакцией, сразу
-      после записи findings.
-5. **XACK** после фиксации транзакции.
+1. **SELECT of the row** — the `headers`/`cookies` jsonb (after the
+   render — the data of the final navigation, T-067/T-058) and
+   `content_hash`. No row — success without writing (0 rows →
+   success, the render-worker style): the domain was rechecked without
+   this key or cleaned up.
+2. **The content** — `ContentStore.Get` by `content_hash` (the same
+   PackStore and zstd dictionary as the writing stages): the HTML/DOM —
+   the material of the `html`/`meta` targets. No hash, lost content
+   (`ErrNotFound`), or an empty DOM — the analysis continues over the
+   headers and cookies (the rules cover six targets, spec 5.8;
+   html/meta are only part of the set).
+3. **The matching** — `Set.EvaluateCtx` with `DefaultLimits` (the
+   cancellation budget — the delivery's context): a ruleset snapshot
+   is taken for every delivery from `Reloader.Set()` (T-068); SIGHUP
+   changes the ruleset without a restart — the
+   `service.Options.OnSIGHUP` hook, no subscription to changes is
+   needed.
+4. **One transaction** (spec 3.4):
+   - `UPDATE subdomain_results SET rules_version = <the ruleset
+     version>` — the stamp "the row was analyzed by ruleset N": the
+     re-analysis reads it (T-074 finds records with a stale version;
+     T-067 resets it to NULL on a content change). The UPDATE as the
+     first statement — the freshness guard: `content_hash IS NOT
+     DISTINCT FROM` the read value (another episode rewrote the row —
+     the T-058 recheck DELETE+INSERT, the render T-067) and the domain
+     is not `deleted` (§8/§13.1). 0 rows — the row slipped out from
+     under the task: success without writing; the new episode has its
+     own `q:analyze` publication;
+   - `laravel_findings` under the same key: **all hits of any rule
+     regardless of the threshold**,
+     `is_laravel = score ≥ threshold` (`analyzer.laravel_min_score`,
+     0.6 by default, §13.1); `ver_min`/`ver_max` — the intersection of
+     the fired rules' ranges (NULL when a bound is absent; a range
+     conflict — both bounds NULL, T-070); `signals` —
+     `[{rule, weight, evidence}, …]`; `rules_version` — the ruleset
+     version. An upsert by PK — redeliveries and re-analysis overwrite
+     (§3.5);
+   - no rule fired — the row is not written (spec 5.8) and an existing
+     one is deleted: the previous analysis found traits that the
+     current episode does not have (§3.5 result overwriting); the
+     `rules_version` stamp is placed on the "empty" outcome too;
+   - the recomputation of the `laravel_domains` row — the domain's
+     aggregate over its findings (T-072, the next section): in the
+     same transaction, right after writing the findings.
+5. **XACK** after the transaction commit.
 
-Идемпотентность повторной доставки (ТЗ 3.4): upsert + повторный штамп
-тем же набором не меняют состояние; сбой между шагами откатывает
-транзакцию целиком — повторная доставка проходит заново.
+Redelivery idempotency (spec 3.4): the upsert + a repeated stamp by
+the same ruleset do not change the state; a failure between the steps
+rolls back the transaction entirely — the redelivery goes through
+again.
 
-Пропускная способность: анализ лёгок (RE2-матчинг по ограниченному
-входу — микросекунды; несколько операторов БД на доставку),
-масштабирование — инстансами сервиса (группа потребителей, ТЗ 4.2).
+Throughput: the analysis is light (RE2 matching over bounded input —
+microseconds; a few database statements per delivery); scaling — by
+service instances (a consumer group, spec 4.2).
 
-## Агрегация на уровне домена: laravel_domains (T-072)
+## Domain-level aggregation: laravel_domains (T-072)
 
-ТЗ 5.8: «на уровне домена — агрегат (максимальный score, объединённый
-диапазон, маска субдоменов)» — строка `laravel_domains` (§6.1: PK
-`(zone_id, domain_id)`, `score`, `ver_min`/`ver_max`, `found_on_mask`,
-`rules_version`, `updated_at`). Пересчёт выполняется в транзакции
-воркера сразу после записи findings: каждое зафиксированное состояние
-согласовано — findings и агрегат не расходятся (ТЗ 3.4). Реализация —
+Spec 5.8: "at the domain level — an aggregate (the maximum score, the
+union range, the subdomain mask)" — the `laravel_domains` row (§6.1:
+the PK `(zone_id, domain_id)`, `score`, `ver_min`/`ver_max`,
+`found_on_mask`, `rules_version`, `updated_at`). The recomputation
+runs in the worker's transaction right after writing the findings:
+every committed state is consistent — the findings and the aggregate
+never diverge (spec 3.4). Implementation —
 `internal/analyzer/aggregate.go`.
 
-**Какие findings входят.** Только уверенные срабатывания —
-`laravel_findings` c `is_laravel` (§13.1: порог попадания домена в
-`laravel_domains` «score ≥ 0.6» и есть определение уверенности; слабые
-срабатывания остаются в findings). Поэтому:
+**Which findings enter.** Only confident hits — `laravel_findings`
+with `is_laravel` (§13.1: the "score ≥ 0.6" threshold for a domain to
+enter `laravel_domains` is the definition of confidence; weak hits
+stay in the findings). Therefore:
 
-- `score` — максимум: порога мог достичь только максимум, значение
-  совпадает с максимумом по всем findings домена;
-- `found_on_mask` — биты субдоменов с `is_laravel`-срабатыванием
-  (любого варианта — варианты одного субдомена схлопываются в бит);
-  семантика та же, что у `domains.dns_mask`: бит № = `subdomains.id`,
-  биты 0..62 (`model.DNSMask`, максимум 63 субдомена, ТЗ 5.10).
+- `score` — the maximum: only the maximum could reach the threshold,
+  and the value coincides with the maximum over all the domain's
+  findings;
+- `found_on_mask` — the bits of the subdomains with an `is_laravel`
+  hit (any variant — the variants of one subdomain collapse into a
+  bit); the semantics are the same as `domains.dns_mask`: bit # =
+  `subdomains.id`, bits 0..62 (`model.DNSMask`, at most 63 subdomains,
+  spec 5.10).
 
-**Объединённый диапазон версий.** Нижняя граница — `min(ver_min)`,
-верхняя — `max(ver_max)` по уверенным срабатываниям — охватывающий
-диапазон, а не пересечение (пересечение считает каждый findings по
-правилам одной страницы; слово ТЗ — «объединённый»). Сравнение —
-числовыми компонентами (`rules.CompareVersions`, T-070): текстовое
-MIN/MAX в SQL упорядочило бы «10» раньше «5.3». Граница NULL у любого
-срабатывания (нет границы или конфликт T-070) распространяется на
-домен: объединение с этой стороны неограничено, граница домена NULL;
-инверсия границ невозможна — у каждого срабатывания `ver_min ≤ ver_max`
-(T-070). Равные границы в разной записи («9.19» и «9.19.0») оставляют
-первую — порядок чтения по PK детерминирован.
+**The union version range.** The lower bound — `min(ver_min)`, the
+upper — `max(ver_max)` over the confident hits — a spanning range, not
+an intersection (an intersection computes each finding by the rules of
+one page; the spec's word is "union"). The comparison — by numeric
+components (`rules.CompareVersions`, T-070): a textual MIN/MAX in SQL
+would order "10" before "5.3". A NULL bound at any hit (no bound or a
+T-070 conflict) propagates to the domain: the union from that side is
+unbounded, the domain's bound is NULL; a bound inversion is impossible
+— every hit has `ver_min ≤ ver_max` (T-070). Equal bounds in different
+notations ("9.19" and "9.19.0") keep the first one — the read order by
+PK is deterministic.
 
-**`rules_version`** — версия набора, которым выполнен пересчёт
-(`rules.Set.Version` доставки): в переходный период переанализа (T-074)
-findings домена смешанных версий, строка перезаписывается каждой
-доставкой — после последнего обновления findings домена версия свежая.
+**`rules_version`** — the version of the ruleset the recomputation was
+performed with (the delivery's `rules.Set.Version`): in the transition
+period of re-analysis (T-074) a domain's findings are of mixed
+versions, the row is rewritten by every delivery — after the last
+update of the domain's findings the version is fresh.
 
-**Нет уверенных срабатываний — нет строки** (порог §13.1): пересчёт
-удаляет существующую строку — прежние признаки в текущем эпизоде не
-подтвердились (§3.5: хранится только последний результат). Снятие
-находки **переанализом** (доставка без fresh) — сигнал `unfound` из
-`aggregateDomain` (`RowsAffected > 0 ∧ ¬fresh ∧ existed`): записи
-домена `subdomain_results` не переписывались и вернулись в кандидаты
-retention позади курсора дренажа T-185 — воркер сразу после фиксации
-транзакции зовёт точечный дренаж `content.DrainDomain` (T-187, шов
-`Options.DrainDomain`, окно `Options.Retention` = `content.retention`):
-чистка по префиксу PK `(zone_id, domain_id)` штатной purge-механикой
-T-166; сбой дренажа — Warn и метрика, доставка не роняется. Детали и
-сознательные остаточные окна — docs/content.md («Retention контента»).
+**No confident hits — no row** (the §13.1 threshold): the
+recomputation deletes the existing row — the previous traits were not
+confirmed by the current episode (§3.5: only the last result is
+stored). The removal of a find **by re-analysis** (a delivery without
+fresh) — the `unfound` signal from `aggregateDomain`
+(`RowsAffected > 0 ∧ ¬fresh ∧ existed`): the domain's
+`subdomain_results` records were not rewritten and returned to the
+retention candidates behind the T-185 drain cursor — right after
+committing the transaction the worker calls the point drain
+`content.DrainDomain` (T-187, the `Options.DrainDomain` seam, the
+window `Options.Retention` = `content.retention`): the cleanup by the
+PK prefix `(zone_id, domain_id)` with the regular T-166 purge
+mechanics; a drain failure — a Warn and a metric, the delivery is not
+failed. The details and the deliberate residual windows —
+docs/content.md ("Content retention").
 
-**Согласование параллельных доставок.** HTTP-этап публикует `q:analyze`
-пачкой по строкам домена, воркер обрабатывает доставки параллельно
-(8 одновременно, плюс другие инстансы группы). Два пересчёта, читающие
-findings до фиксации друг друга, породили бы агрегат без вклада
-соседней доставки. Поэтому пересчёт сначала берёт
-`pg_advisory_xact_lock(domain_id)` (идентификатор глобально уникален —
-sequence `domain_id_seq`): второй пересчёт домена ждёт фиксации первого
-и читает уже полные findings. Advisory, а не блокировка строки
-`domains`: воркер к этому моменту уже держит блокировку строки
-`subdomain_results` (штамп T-071), и цепочка «штамп → domains»
-замкнулась бы в цикл с транзакцией перепроверки T-058 (UPDATE domains →
-DELETE subdomain_results); advisory-ключ этого класса берут только
-пересчёты анализатора — циклов ожидания нет.
+**Reconciling parallel deliveries.** The HTTP stage publishes
+`q:analyze` in a batch over a domain's rows, and the worker processes
+deliveries in parallel (8 at a time, plus other instances of the
+group). Two recomputations reading the findings before each other's
+commit would produce an aggregate without the neighboring delivery's
+contribution. Therefore the recomputation first takes
+`pg_advisory_xact_lock(domain_id)` (the identifier is globally unique
+— the `domain_id_seq` sequence): the domain's second recomputation
+waits for the first one's commit and reads the already complete
+findings. An advisory lock, not a lock of the `domains` row: by this
+moment the worker already holds the `subdomain_results` row lock (the
+T-071 stamp), and the "stamp → domains" chain would close into a cycle
+with the T-058 recheck transaction (UPDATE domains → DELETE
+subdomain_results); the advisory key of this class is taken only by
+the analyzer's recomputations — there are no waiting cycles.
 
-`updated_at` — `now()` сервера БД: время транзакции (стиль
-`httpworker/record.go`).
+`updated_at` — the database server's `now()`: the transaction time (in
+the style of `httpworker/record.go`).
 
-## Переанализ (T-074)
+## Re-analysis (T-074)
 
-ТЗ 5.8 «Переанализ»: фоновая задача находит записи с устаревшей
-`rules_version` и ставит их в `q:analyze`; повторное скачивание не
-требуется. Реализация — `internal/analyzer/reanalyze.go`.
+Spec 5.8 "Re-analysis": a background task finds records with a stale
+`rules_version` and enqueues them into `q:analyze`; re-downloading is
+not required. Implementation — `internal/analyzer/reanalyze.go`.
 
-**Критерий устаревания.** `subdomain_results.rules_version IS DISTINCT
-FROM <текущая версия набора>` (`rules.Set.Version`, T-068). `IS DISTINCT
-FROM`, а не `<>`: NULL — «никогда не анализировалась» (строки,
-записанные до T-071, и новые эпизоды проверки T-058) — не выпадает из
-сравнения. Домены `deleted` не переанализируются (§13.1, охрана
-`status <> deleted` как в выборках планировщика); их результаты чистит
-T-020. Отключённые зоны не фильтруются: переанализ не ходит в сеть и
-запретов §5.10 не нарушает.
+**The staleness criterion.** `subdomain_results.rules_version IS
+DISTINCT FROM <the current ruleset version>` (`rules.Set.Version`,
+T-068). `IS DISTINCT FROM`, not `<>`: NULL — "never analyzed" (rows
+written before T-071 and the new check episodes of T-058) — does not
+drop out of the comparison. `deleted` domains are not re-analyzed
+(§13.1, the `status <> deleted` guard as in the scheduler's
+selections); their results are cleaned by T-020. Disabled zones are
+not filtered: re-analysis does not touch the network and violates none
+of the §5.10 bans.
 
-**Проход.** Пачки по 5000 строк (`DefaultReanalyzeBatch`): выборка ключей
-(домен, субдомен, вариант + имя домена) → публикация `Result`-сообщений
-(T-024) в `q:analyze`. Контент воркер берёт из хранилища по ключу —
-никаких обращений к сайтам (§5.8 «пассивный анализ»). Backpressure —
-`WatermarkPublisher` (T-026): публикация ждёт ёмкости `q:analyze`, отмена
-ctx — чистый выход.
+**The pass.** Batches of 5000 rows (`DefaultReanalyzeBatch`): a
+selection of keys (domain, subdomain, variant + the domain name) →
+the publication of `Result` messages (T-024) into `q:analyze`. The
+worker takes the content from the storage by key — no requests to the
+sites (§5.8 "passive analysis"). Backpressure — `WatermarkPublisher`
+(T-026): the publication waits for the `q:analyze` capacity; a ctx
+cancellation — a clean exit.
 
-**Курсор вместо повторной выборки — две формы (T-193).** Публикация не
-меняет строку — версию зафиксирует воркер T-071, асинхронно. Повторная
-выборка «с начала» брала бы ту же in-flight пачку, поэтому у проходов
-курсорная пагинация, и форм две:
+**A cursor instead of re-selection — two shapes (T-193).** The
+publication does not change the row — the T-071 worker will stamp the
+version, asynchronously. Re-selecting "from the beginning" would take
+the same in-flight batch, so the passes use cursor pagination, and
+there are two shapes:
 
-- **PK-форма** (`ReanalyzeDrain`/`ReanalyzeOnce`, row-value `>` по PK) —
-  полный дренаж: смена правил (Subscribe, T-068) и `crawlerctl
-  reanalyze`. Редкий, обязан пройти всё устаревшее множество с нуля;
-  `rules_version` не индексируется сознательно (HOT-инвариант: апдейты
-  анализа — миллионы/сут, класс T-104/T-175), seq scan здесь осознанно
-  полон — один полный проход на смену правил.
-- **время-форма** (`ReanalyzeTick`, row-value `>` по `(checked_at, PK)`,
-  `ORDER BY` по тому же ключу) — часовой тик: множество кандидатов тика —
-  свежий срез (новые эпизоды T-058 со свежим `checked_at` и NULL-версией;
-  хвосты, чья публикация отстала/потерялась). Композитный курсор
-  обслуживает готовый индекс `subdomain_results_checked_idx` (T-171) —
-  тик читает только окно вперёд курсора, стоимость ∝ притоку с момента
-  прошлого тика, а не размеру таблицы (до T-193 нулевой PK-курсор гнал
-  Parallel Seq Scan всей `subdomain_results` — 4,8 млн строк, 19,9 с —
-  ради горстки строк; прецедент решения — курсор retention T-185).
-  Курсор живёт в состоянии цикла между проходами и продвигается за
-  последнюю строку опубликованной пачки; пустая пачка — окно исчерпано,
-  курсор ждёт следующего тика. Ошибка публикации не двигает курсор за
-  сбойную пачку — повторный тик опубликует её строки снова
-  (at-least-once, §3.4; дубликаты гасятся идемпотентностью воркера по
-  ключу — как у T-066).
+- **the PK shape** (`ReanalyzeDrain`/`ReanalyzeOnce`, a row-value `>`
+  over the PK) — the full drain: a rules change (Subscribe, T-068) and
+  `crawlerctl reanalyze`. Rare; it must traverse the whole stale set
+  from zero; `rules_version` is deliberately not indexed (the HOT
+  invariant: analysis updates — millions/day, the T-104/T-175 class),
+  and the seq scan here is deliberately complete — one full pass per
+  rules change.
+- **the time shape** (`ReanalyzeTick`, a row-value `>` over
+  `(checked_at, PK)`, an `ORDER BY` over the same key) — the hourly
+  tick: the tick's candidate set — a fresh slice (the new T-058
+  episodes with a fresh `checked_at` and a NULL version; the tails
+  whose publication lagged/was lost). The composite cursor is served
+  by the ready `subdomain_results_checked_idx` index (T-171) — the
+  tick reads only the window ahead of the cursor, the cost ∝ the
+  inflow since the previous tick, not the table size (before T-193 a
+  zero PK cursor ran a Parallel Seq Scan of the whole
+  `subdomain_results` — 4.8M rows, 19.9 s — for the sake of a handful
+  of rows; the decision's precedent — the T-185 retention cursor).
+  The cursor lives in the loop state between passes and advances past
+  the last row of the published batch; an empty batch — the window is
+  exhausted, the cursor waits for the next tick. A publication error
+  does not move the cursor past the failed batch — the next tick will
+  publish its rows again (at-least-once, §3.4; the duplicates are
+  absorbed by the worker's key idempotency — like T-066).
 
-**Guard корзин хвостов — тик без зрелых хвостов не ходит в окно (T-204).**
-Даже окно часа — 84 тыс. строк (приток 2–3 млн/сут, TZ T-201 §2.1) с
-heap-визитом каждой ради неиндексируемого `rules_version` стоило
-5–12 с стационарно и 86–94 с в полуночном шторме (множитель
-CPU/IO-голода, PSI ~80 %) — критерий приёмки T-193 «тик исчезает из
-журнала медленных» не достигался. Как и у ретрая (T-191 → T-202),
-наивный счётчик «записано без анализа» не отличает хвосты от незрелого
-in-flight-потока (запись → `q:analyze` → штамп занимает секунды,
-приток 23–35 строк/с держит его ненулевым всегда) — зрелость дают
-ЧАСОВЫЕ корзины `crawler_counters['reanalyze:YYYY-MM-DD"T"HH24']`
-(семья T-202/T-203): guard (`reanalyzeGuardSQL`) суммирует корзины
-старше текущего часа ДО тяжёлой выборки. Сумма ≤ 0 — окно не
-вычитывается вовсе, а курсор прыгает на границу текущего часа (дата из
-той же строки guard'а): без прыжка курсор замерзал бы на последней
-публикации, и первый хвост после тихих часов стоил бы многочасовой
-проход — прыжок держит каждое guard-открытое окно в пределах ~2 ч
-притока; первый тик после старта цикла якорное окно 24 ч при закрытом
-guard тоже не вычитывает (стартовый дренаж уже прошёл всё устаревшее).
-Корзины ведут инкременты записи результата (`record.go`, час `now()`
-транзакции = `checked_at` строк) и замены контента рендером
-(`renderworker`, час эпизода из `RETURNING`), декремент — штамп
-анализатора только устаревших строк (охрана версии в `analyzeMarkSQL`:
-повторные доставки — no-op, дельта не двоится); авторитет —
-реконсиляция monitor (FILTER-позиции `prev_reanalyze`/`cur_reanalyze`
-агрегата окна двух живых часов, `docs/schema.md`). Порядок блокировок
-писателей общий с проходом: «… → `retry_mature:` → `reanalyze:` →
-`rendered:` → `results:`». Остаточные классы (порядок того же рода,
-что якорь §4.2): хвост, не подобранный за два часа (сбойные тики) —
-корзина удалена проходом, его подберут рестарт с якорем или полный
-дренаж смены правил; зрелый хвост, замаскированный отрицательным
-дрейфом корзин (закрытый guard прыгает курсором за него) — то же
-спасение: рестарт/дренаж, ждать одной реконсиляции недостаточно
-(docs/runbooks.md §7); устаревшие НЕ-NULL строки (штамп старой версии
-незадолго до смены правил + потерянная публикация дренажа) корзинам
-не видны (`IS NULL` против `IS DISTINCT FROM` выборки тика) — их
-территория следующего полного дренажа/рестарта; декременты штампов
-старой версии (дренажи) дают
-отрицательный дрейф до прохода — guard молчит, у тика во время
-дренажа своя работа пересекается только дублями; рендер-опоздание > 1 ч
-воскрешает корзину старого часа — guard открывается впустую (хвост за
-курсором), проход корзину удаляет.
+**The tail-bucket guard — the tick does not enter the window without
+mature tails (T-204).** Even an hour's window — 84K rows (the inflow
+2–3M/day, TZ T-201 §2.1) with a heap visit for each because of the
+unindexable `rules_version` — cost 5–12 s at steady state and 86–94 s
+in the midnight storm (a multiplier of CPU/IO starvation,
+PSI ~80%) — the T-193 acceptance criterion "the tick disappears from
+the slow journal" was not met. As with the retry (T-191 → T-202), a
+naive "recorded without analysis" counter does not distinguish tails
+from the immature in-flight flow (record → `q:analyze` → stamp takes
+seconds, and an inflow of 23–35 rows/s keeps it non-zero always) —
+maturity is provided by the HOURLY buckets
+`crawler_counters['reanalyze:YYYY-MM-DD"T"HH24']` (the T-202/T-203
+family): the guard (`reanalyzeGuardSQL`) sums the buckets older than
+the current hour BEFORE the heavy selection. A sum ≤ 0 — the window is
+not read at all, and the cursor jumps to the current hour's boundary
+(the date from the same guard row): without the jump the cursor would
+freeze at the last publication, and the first tail after quiet hours
+would cost a multi-hour pass — the jump keeps every guard-opened
+window within ~2 h of inflow; the first tick after the loop start,
+with the guard closed, does not read the 24 h anchor window either
+(the starting drain has already traversed everything stale). The
+buckets take increments from result recording (`record.go`, the hour
+of the transaction's `now()` = the rows' `checked_at`) and from
+content replacement by the render (`renderworker`, the episode's hour
+from `RETURNING`); the decrement — the analyzer's stamp of stale rows
+only (the version guard in `analyzeMarkSQL`: repeated deliveries are a
+no-op, the delta is not doubled); the authority — the monitor's
+reconciliation (the `prev_reanalyze`/`cur_reanalyze` FILTER positions
+of the two-live-hours window aggregate, `docs/schema.md`). The
+writers' lock order is shared with the pass: "… → `retry_mature:` →
+`reanalyze:` → `rendered:` → `results:`". The residual classes (an
+order of the same kind as the §4.2 anchor): a tail not picked up
+within two hours (failed ticks) — the bucket was deleted by the pass;
+a restart with the anchor or the full drain of a rules change will
+pick it up; a mature tail masked by a negative bucket drift (a closed
+guard jumps the cursor past it) — the same rescue: a restart/drain,
+waiting for one reconciliation is not enough (docs/runbooks.md §7);
+stale NON-NULL rows (a stamp of the old version shortly before a rules
+change + a lost drain publication) are invisible to the buckets
+(`IS NULL` against the `IS DISTINCT FROM` of the tick's selection) —
+their territory is the next full drain/restart; the decrements of
+old-version stamps (drains) produce a negative drift before the pass —
+the guard is silent, and during a drain the tick's own work intersects
+only in duplicates; a render lateness > 1 h resurrects an old hour's
+bucket — the guard opens in vain (the tail is behind the cursor), and
+the pass deletes the bucket.
 
-**Якорь курсора — окно 24 ч, не эпоха** (`DefaultReanalyzeLookback`,
-T-193 §4.2): курсор тика стартует с `now() − 24 ч`, а не с начала
-времён — стартовый полный дренаж уже покрыл всё устаревшее на момент
-запуска, тику остаются только свежие хвосты, и первый тик не должен
-вычитывать всю историю. Страховка тика обслуживает свежие потери
-(основной путь — немедленная публикация `record.go` и дренаж по
-Subscribe), всё старше либо проанализировано (`rules_version` меняется
-только записью анализа воркером T-071 или сменой правил; новый эпизод
-даёт свежий `checked_at`), либо это **остаточный класс** — потерянное
-старше окна без смены правил: в модели недостижимо, подстраховано
-наблюдаемостью q:dead/q:analyze (T-162) и подбирается следующим полным
-дренажом при смене правил (или руками — `crawlerctl reanalyze`).
-Персистентность курсора в БД отклонена сознательно: якорь делает
-потерю курсора дешёвой (одно окно 24 ч, ∝ притоку).
+**The cursor anchor — a 24 h window, not the epoch**
+(`DefaultReanalyzeLookback`, T-193 §4.2): the tick's cursor starts at
+`now() − 24 h`, not at the beginning of time — the starting full drain
+has already covered everything stale at start-up; the tick is left
+with only the fresh tails, and the first tick must not read the whole
+history. The tick's safety net serves fresh losses (the main path —
+the immediate publication of `record.go` and the drain on Subscribe);
+everything older is either analyzed (`rules_version` changes only with
+an analysis write by the T-071 worker or a rules change; a new episode
+gives a fresh `checked_at`) or is a **residual class** — a loss older
+than the window without a rules change: unreachable in the model,
+insured by the q:dead/q:analyze observability (T-162), and picked up
+by the next full drain at a rules change (or by hand —
+`crawlerctl reanalyze`). Cursor persistence in the database was
+rejected deliberately: the anchor makes cursor loss cheap (one 24 h
+window, ∝ the inflow).
 
-**Цикл `ReanalyzeLoop`** (подключён в `cmd/analyzer`, одна горутина
-`OnRun`): стартовый полный дренаж сразу при старте (устаревшее за
-простоем, включая сменившиеся за простоем правила — Subscribe
-уведомляет только работающий процесс) → тикер раз в час
-(`DefaultReanalyzeInterval` — страховка: потерянные сообщения MAXLEN ~,
-сбой воркера, новые эпизоды) время-формой под guard'ом корзин хвостов
-(T-204, выше): курсор заякоривается при
-старте цикла на `now − 24 ч` и переживает проходы, каждый тик
-продолжает с места остановки (или прыгает на границу часа при закрытом
-guard'е) → внеочередной полный дренаж по смене
-набора правил (`Reloader.Subscribe`, SIGHUP — `make rules-reload`;
-PK-форма с нуля; guard дренажа не касается — тот обязан пройти всё).
-Тик и дренаж идут в одной горутине цикла —
-пересечение множеств (смена правил во время тика) безопасно: оба
-идемпотентны на уровне «выборка+публикация». Ошибка прохода — Warn,
-цикл живёт (контракт OnRun, T-012).
+**The `ReanalyzeLoop` loop** (wired in `cmd/analyzer`, a single
+`OnRun` goroutine): a starting full drain right at start-up (the stale
+data from the downtime, including the rules that changed during the
+downtime — Subscribe notifies only a running process) → a ticker once
+an hour (`DefaultReanalyzeInterval` — the insurance: messages lost to
+the MAXLEN ~, a worker failure, new episodes) in the time shape under
+the tail-bucket guard (T-204, above): the cursor is anchored at the
+loop start to `now − 24 h` and survives passes, every tick continues
+from where it stopped (or jumps to the hour boundary with the guard
+closed) → an off-schedule full drain on a ruleset change
+(`Reloader.Subscribe`, SIGHUP — `make rules-reload`; the PK shape from
+zero; the guard does not concern the drain — it must traverse
+everything). The tick and the drain run in the loop's single goroutine
+— an intersection of the sets (a rules change during a tick) is safe:
+both are idempotent at the "selection + publication" level. A pass
+error — a Warn, the loop lives on (the OnRun contract, T-012).
 
-**Контракт с воркером T-071:** по каждому обработанному `Result` воркер
-фиксирует `subdomain_results.rules_version = версия набора` — в том
-числе строкам без сохранённого контента («анализировать нечего» — тоже
-результат с версией), иначе фоновый проход возвращался бы к ним
-бесконечно. Штамп ставится только устаревшим строкам (охрана
-актуальности версии, T-204): повторная доставка той же версии — no-op
-(та же версия × тот же контент детерминированно дают те же findings);
-штамп той же транзакцией декрементирует корзину хвостов часа эпизода
-строки — guard следующего тика закрывается.
+**The contract with the T-071 worker:** for every processed `Result`
+the worker stamps `subdomain_results.rules_version = the ruleset
+version` — including rows without stored content ("nothing to
+analyze" is also a result with a version), otherwise the background
+pass would return to them endlessly. The stamp is placed only on stale
+rows (the version freshness guard, T-204): a redelivery of the same
+version is a no-op (the same version × the same content
+deterministically give the same findings); the stamp decrements the
+tail bucket of the row's episode hour in the same transaction — the
+next tick's guard closes.
 
-**Ручной запуск** — `crawlerctl reanalyze [--zone ИМЯ]` (см.
-`docs/dev-environment.md` §6): тот же дренаж по зоне или всем зонам с
-разовой загрузкой каталога правил; печатает счётчик постановок.
-
+**Manual run** — `crawlerctl reanalyze [--zone NAME]` (see
+`docs/dev-environment.md` §6): the same drain for one zone or all
+zones, with a one-time load of the rules directory; prints the
+enqueueing counter.
