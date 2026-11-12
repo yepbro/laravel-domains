@@ -1,7 +1,8 @@
-// Юнит-тесты метрики фоновой очистки (T-099): экспорт BadHashes проходов
-// в счётчик crawler_ingest_bad_hashes_total, нулевой итог не меняет
-// значение, no-op без реестра, идемпотентность конструктора (T-076) и
-// доставка итогов проходов циклом через CleanupOptions.OnPass.
+// Unit tests of the background cleanup metric (T-099): the export of
+// pass BadHashes into the crawler_ingest_bad_hashes_total counter, a
+// zero result not changing the value, the no-op without a registry, the
+// constructor idempotency (T-076), and the delivery of pass results by
+// the loop via CleanupOptions.OnPass.
 package ingest
 
 import (
@@ -16,9 +17,9 @@ import (
 	"crawler/internal/metrics"
 )
 
-// cleanupCounterValue — значение счётчика name (без меток, кроме
-// сервисной): первый ряд семейства; -1, если метрика не экспортирована
-// (стиль fallbackCounterValue в dnsworker).
+// cleanupCounterValue — the value of the name counter (no labels except
+// the service one): the first row of the family; -1 if the metric is not
+// exported (the fallbackCounterValue style in dnsworker).
 func cleanupCounterValue(t *testing.T, g prometheus.Gatherer, name string) float64 {
 	t.Helper()
 	families, err := g.Gather()
@@ -38,14 +39,14 @@ func cleanupCounterValue(t *testing.T, g prometheus.Gatherer, name string) float
 	return -1
 }
 
-// TestCleanupMetricsObserve — итоги проходов накапливаются в счётчик:
-// нулевой BadHashes значение не меняет, положительные складываются
-// (Prometheus-семантика _total сохраняется).
+// TestCleanupMetricsObserve — pass results accumulate in the counter: a
+// zero BadHashes does not change the value, positive ones are summed
+// (the Prometheus _total semantics are preserved).
 func TestCleanupMetricsObserve(t *testing.T) {
 	reg := metrics.New("ingest")
 	m := NewCleanupMetrics(reg)
 
-	m.Observe(CleanupResult{Domains: 3, Results: 10}) // BadHashes 0 — нет роста
+	m.Observe(CleanupResult{Domains: 3, Results: 10}) // BadHashes 0 — no growth
 	if got := cleanupCounterValue(t, reg, "crawler_ingest_bad_hashes_total"); got != 0 {
 		t.Fatalf("после нулевого BadHashes счётчик = %v, want 0", got)
 	}
@@ -58,13 +59,14 @@ func TestCleanupMetricsObserve(t *testing.T) {
 	}
 }
 
-// TestCleanupMetricsNoRegistry — без реестра коллектора нет (изолированные
-// сборки), вызовы Observe — no-op без паники.
+// TestCleanupMetricsNoRegistry — without a registry there is no
+// collector (isolated builds); Observe calls are a no-op without a
+// panic.
 func TestCleanupMetricsNoRegistry(t *testing.T) {
 	if m := NewCleanupMetrics(nil); m != nil {
 		t.Fatalf("NewCleanupMetrics(nil) = %v, want nil", m)
 	}
-	NewCleanupMetrics(nil).Observe(CleanupResult{BadHashes: 7}) // не паникует
+	NewCleanupMetrics(nil).Observe(CleanupResult{BadHashes: 7}) // does not panic
 
 	reg := metrics.New("ingest")
 	families, err := reg.Gather()
@@ -78,12 +80,13 @@ func TestCleanupMetricsNoRegistry(t *testing.T) {
 	}
 }
 
-// TestCleanupMetricsIdempotent — повторная регистрация делит тот же
-// счётчик (T-076): вызовы через второй экземпляр продолжают ряд.
+// TestCleanupMetricsIdempotent — a repeated registration shares the same
+// counter (T-076): calls through the second instance continue the
+// series.
 func TestCleanupMetricsIdempotent(t *testing.T) {
 	reg := metrics.New("ingest")
 	first := NewCleanupMetrics(reg)
-	second := NewCleanupMetrics(reg) // дубль-регистрация — не паника
+	second := NewCleanupMetrics(reg) // duplicate registration — no panic
 
 	first.Observe(CleanupResult{BadHashes: 4})
 	second.Observe(CleanupResult{BadHashes: 6})
@@ -92,16 +95,17 @@ func TestCleanupMetricsIdempotent(t *testing.T) {
 	}
 }
 
-// TestCleanupDeletedOnPass — цикл отдаёт хуку итог каждого успешного
-// прохода (включая нулевой) и не отдаёт ошибочные: Warn уже записан,
-// метрика по несостоявшемуся проходу не врёт.
+// TestCleanupDeletedOnPass — the loop hands the hook the result of every
+// successful pass (including a zero one) and does not hand over failed
+// ones: Warn is already recorded, and the metric must not lie about a
+// pass that did not happen.
 func TestCleanupDeletedOnPass(t *testing.T) {
 	var mu sync.Mutex
 	var passes []CleanupResult
 
 	pool := &cleanupFakePool{
-		// Проход 1 (сразу) — работа с мусорным хэшем; проход 2 — ошибка
-		// БД; проход 3 — пустой набор; дальше — пустые.
+		// Pass 1 (immediately) — work with a junk hash; pass 2 — a DB
+		// error; pass 3 — an empty set; then — empty ones.
 		selects: []*cleanupFakeRows{
 			cleanupRows([]any{int16(1), int64(10)}),
 			cleanupRows(),
@@ -141,9 +145,10 @@ func TestCleanupDeletedOnPass(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	// После отмены возможен лишний пустой проход (тир между опросом
-	// счётчика и cancel) — детерминированы первый итог и отсутствие
-	// данных ошибочного прохода: все проходы после первого нулевые.
+	// After the cancel an extra empty pass is possible (a race between
+	// the counter poll and cancel) — the first result and the absence of
+	// the failed pass's data are deterministic: all passes after the
+	// first are zero.
 	if len(passes) < 2 {
 		t.Fatalf("проходов в хуке = %d (%+v), want ≥2", len(passes), passes)
 	}

@@ -1,11 +1,12 @@
-// Юнит-тесты применения delete без БД (стиль stage_test.go/zones_test.go):
-// текст SQL и параметры, счётчики, порядок «применить → очистить», пустая
-// партия, идемпотентность повтора (ТЗ 3.4), пара «снятие бита
-// render_pending × декремент счётчика долга» двумя операторами одной
-// транзакции (T-186/T-269), перенос ключей битовых строк между
-// операторами, ошибки шагов и очистки, отмена ctx. Реальное поведение
-// против живой БД — интеграционные тесты ingest (T-023) и renderbit
-// (гонка инцидента 08.11.2026, T-269).
+// Unit tests of applying delete without a DB (the stage_test.go/
+// zones_test.go style): the SQL text and arguments, the counters, the
+// "apply → clean" order, an empty batch, the retry idempotency
+// (spec 3.4), the pair "clearing the render_pending bit × decrementing
+// the debt counter" by two statements of one transaction
+// (T-186/T-269), carrying the bit row keys between the statements, the
+// step and cleanup errors, the ctx cancellation. The real behavior
+// against a live DB — the ingest integration tests (T-023) and renderbit
+// (the race of the 2026-11-08 incident, T-269).
 package ingest
 
 import (
@@ -21,23 +22,24 @@ import (
 	"crawler/internal/model"
 )
 
-// applyDeletePool — ApplyDB для тестов применения delete: транзакция
-// Begin → applyDeleteSQL → applyClearRenderSQL → Commit, затем очистка
-// партии через пул. Помнит порядок обращений с SQL и аргументами, ответы
-// операторов — заготовленными строками (позиционный Scan, стиль
-// cleanupFakeRows). Ошибки шагов — по именованным полям.
+// applyDeletePool — an ApplyDB for the delete application tests: the
+// Begin → applyDeleteSQL → applyClearRenderSQL → Commit transaction,
+// then the batch cleanup through the pool. Remembers the call order
+// with the SQL and the arguments; the statement answers are prepared
+// rows (a positional Scan, the cleanupFakeRows style). Step errors —
+// by named fields.
 type applyDeletePool struct {
-	ops  []string // порядок: "begin", "query:<sql>", "commit", "exec:<sql>"
-	args [][]any  // аргументы операций в порядке вызовов
+	ops  []string // the order: "begin", "query:<sql>", "commit", "exec:<sql>"
+	args [][]any  // the operation arguments in call order
 
-	applyRows *cleanupFakeRows // ответ applyDeleteSQL: deleted, not_found, render_zones, render_labels
-	clearRows *cleanupFakeRows // ответ applyClearRenderSQL: value
+	applyRows *cleanupFakeRows // the applyDeleteSQL answer: deleted, not_found, render_zones, render_labels
+	clearRows *cleanupFakeRows // the applyClearRenderSQL answer: value
 
 	beginErr     error
 	applyErr     error
 	clearRendErr error
 	commitErr    error
-	clearErr     error // очистка партии (пул)
+	clearErr     error // the batch cleanup (pool)
 
 	begins    int
 	commits   int
@@ -50,7 +52,8 @@ func (p *applyDeletePool) CopyFrom(context.Context, pgx.Identifier, []string, pg
 	return 0, errors.New("CopyFrom не должен вызываться")
 }
 
-// Query пула применению не нужен (операторы — в транзакции): отказ.
+// The pool's Query is not needed by the application (the statements are
+// in the transaction): fail.
 func (p *applyDeletePool) Query(context.Context, string, ...any) (pgx.Rows, error) {
 	return nil, errors.New("applyDeletePool: Query вне транзакции не должен вызываться")
 }
@@ -79,10 +82,10 @@ func (p *applyDeletePool) Begin(ctx context.Context) (pgx.Tx, error) {
 	return &applyDeleteTx{pool: p}, nil
 }
 
-// applyDeleteTx — транзакция фейкового пула: операторы применения и
-// снятия бита, фиксация/откат.
+// applyDeleteTx — the fake pool's transaction: the application and
+// bit-clearing statements, the commit/rollback.
 type applyDeleteTx struct {
-	pgx.Tx // остальные методы pgx.Tx применение не использует
+	pgx.Tx // the application does not use the rest of the pgx.Tx methods
 
 	pool      *applyDeletePool
 	committed bool
@@ -132,13 +135,13 @@ func (t *applyDeleteTx) Commit(context.Context) error {
 
 func (t *applyDeleteTx) Rollback(context.Context) error {
 	if t.committed {
-		return nil // pgx.ErrTxClosed в реальности; здесь достаточно no-op
+		return nil // pgx.ErrTxClosed in reality; a no-op is enough here
 	}
 	t.pool.rollbacks++
 	return nil
 }
 
-// validDeleteBatch — валидная delete-партия для тестов применения.
+// validDeleteBatch — a valid delete batch for the application tests.
 func validDeleteBatch(t *testing.T) Batch {
 	t.Helper()
 	id, err := NewBatchID()
@@ -148,18 +151,19 @@ func validDeleteBatch(t *testing.T) Batch {
 	return Batch{ID: id, ZoneID: 7, Action: model.ActionDelete}
 }
 
-// wantApplyArgs — аргументы оператора применения: идентификатор партии,
-// код статуса deleted и код операции delete (в параметрах, а не в тексте
-// SQL — точные значения model закрепляются тестом).
+// wantApplyArgs — the application statement's arguments: the batch
+// identifier, the deleted status code and the delete action code (in
+// the parameters, not in the SQL text — the exact model values are
+// pinned by the test).
 func wantApplyArgs(b Batch) []any {
 	return []any{b.ID[:], int16(model.StatusDeleted), int16(model.ActionDelete)}
 }
 
-// TestApplyDelete — полный протокол применения с битовыми строками:
-// транзакция (перевод статуса → снятие бита со счётчиком по ключам
-// applyDeleteSQL → фиксация), затем очистка партии. Ключи битовых строк
-// (render_zones/render_labels) передаются второй парой операторов
-// дословно.
+// TestApplyDelete — the full application protocol with bit rows: the
+// transaction (the status move → the bit clearing with the counter over
+// the applyDeleteSQL keys → the commit), then the batch cleanup. The
+// bit row keys (render_zones/render_labels) are passed to the second
+// statement pair verbatim.
 func TestApplyDelete(t *testing.T) {
 	b := validDeleteBatch(t)
 	zones := []int16{7, 9}
@@ -177,7 +181,8 @@ func TestApplyDelete(t *testing.T) {
 		t.Errorf("счётчики = %+v, want {5 2}", res)
 	}
 
-	// Порядок: begin → применение → снятие бита → commit → очистка.
+	// The order: begin → the application → the bit clearing → commit →
+	// the cleanup.
 	want := []string{"begin", "query:" + applyDeleteSQL, "query:" + applyClearRenderSQL, "commit", "exec:" + clearStageSQL}
 	if !reflect.DeepEqual(pool.ops, want) {
 		t.Fatalf("порядок обращений = %v, want %v", pool.ops, want)
@@ -196,10 +201,11 @@ func TestApplyDelete(t *testing.T) {
 	}
 }
 
-// TestApplyDeleteNoRenderRows — файл без флаговых доменов: вторая пара
-// (снятие бита × счётчик) не выполняется вовсе — строку счётчика файл
-// не трогает (единая точка сериализации флажащих транзакций, record.go;
-// прецедент HAVING T-186).
+// TestApplyDeleteNoRenderRows — a file without flagged domains: the
+// second pair (the bit clearing × the counter) does not run at all —
+// the file does not touch the counter row (the single serialization
+// point of the flagging transactions, record.go; the HAVING precedent
+// of T-186).
 func TestApplyDeleteNoRenderRows(t *testing.T) {
 	pool := &applyDeletePool{
 		applyRows: cleanupRows([]any{int64(4), int64(1), []int16{}, []string{}}),
@@ -218,19 +224,20 @@ func TestApplyDeleteNoRenderRows(t *testing.T) {
 	}
 }
 
-// TestApplyDeleteSQLContract — точный текст применения: перенос статуса
-// по ключу (zone_id, label) из строк своей партии с охраной «ещё не
-// deleted» (T-178: дельты счётчиков зон декрементируют только
-// действительно переводимые строки — повторное применение партии
-// идемпотентно и по счётчикам, ТЗ 3.4; отчёт при этом сохраняет прежнюю
-// семантику: уже удалённый домен считается строкой «удалён»); оператор
-// перевода бит render_pending НЕ трогает (T-269: дельта снимка had_render
-// двойно декрементировала счётчик при конкурентном снятии проходом
-// доработки — инцидент 08.11.2026), факт «бит стоял на момент перевода»
-// выносят RETURNING-колонка had_render (версия-основание обновления) и
-// массивы render_zones/render_labels; дельты счётчиков зон — по
-// check_state переведённых; домен остаётся в БД (нет DELETE); счётчики —
-// по строкам staging.
+// TestApplyDeleteSQLContract — the exact application text: the status
+// move by the (zone_id, label) key over the own batch's rows with the
+// "not yet deleted" guard (T-178: the zone counter deltas decrement
+// only the rows actually moved — a repeated batch application is
+// idempotent for the counters too, spec 3.4; the report keeps the
+// previous semantics: an already deleted domain counts as a "deleted"
+// row); the move statement does NOT touch the render_pending bit
+// (T-269: the had_render snapshot delta double-decremented the counter
+// on a concurrent clearing by the rework pass — the 2026-11-08
+// incident); the "the bit was set at the moment of the move" fact is
+// carried by the RETURNING column had_render (the update's base
+// version) and the render_zones/render_labels arrays; the zone counter
+// deltas — by the check_state of the moved rows; the domain stays in
+// the DB (no DELETE); the counters — over the staging rows.
 func TestApplyDeleteSQLContract(t *testing.T) {
 	want := `WITH pre AS MATERIALIZED (
 	SELECT d.zone_id, d.label
@@ -279,34 +286,38 @@ SELECT
 		t.Errorf("applyDeleteSQL = %q, want точное совпадение", applyDeleteSQL)
 	}
 
-	// Таблица staging — из StageTable, как COPY и очистка партии.
+	// The staging table — from StageTable, like the COPY and the batch
+	// cleanup.
 	if !strings.Contains(applyDeleteSQL, `FROM `+StageTable.Sanitize()+` AS s`) {
 		t.Errorf("SQL = %q, want обращение к staging через StageTable", applyDeleteSQL)
 	}
-	// Только перевод статуса: домен остаётся в БД (ТЗ 13.1), результаты и
-	// контент чистит T-020 — здесь их нет. Бит render_pending оператор
-	// перевода не снимает (T-269) — в SET только status.
+	// Only the status move: the domain stays in the DB (spec 13.1); the
+	// results and content are cleaned by T-020 — they are not here. The
+	// move statement does not clear the render_pending bit (T-269) —
+	// only status is in SET.
 	if !strings.Contains(applyDeleteSQL, "UPDATE domains") || strings.Contains(applyDeleteSQL, "DELETE FROM domains") {
 		t.Errorf("SQL = %q, want только UPDATE domains", applyDeleteSQL)
 	}
 	if strings.Contains(applyDeleteSQL, "SET flags") || strings.Contains(applyDeleteSQL, "CASE WHEN") {
 		t.Errorf("SQL = %q, want перевод статуса БЕЗ касания flags (снятие бита — applyClearRenderSQL, T-269)", applyDeleteSQL)
 	}
-	// Охрана статуса пинирует перевод для дельт (T-178): оператор не
-	// меняет check_state — RETURNING отдаёт старое значение (ТЗИ §6.1.2).
+	// The status guard pins the move for the deltas (T-178): the
+	// statement does not change check_state — RETURNING yields the old
+	// value (incremental-counters spec §6.1.2).
 	if !strings.Contains(applyDeleteSQL, "AND d.status <> $2") {
 		t.Errorf("SQL = %q, want охрана «ещё не deleted» для дельт счётчиков", applyDeleteSQL)
 	}
-	// Отчёт: уже удалённый до оператора домен считается «удалён»
-	// (EXISTS по domains со старым статусом — снимок оператора).
+	// The report: a domain already deleted before the statement counts
+	// as "deleted"
+	// (EXISTS over domains with the old status — the statement snapshot).
 	if !strings.Contains(applyDeleteSQL, "OR EXISTS") {
 		t.Errorf("SQL = %q, want альтернативу «уже был deleted» в счётчике deleted", applyDeleteSQL)
 	}
-	// Факт битовых строк — RETURNING-колонкой (версия-основание, не
-	// снимок pre) и параллельными массивами для второй пары; ОБЯАТЕЛЬНЫЙ
-	// ORDER BY в обоих array_agg — контракт парности ключей (len-проверка
-	// в Go перестановку не ловит, порядок агрегатов без него не задан —
-	// ревью T-269 P2-3).
+	// The bit row fact — by the RETURNING column (the base version, not
+	// the pre snapshot) and the parallel arrays for the second pair; the
+	// ORDER BY in both array_agg is MANDATORY — the key pairing contract
+	// (the len check in Go does not catch a permutation, the aggregate
+	// order is unspecified without it — the T-269 review, P2-3).
 	if !strings.Contains(applyDeleteSQL, "(d.flags & 2) <> 0 AS had_render") ||
 		!strings.Contains(applyDeleteSQL, "array_agg(m.zone_id ORDER BY m.zone_id, m.label)") ||
 		!strings.Contains(applyDeleteSQL, "array_agg(m.label ORDER BY m.zone_id, m.label)") {
@@ -314,13 +325,14 @@ SELECT
 	}
 }
 
-// TestApplyClearRenderSQLContract — точный текст второй пары: снятие
-// бита по ОХРАНЕ текущей версии (окно «снимок → блокировка» инцидента
-// 08.11.2026 закрыто: конкурентное снятие даёт 0 строк, счётчик не
-// трогается — зеркально Д7), декремент — по факту снятых (count из
-// RETURNING, runbooks §6), строка счётчика не трогается файлами без
-// флаговых доменов (guard count > 0), RETURNING — контроль наличия
-// строки (миграция 000015).
+// TestApplyClearRenderSQLContract — the exact text of the second pair:
+// the bit clearing by the GUARD of the current version (the
+// "snapshot → lock" window of the 2026-11-08 incident is closed: a
+// concurrent clearing yields 0 rows, the counter is not touched —
+// mirroring D7); the decrement — by the fact of the cleared rows (the
+// count from RETURNING, runbooks §6); the counter row is not touched by
+// files without flagged domains (the guard count > 0); the RETURNING —
+// the row presence check (migration 000015).
 func TestApplyClearRenderSQLContract(t *testing.T) {
 	want := `WITH cleared AS (
 	UPDATE domains AS d
@@ -338,20 +350,21 @@ RETURNING value`
 	if applyClearRenderSQL != want {
 		t.Errorf("applyClearRenderSQL = %q, want точное совпадение", applyClearRenderSQL)
 	}
-	// Охрана бита — по текущей версии строки (стиль renderClearPendingSQL
-	// httpworker: RowsAffected 0 — перехода не было, счётчик не трогается).
+	// The bit guard — over the row's current version (the
+	// renderClearPendingSQL style of httpworker: RowsAffected 0 — no
+	// transition, the counter is not touched).
 	if !strings.Contains(applyClearRenderSQL, "AND (d.flags & 2) <> 0") {
 		t.Errorf("SQL = %q, want охрану бита текущей версии", applyClearRenderSQL)
 	}
-	// Дельта — только по фактически снятым (count из RETURNING), не по
-	// заготовленному числу.
+	// The delta — only by the rows actually cleared (the count from
+	// RETURNING), not by a prepared number.
 	if !strings.Contains(applyClearRenderSQL, "value - (SELECT count(*) FROM cleared)") {
 		t.Errorf("SQL = %q, want декремент по факту снятых", applyClearRenderSQL)
 	}
 }
 
-// TestApplyDeleteEmptyBatch — партия без строк (файл из одних пустых
-// строк/комментариев): no-op с нулевыми счётчиками, очистка выполняется.
+// TestApplyDeleteEmptyBatch — a batch without rows (a file of only
+// empty rows/comments): a no-op with zero counters, the cleanup runs.
 func TestApplyDeleteEmptyBatch(t *testing.T) {
 	pool := &applyDeletePool{
 		applyRows: cleanupRows([]any{int64(0), int64(0), []int16{}, []string{}}),
@@ -372,15 +385,16 @@ func TestApplyDeleteEmptyBatch(t *testing.T) {
 	}
 }
 
-// TestApplyDeleteIdempotentRepeat — повторное применение после очистки —
-// no-op: staging партии пуст, счётчики нулевые, ошибок нет (ТЗ 3.4).
+// TestApplyDeleteIdempotentRepeat — re-applying after the cleanup is a
+// no-op: the batch's staging is empty, the counters are zero, no errors
+// (spec 3.4).
 func TestApplyDeleteIdempotentRepeat(t *testing.T) {
 	b := validDeleteBatch(t)
 	pool := &applyDeletePool{
 		applyRows: cleanupRows([]any{int64(3), int64(0), []int16{}, []string{}}),
 	}
-	// Второе применение — тот же ответ (партия в staging фейка не
-	// моделируется: важен протокол повтора, не состояние).
+	// The second application — the same answer (the batch is not modeled
+	// in the fake's staging: the retry protocol matters, not the state).
 	pool2 := &applyDeletePool{
 		applyRows: cleanupRows([]any{int64(0), int64(0), []int16{}, []string{}}),
 	}
@@ -405,9 +419,10 @@ func TestApplyDeleteIdempotentRepeat(t *testing.T) {
 	}
 }
 
-// TestApplyDeleteValidation — программные ошибки партии отбиваются до БД:
-// партия без идентификатора и партия не-delete (иначе очистка в конце
-// ApplyDelete молча уничтожила бы неприменённую add-партию).
+// TestApplyDeleteValidation — the batch's program errors are fought off
+// before the DB: a batch without an identifier and a non-delete batch
+// (otherwise the cleanup at the end of ApplyDelete would silently
+// destroy an unapplied add batch).
 func TestApplyDeleteValidation(t *testing.T) {
 	id, err := NewBatchID()
 	if err != nil {
@@ -435,9 +450,9 @@ func TestApplyDeleteValidation(t *testing.T) {
 	}
 }
 
-// TestApplyDeleteApplyError — ошибка применения (в том числе отмена ctx)
-// прерывает транзакцию до пары и очистки: партия остаётся в staging для
-// повтора (ТЗ 3.4).
+// TestApplyDeleteApplyError — an application error (including the ctx
+// cancellation) interrupts the transaction before the pair and the
+// cleanup: the batch stays in staging for the retry (spec 3.4).
 func TestApplyDeleteApplyError(t *testing.T) {
 	cases := []struct {
 		name string
@@ -463,17 +478,17 @@ func TestApplyDeleteApplyError(t *testing.T) {
 			if pool.commits != 0 || pool.rollbacks != 1 {
 				t.Errorf("commit=%d rollback=%d, want 0/1 (откат)", pool.commits, pool.rollbacks)
 			}
-			if len(pool.ops) != 2 { // begin + query:применение
+			if len(pool.ops) != 2 { // begin + query:<the application>
 				t.Errorf("обращения = %v, want применение без пары и очистки", pool.ops)
 			}
 		})
 	}
 }
 
-// TestApplyDeleteClearRenderError — ошибки второй пары: сбой оператора и
-// отсутствие строки счётчика откатывают применение целиком (молчаливый
-// рассинхрон «сняли бит — счётчик не сдвинут» недопустим, философия
-// renderBumpDebtCounter).
+// TestApplyDeleteClearRenderError — the second pair's errors: a
+// statement failure and a missing counter row roll back the whole
+// application (a silent desync "the bit cleared — the counter not
+// moved" is unacceptable, the renderBumpDebtCounter philosophy).
 func TestApplyDeleteClearRenderError(t *testing.T) {
 	t.Run("сбой оператора", func(t *testing.T) {
 		pool := &applyDeletePool{
@@ -494,7 +509,7 @@ func TestApplyDeleteClearRenderError(t *testing.T) {
 	t.Run("строки счётчика нет", func(t *testing.T) {
 		pool := &applyDeletePool{
 			applyRows: cleanupRows([]any{int64(2), int64(0), []int16{7}, []string{"a"}}),
-			clearRows: cleanupRows(), // RETURNING пуст — строки нет
+			clearRows: cleanupRows(), // the RETURNING is empty — the row is missing
 		}
 		_, err := ApplyDelete(context.Background(), pool, validDeleteBatch(t))
 		if err == nil || !strings.Contains(err.Error(), "'render_pending' отсутствует") {
@@ -506,9 +521,9 @@ func TestApplyDeleteClearRenderError(t *testing.T) {
 	})
 }
 
-// TestApplyDeleteBadCounters — защита от развала контракта запроса:
-// отсутствие строки счётчиков, лишние колонки, расхождение битовых
-// массивов — ошибка, откат, очистка не выполняется.
+// TestApplyDeleteBadCounters — protection against the query contract
+// falling apart: a missing counters row, an extra column, a mismatch of
+// the bit arrays — an error, a rollback, no cleanup.
 func TestApplyDeleteBadCounters(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -538,8 +553,8 @@ func TestApplyDeleteBadCounters(t *testing.T) {
 	}
 }
 
-// TestApplyDeleteTxErrors — ошибки транзакции (begin/commit) прерывают
-// применение; очистка партии не выполняется.
+// TestApplyDeleteTxErrors — transaction errors (begin/commit) interrupt
+// the application; the batch cleanup does not run.
 func TestApplyDeleteTxErrors(t *testing.T) {
 	t.Run("begin", func(t *testing.T) {
 		pool := &applyDeletePool{beginErr: errors.New("pool closed")}
@@ -558,14 +573,15 @@ func TestApplyDeleteTxErrors(t *testing.T) {
 		if _, err := ApplyDelete(context.Background(), pool, validDeleteBatch(t)); err == nil || !strings.Contains(err.Error(), "фиксация") {
 			t.Fatalf("err = %v, want ошибку фиксации", err)
 		}
-		if len(pool.ops) != 3 { // begin, применение, commit (упавший)
+		if len(pool.ops) != 3 { // begin, the application, commit (the failing one)
 			t.Errorf("обращения = %v, want без очистки партии", pool.ops)
 		}
 	})
 }
 
-// TestApplyDeleteClearError — ошибка очистки не отменяет применённый
-// delete: счётчики возвращаются вместе с ошибкой, повтор доведёт очистку.
+// TestApplyDeleteClearError — a cleanup error does not undo the applied
+// delete: the counters are returned together with the error, a retry
+// will finish the cleanup.
 func TestApplyDeleteClearError(t *testing.T) {
 	pool := &applyDeletePool{
 		applyRows: cleanupRows([]any{int64(4), int64(1), []int16{}, []string{}}),

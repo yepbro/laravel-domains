@@ -1,11 +1,13 @@
-// Сквозные юнит-тесты приёма архивов (T-133; ТЗ 5.1 расширение, 3.5)
-// без БД: синтетические архивы (archive/zip, archive/tar, compress/gzip)
-// во временных каталогах, окружение конвейера — pipeline_test.go
-// (pipeTest). Сценарии: потоковая обработка членов всех форматов, зона
-// из каталога архива (не из пути члена), пропуск мусорных записей с Warn,
-// лимиты (объём/число записей), битый архив → failed/, идемпотентность
-// повторной подачи (дубль по sha256 архива), пустой архив, вложенный
-// архив не распаковывается, сбой инфраструктуры → архив остаётся.
+// End-to-end unit tests of archive ingest (T-133; spec 5.1 extension,
+// 3.5) without a DB: synthetic archives (archive/zip, archive/tar,
+// compress/gzip) in temporary directories, the pipeline environment —
+// pipeline_test.go (pipeTest). Scenarios: streaming processing of the
+// members of all formats, the zone from the archive directory (not from
+// a member path), skipping junk entries with a Warn, the limits (size /
+// number of entries), a corrupt archive → failed/, idempotency of
+// re-submitting (a duplicate by the archive's sha256), an empty archive,
+// a nested archive is not unpacked, an infrastructure failure → the
+// archive stays.
 package ingest
 
 import (
@@ -30,16 +32,16 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
-// --- синтетические архивы ---------------------------------------------------
+// --- synthetic archives -----------------------------------------------------
 
-// archEntry — запись синтетического архива: имя (для каталогов — с
-// завершающим «/») и содержимое.
+// archEntry — an entry of a synthetic archive: the name (for directories
+// — with a trailing "/") and the content.
 type archEntry struct {
 	name string
 	data string
 }
 
-// zipBytes собирает zip в памяти (порядок записей фиксирован).
+// zipBytes assembles a zip in memory (the entry order is fixed).
 func zipBytes(t *testing.T, entries ...archEntry) []byte {
 	t.Helper()
 	var buf bytes.Buffer
@@ -59,7 +61,7 @@ func zipBytes(t *testing.T, entries ...archEntry) []byte {
 	return buf.Bytes()
 }
 
-// buildZip — файл zip по пути path (каталоги создаёт сам).
+// buildZip — a zip file at path (creates the directories itself).
 func buildZip(t *testing.T, path string, entries ...archEntry) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -70,7 +72,7 @@ func buildZip(t *testing.T, path string, entries ...archEntry) {
 	}
 }
 
-// tarBytes собирает tar (raw или поверх gzip) в памяти.
+// tarBytes assembles a tar (raw or gzip-wrapped) in memory.
 func tarBytes(t *testing.T, gz bool, entries ...archEntry) []byte {
 	t.Helper()
 	var buf bytes.Buffer
@@ -97,7 +99,7 @@ func tarBytes(t *testing.T, gz bool, entries ...archEntry) []byte {
 func writeTarEntries(t *testing.T, tw *tar.Writer, entries []archEntry) {
 	t.Helper()
 	for _, e := range entries {
-		if strings.HasSuffix(e.name, "/") { // каталог
+		if strings.HasSuffix(e.name, "/") { // a directory
 			if err := tw.WriteHeader(&tar.Header{Name: e.name, Typeflag: tar.TypeDir, Mode: 0o755}); err != nil {
 				t.Fatal(err)
 			}
@@ -113,7 +115,7 @@ func writeTarEntries(t *testing.T, tw *tar.Writer, entries []archEntry) {
 	}
 }
 
-// buildTar — файл tar (.tar) или gzip-обёрнутый (.tar.gz/.tgz) по пути.
+// buildTar — a tar file (.tar) or gzip-wrapped (.tar.gz/.tgz) at path.
 func buildTar(t *testing.T, path string, gz bool, entries ...archEntry) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -124,7 +126,7 @@ func buildTar(t *testing.T, path string, gz bool, entries ...archEntry) {
 	}
 }
 
-// buildGz — файл .gz с единственным потоком content.
+// buildGz — a .gz file with the single stream content.
 func buildGz(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -146,18 +148,20 @@ func buildGz(t *testing.T, path, content string) {
 	}
 }
 
-// addExecs — заготовка удачного применения add: ответы вставки пачки/
-// возврата уходят в поля пула (Query по модели staging, T-205), Exec
-// остаются две очистки Stage — перед загрузкой и в транзакции применения.
+// addExecs — a stub of a successful add application: the insert chunk /
+// revive answers go into the pool fields (a Query over the staging
+// model, T-205); two Stage cleanups remain as Execs — before loading and
+// in the application transaction.
 func addExecs(pool *pipePool, n, r int) []pipeExec {
 	pool.inserted, pool.revived = int64(n), int64(r)
 	return []pipeExec{
-		{tag: pgconn.NewCommandTag("DELETE 0")},                      // очистка перед загрузкой (Stage)
-		{tag: pgconn.NewCommandTag(fmt.Sprintf("DELETE %d", n+r+1))}, // очистка после применения
+		{tag: pgconn.NewCommandTag("DELETE 0")},                      // the cleanup before loading (Stage)
+		{tag: pgconn.NewCommandTag(fmt.Sprintf("DELETE %d", n+r+1))}, // the cleanup after the application
 	}
 }
 
-// newPipe — конвейер над окружением теста с правкой параметров.
+// newPipe — a pipeline over the test's environment with parameter
+// tweaks.
 func (pt *pipeTest) newPipe(t *testing.T, mutate func(*PipelineOptions)) *Pipeline {
 	t.Helper()
 	opts := PipelineOptions{
@@ -175,10 +179,11 @@ func (pt *pipeTest) newPipe(t *testing.T, mutate func(*PipelineOptions)) *Pipeli
 	return pipe
 }
 
-// --- вспомогательные функции форматов --------------------------------------
+// --- format helpers ---------------------------------------------------------
 
-// TestArchiveKindOf — определение формата по расширению (T-133): регистр
-// не важен, .tar.gz раньше .gz, неподдерживаемые — не архив.
+// TestArchiveKindOf — the format detection by extension (T-133): the
+// case does not matter, .tar.gz before .gz, unsupported ones — not an
+// archive.
 func TestArchiveKindOf(t *testing.T) {
 	tests := []struct {
 		name string
@@ -208,8 +213,9 @@ func TestArchiveKindOf(t *testing.T) {
 	}
 }
 
-// TestGzMemberName — имя единственного члена .gz: архив без расширения
-// (T-133), регистр расширения не важен.
+// TestGzMemberName — the name of the single member of a .gz: the
+// archive without the extension (T-133), the extension case does not
+// matter.
 func TestGzMemberName(t *testing.T) {
 	for in, want := range map[string]string{
 		"com/add/zone.gz": "zone",
@@ -222,8 +228,8 @@ func TestGzMemberName(t *testing.T) {
 	}
 }
 
-// TestJunkMember — записи архива без списков доменов (T-133): скрытые
-// файлы и деревья, мусор macOS; обычные пути — члены.
+// TestJunkMember — archive entries without domain lists (T-133): hidden
+// files and trees, macOS junk; ordinary paths — members.
 func TestJunkMember(t *testing.T) {
 	for _, name := range []string{
 		".DS_Store", "._one.txt", ".hidden", ".hidden/x.txt", "a/.b/c.txt",
@@ -242,21 +248,22 @@ func TestJunkMember(t *testing.T) {
 	}
 }
 
-// --- сценарии ---------------------------------------------------------------
+// --- scenarios --------------------------------------------------------------
 
-// TestPipelineArchiveZip — удачный zip (T-133): члены читаются потоково
-// и проходят прежний конвейер; зона — из каталога архива, внутренние
-// пути членов (подкаталоги, «чужой» ru/) на зону не влияют; каталоги,
-// скрытые файлы и мусор macOS пропускаются с Warn; единица учёта —
-// архив: одна строка ingest_files с суммами по членам, rejected-лог
-// адресует «архив!член:строка».
+// TestPipelineArchiveZip — a good zip (T-133): the members are read
+// as a stream and go through the same pipeline; the zone — from the
+// archive directory, the members' internal paths (subdirectories, the
+// "foreign" ru/) do not affect the zone; directories, hidden files and
+// macOS junk are skipped with a Warn; the accounting unit — the archive:
+// one ingest_files row with the sums over the members, the rejected log
+// addresses "archive!member:line".
 func TestPipelineArchiveZip(t *testing.T) {
 	pt := newPipeTest(t)
 	entries := []archEntry{
-		{"sub/one.txt", "a.com\nb.com\n"},        // вложенный путь — зона не из него
-		{"ru/two.txt", "# комментарий\nc.com\n"}, // «чужой» каталог — зона всё равно com
-		{"three.txt", "\nd.com\na.com\n"},        // дубль строки, пустая строка
-		// Мусор: каталоги, скрытые файлы, мусор macOS — пропускаются.
+		{"sub/one.txt", "a.com\nb.com\n"},        // a nested path — the zone is not from it
+		{"ru/two.txt", "# комментарий\nc.com\n"}, // a "foreign" directory — the zone is com anyway
+		{"three.txt", "\nd.com\na.com\n"},        // a duplicate row, an empty row
+		// Junk: directories, hidden files, macOS junk — skipped.
 		{"data/", ""},
 		{"__MACOSX/three.txt", "junk"},
 		{"._one.txt", "junk"},
@@ -271,7 +278,7 @@ func TestPipelineArchiveZip(t *testing.T) {
 	}
 	sha := sha256.Sum256(raw)
 
-	pt.pool.execs = addExecs(pt.pool, 4, 0) // метки a, b, c, d (дубль a.com — одна)
+	pt.pool.execs = addExecs(pt.pool, 4, 0) // the labels a, b, c, d (a duplicate a.com — one)
 	pt.pool.uniques = 4
 
 	var logBuf bytes.Buffer
@@ -291,8 +298,8 @@ func TestPipelineArchiveZip(t *testing.T) {
 	if rep.Zone != "com" || rep.ZoneID != 1 || rep.Action != model.ActionAdd {
 		t.Errorf("отчёт = %+v, want зона com (id 1), действие add", rep)
 	}
-	// 7 физических строк (2+2+3), 2 пропущено (комментарий, пустая),
-	// 5 валидных, 0 отклонённых: путь члена ru/ на зону не повлиял.
+	// 7 physical rows (2+2+3), 2 skipped (a comment, an empty one),
+	// 5 valid, 0 rejected: the member path ru/ did not affect the zone.
 	if rep.LinesTotal != 7 || rep.Skipped != 2 || rep.Accepted != 5 || rep.Rejected != 0 {
 		t.Errorf("счётчики строк = %+v, want 7/2/5/0", rep)
 	}
@@ -316,7 +323,7 @@ func TestPipelineArchiveZip(t *testing.T) {
 
 	want := []string{
 		"exec:" + clearStageSQL,
-		"copy:5", // строки всех членов — одна партия
+		"copy:5", // the rows of all the members — one batch
 		"begin",
 		"query:" + addChunkBoundSQL,
 		"query:" + insertAddSQL,
@@ -335,7 +342,8 @@ func TestPipelineArchiveZip(t *testing.T) {
 		t.Error("архив должен уйти в processed/com/add/zone.zip")
 	}
 
-	// Мусор пропущен с Warn (ТЗ 5.1: наблюдаемая часть поведения).
+	// The junk is skipped with a Warn (spec 5.1: the observable part of
+	// the behavior).
 	log := logBuf.String()
 	for _, frag := range []string{
 		"запись архива пропущена (каталог)",
@@ -352,9 +360,9 @@ func TestPipelineArchiveZip(t *testing.T) {
 	}
 }
 
-// TestPipelineArchiveTarGzTgz — tar и gzip-обёрнутые tar (T-133):
-// двойное открытие (gzip поверх tar) имена .tar.gz/.tgz; члены проходят
-// тот же конвейер, каталоги пропускаются.
+// TestPipelineArchiveTarGzTgz — tar and gzip-wrapped tars (T-133):
+// the double opening (gzip over tar) for the .tar.gz/.tgz names; the
+// members go through the same pipeline, directories are skipped.
 func TestPipelineArchiveTarGzTgz(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -398,14 +406,15 @@ func TestPipelineArchiveTarGzTgz(t *testing.T) {
 	}
 }
 
-// TestPipelineArchiveGz — одиночный .gz (T-133): единственный член с
-// именем архива без расширения; rejected-лог адресует «архив!член:строка»;
-// единичный мусор внутри члена архив не роняет (порог как у txt).
+// TestPipelineArchiveGz — a single .gz (T-133): the only member named
+// as the archive without the extension; the rejected log addresses
+// "archive!member:line"; isolated junk inside a member does not sink the
+// archive (the threshold as for txt).
 func TestPipelineArchiveGz(t *testing.T) {
 	pt := newPipeTest(t)
 	var b strings.Builder
 	b.WriteString("a.com\n")
-	b.WriteString("%%%%\n") // мусор: 1 из 13 < порога 0.1
+	b.WriteString("%%%%\n") // junk: 1 of 13 < the 0.1 threshold
 	for _, d := range []string{"b.com", "c.com", "d.com", "e.com", "f.com", "g.com", "h.com", "i.com", "j.com", "k.com", "l.com"} {
 		b.WriteString(d + "\n")
 	}
@@ -445,7 +454,8 @@ func TestPipelineArchiveGz(t *testing.T) {
 	if rep.Added != 12 {
 		t.Errorf("added = %d, want 12", rep.Added)
 	}
-	// Адресация отклонения — «архив!член»: член — имя без расширения.
+	// The rejection's addressing — "archive!member": the member is the
+	// name without the extension.
 	logged := rejBuf.String()
 	for _, want := range []string{
 		"file=com/add/list.gz!list",
@@ -460,16 +470,17 @@ func TestPipelineArchiveGz(t *testing.T) {
 	}
 }
 
-// TestPipelineArchiveDelete — архив в delete/ (T-133): действие — из
-// каталога архива, применение delete по строкам членов.
+// TestPipelineArchiveDelete — an archive in delete/ (T-133): the action
+// comes from the archive directory, the delete application over the
+// members' rows.
 func TestPipelineArchiveDelete(t *testing.T) {
 	pt := newPipeTest(t)
 	abs := filepath.Join(pt.dir, "net", "delete", "x.tar")
 	buildTar(t, abs, false, archEntry{"list", "a.net\n"})
 
 	pt.pool.execs = []pipeExec{
-		{tag: pgconn.NewCommandTag("DELETE 0")}, // очистка перед загрузкой
-		{tag: pgconn.NewCommandTag("DELETE 1")}, // очистка после применения
+		{tag: pgconn.NewCommandTag("DELETE 0")}, // the cleanup before loading
+		{tag: pgconn.NewCommandTag("DELETE 1")}, // the cleanup after the application
 	}
 	pt.pool.delDeleted = 1
 
@@ -488,9 +499,10 @@ func TestPipelineArchiveDelete(t *testing.T) {
 	}
 }
 
-// TestPipelineArchiveMemberErrorRatio — член выше ingest.max_error_ratio
-// (T-133): архив ошибочен целиком — применение не выполняется, партия
-// отброшена, failed/ с лог-отчётом; причина адресует член.
+// TestPipelineArchiveMemberErrorRatio — a member over
+// ingest.max_error_ratio (T-133): the archive is bad as a whole — no
+// application runs, the batch is discarded, failed/ with a log report;
+// the reason addresses the member.
 func TestPipelineArchiveMemberErrorRatio(t *testing.T) {
 	pt := newPipeTest(t)
 	entries := []archEntry{
@@ -517,7 +529,8 @@ func TestPipelineArchiveMemberErrorRatio(t *testing.T) {
 	if len(pt.files.records) != 0 {
 		t.Error("отчёт ошибочного архива не пишется в журнал")
 	}
-	// Загрузка была (хэш известен после чтения), применение — нет.
+	// The loading happened (the hash is known after reading), the
+	// application — no.
 	want := []string{
 		"exec:" + clearStageSQL,
 		"copy:2",
@@ -543,8 +556,8 @@ func TestPipelineArchiveMemberErrorRatio(t *testing.T) {
 	}
 }
 
-// TestPipelineArchiveBroken — битый архив (T-133): не читается или
-// повреждён — целиком в failed/ с лог-отчётом, журнал не пишется.
+// TestPipelineArchiveBroken — a corrupt archive (T-133): unreadable or
+// damaged — entirely into failed/ with a log report, no journal record.
 func TestPipelineArchiveBroken(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -597,8 +610,9 @@ func TestPipelineArchiveBroken(t *testing.T) {
 			name: "битый CRC tar.gz",
 			rel:  "com/add/badcrc.tar.gz",
 			content: func(t *testing.T, path string) {
-				// Данные целы, испорчен CRC32 в трейлере gzip: без дочитки
-				// потока после tar-EOF ошибка незамечена (ревью T-133, R4).
+				// The data is intact, the CRC32 in the gzip trailer is
+				// corrupted: without draining the stream after the tar EOF
+				// the error goes unnoticed (the T-133 review, R4).
 				full := tarBytes(t, true, archEntry{"list", "a.com\nb.com\n"})
 				full[len(full)-8] ^= 0xff
 				if err := os.WriteFile(path, full, 0o644); err != nil {
@@ -640,9 +654,10 @@ func TestPipelineArchiveBroken(t *testing.T) {
 	}
 }
 
-// TestPipelineArchiveLimits — лимиты защиты от zip-бомб (T-133): число
-// записей и несжатый объём; для zip объём проверяется до чтения по
-// заголовку, для tar/gz — счётчиком по потоку; превышение — failed.
+// TestPipelineArchiveLimits — the zip-bomb protection limits (T-133):
+// the number of entries and the uncompressed size; for zip the size is
+// checked before reading by the header, for tar/gz — by a counter over
+// the stream; exceeding — failed.
 func TestPipelineArchiveLimits(t *testing.T) {
 	t.Run("zip записей больше archive_max_files", func(t *testing.T) {
 		pt := newPipeTest(t)
@@ -664,8 +679,9 @@ func TestPipelineArchiveLimits(t *testing.T) {
 		if out.Err == nil || !strings.Contains(out.Err.Error(), "ingest.archive_max_files (2)") {
 			t.Errorf("причина = %v, want превышение archive_max_files", out.Err)
 		}
-		// Проверка по центральному каталогу — до загрузки: обращение к
-		// staging только очистка отброшенной партии, применения нет.
+		// The check over the central directory — before loading: the only
+		// staging access is the cleanup of the discarded batch, no
+		// application.
 		if got := strings.Join(pt.pool.ops, "\n"); got != "exec:"+clearStageSQL {
 			t.Errorf("обращения = %s, want одна очистка партии", got)
 		}
@@ -697,7 +713,7 @@ func TestPipelineArchiveLimits(t *testing.T) {
 	t.Run("zip объём по заголовку до чтения", func(t *testing.T) {
 		pt := newPipeTest(t)
 		abs := filepath.Join(pt.dir, "com", "add", "big.zip")
-		buildZip(t, abs, archEntry{"big.txt", strings.Repeat("a.com\n", 20)}) // 120 байт
+		buildZip(t, abs, archEntry{"big.txt", strings.Repeat("a.com\n", 20)}) // 120 bytes
 		pipe := pt.newPipe(t, func(o *PipelineOptions) { o.ArchiveMaxUncompressed = 64 })
 
 		out, err := pipe.Process(context.Background(), abs)
@@ -711,8 +727,9 @@ func TestPipelineArchiveLimits(t *testing.T) {
 			!strings.Contains(out.Err.Error(), "big.txt") {
 			t.Errorf("причина = %v, want превышение несжатого объёма члена big.txt", out.Err)
 		}
-		// Заголовок проверен до чтения члена: строк в staging нет —
-		// очистка партии загрузкой и отбрасывание, COPY не было.
+		// The header is checked before reading the member: no rows in
+		// staging — the batch cleanup by the loading and the discard, no
+		// COPY.
 		if got := strings.Join(pt.pool.ops, "\n"); got != "exec:"+clearStageSQL+"\nexec:"+clearStageSQL {
 			t.Errorf("обращения = %s, want две очистки партии без COPY", got)
 		}
@@ -721,7 +738,7 @@ func TestPipelineArchiveLimits(t *testing.T) {
 	t.Run("tar.gz объём счётчиком по потоку", func(t *testing.T) {
 		pt := newPipeTest(t)
 		abs := filepath.Join(pt.dir, "com", "add", "stream.tar.gz")
-		buildTar(t, abs, true, archEntry{"list", strings.Repeat("a.com\n", 60)}) // 360 байт
+		buildTar(t, abs, true, archEntry{"list", strings.Repeat("a.com\n", 60)}) // 360 bytes
 		pipe := pt.newPipe(t, func(o *PipelineOptions) { o.ArchiveMaxUncompressed = 100 })
 
 		out, err := pipe.Process(context.Background(), abs)
@@ -741,9 +758,9 @@ func TestPipelineArchiveLimits(t *testing.T) {
 
 	t.Run("лимит записей считает каталоги", func(t *testing.T) {
 		pt := newPipeTest(t)
-		// Бомба метаданными: tar.gz из тысяч пустых каталогов сжимается на
-		// порядки — записи-каталоги обязаны считаться лимитом (как у zip
-		// по центральному каталогу).
+		// A metadata bomb: a tar.gz of thousands of empty directories
+		// compresses by orders of magnitude — directory entries must
+		// count against the limit (like zip over the central directory).
 		entries := make([]archEntry, 0, 2001)
 		for i := 0; i < 2000; i++ {
 			entries = append(entries, archEntry{name: fmt.Sprintf("d%04d/", i)})
@@ -752,7 +769,7 @@ func TestPipelineArchiveLimits(t *testing.T) {
 		abs := filepath.Join(pt.dir, "com", "add", "bomb.tar.gz")
 		buildTar(t, abs, true, entries...)
 
-		out, err := pt.pipe.Process(context.Background(), abs) // дефолт archive_max_files = 1000
+		out, err := pt.pipe.Process(context.Background(), abs) // the default archive_max_files = 1000
 		if err != nil {
 			t.Fatalf("Process: %v", err)
 		}
@@ -774,10 +791,10 @@ func TestPipelineArchiveLimits(t *testing.T) {
 			entries = append(entries, archEntry{name: fmt.Sprintf("d%04d/", i)})
 		}
 		abs := filepath.Join(pt.dir, "com", "add", "bomb.tar.gz")
-		buildTar(t, abs, true, entries...) // несжатый поток ≈ 3000×512 ≈ 1,5 МБ
+		buildTar(t, abs, true, entries...) // the uncompressed stream ≈ 3000×512 ≈ 1.5 MB
 
 		pipe := pt.newPipe(t, func(o *PipelineOptions) {
-			o.ArchiveMaxFiles = 100000 // записи не лимитируют
+			o.ArchiveMaxFiles = 100000 // the entries do not limit
 			o.ArchiveMaxUncompressed = 4096
 		})
 		out, err := pipe.Process(context.Background(), abs)
@@ -793,11 +810,12 @@ func TestPipelineArchiveLimits(t *testing.T) {
 	})
 }
 
-// TestPipelineArchiveDuplicate — повторная подача того же архива (T-133,
-// ТЗ 5.1): та же тройка (зона, действие, sha256) уже в журнале — дубль,
-// не применяется, отчёт не дублируется, файл уходит в processed/.
-// Журнал для второй обработки засеян записью первой (контракт фейка:
-// RecordFile не регистрирует содержимое для FilesBySHA256).
+// TestPipelineArchiveDuplicate — re-submitting the same archive (T-133,
+// spec 5.1): the same triple (zone, action, sha256) is already in the
+// journal — a duplicate, not applied, the report is not duplicated, the
+// file goes to processed/. The journal for the second processing is
+// seeded with the first one's record (the fake's contract: RecordFile
+// does not register the content for FilesBySHA256).
 func TestPipelineArchiveDuplicate(t *testing.T) {
 	pt := newPipeTest(t)
 	abs := filepath.Join(pt.dir, "com", "add", "zone.zip")
@@ -819,8 +837,8 @@ func TestPipelineArchiveDuplicate(t *testing.T) {
 		t.Fatalf("журнал = %x, want sha256 архива %x", pt.files.records[0].SHA256, sha)
 	}
 
-	// Повторная доставка того же содержимого (файл вернулся в incoming;
-	// запись первой обработки уже в журнале).
+	// A repeated delivery of the same content (the file came back to
+	// incoming; the first processing's record is already in the journal).
 	zone, action := int16(1), model.ActionAdd
 	path := "com/add/zone.zip"
 	processed := pt.now
@@ -842,7 +860,8 @@ func TestPipelineArchiveDuplicate(t *testing.T) {
 	if len(pt.files.records) != 0 {
 		t.Errorf("записей в журнале = %d, want 0 (дубль не дублирует отчёт)", len(pt.files.records))
 	}
-	// Загрузка была (хэш известен после чтения), применение — нет.
+	// The loading happened (the hash is known after reading), the
+	// application — no.
 	want := []string{
 		"exec:" + clearStageSQL,
 		"copy:2",
@@ -852,17 +871,19 @@ func TestPipelineArchiveDuplicate(t *testing.T) {
 	if strings.Join(tail, "\n") != strings.Join(want, "\n") {
 		t.Errorf("обращения повторной обработки = %v, want очистка → COPY → отбрасывание", pt.pool.ops)
 	}
-	// Обе копии — в архиве processed/ (коллизия имён — суффикс -2).
+	// Both copies — in the processed/ archive (a name collision — the -2
+	// suffix).
 	if !exists(t, filepath.Join(pt.dir, DirProcessed, "com/add/zone.zip")) ||
 		!exists(t, filepath.Join(pt.dir, DirProcessed, "com/add/zone-2.zip")) {
 		t.Error("обе доставки должны лежать в processed/ (вторая — с суффиксом)")
 	}
 }
 
-// TestPipelineArchiveEmpty — пустой архив (T-133): ошибочным не считается
-// (как пустой txt-файл, T-016) — применяется пустой партией с отчётом.
-// Пустой tar — корректный контейнер без записей; пустые zip/tar читаются,
-// пустой .gz — битый (нет заголовка, TestPipelineArchiveBroken).
+// TestPipelineArchiveEmpty — an empty archive (T-133): not counted as
+// bad (like an empty txt file, T-016) — applied with an empty batch and
+// a report. An empty tar is a valid container without entries; empty
+// zip/tar are read, an empty .gz is corrupt (no header,
+// TestPipelineArchiveBroken).
 func TestPipelineArchiveEmpty(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -893,9 +914,9 @@ func TestPipelineArchiveEmpty(t *testing.T) {
 			if len(pt.files.records) != 1 {
 				t.Error("отчёт пустого архива должен записаться в журнал")
 			}
-			// COPY с пустой пачкой не выполняется (db.CopyFrom: пустая
-			// пачка — no-op); применение пустой партии — граница и подсчёт
-			// без вставки и дельт зон (T-205).
+			// COPY with an empty chunk does not run (db.CopyFrom: an empty
+			// chunk is a no-op); applying an empty batch — the bound and
+			// the count without an insert and zone deltas (T-205).
 			want := []string{
 				"exec:" + clearStageSQL,
 				"begin",
@@ -912,14 +933,16 @@ func TestPipelineArchiveEmpty(t *testing.T) {
 	}
 }
 
-// TestPipelineArchivePaddedTarSHA — sha256 .tar с GNU-паддингом (T-133):
-// tar.Reader останавливается на EOF-блоках, не дочитывая хвост, — конвейер
-// дочитывает поток, и хэш равен sha256 файла целиком (контракт
-// ingest_files.sha256, сверяемый оператором sha256sum).
+// TestPipelineArchivePaddedTarSHA — the sha256 of a .tar with GNU
+// padding (T-133): tar.Reader stops at the EOF blocks without reading
+// the tail — the pipeline drains the stream, and the hash equals the
+// sha256 of the whole file (the ingest_files.sha256 contract, checked
+// by the operator with sha256sum).
 func TestPipelineArchivePaddedTarSHA(t *testing.T) {
 	pt := newPipeTest(t)
 	raw := tarBytes(t, false, archEntry{"list", "a.com\nb.com\n"})
-	// GNU tar дополняет архив нулями до record size (блок 10 КиБ).
+	// GNU tar pads the archive with zeros up to the record size (a 10
+	// KiB block).
 	if r := len(raw) % 10240; r != 0 {
 		raw = append(raw, make([]byte, 10240-r)...)
 	}
@@ -947,8 +970,9 @@ func TestPipelineArchivePaddedTarSHA(t *testing.T) {
 	}
 }
 
-// TestPipelineArchiveNestedNotUnpacked — вложенный архив не распаковывается
-// (T-133): член-архив — бинарный мусор, доля ошибок роняет архив целиком.
+// TestPipelineArchiveNestedNotUnpacked — a nested archive is not
+// unpacked (T-133): an archive member is binary junk, the error share
+// sinks the archive as a whole.
 func TestPipelineArchiveNestedNotUnpacked(t *testing.T) {
 	pt := newPipeTest(t)
 	inner := zipBytes(t, archEntry{"deep.txt", "a.com\n"})
@@ -966,7 +990,7 @@ func TestPipelineArchiveNestedNotUnpacked(t *testing.T) {
 		!strings.Contains(out.Err.Error(), "ingest.max_error_ratio") {
 		t.Errorf("причина = %v, want доля отказов члена inner.zip", out.Err)
 	}
-	if out.Report.Accepted != 0 { // домены внутреннего архива не применились
+	if out.Report.Accepted != 0 { // the inner archive's domains were not applied
 		t.Errorf("accepted = %d, want 0 (вложенный архив — мусор, не список)", out.Report.Accepted)
 	}
 	if !exists(t, filepath.Join(pt.dir, DirFailed, "com/add/outer.zip")) {
@@ -974,9 +998,9 @@ func TestPipelineArchiveNestedNotUnpacked(t *testing.T) {
 	}
 }
 
-// TestPipelineArchiveStageError — сбой COPY (T-133): инфраструктурный
-// сбой — архив остаётся в incoming (at-least-once, ТЗ 3.4), партия
-// отброшена.
+// TestPipelineArchiveStageError — a COPY failure (T-133): an
+// infrastructure failure — the archive stays in incoming
+// (at-least-once, spec 3.4), the batch is discarded.
 func TestPipelineArchiveStageError(t *testing.T) {
 	pt := newPipeTest(t)
 	abs := filepath.Join(pt.dir, "com", "add", "zone.zip")

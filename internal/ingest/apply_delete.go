@@ -1,13 +1,14 @@
-// Применение delete (T-019, ТЗ 5.1): партия staging со строками
-// action=delete переводит статус подходящих доменов в deleted. Домен
-// остаётся в БД (ТЗ 13.1: «удалённый домен остаётся в БД со статусом
-// deleted; результаты и контент удаляются фоновой задачей») — их чистит
-// фоновая задача T-020. Вместе со статусом снимается бит render_pending
-// (T-186): удаляемый домен покидает цикл проверок, проход доработки
-// рендера его больше не выберет — бит снимается парой с декрементом
-// счётчика рендер-долга двумя операторами одной транзакции применения
-// (applyDeleteSQL + applyClearRenderSQL, T-269: дельта — по факту
-// перехода, не по снимку).
+// Applying delete (T-019, spec 5.1): a staging batch with action=delete
+// rows moves the status of the matching domains to deleted. The domain
+// stays in the DB (spec 13.1: "a deleted domain stays in the DB with the
+// deleted status; the results and content are removed by a background
+// task") — the T-020 background task cleans them. Together with the
+// status the render_pending bit is cleared (T-186): the deleted domain
+// leaves the check cycle, the render rework pass will not select it
+// anymore — the bit is cleared in a pair with a decrement of the render
+// debt counter by two statements of one application transaction
+// (applyDeleteSQL + applyClearRenderSQL, T-269: the delta — by the fact
+// of the transition, not by a snapshot).
 package ingest
 
 import (
@@ -20,71 +21,78 @@ import (
 	"crawler/internal/model"
 )
 
-// applyDeleteSQL — применение delete: первый оператор транзакции
-// ApplyDelete (ТЗ 5.1). В терминах автомата check_state — строка Р14
-// спецификации (единая точка правды: internal/scheduler/checkstate.go,
-// T-255): статус-переход в deleted, check_state НЕ меняется — строка
-// выпадает из всех проходов охранными предикатами status <> deleted.
-// Бит render_pending и счётчик рендер-долга этот оператор НЕ трогает
-// (T-269, ранее — CASE в moved и CTE rd): пару «бит × счётчик» закрывает
-// второй оператор applyClearRenderSQL той же транзакции — см. его
-// комментарий (инцидент 08.11.2026: декремент по снимку had_render
-// применялся ВТОРОЙ раз поверх конкурентного снятия проходом доработки,
-// −36 за один проход). Детали оператора:
+// applyDeleteSQL — applying delete: the first statement of the
+// ApplyDelete transaction (spec 5.1). In the check_state FSM terms — the
+// R14 row of the spec (the single source of truth:
+// internal/scheduler/checkstate.go, T-255): a status transition to
+// deleted, check_state is NOT changed — the row drops out of all passes
+// via the status <> deleted guard predicates. The render_pending bit and
+// the render debt counter are NOT touched by this statement (T-269,
+// previously a CASE in moved and a CTE rd): the "bit × counter" pair is
+// handled by the second statement applyClearRenderSQL of the same
+// transaction — see its comment (the 2026-11-08 incident: a decrement by
+// the had_render snapshot was applied a SECOND time on top of the
+// concurrent clearing by the rework pass, −36 in one pass). The
+// statement details:
 //
-//   - CTE pre — снимок кандидатов перевода ДО изменения (тот же снимок
-//     оператора, что и у moved): staging×domains по ключу (zone_id,
-//     label) с фильтрами партии и охраной «ещё не deleted» (T-178).
-//     MATERIALIZED стабилизирует множество кандидатов от инлайна
-//     (форма плана, замер T-178 на живой БД), цена — пачка размера
-//     файла; старое значение бита render_pending здесь больше не
-//     нужно — снятие бита ушло в applyClearRenderSQL с охраной по
-//     текущей версии строки;
-//   - CTE moved — перенос статуса: UPDATE domains SET status = deleted
-//     для доменов партии — соединение с pre по уникальному ключу
-//     (zone_id, label); flags НЕ трогает. Охраны по текущему статусу
-//     до T-178 не было: повторное применение переводило уже удалённый
-//     в тот же deleted (идемпотентность at-least-once, ТЗ 3.4) — отчёт
-//     считал строку «удалённой». Охрана d.status <> deleted теперь
-//     нужна для дельт счётчиков зон (T-178, ТЗИ §6.2): повторное
-//     применение не должно декрементировать счётчики за уже удалённый
-//     домен; отчёт это сохраняет — см. внешний SELECT. Охрана
-//     повторена в moved (не только в pre): при конкуренции за строку
-//     (второй delete-файл по тому же домену) повторная проверка
-//     условия после ожидания блокировки отсекает уже переведённую
-//     строку от дельт. RETURNING несёт had_render — бит render_pending
-//     версии строки, С КОТОРОЙ работает обновление: для нетронутых
-//     конкурентами строк это снимок оператора, для перезахваченных
-//     после ожидания блокировки (EvalPlanQual) — ТЕКУЩАЯ зафиксированная
-//     версия. Колонки вне SET RETURNING отдаёт по версии-основанию —
-//     это и есть «бит на момент перевода», тот факт перехода, по
-//     которому второй оператор ведёт счётчик (PG16 без RETURNING OLD
-//     не видит старых значений колонок ИЗ SET — потому бит здесь и не
-//     снимается);
-//   - CTE zc — дельты счётчиков зон по RETURNING zone_id, check_state
-//     переведённых строк (T-178): total −n и по состоянию —
-//     pending −n / queued −n / checked −n (оператор не меняет
-//     check_state — RETURNING отдаёт старое значение, ТЗИ §6.1.2);
-//     базовое множество колонок зон — status <> deleted (ТЗИ §4.1),
-//     удаляемый домен покидает все колонки;
-//   - внешний SELECT без FROM всегда возвращает одну строку: счётчики
-//     deleted (строки файла, чей домен переведён этим оператором —
-//     EXISTS по moved — ЛИБО уже был удалён до него — EXISTS по domains
-//     со старым статусом: снимок оператора не видит собственной записи
-//     moved; семантика счётчика прежняя — повторяющаяся метка в файле
-//     считает каждую свою строку, повторное применение считает свои
-//     строки удалёнными) и not_found (строки, чьего домена нет
-//     в domains), а также ключи битовых строк render_zones/render_labels
-//     — параллельные массивы (zone_id, label) переведённых строк с
-//     had_render: адресаты второго оператора. Все обращения к staging —
-//     через StageTable: единый источник таблицы с COPY и очисткой
-//     партии.
+//   - the pre CTE — a snapshot of the transition candidates BEFORE the
+//     change (the same statement snapshot as moved's): staging×domains by
+//     the (zone_id, label) key with the batch filters and the "not yet
+//     deleted" guard (T-178). MATERIALIZED stabilizes the candidate set
+//     against inlining (a plan shape, measured by T-178 on a live DB);
+//     the cost is a chunk of the file's size; the old value of the
+//     render_pending bit is no longer needed here — the bit clearing
+//     moved to applyClearRenderSQL with a guard over the current version
+//     of the row;
+//   - the moved CTE — the status move: UPDATE domains SET status =
+//     deleted for the batch's domains — a join with pre over the unique
+//     (zone_id, label) key; flags are NOT touched. There was no guard on
+//     the current status before T-178: a repeated application moved an
+//     already deleted domain to the same deleted (at-least-once
+//     idempotency, spec 3.4) — and the report counted the row as
+//     "deleted". The d.status <> deleted guard is now needed for the zone
+//     counter deltas (T-178, incremental-counters spec §6.2): a repeated
+//     application must not decrement the counters for an already deleted
+//     domain; the report keeps that — see the outer SELECT. The guard is
+//     repeated in moved (not only in pre): when competing for a row (a
+//     second delete file over the same domain), re-checking the condition
+//     after waiting for the lock cuts off the already moved row from the
+//     deltas. RETURNING carries had_render — the render_pending bit of
+//     the row version the update works WITH: for rows untouched by
+//     competitors it is the statement snapshot; for rows re-acquired
+//     after waiting for the lock (EvalPlanQual) — the CURRENT committed
+//     version. Columns outside SET are returned by RETURNING at the base
+//     version — that is exactly "the bit at the moment of the
+//     transition", the fact of the transition the second statement keeps
+//     the counter by (PG16 without RETURNING OLD cannot see the old
+//     values of the columns FROM SET — hence the bit is not cleared
+//     here);
+//   - the zc CTE — the zone counter deltas over the RETURNING zone_id,
+//     check_state of the moved rows (T-178): total −n and, by the state —
+//     pending −n / queued −n / checked −n (the statement does not change
+//     check_state — RETURNING yields the old value, incremental-counters
+//     spec §6.1.2); the base set of the zone columns is status <>
+//     deleted (incremental-counters spec §4.1), the deleted domain leaves
+//     all the columns;
+//   - the outer SELECT without FROM always returns one row: the deleted
+//     counters (the file rows whose domain was moved by this statement —
+//     EXISTS over moved — OR was already deleted before it — EXISTS over
+//     domains with the old status: the statement snapshot does not see
+//     its own moved record; the counter semantics are the same as before
+//     — a repeated label in the file counts each of its rows, a repeated
+//     application counts its own rows as deleted) and not_found (the
+//     rows whose domain is not in domains), plus the bit row keys
+//     render_zones/render_labels — parallel arrays of the (zone_id,
+//     label) of the moved rows with had_render: the targets of the second
+//     statement. All the staging accesses go through StageTable: the
+//     single source of the table for COPY and the batch cleanup.
 //
-// Оба множества (staging и domains) уже находятся в БД, поэтому один
-// set-based оператор вместо db.Update с unnest-массивами: ничего не
-// возится через приложение, память не зависит от размера файла (ТЗ 3.5,
-// битовые массивы — только флаговые строки перевода, обычно малы), а
-// счётчики считаются тем же оператором и не расходятся с применением.
+// Both sets (staging and domains) are already in the DB, hence one
+// set-based statement instead of a db.Update with unnest arrays: nothing
+// is carried through the application, memory does not depend on the file
+// size (spec 3.5; the bit arrays are only the flag rows of the
+// transition, usually small), and the counters are computed by the same
+// statement and do not diverge from the application.
 var applyDeleteSQL = `WITH pre AS MATERIALIZED (
 	SELECT d.zone_id, d.label
 	FROM ` + StageTable.Sanitize() + ` AS s
@@ -129,47 +137,51 @@ SELECT
 	(SELECT coalesce(array_agg(m.zone_id ORDER BY m.zone_id, m.label), '{}'::int2[]) FROM moved AS m WHERE m.had_render) AS render_zones,
 	(SELECT coalesce(array_agg(m.label ORDER BY m.zone_id, m.label), '{}'::text[]) FROM moved AS m WHERE m.had_render) AS render_labels`
 
-// applyClearRenderSQL — второй оператор транзакции ApplyDelete: пара
-// «снятие бита render_pending × декремент счётчика рендер-долга» (T-186
-// владеет переходом, T-269 — форма; переход Д6 спецификации автомата
-// бита × счётчика — internal/httpworker/renderq.go у renderSetPendingSQL,
-// T-258). Удаляемый домен покидает цикл проверок (§13.1), проход
-// доработки рендера его больше не выбирает (renderq исключает deleted),
-// а бит без владельца держал бы счётчик рендер-долга навсегда — guard
-// T-181 не спал и гонял порожний seq scan каждый тик.
+// applyClearRenderSQL — the second statement of the ApplyDelete
+// transaction: the pair "clearing the render_pending bit × decrementing
+// the render debt counter" (T-186 owns the transition, T-269 — the
+// shape; the D6 transition of the bit × counter FSM spec —
+// internal/httpworker/renderq.go at renderSetPendingSQL, T-258). The
+// deleted domain leaves the check cycle (§13.1), the render rework pass
+// will not select it anymore (renderq excludes deleted), and an
+// ownerless bit would hold the render debt counter forever — the T-181
+// guard would not sleep and would run an empty seq scan every tick.
 //
-// Ключи — параллельные массивы applyDeleteSQL (render_zones/render_labels:
-// переведённые строки, чей бит стоял на момент перевода), снятие — по
-// ОХРАНЕ бита текущей версии строки `(flags & render_pending) <> 0`, дельта
-// счётчика — по ФАКТУ снятых строк (count из RETURNING): ровно семантика
-// пары runbooks §6 и операторов httpworker (И1 автомата: RowsAffected 0 —
-// перехода не было, счётчик не трогается). Охрана закрывает окно
-// «снимок → блокировка», на котором ломался единый оператор T-186
-// (инцидент 08.11.2026, prod-reports/2026-11-08-010800.md): декремент
-// тогда считался по СНАПШОЧНОМУ had_render из pre, а CASE снятия бита
-// читал ТЕКУЩУЮ версию — проход доработки, снявший биты между снимком и
-// блокировкой, уже вёл −1 каждый, rd добавлял второе −n по снимку: −36 за
-// один проход при единственном наборе снятий −18, счётчик −18 при нулевом
-// бите. Теперь: если конкурент (проход доработки, второй экземпляр
-// применения) снял бит раньше — охрана даёт 0 строк, счётчик не трогается
-// (переход уже учтён конкурентом, Д7); если бит стоит — снятие и −1
-// выполняются здесь одной транзакцией применения. Идемпотентность
-// повторного применения партии (ТЗ 3.4) сохранена: переведённых строк нет
-// — массивы пусты, оператор не выполняется вовсе (Go-сторона), повторных
-// дельт нет.
+// The keys are the parallel arrays of applyDeleteSQL
+// (render_zones/render_labels: the moved rows whose bit was set at the
+// moment of the transition); the clearing goes by the GUARD of the bit
+// of the row's current version `(flags & render_pending) <> 0`, the
+// counter delta — by the FACT of the cleared rows (the count from
+// RETURNING): exactly the semantics of the runbooks §6 pair and the
+// httpworker statements (I1 of the FSM: RowsAffected 0 — no transition,
+// the counter is not touched). The guard closes the "snapshot → lock"
+// window that broke the single statement of T-186 (the 2026-11-08
+// computed by the SNAPSHOT had_render from pre, while the bit-clearing
+// CASE read the CURRENT version — the rework pass that cleared the bits
+// between the snapshot and the lock had already contributed a −1 each,
+// and rd added a second −n by the snapshot: −36 in one pass with a
+// single set of clearings of −18, the counter at −18 with a zero bit.
+// Now: if a competitor (the rework pass, a second application instance)
+// cleared the bit earlier — the guard yields 0 rows, the counter is not
+// touched (the transition is already accounted for by the competitor,
+// D7); if the bit is set — the clearing and the −1 happen here in one
+// application transaction. The idempotency of re-applying the batch
+// (spec 3.4) is preserved: no moved rows — the arrays are empty, the
+// statement does not run at all (the Go side), no repeated deltas.
 //
-// Порядок блокировок «domains → zones → счётчик» инварианта
-// docs/schema.md сохранён: cleared пере захватывает ТОЛЬКО строки,
-// уже заблокированные moved этой же транзакции (массивы — подмножество
-// переведённых), новых рёбер «zones → domains» нет; строка счётчика —
-// последней, как у всех писателей переходов. Условие
-// `(SELECT count(*) FROM cleared) > 0` не трогает строку счётчика
-// файлами без флаговых доменов (единая точка сериализации флажащих
-// транзакций, record.go; прецедент HAVING T-186). RETURNING value —
-// контроль строки: пустой ответ = строки 'render_pending' нет (миграция
-// 000015; пропасть может только ручная правка, runbooks §6) — ошибка
-// громче молчаливого рассинхрона (философия renderBumpDebtCounter,
-// T-175). Стиль литералов — коды схемы через model.* (как applyDeleteSQL).
+// The "domains → zones → counter" lock order of the docs/schema.md
+// invariant is preserved: cleared re-locks ONLY the rows already locked
+// by moved of the same transaction (the arrays are a subset of the moved
+// rows), there are no new "zones → domains" edges; the counter row —
+// last, like with all the transition writers. The condition
+// `(SELECT count(*) FROM cleared) > 0` does not touch the counter row
+// for files without flagged domains (the single serialization point of
+// the flagging transactions, record.go; the HAVING precedent of T-186).
+// RETURNING value — a row check: an empty result = the 'render_pending'
+// row is missing (migration 000015; only a manual edit can remove it,
+// runbooks §6) — an error is louder than a silent desync (the
+// renderBumpDebtCounter philosophy, T-175). The literal style — schema
+// codes via model.* (like applyDeleteSQL).
 var applyClearRenderSQL = `WITH cleared AS (
 	UPDATE domains AS d
 	SET flags = (d.flags & ` + fmt.Sprintf("%d", int16(^int16(model.FlagRenderPending))) + `)::int2
@@ -184,39 +196,44 @@ SET value = value - (SELECT count(*) FROM cleared)
 WHERE name = 'render_pending' AND (SELECT count(*) FROM cleared) > 0
 RETURNING value`
 
-// DeleteResult — счётчики применения delete по файлу для отчёта (ТЗ 5.1:
-// «удалено»; пишет в ingest_files задача T-021). Считаются строки файла:
-// каждая строка delete-файла либо перевела свой домен в deleted, либо
-// домена в БД нет.
+// DeleteResult — the per-file delete application counters for the report
+// (spec 5.1: "deleted"; written to ingest_files by the T-021 task). File
+// rows are counted: each row of a delete file either moved its domain to
+// deleted, or the domain is not in the DB.
 type DeleteResult struct {
-	// Deleted — строки, чьи домены переведены в статус deleted. Домен,
-	// уже находившийся в deleted, тоже считается удалённым: итог строки
-	// «домен удалён» достигнут, отдельного счётчика «уже удалён» нет —
-	// ТЗ 5.1/13.1 различают только итоговый статус, а не путь к нему.
+	// Deleted — the rows whose domains were moved to the deleted status.
+	// A domain already in deleted also counts as deleted: the row's
+	// "domain deleted" outcome is achieved, there is no separate
+	// "already deleted" counter — spec 5.1/13.1 distinguish only the
+	// final status, not the path to it.
 	Deleted int64
-	// NotFound — строки, чьего домена нет в domains: удалять нечего.
+	// NotFound — the rows whose domain is not in domains: nothing to
+	// delete.
 	NotFound int64
 }
 
-// ApplyDelete применяет партию action=delete из staging (Stage, T-017):
-// переводит статус подходящих доменов в model.StatusDeleted и снимает бит
-// render_pending с декрементом счётчика рендер-долга — двумя операторами
-// ОДНОЙ транзакции (T-186 — переход, T-269 — форма пары: дельта по факту
-// перехода, а не по снимку; инцидент 08.11.2026 — комментарий
-// applyClearRenderSQL) — и возвращает счётчики строк файла (DeleteResult).
-// Домены остаются в БД (ТЗ 13.1); результаты и ссылки на контент
-// удаляются фоновой задачей (T-020).
+// ApplyDelete applies a batch of action=delete from staging (Stage,
+// T-017): moves the status of the matching domains to model.StatusDeleted
+// and clears the render_pending bit with a decrement of the render debt
+// counter — by two statements of ONE transaction (T-186 — the
+// transition, T-269 — the pair's shape: the delta by the fact of the
+// transition, not by a snapshot; the 2026-11-08 incident — the
+// applyClearRenderSQL comment) — and returns the file row counters
+// (DeleteResult). The domains stay in the DB (spec 13.1); the results
+// and content references are removed by the background task (T-020).
 //
-// Применение — транзакция applyDeleteSQL + applyClearRenderSQL: пустая
-// партия — no-op с нулевыми счётчиками; сбой любого шага откатывает
-// перевод и пару целиком — повторная доставка файла сойдётся к тому же
-// состоянию (ТЗ 3.4). После применения партия очищается из staging
-// (ClearBatch, stage.go) — staging не растёт от файла к файлу. Очистка —
-// отдельный оператор вне транзакции применения: сбой между ними безвреден
-// — повторное применение переведёт те же домены в тот же deleted
-// (no-op по состоянию, битовые массивы пусты) и доочистит партию (ТЗ
-// 3.4). При ошибке очистки счётчики возвращаются вместе с ошибкой:
-// применение уже состоялось, отчёт по нему валиден.
+// The application is the applyDeleteSQL + applyClearRenderSQL
+// transaction: an empty batch — a no-op with zero counters; a failure of
+// any step rolls back the move and the pair entirely — a repeated
+// delivery of the file converges to the same state (spec 3.4). After the
+// application the batch is cleaned from staging (ClearBatch, stage.go) —
+// staging does not grow from file to file. The cleanup is a separate
+// statement outside the application transaction: a failure between them
+// is harmless — re-applying will move the same domains to the same
+// deleted (a no-op state-wise, the bit arrays are empty) and will finish
+// cleaning the batch (spec 3.4). On a cleanup error the counters are
+// returned together with the error: the application has already
+// happened, the report on it is valid.
 func ApplyDelete(ctx context.Context, pool ApplyDB, b Batch) (DeleteResult, error) {
 	if b.ID == (BatchID{}) {
 		return DeleteResult{}, errors.New("ingest: партия без идентификатора (ingest.NewBatchID)")
@@ -229,7 +246,8 @@ func ApplyDelete(ctx context.Context, pool ApplyDB, b Batch) (DeleteResult, erro
 	if err != nil {
 		return DeleteResult{}, fmt.Errorf("ingest: применение delete по партии в %s: транзакция: %w", StageTable, err)
 	}
-	// Откат безусловно: после Commit — no-op (стиль T-044).
+	// Rollback unconditionally: after Commit it is a no-op (the T-044
+	// style).
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	res, zones, labels, err := applyDeleteCounters(ctx, tx, b)
@@ -245,18 +263,19 @@ func ApplyDelete(ctx context.Context, pool ApplyDB, b Batch) (DeleteResult, erro
 		return DeleteResult{}, fmt.Errorf("ingest: применение delete по партии в %s: фиксация: %w", StageTable, err)
 	}
 
-	// Применено — партия покидает staging: очистка после применения, а не
-	// до (иначе сбой применения терял бы строки партии до повтора).
+	// Applied — the batch leaves staging: cleanup after the application,
+	// not before (otherwise an application failure would lose the batch
+	// rows before the retry).
 	if _, err := ClearBatch(ctx, pool, b.ID); err != nil {
 		return res, err
 	}
 	return res, nil
 }
 
-// applyDeleteCounters выполняет applyDeleteSQL и разбирает строку
-// результата (одна — форма запроса без FROM): счётчики строк файла и
-// ключи битовых строк (render_zones/render_labels — параллельные массивы
-// переведённых строк с битом render_pending) для второго оператора.
+// applyDeleteCounters runs applyDeleteSQL and parses the result row (one
+// — the query has no FROM): the file row counters and the bit row keys
+// (render_zones/render_labels — parallel arrays of the moved rows with
+// the render_pending bit) for the second statement.
 func applyDeleteCounters(ctx context.Context, tx pgx.Tx, b Batch) (DeleteResult, []int16, []string, error) {
 	rows, err := tx.Query(ctx, applyDeleteSQL, b.ID[:], int16(model.StatusDeleted), int16(model.ActionDelete))
 	if err != nil {
@@ -285,11 +304,12 @@ func applyDeleteCounters(ctx context.Context, tx pgx.Tx, b Batch) (DeleteResult,
 	return res, zones, labels, nil
 }
 
-// applyDeleteClearRender выполняет applyClearRenderSQL — пару «снятие
-// бита × декремент счётчика» по ключам битовых строк перевода (T-186/
-// T-269; комментарий к SQL). Пустой ответ RETURNING — строки счётчика
-// 'render_pending' нет: молчаливый рассинхрон недопустим, ошибка громче
-// (философия renderBumpDebtCounter, runbooks §6).
+// applyDeleteClearRender runs applyClearRenderSQL — the pair "clearing
+// the bit × decrementing the counter" over the keys of the transition's
+// bit rows (T-186/T-269; the SQL comment). An empty RETURNING result —
+// the 'render_pending' counter row is missing: a silent desync is
+// unacceptable, an error is louder (the renderBumpDebtCounter
+// philosophy, runbooks §6).
 func applyDeleteClearRender(ctx context.Context, tx pgx.Tx, zones []int16, labels []string) error {
 	rows, err := tx.Query(ctx, applyClearRenderSQL, zones, labels)
 	if err != nil {

@@ -1,16 +1,16 @@
-// Применение партии add к domains (T-018, ТЗ 5.1): строки партии в
-// staging вставляются в domains пачками по ingest.batch_size (T-205)
-// через INSERT … SELECT … ON CONFLICT DO NOTHING (конфликт — уникальный
-// (zone_id, label) партиций domains); существующий домен не меняется,
-// кроме статуса deleted — такой возвращается в проверку (status → new,
-// check_state → pending, ТЗ 6.2). Пачки — курсором по PK staging
-// (batch_id, line_no), всё применение — одна транзакция: атомарность
-// эквивалентна одному оператору эпохи T-018, а время удержания
-// блокировок и запись в журнал медленных запросов ограничены пачкой
-// (боевой замер T-205: суточный NRD-файл ~470 тыс. доменов одним
-// оператором шёл 63–200 с под вечерним CPU-голодом; пачка 50 тыс. —
-// секунды). После применения партия удаляется из staging:
-// применить → очистить.
+// Applying an add batch to domains (T-018, spec 5.1): the batch rows in
+// staging are inserted into domains in chunks of ingest.batch_size (T-205)
+// via INSERT … SELECT … ON CONFLICT DO NOTHING (the conflict is the unique
+// (zone_id, label) of the domains partitions); an existing domain is not
+// changed, except for the deleted status — such a domain is returned to
+// checking (status → new, check_state → pending, spec 6.2). Chunks are
+// walked with a cursor over the staging PK (batch_id, line_no); the whole
+// application is a single transaction: atomicity is equivalent to a single
+// statement of the T-018 era, and lock hold time and slow-query log entries
+// are bounded by a chunk (production measurement T-205: a daily NRD file of
+// ~470k domains took 63–200 s as a single statement under evening CPU
+// starvation; a 50k chunk takes seconds). After the application the batch
+// is removed from staging: apply → clean.
 package ingest
 
 import (
@@ -26,101 +26,107 @@ import (
 	"crawler/internal/model"
 )
 
-// ApplyDB — пул для применения add: db.DB, из которого можно начать
-// транзакцию. Применение партии атомарно (T-205): пачки вставки, дельты
-// счётчиков зон, возврат удалённых и очистка staging — одна транзакция,
-// поэтому db.DB мало — нужен Begin; *pgxpool.Pool удовлетворяет
-// (стиль CleanupDB).
+// ApplyDB — a pool for applying add: a db.DB from which a transaction can
+// be started. Applying a batch is atomic (T-205): the insert chunks, the
+// zone counter deltas, the revive of deleted domains and the staging
+// cleanup are one transaction, so db.DB is not enough — Begin is needed;
+// *pgxpool.Pool satisfies it (CleanupDB style).
 type ApplyDB interface {
 	db.DB
 	Begin(ctx context.Context) (pgx.Tx, error)
 }
 
-// compile-time: реальный пул подходит под интерфейс.
+// compile-time: the real pool satisfies the interface.
 var _ ApplyDB = (*pgxpool.Pool)(nil)
 
-// SQL применения add. Семантические константы (коды статусов, биты flags)
-// вшиты в текст через model.*: это коды схемы, а не данные (стиль zones.go
-// с is_active = true); тест-контракт связывает литералы с константами.
+// SQL for applying add. Semantic constants (status codes, flags bits)
+// are baked into the text via model.*: these are schema codes, not data
+// (zones.go style with is_active = true); the test contract ties the
+// literals to the constants.
 var (
-	// addChunkBoundSQL — граница следующей пачки применения (T-205):
-	// line_no N-й строки партии после курсора $3 в порядке PK staging
-	// (batch_id, line_no, миграция 000004) — подзапрос режет диапазон
-	// LIMIT $4, внешний max даёт line_no последней строки пачки (порядок
-	// возрастающий). Пустой диапазон — COALESCE → 0: строк после курсора
-	// нет, партия исчерпана. Курсор двигается по диапазону staging, а не
-	// по вставленным строкам: пачка из одних конфликтов (ON CONFLICT DO
-	// NOTHING пропустил всё) всё равно закрывается границей — иначе
-	// применение партии из сплошных существующих доменов зациклилось бы.
-	// Скан только по первичному ключу: ровно пачка строк, без чтения
-	// данных таблицы.
+	// addChunkBoundSQL — the bound of the next application chunk (T-205):
+	// the line_no of the Nth batch row after cursor $3 in staging PK order
+	// (batch_id, line_no, migration 000004) — the subquery cuts the range
+	// with LIMIT $4, the outer max gives the line_no of the chunk's last
+	// row (ascending order). An empty range — COALESCE → 0: no rows after
+	// the cursor, the batch is exhausted. The cursor moves over the
+	// staging range, not over the inserted rows: an all-conflict chunk
+	// (ON CONFLICT DO NOTHING skipped everything) is still closed by the
+	// bound — otherwise applying a batch of all-existing domains would
+	// loop forever. The scan is over the primary key only: exactly a
+	// chunk of rows, with no reads of the table data.
 	addChunkBoundSQL = "SELECT COALESCE(max(t.line_no), 0) FROM (" +
 		"SELECT s.line_no FROM ingest_stage AS s " +
 		"WHERE s.batch_id = $1 AND s.action = $2 AND s.line_no > $3 " +
 		"ORDER BY s.line_no LIMIT $4) AS t"
 
-	// insertAddSQL — новые домены одной пачки партии (ТЗ 5.1; T-205):
-	// строки staging в диапазоне курсора ($3, $4] вставляются за один
-	// INSERT … SELECT, ON CONFLICT DO NOTHING пропускает существующие
-	// (в том числе повторяющиеся метки внутри одного файла, миграция
-	// 000004). Новые домены получают DEFAULT схемы: status = new,
-	// check_state = pending (ТЗ 6.2) — домен сразу в цикле проверок
-	// (переход-вставка Р10 спецификации автомата check_state —
+	// insertAddSQL — the new domains of one batch chunk (spec 5.1; T-205):
+	// the staging rows in the cursor range ($3, $4] are inserted by a
+	// single INSERT … SELECT; ON CONFLICT DO NOTHING skips the existing
+	// ones (including repeated labels within one file, migration 000004).
+	// New domains get the schema DEFAULT: status = new, check_state =
+	// pending (spec 6.2) — the domain is in the check cycle right away
+	// (the R10 insert transition of the check_state FSM spec —
 	// internal/scheduler/checkstate.go, T-255).
-	// is_idn вычисляется из метки (ТЗ 5.2 п. 9): staging флага не хранит,
-	// а метка — его единственный источник. Условие — любая метка имени
-	// начинается с xn-- (метка бывает составной, ING-P1-1): первая
-	// ('xn--%') либо после точки ('%.xn--%') — эквивалент
-	// idn.HasXNLabel, ILIKE — без учёта регистра.
+	// is_idn is computed from the label (spec 5.2 item 9): staging does
+	// not store the flag, and the label is its only source. The condition
+	// is any name label starting with xn-- (a label can be composite,
+	// ING-P1-1): the first one ('xn--%') or one after a dot ('%.xn--%') —
+	// equivalent to idn.HasXNLabel; ILIKE — case-insensitive.
 	//
-	// RETURNING zone_id вставленных строк читается потоком: счётчик
-	// Inserted и дельты счётчиков зон (ТЗИ §6.2) копятся в Go и
-	// применяются одним итоговым оператором по завершении пачек
-	// (zoneDeltaAddSQL) — память ограничена пачкой и числом зон партии,
-	// а не размером файла (ТЗ 3.5).
+	// The RETURNING zone_id of the inserted rows is read as a stream: the
+	// Inserted counter and the zone counter deltas (incremental-counters
+	// spec §6.2) accumulate in Go and are applied by a single final
+	// statement after the chunks finish (zoneDeltaAddSQL) — memory is
+	// bounded by the chunk and the batch's zone count, not the file size
+	// (spec 3.5).
 	insertAddSQL = "INSERT INTO domains (zone_id, label, flags) " +
 		"SELECT s.zone_id, s.label, CASE WHEN s.label ILIKE 'xn--%' OR s.label ILIKE '%.xn--%' THEN " + fmt.Sprint(int16(model.FlagIDN)) + " ELSE 0 END " +
 		"FROM ingest_stage AS s " +
 		"WHERE s.batch_id = $1 AND s.action = $2 AND s.line_no > $3 AND s.line_no <= $4 " +
 		"ON CONFLICT DO NOTHING RETURNING zone_id"
 
-	// zoneDeltaAddSQL — итоговые дельты счётчиков зон вставки (T-205,
-	// ТЗИ §6.2: новые домены попадают и в total, и в pending): unnest-пачка
-	// пар zone_id→n, стиль внутренних операторов пакета (internal/db,
-	// cleanup.go). Один оператор на партию вместо CTE в каждом INSERT:
-	// счётчики зон трогаются один раз за применение — точечная запись
-	// вместо шторма мелких UPDATE, атомарность общая с вставкой
-	// (транзакция ApplyAdd). В SET колонки не квалифицируются алиасом —
-	// требование PG (см. internal/db/update.go).
+	// zoneDeltaAddSQL — the final zone counter deltas of the insert
+	// (T-205, incremental-counters spec §6.2: new domains are counted in
+	// both total and pending): an unnest batch of zone_id→n pairs, the
+	// style of the package's internal statements (internal/db, cleanup.go).
+	// One statement per batch instead of a CTE in every INSERT: the zone
+	// counters are touched once per application — a point write instead
+	// of a storm of small UPDATEs, with atomicity shared with the insert
+	// (the ApplyAdd transaction). In SET the columns are not qualified
+	// with an alias — a PG requirement (see internal/db/update.go).
 	zoneDeltaAddSQL = "UPDATE zones AS z " +
 		"SET domains_total = z.domains_total + d.n, " +
 		"domains_pending = z.domains_pending + d.n " +
 		"FROM unnest($1::int2[], $2::int8[]) AS d(zone_id, n) " +
 		"WHERE z.id = d.zone_id"
 
-	// reviveAddSQL — возврат удалённых доменов партии в проверку (ТЗ 5.1:
-	// существующий домен не меняется, «кроме случая статуса deleted — он
-	// возвращается в new/pending»). Переход check_state — строка Р9
-	// спецификации автомата (единая точка правды:
-	// internal/scheduler/checkstate.go, T-255). Охрана d.status = deleted
-	// трогает только удалённые строки: остальные существующие домены
-	// партия не меняет вовсе. Один SQL вместо пакетного db.Update: ключи
-	// уже в БД,
-	// выборка меток в память и обратная пересылка противоречат потоковости
-	// (ТЗ 3.5). В SET колонки не квалифицируются алиасом — требование PG
-	// (см. internal/db/update.go). queued_at сбрасывается: у pending-домена
-	// нет действующего lease (ТЗ 5.3). flags, dns_mask, last_checked_at не
-	// трогаются: признаки метки и история прошлых проверок сохраняются —
-	// перепроверка перепишет их сама.
+	// reviveAddSQL — returning the batch's deleted domains to checking
+	// (spec 5.1: an existing domain is not changed, "except for the
+	// deleted status — it is returned to new/pending"). The check_state
+	// transition is the R9 row of the FSM spec (the single source of
+	// truth: internal/scheduler/checkstate.go, T-255). The guard
+	// d.status = deleted touches only the deleted rows: the batch does
+	// not change the other existing domains at all. One SQL instead of a
+	// batched db.Update: the keys are already in the DB,
+	// selecting the labels into memory and sending them back contradicts
+	// streaming (spec 3.5). In SET the columns are not qualified with an
+	// alias — a PG requirement (see internal/db/update.go). queued_at is
+	// reset: a pending domain has no active lease (spec 5.3). flags,
+	// dns_mask, last_checked_at are not touched: the label marks and the
+	// history of past checks are preserved — a recheck will rewrite them
+	// itself.
 	//
-	// Дельты счётчиков зон (total +n / pending +n) — CTE zc по RETURNING
-	// zone_id возвращённых строк (T-178, ТЗИ §6.2: домен был вне базового
-	// множества — счётчики его не содержали, декрементов нет).
+	// The zone counter deltas (total +n / pending +n) — the zc CTE over
+	// the RETURNING zone_id of the returned rows (T-178,
+	// incremental-counters spec §6.2: the domain was outside the base
+	// set — the counters did not include it, no decrements).
 	//
-	// T-205: возврат оставлен одним оператором на всю партию, без
-	// чанкинга — revive затрагивает только deleted-домены партии, у
-	// NRD-файлов их почти нет (день регистрации моложе любых удалений),
-	// масштаб мал и пачками не окупается.
+	// T-205: the revive is left as a single statement for the whole
+	// batch, without chunking — revive touches only the batch's deleted
+	// domains, and NRD files have almost none (a registration day is
+	// younger than any deletions); the scale is small and does not pay
+	// off in chunks.
 	reviveAddSQL = "WITH rev AS (UPDATE domains AS d " +
 		fmt.Sprintf("SET status = %d, check_state = %d, queued_at = NULL ", int16(model.StatusNew), int16(model.CheckStatePending)) +
 		"FROM ingest_stage AS s " +
@@ -134,64 +140,68 @@ var (
 		"WHERE z.id = c.zone_id) " +
 		"SELECT count(*) FROM rev"
 
-	// countAddSQL — уникальные домены партии (по паре zone_id, label —
-	// дубликаты строк файла не надувают счётчики) до очистки: из него
-	// вычитается вставленное и возвращённое — остаток «уже было». Один
-	// запрос на партию (T-205): DISTINCT по staging дешевле вставки и в
-	// окно медленных не попадал.
+	// countAddSQL — the batch's unique domains (by the zone_id, label
+	// pair — duplicate file rows do not inflate the counters) before the
+	// cleanup: inserted and revived are subtracted from it — the "already
+	// existed" remainder. One query per batch (T-205): DISTINCT over
+	// staging is cheaper than the insert and never hit the slow-query
+	// window.
 	countAddSQL = "SELECT count(*) FROM (" +
 		"SELECT DISTINCT s.zone_id, s.label FROM ingest_stage AS s " +
 		"WHERE s.batch_id = $1 AND s.action = $2) AS t"
 )
 
-// AddResult — итог применения партии add: счётчики отчёта по файлу
-// (ТЗ 5.1 — T-021). Домены считаются по уникальным (zone_id, label)
-// партии: повторяющиеся строки файла дедуплицируются конфликтом
-// (миграция 000004), каждая метка входит ровно в один счётчик.
+// AddResult — the result of applying an add batch: the file report
+// counters (spec 5.1 — T-021). Domains are counted by the batch's unique
+// (zone_id, label) pairs: duplicate file rows are deduplicated by the
+// conflict (migration 000004), each label enters exactly one counter.
 type AddResult struct {
-	// Inserted — добавлено: вставлено новых доменов (сумма вставок пачек,
-	// T-205).
+	// Inserted — added: new domains inserted (the sum of the chunk
+	// inserts, T-205).
 	Inserted int64
-	// Existing — уже было: существующие домены не в статусе deleted —
-	// партия их не изменила (ТЗ 5.1).
+	// Existing — already existed: existing domains not in the deleted
+	// status — the batch did not change them (spec 5.1).
 	Existing int64
-	// Revived — возвращено из deleted: статус → new, check_state →
-	// pending — домен снова в цикле проверок (ТЗ 5.1, 6.2).
+	// Revived — returned from deleted: status → new, check_state →
+	// pending — the domain is back in the check cycle (spec 5.1, 6.2).
 	Revived int64
 }
 
-// Total — уникальных доменов партии: Inserted + Existing + Revived.
+// Total — the batch's unique domains: Inserted + Existing + Revived.
 func (r AddResult) Total() int64 { return r.Inserted + r.Existing + r.Revived }
 
-// ApplyAdd применяет партию add к domains (ТЗ 5.1) в ОДНОЙ транзакции
-// (T-205) по шагам в фиксированном порядке, закреплённом тестами:
+// ApplyAdd applies an add batch to domains (spec 5.1) in a SINGLE
+// transaction (T-205), step by step in a fixed order pinned by tests:
 //
-//  1. вставка новых доменов пачками по batchSize строк (ingest.batch_size,
-//     как COPY в staging): курсор по PK staging (batch_id, line_no) —
-//     граница пачки (addChunkBoundSQL), INSERT диапазона (insertAddSQL),
-//     следующая пачка продолжает после последней строки предыдущей —
-//     независимо от того, вставились ли её строки (конфликтная пачка
-//     закрывается той же границей). zone_id и label — из строк staging:
-//     зона создана EnsureZone (T-014) и несена каждой строкой партии;
-//  2. дельты счётчиков зон (total +n / pending +n, ТЗИ §6.2) — один
-//     итоговый UPDATE … FROM unnest по zone_id, накопленным из RETURNING
-//     всех пачек;
-//  3. UPDATE существующих строк партии со статусом deleted — возврат в
-//     проверку (status → new, check_state → pending, ТЗ 6.2), один
-//     оператор на партию;
-//  4. подсчёт уникальных доменов партии до очистки: Existing = уникальные −
-//     Inserted − Revived;
-//  5. ClearBatch — партия удаляется из staging (применить → очистить).
+//  1. inserting new domains in chunks of batchSize rows
+//     (ingest.batch_size, like COPY into staging): the cursor over the
+//     staging PK (batch_id, line_no) — the chunk bound
+//     (addChunkBoundSQL), the INSERT of the range (insertAddSQL); the
+//     next chunk continues after the last row of the previous one —
+//     regardless of whether its rows were inserted (an all-conflict
+//     chunk is closed by the same bound). zone_id and label come from
+//     the staging rows: the zone was created by EnsureZone (T-014) and
+//     is carried by every batch row;
+//  2. the zone counter deltas (total +n / pending +n,
+//     incremental-counters spec §6.2) — one final UPDATE … FROM unnest
+//     over the zone_ids accumulated from the RETURNING of all chunks;
+//  3. UPDATE of the batch's existing rows with the deleted status —
+//     returning them to checking (status → new, check_state → pending,
+//     spec 6.2), one statement per batch;
+//  4. counting the batch's unique domains before cleanup:
+//     Existing = unique − Inserted − Revived;
+//  5. ClearBatch — the batch is removed from staging
+//     (apply → clean).
 //
-// Транзакция делает применение атомарным эквивалентом одного оператора
-// эпохи T-018: сбой любого шага откатывает всё применение целиком, строки
-// партии остаются в staging, повторное применение выполняет те же шаги
-// на тех же данных и сходится к тому же итогу (идемпотентность, ТЗ 3.4);
-// зафиксированное применение очищает staging, и повторная подача того же
-// списка (новая партия) упирается в конфликты — счётчики повторного
-// прогона отражают текущее состояние, отчёт по файлу пишет первая
-// успешная попытка (T-021). Повторное применение уже применённой
-// (очищенной) партии — no-op с нулевым результатом.
+// The transaction makes the application an atomic equivalent of a single
+// statement of the T-018 era: a failure of any step rolls back the whole
+// application, the batch rows stay in staging, a repeated application
+// performs the same steps on the same data and converges to the same
+// result (idempotency, spec 3.4); a committed application clears staging,
+// and re-submitting the same list (a new batch) hits the conflicts — the
+// counters of the repeated run reflect the current state, and the file
+// report is written by the first successful attempt (T-021). Re-applying
+// an already applied (cleaned) batch is a no-op with a zero result.
 func ApplyAdd(ctx context.Context, pool ApplyDB, batch Batch, batchSize int) (AddResult, error) {
 	var res AddResult
 	if batch.ID == (BatchID{}) {
@@ -208,8 +218,8 @@ func ApplyAdd(ctx context.Context, pool ApplyDB, batch Batch, batchSize int) (Ad
 	if err != nil {
 		return res, fmt.Errorf("ingest: применение партии add: транзакция: %w", err)
 	}
-	// Откат безусловно: после Commit — no-op. Прерванное применение не
-	// оставляет половинчатых изменений (ТЗ 3.4).
+	// Rollback unconditionally: after Commit it is a no-op. An interrupted
+	// application leaves no half-done changes (spec 3.4).
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	args := []any{batch.ID[:], int16(model.ActionAdd)}
@@ -240,9 +250,9 @@ func ApplyAdd(ctx context.Context, pool ApplyDB, batch Batch, batchSize int) (Ad
 	}
 	res.Existing = uniques - res.Inserted - res.Revived
 
-	// Применено — партия покидает staging той же транзакцией: очистка
-	// после применения, а не до (иначе сбой применения терял бы строки
-	// партии до повтора).
+	// Applied — the batch leaves staging in the same transaction: cleanup
+	// after the application, not before (otherwise an application failure
+	// would lose the batch rows before the retry).
 	if _, err := ClearBatch(ctx, tx, batch.ID); err != nil {
 		return res, err
 	}
@@ -252,14 +262,15 @@ func ApplyAdd(ctx context.Context, pool ApplyDB, batch Batch, batchSize int) (Ad
 	return res, nil
 }
 
-// applyAddInsert вставляет новые домены партии пачками по batchSize строк
-// (T-205) и возвращает счётчик вставленных и накопленные по zone_id дельты
-// счётчиков зон (применяются одним оператором по завершении пачек).
-// Курсор — line_no последней закрытой строки: пачка — диапазон
-// (курсор, граница], строки партии нумеруются с единицы, начальный курсор
-// 0 закрывает партию целиком. Память ограничена пачкой и числом зон
-// партии, а не размером файла (ТЗ 3.5): RETURNING вставленных читается
-// потоком, в Go копятся только счётчики.
+// applyAddInsert inserts the batch's new domains in chunks of batchSize
+// rows (T-205) and returns the inserted counter and the zone counter
+// deltas accumulated by zone_id (applied by a single statement after the
+// chunks finish). The cursor is the line_no of the last closed row: a
+// chunk is the range (cursor, bound], the batch rows are numbered from
+// one, the initial cursor 0 covers the whole batch. Memory is bounded by
+// the chunk and the batch's zone count, not the file size (spec 3.5):
+// the RETURNING of the inserts is read as a stream, only counters
+// accumulate in Go.
 func applyAddInsert(ctx context.Context, tx pgx.Tx, b Batch, batchSize int) (int64, map[int16]int64, error) {
 	zones := make(map[int16]int64)
 	var (
@@ -276,7 +287,7 @@ func applyAddInsert(ctx context.Context, tx pgx.Tx, b Batch, batchSize int) (int
 			return 0, nil, fmt.Errorf("ingest: граница пачки вставки новых доменов партии add: %w", err)
 		}
 		if bound == 0 {
-			return inserted, zones, nil // партия исчерпана
+			return inserted, zones, nil // the batch is exhausted
 		}
 
 		rows, err = tx.Query(ctx, insertAddSQL, b.ID[:], int16(model.ActionAdd), cursor, bound)
@@ -298,16 +309,16 @@ func applyAddInsert(ctx context.Context, tx pgx.Tx, b Batch, batchSize int) (int
 		}
 		rows.Close()
 
-		// Курсор закрывает пачку по staging, а не по вставленным строкам:
-		// полностью конфликтная пачка тоже двигает курсор вперёд.
+		// The cursor closes the chunk over staging, not over the inserted
+		// rows: a fully conflicting chunk also moves the cursor forward.
 		cursor = bound
 	}
 }
 
-// applyAddZoneDeltas применяет накопленные дельты счётчиков зон одним
-// оператором (zoneDeltaAddSQL, T-205). Пустые дельты (партия без
-// вставок) — no-op без обращения к БД. Порядок zone_id детерминирован
-// (сортировка) — воспроизводимые пачки, как у cleanupRefcounts.
+// applyAddZoneDeltas applies the accumulated zone counter deltas with a
+// single statement (zoneDeltaAddSQL, T-205). Empty deltas (a batch with
+// no inserts) are a no-op without a DB call. The zone_id order is
+// deterministic (sorted) — reproducible chunks, like cleanupRefcounts.
 func applyAddZoneDeltas(ctx context.Context, tx pgx.Tx, zones map[int16]int64) error {
 	if len(zones) == 0 {
 		return nil
@@ -327,10 +338,10 @@ func applyAddZoneDeltas(ctx context.Context, tx pgx.Tx, zones map[int16]int64) e
 	return nil
 }
 
-// applyAddCount выполняет CTE-оператор применения (возврат с дельтами
-// счётчиков зон одним оператором, T-178) либо подсчёт и возвращает
-// счётчик внешнего SELECT (число затронутых строк партии). Вызывается
-// в транзакции ApplyAdd: pgx.Tx удовлетворяет db.DB.
+// applyAddCount runs the application's CTE statement (the revive with
+// the zone counter deltas in one statement, T-178) or the count, and
+// returns the counter of the outer SELECT (the number of batch rows
+// affected). Called in the ApplyAdd transaction: pgx.Tx satisfies db.DB.
 func applyAddCount(ctx context.Context, pool db.DB, sql string, args []any, kind string) (int64, error) {
 	rows, err := pool.Query(ctx, sql, args...)
 	if err != nil {

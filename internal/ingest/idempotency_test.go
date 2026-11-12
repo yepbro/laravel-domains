@@ -1,14 +1,15 @@
-// Юнит-тесты идемпотентности приёма на уровне доменов (T-097, вариант D;
-// ТЗ 3.4, 5.1): файловый дедуп по sha256 — оптимизация, корректность
-// повторной обработки гарантируют операции над доменами. Сценарии:
-// повторная обработка того же файла после сбоя записи отчёта (журнал
-// пуст — дубль не находится, применение обязано сойтись к тому же
-// состоянию, отчёт пишется ровно один раз) и сбой очистки партии в ветках
-// порога ошибок и дубля — discard досыпает очистку собственным
-// контекстом, строки не остаются в staging. Повторное применение партий
-// add/delete без БД — TestApplyAdd_Reapply / TestApplyDeleteIdempotentRepeat;
-// реальная сходимость против живой БД — интеграционные тесты
-// идемпотентности (test/integration/ingest_idempotency_test.go).
+// Unit tests of domain-level ingest idempotency (T-097, option D;
+// spec 3.4, 5.1): the file dedup by sha256 — an optimization; the
+// correctness of reprocessing is guaranteed by the domain operations.
+// Scenarios: reprocessing the same file after a report record failure
+// (the journal is empty — no duplicate is found, the application must
+// converge to the same state, the report is written exactly once) and a
+// batch cleanup failure in the error-threshold and duplicate branches —
+// the discard retries the cleanup with its own context, the rows are not
+// left in staging. Re-applying add/delete batches without a DB —
+// TestApplyAdd_Reapply / TestApplyDeleteIdempotentRepeat; the real
+// convergence against a live DB — the idempotency integration tests
+// (test/integration/ingest_idempotency_test.go).
 package ingest
 
 import (
@@ -26,24 +27,26 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
-// TestPipelineReapplyAfterLostReport — идемпотентность уровня доменов
-// (T-097): сбой между применением и записью отчёта (окно RecordFile) —
-// файл остаётся в incoming и обрабатывается повторно, но журнал пуст,
-// дубль по sha256 не находится. Повторное применение обязано быть no-op
-// для доменов (INSERT 0 / UPDATE 0 — вставленные первой попыткой
-// конфликтуют, возвращать некого), отчёт пишётся ровно один раз.
+// TestPipelineReapplyAfterLostReport — domain-level idempotency (T-097):
+// (T-097): a failure between the application and the report record (the
+// RecordFile window) — the file stays in incoming and is reprocessed,
+// but the journal is empty, no duplicate is found by sha256. The repeated
+// application must be a no-op for the domains (INSERT 0 / UPDATE 0 — the
+// ones inserted by the first attempt conflict, there is nothing to
+// revive), the report is written exactly once.
 func TestPipelineReapplyAfterLostReport(t *testing.T) {
 	pt := newPipeTest(t)
 	content := "example.com\nshop.com\n"
 	abs := pt.addFile(t, "com/add/list.txt", content)
 	sha := sha256.Sum256([]byte(content))
 
-	// Первая попытка: применение полностью прошло, отчёт не записан.
+	// The first attempt: the application fully went through, the report
+	// was not recorded.
 	pt.pool.execs = []pipeExec{
-		{tag: pgconn.NewCommandTag("DELETE 0")}, // очистка перед загрузкой
+		{tag: pgconn.NewCommandTag("DELETE 0")}, // the cleanup before loading
 		{tag: pgconn.NewCommandTag("INSERT 2")}, // example, shop
-		{tag: pgconn.NewCommandTag("UPDATE 0")}, // возвращать некого
-		{tag: pgconn.NewCommandTag("DELETE 2")}, // очистка после применения
+		{tag: pgconn.NewCommandTag("UPDATE 0")}, // nothing to revive
+		{tag: pgconn.NewCommandTag("DELETE 2")}, // the cleanup after the application
 	}
 	pt.pool.uniques = 2
 	pt.files.recErr = errors.New("журнал недоступен")
@@ -59,15 +62,16 @@ func TestPipelineReapplyAfterLostReport(t *testing.T) {
 		t.Fatal("отчёт не должен был записаться (сбой журнала)")
 	}
 
-	// Повторная обработка того же файла (at-least-once, ТЗ 3.4): домены
-	// уже добавлены первой попыткой — применение сходится к no-op.
+	// Reprocessing the same file (at-least-once, spec 3.4): the domains
+	// were already added by the first attempt — the application converges
+	// to a no-op.
 	pt.files.recErr = nil
 	pt.pool = &pipePool{
 		execs: []pipeExec{
-			{tag: pgconn.NewCommandTag("DELETE 0")}, // очистка перед загрузкой
-			{tag: pgconn.NewCommandTag("INSERT 0")}, // конфликт уникальности
-			{tag: pgconn.NewCommandTag("UPDATE 0")}, // охрана status = deleted
-			{tag: pgconn.NewCommandTag("DELETE 2")}, // очистка после применения
+			{tag: pgconn.NewCommandTag("DELETE 0")}, // the cleanup before loading
+			{tag: pgconn.NewCommandTag("INSERT 0")}, // a uniqueness conflict
+			{tag: pgconn.NewCommandTag("UPDATE 0")}, // the status = deleted guard
+			{tag: pgconn.NewCommandTag("DELETE 2")}, // the cleanup after the application
 		},
 		uniques: 2,
 	}
@@ -86,14 +90,14 @@ func TestPipelineReapplyAfterLostReport(t *testing.T) {
 	if out.Kind != OutcomeApplied {
 		t.Fatalf("повторная обработка: итог = %s, want applied", out.Kind)
 	}
-	// Состояние доменов неизменно: добавлять нечего, всё «уже было»
-	// (счётчики повтора отражают текущее состояние, ТЗ 3.4).
+	// The domain state is unchanged: nothing to add, everything "already
+	// existed" (the retry counters reflect the current state, spec 3.4).
 	if out.Report.Added != 0 || out.Report.Revived != 0 || out.Report.Existed != 2 {
 		t.Errorf("счётчики повтора = added %d, revived %d, existed %d; want 0/0/2",
 			out.Report.Added, out.Report.Revived, out.Report.Existed)
 	}
 
-	// Отчёт — ровно один, повтор не дублирует журнал.
+	// The report — exactly one, the retry does not duplicate the journal.
 	if len(pt.files.records) != 1 {
 		t.Fatalf("записей в журнале = %d, want 1", len(pt.files.records))
 	}
@@ -110,10 +114,11 @@ func TestPipelineReapplyAfterLostReport(t *testing.T) {
 	}
 }
 
-// TestPipelineDuplicateClearFailureDiscards — сбой очистки партии в ветке
-// дубля (T-097): clearBatch с уже отменённым ctx (graceful shutdown) или
-// кратковременным сбоем БД не должен оставлять строки партии в staging —
-// discard ретраит очистку собственным контекстом.
+// TestPipelineDuplicateClearFailureDiscards — a batch cleanup failure in
+// the duplicate branch (T-097): a clearBatch with an already cancelled
+// ctx (a graceful shutdown) or a momentary DB failure must not leave the
+// batch rows in staging — the discard retries the cleanup with its own
+// context.
 func TestPipelineDuplicateClearFailureDiscards(t *testing.T) {
 	pt := newPipeTest(t)
 	content := "example.com\n"
@@ -129,9 +134,9 @@ func TestPipelineDuplicateClearFailureDiscards(t *testing.T) {
 
 	boom := errors.New("очистка партии не прошла")
 	pt.pool.execs = []pipeExec{
-		{tag: pgconn.NewCommandTag("DELETE 0")}, // очистка перед загрузкой (Stage)
-		{err: boom},                             // очистка партии дубля — сбой
-		// discard: третья очистка — успела
+		{tag: pgconn.NewCommandTag("DELETE 0")}, // the cleanup before loading (Stage)
+		{err: boom},                             // the duplicate's batch cleanup — a failure
+		// the discard: the third cleanup — went through
 	}
 	pipe, err := NewPipeline(pt.zones, pt.files, pt.pool, PipelineOptions{
 		Dir: pt.dir, BatchSize: 10, Now: func() time.Time { return pt.now },
@@ -151,8 +156,8 @@ func TestPipelineDuplicateClearFailureDiscards(t *testing.T) {
 		t.Error("дубль не должен писать второй отчёт")
 	}
 
-	// Очистка → COPY → сбой очистки дубля → discard-ретрай собственной
-	// очисткой: строки партии не остаются в staging.
+	// The cleanup → COPY → the duplicate's cleanup failure → a discard
+	// retry with its own cleanup: the batch rows are not left in staging.
 	want := []string{
 		"exec:" + clearStageSQL,
 		"copy:1",
@@ -165,18 +170,18 @@ func TestPipelineDuplicateClearFailureDiscards(t *testing.T) {
 	}
 }
 
-// TestPipelineFailedRatioClearFailureDiscards — тот же инвариант для
-// ветки порога ошибок (T-016): файл ошибочен, партия отбрасывается;
-// сбой отбрасывания ретраится discard'ом.
+// TestPipelineFailedRatioClearFailureDiscards — the same invariant for
+// the error threshold branch (T-016): the file is bad, the batch is
+// discarded; a discard failure is retried by the discard.
 func TestPipelineFailedRatioClearFailureDiscards(t *testing.T) {
 	pt := newPipeTest(t)
 	abs := pt.addFile(t, "com/add/list.txt", "a.org\nb.org\nc.com\n") // 2/3 > 0.1
 
 	boom := errors.New("очистка партии не прошла")
 	pt.pool.execs = []pipeExec{
-		{tag: pgconn.NewCommandTag("DELETE 0")}, // очистка перед загрузкой (Stage)
-		{err: boom},                             // отбрасывание партии — сбой
-		// discard: третья очистка — успела
+		{tag: pgconn.NewCommandTag("DELETE 0")}, // the cleanup before loading (Stage)
+		{err: boom},                             // the batch discard — a failure
+		// the discard: the third cleanup — went through
 	}
 
 	out, err := pt.pipe.Process(context.Background(), abs)

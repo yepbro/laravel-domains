@@ -1,46 +1,49 @@
-// Фоновая очистка удалённых доменов (T-020; ТЗ 5.1 delete-ветка, 13.1, 8).
+// Background cleanup of deleted domains (T-020; spec 5.1 delete branch,
+// 13.1, 8).
 //
-// Удалённый домен остаётся в БД со статусом deleted (ТЗ 13.1), а его
-// результаты и ссылки на контент убирает фоновая задача: у доменов
-// status = deleted удаляются строки subdomain_results, и по каждому
-// content_hash удалённых строк уменьшается contents.refcount (ТЗ 6.1:
-// content_hash — ссылка на contents; дедупликация — ТЗ 5.7, 8).
+// A deleted domain stays in the DB with the deleted status (spec 13.1),
+// and a background task removes its results and content references: for
+// domains with status = deleted the subdomain_results rows are deleted,
+// and contents.refcount is decreased for the content_hash of each
+// deleted row (spec 6.1: content_hash is a reference to contents;
+// deduplication — spec 5.7, 8).
 //
-// Граница с этапом 4: контент с refcount → 0 физически НЕ удаляется —
-// пак-файлы и сборка мусора (компактификация паков) остаются за
-// хранилищем контента (T-042/T-045, ТЗ 5.7); нулевой refcount лишь
-// помечает данные мёртвыми для будущей компактификации. Находки
-// laravel_* задача не трогает: план T-020 ограничивает очистку
-// результатами и ссылками на контент, а домен остаётся в БД (ТЗ 13.1).
+// The boundary with stage 4: content with refcount → 0 is NOT physically
+// removed — pack files and garbage collection (pack compaction) stay
+// with the content store (T-042/T-045, spec 5.7); a zero refcount only
+// marks the data dead for a future compaction. The task does not touch
+// laravel_* finds: the T-020 plan limits the cleanup to results and
+// content references, and the domain stays in the DB (spec 13.1).
 //
-// Отслеживание обработанных без смены схемы: «пометка в строке» — сами
-// оставшиеся результаты. Кандидат прохода — deleted-домен, у которого
-// ещё есть строки subdomain_results (EXISTS); вычищенный домен не
-// выбирается вовсе, повторные проходы не делают лишней работы, а сбой
-// или рестарт ничего не теряют — внешнего состояния нет. Выборка
-// кандидатов обслуживается частичным индексом domains_deleted_idx
-// (миграция 0013, T-170): (zone_id, id) WHERE status = 6 — ключ
-// совпадает с PK и ORDER BY выборки (пачки без сортировки, ранний
-// останов LIMIT), а пока deleted-доменов нет, проход не читает таблицу
-// доменов вовсе (боевой замер 23–24.10: без индекса планировщик
-// перебирал все subdomain_results — 17 с CPU БД на проход вхолостую).
-// Код статуса вшит в текст SQL литералом через model.StatusDeleted
-// (стиль scheduler/dispatch.go): параметр в предикате частичного
-// индекса планировщик не доказывает, generic-план подготовленного
-// выражения терял бы индекс.
+// Tracking what was processed without a schema change: the "mark in the
+// row" is the remaining results themselves. A pass candidate is a
+// deleted domain that still has subdomain_results rows (EXISTS); a fully
+// cleaned domain is not selected at all, repeated passes do no extra
+// work, and a failure or restart loses nothing — there is no external
+// state. The candidate selection is served by the partial index
+// domains_deleted_idx (migration 0013, T-170): (zone_id, id)
+// WHERE status = 6 — the key matches the PK and the selection's ORDER BY
+// (chunks without sorting, early stop by LIMIT), and while there are no
+// deleted domains the pass does not read the domains table at all
+// (production measurement Oct 23–24: without the index the planner
+// scanned all subdomain_results — 17 s of DB CPU per pass, idle).
+// The status code is baked into the SQL text as a literal via
+// model.StatusDeleted (scheduler/dispatch.go style): the planner cannot
+// prove a parameter in the partial index predicate, and a generic plan
+// of the prepared statement would lose the index.
 //
-// Тот же цикл зачищает осиротевшие партии ingest_stage (T-098, страховка
-// ING-P2-3): строки партии, чей конвейер умер без discard (kill -9
-// сервиса, падение СУБД), удаляются по возрасту batch_id — время
-// создания зашито в старшие байты идентификатора (stage.go), см.
-// CleanupStaleBatches.
+// The same loop cleans up orphaned ingest_stage batches (T-098, the
+// ING-P2-3 guard): the rows of a batch whose pipeline died without a
+// discard (kill -9 of the service, a DB crash) are removed by the
+// batch_id age — the creation time is baked into the identifier's high
+// bytes (stage.go), see CleanupStaleBatches.
 //
-// Момент запуска — по расписанию (ticker в CleanupDeleted), а не событие
-// после применения delete-файла: применение (T-019) не связано с
-// очисткой API, а повторяемые проходы гарантированно подбирают всё —
-// включая результаты, дописанные воркерами после удаления домена
-// (ТЗ 8: «…либо удаляется фоновой очисткой»). Подключение к сервису
-// ingest — T-021.
+// The start moment is on a schedule (a ticker in CleanupDeleted), not an
+// event after applying a delete file: the application (T-019) is not
+// coupled with the cleanup by API, and repeatable passes are guaranteed
+// to pick up everything — including results appended by workers after
+// the domain was deleted (spec 8: "…or is removed by the background
+// cleanup"). Wiring into the ingest service — T-021.
 package ingest
 
 import (
@@ -60,51 +63,52 @@ import (
 )
 
 const (
-	// DefaultCleanupBatch — лимит пачки: доменов на один проход.
-	// Сопоставимо с пачками планировщика (ТЗ 5.3: 1000–10 000): транзакция
-	// прохода остаётся короткой — блокировки строк subdomain_results
-	// удерживаются минимум времени, — а темп дренажа при интервале по
-	// умолчанию (1000 доменов раз в минуту) — до 60 000 доменов в час.
+	// DefaultCleanupBatch — the chunk limit: domains per pass.
+	// Comparable to the scheduler chunks (spec 5.3: 1,000–10,000): the
+	// pass transaction stays short — subdomain_results row locks are held
+	// for the minimum time — and the drain rate at the default interval
+	// (1,000 domains a minute) is up to 60,000 domains per hour.
 	DefaultCleanupBatch = 1000
 
-	// DefaultCleanupInterval — интервал проходов цикла CleanupDeleted.
-	// ТЗ темп очистки не задаёт: фоновая задача не спешит, данные уже
-	// не отдаются клиенту; T-021 сможет завести значение в конфиг.
+	// DefaultCleanupInterval — the interval of CleanupDeleted loop
+	// passes. The spec does not set a cleanup rate: the background task
+	// is in no hurry, the data is not served to clients anymore; T-021
+	// can move the value into config.
 	DefaultCleanupInterval = time.Minute
 )
 
-// contentHashLen — размер content_hash → contents.hash: 16 байт, 128 бит
-// (ТЗ 6.1, 5.7). Проверяется при чтении RETURNING — дешёвый инвариант
-// против программных ошибок писателя результатов (T-056), как
-// MaxLabelLen в Stage. Неверная длина не роняет проход (poison pill,
-// ING-P2-4): строка уже удалена, refcount по ней не меняется.
+// contentHashLen — the size of content_hash → contents.hash: 16 bytes,
+// 128 bits (spec 6.1, 5.7). Checked when reading RETURNING — a cheap
+// invariant against result-writer bugs (T-056), like MaxLabelLen in
+// Stage. A wrong length does not crash the pass (poison pill,
+// ING-P2-4): the row is already deleted, its refcount was not changed.
 const contentHashLen = 16
 
-// SQL прохода. unnest-пачки — стиль пакетных UPDATE internal/db (ТЗ 6:
-// «запись пачками … UPDATE … FROM unnest(...)»).
+// Pass SQL. unnest chunks — the style of the batched UPDATEs of
+// internal/db (spec 6: "writing in chunks … UPDATE … FROM unnest(...)").
 const (
-	// cleanupUpdateSQL — уменьшение refcount по агрегированным хэшам:
-	// один контент может ссылаться из многих удалённых результатов
-	// (дедупликация, ТЗ 5.7). GREATEST(..., 0) держит счётчик
-	// неотрицательным при рассинхронизации (до миграции 000019 CHECK в
-	// схеме не было; теперь инвариант дублирует contents_refcount_check,
-	// а клэмп — первая линия, не дающая массовому проходу его триггерить
-	// — спецификация internal/content/pack.go, И1): минус сломал бы
-	// инвариант «0 = мёртвый контент» для компактификации
-	// (T-042/T-045). refcount = 0 — не удаление строки: физически
-	// носитель чистит компактификация паков (этап 4, T-045).
+	// cleanupUpdateSQL — decreasing the refcount by the aggregated hashes:
+	// one content can be referenced from many deleted results
+	// (deduplication, spec 5.7). GREATEST(..., 0) keeps the counter
+	// non-negative on desync (before migration 000019 there was no CHECK
+	// in the schema; now the invariant duplicates contents_refcount_check,
+	// and the clamp is the first line of defense keeping a mass pass from
+	// triggering it — the internal/content/pack.go spec, I1): a negative
+	// would break the "0 = dead content" invariant for compaction
+	// (T-042/T-045). refcount = 0 is not a row deletion: the storage is
+	// cleaned physically by pack compaction (stage 4, T-045).
 	cleanupUpdateSQL = "UPDATE contents SET refcount = GREATEST(refcount - h.n, 0) " +
 		"FROM unnest($1::bytea[], $2::int4[]) AS h(hash, n) " +
 		"WHERE contents.hash = h.hash"
 )
 
-// cleanupSelectSQL — кандидаты: deleted-домены с оставшимися
-// результатами. EXISTS — та самая «пометка»: вычищенные не выбираются.
-// ORDER BY по ключу домена — детерминированные пачки без сортировки
-// (совпадает с PK и ключом domains_deleted_idx, ТЗ 6.1/T-170). Код
-// статуса — литерал в тексте (fmt.Sprintf через model, стиль
-// dispatch.go): предикат частичного индекса планировщик доказывает
-// только по литералу.
+// cleanupSelectSQL — the candidates: deleted domains with remaining
+// results. EXISTS is that very "mark": cleaned domains are not selected.
+// ORDER BY the domain key — deterministic chunks without sorting
+// (matches the PK and the domains_deleted_idx key, spec 6.1/T-170). The
+// status code is a literal in the text (fmt.Sprintf via model,
+// dispatch.go style): the planner proves the partial index predicate
+// only by a literal.
 var cleanupSelectSQL = fmt.Sprintf(
 	"SELECT d.zone_id, d.id FROM domains d "+
 		"WHERE d.status = %d "+
@@ -113,16 +117,17 @@ var cleanupSelectSQL = fmt.Sprintf(
 		"ORDER BY d.zone_id, d.id LIMIT $1",
 	int16(model.StatusDeleted))
 
-// cleanupDeleteSQL — удаление результатов пачки доменов. Охрана
-// EXISTS по domains.status — от гонки с применением add-файла
-// (T-018): домен, воскрешённый из deleted в new/pending между
-// выборкой кандидатов и удалением, результаты сохраняет (ТЗ 5.1:
-// вернувшийся домен «не меняется»); домен, удалённый заново, пройдёт
-// цикл ещё раз. RETURNING отдаёт только фактически удалённые строки —
-// уменьшение refcount ниже строго по ним: вторая параллельная очистка,
-// удалившая те же строки раньше, refcount повторно не уменьшит.
-// Литерал статуса — доказательство предиката domains_deleted_idx
-// (T-170): охрана — проба индекса, не чтение таблицы.
+// cleanupDeleteSQL — deleting the results of a chunk of domains. The
+// EXISTS guard over domains.status — against a race with applying an
+// add file (T-018): a domain revived from deleted to new/pending between
+// the candidate selection and the deletion keeps its results (spec 5.1:
+// a returning domain "is not changed"); a domain deleted again will go
+// through the loop once more. RETURNING yields only the rows actually
+// deleted — the refcount decrease below goes strictly by them: a second
+// parallel cleanup that deleted the same rows earlier will not decrease
+// the refcount again. The status literal — the provability of the
+// domains_deleted_idx predicate (T-170): the guard is an index probe,
+// not a table read.
 var cleanupDeleteSQL = fmt.Sprintf(
 	"DELETE FROM subdomain_results r "+
 		"USING unnest($1::int2[], $2::int8[]) AS k(zone_id, domain_id) "+
@@ -132,49 +137,50 @@ var cleanupDeleteSQL = fmt.Sprintf(
 		"RETURNING r.zone_id, r.domain_id, r.content_hash",
 	int16(model.StatusDeleted))
 
-// staleStageSQL — зачистка осиротевших партий staging (T-098): диапазон
-// batch_id меньше границы «сейчас − StaleBatchAge» — скан по ведущей
-// колонке первичного ключа, как и очистка своей партии. Имя таблицы — из
-// StageTable (экранирование идентификатора, как в internal/db), единый
-// источник для SQL и COPY — поэтому var, как clearStageSQL.
+// staleStageSQL — the cleanup of orphaned staging batches (T-098): the
+// batch_id range below the "now − StaleBatchAge" bound — a scan over the
+// leading primary key column, like the cleanup of the pipeline's own
+// batch. The table name comes from StageTable (identifier quoting, as in
+// internal/db), a single source for SQL and COPY — hence a var, like
+// clearStageSQL.
 var staleStageSQL = "DELETE FROM " + StageTable.Sanitize() + " WHERE batch_id < $1"
 
-// CleanupDB — пул для очистки: db.DB, из которого можно начать
-// транзакцию. Проход атомарен (удаление результатов и уменьшение
-// refcount — одна транзакция: сбой между ними не оставит refcount
-// навсегда завышенным), поэтому db.DB мало — нужен Begin;
-// *pgxpool.Pool удовлетворяет.
+// CleanupDB — a pool for the cleanup: a db.DB from which a transaction
+// can be started. A pass is atomic (deleting the results and decreasing
+// the refcount is one transaction: a failure between them would leave
+// the refcount inflated forever), so db.DB is not enough — Begin is
+// needed; *pgxpool.Pool satisfies it.
 type CleanupDB interface {
 	db.DB
 	Begin(ctx context.Context) (pgx.Tx, error)
 }
 
-// compile-time: реальный пул подходит под интерфейс.
+// compile-time: the real pool satisfies the interface.
 var _ CleanupDB = (*pgxpool.Pool)(nil)
 
-// CleanupOptions — параметры очистки; нулевые значения заменяются
-// дефолтами (withDefaults, стиль watch.Options).
+// CleanupOptions — the cleanup parameters; zero values are replaced
+// with the defaults (withDefaults, watch.Options style).
 type CleanupOptions struct {
-	// BatchSize — максимум доменов в одном проходе (DefaultCleanupBatch);
-	// лимит пачки задаёт SELECT кандидатов.
+	// BatchSize — the maximum domains in one pass (DefaultCleanupBatch);
+	// the chunk limit is set by the candidate SELECT.
 	BatchSize int
-	// Interval — период повторных проходов цикла CleanupDeleted
-	// (DefaultCleanupInterval); на разовый CleanupOnce не влияет.
+	// Interval — the period of the CleanupDeleted loop's repeated passes
+	// (DefaultCleanupInterval); a one-off CleanupOnce is not affected.
 	Interval time.Duration
-	// Log — логгер цикла CleanupDeleted; nil — записи подавлены
-	// (slog.DiscardHandler). CleanupOnce не логирует — итог возвращается
-	// CleanupResult.
+	// Log — the CleanupDeleted loop logger; nil — records suppressed
+	// (slog.DiscardHandler). CleanupOnce does not log — the result is
+	// returned as CleanupResult.
 	Log *slog.Logger
-	// OnPass — хук итога успешного прохода: снапшот CleanupResult сразу
-	// после фиксации транзакции (ошибочный проход хуку не отдаётся — его
-	// уже записал Warn). Точка подключения экспорта метрик (T-099)
-	// без зависимости цикла от internal/metrics; стиль AlertsOptions.OnPass
-	// (лог + поле). Обязан быть быстрым и не паниковать — вызывается
-	// в цикле прохода.
+	// OnPass — the hook of a successful pass's result: a snapshot of
+	// CleanupResult right after the transaction commit (a failed pass is
+	// not handed to the hook — Warn has already recorded it). The wiring
+	// point of metric export (T-099) without the loop depending on
+	// internal/metrics; the AlertsOptions.OnPass style (log + field).
+	// Must be fast and must not panic — called in the pass loop.
 	OnPass func(CleanupResult)
 }
 
-// withDefaults заменяет неположительные значения дефолтами.
+// withDefaults replaces non-positive values with the defaults.
 func (o CleanupOptions) withDefaults() CleanupOptions {
 	if o.BatchSize <= 0 {
 		o.BatchSize = DefaultCleanupBatch
@@ -185,37 +191,41 @@ func (o CleanupOptions) withDefaults() CleanupOptions {
 	return o
 }
 
-// CleanupResult — итог одного прохода CleanupOnce.
+// CleanupResult — the result of one CleanupOnce pass.
 type CleanupResult struct {
-	// Domains — домены, у которых удалены результаты (после охраны от
-	// воскрешённых add-файлом; не больше размера пачки).
+	// Domains — the domains whose results were deleted (after the guard
+	// against ones revived by an add file; no more than the chunk size).
 	Domains int
-	// Results — удалённые строки subdomain_results.
+	// Results — the deleted subdomain_results rows.
 	Results int64
-	// Contents — строки contents с уменьшенным refcount (различные хэши).
+	// Contents — the contents rows with a decreased refcount (distinct
+	// hashes).
 	Contents int64
-	// BadHashes — удалённые результаты с content_hash неверной длины
-	// (контракт contents — 16 октет, ТЗ 6.1): проход не роняется,
-	// refcount по ним не менялся; цикл CleanupDeleted помечает это Warn.
+	// BadHashes — the deleted results with a wrong-length content_hash
+	// (the contents contract — 16 octets, spec 6.1): the pass does not
+	// crash, their refcount was not changed; the CleanupDeleted loop
+	// marks this with a Warn.
 	BadHashes int64
 }
 
-// cleanupKey — ключ домена: партиция + идентификатор, как PK domains.
+// cleanupKey — the domain key: partition + identifier, like the domains
+// PK.
 type cleanupKey struct {
 	zoneID int16
 	id     int64
 }
 
-// cleanupHash — 128-битный content_hash (ТЗ 6.1); ключ агрегации ссылок.
+// cleanupHash — the 128-bit content_hash (spec 6.1); the reference
+// aggregation key.
 type cleanupHash [contentHashLen]byte
 
-// CleanupOnce выполняет один проход очистки (ТЗ 5.1, 13.1): до
-// opts.BatchSize доменов в статусе deleted, у которых ещё есть
-// результаты, — в одной транзакции удаляются их строки
-// subdomain_results, и по каждому content_hash удалённых строк
-// уменьшается contents.refcount. Повторный проход безопасен (ТЗ 3.4):
-// вычищенные домены не выбираются, refcount уменьшается строго по
-// фактически удалённым ссылкам.
+// CleanupOnce performs one cleanup pass (spec 5.1, 13.1): up to
+// opts.BatchSize domains with the deleted status that still have
+// results — their subdomain_results rows are deleted in one transaction,
+// and contents.refcount is decreased for the content_hash of each
+// deleted row. A repeated pass is safe (spec 3.4): cleaned domains are
+// not selected, and the refcount is decreased strictly by the references
+// actually deleted.
 func CleanupOnce(ctx context.Context, pool CleanupDB, opts CleanupOptions) (CleanupResult, error) {
 	if pool == nil {
 		return CleanupResult{}, errors.New("ingest: очистка удалённых доменов: пул не задан")
@@ -227,7 +237,7 @@ func CleanupOnce(ctx context.Context, pool CleanupDB, opts CleanupOptions) (Clea
 		return CleanupResult{}, err
 	}
 	if len(zoneIDs) == 0 {
-		// Пустой набор — чистить нечего; транзакция не открывается.
+		// An empty set — nothing to clean; no transaction is opened.
 		return CleanupResult{}, nil
 	}
 
@@ -235,8 +245,8 @@ func CleanupOnce(ctx context.Context, pool CleanupDB, opts CleanupOptions) (Clea
 	if err != nil {
 		return CleanupResult{}, fmt.Errorf("ingest: очистка удалённых доменов: транзакция: %w", err)
 	}
-	// Откат безусловно: после Commit — no-op. Прерванный проход не
-	// оставляет половинчатых изменений (ТЗ 3.4).
+	// Rollback unconditionally: after Commit it is a no-op. An interrupted
+	// pass leaves no half-done changes (spec 3.4).
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	res, refs, err := cleanupResults(ctx, tx, zoneIDs, domainIDs)
@@ -256,9 +266,9 @@ func CleanupOnce(ctx context.Context, pool CleanupDB, opts CleanupOptions) (Clea
 	return res, nil
 }
 
-// cleanupCandidates выбирает до limit deleted-доменов с оставшимися
-// результатами (cleanupSelectSQL): параллельные массивы ключей зон и
-// доменов для unnest-пачки DELETE.
+// cleanupCandidates selects up to limit deleted domains with remaining
+// results (cleanupSelectSQL): parallel arrays of zone and domain keys
+// for the unnest chunk DELETE.
 func cleanupCandidates(ctx context.Context, pool CleanupDB, limit int) ([]int16, []int64, error) {
 	rows, err := pool.Query(ctx, cleanupSelectSQL, limit)
 	if err != nil {
@@ -285,9 +295,9 @@ func cleanupCandidates(ctx context.Context, pool CleanupDB, limit int) ([]int16,
 	return zoneIDs, domainIDs, nil
 }
 
-// cleanupResults удаляет строки subdomain_results пачки доменов
-// (cleanupDeleteSQL) и возвращает счётчики прохода вместе с числом
-// удалённых ссылок на каждый хэш контента.
+// cleanupResults deletes the subdomain_results rows of a chunk of
+// domains (cleanupDeleteSQL) and returns the pass counters together with
+// the number of deleted references to each content hash.
 func cleanupResults(ctx context.Context, tx pgx.Tx, zoneIDs []int16, domainIDs []int64) (CleanupResult, map[cleanupHash]int32, error) {
 	rows, err := tx.Query(ctx, cleanupDeleteSQL, zoneIDs, domainIDs)
 	if err != nil {
@@ -311,12 +321,14 @@ func cleanupResults(ctx context.Context, tx pgx.Tx, zoneIDs []int16, domainIDs [
 		res.Results++
 		switch {
 		case hash == nil:
-			// Результат без контента (NULL content_hash) — ссылок не держит.
+			// A result without content (NULL content_hash) — holds no
+			// references.
 		case len(hash) != contentHashLen:
-			// Программная ошибка писателя результатов (T-056): строка уже
-			// удалена, ронять проход нельзя — один некорректный хэш блокировал
-			// бы очистку навсегда (кандидаты перевыбираются те же, ING-P2-4).
-			// Refcount по такой ссылке не трогаем, итог — BadHashes.
+			// A result-writer bug (T-056): the row is already deleted,
+			// crashing the pass is not allowed — one bad hash would block
+			// the cleanup forever (the same candidates are reselected,
+			// ING-P2-4). The refcount of such a reference is not touched;
+			// the result is BadHashes.
 			res.BadHashes++
 		default:
 			var h cleanupHash
@@ -331,14 +343,15 @@ func cleanupResults(ctx context.Context, tx pgx.Tx, zoneIDs []int16, domainIDs [
 	return res, refs, nil
 }
 
-// cleanupRefcounts уменьшает contents.refcount по числу удалённых ссылок
-// (cleanupUpdateSQL) и возвращает число затронутых строк contents.
+// cleanupRefcounts decreases contents.refcount by the number of deleted
+// references (cleanupUpdateSQL) and returns the number of contents rows
+// affected.
 func cleanupRefcounts(ctx context.Context, tx pgx.Tx, refs map[cleanupHash]int32) (int64, error) {
 	list := make([]cleanupHash, 0, len(refs))
 	for h := range refs {
 		list = append(list, h)
 	}
-	// Детерминированный порядок аргументов — воспроизводимые пачки.
+	// A deterministic argument order — reproducible chunks.
 	sort.Slice(list, func(i, j int) bool {
 		return bytes.Compare(list[i][:], list[j][:]) < 0
 	})
@@ -356,53 +369,55 @@ func cleanupRefcounts(ctx context.Context, tx pgx.Tx, refs map[cleanupHash]int32
 	return tag.RowsAffected(), nil
 }
 
-// StaleBatchAge — порог осиротевших партий staging (T-098). После фикса
-// ING-P2-3 (614e690) сбойную партию чистит discard собственным контекстом,
-// но kill -9 сервиса или падение СУБД оставляют строки навсегда:
-// UNLOGGED-таблица переживает рестарт сервиса, а усекается только
-// аварийным восстановлением PostgreSQL (crash recovery) — штатный рестарт
-// СУБД строки сохраняет. Партия живёт ровно время обработки одного
-// файла — конвейер обрабатывает файлы последовательно, а пачки COPY
-// дают ~10⁵–10⁶ строк/с, поэтому даже огромный файл укладывается
-// в минуты: сутки — заведомый запас поверх времени жизни любой живой
-// партии, зачистка не может подрезать партию работающего Process
-// (гонка исключена возрастом, а не блокировкой). Осиротевшие строки
-// на корректность не влияют (batch_id не встретится повторно) — только
-// место на диске, так что большой запас дешевле риска; конфигурационного
-// ключа не заводим (экспорт — для интеграционного теста границы).
+// StaleBatchAge — the orphaned staging batch threshold (T-098). After
+// the ING-P2-3 fix (614e690) a failed batch is cleaned by a discard with
+// its own context, but a kill -9 of the service or a DB crash leaves the
+// rows forever: the UNLOGGED table survives a service restart and is
+// truncated only by PostgreSQL crash recovery — a graceful DB restart
+// keeps the rows. A batch lives exactly as long as one file is
+// processed — the pipeline processes files sequentially, and COPY
+// chunks deliver ~10⁵–10⁶ rows/s, so even a huge file fits in minutes:
+// a day is a deliberate margin over the lifetime of any live batch; the
+// cleanup cannot cut into the batch of a running Process (the race is
+// excluded by age, not by locking). Orphaned rows do not affect
+// correctness (a batch_id will not be encountered again) — only disk
+// space, so a large margin is cheaper than the risk; no config key is
+// introduced (the export is for the integration test of the boundary).
 //
-// Граница контракта — системные часы (возраст и границы — wall time):
-// шаг времени вперёд больше порога в момент живой обработки (пауза ВМ
-// дольше суток, ручная правка даты, запуск до синхронизации времени)
-// преждевременно состаривает партию. Самое частое осложнение длинной
-// паузы ВМ — обрыв соединения с БД — самолечится: Process вернёт
-// OutcomeLeft, файл переработается со свежим batch_id. Исключение
-// активных партий из зачистки (реестр, разделяемый конвейером и циклом)
-// сознательно не делаем: стоимость состояния несоизмерима со сценарием,
-// часы узлов обязаны быть согласованы (NTP/chrony в режиме slew).
+// The contract boundary is the system clock (age and bounds are wall
+// time): a time step forward larger than the threshold during live
+// processing (a VM pause longer than a day, a manual date edit, a start
+// before time synchronization) prematurely ages a batch. The most common
+// complication of a long VM pause — a lost DB connection — heals by
+// itself: Process will return OutcomeLeft, and the file is reprocessed
+// with a fresh batch_id. Excluding active batches from the cleanup (a
+// registry shared by the pipeline and the loop) is deliberately not
+// done: the cost of the state is out of proportion to the scenario, and
+// node clocks must be consistent (NTP/chrony in slew mode).
 //
-// Строки, оставшиеся от версий до T-098 (полностью случайный batch_id),
-// под диапазон времени почти не попадают и не удаляются вовсе — до
-// аварийного восстановления PostgreSQL, усекающего UNLOGGED-таблицу;
-// на корректность это не влияет, только место на диске.
+// Rows left over from the versions before T-098 (a fully random
+// batch_id) almost never fall into the time range and are not deleted at
+// all — until a PostgreSQL crash recovery truncates the UNLOGGED table;
+// this does not affect correctness, only disk space.
 const StaleBatchAge = 24 * time.Hour
 
-// CleanupStaleBatches удаляет из staging строки партий старше StaleBatchAge
-// (T-098) и возвращает их число. Возраст читается из самого batch_id —
-// времени создания в старших байтах (stage.go): колонки-метки времени в
-// staging нет, а диапазон по префиксу идентификатора обслуживается
-// первичным ключом. Живые партии моложе порога не задеваются; пустой
-// staging — DELETE 0.
+// CleanupStaleBatches deletes from staging the rows of batches older
+// than StaleBatchAge (T-098) and returns their count. The age is read
+// from the batch_id itself — the creation time in the high bytes
+// (stage.go): staging has no timestamp column, and the range over the
+// identifier prefix is served by the primary key. Live batches younger
+// than the threshold are not touched; an empty staging — DELETE 0.
 func CleanupStaleBatches(ctx context.Context, pool db.DB, now time.Time) (int64, error) {
 	if pool == nil {
 		return 0, errors.New("ingest: зачистка осиротевших партий staging: пул не задан")
 	}
-	// Граница возраста обязана выражаться положительными микросекундами:
-	// до 1970 года (часы на эпохе Unix — севшая батарейка RTC, старт до
-	// синхронизации) uint64-переход в batchIDBefore сделал бы границу
-	// огромной и зачистка срезала бы весь staging. Отказ (Warn в цикле)
-	// вместо удаления всего — проверяется именно граница now−StaleBatchAge,
-	// а не само now: часы на эпохе 1970-01-01 дают отрицательную границу.
+	// The age bound must be expressible as positive microseconds: before
+	// 1970 (a clock on the Unix epoch — a dead RTC battery, a start
+	// before synchronization) the uint64 cast in batchIDBefore would make
+	// the bound huge and the cleanup would cut away the whole staging. A
+	// failure (Warn in the loop) instead of deleting everything — it is
+	// the now−StaleBatchAge bound that is checked, not now itself: a
+	// clock on the 1970-01-01 epoch gives a negative bound.
 	if cutoff := now.Add(-StaleBatchAge); cutoff.UnixMicro() < 0 {
 		return 0, errors.New("ingest: зачистка осиротевших партий staging: граница возраста до 1970 года — системные часы не синхронизированы")
 	}
@@ -414,13 +429,14 @@ func CleanupStaleBatches(ctx context.Context, pool db.DB, now time.Time) (int64,
 	return tag.RowsAffected(), nil
 }
 
-// CleanupDeleted — фоновая задача очистки (ТЗ 5.1, 13.1): повторяет
-// CleanupOnce по ticker (первый проход — сразу: дренаж накопленного
-// после рестарта) до отмены ctx и возвращает nil — контракт OnRun каркаса
-// сервисов (T-012: чистое завершение по SIGTERM). Теми же проходами
-// зачищаются осиротевшие партии staging (CleanupStaleBatches, T-098).
-// Ошибка прохода не останавливает задачу и сервис: логируется (Warn),
-// очередной проход повторит — проходы идемпотентны (ТЗ 3.4).
+// CleanupDeleted — the background cleanup task (spec 5.1, 13.1):
+// repeats CleanupOnce on a ticker (the first pass — immediately: the
+// drain of what accumulated after a restart) until ctx is cancelled and
+// returns nil — the OnRun contract of the service framework (T-012: a
+// clean shutdown on SIGTERM). The same passes clean up orphaned staging
+// batches (CleanupStaleBatches, T-098). A pass error does not stop the
+// task or the service: it is logged (Warn), the next pass will retry —
+// passes are idempotent (spec 3.4).
 func CleanupDeleted(ctx context.Context, pool CleanupDB, opts CleanupOptions) error {
 	if pool == nil {
 		return errors.New("ingest: очистка удалённых доменов: пул не задан")
@@ -437,13 +453,14 @@ func CleanupDeleted(ctx context.Context, pool CleanupDB, opts CleanupOptions) er
 		res, err := CleanupOnce(ctx, pool, o)
 		switch {
 		case err != nil && ctx.Err() != nil:
-			// Отмена во время прохода — часть остановки, не тревога.
+			// A cancel during the pass is part of the shutdown, not an
+			// alarm.
 		case err != nil:
 			log.Warn("проход очистки удалённых доменов", "err", err)
 		default:
 			if res.BadHashes > 0 {
-				// Poison pill обезврежен (ING-P2-4): аномалия видна оператору,
-				// очистка продолжается.
+				// The poison pill is defused (ING-P2-4): the anomaly is
+				// visible to the operator, the cleanup continues.
 				log.Warn("удалены результаты с некорректным content_hash — refcount не менялся",
 					"bad_hashes", res.BadHashes)
 			}
@@ -451,18 +468,19 @@ func CleanupDeleted(ctx context.Context, pool CleanupDB, opts CleanupOptions) er
 				log.Info("проход очистки удалённых доменов",
 					"domains", res.Domains, "results", res.Results, "contents", res.Contents)
 			}
-			// Итог прохода — потребителям (метрика T-099): после лога,
-			// до зачистки staging — строго итог CleanupOnce.
+			// The pass result — to the consumers (the T-099 metric):
+			// after the log, before the staging cleanup — strictly the
+			// CleanupOnce result.
 			if o.OnPass != nil {
 				o.OnPass(res)
 			}
 		}
 
-		// Зачистка осиротевших партий staging (T-098) — тем же проходом
-		// цикла: первый проход сразу после старта подбирает строки,
-		// осиротевшие при гибели предыдущего запуска (kill -9, падение
-		// СУБД). Ошибка не останавливает цикл — повторит очередной
-		// проход; нулевой итог не логируется.
+		// The cleanup of orphaned staging batches (T-098) — in the same
+		// loop pass: the first pass right after the start picks up the
+		// rows orphaned by the death of the previous run (kill -9, a DB
+		// crash). An error does not stop the loop — the next pass will
+		// retry; a zero result is not logged.
 		if rows, err := CleanupStaleBatches(ctx, pool, time.Now()); err != nil {
 			if ctx.Err() == nil {
 				log.Warn("зачистка осиротевших партий staging", "err", err)

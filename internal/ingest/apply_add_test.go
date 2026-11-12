@@ -1,11 +1,12 @@
-// Юнит-тесты применения партии add (T-018, ТЗ 5.1; чанкинг T-205) без БД
-// (стиль stage_test.go / cleanup_test.go): точные SQL-тексты и параметры,
-// движение курсора пачками по PK staging (конфликтная пачка тоже
-// закрывается), накопление дельт зон и один итоговый UPDATE, транзакция
-// (Begin/Commit, откат при сбое шага), счётчики, границы (партия меньше
-// пачки, пустая партия), повторное применение (идемпотентность, ТЗ 3.4),
-// ошибки шагов, инвариант счётчиков, отмена ctx. Реальное применение —
-// интеграционные тесты ingest (T-023).
+// Unit tests of applying an add batch (T-018, spec 5.1; the chunking
+// T-205) without a DB (stage_test.go / cleanup_test.go style): exact SQL
+// texts and arguments, the cursor movement in chunks over the staging PK
+// (an all-conflict chunk is closed too), the accumulation of zone deltas
+// and a single final UPDATE, the transaction (Begin/Commit, a rollback
+// on a step failure), the counters, the edges (a batch smaller than a
+// chunk, an empty batch), repeated application (idempotency, spec 3.4),
+// step errors, the counter invariant, the ctx cancellation. Real
+// application — the ingest integration tests (T-023).
 package ingest
 
 import (
@@ -22,30 +23,31 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
-// --- фейковый пул с транзакциями ------------------------------------------
+// --- fake pool with transactions ------------------------------------------
 
-// addStageRow — строка партии в модели staging фейка.
+// addStageRow — a batch row in the fake's staging model.
 type addStageRow struct {
 	lineNo int64
 	zoneID int16
 }
 
-// applyAddPool — ApplyDB для ApplyAdd без БД: моделирует строки партии в
-// staging (staged) и отвечает на границу пачки (addChunkBoundSQL) и
-// RETURNING вставки (insertAddSQL) по диапазону курсора — конфликтами
-// считаются строки с line_no >= conflictFrom (0 — конфликтов нет, всё
-// вставляется); revive/count — заготовленные числа. Ошибки шагов — по
-// именованным полям; протокол ops фиксирует порядок применения.
-// Как и реальный pgx, отказывается работать с отменённым контекстом.
+// applyAddPool — an ApplyDB for ApplyAdd without a DB: models the batch
+// rows in staging (staged) and answers the chunk bound (addChunkBoundSQL)
+// and the insert RETURNING (insertAddSQL) over the cursor range — rows
+// with line_no >= conflictFrom count as conflicts (0 — no conflicts,
+// everything is inserted); revive/count are prepared numbers. Step
+// errors are set by named fields; the ops protocol records the
+// application order. Like real pgx, it refuses to work with a cancelled
+// context.
 type applyAddPool struct {
-	ops  []string // порядок: "begin", "commit", "query:<sql>", "exec:<sql>"
-	args [][]any  // аргументы операций в порядке вызовов
+	ops  []string // the order: "begin", "commit", "query:<sql>", "exec:<sql>"
+	args [][]any  // the operation arguments in call order
 
-	staged       []addStageRow // строки партии (модель staging, порядок line_no)
-	conflictFrom int64         // line_no, с которого строки уже существуют (конфликт)
+	staged       []addStageRow // the batch rows (the staging model, line_no order)
+	conflictFrom int64         // the line_no from which the rows already exist (a conflict)
 
-	revived int64 // ответ reviveAddSQL
-	uniques int64 // ответ countAddSQL
+	revived int64 // the reviveAddSQL answer
+	uniques int64 // the countAddSQL answer
 
 	beginErr     error
 	boundErr     error
@@ -59,8 +61,8 @@ type applyAddPool struct {
 	begins     int
 	commits    int
 	rollbacks  int
-	txArgs     [][]any // аргументы операций транзакции (zoneDelta/clear)
-	zoneCall   int     // индекс аргументов итогового UPDATE зон (последний вызов)
+	txArgs     [][]any // the transaction operation arguments (zoneDelta/clear)
+	zoneCall   int     // the index of the final zone UPDATE arguments (the last call)
 	zoneCalled bool
 }
 
@@ -70,8 +72,9 @@ func (p *applyAddPool) CopyFrom(context.Context, pgx.Identifier, []string, pgx.C
 	return 0, errors.New("applyAddPool: CopyFrom не должен вызываться")
 }
 
-// Exec и Query пула применению не нужны (всё — в транзакции): отказ, если
-// что-то вызвано мимо Begin.
+// Exec and Query of the pool are not needed by the application
+// (everything is in the transaction): fail if something is called past
+// Begin.
 func (p *applyAddPool) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
 	return pgconn.CommandTag{}, errors.New("applyAddPool: Exec вне транзакции не должен вызываться")
 }
@@ -80,8 +83,8 @@ func (p *applyAddPool) Query(context.Context, string, ...any) (pgx.Rows, error) 
 	return nil, errors.New("applyAddPool: Query вне транзакции не должен вызываться")
 }
 
-// stageRange — строки партии модели staging с line_no в (after, to];
-// to >= 1<<62 — без верхней границы (граница пачки).
+// stageRange — the batch rows of the staging model with line_no in
+// (after, to]; to >= 1<<62 — no upper bound (the chunk bound).
 func (p *applyAddPool) stageRange(after, to int64) []addStageRow {
 	var res []addStageRow
 	for _, r := range p.staged {
@@ -104,10 +107,10 @@ func (p *applyAddPool) Begin(ctx context.Context) (pgx.Tx, error) {
 	return &applyAddTx{pool: p}, nil
 }
 
-// applyAddTx — транзакция фейкового пула: все операции идут через пул
-// (протокол общий), ошибки — по именованным полям пула.
+// applyAddTx — the fake pool's transaction: all operations go through
+// the pool (a shared protocol), errors — by the pool's named fields.
 type applyAddTx struct {
-	pgx.Tx // остальные методы pgx.Tx применение не использует
+	pgx.Tx // the application does not use the rest of the pgx.Tx methods
 
 	pool      *applyAddPool
 	committed bool
@@ -143,7 +146,7 @@ func (t *applyAddTx) Query(ctx context.Context, sql string, args ...any) (pgx.Ro
 		out := cleanupRows()
 		for _, r := range p.stageRange(from, to) {
 			if p.conflictFrom > 0 && r.lineNo >= p.conflictFrom {
-				continue // существующий домен: ON CONFLICT DO NOTHING
+				continue // an existing domain: ON CONFLICT DO NOTHING
 			}
 			out.rows = append(out.rows, []any{r.zoneID})
 		}
@@ -198,14 +201,14 @@ func (t *applyAddTx) Commit(context.Context) error {
 }
 
 func (t *applyAddTx) Rollback(context.Context) error {
-	// После Commit откат — no-op (как ErrTxClosed реального pgx).
+	// After Commit the rollback is a no-op (like real pgx's ErrTxClosed).
 	if !t.committed {
 		t.pool.rollbacks++
 	}
 	return nil
 }
 
-// stageLines — модель партии: строки 1..n в одной зоне.
+// stageLines — the batch model: rows 1..n in one zone.
 func stageLines(n int, zone int16) []addStageRow {
 	rows := make([]addStageRow, n)
 	for i := range rows {
@@ -214,16 +217,16 @@ func stageLines(n int, zone int16) []addStageRow {
 	return rows
 }
 
-// applyAddOps — ожидаемый порядок операций применения с вставками:
-// транзакция → пачки (граница, вставка) до исчерпания → дельты зон →
-// возврат → подсчёт → очистка → фиксация.
+// applyAddOps — the expected order of the application operations with
+// inserts: transaction → chunks (the bound, the insert) until exhausted →
+// the zone deltas → the revive → the count → the cleanup → the commit.
 func applyAddOps(chunks int) []string {
 	ops := []string{"begin"}
 	for i := 0; i < chunks; i++ {
 		ops = append(ops, "query:"+addChunkBoundSQL, "query:"+insertAddSQL)
 	}
 	ops = append(ops,
-		"query:"+addChunkBoundSQL, // партия исчерпана
+		"query:"+addChunkBoundSQL, // the batch is exhausted
 		"exec:"+zoneDeltaAddSQL,
 		"query:"+reviveAddSQL,
 		"query:"+countAddSQL,
@@ -233,13 +236,13 @@ func applyAddOps(chunks int) []string {
 	return ops
 }
 
-// ---------------------------------------------------------------- сценарии
+// ---------------------------------------------------------------- scenarios
 
 func TestApplyAdd(t *testing.T) {
-	b := validBatch(t) // зона 7, add — как после EnsureZone и Stage
+	b := validBatch(t) // zone 7, add — as after EnsureZone and Stage
 	pool := &applyAddPool{
-		staged:       stageLines(10, 7), // партия одной пачкой (10 < 50 000)
-		conflictFrom: 6,                 // строки 6–10 уже существуют
+		staged:       stageLines(10, 7), // the batch in one chunk (10 < 50,000)
+		conflictFrom: 6,                 // rows 6–10 already exist
 		revived:      3,
 		uniques:      10,
 	}
@@ -255,8 +258,9 @@ func TestApplyAdd(t *testing.T) {
 		t.Errorf("Total() = %d, want 10", res.Total())
 	}
 
-	// Порядок: транзакция → граница/вставка пачки → граница (пусто) →
-	// дельты зон → возврат → подсчёт → очистка → фиксация.
+	// The order: transaction → the chunk bound/insert → the bound
+	// (empty) → the zone deltas → the revive → the count → the cleanup →
+	// the commit.
 	if got, want := strings.Join(pool.ops, "\n"), strings.Join(applyAddOps(1), "\n"); got != want {
 		t.Errorf("порядок операций:\n%s\nwant:\n%s", got, want)
 	}
@@ -264,12 +268,14 @@ func TestApplyAdd(t *testing.T) {
 		t.Errorf("транзакций: begin %d, commit %d, rollback %d, want 1/1/0", pool.begins, pool.commits, pool.rollbacks)
 	}
 
-	// Пачка адресует свою партию и диапазон курсора от нуля до границы.
+	// The chunk addresses its own batch and the cursor range from zero
+	// to the bound.
 	wantArgs := []any{[]byte(b.ID[:]), int16(model.ActionAdd), int64(0), int64(10)}
 	if !reflect.DeepEqual(pool.args[1], wantArgs) {
 		t.Errorf("аргументы вставки = %v, want [batch_id, action=%d, line_no > 0, line_no <= 10]", pool.args[1], int16(model.ActionAdd))
 	}
-	// Дельты зон — один итоговый оператор по накопленному zone_id→n.
+	// The zone deltas — one final statement over the accumulated
+	// zone_id→n.
 	if !pool.zoneCalled {
 		t.Fatal("итоговый UPDATE дельт зон не выполнен")
 	}
@@ -278,12 +284,13 @@ func TestApplyAdd(t *testing.T) {
 	}
 }
 
-// TestApplyAdd_Chunks — партия больше пачки (T-205): 12 строк пачками по
-// 5 — диапазоны (0,5], (5,10], (10,12]; Inserted — сумма вставок пачек,
-// дельты зон — один оператор по накоплениям всех пачек.
+// TestApplyAdd_Chunks — a batch bigger than a chunk (T-205): 12 rows in
+// chunks of 5 — the ranges (0,5], (5,10], (10,12]; Inserted — the sum of
+// the chunk inserts, the zone deltas — one statement over the
+// accumulations of all chunks.
 func TestApplyAdd_Chunks(t *testing.T) {
 	b := validBatch(t)
-	// Две зоны: строки 1–6 в зоне 7, 7–12 в зоне 9.
+	// Two zones: rows 1–6 in zone 7, 7–12 in zone 9.
 	staged := stageLines(6, 7)
 	staged = append(staged, stageLines(6, 9)...)
 	for i := 6; i < len(staged); i++ {
@@ -302,18 +309,19 @@ func TestApplyAdd_Chunks(t *testing.T) {
 		t.Errorf("порядок операций:\n%s\nwant:\n%s", got, want)
 	}
 
-	// Диапазоны пачек продолжают друг друга по PK staging.
+	// The chunk ranges continue one another over the staging PK.
 	wantRanges := [][2]int64{{0, 5}, {5, 10}, {10, 12}}
 	for i, want := range wantRanges {
-		args := pool.args[1+2*i] // вставки чередуются с границами
+		args := pool.args[1+2*i] // inserts alternate with bounds
 		got := [2]int64{args[2].(int64), args[3].(int64)}
 		if got != want {
 			t.Errorf("пачка %d: диапазон (курсор, граница] = %v, want %v", i+1, got, want)
 		}
 	}
 
-	// Дельты двух зон накоплены всеми пачками и применены одним
-	// оператором: зона 7 × 6, зона 9 × 6, порядок zone_id детерминирован.
+	// The deltas of the two zones are accumulated by all the chunks and
+	// applied by one statement: zone 7 × 6, zone 9 × 6, the zone_id order
+	// is deterministic.
 	if !pool.zoneCalled {
 		t.Fatal("итоговый UPDATE дельт зон не выполнен")
 	}
@@ -322,15 +330,15 @@ func TestApplyAdd_Chunks(t *testing.T) {
 	}
 }
 
-// TestApplyAdd_ConflictChunkAdvances — пачка из одних конфликтов
-// (ON CONFLICT DO NOTHING пропустил всё) обязана закрывать курсор по
-// диапазону staging, а не по вставленным строкам — иначе применение
-// партии из сплошных существующих доменов зациклилось бы (T-205).
+// TestApplyAdd_ConflictChunkAdvances — a chunk of nothing but conflicts
+// (ON CONFLICT DO NOTHING skipped everything) must close the cursor over
+// the staging range, not over the inserted rows — otherwise applying a
+// batch of all-existing domains would loop forever (T-205).
 func TestApplyAdd_ConflictChunkAdvances(t *testing.T) {
 	b := validBatch(t)
 	pool := &applyAddPool{
 		staged:       stageLines(8, 7),
-		conflictFrom: 1, // все строки партии уже существуют
+		conflictFrom: 1, // all the batch rows already exist
 		uniques:      8,
 	}
 
@@ -341,13 +349,14 @@ func TestApplyAdd_ConflictChunkAdvances(t *testing.T) {
 	if res.Inserted != 0 || res.Revived != 0 || res.Existing != 8 {
 		t.Errorf("результат = %+v, want конфликтная партия: Inserted/Revived 0, Existing 8", res)
 	}
-	// Три пачки по диапазону (0,3], (3,6], (6,8] — курсор дошёл до конца;
-	// вставок нет — дельты зон не применяются вовсе.
+	// Three chunks over the ranges (0,3], (3,6], (6,8] — the cursor
+	// reached the end; no inserts — the zone deltas are not applied at
+	// all.
 	want := append([]string{"begin"},
 		"query:"+addChunkBoundSQL, "query:"+insertAddSQL,
 		"query:"+addChunkBoundSQL, "query:"+insertAddSQL,
 		"query:"+addChunkBoundSQL, "query:"+insertAddSQL,
-		"query:"+addChunkBoundSQL, // партия исчерпана
+		"query:"+addChunkBoundSQL, // the batch is exhausted
 		"query:"+reviveAddSQL,
 		"query:"+countAddSQL,
 		"exec:"+clearStageSQL,
@@ -361,9 +370,9 @@ func TestApplyAdd_ConflictChunkAdvances(t *testing.T) {
 	}
 }
 
-// TestApplyAdd_EmptyBatch — пустая партия (или уже применённая, staging
-// пуст): данные не меняются, результат нулевой; транзакция открывается,
-// вставки нет, дельты зон не применяются.
+// TestApplyAdd_EmptyBatch — an empty batch (or an already applied one,
+// staging empty): the data is not changed, the result is zero; the
+// transaction is opened, no insert, the zone deltas are not applied.
 func TestApplyAdd_EmptyBatch(t *testing.T) {
 	pool := &applyAddPool{}
 
@@ -376,7 +385,7 @@ func TestApplyAdd_EmptyBatch(t *testing.T) {
 	}
 	want := []string{
 		"begin",
-		"query:" + addChunkBoundSQL, // партия исчерпана сразу
+		"query:" + addChunkBoundSQL, // the batch is exhausted right away
 		"query:" + reviveAddSQL,
 		"query:" + countAddSQL,
 		"exec:" + clearStageSQL,
@@ -390,10 +399,10 @@ func TestApplyAdd_EmptyBatch(t *testing.T) {
 	}
 }
 
-// TestApplyAdd_Reapply — повторное применение той же партии (ТЗ 3.4):
-// после первой попытки все домены существуют — повторная загрузка тех же
-// строк конфликтует, вставок и дельт нет, данные сходятся к тому же
-// итогу (счётчики повторного прогона отражают текущее состояние).
+// TestApplyAdd_Reapply — re-applying the same batch (spec 3.4): after
+// the first attempt all the domains exist — re-loading the same rows
+// conflicts, no inserts or deltas, the data converges to the same result
+// (the counters of the repeated run reflect the current state).
 func TestApplyAdd_Reapply(t *testing.T) {
 	b := validBatch(t)
 	pool := &applyAddPool{staged: stageLines(10, 7), uniques: 10}
@@ -406,8 +415,8 @@ func TestApplyAdd_Reapply(t *testing.T) {
 		t.Fatalf("первое применение = %+v, want Inserted 10", first)
 	}
 
-	// Партия загружена заново тем же batch_id (Stage затирает свою
-	// партию), домены уже в БД — сплошные конфликты.
+	// The batch is loaded again with the same batch_id (Stage wipes its
+	// own batch), the domains are already in the DB — all conflicts.
 	pool.staged = stageLines(10, 7)
 	pool.conflictFrom = 1
 	second, err := ApplyAdd(context.Background(), pool, b, 4)
@@ -447,16 +456,17 @@ func TestApplyAdd_Validation(t *testing.T) {
 	}
 }
 
-// TestApplyAdd_StepErrors — сбой каждого шага возвращает обёрнутую
-// ошибку, транзакция откатывается (строки остаются в staging, повторное
-// применение безопасно, ТЗ 3.4), очистка и фиксация не выполняются.
+// TestApplyAdd_StepErrors — a failure of each step returns a wrapped
+// error, the transaction is rolled back (the rows stay in staging, the
+// repeated application is safe, spec 3.4), the cleanup and the commit do
+// not run.
 func TestApplyAdd_StepErrors(t *testing.T) {
 	boom := errors.New("соединение потеряно")
 	cases := []struct {
 		name    string
 		set     func(*applyAddPool)
-		wantOps int    // обращений до сбоя включительно
-		want    string // фрагмент ожидаемой ошибки
+		wantOps int    // calls up to and including the failure
+		want    string // a fragment of the expected error
 	}{
 		{"сбой транзакции", func(p *applyAddPool) { p.beginErr = boom }, 0, "транзакция"},
 		{"сбой границы пачки", func(p *applyAddPool) { p.boundErr = boom }, 2, "граница пачки"},
@@ -492,9 +502,9 @@ func TestApplyAdd_StepErrors(t *testing.T) {
 	}
 }
 
-// TestApplyAdd_CountInvariant — подсчёт меньше вставленного и
-// возвращённого: счётчики расходятся, применение признаётся ошибочным,
-// транзакция откатывается.
+// TestApplyAdd_CountInvariant — the count is less than the inserted plus
+// the revived: the counters diverge, the application is declared failed,
+// the transaction is rolled back.
 func TestApplyAdd_CountInvariant(t *testing.T) {
 	pool := &applyAddPool{
 		staged:  stageLines(5, 7),
@@ -511,8 +521,8 @@ func TestApplyAdd_CountInvariant(t *testing.T) {
 	}
 }
 
-// TestApplyAdd_ContextCanceled — отменённый контекст отказывает на
-// открытии транзакции (как реальный pgx), партия не применяется.
+// TestApplyAdd_ContextCanceled — a cancelled context fails at the
+// transaction start (like real pgx), the batch is not applied.
 func TestApplyAdd_ContextCanceled(t *testing.T) {
 	pool := &applyAddPool{}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -527,7 +537,7 @@ func TestApplyAdd_ContextCanceled(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------- контракт SQL
+// ---------------------------------------------------------------- the SQL contract
 
 const (
 	wantAddChunkBoundSQL = "SELECT COALESCE(max(t.line_no), 0) FROM (" +
@@ -565,10 +575,11 @@ const (
 		"WHERE s.batch_id = $1 AND s.action = $2) AS t"
 )
 
-// TestApplyAdd_SQLContract — точные тексты SQL применения и связь
-// литералов с константами модели: курсор пачек опирается на PK staging
-// (batch_id, line_no, миграция 000004), ON CONFLICT — на уникальный
-// (zone_id, label) партиций domains (миграция 000001).
+// TestApplyAdd_SQLContract — the exact SQL texts of the application and
+// the tie between the literals and the model constants: the chunk cursor
+// relies on the staging PK (batch_id, line_no, migration 000004), ON
+// CONFLICT — on the unique (zone_id, label) of the domains partitions
+// (migration 000001).
 func TestApplyAdd_SQLContract(t *testing.T) {
 	if addChunkBoundSQL != wantAddChunkBoundSQL {
 		t.Errorf("addChunkBoundSQL = %q,\nwant %q", addChunkBoundSQL, wantAddChunkBoundSQL)
@@ -586,9 +597,10 @@ func TestApplyAdd_SQLContract(t *testing.T) {
 		t.Errorf("countAddSQL = %q,\nwant %q", countAddSQL, wantAddCountSQL)
 	}
 
-	// Литералы в текстах выше обязаны следовать за кодами модели (ТЗ 6.2,
-	// 5.2 п. 9): при изменении кодов тексты пересобираются сами — тест
-	// ловит рассинхронизацию рукописного литерала.
+	// The literals in the texts above must follow the model codes
+	// (spec 6.2, 5.2 item 9): when the codes change the texts are rebuilt
+	// by themselves — the test catches a desync of the hand-written
+	// literal.
 	if int16(model.StatusNew) != 0 || int16(model.StatusDeleted) != 6 ||
 		int16(model.CheckStatePending) != 0 || int16(model.FlagIDN) != 1 {
 		t.Errorf("коды модели изменились (new=%d deleted=%d pending=%d is_idn=%d): обновите литералы в wantAdd*SQL",
@@ -599,29 +611,30 @@ func TestApplyAdd_SQLContract(t *testing.T) {
 	if !strings.Contains(up, "UNIQUE (zone_id, label)") {
 		t.Error("в миграции 000001 нет UNIQUE (zone_id, label) — ON CONFLICT DO NOTHING нечему конфликтовать (ТЗ 5.1)")
 	}
-	// Курсор пачек — PK staging: без него ORDER BY line_no не обслуживается
-	// индексом и граница пачки читала бы всю партию (T-205).
+	// The chunk cursor — the staging PK: without it the ORDER BY line_no
+	// is not served by an index and the chunk bound would read the whole
+	// batch (T-205).
 	stage := readMigration(t, "000004_ingest_staging.up.sql")
 	if !strings.Contains(stage, "PRIMARY KEY (batch_id, line_no)") {
 		t.Error("в миграции 000004 нет PRIMARY KEY (batch_id, line_no) — курсор пачек применения не обслуживается ключом (T-205)")
 	}
 }
 
-// TestInsertAddIDNConditionEquivalent — условие is_idn в insertAddSQL
-// ('xn--%' OR '%.xn--%') эквивалентно idn.HasXNLabel (ТЗ 5.2 п. 9) на
-// простых и составных метках (ING-P1-1): «любая метка имени начинается
-// с xn--».
+// TestInsertAddIDNConditionEquivalent — the is_idn condition in
+// insertAddSQL ('xn--%' OR '%.xn--%') is equivalent to idn.HasXNLabel
+// (spec 5.2 item 9) on simple and composite labels (ING-P1-1): "any name
+// label starts with xn--".
 func TestInsertAddIDNConditionEquivalent(t *testing.T) {
 	prefixFold := func(s, p string) bool {
 		return len(s) >= len(p) && strings.EqualFold(s[:len(p)], p)
 	}
-	ilike := func(label string) bool { // семантика 'xn--%' OR '%.xn--%'
+	ilike := func(label string) bool { // the semantics of 'xn--%' OR '%.xn--%'
 		return prefixFold(label, "xn--") ||
 			strings.Contains(strings.ToLower(label), ".xn--")
 	}
 	labels := []string{
 		"example", "xn--e1afmkfd",
-		"shop.xn--p1ai", "xn--p1ai.shop", // расходились до фикса
+		"shop.xn--p1ai", "xn--p1ai.shop", // diverged before the fix
 		"xn--80aairftm.xn--p1ai", "sub.example", "sub.xn--e1afmkfd.example",
 		"XN--E1AFMKFD", "sub.XN--e1afmkfd",
 	}

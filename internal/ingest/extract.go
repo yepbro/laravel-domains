@@ -1,15 +1,16 @@
-// Извлечение домена из произвольной строки (T-132 — расширение ТЗ 5.1,
-// этап 16): реальные выгрузки регистраторов и публичные дампы несут
-// посторонние данные («xxx.com 2029-11-11 TIMEWEB», CSV, URL), а не
-// только полное имя домена. extractCandidates решает, подлежит ли
-// строка извлечению, и собирает кандидатов; конвейер валидации имён
-// (ТЗ 5.2 пп. 1–6) не меняется — извлечение лишь выбирает, какой токен
-// строки идёт в него (интеграция — Validator.Line).
+// Extracting a domain from an arbitrary line (T-132 — an extension of
+// spec 5.1, stage 16): real registrar exports and public dumps carry
+// foreign data ("xxx.com 2029-11-11 TIMEWEB", CSV, URLs), not just a
+// full domain name. extractCandidates decides whether a line is subject
+// to extraction and collects the candidates; the name validation
+// pipeline (spec 5.2 items 1–6) is unchanged — extraction only picks
+// which token of the line goes into it (the integration point is
+// Validator.Line).
 //
-// Одиночная строка — без разделителей и без явной схемы http(s) —
-// извлечению не подлежит и проходит прежний путь валидации без
-// изменений: нулевая регрессия для сегодняшних файлов, точность причин
-// одиночных строк сохранена.
+// A single line — no separators and no explicit http(s) scheme — is not
+// subject to extraction and goes through the previous validation path
+// unchanged: zero regression for today's files, the reason accuracy for
+// single lines is preserved.
 package ingest
 
 import (
@@ -18,35 +19,36 @@ import (
 	"unicode"
 )
 
-// isSeparator — предикат разделителя токенов (T-132): пробельный символ
-// (unicode.IsSpace — тот же предикат, что в idn.cleanup и парсере),
-// запятая или точка с запятой. Пробел внутри строки — разделитель полей
-// выгрузки, а не помарка в имени: склейка «при мер.рф» → «пример.рф»
-// ушла вместе с прежней интерпретацией (кандидатом становится токен
-// с точкой — мер.рф).
+// isSeparator — the token separator predicate (T-132): a whitespace
+// character (unicode.IsSpace — the same predicate as in idn.cleanup and
+// the parser), a comma or a semicolon. A space inside a line is a field
+// separator of the export, not a typo in the name: gluing
+// "при мер.рф" → "пример.рф" went away together with the old
+// interpretation (the token with a dot becomes the candidate — мер.рф).
 func isSeparator(r rune) bool {
 	return unicode.IsSpace(r) || r == ',' || r == ';'
 }
 
-// hasSeparator — есть ли в строке хотя бы один разделитель токенов.
+// hasSeparator — whether the line has at least one token separator.
 func hasSeparator(s string) bool {
 	return strings.IndexFunc(s, isSeparator) >= 0
 }
 
-// splitTokens — разбиение строки на токены по разделителям isSeparator;
-// пустые токены между соседними разделителями отбрасываются
-// (strings.FieldsFunc): «"xxx.com",» даёт один токен-кандидат.
+// splitTokens — splitting a line into tokens by the isSeparator
+// separators; empty tokens between adjacent separators are dropped
+// (strings.FieldsFunc): "xxx.com", yields one candidate token.
 func splitTokens(line string) []string {
 	return strings.FieldsFunc(line, isSeparator)
 }
 
-// isQuoteOrPunct — кавычки (обратная кавычка не входит в
-// unicode.IsPunct — условная, отдельно) и пунктуация unicode, кроме
-// дефисов (Pd) и соединителей (Pc, подчёркивание): обрамления CSV,
-// концевые точки и скобки — не часть имени, а краевые «-»/«_» — части
-// имени. Их срез подменял бы токен другим доменом («_dmarc.example.com»
-// → «dmarc.example.com»): такое имя обязано идти в конвейер как есть и
-// провалиться нормализацией (STD3), а не превращаться в чужое валидное.
+// isQuoteOrPunct — quotes (the backtick is not in unicode.IsPunct —
+// conditional, handled separately) and unicode punctuation, except
+// hyphens (Pd) and connectors (Pc, the underscore): CSV framing,
+// trailing dots and brackets are not part of a name, while edge "-"/"_"
+// are parts of a name. Cutting them would substitute the token with
+// another domain ("_dmarc.example.com" → "dmarc.example.com"): such a
+// name must go into the pipeline as is and fail normalization (STD3),
+// not turn into someone else's valid name.
 func isQuoteOrPunct(r rune) bool {
 	if r == '"' || r == '\'' || r == '`' {
 		return true
@@ -55,17 +57,17 @@ func isQuoteOrPunct(r rune) bool {
 		!unicode.Is(unicode.Pd, r) && !unicode.Is(unicode.Pc, r)
 }
 
-// trimToken снимает кавычки и пунктуацию с краёв токена («"xxx.com",» →
-// xxx.com). Внутренние символы не трогаются: точки и дефисы внутри
-// имени значимы, срезается только обрамление.
+// trimToken strips quotes and punctuation from the token edges
+// ("xxx.com", → xxx.com). Inner characters are not touched: dots and
+// hyphens inside a name are significant, only the framing is cut.
 func trimToken(tok string) string {
 	return strings.TrimFunc(tok, isQuoteOrPunct)
 }
 
-// hasSchemePrefix — начинается ли токен с явной схемы http(s):// —
-// регистронезависимо (EqualFold, ASCII-префиксы) и без аллокации:
-// извлечение спрашивает это у каждого токена, ingest потоковый
-// (ТЗ 3.5), ToLower на каждый токен — лишняя работа.
+// hasSchemePrefix — whether the token starts with an explicit
+// http(s):// scheme — case-insensitively (EqualFold, ASCII prefixes)
+// and without allocation: extraction asks this of every token, and
+// ingest is streaming (spec 3.5); a ToLower per token is extra work.
 func hasSchemePrefix(tok string) bool {
 	for _, scheme := range [...]string{"http://", "https://"} {
 		if len(tok) >= len(scheme) && strings.EqualFold(tok[:len(scheme)], scheme) {
@@ -75,15 +77,17 @@ func hasSchemePrefix(tok string) bool {
 	return false
 }
 
-// urlHost — хост токена с явной схемой http(s) (hasSchemePrefix, регистр
-// схемы не важен). Токен-URL не является именем домена, но несёт его в
-// хосте: net/url отделяет хост от схемы, userinfo, порта и пути
-// (Hostname — порт срезан). ok = false — токен не начинается со схемы
-// http(s): другие схемы («ftp://…») не заменяются — такой токен останется
-// кандидатом и не пройдёт нормализацию. Ошибка разбора или пустой хост —
-// пустая строка: домена в токене нет. IPv6-хост точек не содержит и
-// кандидатом не станет; IPv4 (в том числе IPv4-mapped) — станет и будет
-// отвергнут конвейером валидации, как и любой IP-литерал.
+// urlHost — the host of a token with an explicit http(s) scheme
+// (hasSchemePrefix, the scheme case does not matter). A URL token is not
+// a domain name, but carries one in its host: net/url separates the
+// host from the scheme, userinfo, port and path (Hostname — the port is
+// cut off). ok = false — the token does not start with an http(s)
+// scheme: other schemes ("ftp://…") are not substituted — such a token
+// stays a candidate and fails normalization. A parse error or an empty
+// host — an empty string: there is no domain in the token. An IPv6 host
+// contains no dots and will not become a candidate; an IPv4 (including
+// IPv4-mapped) will, and will be rejected by the validation pipeline,
+// like any IP literal.
 func urlHost(tok string) (host string, ok bool) {
 	if !hasSchemePrefix(tok) {
 		return "", false
@@ -95,34 +99,34 @@ func urlHost(tok string) (host string, ok bool) {
 	return u.Hostname(), true
 }
 
-// extractCandidates — шаг извлечения T-132: возвращает кандидатов
-// (токены, содержащие точку, в порядке слева направо) и признак того,
-// что строка подлежит извлечению. Кандидат без точки — не домен
-// (даты 2029-11-11, слова); проверку кандидата берёт на себя полный
-// конвейер валидации — здесь только выбор токенов.
+// extractCandidates — the extraction step of T-132: returns the
+// candidates (tokens containing a dot, left to right) and whether the
+// line is subject to extraction. A candidate without a dot is not a
+// domain (dates 2029-11-11, words); checking a candidate is the job of
+// the full validation pipeline — here it is only token selection.
 //
-// Одиночная строка без разделителей: единственное исключение прежнего
-// пути — явная схема http(s) (токен-URL доменом быть не может, прежняя
-// причина «invalid» теряла хост с путём). Крайние пробелы снимаются до
-// решения: строка из одних пробелов остаётся прежним случаем empty
-// (парсер такие строки не доставляет, но контракт Line — для любого
-// вызова).
+// A single line without separators: the only exception to the previous
+// path is an explicit http(s) scheme (a URL token cannot be a domain,
+// the previous "invalid" reason lost the host with the path). Edge
+// spaces are trimmed before the decision: a line of only spaces stays
+// the previous empty case (the parser does not deliver such lines, but
+// the Line contract is for any call).
 func extractCandidates(line string) (cands []string, extract bool) {
 	tok := strings.TrimFunc(line, unicode.IsSpace)
 	if !hasSeparator(tok) {
 		host, isURL := urlHost(tok)
 		if !isURL {
-			return nil, false // прежний путь: одиночный токен
+			return nil, false // the previous path: a single token
 		}
 		if strings.Contains(host, ".") {
 			return []string{host}, true
 		}
-		return nil, true // URL, но хост без точки — домена нет
+		return nil, true // a URL, but the host has no dot — no domain
 	}
 	for _, t := range splitTokens(tok) {
 		t = trimToken(t)
 		if host, isURL := urlHost(t); isURL {
-			t = host // схема, порт и путь срезаны
+			t = host // the scheme, port and path are cut off
 		}
 		if strings.Contains(t, ".") {
 			cands = append(cands, t)

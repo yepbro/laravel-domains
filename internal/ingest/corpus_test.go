@@ -1,18 +1,19 @@
-// Сквозной корпус ingest — задача T-022 (ТЗ 11.1: «парсинг файлов:
-// пустые строки, комментарии, CRLF, BOM, дубликаты, строки не из зоны»).
-// В отличие от тестов T-015 (парсер сам по себе) и T-016 (валидатор сам
-// по себе) корпус гонит файл через оба этапа так, как их соединит
-// потребитель T-017: Parse отдаёт значимые строки и построчные
-// отклонения (невалидный UTF-8, лимит длины), Validator превращает
-// строки в Entry зоны пути либо в причину отклонения. Лог rejected
-// пишется в io.Discard: формат записей закреплён тестами T-016, корпус
-// проверяет конвейер целиком.
+// The end-to-end ingest corpus — task T-022 (spec 11.1: "parsing files:
+// empty rows, comments, CRLF, BOM, duplicates, rows not of the zone").
+// Unlike the T-015 tests (the parser on its own) and the T-016 tests
+// (the validator on its own), the corpus runs a file through both stages
+// the way the T-017 consumer connects them: Parse yields the meaningful
+// rows and the per-row rejections (invalid UTF-8, the length limit),
+// Validator turns the rows into an Entry of the path's zone or into a
+// rejection reason. The rejected log goes to io.Discard: the record
+// format is pinned by the T-016 tests, the corpus checks the pipeline as
+// a whole.
 //
-// Контракты корпуса: дубликаты строк (и unicode/punycode формы одного
-// IDN-домена) дают по записи на каждое вхождение — дедуп лежит на БД
-// (T-018, INSERT … ON CONFLICT DO NOTHING); каждая значимая строка
-// парсера доходит до валидатора (Stats.Data = ValidatorStats.Total),
-// построчные отклонения парсера — нет.
+// The corpus contracts: duplicate rows (and the unicode/punycode forms
+// of one IDN domain) yield a record per occurrence — the dedup is the
+// DB's job (T-018, INSERT … ON CONFLICT DO NOTHING); every meaningful
+// parser row reaches the validator (Stats.Data = ValidatorStats.Total),
+// the per-row parser rejections do not.
 package ingest
 
 import (
@@ -23,24 +24,25 @@ import (
 	"testing"
 )
 
-// corpusEntry — ожидаемая валидная запись: номер физической строки и
-// Entry для загрузки (T-017).
+// corpusEntry — an expected valid record: the physical row number and
+// the Entry to load (T-017).
 type corpusEntry struct {
 	num   int
 	entry Entry
 }
 
-// corpusReject — ожидаемое отклонение валидатора: номер физической
-// строки и причина.
+// corpusReject — an expected validator rejection: the physical row
+// number and the reason.
 type corpusReject struct {
 	num    int
 	reason Reason
 }
 
-// corpusCase — сквозной кейс «файл → строки → записи/отклонения»:
-// содержимое файла in, зона пути, порог доли ошибок (0 — дефолт),
-// счётчики обоих этапов, вердикт файла, записи, отклонения валидатора
-// и построчные отклонения парсера (в порядке строк).
+// corpusCase — an end-to-end case "file → rows → records/rejections":
+// the file content in, the path's zone, the error-share threshold
+// (0 — default), the counters of both stages, the file verdict, the
+// records, the validator rejections and the per-row parser rejections
+// (in row order).
 type corpusCase struct {
 	name    string
 	zone    string
@@ -54,12 +56,14 @@ type corpusCase struct {
 	parsed  []gotReject
 }
 
-// corpusLongName — имя из 254 октет (63+63+63+62 и три точки): длиннее
-// лимита 253 октет в ASCII-форме (ТЗ 5.2 п. 4) — ReasonNameLen.
+// corpusLongName — a name of 254 octets (63+63+63+62 and three dots):
+// longer than the 253-octet limit in the ASCII form (spec 5.2 item 4) —
+// ReasonNameLen.
 var corpusLongName = strings.Repeat("a", 63) + "." + strings.Repeat("b", 63) + "." +
 	strings.Repeat("c", 63) + "." + strings.Repeat("d", 62)
 
-// corpusResult — итог сквозного прогона файла по конвейеру.
+// corpusResult — the result of an end-to-end file run through the
+// pipeline.
 type corpusResult struct {
 	stats   Stats
 	res     FileResult
@@ -68,10 +72,11 @@ type corpusResult struct {
 	parsed  []gotReject
 }
 
-// corpusRun — сквозной прогон кейса: парсер T-015 + валидатор T-016,
-// соединённые как в T-017; rejected-логгер пишет в io.Discard.
-// Многоуровневая зона каталога — в allowlist (ТЗТ §5.1): корпус
-// проверяет построчную семантику, gate — TestNewValidator.
+// corpusRun — an end-to-end run of the case: the T-015 parser + the
+// T-016 validator, connected as in T-017; the rejected logger writes to
+// io.Discard. The multi-level directory zone — in the allowlist
+// (the tld-only-zones spec §5.1): the corpus checks the per-row
+// semantics, the gate — TestNewValidator.
 func corpusRun(t *testing.T, tc corpusCase) corpusResult {
 	t.Helper()
 	var allowed []string
@@ -111,30 +116,31 @@ func corpusRun(t *testing.T, tc corpusCase) corpusResult {
 	return out
 }
 
-// TestCorpusFile — корпус сквозных кейсов файла (ТЗ 11.1).
+// TestCorpusFile — the corpus of the file's end-to-end cases
+// (spec 11.1).
 func TestCorpusFile(t *testing.T) {
 	tests := []corpusCase{
-		// ТЗ 11.1: пустой файл.
+		// Spec 11.1: an empty file.
 		{
 			name: "пустой файл",
 			zone: "com",
 		},
-		// ТЗ 11.1: файл только из комментариев (в том числе с ведущими
-		// пробелами — первый значимый символ «#»).
+		// Spec 11.1: a file of only comments (including ones with leading
+		// spaces — the first meaningful character "#").
 		{
 			name:  "файл только из комментариев",
 			zone:  "com",
 			in:    "# домены зоны com\r\n  # комментарий с ведущими пробелами\n#\n",
 			stats: Stats{Total: 3, Skipped: 3},
 		},
-		// ТЗ 11.1: пустые строки.
+		// Spec 11.1: empty rows.
 		{
 			name:  "файл из пустых строк",
 			zone:  "com",
 			in:    "\n\r\n \t \n",
 			stats: Stats{Total: 3, Skipped: 3},
 		},
-		// ТЗ 11.1: CRLF-файл.
+		// Spec 11.1: a CRLF file.
 		{
 			name:   "CRLF-файл",
 			zone:   "com",
@@ -146,7 +152,7 @@ func TestCorpusFile(t *testing.T) {
 				{3, Entry{"com", "shop", false}},
 			},
 		},
-		// ТЗ 11.1: BOM-файл — BOM снимается в начале файла.
+		// Spec 11.1: a BOM file — the BOM is stripped at the file start.
 		{
 			name:   "BOM-файл",
 			zone:   "com",
@@ -158,8 +164,9 @@ func TestCorpusFile(t *testing.T) {
 				{2, Entry{"com", "shop", false}},
 			},
 		},
-		// BOM в середине файла остаётся в данных (парсер не трогает) и
-		// убирается нормализацией UTS-46 — разборка ролей этапов.
+		// A BOM in the middle of the file stays in the data (the parser
+		// does not touch it) and is removed by the UTS-46 normalization —
+		// separating the stages' roles.
 		{
 			name:   "BOM в середине файла — в данных, убирает нормализация",
 			zone:   "com",
@@ -171,9 +178,10 @@ func TestCorpusFile(t *testing.T) {
 				{2, Entry{"com", "b", false}},
 			},
 		},
-		// ТЗ 11.1: дубликаты строк. Контракт: каждое вхождение валидно и
-		// даёт свою запись (нормализация сводит формы к одной метке),
-		// дедуп — задача БД (T-018), конвейер не отбрасывает повтор.
+		// Spec 11.1: duplicate rows. The contract: each occurrence is
+		// valid and yields its record (normalization reduces the forms to
+		// one label); the dedup is the DB's job (T-018), the pipeline does
+		// not drop the repeat.
 		{
 			name:   "дубликаты строк — дедуп на БД (T-018), не на конвейере",
 			zone:   "com",
@@ -186,9 +194,10 @@ func TestCorpusFile(t *testing.T) {
 				{3, Entry{"com", "example", false}},
 			},
 		},
-		// ТЗ 11.1: строки не из зоны пути. Доля отказов ~1 (3 из 4)
-		// превышает порог по умолчанию 0.1 — файл ошибочен целиком
-		// (сигнал failed/ для T-021), но строки разобраны и посчитаны.
+		// Spec 11.1: rows not of the path's zone. The rejection share ~1
+		// (3 of 4) exceeds the default threshold 0.1 — the file is bad as
+		// a whole (the failed/ signal for T-021), but the rows are parsed
+		// and counted.
 		{
 			name:   "файл не из зоны пути — доля ошибок роняет файл",
 			zone:   "com",
@@ -205,9 +214,10 @@ func TestCorpusFile(t *testing.T) {
 				{4, ReasonWrongZone},
 			},
 		},
-		// 2LD-регистрация в TLD-зоне пути (ТЗТ §5.3): example.co.uk
-		// в каталоге uk — бывший wrong_zone, теперь accept с составной
-		// меткой example.co (зона имени — TLD uk).
+		// 2LD registration in the path's TLD zone (the tld-only-zones spec
+		// §5.3): example.co.uk in the uk directory — a former wrong_zone,
+		// now an accept with the composite label example.co (the name's
+		// zone — the TLD uk).
 		{
 			name:   "2LD-регистрация в TLD-зоне пути: example.co.uk в зоне uk",
 			zone:   "uk",
@@ -219,7 +229,8 @@ func TestCorpusFile(t *testing.T) {
 				{2, Entry{"uk", "example.co", false}},
 			},
 		},
-		// Составная зона пути и составная метка (контракт idn, T-010).
+		// A composite path zone and a composite label (the idn contract,
+		// T-010).
 		{
 			name:   "составная зона пути co.uk",
 			zone:   "co.uk",
@@ -235,10 +246,11 @@ func TestCorpusFile(t *testing.T) {
 				{3, ReasonWrongZone},
 			},
 		},
-		// ТЗ 11.1 (нормализация + парсинг): IDN-домен одной строкой в
-		// unicode и в punycode — нормализация даёт одну и ту же запись;
-		// unicode-зона пути каталога. Как и дубликаты: по записи на
-		// вхождение, схлопывание форм — на БД (T-018).
+		// Spec 11.1 (normalization + parsing): an IDN domain in one line
+		// in unicode and in punycode — normalization yields the same
+		// record; the unicode zone of the directory's path. Like the
+		// duplicates: a record per occurrence, folding the forms is the
+		// DB's job (T-018).
 		{
 			name:   "IDN: unicode и punycode формы одного домена — одна запись",
 			zone:   "рф",
@@ -251,9 +263,9 @@ func TestCorpusFile(t *testing.T) {
 				{3, Entry{"xn--p1ai", "xn--e1afmkfd", true}},
 			},
 		},
-		// Крайние пробелы снимает парсер; внутренние остаются в Line —
-		// дальше их разбирает извлечение T-132 (разделитель полей) либо
-		// нормализация одиночного имени (ТЗ 5.2 п. 1).
+		// Edge spaces are stripped by the parser; inner ones stay in the
+		// Line — the T-132 extraction (a field separator) or the single
+		// name normalization (spec 5.2 item 1) deals with them next.
 		{
 			name:   "пробелы вокруг строки",
 			zone:   "com",
@@ -265,11 +277,12 @@ func TestCorpusFile(t *testing.T) {
 				{2, Entry{"com", "shop", false}},
 			},
 		},
-		// T-132 (смена поведения): внутренний пробел — разделитель полей
-		// выгрузки, помарки больше не склеиваются нормализацией: из
-		// «при мер.рф» извлекается токен с точкой (мер.рф), а не склейка
-		// «пример.рф». Крайние пробелы по-прежнему снимает парсер,
-		// внутренние остаются в Line (разборка ролей этапов не менялась).
+		// T-132 (a behavior change): an inner space is a field separator
+		// of the export, typos are not glued by the normalization anymore:
+		// from "при мер.рф" the token with a dot (мер.рф) is extracted,
+		// not the gluing "пример.рф". Edge spaces are still stripped by
+		// the parser, inner ones stay in the Line (the stages' role
+		// separation unchanged).
 		{
 			name:   "внутренние пробелы — извлечение токена с точкой (T-132)",
 			zone:   "рф",
@@ -280,21 +293,22 @@ func TestCorpusFile(t *testing.T) {
 				{1, Entry{"xn--p1ai", "xn--e1ann", true}},
 			},
 		},
-		// T-132: смешанные строки реальных выгрузок — посторонние данные
-		// в строке (дата, регистратор, URL, CSV-обрамление) снимаются
-		// извлечением; строка без точкосодержащих токенов — no_domain.
-		// Порог 1: проверяем разбор, не вердикт (2 отклонения из 6 при
-		// дефолте роняли бы файл — no_domain считается в долю ошибок).
+		// T-132: mixed lines of real exports — the foreign data in a row
+		// (a date, a registrar, a URL, CSV framing) is removed by the
+		// extraction; a line without dot-bearing tokens — no_domain.
+		// Threshold 1: we check the parsing, not the verdict (2 rejections
+		// of 6 at the default would sink the file — no_domain counts into
+		// the error share).
 		{
 			name:  "смешанные строки: извлечение домена (T-132)",
 			zone:  "com",
 			ratio: 1,
-			in: "xxx.com 2029-11-11 TIMEWEB\n" + // пример заказчика
-				"https://shop.com/page\n" + // URL с путём
-				"\"quote.com\",\"2029-11-11\",\"TIMEWEB\"\n" + // CSV в кавычках
-				"yyy.org xxx.com\n" + // первый кандидат — чужая зона
-				"нет домена тут\n" + // кандидатов нет
-				"2029-11-11 TIMEWEB\n", // даты/слова — не кандидаты
+			in: "xxx.com 2029-11-11 TIMEWEB\n" + // the customer's example
+				"https://shop.com/page\n" + // a URL with a path
+				"\"quote.com\",\"2029-11-11\",\"TIMEWEB\"\n" + // CSV in quotes
+				"yyy.org xxx.com\n" + // the first candidate — a foreign zone
+				"нет домена тут\n" + // no candidates
+				"2029-11-11 TIMEWEB\n", // dates/words — not candidates
 			stats:  Stats{Total: 6, Data: 6},
 			vstats: ValidatorStats{Total: 6, Accepted: 4, Rejected: 2},
 			entries: []corpusEntry{
@@ -308,8 +322,9 @@ func TestCorpusFile(t *testing.T) {
 				{6, ReasonNoDomain},
 			},
 		},
-		// T-132: IDN в смешанной строке и в URL — полный конвейер ТЗ 5.2
-		// (пунникод, метка, бит is_idn) на извлечённом токене.
+		// T-132: IDN in a mixed line and in a URL — the full pipeline of
+		// spec 5.2 (punycode, label, the is_idn bit) on the extracted
+		// token.
 		{
 			name:  "IDN в смешанной строке и URL (T-132)",
 			zone:  "рф",
@@ -323,7 +338,7 @@ func TestCorpusFile(t *testing.T) {
 				{2, Entry{"xn--p1ai", "xn--e1afmkfd", true}},
 			},
 		},
-		// ТЗ 5.2 п. 3: битый punycode отклоняется как невалидное имя.
+		// Spec 5.2 item 3: broken punycode is rejected as an invalid name.
 		{
 			name:   "битый punycode",
 			zone:   "com",
@@ -339,7 +354,8 @@ func TestCorpusFile(t *testing.T) {
 				{2, ReasonInvalid},
 			},
 		},
-		// Длинные имена (ТЗ 5.2 п. 4): метка 64 октета и имя 254 октета.
+		// Long names (spec 5.2 item 4): a 64-octet label and a 254-octet
+		// name.
 		{
 			name:   "длинные имена: метка длиннее 63 и имя длиннее 253",
 			zone:   "com",
@@ -355,11 +371,12 @@ func TestCorpusFile(t *testing.T) {
 				{3, ReasonNameLen},
 			},
 		},
-		// Всё вперемешку: BOM, CRLF, комментарии, пустые строки, мусор
-		// валидатора (невалидное имя, чужие зоны), отклонения парсера
-		// (битый UTF-8, сверхдлинная строка), пробелы, дубликат без
-		// завершающего перевода строки. Доля отказов валидатора 3 из 6
-		// — ровно порог 0.5: файл не роняется (строгое сравнение).
+		// Everything mixed: a BOM, CRLF, comments, empty rows, validator
+		// junk (an invalid name, foreign zones), parser rejections
+		// (broken UTF-8, an overlong row), spaces, a duplicate without
+		// the trailing newline. The validator's rejection share 3 of 6 —
+		// exactly the 0.5 threshold: the file is not sunk (a strict
+		// comparison).
 		{
 			name:  "смешанный файл: BOM, CRLF, мусор, дубликаты, порог на грани",
 			zone:  "com",
@@ -397,30 +414,30 @@ func TestCorpusFile(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			got := corpusRun(t, tc)
 
-			// Счётчики парсера и его инвариант (T-015).
+			// The parser's counters and its invariant (T-015).
 			if got.stats != tc.stats {
 				t.Errorf("Stats = %+v, want %+v", got.stats, tc.stats)
 			}
 			if got.stats.Total != got.stats.Skipped+got.stats.Rejected+got.stats.Data {
 				t.Errorf("инвариант Total != Skipped+Rejected+Data: %+v", got.stats)
 			}
-			// Каждая значимая строка парсера доходит до валидатора,
-			// отклонённые парсером — нет: оба счётчика сцеплены.
+			// Every meaningful parser row reaches the validator, the ones
+			// rejected by the parser do not: both counters are chained.
 			if got.res.Total != got.stats.Data {
 				t.Errorf("ValidatorStats.Total = %d, want %d (Stats.Data)", got.res.Total, got.stats.Data)
 			}
-			// Счётчики файла (ТЗ 5.1, отчёт T-021); Reasons — карта,
-			// сверяется ниже по производной отклонений.
+			// The file's counters (spec 5.1, the T-021 report); Reasons is
+			// a map, checked below against the rejections' derivative.
 			if got.res.Total != tc.vstats.Total ||
 				got.res.Accepted != tc.vstats.Accepted ||
 				got.res.Rejected != tc.vstats.Rejected {
 				t.Errorf("ValidatorStats = %+v, want %+v", got.res.ValidatorStats, tc.vstats)
 			}
-			// Вердикт порога доли ошибок.
+			// The error-share threshold verdict.
 			if got.res.Failed != tc.failed {
 				t.Errorf("Failed = %v, want %v", got.res.Failed, tc.failed)
 			}
-			// Причины — производная ожидаемых отклонений.
+			// The reasons — the derivative of the expected rejections.
 			wantReasons := make(map[Reason]int, len(tc.rejects))
 			for _, rj := range tc.rejects {
 				wantReasons[rj.reason]++
@@ -436,20 +453,21 @@ func TestCorpusFile(t *testing.T) {
 
 			corpusCompareEntries(t, got.entries, tc.entries)
 			corpusCompareRejects(t, got.rejects, tc.rejects)
-			compareRejects(t, got.parsed, tc.parsed) // хелпер parser_test.go
+			compareRejects(t, got.parsed, tc.parsed) // a parser_test.go helper
 		})
 	}
 }
 
-// TestCorpusErrorRatio — порог доли ошибок ingest.max_error_ratio на
-// грани, сквозью через файл (ТЗ 5.1: единичный мусор файлу не вредит,
-// файл не в той зоне роняет его; доля, равная порогу, — не роняет).
-// Вердикт Failed — сигнал для T-021 (перемещение в failed/): валидные
-// строки ошибочного файла потребитель не грузит, хотя конвейер их
-// разобрал и посчитал.
+// TestCorpusErrorRatio — the ingest.max_error_ratio error-share
+// threshold at the boundary, end-to-end through a file (spec 5.1: a
+// single junk row does not hurt a file, a file not of the zone sinks
+// it; a share equal to the threshold does not sink). The Failed verdict
+// — the signal for T-021 (moving to failed/): the consumer does not
+// load a bad file's valid rows, although the pipeline parsed and counted
+// them.
 func TestCorpusErrorRatio(t *testing.T) {
-	// corpusRatioFile — файл из good доменов зоны com и bad чужих
-	// (wrong_zone).
+	// corpusRatioFile — a file of good domains of the com zone and bad
+	// foreign ones (wrong_zone).
 	corpusRatioFile := func(good, bad int) string {
 		var b strings.Builder
 		for i := 0; i < good; i++ {
@@ -500,7 +518,7 @@ func TestCorpusErrorRatio(t *testing.T) {
 	}
 }
 
-// corpusCompareEntries — сравнение ожидаемых записей (в порядке строк).
+// corpusCompareEntries — comparing the expected records (in row order).
 func corpusCompareEntries(t *testing.T, got, want []corpusEntry) {
 	t.Helper()
 	if len(got) != len(want) {
@@ -513,7 +531,7 @@ func corpusCompareEntries(t *testing.T, got, want []corpusEntry) {
 	}
 }
 
-// corpusCompareRejects — сравнение ожидаемых отклонений валидатора.
+// corpusCompareRejects — comparing the expected validator rejections.
 func corpusCompareRejects(t *testing.T, got, want []corpusReject) {
 	t.Helper()
 	if len(got) != len(want) {

@@ -1,9 +1,9 @@
-// Юнит-тесты фоновой очистки удалённых доменов (T-020, ТЗ 5.1, 13.1, 8)
-// на фейковом pgx-пуле с транзакциями: точные SQL-тексты и параметры
-// (DELETE subdomain_results / UPDATE contents refcount), пачечность,
-// агрегация хэшей, повторные проходы, пустой набор, ошибки и отмена ctx,
-// цикл CleanupDeleted. Поведение против живой БД — интеграционные тесты
-// ingest (T-023).
+// Unit tests of the background cleanup of deleted domains (T-020, spec
+// 5.1, 13.1, 8) on a fake pgx pool with transactions: exact SQL texts and
+// arguments (DELETE subdomain_results / UPDATE contents refcount),
+// chunking, hash aggregation, repeated passes, the empty set, errors and
+// ctx cancellation, the CleanupDeleted loop. Behavior against a live DB —
+// the ingest integration tests (T-023).
 package ingest
 
 import (
@@ -25,21 +25,21 @@ import (
 	"crawler/internal/model"
 )
 
-// --- фейковый пул с транзакциями -----------------------------------------
+// --- fake pool with transactions -----------------------------------------
 
-// cleanupCall — записанный SQL-вызов с аргументами.
+// cleanupCall — a recorded SQL call with its arguments.
 type cleanupCall struct {
 	sql  string
 	args []any
 }
 
-// cleanupFakeRows — pgx.Rows с заготовленными строками; Scan позиционный,
-// в порядке колонок SQL.
+// cleanupFakeRows — pgx.Rows with prepared rows; Scan is positional, in
+// the SQL column order.
 type cleanupFakeRows struct {
 	rows   [][]any
 	i      int
 	closed bool
-	err    error // Err() после исчерпания строк
+	err    error // Err() after the rows are exhausted
 }
 
 func cleanupRows(rows ...[]any) *cleanupFakeRows {
@@ -85,29 +85,30 @@ func (r *cleanupFakeRows) Values() ([]any, error) { return r.rows[r.i-1], nil }
 
 func (r *cleanupFakeRows) RawValues() [][]byte { return nil }
 
-// Conn и TypeMap — часть pgx.Rows, не используемая позиционным Scan.
+// Conn and TypeMap — the part of pgx.Rows not used by the positional
+// Scan.
 func (r *cleanupFakeRows) Conn() *pgx.Conn      { return nil }
 func (r *cleanupFakeRows) TypeMap() *pgtype.Map { return nil }
 
-// cleanupFakePool — CleanupDB без БД: очереди заготовленных результатов
-// SELECT кандидатов и DELETE … RETURNING, ошибки по шагам прохода,
-// протокол вызовов. Всё под замком: цикл CleanupDeleted работает в
-// горутине, тест ожидает прогресс по счётчикам.
+// cleanupFakePool — a CleanupDB without a DB: queues of prepared SELECT
+// candidate results and DELETE … RETURNING results, errors by the pass
+// steps, a call protocol. Everything is under a lock: the CleanupDeleted
+// loop runs in a goroutine, the test waits for progress by the counters.
 type cleanupFakePool struct {
 	mu         sync.Mutex
-	selects    []*cleanupFakeRows // очередь результатов SELECT (кончилась — пустой набор)
-	deletes    []*cleanupFakeRows // очередь результатов DELETE … RETURNING
-	selectErrs []error            // очередь ошибок SELECT (nil — проход без ошибки)
+	selects    []*cleanupFakeRows // the queue of SELECT results (exhausted — an empty set)
+	deletes    []*cleanupFakeRows // the queue of DELETE … RETURNING results
+	selectErrs []error            // the queue of SELECT errors (nil — a pass without an error)
 	deleteErr  error
 	updateErr  error
 	beginErr   error
 	commitErr  error
 
-	execs     []pipeExec // результаты Exec по очереди — зачистка осиротевших партий staging (T-098)
+	execs     []pipeExec // Exec results in order — the cleanup of orphaned staging batches (T-098)
 	execI     int
-	execCalls []cleanupCall // Exec'ы через пул
+	execCalls []cleanupCall // Execs through the pool
 
-	queries []cleanupCall // SELECT'ы через пул
+	queries []cleanupCall // SELECTs through the pool
 	begins  int
 	txs     []*cleanupFakeTx
 }
@@ -116,13 +117,14 @@ func (p *cleanupFakePool) CopyFrom(context.Context, pgx.Identifier, []string, pg
 	return 0, errors.New("CopyFrom не должен вызываться")
 }
 
-// Exec обслуживает зачистку осиротевших партий (CleanupStaleBatches,
-// T-098): результат — по очереди, конец очереди — DELETE 0 (нечего
-// чистить). Вызов записывается до проверки ctx — как Query: после
-// cancel() цикл может начать ещё один проход (выбор ветви select
-// случаен), и не записанный Exec расшатывал бы соответствие «проходов
-// цикла = зачисток» в тестах. Сам CleanupOnce по пулу не Exec'ит —
-// это проверяют тесты прохода (execCalls пуст).
+// Exec serves the cleanup of orphaned batches (CleanupStaleBatches,
+// T-098): the result is taken from the queue, the end of the queue is
+// DELETE 0 (nothing to clean). The call is recorded before the ctx check
+// — like Query: after cancel() the loop may start one more pass (the
+// select branch choice is random), and an unrecorded Exec would loosen
+// the "loop passes = cleanups" correspondence in the tests. CleanupOnce
+// itself does not Exec through the pool — the pass tests verify this
+// (execCalls is empty).
 func (p *cleanupFakePool) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -172,7 +174,8 @@ func (p *cleanupFakePool) Begin(context.Context) (pgx.Tx, error) {
 	return tx, nil
 }
 
-// stats — снимок счётчиков под замком (ожидание прогресса в тестах цикла).
+// stats — a snapshot of the counters under the lock (waiting for
+// progress in the loop tests).
 type cleanupStats struct {
 	selects int
 	begins  int
@@ -191,9 +194,10 @@ func (p *cleanupFakePool) stats() cleanupStats {
 	return s
 }
 
-// cleanupFakeTx — транзакция фейкового пула: помнит вызовы и исход.
+// cleanupFakeTx — the fake pool's transaction: remembers the calls and
+// the outcome.
 type cleanupFakeTx struct {
-	pgx.Tx // остальные методы pgx.Tx проход не использует
+	pgx.Tx // the pass does not use the rest of the pgx.Tx methods
 
 	pool       *cleanupFakePool
 	calls      []cleanupCall
@@ -208,7 +212,8 @@ func (t *cleanupFakeTx) Exec(_ context.Context, sql string, args ...any) (pgconn
 	if t.pool.updateErr != nil {
 		return pgconn.CommandTag{}, t.pool.updateErr
 	}
-	// UPDATE с unnest-массивами: число затронутых строк = число хэшей.
+	// UPDATE with unnest arrays: the number of rows affected = the number
+	// of hashes.
 	hashes := args[0].([][]byte)
 	return pgconn.NewCommandTag(fmt.Sprintf("UPDATE %d", len(hashes))), nil
 }
@@ -247,14 +252,14 @@ func (t *cleanupFakeTx) Rollback(context.Context) error {
 	return nil
 }
 
-// compile-time: фейковый пул — CleanupDB для тестов без БД.
+// compile-time: the fake pool is a CleanupDB for tests without a DB.
 var _ CleanupDB = (*cleanupFakePool)(nil)
 
-// --- ожидаемые SQL-тексты (контракт) -------------------------------------
+// --- expected SQL texts (the contract) -----------------------------------
 //
-// Код статуса deleted вшит в текст литералом (T-170: предикат частичного
-// индекса domains_deleted_idx планировщик доказывает только по литералу),
-// параметры — только данные пачки.
+// The deleted status code is baked into the text as a literal (T-170:
+// the planner proves the partial index predicate of domains_deleted_idx
+// only by a literal), the arguments are only the chunk's data.
 
 var wantCleanupSelect = fmt.Sprintf(
 	"SELECT d.zone_id, d.id FROM domains d "+
@@ -277,11 +282,12 @@ const wantCleanupUpdate = "UPDATE contents SET refcount = GREATEST(refcount - h.
 	"FROM unnest($1::bytea[], $2::int4[]) AS h(hash, n) " +
 	"WHERE contents.hash = h.hash"
 
-// wantStaleStageSQL — контракт зачистки осиротевших партий (T-098):
-// диапазон по префиксу batch_id (StageTable.Sanitize — «ingest_stage»).
+// wantStaleStageSQL — the contract of the orphaned batch cleanup
+// (T-098): the range over the batch_id prefix (StageTable.Sanitize —
+// "ingest_stage").
 const wantStaleStageSQL = "DELETE FROM \"ingest_stage\" WHERE batch_id < $1"
 
-// cleanupHash16 — 16-октетный content_hash с заданным первым байтом.
+// cleanupHash16 — a 16-octet content_hash with the given first byte.
 func cleanupHash16(b byte) []byte {
 	h := make([]byte, contentHashLen)
 	h[0] = b
@@ -291,7 +297,7 @@ func cleanupHash16(b byte) []byte {
 // --- CleanupOnce ---------------------------------------------------------
 
 func TestCleanupOnceEmpty(t *testing.T) {
-	pool := &cleanupFakePool{} // очередь SELECT пуста — кандидатов нет
+	pool := &cleanupFakePool{} // the SELECT queue is empty — no candidates
 
 	res, err := CleanupOnce(context.Background(), pool, CleanupOptions{})
 	if err != nil {
@@ -319,7 +325,7 @@ func TestCleanupOnceSQLAndFlow(t *testing.T) {
 		)},
 		deletes: []*cleanupFakeRows{cleanupRows(
 			[]any{int16(1), int64(10), hashA},
-			[]any{int16(1), int64(10), nil}, // результат без контента
+			[]any{int16(1), int64(10), nil}, // a result without content
 			[]any{int16(1), int64(11), hashA},
 			[]any{int16(2), int64(20), hashB},
 		)},
@@ -330,7 +336,7 @@ func TestCleanupOnceSQLAndFlow(t *testing.T) {
 		t.Fatalf("CleanupOnce: %v", err)
 	}
 
-	// Выборка кандидатов: статус deleted и лимит пачки.
+	// Candidate selection: the deleted status and the chunk limit.
 	if len(pool.queries) != 1 {
 		t.Fatalf("SELECT'ов = %d, want 1", len(pool.queries))
 	}
@@ -341,7 +347,7 @@ func TestCleanupOnceSQLAndFlow(t *testing.T) {
 		t.Errorf("аргументы выборки = %v, want %v (лимит пачки; статус deleted — литерал в SQL, T-170)", pool.queries[0].args, want)
 	}
 
-	// Транзакция: удаление результатов + уменьшение refcount.
+	// Transaction: deleting the results + decreasing the refcount.
 	if pool.begins != 1 || len(pool.txs) != 1 {
 		t.Fatalf("транзакций = %d, want 1", pool.begins)
 	}
@@ -358,8 +364,8 @@ func TestCleanupOnceSQLAndFlow(t *testing.T) {
 	if tx.calls[1].sql != wantCleanupUpdate {
 		t.Errorf("SQL refcount:\n%s\nwant:\n%s", tx.calls[1].sql, wantCleanupUpdate)
 	}
-	// Хэши агрегированы по числу удалённых ссылок, NULL пропущен,
-	// порядок детерминированный.
+	// The hashes are aggregated by the number of deleted references, the
+	// NULL is skipped, the order is deterministic.
 	if want := []any{[][]byte{hashA, hashB}, []int32{2, 1}}; !reflect.DeepEqual(tx.calls[1].args, want) {
 		t.Errorf("аргументы refcount = %v, want %v", tx.calls[1].args, want)
 	}
@@ -371,14 +377,15 @@ func TestCleanupOnceSQLAndFlow(t *testing.T) {
 	if !tx.committed || tx.rolledBack {
 		t.Errorf("транзакция: committed=%v rolledBack=%v, want фиксация без отката", tx.committed, tx.rolledBack)
 	}
-	// Проход очистки доменов не пишет в пул напрямую: Exec — только
-	// канал зачистки осиротевших партий (T-098).
+	// The domain cleanup pass does not write to the pool directly: Exec
+	// is only the channel of the orphaned batch cleanup (T-098).
 	if len(pool.execCalls) != 0 {
 		t.Errorf("Exec'ы через пул = %v, want нет: CleanupOnce работает в транзакции", pool.execCalls)
 	}
 }
 
-// TestCleanupOnceDefaultBatch — нулевой размер пачки заменяется дефолтом.
+// TestCleanupOnceDefaultBatch — a zero chunk size is replaced with the
+// default.
 func TestCleanupOnceDefaultBatch(t *testing.T) {
 	pool := &cleanupFakePool{}
 
@@ -391,8 +398,8 @@ func TestCleanupOnceDefaultBatch(t *testing.T) {
 	}
 }
 
-// TestCleanupOnceRepeatPasses — вычищенный домен не выбирается: повторный
-// проход видит пустой набор и не открывает транзакцию.
+// TestCleanupOnceRepeatPasses — a cleaned domain is not selected: the
+// repeated pass sees an empty set and does not open a transaction.
 func TestCleanupOnceRepeatPasses(t *testing.T) {
 	pool := &cleanupFakePool{
 		selects: []*cleanupFakeRows{cleanupRows([]any{int16(3), int64(30)})},
@@ -422,9 +429,10 @@ func TestCleanupOnceRepeatPasses(t *testing.T) {
 	}
 }
 
-// TestCleanupOnceBadHash — content_hash не 16 октетов (контракт contents,
-// ТЗ 6.1) не роняет проход (poison pill, ING-P2-4): строка уже удалена,
-// refcount по ней не меняется, транзакция фиксируется, аномалия видна в
+// TestCleanupOnceBadHash — a content_hash of not 16 octets (the contents
+// contract, spec 6.1) does not crash the pass (poison pill, ING-P2-4):
+// the row is already deleted, its refcount is not changed, the
+// transaction is committed, and the anomaly is visible in
 // CleanupResult.BadHashes.
 func TestCleanupOnceBadHash(t *testing.T) {
 	t.Run("мусорный хэш рядом с корректным", func(t *testing.T) {
@@ -473,8 +481,9 @@ func TestCleanupOnceBadHash(t *testing.T) {
 		if res.BadHashes != 1 || res.Domains != 2 || res.Contents != 0 {
 			t.Errorf("итог = %+v, want bad_hashes 1, domains 2, contents 0", res)
 		}
-		// Ссылок для refcount нет — UPDATE не выполняется, но проход
-		// фиксируется: домены вычищены, следующие проходы их не выберут.
+		// No references for the refcount — the UPDATE does not run, but
+		// the pass is committed: the domains are cleaned, the next passes
+		// will not select them.
 		tx := pool.txs[0]
 		if len(tx.calls) != 1 {
 			t.Fatalf("вызовов в транзакции %d, want 1 (только DELETE)", len(tx.calls))
@@ -496,7 +505,7 @@ func TestCleanupOnceErrors(t *testing.T) {
 	tests := []struct {
 		name    string
 		pool    *cleanupFakePool
-		context string // ожидаемый фрагмент сообщения
+		context string // the expected fragment of the message
 	}{
 		{"ошибка SELECT", &cleanupFakePool{selectErrs: []error{errors.New("бд недоступна")}}, "выборка кандидатов"},
 		{"ошибка Begin", func() *cleanupFakePool {
@@ -540,8 +549,9 @@ func TestCleanupOnceErrors(t *testing.T) {
 	}
 }
 
-// TestCleanupOnceCtxCanceled — отмена контекста проходит через оба шага
-// прохода как ошибка (errors.Is), транзакция не фиксируется.
+// TestCleanupOnceCtxCanceled — the context cancellation goes through both
+// steps of the pass as an error (errors.Is), the transaction is not
+// committed.
 func TestCleanupOnceCtxCanceled(t *testing.T) {
 	selectPool := &cleanupFakePool{selectErrs: []error{context.Canceled}}
 	if _, err := CleanupOnce(context.Background(), selectPool, CleanupOptions{}); !errors.Is(err, context.Canceled) {
@@ -570,11 +580,12 @@ func TestCleanupOnceNilPool(t *testing.T) {
 
 // --- CleanupStaleBatches (T-098) -----------------------------------------
 
-// TestCleanupStaleBatchesSQLAndArg — контракт зачистки: SQL-диапазон по
-// префиксу batch_id и точная граница «now − StaleBatchAge» (фиксированное
-// now делает аргумент детерминированным). Семантика «старая партия
-// удаляется, свежая живёт» диапазона против живой БД — интеграционные
-// тесты ingest; здесь — кодировка границы (TestBatchIDAgeOrdering).
+// TestCleanupStaleBatchesSQLAndArg — the cleanup contract: the SQL range
+// over the batch_id prefix and the exact "now − StaleBatchAge" bound (a
+// fixed now makes the argument deterministic). The "old batch is deleted,
+// a fresh one lives" semantics of the range against a live DB — the
+// ingest integration tests; here — the bound encoding
+// (TestBatchIDAgeOrdering).
 func TestCleanupStaleBatchesSQLAndArg(t *testing.T) {
 	now := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
 	pool := &cleanupFakePool{execs: []pipeExec{{tag: pgconn.NewCommandTag("DELETE 7")}}}
@@ -600,10 +611,10 @@ func TestCleanupStaleBatchesSQLAndArg(t *testing.T) {
 	}
 }
 
-// TestCleanupStaleBatchesNoop — пустой staging: DELETE 0 без ошибки,
-// лишних обращений нет.
+// TestCleanupStaleBatchesNoop — an empty staging: DELETE 0 without an
+// error, no extra calls.
 func TestCleanupStaleBatchesNoop(t *testing.T) {
-	pool := &cleanupFakePool{} // очередь Exec пуста — DELETE 0
+	pool := &cleanupFakePool{} // the Exec queue is empty — DELETE 0
 
 	rows, err := CleanupStaleBatches(context.Background(), pool, time.Now())
 	if err != nil {
@@ -638,10 +649,11 @@ func TestCleanupStaleBatchesErrors(t *testing.T) {
 		t.Errorf("ошибка = %v, want context.Canceled", err)
 	}
 
-	// Граница возраста до 1970 года — отказ до обращения к БД: uint64-переход
-	// границы делал бы зачистку срезающей весь staging (P1 раунда 3:
-	// проверяется именно now−StaleBatchAge, а не now — часы ровно на
-	// эпохе Unix дают отрицательную границу при положительном now).
+	// An age bound before 1970 — a failure before the DB call: the uint64
+	// cast of the bound would make the cleanup cut away the whole staging
+	// (a P1 of round 3: it is exactly now−StaleBatchAge that is checked,
+	// not now — a clock exactly on the Unix epoch gives a negative bound
+	// with a positive now).
 	preEpoch := &cleanupFakePool{}
 	if _, err := CleanupStaleBatches(context.Background(), preEpoch, time.Unix(0, 0)); err == nil ||
 		!strings.Contains(err.Error(), "до 1970 года") {
@@ -655,8 +667,8 @@ func TestCleanupStaleBatchesErrors(t *testing.T) {
 		t.Errorf("Exec'ы = %v, want нет: отказ до обращения к БД", preEpoch.execCalls)
 	}
 
-	// Сутки спустя после эпохи граница положительна — зачистка работает
-	// даже с «сдвинутыми» часами (контракт не требует 2026 года).
+	// A day after the epoch the bound is positive — the cleanup works
+	// even with "shifted" clocks (the contract does not require 2026).
 	epochPlus := &cleanupFakePool{execs: []pipeExec{{tag: pgconn.NewCommandTag("DELETE 2")}}}
 	now := time.Unix(2*86400+3600, 0) // 1970-01-03 01:00 UTC
 	rows, err := CleanupStaleBatches(context.Background(), epochPlus, now)
@@ -677,8 +689,8 @@ func TestCleanupStaleBatchesErrors(t *testing.T) {
 func TestCleanupOptionsDefaults(t *testing.T) {
 	got := CleanupOptions{}.withDefaults()
 	want := CleanupOptions{BatchSize: DefaultCleanupBatch, Interval: DefaultCleanupInterval}
-	// OnPass (функция) не сравнима оператором == — структура целиком
-	// сверяется через reflect.DeepEqual (nil == nil).
+	// OnPass (a function) is not comparable with == — the whole struct is
+	// compared via reflect.DeepEqual (nil == nil).
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("withDefaults = %+v, want %+v", got, want)
 	}
@@ -696,18 +708,19 @@ func TestCleanupOptionsDefaults(t *testing.T) {
 
 // --- CleanupDeleted ------------------------------------------------------
 
-// TestCleanupDeletedLoop — первый проход сразу, ошибки прохода не
-// останавливают цикл, отмена ctx возвращает nil (контракт OnRun, T-012).
-// Теми же проходами идёт зачистка осиротевших партий staging (T-098):
-// первый проход удаляет строки (Warn с числом), второй — ошибка БД
-// (Warn, цикл жив), дальше — DELETE 0 без записей.
+// TestCleanupDeletedLoop — the first pass immediately, pass errors do
+// not stop the loop, the ctx cancellation returns nil (the OnRun
+// contract, T-012). The same passes run the orphaned staging batch
+// cleanup (T-098): the first pass deletes rows (a Warn with the count),
+// the second — a DB error (a Warn, the loop is alive), then — DELETE 0
+// with no records.
 func TestCleanupDeletedLoop(t *testing.T) {
 	var buf bytes.Buffer
 	logger := newCleanupTestLogger(&buf)
 
 	pool := &cleanupFakePool{
-		// Проход 1 (сразу после старта) — работа; проход 2 — ошибка БД;
-		// дальше — пустые наборы.
+		// Pass 1 (right after the start) — work; pass 2 — a DB error;
+		// then — empty sets.
 		selects: []*cleanupFakeRows{
 			cleanupRows([]any{int16(1), int64(10)}),
 			cleanupRows(),
@@ -715,10 +728,10 @@ func TestCleanupDeletedLoop(t *testing.T) {
 		selectErrs: []error{nil, errors.New("бд недоступна")},
 		deletes: []*cleanupFakeRows{cleanupRows(
 			[]any{int16(1), int64(10), cleanupHash16(0xaa)},
-			[]any{int16(1), int64(10), make([]byte, 9)}, // poison pill: Warn, проход жив
+			[]any{int16(1), int64(10), make([]byte, 9)}, // poison pill: a Warn, the pass is alive
 		)},
-		// Зачистка staging: проход 1 — 5 осиротевших строк, проход 2 —
-		// ошибка БД, дальше — DELETE 0 (очередь кончилась).
+		// Staging cleanup: pass 1 — 5 orphaned rows, pass 2 — a DB error,
+		// then — DELETE 0 (the queue is exhausted).
 		execs: []pipeExec{
 			{tag: pgconn.NewCommandTag("DELETE 5")},
 			{err: errors.New("бд недоступна")},
@@ -734,7 +747,7 @@ func TestCleanupDeletedLoop(t *testing.T) {
 		})
 	}()
 
-	// Ждём трёх проходов (сразу + минимум два тика) и останавливаем.
+	// Wait for three passes (immediately + at least two ticks) and stop.
 	deadline := time.Now().Add(2 * time.Second)
 	for pool.stats().selects < 3 {
 		if time.Now().After(deadline) {
@@ -753,7 +766,8 @@ func TestCleanupDeletedLoop(t *testing.T) {
 	if st.begins != 1 || st.commits != 1 {
 		t.Errorf("транзакций %d, коммитов %d, want 1 и 1: ошибочный и пустые проходы не открывают", st.begins, st.commits)
 	}
-	// Каждый проход — одна зачистка staging, ошибки её не прерывают.
+	// Each pass is one staging cleanup; its errors do not interrupt the
+	// passes.
 	pool.mu.Lock()
 	sweeps := len(pool.execCalls)
 	pool.mu.Unlock()
@@ -763,15 +777,15 @@ func TestCleanupDeletedLoop(t *testing.T) {
 
 	log := buf.String()
 	for _, want := range []string{
-		"фоновая очистка удалённых доменов", // старт
-		"проход очистки удалённых доменов",  // итог первого прохода
-		"domains=1",                 // счётчики прохода
-		"некорректным content_hash", // poison pill — Warn (ING-P2-4)
-		"бд недоступна",             // ошибка второго прохода
-		"удалены осиротевшие строки staging", // зачистка: Warn с числом строк (T-098)
-		"rows=5",                               // счётчик зачистки
-		"older_than=" + StaleBatchAge.String(), // порог возраста
-		"зачистка осиротевших партий staging", // ошибка зачистки — Warn, цикл жив
+		"фоновая очистка удалённых доменов", // start
+		"проход очистки удалённых доменов",  // the first pass's result
+		"domains=1",                 // pass counters
+		"некорректным content_hash", // poison pill — a Warn (ING-P2-4)
+		"бд недоступна",             // the second pass's error
+		"удалены осиротевшие строки staging", // the cleanup: a Warn with the row count (T-098)
+		"rows=5",                               // the cleanup counter
+		"older_than=" + StaleBatchAge.String(), // the age threshold
+		"зачистка осиротевших партий staging", // the cleanup error — a Warn, the loop is alive
 	} {
 		if !strings.Contains(log, want) {
 			t.Errorf("лог не содержит %q:\n%s", want, log)
@@ -786,7 +800,8 @@ func TestCleanupDeletedNilPool(t *testing.T) {
 	}
 }
 
-// newCleanupTestLogger — текстовый логгер в буфер (проверка записей цикла).
+// newCleanupTestLogger — a text logger into a buffer (checking the loop
+// records).
 func newCleanupTestLogger(buf *bytes.Buffer) *slog.Logger {
 	return slog.New(slog.NewTextHandler(buf, nil))
 }

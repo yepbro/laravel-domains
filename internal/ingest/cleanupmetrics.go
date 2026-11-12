@@ -1,18 +1,19 @@
-// Метрика фоновой очистки удалённых доменов (T-099, ТЗ 5.9): счётчик
-// crawler_ingest_bad_hashes_total — удалённые проходом результаты с
-// content_hash неверной длины (CleanupResult.BadHashes). В норме инвариант
-// писателя результатов держит 16 октет (ТЗ 6.1, T-056) и значение не растёт
-// вовсе: любой рост — программная ошибка писателя, а не шум нагрузки;
-// всплеск отлавливает алерт мониторинга (internal/monitor, T-099) по
-// экспозиции этого счётчика.
+// The metric of the background cleanup of deleted domains (T-099, spec
+// 5.9): the crawler_ingest_bad_hashes_total counter — results removed by
+// a pass with a wrong-length content_hash (CleanupResult.BadHashes). In
+// the normal case the writer invariant keeps 16 octets (spec 6.1, T-056)
+// and the value never grows at all: any growth is a writer bug, not load
+// noise; the monitoring alert (internal/monitor, T-099) catches a spike
+// via the exposition of this counter.
 //
-// Архитектурно — не полл, а push: результаты проходов очистки —
-// возвращаемые значения CleanupOnce, долговременного состояния со снимками
-// (как LimitStats/FallbackStats у DNS-коллекторов) нет — поллить нечего.
-// Цикл CleanupDeleted отдаёт итог каждому проходу хуком CleanupOptions.OnPass,
-// коллектор лишь переводит его в счётчик — тот же шов, что AlertsOptions.OnPass
-// в мониторинге («лог + поле»), пакет cleanup.go зависимостей на метрики не
-// получает.
+// Architecturally it is not a poll but a push: the cleanup pass results
+// are the return values of CleanupOnce; there is no long-lived state with
+// snapshots (like LimitStats/FallbackStats of the DNS collectors) —
+// nothing to poll. The CleanupDeleted loop hands each pass's result over
+// the CleanupOptions.OnPass hook; the collector only converts it into a
+// counter — the same seam as AlertsOptions.OnPass in monitoring
+// ("log + field"); cleanup.go takes no metric dependencies into the
+// package.
 package ingest
 
 import (
@@ -21,16 +22,17 @@ import (
 	"crawler/internal/metrics"
 )
 
-// CleanupMetrics — приборы очистки удалённых доменов: счётчик мусорных
-// content_hash (создаётся один раз, значения монотонно растут итогами
-// проходов).
+// CleanupMetrics — the deleted-domain cleanup instruments: the junk
+// content_hash counter (created once, its values grow monotonically with
+// the pass results).
 type CleanupMetrics struct {
 	badHashes prometheus.Counter // crawler_ingest_bad_hashes_total
 }
 
-// NewCleanupMetrics регистрирует приборы очистки в реестре reg; nil — nil
-// (сервис без реестра — изолированные сборки — метрик не поднимает).
-// Идемпотентен (T-076): повторный вызов делит тот же счётчик.
+// NewCleanupMetrics registers the cleanup instruments in the reg
+// registry; nil in — nil out (a service without a registry — isolated
+// builds — raises no metrics). Idempotent (T-076): a repeated call
+// shares the same counter.
 func NewCleanupMetrics(reg *metrics.Registry) *CleanupMetrics {
 	if reg == nil {
 		return nil
@@ -43,10 +45,11 @@ func NewCleanupMetrics(reg *metrics.Registry) *CleanupMetrics {
 	}
 }
 
-// Observe — итог одного прохода очистки (подключается хуком
-// CleanupOptions.OnPass): добавляет BadHashes прохода в счётчик.
-// Нулевой итог значение не меняет; nil-приёмник — no-op (сервис без
-// реестра), чтобы cmd/ingest подключал хук безусловно.
+// Observe — the result of one cleanup pass (wired by the
+// CleanupOptions.OnPass hook): adds the pass's BadHashes to the counter.
+// A zero result does not change the value; a nil receiver is a no-op (a
+// service without a registry), so cmd/ingest can wire the hook
+// unconditionally.
 func (m *CleanupMetrics) Observe(res CleanupResult) {
 	if m == nil || res.BadHashes <= 0 {
 		return
