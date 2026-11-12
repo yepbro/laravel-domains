@@ -170,7 +170,7 @@ func TestSwapReasonTable(t *testing.T) {
 		{"the first start (G0)", func(t *testing.T) *Manager {
 			m, _, _ := managerFor(t, managerOpts())
 			return m
-		}, "the first start", true},
+		}, "first start", true},
 		{"browser unavailable (G4)", func(t *testing.T) *Manager {
 			m, b := genStartedWith(t)
 			b.Close()
@@ -202,7 +202,7 @@ func TestSwapReasonTable(t *testing.T) {
 			b.pages.Add(1) // one successful page — the threshold
 			m.mu.Unlock()
 			return m
-		}, "the page threshold", true},
+		}, "page threshold", true},
 		{"the page threshold takes precedence over the memory threshold", func(t *testing.T) *Manager {
 			m, b := genStartedWith(t)
 			m.mu.Lock()
@@ -217,7 +217,7 @@ func TestSwapReasonTable(t *testing.T) {
 			b.opts.MemoryThreshold = 1 // both thresholds reached — the first one decides
 			m.mu.Unlock()
 			return m
-		}, "the page threshold", true},
+		}, "page threshold", true},
 		{"the memory threshold (G2, T5)", func(t *testing.T) *Manager {
 			m, b := genStartedWith(t)
 			m.mu.Lock()
@@ -230,7 +230,7 @@ func TestSwapReasonTable(t *testing.T) {
 			b.opts.MemoryThreshold = 1 // bytes: any live memory is an excess
 			m.mu.Unlock()
 			return m
-		}, "the memory threshold", true},
+		}, "memory threshold", true},
 		{"a dead browser with a reached threshold — the state beats the threshold (I1)", func(t *testing.T) *Manager {
 			m, b := genStartedWith(t)
 			m.mu.Lock()

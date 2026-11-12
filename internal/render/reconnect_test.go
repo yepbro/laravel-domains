@@ -609,7 +609,7 @@ func TestBrowserProbeConnDeadConnection(t *testing.T) {
 		t.Fatal("the dead connection probe passed")
 	}
 	if !b.Alive() {
-		t.Fatal("a single "black hole" timeout killed the generation (T-226: a series is required)")
+		t.Fatal(`a single "black hole" timeout killed the generation (T-226: a series is required)`)
 	}
 	// The second in a row — lost stickily; Manager will see the
 	// generation swap.
