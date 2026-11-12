@@ -1,14 +1,14 @@
-// Счётчики истории детекции Laravel (T-118): кумулятивные метрики
+// The Laravel detection history counters (T-118): the cumulative metrics
 // crawler_laravel_appeared_total / crawler_laravel_lost_total.
-// События (строки append-only журнала laravel_history, пишет analyzer
-// при свежих эпизодах HTTP) инкрементируют строки crawler_counters
-// той же транзакцией (T-178, analyzer/aggregate.go), авторитетное
-// значение периодически перезаписывает совмещённая реконсиляция
-// (zonestats.go, агрегат laravel_history) — часовой seq scan по
-// журналу ушёл из цикла, проход читает две точки PK (ТЗИ §8.5).
-// gauge с counter-семантикой корректен для rate()/increase() в
-// Prometheus (значения монотонны; решение T-118 — метрики отнесены
-// internal/monitor, а не реестру analyzer).
+// The events (the rows of the append-only laravel_history journal, written by the analyzer
+// on fresh HTTP episodes) increment the crawler_counters rows
+// in the same transaction (T-178, analyzer/aggregate.go); the authoritative
+// value is periodically rewritten by the combined reconciliation
+// (zonestats.go, the laravel_history aggregate) — the hourly seq scan
+// of the journal left the loop; the pass reads two PK points (the incremental-counters spec §8.5).
+// A gauge with counter semantics is correct for rate()/increase() in
+// Prometheus (the values are monotonic; the T-118 decision — the metrics are attributed
+// to internal/monitor, not the analyzer registry).
 package monitor
 
 import (
@@ -24,24 +24,24 @@ import (
 	"crawler/internal/metrics"
 )
 
-// DefaultHistoryStatsInterval — период цикла HistoryStatsLoop: 1 ч
-// (свежесть кумулятивов между реконсиляциями; проход — точечные чтения,
-// интервал задаёт не цену, а частоту Debug-строк).
+// DefaultHistoryStatsInterval — the HistoryStatsLoop cycle period: 1h
+// (the freshness of the cumulatives between reconciliations; the pass is point reads —
+// the interval sets not the price but the frequency of Debug lines).
 const DefaultHistoryStatsInterval = time.Hour
 
-// historyStatsSQL — чтение обеих строк счётчиков одним оператором:
-// FILTER-позиции вместо двух Lookup; отсутствующая строка (до первой
-// реконсиляции) честно даёт 0 — как пустой журнал раньше.
+// historyStatsSQL — reading both counter rows with one statement:
+// FILTER positions instead of two Lookups; a missing row (before the first
+// reconciliation) honestly gives 0 — like the empty journal before.
 const historyStatsSQL = "SELECT coalesce(max(value) FILTER (WHERE name = 'laravel_appeared_total'), 0), " +
 	"coalesce(max(value) FILTER (WHERE name = 'laravel_lost_total'), 0) " +
 	"FROM crawler_counters WHERE name IN ('laravel_appeared_total', 'laravel_lost_total')"
 
-// HistoryStatsOptions — параметры цикла HistoryStatsLoop; нулевые значения
-// заменяются дефолтами (стиль NearStatsOptions).
+// HistoryStatsOptions — the HistoryStatsLoop parameters; zero values are
+// replaced by defaults (the NearStatsOptions style).
 type HistoryStatsOptions struct {
-	// Interval — период цикла (DefaultHistoryStatsInterval).
+	// Interval — the cycle period (DefaultHistoryStatsInterval).
 	Interval time.Duration
-	// Log — логгер цикла; nil — записи подавлены (slog.DiscardHandler).
+	// Log — the loop logger; nil — entries suppressed (slog.DiscardHandler).
 	Log *slog.Logger
 }
 
@@ -52,15 +52,15 @@ func (o HistoryStatsOptions) withDefaults() HistoryStatsOptions {
 	return o
 }
 
-// HistoryStats — итог одного прохода: кумулятивные числа переходов.
+// HistoryStats — the result of one pass: the cumulative transition numbers.
 type HistoryStats struct {
 	Appeared int64
 	Lost     int64
 }
 
-// HistoryStatsOnce выполняет один проход: числа appeared/lost одним
-// агрегатом (стиль NearStatsOnce — db.DB без QueryRow). Идемпотентен
-// (ТЗ 3.4): журнал append-only, повтор даёт те же значения.
+// HistoryStatsOnce performs one pass: the appeared/lost numbers by one
+// aggregate (the NearStatsOnce style — a db.DB without QueryRow). Idempotent
+// (spec 3.4): the journal is append-only; a repeat gives the same values.
 func HistoryStatsOnce(ctx context.Context, pool db.DB) (HistoryStats, error) {
 	if pool == nil {
 		return HistoryStats{}, errors.New("monitor: счётчики истории детекции: пул не задан")
@@ -83,11 +83,11 @@ func HistoryStatsOnce(ctx context.Context, pool db.DB) (HistoryStats, error) {
 	return st, nil
 }
 
-// NewHistoryGauges создаёт пару gauge crawler_laravel_appeared_total /
-// crawler_laravel_lost_total в реестре reg (метка service подставит
-// фабрика); nil — nil: сервис без реестра цикл не поднимает.
-// Идемпотентны (T-076). Имена с суффиксом _total — counter-семантика
-// (значения монотонны), тип gauge — значения задаёт проход из БД.
+// NewHistoryGauges creates the crawler_laravel_appeared_total /
+// crawler_laravel_lost_total gauge pair in the reg registry (the service label
+// is substituted by the factory); nil — nil: a service without a registry does not raise the loop.
+// Idempotent (T-076). The names with the _total suffix — counter semantics
+// (monotonic values); the gauge type — the values are set by a pass from the DB.
 func NewHistoryGauges(reg *metrics.Registry) (appeared, lost *prometheus.GaugeVec) {
 	if reg == nil {
 		return nil, nil
@@ -105,23 +105,23 @@ func NewHistoryGauges(reg *metrics.Registry) (appeared, lost *prometheus.GaugeVe
 
 // mutator-disable-regexp log\.Info\("цикл statement/remove
 // mutator-disable-regexp log\.Debug\("проход statement/remove
-// Обоснование: служебные записи цикла истории (старт Info, итог
-// успешного прохода Debug) — поведение счётчиков не меняют, гасятся по
-// docs/mutation-testing.md §4 (логирование не тестируется).
+// Justification: the service entries of the history loop (the Info start, the Debug result
+// of a successful pass) — they do not change the counter behavior, damped per
+// docs/mutation-testing.md §4 (logging is not tested).
 
-// HistoryStatsLoop — периодический цикл: HistoryStatsOnce по ticker,
-// значения — в пару gauge. Первый проход — сразу при старте (свежие
-// значения после простоя/рестарта); ошибка прохода прерывает только его
-// (Warn, цикл живёт — контракт OnRun, T-012), gauge хранит последнее
-// успешное значение. Отмена ctx — чистый nil (graceful shutdown, ТЗ 3.4).
-// nil gauge/пула — no-op (стиль NearStatsLoop).
+// HistoryStatsLoop — a periodic loop: HistoryStatsOnce by ticker,
+// the values — into the gauge pair. The first pass — right at start (fresh
+// values after an idle/restart); a pass error interrupts only that pass
+// (a Warn, the loop keeps living — the OnRun contract, T-012); the gauge holds the last
+// successful value. A ctx cancellation — a clean nil (graceful shutdown, spec 3.4).
+// A nil gauge/pool — no-op (the NearStatsLoop style).
 func HistoryStatsLoop(ctx context.Context, pool db.DB, reg *metrics.Registry, opts HistoryStatsOptions) error {
 	appearedG, lostG := NewHistoryGauges(reg)
-	// Пара gauge рождается и гибнет вместе: NewHistoryGauges возвращает
-	// (nil, nil) при nil-реестре или два живых указателя — условия
-	// appearedG == nil и lostG == nil неотделимы ни на одном входе,
-	// мутанты-близнецы `false ||` эквивалентны (дубль — страховка
-	// будущих правок конструктора).
+	// The gauge pair is born and dies together: NewHistoryGauges returns
+	// (nil, nil) at a nil registry or two live pointers — the conditions
+	// appearedG == nil and lostG == nil are inseparable on any input;
+	// the twin mutants `false ||` are equivalent (the duplicate is a safety net
+	// for future constructor edits).
 	// mutator-disable-next-line expression/remove
 	if appearedG == nil || lostG == nil || pool == nil {
 		return nil
@@ -137,13 +137,13 @@ func HistoryStatsLoop(ctx context.Context, pool db.DB, reg *metrics.Registry, op
 	pass := func() {
 		st, err := HistoryStatsOnce(ctx, pool)
 		switch {
-		// Тело ветки пустое (только комментарий): branch/case подменяет
-		// его на noop-EmptyStmt, печать которого идентична оригиналу, —
-		// мутант с пустым диффом, тестом не убить; подавление генерации —
-		// единственная альтернатива блэклисту чексумм (§4).
+		// The branch body is empty (only a comment): branch/case replaces it
+		// with a noop EmptyStmt whose print is identical to the original —
+		// a mutant with an empty diff, not killable by a test; suppressing generation is
+		// the only alternative to the checksum blacklist (§4).
 		// mutator-disable-next-line branch/case
 		case err != nil && ctx.Err() != nil:
-			// Отмена во время прохода — часть остановки, не тревога.
+			// A cancellation during the pass — part of the shutdown, not an alarm.
 		case err != nil:
 			log.Warn("проход счётчиков истории детекции", "err", err)
 		default:

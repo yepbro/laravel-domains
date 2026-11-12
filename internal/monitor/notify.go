@@ -1,26 +1,26 @@
-// Доставка алертов оператору в Telegram (T-162, ТЗ 5.9): сработавшие и
-// снятые алерты monitor отправляет сообщениями в ту же выделенную группу,
-// что и извещения CI/CD (ТЗ 10.4), — вызовом deploy/telegram-notify.sh
-// (T-136) с режимом --message: exec внешнего скрипта, как зовёт его
-// конвейер, HTTP-клиент Telegram в Go не заводится (одна точка правды об
-// отправке: маркеры, маскировка секретов, поведение при их отсутствии).
+// Delivering alerts to the operator in Telegram (T-162, spec 5.9): fired and
+// cleared monitor alerts are sent as messages to the same dedicated group
+// as the CI/CD notifications (spec 10.4) — by calling deploy/telegram-notify.sh
+// (T-136) with the --message mode: an exec of the external script, as the
+// pipeline calls it; no Telegram HTTP client is created in Go (a single point of
+// truth about sending: the markers, secret masking, behavior without them).
 //
-// Секреты TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID скрипт берёт из окружения:
-// monitor наследует их из EnvironmentFile юнита (/etc/crawler/crawler.env
-// — crawler-monitor.service), в YAML они не попадают. Нет любого секрета
-// или скрипта — доставка выключена, алерты остаются Warn в журнале
-// мониторинга (как шаг CI молчит без секретов, §10.4).
+// The secrets TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID are taken by the script from the environment:
+// monitor inherits them from the unit's EnvironmentFile (/etc/crawler/crawler.env
+// — crawler-monitor.service); they do not get into the YAML. Without any secret
+// or the script — the delivery is off; the alerts stay a Warn in the monitoring
+// journal (like a CI step staying silent without secrets, §10.4).
 //
-// Дебаунс — эпизод алерта (открытие…закрытие) доставляется ровно двумя
-// сообщениями: 🚨 при первом срабатывании, «✅ Восстановлено» при
-// снятии; повторные проходы сработавшего алерта сообщений не порождают.
-// Первый проход — база без рассылки (рестарт monitor на деплое не
-// рассылает состояния всех алертов). Перерыв источника («не измеряется»)
-// эпизод не рвёт: возврат измерений сразу в ok закрывает эпизод честным
-// ✅ (алерт перестал срабатывать — оператору нужна точка), возврат в
-// firing второго 🚨 не делает (алерт и не снимался — дребезг источника
-// не спамит); сам переход в «не измеряется» сообщением не отмечается:
-// «восстановлено» было бы ложью, переход виден в журнале (Info).
+// Debouncing — an alert episode (opening…closing) is delivered by exactly two
+// messages: 🚨 at the first firing, "✅ Recovered" at the
+// clearing; repeated passes of a fired alert produce no messages.
+// The first pass — the base without mailing (a monitor restart on a deploy does not
+// mail out the states of all alerts). A source interruption ("not measured")
+// does not break the episode: a return of measurements straight to ok closes the episode with an honest
+// ✅ (the alert stopped firing — the operator needs the point); a return to
+// firing does not make a second 🚨 (the alert was never cleared — source flapping
+// does not spam); the transition to "not measured" itself is not marked by a message:
+// "recovered" would be a lie; the transition is visible in the journal (Info).
 package monitor
 
 import (
@@ -33,64 +33,64 @@ import (
 	"time"
 )
 
-// Переменные окружения секретов Telegram (EnvironmentFile юнита monitor,
-// deploy/systemd/crawler.env.example — те же значения, что у извещений
-// CI/CD, docs/ci-cd.md §«Извещения Telegram»).
+// The Telegram secret environment variables (the monitor unit's EnvironmentFile,
+// deploy/systemd/crawler.env.example — the same values as the CI/CD
+// notifications, docs/ci-cd.md §"Telegram notifications").
 const (
 	EnvTelegramBotToken = "TELEGRAM_BOT_TOKEN"
 	EnvTelegramChatID   = "TELEGRAM_CHAT_ID"
 )
 
-// telegramNotifyTimeout — бюджет одного вызова скрипта: curl внутри с
-// --max-time 30 плюс запуск bash/jq — с запасом, но короче периода
-// цикла алертов.
+// telegramNotifyTimeout — the budget of one script call: curl inside with
+// --max-time 30 plus a bash/jq start — with headroom, but shorter than the
+// alert loop period.
 const telegramNotifyTimeout = 40 * time.Second
 
-// TelegramOptions — параметры доставки алертов (NewTelegramNotifier).
+// TelegramOptions — the alert delivery parameters (NewTelegramNotifier).
 type TelegramOptions struct {
-	// Enabled — включение доставки (monitor.alerts.telegram): false —
-	// доставка выключена явно.
+	// Enabled — the delivery switch (monitor.alerts.telegram): false —
+	// the delivery is explicitly off.
 	Enabled bool
-	// Script — путь telegram-notify.sh на хосте
+	// Script — the telegram-notify.sh path on the host
 	// (monitor.alerts.telegram_script).
 	Script string
-	// Log — логгер (nil — записи подавлены, slog.DiscardHandler).
+	// Log — the logger (nil — entries suppressed, slog.DiscardHandler).
 	Log *slog.Logger
-	// Getenv — чтение окружения секретов (nil — os.Getenv); тесты
-	// подменяют (t.Setenv непригоден: проверяется и пустое значение).
+	// Getenv — reading the secret environment (nil — os.Getenv); the tests
+	// substitute it (t.Setenv is unsuitable: an empty value is checked too).
 	Getenv func(string) string
 }
 
-// TelegramNotifier — доставка переходов алертов в Telegram: подключается
-// хуком в AlertsOptions.OnPass (цикл проходов вызывает из одного потока —
-// блокировки состояния не нужны). Отправка асинхронна: проход алертов не
-// ждёт curl (зависший скрипт срезается таймаутом), сбой — Warn: алерт уже
-// в журнале и метриках, повторная попытка — следующий переход состояния.
+// TelegramNotifier — the delivery of alert transitions to Telegram: connected
+// by the hook in AlertsOptions.OnPass (the pass loop calls it from one thread —
+// no state locking is needed). Sending is asynchronous: an alert pass does
+// not wait for curl (a hung script is cut off by the timeout); a failure — a Warn: the alert is
+// already in the journal and metrics; a retry — the next state transition.
 type TelegramNotifier struct {
-	// script — путь скрипта; "" — доставка выключена (все причины —
-	// конфигурация, секреты, доступность скрипта — решает конструктор).
+	// script — the script path; "" — the delivery is off (all reasons —
+	// configuration, secrets, script availability — are decided by the constructor).
 	script string
 	log    *slog.Logger
-	// state — трекинг эпизодов по именам алертов: эпизод — от первого
-	// срабатывания до снятия; в его пределах ровно одно 🚨 и одно ✅.
+	// state — the episode tracking by alert names: an episode is from the
+	// first firing to the clearing; within it exactly one 🚨 and one ✅.
 	state map[string]notifyEpisode
 }
 
-// notifyEpisode — состояние одного алерта для доставки.
+// notifyEpisode — the state of one alert for delivery.
 type notifyEpisode struct {
-	// seen — проход алерта уже наблюдался (стартовая база).
+	// seen — the alert pass has already been observed (the starting base).
 	seen bool
-	// wasFiring — алерт срабатывал с последнего снятия (эпизод открыт):
-	// перерывы источника («не измеряется») эпизод не закрывают —
-	// восстановление измерений в ok честно закрывает его ✅, возврат в
-	// firing второго 🚨 не делает (алерт и не снимался).
+	// wasFiring — the alert fired since the last clearing (the episode is open):
+	// source interruptions ("not measured") do not close the episode —
+	// a recovery of measurements to ok closes it honestly with ✅; a return to
+	// firing does not make a second 🚨 (the alert was never cleared).
 	wasFiring bool
 }
 
-// NewTelegramNotifier решает, включена ли доставка: выключена явно,
-// нет секретов окружения, скрипт недоступен/не исполняем — адресат
-// сообщений не появляется, каждая причина — запись в журнале (Info для
-// ожидаемых состояний, Warn для сломанной настройки боевого хоста).
+// NewTelegramNotifier decides whether the delivery is on: explicitly off,
+// no environment secrets, the script unavailable/not executable — no message
+// recipient appears; every reason is a journal entry (Info for
+// expected states, a Warn for a broken production host setup).
 func NewTelegramNotifier(opts TelegramOptions) *TelegramNotifier {
 	log := opts.Log
 	if log == nil {
@@ -125,12 +125,12 @@ func NewTelegramNotifier(opts TelegramOptions) *TelegramNotifier {
 	return n
 }
 
-// OnPass — хук AlertsOptions.OnPass: эпизод алерта (срабатывание … снятие)
-// доставляется ровно двумя сообщениями — 🚨 при открытии и ✅ при
-// закрытии. Дебаунс: повторные проходы сработавшего алерта, возврат в
-// firing после перерыва источника и шум несработавших алертов — тишина.
-// Первый проход — стартовая база без рассылки: рестарт monitor на деплое
-// не рассылает состояния всех алертов.
+// OnPass — the AlertsOptions.OnPass hook: an alert episode (firing … clearing)
+// is delivered by exactly two messages — 🚨 at the opening and ✅ at
+// the closing. Debouncing: repeated passes of a fired alert, a return to
+// firing after a source interruption and the noise of unfired alerts — silence.
+// The first pass — the starting base without mailing: a monitor restart on a deploy
+// does not mail out the states of all alerts.
 func (n *TelegramNotifier) OnPass(res AlertsResult) {
 	if n.script == "" {
 		return
@@ -151,8 +151,8 @@ func (n *TelegramNotifier) OnPass(res AlertsResult) {
 			}
 			st.wasFiring = false
 		case a.Status == AlertStatusNotMeasured && st.wasFiring:
-			// Без сообщения — см. шапку файла: восстановление не доказано,
-			// а дребезг источника не должен ни спамить, ни закрывать эпизод.
+			// Without a message — see the file header: a recovery is not proven,
+			// and source flapping must neither spam nor close the episode.
 			n.log.Info("telegram: сработавший алерт больше не измеряется — без сообщения",
 				"alert", a.Name, "причина", a.Detail)
 		}
@@ -160,7 +160,7 @@ func (n *TelegramNotifier) OnPass(res AlertsResult) {
 	}
 }
 
-// alertDesc — описание алерта для текста сообщения (alertDescs).
+// alertDesc — the alert description for the message text (alertDescs).
 func alertDesc(name string) string {
 	if d, ok := alertDescs[name]; ok {
 		return d
@@ -168,10 +168,10 @@ func alertDesc(name string) string {
 	return name
 }
 
-// Send — произвольное сообщение оператору (периодический отчёт нагрузки
-// T-173): тот же скрипт, секреты и таймаут, что у алертов; доставка
-// выключена (нет секретов/скрипта — script == "") — no-op. Безопасен
-// для конкурентного вызова (send — своя горутина на сообщение).
+// Send — an arbitrary message to the operator (the periodic load report
+// of T-173): the same script, secrets and timeout as the alerts; the delivery
+// off (no secrets/script — script == "") — a no-op. Safe
+// for a concurrent call (send — its own goroutine per message).
 func (n *TelegramNotifier) Send(text string) {
 	if n.script == "" {
 		return
@@ -179,10 +179,10 @@ func (n *TelegramNotifier) Send(text string) {
 	n.send(text)
 }
 
-// send запускает скрипт в фоновой горутине: текст — единственный
-// аргумент --message (exec без оболочки: текст не интерпретируется,
-// кавычки/переводы строк сохраняются; секреты скрипт берёт из унаследованного
-// окружения monitor и в вывод не печатает).
+// send runs the script in a background goroutine: the text is the only
+// --message argument (an exec without a shell: the text is not interpreted,
+// quotes/newlines are preserved; the script takes the secrets from the inherited
+// monitor environment and does not print them into the output).
 func (n *TelegramNotifier) send(text string) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), telegramNotifyTimeout)

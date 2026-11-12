@@ -1,8 +1,8 @@
-// Тесты доставки алертов в Telegram (T-162): мок-скрипт (exec через
-// временный файл — реальный telegram-notify.sh ходит в сеть) пишет
-// аргументы в журнал; проверяются переходы (срабатывание 🚨, снятие ✅,
-// дебаунс без дублей, первый проход — база, уход в «не измеряется» —
-// без сообщения), выключения (конфиг, секреты, скрипт) и сбой отправки.
+// The tests of alert delivery to Telegram (T-162): a mock script (an exec via
+// a temporary file — the real telegram-notify.sh goes to the network) writes
+// the arguments into a journal; the transitions are checked (firing 🚨, clearing ✅,
+// debouncing without duplicates, the first pass — the base, going to "not measured" —
+// without a message), the disabling (config, secrets, script) and the send failure.
 package monitor
 
 import (
@@ -16,11 +16,11 @@ import (
 	"time"
 )
 
-// fakeNotifyScript — исполняемый мок telegram-notify.sh: дописывает текст
-// сообщения (--message) в journal одной строкой на вызов (переводы строк
-// текста — в табы: строка журнала = отправка; запись одним write —
-// фоновые отправки последовательных проходов не интерлетятся). fail=true
-// — выход 1 с шумом в stderr (сбой отправки).
+// fakeNotifyScript — an executable mock of telegram-notify.sh: it appends the
+// message text (--message) to the journal, one line per call (the newlines
+// of the text become tabs: a journal line = a send; a single-write record —
+// the background sends of consecutive passes do not interleave). fail=true
+// — exit 1 with noise in stderr (a send failure).
 func fakeNotifyScript(t *testing.T, journal string, fail bool) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -36,9 +36,9 @@ func fakeNotifyScript(t *testing.T, journal string, fail bool) string {
 	return script
 }
 
-// syncedBuffer — bytes.Buffer под замком: фоновая горутина отправки
-// пишет Warn в логгер одновременно с чтением буфера тестом (логгер
-// сериализует записи, но не чтение буфера из другой горутины).
+// syncedBuffer — a bytes.Buffer under a lock: the background send
+// goroutine writes a Warn into the logger at the same time as the test reads the buffer (the
+// logger serializes writes, but not the buffer read from another goroutine).
 type syncedBuffer struct {
 	mu  sync.Mutex
 	buf bytes.Buffer
@@ -56,7 +56,7 @@ func (b *syncedBuffer) String() string {
 	return b.buf.String()
 }
 
-// notifierEnv — нотификатор на моке с буфером лога и геттером секрета.
+// notifierEnv — a notifier on the mock with a log buffer and a secret getter.
 func notifierEnv(t *testing.T, script string, token, chat string) (*TelegramNotifier, *syncedBuffer) {
 	t.Helper()
 	buf := &syncedBuffer{}
@@ -78,7 +78,7 @@ func notifierEnv(t *testing.T, script string, token, chat string) (*TelegramNoti
 	return n, buf
 }
 
-// journalLines — строки журнала отправок мока.
+// journalLines — the lines of the mock's send journal.
 func journalLines(t *testing.T, journal string) []string {
 	t.Helper()
 	b, err := os.ReadFile(journal)
@@ -94,7 +94,7 @@ func journalLines(t *testing.T, journal string) []string {
 	return lines
 }
 
-// waitLines — ждёт появления n строк журнала (отправка асинхронна).
+// waitLines — waits for n journal lines to appear (the send is asynchronous).
 func waitLines(t *testing.T, journal string, n int) []string {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
@@ -110,10 +110,10 @@ func waitLines(t *testing.T, journal string, n int) []string {
 	}
 }
 
-// TestTelegramNotifierTransitions — срабатывание и снятие отдельными
-// сообщениями, дубли отсутствуют (дебаунс — только изменение состояния),
-// первый проход — база без рассылки, уход сработавшего в «не измеряется»
-// — без сообщения.
+// TestTelegramNotifierTransitions — firing and clearing as separate
+// messages, no duplicates (debouncing — a state change only),
+// the first pass — the base without mailing, a fired alert going to "not measured"
+// — without a message.
 func TestTelegramNotifierTransitions(t *testing.T) {
 	journal := filepath.Join(t.TempDir(), "journal")
 	script := fakeNotifyScript(t, journal, false)
@@ -125,54 +125,54 @@ func TestTelegramNotifierTransitions(t *testing.T) {
 		}})
 	}
 
-	pass(AlertStatusFiring) // первый проход — база: сработавший до старта не рассылается
+	pass(AlertStatusFiring) // the first pass — the base: a pre-start firing is not mailed
 	if lines := journalLines(t, journal); len(lines) != 0 {
 		t.Fatalf("после базы отправок = %d, want 0: %q", len(lines), lines)
 	}
-	pass(AlertStatusFiring) // повторно сработавший — тишина
+	pass(AlertStatusFiring) // a repeated firing — silence
 	pass(AlertStatusFiring)
 	if lines := journalLines(t, journal); len(lines) != 0 {
 		t.Fatalf("повторные срабатывания дали дубли: %q", lines)
 	}
 
-	pass(AlertStatusOK) // снятие — отдельное сообщение
+	pass(AlertStatusOK) // clearing — a separate message
 	lines := waitLines(t, journal, 1)
 	if !strings.Contains(lines[0], "✅ Восстановлено") || !strings.Contains(lines[0], AlertDiskMin) ||
 		!strings.Contains(lines[0], "12.1GiB") {
 		t.Errorf("снятие = %q, want «✅ Восстановлено» с именем и деталью", lines[0])
 	}
 
-	pass(AlertStatusFiring) // новый эпизод — новое срабатывание
+	pass(AlertStatusFiring) // a new episode — a new firing
 	lines = waitLines(t, journal, 2)
 	if !strings.Contains(lines[1], "🚨") || !strings.Contains(lines[1], AlertDiskMin) ||
 		!strings.Contains(lines[1], alertDesc(AlertDiskMin)) {
 		t.Errorf("срабатывание = %q, want «🚨» с именем и описанием", lines[1])
 	}
 
-	// Сбой источника у сработавшего — без сообщения («восстановлено» было
-	// бы ложью), эпизод открыт; повторное срабатывание после паузы
-	// источника второго 🚨 не даёт (алерт и не снимался).
+	// A source failure at a fired alert — without a message ("recovered" would
+	// be a lie); the episode stays open; a repeated firing after the
+	// source pause does not give a second 🚨 (the alert was never cleared).
 	pass(AlertStatusNotMeasured)
 	pass(AlertStatusFiring)
 	if lines := journalLines(t, journal); len(lines) != 2 {
 		t.Errorf("пауза источника дала сообщение: %q", lines)
 	}
 
-	// Восстановление измерений сразу в ok — закрывает эпизод ✅.
+	// A recovery of measurements straight to ok — closes the episode with ✅.
 	pass(AlertStatusOK)
 	lines = waitLines(t, journal, 3)
 	if !strings.Contains(lines[2], "✅ Восстановлено") {
 		t.Errorf("восстановление после «не измеряется» = %q, want ✅", lines[2])
 	}
 
-	// Новый эпизод — новый 🚨.
+	// A new episode — a new 🚨.
 	pass(AlertStatusFiring)
 	lines = waitLines(t, journal, 4)
 	if !strings.Contains(lines[3], "🚨") {
 		t.Errorf("новый эпизод = %q, want 🚨", lines[3])
 	}
 
-	// Несработавший алерт в «не измеряется» и обратно — тишина.
+	// An unfired alert going to "not measured" and back — silence.
 	n2, _ := notifierEnv(t, script, "token", "chat")
 	n2.OnPass(AlertsResult{Alerts: []AlertSnapshot{{Name: AlertPSICPU, Status: AlertStatusOK}}})
 	n2.OnPass(AlertsResult{Alerts: []AlertSnapshot{{Name: AlertPSICPU, Status: AlertStatusNotMeasured}}})
@@ -182,9 +182,9 @@ func TestTelegramNotifierTransitions(t *testing.T) {
 	}
 }
 
-// TestTelegramNotifierDisabled — все причины выключения: конфиг, нет
-// секретов (нет любого из двух), скрипт не существует/не исполняем —
-// ни одного exec, причина — в журнале.
+// TestTelegramNotifierDisabled — all the disabling reasons: config, no
+// secrets (either of the two missing), the script not existing/not executable —
+// not a single exec; the reason — in the journal.
 func TestTelegramNotifierDisabled(t *testing.T) {
 	journal := filepath.Join(t.TempDir(), "journal")
 	script := fakeNotifyScript(t, journal, false)
@@ -196,7 +196,7 @@ func TestTelegramNotifierDisabled(t *testing.T) {
 		n.OnPass(fire)
 	}
 
-	// Явно выключено конфигом.
+	// Explicitly disabled by config.
 	var buf bytes.Buffer
 	n := NewTelegramNotifier(TelegramOptions{
 		Enabled: false, Script: script,
@@ -211,7 +211,7 @@ func TestTelegramNotifierDisabled(t *testing.T) {
 		t.Errorf("выключение конфигом без записи:\n%s", buf.String())
 	}
 
-	// Нет токена / нет чата / нет обоих.
+	// No token / no chat / neither.
 	for _, c := range []struct {
 		name  string
 		token string
@@ -231,7 +231,7 @@ func TestTelegramNotifierDisabled(t *testing.T) {
 		}
 	}
 
-	// Скрипта нет / каталог вместо скрипта / не исполняем.
+	// No script / a directory instead of the script / not executable.
 	dir := t.TempDir()
 	noExec := filepath.Join(dir, "plain")
 	if err := os.WriteFile(noExec, []byte("#!/bin/sh\n"), 0o644); err != nil {
@@ -256,18 +256,18 @@ func TestTelegramNotifierDisabled(t *testing.T) {
 	}
 }
 
-// TestTelegramNotifierScriptFailure — сбой отправки (код выхода 1): Warn
-// с выводом скрипта, доставка живёт (следующий переход пытается снова).
+// TestTelegramNotifierScriptFailure — a send failure (exit code 1): a Warn
+// with the script output; the delivery stays alive (the next transition tries again).
 func TestTelegramNotifierScriptFailure(t *testing.T) {
 	journal := filepath.Join(t.TempDir(), "journal")
 	script := fakeNotifyScript(t, journal, true)
 	n, buf := notifierEnv(t, script, "token", "chat")
 
-	n.OnPass(AlertsResult{Alerts: []AlertSnapshot{{Name: AlertQueueFreeze, Status: AlertStatusOK, Detail: "d"}}}) // база
+	n.OnPass(AlertsResult{Alerts: []AlertSnapshot{{Name: AlertQueueFreeze, Status: AlertStatusOK, Detail: "d"}}}) // the base
 	n.OnPass(AlertsResult{Alerts: []AlertSnapshot{{Name: AlertQueueFreeze, Status: AlertStatusFiring, Detail: "d"}}})
 	n.OnPass(AlertsResult{Alerts: []AlertSnapshot{{Name: AlertQueueFreeze, Status: AlertStatusOK, Detail: "d"}}})
 
-	// Оба вызова дошли до скрипта (журнал мока пишется до exit 1).
+	// Both calls reached the script (the mock journal is written before exit 1).
 	waitLines(t, journal, 2)
 	deadline := time.Now().Add(2 * time.Second)
 	for !strings.Contains(buf.String(), "level=WARN") {

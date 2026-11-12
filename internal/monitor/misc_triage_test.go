@@ -1,12 +1,12 @@
-// Тесты триажа мутантов CI-прогона 09.11.2026 (половина A): добивки
-// небольших источников monitor — unitevents (hot-границы событий,
-// парсеры systemctl/memory.events, ошибки чтения с нулями),
-// redisuptime/redismem (числовые поля INFO: отсутствующее поле,
-// отрицательное, 2^63, нули на ошибке), psi (ParseFloat-границы
-// значений), streamgroups (пропуск пустых стримов, «no such key»),
-// notify (конструктор без паники на nil-логгере, Warn-причины
-// выключения, доставка Send) и renderdebt (withDefaults-границы,
-// выключенный интервал, nil-логгер цикла, ошибки источника).
+// The mutant triage tests of the CI run of Nov 09, 2026 (half A): the finishing
+// of the small monitor sources — unitevents (the hot boundaries of events,
+// the systemctl/memory.events parsers, read errors with zeros),
+// redisuptime/redismem (the INFO numeric fields: a missing field,
+// a negative one, 2^63, zeros on error), psi (the ParseFloat boundaries
+// of values), streamgroups (skipping empty streams, "no such key"),
+// notify (a constructor without a panic on a nil logger, the Warn reasons
+// of disabling, the Send delivery) and renderdebt (the withDefaults boundaries,
+// a disabled interval, a nil loop logger, source errors).
 package monitor
 
 import (
@@ -43,8 +43,8 @@ func TestUnitEventsHot(t *testing.T) {
 }
 
 func TestParseSystemctlShowBoundaries(t *testing.T) {
-	// NRestarts до первого Id отбрасывается; несколько блоков; «[not
-	// set]» — ноль; значения различимы (base 10, не 9/11).
+	// NRestarts before the first Id is discarded; several blocks; "[not
+	// set]" — zero; the values are distinguishable (base 10, not 9/11).
 	out := "NRestarts=99\n" +
 		"Id=crawler-http-worker.service\nNRestarts=123\n" +
 		"\n" +
@@ -59,7 +59,7 @@ func TestParseSystemctlShowBoundaries(t *testing.T) {
 	if units[1].NRestarts != 0 {
 		t.Errorf("[not set] = %d, want 0", units[1].NRestarts)
 	}
-	// Пустой вывод — пустой снимок.
+	// Empty output — an empty snapshot.
 	if got := parseSystemctlShow(""); len(got) != 0 {
 		t.Errorf("пустой вывод = %+v", got)
 	}
@@ -73,16 +73,16 @@ func TestParseMemoryEventsBoundaries(t *testing.T) {
 	if ev.OOM != 4 || ev.OOMKill != 5 || ev.High != 42 {
 		t.Errorf("memory.events = %+v, want oom 4 kill 5 high 42", ev)
 	}
-	// Значение 2^63 — валидно для uint64.
+	// A value of 2^63 — valid for uint64.
 	ev, err = parseMemoryEvents("oom 9223372036854775808\n")
 	if err != nil || ev.OOM != 9223372036854775808 {
 		t.Errorf("oom 2^63 = (%+v, %v)", ev, err)
 	}
-	// Нечисловое значение — ошибка.
+	// A non-numeric value — an error.
 	if _, err := parseMemoryEvents("oom x\n"); err == nil {
 		t.Error("нечисловое значение: хочу ошибку")
 	}
-	// Отсутствующие ключи — нули.
+	// Missing keys — zeros.
 	ev, err = parseMemoryEvents("low 7\n")
 	if err != nil || ev != (memoryEvents{}) {
 		t.Errorf("нет ключей = (%+v, %v), want нули", ev, err)
@@ -91,16 +91,16 @@ func TestParseMemoryEventsBoundaries(t *testing.T) {
 
 func TestReadMemoryEventsFileClasses(t *testing.T) {
 	dir := t.TempDir()
-	// Файла нет — нули без ошибки (юнит без cgroup).
+	// No file — zeros without an error (a unit without a cgroup).
 	ev, err := readMemoryEvents(filepath.Join(dir, "нет"))
 	if err != nil || ev != (memoryEvents{}) {
 		t.Errorf("нет файла = (%+v, %v), want нули", ev, err)
 	}
-	// Каталог вместо файла — ошибка чтения (не ErrNotExist).
+	// A directory instead of a file — a read error (not ErrNotExist).
 	if _, err := readMemoryEvents(dir); err == nil {
 		t.Error("каталог вместо файла: хочу ошибку")
 	}
-	// Кривой файл — ошибка формата.
+	// A corrupt file — a format error.
 	p := filepath.Join(dir, "memory.events")
 	if err := os.WriteFile(p, []byte("oom x\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -116,23 +116,23 @@ func TestInfoSecondsBoundaries(t *testing.T) {
 	if v, err := infoSeconds(map[string]string{"uptime_in_seconds": "125"}, "uptime_in_seconds"); err != nil || v != 125 {
 		t.Errorf("125 = (%v, %v)", v, err)
 	}
-	// Отсутствующее поле — ошибка и ноль.
+	// A missing field — an error and zero.
 	if v, err := infoSeconds(map[string]string{}, "uptime_in_seconds"); err == nil || v != 0 {
 		t.Errorf("нет поля = (%v, %v), want 0 и ошибка", v, err)
 	}
-	// Ноль — валидное значение (граница n < 0).
+	// Zero is a valid value (the n < 0 boundary).
 	if v, err := infoSeconds(map[string]string{"k": "0"}, "k"); err != nil || v != 0 {
 		t.Errorf("ноль = (%v, %v), want 0 без ошибки", v, err)
 	}
-	// Отрицательное — ошибка и ноль.
+	// A negative — an error and zero.
 	if v, err := infoSeconds(map[string]string{"k": "-5"}, "k"); err == nil || v != 0 {
 		t.Errorf("отрицательное = (%v, %v), want 0 и ошибка", v, err)
 	}
-	// Нечисловое — ошибка и ноль.
+	// Non-numeric — an error and zero.
 	if v, err := infoSeconds(map[string]string{"k": "x"}, "k"); err == nil || v != 0 {
 		t.Errorf("нечисловое = (%v, %v), want 0 и ошибка", v, err)
 	}
-	// 2^63 — валидно для int64 (граница bitSize).
+	// 2^63 — valid for int64 (the bitSize boundary).
 	if v, err := infoSeconds(map[string]string{"k": "4611686018427387904"}, "k"); err != nil || v != 4611686018427387904 {
 		t.Errorf("2^62 = (%v, %v)", v, err)
 	}
@@ -156,19 +156,19 @@ func TestInfoBytesBoundaries(t *testing.T) {
 // --- psi -----------------------------------------------------------------------
 
 func TestParsePSIValueBoundaries(t *testing.T) {
-	// Ноль и 100 — валидные доли (границы 0..100 включительно).
+	// Zero and 100 are valid shares (the 0..100 boundaries inclusive).
 	for _, v := range []string{"0.00", "100.00"} {
 		if _, err := parsePSI("some avg10=" + v + " avg60=1 avg300=1 total=0\n"); err != nil {
 			t.Errorf("avg10=%s: %v, want валидно", v, err)
 		}
 	}
-	// 1e308 — валидное число для ParseFloat (парсер не режет диапазон
-	// раньше проверки 0..100 — ошибка формата «не доля», а не «не число»).
+	// 1e308 is a valid number for ParseFloat (the parser does not cut the range
+	// before the 0..100 check — a "not a share" format error, not "not a number").
 	if _, err := parsePSI("some avg10=1e308 avg60=1 avg300=1 total=0\n"); err == nil ||
 		!strings.Contains(err.Error(), "не доля") {
 		t.Errorf("1e308: %v, want «не доля процента»", err)
 	}
-	// Отсутствующее поле avg300 — ошибка.
+	// A missing avg300 field — an error.
 	if _, err := parsePSI("some avg10=1 avg60=1 total=0\n"); err == nil ||
 		!strings.Contains(err.Error(), "avg300") {
 		t.Errorf("нет avg300: %v", err)
@@ -178,11 +178,11 @@ func TestParsePSIValueBoundaries(t *testing.T) {
 // --- streamgroups ----------------------------------------------------------------
 
 func TestStreamGroupsEmptyAndMissing(t *testing.T) {
-	// Оба стрима без групп — пустой снимок; группы с нулевым числом
-	// пропускаются (continue, не break — последующие стримы читаются).
+	// Both streams without groups — an empty snapshot; groups with a zero count
+	// are skipped (continue, not break — the subsequent streams are read).
 	rdb := &fakeGroupsRedis{
 		groups: map[string][]redis.XInfoGroup{
-			"q:dns": {}, // пустой список
+			"q:dns": {}, // an empty list
 		},
 		xlen: map[string]int64{},
 	}
@@ -198,8 +198,8 @@ func TestStreamGroupsEmptyAndMissing(t *testing.T) {
 // --- notify ------------------------------------------------------------------------
 
 func TestTelegramNotifierNilLogNoPanic(t *testing.T) {
-	// nil-логгер и nil-Getenv подменяются дефолтами — конструктор не
-	// паникует ни в одной ветке выключения.
+	// A nil logger and a nil Getenv are substituted by defaults — the constructor
+	// does not panic in any disabling branch.
 	for _, opts := range []TelegramOptions{
 		{Enabled: false},
 		{Enabled: true, Getenv: func(string) string { return "t" }},
@@ -212,8 +212,8 @@ func TestTelegramNotifierNilLogNoPanic(t *testing.T) {
 }
 
 func TestTelegramNotifierOffReasons(t *testing.T) {
-	// Включён, секреты есть, скрипт не задан — Warn «не задан путь
-	// скрипта», доставка выключена (не ветка «скрипт не доступен»).
+	// Enabled, the secrets are present, the script not set — a Warn "the script
+	// path is not set", the delivery is off (not the "script unavailable" branch).
 	var buf syncedBuffer
 	logger := newNotifyLogger(&buf)
 	n := NewTelegramNotifier(TelegramOptions{
@@ -233,34 +233,34 @@ func TestTelegramNotifierOffReasons(t *testing.T) {
 	}
 }
 
-// newNotifyLogger — текстовый логгер в синхронизированный буфер.
+// newNotifyLogger — a text logger into a synchronized buffer.
 func newNotifyLogger(buf *syncedBuffer) *slog.Logger {
 	return slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 }
 
-// TestTelegramNotifierDisabledNoSend — выключенная доставка (нет
-// секретов): OnPass/Send не порождают попыток отправки (журнал мока и
-// лог чисты от «telegram:»), состояние эпизодов не рассылается.
+// TestTelegramNotifierDisabledNoSend — the delivery disabled (no
+// secrets): OnPass/Send make no send attempts (the mock journal and
+// the log are clean of "telegram:"), the episode state is not mailed out.
 func TestTelegramNotifierDisabledNoSend(t *testing.T) {
 	buf := &syncedBuffer{}
 	n := NewTelegramNotifier(TelegramOptions{
 		Enabled: true,
 		Log:     newNotifyLogger(buf),
-		Getenv:  func(string) string { return "" }, // секретов нет
+		Getenv:  func(string) string { return "" }, // no secrets
 	})
 	res := AlertsResult{Alerts: []AlertSnapshot{{
 		Name: AlertQueueDead, Status: AlertStatusFiring, Detail: "глубина 5",
 	}}}
 	n.OnPass(res)
 	n.Send("отчёт")
-	time.Sleep(50 * time.Millisecond) // фоновые горутины отправки
+	time.Sleep(50 * time.Millisecond) // the background send goroutines
 	if log := buf.String(); strings.Contains(log, "отправка") {
 		t.Errorf("выключенная доставка пытается отправить:\n%s", log)
 	}
 }
 
-// TestTelegramNotifierNotMeasuredEpisode — «не измеряется» не рвёт
-// эпизод: возврат измерений в ok закрывает его ровно одним ✅.
+// TestTelegramNotifierNotMeasuredEpisode — "not measured" does not break
+// the episode: the return of measurements to ok closes it with exactly one ✅.
 func TestTelegramNotifierNotMeasuredEpisode(t *testing.T) {
 	journal := filepath.Join(t.TempDir(), "journal.log")
 	script := fakeNotifyScript(t, journal, false)
@@ -269,11 +269,11 @@ func TestTelegramNotifierNotMeasuredEpisode(t *testing.T) {
 	pass := func(status, detail string) AlertsResult {
 		return AlertsResult{Alerts: []AlertSnapshot{{Name: AlertQueueDead, Status: status, Detail: detail}}}
 	}
-	n.OnPass(pass(AlertStatusNotMeasured, "Redis не задан")) // база «не измеряется»
+	n.OnPass(pass(AlertStatusNotMeasured, "Redis не задан")) // the "not measured" base
 	n.OnPass(pass(AlertStatusFiring, "глубина 5"))           // 🚨
-	n.OnPass(pass(AlertStatusNotMeasured, "обрыв"))          // перерыв — без сообщения
+	n.OnPass(pass(AlertStatusNotMeasured, "обрыв"))          // an interruption — without a message
 	n.OnPass(pass(AlertStatusOK, "глубина 0"))               // ✅
-	n.OnPass(pass(AlertStatusOK, "глубина 0"))               // тишина
+	n.OnPass(pass(AlertStatusOK, "глубина 0"))               // silence
 	waitForJournal(t, journal, "🚨")
 	waitForJournal(t, journal, "✅")
 	b, err := os.ReadFile(journal)
@@ -288,9 +288,9 @@ func TestTelegramNotifierNotMeasuredEpisode(t *testing.T) {
 	}
 }
 
-// TestTelegramNotifierNotMeasuredCold — «не измеряется» без открытого
-// эпизода — полная тишина (ни сообщения, даже в лог: заметка только для
-// сработавшего).
+// TestTelegramNotifierNotMeasuredCold — "not measured" without an open
+// episode — complete silence (no message, not even in the log: the note is only
+// for a fired alert).
 func TestTelegramNotifierNotMeasuredCold(t *testing.T) {
 	journal := filepath.Join(t.TempDir(), "journal.log")
 	script := fakeNotifyScript(t, journal, false)
@@ -321,8 +321,8 @@ func TestTelegramNotifierSendDelivers(t *testing.T) {
 	waitForJournal(t, journal, "произвольный отчёт")
 }
 
-// waitForJournal — ждёт появления строки в журнале мока (фоновая
-// горутина отправки).
+// waitForJournal — waits for a line to appear in the mock journal (a
+// background send goroutine).
 func waitForJournal(t *testing.T, journal, want string) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
@@ -363,7 +363,7 @@ func TestRenderDebtOptionsBoundaries(t *testing.T) {
 }
 
 func TestRenderDebtLoopNilLogAndSourceErrors(t *testing.T) {
-	// nil-логгер не паникует: стартовый проход выполняется и выходит.
+	// A nil logger does not panic: the starting pass runs and exits.
 	src := &fakeDebtSource{debt: RenderDebt{Flags: 3, Lag: 1}}
 	done := make(chan error, 1)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -378,29 +378,29 @@ func TestRenderDebtLoopNilLogAndSourceErrors(t *testing.T) {
 		t.Fatal("цикл не вышел")
 	}
 
-	// Источник не задан — ошибка.
+	// The source not set — an error.
 	if err := RenderDebtLoop(context.Background(), nil, RenderDebtOptions{Interval: time.Minute}); err == nil {
 		t.Error("источник не задан: хочу ошибку")
 	}
 }
 
 func TestRenderDebtSourceErrors(t *testing.T) {
-	// Пул/Redis не заданы — ошибки источника (мутанты вырезания return
-	// паниковали бы на nil).
+	// The pool/Redis not set — source errors (return-cut
+	// mutants would panic on nil).
 	if _, err := renderDebtOf(context.Background(), nil, nil); err == nil {
 		t.Error("пул не задан: хочу ошибку")
 	}
 	if _, err := renderDebtOf(context.Background(), &zonestatsFakePool{}, nil); err == nil {
 		t.Error("Redis не задан: хочу ошибку")
 	}
-	// Ошибка Query — ошибка источника.
+	// A Query error — a source error.
 	pool := &zonestatsFakePool{steps: []zonestatsStep{{err: errors.New("бд недоступна")}}}
 	if _, err := renderDebtOf(context.Background(), pool, &renderLensSource{}); err == nil {
 		t.Error("Query-ошибка: хочу ошибку")
 	}
 }
 
-// renderLensSource — StreamLener с нулевыми глубинами.
+// renderLensSource — a StreamLener with zero depths.
 type renderLensSource struct{}
 
 func (s *renderLensSource) Len(context.Context, string) (int64, error) { return 0, nil }

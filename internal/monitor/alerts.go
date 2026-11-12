@@ -1,168 +1,168 @@
-// Алерты мониторинга — минимальный набор ТЗ 5.9 (T-080; ТЗ 8, ТЗ 10.3),
-// цикл оценки в том же сервисе monitor, что и пересчёт зон (T-078).
+// Monitoring alerts — the minimal set of spec 5.9 (T-080; spec 8, spec 10.3),
+// the evaluation loop lives in the same monitor service as the zone recount (T-078).
 //
-// Набор и источники:
+// The set and its sources:
 //
-//   - рост доли ошибок DNS — доля temp_error среди проверок текущих
-//     суток (суточные строки crawler_counters temp_error:/checks: —
-//     точечные чтения, T-182; temp_error — исход DNS-этапа после
-//     исчерпания ретраев, ТЗ 5.4; NXDOMAIN → not_delegated — валидный
-//     результат, не ошибка);
-//   - переполнение очередей — глубина рабочих стримов q:dns/q:http/
-//     q:render/q:analyze (backlog групп потребления) против
-//     scheduler.queue_high_watermark (порог backpressure, ТЗ 4.2/5.3;
-//     q:dead гейтом не ограничивается — см. шапку
-//     internal/queue/backpressure.go — и не проверяется);
-//   - остановка прогресса — zones.updated_at (пишет ZoneStatsLoop, T-078)
-//     старше N периодов пересчёта: живой monitor метит свою работу сам;
-//   - нехватка места на диске — statfs каталога контента против
-//     content.disk_free_percent (тот же порог, что ставит Put контента
-//     в паузу, ТЗ 8; формула — как в internal/content/disk.go, подход
-//     переиспользован собственной копией, пакет хранилища не тянется);
-//   - износ NVMe (SMART) — percentage_used из health-лога NVMe (ТЗ 10.3),
-//     чтение ioctl-ом admin-команды, без nvme-cli;
-//   - мусорные content_hash очистки (T-099) — всплеск счётчика
-//     crawler_ingest_bad_hashes_total в экспозиции /metrics сервиса
-//     ingest (BadHashesSource, реализация IngestBadHashes — badhashes.go):
-//     рост счётчика — ошибка писателя результатов (T-056), данные не
-//     теряются (refcount по мусорной ссылке не менялся, ING-P2-4);
-//   - OOM и рестарты юнитов crawler (T-145) — счётчики memory.events
-//     (oom/oom_kill) cgroup v2 и NRestarts systemd (UnitEventsSource,
-//     реализация OSUnitEvents — unitevents.go): событие — незапланированный
-//     простой конвейера и симптом невыполнения бюджета памяти (ТЗ 3.4,
+//   - growth of the DNS error share — the share of temp_error among the checks of
+//     the current day (the daily crawler_counters rows temp_error:/checks: —
+//     point reads, T-182; temp_error is the DNS-stage outcome after
+//     retries are exhausted, spec 5.4; NXDOMAIN → not_delegated is a valid
+//     outcome, not an error);
+//   - queue overflow — the depth of the working streams q:dns/q:http/
+//     q:render/q:analyze (the consumer group backlog) against
+//     scheduler.queue_high_watermark (the backpressure threshold, spec 4.2/5.3;
+//     q:dead is not capped by the gate — see the header of
+//     internal/queue/backpressure.go — and is not checked);
+//   - progress stall — zones.updated_at (written by ZoneStatsLoop, T-078)
+//     older than N recount periods: a live monitor marks its own work itself;
+//   - disk space shortage — statfs of the content directory against
+//     content.disk_free_percent (the same threshold that puts content Put
+//     on pause, spec 8; the formula is as in internal/content/disk.go, the approach
+//     is reused via an owned copy — the storage package is not pulled in);
+//   - NVMe wear (SMART) — percentage_used from the NVMe health log (spec 10.3),
+//     read via an ioctl of the admin command, without nvme-cli;
+//   - junk content_hash of cleanup (T-099) — a spike of the
+//     crawler_ingest_bad_hashes_total counter in the /metrics exposition of the
+//     ingest service (BadHashesSource, the IngestBadHashes implementation — badhashes.go):
+//     counter growth is a result-writer error (T-056), no data is
+//     lost (the refcount on the junk reference did not change, ING-P2-4);
+//   - OOM and restarts of crawler units (T-145) — the memory.events
+//     counters (oom/oom_kill) of cgroup v2 and the systemd NRestarts (UnitEventsSource,
+//     the OSUnitEvents implementation — unitevents.go): an event is an unscheduled
+//     pipeline downtime and a symptom of the memory budget not being met (spec 3.4,
 //     docs/deploy.md §2).
-//   - неразобранный q:dead (T-154) — глубина карантина (XLEN через тот
-//     же StreamLener: групп потребителей у q:dead нет) устойчиво
-//     ненулевая; сверяется со счётчиком смертей
-//     crawler_queue_dead_buried_total (metrics/dead.go) — глубина
-//     (сток) держит сигнал, который темп (rate) растягивает медленным
-//     клеймом на часы (пост-мортем docs/load-measurements.md §11.1);
-//   - память Redis (T-154) — used_memory/maxmemory из INFO memory
-//     (RedisMemorySource, реализация RedisInfo — redismem.go): при
-//     noeviction (ТЗ 3.2) заполнение maxmemory — прокси-метрика
-//     предстоящих OOM-отказов записи, прямого счётчика отказов INFO
-//     не отдаёт;
-//   - рестарт Redis (T-270, ТЗ-fsm §3 ФТ-2.2) — uptime_in_seconds из
-//     INFO server (RedisUptimeSource, реализация RedisInfo —
-//     redisuptime.go) меньше окна AlertRedisRestartWindow: рестарт при
-//     отсутствии персистентности (docs/redis.md §5) теряет все
-//     недоставленные записи стримов — главная причина класса потерь
-//     «статус повис» (потерянные q:http при записанном done лечит
-//     компенсатор T-270), сигнал — в момент события, а не когортой
-//     gauge спустя сутки;
-//   - абсолютный минимум места на диске (T-162) — свободные байты
-//     каталога контента против monitor.alerts.disk_free_min_bytes
-//     (Warn) и disk_free_crit_bytes (эскалация отдельным алертом):
-//     процентный порог на большом томе поздний — 10 % от 79 ГБ = 8 ГБ
-//     ≈ 5 ч до заполнения при темпе ≈36 GiB/сут (замер §12);
-//   - троттлинг MemoryHigh (T-162) — рост счётчика memory.events high
-//     юнита между проходами (источник — тот же UnitEventsSource, что у
-//     unit_oom): предвестник фаталов http-worker (T-157) до OOM-kill;
-//   - замороженная очередь (T-162) — last-delivered-id группы рабочего
-//     стрима не движется ≥ monitor.alerts.queue_freeze_window при
-//     глубине > 0 (StreamGroupsSource, реализация RedisStreamGroups —
-//     streamgroups.go): сигнатура отравленной задачи T-159 — запись
-//     валит потребителя, XREADGROUP не читает, очередь стоит;
-//   - PSI CPU (T-162) — some avg300 /proc/pressure/cpu выше
-//     monitor.alerts.psi_cpu_percent устойчиво monitor.alerts.
-//     psi_cpu_window (PSISource, реализация OSPSI — psi.go): голод
-//     планировщика, на котором тонут все этапы разом (замер §12:
-//     some 91–95 % в пиках; T-158 дал monitor'у вес CPU 50 против
-//     1000 — собственные проходы голод не приближают);
-//   - накопление рендер-долга (T-175) — флаги render_pending
-//     (счётчик crawler_counters, миграция 000015) + лаг q:render
-//     (renderdebt.go) выше monitor.alerts.render_debt_domains И растёт
-//     monitor.alerts.render_debt_passes проходов подряд: очередь
-//     переполнена и приток обгоняет дренаж — алерт T-162
-//     «замороженная очередь» такой случай не ловит (доставки идут),
-//     долг 443 тыс. (морозка 24.10) нашли ручным SQL;
-//   - рост глубины очереди фолбэка рендера (T-246, ТЗ рендера §4.6
-//     п.3) — глубина q:render-fallback (той же семантикой, что алерт
-//     очередей: backlog группы потребления воркера B) у эффективного
-//     порога стрима И растёт 2 прохода подряд, ИЛИ держится над
-//     порогом 2 прохода подряд без роста (S-P2-1: стационарная
-//     глубина — остановленный B, упор в MAXLEN или эпизод после
-//     рестарта монитора) — chromium-воркер B не
-//     успевает дорабатывать (темп воркера ниже притока фолбэка, вплоть
-//     до полной остановки B — чтение Redis живо при мёртвом воркере,
-//     метрика crawler_queue_depth{queue="q:render-fallback"} экспонирует
-//     сам B и при его смерти ряда нет);
-//   - превышение бюджета доли фолбэка (T-246, ТЗ рендера §4.6 п.3) —
-//     рост счётчика событий приостановки
+//   - untriaged q:dead (T-154) — the depth of the quarantine (XLEN via the
+//     same StreamLener: q:dead has no consumer groups) persistently
+//     non-zero; cross-checked against the deaths counter
+//     crawler_queue_dead_buried_total (metrics/dead.go) — the depth
+//     (the sink) holds the signal that the rate stretches over hours
+//     with slow claiming (post-mortem docs/load-measurements.md §11.1);
+//   - Redis memory (T-154) — used_memory/maxmemory from INFO memory
+//     (RedisMemorySource, the RedisInfo implementation — redismem.go): with
+//     noeviction (spec 3.2) filling maxmemory is a proxy metric of
+//     upcoming OOM write refusals; INFO does not expose a direct refusal
+//     counter;
+//   - Redis restart (T-270, TZ-fsm spec §3 FR-2.2) — uptime_in_seconds from
+//     INFO server (RedisUptimeSource, the RedisInfo implementation —
+//     redisuptime.go) below the AlertRedisRestartWindow: a restart without
+//     persistence (docs/redis.md §5) loses all undelivered stream
+//     entries — the main cause of the "status hung" loss class
+//     (lost q:http with done already written is handled by the T-270
+//     compensator); the signal comes at the moment of the event, not as a
+//     gauge cohort a day later;
+//   - absolute minimum of disk space (T-162) — the free bytes of the
+//     content directory against monitor.alerts.disk_free_min_bytes
+//     (Warn) and disk_free_crit_bytes (escalated as a separate alert):
+//     a percentage threshold is late on a large volume — 10% of 79 GB = 8 GB
+//     ≈ 5h until full at a rate of ≈36 GiB/day (measurement §12);
+//   - MemoryHigh throttling (T-162) — growth of the unit's memory.events high
+//     counter between passes (the source is the same UnitEventsSource as
+//     unit_oom): a harbinger of http-worker fatals (T-157) before the OOM kill;
+//   - frozen queue (T-162) — the last-delivered-id of the working
+//     stream's group does not move for ≥ monitor.alerts.queue_freeze_window while
+//     depth > 0 (StreamGroupsSource, the RedisStreamGroups implementation —
+//     streamgroups.go): the signature of the poisoned task of T-159 — an entry
+//     kills the consumer, XREADGROUP reads nothing, the queue stands still;
+//   - PSI CPU (T-162) — some avg300 of /proc/pressure/cpu above
+//     monitor.alerts.psi_cpu_percent sustained for monitor.alerts.
+//     psi_cpu_window (PSISource, the OSPSI implementation — psi.go): scheduler
+//     starvation that drowns all stages at once (measurement §12:
+//     some 91–95% at peaks; T-158 gave monitor a CPU weight of 50 against
+//     1000 — its own passes do not approach starvation);
+//   - render debt accumulation (T-175) — render_pending flags
+//     (the crawler_counters counter, migration 000015) + the q:render lag
+//     (renderdebt.go) above monitor.alerts.render_debt_domains AND growing
+//     for monitor.alerts.render_debt_passes passes in a row: the queue is
+//     overflowing and inflow outruns drain — the T-162 "frozen queue"
+//     alert does not catch this case (deliveries go through);
+//     the debt of 443k (the freeze of Oct 24) was found by manual SQL;
+//   - growth of the render fallback queue depth (T-246, render spec §4.6
+//     item 3) — the depth of q:render-fallback (with the same semantics as the
+//     queue alert: the backlog of worker B's consumer group) at the effective
+//     threshold of the stream AND growing for 2 passes in a row, OR holding above
+//     the threshold for 2 passes in a row without growth (S-P2-1: a stationary
+//     depth — B stalled, pinned at MAXLEN, or an episode after
+//     a monitor restart) — the chromium worker B does not
+//     keep up with finishing its work (the worker rate is below the fallback inflow, up to
+//     a full stop of B — the Redis read is alive with a dead worker;
+//     the crawler_queue_depth{queue="q:render-fallback"} metric exposes
+//     B itself, and when it dies the series is gone);
+//   - exceeding the fallback share budget (T-246, render spec §4.6 item 3) —
+//     growth of the suspension events counter
 //     crawler_render_fallback_suspended_total{reason="budget"} (T-239,
-//     зонд /metrics рендер-воркера, suspends.go): доля публикаций за
-//     окно бюджета ушла за потолок render.fallback.share_percent —
-//     деградация основного движка (движко-зависимые финализации
-//     множатся), задачи при этом не теряются (финализация штатная, ФТ-9).
-//     Падение юнита движка отдельным алертом не вводится: юниты движков
-//     рендера — crawler-*.service (crawler-chromium сегодня, moli/
-//     lightpanda по ТЗ рендера §4.7 п.3) — покрывает существующий
-//     unit_oom (T-145, шаблон unitEventsPattern);
-//   - устойчивый рост browser-ошибок этапа рендера (S-P2-6, ТЗ рендера
-//     §4.6 п.3, решение оператора — rate-детектор) — счётчик
-//     crawler_stage_errors_total{stage="render",type="browser"} из
-//     того же зонда /metrics рендер-воркера растёт 2 проходов подряд:
-//     движок-кандидат (moli/lightpanda) завис или недоступен (гейт
-//     T-239 приостанавливает фолбэк-публикации; событие гейта —
-//     счётчик suspended{reason="gate"} и Warn-лог воркера, детектор —
-//     здесь);
-//   - домены «статус повис» (T-256, ТЗ-fsm §3 ФТ-2.2) — строка
-//     crawler_counters new_done_stale (FILTER-колонка прохода
-//     реконсиляции zonestats.go: status = new ∧ check_state = done ∧
-//     last_checked_at старше суток — DNS записал «есть адреса», HTTP
-//     итог не пришёл: потеря задачи q:http)
-//     ненулевая в 2 НОВЫХ снапшотах реконсиляции подряд (серия — по
-//     смене updated_at строки: проходы алертов чаще источника,
-//     повторные чтения одного снапшота наблюдением не считаются).
-//     Точечное PK-чтение, без скана domains; стационарно ноль в норме.
-//     Лечит компенсатор T-270 (ранний recheck Р15 спецификации
-//     check_state, часовой проход планировщика stalerequeue.go —
-//     его guard читает ту же строку); алерт остаётся сигналом о новых
-//     потерях (gauge crawler_domains_new_done_stale экспонирует
-//     уровень).
+//     the /metrics probe of the render worker, suspends.go): the share of publications over
+//     the budget window went past the render.fallback.share_percent cap —
+//     degradation of the primary engine (engine-dependent finalizations
+//     multiply); tasks are not lost meanwhile (finalization is normal, FR-9).
+//     A falling engine unit is not introduced as a separate alert: the engine
+//     units of render — crawler-*.service (crawler-chromium today, moli/
+//     lightpanda per the render spec §4.7 item 3) — are covered by the existing
+//     unit_oom (T-145, the unitEventsPattern template);
+//   - sustained growth of browser errors of the render stage (S-P2-6, the render spec
+//     §4.6 item 3, the operator's decision — a rate detector) — the counter
+//     crawler_stage_errors_total{stage="render",type="browser"} from
+//     the same /metrics probe of the render worker grows for 2 passes in a row:
+//     the candidate engine (moli/lightpanda) is hung or unavailable (the gate
+//     of T-239 suspends fallback publications; the gate event —
+//     the suspended{reason="gate"} counter and the worker's Warn log; the detector —
+//     here);
+//   - "status hung" domains (T-256, TZ-fsm spec §3 FR-2.2) — the
+//     crawler_counters new_done_stale row (the FILTER column of the
+//     reconciliation pass of zonestats.go: status = new ∧ check_state = done ∧
+//     last_checked_at older than a day — DNS wrote the "has addresses" branch, the HTTP
+//     outcome never arrived: a lost q:http task)
+//     non-zero in 2 NEW reconciliation snapshots in a row (the series — by
+//     the change of the row's updated_at: alert passes are more frequent than the source,
+//     repeated reads of one snapshot do not count as observations).
+//     A point PK read, no scan of domains; stationary zero normally.
+//     Treated by the T-270 compensator (the early recheck of R15 of the
+//     check_state specification, the hourly scheduler pass of stalerequeue.go —
+//     its guard reads the same row); the alert remains the signal about new
+//     losses (the crawler_domains_new_done_stale gauge exposes
+//     the level).
 //
-// Доставка (T-162): переходы алертов (срабатывание/снятие) уходят
-// оператору в Telegram — хук AlertsOptions.OnPass (TelegramNotifier,
-// notify.go) зовёт exec deploy/telegram-notify.sh --message с дебаунсом
-// «только изменение состояния»; без секретов/скрипта доставка выключена,
-// сигнал остаётся Warn в журнале (ТЗ 10.4 — тот же канал, что у CI/CD).
+// Delivery (T-162): alert transitions (firing/clearing) go
+// to the operator in Telegram — the AlertsOptions.OnPass hook (TelegramNotifier,
+// notify.go) calls exec deploy/telegram-notify.sh --message with debouncing
+// of "state change only"; without secrets/the script delivery is off,
+// the signal remains a Warn in the log (spec 10.4 — the same channel as CI/CD).
 //
-// Сигнал фронтовой (на переходах, стиль DiskWatchLoop в internal/content):
-// Warn при срабатывании, Info при снятии, Debug когда алерт неприменим
-// («не измеряется»). Ошибки источников (БД, Redis, statfs) — Warn каждого
-// прохода, цикл живёт (контракт OnRun, T-012). Исключение — SMART NVMe:
-// в Docker-контейнере /dev/nvme* недоступен, это ожидаемое состояние, а не
-// авария — честная деградация «не измеряется» без Warn и без ложного
-// срабатывания; на боевом systemd-хосте слой включается доступом юнита к
-// /dev/nvme* (группа nvme-smart, T-089 — docs/disks.md) рядом с хостовым
+// Signaling is front-loaded (on transitions, the DiskWatchLoop style in internal/content):
+// Warn on firing, Info on clearing, Debug when the alert does not apply
+// ("not measured"). Source errors (DB, Redis, statfs) — a Warn every
+// pass, the loop keeps living (the OnRun contract, T-012). The exception is NVMe SMART:
+// in a Docker container /dev/nvme* is unavailable — this is an expected state, not
+// an incident — an honest "not measured" degradation without a Warn and without
+// a false firing; on a production systemd host the layer is enabled by granting the unit access to
+// /dev/nvme* (the nvme-smart group, T-089 — docs/disks.md) next to the host-side
 // smartd.
 //
-// Гистерезис — у алертов с дребезгом у порога: доля ошибок DNS (включение
-// 30 % / снятие 20 %), очереди (включение на пороге гейта / снятие ниже
-// 90 % порога) и память Redis (80 % / 75 %, T-154); q:dead гасится
-// устойчивостью (3 прохода) и снимается пустым карантином (T-154). Диск
-// зеркалирует порог паузы Put без зазора: алерт виден
-// ровно тогда, когда запись контента остановлена; остановка прогресса и
-// износ меняются только событиями, не порогом — гистерезис не нужен.
-// Новые алерты T-162 гасятся устойчивостью вместо гистерезиса:
-// memory_high — серия проходов с ростом счётчика, queue_frozen — окно
-// неподвижности last-delivered-id при ненулевой глубине, psi_cpu — окно
-// удержания avg300 выше порога (сам avg300 сглаживает 5 минут);
-// абсолютные минимумы диска — без зазора, как процентный.
+// Hysteresis — for alerts that flap at the threshold: the DNS error share (firing
+// 30% / clearing 20%), queues (firing at the gate threshold / clearing below
+// 90% of the threshold) and Redis memory (80% / 75%, T-154); q:dead is damped
+// by persistence (3 passes) and cleared by an empty quarantine (T-154). Disk
+// mirrors the Put pause threshold without a gap: the alert is visible
+// exactly when content writing is stopped; progress stall and
+// wear change only via events, not via a threshold — hysteresis is not needed.
+// The new T-162 alerts are damped by persistence instead of hysteresis:
+// memory_high — a series of passes with counter growth; queue_frozen — a window
+// of last-delivered-id immobility at non-zero depth; psi_cpu — a window
+// of holding avg300 above the threshold (avg300 itself smooths over 5 minutes);
+// the absolute disk minimums — without a gap, like the percentage one.
 //
-// Экспорт состояния — снапшот прохода AlertsResult в хук
-// AlertsOptions.OnPass (решение: лог + поле). Собственный gauge-реестр
-// Prometheus в monitor не заводится — не дублировать internal/metrics
-// (T-076): метрики алертов (crawler_alert_firing по меткам) заведёт слой
-// T-077 поверх общего реестра, хук даёт точку подключения без правки
-// цикла.
+// State export — the AlertsResult pass snapshot into the
+// AlertsOptions.OnPass hook (the decision: log + field). An own Prometheus
+// gauge registry is not created in monitor — do not duplicate internal/metrics
+// (T-076): the alert metrics (crawler_alert_firing by labels) will be added by the
+// T-077 layer on top of the shared registry; the hook gives an attach point without editing
+// the loop.
 //
-// Автомат алертов (T-264, ТЗ tasks/TZ-fsm.md §3 ФТ-10): каждый алерт —
-// значение единой структуры «{имя, статус, track-память}»
-// (alertMachine) с единственной точкой записи состояния transition;
-// eval-функции этого файла возвращают наблюдение (observation), решение
-// принимают типизированные track-памяти. Спецификация состояний и
-// переходов — internal/monitor/alertstate.go.
+// The alert state machine (T-264, spec tasks/TZ-fsm.md §3 FR-10): each alert is
+// a value of a single "{name, status, track memory}" structure
+// (alertMachine) with the single state-writing point transition;
+// the eval functions of this file return an observation; the decision
+// is made by the typed track memories. The specification of states and
+// transitions — internal/monitor/alertstate.go.
 package monitor
 
 import (
@@ -184,42 +184,42 @@ import (
 	"crawler/internal/queue"
 )
 
-// Статусы алертов (AlertSnapshot.Status).
+// Alert statuses (AlertSnapshot.Status).
 const (
-	// AlertStatusOK — условие алерта не выполнено.
+	// AlertStatusOK — the alert condition is not met.
 	AlertStatusOK = "ok"
-	// AlertStatusFiring — алерт сработал (Warn на переходе).
+	// AlertStatusFiring — the alert fired (Warn on the transition).
 	AlertStatusFiring = "firing"
-	// AlertStatusNotMeasured — алерт неприменим в текущем окружении
-	// (нет данных/источник недоступен): не срабатывает ложно.
+	// AlertStatusNotMeasured — the alert does not apply in the current environment
+	// (no data/the source is unavailable): it never fires falsely.
 	AlertStatusNotMeasured = "not_measured"
 )
 
-// Имена алертов — метка в логах и снапшоте прохода.
+// Alert names — the label in the logs and the pass snapshot.
 const (
-	AlertDNSErrors        = "dns_temp_error_share"   // доля temp_error за сутки
-	AlertQueueOverflow    = "queue_overflow"         // глубина очереди у порога гейта
-	AlertProgressStall    = "progress_stall"         // zones.updated_at устарел
-	AlertDiskFree         = "disk_free"              // место каталога контента
+	AlertDNSErrors        = "dns_temp_error_share"   // the temp_error share of the day
+	AlertQueueOverflow    = "queue_overflow"         // queue depth at the gate threshold
+	AlertProgressStall    = "progress_stall"         // zones.updated_at is stale
+	AlertDiskFree         = "disk_free"              // content directory space
 	AlertNVMeWear         = "nvme_wear"              // SMART percentage_used
-	AlertBadHashes        = "ingest_bad_hashes"      // всплеск мусорных content_hash
-	AlertUnitOOM          = "unit_oom"               // OOM/рестарты юнитов crawler (T-145)
-	AlertQueueDead        = "queue_dead"             // неразобранный q:dead (T-154)
-	AlertRedisMemory      = "redis_memory"           // память Redis у maxmemory (T-154)
-	AlertRedisRestart     = "redis_restart"          // рестарт Redis: недоставленные записи стримов потеряны (T-270)
-	AlertDiskMin          = "disk_free_min"          // абсолютный минимум места, Warn (T-162)
-	AlertDiskCrit         = "disk_free_crit"         // эскалация абсолютного минимума (T-162)
-	AlertMemHigh          = "memory_high"            // троттлинг MemoryHigh (T-162)
-	AlertQueueFreeze      = "queue_frozen"           // замороженная очередь (T-162)
+	AlertBadHashes        = "ingest_bad_hashes"      // junk content_hash spike
+	AlertUnitOOM          = "unit_oom"               // OOM/restarts of crawler units (T-145)
+	AlertQueueDead        = "queue_dead"             // untriaged q:dead (T-154)
+	AlertRedisMemory      = "redis_memory"           // Redis memory near maxmemory (T-154)
+	AlertRedisRestart     = "redis_restart"          // Redis restart: undelivered stream entries lost (T-270)
+	AlertDiskMin          = "disk_free_min"          // absolute space minimum, Warn (T-162)
+	AlertDiskCrit         = "disk_free_crit"         // absolute minimum escalation (T-162)
+	AlertMemHigh          = "memory_high"            // MemoryHigh throttling (T-162)
+	AlertQueueFreeze      = "queue_frozen"           // frozen queue (T-162)
 	AlertPSICPU           = "psi_cpu"                // PSI CPU some (T-162)
-	AlertRenderDebt       = "render_debt"            // накопление рендер-долга (T-175)
-	AlertRenderFbDepth    = "render_fallback_depth"  // рост глубины q:render-fallback (T-246)
-	AlertRenderFbBudget   = "render_fallback_budget" // превышение бюджета доли фолбэка (T-246)
-	AlertRenderBrowserErr = "render_browser_errors"  // рост browser-ошибок этапа: движок недоступен (S-P2-6)
-	AlertDomainsStale     = "domains_new_done_stale" // домены «статус повис» new∧done старше суток (T-256, ФТ-2.2)
+	AlertRenderDebt       = "render_debt"            // render debt accumulation (T-175)
+	AlertRenderFbDepth    = "render_fallback_depth"  // q:render-fallback depth growth (T-246)
+	AlertRenderFbBudget   = "render_fallback_budget" // fallback share budget exceeded (T-246)
+	AlertRenderBrowserErr = "render_browser_errors"  // stage browser-error growth: engine unavailable (S-P2-6)
+	AlertDomainsStale     = "domains_new_done_stale" // "status hung" domains new∧done older than a day (T-256, FR-2.2)
 )
 
-// alertDescs — человекочитаемые описания алертов для записей лога.
+// alertDescs — human-readable alert descriptions for log entries.
 var alertDescs = map[string]string{
 	AlertDNSErrors:        "рост доли ошибок DNS",
 	AlertQueueOverflow:    "переполнение очередей",
@@ -243,322 +243,322 @@ var alertDescs = map[string]string{
 	AlertDomainsStale:     "домены «статус повис»: new с завершённой проверкой старше 24 ч",
 }
 
-// Пороги оценки. Числа ТЗ не задаёт; переиспользуются существующие пороги
-// конфигурации (queue_high_watermark, disk_free_percent), остальное —
-// константы с обоснованием (меньше поверхности конфигурации, значения
-// связаны механикой этапов, а не тюнингом оператора).
+// Evaluation thresholds. The spec does not set numbers; existing config
+// thresholds are reused (queue_high_watermark, disk_free_percent); the rest —
+// constants with justification (a smaller config surface, the values
+// are tied by stage mechanics, not by operator tuning).
 const (
-	// DefaultAlertsInterval — период оценки алертов: 5 минут —
-	// fallback нулевых AlertsOptions.Interval; рабочее значение —
-	// monitor.alerts_interval (T-206 — отвязка от реконсиляции,
-	// решение оператора 26.10). История частоты: исходные 60 с — верх
-	// коридора ТЗ 5.9 «30–60 с», рассчитанный на малый корпус; T-161
-	// держал «одну пару циклов» на zone_stats_interval (5 мин);
-	// T-199 разредил реконсиляцию до 30 мин — окна детекции в проходах
-	// растянулись в 6 раз; T-206 вернул циклу алертов собственные
-	// 5 мин, эффективные окна прежние: queue_dead срабатывает за ≈15 мин
-	// (3 прохода), mem_high/render_debt — за 10 мин (2 прохода),
-	// bad_hashes держит окно 75 мин (15 проходов), погрешность
-	// PSI-выборки ~5 мин.
+	// DefaultAlertsInterval — the alert evaluation period: 5 minutes is the
+	// fallback for a zero AlertsOptions.Interval; the working value is
+	// monitor.alerts_interval (T-206 — decoupling from reconciliation,
+	// the operator's decision of Oct 26). Frequency history: the original 60 s was the
+	// top of the spec 5.9 corridor "30–60 s", sized for a small corpus; T-161
+	// kept "one pair of cycles" on zone_stats_interval (5 min);
+	// T-199 thinned reconciliation to 30 min — the detection windows in passes
+	// stretched 6×; T-206 gave the alert loop its own
+	// 5 min, the effective windows unchanged: queue_dead fires in ≈15 min
+	// (3 passes), mem_high/render_debt — in 10 min (2 passes),
+	// bad_hashes holds a 75 min window (15 passes), the
+	// PSI sampling error is ~5 min.
 	DefaultAlertsInterval = 5 * time.Minute
 
-	// AlertStallFactor — порог остановки прогресса в периодах
-	// РЕКОНСИЛЯЦИИ: updated_at старше 5 × zone_stats_interval —
-	// остановка. Единица порога — период ZoneStatsLoop (метку пишет
-	// именно этот цикл), а не интервал алертов: при 30-мин реконсиляции
-	// порог 5 × 5 мин стрелял бы вечно; более частые проходы алертов
-	// (T-206) только опрашивают свежесть чаще, порог остался
-	// «5 пропущенных проходов реконсиляции» (≈2,5 ч на дефолтных
-	// 30 мин). Проход T-078 по десяткам млн строк — минуты: единичный
-	// пропуск периода — не авария, 5 периодов — уверенная остановка.
+	// AlertStallFactor — the progress stall threshold in periods
+	// of RECONCILIATION: updated_at older than 5 × zone_stats_interval —
+	// a stall. The threshold unit is the ZoneStatsLoop period (the stamp is written
+	// by exactly that loop), not the alert interval: with 30 min reconciliation
+	// a threshold of 5 × 5 min would fire forever; more frequent alert
+	// passes (T-206) only poll freshness more often; the threshold stayed
+	// "5 missed reconciliation passes" (≈2.5h at the default
+	// 30 min). A T-078 pass over tens of millions of rows takes minutes: a single
+	// missed period is not an incident, 5 periods is a confident stall.
 	AlertStallFactor = 5
 
-	// AlertDNSFireShare — доля temp_error, включающая алерт: 30 %.
-	// Адаптивный лимитёр DNS (T-035) держит долю таймаутов ≤10 %,
-	// снижая QPS: 30 % — устойчивый отказ резолверов (недоступен
-	// Unbound/апстрим), а не адаптивное проседание.
+	// AlertDNSFireShare — the temp_error share that fires the alert: 30%.
+	// The adaptive DNS limiter (T-035) keeps the timeout share ≤10%,
+	// lowering QPS: 30% is a sustained resolver failure (Unbound/upstream
+	// unavailable), not an adaptive dip.
 	AlertDNSFireShare = 0.30
 
-	// AlertDNSRecoverShare — снятие алерта ниже 20 %: гистерезис, доля
-	// в коридоре 20–30 % не дребезжит Warn.
+	// AlertDNSRecoverShare — alert clearing below 20%: hysteresis, a share
+	// in the 20–30% corridor does not flap the Warn.
 	AlertDNSRecoverShare = 0.20
 
-	// AlertDNSMinSamples — минимум проверок в окне для оценки доли:
-	// 2 из 2 в temp_error — шум пустого окна (сразу после полуночи или
-	// простоя), не рост ошибок.
+	// AlertDNSMinSamples — the minimum number of checks in the window to evaluate the share:
+	// 2 of 2 in temp_error is the noise of an empty window (right after midnight or
+	// downtime), not error growth.
 	AlertDNSMinSamples = 100
 
-	// AlertQueueRecoverFactor — снятие алерта очередей ниже 90 % порога.
-	// Гейт мягкий (между проверкой и публикацией другие продюсеры
-	// добавляют записи, T-026): глубина в коридоре 90–100 % порога
-	// дребезжала бы Warn. Срабатывание — ровно на пороге гейта
-	// (depth ≥ watermark): алерт виден одновременно с приостановкой
-	// публикации.
+	// AlertQueueRecoverFactor — queue alert clearing below 90% of the threshold.
+	// The gate is soft (between the check and publication other producers
+	// add entries, T-026): depth in the 90–100% corridor of the threshold
+	// would flap the Warn. Firing is exactly at the gate threshold
+	// (depth ≥ watermark): the alert is visible at the same moment as the
+	// publication suspension.
 	AlertQueueRecoverFactor = 0.9
 
-	// AlertNVMeWearPercent — percentage_used, включающая алерт износа:
-	// 90 % — осталось ≤10 % расчётного ресурса, порог планирования
-	// замены. Ресурс монотонен (не восстанавливается) — гистерезис не
-	// нужен; значения >100 % валидны (ресурс исчерпан) и тоже алертятся.
+	// AlertNVMeWearPercent — the percentage_used that fires the wear alert:
+	// 90% — ≤10% of the rated lifespan left, the threshold for planning
+	// a replacement. Lifespan is monotonic (does not recover) — hysteresis is
+	// not needed; values >100% are valid (lifespan exhausted) and also alert.
 	AlertNVMeWearPercent = 90
 
-	// AlertBadHashesThreshold — порог всплеска мусорных content_hash
-	// (T-099): новых строк за окно AlertBadHashesWindow. В норме инвариант
-	// писателя результатов (ТЗ 6.1: 16 октет) держит ноль всегда, но
-	// единичные реликты — строки, посаженные до фикса ING-P2-4 и
-	// добираемые очисткой по одному — не должны будить оператора:
-	// 10 за окно — уверенная ошибка писателя (T-056), не эхо прошлого.
+	// AlertBadHashesThreshold — the junk content_hash spike threshold
+	// (T-099): new rows over the AlertBadHashesWindow window. Normally the result-writer
+	// invariant (spec 6.1: 16 octets) always holds zero, but
+	// single relics — rows planted before the ING-P2-4 fix and
+	// picked off by cleanup one by one — must not wake the operator:
+	// 10 over the window is a confident writer error (T-056), not an echo of the past.
 	AlertBadHashesThreshold = 10
 
-	// AlertBadHashesWindow — окно всплеска в проходах алертов:
-	// 15 × период алертов (5 мин на дефолте, T-206) = 75 мин
-	// (исходные «15 × 60 с = 15 мин» — до T-161; на 30-мин цикле
-	// T-199 окно растягивалось до 7,5 ч). Задержка снятия — то же
-	// окно: разовый всплеск держит алерт сработавшим до вытеснения из
-	// кольца. Проходы очистки идут раз в минуту (DefaultCleanupInterval):
-	// окно охватывает десятки проходов очистки — всплеск не проскакивает
-	// между оценками, а короткий (одно-два мусорных строки) не набирает
-	// порог; против дребезга гистерезис не нужен — сумма окна убывает
-	// только старением дельт, у порога она держится лишь при продолжении
-	// потока.
+	// AlertBadHashesWindow — the spike window in alert passes:
+	// 15 × the alert period (5 min at the default, T-206) = 75 min
+	// (the original "15 × 60 s = 15 min" — before T-161; on the 30 min cycle
+	// of T-199 the window stretched to 7.5h). The clearing delay is the same
+	// window: a one-off spike keeps the alert firing until eviction from
+	// the ring. Cleanup passes run once a minute (DefaultCleanupInterval):
+	// the window covers dozens of cleanup passes — a spike does not slip
+	// between evaluations, and a short one (one or two junk rows) does not reach the
+	// threshold; no hysteresis is needed against flapping — the window sum decreases
+	// only by delta aging, and near the threshold it holds only while the
+	// flow continues.
 	AlertBadHashesWindow = 15
 
-	// AlertDeadMinPasses — проходов алертов с ненулевой глубиной q:dead
-	// до срабатывания queue_dead (T-154): 3 × период алертов (5 мин на
-	// дефолте, T-206) ≈ 15 мин (исходные «3 × 60 с ≈ 3 мин» — до T-161;
-	// на 30-мин цикле T-199 окно растягивалось до ≈1,5 ч). «Устойчиво
-	// ненулевой», а не «любая смерть»: карантин не опустошается сам
-	// (только разбор оператора, ТЗ 4.2), и единичная смерть при живом
-	// разборе — штатная работа q:dead, не авария; в то же время окно
-	// несопоставимо с инцидентным масштабом (5507 смертей за вечер,
-	// пост-мортем §11.1) — сигнал опаздывает максимум на один проход.
+	// AlertDeadMinPasses — the number of alert passes with a non-zero q:dead depth
+	// before queue_dead fires (T-154): 3 × the alert period (5 min at
+	// the default, T-206) ≈ 15 min (the original "3 × 60 s ≈ 3 min" — before T-161;
+	// on the 30 min cycle of T-199 the window stretched to ≈1.5h). "Persistently
+	// non-zero", not "any death": the quarantine does not empty itself
+	// (only operator triage, spec 4.2), and a single death with triage
+	// alive is normal q:dead operation, not an incident; at the same time the window
+	// is incommensurate with the incident scale (5507 deaths in an evening,
+	// post-mortem §11.1) — the signal is late by at most one pass.
 	AlertDeadMinPasses = 3
 
-	// AlertRedisMemFireRatio — доля used_memory/maxmemory, включающая
-	// redis_memory (T-154): 80 %. При noeviction (ТЗ 3.2) заполнение
-	// maxmemory — отказ записи XADD; 20 % запаса — межобрезочные остатки
-	// TrimLoop (подтверждённый префикс до обрезки), фрагментация и буферы
-	// клиентов, растущие быстрее обрезки (инцидент 22.10: 620 МиБ данных
-	// при потолке 900 МиБ уже отказывал публикации).
+	// AlertRedisMemFireRatio — the used_memory/maxmemory share that fires
+	// redis_memory (T-154): 80%. With noeviction (spec 3.2) filling
+	// maxmemory is an XADD write refusal; the 20% headroom — the between-trims remainders
+	// of TrimLoop (the confirmed prefix before the trim), fragmentation and client
+	// buffers growing faster than the trim (the incident of Oct 22: 620 MiB of data
+	// at a cap of 900 MiB already refused publications).
 	AlertRedisMemFireRatio = 0.80
 
-	// AlertRedisMemRecoverRatio — снятие redis_memory ниже 75 %:
-	// гистерезис 5 п.п. — память ползёт (остатки/фрагментация) и падает
-	// резко (XTRIM/Drain), доля в коридоре 75–80 % не дребезжала бы Warn
-	// у порога.
+	// AlertRedisMemRecoverRatio — clearing redis_memory below 75%:
+	// a 5 pp hysteresis — memory creeps up (remainders/fragmentation) and drops
+	// abruptly (XTRIM/Drain); a share in the 75–80% corridor would not flap the Warn
+	// at the threshold.
 	AlertRedisMemRecoverRatio = 0.75
 
-	// DefaultDiskFreeMinBytes — абсолютный минимум свободного места
-	// каталога контента (T-162): 15 GiB Warn. Процентный порог
-	// content.disk_free_percent на томе 79 ГБ поздний: 10 % = 8 ГБ ≈ 5 ч
-	// до заполнения при темпе записи ≈36 GiB/сут (замер §12) — минимум
-	// в байтах даёт оператору запас на разбор (освобождение
-	// компактификацией — часы, docs/disks.md).
+	// DefaultDiskFreeMinBytes — the absolute minimum of free space
+	// of the content directory (T-162): 15 GiB Warn. The percentage threshold
+	// content.disk_free_percent is late on a 79 GB volume: 10% = 8 GB ≈ 5h
+	// until full at a write rate of ≈36 GiB/day (measurement §12) — a minimum
+	// in bytes gives the operator headroom for triage (freeing space
+	// by compaction takes hours, docs/disks.md).
 	DefaultDiskFreeMinBytes = int64(15 << 30)
 
-	// DefaultDiskFreeCritBytes — эскалация абсолютного минимума (T-162):
-	// 10 GiB — отдельный алерт disk_free_crit; на темпе 36 GiB/сут это
-	// ≈6,5 ч до заполнения — время ещё есть, но действовать надо сейчас.
+	// DefaultDiskFreeCritBytes — the escalation of the absolute minimum (T-162):
+	// 10 GiB — a separate disk_free_crit alert; at a rate of 36 GiB/day this is
+	// ≈6.5h until full — there is still time, but action is needed now.
 	DefaultDiskFreeCritBytes = int64(10 << 30)
 
-	// DefaultQueueFreezeWindow — окно неподвижности last-delivered-id
-	// группы стрима при глубине > 0 (T-162): 15 минут. Яд T-159 валит
-	// потребителя на первой же записи — активный разбор (живая группа)
-	// двигает last-delivered-id каждые секунды, 15 мин без движения при
-	// ненулевой глубине — потребителя нет; короче — ложные срабатывания
-	// на паузах между пачками, длиннее — теряется половина шага
-	// «перезапусти потребителя и посмотри логи».
+	// DefaultQueueFreezeWindow — the immobility window of the last-delivered-id
+	// of a stream group at depth > 0 (T-162): 15 minutes. The poison of T-159 kills
+	// the consumer on the very first entry — active triage (a live group)
+	// moves last-delivered-id every few seconds; 15 min without movement at
+	// non-zero depth — there is no consumer; shorter — false firings
+	// on the pauses between batches; longer — half of the step
+	// "restart the consumer and look at the logs" is lost.
 	DefaultQueueFreezeWindow = 15 * time.Minute
 
-	// DefaultPSICPUPercent — порог PSI CPU some avg300 (T-162): 90 %.
-	// Замер §12: рабочий голод планировщика — some 91–95 %; ниже 90 %
-	// — утилизация без очереди (норма для CPU-bound конвейера).
+	// DefaultPSICPUPercent — the PSI CPU some avg300 threshold (T-162): 90%.
+	// Measurement §12: working scheduler starvation is some 91–95%; below 90%
+	// — utilization without a queue (normal for a CPU-bound pipeline).
 	DefaultPSICPUPercent = 90.0
 
-	// DefaultPSIWindow — окно устойчивости PSI (T-162): 30 мин. avg300
-	// само сглаживает 5 минут, окно требует устойчивый голод — разовые
-	// шпильки (деплой, разбор ретро-пачек) алертом не считаются.
-	// Дискретизация оценки — период цикла алертов (monitor.
-	// alerts_interval, 5 мин на дефолте — T-206 вернул частоту,
-	// погрешность ~5 мин; на 30-мин цикле T-199 окно ≤ периода
-	// вырождалось в «avg300 выше порога на двух соседних проходах» —
-	// гарантированно ловился только голод ≳60 мин).
+	// DefaultPSIWindow — the PSI persistence window (T-162): 30 min. avg300
+	// itself smooths over 5 minutes; the window demands sustained starvation — one-off
+	// spikes (a deploy, triage of retro batches) do not count as an alert.
+	// The discretization of the evaluation is the alert loop period (monitor.
+	// alerts_interval, 5 min at the default — T-206 restored the frequency,
+	// error ~5 min; on the 30 min cycle of T-199 a window ≤ the period
+	// degenerated into "avg300 above the threshold on two adjacent passes" —
+	// only starvation of ≳60 min was reliably caught).
 	DefaultPSIWindow = 30 * time.Minute
 
-	// DefaultMemHighMinPasses — проходов алертов подряд с ростом счётчика
-	// memory.events high (T-162): 2 × период алертов (5 мин на дефолте,
-	// T-206) = 10 мин устойчивого троттлинга (на 30-мин цикле T-199
-	// растягивалось до 1 ч). Единичный всплеск reclaim — штатная работа
-	// MemoryHigh (850M у http-worker, T-145): мягкий потолок и должен
-	// придавливать пики; устойчивый рост — предвестник фаталов T-157.
+	// DefaultMemHighMinPasses — alert passes in a row with growth of the
+	// memory.events high counter (T-162): 2 × the alert period (5 min at the default,
+	// T-206) = 10 min of sustained throttling (on the 30 min cycle of T-199
+	// it stretched to 1h). A single reclaim spike is normal operation
+	// of MemoryHigh (850M at http-worker, T-145): a soft cap is supposed
+	// to press down peaks; sustained growth is the harbinger of the T-157 fatals.
 	DefaultMemHighMinPasses = 2
 
-	// DefaultRenderDebtDomains — порог рендер-долга, включающий алерт
-	// при росте (T-175): 50 тыс. доменов. Ориентир — фактический долг
-	// морозки 24.10 (443 тыс. флагов + лаг q:render, найден ручным SQL)
-	// на порядок выше порога, а здоровый фон — тысячи (локальное
-	// переполнение при волне SPA гасится проходом доработки за минуты):
-	// 50 тыс. — это сутки стагнации дренажа при темпе притока волны
-	// (~0,6 дом/с), уверенное накопление, а не шум фона. Выше порога без
-	// роста алерт не включается — стагнация видна строкой долга отчёта
-	// нагрузки (T-173), алерт — про накопление.
+	// DefaultRenderDebtDomains — the render debt threshold that fires the alert
+	// on growth (T-175): 50k domains. The reference point — the actual debt
+	// of the Oct 24 freeze (443k flags + the q:render lag, found by manual SQL)
+	// is an order of magnitude above the threshold, and the healthy background is thousands
+	// (local overflow during an SPA wave is extinguished by a finishing pass in minutes):
+	// 50k is a day of drain stagnation at the wave inflow rate
+	// (~0.6 domains/s), confident accumulation, not background noise. Above the threshold without
+	// growth the alert does not fire — stagnation is visible in the debt row of the load
+	// report (T-173); the alert is about accumulation.
 	DefaultRenderDebtDomains = 50000
 
-	// DefaultRenderDebtPasses — проходов алертов подряд с ростом долга
-	// до срабатывания render_debt (T-175): 2 × период алертов (5 мин на
-	// дефолте, T-206) = 10 мин непрерывного роста (по образцу
-	// mem_high_passes; на 30-мин цикле T-199 растягивалось до 1 ч).
-	// Разовый скачок (волна SPA против замороженного дренажа на минуту) —
-	// штатное переполнение с флагами, проход доработки разбирает его сам;
-	// устойчивый рост — переполнение стало стационарным, оператору
-	// пора решать (контексты рендера, приток планировщика).
+	// DefaultRenderDebtPasses — alert passes in a row with debt growth
+	// before render_debt fires (T-175): 2 × the alert period (5 min at
+	// the default, T-206) = 10 min of continuous growth (modeled on
+	// mem_high_passes; on the 30 min cycle of T-199 it stretched to 1h).
+	// A one-off jump (an SPA wave against a frozen drain for a minute) —
+	// normal overflow with flags; a finishing pass resolves it itself;
+	// sustained growth — the overflow has become stationary; it is time
+	// for the operator to act (render contexts, scheduler inflow).
 	DefaultRenderDebtPasses = 2
 
-	// AlertRenderFallbackPasses — проходов алертов подряд до срабатывания
-	// render_fallback_depth (T-246): 2 × период алертов (5 мин на
-	// дефолте, T-206) = 10 мин (по образцу render_debt_passes/
-	// mem_high_passes). Порог сам по себе не будит оператора: разовый
-	// всплеск публикаций (эпизод деградации движка, разобранный
-	// health-гейтом) — штатная работа фолбэка «собрать и доработать»
-	// (ФТ-13), воркер B сгребает его темпом; серия из проходов — либо
-	// непрерывный рост (темпа воркера не хватает или B стоит), либо
-	// стационарная глубина над порогом (второй триггер, S-P2-1:
-	// остановленный B, упор в предел MAXLEN стрима — DefaultStreamMaxLen:
-	// q:render-fallback — 15 000 — или эпизод, переживший рестарт
-	// монитора) — накопление approaching предела MAXLEN, оператору
-	// пора поднимать потолок темпа/движок B. Константа, а не поле
-	// конфигурации: окно связано механикой с серией render_debt, а порог
-	// уровня — уже конфигурируемый scheduler.queue_high_watermark.
+	// AlertRenderFallbackPasses — alert passes in a row before
+	// render_fallback_depth fires (T-246): 2 × the alert period (5 min at
+	// the default, T-206) = 10 min (modeled on render_debt_passes/
+	// mem_high_passes). The threshold by itself does not wake the operator: a one-off
+	// publication spike (an engine degradation episode resolved by the
+	// health gate) is normal fallback operation of "collect and finish"
+	// (FR-13); worker B rakes it away at its rate; a series of passes is either
+	// continuous growth (the worker rate is insufficient or B is stopped), or
+	// a stationary depth above the threshold (the second trigger, S-P2-1:
+	// a stopped B, pinned at the stream's MAXLEN limit — DefaultStreamMaxLen:
+	// q:render-fallback — 15,000 — or an episode that survived a restart
+	// of the monitor) — accumulation approaching the MAXLEN limit; it is time
+	// for the operator to raise the rate cap/change engine B. A constant, not a config
+	// field: the window is mechanically tied to the render_debt series, and the level
+	// threshold is already the configurable scheduler.queue_high_watermark.
 	AlertRenderFallbackPasses = 2
 
-	// AlertFallbackBudgetWindow — окно событий приостановки бюджета доли
-	// фолбэка в проходах алертов (T-246): 6 × период алертов (5 мин на
-	// дефолте, T-206) = 30 мин. Бюджетное окно T-239 — 1000
-	// подтверждённых доставок этапа (≈17 мин при ёмкости рендера ~60/мин,
-	// замер §12): окно алерта вмещает эпизод и один рецидив следующего
-	// окна; снятие — старением (события — защёлкивания, не состояние:
-	// пока приостановка держится, новых точек нет — держит алерт только
-	// окно, оператору виден fallback-рейт панели движков). Событие —
-	// всегда аномалия (в норме публикации укладываются в потолок доли),
-	// порог — одно событие, стиль износа NVMe.
+	// AlertFallbackBudgetWindow — the window of fallback share budget suspension
+	// events in alert passes (T-246): 6 × the alert period (5 min at
+	// the default, T-206) = 30 min. The budget window of T-239 is 1000
+	// confirmed deliveries of the stage (≈17 min at a render capacity of ~60/min,
+	// measurement §12): the alert window fits an episode and one recurrence of the next
+	// window; clearing is by aging (events are latchings, not state:
+	// while the suspension holds there are no new points — only the
+	// window keeps the alert; the operator sees the fallback rate on the engines dashboard). An event is
+	// always an anomaly (normally publications fit in the share cap),
+	// the threshold is a single event, the NVMe wear style.
 	AlertFallbackBudgetWindow = 6
 
-	// AlertRenderBrowserErrorsPasses — проходов алертов подряд с ростом
-	// счётчика browser-ошибок этапа рендера до срабатывания
-	// render_browser_errors (S-P2-6, решение оператора — rate-детектор):
-	// 2 × период алертов (5 мин на дефолте, T-206) = 10 мин (по образцу
-	// mem_high/render_debt). Разовая browser-ошибка — штатная работа ядра
-	// рендера (перезапуск сессии/контекста, T-063) и эпизод, разбираемый
-	// health-гейтом; серия роста — движок (moli/lightpanda) завис или
-	// недоступен: гейт T-239 уже приостановил фолбэк-публикации,
-	// браузер-класс ждёт в redelivery q:render — оператору нужен сигнал
-	// про сам движок. Событие гейта остаётся счётчиком
-	// suspended{reason="gate"} и Warn-логом воркера: гейт — порог стрика
-	// в воркере, алерт — наблюдаемость средствами монитора.
+	// AlertRenderBrowserErrorsPasses — alert passes in a row with growth of
+	// the render stage browser-error counter before
+	// render_browser_errors fires (S-P2-6, the operator's decision — a rate detector):
+	// 2 × the alert period (5 min at the default, T-206) = 10 min (modeled on
+	// mem_high/render_debt). A single browser error is normal operation of the
+	// render core (a session/context restart, T-063) and an episode resolved by the
+	// health gate; a growth series — the engine (moli/lightpanda) is hung or
+	// unavailable: the gate of T-239 has already suspended fallback publications,
+	// the browser class waits in the q:render redelivery — the operator needs a signal
+	// about the engine itself. The gate event remains the
+	// suspended{reason="gate"} counter and the worker's Warn log: the gate is a streak threshold
+	// in the worker, the alert is observability by monitor means.
 	AlertRenderBrowserErrorsPasses = 2
 
-	// AlertNewDoneStalePasses — НОВЫХ снапшотов реконсиляции подряд с
-	// ненулевой строкой new_done_stale до срабатывания domains_new_done_stale
-	// (T-256, ФТ-2.2): 2 × период реконсиляции (30 мин на дефолте,
-	// T-199) ≈ 1 ч устойчивого ненулевого значения. Проходы алертов
-	// (5 мин, T-206) чаще проходов источника — серия растёт только при
-	// смене updated_at снапшота, повторные чтения одной строки наблюдением
-	// не считаются: одиночный пограничный снапшот границы суток (полночь
-	// состарила вчерашние in-flight эпизоды «новой» проверки — DNS-итог
-	// вчера, HTTP в полёте на скане агрегата) следующим проходом
-	// перезаписывается нулём и алерта не даёт (ревью T-256, P2-1).
-	// Стационарно ноль: норма не будит вовсе.
+	// AlertNewDoneStalePasses — NEW reconciliation snapshots in a row with
+	// a non-zero new_done_stale row before domains_new_done_stale fires
+	// (T-256, FR-2.2): 2 × the reconciliation period (30 min at the default,
+	// T-199) ≈ 1h of sustained non-zero value. Alert passes
+	// (5 min, T-206) are more frequent than source passes — the series grows only on
+	// a change of the snapshot's updated_at; repeated reads of one row do not count
+	// as an observation: a single boundary snapshot of the day boundary (midnight
+	// aged yesterday's in-flight episodes of a "new" check — the DNS outcome
+	// yesterday, HTTP in flight on the aggregate scan) is overwritten
+	// by zero by the next pass and does not produce an alert (T-256 review, P2-1).
+	// Stationary zero: the norm does not wake anyone at all.
 	AlertNewDoneStalePasses = 2
 
-	// AlertRedisRestartWindow — окно «недавнего рестарта» Redis (T-270):
-	// uptime_in_seconds меньше окна — алерт redis_restart. 15 мин =
-	// 3 прохода алертов (5 мин, T-206): рестарт между проходами не
-	// проскакивает; после выхода из окна алерт снимается сам (uptime
-	// монотонно растёт — уровень, память машины не нужна, порог
-	// «без зазора» как у износа NVMe). Рестарт при отсутствии
-	// персистентности (docs/redis.md §5) теряет ВСЕ недоставленные
-	// записи стримов: q:dns самолечится lease T-029, потерянные q:http
-	// при записанном done — компенсатор T-270; сигнал оператору — в
-	// момент события (ожидать рост new_done_stale и всплеск
-	// crawler_scheduler_stale_requeued_total), а не когортой спустя
-	// сутки. Плановый рестарт алертится так же: потери недоставленного
-	// не зависят от намерений.
+	// AlertRedisRestartWindow — the "recent restart" window of Redis (T-270):
+	// uptime_in_seconds below the window — the redis_restart alert. 15 min =
+	// 3 alert passes (5 min, T-206): a restart between passes does not
+	// slip through; after leaving the window the alert clears itself (uptime
+	// grows monotonically — a level, no machine memory needed; a "no gap"
+	// threshold like NVMe wear). A restart without
+	// persistence (docs/redis.md §5) loses ALL undelivered
+	// stream entries: q:dns self-heals via the T-029 lease; lost q:http
+	// with done written — the T-270 compensator; the signal to the operator — at
+	// the moment of the event (expect new_done_stale growth and a spike of
+	// crawler_scheduler_stale_requeued_total), not as a cohort
+	// a day later. A scheduled restart alerts the same way: the losses of undelivered
+	// data do not depend on intentions.
 	AlertRedisRestartWindow = 15 * time.Minute
 )
 
-// dnsDailyCountersSQL — числитель и знаменатель доли temp_error текущих
-// суток ДВУМЯ точечными чтениями суточных строк crawler_counters (T-182,
-// TZ_slow_dns_share §7): temp_error:YYYY-MM-DD — события записей
-// результатов с вердиктом temp_error (инкремент httpworker/record.go,
-// T-182), checks:YYYY-MM-DD — события записей результатов (T-179);
-// авторитет обеих строк — проход реконсиляции monitor (FILTER-колонки
-// last_checked_at = current_date, занижены между проходами на DNS-only
-// завершения — доля устойчива, абсолюты чинит проход). Имя дня
-// вычисляет БД (current_date — та же таймзона, что у now() записи
-// last_checked_at и окна реконсиляции); coalesce СНАРУЖИ подзапросов
-// (стиль throughputSQL T-179): до первой записи суток подзапрос пуст —
-// честный ноль. Прежний живой агрегат по окну суток (dnsShareSQL,
-// count(*) FILTER … WHERE last_checked_at >= current_date) убран:
-// Index Scan окна обязан был посещать heap каждой строки за статусом
-// (status в индексе быть не может — HOT-инвариант, docs/schema.md),
-// запрос №6 журнала медленных боя 24.10 (33 срабатывания >3 с, медиана
-// 27,7 с, max 110,7 с — ≈1,3 ГБ чтений за оценку).
+// dnsDailyCountersSQL — the numerator and denominator of the temp_error share of the
+// current day via TWO point reads of the daily crawler_counters rows (T-182,
+// TZ_slow_dns_share §7): temp_error:YYYY-MM-DD — events of result
+// writes with the temp_error verdict (incremented by httpworker/record.go,
+// T-182), checks:YYYY-MM-DD — events of result writes (T-179);
+// the authority of both rows is the monitor reconciliation pass (FILTER columns
+// last_checked_at = current_date, understated between passes by DNS-only
+// completions — the share is stable; the pass fixes the absolutes). The day name
+// is computed by the DB (current_date — the same timezone as the now() of the
+// last_checked_at write and the reconciliation window); coalesce OUTSIDE the subqueries
+// (the throughputSQL style of T-179): before the first write of the day the subquery is empty —
+// an honest zero. The former live aggregate over the day window (dnsShareSQL,
+// count(*) FILTER … WHERE last_checked_at >= current_date) is removed:
+// the Index Scan of the window had to visit the heap of every row for the status
+// (status cannot be in the index — the HOT invariant, docs/schema.md),
+// slow-query log entry #6 of the production day of Oct 24 (33 firings >3 s, median
+// 27.7 s, max 110.7 s — ≈1.3 GB of reads per evaluation).
 const dnsDailyCountersSQL = "SELECT " +
 	"coalesce((SELECT value FROM crawler_counters " +
 	"WHERE name = 'temp_error:' || to_char(current_date, 'YYYY-MM-DD')), 0), " +
 	"coalesce((SELECT value FROM crawler_counters " +
 	"WHERE name = 'checks:' || to_char(current_date, 'YYYY-MM-DD')), 0)"
 
-// newDoneStaleSQL — точечное PK-чтение строки new_done_stale (T-256,
-// ФТ-2.2): домены «статус повис» (status = new ∧ check_state = done ∧
-// last_checked_at старше суток) — значение пишет FILTER-колонка
-// f_new_done_stale прохода реконсиляции (zonestats.go), алерт ценой
-// одного лукапа наблюдает её между проходами (глубина окна —
-// zone_stats_interval), seq scan по domains не добавляет. updated_at —
-// метка снапшота: проходы алертов чаще проходов источника (5 мин против
-// 30), серия алерта растёт только на НОВОМ снапшоте — два чтения одной
-// строки не «два наблюдения» (ревью T-256, P2-1). Пустой результат —
-// строки ещё нет: её создаёт первый проход реконсиляции (обе петли
-// monitor стартуют вместе; в отличие от render_pending, создающегося
-// миграцией, корректного «нет строки» у new_done_stale не бывает — либо
-// гонка старта, либо ручная правка таблицы) — тихое «не измеряется»
-// без Warn, а не ложный ноль и не тревога.
+// newDoneStaleSQL — a point PK read of the new_done_stale row (T-256,
+// FR-2.2): "status hung" domains (status = new ∧ check_state = done ∧
+// last_checked_at older than a day) — the value is written by the FILTER column
+// f_new_done_stale of the reconciliation pass (zonestats.go); the alert, at the cost
+// of one lookup, observes it between passes (the window depth —
+// zone_stats_interval); a seq scan over domains adds nothing. updated_at —
+// the snapshot stamp: alert passes are more frequent than source passes (5 min vs
+// 30), the alert series grows only on a NEW snapshot — two reads of one
+// row are not "two observations" (T-256 review, P2-1). An empty result —
+// the row does not exist yet: it is created by the first reconciliation pass (both monitor
+// loops start together; unlike render_pending, which is created
+// by a migration, a correct "no row" state of new_done_stale does not exist — either
+// a start race or a manual edit of the table) — a quiet "not measured"
+// without a Warn, not a false zero and not an alarm.
 const newDoneStaleSQL = "SELECT value, updated_at FROM crawler_counters WHERE name = 'new_done_stale'"
 
-// zoneFreshSQL — свежесть прогресса: последний момент пересчёта зон
-// (zones.updated_at пишет ZoneStatsLoop, T-078). Справочник зон маленький;
-// max по пустому набору — NULL.
+// zoneFreshSQL — the freshness of progress: the last moment of the zone recount
+// (zones.updated_at is written by ZoneStatsLoop, T-078). The zone reference table is small;
+// max over an empty set is NULL.
 const zoneFreshSQL = "SELECT max(updated_at) FROM zones"
 
-// --------------------------------------------------------------- место на диске
+// --------------------------------------------------------------- disk space
 
-// SpaceStat — снимок места файловой системы каталога, байты.
+// SpaceStat — a snapshot of the file system space of the directory, bytes.
 type SpaceStat struct {
-	// Avail — доступно процессам без root-резерва (statfs.Bavail):
-	// сервисы краулера работают непривилегированными (ТЗ 10.1).
+	// Avail — available to processes without the root reserve (statfs.Bavail):
+	// crawler services run unprivileged (spec 10.1).
 	Avail uint64
-	// Total — ёмкость тома (statfs.Blocks).
+	// Total — the volume capacity (statfs.Blocks).
 	Total uint64
 }
 
-// SpaceChecker — источник сведений о месте файловой системы; выделен
-// интерфейсом, чтобы юнит-тесты подменяли statfs без реального тома.
-// Подход internal/content/disk.go (T-046) собственной копией: monitor не
-// тянет пакет хранилища (PackStore, zstd) ради одного сисколла, а
-// проверка места — независимый взгляд мониторинга (ТЗ 5.9), параллельный
-// DiskWatchLoop писателя контента.
+// SpaceChecker — a source of file system space information; factored out
+// as an interface so unit tests could substitute statfs without a real volume.
+// The internal/content/disk.go approach (T-046) via an owned copy: monitor does
+// not pull the storage package (PackStore, zstd) for the sake of one syscall;
+// the space check is an independent view of monitoring (spec 5.9), parallel to
+// the DiskWatchLoop of the content writer.
 type SpaceChecker interface {
-	// Space возвращает снимок места каталога dir.
+	// Space returns a space snapshot of the dir directory.
 	Space(dir string) (SpaceStat, error)
 }
 
-// OSStatfs — SpaceChecker поверх syscall.Statfs.
+// OSStatfs — a SpaceChecker on top of syscall.Statfs.
 type OSStatfs struct{}
 
-// compile-time: OSStatfs — SpaceChecker.
+// compile-time: OSStatfs is a SpaceChecker.
 var _ SpaceChecker = OSStatfs{}
 
-// Space снимает statfs каталога dir.
+// Space takes a statfs of the dir directory.
 func (OSStatfs) Space(dir string) (SpaceStat, error) {
 	var st syscall.Statfs_t
 	if err := syscall.Statfs(dir, &st); err != nil {
@@ -571,71 +571,71 @@ func (OSStatfs) Space(dir string) (SpaceStat, error) {
 	}, nil
 }
 
-// ------------------------------------------------------------------ износ NVMe
+// ------------------------------------------------------------------ NVMe wear
 
-// NVMeWear — износ одного NVMe-устройства по health-логу (ТЗ 10.3).
+// NVMeWear — the wear of one NVMe device per the health log (spec 10.3).
 type NVMeWear struct {
-	// Device — имя контроллера (nvme0), базовое имя в sysfs.
+	// Device — the controller name (nvme0), the base name in sysfs.
 	Device string
-	// PercentUsed — percentage_used health-лога: 0..100, значения >100
-	// валидны — расчётный ресурс исчерпан (NVMe 1.x).
+	// PercentUsed — the percentage_used of the health log: 0..100; values >100
+	// are valid — the rated lifespan is exhausted (NVMe 1.x).
 	PercentUsed int
-	// DataUnitsWritten — записано единиц записи (единица NVMe = 512 000
-	// байт): ТБ ≈ units × 5,12e-7; ТЗ 10.3 упоминает TBW — вычисляется
-	// из той же страницы.
+	// DataUnitsWritten — written data units (one NVMe unit = 512,000
+	// bytes): TB ≈ units × 5.12e-7; spec 10.3 mentions TBW — computed
+	// from the same page.
 	DataUnitsWritten uint64
 }
 
-// WearSource — источник данных износа NVMe; интерфейс для подмены в
-// юнит-тестах (реальное чтение — ioctl, оборудования в тестах нет).
+// WearSource — a source of NVMe wear data; an interface for substitution in
+// unit tests (the real read is an ioctl; there is no hardware in tests).
 type WearSource interface {
-	// Wear возвращает износ всех NVMe-устройств. Ошибка = «не
-	// измеряется» с причиной (контейнер без /dev/nvme*, пустой sysfs):
-	// алерт деградирует, а не срабатывает ложно.
+	// Wear returns the wear of all NVMe devices. An error = "not
+	// measured" with a reason (a container without /dev/nvme*, an empty sysfs):
+	// the alert degrades instead of firing falsely.
 	Wear(ctx context.Context) ([]NVMeWear, error)
 }
 
-// OSWear — WearSource поверх sysfs + ioctl NVMe admin-команды: устройства
-// обнаруживаются в sysfs (доступен и в контейнере — но сам /dev/nvme*
-// туда не проброшен), износ читается health-логом (log page 0x02) через
-// NVME_IOCTL_ADMIN_CMD — без nvme-cli и без новых зависимостей.
+// OSWear — a WearSource on top of sysfs + the NVMe admin command ioctl: devices
+// are discovered in sysfs (available in a container too — but /dev/nvme*
+// itself is not passed through), the wear is read from the health log (log page 0x02) via
+// NVME_IOCTL_ADMIN_CMD — without nvme-cli and without new dependencies.
 type OSWear struct {
-	// SysFS — корень sysfs ("" — "/sys"); тесты подменяют каталогом.
+	// SysFS — the sysfs root ("" — "/sys"); tests substitute a directory.
 	SysFS string
-	// DevFS — корень devfs ("" — "/dev"); тесты подменяют каталогом.
+	// DevFS — the devfs root ("" — "/dev"); tests substitute a directory.
 	DevFS string
 }
 
-// compile-time: OSWear — WearSource.
+// compile-time: OSWear is a WearSource.
 var _ WearSource = OSWear{}
 
-// Wear обходит NVMe-контроллеры sysfs и читает health-лог каждого.
-// Ни одного устройства или ни одного доступного /dev-узла — ошибка
-// деградации (в Docker-контейнере это норма: sysfs видит устройства
-// хоста, /dev/nvme0 не проброшен — открыт не будет).
+// Wear walks the NVMe controllers of sysfs and reads the health log of each.
+// No devices at all or no accessible /dev node — a degradation
+// error (in a Docker container this is the norm: sysfs sees the host
+// devices, /dev/nvme0 is not passed through — it will not be opened).
 func (w OSWear) Wear(ctx context.Context) ([]NVMeWear, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	sysfs := w.SysFS
-	// Дефолт «/sys» живёт только на боевом хосте: юнит-тесты всегда задают
-	// SysFS каталогом, а чтение настоящего /sys негерметично (набор
-	// устройств зависит от железа).
+	// The default "/sys" lives only on the production host: unit tests always set
+	// SysFS to a directory, and reading the real /sys is not hermetic (the set
+	// of devices depends on the hardware).
 	// mutator-disable-next-line branch/if
 	if sysfs == "" {
 		// mutator-disable-next-line statement/remove
 		sysfs = "/sys"
 	}
 	devfs := w.DevFS
-	// Дефолт «/dev» — как у sysfs выше.
+	// The default "/dev" — as with sysfs above.
 	// mutator-disable-next-line branch/if
 	if devfs == "" {
 		// mutator-disable-next-line statement/remove
 		devfs = "/dev"
 	}
 	names, err := filepath.Glob(filepath.Join(sysfs, "class", "nvme", "nvme*"))
-	// Glob с фиксированным валидным шаблоном ошибок не возвращает (только
-	// malformed pattern) — ветка недостижима, тестом не убить.
+	// Glob with a fixed valid pattern returns no error (only
+	// a malformed pattern) — the branch is unreachable, cannot be killed by a test.
 	// mutator-disable-next-line branch/if
 	if err != nil {
 		return nil, fmt.Errorf("NVMe: обзор %s: %w", sysfs, err)
@@ -665,26 +665,26 @@ func (w OSWear) Wear(ctx context.Context) ([]NVMeWear, error) {
 	return wears, nil
 }
 
-// Константы NVMe (uapi/linux/nvme.h, uapi/linux/nvme_ioctl.h).
+// NVMe constants (uapi/linux/nvme.h, uapi/linux/nvme_ioctl.h).
 const (
 	// nvmeIoctlAdminCmd — _IOWR('N', 0x41, struct nvme_admin_cmd):
 	// dir=3<<30 | size=72<<16 | type='N'<<8 | nr=0x41.
 	nvmeIoctlAdminCmd = 0xc0484e41
-	// nvmeAdminCmdSize — sizeof(struct nvme_admin_cmd) на 64-бит.
+	// nvmeAdminCmdSize — sizeof(struct nvme_admin_cmd) on 64-bit.
 	nvmeAdminCmdSize = 72
-	// nvmeAdminGetLogPage — opcode admin «получить страницу журнала».
+	// nvmeAdminGetLogPage — the "get log page" admin opcode.
 	nvmeAdminGetLogPage = 0x02
-	// nvmeLogHealth — идентификатор страницы health information.
+	// nvmeLogHealth — the health information page identifier.
 	nvmeLogHealth = 0x02
-	// nvmeHealthLogSize — размер страницы health information, байт.
+	// nvmeHealthLogSize — the size of the health information page, bytes.
 	nvmeHealthLogSize = 512
-	// nvmeNsidNone — скоуп контроллера (host/any namespace).
+	// nvmeNsidNone — the controller scope (host/any namespace).
 	nvmeNsidNone = 0xFFFFFFFF
 )
 
-// nvmeAdminCmd — struct nvme_admin_cmd (uapi/linux/nvme_ioctl.h): layout
-// фиксирован ядром, порядок полей и выравнивание Go-структуры обязаны
-// совпадать (проверка размера — compile-time ниже). 72 байта на 64-бит.
+// nvmeAdminCmd — struct nvme_admin_cmd (uapi/linux/nvme_ioctl.h): the layout
+// is fixed by the kernel; the field order and the Go struct alignment must
+// match (the size check is compile-time below). 72 bytes on 64-bit.
 type nvmeAdminCmd struct {
 	opcode      uint8
 	flags       uint8
@@ -705,32 +705,32 @@ type nvmeAdminCmd struct {
 	result      uint32
 }
 
-// compile-time: размер структуры договаривается с константой ioctl-номера
-// (номер кодирует size=72). Мутант [2]struct{}{} тоже компилируется и
-// поведением не наблюдаем — compile-time проверка.
+// compile-time: the struct size agrees with the ioctl number constant
+// (the number encodes size=72). The [2]struct{}{} mutant also compiles and
+// is not observable by behavior — a compile-time check.
 // mutator-disable-next-line numbers/incrementer
 var _ = [1]struct{}{}[unsafe.Sizeof(nvmeAdminCmd{})-nvmeAdminCmdSize]
 
-// wearOf читает износ одного устройства: открывает char-узел контроллера
-// /dev/nvmeX (O_RDWR — ioctl admin требует записи) и забирает страницу
-// health одним NVME_IOCTL_ADMIN_CMD. Декодирование — parseHealthLog.
+// wearOf reads the wear of one device: opens the controller char node
+// /dev/nvmeX (O_RDWR — the ioctl admin command requires write access) and takes the
+// health page in one NVME_IOCTL_ADMIN_CMD. Decoding — parseHealthLog.
 //
-// mutator-disable-func — аппаратный passthrough: ioctl к /dev/nvme*
-// исполняется только на боевом хосте; в CI-контейнере устройство не
-// проброшено (юнит-тесты доходят лишь до отказа открытия, а значения
-// возврата при ошибке игнорирует единственный вызывающий).
+// mutator-disable-func — hardware passthrough: the ioctl to /dev/nvme*
+// runs only on the production host; in the CI container the device is not
+// passed through (unit tests only reach the open failure, and the
+// return values on error are ignored by the single caller).
 func wearOf(devPath string) (percent int, unitsWritten uint64, err error) {
-	// O_RDWR: ioctl admin-команды требуют доступа на запись к узлу —
-	// контейнер без проброса устройства получит EPERM/ENOENT (деградация).
+	// O_RDWR: the ioctl of admin commands requires write access to the node —
+	// a container without the passed-through device gets EPERM/ENOENT (degradation).
 	f, err := os.OpenFile(devPath, os.O_RDWR, 0)
 	if err != nil {
 		return 0, 0, err
 	}
 	defer func() { _ = f.Close() }()
 
-	// Буфер страницы — в обёртке с нулевым полем uint64: массив байт сам по
-	// себе не выровнен, а тип структуры наследует выравнивание поля (8) —
-	// адрес данных пойдёт в драйвер выровненным.
+	// The page buffer — in a wrapper with a zero-size uint64 field: a byte array by
+	// itself is not aligned, but the struct type inherits the field's alignment (8) —
+	// the data address goes to the driver aligned.
 	var pageBuf struct {
 		_    [0]uint64
 		data [nvmeHealthLogSize]byte
@@ -740,14 +740,14 @@ func wearOf(devPath string) (percent int, unitsWritten uint64, err error) {
 		nsid:    nvmeNsidNone,
 		addr:    uint64(uintptr(unsafe.Pointer(&pageBuf.data[0]))),
 		dataLen: nvmeHealthLogSize,
-		// cdw10: NUMD (число двойных слов − 1) в старших битах, LID —
-		// в младших.
+		// cdw10: NUMD (the number of double words − 1) in the high bits, LID —
+		// in the low ones.
 		cdw10: uint32(nvmeHealthLogSize/4-1)<<16 | nvmeLogHealth,
 	}
 	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(),
 		nvmeIoctlAdminCmd, uintptr(unsafe.Pointer(&cmd)))
-	// Адрес буфера ушёл в ioctl целым числом — GC его не видит; KeepAlive
-	// держит буфер живым до возврата сисколла (правила unsafe.Pointer).
+	// The buffer address went into the ioctl as an integer — the GC does not see it; KeepAlive
+	// keeps the buffer alive until the syscall returns (the unsafe.Pointer rules).
 	runtime.KeepAlive(&pageBuf)
 	if errno != 0 {
 		return 0, 0, fmt.Errorf("ioctl NVME_ADMIN_GET_LOG_PAGE: %w", errno)
@@ -755,203 +755,203 @@ func wearOf(devPath string) (percent int, unitsWritten uint64, err error) {
 	return parseHealthLog(pageBuf.data[:])
 }
 
-// parseHealthLog декодирует страницу health information (layout —
-// struct nvme_smart_log из uapi/linux/nvme.h): critical_warning — байт 0,
+// parseHealthLog decodes the health information page (the layout —
+// struct nvme_smart_log from uapi/linux/nvme.h): critical_warning — byte 0,
 // composite temperature — 1–2, available spare — 3, spare threshold — 4,
-// percentage_used — байт 5 (значения >100 валидны — ресурс исчерпан);
-// data units written — байты 48–63, 128-бит little-endian, старшая
-// половина на практике 0. Выделен чистой функцией для табличного теста
-// смещений без оборудования.
+// percentage_used — byte 5 (values >100 are valid — lifespan exhausted);
+// data units written — bytes 48–63, 128-bit little-endian, the high
+// half is 0 in practice. Factored out as a pure function for a table test
+// of offsets without hardware.
 func parseHealthLog(page []byte) (percent int, unitsWritten uint64, err error) {
 	if len(page) < nvmeHealthLogSize {
 		return 0, 0, fmt.Errorf("NVMe: страница health короче %d байт: %d", nvmeHealthLogSize, len(page))
 	}
-	// Эквивалентен только мутант конца среза page[48:57]: Uint64 читает
-	// первые 8 байт, девятый не влияет. Аннотация действует на строку
-	// целиком и заодно подавляет killable-мутанты page[5]→[6] и
-	// page[49:56] — оба остаются закрытыми утверждениями
-	// TestParseHealthLog; точечный инструмент (блэклист чексумм) отвергнут
-	// как хрупкий (docs/mutation-testing.md §4).
+	// Equivalent to only the slice-end mutant page[48:57]: Uint64 reads
+	// the first 8 bytes, the ninth has no effect. The annotation applies to the whole
+	// line and also suppresses the killable mutants page[5]→[6] and
+	// page[49:56] — both remain covered by the assertions
+	// of TestParseHealthLog; a point tool (a checksum blacklist) was rejected
+	// as fragile (docs/mutation-testing.md §4).
 	// mutator-disable-next-line numbers/incrementer
 	return int(page[5]), binary.LittleEndian.Uint64(page[48:56]), nil
 }
 
-// ------------------------------------------------------------------- алерты
+// ------------------------------------------------------------------- alerts
 
-// StreamLener — глубина стримов; *queue.BackpressureGate (T-026)
-// удовлетворяет интерфейсу — тот же узкий API над go-redis, что у
-// планировщика и crawlerctl status (T-079). Отдельный интерфейс, а не
-// go-redis: тесты подменяют фейком, транспорт заменяем (ТЗ 4.2).
+// StreamLener — stream depths; *queue.BackpressureGate (T-026)
+// satisfies the interface — the same narrow API over go-redis as the
+// scheduler and crawlerctl status use (T-079). A separate interface, not
+// go-redis: tests substitute a fake, the transport is replaceable (spec 4.2).
 type StreamLener interface {
-	// Len возвращает глубину стрима: непрочитанный группой потребителей
-	// остаток плюс неподтверждённые доставки (backlog, см.
+	// Len returns the stream depth: the unconsumed
+	// remainder plus unacknowledged deliveries (the backlog, see
 	// BackpressureGate.Len).
 	Len(ctx context.Context, stream string) (int64, error)
 }
 
-// BadHashesSource — счётчик мусорных content_hash очистки ingest
-// (crawler_ingest_bad_hashes_total, T-099); реализация IngestBadHashes
-// читает его из экспозиции /metrics сервиса ingest, юнит-тесты подменяют
-// фейком. Отдельный интерфейс в стиле StreamLener/SpaceChecker: источник
-// заменяем, алерт не зависит от HTTP.
+// BadHashesSource — the junk content_hash counter of ingest cleanup
+// (crawler_ingest_bad_hashes_total, T-099); the IngestBadHashes implementation
+// reads it from the /metrics exposition of the ingest service; unit tests substitute
+// a fake. A separate interface in the StreamLener/SpaceChecker style: the source
+// is replaceable, the alert does not depend on HTTP.
 type BadHashesSource interface {
-	// BadHashes возвращает текущее значение счётчика (монотонно растёт
-	// итогами проходов CleanupDeleted; рестарт ingest обнуляет).
+	// BadHashes returns the current counter value (it grows monotonically
+	// with the results of CleanupDeleted passes; an ingest restart resets it).
 	BadHashes(ctx context.Context) (int64, error)
 }
 
-// FallbackBudgetSource — счётчик событий приостановки фолбэка по бюджету
-// доли (crawler_render_fallback_suspended_total{reason="budget"}, T-239);
-// реализация RenderSuspends (suspends.go) читает его из экспозиции
-// /metrics рендер-воркера, юнит-тесты подменяют фейком. Стиль
-// BadHashesSource: источник заменяем, алерт не зависит от HTTP.
+// FallbackBudgetSource — the counter of fallback suspensions by the share
+// budget (crawler_render_fallback_suspended_total{reason="budget"}, T-239);
+// the RenderSuspends implementation (suspends.go) reads it from the
+// /metrics exposition of the render worker; unit tests substitute a fake. The
+// BadHashesSource style: the source is replaceable, the alert does not depend on HTTP.
 type FallbackBudgetSource interface {
-	// FallbackBudget возвращает текущее значение счётчика (монотонно
-	// растёт защёлкиваниями приостановки; рестарт воркера обнуляет).
+	// FallbackBudget returns the current counter value (it grows monotonically
+	// with suspension latchings; a worker restart resets it).
 	FallbackBudget(ctx context.Context) (int64, error)
 }
 
-// RenderBrowserErrorsSource — счётчик ошибок класса браузера этапа
-// рендера (crawler_stage_errors_total{stage="render",type="browser"},
-// S-P2-6); реализация RenderSuspends (suspends.go) читает его из той же
-// экспозиции /metrics рендер-воркера (адрес monitor.render_metrics_url),
-// юнит-тесты подменяют фейком. Стиль FallbackBudgetSource: источник
-// заменяем, алерт не зависит от HTTP.
+// RenderBrowserErrorsSource — the counter of browser-class errors of the
+// render stage (crawler_stage_errors_total{stage="render",type="browser"},
+// S-P2-6); the RenderSuspends implementation (suspends.go) reads it from the same
+// /metrics exposition of the render worker (the address monitor.render_metrics_url),
+// unit tests substitute a fake. The FallbackBudgetSource style: the source
+// is replaceable, the alert does not depend on HTTP.
 type RenderBrowserErrorsSource interface {
-	// RenderBrowserErrors возвращает текущее значение счётчика (монотонно
-	// растёт инфра-ошибками движка; рестарт воркера обнуляет). Ошибка
-	// errNotRenderExposition — «адрес настроен не на рендер-воркера».
+	// RenderBrowserErrors returns the current counter value (it grows monotonically
+	// with engine infra errors; a worker restart resets it). The error
+	// errNotRenderExposition — "the address is not configured to a render worker".
 	RenderBrowserErrors(ctx context.Context) (int64, error)
 }
 
-// alertStreams — проверяемые стримы: рабочие, ограниченные гейтом
-// backpressure (q:dead не ограничивается — см. шапку backpressure.go).
+// alertStreams — the checked streams: the working ones, capped by the
+// backpressure gate (q:dead is not capped — see the backpressure.go header).
 var alertStreams = []string{
 	queue.StreamDNS, queue.StreamHTTP, queue.StreamRender, queue.StreamAnalyze,
 }
 
-// AlertsDeps — источники данных алертов. Каждый источник может деградировать
-// («не измеряется» с причиной), кроме пула БД: монитор без БД бессмысленен
-// (цикл заканчивается ошибкой).
+// AlertsDeps — the alert data sources. Every source may degrade
+// ("not measured" with a reason), except the DB pool: a monitor without a DB is pointless
+// (the loop ends with an error).
 type AlertsDeps struct {
-	// Pool — БД: доля temp_error за сутки, zones.updated_at.
+	// Pool — the DB: the temp_error share of the day, zones.updated_at.
 	Pool db.DB
-	// Redis — длины стримов; nil — алерт очередей «не измеряется».
+	// Redis — the stream lengths; nil — the queue alert is "not measured".
 	Redis StreamLener
-	// Space — место каталога контента; nil — OSStatfs.
+	// Space — the content directory space; nil — OSStatfs.
 	Space SpaceChecker
-	// Wear — износ NVMe; nil — OSWear (sysfs/ioctl).
+	// Wear — the NVMe wear; nil — OSWear (sysfs/ioctl).
 	Wear WearSource
-	// BadHashes — счётчик мусорных content_hash очистки ingest (T-099);
-	// nil — алерт «не измеряется».
+	// BadHashes — the junk content_hash counter of ingest cleanup (T-099);
+	// nil — the alert is "not measured".
 	BadHashes BadHashesSource
-	// FallbackBudget — счётчик событий приостановки бюджета доли фолбэка
-	// рендера (T-246); nil — алерт «не измеряется». Источником командует
-	// cmd/monitor (RenderSuspends по monitor.render_metrics_url).
+	// FallbackBudget — the counter of fallback share budget suspension
+	// events (T-246); nil — the alert is "not measured". The source is driven by
+	// cmd/monitor (RenderSuspends by monitor.render_metrics_url).
 	FallbackBudget FallbackBudgetSource
-	// RenderBrowserErrors — счётчик ошибок класса браузера этапа рендера
-	// (S-P2-6); nil — алерт «не измеряется». Источник — тот же зонд
-	// RenderSuspends по monitor.render_metrics_url (cmd/monitor).
+	// RenderBrowserErrors — the counter of browser-class errors of the render stage
+	// (S-P2-6); nil — the alert is "not measured". The source is the same
+	// RenderSuspends probe by monitor.render_metrics_url (cmd/monitor).
 	RenderBrowserErrors RenderBrowserErrorsSource
-	// UnitEvents — OOM/рестарты юнитов crawler (T-145); nil — алерт
-	// «не измеряется». Дефолтной реализации ОС нет (в отличие от
-	// Space/Wear): OSUnitEvents делает exec systemctl и читает хостовый
-	// cgroupfs — в юнит-тестах пакета это недопустимо, источником
-	// командует cmd/monitor (OSUnitEvents, обёрнутая в метрики
+	// UnitEvents — OOM/restarts of crawler units (T-145); nil — the alert
+	// is "not measured". There is no default OS implementation (unlike
+	// Space/Wear): OSUnitEvents execs systemctl and reads the host
+	// cgroupfs — unacceptable in the package's unit tests; the source is
+	// driven by cmd/monitor (OSUnitEvents, wrapped in the metrics
 	// NewUnitEventsMetrics).
 	UnitEvents UnitEventsSource
-	// RedisMemory — used_memory/maxmemory из INFO memory (T-154);
-	// nil — алерт redis_memory «не измеряется». Источником командует
-	// cmd/monitor (RedisInfo того же клиента, что у гейта глубин,
-	// обёрнутая в метрики NewRedisMemoryMetrics).
+	// RedisMemory — used_memory/maxmemory from INFO memory (T-154);
+	// nil — the redis_memory alert is "not measured". The source is driven by
+	// cmd/monitor (RedisInfo of the same client as the depth gate,
+	// wrapped in the metrics NewRedisMemoryMetrics).
 	RedisMemory RedisMemorySource
-	// RedisUptime — uptime_in_seconds из INFO server (T-270); nil —
-	// алерт redis_restart «не измеряется». Источник — тот же клиент
-	// Redis, что у памяти (cmd/monitor: RedisInfo).
+	// RedisUptime — uptime_in_seconds from INFO server (T-270); nil —
+	// the redis_restart alert is "not measured". The source is the same Redis
+	// client as for memory (cmd/monitor: RedisInfo).
 	RedisUptime RedisUptimeSource
-	// StreamGroups — группы рабочих стримов для алерта замороженной
-	// очереди (T-162); nil — алерт «не измеряется». Источником командует
-	// cmd/monitor (RedisStreamGroups того же клиента, что у гейта).
+	// StreamGroups — the groups of working streams for the frozen queue
+	// alert (T-162); nil — the alert is "not measured". The source is driven by
+	// cmd/monitor (RedisStreamGroups of the same client as the gate).
 	StreamGroups StreamGroupsSource
-	// PSI — давление CPU /proc/pressure/cpu (T-162); nil — OSPSI
-	// (чистое чтение файла, как OSStatfs/OSWear).
+	// PSI — the CPU pressure of /proc/pressure/cpu (T-162); nil — OSPSI
+	// (a pure file read, like OSStatfs/OSWear).
 	PSI PSISource
 }
 
-// AlertsOptions — параметры оценки; нулевые значения заменяются
-// дефолтами (withDefaults, стиль ZoneStatsOptions).
+// AlertsOptions — evaluation parameters; zero values are replaced
+// by defaults (withDefaults, the ZoneStatsOptions style).
 type AlertsOptions struct {
-	// Interval — период цикла AlertsLoop (DefaultAlertsInterval);
-	// рабочее значение — monitor.alerts_interval (T-206): окна детекции
-	// в проходах (AlertDeadMinPasses, MemHighMinPasses,
-	// RenderDebtPasses, AlertBadHashesWindow) считаются от него.
+	// Interval — the AlertsLoop cycle period (DefaultAlertsInterval);
+	// the working value is monitor.alerts_interval (T-206): the detection
+	// windows in passes (AlertDeadMinPasses, MemHighMinPasses,
+	// RenderDebtPasses, AlertBadHashesWindow) are counted from it.
 	Interval time.Duration
-	// ZoneStatsInterval — период ZoneStatsLoop: единица порога остановки
-	// прогресса (AlertStallFactor × интервал; updated_at пишет цикл
-	// реконсиляции — порог обязан считать его пропусками, а не проходы
-	// алертов); 0 — DefaultZoneStatsInterval. Рабочее значение —
+	// ZoneStatsInterval — the ZoneStatsLoop period: the unit of the stall
+	// threshold (AlertStallFactor × the interval; updated_at is written by the
+	// reconciliation loop — the threshold must count its misses, not alert
+	// passes); 0 — DefaultZoneStatsInterval. The working value is
 	// monitor.zone_stats_interval.
 	ZoneStatsInterval time.Duration
-	// QueueWatermark — порог глубины стримов
-	// (scheduler.queue_high_watermark); ≤ 0 — алерт очередей «не
-	// измеряется» (валидация конфига требует ≥ 1). Эффективный порог
-	// стрима ограничивается половиной его предела MAXLEN — как у гейта
-	// backpressure (queue.StreamWatermark, T-026).
+	// QueueWatermark — the stream depth threshold
+	// (scheduler.queue_high_watermark); ≤ 0 — the queue alert is "not
+	// measured" (config validation requires ≥ 1). The effective
+	// stream threshold is capped at half of its MAXLEN limit — like the
+	// backpressure gate (queue.StreamWatermark, T-026).
 	QueueWatermark int64
-	// QueueMaxLen — предел длины стримов MAXLEN (зеркалит redis.maxlen;
-	// 0 — пределы по стримам политики T-025): нужен для эффективного
-	// порога стрима (см. QueueWatermark).
+	// QueueMaxLen — the MAXLEN limit of stream lengths (mirrors redis.maxlen;
+	// 0 — the per-stream limits of the T-025 policy): needed for the effective
+	// stream threshold (see QueueWatermark).
 	QueueMaxLen int64
-	// ContentDir — каталог контента (content.dir); "" — алерт места «не
-	// измеряется».
+	// ContentDir — the content directory (content.dir); "" — the space alert is "not
+	// measured".
 	ContentDir string
-	// DiskFreePercent — порог свободного места
-	// (content.disk_free_percent); ≤ 0 — контроль выключен, алерт «не
-	// измеряется».
+	// DiskFreePercent — the free space threshold
+	// (content.disk_free_percent); ≤ 0 — the check is off, the alert is "not
+	// measured".
 	DiskFreePercent float64
-	// DiskFreeMinBytes — абсолютный минимум свободного места каталога
-	// контента, Warn (monitor.alerts.disk_free_min_bytes, T-162);
-	// ≤ 0 — DefaultDiskFreeMinBytes (выключения нет: абсолютный минимум
-	// — страховка процентного порога, отключать её незачем).
+	// DiskFreeMinBytes — the absolute minimum of free space of the content
+	// directory, Warn (monitor.alerts.disk_free_min_bytes, T-162);
+	// ≤ 0 — DefaultDiskFreeMinBytes (no off switch: the absolute minimum
+	// is the safety net of the percentage threshold; there is no reason to disable it).
 	DiskFreeMinBytes int64
-	// DiskFreeCritBytes — эскалация абсолютного минимума, отдельный
-	// алерт (monitor.alerts.disk_free_crit_bytes, T-162); ≤ 0 —
+	// DiskFreeCritBytes — the escalation of the absolute minimum, a separate
+	// alert (monitor.alerts.disk_free_crit_bytes, T-162); ≤ 0 —
 	// DefaultDiskFreeCritBytes.
 	DiskFreeCritBytes int64
-	// QueueFreeze — окно неподвижности last-delivered-id группы при
-	// глубине > 0 (monitor.alerts.queue_freeze_window, T-162);
+	// QueueFreeze — the immobility window of the group's last-delivered-id at
+	// depth > 0 (monitor.alerts.queue_freeze_window, T-162);
 	// ≤ 0 — DefaultQueueFreezeWindow.
 	QueueFreeze time.Duration
-	// PSICPUPercent — порог PSI CPU some avg300, %
+	// PSICPUPercent — the PSI CPU some avg300 threshold, %
 	// (monitor.alerts.psi_cpu_percent, T-162); ≤ 0 — DefaultPSICPUPercent.
 	PSICPUPercent float64
-	// PSIWindow — окно устойчивости PSI выше порога
+	// PSIWindow — the PSI persistence window above the threshold
 	// (monitor.alerts.psi_cpu_window, T-162); ≤ 0 — DefaultPSIWindow.
 	PSIWindow time.Duration
-	// MemHighMinPasses — проходов подряд с ростом счётчика
-	// memory.events high до срабатывания memory_high
+	// MemHighMinPasses — passes in a row with growth of the
+	// memory.events high counter before memory_high fires
 	// (monitor.alerts.mem_high_passes, T-162); ≤ 0 — DefaultMemHighMinPasses.
 	MemHighMinPasses int
-	// RenderDebtDomains — порог рендер-долга (флаги + лаг q:render),
-	// включающий алерт при росте (monitor.alerts.render_debt_domains,
+	// RenderDebtDomains — the render debt threshold (flags + the q:render lag)
+	// that fires the alert on growth (monitor.alerts.render_debt_domains,
 	// T-175); ≤ 0 — DefaultRenderDebtDomains.
 	RenderDebtDomains int64
-	// RenderDebtPasses — проходов подряд с ростом долга до срабатывания
-	// render_debt (monitor.alerts.render_debt_passes, T-175); ≤ 0 —
+	// RenderDebtPasses — passes in a row with debt growth before
+	// render_debt fires (monitor.alerts.render_debt_passes, T-175); ≤ 0 —
 	// DefaultRenderDebtPasses.
 	RenderDebtPasses int
-	// Now — источник времени (возраст zones.updated_at); nil — time.Now.
+	// Now — the time source (the age of zones.updated_at); nil — time.Now.
 	Now func() time.Time
-	// Log — логгер цикла; nil — записи подавлены (slog.DiscardHandler).
+	// Log — the loop logger; nil — entries suppressed (slog.DiscardHandler).
 	Log *slog.Logger
-	// OnPass — хук экспорта состояния: снапшот каждого прохода (лог +
-	// поле; см. шапку файла). Вызывается в цикле прохода — обязан быть
-	// быстрым и не паниковать.
+	// OnPass — the state export hook: a snapshot of every pass (log +
+	// field; see the file header). Called in the pass loop — it must be
+	// fast and must not panic.
 	OnPass func(AlertsResult)
 }
 
-// withDefaults заменяет неположительные периоды и пороги дефолтами (Now/Log
-// проверяются отдельно: функций/указателей — nil).
+// withDefaults replaces non-positive periods and thresholds with defaults (Now/Log
+// are checked separately: functions/pointers — nil).
 func (o AlertsOptions) withDefaults() AlertsOptions {
 	if o.Interval <= 0 {
 		o.Interval = DefaultAlertsInterval
@@ -986,23 +986,23 @@ func (o AlertsOptions) withDefaults() AlertsOptions {
 	return o
 }
 
-// AlertSnapshot — состояние одного алерта после прохода.
+// AlertSnapshot — the state of one alert after a pass.
 type AlertSnapshot struct {
-	// Name — имя алерта (константы Alert*).
+	// Name — the alert name (the Alert* constants).
 	Name string
 	// Status — AlertStatusOK | AlertStatusFiring | AlertStatusNotMeasured.
 	Status string
-	// Detail — измерение или причина «не измеряется».
+	// Detail — the measurement or the "not measured" reason.
 	Detail string
 }
 
-// AlertsResult — снапшот прохода оценки: по одному AlertSnapshot на алерт,
-// порядок фиксирован (NewAlerts).
+// AlertsResult — a snapshot of the evaluation pass: one AlertSnapshot per alert,
+// the order is fixed (NewAlerts).
 type AlertsResult struct {
 	Alerts []AlertSnapshot
 }
 
-// Firing — сработавшие алерты прохода.
+// Firing — the fired alerts of the pass.
 func (r AlertsResult) Firing() []AlertSnapshot {
 	var firing []AlertSnapshot
 	for _, a := range r.Alerts {
@@ -1013,30 +1013,30 @@ func (r AlertsResult) Firing() []AlertSnapshot {
 	return firing
 }
 
-// Alerts — оценка алертов с памятью состояний между проходами
-// (гистерезис, фронтовые записи лога только на переходах). Каждый алерт
-// — машина alertMachine (T-264, ТЗ-fsm §3 ФТ-10): «{имя, статус,
-// track-память}» с единственной точкой записи состояния transition —
-// спецификация автомата и типизированные track-памяти в alertstate.go,
-// этот файл — источники наблюдений (observe*) и сборка машин.
+// Alerts — alert evaluation with state memory between passes
+// (hysteresis, front-loaded log entries only on transitions). Each alert
+// is an alertMachine (T-264, TZ-fsm spec §3 FR-10): "{name, status,
+// track memory}" with the single state-writing point transition —
+// the machine specification and the typed track memories are in alertstate.go;
+// this file — the observation sources (observe*) and the machine assembly.
 type Alerts struct {
 	deps AlertsDeps
 	opts AlertsOptions
 	log  *slog.Logger
 	now  func() time.Time
-	// machines — машины алертов в фиксированном порядке (инвариант И4
-	// alertstate.go): снапшот AlertsResult детерминирован, очередь
-	// чтений Redis источников стабильна.
+	// machines — the alert machines in a fixed order (invariant I4
+	// of alertstate.go): the AlertsResult snapshot is deterministic, the
+	// order of Redis reads of the sources is stable.
 	machines []alertRunner
 }
 
-// NewAlerts строит оценщик: нормализует опции (дефолты периодов),
-// источники Space/Wear/PSI (nil → реализации ОС) и собирает машины
-// алертов (конструкторы newXMachine — рядом с observe-функциями
-// источников; источники и пороги — шапка файла). Порядок машин —
-// прежний порядок evaluators (T-080…T-256): от него зависит очередь
-// чтений общих источников (фейки тестов позиционируют ошибки по номеру
-// чтения Len).
+// NewAlerts builds the evaluator: normalizes the options (period defaults),
+// the Space/Wear/PSI sources (nil → OS implementations) and assembles
+// the alert machines (the newXMachine constructors — next to the
+// observe functions of the sources; the sources and thresholds — the file header). The machine order —
+// the former evaluators order (T-080…T-256): the queue of reads of the shared
+// sources depends on it (the test fakes position errors by the read
+// number of Len).
 func NewAlerts(deps AlertsDeps, opts AlertsOptions) *Alerts {
 	o := opts.withDefaults()
 	log := o.Log
@@ -1084,12 +1084,12 @@ func NewAlerts(deps AlertsDeps, opts AlertsOptions) *Alerts {
 
 // mutator-disable-regexp a\.log\.Debug\("проход statement/remove
 // mutator-disable-regexp a\.log\.Info\("цикл statement/remove
-// Обоснование: служебные записи цикла (итог прохода Debug, старт Info) —
-// поведение алертов не меняют, гасятся по docs/mutation-testing.md §4.
+// Justification: the service entries of the loop (the pass result Debug, the start Info) —
+// they do not change alert behavior, damped per docs/mutation-testing.md §4.
 
-// Pass выполняет один проход: прогоняет все машины (деградация
-// источника одной не останавливает остальные), логирует переходы,
-// отдаёт снапшот в OnPass и возвращает его.
+// Pass performs one pass: runs all machines (a source degradation of one
+// does not stop the others), logs the transitions,
+// hands the snapshot to OnPass and returns it.
 func (a *Alerts) Pass(ctx context.Context) AlertsResult {
 	snaps := make([]AlertSnapshot, 0, len(a.machines))
 	for _, m := range a.machines {
@@ -1103,12 +1103,12 @@ func (a *Alerts) Pass(ctx context.Context) AlertsResult {
 	return res
 }
 
-// logFront пишет фронтовую запись на смене состояния (инвариант И3
-// alertstate.go): срабатывание — Warn, снятие — Info, неприменимость —
-// Debug. Исключение — уход сработавшего алерта в «не измеряется» (сбой
-// источника): Warn об ошибке пишет transition, потерю самого алерта
-// фиксируем Info — иначе авария исчезла бы из лога без единой записи
-// о прекращении.
+// logFront writes a front entry on the state change (invariant I3
+// of alertstate.go): firing — Warn, clearing — Info, inapplicability —
+// Debug. The exception — a firing alert going to "not measured" (a source
+// failure): the Warn of the error is written by transition; the loss of the alert itself
+// is recorded with Info — otherwise the incident would vanish from the log without a single
+// entry about the termination.
 func (a *Alerts) logFront(name, prev, status, detail string) {
 	if prev == status {
 		return
@@ -1133,13 +1133,13 @@ func (a *Alerts) logFront(name, prev, status, detail string) {
 	}
 }
 
-// observeDNS — доля temp_error среди проверок текущих суток: числитель
-// и знаменатель — суточные строки crawler_counters (T-182, точечные
-// чтения dnsDailyCountersSQL; события записей результатов — ретраи и
-// дубли доставки остаются в истории событий, доля устойчива, абсолюты
-// чинит реконсиляция). До 100 событий знаменателя (AlertDNSMinSamples)
-// доля — шум пустого окна, тихое «не измеряется»; гистерезис доли —
-// track машины (пороги T-080/T-162 не менялись с T-182).
+// observeDNS — the temp_error share among the checks of the current day: the numerator
+// and the denominator — the daily crawler_counters rows (T-182, point
+// reads dnsDailyCountersSQL; result-write events — retries and
+// delivery duplicates stay in the event history, the share is stable, the absolutes
+// are fixed by reconciliation). Below 100 denominator events (AlertDNSMinSamples)
+// the share is the noise of an empty window, a quiet "not measured"; the share hysteresis —
+// the machine track (the T-080/T-162 thresholds were not changed since T-182).
 func (a *Alerts) observeDNS(ctx context.Context) observation[dnsShare] {
 	rows, err := a.deps.Pool.Query(ctx, dnsDailyCountersSQL)
 	if err != nil {
@@ -1164,9 +1164,9 @@ func (a *Alerts) observeDNS(ctx context.Context) observation[dnsShare] {
 	return observation[dnsShare]{value: dnsShare{temp: temp, total: total}}
 }
 
-// newDNSMachine — машина dns_temp_error_share: гистерезис порогов доли
-// (включение ≥ AlertDNSFireShare 30 %, удержание сработавшего до
-// AlertDNSRecoverShare 20 % — коридор не дребезжит Warn).
+// newDNSMachine — the dns_temp_error_share machine: the hysteresis of the share thresholds
+// (firing ≥ AlertDNSFireShare 30%, holding the fired state until
+// AlertDNSRecoverShare 20% — the corridor does not flap the Warn).
 func (a *Alerts) newDNSMachine() *alertMachine[dnsShare] {
 	return &alertMachine[dnsShare]{
 		name: AlertDNSErrors,
@@ -1182,10 +1182,10 @@ func (a *Alerts) newDNSMachine() *alertMachine[dnsShare] {
 	}
 }
 
-// observeQueues — глубина рабочих стримов (источник наблюдения): Len по
-// каждому рабочему стриму alertStreams; гистерезис «порог гейта /
-// 90 % порога» — track машины. q:dead алертом очередей не опрашивается
-// (глубину карантина читает queue_dead).
+// observeQueues — the depth of the working streams (the observation source): Len of
+// each working stream of alertStreams; the "gate threshold /
+// 90% of the threshold" hysteresis — the machine track. q:dead is not polled by the queue alert
+// (the quarantine depth is read by queue_dead).
 func (a *Alerts) observeQueues(ctx context.Context) observation[map[string]int64] {
 	if a.deps.Redis == nil {
 		return observation[map[string]int64]{reason: "Redis не задан"}
@@ -1206,14 +1206,14 @@ func (a *Alerts) observeQueues(ctx context.Context) observation[map[string]int64
 	return observation[map[string]int64]{value: lens}
 }
 
-// newQueuesMachine — машина queue_overflow: гистерезис глубин рабочих
-// стримов — срабатывание на эффективном пороге стрима (в тот же момент
-// гейт закрывает публикацию), снятие ниже 90 % порога
-// (AlertQueueRecoverFactor — мягкий гейт: между проверкой и публикацией
-// другие продюсеры добавляют записи, T-026). Порог — по стриму, как у
-// гейта (T-026): для q:dns настроенные 100 000 записей ограничиваются
-// половиной его MAXLEN по политике (DefaultStreamMaxLen, T-141:
-// 125 пачек).
+// newQueuesMachine — the queue_overflow machine: the hysteresis of the working
+// stream depths — firing at the effective stream threshold (at the same moment
+// the gate closes publication), clearing below 90% of the threshold
+// (AlertQueueRecoverFactor — a soft gate: between the check and publication
+// other producers add entries, T-026). The threshold is per stream, like the
+// gate's (T-026): for q:dns the configured 100,000 entries are capped
+// at half of its MAXLEN by policy (DefaultStreamMaxLen, T-141:
+// 125 batches).
 func (a *Alerts) newQueuesMachine() *alertMachine[map[string]int64] {
 	wm := make(map[string]int64, len(alertStreams))
 	for _, s := range alertStreams {
@@ -1242,14 +1242,14 @@ func (a *Alerts) newQueuesMachine() *alertMachine[map[string]int64] {
 				return false
 			},
 			okDetail: func(lens map[string]int64) string {
-				// Деталь «ok» — максимальная глубина среди рабочих
-				// стримов; стартовое значение — первый стрим: при всех
-				// нулях (простаивающие очереди) деталь называет стрим,
-				// а не пустую строку.
+				// The "ok" detail — the maximum depth among the working
+				// streams; the starting value is the first stream: with all
+				// zeros (idle queues) the detail names a stream,
+				// not an empty string.
 				maxStream, maxLen := alertStreams[0], lens[alertStreams[0]]
-				// Эквивалентный мутант alertStreams[0:]: первый элемент
-				// не превосходит сам себя (старт максимума), итог не
-				// меняется.
+				// The equivalent mutant alertStreams[0:]: the first element
+				// does not exceed itself (the maximum start), the result does
+				// not change.
 				// mutator-disable-next-line numbers/decrementer
 				for _, s := range alertStreams[1:] {
 					if lens[s] > maxLen {
@@ -1259,8 +1259,8 @@ func (a *Alerts) newQueuesMachine() *alertMachine[map[string]int64] {
 				return fmt.Sprintf("макс %s=%d", maxStream, maxLen)
 			},
 			hotDetail: func(lens map[string]int64) string {
-				// Сработавшая деталь называет горячие стримы; при их
-				// отсутствии — удерживающие коридор гистерезиса.
+				// The fired detail names the hot streams; when there are none —
+				// the ones holding the hysteresis corridor.
 				var hot, hold []string
 				for _, s := range alertStreams {
 					n := lens[s]
@@ -1273,7 +1273,7 @@ func (a *Alerts) newQueuesMachine() *alertMachine[map[string]int64] {
 				}
 				at := hot
 				if len(at) == 0 {
-					at = hold // коридор гистерезиса: ниже порога гейта, но близко
+					at = hold // hysteresis corridor: below the gate threshold, but close
 				}
 				return strings.Join(at, ", ") + " — глубина у порога"
 			},
@@ -1282,12 +1282,12 @@ func (a *Alerts) newQueuesMachine() *alertMachine[map[string]int64] {
 	}
 }
 
-// observeStall — свежесть последнего пересчёта зон: zones.updated_at
-// (пишет ZoneStatsLoop, T-078); NULL — зон нет, прогресс не
-// отслеживается (тихое «не измеряется»). Порог возраста — track машины;
-// оговорка самоконтроля: updated_at пишет сам monitor — при полной
-// смерти процесса алерт некому сработать, пропажу сервиса видит метрика
-// crawler_service_up каркаса (T-012).
+// observeStall — the freshness of the last zone recount: zones.updated_at
+// (written by ZoneStatsLoop, T-078); NULL — no zones, progress is
+// not tracked (a quiet "not measured"). The age threshold — the machine track;
+// a self-check caveat: monitor writes updated_at itself — with the process
+// fully dead there is nobody to fire the alert; the service loss is seen by the
+// crawler_service_up metric of the framework (T-012).
 func (a *Alerts) observeStall(ctx context.Context) observation[time.Time] {
 	rows, err := a.deps.Pool.Query(ctx, zoneFreshSQL)
 	if err != nil {
@@ -1310,13 +1310,13 @@ func (a *Alerts) observeStall(ctx context.Context) observation[time.Time] {
 	return observation[time.Time]{value: last.Time}
 }
 
-// newStallMachine — машина progress_stall: порог возраста метки в
-// периодах РЕКОНСИЛЯЦИИ (AlertStallFactor × ZoneStatsInterval — метку
-// пишет именно этот цикл, а не проходы алертов: при 30-мин
-// реконсиляции порог 5 × 5 мин стрелял бы вечно; проход T-078 по
-// десяткам млн строк — минуты, единичный пропуск периода не авария,
-// 5 периодов — уверенная остановка). Гистерезис не нужен: возраст
-// уменьшается только новым проходом, дребезга у порога нет.
+// newStallMachine — the progress_stall machine: the stamp age threshold in
+// RECONCILIATION periods (AlertStallFactor × ZoneStatsInterval — the stamp
+// is written by exactly that loop, not by alert passes: with 30 min
+// reconciliation a threshold of 5 × 5 min would fire forever; a T-078 pass over
+// tens of millions of rows takes minutes, a single missed period is not an incident,
+// 5 periods is a confident stall). No hysteresis needed: the age
+// decreases only with a new pass, there is no flapping at the threshold.
 func (a *Alerts) newStallMachine() *alertMachine[time.Time] {
 	stallAfter := time.Duration(AlertStallFactor) * a.opts.ZoneStatsInterval
 	return &alertMachine[time.Time]{
@@ -1338,10 +1338,10 @@ func (a *Alerts) newStallMachine() *alertMachine[time.Time] {
 	}
 }
 
-// observeDisk — наблюдение процентного алерта места: каталог контента
-// не задан / контроль выключен (content.disk_free_percent ≤ 0) — тихое
-// «не измеряется», не ложное срабатывание; далее — общий снимок места
-// observeDiskSpace.
+// observeDisk — the observation of the percentage space alert: the content directory
+// not set / the check off (content.disk_free_percent ≤ 0) — a quiet
+// "not measured", not a false firing; next — the shared space
+// snapshot observeDiskSpace.
 func (a *Alerts) observeDisk(_ context.Context) observation[SpaceStat] {
 	if a.opts.ContentDir == "" {
 		return observation[SpaceStat]{reason: "каталог контента не задан"}
@@ -1354,11 +1354,11 @@ func (a *Alerts) observeDisk(_ context.Context) observation[SpaceStat] {
 	return a.observeDiskSpace()
 }
 
-// observeDiskSpace — общий снимок statfs каталога контента: доля
-// свободного места (та же формула, что пауза Put в internal/content,
-// T-046) и абсолютные минимумы читают один и тот же срез (две копии
-// сисколла на проход дешевле связывания алертов общим кэшем). Ошибка
-// statfs — Warn; total=0 — файловая система не сообщает ёмкость.
+// observeDiskSpace — the shared statfs snapshot of the content directory: the share
+// of free space (the same formula as the Put pause in internal/content,
+// T-046) and the absolute minimums read the same snapshot (two
+// syscall copies per pass are cheaper than coupling the alerts with a shared cache). An error
+// of statfs — a Warn; total=0 — the file system does not report capacity.
 func (a *Alerts) observeDiskSpace() observation[SpaceStat] {
 	sp, err := a.deps.Space.Space(a.opts.ContentDir)
 	if err != nil {
@@ -1370,9 +1370,9 @@ func (a *Alerts) observeDiskSpace() observation[SpaceStat] {
 	return observation[SpaceStat]{value: sp}
 }
 
-// observeDiskBytes — наблюдение абсолютных минимумов места
-// (disk_free_min/disk_free_crit, T-162): каталог не задан — тихое «не
-// измеряется»; далее — общий снимок observeDiskSpace.
+// observeDiskBytes — the observation of the absolute space minimums
+// (disk_free_min/disk_free_crit, T-162): the directory not set — a quiet "not
+// measured"; next — the shared snapshot observeDiskSpace.
 func (a *Alerts) observeDiskBytes(_ context.Context) observation[SpaceStat] {
 	if a.opts.ContentDir == "" {
 		return observation[SpaceStat]{reason: "каталог контента не задан"}
@@ -1380,10 +1380,10 @@ func (a *Alerts) observeDiskBytes(_ context.Context) observation[SpaceStat] {
 	return a.observeDiskSpace()
 }
 
-// newDiskMachine — машина disk_free: срабатывание при доле свободного
-// строго ниже порога — ровно когда Pause контента останавливает запись;
-// отдельный порог рассинхронировал бы сигнал с реальной паузой,
-// поэтому без зазора гистерезиса.
+// newDiskMachine — the disk_free machine: firing when the free share is
+// strictly below the threshold — exactly when content Pause stops writing;
+// a separate threshold would desync the signal from the real pause,
+// hence no hysteresis gap.
 func (a *Alerts) newDiskMachine() *alertMachine[SpaceStat] {
 	pct := a.opts.DiskFreePercent
 	return &alertMachine[SpaceStat]{
@@ -1402,17 +1402,17 @@ func (a *Alerts) newDiskMachine() *alertMachine[SpaceStat] {
 	}
 }
 
-// newDiskBytesMachine — машина абсолютного минимума места (T-162):
-// Warn при Avail < порога, эскалация — отдельным алертом, а не
-// «уровнем» первого: каждое состояние видно своей парой сообщений
-// срабатывание/снятие (дебаунс notify.go) и своей строкой в журнале,
-// иерархия Warn→усиление читается по имени. Срабатывание строгое (<),
-// восстановление возвратом к порогу; гистерезиса нет, как у
-// процентного: место при инциденте убывает монотонно (~1,5 ГБ/ч) —
-// дребезг у порога нечему двигать. Порог ≥ ёмкости тома неприменим:
-// свободное место никогда не достигнет минимума (dev-том 10 ГБ против
-// 15 GiB) — вечное срабатывание было бы ложным, малые тома остаются
-// под крылом процентного порога.
+// newDiskBytesMachine — the absolute space minimum machine (T-162):
+// Warn at Avail < the threshold, the escalation — a separate alert, not
+// a "level" of the first: every state is visible via its own firing/clearing
+// message pair (the notify.go debouncing) and its own log line;
+// the Warn→escalation hierarchy reads by name. Firing is strict (<),
+// recovery by returning to the threshold; no hysteresis, like
+// the percentage one: space decreases monotonically during an incident (~1.5 GB/h) —
+// nothing moves the flapping at the threshold. A threshold ≥ the volume capacity is inapplicable:
+// free space would never reach the minimum (a 10 GB dev volume against
+// 15 GiB) — an eternal firing would be false; small volumes stay
+// under the wing of the percentage threshold.
 func (a *Alerts) newDiskBytesMachine(name string, threshold int64) *alertMachine[SpaceStat] {
 	return &alertMachine[SpaceStat]{
 		name: name,
@@ -1436,12 +1436,12 @@ func (a *Alerts) newDiskBytesMachine(name string, threshold int64) *alertMachine
 	}
 }
 
-// newDiskMinMachine / newDiskCritMachine — Warn-минимум (15 GiB,
-// DefaultDiskFreeMinBytes) и эскалация (10 GiB, DefaultDiskFreeCritBytes)
-// абсолютного запаса места: процентный порог на большом томе поздний
-// (10 % от 79 ГБ = 8 ГБ ≈ 5 ч до заполнения при темпе ≈36 GiB/сут,
-// замер §12), минимум в байтах даёт запас на разбор независимо от
-// размера тома.
+// newDiskMinMachine / newDiskCritMachine — the Warn minimum (15 GiB,
+// DefaultDiskFreeMinBytes) and the escalation (10 GiB, DefaultDiskFreeCritBytes)
+// of the absolute space reserve: a percentage threshold is late on a large volume
+// (10% of 79 GB = 8 GB ≈ 5h until full at a rate of ≈36 GiB/day,
+// measurement §12); a minimum in bytes gives triage headroom regardless of
+// the volume size.
 func (a *Alerts) newDiskMinMachine() *alertMachine[SpaceStat] {
 	return a.newDiskBytesMachine(AlertDiskMin, a.opts.DiskFreeMinBytes)
 }
@@ -1450,11 +1450,11 @@ func (a *Alerts) newDiskCritMachine() *alertMachine[SpaceStat] {
 	return a.newDiskBytesMachine(AlertDiskCrit, a.opts.DiskFreeCritBytes)
 }
 
-// observeWear — износ NVMe по health-логу. Недоступность SMART —
-// ожидаемое состояние контейнера: тихое «не измеряется» без Warn —
-// деградация честная (см. шапку файла); на боевом systemd-хосте слой
-// включается доступом юнита к /dev/nvme* (группа nvme-smart, T-089 —
-// docs/disks.md). Пустой список — источник жив, устройств нет.
+// observeWear — the NVMe wear per the health log. SMART unavailability —
+// an expected container state: a quiet "not measured" without a Warn —
+// the degradation is honest (see the file header); on a production systemd host the layer
+// is enabled by granting the unit access to /dev/nvme* (the nvme-smart group, T-089 —
+// docs/disks.md). An empty list — the source is alive, no devices.
 func (a *Alerts) observeWear(ctx context.Context) observation[[]NVMeWear] {
 	wears, err := a.deps.Wear.Wear(ctx)
 	if err != nil {
@@ -1466,18 +1466,18 @@ func (a *Alerts) observeWear(ctx context.Context) observation[[]NVMeWear] {
 	return observation[[]NVMeWear]{value: wears}
 }
 
-// newWearMachine — машина nvme_wear: алерт при percentage_used ≥
-// AlertNVMeWearPercent (90 % — осталось ≤10 % расчётного ресурса, порог
-// планирования замены) любого устройства; ресурс монотонен (не
-// восстанавливается) — гистерезис не нужен, значения >100 % валидны
-// (ресурс исчерпан) и тоже алертятся.
+// newWearMachine — the nvme_wear machine: the alert at percentage_used ≥
+// AlertNVMeWearPercent (90% — ≤10% of the rated lifespan left, the threshold
+// for planning a replacement) of any device; lifespan is monotonic (it
+// does not recover) — hysteresis is not needed; values >100% are valid
+// (lifespan exhausted) and also alert.
 func (a *Alerts) newWearMachine() *alertMachine[[]NVMeWear] {
-	// Худший по износу; старт — первое устройство, а не нулевое значение:
-	// новый накопитель (0 %) оставил бы пустое имя в детали.
+	// The worst by wear; the start is the first device, not the zero value:
+	// a new drive (0%) would leave an empty name in the detail.
 	worstOf := func(wears []NVMeWear) NVMeWear {
 		worst := wears[0]
-		// Эквивалентный мутант wears[0:]: первый элемент не превосходит
-		// сам себя (старт максимума), итог не меняется.
+		// The equivalent mutant wears[0:]: the first element does not exceed
+		// itself (the maximum start), the result does not change.
 		// mutator-disable-next-line numbers/decrementer
 		for _, w := range wears[1:] {
 			if w.PercentUsed > worst.PercentUsed {
@@ -1514,18 +1514,18 @@ func (a *Alerts) newWearMachine() *alertMachine[[]NVMeWear] {
 	}
 }
 
-// nvmeTBW — записано терабайт (единица NVMe = 512 000 байт, десятичные
-// ТБ — как в спецификации TBW).
+// nvmeTBW — written terabytes (one NVMe unit = 512,000 bytes, decimal
+// TB — as in the TBW specification).
 func nvmeTBW(w NVMeWear) float64 {
 	return float64(w.DataUnitsWritten) * 512000 / 1e12
 }
 
-// observeBadHashes — счётчик мусорных content_hash очистки ingest
-// (T-099): источник — экспозиция /metrics сервиса ingest (BadHashes).
-// Ошибка источника (ingest недоступен, метрики нет) — «не измеряется»
-// с Warn: смерть самого ingest видна по crawler_service_up, а не этим
-// алертом; окно всплеска (кольцо дельт, снятие старением — гистерезис
-// не нужен, сумма окна убывает только старением) — track машины.
+// observeBadHashes — the junk content_hash counter of ingest cleanup
+// (T-099): the source is the /metrics exposition of the ingest service (BadHashes).
+// A source error (ingest unavailable, no metrics) — "not measured"
+// with a Warn: the death of ingest itself is seen via crawler_service_up, not by this
+// alert; the spike window (a delta ring, clearing by aging — hysteresis
+// is not needed, the window sum decreases only by aging) — the machine track.
 func (a *Alerts) observeBadHashes(ctx context.Context) observation[int64] {
 	if a.deps.BadHashes == nil {
 		return observation[int64]{
@@ -1539,10 +1539,10 @@ func (a *Alerts) observeBadHashes(ctx context.Context) observation[int64] {
 	return observation[int64]{value: cur}
 }
 
-// newBadHashesMachine — машина ingest_bad_hashes: кольцо дельт за окно
-// AlertBadHashesWindow проходов, порог AlertBadHashesThreshold (в норме
-// инвариант писателя результатов держит ноль всегда; порог отсекает
-// единичные реликты до фикса ING-P2-4 — обоснование у константы).
+// newBadHashesMachine — the ingest_bad_hashes machine: the delta ring over the
+// AlertBadHashesWindow passes, the AlertBadHashesThreshold threshold (normally
+// the result-writer invariant always holds zero; the threshold cuts off
+// single relics from before the ING-P2-4 fix — the justification is at the constant).
 func (a *Alerts) newBadHashesMachine() *alertMachine[int64] {
 	return &alertMachine[int64]{
 		name: AlertBadHashes,
@@ -1558,13 +1558,13 @@ func (a *Alerts) newBadHashesMachine() *alertMachine[int64] {
 	}
 }
 
-// observeUnitsSource — чтение источника юнитов без трактовки пустого
-// списка: деградации общие у машин unit_oom и memory_high — источник
-// не задан (тихо), errNoSystemd (dev-контейнер — тихо, как у SMART:
-// окружение без systemd — норма dev, а не авария) и прочие ошибки
-// (боевой хост, systemd/cgroupfs сломан — Warn каждого прохода, стиль
-// остальных источников; без повторного «monitor: юниты:» — источник
-// уже ставит префикс).
+// observeUnitsSource — the unit source read without interpreting an empty
+// list: the degradations are shared by the unit_oom and memory_high machines — the source
+// not set (quiet), errNoSystemd (a dev container — quiet, like SMART:
+// an environment without systemd is the dev norm, not an incident) and other errors
+// (a production host, systemd/cgroupfs broken — a Warn every pass, the style
+// of the other sources; without a repeated "monitor: units:" — the source
+// already puts the prefix).
 func (a *Alerts) observeUnitsSource(ctx context.Context) observation[[]UnitEvents] {
 	if a.deps.UnitEvents == nil {
 		return observation[[]UnitEvents]{reason: "источник не задан"}
@@ -1579,8 +1579,8 @@ func (a *Alerts) observeUnitsSource(ctx context.Context) observation[[]UnitEvent
 	return observation[[]UnitEvents]{value: units}
 }
 
-// observeUnitEvents — наблюдение unit_oom: пустой список — юниты не
-// загружены, «не измеряется» (события юнитов вне наблюдения).
+// observeUnitEvents — the unit_oom observation: an empty list — units not
+// loaded, "not measured" (unit events outside the observation).
 func (a *Alerts) observeUnitEvents(ctx context.Context) observation[[]UnitEvents] {
 	o := a.observeUnitsSource(ctx)
 	if o.err != nil || o.reason != "" {
@@ -1592,25 +1592,25 @@ func (a *Alerts) observeUnitEvents(ctx context.Context) observation[[]UnitEvents
 	return o
 }
 
-// observeMemHighUnits — наблюдение memory_high: пустой список —
-// ВАЛИДНОЕ измерение (0 юнитов), а не «не найдены» — асимметрия
-// осознанная и прежняя (evalMemHigh в master не имел ветки пустого
-// списка): троттлинг — про скорость счётчиков живых юнитов, пустой
-// ответ чистит память исчезнувших и даёт ok «0 юнитов» (эпизод без
-// горячих юнитов закрывается честно), а unit_oom — про события, их
-// отсутствие вне загруженных юнитов не наблюдаемо.
+// observeMemHighUnits — the memory_high observation: an empty list is a
+// VALID measurement (0 units), not "not found" — the asymmetry
+// is deliberate and old (evalMemHigh in master had no empty-list branch):
+// throttling is about the rate of the counters of live units; an empty
+// answer cleans the memory of vanished units and gives an ok "0 units" (an episode without
+// hot units closes honestly), while unit_oom is about events; their
+// absence outside loaded units is not observable.
 func (a *Alerts) observeMemHighUnits(ctx context.Context) observation[[]UnitEvents] {
 	return a.observeUnitsSource(ctx)
 }
 
-// newUnitOOMMachine — машина unit_oom: срабатывание, пока у любого
-// юнита есть oom/oom_kill (memory.events) или NRestarts > 0. Счётчики
-// монотонны внутри жизни cgroup/юнита — гистерезис не нужен (стиль
-// износа NVMe): эпизод тянется от первого события до сброса состояния
-// юнита — перезапуска (деплой сбрасывает сам: stop → reset-failed →
-// start в deploy-install.sh; reset-failed/старт обнуляет NRestarts,
-// пересозданная cgroup забирает oom/oom_kill с собой). Один Warn на
-// эпизод даёт фронтовая механика transition.
+// newUnitOOMMachine — the unit_oom machine: firing while any
+// unit has oom/oom_kill (memory.events) or NRestarts > 0. The counters
+// are monotonic within the life of a cgroup/unit — hysteresis is not needed (the
+// NVMe wear style): the episode stretches from the first event to the state reset
+// of the unit — a restart (a deploy resets it itself: stop → reset-failed →
+// start in deploy-install.sh; reset-failed/start zeroes NRestarts,
+// a recreated cgroup takes the oom/oom_kill with it). One Warn per
+// episode is given by the front mechanics of transition.
 func (a *Alerts) newUnitOOMMachine() *alertMachine[[]UnitEvents] {
 	return &alertMachine[[]UnitEvents]{
 		name: AlertUnitOOM,
@@ -1642,19 +1642,19 @@ func (a *Alerts) newUnitOOMMachine() *alertMachine[[]UnitEvents] {
 	}
 }
 
-// newMemHighMachine — машина memory_high (T-162): серия роста счётчика
-// memory.events high по юнитам — порог не значение, а скорость (счётчик
-// накапливается за жизнь cgroup: http-worker с MemoryHigh=850M набирает
-// >100 тыс. за сутки). Устойчивость — рост MemHighMinPasses проходов
-// подряд (2 × период алертов = 10 мин на дефолтных 5 мин, T-206):
-// одиночный всплеск — штатная работа мягкого потолка, устойчивый
-// троттлинг — предвестник фаталов http-worker (T-157) и запроса потолка
-// выше (docs/deploy.md §2). Снятие — первый проход без роста:
-// гистерезис не нужен, событие снятия и есть «рост прекратился»,
-// дребезг у нуля серии невозможен (серия целая). Источник и деградации
-// — те же, что у unit_oom, КРОМЕ пустого списка: для memory_high это
-// валидное измерение «0 юнитов» (observeMemHighUnits), не «не
-// найдены» — прежняя асимметрия master.
+// newMemHighMachine — the memory_high machine (T-162): a series of counter growth
+// of memory.events high across units — the threshold is not a value but a rate (the counter
+// accumulates over the cgroup lifetime: http-worker with MemoryHigh=850M gains
+// >100k per day). Persistence — growth for MemHighMinPasses passes
+// in a row (2 × the alert period = 10 min at the default 5 min, T-206):
+// a single spike is normal soft-cap operation; sustained
+// throttling is the harbinger of the http-worker fatals (T-157) and a request for a
+// higher cap (docs/deploy.md §2). Clearing — the first pass without growth:
+// no hysteresis needed, the clearing event is exactly "growth stopped",
+// flapping at the series zero is impossible (the series is integer). The source and degradations
+// are the same as unit_oom, EXCEPT the empty list: for memory_high it is
+// a valid "0 units" measurement (observeMemHighUnits), not "not
+// found" — the former master asymmetry.
 func (a *Alerts) newMemHighMachine() *alertMachine[[]UnitEvents] {
 	return &alertMachine[[]UnitEvents]{
 		name:  AlertMemHigh,
@@ -1663,17 +1663,17 @@ func (a *Alerts) newMemHighMachine() *alertMachine[[]UnitEvents] {
 	}
 }
 
-// observeDead — глубина q:dead (T-154): карантин без потребителей
-// (ручной разбор, ТЗ 4.2), Len читает XLEN, покидают записи карантин
-// только разбором оператора (XTRIM/runbooks §2) — глубина и есть
-// «неразобранный остаток». Источник — тот же Redis, что у алерта
-// очередей (StreamLener); сверка темпа смертей — счётчик
-// crawler_queue_dead_buried_total (T-154) объясняет, откуда сток.
-// Устойчивость (серия проходов, удержание любой ненулевой глубиной,
-// снятие пустым карантином) — track машины; отдельный контроль роста
-// не нужен: рост — частный случай устойчивой ненулёвости, а
-// дифференциация «растёт/стоит» дребезжала бы на подвижном XTRIM
-// разбора.
+// observeDead — the q:dead depth (T-154): a quarantine without consumers
+// (manual triage, spec 4.2); Len reads XLEN; entries leave the quarantine
+// only by operator triage (XTRIM/runbooks §2) — the depth is exactly the
+// "untriaged remainder". The source is the same Redis as the queue
+// alert (StreamLener); the death rate cross-check — the counter
+// crawler_queue_dead_buried_total (T-154) explains where the sink is.
+// Persistence (a series of passes, holding by any non-zero depth,
+// clearing by an empty quarantine) — the machine track; a separate growth check
+// is not needed: growth is a special case of sustained non-zero, and
+// a "growing/stalled" differentiation would flap on the moving XTRIM
+// of triage.
 func (a *Alerts) observeDead(ctx context.Context) observation[int64] {
 	if a.deps.Redis == nil {
 		return observation[int64]{reason: "Redis не задан"}
@@ -1685,11 +1685,11 @@ func (a *Alerts) observeDead(ctx context.Context) observation[int64] {
 	return observation[int64]{value: n}
 }
 
-// newDeadMachine — машина queue_dead: срабатывание на AlertDeadMinPasses
-// проходе с ненулевой глубиной («устойчиво ненулевой», а не «любая
-// смерть»: карантин не опустошается сам, но окно несопоставимо с
-// инцидентным масштабом пост-мортема §11.1 — сигнал опаздывает максимум
-// на один проход), удержание любой ненулевой глубиной, снятие пустым
+// newDeadMachine — the queue_dead machine: firing on the AlertDeadMinPasses
+// pass with a non-zero depth ("persistently non-zero", not "any
+// death": the quarantine does not empty itself, but the window is incommensurate with
+// the incident scale of post-mortem §11.1 — the signal is late by at most
+// one pass), holding by any non-zero depth, clearing by an empty
 // q:dead.
 func (a *Alerts) newDeadMachine() *alertMachine[int64] {
 	return &alertMachine[int64]{
@@ -1699,13 +1699,13 @@ func (a *Alerts) newDeadMachine() *alertMachine[int64] {
 	}
 }
 
-// observeQueueFreeze — группы рабочих стримов (T-162):
-// last-delivered-id и глубина групп потребления (источник
-// StreamGroupsSource). Согласовано с BackpressureGate.Len о глубине
-// (кламп T-168 в источнике): застрявший фантомный лаг инцидента
-// 22–23.10 сам по себе не «глубина», но замороженные доставки там были
-// — алерт ловит и этот класс простоев. Окно неподвижности — track
-// машины.
+// observeQueueFreeze — the groups of the working streams (T-162):
+// the last-delivered-id and the depth of the consumer groups (the source
+// StreamGroupsSource). Consistent with BackpressureGate.Len on the depth
+// (the T-168 clamp in the source): the stuck phantom lag of the incident
+// of Oct 22–23 is not "depth" by itself, but frozen deliveries were there
+// — the alert catches this downtime class too. The immobility window — the
+// machine track.
 func (a *Alerts) observeQueueFreeze(ctx context.Context) observation[[]StreamGroupState] {
 	if a.deps.StreamGroups == nil {
 		return observation[[]StreamGroupState]{reason: "источник не задан"}
@@ -1717,14 +1717,14 @@ func (a *Alerts) observeQueueFreeze(ctx context.Context) observation[[]StreamGro
 	return observation[[]StreamGroupState]{value: groups}
 }
 
-// newQueueFreezeMachine — машина queue_frozen: окно неподвижности
-// last-delivered-id группы при глубине > 0 (QueueFreeze — 15 мин:
-// живой потребитель двигает ID каждым XREADGROUP, пачки в секунды —
-// ТЗ 3.3; короче — ложные срабатывания на паузах между пачками,
-// длиннее — теряется половина шага «перезапусти потребителя и посмотри
-// логи»). Снятие — первый проход, где ни одна группа не заморожена
-// (глубина ушла в ноль или доставки пошли): гистерезис не нужен, окно
-// — естественный фильтр дребезга.
+// newQueueFreezeMachine — the queue_frozen machine: the immobility window
+// of the group's last-delivered-id at depth > 0 (QueueFreeze — 15 min:
+// a live consumer moves the ID with every XREADGROUP, batches in seconds —
+// spec 3.3; shorter — false firings on the pauses between batches,
+// longer — half of the step "restart the consumer and look at the
+// logs" is lost). Clearing — the first pass where no group is frozen
+// (the depth went to zero or deliveries resumed): no hysteresis needed; the window
+// is the natural flap filter.
 func (a *Alerts) newQueueFreezeMachine() *alertMachine[[]StreamGroupState] {
 	return &alertMachine[[]StreamGroupState]{
 		name:  AlertQueueFreeze,
@@ -1733,14 +1733,14 @@ func (a *Alerts) newQueueFreezeMachine() *alertMachine[[]StreamGroupState] {
 	}
 }
 
-// observeRedisMemory — доля памяти Redis used_memory/maxmemory из INFO
-// memory (T-154): при noeviction (политика бюджета ТЗ 3.2) заполнение
-// maxmemory — отказ записи XADD: прямого счётчика отказов INFO не
-// отдаёт, доля — прокси-метрика с запасом на буферы/фрагментацию
-// (инцидент 22.10: OOM-отказы публикаций при 620 из 900 МиБ).
-// maxmemory 0 (без потолка) — «не измеряется»: отношение не определено,
-// отказов записи по maxmemory не бывает. Гистерезис 80 %/75 % — track
-// машины.
+// observeRedisMemory — the Redis memory share used_memory/maxmemory from INFO
+// memory (T-154): with noeviction (the budget policy of spec 3.2) filling
+// maxmemory is an XADD write refusal: INFO does not expose a direct refusal
+// counter; the share is a proxy metric with headroom for buffers/fragmentation
+// (the incident of Oct 22: OOM publication refusals at 620 of 900 MiB).
+// maxmemory 0 (no cap) — "not measured": the ratio is undefined,
+// there are no maxmemory write refusals. The 80%/75% hysteresis — the
+// machine track.
 func (a *Alerts) observeRedisMemory(ctx context.Context) observation[RedisMemory] {
 	if a.deps.RedisMemory == nil {
 		return observation[RedisMemory]{reason: "источник не задан"}
@@ -1757,12 +1757,12 @@ func (a *Alerts) observeRedisMemory(ctx context.Context) observation[RedisMemory
 	return observation[RedisMemory]{value: m}
 }
 
-// newRedisMemoryMachine — машина redis_memory: гистерезис доли
-// used/max (включение AlertRedisMemFireRatio 80 % — 20 % запаса на
-// межобрезочные остатки TrimLoop, фрагментацию и буферы клиентов;
-// удержание сработавшего до AlertRedisMemRecoverRatio 75 % — память
-// ползёт и падает резко после XTRIM, доля в коридоре не дребезжала бы
-// Warn у порога).
+// newRedisMemoryMachine — the redis_memory machine: the hysteresis of the
+// used/max share (firing AlertRedisMemFireRatio 80% — a 20% headroom for
+// the between-trims remainders of TrimLoop, fragmentation and client buffers;
+// holding the fired state until AlertRedisMemRecoverRatio 75% — memory
+// creeps and drops abruptly after XTRIM; a share in the corridor would not flap the
+// Warn at the threshold).
 func (a *Alerts) newRedisMemoryMachine() *alertMachine[RedisMemory] {
 	share := func(m RedisMemory) float64 { return float64(m.UsedBytes) / float64(m.MaxBytes) }
 	detail := func(m RedisMemory) string {
@@ -1783,9 +1783,9 @@ func (a *Alerts) newRedisMemoryMachine() *alertMachine[RedisMemory] {
 	}
 }
 
-// observeRedisUptime — аптайм Redis (INFO server, T-270): уровень,
-// монотонно растущий от запуска; рестарт обнуляет — окно «меньше N мин»
-// ловит событие без памяти машины.
+// observeRedisUptime — the Redis uptime (INFO server, T-270): a level,
+// monotonically growing from the start; a restart resets it — the "below N min" window
+// catches the event without machine memory.
 func (a *Alerts) observeRedisUptime(ctx context.Context) observation[int64] {
 	if a.deps.RedisUptime == nil {
 		return observation[int64]{reason: "источник не задан"}
@@ -1797,10 +1797,10 @@ func (a *Alerts) observeRedisUptime(ctx context.Context) observation[int64] {
 	return observation[int64]{value: up.Seconds}
 }
 
-// newRedisRestartMachine — машина redis_restart (T-270): порог уровня
-// uptime — меньше окна (рестарт «недавно»); снятие — сам выход из окна,
-// track-память не нужна (thresholdTrack: uptime монотонен между
-// рестартами, дребезг у порога исключён механикой источника).
+// newRedisRestartMachine — the redis_restart machine (T-270): a level threshold
+// of uptime — below the window (a "recent" restart); clearing — leaving the window
+// by itself, no track memory needed (thresholdTrack: uptime is monotonic between
+// restarts, flapping at the threshold is excluded by the source mechanics).
 func (a *Alerts) newRedisRestartMachine() *alertMachine[int64] {
 	window := int64(AlertRedisRestartWindow / time.Second)
 	uptime := func(v int64) string { return (time.Duration(v) * time.Second).Round(time.Second).String() }
@@ -1818,11 +1818,11 @@ func (a *Alerts) newRedisRestartMachine() *alertMachine[int64] {
 	}
 }
 
-// observePSI — давление CPU /proc/pressure/cpu (some avg10/60/300 —
-// метрика some: задержка хотя бы одной задачи, не full и не load
-// average: утилизация 100 % без очереди — норма CPU-bound конвейера).
-// Ядро без PSI — errNoPSI, тихая деградация (как SMART в контейнере);
-// окно устойчивости — track машины.
+// observePSI — the CPU pressure of /proc/pressure/cpu (some avg10/60/300 —
+// the some metric: the delay of at least one task, not full and not the load
+// average: 100% utilization without a queue is the norm for a CPU-bound pipeline).
+// A kernel without PSI — errNoPSI, a quiet degradation (like SMART in a container);
+// the persistence window — the machine track.
 func (a *Alerts) observePSI(ctx context.Context) observation[PSIStat] {
 	st, err := a.deps.PSI.PSI(ctx)
 	if err != nil {
@@ -1834,12 +1834,12 @@ func (a *Alerts) observePSI(ctx context.Context) observation[PSIStat] {
 	return observation[PSIStat]{value: st}
 }
 
-// newPSIMachine — машина psi_cpu: окно удержания avg300 выше порога
-// (PSICPUPercent 90 % — рабочий голод планировщика по замеру §12
-// 91–95 %, ниже — утилизация без очереди; PSIWindow 30 мин — avg300
-// сам сглаживает 5 минут, окно требует устойчивый голод, разовые
-// шпильки деплоя/ретро-пачек алертом не считаются; T-158 понизил вес
-// monitor'у — собственные проходы голод не приближают).
+// newPSIMachine — the psi_cpu machine: the window of holding avg300 above the threshold
+// (PSICPUPercent 90% — working scheduler starvation per measurement §12
+// 91–95%, below — utilization without a queue; PSIWindow 30 min — avg300
+// itself smooths over 5 minutes; the window demands sustained starvation, one-off
+// deploy/retro-batch spikes do not count as an alert; T-158 lowered the weight
+// for monitor — its own passes do not approach starvation).
 func (a *Alerts) newPSIMachine() *alertMachine[PSIStat] {
 	return &alertMachine[PSIStat]{
 		name:  AlertPSICPU,
@@ -1848,16 +1848,16 @@ func (a *Alerts) newPSIMachine() *alertMachine[PSIStat] {
 	}
 }
 
-// observeRenderDebt — снимок рендер-долга (T-175): флаги render_pending
-// (точечный Lookup счётчика crawler_counters) + лаг q:render (XLEN той
-// же семантики, что queue_overflow) — renderDebtOf: один снимок с
-// циклом gauge и строкой отчёта нагрузки (семантика не расходится).
-// Источники — те же пул БД и гейт глубин: ошибка любого — «не
-// измеряется» с Warn, память трекинга не трогается (восстановление
-// доедет по фактическому долгу). Отсутствие строки счётчика (миграция
-// не applied / ручная правка таблицы, runbooks §6) — ошибка с Warn,
-// а не тихий ноль: gauge долга не должен лгать. Порог/серия/защёлка —
-// track машины.
+// observeRenderDebt — the render debt snapshot (T-175): the render_pending flags
+// (a point Lookup of the crawler_counters counter) + the q:render lag (XLEN of the
+// same semantics as queue_overflow) — renderDebtOf: one snapshot with
+// the gauge loop and the load report row (the semantics do not diverge).
+// The sources are the same DB pool and depth gate: an error of either — "not
+// measured" with a Warn; the tracking memory is not touched (recovery
+// will arrive by the actual debt). A missing counter row (the migration
+// not applied / a manual table edit, runbooks §6) — an error with a Warn,
+// not a silent zero: the debt gauge must not lie. The threshold/series/latch —
+// the machine track.
 func (a *Alerts) observeRenderDebt(ctx context.Context) observation[RenderDebt] {
 	if a.deps.Redis == nil {
 		return observation[RenderDebt]{reason: "Redis не задан"}
@@ -1869,11 +1869,11 @@ func (a *Alerts) observeRenderDebt(ctx context.Context) observation[RenderDebt] 
 	return observation[RenderDebt]{value: d}
 }
 
-// newRenderDebtMachine — машина render_debt: защёлка уровня + серия
-// роста (RenderDebtDomains 50 тыс. — здоровый фон тысячи флагов,
-// алерт про накопление в масштабе суток дренажа; RenderDebtPasses 2 —
-// 10 мин непрерывного роста, разовый скачок разбирает проход
-// доработки). Спецификация переходов — alertstate.go (renderDebtTrack).
+// newRenderDebtMachine — the render_debt machine: a level latch + a series
+// of growth (RenderDebtDomains 50k — the healthy background is thousands of flags,
+// the alert is about accumulation at the scale of a drain day; RenderDebtPasses 2 —
+// 10 min of continuous growth, a one-off jump is resolved by a finishing
+// pass). The transition specification — alertstate.go (renderDebtTrack).
 func (a *Alerts) newRenderDebtMachine() *alertMachine[RenderDebt] {
 	return &alertMachine[RenderDebt]{
 		name:  AlertRenderDebt,
@@ -1882,18 +1882,18 @@ func (a *Alerts) newRenderDebtMachine() *alertMachine[RenderDebt] {
 	}
 }
 
-// observeRenderFallbackDepth — глубина q:render-fallback (T-246):
-// backlog группы потребления воркера B через тот же гейт, что у
-// алертов очередей. Метрика-зеркало сборки B
-// crawler_queue_depth{queue="q:render-fallback"} экспонируется самим
-// воркером и при его смерти ряда нет — инцидент «B стоит» виден только
-// прямое чтение Redis, поэтому источник здесь Redis, а не зонд метрик.
-// Порог — единый расчёт queue.StreamWatermark (для q:render-fallback
-// это не порог гейта — стрим воротами не ограничивается, ТЗ рендера
-// §4.3 п.3, — а порог наблюдения «глубина приближается к пределу
-// MAXLEN стрима»: 15 000, половина — 7 500 на дефолтных watermark
-// 100 тыс.); триггеры (серия роста ИЛИ стационарная глубина) и защёлка
-// — track машины.
+// observeRenderFallbackDepth — the q:render-fallback depth (T-246):
+// the backlog of worker B's consumer group via the same gate as the
+// queue alerts. The mirror metric of the B build
+// crawler_queue_depth{queue="q:render-fallback"} is exposed by the
+// worker itself and when it dies the series is gone — the incident "B is stalled" is seen only
+// by a direct Redis read, hence the source here is Redis, not a metrics probe.
+// The threshold — the single calculation of queue.StreamWatermark (for q:render-fallback
+// this is not a gate threshold — the stream is not capped by the gate, the render spec
+// §4.3 item 3 — but an observation threshold "the depth approaches the
+// MAXLEN limit of the stream": 15,000; half is 7,500 at the default watermark
+// of 100k); the triggers (a growth series OR a stationary depth) and the latch
+// — the machine track.
 func (a *Alerts) observeRenderFallbackDepth(ctx context.Context) observation[int64] {
 	if a.deps.Redis == nil {
 		return observation[int64]{reason: "Redis не задан"}
@@ -1910,13 +1910,13 @@ func (a *Alerts) observeRenderFallbackDepth(ctx context.Context) observation[int
 	return observation[int64]{value: n}
 }
 
-// newRenderFbDepthMachine — машина render_fallback_depth: защёлка
-// уровня с двумя триггерами — рост AlertRenderFallbackPasses проходов
-// подряд (механика render_debt) ИЛИ стационарная глубина над порогом
-// столько же проходов (S-P2-1: остановленный B, упор в MAXLEN или
-// эпизод, переживший рестарт монитора). Разовый всплеск публикаций —
-// штатная работа фолбэка «собрать и доработать» (ФТ-13), оператора не
-// будит. Спецификация переходов — alertstate.go (renderFbDepthTrack).
+// newRenderFbDepthMachine — the render_fallback_depth machine: a level
+// latch with two triggers — growth for AlertRenderFallbackPasses passes
+// in a row (the render_debt mechanics) OR a stationary depth above the threshold
+// for the same number of passes (S-P2-1: a stopped B, pinned at MAXLEN, or
+// an episode that survived a monitor restart). A one-off publication spike —
+// normal fallback operation of "collect and finish" (FR-13); it does not
+// wake the operator. The transition specification — alertstate.go (renderFbDepthTrack).
 func (a *Alerts) newRenderFbDepthMachine() *alertMachine[int64] {
 	wm := queue.StreamWatermark(a.opts.QueueWatermark, a.opts.QueueMaxLen, queue.StreamRenderFallback)
 	return &alertMachine[int64]{
@@ -1926,15 +1926,15 @@ func (a *Alerts) newRenderFbDepthMachine() *alertMachine[int64] {
 	}
 }
 
-// observeRenderFallbackBudget — счётчик событий приостановки бюджета
-// доли фолбэка crawler_render_fallback_suspended_total{reason="budget"}
-// (T-239, зонд /metrics рендер-воркера): событие, а не состояние — одно
-// защёлкивание приостановки одна точка счётчика, пока приостановка
-// держится, кандидаты фолбэка финализируются штатно (задачи не теряются,
-// ФТ-9). Пустой monitor.render_metrics_url — тихое «не измеряется»
-// (источник не подключён, стиль ingest-зонда); ошибка зонда (воркер
-// остановлен, метрики нет) — «не измеряется» с Warn: смерть самого
-// воркера видна по crawler_service_up. Окно событий — track машины.
+// observeRenderFallbackBudget — the counter of the fallback share budget
+// suspension events crawler_render_fallback_suspended_total{reason="budget"}
+// (T-239, the /metrics probe of the render worker): an event, not a state — one
+// suspension latching is one counter point; while the suspension
+// holds, fallback candidates finalize normally (tasks are not lost,
+// FR-9). An empty monitor.render_metrics_url — a quiet "not measured"
+// (the source not connected, the ingest probe style); a probe error (the worker
+// stopped, no metrics) — "not measured" with a Warn: the death of the
+// worker itself is seen via crawler_service_up. The events window — the machine track.
 func (a *Alerts) observeRenderFallbackBudget(ctx context.Context) observation[int64] {
 	if a.deps.FallbackBudget == nil {
 		return observation[int64]{
@@ -1948,18 +1948,18 @@ func (a *Alerts) observeRenderFallbackBudget(ctx context.Context) observation[in
 	return observation[int64]{value: cur}
 }
 
-// newRenderFbBudgetMachine — машина render_fallback_budget: кольцо
-// дельт событий за окно AlertFallbackBudgetWindow проходов (30 мин —
-// окно вмещает эпизод бюджетного окна T-239 и один рецидив), порог 1 —
-// каждое событие аномалия (в норме публикации укладываются в потолок
-// доли); снятие старением: пока приостановка держится, новых точек нет
-// — держит только окно, оператору виден fallback-рейт панели движков.
+// newRenderFbBudgetMachine — the render_fallback_budget machine: a
+// delta ring of events over the AlertFallbackBudgetWindow passes window (30 min —
+// the window fits an episode of the T-239 budget window and one recurrence), the threshold 1 —
+// every event is an anomaly (normally publications fit in the share
+// cap); clearing by aging: while the suspension holds there are no new points
+// — only the window keeps it; the operator sees the fallback rate on the engines dashboard.
 func (a *Alerts) newRenderFbBudgetMachine() *alertMachine[int64] {
 	return &alertMachine[int64]{
 		name: AlertRenderFbBudget,
 		track: ringTrack{
-			// Окно 6 проходов (не 15 окна мусорных хешей): ёмкость кольца
-			// задаётся здесь, push дефолта не знает.
+			// The window of 6 passes (not 15 like the junk hash window): the ring capacity
+			// is set here, the default push does not know it.
 			ring:      &deltaRing{size: AlertFallbackBudgetWindow},
 			threshold: 1,
 			passes:    AlertFallbackBudgetWindow,
@@ -1971,17 +1971,17 @@ func (a *Alerts) newRenderFbBudgetMachine() *alertMachine[int64] {
 	}
 }
 
-// observeRenderBrowserErrors — счётчик ошибок класса браузера этапа
-// рендера crawler_stage_errors_total{stage="render",type="browser"}
-// (S-P2-6) из зонда /metrics рендер-воркера (тот же адрес, что у зонда
-// бюджета). Семейство stage_errors ленивое: «серии нет» у рендер-воркера
-// — 0, не «не измеряется» (маркер crawler_stage_tasks_total{stage=
-// "render"}; как suspended после предсоздания T-250). Чужая экспозиция
-// (маркера нет) — тихое «не измеряется» без Warn: адрес
-// monitor.render_metrics_url настроен не на рендер-воркера —
-// конфигурационная проблема, зонд жив; сетевая ошибка зонда — «не
-// измеряется» с Warn, как у остальных зондов. Серия роста — track
-// машины.
+// observeRenderBrowserErrors — the counter of the browser-class errors of the
+// render stage crawler_stage_errors_total{stage="render",type="browser"}
+// (S-P2-6) from the /metrics probe of the render worker (the same address as the
+// budget probe). The stage_errors family is lazy: "no series" at the render worker
+// — 0, not "not measured" (the marker crawler_stage_tasks_total{stage=
+// "render"}; like suspended after the T-250 pre-creation). A foreign exposition
+// (no marker) — a quiet "not measured" without a Warn: the address
+// monitor.render_metrics_url is not configured to a render worker —
+// a configuration problem, the probe is alive; a network error of the probe — "not
+// measured" with a Warn, like the other probes. The growth series — the
+// machine track.
 func (a *Alerts) observeRenderBrowserErrors(ctx context.Context) observation[int64] {
 	if a.deps.RenderBrowserErrors == nil {
 		return observation[int64]{
@@ -2000,15 +2000,15 @@ func (a *Alerts) observeRenderBrowserErrors(ctx context.Context) observation[int
 	return observation[int64]{value: cur}
 }
 
-// newRenderBrowserErrMachine — машина render_browser_errors: серия
-// роста счётчика AlertRenderBrowserErrorsPasses проходов (10 мин):
-// разовая browser-ошибка — штатный перезапуск сессии/контекста (T-063)
-// и эпизод, разбираемый health-гейтом, серию не набирает; серия роста
-// — движок-кандидат (moli/lightpanda) завис или недоступен: гейт T-239
-// уже приостановил фолбэк-публикации, браузер-класс ждёт в redelivery
-// q:render — оператору нужен сигнал про сам движок. Событие гейта
-// остаётся счётчиком suspended{reason="gate"} и Warn-логом воркера:
-// детектор не дублирует защёлкивание, а видит первопричину.
+// newRenderBrowserErrMachine — the render_browser_errors machine: a
+// counter growth series for AlertRenderBrowserErrorsPasses passes (10 min):
+// a single browser error is a normal session/context restart (T-063)
+// and an episode resolved by the health gate; it does not build a series; a growth series
+// — the candidate engine (moli/lightpanda) is hung or unavailable: the gate of T-239
+// has already suspended fallback publications, the browser class waits in the redelivery
+// of q:render — the operator needs a signal about the engine itself. The gate event
+// remains the suspended{reason="gate"} counter and the worker's Warn log:
+// the detector does not duplicate the latching, it sees the root cause.
 func (a *Alerts) newRenderBrowserErrMachine() *alertMachine[int64] {
 	return &alertMachine[int64]{
 		name:  AlertRenderBrowserErr,
@@ -2017,20 +2017,20 @@ func (a *Alerts) newRenderBrowserErrMachine() *alertMachine[int64] {
 	}
 }
 
-// observeDomainsNewDoneStale — строка crawler_counters new_done_stale
-// (T-256, ФТ-2.2): домены «статус повис» (status = new ∧ check_state =
-// done ∧ last_checked_at старше суток; DNS-этап записал ветку «есть
-// адреса» — О6 общей таблицы статусов internal/model/enums.go, HTTP-итог
-// О7–О9 не пришёл: задача q:http потеряна). Значение
-// пишет FILTER-колонка f_new_done_stale прохода реконсиляции
-// (zonestats.go), алерт читает его точечным лукапом — seq scan по
-// domains не добавляет; updated_at — метка снапшота (серия растёт
-// только на НОВОМ снапшоте — track машины). Пустой результат (строки
-// нет до первого прохода реконсиляции — обе петли monitor стартуют
-// вместе, корректного «нет строки» не бывает) — тихое «не измеряется»;
-// ошибка чтения — Warn. Когорту лечит компенсатор T-270 (ранний recheck
-// Р15, stalerequeue.go — guard прохода читает ту же строку): алерт —
-// сигнал о новых потерях, уровень наблюдаем gauge'ом
+// observeDomainsNewDoneStale — the crawler_counters new_done_stale row
+// (T-256, FR-2.2): "status hung" domains (status = new ∧ check_state =
+// done ∧ last_checked_at older than a day; the DNS stage wrote the "has
+// addresses" branch — O6 of the shared status table internal/model/enums.go; the HTTP outcome
+// of O7–O9 never arrived: the q:http task is lost). The value
+// is written by the FILTER column f_new_done_stale of the reconciliation pass
+// (zonestats.go); the alert reads it with a point lookup — a seq scan over
+// domains adds nothing; updated_at — the snapshot stamp (the series grows
+// only on a NEW snapshot — the machine track). An empty result (no
+// row before the first reconciliation pass — both monitor loops start
+// together; a correct "no row" state does not exist) — a quiet "not measured";
+// a read error — a Warn. The cohort is treated by the T-270 compensator (the early recheck
+// of R15, stalerequeue.go — the guard of the pass reads the same row): the alert is
+// the signal about new losses; the level is observed by the gauge
 // crawler_domains_new_done_stale.
 func (a *Alerts) observeDomainsNewDoneStale(ctx context.Context) observation[staleRow] {
 	rows, err := a.deps.Pool.Query(ctx, newDoneStaleSQL)
@@ -2039,8 +2039,8 @@ func (a *Alerts) observeDomainsNewDoneStale(ctx context.Context) observation[sta
 	}
 	defer rows.Close()
 	if !rows.Next() {
-		// Обрыв соединения — не «строки нет»: сначала сбой чтения
-		// (стиль retryMatureCount).
+		// A dropped connection — not "no row": first a read failure
+		// (the retryMatureCount style).
 		if err := rows.Err(); err != nil {
 			return observation[staleRow]{err: fmt.Errorf("monitor: домены «статус повис»: %w", err)}
 		}
@@ -2059,10 +2059,10 @@ func (a *Alerts) observeDomainsNewDoneStale(ctx context.Context) observation[sta
 	return observation[staleRow]{value: staleRow{value: n, snap: snap}}
 }
 
-// newDomainsStaleMachine — машина domains_new_done_stale: серия НОВЫХ
-// ненулевых снапшотов реконсиляции (AlertNewDoneStalePasses — 2 × период
-// реконсиляции ≈ 1 ч устойчивого ненулевого значения; стационарно ноль
-// в норме — норма не будит вовсе).
+// newDomainsStaleMachine — the domains_new_done_stale machine: a series of NEW
+// non-zero reconciliation snapshots (AlertNewDoneStalePasses — 2 × the
+// reconciliation period ≈ 1h of sustained non-zero value; stationary
+// zero normally — the norm does not wake anyone at all).
 func (a *Alerts) newDomainsStaleMachine() *alertMachine[staleRow] {
 	return &alertMachine[staleRow]{
 		name:  AlertDomainsStale,
@@ -2071,11 +2071,11 @@ func (a *Alerts) newDomainsStaleMachine() *alertMachine[staleRow] {
 	}
 }
 
-// AlertsLoop — периодический цикл оценки алертов (стиль ZoneStatsLoop):
-// первый проход сразу при старте, далее по ticker. Ошибки источников —
-// Warn внутри прохода, цикл живёт (контракт OnRun, T-012): очередной
-// проход переоценит по живым данным. Отмена ctx — чистый nil (graceful
-// shutdown, ТЗ 3.4).
+// AlertsLoop — the periodic alert evaluation loop (the ZoneStatsLoop style):
+// the first pass right at start, then by ticker. Source errors —
+// a Warn inside the pass, the loop keeps living (the OnRun contract, T-012): the next
+// pass re-evaluates on live data. A ctx cancellation — a clean nil (graceful
+// shutdown, spec 3.4).
 func AlertsLoop(ctx context.Context, deps AlertsDeps, opts AlertsOptions) error {
 	if deps.Pool == nil {
 		return errors.New("monitor: алерты: пул БД не задан")
@@ -2098,8 +2098,8 @@ func AlertsLoop(ctx context.Context, deps AlertsDeps, opts AlertsOptions) error 
 	}
 }
 
-// alertBytes — человекочитаемый размер для деталей алертов (локальный
-// аналог content.humanBytes: пакет хранилища не тянется).
+// alertBytes — a human-readable size for alert details (a local
+// analog of content.humanBytes: the storage package is not pulled in).
 func alertBytes(n uint64) string {
 	switch {
 	case n >= 1<<30:

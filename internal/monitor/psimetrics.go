@@ -1,9 +1,9 @@
-// Метрики давления CPU по PSI (T-162): gauge
-// crawler_psi_cpu_some_percent{kind=avg10|avg60|avg300} — some-доля
-// времени задержки CPU из /proc/pressure/cpu, тот же проход, что питает
-// алерт psi_cpu. Обёртка источника PSISource, а не отдельный цикл:
-// чтение /proc дёшево, но точка одна — значения метрики и порог алерта
-// не расходятся (стиль UnitEventsMetrics, T-145).
+// CPU pressure metrics via PSI (T-162): gauge
+// crawler_psi_cpu_some_percent{kind=avg10|avg60|avg300} — the some share
+// of CPU stall time from /proc/pressure/cpu, the same pass that feeds
+// the psi_cpu alert. A PSISource wrapper, not a separate loop:
+// reading /proc is cheap, but the single point keeps the metric values
+// and the alert threshold from diverging (UnitEventsMetrics style, T-145).
 package monitor
 
 import (
@@ -14,27 +14,27 @@ import (
 	"crawler/internal/metrics"
 )
 
-// Значения метки kind метрики crawler_psi_cpu_some_percent.
+// Values of the kind label of the crawler_psi_cpu_some_percent metric.
 const (
 	psiKindAvg10  = "avg10"
 	psiKindAvg60  = "avg60"
 	psiKindAvg300 = "avg300"
 )
 
-// PSIMetrics — приборы PSI поверх другого PSISource (транзит + зеркало
-// в метрики).
+// PSIMetrics — PSI gauges on top of another PSISource (pass-through plus
+// mirroring into metrics).
 type PSIMetrics struct {
 	// gauge — crawler_psi_cpu_some_percent{kind}.
 	gauge *prometheus.GaugeVec
-	// src — исходный источник (обязателен).
+	// src — the underlying source (required).
 	src PSISource
 }
 
 // compile-time: PSIMetrics — PSISource.
 var _ PSISource = (*PSIMetrics)(nil)
 
-// NewPSIMetrics оборачивает src источником с метриками в reg; nil reg —
-// чистый транзит (стиль NewUnitEventsMetrics). Идемпотентен (T-076).
+// NewPSIMetrics wraps src in a metrics-reporting source in reg; nil reg —
+// pure pass-through (NewUnitEventsMetrics style). Idempotent (T-076).
 func NewPSIMetrics(reg *metrics.Registry, src PSISource) *PSIMetrics {
 	m := &PSIMetrics{src: src}
 	if reg == nil {
@@ -47,9 +47,9 @@ func NewPSIMetrics(reg *metrics.Registry, src PSISource) *PSIMetrics {
 	return m
 }
 
-// PSI читает исходный источник и зеркалит результат в метрики. Ошибка
-// источника метрики не трогает — держат последнее значение (hold-last,
-// стиль UnitEventsMetrics): сбой чтения не рвёт график.
+// PSI reads the underlying source and mirrors the result into metrics. A
+// source error leaves the metrics untouched — they keep the last value
+// (hold-last, UnitEventsMetrics style): a read failure does not break the graph.
 func (m *PSIMetrics) PSI(ctx context.Context) (PSIStat, error) {
 	st, err := m.src.PSI(ctx)
 	if err != nil {

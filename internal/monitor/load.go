@@ -1,38 +1,38 @@
-// Периодический отчёт системной нагрузки оператору (T-173, ТЗ 5.9): цикл
-// monitor.load_report_interval (по умолчанию 10 минут) собирает один
-// снимок из четырёх источников и доставляет его в Telegram (Notify-хук —
-// TelegramNotifier.Send, тот же бот и группа, что у алертов T-162) плюс
-// gauge Prometheus crawler_os_* (на проде скрейпера нет — приборы к
-// моменту его появления) и строку Info в журнал monitor.
+// The periodic system load report to the operator (T-173, spec 5.9): the
+// monitor.load_report_interval loop (10 minutes by default) collects one
+// snapshot from four sources and delivers it to Telegram (a Notify hook —
+// TelegramNotifier.Send, the same bot and group as the T-162 alerts) plus
+// the crawler_os_* Prometheus gauges (there is no scraper in production — the gauges are for
+// when it appears) and an Info line into the monitor journal.
 //
-// Состав снимка (волна оптимизации CPU/памяти T-158…T-172 — дневник
-// «до/после» каждого изменения без ручных замеров):
+// The snapshot composition (the CPU/memory optimization wave T-158…T-172 — a diary
+// of "before/after" for every change without manual measurements):
 //
-//   - система: load average, утилизация CPU за окно цикла (дельта тиков
-//     /proc/stat), PSI CPU/memory, /proc/meminfo (+swap);
-//   - топ процессов «htop»-вида: тики utime+stime и RSS каждого процесса
-//     /proc агрегируются по имени (comm) — 12 рендереров Chromium видны
-//     одной строкой «headless-shell», бэкенды PostgreSQL — «postgres»;
-//     CPU за окно — дельтой между проходами, в долях ядра (1.0 = ядро);
-//     имя, чьи процессы рестартовали за окно (сумма тиков упала),
-//     пропускается до следующего окна — тики имени немонотонны (T-189);
-//   - диск: statfs каталогов отчёта (контент-каталог — главный потребитель
-//     тома; SpaceChecker алертов disk_free_*, alerts.go);
-//   - очереди: глубина рабочих стримов — бэклог групп потребления
-//     (min(lag, XLEN) + pending, общий расчёт с гейтом — queue.GroupDepth;
-//     та же цифра у `crawlerctl status` и `crawler_queue_depth`, T-188;
-//     стрим без групп и карантин q:dead — XLEN) и темп потребления —
-//     дельта entries-read групп XINFO GROUPS (Redis 7+; ядро < 7 — темп
-//     «н/д», глубины честны) и рендер-долг одной строкой (T-175: флаги
-//     render_pending + лаг q:render, renderdebt.go).
+//   - system: load average, the CPU utilization over the loop window (a delta of
+//     /proc/stat ticks), PSI CPU/memory, /proc/meminfo (+swap);
+//   - the "htop-style" process top: the utime+stime ticks and the RSS of each
+//     /proc process are aggregated by name (comm) — 12 Chromium renderers are visible
+// as one "headless-shell" line, the PostgreSQL backends — "postgres";
+//     the CPU over the window — by the delta between passes, in core fractions (1.0 = a core);
+//     a name whose processes restarted over the window (the tick sum fell)
+//     is skipped until the next window — the name's ticks are non-monotonic (T-189);
+//   - disk: the statfs of the report directories (the content directory — the main consumer
+//     of the volume; the SpaceChecker of the disk_free_* alerts, alerts.go);
+//   - queues: the depth of the working streams — the backlog of the consumer groups
+//     (min(lag, XLEN) + pending, a shared calculation with the gate — queue.GroupDepth;
+//     the same figure as `crawlerctl status` and `crawler_queue_depth`, T-188;
+//     a stream without groups and the q:dead quarantine — XLEN) and the consumption rate —
+//     the delta of the entries-read of the XINFO GROUPS groups (Redis 7+; a core < 7 — the rate
+//     is "n/a", the depths are honest) and the render debt on one line (T-175: the
+//     render_pending flags + the q:render lag, renderdebt.go).
 //
-// Первый проход после старта — база: утилизация и темпы «н/д» (дельт
-// нет), размеры (RAM, диск, очереди, топ RSS) полноценны. Деградация
-// окружения — как у PSI (psi.go): нет /proc/pressure — теряется только
-// доля PSI; сломанные /proc/loadavg|meminfo — Warn прохода, цикл живёт;
-// недоступный Redis/диск — секция «н/д», остальные честны. Источники —
-// интерфейсы с подменяемым корнем /proc и фейками: юнит-тесты герметичны
-// (стиль OSPSI.Path, StreamGroupsSource).
+// The first pass after the start — the base: the utilization and rates are "n/a" (no
+// deltas); the sizes (RAM, disk, queues, the RSS top) are full. An environment
+// degradation — like PSI (psi.go): no /proc/pressure — only the PSI share is lost;
+// broken /proc/loadavg|meminfo — a Warn of the pass, the loop keeps living;
+// an unavailable Redis/disk — the section is "n/a", the others are honest. The sources are
+// interfaces with a substitutable /proc root and fakes: the unit tests are hermetic
+// (the OSPSI.Path, StreamGroupsSource style).
 package monitor
 
 import (
@@ -53,65 +53,65 @@ import (
 	"crawler/internal/queue"
 )
 
-// DefaultLoadReportInterval — период снимков нагрузки: 10 минут (T-173):
-// окно ловит эпизоды голода CPU/памяти (десятки минут — инцидент
-// 23–24.10), 144 сообщения/сутки не тонут алерты в группе оператора.
+// DefaultLoadReportInterval — the load snapshot period: 10 minutes (T-173):
+// the window catches CPU/memory starvation episodes (tens of minutes — the
+// incident of Oct 23–24); 144 messages/day do not drown the alerts in the operator's group.
 const DefaultLoadReportInterval = 10 * time.Minute
 
-// topProcs — сколько имён процессов в строках топа отчёта (CPU и RSS).
+// topProcs — how many process names in the report top lines (CPU and RSS).
 const topProcs = 4
 
-// minProcCPUShare — порог шума топа CPU: имена с долей ядра ниже не
-// поднимаются в строку отчёта (сотни спящих процессов ядра).
+// minProcCPUShare — the noise threshold of the CPU top: names with a core share below do
+// not rise into a report line (hundreds of sleeping kernel processes).
 const minProcCPUShare = 0.05
 
-// LoadStat — снимок системы и процессов одного прохода. Поля памяти —
-// байты; тики — единицы USER_HZ ядра (счётчики растут монотонно).
+// LoadStat — the snapshot of the system and processes of one pass. The memory fields are
+// bytes; the ticks — the kernel USER_HZ units (the counters grow monotonically).
 type LoadStat struct {
-	// Load1/Load5/Load15 — load average (работа + uninterruptible).
+	// Load1/Load5/Load15 — the load average (running + uninterruptible).
 	Load1  float64
 	Load5  float64
 	Load15 float64
-	// CPU — счётчики тиков агрегированной строки cpu /proc/stat и число
-	// логических ядер (строки cpuN).
+	// CPU — the tick counters of the aggregated cpu line of /proc/stat and the number
+	// of logical cores (the cpuN lines).
 	CPU CPUStat
-	// CPUPSI — давление CPU some (psi.go: avg10/60/300).
+	// CPUPSI — the CPU some pressure (psi.go: avg10/60/300).
 	CPUPSI PSIStat
-	// MemPSISome/MemPSIFull — давление памяти /proc/pressure/memory.
+	// MemPSISome/MemPSIFull — the memory pressure of /proc/pressure/memory.
 	MemPSISome PSIStat
 	MemPSIFull PSIStat
-	// PSIPresent — файлы /proc/pressure/* доступны: false — доли PSI в
-	// отчёте «н/д» (деградация как у алерта psi_cpu, T-162).
+	// PSIPresent — the /proc/pressure/* files are available: false — the PSI shares in
+	// the report are "n/a" (a degradation like the psi_cpu alert, T-162).
 	PSIPresent bool
-	// MemTotal, MemAvailable — /proc/meminfo, байты.
+	// MemTotal, MemAvailable — /proc/meminfo, bytes.
 	MemTotal     uint64
 	MemAvailable uint64
-	// SwapTotal, SwapFree — /proc/meminfo, байты (0/0 — без свопа).
+	// SwapTotal, SwapFree — /proc/meminfo, bytes (0/0 — without swap).
 	SwapTotal uint64
 	SwapFree  uint64
-	// Procs — процессы, агрегированные по comm (имя исполняемого):
-	// тики CPU (utime+stime) и суммарный RSS, байты. «htop-вид» отчёта.
+	// Procs — the processes aggregated by comm (the executable name):
+	// the CPU ticks (utime+stime) and the total RSS, bytes. The "htop view" of the report.
 	Procs map[string]ProcAgg
 }
 
-// ProcAgg — агрегат процессов одного имени (comm).
+// ProcAgg — the aggregate of the processes of one name (comm).
 type ProcAgg struct {
-	// Ticks — сумма тиков CPU (utime+stime) процессов имени.
+	// Ticks — the sum of the CPU ticks (utime+stime) of the name's processes.
 	Ticks uint64
-	// RSS — суммарный резидентный размер, байты. Общая память считается
-	// в каждом процессе (у 30 бэкендов postgres — разделяемые буферы
-	// тридцать раз): в отчёте рядом печатается Count, «сумма» читается
-	// с оговоркой; PSS недоступен — smaps_rollup чужих uid монитор
-	// (не-root) не читает.
+	// RSS — the total resident size, bytes. Shared memory is counted
+	// in every process (30 postgres backends count the shared buffers
+	// thirty times): the report prints Count next to it; the "sum" is read
+	// with a caveat; PSS is unavailable — monitor (non-root) does not read
+	// the smaps_rollup of foreign uids.
 	RSS uint64
-	// Count — процессы имени (для отчёта).
+	// Count — the processes of the name (for the report).
 	Count int
 }
 
-// CPUStat — счётчики тиков CPU (/proc/stat): busy-доля прохода считается
-// дельтой между снимками (Idle+Iowait — непроизводительные тики).
+// CPUStat — the CPU tick counters (/proc/stat): the busy share of a pass is
+// counted as the delta between snapshots (Idle+Iowait — unproductive ticks).
 type CPUStat struct {
-	User    uint64 // user (guest уже исключён ядром из user)
+	User    uint64 // user (guest is already excluded from user by the kernel)
 	Nice    uint64
 	System  uint64
 	Idle    uint64
@@ -119,52 +119,52 @@ type CPUStat struct {
 	Irq     uint64
 	Softirq uint64
 	Steal   uint64
-	Total   uint64 // сумма всех полей выше
-	Cores   int    // строки cpuN (логические ядра)
+	Total   uint64 // the sum of all the fields above
+	Cores   int    // the cpuN lines (logical cores)
 }
 
-// QueueStat — состояние одного рабочего стрима: глубина и потребление.
+// QueueStat — the state of one working stream: the depth and consumption.
 type QueueStat struct {
-	// Len — глубина стрима: бэклог групп потребления — Σ по группам
-	// (min(lag, XLEN) + pending), общий расчёт queue.GroupDepth — та же
-	// цифра, что у `crawlerctl status` и `crawler_queue_depth` (T-188);
-	// стрим без групп и карантин q:dead — XLEN. Сырой XLEN для рабочих
-	// стримов не печатается: подтверждённая история до обрезки XTRIM —
-	// не очередь (инцидент 25.10: q:render завышен в ~5 раз).
+	// Len — the stream depth: the backlog of the consumer groups — Σ over the groups
+	// (min(lag, XLEN) + pending), the shared queue.GroupDepth calculation — the
+	// same figure as `crawlerctl status` and `crawler_queue_depth` (T-188);
+	// a stream without groups and the q:dead quarantine — XLEN. The raw XLEN for
+	// working streams is not printed: the acknowledged history before the XTRIM —
+	// is not a queue (the incident of Oct 25: q:render overstated ~5×).
 	Len int64
-	// Read — доставки группы (entries-read XINFO GROUPS, максимум по
-	// группам): монотонный счётчик потребления для темпа отчёта;
-	// 0 — групп нет или Redis < 7 (поле отсутствует) — темп «н/д».
+	// Read — the group deliveries (entries-read of XINFO GROUPS, the maximum over
+	// the groups): a monotonic consumption counter for the report rate;
+	// 0 — no groups or Redis < 7 (the field is missing) — the rate is "n/a".
 	Read int64
 }
 
-// reportStreams — стримы очередей отчёта: все шесть, включая очередь
-// фолбэка рендера q:render-fallback (T-237, ФТ-6) и карантин q:dead
-// (его глубина — инвентарь оператора, ТЗ 4.2). Единый источник —
-// queue.AllStreams (S-P3-1), порядок — конвейер: q:dns → q:http →
+// reportStreams — the report queue streams: all six, including the render
+// fallback queue q:render-fallback (T-237, FR-6) and the q:dead quarantine
+// (its depth is the operator's inventory, spec 4.2). A single source —
+// queue.AllStreams (S-P3-1); the order — the pipeline: q:dns → q:http →
 // q:render → q:render-fallback → q:analyze → q:dead.
 var reportStreams = queue.AllStreams()
 
-// LoadSource — источник снимка системы и процессов; интерфейс для
-// подмены в юнит-тестах (реальное чтение — /proc хоста). Стиль PSISource.
+// LoadSource — the source of the system and process snapshot; an interface for
+// substitution in unit tests (the real read — the host /proc). The PSISource style.
 type LoadSource interface {
-	// Load возвращает снимок. Ошибка — «не измеряется» с причиной.
+	// Load returns the snapshot. An error — "not measured" with a reason.
 	Load(ctx context.Context) (LoadStat, error)
 }
 
-// OSLoad — LoadSource поверх /proc: Root — корень псевдофса ("" —
-// "/proc"); тесты подменяют временным каталогом с фикстурами (loadavg,
-// stat, meminfo, pressure/cpu, pressure/memory, PID-каталоги) — чтение
-// настоящего /proc в тестах негерметично (нагрузка хоста CI меняется
-// между запусками). Стиль OSPSI.Path.
+// OSLoad — a LoadSource on top of /proc: Root — the pseudo-fs root ("" —
+// "/proc"); the tests substitute a temporary directory with fixtures (loadavg,
+// stat, meminfo, pressure/cpu, pressure/memory, PID directories) — reading
+// the real /proc in tests is not hermetic (the CI host load changes
+// between runs). The OSPSI.Path style.
 type OSLoad struct {
 	Root string
 }
 
-// compile-time: OSLoad — LoadSource.
+// compile-time: OSLoad is a LoadSource.
 var _ LoadSource = OSLoad{}
 
-// Load снимает loadavg, счётчики CPU, PSI, память и процессы.
+// Load takes the loadavg, the CPU counters, PSI, memory and processes.
 func (s OSLoad) Load(ctx context.Context) (LoadStat, error) {
 	if err := ctx.Err(); err != nil {
 		return LoadStat{}, err
@@ -187,8 +187,8 @@ func (s OSLoad) Load(ctx context.Context) (LoadStat, error) {
 		return LoadStat{}, err
 	}
 
-	// PSI — опционально: ядро без CONFIG_PSI (errNoPSI у psi.go) теряет
-	// только долю давления, проход жив.
+	// PSI — optional: a kernel without CONFIG_PSI (errNoPSI at psi.go) loses
+	// only the pressure share; the pass lives.
 	if b, err := os.ReadFile(root + "/pressure/cpu"); err == nil {
 		if st.CPUPSI, err = parsePSI(string(b)); err != nil {
 			return LoadStat{}, fmt.Errorf("monitor: нагрузка: %w", err)
@@ -217,7 +217,7 @@ func (s OSLoad) Load(ctx context.Context) (LoadStat, error) {
 	return st, nil
 }
 
-// readLoadAvg разбирает /proc/loadavg: «24.82 21.96 20.67 3/943 1588621».
+// readLoadAvg parses /proc/loadavg: "24.82 21.96 20.67 3/943 1588621".
 func readLoadAvg(path string) (float64, float64, float64, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -238,10 +238,10 @@ func readLoadAvg(path string) (float64, float64, float64, error) {
 	return v[0], v[1], v[2], nil
 }
 
-// readCPUStat разбирает агрегированную строку cpu и считает строки cpuN
-// /proc/stat: «cpu  u n s idle iowait irq softirq steal …» (хвостовые
-// guest/guest_nice в user не входят — ядро их уже вычло; длина строки
-// между версиями ядра гуляет — отсутствующие поля читаются нулями).
+// readCPUStat parses the aggregated cpu line and counts the cpuN lines
+// of /proc/stat: "cpu  u n s idle iowait irq softirq steal …" (the trailing
+// guest/guest_nice are not included in user — the kernel has already subtracted them; the line
+// length wanders between kernel versions — missing fields are read as zeros).
 func readCPUStat(path string) (CPUStat, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -258,7 +258,7 @@ func readCPUStat(path string) (CPUStat, error) {
 			var c [8]uint64
 			for i, f := range fields[1:] {
 				if i >= len(c) {
-					break // guest-тики в busy-долю не входят
+					break // guest ticks are not included in the busy share
 				}
 				n, err := strconv.ParseUint(f, 10, 64)
 				if err != nil {
@@ -282,9 +282,9 @@ func readCPUStat(path string) (CPUStat, error) {
 	return st, nil
 }
 
-// readMemInfo разбирает /proc/meminfo: килобайты ядра (kB = 1024 Б) →
-// байты. MemTotal/MemAvailable обязательны; отсутствующий своп — не
-// ошибка: 0/0 (без свопа).
+// readMemInfo parses /proc/meminfo: kernel kilobytes (kB = 1024 B) →
+// bytes. MemTotal/MemAvailable are required; a missing swap is not
+// an error: 0/0 (no swap).
 func readMemInfo(path string) (total, available, swapTotal, swapFree uint64, err error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -304,8 +304,8 @@ func readMemInfo(path string) (total, available, swapTotal, swapFree uint64, err
 		if perr != nil {
 			return 0, 0, 0, 0, fmt.Errorf("monitor: нагрузка: meminfo: %q не число", f[0])
 		}
-		// Единица — всегда kB, множитель 1024; значения meminfo умещаются
-		// в uint64 без переполнения.
+		// The unit is always kB, the multiplier 1024; the meminfo values fit
+		// into uint64 without overflow.
 		fields[strings.TrimSpace(name)] = n * 1024
 	}
 	total, okT := fields["MemTotal"]
@@ -317,10 +317,10 @@ func readMemInfo(path string) (total, available, swapTotal, swapFree uint64, err
 	return total, available, swapTotal, swapFree, nil
 }
 
-// readProcs агрегирует процессы по comm: тики CPU (utime+stime из
-// /proc/PID/stat) и RSS (resident из /proc/PID/statm × размер страницы).
-// Исчезнувший между листингом и чтением процесс — пустой вклад (гонка
-// жизней процессов нормальна: соседние проходы дают цельные дельты).
+// readProcs aggregates the processes by comm: the CPU ticks (utime+stime from
+// /proc/PID/stat) and the RSS (resident from /proc/PID/statm × the page size).
+// A process that vanished between the listing and the read — an empty contribution
+// (the race of process lives is normal: adjacent passes give whole deltas).
 func readProcs(root string) (map[string]ProcAgg, error) {
 	entries, err := os.ReadDir(root)
 	if err != nil {
@@ -334,7 +334,7 @@ func readProcs(root string) (map[string]ProcAgg, error) {
 		}
 		name := e.Name()
 		if name[0] < '0' || name[0] > '9' {
-			continue // не PID-каталог
+			continue // not a PID directory
 		}
 		b, err := os.ReadFile(root + "/" + name + "/stat")
 		if err != nil {
@@ -357,12 +357,12 @@ func readProcs(root string) (map[string]ProcAgg, error) {
 	return procs, nil
 }
 
-// parseProcStatLine — comm и тики CPU (utime+stime) из строки
-// /proc/PID/stat. Имя заключено в скобки и может содержать пробелы и
-// скобки: comm — от ПЕРВОЙ «(» до ПОСЛЕДНЕЙ «)» (стандартный разбор
-// procfs), поля — после «)». Позиции полей после имени: 0 state …
-// 11 utime, 12 stime (man proc_pid_stat); короткая/кривая строка —
-// пустой вклад.
+// parseProcStatLine — the comm and the CPU ticks (utime+stime) from the
+// /proc/PID/stat line. The name is enclosed in parentheses and may contain spaces and
+// parentheses: comm — from the FIRST "(" to the LAST ")" (the standard
+// procfs parse); the fields — after ")". The field positions after the name: 0 state …
+// 11 utime, 12 stime (man proc_pid_stat); a short/corrupt line —
+// an empty contribution.
 func parseProcStatLine(b []byte) (string, uint64) {
 	s := string(b)
 	open := strings.IndexByte(s, '(')
@@ -383,9 +383,9 @@ func parseProcStatLine(b []byte) (string, uint64) {
 	return comm, utime + stime
 }
 
-// parseStatmRSS — резидентные страницы (второе поле statm, man
-// proc_pid_statm); кривая строка — 0 (RSS процесса неизвестен, тики
-// остаются честными).
+// parseStatmRSS — the resident pages (the second statm field, man
+// proc_pid_statm); a corrupt line — 0 (the process RSS unknown; the
+// ticks stay honest).
 func parseStatmRSS(b []byte) uint64 {
 	fields := strings.Fields(string(b))
 	if len(fields) < 2 {
@@ -398,39 +398,39 @@ func parseStatmRSS(b []byte) uint64 {
 	return n
 }
 
-// ---------------------------------------------------------------- очереди
+// ---------------------------------------------------------------- queues
 
-// QueueSource — источник состояния стримов очередей для отчёта;
-// интерфейс для подмены в юнит-тестах (реальное чтение — XLEN/XINFO
-// живого Redis). Стиль StreamGroupsSource.
+// QueueSource — the source of the queue stream states for the report;
+// an interface for substitution in unit tests (the real read — XLEN/XINFO
+// of the live Redis). The StreamGroupsSource style.
 type QueueSource interface {
-	// Queues возвращает снимок стримов отчёта (reportStreams): глубину
-	// (бэклог групп, T-188) и счётчик доставок. Ошибка — «не измеряется»
-	// с причиной.
+	// Queues returns the snapshot of the report streams (reportStreams): the depth
+	// (the group backlog, T-188) and the delivery counter. An error — "not measured"
+	// with a reason.
 	Queues(ctx context.Context) (map[string]QueueStat, error)
 }
 
-// RedisQueues — QueueSource поверх XLEN + XINFO GROUPS того же узкого
-// окна go-redis, что у групп алертов (redisGroupsCmd, streamgroups.go);
-// глубина — бэклог групп потребления (queue.GroupDepth, T-188).
+// RedisQueues — a QueueSource on top of XLEN + XINFO GROUPS of the same narrow
+// go-redis window as the alert groups (redisGroupsCmd, streamgroups.go);
+// the depth — the backlog of the consumer groups (queue.GroupDepth, T-188).
 type RedisQueues struct {
-	// RDB — клиент Redis; nil — ошибка источника.
+	// RDB — the Redis client; nil — a source error.
 	RDB redisGroupsCmd
 }
 
-// compile-time: RedisQueues — QueueSource.
+// compile-time: RedisQueues is a QueueSource.
 var _ QueueSource = RedisQueues{}
 
-// Queues обходит стримы отчёта. Стрим без ключа (очередь пуста отродясь)
-// — вклад {0, 0}: пустая очередь — честный нуль, а не отсутствие данных.
-// Глубина рабочего стрима с группами — сумма бэклогов его групп
-// (queue.GroupDepth — общий расчёт с гейтом, `crawlerctl status` и
-// `crawler_queue_depth`: отчёт не имеет права разойтись о том, есть ли
-// работа); стрим без групп и карантин q:dead (глубина — инвентарь
-// оператора, групп у карантина нет по построению) — XLEN. Групп
-// несколько быть может (консьюмеры раздельно) — счётчик доставок
-// берётся максимумом по группам: одна группа делит общий entries-read,
-// независимые группы читают стрим каждая со своей скоростью.
+// Queues walks the report streams. A stream without a key (a queue empty from birth)
+// — a contribution of {0, 0}: an empty queue is an honest zero, not missing data.
+// The depth of a working stream with groups — the sum of its groups' backlogs
+// (queue.GroupDepth — a shared calculation with the gate, `crawlerctl status` and
+// `crawler_queue_depth`: the report has no right to diverge on whether there is
+// work); a stream without groups and the q:dead quarantine (the depth is the
+// operator's inventory; the quarantine has no groups by construction) — XLEN. There
+// may be several groups (consumers separately) — the delivery counter
+// is taken as the maximum over the groups: one group divides the shared entries-read,
+// independent groups read the stream each at its own rate.
 func (s RedisQueues) Queues(ctx context.Context) (map[string]QueueStat, error) {
 	if s.RDB == nil {
 		return nil, errors.New("monitor: нагрузка: очереди: клиент Redis не задан")
@@ -439,8 +439,8 @@ func (s RedisQueues) Queues(ctx context.Context) (map[string]QueueStat, error) {
 	for _, stream := range reportStreams {
 		xlen, err := s.RDB.XLen(ctx, stream).Result()
 		if err != nil {
-			// Стрима нет — Redis отвечает «no such key» (та же ветка, что
-			// у BackpressureGate.Len и RedisStreamGroups).
+			// No stream — Redis answers "no such key" (the same branch as
+			// BackpressureGate.Len and RedisStreamGroups).
 			if errors.Is(err, redis.Nil) || strings.Contains(err.Error(), "no such key") {
 				out[stream] = QueueStat{}
 				continue
@@ -449,11 +449,11 @@ func (s RedisQueues) Queues(ctx context.Context) (map[string]QueueStat, error) {
 		}
 		groups, err := s.RDB.XInfoGroups(ctx, stream).Result()
 		if err != nil {
-			// Стрим исчез между XLEN и XINFO (DEL/обрезка в 0) — «no such
-			// key», как у гейта: групп нет. Иная ошибка роняет секцию:
-			// бэклог без состояний групп не считается, а сырой XLEN
-			// вместо него завышал бы глубину всей необрезанной историей
-			// стрима (расхождение 25.10, ТЗ §2).
+			// The stream vanished between XLEN and XINFO (DEL/a trim to 0) — "no such
+			// key", like the gate: no groups. A different error drops the section:
+			// a backlog without group states is not counted, and a raw XLEN
+			// instead of it would overstate the depth by the whole untrimmed
+			// stream history (the Oct 25 divergence, spec §2).
 			if errors.Is(err, redis.Nil) || strings.Contains(err.Error(), "no such key") {
 				groups = nil
 			} else {
@@ -477,9 +477,9 @@ func (s RedisQueues) Queues(ctx context.Context) (map[string]QueueStat, error) {
 	return out, nil
 }
 
-// ---------------------------------------------------------------- метрики
+// ---------------------------------------------------------------- metrics
 
-// Значения метки kind метрик нагрузки.
+// Values of the kind label of the load metrics.
 const (
 	osKindLoad1  = "1m"
 	osKindLoad5  = "5m"
@@ -498,11 +498,11 @@ const (
 	osKindSwapUsed  = "used"
 )
 
-// LoadMetrics — приборы снимка нагрузки (crawler_os_*): пишет успешный
-// проход цикла (hold-last не нужен — стиль psimetrics.go). Топ
-// процессов, диск и очереди gauge'ами не дублируются: их публикуют
-// свои контуры (crawler_queue_depth у воркеров, алерты disk_free_*),
-// либо они принадлежат только отчёту (процессы).
+// LoadMetrics — the load snapshot gauges (crawler_os_*): a successful pass writes
+// them (no hold-last needed — the psimetrics.go style). The process
+// top, disk and queues are not duplicated by gauges: their publishers are
+// their own circuits (crawler_queue_depth at the workers, the disk_free_* alerts),
+// or they belong only to the report (the processes).
 type LoadMetrics struct {
 	loadavg *prometheus.GaugeVec
 	cpu     *prometheus.GaugeVec
@@ -511,8 +511,8 @@ type LoadMetrics struct {
 	swap    *prometheus.GaugeVec
 }
 
-// NewLoadMetrics — приборы в реестре reg (nil — nil, цикл без метрик:
-// шов тестов, прецедент newCollectorMetrics).
+// NewLoadMetrics — the gauges in the reg registry (nil — nil, a loop without metrics:
+// the tests seam, the newCollectorMetrics precedent).
 func NewLoadMetrics(reg *metrics.Registry) *LoadMetrics {
 	if reg == nil {
 		return nil
@@ -541,8 +541,8 @@ func NewLoadMetrics(reg *metrics.Registry) *LoadMetrics {
 	}
 }
 
-// observe публикует снимок (утилизация — доли 0..1 или nil, когда дельты
-// ещё нет; nil-приёмник — no-op).
+// observe publishes the snapshot (the utilization — shares of 0..1 or nil while there is
+// no delta yet; a nil receiver — no-op).
 func (m *LoadMetrics) observe(st LoadStat, busy, user, sys, iowait *float64) {
 	if m == nil {
 		return
@@ -569,8 +569,8 @@ func (m *LoadMetrics) observe(st LoadStat, busy, user, sys, iowait *float64) {
 	m.swap.WithLabelValues(osKindSwapUsed).Set(float64(st.SwapTotal - st.SwapFree))
 }
 
-// cpuDelta — доли тиков между двумя снимками (0..1); ok=false — дельта
-// невозможна (первый проход или счётчики сброшены рестартом хоста).
+// cpuDelta — the tick shares between two snapshots (0..1); ok=false — the delta
+// is impossible (the first pass or the counters reset by a host restart).
 func cpuDelta(prev, cur CPUStat) (busy, user, sys, iowait float64, ok bool) {
 	d := cur.Total - prev.Total
 	if prev.Total == 0 || d == 0 {
@@ -587,63 +587,63 @@ func cpuDelta(prev, cur CPUStat) (busy, user, sys, iowait float64, ok bool) {
 	return busy, user, sys, iowait, true
 }
 
-// ---------------------------------------------------------------- цикл
+// ---------------------------------------------------------------- loop
 
-// LoadReportOptions — параметры цикла; Interval <= 0 выключает цикл
-// (в отличие от withDefaults-циклов мониторинга: у отчёта нет «верного»
-// периода — выбор оператора, конфиг monitor.load_report_interval).
+// LoadReportOptions — the loop parameters; Interval <= 0 turns the loop off
+// (unlike the withDefaults monitor loops: the report has no "right"
+// period — the operator's choice, the monitor.load_report_interval config).
 type LoadReportOptions struct {
-	// Interval — период снимков (DefaultLoadReportInterval).
+	// Interval — the snapshot period (DefaultLoadReportInterval).
 	Interval time.Duration
-	// Log — логгер цикла; nil — записи подавлены (slog.DiscardHandler).
+	// Log — the loop logger; nil — entries suppressed (slog.DiscardHandler).
 	Log *slog.Logger
-	// Metrics — реестр сервиса; nil — без метрик.
+	// Metrics — the service registry; nil — without metrics.
 	Metrics *metrics.Registry
-	// Notify — получатель отчёта оператором (Telegram-доставка T-162);
-	// nil — отчёт только в журнал. Вызывается в горутине прохода —
-	// обязан быть безопасен для конкурентного вызова (TelegramNotifier.Send).
+	// Notify — the report recipient for the operator (the Telegram delivery of T-162);
+	// nil — the report only into the journal. Called in the pass goroutine —
+	// it must be safe for a concurrent call (TelegramNotifier.Send).
 	Notify func(text string)
-	// Queues — источник состояния стримов; nil — секция очередей «н/д».
+	// Queues — the stream state source; nil — the queue section is "n/a".
 	Queues QueueSource
-	// RenderDebt — источник рендер-долга (renderdebt.go, T-175); строка
-	// долга в секции очередей; nil — строка «н/д».
+	// RenderDebt — the render debt source (renderdebt.go, T-175); the debt
+	// line in the queue section; nil — an "n/a" line.
 	RenderDebt RenderDebtSource
-	// Space — источник места каталогов (SpaceChecker алертов disk_free_*,
-	// alerts.go); nil — секция диска «н/д».
+	// Space — the directory space source (the SpaceChecker of the disk_free_*
+	// alerts, alerts.go); nil — the disk section is "n/a".
 	Space SpaceChecker
-	// Dirs — каталоги секции диска (обычно один — контент: главный
-	// потребитель тома; пусто при Space ≠ nil — секция пустая).
+	// Dirs — the disk section directories (usually one — content: the main
+	// volume consumer; empty at Space ≠ nil — an empty section).
 	Dirs []string
 }
 
-// loadPassState — дельта-база прохода: счётчики предыдущего снимка
-// (проходы последовательны в одной горутине — мьютекс не нужен).
+// loadPassState — the delta base of a pass: the counters of the previous snapshot
+// (the passes are sequential in one goroutine — no mutex needed).
 type loadPassState struct {
 	cpu     CPUStat
-	ticks   map[string]uint64 // comm → тики прошлого прохода
+	ticks   map[string]uint64 // comm → the ticks of the past pass
 	queues  map[string]QueueStat
-	at      time.Time // момент прошлого прохода (окно темпов)
-	started bool      // база снята (первый проход — темпы «н/д»)
+	at      time.Time // the moment of the past pass (the rate window)
+	started bool      // the base taken (the first pass — "n/a" rates)
 }
 
-// DiskLine — строка секции диска отчёта.
+// DiskLine — a line of the report disk section.
 type DiskLine struct {
 	Dir   string
 	Avail uint64
 	Total uint64
 }
 
-// LoadReportLoop — цикл отчётов нагрузки (T-173): проход сразу при
-// старте (свежий снимок после рестарта; дельты — «н/д») и далее по
-// ticker. Ошибка источника — Warn, цикл живёт (контракт OnRun, ТЗ 3.4):
-// очередной проход повторит; частичные сбои (Redis недоступен) роняют
-// только свою секцию. Возвращает nil по отмене ctx (graceful shutdown).
+// LoadReportLoop — the load report loop (T-173): a pass right at
+// start (a fresh snapshot after a restart; the deltas — "n/a") and then by
+// ticker. A source error — a Warn, the loop keeps living (the OnRun contract, spec 3.4):
+// the next pass will repeat; partial failures (Redis unavailable) drop
+// only their section. Returns nil on a ctx cancellation (graceful shutdown).
 func LoadReportLoop(ctx context.Context, src LoadSource, opts LoadReportOptions) error {
 	if src == nil {
 		return errors.New("monitor: отчёт нагрузки: источник не задан")
 	}
 	if opts.Interval <= 0 {
-		return nil // выключен конфигурацией (monitor.load_report_interval)
+		return nil // disabled by configuration (monitor.load_report_interval)
 	}
 	log := opts.Log
 	if log == nil {
@@ -667,29 +667,29 @@ func LoadReportLoop(ctx context.Context, src LoadSource, opts LoadReportOptions)
 			busyP, userP, sysP, ioP = &busy, &user, &sys, &io
 		}
 
-		// Топ процессов: доли ядра — дельта тиков имени к дельте одного
-		// ядра (delta_total/cores); сумма по именам ≈ busy × ядра.
-		// Рестарт/исчез процессов имени за окно (бой 25.10: postgres
-		// 18 → 16 процессов) роняет сумму тиков имени — вычитание
-		// uint64 андерфлоуится к ~2⁶⁴ и даёт мусорные «10¹⁴ ядер»:
-		// немонотонное имя честно пропускается за окно (ни нуля, ни
-		// мусора; новые имена идут с полной суммой — их тики начаты
-		// внутри окна).
+		// The process top: the core shares — the delta of the name's ticks to the delta of one
+		// core (delta_total/cores); the sum over the names ≈ busy × cores.
+		// A restart/disappearance of a name's processes over the window (production of Oct 25: postgres
+		// 18 → 16 processes) drops the name's tick sum — the uint64 subtraction
+		// underflows to ~2⁶⁴ and gives junk "10¹⁴ cores":
+		// the non-monotonic name is honestly skipped for the window (neither zero nor
+		// junk; new names come with the full sum — their ticks started
+		// inside the window).
 		procCPU := make(map[string]float64, len(st.Procs))
 		if d := st.CPU.Total - prev.cpu.Total; prev.started && d > 0 {
 			if perCore := float64(d) / float64(st.CPU.Cores); perCore > 0 {
 				for name, agg := range st.Procs {
 					if agg.Ticks <= prev.ticks[name] {
-						continue // рестарт/исчез процессов имени: окно пропущено
+						continue // a restart/disappearance of the name's processes: the window skipped
 					}
 					procCPU[name] = float64(agg.Ticks-prev.ticks[name]) / perCore
 				}
 			}
 		}
 
-		// Очереди: бэклог сейчас (RedisQueues), темпы — дельты доставок
-		// за окно; дельта бэклога ±N — рост/дренаж реальной очереди
-		// (необрезанная история стрима на ней не сказывается).
+		// The queues: the backlog now (RedisQueues); the rates — the delivery deltas
+		// over the window; a backlog delta of ±N — the growth/drain of the real queue
+		// (the untrimmed stream history does not affect it).
 		var queues map[string]QueueStat
 		var rates map[string]float64
 		if opts.Queues != nil {
@@ -711,9 +711,9 @@ func LoadReportLoop(ctx context.Context, src LoadSource, opts LoadReportOptions)
 			}
 		}
 
-		// Рендер-долг (T-175): флаги render_pending + лаг q:render —
-		// той же строкой, что сводка цикла и деталь алерта
-		// (renderDebtOf). Сбой источника роняет только строку («н/д»).
+		// The render debt (T-175): the render_pending flags + the q:render lag —
+		// the same line as the loop summary and the alert detail
+		// (renderDebtOf). A source failure drops only the line ("n/a").
 		var debt *RenderDebt
 		if opts.RenderDebt != nil {
 			if d, err := opts.RenderDebt.RenderDebt(ctx); err != nil {
@@ -725,7 +725,7 @@ func LoadReportLoop(ctx context.Context, src LoadSource, opts LoadReportOptions)
 			}
 		}
 
-		// Диск: statfs каталогов (SpaceChecker алертов).
+		// Disk: the statfs of the directories (the alerts' SpaceChecker).
 		var disks []DiskLine
 		if opts.Space != nil {
 			for _, dir := range opts.Dirs {
@@ -748,8 +748,8 @@ func LoadReportLoop(ctx context.Context, src LoadSource, opts LoadReportOptions)
 			opts.Notify(report)
 		}
 
-		// База следующего прохода — после успешного построения отчёта:
-		// сбойный проход дельты не сдвигает (окно темпов честно шире).
+		// The base of the next pass — after the successful report build:
+		// a failing pass does not shift the delta (the rate window is honestly wider).
 		ticks := make(map[string]uint64, len(st.Procs))
 		for name, agg := range st.Procs {
 			ticks[name] = agg.Ticks
@@ -770,11 +770,11 @@ func LoadReportLoop(ctx context.Context, src LoadSource, opts LoadReportOptions)
 	}
 }
 
-// formatLoadReport — компактный отчёт оператору (Telegram/журнал), до
-// шести строк: система, топ CPU, топ RSS, память, диск, очереди.
-// nil-доля утилизации и пустые карты — «н/д» секций. Гибибайты: meminfo
-// в кибибайтах, деление на 2³⁰ без «десятых гигабайта». Доля ядра
-// процессов: 1.0 = одно ядро целиком (масштаб htop).
+// formatLoadReport — a compact report for the operator (Telegram/journal), up
+// to six lines: the system, the CPU top, the RSS top, memory, disk, queues.
+// A nil utilization share and empty maps — "n/a" sections. Gibibytes: meminfo
+// is in kibibytes; division by 2³⁰ without "tenths of a gigabyte". The core
+// share of the processes: 1.0 = one core entirely (the htop scale).
 func formatLoadReport(st LoadStat, busy, iowait *float64, procCPU map[string]float64,
 	queues map[string]QueueStat, rates map[string]float64, prevStarted bool,
 	prevQueues map[string]QueueStat, disks []DiskLine, debt *RenderDebt) string {
@@ -811,9 +811,9 @@ func formatLoadReport(st LoadStat, busy, iowait *float64, procCPU map[string]flo
 			if i > 0 {
 				b.WriteString(", ")
 			}
-			// Сумма RSS c оговоркой: общие страницы считаются в каждом
-			// процессе — число процессов печатается рядом (у postgres
-			// и chromium их десятки), пик/process смотрится htop'ом.
+			// The RSS sum with a caveat: shared pages are counted in every
+			// process — the number of processes is printed next to it (postgres
+			// and chromium have dozens); the per-process peak is looked up with htop.
 			fmt.Fprintf(&b, "%s %s", it.name, fmtMem(uint64(it.value)))
 			if it.count > 1 {
 				fmt.Fprintf(&b, " (%d пр.)", it.count)
@@ -857,8 +857,8 @@ func formatLoadReport(st LoadStat, busy, iowait *float64, procCPU map[string]flo
 			}
 			first = false
 			fmt.Fprintf(&b, "%s %d", stream, q.Len)
-			// Динамика окна: ±глубина и темп доставок; первый проход —
-			// только размер (дельты нет).
+			// The window dynamics: the ±depth and the delivery rate; the first pass —
+			// only the size (no delta).
 			if p, ok := prevQueues[stream]; ok && prevStarted {
 				switch d := q.Len - p.Len; {
 				case d > 0:
@@ -875,11 +875,11 @@ func formatLoadReport(st LoadStat, busy, iowait *float64, procCPU map[string]flo
 			}
 		}
 	}
-	// Рендер-долг (T-175): работа, ждущая рендера, — флаги
-	// render_pending + непотреблённый остаток q:render. Строка печатается
-	// и при недоступных очередях (ревью T-175, P3-1: источник долга
-	// независим — очередь могла слечь, а долг измерен); «н/д» — когда
-	// источник долга сам недоступен/не задан.
+	// The render debt (T-175): the work waiting for a render — the render_pending
+	// flags + the unconsumed remainder of q:render. The line is printed
+	// even with unavailable queues (the T-175 review, P3-1: the debt source
+	// is independent — the queue could be down while the debt is measured); "n/a" — when
+	// the debt source itself is unavailable/not set.
 	if debt == nil {
 		b.WriteString("\n📬 Рендер-долг: н/д")
 	} else {
@@ -888,16 +888,16 @@ func formatLoadReport(st LoadStat, busy, iowait *float64, procCPU map[string]flo
 	return b.String()
 }
 
-// topItem — строка топа: value — доля ядра (CPU) или байты (память);
-// count — процессы имени (аннотация топа памяти).
+// topItem — a top line: value — a core share (CPU) or bytes (memory);
+// count — the processes of the name (the memory top annotation).
 type topItem struct {
 	name  string
 	value float64
 	count int
 }
 
-// topByCPU — topProcs имён по доле ядра, шум ниже minProcCPUShare не
-// поднимается.
+// topByCPU — topProcs names by core share; noise below minProcCPUShare does
+// not rise.
 func topByCPU(m map[string]float64) []topItem {
 	items := make([]topItem, 0, len(m))
 	for name, v := range m {
@@ -909,7 +909,7 @@ func topByCPU(m map[string]float64) []topItem {
 	return sortTop(items)
 }
 
-// topByRSS — topProcs имён по суммарному RSS (с числом процессов).
+// topByRSS — topProcs names by the total RSS (with the process count).
 func topByRSS(m map[string]ProcAgg) []topItem {
 	items := make([]topItem, 0, len(m))
 	for name, agg := range m {
@@ -921,8 +921,8 @@ func topByRSS(m map[string]ProcAgg) []topItem {
 	return sortTop(items)
 }
 
-// sortTop — значение по убыванию, имя — по возрастанию при равенстве
-// (детерминированный отчёт), срез до topProcs.
+// sortTop — the value descending, the name ascending at equality
+// (a deterministic report), sliced to topProcs.
 func sortTop(items []topItem) []topItem {
 	slices.SortFunc(items, func(a, b topItem) int {
 		if a.value != b.value {
@@ -939,13 +939,13 @@ func sortTop(items []topItem) []topItem {
 	return items
 }
 
-// gib/mib — байты в гиби-/мебибайты для отчёта.
+// gib/mib — bytes to gibi-/mebibytes for the report.
 func gib(b uint64) float64 { return float64(b) / (1 << 30) }
 func mib(b uint64) float64 { return float64(b) / (1 << 20) }
 
-// fmtMem — человекочитаемый размер для топа памяти: от 1 ГиБ — дробные
-// ГиБ, меньше — целые МиБ (процессы меньше гигабайта частыми «0.0ГиБ»
-// не мазать).
+// fmtMem — a human-readable size for the memory top: from 1 GiB — fractional
+// GiB; below — whole MiB (processes smaller than a gigabyte are not smeared
+// with frequent "0.0GiB").
 func fmtMem(b uint64) string {
 	if b >= 1<<30 {
 		return fmt.Sprintf("%.1fГиБ", gib(b))
@@ -953,7 +953,7 @@ func fmtMem(b uint64) string {
 	return fmt.Sprintf("%.0fМиБ", mib(b))
 }
 
-// round — округление к целому % (отчёт оператору, не метрика).
+// round — rounding to a whole % (a report to the operator, not a metric).
 func round(v float64) int {
 	if v < 0 {
 		return 0

@@ -1,12 +1,12 @@
-// Тесты автомата алертов (T-264, ТЗ tasks/TZ-fsm.md §3 ФТ-10): драйвер
-// перехода (единственная точка записи состояния) и табличные тесты
-// машин «последовательность наблюдений → последовательность статусов».
-// Последовательностные тесты остальных машин мигрированы на месте —
-// alerts_test.go / badhashes_test.go / fallbackalerts_test.go (ожидания
-// прежние); здесь — общие конструкторы наблюдений и покрытие машин без
-// собственного последовательностного теста (unit_oom). Источники
-// наблюдений (observe*-функции) и полный стек прохода покрываются
-// Pass-тестами тех же файлов.
+// The alert state machine tests (T-264, spec tasks/TZ-fsm.md §3 FR-10): the driver
+// of the transition (the single state-writing point) and the table tests
+// of the machines "a sequence of observations → a sequence of statuses".
+// The sequential tests of the other machines were migrated in place —
+// alerts_test.go / badhashes_test.go / fallbackalerts_test.go (the
+// expectations are the same); here — the shared observation constructors and the coverage of machines without
+// their own sequential test (unit_oom). The observation
+// sources (the observe* functions) and the full pass stack are covered
+// by the Pass tests of the same files.
 package monitor
 
 import (
@@ -17,25 +17,25 @@ import (
 	"time"
 )
 
-// --- конструкторы наблюдений и прогон последовательностей ---------------------
+// --- observation constructors and sequence runs -------------------------------
 
-// obs — измерение (источник жив, наблюдение валидно).
+// obs — a measurement (the source is alive, the observation is valid).
 func obs[V any](v V) observation[V] {
 	return observation[V]{value: v}
 }
 
-// obsErr — ошибка источника (Warn каждого прохода).
+// obsErr — a source error (a Warn every pass).
 func obsErr[V any](err error) observation[V] {
 	return observation[V]{err: err}
 }
 
-// obsReason — тихая деградация «не измеряется» с причиной (без Warn).
+// obsReason — a quiet "not measured" degradation with a reason (without a Warn).
 func obsReason[V any](reason string) observation[V] {
 	return observation[V]{reason: reason}
 }
 
-// runSequence прогоняет последовательность наблюдений через машину и
-// возвращает последовательность статусов — формат табличных тестов ФТ-10.
+// runSequence runs a sequence of observations through the machine and
+// returns the sequence of statuses — the format of the FR-10 table tests.
 func runSequence[V any](a *Alerts, m *alertMachine[V], list ...observation[V]) []string {
 	out := make([]string, 0, len(list))
 	for _, o := range list {
@@ -44,7 +44,7 @@ func runSequence[V any](a *Alerts, m *alertMachine[V], list ...observation[V]) [
 	return out
 }
 
-// wantSequence сверяет последовательность статусов с ожидаемой.
+// wantSequence compares the sequence of statuses with the expected one.
 func wantSequence(t *testing.T, name string, got, want []string) {
 	t.Helper()
 	if len(got) != len(want) {
@@ -58,21 +58,21 @@ func wantSequence(t *testing.T, name string, got, want []string) {
 	}
 }
 
-// --- драйвер перехода ---------------------------------------------------------
+// --- the transition driver ----------------------------------------------------
 
-// TestAlertMachineTransition — единственная точка записи состояния
-// (инварианты И1/И2/И3 спецификации): ошибка источника — Warn и «не
-// измеряется» с причиной в detail, track-память не трогается (серия
-// переживает сбой); тихая причина — то же без Warn; отмена ctx — без
-// Warn (часть остановки); статус пишется только transition-ом и виден
-// следующему проходу (гистерезис/удержание читают его как prev).
+// TestAlertMachineTransition — the single state-writing point
+// (the invariants I1/I2/I3 of the specification): a source error — a Warn and "not
+// measured" with the reason in detail, the track memory untouched (the
+// series survives the failure); a quiet reason — the same without a Warn; a ctx cancellation — without
+// a Warn (part of the shutdown); the status is written only by transition and is visible
+// to the next pass (the hysteresis/hold read it as prev).
 func TestAlertMachineTransition(t *testing.T) {
 	env := newAlertsTestEnv(t, nil)
 	ctx := context.Background()
-	m := env.newDeadMachine() // серия: память видна в детали («N/3»)
+	m := env.newDeadMachine() // series: the memory is visible in the detail ("N/3")
 
-	// Ошибка источника: «не измеряется» с Warn; серия не сброшена —
-	// следующее живое наблюдение продолжает счёт (не «первое»).
+	// A source error: "not measured" with a Warn; the series is not reset —
+	// the next live observation continues the count (not "the first").
 	s := m.transition(env.Alerts, ctx, obs(int64(5)))
 	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "1/3") {
 		t.Fatalf("первое наблюдение: %s (%s), want ok с серией 1/3", s.Status, s.Detail)
@@ -91,11 +91,11 @@ func TestAlertMachineTransition(t *testing.T) {
 		t.Fatalf("после сбоя: %s (%s), want ok с серией 2/3 (память пережила деградацию)", s.Status, s.Detail)
 	}
 
-	// Тихая причина — «не измеряется» без Warn; серия, как и при
-	// ошибке, не сбрасывается (деградация память не трогает).
+	// A quiet reason — "not measured" without a Warn; the series, as with
+	// an error, is not reset (a degradation does not touch the memory).
 	env2 := newAlertsTestEnv(t, nil)
 	m2 := env2.newDeadMachine()
-	_ = m2.transition(env2.Alerts, ctx, obs(int64(5))) // серия 1/3
+	_ = m2.transition(env2.Alerts, ctx, obs(int64(5))) // series 1/3
 	before = env2.buf.String()
 	s = m2.transition(env2.Alerts, ctx, obsReason[int64]("Redis не задан"))
 	if s.Status != AlertStatusNotMeasured || !strings.Contains(s.Detail, "Redis не задан") {
@@ -109,7 +109,7 @@ func TestAlertMachineTransition(t *testing.T) {
 		t.Fatalf("после тихой причины: %s (%s), want ok с серией 2/3 (память пережила)", s.Status, s.Detail)
 	}
 
-	// Отмена ctx во время перехода — Warn подавлен (часть остановки).
+	// A ctx cancellation during the transition — the Warn is suppressed (part of the shutdown).
 	env3 := newAlertsTestEnv(t, nil)
 	m3 := env3.newDeadMachine()
 	cancelled, cancel := context.WithCancel(ctx)
@@ -120,8 +120,8 @@ func TestAlertMachineTransition(t *testing.T) {
 		t.Errorf("отмена ctx дала Warn:\n%s", env3.buf.String()[len(before):])
 	}
 
-	// Статус пишется переходом: prev следующего прохода — прошлый
-	// статус машины (удержание серии по prev = firing).
+	// The status is written by the transition: the next pass's prev is the past
+	// machine status (the series hold by prev = firing).
 	env4 := newAlertsTestEnv(t, nil)
 	m4 := env4.newDeadMachine()
 	got := runSequence(env4.Alerts, m4,
@@ -131,9 +131,9 @@ func TestAlertMachineTransition(t *testing.T) {
 	})
 }
 
-// TestAlertMachineUnitOOM — машина unit_oom (семья порога уровня, без
-// памяти): каждый вид события отдельно включает алерт, сработавший
-// держится до сброса счётчиков юнита, все нули — ok.
+// TestAlertMachineUnitOOM — the unit_oom machine (the level threshold family, without
+// memory): each kind of event alone fires the alert; the fired
+// state is held until the unit counters reset; all zeros — ok.
 func TestAlertMachineUnitOOM(t *testing.T) {
 	env := newAlertsTestEnv(t, nil)
 	m := env.newUnitOOMMachine()
@@ -163,8 +163,8 @@ func TestAlertMachineUnitOOM(t *testing.T) {
 			t.Errorf("%s: статус = %s (%s), want %s", c.name, s.Status, s.Detail, c.want)
 		}
 	}
-	// Деталь сработавшего называет каждый горячий юнит и его счётчики,
-	// здоровый не упомянут; деталь ok — число юнитов.
+	// The fired detail names every hot unit and its counters,
+	// the healthy one is not mentioned; the ok detail — the number of units.
 	env2 := newAlertsTestEnv(t, nil)
 	m2 := env2.newUnitOOMMachine()
 	s := m2.transition(env2.Alerts, context.Background(), obs(events[3].units))
@@ -183,25 +183,25 @@ func TestAlertMachineUnitOOM(t *testing.T) {
 	}
 }
 
-// TestAlertMachineClockUsesDriver — окна времени (psi/freeze) берут
-// «сейчас» из часов драйвера: между проходами двигаются только часы —
-// окно закрывается; часы стоят — удержание не растёт (проверка
-// прокидывания now из transition в decide).
+// TestAlertMachineClockUsesDriver — the time windows (psi/freeze) take
+// "now" from the driver's clock: only the clock moves between passes —
+// the window closes; the clock stands — the hold does not grow (a check
+// of passing now from transition into decide).
 func TestAlertMachineClockUsesDriver(t *testing.T) {
 	base := time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
 	over := obs(PSIStat{Avg10: 95, Avg60: 95, Avg300: 95})
 
-	// Часы драйвера двигаются на 31 мин между проходами — окно закрыто.
+	// The driver's clock moves 31 min between passes — the window closed.
 	now := base
 	moved := NewAlerts(AlertsDeps{}, AlertsOptions{Now: func() time.Time { return now }})
 	mMoved := moved.newPSIMachine()
-	_ = mMoved.transition(moved, context.Background(), over) // база окна в t0
+	_ = mMoved.transition(moved, context.Background(), over) // the window base at t0
 	now = base.Add(31 * time.Minute)
 	if s := mMoved.transition(moved, context.Background(), over); s.Status != AlertStatusFiring {
 		t.Errorf("часы +31м: %s (%s), want firing (окно закрыто по часам драйвера)", s.Status, s.Detail)
 	}
 
-	// Часы стоят — окно не тикает, удержание не растёт.
+	// The clock stands — the window does not tick, the hold does not grow.
 	still := base
 	fixed := NewAlerts(AlertsDeps{}, AlertsOptions{Now: func() time.Time { return still }})
 	mFixed := fixed.newPSIMachine()

@@ -1,11 +1,11 @@
-// Тесты триажа мутантов CI-прогона 09.11.2026 (половина A, score 0.758):
-// добивки покрытия load.go — точные значения парсеров /proc (все поля
-// CPU ненулевые — арифметика Total наблюдаема), границы условий
-// (len(fields), n < 0, индексы), деградации PSI по одному файлу, ошибки
-// источников с нулевыми значениями, метрики observe (gauge ×100),
-// точный текст отчёта, границы fmtMem/round/топов, источник очередей
-// на текстовой ошибке «no such key», вычислитель темпов и выключенный
-// интервал цикла. Живые /proc и Redis — вне юнит-тестов (герметичность).
+// The mutant triage tests of the CI run of Nov 09, 2026 (half A, score 0.758):
+// the finishing of the load.go coverage — exact /proc parser values (all
+// CPU fields non-zero — the Total arithmetic observable), condition
+// boundaries (len(fields), n < 0, indexes), PSI degradations per file, source
+// errors with zero values, the observe metrics (gauges ×100),
+// the exact report text, the fmtMem/round/top boundaries, the queue source
+// on the "no such key" text error, the rate calculator and the disabled
+// loop interval. Live /proc and Redis — outside the unit tests (hermeticity).
 package monitor
 
 import (
@@ -24,16 +24,16 @@ import (
 	"crawler/internal/queue"
 )
 
-// fullCPUFixtures — каталог фикстур, где ВСЕ восемь полей агрегированной
-// строки cpu ненулевые и различимые: арифметика st.Total и переносы
-// индексов c[i] наблюдаемы (нулевые поля фикстуры loadFixtures прятали
-// мутантов знака и индексов).
+// fullCPUFixtures — a fixture directory where ALL eight fields of the
+// aggregated cpu line are non-zero and distinguishable: the arithmetic of st.Total and the
+// index carries of c[i] are observable (the zero fields of the loadFixtures fixtures hid
+// the sign and index mutants).
 func fullCPUFixtures(t *testing.T) string {
 	t.Helper()
 	root := loadFixtures(t)
 	writeFix(t, root, "loadavg", "1.5 2.5 3.5 1/100 500\n")
 	writeFix(t, root, "stat",
-		"cpu  11 22 33 44 55 66 77 88 99 100\n"+ // 10 полей: guest-хвост обязан игнорироваться
+		"cpu  11 22 33 44 55 66 77 88 99 100\n"+ // 10 fields: the guest tail must be ignored
 			"cpu0 11 22 33 44 55 66 77 88\n"+
 			"cpu1 11 22 33 44 55 66 77 88\n")
 	writeFix(t, root, "meminfo",
@@ -44,8 +44,8 @@ func fullCPUFixtures(t *testing.T) string {
 	return root
 }
 
-// TestReadCPUStat_AllFieldsNonZero — Total — сумма всех восьми полей
-// (guest-хвост вне суммы), каждое поле читается своей позицией.
+// TestReadCPUStat_AllFieldsNonZero — Total is the sum of all eight fields
+// (the guest tail outside the sum); every field is read by its position.
 func TestReadCPUStat_AllFieldsNonZero(t *testing.T) {
 	st, err := readCPUStat(fullCPUFixtures(t) + "/stat")
 	if err != nil {
@@ -63,22 +63,22 @@ func TestReadCPUStat_AllFieldsNonZero(t *testing.T) {
 	}
 }
 
-// TestReadCPUStat_MissingAggLine — строки cpuN без агрегированной «cpu »:
-// Total 0 — ошибка (мутант ослабления первого дизъюнкта молчал бы).
+// TestReadCPUStat_MissingAggLine — cpuN lines without the aggregated "cpu ":
+// a Total of 0 — an error (a first-disjunct-weakening mutant would stay silent).
 func TestReadCPUStat_MissingAggLine(t *testing.T) {
 	root := fullCPUFixtures(t)
 	writeFix(t, root, "stat", "cpu0 11 22 33 44 55 66 77 88\n")
 	if _, err := readCPUStat(root + "/stat"); err == nil {
 		t.Error("нет строки cpu: хочу ошибку (Total 0)")
 	}
-	// Агрегированная строка без строк cpuN — тоже ошибка (Cores 0).
+	// An aggregated line without cpuN lines — also an error (Cores 0).
 	writeFix(t, root, "stat", "cpu  11 22 33 44 55 66 77 88\n")
 	if _, err := readCPUStat(root + "/stat"); err == nil {
 		t.Error("нет строк cpuN: хочу ошибку (Cores 0)")
 	}
 }
 
-// TestReadCPUStat_BrokenLines — короткая строка cpu и нечисловой тик.
+// TestReadCPUStat_BrokenLines — a short cpu line and a non-numeric tick.
 func TestReadCPUStat_BrokenLines(t *testing.T) {
 	root := fullCPUFixtures(t)
 	writeFix(t, root, "stat", "cpu  11 22 33\n"+"cpu0 1 1 1 1 1 1 1 1\n")
@@ -89,21 +89,21 @@ func TestReadCPUStat_BrokenLines(t *testing.T) {
 	if _, err := readCPUStat(root + "/stat"); err == nil {
 		t.Error("нечисловой тик: хочу ошибку")
 	}
-	// Тик 2^63 — законен для uint64 (мутант bitSize 63 обязан его принять).
+	// A tick of 2^63 is legal for uint64 (a bitSize 63 mutant must accept it).
 	writeFix(t, root, "stat", "cpu  9223372036854775808 22 33 44 55 66 77 88\n"+"cpu0 1 1 1 1 1 1 1 1\n")
 	if _, err := readCPUStat(root + "/stat"); err != nil {
 		t.Errorf("тик 2^63: %v (uint64 принимает)", err)
 	}
-	// Файл недоступен — ошибка с нулевой структурой (пин нулей).
+	// An unavailable file — an error with a zero structure (the zeros pin).
 	st, err := readCPUStat(root + "/нет")
 	if err == nil || st != (CPUStat{}) {
 		t.Errorf("нет файла: (%+v, %v), want нули и ошибка", st, err)
 	}
 }
 
-// TestReadLoadAvg_Boundaries — ровно три поля валидны (граница < 3),
-// два — ошибка; нулевая загрузка валидна, отрицательная — ошибка;
-// значения на ошибке — нули (пин).
+// TestReadLoadAvg_Boundaries — exactly three fields are valid (the < 3 boundary),
+// two — an error; a zero load is valid, a negative one — an error;
+// the values on error — zeros (a pin).
 func TestReadLoadAvg_Boundaries(t *testing.T) {
 	dir := t.TempDir()
 	file := dir + "/loadavg"
@@ -132,8 +132,8 @@ func TestReadLoadAvg_Boundaries(t *testing.T) {
 	}
 }
 
-// TestReadMemInfo_Boundaries — кривое значение и пустое поле значения —
-// ошибки; swap отсутствует — нули без ошибки; на ошибке — нули.
+// TestReadMemInfo_Boundaries — a corrupt value and an empty value field —
+// errors; a missing swap — zeros without an error; on error — zeros.
 func TestReadMemInfo_Boundaries(t *testing.T) {
 	dir := t.TempDir()
 	writeFix(t, dir, "meminfo", "MemTotal: 100 kB\nMemAvailable: x kB\n")
@@ -145,7 +145,7 @@ func TestReadMemInfo_Boundaries(t *testing.T) {
 	if _, _, _, _, err := readMemInfo(dir + "/meminfo"); err == nil {
 		t.Error("пустое значение: хочу ошибку (поле без числа)")
 	}
-	// kB → байты точно; без свопа — нули.
+	// kB → bytes exactly; without swap — zeros.
 	writeFix(t, dir, "meminfo", "MemTotal: 1 kB\nMemAvailable: 1 kB\n")
 	if tt, a, st, sf, err := readMemInfo(dir + "/meminfo"); err != nil ||
 		tt != 1024 || a != 1024 || st != 0 || sf != 0 {
@@ -153,11 +153,11 @@ func TestReadMemInfo_Boundaries(t *testing.T) {
 	}
 }
 
-// TestOSLoad_PSIDegradations — PSI присутствует, когда доступен хотя бы
-// один файл давления (каждое присваивание PSIPresent наблюдаемо).
+// TestOSLoad_PSIDegradations — PSI is present when at least one pressure
+// file is available (each PSIPresent assignment is observable).
 func TestOSLoad_PSIDegradations(t *testing.T) {
 	root := fullCPUFixtures(t)
-	// Только cpu-давление: файл памяти удалён.
+	// Only cpu pressure: the memory file removed.
 	if err := removeFix(root, "pressure/memory"); err != nil {
 		t.Fatal(err)
 	}
@@ -168,7 +168,7 @@ func TestOSLoad_PSIDegradations(t *testing.T) {
 	if !st.PSIPresent || st.CPUPSI.Avg10 != 91.59 {
 		t.Errorf("PSI cpu = present=%v %+v, want present и 91.59", st.PSIPresent, st.CPUPSI)
 	}
-	// Только память: cpu-файл удалён.
+	// Only memory: the cpu file removed.
 	root2 := fullCPUFixtures(t)
 	if err := removeFix(root2, "pressure/cpu"); err != nil {
 		t.Fatal(err)
@@ -180,7 +180,7 @@ func TestOSLoad_PSIDegradations(t *testing.T) {
 	if !st.PSIPresent || st.MemPSISome.Avg10 != 7.85 {
 		t.Errorf("PSI mem = present=%v some=%+v, want present и 7.85", st.PSIPresent, st.MemPSISome)
 	}
-	// Кривой cpu-файл — ошибка прохода (значения не молчат).
+	// A corrupt cpu file — a pass error (the values do not stay silent).
 	root3 := fullCPUFixtures(t)
 	writeFix(t, root3, "pressure/cpu", "some avg10=999 avg60=1 avg300=1 total=1\n")
 	if _, err := (OSLoad{Root: root3}).Load(context.Background()); err == nil {
@@ -193,14 +193,14 @@ func TestOSLoad_PSIDegradations(t *testing.T) {
 	}
 }
 
-// removeFix — удаление файла фикстуры (деградации PSI).
+// removeFix — the deletion of a fixture file (the PSI degradations).
 func removeFix(root, name string) error {
 	return os.Remove(root + "/" + name)
 }
 
-// TestOSLoad_MissingSources — обязательные источники: отсутствие
-// loadavg/stat/meminfo и провал процессов роняет проход (мутанты
-// вырезания return глотали бы ошибку и доходили до успеха).
+// TestOSLoad_MissingSources — the mandatory sources: a missing
+// loadavg/stat/meminfo and a process failure drop the pass (return-cut
+// mutants would swallow the error and reach success).
 func TestOSLoad_MissingSources(t *testing.T) {
 	for _, miss := range []string{"loadavg", "stat", "meminfo"} {
 		root := fullCPUFixtures(t)
@@ -213,24 +213,24 @@ func TestOSLoad_MissingSources(t *testing.T) {
 	}
 }
 
-// TestReadProcs_ContinueBoundaries — не-PID каталог и кривой stat между
-// валидными PID: continue пропускает только сбойный вклад, break не
-// должен обрывать обход (последующие PID агрегируются). Не-PID каталоги
-// с собственным stat-файлом («.cfg», «zzz») в агрегат не попадают.
+// TestReadProcs_ContinueBoundaries — a non-PID directory and a corrupt stat between
+// valid PIDs: continue skips only the failing contribution; break must
+// not cut the walk (the subsequent PIDs are aggregated). Non-PID directories
+// with their own stat file (".cfg", "zzz") do not enter the aggregate.
 func TestReadProcs_ContinueBoundaries(t *testing.T) {
 	root := fullCPUFixtures(t)
-	// Не-PID каталог в середине + PID без stat-файла + PID с кривым stat,
-	// затем два валидных: все валидные обязаны попасть в агрегат.
+	// A non-PID directory in the middle + a PID without a stat file + a PID with a corrupt stat,
+	// then two valid ones: all valid ones must enter the aggregate.
 	mkdirFixRaw(t, root, "zcfg")
-	mkdirFixRaw(t, root, "300") // пустой PID-каталог (stat нет)
+	mkdirFixRaw(t, root, "300") // an empty PID directory (no stat)
 	mkdirFix(t, root, "301", "(broken) no parens here", "1 1\n")
 	mkdirFix(t, root, "302", "(alpha) S 1 0 0 0 -1 0 0 0 0 0 7 3 0 0 20 0 1", "1000 500 200 10 0 400 0\n")
 	mkdirFix(t, root, "033", "(beta) S 1 0 0 0 -1 0 0 0 0 0 5 9 0 0 20 0 2", "2000 800 900 5 0 700 0\n")
-	// Не-PID каталоги с СОБСТВЕННЫМ stat (dir[0] вне '0'..'9' с обеих
-	// сторон границы): читаться не обязаны вовсе.
+	// Non-PID directories with their OWN stat (dir[0] outside '0'..'9' on both
+	// sides of the boundary): they need not be read at all.
 	mkdirFix(t, root, ".cfg", "(ghost) S 1 0 0 0 -1 0 0 0 0 0 1 1 0 0 20 0 3", "1 1\n")
 	mkdirFix(t, root, "zzz", "(spook) S 1 0 0 0 -1 0 0 0 0 0 1 1 0 0 20 0 4", "1 1\n")
-	// PID-каталоги с границами цифры: '9xx' и '0xx' — читаются.
+	// PID directories with digit boundaries: '9xx' and '0xx' — read.
 	mkdirFix(t, root, "9xx", "(nine) S 1 0 0 0 -1 0 0 0 0 0 2 2 0 0 20 0 5", "1 1\n")
 	procs, err := readProcs(root)
 	if err != nil {
@@ -252,7 +252,7 @@ func TestReadProcs_ContinueBoundaries(t *testing.T) {
 	}
 }
 
-// mkdirFixRaw — пустой каталог фикстуры (не-PID / PID без stat).
+// mkdirFixRaw — an empty fixture directory (non-PID / a PID without stat).
 func mkdirFixRaw(t *testing.T, root, name string) {
 	t.Helper()
 	if err := os.Mkdir(root+"/"+name, 0o755); err != nil {
@@ -260,27 +260,27 @@ func mkdirFixRaw(t *testing.T, root, name string) {
 	}
 }
 
-// TestParseProcStatLine_Boundaries — ровно 13 полей после имени,
-// имя в начале строки, close == open, пустое имя — пустой вклад.
+// TestParseProcStatLine_Boundaries — exactly 13 fields after the name,
+// the name at the start of the line, close == open, an empty name — an empty contribution.
 func TestParseProcStatLine_Boundaries(t *testing.T) {
-	// Ровно 13 полей: state + 12 (utime — 12-е, stime — 13-е) — валидно.
+	// Exactly 13 fields: state + 12 (utime — the 12th, stime — the 13th) — valid.
 	line := "7 (ok) R 1 2 3 4 5 6 7 8 9 10 3 4"
 	if comm, ticks := parseProcStatLine([]byte(line)); comm != "ok" || ticks != 7 {
 		t.Errorf("13 полей = %q %d, want ok и 7 (3+4)", comm, ticks)
 	}
-	// 12 полей — коротко.
+	// 12 fields — short.
 	if comm, ticks := parseProcStatLine([]byte("7 (short) R 1 2 3 4 5 6 7 8 9 10 3")); comm != "" || ticks != 0 {
 		t.Errorf("12 полей = %q %d, want пустой вклад", comm, ticks)
 	}
-	// Скобки встречной ориентации («)(») — пустой вклад.
+	// Counter-oriented parentheses (")(") — an empty contribution.
 	if comm, _ := parseProcStatLine([]byte("1 )( R 1 2 3 4 5 6 7 8 9 10 3 4")); comm != "" {
 		t.Errorf("встречные скобки = %q, want пустой вклад", comm)
 	}
-	// Пустое имя «()» — пустой вклад (и нулевые тики).
+	// An empty name "()" — an empty contribution (and zero ticks).
 	if comm, ticks := parseProcStatLine([]byte("1 () R 1 2 3 4 5 6 7 8 9 10 3 4")); comm != "" || ticks != 0 {
 		t.Errorf("пустое имя = (%q, %d), want пустой вклад с нулём", comm, ticks)
 	}
-	// Короткая/кривая строка — нулевые тики (пин значения на отказе).
+	// A short/corrupt line — zero ticks (the value pin on failure).
 	for _, bad := range []string{
 		"7 (short) R 1 2 3 4 5 6 7 8 9 10 3",
 		"1 )( R 1 2 3 4 5 6 7 8 9 10 3 4",
@@ -290,19 +290,19 @@ func TestParseProcStatLine_Boundaries(t *testing.T) {
 			t.Errorf("%q: тики = %d, want 0", bad, ticks)
 		}
 	}
-	// utime 2^63 — валиден для uint64 (мутант bitSize 63 обязан принять).
+	// utime of 2^63 — valid for uint64 (a bitSize 63 mutant must accept it).
 	if comm, ticks := parseProcStatLine([]byte(
 		"9 (huge) R 1 2 3 4 5 6 7 8 9 10 9223372036854775808 5")); comm != "huge" || ticks != 9223372036854775813 {
 		t.Errorf("utime 2^63 = (%q, %d), want huge и 2^63+5", comm, ticks)
 	}
-	// Нечисловые utime/stime — пустой вклад.
+	// Non-numeric utime/stime — an empty contribution.
 	if comm, _ := parseProcStatLine([]byte("1 (x) R 1 2 3 4 5 6 7 8 9 10 p q")); comm != "" {
 		t.Errorf("нечисловые тики = %q, want пустой вклад", comm)
 	}
 }
 
-// TestParseStatmRSS_Boundaries — резидент — ВТОРОЕ поле (не первое),
-// одно поле — ноль; значение 2^63 читается.
+// TestParseStatmRSS_Boundaries — resident is the SECOND field (not the first),
+// one field — zero; a value of 2^63 is read.
 func TestParseStatmRSS_Boundaries(t *testing.T) {
 	if got := parseStatmRSS([]byte("100 900 1 1 1 1 1\n")); got != 900 {
 		t.Errorf("resident = %d, want 900 (второе поле)", got)
@@ -318,8 +318,8 @@ func TestParseStatmRSS_Boundaries(t *testing.T) {
 	}
 }
 
-// TestCPUDelta_IowaitAndClamp — ненулевая дельта iowait (формула busy),
-// нулевая prev.Total+единичная дельта и отрицательный busy (кламп 0).
+// TestCPUDelta_IowaitAndClamp — a non-zero iowait delta (the busy formula),
+// a zero prev.Total + a unit delta and a negative busy (the clamp of 0).
 func TestCPUDelta_IowaitAndClamp(t *testing.T) {
 	prev := CPUStat{User: 1000, System: 500, Idle: 500, Iowait: 100, Total: 2100, Cores: 4}
 	cur := CPUStat{User: 1200, System: 700, Idle: 600, Iowait: 300, Total: 2800, Cores: 4}
@@ -328,19 +328,19 @@ func TestCPUDelta_IowaitAndClamp(t *testing.T) {
 		t.Fatal("дельта не посчитана")
 	}
 	// dTotal=700: user 200/700, sys 200/700, io 200/700, idle 100/700 →
-	// busy = 1 − 100/700 − 200/700 = 400/700 (сравнение с допуском —
-	//浮 порядок операций).
+	// busy = 1 − 100/700 − 200/700 = 400/700 (a comparison with a tolerance —
+	// because of the operation order).
 	const eps = 1e-12
 	if diff(busy, 400.0/700) > eps || diff(user, 200.0/700) > eps ||
 		diff(sys, 200.0/700) > eps || diff(io, 200.0/700) > eps {
 		t.Errorf("delta = busy %v user %v sys %v io %v", busy, user, sys, io)
 	}
-	// prev.Total = 1, d = 1 — дельта возможна (границы нулей).
+	// prev.Total = 1, d = 1 — a delta is possible (the zero boundaries).
 	_, _, _, _, ok = cpuDelta(CPUStat{Total: 1}, CPUStat{Total: 2})
 	if !ok {
 		t.Error("prev.Total=1, d=1: хочу ok (нулевые границы — только точные нули)")
 	}
-	// Отрицательный busy (idle-дельта больше тотала) — кламп нулём.
+	// A negative busy (the idle delta above the total) — clamped to zero.
 	busy, _, _, _, ok = cpuDelta(CPUStat{Total: 100}, CPUStat{Total: 200, Idle: 300})
 	if !ok {
 		t.Fatal("кламп: дельта посчитана")
@@ -348,7 +348,7 @@ func TestCPUDelta_IowaitAndClamp(t *testing.T) {
 	if busy != 0 {
 		t.Errorf("отрицательный busy не прижат: %v, want 0", busy)
 	}
-	// Нет дельты — нулевые значения (пин нулей на «не измеряется»).
+	// No delta — zero values (the zeros pin at "not measured").
 	if b, u2, s2, i2, ok := cpuDelta(cur, cur); ok || b != 0 || u2 != 0 || s2 != 0 || i2 != 0 {
 		t.Errorf("нулевая дельта = (%v/%v/%v/%v, %v), want нули", b, u2, s2, i2, ok)
 	}
@@ -357,7 +357,7 @@ func TestCPUDelta_IowaitAndClamp(t *testing.T) {
 	}
 }
 
-// diff — |a − b| для допусков сравнения дробей.
+// diff — |a − b| for the tolerances of fraction comparisons.
 func diff(a, b float64) float64 {
 	if a > b {
 		return a - b
@@ -365,8 +365,8 @@ func diff(a, b float64) float64 {
 	return b - a
 }
 
-// TestLoadMetricsObserve — все приборы получают точные значения:
-// loadavg ×3, cpu ×4 (доли ×100), PSI ×4, память ×3 (used = total −
+// TestLoadMetricsObserve — all gauges get exact values:
+// loadavg ×3, cpu ×4 (shares ×100), PSI ×4, memory ×3 (used = total −
 // available), swap ×2 (used = total − free).
 func TestLoadMetricsObserve(t *testing.T) {
 	reg := metrics.New("monitor")
@@ -420,8 +420,8 @@ func TestLoadMetricsObserve(t *testing.T) {
 	}
 }
 
-// TestLoadConsts — пины констант отчёта (период, размеры топа, порог
-// шума) и дефолт интервала.
+// TestLoadConsts — the pins of the report constants (the period, the top sizes, the noise
+// threshold) and the interval default.
 func TestLoadConsts(t *testing.T) {
 	if DefaultLoadReportInterval != 10*time.Minute {
 		t.Errorf("DefaultLoadReportInterval = %v, want 10m", DefaultLoadReportInterval)
@@ -434,9 +434,9 @@ func TestLoadConsts(t *testing.T) {
 	}
 }
 
-// TestFormatLoadReport_Exact — полный текст отчёта на компактном снимке:
-// любая правка формата (префиксы, разделители, проценты диска, дельты
-// очередей ±N и темп) наблюдаема сравнением целиком.
+// TestFormatLoadReport_Exact — the full report text on a compact snapshot:
+// any format edit (prefixes, separators, disk percentages, queue deltas
+// of ±N and the rate) is observable by a whole-string comparison.
 func TestFormatLoadReport_Exact(t *testing.T) {
 	st := LoadStat{
 		Load1: 24.82, Load5: 21.96, Load15: 20.67,
@@ -452,8 +452,8 @@ func TestFormatLoadReport_Exact(t *testing.T) {
 			"headless-shell": {RSS: 1 << 30, Count: 2},
 		},
 	}
-	// busy/io подобраны чувствительными к мутациям множителя (×99/×101
-	// меняют округление процента).
+	// busy/io are chosen sensitive to the multiplier mutations (×99/×101
+	// change the percentage rounding).
 	busy, io := 0.997, 0.996
 	procCPU := map[string]float64{"postgres": 1.4, "headless-shell": 0.05}
 	queues := map[string]QueueStat{
@@ -479,21 +479,21 @@ func TestFormatLoadReport_Exact(t *testing.T) {
 	}
 }
 
-// TestFormatLoadReport_EdgeSections — границы секций: темп 0 и < 1 не
-// печатаются, дельта ±0, диск с Total 0 (процент без деления на ноль),
-// топ памяти только из нулевых RSS — «н/д», prevQueues без
-// prevStarted — без дельт, ровно topProcs строк и порог шума по
-// значению (0.05 проходит, ниже — нет).
+// TestFormatLoadReport_EdgeSections — the section boundaries: a rate of 0 and < 1 are
+// not printed; a delta of ±0; a disk with Total 0 (a percentage without division by zero);
+// a memory top of only zero RSS — "n/a"; prevQueues without
+// prevStarted — without deltas; exactly topProcs lines and the noise threshold by
+// value (0.05 passes, below — no).
 func TestFormatLoadReport_EdgeSections(t *testing.T) {
 	st := LoadStat{
 		Load1: 1, Load5: 1, Load15: 1,
 		CPU:      CPUStat{Cores: 2},
 		MemTotal: 4 << 30, MemAvailable: 2 << 30,
-		Procs: map[string]ProcAgg{"ghost": {Count: 2}}, // RSS 0 — «н/д»
+		Procs: map[string]ProcAgg{"ghost": {Count: 2}}, // RSS 0 — "n/a"
 	}
 	queues := map[string]QueueStat{queue.StreamDNS: {Len: 5, Read: 10}}
-	// Темпы: нулевой (не печатается), дробный < 1 печатается — с дельтой
-	// ±0 (prevStarted=true, глубина не менялась).
+	// Rates: zero (not printed), a fractional < 1 is printed — with a delta
+	// of ±0 (prevStarted=true, the depth did not change).
 	rates := map[string]float64{queue.StreamDNS: 0}
 	prevQueues := map[string]QueueStat{queue.StreamDNS: {Len: 5}}
 	r := formatLoadReport(st, nil, nil, nil, queues, rates, true, prevQueues, nil, nil)
@@ -503,9 +503,9 @@ func TestFormatLoadReport_EdgeSections(t *testing.T) {
 	if strings.Contains(r, "/с") {
 		t.Errorf("нулевой темп напечатан:\n%s", r)
 	}
-	// Дробный темп 0.5 печатается; prevQueues без prevStarted — дельт нет
-	// (прямой вызов формулятора: в цикле пары всегда вместе, здесь
-	// разделяем).
+	// A fractional rate of 0.5 is printed; prevQueues without prevStarted — no deltas
+	// (a direct call of the formatter: in the loop the pair always goes together; here
+	// we separate them).
 	rates[queue.StreamDNS] = 0.5
 	r = formatLoadReport(st, nil, nil, nil, queues, rates, true, prevQueues, nil, nil)
 	if !strings.Contains(r, "q:dns 5 (±0, 0.5/с)") {
@@ -516,20 +516,20 @@ func TestFormatLoadReport_EdgeSections(t *testing.T) {
 		t.Errorf("дельта/темп без prevStarted напечатаны:\n%s", r)
 	}
 
-	// Диск с нулевым Total — процент 0 без паники.
+	// A disk with a zero Total — a percentage of 0 without a panic.
 	disks := []DiskLine{{Dir: "/x", Avail: 100, Total: 0}}
 	r = formatLoadReport(st, nil, nil, nil, nil, nil, false, nil, disks, nil)
 	if !strings.Contains(r, "📀 Диск /x: свободно 0 из 0 ГиБ (0%)") {
 		t.Errorf("диск с Total 0 = %q", r)
 	}
 
-	// Топ памяти из нулевых RSS — «н/д».
+	// A memory top of zero RSS — "n/a".
 	if !strings.Contains(r, "🧮 Топ память: н/д") {
 		t.Errorf("топ памяти без RSS не «н/д»:\n%s", r)
 	}
 
-	// Топ CPU: пять имён выше порога — печатаются ровно четыре
-	// (topProcs); имя ровно в пороге 0.05 проходит, ниже — нет.
+	// The CPU top: five names above the threshold — exactly four are
+	// printed (topProcs); a name exactly at the 0.05 threshold passes, below — no.
 	procCPU := map[string]float64{
 		"a": 2, "b": 1.7, "c": 1.3, "d": 0.9, "e": 0.7, "f": 0.05, "g": 0.04,
 	}
@@ -540,8 +540,8 @@ func TestFormatLoadReport_EdgeSections(t *testing.T) {
 	if strings.Contains(r, "g 0.0я") {
 		t.Errorf("шум ниже порога в топе:\n%s", r)
 	}
-	// Граница порога: имя ровно в 0.05 — проходит (мутант «≤» терял бы
-	// его), ниже порога — нет (два имени, топ не режет).
+	// The threshold boundary: a name exactly at 0.05 — passes (a "≤" mutant would
+	// lose it), below the threshold — no (two names, the top is not cut).
 	r = formatLoadReport(st, nil, nil,
 		map[string]float64{"f": 0.05, "g": 0.04}, nil, nil, false, nil, nil, nil)
 	if !strings.Contains(r, "🧮 Топ CPU: f 0.1я") {
@@ -552,20 +552,20 @@ func TestFormatLoadReport_EdgeSections(t *testing.T) {
 	}
 }
 
-// TestSortTopOrder — равные значения: порядок по имени возрастанию
-// (детерминизм), различные — по убыванию значения.
+// TestSortTopOrder — equal values: the order by name ascending
+// (determinism); different ones — by value descending.
 func TestSortTopOrder(t *testing.T) {
 	items := topByCPU(map[string]float64{"b": 1, "a": 1, "c": 2})
 	if len(items) != 3 || items[0].name != "c" || items[1].name != "a" || items[2].name != "b" {
 		t.Errorf("порядок = %+v, want c,a,b (значение ↓, имя ↑)", items)
 	}
-	// RSS = 1 байт — имя попадает в топ (граница нуля).
+	// RSS = 1 byte — the name enters the top (the zero boundary).
 	items = topByRSS(map[string]ProcAgg{"tiny": {RSS: 1, Count: 1}})
 	if len(items) != 1 || items[0].name != "tiny" {
 		t.Errorf("RSS 1 байт исчез из топа: %+v", items)
 	}
-	// Count = 1 — без суффикса процессов; Count = 2 — с ним (граница
-	// «> 1» наблюдается текстом топа памяти).
+	// Count = 1 — without the process suffix; Count = 2 — with it (the
+	// "> 1" boundary is observed by the memory top text).
 	st := LoadStat{Procs: map[string]ProcAgg{
 		"one": {RSS: 1 << 20, Count: 1},
 		"two": {RSS: 2 << 20, Count: 2},
@@ -576,7 +576,7 @@ func TestSortTopOrder(t *testing.T) {
 	}
 }
 
-// TestFmtMemAndRound — границы человекочитаемых размеров и округления.
+// TestFmtMemAndRound — the boundaries of the human-readable sizes and rounding.
 func TestFmtMemAndRound(t *testing.T) {
 	cases := map[uint64]string{
 		0:             "0МиБ",
@@ -600,9 +600,9 @@ func TestFmtMemAndRound(t *testing.T) {
 	}
 }
 
-// TestRedisQueues_TextNoSuchKey — текстовая ошибка «no such key» (не
-// redis.Nil — прокси/кластер) у XLEN и XINFO GROUPS читается отсутствием
-// стрима, секция жива.
+// TestRedisQueues_TextNoSuchKey — the "no such key" text error (not
+// redis.Nil — a proxy/cluster) at XLEN and XINFO GROUPS is read as a missing
+// stream; the section stays alive.
 func TestRedisQueues_TextNoSuchKey(t *testing.T) {
 	rdb := &fakeGroupsRedis{
 		groups:    map[string][]redis.XInfoGroup{},
@@ -617,9 +617,9 @@ func TestRedisQueues_TextNoSuchKey(t *testing.T) {
 	if q[queue.StreamDNS] != (QueueStat{}) {
 		t.Errorf("q:dns = %+v, want {0 0}", q[queue.StreamDNS])
 	}
-	// Полное вырезание ветки XLEN: оригинал глотает «no such key» и
-	// живёт ({0 0}); мутант дошёл бы до XINFO GROUPS с её полноценной
-	// ошибкой и ронял бы секцию — здесь обязана быть тишина.
+	// A full cut of the XLEN branch: the original swallows "no such key" and
+	// lives ({0 0}); a mutant would reach XINFO GROUPS with its full-fledged
+	// error and drop the section — silence is required here.
 	rdb2 := &fakeGroupsRedis{
 		groups:    map[string][]redis.XInfoGroup{},
 		xlen:      map[string]int64{queue.StreamDNS: 5},
@@ -635,8 +635,8 @@ func TestRedisQueues_TextNoSuchKey(t *testing.T) {
 	}
 }
 
-// TestRedisQueues_ReadEqualGroups — группы с равным entries-read:
-// максимум корректен и при равенстве (граница >).
+// TestRedisQueues_ReadEqualGroups — groups with equal entries-read:
+// the maximum is correct at equality too (the > boundary).
 func TestRedisQueues_ReadEqualGroups(t *testing.T) {
 	rdb := &fakeGroupsRedis{
 		groups: map[string][]redis.XInfoGroup{
@@ -656,9 +656,9 @@ func TestRedisQueues_ReadEqualGroups(t *testing.T) {
 	}
 }
 
-// TestLoadReportLoop_DisabledAndRates — интервал 0 выключает цикл без
-// снимков; темп доставок между проходами — дельта Read за окно (не
-// произведение и не сумма с прошлым).
+// TestLoadReportLoop_DisabledAndRates — an interval of 0 turns the loop off without
+// snapshots; the delivery rate between passes — the Read delta over the window (not
+// a product and not a sum with the past).
 func TestLoadReportLoop_DisabledAndRates(t *testing.T) {
 	src := &countingLoadSource{}
 	if err := LoadReportLoop(context.Background(), src, LoadReportOptions{Interval: 0}); err != nil {
@@ -668,9 +668,9 @@ func TestLoadReportLoop_DisabledAndRates(t *testing.T) {
 		t.Errorf("выключенный цикл: снимков = %d, want 0", src.count)
 	}
 
-	// Темп: базовый снимок + окно с дельтой доставок 100 при прошлом
-	// Read 5000 — печатается «N/с» порядка сотен (деление на окно ~20 мс;
-	// мутанты умножения/сления дают единицы либо сотни тысяч).
+	// The rate: a base snapshot + a window with a delivery delta of 100 at a past
+	// Read of 5000 — an "N/s" of the order of hundreds is printed (dividing by a window of ~20 ms;
+	// the multiplication/addition mutants give units or hundreds of thousands).
 	st := LoadStat{
 		Load1: 1, Load5: 1, Load15: 1, CPU: CPUStat{Total: 1_000_000, Cores: 4},
 		MemTotal: 8 << 30, MemAvailable: 4 << 30,
@@ -696,7 +696,7 @@ func TestLoadReportLoop_DisabledAndRates(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- LoadReportLoop(ctx, two, opts) }()
-	<-reports // база
+	<-reports // the base
 	var r string
 	select {
 	case r = <-reports:
@@ -717,7 +717,7 @@ func TestLoadReportLoop_DisabledAndRates(t *testing.T) {
 	if !strings.Contains(line, "/с") {
 		t.Fatalf("темп не напечатан: %q", line)
 	}
-	// Вытащить темп «N.N/с» из хвоста «q:dns 2 (+1, N.N/с)».
+	// Extract the "N.N/s" rate from the tail "q:dns 2 (+1, N.N/s)".
 	rate := 0.0
 	if i := strings.Index(line, "/с"); i >= 0 {
 		j := i
@@ -728,9 +728,9 @@ func TestLoadReportLoop_DisabledAndRates(t *testing.T) {
 			rate = v
 		}
 	}
-	// Окно — тикер 20 мс плюс джиттер: корректный темп 100/0.02..0.3 =
-	// 333..5000; мутанты: *window ≈ 100*0.02..0.3 = 2..30; +p.Read
-	// ≈ 10100/окно ≥ 33666. Коридор [150, 20000] разделяет их с запасом.
+	// The window — a 20 ms ticker plus jitter: a correct rate of 100/0.02..0.3 =
+	// 333..5000; the mutants: *window ≈ 100*0.02..0.3 = 2..30; +p.Read
+	// ≈ 10100/window ≥ 33666. The corridor [150, 20000] separates them with headroom.
 	if rate < 150 || rate > 20000 {
 		t.Errorf("темп доставок = %v (окно ~20мс, дельта 100), want 150..20000", rate)
 	}
@@ -739,9 +739,9 @@ func TestLoadReportLoop_DisabledAndRates(t *testing.T) {
 	}
 }
 
-// TestLoadReportLoop_TinyWindowTopCPU — окно тиков CPU в одну единицу:
-// доля ядра процесса всё равно считается (perCore 0.25 при 4 ядрах →
-// дельта 1 тик = 4 ядра — масштаб окна не гасит топ).
+// TestLoadReportLoop_TinyWindowTopCPU — a CPU tick window of one unit:
+// the process core share is computed anyway (perCore 0.25 at 4 cores →
+// a delta of 1 tick = 4 cores — the window scale does not mute the top).
 func TestLoadReportLoop_TinyWindowTopCPU(t *testing.T) {
 	base := LoadStat{
 		Load1: 1, Load5: 1, Load15: 1, CPU: CPUStat{Total: 100, Cores: 4},
@@ -762,7 +762,7 @@ func TestLoadReportLoop_TinyWindowTopCPU(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- LoadReportLoop(ctx, src, opts) }()
-	<-reports // база
+	<-reports // the base
 	var r string
 	select {
 	case r = <-reports:
@@ -774,25 +774,25 @@ func TestLoadReportLoop_TinyWindowTopCPU(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatalf("цикл: %v", err)
 	}
-	// Окно d=1, perCore=0.25: доля a = 1/0.25 = 4.0я.
+	// A window of d=1, perCore=0.25: a's share = 1/0.25 = 4.0 cores.
 	if want := "🧮 Топ CPU: a 4.0я"; !strings.Contains(r, want) {
 		t.Errorf("топ CPU окна в 1 тик = %q, want %q", topCPULine(r), want)
 	}
 }
 
-// TestLoadReportLoop_SourceErrorNoReport — сбой снимка системы роняет
-// проход ЦЕЛИКОМ: ни отчёта, ни базы дельт (мутант вырезания return
-// строил бы отчёт из нулевого снимка).
+// TestLoadReportLoop_SourceErrorNoReport — a system snapshot failure drops
+// the pass ENTIRELY: neither a report nor delta bases (a return-cut
+// mutant would build a report from a zero snapshot).
 func TestLoadReportLoop_SourceErrorNoReport(t *testing.T) {
 	st := LoadStat{
 		Load1: 1, Load5: 1, Load15: 1, CPU: CPUStat{Total: 1000, Cores: 1},
 		MemTotal: 1, MemAvailable: 1,
 		Procs: map[string]ProcAgg{"a": {Ticks: 10}},
 	}
-	// Первый проход — снимок, далее — стойкая ошибка источника.
+	// The first pass — a snapshot, then — a persistent source error.
 	src := &flakyLoadSource{first: st, err: errors.New("источник недоступен")}
-	// reports пишется из горутины цикла (Notify) и опрашивается здесь
-	// до остановки цикла — доступ только под мьютексом (race-detector).
+	// reports is written from the loop goroutine (Notify) and polled here
+	// until the loop stops — access only under a mutex (the race detector).
 	var mu sync.Mutex
 	var reports []string
 	opts := LoadReportOptions{
@@ -819,7 +819,7 @@ func TestLoadReportLoop_SourceErrorNoReport(t *testing.T) {
 		cancel()
 		t.Fatalf("отчётов = %d, want 1 (успешный старт)", n)
 	}
-	// Ждём пару ошибочных проходов и отменяем: новых отчётов нет.
+	// Wait for a couple of failing passes and cancel: no new reports.
 	time.Sleep(60 * time.Millisecond)
 	cancel()
 	if err := <-done; err != nil {
@@ -833,7 +833,7 @@ func TestLoadReportLoop_SourceErrorNoReport(t *testing.T) {
 	}
 }
 
-// flakyLoadSource — успешный первый снимок, затем стойкая ошибка.
+// flakyLoadSource — a successful first snapshot, then a persistent error.
 type flakyLoadSource struct {
 	first LoadStat
 	err   error
@@ -848,8 +848,8 @@ func (s *flakyLoadSource) Load(context.Context) (LoadStat, error) {
 	return s.first, nil
 }
 
-// TestLoadReportLoop_SpaceErrorNoDiskLine — сбой statfs каталога не
-// порождает строку диска с нулями (continue, не «0 из 0»).
+// TestLoadReportLoop_SpaceErrorNoDiskLine — a statfs failure of a directory does not
+// produce a disk line with zeros (continue, not "0 of 0").
 func TestLoadReportLoop_SpaceErrorNoDiskLine(t *testing.T) {
 	st := LoadStat{
 		Load1: 1, Load5: 1, Load15: 1, CPU: CPUStat{Cores: 1},
@@ -858,7 +858,7 @@ func TestLoadReportLoop_SpaceErrorNoDiskLine(t *testing.T) {
 	src := &fakeLoadSource{states: []LoadStat{st}}
 	var reports []string
 	opts := LoadReportOptions{
-		Interval: time.Hour, // единственный стартовый проход
+		Interval: time.Hour, // the only starting pass
 		Space:    fakeLoadSpace{err: errors.New("statfs: отказано")},
 		Dirs:     []string{"/var/lib/crawler/content"},
 		Notify:   func(text string) { reports = append(reports, text) },
@@ -886,7 +886,7 @@ func TestLoadReportLoop_SpaceErrorNoDiskLine(t *testing.T) {
 	}
 }
 
-// switchQueuesSource — QueueSource с очередью снимков по проходам.
+// switchQueuesSource — a QueueSource with a snapshot queue per pass.
 type switchQueuesSource struct {
 	passes []map[string]QueueStat
 	i      int
@@ -901,8 +901,8 @@ func (s *switchQueuesSource) Queues(context.Context) (map[string]QueueStat, erro
 	return q, nil
 }
 
-// countingLoadSource — LoadSource со счётчиком вызовов (выключенный
-// цикл не делает ни одного снимка).
+// countingLoadSource — a LoadSource with a call counter (a disabled
+// loop makes no snapshots at all).
 type countingLoadSource struct {
 	count int
 }
@@ -912,10 +912,10 @@ func (s *countingLoadSource) Load(context.Context) (LoadStat, error) {
 	return LoadStat{}, nil
 }
 
-// --- дотриаж CI-прогона 10.11.2026 (остатки после T-270/T-271/T-273) ---------
+// --- the post-triage of the CI run of Nov 10, 2026 (the remains after T-270/T-271/T-273) ---
 
-// TestOSLoadCanceledContext — отмена ctx до прохода: ошибка, а не снимок
-// (мутант вырезания return читал бы фикстуры и возвращал успех).
+// TestOSLoadCanceledContext — a ctx cancellation before the pass: an error, not a
+// snapshot (a return-cut mutant would read the fixtures and return success).
 func TestOSLoadCanceledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -924,9 +924,9 @@ func TestOSLoadCanceledContext(t *testing.T) {
 	}
 }
 
-// TestReadCPUStat_GuestTailGarbage — поля после восьми (guest-хвост)
-// не парсятся вовсе: мусор в хвосте — не ошибка (мутант ёмкости [9]
-// дотягивался бы до хвоста и ронял разбор длинных строк ядра).
+// TestReadCPUStat_GuestTailGarbage — the fields after eight (the guest tail)
+// are not parsed at all: junk in the tail is not an error (a [9]-capacity
+// mutant would reach the tail and drop the parsing of long kernel lines).
 func TestReadCPUStat_GuestTailGarbage(t *testing.T) {
 	root := fullCPUFixtures(t)
 	writeFix(t, root, "stat",
@@ -936,9 +936,9 @@ func TestReadCPUStat_GuestTailGarbage(t *testing.T) {
 	}
 }
 
-// TestReadProcs_NonDirBreaksScan — не-каталог с цифровой головой
-// («0note» сортируется ПЕРЕД всеми PID-каталогами): continue пропускает
-// только его, break (мутант) обрывал бы обход и терял каждый PID ниже.
+// TestReadProcs_NonDirBreaksScan — a non-directory with a digit head
+// ("0note" sorts BEFORE all PID directories): continue skips only
+// it; break (a mutant) would cut the walk and lose every PID below.
 func TestReadProcs_NonDirBreaksScan(t *testing.T) {
 	root := fullCPUFixtures(t)
 	writeFix(t, root, "0note", "не каталог")
@@ -952,9 +952,9 @@ func TestReadProcs_NonDirBreaksScan(t *testing.T) {
 	}
 }
 
-// TestReadProcs_SymlinkNotDir — симлинк-«PID» не читается: IsDir — часть
-// контракта отбора (мутант вырезания continue читал бы stat цели
-// симлинка и агрегировал чужой вклад).
+// TestReadProcs_SymlinkNotDir — a symlink "PID" is not read: IsDir is part
+// of the selection contract (a continue-cut mutant would read the stat
+// of the symlink's target and aggregate a foreign contribution).
 func TestReadProcs_SymlinkNotDir(t *testing.T) {
 	root := t.TempDir()
 	mkdirFix(t, root, "ghostpkg", "(ghost) S 1 0 0 0 -1 0 0 0 0 0 7 3 0 0 20 0 1", "1 1\n")
@@ -970,17 +970,17 @@ func TestReadProcs_SymlinkNotDir(t *testing.T) {
 	}
 }
 
-// TestParseProcStatLine_NoOpenParen — «)» без «(»: пустой вклад, а не
-// имя-префикс до скобки (мутанты ослабления open < 0 пропускали защиту
-// к строкам без открывающей скобки).
+// TestParseProcStatLine_NoOpenParen — ")" without "(": an empty contribution, not
+// a prefix name up to the parenthesis (the open < 0 weakening mutants let
+// lines without an opening parenthesis through).
 func TestParseProcStatLine_NoOpenParen(t *testing.T) {
 	if comm, ticks := parseProcStatLine([]byte("1 x) R 1 2 3 4 5 6 7 8 9 10 3 4")); comm != "" || ticks != 0 {
 		t.Errorf("скобка закрытия без открытия = (%q, %d), want пустой вклад", comm, ticks)
 	}
 }
 
-// TestParseProcStatLine_HugeStime — stime 2^63 законен для uint64
-// (мутант bitSize 63 обязан его принять; utime-случай закрыт ранее).
+// TestParseProcStatLine_HugeStime — stime of 2^63 is legal for uint64
+// (a bitSize 63 mutant must accept it; the utime case is covered above).
 func TestParseProcStatLine_HugeStime(t *testing.T) {
 	if comm, ticks := parseProcStatLine([]byte(
 		"9 (huge) R 1 2 3 4 5 6 7 8 9 10 5 9223372036854775808")); comm != "huge" || ticks != 9223372036854775813 {
@@ -988,10 +988,10 @@ func TestParseProcStatLine_HugeStime(t *testing.T) {
 	}
 }
 
-// TestRedisQueues_GroupsTextNoSuchKey — стрим исчез между XLEN и XINFO
-// (DEL/обрезка в 0): текстовая форма «no such key» у XINFO GROUPS —
-// «групп нет», глубина остаётся XLEN, секция жива (мутант вырезания
-// второго дизъюнкта ронял бы её; XLEN-ветка закрыта тестом выше).
+// TestRedisQueues_GroupsTextNoSuchKey — the stream vanished between XLEN and XINFO
+// (DEL/a trim to 0): the "no such key" text form at XINFO GROUPS —
+// "no groups"; the depth stays XLEN; the section is alive (a cut of the
+// second disjunct would drop it; the XLEN branch is covered by the test above).
 func TestRedisQueues_GroupsTextNoSuchKey(t *testing.T) {
 	rdb := &fakeGroupsRedis{
 		groups:    map[string][]redis.XInfoGroup{},

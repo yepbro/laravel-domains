@@ -1,11 +1,11 @@
-// Тесты триажа мутантов CI-прогона 09.11.2026 (половина A): добивки
-// alerts.go/alertstate.go — пины дефолтов и границ withDefaults (0 →
-// дефолт, 1 — рабочее значение), границы машин алертов (деталь глубины
-// ровно у watermark/порога удержания, порог ≥ ёмкости тома, процент
-// свободного точно, наблюдение глубин всех стримов, ceil-граница
-// защёлок рендера, серии new_done_stale по меткам снапшота, окно PSI на
-// границе процента, кольцо дельт, q:dead глубина 1, удаление исчезнувших
-// юнитов памяти) и прямые границы track-памятей.
+// The mutant triage tests of the CI run of Nov 09, 2026 (half A): the finishing
+// of alerts.go/alertstate.go — the pins of the withDefaults defaults and boundaries (0 →
+// default, 1 — a working value), the alert machine boundaries (the depth detail
+// exactly at the watermark/hold threshold, a threshold ≥ the volume capacity, the exact
+// free percentage, the observation of the depths of all streams, the ceil boundary
+// of the render latches, the new_done_stale series by snapshot stamps, the PSI window at
+// the percentage boundary, the delta ring, a q:dead depth of 1, the deletion of vanished
+// units from the memory) and the direct boundaries of the track memories.
 package monitor
 
 import (
@@ -19,8 +19,8 @@ import (
 	"crawler/internal/queue"
 )
 
-// TestAlertsDefaultsPins — пины констант-дефолтов (значения — контракт
-// конфигурации оператора).
+// TestAlertsDefaultsPins — the pins of the default constants (the values are the
+// contract of the operator's configuration).
 func TestAlertsDefaultsPins(t *testing.T) {
 	if DefaultAlertsInterval != 5*time.Minute {
 		t.Errorf("DefaultAlertsInterval = %v, want 5m", DefaultAlertsInterval)
@@ -45,8 +45,8 @@ func TestAlertsDefaultsPins(t *testing.T) {
 	}
 }
 
-// TestAlertsWithDefaultsBoundaries — нули и отрицательные заменяются
-// дефолтами, единицы — рабочие значения (границы «≤ 0»).
+// TestAlertsWithDefaultsBoundaries — zeros and negatives are replaced
+// by defaults, unit values are working values (the "≤ 0" boundaries).
 func TestAlertsWithDefaultsBoundaries(t *testing.T) {
 	o := AlertsOptions{}.withDefaults()
 	if o.QueueFreeze != DefaultQueueFreezeWindow || o.PSICPUPercent != DefaultPSICPUPercent ||
@@ -56,8 +56,8 @@ func TestAlertsWithDefaultsBoundaries(t *testing.T) {
 		o.DiskFreeMinBytes != DefaultDiskFreeMinBytes || o.DiskFreeCritBytes != DefaultDiskFreeCritBytes {
 		t.Errorf("нулевые опции не дефолты: %+v", o)
 	}
-	// Единицы — рабочие значения, не дефолты (1нс > 0 — граница «≤ 0»
-	// различима в обе стороны).
+	// Unit values are working values, not defaults (1ns > 0 — the "≤ 0" boundary
+	// is distinguishable in both directions).
 	o = AlertsOptions{
 		QueueFreeze: time.Nanosecond, PSICPUPercent: 1, RenderDebtPasses: 1,
 		MemHighMinPasses: 1, RenderDebtDomains: 1, PSIWindow: time.Nanosecond,
@@ -72,13 +72,13 @@ func TestAlertsWithDefaultsBoundaries(t *testing.T) {
 	}
 }
 
-// TestAlertsQueueHotDetailBoundary — сработавшая деталь: стрим ровно у
-// watermark — горячий (деталь называет его, а не коридор удержания);
-// стрим ровно у порога удержания — коридор, деталь при отсутствии
-// горячих называет его.
+// TestAlertsQueueHotDetailBoundary — the fired detail: a stream exactly at
+// the watermark is hot (the detail names it, not the hold corridor);
+// a stream exactly at the hold threshold is a corridor; the detail, when there are no
+// hot ones, names it.
 func TestAlertsQueueHotDetailBoundary(t *testing.T) {
-	// Горячий A ровно у watermark, B — в коридоре: деталь называет
-	// только A (мутант «>» отправил бы A в коридор, деталь — оба).
+	// Hot A exactly at the watermark, B in the corridor: the detail names
+	// only A (a ">" mutant would send A to the corridor, the detail — both).
 	env := newAlertsTestEnv(t, nil)
 	a, b := alertStreams[0], alertStreams[1]
 	wmA := queue.StreamWatermark(env.opts.QueueWatermark, env.opts.QueueMaxLen, a)
@@ -100,11 +100,11 @@ func TestAlertsQueueHotDetailBoundary(t *testing.T) {
 		t.Errorf("коридорный стрим затопил горячий: %s", s.Detail)
 	}
 
-	// Горячих нет, B ровно у порога удержания — деталь называет B
-	// (мутант «>» у holdAt потерял бы его).
+	// No hot ones, B exactly at the hold threshold — the detail names B
+	// (a ">" mutant in holdAt would lose it).
 	env2 := newAlertsTestEnv(t, nil)
 	m2 := env2.newQueuesMachine()
-	// Сначала срабатывание (firing), затем удержание ровно в коридоре.
+	// First a firing, then a hold exactly in the corridor.
 	env2.lener.lens = map[string]int64{b: wmB}
 	_ = m2.transition(env2.Alerts, context.Background(), obs(env2.lener.lens))
 	env2.lener.lens = map[string]int64{b: holdB}
@@ -117,8 +117,8 @@ func TestAlertsQueueHotDetailBoundary(t *testing.T) {
 	}
 }
 
-// TestAlertsDiskBytesNABoundary — порог абсолютного минимума ровно
-// ёмкости тома — неприменимость, на единицу меньше — применим.
+// TestAlertsDiskBytesNABoundary — an absolute minimum threshold exactly
+// the volume capacity — inapplicability; one less — applicable.
 func TestAlertsDiskBytesNABoundary(t *testing.T) {
 	env := newAlertsTestEnv(t, nil)
 	total := int64(200 << 30)
@@ -135,20 +135,20 @@ func TestAlertsDiskBytesNABoundary(t *testing.T) {
 	}
 }
 
-// TestAlertsDiskPercentDetail — точный процент свободного в деталях
-// (100 × avail / total).
+// TestAlertsDiskPercentDetail — the exact percentage of free space in the
+// details (100 × avail / total).
 func TestAlertsDiskPercentDetail(t *testing.T) {
 	env := newAlertsTestEnv(t, nil)
 	m := env.newDiskMachine()
-	env.space.stat = SpaceStat{Avail: 50 << 30, Total: 200 << 30} // ровно 25 %
+	env.space.stat = SpaceStat{Avail: 50 << 30, Total: 200 << 30} // exactly 25%
 	s := m.transition(env.Alerts, context.Background(), obs(env.space.stat))
 	if !strings.Contains(s.Detail, "свободно 25.0%") {
 		t.Errorf("деталь процента = %q, want «свободно 25.0%%»", s.Detail)
 	}
 }
 
-// TestAlertsQueueLensObserved — наблюдение очередей возвращает ВСЕ
-// стримы с глубинами (мутант вырезания записи в карту глотал стримы).
+// TestAlertsQueueLensObserved — the queue observation returns ALL
+// streams with depths (a map-write-cut mutant swallowed streams).
 func TestAlertsQueueLensObserved(t *testing.T) {
 	env := newAlertsTestEnv(t, nil)
 	lens := map[string]int64{}
@@ -167,8 +167,8 @@ func TestAlertsQueueLensObserved(t *testing.T) {
 	}
 }
 
-// TestAlertsRedisMemoryMaxBytesBoundary — maxmemory = 1 — валидное
-// наблюдение (потолок есть); = 0 — тихая неприменимость.
+// TestAlertsRedisMemoryMaxBytesBoundary — maxmemory = 1 is a valid
+// observation (there is a cap); = 0 — a quiet inapplicability.
 func TestAlertsRedisMemoryMaxBytesBoundary(t *testing.T) {
 	env := newAlertsTestEnv(t, nil)
 	env.redisMem.mem = RedisMemory{UsedBytes: 1, MaxBytes: 1, Policy: "noeviction"}
@@ -183,8 +183,8 @@ func TestAlertsRedisMemoryMaxBytesBoundary(t *testing.T) {
 	}
 }
 
-// TestAlertsRenderFbDepthWatermarkBoundary — QueueWatermark=1 — рабочее
-// значение (наблюдение глубины живо, не «порог не задан»).
+// TestAlertsRenderFbDepthWatermarkBoundary — QueueWatermark=1 is a working
+// value (the depth observation is alive, not "the threshold is not set").
 func TestAlertsRenderFbDepthWatermarkBoundary(t *testing.T) {
 	env := newAlertsTestEnv(t, func(o *AlertsOptions) { o.QueueWatermark = 1 })
 	o := env.observeRenderFallbackDepth(context.Background())
@@ -193,8 +193,8 @@ func TestAlertsRenderFbDepthWatermarkBoundary(t *testing.T) {
 	}
 }
 
-// TestAlertsDiskPercentEnabledBoundary — DiskFreePercent=1 — контроль
-// включён (измерение, не «выключен»).
+// TestAlertsDiskPercentEnabledBoundary — DiskFreePercent=1 — the check
+// is on (a measurement, not "off").
 func TestAlertsDiskPercentEnabledBoundary(t *testing.T) {
 	env := newAlertsTestEnv(t, func(o *AlertsOptions) { o.DiskFreePercent = 1 })
 	o := env.observeDisk(context.Background())
@@ -203,8 +203,8 @@ func TestAlertsDiskPercentEnabledBoundary(t *testing.T) {
 	}
 }
 
-// TestDeadStreakNOne — глубина 1 — полноценное событие серии (граница
-// n > 0), удержание сработавшего любой ненулевой глубиной.
+// TestDeadStreakNOne — a depth of 1 is a full series event (the
+// n > 0 boundary); the fired state is held by any non-zero depth.
 func TestDeadStreakNOne(t *testing.T) {
 	env := newAlertsTestEnv(t, nil)
 	m := env.newDeadMachine()
@@ -214,9 +214,9 @@ func TestDeadStreakNOne(t *testing.T) {
 	wantSequence(t, "удержание единицей", got, []string{AlertStatusFiring, AlertStatusOK})
 }
 
-// TestMemHighStreakGrewAndEvict — рост High наращивает серию с деталью
-// «+N за проход» (точная дельта); стагнация — снятие; исчезнувший юнит
-// покидает память, возвращение начинает серию заново.
+// TestMemHighStreakGrewAndEvict — a High growth builds the series with the
+// "+N per pass" detail (the exact delta); stagnation — clearing; a vanished
+// unit leaves the memory, a return starts the series anew.
 func TestMemHighStreakGrewAndEvict(t *testing.T) {
 	env := newAlertsTestEnv(t, nil)
 	m := env.newMemHighMachine()
@@ -230,17 +230,17 @@ func TestMemHighStreakGrewAndEvict(t *testing.T) {
 	if s4.Status != AlertStatusOK {
 		t.Errorf("стагнация: %s, want ok", s4.Status)
 	}
-	// Юнит исчез и вернулся с ростом — свежая база: серии нет (мутант
-	// невычищения памяти продолжил бы серию и ложно срабатывал).
+	// The unit vanished and returned with growth — a fresh base: no series (a
+	// no-cleanup mutant would continue the series and fire falsely).
 	m2 := env.newMemHighMachine()
 	_ = m2.transition(env.Alerts, context.Background(), obs([]UnitEvents{{Unit: "u", High: 100}}))
-	_ = m2.transition(env.Alerts, context.Background(), obs([]UnitEvents{{Unit: "u", High: 150}})) // серия 1
-	_ = m2.transition(env.Alerts, context.Background(), obs([]UnitEvents{}))                       // юнит исчез
+	_ = m2.transition(env.Alerts, context.Background(), obs([]UnitEvents{{Unit: "u", High: 150}})) // series 1
+	_ = m2.transition(env.Alerts, context.Background(), obs([]UnitEvents{}))                       // the unit vanished
 	s := m2.transition(env.Alerts, context.Background(), obs([]UnitEvents{{Unit: "u", High: 160}}))
 	if s.Status != AlertStatusOK {
 		t.Errorf("после исчезновения: %s (%s), want ok (свежая база, серия с нуля)", s.Status, s.Detail)
 	}
-	// Серия после возвращения считается заново: два роста — firing.
+	// The series after the return is counted anew: two growths — firing.
 	s = m2.transition(env.Alerts, context.Background(), obs([]UnitEvents{{Unit: "u", High: 200}}))
 	s = m2.transition(env.Alerts, context.Background(), obs([]UnitEvents{{Unit: "u", High: 260}}))
 	if s.Status != AlertStatusFiring {
@@ -248,12 +248,12 @@ func TestMemHighStreakGrewAndEvict(t *testing.T) {
 	}
 }
 
-// TestRenderDebtTrackBoundaries — порог срабатывания строго больше,
-// удержание от защёлки на пороге снятия (ceil), снятие ниже; стагнация
-// без роста не срабатывает.
+// TestRenderDebtTrackBoundaries — the firing threshold is strictly greater,
+// the hold from the latch at the clearing threshold (ceil), the clearing below; stagnation
+// without growth does not fire.
 func TestRenderDebtTrackBoundaries(t *testing.T) {
 	d := func(total int64) RenderDebt { return RenderDebt{Flags: total} }
-	// Порог 10, снятие < 9 (ceil): уровень 9 удерживает, 8 — снимает.
+	// A threshold of 10, a clearing < 9 (ceil): a level of 9 holds, 8 clears.
 	tr := &renderDebtTrack{domains: 10, passes: 2}
 	if s := tr.decide("", time.Time{}, d(8)); s.status != AlertStatusOK {
 		t.Errorf("база: %s", s.status)
@@ -270,7 +270,7 @@ func TestRenderDebtTrackBoundaries(t *testing.T) {
 	if s := tr.decide("", time.Time{}, d(8)); s.status != AlertStatusOK {
 		t.Errorf("снятие на 8: %s, want ok", s.status)
 	}
-	// Стагнация выше порога без роста — ok.
+	// Stagnation above the threshold without growth — ok.
 	tr2 := &renderDebtTrack{domains: 10, passes: 2}
 	_ = tr2.decide("", time.Time{}, d(5))
 	if s := tr2.decide("", time.Time{}, d(20)); s.status != AlertStatusOK {
@@ -281,8 +281,8 @@ func TestRenderDebtTrackBoundaries(t *testing.T) {
 	}
 }
 
-// TestRenderFbDepthBoundaries — глубина ровно у watermark — hot-серия,
-// срабатывание стационарной глубиной; удержание ceil-порога снятия.
+// TestRenderFbDepthBoundaries — a depth exactly at the watermark — a hot
+// series, firing by a stationary depth; the hold of the ceil clearing threshold.
 func TestRenderFbDepthBoundaries(t *testing.T) {
 	tr := &renderFbDepthTrack{wm: 100, passes: 2}
 	if s := tr.decide("", time.Time{}, 100); s.status != AlertStatusOK {
@@ -298,7 +298,7 @@ func TestRenderFbDepthBoundaries(t *testing.T) {
 	if s := tr.decide("", time.Time{}, 89); s.status != AlertStatusOK {
 		t.Errorf("снятие на 89: %s, want ok", s.status)
 	}
-	// 99 — не «у порога»: hot не копится.
+	// 99 is not "at the threshold": hot does not accumulate.
 	tr2 := &renderFbDepthTrack{wm: 100, passes: 2}
 	_ = tr2.decide("", time.Time{}, 99)
 	if s := tr2.decide("", time.Time{}, 99); s.status != AlertStatusOK {
@@ -306,9 +306,9 @@ func TestRenderFbDepthBoundaries(t *testing.T) {
 	}
 }
 
-// TestNewDoneStaleSnapshotBoundaries — серия растёт только по новым
-// снапшотам (смена метки), повтор строки — нет; невалидная метка —
-// рост; нулевой снапшот обнуляет; сработавший удерживается единицей.
+// TestNewDoneStaleSnapshotBoundaries — the series grows only on new
+// snapshots (a stamp change); a row repeat — no; an invalid stamp —
+// growth; a zero snapshot resets; the fired state is held by a value of one.
 func TestNewDoneStaleSnapshotBoundaries(t *testing.T) {
 	t0 := time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
 	row := func(v int64, at time.Time) staleRow {
@@ -324,13 +324,13 @@ func TestNewDoneStaleSnapshotBoundaries(t *testing.T) {
 	if s := tr.decide("", time.Time{}, row(5, t0.Add(time.Minute))); s.status != AlertStatusFiring {
 		t.Errorf("новый снапшот: %s (%s), want firing", s.status, s.detail)
 	}
-	// Невалидная метка — рост серии (первый проход такой строки).
+	// An invalid stamp — series growth (the first pass of such a row).
 	tr2 := &newDoneStaleTrack{minPasses: 2}
 	_ = tr2.decide("", time.Time{}, row(5, t0))
 	if s := tr2.decide("", time.Time{}, staleRow{value: 5}); !strings.Contains(s.detail, "2/2") {
 		t.Errorf("невалидная метка не нарастила серию: %s", s.detail)
 	}
-	// Сработавший удерживается единицей; нулевой снапшот снимает.
+	// The fired state is held by a value of one; a zero snapshot clears.
 	tr3 := &newDoneStaleTrack{minPasses: 2}
 	_ = tr3.decide("", time.Time{}, row(5, t0))
 	_ = tr3.decide("", time.Time{}, row(5, t0.Add(time.Minute)))
@@ -342,8 +342,8 @@ func TestNewDoneStaleSnapshotBoundaries(t *testing.T) {
 	}
 }
 
-// TestPsiWindowBoundary — avg300 ровно на пороге — не «выше» (строгое
-// >); чуть выше — окно копится и закрывается firing.
+// TestPsiWindowBoundary — avg300 exactly at the threshold is not "above" (a strict
+// >); slightly above — the window accumulates and closes with firing.
 func TestPsiWindowBoundary(t *testing.T) {
 	base := time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
 	tr := &psiWindowTrack{percent: 90, window: 30 * time.Minute}
@@ -359,8 +359,8 @@ func TestPsiWindowBoundary(t *testing.T) {
 	}
 }
 
-// TestDeltaRingSizeOneAndValues — кольцо размера 1 — окно одного
-// прохода; сумма — точная дельта, рестарт — нулевая дельта.
+// TestDeltaRingSizeOneAndValues — a ring of size 1 — a one-pass
+// window; the sum — the exact delta; a restart — a zero delta.
 func TestDeltaRingSizeOneAndValues(t *testing.T) {
 	w := &deltaRing{size: 1}
 	if got := w.push(100); got != 0 {
@@ -377,9 +377,9 @@ func TestDeltaRingSizeOneAndValues(t *testing.T) {
 	}
 }
 
-// TestQueueFreezeDepthZero — нулевая глубина не копит неподвижность:
-// сколько проходов — ок; глубина 1 — полноценная работа окна (граница
-// «> 0»); деталь ок называет счётчик движимых/пустых групп.
+// TestQueueFreezeDepthZero — a zero depth does not accumulate immobility:
+// however many passes — ok; a depth of 1 is full window operation (the
+// "> 0" boundary); the ok detail names the counter of moved/empty groups.
 func TestQueueFreezeDepthZero(t *testing.T) {
 	env := newAlertsTestEnv(t, nil)
 	m := env.newQueueFreezeMachine()
@@ -394,7 +394,7 @@ func TestQueueFreezeDepthZero(t *testing.T) {
 		}
 	}
 
-	// Глубина 1 неподвижна окно — firing (минимальная живая глубина).
+	// A depth of 1 immobile over the window — firing (the minimal live depth).
 	now := time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
 	env2 := newAlertsTestEnv(t, func(o *AlertsOptions) {
 		o.QueueFreeze = 15 * time.Minute

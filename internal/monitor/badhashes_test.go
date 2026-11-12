@@ -1,10 +1,10 @@
-// Юнит-тесты алерта мусорных content_hash очистки ingest (T-099) и его
-// HTTP-источника: порог всплеска за окно, базирование первого наблюдения
-// (старт мониторинга позже накопленного счётчика — не всплеск), рестарт
-// ingest (счётчик начал заново — без ложного срабатывания), старение окна
-// без продолжения потока, деградация источника, разбор экспозиции
-// Prometheus и поведение зонда по HTTP (статусы, отсутствие метрики,
-// отмена ctx). Живой зонд против /metrics ingest — интеграционный уровень.
+// Unit tests of the junk content_hash alert of ingest cleanup (T-099) and its
+// HTTP source: the spike threshold over a window, the basing of the first observation
+// (a monitoring start later than the accumulated counter — not a spike), a restart
+// of ingest (the counter started anew — no false firing), the window aging
+// without a continuing flow, the source degradation, the exposition parsing
+// of Prometheus and the probe behavior over HTTP (statuses, a missing metric,
+// a ctx cancellation). The live probe against the ingest /metrics — the integration level.
 package monitor
 
 import (
@@ -18,8 +18,8 @@ import (
 	"testing"
 )
 
-// fakeBadHashes — источник счётчика по заготовке: значение меняется между
-// проходами, очередь ошибок (пустая — ответ без ошибки).
+// fakeBadHashes — a counter source per a stub: the value changes between
+// passes, an error queue (empty — an answer without an error).
 type fakeBadHashes struct {
 	mu    sync.Mutex
 	val   int64
@@ -43,21 +43,21 @@ func (f *fakeBadHashes) set(v int64) {
 	f.val = v
 }
 
-// --- алерт -------------------------------------------------------------------
+// --- the alert -----------------------------------------------------------------
 
-// TestAlertsBadHashesThreshold — накопление дельт до порога окном:
-// скачки ниже порога поодиночке не срабатывают, сумма за окно ≥
-// AlertBadHashesThreshold — firing; без продолжения потока окно стареет
-// и алерт снимается.
+// TestAlertsBadHashesThreshold — accumulating deltas up to the threshold by the window:
+// jumps below the threshold one by one do not fire; a sum over the window ≥
+// AlertBadHashesThreshold — firing; without a continuing flow the window ages
+// and the alert is cleared.
 func TestAlertsBadHashesThreshold(t *testing.T) {
 	env := newAlertsTestEnv(t, nil)
 	ctx := context.Background()
 	m := env.newBadHashesMachine()
 
-	// Первое наблюдение — база: накопленное до старта мониторинга
-	// (100) не считается всплеском.
-	// Рост по 5 и 3 — сумма 8 < 10: ок.
-	// Ещё 4 — сумма 12 ≥ 10: всплеск.
+	// The first observation — the base: what accumulated before the monitoring
+	// start (100) does not count as a spike.
+	// Growths of 5 and 3 — a sum of 8 < 10: ok.
+	// 4 more — the sum of 12 ≥ 10: a spike.
 	steps := []struct {
 		cur  int64
 		want string
@@ -73,7 +73,7 @@ func TestAlertsBadHashesThreshold(t *testing.T) {
 			t.Errorf("шаг %d (счётчик %d): статус = %s (%s), want %s", i, s.cur, got.Status, got.Detail, s.want)
 		}
 		if i == len(steps)-1 {
-			for _, want := range []string{"112", "12", "10"} { // счётчик, сумма, порог
+			for _, want := range []string{"112", "12", "10"} { // the counter, the sum, the threshold
 				if !strings.Contains(got.Detail, want) {
 					t.Errorf("detail %q не содержит %s", got.Detail, want)
 				}
@@ -81,13 +81,13 @@ func TestAlertsBadHashesThreshold(t *testing.T) {
 		}
 	}
 
-	// Держится следующий проход (сумма ещё в окне)…
+	// It holds for the next pass (the sum is still in the window)…
 	if got := m.transition(env.Alerts, ctx, obs(int64(112))); got.Status != AlertStatusFiring {
 		t.Errorf("окно ещё держит сумму: статус = %s (%s), want firing", got.Status, got.Detail)
 	}
 
-	// …и стареет без новых мусорных строк: после окна нулевых дельт
-	// сумма обнуляется — снятие.
+	// …and ages without new junk rows: after the window of zero deltas
+	// the sum zeroes out — clearing.
 	for range AlertBadHashesWindow + 2 {
 		if got := m.transition(env.Alerts, ctx, obs(int64(112))); got.Status == AlertStatusOK {
 			return
@@ -96,12 +96,12 @@ func TestAlertsBadHashesThreshold(t *testing.T) {
 	t.Fatal("алерт не снят после старения окна без новых мусорных строк")
 }
 
-// TestBadHashesWindow — размер кольца дельт (deltaRing): окно ровно 15 значений —
-// всплеск удерживается суммой до вытеснения последней (15-й) нулевой
-// дельтой. Размер pinned литералом в начале: граница из константы
-// мутировалась бы вместе с тестом и «следовала» за мутантом. Шаг записи
-// отдельно не фиксируется: любой взаимно простой с длиной шаг даёт то же
-// множество последних дельт (см. аннотацию в push).
+// TestBadHashesWindow — the delta ring size (deltaRing): the window of exactly 15 values —
+// the spike is held by the sum until the eviction by the last (15th) zero
+// delta. The size is pinned by a literal at the start: a boundary from the
+// constant would mutate together with the test and "follow" the mutant. The write step
+// is not pinned separately: any step coprime with the length gives the same
+// set of last deltas (see the annotation in push).
 func TestBadHashesWindow(t *testing.T) {
 	if AlertBadHashesWindow != 15 {
 		t.Fatalf("AlertBadHashesWindow = %d, want 15 (окно 15 проходов алертов)", AlertBadHashesWindow)
@@ -113,66 +113,66 @@ func TestBadHashesWindow(t *testing.T) {
 	if sum := w.push(10); sum != 10 {
 		t.Fatalf("всплеск +10: сумма = %d, want 10", sum)
 	}
-	// Окно 15: всплеск держится, пока 14 последующих дельт не вытеснили
-	// его из кольца (без роста счётчика дельты нулевые).
+	// The window of 15: the spike holds while 14 subsequent deltas have not evicted
+	// it from the ring (without counter growth the deltas are zero).
 	for i := 1; i <= AlertBadHashesWindow-1; i++ {
 		if sum := w.push(10); sum != 10 {
 			t.Fatalf("после %d нулевых дельт: сумма = %d, want 10 (окно ещё держит)", i, sum)
 		}
 	}
-	// 15-я нулевая дельта перезаписывает ячейку всплеска — сумма 0.
+	// The 15th zero delta overwrites the spike cell — the sum is 0.
 	if sum := w.push(10); sum != 0 {
 		t.Fatalf("окно освободилось: сумма = %d, want 0", sum)
 	}
 }
 
-// TestAlertsBadHashesExactThreshold — сумма ровно AlertBadHashesThreshold —
-// уже всплеск (≥, не «строго больше»); деталь называет окно — 15 проходов
-// интервала тестовой среды (DefaultAlertsInterval 5м) = 1ч15м.
+// TestAlertsBadHashesExactThreshold — a sum of exactly AlertBadHashesThreshold is
+// already a spike (≥, not "strictly greater"); the detail names the window — 15
+// passes of the test env interval (DefaultAlertsInterval 5m) = 1h15m.
 func TestAlertsBadHashesExactThreshold(t *testing.T) {
 	env := newAlertsTestEnv(t, nil)
 	ctx := context.Background()
 	m := env.newBadHashesMachine()
 
-	_ = m.transition(env.Alerts, ctx, obs(int64(0)))   // база
-	s := m.transition(env.Alerts, ctx, obs(int64(10))) // одна дельта ровно 10
+	_ = m.transition(env.Alerts, ctx, obs(int64(0)))   // the base
+	s := m.transition(env.Alerts, ctx, obs(int64(10))) // a single delta of exactly 10
 	if s.Status != AlertStatusFiring {
 		t.Fatalf("сумма ровно 10: статус = %s (%s), want firing", s.Status, s.Detail)
 	}
-	for _, want := range []string{"1h15m0s", "10"} { // окно 15 × 5м, порог
+	for _, want := range []string{"1h15m0s", "10"} { // the window of 15 × 5m, the threshold
 		if !strings.Contains(s.Detail, want) {
 			t.Errorf("detail %q не содержит %s", s.Detail, want)
 		}
 	}
 }
 
-// TestAlertsBadHashesRestart — рестарт ingest обнуляет счётчик: убывание
-// даёт нулевую дельту, ложного всплеска нет (счётчик считается заново).
+// TestAlertsBadHashesRestart — an ingest restart resets the counter: a decrease
+// gives a zero delta, no false spike (the counter is counted anew).
 func TestAlertsBadHashesRestart(t *testing.T) {
 	env := newAlertsTestEnv(t, nil)
 	ctx := context.Background()
 	m := env.newBadHashesMachine()
 
-	_ = m.transition(env.Alerts, ctx, obs(int64(50)))                                      // база
-	if got := m.transition(env.Alerts, ctx, obs(int64(50))); got.Status != AlertStatusOK { // тишина
+	_ = m.transition(env.Alerts, ctx, obs(int64(50)))                                      // the base
+	if got := m.transition(env.Alerts, ctx, obs(int64(50))); got.Status != AlertStatusOK { // silence
 		t.Fatalf("тишина: статус = %s (%s), want ok", got.Status, got.Detail)
 	}
 
-	// Рестарт ingest: счётчик меньше прежнего — убыль даёт нулевую
-	// дельту, ложного всплеска нет (счётчик считается заново).
+	// An ingest restart: the counter is below the previous one — a decrease gives a zero
+	// delta, no false spike (the counter is counted anew).
 	if got := m.transition(env.Alerts, ctx, obs(int64(3))); got.Status != AlertStatusOK {
 		t.Errorf("рестарт источника: статус = %s (%s), want ok без ложного всплеска", got.Status, got.Detail)
 	}
 
-	// Новый рост после рестарта считается от новой базы: +17 ≥ порога.
+	// New growth after the restart is counted from the new base: +17 ≥ the threshold.
 	if got := m.transition(env.Alerts, ctx, obs(int64(20))); got.Status != AlertStatusFiring {
 		t.Errorf("рост после рестарта: статус = %s (%s), want firing", got.Status, got.Detail)
 	}
 }
 
-// TestAlertsBadHashesDegradation — без источника алерт «не измеряется»
-// тихо; ошибка источника (ingest недоступен) — Warn и «не измеряется»,
-// следующий проход жив.
+// TestAlertsBadHashesDegradation — without a source the alert is "not measured"
+// quietly; a source error (ingest unavailable) — a Warn and "not measured",
+// the next pass is alive.
 func TestAlertsBadHashesDegradation(t *testing.T) {
 	env := newAlertsTestEnv(t, nil)
 	if s := snapshotOf(t, env.Pass(context.Background()), AlertBadHashes); s.Status != AlertStatusNotMeasured {
@@ -195,11 +195,11 @@ func TestAlertsBadHashesDegradation(t *testing.T) {
 	}
 }
 
-// --- HTTP-источник --------------------------------------------------------------
+// --- the HTTP source -------------------------------------------------------------
 
-// TestIngestBadHashesHTTP — зонд читает счётчик из экспозиции /metrics:
-// реальный формат (HELP/TYPE, соседние метрики с метками) и ошибки
-// статуса/сети.
+// TestIngestBadHashesHTTP — the probe reads the counter from the /metrics exposition:
+// the real format (HELP/TYPE, neighboring metrics with labels) and the
+// status/network errors.
 func TestIngestBadHashesHTTP(t *testing.T) {
 	const exposition = "# HELP crawler_service_up Сервис запущен.\n" +
 		"# TYPE crawler_service_up gauge\n" +
@@ -221,14 +221,14 @@ func TestIngestBadHashesHTTP(t *testing.T) {
 		t.Errorf("счётчик = %d, want 42", got)
 	}
 
-	// Некорректный URL (управляющий символ) — ошибка сборки запроса до
-	// сети; значение ошибки — строго 0 (не ±1).
+	// An invalid URL (a control character) — a request build error before
+	// the network; the error value is strictly 0 (not ±1).
 	got, err = (IngestBadHashes{URL: "http://ingest:9101/\n"}).BadHashes(context.Background())
 	if err == nil || got != 0 {
 		t.Errorf("ошибка URL: (%d, %v), want (0, ошибка)", got, err)
 	}
 
-	// Отсутствие метрики (старый ingest) — ошибка источника с именем.
+	// A missing metric (an old ingest) — a source error with the name.
 	noMetric := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("crawler_service_up{service=\"ingest\"} 1\n"))
 	}))
@@ -238,7 +238,7 @@ func TestIngestBadHashesHTTP(t *testing.T) {
 		t.Errorf("нет метрики: (%d, %v), want (0, ошибка с именем метрики)", n, err)
 	}
 
-	// Не-200 — ошибка со статусом.
+	// Non-200 — an error with the status.
 	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
 	}))
@@ -248,7 +248,7 @@ func TestIngestBadHashesHTTP(t *testing.T) {
 		t.Errorf("статус 503: (%d, %v), want (0, ошибка со статусом)", n, err)
 	}
 
-	// Недоступный сервер — ошибка транспорта.
+	// An unreachable server — a transport error.
 	dead := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 	url := dead.URL
 	dead.Close()
@@ -256,7 +256,7 @@ func TestIngestBadHashesHTTP(t *testing.T) {
 		t.Errorf("закрытый сервер: (%d, %v), want (0, ошибка)", n, err)
 	}
 
-	// Отмена ctx — ошибка контекста, не зависание.
+	// A ctx cancellation — a context error, not a hang.
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if _, err := (IngestBadHashes{URL: srv.URL}).BadHashes(ctx); !errors.Is(err, context.Canceled) {
@@ -264,12 +264,12 @@ func TestIngestBadHashesHTTP(t *testing.T) {
 	}
 }
 
-// roundTripFunc — транспорт с фиксированным ответом, без сети.
+// roundTripFunc — a transport with a fixed answer, no network.
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
-// closeTrackingBody — тело ответа с отметкой Close.
+// closeTrackingBody — a response body with a Close mark.
 type closeTrackingBody struct {
 	io.Reader
 	closed bool
@@ -280,8 +280,8 @@ func (b *closeTrackingBody) Close() error {
 	return nil
 }
 
-// TestIngestBadHashesClosesBody — тело ответа закрывается после разбора:
-// единственный ресурс метода, утечка держала бы соединения ingest.
+// TestIngestBadHashesClosesBody — the response body is closed after parsing:
+// the only resource of the method; a leak would hold the ingest connections.
 func TestIngestBadHashesClosesBody(t *testing.T) {
 	body := &closeTrackingBody{Reader: strings.NewReader(
 		"crawler_ingest_bad_hashes_total{service=\"ingest\"} 42\n")}
@@ -305,15 +305,15 @@ func TestIngestBadHashesClosesBody(t *testing.T) {
 	}
 }
 
-// TestParseBadHashesExposition — табличный разбор формата: метки, научная
-// запись, штамп времени после значения, комментарии и мусор — мимо.
+// TestParseBadHashesExposition — a table parse of the format: labels, scientific
+// notation, a timestamp after the value, comments and junk — miss.
 func TestParseBadHashesExposition(t *testing.T) {
 	tests := []struct {
 		name    string
 		body    string
 		want    int64
-		wantErr string // «» — успех
-		wantHas string // значение-нарушитель в тексте ошибки («» — не важно)
+		wantErr string // "" — success
+		wantHas string // the offending value in the error text ("" — does not matter)
 	}{
 		{
 			"ряд с метками",
@@ -339,9 +339,9 @@ func TestParseBadHashesExposition(t *testing.T) {
 				"crawler_ingest_bad_hashes_total{service=\"ingest\"} 5\n",
 			5, "", "",
 		},
-		// Ноль — валидный счётчик (рестарт ingest): граница «v < 0»
-		// включающая, отрицательные и не-числа — ошибка с названием
-		// значения-нарушителя.
+		// Zero is a valid counter (an ingest restart): the "v < 0" boundary
+		// is inclusive; negatives and non-numbers — an error naming
+		// the offending value.
 		{"нулевое значение", "crawler_ingest_bad_hashes_total 0\n", 0, "", ""},
 		{"минус один", "crawler_ingest_bad_hashes_total -1\n", 0, "не счётчик", "-1"},
 		{"имя без значения", "crawler_ingest_bad_hashes_total\n", 0, "отсутствует", ""},
@@ -376,14 +376,14 @@ func TestParseBadHashesExposition(t *testing.T) {
 	}
 }
 
-// failReader — читатель с неисправимой ошибкой (обрыв транспорта во
-// время чтения тела /metrics).
+// failReader — a reader with an unrecoverable error (a transport break during
+// the /metrics body read).
 type failReader struct{ err error }
 
 func (r *failReader) Read([]byte) (int, error) { return 0, r.err }
 
-// TestParseBadHashesExpositionReadError — ошибка чтения тела всплывает из
-// Scanner: «чтение экспозиции» с исходной причиной и нулевое значение.
+// TestParseBadHashesExpositionReadError — a body read error bubbles out of the
+// Scanner: "exposition read" with the original reason and a zero value.
 func TestParseBadHashesExpositionReadError(t *testing.T) {
 	got, err := parseBadHashesExposition(&failReader{err: errors.New("сброс соединения")})
 	if err == nil ||
@@ -396,11 +396,11 @@ func TestParseBadHashesExpositionReadError(t *testing.T) {
 	}
 }
 
-// TestParseBadHashesExpositionBodyLimit — потолок чтения тела: метрика
-// последней строкой ровно на границе badHashesBodyLimit читается (лимит
-// включающий), за пределами — отрезается («метрика отсутствует»).
-// Сам лимит pinned литералом 4<<20: константа в проверке мутировала бы
-// вместе с мутантом и «следовала» за ним (T-M01, alerts).
+// TestParseBadHashesExpositionBodyLimit — the body read cap: a metric
+// on the last line exactly at the badHashesBodyLimit boundary is read (the limit
+// is inclusive); beyond it — cut off ("the metric is missing").
+// The limit itself is pinned by the 4<<20 literal: a constant in the check would
+// mutate together with the mutant and "follow" it (T-M01, alerts).
 func TestParseBadHashesExpositionBodyLimit(t *testing.T) {
 	if badHashesBodyLimit != 4<<20 {
 		t.Fatalf("badHashesBodyLimit = %d, want 4<<20 (4 МиБ)", badHashesBodyLimit)
@@ -408,8 +408,8 @@ func TestParseBadHashesExpositionBodyLimit(t *testing.T) {
 	const filler = "crawler_service_up{service=\"ingest\"} 1\n"
 	const metric = "crawler_ingest_bad_hashes_total{service=\"ingest\"} 42\n"
 
-	// Ровно на лимите: filler-строки, добивка точной длины и метрика
-	// последней строкой — общий размер badHashesBodyLimit.
+	// Exactly at the limit: filler lines, a pad of the exact length and the
+	// metric on the last line — the total size of badHashesBodyLimit.
 	var b strings.Builder
 	for b.Len()+len(filler)+len(metric) <= badHashesBodyLimit {
 		b.WriteString(filler)
@@ -417,7 +417,7 @@ func TestParseBadHashesExpositionBodyLimit(t *testing.T) {
 	rest := badHashesBodyLimit - b.Len() - len(metric)
 	switch {
 	case rest == 1:
-		b.WriteString("\n") // пустая строка — тоже мимо парсера
+		b.WriteString("\n") // an empty line — also past the parser
 	case rest >= 2:
 		b.WriteString("#" + strings.Repeat("x", rest-2) + "\n")
 	}
@@ -430,12 +430,12 @@ func TestParseBadHashesExpositionBodyLimit(t *testing.T) {
 		t.Fatalf("на границе лимита: (%d, %v), want (42, nil)", got, err)
 	}
 
-	// За лимитом: метрика в хвосте за badHashesBodyLimit — не читается.
+	// Beyond the limit: the metric in the tail beyond badHashesBodyLimit — not read.
 	var over strings.Builder
 	for over.Len()+len(filler) <= badHashesBodyLimit {
 		over.WriteString(filler)
 	}
-	over.WriteString(filler) // хвост за лимитом
+	over.WriteString(filler) // the tail beyond the limit
 	over.WriteString(metric)
 	if _, err := parseBadHashesExposition(strings.NewReader(over.String())); err == nil ||
 		!strings.Contains(err.Error(), "отсутствует") {

@@ -1,9 +1,9 @@
-// Юнит-тесты счётчиков истории детекции appeared/lost (T-118) на
-// фейковом pgx-пуле: точный SQL-текст (FILTER-агрегат одним сканом),
-// значения gauge после первого прохода, дефолты, ошибки запроса и
-// деградации формы ответа (пустой, нечитаемая строка, ошибка итерации),
-// no-op без реестра, Warn и переживание ошибки, успешный проход под
-// отменой. Поведение против живой БД — dev-окружение.
+// Unit tests of the appeared/lost detection history counters (T-118) on a
+// fake pgx pool: the exact SQL text (a FILTER aggregate by one scan),
+// the gauge values after the first pass, the defaults, query errors and
+// answer-shape degradations (empty, an unreadable row, an iteration error),
+// no-op without a registry, a Warn and surviving an error, a successful pass under
+// cancellation. Behavior against a live DB — the dev environment.
 package monitor
 
 import (
@@ -24,23 +24,23 @@ import (
 	"crawler/internal/metrics"
 )
 
-// historystatsFakePool — db.DB без БД: очередь пар (appeared, lost) и
-// ошибок агрегата.
+// historystatsFakePool — a db.DB without a DB: the queue of (appeared, lost) pairs and
+// aggregate errors.
 type historystatsFakePool struct {
 	mu    sync.Mutex
-	stats [][2]int64 // очередь ответов (кончилась — {0,0})
+	stats [][2]int64 // the queue of answers (exhausted — {0,0})
 	errs  []error
 
-	// Деградации формы ответа (стиль alertsPool): пустой ответ (Next
-	// ложен), строка с нечитаемым типом (ошибка Scan), ошибка итерации
+	// Answer-shape degradations (the alertsPool style): an empty answer (Next
+	// false), a row with an unreadable type (a Scan error), an iteration error
 	// (rows.Err).
 	empty   bool
 	badRow  bool
 	rowsErr error
-	// ignoreCtx — отвечать успехом без проверки ctx: сценарий «проход
-	// успешен, отмены во время него не было» для классификации в цикле.
-	// Неизменяемо после конструирования (задаётся композит-литералом до
-	// старта горутины цикла) — замок очередей его не защищает и не должен.
+	// ignoreCtx — answer success without checking ctx: the scenario "the pass
+	// is successful, there was no cancellation during it" for the loop classification.
+	// Immutable after construction (set by a composite literal before
+	// the loop goroutine starts) — the queues lock does not protect it and must not.
 	ignoreCtx bool
 
 	calls []nearstatsCall
@@ -86,8 +86,8 @@ func (p *historystatsFakePool) statsCalls() []nearstatsCall {
 	return append([]nearstatsCall(nil), p.calls...)
 }
 
-// historyRows — pgx.Rows с одной строкой агрегата (appeared, lost).
-// empty — ответ без строк (Next сразу ложен), err — ответ rows.Err.
+// historyRows — pgx.Rows with one aggregate row (appeared, lost).
+// empty — an answer without rows (Next false at once); err — the rows.Err answer.
 type historyRows struct {
 	row    []any
 	next   bool
@@ -131,7 +131,7 @@ func (r *historyRows) RawValues() [][]byte    { return nil }
 func (r *historyRows) Conn() *pgx.Conn        { return nil }
 func (r *historyRows) TypeMap() *pgtype.Map   { return nil }
 
-// --- тесты --------------------------------------------------------------------
+// --- tests ---------------------------------------------------------------------
 
 const wantHistoryStatsSQL = "SELECT coalesce(max(value) FILTER (WHERE name = 'laravel_appeared_total'), 0), " +
 	"coalesce(max(value) FILTER (WHERE name = 'laravel_lost_total'), 0) " +
@@ -158,9 +158,9 @@ func TestHistoryStatsOnceNilPool(t *testing.T) {
 	}
 }
 
-// TestHistoryStatsOnceErrors — деградации ответа агрегата: ошибка
-// запроса, пустой ответ, нечитаемая строка, ошибка итерации — каждая с
-// контекстом задачи в тексте и нулевым итогом.
+// TestHistoryStatsOnceErrors — the aggregate answer degradations: a query
+// error, an empty answer, an unreadable row, an iteration error — each with
+// the task context in the text and a zero result.
 func TestHistoryStatsOnceErrors(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -193,8 +193,8 @@ func TestHistoryStatsOnceErrors(t *testing.T) {
 	}
 }
 
-// TestHistoryStatsOptionsDefaults — нулевой интервал — час; граница
-// «≤ 0»: положительный наносекундный интервал дефолтом не заменяется.
+// TestHistoryStatsOptionsDefaults — a zero interval — an hour; the
+// "≤ 0" boundary: a positive nanosecond interval is not replaced by the default.
 func TestHistoryStatsOptionsDefaults(t *testing.T) {
 	if got := (HistoryStatsOptions{}).withDefaults().Interval; got != DefaultHistoryStatsInterval {
 		t.Errorf("дефолт интервала = %v, want %v", got, DefaultHistoryStatsInterval)
@@ -204,7 +204,7 @@ func TestHistoryStatsOptionsDefaults(t *testing.T) {
 	}
 }
 
-// historyGaugeValue — значение gauge по имени из реестра.
+// historyGaugeValue — the gauge value by name from the registry.
 func historyGaugeValue(t *testing.T, reg *metrics.Registry, name string) float64 {
 	t.Helper()
 	mfs, err := reg.Gather()
@@ -275,9 +275,9 @@ func TestHistoryStatsLoopNoop(t *testing.T) {
 	}
 }
 
-// TestHistoryStatsLoopErrorSurvives — ошибка прохода не убивает цикл:
-// Warn в лог (отмена ctx ни при чём — она классифицирует только ошибки
-// под уже отменённым контекстом), очередной проход считает заново.
+// TestHistoryStatsLoopErrorSurvives — a pass error does not kill the loop:
+// a Warn into the log (a ctx cancellation is not at fault — it classifies only
+// errors under an already cancelled context); the next pass counts anew.
 func TestHistoryStatsLoopErrorSurvives(t *testing.T) {
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&buf, nil))
@@ -311,10 +311,10 @@ func TestHistoryStatsLoopErrorSurvives(t *testing.T) {
 	}
 }
 
-// TestHistoryStatsLoopPassDuringCancel — успешный проход под уже
-// отменённым ctx (пул игнорирует отмену) — штатный итог в gauge'ах, а не
-// тишина ветки «отмена во время прохода»: отмена классифицирует только
-// ошибки.
+// TestHistoryStatsLoopPassDuringCancel — a successful pass under an already
+// cancelled ctx (the pool ignores the cancellation) — a normal result in the gauges, not
+// the silence of the "cancellation during the pass" branch: the cancellation classifies
+// only errors.
 func TestHistoryStatsLoopPassDuringCancel(t *testing.T) {
 	pool := &historystatsFakePool{stats: [][2]int64{{7, 2}}, ignoreCtx: true}
 	reg := metrics.New("monitor-test")

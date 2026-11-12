@@ -1,12 +1,12 @@
-// Юнит-тесты отчёта системной нагрузки (T-173): разбор /proc-файлов
-// (loadavg, stat, meminfo, строки процессов, PSI some/full), дельты
-// утилизации CPU и тиков процессов, топы, формат отчёта (секции,
-// «н/д»-деградация), источник OSLoad на каталоге фикстур, цикл на
-// фейках одним-двумя проходами (рестарт имени между проходами — окно
-// топа CPU пропускается без мусора андерфлоу, T-189); источник очередей
-// RedisQueues — бэклог групп потребления на фейке redisGroupsCmd
-// (T-188). Живые /proc и Redis — вне юнит-тестов (герметичность,
-// стиль psi_test.go).
+// Unit tests of the system load report (T-173): the parsing of the /proc files
+// (loadavg, stat, meminfo, the process lines, PSI some/full), the utilization
+// and process tick deltas, the tops, the report format (sections,
+// "n/a" degradation), the OSLoad source on a fixture directory, the loop on
+// fakes with one–two passes (a name restart between passes — the CPU top
+// window is skipped without underflow junk, T-189); the queue source
+// RedisQueues — the consumer group backlog on a fake redisGroupsCmd
+// (T-188). Live /proc and Redis — outside the unit tests (hermeticity,
+// the psi_test.go style).
 package monitor
 
 import (
@@ -24,8 +24,8 @@ import (
 	"crawler/internal/queue"
 )
 
-// writeFix — файл фикстуры во временном корне (родительский каталог
-// создаётся — фикстуры лежат в pressure/ и PID-каталогах).
+// writeFix — a fixture file in the temporary root (the parent directory
+// is created — the fixtures live in pressure/ and PID directories).
 func writeFix(t *testing.T, root, name, content string) {
 	t.Helper()
 	path := filepath.Join(root, name)
@@ -37,14 +37,14 @@ func writeFix(t *testing.T, root, name, content string) {
 	}
 }
 
-// loadFixtures — каталог /proc-фикстур: 4 ядра, load 24/22/20, 2 ГиБ
-// занятой памяти, своп 200 МиБ, PSI, три процесса (два headless-shell).
+// loadFixtures — the /proc fixture directory: 4 cores, a load of 24/22/20, 2 GiB
+// of used memory, a 200 MiB swap, PSI, three processes (two headless-shell).
 func loadFixtures(t *testing.T) string {
 	t.Helper()
 	root := t.TempDir()
 	writeFix(t, root, "loadavg", "24.82 21.96 20.67 3/943 1588621\n")
-	// 4 ядра × 100 тиков: busy 97/100 по сумме ядер (user 70, sys 24,
-	// idle 3, iowait 0 … на каждое ядро) — строка cpu агрегированная.
+	// 4 cores × 100 ticks: busy 97/100 by the sum of the cores (user 70, sys 24,
+	// idle 3, iowait 0 … per core) — the cpu line is aggregated.
 	writeFix(t, root, "stat",
 		"cpu  28000 0 9600 1200 0 200 0 0\n"+
 			"cpu0 7000 0 2400 300 0 50 0 0\n"+
@@ -64,20 +64,20 @@ func loadFixtures(t *testing.T) string {
 		"some avg10=7.85 avg60=7.57 avg300=5.97 total=19881877618\n"+
 			"full avg10=2.00 avg60=1.87 avg300=1.76 total=8010557278\n")
 
-	// Процессы: utime+stime — поля 12/13 после имени; statm resident —
-	// поле 2 (страницы по 4 КиБ в тесте не важны — множитель страницы хоста).
-	// 1588621 (monitor) 20 0 ... utime=300 stime=100 → 400 тиков.
+	// The processes: utime+stime — the fields 12/13 after the name; the statm resident —
+	// field 2 (4 KiB pages do not matter in the test — the host page multiplier).
+	// 1588621 (monitor) 20 0 ... utime=300 stime=100 → 400 ticks.
 	mkdirFix(t, root, "1588621", "(monitor) R 1 0 0 0 -1 4194560 0 0 0 0 "+
 		"300 100 0 0 20 0 1 0", "3000 500 200 10 0 400 0\n")
-	// Два headless-shell по 1000 тиков и 262144 страниц (1 ГиБ).
+	// Two headless-shell with 1000 ticks and 262144 pages (1 GiB) each.
 	mkdirFix(t, root, "201", "(headless-shell) S 1 0 0 0 -1 4194560 0 0 0 0 "+
 		"700 300 0 0 20 0 1 0", "262144 262144 100 10 0 262144 0\n")
 	mkdirFix(t, root, "202", "(headless-shell) S 1 0 0 0 -1 4194560 0 0 0 0 "+
 		"600 400 0 0 20 0 2 0", "262144 262144 100 10 0 262144 0\n")
-	// postgres с именем, содержащим пробелы и скобки.
+	// postgres with a name containing spaces and parentheses.
 	mkdirFix(t, root, "203", "(postgres: 1[2] writer) S 1 0 0 0 -1 0 0 0 0 0 "+
 		"500 500 0 0 20 0 3 0", "1000 900 50 5 0 900 0\n")
-	// Не-PID каталог и файл — игнорируются.
+	// A non-PID directory and a file — ignored.
 	if err := os.Mkdir(filepath.Join(root, "acpi"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -85,7 +85,7 @@ func loadFixtures(t *testing.T) string {
 	return root
 }
 
-// mkdirFix — PID-каталог фикстуры со stat и statm.
+// mkdirFix — a PID fixture directory with stat and statm.
 func mkdirFix(t *testing.T, root, pid, stat, statm string) {
 	t.Helper()
 	dir := filepath.Join(root, pid)
@@ -123,8 +123,8 @@ func TestOSLoad_Fixtures(t *testing.T) {
 		t.Errorf("swap total/free = %d/%d", st.SwapTotal, st.SwapFree)
 	}
 
-	// Процессы: агрегаты по имени — headless-shell слит (2 процесса),
-	// кривое имя postgres с пробелами/скобками разобрано целиком.
+	// The processes: the aggregates by name — headless-shell merged (2 processes),
+	// the corrupt postgres name with spaces/parentheses parsed whole.
 	if got := st.Procs["monitor"].Ticks; got != 400 {
 		t.Errorf("monitor тики = %d, want 400", got)
 	}
@@ -141,7 +141,7 @@ func TestOSLoad_Fixtures(t *testing.T) {
 
 func TestOSLoad_NoPressureFiles(t *testing.T) {
 	root := loadFixtures(t)
-	// Ядро без PSI: файлы давления отсутствуют — снимок жив, PSI «н/д».
+	// A kernel without PSI: the pressure files are missing — the snapshot lives, PSI is "n/a".
 	if err := os.RemoveAll(filepath.Join(root, "pressure")); err != nil {
 		t.Fatal(err)
 	}
@@ -184,7 +184,7 @@ func TestCPUDelta(t *testing.T) {
 	}
 }
 
-// fakeLoadSource — LoadSource с очередью снимков (кончилась — последний).
+// fakeLoadSource — a LoadSource with a snapshot queue (exhausted — the last one).
 type fakeLoadSource struct {
 	states []LoadStat
 }
@@ -200,7 +200,7 @@ func (s *fakeLoadSource) Load(context.Context) (LoadStat, error) {
 	return st, nil
 }
 
-// fakeLoadQueues — QueueSource с заготовленным снимком.
+// fakeLoadQueues — a QueueSource with a prepared snapshot.
 type fakeLoadQueues struct {
 	queues map[string]QueueStat
 	err    error
@@ -210,7 +210,7 @@ func (s fakeLoadQueues) Queues(context.Context) (map[string]QueueStat, error) {
 	return s.queues, s.err
 }
 
-// fakeLoadSpace — SpaceChecker с единственным ответом.
+// fakeLoadSpace — a SpaceChecker with a single answer.
 type fakeLoadSpace struct {
 	stat SpaceStat
 	err  error
@@ -224,7 +224,7 @@ func TestLoadReportLoop_OnePass(t *testing.T) {
 		t.Fatalf("снимок: %v", err)
 	}
 	src := &fakeLoadSource{states: []LoadStat{st}}
-	// Len фикстуры — бэклоги (T-188): формат строки не меняется.
+	// The Len of the fixtures — backlogs (T-188): the line format does not change.
 	queues := map[string]QueueStat{
 		queue.StreamDNS:    {Len: 121, Read: 500},
 		queue.StreamRender: {Len: 116320, Read: 1200},
@@ -238,10 +238,10 @@ func TestLoadReportLoop_OnePass(t *testing.T) {
 		Notify:   func(text string) { reports = append(reports, text) },
 	}
 
-	// Отмена ДО старта: стартовый pass выполняется (снимок после рестарта
-	// — сразу), цикл выходит по уже закрытому ctx — ровно один отчёт.
-	// Дельты (утилизация, темпы) этим проходом не проверяются — их
-	// считает formatLoadReport-тест ниже.
+	// A cancellation BEFORE the start: the starting pass runs (a snapshot after a restart
+	// — right away), the loop exits by the already closed ctx — exactly one report.
+	// The deltas (the utilization, the rates) are not checked by this pass —
+	// the formatLoadReport test below counts them.
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	done := make(chan error, 1)
@@ -259,13 +259,13 @@ func TestLoadReportLoop_OnePass(t *testing.T) {
 	}
 	r := reports[0]
 	for _, want := range []string{
-		"📊 Нагрузка: CPU н/д",           // дельты нет — база
-		"🧮 Топ CPU: н/д",                // темпы процессов — тоже дельта
-		"headless-shell 2.0ГиБ (2 пр.)", // топ памяти полноценен сразу
-		"💾 RAM: занято 5.4 из 7.6 ГиБ",  // 7973728−2359296 КиБ
+		"📊 Нагрузка: CPU н/д",           // no delta — the base
+		"🧮 Топ CPU: н/д",                // the process rates are also a delta
+		"headless-shell 2.0ГиБ (2 пр.)", // the memory top is full right away
+		"💾 RAM: занято 5.4 из 7.6 ГиБ",  // 7973728−2359296 KiB
 		"swap 198 МиБ",
 		"📀 Диск /var/lib/crawler/content: свободно 44 из 79 ГиБ (56%)",
-		"📬 Очереди: q:dns 121 · q:render 116320", // бэклоги без дельт
+		"📬 Очереди: q:dns 121 · q:render 116320", // backlogs without deltas
 	} {
 		if !strings.Contains(r, want) {
 			t.Errorf("отчёт не содержит %q:\n%s", want, r)
@@ -273,17 +273,17 @@ func TestLoadReportLoop_OnePass(t *testing.T) {
 	}
 }
 
-// TestLoadReportLoop_ProcRestart — рестарт процессов имени между
-// проходами (T-189, бой 25.10: postgres 18 → 16 процессов — сумма тиков
-// имени упала): uint64-вычитание меньшей суммы из большей андерфлоуится
-// к ~2⁶⁴ и после деления на perCore печатает мусорные «10¹⁴ ядер»
-// («postgres 310613997334638.2я»). Немонотонное имя пропускается за
-// окно — честное отсутствие, не ноль и не мусор; прочие имена корректны,
-// топ памяти рестартованного имени жив (имя не исчезает из отчёта).
+// TestLoadReportLoop_ProcRestart — a restart of a name's processes between
+// passes (T-189, production of Oct 25: postgres 18 → 16 processes — the name's
+// tick sum fell): the uint64 subtraction of a smaller sum from a bigger one underflows
+// to ~2⁶⁴ and after dividing by perCore prints junk "10¹⁴ cores"
+// ("postgres 310613997334638.2 cores"). The non-monotonic name is skipped for the
+// window — an honest absence, not zero and not junk; the other names are correct,
+// the memory top of the restarted name is alive (the name does not vanish from the report).
 func TestLoadReportLoop_ProcRestart(t *testing.T) {
-	// Окно 40 000 тиков на 4 ядрах → perCore 10 000. База: postgres
-	// 100 000 тиков; второй проход: postgres рестартован (сумма упала
-	// до 1 000), headless-shell и render-worker монотонно растут.
+	// A window of 40,000 ticks on 4 cores → perCore 10,000. The base: postgres
+	// 100,000 ticks; the second pass: postgres restarted (the sum fell
+	// to 1,000); headless-shell and render-worker grow monotonically.
 	base := LoadStat{
 		Load1: 4, Load5: 4, Load15: 4,
 		CPU:      CPUStat{Total: 1_000_000, Cores: 4},
@@ -302,13 +302,13 @@ func TestLoadReportLoop_ProcRestart(t *testing.T) {
 			"postgres":       {Ticks: 1_000, RSS: 2 << 30, Count: 16},
 			"headless-shell": {Ticks: 60_000, RSS: 1 << 30, Count: 2},
 			"render-worker":  {Ticks: 21_000},
-			// Новое имя окна: в базе его не было — полная сумма тиков
-			// и есть дельта (тики начаты внутри окна), 5 000/10 000.
+			// A new name of the window: it was not in the base — the full tick sum
+			// is the delta (the ticks started inside the window): 5,000/10,000.
 			"cron": {Ticks: 5_000},
 		},
 	}
 	src := &fakeLoadSource{states: []LoadStat{base, cur}}
-	reports := make(chan string, 8) // буфер: хвостовые проходы до отмены
+	reports := make(chan string, 8) // a buffer: the tail passes before the cancellation
 	opts := LoadReportOptions{
 		Interval: 20 * time.Millisecond,
 		Notify:   func(text string) { reports <- text },
@@ -336,20 +336,20 @@ func TestLoadReportLoop_ProcRestart(t *testing.T) {
 		t.Fatalf("цикл: %v", err)
 	}
 
-	// Рестартованное имя пропущено, прочие корректны: headless-shell
-	// 10 000/10 000 = 1.0я; новое имя cron — 5 000/10 000 = 0.5я
-	// (полная сумма: в базе его не было); render-worker 1 000/10 000 = 0.1я.
+	// The restarted name skipped, the others correct: headless-shell
+	// 10,000/10,000 = 1.0 (cores); the new cron name — 5,000/10,000 = 0.5
+	// (the full sum: it was not in the base); render-worker 1,000/10,000 = 0.1.
 	if want := "🧮 Топ CPU: headless-shell 1.0я, cron 0.5я, render-worker 0.1я"; !strings.Contains(r, want) {
 		t.Errorf("топ CPU = %q, хочу %q:\n%s", topCPULine(r), want, r)
 	}
-	// Топ памяти имени жив — рестарт лечит только дельту CPU.
+	// The memory top of the name is alive — the restart cures only the CPU delta.
 	if want := "postgres 2.0ГиБ (16 пр.)"; !strings.Contains(r, want) {
 		t.Errorf("postgres исчез из топа памяти (должен остаться):\n%s", r)
 	}
 
-	// Мусорных значений нет: доля имени ограничена ядрами сверху (сумма
-	// тиков всех имён ≤ тиков системы), всё выше — андерфлоу; порог
-	// ядра × 8 — запас на счётные аномалии, мусор симптома ~10¹⁴.
+	// No junk values: a name's share is bounded by the cores from above (the tick
+	// sum of all names ≤ the system ticks); everything above is an underflow; the
+	// core × 8 threshold — headroom for counting anomalies; the junk symptom is ~10¹⁴.
 	for _, item := range strings.Split(strings.TrimPrefix(topCPULine(r), "🧮 Топ CPU: "), ", ") {
 		name, v, ok := strings.Cut(item, " ")
 		if !ok {
@@ -368,7 +368,7 @@ func TestLoadReportLoop_ProcRestart(t *testing.T) {
 	}
 }
 
-// topCPULine — строка «🧮 Топ CPU: …» отчёта (пусто — нет).
+// topCPULine — the "CPU top" line of the report (empty — none).
 func topCPULine(report string) string {
 	for _, line := range strings.Split(report, "\n") {
 		if strings.HasPrefix(line, "🧮 Топ CPU: ") {
@@ -383,16 +383,16 @@ func TestFormatLoadReport_Deltas(t *testing.T) {
 	if err != nil {
 		t.Fatalf("снимок: %v", err)
 	}
-	busy, io := 0.975, 0.0 // user/sys доли отчётом не печатаются — только busy/io
+	busy, io := 0.975, 0.0 // the user/sys shares are not printed by the report — only busy/io
 	procCPU := map[string]float64{
 		"postgres":       1.9,
 		"headless-shell": 1.15,
 		"http-worker":    0.5,
 		"analyzer":       0.31,
-		"unbound":        0.01, // шум: ниже порога
+		"unbound":        0.01, // noise: below the threshold
 	}
-	// Len фикстур — бэклоги (T-188): дельта ±N — рост/дренаж бэклога
-	// (−1200 — дренаж q:render), темп N/с — доставки.
+	// The Len of the fixtures — backlogs (T-188): a delta of ±N — a backlog growth/drain
+	// (−1200 — the q:render drain); a rate of N/s — deliveries.
 	queues := map[string]QueueStat{
 		queue.StreamDNS:    {Len: 121, Read: 2100},
 		queue.StreamRender: {Len: 115120, Read: 1200},
@@ -429,8 +429,8 @@ func TestFormatLoadReport_Deltas(t *testing.T) {
 }
 
 func TestFormatLoadReport_Degraded(t *testing.T) {
-	// Нет очередей и диска — «н/д» секции; PSI отсутствует — строки
-	// давления просто короче.
+	// No queues and no disk — "n/a" sections; PSI missing — the pressure
+	// lines are simply shorter.
 	st := LoadStat{
 		Load1: 1.0, Load5: 1.0, Load15: 1.0,
 		CPU:      CPUStat{Cores: 4},
@@ -447,8 +447,8 @@ func TestFormatLoadReport_Degraded(t *testing.T) {
 		t.Errorf("PSI попал в отчёт без данных:\n%s", r)
 	}
 
-	// Источник долга независим от очередей (ревью T-175, P3-1): при
-	// недоступных очередях строка долга всё равно печатается.
+	// The debt source is independent of the queues (the T-175 review, P3-1): with
+	// unavailable queues the debt line is printed anyway.
 	debt := RenderDebt{Flags: 443000, Lag: 99120}
 	r = formatLoadReport(st, nil, nil, nil, nil, nil, false, nil, nil, &debt)
 	if !strings.Contains(r, "📬 Рендер-долг: флаги 443000 + лаг 99120 = 542120") {
@@ -457,7 +457,7 @@ func TestFormatLoadReport_Degraded(t *testing.T) {
 }
 
 func TestParseProcStatLine(t *testing.T) {
-	// Имя со скобками и пробелами; utime/stime — 12/13 поля после имени.
+	// A name with parentheses and spaces; utime/stime — the 12/13 fields after the name.
 	line := "203 (postgres: 1[2] writer) S 1 0 0 0 -1 0 0 0 0 0 500 500 0 0 20 0"
 	if comm, ticks := parseProcStatLine([]byte(line)); comm != "postgres: 1[2] writer" || ticks != 1000 {
 		t.Errorf("parseProcStatLine = %q %d", comm, ticks)
@@ -467,46 +467,46 @@ func TestParseProcStatLine(t *testing.T) {
 	}
 }
 
-// TestRedisQueues_NoClient — nil-клиент: ошибка источника.
+// TestRedisQueues_NoClient — a nil client: a source error.
 func TestRedisQueues_NoClient(t *testing.T) {
 	if _, err := (RedisQueues{}).Queues(context.Background()); err == nil {
 		t.Error("клиент nil: хочу ошибку источника")
 	}
 }
 
-// TestRedisQueues_Backlog — глубина стрима отчёта — бэклог групп
-// потребления (T-188): история в XLEN не завышает глубину (бой 25.10:
-// q:render XLEN 136 500 при бэклоге 27 529); несколько групп — сумма
-// вкладов (queue.GroupDepth); lag −1 — только pending; стрим без групп
-// и карантин q:dead — XLEN; Read — максимум entries-read по группам.
-// Фейк — fakeGroupsRedis (streamgroups_test.go), тот же интерфейс.
+// TestRedisQueues_Backlog — the depth of a report stream — the backlog of the
+// consumer groups (T-188): the history in XLEN does not overstate the depth
+// (production of Oct 25: q:render XLEN 136,500 at a backlog of 27,529); several
+// groups — the sum of the contributions (queue.GroupDepth); lag −1 — pending only; a stream
+// without groups and the q:dead quarantine — XLEN; Read — the maximum of the groups' entries-read.
+// The fake — fakeGroupsRedis (streamgroups_test.go), the same interface.
 func TestRedisQueues_Backlog(t *testing.T) {
 	rdb := &fakeGroupsRedis{
 		groups: map[string][]redis.XInfoGroup{
-			// Бой 25.10 (ТЗ §2): XLEN 136 500 — 17 ч необрезанной
-			// истории, бэклог группы min(27409, 136500) + 120 = 27 529.
+			// Production of Oct 25 (spec §2): XLEN 136,500 — 17h of untrimmed
+			// history; the group backlog min(27409, 136500) + 120 = 27,529.
 			queue.StreamRender: {{
 				Name: "render-worker", Lag: 27409, Pending: 120, EntriesRead: 1097613,
 			}},
-			// Две группы: min(98, 50)+2 = 52 и 10+1 = 11 → 63; Read —
-			// максимум по группам.
+			// Two groups: min(98, 50)+2 = 52 and 10+1 = 11 → 63; Read —
+			// the maximum over the groups.
 			queue.StreamHTTP: {
 				{Name: "http-worker", Lag: 98, Pending: 2, EntriesRead: 500},
 				{Name: "retry", Lag: 10, Pending: 1, EntriesRead: 700},
 			},
-			// lag −1 (обрезка недоставленного, T-168) — только pending.
+			// lag −1 (a trim of undelivered, T-168) — pending only.
 			queue.StreamAnalyze: {{
 				Name: "analyzer", Lag: -1, Pending: 1, EntriesRead: 8_000_000,
 			}},
-			// Стрим есть, групп нет — никто не доставлял: XLEN.
+			// The stream exists, no groups — nobody delivered: XLEN.
 			queue.StreamDNS: {},
-			// q:render-fallback — группа воркера B: min(40, 300)+1 = 41
-			// (S-P3-1: стрим в отчёте, бэклог считается общей формулой).
+			// q:render-fallback — the worker B group: min(40, 300)+1 = 41
+			// (S-P3-1: the stream in the report; the backlog is computed by the shared formula).
 			queue.StreamRenderFallback: {{
 				Name: "render-fallback-worker", Lag: 40, Pending: 1, EntriesRead: 77,
 			}},
-			// q:dead — всегда XLEN: глубина карантина — инвентарь
-			// оператора, не бэклог (групп у него нет по построению).
+			// q:dead — always XLEN: the quarantine depth is the
+			// operator's inventory, not a backlog (it has no groups by construction).
 			queue.StreamDead: {{Name: "triage", Lag: 100, Pending: 5, EntriesRead: 30}},
 		},
 		xlen: map[string]int64{
@@ -539,7 +539,7 @@ func TestRedisQueues_Backlog(t *testing.T) {
 		}
 	}
 
-	// Стримов нет вовсе (очередь пуста отродясь) — {0, 0} без ошибки.
+	// No streams at all (a queue empty from birth) — {0, 0} without an error.
 	rdb2 := &fakeGroupsRedis{groups: map[string][]redis.XInfoGroup{}, xlen: map[string]int64{}}
 	q2, err := RedisQueues{RDB: rdb2}.Queues(context.Background())
 	if err != nil {
@@ -552,10 +552,10 @@ func TestRedisQueues_Backlog(t *testing.T) {
 	}
 }
 
-// TestRedisQueues_GroupsError — ошибка XINFO GROUPS (не «нет ключа»)
-// роняет секцию с именем стрима: бэклог без состояний групп не
-// считается, сырой XLEN вместо него завышал бы глубину историей (T-188).
-// «Нет ключа» от XLEN — вклад {0, 0}, секция жива.
+// TestRedisQueues_GroupsError — an XINFO GROUPS error (not "no key")
+// drops the section with the stream name: a backlog without group states is
+// not counted; a raw XLEN instead of it would overstate the depth with history (T-188).
+// "No key" from XLEN — a {0, 0} contribution; the section is alive.
 func TestRedisQueues_GroupsError(t *testing.T) {
 	rdb := &fakeGroupsRedis{
 		groups:    map[string][]redis.XInfoGroup{},

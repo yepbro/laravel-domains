@@ -1,25 +1,25 @@
-// Счётчик находок Laravel в серой зоне порога (T-115, по итогам анализа
-// larasites 2026-10-19): laravel_findings хранит все срабатывания правил
-// независимо от итога (T-071), находки с score ниже порога
-// analyzer.laravel_min_score — материал калибровки весов и порога
-// (T-116/T-117) и индикатор качества набора правил в бою: стабильная
-// серая зона — норма (слабые признаки частых не-Laravel стеков),
-// всплеск — сигнал деградации точности после смены правил.
+// The counter of Laravel findings in the threshold gray zone (T-115, from the analysis
+// of larasites of 2026-10-19): laravel_findings stores all rule firings
+// regardless of the outcome (T-071); findings with a score below the
+// analyzer.laravel_min_score threshold — material for calibrating the weights and the
+// threshold (T-116/T-117) and an indicator of the rule set quality in production: a stable
+// gray zone is the norm (weak signs of frequent non-Laravel stacks);
+// a spike is a signal of precision degradation after a rule change.
 //
-// Метрика — gauge crawler_laravel_near_findings: текущее число findings
-// с min_score/2 <= score < min_score (половина порога — нижняя граница
-// «почти-срабатываний»: ниже шум одиночных слабых правил, аналогично
-// one.log старой реализации — «хосты с единственным признаком»).
-// Командная строка разбора тех же строк — crawlerctl near (T-115):
-// gauge отвечает «сколько», CLI — «какие именно»; SQL обеих сторон
-// держит одна семантика диапазона, текст запроса здесь — единственный
-// источник правды о границах для метрики.
+// The metric — the crawler_laravel_near_findings gauge: the current number of findings
+// with min_score/2 <= score < min_score (half the threshold — the lower boundary
+// of "near-firings": below is the noise of single weak rules, similarly
+// to one.log of the old implementation — "hosts with a single sign").
+// The command line parsing the same rows — crawlerctl near (T-115):
+// the gauge answers "how many", the CLI — "which exactly"; the SQL of both
+// sides keeps one range semantics; the query text here is the single
+// source of truth about the boundaries for the metric.
 //
-// Период — час, а не 30–60 с пересчёта зон (T-078): проход считает
-// агрегат по laravel_findings (последовательное чтение партиций, на
-// боевом корпусе — десятки миллионов строк), а серая зона — материал
-// калибровки, не оперативный сигнал: часовая свежесть достаточна,
-// цена прохода — как один проход zonestats, но в 60 раз реже.
+// The period is an hour, not the 30–60 s of zone recounts (T-078): a pass counts
+// the aggregate over laravel_findings (a sequential partition read; on
+// the production corpus — tens of millions of rows), and the gray zone is
+// calibration material, not an operational signal: an hour of freshness is enough;
+// the pass price is like one zonestats pass, but 60× rarer.
 package monitor
 
 import (
@@ -35,27 +35,27 @@ import (
 	"crawler/internal/metrics"
 )
 
-// DefaultNearStatsInterval — период цикла NearStatsLoop: 1 ч
-// (обоснование цены прохода — в комментарии пакета).
+// DefaultNearStatsInterval — the NearStatsLoop cycle period: 1h
+// (the pass price justification — in the package comment).
 const DefaultNearStatsInterval = time.Hour
 
-// nearStatsSQL — один проход: число находок серой зоны. Границы —
-// параметры (real в SQL, float32 в таблице): порог читается из
-// конфигурации на каждом запуске цикла, смена analyzer.laravel_min_score
-// подхватывается рестартом monitor; параметр, а не литерал, потому что
-// значение — конфигурация оператора, а не код схемы (в отличие от кодов
-// check_state/status в проходах планировщика).
+// nearStatsSQL — one pass: the number of gray zone findings. The boundaries —
+// parameters (real in SQL, float32 in the table): the threshold is read from
+// the configuration at every loop run; a change of analyzer.laravel_min_score
+// is picked up by a monitor restart; a parameter, not a literal, because
+// the value is the operator's configuration, not the schema code (unlike the
+// check_state/status codes in the scheduler passes).
 const nearStatsSQL = "SELECT count(*) FROM laravel_findings WHERE score >= $1::real AND score < $2::real"
 
-// NearStatsOptions — параметры цикла NearStatsLoop; нулевые значения
-// заменяются дефолтами (withDefaults, стиль ZoneStatsOptions).
+// NearStatsOptions — the NearStatsLoop parameters; zero values are
+// replaced by defaults (withDefaults, the ZoneStatsOptions style).
 type NearStatsOptions struct {
-	// Interval — период цикла (DefaultNearStatsInterval).
+	// Interval — the cycle period (DefaultNearStatsInterval).
 	Interval time.Duration
-	// MinScore — порог is_laravel (analyzer.laravel_min_score); серая
-	// зона — [MinScore/2, MinScore). Валидируется NearStatsOnce.
+	// MinScore — the is_laravel threshold (analyzer.laravel_min_score); the gray
+	// zone is [MinScore/2, MinScore). Validated by NearStatsOnce.
 	MinScore float64
-	// Log — логгер цикла; nil — записи подавлены (slog.DiscardHandler).
+	// Log — the loop logger; nil — entries suppressed (slog.DiscardHandler).
 	Log *slog.Logger
 }
 
@@ -66,10 +66,10 @@ func (o NearStatsOptions) withDefaults() NearStatsOptions {
 	return o
 }
 
-// NearStatsOnce выполняет один проход: число находок laravel_findings в
-// серой зоне [minScore/2, minScore) одним запросом (стиль
-// analyzer.ZoneIDByName — db.DB без QueryRow). Идемпотентен (ТЗ 3.4):
-// повтор даёт то же значение при том же состоянии таблицы.
+// NearStatsOnce performs one pass: the number of laravel_findings findings in
+// the gray zone [minScore/2, minScore) by one query (the
+// analyzer.ZoneIDByName style — a db.DB without QueryRow). Idempotent (spec 3.4):
+// a repeat gives the same value at the same table state.
 func NearStatsOnce(ctx context.Context, pool db.DB, minScore float64) (int64, error) {
 	if pool == nil {
 		return 0, errors.New("monitor: счётчик серой зоны: пул не задан")
@@ -96,10 +96,10 @@ func NearStatsOnce(ctx context.Context, pool db.DB, minScore float64) (int64, er
 	return n, nil
 }
 
-// NewNearGauge создаёт gauge crawler_laravel_near_findings в реестре reg
-// (метка service подставит фабрика); nil — nil: сервис без реестра
-// (изолированные сборки) цикл не поднимает (стиль metrics.NewQueueGauge).
-// Идемпотентен (T-076).
+// NewNearGauge creates the crawler_laravel_near_findings gauge in the reg registry
+// (the service label is substituted by the factory); nil — nil: a service without a
+// registry (isolated builds) does not raise the loop (the metrics.NewQueueGauge style).
+// Idempotent (T-076).
 func NewNearGauge(reg *metrics.Registry) *prometheus.GaugeVec {
 	if reg == nil {
 		return nil
@@ -112,17 +112,17 @@ func NewNearGauge(reg *metrics.Registry) *prometheus.GaugeVec {
 
 // mutator-disable-regexp log\.Info\("цикл statement/remove
 // mutator-disable-regexp log\.Debug\("проход statement/remove
-// Обоснование: служебные записи цикла серой зоны (старт Info, итог
-// успешного прохода Debug) — поведение счётчика не меняют, гасятся по
-// docs/mutation-testing.md §4 (логирование не тестируется).
+// Justification: the service entries of the gray zone loop (the Info start, the Debug result
+// of a successful pass) — they do not change the counter behavior, damped per
+// docs/mutation-testing.md §4 (logging is not tested).
 
-// NearStatsLoop — периодический цикл пересчёта: NearStatsOnce по ticker,
-// значение — в gauge. Первый проход — сразу при старте (свежее значение
-// после простоя/рестарта, стиль ZoneStatsLoop); ошибка прохода
-// прерывает только его (Warn, цикл живёт — контракт OnRun, T-012),
-// gauge хранит последнее успешное значение. Отмена ctx — чистый nil
-// (graceful shutdown, ТЗ 3.4). nil gauge/пула — no-op: запуск без
-// реестра не должен падать (стиль CollectQueueLoop).
+// NearStatsLoop — a periodic recount loop: NearStatsOnce by ticker,
+// the value — into the gauge. The first pass — right at start (a fresh value
+// after an idle/restart, the ZoneStatsLoop style); a pass error
+// interrupts only that pass (a Warn, the loop keeps living — the OnRun contract, T-012);
+// the gauge holds the last successful value. A ctx cancellation — a clean nil
+// (graceful shutdown, spec 3.4). A nil gauge/pool — no-op: a run without
+// a registry must not crash (the CollectQueueLoop style).
 func NearStatsLoop(ctx context.Context, pool db.DB, reg *metrics.Registry, opts NearStatsOptions) error {
 	gauge := NewNearGauge(reg)
 	if gauge == nil || pool == nil {
@@ -139,13 +139,13 @@ func NearStatsLoop(ctx context.Context, pool db.DB, reg *metrics.Registry, opts 
 	pass := func() {
 		n, err := NearStatsOnce(ctx, pool, o.MinScore)
 		switch {
-		// Тело ветки пустое (только комментарий): branch/case подменяет
-		// его на noop-EmptyStmt, печать которого идентична оригиналу, —
-		// мутант с пустым диффом, тестом не убить; подавление генерации —
-		// единственная альтернатива блэклисту чексумм (§4).
+		// The branch body is empty (only a comment): branch/case replaces it
+		// with a noop EmptyStmt whose print is identical to the original —
+		// a mutant with an empty diff, not killable by a test; suppressing generation is
+		// the only alternative to the checksum blacklist (§4).
 		// mutator-disable-next-line branch/case
 		case err != nil && ctx.Err() != nil:
-			// Отмена во время прохода — часть остановки, не тревога.
+			// A cancellation during the pass — part of the shutdown, not an alarm.
 		case err != nil:
 			log.Warn("проход счётчика серой зоны", "err", err)
 		default:

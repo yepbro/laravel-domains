@@ -1,12 +1,12 @@
-// Юнит-тесты алертов очереди фолбэка рендера (T-246, ТЗ рендера §4.6
-// п.3): рост глубины q:render-fallback (порог — эффективный watermark
-// стрима, механика render_debt: уровень + серия роста/у порога +
-// защёлка), превышение бюджета доли (окно дельт счётчика событий
-// suspended{reason="budget"} зонда /metrics рендер-воркера, suspends.go
-// — парсер и деградации) и рост browser-ошибок этапа (S-P2-6,
-// rate-детектор по счётчику
-// crawler_stage_errors_total{stage="render",type="browser"} того же
-// зонда). Фейковые источники, стиль renderdebt/badhashes тестов.
+// Unit tests of the render fallback queue alerts (T-246, render spec §4.6
+// item 3): the growth of the q:render-fallback depth (the threshold — the effective
+// watermark of the stream, the render_debt mechanics: a level + a growth/at-threshold
+// series + a latch), exceeding the share budget (a delta window of the event
+// counter suspended{reason="budget"} of the render worker /metrics probe, suspends.go
+// — the parser and the degradations) and the growth of the stage browser errors (S-P2-6,
+// a rate detector over the counter
+// crawler_stage_errors_total{stage="render",type="browser"} of the same
+// probe). Fake sources, the style of the renderdebt/badhashes tests.
 package monitor
 
 import (
@@ -21,9 +21,9 @@ import (
 	"crawler/internal/queue"
 )
 
-// fakeBudgetEvents — источник счётчика событий бюджета доли по заготовке
-// (стиль fakeBadHashes): значение меняется между проходами, очередь
-// ошибок пустая — ответ без ошибки.
+// fakeBudgetEvents — a share budget event counter source per a stub
+// (the fakeBadHashes style): the value changes between passes, the error
+// queue is empty — an answer without an error.
 type fakeBudgetEvents struct {
 	mu    sync.Mutex
 	val   int64
@@ -47,30 +47,30 @@ func (f *fakeBudgetEvents) FallbackBudget(context.Context) (int64, error) {
 	return f.val, nil
 }
 
-// --- рост глубины q:render-fallback -------------------------------------------
+// --- the q:render-fallback depth growth -----------------------------------------
 
-// setFallbackDepth — заготовка глубины прохода: Len(q:render-fallback)
-// читает карту ленера (одинаково для всех последующих проходов, тест
-// задаёт значение на шаг).
+// setFallbackDepth — a stub of the pass depth: Len(q:render-fallback)
+// reads the lener map (the same for all subsequent passes; the test
+// sets the value per step).
 func setFallbackDepth(env *alertsTestEnv, depth int64) {
 	env.lener.lens[queue.StreamRenderFallback] = depth
 }
 
-// TestAlertsRenderFallbackDepthGrowth — срабатывание по росту: глубина
-// растёт 2 прохода подряд, пересекая порог; удержание стагнацией
-// (защёлка), снятие дренажем ниже 90 % порога; разовый всплеск публикаций
-// (скачок, рассосавшийся до следующего прохода) оператора не будит.
-// Стационарная глубина у порога — второй триггер, отдельный тест ниже
+// TestAlertsRenderFallbackDepthGrowth — firing by growth: the depth
+// grows for 2 passes in a row, crossing the threshold; holding by
+// stagnation (the latch), clearing by a drain below 90% of the threshold; a one-off publication
+// spike (a jump that dissolved before the next pass) does not wake the operator.
+// A stationary depth at the threshold — the second trigger, a separate test below
 // (TestAlertsRenderFallbackDepthStationary).
 func TestAlertsRenderFallbackDepthGrowth(t *testing.T) {
-	// Порог 1000 (watermark из дефолта тестового окружения; предел
-	// MAXLEN стрима выше — без клампа), снятие < 900.
+	// A threshold of 1000 (the watermark from the test environment default; the
+	// stream's MAXLEN limit is higher — without a clamp), clearing < 900.
 	env := newAlertsTestEnv(t, nil)
 	ctx := context.Background()
 	m := env.newRenderFbDepthMachine()
 
-	// База и рост ниже порога: серия роста копится, порог ещё не
-	// задействован.
+	// The base and growth below the threshold: the growth series accumulates; the threshold is
+	// not yet engaged.
 	s := m.transition(env.Alerts, ctx, obs(int64(500)))
 	if s.Status != AlertStatusOK {
 		t.Fatalf("база: %s (%s), want ok", s.Status, s.Detail)
@@ -80,13 +80,13 @@ func TestAlertsRenderFallbackDepthGrowth(t *testing.T) {
 			t.Errorf("detail = %q, want содержит %s", s.Detail, want)
 		}
 	}
-	// Один проход роста — серии мало (разовый всплеск публикаций —
-	// штатная работа фолбэка «собрать и доработать»).
+	// One growth pass — the series is short (a one-off publication spike is
+	// normal fallback operation of "collect and finish").
 	s = m.transition(env.Alerts, ctx, obs(int64(800)))
 	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "серия роста 1/2") {
 		t.Fatalf("один проход роста: %s (%s), want ok с серией 1/2", s.Status, s.Detail)
 	}
-	// Второй проход роста с пересечением порога — срабатывание.
+	// The second growth pass with a threshold crossing — firing.
 	s = m.transition(env.Alerts, ctx, obs(int64(1420)))
 	if s.Status != AlertStatusFiring {
 		t.Fatalf("второй проход роста: %s (%s), want firing", s.Status, s.Detail)
@@ -96,22 +96,22 @@ func TestAlertsRenderFallbackDepthGrowth(t *testing.T) {
 			t.Errorf("detail = %q, want содержит %s", s.Detail, want)
 		}
 	}
-	// Стагнация выше порога снятия — удержание (не повторный Warn,
-	// эпизод один).
+	// Stagnation above the clearing threshold — a hold (not a repeated Warn;
+	// one episode).
 	if s := m.transition(env.Alerts, ctx, obs(int64(1410))); s.Status != AlertStatusFiring {
 		t.Errorf("стагнация: %s (%s), want firing (удержание)", s.Status, s.Detail)
 	}
-	// Дренаж ниже 90 % порога — снятие.
+	// A drain below 90% of the threshold — clearing.
 	if s := m.transition(env.Alerts, ctx, obs(int64(890))); s.Status != AlertStatusOK {
 		t.Errorf("дренаж: %s (%s), want ok", s.Status, s.Detail)
 	}
-	// Коридор гистерезиса (900..1000) без сработавшего алерта — ok:
-	// порог срабатывания строгий, рост в коридоре серию копит.
+	// The hysteresis corridor (900..1000) without a fired alert — ok: the firing
+	// threshold is strict; growth in the corridor builds the series.
 	if s := m.transition(env.Alerts, ctx, obs(int64(950))); s.Status != AlertStatusOK {
 		t.Errorf("коридор без алерта: %s (%s), want ok", s.Status, s.Detail)
 	}
-	// Просадка сбрасывает серию; повторное накопление — снова два
-	// прохода роста (рост через порог — то же накопление).
+	// A dip resets the series; re-accumulation is again two
+	// growth passes (growth through the threshold is the same accumulation).
 	_ = m.transition(env.Alerts, ctx, obs(int64(800))) // streak 0
 	s = m.transition(env.Alerts, ctx, obs(int64(1010)))
 	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "серия роста 1/2") {
@@ -122,23 +122,23 @@ func TestAlertsRenderFallbackDepthGrowth(t *testing.T) {
 	}
 }
 
-// TestAlertsRenderFallbackDepthStationary — второй триггер (S-P2-1,
-// решение оператора): глубина ≥ порога 2 прохода подряд БЕЗ роста —
-// firing со 2-го прохода (серия роста базируется нулём и стационарную
-// глубину не видит — рестарт монитора посреди эпизода больше не глушит
-// алерт); упор в потолок MAXLEN — firing и удержание (XADD вытесняет
-// старейшие недоставленные записи, глубина стоит); одиночный всплеск,
-// рассосавшийся между проходами, — тихо (анти-спайк); защёлка/снятие
-// прежние.
+// TestAlertsRenderFallbackDepthStationary — the second trigger (S-P2-1,
+// the operator's decision): a depth ≥ the threshold for 2 passes in a row WITHOUT growth —
+// firing from the 2nd pass (the growth series is based at zero and does not see the
+// stationary depth — a monitor restart in the middle of an episode no longer mutes
+// the alert); pinning at the MAXLEN cap — firing and a hold (XADD evicts the
+// oldest undelivered entries, the depth stands); a one-off spike dissolved
+// between passes — silent (anti-spike); the latch/clearing
+// are the same.
 func TestAlertsRenderFallbackDepthStationary(t *testing.T) {
-	// Порог — кламп по половине MAXLEN q:render-fallback (15 000/2 =
-	// 7 500), как на дефолтных watermark 100 тыс.
+	// The threshold — a clamp at half of the q:render-fallback MAXLEN (15,000/2 =
+	// 7,500), as at the default watermark of 100k.
 	env := newAlertsTestEnv(t, func(o *AlertsOptions) { o.QueueWatermark = 100000 })
 	ctx := context.Background()
 	m := env.newRenderFbDepthMachine()
 
-	// Стационарная глубина 9000 без роста: первый проход — база
-	// (у порога 1/2), второй — firing.
+	// A stationary depth of 9000 without growth: the first pass — the
+	// base (at the threshold 1/2), the second — firing.
 	s := m.transition(env.Alerts, ctx, obs(int64(9000)))
 	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "у порога 1/2") {
 		t.Fatalf("стационарная база: %s (%s), want ok с серией у порога 1/2", s.Status, s.Detail)
@@ -153,8 +153,8 @@ func TestAlertsRenderFallbackDepthStationary(t *testing.T) {
 		}
 	}
 
-	// Упор в потолок MAXLEN: глубина не растёт (обрезка вытесняет
-	// недоставленное) — firing и удержание.
+	// Pinning at the MAXLEN cap: the depth does not grow (the trim evicts
+	// the undelivered) — firing and a hold.
 	if s := m.transition(env.Alerts, ctx, obs(int64(15000))); s.Status != AlertStatusFiring {
 		t.Errorf("упор в MAXLEN: %s (%s), want firing", s.Status, s.Detail)
 	}
@@ -162,26 +162,26 @@ func TestAlertsRenderFallbackDepthStationary(t *testing.T) {
 		t.Errorf("упор в MAXLEN, второй проход: %s (%s), want firing (удержание)", s.Status, s.Detail)
 	}
 
-	// Дренаж ниже 90 % порога — снятие (защёлка не вечна).
+	// A drain below 90% of the threshold — clearing (the latch is not eternal).
 	if s := m.transition(env.Alerts, ctx, obs(int64(6000))); s.Status != AlertStatusOK {
 		t.Errorf("дренаж: %s (%s), want ok", s.Status, s.Detail)
 	}
 
-	// Одиночный всплеск между проходами (рассасывается) — тихо: серия
-	// у порога не набирается, рост одного прохода — не триггер.
-	_ = m.transition(env.Alerts, ctx, obs(int64(9000))) // у порога 1/2, ok
-	_ = m.transition(env.Alerts, ctx, obs(int64(100)))  // рассосался, ok
+	// A one-off spike between the passes (dissolving) — silent: the
+	// at-threshold series does not build up; one growth pass is not a trigger.
+	_ = m.transition(env.Alerts, ctx, obs(int64(9000))) // at the threshold 1/2, ok
+	_ = m.transition(env.Alerts, ctx, obs(int64(100)))  // dissolved, ok
 	s = m.transition(env.Alerts, ctx, obs(int64(9000)))
 	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "у порога 1/2") {
 		t.Errorf("одиночный всплеск: %s (%s), want ok с серией у порога 1/2 (анти-спайк)", s.Status, s.Detail)
 	}
 }
 
-// TestAlertsRenderFallbackDepthWatermark — порог из конфигурации по
-// образцу q:render: эффективный watermark стрима
+// TestAlertsRenderFallbackDepthWatermark — the threshold from the configuration
+// following the q:render model: the effective watermark of the stream
 // queue.StreamWatermark(scheduler.queue_high_watermark, redis.maxlen,
-// q:render-fallback) — кламп по половине предела MAXLEN (политика T-025:
-// q:render-fallback — 15 000 → 7 500 на дефолтных 100 тыс.).
+// q:render-fallback) — a clamp at half of the MAXLEN limit (the T-025 policy:
+// q:render-fallback — 15,000 → 7,500 at the default 100k).
 func TestAlertsRenderFallbackDepthWatermark(t *testing.T) {
 	cases := []struct {
 		name      string
@@ -201,9 +201,9 @@ func TestAlertsRenderFallbackDepthWatermark(t *testing.T) {
 			})
 			ctx := context.Background()
 			m := env.newRenderFbDepthMachine()
-			// Серия роста двумя проходами на глубине ровно порога.
-			_ = m.transition(env.Alerts, ctx, obs(tc.want+10)) // база
-			_ = m.transition(env.Alerts, ctx, obs(tc.want+20)) // рост 1
+			// A growth series by two passes at a depth exactly the threshold.
+			_ = m.transition(env.Alerts, ctx, obs(tc.want+10)) // the base
+			_ = m.transition(env.Alerts, ctx, obs(tc.want+20)) // growth 1
 			s := m.transition(env.Alerts, ctx, obs(tc.want+30))
 			if s.Status != AlertStatusFiring {
 				t.Fatalf("глубина %d > порога %d: %s (%s), want firing",
@@ -217,45 +217,45 @@ func TestAlertsRenderFallbackDepthWatermark(t *testing.T) {
 			}
 		})
 	}
-	// Глубина ровно порога: одиночный проход — не firing (анти-спайк:
-	// всплеск обязан пережить второй проход), стационарно — firing со
-	// второго прохода (S-P2-1: равенство — уже «у порога», серия у
-	// порога без роста — полноценный триггер); рост с пересечением
-	// порога — срабатывание.
+	// A depth exactly the threshold: a single pass — not firing (anti-spike:
+	// the spike must survive the second pass); stationary — firing from
+	// the second pass (S-P2-1: equality is already "at the threshold"; an
+	// at-threshold series without growth is a full trigger); growth with a
+	// threshold crossing — firing.
 	env := newAlertsTestEnv(t, func(o *AlertsOptions) { o.QueueWatermark = 1000 })
 	ctx := context.Background()
 	m := env.newRenderFbDepthMachine()
-	_ = m.transition(env.Alerts, ctx, obs(int64(1000))) // база (у порога 1/2)
+	_ = m.transition(env.Alerts, ctx, obs(int64(1000))) // the base (at the threshold 1/2)
 	if s := m.transition(env.Alerts, ctx, obs(int64(1000))); s.Status != AlertStatusFiring {
 		t.Errorf("глубина == порогу без роста два прохода: %s (%s), want firing (стационарно у порога, S-P2-1)", s.Status, s.Detail)
 	}
-	_ = m.transition(env.Alerts, ctx, obs(int64(1001))) // рост 1 (удержание)
+	_ = m.transition(env.Alerts, ctx, obs(int64(1001))) // growth 1 (hold)
 	if s := m.transition(env.Alerts, ctx, obs(int64(1002))); s.Status != AlertStatusFiring {
 		t.Errorf("рост через порог: %s (%s), want firing", s.Status, s.Detail)
 	}
 }
 
-// TestAlertsRenderFallbackDepthDegradation — Redis не задан, порог не
-// задан, ошибка Len — «не измеряется» (ошибка — с Warn); память трекинга
-// и защёлка сработавшего эпизода переживают сбой источника (стиль
-// render_debt).
+// TestAlertsRenderFallbackDepthDegradation — Redis not set, the threshold not
+// set, a Len error — "not measured" (an error — with a Warn); the tracking
+// memory and the latch of the fired episode survive a source failure (the
+// render_debt style).
 func TestAlertsRenderFallbackDepthDegradation(t *testing.T) {
-	// Redis не задан — как у алертов очередей.
+	// Redis not set — like the queue alerts.
 	env := newAlertsTestEnv(t, nil)
 	a := NewAlerts(AlertsDeps{Pool: env.pool}, env.opts)
 	if s := snapshotOf(t, a.Pass(context.Background()), AlertRenderFbDepth); s.Status != AlertStatusNotMeasured {
 		t.Errorf("Redis не задан: %s, want not_measured", s.Status)
 	}
 
-	// Порог не задан (гейт выключен) — не измеряется.
+	// The threshold not set (the gate off) — not measured.
 	env2 := newAlertsTestEnv(t, func(o *AlertsOptions) { o.QueueWatermark = 0 })
 	if s := snapshotOf(t, env2.Pass(context.Background()), AlertRenderFbDepth); s.Status != AlertStatusNotMeasured {
 		t.Errorf("watermark 0: %s, want not_measured", s.Status)
 	}
 
-	// Ошибка Len — Warn; очередь ошибок: до этого алерта Len зовут
-	// 6 раз (4 стрима алерта очередей + q:dead + q:render рендер-долга
-	// — он раньше по порядку машин NewAlerts), ошибка — седьмая.
+	// A Len error — a Warn; the error queue: before this alert Len is called
+	// 6 times (4 streams of the queue alert + q:dead + the q:render of render debt
+	// — it is earlier in the NewAlerts machine order); the error is the seventh.
 	env3 := newAlertsTestEnv(t, nil)
 	env3.lener.errs = []error{nil, nil, nil, nil, nil, nil, errors.New("redis: xinfo")}
 	s := snapshotOf(t, env3.Pass(context.Background()), AlertRenderFbDepth)
@@ -266,14 +266,14 @@ func TestAlertsRenderFallbackDepthDegradation(t *testing.T) {
 		t.Errorf("ошибка Len без Warn:\n%s", env3.buf.String())
 	}
 
-	// Память трекинга переживает сбой: рост считается от последнего
-	// успешного снимка; защёлка сработавшего эпизода сбой не рвёт.
+	// The tracking memory survives the failure: growth is counted from the last
+	// successful snapshot; the latch of the fired episode is not broken by the failure.
 	env4 := newAlertsTestEnv(t, nil)
 	ctx := context.Background()
 	setFallbackDepth(env4, 1200)
-	_ = snapshotOf(t, env4.Pass(ctx), AlertRenderFbDepth) // база
+	_ = snapshotOf(t, env4.Pass(ctx), AlertRenderFbDepth) // the base
 	setFallbackDepth(env4, 1300)
-	_ = snapshotOf(t, env4.Pass(ctx), AlertRenderFbDepth) // рост
+	_ = snapshotOf(t, env4.Pass(ctx), AlertRenderFbDepth) // growth
 	setFallbackDepth(env4, 1400)
 	if s := snapshotOf(t, env4.Pass(ctx), AlertRenderFbDepth); s.Status != AlertStatusFiring {
 		t.Fatalf("до сбоя: %s, want firing", s.Status)
@@ -282,7 +282,7 @@ func TestAlertsRenderFallbackDepthDegradation(t *testing.T) {
 	if s := snapshotOf(t, env4.Pass(ctx), AlertRenderFbDepth); s.Status != AlertStatusNotMeasured {
 		t.Fatalf("сбой источника: %s, want not_measured", s.Status)
 	}
-	setFallbackDepth(env4, 1350) // выше порога снятия 900
+	setFallbackDepth(env4, 1350) // above the clearing threshold of 900
 	if s := snapshotOf(t, env4.Pass(ctx), AlertRenderFbDepth); s.Status != AlertStatusFiring {
 		t.Errorf("после сбоя, глубина 1350: %s, want firing (эпизод пережил сбой)", s.Status)
 	}
@@ -292,18 +292,18 @@ func TestAlertsRenderFallbackDepthDegradation(t *testing.T) {
 	}
 }
 
-// --- превышение бюджета доли ---------------------------------------------------
+// --- the share budget exceeding --------------------------------------------------
 
-// TestAlertsRenderFallbackBudgetEpisode — событие приостановки (рост
-// счётчика) — срабатывание; окно держит алерт до старения дельты
-// (6 проходов), поток событий продлевает; рестарт воркера (убыль
-// счётчика) — без ложного всплеска.
+// TestAlertsRenderFallbackBudgetEpisode — a suspension event (counter
+// growth) — firing; the window holds the alert until the delta ages
+// (6 passes); an event flow extends it; a worker restart (a counter
+// decrease) — without a false spike.
 func TestAlertsRenderFallbackBudgetEpisode(t *testing.T) {
 	env := newAlertsTestEnv(t, nil)
 	ctx := context.Background()
 	m := env.newRenderFbBudgetMachine()
 
-	// База: накопленное до старта мониторинга не событие.
+	// The base: what accumulated before the monitoring start is not an event.
 	s := m.transition(env.Alerts, ctx, obs(int64(3)))
 	if s.Status != AlertStatusOK {
 		t.Fatalf("база: %s (%s), want ok", s.Status, s.Detail)
@@ -311,7 +311,7 @@ func TestAlertsRenderFallbackBudgetEpisode(t *testing.T) {
 	if !strings.Contains(s.Detail, "события бюджета 3") {
 		t.Errorf("detail = %q, want значение счётчика", s.Detail)
 	}
-	// Событие — срабатывание (порог 1: каждое защёлкивание — аномалия).
+	// An event — firing (the threshold 1: every latching is an anomaly).
 	s = m.transition(env.Alerts, ctx, obs(int64(4)))
 	if s.Status != AlertStatusFiring {
 		t.Fatalf("событие: %s (%s), want firing", s.Status, s.Detail)
@@ -321,8 +321,8 @@ func TestAlertsRenderFallbackBudgetEpisode(t *testing.T) {
 			t.Errorf("detail = %q, want содержит %s", s.Detail, want)
 		}
 	}
-	// Окно 6 проходов держит алерт старением: 5 проходов без событий —
-	// ещё держит, шестой вытесняет дельту — снятие.
+	// The window of 6 passes holds the alert by aging: 5 passes without events —
+	// still holding; the sixth evicts the delta — clearing.
 	for range 5 {
 		if got := m.transition(env.Alerts, ctx, obs(int64(4))); got.Status != AlertStatusFiring {
 			t.Fatalf("окно держит событие: %s (%s), want firing", got.Status, got.Detail)
@@ -331,11 +331,11 @@ func TestAlertsRenderFallbackBudgetEpisode(t *testing.T) {
 	if got := m.transition(env.Alerts, ctx, obs(int64(4))); got.Status != AlertStatusOK {
 		t.Fatalf("после старения окна: %s (%s), want ok", got.Status, got.Detail)
 	}
-	// Рестарт воркера (счётчик обнулился) — убыль не всплеск.
+	// A worker restart (the counter reset) — a decrease is not a spike.
 	if got := m.transition(env.Alerts, ctx, obs(int64(0))); got.Status != AlertStatusOK {
 		t.Errorf("рестарт воркера: %s (%s), want ok без всплеска", got.Status, got.Detail)
 	}
-	// Поток событий продлевает алерт: событие в каждом проходе.
+	// An event flow extends the alert: an event in every pass.
 	for i := int64(1); i <= 3; i++ {
 		if got := m.transition(env.Alerts, ctx, obs(i)); got.Status != AlertStatusFiring {
 			t.Fatalf("поток событий, проход %d: %s, want firing", i, got.Status)
@@ -343,26 +343,26 @@ func TestAlertsRenderFallbackBudgetEpisode(t *testing.T) {
 	}
 }
 
-// TestAlertsRenderFallbackBudgetPrecreatedSeries — S-P1-4 (мониторная
-// часть) поверх предсозданных серий T-250: первое событие бюджета 0→1 —
-// firing (первый проход зонда читает 0 и базирует prev нулём — событие
-// больше не теряется); рестарт воркера (счётчик процессный, обнулился) —
-// повторное первое событие снова firing, убыль — без ложного всплеска.
+// TestAlertsRenderFallbackBudgetPrecreatedSeries — S-P1-4 (the monitor
+// part) on top of the T-250 pre-created series: the first budget event 0→1 —
+// firing (the first probe pass reads 0 and bases prev at zero — the event
+// is no longer lost); a worker restart (a process counter, reset) —
+// the first event again fires; a decrease — without a false spike.
 func TestAlertsRenderFallbackBudgetPrecreatedSeries(t *testing.T) {
 	env := newAlertsTestEnv(t, nil)
 	ctx := context.Background()
 	m := env.newRenderFbBudgetMachine()
 
-	// Предсозданная серия: зонд читает 0 (не «не измеряется»), prev
-	// базируется нулём.
+	// The pre-created series: the probe reads 0 (not "not measured"); prev
+	// is based at zero.
 	if s := m.transition(env.Alerts, ctx, obs(int64(0))); s.Status != AlertStatusOK {
 		t.Fatalf("нулевая серия: %s (%s), want ok (предсоздание T-250)", s.Status, s.Detail)
 	}
-	// Первое событие 0→1 — firing: дельта видна, окно её держит.
+	// The first event 0→1 — firing: the delta is visible, the window holds it.
 	if s := m.transition(env.Alerts, ctx, obs(int64(1))); s.Status != AlertStatusFiring {
 		t.Fatalf("первое событие 0→1: %s (%s), want firing", s.Status, s.Detail)
 	}
-	// Окно стареет: 5 проходов держат событие, шестой вытесняет — снятие.
+	// The window ages: 5 passes hold the event, the sixth evicts — clearing.
 	for range 5 {
 		if got := m.transition(env.Alerts, ctx, obs(int64(1))); got.Status != AlertStatusFiring {
 			t.Fatalf("окно держит событие: %s (%s), want firing", got.Status, got.Detail)
@@ -371,19 +371,19 @@ func TestAlertsRenderFallbackBudgetPrecreatedSeries(t *testing.T) {
 	if got := m.transition(env.Alerts, ctx, obs(int64(1))); got.Status != AlertStatusOK {
 		t.Fatalf("после старения окна: %s (%s), want ok", got.Status, got.Detail)
 	}
-	// Рестарт воркера: счётчик процессный — обнулился; убыль не всплеск.
+	// A worker restart: a process counter — reset; a decrease is not a spike.
 	if got := m.transition(env.Alerts, ctx, obs(int64(0))); got.Status != AlertStatusOK {
 		t.Fatalf("рестарт воркера: %s (%s), want ok без всплеска", got.Status, got.Detail)
 	}
-	// Повторное первое событие (0→1 нового процесса) — снова firing.
+	// A repeated first event (0→1 of the new process) — firing again.
 	if got := m.transition(env.Alerts, ctx, obs(int64(1))); got.Status != AlertStatusFiring {
 		t.Fatalf("первое событие после рестарта: %s (%s), want firing", got.Status, got.Detail)
 	}
 }
 
-// TestAlertsRenderFallbackBudgetDegradation — источник не задан — тихое
-// «не измеряется» (адрес не настроен), ошибка зонда — «не измеряется»
-// с Warn (метрики нет в экспозиции — ошибка разбора, тоже Warn).
+// TestAlertsRenderFallbackBudgetDegradation — the source not set — a quiet
+// "not measured" (the address not configured); a probe error — "not measured"
+// with a Warn (no metric in the exposition — a parse error, also a Warn).
 func TestAlertsRenderFallbackBudgetDegradation(t *testing.T) {
 	env := newAlertsTestEnv(t, nil)
 	s := snapshotOf(t, env.Pass(context.Background()), AlertRenderFbBudget)
@@ -408,9 +408,9 @@ func TestAlertsRenderFallbackBudgetDegradation(t *testing.T) {
 		t.Errorf("ошибка зонда без Warn:\n%s", env2.buf.String())
 	}
 
-	// Очередь ошибок опустела — следующий проход живого зонда работает
-	// (успешный путь observeRenderFallbackBudget полным стеком): база
-	// кольца без всплеска.
+	// The error queue emptied — the next pass of the live probe works
+	// (the success path of observeRenderFallbackBudget with the full stack): a ring
+	// base without a spike.
 	src.set(5)
 	if s := snapshotOf(t, env2.Pass(context.Background()), AlertRenderFbBudget); s.Status != AlertStatusOK ||
 		!strings.Contains(s.Detail, "события бюджета 5") {
@@ -418,10 +418,10 @@ func TestAlertsRenderFallbackBudgetDegradation(t *testing.T) {
 	}
 }
 
-// --- browser-ошибки этапа рендера (S-P2-6) --------------------------------------
+// --- the stage browser errors of render (S-P2-6) ----------------------------------
 
-// fakeBrowserErrors — источник счётчика browser-ошибок по заготовке
-// (стиль fakeBudgetEvents).
+// fakeBrowserErrors — a browser error counter source per a stub
+// (the fakeBudgetEvents style).
 type fakeBrowserErrors struct {
 	mu   sync.Mutex
 	val  int64
@@ -437,27 +437,27 @@ func (f *fakeBrowserErrors) RenderBrowserErrors(context.Context) (int64, error) 
 	return f.val, nil
 }
 
-// TestAlertsRenderBrowserErrors — rate-детектор (S-P2-6): серия
-// browser-ошибок (рост счётчика 2 прохода подряд) — firing; одиночная
-// ошибка — тихо; счётчик перестал расти — снятие (алерт события, не
-// состояния); рестарт воркера (убыль) — без всплеска, новое накопление
-// с нуля.
+// TestAlertsRenderBrowserErrors — the rate detector (S-P2-6): a series of
+// browser errors (counter growth for 2 passes in a row) — firing; a single
+// error — silent; the counter stopped growing — clearing (an event alert, not
+// a state one); a worker restart (a decrease) — without a spike; a new
+// accumulation from scratch.
 func TestAlertsRenderBrowserErrors(t *testing.T) {
 	env := newAlertsTestEnv(t, nil)
 	ctx := context.Background()
 	m := env.newRenderBrowserErrMachine()
 
-	// База: ленивое семейство — 0 у живого воркера без browser-ошибок.
+	// The base: the lazy family — 0 at a live worker without browser errors.
 	s := m.transition(env.Alerts, ctx, obs(int64(0)))
 	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "browser-ошибки рендера 0") {
 		t.Fatalf("база: %s (%s), want ok с нулём", s.Status, s.Detail)
 	}
-	// Одиночная ошибка — серия 1/2, тихо (штатный перезапуск сессии).
+	// A single error — a series of 1/2, silent (a normal session restart).
 	s = m.transition(env.Alerts, ctx, obs(int64(1)))
 	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "серия роста 1/2") {
 		t.Fatalf("одиночная: %s (%s), want ok с серией 1/2", s.Status, s.Detail)
 	}
-	// Серия — второй растущий проход: firing.
+	// A series — the second growing pass: firing.
 	s = m.transition(env.Alerts, ctx, obs(int64(3)))
 	if s.Status != AlertStatusFiring {
 		t.Fatalf("серия: %s (%s), want firing", s.Status, s.Detail)
@@ -467,16 +467,16 @@ func TestAlertsRenderBrowserErrors(t *testing.T) {
 			t.Errorf("detail = %q, want содержит %s", s.Detail, want)
 		}
 	}
-	// Счётчик стоит — серия сброшена, алерт снят (восстановление движка
-	// или удержание гейта: новых ошибок нет).
+	// The counter stands — the series is reset, the alert cleared (an engine recovery
+	// or the gate hold: no new errors).
 	if s := m.transition(env.Alerts, ctx, obs(int64(3))); s.Status != AlertStatusOK {
 		t.Errorf("стационарно: %s (%s), want ok", s.Status, s.Detail)
 	}
-	// Рестарт воркера (счётчик процессный, обнулился) — убыль не всплеск.
+	// A worker restart (a process counter, reset) — a decrease is not a spike.
 	if s := m.transition(env.Alerts, ctx, obs(int64(0))); s.Status != AlertStatusOK {
 		t.Errorf("рестарт воркера: %s (%s), want ok без всплеска", s.Status, s.Detail)
 	}
-	// Новое накопление — снова два растущих прохода.
+	// A new accumulation — again two growing passes.
 	s = m.transition(env.Alerts, ctx, obs(int64(2)))
 	if s.Status != AlertStatusOK || !strings.Contains(s.Detail, "серия роста 1/2") {
 		t.Errorf("первый проход новой серии: %s (%s), want ok с серией 1/2", s.Status, s.Detail)
@@ -486,11 +486,11 @@ func TestAlertsRenderBrowserErrors(t *testing.T) {
 	}
 }
 
-// TestAlertsRenderBrowserErrorsDegradation — источник не задан — тихое
-// «не измеряется» с подсказкой адреса; чужая экспозиция (адрес настроен
-// не на рендер-воркер) — тихое «не измеряется» без Warn (S-P2-6:
-// конфигурация, не авария зонда); сетевая ошибка — «не измеряется»
-// с Warn.
+// TestAlertsRenderBrowserErrorsDegradation — the source not set — a quiet
+// "not measured" with the address hint; a foreign exposition (the address is
+// not configured to a render worker) — a quiet "not measured" without a Warn (S-P2-6:
+// a configuration, not a probe incident); a network error — "not measured"
+// with a Warn.
 func TestAlertsRenderBrowserErrorsDegradation(t *testing.T) {
 	env := newAlertsTestEnv(t, nil)
 	s := snapshotOf(t, env.Pass(context.Background()), AlertRenderBrowserErr)
@@ -522,18 +522,18 @@ func TestAlertsRenderBrowserErrorsDegradation(t *testing.T) {
 		t.Errorf("сетевая ошибка без Warn:\n%s", env3.buf.String())
 	}
 
-	// Очередь ошибок опустела — живой зонд читает ленивую серию (успех
-	// observeRenderBrowserErrors полным стеком): 0 без ошибок — ok.
+	// The error queue emptied — the live probe reads the lazy series (the
+	// success of observeRenderBrowserErrors with the full stack): 0 without errors — ok.
 	if s := snapshotOf(t, env3.Pass(context.Background()), AlertRenderBrowserErr); s.Status != AlertStatusOK ||
 		!strings.Contains(s.Detail, "browser-ошибки рендера 0") {
 		t.Errorf("живой зонд после ошибки: %s (%s), want ok с нулём", s.Status, s.Detail)
 	}
 }
 
-// TestParseBrowserErrorsExposition — табличный разбор ветки
-// stage="render",type="browser": соседние классы (task/context) и чужой
-// stage не мешают; ленивое семейство (серии нет у рендер-воркера) — 0;
-// чужая экспозиция без маркера — errNotRenderExposition.
+// TestParseBrowserErrorsExposition — a table parse of the
+// stage="render",type="browser" branch: neighboring classes (task/context) and
+// a foreign stage do not interfere; the lazy family (no series at the render worker) — 0;
+// a foreign exposition without the marker — errNotRenderExposition.
 func TestParseBrowserErrorsExposition(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -572,11 +572,11 @@ func TestParseBrowserErrorsExposition(t *testing.T) {
 	}
 }
 
-// --- зонд /metrics рендер-воркера (suspends.go) ----------------------------------
+// --- the /metrics probe of the render worker (suspends.go) ------------------------
 
-// TestRenderSuspendsHTTP — зонд читает ветку reason="budget" и счётчик
-// browser-ошибок из живой экспозиции (httptest): gate-события и прочие
-// приборы не мешают, путь 404 — ошибка с адресом.
+// TestRenderSuspendsHTTP — the probe reads the reason="budget" branch and the
+// browser error counter from a live exposition (httptest): gate events and other
+// gauges do not interfere; a 404 path — an error with the address.
 func TestRenderSuspendsHTTP(t *testing.T) {
 	const expo = `# HELP crawler_render_fallback_suspended_total События приостановки
 # TYPE crawler_render_fallback_suspended_total counter
@@ -621,11 +621,11 @@ crawler_stage_tasks_total{stage="render"} 123
 	}
 }
 
-// TestParseSuspendExposition — табличный разбор: точная пара меток,
-// пропуск HELP/TYPE и чужих метрик, предсозданная серия T-250 (0 с
-// первого старта), отсутствие метрики/ветки — 0 при маркере
-// рендер-воркера (S-P1-4) и ошибка для чужой экспозиции, мусорное
-// значение — ошибка.
+// TestParseSuspendExposition — a table parse: the exact label pair,
+// skipping HELP/TYPE and foreign metrics; the T-250 pre-created series (0 from
+// the first start); a missing metric/branch — 0 at the render-worker
+// marker (S-P1-4) and an error for a foreign exposition; a junk
+// value — an error.
 func TestParseSuspendExposition(t *testing.T) {
 	cases := []struct {
 		name    string

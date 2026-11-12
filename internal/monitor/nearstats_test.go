@@ -1,11 +1,11 @@
-// Юнит-тесты счётчика серой зоны Laravel-находок (T-115) на фейковом
-// pgx-пуле: точный SQL-текст и параметры (границы диапазона real),
-// валидация порога, дефолты, ошибки запроса и деградации формы ответа
-// (пустой, нечитаемая строка, ошибка итерации), отмена ctx, цикл
-// NearStatsLoop (немедленный первый проход, gauge обновляется, Warn и
-// переживание ошибки, успешный проход под отменой, чистый выход, no-op
-// без реестра). Поведение против живой БД — dev-окружение (crawlerctl
-// near + /metrics monitor).
+// Unit tests of the Laravel findings gray zone counter (T-115) on a fake
+// pgx pool: the exact SQL text and parameters (the real range boundaries),
+// the threshold validation, the defaults, the query errors and answer-shape
+// degradations (empty, an unreadable row, an iteration error), a ctx cancellation, the loop
+// NearStatsLoop (an immediate first pass, the gauge updated, a Warn and
+// surviving an error, a successful pass under cancellation, a clean exit, no-op
+// without a registry). Behavior against a live DB — the dev environment (crawlerctl
+// near + the monitor /metrics).
 package monitor
 
 import (
@@ -27,32 +27,32 @@ import (
 	"crawler/internal/metrics"
 )
 
-// --- фейковый пул (Query — агрегат count) -----------------------------------
+// --- the fake pool (Query — a count aggregate) --------------------------------
 
-// nearstatsCall — записанный SQL-вызов с аргументами.
+// nearstatsCall — a recorded SQL call with arguments.
 type nearstatsCall struct {
 	sql  string
 	args []any
 }
 
-// nearstatsFakePool — db.DB без БД: очередь ответов агрегата count(*)
-// и ошибок, протокол вызовов. Под замком: цикл NearStatsLoop работает
-// в горутине.
+// nearstatsFakePool — a db.DB without a DB: the queue of the count(*)
+// aggregate answers and errors, the call protocol. Under a lock: the NearStatsLoop runs
+// in a goroutine.
 type nearstatsFakePool struct {
 	mu     sync.Mutex
-	counts []int64 // очередь значений count(*) (кончилась — 0)
-	errs   []error // очередь ошибок (nil — вызов без ошибки)
+	counts []int64 // the queue of count(*) values (exhausted — 0)
+	errs   []error // the error queue (nil — a call without an error)
 
-	// Деградации формы ответа (стиль alertsPool): пустой ответ (Next
-	// ложен), строка с нечитаемым типом (ошибка Scan), ошибка итерации
+	// Answer-shape degradations (the alertsPool style): an empty answer (Next
+	// false), a row with an unreadable type (a Scan error), an iteration error
 	// (rows.Err).
 	empty   bool
 	badRow  bool
 	rowsErr error
-	// ignoreCtx — отвечать успехом без проверки ctx: сценарий «проход
-	// успешен, отмены во время него не было» для классификации в цикле.
-	// Неизменяемо после конструирования (задаётся композит-литералом до
-	// старта горутины цикла) — замок очередей его не защищает и не должен.
+	// ignoreCtx — answer success without checking ctx: the scenario "the pass
+	// is successful, there was no cancellation during it" for the loop classification.
+	// Immutable after construction (set by a composite literal before
+	// the loop goroutine starts) — the queues lock does not protect it and must not.
 	ignoreCtx bool
 
 	queries []nearstatsCall
@@ -92,22 +92,22 @@ func (p *nearstatsFakePool) Query(ctx context.Context, sql string, args ...any) 
 	return &nearstatsRows{rows: [][]any{{n}}, err: p.rowsErr}, nil
 }
 
-// stats — снимок числа вызовов (ожидание прогресса цикла).
+// stats — a snapshot of the call count (waiting for loop progress).
 func (p *nearstatsFakePool) stats() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return len(p.queries)
 }
 
-// calls — снимок протокола вызовов.
+// calls — a snapshot of the call protocol.
 func (p *nearstatsFakePool) calls() []nearstatsCall {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return append([]nearstatsCall(nil), p.queries...)
 }
 
-// nearstatsRows — pgx.Rows с одной строкой агрегата. err — ответ
-// rows.Err (nil по умолчанию), тип значения строки проверяется в Scan.
+// nearstatsRows — pgx.Rows with one aggregate row. err — the rows.Err
+// answer (nil by default); the row value type is checked in Scan.
 type nearstatsRows struct {
 	rows   [][]any
 	i      int
@@ -149,14 +149,14 @@ func (r *nearstatsRows) RawValues() [][]byte    { return nil }
 func (r *nearstatsRows) Conn() *pgx.Conn        { return nil }
 func (r *nearstatsRows) TypeMap() *pgtype.Map   { return nil }
 
-// --- ожидаемый SQL-текст (контракт) ---------------------------------------
+// --- the expected SQL text (the contract) ------------------------------------
 
 const wantNearStatsSQL = "SELECT count(*) FROM laravel_findings WHERE score >= $1::real AND score < $2::real"
 
 // --- NearStatsOnce ---------------------------------------------------------
 
-// TestNearStatsOnceSQL — один запрос с точными параметрами: границы
-// серой зоны [min/2, min) приводятся к real.
+// TestNearStatsOnceSQL — one query with exact parameters: the gray zone
+// boundaries [min/2, min) are cast to real.
 func TestNearStatsOnceSQL(t *testing.T) {
 	pool := &nearstatsFakePool{counts: []int64{42}}
 	n, err := NearStatsOnce(context.Background(), pool, 0.6)
@@ -179,8 +179,8 @@ func TestNearStatsOnceSQL(t *testing.T) {
 	}
 }
 
-// TestNearStatsOnceThreshold — порог вне (0, 1) — ошибка до БД
-// (половина отрицательного или >= 1 бессмысленна).
+// TestNearStatsOnceThreshold — a threshold outside (0, 1) — an error before the DB
+// (half of a negative or >= 1 is meaningless).
 func TestNearStatsOnceThreshold(t *testing.T) {
 	pool := &nearstatsFakePool{}
 	for _, m := range []float64{0, -0.1, 1, 1.5} {
@@ -197,8 +197,8 @@ func TestNearStatsOnceThreshold(t *testing.T) {
 	}
 }
 
-// TestNearStatsOnceNilPool — пул не задан: ошибка, не паника; значение
-// ошибки — строго 0.
+// TestNearStatsOnceNilPool — the pool not set: an error, not a panic; the value
+// of the error is strictly 0.
 func TestNearStatsOnceNilPool(t *testing.T) {
 	n, err := NearStatsOnce(context.Background(), nil, 0.6)
 	if err == nil {
@@ -209,9 +209,9 @@ func TestNearStatsOnceNilPool(t *testing.T) {
 	}
 }
 
-// TestNearStatsOnceErrors — деградации ответа агрегата: ошибка запроса,
-// пустой ответ, нечитаемая строка, ошибка итерации — каждая с контекстом
-// задачи в тексте и нулевым значением (не ±1).
+// TestNearStatsOnceErrors — the aggregate answer degradations: a query
+// error, an empty answer, an unreadable row, an iteration error — each with the
+// task context in the text and a zero value (not ±1).
 func TestNearStatsOnceErrors(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -244,8 +244,8 @@ func TestNearStatsOnceErrors(t *testing.T) {
 	}
 }
 
-// TestNearStatsOptionsDefaults — нулевой интервал — час; граница «≤ 0»:
-// положительный наносекундный интервал дефолтом не заменяется.
+// TestNearStatsOptionsDefaults — a zero interval — an hour; the "≤ 0" boundary:
+// a positive nanosecond interval is not replaced by the default.
 func TestNearStatsOptionsDefaults(t *testing.T) {
 	if got := (NearStatsOptions{}).withDefaults().Interval; got != DefaultNearStatsInterval {
 		t.Errorf("дефолт интервала = %v, want %v", got, DefaultNearStatsInterval)
@@ -258,7 +258,7 @@ func TestNearStatsOptionsDefaults(t *testing.T) {
 	}
 }
 
-// nearGaugeValue — текущее значение gauge серой зоны из реестра.
+// nearGaugeValue — the current gray zone gauge value from the registry.
 func nearGaugeValue(t *testing.T, reg *metrics.Registry) float64 {
 	t.Helper()
 	mfs, err := reg.Gather()
@@ -279,8 +279,8 @@ func nearGaugeValue(t *testing.T, reg *metrics.Registry) float64 {
 	return -1
 }
 
-// TestNearStatsLoopImmediatePass — первый проход сразу: gauge получает
-// значение до первого тика; отмена — чистый nil.
+// TestNearStatsLoopImmediatePass — the first pass right away: the gauge gets
+// the value before the first tick; a cancellation — a clean nil.
 func TestNearStatsLoopImmediatePass(t *testing.T) {
 	pool := &nearstatsFakePool{counts: []int64{7}}
 	reg := metrics.New("monitor-test")
@@ -314,8 +314,8 @@ func TestNearStatsLoopImmediatePass(t *testing.T) {
 	}
 }
 
-// TestNearStatsLoopNoop — nil реестр или пул — no-op без паники
-// (изолированные сборки, стиль CollectQueueLoop).
+// TestNearStatsLoopNoop — a nil registry or pool — a no-op without a panic
+// (isolated builds, the CollectQueueLoop style).
 func TestNearStatsLoopNoop(t *testing.T) {
 	pool := &nearstatsFakePool{}
 	if err := NearStatsLoop(context.Background(), pool, nil, NearStatsOptions{MinScore: 0.6}); err != nil {
@@ -330,9 +330,9 @@ func TestNearStatsLoopNoop(t *testing.T) {
 	}
 }
 
-// TestNearStatsLoopErrorSurvives — ошибка прохода не убивает цикл:
-// Warn в лог (отмена ctx ни при чём — она классифицирует только ошибки
-// под уже отменённым контекстом), очередной проход считает заново.
+// TestNearStatsLoopErrorSurvives — a pass error does not kill the loop:
+// a Warn into the log (a ctx cancellation is not at fault — it classifies only
+// errors under an already cancelled context); the next pass counts anew.
 func TestNearStatsLoopErrorSurvives(t *testing.T) {
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&buf, nil))
@@ -365,15 +365,15 @@ func TestNearStatsLoopErrorSurvives(t *testing.T) {
 		t.Errorf("ошибка прохода при живом ctx без Warn:\n%s", log)
 	}
 	if got := nearGaugeValue(t, reg); got != 0 {
-		// Очередь значений пуста (counts не задан) — успешный проход
-		// вернул 0; важнее, что gauge существует и цикл жив.
+		// The value queue is empty (counts not set) — a successful pass
+		// returned 0; what matters more is that the gauge exists and the loop is alive.
 		t.Logf("gauge = %v после восстановления", got)
 	}
 }
 
-// TestNearStatsLoopPassDuringCancel — успешный проход под уже отменённым
-// ctx (пул игнорирует отмену) — штатный итог в gauge, а не тишина ветки
-// «отмена во время прохода»: отмена классифицирует только ошибки.
+// TestNearStatsLoopPassDuringCancel — a successful pass under an already cancelled
+// ctx (the pool ignores the cancellation) — a normal result in the gauge, not the
+// silence of the "cancellation during the pass" branch: the cancellation classifies only errors.
 func TestNearStatsLoopPassDuringCancel(t *testing.T) {
 	pool := &nearstatsFakePool{counts: []int64{42}, ignoreCtx: true}
 	reg := metrics.New("monitor-test")

@@ -1,95 +1,95 @@
-// Автомат алертов монитора (T-264, ТЗ tasks/TZ-fsm.md §3 ФТ-10): единая
-// точка правды о состояниях и переходах алертов цикла AlertsLoop
-// (monitor/alerts.go). До T-264 состояние одного алерта было размазано
-// на 2–3 переменные (карта статусов + персональные поля памяти:
-// deadStreak, psiHot, renderDebt, renderFbBudget, ...), консистентность
-// держалась вручную каждой eval-функцией; теперь каждый алерт — значение
-// единой структуры alertMachine «{имя, статус, track-память}», переход —
-// единственный метод transition, наблюдение источника (observation) и
-// решение о переходе (типизированная track-память) разделены.
-// Формализация НЕ меняет поведение алертов (ФТ-10): пороги, окна, серии,
-// защёлки и тексты деталей прежние; существующие тесты мигрированы в
-// формат «последовательность наблюдений → последовательность статусов»
-// без изменения ожиданий. Формализация не переписывает переходы на
-// FSM-фреймворк (ТЗ-fsm §1): они остаются функциями над наблюдениями с
-// охранными предикатами; эта спецификация — то, с чем сверяются eval
-// (наблюдения) и track (переходы) в alerts.go.
+// The monitor alert state machine (T-264, spec tasks/TZ-fsm.md §3 FR-10): the single
+// point of truth about the states and transitions of the AlertsLoop cycle alerts
+// (monitor/alerts.go). Before T-264 the state of one alert was smeared
+// across 2–3 variables (a status map + personal memory fields:
+// deadStreak, psiHot, renderDebt, renderFbBudget, ...); consistency
+// was maintained manually by each eval function; now each alert is a value
+// of the single alertMachine structure "{name, status, track memory}"; the transition is
+// the single method transition; the source observation and
+// the transition decision (the typed track memory) are separated.
+// The formalization does NOT change alert behavior (FR-10): the thresholds, windows, series,
+// latches and detail texts are the same; the existing tests are migrated to
+// the "sequence of observations → sequence of statuses" format
+// without changing the expectations. The formalization does not rewrite the transitions onto
+// an FSM framework (TZ-fsm spec §1): they remain functions over observations with
+// guard predicates; this specification is what the eval
+// (observations) and track (transitions) of alerts.go are checked against.
 //
-// # Состояния (единые для всех 19 машин)
+// # States (shared by all 19 machines)
 //
-//	ok           условие алерта не выполнено
-//	firing       алерт сработал (Warn на переходе; дебаунс доставки —
-//	             notify.go «только изменение состояния»)
-//	not_measured алерт неприменим или источник деградировал: ошибка (err
-//	             — Warn каждого прохода, цикл живёт) или тихая причина
-//	             (reason — Debug: неприменимость ожидаема, SMART в
-//	             контейнере); ложных срабатываний не даёт
+//	ok           the alert condition is not met
+//	firing       the alert fired (Warn on the transition; the delivery debouncing —
+//	             notify.go "state change only")
+//	not_measured the alert does not apply or the source degraded: an error (err
+//	             — a Warn every pass, the loop keeps living) or a quiet reason
+//	             (reason — Debug: the inapplicability is expected, SMART in
+//	             a container); it never yields false firings
 //
-// Статус до первого прохода — «» (пустой): все переходы из него
-// фронтовые (срабатывание/неприменимость), как у прежней пустой карты
-// состояний.
+// The status before the first pass is "" (empty): all transitions out of it are
+// front ones (firing/inapplicability), like the former empty state
+// map.
 //
-// # События
+// # Events
 //
-//	измерение  observation{value} — источник жив, наблюдение валидно
-//	           (валидность оценивает eval: минимум выборки, выключенный
-//	           контроль, maxmemory 0 — reason, не значение)
-//	деградация observation{err | reason} — источник сломан/неприменим;
-//	           track-память НЕ трогается (неизвестное наблюдение — не
-//	           наблюдение: серии, окна, защёлки переживают сбой;
-//	           восстановление доедает по фактическим данным)
+//	measurement  observation{value} — the source is alive, the observation is valid
+//	             (validity is judged by eval: a sample minimum, a disabled
+//	             check, maxmemory 0 — a reason, not a value)
+//	degradation  observation{err | reason} — the source is broken/inapplicable;
+//	             the track memory is NOT touched (an unknown observation is not
+//	             an observation: the series, windows and latches survive the failure;
+//	             recovery finishes the job on the actual data)
 //
-// # Переходы: track-тип × охрана → цель
+// # Transitions: track type × guard → target
 //
-//	| track-тип | машины | включение → firing | удержание firing | снятие → ok |
+//	| track type | machines | firing entry | firing hold | clearing → ok |
 //	|-----------|--------|--------------------|-----------------|-------------|
-//	| порог уровня thresholdTrack | progress_stall, disk_free, disk_free_min, disk_free_crit, nvme_wear, unit_oom, redis_restart | предикат наблюдения | — (памяти нет: каждый проход решает заново; «память» — сам наблюдаемый уровень, монотонный по механике: возраст метки, место, износ, счётчики событий, аптайм Redis) | тот же предикат |
-//	| гистерезис порогов hysteresisTrack | dns_temp_error_share, queue_overflow, redis_memory | fire(v) | prev = firing ∧ hold(v) — коридор снятия не дребезжит Warn | ¬(fire ∨ hold) |
-//	| серия: deadStreakTrack | queue_dead | ненулевая глубина N=3 проходов подряд | prev = firing ∧ глубина > 0 | нулевая глубина |
-//	| серия: memHighStreakTrack | memory_high | рост счётчика high юнита N=2 проходов подряд (любой юнит) | серия горячего юнита не оборвана | первый проход без роста |
-//	| серия: counterGrowthTrack | render_browser_errors | рост счётчика N=2 проходов подряд | серия не оборвана | первый проход без роста |
-//	| серия: newDoneStaleTrack | domains_new_done_stale | НОВЫЙ ненулевой снапшот реконсиляции N=2 подряд (смена updated_at: проходы алертов чаще источника, повторное чтение наблюдением не считается) | prev = firing ∧ значение > 0 | нулевой снапшот |
-//	| защёлка уровня: renderDebtTrack | render_debt | уровень > порога ∧ серия роста N=2 (строгое >) | защёлка firing при уровне ≥ порога снятия (90 %, ceil) — стагнация и колебания лага эпизод не рвут | уровень < порога снятия |
-//	| защёлка уровня: renderFbDepthTrack | render_fallback_depth | глубина ≥ порога ∧ (серия роста ИЛИ серия «у порога» N=2 — стационарная глубина, S-P2-1) | защёлка при глубине ≥ порога снятия | глубина < порога снятия |
-//	| кольцо дельт ringTrack | ingest_bad_hashes, render_fallback_budget | сумма дельт за окно (15/6 проходов) ≥ порога (10/1) | продолжение потока событий продлевает сумму | старение: вытеснение дельт из кольца |
-//	| окно времени: psiWindowTrack | psi_cpu | avg300 > порога устойчиво окно (30 мин: первый проход выше порога стартует окно, срабатывание при закрытии) | удержание = окно тикает | провал под порог сбрасывает окно (шпилька не продлевает) |
-//	| окно времени: queueFreezeTrack | queue_frozen | last-delivered-id группы неподвижен ≥ окна (15 мин) при глубине > 0 | неподвижность держится | движение ID / глубина 0 / групп нет |
+//	| level threshold thresholdTrack | progress_stall, disk_free, disk_free_min, disk_free_crit, nvme_wear, unit_oom, redis_restart | the observation predicate | — (no memory: every pass decides anew; the "memory" is the observed level itself, monotonic by mechanics: the stamp age, space, wear, event counters, Redis uptime) | the same predicate |
+//	| threshold hysteresis hysteresisTrack | dns_temp_error_share, queue_overflow, redis_memory | fire(v) | prev = firing ∧ hold(v) — the clearing corridor does not flap the Warn | ¬(fire ∨ hold) |
+//	| series: deadStreakTrack | queue_dead | a non-zero depth for N=3 passes in a row | prev = firing ∧ depth > 0 | a zero depth |
+//	| series: memHighStreakTrack | memory_high | growth of the unit's high counter for N=2 passes in a row (any unit) | the hot unit series is not broken | the first pass without growth |
+//	| series: counterGrowthTrack | render_browser_errors | counter growth for N=2 passes in a row | the series is not broken | the first pass without growth |
+//	| series: newDoneStaleTrack | domains_new_done_stale | a NEW non-zero reconciliation snapshot N=2 in a row (a change of updated_at: alert passes are more frequent than the source; a repeated read does not count as an observation) | prev = firing ∧ value > 0 | a zero snapshot |
+//	| level latch: renderDebtTrack | render_debt | the level > the threshold ∧ a growth series N=2 (strict >) | the latch holds firing while the level ≥ the clearing threshold (90%, ceil) — stagnation and lag swings do not break the episode | the level < the clearing threshold |
+//	| level latch: renderFbDepthTrack | render_fallback_depth | the depth ≥ the threshold ∧ (a growth series OR an "at the threshold" series N=2 — a stationary depth, S-P2-1) | the latch holds while the depth ≥ the clearing threshold | the depth < the clearing threshold |
+//	| delta ring ringTrack | ingest_bad_hashes, render_fallback_budget | the sum of the deltas over the window (15/6 passes) ≥ the threshold (10/1) | a continuing event flow extends the sum | aging: eviction of deltas from the ring |
+//	| time window: psiWindowTrack | psi_cpu | avg300 > the threshold sustained over the window (30 min: the first pass above the threshold starts the window, firing on its close) | hold = the window ticks | a dip below the threshold resets the window (a spike does not extend it) |
+//	| time window: queueFreezeTrack | queue_frozen | the group's last-delivered-id is immobile ≥ the window (15 min) at depth > 0 | the immobility holds | the ID moves / depth 0 / no groups |
 //
-//	Деградация (любая машина): → not_measured, track-память нетронута.
-//	Защёлки уровня — единственные, чей ПРОЖИТЫЙ эпизод переживает
-//	деградацию (firing живёт в track-памяти, не в статусе); у гистерезисов
-//	и серий «не измеряется» перезаписывает статус — возврат источника
-//	в коридоре удержания даёт ok, не удержание (прежняя семантика карты
-//	состояний, задокументирована как решение).
+//	Degradation (any machine): → not_measured, the track memory untouched.
+//	Level latches are the only ones whose LIVED episode survives
+//	degradation (firing lives in the track memory, not in the status); for the hystereses
+//	and series "not measured" overwrites the status — the return of the source
+//	in the hold corridor yields ok, not a hold (the former state map
+//	semantics, documented as a decision).
 //
-// # Побочные действия перехода (единые, только transition)
+// # Transition side effects (shared, only transition)
 //
-//   - смена статуса — фронтовая запись журнала (logFront): срабатывание
-//     Warn «АЛЕРТ», снятие Info, неприменимость Debug; уход сработавшего
-//     в «не измеряется» — Info (потеря активной аварии видна в логе);
-//   - ошибка источника — Warn каждого прохода (кроме отмены ctx — часть
-//     остановки сервиса);
-//   - снапшот прохода — AlertSnapshot в AlertsResult → хук OnPass
-//     (Telegram-доставка notify.go, метрики T-077).
+//   - a status change — a front log entry (logFront): firing
+//     "ALERT" Warn, clearing Info, inapplicability Debug; a fired alert going
+//     to "not measured" — Info (the loss of an active incident is visible in the log);
+//   - a source error — a Warn every pass (except a ctx cancellation — part of
+//     the service shutdown);
+//   - the pass snapshot — an AlertSnapshot into AlertsResult → the OnPass hook
+//     (Telegram delivery by notify.go, the T-077 metrics).
 //
-// # Инварианты
+// # Invariants
 //
-//	И1  Состояние автомата (статус и track-память) пишет ТОЛЬКО
-//	    alertMachine.transition: eval-функции возвращают наблюдение и
-//	    состояния не касаются; decide трек-памяти — единственный писатель
-//	    собственной памяти и вызывается только transition-ом с валидным
-//	    измерением.
-//	И2  Деградация источника не трогает track-память: серии/окна/защёлки
-//	    переживают сбой; статус при этом перезаписывается в
-//	    not_measured (коридоры гистерезиса, привязанные к статусу,
-//	    сбрасываются — прежнее поведение).
-//	И3  Фронтовые записи — только на смене статуса (дебаунс); повторный
-//	    проход в том же состоянии тих.
-//	И4  Порядок машин фиксирован (NewAlerts): снапшот AlertsResult
-//	    детерминирован, очередь чтений Redis источников стабильна.
-//	И5  Каждый алерт — значение единой структуры alertMachine; отличает
-//	    машины только тип track-памяти и источник наблюдения (реестр
-//	    машин — NewAlerts, спецификации источников — alerts.go).
+//	I1  The machine state (the status and the track memory) is written ONLY by
+//	    alertMachine.transition: the eval functions return an observation and
+//	    do not touch the state; the decide of the track memory is the only writer
+//	    of its own memory and is called only by transition with a valid
+//	    measurement.
+//	I2  A source degradation does not touch the track memory: the series/windows/latches
+//	    survive the failure; the status is meanwhile overwritten to
+//	    not_measured (the status-bound hysteresis corridors
+//	    are reset — the former behavior).
+//	I3  Front entries — only on a status change (debouncing); a repeated
+//	    pass in the same state is silent.
+//	I4  The machine order is fixed (NewAlerts): the AlertsResult
+//	    snapshot is deterministic, the order of Redis reads of the sources is stable.
+//	I5  Each alert is a value of the single alertMachine structure; what distinguishes
+//	    machines is only the track memory type and the observation source (the
+//	    machine registry — NewAlerts; the source specifications — alerts.go).
 package monitor
 
 import (
@@ -102,48 +102,48 @@ import (
 	"crawler/internal/queue"
 )
 
-// observation — наблюдение одного прохода источника алерта: измерение
-// (value), тихая деградация с причиной (reason — «не измеряется» без
-// Warn: неприменимость ожидаема — SMART в контейнере, выключенный
-// контроль, мало данных) или ошибка источника (err — Warn каждого
-// прохода, цикл живёт). Eval-функции возвращают наблюдение и НЕ пишут
-// состояние — состояние пишет только alertMachine.transition (И1).
+// observation — the observation of one source pass: a measurement
+// (value), a quiet degradation with a reason (reason — "not measured" without
+// a Warn: the inapplicability is expected — SMART in a container, a disabled
+// check, too little data) or a source error (err — a Warn every
+// pass, the loop keeps living). The eval functions return an observation and do NOT write
+// state — only alertMachine.transition writes state (I1).
 type observation[V any] struct {
 	value  V
 	reason string
 	err    error
 }
 
-// decision — решение перехода одной машины: статус прохода и деталь
-// снапшота (детали прежние — тексты мигрированы из eval-функций без
-// правок).
+// decision — the transition decision of one machine: the pass status and the
+// snapshot detail (the details are the same — the texts were migrated from the eval functions without
+// edits).
 type decision struct {
 	status string
 	detail string
 }
 
-// alertTrack — типизированная track-память автомата одного алерта:
-// применяет измерение к памяти (серии/окна/защёлки) и решает статус
-// прохода. decide — единственный писатель собственной памяти; вызывается
-// только transition-ом и только с валидным измерением — деградации
-// память не трогают (И1/И2). Реализации (семьи): thresholdTrack (порог
-// уровня, без памяти), hysteresisTrack (гистерезис порогов),
+// alertTrack — the typed track memory of a single alert's machine:
+// applies the measurement to the memory (series/windows/latches) and decides the
+// pass status. decide is the only writer of its own memory; it is called
+// only by transition and only with a valid measurement — degradations
+// do not touch the memory (I1/I2). The implementations (families): thresholdTrack (a
+// level threshold, no memory), hysteresisTrack (a threshold hysteresis),
 // deadStreakTrack/memHighStreakTrack/counterGrowthTrack/
-// newDoneStaleTrack (серия), renderDebtTrack/renderFbDepthTrack
-// (защёлка уровня), ringTrack (кольцо дельт), psiWindowTrack/
-// queueFreezeTrack (окно времени).
+// newDoneStaleTrack (a series), renderDebtTrack/renderFbDepthTrack
+// (a level latch), ringTrack (a delta ring), psiWindowTrack/
+// queueFreezeTrack (a time window).
 type alertTrack[V any] interface {
-	// decide применяет наблюдение v к памяти; prev — прошлый статус
-	// автомата (охраны гистерезиса и удержания серий), now — текущее
-	// время (окна, возрасты).
+	// decide applies the observation v to the memory; prev — the past status
+	// of the machine (the hysteresis guards and series holds), now — the current
+	// time (windows, ages).
 	decide(prev string, now time.Time, v V) decision
 }
 
-// alertMachine — единая структура автомата алерта (ФТ-10): «{имя,
-// статус, track-память}». Все 20 алертов — значения этого типа;
-// отличается машины только тип track-памяти (alertTrack) и источник
-// наблюдения (eval — observe*-функция в alerts.go). Единственная точка
-// записи состояния — transition (И1).
+// alertMachine — the single state machine structure of an alert (FR-10): "{name,
+// status, track memory}". All 20 alerts are values of this type;
+// what distinguishes machines is only the track memory type (alertTrack) and the
+// observation source (eval — an observe* function in alerts.go). The single
+// state-writing point — transition (I1).
 type alertMachine[V any] struct {
 	name   string
 	status string
@@ -151,25 +151,25 @@ type alertMachine[V any] struct {
 	eval   func(ctx context.Context) observation[V]
 }
 
-// alertRunner — стирание типа alertMachine[V] для гетерогенного списка
-// машин прохода (порядок фиксирован — И4).
+// alertRunner — the type erasure of alertMachine[V] for the heterogeneous list
+// of the pass machines (the order is fixed — I4).
 type alertRunner interface {
 	run(ctx context.Context, a *Alerts) AlertSnapshot
 }
 
-// compile-time: alertMachine реализует alertRunner при любом V.
+// compile-time: alertMachine implements alertRunner for any V.
 var _ alertRunner = (*alertMachine[int64])(nil)
 
-// run — один проход машины: наблюдение источника → переход.
+// run — one machine pass: the source observation → the transition.
 func (m *alertMachine[V]) run(ctx context.Context, a *Alerts) AlertSnapshot {
 	return m.transition(a, ctx, m.eval(ctx))
 }
 
-// transition — ЕДИНСТВЕННАЯ точка записи состояния автомата (ФТ-10, И1):
-// применяет наблюдение (деградация переводит в «не измеряется», не
-// трогая track-память — И2), пишет фронтовую запись на смене статуса
-// (И3) и обновляет статус. Ошибка источника — Warn каждого прохода,
-// кроме отмены ctx (часть остановки, стиль ZoneStatsLoop).
+// transition — the SINGLE state-writing point of the machine (FR-10, I1):
+// applies the observation (a degradation moves to "not measured", without
+// touching the track memory — I2), writes a front entry on a status change
+// (I3) and updates the status. A source error — a Warn every pass,
+// except a ctx cancellation (part of the shutdown, the ZoneStatsLoop style).
 func (m *alertMachine[V]) transition(a *Alerts, ctx context.Context, o observation[V]) AlertSnapshot {
 	prev := m.status
 	var status, detail string
@@ -190,23 +190,23 @@ func (m *alertMachine[V]) transition(a *Alerts, ctx context.Context, o observati
 	return AlertSnapshot{Name: m.name, Status: status, Detail: detail}
 }
 
-// ------------------------------------------------------------ порог уровня
+// ------------------------------------------------------------ level threshold
 
-// thresholdTrack — машина без track-памяти: решение — предикат
-// наблюдения (порог уровня). Памятью служит сам наблюдаемый уровень
-// (возраст метки зон, место на диске, износ NVMe, счётчики событий
-// юнитов) — величины монотонны или событийны по механике источника,
-// дребезг у порога исключён без зазора (обоснования — у источников в
-// alerts.go). Порог может быть неприменим к наблюдению (na: абсолютный
-// минимум ≥ ёмкости тома) — тихое «не измеряется»; nil — всегда применим.
+// thresholdTrack — a machine without track memory: the decision is the
+// observation predicate (a level threshold). The memory is the observed level itself
+// (the zone stamp age, the disk space, the NVMe wear, the unit event
+// counters) — the quantities are monotonic or event-driven by the source mechanics;
+// flapping at the threshold is excluded without a gap (the justifications are at the sources in
+// alerts.go). The threshold may be inapplicable to an observation (na: the absolute
+// minimum ≥ the volume capacity) — a quiet "not measured"; nil — always applicable.
 type thresholdTrack[V any] struct {
 	fire      func(now time.Time, v V) bool
 	okDetail  func(now time.Time, v V) string
-	hotDetail func(now time.Time, v V) string // nil — деталь ok (диск: деталь одна)
-	na        func(v V) string                // неприменимость (деталь) или "" — применим; nil — нет проверки
+	hotDetail func(now time.Time, v V) string // nil — the ok detail (disk: one detail for all)
+	na        func(v V) string                // the inapplicability (detail) or "" — applicable; nil — no check
 }
 
-// decide — переход порога: na → not_measured, fire → firing, иначе ok.
+// decide — the threshold transition: na → not_measured, fire → firing, otherwise ok.
 func (t thresholdTrack[V]) decide(_ string, now time.Time, v V) decision {
 	if t.na != nil {
 		if d := t.na(v); d != "" {
@@ -223,22 +223,22 @@ func (t thresholdTrack[V]) decide(_ string, now time.Time, v V) decision {
 	return decision{AlertStatusOK, t.okDetail(now, v)}
 }
 
-// --------------------------------------------------------- гистерезис порогов
+// --------------------------------------------------------- threshold hysteresis
 
-// hysteresisTrack — гистерезис порогов: включение по fire, удержание
-// сработавшего по hold (коридор снятия), память — статус автомата
-// (prev): значение в коридоре между порогами не дребезжит Warn.
-// Коридор живёт только пока статус firing: «не измеряется» (сбой
-// источника) статус перезаписывает — возврат источника в коридоре даёт
-// ok, а не удержание (прежняя семантика карты состояний, И2).
+// hysteresisTrack — a threshold hysteresis: entry by fire, holding
+// the fired state by hold (the clearing corridor); the memory is the machine
+// status (prev): a value in the corridor between the thresholds does not flap the Warn.
+// The corridor lives only while the status is firing: "not measured" (a source
+// failure) overwrites the status — the return of the source in the corridor yields
+// ok, not a hold (the former state map semantics, I2).
 type hysteresisTrack[V any] struct {
 	fire      func(v V) bool
 	hold      func(v V) bool
 	okDetail  func(v V) string
-	hotDetail func(v V) string // nil — деталь ok (доля ошибок DNS одна на оба статуса)
+	hotDetail func(v V) string // nil — the ok detail (one DNS error share for both statuses)
 }
 
-// decide — переход гистерезиса: fire ∨ (prev = firing ∧ hold) → firing.
+// decide — the hysteresis transition: fire ∨ (prev = firing ∧ hold) → firing.
 func (t hysteresisTrack[V]) decide(prev string, _ time.Time, v V) decision {
 	if t.fire(v) || (prev == AlertStatusFiring && t.hold(v)) {
 		d := t.okDetail(v)
@@ -250,42 +250,42 @@ func (t hysteresisTrack[V]) decide(prev string, _ time.Time, v V) decision {
 	return decision{AlertStatusOK, t.okDetail(v)}
 }
 
-// dnsShare — наблюдение доли temp_error суток: числитель (события
-// записей результатов с вердиктом temp_error) и знаменатель (события
-// записей результатов) суточных строк crawler_counters (T-182).
+// dnsShare — the observation of the day's temp_error share: the numerator (the events
+// of result writes with the temp_error verdict) and the denominator (the events
+// of result writes) of the daily crawler_counters rows (T-182).
 type dnsShare struct {
 	temp  int64
 	total int64
 }
 
-// share — доля temp_error (знаменатель ≥ AlertDNSMinSamples — гарантирует
-// observeDNS, пустое окно наблюдением не становится).
+// share — the temp_error share (the denominator ≥ AlertDNSMinSamples — guaranteed
+// by observeDNS; an empty window does not become an observation).
 func (d dnsShare) share() float64 {
 	return float64(d.temp) / float64(d.total)
 }
 
-// staleRow — наблюдение строки new_done_stale: значение (домены
-// «статус повис») и метка снапшота реконсиляции (updated_at строки —
-// момент прохода, писавшего значение).
+// staleRow — the observation of the new_done_stale row: the value (the
+// "status hung" domains) and the reconciliation snapshot stamp (the row's updated_at —
+// the moment of the pass that wrote the value).
 type staleRow struct {
 	value int64
 	snap  sql.NullTime
 }
 
-// ------------------------------------------------------------- серия проходов
+// ------------------------------------------------------------- pass series
 
-// deadStreakTrack — серия ненулевых проходов (queue_dead, T-154):
-// «устойчиво ненулевой» карантин вместо мгновенного срабатывания на
-// первую смерть; сработавший удерживается любой ненулевой глубиной
-// (гистерезис эпизода: от третьего прохода до разбора оператором),
-// снятие — пустой q:dead. Рост — частный случай ненулёвости: отдельный
-// контроль роста дребезжал бы на подвижном XTRIM разбора.
+// deadStreakTrack — a series of non-zero passes (queue_dead, T-154):
+// a "persistently non-zero" quarantine instead of an instant firing on the
+// first death; the fired state is held by any non-zero depth
+// (the episode hysteresis: from the third pass to the operator's triage),
+// clearing — an empty q:dead. Growth is a special case of non-zero: a separate
+// growth check would flap on the moving XTRIM of triage.
 type deadStreakTrack struct {
 	minPasses int
 	streak    int
 }
 
-// decide — переход серии q:dead.
+// decide — the q:dead series transition.
 func (t *deadStreakTrack) decide(prev string, _ time.Time, n int64) decision {
 	if n > 0 {
 		t.streak++
@@ -300,31 +300,31 @@ func (t *deadStreakTrack) decide(prev string, _ time.Time, n int64) decision {
 	return decision{AlertStatusOK, detail}
 }
 
-// memHighTrack — память серии одного юнита: прошлый счётчик
-// memory.events high и серия проходов подряд с его ростом. Ростом
-// считается только увеличение: рестарт юнита пересоздаёт cgroup и
-// обнуляет счётчик — убыль начинает новую серию без ложного всплеска
-// (стиль deltaRing).
+// memHighTrack — the series memory of one unit: the past
+// memory.events high counter and the series of passes in a row with its growth. Growth
+// is only an increase: a unit restart recreates the cgroup and
+// zeroes the counter — a decrease starts a new series without a false spike
+// (the deltaRing style).
 type memHighTrack struct {
 	prev   uint64
 	streak int
 	seen   bool
 }
 
-// memHighStreakTrack — серия роста троттлинга MemoryHigh по юнитам
-// (memory_high, T-162): событие — рост счётчика high юнита между
-// проходами (порог — не значение, а скорость: счётчик накапливается за
-// жизнь cgroup). Срабатывание, когда серия какого-то юнита достигает
-// minPasses; снятие — первый проход без роста (событие снятия и есть
-// «рост прекратился», дребезг у нуля серии невозможен — серия целая).
-// Юниты, исчезнувшие из ответа (переименован/выгружен), память не
-// копят.
+// memHighStreakTrack — a series of MemoryHigh throttling growth across units
+// (memory_high, T-162): the event is the growth of the unit's high counter between
+// passes (the threshold is not a value but a rate: the counter accumulates over the
+// cgroup lifetime). Firing when some unit's series reaches
+// minPasses; clearing — the first pass without growth (the clearing event is exactly
+// "growth stopped"; flapping at the series zero is impossible — the series is integer).
+// Units that vanished from the answer (renamed/unloaded) do not
+// accumulate memory.
 type memHighStreakTrack struct {
 	minPasses int
 	units     map[string]memHighTrack
 }
 
-// decide — переход серии MemoryHigh.
+// decide — the MemoryHigh series transition.
 func (t *memHighStreakTrack) decide(_ string, _ time.Time, units []UnitEvents) decision {
 	seen := make(map[string]bool, len(units))
 	var hot []string
@@ -344,7 +344,7 @@ func (t *memHighStreakTrack) decide(_ string, _ time.Time, units []UnitEvents) d
 			hot = append(hot, fmt.Sprintf("%s: +%d за проход, серия %d", u.Unit, grew, tr.streak))
 		}
 	}
-	for name := range t.units { // юнит исчез (переименован/выгружен) — не копить
+	for name := range t.units { // the unit vanished (renamed/unloaded) — do not accumulate
 		if !seen[name] {
 			delete(t.units, name)
 		}
@@ -362,11 +362,11 @@ func (t *memHighStreakTrack) decide(_ string, _ time.Time, units []UnitEvents) d
 	}
 }
 
-// counterGrowthTrack — серия роста одиночного счётчика между проходами
-// (render_browser_errors, S-P2-6): прошлый снимок зонда и серия растущих
-// проходов (стиль memHighTrack; отдельный тип — счётчик int64, как
-// значения зондов /metrics). Рестарт владельца (убыль) — нулевая дельта,
-// серия с нуля.
+// counterGrowthTrack — a series of growth of a single counter between passes
+// (render_browser_errors, S-P2-6): the past probe snapshot and the series of growing
+// passes (the memHighTrack style; a separate type — the counter is int64, like
+// the values of the /metrics probes). An owner restart (a decrease) — a zero delta,
+// the series starts from scratch.
 type counterGrowthTrack struct {
 	minPasses int
 	prev      int64
@@ -374,7 +374,7 @@ type counterGrowthTrack struct {
 	seen      bool
 }
 
-// decide — переход серии роста счётчика.
+// decide — the counter growth series transition.
 func (t *counterGrowthTrack) decide(_ string, _ time.Time, cur int64) decision {
 	var delta int64
 	if t.seen && cur > t.prev {
@@ -395,14 +395,14 @@ func (t *counterGrowthTrack) decide(_ string, _ time.Time, cur int64) decision {
 	return decision{AlertStatusOK, detail}
 }
 
-// newDoneStaleTrack — серия НОВЫХ ненулевых снапшотов реконсиляции
-// (domains_new_done_stale, T-256 ФТ-2.2): проходы алертов (5 мин) чаще
-// проходов источника (zone_stats_interval, 30 мин) — серия растёт только
-// при смене метки снапшота (updated_at строки), повторное чтение той же
-// строки наблюдением не считается (одиночный пограничный снапшот
-// границы суток следующим проходом перезаписывается нулём — алерта
-// нет). Нулевой снапшот серию обнуляет; сработавший удерживается любой
-// ненулевой строкой (стиль queue_dead).
+// newDoneStaleTrack — a series of NEW non-zero reconciliation snapshots
+// (domains_new_done_stale, T-256 FR-2.2): the alert passes (5 min) are more frequent
+// than the source passes (zone_stats_interval, 30 min) — the series grows only
+// on a change of the snapshot stamp (the row's updated_at); a repeated read of the same
+// row does not count as an observation (a single boundary snapshot
+// of the day boundary is overwritten by zero by the next pass — no
+// alert). A zero snapshot resets the series; the fired state is held by any
+// non-zero row (the queue_dead style).
 type newDoneStaleTrack struct {
 	minPasses int
 	snap      time.Time
@@ -410,13 +410,13 @@ type newDoneStaleTrack struct {
 	seen      bool
 }
 
-// decide — переход серии снапшотов new_done_stale.
+// decide — the new_done_stale snapshot series transition.
 func (t *newDoneStaleTrack) decide(prev string, _ time.Time, row staleRow) decision {
 	n := row.value
 	if n > 0 {
-		// Серия — число различных ненулевых снапшотов: повторное чтение
-		// той же строки (алерт ходит чаще реконсиляции) серию не
-		// наращивает; нулевой снапшот обнуляет.
+		// The series is the number of distinct non-zero snapshots: a repeated read
+		// of the same row (the alert polls more often than reconciliation) does not
+		// grow the series; a zero snapshot resets it.
 		switch {
 		case !t.seen || !row.snap.Valid || !row.snap.Time.Equal(t.snap):
 			t.streak++
@@ -437,22 +437,22 @@ func (t *newDoneStaleTrack) decide(prev string, _ time.Time, row staleRow) decis
 	return decision{AlertStatusOK, detail}
 }
 
-// ------------------------------------------------------------- защёлка уровня
+// ------------------------------------------------------------- level latch
 
-// depthGrowth — память уровня-глубины: прошлый снимок, серия проходов с
-// ростом, защёлка сработавшего эпизода и серия проходов «у порога»
-// (hot — только render_fallback_depth). Рост — строго увеличение:
-// дренаж и приток плещутся вокруг константы — стагнация, а не
-// накопление, серию не копит. Защёлка firing переживает «не измеряется»
-// (сбой источника состояние алерта перезаписывает, ревью T-175 раунд 2,
-// P2-1): удержание обязано опираться на неё, а не на прошлый статус —
-// иначе короткий сбой БД/Redis посреди эпизода давал бы ложное ✅
-// «Восстановлено» при долге выше порога снятия; сбрасывает защёлку
-// только фактический дренаж ниже порога. hot ловит стационарно высокую
-// глубину, которую серия роста не видит — рестарт монитора посреди
-// эпизода (первый проход базирует prev и серию роста нулём) и упор в
-// предел MAXLEN стрима (обрезка вытесняет старейшие недоставленные
-// записи — глубина перестаёт расти).
+// depthGrowth — the memory of a depth level: the past snapshot, the series of passes with
+// growth, the latch of the fired episode and the series of "at the threshold" passes
+// (hot — only render_fallback_depth). Growth is a strict increase:
+// the drain and the inflow splash around a constant — stagnation, not
+// accumulation, it does not build a series. The firing latch survives "not measured"
+// (a source failure overwrites the alert state; the T-175 review round 2,
+// P2-1): the hold must rely on it, not on the past status —
+// otherwise a short DB/Redis failure in the middle of an episode would give a false ✅
+// "Recovered" at a debt above the clearing threshold; only the actual
+// drain below the threshold resets the latch. hot catches a stationary high
+// depth that the growth series does not see — a monitor restart in the middle of
+// an episode (the first pass bases prev and the growth series at zero) and pinning at
+// the MAXLEN limit of the stream (the trim evicts the oldest undelivered
+// entries — the depth stops growing).
 type depthGrowth struct {
 	prev   int64
 	streak int
@@ -461,11 +461,11 @@ type depthGrowth struct {
 	hot    int
 }
 
-// growthStep применяет новый уровень: обновляет серию роста (строгое
-// увеличение) и серию «у порога» (atThreshold — уровень достиг порога
-// срабатывания; render_debt порога «уровня» не ведёт — стагнация долга
-// — строка отчёта нагрузки, не алерт), базирует первый снимок; возвращает
-// дельту роста для детали.
+// growthStep applies the new level: updates the growth series (a strict
+// increase) and the "at the threshold" series (atThreshold — the level reached the
+// firing threshold; render_debt keeps no "level" threshold — debt stagnation
+// is a load report row, not an alert), bases the first snapshot; returns the
+// growth delta for the detail.
 func (g *depthGrowth) growthStep(level int64, atThreshold bool) (delta int64) {
 	if g.seen && level > g.prev {
 		g.streak++
@@ -482,33 +482,33 @@ func (g *depthGrowth) growthStep(level int64, atThreshold bool) (delta int64) {
 	return delta
 }
 
-// renderDebtTrack — защёлка уровня рендер-долга (render_debt, T-175):
-// срабатывание — долг (флаги render_pending + лаг q:render) строго выше
-// порога И растёт minPasses проходов подряд (серия положительных дельт,
-// стиль memory_high). Снятие — дренаж ниже 90 % порога: долг — УРОВЕНЬ,
-// а не монотонный счётчик, лаг колеблется на сотни-тысячи за проход при
-// дренаже ~1–2 стр/с — снятие «по не-росту» качало бы эпизод 🚨/✅ каждые
-// несколько проходов на стационарном высоком долге (ревью T-175, P2-1).
-// Поэтому рост — только триггер (стагнация без серии роста не будит
-// оператора — она видна строкой «Рендер-долг» отчёта нагрузки и gauge),
-// уровень — удержание и снятие (порог снятия 90 %, ceil — при пороге 1
-// снятие < 1 достигается нулём, ревью раунд 2 P3-3). Удержание
-// опирается на защёлку памяти, а не прошлый статус (И2). Первый проход —
-// база (рост неизвестен).
+// renderDebtTrack — the render debt level latch (render_debt, T-175):
+// firing — the debt (the render_pending flags + the q:render lag) strictly above
+// the threshold AND growing for minPasses passes in a row (a series of positive deltas,
+// the memory_high style). Clearing — the drain below 90% of the threshold: the debt is a LEVEL,
+// not a monotonic counter; the lag swings by hundreds–thousands per pass at
+// a drain of ~1–2 rows/s — a "by no-growth" clearing would swing the episode 🚨/✅ every
+// few passes at a stationary high debt (the T-175 review, P2-1).
+// Hence growth is only a trigger (stagnation without a growth series does not wake
+// the operator — it is visible in the "Render debt" row of the load report and the gauge);
+// the level — the hold and the clearing (the clearing threshold is 90%, ceil — at a threshold of 1
+// the clearing < 1 is reached by zero; review round 2 P3-3). The hold
+// relies on the memory latch, not the past status (I2). The first pass —
+// the base (growth is unknown).
 type renderDebtTrack struct {
 	domains int64
 	passes  int
 	mem     depthGrowth
 }
 
-// decide — переход защёлки рендер-долга.
+// decide — the render debt latch transition.
 func (t *renderDebtTrack) decide(_ string, _ time.Time, d RenderDebt) decision {
 	total := d.Total()
 	delta := t.mem.growthStep(total, false)
 
-	// Порог снятия — 90 % порога срабатывания, целочисленный ceil:
-	// коридор ≥ 1 при любом допустимом пороге (минимум 1) — сработавший
-	// алерт всегда достижим для снятия; при 50 тыс. снятие — ниже 45 тыс.
+	// The clearing threshold — 90% of the firing threshold, an integer ceil:
+	// a corridor ≥ 1 at any valid threshold (the minimum 1) — the fired
+	// alert is always reachable for clearing; at 50k the clearing is below 45k.
 	recoverAt := (t.domains*9 + 9) / 10
 	detail := fmt.Sprintf("рендер-долг: %s, порог %d (снятие < %d), серия роста %d/%d проходов (+%d за проход)",
 		d.String(), t.domains, recoverAt, t.mem.streak, t.passes, delta)
@@ -520,10 +520,10 @@ func (t *renderDebtTrack) decide(_ string, _ time.Time, d RenderDebt) decision {
 			detail + " — накопление: приток SPA обгоняет дренаж (render.contexts / приток планировщика, разбор — docs/runbooks.md)",
 		}
 	case t.mem.firing && total >= recoverAt:
-		// Удержание сработавшего: колебания лага при стационарном долге
-		// (серия роста сброшена, уровень выше порога снятия) — эпизод
-		// живёт до фактического дренажа. Защёлка, а не прошлый статус:
-		// сбой источника («не измеряется») эпизод не закрывает.
+		// Holding the fired state: lag swings at a stationary debt
+		// (the growth series is reset, the level above the clearing threshold) — the
+		// episode lives until the actual drain. A latch, not the past status:
+		// a source failure ("not measured") does not close the episode.
 		return decision{
 			AlertStatusFiring,
 			detail + " — долг держится выше порога снятия (уровень — строка «Рендер-долг» отчёта нагрузки)",
@@ -534,30 +534,30 @@ func (t *renderDebtTrack) decide(_ string, _ time.Time, d RenderDebt) decision {
 	}
 }
 
-// renderFbDepthTrack — защёлка уровня глубины q:render-fallback
-// (render_fallback_depth, T-246, ТЗ рендера §4.6 п.3; второй триггер —
-// S-P2-1, решение оператора): срабатывание — глубина у эффективного
-// порога стрима (единый расчёт queue.StreamWatermark — как у алерта
-// очередей; для q:render-fallback это не порог гейта, а порог наблюдения
-// «глубина приближается к пределу MAXLEN») И (растёт minPasses проходов
-// подряд — механика render_debt — ИЛИ держится над порогом minPasses
-// проходов без требования роста: стационарная глубина у порога —
-// остановленный воркер B либо упор в MAXLEN, XADD вытесняет старейшие
-// недоставленные записи и новые фолбэк-задачи молча теряются).
-// Снятие — дренаж ниже 90 % порога (ceil, стиль render_debt); стагнация
-// выше порога удерживается защёлкой, повторно не будит.
+// renderFbDepthTrack — the level latch of the q:render-fallback depth
+// (render_fallback_depth, T-246, render spec §4.6 item 3; the second trigger —
+// S-P2-1, the operator's decision): firing — the depth at the effective
+// stream threshold (the single queue.StreamWatermark calculation — like the
+// queue alert; for q:render-fallback this is not a gate threshold but an observation
+// threshold "the depth approaches the MAXLEN limit") AND (growing for minPasses passes
+// in a row — the render_debt mechanics — OR holding above the threshold for minPasses
+// passes without a growth requirement: a stationary depth at the threshold —
+// a stopped worker B or pinning at MAXLEN; XADD evicts the oldest
+// undelivered entries and new fallback tasks are silently lost).
+// Clearing — the drain below 90% of the threshold (ceil, the render_debt style); stagnation
+// above the threshold is held by the latch and does not wake again.
 type renderFbDepthTrack struct {
 	wm     int64
 	passes int
 	mem    depthGrowth
 }
 
-// decide — переход защёлки глубины фолбэка.
+// decide — the fallback depth latch transition.
 func (t *renderFbDepthTrack) decide(_ string, _ time.Time, n int64) decision {
 	delta := t.mem.growthStep(n, n >= t.wm)
 
-	// Порог снятия — 90 % порога срабатывания, целочисленный ceil
-	// (стиль render_debt): коридор ≥ 1 при любом валидном watermark.
+	// The clearing threshold — 90% of the firing threshold, an integer ceil
+	// (the render_debt style): a corridor ≥ 1 at any valid watermark.
 	recoverAt := (t.wm*9 + 9) / 10
 	detail := fmt.Sprintf("глубина %s=%d, порог %d (снятие < %d), серия роста %d/%d (+%d за проход), у порога %d/%d проходов",
 		queue.StreamRenderFallback, n, t.wm, recoverAt, t.mem.streak, t.passes, delta,
@@ -586,30 +586,30 @@ func (t *renderFbDepthTrack) decide(_ string, _ time.Time, n int64) decision {
 	}
 }
 
-// ------------------------------------------------------------- кольцо дельт
+// ------------------------------------------------------------- delta ring
 
-// deltaRing — кольцо дельт счётчика между проходами (память окна):
-// ёмкость size; 0 — AlertBadHashesWindow (историческое поведение
-// всплеска мусорных хешей). Первое наблюдение только базирует prev —
-// старт мониторинга позже накопленного счётчика не ретроспективен (окно
-// считает новые события, а не всю историю); убывание счётчика (рестарт
-// владельца) даёт нулевую дельту — счётчик начинается заново, ложного
-// всплеска нет.
+// deltaRing — a delta ring of the counter between passes (the window memory):
+// the capacity size; 0 — AlertBadHashesWindow (the historical behavior
+// of the junk hash spike). The first observation only bases prev —
+// the monitoring start later than the accumulated counter is not retrospective (the
+// window counts new events, not the whole history); a counter decrease (an owner
+// restart) yields a zero delta — the counter starts anew, no false
+// spike.
 type deltaRing struct {
 	prev   int64
 	seen   bool
 	deltas []int64
 	i      int
-	// size — ёмкость кольца в проходах; 0 — AlertBadHashesWindow.
+	// size — the ring capacity in passes; 0 — AlertBadHashesWindow.
 	size int
 }
 
-// push принимает текущее значение счётчика и возвращает сумму окна.
+// push takes the current counter value and returns the window sum.
 func (w *deltaRing) push(cur int64) int64 {
 	var d int64
 	if !w.seen {
-		w.seen = true // база: накопленное до старта мониторинга не считается
-		// Эквивалентный мутант: при cur == prev обе ветви дают дельту 0.
+		w.seen = true // the base: what accumulated before the monitoring start does not count
+		// The equivalent mutant: at cur == prev both branches give a delta of 0.
 		// mutator-disable-next-line expression/comparison
 	} else if cur > w.prev {
 		d = cur - w.prev
@@ -623,9 +623,9 @@ func (w *deltaRing) push(cur int64) int64 {
 		w.deltas = make([]int64, size)
 	}
 	w.deltas[w.i] = d
-	// Эквивалентный мутант шага +2: 2 взаимно просто с длиной окна 15 —
-	// кольцо в обоих случаях содержит последние 15 дельт, сумма окна
-	// неотличима тестом.
+	// The equivalent mutant of a +2 step: 2 is coprime with the window length 15 —
+	// the ring contains the last 15 deltas in both cases; the window sum
+	// is indistinguishable by the test.
 	// mutator-disable-next-line numbers/incrementer
 	w.i = (w.i + 1) % len(w.deltas)
 	var sum int64
@@ -635,27 +635,27 @@ func (w *deltaRing) push(cur int64) int64 {
 	return sum
 }
 
-// ringTrack — окно событий в проходах (кольцо дельт): сумма дельт
-// счётчика за окно ≥ threshold — срабатывание; снятие — старением (окно
-// держит сработавшим только продолжение потока событий), против дребезга
-// гистерезис не нужен — сумма окна убывает только вытеснением дельт, у
-// порога она держится лишь при продолжении потока. Порог 1 превращает
-// кольцо в «любое событие за окно» (бюджет доли фолбэка: каждое
-// защёлкивание приостановки — аномалия, стиль износа NVMe).
+// ringTrack — an events window in passes (a delta ring): the sum of the counter
+// deltas over the window ≥ the threshold — firing; clearing — by aging (the window
+// holds the fired state only on a continuing event flow); no hysteresis is needed
+// against flapping — the window sum decreases only by evicting deltas, and
+// near the threshold it holds only while the flow continues. A threshold of 1 turns
+// the ring into "any event within the window" (the fallback share budget: every
+// suspension latching is an anomaly, the NVMe wear style).
 type ringTrack struct {
 	ring      *deltaRing
 	threshold int64
-	// passes — окно в проходах и interval — период алертов: только для
-	// детали (человекочитаемая длительность окна).
+	// passes — the window in passes, and interval — the alert period: only for the
+	// detail (a human-readable window duration).
 	passes   int
 	interval time.Duration
-	// label — имя измерения в детали («счётчик», «события бюджета»),
-	// fireNote — суффикс детали срабатывания.
+	// label — the measurement name in the detail ("counter", "budget events"),
+	// fireNote — the suffix of the firing detail.
 	label    string
 	fireNote string
 }
 
-// decide — переход кольца: сумма окна против порога.
+// decide — the ring transition: the window sum against the threshold.
 func (t ringTrack) decide(_ string, _ time.Time, cur int64) decision {
 	sum := t.ring.push(cur)
 	detail := fmt.Sprintf("%s %d, новых за окно %s — %d (порог %d)",
@@ -666,23 +666,23 @@ func (t ringTrack) decide(_ string, _ time.Time, cur int64) decision {
 	return decision{AlertStatusOK, detail}
 }
 
-// --------------------------------------------------------------- окно времени
+// --------------------------------------------------------------- time window
 
-// psiWindowTrack — окно удержания PSI CPU (psi_cpu, T-162): avg300 выше
-// порога устойчиво окно — срабатывание. Первый проход выше порога
-// стартует окно, срабатывание при его закрытии; avg300 сам сглаживает
-// 5 минут, окно отбрасывает разовые шпильки (деплой, ретро-пачки).
-// Гистерезис не нужен: чтобы «снять», avg300 должен опуститься к порогу
-// после 30+ минут выше — фактическое восстановление; сброс окна при
-// кратком провале — консервативнее удержания (шпилька не продлевает
-// алерт).
+// psiWindowTrack — the PSI CPU hold window (psi_cpu, T-162): avg300 above
+// the threshold sustained over the window — firing. The first pass above the
+// threshold starts the window, firing on its close; avg300 itself smooths
+// over 5 minutes; the window discards one-off spikes (a deploy, retro batches).
+// No hysteresis needed: to "clear", avg300 must fall to the threshold
+// after 30+ minutes above — an actual recovery; the window reset on
+// a brief dip is more conservative than a hold (a spike does not extend
+// the alert).
 type psiWindowTrack struct {
 	percent float64
 	window  time.Duration
 	hot     time.Time
 }
 
-// decide — переход окна PSI.
+// decide — the PSI window transition.
 func (t *psiWindowTrack) decide(_ string, now time.Time, st PSIStat) decision {
 	over := st.Avg300 > t.percent
 	switch {
@@ -709,33 +709,33 @@ func (t *psiWindowTrack) decide(_ string, now time.Time, st PSIStat) decision {
 	return decision{AlertStatusOK, detail}
 }
 
-// freezeEntry — память одной группы стрима: последний замеченный
-// last-delivered-id и момент, с которого он стоит. since живёт только
-// при глубине > 0 — простой пустой очереди не накапливает «время без
-// доставок» (час простоя + первая нечитаемая запись дали бы мгновенное
-// ложное срабатывание).
+// freezeEntry — the memory of one stream group: the last seen
+// last-delivered-id and the moment it froze at. since lives only
+// at depth > 0 — the idle time of an empty queue does not accumulate "time
+// without deliveries" (an hour of idle plus the first unread entry would give an instant
+// false firing).
 type freezeEntry struct {
 	lastID string
 	since  time.Time
 }
 
-// queueFreezeTrack — окно неподвижности групп (queue_frozen, T-162):
-// last-delivered-id группы рабочего стрима не движется ≥ окна при
-// глубине > 0. Живой потребитель двигает ID каждым XREADGROUP (пачки в
-// секунды); стоящий ID при непустом backlog — записи не доставляются
-// вовсе: потребитель мёртв или валится на первой записи (яд T-159),
-// lease-восстановление не поднимает. Первое наблюдение группы — база с
-// текущего момента (после рестарта monitor алерт сработает не раньше
-// окна, не ретроспективно); движение ID обновляет момент; глубина 0 —
-// запись вычищена; группа исчезла из ответа (стрим удалён) — не копится.
-// Снятие — первый проход без замороженных групп; гистерезис не нужен,
-// окно — естественный фильтр дребезга.
+// queueFreezeTrack — the group immobility window (queue_frozen, T-162):
+// the last-delivered-id of a working stream group does not move ≥ the window at
+// depth > 0. A live consumer moves the ID with every XREADGROUP (batches in
+// seconds); a standing ID at a non-empty backlog — entries are not
+// delivered at all: the consumer is dead or crashes on the first entry (the T-159 poison),
+// lease recovery does not raise it. The first observation of a group — the base from
+// the current moment (after a monitor restart the alert fires no earlier than
+// the window, not retrospectively); an ID movement updates the moment; depth 0 —
+// the entry is cleaned out; a group vanished from the answer (the stream deleted) — does not accumulate.
+// Clearing — the first pass without frozen groups; no hysteresis needed,
+// the window is the natural flap filter.
 type queueFreezeTrack struct {
 	window time.Duration
 	groups map[string]freezeEntry
 }
 
-// decide — переход окна заморозки групп.
+// decide — the group freeze window transition.
 func (t *queueFreezeTrack) decide(_ string, now time.Time, groups []StreamGroupState) decision {
 	seen := make(map[string]bool, len(groups))
 	var frozen []string
@@ -744,7 +744,7 @@ func (t *queueFreezeTrack) decide(_ string, now time.Time, groups []StreamGroupS
 		key := g.Stream + "/" + g.Group
 		seen[key] = true
 		if g.Depth <= 0 {
-			delete(t.groups, key) // работа кончилась — копить нечего
+			delete(t.groups, key) // the work is over — nothing to accumulate
 			moving++
 			continue
 		}
@@ -760,7 +760,7 @@ func (t *queueFreezeTrack) decide(_ string, now time.Time, groups []StreamGroupS
 				g.Stream, g.Group, idle.Round(time.Second), g.Depth, g.LastDeliveredID))
 		}
 	}
-	for key := range t.groups { // группа исчезла (стрим удалён) — не копить
+	for key := range t.groups { // the group vanished (the stream deleted) — do not accumulate
 		if !seen[key] {
 			delete(t.groups, key)
 		}
