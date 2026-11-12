@@ -13,8 +13,8 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// repoRoot — корень репозитория относительно каталога пакета (тесты
-// запускаются из cmd/testbedgen).
+// repoRoot — the repository root relative to the package directory (the
+// tests run from cmd/testbedgen).
 func repoRoot(t *testing.T) string {
 	t.Helper()
 	root, err := filepath.Abs(filepath.Join("..", ".."))
@@ -24,7 +24,7 @@ func repoRoot(t *testing.T) string {
 	return root
 }
 
-// loadScenarios — реальный scenarios.yaml стенда как Config.
+// loadScenarios — the real scenarios.yaml of the bench as a Config.
 func loadScenarios(t *testing.T) Config {
 	t.Helper()
 	raw, err := os.ReadFile(filepath.Join(repoRoot(t), "deploy/docker/testbed/scenarios.yaml"))
@@ -40,9 +40,10 @@ func loadScenarios(t *testing.T) Config {
 
 // ---------------------------------------------------------------- §11.2
 
-// TestScenariosCoverTZ — аудит полноты стенда против обязательного состава
-// ТЗ 11.2: каждый сценарий из списка задачи T-090 присутствует и описан
-// корректно (сверка таблицей; «страницы Laravel разных версий» — отдельный
+// TestScenariosCoverTZ — an audit of the bench completeness against the
+// mandatory composition of spec 11.2: every scenario from the T-090 task
+// list is present and described correctly (a check by a table; "the
+// Laravel pages of different versions" — a separate
 // TestSamplesCoverLaravelVersions).
 func TestScenariosCoverTZ(t *testing.T) {
 	cfg := loadScenarios(t)
@@ -58,7 +59,7 @@ func TestScenariosCoverTZ(t *testing.T) {
 	}
 
 	cases := []struct {
-		req      string // требование §11.2
+		req      string // the requirement of §11.2
 		scenario string
 		ok       func(d DNSCfg, s SiteCfg) bool
 	}{
@@ -82,8 +83,9 @@ func TestScenariosCoverTZ(t *testing.T) {
 		})
 	}
 
-	// Контракт mock-сценариев: у каждого указан mock_path — маршрут
-	// cmd/mockserver.hostRoutes обязан обслуживать «/» по Host сценария.
+	// The contract of the mock scenarios: each one has a mock_path — the
+	// route map cmd/mockserver.hostRoutes must serve "/" by the scenario
+	// Host.
 	for _, sc := range cfg.Scenarios {
 		if sc.Site.Template == "mock" && sc.Site.MockPath == "" {
 			t.Errorf("сценарий %s: template=mock без mock_path", sc.Name)
@@ -91,16 +93,17 @@ func TestScenariosCoverTZ(t *testing.T) {
 	}
 }
 
-// sampleMeta — поля meta.yaml образца, нужные аудиту.
+// sampleMeta — the meta.yaml fields of a sample needed by the audit.
 type sampleMeta struct {
 	IsLaravel bool   `yaml:"is_laravel"`
 	VerMin    string `yaml:"ver_min"`
 }
 
-// TestSamplesCoverLaravelVersions — «страницы Laravel разных версий» из
-// ТЗ 11.2: корпус testdata/laravel-samples (T-073) покрывает линейку 5.x–12
-// и отдаётся стендом с куками (headers.json → Set-Cookie в Caddyfile),
-// чтобы анализ по cookies был возможен на e2e, а не только по HTML.
+// TestSamplesCoverLaravelVersions — "the Laravel pages of different
+// versions" from spec 11.2: the testdata/laravel-samples corpus (T-073)
+// covers the 5.x–12 line and is served by the bench with cookies
+// (headers.json → Set-Cookie in the Caddyfile), so that the cookie-based
+// analysis is possible on e2e, not only by the HTML.
 func TestSamplesCoverLaravelVersions(t *testing.T) {
 	samplesDir := filepath.Join(repoRoot(t), "testdata/laravel-samples")
 	entries, err := os.ReadDir(samplesDir)
@@ -116,7 +119,7 @@ func TestSamplesCoverLaravelVersions(t *testing.T) {
 		}
 		raw, err := os.ReadFile(filepath.Join(samplesDir, e.Name(), "meta.yaml"))
 		if err != nil {
-			continue // не образец (каталог без meta.yaml генератор не подключает)
+			continue // not a sample (the generator does not wire in a directory without meta.yaml)
 		}
 		var meta sampleMeta
 		if err := yaml.Unmarshal(raw, &meta); err != nil {
@@ -144,8 +147,9 @@ func TestSamplesCoverLaravelVersions(t *testing.T) {
 		}
 		hasLaravelCookie := false
 		for _, c := range hdrs["Set-Cookie"] {
-			// Куки Laravel: XSRF-TOKEN, laravel_session, remember_<guard> или
-			// суффикс _session с зашифрованным значением (правила T-073).
+			// The Laravel cookies: XSRF-TOKEN, laravel_session,
+			// remember_<guard> or a _session suffix with an encrypted
+			// value (the rules of T-073).
 			if strings.HasPrefix(c, "XSRF-TOKEN=") || strings.HasPrefix(c, "laravel_session=") ||
 				strings.HasPrefix(c, "remember_") || strings.Contains(c, "_session=") {
 				hasLaravelCookie = true
@@ -166,13 +170,14 @@ func TestSamplesCoverLaravelVersions(t *testing.T) {
 	if positives < 7 {
 		t.Errorf("позитивных образцов Laravel = %d, хочу >= 7 (спектр версий и стеков mix/vite/inertia/livewire)", positives)
 	}
-	// Линейка версий: от legacy 5.x до актуальной 12 (ТЗ 11.2 «разных версий»).
+	// The version line: from the legacy 5.x to the current 12 (spec 11.2
+	// "different versions").
 	if minMajor > 6 || maxMajor < 11 {
 		t.Errorf("спектр мажорных версий образцов [%d..%d], хочу покрытие 5.x–12", minMajor, maxMajor)
 	}
 }
 
-// majorOf — мажорная часть строки версии («5.8» → 5, «11» → 11).
+// majorOf — the major part of a version string ("5.8" → 5, "11" → 11).
 func majorOf(ver string) int {
 	n := 0
 	for _, r := range ver {
@@ -184,15 +189,16 @@ func majorOf(ver string) int {
 	return n
 }
 
-// ---------------------------------------------------------------- синхронность генерата
+// ---------------------------------------------------------------- generate sync
 
-// TestGeneratedArtifactsInSync — закоммиченный генерат (зоны, zones.conf,
-// Caddyfile, фикстуры web/sites) соответствует scenarios.yaml и корпусу
-// testdata/laravel-samples. Ловит рассинхрон типа T-073: образцы добавлены,
-// а make testbed-gen после правки не выполнен — домены образцов не
-// резолвятся и стенд молча теряет сценарии (CI зон зависит от коммита
-// генерата). Регенерация: изолированный корень с копией scenarios.yaml и
-// symlink на реальный каталог образцов.
+// TestGeneratedArtifactsInSync — the committed generated artifacts (the
+// zones, zones.conf, the Caddyfile, the web/sites fixtures) match
+// scenarios.yaml and the testdata/laravel-samples corpus. It catches a
+// desync like T-073: the samples were added but make testbed-gen was not
+// run after the edit — the sample domains do not resolve and the bench
+// silently loses the scenarios (the CI of the zones depends on the commit
+// of the artifacts). Regeneration: an isolated root with a copy of
+// scenarios.yaml and a symlink to the real samples directory.
 func TestGeneratedArtifactsInSync(t *testing.T) {
 	root := repoRoot(t)
 	tmp := t.TempDir()
@@ -231,7 +237,8 @@ func TestGeneratedArtifactsInSync(t *testing.T) {
 	}
 }
 
-// assertTreesEqual — файловые деревья идентичны (набор файлов и содержимое).
+// assertTreesEqual — the file trees are identical (the file set and the
+// contents).
 func assertTreesEqual(t *testing.T, got, want string) {
 	t.Helper()
 	snapshot := func(root string) map[string]string {
@@ -279,9 +286,10 @@ func assertTreesEqual(t *testing.T, got, want string) {
 
 // ---------------------------------------------------------------- addSamples
 
-// TestAddSamples — подключение корпуса образцов: домен + A-запись для
-// каждого каталога с meta.yaml, заголовки из headers.json (в т.ч. несколько
-// Set-Cookie) попадают в сниппет Caddy, каталог без meta.yaml пропускается.
+// TestAddSamples — the wiring of the samples corpus: a domain + an A
+// record for each directory with a meta.yaml, the headers from
+// headers.json (including several Set-Cookie) land in the Caddy snippet,
+// a directory without a meta.yaml is skipped.
 func TestAddSamples(t *testing.T) {
 	tmp := t.TempDir()
 	samples := map[string]string{
@@ -290,7 +298,7 @@ ver_min: "11"
 `,
 		"plain-ex": `is_laravel: false
 `,
-		"not-a-sample": "", // без meta.yaml — не подключается
+		"not-a-sample": "", // no meta.yaml — not wired in
 	}
 	for id, meta := range samples {
 		dir := filepath.Join(tmp, "testdata/laravel-samples", id)
@@ -347,9 +355,10 @@ ver_min: "11"
 		t.Error("каталог без meta.yaml не должен подключаться как образец")
 	}
 
-	// Заголовки: обе куки и обычный заголовок; имена отсортированы
-	// (Set-Cookie раньше X-Frame-Options) — сортировка даёт детерминизм
-	// генерата независимо от порядка ключей в headers.json.
+	// Headers: both cookies and an ordinary header; the names are sorted
+	// (Set-Cookie before X-Frame-Options) — the sorting gives the
+	// determinism of the generated artifacts regardless of the key order
+	// in headers.json.
 	for _, want := range []string{
 		`header +Set-Cookie "XSRF-TOKEN=`,
 		`header +Set-Cookie "laravel_session=`,

@@ -1,26 +1,29 @@
-// Сервис monitor (ТЗ 5.9): фоновый цикл реконсиляции инкрементальных
-// счётчиков конвейера (internal/monitor.ZoneStatsLoop, T-178: один
-// совмещённый проход — колонки зон + глобальные скаляры
-// crawler_counters — раз в monitor.zone_stats_interval, единственный
-// полный проход domains в стационаре) и оценка алертов минимального
-// набора ТЗ 5.9 (internal/monitor.AlertsLoop, T-080): доля ошибок DNS,
-// переполнение очередей, остановка прогресса, свободное место каталога
-// контента, износ NVMe (SMART), всплеск мусорных content_hash очистки
-// ingest (T-099, зонд /metrics), OOM и рестарты юнитов crawler (T-145,
-// systemctl + cgroup v2), неразобранный q:dead и память Redis (T-154,
-// XLEN + INFO memory); недостающие пороги T-162 — абсолютный минимум
-// диска (Warn/эскалация), троттлинг MemoryHigh, замороженная очередь
-// (last-delivered-id), PSI CPU; накопление рендер-долга — T-175 (флаги
-// render_pending по счётчику + лаг q:render); очередь фолбэка рендера —
-// T-246 (рост глубины q:render-fallback + события бюджета доли из
-// зонда /metrics рендер-воркера); переходы алертов
-// доставляются в Telegram (TelegramNotifier → telegram-notify.sh
-// --message). Ещё два цикла — отчёт системной нагрузки (T-173) и
-// медленные запросы PostgreSQL (T-177: pg_stat_activity → Telegram той
-// же доставкой), плюс цикл gauge рендер-долга (T-175) и кумулятивы
-// истории детекции appeared/lost из строк счётчиков (T-118/T-178).
-// Каркас — internal/service: миграции, пул БД (OnDBPool), пробы /livez +
-// /healthz, /metrics, graceful shutdown (ТЗ 3.4).
+// The monitor service (spec 5.9): the background loop of the
+// reconciliation of the incremental counters of the pipeline
+// (internal/monitor.ZoneStatsLoop, T-178: one combined pass — the zone
+// columns + the global crawler_counters scalars — once per
+// monitor.zone_stats_interval, the only full domains pass in the steady
+// state) and the evaluation of the alerts of the minimal set of spec 5.9
+// (internal/monitor.AlertsLoop, T-080): the share of DNS errors, the
+// queue overflow, the progress standstill, the free space of the content
+// directory, the NVMe wear (SMART), a spike of the junk content_hash of
+// the ingest cleanup (T-099, a /metrics probe), OOM and the restarts of
+// the crawler units (T-145, systemctl + cgroup v2), the untriaged q:dead
+// and the Redis memory (T-154, XLEN + INFO memory); the missing
+// thresholds of T-162 — the absolute disk minimum (Warn/escalation), the
+// MemoryHigh throttling, a frozen queue (last-delivered-id), the PSI CPU;
+// the accumulation of render debt — T-175 (the render_pending flags by
+// the counter + the q:render lag); the render fallback queue — T-246
+// (the growth of the q:render-fallback depth + the share budget events
+// from the /metrics probe of the render worker); the alert transitions
+// are delivered to Telegram (TelegramNotifier → telegram-notify.sh
+// --message). Two more loops — the system load report (T-173) and the
+// slow PostgreSQL queries (T-177: pg_stat_activity → Telegram by the same
+// delivery), plus the loop of the render debt gauge (T-175) and the
+// cumulatives of the appeared/lost detection history from the counter
+// rows (T-118/T-178).
+// The framework is internal/service: migrations, the DB pool (OnDBPool),
+// the /livez + /healthz probes, /metrics, graceful shutdown (spec 3.4).
 package main
 
 import (
@@ -41,28 +44,31 @@ import (
 )
 
 func main() {
-	// Ошибка конфигурации — до инициализации логгера: stderr и код 1.
+	// A configuration error — before the logger is initialized: stderr and exit code 1.
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("[monitor] конфигурация: %v", err)
 	}
 	logger := service.NewLogger("monitor", cfg)
-	// Адрес мониторинга — monitor.listen из конфигурации (ТЗ 5.10):
-	// важнее METRICS_ADDR — docs/services.md (приоритет приведён к
-	// документации; прежде переменная ошибочно побеждала конфиг).
-	// METRICS_ADDR — страховка при пустом monitor.listen (на практике не
-	// пуст: Default/Validate); адреса метрик остальных сервисов задаются
-	// только переменной (ТЗ 5.9).
+	// The monitoring address — monitor.listen from the configuration
+	// (spec 5.10): it takes precedence over METRICS_ADDR —
+	// docs/services.md (the priority was brought to the documentation;
+	// before, the variable erroneously beat the config). METRICS_ADDR —
+	// the guard for an empty monitor.listen (in practice it is not empty:
+	// Default/Validate); the metric addresses of the other services are
+	// set only by the variable (spec 5.9).
 	//
-	// Пул приходит от каркаса после миграций (OnDBPool) и гарантированно
-	// готов до старта OnRun: postgres.dsn обязателен (config.Validate).
+	// The pool comes from the framework after the migrations (OnDBPool)
+	// and is guaranteed to be ready before OnRun starts: postgres.dsn is
+	// required (config.Validate).
 	listen := cfg.Monitor.Listen
 	if listen == "" {
 		listen = service.EnvOr("METRICS_ADDR", ":9100")
 	}
-	// Реестр метрик (T-115): gauge серой зоны Laravel-находок
-	// (crawler_laravel_near_findings) регистрируется до старта OnRun,
-	// каркас отдаёт тот же реестр через /metrics (стиль cmd/analyzer).
+	// The metrics registry (T-115): the gauge of the Laravel near-find
+	// grey zone (crawler_laravel_near_findings) is registered before OnRun
+	// starts, the framework serves the same registry via /metrics (the
+	// cmd/analyzer style).
 	reg := metrics.New("monitor")
 	var pool *pgxpool.Pool
 	if err := service.Run(service.Options{
@@ -72,11 +78,12 @@ func main() {
 		MetricsAddr: listen,
 		Metrics:     reg,
 		OnDBPool:    func(p *pgxpool.Pool) { pool = p },
-		// Пересчёт счётчиков зон и окна алертов — агрегаты по всей
-		// domains (T-171): без параллельных воркеров проход не
-		// забирает все ядра у конвейера; свежесть счётчиков в
-		// десятки секунд достаточна (порог алерта остановки
-		// прогресса — 5 периодов пересчёта).
+		// The recomputation of the zone counters and the alert windows —
+		// the aggregates over the whole domains (T-171): without parallel
+		// workers the pass does not take all the cores away from the
+		// pipeline; a freshness of the counters in tens of seconds is
+		// sufficient (the threshold of the progress standstill alert —
+		// 5 recomputation periods).
 		DBAfterConnect: db.NoParallelGather,
 		OnRun:          func(ctx context.Context) error { return run(ctx, cfg, logger, pool, reg) },
 	}); err != nil {
@@ -84,19 +91,22 @@ func main() {
 	}
 }
 
-// run — рабочая логика monitor: пересчёт счётчиков зон (ТЗ 5.9, T-078)
-// фоновым циклом и оценка алертов (ТЗ 5.9, T-080) циклом первого плана —
-// алерт остановки прогресса читает zones.updated_at, который пишет именно
-// фоновый цикл. Оба завершаются отменой ctx (graceful shutdown, ТЗ 3.4);
-// после своего цикла забираем результат фонового (стиль cmd/scheduler).
+// run — the working logic of monitor: the recomputation of the zone
+// counters (spec 5.9, T-078) by a background loop and the alert
+// evaluation (spec 5.9, T-080) by the foreground loop — the progress
+// standstill alert reads zones.updated_at, which is written exactly by
+// the background loop. Both finish on the ctx cancellation (graceful
+// shutdown, spec 3.4); after its own loop we collect the result of the
+// background one (the cmd/scheduler style).
 func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgxpool.Pool, reg *metrics.Registry) error {
 	if pool == nil {
 		return errors.New("monitor: пул БД не получен (postgres.dsn обязателен)")
 	}
 
-	// Глубина стримов для алерта очередей — через BackpressureGate
-	// (T-026): тот же узкий API над go-redis, что у планировщика и
-	// crawlerctl status (T-079); сам гейт ничего не ждёт — только Len.
+	// The depth of the streams for the queue alert — via BackpressureGate
+	// (T-026): the same narrow API over go-redis as by the scheduler and
+	// crawlerctl status (T-079); the gate itself waits for nothing — only
+	// Len.
 	rdb := queue.NewClient(cfg.Redis.Addr)
 	defer func() { _ = rdb.Close() }()
 	gate := queue.NewBackpressureGate(rdb, queue.BackpressureOptions{
@@ -104,25 +114,26 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		Log:       logger,
 	})
 
-	// Производная отмена: ранний выход своего цикла останавливает
-	// и фоновый — иначе <-bg ждал бы вечно. Отмена выполняется ДО
-	// ожидания (defer остаётся страховкой на путь с паникой): если
-	// AlertsLoop когда-нибудь научится возвращаться ошибкой без
-	// отмены родительского ctx, зависание не наступит.
+	// Derived cancellation: an early exit of its own loop stops the
+	// background one too — otherwise <-bg would wait forever. The
+	// cancellation executes BEFORE the waiting (the defer remains the
+	// guard for the panic path): if AlertsLoop ever learns to return an
+	// error without cancelling the parent ctx, a hang will not happen.
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// Фоновые циклы: реконсиляция инкрементальных счётчиков (T-178;
-	// период — monitor.zone_stats_interval, единственный полный проход
-	// domains в стационаре; реестр — длительность прохода, пропуски
-	// тиков и gauge дрейфа crawler_counters_drift), gauge серой зоны
-	// Laravel-находок (T-115) и кумулятивы истории детекции
-	// appeared/lost (T-118; строки счётчиков — T-178). Четвёртый цикл —
-	// отчёт системной нагрузки (T-173), пятый — медленные запросы
-	// PostgreSQL (T-177): оба подключаются ниже, после сборки
-	// Telegram-доставки. Шестой — рендер-долг (T-175): gauge
-	// crawler_render_pending_domains и сводка в журнал (счётчик флагов
-	// из БД + лаг q:render тем же гейтом).
+	// The background loops: the reconciliation of the incremental
+	// counters (T-178; the period — monitor.zone_stats_interval, the only
+	// full domains pass in the steady state; the registry — the pass
+	// duration, the skipped ticks and the crawler_counters_drift drift
+	// gauge), the gauge of the Laravel near-find grey zone (T-115) and the
+	// cumulatives of the appeared/lost detection history (T-118; the
+	// counter rows — T-178). The fourth loop — the system load report
+	// (T-173), the fifth — the slow PostgreSQL queries (T-177): both hook
+	// in below, after the Telegram delivery is built. The sixth — the
+	// render debt (T-175): the gauge crawler_render_pending_domains and a
+	// summary into the log (the flag counter from the DB + the q:render
+	// lag by the same gate).
 	bg := make(chan error, 6)
 	go func() {
 		bg <- monitor.ZoneStatsLoop(ctx, pool, reg, monitor.ZoneStatsOptions{
@@ -142,11 +153,12 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		})
 	}()
 
-	// Рендер-долг (T-175): раз в monitor.render_debt_interval — снимок
-	// долга (счётчик crawler_counters через пул + лаг q:render тем же
-	// гейтом, что у алертов очередей) в gauge
-	// crawler_render_pending_domains и строкой сводки в журнал; алерт
-	// накопления и строка отчёта нагрузки читают тот же источник.
+	// The render debt (T-175): once per monitor.render_debt_interval — a
+	// snapshot of the debt (the crawler_counters counter via the pool +
+	// the q:render lag by the same gate as the queue alerts) into the
+	// gauge crawler_render_pending_domains and a summary line into the
+	// log; the accumulation alert and the load report line read the same
+	// source.
 	go func() {
 		bg <- monitor.RenderDebtLoop(ctx, monitor.RenderDebtReader{Pool: pool, Redis: gate},
 			monitor.RenderDebtOptions{
@@ -156,82 +168,90 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 			})
 	}()
 
-	// Период алертов — monitor.alerts_interval (T-206): цикл отвязан
-	// от реконсиляции (zone_stats_interval, с T-199 — 30 мин), дефолт
-	// 5 мин — прежняя частота, окна детекции в проходах вернулись к
-	// прежним минутам. Порог остановки прогресса считается в периодах
-	// РЕКОНСИЛЯЦИИ (ZoneStatsInterval опции ниже): zones.updated_at
-	// пишет ZoneStatsLoop — порог 5 × 5 мин при 30-мин записи метки
-	// стрелял бы вечно.
+	// The alerts period — monitor.alerts_interval (T-206): the loop is
+	// decoupled from the reconciliation (zone_stats_interval, since T-199
+	// — 30 min), the default 5 min — the former frequency, the detection
+	// windows in the passes returned to the former minutes. The progress
+	// standstill threshold is counted in the RECONCILIATION periods (the
+	// ZoneStatsInterval of the options below): ZoneStatsLoop writes
+	// zones.updated_at — a threshold of 5 × 5 min with a 30-min label
+	// write would fire forever.
 	//
-	// Глубина q:dead (T-154) — через тот же гейт обёрткой
-	// NewDeadDepthMetrics: Len(q:dead) зеркалится в
-	// crawler_queue_depth{queue="q:dead"} (monitor — назначенный
-	// наблюдатель карантина, потребителей у него нет), рабочие стримы
-	// идут транзитом — их глубину публикуют сами воркеры (T-077).
+	// The q:dead depth (T-154) — via the same gate wrapped by
+	// NewDeadDepthMetrics: Len(q:dead) is mirrored into
+	// crawler_queue_depth{queue="q:dead"} (monitor — the designated
+	// observer of the quarantine, it has no consumers), the working
+	// streams go in transit — the workers publish their depth themselves
+	// (T-077).
 	//
-	// Источник мусорных content_hash (T-099) — зонд экспозиции /metrics
-	// сервиса ingest: счётчик растёт в процессе ingest, монитор читает
-	// его тем же адресом, что скрейпит Prometheus. Пустой адрес — алерт
-	// «не измеряется» (тихо), а не Warn зондом на каждый проход.
+	// The source of the junk content_hash (T-099) — a probe of the
+	// /metrics exposure of the ingest service: the counter grows during
+	// ingest, the monitor reads it by the same address Prometheus
+	// scrapes. An empty address — the alert "not measured" (silently),
+	// not a Warn by the probe on every pass.
 	deps := monitor.AlertsDeps{Pool: pool, Redis: monitor.NewDeadDepthMetrics(reg, gate)}
 	if cfg.Monitor.IngestMetricsURL != "" {
 		deps.BadHashes = monitor.IngestBadHashes{URL: cfg.Monitor.IngestMetricsURL}
 	}
-	// Источник событий бюджета доли фолбэка (T-246): зонд экспозиции
-	// /metrics рендер-воркера (счётчик suspended{reason="budget"} растёт
-	// в процессе воркера, монитор читает его тем же адресом, что
-	// скрейпит Prometheus). Пустой адрес — алерт «не измеряется» тихо
-	// (а не Warn зондом на каждый проход), стиль ingest-зонда. Тот же
-	// зонд питает алерт browser-ошибок (S-P2-6): один адрес — два
-	// независимых чтения, период цикла алертов поглощает стоимость.
+	// The source of the share budget events of the fallback (T-246): a
+	// probe of the /metrics exposure of the render worker (the counter
+	// suspended{reason="budget"} grows during the worker, the monitor
+	// reads it by the same address Prometheus scrapes). An empty address —
+	// the alert "not measured" silently (not a Warn by the probe on every
+	// pass), the ingest-probe style. The same probe feeds the browser
+	// error alert (S-P2-6): one address — two independent reads, the
+	// alerts loop period absorbs the cost.
 	if cfg.Monitor.RenderMetricsURL != "" {
 		probe := monitor.RenderSuspends{URL: cfg.Monitor.RenderMetricsURL}
 		deps.FallbackBudget = probe
 		deps.RenderBrowserErrors = probe
 	}
-	// События юнитов (T-145): systemctl show + cgroup v2 memory.events
-	// (unitevents.go), обёрнуты в метрики — одно чтение на проход питает
-	// алерты unit_oom и memory_high (T-162: рост счётчика high) и gauge
+	// The unit events (T-145): systemctl show + cgroup v2 memory.events
+	// (unitevents.go), wrapped into metrics — one read per pass feeds the
+	// unit_oom and memory_high alerts (T-162: the growth of the high
+	// counter) and the gauges
 	// crawler_unit_oom_events/crawler_unit_memory_high_events/
-	// crawler_unit_restarts. В dev-контейнере без systemd источник
-	// деградирует тихо (как SMART).
+	// crawler_unit_restarts. In a dev container without systemd the
+	// source degrades silently (as SMART).
 	deps.UnitEvents = monitor.NewUnitEventsMetrics(reg, monitor.OSUnitEvents{})
-	// Память Redis (T-154): INFO memory того же клиента, что у гейта,
-	// обёрнута в метрики — одно чтение питает алерт redis_memory и gauge
-	// crawler_redis_memory_ratio/_bytes.
+	// The Redis memory (T-154): INFO memory of the same client as the
+	// gate, wrapped into metrics — one read feeds the redis_memory alert
+	// and the gauges crawler_redis_memory_ratio/_bytes.
 	deps.RedisMemory = monitor.NewRedisMemoryMetrics(reg, monitor.RedisInfo{RDB: rdb})
-	// Аптайм Redis (T-270): INFO server того же клиента — алерт
-	// redis_restart (рестарт без персистентности теряет недоставленные
-	// записи стримов: главная причина класса потерь «статус повис»,
-	// ФТ-2.2).
+	// The Redis uptime (T-270): INFO server of the same client — the
+	// redis_restart alert (a restart without persistence loses the
+	// undelivered stream records: the main cause of the "status hung"
+	// loss class, FR-2.2).
 	deps.RedisUptime = monitor.RedisInfo{RDB: rdb}
-	// Группы стримов для алерта замороженной очереди (T-162): XINFO
-	// GROUPS + XLEN того же клиента (last-delivered-id и глубина группы
-	// с клампом T-168); стрим без групп — пустой вклад.
+	// The stream groups for the frozen queue alert (T-162): XINFO GROUPS
+	// + XLEN of the same client (the last-delivered-id and the group depth
+	// with the T-168 clamp); a stream without groups — an empty
+	// contribution.
 	deps.StreamGroups = monitor.RedisStreamGroups{RDB: rdb}
-	// PSI CPU (T-162): /proc/pressure/cpu хоста, обёрнуто в метрики —
-	// gauge crawler_psi_cpu_some_percent и алерт psi_cpu одним чтением;
-	// ядро без PSI деградирует тихо.
+	// The PSI CPU (T-162): /proc/pressure/cpu of the host, wrapped into
+	// metrics — the gauge crawler_psi_cpu_some_percent and the psi_cpu
+	// alert by one read; a kernel without PSI degrades silently.
 	deps.PSI = monitor.NewPSIMetrics(reg, monitor.OSPSI{})
-	// Доставка алертов в Telegram (T-162): переходы состояний уходят
-	// exec-ом telegram-notify.sh --message; секреты берёт из окружения
-	// юнита (EnvironmentFile /etc/crawler/crawler.env), нет секретов или
-	// скрипта — доставка выключена, алерты остаются Warn в журнале.
+	// The delivery of the alerts to Telegram (T-162): the state
+	// transitions go by exec-ing telegram-notify.sh --message; the
+	// secrets are taken from the environment of the unit (EnvironmentFile
+	// /etc/crawler/crawler.env), no secrets or script — the delivery is
+	// off, the alerts stay Warn in the log.
 	telegram := monitor.NewTelegramNotifier(monitor.TelegramOptions{
 		Enabled: cfg.Monitor.Alerts.Telegram,
 		Script:  cfg.Monitor.Alerts.TelegramScript,
 		Log:     logger,
 	})
 
-	// Отчёт системной нагрузки оператору (T-173): раз в
-	// monitor.load_report_interval — снимок /proc (система + топ
-	// процессов «htop»-видом), места каталога контента и глубин очередей
-	// — бэклог групп потребления, тот же общий расчёт, что у
-	// crawlerctl status (queue.GroupDepth, T-188), — с темпами
-	// потребления: в Telegram той же доставкой, что алерты
-	// (нет секретов/скрипта — только журнал и gauge crawler_os_*).
-	// Период 0 — цикл выключен (LoadReportLoop молча выйдет).
+	// The system load report to the operator (T-173): once per
+	// monitor.load_report_interval — a snapshot of /proc (the system + a
+	// "htop"-style top of the processes), the space of the content
+	// directory and the queue depths — the group consumption backlogs,
+	// the same common calculation as crawlerctl status (queue.GroupDepth,
+	// T-188), — with the consumption paces: into Telegram by the same
+	// delivery as the alerts (no secrets/script — only the log and the
+	// crawler_os_* gauges).
+	// A period of 0 — the loop is off (LoadReportLoop exits silently).
 	go func() {
 		bg <- monitor.LoadReportLoop(ctx, monitor.OSLoad{}, monitor.LoadReportOptions{
 			Interval:   cfg.Monitor.LoadReportInterval.D(),
@@ -245,17 +265,19 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		})
 	}()
 
-	// Медленные запросы PostgreSQL (T-177): цикл опрашивает
-	// pg_stat_activity — выполняемые дольше monitor.slow_query_min_duration
-	// клиентские операторы уходят в Telegram той же доставкой, что алерты
-	// и отчёт нагрузки (дебаунс pid+query_start; агрегат реконсиляции
-	// monitor — UPDATE по 47 млн строк каждые 30 мин (T-199), замер §12 —
-	// исключены application_name пула). Полный посмертный след — журнал
-	// сервера (log_min_duration_statement, deploy/postgres). 0 — цикл
-	// выключен (SlowQueryLoop молча выйдет). Доставка в Telegram —
-	// только при monitor.slow_query_telegram (по умолчанию выключена:
-	// диагностика уже видна в журнале monitor, метриках и логе сервера);
-	// без флага Notify nil — цикл ограничен Warn в журнал и метриками.
+	// The slow PostgreSQL queries (T-177): the loop polls pg_stat_activity
+	// — the client statements running longer than
+	// monitor.slow_query_min_duration go to Telegram by the same delivery
+	// as the alerts and the load report (a debounce by pid+query_start;
+	// the reconciliation aggregate of monitor — an UPDATE over 47 million
+	// rows every 30 min (T-199), the §12 measurement — excluded by the
+	// application_name of the pool). The full post-mortem trail — the
+	// server log (log_min_duration_statement, deploy/postgres). 0 — the
+	// loop is off (SlowQueryLoop exits silently). The Telegram delivery —
+	// only with monitor.slow_query_telegram (off by default: the
+	// diagnostics are already visible in the monitor log, the metrics and
+	// the server log); without the flag Notify is nil — the loop is bound
+	// to Warn into the log and the metrics.
 	var slowQueryNotify func(string)
 	if cfg.Monitor.SlowQueryTelegram {
 		slowQueryNotify = telegram.Send
@@ -291,9 +313,10 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		Log:               logger,
 		OnPass:            telegram.OnPass,
 	})
-	// Свой цикл закончился — отменяем фоновые до ожидания результатов
-	// (отмена идемпотентна и при уже остановленных циклах). Их сбой не
-	// прячем за nil алертов — забираем результаты.
+	// Its own loop has finished — we cancel the background ones before
+	// waiting for the results (the cancellation is idempotent even with
+	// the already stopped loops). We do not hide their failure behind a
+	// nil of the alerts — we collect the results.
 	cancel()
 	for i := 0; i < 6; i++ {
 		bgErr := <-bg

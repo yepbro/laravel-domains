@@ -1,19 +1,22 @@
-// Сервис dns-worker (ТЗ 5.4, 4.2, 3.4): DNS-этап проверки доменов.
-// Потребляет пачки q:dns (DNSBatch) группой потребителей, для каждого
-// домена выполняет эпизод — апекс (internal/dnsworker CheckApex, T-036),
-// субдомены (CheckSubdomains, T-037) и wildcard-детект (DetectWildcard/
-// MarkWildcardSubdomains, T-038) — и записывает результат (dns_mask,
-// статус, done) с публикацией задач q:http по найденным адресам
-// (T-039). Обмены идут через internal/dnsclient: цепь резолверов —
-// локальный клиент с собственным пулом UDP-сокетов (T-034) и резервные
-// клиенты dns.fallback_resolvers под декоратором переключения
-// (FallbackResolver, T-107), поверх — лимиты параллелизма/QPS с адаптивным
-// снижением (LimitResolver, T-035); старт — синтетическая проба цепи
-// (fail-fast на мёртвых резолверах, T-107); параллелизм эпизодов —
-// dns.concurrency. Публикация q:http — под гейтом backpressure
-// (WatermarkPublisher, T-026). Подтверждение q:dns — паттерном Processing
-// (XACK только после записи в БД, T-025). Каркас — internal/service:
-// миграции, пул БД (OnDBPool), пробы /livez + /healthz, /metrics, graceful shutdown.
+// The dns-worker service (spec 5.4, 4.2, 3.4): the DNS stage of the
+// domain check. It consumes the q:dns batches (DNSBatch) with a consumer
+// group, for each domain it performs an episode — the apex
+// (internal/dnsworker CheckApex, T-036), the subdomains (CheckSubdomains,
+// T-037) and the wildcard detect (DetectWildcard/MarkWildcardSubdomains,
+// T-038) — and writes the result (dns_mask, the status, done) with
+// publishing q:http tasks by the found addresses (T-039). The exchanges
+// go through internal/dnsclient: a resolver chain — a local client with
+// its own pool of UDP sockets (T-034) and the reserve clients of
+// dns.fallback_resolvers under the switchover decorator
+// (FallbackResolver, T-107), on top — the concurrency/QPS limits with an
+// adaptive reduction (LimitResolver, T-035); the startup — a synthetic
+// probe of the chain (a fail-fast on dead resolvers, T-107); the episode
+// concurrency — dns.concurrency. The q:http publishing — under the
+// backpressure gate (WatermarkPublisher, T-026). The q:dns
+// acknowledgment — by the Processing pattern (XACK only after the DB
+// write, T-025). The framework is internal/service: migrations, the DB
+// pool (OnDBPool), the /livez + /healthz probes, /metrics, graceful
+// shutdown.
 package main
 
 import (
@@ -37,18 +40,19 @@ import (
 )
 
 func main() {
-	// Ошибка конфигурации — до инициализации логгера: stderr и код 1.
+	// A configuration error — before the logger is initialized: stderr and exit code 1.
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("[dns-worker] конфигурация: %v", err)
 	}
 	logger := service.NewLogger("dns-worker", cfg)
 
-	// Пул приходит от каркаса после миграций (OnDBPool) и гарантированно
-	// готов до старта OnRun: postgres.dsn обязателен (config.Validate).
-	// Реестр метрик — здесь же (T-077): приборы DNS-этапа и коллектор
-	// длины q:dns получают его до старта OnRun, каркас отдаёт тот же
-	// реестр через /metrics.
+	// The pool comes from the framework after the migrations (OnDBPool)
+	// and is guaranteed to be ready before OnRun starts: postgres.dsn is
+	// required (config.Validate).
+	// The metrics registry — right here (T-077): the instruments of the
+	// DNS stage and the collector of the q:dns depth receive it before
+	// OnRun starts, the framework serves the same registry via /metrics.
 	reg := metrics.New("dns-worker")
 	var pool *pgxpool.Pool
 	if err := service.Run(service.Options{
@@ -58,11 +62,12 @@ func main() {
 		MetricsAddr: service.EnvOr("METRICS_ADDR", ":9103"),
 		Metrics:     reg,
 		OnDBPool:    func(p *pgxpool.Pool) { pool = p },
-		// AfterConnect-хук write-пула (T-192): сессионный потолок
-		// lock_timeout 30 с — транзакции записи результатов и публикации
-		// берут строчные локи domains; конвой блокировок 25.10 (держатель
-		// ≈37 мин, жертвы до 39 мин) обрезается откатом транзакции
-		// и повтором доставки пачки (at-least-once, ТЗ §3.4).
+		// The AfterConnect hook of the write pool (T-192): the session cap
+		// of lock_timeout 30 s — the transactions of writing the results
+		// and publishing take the row locks of domains; the 25.10 lock
+		// convoy (the holder ≈37 min, the victims up to 39 min) is
+		// truncated by a transaction rollback and a batch delivery retry
+		// (at-least-once, spec §3.4).
 		DBAfterConnect: db.LockTimeout(db.DefaultLockTimeout),
 		OnRun:          func(ctx context.Context) error { return run(ctx, cfg, logger, pool, reg) },
 	}); err != nil {
@@ -70,38 +75,41 @@ func main() {
 	}
 }
 
-// run — рабочая логика dns-worker: цепь резолверов (локальный клиент
-// T-034 + резервы dns.fallback_resolvers, T-107) со стартовой пробой
-// (fail-fast: все мертвы — ошибка старта), под ней лимиты T-035, цикл
-// воркера dnsworker.Run с приборами этапа (T-077), коллекторы длины q:dns
-// и переключений на резерв (метрика глубины очередей — ТЗ 5.9: backlog
-// стрима, который потребляет этот воркер). Завершение — отмена ctx
-// (graceful shutdown, ТЗ 3.4): начатые эпизоды дорабатывают или
-// возвращаются очереди повторной доставкой (Processing, T-025);
-// фоновые коллекторы гасятся производной отменой и джойнятся до
-// defer-закрытий rdb/резолверов (T-232).
+// run — the working logic of dns-worker: the resolver chain (the local
+// client T-034 + the reserves of dns.fallback_resolvers, T-107) with a
+// startup probe (a fail-fast: all dead — a startup error), under it the
+// T-035 limits, the dnsworker.Run loop of the worker with the stage
+// instruments (T-077), the collectors of the q:dns depth and the
+// switchovers to the reserve (the queue depth metric — spec 5.9: the
+// backlog of the stream this worker consumes). Shutdown — ctx
+// cancellation (graceful shutdown, spec 3.4): the started episodes finish
+// or are refunded to the queue for redelivery (Processing, T-025);
+// the background collectors are stopped by the derived cancellation and
+// joined before the defer-closes of rdb/the resolvers (T-232).
 func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgxpool.Pool, reg *metrics.Registry) error {
 	if pool == nil {
 		return errors.New("dns-worker: пул БД не получен (postgres.dsn обязателен)")
 	}
 
-	// Цепь резолверов (T-107): основной — первый из dns.resolvers
-	// (локальный unbound, ТЗ 5.4), резервы — dns.fallback_resolvers в
-	// порядке конфига. Каждый адрес — собственный клиент с собственным
-	// пулом сокетов (транспорт T-034 «один клиент — один резолвер»);
-	// пулы резервов открываются тем же размером: в режиме переключения
-	// резерв держит плановый параллелизм конвейера целиком, а простаивающий
-	// подключённый UDP-сокет ничего не потребляет (пакетов нет).
+	// The resolver chain (T-107): the primary — the first of dns.resolvers
+	// (a local unbound, spec 5.4), the reserves — dns.fallback_resolvers
+	// in the config order. Each address — its own client with its own pool
+	// of sockets (the T-034 transport "one client — one resolver"); the
+	// pools of the reserves are opened with the same size: in the
+	// switchover mode the reserve holds the planned concurrency of the
+	// pipeline in full, while an idle connected UDP socket consumes
+	// nothing (no packets).
 	opt := dnsclient.NewOptions(cfg.DNS)
 	client, err := dnsclient.NewClient(ctx, opt)
 	if err != nil {
 		return err
 	}
 	clients := []*dnsclient.Client{client}
-	// Закрытие клиентов цепи — единый defer, зарегистрированный ДО цикла
-	// резервов: ошибка старта посреди цикла не должна оставлять открытых
-	// пулов сокетов (выход из main закрыл бы их ядром, но корректность
-	// пути ошибок не держится на этом).
+	// Closing the clients of the chain — a single defer registered BEFORE
+	// the loop of the reserves: a startup error in the middle of the loop
+	// must not leave open socket pools (an exit from main would close them
+	// by the runtime, but the correctness of the error path does not rely
+	// on that).
 	defer func() {
 		for _, c := range clients {
 			_ = c.Close()
@@ -119,13 +127,15 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		chain = append(chain, dnsclient.FallbackTarget{Addr: addr, Resolver: fc})
 	}
 
-	// Стартовая синтетическая проба цепи (T-107/DNS-12): пул сокетов
-	// fail-fast только по адресу, мёртвый сервер без пробы звучал бы
-	// первым боевым temp_error-обменом. Идёт в клиентов напрямую, мимо
-	// лимитёра (слот/токен/окно адаптива — не для служебного обмена).
-	// Частичный отказ — Warn в лог (цепь дорабатывает переключением),
-	// не отвечает никто — ошибка старта: конвейер без резолверов
-	// раскладывает домены в temp_error (T-031), дешевле упасть заметно.
+	// The startup synthetic probe of the chain (T-107/DNS-12): a socket
+	// pool is fail-fast only by the address, a dead server without the
+	// probe would sound with the first production temp_error exchange. It
+	// goes to the clients directly, bypassing the limiter (the
+	// slot/token/window of the adaptive — not for a service exchange).
+	// A partial failure — a Warn in the log (the chain keeps working by
+	// switching), nobody answers — a startup error: a pipeline without
+	// resolvers puts the domains into temp_error (T-031), it is cheaper to
+	// fall down noticeably.
 	if err := dnsclient.ProbeChain(ctx, chain, logger); err != nil {
 		return err
 	}
@@ -141,58 +151,61 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 
 	rdb := queue.NewClient(cfg.Redis.Addr)
 	defer func() { _ = rdb.Close() }()
-	// Публикация q:http — под гейтом backpressure (T-026: порог общий
-	// для гейтируемых стримов; ворота ёмкости q:render — отдельные,
-	// render.queue_high_watermark, T-174); потребление q:dns и XACK
-	// проходят прозрачно.
+	// The q:http publishing — under the backpressure gate (T-026: the
+	// threshold is common for the gated streams; the capacity gate of
+	// q:render is separate, render.queue_high_watermark, T-174); the
+	// consumption of q:dns and the XACK pass through transparently.
 	gate := queue.NewBackpressureGate(rdb, queue.BackpressureOptions{
 		Watermark: int64(cfg.Scheduler.QueueHighWatermark),
-		MaxLen:    int64(cfg.Redis.MaxLen), // пределы обрезки — для порога гейта (T-026/T-025)
+		MaxLen:    int64(cfg.Redis.MaxLen), // the trim limits — for the gate threshold (T-026/T-025)
 		Log:       logger,
 	})
 	q := queue.NewWatermarkPublisher(queue.NewRedisQueue(rdb, queue.RedisOptions{
-		MaxLen: int64(cfg.Redis.MaxLen), // XADD MAXLEN ~ на каждом стриме (T-025)
+		MaxLen: int64(cfg.Redis.MaxLen), // XADD MAXLEN ~ on every stream (T-025)
 	}), gate)
 
-	// Джойн фоновых циклов (T-232, инвариант http-worker T-223):
-	// производная отмена + WaitGroup. Каркас отменяет ctx OnRun только
-	// после его возврата (internal/service: cancelRun после onRunDone);
-	// паника в цикле воркера обязана останавливать коллекторы сама, иначе
-	// defer-закрытия rdb/клиентов цепи (LIFO ниже) закроют ресурсы под
-	// запросом глубины q:dns (gate.Len → rdb); до T-232 все три
-	// коллектора жили fire-and-forget. Джойн — defer, зарегистрированный
-	// ПОСЛЕ defer-закрытий выше → исполняется ДО них (LIFO). WaitGroup,
-	// а не канал ёмкости: джойн ждёт ровно запущенное (Add/Done по месту
-	// запуска). Инварианты закреплены структурным тестом
-	// TestRunBackgroundJoin (main_test.go, разборщик — internal/bgjoin).
+	// The join of the background loops (T-232, the http-worker invariant
+	// T-223): the derived cancellation + a WaitGroup. The framework
+	// cancels the ctx of OnRun only after it returns (internal/service:
+	// cancelRun after onRunDone); a panic in the worker loop must stop
+	// the collectors itself, otherwise the defer-closes of rdb/the chain
+	// clients (the LIFO below) would close the resources in the middle of
+	// a q:dns depth request (gate.Len → rdb); before T-232 all three
+	// collectors lived fire-and-forget. The join is a defer registered
+	// AFTER the defer-closes above → it executes BEFORE them (LIFO). A
+	// WaitGroup, not a channel of a capacity: the join waits for exactly
+	// what was started (Add/Done at the launch site). The invariants are
+	// pinned by the structural test TestRunBackgroundJoin (main_test.go,
+	// the checker — internal/bgjoin).
 	ctx, cancel := context.WithCancel(ctx)
 	var bg sync.WaitGroup
 	defer func() {
-		// Штатно ctx уже отменён каркасом к моменту возврата run;
-		// ранняя паника гасит ещё живые коллекторы здесь — до
-		// defer-закрытий (LIFO).
+		// Normally the ctx is already cancelled by the framework by the
+		// moment run returns; an early panic stops the still living
+		// collectors here — before the defer-closes (LIFO).
 		cancel()
 		bg.Wait()
 	}()
 
-	// Возврат зависших доставок q:dns (T-025): RecoverLoop в воркере —
-	// клейм XAUTOCLAIM, исчерпание попыток — q:dead; параметры надёжности
-	// и темпа — секция redis (max_attempts, claim_min_idle,
-	// recover_batch, recover_interval — T-153). OnBury — счётчик смертей
-	// crawler_queue_dead_buried_total (T-154): bury молчаливым быть не
-	// должно (пост-мортем 22.10).
+	// Refunding the stuck q:dns deliveries (T-025): RecoverLoop in the
+	// worker — the XAUTOCLAIM claim, the attempt exhaustion — q:dead; the
+	// reliability and pace parameters — the redis section (max_attempts,
+	// claim_min_idle, recover_batch, recover_interval — T-153). OnBury —
+	// the counter of deaths crawler_queue_dead_buried_total (T-154): a
+	// bury must not be silent (the 22.10 post-mortem).
 	rel := queue.NewReliab(rdb, q, queue.ReliabOptions{
 		MaxAttempts: cfg.Redis.MaxAttempts,
 		MinIdle:     cfg.Redis.ClaimMinIdle.D(),
 		OnBury:      metrics.NewDeadBuriedHook(reg),
-		// OnBuryUnidentified — карантин неидентифицируемых записей
-		// (без task_id): crawler_queue_dead_unidentified_total
-		// (T-260, ФТ-6.1) — терминальная ветка bury.
+		// OnBuryUnidentified — the quarantine of unidentifiable records
+		// (without a task_id): crawler_queue_dead_unidentified_total
+		// (T-260, FR-6.1) — the terminal bury branch.
 		OnBuryUnidentified: metrics.NewDeadUnidentifiedHook(reg),
 	})
 
-	// Длина потребляемого стрима q:dns → crawler_queue_depth (T-077):
-	// источник глубины — гейт (тот же клиент Redis), завершается отменой ctx.
+	// The depth of the consumed q:dns stream → crawler_queue_depth
+	// (T-077): the depth source — the gate (the same Redis client), it
+	// finishes on the ctx cancellation.
 	bg.Add(1)
 	go func() {
 		defer bg.Done()
@@ -200,40 +213,42 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 			[]string{queue.StreamDNS}, metrics.DefaultQueueCollectInterval, logger)
 	}()
 
-	// Состояние лимитёра DNS → gauges (T-035 → T-077): эффективные
-	// потолки после адаптива, доля таймаутов в окне, обмены в полёте —
-	// тихая деградация резолвера (снижение до пола) видна метрикой,
-	// а не только ростом temp_error (DNS-06).
+	// The state of the DNS limiter → gauges (T-035 → T-077): the effective
+	// caps after the adaptive, the share of timeouts in the window, the
+	// exchanges in flight — a quiet degradation of the resolver (a
+	// reduction to the floor) is visible by the metric, not only by the
+	// growth of temp_error (DNS-06).
 	bg.Add(1)
 	go func() {
 		defer bg.Done()
 		_ = dnsworker.CollectLimitLoop(ctx, reg, resolve.Stats, 0, logger)
 	}()
 
-	// Переключения на резерв → счётчики (T-107 → ТЗ 5.9): темп
-	// crawler_dns_fallback_switches_total — деградация локального
-	// unbound при живом резерве (лимитёр при этом «здоров» — адаптив
-	// видит итог-успех), crawler_dns_fallback_exhausted_total — не
-	// ответил никто, завтрашние temp_error.
+	// The switchovers to the reserve → counters (T-107 → spec 5.9): the
+	// pace of crawler_dns_fallback_switches_total — a degradation of the
+	// local unbound with a live reserve (the limiter is "healthy" at that
+	// moment — the adaptive sees the final success),
+	// crawler_dns_fallback_exhausted_total — nobody answered, the
+	// tomorrow temp_errors.
 	bg.Add(1)
 	go func() {
 		defer bg.Done()
 		_ = dnsworker.CollectFallbackLoop(ctx, reg, fallback.Stats, 0, logger)
 	}()
 
-	// Главный цикл живёт до отмены ctx (graceful shutdown); джойн
-	// фоновых коллекторов — defer выше: любой выход run (штатный, паника)
-	// сначала гасит и дожидается их, и лишь затем LIFO закрывает
-	// rdb и клиентов цепи резолверов.
+	// The main loop lives until the ctx cancellation (graceful shutdown);
+	// the join of the background collectors — the defer above: any exit of
+	// run (graceful, a panic) first stops and waits for them, and only
+	// then the LIFO closes rdb and the clients of the resolver chain.
 	return dnsworker.Run(ctx, pool, q, resolve, dnsworker.Options{
-		Concurrency: cfg.DNS.Concurrency, // параллелизм эпизодов = dns.concurrency (ТЗ 5.10)
-		AskAAAA:     cfg.DNS.IPv6,        // AAAA отключаются конфигом без IPv6 (ТЗ 5.4)
-		Recover:     rel,                 // возврат зависших пачек q:dns (T-025)
-		// Темп возврата зависших (T-153): пачка/интервал клейма —
-		// redis.recover_*.
+		Concurrency: cfg.DNS.Concurrency, // the episode concurrency = dns.concurrency (spec 5.10)
+		AskAAAA:     cfg.DNS.IPv6,        // AAAA is disabled by the config without IPv6 (spec 5.4)
+		Recover:     rel,                 // refunding the stuck q:dns batches (T-025)
+		// The pace of the stuck refunds (T-153): the batch/interval of the
+		// claim — redis.recover_*.
 		RecoverBatch:    cfg.Redis.RecoverBatch,
 		RecoverInterval: cfg.Redis.RecoverInterval.D(),
-		Metrics:         reg, // приборы этапа: эпизоды, длительности, статусы (T-077)
+		Metrics:         reg, // the stage instruments: the episodes, the durations, the statuses (T-077)
 		Log:             logger,
 	})
 }

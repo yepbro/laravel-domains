@@ -1,11 +1,12 @@
-// Сервис ingest (ТЗ 5.1): наблюдает каталог incoming/ (internal/watch),
-// прогоняет готовые файлы через конвейер приёма (internal/ingest:
-// разбор пути → зона → разбор файла с sha256 в один проход → валидация →
-// staging → применение add/delete → отчёт ingest_files → processed/failed)
-// и держит фоновые очистки: удалённые домены и осиротевшие партии
-// staging (CleanupDeleted, T-020/T-098).
-// Каркас — internal/service: миграции, пул БД (OnDBPool), пробы /livez + /healthz
-// и /metrics, graceful shutdown (ТЗ 3.4).
+// The ingest service (spec 5.1): watches the incoming/ directory
+// (internal/watch), runs the ready files through the ingest pipeline
+// (internal/ingest: path parsing → zone → file parsing with sha256 in a
+// single pass → validation → staging → applying add/delete → the
+// ingest_files report → processed/failed) and keeps background cleanups:
+// deleted domains and orphaned staging batches (CleanupDeleted,
+// T-020/T-098).
+// The framework is internal/service: migrations, the DB pool (OnDBPool),
+// the /livez + /healthz probes and /metrics, graceful shutdown (spec 3.4).
 package main
 
 import (
@@ -26,16 +27,16 @@ import (
 )
 
 func main() {
-	// Ошибка конфигурации — до инициализации логгера: stderr и код 1.
+	// A configuration error — before the logger is initialized: stderr and exit code 1.
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("[ingest] конфигурация: %v", err)
 	}
 	logger := service.NewLogger("ingest", cfg)
 
-	// Реестр метрик — здесь же (T-077): счётчик мусорных content_hash
-	// очистки (T-099) получает его до старта OnRun, каркас отдаёт тот же
-	// реестр через /metrics.
+	// The metrics registry — right here (T-077): the junk content_hash
+	// counter of the cleanup (T-099) receives it before OnRun starts, the
+	// framework serves the same registry via /metrics.
 	reg := metrics.New("ingest")
 	var pool *pgxpool.Pool
 	if err := service.Run(service.Options{
@@ -51,14 +52,15 @@ func main() {
 	}
 }
 
-// run — рабочий цикл ingest (ТЗ 5.1): наблюдение incoming (fsnotify +
-// обход-страховка, стабильность размера/mtime — internal/watch, T-013),
-// конвейер обработки каждого готового файла (internal/ingest, T-014…T-021)
-// и фоновая очистка удалённых доменов в отдельной горутине (T-020;
-// интервал и пачка — дефолты пакета; итоги проходов — в счётчик мусорных
-// content_hash, T-099). Завершение — отмена ctx (graceful
-// shutdown, ТЗ 3.4): канал готовых файлов закрывается, конвейер
-// дорабатывает текущий файл, очистка выходит по отмене.
+// run — the working loop of ingest (spec 5.1): watching incoming
+// (fsnotify + a safety-net crawl, the size/mtime stability —
+// internal/watch, T-013), the processing pipeline of each ready file
+// (internal/ingest, T-014…T-021) and the background cleanup of deleted
+// domains in a separate goroutine (T-020; the interval and the chunk are
+// the package defaults; the pass totals go into the junk content_hash
+// counter, T-099). Shutdown — ctx cancellation (graceful shutdown,
+// spec 3.4): the channel of ready files is closed, the pipeline finishes
+// the current file, the cleanup exits on the cancellation.
 func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgxpool.Pool, reg *metrics.Registry) error {
 	if pool == nil {
 		return errors.New("ingest: пул БД не получен (postgres.dsn обязателен)")
@@ -72,14 +74,16 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 			Dir:           cfg.Ingest.Dir,
 			BatchSize:     cfg.Ingest.BatchSize,
 			MaxErrorRatio: cfg.Ingest.MaxErrorRatio,
-			// Лимиты архивов (T-133): несжатый объём и число записей.
+			// Archive limits (T-133): the uncompressed size and the record count.
 			ArchiveMaxUncompressed: cfg.Ingest.ArchiveMaxUncompressed.B(),
 			ArchiveMaxFiles:        cfg.Ingest.ArchiveMaxFiles,
-			// Allowlist многоуровневых каталогов зон (ТЗТ §5.1):
-			// тестовые зоны testbed; продуктовое значение — пусто.
+			// The allowlist of the multi-level zone directories
+			// (the tld-only-zones spec §5.1): the test zones of the
+			// testbed; the production value is empty.
 			AllowedZonePaths: cfg.Ingest.AllowedZonePaths,
-			// Лог rejected — в общий stderr сервиса (ТЗ 5.10 пути не
-			// задаёт): записи отличимы атрибутом service=rejected (T-016).
+			// The rejected log goes to the service's common stderr
+			// (spec 5.10 does not set paths): the records are
+			// distinguishable by the service=rejected attribute (T-016).
 			RejectLog: ingest.NewRejectedLogger(os.Stderr, slog.LevelInfo),
 			Log:       logger,
 		},
@@ -102,24 +106,26 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	go func() {
 		cleanupDone <- ingest.CleanupDeleted(ctx, pool, ingest.CleanupOptions{
 			Log: logger,
-			// Итог прохода — в счётчик мусорных content_hash (T-099):
-			// нулевой BadHashes значение не меняет, nil-реестр — no-op.
+			// The pass total — into the junk content_hash counter (T-099):
+			// a zero BadHashes does not change the value, a nil registry — no-op.
 			OnPass: ingest.NewCleanupMetrics(reg).Observe,
 		})
 	}()
 
 	for f := range files {
-		// Итоги обработки (перемещения processed/failed, дубли, порог
-		// ошибок) Pipeline логирует сам; ошибка возврата — только файлы,
-		// оставшиеся в incoming из-за сбоя инфраструктуры: цикл продолжает
-		// следующие файлы, оставшиеся переработает рестарт (at-least-once,
-		// ТЗ 3.4).
+		// The processing totals (the processed/failed moves, duplicates,
+		// the error threshold) are logged by the Pipeline itself; a return
+		// error means only the files left in incoming because of an
+		// infrastructure failure: the loop continues with the next files,
+		// the rest will be reprocessed by a restart (at-least-once,
+		// spec 3.4).
 		if _, err := pipe.Process(ctx, f.Path); err != nil {
 			logger.Error("файл не обработан — останется в incoming",
 				"path", f.Path, "err", err)
 		}
 	}
-	// Канал закрыт (отмена ctx) — конвейер завершён; ждём очистку
-	// (выходит по той же отмене).
+	// The channel is closed (the ctx cancellation) — the pipeline is
+	// finished; we wait for the cleanup (it exits on the same
+	// cancellation).
 	return <-cleanupDone
 }

@@ -1,11 +1,13 @@
-// Структурный инвариант остановки dns-worker (T-232): фоновые коллекторы
-// run (длина q:dns — rdb через гейт, состояние лимитёра T-035,
-// переключения на резерв T-107 — метрики) останавливаются производной
-// отменой и джойнятся WaitGroup'ом до defer-закрытий rdb и клиентов цепи
-// резолверов на любом выходе run — штатной отмене ctx, панике. До T-232
-// все три жили fire-and-forget: defer-закрытия могли настигнуть запрос
-// глубины очереди. Разбор main.go — общий хелпер internal/bgjoin
-// (образец и прародитель — TestRunBackgroundJoin http-worker, T-223).
+// Structural shutdown invariant of dns-worker (T-232): the background
+// collectors of run (the q:dns depth — rdb via the gate, the state of the
+// limiter T-035, the switchovers to the reserve T-107 — metrics) are
+// stopped by the derived cancellation and joined by the WaitGroup before
+// the defer-closes of rdb and the clients of the resolver chain on any
+// exit of run — a graceful ctx cancellation, a panic. Before T-232 all
+// three lived fire-and-forget: the defer-closes could catch a queue depth
+// request. main.go is checked by the shared helper internal/bgjoin
+// (the sample and progenitor — TestRunBackgroundJoin of http-worker,
+// T-223).
 package main
 
 import (

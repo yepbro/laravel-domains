@@ -1,14 +1,15 @@
-// Сервис dashboard — операторский веб-дашборд конвейера (ТЗД, этап 15):
-// единая страница состояния конвейера с доступом по паролю (HTTP Basic,
-// ТЗД §7), строго read-only (ТЗД §1.3). Каркас — internal/service
-// (миграции, пул БД через OnDBPool, пробы и /metrics на loopback
-// 127.0.0.1:9108 — ТЗД §4.2, следующий за web :9107); публичный
-// слушатель dashboard.listen — собственный http.Server внутри OnRun
-// с graceful stop по отмене ctx (прецедент cmd/web, T-121). Рядом со
-// слушателем — фоновый цикл сборки снимков (ТЗД §4.4, T-129): период
-// dashboard.refresh, атомарная замена, /api/status отдаёт последний
-// готовый снимок. Фронт — internal/dashboard/assets (T-130),
-// развёртывание — T-131.
+// The dashboard service — the operator web dashboard of the pipeline
+// (dashboard spec, stage 15): a single page of the pipeline state with
+// password access (HTTP Basic, dashboard spec §7), strictly read-only
+// (dashboard spec §1.3). The framework is internal/service (migrations,
+// the DB pool via OnDBPool, the probes and /metrics on loopback
+// 127.0.0.1:9108 — dashboard spec §4.2, the next one after web :9107);
+// the public listener dashboard.listen — its own http.Server inside OnRun
+// with a graceful stop on ctx cancellation (the cmd/web precedent,
+// T-121). Next to the listener — the background snapshot building loop
+// (dashboard spec §4.4, T-129): the dashboard.refresh period, an atomic
+// replacement, /api/status serves the latest ready snapshot. The front is
+// internal/dashboard/assets (T-130), the deployment — T-131.
 package main
 
 import (
@@ -29,28 +30,30 @@ import (
 )
 
 func main() {
-	// Ошибка конфигурации — до инициализации логгера: stderr и код 1.
+	// A configuration error — before the logger is initialized: stderr and exit code 1.
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("[dashboard] конфигурация: %v", err)
 	}
 	logger := service.NewLogger("dashboard", cfg)
-	// ТЗД §7.7: креды оператора обязательны — пустые username/
-	// password_hash (или неразборимый хэш) отказывают запуску ДО старта
-	// каркаса: миграции и слушатели не поднимаются. Общий config.Validate
-	// их сознательно не проверяет — иначе требование коснулось бы всех
-	// сервисов проекта.
+	// Dashboard spec §7.7: the operator credentials are required — empty
+	// username/password_hash (or an unparsable hash) reject the startup
+	// BEFORE the framework starts: the migrations and the listeners are
+	// not brought up. The common configValidate deliberately does not
+	// check them — otherwise the requirement would affect all the services
+	// of the project.
 	if _, err := dashboard.ParseCredentials(cfg); err != nil {
 		logger.Error("креды дашборда", "err", err)
 		os.Exit(1)
 	}
 
-	// Метрики — loopback (ТЗД §4.2: публичная точка входа одна —
-	// dashboard.listen); счётчики/гистограмма сборки снимков (ТЗД §10)
-	// регистрируются до старта OnRun, каркас отдаёт тот же реестр через
-	// /metrics (прецедент cmd/monitor). Пул приходит от каркаса после
-	// миграций (OnDBPool): postgres.dsn обязателен (config.Validate),
-	// readiness /healthz публичного mux пингует его.
+	// Metrics are loopback (dashboard spec §4.2: the public entry point is
+	// one — dashboard.listen); the counters/histogram of the snapshot
+	// building (dashboard spec §10) are registered before OnRun starts,
+	// the framework serves the same registry via /metrics (the
+	// cmd/monitor precedent). The pool comes from the framework after the
+	// migrations (OnDBPool): postgres.dsn is required (config.Validate),
+	// the readiness /healthz of the public mux pings it.
 	reg := metrics.New("dashboard")
 	var pool *pgxpool.Pool
 	if err := service.Run(service.Options{
@@ -60,10 +63,11 @@ func main() {
 		MetricsAddr: service.EnvOr("METRICS_ADDR", "127.0.0.1:9108"),
 		Metrics:     reg,
 		OnDBPool:    func(p *pgxpool.Pool) { pool = p },
-		// Сборка снимков — секундные агрегаты по domains (T-171; тяжёлые
-		// секции дополнительно кэшируются TTL, T-161): без параллельных
-		// воркеров проходы не забирают все ядра у конвейера; свежесть
-		// снимка оператору достаточна (частота — dashboard.refresh/TTL).
+		// The snapshot building — per-second aggregates over domains (T-171;
+		// the heavy sections are additionally TTL-cached, T-161): without
+		// parallel workers the passes do not take all the cores away from
+		// the pipeline; the snapshot freshness is sufficient for the
+		// operator (the frequency — dashboard.refresh/TTL).
 		DBAfterConnect: db.NoParallelGather,
 		OnRun:          func(ctx context.Context) error { return run(ctx, cfg, logger, pool, reg) },
 	}); err != nil {
@@ -71,18 +75,19 @@ func main() {
 	}
 }
 
-// run — публичный слушатель и цикл сборки снимков внутри OnRun: сервер
-// в первом плане, сборщик — фоновым циклом (стиль cmd/monitor: ранняя
-// остановка одного останавливает другого производной отменой ctx);
-// завершение возвращается каркасу.
+// run — the public listener and the snapshot building loop inside OnRun:
+// the server is in the foreground, the collector — as a background loop
+// (the cmd/monitor style: an early stop of one stops the other by the
+// derived ctx cancellation); the completion is returned to the framework.
 func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgxpool.Pool, reg *metrics.Registry) error {
 	if pool == nil {
 		return errors.New("dashboard: пул БД не получен (postgres.dsn обязателен)")
 	}
 
-	// Глубина стримов — через тот же узкий API, что у monitor и
-	// crawlerctl status (ТЗД §4.3.2): клиент Redis по секции redis
-	// конфигурации, гейт без порога — сборщику нужен только Len.
+	// The stream depths — via the same narrow API as monitor and
+	// crawlerctl status (dashboard spec §4.3.2): a Redis client by the
+	// redis section of the configuration, a gate without a threshold —
+	// the collector needs only Len.
 	rdb := queue.NewClient(cfg.Redis.Addr)
 	defer func() { _ = rdb.Close() }()
 	gate := queue.NewBackpressureGate(rdb, queue.BackpressureOptions{Log: logger})
@@ -90,24 +95,24 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	coll, err := dashboard.NewCollector(pool, gate, cfg.Dashboard, dashboard.CollectorOptions{
 		Log:            logger,
 		Metrics:        reg,
-		QueueWatermark: int64(cfg.Scheduler.QueueHighWatermark), // подсветка очередей, §5.4
-		QueueMaxLen:    int64(cfg.Redis.MaxLen),                 // эффективный порог: кламп по MAXLEN, как у гейта и монитора
-		RenderMetrics:  cfg.Dashboard.RenderMetrics,             // панель движков (T-246): экспозиции /metrics рендер-воркеров
+		QueueWatermark: int64(cfg.Scheduler.QueueHighWatermark), // queue highlighting, §5.4
+		QueueMaxLen:    int64(cfg.Redis.MaxLen),                 // the effective threshold: a clamp by MAXLEN, as by the gate and the monitor
+		RenderMetrics:  cfg.Dashboard.RenderMetrics,             // the engine panel (T-246): the /metrics exposures of the render workers
 	})
 	if err != nil {
 		return err
 	}
 	srv, err := dashboard.New(pool, cfg, dashboard.Options{
 		Log:       logger,
-		Snapshots: coll, // /api/status отдаёт последний готовый снимок
+		Snapshots: coll, // /api/status serves the latest ready snapshot
 	})
 	if err != nil {
 		return err
 	}
 
-	// Производная отмена: ранний выход своего цикла останавливает
-	// и фоновый — иначе ожидание результата висело бы вечно (стиль
-	// cmd/monitor).
+	// Derived cancellation: an early exit of its own loop stops the
+	// background one too — otherwise waiting for the result would hang
+	// forever (the cmd/monitor style).
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 

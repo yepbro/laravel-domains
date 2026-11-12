@@ -1,10 +1,10 @@
-// mockserver — Go-приложение тестового стенда для сценариев, которые нельзя
-// описать статикой: тарпит, медленные ответы, огромные тела, zip-бомба,
-// обрыв соединения, бесконечные/циклические редиректы, кривые TLS-сертификаты
-// (ТЗ 4.4).
+// mockserver — a Go application of the test bench for the scenarios that
+// cannot be described by statics: tarpit, slow responses, huge bodies,
+// a zip bomb, a connection drop, infinite/cyclic redirects, crooked TLS
+// certificates (spec 4.4).
 //
-// Слушает :80 (HTTP), :443 (TLS с самодельными сертификатами по SNI) и
-// :8080 (healthcheck/метрики).
+// It listens on :80 (HTTP), :443 (TLS with self-made certificates by SNI)
+// and :8080 (healthcheck/metrics).
 package main
 
 import (
@@ -24,14 +24,14 @@ import (
 	"time"
 )
 
-// hostRoutes — виртуальные хосты сценариев из scenarios.yaml (сценарии с
-// site: {template: mock, mock_path: …}): запрос «/» по Host сценария
-// маршрутизируется на его обработчик, как это делал бы выделенный сервер
-// сценария — HTTP-воркер запрашивает только главную страницу «/» (ТЗ 5.5,
-// §9), и «злой» ответ обязан приезжать именно на неё. Прямые пути
-// (env_test.go, ручная отладка) работают как раньше. Синхронность карты со
-// scenarios.yaml — контракт тестбеда (изменение набора сценариев mock —
-// правка карты в той же правке).
+// hostRoutes — the virtual hosts of the scenarios from scenarios.yaml
+// (the scenarios with site: {template: mock, mock_path: …}): a "/" request
+// by the scenario Host is routed to its handler, as a dedicated scenario
+// server would do — the HTTP worker requests only the main page "/"
+// (spec 5.5, §9), and the "nasty" response must arrive exactly there.
+// The direct paths (env_test.go, manual debugging) work as before. The
+// map being in sync with scenarios.yaml is a testbed contract (changing
+// the set of mock scenarios — editing the map in the same change).
 var hostRoutes = map[string]string{
 	"tarpit.crawl.test":               "/tarpit",
 	"slow-headers.crawl.test":         "/slow?delay=30s",
@@ -49,11 +49,12 @@ var hostRoutes = map[string]string{
 	"tls-wrong-san.crawl.test":        "/host",
 }
 
-// routeByHost обслуживает виртуальные хосты сценариев: «/» по Host из
-// hostRoutes переписывается на целевой путь (с query, если задан) и
-// передаётся дальше в mux. Остальные запросы — без изменений. Маршрутизация
-// проверяется интеграционными тестами HTTP-этапа (test/integration/http_test.go,
-// T-060): каждый «злой» сценарий обязан приезжать воркеру на «/».
+// routeByHost serves the virtual hosts of the scenarios: "/" by a Host
+// from hostRoutes is rewritten to the target path (with a query, if set)
+// and passed on to the mux. The other requests — unchanged. The routing
+// is checked by the integration tests of the HTTP stage
+// (test/integration/http_test.go, T-060): every "nasty" scenario must
+// arrive at the worker on "/".
 func routeByHost(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" {
@@ -123,20 +124,22 @@ func main() {
 	}
 }
 
-// Границы параметров «злых» обработчиков. Прямые пути доступны из общей
-// сети стенда (172.28.100.0/24): один запрос не должен заказывать
-// гигабайтную аллокацию (?rate=) или удерживать горутину сутками (?delay=).
-// Штатным сценариям хватает значений много ниже (512 байт/с, 30 с).
+// The parameter bounds of the "nasty" handlers. The direct paths are
+// reachable from the common bench network (172.28.100.0/24): one request
+// must not order a gigabyte allocation (?rate=) or hold a goroutine for
+// days (?delay=). The normal scenarios have plenty with values far below
+// (512 bytes/s, 30 s).
 const (
-	// tarpitMaxRate — верхняя планка скорости тарпита, байт/с.
+	// tarpitMaxRate — the upper bar of the tarpit rate, bytes/s.
 	tarpitMaxRate = 1 << 20
-	// slowMaxDelay — верхняя планка задержки /slow.
+	// slowMaxDelay — the upper bar of the /slow delay.
 	slowMaxDelay = 10 * time.Minute
 )
 
-// tarpitRate — скорость тарпита из ?rate=: по умолчанию 512 байт/с (ниже
-// минимальной скорости 2 КБ/с из основного ТЗ), сверху ограничена
-// tarpitMaxRate — буфер куска аллоцируется по значению из запроса.
+// tarpitRate — the tarpit rate from ?rate=: by default 512 bytes/s (below
+// the minimum rate of 2 KB/s from the main spec), capped at the top by
+// tarpitMaxRate — the chunk buffer is allocated by the value from the
+// request.
 func tarpitRate(raw string) int {
 	rate, _ := strconv.Atoi(raw)
 	if rate <= 0 {
@@ -148,8 +151,8 @@ func tarpitRate(raw string) int {
 	return rate
 }
 
-// slowDelay — задержка /slow из ?delay=: по умолчанию 30 с, сверху
-// ограничена slowMaxDelay.
+// slowDelay — the /slow delay from ?delay=: by default 30 s, capped at
+// the top by slowMaxDelay.
 func slowDelay(raw string) time.Duration {
 	delay, _ := time.ParseDuration(raw)
 	if delay <= 0 {
@@ -162,19 +165,19 @@ func slowDelay(raw string) time.Duration {
 }
 
 func registerRoutes(mux *http.ServeMux) {
-	// Медленный ответ: ждёт delay (с учётом отключения клиента), потом
-	// отвечает (проверка header timeout).
+	// Slow response: waits for the delay (taking the client disconnect
+	// into account), then responds (a header timeout check).
 	mux.HandleFunc("/slow", func(w http.ResponseWriter, r *http.Request) {
 		delay := slowDelay(r.URL.Query().Get("delay"))
 		select {
 		case <-time.After(delay):
-		case <-r.Context().Done(): // клиент ушёл — горутину не держим
+		case <-r.Context().Done(): // the client is gone — we do not hold the goroutine
 			return
 		}
 		writePage(w, "slow", "наконец-то")
 	})
 
-	// Тарпит: отдаёт тело со скоростью rate байт/с, бесконечно.
+	// Tarpit: serves the body at the rate bytes/s, endlessly.
 	mux.HandleFunc("/tarpit", func(w http.ResponseWriter, r *http.Request) {
 		rate := tarpitRate(r.URL.Query().Get("rate"))
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -200,7 +203,8 @@ func registerRoutes(mux *http.ServeMux) {
 		}
 	})
 
-	// Огромное тело: заявлен гигабайт, льём нули (клиент обязан обрезать по лимиту).
+	// Huge body: a gigabyte is declared, we pour zeros (the client must
+	// truncate by the limit).
 	mux.HandleFunc("/huge", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("Content-Length", "1073741824")
@@ -213,7 +217,8 @@ func registerRoutes(mux *http.ServeMux) {
 		}
 	})
 
-	// Zip-бомба: gzip-поток нулей (распаковка обязана ограничиваться лимитом).
+	// Zip bomb: a gzip stream of zeros (the decompression must be bounded
+	// by the limit).
 	mux.HandleFunc("/zipbomb", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("Content-Encoding", "gzip")
@@ -230,7 +235,7 @@ func registerRoutes(mux *http.ServeMux) {
 		}
 	})
 
-	// Бесконечный редирект: каждый ответ — Location на самого себя.
+	// Infinite redirect: every response — a Location to itself.
 	mux.HandleFunc("/redirect/infinite", func(w http.ResponseWriter, r *http.Request) {
 		n, _ := strconv.Atoi(r.URL.Query().Get("n"))
 		n++
@@ -238,7 +243,7 @@ func registerRoutes(mux *http.ServeMux) {
 		w.WriteHeader(http.StatusFound)
 	})
 
-	// Циклический редирект: /a -> /b -> /a.
+	// Cyclic redirect: /a -> /b -> /a.
 	mux.HandleFunc("/redirect/cycle/", func(w http.ResponseWriter, r *http.Request) {
 		next := map[string]string{"/redirect/cycle/a": "/redirect/cycle/b", "/redirect/cycle/b": "/redirect/cycle/a"}
 		if loc, ok := next[r.URL.Path]; ok {
@@ -249,7 +254,7 @@ func registerRoutes(mux *http.ServeMux) {
 		http.NotFound(w, r)
 	})
 
-	// Обрыв соединения посреди тела.
+	// Connection drop in the middle of the body.
 	mux.HandleFunc("/truncate", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Header().Set("Content-Length", "1048576")
@@ -261,7 +266,7 @@ func registerRoutes(mux *http.ServeMux) {
 		panic(http.ErrAbortHandler)
 	})
 
-	// Мусорные байты с text/html.
+	// Junk bytes with text/html.
 	mux.HandleFunc("/garbage", func(w http.ResponseWriter, r *http.Request) {
 		buf := make([]byte, 64*1024)
 		_, _ = rand.Read(buf)
@@ -270,9 +275,9 @@ func registerRoutes(mux *http.ServeMux) {
 		_, _ = w.Write(buf)
 	})
 
-	// Кодировки: корректная 1251 и «соврущая» meta charset.
+	// Encodings: a correct 1251 one and a "lying" meta charset.
 	mux.HandleFunc("/bad-charset/", func(w http.ResponseWriter, r *http.Request) {
-		// «Привет, мир!» в windows-1251
+		// "Hello, world!" in windows-1251
 		body := []byte{
 			'<', 'h', 't', 'm', 'l', '>', 0xcf, 0xf0, 0xe8, 0xe2, 0xe5, 0xf2,
 			',', ' ', 0xec, 0xe8, 0xf0, '!', '<', '/', 'h', 't', 'm', 'l', '>',
@@ -281,7 +286,7 @@ func registerRoutes(mux *http.ServeMux) {
 		case strings.HasSuffix(r.URL.Path, "/declared"):
 			w.Header().Set("Content-Type", "text/html; charset=windows-1251")
 		case strings.HasSuffix(r.URL.Path, "/wrong"):
-			w.Header().Set("Content-Type", "text/html; charset=utf-8") // соврамши
+			w.Header().Set("Content-Type", "text/html; charset=utf-8") // mismatches
 		default:
 			http.NotFound(w, r)
 			return
@@ -290,14 +295,16 @@ func registerRoutes(mux *http.ServeMux) {
 		_, _ = w.Write(body)
 	})
 
-	// Cookies, как у Laravel (XSRF-TOKEN + *_session с зашифрованным payload).
+	// Cookies, like Laravel's (XSRF-TOKEN + *_session with an encrypted
+	// payload).
 	mux.HandleFunc("/cookies", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Add("Set-Cookie", "XSRF-TOKEN=eyJpdiI6ZmFrZVRva2VuOjE2Oml7InZhbCI6IjEyMzQ1Njc4OTAiLCJpdiI6ImFiY2RlZmFhYmNkZWYiLCJ0YWciOiIifQ==; expires=Wed, 21 Oct 2026 07:28:00 GMT; path=/; secure")
 		w.Header().Add("Set-Cookie", "laravel_session=eyJpdiI6c2Vzc2lvbjoxNjppeyJpc3MiOiJodHRwczovL2V4YW1wbGUifQ==; path=/; httponly; samesite=lax")
 		writePage(w, "cookies", "страница с куками Laravel")
 	})
 
-	// Эхо Host-заголовка — полезно при отладке прокси/виртуальных хостов.
+	// Echo of the Host header — useful when debugging proxies/virtual
+	// hosts.
 	mux.HandleFunc("/host", func(w http.ResponseWriter, r *http.Request) {
 		writePage(w, "host", "Host: "+r.Host)
 	})
@@ -317,10 +324,11 @@ func writePage(w http.ResponseWriter, title, body string) {
 	_, _ = fmt.Fprintf(w, "<!DOCTYPE html><html><head><title>%s</title></head><body><h1>%s</h1><p>%s</p></body></html>\n", title, title, body)
 }
 
-// buildCerts генерирует самодельные сертификаты для TLS-сценариев:
-// самоподписанный валидный, просроченный и с чужим SAN. Имена сценариев
-// (scenarios.yaml: tls-self-signed/tls-expired/tls-wrong-san) и отладочные
-// bad-tls-имена (env_test.go) получают собственные сертификаты по SNI.
+// buildCerts generates the self-made certificates for the TLS scenarios:
+// a valid self-signed one, an expired one and one with a foreign SAN.
+// The scenario names (scenarios.yaml: tls-self-signed/tls-expired/
+// tls-wrong-san) and the bad-tls debug names (env_test.go) get their own
+// certificates by SNI.
 func buildCerts() (map[string]*tls.Certificate, error) {
 	mk := func(cn string, sans []string, notAfter time.Time) (*tls.Certificate, error) {
 		key, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -349,7 +357,7 @@ func buildCerts() (map[string]*tls.Certificate, error) {
 	far := time.Now().AddDate(10, 0, 0)
 	past := time.Now().AddDate(-2, 0, 0)
 
-	// Валидный самоподписанный: ключ "*" — SNI по умолчанию.
+	// A valid self-signed one: the "*" key — the default SNI.
 	name := "self-signed.bad-tls.crawl.test"
 	c, err := mk(name, []string{name}, far)
 	if err != nil {
@@ -358,7 +366,7 @@ func buildCerts() (map[string]*tls.Certificate, error) {
 	out[name] = c
 	out["*"] = c
 
-	// Просроченный.
+	// An expired one.
 	name = "expired.bad-tls.crawl.test"
 	c, err = mk(name, []string{name}, past)
 	if err != nil {
@@ -366,15 +374,15 @@ func buildCerts() (map[string]*tls.Certificate, error) {
 	}
 	out[name] = c
 
-	// Чужой SAN: сертификат издан для другого хоста.
+	// A foreign SAN: the certificate is issued for another host.
 	c, err = mk("other-host.test", []string{"other-host.test", "www.other-host.test"}, far)
 	if err != nil {
 		return nil, err
 	}
 	out["wrong-san.bad-tls.crawl.test"] = c
 
-	// Домены сценариев тестбеда (scenarios.yaml): каждый получает своё
-	// «злое» свойство — самоподписанность, просрочку, чужой SAN.
+	// The scenario domains of the testbed (scenarios.yaml): each gets its
+	// own "nasty" property — self-signedness, expiry, a foreign SAN.
 	scenarioCerts := []struct {
 		host string
 		cn   string

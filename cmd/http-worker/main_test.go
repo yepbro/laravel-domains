@@ -1,19 +1,22 @@
-// Юнит-тесты адаптера защиты retention (retentionPending, T-166/T-167):
-// чтение непотреблённого хвоста стримов без живого Redis (фейк с
-// заготовленными XINFO GROUPS/XRANGE, стиль fakeBackpressure в
-// internal/queue): нижний край XRANGE — last-delivered-id группы
-// эксклюзивно, отсутствие групп — весь стрим с начала, отсутствие
-// стрима — пустое множество, пагинация хвоста, ошибки, чужие тела.
-// Здесь же — эффективный порог ёмкости q:render (renderQueueWatermark,
-// T-174): фолбэк «0 — общий scheduler.queue_high_watermark» и кламп
-// MAXLEN/2 (queue.StreamWatermark); и проводка AfterConnect-хуков пула
-// сервиса (afterConnectHooks, T-201): NoParallelGather — сериальность
-// retention-дренажа + LockTimeout (T-192); и гейт тяжёлых фоновых
-// сканов (scanGate, T-271): retention ↔ render-late не совпадают в
-// PostgreSQL; и структурный инвариант
-// остановки run (TestRunBackgroundJoin, T-223): производная отмена +
-// WaitGroup — каждый фоновый цикл Add/Done, джойн-defer исполняется до
-// defer-закрытий ресурсов (разборщик — общий internal/bgjoin, T-232).
+// The unit tests of the retention guard adapter (retentionPending,
+// T-166/T-167): reading the unconsumed tail of the streams without a live
+// Redis (a fake with the prepared XINFO GROUPS/XRANGE, the fakeBackpressure
+// style in internal/queue): the lower edge of XRANGE — the last-delivered-id
+// of the group exclusively, no groups — the whole stream from the
+// beginning, no stream — an empty set, the pagination of the tail, the
+// errors, the foreign bodies.
+// Right here — the effective capacity threshold of q:render
+// (renderQueueWatermark, T-174): the fallback "0 — the common
+// scheduler.queue_high_watermark" and the MAXLEN/2 clamp
+// (queue.StreamWatermark); and the wiring of the AfterConnect hooks of
+// the service pool (afterConnectHooks, T-201): NoParallelGather — the
+// seriality of the retention drain + LockTimeout (T-192); and the gate of
+// the heavy background scans (scanGate, T-271): retention ↔ render-late
+// must not coincide in PostgreSQL; and the structural shutdown invariant
+// of run (TestRunBackgroundJoin, T-223): the derived cancellation + a
+// WaitGroup — every background loop Add/Done, the join-defer executes
+// before the defer-closes of the resources (the checker — the shared
+// internal/bgjoin, T-232).
 package main
 
 import (
@@ -38,17 +41,19 @@ import (
 	"crawler/internal/queue"
 )
 
-// fakePendingRedis — окно адаптера с заготовками: groups — ответ XINFO
-// GROUPS, xrange — страницы XRANGE по нижнему краю (nil — хвост пуст).
+// fakePendingRedis — the window of the adapter with the stubs: groups —
+// the response of XINFO GROUPS, xrange — the XRANGE pages by the lower
+// edge (nil — the tail is empty).
 type fakePendingRedis struct {
 	groups    []redis.XInfoGroup
 	groupsErr error
 	xrange    func(start string) ([]redis.XMessage, error)
 
-	froms []string // нижние края XRANGE по порядку
+	froms []string // the lower edges of XRANGE in order
 }
 
-// compile-time: фейк взаимозаменяем с реальным клиентом в окне адаптера.
+// compile-time: the fake is interchangeable with the real client in the
+// adapter window.
 var _ retentionPendingRedis = (*fakePendingRedis)(nil)
 
 func (f *fakePendingRedis) XInfoGroups(ctx context.Context, key string) *redis.XInfoGroupsCmd {
@@ -77,7 +82,8 @@ func (f *fakePendingRedis) XRangeN(ctx context.Context, key, start, stop string,
 	return cmd
 }
 
-// pendingMsg — запись стрима с Result-сообщением (формат T-024).
+// pendingMsg — a stream record with a Result message (the format of
+// T-024).
 func pendingMsg(id string, zone int16, domain int64, sub, variant int16) redis.XMessage {
 	return redis.XMessage{
 		ID: id,
@@ -87,13 +93,14 @@ func pendingMsg(id string, zone int16, domain int64, sub, variant int16) redis.X
 	}
 }
 
-// wantKey — ожидаемый ключ защиты.
+// wantKey — the expected guard key.
 func wantKey(zone int16, domain int64, sub, variant int16) content.RetentionPendingKey {
 	return content.RetentionPendingKey{Zone: zone, Domain: domain, Sub: sub, Variant: variant}
 }
 
-// TestPendingKeys_LastDelivered — нижний край XRANGE — last-delivered-id
-// группы эксклюзивно («(id»): записи после него — ключи множества.
+// TestPendingKeys_LastDelivered — the lower edge of XRANGE — the
+// last-delivered-id of the group exclusively ("(id"): the records after
+// it are the keys of the set.
 func TestPendingKeys_LastDelivered(t *testing.T) {
 	f := &fakePendingRedis{
 		groups: []redis.XInfoGroup{{Name: "render-worker", LastDeliveredID: "5-0"}},
@@ -125,10 +132,10 @@ func TestPendingKeys_LastDelivered(t *testing.T) {
 	}
 }
 
-// TestPendingKeys_MinDelivered — несколько групп: хвост читается одним
-// XRANGE от минимального last-delivered-id (численно: "999-0" < "1000-0",
-// лексикографическое сравнение ошибочно) — объединение недоставленных
-// интервалов всех групп.
+// TestPendingKeys_MinDelivered — several groups: the tail is read by one
+// XRANGE from the minimal last-delivered-id (numerically: "999-0" <
+// "1000-0", the lexicographic comparison is wrong) — the union of the
+// undelivered intervals of all the groups.
 func TestPendingKeys_MinDelivered(t *testing.T) {
 	f := &fakePendingRedis{
 		groups: []redis.XInfoGroup{
@@ -154,8 +161,8 @@ func TestPendingKeys_MinDelivered(t *testing.T) {
 	}
 }
 
-// TestPendingKeys_NoGroups — групп у стрима нет: недоставлено всё
-// содержимое, XRANGE с начала («-»).
+// TestPendingKeys_NoGroups — the stream has no groups: everything is
+// undelivered, XRANGE from the beginning ("-").
 func TestPendingKeys_NoGroups(t *testing.T) {
 	f := &fakePendingRedis{
 		xrange: func(string) ([]redis.XMessage, error) {
@@ -174,8 +181,9 @@ func TestPendingKeys_NoGroups(t *testing.T) {
 	}
 }
 
-// TestPendingKeys_NoStream — стрима нет («no such key» на XINFO GROUPS):
-// ждать потребителей нечего — пустое множество без ошибки.
+// TestPendingKeys_NoStream — the stream does not exist ("no such key" on
+// XINFO GROUPS): there is nothing to wait for consumers — an empty set
+// without an error.
 func TestPendingKeys_NoStream(t *testing.T) {
 	f := &fakePendingRedis{groupsErr: redis.Nil}
 	keys, err := retentionPending{rdb: f}.PendingKeys(context.Background(), "q:render")
@@ -192,8 +200,9 @@ func TestPendingKeys_NoStream(t *testing.T) {
 	}
 }
 
-// TestPendingKeys_Pagination — хвост длиннее страницы: следующая читается
-// от последней записи предыдущей (эксклюзивно), до пустой страницы.
+// TestPendingKeys_Pagination — the tail is longer than a page: the next
+// one is read from the last record of the previous one (exclusively),
+// until an empty page.
 func TestPendingKeys_Pagination(t *testing.T) {
 	page1 := make([]redis.XMessage, pendingScanBatch)
 	for i := range page1 {
@@ -206,7 +215,7 @@ func TestPendingKeys_Pagination(t *testing.T) {
 			if start == "(0-0" {
 				return page1, nil
 			}
-			return tail, nil // вторая страница — короче, чтение закончится
+			return tail, nil // the second page is shorter, the reading will finish
 		},
 	}
 	keys, err := retentionPending{rdb: f}.PendingKeys(context.Background(), "q:analyze")
@@ -224,8 +233,9 @@ func TestPendingKeys_Pagination(t *testing.T) {
 	}
 }
 
-// TestPendingKeys_Errors — недоступность Redis (группы, XRANGE) — ошибка:
-// защита консервативна, пропуск прохода решает цикл.
+// TestPendingKeys_Errors — an unavailability of Redis (the groups,
+// XRANGE) — an error: the guard is conservative, skipping the pass is
+// decided by the loop.
 func TestPendingKeys_Errors(t *testing.T) {
 	f := &fakePendingRedis{groupsErr: errors.New("connection refused")}
 	if _, err := (retentionPending{rdb: f}).PendingKeys(context.Background(), "q:render"); err == nil {
@@ -241,11 +251,11 @@ func TestPendingKeys_Errors(t *testing.T) {
 	}
 }
 
-// TestPendingKeys_ForeignPayload — тела без поля data, неразбираемый
-// JSON и нулевые идентификаторы (валидный JSON `{}` — не Result:
-// validate требует zone_id/domain_id ≥ 1) пропускаются: стримы очереди
-// пишет только marshalMessage (валидированные форматы), чужие записи —
-// вне контракта.
+// TestPendingKeys_ForeignPayload — the bodies without the data field, an
+// unparsable JSON and the zero identifiers (a valid JSON `{}` — not a
+// Result: validate requires zone_id/domain_id ≥ 1) are skipped: only
+// marshalMessage writes the queue streams (the validated formats), the
+// foreign records are outside the contract.
 func TestPendingKeys_ForeignPayload(t *testing.T) {
 	f := &fakePendingRedis{
 		xrange: func(string) ([]redis.XMessage, error) {
@@ -269,40 +279,44 @@ func TestPendingKeys_ForeignPayload(t *testing.T) {
 	}
 }
 
-// TestAfterConnectHooks — проводка AfterConnect-хуков пула http-worker
-// (T-201): retention-дренаж (RetentionLoop) на пуле сервиса собирал
-// Gather Merge — 2 параллельных воркера на CPU HTTP-слотов (EXPLAIN
-// ANALYZE 26.10) — NoParallelGather обязан входить в состав (продление
-// T-171 на четвёртый сервис), рядом LockTimeout (T-192). До T-201
-// проводка хуков в main тестом не закреплялась (коммит T-192: «Options
-// собираются в main без шва») — именованный список afterConnectHooks и
-// есть шов: выпадение или подмена хука валит тест громко. Граница
-// покрытия (ревью T-201, P3-1): закреплён состав, но не последнее звено
-// — строку DBAfterConnect в main (стиль проекта: Options инлайн; вынос
-// сборки — отдельная задача). Сами SET — контракты
-// TestLockTimeout_HookSQL/TestJoinHooks в internal/db (исполнение хука
-// требует живого соединения — юнит-тесту нечего подменять в *pgx.Conn),
-// здесь закреплён только состав.
+// TestAfterConnectHooks — the wiring of the AfterConnect hooks of the
+// http-worker pool (T-201): the retention drain (RetentionLoop) on the
+// service pool assembled a Gather Merge — 2 parallel workers on the CPUs
+// of the HTTP slots (the EXPLAIN ANALYZE of 26.10) — NoParallelGather
+// must be part of it (the extension of T-171 to the fourth service), next
+// to it LockTimeout (T-192). Before T-201 the hook wiring in main was not
+// pinned by any test (the commit of T-192: "the Options are assembled in
+// main without a seam") — the named list afterConnectHooks is that seam:
+// dropping or replacing a hook fails the test loudly. The coverage
+// boundary (the review of T-201, P3-1): the composition is pinned, but
+// not the last link — the DBAfterConnect line in main (the project style:
+// the Options are inline; extracting the assembly — a separate task).
+// The SETs themselves — the contracts of
+// TestLockTimeout_HookSQL/TestJoinHooks in internal/db (executing a hook
+// needs a live connection — a unit test has nothing to substitute in
+// *pgx.Conn); here only the composition is pinned.
 func TestAfterConnectHooks(t *testing.T) {
 	if len(afterConnectHooks) != 2 {
 		t.Fatalf("AfterConnect-хуков пула = %d, want 2 (NoParallelGather T-201 + LockTimeout T-192)", len(afterConnectHooks))
 	}
-	// NoParallelGather — именованная функция пакета db: кодовый указатель
-	// однозначно идентифицирует её среди хуков (замыкание LockTimeout —
-	// другой код); регрессия T-201 — возврат к LockTimeout-без-параллельности
-	// — ловится именно здесь.
+	// NoParallelGather — a named function of the db package: a code
+	// pointer identifies it unambiguously among the hooks (the LockTimeout
+	// closure — a different code); the regression of T-201 — a return to
+	// LockTimeout-without-seriality — is caught exactly here.
 	if reflect.ValueOf(afterConnectHooks[0]).Pointer() != reflect.ValueOf(db.NoParallelGather).Pointer() {
 		t.Error("первый AfterConnect-хук не db.NoParallelGather — retention-дренаж снова соберёт Gather Merge (T-201)")
 	}
-	// LockTimeout — замыкание: кодовый указатель сравнить нельзя —
-	// компилятор специализирует замыкание под call-site (init/main —
-	// разные коды, проверено на инструментальной цепочке проекта), а
-	// символизация runtime.FuncForPC сохраняет базовое имя литерала
-	// (…LockTimeout.func1) при любом инлайнинге. Путь в имени — пакета
-	// call-site (…cmd/http-worker.init.LockTimeout.func1), не пакета
-	// db: сверять полное имя нельзя, суффикс — правильный инструмент
-	// (подстрока совпала бы и с гипотетическими func10/func12).
-	// Аргумент 30 с — контракт TestLockTimeout_HookSQL в internal/db.
+	// LockTimeout — a closure: a code pointer cannot be compared — the
+	// compiler specializes the closure per call-site (init/main — different
+	// codes, verified on the project toolchain), and the symbolization of
+	// runtime.FuncForPC keeps the base name of the literal
+	// (…LockTimeout.func1) under any inlining. The path in the name — the
+	// package of the call-site (…cmd/http-worker.init.LockTimeout.func1),
+	// not the db package: comparing the full name is impossible, the
+	// suffix — the right instrument (a substring would also match
+	// hypothetical func10/func12).
+	// The argument of 30 s — the contract of TestLockTimeout_HookSQL in
+	// internal/db.
 	if name := runtime.FuncForPC(reflect.ValueOf(afterConnectHooks[1]).Pointer()).Name(); !strings.HasSuffix(name, "LockTimeout.func1") {
 		t.Errorf("второй AfterConnect-хук — %s, want замыкание db.LockTimeout (T-192)", name)
 	}
@@ -313,17 +327,18 @@ func TestAfterConnectHooks(t *testing.T) {
 	}
 }
 
-// TestScanGate — проводка общего семафора тяжёлых фоновых сканов
-// (scanGate, T-271): retention-дренаж и поздний переиздатель обязаны
-// делить ОДИН гейт ёмкости 1 — совпадение их сканов в PostgreSQL и было
-// инцидентом 08–09.11.2026 (пять OOM-киллов за ночь: два деградировавших
-// курсорных SELECT по ≈1 ГиБ поверх shared_buffers 2 ГиБ). Граница
-// покрытия — как у TestAfterConnectHooks (ревью T-201, P3-1): закреплён
-// сам гейт (ёмкость 1, не nil); последнее звено — строки Gate в опциях
-// циклов run — TestScanGateLoopWiring (ревью T-271, P3-4). Взаимное
-// исключение держателей — TestScanGate в internal/db; поведение под
-// гейтом — TestRetentionSelectGate/TestRenderLateSelectGate в пакетах
-// циклов.
+// TestScanGate — the wiring of the common semaphore of the heavy
+// background scans (scanGate, T-271): the retention drain and the late
+// re-publisher must share ONE gate of capacity 1 — a coincidence of their
+// scans in PostgreSQL was exactly the incident of 08–09.11.2026 (five
+// OOM-kills overnight: two degraded cursor SELECTs of ≈1 GiB on top of
+// 2 GiB shared_buffers). The coverage boundary — as by TestAfterConnectHooks
+// (the review of T-201, P3-1): the gate itself is pinned (capacity 1,
+// not nil); the last link — the Gate lines in the options of the run
+// loops — TestScanGateLoopWiring (the review of T-271, P3-4). The mutual
+// exclusion of the holders — TestScanGate in internal/db; the behavior
+// under the gate — TestRetentionSelectGate/TestRenderLateSelectGate in
+// the loop packages.
 func TestScanGate(t *testing.T) {
 	if scanGate == nil {
 		t.Fatal("scanGate = nil: гейт тяжёлых сканов не создан — циклы уйдут без сериализации (T-271)")
@@ -333,24 +348,25 @@ func TestScanGate(t *testing.T) {
 	}
 }
 
-// TestScanGateLoopWiring — последнее звено проводки scanGate: поле Gate
-// в опциях циклов run (ревью T-271, P3-4). Выпадение строки Gate молчало
-// бы во всех остальных проверках: TestScanGate закрепляет сам гейт,
-// тесты пакетов циклов — поведение под переданным гейтом, но никто не
-// проверял, что run его передаёт. Прогнать run в юнит-тесте нельзя
-// (живые Postgres/Redis), вынос сборки опций в шов-функцию — отдельная
-// задача (признана ревью T-201, P3-1: стиль проекта — Options инлайн),
-// поэтому инвариант закреплён разбором main.go через go/ast — прецедент
-// TestRunBackgroundJoin/bgjoin (T-223). Инвариант: литералы
-// LateOptions/RetentionOptions существуют ровно по одному (каждый цикл
-// запускается) и содержат Gate: scanGate.
+// TestScanGateLoopWiring — the last link of the scanGate wiring: the Gate
+// field in the options of the run loops (the review of T-271, P3-4). A
+// dropped Gate line would be silent in all the other checks: TestScanGate
+// pins the gate itself, the tests of the loop packages — the behavior
+// under the passed gate, but nobody checked that run passes it. Running
+// run in a unit test is impossible (live Postgres/Redis), extracting the
+// options assembly into a seam function — a separate task (recognized by
+// the review of T-201, P3-1: the project style — the Options are inline),
+// so the invariant is pinned by parsing main.go via go/ast — the
+// TestRunBackgroundJoin/bgjoin precedent (T-223). The invariants: the
+// LateOptions/RetentionOptions literals exist exactly one each (each loop
+// is started) and contain Gate: scanGate.
 func TestScanGateLoopWiring(t *testing.T) {
 	fset := token.NewFileSet()
 	parsed, err := parser.ParseFile(fset, "main.go", nil, 0)
 	if err != nil {
 		t.Fatalf("разбор main.go: %v", err)
 	}
-	literals := map[string]int{ // литералы опций циклов по типам
+	literals := map[string]int{ // the literals of the loop options by the types
 		"httpworker.LateOptions":   0,
 		"content.RetentionOptions": 0,
 	}
@@ -394,14 +410,15 @@ func TestScanGateLoopWiring(t *testing.T) {
 	}
 }
 
-// TestRenderQueueWatermark — эффективный порог ёмкости q:render
-// (renderQueueWatermark, T-174): фолбэк «0 — общий
-// scheduler.queue_high_watermark» (семантика retention_analyze_watermark)
-// и кламп min(watermark, MAXLEN/2) тем же единым расчётом
-// queue.StreamWatermark, что у гейта публикации (T-026): ворота обязаны
-// закрываться до обрезки MAXLEN — порог выше предела молча терял бы
-// недоставленные рендер-задачи обрезкой (флага render_pending у них нет,
-// публикация прошла).
+// TestRenderQueueWatermark — the effective capacity threshold of
+// q:render (renderQueueWatermark, T-174): the fallback "0 — the common
+// scheduler.queue_high_watermark" (the semantics of
+// retention_analyze_watermark) and the clamp min(watermark, MAXLEN/2) by
+// the same single calculation queue.StreamWatermark as by the publishing
+// gate (T-026): the gate must close before the MAXLEN trim — a threshold
+// above the limit would silently lose the undelivered render tasks by
+// the trim (they have no render_pending flag, the publishing went
+// through).
 func TestRenderQueueWatermark(t *testing.T) {
 	cases := []struct {
 		name      string
@@ -410,21 +427,22 @@ func TestRenderQueueWatermark(t *testing.T) {
 		redisLen  int
 		want      int64
 	}{
-		// Дефолты конфигурации: 10 тыс. < 75 тыс. (половина
-		// DefaultStreamMaxLen(q:render) = 150 тыс., T-025) — кламп
-		// не активен, ворота срабатывают на настроенном значении.
+		// The configuration defaults: 10k < 75k (half of
+		// DefaultStreamMaxLen(q:render) = 150k, T-025) — the clamp is not
+		// active, the gate fires at the configured value.
 		{"дефолт: кламп не активен", 10000, 100000, 0, 10000},
 		{"явное значение ниже клампа", 7000, 100000, 0, 7000},
-		// 0 — общий порог; кламп ограничивает его до 75 тыс.: сырое
-		// сравнение T-066 (без клампа) держало ворота открытыми при
-		// лаге 98,4 тыс. из 100 тыс. — равновесие 24.10.
+		// 0 — the common threshold; the clamp caps it to 75k: the raw
+		// comparison of T-066 (without the clamp) kept the gate open at a
+		// lag of 98.4k out of 100k — the equilibrium of 24.10.
 		{"0 — общий порог с клампом", 0, 100000, 0, 75000},
 		{"явное значение выше клампа ограничивается", 200000, 100000, 0, 75000},
-		// Явный redis.maxlen режет потолок клампа для всех случаев.
+		// An explicit redis.maxlen cuts the clamp ceiling for all the
+		// cases.
 		{"0 — общий при явном redis.maxlen", 0, 100000, 10000, 5000},
 		{"явное при явном redis.maxlen", 10000, 100000, 10000, 5000},
-		// Отрицательные (мимо валидации) — StreamWatermark даёт 0:
-		// гейт отключён, документированная семантика ≤ 0.
+		// The negative ones (past the validation) — StreamWatermark gives
+		// 0: the gate is off, the documented semantics of ≤ 0.
 		{"отрицательные — гейт отключён", -5, 0, 0, 0},
 	}
 	for _, tc := range cases {
@@ -437,9 +455,10 @@ func TestRenderQueueWatermark(t *testing.T) {
 		}
 	}
 
-	// Инвариант дефолта (критерий задачи): порог не выше половины
-	// предела MAXLEN q:render — иначе кламп резал бы его молча, а
-	// ворота при глубине у предела не успевали закрываться до обрезки.
+	// The default invariant (the task criterion): the threshold is not
+	// above half of the MAXLEN limit of q:render — otherwise the clamp
+	// would cut it silently, and the gate at a depth near the limit would
+	// not make it in time to close before the trim.
 	def := renderQueueWatermark(config.Default())
 	if def != 10000 {
 		t.Errorf("дефолт эффективного порога q:render = %d, хочу 10000 (T-174)", def)
@@ -449,40 +468,45 @@ func TestRenderQueueWatermark(t *testing.T) {
 	}
 }
 
-// TestRunBackgroundJoin — структурный инвариант остановки http-worker
-// (T-223): все фоновые циклы run останавливаются и джойнятся до
-// defer-закрытий store/rdb и транспорта на любом выходе — штатной
-// отмене ctx, раннем возврате из конструктора, панике. До T-223
-// CompactLoop и RetentionLoop запускались fire-and-forget: run после
-// трёх приёмов bg-канала возвращался и закрывал PackStore/пул Redis под
-// серединой прохода компактификации/retention, а четвёртый сендер вис
-// бы на канале ёмкости 3. Схема — производная отмена + WaitGroup (по
-// ревью T-223: канал ёмкости не накрывает ранние выходы и панику, а
-// связка «ёмкость = сендеры = приёмы» хрупка руками). Прогнать run в
-// юнит-тесте нельзя (живые Postgres/Redis/DNS), инвариант закреплён
-// разбором main.go через go/ast (прецедент чтения исходников тестами —
-// compose_test.go, postgresql_conf_test.go); проверяемые инварианты:
+// TestRunBackgroundJoin — the structural shutdown invariant of
+// http-worker (T-223): all the background loops of run are stopped and
+// joined before the defer-closes of store/rdb and the transport on any
+// exit — a graceful ctx cancellation, an early return from a
+// constructor, a panic. Before T-223 CompactLoop and RetentionLoop were
+// started fire-and-forget: run after the three receptions of the bg
+// channel returned and closed the PackStore/the Redis pool in the middle
+// of a compaction/retention pass, and a fourth sender would hang on the
+// channel of capacity 3. The scheme — the derived cancellation + a
+// WaitGroup (by the review of T-223: a channel of a capacity does not
+// cover the early exits and a panic, and the "capacity = senders =
+// receptions" coupling is fragile by hand). Running run in a unit test
+// is impossible (live Postgres/Redis/DNS), the invariant is pinned by
+// parsing main.go via go/ast (the precedent of reading the sources by
+// tests — compose_test.go, postgresql_conf_test.go); the checked
+// invariants:
 //
-//   - run выводит ctx производной отменой (context.WithCancel) и
-//     передаёт его каждому циклу и главному циклу: каркас отменяет
-//     ctx OnRun только после его возврата, ранний выход/паника обязаны
-//     гасить циклы сами;
-//   - джойн-defer (единственный defer с bg.Wait) — func-литерал с
-//     безусловным cancel() до bg.Wait(), зарегистрирован последним из
-//     defer run → исполняется первым (LIFO), до закрытий
-//     rdb/store/транспорта, и до первого запуска циклов;
-//   - каждый go-запуск в run обёрнут парой «bg.Add(1); go func(){ defer
-//     bg.Done(); … }()»: Add без пары к go — незаджойненный цикл
-//     (регрессия T-223), сиротский Add без go и Wait-до-cancel вешают
-//     Wait (добавлено по ревью T-232), defer bg.Done обязан быть
-//     безусловным оператором верхнего уровня литерала — условный Done
-//     (внутри if) оставил бы Wait виснуть.
+//   - run derives the ctx with a derived cancellation (context.WithCancel)
+//     and passes it to every loop and the main loop: the framework cancels
+//     the ctx of OnRun only after it returns, an early exit/a panic must
+//     stop the loops themselves;
+//   - the join-defer (the only defer with bg.Wait) — a func literal with
+//     an unconditional cancel() before bg.Wait(), registered last of the
+//     defers of run → it executes first (LIFO), before the closes of
+//     rdb/store/the transport, and before the first start of the loops;
+//   - every go-start in run is wrapped by the pair "bg.Add(1); go
+//     func(){ defer bg.Done(); … }()": an Add without a pair to a go —
+//     an unjoined loop (the regression of T-223), an orphan Add without a
+//     go and a Wait-before-cancel hang the Wait (added by the review of
+//     T-232), the defer bg.Done must be an unconditional top-level
+//     statement of the literal — a conditional Done (inside an if) would
+//     leave the Wait hanging.
 //
-// Разборщик — общий internal/bgjoin (извлечён из этого теста задачей
-// T-232 для render-worker/analyzer/dns-worker и усилен там по ревью:
-// порядок cancel-до-Wait, привязка производного ctx, сиротский Add,
-// defer во вложенных блоках) — здесь и в остальных сервисах одна
-// реализация инварианта, усиления доезжают до всех.
+// The checker — the shared internal/bgjoin (extracted from this test by
+// the task T-232 for render-worker/analyzer/dns-worker and strengthened
+// there by the review: the cancel-before-Wait order, the binding of the
+// derived ctx, an orphan Add, a defer in nested blocks) — here and in the
+// other services one implementation of the invariant, the strengthening
+// reaches all of them.
 func TestRunBackgroundJoin(t *testing.T) {
 	bgjoin.Check(t, "main.go")
 }

@@ -1,11 +1,12 @@
-// Сервис web — публичный лендинг (этап 13, T-121; продуктовое расширение
-// вне основного ТЗ — перенос из larasites): предподсчитанные счётчики
-// конвейера (карточки, облако/таблица зон, последние находки — T-122) и
-// форма ручной проверки домена (T-123). Каркас — internal/service:
-// миграции, пул БД (OnDBPool), пробы и /metrics на loopback :9107,
-// graceful shutdown (ТЗ 3.4); публичный слушатель web.listen —
-// собственный http.Server внутри OnRun (метрики наружу не выставляются,
-// ТЗ §9). Лендинг — единственный публичный порт системы.
+// The web service — the public landing (stage 13, T-121; a production
+// extension outside the main spec — moved from larasites): precomputed
+// pipeline counters (cards, the zone cloud/table, the latest finds —
+// T-122) and the manual domain check form (T-123). The framework is
+// internal/service: migrations, the DB pool (OnDBPool), the probes and
+// /metrics on loopback :9107, graceful shutdown (spec 3.4); the public
+// listener web.listen — its own http.Server inside OnRun (the metrics are
+// not exposed outward, spec §9). The landing is the only public port of
+// the system.
 package main
 
 import (
@@ -24,20 +25,20 @@ import (
 )
 
 func main() {
-	// Ошибка конфигурации — до инициализации логгера: stderr и код 1.
+	// A configuration error — before the logger is initialized: stderr and exit code 1.
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("[web] конфигурация: %v", err)
 	}
 	logger := service.NewLogger("web", cfg)
 
-	// Реестр создаётся здесь (не каркасом), чтобы приборы формы
-	// (исходы/сбои/длительность, T-221) жили в том же реестре, что
-	// отдаёт /metrics. Метрики — loopback (ТЗ §9: публичная точка входа
-	// одна — web.listen; 9107 — следующий свободный за analyzer :9106).
-	// Пул приходит от каркаса после миграций (OnDBPool): postgres.dsn
-	// обязателен (config.Validate), readiness /healthz публичного mux
-	// пингует его.
+	// The registry is created here (not by the framework) so that the form
+	// instruments (outcomes/failures/duration, T-221) live in the same
+	// registry that serves /metrics. Metrics are loopback (spec §9: the
+	// public entry point is one — web.listen; 9107 is the next free one
+	// after analyzer :9106). The pool comes from the framework after the
+	// migrations (OnDBPool): postgres.dsn is required (config.Validate),
+	// the readiness /healthz of the public mux pings it.
 	reg := metrics.New("web")
 	var pool *pgxpool.Pool
 	if err := service.Run(service.Options{
@@ -53,9 +54,10 @@ func main() {
 	}
 }
 
-// run — публичный слушатель внутри OnRun: жизненным циклом владеет
-// сервис web (graceful stop по отмене ctx — прецедент OnRun-клиентов
-// воркеров), завершение возвращает каркасу.
+// run — the public listener inside OnRun: the web service owns the
+// lifecycle (a graceful stop on ctx cancellation — the precedent of the
+// OnRun clients of the workers), the completion returns control to the
+// framework.
 func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgxpool.Pool, reg *metrics.Registry) error {
 	if pool == nil {
 		return errors.New("web: пул БД не получен (postgres.dsn обязателен)")

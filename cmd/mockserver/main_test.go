@@ -1,6 +1,7 @@
-// Тесты ограничений «злых» обработчиков mockserver (CLI-09): параметры
-// из запроса ограничены сверху (аллокация по ?rate=, удержание горутины
-// по ?delay=), /slow слушает отключение клиента.
+// The tests of the bounds of the "nasty" mockserver handlers (CLI-09):
+// the request parameters are capped at the top (the allocation by ?rate=,
+// holding the goroutine by ?delay=), /slow listens to the client
+// disconnect.
 package main
 
 import (
@@ -13,13 +14,13 @@ import (
 
 func TestTarpitRate(t *testing.T) {
 	cases := map[string]int{
-		"":             512,           // дефолт — ниже 2 КБ/с основного ТЗ
-		"abc":          512,           // мусор — дефолт
-		"0":            512,           // неположительное — дефолт
-		"-5":           512,           // отрицательное — дефолт
-		"4096":         4096,          // штатное значение — как есть
-		"2000000000":   tarpitMaxRate, // гигабайт/с — обрезан до предела
-		"999999999999": tarpitMaxRate, // ещё больше — обрезан
+		"":             512,           // the default — below the 2 KB/s of the main spec
+		"abc":          512,           // junk — the default
+		"0":            512,           // non-positive — the default
+		"-5":           512,           // negative — the default
+		"4096":         4096,          // a normal value — as is
+		"2000000000":   tarpitMaxRate, // a gigabyte/s — truncated to the limit
+		"999999999999": tarpitMaxRate, // even more — truncated
 	}
 	for raw, want := range cases {
 		if got := tarpitRate(raw); got != want {
@@ -33,13 +34,13 @@ func TestTarpitRate(t *testing.T) {
 
 func TestSlowDelay(t *testing.T) {
 	cases := map[string]time.Duration{
-		"":         30 * time.Second, // дефолт сценария slow-headers
+		"":         30 * time.Second, // the default of the slow-headers scenario
 		"junk":     30 * time.Second,
 		"0s":       30 * time.Second,
 		"-1m":      30 * time.Second,
 		"45s":      45 * time.Second,
 		"5m":       5 * time.Minute,
-		"9999h":    slowMaxDelay, // сутки ожидания — обрезаны
+		"9999h":    slowMaxDelay, // a day of waiting — truncated
 		"1000000h": slowMaxDelay,
 	}
 	for raw, want := range cases {
@@ -49,9 +50,10 @@ func TestSlowDelay(t *testing.T) {
 	}
 }
 
-// TestSlowHandlerClientGone — отключение клиента (отмена ctx запроса)
-// возвращает горутину обработчика немедленно, а не по истечении delay:
-// ответ не пишется (тело пусто), ServeHTTP завершается быстро.
+// TestSlowHandlerClientGone — a client disconnect (the ctx cancellation of
+// the request) returns the handler goroutine immediately, not after the
+// delay expires: no response is written (the body is empty), ServeHTTP
+// finishes fast.
 func TestSlowHandlerClientGone(t *testing.T) {
 	mux := http.NewServeMux()
 	registerRoutes(mux)

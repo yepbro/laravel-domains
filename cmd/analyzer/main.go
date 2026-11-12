@@ -1,18 +1,20 @@
-// Сервис analyzer (ТЗ 5.8, §7; T-071): этап анализа Laravel. Потребляет
-// задачи q:analyze (Result — ключ строки subdomain_results, T-024;
-// публикуют HTTP-этап T-058, render-worker T-067 и переанализ T-074)
-// группой потребителей; вход пассивного анализа читается из БД
-// (заголовки/cookies jsonb, content_hash) и хранилища контента (HTML/DOM,
-// ТЗ 5.7), правила применяются из текущего снапшота набора (Reloader,
-// T-068: SIGHUP перезагружает каталог analyzer.rules_dir без рестарта —
-// хук OnSIGHUP каркаса), срабатывания записываются в laravel_findings
-// (все, независимо от порога; is_laravel = score ≥ порога, §13.1) одной
-// транзакцией со штампом subdomain_results.rules_version; подтверждение
-// q:analyze — паттерном Processing (XACK только после записи в БД,
-// T-025). Фоновый цикл переанализа (T-074) ставит записи с устаревшим
-// rules_version в q:analyze без повторного скачивания. Каркас —
-// internal/service: миграции, пул БД (OnDBPool), пробы /livez + /healthz, /metrics,
-// graceful shutdown.
+// The analyzer service (spec 5.8, §7; T-071): the Laravel analysis stage.
+// It consumes the q:analyze tasks (Result — the key of the
+// subdomain_results row, T-024; published by the HTTP stage T-058,
+// render-worker T-067 and the reanalysis T-074) with a consumer group;
+// the input of the passive analysis is read from the DB (the
+// headers/cookies jsonb, content_hash) and the content store (HTML/DOM,
+// spec 5.7), the rules are applied from the current snapshot of the rule
+// set (Reloader, T-068: SIGHUP reloads the analyzer.rules_dir directory
+// without a restart — the OnSIGHUP hook of the framework), the hit rules
+// are written to laravel_findings (all of them, regardless of the
+// threshold; is_laravel = score ≥ threshold, §13.1) in one transaction
+// with the subdomain_results.rules_version stamp; the q:analyze
+// acknowledgment — by the Processing pattern (XACK only after the DB
+// write, T-025). The background reanalysis loop (T-074) enqueues the
+// records with an outdated rules_version into q:analyze without a
+// re-download. The framework is internal/service: migrations, the DB pool
+// (OnDBPool), the /livez + /healthz probes, /metrics, graceful shutdown.
 package main
 
 import (
@@ -35,29 +37,32 @@ import (
 )
 
 func main() {
-	// Ошибка конфигурации — до инициализации логгера: stderr и код 1.
+	// A configuration error — before the logger is initialized: stderr and exit code 1.
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("[analyzer] конфигурация: %v", err)
 	}
 	logger := service.NewLogger("analyzer", cfg)
 
-	// Набор правил обязателен уже при старте (T-068): analyzer без правил
-	// молча не находил бы Laravel — ошибка загрузки останавливает сервис
-	// (код 1, systemd Restart=on-failure). Снапшот для каждой доставки
-	// берёт воркер через Set(); SIGHUP перезагружает каталог на живом
-	// сервисе (HandleSIGHUP — OnSIGHUP каркаса, make rules-reload).
+	// The rule set is required already at startup (T-068): an analyzer
+	// without rules would silently not find Laravel — a load error stops
+	// the service (exit code 1, systemd Restart=on-failure). The snapshot
+	// for each delivery is taken by the worker via Set(); SIGHUP reloads
+	// the directory on the live service (HandleSIGHUP — the OnSIGHUP hook
+	// of the framework, make rules-reload).
 	reloader, err := rules.NewReloader(cfg.Analyzer.RulesDir, logger)
 	if err != nil {
 		log.Fatalf("[analyzer] правила %s: %v", cfg.Analyzer.RulesDir, err)
 	}
 
-	// Пул приходит от каркаса после миграций (OnDBPool) и гарантированно
-	// готов до старта OnRun: postgres.dsn обязателен (config.Validate);
-	// им пользуется и хранилище контента (строки contents, T-042), и
-	// чтение subdomain_results/запись findings. Реестр метрик — здесь же
-	// (T-077): приборы этапа и коллектор длины q:analyze получают его до
-	// старта OnRun, каркас отдаёт тот же реестр через /metrics.
+	// The pool comes from the framework after the migrations (OnDBPool)
+	// and is guaranteed to be ready before OnRun starts: postgres.dsn is
+	// required (config.Validate); it is used both by the content store
+	// (the contents rows, T-042) and by reading subdomain_results/writing
+	// findings. The metrics registry — right here (T-077): the stage
+	// instruments and the collector of the q:analyze depth receive it
+	// before OnRun starts, the framework serves the same registry via
+	// /metrics.
 	reg := metrics.New("analyzer")
 	var pool *pgxpool.Pool
 	if err := service.Run(service.Options{
@@ -74,26 +79,28 @@ func main() {
 	}
 }
 
-// run — рабочая логика analyzer: хранилище контента (чтение — тот же
-// PackStore, что пишет HTTP/рендер-этапы: словарь zstd T-043 обязан
-// совпадать, иначе распаковка чужих блоков невозможна) → очередь →
-// воркер q:analyze (передний план) с приборами этапа (T-077) и коллектор
-// длины q:analyze (метрика длин очередей, ТЗ 5.9) + фоновый цикл
-// переанализа (T-074). Завершение — отмена ctx (graceful shutdown,
-// ТЗ 3.4): начатые доставки дорабатывают или возвращаются очереди
-// повторной доставкой (Processing, T-025); ReanalyzeLoop на отмене
-// возвращает чистый nil; фоновые циклы (ReanalyzeLoop, коллектор
-// q:analyze) гасятся производной отменой и джойнятся до defer-закрытий
-// store/rdb (T-232).
+// run — the working logic of analyzer: the content store (reading — the
+// same PackStore that the HTTP/render stages write with: the zstd
+// dictionary T-043 must match, otherwise unpacking foreign blocks is
+// impossible) → queue → the q:analyze worker (the foreground) with the
+// stage instruments (T-077) and the collector of the q:analyze depth
+// (the queue depth metric, spec 5.9) + the background reanalysis loop
+// (T-074). Shutdown — ctx cancellation (graceful shutdown, spec 3.4):
+// the started deliveries finish or are refunded to the queue for
+// redelivery (Processing, T-025); ReanalyzeLoop on cancellation returns
+// a clean nil; the background loops (ReanalyzeLoop, the q:analyze
+// collector) are stopped by the derived cancellation and joined before
+// the defer-closes of store/rdb (T-232).
 func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgxpool.Pool, reloader *rules.Reloader, reg *metrics.Registry) error {
 	if pool == nil {
 		return errors.New("analyzer: пул БД не получен (postgres.dsn обязателен)")
 	}
 
-	// Хранилище контента (ТЗ 5.7, T-042): этап только читает (контент для
-	// матчинга целей html/meta), запись и DiskWatchLoop — территория
-	// пишущих этапов; лимиты Put этому воркеру не нужны, каталог и файл
-	// блокировки открываются те же.
+	// The content store (spec 5.7, T-042): the stage only reads (the
+	// content for matching the html/meta targets), the writes and the
+	// DiskWatchLoop are the territory of the writing stages; this worker
+	// does not need the Put limits, the same directory and file locks are
+	// opened.
 	if _, err := content.SetDictFile(cfg.Content.ZstdDictionary, logger); err != nil {
 		return err
 	}
@@ -102,73 +109,79 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		return err
 	}
 	defer func() { _ = store.Close() }()
-	// Словарь против новейшего пака (T-043): прежний словарь реестра
-	// даёт читаемость старых кадров (T-103); расхождение без файла
-	// в реестре видно Warn-ом при старте, а не ошибками чтения.
+	// The dictionary against the newest pack (T-043): the previous
+	// registry dictionary keeps the old frames readable (T-103); a
+	// mismatch without a file in the registry is visible as a Warn at
+	// startup, not as read errors.
 	content.WarnDictMismatch(store.Dir(), logger)
 
-	// Очередь: воркер только потребляет q:analyze и XACK (конец конвейера
-	// §7); циклу переанализа публикация нужна под гейтом backpressure
-	// (WatermarkPublisher, T-026) — один клиент Redis на сервис.
+	// Queue: the worker only consumes q:analyze and XACKs (the end of the
+	// pipeline §7); the reanalysis loop needs the publishing under the
+	// backpressure gate (WatermarkPublisher, T-026) — one Redis client per
+	// service.
 	rdb := queue.NewClient(cfg.Redis.Addr)
 	defer func() { _ = rdb.Close() }()
 	q := queue.NewRedisQueue(rdb, queue.RedisOptions{
-		MaxLen: int64(cfg.Redis.MaxLen), // XADD MAXLEN ~ на каждом стриме (T-025)
+		MaxLen: int64(cfg.Redis.MaxLen), // XADD MAXLEN ~ on every stream (T-025)
 	})
 
-	// Возврат зависших доставок q:analyze (T-025): RecoverLoop в воркере —
-	// клейм XAUTOCLAIM, исчерпание попыток — q:dead; параметры надёжности
-	// и темпа — секция redis (max_attempts, claim_min_idle,
-	// recover_batch, recover_interval — T-153). OnBury — счётчик смертей
-	// crawler_queue_dead_buried_total (T-154): bury молчаливым быть не
-	// должно (пост-мортем 22.10).
+	// Refunding the stuck q:analyze deliveries (T-025): RecoverLoop in the
+	// worker — the XAUTOCLAIM claim, the attempt exhaustion — q:dead; the
+	// reliability and pace parameters — the redis section (max_attempts,
+	// claim_min_idle, recover_batch, recover_interval — T-153). OnBury —
+	// the counter of deaths crawler_queue_dead_buried_total (T-154): a
+	// bury must not be silent (the 22.10 post-mortem).
 	rel := queue.NewReliab(rdb, q, queue.ReliabOptions{
 		MaxAttempts: cfg.Redis.MaxAttempts,
 		MinIdle:     cfg.Redis.ClaimMinIdle.D(),
 		OnBury:      metrics.NewDeadBuriedHook(reg),
-		// OnBuryUnidentified — карантин неидентифицируемых записей
-		// (без task_id): crawler_queue_dead_unidentified_total
-		// (T-260, ФТ-6.1) — терминальная ветка bury.
+		// OnBuryUnidentified — the quarantine of unidentifiable records
+		// (without a task_id): crawler_queue_dead_unidentified_total
+		// (T-260, FR-6.1) — the terminal bury branch.
 		OnBuryUnidentified: metrics.NewDeadUnidentifiedHook(reg),
 	})
 
-	// Гейт backpressure (T-026) для публикации цикла переанализа ниже:
-	// сам воркер только потребляет q:analyze и XACK (конец конвейера §7).
+	// The backpressure gate (T-026) for the publishing of the reanalysis
+	// loop below: the worker itself only consumes q:analyze and XACKs
+	// (the end of the pipeline §7).
 	gate := queue.NewBackpressureGate(rdb, queue.BackpressureOptions{
 		Watermark: int64(cfg.Scheduler.QueueHighWatermark),
-		MaxLen:    int64(cfg.Redis.MaxLen), // пределы обрезки — для порога гейта (T-026/T-025)
+		MaxLen:    int64(cfg.Redis.MaxLen), // the trim limits — for the gate threshold (T-026/T-025)
 		Log:       logger,
 	})
 	publish := queue.NewWatermarkPublisher(q, gate)
 
-	// Джойн фоновых циклов (T-232, инвариант http-worker T-223):
-	// производная отмена + WaitGroup. Каркас отменяет ctx OnRun только
-	// после его возврата (internal/service: cancelRun после onRunDone) —
-	// ранний выход run из конструктора ниже (analyzer.New) или паника
-	// обязаны останавливать циклы сами, иначе defer-закрытия rdb/store
-	// (LIFO ниже) закроют ресурсы под серединой прохода переанализа
-	// (пул БД, публикация q:analyze через rdb) или запроса глубины
-	// очереди (gate.Len → rdb); до T-232 оба цикла жили fire-and-forget.
-	// Джойн — defer, зарегистрированный ПОСЛЕ defer-закрытий выше →
-	// исполняется ДО них (LIFO). WaitGroup, а не канал ёмкости: джойн
-	// ждёт ровно запущенное (Add/Done по месту запуска) — ранний выход с
-	// частью циклов не виснет на «недостающих» приёмах. Инварианты
-	// закреплены структурным тестом TestRunBackgroundJoin (main_test.go,
-	// разборщик — internal/bgjoin).
+	// The join of the background loops (T-232, the http-worker invariant
+	// T-223): the derived cancellation + a WaitGroup. The framework
+	// cancels the ctx of OnRun only after it returns (internal/service:
+	// cancelRun after onRunDone) — an early exit of run from the
+	// constructor below (analyzer.New) or a panic must stop the loops
+	// themselves, otherwise the defer-closes of rdb/store (the LIFO
+	// below) would close the resources in the middle of a reanalysis pass
+	// (the DB pool, publishing q:analyze via rdb) or a queue depth request
+	// (gate.Len → rdb); before T-232 both loops lived fire-and-forget.
+	// The join is a defer registered AFTER the defer-closes above →
+	// it executes BEFORE them (LIFO). A WaitGroup, not a channel of a
+	// capacity: the join waits for exactly what was started (Add/Done at
+	// the launch site) — an early exit with a part of the loops does not
+	// hang on the "missing" receptions. The invariants are pinned by the
+	// structural test TestRunBackgroundJoin (main_test.go, the checker —
+	// internal/bgjoin).
 	ctx, cancel := context.WithCancel(ctx)
 	var bg sync.WaitGroup
 	defer func() {
-		// Штатно ctx уже отменён каркасом к моменту возврата run;
-		// ранний выход/паника гасят ещё живые циклы здесь — до
-		// defer-закрытий (LIFO).
+		// Normally the ctx is already cancelled by the framework by the
+		// moment run returns; an early exit/a panic stop the still living
+		// loops here — before the defer-closes (LIFO).
 		cancel()
 		bg.Wait()
 	}()
 
-	// Фоновый цикл переанализа (T-074, ТЗ 5.8): стартовый дренаж + тикер +
-	// внеочередной проход по смене набора правил (Reloader.Subscribe);
-	// ошибки проходов цикл логирует Warn сам, возвращает только по отмене
-	// ctx — живёт до остановки сервиса рядом с воркером.
+	// The background reanalysis loop (T-074, spec 5.8): an initial drain +
+	// a ticker + an out-of-band pass on a rule set change
+	// (Reloader.Subscribe); the loop logs the pass errors as Warn itself
+	// and returns only on the ctx cancellation — it lives until the
+	// service stops, next to the worker.
 	bg.Add(1)
 	go func() {
 		defer bg.Done()
@@ -179,8 +192,9 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		}
 	}()
 
-	// Длина потребляемого стрима q:analyze → crawler_queue_depth (T-077):
-	// источник глубины — гейт (тот же клиент Redis), завершается отменой ctx.
+	// The depth of the consumed q:analyze stream → crawler_queue_depth
+	// (T-077): the depth source — the gate (the same Redis client), it
+	// finishes on the ctx cancellation.
 	bg.Add(1)
 	go func() {
 		defer bg.Done()
@@ -188,31 +202,33 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 			[]string{queue.StreamAnalyze}, metrics.DefaultQueueCollectInterval, logger)
 	}()
 
-	// Опции воркера — одни на сборку (стиль render-worker): Worker хранит
-	// их для ProcessResult, цикл Run берёт те же Group/Consume.
+	// The worker options — one per build (the render-worker style): the
+	// Worker keeps them for ProcessResult, the Run loop takes the same
+	// Group/Consume.
 	opts := analyzer.Options{
 		MinScore: cfg.Analyzer.LaravelMinScore,
-		Recover:  rel, // возврат зависших задач q:analyze (T-025)
-		// Темп возврата зависших (T-153): пачка/интервал клейма —
+		Recover:  rel, // refunding the stuck q:analyze tasks (T-025)
+		// The pace of the stuck refunds (T-153): the claim batch/interval —
 		// redis.recover_*.
 		RecoverBatch:    cfg.Redis.RecoverBatch,
 		RecoverInterval: cfg.Redis.RecoverInterval.D(),
-		// Точечный дренаж контента домена при снятии находки переанализом
-		// (T-187): окно то же, что у цикла retention http-worker
-		// (content.retention), чистка — content.DrainDomain поверх пула
-		// сервиса; retention = 0 — контент хранится всегда, дренажа нет.
+		// The point drain of a domain's content when a find is removed by
+		// the reanalysis (T-187): the window is the same as that of the
+		// http-worker retention loop (content.retention), the purge is
+		// content.DrainDomain over the service pool; retention = 0 — the
+		// content is always stored, there is no drain.
 		Retention:   cfg.Content.Retention.D(),
 		DrainDomain: content.DrainDomain,
-		Metrics:     reg, // приборы этапа: задачи и длительности (T-077)
+		Metrics:     reg, // the stage instruments: the tasks and the durations (T-077)
 		Log:         logger,
 	}
 	w, err := analyzer.New(pool, q, store, reloader, opts)
 	if err != nil {
 		return err
 	}
-	// Главный цикл живёт до отмены ctx (graceful shutdown); джойн
-	// фоновых циклов — defer выше: любой выход run (штатный, ранний из
-	// конструктора, паника) сначала гасит и дожидается циклы, и лишь
-	// затем LIFO закрывает rdb/store.
+	// The main loop lives until the ctx cancellation (graceful shutdown);
+	// the join of the background loops — the defer above: any exit of run
+	// (graceful, early from the constructor, a panic) first stops and waits
+	// for the loops, and only then the LIFO closes rdb/store.
 	return analyzer.Run(ctx, w, opts)
 }

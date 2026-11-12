@@ -1,14 +1,14 @@
-// testbedgen — генератор тестового стенда (ТЗ 4.4).
+// testbedgen — the test bench generator (spec 4.4).
 //
-// Читает deploy/docker/testbed/scenarios.yaml и testdata/laravel-samples/,
-// генерирует:
+// It reads deploy/docker/testbed/scenarios.yaml and testdata/laravel-samples/,
+// generates:
 //
-//	deploy/docker/testbed/coredns/zones/db.<zone>  — файлы DNS-зон
-//	deploy/docker/testbed/coredns/zones.conf        — серверные блоки CoreDNS
-//	deploy/docker/testbed/web/Caddyfile             — виртуальные хосты Caddy
-//	deploy/docker/testbed/web/sites/<сценарий>/     — статические фикстуры
+//	deploy/docker/testbed/coredns/zones/db.<zone>  — the DNS zone files
+//	deploy/docker/testbed/coredns/zones.conf        — the CoreDNS server blocks
+//	deploy/docker/testbed/web/Caddyfile             — the Caddy virtual hosts
+//	deploy/docker/testbed/web/sites/<scenario>/     — the static fixtures
 //
-// Запуск: make testbed-gen
+// Run: make testbed-gen
 package main
 
 import (
@@ -24,7 +24,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// ---------------------------------------------------------------- yaml-схема
+// ---------------------------------------------------------------- yaml schema
 
 type Network struct {
 	TestwebIP    string `yaml:"testweb_ip"`
@@ -43,40 +43,43 @@ type Config struct {
 
 type DNSCfg struct {
 	A         string `yaml:"a"`          // testweb | mockserver | blackhole | ""
-	WWW       bool   `yaml:"www"`        // создать www.<name>
-	NS        bool   `yaml:"ns"`         // NS без адреса (delegated_no_address)
+	WWW       bool   `yaml:"www"`        // create www.<name>
+	NS        bool   `yaml:"ns"`         // an NS without an address (delegated_no_address)
 	Wildcard  bool   `yaml:"wildcard"`   // *.<name>
-	CNAME     string `yaml:"cname"`      // CNAME на <cname>.<zone>
-	CNAMELoop bool   `yaml:"cname_loop"` // зацикленная CNAME-цепочка
+	CNAME     string `yaml:"cname"`      // a CNAME to <cname>.<zone>
+	CNAMELoop bool   `yaml:"cname_loop"` // a looping CNAME chain
 	Special   string `yaml:"special"`    // servfail | timeout
-	// AMany — сгенерировать столько различных A-записей (round-robin) из
-	// блока документации 192.0.2.0/24: большой ответ не помещается в
-	// UDP-датаграмму без EDNS0 → резолвер ставит TC=1, клиент повторяет
-	// вопрос по TCP (TCP-fallback, ТЗ 5.4/11.2). Сайта у сценария нет —
-	// адреса TEST-NET-1 заведомо никуда не ходят.
+	// AMany — generate that many distinct A records (round-robin) from the
+	// documentation block 192.0.2.0/24: a large response does not fit into
+	// a UDP datagram without EDNS0 → the resolver sets TC=1, the client
+	// repeats the question over TCP (the TCP fallback, spec 5.4/11.2). The
+	// scenario has no site — the TEST-NET-1 addresses are known not to go
+	// anywhere.
 	AMany int `yaml:"a_many"`
 }
 
 type SiteCfg struct {
 	Template     string `yaml:"template"` // generic|parked|redirect-chain|meta-refresh|js-redirect|spa|mock
 	Scheme       string `yaml:"scheme"`   // both|http-only|https-only
-	HTTP         string `yaml:"http"`     // redirect-to-https|different (при scheme=both)
+	HTTP         string `yaml:"http"`     // redirect-to-https|different (with scheme=both)
 	ApexRedirect bool   `yaml:"apex_redirect_to_www"`
 	WWWRedirect  bool   `yaml:"www_redirect_to_apex"`
 	WWWSame      bool   `yaml:"www_same_as_apex"`
-	// MockPath — путь «злого» обработчика для template=mock. Генератор
-	// маршрутов не пишет (это делает cmd/mockserver.hostRoutes по Host
-	// сценария), поле нужно для сверки контракта «сценарий → обработчик»
-	// в TestScenariosCoverTZ (см. main_test.go).
+	// MockPath — the path of the "nasty" handler for template=mock. The
+	// route generator does not write it (cmd/mockserver.hostRoutes does
+	// that by the scenario Host), the field is needed for checking the
+	// "scenario → handler" contract in TestScenariosCoverTZ (see
+	// main_test.go).
 	MockPath string `yaml:"mock_path"`
 }
 
 type Scenario struct {
 	Name string  `yaml:"name"`
-	Zone string  `yaml:"zone"` // базовая зона, по умолчанию первая из zones
+	Zone string  `yaml:"zone"` // the base zone, by default the first of zones
 	DNS  DNSCfg  `yaml:"dns"`
 	Site SiteCfg `yaml:"site"`
-	// Expect — документация ожидаемого результата (для интеграционных тестов).
+	// Expect — the documentation of the expected result (for the
+	// integration tests).
 	Expect string `yaml:"expect"`
 }
 
@@ -88,7 +91,7 @@ type PlainDom struct {
 	} `yaml:"names"`
 }
 
-// ---------------------------------------------------------------- генератор
+// ---------------------------------------------------------------- generator
 
 type zoneData struct {
 	name    string // punycode
@@ -97,9 +100,9 @@ type zoneData struct {
 
 type generator struct {
 	cfg     Config
-	zones   map[string]*zoneData // ключ — punycode-зона
-	blocks  []string             // дополнительные серверные блоки CoreDNS
-	caddy   strings.Builder      // тело Caddyfile
+	zones   map[string]*zoneData // the key — the punycode zone
+	blocks  []string             // the extra CoreDNS server blocks
+	caddy   strings.Builder      // the Caddyfile body
 	baseDir string
 }
 
@@ -170,7 +173,7 @@ func (g *generator) run() {
 	fmt.Printf("testbedgen: готово: зон=%d, сценариев=%d\n", len(g.zones), len(g.cfg.Scenarios))
 }
 
-// ---------------------------------------------------------------- сценарии
+// ---------------------------------------------------------------- scenarios
 
 func (g *generator) addScenario(zone string, sc Scenario) {
 	net := g.cfg.Network
@@ -213,9 +216,10 @@ func (g *generator) addScenario(zone string, sc Scenario) {
 		z.add("%s IN NS ns.%s.", sc.Name, zone)
 	}
 	if sc.DNS.AMany > 0 {
-		// Различные адреса 192.0.2.1..N: записи обязаны отличаться, иначе
-		// ответ не растёт (RRset сжимается до одной записи); 60 × ~16 Б
-		// в сжатой упаковке ≈ 1 КиБ > 512 Б лимита UDP без EDNS0.
+		// Distinct addresses 192.0.2.1..N: the records must differ,
+		// otherwise the response does not grow (the RRset compresses to a
+		// single record); 60 × ~16 B in a compressed packing ≈ 1 KiB >
+		// 512 B of the UDP limit without EDNS0.
 		for i := 1; i <= sc.DNS.AMany; i++ {
 			z.add("%s IN A 192.0.2.%d", sc.Name, i)
 		}
@@ -231,7 +235,7 @@ func (g *generator) addScenario(zone string, sc Scenario) {
 		z.add("%s-loop-b IN CNAME %s.%s.", sc.Name, sc.Name, zone)
 	}
 
-	// Сайт генерируем, только если трафик действительно попадает на testweb.
+	// We generate the site only if the traffic really reaches testweb.
 	if ipFor(sc.DNS.A, net) == net.TestwebIP || sc.DNS.CNAME != "" || sc.DNS.Wildcard {
 		g.addSite(sc, zone, fqdn, www)
 	}
@@ -250,11 +254,12 @@ func ipFor(target string, net Network) string {
 	}
 }
 
-// addPlain добавляет простые домены (без «злых» сценариев) в дополнительные зоны.
+// addPlain adds plain domains (without "nasty" scenarios) to the extra
+// zones.
 func (g *generator) addPlain(zone string, p PlainDom) {
 	z := g.zone(zone)
 	for _, n := range p.Names {
-		// Метка может быть в unicode — приводим полное имя к punycode.
+		// A label may be in unicode — we bring the full name to punycode.
 		full := puny(n.Label + "." + zone)
 		label := strings.TrimSuffix(full, "."+zone)
 		z.add("%s IN A %s", label, g.cfg.Network.TestwebIP)
@@ -275,7 +280,8 @@ func (g *generator) addPlain(zone string, p PlainDom) {
 	}
 }
 
-// addSamples подключает образцы Laravel из testdata/laravel-samples (ТЗ 4.4.2).
+// addSamples wires in the Laravel samples from testdata/laravel-samples
+// (spec 4.4.2).
 func (g *generator) addSamples(baseZone string) {
 	samplesDir := filepath.Join(g.baseDir, "testdata/laravel-samples")
 	entries, err := os.ReadDir(samplesDir)
@@ -295,7 +301,8 @@ func (g *generator) addSamples(baseZone string) {
 		fqdn := id + "." + baseZone
 		g.zone(baseZone).add("%s IN A %s", id, g.cfg.Network.TestwebIP)
 
-		// headers.json — объект имя -> массив значений (в т.ч. Set-Cookie).
+		// headers.json — an object of name → an array of values
+		// (including Set-Cookie).
 		var hdrs map[string][]string
 		if raw, err := os.ReadFile(filepath.Join(samplesDir, id, "headers.json")); err == nil {
 			_ = yaml.Unmarshal(raw, &hdrs)
@@ -314,14 +321,15 @@ func (g *generator) addSamples(baseZone string) {
 	}
 }
 
-// addSite генерирует Caddy-блоки и фикстуры по описанию сайта сценария.
+// addSite generates the Caddy blocks and the fixtures by the site
+// description of the scenario.
 func (g *generator) addSite(sc Scenario, zone, fqdn, www string) {
 	s := sc.Site
 	sitesDir := filepath.Join(g.baseDir, "deploy/docker/testbed/web/sites", sc.Name)
 
 	switch s.Template {
 	case "parked":
-		// Идентичное содержимое для parked-1/parked-2 — дедупликация по хэшу.
+		// Identical content for parked-1/parked-2 — deduplication by hash.
 		g.writeFixture(sitesDir, "index.html", parkedPage())
 		g.serveBlocks(sc, zone, fqdn, www, fmt.Sprintf("root * /srv/sites/%s\nfile_server", sc.Name))
 
@@ -353,12 +361,13 @@ func (g *generator) addSite(sc Scenario, zone, fqdn, www string) {
 	}
 }
 
-// serveBlocks — стандартные комбинации http/https-блоков сценария.
+// serveBlocks — the standard combinations of the http/https blocks of a
+// scenario.
 func (g *generator) serveBlocks(sc Scenario, zone, fqdn, www, serveBody string) {
 	s := sc.Site
 
 	switch {
-	case s.ApexRedirect: // bare -> www: alias_kind = 2, одно хранение контента
+	case s.ApexRedirect: // bare -> www: alias_kind = 2, one content storage
 		g.caddySiteBlock("http://"+fqdn, "", "    redir https://"+www+"{uri} permanent")
 		g.caddySiteBlock("https://"+fqdn, "    tls internal\n", "    redir https://"+www+"{uri} permanent")
 		g.caddySiteBlock("http://"+www, "", serveBody)
@@ -370,7 +379,7 @@ func (g *generator) serveBlocks(sc Scenario, zone, fqdn, www, serveBody string) 
 		g.caddySiteBlock("http://"+fqdn, "", serveBody)
 		g.caddySiteBlock("https://"+fqdn, "    tls internal\n", serveBody)
 
-	case s.WWWSame: // одинаковый контент без редиректа: alias_kind = 1
+	case s.WWWSame: // the same content without a redirect: alias_kind = 1
 		g.caddySiteBlock("http://"+fqdn+", http://"+www, "", serveBody)
 		g.caddySiteBlock("https://"+fqdn+", https://"+www, "    tls internal\n", serveBody)
 
@@ -380,22 +389,23 @@ func (g *generator) serveBlocks(sc Scenario, zone, fqdn, www, serveBody string) 
 	case s.Scheme == "https-only":
 		g.caddySiteBlock("https://"+fqdn, "    tls internal\n", serveBody)
 
-	case s.HTTP == "redirect-to-https": // один сайт: единственная запись, variant = 0
+	case s.HTTP == "redirect-to-https": // one site: a single record, variant = 0
 		g.caddySiteBlock("http://"+fqdn, "", "    redir https://"+fqdn+"{uri} permanent")
 		g.caddySiteBlock("https://"+fqdn, "    tls internal\n", serveBody)
 
-	case s.HTTP == "different": // http и https — разные сайты: variant 0 и 1.
-		// «Разные» по ТЗ §5.5 п. 5 — различие итоговых host+path И хэшей:
-		// одинаковый host с разным контентом «одним сайтом» считает критерий
-		// (host+path равен), поэтому http редиректит на отдельный хост-спутник
-		// <имя>-alt (обычный сценарий testbed со своим A и vhost).
+	case s.HTTP == "different": // http and https are different sites: variants 0 and 1.
+		// "Different" per the spec §5.5 item 5 — the difference of the final
+		// host+path AND the hashes: the same host with different content
+		// counts as "one site" by the criterion (host+path is equal), so
+		// http redirects to a separate satellite host <name>-alt (a normal
+		// testbed scenario with its own A and vhost).
 		alt := "http://" + sc.Name + "-alt." + zone + "{uri} permanent"
 		g.caddySiteBlock("http://"+fqdn, "", "    redir "+alt)
 		sitesDir := filepath.Join(g.baseDir, "deploy/docker/testbed/web/sites", sc.Name)
 		g.writeFixture(filepath.Join(sitesDir, "https"), "index.html", genericPage(fqdn+" — HTTPS-версия"))
 		g.caddySiteBlock("https://"+fqdn, "    tls internal\n", fmt.Sprintf("root * /srv/sites/%s/https\nfile_server", sc.Name))
 
-	default: // оба протокола, одинаковый контент, без редиректа
+	default: // both protocols, the same content, without a redirect
 		g.caddySiteBlock("http://"+fqdn, "", serveBody)
 		g.caddySiteBlock("https://"+fqdn, "    tls internal\n", serveBody)
 	}
@@ -405,7 +415,7 @@ func (g *generator) caddySiteBlock(addresses, prefix, body string) {
 	fmt.Fprintf(&g.caddy, "%s {\n%s%s\n}\n\n", addresses, prefix, body)
 }
 
-// ---------------------------------------------------------------- зоны
+// ---------------------------------------------------------------- zones
 
 func (g *generator) zone(name string) *zoneData {
 	z, ok := g.zones[name]
@@ -476,7 +486,7 @@ func (g *generator) writeCaddyfile() {
 	}
 }
 
-// ---------------------------------------------------------------- фикстуры
+// ---------------------------------------------------------------- fixtures
 
 func (g *generator) writeFixture(dir, name, content string) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -497,7 +507,7 @@ func genericPage(title string) string {
 }
 
 func parkedPage() string {
-	// Одинаковое содержимое для parked-1 и parked-2: дедупликация по хэшу.
+	// The same content for parked-1 and parked-2: deduplication by hash.
 	return `<!DOCTYPE html>
 <html lang="en">
 <head><meta charset="utf-8"><title>Welcome to your new domain</title></head>
@@ -546,7 +556,7 @@ func spaPage(title string) string {
 `, title)
 }
 
-// ---------------------------------------------------------------- утилиты
+// ---------------------------------------------------------------- utilities
 
 func puny(name string) string {
 	p, err := idna.Lookup.ToASCII(name)

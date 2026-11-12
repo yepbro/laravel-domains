@@ -1,18 +1,18 @@
-// Package migrations — SQL-миграции схемы PostgreSQL (формат golang-migrate,
-// пары <версия><имя>.up.sql / .down.sql). Файлы встраиваются в бинарники
-// сервисов через go:embed, поэтому при старте сервису не нужен внешний
-// каталог миграций.
+// Package migrations — SQL migrations of the PostgreSQL schema (the
+// golang-migrate format, the <version><name>.up.sql / .down.sql pairs).
+// The files are embedded into the service binaries via go:embed, so a
+// service does not need an external migrations directory at startup.
 //
-// Новая миграция: make migrate-new NAME=описание — пара файлов создаётся
-// в этом каталоге и автоматически попадает в следующую сборку.
+// A new migration: make migrate-new NAME=description — a pair of files is
+// created in this directory and automatically lands in the next build.
 package migrations
 
 import "embed"
 
-// FS — встроенные SQL-файлы миграций (только *.sql этого каталога).
+// FS — the embedded SQL migration files (only *.sql of this directory).
 //
-// Используется источником source/iofs библиотеки golang-migrate
-// (internal/migrate) и юнит-тестами целостности набора.
+// It is used as the source/iofs source by the golang-migrate library
+// (internal/migrate) and by the set integrity unit tests.
 //
 //go:embed *.sql
 var FS embed.FS

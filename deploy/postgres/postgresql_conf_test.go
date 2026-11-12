@@ -1,8 +1,10 @@
-// Package postgres — боевая конфигурация PostgreSQL для systemd-хоста
-// (deploy/postgres/postgresql.conf, ТЗ §6.3/§3.2/§6). Файл — deploy-артефакт
-// этапа 9; юнит-тест охраняет его формат (синтаксис параметров GUC, отсутствие
-// дублей) и ключевые значения контракта ТЗ от незаметной регрессии —
-// конфигурация не компилируется и без проверки молча едет на боевой сервер.
+// Package postgres — the production PostgreSQL configuration for the
+// systemd host (deploy/postgres/postgresql.conf, spec §6.3/§3.2/§6). The
+// file is a deploy artifact of stage 9; the unit test guards its format
+// (the GUC parameter syntax, no duplicates) and the key values of the
+// spec contract from an unnoticed regression — the configuration is not
+// compiled and without the check it silently drives to the production
+// server.
 package postgres
 
 import (
@@ -13,16 +15,17 @@ import (
 	"testing"
 )
 
-// confFile лежит рядом с тестом: go test запускается с cwd = каталог пакета
-// (в контейнере make test — /src/deploy/postgres).
+// confFile lies next to the test: go test runs with cwd = the package
+// directory (in the container make test — /src/deploy/postgres).
 const confFile = "postgresql.conf"
 
-// settingRe — строка «name = value[ # комментарий]» в синтаксисе postgresql.conf.
+// settingRe — the "name = value[ # comment]" line in the postgresql.conf
+// syntax.
 var settingRe = regexp.MustCompile(`^([a-z][a-z0-9_]*)\s*=\s*(\S.*)$`)
 
-// parseConf разбирает конфигурацию в map имя→значение (без кавычек и
-// хвостового комментария). Комментарий '#', начавшийся вне кавычек значения,
-// отрезается — как это делает сам PostgreSQL.
+// parseConf parses the configuration into a name→value map (without the
+// quotes and the tail comment). A '#' comment that started outside the
+// value quotes is cut off — as PostgreSQL itself does it.
 func parseConf(t *testing.T, content string) map[string]string {
 	t.Helper()
 	settings := make(map[string]string)
@@ -46,7 +49,7 @@ func parseConf(t *testing.T, content string) map[string]string {
 	return settings
 }
 
-// stripComment отрезает хвостовой комментарий «# …» вне кавычек значения.
+// stripComment cuts the tail comment "# …" outside the value quotes.
 func stripComment(value string) string {
 	inQuote := false
 	for i, r := range value {
@@ -62,7 +65,8 @@ func stripComment(value string) string {
 	return strings.TrimSpace(value)
 }
 
-// unquote убирает одиночные кавычки значения ('localhost' → localhost).
+// unquote removes the single quotes of the value ('localhost' →
+// localhost).
 func unquote(value string) string {
 	if len(value) >= 2 && strings.HasPrefix(value, "'") && strings.HasSuffix(value, "'") {
 		return value[1 : len(value)-1]
@@ -70,7 +74,8 @@ func unquote(value string) string {
 	return value
 }
 
-// parseBytes разбирает размер в записи PostgreSQL (16MB, 2GB, …) в байты.
+// parseBytes parses a size in a PostgreSQL entry (16MB, 2GB, …) into
+// bytes.
 func parseBytes(t *testing.T, value string) int64 {
 	t.Helper()
 	m := regexp.MustCompile(`^(\d+)(B|kB|MB|GB)$`).FindStringSubmatch(value)
@@ -94,7 +99,8 @@ func readConf(t *testing.T) map[string]string {
 	return parseConf(t, string(content))
 }
 
-// TestFormat — каждая значимая строка это «name = value», дубликатов нет.
+// TestFormat — every significant line is "name = value", there are no
+// duplicates.
 func TestFormat(t *testing.T) {
 	settings := readConf(t)
 	if len(settings) < 20 {
@@ -102,8 +108,9 @@ func TestFormat(t *testing.T) {
 	}
 }
 
-// TestRequiredSettings — контрактные значения ТЗ §6.3 (планировщик NVMe,
-// autovacuum, synchronous_commit), §3.2 (бюджет памяти) и §6 (WAL).
+// TestRequiredSettings — the contract values of spec §6.3 (the NVMe
+// scheduler, autovacuum, synchronous_commit), §3.2 (the memory budget)
+// and §6 (the WAL).
 func TestRequiredSettings(t *testing.T) {
 	settings := readConf(t)
 	required := map[string]string{
@@ -124,12 +131,14 @@ func TestRequiredSettings(t *testing.T) {
 		"random_page_cost":                      "1.1",
 		"maintenance_io_concurrency":            "200",
 		"shared_preload_libraries":              "pg_stat_statements",
-		// T-177: порог лога медленных запросов = порогу цикла monitor
-		// (monitor.slow_query_min_duration) — одна граница «патология».
+		// T-177: the slow-query log threshold = the threshold of the
+		// monitor loop (monitor.slow_query_min_duration) — one
+		// "pathology" boundary.
 		"log_min_duration_statement": "3000",
-		// T-192: ожидания блокировок дольше deadlock_timeout — в журнал
-		// («process N still waiting …»): имя держателя конвоя доменных
-		// строк в следующем инциденте (25.10 — не восстановим).
+		// T-192: the lock waits longer than deadlock_timeout go into the
+		// log ("process N still waiting …"): the name of the holder of the
+		// convoy of the domain rows in the next incident (25.10 — not
+		// recoverable).
 		"log_lock_waits": "on",
 	}
 	for name, want := range required {
@@ -139,10 +148,11 @@ func TestRequiredSettings(t *testing.T) {
 	}
 }
 
-// TestRanges — требования ТЗ, заданные неравенствами, и бюджетные коридоры:
-// effective_io_concurrency ≥ 200 (§6.3), факторы autovacuum ниже дефолтов
-// PostgreSQL (0.2/0.2/0.1) под партиции 30–50 млн строк, work_mem — на бэкенды
-// в бюджет §3.2, max_wal_size — редкие чекпойнты под NVMe (§10.3).
+// TestRanges — the spec requirements set by the inequalities and the
+// budget corridors: effective_io_concurrency ≥ 200 (§6.3), the autovacuum
+// factors below the PostgreSQL defaults (0.2/0.2/0.1) under the
+// partitions of 30–50 million rows, work_mem — per backends within the
+// budget of §3.2, max_wal_size — rare checkpoints under NVMe (§10.3).
 func TestRanges(t *testing.T) {
 	settings := readConf(t)
 
@@ -165,7 +175,8 @@ func TestRanges(t *testing.T) {
 		}
 	}
 
-	// Бюджет §3.2: shared_buffers ≈ 2 ГБ, весь инстанс ≈ 2,5 ГБ.
+	// The budget of §3.2: shared_buffers ≈ 2 GB, the whole instance ≈
+	// 2.5 GB.
 	if got := parseBytes(t, settings["shared_buffers"]); got < 2<<30 || got > 3<<30 {
 		t.Errorf("shared_buffers = %d байт, коридор бюджета §3.2 — 2–3 ГБ", got)
 	}

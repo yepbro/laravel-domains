@@ -1,16 +1,17 @@
-// Сервис scheduler (ТЗ 5.3, 4.2): главный цикл постановки доменов на
-// проверку — выборка пачек pending с чередованием зон (internal/scheduler
-// DispatchBatch, T-027), перевод в queued с lease и публикация пачек
-// DNSBatch в q:dns (EnqueueBatch/EnqueueLoop, T-028) — и фоновые циклы в
-// тех же OnRun: суточная перепроверка done-доменов (RecheckDaily, T-030),
-// повторные проверки temp_error (RetryTempErrors, T-031), возврат
-// доменов с истёкшим lease (LeaseWatch, T-029) и компенсатор «статус
-// повис» new∧done — ранний recheck потерявших q:http (StaleRequeueLoop,
-// T-270). Публикация — под гейтом
-// backpressure (WatermarkPublisher, T-026). Очередь — Redis Streams
-// (internal/queue, клиент queue.NewClient/RedisQueue); каркас —
-// internal/service: миграции, пул БД (OnDBPool), пробы /livez + /healthz, /metrics,
-// graceful shutdown (ТЗ 3.4).
+// The scheduler service (spec 5.3, 4.2): the main loop of enqueueing
+// domains for checking — selecting pending batches with zone interleaving
+// (internal/scheduler DispatchBatch, T-027), moving them to queued with a
+// lease and publishing DNSBatch batches into q:dns
+// (EnqueueBatch/EnqueueLoop, T-028) — and the background loops in the same
+// OnRun: the daily recheck of done domains (RecheckDaily, T-030), the
+// rechecks of temp_error (RetryTempErrors, T-031), the refund of domains
+// with an expired lease (LeaseWatch, T-029) and the compensator of the
+// "status hung" new∧done — an early recheck of those that lost q:http
+// (StaleRequeueLoop, T-270). The publishing — under the backpressure gate
+// (WatermarkPublisher, T-026). The queue is Redis Streams (internal/queue,
+// the queue.NewClient/RedisQueue client); the framework is
+// internal/service: migrations, the DB pool (OnDBPool), the /livez +
+// /healthz probes, /metrics, graceful shutdown (spec 3.4).
 package main
 
 import (
@@ -32,20 +33,22 @@ import (
 )
 
 func main() {
-	// Ошибка конфигурации — до инициализации логгера: stderr и код 1.
+	// A configuration error — before the logger is initialized: stderr and exit code 1.
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("[scheduler] конфигурация: %v", err)
 	}
 	logger := service.NewLogger("scheduler", cfg)
 
-	// Реестр метрик создаётся здесь (T-077): коллектору глубины backlog
-	// (run ниже) нужны приборы до старта OnRun, каркас отдаёт тот же
-	// реестр через /metrics (Options.Metrics).
+	// The metrics registry is created here (T-077): the collector of the
+	// backlog depth (run below) needs the instruments before OnRun starts,
+	// the framework serves the same registry via /metrics
+	// (Options.Metrics).
 	reg := metrics.New("scheduler")
 
-	// Пул приходит от каркаса после миграций (OnDBPool) и гарантированно
-	// готов до старта OnRun: postgres.dsn обязателен (config.Validate).
+	// The pool comes from the framework after the migrations (OnDBPool)
+	// and is guaranteed to be ready before OnRun starts: postgres.dsn is
+	// required (config.Validate).
 	var pool *pgxpool.Pool
 	if err := service.Run(service.Options{
 		Name:        "scheduler",
@@ -54,16 +57,16 @@ func main() {
 		MetricsAddr: service.EnvOr("METRICS_ADDR", ":9102"),
 		Metrics:     reg,
 		OnDBPool:    func(p *pgxpool.Pool) { pool = p },
-		// Составной AfterConnect-хук пула (db.JoinHooks, T-192): агрегатный
-		// коллектор backlog (T-077) не разбирает параллельные воркеры
-		// (T-171) — путь постановки пачек — индексные сканы
-		// domains_pending_idx без параллельных планов, сессионный SET
-		// его не замедляет, а seq-проходы (backlog, retry temp_error)
-		// перестают забирать все ядра у конвейера; транзакции планировщика
-		// берут строчные локи domains (enqueue, lease-возврат) — потолок
-		// lock_timeout 30 с (T-192) обрезает конвой блокировок
-		// (инцидент 25.10: ожидания до 39 мин) откатом и штатным
-		// повтором пути постановки.
+		// The composite AfterConnect hook of the pool (db.JoinHooks,
+		// T-192): the aggregate backlog collector (T-077) does not tolerate
+		// parallel workers (T-171) — the enqueue path is the index scans of
+		// domains_pending_idx without parallel plans, a session SET does
+		// not slow it down, and the seq passes (backlog, retry temp_error)
+		// stop taking all the cores away from the pipeline; the scheduler
+		// transactions take the row locks of domains (enqueue, the lease
+		// refund) — the cap of lock_timeout 30 s (T-192) truncates the lock
+		// convoy (the 25.10 incident: waits up to 39 min) by a rollback and
+		// a graceful retry of the enqueue path.
 		DBAfterConnect: db.JoinHooks(db.NoParallelGather, db.LockTimeout(db.DefaultLockTimeout)),
 		OnRun:          func(ctx context.Context) error { return run(ctx, cfg, logger, pool, reg) },
 	}); err != nil {
@@ -71,23 +74,26 @@ func main() {
 	}
 }
 
-// run — рабочая логика scheduler: главный цикл постановки пачек в q:dns
-// и фоновые циклы перепроверок (T-030/T-031) горутинами в том же OnRun —
-// они возвращают домены в pending, главный цикл подберёт их следующей
-// пачкой; рядом — коллектор глубины backlog (T-077, ТЗ 5.9): gauge
-// pending/queued из БД, живёт у владельца состояний domains, — цикл
-// освобождения подтверждённого префикса стримов (queue.TrimLoop, T-141:
-// XACK не удаляет записи из стримов, XTRIM MINID по старейшей
-// неподтверждённой записи группы не даёт истории копиться до потолка
-// MAXLEN и бюджета Redis, ТЗ 3.2; scheduler — одиночный хозяин стримов
-// очередей, цикл дёшев: три команды на стрим раз в redis.trim_interval)
-// и цикл гигиены консьюмеров групп (queue.CleanupConsumersLoop, T-155:
-// после рестартов воркеров их pid-консьюмеры остаются в группах
-// навсегда; строго пустые (pending = 0) и неактивные дольше
-// redis.consumer_idle удаляются XGROUP DELCONSUMER — те же дворники
-// стримов тем же темпом trim_interval).
-// Завершение — отмена ctx (graceful shutdown, ТЗ 3.4): цикл дорабатывает
-// текущую пачку, фоновые — текущий проход, все возвращают nil.
+// run — the working logic of scheduler: the main loop of enqueueing
+// batches into q:dns and the background recheck loops (T-030/T-031) by
+// goroutines in the same OnRun — they return the domains to pending, the
+// main loop will pick them up with the next batch; next to them — the
+// collector of the backlog depth (T-077, spec 5.9): a gauge of
+// pending/queued from the DB, it lives with the owner of the domains
+// states, — the loop of the release of the confirmed stream prefix
+// (queue.TrimLoop, T-141: XACK does not remove the records from the
+// streams, XTRIM MINID by the oldest unacknowledged record of the group
+// keeps the history from growing to the MAXLEN cap and the Redis budget,
+// spec 3.2; the scheduler is the single owner of the queue streams, the
+// loop is cheap: three commands per stream once per redis.trim_interval)
+// and the consumer hygiene loop of the groups (queue.CleanupConsumersLoop,
+// T-155: after worker restarts their pid consumers stay in the groups
+// forever; strictly empty (pending = 0) and inactive longer than
+// redis.consumer_idle ones are removed with XGROUP DELCONSUMER — the same
+// stream janitors at the same trim_interval pace).
+// Shutdown — ctx cancellation (graceful shutdown, spec 3.4): the loop
+// finishes the current batch, the background ones — the current pass, all
+// return nil.
 func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgxpool.Pool, reg *metrics.Registry) error {
 	if pool == nil {
 		return errors.New("scheduler: пул БД не получен (postgres.dsn обязателен)")
@@ -95,26 +101,27 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 
 	rdb := queue.NewClient(cfg.Redis.Addr)
 	defer func() { _ = rdb.Close() }()
-	// Публикация пачек — под гейтом backpressure (T-026): длина q:dns
-	// ниже scheduler.queue_high_watermark; MAXLEN/надёжность — T-025 в
-	// RedisQueue.Publish.
+	// Publishing the batches — under the backpressure gate (T-026): the
+	// q:dns depth below scheduler.queue_high_watermark; MAXLEN/reliability
+	// — T-025 in RedisQueue.Publish.
 	gate := queue.NewBackpressureGate(rdb, queue.BackpressureOptions{
 		Watermark: int64(cfg.Scheduler.QueueHighWatermark),
-		MaxLen:    int64(cfg.Redis.MaxLen), // пределы обрезки — для порога гейта (T-026/T-025)
+		MaxLen:    int64(cfg.Redis.MaxLen), // the trim limits — for the gate threshold (T-026/T-025)
 		Log:       logger,
 	})
 	dnsq := queue.NewWatermarkPublisher(queue.NewRedisQueue(rdb, queue.RedisOptions{
-		MaxLen: int64(cfg.Redis.MaxLen), // XADD MAXLEN ~ на каждом стриме (T-025)
+		MaxLen: int64(cfg.Redis.MaxLen), // XADD MAXLEN ~ on every stream (T-025)
 	}), gate)
 
-	// Веса зон выборки (ТЗ 5.3: «опционально в конфиге», T-106): имена
-	// из scheduler.zone_weights разрешаются в zone_id по справочнику
-	// один раз на старте — как и остальной конфиг, веса не меняются на
-	// лету. Имени может не быть в справочнике (зону создаёт ingest
-	// первым файлом, ТЗ 5.1) — Warn: зона проверяется с весом 1 до
-	// рестарта с появившейся зоной. Неактивные зоны разрешаются тоже:
-	// их вес вступит в силу при включении зоны (crawlerctl zones
-	// enable, T-084) без рестарта.
+	// The zone weights of the selection (spec 5.3: "optionally in the
+	// config", T-106): the names from scheduler.zone_weights are resolved
+	// into zone_id by the reference table once at startup — like the rest
+	// of the config, the weights are not changed on the fly. A name may be
+	// missing from the reference table (ingest creates the zone with the
+	// first file, spec 5.1) — a Warn: the zone is checked with weight 1
+	// until a restart with the zone present. The inactive zones are
+	// resolved too: their weight takes effect when the zone is enabled
+	// (crawlerctl zones enable, T-084) without a restart.
 	zoneWeights, unknownZones, err := scheduler.ResolveZoneWeights(ctx, pool, cfg.Scheduler.ZoneWeights)
 	if err != nil {
 		return err
@@ -135,7 +142,7 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		bg <- scheduler.RetryTempErrors(ctx, pool, scheduler.RetryOptions{
 			RetryAfter: cfg.Scheduler.TempErrorRetryAfter.D(),
 			MaxRetries: cfg.Scheduler.TempErrorMaxRetries,
-			Metrics:    reg, // счётчик 40P01-повторов транзакций решений (T-268)
+			Metrics:    reg, // the counter of the 40P01 retries of the decision transactions (T-268)
 			Log:        logger,
 		})
 	}()
@@ -143,46 +150,48 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		bg <- scheduler.LeaseWatch(ctx, pool, scheduler.LeaseOptions{
 			Timeout: cfg.Scheduler.Lease.D(),
 			Log:     logger,
-			// Счётчик ремонтного прохода queued/NULL queued_at (T-255,
-			// ФТ-1.2): ненулевой стационар — сигнал оператору.
+			// The counter of the repair pass of queued/NULL queued_at
+			// (T-255, FR-1.2): a non-zero steady state is a signal to the
+			// operator.
 			Metrics: reg,
 		})
 	}()
 	go func() {
-		// Компенсатор «статус повис» (T-270, ФТ-2.2): часовой проход
-		// возвращает new∧done старше 24 ч (потеря задачи q:http) в
-		// pending; guard по строке new_done_stale — стационарно один
-		// PK-лукап за тик, счётчик
-		// crawler_scheduler_stale_requeued_total — сигнал о новых
-		// потерях.
+		// The "status hung" compensator (T-270, FR-2.2): an hourly pass
+		// returns new∧done older than 24 h (a lost q:http task) to
+		// pending; a guard by the new_done_stale row — steady state is one
+		// PK lookup per tick, the counter
+		// crawler_scheduler_stale_requeued_total is the signal of new
+		// losses.
 		bg <- scheduler.StaleRequeueLoop(ctx, pool, scheduler.StaleRequeueOptions{
 			Log:     logger,
 			Metrics: reg,
 		})
 	}()
 	go func() {
-		// Период — scheduler.backlog_interval (T-161: дефолт 5 мин,
-		// замер §12; 30 с коридора ТЗ 5.9 доступны конфигом).
+		// The period — scheduler.backlog_interval (T-161: the default
+		// 5 min, the §12 measurement; the 30 s of the spec 5.9 corridor
+		// are available via the config).
 		bg <- scheduler.BacklogLoop(ctx, pool, reg, scheduler.BacklogOptions{
 			Interval: cfg.Scheduler.BacklogInterval.D(),
 			Log:      logger,
 		})
 	}()
-	// Освобождение подтверждённого префикса стримов (T-141, ТЗ 4.2
-	// «Дополнение 2026-10-23»): XTRIM MINID по старейшей записи, обязанной
-	// остаться, — рядом с остальными циклами-дворниками планировщика.
+	// The release of the confirmed stream prefix (T-141, spec 4.2
+	// "Supplement 2026-10-23"): XTRIM MINID by the oldest record that must
+	// stay — next to the other janitor loops of the scheduler.
 	go func() {
 		bg <- queue.TrimLoop(ctx, rdb, queue.TrimOptions{
 			Interval: cfg.Redis.TrimInterval.D(),
-			MaxLen:   int64(cfg.Redis.MaxLen), // предел для сигнала застрявшего префикса
+			MaxLen:   int64(cfg.Redis.MaxLen), // the limit for the stuck prefix signal
 			Log:      logger,
 		})
 	}()
-	// Гигиена консьюмеров групп (T-155): строго пустые (pending = 0 —
-	// DELCONSUMER с pending теряет PEL навсегда) и неактивные дольше
-	// redis.consumer_idle pid-консьюмеры мёртвых после рестартов воркеров
-	// вычищаются тем же темпом дворников, что и освобождение префикса
-	// (redis.trim_interval).
+	// The consumer hygiene of the groups (T-155): the strictly empty
+	// (pending = 0 — DELCONSUMER with pending loses the PEL forever) and
+	// inactive longer than redis.consumer_idle pid consumers of the dead
+	// ones after worker restarts are purged at the same janitor pace as
+	// the prefix release (redis.trim_interval).
 	go func() {
 		bg <- queue.CleanupConsumersLoop(ctx, rdb, queue.ConsumerOptions{
 			Interval: cfg.Redis.TrimInterval.D(),
@@ -191,8 +200,9 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		})
 	}()
 
-	// Главный цикл живёт до отмены ctx; после него фоновые циклы уже
-	// завершаются по той же отмене — забираем их результаты.
+	// The main loop lives until the ctx cancellation; after it the
+	// background loops already finish on the same cancellation — we
+	// collect their results.
 	err = scheduler.EnqueueLoop(ctx, pool, dnsq, scheduler.EnqueueOptions{
 		BatchSize:   cfg.Scheduler.BatchSize,
 		ZoneWeights: zoneWeights,

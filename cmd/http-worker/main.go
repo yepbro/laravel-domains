@@ -1,29 +1,35 @@
-// Сервис http-worker (ТЗ 5.5, 4.2, 3.4): HTTP-этап проверки доменов.
-// Потребляет задачи q:http (HTTPTask T-024: домен + DNS-живые субдомены с
-// адресами и CNAME) группой потребителей; для каждого субдомена — проверки
-// https и http цепочками редиректов (internal/httpfetch: транспорт с
-// лимитами T-049, редиректы и meta refresh T-048, TLS-атрибуты T-050,
-// кодировки T-051, честный UA T-052), параллельно внутри задачи с общим
-// кэшем «итоговый URL → результат» (ТЗ 5.5 п. 6); вариант-логика T-054,
-// алиасы T-055 (сравнение по хэшам), SPA-эвристика T-057 — internal/
-// httpworker (T-053). Каждая скачанная страница немедленно сохраняется
-// ранним Put в ContentStore (T-147: паки T-042, словарь zstd T-043, дедуп
-// по хэшу §8; тела в памяти слота не удерживаются — контроль диска T-046 —
-// DiskWatchLoop); сверка ссылок ранних Put — ContentSaver (T-056) в хуке
-// Options.OnResult до XACK: оригиналы наследуют свои ссылки, лишние
-// снимаются Delete, затем результат домена записывается в
-// subdomain_results одной транзакцией со свопом ссылок на контент
-// (Recorder T-058: статус alive/no_http/temp_error, домен done, §7) и
-// каждая запись публикуется в q:analyze (Result, T-024) — вся цепочка
-// до XACK (ТЗ 4.2), подтверждение q:http — паттерном Processing (T-025).
-// SPA-записи публикуются в q:render (T-066, renderq.go): свободная
-// очередь — сразу после фиксации, переполнение — флаг render_pending той
-// же транзакцией без задержки XACK (§5.6), доработка — фоновым проходом
-// RequeueRenderPending (повторный SPA-вердикт по сохранённому контенту).
-// Хосты редиректов резолвятся «через тот же резолвер» (ТЗ 5.5 п. 2):
-// dnsclient с лимитами T-035 → адаптер httpworker.DNSLookup → кэш
-// CachingResolver. Каркас — internal/service: миграции, пул БД,
-// пробы /livez + /healthz, /metrics, graceful shutdown.
+// The http-worker service (spec 5.5, 4.2, 3.4): the HTTP stage of the
+// domain check. It consumes the q:http tasks (HTTPTask T-024: a domain +
+// the DNS-live subdomains with addresses and CNAME) with a consumer
+// group; for each subdomain — the https and http checks by the redirect
+// chains (internal/httpfetch: the transport with the limits T-049, the
+// redirects and meta refresh T-048, the TLS attributes T-050, the
+// encodings T-051, the honest UA T-052), in parallel inside the task with
+// the common cache "final URL → result" (spec 5.5 item 6); the
+// variant-logic T-054, the aliases T-055 (a comparison by the hashes),
+// the SPA heuristic T-057 — internal/httpworker (T-053). Every downloaded
+// page is immediately stored by an early Put into the ContentStore
+// (T-147: the packs T-042, the zstd dictionary T-043, the dedup by hash
+// §8; the bodies are not held in the slot memory — the disk control
+// T-046 — DiskWatchLoop); the reconciliation of the references of the
+// early Puts — ContentSaver (T-056) in the Options.OnResult hook before
+// the XACK: the originals inherit their references, the extra ones are
+// released with Delete, then the domain result is written into
+// subdomain_results in one transaction with the swap of the content
+// references (Recorder T-058: the status alive/no_http/temp_error, the
+// domain done, §7) and each record is published to q:analyze (Result,
+// T-024) — the whole chain before the XACK (spec 4.2), the q:http
+// acknowledgment — by the Processing pattern (T-025).
+// The SPA records are published to q:render (T-066, renderq.go): a free
+// queue — right after the commit, an overflow — the render_pending flag
+// by the same transaction without delaying the XACK (§5.6), the
+// finishing — the background RequeueRenderPending pass (a repeated SPA
+// verdict over the stored content).
+// The redirect hosts are resolved "via the same resolver" (spec 5.5
+// item 2): dnsclient with the T-035 limits → the httpworker.DNSLookup
+// adapter → the CachingResolver cache. The framework is
+// internal/service: migrations, the DB pool, the /livez + /healthz
+// probes, /metrics, graceful shutdown.
 package main
 
 import (
@@ -54,62 +60,68 @@ import (
 	"crawler/internal/service"
 )
 
-// afterConnectHooks — AfterConnect-хуки пула http-worker в порядке
-// применения (T-201): сериальность сканирующих проходов сервиса
-// (db.NoParallelGather) и потолок строчных блокировок write-пула
-// (db.LockTimeout). Именованный список — шов wiring-теста (main_test.go):
-// до T-201 проводка хуков собиралась в main без шва и тестом не
-// закреплялась вовсе; композиция — db.JoinHooks в main.
+// afterConnectHooks — the AfterConnect hooks of the http-worker pool in
+// the order of application (T-201): the seriality of the scanning passes
+// of the service (db.NoParallelGather) and the cap of the row locks of
+// the write pool (db.LockTimeout). A named list — the seam of the wiring
+// test (main_test.go): before T-201 the hook wiring was assembled in main
+// without a seam and was not pinned by any test at all; the composition —
+// db.JoinHooks in main.
 var afterConnectHooks = []db.AfterConnectFunc{
-	// T-201: retention-дренаж (RetentionLoop, retentionSelectSQL —
-	// время-форма T-185) на голодном CPU собирал Gather Merge — 2
-	// параллельных воркера (EXPLAIN ANALYZE 26.10) — на том же сервисе,
-	// где работают HTTP-слоты; сериальность отдаёт стенку фонового
-	// прохода в обмен на CPU-справедливость (темп задаёт
-	// retention_batch/интервал, диск T-166 дренируется часами).
+	// T-201: the retention drain (RetentionLoop, retentionSelectSQL —
+	// the time-form T-185) on a starved CPU assembled a Gather Merge —
+	// 2 parallel workers (the EXPLAIN ANALYZE of 26.10) — on the same
+	// service where the HTTP slots work; the seriality gives away the
+	// wall of the background pass in exchange for the CPU fairness (the
+	// pace is set by retention_batch/the interval, the disk T-166 is
+	// drained for hours).
 	db.NoParallelGather,
-	// T-192: см. комментарий DBAfterConnect в main.
+	// T-192: see the DBAfterConnect comment in main.
 	db.LockTimeout(db.DefaultLockTimeout),
 }
 
-// scanGate — семафор единственности тяжёлых фоновых сканов сервиса
-// (db.ScanGate, T-271): выборки retention-дренажа и позднего
-// переиздателя рендера не совпадают в PostgreSQL — инцидент
-// 08–09.11.2026 (пять OOM-киллов PG за ночь: два деградировавших
-// курсорных SELECT по ≈1 ГиБ рабочих структур поверх shared_buffers
-// 2 ГиБ; сами планы закреплены SET LOCAL у выборок, гейт — страховка
-// от совпадения остаточно тяжёлых сканов). Именованная переменная —
-// шов wiring-теста (main_test.go, стиль afterConnectHooks): проводка —
-// поле Gate в опциях обоих циклов в run.
+// scanGate — the uniqueness semaphore of the heavy background scans of
+// the service (db.ScanGate, T-271): the selections of the retention
+// drain and the late render re-publisher must not coincide in PostgreSQL
+// — the incident of 08–09.11.2026 (five PG OOM-kills overnight: two
+// degraded cursor SELECTs of ≈1 GiB of working structures on top of
+// 2 GiB shared_buffers; the plans themselves are pinned with SET LOCAL
+// by the selections, the gate — the guard against a coincidence of the
+// residually heavy scans). A named variable — the seam of the wiring
+// test (main_test.go, the afterConnectHooks style): the wiring — the
+// Gate field in the options of both loops in run.
 var scanGate = make(db.ScanGate, 1)
 
 func main() {
-	// Ошибка конфигурации — до инициализации логгера: stderr и код 1.
+	// A configuration error — before the logger is initialized: stderr and exit code 1.
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("[http-worker] конфигурация: %v", err)
 	}
 	logger := service.NewLogger("http-worker", cfg)
 
-	// Мягкий потолок памяти Go-рантайма (T-163, http.mem_limit): GC
-	// удерживает кучу ниже порога сам, не доводя anon до MemoryHigh/
-	// MemoryMax юнита — reclaim-штормы ядра и OOM-kill дороже лишних
-	// циклов GC (фаталы T-157: 120 095 событий MemoryHigh, пик
-	// 900.5 MiB = MemoryMax). Ставится до рабочих аллокаций; page cache
-	// записи паков в учёт рантайма не входит — потолок ниже MemoryHigh
-	// с запасом (дефолт 768 MiB против 850M/900M). 0 — выключено.
+	// The soft memory cap of the Go runtime (T-163, http.mem_limit): the
+	// GC keeps the heap below the threshold itself, without bringing anon
+	// up to the MemoryHigh/MemoryMax of the unit — the reclaim storms of
+	// the kernel and an OOM-kill are costlier than the extra GC cycles
+	// (the fatals of T-157: 120,095 MemoryHigh events, the peak
+	// 900.5 MiB = MemoryMax). It is set before the working allocations;
+	// the page cache of the pack writes is not part of the runtime
+	// accounting — the cap is below MemoryHigh with a margin (the default
+	// 768 MiB against 850M/900M). 0 — off.
 	if limit := cfg.HTTP.MemLimit; limit > 0 {
 		debug.SetMemoryLimit(limit.B())
 		logger.Info("мягкий потолок памяти Go-рантайма", "limit", limit.String())
 	}
 
-	// Пул приходит от каркаса после миграций (OnDBPool) и гарантированно
-	// готов до старта OnRun: postgres.dsn обязателен (config.Validate);
-	// им пользуется и хранилище контента (строки contents, T-042/T-056),
-	// и запись результата (subdomain_results/domains, T-058). Реестр
-	// метрик — здесь же (T-077): приборы HTTP-этапа и коллектор длины
-	// q:http получают его до старта OnRun, каркас отдаёт тот же реестр
-	// через /metrics.
+	// The pool comes from the framework after the migrations (OnDBPool)
+	// and is guaranteed to be ready before OnRun starts: postgres.dsn is
+	// required (config.Validate); it is used both by the content store
+	// (the contents rows, T-042/T-056) and by writing the result
+	// (subdomain_results/domains, T-058). The metrics registry — right
+	// here (T-077): the instruments of the HTTP stage and the collector
+	// of the q:http depth receive it before OnRun starts, the framework
+	// serves the same registry via /metrics.
 	reg := metrics.New("http-worker")
 	var pool *pgxpool.Pool
 	if err := service.Run(service.Options{
@@ -119,19 +131,19 @@ func main() {
 		MetricsAddr: service.EnvOr("METRICS_ADDR", ":9104"),
 		Metrics:     reg,
 		OnDBPool:    func(p *pgxpool.Pool) { pool = p },
-		// Составной AfterConnect-хук пула (db.JoinHooks, T-192):
-		// NoParallelGather (T-201) — агрегатные/сканирующие операторы
-		// фоновых циклов сервиса (retention-дренаж, EXPLAIN 26.10:
-		// Parallel Index Scan + Gather Merge) не разбирают параллельные
-		// воркеры на CPU HTTP-слотов; точечные операторы слотов (PK,
-		// unnest) параллелизм не используют — поведение пула меняется
-		// только у фоновых проходов (проход доработки рендера T-066 уже
-		// сериален по своей природе). LockTimeout (T-192) — сессионный
-		// потолок lock_timeout 30 с: запись результатов и чтение
-		// счётчиков (FOR UPDATE) берут строчные локи domains; конвой
-		// блокировок 25.10 (держатель ≈37 мин, жертвы до 39 мин)
-		// обрезается откатом транзакции и повтором доставки задачи
-		// (at-least-once, ТЗ §3.4).
+		// The composite AfterConnect hook of the pool (db.JoinHooks,
+		// T-192): NoParallelGather (T-201) — the aggregate/scanning
+		// operators of the background loops of the service (the retention
+		// drain, the EXPLAIN of 26.10: Parallel Index Scan + Gather Merge)
+		// do not tolerate parallel workers on the CPUs of the HTTP slots;
+		// the point operators of the slots (PK, unnest) do not use the
+		// parallelism — the pool behavior changes only for the background
+		// passes (the render finishing pass T-066 is already serial by its
+		// nature). LockTimeout (T-192) — the session cap of lock_timeout
+		// 30 s: writing the results and reading the counters (FOR UPDATE)
+		// take the row locks of domains; the 25.10 lock convoy (the holder
+		// ≈37 min, the victims up to 39 min) is truncated by a transaction
+		// rollback and a task delivery retry (at-least-once, spec §3.4).
 		DBAfterConnect: db.JoinHooks(afterConnectHooks...),
 		OnRun:          func(ctx context.Context) error { return run(ctx, cfg, logger, pool, reg) },
 	}); err != nil {
@@ -139,16 +151,19 @@ func main() {
 	}
 }
 
-// run — рабочая логика http-worker: клиент DNS (резолв хостов редиректов,
-// ТЗ 5.5 п. 2) под лимитами T-035 → транспорт httpfetch с лимитами T-049
-// и TLS без проверки сертификата (ТЗ 5.5 п. 3: контент нужен всегда,
-// результат проверки сертификата сохраняет TLSInfo T-050) → хранилище
-// контента (T-056/T-147: паки T-042 + словарь T-043 + контроль диска
-// T-046 — ранние Put страниц и сверка ссылок) → воркер (кэш итоговых
-// URL, варианты, алиасы, SPA) с приборами этапа (T-077) и коллектор
-// длины q:http (метрика длин очередей, ТЗ 5.9) → цикл q:http. Завершение
-// — отмена ctx (graceful shutdown, ТЗ 3.4): начатые задачи дорабатывают
-// или возвращаются очереди повторной доставкой (Processing, T-025).
+// run — the working logic of http-worker: a DNS client (the resolution
+// of the redirect hosts, spec 5.5 item 2) under the T-035 limits → the
+// httpfetch transport with the T-049 limits and TLS without the
+// certificate check (spec 5.5 item 3: the content is needed always, the
+// certificate check result is preserved by TLSInfo T-050) → the content
+// store (T-056/T-147: the packs T-042 + the dictionary T-043 + the disk
+// control T-046 — the early Puts of the pages and the reference
+// reconciliation) → the worker (the final URL cache, the variants, the
+// aliases, the SPA) with the stage instruments (T-077) and the collector
+// of the q:http depth (the queue depth metric, spec 5.9) → the q:http
+// loop. Shutdown — ctx cancellation (graceful shutdown, spec 3.4): the
+// started tasks finish or are refunded to the queue for redelivery
+// (Processing, T-025).
 func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgxpool.Pool, reg *metrics.Registry) error {
 	if pool == nil {
 		return errors.New("http-worker: пул БД не получен (postgres.dsn обязателен)")
@@ -164,15 +179,17 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		return err
 	}
 
-	// Транспорт этапа: NewOptions включает лимиты всегда (T-049) и
-	// подставляет дефолтный честный UA (T-052); резолв хостов редиректов —
-	// тем же резолвером DNS-этапа с кэшем (ТЗ 5.5 п. 2, CachingResolver
-	// T-047, адаптер httpworker.DNSLookup); InsecureSkipVerify — ТЗ 5.5
-	// п. 3. Ожидание слота per-IP семафора — в гистограмму :9104 (T-165):
-	// NewMetrics идемпотентен (T-076), воркер ниже делит те же коллекторы;
-	// тот же met держит счётчик 40P01-повторов транзакции записи
-	// (crawler_db_deadlock_retried_total, T-268) — передаётся записателю
-	// результата ниже.
+	// The stage transport: NewOptions always enables the limits (T-049)
+	// and substitutes the default honest UA (T-052); the resolution of the
+	// redirect hosts — by the same resolver of the DNS stage with a cache
+	// (spec 5.5 item 2, CachingResolver T-047, the httpworker.DNSLookup
+	// adapter); InsecureSkipVerify — spec 5.5 item 3. Waiting for a
+	// per-IP semaphore slot — into the :9104 histogram (T-165):
+	// NewMetrics is idempotent (T-076), the worker below shares the same
+	// collectors; the same met holds the counter of the 40P01 retries of
+	// the write transaction
+	// (crawler_db_deadlock_retried_total, T-268) — it is passed to the
+	// result recorder below.
 	met := httpworker.NewMetrics(reg)
 	opts := httpfetch.NewOptions(cfg.HTTP)
 	opts.Limits.OnPerIPWait = met.PerIPWait
@@ -182,12 +199,13 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	fetcher := httpfetch.NewFetcher(opts)
 	defer fetcher.CloseIdleConnections()
 
-	// Хранилище контента (T-056, ТЗ 5.7): словарь zstd (T-043)
-	// активируется до открытия — блоки сжимаются активным словарём
-	// (CompressWithDict), его ID попадает в заголовок создаваемых паков;
-	// отсутствующий файл — не ошибка (сжатие без словаря). Лимиты —
-	// секция content: max_store_bytes (ErrTooLarge), disk_free_percent
-	// (ErrStoreFull, ТЗ 8), pack_size (ротация).
+	// The content store (T-056, spec 5.7): the zstd dictionary (T-043) is
+	// activated before opening — the blocks are compressed with the active
+	// dictionary (CompressWithDict), its ID lands in the header of the
+	// created packs; a missing file — not an error (compression without a
+	// dictionary). The limits — the content section: max_store_bytes
+	// (ErrTooLarge), disk_free_percent (ErrStoreFull, spec 8), pack_size
+	// (the rotation).
 	if _, err := content.SetDictFile(cfg.Content.ZstdDictionary, logger); err != nil {
 		return err
 	}
@@ -196,68 +214,72 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		PackSize:        cfg.Content.PackSize.B(),
 		MaxStoreBytes:   cfg.Content.MaxStoreBytes.B(),
 		DiskFreePercent: cfg.Content.DiskFreePercent,
-		// OnStoreFull — хук алерта T-080 (метрики): до него события
-		// «место ниже порога» видны в Warn-логах DiskWatchLoop и
-		// ContentSaver.
+		// OnStoreFull — the hook of the T-080 alert (the metrics): before
+		// it the "space below the threshold" events are visible in the Warn
+		// logs of DiskWatchLoop and ContentSaver.
 	})
 	if err != nil {
 		return err
 	}
 	defer func() { _ = store.Close() }()
-	// Словарь против новейшего пака (T-043): прежний словарь реестра
-	// даёт читаемость старых кадров (T-103); расхождение без файла
-	// в реестре видно сразу при старте.
+	// The dictionary against the newest pack (T-043): the previous
+	// registry dictionary keeps the old frames readable (T-103); a
+	// mismatch without a file in the registry is visible right at the
+	// startup.
 	content.WarnDictMismatch(store.Dir(), logger)
 
-	// Клиент Redis (q:http/q:analyze/q:render) — до запуска фоновых
-	// циклов: его defer-закрытие обязано стоять в LIFO раньше джойна
-	// (ниже), гейт и очереди собираются дальше по проводке.
+	// The Redis client (q:http/q:analyze/q:render) — before the
+	// background loops are started: its defer-close must stand in the LIFO
+	// earlier than the join (below), the gate and the queues are assembled
+	// further down the wiring.
 	rdb := queue.NewClient(cfg.Redis.Addr)
 	defer func() { _ = rdb.Close() }()
 
-	// Джойн фоновых циклов (T-223): производная отмена + WaitGroup.
-	// Каркас отменяет ctx OnRun только после его возврата (internal/
-	// service: cancelRun после onRunDone) — ранний выход run из
-	// конструкторов ниже или паника обязаны останавливать циклы сами,
-	// иначе defer-закрытия rdb/store/транспорта закроют ресурсы под
-	// серединой прохода компактификации/retention; до T-223 CompactLoop
-	// и RetentionLoop жили fire-and-forget даже на штатной остановке —
-	// три приёма bg-канала их не накрывали, четвёртый сендер вис бы на
-	// канале ёмкости 3. Джойн — defer, зарегистрированный ПОСЛЕ
-	// defer-закрытий выше → исполняется ДО них (LIFO). WaitGroup, а не
-	// канал ёмкости (стиль scheduler/monitor): джойн ждёт ровно
-	// запущенное (Add/Done по месту запуска) — ранний выход с частью
-	// циклов не виснет на «недостающих» приёмах, связку «ёмкость =
-	// сендеры = приёмы» держать руками не нужно. Ошибки циклов
-	// отбрасываются сознательно: каждый цикл логирует свои сбои сам.
-	// Инварианты закреплены структурным тестом TestRunBackgroundJoin
-	// (main_test.go).
+	// The join of the background loops (T-223): the derived cancellation +
+	// a WaitGroup. The framework cancels the ctx of OnRun only after it
+	// returns (internal/service: cancelRun after onRunDone) — an early
+	// exit of run from the constructors below or a panic must stop the
+	// loops themselves, otherwise the defer-closes of rdb/store/the
+	// transport would close the resources in the middle of a
+	// compaction/retention pass; before T-223 CompactLoop and
+	// RetentionLoop lived fire-and-forget even on a graceful stop — the
+	// three receptions of the bg channel did not cover them, a fourth
+	// sender would hang on the channel of capacity 3. The join is a defer
+	// registered AFTER the defer-closes above → it executes BEFORE them
+	// (LIFO). A WaitGroup, not a channel of a capacity (the
+	// scheduler/monitor style): the join waits for exactly what was
+	// started (Add/Done at the launch site) — an early exit with a part of
+	// the loops does not hang on the "missing" receptions, and the
+	// "capacity = senders = receptions" coupling does not need to be kept
+	// by hand. The loop errors are discarded deliberately: each loop logs
+	// its own failures. The invariants are pinned by the structural test
+	// TestRunBackgroundJoin (main_test.go).
 	ctx, cancel := context.WithCancel(ctx)
 	var bg sync.WaitGroup
 	defer func() {
-		// Штатно ctx уже отменён каркасом к моменту возврата run;
-		// ранний выход/паника гасят ещё живые циклы здесь — до
-		// defer-закрытий (LIFO).
+		// Normally the ctx is already cancelled by the framework by the
+		// moment run returns; an early exit/a panic stop the still living
+		// loops here — before the defer-closes (LIFO).
 		cancel()
 		bg.Wait()
 	}()
 
-	// Контроль свободного места каталога контента (T-046, ТЗ 8):
-	// периодический наблюдатель горутиной (не зависит от цикла задач),
-	// Warn и событие при входе в паузу записи/восстановлении; завершается
-	// с отменой ctx.
+	// The free space control of the content directory (T-046, spec 8):
+	// a periodic watcher by a goroutine (it does not depend on the task
+	// loop), a Warn and an event on entering the write pause/its
+	// recovery; it finishes on the ctx cancellation.
 	bg.Add(1)
 	go func() {
 		defer bg.Done()
 		_ = content.DiskWatchLoop(ctx, store, content.DiskWatchOptions{Log: logger})
 	}()
 
-	// Фоновая компактификация паков (T-045, ТЗ 5.7): единственный
-	// механизм физического освобождения места и удаления мёртвых строк
-	// contents — без неё ErrStoreFull не снимается никогда. Цикл один на
-	// хранилище — здесь, рядом с DiskWatchLoop (проходам не нужен
-	// параллелизм; одновременный запуск во втором писателе формально
-	// допустим, но бесполезен). Завершается с отменой ctx.
+	// The background compaction of the packs (T-045, spec 5.7): the only
+	// mechanism of physically freeing the space and deleting the dead
+	// contents rows — without it ErrStoreFull is never lifted. The loop is
+	// one per store — here, next to DiskWatchLoop (the passes do not need
+	// parallelism; a simultaneous start in a second writer is formally
+	// allowed but useless). It finishes on the ctx cancellation.
 	bg.Add(1)
 	go func() {
 		defer bg.Done()
@@ -269,54 +291,56 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		return err
 	}
 
-	// Очередь: потребление q:http и публикация q:analyze — под гейтом
-	// backpressure (T-026: порог общий для гейтируемых стримов;
-	// Consume/Ack проходят прозрачно, как у dns-worker). Публикация
-	// q:render идёт мимо WatermarkPublisher, через ту же RedisQueue
-	// (T-066, §5.6): ожидание ёмкости задержало бы XACK задачи q:http —
-	// при переполнении домен получает флаг render_pending вместо
-	// публикации (renderq.go; порог ёмкости —
-	// render.queue_high_watermark, T-174, ниже).
+	// Queue: the consumption of q:http and the publishing of q:analyze —
+	// under the backpressure gate (T-026: the threshold is common for the
+	// gated streams; Consume/Ack pass through transparently, as by
+	// dns-worker). The q:render publishing goes past the
+	// WatermarkPublisher, through the same RedisQueue (T-066, §5.6):
+	// waiting for the capacity would delay the XACK of the q:http task —
+	// on an overflow the domain gets the render_pending flag instead of
+	// the publishing (renderq.go; the capacity threshold —
+	// render.queue_high_watermark, T-174, below).
 	gate := queue.NewBackpressureGate(rdb, queue.BackpressureOptions{
 		Watermark: int64(cfg.Scheduler.QueueHighWatermark),
-		MaxLen:    int64(cfg.Redis.MaxLen), // пределы обрезки — для порога гейта (T-026/T-025)
+		MaxLen:    int64(cfg.Redis.MaxLen), // the trim limits — for the gate threshold (T-026/T-025)
 		Log:       logger,
 	})
 	rawQ := queue.NewRedisQueue(rdb, queue.RedisOptions{
-		MaxLen: int64(cfg.Redis.MaxLen), // XADD MAXLEN ~ на каждом стриме (T-025)
+		MaxLen: int64(cfg.Redis.MaxLen), // XADD MAXLEN ~ on every stream (T-025)
 	})
 	q := queue.NewWatermarkPublisher(rawQ, gate)
 
-	// Возврат зависших доставок q:http (T-025): RecoverLoop в воркере —
-	// клейм XAUTOCLAIM, исчерпание попыток — q:dead; параметры надёжности
-	// и темпа — секция redis (max_attempts, claim_min_idle,
-	// recover_batch, recover_interval — T-153). OnBury — счётчик смертей
-	// crawler_queue_dead_buried_total (T-154): bury молчаливым быть не
-	// должно (пост-мортем 22.10).
+	// Refunding the stuck q:http deliveries (T-025): RecoverLoop in the
+	// worker — the XAUTOCLAIM claim, the attempt exhaustion — q:dead; the
+	// reliability and pace parameters — the redis section (max_attempts,
+	// claim_min_idle, recover_batch, recover_interval — T-153). OnBury —
+	// the counter of deaths crawler_queue_dead_buried_total (T-154): a
+	// bury must not be silent (the 22.10 post-mortem).
 	rel := queue.NewReliab(rdb, rawQ, queue.ReliabOptions{
 		MaxAttempts: cfg.Redis.MaxAttempts,
 		MinIdle:     cfg.Redis.ClaimMinIdle.D(),
 		OnBury:      metrics.NewDeadBuriedHook(reg),
-		// OnBuryUnidentified — карантин неидентифицируемых записей
-		// (без task_id): crawler_queue_dead_unidentified_total
-		// (T-260, ФТ-6.1) — терминальная ветка bury.
+		// OnBuryUnidentified — the quarantine of unidentifiable records
+		// (without a task_id): crawler_queue_dead_unidentified_total
+		// (T-260, FR-6.1) — the terminal bury branch.
 		OnBuryUnidentified: metrics.NewDeadUnidentifiedHook(reg),
 	})
 
-	// Очередь рендера: неблокирующая проверка ёмкости (глубина через гейт
-	// T-026) + публикация без ожидания ёмкости. Порог ёмкости —
-	// отдельный render.queue_high_watermark (T-174, renderQueueWatermark
-	// ниже): общий scheduler.queue_high_watermark держал ворота
-	// открытыми при лаге 98,4 тыс. из 100 тыс. (равновесие 24.10,
-	// этап 25 tasks.md) — приток равнялся потреблению, дренаж долга
-	// нулевой.
+	// The render queue: a non-blocking capacity check (the depth via the
+	// gate T-026) + publishing without waiting for the capacity. The
+	// capacity threshold — a separate render.queue_high_watermark (T-174,
+	// renderQueueWatermark below): the common scheduler.queue_high_watermark
+	// kept the gate open at a lag of 98.4k out of 100k (the equilibrium of
+	// 24.10, the stage 25 of tasks.md) — the inflow equaled the
+	// consumption, the debt drain was zero.
 	renderQ, err := httpworker.NewRenderQueue(rawQ, gate, renderQueueWatermark(cfg), logger)
 	if err != nil {
 		return err
 	}
 
-	// Длина потребляемого стрима q:http → crawler_queue_depth (T-077):
-	// источник глубины — гейт (тот же клиент Redis), завершается отменой ctx.
+	// The depth of the consumed q:http stream → crawler_queue_depth
+	// (T-077): the depth source — the gate (the same Redis client), it
+	// finishes on the ctx cancellation.
 	bg.Add(1)
 	go func() {
 		defer bg.Done()
@@ -329,17 +353,19 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		return err
 	}
 
-	// Проход доработки рендера (T-066, §5.6 «дорабатываются позже»):
-	// домены с флагом render_pending → повторный SPA-вердикт по
-	// сохранённому контенту → публикация q:render при свободной очереди.
-	// Приоритет зон (T-184, решение (а) T-176): непустой
-	// render.requeue_deprioritized_zones (прод — парковочные .рф,
-	// xn--p1ai) дренажируется по остаточному принципу — пачка прохода
-	// собирается сначала доменами остальных зон; наблюдаемость — поле
-	// deprioritized строки «проход доработки рендера» в журнале.
-	// Отдельной горутиной в том же OnRun (образец CleanupDeleted
-	// T-020/T-021): не зависит от цикла задач q:http, завершается
-	// отменой ctx.
+	// The render finishing pass (T-066, §5.6 "they are finished later"):
+	// the domains with the render_pending flag → a repeated SPA verdict
+	// over the stored content → publishing to q:render when the queue is
+	// free.
+	// The zone priority (T-184, the decision (a) of T-176): a non-empty
+	// render.requeue_deprioritized_zones (production — the parking .рф,
+	// xn--p1ai) is drained gets-the-leftovers — the batch of the pass is
+	// collected first by the domains of the other zones; the observability
+	// — the deprioritized field of the "render finishing pass" line in the
+	// log.
+	// By a separate goroutine in the same OnRun (the CleanupDeleted sample
+	// T-020/T-021): it does not depend on the q:http task loop, it
+	// finishes on the ctx cancellation.
 	bg.Add(1)
 	go func() {
 		defer bg.Done()
@@ -349,19 +375,21 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		})
 	}()
 
-	// Поздний переиздатель рендера (T-259, ТЗ-fsm §3 ФТ-5.3): фоновый
-	// проход переиздаёт в q:render «вечно молодые» записи (не
-	// отрендеренные, без маркера, с целью рендера) старше 6 ч — без бита
-	// render_pending у домена (долгом владеет проход доработки выше) и
-	// без непотреблённых сообщений q:render/q:render-fallback (интерлок
-	// снимком стримов — адаптер retentionPending, тот же, что у защиты
-	// retention). Лечит потерю MAXLEN-усечённых фолбэк-задач и
-	// потерянные публикации: состояние записи перестаёт зависеть от
-	// выживания сообщения в стриме. Курсор по PK, пачка/интервал —
-	// опции цикла; наблюдаемость —
-	// crawler_render_late_republish_total (httpworker.Metrics). Выборка
-	// — тяжёлый скан под общим гейтом scanGate (T-271: не совпадать с
-	// retention-дренажем в PostgreSQL).
+	// The late render re-publisher (T-259, the TZ-fsm spec §3 FR-5.3): a
+	// background pass re-publishes to q:render the "forever young" records
+	// (not rendered, without a marker, with a render target) older than
+	// 6 h — without the render_pending bit on the domain (the finishing
+	// pass above owns the debt) and without unconsumed messages of
+	// q:render/q:render-fallback (an interlock by the snapshot of the
+	// streams — the retentionPending adapter, the same one as the
+	// retention guard). It heals the loss of the MAXLEN-truncated
+	// fallback tasks and the lost publications: the state of the record
+	// stops depending on the survival of the message in the stream. A
+	// cursor by PK, the batch/interval — the loop options; the
+	// observability — crawler_render_late_republish_total
+	// (httpworker.Metrics). The selection — a heavy scan under the common
+	// scanGate gate (T-271: not to coincide with the retention drain in
+	// PostgreSQL).
 	bg.Add(1)
 	go func() {
 		defer bg.Done()
@@ -369,41 +397,47 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 			retentionPending{rdb: rdb}, met, httpworker.LateOptions{
 				Log:  logger,
 				Gate: scanGate,
-				// Потолок выборки пачки переиздателя (T-274, значение
-				// T-273): конфиг-ручка на случай недооценки — смена
-				// потолка без деплоя.
+				// The ceiling of the re-publisher batch selection (T-274, the
+				// value of T-273): a knob in case of an underestimation —
+				// a ceiling change without a deploy.
 				SelectTimeout: cfg.Render.LateSelectTimeout.D(),
 			})
 	}()
 
-	// Retention контента и трим jsonb не-находок (T-166, ТЗ 5.7: контент
-	// хранится, пока нужно переприменять правила; решение оператора
-	// 2026-10-23 — диск без новых мощностей): записи старше
-	// content.retention, не Laravel-находки и не ждущие рендера теряют
-	// content_hash (−1 contents.refcount той же транзакцией, нулевые
-	// строки удаляются) и тяжёлые jsonb; паспорт строки остаётся для
-	// domain_info и дашборда. Интерлок — глубина q:analyze (гейт T-026):
-	// анализатор не успевает — тела ещё нужны, проход пропускается;
-	// порог 0 в конфиге — общий scheduler.queue_high_watermark (тем же
-	// критерием «строго ниже порога» работает гейт публикации q:analyze).
-	// Точная защита (T-166/T-167): записи, чьи сообщения ещё не потреблены
-	// q:render/q:analyze, исключаются из пачек по снимку стримов —
-	// retentionPending ниже, тем же Redis-клиентом, что и гейт.
-	// Цикл здесь же, где компактификация: purge лишь готовит мёртвые
-	// блоки, место возвращает её часовой проход; второму владельцу он не
-	// нужен (охраны делают параллельный запуск безопасным, но
-	// бесполезным). Завершается отменой ctx. Выборка пачки — тяжёлый
-	// скан под общим гейтом scanGate (T-271: не совпадать с поздним
-	// переиздателем рендера в PostgreSQL) в tx-оболочке закрепления
-	// плана с потолком statement_timeout.
+	// The content retention and the jsonb trim of the non-finds (T-166,
+	// spec 5.7: the content is stored while the rules need to be
+	// reapplied; the operator decision of 2026-10-23 — the disk without
+	// new capacities): the records older than content.retention, not
+	// Laravel finds and not waiting for a render lose their content_hash
+	// (−1 contents.refcount by the same transaction, the zero rows are
+	// deleted) and the heavy jsonb; the passport of the row stays for
+	// domain_info and the dashboard. The interlock — the q:analyze depth
+	// (the gate T-026): if the analyzer does not keep up, the bodies are
+	// still needed, the pass is skipped; a threshold of 0 in the config —
+	// the common scheduler.queue_high_watermark (the publishing gate of
+	// q:analyze works by the same "strictly below the threshold"
+	// criterion).
+	// The precise guard (T-166/T-167): the records whose messages are not
+	// yet consumed by q:render/q:analyze are excluded from the batches by
+	// the snapshot of the streams — retentionPending below, by the same
+	// Redis client as the gate.
+	// The loop right here where the compaction is: the purge only
+	// prepares the dead blocks, the hourly compaction pass returns the
+	// space; a second owner does not need it (the guards make a parallel
+	// start safe but useless). It finishes on the ctx cancellation. The
+	// batch selection — a heavy scan under the common scanGate gate
+	// (T-271: not to coincide with the late render re-publisher in
+	// PostgreSQL) in a tx wrapper of plan pinning with a
+	// statement_timeout cap.
 	retentionWatermark := int64(cfg.Content.RetentionAnalyzeWatermark)
 	if retentionWatermark <= 0 {
 		retentionWatermark = int64(cfg.Scheduler.QueueHighWatermark)
 	}
-	// Один экземпляр приборов retention на оба хука: итоги проходов
-	// (OnPass) и ошибки (OnError — crawler_content_retention_errors_
-	// total, T-273: до этого ошибки проходов были видны только в
-	// journalctl, метрики :9104 стояли в нуле при живых WARN-ах).
+	// One retention instruments instance for both hooks: the pass totals
+	// (OnPass) and the errors (OnError —
+	// crawler_content_retention_errors_total, T-273: before this the pass
+	// errors were visible only in journalctl, the :9104 metrics stood at
+	// zero with live WARNs).
 	retentionMet := content.NewRetentionMetrics(reg)
 	bg.Add(1)
 	go func() {
@@ -412,10 +446,11 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 			Retention: cfg.Content.Retention.D(),
 			Interval:  cfg.Content.RetentionInterval.D(),
 			BatchSize: cfg.Content.RetentionBatch,
-			// Потолок выборки пачки (T-274): дефолт 7200 с — удвоенный
-			// запас над замерами 10–11.11.2026 первого catch-up-прохода
-			// под нагрузкой (3600 с T-273 хватило только спокойной
-			// системе); 0 в конфиге — дефолт кода (withDefaults).
+			// The ceiling of the batch selection (T-274): the default
+			// 7200 s — a doubled margin over the measurements of
+			// 10–11.11.2026 of the first catch-up pass under load
+			// (3600 s of T-273 sufficed only for a quiet system); 0 in the
+			// config — the code default (withDefaults).
 			SelectTimeout:    cfg.Content.RetentionSelectTimeout.D(),
 			Depth:            analyzeDepth{gate: gate},
 			Pending:          retentionPending{rdb: rdb},
@@ -428,30 +463,32 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	}()
 
 	opts2 := httpworker.Options{
-		// Задачный параллелизм цикла Run (T-139): скользящее потребление
-		// q:http, значения — http.task_* из конфига (дефолты по замерам
-		// T-092; транспортные потолки — http.concurrency/per_ip_limit/
-		// max_rps выше, в httpfetch.NewOptions).
+		// The task parallelism of the Run loop (T-139): the sliding
+		// consumption of q:http, the values — http.task_* from the config
+		// (the defaults by the measurements of T-092; the transport caps —
+		// http.concurrency/per_ip_limit/max_rps above, in
+		// httpfetch.NewOptions).
 		Concurrency:  cfg.HTTP.TaskConcurrency,
 		Consume:      cfg.HTTP.TaskConsume,
 		PerDomain:    cfg.HTTP.TaskPerDomain,
-		MaxRedirects: cfg.HTTP.MaxRedirects, // 0 — не следовать (T-006/T-048)
-		// Dead-host cutoff (T-164): мёртвые apex+www не жгут слоты
-		// задачи на субдоменах — http.dead_host_cutoff.
+		MaxRedirects: cfg.HTTP.MaxRedirects, // 0 — do not follow (T-006/T-048)
+		// The dead-host cutoff (T-164): dead apex+www do not burn the task
+		// slots on the subdomains — http.dead_host_cutoff.
 		DeadHostCutoff: cfg.HTTP.DeadHostCutoff,
-		Store:          store, // раннее сохранение тел страниц (T-147)
-		Recover:        rel,   // возврат зависших задач q:http (T-025)
-		// Темп возврата зависших (T-153): пачка/интервал клейма —
-		// redis.recover_*.
+		Store:          store, // the early storing of the page bodies (T-147)
+		Recover:        rel,   // refunding the stuck q:http tasks (T-025)
+		// The pace of the stuck refunds (T-153): the batch/interval of the
+		// claim — redis.recover_*.
 		RecoverBatch:    cfg.Redis.RecoverBatch,
 		RecoverInterval: cfg.Redis.RecoverInterval.D(),
-		Metrics:         reg, // приборы этапа: задачи, ошибки, статусы, время ответа, rendered (T-077)
+		Metrics:         reg, // the stage instruments: the tasks, the errors, the statuses, the response time, rendered (T-077)
 		Log:             logger,
-		// Цепочка OnResult (внутри обработки задачи, до XACK, ТЗ 4.2):
-		// сохранение контента (T-056) → запись subdomain_results со свопом
-		// ссылок contents (T-058/T-044) → публикация q:analyze (T-058,
-		// §5.5 п. 9). Сбой любого звена — доставка без подтверждения,
-		// повторная доставка переигрывает цепочку идемпотентно (ТЗ 3.4).
+		// The OnResult chain (inside the task processing, before the XACK,
+		// spec 4.2): storing the content (T-056) → writing subdomain_results
+		// with the contents reference swap (T-058/T-044) → publishing to
+		// q:analyze (T-058, §5.5 item 9). A failure of any link — a
+		// delivery without an acknowledgment, a repeated delivery replays
+		// the chain idempotently (spec 3.4).
 		OnResult: func(c context.Context, res *httpworker.DomainResult) error {
 			if err := saver.Save(c, res); err != nil {
 				return err
@@ -465,27 +502,30 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		return err
 	}
 
-	// Главный цикл живёт до отмены ctx (graceful shutdown); джойн
-	// фоновых циклов — defer выше: любой выход run (штатный, ранний из
-	// конструктора, паника) сначала гасит и дожидается циклов, и лишь
-	// затем LIFO закрывает rdb/store/соединения транспорта.
+	// The main loop lives until the ctx cancellation (graceful shutdown);
+	// the join of the background loops — the defer above: any exit of run
+	// (graceful, early from the constructor, a panic) first stops and
+	// waits for the loops, and only then the LIFO closes rdb/store/the
+	// transport connections.
 	return httpworker.Run(ctx, q, w, opts2)
 }
 
-// renderQueueWatermark — эффективный порог ёмкости q:render (T-174):
-// render.queue_high_watermark, 0 — общий scheduler.queue_high_watermark
-// (семантика content.retention_analyze_watermark в run выше); затем
-// кламп min(watermark, MAXLEN/2) — queue.StreamWatermark, тот же
-// единый расчёт, что у гейта публикации (T-026) и порогов стримов:
-// ворота обязаны закрываться ДО обрезки MAXLEN — обрезка удаляет
-// записи независимо от прочтения, и порог выше предела превращал бы
-// мягкое регулирование в молчаливую потерю недоставленных рендер-задач
-// (флага render_pending у них нет — публикация прошла). На дефолтах
-// кламп не активен: 10 тыс. < 75 тыс. = DefaultStreamMaxLen(q:render)/2
-// (T-025); при явном 0 ограничивает общий порог 100 тыс. до 75 тыс. —
-// прежняя проводка T-066 сравнивала сырое значение, и ворота
-// оставались открытыми при лаге 98,4 тыс. (равновесие 24.10) даже там,
-// где гейт публикации по клампу уже закрылся бы.
+// renderQueueWatermark — the effective capacity threshold of q:render
+// (T-174): render.queue_high_watermark, 0 — the common
+// scheduler.queue_high_watermark (the semantics of
+// content.retention_analyze_watermark in run above); then the clamp
+// min(watermark, MAXLEN/2) — queue.StreamWatermark, the same single
+// calculation as by the publishing gate (T-026) and the stream
+// thresholds: the gate must close BEFORE the MAXLEN trim — the trim
+// removes the records regardless of reading, and a threshold above the
+// limit would turn the soft regulation into a silent loss of the
+// undelivered render tasks (they have no render_pending flag — the
+// publishing went through). On the defaults the clamp is not active:
+// 10k < 75k = DefaultStreamMaxLen(q:render)/2 (T-025); with an explicit
+// 0 it caps the common threshold of 100k to 75k — the former T-066
+// wiring compared the raw value, and the gate stayed open at a lag of
+// 98.4k (the equilibrium of 24.10) even where the publishing gate by the
+// clamp would already have closed.
 func renderQueueWatermark(cfg *config.Config) int64 {
 	wm := int64(cfg.Render.QueueHighWatermark)
 	if wm <= 0 {
@@ -494,55 +534,58 @@ func renderQueueWatermark(cfg *config.Config) int64 {
 	return queue.StreamWatermark(wm, int64(cfg.Redis.MaxLen), queue.StreamRender)
 }
 
-// analyzeDepth — глубина q:analyze для интерлока retention (T-166):
-// адаптер гейта backpressure (T-026) к узкому интерфейсу
-// content.RetentionDepth — пакет контента не знает Redis-специфики
-// гейта (стиль RenderLen, renderq.go).
+// analyzeDepth — the q:analyze depth for the retention interlock
+// (T-166): an adapter of the backpressure gate (T-026) to the narrow
+// content.RetentionDepth interface — the content package does not know
+// the Redis specifics of the gate (the RenderLen style, renderq.go).
 type analyzeDepth struct{ gate *queue.BackpressureGate }
 
 func (a analyzeDepth) AnalyzeDepth(ctx context.Context) (int64, error) {
 	return a.gate.Len(ctx, queue.StreamAnalyze)
 }
 
-// retentionPendingRedis — окно в go-redis для чтения непотреблённого
-// хвоста стрима: XINFO GROUPS (last-delivered-id групп) и XRANGE.
-// Узкое, как redisDepth гейта (T-026): *redis.Client удовлетворяет,
-// юнит-тест (main_test.go) подменяет фейком; внутренний интерфейс
-// пакета internal/queue не расширяется — там параллельные задачи.
+// retentionPendingRedis — a window into go-redis for reading the
+// unconsumed tail of the stream: XINFO GROUPS (the last-delivered-id of
+// the groups) and XRANGE. Narrow, as the redisDepth of the gate (T-026):
+// *redis.Client satisfies it, the unit test (main_test.go) substitutes a
+// fake; the internal interface of the internal/queue package is not
+// extended — there are parallel tasks there.
 type retentionPendingRedis interface {
 	XInfoGroups(ctx context.Context, key string) *redis.XInfoGroupsCmd
 	XRangeN(ctx context.Context, key, start, stop string, count int64) *redis.XMessageSliceCmd
 }
 
-// compile-time: клиент очереди — источник защиты retention.
+// compile-time: the queue client — the source of the retention guard.
 var _ retentionPendingRedis = (*redis.Client)(nil)
 
-// Константы чтения хвоста стрима.
+// The constants of the stream tail reading.
 const (
-	// pendingFieldData — единственное поле записи стрима: JSON сообщения
-	// (fieldData redisq.go; литерал здесь — поле не экспортировано,
-	// дублируется с комментарием-якорем).
+	// pendingFieldData — the only field of a stream record: the JSON
+	// message (fieldData redisq.go; the literal here — the field is not
+	// exported, it is duplicated with an anchor comment).
 	pendingFieldData = "data"
 
-	// pendingScanBatch — записей в одном XRANGE: хвост при застое —
-	// десятки тысяч (лаг q:render ≈99 тыс., runbooks §5), пагинация
-	// держит пиковый слайс умеренным; итоговое множество ключей всё
-	// равно вмещает весь хвост — цена точной защиты.
+	// pendingScanBatch — the records in one XRANGE: the tail at a standstill
+	// — tens of thousands (the q:render lag ≈99k, the runbooks §5), the
+	// pagination keeps the peak slice moderate; the final key set holds the
+	// whole tail anyway — the price of the precise guard.
 	pendingScanBatch = 1000
 )
 
-// retentionPending — ключи записей, чьи сообщения ждут потребителей,
-// для точной защиты retention (content.RetentionPending, T-166/T-167):
-// адаптер над Redis-клиентом гейта (тем же клиентом читает глубину
-// BackpressureGate.Len — одна точка правды о стримах). Читает
-// недоставленный группе хвост: XRANGE от last-delivered-id группы
-// (эксклюзивно, «(id») до '+'. XREADGROUP ">" запрещён — он доставил бы
-// записи в pending группы и сдвинул last-delivered-id, сломав реального
-// потребителя. Групп у стрима нет — недоставлено всё содержимое: XRANGE
-// с начала (та же семантика, что «глубина = XLEN» у гейта). Сообщения
-// разбираются как queue.Result (формат T-024 — публикация record.go и
-// renderSPAResults); чужое тело пропускается: в стрим очереди пишет
-// только marshalMessage (валидированные форматы).
+// retentionPending — the keys of the records whose messages wait for
+// consumers, for the precise retention guard (content.RetentionPending,
+// T-166/T-167): an adapter over the Redis client of the gate (it reads
+// the depth by the same client — BackpressureGate.Len, one point of
+// truth about the streams). It reads the tail not delivered to a group:
+// XRANGE from the last-delivered-id of the group (exclusively, "(id)")
+// to '+'. XREADGROUP ">" is forbidden — it would deliver the records
+// into the pending of the group and shift the last-delivered-id, breaking
+// the real consumer. The stream has no groups — everything is
+// undelivered: XRANGE from the beginning (the same semantics as "depth =
+// XLEN" by the gate). The messages are parsed as queue.Result (the
+// format of T-024 — the publishing by record.go and renderSPAResults); a
+// foreign body is skipped: only marshalMessage writes into the queue
+// streams (the validated formats).
 type retentionPending struct {
 	rdb retentionPendingRedis
 }
@@ -551,8 +594,9 @@ func (p retentionPending) PendingKeys(ctx context.Context, stream string) (map[c
 	keys := make(map[content.RetentionPendingKey]struct{})
 	groups, err := p.rdb.XInfoGroups(ctx, stream).Result()
 	if err != nil {
-		// Стрима нет — «no such key» (не пустой список), как у гейта:
-		// ни публикаций, ни групп — ждать потребителей нечего.
+		// The stream does not exist — "no such key" (not an empty list), as
+		// by the gate: no publications, no groups — there is nothing to
+		// wait for consumers.
 		if errors.Is(err, redis.Nil) || strings.Contains(err.Error(), "no such key") {
 			return keys, nil
 		}
@@ -564,34 +608,36 @@ func (p retentionPending) PendingKeys(ctx context.Context, stream string) (map[c
 		}
 		return keys, nil
 	}
-	// Хвост, недоставленный хоть одной группе, — от минимального
-	// last-delivered-id: интервал каждой группы — (её id, +∞), объединение
-	// интервалов с разными краями — интервал от минимума; один XRANGE
-	// вместо по группе (в бою группа одна — вырожденный случай).
+	// The tail undelivered to at least one group — from the minimal
+	// last-delivered-id: the interval of each group — (its id, +∞), the
+	// union of the intervals with different edges — the interval from the
+	// minimum; one XRANGE instead of one per group (in production a group
+	// is one — a degenerate case).
 	minID := ""
 	for _, g := range groups {
 		if minID == "" || pendingIDLess(g.LastDeliveredID, minID) {
 			minID = g.LastDeliveredID
 		}
 	}
-	// Эксклюзивный нижний край "(" + id: записи строго после
-	// last-delivered-id; у только что созданной группы id "0-0" —
-	// весь стрим.
+	// The exclusive lower edge "(" + id: the records strictly after the
+	// last-delivered-id; a just created group has the id "0-0" — the whole
+	// stream.
 	if err := scanPendingKeys(ctx, p.rdb, stream, "("+minID, keys); err != nil {
 		return nil, err
 	}
 	return keys, nil
 }
 
-// pendingIDLess — сравнение идентификаторов записей стрима "ms-seq"
-// численно по частям: лексикографическое сравнение ошибочно ("999-0"
-// больше "1000-0" — то же замечание у trackProgress, redisq.go;
-// LastDeliveredID новой группы "0-0" короче реальных id).
+// pendingIDLess — a comparison of the "ms-seq" stream record identifiers
+// numerically by the parts: the lexicographic comparison is wrong
+// ("999-0" is greater than "1000-0" — the same remark by trackProgress,
+// redisq.go; the LastDeliveredID of a new group "0-0" is shorter than the
+// real ids).
 func pendingIDLess(a, b string) bool {
 	ams, aseq, aerr := splitPendingID(a)
 	bms, bseq, berr := splitPendingID(b)
 	if aerr != nil || berr != nil {
-		return a < b // неразбираемые — лексикографически: детерминизм важнее точности
+		return a < b // unparsable — lexicographically: determinism over accuracy
 	}
 	if ams != bms {
 		return ams < bms
@@ -599,7 +645,7 @@ func pendingIDLess(a, b string) bool {
 	return aseq < bseq
 }
 
-// splitPendingID разбирает "ms-seq" в пару int64.
+// splitPendingID parses "ms-seq" into a pair of int64.
 func splitPendingID(id string) (ms, seq int64, err error) {
 	s1, s2, ok := strings.Cut(id, "-")
 	if !ok {
@@ -614,8 +660,8 @@ func splitPendingID(id string) (ms, seq int64, err error) {
 	return ms, seq, nil
 }
 
-// scanPendingKeys дочитывает хвост стрима от start (включительно) до '+'
-// пачками pendingScanBatch, разбирая поле data в ключ записи.
+// scanPendingKeys reads up the stream tail from start (inclusive) to '+'
+// in pendingScanBatch chunks, parsing the data field into a record key.
 func scanPendingKeys(ctx context.Context, rdb retentionPendingRedis, stream, start string, keys map[content.RetentionPendingKey]struct{}) error {
 	for {
 		msgs, err := rdb.XRangeN(ctx, stream, start, "+", pendingScanBatch).Result()
@@ -630,14 +676,14 @@ func scanPendingKeys(ctx context.Context, rdb retentionPendingRedis, stream, sta
 			case []byte:
 				raw = v
 			default:
-				continue // поля data нет — не сообщение очереди
+				continue // no data field — not a queue message
 			}
 			var r queue.Result
 			if json.Unmarshal(raw, &r) != nil {
-				continue // чужое тело: стримы очереди пишет только marshalMessage
+				continue // a foreign body: only marshalMessage writes the queue streams
 			}
 			if r.ZoneID <= 0 || r.DomainID <= 0 {
-				continue // нулевые идентификаторы — не Result (validate требует ≥ 1)
+				continue // zero identifiers — not a Result (validate requires ≥ 1)
 			}
 			keys[content.RetentionPendingKey{
 				Zone: r.ZoneID, Domain: r.DomainID,
@@ -645,8 +691,8 @@ func scanPendingKeys(ctx context.Context, rdb retentionPendingRedis, stream, sta
 			}] = struct{}{}
 		}
 		if int64(len(msgs)) < pendingScanBatch {
-			return nil // хвост прочитан целиком
+			return nil // the tail is read in full
 		}
-		start = "(" + msgs[len(msgs)-1].ID // следующая страница — после последней
+		start = "(" + msgs[len(msgs)-1].ID // the next page — after the last one
 	}
 }
