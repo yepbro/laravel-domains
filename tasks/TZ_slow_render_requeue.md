@@ -1,14 +1,14 @@
-# Техническое задание: дренаж рендер-долга без PK-порядка — seq scan выборки пачки
+# Specification: render debt drain without PK ordering — seq scan batch selection
 
-Версия: 1.0 (по итогам разбора лога медленных запросов боя 2026-10-24 —
-запрос №2 журнала, самый частый и самый тяжёлый; лог:
-`log_min_duration_statement = 3000`, T-177).
+Version: 1.0 (based on the analysis of the production slow query log of
+2026-10-24 — query #2 of the log, the most frequent and the heaviest;
+log: `log_min_duration_statement = 3000`, T-177).
 
 ---
 
-## 1. Сегодняшнее состояние и источник
+## 1. Current state and source
 
-Запрос `renderPendingDomainsSQL` (`internal/httpworker/renderq.go:145`):
+The `renderPendingDomainsSQL` query (`internal/httpworker/renderq.go:145`):
 
 ```sql
 SELECT d.zone_id, d.id, d.label || '.' || z.name
@@ -17,59 +17,62 @@ WHERE (d.flags & 2) <> 0 AND d.status <> 6
 ORDER BY d.zone_id, d.id LIMIT $1
 ```
 
-Вызывается `renderSelectPending` ← `RequeueOnce` ← цикл
-`RequeueRenderPending` (`renderq.go:608`; http-worker, тик 60 с, пачка
-100): насос дренажа рендер-долга T-174/T-066. `drain()` крутит
-`RequeueOnce` подряд, пока пачка полная — при долге 344,5 тыс. доменов
-она всегда полная (останавливает только watermark q:render), т.е.
-SELECT выполняется каждые 60 с и чаще.
+Called by `renderSelectPending` ← `RequeueOnce` ← the
+`RequeueRenderPending` loop (`renderq.go:608`; http-worker, 60 s tick,
+batch 100): the render debt drain pump of T-174/T-066. `drain()` runs
+`RequeueOnce` back to back while the batch is full — with a debt of
+344.5K domains it is always full (only the q:render watermark stops
+it), i.e. the SELECT runs every 60 s or more often.
 
-Статистика боя (журнал 24.10 09:39–12:21 UTC): **137 срабатываний**
-порога 3 с (самый частый запрос журнала), медиана **44 с**, max
-**143 с** (растёт со временем) — ≈100 минут чистого сканирования за
-2,7 часа.
+Production statistics (log of Oct 24 09:39–12:21 UTC): **137 threshold
+hits** at 3 s (the most frequent query of the log), median **44 s**,
+max **143 s** (grows over time) — ≈100 minutes of pure scanning over
+2.7 hours.
 
-## 2. Диагноз (EXPLAIN ANALYZE на боевой БД, 24.10)
+## 2. Diagnosis (EXPLAIN ANALYZE on the production DB, Oct 24)
 
-| Вариант | План | Время | Rows Removed by Filter | Буферы |
+| Variant | Plan | Time | Rows Removed by Filter | Buffers |
 |---|---|---|---|---|
-| как в бою (ORDER BY) | Index Scan `domains_default_pkey` + Filter | **30 314 мс** | 14 087 147 | 582 тыс. (≈4,5 ГБ) |
-| без ORDER BY | тот же Index Scan по PK | 15 992 мс* | 14 088 668 | 582 тыс. |
-| seq scan (SET LOCAL, диагностика) | **Seq Scan + Hash Join** | **43 мс** | **35 193** | 1 078 (≈8 МБ) |
+| as in production (ORDER BY) | Index Scan `domains_default_pkey` + Filter | **30,314 ms** | 14,087,147 | 582K (≈4.5 GB) |
+| without ORDER BY | the same Index Scan over the PK | 15,992 ms* | 14,088,668 | 582K |
+| seq scan (SET LOCAL, diagnostics) | **Seq Scan + Hash Join** | **43 ms** | **35,193** | 1,078 (≈8 MB) |
 
-\* разница с боем — кэш страниц, **план тот же**.
+\* the difference from production is the page cache, **the plan is the
+same**.
 
-1. **Убрать ORDER BY само по себе не ускоряет**: планировщик и без него
-   берёт Index Scan по PK. Причина — у PostgreSQL нет статистики по
-   выражению `(flags & 2) <> 0` (индекс по `flags` отвергнут T-175 —
-   HOT-инвариант), оценка селективности `rows=41 665 983` из 41,6 млн —
-   «фильтр почти ничего не отсекает», index scan с LIMIT кажется ему
-   копеечным. Реально первые 100 флаговых доменов лежат за 14,1 млн
-   строк начала PK-порядка.
-2. **«Беговая дорожка»**: запрос не имеет курсора — каждый вызов
-   стартует с (0,0) и вытаптывает уже дренированный «пустой» префикс
-   PK-порядка; с каждым дренажем префикс длиннее (медиана 44 с →
-   max 143 с).
-3. **Физический порядок кучи ≠ PK-порядок**: домены .рф (основной
-   рендер-долг) грузились одними из первых (ingest ru/rf/su), HOT-апдейты
-   держат версии на родных страницах — флаговые строки лежат в начале
-   кучи. Seq scan находит 100 штук за ~36 тыс. просмотров (43 мс),
-   ранний останов LIMIT — до первых найденных.
+1. **Removing ORDER BY alone does not speed anything up**: even
+   without it the planner picks the Index Scan over the PK. The reason
+   — PostgreSQL has no statistics for the `(flags & 2) <> 0` expression
+   (the index over `flags` was rejected by T-175 — the HOT invariant),
+   the selectivity estimate is `rows=41,665,983` out of 41.6M — "the
+   filter cuts out almost nothing", so the index scan with LIMIT looks
+   nearly free to it. In reality the first 100 flagged domains sit
+   behind 14.1M rows of the head of the PK order.
+2. **The "treadmill"**: the query has no cursor — every call starts
+   from (0,0) and tramples through the already drained "empty" prefix
+   of the PK order; with every drain the prefix gets longer (median
+   44 s → max 143 s).
+3. **Physical heap order ≠ PK order**: the `.рф` domains (the bulk of
+   the render debt) were loaded among the first (ingest ru/rf/su),
+   HOT updates keep the versions on their home pages — the flagged
+   rows sit at the start of the heap. A seq scan finds 100 of them
+   within ~36K row visits (43 ms), the LIMIT early stop lands right
+   after the first matches found.
 
-## 3. Целевое состояние
+## 3. Target state
 
-1. Выборка пачки — seq scan с ранним остановом: **десятки мс** вместо
-   десятков секунд; дренаж долга перестаёт быть узким местом БД
-   (скорость определяют ворота q:render T-174, а не SELECT).
-2. Стационар без долга (render_pending = 0) — тяжёлый SELECT не
-   выполняется вовсе: точечная проверка счётчика T-175 (guard).
-3. HOT-инвариант `domains` не тронут (индексов по `flags` нет и не
-   появляется), счётчик рендер-долга T-175 — единственный источник
-   «есть ли долг».
+1. Batch selection — a seq scan with early stop: **tens of ms** instead
+   of tens of seconds; the debt drain stops being the DB bottleneck
+   (the pace is set by the q:render gates of T-174, not the SELECT).
+2. A steady state without debt (render_pending = 0) — the heavy SELECT
+   does not run at all: a spot check of the T-175 counter (guard).
+3. The `domains` HOT invariant is untouched (no indexes over `flags`,
+   and none will appear); the T-175 render debt counter is the single
+   source of truth on whether debt exists.
 
-## 4. Изменения
+## 4. Changes
 
-### 4.1. SQL без ORDER BY
+### 4.1. SQL without ORDER BY
 
 ```sql
 SELECT d.zone_id, d.id, d.label || '.' || z.name
@@ -78,16 +81,17 @@ WHERE (d.flags & 2) <> 0 AND d.status <> 6
 LIMIT $1
 ```
 
-Порядок пачки не важен (решение оператора 2026-10-24: «без разницы
-какие домены первыми»): снятие флага после публикации исключает
-повторы, детерминизм пачек не нужен для корректности. Комментарий
-переменной (`ORDER BY по PK — детерминированные пачки`) обновить.
+The batch order does not matter (the operator's decision of
+2026-10-24: "it makes no difference which domains go first"): clearing
+the flag after publishing rules out repeats; batch determinism is not
+needed for correctness. Update the variable comment (`ORDER BY by
+PK — deterministic batches`).
 
-### 4.2. Транзакция с SET LOCAL (закрепление плана)
+### 4.2. Transaction with SET LOCAL (plan pinning)
 
-`renderSelectPending` выполняет выборку в явной транзакции
-(`pool.Begin`, образец `renderClearPendingTx`; сигнатура принимает
-`RecordDB` вместо `db.DB`):
+`renderSelectPending` runs the selection inside an explicit
+transaction (`pool.Begin`, sample `renderClearPendingTx`; the
+signature takes `RecordDB` instead of `db.DB`):
 
 ```sql
 BEGIN;
@@ -97,106 +101,114 @@ SELECT …;   -- 4.1
 COMMIT;
 ```
 
-- `SET LOCAL` действует только внутри этой транзакции — остальные
-  запросы пула не затронуты; PostgreSQL хинтов не имеет, это штатный
-  способ закрепить форму плана одного оператора.
-- Отключение bitmap-скана вместе с index-сканом — форма плана ровно та,
-  что проверена диагностикой §2 (Seq Scan + Hash Join; bitmap по
-  неиндексированному `flags` всё равно недоступен — фиксация на случай
-  будущих индексов).
-- Правка по итогам код-ревью T-181 (замыкает ту же цель «все индексные
-  формы доступа к domains закрыты»): добавлен и
-  `SET LOCAL enable_indexonlyscan = off` — отдельный GUC, index-only по
-  PK воспроизводил бы патологию префикса.
-- Правка — одна точка (`renderSelectPending`), вызовы `RequeueOnce`
-  не меняются.
+- `SET LOCAL` applies only inside this transaction — the pool's other
+  queries are unaffected; PostgreSQL has no hints, this is the standard
+  way to pin the plan shape of a single statement.
+- Disabling the bitmap scan together with the index scan — the plan
+  shape is exactly the one verified by the §2 diagnostics (Seq Scan +
+  Hash Join; a bitmap over the unindexed `flags` is unavailable anyway
+  — pinned in case of future indexes).
+- The edit following the T-181 code review (it closes the same goal,
+  "all index access paths to domains are closed"): `SET LOCAL
+  enable_indexonlyscan = off` added as well — a separate GUC; an
+  index-only over the PK would reproduce the prefix pathology.
+- The edit is a single spot (`renderSelectPending`); the `RequeueOnce`
+  calls are unchanged.
 
-### 4.3. Guard счётчиком рендер-долга (T-175)
+### 4.3. Guard by the render debt counter (T-175)
 
-До выборки (в `RequeueOnce`, после проверки `HasCapacity`) — точечное
-чтение:
+Before the selection (in `RequeueOnce`, after the `HasCapacity` check)
+— a spot read:
 
 ```sql
 SELECT value FROM crawler_counters WHERE name = 'render_pending'
 ```
 
-- `value = 0` → пустая пачка без тяжёлого SELECT (`Selected = 0` —
-  `drain()` корректно останавливается); стационар без долга стоит одно
-  чтение строки на тик.
-- `value > 0` → выборка §4.1.
-- Отсутствие строки — ошибка прохода (строку гарантирует миграция
-  000015 T-175; философия `renderBumpDebtCounter`: молчаливый
-  рассинхрон сделал бы guard ложью — громче ошибкой).
-- Граница доверия: рассинхрон ручного SQL с флагом мимо счётчика
-  (симптомы и ручной пересчёт — runbooks §6, T-175): при counter = 0 и
-  живых флагах дренаж стоит до пересчёта; при counter > 0 и пустых
-  флагах — один «холостой» seq scan за тик до пересчёта.
+- `value = 0` → an empty batch without the heavy SELECT
+  (`Selected = 0` — `drain()` stops correctly); the steady state
+  without debt costs one row read per tick.
+- `value > 0` → the §4.1 selection.
+- A missing row is a pass error (the row is guaranteed by migration
+  000015 of T-175; the `renderBumpDebtCounter` philosophy: a silent
+  desync would turn the guard into a lie — better to fail loudly).
+- Trust boundary: desync of manual SQL setting the flag bypassing the
+  counter (symptoms and manual recount — runbooks §6, T-175): with
+  counter = 0 and live flags the drain stands still until a recount;
+  with counter > 0 and no flags — one "idle" seq scan per tick until
+  a recount.
 
-### 4.4. Зависимости
+### 4.4. Dependencies
 
-- **T-175 в бою** (миграция 000015, сопровождение счётчика переходами
-  бита; на 24.10 прод на миграции 14 — деплой T-175 предшествует этой
-  задаче). Без счётчика guard невозможен, без guard стационар без
-  долга — полный seq scan каждые 60 с.
-- Миграций нет, схема не меняется.
+- **T-175 is in production** (migration 000015, the counter maintained
+  by bit transitions; as of Oct 24 prod is on migration 14 — the
+  T-175 deploy precedes this task). Without the counter the guard is
+  impossible; without the guard the no-debt steady state is a full
+  seq scan every 60 s.
+- No migrations, the schema is unchanged.
 
-## 5. Риски и границы
+## 5. Risks and boundaries
 
-1. **Физическая локальность — эмпирический факт, не контракт**: если
-   раскладка кучи изменится (массовые перепроверки других зон,
-   переписывания таблицы), seq scan подорожает вплоть до полного
-   прохода за тик при живом долге. Контроль — журнал T-177 (запрос
-   вернётся в лог медленных при >3 с); системная альтернатива на этот
-   случай — keyset-курсор (§6.2), сознательно отложена.
-2. **Долг → 0**: seq scan за тик деградирует к полному проходу —
-   закрывается guard §4.3 (переход в точечное чтение).
-3. Единственный исполнитель прохода — фоновая горутина http-worker
-   (один экземпляр сервиса); конкурентный второй экземпляр сегодня
-   гоняется по флагам с охраной `RowsAffected` — правка семантику
-   конкурентности не меняет.
+1. **Physical locality is an empirical fact, not a contract**: if the
+   heap layout changes (mass rechecks of other zones, table rewrites),
+   the seq scan gets more expensive, up to a full pass per tick while
+   debt is live. The control is the T-177 log (the query returns to
+   the slow log above 3 s); the systematic alternative for that case —
+   the keyset cursor (§6.2), deliberately deferred.
+2. **Debt → 0**: the per-tick seq scan degrades to a full pass —
+   covered by the §4.3 guard (the switch to a spot read).
+3. The only pass executor is the http-worker background goroutine
+   (a single service instance); a concurrent second instance currently
+   races over the flags with the `RowsAffected` guard — the edit does
+   not change the concurrency semantics.
 
-## 6. Принятые решения и отклонённые варианты
+## 6. Accepted decisions and rejected alternatives
 
-1. **Seq scan вместо курсора** — решение оператора 2026-10-24
-   (порядок доменов не важен): минимальный диф, устойчивый выигрыш
-   700× на текущих данных, guard держит стационар.
-2. Отложен **keyset-курсор** (`ORDER BY … AND (zone_id,id) > ($1,$2)`
-   + persist в `crawler_counters`): устойчив к раскладке кучи и не
-   требует `SET LOCAL`, но диф больше (состояние, wrap, persist);
-   кандидат на возврат при деградации локальности (§5.1).
-3. Отклонено **«просто убрать ORDER BY»** (без закрепления плана):
-   план не меняется — слепая оценка выражения `flags & 2` без
-   статистики держит index scan (замер §2).
-4. Отклонён **частичный индекс `(flags & 2) <> 0`** — T-175: ломает
-   HOT-инвариант (`flags` меняется дважды на эпизод каждого домена,
-   миллионы non-HOT-апдейтов/сутки).
-5. Отклонены **expression-статистики** (`CREATE STATISTICS ON
-   ((flags & 2) <> 0)`): семантика на секционированных таблицах
-   неочевидна, сопровождение по партициям, и evaluable-выигрыш уже
-   даёт §4.2 без новых объектов схемы.
-6. Guard **по счётчику T-175**, а не «чтение с LIMIT 1 флага»:
-   последнее — тот же полный скан при пустых флагах, т.е. не guard.
+1. **Seq scan instead of a cursor** — the operator's decision of
+   2026-10-24 (domain order does not matter): a minimal diff,
+   a sustained 700x win on current data, the guard holds the steady
+   state.
+2. Deferred: **the keyset cursor** (`ORDER BY … AND (zone_id,id) >
+   ($1,$2)` + persistence in `crawler_counters`): robust to the heap
+   layout and needs no `SET LOCAL`, but the diff is larger (state,
+   wrap, persist); a candidate to revisit if locality degrades
+   (§5.1).
+3. Rejected: **"just removing ORDER BY"** (without plan pinning): the
+   plan does not change — the blind estimation of the `flags & 2`
+   expression without statistics keeps the index scan (the §2
+   measurement).
+4. Rejected: **the partial index `(flags & 2) <> 0`** — T-175: it
+   breaks the HOT invariant (`flags` changes twice per episode of
+   every domain, millions of non-HOT updates/day).
+5. Rejected: **expression statistics** (`CREATE STATISTICS ON
+   ((flags & 2) <> 0)`): the semantics on partitioned tables are
+   unclear, maintenance is per partition, and §4.2 already delivers
+   the evaluable win without new schema objects.
+6. The guard **by the T-175 counter**, not "a LIMIT 1 read of the
+   flag": the latter is the same full scan when there are no flags,
+   i.e. not a guard.
 
-## 7. Тестирование и приёмка
+## 7. Testing and acceptance
 
-1. Юнит (SQL-контракты по стилю проекта): новый текст
-   `renderPendingDomainsSQL` (без ORDER BY, LIMIT $1); guard-SELECT;
-   последовательность транзакции `SET LOCAL ×2 → SELECT` на фейковом
-   пуле; guard=0 → тяжёлый SELECT не вызывается; отсутствие строки
-   счётчика — ошибка.
-2. Интеграция (`test/integration`): флаги выставлены (counter > 0) —
-   проход публикует и снимает; все флаги сняты (counter = 0) — тик
-   не выполняет тяжёлый SELECT (обёртка пула со счётчиком вызовов);
-   повторный проход не выбирает снятое.
-3. Приёмка: в журнале боевого сервера (порог 3 с, T-177) записи
-   `renderPendingDomainsSQL` исчезают; темп дренажа долга
-   (log «проход доработки рендера» domains/published, метрика долга
-   T-175) растёт от «пачка/30+ с» до ёмкости ворот q:render; при
-   counter = 0 тик в `pg_stat_activity` не появляется вовсе.
+1. Unit (SQL contracts in the project style): the new text of
+   `renderPendingDomainsSQL` (without ORDER BY, LIMIT $1); the guard
+   SELECT; the transaction sequence `SET LOCAL ×2 → SELECT` against
+   a fake pool; guard=0 → the heavy SELECT is not called; a missing
+   counter row is an error.
+2. Integration (`test/integration`): flags set (counter > 0) — the
+   pass publishes and clears them; all flags cleared (counter = 0) —
+   the tick does not run the heavy SELECT (a pool wrapper with a call
+   counter); a repeat pass does not select the cleared ones.
+3. Acceptance: `renderPendingDomainsSQL` entries disappear from the
+   production server log (3 s threshold, T-177); the debt drain pace
+   (the "render rework pass" log domains/published, the T-175 debt
+   metric) grows from "a batch per 30+ s" to the capacity of the
+   q:render gates; with counter = 0 the tick does not show up in
+   `pg_stat_activity` at all.
 
-## 8. Этапность
+## 8. Stages
 
-1. `renderSelectPending`: транзакция + `SET LOCAL` + новый текст §4.1.
-2. Guard счётчиком §4.3 в `RequeueOnce`.
-3. Тесты §7, комментарий SQL-переменной, `docs/render.md` (форма плана
-   выборки и её закрепление, граница доверия guard).
+1. `renderSelectPending`: transaction + `SET LOCAL` + the new §4.1
+   text.
+2. The §4.3 counter guard in `RequeueOnce`.
+3. The §7 tests, the SQL variable comment, `docs/render.md` (the
+   selection plan shape and its pinning, the guard trust boundary).

@@ -1,17 +1,18 @@
-# Техническое задание: повторные проверки temp_error — выборка кандидатов seq scan'ом вместо индексного марафона
+# Specification: temp_error retries — candidate selection with a seq scan instead of an index marathon
 
-Версия: 1.0 (по итогам разбора лога медленных запросов окна после
-деплоя 2026-10-25 12:37 MSK — запрос №1 окна по суммарному времени БД;
-лог: `log_min_duration_statement = 3000`, T-177). Класс болезни — тот
-же, что у [`TZ_slow_render_requeue.md`](./TZ_slow_render_requeue.md)
-(T-181): слепая оценка планировщика + индексный скан невыгодной формы,
-который дренажный цикл крутит непрерывно.
+Version: 1.0 (based on the analysis of the slow query log of the window
+after the 2026-10-25 12:37 MSK deploy — query #1 of the window by total
+DB time; log: `log_min_duration_statement = 3000`, T-177). The disease
+class is the same as that of
+[`TZ_slow_render_requeue.md`](./TZ_slow_render_requeue.md) (T-181):
+blind planner estimation plus an index scan in an unfavorable shape,
+which the drain loop runs continuously.
 
 ---
 
-## 1. Сегодняшнее состояние и источник
+## 1. Current state and source
 
-Запрос `retrySelectSQL` (`internal/scheduler/retry.go:106`):
+The `retrySelectSQL` query (`internal/scheduler/retry.go:106`):
 
 ```sql
 SELECT d.zone_id, d.id, d.temp_attempts FROM domains d
@@ -19,76 +20,79 @@ WHERE d.status = $1 AND d.check_state = $2 AND d.last_checked_at < $3
 ORDER BY d.zone_id, d.id LIMIT $4
 ```
 
-($1 = 5 `StatusTempError`, $2 = 2 `CheckStateDone`, $3 = now−24 ч,
-$4 = 1000 — прод-конфиг переопределений не имеет: пачка 1000, окно
-24 ч, интервал 1 ч.) Вызывается `retryCandidates` ← `RetryOnce` ←
-цикл `RetryTempErrors` (T-031): дренаж крутит проходы подряд, пока
-пачка полная — каждый проход это один SELECT.
+($1 = 5 `StatusTempError`, $2 = 2 `CheckStateDone`, $3 = now−24 h,
+$4 = 1000 — the prod config has no overrides: batch 1000, window 24 h,
+interval 1 h.) Called by `retryCandidates` ← `RetryOnce` ← the
+`RetryTempErrors` loop (T-031): the drain runs passes back to back
+while the batch is full — each pass is one SELECT.
 
-Статистика окна 25.10 09:38–13:15 UTC (3,6 ч после деплоя): **150
-срабатываний** порога 3 с — скан выполняется каждые ~90 с непрерывно,
-медиана **74,8 с**, max 427,4 с, сумма **12 952 с ≈ 3,6 ч времени БД**
-— фактически одно ядро БД занято этим оператором всё окно.
-pg_stat_statements: 175 вызовов, mean 79,4 с, total 13 893 с.
+Window statistics for Oct 25 09:38–13:15 UTC (3.6 h after the deploy):
+**150 threshold hits** at 3 s — the scan runs continuously every ~90 s,
+median **74.8 s**, max 427.4 s, total **12,952 s ≈ 3.6 h of DB time** —
+effectively one DB core busy with this statement the whole window.
+pg_stat_statements: 175 calls, mean 79.4 s, total 13,893 s.
 
-Множитель когорты: DNS-инцидент 24.10 (доля temp_error — алерт T-182,
-33 срабатывания) оставил **491 210** доменов в статусе temp_error,
-из них зрелых кандидатов повтора (done + старше 24 ч) **157 363**
-(срез 25.10 ~16:20 MSK): дренаж держит пачки полными ~157 проходов
-подряд. Окно повтора «старше 24 ч» по date-колонке зреет когортами
-в полночь — шторм повторяется после каждого массового temp_error-
-эпизода.
+The cohort multiplier: the DNS incident of Oct 24 (the temp_error share
+— alert T-182, 33 hits) left **491,210** domains in the temp_error
+status, of which mature retry candidates (done + older than 24 h) are
+**157,363** (a snapshot of Oct 25 ~16:20 MSK): the drain keeps batches
+full for ~157 passes in a row. The "older than 24 h" retry window over
+the date column matures in cohorts at midnight — the storm repeats
+after every mass temp_error episode.
 
-## 2. Диагноз (EXPLAIN ANALYZE на боевой БД, 25.10)
+## 2. Diagnosis (EXPLAIN ANALYZE on the production DB, Oct 25)
 
-Таблица `domains_default`: 42,3 млн строк, heap 4,3 ГБ (540 тыс.
-страниц), индексы 5,5 ГБ; когда-либо проверенных 3,56 млн, окно
-`last_checked_at < now−24 ч` — **3 356 133 строки** (94 %
-проверенных).
+Table `domains_default`: 42.3M rows, heap 4.3 GB (540K pages), indexes
+5.5 GB; ever checked 3.56M, the `last_checked_at < now−24 h` window is
+**3,356,133 rows** (94% of checked).
 
-| Вариант | План | Время | Просмотрено впустую | Буферы |
+| Variant | Plan | Time | Wasted row visits | Buffers |
 |---|---|---|---|---|
-| как в бою | Parallel Index Scan `domains_recheck_idx` (частичный, `WHERE check_state = 2`), Index Cond `last_checked_at < …`, Filter `status = 5` | **44 660 мс** | 2 900 000 | 2 113 971 (≈16 ГБ), чтения 420 тыс. (3,3 ГБ, I/O 113 с), dirty 940 |
-| cast параметра `::date` | тот же план, та же оценка (~1 тыс./воркер) | — | — | — |
-| без ORDER BY + `SET LOCAL` indexscan/bitmapscan/indexonlyscan = off | Parallel Seq Scan + ранний останов LIMIT | **229 мс** | 141 000 | 1 819 (≈14 МБ) |
+| as in production | Parallel Index Scan `domains_recheck_idx` (partial, `WHERE check_state = 2`), Index Cond `last_checked_at < …`, Filter `status = 5` | **44,660 ms** | 2,900,000 | 2,113,971 (≈16 GB), reads 420K (3.3 GB, I/O 113 s), dirty 940 |
+| parameter cast `::date` | same plan, same estimate (~1K/worker) | — | — | — |
+| without ORDER BY + `SET LOCAL` indexscan/bitmapscan/indexonlyscan = off | Parallel Seq Scan + LIMIT early stop | **229 ms** | 141,000 | 1,819 (≈14 MB) |
 
-1. **Планировщик садится на частичный recheck-индекс** (миграция
-   000008/T-104): предикат `check_state = 2` доказуем, а диапазон по
-   первому ключу `last_checked_at` кажется узким. Реально окно
-   «старше 24 ч» — почти вся проверенная история (3,36 млн строк):
-   окно не селективно, индексная форма вырождается в марафон.
-2. **Оценке планировщика верить нельзя**: rows ≈ 2,5–3 тыс. против
-   фактических 3,06 млн посещённых. Гистограмма `last_checked_at`
-   не отражает волну проверок (92 % значений NULL, ненулевые набиты
-   за 4 дня кампании). Cast параметра в `date` (same-type сравнение)
-   оценку не меняет — проверено на бою; полагаться на свежий ANALYZE
-   нельзя (распределение плывёт ежедневно) — форму плана закреплять.
-3. **`status` не в индексе** → heap-визит каждой строки окна — тот же
-   класс, что `dnsShareSQL` (T-182), но окно в ~4 раза больше
-   суточного.
-4. Скан грязнит ~940 страниц за проход (hint bits) — лишний WAL и
-   давление на чекпоинты.
-5. Пул scheduler сериальный (`NoParallelGather`, T-171): в боевой
-   сессии скан идёт без параллельных воркеров — 44,7 с замера
-   суперпользователем соответствуют медиане 74,8 с под нагрузкой.
-   Почти всё время — I/O чтений (113 с на троих в замере).
+1. **The planner lands on the partial recheck index** (migration
+   000008/T-104): the `check_state = 2` predicate is provable, and the
+   range on the leading key `last_checked_at` looks narrow. In reality
+   the "older than 24 h" window is almost the entire checked history
+   (3.36M rows): the window is not selective, and the index form
+   degenerates into a marathon.
+2. **The planner estimate cannot be trusted**: rows ≈ 2.5–3K versus
+   the actual 3.06M visited. The `last_checked_at` histogram does not
+   reflect the check wave (92% of values NULL, the non-null ones packed
+   into 4 days of the campaign). Casting the parameter to `date`
+   (a same-type comparison) does not change the estimate — verified in
+   production; relying on a fresh ANALYZE is not an option (the
+   distribution drifts daily) — pin the plan shape.
+3. **`status` is not in the index** → a heap visit for every row of the
+   window — the same class as `dnsShareSQL` (T-182), but the window is
+   ~4x the daily one.
+4. The scan dirties ~940 pages per pass (hint bits) — extra WAL and
+   pressure on checkpoints.
+5. The scheduler pool is serial (`NoParallelGather`, T-171): in a
+   production session the scan runs without parallel workers — the
+   44.7 s of the superuser measurement matches the 74.8 s median under
+   load. Almost all of the time is read I/O (113 s across the three
+   workers in the measurement).
 
-## 3. Целевое состояние
+## 3. Target state
 
-1. Выборка пачки — seq scan с ранним остановом: **доли секунды**
-   (плотность temp_error ≥ 1/269 строк даёт 1000 кандидатов за
-   ~140–290 тыс. просмотров); шторм дренажа перестаёт занимать БД,
-   темп определяют UPDATE пачки, а не SELECT.
-2. Стационар без temp_error — тяжёлый SELECT не выполняется вовсе:
-   точечная проверка счётчика `crawler_counters['status_temp_error']`
-   (T-178; зрелые кандидаты — подмножество temp_error, счётчик 0 ⇒
-   кандидатов нет).
-3. HOT-инвариант `domains` не тронут: новых индексов нет, `status` в
-   индексы не попадает.
+1. Batch selection — a seq scan with early stop: **fractions of a
+   second** (the temp_error density of ≥1/269 rows yields 1000
+   candidates within ~140–290K row visits); the drain storm stops
+   occupying the DB — the pace is set by the batch UPDATEs, not the
+   SELECT.
+2. A steady state without temp_error — the heavy SELECT does not run at
+   all: a spot check of the `crawler_counters['status_temp_error']`
+   counter (T-178; mature candidates are a subset of temp_error,
+   counter 0 ⇒ no candidates).
+3. The `domains` HOT invariant is untouched: no new indexes, `status`
+   stays out of the indexes.
 
-## 4. Изменения
+## 4. Changes
 
-### 4.1. SQL без ORDER BY
+### 4.1. SQL without ORDER BY
 
 ```sql
 SELECT d.zone_id, d.id, d.temp_attempts FROM domains d
@@ -96,18 +100,18 @@ WHERE d.status = $1 AND d.check_state = $2 AND d.last_checked_at < $3
 LIMIT $4
 ```
 
-Порядок кандидатов не важен: деление пачки по `temp_attempts` не
-зависит от порядка, охраны `retryRequeueSQL`/`retryFinalizeSQL`
-перепроверяют статус и состояние на момент записи (идемпотентность
-T-031), повторный проход безопасен. Комментарий переменной
-(«ORDER BY по PK — детерминированные пачки») обновить: детерминизм
-пачек корректности не нужен.
+Candidate order does not matter: splitting the batch by
+`temp_attempts` is order-independent, the
+`retryRequeueSQL`/`retryFinalizeSQL` guards re-check the status and
+state at write time (T-031 idempotency), and a repeat pass is safe.
+Update the variable comment ("ORDER BY by PK — deterministic
+batches"): batch determinism is not needed for correctness.
 
-### 4.2. Транзакция с SET LOCAL (закрепление плана)
+### 4.2. Transaction with SET LOCAL (plan pinning)
 
-`retryCandidates` выполняет выборку в явной транзакции
-(`pool.Begin` — `RetryDB` уже умеет; образец — `renderSelectPending`
-T-181):
+`retryCandidates` runs the selection inside an explicit transaction
+(`pool.Begin` — `RetryDB` already supports it; sample —
+`renderSelectPending`, T-181):
 
 ```sql
 BEGIN;
@@ -118,106 +122,115 @@ SELECT …;   -- 4.1
 COMMIT;
 ```
 
-`SET LOCAL` действует только внутри транзакции; тройное отключение
-(включая index-only, по итогам ревью T-181) закрывает все индексные
-формы доступа к `domains` — и PK, и оба частичных. Правка — одна
-точка (`retryCandidates`).
+`SET LOCAL` applies only inside the transaction; the triple disable
+(including index-only, following the T-181 review) closes all index
+access paths to `domains` — the PK and both partial ones. The edit is
+a single spot (`retryCandidates`).
 
-### 4.3. Guard счётчиком temp_error (T-178)
+### 4.3. Guard by the temp_error counter (T-178)
 
-До выборки в `RetryOnce` — точечное чтение строки `status_temp_error`
-(имя = `"status_" + model.StatusTempError.String()`, легенда —
-zonestats.go; инкременты переходов ведут writers T-178, авторитет —
-реконсиляция monitor):
+Before the selection in `RetryOnce` — a spot read of the
+`status_temp_error` row (the name =
+`"status_" + model.StatusTempError.String()`, the legend lives in
+zonestats.go; transition increments are maintained by the T-178
+writers, the authority is the monitor reconciliation):
 
-- `value = 0` → пустой результат без тяжёлого SELECT (`drain()`
-  корректно останавливается, транзакция не открывается) — стационар
-  без temp_error стоит одно чтение строки в час;
-- `value > 0` → выборка §4.1;
-- отсутствие строки — ошибка прохода (строки гарантирует наполнение
-  T-178; философия guard T-181: молчаливый рассинхрон сделал бы
-  guard ложью — громче ошибкой).
+- `value = 0` → an empty result without the heavy SELECT (`drain()`
+  stops correctly, no transaction is opened) — the steady state
+  without temp_error costs one row read per hour;
+- `value > 0` → the §4.1 selection;
+- a missing row is a pass error (the row is guaranteed by the T-178
+  backfill; the T-181 guard philosophy: a silent desync would turn the
+  guard into a lie — better to fail loudly).
 
-Не путать со строкой `temp_error:YYYY-MM-DD` (T-182): та — события
-суток, guard читает состояние (число доменов в статусе сейчас).
-Граница доверия — рассинк ручного SQL мимо инкрементов (симптомы и
-пересчёт — `crawlerctl counters recount`, T-178): при 0 и живых
-temp_error дренаж стоит до пересчёта; при > 0 и пустых — один
-«холостой» seq scan за тик.
+Do not confuse this with the `temp_error:YYYY-MM-DD` row (T-182): that
+one counts the day's events, the guard reads the state (the number of
+domains currently in the status). The trust boundary is desync of
+manual SQL bypassing the increments (symptoms and recount —
+`crawlerctl counters recount`, T-178): at 0 with live temp_error the
+drain stands still until a recount; at > 0 with none — one "idle" seq
+scan per tick.
 
-Остаточный случай, принятый сознательно: temp_error > 0, но зрелых
-нет (когорта зреет в полночь, дренаж уже прошёл) — часовой тик
-деградирует к полному seq scan (~15–20 с) до полуночи; это ~20
-проходов/сутки между штормами против сегодняшних 150 за 3,6 ч.
-Контроль — журнал T-177; при регулярном повторении — кандидат на
-счётчик `temp_error_done` (§6.5).
+A residual case, accepted deliberately: temp_error > 0 but no mature
+ones (the cohort matures at midnight, the drain has already passed) —
+the hourly tick degrades to a full seq scan (~15–20 s) until midnight;
+that is ~20 passes/day between storms versus today's 150 in 3.6 h.
+The control is the T-177 log; with regular recurrence — a candidate
+for the `temp_error_done` counter (§6.5).
 
-### 4.4. Зависимости
+### 4.4. Dependencies
 
-- **T-178 в бою** (строки `status_*` в `crawler_counters`) — деплой
-  25.10 12:37 MSK уже прошёл, строки есть. Без него guard невозможен.
-- Миграций нет, схема не меняется.
+- **T-178 is in production** (the `status_*` rows in
+  `crawler_counters`) — the Oct 25 12:37 MSK deploy has already
+  happened, the rows exist. Without it the guard is impossible.
+- No migrations, the schema is unchanged.
 
-## 5. Риски и границы
+## 5. Risks and boundaries
 
-1. **Физическая локальность — эмпирический факт, не контракт**:
-   рассеянные одиночные temp_error при малом множестве удлиняют
-   ранний останов вплоть до полного прохода (~15–20 с) за тик при
-   живом счётчике. Контроль — журнал T-177; системная альтернатива —
-   keyset-курсор по recheck-индексу с persist-состоянием (§6.3).
-2. Рост таблицы (backlog 38,7 млн непроверенных) пропорционально
-   дорожает полному проходу — guard (§4.3) держит стационар, ранний
-   останов — шторм.
-3. Единственный исполнитель — фоновая горутина scheduler (один
-   экземпляр); конкурентный второй экземпляр гоняется по кандидатам
-   с охранами UPDATE — правка семантику конкурентности не меняет.
+1. **Physical locality is an empirical fact, not a contract**:
+   scattered single temp_error rows over a small set stretch the early
+   stop up to a full pass (~15–20 s) per tick while the counter is
+   live. The control is the T-177 log; the systematic alternative is a
+   keyset cursor over the recheck index with persisted state (§6.3).
+2. Table growth (a backlog of 38.7M unchecked) makes the full pass
+   proportionally more expensive — the guard (§4.3) covers the steady
+   state, the early stop covers storms.
+3. The only executor is the scheduler background goroutine (a single
+   instance); a concurrent second instance races over the candidates
+   with the UPDATE guards — the edit does not change the concurrency
+   semantics.
 
-## 6. Принятые решения и отклонённые варианты
+## 6. Accepted decisions and rejected alternatives
 
-1. **Seq scan + закрепление плана** — прецедент T-181 (тот же класс:
-   слепая оценка держит индексный скан невыгодной формы): замер
-   195× по времени, 1162× по буферам, минимальный диф.
-2. Отклонён **частичный индекс `(zone_id, id) WHERE status = 5`** —
-   HOT-инвариант `domains` (класс T-104/T-175): переходы статуса 5
-   часты (491 тыс. эпизодов за 4 дня кампании) — non-HOT на каждом,
-   прецедент T-170 (deleted) на редких переходах здесь не переносится.
-3. Отложен **ORDER BY last_checked_at по recheck-индексу** («старейшие
-   первыми», ранний останов в порядке ключа): при пустых зрелых
-   возвращается тот же марафон по всему окну, стационар не чинит;
-   порядок кандидатов не нужен. Возврат — вместе с keyset-курсором.
-4. Отклонены **cast параметра и упование на ANALYZE**: cast проверен
-   на бою — оценка не меняется; распределение `last_checked_at`
-   плывёт ежедневно с кампанией — pin плана надёжнее статистики.
-5. Отложен **двухфазный guard** (счётчик `temp_error ∧ done`,
-   инкременты через record/retry/recheck/lease): точнее §4.3, но
-   требует проводки через все переходы состояний — машина T-178 ради
-   узкого остаточного случая §4.3; кандидат на возврат при регулярном
-   появлении запроса в журнале между штормами.
+1. **Seq scan + plan pinning** — the T-181 precedent (the same class:
+   blind estimation keeps an index scan in an unfavorable shape):
+   measured 195x by time, 1162x by buffers, a minimal diff.
+2. Rejected: **the partial index `(zone_id, id) WHERE status = 5`** —
+   the `domains` HOT invariant (the T-104/T-175 class): status-5
+   transitions are frequent (491K episodes over 4 days of the
+   campaign) — non-HOT on each one; the T-170 (deleted) precedent on
+   rare transitions does not transfer here.
+3. Deferred: **ORDER BY last_checked_at over the recheck index**
+   ("oldest first", early stop in key order): with no mature
+   candidates it brings back the same marathon across the whole window
+   and does not fix the steady state; candidate order is not needed.
+   To revisit together with the keyset cursor.
+4. Rejected: **the parameter cast and reliance on ANALYZE**: the cast
+   was verified in production — the estimate does not change; the
+   `last_checked_at` distribution drifts daily with the campaign —
+   a plan pin is more reliable than statistics.
+5. Deferred: **the two-phase guard** (a `temp_error ∧ done` counter,
+   increments through record/retry/recheck/lease): more precise than
+   §4.3, but it requires wiring through every state transition — the
+   T-178 machine for the sake of the narrow residual case of §4.3;
+   a candidate to revisit if the query shows up regularly in the log
+   between storms.
 
-## 7. Тестирование и приёмка
+## 7. Testing and acceptance
 
-1. Юнит (SQL-контракты по стилю проекта): новый текст
-   `retrySelectSQL` (без ORDER BY, LIMIT $4); guard-SELECT по имени
-   `status_temp_error`; последовательность транзакции
-   `SET LOCAL ×3 → SELECT` на фейковом пуле; guard=0 → тяжёлый
-   SELECT не вызывается; отсутствие строки счётчика — ошибка;
-   `RetryOnce` на фейках — деление пачки, RetryResult.
-2. Интеграция (`test/integration`): зрелая когорта temp_error —
-   проход назначает повтор и финализирует по `temp_attempts`;
-   `status_temp_error = 0` — тик не выполняет тяжёлый SELECT
-   (обёртка пула со счётчиком вызовов); итерации дренажа сходятся
-   (переведённые не выбираются повторно).
-3. Приёмка: в журнале боевого сервера записи `retrySelectSQL`
-   исчезают; шторм когорты после DNS-инцидента дренируется минутами
-   (лог «дренаж повторных проверок temp_error»); при
-   `status_temp_error = 0` часовой тик — одно чтение строки;
-   `make test` + `make test-integration` зелёные.
+1. Unit (SQL contracts in the project style): the new text of
+   `retrySelectSQL` (without ORDER BY, LIMIT $4); the guard SELECT by
+   the `status_temp_error` name; the transaction sequence
+   `SET LOCAL ×3 → SELECT` against a fake pool; guard=0 → the heavy
+   SELECT is not called; a missing counter row is an error;
+   `RetryOnce` on fakes — batch splitting, RetryResult.
+2. Integration (`test/integration`): a mature temp_error cohort —
+   a pass schedules the retry and finalizes by `temp_attempts`;
+   `status_temp_error = 0` — the tick does not run the heavy SELECT
+   (a pool wrapper with a call counter); drain iterations converge
+   (the processed ones are not selected again).
+3. Acceptance: `retrySelectSQL` entries disappear from the production
+   server log; the post-DNS-incident cohort storm drains within
+   minutes (the "temp_error retry drain" log); with
+   `status_temp_error = 0` the hourly tick is one row read;
+   `make test` + `make test-integration` green.
 
-## 8. Этапность
+## 8. Stages
 
-1. `retryCandidates`: транзакция + `SET LOCAL` ×3 + текст §4.1.
-2. Guard §4.3 в `RetryOnce` (до выборки кандидатов).
-3. Тесты §7, комментарий SQL-переменной, `docs/services.md`
-   (scheduler: форма плана выборки и guard повтора).
+1. `retryCandidates`: transaction + `SET LOCAL` ×3 + the §4.1 text.
+2. The §4.3 guard in `RetryOnce` (before candidate selection).
+3. The §7 tests, the SQL variable comment, `docs/services.md`
+   (scheduler: the selection plan shape and the retry guard).
 
-Зависимости: T-178 в бою (счётчик `status_temp_error`). Миграций нет.
+Dependencies: T-178 in production (the `status_temp_error` counter).
+No migrations.
