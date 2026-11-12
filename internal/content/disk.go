@@ -1,26 +1,27 @@
-// Контроль свободного места каталога контента (ТЗ 8; задачи T-046, T-080).
+// Free-space control of the content directory (spec 8; tasks T-046, T-080).
 //
-// ТЗ 8: «Переполнение диска: сервисы приостанавливают запись контента
-// и сигнализируют об этом алертом; порог настраивается». Механика:
+// Spec 8: "Disk overflow: services pause content writing and signal it
+// with an alert; the threshold is configurable". The mechanics:
 //
-//   - перед записью нового блока (Put после промаха дедупликации) и
-//     периодически (DiskWatchLoop) снимается statfs каталога контента;
-//   - доля свободного места ниже порога content.disk_free_percent —
-//     Put возвращает ErrStoreFull: воркер не сохраняет контент, но
-//     результат пишет (контракт ТЗ 8 — пауза записи контента, не
-//     результатов); чтение и дедуп-ссылки продолжаются — байты не
-//     расходуются;
-//   - сигнал алерта — типизированное событие StoreFullEvent в хук
-//     PackOptions.OnStoreFull (счётчик для T-080) и Warn в логе
-//     DiskWatchLoop; сам алерт (метрики, рассылка) — T-080, здесь не
-//     реализуется;
-//   - ENOSPC при физической записи пака остаётся последней линией
-//     обороны (wrapPackWriteErr, T-042) и тоже даёт событие.
+//   - before writing a new block (a Put after a deduplication miss) and
+//     periodically (DiskWatchLoop) a statfs of the content directory is taken;
+//   - when the free-space share is below the content.disk_free_percent threshold —
+//     Put returns ErrStoreFull: the worker does not store the content but still
+//     writes the result (the spec 8 contract — a pause of content writing, not
+//     of results); reads and dedup references continue — no bytes are
+//     consumed;
+//   - the alert signal is a typed StoreFullEvent event delivered to the
+//     PackOptions.OnStoreFull hook (a counter for T-080) and a Warn in the
+//     DiskWatchLoop log; the alert itself (metrics, paging) is T-080 and is not
+//     implemented here;
+//   - ENOSPC on a physical pack write remains the last line of
+//     defense (wrapPackWriteErr, T-042) and also fires an event.
 //
-// Отдельного счётчика занятого места нет (как и у компактификации,
-// T-045): занятое — сумма размеров пак-файлов, свободное берётся живым
-// statfs, поэтому после ротации и удаления старых паков компактификацией
-// порог честно перевычисляется и запись возобновляется сама.
+// There is no separate counter of used space (just as in compaction,
+// T-045): the used space is the sum of the pack-file sizes, the free space
+// comes from a live statfs, so after rotation and removal of old packs by
+// compaction the threshold is honestly recomputed and writing resumes on
+// its own.
 package content
 
 import (
@@ -32,48 +33,49 @@ import (
 	"time"
 )
 
-// DefaultDiskWatchInterval — интервал периодической проверки места
-// DiskWatchLoop. ТЗ темп не задаёт: statfs — один дешёвый сисколл,
-// 30 секунд дают алерту T-080 свежесть минуты без заметной нагрузки.
+// DefaultDiskWatchInterval — the interval of DiskWatchLoop periodic checks.
+// The spec does not set the pace: a statfs is one cheap syscall,
+// 30 seconds give the T-080 alert minute-level freshness without noticeable
+// load.
 const DefaultDiskWatchInterval = 30 * time.Second
 
-// Источники события StoreFullEvent (Source).
+// Sources of a StoreFullEvent event (Source).
 const (
-	// StoreFullPut — Put упёрся в порог свободного места: новый блок
-	// не дописан, данные не испорчены.
+	// StoreFullPut — Put ran into the free-space threshold: the new block
+	// was not appended, the data is not corrupted.
 	StoreFullPut = "put"
-	// StoreFullENOSPC — физическая запись пака закончилась ошибкой
-	// ENOSPC (последняя линия обороны после порога).
+	// StoreFullENOSPC — the physical pack write ended with an
+	// ENOSPC error (the last line of defense after the threshold).
 	StoreFullENOSPC = "enospc"
-	// StoreFullWatch — периодическая проверка DiskWatchLoop (вход в
-	// паузу и восстановление).
+	// StoreFullWatch — the periodic DiskWatchLoop check (entering the
+	// pause and the recovery).
 	StoreFullWatch = "watch"
 )
 
-// SpaceStat — снимок места файловой системы каталога, байты.
+// SpaceStat — a snapshot of the directory's file system space, bytes.
 type SpaceStat struct {
-	// Avail — доступно процессам без root-резерва (statfs.Bavail):
-	// сервисы краулера работают непривилегированными (ТЗ 10.1).
+	// Avail — available to processes without the root reserve (statfs.Bavail):
+	// the crawler services run unprivileged (spec 10.1).
 	Avail uint64
-	// Total — ёмкость тома (statfs.Blocks).
+	// Total — the volume capacity (statfs.Blocks).
 	Total uint64
 }
 
-// SpaceChecker — источник сведений о месте файловой системы; выделен
-// интерфейсом, чтобы юнит-тесты подменяли statfs без реального тома.
+// SpaceChecker — a source of file-system space information; extracted as
+// an interface so unit tests can stub statfs without a real volume.
 type SpaceChecker interface {
-	// Space возвращает снимок места каталога dir.
+	// Space returns a snapshot of the dir directory's space.
 	Space(dir string) (SpaceStat, error)
 }
 
-// OSStatfs — SpaceChecker поверх syscall.Statfs (реальная файловая
-// система каталога контента).
+// OSStatfs — a SpaceChecker over syscall.Statfs (the real file
+// system of the content directory).
 type OSStatfs struct{}
 
-// compile-time: OSStatfs — SpaceChecker.
+// compile-time: OSStatfs is a SpaceChecker.
 var _ SpaceChecker = OSStatfs{}
 
-// Space снимает statfs каталога dir.
+// Space takes a statfs of the dir directory.
 func (OSStatfs) Space(dir string) (SpaceStat, error) {
 	var st syscall.Statfs_t
 	if err := syscall.Statfs(dir, &st); err != nil {
@@ -86,29 +88,30 @@ func (OSStatfs) Space(dir string) (SpaceStat, error) {
 	}, nil
 }
 
-// StoreFullEvent — типизированное событие «запись контента остановлена:
-// свободное место каталога ниже порога» (ТЗ 8). Аргумент хука алерта
-// PackOptions.OnStoreFull и логов DiskWatchLoop; счётчик/метрика — T-080.
+// StoreFullEvent — a typed event "content writing stopped: the free space
+// of the directory is below the threshold" (spec 8). The argument of the
+// PackOptions.OnStoreFull alert hook and of the DiskWatchLoop logs; the
+// counter/metric is T-080.
 type StoreFullEvent struct {
-	// Space — снимок места на момент события (у события ENOSPC —
-	// best-effort после неудачной записи).
+	// Space — a snapshot of the space at the moment of the event (for an
+	// ENOSPC event — best-effort after the failed write).
 	Space SpaceStat
-	// Source — кто обнаружил: StoreFullPut / StoreFullENOSPC /
+	// Source — who detected it: StoreFullPut / StoreFullENOSPC /
 	// StoreFullWatch.
 	Source string
-	// Recovered — место вернулось за порог, пауза снята (только
-	// StoreFullWatch: переход «полно → свободно»).
+	// Recovered — the space returned above the threshold, the pause is lifted
+	// (StoreFullWatch only: the "full → free" transition).
 	Recovered bool
 }
 
-// OnStoreFullFunc — хук алерта T-080: вызывается на каждом Put,
-// остановленном порогом (Source = put — счётчик событий), на ENOSPC
-// и на переходах периодической проверки. Хук обязан быть быстрым и
-// не паниковать: вызывается под Put.
+// OnStoreFullFunc — the T-080 alert hook: called for every Put
+// stopped by the threshold (Source = put — an event counter), for ENOSPC,
+// and on transitions of the periodic check. The hook must be fast and
+// must not panic: it is called under Put.
 type OnStoreFullFunc func(StoreFullEvent)
 
-// spaceChecker — источник statfs хранилища (nil — реальная ОС; тесты
-// пакета подменяют поле stat до первого использования).
+// spaceChecker — the store's statfs source (nil — the real OS; the package
+// tests stub the stat field before first use).
 func (s *PackStore) spaceChecker() SpaceChecker {
 	if s.stat != nil {
 		return s.stat
@@ -116,14 +119,14 @@ func (s *PackStore) spaceChecker() SpaceChecker {
 	return OSStatfs{}
 }
 
-// diskFull — снимок места каталога контента и вердикт «свободного меньше
-// порога». Общий источник для паузы Put (T-046) и периодической проверки
-// DiskWatchLoop: одна формула — неотвергающая семантика. Total = 0 —
-// экзотическая ФС без ёмкости: пауза по доле неопределима, отдаём «место
-// есть» (ложная пауза остановила бы запись рабочего каталога).
+// diskFull — a snapshot of the content directory's space and the "free space
+// below the threshold" verdict. A shared source for the Put pause (T-046) and the
+// DiskWatchLoop periodic check: one formula — non-rejecting semantics. Total = 0 is
+// an exotic FS without capacity: a share-based pause is undefinable, we report
+// "space available" (a false pause would stop writing to a working directory).
 func (s *PackStore) diskFull() (sp SpaceStat, full bool, err error) {
 	if s.opts.DiskFreePercent <= 0 {
-		return SpaceStat{}, false, nil // контроль выключен (конфиг задаёт всегда)
+		return SpaceStat{}, false, nil // the control is disabled (the config always sets it)
 	}
 	sp, err = s.spaceChecker().Space(s.opts.Dir)
 	if err != nil {
@@ -136,10 +139,10 @@ func (s *PackStore) diskFull() (sp SpaceStat, full bool, err error) {
 	return sp, full, nil
 }
 
-// pauseIfDiskFull — пауза записи контента (ТЗ 8): места ниже порога —
-// ErrStoreFull и событие в хук алерта. Вызывается Put-ом только перед
-// дописыванием нового блока: дедуп-ссылки и чтение байтов не тратят и
-// продолжают работать.
+// pauseIfDiskFull — the content write pause (spec 8): space below the
+// threshold — ErrStoreFull and an event to the alert hook. Put calls it only
+// before appending a new block: dedup references and byte reads consume nothing
+// and keep working.
 func (s *PackStore) pauseIfDiskFull() error {
 	sp, full, err := s.diskFull()
 	if err != nil {
@@ -154,17 +157,17 @@ func (s *PackStore) pauseIfDiskFull() error {
 		100*float64(sp.Avail)/float64(sp.Total), s.opts.DiskFreePercent)
 }
 
-// fireStoreFull отправляет событие в хук алерта, если тот установлен
-// (nil — hook не задан, T-056 подключит на стыке сервиса).
+// fireStoreFull sends the event to the alert hook if it is set
+// (nil — no hook set, T-056 will wire it up at the service boundary).
 func (s *PackStore) fireStoreFull(ev StoreFullEvent) {
 	if s.opts.OnStoreFull != nil {
 		s.opts.OnStoreFull(ev)
 	}
 }
 
-// enospcEvent — событие после ENOSPC: снимок места best-effort (сама
-// запись только что провалилась, statfs может не успеть отразить
-// освобождение — событие информативно и без него).
+// enospcEvent — the event after an ENOSPC: a best-effort space snapshot (the
+// write itself just failed, statfs may not yet reflect
+// the reclamation — the event is informative without it).
 func (s *PackStore) enospcEvent() StoreFullEvent {
 	ev := StoreFullEvent{Source: StoreFullENOSPC}
 	if sp, err := s.spaceChecker().Space(s.opts.Dir); err == nil {
@@ -173,21 +176,21 @@ func (s *PackStore) enospcEvent() StoreFullEvent {
 	return ev
 }
 
-// DiskWatchOptions — параметры DiskWatchLoop; нулевой Interval —
-// DefaultDiskWatchInterval, nil Log — записи подавлены.
+// DiskWatchOptions — DiskWatchLoop parameters; a zero Interval means
+// DefaultDiskWatchInterval, a nil Log suppresses records.
 type DiskWatchOptions struct {
 	Interval time.Duration
 	Log      *slog.Logger
 }
 
-// DiskWatchLoop — периодическая проверка свободного места каталога
-// контента (ТЗ 8): Warn в логе и событие StoreFullEvent при входе
-// в паузу (даже если записей нет — алерт виден оператору), Info
-// и Recovered-событие при восстановлении. Сигнал фронтовой (на
-// переходах), не на каждом тике: Warn-шторм неделю полного диска —
-// не информация. Ошибка statfs — Warn без смены состояния: следующий
-// тик повторит. Возврат nil при отмене ctx — контракт OnRun каркаса
-// (стиль CompactLoop).
+// DiskWatchLoop — the periodic free-space check of the content
+// directory (spec 8): a Warn in the log and a StoreFullEvent event when entering
+// the pause (even if there are no writes — the alert is visible to the operator),
+// an Info and a Recovered event on recovery. The signal is edge-triggered (on
+// transitions), not on every tick: a week-long Warn storm of a full disk is
+// not information. A statfs error is a Warn without a state change: the next
+// tick retries. Returning nil on ctx cancellation is the OnRun contract of the
+// framework (the CompactLoop style).
 func DiskWatchLoop(ctx context.Context, st *PackStore, opts DiskWatchOptions) error {
 	if st == nil {
 		return errors.New("content: контроль диска: хранилище не задано")
@@ -224,7 +227,7 @@ func DiskWatchLoop(ctx context.Context, st *PackStore, opts DiskWatchOptions) er
 		}
 	}
 
-	check() // первый проход сразу: дренаж накопленного за простой
+	check() // the first pass right away: drain what accumulated during idle
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -237,9 +240,9 @@ func DiskWatchLoop(ctx context.Context, st *PackStore, opts DiskWatchOptions) er
 	}
 }
 
-// humanBytes — человекочитаемый размер для сообщений об ошибках и логов
-// (локальный аналог config.ByteSize.String: пакет контента не тянет
-// конфигурацию ради форматирования).
+// humanBytes — a human-readable size for error messages and logs
+// (a local analog of config.ByteSize.String: the content package does not
+// pull in the configuration just for formatting).
 func humanBytes(n uint64) string {
 	switch {
 	case n >= 1<<30:

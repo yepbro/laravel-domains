@@ -1,14 +1,17 @@
-// Обучаемый словарь zstd (ТЗ 5.7, задача T-043; реестр прежних — T-103).
+// The trainable zstd dictionary (spec 5.7, task T-043; the registry of
+// retired dictionaries is T-103).
 //
-// Сжатие маленьких HTML-страниц (парковки, заглушки хостингов — основной
-// контент краулера) гораздо выгоднее с обученным словарём: типовой шаблон
-// попадает в словарь и не кодируется в каждом кадре. Обучение — чистая
-// реализация пакета klauspost/compress (zstd.BuildDict, есть с v1.18):
-// внешний бинарник `zstd --train` и новые зависимости не нужны. Словарь
-// переобучается по требованию командой crawlerctl dict train и кладётся
-// в файл по пути content.zstd_dictionary; прежний словарь при этом
-// архивируется в реестр (dict-<id>.zstd рядом с активным файлом) —
-// записанный контент остаётся читаемым (T-103).
+// Compressing small HTML pages (parking pages, hosting suspension pages —
+// the crawler's main content) is far more efficient with a trained
+// dictionary: the typical template lands in the dictionary and is not
+// encoded in every frame. Training is a pure implementation on top of the
+// klauspost/compress package (zstd.BuildDict, available since v1.18):
+// no external `zstd --train` binary and no new dependencies are needed.
+// The dictionary is retrained on demand by the crawlerctl dict train
+// command and placed into the file at the content.zstd_dictionary path;
+// the retired dictionary is archived into the registry at the same time
+// (dict-<id>.zstd next to the active file) — already written content
+// stays readable (T-103).
 
 package content
 
@@ -27,44 +30,45 @@ import (
 	"github.com/klauspost/compress/zstd"
 )
 
-// Параметры обучения. Лимиты защищают разовую CLI-операцию переобучения
-// от неограниченной памяти: словарь строится по подвыборке корпуса, которой
-// для устойчивой статистики шаблонов достаточно с запасом.
+// Training parameters. The limits protect the one-off CLI retraining
+// operation from unbounded memory: the dictionary is built from a corpus
+// subsample that is amply sufficient for stable template statistics.
 const (
-	// DefaultDictSize — целевой размер содержимого словаря: 110 KiB, как
-	// maxdict по умолчанию у `zstd --train`.
+	// DefaultDictSize — the target size of the dictionary contents: 110 KiB, like
+	// maxdict's default for `zstd --train`.
 	DefaultDictSize = 110 << 10
-	// MinDictSize/MaxDictSize — границы TrainOptions.DictSize.
+	// MinDictSize/MaxDictSize — the bounds of TrainOptions.DictSize.
 	MinDictSize = 1 << 10
 	MaxDictSize = 1 << 20
 
-	// trainSegmentSize — длина сегмента-кандидата: короткие повторяющиеся
-	// фрагменты HTML (теги, атрибуты, типовые скрипты) укладываются в 16 байт,
-	// более длинные собираются из соседних сегментов без пропусков.
+	// trainSegmentSize — the length of a candidate segment: short repeating
+	// HTML fragments (tags, attributes, typical scripts) fit into 16 bytes,
+	// longer ones are assembled from adjacent segments without gaps.
 	trainSegmentSize = 16
-	// trainMinSegmentFreq — сегмент-кандидат обязан встретиться минимум дважды:
-	// одиночные вхождения словарю не помогают.
+	// trainMinSegmentFreq — a candidate segment must occur at least twice:
+	// single occurrences do not help the dictionary.
 	trainMinSegmentFreq = 2
-	// trainScanLimit — объём корпуса, по которому считаются частоты сегментов.
+	// trainScanLimit — the amount of corpus over which segment frequencies
+	// are counted.
 	trainScanLimit = 4 << 20
-	// trainMaxEntries — запоминаемых вхождений сегмента: берётся первое,
-	// не пересекающееся с уже выбранными.
+	// trainMaxEntries — segment occurrences remembered: the first one
+	// that does not overlap the already selected ones is taken.
 	trainMaxEntries = 4
-	// DefaultTrainCorpusLimit — суммарный объём образцов, отдаваемых
-	// zstd.BuildDict (статистика литералов и последовательностей).
+	// DefaultTrainCorpusLimit — the total size of samples handed to
+	// zstd.BuildDict (literal and sequence statistics).
 	DefaultTrainCorpusLimit = 64 << 20
 )
 
-// trainEntry — вхождение сегмента обучения (образец, смещение).
+// trainEntry — a training segment occurrence (sample, offset).
 type trainEntry struct{ sample, off int }
 
-// ---------------------------------------------------------------- словарь
+// ---------------------------------------------------------------- dictionary
 
-// Dict — обученный словарь zstd и кодеки, настроенные на него. Удовлетворяет
-// формату zstd-словаря (заголовок + таблицы + содержимое), создаётся
-// обучением (TrainDict) или загрузкой из файла (LoadDict). Методы
-// безопасны для одновременного использования из нескольких горутин:
-// EncodeAll/DecodeAll у klauspost/compress не меняют состояние кодеков.
+// Dict — a trained zstd dictionary and the codecs configured for it. It satisfies
+// the zstd dictionary format (header + tables + contents); it is created
+// by training (TrainDict) or by loading from a file (LoadDict). The methods
+// are safe for concurrent use from multiple goroutines:
+// klauspost/compress EncodeAll/DecodeAll do not mutate the codecs.
 type Dict struct {
 	raw []byte
 	id  uint32
@@ -72,8 +76,8 @@ type Dict struct {
 	dec *zstd.Decoder
 }
 
-// NewDict создаёт кодеки поверх словаря в формате zstd (файл
-// `zstd --train`, crawlerctl dict train или LoadDict).
+// NewDict creates codecs on top of a dictionary in zstd format (a
+// `zstd --train` file, crawlerctl dict train, or LoadDict).
 func NewDict(raw []byte) (*Dict, error) {
 	insp, err := zstd.InspectDictionary(raw)
 	if err != nil {
@@ -85,39 +89,39 @@ func NewDict(raw []byte) (*Dict, error) {
 	}
 	dec, err := zstd.NewReader(nil, zstd.WithDecoderDicts(raw))
 	if err != nil {
-		_ = enc.Close() // очистка best effort: основная ошибка — декодер
+		_ = enc.Close() // best-effort cleanup: the primary error is the decoder
 		return nil, fmt.Errorf("декодер со словарём: %w", err)
 	}
 	return &Dict{raw: raw, id: insp.ID(), enc: enc, dec: dec}, nil
 }
 
-// ID возвращает идентификатор словаря (dictID в заголовке сжатых кадров).
+// ID returns the dictionary identifier (dictID in the header of compressed frames).
 func (d *Dict) ID() uint32 { return d.id }
 
-// Raw возвращает словарь в формате zstd — для записи в файл
-// (content.zstd_dictionary) и передачи другим процессам.
+// Raw returns the dictionary in zstd format — for writing it to a file
+// (content.zstd_dictionary) and passing it to other processes.
 func (d *Dict) Raw() []byte { return d.raw }
 
-// Compress сжимает src с обученным словарём. Маленькие страницы того же
-// шаблона, по которому обучался словарь, сжимаются заметно лучше Compress.
+// Compress compresses src with the trained dictionary. Small pages of the same
+// template the dictionary was trained on compress noticeably better than with Compress.
 func (d *Dict) Compress(src []byte) []byte {
 	return d.enc.EncodeAll(src, nil)
 }
 
-// Decompress распаковывает кадры, сжатые Compress данного словаря; кадры
-// без словаря (dictID 0) также читаются — декодер выбирает словарь по
-// заголовку кадра.
+// Decompress decompresses frames compressed by this dictionary's Compress; frames
+// without a dictionary (dictID 0) are also readable — the decoder picks the dictionary
+// by the frame header.
 func (d *Dict) Decompress(src []byte) ([]byte, error) {
 	return d.dec.DecodeAll(src, nil)
 }
 
-// Save записывает словарь в path атомарно (временный файл в том же
-// каталоге + rename): сервис, читающий файл при старте, не увидит
-// наполовину записанный словарь переобучения. Данные синхронизируются
-// до rename (Close записи на носитель не гарантирует), rename — запись
-// в каталоге, поэтому синхронизируется и каталог: иначе сбой питания
-// сразу после Save оставляет пустой/частичный словарь, а сервисы
-// отказываются стартовать на битом файле (T-043).
+// Save writes the dictionary to path atomically (a temporary file in the same
+// directory + rename): a service reading the file at startup will not see
+// a half-written retrained dictionary. The data is synced
+// before the rename (a writer's Close does not guarantee it hits the medium), and rename is
+// a directory write, so the directory is synced too: otherwise a power failure
+// right after Save leaves an empty/partial dictionary, and services
+// refuse to start on a broken file (T-043).
 func (d *Dict) Save(path string) error {
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".*")
@@ -126,7 +130,7 @@ func (d *Dict) Save(path string) error {
 	}
 	name := tmp.Name()
 	if _, err := tmp.Write(d.raw); err != nil {
-		_ = tmp.Close() // очистка best effort: основная ошибка — запись
+		_ = tmp.Close() // best-effort cleanup: the primary error is the write
 		_ = os.Remove(name)
 		return fmt.Errorf("словарь: запись: %w", err)
 	}
@@ -147,8 +151,8 @@ func (d *Dict) Save(path string) error {
 		_ = os.Remove(name)
 		return fmt.Errorf("словарь: переименование: %w", err)
 	}
-	// Связь имени с файлом живёт в каталоге — best effort: сбой здесь
-	// редок, а словарь воспроизводим повторным обучением (train).
+	// The name-to-file link lives in the directory — best effort: a failure here
+	// is rare, and the dictionary is reproducible by retraining (train).
 	if dh, err := os.Open(dir); err == nil {
 		_ = dh.Sync()
 		_ = dh.Close()
@@ -156,8 +160,8 @@ func (d *Dict) Save(path string) error {
 	return nil
 }
 
-// LoadDict читает словарь из файла (формат — как у `zstd --train`).
-// Отсутствие файла не оборачивается: errors.Is(err, fs.ErrNotExist).
+// LoadDict reads the dictionary from a file (the format is the same as
+// `zstd --train`). A missing file is not wrapped: errors.Is(err, fs.ErrNotExist).
 func LoadDict(path string) (*Dict, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -170,27 +174,27 @@ func LoadDict(path string) (*Dict, error) {
 	return d, nil
 }
 
-// ---------------------------------------------------------------- обучение
+// ---------------------------------------------------------------- training
 
-// TrainOptions — параметры обучения TrainDict. Нулевое DictSize —
+// TrainOptions — TrainDict training parameters. A zero DictSize means
 // DefaultDictSize.
 type TrainOptions struct {
-	// DictSize — целевой размер содержимого словаря, байты
-	// (MinDictSize..MaxDictSize). Фактический размер может быть меньше,
-	// если повторяющихся фрагментов в корпусе мало.
+	// DictSize — the target size of the dictionary contents, bytes
+	// (MinDictSize..MaxDictSize). The actual size may be smaller
+	// if the corpus has few repeating fragments.
 	DictSize int
 }
 
-// TrainDict обучает словарь zstd по образцам (HTML-страницы) и возвращает
-// готовый к использованию Dict.
+// TrainDict trains a zstd dictionary on samples (HTML pages) and returns a
+// Dict ready for use.
 //
-// Содержимое словаря (History в терминах zstd.BuildDict) собирается из
-// наиболее часто повторяющихся сегментов корпуса: жадный отбор по убыванию
-// частоты, внутри одного образца выбранные вхождения не пересекаются —
-// длинный повтор целиком набирается соседними сегментами без дублирования.
-// Статистические таблицы словаря (литералы, последовательности) строят
-// самой библиотекой zstd.BuildDict по всему корпусу — формат словаря
-// стандартный, кадры читает и реальный zstd.
+// The dictionary contents (History in zstd.BuildDict terms) are assembled from
+// the most frequently repeating corpus segments: a greedy selection by descending
+// frequency; within one sample the selected occurrences do not overlap —
+// a long repeat is assembled in full from adjacent segments without duplication.
+// The dictionary's statistical tables (literals, sequences) are built
+// by the zstd.BuildDict library itself over the whole corpus — the dictionary format
+// is standard, and real zstd reads the frames too.
 func TrainDict(samples [][]byte, opts TrainOptions) (*Dict, error) {
 	dictSize := opts.DictSize
 	if dictSize == 0 {
@@ -217,10 +221,10 @@ func TrainDict(samples [][]byte, opts TrainOptions) (*Dict, error) {
 		return nil, errors.New("dict train: в корпусе нет повторяющихся фрагментов — словарь не обучается")
 	}
 
-	// ID словаря — детерминированная функция содержимого: один и тот же
-	// корпус даёт один и тот же ID, разные версии словаря различаются
-	// (декодер выбирает словарь из зарегистрированных по dictID кадра).
-	// ID 0 форматом запрещён.
+	// The dictionary ID is a deterministic function of the contents: the same
+	// corpus yields the same ID, different dictionary versions differ
+	// (the decoder picks a dictionary from the registered ones by the frame's dictID).
+	// ID 0 is forbidden by the format.
 	id := fnv.New32a()
 	_, _ = id.Write(history)
 	dictID := id.Sum32()
@@ -240,11 +244,11 @@ func TrainDict(samples [][]byte, opts TrainOptions) (*Dict, error) {
 	return NewDict(raw)
 }
 
-// trainHistory отбирает содержимое словаря: сегменты trainSegmentSize байт
-// с частотой ≥ trainMinSegmentFreq, по убыванию частоты; вхождение сегмента
-// в образец берётся, только если оно не пересекается с уже выбранными
-// вхождениями того же образца. Детерминировано: порядок кандидатов полный
-// (частота, затем лексикографический), обход корпуса — в порядке образцов.
+// trainHistory selects the dictionary contents: segments of trainSegmentSize bytes
+// with frequency ≥ trainMinSegmentFreq, by descending frequency; a segment occurrence
+// in a sample is taken only if it does not overlap the already selected
+// occurrences of the same sample. Deterministic: the candidate order is total
+// (frequency, then lexicographic), the corpus is traversed in sample order.
 func trainHistory(samples [][]byte, dictSize int) []byte {
 	type info struct {
 		freq    int
@@ -252,7 +256,7 @@ func trainHistory(samples [][]byte, dictSize int) []byte {
 		n       int
 	}
 
-	// Фаза 1: частоты сегментов по префиксу корпуса (до trainScanLimit).
+	// Phase 1: segment frequencies over a corpus prefix (up to trainScanLimit).
 	counts := make(map[string]*info)
 	var scanned int
 	for si, s := range samples {
@@ -268,7 +272,7 @@ func trainHistory(samples [][]byte, dictSize int) []byte {
 		}
 		for off := 0; off < limit; off++ {
 			seg := s[off : off+trainSegmentSize]
-			inf := counts[string(seg)] // lookup без аллокации
+			inf := counts[string(seg)] // a lookup without allocation
 			if inf == nil {
 				inf = &info{}
 				counts[string(seg)] = inf
@@ -282,7 +286,7 @@ func trainHistory(samples [][]byte, dictSize int) []byte {
 		scanned += len(s)
 	}
 
-	// Фаза 2: жадный отбор непересекающихся вхождений.
+	// Phase 2: greedy selection of non-overlapping occurrences.
 	type candidate struct {
 		seg string
 		inf *info
@@ -300,7 +304,7 @@ func trainHistory(samples [][]byte, dictSize int) []byte {
 		return cands[i].seg < cands[j].seg
 	})
 
-	taken := make([][]trainEntry, len(samples)) // занятые диапазоны по образцам
+	taken := make([][]trainEntry, len(samples)) // occupied ranges per sample
 	history := make([]byte, 0, dictSize)
 	for _, c := range cands {
 		if len(history) >= dictSize {
@@ -319,8 +323,8 @@ func trainHistory(samples [][]byte, dictSize int) []byte {
 	return history
 }
 
-// overlapsSegment сообщает, пересекает ли сегмент с началом off какой-нибудь
-// из уже выбранных диапазонов длинной trainSegmentSize.
+// overlapsSegment reports whether a segment starting at off overlaps any
+// of the already selected ranges of length trainSegmentSize.
 func overlapsSegment(taken []trainEntry, off int) bool {
 	for _, e := range taken {
 		if off < e.off+trainSegmentSize && e.off < off+trainSegmentSize {
@@ -330,46 +334,49 @@ func overlapsSegment(taken []trainEntry, off int) bool {
 	return false
 }
 
-// ---------------------------------------------------------------- активный словарь пакета
+// ---------------------------------------------------------------- the package's active dictionary
 
-// Активный словарь — один на процесс (путь из content.zstd_dictionary).
-// Смена словаря на лету не предусматривается: переобученный файл
-// подхватывается при следующей инициализации (SetDictFile). Прежние
-// словари не теряются: crawlerctl dict train архивирует их в реестр
-// dict-<id>.zstd рядом с активным файлом (RetireDict), чтение блоков
-// с чужим процессу dictID до-регистрирует словарь из реестра лениво
-// и memoизирует его (T-103) — переобучение не делает записанный
-// контент нечитаемым.
+// The active dictionary is one per process (the path from
+// content.zstd_dictionary). Changing the dictionary on the fly is not
+// supported: a retrained file is picked up at the next initialization
+// (SetDictFile). Retired dictionaries are not lost: crawlerctl dict train
+// archives them into the dict-<id>.zstd registry next to the active file
+// (RetireDict); reading a block with a dictID foreign to the process lazily
+// registers the dictionary from the registry and memoizes it (T-103) —
+// retraining does not make written content unreadable.
 var (
 	dictMu  sync.RWMutex
 	activeD *Dict
-	// dictDir — каталог реестра прежних словарей: тот же, что у активного
-	// файла (задаётся SetDictFile). retiredD — memoизация загруженных из
-	// реестра словарей по dictID.
+	// dictDir — the directory of the retired-dictionary registry: the same one
+	// the active file lives in (set by SetDictFile). retiredD — memoization of
+	// dictionaries loaded from the registry by dictID.
 	dictDir  string
 	retiredD map[uint32]*Dict
 )
 
-// SetDict устанавливает словарь для CompressWithDict/DecompressWithDict.
-// nil — отключает (сжатие без словаря). Реестр прежних словарей не трогает:
-// его каталог определяется файлом конфигурации (SetDictFile).
+// SetDict sets the dictionary for CompressWithDict/DecompressWithDict.
+// nil disables it (compression without a dictionary). It does not touch the
+// retired-dictionary registry: its directory is determined by the configuration
+// file (SetDictFile).
 func SetDict(d *Dict) {
 	dictMu.Lock()
 	activeD = d
 	dictMu.Unlock()
 }
 
-// SetDictFile загружает словарь из файла (путь из content.zstd_dictionary)
-// и подключает реестр прежних словарей — каталогом реестра становится
-// каталог активного файла. Пустой путь или отсутствующий файл — не ошибка:
-// возвращается false, сервис работает без словаря (Compress/
-// CompressWithDict одинаково падают в каркасное сжатие); отсутствие
-// отмечается в логе, а реестр остаётся подключённым — блоки, сжатые
-// прежними словарями, читаются и без активного файла. Битый файл —
-// ошибка: молчаливое сжатие без словаря скрыло бы проблему конфигурации.
+// SetDictFile loads the dictionary from a file (the path from
+// content.zstd_dictionary) and wires up the retired-dictionary registry —
+// the registry's directory becomes the directory of the active file. An empty
+// path or a missing file is not an error: false is returned and the service
+// runs without a dictionary (Compress/CompressWithDict fall back to the
+// framework compression identically); the absence is noted in the log, and
+// the registry stays wired up — blocks compressed with retired dictionaries
+// are readable even without the active file. A broken file is
+// an error: silently compressing without a dictionary would hide a configuration
+// problem.
 func SetDictFile(path string, log *slog.Logger) (bool, error) {
-	// Смена пути — сброс реестра и memoизации; до возвращения из функции
-	// чтение по старому каталогу невозможно (dictDir уже новый).
+	// A path change resets the registry and the memoization; until the function
+	// returns, reads via the old directory are impossible (dictDir is already the new one).
 	dictMu.Lock()
 	dictDir = ""
 	if path != "" {
@@ -403,14 +410,15 @@ func SetDictFile(path string, log *slog.Logger) (bool, error) {
 	return true, nil
 }
 
-// WarnDictMismatch сверяет активный словарь пакета с dictID заголовка
-// новейшего пака каталога dir — диагностика при старте сервиса (T-043).
-// Кадр прежнего словаря читается до-регистрацией из реестра (T-103):
-// расхождение с архивированным в реестр словарём — Info (читаемость
-// есть), Warn — только если прежний словарь и в реестре отсутствует
-// (кадры этого пака нечитаемы, текст называет порядок восстановления —
-// runbooks.md §1). Паков нет или заголовок новейшего нечитаем — молча:
-// это не расхождение словаря.
+// WarnDictMismatch cross-checks the package's active dictionary against the
+// dictID of the header of the newest pack of the dir directory — startup
+// diagnostics (T-043). A frame of a retired dictionary is read via late
+// registration from the registry (T-103): a mismatch with a dictionary archived
+// in the registry is Info (readability holds); Warn only if the retired
+// dictionary is absent from the registry too
+// (the frames of this pack are unreadable, the text names the recovery
+// procedure — runbooks.md §1). No packs or an unreadable newest header —
+// silently: that is not a dictionary mismatch.
 func WarnDictMismatch(dir string, log *slog.Logger) {
 	if log == nil || dir == "" {
 		return
@@ -426,7 +434,7 @@ func WarnDictMismatch(dir string, log *slog.Logger) {
 		}
 	}
 	if max == 0 {
-		return // паков нет — сверять не с чем
+		return // no packs — nothing to compare against
 	}
 	f, err := os.Open(filepath.Join(dir, packFileName(max)))
 	if err != nil {
@@ -443,8 +451,8 @@ func WarnDictMismatch(dir string, log *slog.Logger) {
 		reg := dictDir
 		dictMu.RUnlock()
 		if reg != "" {
-			// Существование файла дешевле загрузки кодеков при старте:
-			// сама ленивая до-регистрация произойдёт при первом чтении.
+			// Checking file existence is cheaper than loading codecs at startup:
+			// the lazy late registration itself happens on the first read.
 			if _, err := os.Stat(DictRegistryPath(reg, hdr.dictID)); err == nil {
 				log.Info("словарь zstd новее пака — кадры прежнего словаря читаются через реестр",
 					"pack", max, "pack_dict_id", packDict, "active_dict_id", actDict, "registry", reg)
@@ -456,11 +464,11 @@ func WarnDictMismatch(dir string, log *slog.Logger) {
 	}
 }
 
-// CompressWithDict сжимает src активным словарём пакета (SetDict /
-// SetDictFile); без установленного словаря — то же, что Compress:
-// запись контента не зависит от того, обучен ли уже словарь. Запись
-// всегда идёт активным словарём — реестр прежних словарей в сжатии
-// не участвует.
+// CompressWithDict compresses src with the package's active dictionary (SetDict /
+// SetDictFile); with no dictionary set it is the same as Compress:
+// content writing does not depend on whether the dictionary has been trained
+// yet. Writing always uses the active dictionary — the retired-dictionary
+// registry does not participate in compression.
 func CompressWithDict(src []byte) []byte {
 	dictMu.RLock()
 	d := activeD
@@ -471,12 +479,12 @@ func CompressWithDict(src []byte) []byte {
 	return d.Compress(src)
 }
 
-// DecompressWithDict распаковывает кадры, сжатые CompressWithDict
-// (активным словарём на момент сжатия) и Compress. Кадр, сжатый
-// прежним словарём (переобучение), до-регистрируется из реестра
-// прежних словарей — ленивая загрузка dict-<id>.zstd по dictID кадра
-// и memoизация (T-103). Словаря в реестре нет — ошибка с исходным
-// zstd.ErrUnknownDictionary и путём реестра в тексте.
+// DecompressWithDict decompresses frames compressed by CompressWithDict
+// (with the dictionary active at compression time) and by Compress. A frame
+// compressed by a retired dictionary (after retraining) is late-registered from
+// the retired-dictionary registry — a lazy load of dict-<id>.zstd by the frame's
+// dictID plus memoization (T-103). No dictionary in the registry — an error with the
+// original zstd.ErrUnknownDictionary and the registry path in the text.
 func DecompressWithDict(src []byte) ([]byte, error) {
 	dictMu.RLock()
 	d := activeD
@@ -493,12 +501,12 @@ func DecompressWithDict(src []byte) ([]byte, error) {
 	if err == nil || !errors.Is(err, zstd.ErrUnknownDictionary) {
 		return raw, err
 	}
-	// Кадр словаря, не зарегистрированного в процессе: dictID — из
-	// заголовка кадра, словарь — из реестра прежних.
+	// A frame of a dictionary not registered in this process: the dictID comes
+	// from the frame header, the dictionary from the retired registry.
 	id := frameDictID(src)
 	if id == 0 || (d != nil && id == d.ID()) {
-		// Заголовок не разобрался или ID совпал с активным — это не
-		// чужой словарь, а повреждение кадра: исходная ошибка честнее.
+		// The header did not parse or the ID matches the active one — this is not
+		// a foreign dictionary but frame corruption: the original error is more honest.
 		return raw, err
 	}
 	rd, rerr := dictFromRegistry(id)
@@ -508,28 +516,29 @@ func DecompressWithDict(src []byte) ([]byte, error) {
 	return rd.Decompress(src)
 }
 
-// DictRegistryPath — путь файла словаря id в реестре прежних словарей
-// каталога dir: реестр живёт рядом с активным файлом (каталог
-// content.zstd_dictionary), имя — по dictID словаря.
+// DictRegistryPath — the path of dictionary id's file in the retired-dictionary
+// registry of the dir directory: the registry lives next to the active file
+// (the directory of content.zstd_dictionary), the name is derived from the
+// dictionary's dictID.
 func DictRegistryPath(dir string, id uint32) string {
 	return filepath.Join(dir, fmt.Sprintf("dict-%08x.zstd", id))
 }
 
-// RetireDict архивирует словарь в реестр прежних словарей каталога dir
-// (атомарная запись Save, T-103): crawlerctl dict train вызывает её до
-// записи нового активного файла — сбой оставляет прежний словарь
-// активным. Идемпотентна: файл того же ID перезаписывается тем же
-// содержимым.
+// RetireDict archives a dictionary into the retired-dictionary registry of the dir
+// directory (an atomic Save write, T-103): crawlerctl dict train calls it before
+// writing the new active file — a failure leaves the retired dictionary
+// active. Idempotent: a file of the same ID is overwritten with the same
+// contents.
 func RetireDict(d *Dict, dir string) error {
 	return d.Save(DictRegistryPath(dir, d.ID()))
 }
 
-// dictFromRegistry возвращает словарь dictID: сперва memoизация, затем
-// ленивая загрузка из реестра (каталог задаёт SetDictFile); загруженный
-// словарь запоминается на время жизни процесса — чтение старых паков
-// не ходит в ФС на каждый блок. Отрицательный результат не memoизируется:
-// файл, положенный в реестр на живом сервисе, подхватывается следующим
-// чтением без рестарта.
+// dictFromRegistry returns the dictionary for a dictID: first the memoization, then
+// a lazy load from the registry (the directory is set by SetDictFile); a loaded
+// dictionary is remembered for the life of the process — reading old packs
+// does not hit the FS for every block. A negative result is not memoized:
+// a file placed into the registry on a live service is picked up by the next
+// read without a restart.
 func dictFromRegistry(id uint32) (*Dict, error) {
 	dictMu.RLock()
 	d := retiredD[id]
@@ -565,13 +574,13 @@ func dictFromRegistry(id uint32) (*Dict, error) {
 	return d, nil
 }
 
-// frameDictID извлекает ID словаря из заголовка кадра zstd (0 — кадр
-// без словаря или заголовок не разобрался: короткий обрыв, чужие байты).
-// Заголовок: magic, дескриптор кадра (биты 0x20 — Single_Segment,
-// 0x03 — размер Dictionary_ID), необязательный байт window-дескриптора
-// (без Single_Segment), затем сам ID размером 1/2/4 байта. Ошибкой не
-// сопровождается: вызывается после ошибки декодера — причину в итоге
-// называет он.
+// frameDictID extracts the dictionary ID from a zstd frame header (0 — a frame
+// without a dictionary or an unparsable header: a short truncation, foreign bytes).
+// The header: magic, the frame descriptor (bits 0x20 — Single_Segment,
+// 0x03 — the Dictionary_ID size), an optional window-descriptor byte
+// (without Single_Segment), then the ID itself, 1/2/4 bytes. It does not
+// return an error: it is called after the decoder failed — the decoder names
+// the cause in the end.
 func frameDictID(frame []byte) uint32 {
 	if len(frame) < 5 || binary.LittleEndian.Uint32(frame[:4]) != 0xFD2FB528 {
 		return 0
@@ -586,11 +595,11 @@ func frameDictID(frame []byte) uint32 {
 		size = 4
 	}
 	if size == 0 {
-		return 0 // кадр без словаря
+		return 0 // a frame without a dictionary
 	}
 	pos := 5
 	if frame[4]&0x20 == 0 {
-		pos++ // window-дескриптор присутствует без Single_Segment
+		pos++ // the window descriptor is present without Single_Segment
 	}
 	if len(frame) < pos+size {
 		return 0

@@ -1,34 +1,35 @@
-// Групповая фиксация записей контента (T-102; отложенная находка C-15).
+// Group commit of content records (T-102; deferred finding C-15).
 //
-// Put платит за каждый блок отдельный fsync и отдельный запрос к БД под
-// flock — цена инвариантов C-1. Потребитель, сохраняющий несколько
-// страниц сразу (до 126 записей), фиксирует их одной групповой
-// фиксацией: PutBatch дописывает блоки пачки и фиксирует метаданные
-// всех строк одной групповой фиксацией: один fsync и один пакетный
-// INSERT на пачку вместо по-блочных (с T-147 http-worker сохраняет
-// страницы ранними Put по одной — память слота дороже; пачкой пишут
-// внутренние проходы компактификации и будущие держатели пачек).
-// Инвариант C-1 не ослабляется:
+// Put pays a separate fsync and a separate DB query under flock for every
+// block — the price of the C-1 invariants. A consumer storing several
+// pages at once (up to 126 records) commits them with one group commit:
+// PutBatch appends the batch's blocks and commits the metadata of all
+// rows with one group commit: one fsync and one batched INSERT per batch
+// instead of per-block ones (since T-147 the http-worker stores pages with
+// early Puts one at a time — slot memory is more expensive; batches are
+// written by the internal compaction passes and future batch holders).
+// The C-1 invariant is not weakened:
 //
-//   - байты раньше строк: единственный fsync пачки выполняется ДО
-//     пакетного INSERT — строка не может зафиксироваться раньше своих
-//     байтов на диске (паки, закрытые ротацией внутри пачки,
-//     синхронизируются при ротации — closeActiveLocked, как у пачек
-//     компактификации C-11);
-//   - пак не удаляется раньше фиксации его живых строк: пакетный INSERT
-//     выполняется под flock, взятым до первого дописывания блока пачки.
-//     Компактификация удаляет паки под той же блокировкой (T-045) —
-//     окно «ротация → unlink → INSERT» закрыто взаимным исключением,
-//     а не временем: пометки «пак в записи» и grace-периоды в
-//     компактификации не вводятся (межпроцессная пометка требовала бы
-//     файла с собственной crash-семантикой; ошибка там — тот же класс
-//     потери, что C-1, а выигрыш против одного INSERT на пачку минимален).
+//   - bytes before rows: the batch's single fsync runs BEFORE the
+//     batched INSERT — a row cannot be committed before its bytes are on
+//     disk (packs closed by rotation inside the batch are synced at
+//     rotation — closeActiveLocked, as with compaction batches C-11);
+//   - a pack is not removed before its live rows are committed: the
+//     batched INSERT runs under flock taken before the first block of the
+//     batch is appended. Compaction removes packs under the same lock
+//     (T-045) — the "rotation → unlink → INSERT" window is closed by
+//     mutual exclusion, not by timing: no "pack being written" markers or
+//     grace periods are introduced into compaction (an inter-process
+//     marker would require a file with its own crash semantics; a failure
+//     there is the same class of loss as C-1, and the gain over one INSERT
+//     per batch is minimal).
 //
-// Сбой пачки безопасен и идемпотентен при повторе (ТЗ 3.4): пакетный
-// INSERT атомарен — строк либо нет всех, либо все на месте; крах до
-// INSERT оставляет блоки мусором без строк (невидимы, вычистит
-// компактификация T-045); дедуп-ссылки, добавленные до сбоя, остаются —
-// утечка в безопасную сторону (тот же выбор, что у Put и SwapRef).
+// A batch failure is safe and idempotent on retry (spec 3.4): the batched
+// INSERT is atomic — either all the rows are missing or all are in place;
+// a crash before the INSERT leaves the blocks as garbage without rows
+// (invisible, compaction T-045 will purge them); dedup references added
+// before the failure remain — a leak on the safe side (the same choice as
+// Put and SwapRef).
 package content
 
 import (
@@ -37,31 +38,31 @@ import (
 	"fmt"
 )
 
-// SQL групповой фиксации. Точные тексты закреплены тестами (batch_test.go,
-// стиль pack_test.go).
+// Group commit SQL. The exact texts are pinned by tests (batch_test.go,
+// the pack_test.go style).
 const (
-	// Дедуп-пачка: живой контент пачки — только ссылки, байты не пишутся
-	// (пачковый аналог sqlMetaAddRef: одна команда на пачку вместо
-	// построчных UPDATE). Приращение — счётчик копий хэша в пачке
-	// (unnest-пара hash → n, как у sqlMetaPutBatch): каждый Put элемента
-	// добавляет ссылку, семантика последовательных Put (T-228: раньше
-	// пачка дублей живого контента давала ровно +1 — ссылки занижались,
-	// и компактификация удалила бы ещё нужный блок). Мёртвые строки
-	// (refcount = 0) не воскресаются: их блоки могли быть
-	// скомпактифицированы, новые Put пишут свежие байты.
+	// Dedup batch: the live content of the batch is references only, no bytes
+	// are written (the batched analog of sqlMetaAddRef: one command per batch
+	// instead of per-row UPDATEs). The increment is the count of the hash's
+	// copies in the batch (the unnest pair hash → n, as in sqlMetaPutBatch):
+	// every Put of an item adds a reference, the semantics of sequential Puts
+	// (T-228: earlier a batch of duplicates of live content yielded exactly +1
+	// — references were undercounted, and compaction would have removed a
+	// still-needed block). Dead rows (refcount = 0) are not resurrected:
+	// their blocks may have been compacted, new Puts write fresh bytes.
 	sqlMetaAddRefBatch = "UPDATE contents SET refcount = refcount + v.c " +
 		"FROM unnest($1::bytea[], $2::int4[]) AS v(h, c) " +
 		"WHERE hash = v.h AND refcount > 0 RETURNING hash"
 
-	// Пакетная фиксация новых блоков пачки (пачковый аналог sqlMetaPut):
-	// unnest-массивы; хэши в пачке уникальны (дубликаты одного хэша
-	// сведены в одну строку со счётчиком n — ON CONFLICT не может
-	// затронуть одну строку дважды, а refcount = n сохраняет семантику
-	// «каждый Put добавляет ссылку»). Конфликт — конкурент успел раньше
-	// (блоки пачки — мусор) или воскрешение мёртвой строки: размещение
-	// переводится на блоки пачки (EXCLUDED), как у построчного upsert.
-	// RETURNING hash + (xmax = 0): порядок строк RETURNING не определён,
-	// созданность различается по хэшу.
+	// Batched commit of the new blocks of a batch (the batched analog of
+	// sqlMetaPut): unnest arrays; hashes in the batch are unique (duplicates
+	// of one hash are folded into one row with the counter n — ON CONFLICT
+	// cannot touch one row twice, and refcount = n preserves the semantics
+	// "every Put adds a reference"). A conflict means a concurrent writer got
+	// there first (the batch's blocks are garbage) or resurrection of a dead
+	// row: the placement is moved to the batch's blocks (EXCLUDED), as in the
+	// per-row upsert. RETURNING hash + (xmax = 0): the row order of RETURNING
+	// is undefined, creation is told apart by hash.
 	sqlMetaPutBatch = "INSERT INTO contents (hash, pack_id, off, len, raw_len, refcount) " +
 		"SELECT hash, pack_id, off, len, raw_len, n " +
 		"FROM unnest($1::bytea[], $2::int4[], $3::int8[], $4::int4[], $5::int4[], $6::int4[]) " +
@@ -72,50 +73,51 @@ const (
 		"RETURNING hash, (xmax = 0) AS created"
 )
 
-// BatchStore — необязательное расширение ContentStore групповой фиксацией
-// (T-102): потребитель, сохраняющий несколько контентов сразу, фиксирует
-// их пачкой — один fsync и один пакетный INSERT метаданных на пачку
-// вместо по-блочных (см. комментарий файла). Реализация —
-// (*PackStore).PutBatch; потребители обнаруживают её утверждением типа
-// и обязаны корректно работать с хранилищами без пачки (построчный
-// Put). http-worker с T-147 сохраняет страницы ранними Put по одной
-// (память слота дороже групповой фиксации — docs/content.md, «Запись
-// из http-worker»); пачка — контракт для потребителей, удерживающих
-// несколько контентов к моменту фиксации (компактификация C-11).
+// BatchStore — an optional extension of ContentStore with group commit
+// (T-102): a consumer storing several contents at once commits them as a
+// batch — one fsync and one batched metadata INSERT per batch instead of
+// per-block ones (see the file comment). The implementation is
+// (*PackStore).PutBatch; consumers discover it via a type assertion
+// and must correctly handle stores without batching (per-row
+// Put). Since T-147 the http-worker stores pages with early Puts one at a
+// time (slot memory is more expensive than group commit — docs/content.md,
+// "Writing from the http-worker"); the batch is a contract for consumers
+// holding several contents by commit time (compaction C-11).
 type BatchStore interface {
 	ContentStore
 
-	// PutBatch сохраняет элементы items одной групповой фиксацией и
-	// возвращает результаты по элементам в порядке items. Контракт:
+	// PutBatch stores the items with one group commit and returns the
+	// per-item results in items order. Contract:
 	//
-	//   - errs[i] != nil ⟺ элемент i не сохранён индивидуально:
-	//     ErrTooLarge (сверх max_store_bytes, ТЗ 5.5) или ErrStoreFull
-	//     (пауза записи контента, ТЗ 8: байты элемента не писались);
-	//     остальные элементы пачки при этом сохранены — дедуп-ссылки на
-	//     живой контент проходят и при переполнении;
-	//   - err != nil ⟺ сбой пачки (ошибка БД/ФС или отмена ctx): новые
-	//     строки не зафиксированы, results/errs не определены; повторная
-	//     доставка переигрывает пачку идемпотентно по хэшу (дедуп и
-	//     upsert, ТЗ 3.4);
-	//   - при err == nil len(results) = len(errs) = len(items), и
-	//     results[i].Hash = HashOf(items[i]) — контракт T-041;
-	//     PutResult.Created — «записаны новые байты», false у
-	//     дедупликаций и повторов хэша внутри пачки.
+	//   - errs[i] != nil ⟺ item i is not stored individually:
+	//     ErrTooLarge (over max_store_bytes, spec 5.5) or ErrStoreFull
+	//     (content write pause, spec 8: the item's bytes were not written);
+	//     the other items of the batch are still stored — dedup references
+	//     to live content pass even when full;
+	//   - err != nil ⟺ a batch failure (a DB/FS error or ctx cancellation):
+	//     no new rows committed, results/errs are undefined; redelivery
+	//     replays the batch idempotently by hash (dedup and upsert,
+	//     spec 3.4);
+	//   - with err == nil len(results) = len(errs) = len(items), and
+	//     results[i].Hash = HashOf(items[i]) — the T-041 contract;
+	//     PutResult.Created — "new bytes were written", false for
+	//     deduplications and hash repeats within the batch.
 	//
-	// Дубликаты одного контента внутри пачки допустимы: байты пишутся
-	// один раз, каждая копия добавляет ссылку (как последовательные Put).
-	// Пустая пачка и пачка из одних дедупликаций не занимает блокировок
-	// и не делает fsync.
+	// Duplicates of one content within the batch are allowed: the bytes are
+	// written once, each copy adds a reference (like sequential Puts).
+	// An empty batch and a batch of only deduplications take no locks and
+	// do no fsync.
 	PutBatch(ctx context.Context, items [][]byte) (results []PutResult, errs []error, err error)
 }
 
-// compile-time: PackStore реализует групповую фиксацию (T-102).
+// compile-time: PackStore implements group commit (T-102).
 var _ BatchStore = (*PackStore)(nil)
 
-// batchItem — элемент пачки после фильтров: хэш, индексы элементов
-// оригинального items с этим хэшем (первый — носитель байтов), счётчик
-// Put-ов этого хэша в пачке (refcount вставляемой строки) и размер
-// несжатых байтов (contents.raw_len).
+// batchItem — a batch item after the filters: the hash, the indexes of the
+// items of the original items with this hash (the first one carries the
+// bytes), the counter of Puts of this hash in the batch (the refcount of
+// the inserted row), and the size of the uncompressed bytes
+// (contents.raw_len).
 type batchItem struct {
 	hash   Hash
 	idxs   []int
@@ -123,10 +125,10 @@ type batchItem struct {
 	rawLen int32
 }
 
-// PutBatch — групповая фиксация, контракт — в BatchStore. Шаги:
-// дедуп-пачка (одно UPDATE) → пауза диска → сжатие → дописывание всех
-// блоков, один fsync и один пакетный INSERT под одним захватом мьютекса
-// и flock (инварианты C-1, комментарий файла).
+// PutBatch — group commit; the contract is in BatchStore. Steps:
+// the dedup batch (one UPDATE) → the disk pause → compression → appending
+// all blocks, one fsync and one batched INSERT under a single acquisition
+// of the mutex and flock (the C-1 invariants, the file comment).
 func (s *PackStore) PutBatch(ctx context.Context, items [][]byte) ([]PutResult, []error, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
@@ -137,9 +139,9 @@ func (s *PackStore) PutBatch(ctx context.Context, items [][]byte) ([]PutResult, 
 	results := make([]PutResult, len(items))
 	errs := make([]error, len(items))
 
-	// 0) хэши, лимиты, внутри-пачковые дубликаты: один хэш — одна строка
-	// со счётчиком ссылок (байты пишутся один раз, каждый Put элемента
-	// добавляет ссылку — семантика последовательных Put).
+	// 0) hashes, limits, in-batch duplicates: one hash — one row with a
+	// reference counter (the bytes are written once, every Put of the item
+	// adds a reference — the semantics of sequential Puts).
 	all := make([]*batchItem, 0, len(items))
 	byHash := make(map[Hash]*batchItem, len(items))
 	for i, data := range items {
@@ -162,8 +164,8 @@ func (s *PackStore) PutBatch(ctx context.Context, items [][]byte) ([]PutResult, 
 		return results, errs, nil
 	}
 
-	// 1) дедуп-пачка: живой контент — только ссылки (одно обращение к БД
-	// на пачку), байты не пишутся (sqlMetaAddRefBatch).
+	// 1) dedup batch: live content is references only (one DB call per
+	// batch), no bytes written (sqlMetaAddRefBatch).
 	live, err := s.addRefBatch(ctx, all)
 	if err != nil {
 		return nil, nil, err
@@ -172,7 +174,7 @@ func (s *PackStore) PutBatch(ctx context.Context, items [][]byte) ([]PutResult, 
 	for _, it := range all {
 		if live[it.hash] {
 			for _, i := range it.idxs {
-				results[i] = PutResult{Hash: it.hash} // Created=false: дедуп
+				results[i] = PutResult{Hash: it.hash} // Created=false: dedup
 			}
 			continue
 		}
@@ -182,9 +184,9 @@ func (s *PackStore) PutBatch(ctx context.Context, items [][]byte) ([]PutResult, 
 		return results, errs, nil
 	}
 
-	// 2) пауза записи контента (ТЗ 8, T-046): байты пачки не пишутся,
-	// элементы — по-элементный ErrStoreFull (дедупы выше уже вернулись:
-	// ссылки на живой контент проходят и при переполнении).
+	// 2) content write pause (spec 8, T-046): the batch's bytes are not
+	// written, items get a per-item ErrStoreFull (the dedups above have
+	// already returned: references to live content pass even when full).
 	if err := s.pauseIfDiskFull(); err != nil {
 		for _, it := range remain {
 			for _, i := range it.idxs {
@@ -194,18 +196,19 @@ func (s *PackStore) PutBatch(ctx context.Context, items [][]byte) ([]PutResult, 
 		return results, errs, nil
 	}
 
-	// 3) сжатие до захвата блокировок: CPU-работа не удлиняет критическую
-	// секцию (flock держится от дописывания до фиксации строк).
+	// 3) compression before taking the locks: CPU work must not lengthen the
+	// critical section (flock is held from appending until the rows are
+	// committed).
 	blocks := make([][]byte, len(remain))
 	for i, it := range remain {
 		blocks[i] = CompressWithDict(items[it.idxs[0]])
 	}
 
-	// 4–6) дописывание всех блоков, один fsync и пакетный INSERT — под
-	// одним захватом мьютекса и flock (putBatchCommit, инварианты C-1).
+	// 4–6) appending all blocks, one fsync and a batched INSERT — under one
+	// acquisition of the mutex and flock (putBatchCommit, the C-1 invariants).
 	created, err := s.putBatchCommit(ctx, remain, blocks)
 	if err != nil {
-		// ENOSPC при физической записи — событие алерта (ТЗ 8), как у Put.
+		// ENOSPC on a physical write — an alert event (spec 8), as in Put.
 		if errors.Is(err, ErrStoreFull) {
 			s.fireStoreFull(s.enospcEvent())
 		}
@@ -214,21 +217,21 @@ func (s *PackStore) PutBatch(ctx context.Context, items [][]byte) ([]PutResult, 
 	for _, it := range remain {
 		results[it.idxs[0]] = PutResult{Hash: it.hash, Created: created[it.hash]}
 		for _, i := range it.idxs[1:] {
-			results[i] = PutResult{Hash: it.hash} // повтор хэша в пачке: байты уже есть
+			results[i] = PutResult{Hash: it.hash} // hash repeat within the batch: the bytes are already there
 		}
 	}
 	return results, errs, nil
 }
 
-// addRefBatch — дедуп-пачка (шаг 1): живому контенту добавляются ссылки
-// без записи байтов, одна команда на пачку. Каждый хэш идёт парой с
-// числом копий в пачке — приращение n, а не 1 (контракт «каждый Put
-// элемента добавляет ссылку»). Инвариант: хэши items уникальны —
-// гарантирует дедуп byHash шага 0 PutBatch (при дубле хэша в unnest
-// PostgreSQL обновил бы строку один раз по одной из join-строк, а не
-// суммировал пары; фейк-пул в тестах на дубликат обязан падать, а не
-// расходиться с сервером молча — ревью T-228, P3-2). Возвращает
-// множество хэшей, получивших ссылки.
+// addRefBatch — the dedup batch (step 1): references are added for live
+// content without writing bytes, one command per batch. Every hash is
+// paired with the number of copies in the batch — the increment is n, not
+// 1 (the contract "every Put of an item adds a reference"). Invariant: the
+// hashes of items are unique — guaranteed by the byHash dedup of step 0 of
+// PutBatch (with a duplicate hash in unnest PostgreSQL would update the row
+// once via one of the join rows, not sum the pairs; the fake pool in the
+// duplicate test must fail, not silently diverge from the server — review
+// T-228, P3-2). Returns the set of hashes that got references.
 func (s *PackStore) addRefBatch(ctx context.Context, items []*batchItem) (map[Hash]bool, error) {
 	hashes := make([][]byte, 0, len(items))
 	counts := make([]int32, 0, len(items))
@@ -255,8 +258,8 @@ func (s *PackStore) addRefBatch(ctx context.Context, items []*batchItem) (map[Ha
 	return live, nil
 }
 
-// scanHashRow — первая колонка строки как Hash (RETURNING hash пакетных
-// операторов): контроль длины против повреждённых данных.
+// scanHashRow — the first column of a row as a Hash (RETURNING hash of the
+// batched statements): a length check against corrupted data.
 func scanHashRow(rows rowScanner) (Hash, error) {
 	var hb []byte
 	if err := rows.Scan(&hb); err != nil {
@@ -270,18 +273,18 @@ func scanHashRow(rows rowScanner) (Hash, error) {
 	return h, nil
 }
 
-// rowScanner — минимальный интерфейс чтения строки (pgx.Rows и его
-// подстановки в тестах).
+// rowScanner — the minimal row-reading interface (pgx.Rows and its test
+// stand-ins).
 type rowScanner interface {
 	Scan(dest ...any) error
 }
 
-// putBatchCommit — шаги 4–6 групповой фиксации: дописывает блоки в
-// новейший пак, делает единственный fsync пачки и фиксирует все строки
-// одним пакетным INSERT — под одним захватом мьютекса и flock от
-// дописывания до фиксации (инвариант «пак не удаляется раньше фиксации
-// его живых строк»; fsync до INSERT — «байты раньше строк»). Возвращает
-// отображение «хэш → создан ли» (RETURNING xmax = 0).
+// putBatchCommit — steps 4–6 of the group commit: appends the blocks to
+// the newest pack, performs the batch's single fsync and commits all rows
+// with one batched INSERT — under one acquisition of the mutex and flock
+// from appending to commit (the invariant "a pack is not removed before
+// its live rows are committed"; fsync before INSERT — "bytes before rows").
+// Returns the map "hash → whether created" (RETURNING xmax = 0).
 func (s *PackStore) putBatchCommit(ctx context.Context, items []*batchItem, blocks [][]byte) (map[Hash]bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -307,9 +310,9 @@ func (s *PackStore) putBatchCommit(ctx context.Context, items []*batchItem, bloc
 		}
 		written = append(written, placed{it: it, packID: packID, off: off, clen: int32(len(blocks[i]))})
 	}
-	// Единственный fsync пачки: байты всех блоков — на диске до фиксации
-	// любой строки пачки (C-1); паки, закрытые ротацией внутри пачки,
-	// синхронизированы closeActiveLocked при ротации.
+	// The batch's single fsync: the bytes of all blocks are on disk before
+	// any row of the batch is committed (C-1); packs closed by rotation
+	// inside the batch were synced by closeActiveLocked at rotation.
 	if err := s.syncActiveLocked(); err != nil {
 		return nil, err
 	}

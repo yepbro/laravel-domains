@@ -1,28 +1,29 @@
-// Package content — каркас хранилища контента (ТЗ 5.7).
+// Package content — the content storage framework (spec 5.7).
 //
-// Интерфейс ContentStore (Put/Get/Delete), пак-файлы append-only,
-// дедупликация по 128-битному хэшу, счётчики ссылок и компактификация —
-// задачи T-041…T-046. Сейчас пакет даёт минимальные обёртки сжатия zstd,
-// на которых строится запись в пак-файлы (обучаемый словарь — T-043).
+// The ContentStore interface (Put/Get/Delete), append-only pack files,
+// deduplication by a 128-bit hash, refcounts, and compaction are the
+// subject of tasks T-041…T-046. For now the package provides minimal zstd
+// compression wrappers on top of which pack-file writing is built
+// (the trainable dictionary is T-043).
 package content
 
 import (
 	"github.com/klauspost/compress/zstd"
 )
 
-// Энкодер и декодер создаются один раз: EncodeAll/DecodeAll безопасны
-// для одновременного использования из нескольких горутин.
+// The encoder and decoder are created once: EncodeAll/DecodeAll are safe
+// for concurrent use from multiple goroutines.
 var (
-	encoder, _ = zstd.NewWriter(nil) // nil — только для EncodeAll
-	decoder, _ = zstd.NewReader(nil) // nil — только для DecodeAll
+	encoder, _ = zstd.NewWriter(nil) // nil — for EncodeAll only
+	decoder, _ = zstd.NewReader(nil) // nil — for DecodeAll only
 )
 
-// Compress сжимает src алгоритмом zstd (без словаря).
+// Compress compresses src with zstd (no dictionary).
 func Compress(src []byte) []byte {
 	return encoder.EncodeAll(src, nil)
 }
 
-// Decompress распаковывает данные, сжатые Compress.
+// Decompress decompresses data compressed by Compress.
 func Decompress(src []byte) ([]byte, error) {
 	return decoder.DecodeAll(src, nil)
 }

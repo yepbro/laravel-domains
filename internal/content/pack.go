@@ -1,23 +1,27 @@
-// Пак-файлы — физический слой хранилища контента (ТЗ 5.7, задача T-042).
+// Pack files — the physical layer of the content store (spec 5.7, task
+// T-042).
 //
-// Каталог content.dir хранит пак-файлы pack-NNNNNN.pack: append-only
-// контейнеры сжатых zstd-блоков (словарь — T-043, CompressWithDict).
-// Метаданные блоков — строки PostgreSQL contents(hash, pack_id, off, len,
-// raw_len, refcount) (ТЗ 6.1). Возвращаемая реализация удовлетворяет
-// ContentStore (T-041); формат и контракты зафиксированы в docs/content.md.
+// The content.dir directory holds pack files pack-NNNNNN.pack: append-only
+// containers of zstd-compressed blocks (the dictionary is T-043,
+// CompressWithDict). Block metadata — PostgreSQL rows in
+// contents(hash, pack_id, off, len, raw_len, refcount) (spec 6.1). The returned
+// implementation satisfies ContentStore (T-041); the format and contracts
+// are pinned in docs/content.md.
 //
-// pack_id — порядковый номер файла, реестр паков — само множество файлов
-// (заголовок каждого пака дублирует его id): таблицы packs в ТЗ 6.1 нет,
-// миграция не вводится. Новейший пак — максимальный id в каталоге.
+// pack_id is the ordinal number of the file, the pack registry is the set
+// of files itself (each pack's header duplicates its id): there is no packs
+// table in spec 6.1, and no migration introduces one. The newest pack is the
+// maximum id in the directory.
 //
-// Транзакционность записи (ТЗ 3.4): блок дописывается в пак и
-// синхронизируется на диск (fsync) ДО фиксации строки метаданных. Крах
-// между шагами оставляет в паке мусорный блок без строки — он невидим
-// (Get идёт только по метаданным) и вычищается компактификацией
-// (T-045); обратное окно «строка durable, байтов нет» закрыто: при
-// потере питания записанная строка всегда имеет байты на диске
-// (PostgreSQL в боевом конфиге коммитит асинхронно — synchronous_commit
-// = off, dirty-страницы пака жили бы в кэше минуты).
+// Write transactionality (spec 3.4): a block is appended to the pack and
+// synced to disk (fsync) BEFORE the metadata row is committed. A crash
+// between the steps leaves a garbage block without a row in the pack — it is
+// invisible (Get goes through the metadata only) and is cleaned up by
+// compaction (T-045); the reverse window "the row is durable, the bytes are
+// gone" is closed: after a power loss a written row always has its bytes on
+// disk (PostgreSQL in the production config commits asynchronously —
+// synchronous_commit = off, the pack's dirty pages would sit in cache for
+// minutes).
 package content
 
 import (
@@ -37,147 +41,149 @@ import (
 	"crawler/internal/db"
 )
 
-// Параметры пак-файлов. Ротация — по content.pack_size (рекомендация
-// ТЗ 5.7: 512 МБ–1 ГБ; границы для ops-слоя валидирует конфиг, T-006).
+// Pack file parameters. Rotation follows content.pack_size (the spec 5.7
+// recommendation: 512 MB–1 GB; the config validates the bounds for the ops
+// layer, T-006).
 const (
-	// DefaultPackSize — порог ротации при нулевом PackOptions.PackSize:
-	// 512 МиБ, как content.pack_size по умолчанию.
+	// DefaultPackSize — the rotation threshold with a zero PackOptions.PackSize:
+	// 512 MiB, like the content.pack_size default.
 	DefaultPackSize = 512 << 20
 
-	// packMagic/packVersion — заголовок пак-файла (формат v1).
+	// packMagic/packVersion — the pack file header (format v1).
 	packMagic   = "CDPK"
 	packVersion = 1
 
-	// packHeaderLen — длина заголовка v1: magic[4] version[1] hdrLen[2]
-	// packID[4] maxSize[8] dictID[4], все целые — little-endian.
+	// packHeaderLen — the v1 header length: magic[4] version[1] hdrLen[2]
+	// packID[4] maxSize[8] dictID[4], all integers little-endian.
 	packHeaderLen = 4 + 1 + 2 + 4 + 8 + 4
 
-	// packLockFile — файл межпроцессной блокировки каталога паков:
-	// http-worker и render-worker дописывают контент одновременно (ТЗ 4.1).
+	// packLockFile — the inter-process lock file of the packs directory:
+	// the http-worker and render-worker append content concurrently (spec 4.1).
 	packLockFile = ".packs.lock"
 )
 
-// errPackClosed — операции записи после Close: программная ошибка,
-// в контракт ContentStore не входит.
+// errPackClosed — write operations after Close: a programming error,
+// not part of the ContentStore contract.
 var errPackClosed = errors.New("content: хранилище паков закрыто")
 
-// errReadOnly — запись в хранилище, открытое с PackOptions.ReadOnly:
-// читатель без записи (crawlerctl domain --content) не должен менять ни
-// ФС, ни метаданные; программная ошибка вызывающего.
+// errReadOnly — writing to a store opened with PackOptions.ReadOnly:
+// a read-only reader (crawlerctl domain --content) must change neither the
+// FS nor the metadata; a programming error of the caller.
 var errReadOnly = errors.New("content: хранилище паков открыто только для чтения")
 
-// Автомат refcount контента (T-265, ТЗ tasks/TZ-fsm.md §3 ФТ-11): единая
-// точка правды о состояниях и переходах строки contents — счётчика ссылок
-// на блок контента в паке. Формализация не переписывает переходы на
-// FSM-фреймворк (ТЗ-fsm §1): они остаются SQL-операторами с охранными
-// предикатами (проверенная модель проекта); эта таблица — то, с чем
-// обязаны сверяться все писатели refcount (перечислены ниже). Смежный
-// автомат рендер-состояния строки — internal/renderworker/worker.go
-// (T-259); состояние домена — internal/scheduler/checkstate.go (T-255).
+// The refcount automaton of content (T-265, spec tasks/TZ-fsm.md §3 FR-11): the
+// single source of truth about the states and transitions of a contents row —
+// the reference counter of a content block in a pack. The formalization does
+// not rewrite the transitions onto an FSM framework (TZ-fsm §1): they remain
+// SQL statements with guard predicates (the project's proven model); this
+// table is what all refcount writers (listed below) must be checked against.
+// The adjacent automaton of a row's render state is
+// internal/renderworker/worker.go (T-259); the domain state is
+// internal/scheduler/checkstate.go (T-255).
 //
-// # Состояния
+// # States
 //
-//	С0 «absent»           строки contents нет (контент в хранилище не
-//	                      писали); наблюдением неотличим от С3/С4 —
-//	                      различие только в истории и мусорных байтах
-//	                      паков (С0 их не порождал);
-//	С1 «live(n)», n ≥ 1   строка жива: блок размещён (pack_id, off, len,
-//	                      raw_len), виден потребителям (Get, дедуп
-//	                      Put, своп T-044);
-//	С2 «dead·tombstone»   представление «мёртв» № 1: строка есть,
-//	                      refcount = 0 — надгробие до компактификации
-//	                      (T-045); Get/Delete/дедуп её не видят (И2);
-//	                      байты блока — мёртвые, место держится;
-//	С3 «dead·удалено»     представление «мёртв» № 2: строки нет, мёртвые
-//	                      байты блока остаются в паках до прохода
-//	                      компактификации; возникает сразу из live —
-//	                      retention (decref до 0 → DELETE той же
-//	                      транзакцией) — или из С2 — вычисткой
-//	                      компактификации;
-//	С4 «deleted»          терминальное «чистое»: строки нет И мёртвых
-//	                      байтов нет (компактификация удалила пак);
-//	                      переход только в С1 (Put нового контента).
+//	S0 "absent"           there is no contents row (the content was never
+//	                      written to the store); indistinguishable from S3/S4 by
+//	                      observation — the difference is only in the history and
+//	                      the garbage bytes of packs (S0 did not produce any);
+//	S1 "live(n)", n ≥ 1   the row is live: the block is placed (pack_id, off, len,
+//	                      raw_len), visible to consumers (Get, Put dedup,
+//	                      the T-044 swap);
+//	S2 "dead·tombstone"   reading of "dead" # 1: the row exists,
+//	                      refcount = 0 — a tombstone until compaction
+//	                      (T-045); Get/Delete/dedup do not see it (I2);
+//	                      the block's bytes are dead, the space is held;
+//	S3 "dead·removed"     reading of "dead" # 2: no row, the dead
+//	                      bytes of the block remain in packs until a compaction
+//	                      pass; arises straight from live —
+//	                      retention (decref to 0 → DELETE in the same
+//	                      transaction) — or from S2 — by the purge
+//	                      of compaction;
+//	S4 "deleted"          the terminal "clean" state: no row AND no dead
+//	                      bytes (compaction removed the pack);
+//	                      the only transition is to S1 (a Put of new content).
 //
-// Таблица различий двух представлений «мёртв» — docs/content.md
-// («Два представления „мёртв“», T-265); для потребителей оба —
-// «контента нет» (ErrNotFound / UPDATE 0).
+// The table of differences between the two readings of "dead" is in
+// docs/content.md ("Two readings of dead", T-265); for consumers both mean
+// "no content" (ErrNotFound / UPDATE 0).
 //
-// # Переходы: состояние × событие × охраны × цель × побочные действия
+// # Transitions: state × event × guards × target × side effects
 //
-//	| № | Исходное | Событие | Охраны / оператор | Цель | Побочные действия | Писатель |
-//	|---|----------|---------|-------------------|------|-------------------|----------|
-//	| П1 | С0 | Put нового контента (спул блока → фиксация строки) | INSERT без конфликта | С1(1) | блок дописан и fsync'нут ДО строки (ТЗ 3.4); Created = true; пачка — refcount = n копий (T-228) | pack.go sqlMetaPut (appendAndMeta), batch.go sqlMetaPutBatch |
-//	| П2 | С1(n) | Put/своп живого контента (дедуп) | sqlMetaAddRef: refcount > 0 | С1(n+1) | байты не пишутся; Created = false; пачка — +n копий (sqlMetaAddRefBatch) | pack.go sqlMetaAddRef (Put-дедуп, refcount.go SwapRefTx +1), batch.go |
-//	| П3 | С1(n) | гонка конкурентов Put одного хэша | ON CONFLICT DO UPDATE: refcount + 1 (+ EXCLUDED.refcount у пачки) | С1(n+1) | блок проигравшего — мусор для T-045; RETURNING (xmax = 0) = false | pack.go sqlMetaPut, batch.go sqlMetaPutBatch |
-//	| П4 | С1(n), n ≥ 2 | Delete/своп снимает ссылку | sqlMetaDelRef: refcount > 0 | С1(n−1) | RowsAffected = 1; идемпотентность повторных доставок — транзакции этапов (ТЗ 3.4), не повторные −1 | pack.go sqlMetaDelRef (Delete, refcount.go SwapRefTx −1) |
-//	| П5 | С1(1) | Delete последней ссылки | sqlMetaDelRef: refcount > 0 | С2 | строка остаётся с refcount = 0 (место блока чистит T-045); повторный Delete — UPDATE 0 → ErrNotFound (И4) | pack.go sqlMetaDelRef |
-//	| П6 | С2 | воскрешение Put | дедуп не сработал (UPDATE 0), конфликт DO UPDATE: refcount 0+1, размещение EXCLUDED | С1(1) | свежий блок дописан и fsync'нут ДО строки; размещение переведено на него (байты EXCLUDED гарантированно на месте, прежнее — мёртвые байты); Created = false (xmax ≠ 0) — известное расхождение метрики доли дедупликации (ТЗ 11.4 п. 3) | pack.go sqlMetaPut, batch.go sqlMetaPutBatch |
-//	| П7 | С0/С3/С4 | Put контента без строки | INSERT-ветка (конфликта нет) | С1(1) | Created = true: воскрешение представления «удалено» неотличимо от нового контента (И3) | pack.go sqlMetaPut, batch.go sqlMetaPutBatch |
-//	| П8 | С1(n) | массовое снятие очисткой deleted-доменов (агрегированно по хэшам) | cleanupUpdateSQL: GREATEST(refcount − h.n, 0) | С1(n−k); k = n → С2 | строка НЕ удаляется (tombstone — место чистит T-045); клэмп: рассинхрон k > n прощается нулём, минус невозможен (И1) | ingest/cleanup.go (T-020) |
-//	| П9 | С1(n) | срезание ссылок retention (агрегированно) | retentionDecrefSQL GREATEST + retentionDeleteSQL (refcount <= 0) одной транзакцией | С1(n−k); k ≥ n → С3 сразу, минуя С2 | retention — массовый источник мёртвых блоков: строки не копятся до компактификации паков; клэмп как у П8 | retention.go (T-166) |
-//	| П10 | С1(n) | блок нечитаем при компактификации | sqlCompactCorrupt: SET refcount = 0, охрана refcount > 0 | С2 | контент удалить иначе нельзя (дедуп видит живую строку и байтов не пишет); расхождение целостности — в ошибку прохода | compact.go (T-045) |
-//	| П11 | С2 | компактификация вычищает мёртвые строки пака | sqlCompactDead (список пачки) / sqlCompactDeadPack (финальная зачистка осиротевших): DELETE … WHERE pack_id = N AND refcount = 0 | С3; удаление файла пака — С4 | блок умирает вместе со строкой; файл удаляется после контроля живых (sqlCompactLive); воскрешённая в момент прохода не задета (её размещение уже переведено П6) | compact.go (T-045) |
-//	| П12 | С1(n) без держателей | стендовая утилия наката фикстур | fixturesSweepContentsSQL: DELETE WHERE NOT EXISTS ссылок | С3 | только тестовый стенд (T-243), прод не использует | cmd/crawlerctl/fixtures_import.go |
+//	| # | From | Event | Guards / statement | Target | Side effects | Writer |
+//	|---|------|-------|--------------------|--------|--------------|--------|
+//	| T1 | S0 | Put of new content (block spool → row commit) | INSERT without conflict | S1(1) | the block is appended and fsync'ed BEFORE the row (spec 3.4); Created = true; a batch — refcount = n copies (T-228) | pack.go sqlMetaPut (appendAndMeta), batch.go sqlMetaPutBatch |
+//	| T2 | S1(n) | Put/swap of live content (dedup) | sqlMetaAddRef: refcount > 0 | S1(n+1) | no bytes written; Created = false; a batch — +n copies (sqlMetaAddRefBatch) | pack.go sqlMetaAddRef (Put dedup, refcount.go SwapRefTx +1), batch.go |
+//	| T3 | S1(n) | race of concurrent Puts of one hash | ON CONFLICT DO UPDATE: refcount + 1 (+ EXCLUDED.refcount for a batch) | S1(n+1) | the loser's block is garbage for T-045; RETURNING (xmax = 0) = false | pack.go sqlMetaPut, batch.go sqlMetaPutBatch |
+//	| T4 | S1(n), n ≥ 2 | Delete/swap removes a reference | sqlMetaDelRef: refcount > 0 | S1(n−1) | RowsAffected = 1; idempotency of redeliveries is the stages' transactions (spec 3.4), not repeated −1s | pack.go sqlMetaDelRef (Delete, refcount.go SwapRefTx −1) |
+//	| T5 | S1(1) | Delete of the last reference | sqlMetaDelRef: refcount > 0 | S2 | the row remains with refcount = 0 (the block's space is cleaned by T-045); a repeated Delete — UPDATE 0 → ErrNotFound (I4) | pack.go sqlMetaDelRef |
+//	| T6 | S2 | Put resurrection | dedup missed (UPDATE 0), the DO UPDATE conflict branch: refcount 0+1, EXCLUDED placement | S1(1) | a fresh block is appended and fsync'ed BEFORE the row; the placement is moved to it (EXCLUDED's bytes are guaranteed in place, the old one is dead bytes); Created = false (xmax ≠ 0) — a known discrepancy of the dedup share metric (spec 11.4 item 3) | pack.go sqlMetaPut, batch.go sqlMetaPutBatch |
+//	| T7 | S0/S3/S4 | Put of content without a row | the INSERT branch (no conflict) | S1(1) | Created = true: resurrecting the "removed" reading is indistinguishable from new content (I3) | pack.go sqlMetaPut, batch.go sqlMetaPutBatch |
+//	| T8 | S1(n) | mass removal by deleted-domain cleanup (aggregated by hashes) | cleanupUpdateSQL: GREATEST(refcount − h.n, 0) | S1(n−k); k = n → S2 | the row is NOT deleted (a tombstone — the space is cleaned by T-045); the clamp: a desync of k > n is forgiven with zero, a minus is impossible (I1) | ingest/cleanup.go (T-020) |
+//	| T9 | S1(n) | reference removal by retention (aggregated) | retentionDecrefSQL GREATEST + retentionDeleteSQL (refcount <= 0) in one transaction | S1(n−k); k ≥ n → S3 directly, bypassing S2 | retention is a mass source of dead blocks: rows do not accumulate until pack compaction; the clamp as in T8 | retention.go (T-166) |
+//	| T10 | S1(n) | a block is unreadable during compaction | sqlCompactCorrupt: SET refcount = 0, the refcount > 0 guard | S2 | the content cannot be removed otherwise (dedup sees a live row and writes no bytes); the integrity discrepancy goes into the pass error | compact.go (T-045) |
+//	| T11 | S2 | compaction purges the pack's dead rows | sqlCompactDead (the batch list) / sqlCompactDeadPack (the final sweep of orphans): DELETE … WHERE pack_id = N AND refcount = 0 | S3; removing the pack file — S4 | the block dies together with the row; the file is removed after the live check (sqlCompactLive); a row resurrected during the pass is untouched (its placement was already moved by T6) | compact.go (T-045) |
+//	| T12 | S1(n) without holders | the bench fixture-import utility | fixturesSweepContentsSQL: DELETE WHERE NOT EXISTS of references | S3 | the test bench only (T-243), production does not use it | cmd/crawlerctl/fixtures_import.go |
 //
-// Не-переходы (refcount не меняют): Get (sqlMetaGet — чтение живых);
-// выборки retention/компактификации; перенос живых блоков
-// компактификацией (sqlCompactMove: С1 → С1, меняется размещение —
-// pack_id/off, не состояние).
+// Non-transitions (refcount unchanged): Get (sqlMetaGet — reading live rows);
+// retention/compaction selections; moving live blocks by
+// compaction (sqlCompactMove: S1 → S1, the placement changes —
+// pack_id/off, not the state).
 //
-// # Инварианты
+// # Invariants
 //
-//	И1  refcount ≥ 0 всегда, включая рассинхрон. Точечные операторы —
-//	    охранный предикат refcount > 0 (снятие видит только живую
-//	    строку: UPDATE 0 → ErrNotFound у Delete, ErrRefIntegrity у
-//	    свопа T-044 — лучше ошибиться, чем молча испортить счётчик);
-//	    массовые проходы (retention, очистка T-020) — клэмп
-//	    GREATEST(refcount − n, 0): рассинхрон прощается, инвариант
-//	    «0 = мёртвый» не ломается. С миграции 000019 (T-265) инвариант
-//	    дублирует CHECK схемы contents_refcount_check (NOT VALID;
-//	    VALIDATE — по регламенту docs/schema.md «CHECK-инварианты»):
-//	    минус невозможен ни писателем, ни ручным SQL.
-//	И2  «0 = мёртвый»: все потребители живого фильтруют refcount > 0
-//	    (sqlMetaGet, sqlMetaAddRef); refcount = 0 и отсутствие строки
-//	    для них неотличимы — «мёртв» живёт в двух представлениях
-//	    (С2/С3), различия — docs/content.md.
-//	И3  воскрешение всегда пишет свежий блок и переводит размещение на
-//	    него: Put дописывает и fsync'ит блок ДО фиксации строки (ТЗ 3.4
-//	    «спул → фиксация»), EXCLUDED указывает на гарантированно живые
-//	    байты; у представления «удалено» строк просто нет — INSERT (П7)
-//	    создаёт её заново. Единственное различие представлений,
-//	    наблюдаемое Put: Created = false (П6) против true (П7).
-//	И4  двойное снятие запрещено: повторный Delete мёртвого или
-//	    отсутствующего контента — UPDATE 0 → ErrNotFound (симптом
-//	    ошибки учёта, не нормальный путь).
-//	И5  срезание ссылки и −1 счётчика атомарны в одной транзакции
-//	    (запись результата SwapRefTx T-044/T-058, retention T-166,
-//	    очистка T-020 — ТЗ 3.4): крах не оставляет ссылку без счётчика
-//	    и счётчик без ссылки.
-//	И6  «+1 без владельца» допустим (безопасная утечка): повторная
-//	    доставка Put после сбоя добавляет лишнюю ссылку — блок остаётся
-//	    живым, данные целы (тот же выбор, что у порядка операторов
-//	    SwapRef: утечка места лучше потери данных).
+//	I1  refcount ≥ 0 always, including a desync. Point statements use the
+//	    refcount > 0 guard predicate (a removal only sees a live
+//	    row: UPDATE 0 → ErrNotFound for Delete, ErrRefIntegrity for
+//	    the T-044 swap — better to fail than to silently corrupt the counter);
+//	    mass passes (retention, T-020 cleanup) use the
+//	    GREATEST(refcount − n, 0) clamp: a desync is forgiven, the
+//	    "0 = dead" invariant holds. Since migration 000019 (T-265) the invariant
+//	    is duplicated by the schema CHECK contents_refcount_check (NOT VALID;
+//	    VALIDATE — per the docs/schema.md regulation "CHECK invariants"):
+//	    a minus is impossible for a writer or manual SQL alike.
+//	I2  "0 = dead": all consumers of live rows filter refcount > 0
+//	    (sqlMetaGet, sqlMetaAddRef); refcount = 0 and a missing row
+//	    are indistinguishable to them — "dead" lives in two readings
+//	    (S2/S3), the differences are in docs/content.md.
+//	I3  a resurrection always writes a fresh block and moves the placement
+//	    onto it: Put appends and fsyncs the block BEFORE committing the row
+//	    (spec 3.4 "spool → commit"), EXCLUDED points at guaranteed-live
+//	    bytes; the "removed" reading simply has no rows — the INSERT (T7)
+//	    recreates it. The only reading difference observable by Put:
+//	    Created = false (T6) versus true (T7).
+//	I4  a double removal is forbidden: a repeated Delete of dead or missing
+//	    content — UPDATE 0 → ErrNotFound (a symptom of an accounting error,
+//	    not a normal path).
+//	I5  removing a reference and the −1 of the counter are atomic in one
+//	    transaction (the result write of SwapRefTx T-044/T-058, retention
+//	    T-166, the T-020 cleanup — spec 3.4): a crash leaves neither a reference
+//	    without a counter nor a counter without a reference.
+//	I6  "+1 without an owner" is allowed (a safe leak): a redelivered Put
+//	    after a failure adds an extra reference — the block stays
+//	    live, the data is intact (the same choice as the statement order of
+//	    SwapRef: a space leak is better than data loss).
 
-// SQL метаданных contents (ТЗ 6.1). Точные тексты закреплены тестами
-// (pack_test.go, стиль ingest-тестов на фейковом pgx-пуле).
+// Metadata SQL of contents (spec 6.1). The exact texts are pinned by tests
+// (pack_test.go, the ingest-test style on a fake pgx pool).
 const (
-	// Дедупликация Put: живой контент уже в хранилище — только ссылка,
-	// байты не пишутся. Мёртвая строка (refcount = 0) не воскрешается
-	// этим путём: её блок мог быть скомпактифицирован, новый Put пишет
-	// свежие байты (sqlMetaPut).
+	// Put deduplication: the live content is already in the store — a reference
+	// only, no bytes written. A dead row (refcount = 0) is not resurrected by
+	// this path: its block may have been compacted, a new Put writes
+	// fresh bytes (sqlMetaPut).
 	sqlMetaAddRef = "UPDATE contents SET refcount = refcount + 1 " +
 		"WHERE hash = $1 AND refcount > 0"
 
-	// Метаданные нового блока. Конфликт хэша — гонка конкурентов Put
-	// одного контента или мёртвая строка (refcount = 0): опоздавший
-	// добавляет ссылку, размещение переводится на только что дописанный
-	// блок (EXCLUDED — его байты гарантированно на месте, блок прежнего
-	// размещения мог быть скомпактифицирован), блок проигравшего —
-	// мусор для T-045. RETURNING (xmax = 0) — различение вставки и
-	// обновления: у вставленной строки xmax не установлен (0), у
-	// обновлённой конфликтником равен xid текущей транзакции; CommandTag
-	// на INSERT … ON CONFLICT DO UPDATE всегда «INSERT 0 1» и ветки не
-	// различает.
+	// Metadata of a new block. A hash conflict — a race of concurrent Puts of
+	// one content or a dead row (refcount = 0): the loser adds a reference,
+	// the placement is moved to the just-appended
+	// block (EXCLUDED — its bytes are guaranteed in place, the block at the old
+	// placement may have been compacted), the loser's block is
+	// garbage for T-045. RETURNING (xmax = 0) tells an insert from an
+	// update: an inserted row has no xmax set (0), a row updated by the
+	// conflict has the xid of the current transaction; CommandTag for
+	// INSERT … ON CONFLICT DO UPDATE is always "INSERT 0 1" and does not
+	// tell the branches apart.
 	sqlMetaPut = "INSERT INTO contents (hash, pack_id, off, len, raw_len, refcount) " +
 		"VALUES ($1, $2, $3, $4, $5, 1) " +
 		"ON CONFLICT (hash) DO UPDATE SET refcount = contents.refcount + 1, " +
@@ -185,70 +191,71 @@ const (
 		"len = EXCLUDED.len, raw_len = EXCLUDED.raw_len " +
 		"RETURNING (xmax = 0) AS created"
 
-	// Метаданные для чтения: мёртвые строки (refcount = 0) невидимы —
-	// контракт Delete (T-041): после последней ссылки контент недоступен.
+	// Metadata for reading: dead rows (refcount = 0) are invisible —
+	// the Delete contract (T-041): after the last reference the content is
+	// unavailable.
 	sqlMetaGet = "SELECT pack_id, off, len, raw_len FROM contents " +
 		"WHERE hash = $1 AND refcount > 0"
 
-	// Снятие ссылки Delete: refcount = 0 строка остаётся «мёртвой» —
-	// физическое освобождение места за компактификацией (T-045).
+	// Removing a reference by Delete: with refcount = 0 the row stays "dead" —
+	// physical space reclamation is compaction's job (T-045).
 	sqlMetaDelRef = "UPDATE contents SET refcount = refcount - 1 " +
 		"WHERE hash = $1 AND refcount > 0"
 )
 
-// PackOptions — параметры PackStore из секции content конфигурации
-// (T-006). Нулевой PackSize — DefaultPackSize; нулевой MaxStoreBytes —
-// без лимита (конфиг задаёт его всегда, T-046).
+// PackOptions — PackStore parameters from the content section of the
+// configuration (T-006). A zero PackSize means DefaultPackSize; a zero
+// MaxStoreBytes means no limit (the config always sets it, T-046).
 type PackOptions struct {
-	Dir           string // каталог пак-файлов (content.dir)
-	PackSize      int64  // порог ротации, байты (content.pack_size)
-	MaxStoreBytes int64  // лимит одного контента, байты (content.max_store_bytes)
-	// DiskFreePercent — порог свободного места каталога контента, %
-	// (content.disk_free_percent, ТЗ 8): ниже порога Put возвращает
-	// ErrStoreFull — пауза записи контента; 0 — контроль выключен
-	// (конфиг задаёт его всегда, T-046).
+	Dir           string // the pack-file directory (content.dir)
+	PackSize      int64  // the rotation threshold, bytes (content.pack_size)
+	MaxStoreBytes int64  // the limit of one content, bytes (content.max_store_bytes)
+	// DiskFreePercent — the free-space threshold of the content directory, %
+	// (content.disk_free_percent, spec 8): below the threshold Put returns
+	// ErrStoreFull — a content write pause; 0 — the control is disabled
+	// (the config always sets it, T-046).
 	DiskFreePercent float64
-	// OnStoreFull — хук алерта T-080: типизированные события «место
-	// ниже порога» от Put, ENOSPC и DiskWatchLoop. nil — не задан.
+	// OnStoreFull — the T-080 alert hook: typed events "space below the
+	// threshold" from Put, ENOSPC, and DiskWatchLoop. nil — not set.
 	OnStoreFull OnStoreFullFunc
-	// ReadOnly — открыть хранилище только для чтения (читатели без
-	// записи: crawlerctl domain --content): каталог и файл блокировки
-	// не создаются — работают даже без прав на запись в content.dir,
-	// опечатка в каталоге не создаёт посторонних путей; Put/Delete/
-	// beginAppend отказывают errReadOnly, Get читает по имеющимся пакам
-	// и метаданным.
+	// ReadOnly — open the store read-only (readers without writes:
+	// crawlerctl domain --content): neither the directory nor the lock file
+	// is created — it works even without write permissions on content.dir,
+	// and a typo in the directory does not create stray paths; Put/Delete/
+	// beginAppend refuse with errReadOnly, Get reads via the existing packs
+	// and metadata.
 	ReadOnly bool
 }
 
-// PackStore — ContentStore на пак-файлах: блоки в pack-NNNNNN.pack,
-// метаданные и счётчики ссылок в PostgreSQL (contents). Put сериализован
-// (мьютекс позиции записи + flock каталога между процессами), Get читает
-// зафиксированные смещения параллельно без блокировок: паки append-only.
+// PackStore — a ContentStore on pack files: blocks in pack-NNNNNN.pack,
+// metadata and reference counters in PostgreSQL (contents). Put is serialized
+// (the write-position mutex + the directory flock across processes), Get reads
+// committed offsets in parallel without locks: packs are append-only.
 type PackStore struct {
 	pool db.DB
 	opts PackOptions
 
-	mu       sync.Mutex   // позиция записи и ротация (внутри процесса)
-	active   *packFile    // пак для дописывания — всегда новейший (appendBlockLocked)
-	lock     *os.File     // flock каталога паков (между процессами)
-	dirCache packDirCache // новейший пак с кэшем по mtime каталога
-	stat     SpaceChecker // источник statfs для контроля места (nil — OSStatfs; тесты подменяют)
+	mu       sync.Mutex   // the write position and rotation (within the process)
+	active   *packFile    // the pack to append to — always the newest (appendBlockLocked)
+	lock     *os.File     // the packs directory flock (across processes)
+	dirCache packDirCache // the newest pack with an mtime-based directory cache
+	stat     SpaceChecker // the statfs source for space control (nil — OSStatfs; tests stub it)
 	closed   bool
 }
 
-// compile-time: PackStore реализует ContentStore (T-041).
+// compile-time: PackStore implements ContentStore (T-041).
 var _ ContentStore = (*PackStore)(nil)
 
-// packFile — открытый на дописывание пак.
+// packFile — a pack open for appending.
 type packFile struct {
 	id   int32
 	f    packWriter
-	size int64 // актуализируется stat'ом под блокировкой
+	size int64 // refreshed by Stat under the lock
 }
 
-// packWriter — файл пака, как он нужен писателю: реальный *os.File или
-// подстановка тестов (обёртка с подсчётом fsync групповой фиксации,
-// T-102; стиль SpaceChecker в disk.go).
+// packWriter — a pack file as the writer needs it: a real *os.File or a
+// test stub (a wrapper counting the group-commit fsyncs,
+// T-102; the SpaceChecker style in disk.go).
 type packWriter interface {
 	Write(p []byte) (int, error)
 	ReadAt(p []byte, off int64) (int, error)
@@ -257,18 +264,18 @@ type packWriter interface {
 	Close() error
 }
 
-// packHeader — метаданные пак-файла (v1).
+// packHeader — pack file metadata (v1).
 type packHeader struct {
-	id      int32  // номер пака = порядковый номер имени файла
-	maxSize int64  // порог ротации на момент создания (content.pack_size)
-	dictID  uint32 // ID словаря zstd на момент создания (0 — без словаря)
+	id      int32  // the pack number = the ordinal number in the file name
+	maxSize int64  // the rotation threshold at creation time (content.pack_size)
+	dictID  uint32 // the zstd dictionary ID at creation time (0 — no dictionary)
 }
 
-// OpenPackStore открывает хранилище в opts.Dir: каталог создаётся,
-// файл блокировки — тоже (fail-fast на неустройчивом к записи каталоге);
-// сами паки сканируются лениво при первой записи. pool — pgx-пул
-// (internal/db), где живут строки contents. PackOptions.ReadOnly открывает
-// читателя: без создания каталога и замка (см. поле).
+// OpenPackStore opens the store in opts.Dir: the directory is created,
+// and so is the lock file (fail-fast on a directory that is not writable);
+// the packs themselves are scanned lazily on the first write. pool is the
+// pgx pool (internal/db) holding the contents rows. PackOptions.ReadOnly opens
+// a reader: without creating a directory or a lock (see the field).
 func OpenPackStore(pool db.DB, opts PackOptions) (*PackStore, error) {
 	if pool == nil {
 		return nil, errors.New("content: пул БД не задан")
@@ -286,9 +293,10 @@ func OpenPackStore(pool db.DB, opts PackOptions) (*PackStore, error) {
 		return nil, fmt.Errorf("content: max_store_bytes %d отрицателен", opts.MaxStoreBytes)
 	}
 	if opts.ReadOnly {
-		// Читателю каталог и замок не нужны: ФС не меняется, права на
-		// запись не требуются. Отсутствующий каталог — ошибка: опечатка
-		// в content.dir не должна молча выглядеть пустым хранилищем.
+		// A reader needs neither the directory nor the lock: the FS is not
+		// modified, no write permissions are required. A missing directory is an
+		// error: a typo in content.dir must not silently look like an empty
+		// store.
 		st, err := os.Stat(opts.Dir)
 		if err != nil {
 			return nil, fmt.Errorf("content: каталог паков %s: %w", opts.Dir, err)
@@ -301,10 +309,11 @@ func OpenPackStore(pool db.DB, opts PackOptions) (*PackStore, error) {
 	if err := os.MkdirAll(opts.Dir, 0o755); err != nil {
 		return nil, fmt.Errorf("content: каталог паков %s: %w", opts.Dir, err)
 	}
-	// 0o660: lock и паки открывают на запись несколько юнитов группы
-	// crawler (http-worker, render-worker, analyzer — flock; docs/deploy.md
-	// §3, «права на пак-файлы 0660»); 0644 у первого создателя отрезало бы
-	// запись остальным в systemd-деплое (отдельный пользователь на сервис).
+	// 0o660: the lock and the packs are opened for writing by several units of
+	// the crawler group (http-worker, render-worker, analyzer — flock;
+	// docs/deploy.md §3, "pack-file permissions 0660"); 0644 on the first
+	// creator would cut off the others' write access in the systemd deploy
+	// (a separate user per service).
 	lock, err := os.OpenFile(filepath.Join(opts.Dir, packLockFile), os.O_CREATE|os.O_RDWR, 0o660)
 	if err != nil {
 		return nil, fmt.Errorf("content: файл блокировки %s: %w", filepath.Join(opts.Dir, packLockFile), err)
@@ -312,11 +321,11 @@ func OpenPackStore(pool db.DB, opts PackOptions) (*PackStore, error) {
 	return &PackStore{pool: pool, opts: opts, lock: lock, stat: OSStatfs{}}, nil
 }
 
-// Dir — каталог пак-файлов хранилища (диагностика, тесты, сервисы).
+// Dir — the store's pack-file directory (diagnostics, tests, services).
 func (s *PackStore) Dir() string { return s.opts.Dir }
 
-// Close закрывает файлы хранилища; Get после Close продолжает работать
-// (паки открываются на чтение по запросу), запись — ошибка.
+// Close closes the store's files; Get after Close keeps working
+// (packs are opened for reading on demand), writing is an error.
 func (s *PackStore) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -331,7 +340,7 @@ func (s *PackStore) Close() error {
 		}
 		s.active = nil
 	}
-	// У хранилища из ReadOnly замка нет (s.lock == nil).
+	// A ReadOnly store has no lock (s.lock == nil).
 	if s.lock != nil {
 		if cerr := s.lock.Close(); cerr != nil && err == nil {
 			err = cerr
@@ -340,10 +349,11 @@ func (s *PackStore) Close() error {
 	return err
 }
 
-// Put сохраняет data (контракт — store.go). Дедупликация: хэш уже есть
-// среди живых строк contents — добавляется ссылка, байты не пишутся.
-// Новый контент: блок дописывается в пак (спул), затем фиксируются
-// метаданные — крах между шагами оставляет невидимый мусорный блок.
+// Put stores data (the contract is in store.go). Deduplication: the hash is
+// already among the live contents rows — a reference is added, no bytes are
+// written. New content: the block is appended to the pack (spooled), then the
+// metadata is committed — a crash between the steps leaves an invisible
+// garbage block.
 func (s *PackStore) Put(ctx context.Context, data []byte) (PutResult, error) {
 	if err := ctx.Err(); err != nil {
 		return PutResult{}, err
@@ -357,7 +367,7 @@ func (s *PackStore) Put(ctx context.Context, data []byte) (PutResult, error) {
 	}
 	h := HashOf(data)
 
-	// 1) дедуп: живой контент — только ссылка.
+	// 1) dedup: live content is a reference only.
 	tag, err := s.pool.Exec(ctx, sqlMetaAddRef, h[:])
 	if err != nil {
 		return PutResult{}, fmt.Errorf("content: метаданные %s: %w", h, err)
@@ -366,24 +376,24 @@ func (s *PackStore) Put(ctx context.Context, data []byte) (PutResult, error) {
 		return PutResult{Hash: h}, nil
 	}
 
-	// 1.5) пауза записи контента (ТЗ 8, T-046): свободное место каталога
-	// ниже порога — новый блок не пишется, ErrStoreFull + событие алерта.
-	// Дедуп выше уже вернулся: ссылки на живой контент и чтение продолжают
-	// работать — байты не расходуются.
+	// 1.5) the content write pause (spec 8, T-046): the directory's free space
+	// below the threshold — the new block is not written, ErrStoreFull + an
+	// alert event. The dedup above has already returned: references to live
+	// content and reads keep working — no bytes are consumed.
 	if err := s.pauseIfDiskFull(); err != nil {
 		return PutResult{}, err
 	}
 
-	// 2) спул блока в пак и 3) фиксация метаданных — под одним захватом
-	// мьютекса и flock (appendAndMeta): блок и его строка появляются в
-	// хранилище атомарно относительно компактификации (T-045), которая
-	// удаляет старые паки под той же блокировкой. Комментарий о конфликтах
-	// INSERT — в appendAndMeta.
+	// 2) spooling the block into the pack and 3) committing the metadata —
+	// under one acquisition of the mutex and flock (appendAndMeta): the block
+	// and its row appear in the store atomically with respect to compaction
+	// (T-045), which removes old packs under the same lock. The INSERT conflict
+	// commentary is in appendAndMeta.
 	block := CompressWithDict(data)
 	created, err := s.appendAndMeta(ctx, h, block, len(data))
 	if err != nil {
-		// ENOSPC при физической записи — последняя линия обороны после
-		// порога (wrapPackWriteErr): тоже сигнал алерта (ТЗ 8).
+		// ENOSPC on a physical write — the last line of defense after the
+		// threshold (wrapPackWriteErr): also an alert signal (spec 8).
 		if errors.Is(err, ErrStoreFull) {
 			s.fireStoreFull(s.enospcEvent())
 		}
@@ -392,24 +402,24 @@ func (s *PackStore) Put(ctx context.Context, data []byte) (PutResult, error) {
 	return PutResult{Hash: h, Created: created}, nil
 }
 
-// appendAndMeta дописывает блок в новейший пак и фиксирует строку
-// метаданных под одним захватом мьютекса и flock каталога (T-045):
-// строка появляется в БД не позже снятия блокировки, удерживавшейся при
-// дописывании блока, — компактификация, взявшая flock следующим, не может
-// счесть блок мусорным и удалить пак до фиксации строки. Ошибка на любом
-// шаге оставляет блок мусорным без строки — невидим, вычистит
-// компактификация (семантика краш-окна T-042 сохранена); блокировка в
-// критической секции удерживается и на время запроса к БД — цена
-// корректности межпроцессного протокола, запись контента не является
-// горячим путём (страницы приходят с сети медленнее коммита).
+// appendAndMeta appends the block to the newest pack and commits the
+// metadata row under one acquisition of the mutex and the directory flock
+// (T-045): the row appears in the DB no later than the lock held during the
+// block's append is released — compaction, taking flock next, cannot deem the
+// block garbage and remove the pack before the row is committed. An error at
+// any step leaves the block as garbage without a row — invisible, purged by
+// compaction (the T-042 crash-window semantics preserved); the lock is held in
+// the critical section for the duration of the DB query too — the price of a
+// correct inter-process protocol, content writing is not a hot path (pages
+// arrive from the network slower than a commit).
 //
-// INSERT-ветка sqlMetaPut — новый контент; UPDATE-ветка конфликта —
-// конкурент успел раньше (блок этого вызова — мусор) или воскрешение
-// мёртвой строки (свежий блок дописан, размещение переведено на него).
-// Created берётся из RETURNING (xmax = 0): true — фактическая вставка,
-// false — обновление. Ветка воскрешения даёт false, хотя байты писались:
-// для метрики доли дедупликации (ТЗ 11.4 п. 3) это редкое расхождение,
-// зафиксированное в docs/content.md.
+// The INSERT branch of sqlMetaPut — new content; the UPDATE branch of a
+// conflict — a concurrent writer got there first (this call's block is
+// garbage) or resurrection of a dead row (a fresh block appended, the
+// placement moved onto it). Created comes from RETURNING (xmax = 0): true —
+// an actual insert, false — an update. The resurrection branch yields false
+// although bytes were written: for the dedup share metric (spec 11.4 item 3)
+// this is a rare discrepancy, pinned in docs/content.md.
 func (s *PackStore) appendAndMeta(ctx context.Context, h Hash, block []byte, rawLen int) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -425,11 +435,11 @@ func (s *PackStore) appendAndMeta(ctx context.Context, h Hash, block []byte, raw
 	if err != nil {
 		return false, err
 	}
-	// Блок обязан дожить до диска раньше строки метаданных (ТЗ 3.4,
-	// «спул → фиксация»): fsync в том же захвате flock закрывает окно
-	// «строка durable, байтов нет» при потере питания (повторный Put
-	// такой записи не чинит — дедуп видит живую строку). Запись контента
-	// — не горячий путь (docs/content.md): цена — один fsync на блок.
+	// The block must survive to disk before the metadata row (spec 3.4,
+	// "spool → commit"): fsync within the same flock acquisition closes the
+	// "row durable, bytes gone" window on power loss (a repeated Put does not
+	// fix such a record — dedup sees a live row). Content writing
+	// is not a hot path (docs/content.md): the price is one fsync per block.
 	if err := s.syncActiveLocked(); err != nil {
 		return false, err
 	}
@@ -452,10 +462,10 @@ func (s *PackStore) appendAndMeta(ctx context.Context, h Hash, block []byte, raw
 	return created, nil
 }
 
-// Get возвращает контент по метаданным contents: блок (pack_id, off, len)
-// читается из пака и распаковывается. Мёртвые строки (refcount = 0) и
-// отсутствующие — ErrNotFound. Блок нечитаем при живой строке —
-// ErrCorrupted (см. store.go).
+// Get returns content by the contents metadata: the block (pack_id, off, len)
+// is read from the pack and decompressed. Dead rows (refcount = 0) and
+// missing ones — ErrNotFound. An unreadable block with a live row —
+// ErrCorrupted (see store.go).
 func (s *PackStore) Get(ctx context.Context, hash Hash) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -466,11 +476,11 @@ func (s *PackStore) Get(ctx context.Context, hash Hash) ([]byte, error) {
 	}
 	block, err := readPackBlock(s.opts.Dir, packID, off, clen)
 	if err != nil && errors.Is(err, fs.ErrNotExist) {
-		// Пака нет (ENOENT), хотя строка живая: файл удалён под
-		// компактификацией между чтением строки и открытием пака —
-		// строка уже переехала на новое место. Перечитываем метаданные
-		// (не более одного раза) и читаем по свежему размещению; без
-		// повтора читатель видел бы транзиентную ошибку на ровном месте.
+		// The pack is gone (ENOENT) although the row is live: the file was
+		// removed under compaction between reading the row and opening the
+		// pack — the row has already moved to a new place. We re-read the
+		// metadata (at most once) and read via the fresh placement; without
+		// the retry the reader would see a transient error out of the blue.
 		if packID, off, clen, rawLen, err = s.meta(ctx, hash); err != nil {
 			return nil, err
 		}
@@ -490,8 +500,8 @@ func (s *PackStore) Get(ctx context.Context, hash Hash) ([]byte, error) {
 	return raw, nil
 }
 
-// meta — строка метаданных живого контента (sqlMetaGet): размещение
-// блока. Отсутствующий/мёртвый контент — ErrNotFound.
+// meta — the metadata row of live content (sqlMetaGet): the block's
+// placement. Missing/dead content — ErrNotFound.
 func (s *PackStore) meta(ctx context.Context, hash Hash) (int32, int64, int32, int32, error) {
 	rows, err := s.pool.Query(ctx, sqlMetaGet, hash[:])
 	if err != nil {
@@ -514,8 +524,8 @@ func (s *PackStore) meta(ctx context.Context, hash Hash) (int32, int64, int32, i
 	return packID, off, clen, rawLen, nil
 }
 
-// Delete снимает одну ссылку: refcount − 1, строка остаётся (при нуле —
-// «мёртвая», невидима для Get). Снимать нечего — ErrNotFound.
+// Delete removes one reference: refcount − 1, the row remains (at zero —
+// "dead", invisible to Get). Nothing to remove — ErrNotFound.
 func (s *PackStore) Delete(ctx context.Context, hash Hash) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -533,19 +543,19 @@ func (s *PackStore) Delete(ctx context.Context, hash Hash) error {
 	return nil
 }
 
-// appendBatch — пачка дописываний под одним захватом мьютекса и flock
-// (C-11): компактификация дописывает тысячи блоков прохода —
-// переоткрытие файлов и пара flock-сисколлов на каждый блок бессмысленно
-// дорожают фоновую задачу, чья работа — жалеть диск. Один fsync на пачку
-// (finish) сохраняет инвариант C-1: байты — на диске до транзакции
-// переноса строк.
+// appendBatch — a batch of appends under one acquisition of the mutex and
+// flock (C-11): compaction appends thousands of blocks of a pass —
+// reopening files and a pair of flock syscalls per block would needlessly
+// drive up the cost of a background task whose job is to spare the disk. One
+// fsync per batch (finish) preserves the C-1 invariant: the bytes are on disk
+// before the row-move transaction.
 type appendBatch struct {
 	s *PackStore
 }
 
-// beginAppend захватывает блокировки пачки. Используется компактификацией
-// (T-045); Put проходит через appendAndMeta, удерживающий ту же
-// блокировку до фиксации метаданных.
+// beginAppend takes the batch's locks. Used by compaction
+// (T-045); Put goes through appendAndMeta, which holds the same lock until the
+// metadata is committed.
 func (s *PackStore) beginAppend() (*appendBatch, error) {
 	s.mu.Lock()
 	if s.closed {
@@ -563,15 +573,15 @@ func (s *PackStore) beginAppend() (*appendBatch, error) {
 	return &appendBatch{s: s}, nil
 }
 
-// append дописывает блок в новейший пак (мьютекс и flock пачки уже
-// удерживаются). Ошибка дописывания — не фатальна для пачки: вызывающий
-// обязан завершить её finish.
+// append appends a block to the newest pack (the batch's mutex and flock are
+// already held). An append error is not fatal for the batch: the caller must
+// finish it with finish.
 func (b *appendBatch) append(block []byte) (int32, int64, error) {
 	return b.s.appendBlockLocked(block)
 }
 
-// finish синхронизирует активный пак на диск (до фиксации строк — C-1)
-// и снимает блокировки пачки.
+// finish syncs the active pack to disk (before the rows are committed — C-1)
+// and releases the batch's locks.
 func (b *appendBatch) finish() error {
 	err := b.s.syncActiveLocked()
 	unlockDir(b.s.lock)
@@ -579,23 +589,23 @@ func (b *appendBatch) finish() error {
 	return err
 }
 
-// appendBlockLocked — ядро дописывания, вызывается под мьютексом и
-// flock. fsync НЕ выполняет: пачка дописываний синхронизируется одним
-// syncActiveLocked (Put — до фиксации строки, компактификация — до
-// транзакции переноса; syncActiveLocked), ротация — closeActiveLocked.
-// Активный пак синхронизируется с новейшим в каталоге: писатели
-// дописывают ТОЛЬКО в новейший пак, все остальные закрыты для записи —
-// предусловие компактификации (T-045), удаляющей старые паки: множество
-// строк не-новейшего пака замораживается в момент появления следующего
-// пака, опоздавших дописываний не бывает (в прежней схеме активный пак
-// мог отставать от новейшего и старый пак оставался открытым для записи).
+// appendBlockLocked — the append core, called under the mutex and
+// flock. It performs NO fsync: a batch of appends is synced by one
+// syncActiveLocked (Put — before the row is committed, compaction — before
+// the move transaction; syncActiveLocked), rotation — closeActiveLocked.
+// The active pack is synchronized with the newest in the directory: writers
+// append ONLY to the newest pack, all the others are closed for writing —
+// the compaction precondition (T-045), which removes old packs: the set of
+// rows of a non-newest pack is frozen the moment the next pack appears, late
+// appends do not happen (in the previous scheme the active pack could lag
+// behind the newest and the old pack stayed open for writing).
 func (s *PackStore) appendBlockLocked(block []byte) (int32, int64, error) {
 	maxID, err := s.newestPackIDLocked()
 	if err != nil {
 		return 0, 0, err
 	}
 	if maxID == 0 {
-		maxID = 1 // пустой каталог — создаётся пак номер 1
+		maxID = 1 // an empty directory — pack number 1 is created
 	}
 	if s.active == nil || s.active.id != maxID {
 		pf, err := s.openPackForWrite(maxID)
@@ -607,7 +617,7 @@ func (s *PackStore) appendBlockLocked(block []byte) (int32, int64, error) {
 		}
 		s.active = pf
 	} else {
-		// Другой процесс мог дописать пак с момента прошлого вызова.
+		// Another process may have appended to the pack since the last call.
 		st, err := s.active.f.Stat()
 		if err != nil {
 			return 0, 0, fmt.Errorf("content: пак %d: %w", s.active.id, err)
@@ -622,7 +632,7 @@ func (s *PackStore) appendBlockLocked(block []byte) (int32, int64, error) {
 		}
 	}
 
-	off := s.active.size + 4 // запись: [len u32 LE][блок]; off — начало блока
+	off := s.active.size + 4 // a record: [len u32 LE][block]; off — the start of the block
 	buf := make([]byte, 4+len(block))
 	binary.LittleEndian.PutUint32(buf[:4], uint32(len(block)))
 	copy(buf[4:], block)
@@ -633,10 +643,10 @@ func (s *PackStore) appendBlockLocked(block []byte) (int32, int64, error) {
 	return s.active.id, off, nil
 }
 
-// syncActiveLocked — fsync активного пака: байты дописанных блоков
-// обязаны дожить до диска ДО фиксации строк метаданных (C-1, ТЗ 3.4
-// «спул → фиксация»); вызывается под мьютексом и flock (Put — на каждый
-// блок, компактификация — один на пачку, C-11).
+// syncActiveLocked — fsync of the active pack: the bytes of appended blocks
+// must survive to disk BEFORE the metadata rows are committed (C-1, spec 3.4
+// "spool → commit"); called under the mutex and flock (Put — per block,
+// compaction — one per batch, C-11).
 func (s *PackStore) syncActiveLocked() error {
 	if s.active == nil {
 		return nil
@@ -647,9 +657,10 @@ func (s *PackStore) syncActiveLocked() error {
 	return nil
 }
 
-// closeActiveLocked закрывает активный пак: недописанные байты — на диск
-// до Close (ротация внутри пачки компактификации могла бы закрыть пак
-// с несинхронизированными блоками), иначе батч терял бы гарантию C-1.
+// closeActiveLocked closes the active pack: unsynced bytes go to disk
+// before Close (a rotation inside a compaction batch could otherwise close a
+// pack with unsynced blocks), otherwise the batch would lose the C-1
+// guarantee.
 func (s *PackStore) closeActiveLocked() error {
 	if err := s.syncActiveLocked(); err != nil {
 		return err
@@ -657,37 +668,37 @@ func (s *PackStore) closeActiveLocked() error {
 	return s.active.f.Close()
 }
 
-// packDirCache — кэш реестра паков: mtime каталога меняется при создании
-// и удалении pak-файлов, но не при дописывании в них, поэтому свежесть
-// кэша проверяется одним os.Stat вместо ReadDir на каждую запись.
+// packDirCache — the pack registry cache: the directory's mtime changes when
+// pack files are created and removed but not when they are appended to, so
+// cache freshness is checked with one os.Stat instead of a ReadDir on every
+// write.
 type packDirCache struct {
 	valid   bool
 	modTime time.Time
 	maxID   int32
 }
 
-// newestPackIDLocked — максимальный id пака в каталоге (0 — паков нет)
-// с кэшем по mtime каталога; вызывается под мьютексом. Равенство mtime —
-// не доказательство отсутствия нового пака: ядро обновляет mtime по
-// грубому таймеру (1–4 мс, на части ФС грубее), создание пака другим
-// процессом может уложиться в ту же гранулярность. Поэтому при свежем
-// кэше проверяется существование следующего id (один stat дешевле
-// ReadDir): допись обязана идти только в новейший пак — предусловие
-// компактификации (T-045).
+// newestPackIDLocked — the maximum pack id in the directory (0 — no packs)
+// with an mtime-based directory cache; called under the mutex. Equal mtimes do
+// not prove the absence of a new pack: the kernel updates mtime on a coarse
+// timer (1–4 ms, coarser on some FSes), a pack created by another process may
+// fit into the same granularity. So with a fresh cache the existence of the
+// next id is checked (one stat is cheaper than a ReadDir): appends must go
+// only to the newest pack — the compaction precondition (T-045).
 func (s *PackStore) newestPackIDLocked() (int32, error) {
-	// stat до ReadDir: события между ними лишь лишний раз инвалидируют кэш.
+	// stat before ReadDir: events in between just invalidate the cache once more.
 	st, err := os.Stat(s.opts.Dir)
 	if err != nil {
 		return 0, fmt.Errorf("content: каталог паков %s: %w", s.opts.Dir, err)
 	}
 	if s.dirCache.valid && !s.dirCache.modTime.Equal(st.ModTime()) {
-		s.dirCache.valid = false // реестр паков менялся — пересобрать
+		s.dirCache.valid = false // the pack registry changed — rebuild
 	}
 	if s.dirCache.valid {
 		_, err := os.Stat(filepath.Join(s.opts.Dir, packFileName(s.dirCache.maxID+1)))
 		switch {
 		case err == nil:
-			s.dirCache.valid = false // найден пак новее кэша — пересобрать
+			s.dirCache.valid = false // a pack newer than the cache was found — rebuild
 		case errors.Is(err, fs.ErrNotExist):
 			return s.dirCache.maxID, nil
 		default:
@@ -702,12 +713,12 @@ func (s *PackStore) newestPackIDLocked() (int32, error) {
 	return maxID, nil
 }
 
-// rotateLocked вызывается, когда текущий пак полон: переключиться на
-// новейший пак каталога (другой процесс мог ротировать раньше); если и
-// он полон — создать следующий: pack_id монотонно растёт, имя выделяется
-// по каталогу под блокировкой. Первый блок пака пишется всегда, даже
-// сверх порога, — ротация обязана продвигаться (контент ≤ 16 МиБ
-// по валидации max_store_bytes, порог ≥ 1 МиБ).
+// rotateLocked runs when the current pack is full: switch to the directory's
+// newest pack (another process may have rotated earlier); if that one is
+// full too — create the next one: pack_id grows monotonically, the name is
+// allocated from the directory under the lock. The first block of a pack is
+// always written, even over the threshold — rotation must make progress
+// (content ≤ 16 MiB by the max_store_bytes validation, the threshold ≥ 1 MiB).
 func (s *PackStore) rotateLocked(recLen int64) error {
 	maxID, err := s.newestPackIDLocked()
 	if err != nil {
@@ -725,13 +736,13 @@ func (s *PackStore) rotateLocked(recLen int64) error {
 		s.active = pf
 	}
 	if s.active.size <= packHeaderLen || s.active.size+recLen <= s.opts.PackSize {
-		return nil // новейший пак вместил запись
+		return nil // the newest pack fit the record
 	}
 	pf, err := s.createPackLocked(maxID + 1)
 	if err != nil {
 		return err
 	}
-	s.dirCache.valid = false // создан новый пак — реестр изменился
+	s.dirCache.valid = false // a new pack was created — the registry changed
 	if err := s.closeActiveLocked(); err != nil {
 		_ = pf.f.Close()
 		return err
@@ -740,10 +751,10 @@ func (s *PackStore) rotateLocked(recLen int64) error {
 	return nil
 }
 
-// createPackLocked создаёт пак с заголовком. Файл может существовать
-// пустым (крах после create до записи заголовка) — заголовок дописывается;
-// несовместимое содержимое — ошибка (открытый файл закрывается: утечка
-// fd на каждом повторе ротации скормила бы процессу EMFILE).
+// createPackLocked creates a pack with a header. The file may exist empty
+// (a crash after create before the header write) — the header is appended;
+// incompatible contents are an error (the open file is closed: an fd leak on
+// every rotation retry would feed the process EMFILE).
 func (s *PackStore) createPackLocked(id int32) (*packFile, error) {
 	pf, err := s.openPackForWrite(id)
 	if err != nil {
@@ -757,15 +768,15 @@ func (s *PackStore) createPackLocked(id int32) (*packFile, error) {
 	return pf, nil
 }
 
-// openPackForWrite открывает (или создаёт) пак на дописывание и
-// приводит заголовок в порядок: пустой файл получает заголовок v1,
-// непустой валидируется (версия и совпадение id с именем файла).
+// openPackForWrite opens (or creates) a pack for appending and puts the
+// header in order: an empty file gets a v1 header, a non-empty one is
+// validated (the version and the id matching the file name).
 func (s *PackStore) openPackForWrite(id int32) (*packFile, error) {
 	path := filepath.Join(s.opts.Dir, packFileName(id))
-	// O_APPEND: дописывание всегда в конец файла независимо от позиции
-	// fd — размер другого процесса не искажает запись.
-	// 0o660 — см. блокировку выше: активный пак дописывают юниты-писатели
-	// группы crawler (docs/deploy.md §3).
+	// O_APPEND: appends always go to the end of the file regardless of the fd
+	// position — another process's size does not distort the write.
+	// 0o660 — see the lock above: the writer units of the crawler group append
+	// to the active pack (docs/deploy.md §3).
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o660)
 	if err != nil {
 		return nil, fmt.Errorf("content: пак %d: %w", id, err)
@@ -777,13 +788,13 @@ func (s *PackStore) openPackForWrite(id int32) (*packFile, error) {
 	}
 	hdr := packHeader{id: id, maxSize: s.opts.PackSize, dictID: activeDictID()}
 	if st.Size() < packHeaderLen {
-		// Пустой файл (только что создан либо крах до заголовка) или
-		// обрыв записи заголовка при сбое питания/ENOSPC (C-7): записей
-		// в файле быть не может — хвост обрезается, заголовок пишется с
-		// нуля. Иначе «короткий» новейший пак заклинивает запись всего
-		// хранилища, а не-новейший — вечную ошибку скана. Конец файла —
-		// смещение 0, обычный Write и есть запись заголовка (WriteAt на
-		// O_APPEND-дескрипторе запрещён Go).
+		// An empty file (just created or a crash before the header) or a torn
+		// header write on power loss/ENOSPC (C-7): the file cannot contain
+		// records — the tail is truncated and the header is written from
+		// scratch. Otherwise a "short" newest pack jams the writing of the whole
+		// store, and a non-newest one — an eternal scan error. The end of the
+		// file is offset 0, a regular Write is the header write (WriteAt on an
+		// O_APPEND descriptor is forbidden in Go).
 		if st.Size() > 0 {
 			if err := f.Truncate(0); err != nil {
 				_ = f.Close()
@@ -794,9 +805,10 @@ func (s *PackStore) openPackForWrite(id int32) (*packFile, error) {
 			_ = f.Close()
 			return nil, wrapPackWriteErr(err, id)
 		}
-		// Заголовок и запись каталога о файле — на диск до любых строк
-		// метаданных этого пака: без синка каталога созданный файл может
-		// не пережить потерю питания вместе с первыми строками (C-1).
+		// The header and the directory record of the file must be on disk
+		// before any metadata rows of this pack: without a directory sync a
+		// created file may not survive a power loss together with its first
+		// rows (C-1).
 		if err := f.Sync(); err != nil {
 			_ = f.Close()
 			return nil, wrapPackWriteErr(err, id)
@@ -819,7 +831,7 @@ func (s *PackStore) openPackForWrite(id int32) (*packFile, error) {
 	return &packFile{id: id, f: f, size: st.Size()}, nil
 }
 
-// scanPackIDs возвращает максимальный id пака в каталоге (0 — паков нет).
+// scanPackIDs returns the maximum pack id in the directory (0 — no packs).
 func (s *PackStore) scanPackIDs() (int32, error) {
 	ents, err := os.ReadDir(s.opts.Dir)
 	if err != nil {
@@ -834,17 +846,18 @@ func (s *PackStore) scanPackIDs() (int32, error) {
 	return max, nil
 }
 
-// packFileName — имя пак-файла: pack-NNNNNN.pack (порядковый номер —
-// pack_id, реестр паков — множество имён плюс заголовок файла).
+// packFileName — the pack file name: pack-NNNNNN.pack (the ordinal number is
+// the pack_id, the pack registry is the set of names plus the file header).
 func packFileName(id int32) string {
 	return fmt.Sprintf("pack-%06d.pack", id)
 }
 
-// packIDFromName разбирает имя пак-файла; чужие файлы (словарь, замок,
-// временные) отвергаются. Принимается только каноническое имя
-// pack-NNNNNN.pack (packFileName): «pack-1.pack» — чужой файл, иначе
-// один pack_id получил бы два файла (писатель создаёт каноничное имя
-// рядом с неканоничным), и удаление с ротацией путались бы между ними.
+// packIDFromName parses a pack file name; foreign files (the dictionary, the
+// lock, temporary ones) are rejected. Only the canonical name
+// pack-NNNNNN.pack (packFileName) is accepted: "pack-1.pack" is a foreign
+// file, otherwise one pack_id would get two files (the writer creates the
+// canonical name next to a non-canonical one), and removal with rotation
+// would confuse them.
 func packIDFromName(name string) (int32, bool) {
 	const prefix, suffix = "pack-", ".pack"
 	if !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, suffix) {
@@ -855,12 +868,12 @@ func packIDFromName(name string) (int32, bool) {
 		return 0, false
 	}
 	if name != packFileName(int32(n)) {
-		return 0, false // имя без паддинга — не наш пак
+		return 0, false // a name without padding is not our pack
 	}
 	return int32(n), true
 }
 
-// bytes кодирует заголовок v1 (little-endian).
+// bytes encodes the v1 header (little-endian).
 func (h packHeader) bytes() []byte {
 	b := make([]byte, 0, packHeaderLen)
 	b = append(b, packMagic...)
@@ -872,7 +885,7 @@ func (h packHeader) bytes() []byte {
 	return b
 }
 
-// readPackHeader читает и разбирает заголовок пака.
+// readPackHeader reads and parses a pack header.
 func readPackHeader(f *os.File) (packHeader, error) {
 	buf := make([]byte, packHeaderLen)
 	if _, err := f.ReadAt(buf, 0); err != nil {
@@ -881,10 +894,11 @@ func readPackHeader(f *os.File) (packHeader, error) {
 	return parsePackHeader(buf)
 }
 
-// parsePackHeader разбирает заголовок v1: первые packHeaderLen байт с
-// полями v1. hdrLen допускается больше packHeaderLen — будущие версии
-// дописывают поля в конец, v1 их не читает (документировано в
-// docs/content.md); hdrLen меньше обязательных полей v1 — повреждение.
+// parsePackHeader parses a v1 header: the first packHeaderLen bytes with
+// the v1 fields. hdrLen may exceed packHeaderLen — future versions
+// append fields at the end, v1 does not read them (documented in
+// docs/content.md); an hdrLen smaller than the mandatory v1 fields is
+// corruption.
 func parsePackHeader(b []byte) (packHeader, error) {
 	bad := errors.New("заголовок пака нечитаем")
 	if len(b) < packHeaderLen || string(b[:len(packMagic)]) != packMagic {
@@ -903,15 +917,15 @@ func parsePackHeader(b []byte) (packHeader, error) {
 	}, nil
 }
 
-// readPackBlock открывает пак и читает clen байт блока со смещения off
-// (точечные чтения Get). Компактификация читает пак один раз на проход —
-// readPackBlockAt по открытому файлу (C-11).
+// readPackBlock opens the pack and reads clen bytes of the block at offset
+// off (Get's point reads). Compaction reads the pack once per pass —
+// readPackBlockAt on the open file (C-11).
 func readPackBlock(dir string, packID int32, off int64, clen int32) ([]byte, error) {
 	f, err := os.Open(filepath.Join(dir, packFileName(packID)))
 	if err != nil {
 		return nil, fmt.Errorf("content: пак %d: %w", packID, err)
 	}
-	defer func() { _ = f.Close() }() // только чтение
+	defer func() { _ = f.Close() }() // read-only
 	st, err := f.Stat()
 	if err != nil {
 		return nil, fmt.Errorf("content: пак %d: %w", packID, err)
@@ -919,11 +933,11 @@ func readPackBlock(dir string, packID int32, off int64, clen int32) ([]byte, err
 	return readPackBlockAt(f, st.Size(), packID, off, clen)
 }
 
-// readPackBlockAt читает clen байт блока из открытого пака со смещения
-// off; size — размер файла для контроля размещения. Размещение сверяется
-// до аллокации: len приходит из БД (contents.len), повреждённая строка
-// не должна заказывать буфер до 2 ГиБ (C-14) — тот же контроль, что у
-// скана CompactScan.
+// readPackBlockAt reads clen bytes of a block from an open pack at offset
+// off; size is the file size for validating the placement. The placement is
+// checked before the allocation: len comes from the DB (contents.len), a
+// corrupted row must not order a buffer of up to 2 GiB (C-14) — the same
+// check as in the CompactScan scan.
 func readPackBlockAt(f *os.File, size int64, packID int32, off int64, clen int32) ([]byte, error) {
 	if clen < 0 || off < packHeaderLen+4 || off+int64(clen) > size {
 		return nil, fmt.Errorf("content: пак %d, смещение %d, длина %d: блок вне файла (%d байт)",
@@ -936,9 +950,9 @@ func readPackBlockAt(f *os.File, size int64, packID int32, off int64, clen int32
 	return buf, nil
 }
 
-// syncDir синхронизирует каталог: запись о создании/удалении файла
-// (заголовок нового пака, unlink компактификации) обязана дожить до
-// диска вместе с содержимым файла.
+// syncDir syncs the directory: the record of a file's creation/removal
+// (a new pack's header, compaction's unlink) must survive to disk
+// together with the file's contents.
 func syncDir(dir string) error {
 	d, err := os.Open(dir)
 	if err != nil {
@@ -951,9 +965,9 @@ func syncDir(dir string) error {
 	return d.Close()
 }
 
-// wrapPackWriteErr классифицирует ошибки записи пака: кончившееся место
-// на диске — ErrStoreFull (ТЗ 8; проактивный порог и пауза записи — T-046),
-// дубль сохраняет исходную ошибку для errors.Is.
+// wrapPackWriteErr classifies pack write errors: out of disk space —
+// ErrStoreFull (spec 8; the proactive threshold and write pause — T-046),
+// the original error is kept for errors.Is.
 func wrapPackWriteErr(err error, packID int32) error {
 	if errors.Is(err, syscall.ENOSPC) {
 		return fmt.Errorf("%w: пак %d: %w", ErrStoreFull, packID, err)
@@ -961,8 +975,8 @@ func wrapPackWriteErr(err error, packID int32) error {
 	return fmt.Errorf("content: запись пака %d: %w", packID, err)
 }
 
-// flockDir/unlockDir — захват/освобождение межпроцессной блокировки
-// каталога паков: писатели (T-042) и компактификация (T-045).
+// flockDir/unlockDir — acquiring/releasing the inter-process lock of the
+// packs directory: writers (T-042) and compaction (T-045).
 func flockDir(f *os.File) error {
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
 		return fmt.Errorf("content: блокировка каталога паков: %w", err)
@@ -974,8 +988,8 @@ func unlockDir(f *os.File) {
 	_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 }
 
-// activeDictID — ID активного словаря пакета (0 — без словаря) для
-// заголовка создаваемого пака.
+// activeDictID — the ID of the package's active dictionary (0 — no
+// dictionary) for the header of a pack being created.
 func activeDictID() uint32 {
 	dictMu.RLock()
 	defer dictMu.RUnlock()

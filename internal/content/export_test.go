@@ -1,18 +1,19 @@
-// Экспорт тестовых фабрик внешнему тест-пакету content_test — паттерн
-// stdlib export_test.go. Нужен с T-228: контрактный набор StoreContract
-// переехал в пакет contenttest, который импортирует content, поэтому
-// внутренние _test-файлы пакета импортировать contenttest не могут
-// (цикл импортов в тесте: content+tests → contenttest → content), а
-// внешний content_test может (go перепривязывает его зависимость от
-// content к тестовому варианту пакета). Файл существует только в
-// тестовой сборке (суффикс _test.go) и в прод-бинарник не попадает.
+// Export of test factories to the external test package content_test —
+// the stdlib export_test.go pattern. Needed since T-228: the contract
+// suite StoreContract moved to the contenttest package, which imports
+// content, so the package's internal _test files cannot import contenttest
+// (an import cycle in the test: content+tests → contenttest → content),
+// while the external content_test can (go rebinds its dependency on
+// content to the test variant of the package). The file exists only in
+// the test build (the _test.go suffix) and never reaches the production
+// binary.
 package content
 
 import "testing"
 
-// NewPackStoreForTest — PackStore на фейковом pgx-пуле с реальными
-// пак-файлами во временном каталоге (newPackTestStore, pack_test.go):
-// для contenttest.StoreContract во внешнем тест-пакете
+// NewPackStoreForTest — a PackStore on a fake pgx pool with real pack
+// files in a temporary directory (newPackTestStore, pack_test.go):
+// for contenttest.StoreContract in the external test package
 // (pack_contract_test.go).
 func NewPackStoreForTest(t *testing.T) *PackStore {
 	st, _ := newPackTestStore(t, nil)

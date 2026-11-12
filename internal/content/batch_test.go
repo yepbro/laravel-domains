@@ -1,9 +1,9 @@
-// Юнит-тесты групповой фиксации контента (T-102): один fsync и один
-// пакетный INSERT на пачку, инварианты C-1 сохранены (fsync до фиксации
-// строк; фиксация под flock — компактификация не может удалить пак
-// незафиксированной строки), дедуп и дубликаты пачки, по-элементные
-// ErrTooLarge/ErrStoreFull, сбой пачки и идемпотентность повтора.
-// Стиль — pack_test.go/compact_test.go (фейковый пул, реальные паки).
+// Unit tests of content group commit (T-102): one fsync and one batched
+// INSERT per batch, the C-1 invariants preserved (fsync before the rows are
+// committed; the commit under flock — compaction cannot remove the pack of
+// an uncommitted row), dedup and batch duplicates, per-item
+// ErrTooLarge/ErrStoreFull, a batch failure and the idempotency of the retry.
+// The style is pack_test.go/compact_test.go (a fake pool, real packs).
 package content
 
 import (
@@ -21,10 +21,10 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// --- подсчёт fsync активного пака ---------------------------------------------
+// --- counting fsyncs of the active pack --------------------------------------
 
-// syncCountFile — packWriter, считающий Sync: групповая семантика «пачка
-// из нескольких Put — один fsync» наблюдаема без реального диска.
+// syncCountFile — a packWriter counting Syncs: the group semantics "a batch
+// of several Puts — one fsync" is observable without a real disk.
 type syncCountFile struct {
 	packWriter
 	syncs *atomic.Int32
@@ -35,8 +35,9 @@ func (f *syncCountFile) Sync() error {
 	return f.packWriter.Sync()
 }
 
-// wrapActiveSyncs оборачивает файл активного пака счётчиком fsync
-// (после прогревочного Put, создавшего пак; без конкурентных писателей).
+// wrapActiveSyncs wraps the active pack's file with an fsync counter
+// (after the warm-up Put that created the pack; without concurrent
+// writers).
 func wrapActiveSyncs(t *testing.T, st *PackStore) *atomic.Int32 {
 	t.Helper()
 	var syncs atomic.Int32
@@ -48,7 +49,7 @@ func wrapActiveSyncs(t *testing.T, st *PackStore) *atomic.Int32 {
 	return &syncs
 }
 
-// countSQL — число вызовов SQL с этим текстом в записи пула.
+// countSQL — the number of SQL calls with this text in the pool's record.
 func countSQL(calls []packCall, sql string) int {
 	n := 0
 	for _, c := range calls {
@@ -59,10 +60,10 @@ func countSQL(calls []packCall, sql string) int {
 	return n
 }
 
-// --- SQL-контракт --------------------------------------------------------------
+// --- SQL contract --------------------------------------------------------------
 
-// Точные тексты пакетных операторов (против схемы 000001, стиль
-// TestPackSQLContract).
+// The exact texts of the batched statements (against schema 000001, the
+// TestPackSQLContract style).
 const (
 	wantSQLAddRefBatch = "UPDATE contents SET refcount = refcount + v.c " +
 		"FROM unnest($1::bytea[], $2::int4[]) AS v(h, c) " +
@@ -77,10 +78,10 @@ const (
 		"RETURNING hash, (xmax = 0) AS created"
 )
 
-// TestPutBatchSQLContract — тексты и аргументы пакетных операторов: хэши
-// []byte[16] с счётчиками копий int32 (дедуп-пачка), идентификаторы пака
-// int32, смещения int64, длины/счётчики int32; одна команда дедупа и одна
-// фиксация на пачку.
+// TestPutBatchSQLContract — the texts and arguments of the batched
+// statements: hashes []byte[16] with int32 copy counters (the dedup batch),
+// pack ids int32, offsets int64, lengths/counters int32; one dedup command
+// and one commit per batch.
 func TestPutBatchSQLContract(t *testing.T) {
 	if sqlMetaAddRefBatch != wantSQLAddRefBatch || sqlMetaPutBatch != wantSQLPutBatch {
 		t.Fatal("SQL групповой фиксации изменился — обновите контракт и schema_test")
@@ -142,24 +143,23 @@ func TestPutBatchSQLContract(t *testing.T) {
 	}
 }
 
-// --- групповая семантика --------------------------------------------------------
+// --- group semantics --------------------------------------------------------
 
-// TestPutBatchGroupCommit — пачка из нескольких контентов: все строки
-// зафиксированы, по одному пакетному оператору на пачку и ровно один
-// fsync (счётчик активного пака); пустой элемент — допустимый контент
-// (контракт T-041).
+// TestPutBatchGroupCommit — a batch of several contents: all rows committed,
+// one batched statement per batch and exactly one fsync (the active pack's
+// counter); an empty item is valid content (the T-041 contract).
 func TestPutBatchGroupCommit(t *testing.T) {
 	st, pool := newPackTestStore(t, func(o *PackOptions) { o.PackSize = 1 << 20 })
 	ctx := context.Background()
 
-	// Прогрев: создаёт пак и активный файл для обёртки-счётчика.
+	// Warm-up: creates the pack and the active file for the counter wrapper.
 	if _, err := st.Put(ctx, []byte("прогрев")); err != nil {
 		t.Fatal(err)
 	}
 	syncs := wrapActiveSyncs(t, st)
 
 	items := [][]byte{
-		nil, // пустой контент — валиден (T-041)
+		nil, // empty content is valid (T-041)
 		[]byte("<html>страница 1 групповой фиксации</html>"),
 		[]byte("<html>страница 2 групповой фиксации</html>"),
 		[]byte("<html>страница 3 групповой фиксации</html>"),
@@ -212,10 +212,10 @@ func TestPutBatchGroupCommit(t *testing.T) {
 	}
 }
 
-// TestPutBatchDuplicatesAndDedup — смешанная пачка: живой в БД контент —
-// дедуп (Created=false, refcount+1, байтов нет); повтор хэша внутри
-// пачки — байты один раз, каждая копия добавляет ссылку; свежие
-// контенты — Created=true.
+// TestPutBatchDuplicatesAndDedup — a mixed batch: content already live in
+// the DB is a dedup (Created=false, refcount+1, no bytes); a hash repeat
+// within the batch — the bytes are written once, each copy adds a reference;
+// fresh contents — Created=true.
 func TestPutBatchDuplicatesAndDedup(t *testing.T) {
 	st, pool := newPackTestStore(t, func(o *PackOptions) { o.PackSize = 1 << 20 })
 	ctx := context.Background()
@@ -256,7 +256,7 @@ func TestPutBatchDuplicatesAndDedup(t *testing.T) {
 			t.Errorf("%s: refcount = %d, want %d", h, row.refc, want)
 		}
 	}
-	// Байты: только b и c (a — дедуп); рост файла — две записи.
+	// Bytes: only b and c (a is a dedup); the file growth is two records.
 	rowB, _ := pool.row(HashOf(b))
 	rowC, _ := pool.row(HashOf(c))
 	wantGrow := int64(4+rowB.clen) + int64(4+rowC.clen)
@@ -270,18 +270,18 @@ func TestPutBatchDuplicatesAndDedup(t *testing.T) {
 	}
 }
 
-// TestPutBatchDuplicateRefsBothPaths — дубликаты одного хэша в пачке на
-// обоих путях фиксации, таблицей (T-228, латентный дефект: дедуп-UPDATE
-// приращал ровно +1 независимо от числа копий — ссылки занижались, и
-// при появлении пачечного писателя компактификация удалила бы ещё
-// нужный блок):
+// TestPutBatchDuplicateRefsBothPaths — duplicates of one hash in a batch on
+// both commit paths, table-style (T-228, a latent defect: the dedup UPDATE
+// incremented exactly +1 regardless of the number of copies — references
+// were undercounted, and with a batched writer appearing, compaction would
+// have removed a still-needed block):
 //
-//	путь                       | refcount
+//	path                       | refcount
 //	----------------------------+------------------------------------
-//	живой хэш, 1 ссылка до пачки| 1 + n копий (дедуп, sqlMetaAddRefBatch)
-//	новый хэш                   | n копий      (INSERT, counts → sqlMetaPutBatch)
+//	live hash, 1 ref before batch| 1 + n copies (dedup, sqlMetaAddRefBatch)
+//	new hash                    | n copies      (INSERT, counts → sqlMetaPutBatch)
 //
-// Ссылки настоящие: исчерпание Delete × refcount убивает контент.
+// The references are real: exhausting Delete × refcount kills the content.
 func TestPutBatchDuplicateRefsBothPaths(t *testing.T) {
 	st, pool := newPackTestStore(t, func(o *PackOptions) { o.PackSize = 1 << 20 })
 	ctx := context.Background()
@@ -301,8 +301,8 @@ func TestPutBatchDuplicateRefsBothPaths(t *testing.T) {
 			t.Fatalf("элемент %d: %v", i, e)
 		}
 	}
-	// Created: live — дедуп (байтов нет), fresh — первый элемент пишет
-	// байты, повторы хэша — нет.
+	// Created: live is a dedup (no bytes), the first fresh item writes the
+	// bytes, the hash repeats do not.
 	for i, want := range []bool{false, false, false, true, false, false} {
 		if results[i].Created != want {
 			t.Errorf("элемент %d: Created = %v, want %v", i, results[i].Created, want)
@@ -318,7 +318,7 @@ func TestPutBatchDuplicateRefsBothPaths(t *testing.T) {
 		}
 	}
 
-	// Ссылки настоящие, а не число: исчерпание Delete × refcount.
+	// The references are real, not a number: exhausting Delete × refcount.
 	for i := 0; i < 3; i++ {
 		if err := st.Delete(ctx, HashOf(live)); err != nil {
 			t.Fatalf("Delete живого %d из 4: %v", i+1, err)
@@ -346,9 +346,9 @@ func TestPutBatchDuplicateRefsBothPaths(t *testing.T) {
 	}
 }
 
-// TestPutBatchResurrectDeadRow — мёртвая строка (refcount = 0) не
-// воскрешается дедупом: пачка пишет свежий блок, upsert переводит
-// размещение и ставит refcount = n копий (семантика sqlMetaPut).
+// TestPutBatchResurrectDeadRow — a dead row (refcount = 0) is not
+// resurrected by dedup: the batch writes a fresh block, the upsert moves the
+// placement and sets refcount = n copies (the sqlMetaPut semantics).
 func TestPutBatchResurrectDeadRow(t *testing.T) {
 	st, pool := newPackTestStore(t, func(o *PackOptions) { o.PackSize = 1 << 20 })
 	ctx := context.Background()
@@ -386,9 +386,9 @@ func TestPutBatchResurrectDeadRow(t *testing.T) {
 	}
 }
 
-// TestPutBatchEmptyAndTooLarge — пустая пачка не обращается к БД; элемент
-// сверх max_store_bytes отвергается по-элементно (ErrTooLarge), остальные
-// сохраняются.
+// TestPutBatchEmptyAndTooLarge — an empty batch does not touch the DB; an
+// item over max_store_bytes is rejected per item (ErrTooLarge), the others
+// are stored.
 func TestPutBatchEmptyAndTooLarge(t *testing.T) {
 	st, pool := newPackTestStore(t, func(o *PackOptions) { o.MaxStoreBytes = 64 })
 	ctx := context.Background()
@@ -424,9 +424,9 @@ func TestPutBatchEmptyAndTooLarge(t *testing.T) {
 	}
 }
 
-// TestPutBatchStoreFullPause — пауза записи контента (ТЗ 8): новые байты
-// пачки не пишутся (по-элементный ErrStoreFull), дедуп-ссылка живого
-// контента проходит, событие алерта уходит.
+// TestPutBatchStoreFullPause — the content write pause (spec 8): the new
+// bytes of the batch are not written (a per-item ErrStoreFull), the dedup
+// reference of live content passes, the alert event fires.
 func TestPutBatchStoreFullPause(t *testing.T) {
 	var sink *fullSink
 	st, pool := newPackTestStore(t, func(o *PackOptions) {
@@ -445,7 +445,7 @@ func TestPutBatchStoreFullPause(t *testing.T) {
 	}
 	sizeBefore := compactPackSize(t, st.opts.Dir, 1)
 
-	fake.set(4, 100) // 4% < порога 5%
+	fake.set(4, 100) // 4% < the 5% threshold
 	fresh := []byte("<html>новый контент в полный диск</html>")
 	results, errs, err := st.PutBatch(ctx, [][]byte{live, fresh})
 	if err != nil {
@@ -475,12 +475,12 @@ func TestPutBatchStoreFullPause(t *testing.T) {
 	}
 }
 
-// --- сбои и идемпотентность -----------------------------------------------------
+// --- failures and idempotency ---------------------------------------------------
 
-// TestPutBatchCommitFailureIdempotent — сбой пакетного INSERT: строк нет,
-// блоки — мусор без строк (невидимы, вычистит компактификация); повтор
-// пачки идемпотентен по хэшу. Сбой дедуп-команды — до захвата блокировок:
-// файл не трогается вовсе.
+// TestPutBatchCommitFailureIdempotent — a batched INSERT failure: no rows,
+// the blocks are garbage without rows (invisible, compaction will purge
+// them); the batch retry is idempotent by hash. A dedup command failure is
+// before the locks are taken: the file is not touched at all.
 func TestPutBatchCommitFailureIdempotent(t *testing.T) {
 	st, pool := newCompactTestStore(t, nil)
 	ctx := context.Background()
@@ -504,7 +504,8 @@ func TestPutBatchCommitFailureIdempotent(t *testing.T) {
 		t.Errorf("блоки сбойной пачки: мусора %d, живых %d — want 2/0", info.GarbageBlocks, info.LiveBlocks)
 	}
 
-	// Повтор (сбой снят) идемпотентен: строки на месте, байты читаются.
+	// The retry (the failure lifted) is idempotent: the rows are in place,
+	// the bytes are readable.
 	results, errs, err := st.PutBatch(ctx, [][]byte{a, b})
 	if err != nil {
 		t.Fatalf("повтор PutBatch: %v", err)
@@ -523,7 +524,8 @@ func TestPutBatchCommitFailureIdempotent(t *testing.T) {
 		}
 	}
 
-	// Сбой дедуп-команды — до дописывания: размер файла не меняется.
+	// A dedup command failure is before appending: the file size does not
+	// change.
 	pool.failSQL, pool.failN = sqlMetaAddRefBatch, 1
 	sizeBefore := compactPackSize(t, st.opts.Dir, 1)
 	c := []byte("<html>контент сбойного дедупа</html>")
@@ -535,8 +537,8 @@ func TestPutBatchCommitFailureIdempotent(t *testing.T) {
 	}
 }
 
-// TestPutBatchCtxCanceled — отменённый ctx: ошибка контекста, пачка не
-// зафиксирована.
+// TestPutBatchCtxCanceled — a cancelled ctx: a context error, the batch not
+// committed.
 func TestPutBatchCtxCanceled(t *testing.T) {
 	st, pool := newPackTestStore(t, nil)
 	canceled, cancel := context.WithCancel(context.Background())
@@ -550,11 +552,12 @@ func TestPutBatchCtxCanceled(t *testing.T) {
 	}
 }
 
-// --- инварианты против компактификации ------------------------------------------
+// --- invariants against compaction ---------------------------------------------
 
-// batchProbe — итог зонда в момент пакетного INSERT: fsync пачки уже был,
-// блокировки хранилища (мьютекс, flock каталога — путь удаления паков
-// компактификацией) удержаны фиксацией строк.
+// batchProbe — the probe result at the moment of the batched INSERT: the
+// batch's fsync has already happened, the store locks (the mutex, the
+// directory flock — the path by which compaction removes packs) are held by
+// the row commit.
 type batchProbe struct {
 	fired     bool
 	syncs     int
@@ -562,8 +565,9 @@ type batchProbe struct {
 	flockHeld bool
 }
 
-// probeBatchPool — компакт-пул с зондом на sqlMetaPutBatch (стиль
-// getRacePool/killOnRowsPool — моделирование гонки в точке интереса).
+// probeBatchPool — a compaction pool with a probe on sqlMetaPutBatch (the
+// getRacePool/killOnRowsPool style — modeling a race at the point of
+// interest).
 type probeBatchPool struct {
 	*compactFakePool
 	st    *PackStore
@@ -576,8 +580,8 @@ func (p *probeBatchPool) Query(ctx context.Context, sql string, args ...any) (pg
 		p.probe.fired = true
 		p.probe.syncs = int(p.syncs.Load())
 		p.probe.muHeld = !p.st.mu.TryLock()
-		// flock зондируется отдельным дескриптором того же файла:
-		// LOCK_EX|LOCK_NB обязан упереться в замок PutBatch.
+		// The flock is probed with a separate descriptor of the same file:
+		// LOCK_EX|LOCK_NB must run into PutBatch's lock.
 		lf, err := os.OpenFile(filepath.Join(p.st.opts.Dir, packLockFile), os.O_RDWR, 0o644)
 		if err != nil {
 			return nil, fmt.Errorf("зонд блокировки каталога: %w", err)
@@ -589,13 +593,13 @@ func (p *probeBatchPool) Query(ctx context.Context, sql string, args ...any) (pg
 	return p.compactFakePool.Query(ctx, sql, args...)
 }
 
-// TestPutBatchInvariantFsyncAndFlock — точка гонки T-102: в момент
-// фиксации строк пачки (пакетный INSERT) байты уже синхронизированы
-// (fsync до INSERT — C-1 «байты раньше строк»), а мьютекс и flock
-// каталога удержаны — компактификация не может ни взять блокировки, ни
-// удалить пак незафиксированной строки (C-1 «пак не удаляется раньше
-// фиксации»). После снятия блокировок проход компактификации старого
-// пака корректен.
+// TestPutBatchInvariantFsyncAndFlock — the T-102 race point: at the moment
+// the batch's rows are committed (the batched INSERT) the bytes are already
+// synced (fsync before INSERT — C-1 "bytes before rows"), and the mutex and
+// the directory flock are held — compaction can neither take the locks nor
+// remove the pack of an uncommitted row (C-1 "a pack is not removed before
+// its rows are committed"). After the locks are released, the compaction pass
+// over the old pack is correct.
 func TestPutBatchInvariantFsyncAndFlock(t *testing.T) {
 	probe := &batchProbe{}
 	probePool := &probeBatchPool{
@@ -606,11 +610,11 @@ func TestPutBatchInvariantFsyncAndFlock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer st.Close() //nolint:errcheck // тест закрывает при очистке
+	defer st.Close() //nolint:errcheck // the test closes the store in cleanup
 	probePool.st = st
 	ctx := context.Background()
 
-	// Пак 1: контент умирает (доля живых 0 — компактифицируем).
+	// Pack 1: the content dies (live share 0 — compactable).
 	x := []byte("<html>контент умирающего пака</html>")
 	if _, err := st.Put(ctx, x); err != nil {
 		t.Fatal(err)
@@ -618,7 +622,8 @@ func TestPutBatchInvariantFsyncAndFlock(t *testing.T) {
 	if err := st.Delete(ctx, HashOf(x)); err != nil {
 		t.Fatal(err)
 	}
-	// Пак 2 — новейший: прогрев создаёт его активный файл для счётчика.
+	// Pack 2 — the newest: the warm-up creates its active file for the
+	// counter.
 	compactCraftPack(t, st.opts.Dir, 2, nil)
 	if _, err := st.Put(ctx, []byte("прогрев пака 2")); err != nil {
 		t.Fatal(err)
@@ -643,8 +648,8 @@ func TestPutBatchInvariantFsyncAndFlock(t *testing.T) {
 		t.Error("flock каталога паков не удержан в момент фиксации строк пачки — компактификация могла бы удалить пак")
 	}
 
-	// После фиксации: компактификация старого пака проходит, контент
-	// пачки жив.
+	// After the commit: the compaction pass over the old pack succeeds, the
+	// batch's content is alive.
 	stats, err := CompactOnce(ctx, st, CompactOptions{})
 	if err != nil || stats.Compacted != 1 {
 		t.Fatalf("CompactOnce старого пака: %+v, %v", stats, err)
@@ -659,10 +664,10 @@ func TestPutBatchInvariantFsyncAndFlock(t *testing.T) {
 	}
 }
 
-// TestPutBatchWithConcurrentCompaction — сквозная гонка: компактификация
-// старого пака идёт одновременно с групповой фиксацией в новейший
-// (блокировки сериализуют дописывания) — все контенты живы, старый пак
-// удалён, живой блок переехал.
+// TestPutBatchWithConcurrentCompaction — an end-to-end race: compaction of
+// the old pack runs concurrently with a group commit into the newest
+// (the locks serialize the appends) — all contents are alive, the old pack
+// is removed, the live block has moved.
 func TestPutBatchWithConcurrentCompaction(t *testing.T) {
 	st, pool := newCompactTestStore(t, nil)
 	ctx := context.Background()
@@ -672,7 +677,7 @@ func TestPutBatchWithConcurrentCompaction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	compactCraftPack(t, st.opts.Dir, 2, nil) // пак 2 — новейший
+	compactCraftPack(t, st.opts.Dir, 2, nil) // pack 2 is the newest
 
 	m := []byte("<html>страница пачки против компактификации M</html>")
 	n := []byte("<html>страница пачки против компактификации N</html>")
@@ -718,10 +723,10 @@ func TestPutBatchWithConcurrentCompaction(t *testing.T) {
 	}
 }
 
-// TestPutBatchRotation — пачка, не влезающая в один пак: ротация внутри
-// пачки не ломает фиксацию (байты всех блоков — на диске до INSERT:
-// закрытые ротацией паки синхронизируются при ротации), все контенты
-// читаются.
+// TestPutBatchRotation — a batch that does not fit into one pack: rotation
+// inside the batch does not break the commit (the bytes of all blocks are on
+// disk before the INSERT: packs closed by rotation are synced at rotation),
+// all contents are readable.
 func TestPutBatchRotation(t *testing.T) {
 	st, pool := newCompactTestStore(t, func(o *PackOptions) { o.PackSize = 256 })
 	ctx := context.Background()
@@ -752,10 +757,11 @@ func TestPutBatchRotation(t *testing.T) {
 	}
 }
 
-// --- синтетический бенчмарк цены фиксации (T-102, шаг 3) ------------------------
+// --- a synthetic benchmark of the commit cost (T-102, step 3) ------------------
 
-// benchPage — синтетическая страница ~30 КиБ (типовая парковка): сжимаемый
-// HTML с уникальным номером — дедупликация не съедает бенчмарк.
+// benchPage — a synthetic page of ~30 KiB (a typical parking page):
+// compressible HTML with a unique number — deduplication must not eat the
+// benchmark.
 func benchPage(i int) []byte {
 	buf := make([]byte, 0, 32<<10)
 	buf = append(buf, "<html><head><title>парковка "...)
@@ -769,8 +775,8 @@ func benchPage(i int) []byte {
 	return buf
 }
 
-// benchStore — хранилище на фейковом пуле (БД не вносит задержек —
-// измеряется цена ФС: write + fsync).
+// benchStore — a store on the fake pool (the DB adds no latency — what is
+// measured is the FS cost: write + fsync).
 func benchStore(b *testing.B) *PackStore {
 	b.Helper()
 	st, err := OpenPackStore(newPackFakePool(), PackOptions{
@@ -783,8 +789,8 @@ func benchStore(b *testing.B) *PackStore {
 	return st
 }
 
-// BenchmarkPutOneByOne — построчный Put: fsync и INSERT на каждый блок
-// (путь до T-102).
+// BenchmarkPutOneByOne — per-row Put: an fsync and an INSERT per block
+// (the pre-T-102 path).
 func BenchmarkPutOneByOne(b *testing.B) {
 	st := benchStore(b)
 	ctx := context.Background()
@@ -796,8 +802,8 @@ func BenchmarkPutOneByOne(b *testing.B) {
 	}
 }
 
-// benchPutBatch — групповая фиксация пачками по k: один fsync и один
-// пакетный INSERT на пачку (T-102).
+// benchPutBatch — group commit in batches of k: one fsync and one batched
+// INSERT per batch (T-102).
 func benchPutBatch(b *testing.B, k int) {
 	st := benchStore(b)
 	ctx := context.Background()

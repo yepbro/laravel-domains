@@ -1,6 +1,7 @@
-// Тесты обучаемого словаря zstd (T-043): обучение на детерминированном
-// синтетическом корпусе, факт улучшения сжатия (без хрупких процентов),
-// roundtrip, детерминизм, фолбэк без словаря, загрузка из файла.
+// Tests of the trainable zstd dictionary (T-043): training on a deterministic
+// synthetic corpus, the fact of compression improvement (without brittle
+// percentages), roundtrip, determinism, the fallback without a dictionary,
+// loading from a file.
 
 package content
 
@@ -16,11 +17,11 @@ import (
 	"testing"
 )
 
-// dictCorpus — детерминированный корпус «парковочных страниц»: общий
-// шаблон (шапка, навигация, футер) и несжимаемая случайная середина.
-// Именно такие страницы — целевой сценарий словаря (ТЗ 5.7: парковки
-// и заглушки). Генератор с фиксированным seed — корпус стабилен между
-// прогонами, как требует ТЗ 11.1 к тестовым данным.
+// dictCorpus — a deterministic corpus of "parking pages": a shared
+// template (header, navigation, footer) and an incompressible random middle.
+// These are exactly the pages the dictionary targets (spec 5.7: parking
+// and suspension pages). The generator with a fixed seed keeps the corpus
+// stable between runs, as spec 11.1 requires of test data.
 func dictCorpus(n, pageSize int) [][]byte {
 	head := `<!DOCTYPE html><html lang="ru"><head><meta charset="utf-8">` +
 		`<meta name="viewport" content="width=device-width, initial-scale=1">` +
@@ -58,7 +59,8 @@ func TestTrainDictImprovesCompression(t *testing.T) {
 		t.Fatalf("TrainDict: %v", err)
 	}
 
-	// Оценка на новой странице того же шаблона (не из обучающего корпуса).
+	// Evaluated on a new page of the same template (not from the training
+	// corpus).
 	page := dictCorpus(1, 2048)[0]
 	plain := Compress(page)
 	withDict := d.Compress(page)
@@ -77,7 +79,7 @@ func TestTrainDictImprovesCompression(t *testing.T) {
 		t.Error("roundtrip со словарём изменил данные")
 	}
 
-	// Кадры, сжатые без словаря, декодер со словарём тоже читает.
+	// The dictionary-equipped decoder reads dictionary-less frames too.
 	got, err = d.Decompress(plain)
 	if err != nil {
 		t.Fatalf("Decompress беззоварного кадра: %v", err)
@@ -109,7 +111,7 @@ func TestTrainDictValidation(t *testing.T) {
 	if _, err := TrainDict(nil, TrainOptions{}); err == nil {
 		t.Error("пустой корпус: ожидалась ошибка")
 	}
-	// Нет повторов: случайные данные, каждый сегмент уникален.
+	// No repeats: random data, every segment is unique.
 	random := make([][]byte, 8)
 	for i := range random {
 		b := make([]byte, 512)
@@ -126,14 +128,16 @@ func TestTrainDictValidation(t *testing.T) {
 			t.Errorf("DictSize=%d: ожидалась ошибка", size)
 		}
 	}
-	// Нулевой DictSize — дефолт, ошибка только если корпус не тянет на минимум.
+	// A zero DictSize is the default; an error only if the corpus cannot reach
+	// the minimum.
 	if _, err := TrainDict(dictCorpus(16, 4096), TrainOptions{}); err != nil {
 		t.Errorf("DictSize по умолчанию: %v", err)
 	}
 }
 
-// TestWarnDictMismatch — сверка активного словаря с новейшим паком:
-// расхождение — Warn, совпадение и пустой каталог — тишина.
+// TestWarnDictMismatch — cross-checking the active dictionary against the
+// newest pack: a mismatch is Warn, a match and an empty directory are
+// silence.
 func TestWarnDictMismatch(t *testing.T) {
 	dict, err := TrainDict(dictCorpus(12, 2048), TrainOptions{DictSize: 16 << 10})
 	if err != nil {
@@ -150,9 +154,9 @@ func TestWarnDictMismatch(t *testing.T) {
 
 	t.Run("расхождение — Warn", func(t *testing.T) {
 		dir := t.TempDir()
-		compactCraftPack(t, dir, 1, nil) // новейший пак (dictID 0 в заголовке)
-		_, _ = SetDictFile("", nil)      // реестр не подключён — только активный словарь
-		SetDict(dict)                    // активный словарь с ненулевым ID
+		compactCraftPack(t, dir, 1, nil) // the newest pack (dictID 0 in the header)
+		_, _ = SetDictFile("", nil)      // the registry is not wired up — only the active dictionary
+		SetDict(dict)                    // an active dictionary with a non-zero ID
 		defer SetDict(nil)
 		buf, log := newBuf()
 		WarnDictMismatch(dir, log)
@@ -167,11 +171,11 @@ func TestWarnDictMismatch(t *testing.T) {
 		if err != nil {
 			t.Fatalf("TrainDict: %v", err)
 		}
-		dictCraftHeaderPack(t, packs, 1, dict.ID()) // пак прежнего словаря
+		dictCraftHeaderPack(t, packs, 1, dict.ID()) // a pack of the retired dictionary
 		if err := newD.Save(filepath.Join(reg, "dict.zst")); err != nil {
 			t.Fatal(err)
 		}
-		_, _ = SetDictFile(filepath.Join(reg, "dict.zst"), nil) // реестр подключён, файла прежнего нет
+		_, _ = SetDictFile(filepath.Join(reg, "dict.zst"), nil) // the registry is wired up, the retired file is absent
 		defer func() { _, _ = SetDictFile("", nil) }()
 		buf, log := newBuf()
 		WarnDictMismatch(packs, log)
@@ -208,7 +212,7 @@ func TestWarnDictMismatch(t *testing.T) {
 	t.Run("совпадение — тишина", func(t *testing.T) {
 		dir := t.TempDir()
 		compactCraftPack(t, dir, 1, nil)
-		SetDict(nil) // оба dictID нулевые
+		SetDict(nil) // both dictIDs are zero
 		buf, log := newBuf()
 		WarnDictMismatch(dir, log)
 		if warned(buf) {
@@ -251,7 +255,7 @@ func TestDictSaveLoad(t *testing.T) {
 		t.Errorf("roundtrip загруженного словаря: %v", err)
 	}
 
-	// Временных файлов после Save не осталось.
+	// No temporary files were left behind by Save.
 	entries, _ := os.ReadDir(dir)
 	if len(entries) != 1 {
 		names := make([]string, len(entries))
@@ -261,7 +265,7 @@ func TestDictSaveLoad(t *testing.T) {
 		t.Errorf("в каталоге кроме словаря что-то осталось: %v", names)
 	}
 
-	// Отсутствующий файл — fs.ErrNotExist, битый — ошибка формата.
+	// A missing file is fs.ErrNotExist, a broken one is a format error.
 	if _, err := LoadDict(filepath.Join(dir, "nope.zst")); !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("отсутствующий файл: err = %v, хочу fs.ErrNotExist", err)
 	}
@@ -277,7 +281,7 @@ func TestDictSaveLoad(t *testing.T) {
 func TestWithDictPackageFallback(t *testing.T) {
 	t.Cleanup(func() { SetDict(nil) })
 
-	// Без словаря — то же сжатие, что каркасное.
+	// Without a dictionary — the same compression as the framework's.
 	src := []byte("<html>парковка домена</html>")
 	SetDict(nil)
 	if got := CompressWithDict(src); !bytes.Equal(got, Compress(src)) {
@@ -288,7 +292,8 @@ func TestWithDictPackageFallback(t *testing.T) {
 		t.Errorf("фолбэк-распаковка: %v", err)
 	}
 
-	// Со словарём — сжатие словарное, распаковка понимает оба вида кадров.
+	// With a dictionary — dictionary compression, and decompression understands
+	// both kinds of frames.
 	d, err := TrainDict(dictCorpus(12, 2048), TrainOptions{DictSize: 16 << 10})
 	if err != nil {
 		t.Fatalf("TrainDict: %v", err)
@@ -328,7 +333,7 @@ func TestSetDictFile(t *testing.T) {
 		t.Errorf("загрузка не отражена в логе:\n%s", logBuf.String())
 	}
 
-	// Отсутствующий файл — не ошибка, работа без словаря.
+	// A missing file is not an error, the service runs without a dictionary.
 	logBuf.Reset()
 	ok, err = SetDictFile(filepath.Join(dir, "absent.zst"), log)
 	if err != nil || ok {
@@ -341,7 +346,7 @@ func TestSetDictFile(t *testing.T) {
 		t.Error("после фолбэка CompressWithDict должен совпадать с Compress")
 	}
 
-	// Пустой путь — просто отключение, без записи в лог.
+	// An empty path is just a switch-off, with nothing logged.
 	logBuf.Reset()
 	if ok, err := SetDictFile("", log); err != nil || ok {
 		t.Fatalf("пустой путь: ok=%v err=%v", ok, err)
@@ -350,7 +355,7 @@ func TestSetDictFile(t *testing.T) {
 		t.Errorf("пустой путь не должен логироваться:\n%s", logBuf.String())
 	}
 
-	// Битый файл — ошибка (молчаливый фолбэк скрыл бы проблему).
+	// A broken file is an error (a silent fallback would hide the problem).
 	bad := filepath.Join(dir, "bad.zst")
 	if err := os.WriteFile(bad, []byte("мусор"), 0o644); err != nil {
 		t.Fatal(err)
@@ -361,7 +366,7 @@ func TestSetDictFile(t *testing.T) {
 }
 
 func TestTrainDictSyntheticScanLimit(t *testing.T) {
-	// Корпус больше trainScanLimit: обучение берёт префикс и работает.
+	// A corpus larger than trainScanLimit: training takes the prefix and works.
 	corpus := dictCorpus(64, 128<<10)
 	if _, err := TrainDict(corpus, TrainOptions{DictSize: 16 << 10}); err != nil {
 		t.Fatalf("TrainDict на корпусе сверх лимита сканирования: %v", err)

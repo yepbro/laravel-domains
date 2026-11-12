@@ -1,8 +1,8 @@
-// Юнит-тесты контроля свободного места каталога контента (T-046; ТЗ 8):
-// заглушаемый statfs (SpaceChecker), порог паузы записи, дедуп и чтение
-// продолжают работать, восстановление после освобождения, событие алерта,
-// периодическая проверка DiskWatchLoop (Warn/Info и переходы). Стиль
-// pack_test.go/compact_test.go: фейковый пул БД, реальные файлы в t.TempDir.
+// Unit tests of the free-space control of the content directory (T-046; spec 8):
+// a stubbable statfs (SpaceChecker), the write-pause threshold, dedup and reads
+// keep working, recovery after reclamation, the alert event,
+// the DiskWatchLoop periodic check (Warn/Info and transitions). The
+// pack_test.go/compact_test.go style: a fake DB pool, real files in t.TempDir.
 package content
 
 import (
@@ -17,9 +17,9 @@ import (
 	"time"
 )
 
-// fakeSpace — заглушаемый SpaceChecker: снимок места и число вызовов
-// (пауза Put и DiskWatchLoop должны спрашивать место по одному разу
-// на операцию).
+// fakeSpace — a stubbable SpaceChecker: a space snapshot and the call count
+// (the Put pause and DiskWatchLoop must ask for the space exactly once
+// per operation).
 type fakeSpace struct {
 	mu    sync.Mutex
 	stat  SpaceStat
@@ -52,8 +52,8 @@ func (f *fakeSpace) count() int {
 	return f.calls
 }
 
-// fullSink — сборщик событий алерта (хук вызывается из Put и горутины
-// DiskWatchLoop — синхронизация обязательна).
+// fullSink — a collector of alert events (the hook is called from Put and the
+// DiskWatchLoop goroutine — synchronization is mandatory).
 type fullSink struct {
 	mu     sync.Mutex
 	events []StoreFullEvent
@@ -71,8 +71,8 @@ func (s *fullSink) snapshot() []StoreFullEvent {
 	return append([]StoreFullEvent(nil), s.events...)
 }
 
-// newDiskTestStore — хранилище с подменённым statfs и порогом 5%
-// (место 50/100 = 50% — «много», 4/100 = 4% — «ниже порога»).
+// newDiskTestStore — a store with a stubbed statfs and a 5% threshold
+// (space 50/100 = 50% — "plenty", 4/100 = 4% — "below the threshold").
 func newDiskTestStore(t *testing.T, mutate func(*PackOptions)) (*PackStore, *packFakePool, *fakeSpace) {
 	t.Helper()
 	st, pool := newPackTestStore(t, func(o *PackOptions) {
@@ -87,8 +87,8 @@ func newDiskTestStore(t *testing.T, mutate func(*PackOptions)) (*PackStore, *pac
 	return st, pool, fake
 }
 
-// TestOSStatfs — реальный statfs временного каталога: ёмкость известна,
-// доступно не больше ёмкости; несуществующий каталог — ошибка.
+// TestOSStatfs — a real statfs of a temporary directory: the capacity is known,
+// the available space is at most the capacity; a missing directory is an error.
 func TestOSStatfs(t *testing.T) {
 	var osStat OSStatfs
 	sp, err := osStat.Space(t.TempDir())
@@ -106,9 +106,9 @@ func TestOSStatfs(t *testing.T) {
 	}
 }
 
-// TestPutPauseOnLowDisk — пауза записи контента (ТЗ 8): места ниже порога —
-// Put нового контента возвращает ErrStoreFull, блок и строка метаданных
-// не появляются; событие алерта уходит в хук со снимком места.
+// TestPutPauseOnLowDisk — the content write pause (spec 8): space below the
+// threshold — Put of new content returns ErrStoreFull, no block or metadata
+// row appears; the alert event goes to the hook with a space snapshot.
 func TestPutPauseOnLowDisk(t *testing.T) {
 	var sink *fullSink
 	st, pool, fake := newDiskTestStore(t, func(o *PackOptions) {
@@ -123,7 +123,7 @@ func TestPutPauseOnLowDisk(t *testing.T) {
 		t.Fatalf("Put при месте: %v", err)
 	}
 
-	fake.set(4, 100) // 4% < порога 5%
+	fake.set(4, 100) // 4% < the 5% threshold
 	big := []byte("<html>новый контент в полный диск</html>")
 	packBefore := compactPackSize(t, st.opts.Dir, 1)
 	_, err = st.Put(ctx, big)
@@ -152,7 +152,7 @@ func TestPutPauseOnLowDisk(t *testing.T) {
 		t.Errorf("событие без снимка места: %+v", ev.Space)
 	}
 
-	// Дедуп продолжает работать: байты не расходуются, ссылка добавляется.
+	// Dedup keeps working: no bytes consumed, a reference is added.
 	dup, err := st.Put(ctx, good)
 	if err != nil {
 		t.Fatalf("дедуп-Put в полный диск: %v (запись контента на паузе, ссылки — нет)", err)
@@ -163,17 +163,17 @@ func TestPutPauseOnLowDisk(t *testing.T) {
 	if row, ok := pool.row(res.Hash); !ok || row.refc != 2 {
 		t.Errorf("refcount после дедупа в паузе: %+v, want 2", row)
 	}
-	// Чтение не останавливается: контент нужен анализатору и перепроверкам.
+	// Reading does not stop: the analyzer and re-checks need the content.
 	got, err := st.Get(ctx, res.Hash)
 	if err != nil || !bytes.Equal(got, good) {
 		t.Errorf("Get в паузе: %v, совпадение=%v", err, bytes.Equal(got, good))
 	}
 }
 
-// TestPutResumeAfterFree — восстановление после освобождения (ТЗ 8):
-// место вернулось за порог — запись продолжается, отдельного счётчика
-// занятого нет, statfs видит актуальное состояние (после компактификации
-// T-045 — то же самое: паки удалены, место свободно).
+// TestPutResumeAfterFree — recovery after reclamation (spec 8):
+// the space returned above the threshold — writing continues; there is no separate
+// used-space counter, statfs sees the current state (after compaction
+// T-045 it is the same: the packs are removed, the space is free).
 func TestPutResumeAfterFree(t *testing.T) {
 	st, pool, fake := newDiskTestStore(t, nil)
 	ctx := context.Background()
@@ -182,7 +182,7 @@ func TestPutResumeAfterFree(t *testing.T) {
 	if _, err := st.Put(ctx, []byte("в полный диск")); !errors.Is(err, ErrStoreFull) {
 		t.Fatalf("Put в полный диск: %v, want ErrStoreFull", err)
 	}
-	fake.set(50, 100) // место освободили (компактификация, ручная чистка)
+	fake.set(50, 100) // the space was reclaimed (compaction, manual cleanup)
 	res, err := st.Put(ctx, []byte("после освобождения"))
 	if err != nil {
 		t.Fatalf("Put после освобождения: %v", err)
@@ -195,8 +195,8 @@ func TestPutResumeAfterFree(t *testing.T) {
 	}
 }
 
-// TestPutDiskCheckDisabled — нулевой порог выключает контроль: statfs
-// не вызывается вовсе (и не падает на заглушке с нулевым снимком).
+// TestPutDiskCheckDisabled — a zero threshold disables the control: statfs
+// is not called at all (and does not fail on the stub with a zero snapshot).
 func TestPutDiskCheckDisabled(t *testing.T) {
 	st, _, fake := newDiskTestStore(t, func(o *PackOptions) { o.DiskFreePercent = 0 })
 	ctx := context.Background()
@@ -208,8 +208,8 @@ func TestPutDiskCheckDisabled(t *testing.T) {
 	}
 }
 
-// TestPutDiskStatError — ошибка statfs — инфраструктурная, а не вердикт
-// «место кончилось»: Put возвращает её как есть (не ErrStoreFull).
+// TestPutDiskStatError — a statfs error is an infrastructure failure, not the
+// verdict "out of space": Put returns it as is (not ErrStoreFull).
 func TestPutDiskStatError(t *testing.T) {
 	st, _, fake := newDiskTestStore(t, nil)
 	fake.setErr(errors.New("statfs недоступен"))
@@ -219,8 +219,9 @@ func TestPutDiskStatError(t *testing.T) {
 	}
 }
 
-// TestPutDiskZeroTotal — экзотическая ФС без ёмкости: доля неопределима,
-// пауза не срабатывает (ложная остановка записи хуже пропущенного порога).
+// TestPutDiskZeroTotal — an exotic FS without capacity: the share is
+// undefinable, the pause does not trigger (a false write stop is worse than a
+// missed threshold).
 func TestPutDiskZeroTotal(t *testing.T) {
 	st, _, fake := newDiskTestStore(t, nil)
 	fake.set(0, 0)
@@ -233,7 +234,7 @@ func TestPutDiskZeroTotal(t *testing.T) {
 	}
 }
 
-// TestPutNoHook — хук не задан: пауза работает, паники нет.
+// TestPutNoHook — no hook set: the pause works, no panic.
 func TestPutNoHook(t *testing.T) {
 	st, _, fake := newDiskTestStore(t, func(o *PackOptions) { o.OnStoreFull = nil })
 	fake.set(4, 100)
@@ -242,9 +243,9 @@ func TestPutNoHook(t *testing.T) {
 	}
 }
 
-// TestDiskWatchLoop — периодическая проверка (ТЗ 8): Warn при входе
-// в паузу и Info при восстановлении, события только на переходах;
-// отмена ctx — чистый nil.
+// TestDiskWatchLoop — the periodic check (spec 8): a Warn when entering
+// the pause and an Info on recovery, events only on transitions;
+// ctx cancellation — a clean nil.
 func TestDiskWatchLoop(t *testing.T) {
 	var (
 		logBuf lockedBuffer
@@ -263,25 +264,26 @@ func TestDiskWatchLoop(t *testing.T) {
 	}()
 
 	waitFor(t, func() bool { return fake.count() > 0 }, "первый проход DiskWatchLoop")
-	// Первый проход при месте (50%): ни события, ни Warn.
+	// The first pass with space available (50%): no events, no Warn.
 	if evs := sink.snapshot(); len(evs) != 0 {
 		t.Fatalf("событий при месте %d, want 0", len(evs))
 	}
 
-	fake.set(4, 100) // место упало ниже порога
+	fake.set(4, 100) // the space fell below the threshold
 	waitFor(t, func() bool { return logBuf.contains("пауза записи контента") }, "Warn о паузе")
 	evs := sink.snapshot()
 	if len(evs) == 0 || evs[0].Source != StoreFullWatch || evs[0].Recovered {
 		t.Fatalf("событие паузы: %+v, want Source=%s Recovered=false", evs, StoreFullWatch)
 	}
 
-	fake.set(50, 100) // место освободили
+	fake.set(50, 100) // the space was reclaimed
 	waitFor(t, func() bool { return logBuf.contains("запись контента возобновлена") }, "Info о восстановлении")
 	evs = sink.snapshot()
 	if len(evs) < 2 || !evs[len(evs)-1].Recovered || evs[len(evs)-1].Source != StoreFullWatch {
 		t.Errorf("событие восстановления: %+v, want последнее Recovered=true", evs)
 	}
-	// Пока состояние не меняется, повторных событий нет (фронтовой сигнал).
+	// While the state does not change, there are no repeated events (an
+	// edge-triggered signal).
 	n := len(sink.snapshot())
 	time.Sleep(30 * time.Millisecond)
 	if got := len(sink.snapshot()); got != n {
@@ -299,8 +301,8 @@ func TestDiskWatchLoop(t *testing.T) {
 	}
 }
 
-// TestDiskWatchLoopStatError — ошибка statfs: Warn без смены состояния,
-// цикл жив, следующий тик повторяет.
+// TestDiskWatchLoopStatError — a statfs error: a Warn without a state change,
+// the loop stays alive, the next tick retries.
 func TestDiskWatchLoopStatError(t *testing.T) {
 	var (
 		logBuf lockedBuffer
@@ -333,14 +335,14 @@ func TestDiskWatchLoopStatError(t *testing.T) {
 	}
 }
 
-// TestDiskWatchNilStore — программная ошибка, а не паника.
+// TestDiskWatchNilStore — a programming error, not a panic.
 func TestDiskWatchNilStore(t *testing.T) {
 	if err := DiskWatchLoop(context.Background(), nil, DiskWatchOptions{}); err == nil {
 		t.Error("DiskWatchLoop(nil): ожидалась ошибка")
 	}
 }
 
-// TestHumanBytes — форматирование размеров в сообщениях.
+// TestHumanBytes — size formatting in messages.
 func TestHumanBytes(t *testing.T) {
 	cases := []struct {
 		n    uint64
@@ -359,8 +361,8 @@ func TestHumanBytes(t *testing.T) {
 	}
 }
 
-// waitFor — опрос условия с дедлайном (тихие ретраи асинхронных переходов
-// цикла; стиль compactWaitFor).
+// waitFor — polling a condition with a deadline (quiet retries of the loop's
+// asynchronous transitions; the compactWaitFor style).
 func waitFor(t *testing.T, cond func() bool, what string) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
@@ -373,7 +375,7 @@ func waitFor(t *testing.T, cond func() bool, what string) {
 	t.Fatalf("не дождались: %s", what)
 }
 
-// lockedBuffer — потокобезопасный буфер для slog-хендлера.
+// lockedBuffer — a thread-safe buffer for a slog handler.
 type lockedBuffer struct {
 	mu  sync.Mutex
 	buf bytes.Buffer

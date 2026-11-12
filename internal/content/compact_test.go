@@ -1,7 +1,7 @@
-// Юнит-тесты компактификации паков (T-045; ТЗ 5.7, 13.2) на фейковом
-// pgx-пуле с транзакциями (семантика contents + перенос размещений) и
-// реальных пак-файлах в t.TempDir — стиль pack_test.go. Поведение против
-// живой БД — сквозные тесты хранилища (T-046).
+// Unit tests of pack compaction (T-045; spec 5.7, 13.2) on a fake
+// pgx pool with transactions (the contents semantics + placement moves) and
+// real pack files in t.TempDir — the pack_test.go style. Behavior against
+// live DB — end-to-end store tests (T-046).
 package content
 
 import (
@@ -22,11 +22,12 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
-// --- фейковый пул с транзакциями компактификации ----------------------------
+// --- fake pool with compaction transactions ---------------------------------
 
-// compactFakePool — packFakePool (семантика Put/Get/Delete) плюс запросы
-// и транзакции компактификации: скан пака, контроль живых строк, перенос
-// размещений и удаление мёртвых строк. Отказы по шагам — краш-окна.
+// compactFakePool — a packFakePool (the Put/Get/Delete semantics) plus the
+// compaction queries and transactions: the pack scan, the live-row check,
+// the placement moves and the dead-row deletions. Step failures — crash
+// windows.
 type compactFakePool struct {
 	*packFakePool
 
@@ -37,11 +38,11 @@ type compactFakePool struct {
 	commits   int
 }
 
-// compile-time: фейковый пул — CompactDB для тестов без БД.
+// compile-time: the fake pool is a CompactDB for tests without a DB.
 var _ CompactDB = (*compactFakePool)(nil)
 
-// Query — SQL компактификации обслуживается по карте contents,
-// остальное (Put/Get/Delete) — во встроенный packFakePool.
+// Query — the compaction SQL is served from the contents map,
+// the rest (Put/Get/Delete) goes to the embedded packFakePool.
 func (p *compactFakePool) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
 	switch sql {
 	case sqlCompactRows, sqlCompactLive, sqlCompactAll:
@@ -96,8 +97,8 @@ func (p *compactFakePool) Begin(context.Context) (pgx.Tx, error) {
 	return &compactFakeTx{pool: p}, nil
 }
 
-// Exec — финальная зачистка мёртвых строк пака (sqlCompactDeadPack);
-// операторы Put/Get/Delete — во встроенном packFakePool.
+// Exec — the final sweep of the pack's dead rows (sqlCompactDeadPack);
+// the Put/Get/Delete statements go to the embedded packFakePool.
 func (p *compactFakePool) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
 	if sql != sqlCompactDeadPack {
 		return p.packFakePool.Exec(ctx, sql, args...)
@@ -122,17 +123,17 @@ func (p *compactFakePool) Exec(ctx context.Context, sql string, args ...any) (pg
 	return pgconn.NewCommandTag(fmt.Sprintf("DELETE %d", n)), nil
 }
 
-// compactFakeMove — отложенное изменение размещения строки.
+// compactFakeMove — a deferred row placement change.
 type compactFakeMove struct {
 	h      [HashLen]byte
 	packID int32
 	off    int64
 }
 
-// compactFakeTx — транзакция фейкового пака: изменения копятся и
-// применяются только в Commit (откат честно отменяет их).
+// compactFakeTx — a transaction of the fake pack: changes accumulate and
+// are applied only in Commit (a rollback honestly undoes them).
 type compactFakeTx struct {
-	pgx.Tx // остальные методы pgx.Tx проход не использует
+	pgx.Tx // the pass does not use the other pgx.Tx methods
 
 	pool     *compactFakePool
 	moves    []compactFakeMove
@@ -170,10 +171,10 @@ func (t *compactFakeTx) Exec(_ context.Context, sql string, args ...any) (pgconn
 			var h [HashLen]byte
 			copy(h[:], hb)
 			if r := t.pool.contents[h]; r != nil && r.packID == from {
-				// Охрана refcount = 0 оценивается в момент выполнения
-				// оператора (как в PostgreSQL): пометки мёртвыми из той
-				// же транзакции уже применились — sqlCompactCorrupt идёт
-				// в CompactPack раньше sqlCompactDead.
+				// The refcount = 0 guard is evaluated at statement execution
+				// time (as in PostgreSQL): the dead markings from the same
+				// transaction are already applied — sqlCompactCorrupt runs
+				// in CompactPack before sqlCompactDead.
 				if r.refc == 0 || t.corruptPending(h) {
 					t.deads = append(t.deads, h)
 					n++
@@ -203,7 +204,7 @@ func (t *compactFakeTx) Commit(context.Context) error {
 	if t.pool.commitErr != nil {
 		return t.pool.commitErr
 	}
-	for _, h := range t.corrupts { // пометки мёртвыми — до удаления deads
+	for _, h := range t.corrupts { // the dead markings go before the deads deletions
 		if r := t.pool.contents[h]; r != nil {
 			r.refc = 0
 		}
@@ -224,8 +225,8 @@ func (t *compactFakeTx) Commit(context.Context) error {
 
 func (t *compactFakeTx) Rollback(context.Context) error { return nil }
 
-// corruptPending — строка помечается мёртвой оператором sqlCompactCorrupt
-// этой же транзакции (применяются в Commit раньше deads).
+// corruptPending — the row is marked dead by this transaction's
+// sqlCompactCorrupt statement (applied in Commit before the deads).
 func (t *compactFakeTx) corruptPending(h [HashLen]byte) bool {
 	for _, c := range t.corrupts {
 		if c == h {
@@ -235,10 +236,10 @@ func (t *compactFakeTx) corruptPending(h [HashLen]byte) bool {
 	return false
 }
 
-// --- общий конструктор и утилиты --------------------------------------------
+// --- the shared constructor and utilities -----------------------------------
 
-// newCompactTestStore — PackStore во временном каталоге с фейковым пулом,
-// поддерживающим транзакции компактификации.
+// newCompactTestStore — a PackStore in a temporary directory with a fake pool
+// that supports compaction transactions.
 func newCompactTestStore(t *testing.T, mutate func(*PackOptions)) (*PackStore, *compactFakePool) {
 	t.Helper()
 	opts := PackOptions{Dir: t.TempDir(), PackSize: 1 << 20, MaxStoreBytes: 1 << 20}
@@ -254,9 +255,10 @@ func newCompactTestStore(t *testing.T, mutate func(*PackOptions)) (*PackStore, *
 	return st, pool
 }
 
-// compactCraftPack — ручная сборка пака: заголовок v1 и записи
-// [len u32 LE][блок]; возвращает смещения блоков. Для точного управления
-// байтами (порог доли живых) и создания новейшего пака без записи в него.
+// compactCraftPack — manual pack assembly: a v1 header and records
+// [len u32 LE][block]; returns the block offsets. For precise byte control
+// (the live share threshold) and for creating the newest pack without
+// writing into it.
 func compactCraftPack(t *testing.T, dir string, id int32, blocks [][]byte) []int64 {
 	t.Helper()
 	var buf bytes.Buffer
@@ -276,7 +278,7 @@ func compactCraftPack(t *testing.T, dir string, id int32, blocks [][]byte) []int
 	return offs
 }
 
-// compactCraftRow — строка contents поверх вручную собранного пака.
+// compactCraftRow — a contents row on top of a manually assembled pack.
 func compactCraftRow(t *testing.T, pool *compactFakePool, key string, packID int32, off int64, clen int, refc int32) Hash {
 	t.Helper()
 	h := HashOf([]byte(key))
@@ -284,7 +286,7 @@ func compactCraftRow(t *testing.T, pool *compactFakePool, key string, packID int
 	return h
 }
 
-// compactPackSize — размер файла пака (0 — файла нет).
+// compactPackSize — the size of the pack's file (0 — no file).
 func compactPackSize(t *testing.T, dir string, id int32) int64 {
 	t.Helper()
 	st, err := os.Stat(filepath.Join(dir, packFileName(id)))
@@ -297,7 +299,8 @@ func compactPackSize(t *testing.T, dir string, id int32) int64 {
 	return st.Size()
 }
 
-// compactWaitFor — опрос условия до дедлайна (цикл работает в горутине).
+// compactWaitFor — polling a condition until the deadline (the cycle runs in
+// a goroutine).
 func compactWaitFor(t *testing.T, cond func() bool, what string) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
@@ -310,7 +313,7 @@ func compactWaitFor(t *testing.T, cond func() bool, what string) {
 	t.Fatalf("не дождались: %s", what)
 }
 
-// --- SQL-контракт ------------------------------------------------------------
+// --- SQL contract ------------------------------------------------------------
 
 const (
 	wantCompactRows = "SELECT hash, off, len, refcount FROM contents " +
@@ -330,8 +333,8 @@ const (
 		"WHERE pack_id = $1 AND refcount = 0"
 )
 
-// TestCompactSQLContract — точные тексты SQL против схемы contents
-// (миграция 000001: hash, pack_id, off, len, raw_len, refcount).
+// TestCompactSQLContract — the exact SQL texts against the contents schema
+// (migration 000001: hash, pack_id, off, len, raw_len, refcount).
 func TestCompactSQLContract(t *testing.T) {
 	if sqlCompactRows != wantCompactRows || sqlCompactMove != wantCompactMove ||
 		sqlCompactDead != wantCompactDead || sqlCompactLive != wantCompactLive ||
@@ -340,15 +343,15 @@ func TestCompactSQLContract(t *testing.T) {
 	}
 }
 
-// --- скан --------------------------------------------------------------------
+// --- scan --------------------------------------------------------------------
 
-// TestPackShortHeaderRecovered — пак с обрывом заголовка (1..22 байт):
-// писатель восстанавливает заголовок с нуля и пишет (краш-окно C-1/C-7
-// не должно заклинивать хранилище).
+// TestPackShortHeaderRecovered — a pack with a torn header (1..22 bytes):
+// the writer rebuilds the header from scratch and writes (the C-1/C-7 crash
+// window must not jam the store).
 func TestPackShortHeaderRecovered(t *testing.T) {
 	dir := t.TempDir()
 	pool := newPackFakePool()
-	// «Обрыв записи заголовка»: частичный файл без заголовка.
+	// A "torn header write": a partial file without a header.
 	if err := os.WriteFile(filepath.Join(dir, packFileName(1)), []byte("CDPK\x01"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -356,7 +359,7 @@ func TestPackShortHeaderRecovered(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer st.Close() //nolint:errcheck // тест закрывает при очистке
+	defer st.Close() //nolint:errcheck // the test closes the store in cleanup
 	ctx := context.Background()
 	d := []byte("контент в пак с обрывом заголовка")
 	if _, err := st.Put(ctx, d); err != nil {
@@ -374,13 +377,14 @@ func TestPackShortHeaderRecovered(t *testing.T) {
 	}
 }
 
-// TestCompactShortPackSwept — не-новейший пак короче заголовка без строк
-// contents: скан видит «пустой» пак (доля живых 0), проход удаляет файл
-// вместо вечной ошибки; строки у такого пака — повреждение (ошибка).
+// TestCompactShortPackSwept — a non-newest pack shorter than the header with
+// no contents rows: the scan sees an "empty" pack (live share 0), the pass
+// removes the file instead of an eternal error; rows on such a pack mean
+// corruption (an error).
 func TestCompactShortPackSwept(t *testing.T) {
 	dir := t.TempDir()
 	pool := &compactFakePool{packFakePool: newPackFakePool()}
-	// Пак 1 — обрыв заголовка (6 байт); пак 2 — новейший.
+	// Pack 1 — a torn header (6 bytes); pack 2 is the newest.
 	if err := os.WriteFile(filepath.Join(dir, packFileName(1)), []byte("CDPK\x01\x02"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -390,7 +394,7 @@ func TestCompactShortPackSwept(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer st.Close() //nolint:errcheck // тест закрывает при очистке
+	defer st.Close() //nolint:errcheck // the test closes the store in cleanup
 	ctx := context.Background()
 
 	info, err := st.CompactScan(ctx, 1)
@@ -411,7 +415,7 @@ func TestCompactShortPackSwept(t *testing.T) {
 		t.Errorf("пак-пустышка не удалён: %d байт", got)
 	}
 
-	// Строки у пака без заголовка — повреждение: скан отказывает.
+	// Rows on a headerless pack mean corruption: the scan refuses.
 	if err := os.WriteFile(filepath.Join(dir, packFileName(3)), []byte("CDPK\x01"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -421,8 +425,8 @@ func TestCompactShortPackSwept(t *testing.T) {
 	}
 }
 
-// TestGetCorrupted — порча байтов блока при живой строке: Get отвечает
-// ErrCorrupted (отличимо от ErrNotFound и от ошибки БД).
+// TestGetCorrupted — block byte corruption with a live row: Get answers
+// ErrCorrupted (distinguishable from ErrNotFound and from a DB error).
 func TestGetCorrupted(t *testing.T) {
 	st, pool := newCompactTestStore(t, nil)
 	ctx := context.Background()
@@ -437,7 +441,7 @@ func TestGetCorrupted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.WriteAt([]byte("\xFF\xFF\xFF\xFF"), row.off); err != nil { // затираем кадр zstd
+	if _, err := f.WriteAt([]byte("\xFF\xFF\xFF\xFF"), row.off); err != nil { // smearing the zstd frame
 		t.Fatal(err)
 	}
 	if err := f.Close(); err != nil {
@@ -451,9 +455,9 @@ func TestGetCorrupted(t *testing.T) {
 	}
 }
 
-// TestCompactCorruptBlock — нечитаемый при копировании блок (обрыв хвоста
-// файла) живой строки: строка помечается мёртвой, пак удаляется, живые
-// соседи переезжают, расхождение целостности — в ошибке прохода.
+// TestCompactCorruptBlock — a block unreadable while copying (a torn file
+// tail) of a live row: the row is marked dead, the pack is removed, the live
+// neighbors move, the integrity discrepancy is in the pass error.
 func TestCompactCorruptBlock(t *testing.T) {
 	st, pool := newCompactTestStore(t, nil)
 	ctx := context.Background()
@@ -466,10 +470,11 @@ func TestCompactCorruptBlock(t *testing.T) {
 		}
 		hashes = append(hashes, res.Hash)
 	}
-	compactCraftPack(t, st.opts.Dir, 2, nil) // новейший
+	compactCraftPack(t, st.opts.Dir, 2, nil) // the newest
 
-	// Обрываем хвост пака: блок последней строки выходит за конец файла
-	// (краш записи/потеря хвоста), чтение его — ошибка I/O, не декодера.
+	// Tear off the pack's tail: the last row's block extends past the end of
+	// the file (a write crash/lost tail), reading it is an I/O error, not a
+	// decoder error.
 	row, _ := pool.row(hashes[2])
 	if err := os.Truncate(filepath.Join(st.opts.Dir, packFileName(row.packID)), row.off-2); err != nil {
 		t.Fatal(err)
@@ -488,7 +493,7 @@ func TestCompactCorruptBlock(t *testing.T) {
 	if !res.Removed || res.Corrupted != 1 || res.CopiedBlocks != 2 || res.Tombstones != 1 {
 		t.Errorf("итог %+v, want удалённый пак, 1 порченая и 2 переписанные строки", res)
 	}
-	// Порченая строка мертва (удалена компактификацией), соседи переехали.
+	// The corrupted row is dead (removed by compaction), the neighbors moved.
 	if _, ok := pool.row(hashes[2]); ok {
 		t.Error("строка нечитаемого блока не помечена мёртвой")
 	}
@@ -499,9 +504,10 @@ func TestCompactCorruptBlock(t *testing.T) {
 	}
 }
 
-// TestGetRetryAfterCompaction — гонка Get ↔ компактификация: файл пака
-// удалён между чтением метаданных и открытием (строка уже переехала) —
-// Get перечитывает метаданные и отвечает контентом, а не ENOENT.
+// TestGetRetryAfterCompaction — a Get ↔ compaction race: the pack file is
+// removed between reading the metadata and opening it (the row has already
+// moved) — Get re-reads the metadata and answers with the content, not
+// ENOENT.
 func TestGetRetryAfterCompaction(t *testing.T) {
 	st, pool := newCompactTestStore(t, nil)
 	ctx := context.Background()
@@ -512,7 +518,7 @@ func TestGetRetryAfterCompaction(t *testing.T) {
 	}
 	row, _ := pool.row(res.Hash)
 
-	// Компактификация переносит запись в пак 2 и удаляет старый файл.
+	// Compaction moves the record into pack 2 and removes the old file.
 	raw1, err := os.ReadFile(filepath.Join(st.opts.Dir, packFileName(row.packID)))
 	if err != nil {
 		t.Fatal(err)
@@ -527,15 +533,15 @@ func TestGetRetryAfterCompaction(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Пул гонки: первый sqlMetaGet возвращает старое размещение и лишь
-	// затем «перевозит» строку (как UPDATE под компактификацией).
+	// The race pool: the first sqlMetaGet returns the old placement and only
+	// then "moves" the row (as an UPDATE under compaction).
 	rp := &getRacePool{compactFakePool: pool, hash: res.Hash,
 		newRow: packFakeRow{packID: 2, off: packHeaderLen + 4, clen: row.clen, rawLen: row.rawLen, refc: row.refc}}
 	st2, err := OpenPackStore(rp, PackOptions{Dir: st.opts.Dir, PackSize: 1 << 20, MaxStoreBytes: 1 << 20})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer st2.Close() //nolint:errcheck // тест закрывает при очистке
+	defer st2.Close() //nolint:errcheck // the test closes the store in cleanup
 
 	got, err := st2.Get(ctx, res.Hash)
 	if err != nil {
@@ -549,9 +555,9 @@ func TestGetRetryAfterCompaction(t *testing.T) {
 	}
 }
 
-// getRacePool — compactFakePool, который на первом sqlMetaGet отдаёт
-// старое размещение строки и одновременно переводит её на новое (окно
-// гонки «SELECT → открытие файла» под компактификацией).
+// getRacePool — a compactFakePool that on the first sqlMetaGet returns the
+// row's old placement and simultaneously moves it to the new one (the
+// "SELECT → file open" race window under compaction).
 type getRacePool struct {
 	*compactFakePool
 	hash   Hash
@@ -571,12 +577,12 @@ func (p *getRacePool) Query(ctx context.Context, sql string, args ...any) (pgx.R
 	return rows, err
 }
 
-// TestCompactOrphanDeadRowsSwept — строка, умершая между чтением строк
-// пака и транзакцией правки (C-13): перенос её пропускает (охрана
-// refcount > 0), пачечное удаление не видит (читалась живой). Финальная
-// зачистка мёртвых строк пака обязана удалить её до unlink файла —
-// иначе мёртвый указатель на несуществующий пак остаётся в contents
-// навсегда.
+// TestCompactOrphanDeadRowsSwept — a row that died between reading the
+// pack's rows and the repair transaction (C-13): the move skips it (the
+// refcount > 0 guard), the batch deletion does not see it (it was read as
+// live). The final sweep of the pack's dead rows must remove it before the
+// file's unlink — otherwise a dead pointer to a nonexistent pack stays in
+// contents forever.
 func TestCompactOrphanDeadRowsSwept(t *testing.T) {
 	st, pool := newCompactTestStore(t, nil)
 	ctx := context.Background()
@@ -585,18 +591,18 @@ func TestCompactOrphanDeadRowsSwept(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Пак 2 — новейший (закрывает пак 1 для записи и компактификации).
+	// Pack 2 is the newest (closes pack 1 to writes and compaction).
 	compactCraftPack(t, st.opts.Dir, 2, nil)
 
-	// Убить строку в момент выдачи строк пака: SELECT уже прочитал её
-	// живой, транзакция правки увидит refcount = 0 (как Delete между
-	// шагами).
+	// Kill the row at the moment the pack's rows are served: the SELECT has
+	// already read it as live, the repair transaction will see refcount = 0
+	// (as a Delete between the steps).
 	dead := &killOnRowsPool{compactFakePool: pool, hash: res.Hash}
 	st2, err := OpenPackStore(dead, PackOptions{Dir: st.opts.Dir, PackSize: 1 << 20, MaxStoreBytes: 1 << 20})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer st2.Close() //nolint:errcheck // тест закрывает при очистке
+	defer st2.Close() //nolint:errcheck // the test closes the store in cleanup
 
 	if _, err := st2.CompactPack(ctx, 1); err != nil {
 		t.Fatalf("CompactPack: %v", err)
@@ -609,8 +615,9 @@ func TestCompactOrphanDeadRowsSwept(t *testing.T) {
 	}
 }
 
-// killOnRowsPool — компакт-пул, убивающий строку в момент выдачи строк
-// пака (имитация Delete между SELECT и транзакцией правки, C-13).
+// killOnRowsPool — a compaction pool that kills a row at the moment the
+// pack's rows are served (simulating a Delete between the SELECT and the
+// repair transaction, C-13).
 type killOnRowsPool struct {
 	*compactFakePool
 	hash Hash
@@ -628,9 +635,9 @@ func (p *killOnRowsPool) Query(ctx context.Context, sql string, args ...any) (pg
 	return rows, err
 }
 
-// TestCompactScanMixed — скан различает живые, мёртвые и мусорные блоки:
-// живая и мёртвая строки, блок краш-окна Put (без строки) и недописанный
-// хвост.
+// TestCompactScanMixed — the scan distinguishes live, dead, and garbage
+// blocks: a live and a dead row, a Put crash-window block (without a row),
+// and an unterminated tail.
 func TestCompactScanMixed(t *testing.T) {
 	st, pool := newCompactTestStore(t, nil)
 	ctx := context.Background()
@@ -646,14 +653,14 @@ func TestCompactScanMixed(t *testing.T) {
 	if err := st.Delete(ctx, HashOf(dead)); err != nil {
 		t.Fatal(err)
 	}
-	// Третий Put: addRef (Exec) проходит, дописывание проходит,
-	// фиксация метаданных (Query 3 — после put live и put dead) падает —
-	// блок без строки.
+	// The third Put: addRef (Exec) passes, the append passes,
+	// the metadata commit (Query 3 — after put live and put dead) fails —
+	// a block without a row.
 	pool.failOnQuery = 3
 	if _, err := st.Put(ctx, orphan); err == nil {
 		t.Fatal("Put с упавшей фиксацией метаданных должен вернуть ошибку")
 	}
-	// Недописанный хвост: префикс длины 255 и один байт данных.
+	// An unterminated tail: a length prefix of 255 and one data byte.
 	f, err := os.OpenFile(filepath.Join(st.opts.Dir, packFileName(1)), os.O_WRONLY|os.O_APPEND, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -693,7 +700,8 @@ func TestCompactScanMixed(t *testing.T) {
 	if info.DeadBytes != wantDead || info.DeadBlocks != 1 {
 		t.Errorf("мёртвые: %d байт / %d блоков, want %d / 1", info.DeadBytes, info.DeadBlocks, wantDead)
 	}
-	// Мусор: блок краш-окна (4+len) и хвост 5 байт — один целый блок.
+	// Garbage: the crash-window block (4+len) and the 5-byte tail — one whole
+	// block.
 	orphanRow, ok := pool.row(HashOf(orphan))
 	if ok {
 		t.Fatalf("строка orphan не должна была зафиксироваться: %+v", orphanRow)
@@ -712,9 +720,9 @@ func TestCompactScanMixed(t *testing.T) {
 	}
 }
 
-// TestCompactScanValidation — строка, указывающая мимо целой записи
-// файла, — повреждение метаданных: скан отказывается, компактификация
-// такого пака не запускается.
+// TestCompactScanValidation — a row pointing outside a whole file record
+// means corrupted metadata: the scan refuses, compaction of such a pack is
+// not started.
 func TestCompactScanValidation(t *testing.T) {
 	st, pool := newCompactTestStore(t, nil)
 	ctx := context.Background()
@@ -740,17 +748,18 @@ func TestCompactScanValidation(t *testing.T) {
 	}
 }
 
-// --- порог -------------------------------------------------------------------
+// --- threshold ----------------------------------------------------------------
 
-// TestCompactThreshold49 — доля живых ниже порога: пак переписан и удалён,
-// строка переехала в новейший пак, мёртвая строка удалена.
+// TestCompactThreshold49 — the live share below the threshold: the pack is
+// rewritten and removed, the row moved into the newest pack, the dead row
+// deleted.
 func TestCompactThreshold49(t *testing.T) {
 	dir := t.TempDir()
 	pool := &compactFakePool{packFakePool: newPackFakePool()}
 	liveBlock := bytes.Repeat([]byte("L"), 49)
 	deadBlock := bytes.Repeat([]byte("D"), 51)
 	offs := compactCraftPack(t, dir, 1, [][]byte{liveBlock, deadBlock})
-	compactCraftPack(t, dir, 2, nil) // новейший, только заголовок
+	compactCraftPack(t, dir, 2, nil) // the newest, header only
 	hLive := compactCraftRow(t, pool, "live", 1, offs[0], len(liveBlock), 2)
 	hDead := compactCraftRow(t, pool, "dead", 1, offs[1], len(deadBlock), 0)
 	oldSize := compactPackSize(t, dir, 1)
@@ -759,7 +768,7 @@ func TestCompactThreshold49(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer st.Close() //nolint:errcheck // тест закрывает при очистке
+	defer st.Close() //nolint:errcheck // the test closes the store in cleanup
 
 	info, err := st.CompactScan(context.Background(), 1)
 	if err != nil {
@@ -799,8 +808,8 @@ func TestCompactThreshold49(t *testing.T) {
 	}
 }
 
-// TestCompactThreshold51 — доля живых не ниже порога: проход ничего
-// не трогает.
+// TestCompactThreshold51 — the live share not below the threshold: the pass
+// touches nothing.
 func TestCompactThreshold51(t *testing.T) {
 	dir := t.TempDir()
 	pool := &compactFakePool{packFakePool: newPackFakePool()}
@@ -816,7 +825,7 @@ func TestCompactThreshold51(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer st.Close() //nolint:errcheck // тест закрывает при очистке
+	defer st.Close() //nolint:errcheck // the test closes the store in cleanup
 
 	stats, err := CompactOnce(context.Background(), st, CompactOptions{})
 	if err != nil {
@@ -839,11 +848,11 @@ func TestCompactThreshold51(t *testing.T) {
 	}
 }
 
-// --- переписывание ------------------------------------------------------------
+// --- rewriting ----------------------------------------------------------------
 
-// TestCompactPackRewrites — правка реального пака: байты и смещения в
-// метаданных верны, Get работает, мёртвые строки удалены, запись после
-// компактификации продолжает идти в новейший пак.
+// TestCompactPackRewrites — repairing a real pack: the bytes and offsets in
+// the metadata are correct, Get works, the dead rows are removed, writing
+// after compaction keeps going into the newest pack.
 func TestCompactPackRewrites(t *testing.T) {
 	st, pool := newCompactTestStore(t, nil)
 	ctx := context.Background()
@@ -858,8 +867,8 @@ func TestCompactPackRewrites(t *testing.T) {
 		pages[res.Hash] = d
 		hashes = append(hashes, res.Hash)
 	}
-	compactCraftPack(t, st.opts.Dir, 2, nil) // новейший пак
-	for _, h := range hashes[2:] {           // три из пяти — мёртвые
+	compactCraftPack(t, st.opts.Dir, 2, nil) // the newest pack
+	for _, h := range hashes[2:] {           // three of five are dead
 		if err := st.Delete(ctx, h); err != nil {
 			t.Fatal(err)
 		}
@@ -911,7 +920,8 @@ func TestCompactPackRewrites(t *testing.T) {
 		}
 	}
 
-	// Запись после компактификации — в новейший пак, поверх переписанного.
+	// Writing after compaction goes into the newest pack, on top of the
+	// rewritten one.
 	after := []byte("<html>контент после компактификации</html>")
 	ares, err := st.Put(ctx, after)
 	if err != nil {
@@ -926,12 +936,12 @@ func TestCompactPackRewrites(t *testing.T) {
 	}
 }
 
-// --- краш-окна ----------------------------------------------------------------
+// --- crash windows ------------------------------------------------------------
 
-// TestCompactCrashBeforeCommit — сбой транзакции (после переписывания
-// блоков): строки не тронуты, старый пак цел, чтение работает,
-// скопированные блоки — мусор в новейшем паке; повторный проход
-// завершает компактификацию.
+// TestCompactCrashBeforeCommit — a transaction failure (after the blocks
+// were rewritten): the rows are untouched, the old pack is intact, reading
+// works, the copied blocks are garbage in the newest pack; a repeated pass
+// finishes the compaction.
 func TestCompactCrashBeforeCommit(t *testing.T) {
 	for name, fail := range map[string]func(*compactFakePool){
 		"Begin":  func(p *compactFakePool) { p.beginErr = errors.New("сбой Begin") },
@@ -953,7 +963,7 @@ func TestCompactCrashBeforeCommit(t *testing.T) {
 				pages[res.Hash] = d
 			}
 			compactCraftPack(t, st.opts.Dir, 2, nil)
-			if err := st.Delete(ctx, hashes[0]); err != nil { // 3 живых из 4
+			if err := st.Delete(ctx, hashes[0]); err != nil { // 3 live out of 4
 				t.Fatal(err)
 			}
 			sizeBefore := compactPackSize(t, st.opts.Dir, 2)
@@ -963,7 +973,8 @@ func TestCompactCrashBeforeCommit(t *testing.T) {
 				t.Fatal("компактификация с упавшей транзакцией должна вернуть ошибку")
 			}
 
-			// Состояние не изменилось: старый пак цел, строки на месте.
+			// The state did not change: the old pack is intact, the rows are in
+			// place.
 			if got := compactPackSize(t, st.opts.Dir, 1); got == 0 {
 				t.Fatal("старый пак удалён при упавшей транзакции")
 			}
@@ -979,7 +990,7 @@ func TestCompactCrashBeforeCommit(t *testing.T) {
 				t.Errorf("новейший пак не вырос (%d ≤ %d) — блоки не переписывались", got, sizeBefore)
 			}
 
-			// Повторный проход завершает компактификацию.
+			// A repeated pass finishes the compaction.
 			pool.beginErr, pool.txExecErr, pool.commitErr = nil, nil, nil
 			res, err := st.CompactPack(ctx, 1)
 			if err != nil || !res.Removed {
@@ -998,9 +1009,9 @@ func TestCompactCrashBeforeCommit(t *testing.T) {
 	}
 }
 
-// TestCompactCrashAfterCommitBeforeDelete — состояние «транзакции
-// зафиксированы, файл ещё на месте» (крах между шагами): чтение идёт по
-// новым размещениям, следующий проход удаляет файл-мусор.
+// TestCompactCrashAfterCommitBeforeDelete — the state "the transactions are
+// committed, the file is still in place" (a crash between the steps): reads
+// go through the new placements, the next pass removes the garbage file.
 func TestCompactCrashAfterCommitBeforeDelete(t *testing.T) {
 	st, pool := newCompactTestStore(t, nil)
 	ctx := context.Background()
@@ -1024,7 +1035,8 @@ func TestCompactCrashAfterCommitBeforeDelete(t *testing.T) {
 	if _, err := st.CompactPack(ctx, 1); err != nil {
 		t.Fatalf("CompactPack: %v", err)
 	}
-	// Возвращаем файл на место — эквивалент краха после COMMIT до unlink.
+	// Put the file back — the equivalent of a crash after COMMIT before the
+	// unlink.
 	if err := os.WriteFile(filepath.Join(st.opts.Dir, packFileName(1)), oldBytes, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -1056,11 +1068,11 @@ func TestCompactCrashAfterCommitBeforeDelete(t *testing.T) {
 	}
 }
 
-// --- конкурентность -----------------------------------------------------------
+// --- concurrency ---------------------------------------------------------------
 
-// TestCompactConcurrentWriter — конкурентный писатель в новейший пак не
-// мешает компактификации: блоки перемешиваются в новом паке, все
-// контенты читаются (прогон с -race — в ручной проверке).
+// TestCompactConcurrentWriter — a concurrent writer into the newest pack
+// does not interfere with compaction: the blocks interleave in the new pack,
+// all contents are readable (the -race run is in the manual check).
 func TestCompactConcurrentWriter(t *testing.T) {
 	st, _ := newCompactTestStore(t, nil)
 	ctx := context.Background()
@@ -1073,8 +1085,8 @@ func TestCompactConcurrentWriter(t *testing.T) {
 		}
 		hashes = append(hashes, res.Hash)
 	}
-	compactCraftPack(t, st.opts.Dir, 2, nil) // новейший пак
-	for _, h := range hashes[:8] {           // 8 из 10 мёртвые
+	compactCraftPack(t, st.opts.Dir, 2, nil) // the newest pack
+	for _, h := range hashes[:8] {           // 8 of 10 are dead
 		if err := st.Delete(ctx, h); err != nil {
 			t.Fatal(err)
 		}
@@ -1099,8 +1111,8 @@ func TestCompactConcurrentWriter(t *testing.T) {
 			}
 			d := []byte(strings.Repeat(fmt.Sprintf("<p>горячая запись %05d</p>", i), 6))
 			res, err := st.Put(wctx, d)
-			// Отправка с выходом по отмене: главный тест читает канал
-			// только после остановки писателя.
+			// Sending with an exit on cancellation: the main test reads the
+			// channel only after the writer stops.
 			select {
 			case puts <- put{h: res.Hash, d: d, err: err}:
 			case <-wctx.Done():
@@ -1125,7 +1137,8 @@ func TestCompactConcurrentWriter(t *testing.T) {
 
 	for p := range puts {
 		if p.err != nil {
-			// Отмена в полёте — не потеря: воркер повторит (ТЗ 3.4).
+			// A cancellation in flight is not a loss: the worker retries
+			// (spec 3.4).
 			if errors.Is(p.err, context.Canceled) {
 				continue
 			}
@@ -1136,7 +1149,8 @@ func TestCompactConcurrentWriter(t *testing.T) {
 			t.Fatalf("Get конкурентного контента %s: %v", p.h, err)
 		}
 	}
-	// Старые контенты: мёртвые невидимы, живые читаются по новым местам.
+	// Old contents: the dead ones are invisible, the live ones are readable
+	// at their new places.
 	for i, h := range hashes {
 		_, err := st.Get(ctx, h)
 		if i < 8 {
@@ -1151,10 +1165,10 @@ func TestCompactConcurrentWriter(t *testing.T) {
 	}
 }
 
-// TestCompactWriterSyncsToNewest — «отстающий» писатель всегда
-// синхронизируется с новейшим паком (инвариант T-042/T-045): запись
-// после появления нового пака идёт в него, а после удаления старого пака
-// — в новейший, без потерь.
+// TestCompactWriterSyncsToNewest — a "lagging" writer always synchronizes
+// with the newest pack (the T-042/T-045 invariant): writing after a new pack
+// appears goes into it, and after the old pack is removed — into the newest,
+// with no losses.
 func TestCompactWriterSyncsToNewest(t *testing.T) {
 	dir := t.TempDir()
 	pool := &compactFakePool{packFakePool: newPackFakePool()}
@@ -1162,16 +1176,16 @@ func TestCompactWriterSyncsToNewest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer a.Close() //nolint:errcheck // тест закрывает при очистке
+	defer a.Close() //nolint:errcheck // the test closes the store in cleanup
 	b, err := OpenPackStore(pool, PackOptions{Dir: dir, PackSize: 1 << 20, MaxStoreBytes: 1 << 20})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer b.Close() //nolint:errcheck // тест закрывает при очистке
+	defer b.Close() //nolint:errcheck // the test closes the store in cleanup
 	ctx := context.Background()
 
-	// A пишет первым: пак 1; контент тут же умирает (компактификация
-	// заберёт весь пак).
+	// A writes first: pack 1; the content dies right away (compaction will
+	// take the whole pack).
 	x := []byte("<html>первый контент писателя A</html>")
 	if _, err := a.Put(ctx, x); err != nil {
 		t.Fatal(err)
@@ -1179,10 +1193,10 @@ func TestCompactWriterSyncsToNewest(t *testing.T) {
 	if err := a.Delete(ctx, HashOf(x)); err != nil {
 		t.Fatal(err)
 	}
-	// Появляется новейший пак 2 (другой «процесс» ротировал).
+	// The newest pack 2 appears (another "process" rotated).
 	compactCraftPack(t, dir, 2, nil)
 
-	// Отстающий A обязан переключиться на пак 2.
+	// The lagging A must switch to pack 2.
 	z := []byte("<html>запись отстающего писателя</html>")
 	zres, err := a.Put(ctx, z)
 	if err != nil {
@@ -1196,7 +1210,7 @@ func TestCompactWriterSyncsToNewest(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Компактификация пака 1 (доля живых 0) и запись после неё.
+	// Compacting pack 1 (live share 0) and writing after it.
 	res, err := a.CompactPack(ctx, 1)
 	if err != nil || !res.Removed {
 		t.Fatalf("CompactPack(1): %v, %+v", err, res)
@@ -1219,10 +1233,10 @@ func TestCompactWriterSyncsToNewest(t *testing.T) {
 	}
 }
 
-// --- проход и цикл ------------------------------------------------------------
+// --- pass and cycle -------------------------------------------------------------
 
-// TestCompactNewestNotCompacted — новейший пак (единственный) не
-// компактифицируется: прямой отказ и пустой проход.
+// TestCompactNewestNotCompacted — the newest pack (the only one) is not
+// compacted: a direct refusal and an empty pass.
 func TestCompactNewestNotCompacted(t *testing.T) {
 	st, _ := newCompactTestStore(t, nil)
 	ctx := context.Background()
@@ -1241,24 +1255,25 @@ func TestCompactNewestNotCompacted(t *testing.T) {
 	}
 }
 
-// TestCompactOnceErrors — ошибка скана одного пака собирается в итог
-// прохода, остальные паки обрабатываются.
+// TestCompactOnceErrors — the scan error of one pack is collected into the
+// pass result, the other packs are processed.
 func TestCompactOnceErrors(t *testing.T) {
 	dir := t.TempDir()
 	pool := &compactFakePool{packFakePool: newPackFakePool()}
-	// Пак 1: только мёртвая строка — компактифицируется (доля живых 0).
-	// Пак 2: живая строка с битым len — скан откажет. Пак 3 — новейший.
+	// Pack 1: only a dead row — compactable (live share 0).
+	// Pack 2: a live row with a broken len — the scan will refuse. Pack 3 is
+	// the newest.
 	offs1 := compactCraftPack(t, dir, 1, [][]byte{bytes.Repeat([]byte("x"), 40)})
 	offs2 := compactCraftPack(t, dir, 2, [][]byte{bytes.Repeat([]byte("y"), 40)})
 	compactCraftPack(t, dir, 3, nil)
 	hDead := compactCraftRow(t, pool, "dead", 1, offs1[0], 40, 0)
-	hLive := compactCraftRow(t, pool, "live", 2, offs2[0], 40+7, 1) // len не сходится
+	hLive := compactCraftRow(t, pool, "live", 2, offs2[0], 40+7, 1) // len does not match
 
 	st, err := OpenPackStore(pool, PackOptions{Dir: dir, PackSize: 1 << 20, MaxStoreBytes: 1 << 20})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer st.Close() //nolint:errcheck // тест закрывает при очистке
+	defer st.Close() //nolint:errcheck // the test closes the store in cleanup
 
 	stats, err := CompactOnce(context.Background(), st, CompactOptions{})
 	if err == nil {
@@ -1281,11 +1296,12 @@ func TestCompactOnceErrors(t *testing.T) {
 	}
 }
 
-// TestCompactOnceFullDiskSkipsLivePacks — пик места «старое + новое»
-// (C-17): на томе ниже порога паузы записи проход не начинает копировать
-// живые блоки (упёрся бы в ENOSPC на полпути), пак с живыми данными
-// откладывается с ошибкой прохода; пак без живых блоков обрабатывается
-// и на полном диске — удаление мусора освобождает место без копирования.
+// TestCompactOnceFullDiskSkipsLivePacks — the "old + new" space peak
+// (C-17): on a volume below the write-pause threshold the pass does not
+// start copying live blocks (it would run into ENOSPC halfway), a pack with
+// live data is postponed with a pass error; a pack without live blocks is
+// processed even on a full disk — removing garbage frees space without
+// copying.
 func TestCompactOnceFullDiskSkipsLivePacks(t *testing.T) {
 	newStore := func(t *testing.T) (*PackStore, *compactFakePool, string) {
 		t.Helper()
@@ -1294,22 +1310,22 @@ func TestCompactOnceFullDiskSkipsLivePacks(t *testing.T) {
 	}
 	fullDisk := func(st *PackStore) *fakeSpace {
 		fake := &fakeSpace{}
-		fake.set(1<<20, 100<<20) // 1% свободно — ниже порога 10%
+		fake.set(1<<20, 100<<20) // 1% free — below the 10% threshold
 		st.stat = fake
 		return fake
 	}
 
-	// Пак с живыми блоками (доля живых ниже порога компактификации) —
-	// откладывается на полном диске, файл остаётся.
+	// A pack with live blocks (the live share below the compaction threshold)
+	// is postponed on a full disk, the file remains.
 	st, pool, dir := newStore(t)
 	ctx := context.Background()
 	offs := compactCraftPack(t, dir, 1, [][]byte{
-		bytes.Repeat([]byte("l"), 40),  // живой блок
-		bytes.Repeat([]byte("d"), 400), // мёртвый блок
+		bytes.Repeat([]byte("l"), 40),  // a live block
+		bytes.Repeat([]byte("d"), 400), // a dead block
 	})
 	compactCraftRow(t, pool, "живой контент полного диска", 1, offs[0], 40, 1)
 	compactCraftRow(t, pool, "мёртвый наполнитель", 1, offs[1], 400, 0)
-	compactCraftPack(t, dir, 2, nil) // пак 2 — новейший, пак 1 закрыт
+	compactCraftPack(t, dir, 2, nil) // pack 2 is the newest, pack 1 is closed
 	fullDisk(st)
 
 	stats, err := CompactOnce(ctx, st, CompactOptions{})
@@ -1326,7 +1342,7 @@ func TestCompactOnceFullDiskSkipsLivePacks(t *testing.T) {
 		t.Error("пак с живыми блоками тронут на полном диске")
 	}
 
-	// Пак из одного мусора — обрабатывается и на полном диске.
+	// A pack of pure garbage is processed even on a full disk.
 	st2, pool2, dir2 := newStore(t)
 	fullDisk(st2)
 	h := HashOf([]byte("мёртвый контент полного диска"))
@@ -1349,8 +1365,9 @@ func TestCompactOnceFullDiskSkipsLivePacks(t *testing.T) {
 	}
 }
 
-// TestCompactLoop — цикл: первый проход срабатывает сразу, ошибка
-// прохода не останавливает (Warn и retry тиком), отмена ctx — чистый nil.
+// TestCompactLoop — the cycle: the first pass fires immediately, a pass
+// error does not stop it (a Warn and a retry on the tick), ctx cancellation
+// is a clean nil.
 func TestCompactLoop(t *testing.T) {
 	st, pool := newCompactTestStore(t, nil)
 	ctx := context.Background()
@@ -1372,8 +1389,9 @@ func TestCompactLoop(t *testing.T) {
 
 	lctx, cancel := context.WithCancel(ctx)
 	done := make(chan error, 1)
-	// Первый проход падает (сбой БД скана); через 30 мс сбой снимается —
-	// тик цикла повторяет и преуспевает: ошибка прохода не останавливает.
+	// The first pass fails (a DB scan failure); after 30 ms the failure is
+	// lifted — the cycle's tick retries and succeeds: a pass error does not
+	// stop the cycle.
 	pool.queryErr = errors.New("сбой БД")
 	time.AfterFunc(30*time.Millisecond, func() {
 		pool.mu.Lock()
@@ -1403,7 +1421,8 @@ func TestCompactLoop(t *testing.T) {
 	}
 }
 
-// TestCompactOptionsDefaults — нули и нелепости заменяются дефолтами.
+// TestCompactOptionsDefaults — zeros and absurd values are replaced with
+// defaults.
 func TestCompactOptionsDefaults(t *testing.T) {
 	o := CompactOptions{}.withDefaults()
 	if o.Interval != DefaultCompactInterval || o.Threshold != DefaultCompactThreshold {
@@ -1419,7 +1438,8 @@ func TestCompactOptionsDefaults(t *testing.T) {
 	}
 }
 
-// TestCompactEmptyDir — пустой каталог: проход без работы и без ошибок.
+// TestCompactEmptyDir — an empty directory: a pass with no work and no
+// errors.
 func TestCompactEmptyDir(t *testing.T) {
 	st, _ := newCompactTestStore(t, nil)
 	stats, err := CompactOnce(context.Background(), st, CompactOptions{})

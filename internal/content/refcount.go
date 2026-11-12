@@ -1,14 +1,16 @@
 package content
 
-// Перезапись ссылки на контент при перезаписи результата (T-044; ТЗ 5.7, 8).
+// Rewriting a content reference when a result is rewritten (T-044; spec 5.7, 8).
 //
-// ТЗ 5.7: «при перезаписи результата счётчик ссылок старого контента
-// уменьшается». Дедупликация Put и снятие ссылки Delete — уже в хранилище
-// (T-042); здесь недостающая операция учёта для слоя результатов:
-// субдомен/вариант получил новый контент → новая ссылка добавляется,
-// старая снимается. Запись самих строк subdomain_results — территория
-// http-worker (T-058): ниже только чистые функции свопа для вызова оттуда;
-// рекомендуемое место — одна транзакция с записью результата (SwapRefTx).
+// Spec 5.7: "when a result is rewritten, the reference counter of the old
+// content is decremented". Put deduplication and Delete reference removal
+// already live in the store (T-042); this is the missing accounting
+// operation for the results layer: a subdomain/variant got new content →
+// a new reference is added, the old one is removed. Writing the
+// subdomain_results rows themselves is the http-worker's territory
+// (T-058): below are only pure swap functions to call from there;
+// the recommended place is one transaction with the result write
+// (SwapRefTx).
 
 import (
 	"context"
@@ -21,69 +23,70 @@ import (
 	"crawler/internal/db"
 )
 
-// refNoHash — нулевой Hash: «ссылки нет», NULL content_hash в
-// subdomain_results (ТЗ 6.1). Вероятность хэша настоящего контента,
-// равного нулю (первые 16 байт SHA-256), — 2^-128, пренебрежима;
-// семантика зафиксирована в одном месте, чтобы слои не расходились
-// в трактовке NULL.
+// refNoHash — the zero Hash: "no reference", NULL content_hash in
+// subdomain_results (spec 6.1). The probability of a real content hash
+// equal to zero (the first 16 bytes of SHA-256) is 2^-128, negligible;
+// the semantics are fixed in one place so the layers do not diverge
+// in their reading of NULL.
 var refNoHash Hash
 
-// ErrRefIntegrity — учёт ссылок contents расходится с ожиданием свопа:
-// контент не записан Put-ом (или мёртв — refcount = 0) там, где нужна
-// живая ссылка. Это ошибка целостности, а не ErrNotFound: идемпотентная
-// запись результата (ТЗ 3.4) в такую ветку попадать не должна; молча
-// уйти в минус или пропустить шаг хуже, чем ошибиться — транзакция
-// откатывается целиком, повторная доставка разбирается вызывающим.
+// ErrRefIntegrity — the contents reference accounting diverges from what
+// the swap expects: the content was not written by a Put (or is dead —
+// refcount = 0) where a live reference is needed. This is an integrity
+// error, not ErrNotFound: idempotent result writing (spec 3.4) must not
+// get into this branch; silently going negative or skipping a step is
+// worse than failing — the transaction is rolled back in full, and the
+// redelivery is handled by the caller.
 var ErrRefIntegrity = errors.New("content: нарушен учёт ссылок на контент")
 
-// RefDB — пул для свопа ссылок: db.DB, из которого можно начать
-// транзакцию (стиль ingest.CleanupDB, scheduler.RetryDB). Оба оператора
-// свопа атомарны в одной транзакции (ТЗ 3.4); *pgxpool.Pool
-// удовлетворяет интерфейсу.
+// RefDB — a pool for reference swaps: a db.DB from which a transaction
+// can be started (the ingest.CleanupDB, scheduler.RetryDB style). Both
+// swap statements are atomic in one transaction (spec 3.4);
+// *pgxpool.Pool satisfies the interface.
 type RefDB interface {
 	db.DB
 	Begin(ctx context.Context) (pgx.Tx, error)
 }
 
-// compile-time: реальный пул подходит под интерфейс.
+// compile-time: the real pool fits the interface.
 var _ RefDB = (*pgxpool.Pool)(nil)
 
-// SwapRef перезаписывает ссылку на контент у одного результата (ТЗ 5.7,
-// 8): newHash получает ссылку (refcount + 1), oldHash теряет её
-// (refcount − 1) — атомарно в одной транзакции БД, поверх той же таблицы
-// contents и тех же операторов, что у Put/Delete хранилища (T-042).
-// Вызывается слоем записи результатов http-worker (T-058) при перезаписи
-// subdomain_results со сменой content_hash; сами строки результатов
-// функция не трогает.
+// SwapRef rewrites the content reference of one result (spec 5.7,
+// 8): newHash gains a reference (refcount + 1), oldHash loses it
+// (refcount − 1) — atomically in one DB transaction, on the same
+// contents table and with the same statements the store's Put/Delete use
+// (T-042). Called by the http-worker results-writing layer (T-058) when
+// rewriting subdomain_results with a content_hash change; the function
+// does not touch the result rows themselves.
 //
-// Сценарии (нулевой Hash — «нет ссылки», NULL content_hash, ТЗ 6.1):
-//   - old == new — контент не сменился: no-op без транзакции
-//     (идемпотентность повторной доставки, ТЗ 3.4);
-//   - старый нулевой — первый контент результата: только +1 новому;
-//   - новый нулевой — результат без контента: только −1 старому;
-//   - оба нулевых — no-op;
-//   - refcount старого после −1 достиг нуля — строка остаётся «мёртвой»
-//     (контракт T-042): Get/Delete её не видят, место освобождает
-//     компактификация паков (T-045).
+// Scenarios (a zero Hash — "no reference", NULL content_hash, spec 6.1):
+//   - old == new — the content did not change: a no-op without a transaction
+//     (idempotency of redelivery, spec 3.4);
+//   - the old one is zero — the result's first content: only +1 to the new one;
+//   - the new one is zero — a result without content: only −1 to the old one;
+//   - both zero — a no-op;
+//   - the old one's refcount reaches zero after −1 — the row stays "dead"
+//     (the T-042 contract): Get/Delete do not see it, the space is freed by
+//     pack compaction (T-045).
 //
-// Порядок операторов — сначала +1 новому, потом −1 старому. Внутри одной
-// транзакции промежуточного состояния нет; порядок зафиксирован для
-// встраивания свопа в транзакцию записи результата (SwapRefTx, T-058) и
-// на случай выполнения шагов раздельно: крах «после +1, до −1» оставляет
-// лишнюю ссылку у старого контента — безопасно, блок лишь остаётся живым
-// (утечка места, данные целы); крах в обратном порядке теряет живую
-// ссылку: refcount контента, на который всё ещё ссылается результат,
-// мог достичь нуля — компактификация T-045 освободит блок, Get вернёт
-// ErrNotFound для живого результата, повторное применение правил анализа
-// (ТЗ 5.7: контент хранится, пока нужно переприменять правила) станет
-// невозможно. По ТЗ 3.4 выбираем безопасную сторону: утечка места лучше
-// потери данных.
+// Statement order — first +1 to the new one, then −1 to the old one. Inside one
+// transaction there is no intermediate state; the order is pinned for
+// embedding the swap into the result-write transaction (SwapRefTx, T-058) and
+// in case the steps are run separately: a crash "after +1, before −1" leaves
+// an extra reference on the old content — safe, the block merely stays live
+// (a space leak, the data is intact); a crash in the reverse order loses a live
+// reference: the refcount of content still referenced by a result
+// could reach zero — compaction T-045 would free the block, Get would return
+// ErrNotFound for a live result, and re-applying the analysis rules
+// (spec 5.7: content is stored while rules need to be re-applied) would become
+// impossible. Per spec 3.4 we choose the safe side: a space leak is better
+// than data loss.
 //
-// Охрана refcount > 0 в обоих операторах — не только запрет ухода
-// в минус: RowsAffected = 0 значит, что новый контент не был записан
-// Put-ом (или мёртв), либо ссылка старого уже снята — расхождение учёта
-// результата и contents. Такой случай — ErrRefIntegrity с откатом
-// транзакции: лучше ошибиться, чем молча испортить счётчик.
+// The refcount > 0 guard in both statements is not only a ban on going
+// negative: RowsAffected = 0 means the new content was not written by
+// a Put (or is dead), or the old one's reference was already removed — a discrepancy
+// between the result accounting and contents. Such a case is ErrRefIntegrity with a
+// transaction rollback: better to fail than to silently corrupt the counter.
 func SwapRef(ctx context.Context, pool RefDB, oldHash, newHash Hash) error {
 	if pool == nil {
 		return errors.New("content: своп ссылок: пул не задан")
@@ -92,16 +95,16 @@ func SwapRef(ctx context.Context, pool RefDB, oldHash, newHash Hash) error {
 		return err
 	}
 	if oldHash == newHash {
-		// Контент не сменился (в т.ч. обе ссылки нулевые): счётчики
-		// не трогаются, транзакция не открывается.
+		// The content did not change (including both references zero): the counters
+		// are not touched, no transaction is opened.
 		return nil
 	}
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("content: своп ссылок %s → %s: транзакция: %w", oldHash, newHash, err)
 	}
-	// Откат безусловно: после Commit — no-op. Прерванный своп не
-	// оставляет половинчатых изменений (ТЗ 3.4).
+	// Rollback unconditionally: after Commit — a no-op. An interrupted swap leaves
+	// no half-applied changes (spec 3.4).
 	defer func() { _ = tx.Rollback(ctx) }()
 	if err := SwapRefTx(ctx, tx, oldHash, newHash); err != nil {
 		return err
@@ -112,11 +115,11 @@ func SwapRef(ctx context.Context, pool RefDB, oldHash, newHash Hash) error {
 	return nil
 }
 
-// SwapRefTx — примитив SwapRef для транзакции вызывающего: T-058 пишет
-// subdomain_results и меняет ссылки в ОДНОЙ транзакции — раздельные
-// транзакции опасны в обе стороны (ссылка без строки или строка без
-// ссылки, ТЗ 3.4). Семантика, сценарии и порядок операторов — как у
-// SwapRef; Begin/Commit за вызывающим.
+// SwapRefTx — the SwapRef primitive for the caller's transaction: T-058 writes
+// subdomain_results and changes references in ONE transaction — separate
+// transactions are dangerous in both directions (a reference without a row or a row without
+// a reference, spec 3.4). The semantics, scenarios, and statement order are the same as
+// SwapRef's; Begin/Commit are the caller's responsibility.
 func SwapRefTx(ctx context.Context, tx pgx.Tx, oldHash, newHash Hash) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -125,7 +128,7 @@ func SwapRefTx(ctx context.Context, tx pgx.Tx, oldHash, newHash Hash) error {
 		return errors.New("content: своп ссылок: транзакция не задана")
 	}
 	if oldHash == newHash {
-		return nil // контент не сменился (в т.ч. обе ссылки нулевые)
+		return nil // the content did not change (including both references zero)
 	}
 	if newHash != refNoHash {
 		tag, err := tx.Exec(ctx, sqlMetaAddRef, newHash[:])
@@ -150,12 +153,12 @@ func SwapRefTx(ctx context.Context, tx pgx.Tx, oldHash, newHash Hash) error {
 	return nil
 }
 
-// SwapRef перезаписывает ссылку на контент через пул этого хранилища:
-// та же таблица contents и те же операторы, что у Put/Delete (T-042).
-// Удобен воркеру, уже держащему *PackStore (T-058). OpenPackStore
-// принимает db.DB, поэтому способность пула открывать транзакции
-// (RefDB, например *pgxpool.Pool) проверяется во время вызова.
-// Семантика и порядок операторов — SwapRef.
+// SwapRef rewrites the content reference through this store's pool:
+// the same contents table and the same statements as Put/Delete (T-042).
+// Convenient for a worker already holding a *PackStore (T-058). OpenPackStore
+// accepts a db.DB, so the pool's ability to open transactions
+// (RefDB, e.g. *pgxpool.Pool) is checked at call time.
+// The semantics and statement order are SwapRef's.
 func (s *PackStore) SwapRef(ctx context.Context, oldHash, newHash Hash) error {
 	pool, ok := s.pool.(RefDB)
 	if !ok {

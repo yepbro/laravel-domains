@@ -1,10 +1,10 @@
-// Юнит-тесты свопа ссылок contents при перезаписи результата (T-044,
-// ТЗ 5.7, 8): фейковый pgx-пул с транзакциями (стиль pack_test.go и
-// ingest/cleanup_test.go) — точные SQL-тексты и параметры, порядок
-// операторов, единственная транзакция на своп, сценарии нулевых и равных
-// хэшей, живая семантика refcount с откатом, ошибки целостности, сбои
-// шагов и отмена ctx. Поведение против живой PostgreSQL — сквозные
-// тесты хранилища (T-046).
+// Unit tests of the contents reference swap on result rewrite (T-044,
+// spec 5.7, 8): a fake pgx pool with transactions (the pack_test.go and
+// ingest/cleanup_test.go style) — exact SQL texts and parameters, statement
+// order, a single transaction per swap, zero and equal hash scenarios,
+// live refcount semantics with rollback, integrity errors, step
+// failures, and ctx cancellation. Behavior against live PostgreSQL is covered by
+// end-to-end store tests (T-046).
 package content
 
 import (
@@ -20,20 +20,20 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
-// --- фейковый пул: семантика refcount с транзакциями ------------------------
+// --- fake pool: refcount semantics with transactions ------------------------
 
-// refcountCall — записанный SQL-вызов с аргументами.
+// refcountCall — a recorded SQL call with arguments.
 type refcountCall struct {
 	sql  string
 	args []any
 }
 
-// refcountFakePool — RefDB без БД: живая семантика refcount таблицы
-// contents (карта hash → refcount; 0 или отсутствие строки — мёртвая,
-// UPDATE с охраной её не трогает). Незакоммиченные изменения живут
-// в overlay своей транзакции: Commit применяет их к пулу, Rollback
-// отбрасывает — тесты проверяют атомарность отката. Exec/Query вне
-// транзакции — ошибка: операторы свопа обязаны идти одной транзакцией.
+// refcountFakePool — a RefDB without a DB: live refcount semantics of the
+// contents table (a map hash → refcount; 0 or a missing row means dead,
+// a guarded UPDATE does not touch it). Uncommitted changes live
+// in their transaction's overlay: Commit applies them to the pool, Rollback
+// discards them — the tests check rollback atomicity. Exec/Query outside
+// a transaction is an error: the swap statements must run in one transaction.
 type refcountFakePool struct {
 	mu   sync.Mutex
 	refc map[[HashLen]byte]int32
@@ -41,10 +41,10 @@ type refcountFakePool struct {
 	begins    int
 	txs       []*refcountFakeTx
 	beginErr  error
-	poolExecs int // Exec мимо транзакции (должно быть 0)
+	poolExecs int // Exec outside a transaction (must be 0)
 
-	execErr     error // чем уронить оператор transOnStep
-	transOnStep int   // номер оператора в транзакции (1-based; 0 — не ронять)
+	execErr     error // what to fail the transOnStep statement with
+	transOnStep int   // the statement number in the transaction (1-based; 0 — do not fail)
 	commitErr   error
 }
 
@@ -83,18 +83,18 @@ func (p *refcountFakePool) Begin(context.Context) (pgx.Tx, error) {
 	return tx, nil
 }
 
-// count — снимок refcount хэша под замком.
+// count — a snapshot of a hash's refcount under the lock.
 func (p *refcountFakePool) count(h Hash) int32 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.refc[h]
 }
 
-// refcountFakeTx — транзакция над пулом: операторы читают базу через
-// overlay (незакоммиченное видит только своя транзакция), Commit сливает
-// изменения в пул, Rollback отбрасывает.
+// refcountFakeTx — a transaction over the pool: statements read the base through
+// the overlay (uncommitted state is visible only to their own transaction), Commit
+// merges the changes into the pool, Rollback discards them.
 type refcountFakeTx struct {
-	pgx.Tx // остальные методы pgx.Tx своп не использует
+	pgx.Tx // the swap does not use the other pgx.Tx methods
 
 	pool       *refcountFakePool
 	overlay    map[[HashLen]byte]int32
@@ -103,7 +103,7 @@ type refcountFakeTx struct {
 	rolledBack bool
 }
 
-// visible — refcount хэша глазами транзакции (pool.mu уже удержан).
+// visible — a hash's refcount as seen by the transaction (pool.mu is already held).
 func (t *refcountFakeTx) visible(h [HashLen]byte) int32 {
 	if v, ok := t.overlay[h]; ok {
 		return v
@@ -164,17 +164,17 @@ func (t *refcountFakeTx) Rollback(context.Context) error {
 	return nil
 }
 
-// compile-time: фейковый пул — RefDB для тестов без БД.
+// compile-time: the fake pool is a RefDB for tests without a DB.
 var _ RefDB = (*refcountFakePool)(nil)
 
-// refcountHash — различимые тестовые хэши: refcountHash(1), (2), …
+// refcountHash — distinguishable test hashes: refcountHash(1), (2), …
 func refcountHash(n byte) Hash {
 	var h Hash
 	h[0] = n
 	return h
 }
 
-// --- своп: порядок, параметры, транзакция -----------------------------------
+// --- swap: order, parameters, transaction -----------------------------------
 
 func TestSwapRefOrderAndTransaction(t *testing.T) {
 	oldH, newH := refcountHash(1), refcountHash(2)
@@ -191,8 +191,8 @@ func TestSwapRefOrderAndTransaction(t *testing.T) {
 	}
 	tx := pool.txs[0]
 	want := []refcountCall{
-		{sql: wantSQLAddRef, args: []any{newH[:]}}, // сначала +1 новому…
-		{sql: wantSQLDelRef, args: []any{oldH[:]}}, // …потом −1 старому
+		{sql: wantSQLAddRef, args: []any{newH[:]}}, // first +1 to the new one…
+		{sql: wantSQLDelRef, args: []any{oldH[:]}}, // …then −1 to the old one
 	}
 	if !reflect.DeepEqual(tx.calls, want) {
 		t.Fatalf("операторы свопа:\nполучено  %v\nожидалось %v", tx.calls, want)
@@ -215,10 +215,10 @@ func TestSwapRefScenarios(t *testing.T) {
 		name       string
 		oldH, newH Hash
 		seed       map[Hash]int32
-		wantOld    int32 // refcount старого после свопа (ненулевого)
-		wantNew    int32 // refcount нового после свопа (ненулевого)
-		wantCalls  int   // операторов в транзакции
-		wantBegins int   // открытых транзакций
+		wantOld    int32 // the old one's refcount after the swap (when non-zero)
+		wantNew    int32 // the new one's refcount after the swap (when non-zero)
+		wantCalls  int   // statements in the transaction
+		wantBegins int   // transactions opened
 	}{
 		{"контент не сменился (old == new)", b, b, map[Hash]int32{b: 3}, 3, 3, 0, 0},
 		{"обе ссылки нулевые", zero, zero, nil, 0, 0, 0, 0},
@@ -284,7 +284,7 @@ func TestSwapRefIntegrity(t *testing.T) {
 		if !errors.Is(err, ErrRefIntegrity) {
 			t.Fatalf("ошибка %v, ожидалась ErrRefIntegrity", err)
 		}
-		// Атомарность отката: успевший +1 новому не применился.
+		// Rollback atomicity: the +1 to the new one that did happen was not applied.
 		if got := pool.count(b); got != 1 {
 			t.Fatalf("refcount нового = %d, ожидался 1 — добавление откачено вместе со снятием", got)
 		}
@@ -306,9 +306,9 @@ func TestSwapRefIntegrity(t *testing.T) {
 		if err := SwapRef(context.Background(), pool, a, b); err != nil {
 			t.Fatalf("первый своп: %v", err)
 		}
-		// Повтор идемпотентной записи результата даёт old == new (no-op);
-		// прямой повторный своп — двойное снятие старого: у A ссылка
-		// уже снята, охрана refcount > 0 отказывает, минуса нет.
+		// A repeat of the idempotent result write yields old == new (a no-op);
+		// a direct repeated swap is a double removal of the old one: A's reference
+		// is already removed, the refcount > 0 guard refuses, there is no minus.
 		err := SwapRef(context.Background(), pool, a, b)
 		if !errors.Is(err, ErrRefIntegrity) {
 			t.Fatalf("ошибка %v, ожидалась ErrRefIntegrity", err)
@@ -368,7 +368,7 @@ func TestSwapRefFailures(t *testing.T) {
 		if !pool.txs[0].rolledBack {
 			t.Fatal("транзакция не откачена")
 		}
-		// Успевший +1 новому откачен вместе с транзакцией.
+		// The +1 to the new one that did happen is rolled back with the transaction.
 		if got := pool.count(b); got != 1 {
 			t.Fatalf("refcount нового = %d, ожидался 1 — добавление откачено", got)
 		}
@@ -382,7 +382,7 @@ func TestSwapRefFailures(t *testing.T) {
 		if err := SwapRef(context.Background(), pool, a, b); !errors.Is(err, boom) {
 			t.Fatalf("ошибка %v, ожидалась оборачивающая boom", err)
 		}
-		// Незафиксированное не применилось: счётчики не тронуты.
+		// The uncommitted state was not applied: the counters are untouched.
 		if got := pool.count(a); got != 1 {
 			t.Fatalf("refcount старого = %d, ожидался 1", got)
 		}
@@ -392,7 +392,7 @@ func TestSwapRefFailures(t *testing.T) {
 	})
 }
 
-// --- примитив для транзакции вызывающего ------------------------------------
+// --- the primitive for the caller's transaction ------------------------------
 
 func TestSwapRefTx(t *testing.T) {
 	a, b := refcountHash(1), refcountHash(2)
@@ -409,7 +409,7 @@ func TestSwapRefTx(t *testing.T) {
 		if err := tx.Commit(context.Background()); err != nil {
 			t.Fatalf("Commit: %v", err)
 		}
-		// SwapRefTx не открывает собственных транзакций.
+		// SwapRefTx does not open transactions of its own.
 		if pool.begins != 1 {
 			t.Fatalf("транзакций %d, ожидалась 1 (только вызывающего)", pool.begins)
 		}
@@ -451,7 +451,7 @@ func TestSwapRefTx(t *testing.T) {
 	})
 }
 
-// --- метод PackStore ---------------------------------------------------------
+// --- the PackStore method ----------------------------------------------------
 
 func TestPackStoreSwapRef(t *testing.T) {
 	a, b := refcountHash(1), refcountHash(2)
@@ -465,7 +465,7 @@ func TestPackStoreSwapRef(t *testing.T) {
 		}
 		defer func() { _ = st.Close() }()
 
-		// no-op через метод: транзакция не открывается.
+		// A no-op through the method: no transaction is opened.
 		if err := st.SwapRef(context.Background(), b, b); err != nil {
 			t.Fatalf("no-op своп: %v", err)
 		}
@@ -483,7 +483,7 @@ func TestPackStoreSwapRef(t *testing.T) {
 		}
 	})
 	t.Run("пул без Begin отвергается", func(t *testing.T) {
-		// packFakePool (pack_test.go) — только db.DB, без Begin.
+		// packFakePool (pack_test.go) is only a db.DB, without Begin.
 		st, err := OpenPackStore(newPackFakePool(), PackOptions{Dir: dir})
 		if err != nil {
 			t.Fatalf("OpenPackStore: %v", err)

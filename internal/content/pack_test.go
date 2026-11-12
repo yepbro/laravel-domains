@@ -1,8 +1,8 @@
-// Юнит-тесты PackStore (T-042): контракт ContentStore на реальных
-// пак-файлах во временном каталоге и метаданных contents на фейковом
-// pgx-пуле (стиль ingest-тестов: пул с точными SQL и живой семантикой
-// refcount). Поведение против живой PostgreSQL — сквозные тесты
-// хранилища (T-046).
+// Unit tests of PackStore (T-042): the ContentStore contract on real pack
+// files in a temporary directory and contents metadata on a fake pgx pool
+// (the ingest-test style: a pool with exact SQL and live refcount
+// semantics). Behavior against live PostgreSQL — end-to-end store tests
+// (T-046).
 package content
 
 import (
@@ -24,15 +24,15 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-// --- фейковый пул: семантика contents без БД -------------------------------
+// --- fake pool: contents semantics without a DB -------------------------------
 
-// packCall — записанный SQL-вызов с аргументами.
+// packCall — a recorded SQL call with arguments.
 type packCall struct {
 	sql  string
 	args []any
 }
 
-// packFakeRow — строка contents.
+// packFakeRow — a contents row.
 type packFakeRow struct {
 	packID int32
 	off    int64
@@ -41,25 +41,25 @@ type packFakeRow struct {
 	refc   int32
 }
 
-// packFakePool — db.DB с настоящей семантикой четырёх SQL метаданных
-// (карта hash → строка, refcount по правилам хранилища): внешний прогон
-// StoreContract (pack_contract_test.go, T-228) и тесты ротации требуют
-// живое состояние, а не заготовленные ответы.
-// Неизвестный SQL — ошибка: пул закрепляет точные тексты запросов.
+// packFakePool — a db.DB with real semantics of the four metadata SQL
+// statements (a map hash → row, refcount by the store's rules): the external
+// StoreContract run (pack_contract_test.go, T-228) and the rotation tests
+// need live state, not canned responses.
+// Unknown SQL is an error: the pool pins the exact query texts.
 type packFakePool struct {
 	mu       sync.Mutex
 	contents map[[HashLen]byte]*packFakeRow
 	calls    []packCall
 
-	execSeq    int   // счётчик Exec для failOnExec
-	failOnExec int   // уронить Exec с этим порядковым номером (1-based)
-	execErr    error // чем уронить (по умолчанию общая ошибка БД)
+	execSeq    int   // the Exec counter for failOnExec
+	failOnExec int   // fail the Exec with this ordinal number (1-based)
+	execErr    error // what to fail it with (a generic DB error by default)
 
-	querySeq    int // счётчик Query для failOnQuery
-	failOnQuery int // уронить Query с этим порядковым номером (1-based)
+	querySeq    int // the Query counter for failOnQuery
+	failOnQuery int // fail the Query with this ordinal number (1-based)
 	queryErr    error
 
-	failSQL string // SQL, который обязан упасть failSQLCount раз (краш-окна пачки, T-102)
+	failSQL string // the SQL that must fail failSQLCount times (batch crash windows, T-102)
 	failN   int
 }
 
@@ -140,10 +140,10 @@ func (p *packFakePool) Query(ctx context.Context, sql string, args ...any) (pgx.
 	case sqlMetaPut:
 		var h [HashLen]byte
 		copy(h[:], args[0].([]byte))
-		// RETURNING (xmax = 0): вставка — true, конфликт
-		// (ON CONFLICT DO UPDATE) — false, как в PostgreSQL.
+		// RETURNING (xmax = 0): an insert is true, a conflict
+		// (ON CONFLICT DO UPDATE) is false, as in PostgreSQL.
 		if r := p.contents[h]; r != nil {
-			r.refc++ // ON CONFLICT: ссылка конкурента/мёртвой строки
+			r.refc++ // ON CONFLICT: the reference of a concurrent writer/a dead row
 			r.packID, r.off = args[1].(int32), args[2].(int64)
 			r.clen, r.rawLen = args[3].(int32), args[4].(int32)
 			return &packRows{rows: [][]any{{false}}}, nil
@@ -154,13 +154,13 @@ func (p *packFakePool) Query(ctx context.Context, sql string, args ...any) (pgx.
 		}
 		return &packRows{rows: [][]any{{true}}}, nil
 	case sqlMetaAddRefBatch:
-		// Дедуп-пачка (T-102; счётчики копий — T-228): +n каждому
-		// живому хэшу (n копий в пачке), RETURNING по нему.
-		// Инвариант PutBatch — хэши уникальны (дедуп byHash шага 0):
-		// живой PostgreSQL при двух join-строках на одну цель обновил
-		// бы строку один раз с произвольной парой, а не суммировал —
-		// фейк на дубликате падает, а не расходится с сервером молча
-		// (ревью T-228, P3-2).
+		// The dedup batch (T-102; copy counters — T-228): +n to every
+		// live hash (n copies in the batch), RETURNING for it.
+		// The PutBatch invariant — hashes are unique (the step-0 byHash
+		// dedup): live PostgreSQL with two join rows targeting one row would
+		// update it once with an arbitrary pair, not sum the pairs —
+		// the fake fails on a duplicate rather than silently diverging from
+		// the server (review T-228, P3-2).
 		hashes := args[0].([][]byte)
 		counts := args[1].([]int32)
 		seen := make(map[[HashLen]byte]bool, len(hashes))
@@ -179,8 +179,8 @@ func (p *packFakePool) Query(ctx context.Context, sql string, args ...any) (pgx.
 		}
 		return &packRows{rows: rows}, nil
 	case sqlMetaPutBatch:
-		// Пакетный upsert (T-102): строки по unnest-массивам; конфликт —
-		// refcount += n и перенос размещения; RETURNING hash, (xmax = 0).
+		// The batched upsert (T-102): rows by unnest arrays; a conflict —
+		// refcount += n and a placement move; RETURNING hash, (xmax = 0).
 		hashes := args[0].([][]byte)
 		packs := args[1].([]int32)
 		offs := args[2].([]int64)
@@ -211,13 +211,13 @@ func (p *packFakePool) Query(ctx context.Context, sql string, args ...any) (pgx.
 		if r := p.contents[h]; r != nil && r.refc > 0 {
 			return &packRows{rows: [][]any{{r.packID, r.off, r.clen, r.rawLen}}}, nil
 		}
-		return &packRows{}, nil // pgx: ноль строк → ErrNoRows у вызывающего
+		return &packRows{}, nil // pgx: zero rows → ErrNoRows at the caller
 	default:
 		return nil, fmt.Errorf("packFakePool: неожидаемый SQL: %s", sql)
 	}
 }
 
-// row — снимок строки contents для проверок (refcount, смещения).
+// row — a snapshot of a contents row for assertions (refcount, offsets).
 func (p *packFakePool) row(h Hash) (packFakeRow, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -228,8 +228,8 @@ func (p *packFakePool) row(h Hash) (packFakeRow, bool) {
 	return packFakeRow(*r), true
 }
 
-// dropRow — удалить строку contents из фейка (путь retention/
-// компактификации: строка уходит целиком, не через счётчик).
+// dropRow — remove a contents row from the fake (the retention/
+// compaction path: the row goes away entirely, not via the counter).
 func (p *packFakePool) dropRow(h Hash) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -242,7 +242,7 @@ func (p *packFakePool) snapshotCalls() []packCall {
 	return append([]packCall(nil), p.calls...)
 }
 
-// packRows — pgx.Rows с заготовленными строками; Scan позиционный.
+// packRows — pgx.Rows with canned rows; Scan is positional.
 type packRows struct {
 	rows   [][]any
 	i      int
@@ -291,11 +291,11 @@ func (r *packRows) RawValues() [][]byte { return nil }
 func (r *packRows) Conn() *pgx.Conn      { return nil }
 func (r *packRows) TypeMap() *pgtype.Map { return nil }
 
-// --- общий конструктор хранилища для тестов --------------------------------
+// --- the shared store constructor for tests --------------------------------
 
-// newPackTestStore — PackStore во временном каталоге с фейковым пулом.
-// Маленький PackSize по умолчанию: часть тестов полагается на ротацию,
-// контракт тоже её простреливает.
+// newPackTestStore — a PackStore in a temporary directory with a fake pool.
+// A small PackSize by default: some tests rely on rotation,
+// the contract probes it too.
 func newPackTestStore(t *testing.T, mutate func(*PackOptions)) (*PackStore, *packFakePool) {
 	t.Helper()
 	opts := PackOptions{Dir: t.TempDir(), PackSize: 64 << 10, MaxStoreBytes: 1 << 20}
@@ -311,14 +311,14 @@ func newPackTestStore(t *testing.T, mutate func(*PackOptions)) (*PackStore, *pac
 	return st, pool
 }
 
-// TestStoreContractOnPack вынесен во внешний тест-пакет
-// (pack_contract_test.go, T-228): набор StoreContract живёт в
-// contenttest, импортирующем content, — внутренние _test-файлы пакета
-// импортировать contenttest не могут (цикл импортов в тесте), внешний
-// content_test может (go перепривязывает его зависимость от content к
-// тестовому варианту пакета); фабрика хранилища — export_test.go.
+// TestStoreContractOnPack moved to the external test package
+// (pack_contract_test.go, T-228): the StoreContract suite lives in
+// contenttest, which imports content — the package's internal _test files
+// cannot import contenttest (an import cycle in the test), while the
+// external content_test can (go rebinds its dependency on content to the
+// test variant of the package); the store factory is export_test.go.
 
-// --- ожидаемые SQL (контракт против схемы 000001) ---------------------------
+// --- expected SQL (the contract against schema 000001) -----------------------
 
 const (
 	wantSQLAddRef = "UPDATE contents SET refcount = refcount + 1 " +
@@ -335,9 +335,9 @@ const (
 		"WHERE hash = $1 AND refcount > 0"
 )
 
-// TestPackSQLContract — SQL метаданных и параметры: точные тексты,
-// порядок вызовов Put/Get/Delete, типы аргументов. Схема contents —
-// миграция 000001 (hash, pack_id, off, len, raw_len, refcount).
+// TestPackSQLContract — the metadata SQL and parameters: the exact texts,
+// the Put/Get/Delete call order, the argument types. The contents schema is
+// migration 000001 (hash, pack_id, off, len, raw_len, refcount).
 func TestPackSQLContract(t *testing.T) {
 	if sqlMetaAddRef != wantSQLAddRef || sqlMetaPut != wantSQLPut ||
 		sqlMetaGet != wantSQLGet || sqlMetaDelRef != wantSQLDelRef {
@@ -401,11 +401,12 @@ func TestPackSQLContract(t *testing.T) {
 	}
 }
 
-// --- формат пака --------------------------------------------------------------
+// --- pack format --------------------------------------------------------------
 
-// TestPackHeaderAndOffsets — формат файла: заголовок v1 (magic, версия,
-// длина, id, порог ротации, ID словаря) и записи [len u32 LE][zstd-блок];
-// метаданные off/len указывают на сжатые данные блока.
+// TestPackHeaderAndOffsets — the file format: the v1 header (magic, version,
+// length, id, rotation threshold, dictionary ID) and the records
+// [len u32 LE][zstd block]; the off/len metadata point at the compressed
+// block data.
 func TestPackHeaderAndOffsets(t *testing.T) {
 	st, pool := newPackTestStore(t, func(o *PackOptions) { o.PackSize = 1 << 20 })
 	ctx := context.Background()
@@ -442,7 +443,8 @@ func TestPackHeaderAndOffsets(t *testing.T) {
 		t.Errorf("заголовок: hdrLen = %d, want %d", ln, packHeaderLen)
 	}
 
-	// Каждый блок: смещение из метаданных, перед блоком — префикс длины.
+	// Each block: the offset from the metadata, with the length prefix in
+	// front of the block.
 	seen := 0
 	for h, d := range byHash {
 		row, ok := pool.row(h)
@@ -473,9 +475,10 @@ func TestPackHeaderAndOffsets(t *testing.T) {
 	}
 }
 
-// TestPackRotation — ротация по размеру: несколько маленьких паков, все
-// контенты читаются, pack_id монотонны и без дыр, размер пака не выходит
-// за порог (кроме первого блока — исключение продвигает ротацию).
+// TestPackRotation — rotation by size: several small packs, all contents
+// readable, pack_ids monotonic and gap-free, the pack size does not exceed
+// the threshold (except the first block — the exception drives rotation
+// forward).
 func TestPackRotation(t *testing.T) {
 	const packSize = 400
 	st, pool := newPackTestStore(t, func(o *PackOptions) { o.PackSize = packSize })
@@ -536,7 +539,7 @@ func TestPackRotation(t *testing.T) {
 		}
 	}
 
-	// Все контенты читаются после ротации.
+	// All contents are readable after rotation.
 	for i, h := range hashes {
 		got, err := st.Get(ctx, h)
 		if err != nil {
@@ -549,8 +552,8 @@ func TestPackRotation(t *testing.T) {
 	}
 }
 
-// TestPackDedupNoBytes — повторный Put того же контента: только ссылка
-// (UPDATE), байты в пак не пишутся, Created = false.
+// TestPackDedupNoBytes — a repeated Put of the same content: a reference
+// only (UPDATE), no bytes appended to the pack, Created = false.
 func TestPackDedupNoBytes(t *testing.T) {
 	st, pool := newPackTestStore(t, func(o *PackOptions) { o.PackSize = 1 << 20 })
 	ctx := context.Background()
@@ -593,13 +596,14 @@ func TestPackDedupNoBytes(t *testing.T) {
 	}
 }
 
-// TestPackCrashWindow — краш между спулом блока и метаданными: блок в
-// паке есть, но невидим (Get — ErrNotFound); повторная запись работает.
+// TestPackCrashWindow — a crash between the block spool and the metadata:
+// the block is in the pack but invisible (Get — ErrNotFound); writing again
+// works.
 func TestPackCrashWindow(t *testing.T) {
 	st, pool := newPackTestStore(t, func(o *PackOptions) { o.PackSize = 1 << 20 })
 	ctx := context.Background()
 	d := []byte("контент, чьи метаданные не закоммитятся")
-	pool.failOnQuery = 1 // первый Exec (addRef) проходит, фиксация метаданных (Query 1) падает
+	pool.failOnQuery = 1 // the first Exec (addRef) passes, the metadata commit (Query 1) fails
 
 	if _, err := st.Put(ctx, d); err == nil {
 		t.Fatal("Put с упавшей БД метаданных должен вернуть ошибку")
@@ -619,7 +623,7 @@ func TestPackCrashWindow(t *testing.T) {
 		t.Fatalf("метаданные всё же появились: %+v", row)
 	}
 
-	// Повторная запись того же контента исправляет ситуацию.
+	// Writing the same content again fixes the situation.
 	res, err := st.Put(ctx, d)
 	if err != nil {
 		t.Fatalf("повторный Put: %v", err)
@@ -633,9 +637,9 @@ func TestPackCrashWindow(t *testing.T) {
 	}
 }
 
-// TestPackDeadRowInvisible — refcount = 0: строка остаётся («мёртвая»),
-// Get её не видит, Delete отказывает; новый Put пишет свежие байты
-// (Created = true, новое смещение), а не воскрешает старый блок.
+// TestPackDeadRowInvisible — refcount = 0: the row remains ("dead"),
+// Get does not see it, Delete refuses; a new Put writes fresh bytes
+// (Created = true, a new offset) instead of resurrecting the old block.
 func TestPackDeadRowInvisible(t *testing.T) {
 	st, pool := newPackTestStore(t, func(o *PackOptions) { o.PackSize = 1 << 20 })
 	ctx := context.Background()
@@ -665,9 +669,9 @@ func TestPackDeadRowInvisible(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Конфликт с мёртвой строкой — ON CONFLICT DO UPDATE, не вставка:
-	// Created = false (RETURNING (xmax = 0)), хотя блок пишется свежий
-	// и размещение переводится на него.
+	// A conflict with a dead row — ON CONFLICT DO UPDATE, not an insert:
+	// Created = false (RETURNING (xmax = 0)) although a fresh block is
+	// written and the placement is moved onto it.
 	if again.Created {
 		t.Error("Put после исчерпания ссылок: Created = true, want false (конфликт мёртвой строки)")
 	}
@@ -680,21 +684,22 @@ func TestPackDeadRowInvisible(t *testing.T) {
 	}
 }
 
-// TestPackRefcountFSM — инвариантный проход автомата refcount (T-265,
-// ТЗ-fsm §3 ФТ-11; спецификация — doc-комментарий pack.go): цепочка
-// П1→П2→П4→П5 (absent → live → tombstone), запрет двойного снятия (И4),
-// невидимость мёртвого для Get и дедупа (И2), воскрешение П6 с переводом
-// размещения на свежий блок (И3) и клэмп-представление «строки нет» П7.
-// Соседние поведенческие тесты (TestPackDeadRowInvisible, контракт
-// StoreContract) закрывают те же операторы по сценариям — здесь
-// состояния закреплены явно, по таблице переходов. Живая PostgreSQL —
+// TestPackRefcountFSM — an invariant pass over the refcount automaton
+// (T-265, TZ-fsm §3 FR-11; the specification is the pack.go doc comment):
+// the chain T1→T2→T4→T5 (absent → live → tombstone), the ban on double
+// removal (I4), the dead state invisible to Get and dedup (I2), the T6
+// resurrection with the placement moved onto a fresh block (I3), and the T7
+// "no row" reading.
+// The adjacent behavioral tests (TestPackDeadRowInvisible, the StoreContract
+// suite) cover the same statements by scenario — here
+// the states are pinned explicitly, by the transition table. Live PostgreSQL —
 // test/integration/content_test.go (TestContent_RefcountFSM).
 func TestPackRefcountFSM(t *testing.T) {
 	st, pool := newPackTestStore(t, func(o *PackOptions) { o.PackSize = 1 << 20 })
 	ctx := context.Background()
 	d := []byte("автомат refcount: absent → live(n) → dead → deleted")
 
-	// П1: С0 absent → С1(1) вставкой, Created = true.
+	// T1: S0 absent → S1(1) by insert, Created = true.
 	res, err := st.Put(ctx, d)
 	if err != nil {
 		t.Fatalf("Put нового контента: %v", err)
@@ -707,7 +712,7 @@ func TestPackRefcountFSM(t *testing.T) {
 		t.Fatalf("после П1: строка %+v (found=%v), want refcount 1", live1, ok)
 	}
 
-	// П2: С1(1) → С1(2) дедупом, байты не пишутся.
+	// T2: S1(1) → S1(2) by dedup, no bytes written.
 	dup, err := st.Put(ctx, append([]byte(nil), d...))
 	if err != nil {
 		t.Fatalf("Put-дедуп: %v", err)
@@ -719,7 +724,7 @@ func TestPackRefcountFSM(t *testing.T) {
 		t.Errorf("после П2: refcount = %d, want 2", row.refc)
 	}
 
-	// П4: С1(2) → С1(1) — снятие одной ссылки.
+	// T4: S1(2) → S1(1) — one reference removed.
 	if err := st.Delete(ctx, res.Hash); err != nil {
 		t.Fatalf("Delete при двух ссылках: %v", err)
 	}
@@ -727,7 +732,7 @@ func TestPackRefcountFSM(t *testing.T) {
 		t.Errorf("после П4: refcount = %d, want 1", row.refc)
 	}
 
-	// П5: С1(1) → С2 dead·tombstone — строка остаётся с refcount = 0.
+	// T5: S1(1) → S2 dead·tombstone — the row remains with refcount = 0.
 	if err := st.Delete(ctx, res.Hash); err != nil {
 		t.Fatalf("Delete последней ссылки: %v", err)
 	}
@@ -739,8 +744,9 @@ func TestPackRefcountFSM(t *testing.T) {
 		t.Fatalf("П5: refcount = %d, want 0", row.refc)
 	}
 
-	// И2: мёртвая невидима Get; дедуп её не видит (следующий Put пойдёт
-	// в upsert, не в AddRef); И4: двойное снятие — ErrNotFound.
+	// I2: the dead row is invisible to Get; dedup does not see it (the next
+	// Put goes into the upsert, not AddRef); I4: a double removal —
+	// ErrNotFound.
 	if _, err := st.Get(ctx, res.Hash); !errors.Is(err, ErrNotFound) {
 		t.Errorf("Get мёртвой (И2): %v, want ErrNotFound", err)
 	}
@@ -748,8 +754,8 @@ func TestPackRefcountFSM(t *testing.T) {
 		t.Errorf("повторный Delete (И4): %v, want ErrNotFound", err)
 	}
 
-	// П6: С2 → С1(1) воскрешение — DO UPDATE от нуля, размещение
-	// переводится на свежий блок (EXCLUDED), Created = false.
+	// T6: S2 → S1(1) resurrection — DO UPDATE from zero, the placement
+	// is moved onto the fresh block (EXCLUDED), Created = false.
 	res2, err := st.Put(ctx, d)
 	if err != nil {
 		t.Fatalf("Put воскрешения: %v", err)
@@ -768,10 +774,10 @@ func TestPackRefcountFSM(t *testing.T) {
 		t.Errorf("Get воскрешённого: %v", err)
 	}
 
-	// П7 (представление «строки нет»): удаление строки руками — путь
-	// retention/компактификации (retentionDeleteSQL/sqlCompactDeadPack) —
-	// и воскрешение веткой вставки: Created = true, неотличимо от нового
-	// контента.
+	// T7 (the "no row" reading): deleting the row by hand — the retention/
+	// compaction path (retentionDeleteSQL/sqlCompactDeadPack) —
+	// and resurrecting via the insert branch: Created = true,
+	// indistinguishable from new content.
 	pool.dropRow(res.Hash)
 	if _, err := st.Get(ctx, res.Hash); !errors.Is(err, ErrNotFound) {
 		t.Errorf("Get отсутствующей строки: %v, want ErrNotFound", err)
@@ -791,9 +797,9 @@ func TestPackRefcountFSM(t *testing.T) {
 	}
 }
 
-// TestPackTooLarge — лимит max_store_bytes: контент отвергается целиком
-// (ErrTooLarge), ни байта в пак, ни строки метаданных; пустой контент —
-// допустим (контракт T-041).
+// TestPackTooLarge — the max_store_bytes limit: the content is rejected
+// entirely (ErrTooLarge), not a byte into the pack, no metadata row; empty
+// content is allowed (the T-041 contract).
 func TestPackTooLarge(t *testing.T) {
 	st, pool := newPackTestStore(t, func(o *PackOptions) {
 		o.PackSize = 1 << 20
@@ -828,8 +834,9 @@ func TestPackTooLarge(t *testing.T) {
 	}
 }
 
-// TestPackReopen — повторное открытие каталога: новейший пак подхватывается,
-// контент прошлого запуска читается, запись продолжает тот же пак.
+// TestPackReopen — reopening the directory: the newest pack is picked up,
+// the previous run's content is readable, writing continues into the same
+// pack.
 func TestPackReopen(t *testing.T) {
 	dir := t.TempDir()
 	pool := newPackFakePool()
@@ -852,7 +859,7 @@ func TestPackReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer st2.Close() //nolint:errcheck // тест закрывает при очистке
+	defer st2.Close() //nolint:errcheck // the test closes the store in cleanup
 	if got, err := st2.Get(ctx, h); err != nil || string(got) != string(d) {
 		t.Fatalf("Get после переоткрытия: %v", err)
 	}
@@ -874,9 +881,10 @@ func TestPackReopen(t *testing.T) {
 	}
 }
 
-// TestPackDictOnOff — словарь T-043: пак, созданный со словарём, помнит
-// его ID в заголовке; без словаря — dictID 0. Читаемость записей их
-// словарём — ограничение T-043 (см. docs/configuration.md).
+// TestPackDictOnOff — the T-043 dictionary: a pack created with a dictionary
+// remembers its ID in the header; without a dictionary — dictID 0. The
+// readability of records by their dictionary is the T-043 limitation (see
+// docs/configuration.md).
 func TestPackDictOnOff(t *testing.T) {
 	corpus := dictCorpus(24, 2048)
 	dict, err := TrainDict(corpus, TrainOptions{DictSize: 16 << 10})
@@ -909,7 +917,8 @@ func TestPackDictOnOff(t *testing.T) {
 		t.Errorf("заголовок пака: dictID = %d, want %d", hdr.dictID, dict.ID())
 	}
 
-	// Словарь выключен: новый каталог, roundtrip без словаря, dictID 0.
+	// The dictionary is off: a new directory, a dictionary-less roundtrip,
+	// dictID 0.
 	SetDict(nil)
 	st2, _ := newPackTestStore(t, func(o *PackOptions) { o.PackSize = 1 << 20 })
 	d2 := append([]byte(nil), d...)
@@ -934,9 +943,10 @@ func TestPackDictOnOff(t *testing.T) {
 	}
 }
 
-// TestPackConcurrent — конкурентные Put (мьютекс позиции записи/ротации)
-// и параллельные Get: уникальные и одинаковые контенты, счётчики ссылок
-// сходятся. Прогон с -race — в ручной проверке (make test не включает).
+// TestPackConcurrent — concurrent Puts (the write-position/rotation mutex)
+// and parallel Gets: unique and identical contents, the reference counters
+// converge. The -race run is in the manual check (make test does not include
+// it).
 func TestPackConcurrent(t *testing.T) {
 	st, pool := newPackTestStore(t, func(o *PackOptions) { o.PackSize = 8 << 10 })
 	ctx := context.Background()
@@ -975,8 +985,8 @@ func TestPackConcurrent(t *testing.T) {
 	}
 }
 
-// TestPackClosed — запись после Close запрещена, чтение работает
-// (паки открываются на чтение независимо).
+// TestPackClosed — writing after Close is forbidden, reading works
+// (packs are opened for reading independently).
 func TestPackClosed(t *testing.T) {
 	st, _ := newPackTestStore(t, nil)
 	ctx := context.Background()
@@ -995,18 +1005,18 @@ func TestPackClosed(t *testing.T) {
 	}
 }
 
-// TestPackStaleCacheSyncsToNewest — гранулярность mtime ФС: пак,
-// созданный другим процессом в пределах той же единицы mtime, не должен
-// остаться незамеченным — кэш реестра обязан перепроверяться, допись
-// идёт в новейший пак (инвариант T-042/T-045).
+// TestPackStaleCacheSyncsToNewest — the FS mtime granularity: a pack created
+// by another process within the same mtime unit must not go unnoticed — the
+// registry cache must re-check, the append goes to the newest pack (the
+// T-042/T-045 invariant).
 func TestPackStaleCacheSyncsToNewest(t *testing.T) {
 	st, pool := newPackTestStore(t, func(o *PackOptions) { o.PackSize = 1 << 20 })
 	ctx := context.Background()
 	if _, err := st.Put(ctx, []byte("контент до появления нового пака")); err != nil {
 		t.Fatal(err)
 	}
-	// Второй Put перечитывает каталог (создание пака сменило mtime) —
-	// кэш фиксирует maxID 1.
+	// The second Put re-reads the directory (the pack creation changed the
+	// mtime) — the cache records maxID 1.
 	if _, err := st.Put(ctx, []byte("контент для прогрева кэша")); err != nil {
 		t.Fatal(err)
 	}
@@ -1014,8 +1024,8 @@ func TestPackStaleCacheSyncsToNewest(t *testing.T) {
 		t.Fatalf("кэш реестра после Put: %+v", st.dirCache)
 	}
 
-	// «Другой процесс» создал пак 2 в пределах гранулярности mtime:
-	// каталог восстанавливает прежнее время — кэш выглядит свежим.
+	// "Another process" created pack 2 within the mtime granularity:
+	// the directory restores its previous time — the cache looks fresh.
 	mt := st.dirCache.modTime
 	compactCraftPack(t, st.opts.Dir, 2, nil)
 	if err := os.Chtimes(st.opts.Dir, mt, mt); err != nil {
@@ -1034,13 +1044,14 @@ func TestPackStaleCacheSyncsToNewest(t *testing.T) {
 	}
 }
 
-// TestPackCreatePackClosesOnSize — несовместимое содержимое при создании
-// пака: ошибка, и открытый файл не утекает (fd закрыт — повторяющаяся
-// ротация по устаревшему кэшу не выест дескрипторы до EMFILE).
+// TestPackCreatePackClosesOnSize — incompatible contents when creating a
+// pack: an error, and the open file does not leak (the fd is closed —
+// repeated rotation over a stale cache must not eat descriptors up to
+// EMFILE).
 func TestPackCreatePackClosesOnSize(t *testing.T) {
 	st, _ := newPackTestStore(t, func(o *PackOptions) { o.PackSize = 1 << 20 })
-	// Пак 2 уже существует с содержимым сверх заголовка — createPackLocked
-	// обязан отказаться и закрыть открытый файл.
+	// Pack 2 already exists with contents beyond the header —
+	// createPackLocked must refuse and close the open file.
 	compactCraftPack(t, st.opts.Dir, 2, [][]byte{bytes.Repeat([]byte("x"), 32)})
 
 	openPacks := func() int {
@@ -1071,7 +1082,7 @@ func TestPackCreatePackClosesOnSize(t *testing.T) {
 	}
 }
 
-// TestPackOpenValidation — параметры конструктора.
+// TestPackOpenValidation — constructor parameters.
 func TestPackOpenValidation(t *testing.T) {
 	pool := newPackFakePool()
 	if _, err := OpenPackStore(nil, PackOptions{Dir: t.TempDir()}); err == nil {
@@ -1087,12 +1098,13 @@ func TestPackOpenValidation(t *testing.T) {
 	if _, err := OpenPackStore(pool, PackOptions{Dir: dir, MaxStoreBytes: -1}); err == nil {
 		t.Error("отрицательный max_store_bytes: ожидалась ошибка")
 	}
-	// Нулевой pack_size — DefaultPackSize, каталог и замок создаются.
+	// A zero pack_size means DefaultPackSize; the directory and the lock are
+	// created.
 	st, err := OpenPackStore(pool, PackOptions{Dir: dir})
 	if err != nil {
 		t.Fatalf("нули в опциях: %v", err)
 	}
-	defer st.Close() //nolint:errcheck // тест закрывает при очистке
+	defer st.Close() //nolint:errcheck // the test closes the store in cleanup
 	if st.opts.PackSize != DefaultPackSize {
 		t.Errorf("pack_size по умолчанию = %d, want %d", st.opts.PackSize, DefaultPackSize)
 	}
@@ -1101,16 +1113,16 @@ func TestPackOpenValidation(t *testing.T) {
 	}
 }
 
-// TestPackReadOnly — читатель без записи (crawlerctl domain --content):
-// открытие не создаёт каталог и файл блокировки, отсутствующий каталог —
-// ошибка; Put/Delete/beginAppend отказывают, Get читает существующий
-// контент, Close работает без замка.
+// TestPackReadOnly — a reader without writes (crawlerctl domain --content):
+// opening creates neither a directory nor a lock file, a missing directory is
+// an error; Put/Delete/beginAppend refuse, Get reads the existing
+// content, Close works without the lock.
 func TestPackReadOnly(t *testing.T) {
 	pool := newPackFakePool()
 	ctx := context.Background()
 
-	// Каталога нет — ошибка, и он не создаётся (опечатка в content.dir
-	// не должна молча выглядеть пустым хранилищем).
+	// No directory — an error, and it is not created (a typo in content.dir
+	// must not silently look like an empty store).
 	missing := filepath.Join(t.TempDir(), "missing")
 	if _, err := OpenPackStore(pool, PackOptions{Dir: missing, ReadOnly: true}); err == nil {
 		t.Fatal("ReadOnly на отсутствующем каталоге: ожидалась ошибка")
@@ -1119,8 +1131,8 @@ func TestPackReadOnly(t *testing.T) {
 		t.Errorf("ReadOnly не должен создавать каталог: %v", err)
 	}
 
-	// Пустой существующий каталог — открытие и закрытие читателя не
-	// оставляют следов (ни замка, ни паков).
+	// An empty existing directory — the reader's open and close leave no
+	// traces (neither a lock nor packs).
 	clean := t.TempDir()
 	roClean, err := OpenPackStore(pool, PackOptions{Dir: clean, ReadOnly: true})
 	if err != nil {
@@ -1133,8 +1145,8 @@ func TestPackReadOnly(t *testing.T) {
 		t.Errorf("читатель не создаёт файл блокировки: %v", err)
 	}
 
-	// Наполнение обычным хранилищем (замок и пак на месте) — чтение
-	// читателем без записи.
+	// Filling via a regular store (the lock and the pack in place) — reading
+	// by the reader without writes.
 	dir := t.TempDir()
 	wr, err := OpenPackStore(pool, PackOptions{Dir: dir, PackSize: 1 << 20, MaxStoreBytes: 1 << 20})
 	if err != nil {
@@ -1169,18 +1181,19 @@ func TestPackReadOnly(t *testing.T) {
 	if _, err := ro.beginAppend(); !errors.Is(err, errReadOnly) {
 		t.Errorf("beginAppend читателем: err = %v, want errReadOnly", err)
 	}
-	if err := ro.Close(); err != nil { // Close без замка не падает
+	if err := ro.Close(); err != nil { // Close without the lock does not fail
 		t.Errorf("Close читателем: %v", err)
 	}
 }
 
-// TestParsePackHeaderHdrLen — заголовок будущей версии (hdrLen больше
-// полей v1) читается: v1 берёт первые 23 байта и не отвергает расширение
-// (документированная совместимость вперёд); укороченный hdrLen — порча.
+// TestParsePackHeaderHdrLen — a header of a future version (hdrLen larger
+// than the v1 fields) is read: v1 takes the first 23 bytes and does not
+// reject the extension (documented forward compatibility); a shortened
+// hdrLen is corruption.
 func TestParsePackHeaderHdrLen(t *testing.T) {
 	future := packHeader{id: 7, maxSize: 1 << 20, dictID: 0xABCD}
 	b := future.bytes()
-	// hdrLen = 40: поля v1 читаются, расширение игнорируется.
+	// hdrLen = 40: the v1 fields are read, the extension is ignored.
 	binary.LittleEndian.PutUint16(b[5:7], 40)
 	hdr, err := parsePackHeader(b)
 	if err != nil {
@@ -1189,17 +1202,17 @@ func TestParsePackHeaderHdrLen(t *testing.T) {
 	if hdr.id != 7 || hdr.maxSize != 1<<20 || hdr.dictID != 0xABCD {
 		t.Errorf("поля v1 искажены: %+v", hdr)
 	}
-	// hdrLen меньше обязательных полей — нечитаем.
+	// An hdrLen smaller than the mandatory fields — unreadable.
 	binary.LittleEndian.PutUint16(b[5:7], packHeaderLen-4)
 	if _, err := parsePackHeader(b); err == nil {
 		t.Error("укороченный hdrLen принят")
 	}
 }
 
-// TestPackIDFromNameCanonical — реестр паков принимает только
-// канонические имена pack-NNNNNN.pack (C-16): имя без паддинга — чужой
-// файл, а не второй файл того же pack_id; длинные id (≥ 7 цифр)
-// каноничны — packFileName не усекает разряды.
+// TestPackIDFromNameCanonical — the pack registry accepts only the canonical
+// names pack-NNNNNN.pack (C-16): a name without padding is a foreign
+// file, not a second file of the same pack_id; long ids (≥ 7 digits)
+// are canonical — packFileName does not truncate digits.
 func TestPackIDFromNameCanonical(t *testing.T) {
 	for _, ok := range []struct {
 		name string
@@ -1207,16 +1220,16 @@ func TestPackIDFromNameCanonical(t *testing.T) {
 	}{
 		{"pack-000001.pack", 1},
 		{"pack-123456.pack", 123456},
-		{"pack-1000000.pack", 1000000}, // 7 цифр: %06d не усекает
+		{"pack-1000000.pack", 1000000}, // 7 digits: %06d does not truncate
 	} {
 		if id, valid := packIDFromName(ok.name); !valid || id != ok.id {
 			t.Errorf("packIDFromName(%q) = %d, %v; want %d, true", ok.name, id, valid, ok.id)
 		}
 	}
 	for _, bad := range []string{
-		"pack-1.pack",       // без паддинга
-		"pack-0001.pack",    // короткий паддинг
-		"pack-0000001.pack", // длинный паддинг
+		"pack-1.pack",       // no padding
+		"pack-0001.pack",    // short padding
+		"pack-0000001.pack", // long padding
 		"pack-000001.pack.bak",
 		"dict.zst",
 		".packs.lock",
@@ -1227,9 +1240,10 @@ func TestPackIDFromNameCanonical(t *testing.T) {
 	}
 }
 
-// TestPackReadBlockBounds — readPackBlock сверяет размещение с файлом до
-// аллокации (C-14): повреждённая строка (len до 2 ГиБ или отрицательный,
-// смещение мимо файла) — ошибка, а не гигантский буфер и не паника.
+// TestPackReadBlockBounds — readPackBlock checks the placement against the
+// file before the allocation (C-14): a corrupted row (a len of up to 2 GiB or
+// negative, an offset past the file) is an error, not a giant buffer and not
+// a panic.
 func TestPackReadBlockBounds(t *testing.T) {
 	dir := t.TempDir()
 	compactCraftPack(t, dir, 1, [][]byte{bytes.Repeat([]byte("block"), 8)})
@@ -1249,15 +1263,15 @@ func TestPackReadBlockBounds(t *testing.T) {
 			t.Errorf("%s: readPackBlock принял (%d, %d)", tc.name, tc.off, tc.clen)
 		}
 	}
-	// Живое размещение читается как раньше.
+	// A live placement is read as before.
 	block, err := readPackBlock(dir, 1, packHeaderLen+4, 40)
 	if err != nil || len(block) != 40 {
 		t.Errorf("чтение целого блока: %v, длина %d", err, len(block))
 	}
 }
 
-// TestPackWriteErrENOSPC — кончившееся место на диске — ErrStoreFull
-// (ТЗ 8); исходная ошибка остаётся доступной errors.Is.
+// TestPackWriteErrENOSPC — out of disk space is ErrStoreFull
+// (spec 8); the original error stays available to errors.Is.
 func TestPackWriteErrENOSPC(t *testing.T) {
 	diskFull := &os.PathError{Op: "write", Path: "pack-000001.pack", Err: syscall.ENOSPC}
 	err := wrapPackWriteErr(diskFull, 1)
