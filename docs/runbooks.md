@@ -1,376 +1,412 @@
-# Процедурные инструкции (runbooks)
+# Operational runbooks
 
-Пошаговые инструкции для оператора: переобучение словаря сжатия,
-разбор очереди мёртвых задач `q:dead`, переанализ результатов по новым
-правилам, разбор отказа резолвера DNS, разовая очистка накопленного
-контента и трима jsonb (кампания T-167), ручные операции с битом
-`render_pending` (счётчик рендер-долга T-175), дрейф инкрементальных
-счётчиков (T-178), окно сворачивания зон `crawlerctl zones collapse`
-(переход на TLD-семантику зоны), рост счётчика страховки queued без
-queued_at (T-255). Общая эксплуатация
-(запуск, логи, метрики, обновление) — [`operations.md`](operations.md);
-справочник CLI — [`dev-environment.md`](dev-environment.md) §6.
+Step-by-step instructions for the operator: retraining the compression
+dictionary, triage of the `q:dead` dead-letter queue, re-analysis of
+results under new rules, triage of a DNS resolver failure, a one-off
+cleanup of accumulated content and the jsonb trim (the T-167 campaign),
+manual operations on the `render_pending` bit (the T-175 render-debt
+counter), drift of incremental counters (T-178), the zone collapse
+window `crawlerctl zones collapse` (the switch to TLD zone semantics),
+growth of the queued-without-queued_at guard counter (T-255). General
+operations (startup, logs, metrics, updates) —
+[`operations.md`](operations.md); the CLI reference —
+[`dev-environment.md`](dev-environment.md) §6.
 
-## 1. Переобучение словаря сжатия zstd
+## 1. Retraining the zstd compression dictionary
 
-Сжатие маленьких HTML-страниц (парковки, заглушки хостингов) заметно
-выгоднее с обученным словарём: типовой шаблон кодируется один раз
-(ТЗ 5.7; механика — [`content.md`](content.md), параметры —
-[`configuration.md`](configuration.md), секция `content`).
+Compressing small HTML pages (parking pages, hosting stubs) is markedly
+more efficient with a trained dictionary: the typical template is
+encoded once (spec 5.7; mechanics — [`content.md`](content.md),
+parameters — [`configuration.md`](configuration.md), the `content`
+section).
 
-**Когда переобучать.** Лучшее время — **до начала массовой загрузки
-контента** (пустое хранилище): все паки сжимаются одним словарём.
-Переобучение на живом хранилище читаемость старых паков не портит —
-реестр прежних словарей, шаг 5.
+**When to retrain.** The best time is **before bulk content loading
+starts** (an empty store): all packs are compressed with one
+dictionary. Retraining on a live store does not harm the readability of
+old packs — the previous-dictionary registry, step 5.
 
-### Шаги
+### Steps
 
-1. **Собрать образцы** — HTML-страницы (`*.html`/`*.htm`), типичные для
-   вашей нагрузки: один-два каталога, обход рекурсивный. Стартовый набор —
-   `testdata/laravel-samples`; корпус читается до 64 МиБ (лимит
-   обучения), больше не нужно.
-2. **Обучить словарь** — `crawlerctl dict train <выходной-файл>
-   [--samples ПУТЬ]…` (флаг повторяется):
+1. **Collect samples** — HTML pages (`*.html`/`*.htm`) typical of your
+   workload: one or two directories, a recursive crawl. The starter set
+   is `testdata/laravel-samples`; the corpus is read up to 64 MiB (the
+   training limit), no more is needed.
+2. **Train the dictionary** — `crawlerctl dict train <output-file>
+   [--samples PATH]…` (the flag repeats):
 
    ```bash
-   # dev-окружение (словарь — в каталог данных, смонтированный в сервисы)
+   # dev environment (the dictionary goes into the data directory
+   # mounted into the services)
    docker compose --project-directory . -f deploy/docker/compose.yaml \
        run --rm -v "$(pwd)/var/content:/out" tools \
        go run ./cmd/crawlerctl dict train /out/dict.zst \
        --samples testdata/laravel-samples
 
-   # боевой сервер
+   # production server
    /opt/crawler/bin/crawlerctl dict train \
        /var/lib/crawler/content/dict.zst --samples /opt/crawler/samples
    ```
 
-   Команда печатает число образцов, размер корпуса, ID словаря и оценку
-   сжатия корпуса («без словаря / со словарём» — ориентир, реальный
-   эффект измеряется на новых страницах того же шаблона). Файл
-   записывается атомарно (временный файл + rename) — «наполовину
-   записанного» словаря не бывает. Переобучение — тот же запуск
-   команды: файл перезаписывается, ID словаря меняется (детерминированная
-   функция содержимого), а **прежний словарь автоматически архивируется
-   в реестр прежних словарей** (T-103): файл `dict-<id>.zstd` (id — ID
-   прежнего словаря) в каталоге нового; команда печатает путь архива.
-   Сбоя архивации не бывает молчаливым — команда падает до записи
-   нового файла, прежний остаётся активным.
-3. **Подключить** — путь уже задан конфигурацией
-   `content.zstd_dictionary` (dev: `var/content/dict.zst`; бой:
-   `/var/lib/crawler/content/dict.zst`) и он же задаёт каталог реестра
-   прежних словарей. Отсутствующий файл — не ошибка: контент сжимается
-   без словаря (запись в логе при старте), реестр остаётся подключён.
-4. **Перезапустить сервисы хранилища** — словарь читается при старте
-   процесса: http-worker, render-worker (пишут паки), analyzer и
-   `crawlerctl domain --content` (читают):
+   The command prints the sample count, the corpus size, the dictionary
+   ID, and the corpus compression estimate ("without dictionary / with
+   dictionary" — a reference point; the real effect is measured on new
+   pages of the same template). The file is written atomically (a temp
+   file + rename) — a half-written dictionary is impossible. Retraining
+   is the same command run again: the file is overwritten, the
+   dictionary ID changes (a deterministic function of the content), and
+   **the previous dictionary is automatically archived into the
+   previous-dictionary registry** (T-103): the file `dict-<id>.zstd`
+   (id — the previous dictionary's ID) next to the new one; the command
+   prints the archive path. An archiving failure is never silent — the
+   command fails before writing the new file, and the previous
+   dictionary stays active.
+3. **Hook it up** — the path is already set by the
+   `content.zstd_dictionary` configuration (dev: `var/content/dict.zst`;
+   production: `/var/lib/crawler/content/dict.zst`), and it also sets
+   the previous-dictionary registry directory. A missing file is not an
+   error: content is compressed without a dictionary (a log entry at
+   startup), and the registry stays connected.
+4. **Restart the storage services** — the dictionary is read at process
+   start: http-worker, render-worker (they write packs), analyzer, and
+   `crawlerctl domain --content` (they read):
 
    ```bash
    systemctl restart crawler-http-worker crawler-render-worker crawler-analyzer
-   # проверка: в логе «словарь zstd загружен» с тем же ID, что напечатал dict train
-   journalctl -t crawler-http-worker | grep словарь
+   # check: the log line "zstd dictionary loaded" with the same ID that
+   # dict train printed
+   journalctl -t crawler-http-worker | grep dictionary
    ```
 
-   В dev — `make up` (контейнер tools и сервисы видят один bind-mount
-   `var/content`).
-5. **Реестр прежних словарей — читаемость старых паков.** Кадр zstd
-   несёт ID словаря в заголовке; при чтении блока с незнакомым процессу
-   ID словарь лениво до-регистрируется из реестра (`dict-<id>.zstd` в
-   каталоге `content.zstd_dictionary`) и memoизируется: **переобучение
-   не делает записанный контент нечитаемым** — старые паки читаются
-   прежним словарём из реестра, новые пишутся новым активным. Реестр не
-   требует рестарта при пополнении: файл, положенный в каталог на живом
-   сервисе, подхватывается следующим чтением.
+   In dev — `make up` (the tools container and the services see one
+   bind-mount of `var/content`).
+5. **The previous-dictionary registry — readability of old packs.** A
+   zstd frame carries the dictionary ID in its header; when reading a
+   block whose ID is unknown to the process, the dictionary is lazily
+   registered from the registry (`dict-<id>.zstd` in the
+   `content.zstd_dictionary` directory) and memoized: **retraining does
+   not make recorded content unreadable** — old packs are read with
+   their previous dictionary from the registry, new ones are written
+   with the new active one. The registry needs no restart when refilled:
+   a file dropped into the directory on a live service is picked up on
+   the next read.
 
-   Читаемость теряется только если файла прежнего словаря в реестре
-   нет (обучен до T-103 и файл заменён, файл удалён вручную):
-   `Get` отвечает ошибкой «словарь … отсутствует в реестре», при старте
-   сервисы показывают Warn (`WarnDictMismatch`; словарь в реестре —
-   Info). Восстановление — вернуть файл `dict-<id>.zstd` из резервной
-   копии или переобучить на прежнем корпусе образцов (детерминизм
-   даёт тот же ID). Место: ~100 КБ на словарь, вручную не критично;
-   удалять архив можно лишь когда паков, сжатых этим словарём, больше
-   нет (механика — [`content.md`](content.md) «Словарь и реестр прежних
-   словарей»).
-6. **Проверить эффект** — размер записей новых паков (каталог
-   `content.dir`) и лог; ручная проверка чтения —
-   `crawlerctl domain --content <домен с недавней проверкой>`.
+   Readability is lost only if the previous dictionary's file is absent
+   from the registry (trained before T-103 and the file was replaced,
+   or the file was deleted by hand): `Get` answers with the error
+   "dictionary … is missing from the registry", and at startup the
+   services show a Warn (`WarnDictMismatch`; a dictionary present in
+   the registry — Info). Recovery — restore the `dict-<id>.zstd` file
+   from a backup or retrain on the same sample corpus (determinism
+   gives the same ID). Space: ~100 KB per dictionary — not critical by
+   hand; the archive may be deleted only when no packs compressed with
+   that dictionary remain (mechanics — [`content.md`](content.md)
+   "Dictionary and the previous-dictionary registry").
+6. **Check the effect** — the size of new pack records (the
+   `content.dir` directory) and the log; a manual read check —
+   `crawlerctl domain --content <a domain with a recent check>`.
 
-Команда без БД и Redis — работает на остановленном стеке.
+The command needs no database or Redis — it works with the stack
+stopped.
 
-## 2. Разбор очереди мёртвых задач q:dead
+## 2. Triage of the q:dead dead-letter queue
 
-`q:dead` — стрим задач, исчерпавших число доставок
-(`redis.max_attempts`, по умолчанию 3): запись, неоднократно прочитанная
-группой и не подтверждённая (XACK ставится только после записи
-результата в БД), при возврате зависших клеймом `XAUTOCLAIM`
-публикуется в `q:dead` и подтверждается в исходном стриме (ТЗ 4.2,
-T-025). Очередь не имеет потребителя — разбор ручной.
+`q:dead` is a stream of tasks that exhausted their delivery count
+(`redis.max_attempts`, 3 by default): an entry read by the group
+multiple times and never acknowledged (XACK is set only after the
+result is recorded into the database), when claimed back from a hang
+via `XAUTOCLAIM`, is published to `q:dead` and acknowledged in the
+source stream (spec 4.2, T-025). The queue has no consumer — triage is
+manual.
 
-**Важно про самовосстановление:** клейм `XAUTOCLAIM` встроен в каждый
-воркер (RecoverLoop, T-025) — запись, зависшая в pending после краха
-воркера или ядовитой ошибки, возвращается в работу, а исчерпавшая
-попытки уходит в `q:dead`. Lease-проход планировщика (T-029) при этом
-восстанавливает только задачи `q:dns` (домен в `queued`): для
-остальных этапов домен уже `done`, повторная доставка — обязанность
-клейма. Рост `q:dead` в сводке — сигнал разобраться, не авария:
-единичные записи — след задач, валидно опубликованных, но стабильно
-падающих в обработке (см. типовые причины ниже); сообщения вне форматов
-пакета (без `task_id`) тоже уходят сюда — с синтетическим
-идентификатором `unknown:<стрим>:<entry_id>` и без предметных полей
-(T-260: до него крутились в pending вечным циклом клейма), их поток
-считает `crawler_queue_dead_unidentified_total`; массовый рост —
-симптом отвала БД, зависания этапа или OOM Redis (§2.6).
+**Important note on self-healing:** the `XAUTOCLAIM` claim is built
+into every worker (RecoverLoop, T-025) — an entry stuck in pending
+after a worker crash or a poison error returns to work, and one that
+exhausted its attempts goes to `q:dead`. The scheduler's lease pass
+(T-029) recovers only `q:dns` tasks (the domain in `queued`): for the
+other stages the domain is already `done`, and redelivery is the
+claim's job. Growth of `q:dead` in the summary is a signal to
+investigate, not an outage: isolated entries are traces of tasks that
+were published validly but keep failing in processing (see the typical
+causes below); messages outside the package formats (without
+`task_id`) also end up here — with the synthetic identifier
+`unknown:<stream>:<entry_id>` and without entity fields
+(T-260: before it they spun in pending in an endless claim loop), their
+flow is counted by `crawler_queue_dead_unidentified_total`; mass growth
+is a symptom of a database outage, a stuck stage, or Redis OOM (§2.6).
 
-**Повтор пачки `q:dns` и бит `http_published` (T-108):** повторная
-доставка пачки (клейм или очередь) обрабатывает только недоработанные
-домены (`check_state <> done`), а домены, чья задача `q:http` уже была
-опубликована, распознаются по биту `http_published` в `domains.flags` —
-воркер доводит их до записи результата без повторной публикации
-(дубль `q:http` — полная повторная HTTP-проверка — не создаётся).
-Бит живёт только внутри эпизода: снимается записью результата
-(`done`) и постановкой планировщика (`pending → queued` — включая
-возврат lease, воскрешение и перепроверку). Для оператора: домен
-в `queued` с битом `http_published` — нормальное промежуточное
-состояние «опубликовано, записывается»; бит на `done`-строке —
-косметический след сбоя, гасится ближайшей постановкой, чистить руками
-не нужно. Увидеть бит: `SELECT label, flags FROM domains WHERE
-flags & 4 <> 0;` (значение 4).
+**q:dns batch retry and the `http_published` bit (T-108):** a batch
+redelivery (claim or queue) processes only unfinished domains
+(`check_state <> done`), and domains whose `q:http` task has already
+been published are recognized by the `http_published` bit in
+`domains.flags` — the worker carries them through to result recording
+without republishing (a duplicate `q:http` — a full repeat HTTP check —
+is not created). The bit lives only within an episode: it is cleared by
+result recording (`done`) and by a scheduler enqueue
+(`pending → queued` — including a lease return, resurrection, and a
+recheck). For the operator: a domain in `queued` with the
+`http_published` bit is a normal intermediate state "published, being
+recorded"; the bit on a `done` row is a cosmetic residue of a failure,
+cleared by the next enqueue — no manual cleanup needed. To see the bit:
+`SELECT label, flags FROM domains WHERE
+flags & 4 <> 0;` (the value 4).
 
-### 2.1. Посмотреть, что накопилось
+### 2.1. See what has accumulated
 
 ```bash
-# сводка оператора: строка q:dead
+# operator summary: the q:dead line
 crawlerctl status            # dev: make status
 
-# Redis напрямую (dev: make redis-cli)
-XLEN q:dead                  # глубина
-XINFO STREAM q:dead          # метаданные: length, first/last entry
-XRANGE q:dead - + COUNT 10   # первые 10 записей
-XREVRANGE q:dead + - COUNT 10 # свежие
+# Redis directly (dev: make redis-cli)
+XLEN q:dead                  # depth
+XINFO STREAM q:dead          # metadata: length, first/last entry
+XRANGE q:dead - + COUNT 10   # the first 10 entries
+XREVRANGE q:dead + - COUNT 10 # the newest entries
 ```
 
-Формат записи (`internal/queue`, конверт `data`): идентификаторы задачи
-и предмета, без payload исходного сообщения (T-105 — байтовая защита,
-см. [`redis.md`](redis.md) §3):
+Entry format (`internal/queue`, the `data` envelope): the task and
+entity identifiers, without the original message payload (T-105 —
+byte-level protection, see [`redis.md`](redis.md) §3):
 
 ```json
 {"task_id": "9f2b…", "stream": "q:http", "entry_id": "1770…-0",
- "attempts": 4, "reason": "исчерпан лимит попыток 3: доставок без подтверждения — 4",
+ "attempts": 4, "reason": "attempt limit 3 exhausted: 4 deliveries without ack",
  "zone_id": 3, "domain_id": 42, "name": "example.com"}
 ```
 
-- `stream` — источник: `q:dns` (пачка доменов), `q:http` (домен),
-  `q:render`/`q:analyze` (ключ строки `subdomain_results`);
-- идентификаторы предмета: `name`/`zone_id`/`domain_id` — домен штучной
-  задачи; для `q:render`/`q:analyze` ключ строки дополняют `subdomain_id`
-  и `variant` (опущен — 0, основной); для `q:dns` вместо списка доменов —
-  `domains` (размер пачки): список не хранится — до ~250 КБ на пачку
-  при потолке 10 000 записей давал worst-case ~2,5 ГБ против бюджета
-  Redis 0,5 ГБ; сами домены пачки переиздаст lease-проход (см. §2.3);
-- `task_id` вида `unknown:<стрим>:<entry_id>` — синтетический
-  идентификатор записи без `task_id` (T-260): тело вне форматов пакета,
-  предметных полей у такой записи нет — источник ищут по `entry_id`
-  (шаг 2 ниже: `XRANGE <stream> <entry_id> <entry_id>` покажет тело)
-  и по журналам вокруг времени записи; поток таких записей считает
-  `crawler_queue_dead_unidentified_total` (стационарно ноль — рост
-  означает публикацию мимо контракта пакета: ручной XADD либо баг
-  писателя);
-- payload исходного сообщения записи не несут (T-105); поле `payload`
-  встречается только в записях, перенесённых до T-105, — читается, но
-  новыми записями не публикуется;
-- MAXLEN стрима — 10 000 (история ограничена; записи без payload —
-  потолок ~2–3 МБ, см. docs/redis.md §3).
+- `stream` — the source: `q:dns` (a domain batch), `q:http` (a domain),
+  `q:render`/`q:analyze` (the `subdomain_results` row key);
+- entity identifiers: `name`/`zone_id`/`domain_id` — the domain of a
+  single-domain task; for `q:render`/`q:analyze` the row key is
+  extended with `subdomain_id` and `variant` (omitted — 0, the primary
+  one); for `q:dns`, `domains` (the batch size) instead of the domain
+  list: the list is not stored — up to ~250 KB per batch with the
+  10,000-entry cap would give a worst case of ~2.5 GB against the 0.5 GB
+  Redis budget; the batch's domains themselves are republished by the
+  lease pass (see §2.3);
+- a `task_id` of the form `unknown:<stream>:<entry_id>` — a synthetic
+  identifier for an entry without a `task_id` (T-260): a body outside
+  the package formats, such an entry has no entity fields — the source
+  is tracked down via `entry_id` (step 2 below:
+  `XRANGE <stream> <entry_id> <entry_id>` shows the body) and via the
+  journals around the entry's time; the flow of such entries is counted
+  by `crawler_queue_dead_unidentified_total` (zero in steady state —
+  growth means a publication outside the package contract: a manual
+  XADD or a writer bug);
+- entries carry no original message payload (T-105); a `payload` field
+  occurs only in entries migrated before T-105 — it is readable but no
+  longer published by new entries;
+- the stream MAXLEN is 10,000 (history is bounded; entries without
+  payload — a cap of ~2–3 MB, see docs/redis.md §3).
 
-### 2.2. Найти причину
+### 2.2. Find the cause
 
-1. Определите домен по `name`/`domain_id` записи — `crawlerctl domain
-   <имя>` покажет статус, результаты, ошибки проверки; для
-   `q:render`/`q:analyze` точная строка — ключ `(zone_id, domain_id,
-   subdomain_id, variant)`. Пачка `q:dns` имён в записи не несёт (только
-   размер): конкретные домены вернёт lease-проход, причина гибели пачки
-   видна в логах dns-worker вокруг времени записи.
-2. Само исходное сообщение иногда ещё читается: XACK не удаляет запись
-   из стрима-источника сразу, но подтверждённый префикс освобождает
-   цикл планировщика XTRIM MINID (T-141, до `redis.trim_interval` после
-   подтверждения), а `entry_id` есть в записи q:dead —
+1. Identify the domain from the entry's `name`/`domain_id` —
+   `crawlerctl domain <name>` shows the status, the results, and the
+   check errors; for `q:render`/`q:analyze` the exact row is keyed by
+   `(zone_id, domain_id, subdomain_id, variant)`. A `q:dns` batch
+   carries no names in the entry (only the size): the lease pass will
+   bring back the specific domains, and the cause of the batch's death
+   is visible in the dns-worker logs around the entry's time.
+2. The original message itself is sometimes still readable: XACK does
+   not remove the entry from the source stream immediately, but the
+   acknowledged prefix frees it for the scheduler's XTRIM MINID loop
+   (T-141, up to `redis.trim_interval` after acknowledgement), and
+   `entry_id` is present in the q:dead entry —
 
    ```bash
-   XRANGE <stream> <entry_id> <entry_id>   # полный payload задачи
+   XRANGE <stream> <entry_id> <entry_id>   # the task's full payload
    ```
 
-   (`stream` и `entry_id` — поля самой записи q:dead; после освобождения
-   записи стримом остаются логи воркера и lease-восстановление).
-3. Логи воркера соответствующего этапа вокруг времени зависания
-   (атрибут `service`): dev — `make logs SERVICE=http-worker`, бой —
-   `journalctl -t crawler-http-worker --since …`.
-4. Типовые постоянные причины (задача будет падать снова):
-   - DOM раздут JS сверх `content.max_store_bytes` (`ErrTooLarge`,
-     render) — поднять лимит конфигом;
-   - контент сжат словарём, чей файл утрачен из реестра прежних
-     (runbook 1, шаг 5) — верните файл `dict-<id>.zstd` в каталог
-     словаря, чтение восстановится без рестарта;
-   - сбой БД/хранилища — виден в логах шире (не только эта задача);
-   - таймаут страницы рендера (тарпит) до T-148 исчерпывал попытки
-     здесь; после T-148 такие записи финализируются без рендера
-     и в `q:dead` не попадают — накопившийся до фикса backlog
-     разбирает §2.5;
-   - постоянная ошибка сертификата хоста рендера
+   (`stream` and `entry_id` are fields of the q:dead entry itself;
+   once the stream has trimmed the entry away, what remains is the
+   worker logs and lease recovery).
+3. Logs of the worker of the corresponding stage around the hang time
+   (the `service` attribute): dev — `make logs SERVICE=http-worker`,
+   production — `journalctl -t crawler-http-worker --since …`.
+4. Typical permanent causes (the task will fail again):
+   - a DOM bloated by JS beyond `content.max_store_bytes`
+     (`ErrTooLarge`, render) — raise the limit via config;
+   - content compressed with a dictionary whose file is lost from the
+     previous-dictionary registry (runbook 1, step 5) — put the
+     `dict-<id>.zstd` file back into the dictionary directory; reads
+     recover without a restart;
+   - a database/storage failure — visible in logs more broadly (not
+     only this task);
+   - a render page timeout (tarpit) exhausted attempts here before
+     T-148; after T-148 such entries are finalized without render and
+     never reach `q:dead` — §2.5 covers the backlog accumulated before
+     the fix;
+   - a permanent render-host certificate error
      (`net::ERR_CERT_AUTHORITY_INVALID`/`ERR_CERT_COMMON_NAME_INVALID`,
-     с T-172 — и `net::ERR_CERT_DATE_INVALID`) до T-159 исчерпывала
-     попытки здесь же; после T-159 cert-класс финализируется без
-     рендера с первой доставки и в `q:dead` не попадает — накопившийся
-     до фикса backlog разбирает §2.5;
-   - ошибка рендера класса задачи (отказ соединения, load error) на
-     последней доставке до T-172 умирала здесь же (замер 23.10: 88%
-     первых неудач `ERR_CONNECTION_REFUSED` исчерпывали попытки);
-     после T-172 такие записи финализируются без рендера на последней
-     доставке и в `q:dead` не попадают — backlog разбирает §2.5.
+     plus `net::ERR_CERT_DATE_INVALID` since T-172) exhausted attempts
+     here before T-159; after T-159 the cert class is finalized without
+     render on the first delivery and never reaches `q:dead` — §2.5
+     covers the backlog accumulated before the fix;
+   - a task-class render error (connection refused, load error) on the
+     last delivery died here before T-172 (the 23.10 measurement: 88%
+     of first `ERR_CONNECTION_REFUSED` failures exhausted attempts);
+     after T-172 such entries are finalized without render on the last
+     delivery and never reach `q:dead` — §2.5 covers the backlog.
 
-### 2.3. Вернуть или выбросить
+### 2.3. Requeue or discard
 
-- **Возвращать вручную не нужно и не рекомендуется** (ручное
-  переиздание XADD-ом создаёт новую запись без истории попыток —
-  источник дублей, а не исправление):
-  - домены из задач `q:dns`/`q:http` восстанавливает lease-проход
-    планировщика: `queued` без результата старше `scheduler.lease`
-    (30 мин) возвращается в `pending` и проходит конвейер заново.
-    Важно: lease видит только `queued` — если DNS-результат уже
-    записан (`done`, статус ещё new), потерянная q:http lease-проходом
-    НЕ возвращается: строку возвращает компенсатор «статус повис»
-    T-270 (часовой проход, new∧done старше 24 ч — §2.10);
-  - SPA-записи (`q:render`) дорабатывает фоновый проход HTTP-этапа
-    (`render_pending`, раз в минуту);
-  - анализ (`q:analyze`) повторит часовой цикл переанализа
+- **Manual requeueing is unnecessary and not recommended** (manual
+  republishing via XADD creates a new entry without attempt history —
+  a source of duplicates, not a fix):
+  - domains from `q:dns`/`q:http` tasks are recovered by the
+    scheduler's lease pass: `queued` without a result older than
+    `scheduler.lease` (30 min) returns to `pending` and goes through
+    the pipeline again. Important: the lease pass only sees `queued` —
+    if the DNS result is already recorded (`done`, the status still
+    new), a lost q:http is NOT returned by the lease pass: the row is
+    recovered by the "stuck status" compensator T-270 (an hourly pass,
+    new∧done older than 24 h — §2.10);
+  - SPA entries (`q:render`) are finished by the HTTP stage's
+    background pass (`render_pending`, once a minute);
+  - analysis (`q:analyze`) is retried by the hourly re-analysis cycle
     (ReanalyzeLoop).
-  Точечный «вернуть домен» — `crawlerctl recheck <домен>` (переводит в
-  `pending`, дальше штатный конвейер).
-- **Выбросить** разобранные записи:
+  A point requeue of a single domain — `crawlerctl recheck <domain>`
+  (moves it to `pending`; the regular pipeline takes over).
+- **Discard** the triaged entries:
 
   ```bash
-  XDEL q:dead <entry_id>          # точечно
-  XTRIM q:dead MAXLEN 0           # всё (после разбора)
+  XDEL q:dead <entry_id>          # point-wise
+  XTRIM q:dead MAXLEN 0           # everything (after triage)
   ```
 
-  После обновления до версии, где записи q:dead перестали нести payload
-  (T-105), старые записи с payload можно единожды вычистить тем же
-  `XTRIM q:dead MAXLEN 0` после разбора — иначе они остаются в стриме
-  до вытеснения потолком 10 000 записей.
+  After upgrading to a version where q:dead entries no longer carry
+  payload (T-105), old payload-bearing entries can be flushed once with
+  the same `XTRIM q:dead MAXLEN 0` after triage — otherwise they stay
+  in the stream until evicted by the 10,000-entry cap.
 
-- Потеря/рестарт Redis очищает `q:dead` (персистентности нет) — это
-  штатный сценарий ([`redis.md`](redis.md) §5): задачи `queued`-доменов
-  не теряются, домены вернёт lease; недоставленная `q:http` при
-  записанном `done` возвращается компенсатором «статус повис» (§2.10).
+- Redis loss/restart clears `q:dead` (there is no persistence) — this
+  is the expected scenario ([`redis.md`](redis.md) §5): the tasks of
+  `queued` domains are not lost, the lease pass brings the domains
+  back; an undelivered `q:http` with a recorded `done` is returned by
+  the "stuck status" compensator (§2.10).
 
-### 2.4. Ядовитые строки доменов: статус invalid
+### 2.4. Poison domain rows: the invalid status
 
-Домен с пустым/пробельным именем в пачке `q:dns` (мусорная или
-порченая строка `domains`: ручные правки, повреждение БД — штатный
-ingest такие строки не пишет) получает терминальный диагноз
-`status = invalid` (T-109): `check_state = done`, lease завершён,
-Warn в логах dns-worker. Статус — не факт о домене, а диагностика
-«проверка невозможна»: перепроверка (T-030) и lease такие строки не
-возвращают, конвейер не циклит их бесконечно.
+A domain with an empty/whitespace name in a `q:dns` batch (a junk or
+corrupted `domains` row: manual edits, database corruption — the
+regular ingest never writes such rows) receives the terminal diagnosis
+`status = invalid` (T-109): `check_state = done`, the lease is
+completed, a Warn in the dns-worker logs. The status is not a fact
+about the domain but the diagnosis "checking is impossible": the
+recheck (T-030) and the lease pass do not return such rows, and the
+pipeline does not loop them endlessly.
 
-Найти:
+Find them:
 
 ```sql
 SELECT zone_id, id, label, last_checked_at
 FROM domains WHERE status = 7;        -- invalid
 ```
 
-Разбор ручной — два пути:
+Triage is manual — two paths:
 
-- **строка мусор** (битая навсегда): удалить её
-  `DELETE FROM domains WHERE zone_id = $1 AND id = $2;` — после этого
-  зона может стать пустой и уйти из сводки, это ожидаемо;
-- **имя исправимо** (опечатка в `label`): исправить
+- **the row is junk** (broken for good): delete it with
+  `DELETE FROM domains WHERE zone_id = $1 AND id = $2;` — the zone may
+  then become empty and drop out of the summary; this is expected;
+- **the name is fixable** (a typo in `label`): fix it with
   `UPDATE domains SET label = $1 WHERE zone_id = $2 AND id = $3;`
-  (уникальность `label` в зоне действует), затем вернуть в конвейер:
-  `UPDATE domains SET status = 0, check_state = 0 WHERE …;` — строка
-  пройдёт полный цикл заново.
+  (label uniqueness within a zone applies), then return it to the
+  pipeline: `UPDATE domains SET status = 0, check_state = 0 WHERE …;`
+  — the row goes through the full cycle again.
 
-Держать invalid-строки неопасно (из циклов исключены), но счётчик
-`crawler_domain_status_total{type="invalid"}` и gauge backlog их
-честно показывают — рост означает напортченные данные, а не сбой
-конвейера.
+Keeping invalid rows is harmless (they are excluded from the cycles),
+but the `crawler_domain_status_total{type="invalid"}` counter and the
+backlog gauge show them honestly — growth means corrupted data, not a
+pipeline failure.
 
-### 2.5. Массовый разбор записей q:render без рендера (после T-148/T-159)
+### 2.5. Bulk triage of q:render entries without render (after T-148/T-159)
 
-До T-148 таймаут страницы рендера жёг общий лимит доставок как случайная
-ошибка: тяжёлая SPA (не укладывается в `render.timeout` 25 с) исчерпывала
-`redis.max_attempts` 3 и уводилась в `q:dead` — работа выпадала из
-конвейера до ручного разбора. Инцидент 2026-10-23: 5507 записей за часы
-с reason «исчерпан лимит попыток 3»; первичная атрибуция «все — тарпиты
-q:render» опровергнута пост-мортемом (состав: 2786 `q:http`, 2685
-`q:render`, 36 пачек `q:dns`; корень — OOM-окно Redis, сигнатура и
-разбор — §2.6 и [`load-measurements.md`](load-measurements.md) §11.1).
-После деплоя T-148 новые тарпиты в `q:dead` не попадают (политика —
+Before T-148 a render page timeout burned the common delivery limit as
+a random error: a heavy SPA (not fitting into the 25 s `render.timeout`)
+exhausted `redis.max_attempts` 3 and was sent to `q:dead` — the work
+dropped out of the pipeline until manual triage. The 2026-10-23
+incident: 5507 entries over hours with the reason "attempt limit 3
+exhausted"; the initial attribution "all of them are q:render tarpits"
+was refuted by the post-mortem (composition: 2786 `q:http`, 2685
+`q:render`, 36 `q:dns` batches; the root — a Redis OOM window; the
+signature and the analysis — §2.6 and
+[`load-measurements.md`](load-measurements.md) §11.1). After the T-148
+deploy, new tarpits never reach `q:dead` (the policy —
 [`configuration.md`](configuration.md) §render, `render.timeout_attempts`),
-после T-159 — и cert-хосты: постоянная ошибка сертификата
-(`ERR_CERT_AUTHORITY_INVALID`/`ERR_CERT_COMMON_NAME_INVALID`, с T-172 —
-и `ERR_CERT_DATE_INVALID` по замеру: 0 успешных ретраев из 321 за сутки)
-финализируется без рендера с первой же доставки (свойство хоста, ретраи
-бессмысленны — [`render.md`](render.md), «Цикл очередей»), после T-211 —
-и DNS-мёртвые хосты (`ERR_NAME_NOT_RESOLVED`: запись попала в `q:render`
-через живой HTTP-эпизод, а имя перестало резолвиться — возврат DNS
-масштаба дней не покрывает окно ретраев, замер T-207), а после
-T-172 — и записи, чья последняя доставка упала ошибкой рендера класса
-задачи (отказ соединения, load error): до `redis.max_attempts` ошибка
-повторяема (восстановление хостов наблюдается — 6.6% ретраев
-`ERR_CONNECTION_REFUSED` успешны), на последней — запись финализируется
-без рендера, не уходит в `q:dead` (инцидент 23.10 21:20–21:31: волна
-459 смертей на смешанных сериях таймаут→refused). Тяжёлая страница,
-cert-хост и исчерпавший попытки хост оставляют итогом записи сырой HTML
-HTTP-фазы (запись уходит в `q:analyze`), `q:dead` растёт только от
-инфраструктурных ошибок (БД, хранилище, публикация, браузер).
+after T-159 — cert hosts too: a permanent certificate error
+(`ERR_CERT_AUTHORITY_INVALID`/`ERR_CERT_COMMON_NAME_INVALID`, plus
+`ERR_CERT_DATE_INVALID` since T-172; per the measurement: 0 successful
+retries out of 321 per day) is finalized without render on the first
+delivery (a host property, retries are pointless —
+[`render.md`](render.md), "Queue cycles"); after T-211 —
+DNS-dead hosts too (`ERR_NAME_NOT_RESOLVED`: the entry reached `q:render`
+through a live HTTP episode and the name stopped resolving — DNS
+recovery on a scale of days does not fit the retry window, the T-207
+measurement), and after
+T-172 — entries whose last delivery failed with a task-class render
+error (connection refused, load error): up to `redis.max_attempts` the
+error is repeatable (host recovery is observed — 6.6% of retries
+`ERR_CONNECTION_REFUSED` succeed), on the last one the entry is
+finalized without render and never reaches `q:dead` (the 23.10
+21:20–21:31 incident: a wave of 459 deaths on mixed timeout→refused
+series). A heavy page,
+cert host, and a host that exhausted attempts leave the raw HTML of
+the HTTP phase as the entry's outcome (the entry goes to
+`q:analyze`); `q:dead` grows only from
+infrastructure errors (database, storage, publishing, browser).
 
-Накопившиеся записи разбираются вручную, порядок:
+Accumulated entries are triaged manually, in this order:
 
-1. **Сначала деплой фикса** — возвращать записи до него бессмысленно:
-   тарпит снова исчерпал бы попытки и вернулся в `q:dead`.
-2. **Критерий requeue**: запись `q:render` с reason «исчерпан лимит
-   попыток» и таймаутами страницы в логах render-worker вокруг времени
-   гибели (`journalctl -t crawler-render-worker --since … |
-   grep "таймаут страницы"`) — странице дают ещё шанс: после T-148
-   стоимость повторного тарпита ограничена (`render.timeout_attempts` ×
-   25 с слотового времени на задачу), дальше запись финализируется без
-   рендера сама. То же после T-159 для cert-хостов (в логах —
+1. **Deploy the fix first** — requeueing entries before it is
+   pointless: the tarpit would exhaust attempts again and return to
+   `q:dead`.
+2. **Requeue criterion**: a `q:render` entry with the reason "attempt
+   limit exhausted" and page timeouts in the render-worker logs around
+   the time of death (`journalctl -t crawler-render-worker --since … |
+   grep "page timeout"`) — the page gets another chance: after T-148
+   the cost of a repeated tarpit is bounded (`render.timeout_attempts` ×
+   25 s of slot time per task); afterwards the entry finalizes itself
+   without render. The same after T-159 for cert hosts (in the logs —
    `page load error net::ERR_CERT_AUTHORITY_INVALID` /
-   `ERR_CERT_COMMON_NAME_INVALID` / с T-172 — `ERR_CERT_DATE_INVALID`):
-   повтор стоит одну попытку — сертификат не изменился, запись
-   финализируется без рендера сама; изменился — рендер пройдёт. То же
-   после T-172 для смертей с ошибками класса задачи на ранних
-   доставках (в логах — `net::ERR_CONNECTION_REFUSED` и другие
-   `net::ERR_*` без cert-кодов): хосту дали ретраи, после деплоя фикса
-   такая запись финализируется на последней доставке сама (до фикса
-   Mixed-серии до T-172 умирали). Записи с другой причиной (DOM сверх
-   `content.max_store_bytes`, сбои БД/Redis) разбираются по §2.2 и
-   скриптом не возвращаются.
-3. **Вернуть в q:render** — не XADD-ом вручную (§2.3), а флагом
-   `render_pending` (бит 1, значение 2): проход доработки HTTP-этапа
-   (каждую минуту, с проверкой ёмкости `q:render`) сам переиздаст
-   SPA-записи домена (детерминированный повторный вердикт по сохранённому
-   контенту: `rendered = false AND final_url IS NOT NULL AND
-   render_failed_at IS NULL`, T-210) и снимет флаг. Отмаркированные
-   `render_failed_at` записи (финализации T-148/T-159/T-172 уже признали
-   рендер невозможным до смены контента) проход НЕ переиздаст — флаг
-   снимется «черновым» снятием без публикаций; dead-записи инфраструктурных
-   ошибок штампа не имеют (финализации XACKают, в q:dead не попадают),
-   но смешанные домены и принудительный ре-рендер после починки хоста
-   требуют сброса маркера тем же списком доменов (T-210; оговорка: у
-   остаревших строк контент уже чистит retention — `content_hash` NULL,
-   проход их пропустит и без маркера, доработает только новый эпизод
-   `crawlerctl recheck`):
+   `ERR_CERT_COMMON_NAME_INVALID` / plus `ERR_CERT_DATE_INVALID` since
+   T-172): the retry costs one attempt — if the certificate did not
+   change, the entry finalizes itself without render; if it did, the
+   render goes through. The same
+   after T-172 for deaths with task-class errors on early
+   deliveries (in the logs — `net::ERR_CONNECTION_REFUSED` and other
+   `net::ERR_*` without cert codes): the host was given retries, and
+   after the fix deploy such an entry finalizes itself on the last
+   delivery (before the fix, mixed series died up to T-172). Entries
+   with a different cause (a DOM beyond
+   `content.max_store_bytes`, database/Redis failures) are triaged per
+   §2.2 and are not requeued by the script.
+3. **Requeue into q:render** — not via a manual XADD (§2.3) but via
+   the `render_pending` flag (bit 1, value 2): the HTTP stage's rework
+   pass (every minute, with a `q:render` capacity check) will itself
+   republish the domain's SPA entries (a deterministic second verdict
+   over the stored content: `rendered = false AND final_url IS NOT NULL AND
+   render_failed_at IS NULL`, T-210) and clear the flag. Entries
+   already marked `render_failed_at` (the T-148/T-159/T-172
+   finalizations have already declared render impossible until the
+   content changes) will NOT be republished by the pass — the flag is
+   cleared by a "blind" clearing without publications; dead entries of
+   infrastructure errors carry no stamp (finalizations XACK them; they
+   never reach q:dead), but mixed domains and a forced re-render after
+   a host fix require resetting the marker with the same domain list
+   (T-210; caveat: for aged-out rows the content is already cleaned by
+   retention — `content_hash` NULL,
+   the pass skips them even without the marker; only a new episode of
+   `crawlerctl recheck` reworks them):
 
    ```bash
-   # сброс маркера «рендер невозможен» по доменам dead-записей q:render
-   # (перед выставлением флага; RETURNING — контроль числа строк;
-   # zone_id IN — отсечение партиций subdomain_results, T-005)
+   # reset the "render impossible" marker for the domains of q:render
+   # dead entries (before setting the flag; RETURNING — a row-count
+   # check; zone_id IN — partition pruning of subdomain_results, T-005)
    PAIRS=$(redis-cli --raw XRANGE q:dead - + \
      | grep '^{' \
      | jq -r 'select(.stream == "q:render") | "(\(.zone_id),\(.domain_id))"' \
      | sort -u)
-   [ -n "$PAIRS" ] || echo "dead-записей q:render нет — сброс маркера пропущен"
+   [ -n "$PAIRS" ] || echo "no q:render dead entries — marker reset skipped"
    if [ -n "$PAIRS" ]; then
      ZONES=$(printf '%s\n' "$PAIRS" | tr -d '()' | cut -d, -f1 | sort -u | paste -sd,)
      printf '%s\n' "$PAIRS" \
@@ -381,13 +417,13 @@ HTTP-фазы (запись уходит в `q:analyze`), `q:dead` растёт 
    fi
    ```
 
-   Список доменов — из идентификаторов dead-записей. Флаг ставится
-   атомарно со счётчиком рендер-долга (инвариант §6: проход доработки
-   снимет бит с декрементом — установка без инкремента уводила бы
-   счётчик в минус):
+   The domain list comes from the dead entries' identifiers. The flag
+   is set atomically with the render-debt counter (the §6 invariant:
+   the rework pass clears the bit with a decrement — setting it without
+   an increment would drive the counter negative):
 
    ```bash
-   # SQL выставления флага render_pending (+счётчик) по всем q:render dead-записям
+   # SQL to set the render_pending flag (+counter) for all q:render dead entries
    redis-cli --raw XRANGE q:dead - + \
      | grep '^{' \
      | jq -r 'select(.stream == "q:render") | "(\(.zone_id),\(.domain_id))"' \
@@ -400,10 +436,11 @@ HTTP-фазы (запись уходит в `q:analyze`), `q:dead` растёт 
    psql "$CRAWLER_PG_DSN" -1 -f /tmp/opencode/requeue-render.sql
    ```
 
-   (типы значений в VALUES приводит сам PostgreSQL; `psql -1` — оба
-   оператора одной транзакцией; `UPDATE 0` у второго оператора — строки
-   счётчика нет, см. §6 симптом; dev — `make psql`; одиночный домен —
-   точечно, тем же инвариантом §6:
+   (PostgreSQL casts the VALUES types itself; `psql -1` — both
+   statements in one transaction; `UPDATE 0` from the second statement
+   means the counter row is missing, see the §6 symptom; dev —
+   `make psql`; a single domain — point-wise, with the same §6
+   invariant:
 
    ```sql
    WITH flagged AS (
@@ -416,12 +453,12 @@ HTTP-фазы (запись уходит в `q:analyze`), `q:dead` растёт 
    WHERE name = 'render_pending';
    ```
 
-   или полный новый эпизод `crawlerctl recheck <домен>`)
-4. **Финализировать без рендера** (альтернатива для записей, которым
-   рендер не нужен, или когда очередь разбирают без волны рендеров):
-   строки уже остались с сырым HTML (`rendered = false`), не хватает
-   только публикации `q:analyze` — конвейер доводится анализом сырого
-   HTML:
+   or a full new episode of `crawlerctl recheck <domain>`)
+4. **Finalize without render** (an alternative for entries that do not
+   need a render, or when the queue is triaged without a render wave):
+   the rows already hold raw HTML (`rendered = false`); only the
+   `q:analyze` publication is missing — the pipeline is completed by
+   analyzing the raw HTML:
 
    ```bash
    redis-cli --raw XRANGE q:dead - + \
@@ -432,89 +469,94 @@ HTTP-фазы (запись уходит в `q:analyze`), `q:dead` растёт 
            subdomain_id: .subdomain_id, variant: (.variant // 0),
            name: (.name // ""), fresh: true} | tostring)' \
      > /tmp/opencode/finalize-render.sh
-   # прогон порциями (контролируя глубину q:analyze; дубликаты анализа
-   # ограничены и идемпотентны — тот же контракт, что у повторных
-   # доставок рендера):
+   # run in portions (watching the q:analyze depth; analysis duplicates
+   # are bounded and idempotent — the same contract as repeated render
+   # deliveries):
    #   sh -x /tmp/opencode/finalize-render.sh
    ```
 
-5. **Выбросить разобранные записи** — как в §2.3 (`XDEL` точечно,
-   `XTRIM q:dead MAXLEN 0` после разбора всей партии).
+5. **Discard the triaged entries** — as in §2.3 (`XDEL` point-wise,
+   `XTRIM q:dead MAXLEN 0` after triaging the whole batch).
 
-Контроль после requeue: глубины `q:render`/`q:analyze` (сводка
-`crawlerctl status`), метрики `crawler_render_tarpit_finalized_total`,
+Post-requeue monitoring: the `q:render`/`q:analyze` depths (the
+`crawlerctl status` summary), the metrics
+`crawler_render_tarpit_finalized_total`,
 `crawler_render_cert_finalized_total`,
-`crawler_render_dns_finalized_total` и
-`crawler_render_task_finalized_total{reason}` (доля страниц, не
-отрендерившихся и после повтора, и состав причин) и рост `q:dead` —
-после деплоя T-148/T-159/T-211/T-172 он означает уже не тарпиты, не
-сертификаты, не DNS-мёртвые хосты и не ошибки класса задачи на
-последней попытке, а причины
-из §2.2 (массовый рост — сигнатура OOM Redis, §2.6).
+`crawler_render_dns_finalized_total`, and
+`crawler_render_task_finalized_total{reason}` (the share of pages that
+did not render even after the retry, and the breakdown of reasons),
+and the growth of `q:dead` — after the T-148/T-159/T-211/T-172 deploys
+it no longer means tarpits, certificates, DNS-dead hosts, or task-class
+errors on the last attempt, but the causes
+from §2.2 (mass growth is the Redis OOM signature, §2.6).
 
-### 2.6. Массовый рост q:dead при OOM Redis
+### 2.6. Mass q:dead growth under Redis OOM
 
-Разобранный образец — инцидент 22–23.10.2026: 5507 смертей при полностью
-исправной обработке (пост-мортем —
-[`load-measurements.md`](load-measurements.md) §11.1, работы —
-[`operations.md`](operations.md) §5 от 22–23.10).
-OOM-окно Redis (22.10 ≈16:00–18:15 MSK: легаси-пачки `q:dns` эпохи
-batch_size 5000 ≈620 МиБ при временно поднятом maxmemory 900 MiB,
-`noeviction` — [`redis.md`](redis.md) §4) отклоняло публикации
-результатов (`XADD: OOM command not allowed`: 16 953 отказа у
-http-worker, 1953 у render-worker, 392 у dns-worker, 243 у
-планировщика), а ошибка публикации обрабатывалась как ошибка самой
-задачи: доставка — без XACK, RecoverLoop клеймил её по кругу, попытки
-сгорали. Код-фиксы последствий — T-152 (OOM не сжигает попытки:
-  InfraError публикации — повторы XADD, пауза потребления воркеров и
-  гейт клейма пробой записи — `redis.md` §4.1), T-153
-(темп RecoverLoop: на момент инцидента 16 клейм/30 с ≈ 2,6 ч на обход
-PEL ~5К записей — смерти растягиваются на часы), T-154 (наблюдаемость
-смертей); сводка — load-measurements §11.1.
+Worked example — the 22–23.10.2026 incident: 5507 deaths with fully
+healthy processing (the post-mortem —
+[`load-measurements.md`](load-measurements.md) §11.1; the work log —
+[`operations.md`](operations.md) §5, 22–23.10).
+A Redis OOM window (22.10 ≈16:00–18:15 MSK: legacy `q:dns` batches of
+the batch_size 5000 era ≈620 MiB against a temporarily raised
+maxmemory of 900 MiB, `noeviction` — [`redis.md`](redis.md) §4)
+rejected result publications (`XADD: OOM command not allowed`: 16,953
+rejections from http-worker, 1,953 from render-worker, 392 from
+dns-worker, 243 from the scheduler), and the publication error was
+handled as an error of the task itself: delivery without XACK,
+RecoverLoop claimed it in a circle, attempts burned down. Code fixes
+of the consequences — T-152 (OOM does not burn attempts:
+  a publication InfraError — XADD retries, a worker consumption pause,
+  and a claim gate probing the entry — `redis.md` §4.1), T-153
+(the RecoverLoop pace: at the time of the incident 16 claims/30 s ≈
+2.6 h to walk a PEL of ~5K entries — deaths stretch over hours), T-154
+(death observability); summary — load-measurements §11.1.
 
-**Сигнатура** — отличает инфраструктурное событие от ядовитых задач
-(§2.2) и тарпитов рендера (§2.5):
+**The signature** — distinguishes an infrastructure event from poison
+tasks (§2.2) and render tarpits (§2.5):
 
-- reason у всех один — «исчерпан лимит попыток 3», но разброс `attempts`
-  4–11 с пиками на 9 и 11: сами переносы в `q:dead` падали об тот же
-  OOM, счётчик доставок рос до первого успешного XADD;
+- the reason is the same for all — "attempt limit 3 exhausted" — but
+  `attempts` ranges 4–11 with peaks at 9 and 11: the transfers into
+  `q:dead` themselves hit the same OOM, and the delivery counter kept
+  growing until the first successful XADD;
 
   ```bash
   redis-cli --raw XRANGE q:dead - + | grep '^{' \
     | jq -r .attempts | sort -n | uniq -c
   ```
 
-- **исходники опубликованы узким окном**: миллисекунды `entry_id` записи
-  `q:dead` — время публикации исходной задачи. Сравните гистограммы
-  публикации исходников и самих смертей: массы смертей, ведущие к
-  записям одного окна источника (в образце все исходники — 15:00–19:00
-  MSK, 2786 `q:http` — за один час), — инфраструктурное событие, а не
-  качество доменов; у тарпитов и ядовитых задач исходники размазаны
-  вместе с притоком;
+- **the originals were published in a narrow window**: the
+  milliseconds of a `q:dead` entry's `entry_id` are the publication
+  time of the original task. Compare the publication histograms of the
+  originals and of the deaths themselves: masses of deaths leading back
+  to entries from a single source window (in the example all originals
+  fall into 15:00–19:00 MSK, with the 2786 `q:http` inside one hour) —
+  an infrastructure event, not domain quality; for tarpits and poison
+  tasks the originals are spread out together with the inflow;
 
   ```bash
-  # минуты публикации исходников (entry_id записи q:dead)
+  # minutes of original publication (the q:dead entry's entry_id)
   redis-cli --raw XRANGE q:dead - + | grep '^{' \
     | jq -r '(.entry_id | split("-")[0] | tonumber / 1000 | floor)
              | strftime("%Y-%m-%d %H:%M")' | sort | uniq -c
-  # минуты смертей (собственные id записей q:dead)
+  # minutes of deaths (the q:dead entries' own ids)
   redis-cli --raw XRANGE q:dead - + | grep -E '^[0-9]+-[0-9]+$' \
     | cut -d- -f1 \
     | jq -Rr '(tonumber / 1000 | floor) | strftime("%Y-%m-%d %H:%M")' \
     | sort | uniq -c
   ```
 
-- смерти идут «волнами» часами после окна (в образце — 12 ч): RecoverLoop
-  механически дожигает ту же когорту PEL, новых ошибок обработки в логах
-  воркеров при этом нет.
+- deaths come in "waves" for hours after the window (12 h in the
+  example): RecoverLoop mechanically burns through the same PEL cohort,
+  and there are no new processing errors in the worker logs.
 
-**Диагностика причины:**
+**Diagnosing the cause:**
 
 ```bash
-# OOM-отказы публикации в журналах сервисов (бой; dev — make logs SERVICE=…)
+# OOM publication rejections in the service journals (production;
+# dev — make logs SERVICE=…)
 journalctl -t crawler-http-worker --since "2026-10-22 15:00" --until "2026-10-23 07:00" \
   | grep -c "OOM command not allowed"
-# то же по crawler-render-worker / crawler-dns-worker / crawler-scheduler
+# the same for crawler-render-worker / crawler-dns-worker / crawler-scheduler
 
 redis-cli INFO memory \
   | grep -E 'used_memory_human|maxmemory_human|maxmemory_policy'
@@ -522,20 +564,22 @@ redis-cli INFO memory \
 for s in q:dns q:http q:render q:analyze q:dead; do printf '%-9s ' "$s"; redis-cli XLEN "$s"; done
 ```
 
-**Рецепт:**
+**The remedy:**
 
-1. **Сначала убрать причину** — память Redis (в образце: дренаж
-   легаси-`q:dns` — `XTRIM q:dns MAXLEN 125` освободил 575 МиБ, Redis
-   683→104 МиБ, бюджеты 512 MiB/640 MiB возвращены, T-149). Пока OOM
-   жив, разбор бессмыслен: повторные публикации падают, смерти копятся.
-2. **Не requeue** — предметы возвращает сам конвейер (§2.3): домены
-   `q:dns`/`q:http` — lease-проход (`queued` без результата старше
-   `scheduler.lease` 30 мин → `pending`), SPA-записи `q:render` —
-   фоновый проход `render_pending` (раз в минуту), `q:analyze` —
-   часовой ReanalyzeLoop; флаг из §2.5 п. 3 не нужен — рендер тут
-   не виноват. Проверка перед выбросом — SQL по идентификаторам
-   dead-записей: преобладание `check_state=2` (done) подтверждает
-   «обработка прошла, умерла публикация»:
+1. **Remove the cause first** — Redis memory (in the example: draining
+   the legacy `q:dns` — `XTRIM q:dns MAXLEN 125` freed 575 MiB, Redis
+   683→104 MiB, the 512 MiB/640 MiB budgets restored, T-149). While
+   the OOM is alive, triage is pointless: repeated publications fail
+   and deaths keep accumulating.
+2. **Do not requeue** — the pipeline recovers the subjects itself
+   (§2.3): domains of `q:dns`/`q:http` — the lease pass (`queued`
+   without a result older than `scheduler.lease` 30 min → `pending`),
+   `q:render` SPA entries — the `render_pending` background pass (once
+   a minute), `q:analyze` — the hourly ReanalyzeLoop; the flag from
+   §2.5 item 3 is not needed here — render is not at fault. The
+   pre-discard check — SQL over the dead entries' identifiers: a
+   predominance of `check_state=2` (done) confirms "processing
+   completed, the publication died":
 
    ```bash
    redis-cli --raw XRANGE q:dead - + | grep '^{' \
@@ -547,456 +591,503 @@ for s in q:dns q:http q:render q:analyze q:dead; do printf '%-9s ' "$s"; redis-c
    psql "$CRAWLER_PG_DSN" -f /tmp/opencode/check-dead.sql
    ```
 
-   (пачки `q:dns` имён в записи не несут — их домены вернёт lease;
-   `check_state`: 0 pending, 1 queued, 2 done)
-3. **Выбросить разобранные записи** — `XTRIM q:dead MAXLEN 0` (§2.3).
-4. **Контроль хвоста PEL**: в pending групп остаются записи, уже
-   добравшие счётчик доставок (в образце ~940 записей со счётчиком 3,
-   часть — на мёртвых консьюмерах): следующие клеймы продолжат
-   досыпать смерти сотнями. Контроль — рост `XLEN q:dead` и PEL групп;
-   повторный XTRIM после стабилизации (смерти прекратились, PEL пуст):
+   (`q:dns` batches carry no names in the entry — their domains are
+   brought back by the lease; `check_state`: 0 pending, 1 queued,
+   2 done)
+3. **Discard the triaged entries** — `XTRIM q:dead MAXLEN 0` (§2.3).
+4. **PEL tail monitoring**: the groups' pending still holds entries
+   that have already exhausted the delivery counter (~940 entries with
+   a counter of 3 in the example, some on dead consumers): further
+   claims will keep adding deaths by the hundred. Monitor the growth of
+   `XLEN q:dead` and of the groups' PELs; a repeated XTRIM after things
+   stabilize (deaths stopped, the PEL empty):
 
    ```bash
-   redis-cli XINFO GROUPS q:http   # pending групп (аналогично q:render)
-   redis-cli XPENDING q:http http-worker - + 20   # PEL со счётчиками доставок
+   redis-cli XINFO GROUPS q:http   # the group's pending (same for q:render)
+   redis-cli XPENDING q:http http-worker - + 20   # the PEL with delivery counters
    ```
 
-   (дефолтные группы — `dns-worker`/`http-worker`/`render-worker`/
-   `analyzer`; точные имена — в выводе XINFO GROUPS)
+   (default groups — `dns-worker`/`http-worker`/`render-worker`/
+   `analyzer`; exact names — in the XINFO GROUPS output)
 
-### 2.7. Заморозка планировщика фантомным лагом q:dns (XTRIM недоставленного)
+### 2.7. Scheduler freeze from a phantom q:dns lag (XTRIM of undelivered entries)
 
-Разобранный образец — инцидент 22–23.10.2026: гейт публикации `q:dns`
-закрыт с 22.10 23:29 до 23.10 15:24 MSK (~15,5 ч) при живом Redis и
-40,3 млн pending-доменов — конвейер стоял по цепочке («пустые»
-`q:http`/`q:analyze`), dns-worker простаивал (inflight = 0, XLEN
-`q:dns` = 1). Источник фантома — дренаж легаси-пачек T-149 после
-OOM-инцидента §2.6, операционный фикс — T-168 (эта же задача добавила
-кламп в код, см. «Профилактика»).
+Worked example — the 22–23.10.2026 incident: the `q:dns` publication
+gate stayed closed from 22.10 23:29 to 23.10 15:24 MSK (~15.5 h) with
+a live Redis and 40.3M pending domains — the pipeline stood still down
+the chain ("empty" `q:http`/`q:analyze`), the dns-worker idled
+(inflight = 0, XLEN `q:dns` = 1). The phantom's source — the T-149
+drain of legacy batches after the §2.6 OOM incident; the operational
+fix — T-168 (the same task added the clamp in code, see
+"Prevention").
 
-**Сигнатура** — отличается от переполнения (§2.6) и тарпитов (§2.5):
+**The signature** — differs from the overflow case (§2.6) and from
+tarpits (§2.5):
 
-- в журнале scheduler **один** WARN (гейт пишет его раз при входе в
-  ожидание, повторов нет — сама заморозка в журнале невидима):
+- exactly **one** WARN in the scheduler journal (the gate writes it
+  once on entering the wait, no repeats — the freeze itself is
+  invisible in the journal):
 
   ```
-  публикация приостановлена: глубина очереди у порога stream=q:dns depth=1828 watermark=125
+  publication paused: queue depth at threshold stream=q:dns depth=1828 watermark=125
   ```
 
-- XADD в `q:dns` нет, dns-worker простаивает (консьюмер группы idle
-  часами), при этом pending доменов > 0 и `q:http`/`q:analyze` пустые;
-- вечный алерт `queue_overflow` по `q:dns` (глубина у порога, сам не
-  снимется — в образце висел с 09:04 до фикса);
-- решающий признак — лаг группы кратно больше длины стрима:
+- no XADD into `q:dns`, the dns-worker idles (the group's consumer
+  idle for hours), while pending domains > 0 and `q:http`/`q:analyze`
+  are empty;
+- an everlasting `queue_overflow` alert on `q:dns` (the depth at the
+  threshold, it will not clear by itself — in the example it hung from
+  09:04 until the fix);
+- the decisive sign — the group's lag is a multiple of the stream
+  length:
 
   ```bash
   redis-cli XINFO STREAM q:dns   # length, entries-added
-  redis-cli XINFO GROUPS q:dns   # lag, entries-read группы dns-worker
+  redis-cli XINFO GROUPS q:dns   # the dns-worker group's lag, entries-read
   ```
 
-  В образце: `length=1`, `entries-added=2140`; группа `dns-worker`:
-  `entries-read=387`, `lag=1753` — лаг считает записи, которых в стриме
-  давно нет.
+  In the example: `length=1`, `entries-added=2140`; the `dns-worker`
+  group: `entries-read=387`, `lag=1753` — the lag counts entries long
+  gone from the stream.
 
-**Механика.** `lag` группы = `entries_added − entries_read` и не
-вычитает записи, срезанные обрезкой недоставленными. Дренаж T-149
-(`XTRIM q:dns MAXLEN 125`) срезал ~1753 недоставленные легаси-пачки
-эпохи batch_size 5000 — счётчик `entries-read` группы их не вычитает,
-Redis 7.0.x (прод 7.0.15) держит положительный фантомный лаг вечно
-(Redis 7.4+ корректирует лаг при обрезке сам; dev-стек на 7.4 —
-поэтому на dev не воспроизводится). Эффективный порог гейта `q:dns` =
-min(`queue_high_watermark` 100 000, MAXLEN 250 / 2) = 125 — 1753 > 125
-навсегда, `XADD` не возобновляется сам. Маскировка при диагностике:
-прогресс суток до заморозки — это дренаж последних записей стрима, он
-выглядит как живая скорость DNS-этапа.
+**Mechanics.** A group's `lag` = `entries_added − entries_read` and
+does not subtract entries trimmed away while undelivered. The T-149
+drain (`XTRIM q:dns MAXLEN 125`) trimmed ~1753 undelivered legacy
+batches of the batch_size 5000 era — the group's `entries-read`
+counter does not subtract them, and Redis 7.0.x (prod runs 7.0.15)
+holds a positive phantom lag forever (Redis 7.4+ corrects the lag on
+trim by itself; the dev stack runs 7.4 — hence it does not reproduce
+on dev). The effective `q:dns` gate threshold =
+min(`queue_high_watermark` 100,000, MAXLEN 250 / 2) = 125 — 1753 > 125
+forever, `XADD` never resumes on its own. Diagnostic masking: the
+day's progress before the freeze is the drain of the stream's last
+entries, which looks like a healthy DNS-stage rate.
 
-**Рецепт:**
+**The remedy:**
 
-1. Сбросить след группы на конец стрима — лаг обнуляется, гейт
-   открывается:
+1. Reset the group's read position to the end of the stream — the lag
+   zeroes out, the gate opens:
 
    ```bash
    redis-cli XGROUP SETID q:dns dns-worker '$'
-   redis-cli XINFO GROUPS q:dns   # контроль: lag 0, entries-read NULL
+   redis-cli XINFO GROUPS q:dns   # check: lag 0, entries-read NULL
    ```
 
-   Имя группы — из XINFO GROUPS (дефолтные — `dns-worker`/
-   `http-worker`/`render-worker`/`analyzer`). До фикса убедитесь, что
-   pending группы пуст (`pending=0` в том же выводе): SETID теряет
-   неподтверждённые доставки — при живом PEL сначала дать воркеру
-   доработать или разобрать PEL (§2.3).
+   The group name — from XINFO GROUPS (the defaults are `dns-worker`/
+   `http-worker`/`render-worker`/`analyzer`). Before the fix, make sure
+   the group's pending is empty (`pending=0` in the same output):
+   SETID discards unacknowledged deliveries — with a live PEL, first
+   let the worker finish its work or triage the PEL (§2.3).
 
-2. **Не рестартовать Redis и не flush'ить** — в стримах и PEL живые
-   задачи: `q:render` в момент инцидента держал ~107 тыс. SPA-задач без
-   `render_pending`-флагов и Dead-записей, восстановить их неоткуда
-   (семейство потерь OOM-инцидента — §2.6).
+2. **Do not restart Redis and do not flush** — live tasks sit in the
+   streams and PELs: at the moment of the incident `q:render` held
+   ~107K SPA tasks with neither `render_pending` flags nor dead
+   entries — there would be no way to recover them (the loss family of
+   the OOM incident — §2.6).
 
-3. Контроль возобновления (первые минуты): XADD в `q:dns` пошёл,
-   XLEN/entries-read растут, inflight dns-worker > 0, pending доменов
-   убывает; алерт `queue_overflow` по `q:dns` снялся и не возвращается
-   после TrimLoop (XTRIM MINID).
+3. Resumption monitoring (the first minutes): XADD into `q:dns`
+   flowing again, XLEN/entries-read growing, dns-worker inflight > 0,
+   pending domains decreasing; the `queue_overflow` alert on `q:dns`
+   cleared and not returning after the TrimLoop (XTRIM MINID).
 
    ```bash
-   redis-cli XINFO STREAM q:dns   # length, entries-added растут
-   redis-cli XINFO GROUPS q:dns   # entries-read/last-delivered-id растут, lag ≈ живая глубина
+   redis-cli XINFO STREAM q:dns   # length, entries-added growing
+   redis-cli XINFO GROUPS q:dns   # entries-read/last-delivered-id growing, lag ≈ live depth
    ```
 
-   В образце: lag 1753 → 0, через 90 с XLEN 44, entries-read 2144,
-   inflight 32, ~33 дом/с; `q:dead` без роста (366).
+   In the example: lag 1753 → 0, after 90 s XLEN 44, entries-read 2144,
+   inflight 32, ~33 domains/s; `q:dead` flat (366).
 
-**Профилактика.** Код-фикс T-168: глубина гейта (и метрики/алерты с
-ним) считает `min(lag, XLEN) + pending` — недоставленные записи не
-больше записей стрима, фантом отсекается (min(1753, 1) = 1), реальный
-бэклог не искажается (пока недоставленные в стриме, lag ≤ XLEN и кламп
-неактивен). Смежное семейство — WARN TrimLoop «подтверждённый префикс
-стрима у потолка, точка обрезки не двигается»: та же застывшая метка
-группы (`last-delivered-id` осиротевшей группы держит минимум по
-группам в XTRIM MINID). Диагностика та же (XINFO GROUPS стрима);
-действия: живой потребитель двинет `last-delivered-id` сам; мёртвая
-группа с пустым pending — `XGROUP DESTROY` (pending непуст — записи
-вернутся клеймом воркера, группу не трогать; DESTROY теряет PEL).
+**Prevention.** Code fix T-168: the gate depth (and the metrics/alerts
+built on it) is computed as `min(lag, XLEN) + pending` — undelivered
+entries cannot exceed the stream's entries, the phantom is clipped
+(min(1753, 1) = 1), and the real backlog is not distorted (while the
+undelivered entries are still in the stream, lag ≤ XLEN and the clamp
+is inactive). A related family — the TrimLoop WARN "acknowledged
+stream prefix at the cap, the trim point is not advancing": the same
+frozen group position (the `last-delivered-id` of an orphaned group
+holds the minimum across groups in XTRIM MINID). The diagnostics are
+the same (the stream's XINFO GROUPS); actions: a live consumer will
+advance `last-delivered-id` itself; a dead group with an empty
+pending — `XGROUP DESTROY` (non-empty pending — the entries will come
+back via the worker's claim, do not touch the group; DESTROY loses the
+PEL).
 
-### 2.8. Deadlock 40P01 счётчиков (ределиверии q:http)
+### 2.8. Counter deadlocks 40P01 (q:http redeliveries)
 
-**Признак.** В журнале http-worker ошибки вида «суточный счётчик
-проверок: ERROR: deadlock detected (SQLSTATE 40P01)» на upsert
-`checks:YYYY-MM-DD` (`crawler_counters`) внутри транзакции записи
-результата; задача `q:http` не подтверждается и уходит в redelivery —
-каждый повтор стоит полным HTTP-эпизодом. В журнале PostgreSQL
-(`log_lock_waits = on`) — пара `process N still waiting …` /
-`deadlock found` с текстами обоих операторов.
+**Sign.** In the http-worker journal, errors of the form "daily checks
+counter: ERROR: deadlock detected (SQLSTATE 40P01)" on the
+`checks:YYYY-MM-DD` upsert (`crawler_counters`) inside the
+result-recording transaction; the `q:http` task is not acknowledged
+and goes to redelivery — every retry costs a full HTTP episode. The
+PostgreSQL journal (`log_lock_waits = on`) shows a pair of
+`process N still waiting …` / `deadlock found` with the texts of both
+statements.
 
-**Причина.** Инверсия порядка блокировок у одного из писателей
-`crawler_counters`: конвенция — «domains → zones → counters, счётчики
-— последними» (инвариант и перечень писателей —
-[`schema.md`](schema.md), раздел `crawler_counters`). Два инцидента,
-два механизма:
+**Cause.** A lock-ordering inversion in one of the `crawler_counters`
+writers: the convention is "domains → zones → counters, counters
+last" (the invariant and the writer list — [`schema.md`](schema.md),
+the `crawler_counters` section). Two incidents, two mechanisms:
 
-- retry-волна (9 случаев за 3 ч) — `scheduler.RetryOnce`: два
-  оператора пачки в одной транзакции захватывали domains-строки второй
-  половины, уже держа зоны и корзины `retry_mature:` — ребро
-  «счётчики → domains» против записи результата http-worker замыкало
-  цикл. Фикс — раздельные транзакции решений пачки (`retryDecide`).
-- 07.11.2026 (~3–4/ч; фикс 15ff3a3 не помог — ребро было другим) —
-  нессылаемые DML-CTE `zc`/`rm` ОДНОГО оператора записи результата
-  dns-worker (`resultUpdateStatusSQL`, autocommit): PostgreSQL не
-  гарантирует порядок их исполнения, на проде исполнились `rm → zc` —
-  оператор держал строку счётчика и ждал зону (ребро «счётчики →
-  зоны») против http-worker `RecordAndPublish`, держащего зоны до
-  Commit и ждущего `retry_mature:today`; то же ребро давал
-  `retryRequeueSQL` планировщика. Фикс T-267 — счётчики вынесены из
-  оператора зон отдельными операторами (инкремент DNS-этапа —
-  autocommit после записи, декремент requeue — второй оператор
-  транзакции решения; плата — окно неатомарности корзины ±1 до
-  ближайшей реконсиляции, ≤ 30 мин — безопасно, авторитет семейства
-  монитор).
+- the retry wave (9 cases in 3 h) — `scheduler.RetryOnce`: two
+  statements of a batch in one transaction grabbed the domains rows of
+  the second half while already holding the zones and `retry_mature:`
+  buckets — the "counters → domains" edge against the http-worker's
+  result recording closed the cycle. The fix — separate transactions
+  for the batch decisions (`retryDecide`).
+- 07.11.2026 (~3–4 per hour; the 15ff3a3 fix did not help — the edge
+  was a different one) — the unreferenced DML-CTEs `zc`/`rm` of ONE
+  statement of the dns-worker's result recording
+  (`resultUpdateStatusSQL`, autocommit): PostgreSQL does not guarantee
+  their execution order; in production they executed as `rm → zc` —
+  the statement held a counter row and waited for a zone (the
+  "counters → zones" edge) against the http-worker `RecordAndPublish`,
+  which holds zones until Commit and waits for `retry_mature:today`;
+  the same edge came from the scheduler's `retryRequeueSQL`. The
+  T-267 fix moves the counters out of the zones statement into
+  separate statements (the DNS-stage increment — autocommit after the
+  recording; the requeue decrement — a second statement of the
+  decision transaction; the price — a window of bucket non-atomicity
+  ±1 until the nearest reconciliation, ≤ 30 min — safe; the monitor is
+  the authority for the family).
 
-**Действия.** Данные чинить не нужно: запись идемпотентна
-(at-least-once, ТЗ 3.4), ределиверии безопасны, но дороги. Если ошибки
-возвращаются на свежем коде — искать НОВОГО писателя с инверсией:
-оператор или транзакция, которая после `crawler_counters`/`zones`
-захватывает строки `domains`/`zones` (grep по `crawler_counters` в
-internal/, сверка порядка — schema.md), либо смешение зон и счётчиков
-нессылаемыми DML-CTE одного оператора. Дедлок обнаруживается сам
-(`deadlock_timeout` 1 с), жертва откатывается и повторяется.
+**Actions.** No data repair is needed: recording is idempotent
+(at-least-once, spec 3.4), redeliveries are safe but costly. If the
+errors return on fresh code — look for a NEW writer with an inversion:
+a statement or transaction that grabs `domains`/`zones` rows after
+`crawler_counters`/`zones` (grep for `crawler_counters` in internal/,
+cross-check the ordering — schema.md), or zones and counters mixed as
+unreferenced DML-CTEs of one statement. The deadlock is detected
+automatically (`deadlock_timeout` 1 s); the victim rolls back and
+retries.
 
-**Страховка T-268 (прикладной ретрай).** Горячие точки конвейера идут
-под обёрткой `db.RetryDeadlock` (`internal/db/deadlock.go`): до двух
-повторов с джиттером и потолком паузы, только для 40P01 и только
-идемпотентных операций — транзакция записи результата http-worker
-(`RecordAndPublish`), транзакция решения ретрая scheduler (`retryDecide`),
-autocommit-операторы записи DNS-эпизода (`RecordEpisode` — повтор
-команды без повторного DNS-эпизода). Дренаж temp_error планировщика
-переживает ошибку пачки (до `DefaultRetryDrainFails` = 3 подряд
-упавших — устойчивый сбой ждёт следующего тика). Поэтому единичные
-40P01 в журналах сервисов после T-268 — штатная работа страховки:
-смотрите счётчик `crawler_db_deadlock_retried_total{service}`
-(docs/services.md) — темп поглощённых дедлоков. Устойчивый рост метрики
-при ненулевых потерях — тот же новый цикл блокировок: инверсия
-порядка где-то в коде, чинить причину (сверка — schema.md), ретрай её
-только маскирует.
+**The T-268 guard (application-level retry).** The pipeline's hot
+spots run under the `db.RetryDeadlock` wrapper
+(`internal/db/deadlock.go`): up to two retries with jitter and a pause
+cap, only for 40P01 and only for idempotent operations — the
+http-worker's result-recording transaction (`RecordAndPublish`), the
+scheduler's retry decision transaction (`retryDecide`), the
+autocommit statements of DNS-episode recording (`RecordEpisode` — the
+command retries without a second DNS episode). The scheduler's
+temp_error drain survives a batch error (up to `DefaultRetryDrainFails`
+= 3 consecutive failures — a persistent failure waits for the next
+tick). Therefore isolated 40P01s in the service journals after T-268
+are the guard working as designed: watch the
+`crawler_db_deadlock_retried_total{service}` counter (docs/services.md)
+— the rate of absorbed deadlocks. Sustained metric growth with
+non-zero losses is that same new lock cycle: an ordering inversion
+somewhere in the code — fix the cause (cross-check — schema.md);
+retrying only masks it.
 
-### 2.9. Рост `crawler_scheduler_lease_null_returned_total` (строки queued без queued_at)
+### 2.9. Growth of `crawler_scheduler_lease_null_returned_total` (queued rows without queued_at)
 
-**Признак.** Счётчик `crawler_scheduler_lease_null_returned_total`
-(scheduler) отличен от нуля и растёт; в журнале planner — Warn
-«ремонтный проход: строки queued без queued_at возвращены в pending».
+**Sign.** The `crawler_scheduler_lease_null_returned_total` counter
+(scheduler) is non-zero and growing; the planner journal shows the
+Warn "repair pass: queued rows without queued_at returned to pending".
 
-**Причина.** Нарушен инвариант T-028 «`check_state = queued` ⇒
-`queued_at IS NOT NULL`» (спецификация автомата —
-`internal/scheduler/checkstate.go`, инвариант И1). Штатные писатели
-инвариант держат: перевод в queued пишет `queued_at = now()` одним
-оператором с `check_state` (`internal/scheduler/enqueue.go`). Источники
-нарушения:
+**Cause.** The T-028 invariant "`check_state = queued` ⇒
+`queued_at IS NOT NULL`" is violated (the state machine spec —
+`internal/scheduler/checkstate.go`, invariant I1). The regular writers
+maintain the invariant: the transition to queued writes
+`queued_at = now()` in the same statement as `check_state`
+(`internal/scheduler/enqueue.go`). Sources of the violation:
 
-- ручной SQL: `UPDATE domains SET check_state = 1 …` без `queued_at` —
-  например, «переведём домены в проверку» в обход `crawlerctl recheck`
-  (правильная команда переводит в pending и сбрасывает `queued_at`);
-- баг писателя: новый код, ставящий queued мимо оператора постановки.
+- manual SQL: `UPDATE domains SET check_state = 1 …` without
+  `queued_at` — e.g. "let's move the domains to checking" bypassing
+  `crawlerctl recheck` (the proper command moves them to pending and
+  resets `queued_at`);
+- a writer bug: new code setting queued outside the enqueue statement.
 
-До T-255 такие строки зависали в queued навсегда: lease-проход отбирает
-по возрасту `queued_at`, NULL сравнением отсеивается. Теперь ремонтный
-проход цикла LeaseWatch (`internal/scheduler/leasenull.go`) возвращает
-их в pending пачками — диспетчер переиздаёт проверку (повтор
-идемпотентен, ТЗ 3.4). Само по себе событие не авария: данные чинятся
-автоматически, домен теряет максимум lease-окно до следующей проверки.
+Before T-255 such rows hung in queued forever: the lease pass selects
+by the age of `queued_at`, and NULL is filtered out by the comparison.
+Now the repair pass of the LeaseWatch cycle
+(`internal/scheduler/leasenull.go`) returns them to pending in batches
+— the dispatcher republishes the check (the retry is idempotent,
+spec 3.4). The event by itself is not an outage: the data heals
+automatically, and the domain loses at most the lease window until the
+next check.
 
-**Действия.** Ненулевой стационар — найти писателя, ставящего queued без
-отметки, иначе страховка будет возвращать одни и те же строки бесконечно
-(каждый возврат — повторная проверка домена, лишняя работа конвейера):
+**Actions.** A non-zero steady state — find the writer that sets
+queued without the stamp; otherwise the guard will return the same
+rows endlessly (each return is a repeated domain check, wasted
+pipeline work):
 
 ```sql
--- кто сейчас в queued без отметки (до ближайшего прохода страховки):
+-- who is currently queued without the stamp (until the nearest guard pass):
 SELECT zone_id, id, label, status FROM domains
 WHERE check_state = 1 AND queued_at IS NULL;
 ```
 
-Проверить журнал операций с БД вокруг первого роста счётчика: ручные
-правки (кто/что), деплой нового кода. Если источник — код, сверить
-писателя со спецификацией переходов (checkstate.go, единственный
-переход в queued — постановка планировщика Р1). Если источник — разовая
-ручная правка, ничего делать не нужно: страховка уже вернула строки;
-счётчик монотонный, «вернулся в ноль» не бывает — критерий здоровья
-нулевой темп роста (`rate(...) ≈ 0`), а не нулевое значение.
+Check the database operations log around the counter's first rise:
+manual edits (who/what), a deploy of new code. If the source is code,
+verify the writer against the transition spec (checkstate.go — the
+only transition into queued is the scheduler's enqueue R1). If the
+source is a one-off manual edit, nothing needs doing: the guard has
+already returned the rows; the counter is monotonic, it never "returns
+to zero" — the health criterion is a zero growth rate (`rate(...) ≈ 0`),
+not a zero value.
 
-### 2.10. Домены «статус повис» (new ∧ done): компенсатор и ручные операции
+### 2.10. Domains with a stuck status (new ∧ done): the compensator and manual operations
 
-**Признак.** Gauge `crawler_domains_new_done_stale` > 0 (строка
-`crawler_counters['new_done_stale']`, пишет проход реконсиляции раз в
-`monitor.zone_stats_interval`) и/или алерт `domains_new_done_stale`
-(стрик 2 снапшотов); растёт счётчик
-`crawler_scheduler_stale_requeued_total` — компенсатор уже дренирует.
+**Sign.** The `crawler_domains_new_done_stale` gauge > 0 (the
+`crawler_counters['new_done_stale']` row, written by the
+reconciliation pass every `monitor.zone_stats_interval`) and/or the
+`domains_new_done_stale` alert (a streak of 2 snapshots); the
+`crawler_scheduler_stale_requeued_total` counter is growing — the
+compensator is already draining.
 
-**Что это.** Аномалия ФТ-2.2 (ТЗ-fsm §3): DNS-этап записал ветку «есть
-адреса» (`check_state = done`, статус остаётся new — итог решает
-HTTP-этап), а задача q:http потеряна ПОСЛЕ XADD — доставки не будет.
-Причины: рестарт Redis без персистентности ([`redis.md`](redis.md) §5,
-алерт `redis_restart` — сигнал в момент события), гибель записей в
-OOM-окно ([`load-measurements.md`](load-measurements.md) §11.1),
-сбой обрезки стрима. Lease-проход такую строку НЕ видит (вне queued),
-возрастная перепроверка созревает только по `recheck_interval`
-(~полгода) — потому работает компенсатор.
+**What it is.** The FR-2.2 anomaly (TZ-fsm §3): the DNS stage recorded
+the "has addresses" branch (`check_state = done`, the status remains
+new — the HTTP stage decides the outcome), and the `q:http` task was
+lost AFTER the XADD — the delivery will never happen. Causes: a Redis
+restart without persistence ([`redis.md`](redis.md) §5, the
+`redis_restart` alert — a signal at the moment of the event), entry
+deaths in an OOM window
+([`load-measurements.md`](load-measurements.md) §11.1), a stream-trim
+failure. The lease pass does NOT see such a row (outside queued), and
+the age-based recheck matures only after `recheck_interval` (~half a
+year) — hence the compensator.
 
-**Компенсатор (T-270).** Часовой цикл планировщика
-`StaleRequeueLoop` (`internal/scheduler/stalerequeue.go`, переход Р15
-спецификации check_state) возвращает `status = new ∧ check_state =
-done ∧ last_checked_at` старше суток в `pending` пачками ≤1000 — домен
-проходит конвейер заново. Порог — окно gauge (24 ч по date-колонке ≡
-`last_checked_at < current_date`, когорта зреет в полночь — как окна
-ретрая T-031/T-202); сегодняшние in-flight задачи компенсатор не видит
-вовсе. Плата date-гранулярности — полуночный борт: бэклог q:http,
-переживший полночь, дренируется однократно с дублем эпизода (дубль
-гасится асимметрией А3 — повторная доставка HTTP-этапа перезаписывает
-результат и переиздаёт q:analyze); всплеск счётчика в первый час после
-полуночи при непустом q:http — штатный борт, не потери. Guard цикла —
-точечное чтение строки `new_done_stale`: стационарно (когорта
-вылечена) часовой тик стоит один PK-лукап, domains не сканируется;
-свежесть guard — интервал реконсиляции (30 мин), суммарная задержка
-ремонта ≤ ~1,5 ч. Ручное лечение когорты (`crawlerctl recheck`) НЕ
-нужно и не рекомендуется: код лечит сам, повторный эпизод
-идемпотентен.
+**The compensator (T-270).** The scheduler's hourly cycle
+`StaleRequeueLoop` (`internal/scheduler/stalerequeue.go`, the R15
+transition of the check_state spec) returns
+`status = new ∧ check_state = done ∧ last_checked_at` older than a day
+to `pending` in batches of ≤1000 — the domain goes through the
+pipeline again. The threshold is the gauge's window (24 h over the
+date column ≡ `last_checked_at < current_date`; the cohort matures at
+midnight — like the retry windows of T-031/T-202); today's in-flight
+tasks are invisible to the compensator altogether. The price of the
+date granularity is the midnight boundary effect: a q:http backlog
+that survived midnight is drained once, with a duplicate episode (the
+duplicate is resolved by the A3 asymmetry — a repeat HTTP-stage
+delivery overwrites the result and republishes q:analyze); a counter
+spike in the first hour after midnight with a non-empty q:http is the
+normal boundary effect, not losses. The cycle's guard is a point read
+of the `new_done_stale` row: in steady state (the cohort healed) the
+hourly tick costs a single PK lookup, domains is not scanned; the
+guard's freshness is the reconciliation interval (30 min), the total
+repair delay ≤ ~1.5 h. Manual treatment of the cohort
+(`crawlerctl recheck`) is NOT needed and not recommended: the code
+heals itself, and the repeat episode is idempotent.
 
-**Действия.** При срабатывании алерта действий обычно не требуется:
+**Actions.** When the alert fires, action is usually not required:
 
-1. Следить, что компенсатор дренирует: счётчик
-   `crawler_scheduler_stale_requeued_total` растёт, gauge падает до 0
-   в пределах часа после ненулевой реконсиляции (свежесть уровня —
-   `zone_stats_interval`).
-2. Сверить причину: `redis_restart` параллельно — класс потерь
-   рестарта (q:dns тогда же вернул lease); без рестарта — журнал
-   http-worker на время потери (OOM-окно, краш) и §2.5/§2.6.
-3. Когорта не дренируется (gauge стоит, счётчик не растёт):
-   - scheduler жив? (`systemctl status crawler-scheduler`, Warn
-     «дренаж компенсатора» в журнале);
-   - monitor жив? Guard читает строку реконсиляции — стоящий monitor
-     держит уровень и НЕ открывает компенсатор (проверить
-     `zones.updated_at`, алерт progress_stall);
-   - строки не переводятся при открытом guard — снять EXPLAIN выборки
-     (закрепление seq scan с ранним остановом, T-191) и посмотреть
-     журнал: ошибка пачки повторяется каждый час (очередной тик) — Warn
-     в журнале планировщика;
-   - точечно вернуть домен вне компенсатора — `crawlerctl recheck
-     <домен>` (штатная ручная операция, §2.3): guard закрыт (например,
-     monitor в ремонте), а проверить надо сейчас.
-4. Будущие когорты закрываются тем же циклом автоматически: после
-   рестарта Redis ожидать всплеск счётчика и дренаж gauge к нулю;
-   устойчивый ненулевой темп `crawler_scheduler_stale_requeued_total`
-   в стационаре (без рестартов/OOM-окон) — потери происходят ПОСТОЯННО:
-   разбор причины по журналу http-worker и алерту `redis_restart`,
-   прецедент — инцидентная неделя 22–29.10.2026 (1865 доменов).
+1. Watch that the compensator drains: the
+   `crawler_scheduler_stale_requeued_total` counter grows and the
+   gauge falls to 0 within an hour after a non-zero reconciliation
+   (the level's freshness — `zone_stats_interval`).
+2. Cross-check the cause: `redis_restart` in parallel — the restart
+   loss class (q:dns was returned by the lease at the same time);
+   without a restart — the http-worker journal for the loss window
+   (an OOM window, a crash) and §2.5/§2.6.
+3. The cohort is not draining (the gauge is stuck, the counter is not
+   growing):
+   - is the scheduler alive? (`systemctl status crawler-scheduler`,
+     the Warn "compensator drain" in the journal);
+   - is the monitor alive? The guard reads the reconciliation row — a
+     stalled monitor keeps the level frozen and does NOT open the
+     compensator (check `zones.updated_at`, the `progress_stall`
+     alert);
+   - rows are not transitioning while the guard is open — capture the
+     EXPLAIN of the selection (the pinned seq scan with early stop,
+     T-191) and check the journal: a batch error repeating hourly
+     (each next tick) — a Warn in the scheduler journal;
+   - requeue a domain point-wise outside the compensator —
+     `crawlerctl recheck <domain>` (a regular manual operation, §2.3):
+     the guard is closed (e.g. the monitor is under repair) but the
+     check is needed now.
+4. Future cohorts are closed by the same cycle automatically: after a
+   Redis restart expect a counter spike and the gauge draining to
+   zero; a sustained non-zero rate of
+   `crawler_scheduler_stale_requeued_total` in steady state (without
+   restarts/OOM windows) — losses are happening CONSTANTLY:
+   investigate via the http-worker journal and the `redis_restart`
+   alert; precedent — the 22–29.10.2026 incident week (1865 domains).
 
-Найти когорту руками (guard закрыт/для сверки):
+Find the cohort by hand (guard closed / for cross-checking):
 
 ```sql
 SELECT zone_id, id, label, last_checked_at FROM domains
 WHERE status = 0 AND check_state = 2
-  AND last_checked_at < current_date;   -- окно 24 ч при date-точности
+  AND last_checked_at < current_date;   -- the 24 h window at date precision
 ```
 
-## 3. Переанализ результатов по новым правилам
+## 3. Re-analysis of results under new rules
 
-Смена набора правил Laravel не требует повторного скачивания сайтов:
-анализатор читает сохранённый контент из хранилища (ТЗ 5.8 «пассивный
-анализ»). Механика — [`analyzer.md`](analyzer.md) «Переанализ»;
-формат правил — [`configuration.md`](configuration.md), секция
-`analyzer`.
+Changing the Laravel rule set does not require re-downloading sites:
+the analyzer reads the stored content from storage (spec 5.8 "passive
+analysis"). Mechanics — [`analyzer.md`](analyzer.md) "Re-analysis";
+the rule format — [`configuration.md`](configuration.md), the
+`analyzer` section.
 
-### Шаги
+### Steps
 
-1. **Правка правил** — YAML в `rules/` (dev) или `/etc/crawler/rules`
-   (бой). Версия набора (`rules_version`) — хэш детекции
-   (`target`/`match`/`regex`/`weight`/границы версий); правка
-   `description` и комментариев версию **не меняет** — переанализ не
-   нужен.
-2. **Проверка без сети** — `make test-rules`: прогон по корпусу
-   `testdata/laravel-samples`, сверка `is_laravel`/диапазона версий/
-   состава сработавших правил с `meta.yaml`.
-3. **Применить без рестарта** — SIGHUP анализатору:
+1. **Edit the rules** — YAML in `rules/` (dev) or `/etc/crawler/rules`
+   (production). The rule set version (`rules_version`) is the hash of
+   the detection (`target`/`match`/`regex`/`weight`/version bounds);
+   editing `description` and comments does **not** change the version —
+   no re-analysis is needed.
+2. **An offline check** — `make test-rules`: a run over the
+   `testdata/laravel-samples` corpus, cross-checking `is_laravel`/the
+   version range/the matched-rule set against `meta.yaml`.
+3. **Apply without a restart** — SIGHUP the analyzer:
 
    ```bash
    make rules-reload                              # dev
-   systemctl kill -s HUP crawler-analyzer         # бой
+   systemctl kill -s HUP crawler-analyzer         # production
    ```
 
-   Битый набор не останавливает сервис — работает прежний (Warn в
-   логе), повторная попытка — следующий SIGHUP.
-4. **Автоматический переанализ** запускается сам: смена версии набора —
-   внеочередной дренаж цикла переанализа анализатора (постановки в
-   `q:analyze` пачками по 5000, под гейтом backpressure). Ход виден в
-   глубине `q:analyze` (`crawlerctl status`) и по доле строк с новой
-   `rules_version` в БД:
+   A broken rule set does not stop the service — the previous one keeps
+   working (a Warn in the log); the retry happens on the next SIGHUP.
+4. **Automatic re-analysis** starts on its own: a rule set version
+   change triggers an out-of-turn drain of the analyzer's re-analysis
+   cycle (enqueues into `q:analyze` in batches of 5000, under the
+   backpressure gate). Progress is visible in the `q:analyze` depth
+   (`crawlerctl status`) and in the share of rows with the new
+   `rules_version` in the database:
 
    ```sql
    -- make psql
    SELECT rules_version, count(*) FROM subdomain_results GROUP BY 1 ORDER BY 2 DESC;
    ```
 
-5. **Ручной запуск / контроль** — тот же дренаж одной командой:
+5. **Manual run / control** — the same drain with one command:
 
    ```bash
-   make reanalyze                          # dev; бой: crawlerctl reanalyze
-   crawlerctl reanalyze [--zone ИМЯ]       # ограничить зоной (имя в любой форме)
+   make reanalyze                          # dev; production: crawlerctl reanalyze
+   crawlerctl reanalyze [--zone NAME]       # limit to a zone (the name in any form)
    ```
 
-   Команда печатает версию набора («набор правил vN») и счётчик
-   постановок; «устаревших результатов нет — переанализ не требуется» —
-   всё актуально. Потерянные MAXLEN ~ постановки подберёт часовой цикл
-   анализатора.
-6. **Проверить результат** — `crawlerctl domain <имя>` (версия правил,
-   score, диапазон, срабатывания) или SQL:
+   The command prints the rule set version ("ruleset vN") and the
+   enqueue counter; "no stale results — re-analysis not required"
+   means everything is current. Lost MAXLEN ~ enqueues will be picked
+   up by the analyzer's hourly cycle.
+6. **Check the result** — `crawlerctl domain <name>` (the rule
+   version, score, range, hits) or SQL:
 
    ```sql
-   SELECT count(*) FROM laravel_domains;             -- уверенные (score ≥ порога)
-   SELECT count(*) FROM laravel_findings WHERE NOT is_laravel;  -- слабые
+   SELECT count(*) FROM laravel_domains;             -- confident (score ≥ threshold)
+   SELECT count(*) FROM laravel_findings WHERE NOT is_laravel;  -- weak
    ```
 
-### Нюанс порога
+### The threshold caveat
 
-Смена одного `analyzer.laravel_min_score` **не меняет** `rules_version`
-(версия — хэш набора правил, порог — конфигурация): накопленные
-находки не переприменяются, `is_laravel` пересчитается только у новых
-анализируемых записей (свежие проверки, рендеры, переанализ после
-правки правил). Менять порог «задним числом» по всем данным — правкой
-любого веса правил (сместит версию и запустит переанализ) либо
-ожиданием естественных перепроверок.
+Changing only `analyzer.laravel_min_score` does **not** change
+`rules_version` (the version is the rule set hash, the threshold is
+configuration): accumulated finds are not re-evaluated, and
+`is_laravel` is recomputed only for newly analyzed entries (fresh
+checks, renders, re-analysis after rule edits). To change the
+threshold "retroactively" over all data — edit any rule weight (it
+shifts the version and triggers re-analysis) or wait for natural
+rechecks.
 
-## 4. Отказ резолвера DNS (переключение на резерв)
+## 4. DNS resolver failure (switching to the fallbacks)
 
-Резолверы DNS-этапа — цепь: локальный unbound (`dns.resolvers`) и
-резервы (`dns.fallback_resolvers`, ТЗ 5.4). Обмен, исчерпавший попытки
-на сетевом отказе локального, повторяется по резервам до первого
-ответа (T-107); ответ сервера с любым RCODE (включая SERVFAIL) —
-не переключение. Механика и конфигурация —
-[`configuration.md`](configuration.md), секция `dns`.
+The DNS stage's resolvers form a chain: the local unbound
+(`dns.resolvers`) and the fallbacks (`dns.fallback_resolvers`,
+spec 5.4). An exchange that exhausted its attempts on a network
+failure of the local resolver is retried against the fallbacks until
+the first answer (T-107); a server answer with any RCODE (including
+SERVFAIL) is not a switch. Mechanics and configuration —
+[`configuration.md`](configuration.md), the `dns` section.
 
-### 4.1. Признаки
+### 4.1. Signs
 
-- `rate(crawler_dns_fallback_switches_total) > 0` — локальный не
-  отвечает транспортно, работает резерв: конвейер жив, но латентность
-  каждого DNS-обмена выросла на цикл ретраев отказавшего
-  (`dns.timeout` × (`dns.retries`+1), по умолчанию ~6,4 с);
-- `rate(crawler_dns_fallback_exhausted_total) > 0` — не ответил никто
-  (локальный и резервы): эти домены получат `temp_error` и повтор через
-  `scheduler.temp_error_retry_after`;
-- Warn «стартовая проба резолвера: не отвечает» при старте dns-worker —
-  часть цепи мертва (сервис продолжил работу);
-- ошибка старта «стартовая проба: не отвечает ни один резолвер цепи» —
-  мертвы все, systemd перезапускает сервис до починки.
+- `rate(crawler_dns_fallback_switches_total) > 0` — the local one is
+  not answering at the transport level and a fallback is working: the
+  pipeline is alive, but the latency of every DNS exchange grew by the
+  failed resolver's retry cycle (`dns.timeout` × (`dns.retries`+1),
+  ~6.4 s by default);
+- `rate(crawler_dns_fallback_exhausted_total) > 0` — nobody answered
+  (the local one and the fallbacks): these domains get `temp_error`
+  and a retry after `scheduler.temp_error_retry_after`;
+- the Warn "resolver startup probe: no response" at dns-worker start —
+  part of the chain is dead (the service kept working);
+- the startup error "startup probe: no resolver in the chain responds"
+  — all are dead; systemd restarts the service until it is fixed.
 
-### 4.2. Действия
+### 4.2. Actions
 
-1. Проверить локальный unbound: `journalctl -t unbound` (бой) или
-   `make logs SERVICE=unbound` (dev); типовые причины — падение/перезапуск
-   процесса, исчерпание памяти (бюджет ≈ 0,7 ГБ, ТЗ 3.2).
-2. Проверить сетевую досягаемость резервов из пункта 4.1: если
-   `crawler_dns_fallback_exhausted_total` растёт при молчащем локальном,
-   недоступны и публичные резолверы (фильтрация исходящего UDP/53?) —
-   обмена не будет до восстановления любой из сторон.
-3. Восстановление локального подхватывается само: переключение не
-   «запоминает» мёртвый резолвер, следующий обмен после оживания
-   обслужит локальный (метрика switches возвращается к нулю темпа).
-4. Если локальный мёртв надолго, а резервы не настроены — остановить
-   dns-worker (`systemctl stop crawler-dns-worker`) до починки: каждый
-   эпизод без резолверов кладёт домены в `temp_error` и жжёт попытки
-   повторных проверок (`scheduler.temp_error_max_retries`).
+1. Check the local unbound: `journalctl -t unbound` (production) or
+   `make logs SERVICE=unbound` (dev); typical causes — a process
+   crash/restart, memory exhaustion (the budget ≈ 0.7 GB, spec 3.2).
+2. Check the network reachability of the fallbacks from item 4.1: if
+   `crawler_dns_fallback_exhausted_total` grows while the local one is
+   silent, the public resolvers are unreachable too (outbound UDP/53
+   filtering?) — no exchanges until either side recovers.
+3. Recovery of the local resolver is picked up automatically: the
+   switch does not "remember" a dead resolver — the next exchange
+   after it comes back is served by the local one (the switches metric
+   returns to a zero rate).
+4. If the local resolver is dead for a long time and the fallbacks are
+   not configured — stop the dns-worker
+   (`systemctl stop crawler-dns-worker`) until it is fixed: every
+   episode without resolvers puts domains into `temp_error` and burns
+   recheck attempts (`scheduler.temp_error_max_retries`).
 
-Отказ резолвера не требует разбора q:dead (раздел 2): домены
-возвращаются штатным циклом temp_error (T-031).
+A resolver failure needs no q:dead triage (section 2): the domains
+come back through the regular temp_error cycle (T-031).
 
-## 5. Разовая очистка накопленного контента и трима jsonb (кампания T-167)
+## 5. One-off cleanup of accumulated content and the jsonb trim (the T-167 campaign)
 
-Данные, проверенные **до** внедрения retention (T-166), тем же критериям
-не подпадают автоматически только из-за даты: их возраст уже превышает
-окно, и масса истории (замер 2026-10-23 вечер: контент **20 ГБ /
-≈3,1 млн блоков** `contents`, индекс 261 МБ; `subdomain_results`
-**≈3,7 ГБ** на ≈1,14 млн живых проверенных строк) дренируется явной
-кампанией — один раз, дальше окно держит штатный цикл. Критерии отбора и
-механика чистки — [`content.md`](content.md) «Retention контента и трим
-не-находок (T-166)»: здесь не повторяются. Отличия кампании от фонового
-цикла: уменьшенные батчи под CPU-голодом (T-158 не закрыт) с паузами,
-VACUUM (ANALYZE) затронутых партиций после дренажа, контроль
-компактификации паков при массовом orphan-блоке, и неприкосновенность
-когорты `render_pending` до дренажа `q:render` (T-159: лаг ≈99 тыс. при
-watermark 100 тыс.) — эти записи исключены отбором T-166 сами, а записи
-с ещё непотреблёнными сообщениями `q:render`/`q:analyze` исключает
-точная защита фиксa T-166/T-167 (снимок непотреблённых ключей стримов,
-[`content.md`](content.md) «Точная защита по непотреблённым
-сообщениям»): доработает их штатный цикл после снятия флагов и
-разбора очередей.
+Data checked **before** retention was introduced (T-166) does not fall
+under the same criteria automatically, purely because of its date: its
+age already exceeds the window, and the mass of history (the
+2026-10-23 evening measurement: content **20 GB / ≈3.1M** `contents`
+blocks, a 261 MB index; `subdomain_results` **≈3.7 GB** over ≈1.14M
+live checked rows) is drained by an explicit campaign — once; after
+that the window is held by the regular cycle. The selection criteria
+and the cleanup mechanics — [`content.md`](content.md) "Content
+retention and the non-find trim (T-166)": not repeated here. The
+campaign's differences from the background cycle: reduced batches under
+CPU starvation (T-158 still open) with pauses, VACUUM (ANALYZE) of the
+affected partitions after the drain, monitoring of pack compaction
+under mass orphan blocks, and the untouchability of the
+`render_pending` cohort until the `q:render` drain (T-159: a lag of
+≈99K against a 100K watermark) — those entries are excluded by the
+T-166 selection itself, and entries with still-unconsumed
+`q:render`/`q:analyze` messages are excluded by the exact protection
+of the T-166/T-167 fix (a snapshot of unconsumed stream keys,
+[`content.md`](content.md) "Exact protection by unconsumed messages"):
+the regular cycle reworks them after the flags are cleared and the
+queues are triaged.
 
-Выполняется после деплоя волны с T-166. Реестр `domains` не трогается.
+Run after deploying the wave containing T-166. The `domains` registry
+is not touched.
 
-### 5.1. Базовый замер (до любого действия)
+### 5.1. Baseline measurement (before any action)
 
-Все контрольные точки приёмки (§5.5) сверяются с этим замером — фиксируйте
-выводы в журнал работ ([`operations.md`](operations.md) §5).
+All acceptance checkpoints (§5.5) are verified against this
+measurement — record the findings in the work log
+([`operations.md`](operations.md) §5).
 
 ```bash
-# том данных и каталог контента (disk_avail — главный критерий)
+# the data volume and the content directory (disk_avail — the main criterion)
 df -h /var/lib/crawler
 du -sh /var/lib/crawler/content
-# очереди (глубины q:render/q:analyze — интерлок/ворота; лаг групп —
-# точная защита фиксa T-166/T-167; q:dead — приёмка)
+# queues (the q:render/q:analyze depths — interlock/gates; group lags —
+# the exact protection of the T-166/T-167 fix; q:dead — acceptance)
 for s in q:dns q:http q:render q:analyze q:dead; do printf '%-9s ' "$s"; redis-cli XLEN "$s"; done
 for s in q:render q:analyze; do printf 'lag %-9s ' "$s"; redis-cli --raw XINFO GROUPS "$s" | paste - - | awk '$1=="lag"{print $2}'; done
-# PSI CPU (стационар замера §12 — 91–95% some)
+# PSI CPU (the §12 measurement steady state — 91–95% some)
 grep -E '^(some|full)' /proc/pressure/cpu
 ```
 
 ```sql
--- psql "$CRAWLER_PG_DSN" (как §2.5); dev — make psql
+-- psql "$CRAWLER_PG_DSN" (as in §2.5); dev — make psql
 
--- учёт контента: живые/мёртвые строки и байты (что умрёт срезанием
--- ссылок, а что уже мёртвое — территория компактификации паков)
+-- content accounting: live/dead rows and bytes (what will die from
+-- ref clearing, and what is already dead — pack compaction territory)
 SELECT count(*) FILTER (WHERE refcount > 0)      AS live_rows,
        count(*) FILTER (WHERE refcount = 0)      AS dead_rows,
        pg_size_pretty(sum(len)::bigint)          AS block_bytes,
        pg_size_pretty(pg_total_relation_size('contents')) AS contents_size
 FROM contents;
 
--- журнал: сумма листовых партиций (родитель партиционированный — без
--- хранилища, pg_total_relation_size по нему вернул бы 0; миграция 000003:
--- subdomain_results_z<zone>_h<k>, свежие зоны — в subdomain_results_default)
+-- the results journal: the sum of the leaf partitions (the parent is
+-- partitioned — it holds no storage; pg_total_relation_size on it
+-- would return 0; migration 000003: subdomain_results_z<zone>_h<k>,
+-- fresh zones land in subdomain_results_default)
 SELECT pg_size_pretty(sum(pg_total_relation_size(relid))::bigint) AS journal_size
 FROM pg_stat_user_tables
 WHERE relname LIKE 'subdomain\_results\_%';
@@ -1006,23 +1097,23 @@ FROM pg_stat_user_tables
 WHERE relname LIKE 'subdomain\_results\_%'
 ORDER BY pg_total_relation_size(relid) DESC;
 
--- неприкосновенность (счётчики до/после — приёмка §5.5)
-SELECT count(*) FROM laravel_domains;   -- уверенные находки
-SELECT count(*) FROM laravel_findings;  -- все срабатывания
+-- inviolable data (the counts before/after — acceptance §5.5)
+SELECT count(*) FROM laravel_domains;   -- confident finds
+SELECT count(*) FROM laravel_findings;  -- all rule hits
 
--- якорь контента находок: строки находок со ссылкой на контент
--- (число не должно измениться; контент находок хранится всегда)
+-- the finds' content anchor: find rows with a content reference
+-- (the number must not change; find content is always stored)
 SELECT count(*) FROM laravel_domains AS ld
 JOIN subdomain_results AS r
   ON r.zone_id = ld.zone_id AND r.domain_id = ld.domain_id
 WHERE r.content_hash IS NOT NULL;
 
--- когорта render_pending (НЕ трогать до дренажа q:render, T-159)
+-- the render_pending cohort (do NOT touch until the q:render drain, T-159)
 SELECT count(*) FROM domains WHERE flags & 2 <> 0;
 
--- оценка массива кампании (верхняя граница: без исключения находок и
--- render_pending; тяжёлый — выполнять в окно, результат — ориентир
--- прогресса, точное число даст сам дренаж)
+-- the campaign volume estimate (an upper bound: without excluding
+-- finds and render_pending; heavy — run it in a window; the result is
+-- a progress reference, the drain itself gives the exact number)
 SELECT count(*) FROM subdomain_results
 WHERE checked_at < now() - interval '6 hours'
   AND (content_hash IS NOT NULL OR headers IS NOT NULL OR cookies IS NOT NULL
@@ -1030,215 +1121,235 @@ WHERE checked_at < now() - interval '6 hours'
        OR cname IS NOT NULL);
 ```
 
-### 5.2. Путь А (основной): штатный цикл T-166
+### 5.2. Path A (primary): the regular T-166 cycle
 
-Возраст истории уже превышает окно `content.retention` (6 ч) — первый же
-проход `RetentionLoop` (запускается сразу со стартом http-worker, не дожидаясь
-часового тика) дренирует массив пачками `content.retention_batch` до
-исчерпания множества или интерлока `q:analyze`. Ожидаемый масштаб:
-≈1,14 млн строк ÷ 10 000 = **≈114 пачек** на первый проход; секунды на
-пачку — минуты на дренаж (гистограмма `pass_seconds` имеет бакет 300 с
-именно под этот бэкфилл). Десятки минут на ЧАСОВОЙ проход стационара —
-признак CPU-голода (см. «Замедление» ниже). С T-185 первый проход —
-catch-up-круг с Sort среза (сортируются кандидаты среза, а не посещённый
-heap): для СТАРТОВОГО круга десятки минут — верхняя оценка, реагировать
-на неё не нужно; триггер — систематический (не разовый) выход стартового
-круга за бакет 300 с по `pass_seconds`/журналу T-177: тогда включить
-композитный индекс `(checked_at, zone_id, domain_id, subdomain_id,
-variant)` (кандидат DDL, ТЗ T-185). Последующие часовые
-проходы разгребают только приток (≈3 млн строк/сут ≈ 13 пачек на
-проход) — с T-185 буквально: курсор дренажа переживает проходы,
-ежечасных полных кругов больше нет. Интерлок — глубина
-`q:analyze` ≥ `scheduler.queue_high_watermark` (100 000): проход
-пропускается целиком, `skips_total` растёт — это штатная защита тел от
-срезания, кампания продолжится следующим проходом.
+The history's age already exceeds the `content.retention` window
+(6 h) — the very first `RetentionLoop` pass (it starts right away with
+the http-worker, without waiting for the hourly tick) drains the
+volume in `content.retention_batch` batches until the set is exhausted
+or the `q:analyze` interlock trips. The expected scale: ≈1.14M rows ÷
+10,000 = **≈114 batches** for the first pass; seconds per batch —
+minutes for the drain (the `pass_seconds` histogram has the 300 s
+bucket exactly for this backfill). Tens of minutes per HOURLY
+steady-state pass is a sign of CPU starvation (see "Slowdown" below).
+Since T-185 the first pass is a catch-up circle with a Sort of the
+slice (the slice's candidates are sorted, not the visited heap): for
+the STARTING circle, tens of minutes is the upper estimate — no
+reaction needed; the trigger is a systematic (not one-off) excess of
+the 300 s bucket by the starting circle per `pass_seconds`/the T-177
+journal: then enable the composite index `(checked_at, zone_id,
+domain_id, subdomain_id, variant)` (a DDL candidate, spec T-185).
+Subsequent hourly passes process only the inflow (≈3M rows/day ≈ 13
+batches per pass) — literally so since T-185: the drain cursor
+survives passes, and the hourly full circles are gone. The interlock
+is the `q:analyze` depth ≥ `scheduler.queue_high_watermark` (100,000):
+the pass is skipped entirely, `skips_total` grows — this is the
+regular protection of bodies from being cleared, and the campaign
+continues with the next pass.
 
-Точная защита по непотреблённым сообщениям (фикс T-166/T-167, деплой
-волны обязателен до старта кампании): записи, чьи Result-сообщения ещё
-не потреблены `q:render`/`q:analyze`, цикл исключает из пачек по снимку
-стримов — путь А **точно не трогает** ожидающие очередей записи (флаг
-`render_pending` закрывает только непубликованные, интерлок — только
-глубину у порога). При застое `q:render` (сейчас лаг ≈99 тыс.) проход
-будет исключать эти записи пачками: растёт
-`crawler_content_retention_deferred_total{stream="q:render"}` — это
-работа защиты, не ошибка; после дренажа стрима (T-159) исключения
-прекращаются и дренаж продолжится. Ошибка чтения стримов — консервативный
-пропуск прохода (`passes{result="skipped_pending"}`,
-`pending_errors_total`): записи очередей не тронуты, чинить доступ к
-Redis.
+The exact protection by unconsumed messages (the T-166/T-167 fix; the
+wave deploy is mandatory before the campaign starts): entries whose
+Result messages are not yet consumed by `q:render`/`q:analyze` are
+excluded from the batches by a snapshot of the streams — path A
+**never touches** entries waiting for their queues (the
+`render_pending` flag only covers unpublished ones, the interlock only
+the depth at the threshold). With a stalled `q:render` (the lag is now
+≈99K) the pass will keep excluding those entries in batches:
+`crawler_content_retention_deferred_total{stream="q:render"}` grows —
+this is the protection working, not an error; after the stream drains
+(T-159) the exclusions stop and the drain resumes. A stream read error
+— a conservative skip of the pass
+(`passes{result="skipped_pending"}`, `pending_errors_total`): the
+queue entries are untouched; fix the Redis access.
 
-Поведение после сбоя БД (T-271 по инциденту 08–09.11.2026, уточнено
-T-273 по регрессии 09–10.11 и T-274): выборка пачки retention идёт в
-tx-оболочке закрепления плана (`SET LOCAL
-enable_seqscan/hashjoin/mergejoin/bitmapscan = off` + `statement_timeout`
-7200 с и клиентский ctx-дедлайн — зависший запрос невозможен); потолок
-7200 с (T-274, было 3600 у T-273 и 600 у T-271; настраивается
-`content.retention_select_timeout` без деплоя) обязан накрывать первый
-catch-up-проход с нулевого курсора после простоя retention (skip-префикс
-чистых строк, 30–60 мин на прод-объёме, под фронтом — больше часа) —
-дедлайн меньше стоимости прохода убивал его
-до коммита, курсор не двигался, и каждый повтор шёл тем же обречённым
-сканом (вечная петля). Ошибочный проход переводит тикер в паузу
-**15 минут от конца прохода** (T-273: reset после каждой ошибки,
-пауза ≥ длительность прохода + 15 мин): Warn `проход retention контента`
-в журнале один раз на ошибку, немедленных перезапусков в только что
-поднятый PG нет; первый успешный проход возвращает часовой интервал,
-а счётчик `crawler_content_retention_errors_total` (T-273) растёт на
-каждом неудачном проходе — рост серии при нулевых
-`passes_total{result="ok"}` = дренаж стоит, смотреть заголовок Warn.
-Что видит оператор после рестарта PG: один Warn, затем либо успешный
-проход (`passes_total{result="ok"}`), либо повторный Warn не раньше чем
-через 15 минут — это штатный backoff, рестартать http-worker не нужно
-(курсор в памяти переживает паузу; с T-274 курсор и вовсе персистентен в
-БД — таблица `retention_drain_cursor`, миграция 000020: рестарт
-http-worker продолжает дренаж с сохранённой позиции, полный catch-up с
-нуля остаётся только первому проходу после простоя или принудительному
-catch-up-кругу).
-Тяжёлые сканы retention и позднего переиздателя рендера сериализованы
-общим гейтом `db.ScanGate`: минутные проходы переиздателя могут
-подождать retention-выборку (≤7200 с) — на месячном цикле страховки
-потерь это незаметно.
+Behavior after a database failure (T-271 after the 08–09.11.2026
+incident, refined by T-273 after the 09–10.11 regression and T-274):
+the retention batch selection runs inside a plan-pinning tx wrapper
+(`SET LOCAL
+enable_seqscan/hashjoin/mergejoin/bitmapscan = off` + a
+`statement_timeout` of 7200 s and a client ctx deadline — a hung query
+is impossible); the 7200 s cap (T-274; it was 3600 under T-273 and 600
+under T-271; configurable via `content.retention_select_timeout`
+without a deploy) must cover the first catch-up pass from the zero
+cursor after a retention outage (a clean-prefix skip of pure rows,
+30–60 min at production volume, over an hour under front load) — a
+deadline smaller than the pass cost killed the pass before the commit:
+the cursor did not move, and every retry ran the same doomed scan (an
+endless loop). An errored pass puts the ticker into a **15-minute
+pause from the end of the pass** (T-273: a reset after every error,
+the pause ≥ the pass duration + 15 min): a Warn "content retention
+pass" in the journal once per error, no immediate restarts against a
+just-raised PG; the first successful pass restores the hourly
+interval, and the `crawler_content_retention_errors_total` counter
+(T-273) grows on every failed pass — a series growing with zero
+`passes_total{result="ok"}` means the drain is stalled; read the Warn
+heading. What the operator sees after a PG restart: one Warn, then
+either a successful pass (`passes_total{result="ok"}`) or another Warn
+no earlier than 15 minutes later — this is the regular backoff; there
+is no need to restart the http-worker (the in-memory cursor survives
+the pause; since T-274 the cursor is persistent in the database after
+all — the `retention_drain_cursor` table, migration 000020: an
+http-worker restart continues the drain from the saved position, and a
+full catch-up from zero remains only for the first pass after an
+outage or a forced catch-up circle).
+The heavy scans of retention and of the late render republisher are
+serialized by the shared `db.ScanGate` gate: the republisher's minute
+passes may wait for the retention selection (≤7200 s) — imperceptible
+on the monthly loss-guard cycle.
 
-**Контроль хода** (после деплоя, на сервере):
+**Progress monitoring** (after the deploy, on the server):
 
 ```bash
-# метрики цикла (http-worker слушает :9104)
+# cycle metrics (the http-worker listens on :9104)
 curl -s 127.0.0.1:9104/metrics | grep crawler_content_retention
-# журнал проходов и аномалий
-journalctl -t crawler-http-worker -f | grep -E 'retention|компактификации'
-# глубины очередей и скорости этапов
+# the journal of passes and anomalies
+journalctl -t crawler-http-worker -f | grep -E 'retention|compaction'
+# queue depths and stage rates
 crawlerctl status
 ```
 
-Ожидаемые показания: `crawler_content_retention_rows_total` растёт к
-оценке §5.1 (первый проход — основной скачок, дальше — приток);
-`contents_total` — удалённые строки `contents`; `freed_bytes_total` —
-сжатые байты мёртвых блоков (право на место; физически вернёт
-компактификация паков, §5.4); `passes_total{result="ok"}` — по проходу
-в час; `skips_total` — только при глубине `q:analyze` у watermark;
-`deferred_total{stream}` — записи, исключённые точной защитой (растёт
-при застое очередей — ожидаемо до дренажа `q:render`, T-159);
-`pending_errors_total` — **всегда 0** (рост — стоп: защита не читает
-стримы); `bad_hashes_total` и `missing_refs_total` — **всегда 0** (рост
-— стоп, см. §5.5).
+Expected readings: `crawler_content_retention_rows_total` grows toward
+the §5.1 estimate (the first pass is the main jump, after that — the
+inflow); `contents_total` — deleted `contents` rows;
+`freed_bytes_total` — the compressed bytes of dead blocks (the claim
+on the space; the space is physically returned by pack compaction,
+§5.4); `passes_total{result="ok"}` — one pass per hour;
+`skips_total` — only when the `q:analyze` depth is at the watermark;
+`deferred_total{stream}` — entries excluded by the exact protection
+(grows when the queues are stalled — expected until the `q:render`
+drain, T-159); `pending_errors_total` — **always 0** (growth — stop:
+the protection cannot read the streams); `bad_hashes_total` and
+`missing_refs_total` — **always 0** (growth — stop, see §5.5).
 
-**Замедление/пауза** — при устойчивом (минуты) нарушении любого из
-условий: PSI CPU some avg10 > 95% (`grep '^some' /proc/pressure/cpu`),
-скорости этапов ниже замера §12 (HTTP < 20 дом/с и т.п.), глубины
-`q:render`/`q:analyze` растут к watermark:
+**Slowdown/pause** — on a sustained (minutes-long) violation of any of
+the conditions: PSI CPU some avg10 > 95% (`grep '^some'
+/proc/pressure/cpu`), stage rates below the §12 measurement (HTTP < 20
+domains/s etc.), the `q:render`/`q:analyze` depths growing toward the
+watermark:
 
-1. Уменьшить пачку в `/etc/crawler/config.yaml`:
+1. Reduce the batch in `/etc/crawler/config.yaml`:
 
    ```yaml
    content:
-     retention_batch: 2000     # было 10000; вилка кампании под CPU-голод
+     retention_batch: 2000     # was 10000; the campaign's range under CPU starvation
    ```
 
-2. `systemctl restart crawler-http-worker` — безопасно по данным:
-   каждая пачка — короткая атомарная транзакция, рестарт между пачками
-   ничего не роняет, оборванная пачка откатывается целиком; очищенное
-   не пересканируется заново (очищенные строки выпадают из отбора —
-   идемпотентность, ТЗ 3.4). Но in-memory курсор дренажа при этом
-   теряется (T-185): первый проход после рестарта — стартовый catch-up-
-   круг с нулевого курсора, самый дорогой сценарий (Sort среза по всему
-   окну, см. оценку в §5.2). Во время кампании под CPU-голодом
-   рестартить только при необходимости и вне пикового часа.
-2a. (мягкая альтернатива) приостановить кампанию интерлоком: поднять
-   `content.retention_analyze_watermark` до текущей глубины `q:analyze`
-   — проходы начнут пропускаться (`skips_total` растёт) без рестарта.
-3. После кампании вернуть `retention_batch: 10000` тем же способом.
+2. `systemctl restart crawler-http-worker` — safe for the data: every
+   batch is a short atomic transaction, a restart between batches drops
+   nothing, an interrupted batch rolls back entirely; the cleaned data
+   is not scanned again (cleaned rows drop out of the selection —
+   idempotency, spec 3.4). But the in-memory drain cursor is lost this
+   way (T-185): the first pass after the restart is the starting
+   catch-up circle from the zero cursor — the most expensive scenario
+   (a Sort of the slice over the whole window, see the estimate in
+   §5.2). During a campaign under CPU starvation, restart only when
+   necessary and outside the peak hour.
+2a. (a soft alternative) pause the campaign with the interlock: raise
+   `content.retention_analyze_watermark` to the current `q:analyze`
+   depth — passes start being skipped (`skips_total` grows) without a
+   restart.
+3. After the campaign, restore `retention_batch: 10000` the same way.
 
-**Что НЕ делать:**
+**What NOT to do:**
 
-- не трогать когорту `render_pending` до дренажа `q:render` (T-159):
-  не снимать флаги вручную, не переиздавать `q:render` пачками — волна
-  рендеров на голодном CPU ляжет сама; исключённые записи доработает
-  штатный цикл T-166 после снятия флагов проходом доработки T-066;
-- не запускать путь Б (§5.3) параллельно с работающим дренажом пути А:
-  охраны UPDATE делают это безопасным, но бессмысленным — CPU-голод
-  общий, выберите один путь;
-- не поднимать `retention_batch` выше рабочей вилки 10–50 тыс.: длинные
-  транзакции держат блокировки строк и WAL-всплески.
+- do not touch the `render_pending` cohort until the `q:render` drain
+  (T-159): do not clear the flags by hand, do not republish `q:render`
+  in batches — a render wave on a starved CPU would collapse on its
+  own; the excluded entries are reworked by the regular T-166 cycle
+  after the flags are cleared by the T-066 rework pass;
+- do not run path B (§5.3) in parallel with a running path A drain:
+  the UPDATE guards make it safe but pointless — the CPU starvation is
+  shared, pick one path;
+- do not raise `retention_batch` above the working range of 10–50K:
+  long transactions hold row locks and cause WAL spikes.
 
-### 5.3. Путь Б (ускоренный): операционный SQL
+### 5.3. Path B (accelerated): operational SQL
 
-При дефиците времени или когда интерлоки съедают проходы пути А —
-дренаж скриптом `deploy/sql/t167-retention-backfill.sh`: ручное зеркало
-SQL цикла T-166 (`internal/content/retention.go`) — те же критерии,
-те же охраны (повторная проверка возраста +
-`content_hash IS NOT DISTINCT FROM` против гонок с перезаписью,
-`GREATEST(refcount − n, 0)`, `DELETE … refcount <= 0`), курсорная
-пагинация по PK, каждая пачка — отдельная транзакция `BEGIN…COMMIT`.
-Прерывание (Ctrl-C) безопасно в любой момент, повторный запуск
-идемпотентен, рядом со штатным циклом не конфликтует (но и не нужен —
-см. §5.2).
+When time is short or the interlocks eat up path A's passes — a drain
+via the `deploy/sql/t167-retention-backfill.sh` script: a manual
+mirror of the T-166 cycle's SQL (`internal/content/retention.go`) —
+the same criteria, the same guards (a re-check of age +
+`content_hash IS NOT DISTINCT FROM` against races with overwriting,
+`GREATEST(refcount − n, 0)`, `DELETE … refcount <= 0`), cursor
+pagination by PK, every batch a separate `BEGIN…COMMIT` transaction.
+Interrupting (Ctrl-C) is safe at any moment, a re-run is idempotent,
+and it does not conflict with the regular cycle (but is not needed —
+see §5.2).
 
-Отличия от цикла — режим кампании: батч по умолчанию 2000 (под
-CPU-голод), пауза 5 с между пачками, перед каждой пачкой ворота —
-PSI CPU some avg10 (по умолчанию ≤ 95%) и глубины `q:render`/`q:analyze`
-двумя уровнями: грубый `XLEN` (по умолчанию < 100 000; точная глубина —
-`crawlerctl status`) и точный **лаг групп потребления** (`XINFO GROUPS`
-→ `lag`, Redis 7+; `T167_RENDER_LAG`/`T167_ANALYZE_LAG`, по умолчанию
-1000 — ≈полминуты притока `q:analyze`, «потребители практически
-успевают»). Лаг — недоставленный хвост стрима: именно он держит записи
-от чистки у точной защиты цикла T-166, и ворота пути Б выравнивают
-скрипт с той же гарантией: пауза при лаге ≥ порога, записи, ждущие
-потребителя, не трогаются. Групп у стрима нет — лаг считается как XLEN
-(всё содержимое недоставлено); лаг `nil` (обрезка недоставленного либо
-Redis < 7) — лаг-ворота пропускаются с WARN, действует XLEN. Ворота
-**ждут** (до `T167_GATE_MAX_WAIT`, по умолчанию час), а не роняют
-скрипт. Аномалии учёта (`bad_hashes`/`missing_refs` — аналоги счётчиков
-T-166) останавливают скрипт: refcount по ним не менялся, но рост —
-ошибка писателя/учёта, разбираться до продолжения. Код возврата:
-штатные исходы (дренаж исчерпан, потолок `max_batches`) — 0, аварийные
-(ошибка пачки, таймаут ворот, аномалии учёта) — 1: цепочки команд и
-автоматизация видят незавершённый дренаж.
+The differences from the cycle — the campaign mode: a default batch of
+2000 (under CPU starvation), a 5 s pause between batches, and before
+every batch the gates — PSI CPU some avg10 (≤ 95% by default) and the
+`q:render`/`q:analyze` depths on two levels: the coarse `XLEN`
+(< 100,000 by default; the exact depth — `crawlerctl status`) and the
+exact **lag of the consumer groups** (`XINFO GROUPS` → `lag`,
+Redis 7+; `T167_RENDER_LAG`/`T167_ANALYZE_LAG`, 1000 by default —
+≈half a minute of the `q:analyze` inflow, "the consumers almost keep
+up"). The lag is the stream's undelivered tail: it is exactly what
+holds entries back from cleanup at the exact protection of the T-166
+cycle, and path B's gates align the script with the same guarantee: a
+pause while the lag is ≥ the threshold, entries waiting for a consumer
+are not touched. No groups on the stream — the lag is computed as
+XLEN (everything in it is undelivered); a `nil` lag (a trim of
+undelivered entries, or Redis < 7) — the lag gates are skipped with a
+WARN, and XLEN applies. The gates **wait** (up to
+`T167_GATE_MAX_WAIT`, an hour by default) — they do not crash the
+script. Accounting anomalies (`bad_hashes`/`missing_refs` — analogs of
+the T-166 counters) stop the script: refcount was not changed for
+them, but growth is a writer/accounting error — investigate before
+continuing. Exit code: regular outcomes (the drain exhausted, the
+`max_batches` cap) — 0; emergency ones (a batch error, a gate timeout,
+accounting anomalies) — 1: command chains and automation see an
+unfinished drain.
 
-**При застое `q:render` путь Б не запускать до дренажа стрима (T-159):**
-лаг ≈99 тыс. при пороге 1000 не отпустит ворота — скрипт честно
-остановится по таймауту; это ожидаемая работа защиты (срезать записи,
-ждущие рендера, нельзя), сначала верните render-worker в строй либо
-дренируйте стрим, затем повторите запуск (идемпотентен).
+**With a stalled `q:render`, do not run path B until the stream
+drains (T-159):** a lag of ≈99K against a threshold of 1000 will not
+release the gates — the script will honestly stop on the timeout; this
+is the protection working as expected (entries waiting for a render
+must not be cleared), first bring the render-worker back or drain the
+stream, then repeat the run (it is idempotent).
 
 ```bash
-# из чекаута репозитория на сервере, либо через ssh без копирования:
+# from a repository checkout on the server, or via ssh without copying:
 ssh root@155.212.174.88 'CRAWLER_PG_DSN=<dsn> bash -s' -- \
     < deploy/sql/t167-retention-backfill.sh
 
-# настроечные переменные (значения по умолчанию):
-#   T167_BATCH=2000          строк в пачке-транзакции
-#   T167_RETENTION='6 hours' окно, как content.retention
-#   T167_PAUSE=5             пауза между пачками, с
-#   T167_MAX_BATCHES=1000    страховка от вечного цикла (2 млн строк)
-#   T167_PSI_MAX=95          ворота: PSI CPU some avg10, %
-#   T167_QUEUE_MAX=100000    ворота: XLEN q:render/q:analyze (грубые)
-#   T167_RENDER_LAG=1000     ворота: лаг группы q:render (Redis 7+)
-#   T167_ANALYZE_LAG=1000    ворота: лаг группы q:analyze
-#   T167_GATE_MAX_WAIT=3600  сколько ворота ждут до остановки, с
+# tuning variables (the default values):
+#   T167_BATCH=2000          rows per batch transaction
+#   T167_RETENTION='6 hours' the window, same as content.retention
+#   T167_PAUSE=5             the pause between batches, s
+#   T167_MAX_BATCHES=1000    a guard against an endless loop (2M rows)
+#   T167_PSI_MAX=95          gates: PSI CPU some avg10, %
+#   T167_QUEUE_MAX=100000    gates: the XLEN of q:render/q:analyze (coarse)
+#   T167_RENDER_LAG=1000     gates: the q:render group's lag (Redis 7+)
+#   T167_ANALYZE_LAG=1000    gates: the q:analyze group's lag
+#   T167_GATE_MAX_WAIT=3600  how long the gates wait before stopping, s
 ```
 
-Скрипт печатает итог каждой пачки (кандидатов/срезано/ссылок/удалено
-contents/курсор) и суммарный итог (дублируется в journald, тег
-`crawler-t167`). Контроль параллельно — как в §5.2 (`crawlerctl status`,
-PSI, метрики: путь Б не двигает `crawler_content_retention_*` — его итоги
-только в stdout/journald скрипта; сверьте остаток кандидатов запросом
-оценки §5.1). При `bad_hashes`/`missing_refs` > 0 — стоп и разбор, при
-вокруг-watermark глубинах — ворота держат темп сами.
+The script prints the result of every batch
+(candidates/cleared/refs/contents deleted/cursor) and the total result
+(duplicated into journald, the `crawler-t167` tag). Monitoring in
+parallel — as in §5.2 (`crawlerctl status`, PSI, metrics: path B does
+not move `crawler_content_retention_*` — its results are only in the
+script's stdout/journald; cross-check the remaining candidates with
+the §5.1 estimate query). At `bad_hashes`/`missing_refs` > 0 — stop
+and investigate; at near-watermark depths the gates hold the pace
+themselves.
 
-### 5.4. Финальные шаги (после дренажа, оба пути)
+### 5.4. Final steps (after the drain, both paths)
 
-1. **VACUUM (ANALYZE) затронутых партиций `subdomain_results`.** Трим
-   NULL-ит jsonb и ссылок — HOT-версии строк; обычный VACUUM срезает
-   мёртвые версии и возвращает страницы, ANALYZE обновляет статистику
-   после сильного изменения ширины строк. Обычный, **не FULL**: FULL
-   держит AccessExclusiveLock и переписывает таблицы, месту не нужен —
-   срезанные HOT-версии отдаёт и автовакуум, кампания лишь форсирует
-   момент. VACUUM (ANALYZE) лочит только от параллельных вакуумов
-   (ShareUpdateExclusive), конвейер не останавливается; прогоняйте по
-   одной-две партиции, глядя на PSI:
+1. **VACUUM (ANALYZE) the affected `subdomain_results` partitions.**
+   The trim NULLs out jsonb and refs — dead row versions; a plain
+   VACUUM removes the dead versions and returns pages, and ANALYZE
+   refreshes the statistics after a strong change in row width. Plain,
+   **not FULL**: FULL takes an AccessExclusiveLock and rewrites the
+   tables — the space does not need it; autovacuum would return the
+   dead HOT versions anyway, the campaign merely forces the moment.
+   VACUUM (ANALYZE) locks only against concurrent vacuums
+   (ShareUpdateExclusive), the pipeline does not stop; run one or two
+   partitions at a time, watching the PSI:
 
    ```bash
-   # затронутые партиции с мёртвыми строками, самые тяжёлые вперёд
+   # affected partitions with dead rows, heaviest first
    psql "$CRAWLER_PG_DSN" -Atc "
      SELECT format('VACUUM (ANALYZE) %I;', relname)
      FROM pg_stat_user_tables
@@ -1247,105 +1358,115 @@ PSI, метрики: путь Б не двигает `crawler_content_retention_
      | psql "$CRAWLER_PG_DSN" -v ON_ERROR_STOP=1
    ```
 
-   (VACUUM не выполняется в транзакции — по одной команде на строку;
-   партиции `subdomain_results_z<zone>_h<hash>` и `…_default` —
-   миграция 000003. Повторный прогон безопасен.)
+   (VACUUM cannot run inside a transaction — one command per line; the
+   partitions `subdomain_results_z<zone>_h<hash>` and `…_default` —
+   migration 000003. A re-run is safe.)
 
-2. **Контроль bloat.** Если доступен `pgstattuple` —
-   `CREATE EXTENSION IF NOT EXISTS pgstattuple;` и
-   `pgstattuple_approx('<партиция>')`: после VACUUM `dead_tuple_percent`
-   у затронутых партиций ≈0. Без расширения — до/посмертно размерами
-   `pg_total_relation_size` из замера §5.1: размер партиции после
-   VACUUM падает пропорционально срезанному jsonb (планка приёмки —
-   весь журнал ≤ 1,5 ГБ, §5.5), остаточный bloat зажат автовакуумом
-   (`docs/db.md` — autovacuum под партиции).
+2. **Bloat check.** If `pgstattuple` is available —
+   `CREATE EXTENSION IF NOT EXISTS pgstattuple;` and
+   `pgstattuple_approx('<partition>')`: after VACUUM the
+   `dead_tuple_percent` of the affected partitions is ≈0. Without the
+   extension — before/after via the `pg_total_relation_size` sizes
+   from the §5.1 measurement: a partition's size after VACUUM drops in
+   proportion to the cleared jsonb (the acceptance bar — the whole
+   results journal ≤ 1.5 GB, §5.5); the residual bloat is held down by
+   autovacuum (`docs/db.md` — autovacuum for partitions).
 
-3. **Контроль компактификации паков.** После срезания ссылок доля живых
-   данных почти всех паков падает ниже порога 0.5 (`DefaultCompactThreshold`
-   T-045, конфигурацией не меняется) — часовой проход
-   `CompactLoop` (http-worker) перепишет почти все паки: живые блоки
-   дописываются в новые, старые файлы удаляются. Следить:
+3. **Pack compaction monitoring.** After the refs are cleared, the
+   live-data share of almost every pack falls below the 0.5 threshold
+   (`DefaultCompactThreshold` T-045, not changeable via configuration)
+   — the hourly `CompactLoop` pass (http-worker) will rewrite almost
+   all packs: live blocks are appended into new ones and old files are
+   deleted. Watch:
 
    ```bash
-   journalctl -t crawler-http-worker -f | grep 'компактификации'
-   # "проход компактификации паков packs=N freed_bytes=…" — прогресс
-   du -sh /var/lib/crawler/content      # каталог тает по мере unlink паков
-   df -h /var/lib/crawler               # временный двойной след: живые
-                                       # блоки переписываются до удаления
-                                       # старого пака
+   journalctl -t crawler-http-worker -f | grep 'compaction'
+   # "pack compaction pass packs=N freed_bytes=…" — progress
+   du -sh /var/lib/crawler/content      # the directory shrinks as packs are unlinked
+   df -h /var/lib/crawler               # a temporary double footprint: live
+                                        # blocks are rewritten before the old
+                                        # pack is deleted
    ```
 
-   Двойной след при массе мёртвых блоков мал (живых байтов — единицы
-   ГБ из 20), но при `disk_avail` у порога `content.disk_free_percent`
-   компактификация сама откладывает паки с живыми блоками (C-17):
-   паки без живых блоков только удаляются — это и есть освобождение,
-   дренаж не блокируется. Пересборка ~20 ГБ чтения+записи на NVMe —
-   часы; место возвращается постепенно, не ждать мгновенного `du`-обнуления.
+   The double footprint is small with a mass of dead blocks (a few GB
+   of live bytes out of 20), but when `disk_avail` is near the
+   `content.disk_free_percent` threshold, compaction itself defers
+   packs with live blocks (C-17): packs without live blocks are only
+   deleted — that is exactly the space being freed, and the drain is
+   not blocked. Rebuilding ~20 GB of reads+writes on NVMe takes hours;
+   the space returns gradually — do not expect an instant `du` to
+   zero.
 
-4. **Выборочная сверка неприкосновенности** (все числа — против §5.1):
+4. **Spot-check inviolability** (all numbers — against §5.1):
 
    ```sql
-   SELECT count(*) FROM laravel_domains;    -- = базовому
-   SELECT count(*) FROM laravel_findings;   -- = базовому
-   SELECT count(*) FROM laravel_domains AS ld              -- якорь = базовому
+   SELECT count(*) FROM laravel_domains;    -- = the baseline
+   SELECT count(*) FROM laravel_findings;   -- = the baseline
+   SELECT count(*) FROM laravel_domains AS ld              -- the anchor = the baseline
    JOIN subdomain_results AS r
      ON r.zone_id = ld.zone_id AND r.domain_id = ld.domain_id
    WHERE r.content_hash IS NOT NULL;
    ```
 
    ```bash
-   crawlerctl domain --content <имя находки из laravel_domains>   # контент читается
-   redis-cli XLEN q:dead                                          # = базовому
+   crawlerctl domain --content <the name of a find from laravel_domains>   # the content is readable
+   redis-cli XLEN q:dead                                          # = the baseline
    ```
 
-### 5.5. Критерии приёмки
+### 5.5. Acceptance criteria
 
-| Критерий | Планка | Как мерить |
+| Criterion | Target | How to measure |
 |---|---|---|
-| Свободное место тома | **+≥15 ГБ** к базовому | `df -h` (§5.1 ↔ после §5.4) |
-| Каталог контента | **≤3–5 ГБ** (находки, render_pending, свежесть 6 ч) | `du -sh /var/lib/crawler/content` |
-| `subdomain_results` после VACUUM | **≤1,5 ГБ** | сумма `pg_total_relation_size` листовых партиций (§5.1) |
-| Находки | счётчики `laravel_domains`/`laravel_findings` и якорный JOIN = базовым; контент находок читается | §5.4 п. 4 |
-| `q:dead` | **прирост 0** за кампанию | `XLEN` (§5.1 ↔ финал) |
-| Конвейер | скорости этапов в пределах замера §12: HTTP 21–23 дом/с, DNS 26–28, render 0,20–0,23 стр/с; PSI CPU some ≤95% | `crawlerctl status`, t092-сэмплер, `/proc/pressure/cpu` |
-| Учёт контента | `bad_hashes_total` = `missing_refs_total` = 0 (путь А — метрики; путь Б — итог скрипта) | §5.2/§5.3 |
+| Volume free space | **+≥15 GB** over the baseline | `df -h` (§5.1 ↔ after §5.4) |
+| Content directory | **≤3–5 GB** (finds, render_pending, 6 h freshness) | `du -sh /var/lib/crawler/content` |
+| `subdomain_results` after VACUUM | **≤1.5 GB** | the sum of `pg_total_relation_size` over leaf partitions (§5.1) |
+| Finds | the `laravel_domains`/`laravel_findings` counters and the anchor JOIN equal the baseline; find content is readable | §5.4 item 4 |
+| `q:dead` | **0 growth** over the campaign | `XLEN` (§5.1 ↔ the final check) |
+| Pipeline | stage rates within the §12 measurement: HTTP 21–23 domains/s, DNS 26–28, render 0.20–0.23 pages/s; PSI CPU some ≤95% | `crawlerctl status`, the t092 sampler, `/proc/pressure/cpu` |
+| Content accounting | `bad_hashes_total` = `missing_refs_total` = 0 (path A — metrics; path B — the script's summary) | §5.2/§5.3 |
 
-Не сошлось — типовые причины:
+The numbers do not match — typical causes:
 
-- **диск не растёт при состоявшемся дренаже** (`rows_total` у оценки,
-  `contents_total` вырос): компактификация ещё не дошла или откладывает
-  паки по C-17 — смотреть журнал «проход компактификации паков» и §5.4
-  п. 3; остаток мёртвых строк `contents` (§5.1, `dead_rows`) — её вход;
-- **`skips_total` растёт** — глубина `q:analyze` у watermark: анализатор
-  не успевает, тела ещё нужны; кампания честно ждёт (или путь Б — ворота),
-  форсировать нельзя;
-- **`bad_hashes_total`/`missing_refs_total` > 0** — стоп и разбор по
-  инвариантам T-044/T-056 (ошибка писателя/учёта), продолжать дренаж
-  после устранения причины;
-- **скорости/PSI вышли за §12** — замедлить (§5.2: уменьшить
-  `retention_batch`; §5.3: увеличить `T167_PAUSE`/уменьшить `T167_BATCH`)
-  или остановить скрипт — дренаж продолжится с места (идемпотентность).
+- **the disk does not grow despite a completed drain** (`rows_total`
+  near the estimate, `contents_total` grown): compaction has not
+  caught up yet or defers packs per C-17 — check the journal for the
+  "pack compaction pass" and §5.4 item 3; the residual of dead
+  `contents` rows (§5.1, `dead_rows`) is its input;
+- **`skips_total` grows** — the `q:analyze` depth is at the watermark:
+  the analyzer cannot keep up, the bodies are still needed; the
+  campaign honestly waits (or path B — the gates), forcing is not
+  allowed;
+- **`bad_hashes_total`/`missing_refs_total` > 0** — stop and
+  investigate against the T-044/T-056 invariants (a writer/accounting
+  error); resume the drain after the cause is fixed;
+- **rates/PSI outside §12** — slow down (§5.2: reduce
+  `retention_batch`; §5.3: raise `T167_PAUSE`/reduce `T167_BATCH`) or
+  stop the script — the drain resumes from where it stopped
+  (idempotency).
 
-После кампании: вернуть `content.retention_batch`, если меняли (§5.2),
-и зафиксировать работы в журнале ([`operations.md`](operations.md) §5).
+After the campaign: restore `content.retention_batch` if it was
+changed (§5.2) and record the work in the log
+([`operations.md`](operations.md) §5).
 
-## 6. Ручные операции с битом render_pending (T-175)
+## 6. Manual operations on the render_pending bit (T-175)
 
-Бит `render_pending` (бит 1 `domains.flags`) и счётчик рендер-долга
-`crawler_counters['render_pending']` (миграция 000015) связаны
-инвариантом: **счётчик = число строк с битом** (без фильтра по статусу).
-Переходы бита в коде ведут пару атомарно (±1 в той же транзакции,
-internal/httpworker/renderq.go), поэтому **любая ручная правка бита
-обязана править счётчик в той же транзакции** — иначе gauge
-`crawler_render_pending_domains`, строка «Рендер-долг» отчёта нагрузки и
-алерт `render_debt` начинают лгать (а отсутствие строки счётчика
-останавливает запись результатов с флагом — воркер честно падает на
-отсутствии строки, это защита от молчаливой лжи).
+The `render_pending` bit (bit 1 of `domains.flags`) and the render-debt
+counter `crawler_counters['render_pending']` (migration 000015) are
+linked by an invariant: **the counter = the number of rows with the
+bit** (no status filter). Bit transitions in code move the pair
+atomically (±1 in the same transaction, internal/httpworker/renderq.go),
+so **any manual edit of the bit must edit the counter in the same
+transaction** — otherwise the `crawler_render_pending_domains` gauge,
+the "Render debt" row of the load report, and the `render_debt` alert
+start lying (and a missing counter row stops the recording of results
+with the flag — the worker fails honestly on the missing row; that is
+the protection against silent lying).
 
-Ручная правка — парой «бит + счётчик» в ОДНОМ операторе, сдвиг привязан
-к ФАКТУ перехода (безусловный `±1` при уже стоящем/снятом бите — охрана
-дала 0 строк — разводил бы счётчик). Снятие бита (пример: контент домена
-безвозвратно потерян):
+A manual edit — the "bit + counter" pair in ONE statement, the shift
+tied to the FACT of the transition (an unconditional ±1 when the bit is
+already set/cleared — the guard returned 0 rows — would desync the
+counter). Clearing the bit (example: a domain's content is
+irrecoverably lost):
 
 ```sql
 WITH cleared AS (
@@ -1356,13 +1477,14 @@ WITH cleared AS (
 UPDATE crawler_counters
 SET value = value - (SELECT count(*) FROM cleared)
 WHERE name = 'render_pending'
-RETURNING value;  -- пусто = строки счётчика нет (симптом ниже)
+RETURNING value;  -- empty = the counter row is missing (symptom below)
 ```
 
-Установка бита (возврат доменов в доработку — готовый шаблон для списка
-из dead-записей в §2.5; охрана статуса — от гонки с применением delete:
-перевод в `deleted` снимает бит, повторная установка удалённому без
-охраны оставляла бы бит-сироту, T-269):
+Setting the bit (returning domains to rework — a ready-made template
+for the list from the §2.5 dead entries; the status guard protects
+against a race with delete application: a transition to `deleted`
+clears the bit, and re-setting it for a deleted domain without the
+guard would leave an orphan bit, T-269):
 
 ```sql
 WITH flagged AS (
@@ -1376,44 +1498,48 @@ WHERE name = 'render_pending'
 RETURNING value;
 ```
 
-`UPDATE ... RETURNING` показывает фактическое значение счётчика;
-пустой результат второго UPDATE (0 строк) — строки
-`crawler_counters['render_pending']` нет, см. симптом ниже: флаг при
-этом уже поставлен/снят (первый CTE исполняется всегда), счётчик
-остался — восстановить строку и свериться.
+`UPDATE ... RETURNING` shows the counter's actual value; an empty
+result of the second UPDATE (0 rows) means the
+`crawler_counters['render_pending']` row is missing, see the symptom
+below: the flag has by then already been set/cleared (the first CTE
+always executes) while the counter was left behind — restore the row
+and verify.
 
-Симптом пропавшей/сломанной строки счётчика: шквал ошибок записи
-результата «счётчик рендер-долга: затронуто 0 строк» у http-worker при
-переполненной `q:render` (каждая флажащая транзакция откатывается),
-алерт `render_debt` в «не измеряется» и — с T-269 — ошибки применения
-delete-файлов с флаговыми доменами («строка счётчика 'render_pending'
-отсутствует», файл остаётся в staging до восстановления строки) —
-восстановить строку (миграция
-000015 или руками `INSERT ... VALUES ('render_pending', <фактический
-count>)`), затем сверка ниже.
+Symptom of a missing/broken counter row: a burst of result-recording
+errors "render debt counter: 0 rows affected" from the http-worker
+with `q:render` overflowing (every flagging transaction rolls back),
+the `render_debt` alert in the "not measurable" state and — since
+T-269 — errors of applying delete files with flagged domains ("counter
+row 'render_pending' is missing"; the file stays in staging until the
+row is restored) — restore the row (migration
+000015 or a manual `INSERT ... VALUES ('render_pending', <the actual
+count>)`), then verify below.
 
-Симптом рассинхрона «бит без счётчика» (guard прохода доработки, T-181):
-при `value = 0` и живых флагах (ручной SQL поставил бит мимо счётчика)
-дренаж `render_pending` стоит — проход проверяет долг точечным чтением
-счётчика и не выполняет тяжёлую выборку вовсе; симптом виден как
-«флаги есть, проход доработки публикует 0» при нулевом gauge долга.
-Обратный рассинхрон (`value > 0`, selectable-флагов нет) — тяжёлая
-выборка выполняется за каждый тик без раннего останова LIMIT: полный
-проход по корпусу (десятки секунд, как сверка ниже), Warn «счётчик
-долга > 0, выборка пуста» в журнале http-worker. Лечение в обоих
-случаях — сверка ниже и выравнивание счётчика до фактического
-`count(*)` (отрицательный `value` — тот же рецепт: drift <> 0).
+Symptom of the "bit without counter" desync (the rework pass guard,
+T-181): with `value = 0` and live flags (manual SQL set the bit past
+the counter) the `render_pending` drain stands still — the pass checks
+the debt with a point read of the counter and never runs the heavy
+selection; the symptom shows as "flags present, the rework pass
+publishes 0" with a zero debt gauge. The reverse desync (`value > 0`,
+no selectable flags) — the heavy selection runs on every tick without
+the LIMIT early stop: a full pass over the corpus (tens of seconds,
+like the verification below), the Warn "debt counter > 0, the
+selection is empty" in the http-worker journal. The treatment in both
+cases — the verification below and aligning the counter to the actual
+`count(*)` (a negative `value` — the same remedy: drift <> 0).
 
-Биты-«сироты» — удалённые домены с флагом. Штатный путь закрыт T-186:
-применение delete-файла снимает бит той же транзакцией с декрементом
-счётчика (apply_delete, охрана «ещё не deleted» не декрементирует
-повторно — идемпотентность at-least-once). Источники остатка: домены,
-удалённые ДО деплоя T-186 с живым битом (разовый хвост), и дрейф
-ручного SQL. Симптом прежний: счётчик их видит (инвариант — без
-фильтра по status), выборка прохода — нет → `value` вечно > 0,
-gauge/алерт `render_debt` показывают фантомный долг, проход платит
-полный seq scan за каждый тик (Warn «счётчик долга > 0, выборка пуста»).
-Разовая чистка хвоста — парой «бит + счётчик» по образцу выше:
+Orphan bits — deleted domains carrying the flag. The regular path is
+closed by T-186: applying a delete file clears the bit in the same
+transaction with a counter decrement (apply_delete; the "not yet
+deleted" guard does not decrement twice — at-least-once idempotency).
+Sources of the residual: domains deleted BEFORE the T-186 deploy with
+a live bit (a one-off tail), and manual-SQL drift. The symptom is the
+old one: the counter sees them (the invariant has no status filter),
+the pass's selection does not → `value` is > 0 forever, the
+render_debt gauge/alert show phantom debt, and the pass pays a full
+seq scan every tick (the Warn "debt counter > 0, the selection is
+empty"). A one-off tail cleanup — the "bit + counter" pair per the
+template above:
 
 ```sql
 WITH cleared AS (
@@ -1424,292 +1550,320 @@ WITH cleared AS (
 UPDATE crawler_counters
 SET value = value - (SELECT count(*) FROM cleared)
 WHERE name = 'render_pending'
-RETURNING value;  -- пусто = строки счётчика нет (симптом выше)
+RETURNING value;  -- empty = the counter row is missing (symptom above)
 ```
 
-Сверка после любых сомнительных операций (однократный seq scan — делать
-в окно, на корпусе 41,8 млн строк это десятки секунд):
+Verification after any questionable operations (a single seq scan — do
+it in a window; on a corpus of 41.8M rows it takes tens of seconds):
 
 ```sql
--- одна строка: drift = 0 — сошлось; -1 — строки счётчика нет
--- (NULL без COALESCE не сравнивается с 0 и случай «строки нет» не виден)
+-- one row: drift = 0 — the numbers match; -1 — the counter row is missing
+-- (NULL without COALESCE does not compare equal to 0 and the
+-- missing-row case would be invisible)
 SELECT COALESCE((SELECT value FROM crawler_counters WHERE name = 'render_pending'), -1)
      - (SELECT count(*) FROM domains WHERE (flags & 2) <> 0) AS drift;
 ```
 
-`drift <> 0` — выровнять руками (UPDATE счётчика до фактического
-count(*)). Удалять/переименовывать строку `'render_pending'` нельзя:
-миграция создаёт её один раз, писатели результатов ждут её на каждом
-переходе бита.
+`drift <> 0` — align it by hand (UPDATE the counter to the actual
+`count(*)`). Deleting or renaming the `'render_pending'` row is
+forbidden: the migration creates it once, and result writers expect it
+on every bit transition.
 
-Возврат накопленного долга в работу — штатный проход доработки
-(`RequeueRenderPending` цикла http-worker): он снимает флаги со счётчиком
-сам, ручного участия не требует; заморозка/разморозка притока
-планировщика на дренаж `q:render` счётчика не касается (бит ставят только
-результаты HTTP-эпизодов при переполнении очереди рендера).
+Returning the accumulated debt to work — the regular rework pass
+(`RequeueRenderPending` of the http-worker cycle): it clears the flags
+with the counter by itself and needs no manual involvement;
+freezing/unfreezing the scheduler inflow for the `q:render` drain does
+not touch the counter (the bit is set only by HTTP-episode results
+when the render queue overflows).
 
-### Ручные правки при живой реконсиляции (T-269, итог инцидента 08.11.2026)
+### Manual edits alongside a live reconciliation (T-269, the outcome of the 08.11.2026 incident)
 
-Инцидент при разборе `q:dead` (prod-reports/2026-11-08-010800.md):
-ручная установка 18 флагов по шаблону выше, проход доработки снял их
-парой −18 — а счётчик ушёл в −18 (сдвиг −36 за один проход).
-Расследование (T-269) опровергло подозрение в реконсиляции monitor и
-нашло виновника в применении delete-файла: декремент считался по
-СНАПШОЧНОМУ числу битов, а снятие бита — по текущей версии строки,
-конкурентное снятие проходом доработки между снимком и блокировкой
-декрементировало счётчик дважды. Исправлено (пара «бит × счётчик»
-идёт по факту перехода с охраной текущей версии), воспроизведение —
-`test/integration/renderbit_test.go` (TestRenderPendingBit_DeleteClearRace).
-Операционные следствия для ручных правок:
+An incident during q:dead triage (prod-reports/2026-11-08-010800.md):
+18 flags were set manually per the template above, the rework pass
+cleared them with a pair of −18 — and the counter went to −18 (a shift
+of −36 in one pass). The investigation (T-269) refuted the suspicion
+of the monitor's reconciliation and found the culprit in delete-file
+application: the decrement was counted over a SNAPSHOT of the bit
+count while the bit was cleared against the current row version — a
+concurrent clearing by the rework pass between the snapshot and the
+lock decremented the counter twice. Fixed (the "bit × counter" pair
+now follows the fact of the transition with a guard on the current
+version); the reproduction — `test/integration/renderbit_test.go`
+(TestRenderPendingBit_DeleteClearRace). Operational consequences for
+manual edits:
 
-- **Шаблоны снятия и сверки этого раздела безопасны против гонок с
-  кодом** — охрана `(flags & 2)` и дельта по `count(*)` из RETURNING
-  считают фактические переходы; конкуренция с проходом доработки или
-  применением delete даёт 0 строк и не двигает счётчик. Шаблон установки
-  требует охраны статуса (`status <> 6`, добавлена T-269): применение
-  delete снимает бит той же транзакцией, повторная установка удалённому
-  без охраны оставляла бы бит-сироту.
-- **Реконсиляция monitor пишет абсолютное значение агрегата и всегда
-  двигает `updated_at`** — «немого» второго декремента она оставить не
-  может. Её собственное окно (агрегат посчитал раньше, upsert исполнился
-  позже) может затереть конкурентные переходы устаревшим абсолютом:
-  ложный долг или ложный ноль на срок до `monitor.zone_stats_interval`,
-  самолечится следующим проходом. При разборе рассинхрона сверяйте
-  `updated_at` строки: время прохода реконсиляции — её след;
-  `updated_at` не двигался, а значение сместилось — писал дельта-писатель
-  (проход доработки/применение delete) или ручной SQL мимо кода.
-- **Drift-метрика прохода (`crawler_counters_drift`) парность не
-  измеряет** (старое значение счётчика против нового): рассинхрон
-  «счётчик против числа битов» видит только сверка ниже /
-  `crawlerctl counters verify`.
+- **The clearing and verification templates of this section are safe
+  against races with the code** — the `(flags & 2)` guard and the
+  delta over the `count(*)` from RETURNING count the actual
+  transitions; racing with the rework pass or a delete application
+  yields 0 rows and does not move the counter. The setting template
+  needs the status guard (`status <> 6`, added by T-269): a delete
+  application clears the bit in the same transaction, and re-setting
+  it for a deleted domain without the guard would leave an orphan bit.
+- **The monitor's reconciliation writes the aggregate's absolute value
+  and always advances `updated_at`** — it cannot leave a "bit" of a
+  second decrement behind. Its own window (the aggregate computed
+  earlier, the upsert executed later) can overwrite concurrent
+  transitions with the stale absolute: a false debt or a false zero
+  for up to `monitor.zone_stats_interval`, self-healing on the next
+  pass. When investigating a desync, check the row's `updated_at`:
+  the reconciliation pass's time is its trace; if `updated_at` did not
+  move but the value shifted, a delta writer wrote it (the rework
+  pass / delete application) or manual SQL bypassed the code.
+- **The pass's drift metric (`crawler_counters_drift`) does not
+  measure pairing** (the counter's old value against the new one):
+  only the verification below / `crawlerctl counters verify` can see
+  the "counter vs the number of bits" desync.
 
-## 7. Дрейф инкрементальных счётчиков конвейера (T-178)
+## 7. Drift of the pipeline's incremental counters (T-178)
 
-Счётчики состояний конвейера (колонки зон `domains_total` /
+The pipeline state counters (the zone columns `domains_total` /
 `domains_pending` / `domains_queued` / `domains_checked` /
-`domains_laravel` и строки `crawler_counters`: `status_*`, кумулятивы
-`laravel_appeared_total` / `laravel_lost_total`, `render_pending`,
-суточные `checks:YYYY-MM-DD` и `temp_error:YYYY-MM-DD` — T-179/T-182,
-корзины зрелости ретрая `retry_mature:YYYY-MM-DD` — T-202, часовые
-корзины темпа `results:`/`rendered:YYYY-MM-DD"T"HH24` — T-203,
-корзины неанализированных хвостов переанализа
-`reanalyze:YYYY-MM-DD"T"HH24` — T-204)
-ведут дельты в транзакциях переходов; авторитет — совмещённая
-реконсиляция monitor раз в `monitor.zone_stats_interval`. Ненулевой
-дрейф (`crawler_counters_drift`, Warn «реконсиляция: дрейф счётчиков» в
-журнале monitor) — признак пропущенного перехода, сбоя между Deploy
-сервисов или ручного SQL мимо кода; сам проход его чинит. Операционное
-следствие дрейфа `domains_pending` вниз (T-183): зона со счётчиком 0
-невидима выборке диспетчера (фильтр «только зоны с работой») — её
-pending-домены ждут ближайшей реконсиляции (≤
-`monitor.zone_stats_interval`, по умолчанию 30 мин) или `recount`;
-завышенный счётчик даёт лишь «холостую» пробу без деградации. Похожая
-граница доверия у корзин зрелости ретрая (T-202): заниженная сумма
-корзин держит закрытым guard тяжёлой выборки ретрая — зрелые
-temp_error-кандидаты ждут ближайшей реконсиляции или `recount`
-(дренаж лишь откладывается, ≤ интервала), завышенная даёт холостые
-seq scan за тик до прохода; у корзин хвостов переанализа (T-204)
-асимметрия жёстче из-за прыжка курсора закрытого guard'а на границу
-часа: заниженная (отрицательный дрейф декрементов маскирует
-положительную prev-корзину) — тик окно не вычитывает И прыгает
-курсором, зрелый хвост, невидимый корзинам, оказывается за курсором —
-его подберут рестарт (стартовый дренаж + якорь 24 ч) или полный дренаж
-смены правил (остаточный класс T-193 §4.2), ждать одной реконсиляции
-недостаточно; завышенная даёт один холостой проход окна за тик до
-прохода. Суточные
-позиции `daily:checks` / `daily:temp_error` — исключение: они потоковые
-(инкременты считают события записи результатов HTTP, живое окно — домены
-дня всех веток), ненулевое значение под живой нагрузкой — норма, Warn по
-ним не поднимается, наблюдается gauge; корзины `retry_mature:past` /
-`retry_mature:today` (T-202), часовые корзины темпа
-`rendered:prev`/`rendered:cur`/`results:prev`/`results:cur` (T-203)
-и корзины хвостов `reanalyze:prev`/`reanalyze:cur` (T-204)
-— та же потоковая семантика (события вставки строк, рендеров и
-штампов против живых строк окна; дрейф часовых корзин лишь слегка
-искажает темп дашборда между проходами, дрейф корзин хвостов —
-свежесть guard'а — абсолюты выравнивает проход).
+`domains_laravel` and the `crawler_counters` rows: `status_*`, the
+cumulatives `laravel_appeared_total` / `laravel_lost_total`,
+`render_pending`, the daily `checks:YYYY-MM-DD` and
+`temp_error:YYYY-MM-DD` — T-179/T-182, the retry maturity buckets
+`retry_mature:YYYY-MM-DD` — T-202, the hourly rate buckets
+`results:`/`rendered:YYYY-MM-DD"T"HH24` — T-203, the unanalyzed
+reanalysis-tail buckets `reanalyze:YYYY-MM-DD"T"HH24` — T-204) keep
+deltas in the transition transactions; the authority is the monitor's
+combined reconciliation every `monitor.zone_stats_interval`. Non-zero
+drift (`crawler_counters_drift`, the Warn "reconciliation: counter
+drift" in the monitor journal) — a sign of a skipped transition, a
+failure between service deploys, or manual SQL bypassing the code; the
+pass fixes it itself. An operational consequence of `domains_pending`
+drifting downward (T-183): a zone with a counter of 0 is invisible to
+the dispatcher's selection (the "only zones with work" filter) — its
+pending domains wait for the nearest reconciliation (≤
+`monitor.zone_stats_interval`, 30 min by default) or a `recount`; an
+inflated counter yields only an idle probe, without degradation. A
+similar trust boundary at the retry maturity buckets (T-202): an
+understated bucket sum keeps the guard of the heavy retry selection
+closed — mature temp_error candidates wait for the nearest
+reconciliation or a `recount` (the drain is merely postponed, ≤ one
+interval); an inflated one yields idle seq scans per tick until the
+pass. For the reanalysis tail buckets (T-204) the asymmetry is harsher
+because of the closed guard's cursor jumping to the hour boundary:
+understated (a negative drift of the decrements masks a positive
+prev-bucket) — the tick neither reads out the window NOR keeps the
+cursor in place, and the mature tail invisible to the buckets ends up
+behind the cursor — a restart (the starting drain + the 24 h anchor)
+or a full rule-change drain (the residual class of T-193 §4.2) will
+pick it up; waiting for one reconciliation is not enough; an inflated
+one yields one idle window pass per tick until the pass. The daily
+`daily:checks` / `daily:temp_error` positions are the exception: they
+are streaming (the increments count HTTP result-recording events, the
+live window is the day's domains across all branches), a non-zero
+value under live load is normal, no Warn is raised for them, they are
+observed via the gauge; the `retry_mature:past` / `retry_mature:today`
+buckets (T-202), the hourly rate buckets
+`rendered:prev`/`rendered:cur`/`results:prev`/`results:cur` (T-203),
+and the tail buckets `reanalyze:prev`/`reanalyze:cur` (T-204) have the
+same streaming semantics (row-insertion, render, and stamp events
+against the live rows of the window; the hourly buckets' drift only
+slightly distorts the dashboard's rate between passes, the tail
+buckets' drift — the guard's freshness — the pass realigns the
+absolutes).
 
-**Когда действовать руками.** Дрейф цикла в стационаре стремится к
-нулю, но проход реконсиляции — три оператора под READ COMMITTED
-(чтение старых → скан domains → запись), поэтому единичный
-транзиентный дрейф под живой нагрузкой возможен и без пропуска
-перехода: дельта закоммитилась между чтениями — следующий проход
-обнулит. Действовать при устойчивом дрейфе (повтор прохода не
-обнулил; пропущенный переход — код мимо таблицы §6.2 ТЗИ, ручной SQL
-— или сбой между Deploy сервисов), либо когда счётчики нужны «сейчас»
-(после миграций, восстановления из бэкапа, ручных правок `domains` /
-`zones` / `crawler_counters`). Замечание о `--tolerance`: допуск нужен
-только `counters verify` — его чтения сохранённого и живого агрегата
-не атомарны, под живой нагрузкой единичные расхождения в темпе
-переходов закрывает допуск; строки `status_*` в дрейфе и verify не
-участвуют вовсе (пишутся только реконсиляцией, ТЗИ §13.3 — их свежесть
-смотрите по `updated_at` в `counters list`), суточная строка
-`checks:` тоже вне verify — её инкременты считают события записи
-результатов HTTP, живой агрегат — домены дня всех веток конвейера
-(DNS-терминальные завершения эпизода HTTP не имеют): штатное
-расхождение — разница потоков этапов с прошлого прохода (T-179,
-принято осознанно; наблюдается позицией `daily:checks`, в Warn не
-входит).
+**When to act by hand.** The cycle's drift tends to zero in steady
+state, but the reconciliation pass is three statements under READ
+COMMITTED (read the stale ones → scan domains → write), so a one-off
+transient drift under live load is possible even without a skipped
+transition: the delta committed between the reads — the next pass
+zeroes it. Act on a sustained drift (a repeat pass did not zero it; a
+skipped transition — code bypassing the transition table, the
+incremental-counters spec §6.2, or manual SQL — or a failure between
+service deploys), or when the counters are needed "right now" (after
+migrations, a restore from backup, manual edits of `domains` /
+`zones` / `crawler_counters`). A note on `--tolerance`: the tolerance
+is only needed for `counters verify` — its reads of the stored and
+live aggregates are not atomic, and under live load a tolerance
+absorbs isolated rate-of-transition discrepancies; the `status_*`
+rows take no part in drift or verify at all (written only by the
+reconciliation, the incremental-counters spec §13.3 — check their
+freshness via `updated_at` in `counters list`); the daily `checks:`
+row is also outside verify — its increments count HTTP
+result-recording events, while the live aggregate is the day's domains
+across all pipeline branches (DNS-terminal completions have no HTTP
+episode): the regular discrepancy is the difference of the stages'
+flows since the last pass (T-179, an accepted decision; observed via
+the `daily:checks` position, not included in the Warn).
 
-### Шаги
+### Steps
 
-1. **Сверка без записи** — `crawlerctl counters verify` (код 0 —
-   расхождений нет, 1 — есть дрейф, печатает таблицу «сохранено /
-   агрегат»; под живой нагрузкой единичные расхождения в темпе
-   переходов закрывает `--tolerance N`); по одной зоне — `--zone ИМЯ`
-   (глобальные счётчики сверяются всегда).
-2. **Восстановление** — `crawlerctl counters recount` (тот же проход,
-   что у monitor: перезаписывает счётчики агрегатами; вывод «до →
-   после» по позициям с дрейфом). `--zone ИМЯ` ограничивает перезапись
-   колонок одной зоной — глобальные счётчики пересчитываются всегда.
-3. **Повторная сверка** — `crawlerctl counters verify` обязан дать код
-   0; повторный ненулевой дрейф тех же позиций — систематическая
-   причина (см. ниже), а не разовый сбой.
+1. **Read-only verification** — `crawlerctl counters verify` (exit
+   code 0 — no discrepancies, 1 — drift present; it prints a "stored /
+   aggregate" table; under live load `--tolerance N` absorbs isolated
+   rate-of-transition discrepancies); for a single zone —
+   `--zone NAME` (the global counters are always verified).
+2. **Repair** — `crawlerctl counters recount` (the same pass as the
+   monitor's: it overwrites the counters with aggregates; prints
+   "before → after" for the drifting positions). `--zone NAME` limits
+   the column overwrite to one zone — the global counters are always
+   recomputed.
+3. **Re-verify** — `crawlerctl counters verify` must return code 0; a
+   repeated non-zero drift of the same positions is a systematic cause
+   (see below), not a one-off failure.
 
-### Систематические причины
+### Systematic causes
 
-- **Устойчивый дрейф `zone:*:pending`/`queued`/`checked` одной зоны** —
- transition мимо кода: ручной `UPDATE domains ... SET check_state`,
-  скрипты обхода конвейера. Каждая ручная смена `check_state`/`status`
-  обязана сопровождаться дельтой счётчиков зоны (образец —
-  `internal/db/zoneshift.go`), либо выполняться до прохода
-  реконсиляции и перекрываться им.
-- **Дрейф по `status_*` не наблюдается** — распределение статусов
-  пишется только реконсиляцией (ТЗИ §13.3), в gauge/Warn/verify эти
-  позиции не входят; их свежесть — `updated_at` строк в `counters list`.
-  Ручной SQL по `domains.status` нарушает согласованность строк между
-  проходами — правки статусов только через конвейер.
-- **Дрейф `global:laravel_*` и `zone:*:laravel`** — ручные правки
-  `laravel_domains` / `laravel_history` мимо analyzer: таблицы пишёт
-  только он (T-072/T-118), правки — через переанализ.
-- **Ненулевой `daily:checks` — норма под нагрузкой** (T-179): позиция
-  потоковая — разница «события записи результата HTTP» против «домены
-  дня всех веток» с прошлого прохода: DNS-терминальные завершения
-  (`not_delegated`, `invalid` и пр.) толкают её вверх, повторные
-  эпизоды суток — тоже (инкремент без роста живого окна), взаимно
-  компенсируясь. Это наблюдаемая величина, не аномалия; проход уже
-  свёл строку к живому окну, в агрегированный Warn позиция не входит
-  (только gauge). Опираться на неё в алертинге нельзя — реальный
-  пропуск инкремента маскируется потоком; подозрение (строка не
-  сходится с живым окном после `counters recount` при остановленном
-  конвейере) проверяйте руками: `SELECT value FROM crawler_counters
+- **A sustained drift of `zone:*:pending`/`queued`/`checked` for one
+  zone** — transitions bypassing the code: a manual
+  `UPDATE domains ... SET check_state`, pipeline-crawl scripts. Every
+  manual change of `check_state`/`status` must be accompanied by the
+  zone counters' delta (a sample — `internal/db/zoneshift.go`), or be
+  performed before a reconciliation pass and covered by it.
+- **Drift over `status_*` is not observed** — the status distribution
+  is written only by the reconciliation (the incremental-counters spec
+  §13.3); these positions are not part of the gauge/Warn/verify; their
+  freshness — the rows' `updated_at` in `counters list`. Manual SQL
+  over `domains.status` breaks the rows' consistency between passes —
+  status edits only via the pipeline.
+- **Drift of `global:laravel_*` and `zone:*:laravel`** — manual edits
+  of `laravel_domains` / `laravel_history` bypassing the analyzer:
+  only it writes those tables (T-072/T-118); edits go through
+  re-analysis.
+- **A non-zero `daily:checks` is normal under load** (T-179): the
+  position is streaming — the difference between the "HTTP
+  result-recording events" and the "day's domains across all branches"
+  since the last pass: DNS-terminal completions (`not_delegated`,
+  `invalid` etc.) push it up, the day's repeat episodes do too (an
+  increment without the live window growing), mutually compensating.
+  This is an observable quantity, not an anomaly; the pass has already
+  reconciled the row to the live window, and the position is not part
+  of the aggregated Warn (only the gauge). Do not build alerting on it
+  — a real missed increment is masked by the flow; check a suspicion
+  by hand (the row does not match the live window after
+  `counters recount` with the pipeline stopped):
+  `SELECT value FROM crawler_counters
   WHERE name = 'checks:' || to_char(current_date, 'YYYY-MM-DD')`
-  против `SELECT count(*) FROM domains WHERE last_checked_at =
-  current_date` — на стоящем конвейере равенство обязано сходиться
-  сразу после прохода.
-- **«Счётчик рендер-долга: затронуто 0 строк» у http-worker** — строки
-  `'render_pending'` нет (раздел 6): восстановить и пересчитать.
+  against `SELECT count(*) FROM domains WHERE last_checked_at =
+  current_date` — on a stopped pipeline the equality must hold right
+  after a pass.
+- **"Render debt counter: 0 rows affected" from the http-worker** —
+  the `'render_pending'` row is missing (section 6): restore it and
+  recount.
 
-`crawlerctl counters list` показывает текущие значения и возраст
-последней записи (миллисекунды на справочнике — можно дёргать без
-страха); cron-пересчёт `counters recount` для малых корпусов без
-постоянного monitor — легитимный режим (ТЗИ §9).
+`crawlerctl counters list` shows the current values and the age of the
+last write (milliseconds on the reference table — safe to poll
+freely); a cron-driven `counters recount` for small corpora without a
+permanent monitor is a legitimate mode (the incremental-counters spec
+§9).
 
-## 8. Окно сворачивания зон: `crawlerctl zones collapse` (T-196)
+## 8. The zone collapse window: `crawlerctl zones collapse` (T-196)
 
-Разовое окно обслуживания для перехода на TLD-семантику зоны
-(ТЗТ `tasks/TZ_tld_only_zones.md`: зона — последняя метка имени, а не
-публичный суффикс PSL). Команда переносит строки 2LD-зон
-(`5g.in`, `co.uk`, `net.in`… — зоны-публичные суффиксы, созданные
-ингестом до перехода) в их TLD: `zone_id` → TLD, `label` →
-`label || '.' || префикс` (`example` в `5g.in` → `example.5g` в `in`),
-партиции 2LD-зоны дропаются, строка зоны удаляется, счётчики
-пересчитывает общая реконсиляция. Идемпотентна и возобновляема:
-повторный запуск продолжает с места остановки (переносятся только
-строки, ещё лежащие в 2LD-зоне); отсутствие 2LD-зон — no-op.
-Зоны allowlist `ingest.allowed_zone_paths` не сворачиваются — тестовые
-зоны testbed живут как зоны.
+A one-off maintenance window for switching to TLD zone semantics
+(the spec `tasks/TZ_tld_only_zones.md`: a zone is the last label of a
+name, not a PSL public suffix). The command moves the rows of 2LD
+zones (`5g.in`, `co.uk`, `net.in`… — public-suffix zones created by
+ingest before the switch) into their TLD: `zone_id` → the TLD,
+`label` → `label || '.' || prefix` (`example` in `5g.in` →
+`example.5g` in `in`); the 2LD zone's partitions are dropped, the zone
+row is deleted, and the counters are recomputed by the general
+reconciliation. Idempotent and resumable: a re-run continues from
+where it stopped (only rows still sitting in a 2LD zone are moved); no
+2LD zones — a no-op. Zones in the `ingest.allowed_zone_paths` allowlist
+are not collapsed — the testbed's test zones live on as zones.
 
-**Порядок обязателен.** Смешение старого/нового кода с наполовину
-перенесёнными данными даёт дубли и пересоздание 2LD-зон: старый код
-считает зоной публичный суффикс и создаёт зону `5g.in` заново, новый
-код до переноса пишет дубли в TLD-зону, сообщения очередей несут
-устаревший `zone_id`.
+**The order is mandatory.** Mixing old/new code with half-moved data
+produces duplicates and re-creation of 2LD zones: the old code treats
+the public suffix as the zone and re-creates the `5g.in` zone; the new
+code, before the move, writes duplicates into the TLD zone; queue
+messages carry a stale `zone_id`.
 
-### Шаги
+### Steps
 
-1. **Выкатить сборку с TLD-семантикой без запуска** — образы собраны,
-   стек остановлен: обновление не стартует сервисы до команды оператора
-   (systemd: собрать и положить бинари, `crawler.target` остановлен;
-   [`ci-cd.md`](ci-cd.md) — при живом конвейере деплоя сначала остановить
-   `crawler.target`, деплой-скрипт не стартует его сам).
-2. **Бэкап БД** (`pg_dump` или снапшок тома) — единственный путь отката
-   (шаг «Откат» ниже): перенос необратим, частичный откат невозможен.
-3. **Зафиксировать инвентаризацию** — сухой запуск:
+1. **Ship the build with TLD semantics without starting it** — the
+   images are built, the stack is stopped: the update does not start
+   services until the operator's command (systemd: build and place the
+   binaries, `crawler.target` stopped; [`ci-cd.md`](ci-cd.md) — with a
+   live deploy pipeline, stop `crawler.target` first; the deploy script
+   does not start it itself).
+2. **Back up the database** (`pg_dump` or a volume snapshot) — the only
+   rollback path (the "Rollback" step below): the move is irreversible,
+   a partial rollback is impossible.
+3. **Record the inventory** — a dry run:
 
    ```bash
-   # сухой запуск: таблица 2LD-зон и план переноса, ничего не меняет
+   # dry run: the table of 2LD zones and the move plan; changes nothing
    /opt/crawler/bin/crawlerctl zones collapse
    ```
 
-4. **Остановить источники работы** — ingest (watcher) и scheduler:
-   новые файлы и задачи не публикуются. Остальные сервисы пока работают.
-5. **Дождаться опустошения стримов** `q:dns`, `q:http`, `q:analyze`,
-   `q:render` (воркеры добивают хвост; контроль — `crawlerctl status`
-   или `redis-cli XLEN q:dns` …). Сообщения несут `zone_id` — задача
-   удалённой зоны, выполненная после переноса, записала бы результат
-   с несуществующим `zone_id` в DEFAULT-партицию. Экстренный вариант
-   (хвост не дренируется): `DEL` стримов и возврат зависших задач в
-   pending — `UPDATE domains SET check_state = 0, queued_at = NULL
-   WHERE check_state = 1;` (идемпотентность конвейера, T-097,
-   гарантирует корректность повторной выборки).
-6. **Остановить воркеров, analyzer, monitor, render-worker, web** —
-   стек полностью стоит.
-7. **Перенос**:
+4. **Stop the sources of work** — ingest (the watcher) and the
+   scheduler: new files and tasks are no longer published. The other
+   services keep running for now.
+5. **Wait for the streams to empty out**: `q:dns`, `q:http`,
+   `q:analyze`, `q:render` (the workers finish the tail; monitoring —
+   `crawlerctl status` or `redis-cli XLEN q:dns` …). Messages carry a
+   `zone_id` — a task of a deleted zone executed after the move would
+   record a result with a non-existent `zone_id` into the DEFAULT
+   partition. The emergency option (the tail is not draining): `DEL`
+   the streams and return the stuck tasks to pending —
+   `UPDATE domains SET check_state = 0, queued_at = NULL
+   WHERE check_state = 1;` (pipeline idempotency, T-097, guarantees
+   the correctness of the re-selection).
+6. **Stop the workers, analyzer, monitor, render-worker, web** — the
+   stack is fully down.
+7. **The move**:
 
    ```bash
-   # предусловие: в затрагиваемых зонах нет доменов check_state = 1
-   # (в очереди) — иначе отказ с перечнем зон; после экстренного шага 5
-   # осознанно: --force
+   # precondition: no domains with check_state = 1 (queued) in the
+   # affected zones — otherwise it fails with the list of zones; after
+   # the emergency step 5, deliberately: --force
    /opt/crawler/bin/crawlerctl zones collapse --apply
    ```
 
-   Команда печатает перенос по зонам и итог реконсиляции счётчиков;
-   `--skip-reconcile` оставляет пересчёт первому проходу monitor.
-   Прерванный запуск (Ctrl-C, сбой) возобновляется повтором команды —
-   завершённые батчи остаются на месте.
-8. **Пост-проверки** — команда выполняет их сама (2LD-зон вне allowlist
-   не осталось; сиротских `zone_id` в доменных таблицах нет; счётчики
-   = агрегат). Спот-чек руками:
+   The command prints the move per zone and the counter reconciliation
+   result; `--skip-reconcile` leaves the recomputation to the monitor's
+   first pass. An interrupted run (Ctrl-C, a failure) is resumed by
+   repeating the command — completed batches stay in place.
+8. **Post-checks** — the command runs them itself (no 2LD zones left
+   outside the allowlist; no orphan `zone_id`s in the domain tables;
+   counters = the aggregate). A manual spot check:
 
    ```sql
-   SELECT domain_info('example.5g.in');  -- зона in, label example.5g
+   SELECT domain_info('example.5g.in');  -- zone in, label example.5g
    ```
 
-9. **VACUUM после row movement** (bloat переноса между партициями):
+9. **VACUUM after the row movement** (bloat from the move between
+   partitions):
 
    ```sql
    VACUUM (ANALYZE) domains, subdomain_results, laravel_domains,
                   laravel_findings;
    ```
 
-10. **Запустить стек на новой сборке** — сервисы стартуют на новой
-    схеме данных; monitor первой реконсиляцией подтверждает счётчики.
-11. **Почистить каталоги `var/incoming/<2LD>/`** (если дампы
-    складывались по старой схеме каталогов): с TLD-allowlist файл
-    оттуда упадёт в `failed/`, но чистота лучше. При желании —
-    `crawlerctl zones sync` (актуализация справочника по срезу IANA).
+10. **Start the stack on the new build** — the services start on the
+    new data schema; the monitor confirms the counters with its first
+    reconciliation.
+11. **Clean up the `var/incoming/<2LD>/` directories** (if dumps were
+    stored under the old directory scheme): with a TLD allowlist a file
+    from there would fall into `failed/`, but cleaning up is still
+    better. Optionally — `crawlerctl zones sync` (refresh the reference
+    table from the IANA snapshot).
 
-**Предупреждение о `zones sync --deactivate-missing`.** Флаг выключает
-зоны БД, отсутствующие в срезе IANA, — вместе с мусорными 2LD-зонами
-он деактивирует и тестовые зоны allowlist (`crawl.test` в
-dev/testbed-конфигах; продуктовый allowlist пуст — на боевой записи
-проблемы нет). В dev после `--deactivate-missing` верните тестовые
-зоны по одной за вызов (`zones enable` принимает одну зону):
-`crawlerctl zones enable crawl.test`, далее остальные зоны сценариев
-из `ingest.allowed_zone_paths`.
+**A warning about `zones sync --deactivate-missing`.** The flag
+disables database zones missing from the IANA snapshot — along with
+the junk 2LD zones it also deactivates the allowlist's test zones
+(`crawl.test` in the dev/testbed configs; the production allowlist is
+empty — production records have no such problem). In dev, after
+`--deactivate-missing`, restore the test zones one per call
+(`zones enable` takes a single zone):
+`crawlerctl zones enable crawl.test`, then the remaining scenario
+zones from `ingest.allowed_zone_paths`.
 
-### Откат
+### Rollback
 
-Восстановление бэкапа шага 2 целиком. Частичный откат (вернуть одну
-зону) невозможен: перенесённый составной label `example.5g` неотличим
-от исконного составного label (домен `foo.bar.in` всегда мог жить
-в зоне `in` с меткой `foo.bar`).
+Restore the step-2 backup in full. A partial rollback (returning one
+zone) is impossible: a moved compound label `example.5g` is
+indistinguishable from an original compound label (the domain
+`foo.bar.in` could always live in the `in` zone with the label
+`foo.bar`).
 
-### Dev-окружение
+### Dev environment
 
-Окно на dev-стеке не обязательно: допустимо пересоздание данных
-переингестом тестовых дампов вместо переноса (ТЗТ §11). Команда
-работает и на dev (`docker compose … run --rm tools go run
-./cmd/crawlerctl zones collapse`), интеграционный тест процедуры —
-`test/integration/zones_collapse_test.go`.
+The window on the dev stack is not required: re-creating the data by
+re-ingesting the test dumps instead of the move is acceptable
+(spec §11). The command works on dev too (`docker compose … run --rm
+tools go run ./cmd/crawlerctl zones collapse`); the procedure's
+integration test — `test/integration/zones_collapse_test.go`.
