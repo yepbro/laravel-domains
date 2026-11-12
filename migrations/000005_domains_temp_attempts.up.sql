@@ -1,37 +1,37 @@
--- T-031: счётчик повторных проверок temp_error (ТЗ 5.3, 6.2).
+-- T-031: the temp_error retry counter (spec 5.3, 6.2).
 --
--- Планировщик повторяет проверку домена в статусе temp_error не более
--- N раз подряд (scheduler.temp_error_max_retries), после исчерпания
--- попыток домен получает итоговый статус по результату последней проверки.
--- Чтобы различать «первый temp_error» и «N-й подряд», счётчик попыток
--- обязан жить в строке домена: существующие колонки его не выражают —
--- check_state — перечисление жизненного цикла проверки (0 pending,
--- 1 queued, 2 done, ТЗ 6.1), flags — битовые булевы признаки
--- (бит 0 is_idn, бит 1 render_pending, ТЗ 6.1), dns_mask — маска
--- резолвящихся субдоменов (ТЗ 5.4), queued_at/last_checked_at — метки
--- времени (last_checked_at к тому же имеет точность date, ТЗ 6.1), а
--- истории проверок в схеме нет — результаты перезаписываются (ТЗ 3.5).
--- Отдельная таблица счётчиков — сущность ради одного числа; минимальная
--- смена схемы — одна колонка.
+-- The scheduler retries a domain in the temp_error status at most
+-- N times in a row (scheduler.temp_error_max_retries); after the attempts
+-- are exhausted the domain receives a final status per the outcome of the last check.
+-- To tell "the first temp_error" from "the Nth in a row", the attempt counter
+-- must live in the domain row: the existing columns do not express it —
+-- check_state is the check lifecycle enumeration (0 pending,
+-- 1 queued, 2 done, spec 6.1), flags is a set of boolean bit signs
+-- (bit 0 is_idn, bit 1 render_pending, spec 6.1), dns_mask is the mask of
+-- resolving subdomains (spec 5.4), queued_at/last_checked_at are timestamps
+-- (last_checked_at also has date precision, spec 6.1), and
+-- there is no check history in the schema — results are rewritten (spec 3.5).
+-- A separate counter table is an entity for the sake of a single number; the minimal
+-- schema change is one column.
 --
--- smallint — «размеры полей минимальные» (ТЗ 6): максимум попыток из
--- конфигурации ограничен валидацией сотней, smallint берёт с запасом.
--- NOT NULL DEFAULT 0: существующие строки начинают с нуля попыток;
--- ноль — «повторов ещё не назначалось». Счётчик наращивает планировщик
--- в момент назначения повтора (internal/scheduler/retry.go), а не воркер
--- при записи temp_error — точка инкремента ровно одна.
+-- smallint — "the field sizes are minimal" (spec 6): the attempts maximum from
+-- the configuration is capped by validation at a hundred, smallint takes it with headroom.
+-- NOT NULL DEFAULT 0: existing rows start with zero attempts;
+-- zero — "no retry has been assigned yet". The counter is incremented by the scheduler
+-- at the moment it assigns a retry (internal/scheduler/retry.go), not by the worker
+-- when writing temp_error — exactly one increment point.
 --
--- ALTER партиционированной таблицы с DEFAULT — изменение каталога,
--- без перекладки строк (PG 11+); колонку наследуют все партиции.
--- Индекс не добавляется («минимум индексов», ТЗ 6): проход планировщика
--- ищет кандидатов фильтром по status и check_state — как фоновая очистка
--- T-020, — а temp_attempts не входит ни в один индекс, поэтому апдейты
--- счётчика остаются HOT (контракт test/integration/schema_test.go,
+-- ALTER of a partitioned table with a DEFAULT is a catalog change,
+-- with no row relocation (PG 11+); every partition inherits the column.
+-- No index is added ("a minimum of indexes", spec 6): the scheduler pass
+-- finds candidates by filtering on status and check_state — like the background cleanup
+-- T-020, — and temp_attempts is in no index, so the counter
+-- updates stay HOT (the contract test/integration/schema_test.go,
 -- TestSchema_DomainsHOTColumns).
 --
--- Сброс в ноль: при фиксации итогового статуса после исчерпания попыток
--- (тот же проход T-031) и при любой не-temp_error проверке — запись
--- успешного результата обнуляет счётчик, новый эпизод temp_error
--- начинается с нуля (контракт DNS-этапа, T-036+).
+-- Reset to zero: when the final status is committed after the attempts are exhausted
+-- (the same T-031 pass) and on any non-temp_error check — writing
+-- a successful result zeroes the counter; a new temp_error episode
+-- starts from zero (the DNS stage contract, T-036+).
 
 ALTER TABLE domains ADD COLUMN temp_attempts smallint NOT NULL DEFAULT 0;

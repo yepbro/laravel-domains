@@ -1,42 +1,42 @@
--- T-210: маркер «рендер невозможен» — subdomain_results.render_failed_at.
+-- T-210: the "render impossible" marker — subdomain_results.render_failed_at.
 --
--- Финализации без рендера (тарпит T-148, cert-класс T-159, класс задачи
--- T-172) оставляют строку rendered = false: до T-210 такие строки были
--- неотличимы от «не пробовали», и проход доработки рендера
--- (internal/httpworker/renderq.go) переиздавал их без разбора при
--- повторных постановках флага — по замеру T-207 хвост таких записей
--- ~180–220 тыс., каждая переизданная копия стоит доставок и слот-времени
--- рендера (cert-класс и класс задачи — постоянные свойства хоста, замер
--- T-172: 0 успешных ретраев; у тарпита бюджет попыток исчерпан).
+-- Finalizations without a render (the tarpit T-148, the cert class T-159, the task class
+-- T-172) leave a row with rendered = false: before T-210 such rows were
+-- indistinguishable from "not tried yet", and the render rework pass
+-- (internal/httpworker/renderq.go) reissued them indiscriminately on
+-- repeated flag settings — per the T-207 measurement the tail of such records
+-- is ~180–220k, and each reissued copy costs deliveries and render
+-- slot time (the cert class and the task class are permanent host properties, the
+-- T-172 measurement: 0 successful retries; the tarpit's attempt budget is exhausted).
 --
--- Колонка-штамп: финализация render-worker'а пишет now() (coalesce —
--- штамп первой финализации), выборка прохода доработки (rendered =
+-- A stamp column: the render worker's finalization writes now() (coalesce —
+-- the first finalization stamps), the rework pass selection (rendered =
 -- false AND final_url IS NOT NULL AND render_failed_at IS NULL)
--- исключает отмаркированные записи ДО СМЕНЫ КОНТЕНТА. Эффект —
--- повторные издания прохода отмаркированных записей прекращаются
--- (повторный проход по домену, чей флаг пережил публикацию: частичный
--- сбой публикации — опубликованная часть финализируется за секунды и
--- повтор издал бы её снова, выход Full после публикации соседей пачки,
--- keep нечитаемого контента, рестарт между публикацией и снятием);
--- первая попытка свежего эпизода легитимна и не подавляется:
--- перезапись эпизода сбрасывает маркер. Сброс — перезаписью эпизода:
--- запись результата HTTP-этапа (T-058) переписывает строки домена
--- DELETE + INSERT, новые строки получают NULL (колонка в INSERT не
--- участвует) — починившийся хост отрендерится на следующем эпизоде
--- перепроверки (T-030); успешный рендер тоже снимает штамп (UPDATE
--- замены контента, T-067).
+-- excludes the records marked BEFORE THE CONTENT CHANGE. The effect —
+-- repeated issues of the pass over marked records stop
+-- (a repeated pass over a domain whose flag survived the publication: a partial
+-- publication failure — the published part is finalized within seconds and
+-- a repeat would issue it again, a Full exit after the batch neighbors' publication,
+-- keeping unreadable content, a restart between the publication and the clearing);
+-- the first attempt of a fresh episode is legitimate and is not suppressed:
+-- the episode rewrite resets the marker. The reset is by the episode rewrite:
+-- the HTTP stage's result record (T-058) rewrites the domain's rows with
+-- DELETE + INSERT, the new rows get NULL (the column takes no part in the
+-- INSERT) — a recovered host will render on the next recheck episode
+-- (T-030); a successful render clears the stamp too (the content replacement
+-- UPDATE, T-067).
 --
--- NULL — маркера нет, в том числе у всех существующих строк: миграция
--- только добавляет колонку (ADD COLUMN nullable — метаданные, без
--- rewrite 40+ млн строк), данных не трогает. Хвост уже-битых записей
--- дорендерится/перефинализируется обычным путём и получит штамп своими
--- финализациями.
+-- NULL — no marker, including on all existing rows: the migration
+-- only adds a column (ADD COLUMN nullable — metadata, without
+-- a rewrite of the 40+ million rows), touches no data. The tail of already-broken records
+-- will be rendered/finalized the usual way and get stamps from its own
+-- finalizations.
 --
--- HOT: render_failed_at не входит ни в один индекс (минимум индексов,
--- ТЗ 6) и пишется редко (финализация — now(), успешный рендер и новый
--- эпизод — сброс) — картину HOT-апдейтов не меняет (docs/schema.md
--- «HOT-апдейты», инвариант TestSchema_DomainsHOTColumns).
+-- HOT: render_failed_at enters no index (the minimum of indexes,
+-- spec 6) and is written rarely (a finalization — now(), a successful render and a new
+-- episode — a reset) — it does not change the HOT update picture (docs/schema.md
+-- "HOT updates", the TestSchema_DomainsHOTColumns invariant).
 
 ALTER TABLE subdomain_results ADD COLUMN render_failed_at timestamptz;
 
-COMMENT ON COLUMN subdomain_results.render_failed_at IS 'Штамп «рендер невозможен» (T-210): финализация без рендера (тарпит T-148/cert T-159/класс задачи T-172) пометила запись до смены контента — проход доработки рендера её не переиздаёт; NULL — маркера нет';
+COMMENT ON COLUMN subdomain_results.render_failed_at IS 'The "render impossible" stamp (T-210): a finalization without a render (tarpit T-148/cert T-159/task class T-172) marked the record before the content change — the render rework pass does not reissue it; NULL — no marker';

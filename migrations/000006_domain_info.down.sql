@@ -1,7 +1,7 @@
--- T-082: откат SQL-функции domain_info (ТЗ 5.11).
+-- T-082: rollback of the SQL function domain_info (spec 5.11).
 --
--- Функция только читает таблицы и не меняет ни схему, ни данные:
--- удаление не теряет ничего. IF EXISTS — повторный запуск по чистой
--- схеме не падает (полный откат golang-migrate --all после частичного).
+-- The function only reads the tables and changes neither the schema nor the data:
+-- dropping it loses nothing. IF EXISTS — a repeated run against a clean
+-- schema does not fail (a full golang-migrate --all rollback after a partial one).
 
 DROP FUNCTION IF EXISTS domain_info(text);

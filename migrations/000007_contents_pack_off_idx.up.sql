@@ -1,40 +1,40 @@
--- T-096: индекс contents (pack_id, off) для запросов компактификации
--- (ревью этапа 12, INFRA-05).
+-- T-096: the contents (pack_id, off) index for compaction queries
+-- (the stage 12 review, INFRA-05).
 --
--- Фоновая компактификация пак-файлов (internal/content, CompactLoop —
--- проход каждый час) выбирает строки метаданных одного пака:
+-- Background pack-file compaction (internal/content, CompactLoop —
+-- a pass every hour) selects the metadata rows of one pack:
 --   SELECT hash, off, len, refcount FROM contents
 --   WHERE pack_id = $1 ORDER BY off            (CompactScan, CompactPack)
--- и контрольные запросы вида WHERE pack_id = $1 [AND refcount > 0]
--- (зачистка мёртвых строк, проверка живых перед unlink). Единственный
--- индекс таблицы — PK по hash (миграция 000001): каждый такой запрос —
--- seq scan всей таблицы, стоимость растёт линейно с корпусом (сотни
--- миллионов строк, docs/schema.md) и конкурирует с рабочими запросами
--- дедупликации и чтения по hash.
+-- and control queries of the form WHERE pack_id = $1 [AND refcount > 0]
+-- (purging dead rows, checking live ones before unlink). The only
+-- index of the table is the PK on hash (migration 000001): each such query is a
+-- seq scan of the whole table, the cost grows linearly with the corpus (hundreds
+-- of millions of rows, docs/schema.md) and competes with the working
+-- dedup and by-hash read queries.
 --
--- Составной B-tree (pack_id, off) покрывает оба запроса: фильтр по
--- равенству pack_id — префикс ключа, сортировка по off — вторая колонка
--- ключа, план обходит сортировку (Index Scan без Sort). Контрольные
--- запросы идут по тому же префиксу (refcount — фильтр по куче).
+-- The composite B-tree (pack_id, off) covers both queries: the equality filter on
+-- pack_id is the key prefix, the sort by off is the second key
+-- column, the plan avoids the sort (an Index Scan without Sort). The control
+-- queries follow the same prefix (refcount — a heap filter).
 --
--- «Минимум индексов» (ТЗ 6) расширяется осознанно — под фактические
--- фоновые запросы; состав закреплён контрактом
+-- "A minimum of indexes" (spec 6) is extended deliberately — for the actual
+-- background queries; the composition is pinned by the contract
 -- test/integration/schema_test.go (TestSchema_ResultsTablesIndexes).
--- Цена: одна лишняя запись индекса на новую строку контента (Put);
--- refcount в ключ не входит — точечные апдейты счётчика остаются HOT
--- (docs/schema.md, «fillfactor»/«HOT-апдейты»).
+-- The price: one extra index entry per new content row (Put);
+-- refcount is not in the key — point counter updates stay HOT
+-- (docs/schema.md, "fillfactor"/"HOT updates").
 --
--- Без CONCURRENTLY — осознанный выбор, а не ограничение раннера:
--- internal/migrate выполняет файл одним запросом простого протокола,
--- без транзакционной обёртки, так что одиночный CREATE INDEX
--- CONCURRENTLY технически допустим. Миграция применяется при старте
--- сервисов (advisory-блокировка сериализует раннеры) по развёртыванию
--- (этап 10) — до загрузки корпуса, когда ожидание конкурентных
--- транзакций не из-за чего; обычный CREATE INDEX атомарен, а сорвавшийся
--- CONCURRENTLY оставляет INVALID-индекс и dirty-состояние
--- schema_migrations — сервисы откажутся стартовать до ручного разбора
--- (docs/migrations.md, «Восстановление после сбоя»). Перестроение
--- индекса по уже загруженному корпусу — эксплуатационная задача
--- (make psql), не стартовая миграция.
+-- No CONCURRENTLY — a deliberate choice, not a runner limitation:
+-- internal/migrate executes the file as one simple-protocol query,
+-- without a transaction wrapper, so a single CREATE INDEX
+-- CONCURRENTLY is technically possible. The migration is applied at service start
+-- (an advisory lock serializes the runners) on deploy
+-- (stage 10) — before the corpus is loaded, when there is nothing for concurrent
+-- transactions to wait on; a plain CREATE INDEX is atomic, while a failed
+-- CONCURRENTLY leaves an INVALID index and a dirty
+-- schema_migrations state — the services will refuse to start until a manual triage
+-- (docs/migrations.md, "Recovery after a failure"). Rebuilding
+-- the index over an already loaded corpus is an operational task
+-- (make psql), not a startup migration.
 
 CREATE INDEX contents_pack_off_idx ON contents (pack_id, off);

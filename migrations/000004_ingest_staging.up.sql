@@ -1,58 +1,58 @@
--- T-017: staging-таблица загрузки входных файлов (ТЗ 5.1, 3.5).
+-- T-017: the staging table for ingesting input files (spec 5.1, 3.5).
 --
--- Валидированные строки файла попадают в staging пачками по
--- ingest.batch_size (по умолчанию 50 000 строк, ТЗ 5.1) через COPY
--- (internal/ingest.Stage → db.CopyFromStream: каждая пачка — отдельная
--- транзакция, память ограничена размером пачки). Применение к domains
--- (add: INSERT ... ON CONFLICT; delete: перевод в deleted) — задачи
--- T-018/T-019; после применения партия удаляется из staging
--- (ingest.ClearBatch), перед повторной загрузкой — затирается самой
--- загрузкой (идемпотентность, ТЗ 3.4).
+-- Validated rows of a file land in staging in chunks of
+-- ingest.batch_size (50,000 rows by default, spec 5.1) via COPY
+-- (internal/ingest.Stage → db.CopyFromStream: each chunk is a separate
+-- transaction, memory is bounded by the chunk size). Applying to domains
+-- (add: INSERT ... ON CONFLICT; delete: moving to deleted) — the tasks
+-- T-018/T-019; after applying, the batch is removed from staging
+-- (ingest.ClearBatch) and before a re-ingest it is wiped by the
+-- ingest itself (idempotency, spec 3.4).
 --
--- Колонки:
---   batch_id — идентификатор партии загрузки: 16 байт (128 бит), один на
---     загрузку файла: старшие 8 байт — микросекунды Unix времени создания
---     партии (big-endian), младшие 8 — случайные байты (crypto/rand;
---     T-098). Объединяет все COPY-пачки одной загрузки и адресует
---     очистку: удаление/перезапись касается только своей партии и не
---     мешает параллельным файлам с другим batch_id; побайтовый порядок
---     идентификаторов совпадает с хронологией создания, поэтому фоновая
---     зачистка осиротевших партий (kill -9, падение БД) режет диапазон
---     по префиксу без отдельной колонки времени;
---   zone_id  — зона файла (zones.id): все строки файла из одной зоны
---     (ТЗ 5.1: строка не из зоны файла отклоняется валидатором, T-016);
---   label    — метка домена без зоны, punycode (ТЗ 5.2: внутри системы
---     везде ASCII-форма);
---   action   — операция файла: 1 add, 2 delete — коды model.Action, те же,
---     что у ingest_files.action (ТЗ 6.1); денормализована в каждую строку,
---     чтобы применение (T-018/T-019) читало всё из staging без справочников;
---   line_no  — номер строки в исходном файле (с единицы): позиция строки
---     для отчёта по файлу и сопоставления с rejected-логом (ТЗ 5.1).
+-- Columns:
+--   batch_id — the ingestion batch id: 16 bytes (128 bits), one per
+--     file ingest: the high 8 bytes are the Unix microseconds of the batch
+--     creation time (big-endian), the low 8 are random bytes (crypto/rand;
+--     T-098). It ties together all COPY chunks of one ingest and addresses
+--     the cleanup: a deletion/rewrite touches only its own batch and does not
+--     disturb parallel files with a different batch_id; the byte order
+--     of the ids matches the creation chronology, so the background cleanup of orphaned
+--     batches (kill -9, a DB crash) cuts the range
+--     by prefix without a separate time column;
+--   zone_id  — the file's zone (zones.id): all rows of a file belong to one zone
+--     (spec 5.1: a row outside the file's zone is rejected by the validator, T-016);
+--   label    — the domain label without the zone, punycode (spec 5.2: inside the system
+--     everything is in ASCII form);
+--   action   — the file operation: 1 add, 2 delete — the model.Action codes, the same
+--     as ingest_files.action (spec 6.1); denormalized into every row,
+--     so that applying (T-018/T-019) reads everything from staging without reference tables;
+--   line_no  — the row number in the source file (one-based): the row position
+--     for the per-file report and matching against the rejected log (spec 5.1).
 --
--- Первичный ключ (batch_id, line_no): строки партии адресуются позицией
--- в файле; ведущий batch_id обслуживает и очистку партии
--- (DELETE ... WHERE batch_id = $1 — скан по префиксу ключа), и защиту от
--- дублей при повторной вставке. Дубликаты меток внутри файла допускаются:
--- строка файла может повторяться, дедупликацию при применении делает
+-- Primary key (batch_id, line_no): the rows of a batch are addressed by their position
+-- in the file; the leading batch_id serves both the batch cleanup
+-- (DELETE ... WHERE batch_id = $1 — a key prefix scan) and the
+-- protection against duplicates on re-insert. Duplicate labels inside a file are allowed:
+-- a file row may repeat, deduplication at apply time is done by
 -- ON CONFLICT (T-018).
 --
--- UNLOGGED: staging — черновик, живущий от загрузки файла до применения;
--- без записи в WAL COPY не гоняет журнал — минимум ввода-вывода (ТЗ 3.5).
--- Плата — очистка таблицы при восстановлении PostgreSQL после сбоя ОС:
--- недоприменённые партии пропадают, но входной файл остаётся в incoming
--- и будет переработан заново (доставка at-least-once, ТЗ 3.4), а
--- идемпотентность применения не даст дублей.
+-- UNLOGGED: staging is a draft living from the file ingest to the apply;
+-- with no WAL writes COPY does not churn the log — minimal I/O (spec 3.5).
+-- The price is the table being cleared when PostgreSQL recovers from an OS crash:
+-- unapplied batches disappear, but the input file remains in incoming
+-- and will be reprocessed from scratch (at-least-once delivery, spec 3.4), and
+-- apply idempotency prevents duplicates.
 --
--- Без партиционирования и дополнительных индексов (принцип ТЗ 6 «минимум
--- индексов»): domain_id в staging нет, партиционирование по ТЗ 6 не
--- требуется; объём ограничен партией одного файла, для очистки и выборки
--- применения хватает первичного ключа.
+-- No partitioning or extra indexes (the spec 6 principle of "a minimum
+-- of indexes"): there is no domain_id in staging, partitioning per spec 6 is
+-- not needed; the volume is bounded by one file's batch, and the primary key is enough
+-- for the cleanup and the apply's selection.
 
 CREATE UNLOGGED TABLE ingest_stage (
-    batch_id bytea    NOT NULL,                -- идентификатор партии (16 байт)
-    zone_id  smallint NOT NULL,                -- зона файла (zones.id)
-    label    text     NOT NULL,                -- метка домена без зоны, punycode
+    batch_id bytea    NOT NULL,                -- the batch id (16 bytes)
+    zone_id  smallint NOT NULL,                -- the file's zone (zones.id)
+    label    text     NOT NULL,                -- the domain label without the zone, punycode
     action   smallint NOT NULL,                -- 1 add, 2 delete (model.Action)
-    line_no  bigint   NOT NULL,                -- номер строки в файле (с единицы)
+    line_no  bigint   NOT NULL,                -- the row number in the file (one-based)
     PRIMARY KEY (batch_id, line_no)
 );

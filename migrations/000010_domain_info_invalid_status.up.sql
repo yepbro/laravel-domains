@@ -1,17 +1,17 @@
--- T-109: domain_info знает диагностический статус invalid (код 7).
+-- T-109: domain_info knows the diagnostic status invalid (code 7).
 --
--- Миграция 000006 зафиксировала CASE расшифровки status_name семью
--- кодами ТЗ 6.2; T-109 добавил диагностический статус invalid
--- (ядовитая строка domains: пустое/пробельное имя — проверка
--- невозможна, терминальный диагноз DNS-этапа вместо бесконечного
--- lease-возврата). Без ветки CASE функция отвечала бы status_name =
--- null — «значения нет» вместо явной диагностики, и crawlerctl domain
--- (T-081) показывал бы пустое имя статуса.
+-- Migration 000006 pinned the status_name CASE decoding with the family
+-- of spec 6.2 codes; T-109 added the diagnostic status invalid
+-- (a poison domains row: an empty/blank name — the check
+-- is impossible, a terminal diagnosis of the DNS stage instead of an infinite
+-- lease return). Without the CASE branch the function would answer status_name =
+-- null — "the value is missing" instead of explicit diagnostics, and crawlerctl domain
+-- (T-081) would show an empty status name.
 --
--- Тело — повтор 000006 с одной добавленной веткой WHEN 7 (SQL-функция
--- заменяется только целиком, CREATE OR REPLACE); поведение для кодов
--- 0..6 не меняется. Функция только читает — откат безопасен (down
--- возвращает тело 000006).
+-- The body is a repeat of 000006 with one added WHEN 7 branch (an SQL function
+-- can only be replaced as a whole, CREATE OR REPLACE); the behavior for codes
+-- 0..6 does not change. The function only reads — the rollback is safe (down
+-- returns the 000006 body).
 
 CREATE OR REPLACE FUNCTION domain_info(p_name text)
 RETURNS jsonb
@@ -21,7 +21,7 @@ PARALLEL SAFE
 SECURITY INVOKER
 AS $fn$
 WITH input AS (
-    -- ТЗ 5.2 п. 1 SQL-минимумом: регистр, краевые пробелы и точки.
+    -- Spec 5.2 item 1 with the SQL minimum: case, edge spaces and dots.
     SELECT NULLIF(lower(btrim(p_name, E' \t\n\r\f\v.')), '') AS name
 ),
 labels AS (
@@ -30,10 +30,10 @@ labels AS (
     WHERE name IS NOT NULL
 ),
 cand AS (
-    -- Зона — самый длинный суффикс имени, присутствующий в zones
-    -- (co.uk предпочитается uk); label — оставшиеся метки целиком.
-    -- k — индекс первой метки зоны; k = 2 оставляет метке хотя бы одну
-    -- метку: имя из одной метки — зона, не домен.
+    -- The zone — the longest suffix of the name present in zones
+    -- (co.uk is preferred over uk); label — the remaining labels as a whole.
+    -- k is the index of the first zone label; k = 2 leaves the label at least one
+    -- label: a single-label name is a zone, not a domain.
     SELECT z.id                                        AS zone_id,
            z.name                                      AS zone_name,
            z.name_unicode                              AS zone_name_unicode,
@@ -46,8 +46,8 @@ cand AS (
     LIMIT 1
 ),
 dom AS (
-    -- Строка домена по уникальному ключу (ТЗ 5.11); dom пуста —
-    -- функция вернёт NULL (нет строки результата).
+    -- The domain row by the unique key (spec 5.11); an empty dom —
+    -- the function returns NULL (no result row).
     SELECT c.zone_id, c.zone_name, c.zone_name_unicode, c.label,
            d.id, d.status, d.check_state, d.flags, d.dns_mask,
            d.queued_at, d.last_checked_at, d.temp_attempts
@@ -167,9 +167,9 @@ SELECT jsonb_build_object(
 FROM dom;
 $fn$;
 
--- Фиксация search_path за функцией (см. 000006 о безопасности):
--- pg_catalog первым — имена функций в теле, — затем схема, по которой
--- накатана миграция (таблицы). %I экранирует имя при необходимости.
+-- Pinning search_path to the function (see 000006 on security):
+-- pg_catalog first — the function names in the body, — then the schema
+-- the migration was applied to (the tables). %I escapes the name when needed.
 DO $fix$
 BEGIN
     EXECUTE format(

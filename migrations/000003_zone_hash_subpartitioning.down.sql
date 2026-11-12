@@ -1,9 +1,9 @@
--- Откат T-005: процедура выделения зон удаляется.
+-- Rollback of T-005: the zone carve-out procedure is dropped.
 --
--- Партиции зон, созданные вызовами процедуры, не удаляются: это данные,
--- а не часть определения процедуры (таблицы и их партиции живут в
--- миграциях 000001/000002). Если партиции зоны нужно вернуть в DEFAULT —
--- это отдельная ручная операция (DETACH партиций зоны, перенос строк
--- в DEFAULT, ATTACH DEFAULT).
+-- Zone partitions created by procedure calls are not dropped: they are data,
+-- not part of the procedure definition (the tables and their partitions live in
+-- migrations 000001/000002). If the zone's partitions need to be returned to the DEFAULT —
+-- that is a separate manual operation (DETACH the zone's partitions, move the rows
+-- into the DEFAULT, ATTACH the DEFAULT).
 
 DROP PROCEDURE IF EXISTS create_zone_partitions(smallint, integer);

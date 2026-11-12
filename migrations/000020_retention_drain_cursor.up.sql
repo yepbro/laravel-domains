@@ -1,37 +1,37 @@
--- T-274: персистентный курсор дренажа retention — таблица
--- retention_drain_cursor (одна строка, upsert).
+-- T-274: the persistent retention drain cursor — the
+-- retention_drain_cursor table (one row, upsert).
 --
--- Курсор дренажа по времени (checked_at, PK; T-185) до T-274 жил в памяти
--- процесса http-worker (retentionState): каждый рестарт сервиса — деплой,
--- внешний power-cycle виртуалы (прецедент 11.11 11:03), потенциальный
--- OOM-килл — сбрасывал его в ноль, и первый проход обязан был заново
--- обходить «чистый префикс» истории subdomain_results (предикат «есть
--- что чистить» вне индекса — heap-визит каждой строки): замеры
--- 10–11.11.2026 — ~60 мин на idle, >60 мин под полным фронтом; три
--- прохода не влезли в потолок 3600 с (T-273), дренаж продолжился только
--- в спокойном окне (сутки разбора инцидента).
+-- The time-based drain cursor (checked_at, PK; T-185) before T-274 lived in the
+-- http-worker process memory (retentionState): every service restart — a deploy,
+-- an external power-cycle of the VM (the Nov 11 11:03 precedent), a potential
+-- OOM kill — reset it to zero, and the first pass had to traverse
+-- the "clean prefix" of the subdomain_results history again (the "something to purge"
+-- predicate is outside the index — a heap visit of every row): the measurements of
+-- Nov 10–11, 2026 — ~60 min when idle, >60 min under the full load; three
+-- passes did not fit into the 3600 s cap (T-273), the drain continued only
+-- in the quiet window (a day of incident analysis).
 --
--- Хранение — отдельная компактная таблица состояния, а НЕ
--- crawler_counters (T-175): курсор композитный (отметка времени + четыре
--- поля PK), в числовое значение счётчика не лезет. Одна строка:
--- суррогатный PK с CHECK (id = 1) — второй строки не существует по
--- построению, upsert всегда адресован ей. Писатель один — цикл
--- RetentionLoop http-worker (параллельный запуск безопасен, но
--- бесполезен — охраны, как у компактификации T-045), конфликтов нет.
+-- Storage — a separate compact state table, NOT
+-- crawler_counters (T-175): the cursor is composite (a timestamp + four
+-- PK fields), it does not fit into a numeric counter value. One row:
+-- a surrogate PK with CHECK (id = 1) — a second row does not exist by
+-- construction, the upsert is always addressed to it. One writer — the
+-- RetentionLoop cycle of the http-worker (a parallel run is safe, but
+-- useless — guards, like in the T-045 compaction), no conflicts.
 --
--- Атомарность с пачкой: upsert исполняется в ТРАНЗАКЦИИ чистки пачки
--- (retentionPurge) — сохранённая позиция не может опередить зафикси-
--- рованную пачку; сбой транзакции оставляет прежний курсор, повтор
--- прохода идемпотентно перечитает уже чистые строки (ТЗ 3.4). Частота —
--- сотни upsert'ов за проход (~155 пачек за 16 ч дренажа 10–11.11):
--- точечный PK-апдейт одной строки, нагрузки нет; на пути горячего
--- фронта (запись результатов http-воркерами) таблица не встречается
--- вовсе. updated_at — диагностика последнего движения курсора.
+-- Atomicity with the batch: the upsert runs in the TRANSACTION of the batch purge
+-- (retentionPurge) — the saved position cannot run ahead of the committed
+-- batch; a transaction failure leaves the previous cursor, a pass repeat
+-- idempotently re-reads the already purged rows (spec 3.4). The frequency —
+-- hundreds of upserts per pass (~155 batches per 16 h of draining Nov 10–11):
+-- a point PK update of one row, no load; the table is not
+-- on the hot front path (writing results by the http workers) at all.
+-- updated_at — diagnostics of the cursor's last movement.
 --
--- Принудительные catch-up-круги (снятие рендер-долга, переполнение
--- списка ретраев, fallback-сутки — retentiondrain.go catchUp) чистят
--- строку DELETE'ом: рестарт посреди круга обязан продолжить круг с нуля,
--- а не со сохранённого курсора — записи позади него вычищает именно круг.
+-- Forced catch-up circles (clearing the render debt, overflowing the
+-- retry list, a fallback day — retentiondrain.go catchUp) purge the
+-- row with a DELETE: a restart in the middle of a circle must continue the circle from zero,
+-- not from the saved cursor — the records behind it are purged by the circle itself.
 
 CREATE TABLE retention_drain_cursor (
     id           smallint    PRIMARY KEY DEFAULT 1 CHECK (id = 1),
@@ -44,4 +44,4 @@ CREATE TABLE retention_drain_cursor (
 );
 
 COMMENT ON TABLE retention_drain_cursor IS
-    'Персистентный курсор дренажа retention (T-274): последняя посещённая строка (checked_at, PK); одна строка (id = 1), upsert в транзакции пачки retentionPurge, DELETE при принудительных catch-up-кругах';
+    'The persistent retention drain cursor (T-274): the last visited row (checked_at, PK); one row (id = 1), upsert in the retentionPurge batch transaction, DELETE on forced catch-up circles';

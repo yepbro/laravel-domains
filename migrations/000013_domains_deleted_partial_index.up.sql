@@ -1,8 +1,8 @@
--- T-170: частичный индекс deleted-доменов для очистки ingest (T-020).
+-- T-170: the partial index of deleted domains for the ingest cleanup (T-020).
 --
--- Проход очистки (internal/ingest/cleanup.go, раз в минуту) выбирает
--- кандидатов — deleted-домены, у которых ещё есть строки
--- subdomain_results:
+-- The cleanup pass (internal/ingest/cleanup.go, once a minute) selects
+-- candidates — deleted domains that still have
+-- subdomain_results rows:
 --
 --   SELECT d.zone_id, d.id FROM domains d
 --   WHERE d.status = 6
@@ -10,45 +10,45 @@
 --                 WHERE r.zone_id = d.zone_id AND r.domain_id = d.id)
 --   ORDER BY d.zone_id, d.id LIMIT $1
 --
--- Индекса по status в domains не было сознательно (T-104: полный индекс
--- ломал бы HOT массовых апдейтов статуса), и планировщик выбирал план
--- «от результатов»: полный Index Only Scan subdomain_results (2,6 млн
--- строк) + по пробе PK на каждый результат в domains (41,8 млн строк) —
--- 15–20 с CPU БД на проход даже при НУЛЕ deleted-доменов (боевой замер
--- 23–24.10: mean 17,4 с × 2056 вызовов ≈ 10 ч времени БД за 2,7 сут —
--- один из главных потребителей CPU PostgreSQL при простое самой
--- очистки). Seq scan domains ради редких deleted хуже на порядок.
+-- There was deliberately no status index in domains (T-104: a full index
+-- would break the HOT of bulk status updates), and the planner chose the
+-- "from results" plan: a full Index Only Scan of subdomain_results (2.6M
+-- rows) plus a PK probe into domains for every result (41.8M rows) —
+-- 15–20 s of DB CPU per pass even with ZERO deleted domains (the production
+-- measurement of Oct 23–24: mean 17.4 s × 2056 calls ≈ 10 h of DB time per 2.7 days —
+-- one of PostgreSQL's main CPU consumers while the cleanup itself
+-- is idle). A domains seq scan for the rare deleted rows is an order of magnitude worse.
 --
 -- domains_deleted_idx (zone_id, id) WHERE status = 6
 --
---   Ключ = префикс PK domains: ORDER BY выборки совпадает с ключом —
---   пачки без сортировки и ранний останов LIMIT; EXISTS по результатам
---   остаётся пробой PK subdomain_results, но выполняется только для
---   реально deleted-доменов. Пока удалённых нет, индекс пуст и проход
---   стоит миллисекунды; при волне delete-файла объём индекса = числу
---   неочищенных deleted-доменов, дренаж линеен (вычищенные строки
---   покидают индекс).
+--   The key = the domains PK prefix: the selection's ORDER BY matches the key —
+--   batches without sorting and an early stop at LIMIT; the EXISTS over the results
+--   remains a subdomain_results PK probe but runs only for
+--   actually deleted domains. While there are no deletions, the index is empty and the pass
+--   costs milliseconds; on a delete-file wave the index volume = the number of
+--   uncleaned deleted domains, the drain is linear (cleaned rows
+--   leave the index).
 --
--- HOT-компромисс (расширение принятого в T-104 «status не
--- индексируется»): status входит только в ПРЕДИКАТ, и в индекс попадают
--- строки лишь со статусом deleted. Non-HOT становятся только переходы
--- с участием deleted — применение delete-файлов (T-019, status → 6) и
--- воскрешение add-файлом (T-018, 6 → new); массовые апдейты
--- статуса-результата воркеров и фиксация итогового статуса temp_error
--- (T-031) строк в индексе не имеют и остаются HOT. Удалённые домены —
--- редкое событие реестра (0 на бою), цена переходов ничтожна.
+-- HOT compromise (an extension of the T-104 decision that "status is
+-- not indexed"): status enters only the PREDICATE, and only rows with the deleted
+-- status enter the index. Only the transitions involving deleted become non-HOT —
+-- applying delete files (T-019, status → 6) and
+-- revival by an add file (T-018, 6 → new); the bulk updates
+-- of the workers' result statuses and committing the final temp_error status
+-- (T-031) have no rows in the index and stay HOT. Deleted domains are
+-- a rare registry event (0 in production), the transition price is negligible.
 --
--- Код статуса вшит в текст SQL литералом через model.StatusDeleted
--- (internal/ingest/cleanup.go, стиль scheduler/dispatch.go): параметр
--- в предикате частичного индекса планировщик не доказывает, generic-план
--- подготовленного выражения терял бы индекс.
+-- The status code is embedded into the SQL text as a literal via model.StatusDeleted
+-- (internal/ingest/cleanup.go, the scheduler/dispatch.go style): the planner cannot prove a
+-- parameter in a partial index predicate, the generic plan of the prepared
+-- statement would lose the index.
 --
--- Индекс создаётся на партиционированном родителе: существующие и все
--- будущие партиции получают дочерние индексы автоматически (как
--- domains_pending_idx, 000001). CREATE INDEX CONCURRENTLY на родителе
--- PG16 не поддерживает: индекс строится с блокировкой записи — на
--- загруженной БД применять в окно обслуживания (при пустом множестве
--- deleted построение мгновенно).
+-- The index is created on the partitioned parent: existing and all
+-- future partitions get child indexes automatically (like
+-- domains_pending_idx, 000001). CREATE INDEX CONCURRENTLY on the parent
+-- is not supported in PG16: the index is built with a write lock — on a
+-- loaded DB apply it in a maintenance window (with an empty deleted set
+-- the build is instant).
 
 CREATE INDEX domains_deleted_idx
     ON domains (zone_id, id) WHERE status = 6;

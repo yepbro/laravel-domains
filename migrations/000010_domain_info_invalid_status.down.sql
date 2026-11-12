@@ -1,10 +1,10 @@
--- T-109: откат domain_info к телу 000006 (без ветки invalid).
+-- T-109: rollback of domain_info to the 000006 body (without the invalid branch).
 --
--- Функция только читает таблицы и не меняет ни схему, ни данные:
--- замена тела ничего не теряет. Повтор 000006 дословно — коды 0..6
--- расшифровываются как раньше; строки со статусом 7 (invalid), если
--- успели появиться, отвечают status_name = null — состояние до
--- наката, из которого накат 000010 возвращает расшифровку.
+-- The function only reads the tables and changes neither the schema nor the data:
+-- replacing the body loses nothing. A verbatim repeat of 000006 — the codes 0..6
+-- decode as before; rows with status 7 (invalid), if any
+-- have appeared already, answer status_name = null — the state before
+-- the apply, from which applying 000010 restores the decoding.
 
 CREATE OR REPLACE FUNCTION domain_info(p_name text)
 RETURNS jsonb
@@ -14,7 +14,7 @@ PARALLEL SAFE
 SECURITY INVOKER
 AS $fn$
 WITH input AS (
-    -- ТЗ 5.2 п. 1 SQL-минимумом: регистр, краевые пробелы и точки.
+    -- Spec 5.2 item 1 with the SQL minimum: case, edge spaces and dots.
     SELECT NULLIF(lower(btrim(p_name, E' \t\n\r\f\v.')), '') AS name
 ),
 labels AS (
@@ -23,10 +23,10 @@ labels AS (
     WHERE name IS NOT NULL
 ),
 cand AS (
-    -- Зона — самый длинный суффикс имени, присутствующий в zones
-    -- (co.uk предпочитается uk); label — оставшиеся метки целиком.
-    -- k — индекс первой метки зоны; k = 2 оставляет метке хотя бы одну
-    -- метку: имя из одной метки — зона, не домен.
+    -- The zone — the longest suffix of the name present in zones
+    -- (co.uk is preferred over uk); label — the remaining labels as a whole.
+    -- k is the index of the first zone label; k = 2 leaves the label at least one
+    -- label: a single-label name is a zone, not a domain.
     SELECT z.id                                        AS zone_id,
            z.name                                      AS zone_name,
            z.name_unicode                              AS zone_name_unicode,
@@ -39,8 +39,8 @@ cand AS (
     LIMIT 1
 ),
 dom AS (
-    -- Строка домена по уникальному ключу (ТЗ 5.11); dom пуста —
-    -- функция вернёт NULL (нет строки результата).
+    -- The domain row by the unique key (spec 5.11); an empty dom —
+    -- the function returns NULL (no result row).
     SELECT c.zone_id, c.zone_name, c.zone_name_unicode, c.label,
            d.id, d.status, d.check_state, d.flags, d.dns_mask,
            d.queued_at, d.last_checked_at, d.temp_attempts
@@ -159,9 +159,9 @@ SELECT jsonb_build_object(
 FROM dom;
 $fn$;
 
--- Фиксация search_path за функцией (см. 000006 о безопасности):
--- pg_catalog первым — имена функций в теле, — затем схема, по которой
--- накатана миграция (таблицы). %I экранирует имя при необходимости.
+-- Pinning search_path to the function (see 000006 on security):
+-- pg_catalog first — the function names in the body, — then the schema
+-- the migration was applied to (the tables). %I escapes the name when needed.
 DO $fix$
 BEGIN
     EXECUTE format(

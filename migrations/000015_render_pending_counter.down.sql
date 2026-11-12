@@ -1,15 +1,15 @@
--- T-175: откат счётчика рендер-долга. Таблица маленькая (одна строка на
--- счётчик), данные не восстанавливаются — бэкфилл при повторном
--- применении up пересчитает текущее состояние флагов.
+-- T-175: rollback of the render debt counter. The table is small (one row per
+-- counter), the data is not restored — the backfill on a repeated
+-- up apply will recount the current flag state.
 --
--- ВНИМАНИЕ (ревью T-175, P3-7/P3-5): (1) таблица заявлена общего вида
--- (будущие счётчики переходов кладутся в неё же) — откат удалит и их
--- строки; пока счётчик один (render_pending), потери нет, при появлении
--- новых откат обязан пересматриваться; (2) применять down только вместе
--- с откатом http-worker на прежнюю версию (или заранее дренировав
--- render_pending до нуля): новый http-worker на ±1 счётчика при каждом
--- переходе бита — без таблицы каждая флажащая транзакция записи
--- результата откатывается ошибкой «затронуто 0 строк», доработка
--- флагов тоже не сможет сниматься.
+-- ATTENTION (the T-175 review, P3-7/P3-5): (1) the table is declared general-purpose
+-- (future transition counters land in it too) — the rollback will delete their
+-- rows as well; while there is one counter (render_pending) there is no loss, when new ones appear
+-- the rollback must be reconsidered; (2) apply down only together with
+-- rolling the http-worker back to the previous version (or after draining
+-- render_pending to zero in advance): the new http-worker does ±1 of the counter on every
+-- bit transition — without the table every flagging result-write
+-- transaction rolls back with the "0 rows affected" error, and the
+-- flag rework would not be able to clear either.
 
 DROP TABLE IF EXISTS crawler_counters;

@@ -1,47 +1,47 @@
--- T-113: ослабление файлового дедупа ingest до точной повторной доставки.
+-- T-113: weakening the ingest file dedup to exact redelivery.
 --
--- Уникальный ключ ingest_files.sha256 (глобальный по содержимому, 000001)
--- заменяется на (zone_id, action, sha256): дубль — только точная
--- повторная доставка (та же зона, то же действие, то же содержимое).
--- Глобальный ключ пропускал два легитимных сценария (продуктовое
--- решение 2026-10-18, вариант D):
+-- The unique key ingest_files.sha256 (global by content, 000001)
+-- is replaced with (zone_id, action, sha256): a duplicate is only an exact
+-- redelivery (the same zone, the same action, the same content).
+-- The global key skipped two legitimate scenarios (the product
+-- decision of 2026-10-18, variant D):
 --
---   - undo тем же списком: файл из add/, затем тот же список в delete/
---     (eef80a7) — повторная доставка с другим действием обязана
---     обрабатываться, домены удаляются;
---   - повторная доставка после изменения мира: то же содержимое в другой
---     зоне — домены той зоны первая доставка не трогала (строки файла
---     обязаны принадлежать зоне пути), обработка легитимна.
+--   - an undo by the same list: a file from add/, then the same list in delete/
+--     (eef80a7) — a redelivery with a different action must
+--     be processed, domains get deleted;
+--   - a redelivery after the world changed: the same content in a different
+--     zone — the first delivery did not touch that zone's domains (the file's rows
+--     must belong to the path's zone), processing is legitimate.
 --
--- Безвредность повторного применения доказана идемпотентностью доменных
--- операций (T-097: ON CONFLICT по (zone_id, label), охрана revive по
--- status = deleted, UPDATE delete без охраны) — файловый дедуп лишь
--- оптимизация, корректность гарантирует уровень доменов.
+-- The harmlessness of re-applying is proven by the idempotency of the domain
+-- operations (T-097: ON CONFLICT by (zone_id, label), the revive guard on
+-- status = deleted, an UPDATE delete without a guard) — the file dedup is merely
+-- an optimization, correctness is guaranteed at the domain level.
 --
--- Замена безопасна для данных: новый ключ строже старого только на
--- непустых zone_id/action (всё множество старого + ещё две колонки),
--- существующие строки с попарно различными sha256 нарушить его не
--- могут. zone_id/action nullable по эскизу §6.1 (место для ручных
--- вставок); конвейер пишет их всегда, а NULL по стандарту SQL в
--- уникальном ключе не конфликтует — для ручных строк ключ остаётся
--- advisory. Журнал — строка на файл, индексы строятся мгновенно, без
--- CONCURRENTLY (стиль 000008: индексирование журнала в окно
--- обслуживания не выносится).
+-- The replacement is safe for the data: the new key is stricter than the old one only on
+-- non-empty zone_id/action (the old key's whole set plus two more columns),
+-- existing rows with pairwise distinct sha256 cannot violate it.
+-- zone_id/action are nullable per the §6.1 sketch (room for manual
+-- inserts); the pipeline always writes them, and a NULL per the SQL standard does not conflict in a
+-- unique key — for manual rows the key remains
+-- advisory. The journal is one row per file, the indexes build instantly, without
+-- CONCURRENTLY (the 000008 style: journal indexing is not moved to a
+-- maintenance window).
 --
--- Ключ 000001 — constraint-форма (колонка UNIQUE в CREATE TABLE):
--- снимается вместе с ограничением, DROP INDEX отвергается PostgreSQL
--- (индекс держит ограничение).
+-- The 000001 key is in constraint form (a UNIQUE column in CREATE TABLE):
+-- it is dropped together with the constraint, DROP INDEX is rejected by PostgreSQL
+-- (the index backs the constraint).
 --
--- ingest_files_sha256_idx (sha256) — обычный индекс взамен индексной
--- части сброшенного уникального: конвейер проверяет дубль ПОСЛЕ загрузки
--- staging запросом «все строки журнала с этим содержимым»
--- (WHERE sha256 = $1, зона/действие фильтруются в коде — по контракту
--- T-113 их может быть несколько). Уникальный ключ (zone_id, action,
--- sha256) такой префикс не покрывает (sha256 — третья колонка), без
--- индекса стоимость проверки росла бы линейно с журналом на каждом файле.
--- Сознательное дополнение «минимума индексов» (ТЗ §6) по образцу
--- contents_pack_off_idx (000007): покрывает фактический запрос, состав
--- закреплён контрактом schema_test.go.
+-- ingest_files_sha256_idx (sha256) — a plain index replacing the index part
+-- of the dropped unique one: the pipeline checks the duplicate AFTER loading
+-- staging with the query "all journal rows with this content"
+-- (WHERE sha256 = $1, zone/action are filtered in code — per the
+-- T-113 contract there may be several of them). The unique key (zone_id, action,
+-- sha256) does not cover such a prefix (sha256 is the third column); without
+-- an index the check cost would grow linearly with the journal on every file.
+-- A deliberate addition to "the minimum of indexes" (spec §6) modeled on
+-- contents_pack_off_idx (000007): covers the actual query, the composition
+-- is pinned by the schema_test.go contract.
 
 ALTER TABLE ingest_files DROP CONSTRAINT ingest_files_sha256_key;
 

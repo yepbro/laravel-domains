@@ -1,31 +1,31 @@
--- T-120: данные публичного лендинга (этап 13, перенос из larasites).
+-- T-120: public landing data (stage 13, moved from larasites).
 --
--- 1) zones.domains_laravel — кэш числа Laravel-доменов зоны: карточки и
---    облако/таблица зон лендинга читают суммы по zones без агрегатов по
---    laravel_domains (сотни миллионов строк на боевом корпусе).
---    Обновляется тем же проходом ZoneStatsLoop (T-078, раз в 30–60 с):
---    дополнительный агрегат SELECT zone_id, count(*) FROM laravel_domains
---    GROUP BY zone_id — строка таблицы уже прошла порог analyzer
---    (laravel_domains пишут только уверенные срабатывания, §13.1),
---    отдельный порог здесь не нужен. NOT NULL DEFAULT 0: зона без
---    находок — ноль, а не NULL (LEFT JOIN прохода даёт COALESCE).
+-- 1) zones.domains_laravel — a cache of the zone's count of Laravel domains: the cards and
+--    the zone cloud/table of the landing read sums over zones without aggregates over
+--    laravel_domains (hundreds of millions of rows on the production corpus).
+--    Updated by the same ZoneStatsLoop pass (T-078, every 30–60 s):
+--    the extra aggregate SELECT zone_id, count(*) FROM laravel_domains
+--    GROUP BY zone_id — a table row has already passed the analyzer threshold
+--    (laravel_domains only records confident hits, §13.1),
+--    a separate threshold is not needed here. NOT NULL DEFAULT 0: a zone without
+--    finds — zero, not NULL (the pass's LEFT JOIN gives COALESCE).
 --
--- 2) laravel_domains_updated_at_idx — «последние находки» лендинга
---    сортируются по updated_at (ORDER BY updated_at DESC LIMIT 5), PK
---    таблицы — (zone_id, domain_id): без индекса — сортировка всей
---    таблицы на каждый показ. Партиционированный (родитель
---    партиционирован по zone_id — индекс создаётся на родителе, листья
---    на партициях создаст PG; новые партиции зон наследуют индекс
---    автоматически, процедура 000003 трогается только своими таблицами).
+-- 2) laravel_domains_updated_at_idx — the landing's "latest finds" are sorted
+--    by updated_at (ORDER BY updated_at DESC LIMIT 5), the table's PK
+--    is (zone_id, domain_id): without an index — sorting the whole
+--    table on every view. On the partitioned parent
+--    (the parent is partitioned by zone_id — the index is created on the parent, PG creates the leaves
+--    on the partitions; new zone partitions inherit the index
+--    automatically, the 000003 procedure touches only its own tables).
 --
--- 3) web_checks — лог ручных проверок из формы лендинга (аналог
---    form_histories larasites; пишет только cmd/web, T-123): кто, что
---    и когда проверял — антиспам-разбор и статистика формы.
---    domain — как введено оператором (до нормализации), punycode_domain
---    — после idn.Normalize: сырой вход нужен для разбора опечаток,
---    punycode — для сопоставления с данными конвейера. Ротации нет —
---    объём ручных проверок мал; рост контролируется рейт-лимитом
---    формы (T-123).
+-- 3) web_checks — the log of manual checks from the landing form (an analog of
+--    the larasites form_histories; only cmd/web writes it, T-123): who checked what,
+--    when and from where — anti-spam triage and form statistics.
+--    domain — as entered by the operator (before normalization), punycode_domain
+--    — after idn.Normalize: the raw input is needed for typo triage,
+--    punycode — for matching against pipeline data. No rotation —
+--    the volume of manual checks is small; growth is controlled by the form's
+--    rate limit (T-123).
 
 ALTER TABLE zones ADD COLUMN domains_laravel bigint NOT NULL DEFAULT 0;
 
@@ -45,5 +45,5 @@ CREATE TABLE web_checks (
 CREATE INDEX web_checks_ip_created_idx ON web_checks (ip_address, created_at);
 CREATE INDEX web_checks_created_idx ON web_checks (created_at);
 
-COMMENT ON COLUMN zones.domains_laravel IS 'Кэш числа Laravel-доменов зоны (пересчёт ZoneStatsLoop, T-120)';
-COMMENT ON TABLE web_checks IS 'Лог ручных проверок из формы лендинга (пишет cmd/web, T-120/T-123)';
+COMMENT ON COLUMN zones.domains_laravel IS 'Cached count of Laravel domains in the zone (recomputed by ZoneStatsLoop, T-120)';
+COMMENT ON TABLE web_checks IS 'Log of manual checks from the landing form (written by cmd/web, T-120/T-123)';

@@ -1,59 +1,59 @@
--- T-171: индексы окон мониторинга — суточный/часовой срез вместо
--- полного прохода таблиц (T-078/T-080/T-126/ТЗД §4.4).
+-- T-171: monitoring window indexes — a daily/hourly snapshot instead of
+-- a full table pass (T-078/T-080/T-126, dashboard spec §4.4).
 --
--- Постоянные потребители-агрегаты (замер боем 23–24.10, pg_stat_statements
--- за 2,7 сут) перечитывают таблицы целиком на каждый проход:
+-- The permanent consumer aggregates (the production measurement of Oct 23–24,
+-- pg_stat_statements over 2.7 days) re-read the whole tables on every pass:
 --
---   - done_today (status.throughputSQL — дашборд каждые ~23 с,
+--   - done_today (status.throughputSQL — the dashboard every ~23 s,
 --     crawlerctl status): count(*) FROM domains WHERE last_checked_at
---     = current_date — seq scan 41,8 млн строк, mean 3,3 с, ≈9,3 ч
---     времени БД за окно;
---   - доля temp_error (monitor/alerts.go dnsShareSQL, каждые 60 с):
+--     = current_date — a seq scan of 41.8M rows, mean 3.3 s, ≈9.3 h
+--     of DB time per window;
+--   - the temp_error share (monitor/alerts.go dnsShareSQL, every 60 s):
 --     count(*) FILTER (WHERE status = $1) FROM domains WHERE
---     last_checked_at >= current_date — тот же seq scan, mean 7,4 с,
---     ≈4,4 ч;
---   - результаты за час (throughputSQL: results_hour / rendered_hour):
+--     last_checked_at >= current_date — the same seq scan, mean 7.4 s,
+--     ≈4.4 h;
+--   - the results of an hour (throughputSQL: results_hour / rendered_hour):
 --     count(*) FROM subdomain_results WHERE checked_at >= now() -
---     interval '1 hour' — seq scan 2,6 млн строк ×2 на каждый снимок.
+--     interval '1 hour' — a seq scan of 2.6M rows ×2 per snapshot.
 --
--- Частичный domains_recheck_idx (T-104) окнам не подходит: предикат
--- check_state = 2 в запросах не доказать (done_today — проверки, а не
--- домены: строка сегодняшней проверки может быть уже не done), окно
--- покрывает почти все done-строки.
+-- The partial domains_recheck_idx (T-104) does not fit the windows: the
+-- check_state = 2 predicate cannot be proven in the queries (done_today — checks, not
+-- domains: a row of today's check may no longer be done), the window
+-- covers almost all done rows.
 --
 -- domains_last_checked_idx (last_checked_at)
 --
---   Диапазонный скан текущих суток: ключ — сама колонка окна, растёт
---   слева направо, «сегодня» — правый край. count(*) по одному индексу
---   — index-only scan; доля temp_error дополнительно фильтрует status
---   по куче (сегодняшние страницы — самые горячие, в shared_buffers).
+--   A range scan of the current day: the key is the window column itself, growing
+--   left to right, "today" is the right edge. count(*) over one index
+--   — an index-only scan; the temp_error share additionally filters status
+--   via the heap (today's pages are the hottest, in shared_buffers).
 --
---   HOT: last_checked_at уже в ключе domains_recheck_idx (T-104), и все
---   писатели меняют её ТОЛЬКО вместе с check_state (результат
---   dns/http-воркера: check_state = done + last_checked_at = now(),
+--   HOT: last_checked_at is already in the domains_recheck_idx key (T-104), and all
+--   the writers change it ONLY together with check_state (the
+--   dns/http worker's result: check_state = done + last_checked_at = now(),
 --   internal/dnsworker/result.go, internal/httpworker/record.go) —
---   переходы уже non-HOT, новых non-HOT апдейтов индекс не создаёт,
---   только ещё одну запись в том же переходе (класс recheck-индекса).
---   Закреплено тестом TestSchema_DomainsHOTColumns (age-колонки).
+--   the transitions are already non-HOT, the index creates no new non-HOT updates,
+--   only one more entry in the same transition (the recheck index class).
+--   Pinned by the TestSchema_DomainsHOTColumns test (the age columns).
 --
---   Размер: ~26 байт × число проверенных доменов (≈1 ГиБ на корпусе
---   41,8 млн) — цена мгновенных окон мониторинга против ~13,7 ч
---   времени БД за каждые 2,7 сут боевого цикла.
+--   Size: ~26 bytes × the number of checked domains (≈1 GiB on a corpus of
+--   41.8M) — the price of instant monitoring windows against ~13.7 h
+--   of DB time per every 2.7 days of the production cycle.
 --
 -- subdomain_results_checked_idx (checked_at)
 --
---   Часовое окно результатов/рендеров: диапазонный скан правого края.
---   checked_at пишет INSERT (строки результатов неизменяемы; DELETE —
---   только очистка deleted и retention T-166) — обслуживания апдейтов
---   нет, записи добавляются в правый лист монотонно (timestamptz
---   now()): цена INSERT'а — одна appending-запись. Размер ~24 байта ×
---   число живых результатов (≈60 МиБ на 2,6 млн).
+--   The hourly window of results/renders: a range scan of the right edge.
+--   checked_at is written by an INSERT (result rows are immutable; a DELETE —
+--   only the deleted cleanup and the T-166 retention) — there is no update maintenance,
+--   entries are added to the right leaf monotonically (timestamptz
+--   now()): the INSERT price is one appending entry. Size ~24 bytes ×
+--   the number of live results (≈60 MiB per 2.6M).
 --
--- Оба индекса создаются на партиционированных родителях: существующие
--- и будущие партиции получают дочерние индексы автоматически. CREATE
--- INDEX CONCURRENTLY на родителе PG16 не поддерживает — применять в
--- окно обслуживания (построение domains_last_checked_idx на корпусе
--- десятков миллионов строк занимает минуты).
+-- Both indexes are created on partitioned parents: existing
+-- and future partitions get child indexes automatically. CREATE
+-- INDEX CONCURRENTLY on the parent is not supported in PG16 — apply in a
+-- maintenance window (building domains_last_checked_idx on a corpus of
+-- tens of millions of rows takes minutes).
 
 CREATE INDEX domains_last_checked_idx
     ON domains (last_checked_at);

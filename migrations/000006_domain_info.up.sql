@@ -1,57 +1,57 @@
--- T-082: SQL-функция domain_info(text) — сводка домена по имени для
--- прямого запроса из psql (ТЗ 5.11: «SQL-функция domain_info(text) для
--- прямого запроса из БД»; CLI-обёртка crawlerctl domain — T-081).
+-- T-082: the SQL function domain_info(text) — a domain summary by name for
+-- a direct query from psql (spec 5.11: "the SQL function domain_info(text) for
+-- a direct query from the DB"; the CLI wrapper crawlerctl domain — T-081).
 --
--- Формат ответа — jsonb, не TABLE-набор колонок: результат составной
--- (зона + строка домена + массивы расшифровок dns_mask, результатов
--- по субдоменам/вариантам и признаков Laravel), переменной глубины;
--- jsonb читается из psql одним значением и даёт стабильные пути полей
--- для тестов. Домен или зона не найдены — NULL, не ошибка (ТЗ 5.11:
--- «понятное сообщение» формирует CLI, SQL-функция лишь отвечает фактом).
+-- The response format is jsonb, not a TABLE column set: the result is composite
+-- (a zone + the domain row + arrays decoding dns_mask, the per-subdomain/variant
+-- results and the Laravel signs), of variable depth;
+-- jsonb is read from psql as one value and gives stable field paths
+-- for the tests. A missing domain or zone — NULL, not an error (spec 5.11:
+-- the "understandable message" is produced by the CLI, the SQL function only answers with the fact).
 --
--- Нормализация входа — минимум средствами SQL (ТЗ 5.2 п. 1): нижний
--- регистр, снятие краевых пробелов и точек. Полный конвейер IDN
--- (пробелы внутри, punycode, проверки длин) — сторона Go (internal/idn):
--- в БД имена хранятся punycode, unicode-вход адресует CLI T-081,
--- нормализуя имя до обращения к функции. Зона отделяется сопоставлением
--- суффиксов со справочником zones (самый длинный совпавший суффикс):
--- список публичных суффиксов в SQL недоступен, а zones — фактический
--- набор зон каталога, покрывающий и составные зоны вроде co.uk;
--- поведение совпадает с idn.Normalize (зона по PSL, составные метки
--- домена остаются в label).
+-- Input normalization — the SQL-side minimum (spec 5.2 item 1): lower case,
+-- trimming edge spaces and dots. The full IDN pipeline
+-- (spaces inside, punycode, length checks) — the Go side (internal/idn):
+-- in the DB names are stored punycode; unicode input is addressed by the CLI T-081,
+-- which normalizes the name before calling the function. The zone is split off by matching
+-- suffixes against the zones reference table (the longest matching suffix):
+-- the public suffix list is unavailable in SQL, and zones is the actual
+-- zone set of the catalog, covering composite zones like co.uk;
+-- the behavior matches idn.Normalize (the zone by PSL, composite domain
+-- labels stay in the label).
 --
--- Поиск домена — по уникальному ключу (zone_id, label), индекс
--- domains_zone_id_label_key, без полного сканирования (ТЗ 5.11).
+-- The domain lookup — by the unique key (zone_id, label), the index
+-- domains_zone_id_label_key, with no full scan (spec 5.11).
 --
--- Безопасность: функция только читает — STABLE, PARALLEL SAFE,
--- SECURITY INVOKER (явно); тело обращается к таблицам по
--- неквалифицированным именам, поэтому search_path закрепляется за
--- функцией (ALTER после CREATE: имя схемы во время миграции неизвестно —
--- набор накатывается и в рабочую схему, и в изолированные схемы
--- интеграционных тестов через search_path DSN).
+-- Security: the function only reads — STABLE, PARALLEL SAFE,
+-- SECURITY INVOKER (explicit); the body references the tables by
+-- unqualified names, so search_path is pinned to the
+-- function (ALTER after CREATE: the schema name is unknown during the migration —
+-- the set is applied both to the production schema and to the isolated schemas
+-- of the integration tests via the search_path DSN).
 --
--- Состав ответа (ключи jsonb, змеиные имена как у колонок):
+-- Response composition (jsonb keys, snake_case names matching the columns):
 --   zone            {id, name, name_unicode}
 --   domain          {id, label, name, status, status_name, check_state,
 --                    check_state_name, is_idn, render_pending, dns_mask,
 --                    temp_attempts, queued_at, last_checked_at}
---   dns_alive       [{id, label}] — расшифровка dns_mask по справочнику
---                    subdomains (ТЗ 5.11)
+--   dns_alive       [{id, label}] — dns_mask decoded against the
+--                    subdomains reference table (spec 5.11)
 --   results         [{subdomain_id, subdomain, variant, scheme,
 --                    scheme_name, http_status, final_url, alias_kind,
 --                    alias_kind_name, alias, rendered, error,
---                    content_hash, checked_at}] — по (субдомен, вариант),
---                    как в ТЗ 5.11; контент не раскрывается — только
---                    ссылка content_hash (распаковка из хранилища — CLI)
+--                    content_hash, checked_at}] — by (subdomain, variant),
+--                    as in spec 5.11; the content is not disclosed — only
+--                    the content_hash reference (unpacking from the store — the CLI)
 --   laravel         {score, ver_min, ver_max, found_on_mask, found_on,
---                    rules_version, updated_at, findings} — агрегат
---                    laravel_domains (json null, когда признаков нет);
---                    findings — все срабатывания laravel_findings
---                    домена по убыванию score (включая слабые ниже
---                    порога с пометкой is_laravel, ТЗ 5.11), signals
---                    передаются как есть
--- Имена *_name дублируют коды значений из ТЗ 6.2 и internal/model
--- (Status/CheckState/Scheme/AliasKind) для чтения из psql без справочника.
+--                    rules_version, updated_at, findings} — the aggregate
+--                    of laravel_domains (json null when there are no signs);
+--                    findings — all laravel_findings hits
+--                    of the domain by descending score (including weak ones below
+--                    the threshold marked with is_laravel, spec 5.11); signals
+--                    are passed as is
+-- The *_name names duplicate the value codes from spec 6.2 and internal/model
+-- (Status/CheckState/Scheme/AliasKind) so that psql can read them without a reference table.
 
 CREATE OR REPLACE FUNCTION domain_info(p_name text)
 RETURNS jsonb
@@ -61,7 +61,7 @@ PARALLEL SAFE
 SECURITY INVOKER
 AS $fn$
 WITH input AS (
-    -- ТЗ 5.2 п. 1 SQL-минимумом: регистр, краевые пробелы и точки.
+    -- Spec 5.2 item 1 with the SQL minimum: case, edge spaces and dots.
     SELECT NULLIF(lower(btrim(p_name, E' \t\n\r\f\v.')), '') AS name
 ),
 labels AS (
@@ -70,10 +70,10 @@ labels AS (
     WHERE name IS NOT NULL
 ),
 cand AS (
-    -- Зона — самый длинный суффикс имени, присутствующий в zones
-    -- (co.uk предпочитается uk); label — оставшиеся метки целиком.
-    -- k — индекс первой метки зоны; k = 2 оставляет метке хотя бы одну
-    -- метку: имя из одной метки — зона, не домен.
+    -- The zone — the longest suffix of the name present in zones
+    -- (co.uk is preferred over uk); label — the remaining labels as a whole.
+    -- k is the index of the first zone label; k = 2 leaves the label at least one
+    -- label: a single-label name is a zone, not a domain.
     SELECT z.id                                        AS zone_id,
            z.name                                      AS zone_name,
            z.name_unicode                              AS zone_name_unicode,
@@ -86,8 +86,8 @@ cand AS (
     LIMIT 1
 ),
 dom AS (
-    -- Строка домена по уникальному ключу (ТЗ 5.11); dom пуста —
-    -- функция вернёт NULL (нет строки результата).
+    -- The domain row by the unique key (spec 5.11); an empty dom —
+    -- the function returns NULL (no result row).
     SELECT c.zone_id, c.zone_name, c.zone_name_unicode, c.label,
            d.id, d.status, d.check_state, d.flags, d.dns_mask,
            d.queued_at, d.last_checked_at, d.temp_attempts
@@ -206,9 +206,9 @@ SELECT jsonb_build_object(
 FROM dom;
 $fn$;
 
--- Фиксация search_path за функцией (см. комментарий о безопасности):
--- pg_catalog первым — имена функций в теле, — затем схема, по которой
--- накатана миграция (таблицы). %I экранирует имя при необходимости.
+-- Pinning search_path to the function (see the security comment):
+-- pg_catalog first — the function names in the body, — then the schema
+-- the migration was applied to (the tables). %I escapes the name when needed.
 DO $fix$
 BEGIN
     EXECUTE format(

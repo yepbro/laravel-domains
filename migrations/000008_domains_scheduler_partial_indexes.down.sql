@@ -1,8 +1,8 @@
--- T-104: откат частичных индексов фоновых проходов планировщика.
+-- T-104: rollback of the partial indexes of the scheduler's background passes.
 --
--- DROP INDEX на партиционированном родителе каскадно удаляет дочерние
--- индексы всех партиций; данные не затрагиваются. Сами проходы
--- (lease/recheck) продолжат работать seq scan'ом — как до миграции.
+-- DROP INDEX on a partitioned parent cascades to the child
+-- indexes of all partitions; the data is untouched. The passes themselves
+-- (lease/recheck) will keep working with a seq scan — as before the migration.
 
 DROP INDEX IF EXISTS domains_recheck_idx;
 DROP INDEX IF EXISTS domains_lease_idx;

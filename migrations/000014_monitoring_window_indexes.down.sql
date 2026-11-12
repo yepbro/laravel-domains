@@ -1,9 +1,9 @@
--- T-171: откат индексов окон мониторинга.
+-- T-171: rollback of the monitoring window indexes.
 --
--- DROP INDEX на партиционированных родителях каскадно удаляет дочерние
--- индексы всех партиций; данные не затрагиваются. Агрегаты мониторинга
--- продолжат работать полными seq-сканами (как до миграции) — на
--- корректность индексы не влияют.
+-- DROP INDEX on the partitioned parents cascades to the child
+-- indexes of all partitions; the data is untouched. The monitoring aggregates
+-- will keep working with full seq scans (as before the migration) — the
+-- indexes do not affect correctness.
 
 DROP INDEX IF EXISTS subdomain_results_checked_idx;
 DROP INDEX IF EXISTS domains_last_checked_idx;

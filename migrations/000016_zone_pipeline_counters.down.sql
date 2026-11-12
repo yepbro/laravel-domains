@@ -1,12 +1,12 @@
--- T-178: откат колонок инкрементальных счётчиков зон. Откат обязан
--- идти вместе с откатом сервисов на версии до T-178: scheduler/ingest/
--- httpworker/dnsworker пишут дельты в эти колонки — без колонки каждая
--- флажащая транзакция перехода падает ошибкой. Таблица crawler_counters
--- сохраняется (владелец — миграция 000015/T-175); удаляется только
--- добавленная этим релизом колонка updated_at — старый код T-175 её не
--- читает, потеря безвредна. Значения не восстанавливаются: повторное
--- применение up наполнит колонки первым проходом реконсиляции
--- (прецедент 000012).
+-- T-178: rollback of the incremental zone counter columns. The rollback must
+-- go together with rolling the services back to the pre-T-178 versions: scheduler/ingest/
+-- httpworker/dnsworker write deltas into these columns — without a column every
+-- flapping transition transaction fails with an error. The crawler_counters table
+-- is preserved (the owner is migration 000015/T-175); only
+-- the updated_at column added by this release is dropped — the old T-175 code does not
+-- read it, the loss is harmless. The values are not restored: re-applying up
+-- will populate the columns with the first reconciliation pass
+-- (the 000012 precedent).
 
 ALTER TABLE zones
     DROP COLUMN domains_pending,

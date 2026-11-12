@@ -1,19 +1,19 @@
--- T-004: fillfactor = 85 листовой партиции subdomain_results.
+-- T-004: fillfactor = 85 of the subdomain_results leaf partition.
 --
--- История проверок не хранится (ТЗ 3.5): перепроверка домена перезаписывает
--- строки результата с тем же первичным ключом. Это UPDATE, и чтобы он
--- оставался HOT, новой версии строки нужно место на той же странице —
--- ТЗ 6.3 прямо относит subdomain_results к часто обновляемым таблицам
--- (настроенный autovacuum для партиций domains и subdomain_results).
--- Значение 85 — как у партиций domains (миграция 000001).
+-- Check history is not kept (spec 3.5): a domain recheck rewrites the
+-- result rows with the same primary key. That is an UPDATE, and for it to
+-- stay HOT the new row version needs room on the same page —
+-- spec 6.3 explicitly classifies subdomain_results as a frequently updated
+-- table (tuned autovacuum for the domains and subdomain_results partitions).
+-- The value 85 — same as the domains partitions (migration 000001).
 --
--- На партиционированном родителе storage parameters задать нельзя (PG16),
--- поэтому параметр ставится листовым партициям; выделенные партиции зон
--- (T-005) создаются сразу с fillfactor = 85 — контракт закреплён тестом
+-- Storage parameters cannot be set on a partitioned parent (PG16),
+-- so the parameter goes to the leaf partitions; dedicated zone
+-- partitions (T-005) are created with fillfactor = 85 right away — the contract is pinned by the test
 -- test/integration/schema_test.go (TestSchema_ResultsTablesPartitioning).
 --
--- ALTER ... SET действует только на будущие страницы: на уже загруженной
--- БД перезапись выполняется VACUUM FULL вне миграции (не выполняется в
--- транзакции; на текущем этапе данных в таблице нет).
+-- ALTER ... SET affects only future pages: on an already loaded
+-- DB the rewrite is done by VACUUM FULL outside the migration (it cannot run
+-- inside a transaction; there is no data in the table at this point).
 
 ALTER TABLE subdomain_results_default SET (fillfactor = 85);

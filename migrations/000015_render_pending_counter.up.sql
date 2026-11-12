@@ -1,38 +1,38 @@
--- T-175: инкрементальный счётчик рендер-долга — таблица crawler_counters.
+-- T-175: the incremental render debt counter — the crawler_counters table.
 --
--- Долг рендера (домены с битом render_pending в domains.flags, бит 1,
--- T-066/T-008, + непотреблённый остаток стрима q:render) до T-175
--- виден только ручным SQL: count по битовой маске — полный seq scan
--- 41,8 млн строк (десятки секунд CPU БД), для периодического опроса
--- мониторингом недопустим (T-171 закрыл тот же класс стоимости окон
--- индексами; здесь индекс невозможен — ниже).
+-- The render debt (the domains with the render_pending bit in domains.flags, bit 1,
+-- T-066/T-008, + the unconsumed remainder of the q:render stream) before T-175
+-- was visible only via manual SQL: a count over the bitmask is a full seq scan
+-- of 41.8M rows (tens of seconds of DB CPU), unacceptable for periodic
+-- monitoring polling (T-171 closed the same cost class of windows with
+-- indexes; an index is impossible here — see below).
 --
--- Почему НЕ частичный индекс (flags & 2) <> 0 (по образцу T-104/T-170):
--- инвариант HOT схемы (docs/schema.md «HOT-апдейты», закреплён тестом
--- TestSchema_DomainsHOTColumns) требует, чтобы flags не входила ни в
--- один индекс — ни в ключ, ни в предикат. Посылка «переходы бита редки»
--- неверна на уровне КОЛОНКИ: flags меняется дважды на каждый эпизод
--- каждого домена (dns-worker ставит бит http_published — бит 2 — после
--- публикации q:http, запись результата снимает, T-108; запись результата
--- ставит/снимает бит dead_host_cutoff, T-164) — миллионы апдейтов в
--- сутки. Частичный индекс с flags в предикате делал бы non-HOT КАЖДЫЙ
--- такой апдейт (переписывание версий строк и записей индексов на
--- полную высоту дерева), а не только редкие переходы render_pending.
--- Поэтому счётчик инкрементальный: +1/−1 в той же транзакции, что и
--- переход бита render_pending (internal/httpworker/renderq.go, T-175),
--- чтение — точечный Lookup по PK (микросекунды) раз в
+-- Why NOT a partial index (flags & 2) <> 0 (modeled on T-104/T-170):
+-- the HOT invariant of the schema (docs/schema.md "HOT updates", pinned by the
+-- TestSchema_DomainsHOTColumns test) requires flags to enter no
+-- index — neither the key nor the predicate. The premise "bit transitions are rare"
+-- is wrong at the COLUMN level: flags changes twice per episode
+-- of every domain (the dns worker sets the http_published bit — bit 2 — after
+-- publishing to q:http, the result record clears it, T-108; the result record
+-- sets/clears the dead_host_cutoff bit, T-164) — millions of updates
+-- per day. A partial index with flags in the predicate would make EVERY
+-- such update non-HOT (rewriting row versions and index entries over
+-- the full tree height), not only the rare render_pending transitions.
+-- Hence the counter is incremental: +1/−1 in the same transaction as
+-- the render_pending bit transition (internal/httpworker/renderq.go, T-175),
+-- reading — a point Lookup by PK (microseconds) once per
 -- monitor.render_debt_interval.
 --
--- Таблица-счётчик общего вида (name/value), а не отдельная таблица
--- render_pending_count: будущие счётчики этого класса (переходы редки,
--- чтение частое) не плодят новых таблиц; имя строки — литерал SQL
--- ('render_pending'), значение — bigint (счётчик доменов).
+-- A general-purpose counter table (name/value), not a separate
+-- render_pending_count table: future counters of this class (rare transitions,
+-- frequent reads) do not spawn new tables; the row name is an SQL
+-- literal ('render_pending'), the value is a bigint (a domain counter).
 --
--- Начальный бэкфилл: ОДНОКРАТНЫЙ seq scan по domains (41,8 млн строк —
--- десятки секунд, тот же класс стоимости, что один проход пересчёта
--- зон T-078), выполняется при применении миграции на деплое один раз;
--- дальше строку ведут переходы бита. Ручные операции с битом
--- render_pending обязаны править счётчик (docs/runbooks.md §6).
+-- The initial backfill: a ONE-OFF seq scan over domains (41.8M rows —
+-- tens of seconds, the same cost class as one zone recount pass
+-- T-078), runs once when the migration is applied on deploy;
+-- afterwards the bit transitions maintain the row. Manual operations with the
+-- render_pending bit must adjust the counter (docs/runbooks.md §6).
 
 CREATE TABLE crawler_counters (
     name  text   PRIMARY KEY,

@@ -1,68 +1,68 @@
--- T-005: субпартиционирование крупных зон (ТЗ §6: «крупные зоны дополнительно
--- по хэшу id, чтобы партиция не превышала ≈ 30–50 млн строк»).
+-- T-005: subpartitioning of large zones (spec §6: "large zones are additionally
+-- hashed by id, so that a partition stays within ≈30–50M rows").
 --
--- Процедура create_zone_partitions(zone_id, hash_parts) выделяет зону из
--- DEFAULT-партиции в собственный набор партиций во всех четырёх таблицах
--- с zone_id (domains, subdomain_results, laravel_domains, laravel_findings):
+-- The create_zone_partitions(zone_id, hash_parts) procedure carves a zone out of the
+-- DEFAULT partition into its own set of partitions in all four
+-- tables with zone_id (domains, subdomain_results, laravel_domains, laravel_findings):
 --
 --   domains                PARTITION BY LIST (zone_id)
 --   └─ domains_z<zone_id>  FOR VALUES IN (zone_id) WITH (fillfactor = 85)
---      — обычная партиция-лист, без второго уровня (см. ниже);
+--      — an ordinary leaf partition, no second level (see below);
 --
 --   subdomain_results / laravel_domains / laravel_findings
---   └─ <таблица>_z<zone_id>         FOR VALUES IN (zone_id)
---      └─ <таблица>_z<zone_id>_h<N> FOR VALUES WITH (MODULUS M, REMAINDER N)
---         — субпартиционирование HASH по domain_id: все строки одного домена
---         попадают в один лист.
+--   └─ <table>_z<zone_id>         FOR VALUES IN (zone_id)
+--      └─ <table>_z<zone_id>_h<N> FOR VALUES WITH (MODULUS M, REMAINDER N)
+--         — HASH subpartitioning by domain_id: all rows of one domain
+--         land in one leaf.
 --
--- Почему domains без хэша. У domains два уникальных ключа: PK (zone_id, id)
--- и UNIQUE (zone_id, label) — контракт T-003 (идемпотентность ingest по
--- ON CONFLICT, ТЗ 5.1; поиск по имени, ТЗ 5.11). PostgreSQL 16 требует,
--- чтобы каждый уникальный ключ содержал колонки ключа партиционирования
--- каждого уровня; общий делитель двух ключей — только zone_id, константа
--- внутри партиции зоны. Значит, субпартиционировать domains по хэшу id (или
--- label) при живом UNIQUE (zone_id, label) невозможно в принципе — это
--- уточнение ТЗ §6/§6.1 при реализации (прямое указание создать HASH по id
--- для domains приводит к ошибке «unique constraint on partitioned table
--- must include all partitioning columns»). Крупная зона получает одну
--- выделенную партицию domains — строки таблицы маленькие, апдейты точечные;
--- основной объём и перезаписи живут в subdomain_results, который
--- субпартиционируется полностью.
+-- Why domains has no hash. domains has two unique keys: PK (zone_id, id)
+-- and UNIQUE (zone_id, label) — the T-003 contract (ingest idempotency via
+-- ON CONFLICT, spec 5.1; lookup by name, spec 5.11). PostgreSQL 16 requires
+-- every unique key to include the partitioning key columns
+-- of every level; the only common divisor of the two keys is zone_id, a constant
+-- inside a zone partition. So subpartitioning domains by a hash of id (or
+-- label) while UNIQUE (zone_id, label) is alive is impossible in principle — a
+-- refinement of spec §6/§6.1 made during implementation (a direct instruction to create a HASH on id
+-- for domains fails with the error "unique constraint on partitioned table
+-- must include all partitioning columns"). A large zone gets one
+-- dedicated domains partition — the table's rows are small, updates are point ones;
+-- the main volume and the rewrites live in subdomain_results, which is
+-- subpartitioned in full.
 --
--- Последовательность и блокировки (PostgreSQL 16), по каждой таблице,
--- в одной транзакции CALL:
---   1. DETACH DEFAULT-партиции: CREATE PARTITION OF невозможен, пока
---      DEFAULT прикреплена и содержит строки зоны (PG откажет с ошибкой
---      «updated partition constraint for default partition would be
---      violated by some row»);
---   2. CREATE партиции зоны (и hash-листьев на все остатки 0..M-1 —
---      у hash-партиций не бывает DEFAULT, «дырок» для маршрутизации нет);
---   3. перенос строк зоны из отсоединённой DEFAULT одной командой
---      WITH moved AS (DELETE ... RETURNING *) INSERT ... — атомарно,
---      без промежуточного хранения;
---   4. ATTACH DEFAULT обратно: строк зоны в ней уже нет, проверка
---      ограничения проходит.
+-- Sequence and locks (PostgreSQL 16), per table,
+-- inside one CALL transaction:
+--   1. DETACH the DEFAULT partition: CREATE PARTITION OF is impossible while
+--      the DEFAULT is attached and holds the zone's rows (PG fails with the error
+--      "updated partition constraint for default partition would be
+--      violated by some row");
+--   2. CREATE the zone partition (and hash leaves for every remainder 0..M-1 —
+--      hash partitions have no DEFAULT, there are no "holes" for routing);
+--   3. move the zone's rows out of the detached DEFAULT with one command
+--      WITH moved AS (DELETE ... RETURNING *) INSERT ... — atomically,
+--      with no intermediate storage;
+--   4. ATTACH the DEFAULT back: the zone's rows are gone from it, the
+--      constraint check passes.
 --
--- DETACH/CREATE/ATTACH держат AccessExclusiveLock на таблице, поэтому
--- на время работы процедуры (включая перенос строк) конкурентная запись
--- в таблицу ждёт, а не падает: для зоны, выделяемой до загрузки, перенос
--- пуст и процедура мгновенна; нагруженную зону выделять в окно обслуживания.
--- DETACH ... CONCURRENTLY внутри процедуры недоступен (не работает
--- в транзакции).
+-- DETACH/CREATE/ATTACH hold an AccessExclusiveLock on the table, so
+-- while the procedure runs (including the row move) concurrent writes
+-- to the table wait instead of failing: for a zone carved out before load, the move
+-- is empty and the procedure is instant; carve out a loaded zone in a maintenance window.
+-- DETACH ... CONCURRENTLY is unavailable inside the procedure (it does not work
+-- in a transaction).
 --
--- fillfactor = 85 (storage parameters на партиционированном родителе PG16
--- запрещает, параметр получают листья): domains — самой партиции зоны,
--- subdomain_results — hash-листьям, как у их DEFAULT-партиций (миграции
--- 000001/000002, контракт test/integration/schema_test.go); laravel_* —
--- без fillfactor. Дочерние индексы всех индексов родителя создаются на
--- партициях автоматически вместе с CREATE TABLE ... PARTITION OF.
+-- fillfactor = 85 (PG16 forbids storage parameters on a partitioned parent,
+-- the leaves get the parameter): domains — the zone partition itself,
+-- subdomain_results — the hash leaves, like their DEFAULT partitions (migrations
+-- 000001/000002, the contract test/integration/schema_test.go); laravel_* —
+-- without fillfactor. Child indexes of every parent index are created on
+-- the partitions automatically together with CREATE TABLE ... PARTITION OF.
 --
--- Идемпотентность: таблицы, у которых партиция зоны уже существует,
--- пропускаются (NOTICE) — повторный CALL безопасен и завершит прерванное
--- выделение; повторные вызовы по одной зоне сериализуются advisory-блокировкой.
+-- Idempotency: tables whose zone partition already exists
+-- are skipped (NOTICE) — a repeated CALL is safe and finishes an interrupted
+-- carve-out; repeated calls for the same zone are serialized by an advisory lock.
 --
--- Как выбирать hash_parts (число листьев под целевые ≈ 30–50 млн строк) —
--- docs/schema.md. Вызов:
+-- How to choose hash_parts (the number of leaves for the target ≈30–50M rows) —
+-- docs/schema.md. Invocation:
 --
 --   CALL create_zone_partitions(<zone_id>);
 --   CALL create_zone_partitions(<zone_id>, <hash_parts>);
@@ -71,32 +71,32 @@ CREATE PROCEDURE create_zone_partitions(p_zone_id smallint, p_hash_parts integer
 LANGUAGE plpgsql
 AS $proc$
 DECLARE
-    v_table    text;    -- таблица: domains, subdomain_results, laravel_*
-    v_hash_col text;    -- колонка хэширования (domain_id) либо NULL для domains
-    v_has_ff   boolean; -- партиции нужен fillfactor = 85
-    v_default  text;    -- имя DEFAULT-партиции таблицы (из каталога)
-    v_part     text;    -- имя партиции зоны: <таблица>_z<zone_id>
-    v_ff       text;    -- хвост ' WITH (fillfactor = 85)' либо ''
-    v_moved    bigint;  -- строк, перенесённых из DEFAULT
+    v_table    text;    -- the table: domains, subdomain_results, laravel_*
+    v_hash_col text;    -- the hash column (domain_id), or NULL for domains
+    v_has_ff   boolean; -- the partition needs fillfactor = 85
+    v_default  text;    -- the table's DEFAULT partition name (from the catalog)
+    v_part     text;    -- the zone partition name: <table>_z<zone_id>
+    v_ff       text;    -- the tail ' WITH (fillfactor = 85)' or ''
+    v_moved    bigint;  -- rows moved out of the DEFAULT
     v_i        integer;
 BEGIN
-    -- Зона обязана существовать: партиция зоны без строки в zones —
-    -- ошибка данных (зоны создаёт ingest, ТЗ 5.1).
+    -- The zone must exist: a zone partition without a row in zones —
+    -- a data error (zones are created by ingest, spec 5.1).
     IF NOT EXISTS (SELECT 1 FROM zones WHERE id = p_zone_id) THEN
         RAISE EXCEPTION 'create_zone_partitions: зоны % нет в таблице zones', p_zone_id
             USING HINT = 'зона создаётся автоматически при первом входном файле (ТЗ 5.1)';
     END IF;
 
-    -- Степень двойки 1..1024: любой modulus валиден, но степень двойки
-    -- позволяет позже делить лист пополам (modulus 2M, остатки N и N+M),
-    -- не пересобирая остальные листья зоны.
+    -- A power of two 1..1024: any modulus is valid, but a power of two
+    -- makes it possible to split a leaf in half later (modulus 2M, remainders N and N+M)
+    -- without rebuilding the zone's other leaves.
     IF p_hash_parts < 1 OR p_hash_parts > 1024
        OR p_hash_parts & (p_hash_parts - 1) <> 0 THEN
         RAISE EXCEPTION 'create_zone_partitions: hash_parts = %, ожидается степень двойки от 1 до 1024', p_hash_parts;
     END IF;
 
-    -- Сериализация повторных вызовов по одной зоне (транзакционная —
-    -- снимается при COMMIT/ROLLBACK сама).
+    -- Serialization of repeated calls for the same zone (transactional —
+    -- released automatically at COMMIT/ROLLBACK).
     PERFORM pg_advisory_xact_lock(hashtext('create_zone_partitions'), p_zone_id);
 
     FOR v_table, v_hash_col, v_has_ff IN
@@ -107,10 +107,10 @@ BEGIN
             ('laravel_findings',  'domain_id', false)
         ) AS t(tab, hash_col, needs_ff)
     LOOP
-        -- Идемпотентность: партиция зоны уже выделена — таблица пропускается.
-        -- pg_get_expr печатает значение smallint в границе в кавычках
-        -- (FOR VALUES IN ('1')), поэтому ожидаемое сравнивается в двух
-        -- вариантах записи.
+        -- Idempotency: the zone partition already exists — the table is skipped.
+        -- pg_get_expr prints a smallint value inside the bound in quotes
+        -- (FOR VALUES IN ('1')), so the expected value is compared in both
+        -- spellings.
         IF EXISTS (
             SELECT 1
             FROM pg_inherits i
@@ -128,7 +128,7 @@ BEGIN
             CONTINUE;
         END IF;
 
-        -- Имя DEFAULT-партиции берём из каталога, а не из соглашения об именах.
+        -- The DEFAULT partition name is taken from the catalog, not from a naming convention.
         SELECT c.relname INTO v_default
         FROM pg_inherits i
         JOIN pg_class c        ON c.oid = i.inhrelid
@@ -144,20 +144,20 @@ BEGIN
         v_part := format('%s_z%s', v_table, p_zone_id);
         v_ff   := CASE WHEN v_has_ff THEN ' WITH (fillfactor = 85)' ELSE '' END;
 
-        -- 1. Отсоединить DEFAULT — см. комментарий над процедурой.
+        -- 1. Detach the DEFAULT — see the comment above the procedure.
         EXECUTE format('ALTER TABLE %I DETACH PARTITION %I', v_table, v_default);
 
         IF v_hash_col IS NULL THEN
-            -- 2а. domains: партиция зоны — сразу лист с fillfactor
-            --     (субпартиционирование невозможно, см. шапку).
+            -- 2a. domains: the zone partition is a leaf with fillfactor right away
+            --     (subpartitioning is impossible, see the header).
             EXECUTE format(
                 'CREATE TABLE %I PARTITION OF %I FOR VALUES IN (%s)%s',
                 v_part, v_table, p_zone_id, v_ff);
         ELSE
-            -- 2б. Промежуточный родитель, субпартиционированный HASH по id
-            --     домена (fillfactor на нём запрещён PG16 — параметр получат
-            --     листья), и листья на все остатки: DEFAULT внутри hash-набора
-            --     невозможен.
+            -- 2b. An intermediate parent, subpartitioned HASH by the domain
+            --     id (fillfactor on it is forbidden by PG16 — the leaves get
+            --     the parameter), and leaves for every remainder: a DEFAULT inside the hash set
+            --     is impossible.
             EXECUTE format(
                 'CREATE TABLE %I PARTITION OF %I FOR VALUES IN (%s) PARTITION BY HASH (%I)',
                 v_part, v_table, p_zone_id, v_hash_col);
@@ -168,7 +168,7 @@ BEGIN
             END LOOP;
         END IF;
 
-        -- 3. Перенос строк зоны из отсоединённой DEFAULT одной командой.
+        -- 3. Move the zone's rows out of the detached DEFAULT with one command.
         EXECUTE format(
             'WITH moved AS (DELETE FROM %I WHERE zone_id = %s RETURNING *) ' ||
             'INSERT INTO %I SELECT * FROM moved',
@@ -176,7 +176,7 @@ BEGIN
         GET DIAGNOSTICS v_moved = ROW_COUNT;
         RAISE NOTICE 'create_zone_partitions: %: перенесено строк из DEFAULT: %', v_table, v_moved;
 
-        -- 4. DEFAULT на место: строк зоны в ней больше нет.
+        -- 4. The DEFAULT back in place: the zone's rows are no longer there.
         EXECUTE format('ALTER TABLE %I ATTACH PARTITION %I DEFAULT', v_table, v_default);
     END LOOP;
 END

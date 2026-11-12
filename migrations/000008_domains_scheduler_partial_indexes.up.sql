@@ -1,77 +1,77 @@
--- T-104: частичные индексы фоновых проходов планировщика (S-04, ТЗ 5.3).
+-- T-104: partial indexes of the scheduler's background passes (S-04, spec 5.3).
 --
--- До сих пор индексировалась только выборка pending (domains_pending_idx,
--- 000001). Остальные фоновые проходы scheduler фильтруют domains по
--- неиндексируемым колонкам и делают полный seq scan по таблице (целевой
--- корпус — до 350 млн строк, ТЗ 3.3):
+-- Until now only the pending selection was indexed (domains_pending_idx,
+-- 000001). The other scheduler background passes filter domains by
+-- non-indexable columns and do a full seq scan of the table (the target
+-- corpus — up to 350M rows, spec 3.3):
 --
---   - возврат истёкших lease (T-029, каждые lease/2 ≈ 15 мин) — по
+--   - returning expired leases (T-029, every lease/2 ≈ 15 min) — by
 --     check_state = 1 AND queued_at < now() − lease;
---   - суточная перепроверка (T-030, дренаж пачками) — по check_state = 2
---     AND last_checked_at < now() − recheck_interval; без индекса дренаж
---     перечитывает пропускаемое (несозревшее) множество в каждой пачке —
---     квадратично.
+--   - the daily recheck (T-030, drain in batches) — by check_state = 2
+--     AND last_checked_at < now() − recheck_interval; without the index the drain
+--     re-reads the skipped (not yet mature) set in every batch —
+--     quadratic.
 --
--- Оба индекса создаются на партиционированном родителе: существующие
--- и все будущие партиции получают дочерние индексы автоматически (как у
--- domains_pending_idx в 000001). CREATE INDEX CONCURRENTLY на родителе
--- PG16 не поддерживает: индекс строится с блокировкой записи — на
--- загруженной БД применять в окно обслуживания (dev-объём мгновенен).
+-- Both indexes are created on the partitioned parent: existing
+-- and all future partitions get child indexes automatically (like
+-- domains_pending_idx in 000001). CREATE INDEX CONCURRENTLY on the parent
+-- is not supported in PG16: the index is built with a write lock — on a
+-- loaded DB apply it in a maintenance window (the dev volume is instant).
 --
 -- domains_lease_idx (queued_at, zone_id, id) WHERE check_state = 1
 --
---   Подзапрос возврата lease ищет «check_state = 1, не deleted,
---   queued_at старше now() − lease» (internal/scheduler/lease.go).
---   queued_at первым в ключе: диапазонный скан с начала индекса читает
---   ТОЛЬКО истёкшие аренды (штатно 0–сотни строк) и останавливается на
---   первой неистёкшей — стоимость прохода пропорциональна числу
---   зависших доменов, а не размеру таблицы. zone_id, id в ключе —
---   детерминизм ORDER BY прохода (queued_at, zone_id, id) и ранний
---   останов LIMIT: дренаж пачками линеен (переведённые в pending строки
---   покидают индекс, следующая пачка продолжает с места остановки),
---   а сами ключи читаются из индекса без обращения к куче. Размер
---   индекса ограничен множеством «в работе» (выборка → lease), а не
---   таблицей целиком.
+--   The lease return subquery looks for "check_state = 1, not deleted,
+--   queued_at older than now() − lease" (internal/scheduler/lease.go).
+--   queued_at first in the key: a range scan from the start of the index reads
+--   ONLY expired leases (normally 0 to hundreds of rows) and stops at
+--   the first unexpired one — the pass cost is proportional to the number
+--   of stuck domains, not to the table size. zone_id, id in the key —
+--   the ORDER BY determinism of the pass (queued_at, zone_id, id) and the early
+--   stop at LIMIT: the batched drain is linear (rows moved to pending
+--   leave the index, the next batch continues from the stop point),
+--   and the keys themselves are read from the index without touching the heap. The
+--   index size is bounded by the "in work" set (selection → lease), not by
+--   the whole table.
 --
 -- domains_recheck_idx (last_checked_at, zone_id, id) WHERE check_state = 2
 --
---   Перепроверка ищет «check_state = 2, не deleted, last_checked_at
---   старше recheck_interval» (internal/scheduler/recheck.go).
---   last_checked_at первым в ключе: скан с самых старых done-строк читает
---   ровно созревший префикс и останавливается по LIMIT — переведённые
---   строки покидают индекс, дренаж линеен и не хранит позиции (ТЗ 3.4:
---   сбой/рестарт ничего не теряют). zone_id, id — детерминизм пачек и
---   ключи без обращения к куче. Сравнение date < timestamptz
---   (параметр порога) входит в btree-opfamily datetime — индекс
---   применим и с параметром timestamptz, отдельный каст не нужен.
+--   The recheck looks for "check_state = 2, not deleted, last_checked_at
+--   older than recheck_interval" (internal/scheduler/recheck.go).
+--   last_checked_at first in the key: a scan from the oldest done rows reads
+--   exactly the matured prefix and stops at LIMIT — the moved
+--   rows leave the index, the drain is linear and keeps no position (spec 3.4:
+--   a failure/restart loses nothing). zone_id, id — batch determinism and
+--   keys without touching the heap. The date < timestamptz comparison
+--   (the threshold parameter) belongs to the datetime btree opfamily — the index
+--   applies with a timestamptz parameter too, no separate cast needed.
 --
---   Индекс покрывает все done-строки (самый крупный из частичных):
---   ~26 байт × число проверенных доменов. Это цена суточной
---   перепроверки на корпусе в сотни миллионов строк — альтернатива
---   (seq scan таблицы в каждой пачке дренажа) хуже на порядки.
+--   The index covers all done rows (the largest of the partials):
+--   ~26 bytes × the number of checked domains. That is the price of the daily
+--   recheck on a corpus of hundreds of millions of rows — the alternative
+--   (a table seq scan in every drain batch) is worse by orders of magnitude.
 --
--- Оба запроса обязаны нести литералы check_state (код вшит в текст SQL
--- через модель, стиль dispatch.go): параметр в предикате частичного
--- индекса планировщик не доказывает, generic-план подготовленного
--- выражения терял бы индекс.
+-- Both queries must carry check_state literals (the code is embedded into the SQL text
+-- via the model, the dispatch.go style): the planner cannot prove a parameter in a partial
+-- index predicate, the generic plan of the prepared
+-- statement would lose the index.
 --
--- HOT-компромисс (docs/schema.md, «HOT-апдейты»): queued_at и
--- last_checked_at впервые входят в индексы, но меняются исключительно
--- вместе с check_state (enqueue/lease/recheck/результат воркера/
--- воскрешение) — эти переходы уже non-HOT из-за check_state в предикате
--- domains_pending_idx. Новых non-HOT апдейтов индексы не создают.
+-- HOT compromise (docs/schema.md, "HOT updates"): queued_at and
+-- last_checked_at enter indexes for the first time, but they change only
+-- together with check_state (enqueue/lease/recheck/the worker's result/
+-- revival) — these transitions are already non-HOT because of check_state in the
+-- domains_pending_idx predicate. The new indexes create no non-HOT updates.
 --
--- Проходы БЕЗ индекса (осознанно, не городить вслепую):
+-- Passes WITHOUT an index (deliberately, do not add them blindly):
 --
---   - повторные проверки temp_error (T-031): предикат включает
---     status = temp_error; индекс по status ломал бы HOT массового
---     применения delete-файлов (status → deleted БЕЗ смены check_state,
---     internal/ingest/apply_delete.go) и фиксации итогового статуса
---     (T-031: status → delegated_no_address при неизменном check_state).
---     Проход остаётся seq scan с часовым интервалом;
---   - коллектор backlog (T-077): GROUP BY по всем состояниям с фильтром
---     status — агрегат по всей таблице, частичным индексом не сводится;
---     стоимость метрики O(таблица) за проход.
+--   - temp_error retries (T-031): the predicate includes
+--     status = temp_error; an index on status would break the HOT of the bulk
+--     application of delete files (status → deleted WITHOUT a check_state change,
+--     internal/ingest/apply_delete.go) and of committing the final status
+--     (T-031: status → delegated_no_address with check_state unchanged).
+--     The pass remains a seq scan with an hourly interval;
+--   - the backlog collector (T-077): a GROUP BY over all states with a status
+--     filter — an aggregate over the whole table, not reducible to a partial index;
+--     the metric cost is O(table) per pass.
 
 CREATE INDEX domains_lease_idx
     ON domains (queued_at, zone_id, id) WHERE check_state = 1;

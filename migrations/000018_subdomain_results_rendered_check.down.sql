@@ -1,11 +1,11 @@
--- T-259: откат CHECK-инварианта рендер-состояния.
+-- T-259: rollback of the render-state CHECK invariant.
 --
--- Откат делать только вместе с откатом render-worker и http-worker на
--- версии до T-259: писать колонки перестанут только новые пути, пару
--- колонок по-прежнему ведут охраны прежних писателей (renderUpdateSQL /
--- renderFailMarkerSQL). Окно смешанных версий безвредно: старые сервисы
--- ограничение не проверяют, новые применяют миграцию при старте до
--- запуска воркеров (migrations/embed.go).
+-- Roll back only together with rolling the render-worker and http-worker back
+-- to the pre-T-259 versions: only the new paths will stop writing the columns, the column pair
+-- is still maintained by the old writers' guards (renderUpdateSQL /
+-- renderFailMarkerSQL). The mixed version window is harmless: the old services
+-- do not check the constraint, the new ones apply the migration at start before
+-- the workers launch (migrations/embed.go).
 
 ALTER TABLE subdomain_results
     DROP CONSTRAINT IF EXISTS subdomain_results_rendered_check;
