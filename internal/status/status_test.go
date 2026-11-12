@@ -892,7 +892,7 @@ func TestFetchLaravelStatsDegradations(t *testing.T) {
 	// An iteration error of the recent finds.
 	pool = seeded(map[string]statusGlitch{laravelRecentSQL: {rowsErr: errors.New("соединение сброшено")}})
 	_, err = FetchLaravelStats(ctx, pool)
-	if err == nil || !strings.Contains(err.Error(), "status: laravel: последние: соединение сброшено") {
+	if err == nil || !strings.Contains(err.Error(), "status: laravel: latest: соединение сброшено") {
 		t.Fatalf("ошибка итерации последних: ошибка = %v, want причину уровня строк", err)
 	}
 }
