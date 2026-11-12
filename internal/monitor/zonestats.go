@@ -2036,7 +2036,8 @@ func readStoredCounters(ctx context.Context, pool db.DB) (map[string]int64, erro
 	return out, nil
 }
 
-// absDiff — |a − b|.func absDiff(a, b int64) int64 {
+// absDiff returns |a − b|.
+func absDiff(a, b int64) int64 {
 	if a > b {
 		return a - b
 	}

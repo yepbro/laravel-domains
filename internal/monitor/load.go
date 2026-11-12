@@ -12,19 +12,21 @@
 //     /proc/stat ticks), PSI CPU/memory, /proc/meminfo (+swap);
 //   - the "htop-style" process top: the utime+stime ticks and the RSS of each
 //     /proc process are aggregated by name (comm) — 12 Chromium renderers are visible
+//
 // as one "headless-shell" line, the PostgreSQL backends — "postgres";
-//     the CPU over the window — by the delta between passes, in core fractions (1.0 = a core);
-//     a name whose processes restarted over the window (the tick sum fell)
-//     is skipped until the next window — the name's ticks are non-monotonic (T-189);
-//   - disk: the statfs of the report directories (the content directory — the main consumer
-//     of the volume; the SpaceChecker of the disk_free_* alerts, alerts.go);
-//   - queues: the depth of the working streams — the backlog of the consumer groups
-//     (min(lag, XLEN) + pending, a shared calculation with the gate — queue.GroupDepth;
-//     the same figure as `crawlerctl status` and `crawler_queue_depth`, T-188;
-//     a stream without groups and the q:dead quarantine — XLEN) and the consumption rate —
-//     the delta of the entries-read of the XINFO GROUPS groups (Redis 7+; a core < 7 — the rate
-//     is "n/a", the depths are honest) and the render debt on one line (T-175: the
-//     render_pending flags + the q:render lag, renderdebt.go).
+//
+//	  the CPU over the window — by the delta between passes, in core fractions (1.0 = a core);
+//	  a name whose processes restarted over the window (the tick sum fell)
+//	  is skipped until the next window — the name's ticks are non-monotonic (T-189);
+//	- disk: the statfs of the report directories (the content directory — the main consumer
+//	  of the volume; the SpaceChecker of the disk_free_* alerts, alerts.go);
+//	- queues: the depth of the working streams — the backlog of the consumer groups
+//	  (min(lag, XLEN) + pending, a shared calculation with the gate — queue.GroupDepth;
+//	  the same figure as `crawlerctl status` and `crawler_queue_depth`, T-188;
+//	  a stream without groups and the q:dead quarantine — XLEN) and the consumption rate —
+//	  the delta of the entries-read of the XINFO GROUPS groups (Redis 7+; a core < 7 — the rate
+//	  is "n/a", the depths are honest) and the render debt on one line (T-175: the
+//	  render_pending flags + the q:render lag, renderdebt.go).
 //
 // The first pass after the start — the base: the utilization and rates are "n/a" (no
 // deltas); the sizes (RAM, disk, queues, the RSS top) are full. An environment

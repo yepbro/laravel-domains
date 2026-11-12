@@ -240,7 +240,7 @@ func TestFixturesReportPace(t *testing.T) {
 	c := snapOf("moli-1", "moli", snapRows(50, nil))
 
 	t.Run("кандидат быстрее", func(t *testing.T) {
-		c2 := *c                                                                                     // a copy of the struct, not the pointer: mutations do not leak into neighboring sub-tests
+		c2 := *c                                                                                         // a copy of the struct, not the pointer: mutations do not leak into neighboring sub-tests
 		c2.Streams = &fixturesSnapshotStreams{AnalyzeLen: 51, AnalyzeFirstMs: 2000, AnalyzeLastMs: 8200} // 8.06 rows/s
 		r, err := fixturesReportBuild(b, &c2, fixturesDefaultMemoryBudget)
 		if err != nil {
