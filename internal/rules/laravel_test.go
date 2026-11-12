@@ -1,10 +1,10 @@
 package rules
 
-// Прогон рабочего набора правил rules/laravel.yaml по корпусу образцов
-// testdata/laravel-samples (ТЗ §11.1, §13.3): порог is_laravel 0.6 (§13.1),
-// ожидаемый диапазон версий и полный состав сработавших правил фиксируются
-// в meta.yaml каждого образца. Ту же сверку вне юнит-тестов выполняет
-// crawlerctl test-rules (make test-rules).
+// Running the production rule set rules/laravel.yaml over the sample corpus
+// testdata/laravel-samples (spec §11.1, §13.3): the is_laravel threshold of
+// 0.6 (§13.1), the expected version range and the complete set of hit rules
+// are fixed in each sample's meta.yaml. The same check outside unit tests
+// is performed by crawlerctl test-rules (make test-rules).
 
 import (
 	"os"
@@ -16,7 +16,7 @@ import (
 const (
 	laravelRulesDir   = `../../rules`
 	laravelSamplesDir = `../../testdata/laravel-samples`
-	laravelThreshold  = 0.6 // порог is_laravel (ТЗ §5.8, §13.1)
+	laravelThreshold  = 0.6 // the is_laravel threshold (spec §5.8, §13.1)
 )
 
 func TestLaravelRulesetOnCorpus(t *testing.T) {
@@ -32,7 +32,7 @@ func TestLaravelRulesetOnCorpus(t *testing.T) {
 		t.Fatalf("корпус не загружается: %v", err)
 	}
 
-	// В корпусе обязаны быть и позитивные, и негативные образцы (ТЗ §13.3).
+	// The corpus must contain both positive and negative samples (spec §13.3).
 	var positives, negatives int
 	for _, s := range samples {
 		if s.Expect.IsLaravel != nil {
@@ -63,7 +63,7 @@ func TestLaravelRulesetOnCorpus(t *testing.T) {
 					orQ(res.VerMin), orQ(res.VerMax), orQ(s.Expect.VerMin), orQ(s.Expect.VerMax))
 			}
 
-			// Полный состав сработавших правил: rules: [] — ничего не сработать.
+			// The complete set of hit rules: rules: [] — nothing may hit.
 			if s.Expect.Rules != nil {
 				fired := make([]string, 0, len(res.Signals))
 				for _, ev := range res.Signals {
@@ -88,7 +88,7 @@ func TestLaravelRulesetNoFalsePositiveOnPlainPage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("набор правил не загружается: %v", err)
 	}
-	// Страница без признаков фреймворка (типовая заглушка хостинга).
+	// A page without framework signs (a typical hosting stub).
 	res := set.Evaluate(Page{
 		HTML: []byte("<!DOCTYPE html><html><head><title>It works!</title></head>" +
 			"<body><h1>It works!</h1><p>This is the default web page.</p></body></html>"),

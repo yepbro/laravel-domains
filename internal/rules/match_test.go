@@ -25,7 +25,7 @@ func TestMatchRuleCookieName(t *testing.T) {
 		{
 			"точное совпадение не сработало",
 			Rule{Target: TargetCookieName, Match: "XSRF-TOKEN"},
-			Page{Cookies: []Cookie{{Name: "xsrf-token", Value: "x"}}}, // регистр важен
+			Page{Cookies: []Cookie{{Name: "xsrf-token", Value: "x"}}}, // case matters
 			false, "",
 		},
 		{
@@ -59,7 +59,7 @@ func TestMatchRuleCookieName(t *testing.T) {
 }
 
 func TestMatchRuleCookieValue(t *testing.T) {
-	// regex по значению: свидетельство с именем и префиксом значения
+	// regex over the value: evidence with the name and the value prefix
 	r := Rule{Target: TargetCookieValue, Regex: `^eyJpdiI6`}
 	ev, ok := matchRule(bgCtx(), r, Page{Cookies: []Cookie{
 		{Name: "PHPSESSID", Value: "plain"},
@@ -72,7 +72,7 @@ func TestMatchRuleCookieValue(t *testing.T) {
 		t.Errorf("неожиданное свидетельство: %q", ev)
 	}
 
-	// точное совпадение по значению (match) тоже поддерживается
+	// exact value match (match) is supported too
 	ev, ok = matchRule(bgCtx(), Rule{Target: TargetCookieValue, Match: "exact"}, Page{Cookies: []Cookie{
 		{Name: "c", Value: "exact"},
 	}}, DefaultLimits())
@@ -90,31 +90,31 @@ func TestMatchRuleHeader(t *testing.T) {
 		"Cache-Control": {"no-cache"},
 	}}
 
-	// точное совпадение имени
+	// exact name match
 	ev, ok := matchRule(bgCtx(), Rule{Target: TargetHeaderName, Match: "X-Laravel"}, page, DefaultLimits())
 	if !ok || ev != "header X-Laravel" {
 		t.Errorf("имя по match: ok=%v ev=%q", ok, ev)
 	}
 
-	// regex по имени
+	// regex over the name
 	_, ok = matchRule(bgCtx(), Rule{Target: TargetHeaderName, Regex: `^X-Powered`}, page, DefaultLimits())
 	if !ok {
 		t.Error("regex по имени заголовка не сработал")
 	}
 
-	// regex по значению: свидетельство с именем заголовка
+	// regex over the value: evidence with the header name
 	ev, ok = matchRule(bgCtx(), Rule{Target: TargetHeaderValue, Regex: `^PHP/`}, page, DefaultLimits())
 	if !ok || ev != "header X-Powered-By: PHP/8.2.8" {
 		t.Errorf("значение по regex: ok=%v ev=%q", ok, ev)
 	}
 
-	// несколько значений одного заголовка: первое по порядку среза
+	// several values of one header: the first one in slice order
 	ev, ok = matchRule(bgCtx(), Rule{Target: TargetHeaderValue, Regex: `^[ab]=`}, page, DefaultLimits())
 	if !ok || ev != "header Set-Cookie: a=1" {
 		t.Errorf("многозначный заголовок: ok=%v ev=%q", ok, ev)
 	}
 
-	// точное совпадение значения
+	// exact value match
 	ev, ok = matchRule(bgCtx(), Rule{Target: TargetHeaderValue, Match: "no-cache"}, page, DefaultLimits())
 	if !ok || ev != "header Cache-Control: no-cache" {
 		t.Errorf("значение по match: ok=%v ev=%q", ok, ev)
@@ -124,13 +124,13 @@ func TestMatchRuleHeader(t *testing.T) {
 func TestMatchRuleHTML(t *testing.T) {
 	page := Page{HTML: []byte(`<html><head><script src="/build/assets/app-DJIrOSj4.js"></script></head></html>`)}
 
-	// свидетельство — сам совпавший фрагмент
+	// the evidence is the matched fragment itself
 	ev, ok := matchRule(bgCtx(), Rule{Target: TargetHTML, Regex: `/build/assets/[^"']+\.js`}, page, DefaultLimits())
 	if !ok || ev != "/build/assets/app-DJIrOSj4.js" {
 		t.Errorf("html: ok=%v ev=%q", ok, ev)
 	}
 
-	// цель html с match вместо regex не срабатывает (ТЗ 5.8: по HTML — regex)
+	// an html target with match instead of regex does not hit (spec 5.8: regex over HTML)
 	_, ok = matchRule(bgCtx(), Rule{Target: TargetHTML, Match: "/build/"}, page, DefaultLimits())
 	if ok {
 		t.Error("html + match не должен срабатывать")
@@ -145,7 +145,7 @@ func TestMatchRuleMeta(t *testing.T) {
 		<meta name="csrf-token" content="eyJ0eXAiOiJKV1Qi">
 		</head><body>csrf-token в тексте не считается meta-целью</body></html>`)}
 
-	// свидетельство — весь meta-тег (до обрезки лимитом свидетельства)
+	// the evidence is the whole meta tag (before the evidence limit truncation)
 	ev, ok := matchRule(bgCtx(), Rule{Target: TargetMeta, Regex: `csrf-token`}, page, DefaultLimits())
 	if !ok {
 		t.Fatal("meta-тег не найден")
@@ -154,27 +154,27 @@ func TestMatchRuleMeta(t *testing.T) {
 		t.Errorf("неожиданное свидетельство: %q", ev)
 	}
 
-	// meta + match не срабатывает (только regex, как html)
+	// meta + match does not hit (regex only, like html)
 	_, ok = matchRule(bgCtx(), Rule{Target: TargetMeta, Match: "csrf-token"}, page, DefaultLimits())
 	if ok {
 		t.Error("meta + match не должен срабатывать")
 	}
 
-	// «>» внутри кавычек значения атрибута не обрывает тег (AN-08):
-	// regex по имени после значения с «>» срабатывает, свидетельство —
-	// весь тег целиком
+	// ">" inside the quoted attribute value does not terminate the tag
+	// (AN-08): the regex over the name after a value containing ">" hits,
+	// the evidence is the whole tag
 	quoted := Page{HTML: []byte(`<meta content="a>b" name="csrf-token">`)}
 	ev, ok = matchRule(bgCtx(), Rule{Target: TargetMeta, Regex: `csrf-token`}, quoted, DefaultLimits())
 	if !ok || ev != `<meta content="a>b" name="csrf-token">` {
 		t.Errorf("meta с «>» в кавычках: ok=%v ev=%q", ok, ev)
 	}
-	// одинарные кавычки — та же семантика
+	// single quotes — the same semantics
 	ev, ok = matchRule(bgCtx(), Rule{Target: TargetMeta, Regex: `csrf-token`},
 		Page{HTML: []byte(`<meta content='a>b' name='csrf-token'>`)}, DefaultLimits())
 	if !ok || ev != `<meta content='a>b' name='csrf-token'>` {
 		t.Errorf("meta с «>» в одинарных кавычках: ok=%v ev=%q", ok, ev)
 	}
-	// незакрытая кавычка — тег не выделяется вовсе (не обрыв по «>»)
+	// an unterminated quote — no tag is extracted at all (no cut at ">")
 	if _, ok := matchRule(bgCtx(), Rule{Target: TargetMeta, Regex: `unterminated`},
 		Page{HTML: []byte(`<meta content="unterminated>`)}, DefaultLimits()); ok {
 		t.Error("незакрытая кавычка не должна давать усечённый meta-тег")
@@ -185,7 +185,7 @@ func TestMatchRuleEvidenceFromCappedInput(t *testing.T) {
 	lim := DefaultLimits()
 	longName := strings.Repeat("n", 100) // > evidenceNameBytes
 
-	// name-only: имя ужимается до 32 байт и внутри свидетельства
+	// name-only: the name is capped to 32 bytes inside the evidence too
 	ev, ok := matchRule(bgCtx(), Rule{Target: TargetCookieName, Match: longName},
 		Page{Cookies: []Cookie{{Name: longName}}}, lim)
 	if !ok {
@@ -203,17 +203,17 @@ func TestMatchRuleEvidenceFromCappedInput(t *testing.T) {
 		t.Errorf("имя заголовка не ужимается: %q, want %q", ev, want)
 	}
 
-	// value: свидетельство строится из обрезанного MaxValueBytes значения
-	// (той же строкой, по которой шёл матчинг), а не из полного c.Value:
-	// значение длиннее лимита всё равно срабатывает по якорю в начале и
-	// даёт свидетельство в пределах окна обрезки.
+	// value: the evidence is built from the MaxValueBytes-capped value (the
+	// same string the matching ran on), not from the full c.Value: a value
+	// longer than the limit still hits via the anchor at the start and
+	// yields evidence within the truncation window.
 	huge := "eyJpdiI6" + strings.Repeat("z", lim.MaxValueBytes)
 	ev, ok = matchRule(bgCtx(), Rule{Target: TargetCookieValue, Regex: `^eyJpdiI6`},
 		Page{Cookies: []Cookie{{Name: "c", Value: huge}}}, lim)
 	if !ok {
 		t.Fatal("значение длиннее MaxValueBytes не сопоставлено по префиксу")
 	}
-	// окно обрезки: префикс формы + начало значения до лимита свидетельства
+	// the truncation window: the form prefix + the start of the value up to the evidence limit
 	zCut := func(prefix string) string {
 		return prefix + strings.Repeat("z", lim.snippetCap()-len(prefix)) + "…"
 	}
@@ -230,39 +230,41 @@ func TestMatchRuleEvidenceFromCappedInput(t *testing.T) {
 func TestMatchRuleSkipsBadRules(t *testing.T) {
 	page := Page{HTML: []byte("x"), Cookies: []Cookie{{Name: "a", Value: "b"}}}
 
-	// некомпилируемый regex — правило пропускается без паники
+	// a non-compilable regex — the rule is skipped without a panic
 	if _, ok := matchRule(bgCtx(), Rule{Target: TargetHTML, Regex: `[unclosed`}, page, DefaultLimits()); ok {
 		t.Error("некомпилируемый regex не должен срабатывать")
 	}
 
-	// слишком длинный паттерн — лимит MaxPatternBytes (ТЗ §9)
+	// a too long pattern — the MaxPatternBytes limit (spec §9)
 	long := strings.Repeat("a", 4097)
 	if _, ok := matchRule(bgCtx(), Rule{Target: TargetHTML, Regex: long}, page, DefaultLimits()); ok {
 		t.Error("паттерн сверх лимита не должен срабатывать")
 	}
 
-	// слишком длинный паттерн, который СОШЁЛСЯ бы: лимит отсекает его до
-	// компиляции — раздутый паттерн не должен матчиться даже при совпадении
+	// a too long pattern that WOULD match: the limit cuts it off before
+	// compilation — a bloated pattern must not match even when there is a
+	// match
 	longMatch := strings.Repeat("a", DefaultLimits().MaxPatternBytes+1)
 	if _, ok := matchRule(bgCtx(), Rule{Target: TargetHTML, Regex: longMatch},
 		Page{HTML: []byte(strings.Repeat("a", 5000))}, DefaultLimits()); ok {
 		t.Error("паттерн сверх лимита не должен срабатывать даже при совпадении")
 	}
 
-	// match + некорректный regex: правило испорчено целиком, деградация
-	// до частичного применения (одно лишь точное совпадение) недопустима
+	// match + an invalid regex: the rule is spoiled as a whole; degrading
+	// to partial application (the exact match only) is not allowed
 	if _, ok := matchRule(bgCtx(), Rule{Target: TargetCookieName, Match: "XSRF-TOKEN", Regex: `[unclosed`},
 		Page{Cookies: []Cookie{{Name: "XSRF-TOKEN"}}}, DefaultLimits()); ok {
 		t.Error("правило с некорректным regex не должно срабатывать по match")
 	}
 
-	// неизвестная цель — без паники и без срабатывания
+	// an unknown target — no panic and no hit
 	if _, ok := matchRule(bgCtx(), Rule{Target: "body", Regex: "x"}, page, DefaultLimits()); ok {
 		t.Error("неизвестная цель не должна срабатывать")
 	}
 
-	// правило без match и regex — просто не матчится; по cookie-целям
-	// проверяется и ветка nil-regex в matches (html-цель её не зовёт)
+	// a rule without match and regex simply does not match; cookie targets
+	// also exercise the nil-regex branch in matches (the html target never
+	// calls it)
 	if _, ok := matchRule(bgCtx(), Rule{Target: TargetHTML}, page, DefaultLimits()); ok {
 		t.Error("пустое правило не должно срабатывать")
 	}
@@ -273,7 +275,7 @@ func TestMatchRuleSkipsBadRules(t *testing.T) {
 }
 
 func TestMatchRuleHTMLSizeCap(t *testing.T) {
-	// совпадение за пределами лимита не ищется; на границе — ищется
+	// a match beyond the limit is not looked up; at the boundary — it is
 	head := strings.Repeat(" ", 100)
 	html := []byte(head + "NEEDLE")
 	lim := DefaultLimits()
@@ -282,12 +284,12 @@ func TestMatchRuleHTMLSizeCap(t *testing.T) {
 	if _, ok := matchRule(bgCtx(), Rule{Target: TargetHTML, Regex: "NEEDLE"}, Page{HTML: html}, lim); ok {
 		t.Error("совпадение за пределами лимита HTML найдено")
 	}
-	lim.MaxHTMLBytes = 106 // NEEDLE целиком в пределах
+	lim.MaxHTMLBytes = 106 // NEEDLE fits entirely
 	if ev, ok := matchRule(bgCtx(), Rule{Target: TargetHTML, Regex: "NEEDLE"}, Page{HTML: html}, lim); !ok || ev != "NEEDLE" {
 		t.Errorf("совпадение в пределах лимита не найдено: ok=%v ev=%q", ok, ev)
 	}
 
-	// meta за пределами лимита тоже не смотрится
+	// meta beyond the limit is not examined either
 	metaHTML := []byte(head + `<meta name="csrf-token">`)
 	if _, ok := matchRule(bgCtx(), Rule{Target: TargetMeta, Regex: "csrf"}, Page{HTML: metaHTML}, lim); ok {
 		t.Error("meta за пределами лимита HTML найдено")
@@ -298,22 +300,23 @@ func TestMatchRuleValueSizeCap(t *testing.T) {
 	lim := DefaultLimits()
 	lim.MaxValueBytes = 8
 
-	// якорь по началу: обрезка невидима
+	// an anchor at the start: the truncation is invisible
 	if _, ok := matchRule(bgCtx(), Rule{Target: TargetCookieValue, Regex: `^eyJ`}, Page{Cookies: []Cookie{
 		{Name: "c", Value: "eyJ" + strings.Repeat("z", 100)},
 	}}, lim); !ok {
 		t.Error("приставка в пределах лимита значения не найдена")
 	}
 
-	// якорь по концу за пределами лимита не срабатывает — задокументированный
-	// размен полноты на гарантию времени (хвост TAIL обрезан и невидим)
+	// an anchor at the end beyond the limit does not hit — the documented
+	// trade of completeness for the time guarantee (the TAIL tail is capped
+	// and invisible)
 	if _, ok := matchRule(bgCtx(), Rule{Target: TargetCookieValue, Regex: `TAIL$`}, Page{Cookies: []Cookie{
 		{Name: "c", Value: strings.Repeat("z", 100) + "TAIL"},
 	}}, lim); ok {
 		t.Error("хвост за пределами лимита значения не должен находиться")
 	}
 
-	// заголовки ограничиваются тем же лимитом
+	// headers are bounded by the same limit
 	if _, ok := matchRule(bgCtx(), Rule{Target: TargetHeaderValue, Regex: `END$`}, Page{Headers: map[string][]string{
 		"X-Long": {strings.Repeat("t", 100) + "END"},
 	}}, lim); ok {
@@ -330,7 +333,7 @@ func TestMatchRuleContextCanceled(t *testing.T) {
 		Cookies: []Cookie{{Name: "XSRF-TOKEN"}},
 		Headers: map[string][]string{"X-Laravel": {"yes"}},
 	}
-	// отмена до начала: ни одна цель не смотрится
+	// cancellation before the start: no target is examined
 	for _, r := range []Rule{
 		{Target: TargetCookieName, Match: "XSRF-TOKEN"},
 		{Target: TargetCookieValue, Regex: "XSRF"},
@@ -344,8 +347,8 @@ func TestMatchRuleContextCanceled(t *testing.T) {
 		}
 	}
 
-	// отмена внутри перебора cookies: проверка на каждой итерации,
-	// совпадающая кука не смотрится
+	// cancellation inside the cookie scan: a check on every iteration, the
+	// matching cookie is not examined
 	partial := Page{Cookies: []Cookie{
 		{Name: "first", Value: "1"},
 		{Name: "XSRF-TOKEN"},
@@ -366,7 +369,7 @@ func TestCompileCache(t *testing.T) {
 		t.Error("повторный вызов должен вернуть тот же скомпилированный паттерн")
 	}
 
-	// ошибка компиляции кэшируется: тот же паттерн даёт ошибку без паники
+	// a compilation error is cached: the same pattern yields the error without a panic
 	bad := `[unclosed`
 	if _, err := compileCached(bad); err == nil {
 		t.Error("ожидалась ошибка компиляции")

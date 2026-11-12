@@ -66,7 +66,7 @@ rules:
 	if res.Partial {
 		t.Error("полный просмотр не должен помечаться Partial")
 	}
-	// пересечение [9.19, ∞) и (-∞, 9.x] = [9.19, 9.x]
+	// the intersection of [9.19, ∞) and (-∞, 9.x] = [9.19, 9.x]
 	if res.VerMin != "9.19" || res.VerMax != "9.x" {
 		t.Errorf("версии = [%s, %s], want [9.19, 9.x]", res.VerMin, res.VerMax)
 	}
@@ -123,10 +123,10 @@ rules:
 	}
 }
 
-// TestEvaluateMatchValueRules — контракт «match по значению cookie/
-// заголовка поддерживается» (движок matchRule + docs/analyzer.md
-// «Цели и режимы матчинга»): валидатор загрузчика не бракует такие
-// правила, набор грузится и срабатывает.
+// TestEvaluateMatchValueRules — the "match over a cookie/header value is
+// supported" contract (the matchRule engine + docs/analyzer.md "Targets
+// and matching modes"): the loader's validator does not reject such rules,
+// the set loads and hits.
 func TestEvaluateMatchValueRules(t *testing.T) {
 	dir := writeRules(t, `
 rules:
@@ -362,8 +362,8 @@ func TestLoadDirErrors(t *testing.T) {
 		}
 	})
 	t.Run("подкаталог с yaml-расширением пропускается", func(t *testing.T) {
-		// каталог — не файл правил: расширение имени не должно тащить его
-		// в набор (чтение каталога как файла падает)
+		// a directory is not a rule file: a name extension must not drag it
+		// into the set (reading a directory as a file fails)
 		dir := t.TempDir()
 		if err := os.Mkdir(filepath.Join(dir, "pkg.yaml"), 0o755); err != nil {
 			t.Fatal(err)
@@ -381,8 +381,8 @@ func TestLoadDirErrors(t *testing.T) {
 		}
 	})
 	t.Run("каталог среди записей не прерывает подбор файлов", func(t *testing.T) {
-		// «0sub.dir» сортируется раньше yaml-файлов: преждевременный выход
-		// из перебора записей терял бы все файлы правил
+		// "0sub.dir" sorts before the yaml files: an early exit from the
+		// entry scan would lose all the rule files
 		dir := t.TempDir()
 		if err := os.Mkdir(filepath.Join(dir, "0sub.dir"), 0o755); err != nil {
 			t.Fatal(err)
@@ -395,9 +395,9 @@ func TestLoadDirErrors(t *testing.T) {
 		}
 	})
 	t.Run("битый symlink — ошибка загрузки", func(t *testing.T) {
-		// запись с расширением .yaml, но ReadFile падает: молчаливая
-		// потеря файла правил недопустима (EOF на пустых данных выглядел
-		// бы как «файл без правил»)
+		// an entry with a .yaml extension but ReadFile fails: a silent loss
+		// of a rule file is not allowed (EOF on empty data would look like
+		// "a file without rules")
 		dir := t.TempDir()
 		if err := os.WriteFile(filepath.Join(dir, "rules.yaml"),
 			[]byte("rules:\n  - id: r\n    target: html\n    regex: x\n    weight: 0.5\n"), 0o644); err != nil {
@@ -438,9 +438,9 @@ func TestLoadDirErrors(t *testing.T) {
 		}
 	})
 	t.Run("многодокументный файл читается целиком", func(t *testing.T) {
-		// Второй документ (---) не должен теряться молча: правила
-		// обоих документов входят в набор, версия совпадает с разбиением
-		// по файлам.
+		// The second document (---) must not be lost silently: the rules of
+		// both documents enter the set, the version matches the per-file
+		// splitting.
 		multi := writeRules(t, partA+"---\n"+partB)
 		set, err := LoadDir(multi)
 		if err != nil {
@@ -466,8 +466,8 @@ func TestLoadDirErrors(t *testing.T) {
 	})
 }
 
-// writeRulesFiles — каталог с несколькими yaml-файлами (порядок записей
-// в map не важен — имена задаются явно).
+// writeRulesFiles — a directory with several yaml files (the map entry
+// order does not matter — the names are given explicitly).
 func writeRulesFiles(t *testing.T, files map[string]string) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -495,7 +495,7 @@ rules:
     weight: 0.3
     ver_min: "9.19"
 `
-	// combined — те же правила одним документом (в обратном порядке).
+	// combined — the same rules in one document (in reverse order).
 	combined = `
 rules:
   - id: b_html
@@ -529,7 +529,7 @@ func TestLoadDirVersionStable(t *testing.T) {
 		t.Errorf("наборы различаются: %+v != %+v", s1.Rules, s2.Rules)
 	}
 
-	// Правка поведения (вес) меняет версию.
+	// A behavior change (the weight) changes the version.
 	dir := writeRules(t, partA)
 	before, err := LoadDir(dir)
 	if err != nil {
@@ -552,7 +552,8 @@ rules:
 		t.Error("смена weight должна менять rules_version")
 	}
 
-	// Правка описания — поведение то же, версия не меняется.
+	// A description change — the behavior is the same, the version does not
+	// change.
 	dirDesc := writeRules(t, `
 rules:
   - id: a_cookie
@@ -585,8 +586,8 @@ rules:
 }
 
 func TestLoadDirRulesSortedByID(t *testing.T) {
-	// Порядок в файле обратный — набор канонизируется по id: детерминированы
-	// и применение правил, и хэш.
+	// The order in the file is reversed — the set is canonicalized by id:
+	// both rule application and the hash are deterministic.
 	dir := writeRules(t, combined)
 	set, err := LoadDir(dir)
 	if err != nil {
@@ -598,25 +599,26 @@ func TestLoadDirRulesSortedByID(t *testing.T) {
 }
 
 func TestCanonicalHashDisambiguation(t *testing.T) {
-	// Поля могут содержать любые байты (YAML-строки): представление с
-	// префиксами длин не позволяет разным наборам давать один хэш из-за
-	// совпадения байтового потока после сдвига границ полей.
+	// Fields may contain arbitrary bytes (YAML strings): the
+	// length-prefixed representation does not let different sets produce
+	// one hash due to the byte streams matching after a field boundary
+	// shift.
 	a := []Rule{{ID: "a\x00b", Target: "c"}}
 	b := []Rule{{ID: "a", Target: "b\x00c"}}
 	if canonicalHash(a) == canonicalHash(b) {
 		t.Error("разные наборы дали одинаковый канонический хэш")
 	}
-	// Разделитель «:» без префикса длины неоднозначен: поток «:a::b» —
-	// это поля («a», «:b») или («a:», «b»)?
+	// The ":" separator without a length prefix is ambiguous: is the stream
+	// ":a::b" the fields ("a", ":b") or ("a:", "b")?
 	c := []Rule{{ID: "a", Target: ":b"}}
 	d := []Rule{{ID: "a:", Target: "b"}}
 	if canonicalHash(c) == canonicalHash(d) {
 		t.Error("кодирование без длин допускает сдвиг границы поля")
 	}
-	// Префикс длины без «:» неоднозначен на значениях из цифр: конкатенация
-	// полей «1», «AAAAAAAAA», «», «9BBBBBBBBB0», … читается и как первое
-	// поле «9AAAAAAAAA0» (длина 11) со сдвигом остальных — байтовые потоки
-	// без «:» совпадают, с «:» — различаются.
+	// A length prefix without ":" is ambiguous on digit values: the
+	// concatenation of the fields "1", "AAAAAAAAA", "", "9BBBBBBBBB0", …
+	// also reads as the first field "9AAAAAAAAA0" (length 11) with the rest
+	// shifted — the byte streams without ":" match, with ":" they differ.
 	e := []Rule{{ID: "1", Target: "AAAAAAAAA", Regex: "9BBBBBBBBB0", Weight: 0.5}}
 	f := []Rule{{ID: "9AAAAAAAAA0", Target: "1", Match: "BBBBBBBBB", Weight: 0.5}}
 	if canonicalHash(e) == canonicalHash(f) {
@@ -624,9 +626,10 @@ func TestCanonicalHashDisambiguation(t *testing.T) {
 	}
 }
 
-// TestCanonicalHashFieldCoverage — в rules_version входит каждое поле,
-// меняющее поведение детекции: правка любого из них обязана менять хэш
-// (вырезание writeField любого поля делало бы разные наборы неразличимыми).
+// TestCanonicalHashFieldCoverage — every field that changes the detection
+// behavior enters rules_version: changing any of them must change the hash
+// (removing the writeField of any field would make different sets
+// indistinguishable).
 func TestCanonicalHashFieldCoverage(t *testing.T) {
 	base := Rule{ID: "r1", Target: "html", Regex: "MARK", Weight: 0.5, VerMin: "9", VerMax: "11"}
 	variants := map[string]Rule{
@@ -646,10 +649,11 @@ func TestCanonicalHashFieldCoverage(t *testing.T) {
 	}
 }
 
-// TestCanonicalHashWeightPrecision — вес пишется в rules_version
-// shortest-записью (prec −1): 0.26 и 0.27 — разные правила. При prec 0
-// («одна значащая цифра», мутант decrementer) обе форматировались бы в
-// «0.3» и наборы становились неразличимы.
+// TestCanonicalHashWeightPrecision — the weight is written to
+// rules_version in the shortest form (prec −1): 0.26 and 0.27 are
+// different rules. At prec 0 ("one significant digit", the decrementer
+// mutant) both would be formatted as "0.3" and the sets would become
+// indistinguishable.
 func TestCanonicalHashWeightPrecision(t *testing.T) {
 	light := []Rule{{ID: "w", Weight: 0.26}}
 	heavy := []Rule{{ID: "w", Weight: 0.27}}
@@ -658,10 +662,10 @@ func TestCanonicalHashWeightPrecision(t *testing.T) {
 	}
 }
 
-// TestLoadDirNegativeVersionComponents — отрицательный числовой
-// компонент версии ("-1") формально проходит parseVersion; без второй
-// границы диапазон не конфликтует сам с собой: сравнение с отсутствующей
-// левой границей (vmin == nil) вычисляться не должно.
+// TestLoadDirNegativeVersionComponents — a negative numeric version
+// component ("-1") formally passes parseVersion; without a second boundary
+// the range does not conflict with itself: the comparison against a missing
+// left boundary (vmin == nil) must not be computed.
 func TestLoadDirNegativeVersionComponents(t *testing.T) {
 	if _, err := LoadDir(writeRules(t, `
 rules:
@@ -675,9 +679,10 @@ rules:
 	}
 }
 
-// TestLoadDirPatternBoundary — граница лимита длины regex: паттерн ровно
-// в MaxPatternBytes байт валиден (на байт длиннее — ошибка, см. таблицу
-// TestLoadDirValidation); мутант «>=» отвергал бы ровно-в-лимите.
+// TestLoadDirPatternBoundary — the regex length limit boundary: a pattern
+// of exactly MaxPatternBytes bytes is valid (one byte longer is an error,
+// see the TestLoadDirValidation table); the ">=" mutant would reject the
+// exactly-at-limit case.
 func TestLoadDirPatternBoundary(t *testing.T) {
 	body := "rules:\n  - id: exact\n    target: html\n    regex: \"" +
 		strings.Repeat("a", DefaultLimits().MaxPatternBytes) + "\"\n    weight: 0.5\n"
@@ -686,8 +691,9 @@ func TestLoadDirPatternBoundary(t *testing.T) {
 	}
 }
 
-// TestLoadDirTrimsIDs — пробелы вокруг id обрезаются у каждого правила:
-// непрокрученная обрезка оставляла бы второе и далее правила с «  id  ».
+// TestLoadDirTrimsIDs — whitespace around the id is trimmed for every
+// rule: a missed trim would leave the second and further rules with
+// "  id  ".
 func TestLoadDirTrimsIDs(t *testing.T) {
 	set, err := LoadDir(writeRules(t, `
 rules:
@@ -708,11 +714,11 @@ rules:
 	}
 }
 
-// TestLoadDirDuplicateIDReported — при повторе id с дополнительной ошибкой
-// во втором правиле сообщается именно повтор: компаратор канонической
-// сортировки строгий, порядок равных id стабилен (insertion sort), и
-// невалидное правило не выскакивает на первое место, подменяя диагноз
-// «повтор id» собственной ошибкой.
+// TestLoadDirDuplicateIDReported — when a duplicate id comes with an extra
+// error in the second rule, it is the duplicate that is reported: the
+// canonical sort comparator is strict, the order of equal ids is stable
+// (insertion sort), and the invalid rule does not jump to the front,
+// replacing the "duplicate id" diagnosis with its own error.
 func TestLoadDirDuplicateIDReported(t *testing.T) {
 	_, err := LoadDir(writeRules(t, `
 rules:
@@ -730,10 +736,10 @@ rules:
 	}
 }
 
-// TestTargetNamesDeterministic — список допустимых target для сообщений
-// об ошибке: полный и строго отсортированный (порядок итерации map
-// случаен — сортировка делает текст детерминированным). Цикл покрывает
-// случайное совпадение порядка итерации с отсортированным.
+// TestTargetNamesDeterministic — the list of allowed targets for error
+// messages: complete and strictly sorted (map iteration order is random —
+// sorting makes the text deterministic). The loop covers a random
+// coincidence of the iteration order with the sorted one.
 func TestTargetNamesDeterministic(t *testing.T) {
 	want := []string{"cookie_name", "cookie_value", "header_name", "header_value", "html", "meta"}
 	for range 50 {
@@ -741,7 +747,7 @@ func TestTargetNamesDeterministic(t *testing.T) {
 			t.Fatalf("targetNames() = %v, want %v", got, want)
 		}
 	}
-	// Текст ошибки валидации называет полный список допустимых целей.
+	// The validation error text names the complete list of allowed targets.
 	_, err := LoadDir(writeRules(t, `
 rules:
   - id: bad_target

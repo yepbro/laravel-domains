@@ -11,14 +11,14 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Sample — образец страницы из testdata/laravel-samples/<id>/ (ТЗ 4.4.2):
+// Sample — a page sample from testdata/laravel-samples/<id>/ (spec 4.4.2):
 //
-//	index.html   — итоговый HTML/DOM в том виде, как его сохраняет сервис;
-//	headers.json — заголовки ответа, объект имя -> массив значений;
-//	cookies.json — массив {name, value, ...};
-//	meta.yaml    — is_laravel, ожидаемый диапазон версий, состав сработавших
-//	               правил (rules), точные ожидания движка (score, calc_ver_*,
-//	               conflict — T-075), примечание.
+//	index.html   — the final HTML/DOM exactly as the service stores it;
+//	headers.json — the response headers, an object name -> array of values;
+//	cookies.json — an array of {name, value, ...};
+//	meta.yaml    — is_laravel, the expected version range, the set of hit
+//	               rules (rules), the exact engine expectations (score,
+//	               calc_ver_*, conflict — T-075), a note.
 type Sample struct {
 	ID      string
 	HTML    []byte
@@ -28,21 +28,23 @@ type Sample struct {
 	Expect SampleExpect
 }
 
-// SampleExpect — ожидания из meta.yaml (пустые поля — не проверяются).
+// SampleExpect — the expectations from meta.yaml (empty fields are not
+// checked).
 //
-// Две группы ожиданий:
+// Two groups of expectations:
 //
-//   - VerMin/VerMax — реальная версия образца: вычисленный движком диапазон
-//     обязан её покрывать (проверка через Result.Contains);
-//   - CalcVerMin/CalcVerMax/Score/Conflict — точные итоги движка (T-075):
-//     строки границ как в правилах ("" — границы нет, при записи в БД NULL),
-//     score — noisy-OR весов правил из Rules, округление до 3 знаков
-//     (допуск сверке задаёт тест-потребитель), Conflict — пустое
-//     пересечение диапазонов.
+//   - VerMin/VerMax — the sample's real version: the engine-computed range
+//     must cover it (checked via Result.Contains);
+//   - CalcVerMin/CalcVerMax/Score/Conflict — the exact engine outcomes
+//     (T-075): the boundary strings as in the rules ("" — no boundary,
+//     NULL when written to the DB), score — the noisy-OR of the weights of
+//     the rules from Rules, rounded to 3 digits (the comparison tolerance
+//     is set by the consuming test), Conflict — an empty range
+//     intersection.
 //
-// Rules — полный состав сработавших правил (id) для сверки в тестах:
-// непустой список означает точное совпадение, `rules: []` — ни одно правило
-// не должно сработать, отсутствие поля — состав не проверяется.
+// Rules — the complete set of hit rule ids for test comparison: a non-empty
+// list means an exact match, `rules: []` — no rule may hit, the field's
+// absence — the contents are not checked.
 type SampleExpect struct {
 	IsLaravel  *bool
 	VerMin     string
@@ -61,7 +63,7 @@ type cookieJSON struct {
 	Value string `json:"value" yaml:"value"`
 }
 
-// LoadSamples читает все подкаталоги с meta.yaml.
+// LoadSamples reads all subdirectories that have a meta.yaml.
 func LoadSamples(dir string) ([]Sample, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -150,7 +152,7 @@ func loadSample(dir, id string) (Sample, error) {
 	return s, nil
 }
 
-// Page превращает образец в вход движка правил.
+// Page converts the sample into a rule engine input.
 func (s Sample) Page() Page {
 	return Page{HTML: s.HTML, Cookies: s.Cookies, Headers: s.Headers}
 }

@@ -1,13 +1,14 @@
-// Package rules — загрузка и применение правил поиска Laravel (ТЗ 5.8 основного ТЗ).
+// Package rules — loading and applying the Laravel detection rules (spec 5.8
+// of the main spec).
 //
-// Правила лежат в YAML-файлах каталога analyzer.rules_dir и перезагружаются
-// по SIGHUP без перезапуска (Reloader). Расчёт score — noisy-OR:
-// 1 − Π(1 − wᵢ); версия — пересечение диапазонов сработавших правил.
+// The rules live in YAML files of the analyzer.rules_dir directory and are
+// reloaded on SIGHUP without a restart (Reloader). The score is noisy-OR:
+// 1 − Π(1 − wᵢ); the version is the intersection of the hit rules' ranges.
 //
-// rules_version — 32-битный FNV-1a хэш канонического представления набора,
-// приведённый к знаковому диапазону под колонку integer таблиц
-// laravel_findings/laravel_domains (миграция 000001): одинаковым наборам —
-// одинаковый хэш независимо от разбиения на файлы и порядка правил.
+// rules_version is a 32-bit FNV-1a hash of the canonical representation of
+// the set, cast to the signed range to fit the integer column of the
+// laravel_findings/laravel_domains tables (migration 000001): identical sets
+// hash identically regardless of the file splitting and the rule order.
 package rules
 
 import (
@@ -27,7 +28,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Допустимые цели правила.
+// Allowed rule targets.
 const (
 	TargetCookieName  = "cookie_name"
 	TargetCookieValue = "cookie_value"
@@ -37,7 +38,7 @@ const (
 	TargetMeta        = "meta"
 )
 
-// targets — множество допустимых значений target (для валидации и сообщений).
+// targets — the set of allowed target values (for validation and messages).
 var targets = map[string]bool{
 	TargetCookieName:  true,
 	TargetCookieValue: true,
@@ -47,36 +48,37 @@ var targets = map[string]bool{
 	TargetMeta:        true,
 }
 
-// regexOnlyTargets — цели, где соответствие ищется только регулярным
-// выражением (ТЗ 5.8: «регулярное выражение по HTML»; движок match по
-// ним не применяет). Для остальных целей match и regex равноправны:
-// движок применяет оба режима (engine.go matchRule), включая точное
-// совпадение значений cookie/header — docs/analyzer.md «Цели и режимы
-// матчинга».
+// regexOnlyTargets — the targets where the match is looked up by a regular
+// expression only (spec 5.8: "a regular expression over HTML"; the engine
+// does not apply match to them). For the other targets match and regex are
+// equal: the engine applies both modes (engine.go matchRule), including
+// exact cookie/header value matches — docs/analyzer.md "Targets and
+// matching modes".
 var regexOnlyTargets = map[string]bool{
 	TargetHTML: true,
 	TargetMeta: true,
 }
 
-// Rule — одно правило поиска признака Laravel.
+// Rule — a single rule searching for a Laravel sign.
 type Rule struct {
 	ID     string  `yaml:"id"`
 	Desc   string  `yaml:"description"`
 	Target string  `yaml:"target"`
-	Match  string  `yaml:"match"`  // точное совпадение (для имён cookie/заголовков)
-	Regex  string  `yaml:"regex"`  // регулярное выражение
+	Match  string  `yaml:"match"`  // exact match (for cookie/header names)
+	Regex  string  `yaml:"regex"`  // regular expression
 	Weight float64 `yaml:"weight"` // 0..1
 	VerMin string  `yaml:"ver_min"`
 	VerMax string  `yaml:"ver_max"`
 }
 
-// Set — загруженный набор правил. Неизменяем после загрузки: потребители
-// держат снапшот, Reloader заменяет его целиком при перезагрузке.
+// Set — a loaded rule set. Immutable after loading: consumers hold the
+// snapshot, the Reloader replaces it wholesale on reload.
 type Set struct {
 	Rules []Rule
-	// Version — rules_version (ТЗ 5.8): FNV-32a канонического представления
-	// набора, int32 под колонку integer. Отражает поведение детекции:
-	// правка описаний и комментариев версию не меняет.
+	// Version — rules_version (spec 5.8): FNV-32a of the canonical
+	// representation of the set, int32 for the integer column. It reflects
+	// the detection behavior: editing descriptions and comments does not
+	// change the version.
 	Version int32
 }
 
@@ -84,10 +86,10 @@ type rulesFile struct {
 	Rules []Rule `yaml:"rules"`
 }
 
-// LoadDir загружает и валидирует все *.yaml/*.yml из каталога (в порядке
-// имён файлов — детерминированно). Повторы id, некорректные target/regex/
-// версии и веса вне (0, 1] — ошибка загрузки: набор применяется целиком
-// или не применяется вовсе (ошибка перезагрузки не трогает прежний набор).
+// LoadDir loads and validates all *.yaml/*.yml from the directory (in file
+// name order — deterministic). Duplicate ids, invalid target/regex/versions
+// and weights outside (0, 1] are a load error: the set is applied wholesale
+// or not applied at all (a reload error does not touch the previous set).
 func LoadDir(dir string) (*Set, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -102,10 +104,10 @@ func LoadDir(dir string) (*Set, error) {
 			names = append(names, e.Name())
 		}
 	}
-	// Эквивалентный мутант (T-M12): os.ReadDir возвращает записи,
-	// отсортированные по имени (контракт stdlib), поэтому sort.Strings
-	// по уже отсортированному names ничего не меняет; сортировка остаётся
-	// защитой на случай смены способа чтения каталога.
+	// An equivalent mutant (T-M12): os.ReadDir returns entries sorted by
+	// name (a stdlib contract), so sort.Strings over the already sorted
+	// names changes nothing; the sort remains a guard against a change in
+	// the way the directory is read.
 	// mutator-disable-next-line statement/remove
 	sort.Strings(names)
 	if len(names) == 0 {
@@ -118,12 +120,12 @@ func LoadDir(dir string) (*Set, error) {
 		if err != nil {
 			return nil, fmt.Errorf("rules: %w", err)
 		}
-		// Строгий разбор: опечатка в имени поля — ошибка, а не молчаливо
-		// отключённое правило (как и в конфигурации сервисов). Файл из
-		// одних комментариев пропускается (первый Decode → io.EOF);
-		// многоокументный файл (---) читается целиком: правила второго
-		// документа не должны теряться молча (документы равноправны
-		// файлам — канонический порядок и хэш от разбиения не зависят).
+		// Strict parsing: a typo in a field name is an error, not a
+		// silently disabled rule (same as in service configuration). A file
+		// of comments only is skipped (the first Decode → io.EOF); a
+		// multi-document file (---) is read whole: the rules of the second
+		// document must not be lost silently (documents are equal to files —
+		// the canonical order and the hash do not depend on the splitting).
 		dec := yaml.NewDecoder(bytes.NewReader(data))
 		dec.KnownFields(true)
 		for {
@@ -142,11 +144,11 @@ func LoadDir(dir string) (*Set, error) {
 		}
 	}
 
-	// Канонический порядок правил — по id: состав набора не зависит от
-	// разбиения на файлы и порядка внутри них. Компаратор строгий («<»):
-	// при равных id порядок равных стабилен (insertion sort для малых n),
-	// поэтому повтор идентифицируется по второй записи — см.
-	// TestLoadDirDuplicateIDReported.
+	// The canonical rule order is by id: the set contents do not depend on
+	// the file splitting or the order within the files. The comparator is
+	// strict ("<"): with equal ids the order of equals is stable (insertion
+	// sort for small n), so a duplicate is identified by the second entry —
+	// see TestLoadDirDuplicateIDReported.
 	sort.Slice(set.Rules, func(i, j int) bool { return set.Rules[i].ID < set.Rules[j].ID })
 
 	if err := set.validate(); err != nil {
@@ -156,11 +158,11 @@ func LoadDir(dir string) (*Set, error) {
 	return set, nil
 }
 
-// validate проверяет набор целиком: непустоту, уникальность id, типы target,
-// применимость match/regex к цели, компилируемость и лимит длины regex
-// (MaxPatternBytes — граница входа едина для загрузчика и движка),
-// отбраковку паттернов, матчащих пустую строку, диапазон веса
-// и корректность границ версий.
+// validate checks the set as a whole: non-emptiness, id uniqueness, target
+// types, match/regex applicability to the target, compilability and the
+// regex length limit (MaxPatternBytes — the input bound is the same for the
+// loader and the engine), rejection of patterns matching the empty string,
+// the weight range and the validity of the version bounds.
 func (s *Set) validate() error {
 	if len(s.Rules) == 0 {
 		return fmt.Errorf("rules: набор правил пуст (нужен хотя бы один файл с rules:)")
@@ -194,9 +196,9 @@ func (s *Set) validate() error {
 			if err != nil {
 				return fmt.Errorf("%s: некорректный regex: %w", where, err)
 			}
-			// Паттерн вида ^ / x* / (?:) срабатывал бы на любом входе с
-			// пустым свидетельством — «правило-всегда-истина», незаметное
-			// по свидетельству (AN-07). Отбраковываем при загрузке.
+			// A pattern like ^ / x* / (?:) would hit on any input with an
+			// empty evidence — an "always-true rule" invisible in the
+			// evidence (AN-07). Rejected at load time.
 			if re.MatchString("") {
 				return fmt.Errorf("%s: regex матчит пустую строку — правило срабатывало бы на любом входе", where)
 			}
@@ -215,8 +217,7 @@ func (s *Set) validate() error {
 	return nil
 }
 
-// targetNames — отсортированный список допустимых target для сообщений
-// об ошибке.
+// targetNames — the sorted list of allowed targets for error messages.
 func targetNames() []string {
 	names := make([]string, 0, len(targets))
 	for t := range targets {
@@ -226,46 +227,50 @@ func targetNames() []string {
 	return names
 }
 
-// canonicalHash — rules_version: FNV-32a по каноническому представлению
-// набора, приведённый к знаковому int32 (колонка integer). Коллизии 32 бит
-// на практике незначимы: версия различает последовательные редакции одного
-// набора, а не все возможные наборы мира.
+// canonicalHash — rules_version: FNV-32a over the canonical representation
+// of the set, cast to a signed int32 (the integer column). 32-bit collisions
+// are negligible in practice: the version distinguishes consecutive
+// revisions of one set, not every possible set in the world.
 func canonicalHash(rules []Rule) int32 {
 	var b bytes.Buffer
-	// Каждый элемент записи — с префиксом длины: поля могут содержать любые
-	// байты (YAML-строки), разделители без длины допускали бы неоднозначное
-	// представление разных наборов.
+	// Every record element carries a length prefix: fields may contain
+	// arbitrary bytes (YAML strings); separators without a length would
+	// allow ambiguous representations of different sets.
 	writeField := func(s string) {
 		b.WriteString(strconv.Itoa(len(s)))
 		b.WriteByte(':')
 		b.WriteString(s)
 	}
 	for _, r := range rules {
-		// description сознательно не входит: версия отражает поведение
-		// детекции (target/match/regex/weight/версии Laravel), правка
-		// описания результатов анализа не меняет — переанализ не нужен.
+		// description is deliberately excluded: the version reflects the
+		// detection behavior (target/match/regex/weight/Laravel versions);
+		// editing the description does not change the analysis results —
+		// no re-analysis is needed.
 		writeField(r.ID)
 		writeField(r.Target)
 		writeField(r.Match)
 		writeField(r.Regex)
-		// Каноническая запись вещественного: shortest round-trip, stable.
-		// Эквивалентный мутант (T-M12): prec −2 ведёт себя как −1 — в
-		// strconv «shortest»-режим активируется при prec < 0 (проверено
-		// на весах 1e−5…1: строки совпадают). Гасим только incrementer;
-		// decrementer (prec 0 — одна значащая цифра: 0.26 и 0.27 обе
-		// «0.3») убит тестом TestCanonicalHashWeightPrecision.
+		// Canonical float formatting: shortest round-trip, stable.
+		// An equivalent mutant (T-M12): prec −2 behaves like −1 — in
+		// strconv the "shortest" mode activates at prec < 0 (verified on
+		// weights 1e−5…1: the strings match). Only the incrementer is
+		// suppressed; the decrementer (prec 0 — one significant digit:
+		// 0.26 and 0.27 both "0.3") is killed by
+		// TestCanonicalHashWeightPrecision.
 		// mutator-disable-next-line numbers/incrementer
 		writeField(strconv.FormatFloat(r.Weight, 'g', -1, 64))
 		writeField(r.VerMin)
 		writeField(r.VerMax)
-		// Эквивалентный мутант (T-M12): разделитель правил избыточен для
-		// контракта версии — кодирование «длина:значение» саморазделимо:
-		// разбор слева направо детерминирован (цифры до первого «:» —
-		// длина, за ними ровно N байт значения), правило — всегда 7 полей,
-		// поэтому конкатенация без «;» декодируется единственным образом.
-		// Контракт rules_version — только равенство одинаковых наборов и
-		// неравенство разных (переанализ по смене); абсолютное значение
-		// нигде не пиннуто и не интерпретируется, его изменение ненаблюдаемо.
+		// An equivalent mutant (T-M12): the rule separator is redundant for
+		// the version contract — the "length:value" encoding is
+		// self-delimiting: left-to-right parsing is deterministic (digits
+		// up to the first ":" are the length, followed by exactly N bytes
+		// of the value), a rule is always 7 fields, so a concatenation
+		// without ";" decodes uniquely.
+		// The rules_version contract is only the equality of identical sets
+		// and the inequality of different ones (re-analysis on change); the
+		// absolute value is pinned nowhere and never interpreted — its
+		// change is unobservable.
 		// mutator-disable-next-line statement/remove
 		b.WriteByte(';')
 	}

@@ -1,7 +1,7 @@
-// Тесты релоадера набора правил (T-068): начальная загрузка, замена набора
-// при перезагрузке, сохранение прежнего набора при ошибке, подписка на
-// смену, точка входа SIGHUP. «Фейковая ФС» — t.TempDir с перезаписываемыми
-// файлами плюс шов load для подмены без диска.
+// Rule set reloader tests (T-068): the initial load, replacing the set on
+// reload, keeping the previous set on error, subscribing to changes, the
+// SIGHUP entry point. The "fake FS" is t.TempDir with rewritable files
+// plus the load seam for substitution without a disk.
 
 package rules
 
@@ -40,8 +40,9 @@ func rewriteRules(t *testing.T, dir, body string) {
 	}
 }
 
-// syncBuf — bytes.Buffer под замком: хендлер slog пишет синхронно, но
-// буфер читает тест после вызовов (паттерн T-M06).
+// syncBuf — a bytes.Buffer under a lock: the slog handler writes
+// synchronously, but the test reads the buffer after the calls (the T-M06
+// pattern).
 type syncBuf struct {
 	mu sync.Mutex
 	b  bytes.Buffer
@@ -59,10 +60,10 @@ func (b *syncBuf) String() string {
 	return b.b.String()
 }
 
-// TestReloaderLogging — журнал жизненного цикла релоадера: начальная
-// загрузка, no-op перезагрузка, замена набора (с prev_version) и
-// сохранение прежнего набора при ошибке. Логи — наблюдаемое поведение
-// при эксплуатации (make logs), фиксируются текстовым хендлером.
+// TestReloaderLogging — the reloader's lifecycle log: the initial load, a
+// no-op reload, replacing the set (with prev_version) and keeping the
+// previous set on error. The logs are observable behavior in operation
+// (make logs), captured with a text handler.
 func TestReloaderLogging(t *testing.T) {
 	var logs syncBuf
 	logger := slog.New(slog.NewTextHandler(&logs, nil))
@@ -104,7 +105,7 @@ func TestReloaderLogging(t *testing.T) {
 
 func TestReloaderInitialLoad(t *testing.T) {
 	dir := writeRules(t, reloadRules)
-	r, err := NewReloader(dir, nil) // nil-логгер — допустимо (тихий)
+	r, err := NewReloader(dir, nil) // a nil logger is allowed (silent)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,7 +156,7 @@ func TestReloaderReloadFailureKeepsOldSet(t *testing.T) {
 	}
 	old := r.Set()
 
-	// Битый набор: перезагрузка падает, сервис работает на прежнем.
+	// A broken set: the reload fails, the service runs on the previous one.
 	rewriteRules(t, dir, "rules: [\n")
 	if err := r.Reload(); err == nil {
 		t.Error("ожидалась ошибка перезагрузки")
@@ -164,7 +165,7 @@ func TestReloaderReloadFailureKeepsOldSet(t *testing.T) {
 		t.Error("при ошибке перезагрузки набор должен сохраниться")
 	}
 
-	// Каталог вовсе исчез — то же самое.
+	// The directory disappeared entirely — the same thing.
 	if err := os.RemoveAll(dir); err != nil {
 		t.Fatal(err)
 	}
@@ -184,8 +185,8 @@ func TestReloaderHandleSIGHUP(t *testing.T) {
 	}
 	old := r.Set()
 
-	// Сигнальная точка входа не возвращает ошибку и не паникует —
-	// ошибка уже залогирована, сервис продолжает работу.
+	// The signal entry point returns no error and does not panic —
+	// the error is already logged, the service keeps running.
 	rewriteRules(t, dir, reloadRulesV2)
 	r.HandleSIGHUP()
 	if r.Set() == old {
@@ -198,12 +199,12 @@ func TestReloaderHandleSIGHUP(t *testing.T) {
 	}
 }
 
-// TestReloaderReloadClearsCompileCache — кэш компиляции не переживает
-// смену набора: паттерны ушедших правил (и кэшированные ошибки) не
-// накапливаются весь срок жизни процесса; неизменившийся набор кэш
-// не трогает.
+// TestReloaderReloadClearsCompileCache — the compilation cache does not
+// survive a set change: the removed rules' patterns (and the cached
+// errors) do not accumulate for the whole lifetime of the process; an
+// unchanged set does not touch the cache.
 func TestReloaderReloadClearsCompileCache(t *testing.T) {
-	const probe = `CACHE-PROBE-V1-` // уникальный паттерн, кроме этого теста не встречается
+	const probe = `CACHE-PROBE-V1-` // a unique pattern, not found outside this test
 	dir := writeRules(t, `
 rules:
   - id: r_html
@@ -218,12 +219,12 @@ rules:
 	if _, ok := compileCache.Load(probe); ok {
 		t.Fatalf("кэш загрязнён до теста: %s", probe)
 	}
-	r.Set().Evaluate(Page{HTML: []byte("x " + probe)}) // компиляция и кэширование
+	r.Set().Evaluate(Page{HTML: []byte("x " + probe)}) // compile and cache
 	if _, ok := compileCache.Load(probe); !ok {
 		t.Fatal("паттерн не попал в кэш компиляции")
 	}
 
-	// Тот же набор (no-op по версии) — кэш не чистится.
+	// The same set (a no-op by version) — the cache is not cleared.
 	if err := r.Reload(); err != nil {
 		t.Fatal(err)
 	}
@@ -315,8 +316,8 @@ func TestReloaderSubscribeCancel(t *testing.T) {
 }
 
 func TestReloaderSubscribeSlowConsumerGetsLatest(t *testing.T) {
-	// Подписчик не читает канал две перезагрузки подряд: Reload не
-	// блокируется, в канале остаётся самое свежее уведомление.
+	// The subscriber does not read the channel for two reloads in a row:
+	// Reload does not block, the freshest notification stays in the channel.
 	dir := writeRules(t, reloadRules)
 	r, err := NewReloader(dir, nil)
 	if err != nil {
@@ -351,8 +352,8 @@ rules:
 }
 
 func TestReloaderLoadSeam(t *testing.T) {
-	// Шов load: подмена источника набора без файловой системы; ошибка
-	// шва ведёт себя как ошибка загрузки — набор не меняется.
+	// The load seam: substituting the set source without a file system; a
+	// seam error behaves like a load error — the set is not changed.
 	dir := writeRules(t, reloadRules)
 	r, err := NewReloader(dir, nil)
 	if err != nil {
@@ -371,8 +372,8 @@ func TestReloaderLoadSeam(t *testing.T) {
 }
 
 func TestReloaderConcurrent(t *testing.T) {
-	// Читатели Set параллельно с перезагрузками: снапшоты консистентны
-	// (запускается и под -race: гонка между заменой набора и чтением).
+	// Set readers in parallel with reloads: the snapshots are consistent
+	// (also run under -race: a race between the set replacement and reads).
 	dir := writeRules(t, reloadRules)
 	r, err := NewReloader(dir, nil)
 	if err != nil {

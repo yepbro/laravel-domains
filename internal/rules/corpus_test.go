@@ -1,28 +1,30 @@
-// Сквозной корпус движка правил — задача T-075 (ТЗ §11.1: «движок правил:
-// score, пересечение диапазонов версий, конфликты; прогон по корпусу
-// реальных образцов Laravel заказчика (/testdata/laravel-samples, с
-// ожидаемыми is_laravel и диапазонами версий) и по негативным образцам»;
-// критерии приёмки §11.4 пп. 4, 11; образцы — §13.3).
+// The end-to-end rule engine corpus — task T-075 (spec §11.1: "the rule
+// engine: score, version range intersection, conflicts; a run over the
+// corpus of the customer's real Laravel samples (/testdata/laravel-samples,
+// with expected is_laravel and version ranges) and over negative samples";
+// acceptance criteria §11.4 items 4, 11; samples — §13.3).
 //
-// В отличие от laravel_test.go (порог, покрытие реальной версии образца,
-// состав) и score_test.go (ScoreRules на изолированных правилах) кейс
-// корпуса — цельная история «headers + cookies + HTML → EvaluateCtx
-// (DefaultLimits) → ScoreRules → IsLaravel(0.6)», как её соберёт воркер
-// анализатора: ожидания точные (score с допуском corpusScoreTol, строки
-// границ вычисленного диапазона, конфликт), а не только покрытие.
+// Unlike laravel_test.go (the threshold, the coverage of the sample's real
+// version, the contents) and score_test.go (ScoreRules on isolated rules),
+// the corpus case is a whole story "headers + cookies + HTML → EvaluateCtx
+// (DefaultLimits) → ScoreRules → IsLaravel(0.6)" as the analyzer worker
+// will assemble it: the expectations are exact (the score with a
+// corpusScoreTol tolerance, the boundary strings of the computed range, the
+// conflict), not just the coverage.
 //
-// Подход к ожиданию score: значение в meta.yaml — noisy-OR весов правил
-// из поля rules, округлённый до 3 знаков; тест допускает ±corpusScoreTol.
-// Точных float-констант в мете нет: веса правил меняются при доработке
-// набора, 3 знака ловят любое содержательное изменение и не хрупки к
-// порядку накопления.
+// The approach to the score expectation: the value in meta.yaml is the
+// noisy-OR of the weights of the rules from the rules field, rounded to 3
+// digits; the test allows ±corpusScoreTol. There are no exact float
+// constants in the meta: rule weights change as the set is reworked, 3
+// digits catch any substantive change and are not fragile to the
+// accumulation order.
 //
-// Группы кейсов: полная история по всем образцам (+ пустой HTML у JSON-API
-// образца), разбор слабых срабатываний негативных образцов, score-математика
-// (накопление noisy-OR против одиночных весов, порог на границе),
-// пересечение диапазонов и конфликтный набор правил на синтетической
-// странице, лимиты (сверхлимитный HTML обрезается — признаки в хвосте
-// не матчатся).
+// Case groups: the full story over all samples (+ empty HTML for the
+// JSON-API sample), the analysis of the negative samples' weak hits, the
+// score math (noisy-OR accumulation against single weights, the threshold
+// at the boundary), the range intersection and a conflicting rule set on a
+// synthetic page, the limits (over-limit HTML is truncated — tail signs do
+// not match).
 package rules
 
 import (
@@ -38,12 +40,13 @@ import (
 const (
 	corpusRulesDir   = `../../rules`
 	corpusSamplesDir = `../../testdata/laravel-samples`
-	// corpusScoreTol — допуск сверки score с ожиданием meta.yaml
-	// (округление до 3 знаков; float-порядок накопления шумит ~1e-16).
+	// corpusScoreTol — the tolerance for comparing the score against the
+	// meta.yaml expectation (rounding to 3 digits; the float accumulation
+	// order adds ~1e-16 noise).
 	corpusScoreTol = 0.001
 )
 
-// corpusSet — рабочий набор правил Laravel (rules/laravel.yaml).
+// corpusSet — the production Laravel rule set (rules/laravel.yaml).
 func corpusSet(t *testing.T) *Set {
 	t.Helper()
 	if _, err := os.Stat(corpusRulesDir); err != nil {
@@ -56,7 +59,7 @@ func corpusSet(t *testing.T) *Set {
 	return set
 }
 
-// corpusSamples — корпус образцов (testdata/laravel-samples).
+// corpusSamples — the sample corpus (testdata/laravel-samples).
 func corpusSamples(t *testing.T) []Sample {
 	t.Helper()
 	if _, err := os.Stat(corpusSamplesDir); err != nil {
@@ -69,7 +72,7 @@ func corpusSamples(t *testing.T) []Sample {
 	return samples
 }
 
-// corpusSampleByID — один образец корпуса по имени каталога.
+// corpusSampleByID — one corpus sample by directory name.
 func corpusSampleByID(t *testing.T, id string) Sample {
 	t.Helper()
 	for _, s := range corpusSamples(t) {
@@ -81,8 +84,8 @@ func corpusSampleByID(t *testing.T, id string) Sample {
 	return Sample{}
 }
 
-// corpusFired — сработавшие правила (id, по сортировке — сравнение
-// с ожиданием порядка набора не зависит).
+// corpusFired — the hit rules (ids, sorted — the comparison against the
+// expectation does not depend on the set order).
 func corpusFired(res Result) []string {
 	fired := make([]string, 0, len(res.Signals))
 	for _, ev := range res.Signals {
@@ -92,16 +95,16 @@ func corpusFired(res Result) []string {
 	return fired
 }
 
-// corpusSortedIDs — отсортированная копия списка id.
+// corpusSortedIDs — a sorted copy of the id list.
 func corpusSortedIDs(ids []string) []string {
 	out := slices.Clone(ids)
 	sort.Strings(out)
 	return out
 }
 
-// corpusMatchedRules — правила набора, сработавшие на странице, в порядке
-// набора (том же, в котором их накопил EvaluateCtx) — вход прямого вызова
-// ScoreRules, следующее звено полной истории.
+// corpusMatchedRules — the set rules that hit the page, in set order (the
+// same order EvaluateCtx accumulated them in) — the input of the direct
+// ScoreRules call, the next link of the full story.
 func corpusMatchedRules(t *testing.T, set *Set, res Result) []Rule {
 	t.Helper()
 	fired := make(map[string]bool, len(res.Signals))
@@ -117,18 +120,19 @@ func corpusMatchedRules(t *testing.T, set *Set, res Result) []Rule {
 	return matched
 }
 
-// TestCorpusSamplesFullHistory — полная история по каждому образцу корпуса:
+// TestCorpusSamplesFullHistory — the full story for each corpus sample:
 // headers.json + cookies.json + index.html → Page → EvaluateCtx
-// (DefaultLimits) → ScoreRules → IsLaravel(0.6). Точные ожидания движка
-// (score/calc_ver_min/calc_ver_max/conflict) обязательны в каждом meta.yaml —
-// корпус без них молча деградировал бы до проверки одного порога.
+// (DefaultLimits) → ScoreRules → IsLaravel(0.6). The exact engine
+// expectations (score/calc_ver_min/calc_ver_max/conflict) are mandatory in
+// every meta.yaml — without them the corpus would silently degrade to
+// checking a single threshold.
 func TestCorpusSamplesFullHistory(t *testing.T) {
 	set := corpusSet(t)
 	samples := corpusSamples(t)
 
-	// Целостность корпуса (ТЗ §11.4 пп. 4, 11; §13.3): позитивные и
-	// негативные образцы, у негативных обязаны быть и «слабые» — со
-	// срабатываниями ниже порога (контроль ложноположительных).
+	// Corpus integrity (spec §11.4 items 4, 11; §13.3): positive and
+	// negative samples; the negatives must include "weak" ones — with hits
+	// below the threshold (a false-positive control).
 	var positives, negatives, weakNegatives int
 	for _, s := range samples {
 		if s.Expect.IsLaravel == nil {
@@ -158,27 +162,27 @@ func TestCorpusSamplesFullHistory(t *testing.T) {
 		t.Run(s.ID, func(t *testing.T) {
 			res := set.EvaluateCtx(context.Background(), s.Page(), DefaultLimits())
 
-			// Состав: полный и точный.
+			// Contents: complete and exact.
 			if fired := corpusFired(res); !slices.Equal(fired, corpusSortedIDs(s.Expect.Rules)) {
 				t.Errorf("сработали %v, в meta.yaml %v", fired, s.Expect.Rules)
 			}
 
-			// Score — точное ожидание (± corpusScoreTol).
+			// Score — an exact expectation (± corpusScoreTol).
 			if d := diff(res.Score, *s.Expect.Score); d > corpusScoreTol {
 				t.Errorf("score = %.6f, в meta.yaml %.3f (расхождение %.6f > %g)",
 					res.Score, *s.Expect.Score, d, corpusScoreTol)
 			}
 
-			// Звено ScoreRules: прямой вызов на сработавших правилах —
-			// тот же итог, что собрал EvaluateCtx.
+			// The ScoreRules link: a direct call on the hit rules — the same
+			// outcome EvaluateCtx assembled.
 			score2, verMin2, verMax2, conflict2 := ScoreRules(corpusMatchedRules(t, set, res))
 			if score2 != res.Score || verMin2 != res.VerMin || verMax2 != res.VerMax || conflict2 != res.Conflict {
 				t.Errorf("ScoreRules не сходится с EvaluateCtx: (%v, %q, %q, %v) против (%v, %q, %q, %v)",
 					score2, verMin2, verMax2, conflict2, res.Score, res.VerMin, res.VerMax, res.Conflict)
 			}
 
-			// Диапазон версий — точные строки границ из правил
-			// ("" — границы нет; при записи в БД это NULL).
+			// The version range — the exact boundary strings from the rules
+			// ("" — no boundary; written to the DB as NULL).
 			if res.VerMin != *s.Expect.CalcVerMin || res.VerMax != *s.Expect.CalcVerMax {
 				t.Errorf("диапазон = [%q..%q], в meta.yaml [%q..%q]",
 					res.VerMin, res.VerMax, *s.Expect.CalcVerMin, *s.Expect.CalcVerMax)
@@ -190,8 +194,8 @@ func TestCorpusSamplesFullHistory(t *testing.T) {
 				t.Errorf("при конфликте диапазон неопределён (обе границы NULL), got [%q..%q]", res.VerMin, res.VerMax)
 			}
 
-			// Порог is_laravel (ТЗ §13.1: 0.6); нулевой порог обязан
-			// подставлять тот же дефолт.
+			// The is_laravel threshold (spec §13.1: 0.6); a zero threshold
+			// must substitute the same default.
 			if got := res.IsLaravel(DefaultMinScore); got != *s.Expect.IsLaravel {
 				t.Errorf("IsLaravel(0.6) = %v (score %.3f), в meta.yaml %v",
 					got, res.Score, *s.Expect.IsLaravel)
@@ -203,12 +207,13 @@ func TestCorpusSamplesFullHistory(t *testing.T) {
 	}
 }
 
-// TestCorpusJSONAPIEmptyHTML — JSON-API образец без HTML: JSON-эпизод мог
-// тела не сохранить (ошибка до чтения тела, контент сверх лимита), пассивный
-// анализ по кукам обязан работать и на пустом контенте. htmlCap на nil-HTML
-// безопасен, HTML-правила (json_message_key) не срабатывают, порог
-// достигается одними куками: 1 − 0.5·0.65·0.85·0.75 = 0.793 ≥ 0.6
-// (вес cookie_encrypted_payload 0.5 — калибровка T-116).
+// TestCorpusJSONAPIEmptyHTML — a JSON-API sample without HTML: a JSON
+// episode may not have stored the body (an error before reading the body,
+// content over the limit), passive analysis by cookies must work on empty
+// content too. htmlCap on nil HTML is safe, the HTML rules
+// (json_message_key) do not hit, the threshold is reached by cookies
+// alone: 1 − 0.5·0.65·0.85·0.75 = 0.793 ≥ 0.6
+// (the cookie_encrypted_payload weight of 0.5 — the T-116 calibration).
 func TestCorpusJSONAPIEmptyHTML(t *testing.T) {
 	set := corpusSet(t)
 	page := corpusSampleByID(t, "laravel-9-json-api").Page()
@@ -237,18 +242,18 @@ func TestCorpusJSONAPIEmptyHTML(t *testing.T) {
 	}
 }
 
-// TestCorpusJSONMessageKey — широкое правило json_message_key (T-117,
-// пассивный аналог активного 404-зонда larasites): матчит и точный
-// «Unauthenticated.», и «Not Found» — ровно один раз на ответ (двойного
-// учёта нет: точного правила рядом не существует), но поодиночке порога
-// не достигает (вес 0.25 понижен против точного 0.3: паттерн пишут
-// NestJS/Express — {"message":"Cannot GET /"}).
+// TestCorpusJSONMessageKey — the broad json_message_key rule (T-117, the
+// passive counterpart of the active larasites 404 probe): it matches both
+// the exact "Unauthenticated." and "Not Found" — exactly once per response
+// (no double counting: no exact rule exists next to it), but alone it does
+// not reach the threshold (the weight of 0.25 is lowered against the exact
+// 0.3: NestJS/Express produce the pattern — {"message":"Cannot GET /"}).
 func TestCorpusJSONMessageKey(t *testing.T) {
 	set := corpusSet(t)
 
 	for _, body := range []string{
-		`{"message":"Unauthenticated."}`, // точная форма (бывший json_unauthenticated)
-		`{"message":"Not Found"}`,        // 404 API-поддомена (образец T-117)
+		`{"message":"Unauthenticated."}`, // the exact form (the former json_unauthenticated)
+		`{"message":"Not Found"}`,        // a 404 API subdomain (the T-117 sample)
 		`{"message":"Too Many Attempts."}`,
 	} {
 		res := set.EvaluateCtx(context.Background(), Page{HTML: []byte(body)}, DefaultLimits())
@@ -263,8 +268,8 @@ func TestCorpusJSONMessageKey(t *testing.T) {
 		}
 	}
 
-	// Границы паттерна: длинное значение (>120) и ключ-не-строка —
-	// несовпадение; пустое — тоже (квантификатор {1,120}).
+	// Pattern boundaries: a long value (>120) and a non-string key do not
+	// match; an empty one does not either (the {1,120} quantifier).
 	for _, body := range []string{
 		`{"message":"` + strings.Repeat("x", 121) + `"}`,
 		`{"message":""}`,
@@ -277,8 +282,9 @@ func TestCorpusJSONMessageKey(t *testing.T) {
 		}
 	}
 
-	// Чужой стек: NestJS/Express даёт ту же форму — поодиночке ниже порога,
-	// в сочетании с куками T-116 детектируется (образец laravel-12-api-404).
+	// A foreign stack: NestJS/Express produces the same form — below the
+	// threshold alone, detected in combination with the T-116 cookies (the
+	// laravel-12-api-404 sample).
 	nest := set.EvaluateCtx(context.Background(),
 		Page{HTML: []byte(`{"message":"Cannot GET /"}`)}, DefaultLimits())
 	if nest.IsLaravel(DefaultMinScore) || nest.Score != 0.25 {
@@ -286,23 +292,25 @@ func TestCorpusJSONMessageKey(t *testing.T) {
 	}
 }
 
-// TestCorpusCMSSession — правило cookie_cms_session (T-134, сверка с
-// larasites): CMS на Laravel ставят собственные имена сессии (october/
-// winter/bagisto — проверено по исходникам CMS), которые до правила ловил
-// только генерический суффикс *_session — пара «CMS-кука + шифро-конверт»
-// без XSRF-TOKEN давала 0.15 + 0.5 = 0.575 < 0.6 (пропуск, не закрытый
-// калибровкой T-116). Вес 0.35 — уровень laravel_session (имена
-// Laravel-экосистемны, в отличие от суффикса, совпадающего с ci_session):
-// 0.35 + 0.5 → 0.675 ≥ 0.6; двойной учёт с суффиксом консистентен с
-// поведением laravel_session (совпадает с обоими). Префиксы __Secure-/
-// __Host- (October ≥1.1 ставит автоматически на https) учтены и в
-// cms-правиле, и в суффиксе *_session.
+// TestCorpusCMSSession — the cookie_cms_session rule (T-134, a cross-check
+// with larasites): Laravel-based CMSes set their own session names
+// (october/winter/bagisto — verified against the CMS sources) which before
+// the rule were only caught by the generic *_session suffix — the
+// "CMS cookie + encrypted envelope" pair without XSRF-TOKEN gave
+// 0.15 + 0.5 = 0.575 < 0.6 (a miss not closed by the T-116 calibration).
+// The weight of 0.35 is the laravel_session level (the names are
+// Laravel-ecosystem-specific, unlike the suffix, which also matches
+// ci_session): 0.35 + 0.5 → 0.675 ≥ 0.6; the double counting with the
+// suffix is consistent with the laravel_session behavior (it matches
+// both). The __Secure-/__Host- prefixes (October ≥1.1 sets them
+// automatically on https) are accounted for in both the cms rule and the
+// *_session suffix.
 func TestCorpusCMSSession(t *testing.T) {
 	set := corpusSet(t)
 
-	// Образцы корпуса: October (префикс __Secure- — https-эпизод October
-	// ≥1.1) и Winter (стоковое имя), оба без XSRF-TOKEN — детекция куками:
-	// ровно три правила, шумовых HTML-признаков нет.
+	// Corpus samples: October (the __Secure- prefix — an https episode of
+	// October ≥1.1) and Winter (the stock name), both without XSRF-TOKEN —
+	// detection by cookies: exactly three rules, no noisy HTML signs.
 	for _, id := range []string{"october-cms", "winter-cms"} {
 		res := set.EvaluateCtx(context.Background(), corpusSampleByID(t, id).Page(), DefaultLimits())
 		want := []string{"cookie_cms_session", "cookie_encrypted_payload", "cookie_session_suffix"}
@@ -317,8 +325,9 @@ func TestCorpusCMSSession(t *testing.T) {
 		}
 	}
 
-	// Состав списка — только имена, проверяемые по исходникам: матчатся
-	// october/winter/bagisto с префиксами __Secure-/__Host- и без.
+	// The list contents — only names verifiable against the sources:
+	// october/winter/bagisto match with and without the __Secure-/__Host-
+	// prefixes.
 	fires := func(name string) bool {
 		t.Helper()
 		res := set.EvaluateCtx(context.Background(),
@@ -333,33 +342,35 @@ func TestCorpusCMSSession(t *testing.T) {
 			t.Errorf("кука %s: правило cookie_cms_session должно срабатывать", name)
 		}
 	}
-	// Не матчатся: подтверждённых имён нет (botble/pyrocms/asgard — состав
-	// не расширен непроверяемыми), генерические имена и огранки паттерна —
-	// якоря, постфиксы, чужая форма (статamic оставляет laravel_session).
+	// No match: no confirmed names (botble/pyrocms/asgard — the contents
+	// are not extended with unverifiable ones), generic names and pattern
+	// edges — anchors, postfixes, a foreign shape (statamic leaves
+	// laravel_session).
 	for _, name := range []string{
 		"ci_session", "myapp_session", "laravel_session",
 		"botble_session", "pyrocms_session", "asgard_session",
-		"october_sessions",         // постфиксный хвост
-		"foo_october_session",      // имя приложения перед cms-именем
-		"october-session",          // дефис вместо подчёркивания
-		"__secure-october_session", // префикс регистрозависим (RFC 6265bis)
+		"october_sessions",         // a postfix tail
+		"foo_october_session",      // an application name before the cms name
+		"october-session",          // a hyphen instead of the underscore
+		"__secure-october_session", // the prefix is case-sensitive (RFC 6265bis)
 	} {
 		if fires(name) {
 			t.Errorf("кука %s: правило cookie_cms_session срабатывать не должно", name)
 		}
 	}
 
-	// laravel_session — эталон консистентности двойного учёта: совпадает
-	// с cookie_laravel_session и суффиксом, но не с cms-правилом.
+	// laravel_session — the reference for double-counting consistency: it
+	// matches cookie_laravel_session and the suffix, but not the cms rule.
 	res := set.EvaluateCtx(context.Background(),
 		Page{Cookies: []Cookie{{Name: "laravel_session", Value: "plain"}}}, DefaultLimits())
 	if fired := corpusFired(res); !slices.Equal(fired, []string{"cookie_laravel_session", "cookie_session_suffix"}) {
 		t.Errorf("laravel_session: сработали %v, ожидались cookie_laravel_session и cookie_session_suffix", fired)
 	}
 
-	// Правка суффикса *_session под префиксы: __Secure-myapp_session (произвольное
-	// имя, как в тесте larasites myapp_session) матчится суффиксом — 0.15;
-	// __Secure-october_session — обоими правилами (двойной учёт).
+	// The *_session suffix with prefixes: __Secure-myapp_session (an
+	// arbitrary name, as in the larasites myapp_session test) is matched by
+	// the suffix — 0.15; __Secure-october_session — by both rules (double
+	// counting).
 	res = set.EvaluateCtx(context.Background(),
 		Page{Cookies: []Cookie{{Name: "__Secure-myapp_session", Value: "plain"}}}, DefaultLimits())
 	if fired := corpusFired(res); !slices.Equal(fired, []string{"cookie_session_suffix"}) {
@@ -369,14 +380,16 @@ func TestCorpusCMSSession(t *testing.T) {
 		t.Errorf("__Secure-myapp_session: score %.3f — суффикс один ниже порога", res.Score)
 	}
 
-	// Серая зона (контроль T-115: новые пары не заносят шум):
+	// The gray zone (the T-115 control: the new pairs add no noise):
 	//
-	//   - CMS-имя без конверта: 0.35 + 0.15 = 0.4475 < 0.6 (EncryptCookies
-	//     отключён/кука от прокси) — находка в findings, но не laravel_domains;
-	//   - ближайший негатив к новой паре: ci_session + конверт — 0.15 + 0.5 =
-	//     0.575 < 0.6 (ci_session не входит в cms-список, суффиксу конверт
-	//     безразличен — тот же класс пропуска для не-CMS имён остался ниже
-	//     порога сознательно: без экосистемного имени конверт слабее).
+	//   - a CMS name without the envelope: 0.35 + 0.15 = 0.4475 < 0.6
+	//     (EncryptCookies disabled/the cookie is from a proxy) — a finding
+	//     in findings, but not laravel_domains;
+	//   - the closest negative to the new pair: ci_session + the envelope —
+	//     0.15 + 0.5 = 0.575 < 0.6 (ci_session is not in the cms list, the
+	//     suffix is indifferent to the envelope — the same miss class for
+	//     non-CMS names was deliberately left below the threshold: without
+	//     an ecosystem name the envelope is weaker).
 	res = set.EvaluateCtx(context.Background(),
 		Page{Cookies: []Cookie{{Name: "october_session", Value: "plain"}}}, DefaultLimits())
 	if want := 1 - 0.65*0.85; diff(res.Score, want) > 1e-9 || res.IsLaravel(DefaultMinScore) {
@@ -392,10 +405,10 @@ func TestCorpusCMSSession(t *testing.T) {
 	}
 }
 
-// TestCorpusNegativesWeakSignals — негативные образцы (ТЗ §13.3: «в том
-// числе на других фреймворках, использующих похожие признаки»): is_laravel
-// обязана быть false, и тест разбирает, какими слабыми срабатываниями
-// ограничивается движок и почему они ниже порога.
+// TestCorpusNegativesWeakSignals — the negative samples (spec §13.3:
+// "including ones on other frameworks using similar signs"): is_laravel
+// must be false, and the test breaks down which weak hits the engine is
+// limited to and why they are below the threshold.
 func TestCorpusNegativesWeakSignals(t *testing.T) {
 	set := corpusSet(t)
 
@@ -419,12 +432,12 @@ func TestCorpusNegativesWeakSignals(t *testing.T) {
 				t.Errorf("сработали %v, в meta.yaml %v", fired, s.Expect.Rules)
 			}
 
-			// Почему ниже порога: каждый отдельный признак слаб — ни один
-			// сработавший вес не достигает порога сам по себе, а накопление
-			// (res.Score) осталось ниже. Рабочий набор устроен так
-			// сознательно (header rules/laravel.yaml): правила, которые
-			// встречаются и вне Laravel, получают вес < 0.6 — срабатывание
-			// попадёт в laravel_findings, но не в laravel_domains.
+			// Why below the threshold: every individual sign is weak — no
+			// hit weight reaches the threshold by itself, and the
+			// accumulation (res.Score) stayed below. The production set is
+			// built this way deliberately (the header of rules/laravel.yaml):
+			// rules that also occur outside Laravel get a weight < 0.6 — a
+			// hit lands in laravel_findings but not in laravel_domains.
 			for _, ev := range res.Signals {
 				if ev.Weight >= DefaultMinScore {
 					t.Errorf("правило %s одним весом %.2f достигает порога: для похожего не-Laravel признака вес завышен",
@@ -434,11 +447,11 @@ func TestCorpusNegativesWeakSignals(t *testing.T) {
 		})
 	}
 
-	// Rails — эталонный «похожий» фреймворк (§13.3): csrf-token meta пишут
-	// и Rails-шаблоны (0.2), кука _shop_session матчится суффиксным
-	// правилом *_session (0.15, вес понижен именно из-за Rails и
-	// CodeIgniter). Поодиночке и вместе — noisy-OR 1 − 0.8·0.85 = 0.32 —
-	// ниже порога 0.6.
+	// Rails — the reference "similar" framework (§13.3): Rails templates
+	// also write the csrf-token meta (0.2), the _shop_session cookie is
+	// matched by the *_session suffix rule (0.15, the weight lowered
+	// precisely because of Rails and CodeIgniter). Alone and together —
+	// the noisy-OR 1 − 0.8·0.85 = 0.32 — below the 0.6 threshold.
 	t.Run("rails-negative: 0.32 = noisy-OR(0.2, 0.15)", func(t *testing.T) {
 		res := set.EvaluateCtx(context.Background(),
 			corpusSampleByID(t, "rails-negative").Page(), DefaultLimits())
@@ -458,16 +471,16 @@ func TestCorpusNegativesWeakSignals(t *testing.T) {
 	})
 }
 
-// TestCorpusScoreMath — score-математика сквозным путём (синтетический
-// набор, страница с маркерами — полная история до IsLaravel): накопление
-// noisy-OR против одиночных весов и порог на границе. ScoreRules сам по
-// себе покрыт score_test.go; здесь — поведение решения «Laravel/не Laravel»
-// на странице целиком.
+// TestCorpusScoreMath — the score math end-to-end (a synthetic set, a page
+// with markers — the full story up to IsLaravel): the noisy-OR
+// accumulation against single weights and the threshold at the boundary.
+// ScoreRules itself is covered by score_test.go; here — the behavior of
+// the "Laravel / not Laravel" decision on a whole page.
 func TestCorpusScoreMath(t *testing.T) {
-	// Накопление: страница добавляет по одному слабому признаку (вес 0.2),
-	// score растёт как 1 − 0.8ⁿ; порог 0.6 достигается только пятым —
-	// одиночные веса, пары и тройки остаются ниже. Слабые признаки
-	// накапливаются, но не дают 100% (ТЗ §5.8).
+	// Accumulation: the page adds one weak sign at a time (weight 0.2), the
+	// score grows as 1 − 0.8ⁿ; the 0.6 threshold is reached only by the
+	// fifth — single weights, pairs and triples stay below. Weak signs
+	// accumulate but never reach 100% (spec §5.8).
 	markers := `
 rules:
   - id: m1
@@ -499,7 +512,7 @@ rules:
 		}
 		res := set.EvaluateCtx(context.Background(),
 			Page{HTML: []byte(strings.Join(parts, " "))}, DefaultLimits())
-		remain := 1.0 // Π(1 − 0.2) по n сработавшим
+		remain := 1.0 // Π(1 − 0.2) over the n hits
 		for i := 0; i < n; i++ {
 			remain *= 0.8
 		}
@@ -510,14 +523,14 @@ rules:
 			t.Errorf("%d маркера: IsLaravel = %v (score %.4f)", n, got, res.Score)
 		}
 	}
-	// Накопление сильнее любой одиночной составляющей, но меньше единицы.
+	// The accumulation exceeds any single component but stays below one.
 	five := set.EvaluateCtx(context.Background(),
 		Page{HTML: []byte("MARK1 MARK2 MARK3 MARK4 MARK5")}, DefaultLimits())
 	if five.Score <= 0.2 || five.Score >= 1 {
 		t.Errorf("накопление пяти по 0.2 вне (0.2, 1): %v", five.Score)
 	}
 
-	// Одиночный вес: score равен весу (допуск на порядок операций).
+	// A single weight: the score equals the weight (a tolerance for the operation order).
 	for _, w := range []float64{0.25, 0.45, 0.5, 0.9} {
 		set := evalSet(t, fmt.Sprintf("rules:\n  - id: solo\n    target: html\n    regex: MARK\n    weight: %v\n", w))
 		res := set.EvaluateCtx(context.Background(), Page{HTML: []byte("MARK")}, DefaultLimits())
@@ -526,8 +539,9 @@ rules:
 		}
 	}
 
-	// Порог на границе: вес ровно 0.6 — score без округлений равен 0.6
-	// (1−(1−0)·(1−0.6) в IEEE-754 точно), нестрогое сравнение даёт true.
+	// The threshold at the boundary: a weight of exactly 0.6 — the score is
+	// exactly 0.6 without rounding (1−(1−0)·(1−0.6) is exact in IEEE-754),
+	// the non-strict comparison gives true.
 	set = evalSet(t, "rules:\n  - id: edge\n    target: html\n    regex: MARK\n    weight: 0.6\n")
 	res := set.EvaluateCtx(context.Background(), Page{HTML: []byte("MARK")}, DefaultLimits())
 	if diff(res.Score, 0.6) > 1e-12 {
@@ -537,11 +551,12 @@ rules:
 		t.Error("score ровно на пороге: нестрогое ≥ должно давать is_laravel")
 	}
 
-	// Реальная пара cookie_xsrf_token (0.25) + cookie_encrypted_payload
-	// (0.5, калибровка T-116): 1 − 0.75·0.5 = 0.625 ≥ порога —
-	// stateless API (api-субдомен без сессии на главной) детектируется
-	// двумя куками; до калибровки (вес 0.45) пара давала 0.5875 и сайт
-	// выпадал из laravel_domains (дефект, найден сверкой с larasites).
+	// The real pair cookie_xsrf_token (0.25) + cookie_encrypted_payload
+	// (0.5, the T-116 calibration): 1 − 0.75·0.5 = 0.625 ≥ the threshold —
+	// a stateless API (an api subdomain without a session on the main page)
+	// is detected by two cookies; before the calibration (weight 0.45) the
+	// pair gave 0.5875 and the site dropped out of laravel_domains (a
+	// defect found by the cross-check with larasites).
 	set = evalSet(t, `
 rules:
   - id: a_xsrf
@@ -562,12 +577,14 @@ rules:
 		t.Errorf("score %.4f обязан достигать порога %v (T-116: stateless API)", res.Score, DefaultMinScore)
 	}
 
-	// Ослабление не занесло шумовые пары (проверка T-116 по аналогии
-	// серой зоны): сочетания БЕЗ шифрованной куки остаются ниже порога —
-	// CodeIgniter-тройка ci_session (суффикс 0.15) + csrf-meta (0.2) +
-	// форма _token (0.25): 1 − 0.85·0.8·0.75 = 0.49. Суффикс — копия
-	// рабочего правила (с префиксами __Secure-/__Host- от T-134): кука
-	// с префиксом ловится тем же весом и порог не меняет.
+	// The weakening did not bring in noisy pairs (a T-116 check by the gray
+	// zone analogy): combinations WITHOUT the encrypted cookie stay below
+	// the threshold — the CodeIgniter triple ci_session (the suffix 0.15) +
+	// the csrf meta (0.2) + the _token form (0.25):
+	// 1 − 0.85·0.8·0.75 = 0.49. The suffix is a copy of the production rule
+	// (with the __Secure-/__Host- prefixes from T-134): a cookie with a
+	// prefix is caught by the same weight and the threshold does not
+	// change.
 	set = evalSet(t, `
 rules:
   - id: ci_sess
@@ -600,24 +617,24 @@ rules:
 		t.Errorf("score тройки с __Secure-ci_session = %v, want %v (префикс вес не меняет)", res.Score, want)
 	}
 
-	// Вес 1 — уверенный признак закрывает score до единицы.
+	// Weight 1 — a confident sign closes the score up to one.
 	set = evalSet(t, "rules:\n  - id: sure\n    target: html\n    regex: MARK\n    weight: 1\n")
 	if res := set.EvaluateCtx(context.Background(), Page{HTML: []byte("MARK")}, DefaultLimits()); res.Score != 1 {
 		t.Errorf("вес 1: score = %v, want 1", res.Score)
 	}
 }
 
-// TestCorpusVersionRanges — пересечение диапазонов версий сквозным путём:
-// заранее собранный Set применяется к синтетической странице, границы
-// читаются из итога EvaluateCtx (не из ScoreRules напрямую). ТЗ §5.8:
-// диапазон — пересечение [ver_min, ver_max] сработавших правил, пустое
-// пересечение — конфликт и неопределённый диапазон.
+// TestCorpusVersionRanges — the version range intersection end-to-end: a
+// pre-built Set is applied to a synthetic page, the boundaries are read
+// from the EvaluateCtx outcome (not from ScoreRules directly). Spec §5.8:
+// the range is the intersection of the hit rules' [ver_min, ver_max], an
+// empty intersection is a conflict and an undefined range.
 func TestCorpusVersionRanges(t *testing.T) {
 	cases := []struct {
 		name             string
-		body             string // yaml набора
-		page             string // HTML синтетической страницы
-		wantMin, wantMax string // точные строки границ ("" — границы нет)
+		body             string // the set yaml
+		page             string // the synthetic page HTML
+		wantMin, wantMax string // exact boundary strings ("" — no boundary)
 		conflict         bool
 	}{
 		{
@@ -647,7 +664,7 @@ rules:
 `,
 			page:     "WELCOME FLOOR CEILING PLAIN",
 			wantMin:  "5.4", // max(5.3, 5.4)
-			wantMax:  "7.x", // min(7.x, 11.x); d_plain без границ не сужает
+			wantMax:  "7.x", // min(7.x, 11.x); d_plain without boundaries does not narrow
 			conflict: false,
 		},
 		{
@@ -687,7 +704,7 @@ rules:
 `,
 			page:     "NEW OLD", // [9.19,∞) ∩ (−∞,9.x]
 			wantMin:  "9.19",
-			wantMax:  "9.x", // «9.x» не превращается в «9»
+			wantMax:  "9.x", // "9.x" does not become "9"
 			conflict: false,
 		},
 	}
@@ -702,11 +719,11 @@ rules:
 		})
 	}
 
-	// Конфликтный набор на одной синтетической странице: признаки с
-	// несовместимыми границами (≥10 и ≤9.x) срабатывают вместе — пересечение
-	// пусто, диапазон сбрасывается (обе границы NULL), но score считается
-	// по всем сработавшим и уверенная детекция остаётся уверенной:
-	// конфликт версий — не конфликт «Laravel/не Laravel».
+	// A conflicting set on one synthetic page: signs with incompatible
+	// boundaries (≥10 and ≤9.x) hit together — the intersection is empty,
+	// the range is reset (both boundaries NULL), but the score is computed
+	// over all hits and the confident detection stays confident: a version
+	// conflict is not a "Laravel / not Laravel" conflict.
 	t.Run("конфликт: [10,∞) ∩ (−∞,9.x] — диапазон сброшен, порог в силе", func(t *testing.T) {
 		set := evalSet(t, `
 rules:
@@ -740,9 +757,9 @@ rules:
 		}
 	})
 
-	// Конфликт на рабочем наборе: страница Laravel 12 с унаследованной
-	// классической welcome-разметкой — Vite (≥9.19) и welcome_classic
-	// (≤7.x) вместе невозможны ни в одной версии.
+	// A conflict on the production set: a Laravel 12 page with inherited
+	// classic welcome markup — Vite (≥9.19) and welcome_classic (≤7.x)
+	// cannot coexist in any version.
 	t.Run("рабочий набор: vite (≥9.19) + welcome_classic (≤7.x) — конфликт", func(t *testing.T) {
 		set := corpusSet(t)
 		res := set.EvaluateCtx(context.Background(), Page{HTML: []byte(`<!DOCTYPE html>
@@ -774,14 +791,15 @@ rules:
 	})
 }
 
-// TestCorpusHTMLTailLimit — лимиты сквозным путём (ТЗ §9: парсеры имеют
-// ограничения размера): сверхлимитный HTML обрезается до матчинга —
-// признаки в хвосте не матчатся, остальные цели (куки) не затрагиваются.
+// TestCorpusHTMLTailLimit — the limits end-to-end (spec §9: parsers have
+// size limits): over-limit HTML is truncated before matching — tail signs
+// do not match, the other targets (cookies) are not affected.
 func TestCorpusHTMLTailLimit(t *testing.T) {
-	// Рабочий набор на реальном образце с 2 MiB мусора перед документом:
-	// HTML-признаки (meta csrf-token, vite, inertia) уходят за пределы
-	// DefaultLimits().MaxHTMLBytes и не срабатывают; куки лимитом HTML не
-	// трогаются — их хватает на порог (0.772 ≥ 0.6), is_laravel сохраняется.
+	// The production set on a real sample with 2 MiB of junk before the
+	// document: the HTML signs (meta csrf-token, vite, inertia) fall beyond
+	// DefaultLimits().MaxHTMLBytes and do not hit; cookies are not touched
+	// by the HTML limit — they are enough for the threshold
+	// (0.772 ≥ 0.6), is_laravel is preserved.
 	t.Run("образец с хвостом за 2 MiB: HTML-признаки не видны, куки работают", func(t *testing.T) {
 		set := corpusSet(t)
 		page := corpusSampleByID(t, "laravel-11-vite").Page()
@@ -808,22 +826,22 @@ func TestCorpusHTMLTailLimit(t *testing.T) {
 		}
 	})
 
-	// Граница обрезки байт в байт: признак, последний байт которого ровно
-	// на лимите, ещё виден; на байт дальше — уже нет. Вес признака 0.6 —
-	// обрезка напрямую решает is_laravel.
+	// The truncation boundary byte by byte: a sign whose last byte is
+	// exactly at the limit is still visible; one byte further — it is not.
+	// The sign weight of 0.6 — the truncation directly decides is_laravel.
 	t.Run("маркер на границе лимита", func(t *testing.T) {
 		set := evalSet(t, "rules:\n  - id: needle\n    target: html\n    regex: NEEDLE\n    weight: 0.6\n")
 		lim := DefaultLimits()
 		lim.MaxHTMLBytes = 100
 
-		// NEEDLE (6 байт) заканчивается ровно на байте с индексом 99.
+		// NEEDLE (6 bytes) ends exactly at the byte with index 99.
 		in := append([]byte(strings.Repeat(" ", 100-6)), []byte("NEEDLE")...)
 		res := set.EvaluateCtx(context.Background(), Page{HTML: in}, lim)
 		if len(res.Signals) != 1 || !res.IsLaravel(DefaultMinScore) {
 			t.Errorf("признак целиком в пределах лимита должен срабатывать: %+v", res)
 		}
 
-		// Хвостовой байт NEEDLE за пределами — совпадения нет.
+		// NEEDLE's trailing byte beyond the limit — no match.
 		out := append([]byte(strings.Repeat(" ", 101-6)), []byte("NEEDLE")...)
 		res = set.EvaluateCtx(context.Background(), Page{HTML: out}, lim)
 		if len(res.Signals) != 0 || res.Score != 0 || res.IsLaravel(DefaultMinScore) {

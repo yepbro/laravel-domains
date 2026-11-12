@@ -8,65 +8,66 @@ import (
 	"sync"
 )
 
-// Cookie — cookie со страницы (достаточно для пассивного анализа).
+// Cookie — a page cookie (sufficient for passive analysis).
 type Cookie struct {
 	Name  string
 	Value string
 }
 
-// Page — данные, по которым применяются правила: контент, cookies и заголовки.
+// Page — the data the rules are applied to: content, cookies and headers.
 type Page struct {
 	HTML    []byte
 	Cookies []Cookie
-	Headers map[string][]string // имена в канонической форме MIME-заголовка
+	Headers map[string][]string // names in canonical MIME header form
 }
 
-// Evidence — сработавшее правило и краткое свидетельство; формат колонки
-// laravel_findings.signals (jsonb, миграция 000001: [{rule, weight, evidence}]).
+// Evidence — a hit rule and a brief evidence snippet; the format of the
+// laravel_findings.signals column (jsonb, migration 000001: [{rule, weight, evidence}]).
 type Evidence struct {
 	Rule     string
 	Weight   float64
 	Evidence string
 }
 
-// Result — итог применения набора правил к странице.
+// Result — the outcome of applying a rule set to a page.
 type Result struct {
-	Score    float64 // noisy-OR по сработавшим правилам
+	Score    float64 // noisy-OR over the hit rules
 	Signals  []Evidence
 	VerMin   string
 	VerMax   string
-	Conflict bool // пересечение диапазонов версий пустое
-	// Partial — просмотр прерван по ctx (EvalTimeout/отмена): правила
-	// просмотрены не все, итог неполон. Потребитель, фиксирующий
-	// результат (воркер), не должен записывать его как полный (AN-09).
+	Conflict bool // the version range intersection is empty
+	// Partial — the scan was interrupted by ctx (EvalTimeout/cancellation):
+	// not all rules were scanned, the outcome is incomplete. A consumer
+	// persisting the result (a worker) must not record it as complete (AN-09).
 	Partial bool
 }
 
-// metaTagRe вырезает meta-теги из HTML. Закрывающий «>» ищется вне
-// кавычек значений атрибутов: ветка «не > и не кавычка» чередуется с
-// закавыченными кускками ("…" / '…'), поэтому content="a>b" не обрывает
-// тег посреди значения (AN-08). Незакрытая кавычка — тег не выделяется
-// вовсе, а не усечённым обрывом. Матчинг линеен (RE2, без бэктрекинга).
+// metaTagRe cuts the meta tags out of the HTML. The closing ">" is looked
+// up outside the quoted attribute values: the "not > and not a quote"
+// branch alternates with quoted chunks ("…" / '…'), so content="a>b" does
+// not terminate the tag in the middle of a value (AN-08). An unterminated
+// quote means no tag is extracted at all, rather than a truncated fragment.
+// Matching is linear (RE2, no backtracking).
 var metaTagRe = regexp.MustCompile(`(?is)<meta\b(?:[^>"']|"[^"]*"|'[^']*')*>`)
 
-// errPatternTooLong — паттерн не проходит по Limits.MaxPatternBytes (ТЗ §9:
-// ограничение недоверенного входа; правило молча пропускается, как и
-// некомпилируемое — валидация набора на этапе загрузки за T-068, движок
-// подстраховывается сам).
+// errPatternTooLong — the pattern fails the Limits.MaxPatternBytes bound
+// (spec §9: untrusted input is bounded; the rule is skipped silently, just
+// like a non-compilable one — set validation at load time is T-068, the
+// engine guards itself as well).
 var errPatternTooLong = errors.New("rules: паттерн длиннее лимита")
 
-// Evaluate применяет все правила набора к странице с ограничениями по
-// умолчанию (DefaultLimits, ТЗ §9). Основной вход анализатора.
+// Evaluate applies all the rules of the set to a page with the default
+// limits (DefaultLimits, spec §9). The analyzer's main entry point.
 func (s *Set) Evaluate(page Page) Result {
 	return s.EvaluateCtx(context.Background(), page, DefaultLimits())
 }
 
-// EvaluateCtx применяет правила с явным контекстом и ограничениями
-// (анализатор задаёт бюджет отмены shutdown/потребления, тесты — узкие
-// лимиты). Нулевые Limits целиком включают DefaultLimits; контекст
-// проверяется между правилами и между значениями cookie/заголовков; при
-// отмене просмотр прекращается, результат содержит сработавшее до отмены
-// и помечается Partial (полным его считать нельзя).
+// EvaluateCtx applies the rules with an explicit context and limits
+// (the analyzer sets the cancellation budget for shutdown/consumption,
+// tests use narrow limits). Zero Limits enable DefaultLimits wholesale;
+// the context is checked between rules and between cookie/header values;
+// on cancellation the scan stops, the result keeps what hit before the
+// cancellation and is marked Partial (it must not be treated as complete).
 func (s *Set) EvaluateCtx(ctx context.Context, page Page, lim Limits) Result {
 	if lim == (Limits{}) {
 		lim = DefaultLimits()
@@ -83,13 +84,13 @@ func (s *Set) EvaluateCtx(ctx context.Context, page Page, lim Limits) Result {
 	for _, r := range s.Rules {
 		if ctx.Err() != nil {
 			res.Partial = true
-			// Эквивалентный мутант (T-M12): продолжение цикла после
-			// отмены безрезультатно — matchRule отвергает каждое правило
-			// по тому же ctx на входе, новые сигналы не появляются, отмена
-			// контекста необратима; итоговый Result идентичен (различие
-			// только в лишних итерациях).
+			// An equivalent mutant (T-M12): continuing the loop after the
+			// cancellation is fruitless — matchRule rejects every rule on
+			// the same ctx at its input, no new signals appear, context
+			// cancellation is irreversible; the final Result is identical
+			// (the only difference is the extra iterations).
 			// mutator-disable-next-line loop/break
-			break // бюджет времени исчерпан — что нашли, то нашли (неполно)
+			break // the time budget is exhausted — what was found is kept (incomplete)
 		}
 		ev, ok := matchRule(ctx, r, page, lim)
 		if !ok {
@@ -103,20 +104,20 @@ func (s *Set) EvaluateCtx(ctx context.Context, page Page, lim Limits) Result {
 	return res
 }
 
-// compileCache кэширует скомпилированные паттерны (sync.Map — наборы
-// перезагружаются по SIGHUP без перезапуска, Evaluate зовут параллельные
-// горутины воркера): без кэша каждая страница платила бы компиляцию каждого
-// правила. Ошибки компиляции кэшируются тоже — некорректный паттерн не
-// перекомпилируется на каждом вызове. Время жизни кэша — текущий набор:
-// смена rules_version очищает его (resetCompileCache из Reloader.Reload),
-// записи ушедших паттернов и осевшие ошибки не накапливаются весь срок
-// жизни процесса.
+// compileCache caches compiled patterns (sync.Map — sets are reloaded on
+// SIGHUP without a restart, Evaluate is called by parallel worker
+// goroutines): without the cache every page would pay for compiling every
+// rule. Compilation errors are cached too — an invalid pattern is not
+// recompiled on every call. The cache lifetime is the current set: a
+// rules_version change clears it (resetCompileCache from Reloader.Reload),
+// so entries of removed patterns and settled errors do not accumulate for
+// the whole lifetime of the process.
 var compileCache sync.Map // string → compileResult
 
-// resetCompileCache очищает кэш компиляции при смене набора правил:
-// паттерны (и кэшированные ошибки компиляции) не живут дольше набора,
-// их породившего. Безопасна при параллельных Evaluate — конкурентный
-// compileCached по промаху просто перекомпилирует паттерн.
+// resetCompileCache clears the compilation cache when the rule set changes:
+// patterns (and cached compilation errors) do not outlive the set that
+// produced them. Safe under parallel Evaluate — a concurrent compileCached
+// on a miss simply recompiles the pattern.
 func resetCompileCache() {
 	compileCache.Clear()
 }
@@ -131,13 +132,13 @@ func compileCached(pattern string) (*regexp.Regexp, error) {
 		cr := v.(compileResult)
 		return cr.re, cr.err
 	}
-	re, err := regexp.Compile(pattern) // RE2: линейный матчинг, без бэктрекинга
+	re, err := regexp.Compile(pattern) // RE2: linear matching, no backtracking
 	compileCache.Store(pattern, compileResult{re, err})
 	return re, err
 }
 
-// ruleRegex компилирует паттерн правила с учётом лимитов; nil-regex —
-// правило точного совпадения (match) либо пропускаемое (лимит/ошибка).
+// ruleRegex compiles a rule pattern subject to the limits; a nil regex
+// means an exact-match rule (match) or a skippable one (limit/error).
 func ruleRegex(r Rule, lim Limits) (*regexp.Regexp, error) {
 	if r.Regex == "" {
 		return nil, nil
@@ -148,8 +149,8 @@ func ruleRegex(r Rule, lim Limits) (*regexp.Regexp, error) {
 	return compileCached(r.Regex)
 }
 
-// sortedHeaderNames — детерминированный порядок имён заголовков: обход map
-// в Go случайный, а свидетельства переанализа должны быть воспроизводимы.
+// sortedHeaderNames — a deterministic header name order: map iteration in
+// Go is random, while re-analysis evidence must be reproducible.
 func sortedHeaderNames(h map[string][]string) []string {
 	names := make([]string, 0, len(h))
 	for name := range h {
@@ -159,19 +160,19 @@ func sortedHeaderNames(h map[string][]string) []string {
 	return names
 }
 
-// matchRule ищет первое совпадение правила на странице: cookie имя/значение
-// и заголовки — точное совпадение (match) или regex; html/meta — только
-// regex (ТЗ 5.8: «регулярное выражение по HTML»). Возвращает свидетельство
-// сработавшего совпадения — оно строится из тех же обрезанных лимитами
-// строк, по которым шёл матчинг (работа над свидетельством ограничена
-// MaxValueBytes, ТЗ §9). Порядок обхода детерминирован (см. evidence.go).
+// matchRule looks up the first match of a rule on the page: cookie
+// name/value and headers use an exact match (match) or a regex; html/meta
+// use a regex only (spec 5.8: "a regular expression over HTML"). Returns
+// the evidence of the hit match — it is built from the same limit-capped
+// strings the matching ran on (evidence work is bounded by MaxValueBytes,
+// spec §9). The traversal order is deterministic (see evidence.go).
 func matchRule(ctx context.Context, r Rule, page Page, lim Limits) (string, bool) {
 	if ctx.Err() != nil {
-		return "", false // бюджет исчерпан — правило не смотрится
+		return "", false // the budget is exhausted — the rule is not examined
 	}
 	regex, err := ruleRegex(r, lim)
 	if err != nil {
-		return "", false // некорректные/раздутые выражения отсеиваются
+		return "", false // invalid/bloated expressions are filtered out
 	}
 	matches := func(s string) bool {
 		if r.Match != "" {
@@ -225,22 +226,22 @@ func matchRule(ctx context.Context, r Rule, page Page, lim Limits) (string, bool
 		}
 	case TargetHTML:
 		if regex != nil {
-			// вход ограничен до матчинга (ТЗ §9); Find возвращает первый
-			// фрагмент — он и есть свидетельство
+			// the input is capped before matching (spec §9); Find returns
+			// the first fragment — that fragment is the evidence
 			if m := regex.Find(lim.htmlCap(page.HTML)); m != nil {
 				return finalizeEvidence(string(m), lim), true
 			}
 		}
 	case TargetMeta:
 		if regex != nil {
-			// скользящий поиск meta-тегов без материализации всех совпадений:
-			// выход на первом сработавшем, каждый шаг двигает позицию за конец
-			// предыдущего тега
+			// sliding search for meta tags without materializing all
+			// matches: exit on the first hit, each step moves the position
+			// past the end of the previous tag
 			html := lim.htmlCap(page.HTML)
 			pos := 0
-			// Эквивалентный мутант (T-M12): итерация при pos == len(html)
-			// ищет по пустому срезу — FindIndex возвращает nil, цикл
-			// выходит тем же break'ом.
+			// An equivalent mutant (T-M12): the iteration at pos == len(html)
+			// searches an empty slice — FindIndex returns nil and the loop
+			// exits with the same break.
 			// mutator-disable-next-line expression/comparison
 			for pos < len(html) {
 				if ctx.Err() != nil {

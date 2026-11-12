@@ -10,11 +10,11 @@ func TestNoisyOR(t *testing.T) {
 		ws   []float64
 		want float64
 	}{
-		{nil, 0}, // ни одного сработавшего правила
+		{nil, 0}, // no rules hit at all
 		{[]float64{0.25}, 0.25},
 		{[]float64{0.25, 0.45}, 1 - 0.75*0.55},
 		{[]float64{0.2, 0.2, 0.2, 0.2, 0.2}, 1 - 0.8*0.8*0.8*0.8*0.8},
-		{[]float64{1, 0.2}, 1}, // вес 1 — уверенный признак закрывает score
+		{[]float64{1, 0.2}, 1}, // weight 1 — a confident sign closes the score
 		{[]float64{0.15, 0.15}, 1 - 0.85*0.85},
 	}
 	for _, c := range cases {
@@ -31,8 +31,9 @@ func diff(a, b float64) float64 {
 	return a - b
 }
 
-// scoreRulesCases — правила без цели/выражения: ScoreRules смотрит только на
-// weight и границы версий, матчинг здесь не участвует.
+// scoreRulesCases — rules without a target/expression: ScoreRules only
+// looks at the weight and the version boundaries, matching does not
+// participate here.
 func scoreRulesCases() []struct {
 	name           string
 	rules          []Rule
@@ -95,16 +96,17 @@ func scoreRulesCases() []struct {
 			verMin: "9.19",
 		},
 		{
-			// ver_min «0» — первая же граница фиксируется даже с нулевым
-			// компонентом: сравнение с ещё пустым аккумулятором не должно
-			// её отбрасывать
+			// ver_min "0" — the first boundary is fixed even with a zero
+			// component: the comparison against the still empty accumulator
+			// must not discard it
 			name:   "ver_min «0» — нижняя граница фиксируется",
 			rules:  []Rule{{ID: "a", Weight: 0.3, VerMin: "0"}},
 			verMin: "0",
 		},
 		{
-			// ver_max с отрицательным компонентом и без ver_min: конфликта
-			// нет — пустая левая граница в сравнение не подставляется
+			// ver_max with a negative component and no ver_min: no
+			// conflict — the empty left boundary is not substituted into
+			// the comparison
 			name:   "ver_max без ver_min — конфликта нет",
 			rules:  []Rule{{ID: "a", Weight: 0.3, VerMax: "-1"}},
 			verMax: "-1",
@@ -112,8 +114,8 @@ func scoreRulesCases() []struct {
 	}
 }
 
-// В случаях с конфликтом verMin/verMax в таблице — ожидаемые границы ДО
-// сброса: ScoreRules обязан их обнулить.
+// In the conflict cases the verMin/verMax in the table are the expected
+// boundaries BEFORE the reset: ScoreRules must zero them.
 func TestScoreRules(t *testing.T) {
 	for _, c := range scoreRulesCases() {
 		weights := make([]float64, len(c.rules))
@@ -149,7 +151,7 @@ func TestIsLaravel(t *testing.T) {
 		score, minScore float64
 		want            bool
 	}{
-		{"ровно порог", 0.6, 0.6, true}, // сравнение нестрогое: score >= порога
+		{"ровно порог", 0.6, 0.6, true}, // the comparison is non-strict: score >= the threshold
 		{"ниже порога", 0.59, 0.6, false},
 		{"выше порога", 0.61, 0.6, true},
 		{"порог из конфига", 0.75, 0.75, true},
@@ -177,15 +179,15 @@ func TestVersionParse(t *testing.T) {
 		{"   ", nil},
 		{"9.19", version{9, 19}},
 		{"10", version{10}},
-		{" 9.19 ", version{9, 19}}, // пробелы вокруг и внутри компонент
+		{" 9.19 ", version{9, 19}}, // whitespace around and inside the components
 		{"9. 19", version{9, 19}},
 		{"9.x", version{9, inf}},
 		{"9.*", version{9, inf}},
 		{"8.83.27", version{8, 83, 27}},
-		{"lts", nil},  // не число
-		{"9..1", nil}, // пустой компонент
+		{"lts", nil},  // not a number
+		{"9..1", nil}, // an empty component
 		{"9.19.1.2.x", version{9, 19, 1, 2, inf}},
-		{"9.x.1", version{9, inf, 1}}, // x не в последней компоненте: хвост разбирается
+		{"9.x.1", version{9, inf, 1}}, // x not in the last component: the tail is parsed
 	}
 	for _, c := range cases {
 		if got := parseVersion(c.in); !versionEq(got, c.want) {
@@ -214,17 +216,17 @@ func TestVersionCompare(t *testing.T) {
 		a, b string
 		less bool
 	}{
-		{"9.19", "11", true}, // числовое сравнение, не строковое
+		{"9.19", "11", true}, // numeric comparison, not string comparison
 		{"11", "9.19", false},
-		{"9.19", "9.x", true}, // 9.19 < всё девятое
-		{"9.x", "10", true},   // бесконечность только в последнем компоненте
-		{"9", "9.1", true},    // отсутствующий компонент = 0
+		{"9.19", "9.x", true}, // 9.19 < everything in the nines
+		{"9.x", "10", true},   // infinity only in the last component
+		{"9", "9.1", true},    // a missing component = 0
 		{"9.19", "9.19", false},
 		{"9.19", "9.19.1", true},  // 9.19 = 9.19.0 < 9.19.1
-		{"9.19.1", "9.19", false}, // и наоборот
-		{"10.x", "10.1", false},   // 10.x — до конца мажорной ветки
+		{"9.19.1", "9.19", false}, // and vice versa
+		{"10.x", "10.1", false},   // 10.x — until the end of the major branch
 		{"10.1", "10.x", true},
-		{"9.-1", "9", true}, // отрицательный хвост приёмника виден только полным перебором компонент
+		{"9.-1", "9", true}, // the negative tail of the receiver is only visible to a full scan of the components
 	}
 	for _, c := range cases {
 		va, vb := parseVersion(c.a), parseVersion(c.b)
@@ -237,27 +239,28 @@ func TestVersionCompare(t *testing.T) {
 	}
 }
 
-// TestCompareVersions — экспортированное сравнение (агрегация
-// laravel_domains, T-072): порядок числовых компонент, эквивалентность
-// разной записи, неупорядоченность пустых/некорректных строк.
+// TestCompareVersions — the exported comparison (the laravel_domains
+// aggregation, T-072): the order of the numeric components, the
+// equivalence of different spellings, the unorderedness of empty/invalid
+// strings.
 func TestCompareVersions(t *testing.T) {
 	cases := []struct {
 		a, b string
 		want int
 	}{
-		{"9.19", "11", -1}, // числовое, а не текстовое: текстовый MIN взял бы «10»/«11» раньше «5.3»
+		{"9.19", "11", -1}, // numeric, not textual: a textual MIN would take "10"/"11" before "5.3"
 		{"10", "5.3", 1},
 		{"5.3", "10", -1},
 		{"9.x", "11", -1},     // 9.x = 9.∞ < 10 < 11
-		{"11", "9.x", 1},      // верхняя граница max(9.x, 11) = 11
-		{"9.19", "9.19.0", 0}, // эквивалентны в разной записи
+		{"11", "9.x", 1},      // the upper bound max(9.x, 11) = 11
+		{"9.19", "9.19.0", 0}, // equivalent in different spellings
 		{"9.19.0", "9.19", 0},
 		{"7.x", "7.x", 0},
 		{"5.3", "5.3", 0},
-		{"", "9.19", 0}, // пустая — нет данных
+		{"", "9.19", 0}, // empty — no data
 		{"9.19", "", 0},
 		{"", "", 0},
-		{"abc", "9.19", 0}, // некорректная — нет данных
+		{"abc", "9.19", 0}, // invalid — no data
 		{"9.19", "9,19", 0},
 	}
 	for _, c := range cases {
@@ -285,20 +288,20 @@ func TestResultContains(t *testing.T) {
 	if res2.Contains("11", "12") {
 		t.Error("[9.19,11.x] не должен включать 12")
 	}
-	res3 := Result{} // неограниченный диапазон включает всё
+	res3 := Result{} // an unbounded range includes everything
 	if !res3.Contains("5", "12") {
 		t.Error("(−∞,∞) должен включать любой диапазон")
 	}
 	if res3.Contains("lts", "") {
 		t.Error("некорректное ожидание не может входить ни в какой диапазон")
 	}
-	// Отрицательная ожидаемая граница в неограниченном снизу диапазоне:
-	// отсутствующая нижняя граница результата не сравнивается с ожиданием
-	// (lo == nil не подставляется в less).
+	// A negative expected boundary in a range unbounded from below: the
+	// result's missing lower boundary is not compared against the
+	// expectation (lo == nil is not substituted into less).
 	if !res3.Contains("-1", "") {
 		t.Error("(−∞,∞) включает любое корректное ожидание, включая «-1»")
 	}
-	// Некорректное ожидание сверху — не входит ни в какой диапазон.
+	// An invalid upper expectation — does not fit any range.
 	if res3.Contains("", "lts") {
 		t.Error("некорректное ожидание сверху не может входить ни в какой диапазон")
 	}

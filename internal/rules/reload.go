@@ -1,8 +1,8 @@
-// Reloader — перезагрузка набора правил Laravel по SIGHUP (ТЗ 5.8):
-// «правила перезагружаются без перезапуска». Сигнал ловит каркас
-// internal/service (Options.OnSIGHUP, make rules-reload) и вызывает
-// HandleSIGHUP; сам Reloader от сигналов не зависит — точка входа
-// перезагрузки инъектируется сервисом analyzer (T-071).
+// Reloader — reloading the Laravel rule set on SIGHUP (spec 5.8):
+// "the rules are reloaded without a restart". The signal is caught by the
+// internal/service framework (Options.OnSIGHUP, make rules-reload), which
+// calls HandleSIGHUP; the Reloader itself is signal-agnostic — the reload
+// entry point is injected by the analyzer service (T-071).
 
 package rules
 
@@ -11,20 +11,20 @@ import (
 	"sync"
 )
 
-// subBuf — ёмкость канала подписки: подписчик получает самый свежий набор;
-// если он не забрал предыдущий, тот заменяется (медленный потребитель
-// всё равно читает актуальное через Set).
+// subBuf — the subscription channel capacity: a subscriber receives the
+// freshest set; if it has not taken the previous one, that one is replaced
+// (a slow consumer still reads the current set via Set).
 const subBuf = 1
 
-// Reloader хранит актуальный набор правил из каталога и оповещает
-// подписчиков о смене. Безопасен для одновременного использования:
-// потребители (воркеры analyzer) читают снапшот через Set, перезагрузка
-// заменяет его целиком — правила внутри Set не мутируют.
+// Reloader holds the current rule set from the directory and notifies
+// subscribers about changes. Safe for concurrent use: consumers (analyzer
+// workers) read the snapshot via Set, a reload replaces it wholesale —
+// the rules inside a Set never mutate.
 type Reloader struct {
 	dir    string
 	logger *slog.Logger
-	// load — шов для тестов (ошибки/подмены без файловой системы);
-	// продакшн — LoadDir.
+	// load — a seam for tests (errors/substitutions without a file
+	// system); production — LoadDir.
 	load func(dir string) (*Set, error)
 
 	mu   sync.Mutex
@@ -32,9 +32,9 @@ type Reloader struct {
 	subs map[chan *Set]struct{}
 }
 
-// NewReloader загружает начальный набор из dir. Ошибка начальной загрузки
-// возвращается вызывающему: сервис без валидного набора правил не стартует
-// (иначе analyzer молча не находил бы Laravel).
+// NewReloader loads the initial set from dir. An initial load error is
+// returned to the caller: a service without a valid rule set does not
+// start (otherwise the analyzer would silently miss Laravel).
 func NewReloader(dir string, logger *slog.Logger) (*Reloader, error) {
 	r := &Reloader{
 		dir:    dir,
@@ -54,19 +54,19 @@ func NewReloader(dir string, logger *slog.Logger) (*Reloader, error) {
 	return r, nil
 }
 
-// Set — текущий снапшот набора (неизменяем; ссылку можно держать без
-// блокировок и после перезагрузки).
+// Set — the current snapshot of the set (immutable; the reference can be
+// held without locks, including after a reload).
 func (r *Reloader) Set() *Set {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.set
 }
 
-// Reload перечитывает каталог. Ошибка загрузки (нет каталога, битый YAML,
-// невалидный набор) НЕ меняет текущий набор и не останавливает сервис —
-// продолжают работать прежние правила (Warn в лог); ошибка возвращается
-// для тестов и вызывающих, которым она нужна. Успешная перезагрузка с тем
-// же rules_version — no-op: набор поведенчески не изменился.
+// Reload re-reads the directory. A load error (no directory, broken YAML,
+// invalid set) does NOT change the current set and does not stop the
+// service — the previous rules keep working (a Warn in the log); the error
+// is returned for tests and callers that need it. A successful reload with
+// the same rules_version is a no-op: the set has not changed behaviorally.
 func (r *Reloader) Reload() error {
 	set, err := r.load(r.dir)
 	if err != nil {
@@ -89,9 +89,10 @@ func (r *Reloader) Reload() error {
 	}
 	r.mu.Unlock()
 
-	// Кэш компиляции живёт вместе с набором: чистится по смене
-	// rules_version — записи паттернов ушедших правил (и осевшие
-	// ошибки компиляции битых редакций) не копятся процессом.
+	// The compilation cache lives together with the set: it is cleared on a
+	// rules_version change — entries of removed rules' patterns (and the
+	// settled compilation errors of broken revisions) do not accumulate in
+	// the process.
 	resetCompileCache()
 
 	r.logger.Info("набор правил перезагружен",
@@ -103,17 +104,18 @@ func (r *Reloader) Reload() error {
 	return nil
 }
 
-// HandleSIGHUP — точка входа для service.Options.OnSIGHUP: перезагрузка
-// по сигналу без рестарта сервиса. Ошибка уже залогирована Reload'ом —
-// сигнал не источник ошибок, каркас продолжает работу.
+// HandleSIGHUP — the entry point for service.Options.OnSIGHUP: a reload on
+// signal without a service restart. The error is already logged by Reload —
+// the signal is not an error source, the framework keeps running.
 func (r *Reloader) HandleSIGHUP() {
 	_ = r.Reload()
 }
 
-// Subscribe — подписка на смену набора (например, планировщик переанализа
-// T-074 запускает обход при смене rules_version). Канал буферизован: при
-// пропуске уведомления актуальный набор всё равно доступен через Set.
-// cancel отписывает; после его возврата канал больше не получает сообщений.
+// Subscribe — a subscription to set changes (for example, the re-analysis
+// scheduler of T-074 starts a crawl when rules_version changes). The
+// channel is buffered: if a notification is missed, the current set is
+// still available via Set. cancel unsubscribes; after it returns, the
+// channel no longer receives messages.
 func (r *Reloader) Subscribe() (<-chan *Set, func()) {
 	ch := make(chan *Set, subBuf)
 	r.mu.Lock()
@@ -127,8 +129,9 @@ func (r *Reloader) Subscribe() (<-chan *Set, func()) {
 	return ch, cancel
 }
 
-// notify доставляет набор подписчику без блокировки: канал полон —
-// подписчик ещё не забрал предыдущее уведомление, заменяем его свежим.
+// notify delivers the set to a subscriber without blocking: if the channel
+// is full, the subscriber has not taken the previous notification yet and
+// it is replaced with the fresh one.
 func notify(ch chan *Set, set *Set) {
 	select {
 	case ch <- set:

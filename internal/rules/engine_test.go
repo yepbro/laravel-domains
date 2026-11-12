@@ -8,8 +8,8 @@ import (
 	"unicode/utf8"
 )
 
-// evalSet строит набор из yaml-тела правила (валидация LoadDir не нужна
-// движку — тестируем матчинг, а не загрузку).
+// evalSet builds a set from a rule yaml body (the engine does not need
+// LoadDir validation — we test matching, not loading).
 func evalSet(t *testing.T, body string) *Set {
 	t.Helper()
 	set, err := LoadDir(writeRules(t, body))
@@ -70,7 +70,7 @@ rules:
 	for _, s := range res.Signals {
 		byRule[s.Rule] = s
 	}
-	// свидетельства по целям
+	// evidence per target
 	for rule, ev := range map[string]string{
 		"cookie_xsrf_token":        "cookie XSRF-TOKEN",
 		"cookie_encrypted_payload": "cookie XSRF-TOKEN=eyJpdiI6ZmFrZQ==",
@@ -89,9 +89,9 @@ rules:
 }
 
 func TestEvaluateHeaderOrderDeterministic(t *testing.T) {
-	// правило матчит любое имя заголовка: обход map случайный, движок
-	// обязан выбирать детерминированно (сортировка имён) — переанализ
-	// воспроизводим
+	// the rule matches any header name: map iteration is random, the engine
+	// must choose deterministically (name sorting) — re-analysis is
+	// reproducible
 	set := evalSet(t, `
 rules:
   - id: any_header
@@ -118,9 +118,9 @@ rules:
 	}
 }
 
-// countingCtx отчитывается ошибкой контекста после N проверок —
-// детерминированная отмена посреди перебора правил (EvalTimeout=0,
-// чтобы EvaluateCtx не оборачивал контекст таймером).
+// countingCtx reports a context error after N checks — a deterministic
+// cancellation in the middle of the rule scan (EvalTimeout=0, so that
+// EvaluateCtx does not wrap the context in a timer).
 type countingCtx struct{ left int }
 
 func (c *countingCtx) Deadline() (time.Time, bool) { return time.Time{}, false }
@@ -151,11 +151,12 @@ rules:
     weight: 0.1
 `)
 	lim := DefaultLimits()
-	lim.EvalTimeout = 0 // без обёртки таймера: Err() зовётся напрямую
+	lim.EvalTimeout = 0 // no timer wrapper: Err() is called directly
 
-	// бюджет: r1 и r2 проходят по две проверки ctx (цикл EvaluateCtx +
-	// вход matchRule), на r3 — отмена; сработавшие до отмены сохранены
-	// и помечены Partial (полным итог считать нельзя, AN-09)
+	// budget: r1 and r2 each pass two ctx checks (the EvaluateCtx loop +
+	// the matchRule entry), r3 gets the cancellation; what hit before the
+	// cancellation is kept and marked Partial (the outcome must not be
+	// treated as complete, AN-09)
 	res := set.EvaluateCtx(&countingCtx{left: 4}, Page{HTML: []byte("MARK MARK MARK")}, lim)
 	if len(res.Signals) != 2 || res.Signals[1].Rule != "r2" {
 		t.Fatalf("ожидались r1,r2 до отмены, получено %+v", res.Signals)
@@ -188,7 +189,7 @@ rules:
 }
 
 func TestEvaluateZeroLimitsMeansDefault(t *testing.T) {
-	// нулевые Limits целиком — DefaultLimits: совпадение за 2 MiB невидимо
+	// zero Limits as a whole — DefaultLimits: a match beyond 2 MiB is invisible
 	set := evalSet(t, `
 rules:
   - id: deep
@@ -203,13 +204,15 @@ rules:
 	}
 }
 
-// TestEvaluateCtxNanoBudget — положительный EvalTimeout любого размера
-// (здесь 1 нс) обязан включать обёртку WithTimeout: к моменту расчёта
-// задержки в WithDeadline дедлайн уже прошёл (между time.Now().Add и
-// time.Until — сотни нс), контекст отменяется синхронно (ветка dur <= 0),
-// и просмотр прерывается с Partial на первой же проверке — детерминированно,
-// без гонки с таймером. Мутант «> 1» пропускает обёртку: бюджет 1 нс
-// трактовался бы как отключённый, просмотр дошёл бы до конца без Partial.
+// TestEvaluateCtxNanoBudget — a positive EvalTimeout of any size (here
+// 1 ns) must enable the WithTimeout wrapper: by the time the delay is
+// computed in WithDeadline the deadline has already passed (between
+// time.Now().Add and time.Until — hundreds of ns), the context is
+// canceled synchronously (the dur <= 0 branch), and the scan is
+// interrupted with Partial on the very first check — deterministically,
+// without a race with the timer. The "> 1" mutant skips the wrapper: a
+// 1 ns budget would be treated as disabled, the scan would run to the end
+// without Partial.
 func TestEvaluateCtxNanoBudget(t *testing.T) {
 	set := &Set{Rules: []Rule{
 		{ID: "r1", Target: TargetHTML, Regex: "MARK", Weight: 0.1},
@@ -217,18 +220,19 @@ func TestEvaluateCtxNanoBudget(t *testing.T) {
 		{ID: "r3", Target: TargetHTML, Regex: "MARK", Weight: 0.1},
 	}}
 	lim := DefaultLimits()
-	lim.EvalTimeout = 1 // нс
+	lim.EvalTimeout = 1 // ns
 	res := set.EvaluateCtx(context.Background(), Page{HTML: []byte("MARK")}, lim)
 	if !res.Partial {
 		t.Error("бюджет 1 нс должен прерывать просмотр (Partial)")
 	}
 }
 
-// TestMatchRuleCtxStopsMidScan — отмена между элементами: бюджет ctx
-// проверяется и на входе matchRule, и в каждом переборе (куки, имена и
-// значения заголовков, meta-теги); совпадающий элемент ПОСЛЕ исчерпания
-// бюджета не смотрится. countingCtx: вход + первый элемент исчерпывают
-// запас, второй (совпадающий) уже под отменой.
+// TestMatchRuleCtxStopsMidScan — cancellation between elements: the ctx
+// budget is checked both at the matchRule entry and in every scan (cookies,
+// header names and values, meta tags); a matching element AFTER the budget
+// is exhausted is not examined. countingCtx: the entry + the first element
+// exhaust the stock, the second (matching) one is already under
+// cancellation.
 func TestMatchRuleCtxStopsMidScan(t *testing.T) {
 	t.Run("cookie_name", func(t *testing.T) {
 		page := Page{Cookies: []Cookie{{Name: "a"}, {Name: "hit"}}}
@@ -262,10 +266,11 @@ func TestMatchRuleCtxStopsMidScan(t *testing.T) {
 	})
 }
 
-// TestMatchRuleMetaAdvance — скользящий поиск meta сдвигает позицию за
-// конец просмотренного тега: третий тег находится и становится
-// свидетельством. Мутант «pos = loc[1]» (без накопления смещения)
-// зацикливается на первых двух тегах — тест умирает по таймауту мутанта.
+// TestMatchRuleMetaAdvance — the sliding meta search moves the position
+// past the end of the scanned tag: the third tag is found and becomes the
+// evidence. The "pos = loc[1]" mutant (without accumulating the offset)
+// loops over the first two tags — the test kills it by the mutant's
+// timeout.
 func TestMatchRuleMetaAdvance(t *testing.T) {
 	page := Page{HTML: []byte(`xx<meta a="1"><meta b="1"><meta c="1">`)}
 	ev, ok := matchRule(bgCtx(), Rule{Target: TargetMeta, Regex: `c="1"`}, page, DefaultLimits())
@@ -307,12 +312,12 @@ rules:
     regex: '(?s)CTRL-.+'
     weight: 0.1
 `)
-	// длинный ASCII-фрагмент: обрезка 64 байта + «…»
+	// a long ASCII fragment: truncation to 64 bytes + "…"
 	long := []byte("LONG-" + strings.Repeat("a", 300))
-	// многоугольный фрагмент: обрезка не рвёт руну
+	// a multibyte fragment: truncation does not split a rune
 	utf8Frag := []byte("ЗДЕСЬ-" + strings.Repeat("тест", 100))
-	// управляющие символы и битый UTF-8 sanitируются: (?s).+ захватывает
-	// всё, включая \x00, ESC и невалидный байт \xff
+	// control characters and broken UTF-8 are sanitized: (?s).+ captures
+	// everything, including \x00, ESC and the invalid byte \xff
 	ctrl := []byte("CTRL-a\x00b\x1bc\xffd")
 
 	lim := DefaultLimits()
@@ -335,7 +340,7 @@ rules:
 		}
 	}
 
-	// ровно 64 байта — без многоточия
+	// exactly 64 bytes — no ellipsis
 	res := set.EvaluateCtx(context.Background(), Page{HTML: []byte("LONG-" + strings.Repeat("a", 59))}, lim)
 	if ev := res.Signals[0].Evidence; len(ev) != 64 || strings.HasSuffix(ev, "…") {
 		t.Errorf("свидетельство ровно в лимит должно оставаться целиком: %q (%d)", ev, len(ev))
@@ -343,9 +348,9 @@ rules:
 }
 
 func TestEvaluateMultibyteRuneNotSplit(t *testing.T) {
-	// граница обрезки приходится на середину многобайтной руны
+	// the truncation boundary falls in the middle of a multibyte rune
 	s := strings.Repeat("тест", 100)
-	got := truncateUTF8(s, 5) // «те» (2+2 байта) + середина «с»
+	got := truncateUTF8(s, 5) // 5 bytes = "te" (2+2) + the first byte of the next rune
 	if got != "те" {
 		t.Errorf("truncateUTF8 рвёт руну: %q", got)
 	}
@@ -358,10 +363,10 @@ func TestEvaluateMultibyteRuneNotSplit(t *testing.T) {
 }
 
 func TestEvaluateReDoSHugeInput(t *testing.T) {
-	// выражение, катастрофическое в PCRE ((a+)+b против a…a), в RE2
-	// линейно; вдобавок вход обрезан лимитом — за пределами 2 MiB совпадения
-	// нет. Тест фиксирует свойство «движок завершается за конечное время»
-	// (зависание уронит тест по таймауту пакета).
+	// an expression catastrophic in PCRE ((a+)+b against a…a) is linear in
+	// RE2; in addition the input is capped by the limit — beyond 2 MiB
+	// there is no match. The test pins the property "the engine terminates
+	// in finite time" (hanging would kill the test by the package timeout).
 	set := evalSet(t, `
 rules:
   - id: redos
@@ -388,7 +393,7 @@ rules:
 }
 
 func TestDefaultLimitsGuard(t *testing.T) {
-	// защитные значения — контракт ТЗ §9; смена должна быть осознанной
+	// the guard values are the spec §9 contract; changing them must be deliberate
 	lim := DefaultLimits()
 	if lim.MaxHTMLBytes != 2<<20 || lim.MaxValueBytes != 64<<10 || lim.MaxPatternBytes != 4<<10 {
 		t.Errorf("размерные лимиты изменились: %+v", lim)

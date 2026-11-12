@@ -1,71 +1,74 @@
-// Ограничения движка правил на недоверенном контенте (ТЗ §9: «содержимое
-// страниц считается недоверенным: все парсеры имеют ограничения размера и
-// времени»). Формат входов движка ограничен ещё на этапах загрузки и
-// рендера (HTTP: предел тела и заголовков; хранилище: content.max_store_bytes,
-// ТЗ 3.2 — рекомендация 1–2 МБ) — лимиты ниже это защита в глубину:
-// движок обязан завершаться за конечное время на любом входе.
+// Engine limits on untrusted content (spec §9: "page content is considered
+// untrusted: all parsers have size and time limits"). The format of the
+// engine inputs is bounded already at the fetch and render stages (HTTP:
+// body and header limits; storage: content.max_store_bytes, spec 3.2 —
+// the 1–2 MB recommendation) — the limits below are defense in depth:
+// the engine must terminate in finite time on any input.
 //
-// Почему лимиты выглядят так (ReDoS-решения):
+// Why the limits look this way (the ReDoS decisions):
 //
-//   - Go regexp — реализация RE2: матчинг линеен по длине входа и не имеет
-//     катастрофического бэктрекинга, «зависающее» выражение вида
-//     (a+)+$ против aaaa…b здесь невозможно. Остаются два вектора:
-//     раздутый вход (линейное время всё равно растёт) и раздутый паттерн
-//     (компиляция и число состояний). Оба закрываются лимитами размера.
+//   - Go regexp is an RE2 implementation: matching is linear in the input
+//     length and has no catastrophic backtracking; a "hanging" expression
+//     like (a+)+$ against aaaa…b is impossible here. Two vectors remain:
+//     a bloated input (linear time still grows) and a bloated pattern
+//     (compilation and the number of states). Both are closed by size
+//     limits.
 //
-//   - MaxHTMLBytes — предел просматриваемого HTML/DOM. Признаки Laravel
-//     (meta csrf-token, пути сборки vite/mix, data-page, wire:*) живут в
-//     head-части документа — первых десятках килобайт; хвост сверх лимита
-//     обрезается до матчинга. Значение по умолчанию 2 MiB — верхняя граница
-//     рекомендации ТЗ по размеру контента (1–2 МБ): всё, что хранилище
-//     укладывает по конфигу, движок обычно видит целиком.
+//   - MaxHTMLBytes — the bound on the HTML/DOM being scanned. Laravel
+//     signs (meta csrf-token, vite/mix build paths, data-page, wire:*)
+//     live in the head part of the document — the first dozens of
+//     kilobytes; the tail beyond the limit is capped before matching.
+//     The default of 2 MiB is the upper bound of the spec's content size
+//     recommendation (1–2 MB): everything storage keeps per config is
+//     usually seen by the engine in full.
 //
-//   - MaxValueBytes — предел одного значения cookie/заголовка. Значения
-//     Laravel (шифрованные куки) — единицы килобайт; все правила по
-//     значениям якорены по началу строки (^…), обрезка для них невидима.
-//     Плата за лимит: правило с якорем в конце ($…) на значении длиннее
-//     лимита не сработает — сознательный размен полноты на гарантию времени.
+//   - MaxValueBytes — the bound on a single cookie/header value. Laravel
+//     values (encrypted cookies) are a few kilobytes; all value rules are
+//     anchored to the start of the string (^…), so truncation is invisible
+//     to them. The price of the limit: a rule anchored to the end ($…)
+//     will not hit a value longer than the limit — a deliberate trade of
+//     completeness for the time guarantee.
 //
-//   - MaxPatternBytes — предел длины regex-паттерна одного правила: правила
-//     пишутся человеком, килобайтные паттерны — ошибка или злоупотребление;
-//     компиляция RE2 раздутого паттерна может стоить на порядки дороже
-//     самого матчинга.
+//   - MaxPatternBytes — the bound on the length of a single rule's regex
+//     pattern: rules are written by humans, kilobyte-scale patterns are a
+//     mistake or abuse; compiling a bloated pattern in RE2 can cost orders
+//     of magnitude more than the matching itself.
 //
-//   - EvalTimeout — общий бюджет на применение набора правил к странице.
-//     Контекст проверяется между правилами и между значениями cookie/
-//     заголовков (одиночный матч прервать нельзя, но он линеен по уже
-//     ограниченному входу), поэтому отмена срабатывает за время одного
-//     матча: микросекунды на реальных страницах.
+//   - EvalTimeout — the overall budget for applying a rule set to a page.
+//     The context is checked between rules and between cookie/header
+//     values (a single match cannot be interrupted, but it is linear in
+//     the already capped input), so cancellation takes effect within one
+//     match: microseconds on real pages.
 package rules
 
 import "time"
 
-// Limits — ограничения одного вызова EvaluateCtx. Нулевое значение (все
-// поля нулевые) включает DefaultLimits: забыть лимиты нельзя — защита по
-// умолчанию. Отдельное поле ≤ 0 отключает соответствующий лимит (кроме
-// MaxSnippetBytes — свидетельство всегда краткое, 64 байта), это инструмент
-// тестов и узких сценариев.
+// Limits — the limits of a single EvaluateCtx call. The zero value (all
+// fields zero) enables DefaultLimits: limits cannot be forgotten —
+// protection by default. An individual field ≤ 0 disables the
+// corresponding limit (except MaxSnippetBytes — the evidence is always
+// brief, 64 bytes); that is a tool for tests and narrow scenarios.
 type Limits struct {
-	MaxHTMLBytes    int           // предел просматриваемого HTML/DOM
-	MaxValueBytes   int           // предел одного значения cookie/заголовка
-	MaxPatternBytes int           // предел длины regex-паттерна правила
-	MaxSnippetBytes int           // предел свидетельства (Evidence) в байтах
-	EvalTimeout     time.Duration // бюджет времени на всю страницу
+	MaxHTMLBytes    int           // the bound on the HTML/DOM being scanned
+	MaxValueBytes   int           // the bound on a single cookie/header value
+	MaxPatternBytes int           // the bound on a rule's regex pattern length
+	MaxSnippetBytes int           // the evidence (Evidence) bound in bytes
+	EvalTimeout     time.Duration // the time budget for the whole page
 }
 
-// DefaultLimits — значения по умолчанию (см. обоснования выше).
+// DefaultLimits — the default values (see the rationale above).
 func DefaultLimits() Limits {
 	return Limits{
 		MaxHTMLBytes:    2 << 20,  // 2 MiB
 		MaxValueBytes:   64 << 10, // 64 KiB
 		MaxPatternBytes: 4 << 10,  // 4 KiB
-		MaxSnippetBytes: 64,       // краткое свидетельство, обрезка + «…»
+		MaxSnippetBytes: 64,       // brief evidence, truncation + "…"
 		EvalTimeout:     5 * time.Second,
 	}
 }
 
-// htmlCap применяет MaxHTMLBytes (вызов на каждом правиле — дёшево, защита
-// работает и при прямом вызове matchRule без EvaluateCtx).
+// htmlCap applies MaxHTMLBytes (called per rule — cheap; the protection
+// also works when matchRule is called directly without EvaluateCtx).
 func (l Limits) htmlCap(b []byte) []byte {
 	if l.MaxHTMLBytes > 0 && len(b) > l.MaxHTMLBytes {
 		return b[:l.MaxHTMLBytes]
@@ -73,7 +76,7 @@ func (l Limits) htmlCap(b []byte) []byte {
 	return b
 }
 
-// valueCap применяет MaxValueBytes к строковому значению (cookie/заголовок).
+// valueCap applies MaxValueBytes to a string value (cookie/header).
 func (l Limits) valueCap(s string) string {
 	if l.MaxValueBytes > 0 && len(s) > l.MaxValueBytes {
 		return s[:l.MaxValueBytes]
@@ -81,12 +84,12 @@ func (l Limits) valueCap(s string) string {
 	return s
 }
 
-// patternAllowed — проходит ли паттерн по MaxPatternBytes.
+// patternAllowed — whether the pattern passes the MaxPatternBytes bound.
 func (l Limits) patternAllowed(pattern string) bool {
 	return l.MaxPatternBytes <= 0 || len(pattern) <= l.MaxPatternBytes
 }
 
-// snippetCap — предел свидетельства (64 по умолчанию при нулевом поле).
+// snippetCap — the evidence bound (64 by default when the field is zero).
 func (l Limits) snippetCap() int {
 	if l.MaxSnippetBytes > 0 {
 		return l.MaxSnippetBytes

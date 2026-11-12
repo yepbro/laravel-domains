@@ -1,9 +1,9 @@
-// Свидетельство (evidence) срабатывания правила — краткий фрагмент «что
-// именно найдено» для jsonb laravel_findings.signals (миграция 000001:
-// [{rule, weight, evidence}, …]). Требования: краткость (обрезка до N байт),
-// читаемость одной строкой и безопасность хранения — контент недоверенный
-// (ТЗ §9), свидетельство не должно тащить за собой сырые громоздкие куски,
-// управляющие символы и невалидный UTF-8.
+// Rule hit evidence — a brief fragment of "what exactly was found" for the
+// jsonb laravel_findings.signals (migration 000001:
+// [{rule, weight, evidence}, …]). Requirements: brevity (truncated to N
+// bytes), single-line readability and storage safety — the content is
+// untrusted (spec §9), the evidence must not drag along raw bulky chunks,
+// control characters or invalid UTF-8.
 package rules
 
 import (
@@ -11,25 +11,26 @@ import (
 	"unicode/utf8"
 )
 
-// evidenceNameBytes — лимит имени cookie/заголовка внутри свидетельства:
-// чтобы враждебно длинное имя не вытеснило значение из окна обрезки.
-// Применяется ко всем evidence-формам с именем — name-only тоже
-// (docs/analyzer.md «Свидетельства»).
+// evidenceNameBytes — the limit for a cookie/header name inside the
+// evidence: so that a hostilely long name does not push the value out of
+// the truncation window. Applied to all evidence forms carrying a name —
+// name-only as well (docs/analyzer.md "Evidence").
 const evidenceNameBytes = 32
 
-// evidence-форматы по целям (стабильный контракт, T-070+ пишет их в jsonb):
+// evidence formats per target (a stable contract, T-070+ writes them to
+// jsonb):
 //
 //	cookie_name   → "cookie XSRF-TOKEN"
 //	cookie_value  → "cookie laravel_session=eyJpdiI6…"
 //	header_name   → "header X-Powered-By"
 //	header_value  → "header X-Powered-By: PHP/8.2"
-//	html          → matched-фрагмент регулярного выражения
-//	meta          → весь meta-тег (обрезается лимитом свидетельства)
+//	html          → the matched fragment of the regular expression
+//	meta          → the whole meta tag (truncated by the evidence limit)
 //
-// Свидетельство одно на срабатывание правила — первое совпадение по
-// детерминированному порядку обхода (cookies в порядке записи; имена
-// заголовков сортируются — обход map в Go недетерминирован, а результат
-// переанализа обязан быть воспроизводимым).
+// There is one evidence per rule hit — the first match in the deterministic
+// traversal order (cookies in write order; header names are sorted — map
+// iteration in Go is non-deterministic, and the re-analysis result must be
+// reproducible).
 func evidenceCookieName(name string) string {
 	return "cookie " + capName(name)
 }
@@ -46,8 +47,8 @@ func evidenceHeaderValue(name, value string) string {
 	return "header " + capName(name) + ": " + value
 }
 
-// capName компактно ограничивает имя внутри свидетельства (без многоточия —
-// итоговую обрезку делает finalizeEvidence один раз для всей строки).
+// capName caps a name compactly inside the evidence (no ellipsis — the
+// final truncation of the whole string is done once by finalizeEvidence).
 func capName(name string) string {
 	if len(name) <= evidenceNameBytes {
 		return name
@@ -55,11 +56,11 @@ func capName(name string) string {
 	return truncateUTF8(name, evidenceNameBytes)
 }
 
-// finalizeEvidence доводит сырое свидетельство до хранимого вида: невалидный
-// UTF-8 → U+FFFD (json.Marshal делал бы то же на выходе — фиксируем здесь,
-// чтобы свидетельство было валидно уже в памяти), управляющие символы → «·»
-// (одна строка без терминальных escape-последовательностей), обрезка до
-// лимита по границе руны с многоточием.
+// finalizeEvidence brings a raw evidence to its stored form: invalid
+// UTF-8 → U+FFFD (json.Marshal would do the same on output — we fix it
+// here so the evidence is valid already in memory), control characters → "·"
+// (a single line without terminal escape sequences), truncation to the
+// limit at a rune boundary with an ellipsis.
 func finalizeEvidence(s string, lim Limits) string {
 	s = cleanEvidence(s)
 	max := lim.snippetCap()
@@ -69,15 +70,15 @@ func finalizeEvidence(s string, lim Limits) string {
 	return truncateUTF8(s, max) + "…"
 }
 
-// cleanEvidence sanitирует недоверенный текст: валидный UTF-8, без
-// управляющих символов (C0, DEL).
+// cleanEvidence sanitizes untrusted text: valid UTF-8, no control
+// characters (C0, DEL).
 func cleanEvidence(s string) string {
 	if !utf8.ValidString(s) {
 		s = strings.ToValidUTF8(s, "\uFFFD")
 	}
 	if !strings.ContainsAny(s, "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f"+
 		"\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f\x7f") {
-		return s // быстрый путь обычных страниц
+		return s // the fast path of ordinary pages
 	}
 	var b strings.Builder
 	b.Grow(len(s))
@@ -90,9 +91,10 @@ func cleanEvidence(s string) string {
 	return b.String()
 }
 
-// truncateUTF8 обрезает строку не длиннее max байт, не рвая руну пополам:
-// хвостовые байты незавершённой руны откатываются (leading-байт без
-// продолжения так же бит, как и оборванное продолжение).
+// truncateUTF8 truncates a string to at most max bytes without splitting a
+// rune in half: the trailing bytes of an incomplete rune are rolled back
+// (a leading byte without a continuation is as broken as a severed
+// continuation).
 func truncateUTF8(s string, max int) string {
 	if max <= 0 {
 		return ""
@@ -104,7 +106,7 @@ func truncateUTF8(s string, max int) string {
 	for len(s) > 0 {
 		r, size := utf8.DecodeLastRuneInString(s)
 		if r == utf8.RuneError && size == 1 {
-			s = s[:len(s)-1] // битая/незавершённая руна в хвосте
+			s = s[:len(s)-1] // a broken/incomplete rune at the tail
 			continue
 		}
 		break

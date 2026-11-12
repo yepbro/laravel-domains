@@ -1,6 +1,6 @@
-// score.go — расчёт итогов применения правил (ТЗ 5.8): score по «noisy-OR»,
-// диапазон версий как пересечение диапазонов сработавших правил и порог
-// is_laravel.
+// score.go — computing the outcomes of rule application (spec 5.8): the
+// score via "noisy-OR", the version range as the intersection of the hit
+// rules' ranges, and the is_laravel threshold.
 
 package rules
 
@@ -10,24 +10,28 @@ import (
 	"strings"
 )
 
-// DefaultMinScore — порог is_laravel по умолчанию (analyzer.laravel_min_score,
-// ТЗ 5.8/5.10; конфиг валидирует значение в (0, 1]).
+// DefaultMinScore — the default is_laravel threshold
+// (analyzer.laravel_min_score, spec 5.8/5.10; the config validates the
+// value to be in (0, 1]).
 const DefaultMinScore = 0.6
 
-// ScoreRules — расчёт по сработавшим правилам страницы:
+// ScoreRules — the computation over the page's hit rules:
 //
-//   - score — «noisy-OR» 1 − Π(1 − wᵢ): слабые признаки накапливаются,
-//     но не дают 100 %;
-//   - диапазон версий — пересечение [ver_min, ver_max] сработавших правил:
-//     нижняя граница — максимум из ver_min, верхняя — минимум из ver_max
-//     (правило без границы диапазон не сужает); строки границ сохраняются
-//     из правил как есть («9.x» не превращается в «9»);
-//   - пустое пересечение (ver_max < ver_min) — conflict=true, границы
-//     сбрасываются: диапазон неопределён (при записи в БД это ver_min и
-//     ver_max NULL, признак конфликта виден по обеим пустым границам).
+//   - score — the "noisy-OR" 1 − Π(1 − wᵢ): weak signs accumulate but
+//     never reach 100%;
+//   - the version range — the intersection of the hit rules'
+//     [ver_min, ver_max]: the lower bound is the maximum of the ver_min
+//     values, the upper bound is the minimum of the ver_max values (a rule
+//     without a boundary does not narrow the range); the boundary strings
+//     are kept from the rules as is ("9.x" does not become "9");
+//   - an empty intersection (ver_max < ver_min) — conflict=true, the
+//     boundaries are reset: the range is undefined (written to the DB as
+//     ver_min and ver_max NULL; the conflict sign is visible in both empty
+//     boundaries).
 //
-// Некорректные строки версий (parseVersion = nil) игнорируются — набор
-// правил уже прошёл валидацию загрузчика, здесь это защита от опечаток.
+// Invalid version strings (parseVersion = nil) are ignored — the rule set
+// has already passed the loader's validation; here it is a guard against
+// typos.
 func ScoreRules(matched []Rule) (score float64, verMin, verMax string, conflict bool) {
 	var (
 		minV, maxV       version
@@ -61,11 +65,11 @@ func ScoreRules(matched []Rule) (score float64, verMin, verMax string, conflict 
 	return score, verMin, verMax, conflict
 }
 
-// IsLaravel — уверенное срабатывание: score ≥ порога (колонка
-// laravel_findings.is_laravel, ТЗ 5.8/6.1). minScore —
-// analyzer.laravel_min_score; неположительное значение заменяется
-// DefaultMinScore (валидация конфига такого не допускает — защита для
-// прямых вызовов с неинициализированным порогом).
+// IsLaravel — a confident hit: score ≥ the threshold (the
+// laravel_findings.is_laravel column, spec 5.8/6.1). minScore —
+// analyzer.laravel_min_score; a non-positive value is replaced with
+// DefaultMinScore (the config validation never allows that — a guard for
+// direct calls with an uninitialized threshold).
 func (res Result) IsLaravel(minScore float64) bool {
 	if minScore <= 0 {
 		minScore = DefaultMinScore
@@ -73,12 +77,12 @@ func (res Result) IsLaravel(minScore float64) bool {
 	return res.Score >= minScore
 }
 
-// noisyOR: 1 − (1−a)(1−b) — слабые признаки накапливаются, но не дают 100%.
+// noisyOR: 1 − (1−a)(1−b) — weak signs accumulate but never reach 100%.
 func noisyOR(a, b float64) float64 {
 	return 1 - (1-a)*(1-b)
 }
 
-// ScoreFixed — noisy-OR по набору весов.
+// ScoreFixed — noisy-OR over a set of weights.
 func ScoreFixed(weights []float64) float64 {
 	s := 0.0
 	for _, w := range weights {
@@ -87,23 +91,25 @@ func ScoreFixed(weights []float64) float64 {
 	return s
 }
 
-// ---------------------------------------------------------------- версии
+// ---------------------------------------------------------------- versions
 
-// version — числовые компоненты версии; "x" означает +∞ (граница «до конца
-// мажорной ветки», например ver_max: "9.x"). Отсутствующий компонент — 0.
+// version — the numeric version components; "x" means +∞ (the "until the
+// end of the major branch" boundary, e.g. ver_max: "9.x"). A missing
+// component is 0.
 type version []float64
 
 func parseVersion(s string) version {
-	// Эквивалентный мутант (T-M12): обрезка всей строки избыточна —
-	// каждый компонент отдельно обрезается strings.TrimSpace ниже, а
-	// пробельное начало/конец строки — это начало первого и конец
-	// последнего компонента.
+	// An equivalent mutant (T-M12): trimming the whole string is redundant —
+	// each component is trimmed separately by strings.TrimSpace below, and
+	// whitespace at the start/end of the string is the start of the first
+	// and the end of the last component.
 	// mutator-disable-next-line statement/remove
 	s = strings.TrimSpace(s)
-	// Эквивалентный мутант (T-M12): без раннего возврата пустая строка
-	// расщепляется на [""], ParseFloat("") даёт ErrSyntax — тот же
-	// итоговый nil. Аннотация стоит на строке if, а не тела: якорь
-	// branch/if — оператор if (урок контрольного прогона T-M10).
+	// An equivalent mutant (T-M12): without the early return, an empty
+	// string splits into [""], ParseFloat("") yields ErrSyntax — the same
+	// final nil. The annotation is on the if line, not the body: the
+	// branch/if anchor is the if statement (a lesson from the control run
+	// T-M10).
 	// mutator-disable-next-line branch/if
 	if s == "" {
 		return nil
@@ -113,21 +119,21 @@ func parseVersion(s string) version {
 	for _, p := range parts {
 		p = strings.TrimSpace(p)
 		if p == "x" || p == "*" {
-			// Эквивалентные мутанты (T-M12): math.Inf возвращает +Inf при
-			// любом знаке ≥ 0 — Inf(0) и Inf(2) тот же +Inf, что и Inf(1)
-			// (документация stdlib).
+			// Equivalent mutants (T-M12): math.Inf returns +Inf for any
+			// sign ≥ 0 — Inf(0) and Inf(2) are the same +Inf as Inf(1)
+			// (stdlib documentation).
 			// mutator-disable-next-line numbers/decrementer, numbers/incrementer
 			out = append(out, math.Inf(1))
 			continue
 		}
-		// Эквивалентные мутанты (T-M12): strconv.ParseFloat различает
-		// только bitSize 32 (отдельная ветка разбора), прочие значения
-		// идут путём 64 — 63 и 65 ведут себя как 64, включая ErrRange
-		// на «1e400» (проверено эмпирически).
+		// Equivalent mutants (T-M12): strconv.ParseFloat only distinguishes
+		// bitSize 32 (a separate parsing branch); other values take the 64
+		// path — 63 and 65 behave like 64, including ErrRange on "1e400"
+		// (verified empirically).
 		// mutator-disable-next-line numbers/decrementer, numbers/incrementer
 		n, err := strconv.ParseFloat(p, 64)
 		if err != nil {
-			return nil // некорректная версия игнорируется
+			return nil // an invalid version is ignored
 		}
 		out = append(out, n)
 	}
@@ -135,11 +141,11 @@ func parseVersion(s string) version {
 }
 
 func (v version) less(o version) bool {
-	// Эквивалентные мутанты (T-M12): дополнительная итерация при
-	// i == len сравнивает два отсутствующих компонента (0 и 0) — они
-	// равны, цикл выходит без результата; итог тот же. Вырезание левого
-	// операнда OR убиваемо — хвост приёмника с отрицательной компонентой
-	// виден только полным перебором (TestVersionCompare, «9.-1»).
+	// Equivalent mutants (T-M12): the extra iteration at i == len compares
+	// two missing components (0 and 0) — they are equal, the loop exits
+	// without a result; the outcome is the same. Removing the left operand
+	// of the OR is killable — a receiver tail with a negative component is
+	// only visible to a full scan (TestVersionCompare, "9.-1").
 	// mutator-disable-next-line expression/comparison
 	for i := 0; i < len(v) || i < len(o); i++ {
 		var a, b float64
@@ -150,9 +156,9 @@ func (v version) less(o version) bool {
 			b = o[i]
 		}
 		if a != b {
-			// Эквивалентный мутант (T-M12): ветка исполняется только при
-			// a != b, где «a <= b» ≡ «a < b»; NaN-компоненты дают false в
-			// обоих вариантах (несравнимость).
+			// An equivalent mutant (T-M12): the branch executes only at
+			// a != b, where "a <= b" ≡ "a < b"; NaN components give false
+			// in both variants (incomparability).
 			// mutator-disable-next-line expression/comparison
 			return a < b
 		}
@@ -160,15 +166,15 @@ func (v version) less(o version) bool {
 	return false
 }
 
-// CompareVersions — сравнение строк версий по числовым компонентам
-// (семантика границ правил, T-070): отсутствующий компонент — 0, «x»/«*» —
-// +∞; возвращает -1 (a < b), 0 (эквивалентны, в том числе разная запись
-// «9.19» и «9.19.0») или 1 (a > b). Экспортирован для агрегации
-// laravel_domains (T-072: min(ver_min)/max(ver_max) по findings домена) —
-// текстовое MIN/MAX в SQL упорядочило бы «10» раньше «5.3». Пустая или
-// некорректная версия (parseVersion = nil) не упорядочена — 0; findings
-// хранят только строки, прошедшие валидацию набора (T-068), вызывающий
-// не передаёт сюда мусор.
+// CompareVersions — comparing version strings by numeric components (the
+// rule boundary semantics, T-070): a missing component is 0, "x"/"*" is
+// +∞; returns -1 (a < b), 0 (equivalent, including the different
+// spellings "9.19" and "9.19.0") or 1 (a > b). Exported for the
+// laravel_domains aggregation (T-072: min(ver_min)/max(ver_max) over the
+// domain's findings) — a textual MIN/MAX in SQL would order "10" before
+// "5.3". An empty or invalid version (parseVersion = nil) is unordered — 0;
+// findings only store strings that passed the set validation (T-068), the
+// caller does not pass garbage here.
 func CompareVersions(a, b string) int {
 	va, vb := parseVersion(a), parseVersion(b)
 	switch {
@@ -183,8 +189,8 @@ func CompareVersions(a, b string) int {
 	}
 }
 
-// Contains — попадает ли ожидаемый диапазон [expMin, expMax] внутрь
-// вычисленного (используется make test-rules).
+// Contains — whether the expected range [expMin, expMax] falls inside the
+// computed one (used by make test-rules).
 func (res Result) Contains(expMin, expMax string) bool {
 	if expMin != "" {
 		e := parseVersion(expMin)
