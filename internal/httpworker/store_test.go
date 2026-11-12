@@ -552,7 +552,7 @@ func TestStoreSaveErrors(t *testing.T) {
 		st.delErr = errors.New("the DB is unavailable")
 		res := storeRun(t, storeWorker(t, script, st, nil), "del.test", "")
 		err := storeSaver(t, st, &bytes.Buffer{}).Save(context.Background(), res)
-		if err == nil || !strings.Contains(err.Error(), "releasing the reference") {
+		if err == nil || !strings.Contains(err.Error(), "releasing the unstored content reference") {
 			t.Fatalf("Save at a Delete failure: %v", err)
 		}
 	})

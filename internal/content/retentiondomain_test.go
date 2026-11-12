@@ -227,7 +227,7 @@ func TestDrainDomain_Errors(t *testing.T) {
 	pool = retentionSeedPool(now)
 	pool.purgeErr = errors.New("purge boom")
 	_, err := DrainDomain(context.Background(), pool, DefaultRetention, 1, 10)
-	if err == nil || !strings.Contains(err.Error(), "domain drain 1/10") {
+	if err == nil || !strings.Contains(err.Error(), "domain 1/10 drain") {
 		t.Fatalf("purge error = %v, want the context with the domain key", err)
 	}
 	// The T-044 guards: the purge failure rolled the transaction back —

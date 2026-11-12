@@ -339,7 +339,7 @@ func TestSetDictFile(t *testing.T) {
 	if err != nil || ok {
 		t.Fatalf("an absent file: ok=%v err=%v, want (false, nil)", ok, err)
 	}
-	if !strings.Contains(logBuf.String(), "without the dictionary") {
+	if !strings.Contains(logBuf.String(), "without a dictionary") {
 		t.Errorf("the fallback not reflected in the log:\n%s", logBuf.String())
 	}
 	if got := CompressWithDict(nil); !bytes.Equal(got, Compress(nil)) {

@@ -94,7 +94,7 @@ func TestRetentionPass_CursorSaveFailsWithBatch(t *testing.T) {
 	pool.cursorSaveErr = errors.New("db unavailable")
 	st := &retentionState{persist: true}
 	if _, err := retentionPass(context.Background(), pool, retentionDefaultOpts(), st); err == nil ||
-		!strings.Contains(err.Error(), "saving the cursor") {
+		!strings.Contains(err.Error(), "saving the drain cursor") {
 		t.Fatalf("error = %v, want the cursor save failure", err)
 	}
 	if pool.cursorRow != nil || pool.cursorSaves != 0 {

@@ -1737,7 +1737,7 @@ func TestRetentionLoop_Disabled(t *testing.T) {
 	if len(pool.queries) != 0 {
 		t.Fatalf("SELECTs = %d, want 0 (retention disabled)", len(pool.queries))
 	}
-	if !strings.Contains(buf.String(), "content retention disabled") {
+	if !strings.Contains(buf.String(), "retention is disabled") {
 		t.Errorf("log = %q, want the retention-disabled entry", buf.String())
 	}
 }

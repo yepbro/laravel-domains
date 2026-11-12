@@ -2083,7 +2083,7 @@ func TestRequeueZoneStageMemory(t *testing.T) {
 		t.Fatalf("pass 1: the outcome %+v the memory %+v", res, *stage)
 	}
 	if pool.stage1Select != 1 || pool.stage2Select != 1 {
-		t.Fatalf("pass 1: %d selections st1=%d st2=%d, 1/1 expected", pool.stage1Select, pool.stage2Select)
+		t.Fatalf("pass 1: selections st1=%d st2=%d, 1/1 expected", pool.stage1Select, pool.stage2Select)
 	}
 
 	// Pass 2: the debt 1 == the expectation (2 − its own withdrawal) — the first stage

@@ -512,7 +512,7 @@ func TestApplyDeleteClearRenderError(t *testing.T) {
 			clearRows: cleanupRows(), // the RETURNING is empty — the row is missing
 		}
 		_, err := ApplyDelete(context.Background(), pool, validDeleteBatch(t))
-		if err == nil || !strings.Contains(err.Error(), "'render_pending' is missing") {
+		if err == nil || !strings.Contains(err.Error(), "counter row is missing") {
 			t.Fatalf("err = %v, want the missing counter-row error", err)
 		}
 		if pool.commits != 0 || pool.rollbacks != 1 {
