@@ -332,18 +332,11 @@ func Run(opts Options) error {
 
 	err = serve(opts, srv, ln, closePool, term, hup)
 	if errors.Is(err, errForcedExit) {
-<<<<<<< HEAD
-		// Раньше здесь был прямой os.Exit(1) — обход defer'ов и
-		// непроверяемость в тестах. Ошибка доезжает до main: его реакция
-		// на любую ошибку Run и так os.Exit(1), код выхода не меняется.
-		opts.Logger.Warn("second signal — forcing exit without waiting for shutdown")
-=======
 		// Previously there was a direct os.Exit(1) here — bypassing the
 		// defers and untestable. The error reaches main: its reaction to
 		// any Run error is os.Exit(1) anyway; the exit code does not
 		// change.
-		opts.Logger.Warn("повторный сигнал — принудительное завершение без ожидания остановки")
->>>>>>> 1588289 (docs: translate small internal package comments to English)
+		opts.Logger.Warn("second signal — forcing exit without waiting for shutdown")
 	}
 	return err
 }

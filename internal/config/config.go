@@ -2061,7 +2061,6 @@ func (c *Config) Validate() error {
 			// path would fail at Listen already at startup; validation
 			// gives a configuration error.
 			problems = append(problems, fmt.Sprintf("web.listen: the unix socket path is longer than 100 bytes, got %q", c.Web.Listen))
->>>>>>> 1588289 (docs: translate small internal package comments to English)
 		}
 	}
 	// A minimum of 1 — zero would mean an unlimited form; the ceiling is
