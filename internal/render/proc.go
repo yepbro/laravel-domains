@@ -6,34 +6,36 @@ import (
 	"strings"
 )
 
-// Контроль памяти Chromium (T-065, ТЗ 5.6 «перезапуск … при превышении
-// порога памяти»): CDP не отдаёт RSS процесса, поэтому порог считается по
-// /proc — суммарный RSS дерева процессов Chromium (главный процесс плюс
-// все потомки: рендереры, GPU, crashpad — в бюджете ТЗ 3.2 участвуют все).
-// Linux-only по построению; деплой проекта — Linux (systemd/cgroups,
-// ТЗ 10.1), в остальных средах чтение возвращает «неизвестно» (-1) и
-// перезапуск по памяти не срабатывает (Browser.RSS).
+// Chromium memory control (T-065, render spec 5.6 "restart … when the
+// memory threshold is exceeded"): CDP does not expose the process RSS,
+// so the threshold is computed over /proc — the total RSS of the
+// Chromium process tree (the main process plus all descendants:
+// renderers, GPU, crashpad — all participate in the render spec 3.2
+// budget). Linux-only by construction; the project deploys to Linux
+// (systemd/cgroups, render spec 10.1); in other environments the read
+// returns "unknown" (-1) and the memory-triggered restart does not fire
+// (Browser.RSS).
 
-// procStat — поля /proc/<pid>/stat, нужные для дерева и памяти.
+// procStat — the /proc/<pid>/stat fields needed for the tree and memory.
 type procStat struct {
-	ppid int   // PPid — родитель, по нему строится дерево
-	rss  int64 // RSS в байтах (поле stat «rss», страницы × размер страницы)
+	ppid int   // PPid — the parent; the tree is built over it
+	rss  int64 // RSS in bytes (the stat field "rss", pages × the page size)
 }
 
-// procTreeRSS — суммарный RSS дерева процессов с корнем root, байт.
-// -1 — прочитать /proc не удалось; корень отсутствует в снимке (процесс
-// уже умер) даёт 0.
+// procTreeRSS — the total RSS of the process tree rooted at root, bytes.
+// -1 — reading /proc failed; a root missing from the snapshot (the
+// process has already died) yields 0.
 func procTreeRSS(root int) int64 {
 	if root <= 0 {
 		return -1
 	}
 	procs, err := readProcStats()
-	// Мутанты ветки (T-M07): отказ чтения /proc в CI недостижим —
-	// контейнер всегда имеет читаемый /proc (TestProcTreeRSSSelf и
-	// TestReadProcStatsSkipsNonNumeric читают его), скрыть или
-	// отмонтировать его из теста нельзя. Вырезание return (branch/if)
-	// — та же недостижимая ветка. Значение -1 — контракт «неизвестно»,
-	// закреплён тестами через rootPID <= 0 выше.
+	// Branch mutants (T-M07): a /proc read failure is unreachable in
+	// CI — the container always has a readable /proc (TestProcTreeRSSSelf
+	// and TestReadProcStatsSkipsNonNumeric read it), and it cannot be
+	// hidden or unmounted from a test. Cutting the return out
+	// (branch/if) is the same unreachable branch. The value -1 is the
+	// "unknown" contract, pinned by tests via rootPID <= 0 above.
 	// mutator-disable-next-line branch/if
 	if err != nil {
 		// mutator-disable-next-line numbers/decrementer, numbers/incrementer
@@ -42,16 +44,17 @@ func procTreeRSS(root int) int64 {
 	return treeRSS(procs, root)
 }
 
-// readProcStats — один проход по /proc: снимок {pid → ppid, rss}.
-// Процессы, исчезнувшие между листингом и чтением, пропускаются: снимок
-// консистентен по построению, задержки между записями для RSS-порога
-// незначимы (проверка — перед каждой задачей, сам проход — не чаще окна
-// кэша rssCacheTTL, T-229; ТЗ 5.6).
+// readProcStats — a single pass over /proc: a snapshot {pid → ppid,
+// rss}. Processes that disappeared between listing and reading are
+// skipped: the snapshot is consistent by construction, the lags between
+// entries are insignificant for the RSS threshold (the check runs
+// before every task, the pass itself no more often than the rssCacheTTL
+// cache window, T-229; render spec 5.6).
 func readProcStats() (map[int]procStat, error) {
 	entries, err := os.ReadDir("/proc")
-	// Недостижимо в CI (T-M07): /proc в контейнере всегда листируется;
-	// отказ ReadDir требует скрытого/отмонтированного /proc. Вырезание
-	// return (branch/if) — та же недостижимая ветка.
+	// Unreachable in CI (T-M07): /proc is always listable in the
+	// container; a ReadDir failure requires a hidden/unmounted /proc.
+	// Cutting the return out (branch/if) is the same unreachable branch.
 	// mutator-disable-next-line branch/if
 	if err != nil {
 		return nil, err
@@ -60,36 +63,38 @@ func readProcStats() (map[int]procStat, error) {
 	for _, e := range entries {
 		pid, err := strconv.Atoi(e.Name())
 		if err != nil {
-			// Мутант loop/break эквивалентен (T-M07): os.ReadDir отдаёт
-			// записи отсортированными по имени, а нечисловые записи /proc
-			// («acpi», «bus», «cmdline»…) алфавитные и идут после всех
-			// pid — break на первой нечисловой равен continue (дальше
-			// pid уже нет). Сам пропуск закреплён тестом
+			// The loop/break mutant is equivalent (T-M07): os.ReadDir
+			// returns entries sorted by name, and the non-numeric /proc
+			// entries ("acpi", "bus", "cmdline"…) are alphabetical and
+			// come after all pids — break on the first non-numeric entry
+			// equals continue (there are no more pids after it). The
+			// skip itself is pinned by the test
 			// TestReadProcStatsSkipsNonNumeric.
 			// mutator-disable-next-line loop/break
-			continue // нечисловое имя — не процесс
+			continue // a non-numeric name is not a process
 		}
 		data, err := os.ReadFile("/proc/" + e.Name() + "/stat")
-		// Вырезание continue (branch/if) эквивалентно (T-M07): без
-		// continue падение на parseProcStat(data) с data == nil безопасно —
-		// пустая строка отвергается разбором (LastIndex = -1), запись
-		// не добавляется. loop/break недетерминирован: срабатывание
-		// требует смерти процесса между листингом и чтением — гонка,
-		// управляемо не воспроизводится в CI.
+		// Cutting the continue out (branch/if) is equivalent (T-M07):
+		// without continue, falling through to parseProcStat(data) with
+		// data == nil is safe — the empty string is rejected by the
+		// parse (LastIndex = -1), the entry is not added. loop/break is
+		// nondeterministic: firing it requires the process to die between
+		// listing and reading — a race, not reproducible on demand in CI.
 		// mutator-disable-next-line branch/if
 		if err != nil {
 			// mutator-disable-next-line loop/break
-			continue // процесс ушёл между листингом и чтением
+			continue // the process went away between listing and reading
 		}
 		if st, ok := parseProcStat(data); ok {
 			procs[pid] = st
 		}
 	}
-	// Недостижимо в CI (T-M07): пустой снимок требует, чтобы в /proc
-	// не было ни одного читаемого процесса — сам тестовый процесс
-	// всегда виден; ровно один (мутант `== 1`) в контейнере go test
-	// тоже недостижим (минимум PID 1 и сам тестовый бинарник).
-	// Вырезание return (branch/if) — та же недостижимая ветка.
+	// Unreachable in CI (T-M07): an empty snapshot requires that /proc
+	// contain not a single readable process — the test process itself
+	// is always visible; exactly one (the `== 1` mutant) is also
+	// unreachable in the go test container (at minimum PID 1 and the
+	// test binary itself).
+	// Cutting the return out (branch/if) is the same unreachable branch.
 	// mutator-disable-next-line numbers/decrementer, numbers/incrementer, branch/if
 	if len(procs) == 0 {
 		return nil, os.ErrNotExist
@@ -97,24 +102,26 @@ func readProcStats() (map[int]procStat, error) {
 	return procs, nil
 }
 
-// parseProcStat разбирает строку /proc/<pid>/stat. Имя процесса берётся по
-// последней «)» — comm может содержать скобки и пробелы; далее поля идут
-// с state: ppid — поле 4, rss — поле 24 (в страницах, man proc).
+// parseProcStat parses a /proc/<pid>/stat line. The process name is
+// taken by the last ")" — comm may contain parentheses and spaces; the
+// fields then start from state: ppid is field 4, rss is field 24 (in
+// pages, man proc).
 func parseProcStat(data []byte) (procStat, bool) {
 	s := string(data)
 	i := strings.LastIndexByte(s, ')')
-	// Эквивалентные мутанты (T-M07): `i+2 >= len(s)` и `i+3 > len(s)`
-	// отличаются от оригинала только при i+2 == len(s) — и там обе ветви
-	// дают отказ (Fields(s[len:]) пуст → < 22 полей). Аннотации попутно
-	// гасят убиваемых `i <= 0` и `i < 1` (')' первым символом) — trade-off
-	// строчных аннотаций (§4 docs/mutation-testing.md); поведение закреплено
+	// Equivalent mutants (T-M07): `i+2 >= len(s)` and `i+3 > len(s)`
+	// differ from the original only at i+2 == len(s) — and there both
+	// branches fail (Fields(s[len:]) is empty → fewer than 22 fields).
+	// The annotations also suppress the killable `i <= 0` and `i < 1`
+	// (')' as the first character) — the trade-off of inline annotations
+	// (§4 docs/mutation-testing.md); the behavior is pinned by
 	// TestParseProcStat.
 	// mutator-disable-next-line expression/comparison, numbers/incrementer
 	if i < 0 || i+2 > len(s) {
 		return procStat{}, false
 	}
 	f := strings.Fields(s[i+2:])
-	if len(f) < 22 { // до rss включительно
+	if len(f) < 22 { // through rss inclusive
 		return procStat{}, false
 	}
 	ppid, err := strconv.Atoi(f[1])
@@ -128,9 +135,9 @@ func parseProcStat(data []byte) (procStat, bool) {
 	return procStat{ppid: ppid, rss: pages * int64(os.Getpagesize())}, true
 }
 
-// treeRSS суммирует RSS дерева от root по снимку процессов. Замкнутые
-// циклы в ppid (повреждённый снимок) невозможны физически, но «посещен»
-// гарантирует завершение на любых входных данных.
+// treeRSS sums the RSS of the tree from root over the process snapshot.
+// Closed ppid loops (a corrupted snapshot) are physically impossible,
+// but "seen" guarantees termination on any input.
 func treeRSS(procs map[int]procStat, root int) int64 {
 	children := make(map[int][]int, len(procs))
 	for pid, st := range procs {
@@ -144,23 +151,24 @@ func treeRSS(procs map[int]procStat, root int) int64 {
 		queue = queue[1:]
 		st, ok := procs[pid]
 		if !ok {
-			// loop/break эквивалентен (T-M07): !ok возможен только для
-			// корня — первого элемента очереди (потомки попадают в неё
-			// лишь из children, построенного по ключам снимка); после
-			// извлечения корня очередь пуста, break и continue неразличимы.
-			// Сам пропуск (в т. ч. с потомками корня в снимке) закреплён
-			// TestTreeRSS.
+			// loop/break is equivalent (T-M07): !ok is possible only for
+			// the root — the first queue element (descendants get into
+			// the queue only from children, built over the snapshot
+			// keys); after the root is dequeued the queue is empty, and
+			// break and continue are indistinguishable. The skip itself
+			// (including with the root's descendants in the snapshot) is
+			// pinned by TestTreeRSS.
 			// mutator-disable-next-line loop/break
 			continue
 		}
 		total += st.rss
 		for _, c := range children[pid] {
 			if !seen[c] {
-				// Эквивалентный мутант (T-M07): каждый pid входит ровно
-				// в один список children (ppid единственный); повторно в
-				// очередь может попасть только корень, а он отмечен при
-				// инициализации (seen = {root: true}) — вырезание
-				// маркировки ненаблюдаемо.
+				// Equivalent mutant (T-M07): each pid enters exactly one
+				// children list (the ppid is unique); only the root can
+				// get into the queue twice, and it is marked at
+				// initialization (seen = {root: true}) — cutting the
+				// marking out is unobservable.
 				// mutator-disable-next-line statement/remove
 				seen[c] = true
 				queue = append(queue, c)

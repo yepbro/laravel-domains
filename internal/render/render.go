@@ -1,39 +1,42 @@
-// Package render — управление Chromium для рендера страниц (ТЗ 5.6, §9).
+// Package render — Chromium control for page rendering (spec 5.6, §9).
 //
-// Модель пакета:
+// The package model:
 //
-//   - Browser — один Chromium на воркер (ТЗ 5.6: «один браузер»). Два
-//     режима: внешнее подключение по CDP (Options.RemoteURL —
-//     render.remote_url, контейнер chromium dev-стека) или собственный
-//     процесс headless-shell (боевой render-образ,
-//     deploy/docker/Dockerfile.render). В обоих режимах — одно соединение
-//     с браузером (WebSocket) и одна служебная вкладка about:blank.
-//   - Session — изолированный контекст Chromium (CDP
-//     Target.createBrowserContext, опция chromedp.WithNewBrowserContext):
-//     инкогнито-профиль со своими cookies, кэшем и хранилищами плюс одна
-//     вкладка. Сессия живёт ровно одну задачу: после страницы пул её
-//     закрывает (Target.disposeBrowserContext), следующая задача получает
-//     новый профиль — состояние между страницами не сохраняется (ТЗ 5.6,
-//     §9). Пересоздание контекста вместо выборочной очистки: dispose
-//     выкидывает все хранилища профиля атомарно и без перечисления
-//     origin'ов (иначе пришлось бы чистить cookies/Storage по каждому
-//     встреченному origin, и кэш это не покрывает), а стоимость — один
-//     CreateBrowserContext + CreateTarget, на фоне таймаута страницы в
-//     секунды это незаметно.
-//   - Pool — до Options.Contexts (рекомендация ТЗ: 2–4) задач параллельно,
-//     каждая в своём изолированном контексте.
+//   - Browser — one Chromium per worker (spec 5.6: "one browser"). Two
+//     modes: an external connection over CDP (Options.RemoteURL —
+//     render.remote_url, the chromium container of the dev stack) or an
+//     own headless-shell process (the production render image,
+//     deploy/docker/Dockerfile.render). In both modes — one browser
+//     connection (WebSocket) and one service about:blank tab.
+//   - Session — an isolated Chromium context (CDP
+//     Target.createBrowserContext, the chromedp.WithNewBrowserContext
+//     option): an incognito profile with its own cookies, cache and
+//     storages plus one tab. The session lives for exactly one task:
+//     after a page the pool closes it (Target.disposeBrowserContext),
+//     the next task gets a new profile — no state survives between
+//     pages (spec 5.6, §9). Recreating the context instead of selective
+//     clearing: dispose discards all the profile storages atomically
+//     and without enumerating origins (otherwise cookies/Storage would
+//     have to be cleared per each encountered origin, and the cache
+//     would not be covered anyway), while the cost is one
+//     CreateBrowserContext + CreateTarget — against a page timeout in
+//     seconds this is imperceptible.
+//   - Pool — up to Options.Contexts (the spec recommendation: 2–4)
+//     tasks in parallel, each in its own isolated context.
 //
-// Ошибки классифицируются (Class): упавший контекст — повтор на новом,
-// недоступный браузер — наверх, ошибка страницы — обычный результат этапа
-// (повторная доставка — уровень очереди, T-066).
+// Errors are classified (Class): a dead context — retry on a new one,
+// an unavailable browser — upward, a page error — a regular stage
+// result (re-delivery is the queue level, T-066).
 //
-// Развитие T-062…T-067 поверх текущего API: блокировка ресурсов (T-062) и
-// ожидание «затишья» сети (T-063) встраиваются этапами в Session.Run (до
-// перехода и до съёма результата соответственно); итоговый DOM, cookies и
-// заголовки ответа (T-064) — поля RenderOutput (extract.go); Manager (T-065)
-// владеет поколениями «браузер + пул» — перезапуск каждые N страниц
-// (счётчик Browser.Pages) и по порогу RSS; цикл очередей — T-066 (публикация
-// q:render) и T-067 (потребитель — internal/renderworker, Manager.Run).
+// The T-062…T-067 development on top of the current API: resource
+// blocking (T-062) and the network quiet wait (T-063) are built in as
+// stages into Session.Run (before navigation and before result capture
+// respectively); the final DOM, cookies and response headers (T-064)
+// are RenderOutput fields (extract.go); Manager (T-065) owns the
+// "browser + pool" generations — a restart every N pages (the
+// Browser.Pages counter) and by the RSS threshold; the queue cycle is
+// T-066 (the q:render publication) and T-067 (the consumer —
+// internal/renderworker, Manager.Run).
 package render
 
 import (
@@ -51,174 +54,193 @@ import (
 	"crawler/internal/httpfetch"
 )
 
-// RenderTask — одна задача рендера: открыть страницу и снять результат.
+// RenderTask — one render task: open a page and capture the result.
 //
-// URL приходит из результата HTTP-этапа (сообщение q:render, T-066); схема
-// контролируется перед переходом (validateTaskURL): рендер открывает только
-// http/https, прочие адреса (file:, data:, ftp:) отвергаются классом task —
-// браузер открыл бы и локальный файл (R-09). Формальный контроль входа —
-// уровень воркера, остальное отвергает сам браузер (chromedp.ErrPageLoad).
+// The URL comes from the HTTP stage result (a q:render message, T-066);
+// the scheme is checked before navigation (validateTaskURL): render
+// opens only http/https, other addresses (file:, data:, ftp:) are
+// rejected with the task class — the browser would open a local file
+// too (R-09). The formal input check is the worker level; the rest is
+// rejected by the browser itself (chromedp.ErrPageLoad).
 type RenderTask struct {
 	URL string
 }
 
-// RenderOutput — результат задачи: итоговый URL и заголовок (T-061),
-// итоговый DOM, все cookies итоговой страницы и заголовки ответа основной
-// навигации (T-064; extract.go — обоснование способов съёма).
+// RenderOutput — the task result: the final URL and title (T-061), the
+// final DOM, all cookies of the final page and the headers of the main
+// navigation's response (T-064; extract.go — the rationale for the
+// capture methods).
 type RenderOutput struct {
-	// FinalURL — document.location после загрузки страницы: включает
-	// JS-редиректы, которых HTTP-этап не видит (T-048 отслеживает только
-	// HTTP-переходы и meta refresh).
+	// FinalURL — document.location after the page loads: includes the
+	// JS redirects the HTTP stage does not see (T-048 tracks only HTTP
+	// transitions and meta refresh).
 	FinalURL string
-	// Title — содержимое document.title (диагностика и live-проверки).
+	// Title — the document.title content (diagnostics and live checks).
 	Title string
-	// DOM — итоговый DOM документа (document.documentElement.outerHTML,
-	// ТЗ 5.6): полное дерево после дорисовки JS; формат HTML — замена
-	// сырого HTML в хранилище (T-067) и вход правил по HTML/meta (T-068).
+	// DOM — the final DOM of the document
+	// (document.documentElement.outerHTML, spec 5.6): the full tree
+	// after the JS rendering; the HTML format — the replacement of the
+	// raw HTML in the store (T-067) and the input of the HTML/meta
+	// rules (T-068).
 	DOM string
-	// Cookies — все cookies итоговой страницы, включая httpOnly и
-	// выставленные JS (ТЗ 5.6, §11.4 п. 3): CDP читает хранилище
-	// изолированного контекста, document.cookie их не видит. Формат —
-	// единый контракт subdomain_results.cookies (T-058). Для страниц без
-	// cookie-хранилища — nil.
+	// Cookies — all cookies of the final page, including httpOnly and
+	// the ones set by JS (spec 5.6, §11.4 item 3): CDP reads the
+	// isolated context's storage, document.cookie does not see them.
+	// The format — the unified contract subdomain_results.cookies
+	// (T-058). For pages without a cookie storage — nil.
 	Cookies []ExtractCookie
-	// ResponseHeaders — заголовки ответа основной навигации (ТЗ 5.8 —
-	// правила по заголовкам): http.Header, как у HTTP-этапа (T-058).
-	// Задачи — только http/https (validateTaskURL, R-09): у навигации
-	// есть реальный сетевой ответ; nil (ответ не получен) обрабатывается
-	// защитно в Session.Run.
+	// ResponseHeaders — the headers of the main navigation's response
+	// (spec 5.8 — the header rules): http.Header, as at the HTTP stage
+	// (T-058). The tasks are only http/https (validateTaskURL, R-09):
+	// the navigation has a real network response; nil (no response
+	// received) is handled defensively in Session.Run.
 	ResponseHeaders http.Header
 }
 
-// Options — параметры Browser и Pool. Собираются из конфигурации NewOptions;
-// производные таймауты (DialTimeout, SessionStartTimeout) — внутренние
-// режимы работы, в ТЗ 5.10 не параметризуются.
+// Options — the parameters of Browser and Pool. Assembled from the
+// configuration by NewOptions; the derived timeouts (DialTimeout,
+// SessionStartTimeout) are internal modes, not parameterized in
+// spec 5.10.
 type Options struct {
-	// Engine — движок рендера (ТЗР движков §4.2, ФТ-1/3/4): "" или
-	// config.EngineChromium — сегодняшний режим (внешний CDP при
-	// заданном RemoteURL, собственный процесс при пустом — здесь и
-	// ниже «chromium» покрывает оба); config.EngineMoli и
-	// config.EngineLightpanda — внешние альтернативные CDP-серверы:
-	// RemoteURL для них обязателен (схема ws/wss), MemoryThreshold — 0
-	// (связку проверяет validate), режим адреса аллокатора — по движку
-	// (remotealloc.go, wsURLMode). Движок видят только валидация и
-	// аллокатор: ядро пакета (Session/Pool/Manager/extract/block/wait)
-	// по нему не ветвится (ФТ-4).
+	// Engine — the render engine (the engines render spec §4.2,
+	// FR-1/3/4): "" or config.EngineChromium — the current mode
+	// (external CDP when RemoteURL is set, an own process when empty —
+	// here and below "chromium" covers both); config.EngineMoli and
+	// config.EngineLightpanda — external alternative CDP servers:
+	// RemoteURL is mandatory for them (the ws/wss scheme),
+	// MemoryThreshold — 0 (the combination is checked by validate), the
+	// allocator address mode is by engine (remotealloc.go, wsURLMode).
+	// Only the validation and the allocator see the engine: the package
+	// core (Session/Pool/Manager/extract/block/wait) does not branch on
+	// it (FR-4).
 	Engine string
-	// RemoteURL — адрес внешнего Chromium по CDP (ws://host:9222):
-	// dev-стек, compose-сервис chromium. Пусто — воркер запускает
-	// собственный процесс headless-shell (боевой render-образ).
+	// RemoteURL — the external Chromium address over CDP
+	// (ws://host:9222): the dev stack, the chromium compose service.
+	// Empty — the worker starts its own headless-shell process (the
+	// production render image).
 	RemoteURL string
-	// Contexts — максимальное число параллельных изолированных контекстов
-	// (ТЗ 5.6: «по умолчанию 2–4 параллельно»).
+	// Contexts — the maximum number of parallel isolated contexts
+	// (spec 5.6: "2–4 in parallel by default").
 	Contexts int
-	// Timeout — общий таймаут одной страницы (ТЗ 5.6: по умолчанию 25 с).
+	// Timeout — the overall timeout of one page (spec 5.6: 25 s by
+	// default).
 	Timeout time.Duration
-	// RestartEveryPages — порог перезапуска браузера по числу страниц
-	// (ТЗ 5.6): Browser ведёт счётчик Pages, смена поколения — Manager
-	// (T-065).
+	// RestartEveryPages — the browser restart threshold by page count
+	// (spec 5.6): Browser keeps the Pages counter, the generation swap
+	// is Manager (T-065).
 	RestartEveryPages int
-	// MemoryThreshold — порог перезапуска браузера по памяти, байт:
-	// суммарный RSS дерева процессов Chromium ≥ порога → перезапуск
-	// (ТЗ 5.6). Бюджет Chromium ≈ 2 ГБ (ТЗ 3.2, cgroup MemoryMax), порог
-	// обязан быть ниже лимита контейнера: перезапуск — профилактика до
-	// срабатывания cgroup-OOM. 0 — контроль отключён; в remote-режиме
-	// процесс Chromium рядом нет (RSS неизвестен) и контроль не работает —
-	// потолок там держит mem_limit контейнера Chromium.
+	// MemoryThreshold — the browser restart threshold by memory, bytes:
+	// the total RSS of the Chromium process tree ≥ the threshold →
+	// restart (spec 5.6). The Chromium budget ≈ 2 GB (spec 3.2, cgroup
+	// MemoryMax), the threshold must be below the container limit: the
+	// restart is a prophylactic before the cgroup-OOM fires. 0 — the
+	// control is off; in the remote mode there is no local Chromium
+	// process (the RSS is unknown) and the control does not work — the
+	// cap there is held by the mem_limit of the Chromium container.
 	MemoryThreshold int64
-	// UserAgent — идентифицируемый User-Agent страниц рендера (ТЗ §9):
-	// подменяет UA браузера в сессиях (Emulation.setUserAgentOverride).
-	// В секции render ТЗ 5.10 отдельного поля нет, краулер представлен
-	// одним UA — http.user_agent. Пусто — UA браузера без изменений.
+	// UserAgent — an identifiable User-Agent of the rendered pages
+	// (spec §9): overrides the browser UA in sessions
+	// (Emulation.setUserAgentOverride). The render section of spec 5.10
+	// has no separate field; the crawler is represented by a single UA
+	// — http.user_agent. Empty — the browser UA unchanged.
 	UserAgent string
-	// ExecPath — путь к Chromium в локальном режиме; пусто — стандартный
-	// поиск chromedp (в списке есть headless-shell по имени из PATH).
+	// ExecPath — the Chromium path in the local mode; empty — the
+	// standard chromedp search (the list includes headless-shell by
+	// name from PATH).
 	ExecPath string
-	// DialTimeout — таймаут WebSocket-подключения к внешнему Chromium
-	// (0 — 10 с, как в chromedp). Ограничивает и уточнение адреса
-	// /json/version; сами bootstrap-команды сессии (вкладка, домены)
-	// ограничивает initBrowserSession суммой DialTimeout +
-	// SessionStartTimeout — потолок действует в обоих режимах, включая
-	// холодный старт локального процесса (T-218). Контекст StartBrowser
-	// при этом обязан жить столько, сколько браузер (жизненный цикл
-	// воркера) — отмена извне гасит и инициализацию; потолок — обгонная
-	// гонка, а не дедлайн на контексте.
+	// DialTimeout — the WebSocket connection timeout to the external
+	// Chromium (0 — 10 s, as in chromedp). It bounds the /json/version
+	// address refinement too; the session's bootstrap commands (the
+	// tab, the domains) are bounded by initBrowserSession with the sum
+	// DialTimeout + SessionStartTimeout — the cap applies in both
+	// modes, including the cold start of the local process (T-218). The
+	// StartBrowser context must live as long as the browser (the worker
+	// lifecycle) — an external cancellation kills the initialization
+	// too; the cap is a racing select, not a deadline on the context.
 	DialTimeout time.Duration
-	// SessionStartTimeout — таймаут создания изолированного контекста с
-	// вкладкой (0 — 15 с).
+	// SessionStartTimeout — the timeout of creating an isolated context
+	// with a tab (0 — 15 s).
 	SessionStartTimeout time.Duration
-	// MaxDOMBytes — потолок итогового DOM в байтах (R-02, гигиена памяти
-	// воркера: render.contexts съёмов параллельно при MemoryMax=128M у
-	// systemd-профиля): DOM сверх лимита обрезается в самом браузере и
-	// получает признак обрезки (extract.go). 0 — без лимита. Источник в
-	// сборке — content.max_store_bytes: контент сверх лимита хранилище не
-	// принимает (ErrTooLarge), держать его в памяти бессмысленно.
+	// MaxDOMBytes — the cap of the final DOM in bytes (R-02, worker
+	// memory hygiene: render.contexts captures in parallel at
+	// MemoryMax=128M of the systemd profile): the DOM above the limit
+	// is truncated in the browser itself and gets a truncation marker
+	// (extract.go). 0 — no limit. The source in the build is
+	// content.max_store_bytes: the store does not accept content above
+	// the limit (ErrTooLarge), keeping it in memory is pointless.
 	MaxDOMBytes int64
-	// BlockStylesheet — блокировать ли CSS в рендер-контексте (T-213):
-	// при true перечень блокируемых типов (block.go, T-062:
-	// Image/Media/Font) пополняется Stylesheet. Дефолт false — риск
-	// редких сайтов, чей JS читает computed styles/media queries:
-	// включение на проде — только после A/B (доля расхождений детекции
-	// <1%, темп не хуже). Источник — render.block_stylesheet.
+	// BlockStylesheet — whether to block CSS in the render context
+	// (T-213): when true, the list of blocked types (block.go, T-062:
+	// Image/Media/Font) is extended with Stylesheet. The default false
+	// — the risk of rare sites whose JS reads computed styles/media
+	// queries: enabling in production — only after an A/B (the share of
+	// detection discrepancies <1%, the rate no worse). The source is
+	// render.block_stylesheet.
 	BlockStylesheet bool
-	// BlockTrackerDomains — блокировать ли в рендер-контексте запросы к
-	// доменам веб-аналитики/телеметрии (T-214): Fetch.enable получает
-	// urlPattern-паттерны по доменам списка blockTrackerDomains
-	// (block.go), вердикт по каждому приостановленному запросу — точная
-	// хостовая проверка (свои скрипты сайта и пути с похожей подстрокой
-	// не задеты). Дефолт true — трекеры не участвуют в детекции,
-	// экономия трафика и CPU прямая; остаточный риск и обоснование
-	// дефолта — у поля BlockTrackerDomains internal/config. Источник —
-	// render.block_tracker_domains.
+	// BlockTrackerDomains — whether to block requests to web
+	// analytics/telemetry domains in the render context (T-214):
+	// Fetch.enable receives urlPattern patterns over the domains of the
+	// blockTrackerDomains list (block.go), the verdict on each paused
+	// request is an exact host check (the site's own scripts and paths
+	// with a similar substring are untouched). The default true —
+	// trackers do not participate in detection, the traffic and CPU
+	// savings are direct; the residual risk and the rationale for the
+	// default are at the BlockTrackerDomains field of internal/config.
+	// The source is render.block_tracker_domains.
 	BlockTrackerDomains bool
-	// BlockInternalAddrs — SSRF-контур рендера (T-219): тот же флаг
-	// http.block_internal_addrs, что у HTTP-этапа. При true задача с
-	// IP-литеральным хостом внутреннего диапазона
-	// (httpfetch.AddrIsInternal, включая IPv4-в-IPv6 —
-	// [::ffff:10.0.0.1]) отвергается классом task до перехода —
-	// Chromium не открывает внутренние адреса: final_url приходит из
-	// БД, и аномалия пайплайна или компрометация БД не должна
-	// превращаться в обход контура. Имена-хосты задачи отдельно не
-	// резолвятся: их адреса фильтруются HTTP-этапом под той же воронкой
-	// httpfetch, второй резолвер в валидации задачи расширял бы контур;
-	// произвольные имена навигаций и подресурсов внутри страницы
-	// резолвирует перехват запросов Chromium (T-230, block.go —
-	// DNS-rebinding). false — прежнее поведение: dev/testbed рендерит
-	// внутренние стенды.
+	// BlockInternalAddrs — the render SSRF guard (T-219): the same
+	// http.block_internal_addrs flag as at the HTTP stage. When true, a
+	// task with an internal-range IP-literal host
+	// (httpfetch.AddrIsInternal, including IPv4-in-IPv6 —
+	// [::ffff:10.0.0.1]) is rejected with the task class before
+	// navigation — Chromium does not open internal addresses: final_url
+	// comes from the DB, and a pipeline anomaly or a DB compromise must
+	// not turn into a bypass of the guard. The task's hostnames are not
+	// resolved separately: their addresses are filtered by the HTTP
+	// stage under the same httpfetch funnel; a second resolver in the
+	// task validation would widen the guard; the arbitrary names of
+	// navigations and subresources inside the page are resolved and
+	// checked by the Chromium request interception (T-230, block.go —
+	// DNS-rebinding). false — the previous behavior: dev/testbed render
+	// internal benches.
 	BlockInternalAddrs bool
-	// LookupHost — шов резолва имён-хостов для SSRF-контура перехвата
-	// рендера (T-230): при включённом BlockInternalAddrs перехват Fetch
-	// резолвит произвольные имена (литеральные и числоподобные формы
-	// ловит renderHostInternal без резолва) и отклоняет запросы, чей
-	// хост резолвится в httpfetch.AddrIsInternal, — DNS-rebinding во
-	// времени (имя публичное на HTTP-этапе, внутреннее — к моменту
-	// рендера) закрывается в самом Chromium. Остаточный вектор —
-	// атакующий с контролем зоны различает резолв перехвата и свой
-	// резолв Chromium (два отдельных DNS-обмена) и отвечает им разными
-	// адресами; полное закрытие — egress-политика контейнера Chromium
-	// (docs/render.md). nil — системный резолвер (net.DefaultResolver):
-	// headless-shell резолвит системным же, перехват видит то же
-	// представление об адресах, что и браузер. Резолвы кэшируются на
-	// сессию с TTL и ограничены потолком на обмен (block.go, dnsCache).
-	// Сборки из конфигурации поле не заполняют (работает дефолт),
-	// подменяют тесты.
+	// LookupHost — the hostname resolve seam for the SSRF guard of the
+	// render interception (T-230): when BlockInternalAddrs is on, the
+	// Fetch interception resolves arbitrary names (literal and
+	// numeric-like forms are caught by renderHostInternal without a
+	// resolve) and rejects requests whose host resolves into
+	// httpfetch.AddrIsInternal — a time-based DNS-rebinding (the name
+	// is public at the HTTP stage, internal by the render time) is
+	// closed inside Chromium itself. The residual vector — an attacker
+	// controlling the zone distinguishes the interception's resolve
+	// from its own Chromium resolve (two separate DNS exchanges) and
+	// answers them with different addresses; the full closure is the
+	// egress policy of the Chromium container (docs/render.md). nil —
+	// the system resolver (net.DefaultResolver): headless-shell
+	// resolves with the system one too, the interception sees the same
+	// view of the addresses as the browser. The resolves are cached per
+	// session with a TTL and bounded by a cap per exchange (block.go,
+	// dnsCache). Builds from the configuration do not set the field
+	// (the default works), tests replace it.
 	LookupHost func(ctx context.Context, host string) ([]netip.Addr, error)
 }
 
-// altEngine — внешний альтернативный движок рендера (ТЗР движков §4.2
-// п.1, ФТ-4): moli или lightpanda. Единственная производная по Engine
-// рядом с Options — читается валидацией (связка «движок × RemoteURL ×
-// MemoryThreshold» и схема RemoteURL) и проводкой remote-аллокатора;
-// глубже пакета движок не проходит.
+// altEngine — an external alternative render engine (the engines render
+// spec §4.2 item 1, FR-4): moli or lightpanda. The only derivative over
+// Engine next to Options — read by the validation (the combination
+// "engine × RemoteURL × MemoryThreshold" and the RemoteURL scheme) and
+// by the remote allocator wiring; deeper into the package the engine
+// does not pass.
 func (o Options) altEngine() bool {
 	return o.Engine == config.EngineMoli || o.Engine == config.EngineLightpanda
 }
 
-// NewOptions собирает Options из конфигурации сервиса (ТЗ 5.10): секция
-// render плюс User-Agent HTTP-этапа (ТЗ §9 — единый идентифицируемый UA
-// краулера), потолок DOM из секции content (R-02: итоговый DOM не больше
-// того, что хранилище контента принимает) и флаг SSRF-контура
-// http.block_internal_addrs (T-219 — общий с HTTP-этапом).
+// NewOptions assembles Options from the service configuration
+// (spec 5.10): the render section plus the HTTP stage User-Agent
+// (spec §9 — a single identifiable UA of the crawler), the DOM cap from
+// the content section (R-02: the final DOM is no larger than what the
+// content store accepts) and the SSRF guard flag
+// http.block_internal_addrs (T-219 — shared with the HTTP stage).
 func NewOptions(cfg config.Config) Options {
 	return Options{
 		Engine:              cfg.Render.Engine,
@@ -235,8 +257,8 @@ func NewOptions(cfg config.Config) Options {
 	}
 }
 
-// withDefaults заполняет производные таймауты. Contexts не дефолтится
-// сознательно: 0 — ошибка конфигурации, а не «как-нибудь».
+// withDefaults fills the derived timeouts. Contexts is not defaulted
+// deliberately: 0 — a configuration error, not "whatever".
 func (o Options) withDefaults() Options {
 	c := o
 	if c.DialTimeout == 0 {
@@ -248,23 +270,24 @@ func (o Options) withDefaults() Options {
 	return c
 }
 
-// validate проверяет значения до передачи в chromedp: невалидные параметры
-// отклоняются здесь, а не паниками глубоко в библиотеке. Диапазоны
-// повторяют секцию render internal/config (ТЗ 5.10).
+// validate checks the values before passing them to chromedp: invalid
+// parameters are rejected here, not by panics deep in the library. The
+// ranges repeat the render section of internal/config (spec 5.10).
 func (o Options) validate() error {
 	var problems []string
-	// Движок рендера (ТЗР движков §4.2, ФТ-3): перечисление и связка
-	// «движок × remote_url × memory_threshold» повторяют валидацию
-	// секции render internal/config (T-233) — Options собирается не
-	// только из конфигурации, пограничная проверка здесь удерживает
-	// контракт аллокатора: moli|lightpanda — внешние CDP-серверы,
-	// remote_url обязателен (собственный процесс браузера — только
-	// chromium, ФТ-2), RSS чужого процесса недоступен — memory_threshold
-	// обязан быть 0. Chromium допускает оба режима подключения; порог
-	// памяти при внешнем chromium не работает, но не запрещён — как
-	// сегодня.
+	// The render engine (the engines render spec §4.2, FR-3): the
+	// enumeration and the combination "engine × remote_url ×
+	// memory_threshold" repeat the validation of the render section of
+	// internal/config (T-233) — Options is assembled not only from the
+	// configuration, the boundary check here holds the allocator
+	// contract: moli|lightpanda — external CDP servers, remote_url is
+	// mandatory (an own browser process — chromium only, FR-2), the RSS
+	// of a foreign process is unavailable — memory_threshold must be 0.
+	// Chromium allows both connection modes; the memory threshold with
+	// an external chromium does not work but is not forbidden — as
+	// today.
 	switch o.Engine {
-	case "", config.EngineChromium, config.EngineMoli, config.EngineLightpanda: // "" — как chromium (конфиг без Default())
+	case "", config.EngineChromium, config.EngineMoli, config.EngineLightpanda: // "" — as chromium (a config without Default())
 	default:
 		problems = append(problems, fmt.Sprintf("engine: ожидается %s|%s|%s, задано %q",
 			config.EngineChromium, config.EngineMoli, config.EngineLightpanda, o.Engine))
@@ -276,11 +299,12 @@ func (o Options) validate() error {
 				o.Engine, config.EngineChromium))
 		} else if u, err := url.Parse(o.RemoteURL); err != nil || u.Host == "" ||
 			(u.Scheme != "ws" && u.Scheme != "wss") {
-			// Аллокатор альтернативных движков диалит адрес конфигурации
-			// (lightpanda) или его authority (moli) напрямую в WebSocket:
-			// http(s) у него нет пути уточнения через /json/version с
-			// готовым ws-адресом, а websocket-клиент chromedp принимает
-			// только ws/wss — отказ на сборке, а не невнятный хендшейк.
+			// The alternative engines' allocator dials the configuration
+			// address (lightpanda) or its authority (moli) straight as a
+			// WebSocket: http(s) has no /json/version refinement path
+			// with a ready ws address, and the chromedp websocket client
+			// accepts only ws/wss — a rejection at assembly time, not an
+			// obscure handshake.
 			problems = append(problems, fmt.Sprintf(
 				"remote_url: для движка %s ожидается ws://host:9222, задано %q", o.Engine, o.RemoteURL))
 		}
@@ -309,19 +333,21 @@ func (o Options) validate() error {
 		problems = append(problems,
 			fmt.Sprintf("restart_every_pages: ожидается >= 1, задано %d", o.RestartEveryPages))
 	}
-	// Диапазон порога памяти повторяет render.restart_memory_bytes
-	// internal/config: 0 — контроль отключён, ниже 256 MiB — ниже холостого
-	// RSS headless-shell с контекстами (краш-луп перезапусков), выше
-	// 16 GiB — за пределами разумного бюджета одного воркера (ТЗ 3.2).
-	// Эквивалентные мутанты (T-M08): `< 0` — страховка, отрицательный
-	// порог ловится и диапазонной половиной ниже (!= 0 и < 256<<20),
-	// тем же сообщением; `< -1` отличается от `< 0` только на значении
-	// -1 — и там тем же путём. Гранулярность строки гасит и убиваемое
-	// вырезание всего правого дизъюнкта (trade-off §4
-	// docs/mutation-testing.md) — диапазонная половина закреплена
-	// TestOptionsValidate (границы 255<<20/256<<20/16<<30/17<<30 и
-	// точный текст ошибки). Инкрементер (`< 1`) не гасим: границу «0 —
-	// контроль отключён» держит тот же тест.
+	// The memory threshold range repeats render.restart_memory_bytes of
+	// internal/config: 0 — the control is off; below 256 MiB — below
+	// the idle RSS of headless-shell with contexts (a restart crash
+	// loop); above 16 GiB — beyond a sane budget of a single worker
+	// (spec 3.2). Equivalent mutants (T-M08): `< 0` is a guard, a
+	// negative threshold is caught by the range half below as well
+	// (!= 0 and < 256<<20), with the same message; `< -1` differs from
+	// `< 0` only at the value -1 — and there by the same path. The
+	// string granularity also suppresses the killable cut of the whole
+	// right disjunct (the trade-off of §4
+	// docs/mutation-testing.md) — the range half is pinned by
+	// TestOptionsValidate (the boundaries
+	// 255<<20/256<<20/16<<30/17<<30 and the exact error text). The
+	// incrementer (`< 1`) is not suppressed: the "0 — the control is
+	// off" boundary is held by the same test.
 	// mutator-disable-next-line expression/remove, numbers/decrementer
 	if o.MemoryThreshold < 0 ||
 		(o.MemoryThreshold != 0 && (o.MemoryThreshold < 256<<20 || o.MemoryThreshold > 16<<30)) {
@@ -339,13 +365,14 @@ func (o Options) validate() error {
 	return nil
 }
 
-// validateTaskURL — контроль схемы задачи рендера: открываются только
-// http/https. URL приходит из subdomain_results.final_url — в штатном
-// потоке это адрес из HTTP-редиректов, но при аномалии пайплайна или
-// компрометации БД он может нести file:///data: — браузер открыл бы
-// локальный файл, а съём DOM унёс бы его содержимое в хранилище контента
-// (R-09). Отказ — класс task: страница не рендерится, повторная доставка
-// уровня очереди (T-066).
+// validateTaskURL — the scheme check of the render task: only
+// http/https are opened. The URL comes from subdomain_results.final_url
+// — in the regular flow it is an address from HTTP redirects, but with
+// a pipeline anomaly or a DB compromise it may carry file:///data: —
+// the browser would open a local file and the DOM capture would carry
+// its contents into the content store (R-09). The failure is the task
+// class: the page is not rendered, re-delivery is the queue level
+// (T-066).
 func validateTaskURL(raw string) error {
 	u, err := url.Parse(raw)
 	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
@@ -355,23 +382,24 @@ func validateTaskURL(raw string) error {
 	return nil
 }
 
-// validateTaskURLInternal — контроль адреса задачи рендера при
-// включённом SSRF-контуре (http.block_internal_addrs, T-219): хост
-// внутреннего диапазона (renderHostInternal — IP-литералы, включая
-// IPv4-в-IPv6 и числоподобные формы WHATWG, loopback-имена) не
-// открывается, класс task — повторная доставка уровня очереди (T-066),
-// как у проверки схемы. Имя-хост проходит без резолва: его адреса уже
-// отфильтрованы HTTP-этапом под той же воронкой httpfetch, а резолв в
-// валидации задачи означал бы второй резолвер в контуре и гонку адресов с
-// DNS-этапом. Той же проверкой плюс резолвом имён (T-230, dnsCache)
-// живёт перехват запросов Chromium (blockInternal): навигации по
-// HTTP/JS-редиректам и подресурсы — включая произвольные имена,
-// резолвящиеся во внутренние адреса уже после HTTP-этапа
-// (DNS-rebinding), — блокируются в самом браузере.
+// validateTaskURLInternal — the render task address check with the SSRF
+// guard enabled (http.block_internal_addrs, T-219): an internal-range
+// host (renderHostInternal — IP literals, including IPv4-in-IPv6 and
+// the WHATWG numeric-like forms, loopback names) is not opened, the
+// task class — re-delivery at the queue level (T-066), as with the
+// scheme check. A hostname passes without a resolve: its addresses are
+// already filtered by the HTTP stage under the same httpfetch funnel,
+// and a resolve in the task validation would mean a second resolver in
+// the guard and an address race with the DNS stage. The same check plus
+// a name resolve (T-230, dnsCache) lives in the Chromium request
+// interception (blockInternal): navigations over HTTP/JS redirects and
+// subresources — including arbitrary names resolving into internal
+// addresses already after the HTTP stage (DNS-rebinding) — are blocked
+// in the browser itself.
 func validateTaskURLInternal(raw string) error {
 	u, err := url.Parse(raw)
 	if err != nil || u.Host == "" {
-		return nil // схема/хост уже отвергнуты validateTaskURL
+		return nil // the scheme/host are already rejected by validateTaskURL
 	}
 	if renderHostInternal(u.Hostname()) {
 		return &Error{Class: ClassTask, URL: raw,
@@ -380,20 +408,22 @@ func validateTaskURLInternal(raw string) error {
 	return nil
 }
 
-// renderHostInternal — хост внутренний для SSRF-контура рендера
-// (T-219): loopback-имена Chromium (localhost и поддомены — браузер
-// резолвит их в петлю сам), IP-литералы внутренних диапазонов
-// (httpfetch.AddrIsInternal — единое определение контура, включая
-// IPv4-в-IPv6) и «числоподобные» хосты, которые Chromium канонизирует
-// в IPv4 по алгоритму WHATWG («127.1», «2130706433», «0x7f.1» — все
-// 127.0.0.1; netip такие формы не разбирает, а браузер открывал бы).
-// Прочие имена проходят без резолва (их адреса на этапе задачи
-// фильтрует HTTP-этап, если имя пришло через конвейер); сами имена в
-// навигациях и подресурсах страницы резолвит и проверяет перехват
-// запросов (T-230, block.go — dnsCache), закрывая DNS-rebinding во
-// времени (смена адреса между HTTP-этапом и рендером) в самом
-// Chromium; остаточный вектор — различение атакующим двух резолвов
-// (перехвата и браузера) — держит egress-политика контейнера
+// renderHostInternal — whether the host is internal for the render SSRF
+// guard (T-219): Chromium loopback names (localhost and subdomains —
+// the browser resolves them to the loopback itself), IP literals of
+// internal ranges (httpfetch.AddrIsInternal — the unified guard
+// definition, including IPv4-in-IPv6) and "numeric-like" hosts that
+// Chromium canonicalizes into IPv4 by the WHATWG algorithm ("127.1",
+// "2130706433", "0x7f.1" — all 127.0.0.1; netip does not parse such
+// forms, but the browser would open them). Other names pass without a
+// resolve (their addresses are filtered at the task stage by the HTTP
+// stage if the name came through the pipeline); the names themselves
+// in the page's navigations and subresources are resolved and checked
+// by the request interception (T-230, block.go — dnsCache), closing
+// the time-based DNS-rebinding (an address change between the HTTP
+// stage and the render) in Chromium itself; the residual vector — the
+// attacker distinguishing the two resolves (the interception's and the
+// browser's) — is held by the egress policy of the container
 // (docs/render.md).
 func renderHostInternal(host string) bool {
 	host = strings.ToLower(strings.TrimSuffix(host, "."))
@@ -409,20 +439,21 @@ func renderHostInternal(host string) bool {
 	return false
 }
 
-// whatwgParseIPv4 — канонизация числоподобного хоста по алгоритму
-// IPv4-парсера WHATWG URL (им руководствуется Chromium): хост из 1..4
-// точечных частей, каждая — десятичное/восьмеричное (ведущий 0)/
-// шестнадцатеричное (0x) число, сворачивается в IPv4; хост, чья
-// последняя часть не число — имя, не IPv4 («0.com» проходит как имя).
-// Точная копия порогов WHATWG: не-последние части ≤ 255, последняя <
-// 256^(5−n). ok=false — хост не числоподобный (имя или мусор).
+// whatwgParseIPv4 — the canonicalization of a numeric-like host by the
+// IPv4 parser algorithm of WHATWG URL (the one Chromium follows): a
+// host of 1..4 dotted parts, each a decimal/octal (leading 0)/
+// hexadecimal (0x) number, folds into an IPv4; a host whose last part
+// is not a number is a name, not an IPv4 ("0.com" passes as a name).
+// An exact copy of the WHATWG thresholds: non-last parts ≤ 255, the
+// last < 256^(5−n). ok=false — the host is not numeric-like (a name or
+// junk).
 func whatwgParseIPv4(host string) (netip.Addr, bool) {
 	parts := strings.Split(host, ".")
 	if len(parts) == 0 || len(parts) > 4 {
 		return netip.Addr{}, false
 	}
 	if _, ok := whatwgIPv4Number(parts[len(parts)-1]); !ok {
-		return netip.Addr{}, false // не заканчивается числом — имя
+		return netip.Addr{}, false // does not end with a number — a name
 	}
 	nums := make([]uint64, len(parts))
 	for i, p := range parts {
@@ -442,15 +473,16 @@ func whatwgParseIPv4(host string) (netip.Addr, bool) {
 	}
 	var v uint64
 	for i, n := range nums[:len(nums)-1] {
-		v += n << (8 * (3 - i)) // части, кроме последней, — старшие байты
+		v += n << (8 * (3 - i)) // the parts except the last are the high bytes
 	}
 	v += nums[len(nums)-1]
 	return netip.AddrFrom4([4]byte{byte(v >> 24), byte(v >> 16), byte(v >> 8), byte(v)}), true
 }
 
-// whatwgIPv4Number — число одной части IPv4-хоста WHATWG: 0x/0X —
-// шестнадцатеричное (пустая мантисса — 0), ведущий 0 — восьмеричное,
-// иначе десятичное; пустая строка и посторонние символы — не число.
+// whatwgIPv4Number — the number of one part of a WHATWG IPv4 host:
+// 0x/0X — hexadecimal (an empty mantissa — 0), a leading 0 — octal,
+// otherwise decimal; an empty string and foreign characters are not a
+// number.
 func whatwgIPv4Number(s string) (uint64, bool) {
 	switch {
 	case len(s) >= 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X'):

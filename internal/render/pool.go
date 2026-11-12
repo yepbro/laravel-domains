@@ -7,42 +7,43 @@ import (
 	"sync/atomic"
 )
 
-// Pool — параллельная обработка задач рендера (ТЗ 5.6: «один браузер,
-// несколько изолированных контекстов, по умолчанию 2–4 параллельно»):
-// одновременно не более Options.Contexts задач, каждая — в свежем
-// изолированном профиле. Сессии не переиспользуются: контекст пересоздаётся
-// на каждую задачу, состояние между страницами не сохраняется (ТЗ §9).
+// Pool — parallel processing of render tasks (render spec 5.6: "one browser,
+// several isolated contexts, 2-4 in parallel by default"): at most
+// Options.Contexts tasks at a time, each in a fresh isolated profile.
+// Sessions are not reused: the context is recreated for every task and no
+// state is carried across pages (render spec §9).
 type Pool struct {
 	b *Browser
 
-	// slots — семафор параллелизма: ёмкость = Options.Contexts.
+	// slots — the concurrency semaphore: capacity = Options.Contexts.
 	slots chan struct{}
-	// done закрывается при Close: ожидающие слот задачи отходят сразу.
+	// done is closed on Close: tasks waiting for a slot bail out at once.
 	done chan struct{}
-	// wg — задачи в полёте; Close их дорабатывает (ТЗ 3.4).
-	// Инвариант против гонки WaitGroup: wg.Add в Run только под mu и
-	// только при closed=false, а Wait в Close стартует ПОСЛЕ retire —
-	// то есть после того, как mu гарантировал: новых Add не будет (Add
-	// на нулевом счётчике одновременно с Wait запрещён документацией
-	// sync.WaitGroup; инцидент CI 11.11.2026 — race в TestGenStateLifecycle).
+	// wg tracks tasks in flight; Close lets them finish (render spec 3.4).
+	// Invariant against the WaitGroup race: wg.Add in Run happens only under
+	// mu and only while closed=false, and Wait in Close starts AFTER retire —
+	// that is, after mu has guaranteed there will be no new Adds (an Add on
+	// a zero counter concurrent with Wait is forbidden by the sync.WaitGroup
+	// docs; the CI incident of Nov 11, 2026 — a race in
+	// TestGenStateLifecycle).
 	mu     sync.Mutex
 	wg     sync.WaitGroup
 	closed atomic.Bool
 
-	// newSession — фабрика сессий; подменяется фейками в юнит-тестах.
+	// newSession — the session factory; replaced by fakes in unit tests.
 	newSession func(ctx context.Context) (renderSession, error)
 }
 
-// renderSession — минимальный контракт сессии для пула (*Session ему
-// удовлетворяет).
+// renderSession — the minimal session contract for the pool (*Session
+// satisfies it).
 type renderSession interface {
 	Run(ctx context.Context, task RenderTask) (RenderOutput, error)
 	Close()
 }
 
-// NewPool — пул над запущенным браузером b; параллелизм берётся из
-// b.opts.Contexts. Один пул на один браузер: перезапуск браузера (T-065) —
-// новый браузер и новый пул над ним.
+// NewPool — a pool over the running browser b; parallelism is taken from
+// b.opts.Contexts. One pool per browser: a browser restart (T-065) means
+// a new browser and a new pool over it.
 func NewPool(b *Browser) *Pool {
 	p := &Pool{
 		b:     b,
@@ -55,18 +56,19 @@ func NewPool(b *Browser) *Pool {
 	return p
 }
 
-// Browser возвращает браузер пула (счётчик страниц, Alive — для цикла
-// воркера T-067 и перезапусков T-065).
+// Browser returns the pool's browser (the page counter and Alive feed the
+// worker loop of T-067 and the restarts of T-065).
 func (p *Pool) Browser() *Browser { return p.b }
 
-// Run выполняет задачу в свободном изолированном контексте, при нехватке —
-// блокируется до освобождения слота или отмены ctx. Ошибка ClassContext
-// (упавший контекст) повторяется один раз на новом контексте; ошибки
-// страницы и недоступный браузер возвращаются наверх — повторная доставка
-// остаётся уровню очереди (T-066), перезапуск браузера — T-065.
+// Run executes the task in a free isolated context, blocking until a slot
+// frees up or ctx is cancelled. A ClassContext error (a dead context) is
+// retried once on a fresh context; page errors and an unavailable browser
+// are returned to the caller — redelivery stays with the queue level
+// (T-066), browser restart is T-065.
 func (p *Pool) Run(ctx context.Context, task RenderTask) (RenderOutput, error) {
-	// Регистрация в полёте — под mu и только живого пула: сериализуется
-	// с retire (см. инвариант wg выше) — Add никогда не гоняется с Wait.
+	// In-flight registration happens under mu and only for a live pool:
+	// serialized with retire (see the wg invariant above) — Add never
+	// races with Wait.
 	p.mu.Lock()
 	if p.closed.Load() {
 		p.mu.Unlock()
@@ -77,8 +79,8 @@ func (p *Pool) Run(ctx context.Context, task RenderTask) (RenderOutput, error) {
 	defer p.wg.Done()
 	select {
 	case p.slots <- struct{}{}:
-		// Close могла произойти в гонке с выбором кейса (select берёт
-		// случайный из готовых): перепроверяем после захвата слота.
+		// Close may have happened while racing with the select (select
+		// picks a random ready case): recheck after taking the slot.
 		select {
 		case <-p.done:
 			<-p.slots
@@ -98,9 +100,9 @@ func (p *Pool) Run(ctx context.Context, task RenderTask) (RenderOutput, error) {
 		return out, nil
 	}
 	if ClassOf(err) == ClassContext && !p.closed.Load() {
-		// Мутант логирования (T-M07): Warn повтора не меняет наблюдаемого
-		// поведения — гасится по §4 docs/mutation-testing.md
-		// (логирование не тестируется).
+		// Logging mutant (T-M07): the retry Warn does not change the
+		// observable behavior — killed per §4 of docs/mutation-testing.md
+		// (logging is not tested).
 		// mutator-disable-next-line statement/remove
 		slog.Warn("контекст рендера умер, повтор задачи на новом контексте",
 			"url", task.URL, "err", err.Error())
@@ -112,8 +114,8 @@ func (p *Pool) Run(ctx context.Context, task RenderTask) (RenderOutput, error) {
 	return out, err
 }
 
-// attempt — одна попытка: свежий изолированный контекст, задача, закрытие
-// профиля независимо от результата (состояние не переживает страницу).
+// attempt — a single attempt: a fresh isolated context, the task, closing
+// the profile regardless of the outcome (no state outlives the page).
 func (p *Pool) attempt(ctx context.Context, task RenderTask) (RenderOutput, error) {
 	sess, err := p.newSession(ctx)
 	if err != nil {
@@ -123,24 +125,25 @@ func (p *Pool) attempt(ctx context.Context, task RenderTask) (RenderOutput, erro
 	return sess.Run(ctx, task)
 }
 
-// Close останавливает пул: новые задачи отклоняются (ErrClosed), текущие
-// дорабатываются — каждая ограничена Options.Timeout (ТЗ 3.4), — затем
-// останавливается браузер. Повторный вызов безвреден.
+// Close stops the pool: new tasks are rejected (ErrClosed), current ones
+// finish — each bounded by Options.Timeout (render spec 3.4) — and then the
+// browser is stopped. Calling it again is harmless.
 func (p *Pool) Close() {
 	p.retire()
 	p.wg.Wait()
 	p.b.Close()
 }
 
-// retire закрывает пул для новых задач (ErrClosed), не дожидаясь текущих:
-// менеджер (T-065) выводит сменяемое поколение из работы синхронно с
-// решением о перезапуске, а доработку задач и остановку браузера оставляет
-// фоновому Close (гонки «задача попала в закрываемый пул после acquire»
-// закрыты повтором в Manager.Run).
+// retire closes the pool to new tasks (ErrClosed) without waiting for the
+// current ones: the manager (T-065) takes the replaceable generation out of
+// service synchronously with the restart decision, leaving task completion
+// and the browser stop to the background Close (the "task landed in the
+// pool being closed after acquire" races are covered by the retry in
+// Manager.Run).
 func (p *Pool) retire() {
-	// Под mu: атомарность CAS + close(done) против wg.Add в Run (см.
-	// инвариант wg у полей пула); Wait в Close стартует после возврата
-	// отсюда — конкурентных Add на нулевом счётчике больше не бывает.
+	// Under mu: atomicity of CAS + close(done) against wg.Add in Run (see
+	// the wg invariant at the pool fields); Wait in Close starts after this
+	// returns — no concurrent Add on a zero counter can happen anymore.
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if !p.closed.CompareAndSwap(false, true) {

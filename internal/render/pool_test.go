@@ -13,7 +13,8 @@ import (
 	"time"
 )
 
-// fakeSession — сессия по контракту renderSession с настраиваемым Run.
+// fakeSession — a renderSession-contract session with a configurable
+// Run.
 type fakeSession struct {
 	run    func(ctx context.Context, task RenderTask) (RenderOutput, error)
 	closes atomic.Int32
@@ -28,12 +29,13 @@ func (f *fakeSession) Run(ctx context.Context, task RenderTask) (RenderOutput, e
 
 func (f *fakeSession) Close() { f.closes.Add(1) }
 
-// recorder — фабрика сессий для пула: помнит созданные сессии и может
-// уронить первые создания с заданной ошибкой (по номеру вызова).
+// recorder — a session factory for the pool: remembers the created
+// sessions and can fail the first creations with a given error (by
+// call number).
 type recorder struct {
 	mu       sync.Mutex
 	sessions []*fakeSession
-	fail     map[int]error // номер создания (с 0) → ошибка фабрики
+	fail     map[int]error // the creation number (from 0) → the factory error
 	calls    int
 }
 
@@ -50,8 +52,8 @@ func (r *recorder) factory(_ context.Context) (renderSession, error) {
 	return s, nil
 }
 
-// n — сессия i (0-based); все создания происходят синхронно внутри Run,
-// поэтому после его возвала достаточно прочитать.
+// session — session i (0-based); all creations happen synchronously
+// inside Run, so after it returns it is enough to read.
 func (r *recorder) session(t *testing.T, i int) *fakeSession {
 	t.Helper()
 	r.mu.Lock()
@@ -121,7 +123,7 @@ func TestPoolRetryOnDeadContext(t *testing.T) {
 			t.Errorf("сессия %d закрыта %d раз", i, s.closes.Load())
 		}
 	}
-	// Одна задача — одна страница в счётчике перезапуска.
+	// One task — one page in the restart counter.
 	if b.Pages() != 1 {
 		t.Errorf("счётчик страниц %d, хочу 1", b.Pages())
 	}
@@ -243,7 +245,7 @@ func TestPoolConcurrencyLimit(t *testing.T) {
 		}()
 	}
 
-	// Две задачи занимают оба слота, третья ждёт.
+	// Two tasks take both slots, the third waits.
 	for range 2 {
 		<-entered
 	}
@@ -260,7 +262,7 @@ func TestPoolConcurrencyLimit(t *testing.T) {
 
 	close(release)
 	wg.Wait()
-	// Все слоты вернулись.
+	// All slots returned.
 	select {
 	case p.slots <- struct{}{}:
 		<-p.slots
@@ -306,8 +308,9 @@ func TestPoolWaitCanceled(t *testing.T) {
 	<-done
 }
 
-// TestPoolNoRetryAfterRetire — закрытый пул не повторяет даже контекстную
-// ошибку: поколение уже выводится из работы, повтор — дело нового поколения.
+// TestPoolNoRetryAfterRetire — a retired pool does not retry even a
+// context error: the generation is already being taken out of service,
+// the retry is the new generation's business.
 func TestPoolNoRetryAfterRetire(t *testing.T) {
 	b := testBrowser(1)
 	p := NewPool(b)
@@ -319,7 +322,7 @@ func TestPoolNoRetryAfterRetire(t *testing.T) {
 		}
 		fs := s.(*fakeSession)
 		fs.run = func(context.Context, RenderTask) (RenderOutput, error) {
-			p.retire() // поколение сменилось по ходу первой попытки
+			p.retire() // the generation was swapped during the first attempt
 			return RenderOutput{}, ctxErr(ClassContext)
 		}
 		return s, nil
@@ -333,8 +336,9 @@ func TestPoolNoRetryAfterRetire(t *testing.T) {
 	}
 }
 
-// TestPoolCloseStopsBrowser — Close пула останавливает и браузер поколения
-// (cancel), а не только слоты: следующее поколение стартует чистым.
+// TestPoolCloseStopsBrowser — the pool Close stops the generation's
+// browser too (cancel), not only the slots: the next generation starts
+// clean.
 func TestPoolCloseStopsBrowser(t *testing.T) {
 	b := testBrowser(1)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -364,7 +368,7 @@ func TestPoolClosed(t *testing.T) {
 	if rec.calls != 0 {
 		t.Errorf("после Close создано сессий: %d", rec.calls)
 	}
-	// Повторный Close безвреден.
+	// A repeated Close is harmless.
 	p.Close()
 }
 
@@ -482,8 +486,8 @@ func TestBrowserNeedsRestart(t *testing.T) {
 }
 
 func TestBrowserRSSUnknown(t *testing.T) {
-	// rootPID не определён (remote-режим, процесс не найден) — RSS
-	// неизвестен, порог памяти не триггерует.
+	// rootPID is unset (the remote mode, no process found) — the RSS
+	// is unknown, the memory threshold does not trigger.
 	b := testBrowser(1)
 	b.opts.MemoryThreshold = 1
 	if got := b.RSS(); got != -1 {
@@ -499,8 +503,8 @@ func TestBrowserRSSUnknown(t *testing.T) {
 	if got := nilB.RSS(); got != -1 {
 		t.Errorf("RSS(nil) = %d, хочу -1", got)
 	}
-	// rootPID 1 валиден (граница «не определён» — ровно 0): дерево pid 1
-	// в контейнере непусто.
+	// rootPID 1 is valid (the "unset" boundary is exactly 0): the pid 1
+	// tree in a container is non-empty.
 	if _, err := os.Stat("/proc"); err == nil {
 		b1 := testBrowser(1)
 		b1.rootPID = 1
@@ -511,12 +515,13 @@ func TestBrowserRSSUnknown(t *testing.T) {
 }
 
 func TestBrowserOverMemory(t *testing.T) {
-	// RSS живого процесса с замороженной памятью: спящий потомок
-	// останавливается (SIGSTOP) — память между чтениями не «дышит»
-	// (RSS самого теста меняется — точные сравнения флакают), граница
-	// порога проверяется на равенстве. Страницы потомка faulted-in
-	// асинхронно (sleep контейнера — busybox): SIGSTOP сразу после
-	// Start заморозил бы нулевой RSS — сперва прогрев до ненулевого.
+	// The RSS of a live process with frozen memory: the sleeping
+	// descendant is stopped (SIGSTOP) — the memory does not "breathe"
+	// between reads (the RSS of the test itself changes — exact
+	// comparisons flake), the threshold boundary is checked by
+	// equality. The descendant's pages are faulted in asynchronously
+	// (the container's sleep is busybox): SIGSTOP right after Start
+	// would freeze a zero RSS — a warm-up to non-zero first.
 	b := testBrowser(1)
 	cmd := exec.Command("sleep", "5")
 	if err := cmd.Start(); err != nil {
@@ -540,14 +545,14 @@ func TestBrowserOverMemory(t *testing.T) {
 	if err := cmd.Process.Signal(syscall.SIGSTOP); err != nil {
 		t.Skipf("SIGSTOP не удался: %v", err)
 	}
-	// Прогрев мог закэшировать значение до SIGSTOP (T-229) — петля
-	// стабилизации обязана мерить живой /proc после заморозки, а не
-	// подпись кэша: сброс окна.
+	// The warm-up may have cached the value before the SIGSTOP (T-229)
+	// — the stabilization loop must measure the live /proc after the
+	// freeze, not the cache signature: the window reset.
 	b.mu.Lock()
 	b.rssAt = time.Time{}
 	b.mu.Unlock()
-	// Заморозили — дождаться стабильного значения (два подряд
-	// одинаковых чтения) на случай последних проживлённых страниц.
+	// Frozen — wait for a stable value (two identical reads in a row)
+	// in case of the last pages faulted in.
 	stable := time.Now().Add(2 * time.Second)
 	for time.Now().Before(stable) {
 		r := b.RSS()
@@ -559,24 +564,24 @@ func TestBrowserOverMemory(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	b.opts.MemoryThreshold = rss // ровно порог — превышен (>=)
+	b.opts.MemoryThreshold = rss // exactly the threshold — over (>=)
 	if !b.OverMemory() {
 		t.Error("RSS равен порогу: перезапуск должен срабатывать")
 	}
-	b.opts.MemoryThreshold = 1 // байт: любая живая память — превышение
+	b.opts.MemoryThreshold = 1 // byte: any live memory — over
 	if !b.OverMemory() {
 		t.Error("минимальный порог 1 байт: положительный RSS — превышение")
 	}
-	b.opts.MemoryThreshold = rss + 1<<30 // заведомо выше живого RSS
+	b.opts.MemoryThreshold = rss + 1<<30 // clearly above the live RSS
 	if b.OverMemory() {
 		t.Error("RSS ниже порога — без перезапуска")
 	}
-	b.opts.MemoryThreshold = 0 // контроль отключён
+	b.opts.MemoryThreshold = 0 // the control is off
 	if b.OverMemory() {
 		t.Error("нулевой порог отключает контроль")
 	}
 
-	// RSS == 0 (корень исчез из снимка) — не превышение.
+	// RSS == 0 (the root disappeared from the snapshot) — not over.
 	if pid := missingPID(); pid != 0 {
 		b.rootPID = pid
 		b.opts.MemoryThreshold = 1
@@ -589,11 +594,12 @@ func TestBrowserOverMemory(t *testing.T) {
 	}
 }
 
-// TestBrowserRSSCache — кэш RSS (T-229): повторные чтения того же корня
-// в окне TTL не обходят /proc (порог проверяется перед каждой задачей);
-// после TTL и смены rootPID (поколение/другой корень) — свежий снимок;
-// неположительные измерения (0 — корень исчез, -1 — /proc недоступен)
-// не кэшируются. Обход /proc и время — швы (procRSS, timeNow).
+// TestBrowserRSSCache — the RSS cache (T-229): repeated reads of the
+// same root within the TTL window do not scan /proc (the threshold is
+// checked before every task); after the TTL and a rootPID change (a
+// generation/another root) — a fresh snapshot; non-positive
+// measurements (0 — the root disappeared, -1 — /proc unavailable) are
+// not cached. The /proc scan and the time are seams (procRSS, timeNow).
 func TestBrowserRSSCache(t *testing.T) {
 	if rssCacheTTL != 10*time.Second {
 		t.Errorf("rssCacheTTL = %s, хочу 10 с (окно 5–15 с по T-229, закреплено точно — стиль movingDropTimeout)", rssCacheTTL)
@@ -612,7 +618,8 @@ func TestBrowserRSSCache(t *testing.T) {
 
 	b := &Browser{rootPID: 42}
 
-	// Первое чтение — снимок; второе в окне TTL — из кэша, без /proc.
+	// The first read — a snapshot; the second within the TTL window —
+	// from the cache, without /proc.
 	if got := b.RSS(); got != rssVal {
 		t.Fatalf("RSS = %d, хочу %d", got, rssVal)
 	}
@@ -623,7 +630,7 @@ func TestBrowserRSSCache(t *testing.T) {
 		t.Errorf("проходов /proc %d, хочу 1 (второе чтение — из кэша)", n)
 	}
 
-	// TTL истёк — свежий снимок.
+	// The TTL expired — a fresh snapshot.
 	fakeNow = fakeNow.Add(rssCacheTTL)
 	rssVal = 200 << 20
 	if got := b.RSS(); got != rssVal {
@@ -633,7 +640,8 @@ func TestBrowserRSSCache(t *testing.T) {
 		t.Errorf("проходов /proc после TTL %d, хочу 2", n)
 	}
 
-	// Смена rootPID — чужой снимок не читается, даже в окне TTL.
+	// A rootPID change — a foreign snapshot is not read, even within
+	// the TTL window.
 	b.rootPID = 43
 	rssVal = 300 << 20
 	if got := b.RSS(); got != rssVal {
@@ -643,9 +651,10 @@ func TestBrowserRSSCache(t *testing.T) {
 		t.Errorf("проходов /proc после смены корня %d, хочу 3", n)
 	}
 
-	// Неположительные измерения не кэшируются: нулевой RSS (корень
-	// исчез) повторяется проходом, а не залипает до конца TTL (время
-	// сдвинуто за окно, чтобы обе проверки шли мимо валидного кэша).
+	// Non-positive measurements are not cached: a zero RSS (the root
+	// disappeared) is repeated by a scan, not stuck until the end of
+	// the TTL (the time is shifted past the window so that both checks
+	// bypass the valid cache).
 	fakeNow = fakeNow.Add(rssCacheTTL)
 	rssVal = 0
 	if got := b.RSS(); got != 0 {
@@ -659,8 +668,9 @@ func TestBrowserRSSCache(t *testing.T) {
 	}
 }
 
-// missingPID — числовой pid, отсутствующий в /proc (0, если не нашёлся):
-// RSS такого корня — 0 (снимок есть, корня в нём нет).
+// missingPID — a numeric pid missing from /proc (0 if none found):
+// the RSS of such a root is 0 (the snapshot exists, the root is not in
+// it).
 func missingPID() int {
 	for p := 1 << 18; p < 1<<18+4096; p++ {
 		if _, err := os.Stat("/proc/" + strconv.Itoa(p)); err != nil {

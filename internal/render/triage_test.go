@@ -1,14 +1,15 @@
 package render
 
-// Триаж выживших мутантов CI-прогона части C (render, 10.11.2026,
-// score 0.916 — 54 выживших): поведенческие дыры закрываются тестами
-// этого файла и дополнением таблиц TestWhatwgParseIPv4 и
-// TestOptionsValidate в render_test.go; доказуемо эквивалентные мутанты
-// погашены блэклистом (test/mutation/blacklist.txt, группы обоснований —
-// docs/mutation-testing.md §4). Тесты герметичны (швы LookupHost,
-// procRSS/timeNow, фейковое время кэша) и не спят дольше 50 мс на обмен:
-// сюит пакета исполняется на каждого мутанта в CI и лишних секунд
-// себе позволять не может.
+// The triage of the surviving mutants of the CI run, part C (render,
+// Nov 10, 2026, score 0.916 — 54 survivors): the behavioral holes are
+// closed by the tests of this file and by extending the tables of
+// TestWhatwgParseIPv4 and TestOptionsValidate in render_test.go; the
+// provably equivalent mutants are suppressed by the blacklist
+// (test/mutation/blacklist.txt, the rationale groups —
+// docs/mutation-testing.md §4). The tests are hermetic (the LookupHost,
+// procRSS/timeNow seams, the fake cache time) and do not sleep longer
+// than 50 ms per exchange: the suite of the package runs for every
+// mutant in CI and cannot afford extra seconds.
 
 import (
 	"context"
@@ -20,11 +21,12 @@ import (
 	"github.com/chromedp/chromedp"
 )
 
-// TestWhatwgIPv4Number — прямой контракт числа одной части IPv4-хоста
-// WHATWG: обе шестнадцатеричные приставки (0x/0X) равноправны, формы
-// держат полную ширину uint64 (граница 2^63/maxuint64 — bitSize 64, а
-// не «почти 64»), посторонний символ — не число (hex-детект по s[1] без
-// проверки ведущего нуля принимал бы «9x» за пустую мантиссу).
+// TestWhatwgIPv4Number — the direct contract of the number of one part
+// of a WHATWG IPv4 host: both hexadecimal prefixes (0x/0X) are equal,
+// the forms hold the full uint64 width (the 2^63/maxuint64 boundary —
+// bitSize 64, not "almost 64"), a foreign character is not a number
+// (the hex detection by s[1] without a leading-zero check would take
+// "9x" for an empty mantissa).
 func TestWhatwgIPv4Number(t *testing.T) {
 	cases := []struct {
 		s    string
@@ -51,11 +53,12 @@ func TestWhatwgIPv4Number(t *testing.T) {
 	}
 }
 
-// TestValidateTaskURLInternalTriage — контракты адресного контроля
-// задачи (T-219): неразбираемый URL и пустой хост уже отвергнуты
-// валидацией схемы (validateTaskURL) — адресной проверки нет (nil) и
-// паники на нил-URL быть не должно; внутренний числоподобный хост —
-// task-ошибка до перехода на страницу.
+// TestValidateTaskURLInternalTriage — the contracts of the task address
+// check (T-219): an unparseable URL and an empty host are already
+// rejected by the scheme validation (validateTaskURL) — there is no
+// address check (nil) and there must be no panic on a nil URL; an
+// internal numeric-like host — a task error before navigating to the
+// page.
 func TestValidateTaskURLInternalTriage(t *testing.T) {
 	for _, raw := range []string{"http://[::1", "http:///path", "not a url"} {
 		if err := validateTaskURLInternal(raw); err != nil {
@@ -68,12 +71,13 @@ func TestValidateTaskURLInternalTriage(t *testing.T) {
 	}
 }
 
-// TestRequestURLInternalTriage — литеральные формы хоста не резолвятся
-// вовсе (адрес известен без DNS-обмена): внешний IPv6-литерал (мимо
-// числоподобной ветки WHATWG) и внешняя десятичная числоподобная форма
-// («134744072» = 8.8.8.8) дают вердикт без единого обращения к
-// резолверу; неразбираемый URL — не внутренний, без паники. Имя-хост
-// доходит до резолва ровно один раз.
+// TestRequestURLInternalTriage — literal host forms are not resolved
+// at all (the address is known without a DNS exchange): an external
+// IPv6 literal (bypassing the WHATWG numeric-like branch) and an
+// external decimal numeric-like form ("134744072" = 8.8.8.8) get a
+// verdict without a single resolver call; an unparseable URL is not
+// internal, without a panic. A hostname reaches the resolve exactly
+// once.
 func TestRequestURLInternalTriage(t *testing.T) {
 	lookup := &fakeLookupHost{addrs: map[string][]netip.Addr{
 		"fallback.example.net": {netip.MustParseAddr("203.0.113.7")},
@@ -103,12 +107,12 @@ func TestRequestURLInternalTriage(t *testing.T) {
 	}
 }
 
-// TestDNSCacheDefaultsTriage — швы и продуктовые константы кэша
-// резолвов (T-230): нулевой LookupHost подменяется системным
-// резолвером, лениво достраивается шов времени, потолок обмена —
-// ровно 3 с (докомментарий dnsLookupTimeout: выше холодной рекурсии
-// unbound, ниже таймаута страницы). Кэш без предустановленного now
-// работает и кэширует вердикт.
+// TestDNSCacheDefaultsTriage — the seams and production constants of
+// the resolve cache (T-230): a nil LookupHost is replaced by the system
+// resolver, the time seam is built lazily, the exchange cap is exactly
+// 3 s (the dnsLookupTimeout doc comment: above the cold unbound
+// recursion, below the page timeout). A cache without a preset now
+// works and caches the verdict.
 func TestDNSCacheDefaultsTriage(t *testing.T) {
 	c := newDNSCache(nil)
 	if c.lookup == nil {
@@ -138,13 +142,14 @@ func TestDNSCacheDefaultsTriage(t *testing.T) {
 	}
 }
 
-// TestDNSCacheExchangeTimeoutTriage — граничные потолки одного обмена
-// (T-230): timeout == 0 означает «без обёртки дедлайна» — резолв идёт
-// напрямую и его ответ (внутренний адрес) становится вердиктом;
-// положительный потолок ниже времени ответа обрезает обмен — вердикт
-// fail-open и не кэшируется. Резолвер уважает контекст обмена; запас
-// 50 мс на ответ против наносекундного дедлайна снимает зависимость
-// от таймингов планировщика.
+// TestDNSCacheExchangeTimeoutTriage — the boundary caps of a single
+// exchange (T-230): timeout == 0 means "no deadline wrapper" — the
+// resolve goes directly and its answer (an internal address) becomes
+// the verdict; a positive cap below the answer time cuts the exchange
+// off — the verdict is fail-open and is not cached. The resolver
+// respects the exchange context; the 50 ms margin for the answer
+// against a nanosecond deadline removes the dependence on the
+// scheduler timings.
 func TestDNSCacheExchangeTimeoutTriage(t *testing.T) {
 	lookup := func(ctx context.Context, _ string) ([]netip.Addr, error) {
 		select {
@@ -165,7 +170,7 @@ func TestDNSCacheExchangeTimeoutTriage(t *testing.T) {
 	}
 
 	cut := newDNSCache(lookup)
-	cut.timeout = 1 // 1 нс: положительный потолок — обмен обрезается
+	cut.timeout = 1 // 1 ns: a positive cap — the exchange is cut off
 	if cut.hostInternal(context.Background(), "rebind.example.net") {
 		t.Fatal("timeout=1ns: хочу fail-open (дедлайн обгоняет обмен)")
 	}
@@ -174,11 +179,13 @@ func TestDNSCacheExchangeTimeoutTriage(t *testing.T) {
 	}
 }
 
-// TestDNSCacheTTLBoundaryTriage — границы TTL кэша резолвов: запись
-// возрастом 29,5 с ещё свежа (вердикт из кэша, без обмена), возрастом
-// ровно 30 с — истекла (свежий обмен берёт новый ответ DNS). Литералы
-// пинят продуктовые 30 с (dnsCacheTTL): срез границ — то, что держит
-// контур DNS-rebinding (T-230) от залипания вердикта дольше окна.
+// TestDNSCacheTTLBoundaryTriage — the TTL boundaries of the resolve
+// cache: an entry aged 29.5 s is still fresh (the verdict from the
+// cache, no exchange), aged exactly 30 s — expired (a fresh exchange
+// takes the new DNS answer). The literals pin the production 30 s
+// (dnsCacheTTL): the slice of boundaries is what keeps the
+// DNS-rebinding guard (T-230) from the verdict sticking longer than
+// the window.
 func TestDNSCacheTTLBoundaryTriage(t *testing.T) {
 	addrs := []netip.Addr{netip.MustParseAddr("169.254.169.254")}
 	calls := 0
@@ -193,7 +200,8 @@ func TestDNSCacheTTLBoundaryTriage(t *testing.T) {
 		t.Fatal("первый обмен: хочу внутренний")
 	}
 
-	// Возраст 29,5 с < 30 с: кэш свеж — новый ответ DNS не виден.
+	// The age of 29.5 s < 30 s: the cache is fresh — the new DNS answer
+	// is not visible.
 	addrs = []netip.Addr{netip.MustParseAddr("203.0.113.7")}
 	now = now.Add(29500 * time.Millisecond)
 	if !c.hostInternal(context.Background(), "rebind.example.net") {
@@ -203,7 +211,8 @@ func TestDNSCacheTTLBoundaryTriage(t *testing.T) {
 		t.Fatalf("обменов %d, хочу 1 (свежая запись — без обмена)", calls)
 	}
 
-	// Возраст ровно 30 с: истёк — свежий обмен несёт внешний ответ.
+	// The age of exactly 30 s: expired — the fresh exchange carries the
+	// external answer.
 	now = now.Add(500 * time.Millisecond)
 	if c.hostInternal(context.Background(), "rebind.example.net") {
 		t.Fatal("возраст 30с: хочу внешний по свежему обмену")
@@ -213,10 +222,11 @@ func TestDNSCacheTTLBoundaryTriage(t *testing.T) {
 	}
 }
 
-// TestDNSCacheCanceledNotCachedTriage — обрыв обмена по отмене контекста
-// (конец страницы) — не ответ DNS: вердикт fail-open, но НЕ кэшируется;
-// повторный запрос того же хоста обменивается заново и видит уже
-// внутренний адрес (контур не замирает на «внешнем» после обрыва).
+// TestDNSCacheCanceledNotCachedTriage — an exchange cut off by a
+// context cancellation (the end of the page) is not a DNS answer: the
+// verdict is fail-open but is NOT cached; a repeated request for the
+// same host exchanges again and already sees the internal address (the
+// guard does not freeze at "external" after the cut-off).
 func TestDNSCacheCanceledNotCachedTriage(t *testing.T) {
 	canceled := false
 	c := newDNSCache(func(_ context.Context, _ string) ([]netip.Addr, error) {
@@ -242,11 +252,12 @@ func TestDNSCacheCanceledNotCachedTriage(t *testing.T) {
 	}
 }
 
-// TestProbeConnTriage — контракты зонда соединения (T-218/T-226):
-// нулевой браузер и залипшая потеря соединения не зондируются (false),
-// браузер юнит-тестов без chromedp-контекста и контекст без браузерной
-// сессии (Browser == nil до первого Run) — зонду нечего проверять,
-// вердикт «жив» без похода в транспорт.
+// TestProbeConnTriage — the contracts of the connection probe
+// (T-218/T-226): a nil browser and a stuck connection loss are not
+// probed (false); a unit-test browser without a chromedp context and a
+// context without a browser session (Browser == nil before the first
+// Run) — the probe has nothing to check, the verdict is "alive"
+// without a transport round-trip.
 func TestProbeConnTriage(t *testing.T) {
 	var nilBrowser *Browser
 	if nilBrowser.probeConn() {
@@ -272,13 +283,14 @@ func TestProbeConnTriage(t *testing.T) {
 	}
 }
 
-// TestBrowserRSSCacheTriage — границы кэша RSS (T-229): кэшируются
-// только положительные измерения — нулевой (корень исчез из снимка) и
-// отрицательный (/proc недоступен) кэш не читается как значение и не
-// записывается (свежий снимок на каждом обращении); кэш с тем же
-// корнем, нулевым/отрицательным значением и свежей меткой — не кэш;
-// гранично малое положительное измерение (1 Б) — валидное значение и
-// пишется, и читается из кэша.
+// TestBrowserRSSCacheTriage — the boundaries of the RSS cache (T-229):
+// only positive measurements are cached — a zero one (the root
+// disappeared from the snapshot) and a negative one (/proc
+// unavailable) are neither read as a value nor written (a fresh
+// snapshot on every call); a cache with the same root, a zero/negative
+// value and a fresh label — not a cache; a boundary-small positive
+// measurement (1 B) is a valid value and is both written and read from
+// the cache.
 func TestBrowserRSSCacheTriage(t *testing.T) {
 	oldProc, oldNow := procRSS, timeNow
 	fakeNow := time.Now()
@@ -287,8 +299,8 @@ func TestBrowserRSSCacheTriage(t *testing.T) {
 	timeNow = func() time.Time { return fakeNow }
 	t.Cleanup(func() { procRSS, timeNow = oldProc, oldNow })
 
-	// Нулевой и отрицательный кэш того же корня со свежей меткой —
-	// не значения: обращение уходит в измерение.
+	// The zero and negative cache of the same root with a fresh label
+	// — not values: the call goes to a measurement.
 	rss = 777
 	zero := &Browser{rootPID: 1234, rssPID: 1234, rss: 0, rssAt: fakeNow}
 	if got := zero.RSS(); got != 777 {
@@ -299,8 +311,9 @@ func TestBrowserRSSCacheTriage(t *testing.T) {
 		t.Fatalf("отрицательный кэш: RSS = %d, хочу 777 (свежий снимок)", got)
 	}
 
-	// Измерение 0 (корень исчез) и -1 (/proc недоступен) — не
-	// значения, а их отсутствие: не кэшируются (метка не пишется).
+	// A measurement of 0 (the root disappeared) and -1 (/proc
+	// unavailable) are not values but their absence: not cached (the
+	// label is not written).
 	rss = 0
 	gone := &Browser{rootPID: 4242424}
 	if got := gone.RSS(); got != 0 {
@@ -319,8 +332,8 @@ func TestBrowserRSSCacheTriage(t *testing.T) {
 		t.Fatalf("снимок -1 закэширован (rssAt=%v) — кэш только положительных", noProc.rssAt)
 	}
 
-	// Граничное положительное 1 Б: пишется в кэш и читается из него
-	// (второе обращение не измеряет заново).
+	// The boundary positive 1 B: written to the cache and read from it
+	// (the second call does not measure again).
 	rss = 1
 	one := &Browser{rootPID: 1234}
 	if got := one.RSS(); got != 1 {

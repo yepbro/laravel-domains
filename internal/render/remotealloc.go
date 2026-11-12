@@ -1,20 +1,20 @@
 package render
 
-// Аллокатор remote-режима (внешний Chromium, Options.RemoteURL) —
-// функциональный аналог remote.Allocator chromedp с одним принципиальным
-// отличием: детерминированным закрытием соединения (T-218, инцидент
-// 02.11). Upstream закрывает WebSocket только после завершения насосов
-// chromedp (browser.run), а транспорт библиотеки не ограничен во
-// времени: remote.Conn.Write не имеет дедлайна и игнорирует контекст,
-// remote.Conn.Read игнорирует контекст вовсе — на полузакрытом или
-// подвисшем соединении (NAT/conntrack между воркером и Chromium,
-// подвисший при остановке браузер) насос висит в записи до исчерпания
-// TCP-ретрансмиссий (минуты), чтение — бесконечно. Сокеты при этом
-// остаются ESTABLISHED: у воркеров инцидента их накопилось 284 к :9222
-// за ~6 ч. Здесь после отмены контекста сначала выполняется штатное
-// закрытие вкладок chromedp (ограничено таймаутами самой библиотеки),
-// затем сокет закрывается принудительно — независимо от состояния
-// насосов.
+// The allocator of the remote mode (an external Chromium,
+// Options.RemoteURL) — a functional analog of the chromedp
+// remote.Allocator with one principal difference: deterministic closure
+// of the connection (T-218, the Nov 2 incident). Upstream closes the
+// WebSocket only after the chromedp pumps (browser.run) finish, and the
+// library transport is not time-bounded: remote.Conn.Write has no
+// deadline and ignores the context, remote.Conn.Read ignores the context
+// entirely — on a half-closed or hung connection (NAT/conntrack between
+// the worker and Chromium, a browser hung on shutdown) a pump hangs in
+// writing until the TCP retransmissions run out (minutes), reading hangs
+// forever. The sockets stay ESTABLISHED: the incident's workers
+// accumulated 284 k of them to :9222 over ~6 h. Here, after the context
+// is cancelled, the regular chromedp tab closure runs first (bounded by
+// the library's own timeouts), then the socket is closed forcibly —
+// regardless of the pump state.
 
 import (
 	"context"
@@ -33,11 +33,12 @@ import (
 	"crawler/internal/config"
 )
 
-// remoteDial — подключение транспорта к внешнему Chromium (WebSocket).
-// Шов юнит-тестов: подменяется управляемым фейком — «чёрная дыра» CDP
-// (чтение висит, записи принимаются) и «воскрешение» браузера новым
-// соединением (reconnect_test.go, T-218). Продуктовый путь —
-// remote.DialContext с таймаутом Options.DialTimeout.
+// remoteDial — connecting the transport to the external Chromium
+// (WebSocket). The unit-test seam: replaced by a controllable fake — a
+// CDP "black hole" (reads hang, writes are accepted) and a "resurrection"
+// of the browser with a new connection (reconnect_test.go, T-218). The
+// production path — remote.DialContext with the Options.DialTimeout
+// timeout.
 var remoteDial = func(ctx context.Context, wsURL string, timeout time.Duration) (chromedp.Transport, error) {
 	dctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -48,63 +49,67 @@ var remoteDial = func(ctx context.Context, wsURL string, timeout time.Duration) 
 	return conn, nil
 }
 
-// remoteResolve — резолв хоста Chromium в адреса; шов юнит-тестов
-// resolveRemoteWSURL (порядок адресов ответа DNS, T-229), продуктовый
-// путь — net.DefaultResolver (стиль remoteDial).
+// remoteResolve — resolving the Chromium host into addresses; the unit
+// test seam of resolveRemoteWSURL (the address order of the DNS answer,
+// T-229); the production path — net.DefaultResolver (the remoteDial
+// style).
 var remoteResolve = func(ctx context.Context, host string) ([]net.IPAddr, error) {
 	return net.DefaultResolver.LookupIPAddr(ctx, host)
 }
 
-// remoteAllocator — аллокатор браузерной сессии поверх внешнего
-// Chromium: одно WebSocket-соединение на поколение браузера (StartBrowser
-// создаёт аллокатор заново). Реализует chromedp.Allocator и
-// chromedp.Attacher — семантика «браузер уже запущен» обязательна (см.
-// Attaches).
+// remoteAllocator — the browser session allocator over an external
+// Chromium: one WebSocket connection per browser generation (StartBrowser
+// creates the allocator anew). Implements chromedp.Allocator and
+// chromedp.Attacher — the "the browser is already running" semantics are
+// mandatory (see Attaches).
 type remoteAllocator struct {
 	wsURL       string
 	dialTimeout time.Duration
-	// urlMode — режим подготовки адреса подключения (ТЗР движков §4.2
-	// п.1/п.3): движковые CDP-нюансы фиксируются параметрами аллокатора,
-	// не кодом ядра. Ставится в newRemoteAllocator по Options.Engine.
+	// urlMode — the mode of preparing the connection address (the
+	// engines render spec §4.2 items 1/3): the engine-specific CDP
+	// nuances are fixed by allocator parameters, not by core code. Set
+	// in newRemoteAllocator by Options.Engine.
 	urlMode wsURLMode
 
 	wg sync.WaitGroup
 }
 
-// wsURLMode — режим подготовки адреса подключения к внешнему движку
-// (ТЗР движков §4.2 п.1: движковая специфика — только здесь). Поведение
-// подтверждено на закреплённых образах стека (moli v1.1.21,
-// lightpanda 1.0.2): moli отдаёт browser-WebSocket только на пути
-// /devtools/browser/<uuid>, генерируемом на каждый старт процесса
-// (хендшейк на корне — 404, на uuid-пути — 101, uuid меняется
-// рестартом), lightpanda — на корневом пути самого адреса (хендшейк
-// на «/» — 101).
+// wsURLMode — the mode of preparing the connection address to the
+// external engine (the engines render spec §4.2 item 1: engine specifics
+// live only here). The behavior is confirmed on the pinned stack images
+// (moli v1.1.21, lightpanda 1.0.2): moli serves the browser WebSocket
+// only on the /devtools/browser/<uuid> path generated on every process
+// start (a handshake at the root — 404, at the uuid path — 101; the uuid
+// changes on restart), lightpanda — at the root path of the address
+// itself (a handshake at "/" — 101).
 type wsURLMode int
 
 const (
-	// wsURLResolve — chromium: резолв хоста в IP и уточнение адреса
-	// запросом /json/version (resolveRemoteWSURL); рекламируемый
-	// webSocketDebuggerUrl используется как есть — Chromium строит его
-	// от того же слушателя.
+	// wsURLResolve — chromium: resolving the host into an IP and
+	// refining the address with a /json/version request
+	// (resolveRemoteWSURL); the advertised webSocketDebuggerUrl is used
+	// as is — Chromium builds it from the same listener.
 	wsURLResolve wsURLMode = iota
-	// wsURLAsIs — lightpanda: browser-WebSocket живёт на корневом пути
-	// адреса — подключение идёт по адресу конфигурации без изменений
-	// (аналог опции remote.NoModifyURL chromedp/remote); реклама
-	// /json/version строится от адреса бинда и для подключения не
-	// используется.
+	// wsURLAsIs — lightpanda: the browser WebSocket lives at the root
+	// path of the address — the connection goes to the configuration
+	// address unchanged (an analog of the remote.NoModifyURL option of
+	// chromedp/remote); the /json/version advertisement is built from the
+	// bind address and is not used for connecting.
 	wsURLAsIs
-	// wsURLResolveAuthority — moli: путь browser-сессии обязан
-	// уточняться запросом /json/version (uuid-путь нов на каждый старт),
-	// но authority (хост:порт) рекламируемого URL подменяется адресом
-	// конфигурации: moli строит рекламу от адреса бинда (флага
-	// advertise-host нет), при бинде 0.0.0.0/127.0.0.1 она недостижима
-	// извне контейнера — см. wsURLWithAuthority.
+	// wsURLResolveAuthority — moli: the browser session path must be
+	// refined with a /json/version request (the uuid path is new on every
+	// start), but the authority (host:port) of the advertised URL is
+	// replaced with the configuration address: moli builds the
+	// advertisement from the bind address (there is no advertise-host
+	// flag), and with 0.0.0.0/127.0.0.1 bound it is unreachable from
+	// outside the container — see wsURLWithAuthority.
 	wsURLResolveAuthority
 )
 
-// newRemoteAllocator — аллокатор для Options.RemoteURL (DialTimeout —
-// бюджет и уточнения адреса, и подключения). Режим адреса — по движку
-// (Options.Engine; chromium и "" — уточнение, как до этапа 35).
+// newRemoteAllocator — the allocator for Options.RemoteURL (DialTimeout
+// bounds both the address refinement and the connection). The address
+// mode is by engine (Options.Engine; chromium and "" — refinement, as
+// before stage 35).
 func newRemoteAllocator(opts Options) *remoteAllocator {
 	a := &remoteAllocator{wsURL: opts.RemoteURL, dialTimeout: opts.DialTimeout, urlMode: wsURLResolve}
 	switch opts.Engine {
@@ -116,10 +121,11 @@ func newRemoteAllocator(opts Options) *remoteAllocator {
 	return a
 }
 
-// Allocate удовлетворяет chromedp.Allocator: ctx — контекст браузерной
-// сессии chromedp (контекст первого Run/Do); его отмена останавливает
-// сессию — сначала мягко (команды закрытия вкладок), затем принудительно
-// (сокет). dial-часть ограничена dialTimeout через remoteDial.
+// Allocate satisfies chromedp.Allocator: ctx is the context of the
+// chromedp browser session (the context of the first Run/Do); its
+// cancellation stops the session — first softly (tab closing commands),
+// then forcibly (the socket). The dial part is bounded by dialTimeout
+// via remoteDial.
 func (a *remoteAllocator) Allocate(ctx context.Context, opts ...chromedp.BrowserOption) (*chromedp.Browser, error) {
 	wsURL, err := a.dialURL(ctx)
 	if err != nil {
@@ -129,31 +135,32 @@ func (a *remoteAllocator) Allocate(ctx context.Context, opts ...chromedp.Browser
 	if err != nil {
 		return nil, fmt.Errorf("подключение к Chromium %s: %w", a.wsURL, err)
 	}
-	// wctx — контекст жизни сессии, отдельный от ctx (как у
-	// remote.Allocator): отмена клиентского контекста не должна рвать
-	// соединение до закрытия вкладок.
+	// wctx — the session lifetime context, separate from ctx (as in
+	// remote.Allocator): cancelling the client context must not tear
+	// down the connection before the tabs are closed.
 	wctx, wcancel := context.WithCancel(context.Background())
 	a.wg.Go(func() {
 		<-ctx.Done()
-		// Штатный путь: закрыть вкладки и изолированные контексты по
-		// сокету. Ожидание ограничено таймаутами самой chromedp
-		// (closeTargetTimeout 5 с + waitTargetGone 0.5 с) и на мёртвом
-		// соединении; результат здесь не важен — сокет закрывается
-		// принудительно в любом случае.
+		// The regular path: close the tabs and isolated contexts over the
+		// socket. The wait is bounded by chromedp's own timeouts
+		// (closeTargetTimeout 5 s + waitTargetGone 0.5 s) even on a dead
+		// connection; the result does not matter here — the socket is
+		// closed forcibly either way.
 		_ = chromedp.Cancel(ctx)
-		// Принудительный финал: Close идемпотентен и разблокирует
-		// зависшие чтение/запись насосов — сокет освобождается в
-		// границы таймаутов chromedp, а не TCP-ретрансмиссий.
+		// The forced finale: Close is idempotent and unblocks the pumps'
+		// hung reads/writes — the socket is released within chromedp's
+		// timeouts, not the TCP retransmissions.
 		_ = tr.Close()
 		wcancel()
 	})
 	return chromedp.NewBrowserTransport(wctx, tr, opts...)
 }
 
-// dialURL — адрес WebSocket-подключения по режиму движка (wsURLMode):
-// chromium уточняет адрес (резолв хоста + /json/version), lightpanda
-// использует адрес конфигурации как есть, moli уточняет путь через
-// /json/version, но подключается с authority адреса конфигурации.
+// dialURL — the WebSocket connection address by engine mode (wsURLMode):
+// chromium refines the address (host resolve + /json/version), lightpanda
+// uses the configuration address as is, moli refines the path via
+// /json/version but connects with the authority of the configuration
+// address.
 func (a *remoteAllocator) dialURL(ctx context.Context) (string, error) {
 	if a.urlMode == wsURLAsIs {
 		return a.wsURL, nil
@@ -165,13 +172,15 @@ func (a *remoteAllocator) dialURL(ctx context.Context) (string, error) {
 	return wsURLWithAuthority(ws, a.wsURL)
 }
 
-// wsURLWithAuthority — webSocketDebuggerUrl с authority (хост:порт)
-// адреса конфигурации (режим moli): путь browser-сессии движка
-// (/devtools/browser/<uuid>, новый на каждый старт) и схема остаются от
-// рекламы, а адрес подключения берётся тот, что задан оператором, —
-// движок строит рекламу от адреса бинда, и при бинде 0.0.0.0/127.0.0.1
-// она недостижима извне контейнера. Адрес конфигурации уже прошёл
-// валидацию (непустой хост); пустой разбор здесь — защитный отказ.
+// wsURLWithAuthority — the webSocketDebuggerUrl with the authority
+// (host:port) of the configuration address (the moli mode): the engine's
+// browser session path (/devtools/browser/<uuid>, new on every start)
+// and the scheme stay from the advertisement, while the connection
+// address is the one set by the operator — the engine builds the
+// advertisement from the bind address, and with 0.0.0.0/127.0.0.1 bound
+// it is unreachable from outside the container. The configuration
+// address has already passed validation (a non-empty host); an empty
+// parse here is a defensive failure.
 func wsURLWithAuthority(wsURL, cfgURL string) (string, error) {
 	ws, err := url.Parse(wsURL)
 	if err != nil {
@@ -188,30 +197,34 @@ func wsURLWithAuthority(wsURL, cfgURL string) (string, error) {
 	return ws.String(), nil
 }
 
-// Attaches удовлетворяет chromedp.Attacher: браузер уже запущен внешним
-// процессом (юнит crawler-chromium / compose-сервис chromium), аллокатор
-// лишь подключается. Признак меняет семантику браузерного контекста
-// chromedp: без него контекст считался бы владельцем браузера — закрытие
-// шло бы командой Browser.close (гасит общий внешний Chromium), а
-// служебная вкладка сессии ждалась бы событием, а не создавалась.
+// Attaches satisfies chromedp.Attacher: the browser is already started
+// by an external process (the crawler-chromium unit / the chromium
+// compose service), the allocator only connects. The flag changes the
+// semantics of the chromedp browser context: without it the context
+// would be considered the browser's owner — closing would go through
+// the Browser.close command (kills the shared external Chromium), and
+// the session's service tab would be awaited as an event rather than
+// created.
 func (a *remoteAllocator) Attaches() bool { return true }
 
-// Wait удовлетворяет chromedp.Allocator: фоновые закрытия соединений
-// аллокатора завершены.
+// Wait satisfies chromedp.Allocator: the allocator's background
+// connection closures have completed.
 func (a *remoteAllocator) Wait() { a.wg.Wait() }
 
-// preferIPv4 — адрес подключения из ответа резолва (T-229): первый IPv4,
-// если он есть, иначе первый адрес. DNS может отдавать IPv6-first
-// (сортировка адресов dual-stack хоста), а Chromium внешнего юнита
-// слушает IPv4 (docker публикует :9222 на 0.0.0.0, systemd-юнит
-// crawler-chromium — на адрес хоста): попытка v6-адреса к v4-only
-// слушателю отказала бы при живом браузере — поколение не поднялось бы.
-// Перебор адресов с попыткой подключения здесь избыточен: резолв только
-// строит URL, фактическое подключение — remoteDial за Options.DialTimeout;
-// v6-only хост продолжает работать первым адресом.
+// preferIPv4 — the connection address from the resolve answer (T-229):
+// the first IPv4 if there is one, otherwise the first address. DNS may
+// answer IPv6-first (the address sorting of a dual-stack host), while
+// the Chromium of the external unit listens on IPv4 (docker publishes
+// :9222 on 0.0.0.0, the crawler-chromium systemd unit — on the host
+// address): a v6 address attempt to a v4-only listener would fail with
+// the browser alive — the generation would not come up. Trying the
+// addresses with connection attempts here is redundant: the resolve
+// only builds the URL, the actual connection is remoteDial within
+// Options.DialTimeout; a v6-only host keeps working with the first
+// address.
 //
-// Контракт входа — net.Resolver.LookupIPAddr: err == nil гарантирует
-// непустой срез (отсутствие записей — ошибка), индексация [0] безопасна.
+// The input contract is net.Resolver.LookupIPAddr: err == nil guarantees
+// a non-empty slice (no records — an error), indexing [0] is safe.
 func preferIPv4(addrs []net.IPAddr) net.IPAddr {
 	for _, a := range addrs {
 		if a.IP.To4() != nil {
@@ -221,18 +234,19 @@ func preferIPv4(addrs []net.IPAddr) net.IPAddr {
 	return addrs[0]
 }
 
-// resolveRemoteWSURL — WebSocket-адрес браузера для подключения: адрес
-// конфигурации с путём /devtools/browser/ — готовый адрес и используется
-// как есть; иначе уточняется запросом /json/version
-// (webSocketDebuggerUrl), как это делает remote.Allocator. Хост, не
-// являющийся IP/localhost, резолвится в IP (предпочтение IPv4 —
-// preferIPv4): Chrome ≥66 требует, чтобы Host-заголовок подключения был
-// IP-адресом или localhost.
+// resolveRemoteWSURL — the browser WebSocket address to connect to: a
+// configuration address with the /devtools/browser/ path is a ready
+// address and is used as is; otherwise it is refined with a
+// /json/version request (webSocketDebuggerUrl), as remote.Allocator
+// does. A host that is not an IP/localhost is resolved into an IP
+// (IPv4 preferred — preferIPv4): Chrome ≥66 requires the Host header of
+// the connection to be an IP address or localhost.
 func resolveRemoteWSURL(ctx context.Context, raw string, timeout time.Duration) (string, error) {
-	// Один потолок timeout на всё уточнение адреса (резолв и запрос):
-	// входной ctx — контекст жизненного цикла браузера, без дедлайна
-	// (контракт StartBrowser), а Options.DialTimeout по доке ограничивает
-	// и уточнение адреса (render.go, Options.DialTimeout).
+	// One timeout cap for the whole address refinement (the resolve and
+	// the request): the input ctx is the browser lifecycle context
+	// without a deadline (the StartBrowser contract), and per the docs
+	// Options.DialTimeout bounds the address refinement as well
+	// (render.go, Options.DialTimeout).
 	rctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	u, err := url.Parse(raw)
@@ -250,10 +264,11 @@ func resolveRemoteWSURL(ctx context.Context, raw string, timeout time.Duration) 
 		} else if ip.IP.To4() != nil {
 			u.Host = ip.String()
 		} else {
-			// IPv6 без порта — только в скобках: голые двоеточия в host
-			// перепарсились бы схемой «host:port» (Hostname "2001:db8:",
-			// Port "1"). JoinHostPort ставит скобки сам, ветка с портом
-			// в этом не нуждается (T-229, ревью P3-7).
+			// IPv6 without a port — in brackets only: bare colons in the
+			// host would be re-parsed by the "host:port" scheme
+			// (Hostname "2001:db8:", Port "1"). JoinHostPort adds the
+			// brackets itself; the port branch does not need this
+			// (T-229, review P3-7).
 			u.Host = "[" + ip.String() + "]"
 		}
 	}
@@ -263,7 +278,8 @@ func resolveRemoteWSURL(ctx context.Context, raw string, timeout time.Duration) 
 	q := *u
 	q.Scheme = "http"
 	if u.Scheme == "wss" || u.Scheme == "https" {
-		// Защищённые схемы не понижаются до plaintext-запроса /json/version.
+		// Secure schemes are not downgraded to a plaintext /json/version
+		// request.
 		q.Scheme = "https"
 	}
 	q.Path = "/json/version"

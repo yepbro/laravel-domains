@@ -13,15 +13,16 @@ import (
 	"crawler/internal/config"
 )
 
-// TestMain глушит служебный лог пакета (Warn пула при повторах) в выводе
-// go test.
+// TestMain silences the package's service log (the pool Warn on
+// retries) in the go test output.
 func TestMain(m *testing.M) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 	os.Exit(m.Run())
 }
 
-// testBrowser — браузер без запуска процесса: только опции и счётчик
-// страниц (юнит-тесты пула и классификации; Close/Alive безопасны на нулях).
+// testBrowser — a browser without starting a process: only options and
+// the page counter (the pool and classification unit tests; Close/Alive
+// are safe on zeros).
 func testBrowser(contexts int) *Browser {
 	return &Browser{opts: Options{
 		Contexts:            contexts,
@@ -52,13 +53,14 @@ func TestNewOptions(t *testing.T) {
 		RestartEveryPages:   500,
 		MemoryThreshold:     1536 << 20,
 		UserAgent:           "Crawler/1.0 (+https://example.example; admin@example.example)",
-		MaxDOMBytes:         cfg.Content.MaxStoreBytes.B(), // R-02: потолок DOM — лимит хранилища
+		MaxDOMBytes:         cfg.Content.MaxStoreBytes.B(), // R-02: the DOM cap — the store limit
 		BlockStylesheet:     true,
 		BlockTrackerDomains: true,
 	}
-	// LookupHost — шов тестов (T-230): сборка из конфигурации оставляет
-	// nil (перехват берёт системный резолвер); Options с полем-функцией
-	// не сравнима оператором ==, поэтому DeepEqual.
+	// LookupHost — the tests' seam (T-230): a build from the
+	// configuration leaves it nil (the interception takes the system
+	// resolver); Options with a function field is not comparable with
+	// ==, hence DeepEqual.
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("NewOptions:\n got %+v\nwant %+v", got, want)
 	}
@@ -67,10 +69,11 @@ func TestNewOptions(t *testing.T) {
 	}
 }
 
-// TestNewOptionsEngine — проводка движка рендера (ТЗР движков §4.2,
-// ФТ-4): render.engine переносится в Options как есть, без нормализации
-// («» = chromium — семантика валидации, не сборки); дальше движок читают
-// только validate и remote-аллокатор.
+// TestNewOptionsEngine — the render engine wiring (the engines render
+// spec §4.2, FR-4): render.engine is carried into Options as is, without
+// normalization ("" = chromium — the semantics of validation, not of
+// assembly); further on, only validate and the remote allocator read
+// the engine.
 func TestNewOptionsEngine(t *testing.T) {
 	for _, engine := range []string{"", config.EngineChromium, config.EngineMoli, config.EngineLightpanda} {
 		cfg := config.Default()
@@ -90,7 +93,8 @@ func TestOptionsWithDefaults(t *testing.T) {
 	if got.SessionStartTimeout != 15*time.Second {
 		t.Errorf("SessionStartTimeout = %s, хочу 15s", got.SessionStartTimeout)
 	}
-	// Прочие поля — как заданы: скрытые дефолты не маскируют конфигурацию.
+	// The other fields — as set: hidden defaults do not mask the
+	// configuration.
 	if got.Contexts != 0 || got.Timeout != 0 {
 		t.Errorf("withDefaults затёр пустые поля: %+v", got)
 	}
@@ -106,16 +110,17 @@ func TestOptionsValidate(t *testing.T) {
 	if err := valid.validate(); err != nil {
 		t.Fatalf("валидные опции отклонены: %v", err)
 	}
-	// RemoteURL не обязателен: пусто — локальный режим.
+	// RemoteURL is not mandatory: empty — the local mode.
 	local := valid
 	local.RemoteURL = ""
 	if err := local.validate(); err != nil {
 		t.Fatalf("локальный режим отклонён: %v", err)
 	}
 
-	// Булевы опции без диапазона: оба значения легальны — для
-	// block_stylesheet (T-213) включение — вопрос A/B-решения, для
-	// block_tracker_domains (T-214) — вопрос экономии, не корректности.
+	// Boolean options without a range: both values are legal — for
+	// block_stylesheet (T-213) enabling is an A/B decision, for
+	// block_tracker_domains (T-214) — a matter of savings, not
+	// correctness.
 	for _, b := range []bool{false, true} {
 		opt := valid
 		opt.BlockStylesheet = b
@@ -125,8 +130,8 @@ func TestOptionsValidate(t *testing.T) {
 		}
 	}
 
-	// Разрешённые схемы remote_url: ws/wss/http/https — вырезание любой
-	// из проверок принимало бы её схему за неразрешённую.
+	// The allowed remote_url schemes: ws/wss/http/https — cutting any
+	// of the checks out would treat its scheme as disallowed.
 	for _, scheme := range []string{"ws", "wss", "http", "https"} {
 		remote := valid
 		remote.RemoteURL = scheme + "://chromium:9222"
@@ -135,7 +140,7 @@ func TestOptionsValidate(t *testing.T) {
 		}
 	}
 
-	// Границы contexts: ровно 1 и ровно 16.
+	// The contexts boundaries: exactly 1 and exactly 16.
 	for _, n := range []int{1, 16} {
 		bound := valid
 		bound.Contexts = n
@@ -144,15 +149,16 @@ func TestOptionsValidate(t *testing.T) {
 		}
 	}
 
-	// Граница timeout: 1 нс — положительная длительность.
+	// The timeout boundary: 1 ns — a positive duration.
 	nano := valid
 	nano.Timeout = 1
 	if err := nano.validate(); err != nil {
 		t.Errorf("timeout = 1 нс отклонён: %v", err)
 	}
 
-	// Границы порога памяти: ровно минимум (256 MiB) и ровно максимум
-	// (16 GiB) — контроль включён, но ещё в допустимом диапазоне.
+	// The memory threshold boundaries: exactly the minimum (256 MiB)
+	// and exactly the maximum (16 GiB) — the control is on but still in
+	// the allowed range.
 	for _, threshold := range []int64{256 << 20, 16 << 30} {
 		bound := valid
 		bound.MemoryThreshold = threshold
@@ -161,22 +167,23 @@ func TestOptionsValidate(t *testing.T) {
 		}
 	}
 
-	// Движок рендера (ТЗР движков §4.2, ФТ-1/3): chromium и "" допускают
-	// оба режима подключения; moli|lightpanda — только внешний CDP, для
-	// них обязателен remote_url и выключен порог памяти (RSS чужого
-	// процесса недоступен). Базовые valid/local выше — движок "".
+	// The render engine (the engines render spec §4.2, FR-1/3): chromium
+	// and "" allow both connection modes; moli|lightpanda — external CDP
+	// only, remote_url is mandatory for them and the memory threshold is
+	// off (the RSS of a foreign process is unavailable). The base
+	// valid/local above are engine "".
 	for _, engine := range []string{config.EngineChromium, config.EngineMoli, config.EngineLightpanda} {
 		named := local
 		named.Engine = engine
 		if engine != config.EngineChromium {
-			named.RemoteURL = valid.RemoteURL // альтернативам нужен внешний CDP
+			named.RemoteURL = valid.RemoteURL // the alternatives need an external CDP
 		}
 		if err := named.validate(); err != nil {
 			t.Errorf("движок %s отклонён: %v", engine, err)
 		}
 	}
-	// Связка «движок × remote_url × memory_threshold» (ФТ-3): движковые
-	// ошибки называют поле и движок.
+	// The combination "engine × remote_url × memory_threshold" (FR-3):
+	// the engine errors name the field and the engine.
 	for _, engine := range []string{config.EngineMoli, config.EngineLightpanda} {
 		noRemote := valid
 		noRemote.Engine = engine
@@ -193,10 +200,11 @@ func TestOptionsValidate(t *testing.T) {
 			t.Errorf("движок %s с порогом памяти: хочу ошибку связки, получено %v", engine, err)
 		}
 	}
-	// Схема remote_url альтернативных движков — только ws/wss (P2
-	// ревью T-234): адрес конфигурации (lightpanda) или его authority
-	// (moli) идут в WebSocket-диал напрямую, http(s) жив лишь
-	// уточнением у chromium.
+	// The remote_url scheme of the alternative engines — ws/wss only
+	// (the P2 of the T-234 review): the configuration address
+	// (lightpanda) or its authority (moli) go straight into the
+	// WebSocket dial; http(s) is alive only through the chromium
+	// refinement.
 	for _, engine := range []string{config.EngineMoli, config.EngineLightpanda} {
 		badScheme := valid
 		badScheme.Engine = engine
@@ -205,10 +213,11 @@ func TestOptionsValidate(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "remote_url: для движка "+engine+" ожидается ws://") {
 			t.Errorf("движок %s с http-адресом: хочу ошибку схемы, получено %v", engine, err)
 		}
-		// Пустой хост — ошибка связки «движок × remote_url», а не только
-		// общей проверки хоста ниже: аллокатор альтернативных движков
-		// диалит адрес конфигурации (lightpanda) или его authority
-		// (moli) напрямую, authority обязателен (ТЗР §4.2).
+		// An empty host — the error of the "engine × remote_url"
+		// combination, not only of the general host check below: the
+		// alternative engines' allocator dials the configuration address
+		// (lightpanda) or its authority (moli) directly; an authority is
+		// mandatory (render spec §4.2).
 		emptyHost := valid
 		emptyHost.Engine = engine
 		emptyHost.RemoteURL = "ws://"
@@ -254,9 +263,10 @@ func TestOptionsValidate(t *testing.T) {
 			}
 		})
 	}
-	// Текст ошибки порога памяти пинит границы диапазона литералами:
-	// 256<<20 = 268435456, 16<<30 = 17179869184 (мутанты сдвигов и ±1
-	// аргументов формата меняли бы числа в сообщении).
+	// The memory threshold error text pins the range boundaries with
+	// literals: 256<<20 = 268435456, 16<<30 = 17179869184 (the shift
+	// mutants and the ±1 of the format arguments would change the
+	// numbers in the message).
 	low := valid
 	low.MemoryThreshold = 1 << 20
 	err := low.validate()
@@ -264,16 +274,17 @@ func TestOptionsValidate(t *testing.T) {
 		"memory_threshold: ожидается 0 (отключено) или 268435456..17179869184 байт, задано 1048576") {
 		t.Fatalf("текст ошибки порога памяти: %v", err)
 	}
-	// 0 — контроль памяти отключён (remote-режим и малые машины), не ошибка.
+	// 0 — the memory control is off (the remote mode and small
+	// machines), not an error.
 	off := Options{Contexts: 2, Timeout: time.Second, RestartEveryPages: 1}
 	if err := off.validate(); err != nil {
 		t.Fatalf("нулевой порог памяти должен быть допустим: %v", err)
 	}
 }
 
-// TestValidateTaskURL — схема задачи рендера (R-09): открываются только
-// http/https; file:/data: браузер принял бы, а съём DOM унёс бы содержимое
-// локального ресурса в хранилище контента.
+// TestValidateTaskURL — the render task scheme (R-09): only http/https
+// are opened; the browser would accept file:/data:, and the DOM capture
+// would carry the contents of a local resource into the content store.
 func TestValidateTaskURL(t *testing.T) {
 	for _, u := range []string{
 		"http://example.com/", "https://example.com/deep/path?q=1",
@@ -299,14 +310,15 @@ func TestValidateTaskURL(t *testing.T) {
 	}
 }
 
-// TestSessionRunBlocksInternalTaskURL — SSRF-контур рендера (T-219): при
-// http.block_internal_addrs задача с внутренним хостом (включая
-// IPv4-в-IPv6 и числоподобные формы WHATWG) отвергается классом task в
-// начале Run — до перехода на страницу (сессия собрана из одних опций,
-// браузер не нужен; создание CDP-контекста NewSession эта проверка не
-// отменяет — см. ревью T-219). Внешний литерал и флаг-выключено
-// проходят адресный контроль (отказ, если он случится, — про браузер,
-// не про контур).
+// TestSessionRunBlocksInternalTaskURL — the render SSRF guard (T-219):
+// with http.block_internal_addrs on, a task with an internal host
+// (including IPv4-in-IPv6 and the WHATWG numeric-like forms) is
+// rejected with the task class at the start of Run — before navigating
+// to the page (the session is assembled from options alone, no browser
+// needed; this check does not cancel the CDP context creation of
+// NewSession — see the T-219 review). An external literal and the flag
+// off pass the address check (a failure, if it happens, is about the
+// browser, not the guard).
 func TestSessionRunBlocksInternalTaskURL(t *testing.T) {
 	newSession := func(opts Options) *Session {
 		return &Session{b: &Browser{opts: opts}, ctx: context.Background()}
@@ -318,9 +330,10 @@ func TestSessionRunBlocksInternalTaskURL(t *testing.T) {
 		"http://[::1]/",
 		"http://[::ffff:10.0.0.1]/x",
 		"http://[::ffff:169.254.169.254]/latest/meta-data/",
-		// Loopback-имена и числоподобные формы WHATWG: netip их не
-		// разбирает, Chromium канонизирует в 127.0.0.1 (T-219, P1
-		// ревью) — ловит renderHostInternal.
+		// Loopback names and the WHATWG numeric-like forms: netip does
+		// not parse them, Chromium canonicalizes them into 127.0.0.1
+		// (T-219, the P1 of the review) — renderHostInternal catches
+		// them.
 		"http://localhost/", "http://sub.localhost:8080/",
 		"http://127.1/", "http://2130706433/", "http://0x7f.1/", "http://0177.0.0.1/",
 	} {
@@ -334,10 +347,10 @@ func TestSessionRunBlocksInternalTaskURL(t *testing.T) {
 			t.Errorf("%s: класс %v, хочу task (повторная доставка уровня очереди)", u, ClassOf(err))
 		}
 	}
-	// Внешние литералы (TEST-NET-3, 2001:db8::/32), «числоподобное, но
-	// имя» (последняя метка не число) и имя-хост контур не задевают: Run
-	// уходит дальше валидации и падает на отсутствии chromedp-контекста
-	// вкладки, не на адресе.
+	// External literals (TEST-NET-3, 2001:db8::/32), "numeric-like but
+	// a name" (the last label is not a number) and a hostname do not
+	// touch the guard: Run goes past the validation and fails on the
+	// missing chromedp context of the tab, not on the address.
 	for _, u := range []string{
 		"http://203.0.113.7/", "http://[2001:db8::1]/", "http://ssrf.example.net/",
 		"http://0.com/", "http://127.example.net/",
@@ -348,8 +361,8 @@ func TestSessionRunBlocksInternalTaskURL(t *testing.T) {
 			t.Errorf("%s: внешний адрес ошибочно заблокирован: %v", u, err)
 		}
 	}
-	// Флаг выключен — внутренний литерал не блокируется (dev/testbed):
-	// отказ, если он случится, — про браузер, не про контур.
+	// The flag is off — an internal literal is not blocked (dev/testbed):
+	// a failure, if it happens, is about the browser, not the guard.
 	s := newSession(Options{Timeout: time.Second})
 	if _, err := s.Run(context.Background(), RenderTask{URL: "http://127.0.0.1/"}); err != nil &&
 		strings.Contains(err.Error(), "внутренн") {
@@ -357,10 +370,11 @@ func TestSessionRunBlocksInternalTaskURL(t *testing.T) {
 	}
 }
 
-// TestRenderHostInternal — единая проверка «хост внутренний» SSRF-контура
-// рендера (T-219): канонические литералы (включая IPv4-в-IPv6),
-// loopback-имена и числоподобные формы WHATWG — внутренние; внешние
-// литералы, обычные и «числоподобные, но имена» — нет.
+// TestRenderHostInternal — the unified "is the host internal" check of
+// the render SSRF guard (T-219): canonical literals (including
+// IPv4-in-IPv6), loopback names and the WHATWG numeric-like forms are
+// internal; external literals, regular names and "numeric-like but
+// names" are not.
 func TestRenderHostInternal(t *testing.T) {
 	cases := []struct {
 		host string
@@ -374,7 +388,7 @@ func TestRenderHostInternal(t *testing.T) {
 		{"fd00::1", true},
 		{"::ffff:127.0.0.1", true},
 		{"::ffff:169.254.169.254", true},
-		{"::ffff:0.0.0.0", true}, // IsUnspecified без Unmap 4-in-6 не разворачивает
+		{"::ffff:0.0.0.0", true}, // IsUnspecified without Unmap does not unfold 4-in-6
 		{"localhost", true},
 		{"LOCALHOST", true},
 		{"sub.localhost", true},
@@ -383,15 +397,15 @@ func TestRenderHostInternal(t *testing.T) {
 		{"0x7f.1", true},
 		{"0177.0.0.1", true},
 		{"0", true},
-		{"127.0.0.1.", true}, // хвостовая точка — WHATWG срезает
+		{"127.0.0.1.", true}, // the trailing dot — WHATWG cuts it
 		{"203.0.113.7", false},
 		{"2001:db8::1", false},
 		{"example.net", false},
-		{"0.com", false}, // последняя метка не число — имя
+		{"0.com", false}, // the last label is not a number — a name
 		{"127.example.net", false},
 		{"1.2.3.4", false},
 		{"not a host", false},
-		{"256.1.1.1", false}, // >255 в не-последней части — имя для WHATWG
+		{"256.1.1.1", false}, // >255 in a non-last part — a name for WHATWG
 	}
 	for _, tc := range cases {
 		if got := renderHostInternal(tc.host); got != tc.want {
@@ -400,14 +414,14 @@ func TestRenderHostInternal(t *testing.T) {
 	}
 }
 
-// TestWhatwgParseIPv4 — канонизация числоподобных хостов по алгоритму
-// WHATWG (поведение Chromium): формы записей 127.0.0.1, пороги частей
-// (не-последние ≤ 255, последняя < 256^(5−n)), «не заканчивается
-// числом» — имя.
+// TestWhatwgParseIPv4 — the canonicalization of numeric-like hosts by
+// the WHATWG algorithm (the Chromium behavior): the entry forms of
+// 127.0.0.1, the part thresholds (non-last ≤ 255, the last <
+// 256^(5−n)), "does not end with a number" — a name.
 func TestWhatwgParseIPv4(t *testing.T) {
 	cases := []struct {
 		host string
-		want string // "" — не числоподобный
+		want string // "" — not numeric-like
 	}{
 		{"127.0.0.1", "127.0.0.1"},
 		{"127.1", "127.0.0.1"},
@@ -418,31 +432,34 @@ func TestWhatwgParseIPv4(t *testing.T) {
 		{"0", "0.0.0.0"},
 		{"1", "0.0.0.1"},
 		{"1.2.3", "1.2.0.3"},
-		// Полная 4-частная форма с ненулевым третьим октетом: пинит
-		// сборку адреса из накопленного v (старшие байты — сдвиги).
+		// The full 4-part form with a non-zero third octet: pins the
+		// address assembly from the accumulated v (the high bytes —
+		// shifts).
 		{"1.2.3.4", "1.2.3.4"},
-		// 255 в не-последней части — законно (порог «строго больше 255»
-		// бракует 256+, но не 255).
+		// 255 in a non-last part is legal (the "strictly greater than
+		// 255" threshold rejects 256+, not 255).
 		{"255.1.1.1", "255.1.1.1"},
 		{"0x1", "0.0.0.1"},
 		{"010", "0.0.0.8"},
 		{"0x", "0.0.0.0"},
 		{"example.com", ""},
 		{"0.com", ""},
-		// Число только в последней части, а ранняя — не число: бракует
-		// разбор частей в цикле (guard смотрит лишь последнюю).
+		// A number only in the last part, an earlier one not a number:
+		// rejected by the part parsing in the loop (the guard looks only
+		// at the last one).
 		{"a.1", ""},
-		// Пять частей с числовым хвостом: бракует сам предел «> 4
-		// частей» (хвост 0 прошёл бы порог последней части).
+		// Five parts with a numeric tail: rejected by the "> 4 parts"
+		// limit itself (a tail of 0 would pass the last-part
+		// threshold).
 		{"1.2.3.4.0", ""},
 		{"1.2.3.4.5", ""},
 		{"256.1.1.1", ""},
 		{"1.2.3.256", ""},
-		{"1.2.3.4.", ""}, // хвостовая точка срезается до whatwgParseIPv4
+		{"1.2.3.4.", ""}, // the trailing dot is cut before whatwgParseIPv4
 		{"", ""},
 		{"..", ""},
 		{"0xg", ""},
-		{"09", ""}, // 9 — не восьмеричная цифра
+		{"09", ""}, // 9 is not an octal digit
 	}
 	for _, tc := range cases {
 		ip, ok := whatwgParseIPv4(tc.host)

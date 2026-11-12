@@ -8,35 +8,38 @@ import (
 	"sync/atomic"
 )
 
-// maxRestartsPerTask — предел перезапусков браузера на одну задачу: краш-луп
-// Chromium не должен множить выполнения одной страницы; после исчерпания
-// ошибка уходит наверх (повторная доставка — уровень очереди, T-066/T-067).
-// С T-226 ClassBrowser-повтор не обязан сопровождаться рестартом (первая
-// неудача зонда соединения не гасит поколение): бюджет 1+maxRestartsPerTask
-// выполнений обязан покрывать серию неудач зонда плюс рестарт — иначе
-// восстановление после чёрной дыры T-218 не помещается в один Manager.Run
-// (инвариант maxRestartsPerTask >= probeFailThreshold пинит
+// maxRestartsPerTask — the browser restart limit per task: the Chromium
+// crash loop must not multiply executions of a single page; once exhausted,
+// the error goes upward (re-delivery is the queue level, T-066/T-067).
+// Since T-226 a ClassBrowser retry need not be accompanied by a restart
+// (the first connection probe failure does not kill the generation): the
+// budget of 1+maxRestartsPerTask executions must cover a series of probe
+// failures plus a restart — otherwise recovery from the T-218 black hole
+// does not fit into a single Manager.Run (the invariant
+// maxRestartsPerTask >= probeFailThreshold pins
 // TestRestartBudgetCoversProbeSeries).
 const maxRestartsPerTask = 2
 
-// Manager — жизненный цикл Chromium воркера (T-065, ТЗ 5.6: «перезапуск
-// браузера каждые N страниц и при превышении порога памяти»): старт,
-// перезапуски и graceful stop. Владеет текущим поколением «браузер + пул»;
-// задачи выполняет Run — конкурентно, как Pool.Run (вызывает цикл очередей,
-// T-067). Состояния и переходы поколения — автомат T-263 (genstate.go).
+// Manager — the Chromium worker lifecycle (T-065, spec 5.6: "restart the
+// browser every N pages and when the memory threshold is exceeded"): start,
+// restarts and graceful stop. It owns the current "browser + pool"
+// generation; Run executes tasks — concurrently, like Pool.Run (drives the
+// queue cycle, T-067). The generation states and transitions are the T-263
+// FSM (genstate.go).
 //
-// Смена поколения не ждёт задач старого пула: старый пул уходит на graceful
-// stop фоновой горутиной (дорабатывает свои страницы — каждая ограничена
-// Options.Timeout, ТЗ 3.4, — и закрывает свой браузер), новый браузер
-// стартует сразу: простой из-за перезапуска не добавляется к чужим задачам,
-// иначе перезапуск по памяти ждал бы самые «тяжёлые» страницы, съевшие
-// бюджет. Задача, не начавшаяся в закрываемом пуле (ErrClosed), повторяется
-// на новом поколении.
+// A generation swap does not wait for the old pool's tasks: the old pool
+// goes to a graceful stop in a background goroutine (it finishes its pages
+// — each bounded by Options.Timeout, spec 3.4 — and closes its browser),
+// and the new browser starts immediately: the restart downtime is not
+// added to someone else's tasks, otherwise a memory-triggered restart
+// would wait for the "heaviest" pages that consumed the budget. A task
+// that did not start in the closing pool (ErrClosed) is retried on the new
+// generation.
 type Manager struct {
 	opts    Options
-	lifeCtx context.Context // контекст жизненного цикла браузеров (StartBrowser)
+	lifeCtx context.Context // lifecycle context of the browsers (StartBrowser)
 
-	// newBrowser/newPool — фабрики; подменяются фейками в юнит-тестах.
+	// newBrowser/newPool — factories; replaced by fakes in unit tests.
 	newBrowser func(ctx context.Context, opts Options) (*Browser, error)
 	newPool    func(b *Browser) *Pool
 
@@ -48,10 +51,10 @@ type Manager struct {
 	p  *Pool
 }
 
-// NewManager — менеджер над контекстом жизненного цикла ctx: на нём
-// стартуют все браузеры менеджера, отмена ctx останавливает их, включая
-// фоновые поколения прошлых перезапусков; дедлайн на ctx не накладывать
-// (контракт StartBrowser). opts проходит валидацию при первом старте.
+// NewManager — a manager over the lifecycle context ctx: all manager
+// browsers start on it, cancelling ctx stops them, including the background
+// generations of past restarts; do not put a deadline on ctx (the
+// StartBrowser contract). opts is validated on the first start.
 func NewManager(ctx context.Context, opts Options) *Manager {
 	m := &Manager{opts: opts.withDefaults(), lifeCtx: ctx}
 	m.newBrowser = StartBrowser
@@ -59,13 +62,14 @@ func NewManager(ctx context.Context, opts Options) *Manager {
 	return m
 }
 
-// Run выполняет задачу рендера на управляемом браузере: перед задачей
-// гарантируется живое поколение (старт или перезапуск по триггерам — пороги
-// страниц и памяти, смерть браузера), затем Pool.Run. Ошибки страницы и
-// контекста возвращаются как есть (свой повтор на новом контексте пул уже
-// сделал); смерть браузера посреди задачи (ClassBrowser) и закрытие пула
-// сменой поколения до начала задачи (ErrClosed — задача не выполнялась) —
-// перезапуск и повтор, не более maxRestartsPerTask раз.
+// Run executes a render task on the managed browser: before the task a
+// live generation is guaranteed (a start or a restart by triggers — the
+// page and memory thresholds, browser death), then Pool.Run. Page and
+// context errors are returned as is (the pool has already made its own
+// retry on a fresh context); browser death mid-task (ClassBrowser) and
+// pool closure by a generation swap before the task started (ErrClosed —
+// the task did not run) mean a restart and a retry, at most
+// maxRestartsPerTask times.
 func (m *Manager) Run(ctx context.Context, task RenderTask) (RenderOutput, error) {
 	for attempt := 0; ; attempt++ {
 		p, err := m.acquire()
@@ -76,11 +80,11 @@ func (m *Manager) Run(ctx context.Context, task RenderTask) (RenderOutput, error
 			return RenderOutput{}, err
 		}
 		out, err := runAcquired(ctx, p, task)
-		// Эквивалентный мутант (T-M08): вырезание тела if при err == nil
-		// проваливается в следующий if, где третья дизъюнкция заведомо
-		// истинна (ClassOf(nil) = ClassTask != ClassBrowser, а
-		// errors.Is(nil, ErrClosed) = false) — возвращаются те же
-		// (out, nil) с err == nil.
+		// Equivalent mutant (T-M08): cutting out the if body when
+		// err == nil falls through to the next if, where the third
+		// disjunct is trivially true (ClassOf(nil) = ClassTask !=
+		// ClassBrowser, and errors.Is(nil, ErrClosed) = false) — the
+		// same (out, nil) with err == nil is returned.
 		// mutator-disable-next-line branch/if
 		if err == nil {
 			return out, nil
@@ -92,18 +96,20 @@ func (m *Manager) Run(ctx context.Context, task RenderTask) (RenderOutput, error
 	}
 }
 
-// runAcquired выполняет задачу на пуле, удерживая взятый в acquire слот
-// поколения (wg.Done) до конца Pool.Run — см. обоснование в acquire.
+// runAcquired executes the task on the pool, holding the generation slot
+// taken in acquire (wg.Done) until the end of Pool.Run — see the
+// rationale in acquire.
 func runAcquired(ctx context.Context, p *Pool, task RenderTask) (RenderOutput, error) {
 	defer p.wg.Done()
 	return p.Run(ctx, task)
 }
 
-// Start запускает первое поколение немедленно, а не лениво первой задачей:
-// боевая сборка (cmd/render-worker) обязана упасть на старте при
-// недоступном Chromium (ошибка OnRun → код 1 → systemd Restart=on-failure),
-// а не молча перебирать попытки доставок q:render. На живом поколении —
-// no-op; после Close — ErrClosed.
+// Start starts the first generation immediately rather than lazily with
+// the first task: the production build (cmd/render-worker) must fail at
+// startup when Chromium is unavailable (an OnRun error → exit code 1 →
+// systemd Restart=on-failure), instead of silently cycling the q:render
+// delivery attempts. On a live generation — a no-op; after Close —
+// ErrClosed.
 func (m *Manager) Start() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -116,15 +122,16 @@ func (m *Manager) Start() error {
 	return nil
 }
 
-// Alive — зонд потребления воркера (renderworker.Options.Alive): живо ли
-// текущее поколение; мёртвое или отсутствующее заменяется прямо здесь
-// (restartLocked → новый StartBrowser), поэтому после потери соединения
-// или рестарта Chromium (host-юнит crawler-chromium.service,
-// Restart=on-failure) зонд сам восстанавливает поколение — пауза
-// потребления не зависает навсегда. Ошибка старта — false: потребление
-// остаётся на паузе (доставки не расходуют попытки, T-025), следующий
-// вызов зонда повторит старт. Закрытость менеджера и живость поколения —
-// предикатом автомата genStateLocked (genstate.go, T-263).
+// Alive — the worker consumption probe (renderworker.Options.Alive):
+// whether the current generation is alive; a dead or missing one is
+// replaced right here (restartLocked → a new StartBrowser), so after a
+// connection loss or a Chromium restart (the host unit
+// crawler-chromium.service, Restart=on-failure) the probe restores the
+// generation itself — the consumption pause never hangs forever. A start
+// failure — false: consumption stays paused (deliveries do not spend
+// attempts, T-025), the next probe call retries the start. The manager
+// closedness and the generation liveness are decided by the FSM predicate
+// genStateLocked (genstate.go, T-263).
 func (m *Manager) Alive() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -137,18 +144,19 @@ func (m *Manager) Alive() bool {
 	return true
 }
 
-// acquire возвращает пул текущего живого поколения, при необходимости
-// меняя его (триггеры — swapReason). Конкурентные вызовы сериализуются
-// мьютексом: смена поколения одна; проверка порогов под ним же — RSS
-// проверяется раз в задачу, обход /proc — не чаще окна кэша rssCacheTTL
-// (Browser.RSS, T-229).
+// acquire returns the pool of the current live generation, swapping it
+// when needed (the triggers — swapReason). Concurrent calls are
+// serialized by the mutex: the generation swap is single; the threshold
+// checks run under the same lock — RSS is checked once per task, the
+// /proc scan no more often than the rssCacheTTL cache window (Browser.RSS,
+// T-229).
 //
-// Взятый пул помечается в полёте (wg.Add) под тем же m.mu: retire
-// сменившегося поколения тоже под m.mu, значит смена поколения не может
-// проскочить между acquire и Pool.Run — а фоновый Close поколения никогда
-// не ждёт WaitGroup с нулевым счётчиком, пока у задачи есть acquired-слот
-// (Add из нуля параллельно Wait запрещён sync.WaitGroup). Слот снимается
-// в runAcquired после Pool.Run.
+// The taken pool is marked in flight (wg.Add) under the same m.mu: the
+// retire of the swapped-out generation is also under m.mu, so a generation
+// swap cannot slip between acquire and Pool.Run — and the background pool
+// Close never waits on a zero-count WaitGroup while a task holds an
+// acquired slot (Add from zero concurrently with Wait is forbidden by
+// sync.WaitGroup). The slot is released in runAcquired after Pool.Run.
 func (m *Manager) acquire() (*Pool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -164,24 +172,25 @@ func (m *Manager) acquire() (*Pool, error) {
 	return m.p, nil
 }
 
-// restartLocked стартует новое поколение. Старый пул выводится из работы
-// синхронно (retire — новые задачи мимо него), а дорабатывает свои страницы
-// и закрывает браузер уже фоновой горутиной: graceful (ТЗ 3.4) не
-// блокирует старт — иначе перезапуск по памяти ждал бы самые долгие
-// страницы, которые и съели бюджет. Неудачный старт возвращает ошибку
-// (задача уходит наверх, следующая попытка Run повторит старт), при этом
-// прежний пул всё равно уходит на закрытие: его браузер мёртв или исчерпал
-// порог.
+// restartLocked starts a new generation. The old pool is taken out of
+// service synchronously (retire — new tasks bypass it), while it finishes
+// its pages and closes the browser in a background goroutine: graceful
+// (spec 3.4) does not block the start — otherwise a memory-triggered
+// restart would wait for the longest pages, the very ones that consumed
+// the budget. A failed start returns the error (the task goes upward, the
+// next Run attempt repeats the start), and the former pool still goes to
+// closure: its browser is dead or has exhausted the threshold.
 //
-// Старт браузера идёт под m.mu — осознанно (R-07): пока стартует новое
-// поколение, живого поколения нет, конкурентным задачам нечего приобретать
-// — их ожидание на мьютексе эквивалентно ожиданию поколения, и вынос старта
-// за критическую секцию (single-flight) ничего бы не сэкономил, добавив
-// гонки установки поколения. Верхняя граница — Options.DialTimeout
-// (подключение remote, включая уточнение адреса /json/version) плюс
-// Options.SessionStartTimeout (bootstrap-команды, initBrowserSession —
-// T-218: сама chromedp их не ограничивает) или чтение адреса процесса
-// (local, 20 с в chromedp).
+// The browser start runs under m.mu — deliberately (R-07): while the new
+// generation starts, there is no live generation and concurrent tasks have
+// nothing to acquire — their wait on the mutex is equivalent to waiting
+// for the generation, and moving the start out of the critical section
+// (single-flight) would save nothing while adding generation-installation
+// races. The upper bound is Options.DialTimeout (connecting remote,
+// including resolving the /json/version address) plus
+// Options.SessionStartTimeout (the bootstrap commands, initBrowserSession
+// — T-218: chromedp itself does not bound them) or reading the process
+// address (local, 20 s in chromedp).
 func (m *Manager) restartLocked(reason string) error {
 	old := m.p
 	if old != nil {
@@ -198,14 +207,14 @@ func (m *Manager) restartLocked(reason string) error {
 	m.b = b
 	m.p = m.newPool(b)
 	if old == nil {
-		// Логирование запуска chromium (§4 docs/mutation-testing.md).
+		// Logging of the chromium start (§4 docs/mutation-testing.md).
 		// mutator-disable-next-line statement/remove
 		slog.Info("chromium запущен", "mode", m.mode(), "pid", b.rootPID)
 		return nil
 	}
 	n := m.restarts.Add(1)
 	go old.Close()
-	// Логирование перезапуска chromium (§4 docs/mutation-testing.md).
+	// Logging of the chromium restart (§4 docs/mutation-testing.md).
 	// mutator-disable-next-line statement/remove
 	slog.Info("chromium перезапущен", "reason", reason,
 		"restarts", n, "pid", b.rootPID)
@@ -213,9 +222,9 @@ func (m *Manager) restartLocked(reason string) error {
 }
 
 func (m *Manager) mode() string {
-	// Мутант ветки меняет только текст лога запуска (remote назвался бы
-	// локальным): mode() потребляется лишь slog.Info в restartLocked —
-	// логирование, §4 docs/mutation-testing.md.
+	// A branch mutant changes only the start log text (remote would be
+	// called local): mode() is consumed only by slog.Info in
+	// restartLocked — logging, §4 docs/mutation-testing.md.
 	// mutator-disable-next-line branch/if
 	if m.opts.RemoteURL != "" {
 		return "remote " + m.opts.RemoteURL
@@ -223,27 +232,28 @@ func (m *Manager) mode() string {
 	return "локальный процесс"
 }
 
-// Close останавливает менеджер: новые задачи отклоняются (ErrClosed →
-// повторная доставка), текущее поколение дорабатывается (graceful, ТЗ 3.4)
-// и останавливается вместе с браузером. Под мьютексом — только перевод в
-// closed и открепление поколения: долгий дрен задач поколения (до
-// Options.Timeout) не блокирует acquire, зонд Alive и Browser() — новые
-// задачи получают ErrClosed сразу, не ожидая дрена (R-07). Если Close
-// попадает на идущий перезапуск, он ждёт мьютекс до конца старта (до
-// Options.DialTimeout + Options.SessionStartTimeout — потолок
-// initBrowserSession, T-218): старт поколения короткоживущий, а браузер
-// этого ещё не созданного поколения погасит отмена контекста жизненного
-// цикла.
-// Фоновые закрытия прошлых поколений завершаются независимо. Повторный
-// вызов безвреден.
+// Close stops the manager: new tasks are rejected (ErrClosed →
+// re-delivery), the current generation finishes (graceful, spec 3.4) and
+// is stopped together with the browser. Under the mutex — only the flip to
+// closed and the generation detach: the long drain of the generation tasks
+// (up to Options.Timeout) does not block acquire, the Alive probe or
+// Browser() — new tasks get ErrClosed immediately, without waiting for the
+// drain (R-07). If Close lands on a restart in progress, it waits for the
+// mutex until the start completes (up to Options.DialTimeout +
+// Options.SessionStartTimeout — the cap of initBrowserSession, T-218): a
+// generation start is short-lived, and the browser of this not yet created
+// generation is killed by the lifecycle context cancellation.
+// The background closures of past generations complete independently. A
+// repeated call is harmless.
 func (m *Manager) Close() {
 	m.mu.Lock()
-	// Эквивалентный мутант (T-M08): проваливание из неудачного CAS
-	// исполняет хвост Close — p := m.p всегда nil (первый Close открепил
-	// поколение, новое после closed не поднимается), повторные
-	// открепление и Unlock ниже дают тот же результат. statement/remove
-	// той же строки не гасим: вырезание именно Unlock вешает мьютекс —
-	// убито тестом (Run после повторного Close).
+	// Equivalent mutant (T-M08): falling through from a failed CAS runs
+	// the tail of Close — p := m.p is always nil (the first Close
+	// detached the generation, no new one is raised after closed), the
+	// repeated detach and Unlock below give the same result. The
+	// statement/remove of the same line is not suppressed: cutting out
+	// Unlock specifically hangs the mutex — killed by a test (Run after
+	// a repeated Close).
 	// mutator-disable-next-line branch/if
 	if !m.closed.CompareAndSwap(false, true) {
 		m.mu.Unlock()
@@ -253,15 +263,16 @@ func (m *Manager) Close() {
 	m.b, m.p = nil, nil
 	m.mu.Unlock()
 	if p != nil {
-		p.Close() // вне m.mu: дорабатывает задачи и гасит браузер
+		p.Close() // outside m.mu: finishes the tasks and kills the browser
 	}
 }
 
-// Restarts — число перезапусков браузера (диагностика; метрики — T-076+).
+// Restarts — the number of browser restarts (diagnostics; metrics —
+// T-076+).
 func (m *Manager) Restarts() int64 { return m.restarts.Load() }
 
-// Browser — браузер текущего поколения (счётчики Pages/RSS — метрики);
-// nil до первого старта или после Close.
+// Browser — the browser of the current generation (the Pages/RSS counters
+// are metrics); nil before the first start or after Close.
 func (m *Manager) Browser() *Browser {
 	m.mu.Lock()
 	defer m.mu.Unlock()

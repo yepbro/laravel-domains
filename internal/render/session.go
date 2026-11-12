@@ -9,62 +9,63 @@ import (
 	"github.com/chromedp/chromedp"
 )
 
-// Session — один изолированный контекст Chromium (CDP
-// Target.createBrowserContext, chromedp.WithNewBrowserContext):
-// инкогнито-профиль со своими cookies, кэшем и хранилищами плюс одна
-// вкладка about:blank. Живёт ровно одну задачу: после страницы пул закрывает
-// сессию и следующая задача получает новый профиль — состояние между
-// страницами не сохраняется (ТЗ 5.6, §9; обоснование пересоздания вместо
-// очистки — в докомментарии пакета).
+// Session — one isolated Chromium context (CDP
+// Target.createBrowserContext, chromedp.WithNewBrowserContext): an
+// incognito profile with its own cookies, cache and storages plus a single
+// about:blank tab. It lives for exactly one task: after a page the pool
+// closes the session and the next task gets a fresh profile — no state
+// survives between pages (spec 5.6, §9; the rationale for recreating
+// instead of clearing is in the package doc comment).
 type Session struct {
 	b      *Browser
-	ctx    context.Context    // chromedp-контекст вкладки (дочерний браузерному)
-	cancel context.CancelFunc // закрывает вкладку и уничтожает профиль
+	ctx    context.Context    // the tab's chromedp context (a child of the browser's)
+	cancel context.CancelFunc // closes the tab and destroys the profile
 
-	// probeFn подменяет зонд вкладки в юнит-тестах; nil — реальный зонд.
+	// probeFn replaces the tab probe in unit tests; nil — the real probe.
 	probeFn func() bool
 }
 
-// NewSession создаёт изолированный контекст с вкладкой (инкогнито-профиль:
-// собственные cookies/кэш/хранилища, изоляция от других сессий и от
-// служебной вкладки браузера). Если задан Options.UserAgent, применяется к
-// вкладке (ТЗ §9). После задачи сессию обязательно закрыть Close — профиль
-// выкидывается целиком.
+// NewSession creates an isolated context with a tab (an incognito profile:
+// own cookies/cache/storages, isolation from other sessions and from the
+// browser's service tab). If Options.UserAgent is set, it is applied to
+// the tab (spec §9). After the task the session must be closed with Close
+// — the profile is discarded entirely.
 func (b *Browser) NewSession(ctx context.Context) (*Session, error) {
 	if !b.Alive() {
 		return nil, &Error{Class: ClassBrowser, Err: ErrBrowserDead}
 	}
-	// Зонд соединения до создания контекста (T-218): полузакрытый сокет
-	// Alive не видит, а проявляется он именно здесь — зависшим
-	// createBrowserContext до SessionStartTimeout (15 с бесполезного
-	// ожидания на каждую задачу, инцидент 02.11). Зонд закрывает вопрос
-	// за probeTimeout: неудача — класс browser, Manager повторит задачу;
-	// поколение сменится со второй подряд неудачи зонда или сразу по
-	// смерти транспорта (T-226: разовый таймаут перегруженного Chromium
-	// поколение не рвёт).
+	// The connection probe before creating the context (T-218): Alive
+	// does not see a half-closed socket, and it shows up exactly here —
+	// as a hung createBrowserContext until SessionStartTimeout (15 s of
+	// useless waiting per task, the Nov 2 incident). The probe settles
+	// the question within probeTimeout: a failure — the browser class,
+	// Manager retries the task; the generation is swapped on the second
+	// probe failure in a row or immediately on transport death (T-226:
+	// a one-off timeout of an overloaded Chromium does not break the
+	// generation).
 	if !b.probeConn() {
 		return nil, &Error{Class: ClassBrowser, Err: ErrBrowserDead}
 	}
 	sctx, cancel := chromedp.NewContext(b.ctx, chromedp.WithNewBrowserContext())
 	s := &Session{b: b, ctx: sctx, cancel: cancel}
 	if err := s.start(ctx); err != nil {
-		// Закрыть недоинициализированную вкладку (если создаётся) и
-		// выбросить частично созданный профиль.
+		// Close the half-initialized tab (if one is being created) and
+		// throw away the partially created profile.
 		cancel()
 		return nil, err
 	}
 	return s, nil
 }
 
-// start инициализирует вкладку (createBrowserContext + about:blank) и
-// применяет User-Agent. Первый вызов обязан идти на самом контексте вкладки
-// s.ctx: в chromedp насос событий вкладки (Target.run) привязан к контексту
-// первого вызова — короткоживущий потомок с таймаутом отменился бы сразу
-// после инициализации и все дальнейшие команды вкладки зависли бы
-// (воспроизводится на живом Chromium). Ожидание ограничено
-// SessionStartTimeout обгонной гонкой: при превышении или отмене
-// вызывающего контекста сессия целиком закрывается (NewSession отменяет
-// вкладку), а не «долечивается».
+// start initializes the tab (createBrowserContext + about:blank) and
+// applies the User-Agent. The first call must run on the tab context
+// s.ctx itself: in chromedp the tab's event pump (Target.run) is bound to
+// the context of the first call — a short-lived child with a timeout would
+// be cancelled right after initialization and all further tab commands
+// would hang (reproducible on a live Chromium). The wait is bounded by
+// SessionStartTimeout in a racing select: on exceeding it or on the caller
+// context being cancelled the session is closed entirely (NewSession
+// cancels the tab), not "finished up later".
 func (s *Session) start(ctx context.Context) error {
 	type result struct{ err error }
 	done := make(chan result, 1)
@@ -89,18 +90,19 @@ func (s *Session) start(ctx context.Context) error {
 			return &Error{Class: ClassTask,
 				Err: fmt.Errorf("задача отменена: %w: %w", ctx.Err(), r.err)}
 		}
-		// Классификация без зонда вкладки (сессия не поднята): умерший
-		// браузер против не сложившегося контекста.
+		// Classification without the tab probe (the session is not up):
+		// a dead browser versus a failed context.
 		return s.b.classifyCtx(r.err, "", nil)
 	case <-timer.C:
-		// Контекст не создался за SessionStartTimeout: отличить
-		// умершее/подвисшее соединение (зонд probeConn — класс browser:
-		// повтор на новом контексте того же мёртвого сокета
-		// бессмысленен, поколение сменит Manager) от просто медленного
-		// браузера при живом соединении (класс context — существующий
-		// повтор на новом контексте). Инцидент 02.11: без зонда эта
-		// ветка единолично давала 11 520 WARN «контекст рендера умер»
-		// за 6 ч на полузакрытом соединении (T-218).
+		// The context was not created within SessionStartTimeout:
+		// distinguish a dead/hung connection (the probeConn probe — the
+		// browser class: a retry on a new context of the same dead socket
+		// is pointless, the generation is swapped by Manager) from a
+		// merely slow browser with a live connection (the context class —
+		// the existing retry on a new context). The Nov 2 incident:
+		// without the probe this branch alone produced 11,520 WARN
+		// "the render context died" messages in 6 h on a half-closed
+		// connection (T-218).
 		if !s.b.probeConn() {
 			return &Error{Class: ClassBrowser,
 				Err: fmt.Errorf("браузер Chromium недоступен: таймаут создания контекста %s",
@@ -114,43 +116,48 @@ func (s *Session) start(ctx context.Context) error {
 	}
 }
 
-// Run выполняет задачу: переход на task.URL (NavigateResponse — с ответом
-// основной навигации, T-064), ожидание готовности страницы (T-063: событие
-// загрузки с потолком + ограниченное «затишье» сети) и съём результата —
-// итоговый URL и заголовок (T-061), итоговый DOM, все cookies итоговой
-// страницы и заголовки ответа основной навигации (T-064, extract.go).
-// Общий таймаут страницы — Options.Timeout (ТЗ 5.6: 25 с по умолчанию); он
-// ограничивает действия задачи, а не жизнь профиля. Истечение общего
-// таймаута — ошибка задачи (ClassTask), а не частичный результат: по ТЗ §8
-// прерывание по лимиту фиксируется кодом ошибки, «частичного» DOM в схеме
-// §6.1 нет — T-067 заменил бы полный сырой HTML недорисованным DOM без
-// маркера; сырой HTML уже сохранён HTTP-этапом и остаётся результатом до
-// успешного рендера (§7: рендер — асинхронное дополнение, неудача —
-// повторная доставка уровнем очереди, T-066). Мягкие потолки фаз ожидания —
-// не ошибка, после них результат снимается как есть (wait.go).
+// Run executes the task: navigation to task.URL (NavigateResponse — with
+// the main navigation's response, T-064), waiting for page readiness
+// (T-063: the load event with a cap + bounded network quiet) and capturing
+// the result — the final URL and title (T-061), the final DOM, all cookies
+// of the final page and the headers of the main navigation's response
+// (T-064, extract.go). The overall page timeout is Options.Timeout
+// (spec 5.6: 25 s by default); it bounds the task's actions, not the
+// profile's lifetime. Expiry of the overall timeout is a task error
+// (ClassTask), not a partial result: per spec §8 an interruption by the
+// limit is recorded as an error code, and there is no "partial" DOM in
+// the §6.1 schema — T-067 would replace the full raw HTML with an
+// under-rendered DOM without a marker; the raw HTML is already saved by
+// the HTTP stage and remains the result until a successful render
+// (§7: render is an asynchronous addition, a failure means re-delivery by
+// the queue level, T-066). The soft caps of the wait phases are not an
+// error; after them the result is captured as is (wait.go).
 //
-// Цепочка контекстов идёт от вкладки (s.ctx): chromedp ищет сессию по
-// значению в контексте, производный от вызывающего контекст её не видит.
-// Отмена и дедлайн вызывающего ctx привносятся AfterFunc: останавливают
-// действия задачи, не трогая профиль.
+// The context chain goes from the tab (s.ctx): chromedp looks up the
+// session by a value in the context; a context derived from the caller
+// does not see it. The cancellation and deadline of the caller ctx are
+// brought in by AfterFunc: they stop the task's actions without touching
+// the profile.
 //
-// Схема URL проверяется до любых команд CDP (validateTaskURL, R-09):
-// file:/data: браузер открыл бы, а съём DOM унёс бы содержимое локального
-// ресурса в хранилище контента. При включённом SSRF-контуре рядом
-// отвергается и внутренний IP-литеральный хост (validateTaskURLInternal,
-// T-219: http.block_internal_addrs — общий флаг с HTTP-этапом).
+// The URL scheme is validated before any CDP commands (validateTaskURL,
+// R-09): file:/data: — the browser would open them and the DOM capture
+// would carry the contents of a local resource into the content store.
+// With the SSRF guard enabled, an internal IP-literal host is rejected
+// right alongside (validateTaskURLInternal, T-219:
+// http.block_internal_addrs — a flag shared with the HTTP stage).
 //
-// Блокировка изображений/шрифтов/медиа (T-062, ТЗ 5.6; с опцией
-// Options.BlockStylesheet — и CSS, T-213; с Options.BlockTrackerDomains
-// — и домены аналитики, T-214) включается здесь, до перехода
-// (startBlock, перед waitSubscribe): перехват видит запросы страницы с
-// первого. Этапы — chromedp.Run/Do над s.Context().
+// Blocking of images/fonts/media (T-062, spec 5.6; with the
+// Options.BlockStylesheet option — CSS too, T-213; with
+// Options.BlockTrackerDomains — analytics domains too, T-214) is enabled
+// here, before navigation (startBlock, before waitSubscribe): the
+// interception sees the page's requests from the first one. The stages
+// are chromedp.Run/Do over s.Context().
 func (s *Session) Run(ctx context.Context, task RenderTask) (RenderOutput, error) {
 	if err := validateTaskURL(task.URL); err != nil {
 		return RenderOutput{}, err
 	}
-	// SSRF-контур (T-219): внутренний IP-литерал — рядом со схемой,
-	// до перехода на страницу; класс task.
+	// The SSRF guard (T-219): an internal IP literal — alongside the
+	// scheme check, before navigating to the page; the task class.
 	if s.b.opts.BlockInternalAddrs {
 		if err := validateTaskURLInternal(task.URL); err != nil {
 			return RenderOutput{}, err
@@ -168,25 +175,27 @@ func (s *Session) Run(ctx context.Context, task RenderTask) (RenderOutput, error
 	defer stopBlock()
 
 	var out RenderOutput
-	// T-063: подписки на события вкладки — до перехода и до Network.enable:
-	// подписка начинает буферизацию с момента вызова; событие загрузки,
-	// случившееся за время NavigateResponse (своё ожидание load), waitLoop
-	// возьмёт из буфера мгновенно и перейдёт к «затишью» сети.
+	// T-063: the tab event subscriptions — before navigation and before
+	// Network.enable: a subscription starts buffering from the moment of
+	// the call; a load event that happened during NavigateResponse (its
+	// own load wait) is picked by waitLoop from the buffer instantly and
+	// moves on to the network quiet.
 	evs, err := waitSubscribe(tctx)
 	var resp *network.Response
 	if err == nil {
-		// NavigateResponse — переход с ожиданием загрузки (то же ожидание,
-		// что у Navigate) плюс ответ основной навигации: chromedp отслеживает
-		// цепочку loader/request через редиректы и возвращает итоговый
-		// документ (T-064 — заголовки для правил ТЗ 5.8). Схема задачи —
-		// http/https (validateTaskURL выше), ответ навигации — реальный
-		// сетевой; nil (оборонительный случай) обрабатывается ниже
-		// проверкой resp != nil.
+		// NavigateResponse — navigation with a load wait (the same wait
+		// as Navigate) plus the main navigation's response: chromedp
+		// tracks the loader/request chain through redirects and returns
+		// the final document (T-064 — the headers for the spec 5.8
+		// rules). The task scheme is http/https (validateTaskURL above),
+		// the navigation response is a real network one; nil (a defensive
+		// case) is handled below by the resp != nil check.
 		resp, err = chromedp.Run(tctx, chromedp.NavigateResponse(task.URL))
 	}
 	if err == nil {
-		// T-063: событие загрузки (из буфера — мгновенно) и «затишье» сети
-		// (окно без новых запросов) с потолками WaitPlan.
+		// T-063: the load event (from the buffer — instantly) and the
+		// network quiet (a window with no new requests) with the WaitPlan
+		// caps.
 		_, err = waitLoop(tctx, DefaultWaitPlan(s.b.opts.Timeout), evs, waitRealTimerFactory)
 	}
 	if err == nil {
@@ -196,8 +205,8 @@ func (s *Session) Run(ctx context.Context, task RenderTask) (RenderOutput, error
 		out.FinalURL, err = chromedp.Run(tctx, chromedp.Location())
 	}
 	if err == nil {
-		// Потолок DOM ≤ 16 МиБ по конфигурации (content.max_store_bytes),
-		// int здесь всегда достаточен.
+		// The DOM cap ≤ 16 MiB by configuration (content.max_store_bytes);
+		// int is always sufficient here.
 		err = newExtractCDP(int(s.b.opts.MaxDOMBytes)).extractResult(tctx, &out) // T-064: DOM + cookies
 	}
 	if err == nil && resp != nil {
@@ -209,37 +218,39 @@ func (s *Session) Run(ctx context.Context, task RenderTask) (RenderOutput, error
 	return out, nil
 }
 
-// Close закрывает вкладку и уничтожает изолированный профиль
-// (Target.disposeBrowserContext): cookies, кэш и хранилища страницы
-// выбрасываются — состояние страниц не переживает (ТЗ §9). Ждёт фактического
-// закрытия (гарантия chromedp), переиспользовать сессию после Close нельзя.
+// Close closes the tab and destroys the isolated profile
+// (Target.disposeBrowserContext): the page's cookies, cache and storages
+// are thrown away — page state does not survive (spec §9). Waits for the
+// actual closure (a chromedp guarantee); the session must not be reused
+// after Close.
 func (s *Session) Close() {
 	if s.cancel != nil {
 		s.cancel()
 	}
 }
 
-// Context — chromedp-контекст вкладки сессии. Точка расширения T-062…T-064:
-// этапы выполняются chromedp.Run/Do над этим контекстом.
+// Context — the session tab's chromedp context. The extension point of
+// T-062…T-064: the stages run as chromedp.Run/Do over this context.
 func (s *Session) Context() context.Context { return s.ctx }
 
-// wrap классифицирует ошибку этапа страницы: отменённый вызывающий контекст
-// — ClassTask (повтор на новом контексте бессмысленен), истёкший таймаут
-// страницы — ClassTask, если соединение с браузером живо (тарпит-политика
-// T-148: тяжёлая страница), и ClassBrowser, если зонд обнаружил мёртвое
-// соединение (T-218: полузакрытый сокет не даёт ошибок транспорта —
-// таймаут страницы на нём выглядит как тарпит, а это инфраструктурный
-// отказ: Manager сменит поколение и повторит задачу); остальное —
-// classifyCtx по состоянию браузера/вкладки.
+// wrap classifies a page stage error: a cancelled caller context —
+// ClassTask (a retry on a new context is pointless), an expired page
+// timeout — ClassTask if the browser connection is alive (the tarpit
+// policy T-148: a heavy page), and ClassBrowser if the probe found a dead
+// connection (T-218: a half-closed socket gives no transport errors — a
+// page timeout on it looks like a tarpit, but this is an infrastructure
+// failure: Manager swaps the generation and retries the task); everything
+// else — classifyCtx by the browser/tab state.
 func (s *Session) wrap(err error, caller, opCtx context.Context, url string) *Error {
 	switch {
 	case caller.Err() != nil:
 		return &Error{Class: ClassTask, URL: url,
 			Err: fmt.Errorf("задача отменена: %w: %w", caller.Err(), err)}
 	case opCtx.Err() != nil:
-		// Зонд соединения дёшев на живом браузере (getTargets отвечает
-		// за миллисекунды и при медленной странице); probeTimeout стоит
-		// только мёртвому сокету — ровно там, где нужен класс browser.
+		// The connection probe is cheap on a live browser (getTargets
+		// answers within milliseconds even for a slow page); probeTimeout
+		// is paid only by a dead socket — exactly where the browser
+		// class is needed.
 		if !s.b.probeConn() {
 			return &Error{Class: ClassBrowser, URL: url,
 				Err: fmt.Errorf("браузер Chromium недоступен: таймаут страницы %s: %w: %w",
@@ -252,11 +263,12 @@ func (s *Session) wrap(err error, caller, opCtx context.Context, url string) *Er
 	}
 }
 
-// probe — зонд вкладки для классификации ошибок: chromedp не отменяет
-// контекст вкладки при её падении (тексты ошибок при этом неинформативны:
-// «Session not found» и т. п.), поэтому неответчивость проверяется живым
-// запросом с коротким таймаутом (tabProbeTimeout: вкладка не решает судьбу
-// поколения — потолок короче зонда соединения, T-226).
+// probe — the tab probe for error classification: chromedp does not cancel
+// the tab context when the tab dies (the error texts are uninformative:
+// "Session not found" and the like), so responsiveness is checked with a
+// live request with a short timeout (tabProbeTimeout: the tab does not
+// decide the generation's fate — the cap is shorter than the connection
+// probe, T-226).
 func (s *Session) probe() bool {
 	if s.ctx == nil || s.ctx.Err() != nil {
 		return false

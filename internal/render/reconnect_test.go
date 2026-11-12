@@ -1,30 +1,33 @@
 package render
 
-// Воспроизведение инцидента 02.11 (T-218): после рестарта внешнего
-// Chromium (systemctl restart crawler-chromium, таймер T-208) воркеры
-// копили вебсокеты к :9222 (284 за ~6 ч), Target.createBrowserContext
-// висел до SessionStartTimeout («таймаут создания контекста 15s» ×
-// 11 520 WARN «контекст рендера умер» за 6 ч), рендер деградировал ~5,5 ч
-// и к 07:25 встал; свежий Chromium был здоров — ломалось состояние
-// воркеров, лечилось рестартом воркеров.
+// A reproduction of the Nov 2 incident (T-218): after an external
+// Chromium restart (systemctl restart crawler-chromium, the T-208
+// timer) the workers accumulated websockets to :9222 (284 over ~6 h),
+// Target.createBrowserContext hung until SessionStartTimeout ("the
+// context creation timeout 15s" × 11,520 WARN "the render context
+// died" over 6 h), rendering degraded for ~5.5 h and stood still by
+// 07:25; the fresh Chromium was healthy — the workers' state was
+// broken, cured by a worker restart.
 //
-// Механизм (по коду chromedp v0.21.0): чтение WebSocket
-// (remote.Conn.Read) не реагирует ни на контекст, ни на таймауты —
-// о смерти соединения библиотека узнаёт только от ошибок сокета.
-// Полузакрытое/подвисшее соединение (без FIN/RST: NAT/conntrack, браузер
-// подвис при остановке) выглядит живым бесконечно: Browser.Alive() =
-// true, Manager не меняет поколение, каждая задача висит в создании
-// контекста и умирает таймаутом (класс context → бесполезный повтор на
-// новом контексте того же мёртвого сокета). Запись WebSocket
-// (remote.Conn.Write) тоже без дедлайна: насос chromedp висит в записи
-// до исчерпания TCP-ретрансмиссий, upstream-аллокатор закрывает сокет
-// только после насосов — старые соединения не освобождаются.
+// The mechanism (per the chromedp v0.21.0 code): the WebSocket read
+// (remote.Conn.Read) reacts neither to the context nor to timeouts —
+// the library learns of the connection's death only from socket
+// errors. A half-closed/hung connection (no FIN/RST: NAT/conntrack,
+// the browser hung on shutdown) looks alive forever: Browser.Alive() =
+// true, Manager does not swap the generation, every task hangs in the
+// context creation and dies by the timeout (the context class → a
+// useless retry on a new context of the same dead socket). The
+// WebSocket write (remote.Conn.Write) is also without a deadline: a
+// chromedp pump hangs in writing until the TCP retransmissions run
+// out, the upstream allocator closes the socket only after the pumps
+// — the old connections are never released.
 //
-// Здесь: switchableCDP — управляемый транспорт («чёрная дыра»: чтение
-// висит, записи принимаются молча); проверяются обе половины фикса —
-// детектор мёртвого соединения (probeConn: ClassBrowser → смена
-// поколения менеджером, восстановление без рестарта воркера) и
-// принудительное закрытие сокета аллокатором (соединения не копятся).
+// Here: switchableCDP — a controllable transport (a "black hole":
+// reads hang, writes are accepted silently); both halves of the fix
+// are checked — the dead connection detector (probeConn: ClassBrowser
+// → a generation swap by the manager, recovery without a worker
+// restart) and the allocator's forced socket closure (connections do
+// not accumulate).
 
 import (
 	"context"
@@ -45,13 +48,14 @@ import (
 	"crawler/internal/config"
 )
 
-// switchableCDP — транспорт CDP с переключением жизни: как fakeCDP
-// отвечает на bootstrap-команды chromedp (уникальные sessionId/targetId —
-// вкладки сессий не конфликтуют со служебной вкладкой браузера), по
-// kill() становится «чёрной дырой» — Write принимает команды молча (как
-// запись в буфер полузакрытого сокета), Read висит до Close()
-// (remote.Conn.Read контекст игнорирует — фidelity важна: зонд и
-// принудительное закрытие проверяются именно против такого поведения).
+// switchableCDP — a CDP transport with a switchable liveness: like
+// fakeCDP it answers the chromedp bootstrap commands (unique
+// sessionId/targetId — the session tabs do not conflict with the
+// browser's service tab); by kill() it becomes a "black hole" — Write
+// accepts commands silently (like a write into a half-closed socket's
+// buffer), Read hangs until Close() (remote.Conn.Read ignores the
+// context — the fidelity matters: the probe and the forced closure are
+// checked exactly against such behavior).
 type switchableCDP struct {
 	mu     sync.Mutex
 	alive  bool
@@ -74,10 +78,11 @@ func newSwitchableCDP() *switchableCDP {
 	}
 }
 
-// Write удовлетворяет chromedp.Transport. Ответ синтезируется синхронно;
-// в режиме «чёрной дыры» и для методов из hang команда принимается
-// молча — ответа не будет никогда (имитация мёртвого браузера/висящей
-// команды при живом соединении).
+// Write satisfies chromedp.Transport. The reply is synthesized
+// synchronously; in the "black hole" mode and for the methods from
+// hang the command is accepted silently — there will never be a reply
+// (an imitation of a dead browser / a hung command with a live
+// connection).
 func (f *switchableCDP) Write(ctx context.Context, m *cdproto.Message) error {
 	f.mu.Lock()
 	f.cmds = append(f.cmds, fakeCDPCmd{
@@ -99,8 +104,8 @@ func (f *switchableCDP) Write(ctx context.Context, m *cdproto.Message) error {
 	reply := &cdproto.Message{ID: m.ID, SessionID: m.SessionID}
 	switch {
 	case cmdErr:
-		// Ответ-ошибка протокола при живом соединении (браузер ответил —
-		// смерть транспорта это не подтверждает).
+		// A protocol error reply with a live connection (the browser
+		// answered — a transport death is not confirmed by it).
 		reply.Error = &cdproto.Error{Code: -32000, Message: "команда сломана"}
 	case method == "Target.attachToTarget":
 		reply.Result = jsonv2.Value(fmt.Sprintf(`{"sessionId":"sw-session-%d"}`, seq))
@@ -123,9 +128,10 @@ func (f *switchableCDP) Write(ctx context.Context, m *cdproto.Message) error {
 	return nil
 }
 
-// Read удовлетворяет chromedp.Transport: ждёт сообщение до закрытия
-// транспорта. Контекст НЕ наблюдается — как у remote.Conn.Read; без
-// этого нельзя доказать, что принудительный Close действительно нужен.
+// Read satisfies chromedp.Transport: waits for a message until the
+// transport is closed. The context is NOT observed — as with
+// remote.Conn.Read; without this one cannot prove that the forced
+// Close is really needed.
 func (f *switchableCDP) Read(_ context.Context, m *cdproto.Message) error {
 	select {
 	case <-f.closeC:
@@ -136,8 +142,8 @@ func (f *switchableCDP) Read(_ context.Context, m *cdproto.Message) error {
 	}
 }
 
-// Close удовлетворяет chromedp.Transport: разблокирует зависшее чтение
-// (аналог закрытия сокета — «use of closed network connection»).
+// Close satisfies chromedp.Transport: unblocks a hung read (an analog
+// of closing the socket — "use of closed network connection").
 func (f *switchableCDP) Close() error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -149,8 +155,9 @@ func (f *switchableCDP) Close() error {
 	return nil
 }
 
-// kill — «смерть браузера» на глазах воркера: соединение полузакрыто,
-// ответы (в том числе накопленные) не приходят никогда.
+// kill — the "browser death" in front of the worker's eyes: the
+// connection is half-closed, the answers (including the accumulated
+// ones) never arrive.
 func (f *switchableCDP) kill() {
 	f.mu.Lock()
 	f.alive = false
@@ -164,23 +171,24 @@ func (f *switchableCDP) kill() {
 	}
 }
 
-// hangMethod — не отвечать на метод (висящая команда при живом
-// соединении: например, createBrowserContext на перегруженном браузере).
+// hangMethod — do not answer the method (a hung command with a live
+// connection: e.g. createBrowserContext on an overloaded browser).
 func (f *switchableCDP) hangMethod(method string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.hang[method] = true
 }
 
-// failMethod — отвечать на метод ошибкой протокола при живом соединении
-// (браузер прислал ответ-ошибку — транспорт работает).
+// failMethod — answer the method with a protocol error while the
+// connection is live (the browser sent an error reply — the transport
+// works).
 func (f *switchableCDP) failMethod(method string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.fail[method] = true
 }
 
-// unhangMethod — снять подвисание метода (снова отвечает).
+// unhangMethod — remove the method hang (answers again).
 func (f *switchableCDP) unhangMethod(method string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -193,7 +201,7 @@ func (f *switchableCDP) isClosed() bool {
 	return f.closed
 }
 
-// countOf — число команд с данным методом.
+// countOf — the number of commands with the given method.
 func (f *switchableCDP) countOf(method string) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -206,8 +214,9 @@ func (f *switchableCDP) countOf(method string) int {
 	return n
 }
 
-// dialRecorder — подмена remoteDial: каждое подключение — новый
-// switchableCDP, журнал транспортов = журнал соединений воркера к :9222.
+// dialRecorder — a remoteDial replacement: every connection is a new
+// switchableCDP; the transport log = the log of the worker's
+// connections to :9222.
 type dialRecorder struct {
 	mu         sync.Mutex
 	transports []*switchableCDP
@@ -227,7 +236,8 @@ func (r *dialRecorder) list() []*switchableCDP {
 	return append([]*switchableCDP(nil), r.transports...)
 }
 
-// overrideRemoteDial — подмена шва подключения на время теста.
+// overrideRemoteDial — replacing the connection seam for the test's
+// duration.
 func overrideRemoteDial(t *testing.T, f func(ctx context.Context, wsURL string, timeout time.Duration) (chromedp.Transport, error)) {
 	t.Helper()
 	old := remoteDial
@@ -235,9 +245,10 @@ func overrideRemoteDial(t *testing.T, f func(ctx context.Context, wsURL string, 
 	t.Cleanup(func() { remoteDial = old })
 }
 
-// waitForFor — как waitFor (block_test.go), с настраиваемым сроком:
-// фоновые закрытия соединений идут до ~5,5 с (внутренние таймауты
-// chromedp: closeTargetTimeout 5 с + waitTargetGone 0,5 с).
+// waitForFor — like waitFor (block_test.go), with a configurable
+// deadline: the background connection closures take up to ~5.5 s (the
+// internal chromedp timeouts: closeTargetTimeout 5 s + waitTargetGone
+// 0.5 s).
 func waitForFor(t *testing.T, d time.Duration, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(d)
@@ -250,10 +261,10 @@ func waitForFor(t *testing.T, d time.Duration, cond func() bool) {
 	t.Fatalf("условие не наступило за %s", d)
 }
 
-// bootSession — сессия пула с реальным созданием контекста (NewSession:
-// зонд соединения + createBrowserContext + вкладка) и мгновенной
-// задачей: воспроизведение инцидента — механика обрыва в создании
-// контекста, а не в рендере страницы.
+// bootSession — a pool session with a real context creation
+// (NewSession: the connection probe + createBrowserContext + the tab)
+// and an instant task: the incident reproduction is the mechanics of
+// the break in the context creation, not in the page rendering.
 type bootSession struct {
 	real renderSession
 }
@@ -264,9 +275,10 @@ func (b bootSession) Run(ctx context.Context, task RenderTask) (RenderOutput, er
 
 func (b bootSession) Close() { b.real.Close() }
 
-// remoteOpts — параметры remote-режима для тестов реконнекта: адрес с
-// готовым путём /devtools/browser/ (без запроса /json/version —
-// транспорт подменяется швом remoteDial), короткие таймауты.
+// remoteOpts — the remote mode parameters for the reconnect tests: an
+// address with a ready /devtools/browser/ path (no /json/version
+// request — the transport is replaced by the remoteDial seam), short
+// timeouts.
 func remoteOpts() Options {
 	return Options{
 		RemoteURL:           "ws://127.0.0.1:9222/devtools/browser/test",
@@ -278,17 +290,19 @@ func remoteOpts() Options {
 	}
 }
 
-// testProbeTimeout — тестовый бюджет зонда соединения (T-226): серия
-// зондов в тестах идёт в реальном времени; полный продуктовый probeTimeout
-// (5 с × ~10 зондов) вытолкнул бы пакет за бюджет мутационного прогона
-// (MUTATE_TIMEOUT=60 с). Короткий бюджет не меняет проверяемую семантику:
-// «чёрная дыра»/висящий метод не отвечают и за 100 мс.
+// testProbeTimeout — the test budget of the connection probe (T-226):
+// the probe series in the tests runs in real time; the full production
+// probeTimeout (5 s × ~10 probes) would push the batch out of the
+// mutation run budget (MUTATE_TIMEOUT=60 s). The short budget does not
+// change the semantics under test: a "black hole"/a hung method does
+// not answer within 100 ms either.
 const testProbeTimeout = 100 * time.Millisecond
 
-// switchableBrowser — браузер поверх управляемого транспорта: полный
-// bootstrap chromedp (StartBrowser не подходит — он строит браузер из
-// Options сам), здесь контекст уже поднят вызывающим для тонких сценариев
-// (зонд, таймаут создания контекста). Освобождение — Cleanup теста.
+// switchableBrowser — a browser over the controllable transport: the
+// full chromedp bootstrap (StartBrowser does not fit — it builds the
+// browser from Options itself); here the context is already raised by
+// the caller for the fine-grained scenarios (the probe, the context
+// creation timeout). The release — the test's Cleanup.
 func switchableBrowser(t *testing.T, tr *switchableCDP, opts Options) *Browser {
 	t.Helper()
 	allocCtx, cancelAlloc := chromedp.NewAllocatorContext(context.Background(),
@@ -305,20 +319,22 @@ func switchableBrowser(t *testing.T, tr *switchableCDP, opts Options) *Browser {
 		probeTimeout: testProbeTimeout}
 }
 
-// TestManagerRecoversAfterBrowserDeath — приёмник задачи T-218: смерть
-// «браузера» (полузакрытое соединение) → попытки контекстов не копятся
-// (класс browser, а не контекстный ретраи на мёртвом сокете) → менеджер
-// сам меняет поколение → после «воскрешения» браузера (новое соединение)
-// рендер продолжается; восстановление ≤ минуты; соединения не растут:
-// старый сокет закрыт принудительно, живой — ровно один.
+// TestManagerRecoversAfterBrowserDeath — the T-218 task sink: the
+// "browser" death (a half-closed connection) → the context attempts do
+// not accumulate (the browser class, not context retries on a dead
+// socket) → the manager swaps the generation itself → after the
+// browser's "resurrection" (a new connection) the rendering continues;
+// the recovery is ≤ a minute; the connections do not grow: the old
+// socket is closed forcibly, the live one is exactly one.
 func TestManagerRecoversAfterBrowserDeath(t *testing.T) {
 	rec := &dialRecorder{}
 	overrideRemoteDial(t, rec.dial)
 
 	m := NewManager(context.Background(), remoteOpts())
-	// Старт — реальный StartBrowser (полный bootstrap поверх фейка), но
-	// с тестовым бюджетом зонда: сценарий дважды ждёт неудачный зонд,
-	// продуктовые 5 с × 2 несовместимы с бюджетом прогона (MUTATE_TIMEOUT).
+	// The start — a real StartBrowser (the full bootstrap over the
+	// fake) but with the test probe budget: the scenario waits for a
+	// failed probe twice; the production 5 s × 2 is incompatible with
+	// the run budget (MUTATE_TIMEOUT).
 	realBrowser := m.newBrowser
 	m.newBrowser = func(ctx context.Context, opts Options) (*Browser, error) {
 		b, err := realBrowser(ctx, opts)
@@ -327,8 +343,8 @@ func TestManagerRecoversAfterBrowserDeath(t *testing.T) {
 		}
 		return b, err
 	}
-	// Пул с реальным созданием сессий (зонд + контекст) и мгновенной
-	// задачей — см. bootSession.
+	// The pool with a real session creation (the probe + the context)
+	// and an instant task — see bootSession.
 	m.newPool = func(b *Browser) *Pool {
 		p := NewPool(b)
 		inner := p.newSession
@@ -343,7 +359,7 @@ func TestManagerRecoversAfterBrowserDeath(t *testing.T) {
 	}
 	t.Cleanup(m.Close)
 
-	// Живой браузер: задача проходит, одно соединение.
+	// A live browser: the task passes, one connection.
 	if _, err := m.Run(context.Background(), RenderTask{URL: "https://a.example/"}); err != nil {
 		t.Fatalf("Run на живом браузере: %v", err)
 	}
@@ -351,16 +367,16 @@ func TestManagerRecoversAfterBrowserDeath(t *testing.T) {
 		t.Fatalf("соединений %d, хочу 1", len(conns))
 	}
 
-	// Смерть браузера: ресайкл хоста, соединение полузакрыто.
+	// The browser death: a host recycle, the connection is half-closed.
 	started := time.Now()
 	dead := rec.list()[0]
-	createdBefore := dead.countOf("Target.createBrowserContext") // живой рендер создал контекст
+	createdBefore := dead.countOf("Target.createBrowserContext") // the live render created a context
 
 	dead.kill()
 
-	// Воркер восстанавливается сам — без рестарта сервиса: зонд
-	// соединения классифицирует смерть как browser, менеджер меняет
-	// поколение, задача проходит на новом соединении.
+	// The worker recovers by itself — without a service restart: the
+	// connection probe classifies the death as browser, the manager
+	// swaps the generation, the task passes on a new connection.
 	if _, err := m.Run(context.Background(), RenderTask{URL: "https://a.example/"}); err != nil {
 		t.Fatalf("воркер не восстановился после смерти браузера: %v", err)
 	}
@@ -372,19 +388,20 @@ func TestManagerRecoversAfterBrowserDeath(t *testing.T) {
 	if len(conns) != 2 {
 		t.Fatalf("соединений %d, хочу 2 (реконнект без накопления)", len(conns))
 	}
-	// После смерти соединения контексты на нём не создаются вовсе
-	// (до фикса — зависший createBrowserContext на каждую попытку,
-	// инцидент 02.11: ×11 520 WARN за 6 ч).
+	// After the connection's death no contexts are created on it at
+	// all (before the fix — a hung createBrowserContext on every
+	// attempt, the Nov 2 incident: ×11,520 WARN over 6 h).
 	if n := conns[0].countOf("Target.createBrowserContext"); n != createdBefore {
 		t.Errorf("createBrowserContext на мёртвом соединении +%d после смерти, хочу 0", n-createdBefore)
 	}
-	// Старый сокет закрыт принудительно (фон — после штатной процедуры
-	// chromedp, ≤ её таймаутов), новый живой — ровно один.
+	// The old socket is closed forcibly (in the background — after the
+	// regular chromedp procedure, within its timeouts), the new live
+	// one — exactly one.
 	waitForFor(t, 10*time.Second, conns[0].isClosed)
 	if conns[1].isClosed() {
 		t.Error("живое соединение закрыто")
 	}
-	// Поколение стабильно: дальнейшие задачи не плодят соединений.
+	// The generation is stable: further tasks do not spawn connections.
 	for range 3 {
 		if _, err := m.Run(context.Background(), RenderTask{URL: "https://a.example/"}); err != nil {
 			t.Fatalf("Run после восстановления: %v", err)
@@ -395,10 +412,11 @@ func TestManagerRecoversAfterBrowserDeath(t *testing.T) {
 	}
 }
 
-// TestRemoteAllocatorClosesConnectionOnCancel — принудительное закрытие
-// сокета при отмене контекста жизненного цикла: «чёрная дыра» не может
-// удержать соединение (насосы chromedp зависли бы в записи/чтении —
-// upstream-аллокатор ждал бы их неограниченно).
+// TestRemoteAllocatorClosesConnectionOnCancel — the forced socket
+// closure on the lifecycle context cancellation: a "black hole" cannot
+// hold the connection (the chromedp pumps would hang in
+// writing/reading — the upstream allocator would wait for them
+// unboundedly).
 func TestRemoteAllocatorClosesConnectionOnCancel(t *testing.T) {
 	tr := newSwitchableCDP()
 	overrideRemoteDial(t, func(context.Context, string, time.Duration) (chromedp.Transport, error) {
@@ -414,31 +432,34 @@ func TestRemoteAllocatorClosesConnectionOnCancel(t *testing.T) {
 	}
 
 	tr.kill()
-	// Отмена контекста жизненного цикла — контракт аллокатора («canceling
-	// the provided context frees all resources»): сокет обязан закрыться
-	// принудительно, не дожидаясь зависших насосов chromedp.
+	// The lifecycle context cancellation — the allocator contract
+	// ("canceling the provided context frees all resources"): the
+	// socket must close forcibly, without waiting for the hung chromedp
+	// pumps.
 	cancelAlloc()
 
 	waitForFor(t, 10*time.Second, tr.isClosed)
-	a.Wait() // фоновое закрытие соединения завершено
+	a.Wait() // the background connection closure has completed
 	cancelBrowser()
 }
 
-// TestRemoteAllocatorEngineURLMode — движковая проводка аллокатора
-// (ТЗР движков §4.2 п.1/п.3, ФТ-4): режим адреса wsURLMode по движку.
-// Поведение движков подтверждено на закреплённых образах стека (moli
-// v1.1.21: browser-WS только на пути /devtools/browser/<uuid>, новом на
-// каждый старт, корень — 404; lightpanda 1.0.2: browser-WS на корневом
-// пути). lightpanda подключается по адресу конфигурации как есть; moli
-// берёт путь из /json/version, но authority — из адреса конфигурации
-// (реклама строится от адреса бинда); контроль: chromium использует
-// webSocketDebuggerUrl из /json/version как есть (поведение до этапа 35).
+// TestRemoteAllocatorEngineURLMode — the engine wiring of the allocator
+// (the engines render spec §4.2 items 1/3, FR-4): the wsURLMode address
+// mode by engine. The engines' behavior is confirmed on the pinned
+// stack images (moli v1.1.21: the browser WS only on the
+// /devtools/browser/<uuid> path, new on every start, the root — 404;
+// lightpanda 1.0.2: the browser WS at the root path). lightpanda
+// connects to the configuration address as is; moli takes the path
+// from /json/version but the authority from the configuration address
+// (the advertisement is built from the bind address); the control:
+// chromium uses the webSocketDebuggerUrl from /json/version as is (the
+// behavior before stage 35).
 func TestRemoteAllocatorEngineURLMode(t *testing.T) {
-	// lightpanda: имя-хост без пути /devtools/browser/ — chromium в
-	// такой конфигурации обязан резолвить и уточнять адрес; для
-	// lightpanda любая попытка — регрессия (резолв подменён отказом,
-	// сервера /json/version нет): подключение проходит только по
-	// адресу как есть.
+	// lightpanda: a hostname without the /devtools/browser/ path —
+	// chromium in such a configuration must resolve and refine the
+	// address; for lightpanda any attempt is a regression (the resolve
+	// is replaced by a failure, there is no /json/version server): the
+	// connection goes only to the address as is.
 	t.Run(config.EngineLightpanda, func(t *testing.T) {
 		tr := newSwitchableCDP()
 		var mu sync.Mutex
@@ -472,10 +493,11 @@ func TestRemoteAllocatorEngineURLMode(t *testing.T) {
 		}
 	})
 
-	// moli: путь browser-сессии — из /json/version, authority — из
-	// адреса конфигурации: реклама ws://0.0.0.0:9222 (бинд 0.0.0.0,
-	// флага advertise-host у moli нет) недостижима, подключение идёт
-	// на адрес оператора с рекламируемым путём.
+	// moli: the browser session path — from /json/version, the
+	// authority — from the configuration address: the advertisement
+	// ws://0.0.0.0:9222 (the bind 0.0.0.0, moli has no advertise-host
+	// flag) is unreachable; the connection goes to the operator's
+	// address with the advertised path.
 	t.Run(config.EngineMoli, func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path != "/json/version" {
@@ -498,7 +520,7 @@ func TestRemoteAllocatorEngineURLMode(t *testing.T) {
 
 		opts := remoteOpts()
 		opts.Engine = config.EngineMoli
-		opts.RemoteURL = strings.Replace(srv.URL, "http://", "ws://", 1) // ws-схема: валидация альт-движков требует ws/wss
+		opts.RemoteURL = strings.Replace(srv.URL, "http://", "ws://", 1) // the ws scheme: the alt-engine validation requires ws/wss
 		b, err := StartBrowser(context.Background(), opts)
 		if err != nil {
 			t.Fatalf("подключение к moli с путём из /json/version: %v", err)
@@ -515,9 +537,9 @@ func TestRemoteAllocatorEngineURLMode(t *testing.T) {
 		}
 	})
 
-	// Контроль (chromium): webSocketDebuggerUrl из /json/version
-	// используется как есть, authority не подменяется — поведение
-	// до этапа 35.
+	// The control (chromium): the webSocketDebuggerUrl from
+	// /json/version is used as is, the authority is not replaced — the
+	// behavior before stage 35.
 	t.Run(config.EngineChromium, func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path != "/json/version" {
@@ -540,7 +562,7 @@ func TestRemoteAllocatorEngineURLMode(t *testing.T) {
 
 		opts := remoteOpts()
 		opts.Engine = config.EngineChromium
-		opts.RemoteURL = srv.URL // http://IP:port без /devtools/browser/ — форсирует уточнение
+		opts.RemoteURL = srv.URL // http://IP:port without /devtools/browser/ — forces the refinement
 		b, err := StartBrowser(context.Background(), opts)
 		if err != nil {
 			t.Fatalf("подключение к chromium с уточнением адреса: %v", err)
@@ -558,12 +580,13 @@ func TestRemoteAllocatorEngineURLMode(t *testing.T) {
 	})
 }
 
-// TestBrowserProbeConnDeadConnection — зонд соединения против «чёрной
-// дыры» T-218 (полузакрытый сокет: транспорт «жив», ответов нет): живое
-// отвечает; после смерти первая неудача поколение ещё не гасит —
-// одиночный таймаут не отличает дыру от перегруженного Chromium (T-226),
-// вторая подряд гасит залипающе, Alive это видит даже при живом (по
-// мнению chromedp) контексте — состояние инцидента 02.11.
+// TestBrowserProbeConnDeadConnection — the connection probe against the
+// T-218 "black hole" (a half-closed socket: the transport is "alive",
+// no answers arrive): a live one answers; after the death the first
+// failure does not kill the generation yet — a single timeout does not
+// distinguish the hole from an overloaded Chromium (T-226); the second
+// in a row kills it stickily, and Alive sees it even with a (by
+// chromedp's opinion) live context — the state of the Nov 2 incident.
 func TestBrowserProbeConnDeadConnection(t *testing.T) {
 	tr := newSwitchableCDP()
 	overrideRemoteDial(t, func(context.Context, string, time.Duration) (chromedp.Transport, error) {
@@ -580,21 +603,24 @@ func TestBrowserProbeConnDeadConnection(t *testing.T) {
 	}
 
 	tr.kill()
-	// Первая неудача: класс browser (зонд не прошёл), но поколение живо.
+	// The first failure: the browser class (the probe failed), but the
+	// generation is alive.
 	if b.probeConn() {
 		t.Fatal("зонд мёртвого соединения прошёл")
 	}
 	if !b.Alive() {
 		t.Fatal("одиночный таймаут «чёрной дыры» погасил поколение (T-226: требуется серия)")
 	}
-	// Вторая подряд — lost залипающе, Manager увидит смену поколения.
+	// The second in a row — lost stickily; Manager will see the
+	// generation swap.
 	if b.probeConn() {
 		t.Fatal("зонд мёртвого соединения прошёл")
 	}
 	if b.Alive() {
 		t.Fatal("мёртвое соединение: Alive обязан быть false (для Manager — смена поколения)")
 	}
-	// Залипание: повторный зонд не ждёт probeTimeout и не «оживляет».
+	// Sticking: a repeated probe does not wait for probeTimeout and
+	// does not "revive".
 	started := time.Now()
 	if b.probeConn() {
 		t.Fatal("повторный зонд мёртвого соединения прошёл")
@@ -604,13 +630,15 @@ func TestBrowserProbeConnDeadConnection(t *testing.T) {
 	}
 }
 
-// TestProbeConnTimeoutTwoFailures — приёмник T-226: одиночный таймаут
-// зонда не гасит поколение. Сценарий — «перегруженный Chromium»: соединение
-// живо (транспорт отвечает на прочие команды), Target.getTargets не успевает
-// за probeTimeout. Обратная сторона контрмеры T-218: зонд ходит перед
-// каждой задачей, и разовый лаг занятого браузера не должен стоить
-// поколения (рестарт, разрыв чужих задач) — lost ставится со второй
-// неудачи подряд, успех между неудачами сбрасывает счётчик.
+// TestProbeConnTimeoutTwoFailures — the T-226 sink: a single probe
+// timeout does not kill the generation. The scenario — an "overloaded
+// Chromium": the connection is alive (the transport answers other
+// commands), Target.getTargets does not make it within probeTimeout.
+// The other side of the T-218 countermeasure: the probe runs before
+// every task, and a one-off lag of a busy browser must not cost the
+// generation (a restart, breaking others' tasks) — lost is set from
+// the second failure in a row, a success between failures resets the
+// counter.
 func TestProbeConnTimeoutTwoFailures(t *testing.T) {
 	tr := newSwitchableCDP()
 	overrideRemoteDial(t, func(context.Context, string, time.Duration) (chromedp.Transport, error) {
@@ -623,14 +651,15 @@ func TestProbeConnTimeoutTwoFailures(t *testing.T) {
 		t.Fatal("зонд живого соединения не прошёл")
 	}
 
-	// Одиночный таймаут: неудача без смерти поколения.
+	// A single timeout: a failure without the generation's death.
 	tr.hangMethod("Target.getTargets")
 	started := time.Now()
 	if b.probeConn() {
 		t.Fatal("зонд висящего getTargets прошёл")
 	}
-	// Пин подмены бюджета: продуктовый probeTimeout зонд ждать не должен
-	// (без подмены поля эта проверка падает на ~5 с).
+	// The budget substitution pin: the probe must not wait for the
+	// production probeTimeout (without substituting the field this
+	// check would fail at ~5 s).
 	if elapsed := time.Since(started); elapsed >= probeTimeout {
 		t.Errorf("зонд ждал полный продуктовый probeTimeout (%s) — тестовый бюджет не подменён", elapsed)
 	}
@@ -638,8 +667,8 @@ func TestProbeConnTimeoutTwoFailures(t *testing.T) {
 		t.Fatal("одиночный таймаут зонда погасил поколение (T-226: ложная смерть на нагруженном воркере)")
 	}
 
-	// Успех между неудачами сбрасывает счётчик: следующий одиночный
-	// таймаут — всё ещё не смерть.
+	// A success between failures resets the counter: the next single
+	// timeout is still not a death.
 	tr.unhangMethod("Target.getTargets")
 	if !b.probeConn() {
 		t.Fatal("зонд живого соединения после сброса не прошёл")
@@ -652,14 +681,15 @@ func TestProbeConnTimeoutTwoFailures(t *testing.T) {
 		t.Fatal("таймаут сразу после успеха (сброс счётчика) погасил поколение")
 	}
 
-	// Вторая подряд неудача: поколение гасится залипающе.
+	// The second failure in a row: the generation is killed stickily.
 	if b.probeConn() {
 		t.Fatal("зонд висящего getTargets прошёл")
 	}
 	if b.Alive() {
 		t.Fatal("двойной таймаут зонда не погасил поколение")
 	}
-	// Залипание: повторный зонд не ждёт probeTimeout и не «оживляет».
+	// Sticking: a repeated probe does not wait for probeTimeout and
+	// does not "revive".
 	started = time.Now()
 	if b.probeConn() {
 		t.Fatal("повторный зонд потерянного браузера прошёл")
@@ -669,10 +699,11 @@ func TestProbeConnTimeoutTwoFailures(t *testing.T) {
 	}
 }
 
-// TestProbeConnTransportDeathInstantLost — доказанная смерть транспорта
-// (закрытый сокет: чтение падает, chromedp закрывает LostConnection, ошибки
-// вызова оборачивают context.Canceled) не ослаблена контрмерой T-226:
-// lost ставится первой же неудачей, без серии, мгновенно.
+// TestProbeConnTransportDeathInstantLost — a proven transport death (a
+// closed socket: the read fails, chromedp closes LostConnection, the
+// call errors wrap context.Canceled) is not weakened by the T-226
+// countermeasure: lost is set by the very first failure, without a
+// series, instantly.
 func TestProbeConnTransportDeathInstantLost(t *testing.T) {
 	tr := newSwitchableCDP()
 	overrideRemoteDial(t, func(context.Context, string, time.Duration) (chromedp.Transport, error) {
@@ -681,8 +712,9 @@ func TestProbeConnTransportDeathInstantLost(t *testing.T) {
 	opts := remoteOpts()
 	b := switchableBrowser(t, tr, opts)
 
-	// Закрытие сокета (аналог FIN/RST — «use of closed network
-	// connection»): chromedp узнаёт от чтения и закрывает LostConnection.
+	// Closing the socket (an analog of FIN/RST — "use of closed network
+	// connection"): chromedp learns of it from the read and closes
+	// LostConnection.
 	_ = tr.Close()
 	c := chromedp.FromContext(b.ctx)
 	waitForFor(t, 5*time.Second, func() bool {
@@ -709,11 +741,11 @@ func TestProbeConnTransportDeathInstantLost(t *testing.T) {
 	}
 }
 
-// TestProbeConnProtocolErrorSeries — ответ-ошибка протокола на getTargets
-// при живом соединении (браузер ответил — транспорт работает) относится к
-// «необъяснённым» неудачам T-226, а не к доказанной смерти: одиночный
-// ошибочный ответ не гасит поколение (класс ложных смертей), серия из
-// двух — гасит.
+// TestProbeConnProtocolErrorSeries — a protocol error reply to
+// getTargets with a live connection (the browser answered — the
+// transport works) belongs to the "unexplained" failures of T-226, not
+// to a proven death: a single error reply does not kill the generation
+// (the class of false deaths), a series of two does.
 func TestProbeConnProtocolErrorSeries(t *testing.T) {
 	tr := newSwitchableCDP()
 	overrideRemoteDial(t, func(context.Context, string, time.Duration) (chromedp.Transport, error) {
@@ -737,10 +769,11 @@ func TestProbeConnProtocolErrorSeries(t *testing.T) {
 	}
 }
 
-// TestSessionStartTimeoutDeadConnection — классификация таймаута
-// создания контекста: мёртвое соединение — класс browser (Manager
-// меняет поколение), висящая команда при живом соединении — класс
-// context (существующий повтор на новом контексте).
+// TestSessionStartTimeoutDeadConnection — the classification of the
+// context creation timeout: a dead connection — the browser class
+// (Manager swaps the generation), a hung command with a live
+// connection — the context class (the existing retry on a new
+// context).
 func TestSessionStartTimeoutDeadConnection(t *testing.T) {
 	tr := newSwitchableCDP()
 	overrideRemoteDial(t, func(context.Context, string, time.Duration) (chromedp.Transport, error) {
@@ -749,7 +782,8 @@ func TestSessionStartTimeoutDeadConnection(t *testing.T) {
 	opts := remoteOpts()
 	b := switchableBrowser(t, tr, opts)
 
-	// Мёртвое соединение: createBrowserContext висит, зонд не отвечает.
+	// A dead connection: createBrowserContext hangs, the probe does not
+	// answer.
 	tr.kill()
 	sctx, scancel := chromedp.NewContext(b.ctx, chromedp.WithNewBrowserContext())
 	defer scancel()
@@ -761,9 +795,9 @@ func TestSessionStartTimeoutDeadConnection(t *testing.T) {
 	}
 }
 
-// TestSessionStartTimeoutSlowBrowser — висящий createBrowserContext при
-// живом соединении (зонд проходит) остаётся классом context: повтор на
-// новом контексте, как до T-218.
+// TestSessionStartTimeoutSlowBrowser — a hung createBrowserContext with
+// a live connection (the probe passes) stays the context class: a
+// retry on a new context, as before T-218.
 func TestSessionStartTimeoutSlowBrowser(t *testing.T) {
 	tr := newSwitchableCDP()
 	overrideRemoteDial(t, func(context.Context, string, time.Duration) (chromedp.Transport, error) {
@@ -783,13 +817,13 @@ func TestSessionStartTimeoutSlowBrowser(t *testing.T) {
 	}
 }
 
-// TestStartBrowserBootstrapTimeout — потолок инициализации
-// (initBrowserSession, T-218): bootstrap-команды chromedp не ограничены
-// изнутри — подвисший при старте Chromium держал бы старт поколения (а с
-// ним и мьютекс менеджера) бесконечно. Подвисшая командаbootstrap'а →
-// StartBrowser отказывает классом browser за потолок DialTimeout +
-// SessionStartTimeout, сокет закрыт; после «выздоровления» браузера
-// следующий старт проходит.
+// TestStartBrowserBootstrapTimeout — the initialization cap
+// (initBrowserSession, T-218): the chromedp bootstrap commands are not
+// bounded from inside — a Chromium hung at startup would hold the
+// generation start (and with it the manager mutex) forever. A hung
+// bootstrap command → StartBrowser fails with the browser class within
+// the DialTimeout + SessionStartTimeout cap, the socket is closed;
+// after the browser's "recovery" the next start passes.
 func TestStartBrowserBootstrapTimeout(t *testing.T) {
 	tr := newSwitchableCDP()
 	var dials int
@@ -801,11 +835,11 @@ func TestStartBrowserBootstrapTimeout(t *testing.T) {
 		return newSwitchableCDP(), nil
 	})
 
-	// Служебная вкладка браузерной сессии не создаётся: соединение есть,
-	// ответов нет (подвисший при старте Chromium).
+	// The browser session's service tab is not created: the connection
+	// is there, no answers arrive (a Chromium hung at startup).
 	tr.hangMethod("Target.createTarget")
 
-	opts := remoteOpts() // потолок инициализации = 1 с + 300 мс
+	opts := remoteOpts() // the initialization cap = 1 s + 300 ms
 	started := time.Now()
 	_, err := StartBrowser(context.Background(), opts)
 	var e *Error
@@ -818,12 +852,14 @@ func TestStartBrowserBootstrapTimeout(t *testing.T) {
 	if elapsed := time.Since(started); elapsed > 10*time.Second {
 		t.Errorf("старт висел %s — потолок не работает", elapsed)
 	}
-	// Сокет подвисшего соединения закрыт принудительно (гигиена отмен
-	// StartBrowser + аллокатор), не ждёт «выздоровления» браузера.
+	// The socket of the hung connection is closed forcibly (the
+	// cancellation hygiene of StartBrowser + the allocator), it does
+	// not wait for the browser's "recovery".
 	waitForFor(t, 10*time.Second, tr.isClosed)
 
-	// Браузер «выздоровел» (hang снят — новый транспорт отвечает):
-	// следующий старт поколения проходит, соединение живо.
+	// The browser "recovered" (the hang is lifted — the new transport
+	// answers): the next generation start passes, the connection is
+	// alive.
 	b, err := StartBrowser(context.Background(), opts)
 	if err != nil {
 		t.Fatalf("старт после восстановления: %v", err)
@@ -834,10 +870,11 @@ func TestStartBrowserBootstrapTimeout(t *testing.T) {
 	}
 }
 
-// TestSessionRunPageTimeoutDeadConnection — обрыв соединения посреди
-// страницы (T-218, ревью P2): таймаут страницы на полузакрытом сокете —
-// не тарпит, а инфраструктурный отказ: зонд в Session.wrap реклассифицирует
-// его в browser, Manager сменит поколение и повторит задачу.
+// TestSessionRunPageTimeoutDeadConnection — a connection break in the
+// middle of a page (T-218, the P2 of the review): a page timeout on a
+// half-closed socket is not a tarpit but an infrastructure failure:
+// the probe in Session.wrap reclassifies it as browser, Manager will
+// swap the generation and retry the task.
 func TestSessionRunPageTimeoutDeadConnection(t *testing.T) {
 	tr := newSwitchableCDP()
 	overrideRemoteDial(t, func(context.Context, string, time.Duration) (chromedp.Transport, error) {
@@ -852,8 +889,9 @@ func TestSessionRunPageTimeoutDeadConnection(t *testing.T) {
 	}
 	defer s.Close()
 
-	// Обрыв посреди задачи: команды уходят, ответов нет — первый же этап
-	// (startBlock/Fetch.enable) висит до таймаута страницы.
+	// A break in the middle of the task: the commands go out, no
+	// answers arrive — the very first stage (startBlock/Fetch.enable)
+	// hangs until the page timeout.
 	tr.kill()
 	_, err = s.Run(context.Background(), RenderTask{URL: "https://a.example/"})
 	var e *Error
@@ -862,9 +900,10 @@ func TestSessionRunPageTimeoutDeadConnection(t *testing.T) {
 	}
 }
 
-// TestResolveRemoteWSURL — уточнение WebSocket-адреса: готовый адрес
-// /devtools/browser/ используется как есть (без сети), иначе — запрос
-// /json/version; ответ без webSocketDebuggerUrl — ошибка.
+// TestResolveRemoteWSURL — the WebSocket address refinement: a ready
+// /devtools/browser/ address is used as is (no network), otherwise — a
+// /json/version request; an answer without webSocketDebuggerUrl is an
+// error.
 func TestResolveRemoteWSURL(t *testing.T) {
 	ctx := context.Background()
 
@@ -904,8 +943,8 @@ func TestResolveRemoteWSURL(t *testing.T) {
 	}
 }
 
-// overrideRemoteResolve — подмена шва резолва на время теста (стиль
-// overrideRemoteDial).
+// overrideRemoteResolve — replacing the resolve seam for the test's
+// duration (the overrideRemoteDial style).
 func overrideRemoteResolve(t *testing.T, f func(context.Context, string) ([]net.IPAddr, error)) {
 	t.Helper()
 	old := remoteResolve
@@ -913,11 +952,12 @@ func overrideRemoteResolve(t *testing.T, f func(context.Context, string) ([]net.
 	t.Cleanup(func() { remoteResolve = old })
 }
 
-// TestResolveRemoteWSURLPreferIPv4 — выбор адреса из ответа DNS (T-229):
-// IPv6-first порядок не должен отдавать v6-адрес Chromium, слушающему
-// только IPv4 (подключение пошло бы вторым адресом); v4-first и v6-only
-// ответы работают первым адресом. Путь /devtools/browser/ — без сети,
-// адрес проверяется сразу после резолва.
+// TestResolveRemoteWSURLPreferIPv4 — the address choice from the DNS
+// answer (T-229): an IPv6-first order must not hand a v6 address to a
+// Chromium listening on IPv4 only (the connection would go to the
+// second address); v4-first and v6-only answers work with the first
+// address. The /devtools/browser/ path — no network; the address is
+// checked right after the resolve.
 func TestResolveRemoteWSURLPreferIPv4(t *testing.T) {
 	ctx := context.Background()
 	v6 := net.ParseIP("2001:db8::1")
@@ -934,8 +974,8 @@ func TestResolveRemoteWSURLPreferIPv4(t *testing.T) {
 		{"IPv6-first — выбран IPv4", withPath, []net.IPAddr{{IP: v6}, {IP: v4}}, "ws://192.0.2.10:9222/devtools/browser/abc"},
 		{"IPv4-first — он же", withPath, []net.IPAddr{{IP: v4}, {IP: v6}}, "ws://192.0.2.10:9222/devtools/browser/abc"},
 		{"только IPv6 — первый адрес", withPath, []net.IPAddr{{IP: v6}}, "ws://[2001:db8::1]:9222/devtools/browser/abc"},
-		// Без порта: v4 — как есть, v6 — в скобках (голые двоеточия
-		// host перепарсились бы портом, ревью P3-7).
+		// Without a port: v4 — as is, v6 — in brackets (bare colons in
+		// the host would be re-parsed as the port, the review P3-7).
 		{"IPv4 без порта", noPort, []net.IPAddr{{IP: v6}, {IP: v4}}, "ws://192.0.2.10/devtools/browser/abc"},
 		{"IPv6 без порта — в скобках", noPort, []net.IPAddr{{IP: v6}}, "ws://[2001:db8::1]/devtools/browser/abc"},
 	} {
