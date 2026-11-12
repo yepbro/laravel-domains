@@ -1,972 +1,991 @@
-# Схема PostgreSQL
+# PostgreSQL Schema
 
-Решения по схеме (задачи T-003 — `zones`, `subdomains`, `domains`; T-004 —
+Schema decisions (tasks T-003 — `zones`, `subdomains`, `domains`; T-004 —
 `subdomain_results`, `contents`, `laravel_domains`, `laravel_findings`,
-`ingest_files`; T-005 — субпартиционирование крупных зон; T-031 — колонка
-`domains.temp_attempts`; T-082 — SQL-функция `domain_info`; T-104 —
-частичные индексы фоновых проходов `domains_lease_idx`/`domains_recheck_idx`;
-T-210 — маркер «рендер невозможен» `subdomain_results.render_failed_at`).
-Механизм применения миграций — в [`migrations.md`](migrations.md).
+`ingest_files`; T-005 — subpartitioning of large zones; T-031 — the
+`domains.temp_attempts` column; T-082 — the `domain_info` SQL function; T-104 —
+the partial indexes of background passes `domains_lease_idx`/`domains_recheck_idx`;
+T-210 — the "render impossible" marker `subdomain_results.render_failed_at`).
+The migration mechanism — in [`migrations.md`](migrations.md).
 
-Контракт схемы закреплён интеграционными тестами
-`test/integration/schema_test.go` и
-`test/integration/zone_partitions_test.go` (`make test-integration`): они
-накатывают миграции в изолированную схему и проверяют все утверждения этой
-страницы.
+The schema contract is pinned by the integration tests
+`test/integration/schema_test.go` and
+`test/integration/zone_partitions_test.go` (`make test-integration`): they
+apply the migrations into an isolated schema and verify every statement of this
+page.
 
-## Обзор таблиц
+## Table overview
 
-| Таблица | Что это | Партиционирование |
+| Table | What it is | Partitioning |
 |---|---|---|
-| `zones` | справочник зон (TLD + тестовые зоны allowlist), счётчики прогресса | нет — размер ≈ тысячи строк |
-| `subdomains` | справочник проверяемых субдоменов, `id` = бит в `dns_mask` (0..62) | нет — максимум 63 строки (ТЗ 5.10) |
-| `domains` | все домены всех зон, статус и состояние проверки | LIST по `zone_id` |
-| `subdomain_results` | результаты проверок: (домен, субдомен, вариант) — адреса, редиректы, TLS, заголовки, cookies, ссылка на контент | LIST по `zone_id` |
-| `contents` | метаданные дедуплицированного контента в пак-файлах (`hash`, пак, смещение, refcount) | нет — нет `domain_id`, ключ `hash` глобален (ТЗ 5.7) |
-| `laravel_domains` | агрегат признаков Laravel по домену (score, диапазон версий, маска субдоменов) | LIST по `zone_id` |
-| `laravel_findings` | срабатывания правил по каждому (домен, субдомен, вариант) | LIST по `zone_id` |
-| `laravel_history` | журнал детекции appeared/lost (T-118) | нет — только переходы, объём на порядки меньше findings |
-| `ingest_files` | журнал обработанных входных файлов с sha256 (идемпотентность) | нет — добавляется по строке на файл |
-| `web_checks` | лог ручных проверок из формы лендинга (T-120; пишет только cmd/web, T-123) | нет — объём ручных проверок мал |
-| `crawler_counters` | инкрементальные счётчики переходов (T-175: `render_pending` — рендер-долг; T-179/T-182: суточные `checks:`/`temp_error:YYYY-MM-DD` — темп и доля ошибок; T-202: корзины зрелости `retry_mature:`; T-203: часовые корзины темпа `results:`/`rendered:YYYY-MM-DD"T"HH24`; T-204: часовые корзины хвостов переанализа `reanalyze:…`; T-256: уровень `new_done_stale` — домены «статус повис», guard компенсатора T-270) | нет — точечные Lookup по PK / суммы пары строк |
-| `retention_drain_cursor` | персистентный курсор дренажа retention (T-274, миграция 000020): последняя посещённая строка `(checked_at, PK)` — одна строка (`id = 1`, CHECK), upsert транзакцией пачки `retentionPurge`, DELETE при принудительных catch-up-кругах; снимает штраф рестартов http-worker (полный catch-up с нуля остаётся только первому проходу после простоя) | нет — одна строка |
+| `zones` | the zone directory (TLD + allowlisted test zones), progress counters | none — the size is ≈ thousands of rows |
+| `subdomains` | the reference of subdomains to check; `id` = a bit in `dns_mask` (0..62) | none — at most 63 rows (spec 5.10) |
+| `domains` | all domains of all zones: status and check state | LIST by `zone_id` |
+| `subdomain_results` | check results per (domain, subdomain, variant) — addresses, redirects, TLS, headers, cookies, a link to the content | LIST by `zone_id` |
+| `contents` | metadata of the deduplicated content in pack files (`hash`, pack, offset, refcount) | none — no `domain_id`; the `hash` key is global (spec 5.7) |
+| `laravel_domains` | the per-domain aggregate of Laravel signs (score, version range, the subdomain mask) | LIST by `zone_id` |
+| `laravel_findings` | rule hits per (domain, subdomain, variant) | LIST by `zone_id` |
+| `laravel_history` | the appeared/lost detection journal (T-118) | none — transitions only; the volume is orders of magnitude below findings |
+| `ingest_files` | the journal of processed input files with sha256 (idempotency) | none — one row per file is appended |
+| `web_checks` | the log of manual checks from the landing form (T-120; only cmd/web writes it, T-123) | none — the manual check volume is small |
+| `crawler_counters` | incremental transition counters (T-175: `render_pending` — render debt; T-179/T-182: the daily `checks:`/`temp_error:YYYY-MM-DD` — throughput and the error share; T-202: the maturity buckets `retry_mature:`; T-203: the hourly throughput buckets `results:`/`rendered:YYYY-MM-DD"T"HH24`; T-204: the hourly buckets of reanalyze tails `reanalyze:…`; T-256: the `new_done_stale` level — "stale status" domains, the guard of the T-270 compensator) | none — point lookups by PK / sums of a couple of rows |
+| `retention_drain_cursor` | the persistent retention drain cursor (T-274, migration 000020): the last visited `(checked_at, PK)` row — a single row (`id = 1`, CHECK), upserted by the `retentionPurge` batch transaction, DELETE on forced catch-up circles; removes the http-worker restart penalty (a full catch-up from zero remains only for the first pass after a standstill) | none — one row |
 
-Принцип ТЗ §6 — партиционирование по `zone_id` — касается таблиц с колонкой
-`domain_id` (все строки зоны лежат в одной партиции; `zone_id` дублируется
-в каждой строке и входит в первичный ключ); справочники и таблицы без
-`domain_id` не партиционируются.
+The spec §6 principle — partitioning by `zone_id` — applies to the tables with
+a `domain_id` column (all rows of a zone live in one partition; `zone_id` is
+duplicated in every row and is part of the primary key); reference tables and
+tables without a `domain_id` are not partitioned.
 
-## Партиционирование LIST по zone_id
+## LIST partitioning by zone_id
 
-- `PARTITION BY LIST (zone_id)` у `domains`, `subdomain_results`,
-  `laravel_domains`, `laravel_findings`; составной первичный ключ начинается
-  с `(zone_id, domain_id)` — все индексы начинаются с `zone_id`.
-- Изначально у каждой таблицы только DEFAULT-партиция — она принимает все
-  зоны. Крупная зона выделяется из DEFAULT в собственный набор партиций
-  процедурой `create_zone_partitions` (T-005, миграция 000003) — см. следующий
-  раздел.
-- Партиция зоны создаётся до загрузки данных зоны (или с переносом
-  из DEFAULT), обязательно с `WITH (fillfactor = 85)` для `domains`
-  и `subdomain_results` — см. ниже.
+- `PARTITION BY LIST (zone_id)` on `domains`, `subdomain_results`,
+  `laravel_domains`, `laravel_findings`; the composite primary key starts
+  with `(zone_id, domain_id)` — all indexes start with `zone_id`.
+- Initially each table has only a DEFAULT partition — it accepts all
+  zones. A large zone is carved out of DEFAULT into its own set of partitions
+  by the `create_zone_partitions` procedure (T-005, migration 000003) — see the
+  next section.
+- A zone partition is created before the zone data is loaded (or with the rows
+  moved from DEFAULT), always with `WITH (fillfactor = 85)` for `domains`
+  and `subdomain_results` — see below.
 
-## Субпартиционирование крупных зон (T-005)
+## Subpartitioning of large zones (T-005)
 
-Пока зона не выделена, её строки живут в DEFAULT-партиции таблицы. Когда
-крупная зона дорастает до ≈ 30–50 млн строк (ТЗ §6), она выделяется
-процедурой:
+Until a zone is carved out, its rows live in the table's DEFAULT partition. When
+a large zone grows to ≈ 30–50M rows (spec §6), it is carved out
+by the procedure:
 
 ```sql
 CALL create_zone_partitions(<zone_id>);             -- hash_parts = 4
 CALL create_zone_partitions(<zone_id>, <hash_parts>);
 ```
 
-Структура после выделения (`<зона>` — id из `zones`):
+The structure after the carve-out (`<zone>` — an id from `zones`):
 
-| Таблица | Партиция зоны | Второй уровень |
+| Table | Zone partition | Second level |
 |---|---|---|
-| `domains` | `domains_z<зона>` — обычный лист, `fillfactor = 85` | нет |
-| `subdomain_results` | `subdomain_results_z<зона>` | HASH по `domain_id`, листья с `fillfactor = 85` |
-| `laravel_domains` | `laravel_domains_z<зона>` | HASH по `domain_id` |
-| `laravel_findings` | `laravel_findings_z<зона>` | HASH по `domain_id` |
+| `domains` | `domains_z<zone>` — a plain leaf, `fillfactor = 85` | none |
+| `subdomain_results` | `subdomain_results_z<zone>` | HASH by `domain_id`, leaves with `fillfactor = 85` |
+| `laravel_domains` | `laravel_domains_z<zone>` | HASH by `domain_id` |
+| `laravel_findings` | `laravel_findings_z<zone>` | HASH by `domain_id` |
 
-Hash-листья именуются `<таблица>_z<зона>_h<N>` и покрывают все остатки
-`0..modulus-1` — DEFAULT внутри hash-набора невозможен, «дырок»
-для маршрутизации нет. Хэш — по id домена: все строки одного домена
-(результаты, находки Laravel) лежат в одном листе.
+Hash leaves are named `<table>_z<zone>_h<N>` and cover all remainders
+`0..modulus-1` — a DEFAULT inside the hash set is impossible; there are no
+"holes" for routing. The hash is by domain id: all rows of one domain
+(the results, the Laravel findings) live in one leaf.
 
-### Почему domains без хэша
+### Why domains has no hash
 
-У `domains` два уникальных ключа: PK `(zone_id, id)` и
-`UNIQUE (zone_id, label)` (контракт T-003: идемпотентность ingest по
-`ON CONFLICT`, ТЗ §5.1; поиск по имени, ТЗ §5.11). PostgreSQL 16 требует,
-чтобы каждый уникальный ключ содержал колонки ключа партиционирования
-**каждого** уровня; общая часть двух ключей — только `zone_id`, константа
-внутри партиции зоны. Поэтому субпартиционировать `domains` по хэшу id (или
-label) при живом `UNIQUE (zone_id, label)` невозможно в принципе — PG
-отказывает ошибкой «unique constraint on partitioned table must include all
-partitioning columns». Это уточнение ТЗ §6/§6.1 при реализации: крупная зона
-получает одну выделенную партицию `domains`. Строки таблицы маленькие
-(~100 байт) и апдейтятся точечно; основной объём и перезаписи живут
-в `subdomain_results`, который субпартиционируется полностью.
+`domains` has two unique keys: PK `(zone_id, id)` and
+`UNIQUE (zone_id, label)` (the T-003 contract: ingest idempotency via
+`ON CONFLICT`, spec §5.1; search by name, spec §5.11). PostgreSQL 16 requires
+every unique key to contain the partition key columns
+**of every** level; the only part shared by the two keys is `zone_id`, a constant
+inside a zone partition. Therefore subpartitioning `domains` by the hash of the id (or
+label) while `UNIQUE (zone_id, label)` exists is impossible in principle — PG
+refuses with the error "unique constraint on partitioned table must include all
+partitioning columns". This is a refinement of spec §6/§6.1 made during
+implementation: a large zone gets a single dedicated
+`domains` partition. The table's rows are small
+(~100 bytes) and are updated by point updates; the main volume and the rewrites live
+in `subdomain_results`, which is subpartitioned in full.
 
-### Как считать hash_parts
+### How to compute hash_parts
 
-Целевой размер листа — 30–50 млн строк. `hash_parts` — ожидаемое число
-доменов зоны, делённое на 40 млн, округлённое вверх до **степени двойки**
-(степень двойки позволяет позже делить лист пополам — `modulus 2M`,
-остатки `N` и `N+M` — не пересобирая остальные листья зоны):
+The target leaf size is 30–50M rows. `hash_parts` is the expected number
+of domains in the zone divided by 40M, rounded up to a **power of two**
+(a power of two allows splitting a leaf in half later — `modulus 2M`,
+the remainders `N` and `N+M` — without rebuilding the zone's other leaves):
 
-| Доменов в зоне | hash_parts |
+| Domains in the zone | hash_parts |
 |---|---|
-| до ≈ 40 млн | 1 (выделенная партиция без второго уровня) |
-| 40–80 млн | 2 |
-| 80–160 млн | 4 (по умолчанию) |
-| 160–320 млн | 8 |
+| up to ≈ 40M | 1 (a dedicated partition without a second level) |
+| 40–80M | 2 |
+| 80–160M | 4 (the default) |
+| 160–320M | 8 |
 
-Текущий размер зоны — `zones.domains_total` (инкрементальные счётчики:
-дельты переходов + реконсиляция monitor, T-178: живые домены,
-`status <> deleted`) или прямой `count(*)` по партиции (все строки,
-включая удалённые — для оценки физического размера).
-Верхняя граница `hash_parts` — 1024. Соседние кэши `zones.domains_laravel`
-(число Laravel-доменов зоны), `domains_pending` / `domains_queued`
-(состояния проверки конвейера, T-178) ведут те же дельты переходов и
-реконсиляция монитор-сервиса (T-120/T-178) — читают лендинг этапа 13,
-`crawlerctl` и дашборд.
+The current zone size is `zones.domains_total` (incremental counters:
+transition deltas + monitor reconciliation; T-178: live domains,
+`status <> deleted`) or a direct `count(*)` over the partition (all rows,
+including deleted ones — for estimating the physical size).
+The upper bound of `hash_parts` is 1024. The adjacent caches `zones.domains_laravel`
+(the number of the zone's Laravel domains), `domains_pending` / `domains_queued`
+(the pipeline's check states, T-178) keep the same transition deltas and the
+monitor service's reconciliation (T-120/T-178) — the stage 13 landing,
+`crawlerctl` and the dashboard read them.
 
-### Поведение и блокировки
+### Behavior and locks
 
-Процедура обрабатывает все четыре таблицы в одной транзакции, для каждой:
+The procedure handles all four tables in one transaction; for each:
 
-1. `ALTER TABLE … DETACH PARTITION …_default` — с прикреплённой DEFAULT
-   создать партицию зоны нельзя, пока в DEFAULT есть строки зоны
-   (PG отказывает: «updated partition constraint for default partition
-   would be violated by some row»);
-2. `CREATE TABLE … PARTITION OF … FOR VALUES IN (зона)` (для таблиц
-   результатов — `PARTITION BY HASH (domain_id)`) и листья на все остатки;
-   дочерние индексы всех индексов родителя создаются автоматически;
-3. перенос строк одной командой
+1. `ALTER TABLE … DETACH PARTITION …_default` — with a DEFAULT attached,
+   a zone partition cannot be created while the DEFAULT still holds rows of the zone
+   (PG refuses: "updated partition constraint for default partition
+   would be violated by some row");
+2. `CREATE TABLE … PARTITION OF … FOR VALUES IN (zone)` (for the results
+   tables — `PARTITION BY HASH (domain_id)`) and leaves covering all remainders;
+   child indexes of all parent indexes are created automatically;
+3. the rows are moved by a single command
    `WITH moved AS (DELETE FROM …_default WHERE zone_id = … RETURNING *)
-   INSERT INTO …_z<зона> SELECT * FROM moved`;
-4. `ALTER TABLE … ATTACH PARTITION …_default DEFAULT` — строк зоны
-   в DEFAULT больше нет, проверка ограничения проходит.
+   INSERT INTO …_z<zone> SELECT * FROM moved`;
+4. `ALTER TABLE … ATTACH PARTITION …_default DEFAULT` — the DEFAULT no longer
+   holds zone rows, the constraint check passes.
 
-`DETACH`/`CREATE`/`ATTACH` держат `AccessExclusiveLock` на таблице:
-конкурентная запись на время работы процедуры (включая перенос строк) **ждёт**,
-а не падает. Поэтому зону выделяйте до загрузки (перенос пуст, процедура
-мгновенна) либо в окно обслуживания. `DETACH … CONCURRENTLY` внутри процедуры
-недоступен — он не работает в транзакции.
+`DETACH`/`CREATE`/`ATTACH` hold an `AccessExclusiveLock` on the table:
+concurrent writes **wait** for the duration of the procedure (including the row
+move) instead of failing. So carve out a zone before loading it (the move is
+empty, the procedure is instant) or in a maintenance window. `DETACH … CONCURRENTLY`
+inside the procedure is unavailable — it does not work in a transaction.
 
-Свойства:
+Properties:
 
-- **идемпотентность**: таблицы, у которых партиция зоны уже существует,
-  пропускаются с NOTICE — повторный `CALL` безопасен и завершит прерванное
-  выделение;
-- повторные вызовы по одной зоне сериализуются advisory-блокировкой;
-- аргументы проверяются: зона обязана существовать в `zones`, `hash_parts` —
-  степень двойки от 1 до 1024;
-- сбой откатывает всё до исходного состояния (одна транзакция).
+- **idempotency**: tables whose zone partition already exists are
+  skipped with a NOTICE — a repeated `CALL` is safe and will finish an interrupted
+  carve-out;
+- repeated calls for the same zone are serialized by an advisory lock;
+- the arguments are validated: the zone must exist in `zones`; `hash_parts` —
+  a power of two from 1 to 1024;
+- a failure rolls everything back to the original state (one transaction).
 
-Down-миграция 000003 удаляет только процедуру; созданные ею партиции зон
-и данные в них остаются (это данные, а не определение процедуры).
+The down migration 000003 drops only the procedure; the zone partitions
+it created and the data in them remain (this is data, not the procedure
+definition).
 
 ## fillfactor
 
-Пониженный `fillfactor` оставляет часть каждой страницы свободной: новые
-версии обновляемых строк кладутся на ту же страницу (ТЗ §6 — частые апдейты,
-HOT-апдейты).
+A lowered `fillfactor` leaves part of each page free: new
+versions of updated rows are placed on the same page (spec §6 — frequent updates,
+HOT updates).
 
-- `domains` — `fillfactor = 85` (миграция 000001): статусы и маски
-  обновляются на каждом цикле проверки.
-- `subdomain_results` — `fillfactor = 85` (миграция 000002): история
-  проверок не хранится (ТЗ §3.5), перепроверка домена перезаписывает строки
-  результата с тем же первичным ключом, а ТЗ §6.3 прямо относит таблицу
-  к часто обновляемым (настроенный autovacuum для партиций `domains`
-  и `subdomain_results`).
-- `laravel_domains`, `laravel_findings` — без fillfactor: строка пишется
-  один раз и перезаписывается только переанализом по новым правилам
-  (ТЗ 5.8), объём обновлений мал; ТЗ §6.3 эти таблицы не называет.
-- `contents` — без fillfactor: таблица insert-ориентированная (сотни
-  миллионов строк уникального контента), по существу обновляется только
-  `refcount` у «горячих» хэшей парковок — точечные апдейты маленьких
-  строк, которые дороже резервировать место под них по всей таблице.
-  Апдейты `refcount` остаются HOT-совместимыми (без записи в индексы —
-  счётчик не входит ни в один индекс, в `contents_pack_off_idx` — только
-  `pack_id, off`; место на странице — обычное условие HOT). Редкая ветка
-  `Put` (гонка конкурентов одного контента, воскрешение мёртвой строки)
-  переписывает размещение `pack_id, off, len, raw_len` и после T-096
-  перестаёт быть HOT — редкость не оправдывает fillfactor.
+- `domains` — `fillfactor = 85` (migration 000001): statuses and masks
+  are updated on every check cycle.
+- `subdomain_results` — `fillfactor = 85` (migration 000002): check
+  history is not kept (spec §3.5); a domain recheck overwrites the result rows
+  with the same primary key, and spec §6.3 explicitly lists the table
+  as frequently updated (the tuned autovacuum for the `domains`
+  and `subdomain_results` partitions).
+- `laravel_domains`, `laravel_findings` — no fillfactor: a row is written
+  once and is overwritten only by a re-analysis under new rules
+  (spec 5.8); the update volume is small; spec §6.3 does not name these tables.
+- `contents` — no fillfactor: the table is insert-oriented (hundreds
+  of millions of rows of unique content); essentially only
+  the `refcount` of the "hot" parking hashes is updated — point updates of small
+  rows, for which reserving space across the whole table would cost more.
+  The `refcount` updates stay HOT-compatible (no index writes —
+  the counter is not part of any index; `contents_pack_off_idx` holds only
+  `pack_id, off`; free space on the page is the usual HOT condition). The rare
+  `Put` branch (a race of competitors for the same content, the resurrection of
+  a dead row)
+  rewrites the placement `pack_id, off, len, raw_len` and after T-096
+  stops being HOT — the rarity does not justify a fillfactor.
 
-Особенность PostgreSQL 16: **storage parameters нельзя задать на
-партиционированном родителе** — ни `CREATE TABLE … WITH (fillfactor = …)`,
-ни `ALTER TABLE … SET (fillfactor = …)` (ошибка «cannot specify storage
-parameters for a partitioned table»). Поэтому `WITH (fillfactor = 85)` из
-эскиза DDL §6.1 реализован на партициях:
+A PostgreSQL 16 quirk: **storage parameters cannot be set on the
+partitioned parent** — neither `CREATE TABLE … WITH (fillfactor = …)`,
+nor `ALTER TABLE … SET (fillfactor = …)` (the error "cannot specify storage
+parameters for a partitioned table"). Therefore the `WITH (fillfactor = 85)` from
+the §6.1 DDL sketch is implemented on the partitions:
 
-- каждая существующая партиция создаётся со своим `WITH (fillfactor = 85)`
-  (`domains_default` — миграция 000001, `subdomain_results_default` —
-  миграция 000002);
-- **новые партиции (T-005) `domains` и `subdomain_results` обязаны включать
-  `fillfactor = 85`** — reloptions от родителя не наследуются; тесты
-  `TestSchema_DomainsPartitioning` и `TestSchema_ResultsTablesPartitioning`
-  падают, если у какой-то листовой партиции параметра нет.
+- each existing partition is created with its own `WITH (fillfactor = 85)`
+  (`domains_default` — migration 000001, `subdomain_results_default` —
+  migration 000002);
+- **the new (T-005) `domains` and `subdomain_results` partitions must include
+  `fillfactor = 85`** — reloptions are not inherited from the parent; the tests
+  `TestSchema_DomainsPartitioning` and `TestSchema_ResultsTablesPartitioning`
+  fail if any leaf partition lacks the parameter.
 
-`ALTER … SET (fillfactor)` действует только на будущие страницы: на уже
-загруженной БД страницы перезаписываются `VACUUM FULL` вне миграции (он не
-выполняется в транзакции; на момент миграции 000002 данных нет).
+`ALTER … SET (fillfactor)` affects only future pages: on an already
+loaded DB, pages are rewritten by `VACUUM FULL` outside the migration (it cannot
+run in a transaction; at the time of migration 000002 there is no data).
 
-## Индексы
+## Indexes
 
-Принцип «минимум индексов» (ТЗ §6): у каждой таблицы ровно тот набор,
-что нужен её запросам; расширение набора — осознанное решение с обновлением
-контракта в `schema_test.go`.
+The "minimum indexes" principle (spec §6): each table has exactly the set
+its queries need; extending the set is a deliberate decision with the contract
+updated in `schema_test.go`.
 
-| Таблица | Индексы | Назначение |
+| Table | Indexes | Purpose |
 |---|---|---|
-| `domains` | `domains_pkey` (`zone_id, id`); `domains_zone_id_label_key` (`zone_id, label`); `domains_pending_idx` (`zone_id, id`) `WHERE check_state = 0`; `domains_lease_idx` (`queued_at, zone_id, id`) `WHERE check_state = 1`; `domains_recheck_idx` (`last_checked_at, zone_id, id`) `WHERE check_state = 2` | поиск по имени (ТЗ 5.11), идемпотентность ingest (ТЗ 5.1), выборка pending планировщиком (ТЗ 5.3), возврат истёкших lease (T-029/T-104), суточная перепроверка (T-030/T-104) — см. раздел «Индексы фоновых проходов» |
-| `subdomain_results` | `subdomain_results_pkey` (`zone_id, domain_id, subdomain_id, variant`) | чтение результатов домена — по префиксу `(zone_id, domain_id)` первичного ключа; идемпотентная перезапись при перепроверке |
-| `contents` | `contents_pkey` (`hash`); `contents_pack_off_idx` (`pack_id, off`) | дедупликация и чтение метаданных по 16-байтному хэшу (ТЗ 5.7); запросы компактификации паков — фильтр по `pack_id` и порядок по `off` (T-096) |
-| `laravel_domains` | `laravel_domains_pkey` (`zone_id, domain_id`), `laravel_domains_updated_at_idx` (`updated_at`, T-120) | агрегат по домену; обновление при переанализе; updated_at — «последние находки» лендинга без сортировки всей таблицы |
-| `laravel_history` | `laravel_history_pkey` (`id`), `laravel_history_changed_at_idx` (`changed_at`) | append-only журнал переходов (T-118); changed_at — «находки за 24 ч» лендинга (T-120) и суточная динамика |
-| `laravel_findings` | `laravel_findings_pkey` (`zone_id, domain_id, subdomain_id, variant`) | срабатывания по результату; чтение всех срабатываний домена — по префиксу ключа |
-| `ingest_files` | `ingest_files_pkey` (`id`); `ingest_files_zone_id_action_sha256_key` (`zone_id, action, sha256`) UNIQUE; `ingest_files_sha256_idx` (`sha256`) | дедуп точной повторной доставки — зона + действие + содержимое (T-113, миграция 000009); `sha256_idx` обслуживает проверку дубля конвейера по содержимому (запрос на каждый файл) |
+| `domains` | `domains_pkey` (`zone_id, id`); `domains_zone_id_label_key` (`zone_id, label`); `domains_pending_idx` (`zone_id, id`) `WHERE check_state = 0`; `domains_lease_idx` (`queued_at, zone_id, id`) `WHERE check_state = 1`; `domains_recheck_idx` (`last_checked_at, zone_id, id`) `WHERE check_state = 2` | search by name (spec 5.11), ingest idempotency (spec 5.1), pending selection by the scheduler (spec 5.3), returning expired leases (T-029/T-104), the daily recheck (T-030/T-104) — see the section "Scheduler background pass indexes" |
+| `subdomain_results` | `subdomain_results_pkey` (`zone_id, domain_id, subdomain_id, variant`) | reading a domain's results — by the `(zone_id, domain_id)` prefix of the primary key; the idempotent overwrite on a recheck |
+| `contents` | `contents_pkey` (`hash`); `contents_pack_off_idx` (`pack_id, off`) | deduplication and metadata reads by a 16-byte hash (spec 5.7); pack compaction queries — the filter by `pack_id` and the order by `off` (T-096) |
+| `laravel_domains` | `laravel_domains_pkey` (`zone_id, domain_id`), `laravel_domains_updated_at_idx` (`updated_at`, T-120) | the per-domain aggregate; updated on a re-analysis; updated_at — the landing's "latest findings" without sorting the whole table |
+| `laravel_history` | `laravel_history_pkey` (`id`), `laravel_history_changed_at_idx` (`changed_at`) | an append-only journal of transitions (T-118); changed_at — the landing's "findings in 24 h" (T-120) and the daily dynamics |
+| `laravel_findings` | `laravel_findings_pkey` (`zone_id, domain_id, subdomain_id, variant`) | hits per result; reading all of a domain's hits — by the key prefix |
+| `ingest_files` | `ingest_files_pkey` (`id`); `ingest_files_zone_id_action_sha256_key` (`zone_id, action, sha256`) UNIQUE; `ingest_files_sha256_idx` (`sha256`) | dedup of exact redelivery — zone + action + content (T-113, migration 000009); `sha256_idx` serves the pipeline's by-content duplicate check (a query per file) |
 
-Индексы под будущие выборки сознательно не добавлены: например, поиск
-`laravel_domains` по `score ≥ порога` (ТЗ 5.11, этап 8) получит собственный
-индекс в своей задаче, когда станет известен реальный запрос. Внешних ключей
-нет — целостность ссылок `(zone_id, domain_id)` обеспечивает код записи,
-а FK добавил бы индексы и блокировки в массовые записи.
+Indexes for future selections are deliberately not added: for example, searching
+`laravel_domains` by `score ≥ threshold` (spec 5.11, stage 8) will get its own
+index in its own task, when the real query is known. There are no foreign keys —
+the `(zone_id, domain_id)` reference integrity is enforced by the writing code,
+while an FK would add indexes and locks to bulk writes.
 
-Ключи `ingest_files` (миграция 000009, T-113) — тот же характер
-осознанного решения, что и `contents_pack_off_idx`: уникальная тройка
-`(zone_id, action, sha256)` — контракт дедупа «точная повторная
-доставка» (глобальный уникальный `sha256` пропускал undo тем же списком
-и повторную доставку в другой зоне), а `ingest_files_sha256_idx` —
-обслуживание фактического запроса конвейера `WHERE sha256 = $1` на
-каждом файле: по контракту T-113 одно содержимое может значиться в
-журнале несколькими строками (зона/действие), конвейер читает их все и
-классифицирует в коде — уникальный ключ такой префикс не покрывает
-(`sha256` — третья колонка), а без индекса стоимость проверки росла бы
-линейно с журналом. Журнал — строка на файл, оба индекса дёшевы.
+The keys of `ingest_files` (migration 000009, T-113) are the same kind
+of deliberate decision as `contents_pack_off_idx`: the unique triple
+`(zone_id, action, sha256)` is the "exact redelivery" dedup contract (a
+globally unique `sha256` would let an undo with the same list and a redelivery
+into another zone slip through), while `ingest_files_sha256_idx` serves
+the pipeline's actual `WHERE sha256 = $1` query on
+every file: by the T-113 contract one piece of content may be recorded in
+the journal by several rows (zone/action); the pipeline reads them all and
+classifies them in code — a unique key does not cover such a prefix
+(`sha256` is the third column), and without the index the cost of the check would grow
+linearly with the journal. The journal is one row per file; both indexes are
+cheap.
 
-Исключение — `contents_pack_off_idx` (`pack_id, off`, миграция 000007,
-T-096): это не индекс «под будущую выборку», а покрытие фактических
-фоновых запросов компактификации (`internal/content`, CompactLoop — проход
-каждый час): `WHERE pack_id = $1 ORDER BY off` (фильтр — префикс ключа,
-сортировка — вторая колонка, план без Sort) и контрольные
-`WHERE pack_id = $1 [AND refcount > 0]` по тому же префиксу. Без индекса
-каждый запрос — seq scan всей таблицы, стоимость растёт линейно с корпусом
-и конкурирует с рабочими запросами по `hash` (ревью этапа 12, INFRA-05).
-`refcount` в ключ не входит — точечные апдейты счётчика остаются HOT.
+The exception is `contents_pack_off_idx` (`pack_id, off`, migration 000007,
+T-096): it is not an index "for a future selection" but coverage of the actual
+background compaction queries (`internal/content`, CompactLoop — a pass
+every hour): `WHERE pack_id = $1 ORDER BY off` (the filter — the key prefix,
+the sort — the second column, a plan without Sort) and the control queries
+`WHERE pack_id = $1 [AND refcount > 0]` over the same prefix. Without the index
+every query is a seq scan of the whole table; the cost grows linearly with the
+corpus and competes with the working queries by `hash`
+(the stage 12 review, INFRA-05).
+`refcount` is not in the key — point updates of the counter stay HOT.
 
-У каждой партиции автоматически создаются дочерние индексы всех индексов
-родителя (проверяется тестом — число индексов листа равно числу индексов
-родителя).
+Each partition automatically gets child indexes of all parent indexes
+(verified by a test — the number of leaf indexes equals the number of parent
+indexes).
 
-## Индексы фоновых проходов планировщика (T-104)
+## Scheduler background pass indexes (T-104)
 
-Миграция 000008 (отложенная находка S-04): до неё индексировалась только
-выборка pending — возврат истёкших lease (T-029, каждые lease/2 ≈ 15 мин) и
-суточная перепроверка (T-030) делали полный seq scan по таблице (до 350 млн
-строк), а дренаж перепроверки пачками перечитывал пропускаемое несозревшее
-множество — квадратично. Карта «запрос → индекс»:
+Migration 000008 (a deferred finding, S-04): before it only
+the pending selection was indexed — returning expired leases (T-029, every lease/2 ≈ 15 min) and
+the daily recheck (T-030) did a full seq scan of the table (up to 350M
+rows), and the recheck drain re-read the skipped unripe set batch by
+batch — quadratic. The "query → index" map:
 
-| Проход | Предикат прохода | Индекс |
+| Pass | Pass predicate | Index |
 |---|---|---|
-| выборка pending (T-027) | `check_state = 0`, не deleted, ORDER BY `(zone_id, id)` | `domains_pending_idx` (`zone_id, id`) `WHERE check_state = 0` |
-| возврат lease (T-029) | `check_state = 1`, не deleted, `queued_at < now() − lease`, ORDER BY `(queued_at, zone_id, id)` | `domains_lease_idx` (`queued_at, zone_id, id`) `WHERE check_state = 1` |
-| страховка queued/NULL queued_at (T-255, ФТ-1.2) | `check_state = 1`, не deleted, `queued_at IS NULL`, ORDER BY `(queued_at, zone_id, id)` | `domains_lease_idx` — тот же: `IS NULL` — поисковое условие на ведущей колонке ключа (NULL-записи компактным диапазоном), форма основного lease-запроса не меняется |
-| перепроверка (T-030) | `check_state = 2`, не deleted, не invalid, `last_checked_at < now() − interval`, ORDER BY `(last_checked_at, zone_id, id)` | `domains_recheck_idx` (`last_checked_at, zone_id, id`) `WHERE check_state = 2` |
-| очистка deleted (T-020) | `status = deleted`, есть `subdomain_results`, ORDER BY `(zone_id, id)` | `domains_deleted_idx` (`zone_id, id`) `WHERE status = 6` (T-170) |
-| повтор temp_error (T-031) | `status = temp_error AND check_state = 2`, `last_checked_at < now() − retry_after` | **нет** — см. ниже |
-| коллектор backlog (T-077) | `status <> deleted` GROUP BY `check_state` | **нет** — агрегат по всей таблице, частичным индексом не сводится |
+| pending selection (T-027) | `check_state = 0`, not deleted, ORDER BY `(zone_id, id)` | `domains_pending_idx` (`zone_id, id`) `WHERE check_state = 0` |
+| lease return (T-029) | `check_state = 1`, not deleted, `queued_at < now() − lease`, ORDER BY `(queued_at, zone_id, id)` | `domains_lease_idx` (`queued_at, zone_id, id`) `WHERE check_state = 1` |
+| queued/NULL queued_at guard (T-255, FR-1.2) | `check_state = 1`, not deleted, `queued_at IS NULL`, ORDER BY `(queued_at, zone_id, id)` | `domains_lease_idx` — the same one: `IS NULL` is a searchable condition on the leading key column (NULL entries in a compact range); the shape of the main lease query does not change |
+| recheck (T-030) | `check_state = 2`, not deleted, not invalid, `last_checked_at < now() − interval`, ORDER BY `(last_checked_at, zone_id, id)` | `domains_recheck_idx` (`last_checked_at, zone_id, id`) `WHERE check_state = 2` |
+| deleted cleanup (T-020) | `status = deleted`, has `subdomain_results`, ORDER BY `(zone_id, id)` | `domains_deleted_idx` (`zone_id, id`) `WHERE status = 6` (T-170) |
+| temp_error retry (T-031) | `status = temp_error AND check_state = 2`, `last_checked_at < now() − retry_after` | **none** — see below |
+| backlog collector (T-077) | `status <> deleted` GROUP BY `check_state` | **none** — an aggregate over the whole table; a partial index cannot reduce it |
 
-Свойства формы ключей:
+Properties of the key shape:
 
-- **колонка возраста первой** — диапазонный скан читает только нужный
-  префикс: lease — с начала индекса до первой неистёкшей аренды (штатно
-  0–сотни строк), recheck — с самых старых done-строк до лимита пачки;
-- **доменный ключ в хвосте** (`zone_id, id`) — ORDER BY прохода совпадает
-  с ключом индекса: без сортировки, детерминированные пачки и ранний
-  останов LIMIT; ключи читаются из индекса без обращения к куче (куча —
-  только фильтр по `status`: не deleted, для recheck ещё и не invalid);
-- **линейный дренаж пачками**: переведённые строки покидают индекс
-  (больше не удовлетворяют предикату `check_state`), следующая пачка
-  продолжается с места остановки — внешнего состояния нет (ТЗ 3.4), а
-  пропускаемое множество не перечитывается;
-- **литералы кодов в SQL**: `check_state`/`status` вшиты в текст запросов
-  через `model.*` (стиль dispatch.go) — параметр в предикате частичного
-  индекса планировщик не доказывает, generic-план подготовленного
-  выражения (pgx кеширует их) терял бы индекс. Сравнение
-  `last_checked_at < $параметр-timestamptz` работает напрямую:
-  кросс-типовой оператор `date < timestamptz` входит в btree-opfamily
-  datetime;
-- **размер**: `domains_lease_idx` ограничен множеством «в работе»
-  (выборка → lease), `domains_recheck_idx` покрывает все done-строки
-  (~26 байт на домен) — цена суточной перепроверки корпуса в сотни
-  миллионов строк.
+- **the age column comes first** — a range scan reads only the needed
+  prefix: lease — from the start of the index to the first unexpired lease (normally
+  0–hundreds of rows); recheck — from the oldest done rows to the batch limit;
+- **the domain key in the tail** (`zone_id, id`) — the pass's ORDER BY matches
+  the index key: no sorting, deterministic batches and an early stop by
+  LIMIT; the keys are read from the index without heap visits (the heap is
+  only the `status` filter: not deleted, and for the recheck also not invalid);
+- **a linear batched drain**: the transitioned rows leave the index
+  (they no longer satisfy the `check_state` predicate); the next batch
+  continues from where the previous stopped — there is no external state (spec 3.4),
+  and the skipped set is not re-read;
+- **code literals in the SQL**: `check_state`/`status` are baked into the text of the queries
+  through `model.*` (the dispatch.go style) — the planner cannot prove a parameter in the predicate of a partial
+  index; the generic plan of a prepared statement (pgx caches them) would lose the index. The comparison
+  `last_checked_at < $timestamptz-param` works directly:
+  the cross-type operator `date < timestamptz` belongs to the datetime
+  btree opfamily;
+- **size**: `domains_lease_idx` is bounded by the in-flight set
+  (selection → lease); `domains_recheck_idx` covers all done rows
+  (~26 bytes per domain) — the price of the daily recheck of a corpus of hundreds
+  of millions of rows.
 
-**Повторные проверки temp_error (T-031) — без индекса сознательно.**
-Предикат прохода сводится к `status = temp_error`, а индекс с `status`
-в ключе ломал бы HOT массовых апдейтов статуса без смены `check_state`:
-применение delete-файлов (T-019, `status → deleted`) и фиксация итогового
-статуса после исчерпания попыток (T-031, `status → delegated_no_address`).
-Единственное исключение — `status` в предикате (не ключе) частичного
-`domains_deleted_idx` (T-170): в индексе живут только deleted-строки,
-non-HOT становятся лишь переходы с участием deleted (delete-файлы и
-воскрешение T-018) — редкие события реестра; массовые апдейты
-статуса-результата строк в индексе не имеют и остаются HOT.
-`domains_recheck_idx` retry-проходу не выручает: окно 24 ч покрывает почти
-все done-строки, скан по возрасту читал бы их целиком ради редких
-temp_error. Проход остаётся seq scan с часовым интервалом; после дренажа
-множество кандидатов пусто до созревания новых temp_error.
+**temp_error retries (T-031) — deliberately without an index.**
+The pass predicate reduces to `status = temp_error`, and an index with `status`
+in the key would break the HOT property of bulk status updates that do not change `check_state`:
+applying the delete files (T-019, `status → deleted`) and finalizing the final
+status after the attempts are exhausted (T-031, `status → delegated_no_address`).
+The only exception is `status` in the predicate (not the key) of the partial
+`domains_deleted_idx` (T-170): only deleted rows live in the index,
+so only transitions involving deleted become non-HOT (the delete files and
+the T-018 resurrection) — rare registry events; bulk updates of the result status of rows not in the index stay HOT.
+`domains_recheck_idx` does not help the retry pass: the 24 h window covers almost
+all done rows; a scan by age would read them in full for the sake of rare
+temp_error. The pass remains a seq scan on an hourly interval; after a drain
+the candidate set is empty until new temp_error ripen.
 
-## Индексы окон мониторинга (T-171)
+## Monitoring window indexes (T-171)
 
-Миграция 000014: календарные окна сводки (T-126/ТЗД §4.4) и алертов
-(T-080) обслуживались полными проходами таблиц на каждый цикл — на корпусе
-41,8 млн доменов это секунды CPU БД на запрос и десятки часов времени БД
-за сутки-трое боевого цикла (замер 23–24.10, pg_stat_statements). Индексы
-окон делают стоимость пропорциональной окну, а не таблице:
+Migration 000014: the calendar windows of the summary (T-126/TZ_dashboard §4.4) and alerts
+(T-080) were served by full table passes on every cycle — on a corpus
+of 41.8M domains that is seconds of DB CPU per query and dozens of hours of DB
+time over a day or three of the production cycle (the measurement of 23–24.10,
+pg_stat_statements). The window indexes make the cost proportional to the
+window, not the table:
 
-| Окно | Запрос | Индекс |
+| Window | Query | Index |
 |---|---|---|
-| сутки, `domains` | `last_checked_at >= current_date` — доля temp_error алерта DNS (T-080); done_today темпа читает суточный счётчик `checks:` (T-179, ниже) — окно из его пути чтения ушло | `domains_last_checked_idx` (`last_checked_at`) |
-| час, `subdomain_results` | `checked_at >= now() − interval '1 hour'` — результаты/рендеры темпа (T-126); с T-203 читатель читает часовые корзины `results:`/`rendered:` (ниже), окно по индексу ходит только реконсиляция раз в `zone_stats_interval` | `subdomain_results_checked_idx` (`checked_at`) |
+| day, `domains` | `last_checked_at >= current_date` — the temp_error share of the DNS alert (T-080); the throughput done_today reads the daily `checks:` counter (T-179, below) — the window left its read path | `domains_last_checked_idx` (`last_checked_at`) |
+| hour, `subdomain_results` | `checked_at >= now() − interval '1 hour'` — the throughput results/renders (T-126); since T-203 the reader reads the hourly `results:`/`rendered:` buckets (below); only the reconciliation walks the index window, once per `zone_stats_interval` | `subdomain_results_checked_idx` (`checked_at`) |
 
-Ключ — сама колонка окна, значения растут монотонно: рабочее окно — правый
-край индекса, записи добавляются в правый лист. `last_checked_at` меняется
-только вместе с `check_state` (аргумент HOT ниже), `checked_at` пишется
-INSERT'ом и не меняется. Частичный `domains_recheck_idx` (T-104) окнам не
-подходит: предикат `check_state = 2` в запросах окон не доказать —
-окно считает проверки, а не домены, строка сегодняшней проверки
-может быть уже не done. Суточное окно темпа (done_today) с T-179
-обслуживается инкрементальным счётчиком — причину см. в разделе
-`crawler_counters` ниже: индексный план оставался правильным, но
-index-only scan деградировал heap-fetch'ами свежих страниц (замер
-24.10: 676 тыс. на 815 тыс. строк окна, ≈1,1 ГБ чтений за вызов).
+The key is the window column itself; the values grow monotonically: the working
+window is the right edge of the index; entries are added to the rightmost leaf. `last_checked_at` changes
+only together with `check_state` (the HOT argument below); `checked_at` is written
+by an INSERT and never changes. The partial `domains_recheck_idx` (T-104) does not
+fit the windows: the `check_state = 2` predicate cannot be proven in the window
+queries — a window counts checks, not domains, and a row checked today
+may no longer be done. Since T-179, the daily throughput window (done_today) is
+served by an incremental counter — see the `crawler_counters` section
+below for the reason: the index plan remained correct, but
+the index-only scan degraded with heap fetches of fresh pages (the measurement
+of 24.10: 676 thousand out of 815 thousand window rows, ≈1.1 GB of reads per
+call).
 
-## crawler_counters — инкрементальные счётчики (T-175/T-178/T-179/T-202/T-203/T-204)
+## crawler_counters — incremental counters (T-175/T-178/T-179/T-202/T-203/T-204)
 
-Маленькая таблица-счётчик общего вида: `name text PRIMARY KEY`,
-`value bigint NOT NULL`, `updated_at timestamptz NOT NULL` (миграция
-000016 — момент последней записи строки: возраст показывает
-`crawlerctl counters list`). Счётчики конвейера (T-178, ТЗИ
+A small general-purpose counter table: `name text PRIMARY KEY`,
+`value bigint NOT NULL`, `updated_at timestamptz NOT NULL` (migration
+000016 — the moment of the row's last write; the age is shown by
+`crawlerctl counters list`). The pipeline counters (T-178, the
+TZ_incremental spec
 `tasks/TZ_incremental_counters.md`):
 
-- `render_pending` (T-175) — число доменов с битом `render_pending`
-  (рендер-долг, наблюдаемость T-175 — раньше был виден только ручным
-  SQL);
-- `status_<имя>` по `model.Statuses` (T-178) — распределение доменов по
-  статусам, **все** строки, включая deleted (полная легенда дашборда);
-  пишется только реконсиляцией — старые статусы переходов не пинируются
-  предикатами операторов (ТЗИ §13.3), FILTER-колонки в
-  реконсиляционном скане бесплатны;
-- `laravel_appeared_total` / `laravel_lost_total` (T-178) — кумулятивы
-  переходов `laravel_history` (T-118): `+1` инкрементом analyzer в
-  транзакции записи истории, авторитет — реконсиляция (агрегат
-  журнала);
-- `new_done_stale` (T-256, ТЗ-fsm §3 ФТ-2.2) — домены «статус повис»:
-  `status = new ∧ check_state = done ∧ last_checked_at` старше суток
-  (DNS-этап записал ветку «есть адреса», HTTP-итог не пришёл — потеря
-  задачи `q:http`). Абсолютный уровень, как `status_*`: пишется ТОЛЬКО
-  реконсиляцией (FILTER-колонка `f_new_done_stale` совмещённого скана,
-  цена нуля; инкрементов нет), в дрейф-позиции не входит, читатели —
-  точечный лукап алерта `domains_new_done_stale` и gauge
-  `crawler_domains_new_done_stale` (цикл реконсиляции). Стационарно 0;
-  `updated_at` строки — метка снапшота для серии алерта.
-- `checks:YYYY-MM-DD` (T-179) — суточный счётчик проверок (темп
-  конвейера): `+1` на каждый записанный результат HTTP-эпизода —
-  инкрементом в транзакции записи результата (internal/httpworker
-  `record.go`, RowsAffected итогового UPDATE домена: не по числу
-  записей субдомен×вариант; охрана deleted отсекла — без дельты),
-  авторитет — реконсиляция (FILTER-колонка `last_checked_at =
-  current_date` совмещённого прохода, цена нуля). Имя дня вычисляет
-  БД (`current_date`) — таймзона согласована с `now()` записи
-  `last_checked_at` (T-058) и с окном реконсиляции; Go-часы в имени
-  не участвуют. Инкременты и живое окно считают **разные классы
-  событий** (принятая семантика «темп работы», TZ_slow_done_today
-  §5.1): инкремент — события записи результата HTTP, окно — домены
-  дня всех веток конвейера (DNS-терминальные завершения —
-  not_delegated, invalid и пр. — эпизода HTTP не имеют, отметку
-  `last_checked_at` ставит DNS-этап), повторный эпизод того же домена
-  даёт +1 при живом нуле. Между проходами значение занижено на
-  DNS-only завершения окна (свежесть ≤ `zone_stats_interval`),
-  дрейф-позиция `daily:checks` — наблюдаемая разница потоков (для
-  знаменателя T-182 разница несущественна: доля устойчива, абсолюты
-  чинит проход). Ротация суток бесплатна: первый после полуночи
-  инкремент (или проход) создаёт строку нового дня, вчерашние
-  остаются историей темпа (365 строк/год, чистка не нужна); строка
-  дня — снапшот прохода: инкременты, закоммиченные в окне прохода,
-  пересекшего полночь, в историю ушедшего дня не попадают (потребителей
-  истории нет — вне рамок ТЗ); читатель — `throughputSQL` секции темпа
-  (`status.FetchThroughput`, T-179): точечный лукап по PK с внешним
-  `coalesce(…, 0)` — до первой записи суток честный ноль.
-- `temp_error:YYYY-MM-DD` (T-182) — суточный числитель доли temp_error
-  (алерт `dns_temp_error_share`, T-080): `+1` на каждый записанный
-  результат HTTP-эпизода с итоговым статусом temp_error — тем же
-  upsert-инкрементом в транзакции записи результата (internal/
-  httpworker `record.go`, после знаменателя `checks:`; прочие итоги
-  строку дня не трогают — создаёт её первый temp_error-эпизод суток),
-  авторитет — реконсиляция (FILTER-колонка
-  `last_checked_at = current_date AND status = temp_error` совмещённого
-  прохода, цена нуля). Имя дня вычисляет БД, как у знаменателя.
-  Семантика — события записей (TZ_slow_dns_share §5.1): ретрай,
-  закрывший ошибку, остаётся в истории событий, дубль-доставки растят
-  числитель и знаменатель вместе — доля устойчива, абсолюты чинит
-  проход; живое окно числителя отличается от инкрементов теми же
-  DNS-only завершениями и повторами — позиция `daily:temp_error`
-  потоковая, в Warn дрейфа не входит, наблюдается gauge. Читатель —
-  алерт доли (observeDNS): два точечных чтения строк суток с внешним
-  `coalesce(…, 0)` (прежде живой агрегат по окну суток ходил в heap за
-  статусом каждой строки — запрос №6 журнала медленных 24.10);
-- `retry_mature:YYYY-MM-DD` (T-202) — корзины зрелости ретрая
-  temp_error: temp_error-эпизоды по датам (`last_checked_at` записи
-  результата), `+1` — ОБЕИХ веток конвейера: HTTP-итог temp_error —
-  инкрементом в транзакции записи результата (internal/httpworker
-  `record.go`), терминальная SERVFAIL-ветка DNS-этапа — ОТДЕЛЬНЫМ
-  autocommit-оператором ПОСЛЕ оператора записи (internal/dnsworker
-  `result.go` `resultMatureIncSQL`, T-267: массовый DNS-инцидент
-  приходит именно через неё), `−n` — решения ретрая (оба завершают
-  кандидату): назначение повтора — хвостовым оператором той же
-  транзакции (`retryRequeueMatureSQL` по датам из RETURNING перевода),
-  финализация — CTE `rm` самого оператора (ссылается на upd, зон нет),
-  — по `last_checked_at` переведённых строк. Имя — дата эпизода: корзина
-  становится зрелой в полночь следующего дня — точный момент
-  созревания когорты при date-точности `last_checked_at` («старше 24 ч»
-  зреет когортами в полночь); формат суточный по той же причине —
-  часовая гранулярность вырождается (все эпизоды суток зреют вместе),
-  ключ выведен одинаково из `current_date` (инкремент) и
-  `last_checked_at` (декремент) — рассинхрон ключей лишил бы декремент
-  адресата. Читатель — guard тяжёлой выборки ретрая
-  (`scheduler/retry.go` `retryMatureSQL`): сумма корзин прошедших суток
-  (лексикографический диапазон по PK, граница `current_date` от БД)
-  нулевая ⇒ seq scan по 42+ млн строк не выполняется вовсе — уточнение
-  guard T-191 по счётчику `status_temp_error`, не отличавшему зрелых
-  кандидатов от незрелых (543 тыс. temp_error при пустом окне зрелости
-  держали полный вычитывающий скан на каждом часовом тике). Авторитет —
-  реконсиляция: FILTER-колонки `status = temp_error × check_state =
-  done × last_checked_at = / < current_date` того же скана (цена нуля),
-  проход держит ровно две живые корзины — вчерашнюю (зрелая когорта) и
-  сегодняшнюю (эпизоды суток), устаревшие (хвосты декрементов дат
-  старых эпизодов) удаляет: корзины — живое расписание дренажа, не
-  история темпа. Границы доверия: кандидаты, ушедшие мимо ретрая
-  (удаление temp_error-домена delete-файлом, возрастная перепроверка
-  T-030), оставляют корзину завышенной до прохода — холостые проходы
-  ≤ `zone_stats_interval`; дубль-доставки и повторные эпизоды суток —
-  +1 к живому нулю (событийная семантика), позиции
-  `retry_mature:past`/`retry_mature:today` потоковые, в Warn не входят;
-  окно неатомарности ±1 (T-267): инкремент DNS-этапа — отдельный
-  autocommit после записи перехода, сбой между операторами (отказ БД,
-  краш воркера) оставляет корзину заниженной до ближайшей
-  реконсиляции (≤ `zone_stats_interval`, 30 мин) — безопасно:
-  повторная доставка эпизода бессильна (охрана done отсечёт оба
-  оператора), guard читает только корзины прошедших суток и недостачу
-  сегодняшней не видит; при `temp_error_retry_after` < 24 ч (не
-  дефолт) guard откладывает дренаж внутрисуточных кандидатов до
-  полуночи — окно по date-колонке и так зреет когортами, деградация
-  ограничена сутками;
+- `render_pending` (T-175) — the number of domains with the `render_pending` bit set
+  (render debt; the T-175 observability — previously visible only through
+  manual SQL);
+- `status_<name>` per `model.Statuses` (T-178) — the distribution of domains across
+  statuses, **all** rows including deleted (the dashboard's full legend);
+  written only by reconciliation — transition statuses are not pinned
+  by statement predicates (the TZ_incremental spec §13.3); the FILTER columns of the
+  reconciliation scan are free;
+- `laravel_appeared_total` / `laravel_lost_total` (T-178) — the cumulatives
+  of the `laravel_history` transitions (T-118): `+1` incremented by the analyzer in
+  the history-write transaction; the authority — reconciliation (the aggregate
+  of the journal);
+- `new_done_stale` (T-256, TZ-fsm §3 FR-2.2) — "stale status" domains:
+  `status = new ∧ check_state = done ∧ last_checked_at` older than a day
+  (the DNS stage recorded the "has addresses" branch; the HTTP outcome never arrived — a lost
+  `q:http` task). An absolute level, like `status_*`: written ONLY by
+  reconciliation (the `f_new_done_stale` FILTER column of the combined scan,
+  zero cost; no increments), not part of the drift positions; the readers —
+  the point lookup of the `domains_new_done_stale` alert and the gauge
+  `crawler_domains_new_done_stale` (the reconciliation cycle). Steady state 0;
+  the row's `updated_at` — the snapshot label for the alert series.
+- `checks:YYYY-MM-DD` (T-179) — the daily check counter (the pipeline
+  throughput): `+1` per recorded HTTP-episode result —
+  incremented in the result-write transaction (internal/httpworker
+  `record.go`, the RowsAffected of the domain's final UPDATE: not per
+  subdomain×variant record; rows cut off by the deleted guard contribute no delta),
+  the authority — reconciliation (the `last_checked_at =
+  current_date` FILTER column of the combined pass, zero cost). The day name is computed
+  by the DB (`current_date`) — the timezone is aligned with the `now()` that writes
+  `last_checked_at` (T-058) and with the reconciliation window; Go clocks
+  do not participate in the name. The increments and the live window count
+  **different classes of events** (the accepted "work throughput" semantics,
+  TZ_slow_done_today
+  §5.1): an increment — HTTP result-write events; the window — the day's
+  domains of all pipeline branches (DNS-terminal completions —
+  not_delegated, invalid, etc. — have no HTTP episode; the DNS stage sets the
+  `last_checked_at` mark); a repeat episode of the same domain
+  gives +1 against a live zero. Between passes the value undercounts
+  the window's DNS-only completions (the freshness ≤ `zone_stats_interval`);
+  the `daily:checks` drift position — the observable difference between the
+  streams (for the T-182 denominator the difference is immaterial: the share is
+  stable, the pass fixes the absolutes). Day rotation is free: the first
+  increment (or pass) after midnight creates the new day's row; yesterday's
+  rows remain the throughput history (365 rows/year, no cleanup needed); the day
+  row — a pass snapshot: increments committed within a pass window that
+  crossed midnight do not make it into the departed day's history (there are no
+  consumers of that history — outside the spec's scope); the reader — the
+  `throughputSQL` of the throughput section
+  (`status.FetchThroughput`, T-179): a point lookup by PK with an outer
+  `coalesce(…, 0)` — an honest zero before the day's first record.
+- `temp_error:YYYY-MM-DD` (T-182) — the daily numerator of the temp_error share
+  (the `dns_temp_error_share` alert, T-080): `+1` per recorded
+  HTTP-episode result with a final temp_error status — the same
+  upsert increment in the result-write transaction (internal/
+  httpworker `record.go`, after the `checks:` denominator; other outcomes
+  leave the day row untouched — the day's first temp_error episode creates it),
+  the authority — reconciliation (the FILTER column
+  `last_checked_at = current_date AND status = temp_error` of the combined
+  pass, zero cost). The day name is computed by the DB, like the denominator's.
+  The semantics — record events (TZ_slow_dns_share §5.1): a retry
+  that cleared the error stays in the event history; duplicate deliveries grow
+  the numerator and the denominator together — the share is stable, the pass
+  fixes the absolutes; the live numerator window differs from the increments by
+  the same DNS-only completions and repeats — the `daily:temp_error`
+  position is streaming, not part of the drift Warns, observed by a gauge. The reader —
+  the share alert (observeDNS): two point reads of the day's rows with an outer
+  `coalesce(…, 0)` (previously the live aggregate over the day window visited the heap
+  for the status of every row — query #6 of the 24.10 slow log);
+- `retry_mature:YYYY-MM-DD` (T-202) — the maturity buckets of the temp_error
+  retry: temp_error episodes by date (the `last_checked_at` of the result
+  record); `+1` — from BOTH pipeline branches: an HTTP outcome of temp_error —
+  incremented in the result-write transaction (internal/httpworker
+  `record.go`); the terminal SERVFAIL branch of the DNS stage — by a SEPARATE
+  autocommit statement AFTER the write statement (internal/dnsworker
+  `result.go` `resultMatureIncSQL`, T-267: a mass DNS incident arrives exactly
+  through it); `−n` — the retry decisions (both terminate the
+  candidate): scheduling a retry — by the tail statement of the same
+  transaction (`retryRequeueMatureSQL`, by the dates from the transition's RETURNING),
+  finalization — by the statement's own `rm` CTE (it references upd; no zones),
+  — by the `last_checked_at` of the transitioned rows. The name — the episode
+  date: a bucket ripens at midnight of the next day — the exact moment of
+  the cohort's maturity given the date precision of `last_checked_at` ("older than
+  24 h" ripens in midnight cohorts); the daily format is for the same reason —
+  hourly granularity degenerates (all of a day's episodes ripen together);
+  the key is derived identically from `current_date` (the increment) and
+  `last_checked_at` (the decrement) — a key desync would leave the decrement
+  with no target. The reader — the guard of the heavy retry selection
+  (`scheduler/retry.go` `retryMatureSQL`): a zero sum of the past days'
+  buckets (a lexicographic range by PK, the `current_date` boundary taken
+  from the DB) ⇒ the seq scan over 42+ million rows does not run at all — a refinement
+  of the T-191 guard by the `status_temp_error` counter, which could not tell mature
+  candidates from unripe ones (543 thousand temp_error with an empty maturity
+  window kept a full read-through scan on every hourly tick). The authority —
+  reconciliation: the FILTER columns `status = temp_error × check_state =
+  done × last_checked_at = / < current_date` of the same scan (zero cost);
+  the pass keeps exactly two live buckets — yesterday's (the mature cohort) and
+  today's (the day's episodes) — and deletes the stale ones (the tails of the
+  decrements for old episodes' dates): the buckets are the live drain schedule,
+  not throughput history. Trust boundaries: candidates that leave without
+  passing through the retry
+  (a temp_error domain deleted by a delete file, the age-based recheck
+  of T-030) leave the bucket inflated until the pass — idle passes at most every
+  `zone_stats_interval`; duplicate deliveries and repeat episodes of the day —
+  +1 against a live zero (event semantics); the
+  `retry_mature:past`/`retry_mature:today` positions are streaming, not part of
+  the Warns;
+  the ±1 non-atomicity window (T-267): the DNS stage's increment — a separate
+  autocommit after the transition write; a failure between the statements (a DB
+  outage, a worker crash) leaves the bucket deflated until the nearest
+  reconciliation (≤ `zone_stats_interval`, 30 min) — safe:
+  redelivery of the episode is powerless (the done guard will cut off both
+  statements), and the guard reads only the past days' buckets, never seeing
+  today's deficit; with `temp_error_retry_after` < 24 h (not
+  the default) the guard postpones the drain of intraday candidates until
+  midnight — a window over a date column ripens in cohorts anyway; the degradation
+  is bounded by a day;
 - `results:YYYY-MM-DD"T"HH24` / `rendered:YYYY-MM-DD"T"HH24` (T-203) —
-  часовые корзины темпа: окна «последний час» результатов и рендеров
-  дашборда. Прежние живые подзапросы `throughputSQL` по
-  `subdomain_results` (`checked_at >= now() − 1 ч`) деградировали
-  heap-fetch'ами свежих страниц — контрольная точка этапа 27 (медиана
-  6,0 с > 3 с, 108 событий; тот же механизм, что у суточного окна
-  T-179 — замер §2 TZ_slow_done_today). `results:` — `+N` строк
-  subdomain_results эпизода в транзакции записи результата
-  (internal/httpworker `record.go`, дельта — RowsAffected INSERT-пачки;
-  час — `date_trunc('hour', now())` той же транзакции, `checked_at`
-  строк — тот же `now()`; эпизоды без записей корзину не трогают);
-  `rendered:` — `+1` в транзакции замены контента render-worker'а
-  (internal/renderworker `worker.go`: `rendered = true` с
-  `RETURNING checked_at` — час ЭПИЗОДА строки, не рендера: так считало
-  живое окно — доля rendered среди результатов окна). Корзина —
-  календарный час, скользящее окно «последний час» точно из корзин не
-  собирается: читатель (`status.throughputSQL`) суммирует ДВЕ живые
-  корзины — предыдущий и текущий час — а честный делитель скорости
-  `hour_window_sec` — фактическая длина покрытого окна `[trunc(now−1ч),
-  now]` (1–2 ч; деление на 3600 завышало бы темп пилообразно в 1–2 раза
-  к границе часа). Имена часов вычисляет БД — таймзона согласована с
-  `now()` записи `checked_at` (T-058), инкрементами и реконсиляцией.
-  Авторитет — реконсиляция: ОТДЕЛЬНЫЙ агрегат окна двух живых часов по
-  `subdomain_results` (FILTER-позиции prev/cur обеих семей; `rendered` —
-  асинхронный флаг: поздний рендер строки прошлого часа учитывается в
-  корзине её часа) пишет prev и cur каждой семьи — prev пересчитывается,
-  а не только cur, потому что rendered-инкременты дорабатывают его весь
-  текущий час (хвост окна чтения); устаревшие корзины (старше
-  предыдущего часа) проход удаляет — корзины живое окно темпа, не
-  история. Семантика — события (вставка строк / перевод в rendered)
-  против живых строк окна: дубль-доставки и перезаписи эпизодов (DELETE
-  старых строк корзину не декрементирует) дают расхождение до прохода —
-  позиции `results:prev`/`results:cur`/`rendered:prev`/`rendered:cur`
-  потоковые, в Warn дрейфа не входят, `verify` не сверяет; rendered-инкремент
-  с опозданием > 1 ч воскрешает устаревшую корзину upsert'ом —
-  читатель её не читает (IN-список двух живых часов), следующий проход
-  удаляет;
-- `reanalyze:YYYY-MM-DD"T"HH24` (T-204) — часовые корзины
-  неанализированных хвостов переанализа: строки `subdomain_results` с
-  `rules_version IS NULL` (никогда не анализировались — вставка записи
-  результата T-058 или замена контента рендером T-067) по часам
-  ЭПИЗОДА (`checked_at`). Guard часового тика переанализа
-  (`analyzer/reanalyze.go`, `reanalyzeGuardSQL`) суммирует корзины
-  старше текущего часа: незрелый in-flight-поток (запись → `q:analyze` →
-  штамп занимает секунды) живёт в корзине текущего часа и guard не
-  открывает — наивный счётчик «записано без анализа» не отличал бы
-  хвосты от потока (то же заболевание, что guard T-191 по
-  `status_temp_error`, и то же лечение корзинами зрелости, что T-202).
-  Нулевая сумма ⇒ тяжёлая выборка окна время-формы (heap-визит ~84 тыс.
-  строк/ч ради неиндексируемого `rules_version` — HOT-инвариант) не
-  выполняется вовсе, курсор прыгает на границу текущего часа — тик в
-  стационаре стоит одну сумму индексного диапазона из пары строк.
-  `+N` — строки INSERT-пачки в транзакции записи результата
-  (internal/httpworker `record.go`, час `now()` транзакции =
-  `checked_at` строк; молчаливые эпизоды дельту 0 не пишут), `+1` —
-  замена контента рендером (internal/renderworker `worker.go`, час
-  эпизода из `RETURNING` — рендер-опоздание воскрешает корзину старого
-  часа: guard открывается впустую, хвост за курсором время-формы,
-  следующий проход корзину удаляет), `−1` — штамп анализатора
-  (internal/analyzer `worker.go`) ТОЛЬКО устаревших строк: охрана
-  актуальности версии в UPDATE-штампе делает повторные доставки no-op —
-  декремент не двоится; штампы старой версии (дренажи смены правил)
-  декрементируют без парного инкремента — отрицательный дрейф до
-  прохода держит guard закрытым на время дренажа (у тика там своя
-  работа пересекается только дублями). Авторитет — реконсиляция:
-  FILTER-позиции `prev_reanalyze`/`cur_reanalyze` агрегата окна двух
-  живых часов (той же ценой нуля на уже идущем скане темпа T-203);
-  проход держит две живые корзины (prev пересчитывается — поздние
-  декременты штампов дорабатывают его весь текущий час), устаревшие
-  удаляет; порядок блокировок семей «`retry_mature:` → `reanalyze:` →
-  `rendered:` → `results:`» общий у всех писателей — без циклов.
-  Семантика — события переходов против живых NULL-строк (перезапись
-  эпизода удаляет строки без декремента, рендер непроштампованной
-  строки даёт двойной инкремент одного хвоста) — потоковая: позиции
-  `reanalyze:prev`/`reanalyze:cur` наблюдается gauge, в Warn дрейфа не
-  входит, `verify` не сверяет. Границы доверия: хвост, не подобранный
-  тиком за два часа жизни корзины (сбойные тики), невидим guard'у —
-  остаточный класс время-формы (T-193 §4.2): рестарт с якорем 24 ч или
-  полный дренаж смены правил; гонка прыжка курсора (коммиты позади
-  границы часа длиннее секундных транзакций записи + потерянная
-  публикация) — той же природы и той же редкости; устаревшие НЕ-NULL
-  строки (штамп старой версии незадолго до смены правил + потерянная
-  публикация дренажа) корзинами не видны вовсе (`IS NULL` против
-  `IS DISTINCT FROM` выборки тика) — их территория следующего полного
-  дренажа/рестарта.
+  hourly throughput buckets: the dashboard's "last hour" windows of results and
+  renders. The former live `throughputSQL` subqueries over
+  `subdomain_results` (`checked_at >= now() − 1 h`) degraded
+  with heap fetches of fresh pages — the stage 27 checkpoint (a median
+  of 6.0 s > 3 s, 108 events; the same mechanism as the daily window of
+  T-179 — the measurement §2 of TZ_slow_done_today). `results:` — `+N` of the
+  episode's subdomain_results rows in the result-write transaction
+  (internal/httpworker `record.go`; the delta — the RowsAffected of the INSERT batch;
+  the hour — `date_trunc('hour', now())` of the same transaction; the rows'
+  `checked_at` — the same `now()`; episodes with no records leave the bucket
+  untouched);
+  `rendered:` — `+1` in the render-worker content swap transaction
+  (internal/renderworker `worker.go`: `rendered = true` with
+  `RETURNING checked_at` — the hour of the row's EPISODE, not of the render: that is
+  how the live window counted — the share of rendered among the window's
+  results). A bucket is a calendar hour; the "last hour" sliding window cannot
+  be assembled from buckets exactly: the reader (`status.throughputSQL`) sums the TWO
+  live buckets — the previous and the current hour — and the honest speed
+  divisor `hour_window_sec` — the actual length of the covered window
+  `[trunc(now−1h), now]` (1–2 h; dividing by 3600 would overstate the throughput
+  sawtooth-style 1–2× toward the hour boundary). The hour names are computed by
+  the DB — the timezone is aligned with the `now()` that writes `checked_at`
+  (T-058), with the increments and the reconciliation.
+  The authority — reconciliation: a SEPARATE aggregate of the two live hours'
+  window over `subdomain_results` (prev/cur FILTER positions of both families;
+  `rendered` — an asynchronous flag: a late render of a past-hour row is accounted
+  to the bucket of its hour) writes prev and cur of each family — prev is
+  recomputed, not only cur, because rendered increments keep updating it for
+  the whole current hour (the tail of the read window); the stale buckets (older
+  than the previous hour) are deleted by the pass — the buckets are the live
+  throughput window, not history. The semantics — events (row inserts /
+  transitions to rendered)
+  versus the window's live rows: duplicate deliveries and episode rewrites (DELETE
+  of old rows does not decrement the bucket) give a divergence until the pass —
+  the `results:prev`/`results:cur`/`rendered:prev`/`rendered:cur` positions are
+  streaming, not part of the drift Warns; `verify` does not compare them; a
+  rendered increment more than 1 h late resurrects a stale bucket by upsert —
+  the reader does not read it (the IN list of the two live hours); the next pass
+  deletes it;
+- `reanalyze:YYYY-MM-DD"T"HH24` (T-204) — hourly buckets of the unanalyzed
+  reanalyze tails: `subdomain_results` rows with
+  `rules_version IS NULL` (never analyzed — a result-record insert of
+  T-058 or a render content swap of T-067) by the EPISODE hour
+  (`checked_at`). The guard of the reanalyze hourly tick
+  (`analyzer/reanalyze.go`, `reanalyzeGuardSQL`) sums the buckets
+  older than the current hour: an unripe in-flight stream (record → `q:analyze` →
+  the stamp takes seconds) lives in the current hour's bucket and does not open
+  the guard — a naive "recorded without analysis" counter could not tell tails
+  from the stream (the same disease as the T-191 guard by
+  `status_temp_error`, and the same maturity-bucket cure as T-202).
+  A zero sum ⇒ the heavy time-form window selection (a heap visit of ~84 thousand
+  rows/h for the non-indexable `rules_version` — the HOT invariant) does not
+  run at all; the cursor jumps to the current hour boundary — a tick in steady
+  state costs one sum over an index range of a couple of rows.
+  `+N` — the rows of the INSERT batch in the result-write transaction
+  (internal/httpworker `record.go`; the hour — the transaction's `now()` =
+  the rows' `checked_at`; silent episodes write no zero delta); `+1` —
+  a render content swap (internal/renderworker `worker.go`; the hour — the
+  episode's from `RETURNING` — a late render resurrects an old hour's bucket:
+  the guard opens in vain, the tail is beyond the time-form cursor; the next
+  pass deletes the bucket); `−1` — the analyzer's stamp
+  (internal/analyzer `worker.go`) ONLY for stale rows: the version-currency guard in
+  the UPDATE stamp makes duplicate deliveries no-ops —
+  the decrement does not double; stamps of an old version (rule-change drains)
+  decrement without a paired increment — the negative drift until the pass keeps
+  the guard closed for the duration of the drain (the tick's own work there
+  intersects only with duplicates). The authority — reconciliation:
+  the `prev_reanalyze`/`cur_reanalyze` FILTER positions of the two live hours'
+  window aggregate (at the same zero cost on the already running T-203 throughput
+  scan);
+  the pass keeps two live buckets (prev is recomputed — late stamp decrements
+  keep updating it for the whole current hour) and deletes the stale ones; the family lock
+  order "`retry_mature:` → `reanalyze:` → `rendered:` → `results:`" is shared by all
+  writers — no cycles.
+  The semantics — transition events versus live NULL rows (an episode rewrite
+  deletes rows without a decrement; a render of an unstamped row gives a double
+  increment of one tail) — streaming: the
+  `reanalyze:prev`/`reanalyze:cur` positions are observed by a gauge, not part
+  of the drift Warns; `verify` does not compare them. Trust boundaries: a tail
+  not picked up by a tick within the bucket's two-hour life (failed ticks) is
+  invisible to the guard — a residual class of the time-form (T-193 §4.2): a
+  restart with a 24 h anchor or a full rule-change drain; the cursor-jump race (commits behind
+  the hour boundary longer than the seconds-long write transactions + a lost
+  publication) — of the same nature and the same rarity; stale NON-NULL
+  rows (a stamp of an old version shortly before a rule change + a lost
+  drain publication) are not visible to the buckets at all (`IS NULL` versus
+  the tick selection's `IS DISTINCT FROM`) — their territory is the next full
+  drain/restart.
 
-**Инвариант порядка блокировок.** Все писатели `crawler_counters`
-держат строки счётчика ПОСЛЕДНИМИ в своей транзакции, в порядке
-«domains ({domains, subdomain_results, contents}) → zones → counters»;
-среди счётчиков — единый порядок семей
-«render_pending → checks: → temp_error: → retry_mature: → reanalyze: →
-rendered: → results:» (конвенция, не лексикографика имён), внутри
-семьи корзин дат/часов — по возрастанию имени. Оговорка для
-много-CTE-операторов: порядок «domains → zones → counters» внутри
-ОДНОГО оператора (например, retryFinalizeSQL: upd → rm) — это
-текстовый порядок DML-CTE; PostgreSQL не формализует порядок исполнения
-нессылаемых CTE (реализационная деталь, оговорка в zonestats.go, ревью
-T-202) — на проде 07.11 нессылаемые zc/rm одного оператора записи
-результата dns-worker исполнились инверсно (rm → zc): оператор держал
-строку `retry_mature:` и ждал зону — ребро «счётчики → зоны» против
-http-worker `RecordAndPublish` (держит зоны до Commit, ждёт
-`retry_mature:today`) замыкало цикл дедлока 40P01 (~3–4/ч; фикс
-T-267 — счётчики вынесены из оператора зон отдельными операторами:
-инкремент DNS-этапа — autocommit после записи, декремент requeue —
-второй оператор транзакции решения; операторы транзакции, в отличие от
-нессылаемых CTE, исполняются в текстовом порядке). Новые писатели не
-смешивают зоны и счётчики нессылаемыми DML-CTE одного оператора:
-ссылочная зависимость (CTE по upd, как у финализации) или отдельные
-операторы. Счётчик никогда не
-захватывается ДО строк `domains`: транзакция, уже держащая
-`crawler_counters`/`zones` и захватывающая `domains`, создаёт ребро
-«счётчики → domains» против идущих «domains → … → counters» писателей
-(запись результата http-worker/dnsworker, проходы scheduler,
-реконсиляция monitor) и замыкает цикл дедлока 40P01 — инцидент
-retry-волны (9 дедлоков за 3 ч, ределиверии `q:http` полными
-HTTP-эпизодами) дал `scheduler.RetryOnce` с двумя операторами пачки в
-одной транзакции; фикс — раздельные транзакции решений (`retryDecide`,
-каждая половина сама по себе конвенции следует). Писатели: запись
-результата http-worker (`record.go`, хвостовые дельты перед Commit),
-терминальные ветки DNS-этапа (`dnsworker/result.go`: перевод с зонами —
-один оператор, инкремент корзины — следующий autocommit), проходы
-scheduler (enqueue/lease/recheck/retry и компенсатор «статус повис»
-stalerequeue T-270 — выборка и перевод раздельными транзакциями, счётчиков
-не касается: «domains → zones»; requeue — перевод и декремент
-двумя операторами одной транзакции), render-worker, analyzer,
-ingest add/delete (delete с T-269 — двумя операторами одной транзакции:
-перевод статуса и охраняемая пара по битовым строкам; второй оператор
-пере захватывает только строки, уже заблокированные первым, — новых
-рёбер «zones → domains» нет) и реконсиляция monitor (последняя — авторитет:
-переписывает строки счётчиков, порядок «зоны → скаляры → семьи
-корзин»). Разбор инцидентов — [`runbooks.md`](runbooks.md) §2.8.
+**The lock order invariant.** All writers of `crawler_counters`
+hold the counter rows LAST in their transaction, in the order
+"domains ({domains, subdomain_results, contents}) → zones → counters";
+among the counters — a single family order
+"render_pending → checks: → temp_error: → retry_mature: → reanalyze: →
+rendered: → results:" (a convention, not lexicographic by name); within
+a family of date/hour buckets — in ascending name order. The caveat for
+multi-CTE statements: the "domains → zones → counters" order within
+ONE statement (for example, retryFinalizeSQL: upd → rm) —
+the textual order of DML CTEs; PostgreSQL does not formalize the execution order
+of unreferenced CTEs (an implementation detail, a caveat in zonestats.go, the review
+of T-202) — in production on 07.11 the unreferenced zc/rm of one result-write
+statement of the dns-worker executed inverted (rm → zc): the statement held
+a `retry_mature:` row and waited for a zone — the "counters → zones" edge against
+the http-worker `RecordAndPublish` (holds the zones until Commit, waits for
+`retry_mature:today`) closed a 40P01 deadlock cycle (~3–4/h; the fix
+T-267 — the counters moved out of the zones statement into separate statements:
+the DNS stage's increment — an autocommit after the write; the requeue decrement —
+the second statement of the decision transaction; the statements of a transaction,
+unlike unreferenced CTEs, execute in textual order). New writers do not
+mix zones and counters in the unreferenced DML CTEs of one statement:
+a referencing dependency (a CTE over upd, as in the finalization) or separate
+statements. A counter is never
+captured BEFORE the `domains` rows: a transaction already holding
+`crawler_counters`/`zones` that then captures `domains` creates the edge
+"counters → domains" against the writers going "domains → … → counters"
+(the result write of the http-worker/dnsworker, the scheduler passes,
+the monitor reconciliation) and closes a 40P01 deadlock cycle — the
+retry-wave incident (9 deadlocks in 3 h, `q:http` redelivered as full
+HTTP episodes) came from `scheduler.RetryOnce` with two statements of a batch in
+one transaction; the fix — separate decision transactions (`retryDecide`,
+each half follows the convention on its own). Writers: the result
+write of the http-worker (`record.go`, the tail deltas before Commit),
+the terminal branches of the DNS stage (`dnsworker/result.go`: the transition with zones —
+one statement; the bucket increment — the next autocommit), the passes of the
+scheduler (enqueue/lease/recheck/retry and the "stale status" compensator
+stalerequeue of T-270 — selection and transition in separate transactions; no
+counters involved: "domains → zones"; requeue — the transition and the decrement
+by two statements of one transaction), the render-worker, the analyzer,
+ingest add/delete (delete since T-269 — two statements of one transaction:
+the status transition and the guarded pair over bit strings; the second statement
+re-captures only rows already locked by the first — no new
+"zones → domains" edges) and the monitor reconciliation (the last one — the
+authority: it rewrites the counter rows; the order "zones → scalars →
+bucket families"). Incident analysis — [`runbooks.md`](runbooks.md) §2.8.
 
-**Страховка поверх инварианта (T-268).** Инвариант убирает известные
-циклы, но не доказывает отсутствия новых, потому горячие точки конвейера
-дополнительно идут под прикладным ретраем 40P01 (`db.RetryDeadlock`,
-`internal/db/deadlock.go`): транзакция записи результата http-worker
-(`RecordAndPublish` → `recordTx`) и транзакция решения ретрая планировщика
-(`retryDecide`) повторяются целиком, autocommit-операторы записи
-DNS-эпизода (`RecordEpisode`/`resultCount`) — как есть, без повторного
-DNS-эпизода; до двух повторов, пауза с джиттером и потолком. Повтор
-безопасен только для идемпотентных операций (ТЗ 3.4) — все обёрнутые
-точки охранами идемпотентны. Дренаж temp_error планировщика переживает
-ошибку пачки (до `DefaultRetryDrainFails` подряд упавших). Наблюдаемость
-— счётчик `crawler_db_deadlock_retried_total` по сервисам; устойчивый
-рост — новый цикл блокировок (инверсия порядка где-то в коде), разбор —
-`runbooks.md` §2.8: ретрай — страховка, а не лечение.
+**A guard on top of the invariant (T-268).** The invariant removes the known
+cycles but does not prove the absence of new ones, so the pipeline's hot spots
+additionally run under the application-level 40P01 retry (`db.RetryDeadlock`,
+`internal/db/deadlock.go`): the result-write transaction of the http-worker
+(`RecordAndPublish` → `recordTx`) and the retry decision transaction of the scheduler
+(`retryDecide`) are retried as a whole; the autocommit statements of the DNS
+episode write (`RecordEpisode`/`resultCount`) — as is, without re-writing a
+DNS episode; up to two retries, with a pause of jitter and a cap. A retry is
+safe only for idempotent operations (spec 3.4) — every wrapped
+spot is idempotent thanks to the guards. The scheduler's temp_error drain survives
+a batch error (up to `DefaultRetryDrainFails` consecutive failures). Observability
+— the `crawler_db_deadlock_retried_total` counter per service; sustained
+growth — a new lock cycle (an order inversion somewhere in the code); analysis —
+`runbooks.md` §2.8: the retry is a guard, not a cure.
 
-Колонки зон `zones.domains_pending` / `domains_queued` (миграция 000016)
-— та же механика на уровне зоны: дельты переходов (DNS-этап записи
-результата — CTE с `FOR UPDATE` (главный переход queued/pending →
-done); scheduler: CTE того же оператора enqueue/lease/recheck/retry;
-ingest add/delete; CLI recheck/submodules recheck; http-worker —
-предчтение `FOR UPDATE` и сдвиг; analyzer — `domains_laravel ±1`) и
-авторитетная реконсиляция monitor — один
-совмещённый проход раз в `monitor.zone_stats_interval`, единственный
-полный проход `domains` в стационаре. Базовое множество всех колонок
-зон — `status <> deleted` (унификация ТЗИ §4.1). `domains_pending`
-читается и фильтром выборки диспетчера (`> 0`, T-183): семантика
-колонки — предикат самой выборки, дрейф (ручной SQL мимо инкрементов)
-может скрыть зону с работой до ближайшей реконсиляции — наблюдается
-метрикой `crawler_counters_drift`. Дрейф |старое − новое|
-— gauge `crawler_counters_drift` + Warn; восстановление — сам проход
-или `crawlerctl counters recount` (разбор — [`runbooks.md`](runbooks.md)).
+The zone columns `zones.domains_pending` / `domains_queued` (migration 000016)
+— the same mechanics at the zone level: transition deltas (the DNS stage of the
+result write — a CTE with `FOR UPDATE` (the main queued/pending →
+done transition); the scheduler: a CTE of the same enqueue/lease/recheck/retry
+statement; ingest add/delete; the CLI recheck/subdomains recheck; the http-worker —
+a `FOR UPDATE` pre-read and a shift; the analyzer — `domains_laravel ±1`) and
+the authoritative monitor reconciliation — one
+combined pass per `monitor.zone_stats_interval`, the only
+full `domains` pass in steady state. The base set of all zone columns —
+`status <> deleted` (the unification of the TZ_incremental spec §4.1). `domains_pending`
+is also read by the dispatcher's selection filter (`> 0`, T-183): the column's
+semantics — the selection's own predicate; drift (manual SQL bypassing the
+increments) can hide a zone with work until the nearest reconciliation — observed
+by the `crawler_counters_drift` metric. The drift |old − new|
+— the `crawler_counters_drift` gauge + a Warn; recovery — the pass itself
+or `crawlerctl counters recount` (the analysis —
+[`runbooks.md`](runbooks.md)).
 
-Счётчик `render_pending` ведут **переходы бита**: `+1` — постановка
-флага в транзакции записи результата (internal/httpworker), `−1` —
-снятие проходом доработки и применением delete-файла (T-186: удаляемый
-домен покидает цикл проверок §13.1, проход его больше не выберет),
-всегда в той же транзакции, что и переход
-бита (§3.4 — откат откатывает пару). Применение delete — ДВА оператора
-одной транзакции (T-269, инцидент 08.11.2026: декремент по снимочному
-`had_render` применялся вторым поверх конкурентного снятия проходом
-доработки — −36 за один проход): перевод статуса без касания flags
-(факт «бит стоял» выносит RETURNING по версии-основанию обновления) и
-охраняемая пара «снятие бита × −count(факта)» по ключам битовых строк —
-дельта привязана к факту перехода текущей версии, окно «снимок →
-блокировка» закрыто (зеркально охране Д7). Начальное значение —
-однократный
-бэкфилл миграции 000015 (`count(*) WHERE (flags & 2) <> 0`, без фильтра
-по статусу);
-реконсиляция T-178 пересчитывает его тем же предикатом — хвост
-«битов-сирот» удалённых до T-186 и редкие рассинхроны гасятся
-выравниванием счётчика по агрегату (runbooks §6). Реконсиляция пишет
-АБСОЛЮТ снапшота раннего оператора прохода (агрегат), а исполняет
-поздним (upsert): конкурентные переходы в окне между операторами
-затираются устаревшим абсолютом (ложный долг/ложный ноль) — транзиентно,
-самолечится следующим проходом (≤ `zone_stats_interval`), каждая
-перезапись двигает `updated_at` (атрибутация писателей — runbooks §6).
-Чтение —
-точечный Lookup по PK (микросекунды): gauge
-`crawler_render_pending_domains` цикла monitor, строка «Рендер-долг»
-отчёта нагрузки (T-173) и алерт `render_debt` (T-175); читатели
-статусов/кумулятивов — дашборд и `crawlerctl` (без проходов `domains`,
-ТЗИ §8).
+The `render_pending` counter is maintained by **bit transitions**: `+1` —
+setting the flag in the result-write transaction (internal/httpworker); `−1` —
+clearing by the render catch-up pass and by applying a delete file (T-186: a deleted
+domain leaves the check cycle §13.1; the pass will not select it again),
+always in the same transaction as the
+bit transition (§3.4 — a rollback rolls back the pair). Applying a delete — TWO
+statements of one transaction (T-269, the 08.11.2026 incident: the decrement based on
+the snapshot `had_render` was applied second, on top of a concurrent clearing by the
+catch-up pass — −36 in one pass): the status transition without touching flags
+(the RETURNING of the update carries the "the bit was set" fact anchored to the
+row version the update was based on) and
+the guarded pair "bit clearing × −count(fact)" over the bit-string keys —
+the delta is tied to the current version's transition fact; the "snapshot →
+lock" window is closed (mirroring the D7 guard). The initial value —
+the one-off
+backfill of migration 000015 (`count(*) WHERE (flags & 2) <> 0`, no
+status filter);
+the T-178 reconciliation recomputes it with the same predicate — the tail
+of the "orphan bits" of domains deleted before T-186 and rare desyncs are absorbed
+by aligning the counter with the aggregate (runbooks §6). The reconciliation writes
+the ABSOLUTE of the early statement's snapshot (the aggregate) but executes it
+late (the upsert): concurrent transitions within the window between the statements
+are overwritten by the stale absolute (a false debt/a false zero) — transient,
+self-heals on the next pass (≤ `zone_stats_interval`); every rewrite
+advances `updated_at` (writer attribution — runbooks §6).
+Reading —
+a point lookup by PK (microseconds): the gauge
+`crawler_render_pending_domains` of the monitor cycle, the "Render debt"
+line of the load report (T-173) and the `render_debt` alert (T-175); the readers
+of statuses/cumulatives — the dashboard and `crawlerctl` (without `domains`
+passes, the TZ_incremental spec §8).
 
-**Почему не индекс по битовой маске.** Частичный индекс
-`(flags & 2) <> 0` (по образцу T-104/T-170) отвергнут: он противоречит
-инварианту HOT (раздел ниже) — `flags` меняется дважды на каждый эпизод
-каждого домена (биты `http_published` T-108 и `dead_host_cutoff`
-T-164), миллионы апдейтов в сутки; индекс с `flags` в предикате делал
-бы non-HOT каждый такой апдейт, а не только редкие переходы
-`render_pending`. Инкрементальный счётчик держит наблюдаемость без
-индекса и без seq scan. Ручные операции с битом обязаны править счётчик
+**Why not an index over the bit mask.** The partial index
+`(flags & 2) <> 0` (modeled on T-104/T-170) was rejected: it contradicts the
+HOT invariant (the section below) — `flags` changes twice per episode
+of every domain (the `http_published` bit of T-108 and `dead_host_cutoff`
+of T-164), millions of updates per day; an index with `flags` in the predicate
+would make every such update non-HOT, not only the rare transitions
+`render_pending`. The incremental counter keeps observability without
+an index and without a seq scan. Manual operations on the bit must update the
+counter
 ([`runbooks.md`](runbooks.md) §6).
 
-## sequence domain_id_seq
+## The domain_id_seq sequence
 
-`domains.id` получает значения из единой sequence `domain_id_seq`
-(`DEFAULT nextval('domain_id_seq')`) — идентификаторы сквозные по всем зонам
-и партициям. Привязка `OWNED BY` не используется (как в эскизе §6.1):
-таблица и sequence живут одинаково долго, отдельная связь не нужна.
+`domains.id` takes values from the single sequence `domain_id_seq`
+(`DEFAULT nextval('domain_id_seq')`) — the identifiers are continuous across all zones
+and partitions. The `OWNED BY` binding is not used (as in the §6.1 sketch):
+the table and the sequence live equally long; a separate link is not needed.
 
-`ingest_files.id` — обычный `GENERATED ALWAYS AS IDENTITY`: таблица —
-журнал, сквозная нумерация между зонами не нужна.
+`ingest_files.id` — a plain `GENERATED ALWAYS AS IDENTITY`: the table —
+a journal; continuous numbering across zones is not needed.
 
-## HOT-апдейты
+## HOT updates
 
-При проверке домена обновляются `status`, `check_state`, `flags`,
-`dns_mask`, `queued_at`, `last_checked_at`, `temp_attempts`. Апдейт остаётся
-HOT (без записи в индексы), пока обновляемая колонка не входит ни в один
-индекс — ни в ключ, ни в предикат:
+Checking a domain updates `status`, `check_state`, `flags`,
+`dns_mask`, `queued_at`, `last_checked_at`, `temp_attempts`. An update stays
+HOT (no index writes) as long as the updated column is not part of any
+index — neither the key nor the predicate:
 
-- `flags`, `dns_mask`, `temp_attempts` **не входят ни в один индекс** —
-  массовые апдейты результатов и счётчика попыток HOT. `status` не входит
-  в ключи, но составляет предикат частичного `domains_deleted_idx`
-  (T-170): в индексе живут только deleted-строки, поэтому массовые смены
-  статуса вне deleted остаются HOT; non-HOT — только применение
-  delete-файлов (T-019, `status → deleted`) и воскрешение add-файлом
-  (T-018), редкие события реестра (retry-проход T-031 индекса по-прежнему
-  не имеет — его предикат `status = temp_error` индексом не покрывается).
-  Именно этот инвариант отверг частичный индекс `(flags & 2) <> 0` для
-  наблюдаемости рендер-долга (T-175): `flags` меняется дважды на каждый
-  эпизод домена (биты `http_published`/`dead_host_cutoff`) — индекс с
-  `flags` в предикате делал бы non-HOT массовые апдейты; вместо индекса
-  переходы бита `render_pending` ведут счётчик
-  `crawler_counters['render_pending']` (миграция 000015, раздел выше),
-  чтение долга — точечный Lookup без прохода по таблице.
-- `check_state` входит в предикаты трёх частичных индексов проходов
+- `flags`, `dns_mask`, `temp_attempts` **are not part of any index** —
+  bulk updates of the results and the attempt counter stay HOT. `status` is not
+  in the keys but forms the predicate of the partial `domains_deleted_idx`
+  (T-170): only deleted rows live in the index, so bulk status changes
+  outside deleted stay HOT; non-HOT — only applying
+  the delete files (T-019, `status → deleted`) and the resurrection by an add file
+  (T-018), rare registry events (the T-031 retry pass still
+  has no index — its `status = temp_error` predicate is not covered by one).
+  It is exactly this invariant that rejected the partial index `(flags & 2) <> 0` for
+  render debt observability (T-175): `flags` changes twice per
+  domain episode (the `http_published`/`dead_host_cutoff` bits) — an index with
+  `flags` in the predicate would make bulk updates non-HOT; instead of an index,
+  the transitions of the `render_pending` bit maintain the counter
+  `crawler_counters['render_pending']` (migration 000015, the section above);
+  reading the debt — a point lookup without a table pass.
+- `check_state` is in the predicates of the three partial pass indexes
   (`domains_pending_idx`, `domains_lease_idx`, `domains_recheck_idx`) —
-  смены состояния `pending → queued → done` всегда non-HOT. Это
-  неустранимый компромисс самого ТЗ: индексы выборки/возврата/перепроверки
-  (§5.3) обязаны фильтровать по `check_state`. Такой апдейт кладёт новую
-  версию строки (fillfactor = 85 оставляет место) и добавляет записи в
-  индексы, которым новая версия удовлетворяет; на частоту смен состояний
-  (две на цикл проверки домена) это влияние ограничено.
-- `queued_at`, `last_checked_at` входят в ключи `domains_lease_idx` и
-  `domains_recheck_idx` (T-104), `last_checked_at` — ещё и окна
-  мониторинга `domains_last_checked_idx` (T-171) — их апдейты non-HOT,
-  **но все писатели меняют эти колонки только вместе с `check_state`**:
-  постановка в очередь (pending→queued + `queued_at = now()`), возврат
-  lease и перепроверка (→pending + `queued_at = NULL`), результат воркера
-  dns/http (→done + `queued_at = NULL, last_checked_at = now()`),
-  воскрешение add-файлом (T-018, →pending + `queued_at = NULL`). Эти
-  переходы уже non-HOT из-за `check_state` в предикатах — новые индексы
-  не добавили ни одного non-HOT апдейта, только ещё одну запись в том же
-  переходе (закреплено тестом `TestSchema_DomainsHOTColumns`: колонки
-  возраста допустимы только в ключах своих индексов проходов/окон).
-- `subdomain_results` при перезаписи результата обновляет только
-  неиндексированные колонки (индекс — сам первичный ключ, который не
-  меняется) — апдейты HOT при наличии места на странице (fillfactor = 85).
-  Индекс окна `subdomain_results_checked_idx` (T-171) на HOT не влияет:
-  `checked_at` пишется только INSERT'ом новой строки результата
-  (перезапись домена — DELETE + INSERT в одной транзакции, §3.5),
-  UPDATE'ов колонки нет.
+  the `pending → queued → done` state changes are always non-HOT. This
+  is an unavoidable trade-off of the spec itself: the selection/return/recheck
+  indexes (§5.3) must filter by `check_state`. Such an update places a new
+  row version (fillfactor = 85 leaves room) and adds entries to the
+  indexes the new version satisfies; the impact is limited by the frequency of state
+  changes (two per domain check cycle).
+- `queued_at`, `last_checked_at` are in the keys of `domains_lease_idx` and
+  `domains_recheck_idx` (T-104); `last_checked_at` is also in the monitoring
+  window index `domains_last_checked_idx` (T-171) — their updates are non-HOT,
+  **but all writers change these columns only together with `check_state`**:
+  enqueueing (pending→queued + `queued_at = now()`), the lease return and
+  the recheck (→pending + `queued_at = NULL`), the dns/http worker result
+  (→done + `queued_at = NULL, last_checked_at = now()`), the resurrection by an add
+  file (T-018, →pending + `queued_at = NULL`). These
+  transitions are already non-HOT because of `check_state` in the predicates —
+  the new indexes added not a single non-HOT update, only one more entry in the
+  same transition (pinned by the `TestSchema_DomainsHOTColumns` test: age
+  columns are allowed only in the keys of their own pass/window indexes).
+- `subdomain_results` on a result rewrite updates only
+  non-indexed columns (the index — the primary key itself, which does not
+  change) — the updates are HOT when there is room on the page (fillfactor = 85).
+  The window index `subdomain_results_checked_idx` (T-171) does not affect HOT:
+  `checked_at` is written only by the INSERT of a new result row
+  (a domain rewrite — DELETE + INSERT in one transaction, §3.5);
+  the column has no UPDATEs.
 
-## CHECK-инварианты (T-259)
+## CHECK invariants (T-259)
 
-Инварианты, которые код всегда держал SQL-охранами писателей,
-фиксируются в схеме CHECK-ограничениями — ручной SQL, будущие писатели
-и эксперименты не смогут их нарушить. Добавление — миграцией `NOT
-VALID`: большие таблицы (десятки млн строк) нельзя сканировать на
-деплое; `NOT VALID` проверяет только новые и изменяемые строки,
-существующие данные не трогает (нарушителей среди них нет — инвариант
-держали охраны). `VALIDATE CONSTRAINT` — отдельный шаг по регламенту
-после выдержки (окно наблюдения за продом): на секционированном
-родителе PostgreSQL 16 валидация рекурсивна на все секции одним
-оператором, новые секции `create_zone_partitions` наследуют
-ограничение уже валидированным. Перед `VALIDATE` — разведочный запрос
-нарушителей (тот же полный скан, но диагноз ДО, а не после сбоя чужого
-UPDATE: латентный нарушитель `NOT VALID` не видит, а упадёт на нём
-первый же писатель строки — анализатор/retention/collapse):
+Invariants that the code always enforced with the SQL guards of the writers are
+fixed in the schema as CHECK constraints — manual SQL, future writers
+and experiments will not be able to violate them. Adding — by a `NOT
+VALID` migration: large tables (tens of millions of rows) cannot be scanned during
+deploy; `NOT VALID` checks only new and modified rows,
+existing data is not touched (there are no violators among them — the guards
+upheld the invariant). `VALIDATE CONSTRAINT` — a separate step per the procedure,
+after a soak (the production observation window): on a partitioned
+parent, PostgreSQL 16 validates recursively across all partitions with one
+statement, and the new partitions of `create_zone_partitions` inherit
+the constraint already validated. Before `VALIDATE` — a reconnaissance query for
+violators (the same full scan, but the diagnosis comes BEFORE, not after someone
+else's UPDATE fails: a latent violator is not visible to `NOT VALID`, and the
+first row writer to hit it — the analyzer/retention/collapse — will fail):
 
 ```sql
 SELECT count(*) FROM subdomain_results
 WHERE rendered AND render_failed_at IS NOT NULL;
 ```
 
-Разведочный запрос нарушителей `contents_refcount_check` (T-265):
+The reconnaissance query for the violators of `contents_refcount_check` (T-265):
 
 ```sql
 SELECT count(*) FROM contents WHERE refcount < 0;
 ```
 
-Парные тест-инварианты —
-`test/integration` (нарушение отвергается, `convalidated = false` до
+The paired test invariants —
+`test/integration` (a violation is rejected; `convalidated = false` before
 VALIDATE).
 
-| Ограничение | Таблица | Инвариант | Миграция | Тест |
+| Constraint | Table | Invariant | Migration | Test |
 |---|---|---|---|---|
-| `subdomain_results_rendered_check` | `subdomain_results` | `rendered = true ⇒ render_failed_at IS NULL` — «отрендерена И невозможна» бессмысленна (T-259, ТЗ-fsm §3 ФТ-5.2; охраны писателей — `renderUpdateSQL`/`renderFailMarkerSQL`, `internal/renderworker`) | 000018, NOT VALID | `TestSchema_ResultsRenderedCheck`, `test/integration/render_late_test.go` |
-| `contents_refcount_check` | `contents` | `refcount >= 0` — отрицательный счётчик ломает семантику «0 = мёртвый» и маскирует двойное списание ссылки (T-265, ТЗ-fsm §3 ФТ-11; охраны писателей — предикаты `refcount > 0` у точечных операторов, `GREATEST`-клэмп у массовых, спецификация автомата — doc-комментарий `internal/content/pack.go`) | 000019, NOT VALID | `TestSchema_ContentsRefcountCheck`, `test/integration/content_test.go` |
+| `subdomain_results_rendered_check` | `subdomain_results` | `rendered = true ⇒ render_failed_at IS NULL` — "rendered AND impossible" is meaningless (T-259, TZ-fsm §3 FR-5.2; the writer guards — `renderUpdateSQL`/`renderFailMarkerSQL`, `internal/renderworker`) | 000018, NOT VALID | `TestSchema_ResultsRenderedCheck`, `test/integration/render_late_test.go` |
+| `contents_refcount_check` | `contents` | `refcount >= 0` — a negative counter breaks the "0 = dead" semantics and masks a double reference write-off (T-265, TZ-fsm §3 FR-11; the writer guards — the `refcount > 0` predicates of the point statements, a `GREATEST` clamp on the bulk ones; the automaton specification — the doc comment of `internal/content/pack.go`) | 000019, NOT VALID | `TestSchema_ContentsRefcountCheck`, `test/integration/content_test.go` |
 
-## Идемпотентность записи
+## Write idempotency
 
-Повторная запись того же результата отбивается первичными ключами
-(закреплено тестом `TestSchema_ResultsIdempotency`):
+A repeated write of the same result is rejected by the primary keys
+(pinned by the `TestSchema_ResultsIdempotency` test):
 
-- `subdomain_results` / `laravel_findings` — ключ
-  `(zone_id, domain_id, subdomain_id, variant)`; HTTP-этап пишет результат
-  домена перезаписью в одной транзакции (T-058): `DELETE` старых строк
-  домена (включая исчезнувшие ключи — §3.5 «только последний результат») с
-  `RETURNING content_hash` → −1 `refcount` старого контента (`SwapRefTx`,
-  T-044) → `INSERT` новых unnest-пачкой; повторная доставка идемпотентна
-  (ТЗ 3.4, 3.5);
-- `laravel_domains` — ключ `(zone_id, domain_id)`;
-- `contents` — ключ `hash`: повторная запись того же контента наращивает
-  `refcount`, а не создаёт строку (ТЗ 5.7);
-- `ingest_files` — уникальная тройка `(zone_id, action, sha256)`
-  (миграция 000009, T-113): точная повторная доставка не обрабатывается
-  повторно (ТЗ 5.1); то же содержимое другим действием (undo) или в
-  другой зоне — отдельная строка журнала.
+- `subdomain_results` / `laravel_findings` — the key
+  `(zone_id, domain_id, subdomain_id, variant)`; the HTTP stage writes a
+  domain's result as a rewrite in one transaction (T-058): `DELETE` of the old
+  rows of the domain (including vanished keys — §3.5 "only the last result") with
+  `RETURNING content_hash` → −1 of the old content's `refcount` (`SwapRefTx`,
+  T-044) → `INSERT` of the new ones in an unnest batch; duplicate delivery is idempotent
+  (spec 3.4, 3.5);
+- `laravel_domains` — the key `(zone_id, domain_id)`;
+- `contents` — the key `hash`: a repeated write of the same content increments
+  `refcount` instead of creating a row (spec 5.7);
+- `ingest_files` — the unique triple `(zone_id, action, sha256)`
+  (migration 000009, T-113): an exact redelivery is not processed
+  again (spec 5.1); the same content under a different action (undo) or in
+  another zone — a separate journal row.
 
-## rules_version — версия набора правил
+## rules_version — the rule set version
 
-Колонка `integer` (миграция 000001): `laravel_domains.rules_version` и
-`laravel_findings.rules_version` — `NOT NULL` (строка пишется только при
-сработавших правилах, набор известен); `subdomain_results.rules_version` —
-`NULL`, пока анализатор не обработал результат (сброс в `NULL` при замене
-контента рендером — T-067).
+An `integer` column (migration 000001): `laravel_domains.rules_version` and
+`laravel_findings.rules_version` — `NOT NULL` (a row is written only when
+rules matched; the set is known); `subdomain_results.rules_version` —
+`NULL` until the analyzer has processed the result (a reset to `NULL` on a render
+content swap — T-067).
 
-Значение — хэш набора правил `internal/rules` (T-068): FNV-32a
-канонического представления набора, приведённый к знаковому `int32`.
-Свойства: одинаковым наборам — одинаковый хэш независимо от разбиения на
-файлы и порядка правил (в канонической форме правила отсортированы по
-`id`); правка `description` и комментариев версию не меняет — она
-отражает поведение детекции (`target`/`match`/`regex`/`weight`/границы
-версий), переанализ после правки описания не нужен. Коллизии 32 бит на
-практике незначимы: версия различает последовательные редакции одного
-набора, а не все возможные наборы. По смене версии фоновая задача
-переанализа (ТЗ 5.8, T-074) находит записи со устаревшей версией и
-ставит их в `q:analyze` без повторного скачивания.
+The value — the hash of the `internal/rules` rule set (T-068): FNV-32a
+of the canonical representation of the set, cast to a signed `int32`.
+Properties: identical sets — an identical hash regardless of the file
+splitting and the rule order (in the canonical form the rules are sorted by
+`id`); editing `description` and comments does not change the version — it
+reflects the detection behavior (`target`/`match`/`regex`/`weight`/version
+bounds); a re-analysis after a description edit is not needed. Collisions of 32 bits are
+immaterial in practice: the version distinguishes successive revisions of one
+set, not all possible sets. On a version change, the background reanalyze task
+(spec 5.8, T-074) finds the records with a stale version and
+enqueues them into `q:analyze` without re-downloading.
 
-## laravel_domains — агрегат признаков по домену (T-072)
+## laravel_domains — the per-domain aggregate of signs (T-072)
 
-Строка `laravel_domains` — агрегат уверенных срабатываний домена
-(`laravel_findings` c `is_laravel`, ТЗ 5.8/§13.1), пересчитывается
-воркером analyzer в той же транзакции, что запись findings (подробности
-и решения — [`analyzer.md`](analyzer.md)):
+A `laravel_domains` row — the aggregate of a domain's confident hits
+(`laravel_findings` with `is_laravel`, spec 5.8/§13.1), recomputed
+by the analyzer worker in the same transaction as the findings write (details
+and decisions — [`analyzer.md`](analyzer.md)):
 
-| Колонка | Семантика |
+| Column | Semantics |
 |---|---|
-| `score` | максимум по findings домена (порог §13.1 мог достичь только максимум — совпадает с максимумом по всем findings) |
-| `ver_min` / `ver_max` | объединённый диапазон: `min(ver_min)` / `max(ver_max)` по числовым компонентам версий; NULL-граница любого срабатывания (нет границы или конфликт T-070) распространяется на домен — объединение неограничено с этой стороны |
-| `found_on_mask` | биты субдоменов с `is_laravel`-срабатыванием (варианты схлопываются в бит); та же семантика битов, что у `domains.dns_mask` |
-| `rules_version` | версия набора, которым выполнен пересчёт; в переходный период переанализа findings домена смешанных версий — строка перезаписывается каждой доставкой |
-| `updated_at` | `now()` — время транзакции пересчёта |
+| `score` | the maximum across the domain's findings (only the maximum could reach the §13.1 threshold — it equals the maximum across all findings) |
+| `ver_min` / `ver_max` | the merged range: `min(ver_min)` / `max(ver_max)` over the numeric version components; a NULL bound of any hit (no bound or a T-070 conflict) propagates to the domain — the union is unbounded on that side |
+| `found_on_mask` | the bits of the subdomains with an `is_laravel` hit (variants collapse into a bit); the same bit semantics as `domains.dns_mask` |
+| `rules_version` | the version of the set the recompute was made with; during the reanalyze transition period, a domain's findings of mixed versions — the row is overwritten by every delivery |
+| `updated_at` | `now()` — the time of the recompute transaction |
 
-Домен без `is_laravel`-строк не попадает в таблицу (порог §13.1);
-существующая строка удаляется — прежние признаки в текущем эпизоде не
-подтвердились (§3.5). Пересчёты одного домена сериализуются
-`pg_advisory_xact_lock(domain_id)` в транзакции воркера (T-072).
+A domain without `is_laravel` rows does not enter the table (the §13.1
+threshold); an existing row is deleted — the previous signs were not confirmed
+in the current episode (§3.5). The recomputes of one domain are serialized by
+`pg_advisory_xact_lock(domain_id)` in the worker's transaction (T-072).
 
-## laravel_history — журнал детекции appeared/lost (T-118)
+## laravel_history — the appeared/lost detection journal (T-118)
 
-`laravel_domains` перезаписывается начисто (§3.5) — тренды «сайт
-пришёл/ушёл с Laravel» хранит append-only журнал переходов (миграция
-`000011`, аналог `laravel_histories` старой реализации larasites):
+`laravel_domains` is rewritten from scratch (§3.5) — the "site arrived at/left
+Laravel" trends are kept by the append-only journal of transitions (migration
+`000011`, an analog of `laravel_histories` from the old larasites
+implementation):
 
-| Колонка | Семантика |
+| Column | Semantics |
 |---|---|
-| `id` | `GENERATED ALWAYS AS IDENTITY` PK — у домена много переходов за жизнь |
-| `zone_id`, `domain_id` | ключ домена (без FK: партиции доменных таблиц не держат ссылок) |
-| `appeared` | `true` — строка домена появилась в `laravel_domains`, `false` — исчезла |
-| `changed_at` | `now()` — время транзакции появления/удаления |
+| `id` | `GENERATED ALWAYS AS IDENTITY` PK — a domain has many transitions over its life |
+| `zone_id`, `domain_id` | the domain key (no FK: the partitions of the domain tables hold no references) |
+| `appeared` | `true` — the domain's row appeared in `laravel_domains`; `false` — it disappeared |
+| `changed_at` | `now()` — the time of the appearance/removal transaction |
 
-Запись — той же транзакцией агрегации (`aggregateDomain`, T-072), но
-только при **свежем эпизоде HTTP-проверки** (`queue.Result.Fresh`,
-ставят HTTP/рендер-этапы при публикации q:analyze): переанализ (T-074)
-пересчитывает тот же скачанный контент по новым правилам и фактом о
-сайте не является — смена правил и флап borderline-скоров вокруг порога
-(T-116) не порождают ложных appeared/lost. Семантика привязана к строке
-`laravel_domains`: «ушёл при переанализе, вернулся свежим эпизодом»
-оставит один appeared без парного lost — плата за защиту от шума
-правил, тренд по множеству доменов верен.
+The record is written by the same aggregation transaction (`aggregateDomain`,
+T-072), but only for a **fresh HTTP check episode** (`queue.Result.Fresh`,
+set by the HTTP/render stages when publishing q:analyze): a reanalyze (T-074)
+recomputes the same downloaded content under new rules and is not a fact about the
+site — a rule change and the flapping of borderline scores around the threshold
+(T-116) do not produce false appeared/lost. The semantics are anchored to the
+`laravel_domains` row: "left on a reanalyze, returned with a fresh episode"
+will leave a single appeared without a paired lost — the price of protection against rule
+noise; the trend across a set of domains is correct.
 
-Индекс — `laravel_history_changed_at_idx (changed_at)`: закрывает оба
-запроса потребителя — «находки за 24 ч» лендинга (T-120) и суточную
-динамику. Партиционирования нет сознательно: пишут только переходы
-(не каждый домен и не каждый эпизод), объём на порядки меньше
-`laravel_findings`. Кумулятивные метрики
-`crawler_laravel_appeared_total`/`crawler_laravel_lost_total` считает
-monitor периодическим агрегатом (T-118, `internal/monitor/historystats.go`).
+The index — `laravel_history_changed_at_idx (changed_at)`: it covers both
+consumer queries — the landing's "findings in 24 h" (T-120) and the daily
+dynamics. No partitioning, deliberately: only transitions are written
+(not every domain and not every episode); the volume is orders of magnitude
+below
+`laravel_findings`. The cumulative metrics
+`crawler_laravel_appeared_total`/`crawler_laravel_lost_total` are computed
+by the monitor as a periodic aggregate (T-118, `internal/monitor/historystats.go`).
 
-## Модель в Go: internal/model
+## The Go model: internal/model
 
-Пакет `internal/model` (T-008) — зеркалит схему в типы Go: структуры
-строк всех таблиц (теги `db` = имена колонок из миграции 000001
-(+ `domains.temp_attempts` из 000005) в том же
-порядке, NULL — указатели или nil `[]byte`, `jsonb` — сырой JSON `[]byte`),
-перечисления и битовые типы. Пакет не содержит логики проверки: переходы
-статусов и состояний вводят планировщик и воркеры (ТЗ 7).
+The `internal/model` package (T-008) mirrors the schema into Go types: the row
+structs of all tables (`db` tags = the column names from migration 000001
+(+ `domains.temp_attempts` from 000005) in the same
+order; NULL — pointers or a nil `[]byte`; `jsonb` — raw JSON `[]byte`),
+enumerations and bit types. The package contains no check logic: the
+status and state transitions are introduced by the scheduler and the workers (spec 7).
 
-| Тип | Колонка | Значения |
+| Type | Column | Values |
 |---|---|---|
-| `model.Status` | `domains.status` | 0 `new`, 1 `not_delegated`, 2 `delegated_no_address`, 3 `no_http`, 4 `alive`, 5 `temp_error`, 6 `deleted` (ТЗ 6.2), 7 `invalid` (диагностический: ядовитая строка, проверка невозможна — T-109; расширение §6.2, перепроверка такие строки не возвращает); имена и `ParseStatus` для разбора |
+| `model.Status` | `domains.status` | 0 `new`, 1 `not_delegated`, 2 `delegated_no_address`, 3 `no_http`, 4 `alive`, 5 `temp_error`, 6 `deleted` (spec 6.2), 7 `invalid` (diagnostic: a poison row, the check is impossible — T-109; an extension of §6.2; the recheck does not return such rows); the names and `ParseStatus` for parsing |
 | `model.CheckState` | `domains.check_state` | 0 `pending`, 1 `queued`, 2 `done` |
-| `model.Flags` | `domains.flags` | бит 0 `is_idn` (ТЗ 5.2 п. 9 — метка содержит `xn--`), бит 1 `render_pending` (ТЗ 5.6), бит 2 `http_published` — staging-пометка «задача q:http эпизода опубликована, результат не записан» (T-108: повторная доставка пачки q:dns не дублирует публикацию; снимается записью результата и постановкой планировщика), бит 3 `dead_host_cutoff` — последний HTTP-эпизод завершён по мёртвой сигнатуре apex+www (T-164: запись результата ставит/снимает бит; выборка контрольной сверки ложных cutoff — `WHERE flags & 8 <> 0`); методы `Set`/`Clear`/`Test` |
-| `model.DNSMask` | `domains.dns_mask`, `laravel_domains.found_on_mask` | бит № = `subdomains.id`, биты 0..62 (максимум 63 субдомена, ТЗ 5.10); `Set`/`Unset`/`Test`/`IDs`/`Count` |
-| `int16` | `domains.temp_attempts` | счётчик назначенных подряд повторных проверок `temp_error` (T-031, миграция 000005; ТЗ 5.3: «не более N раз подряд»); наращивает планировщик, сброс — при итоговом статусе и успешной проверке |
-| `model.Variant` | `subdomain_results.variant` | 0 основной, 1 http-вариант (ТЗ 5.5 п. 5) |
+| `model.Flags` | `domains.flags` | bit 0 `is_idn` (spec 5.2 item 9 — the label contains `xn--`), bit 1 `render_pending` (spec 5.6), bit 2 `http_published` — the staging mark "the q:http task of the episode is published, the result is not recorded yet" (T-108: a duplicate delivery of a q:dns batch does not duplicate the publication; cleared by the result write and by the scheduler's enqueueing), bit 3 `dead_host_cutoff` — the last HTTP episode finished on a dead apex+www signature (T-164: the result write sets/clears the bit; the selection for the false-cutoff cross-check — `WHERE flags & 8 <> 0`); the `Set`/`Clear`/`Test` methods |
+| `model.DNSMask` | `domains.dns_mask`, `laravel_domains.found_on_mask` | bit № = `subdomains.id`, bits 0..62 (at most 63 subdomains, spec 5.10); `Set`/`Unset`/`Test`/`IDs`/`Count` |
+| `int16` | `domains.temp_attempts` | the counter of consecutively assigned `temp_error` rechecks (T-031, migration 000005; spec 5.3: "no more than N times in a row"); the scheduler increments it; the reset — on the final status and on a successful check |
+| `model.Variant` | `subdomain_results.variant` | 0 the primary one, 1 the http variant (spec 5.5 item 5) |
 | `model.Scheme` | `subdomain_results.scheme` | 1 http, 2 https |
-| `model.AliasKind` | `subdomain_results.alias_kind` | 0 нет, 1 идентичен, 2 редирект (ТЗ 5.5 п. 6) |
+| `model.AliasKind` | `subdomain_results.alias_kind` | 0 none, 1 identical, 2 redirect (spec 5.5 item 6) |
 | `model.Action` | `ingest_files.action` | 1 add, 2 delete |
 
-Представления бинарных и jsonb-колонок `subdomain_results` фиксирует
-HTTP-этап (T-058, `internal/httpworker/record.go`):
+The representations of the binary and jsonb columns of `subdomain_results` are
+fixed by the HTTP stage (T-058, `internal/httpworker/record.go`):
 
-- `addrs` — по 16 октетов на адрес, IPv4 в v4-mapped форме
-  (`::ffff:a.b.c.d`, `netip.Addr.As16`): смешанные наборы A/AAAA не
-  двусмысленны, длина всегда кратна 16; порядок адресов — задачи
-  `q:http` (A, затем AAAA, порядок ответа DNS-этапа);
-- `tls`, `redirects` — JSON структур `httpfetch.TLSInfo` (T-050) и
-  `[]httpfetch.RedirectStep` (T-048), теги snake_case;
-- `headers` — канонические имена заголовков итогового ответа
+- `addrs` — 16 octets per address, IPv4 in the v4-mapped form
+  (`::ffff:a.b.c.d`, `netip.Addr.As16`): mixed A/AAAA sets are not
+  ambiguous, the length is always a multiple of 16; the address order — the
+  `q:http` task's (A first, then AAAA, the DNS stage's answer order);
+- `tls`, `redirects` — the JSON of the `httpfetch.TLSInfo` (T-050) and
+  `[]httpfetch.RedirectStep` (T-048) structs, snake_case tags;
+- `headers` — the canonical header names of the final response
   (`http.Header`: `{"Content-Type":["text/html"], …}`);
-- `cookies` — массив `{name, value, path, domain, expires, max_age,
-  secure, http_only, same_site}` (RFC 3339 для `expires`);
-- `error` — класс ошибки проверки (T-053: 1 таймаут, 2 редиректы, 3 TLS,
-  4 тело, 5 сеть; NULL — без ошибки), `rendered = false` до рендера
-  (T-067), `rules_version` заполняет анализатор (T-068+);
-- `render_failed_at` — штамп «рендер невозможен» (T-210, миграция
-  000017): финализация без рендера (тарпит T-148 / cert-класс T-159 /
-  DNS-класс T-211 / класс задачи T-172 — cert-класс, DNS-класс и класс
-  задачи постоянные, у тарпита бюджет попыток исчерпан) помечает запись
-  до смены контента; выборка
-  прохода доработки рендера (`renderPendingRowsSQL`) отмаркированные
-  записи не берёт — повторные издания жгут доставки и слот-время
-  (по замеру T-207 хвост ~180–220 тыс. записей). Значение — первая
-  финализация (`coalesce`, повторный штамп значение не меняет).
-  Сбрасывается перезаписью эпизода (DELETE + INSERT записи результата,
-  T-058 — колонка в INSERT не входит, DEFAULT NULL: первая попытка
-  свежего эпизода легитимна, починившийся хост отрендерится на
-  следующем эпизоде перепроверки T-030) и успешным рендером
-  (renderUpdateSQL). NULL — маркера нет; существующие строки миграция
-  не трогает. Пара с `rendered` скреплена CHECK-инвариантом
-  `subdomain_results_rendered_check` (T-259, миграция 000018 — раздел
-  «CHECK-инварианты»); спецификация автомата рендер-состояния строки —
-  doc-комментарий `internal/renderworker/worker.go` (ТЗ-fsm §3 ФТ-5).
+- `cookies` — an array of `{name, value, path, domain, expires, max_age,
+  secure, http_only, same_site}` (RFC 3339 for `expires`);
+- `error` — the check error class (T-053: 1 timeout, 2 redirects, 3 TLS,
+  4 body, 5 network; NULL — no error); `rendered = false` until the render
+  (T-067); `rules_version` is filled by the analyzer (T-068+);
+- `render_failed_at` — the "render impossible" stamp (T-210, migration
+  000017): a finalization without a render (a tarpit T-148 / a cert class T-159 /
+  a DNS class T-211 / a task class T-172 — the cert class, the DNS class and the
+  task class are permanent; for a tarpit the attempt budget is exhausted) marks the
+  record until the content changes; the selection of the render catch-up pass
+  (`renderPendingRowsSQL`) does not take marked
+  records — repeated publications burn deliveries and slot time
+  (per the T-207 measurement the tail is ~180–220 thousand records). The value —
+  the first finalization (`coalesce`; a repeated stamp does not change the value).
+  It is reset by an episode rewrite (the DELETE + INSERT of the result record,
+  T-058 — the column is not in the INSERT, DEFAULT NULL: the first attempt
+  of a fresh episode is legitimate; a host that recovered will render on the
+  next recheck episode of T-030) and by a successful render
+  (renderUpdateSQL). NULL — no marker; the migration does not touch existing
+  rows. The pair with `rendered` is bound by the CHECK invariant
+  `subdomain_results_rendered_check` (T-259, migration 000018 — the
+  "CHECK invariants" section); the specification of the row's render-state automaton —
+  the doc comment of `internal/renderworker/worker.go` (TZ-fsm §3 FR-5).
 
-Границы маски защищены в самом типе: бит 63 `bigint` знаковый, поэтому
-`DNSMask.Set`/`Unset` отвергают номера вне 0..62 ошибкой (все номера
-проверяются до изменения — маска не меняется частично), `Test` для
-недопустимого номера возвращает false, `ValidateSubdomainID` — та же
-проверка для `crawlerctl subdomains add`. Нулевые значения структур
-совпадают с `DEFAULT`-ами колонок (`TestDomainZeroValueMatchesDefaults`),
-соответствие тегов колонкам миграции закреплено тестом
+The mask bounds are protected in the type itself: bit 63 of a `bigint` is the
+sign bit, so `DNSMask.Set`/`Unset` reject numbers outside 0..62 with an error (all
+numbers are validated before the change — the mask is never partially changed);
+`Test` returns false for an invalid number; `ValidateSubdomainID` — the same
+check for `crawlerctl subdomains add`. The zero values of the structs
+match the `DEFAULT`s of the columns (`TestDomainZeroValueMatchesDefaults`);
+the tags' match to the migration columns is pinned by the test
 `TestStructColumnsMatchSchema`.
 
-## Функция domain_info(text) — поиск домена по имени (T-082)
+## The domain_info(text) function — domain search by name (T-082)
 
-Миграция `000006_domain_info` (ТЗ 5.11) создаёт SQL-функцию для прямого
-запроса из psql — сводка домена одним значением `jsonb`; CLI-обёртка
-`crawlerctl domain` (T-081) — над теми же таблицами на стороне Go.
+The migration `000006_domain_info` (spec 5.11) creates an SQL function for a
+direct query from psql — a domain summary as a single `jsonb` value; the
+CLI wrapper `crawlerctl domain` (T-081) — over the same tables on the Go side.
 
 ```sql
-SELECT domain_info('example.com');            -- сводка или NULL
+SELECT domain_info('example.com');            -- the summary or NULL
 SELECT jsonb_pretty(domain_info('example.com'));
 ```
 
-Домен или зона не найдены — `NULL` (не ошибка): SQL-функция отвечает
-фактом, «понятное сообщение» формирует CLI.
+A domain or zone not found — `NULL` (not an error): the SQL function reports
+the fact; the CLI forms the "friendly message".
 
-### Обработка имени
+### Name handling
 
-- **SQL-минимум нормализации** (ТЗ 5.2 п. 1): нижний регистр, снятие
-  краевых пробелов и точек — `'  Example.COM.  '` находит домен. Полный
-  конвейер IDN (пробелы внутри, punycode, проверки длин) — сторона Go
-  (`internal/idn`): в БД имена хранятся punycode, unicode-вход
-  нормализует CLI до обращения к функции.
-- **Зона — последняя метка имени (TLD)**: `site.co.uk` → зона `uk`,
-  составные метки домена остаются в `label` (`site.co` — норма;
-  ТЗТ tld-only-zones §4, `idn.Normalize`). Отделение совпадает с
-  конвейером ingest: внешних списков суффиксов ни SQL, ни Go не
-  используют. Правило «самый длинный суффикс имени, присутствующий
-  в `zones`», остаётся точным описанием поиска: справочник — TLD
-  (канонический источник — `crawlerctl zones sync`, срез IANA) плюс
-  тестовые зоны allowlist `ingest.allowed_zone_paths` — такая зона
-  (`crawl.test`) длиннее своего TLD и забирает имена своих сценариев
-  (`example.crawl.test` → зона `crawl.test`).
-- Поиск домена — по уникальному ключу `(zone_id, label)` через индекс
-  `domains_zone_id_label_key`, без полного сканирования (ТЗ 5.11).
+- **The SQL minimum of normalization** (spec 5.2 item 1): lowercase, trimming
+  edge spaces and dots — `'  Example.COM.  '` finds the domain. The full
+  IDN pipeline (inner spaces, punycode, length checks) — the Go side
+  (`internal/idn`): names are stored in the DB as punycode; the CLI normalizes
+  the unicode input before calling the function.
+- **The zone — the last label of the name (the TLD)**: `site.co.uk` → the zone `uk`;
+  the composite labels of the domain stay in `label` (`site.co` is normal;
+  the TZ_tld_only_zones spec §4, `idn.Normalize`). The split matches
+  the ingest pipeline: neither SQL nor Go uses
+  external suffix lists. The rule "the longest suffix of the name present
+  in `zones`" remains the exact description of the search: the directory is TLDs
+  (the canonical source — `crawlerctl zones sync`, an IANA snapshot) plus
+  the allowlisted test zones of `ingest.allowed_zone_paths` — such a zone
+  (`crawl.test`) is longer than its TLD and captures the names of its scenarios
+  (`example.crawl.test` → the zone `crawl.test`).
+- The domain is searched by the unique key `(zone_id, label)` through the index
+  `domains_zone_id_label_key`, without a full scan (spec 5.11).
 
-### Состав ответа
+### Response composition
 
-| Путь | Содержимое |
+| Path | Contents |
 |---|---|
-| `zone` | `{id, name, name_unicode}` — зона домена |
-| `domain` | `{id, label, name, status, status_name, check_state, check_state_name, is_idn, render_pending, dns_mask, temp_attempts, queued_at, last_checked_at}` — строка `domains`; `*_name` дублируют коды именами из ТЗ 6.2 / `internal/model` (`alive`, `done`, …) для чтения из psql без справочника |
-| `dns_alive` | `[{id, label}]` — расшифровка `dns_mask` по справочнику `subdomains` |
-| `results` | `[{subdomain_id, subdomain, variant, scheme, scheme_name, http_status, final_url, alias_kind, alias_kind_name, alias, rendered, error, content_hash, checked_at}]` — результаты по (субдомен, вариант); `alias` — метка субдомена-цели алиаса; контент не раскрывается, `content_hash` (hex) — ссылка на него |
-| `laravel` | `{score, ver_min, ver_max, found_on_mask, found_on, rules_version, updated_at, findings}` — агрегат `laravel_domains` (json `null`, когда признаков нет), `found_on` — расшифровка `found_on_mask`; `findings` — все срабатывания `laravel_findings` домена **по убыванию score**, включая слабые ниже порога с пометкой `is_laravel`, `signals` передаются как есть |
+| `zone` | `{id, name, name_unicode}` — the domain's zone |
+| `domain` | `{id, label, name, status, status_name, check_state, check_state_name, is_idn, render_pending, dns_mask, temp_attempts, queued_at, last_checked_at}` — the `domains` row; `*_name` duplicate the codes with the names from spec 6.2 / `internal/model` (`alive`, `done`, …) so psql can be read without a reference |
+| `dns_alive` | `[{id, label}]` — the `dns_mask` decoded via the `subdomains` reference |
+| `results` | `[{subdomain_id, subdomain, variant, scheme, scheme_name, http_status, final_url, alias_kind, alias_kind_name, alias, rendered, error, content_hash, checked_at}]` — the results per (subdomain, variant); `alias` — the label of the alias target subdomain; the content is not disclosed; `content_hash` (hex) — the reference to it |
+| `laravel` | `{score, ver_min, ver_max, found_on_mask, found_on, rules_version, updated_at, findings}` — the `laravel_domains` aggregate (json `null` when there are no signs); `found_on` — the `found_on_mask` decoded; `findings` — all of the domain's `laravel_findings` hits **by descending score**, including the weak ones below the threshold with the `is_laravel` mark; `signals` are passed as is |
 
-Времена (`checked_at`, `updated_at`, `queued_at`) — строки RFC 3339
-со смещением зоны сессии; `last_checked_at` — дата (`date`).
+The times (`checked_at`, `updated_at`, `queued_at`) — RFC 3339 strings
+with the offset of the session's zone; `last_checked_at` — a date (`date`).
 
-### Безопасность
+### Security
 
-Функция только читает: `STABLE`, `PARALLEL SAFE`, `SECURITY INVOKER`,
-таблицы не изменяет. Тело обращается к таблицам по неквалифицированным
-именам, поэтому `search_path` **зафиксирован за функцией** —
-`pg_catalog` + схема, по которой накатана миграция (ALTER после CREATE:
-имя схемы в момент миграции неизвестно — набор применяется и в рабочую
-схему, и в изолированные схемы интеграционных тестов через `search_path`
-DSN). Вызывающий не может подменить таблицы через свой `search_path`.
+The function only reads: `STABLE`, `PARALLEL SAFE`, `SECURITY INVOKER`;
+it does not modify tables. The body references the tables by unqualified
+names, so the `search_path` is **pinned to the function** —
+`pg_catalog` + the schema the migration was applied to (an ALTER after CREATE:
+the schema name at migration time is unknown — the set is applied both to the working
+schema and to the isolated schemas of the integration tests via the `search_path`
+of the DSN). The caller cannot swap the tables through their own `search_path`.
 
-Контракт закреплён интеграционным тестом `TestSchema_DomainInfoFunction`
-(`test/integration/schema_test.go`): атрибуты функции, состав JSON по
-тестовым данным (включая сортировку findings и расшифровки масок),
-отделение зоны самым длинным суффиксом и `NULL` для неизвестных
-домена/зоны. Down-миграция — `DROP FUNCTION IF EXISTS domain_info(text)`.
+The contract is pinned by the integration test `TestSchema_DomainInfoFunction`
+(`test/integration/schema_test.go`): the function attributes, the JSON
+composition against the test data (including the findings sorting and the mask
+decodings), the zone split by the longest suffix, and `NULL` for an unknown
+domain/zone. The down migration — `DROP FUNCTION IF EXISTS domain_info(text)`.
 
-Миграция `000010_domain_info_invalid_status` (T-109) добавила в CASE
-расшифровки `status_name` ветку кода 7 (`invalid` — диагностический
-статус ядовитой строки) полным `CREATE OR REPLACE` тела 000006: для
-кодов 0..6 ответ не изменился.
+The migration `000010_domain_info_invalid_status` (T-109) added to the
+`status_name` decoding CASE the branch of code 7 (`invalid` — the diagnostic
+status of a poison row) by a full `CREATE OR REPLACE` of the 000006 body: for
+codes 0..6 the response is unchanged.

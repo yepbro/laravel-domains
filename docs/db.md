@@ -1,162 +1,162 @@
-# Слой БД: пул подключений и массовая запись
+# DB layer: connection pool and bulk writes
 
-Пакет `internal/db` (T-007): пул `pgx` поверх секции `postgres` конфигурации
-и хелперы массовой записи — потокочный `COPY` пачками и пакетный
-`UPDATE … FROM unnest(...)`. Принципы основного ТЗ: §6.3 (пул ≤ 20–50
-соединений суммарно), §3.5 и §6 («запись пачками COPY, UPDATE … FROM
-unnest(...)», память не зависит от объёма данных).
+The `internal/db` package (T-007): a `pgx` pool on top of the `postgres` section of
+the configuration and bulk write helpers — streaming `COPY` in batches and batched
+`UPDATE … FROM unnest(...)`. Principles of the main spec: §6.3 (a pool of ≤ 20–50
+connections in total), §3.5 and §6 ("write in batches with COPY, UPDATE … FROM
+unnest(...)", memory independent of the data volume).
 
-Схема таблиц — в [`schema.md`](schema.md), миграции — в
-[`migrations.md`](migrations.md), параметры секции `postgres` — в
+Table schema — in [`schema.md`](schema.md), migrations — in
+[`migrations.md`](migrations.md), parameters of the `postgres` section — in
 [`configuration.md`](configuration.md).
 
-## Пул подключений
+## Connection pool
 
 ```go
 pool, err := db.Open(ctx, db.NewOptions(cfg.Postgres)) // dsn + pool_size
 defer pool.Close()
 ```
 
-- `db.Open` разбирает DSN, накладывает настройки и делает fail-fast `Ping`:
-  недоступная БД — ошибка при старте с понятным сообщением (пароль скрыт),
-  а не при первом запросе.
-- `*pgxpool.Pool` передаётся хелперам пакета напрямую (и удовлетворяет
-  интерфейсу `db.DB`, по которому хелперы принимают любое удовлетворяющее
-  подключение — это используется юнит-тестами).
+- `db.Open` parses the DSN, applies the settings and does a fail-fast `Ping`:
+  an unreachable DB is a startup error with a clear message (the password is
+  hidden), not a failure on the first query.
+- `*pgxpool.Pool` is passed to the package helpers directly (and satisfies the
+  `db.DB` interface, by which the helpers accept any matching connection —
+  unit tests rely on this).
 
-Настройки (`db.Options`; значения по умолчанию — константы пакета):
+Settings (`db.Options`; default values are package constants):
 
-| Параметр | По умолчанию | Смысл |
+| Parameter | Default | Meaning |
 |---|---|---|
-| `PoolSize` | 20 (`DefaultPoolSize`) | максимум соединений пула; перекрывает `pool_max_conns` из DSN — источник истины конфигурация |
-| `MinPoolSize` | 0 | фоновые соединения; 0 — ленивое открытие, простой не держит соединений |
-| `MaxConnLifetime` | 30m | переустановка соединения |
-| `MaxConnIdleTime` | 5m | закрытие простаивающего соединения |
-| `HealthCheckPeriod` | 1m | фоновая проверка соединений |
-| `ConnectTimeout` | 10s | установка одного соединения |
+| `PoolSize` | 20 (`DefaultPoolSize`) | the pool's maximum connections; overrides `pool_max_conns` from the DSN — the configuration is the source of truth |
+| `MinPoolSize` | 0 | background connections; 0 — lazy opening, idle time holds no connections |
+| `MaxConnLifetime` | 30m | re-establishing a connection |
+| `MaxConnIdleTime` | 5m | closing an idle connection |
+| `HealthCheckPeriod` | 1m | background connection health check |
+| `ConnectTimeout` | 10s | establishing a single connection |
 
-`PoolSize` валидируется (1..100): пул больше бюджета ТЗ не имеет смысла.
+`PoolSize` is validated (1..100): a pool larger than the spec budget makes no sense.
 
-### AfterConnect-хуки сессии (T-171/T-192/T-201)
+### Session AfterConnect hooks (T-171/T-192/T-201)
 
-`Options.AfterConnect` (`service.Options.DBAfterConnect` в каркасе) —
-настройка каждого соединения пула, включая переоткрытия по
-`MaxConnLifetime`: сессионные `SET` переживают пересборку соединений.
-Готовые хуки пакета:
+`Options.AfterConnect` (`service.Options.DBAfterConnect` in the service
+framework) — setup of every pool connection, including re-openings triggered by
+`MaxConnLifetime`: session-level `SET`s survive connection rebuilds.
+Ready-made hooks of the package:
 
-| Хук | Действие | Где включён |
+| Hook | Action | Enabled in |
 |---|---|---|
-| `db.NoParallelGather` (T-171) | `SET max_parallel_workers_per_gather = 0` — агрегатные проходы не разбирают параллельные воркеры и не забирают все ядра поделимого CPU у конвейера | monitor, dashboard, scheduler (seq-проходы backlog/retry temp_error), http-worker (T-201: retention-дренаж — время-форма T-185 собирала Gather Merge на голодном CPU того же сервиса) |
-| `db.LockTimeout(db.DefaultLockTimeout)` (T-192) | `SET lock_timeout = '30000ms'` — потолок ожидания чужих строковых блокировок: конвой 25.10 (держатель ~37 мин, жертвы до 39 мин) обрезается откатом транзакции и повтором доставки (at-least-once), а не немым ожиданием. 30 с — на три порядка выше штатных ожиданий и на порядок ниже инцидентных; константа, не конфиг | dns-worker, http-worker, scheduler — write-пулы со строчными локами `domains` |
-| `db.JoinHooks(...)` | композиция нескольких хуков одного пула (сбой любого — ошибка открытия соединения) | scheduler: `JoinHooks(NoParallelGather, LockTimeout(DefaultLockTimeout))`; http-worker — те же два хука (T-201) |
+| `db.NoParallelGather` (T-171) | `SET max_parallel_workers_per_gather = 0` — aggregate passes do not consume parallel workers and do not take all cores of the shared CPU away from the pipeline | monitor, dashboard, scheduler (seq passes over backlog/retry temp_error), http-worker (T-201: retention drain — the time-form of T-185 was gathering Gather Merge on a starved CPU of the same service) |
+| `db.LockTimeout(db.DefaultLockTimeout)` (T-192) | `SET lock_timeout = '30000ms'` — a cap on waiting for someone else's row locks: the 25.10 convoy (holder ~37 min, victims up to 39 min) is cut off by a transaction rollback and a redelivery (at-least-once), not by mute waiting. 30 s is three orders of magnitude above normal waits and an order of magnitude below incident ones; a constant, not a config | dns-worker, http-worker, scheduler — write pools with row locks on `domains` |
+| `db.JoinHooks(...)` | composition of several hooks of one pool (failure of any one is a connection-open error) | scheduler: `JoinHooks(NoParallelGather, LockTimeout(DefaultLockTimeout))`; http-worker — the same two hooks (T-201) |
 
-Читатели без строчных локов (monitor, dashboard, web) и анализатор хук
-`LockTimeout` не получают (у monitor/dashboard — только
-`NoParallelGather`): `lock_timeout` режет и легитимно длинные ожидания,
-решение осознанное по каждому сервису (образец рассуждения — T-171).
+Readers without row locks (monitor, dashboard, web) and the analyzer do not get
+the `LockTimeout` hook (monitor/dashboard get only
+`NoParallelGather`): `lock_timeout` also cuts legitimately long waits;
+the decision is deliberate per service (sample reasoning — T-171).
 
-Помимо сессионных хуков, тяжёлые фоновые сканы одного сервиса
-координируются гейтом `db.ScanGate` (T-271): буферизованный канал
-ёмкости 1, разделяемый независимыми циклами (http-worker:
-retention-дренаж ↔ поздний переиздатель рендера). Пины планов самих
-выборок (`SET LOCAL` seq/hash/merge/bitmap off в tx-оболочках, стиль
-T-181/T-191) убирают
-деградацию до seq scan + hash join + Sort и битмап-путь с явным Sort
-(битмап не сохраняет порядок курсорного индекса), гейт — страховка от
-совпадения остаточно тяжёлых сканов поверх `shared_buffers` (инцидент
-08–09.11.2026: два скана по ≈1 ГиБ — пять OOM-киллов PostgreSQL за
-ночь). nil-гейт — no-op, точечные операторы под гейт не ставятся.
+Besides the session hooks, heavy background scans of one service are coordinated
+by the `db.ScanGate` gate (T-271): a buffered channel of capacity 1, shared by
+independent loops (http-worker: retention drain ↔ the late render
+re-publisher). The plan pins of the selections themselves
+(`SET LOCAL` seq/hash/merge/bitmap off in the tx wrappers, the
+T-181/T-191 style) remove the
+degradation to seq scan + hash join + Sort and the bitmap path with an explicit
+Sort (the bitmap does not preserve the cursor index order); the gate is a guard
+against residually heavy scans stacking on top of `shared_buffers` (the incident
+of 08–09.11.2026: two scans of ≈1 GiB each — five PostgreSQL OOM kills in
+one night). A nil gate is a no-op; point statements are not placed under the gate.
 
-### Бюджет соединений: 20–50 на ВСЕ сервисы
+### Connection budget: 20–50 across ALL services
 
-`postgres.pool_size` задаётся **на один сервис**, а рекомендация ТЗ §6.3 —
-суммарная на все сервисы (в примере ТЗ §5.10 `pool_size: 20` — весь бюджет).
-При девяти сервисах закладывайте 2–5 на сервис (например,
-`CRAWLER_POSTGRES_POOL_SIZE=4`; глобальная переменная действует и на
-dashboard — EnvironmentFile юнита переопределяет его Environment,
-поэтому безопасный глобальный максимум — 4), ориентируясь на
+`postgres.pool_size` is set **per service**, while the spec §6.3 recommendation is
+a total across all services (in the spec §5.10 example, `pool_size: 20` is the
+whole budget). With nine services, plan for 2–5 per service (for example,
+`CRAWLER_POSTGRES_POOL_SIZE=4`; the global variable also affects the
+dashboard — the unit's EnvironmentFile overrides its Environment,
+so a safe global maximum is 4), keeping in mind
 `max_connections`
-PostgreSQL (в dev — 130: стек сервисов + параллельные прогоны тестов на
-изолированных схемах, `postgresql.dev.conf`; в бою — 50, см. раздел
-тюнинга ниже).
-Пулы ленивые: сервис без БД-нагрузки не держит ни одного соединения,
-поэтому суммарный пик определяется реально работающими воркерами.
+of PostgreSQL (in dev — 130: the service stack + parallel test runs on
+isolated schemas, `postgresql.dev.conf`; in production — 50, see the
+tuning section below).
+Pools are lazy: a service without DB load holds no connections at all,
+so the total peak is determined by the actually running workers.
 
-## Интеграция с каркасом сервисов
+## Integration with the service framework
 
-`service.Options.OnDBPool` (T-007): если задан и известен DSN, каркас после
-применения миграций открывает пул из `postgres.dsn`/`pool_size` и вызывает
-`OnDBPool(pool)` с готовым пулом. Пул закрывается каркасом при graceful
-shutdown последним — после завершения рабочей логики (`Options.OnRun`,
-отмена контекста по SIGTERM/SIGINT, ТЗ 3.4) и остановки HTTP-сервера
-метрик. Сервисы-заглушки без `OnDBPool` продолжают работать без БД —
-поведение прежнее.
+`service.Options.OnDBPool` (T-007): if set and the DSN is known, the framework
+opens a pool from `postgres.dsn`/`pool_size` after applying migrations and calls
+`OnDBPool(pool)` with the ready pool. The pool is closed by the framework last
+during graceful shutdown — after the worker logic finishes (`Options.OnRun`,
+context cancellation on SIGTERM/SIGINT, spec 3.4) and the metrics HTTP server
+stops. Stub services without `OnDBPool` keep working without a DB —
+the behavior is unchanged.
 
 ```go
 service.Run(service.Options{
 	Name:   "scheduler",
 	Config: cfg,
 	OnDBPool: func(pool *pgxpool.Pool) {
-		// сохранить пул для рабочей логики
+		// keep the pool for the worker logic
 	},
 	OnRun: func(ctx context.Context) error {
-		// рабочая логика воркера; завершение — по отмене ctx при
-		// SIGTERM/SIGINT, чтобы успеть до закрытия пула каркасом
+		// worker logic; termination — on ctx cancellation at
+		// SIGTERM/SIGINT, to finish before the framework closes the pool
 		<-ctx.Done()
 		return nil
 	},
 })
 ```
 
-## Массовая запись: COPY
+## Bulk write: COPY
 
-`db.CopyFrom` копирует готовую пачку строк одним вызовом `COPY` (обёртка
-`pgx.CopyFrom` с проверкой соответствия строк списку колонок; пустая пачка —
-no-op без обращения к БД).
+`db.CopyFrom` copies a ready batch of rows with a single `COPY` call (a wrapper
+over `pgx.CopyFrom` verifying that rows match the column list; an empty batch is
+a no-op with no DB access).
 
-`db.CopyFromStream` — потоковый вариант (ТЗ §3.5): читает строки из
-итератора `db.RowIter` (`func() ([]any, error)`, конец — `io.EOF`) пачками
-по `batchSize` строк; каждая пачка — отдельный `COPY`, то есть отдельная
-транзакция. Поэтому:
+`db.CopyFromStream` — the streaming variant (spec §3.5): it reads rows from
+a `db.RowIter` iterator (`func() ([]any, error)`, the end — `io.EOF`) in batches
+of `batchSize` rows; each batch is a separate `COPY`, that is, a separate
+transaction. Therefore:
 
-- память ограничена `batchSize` и не зависит от объёма данных (ingest
-  читает файлы построчно, ТЗ §5.1);
-- прогресс фиксируется в БД пачками — падение теряет максимум незаконченную
-  пачку;
-- отмена контекста прерывает копирование **до начала следующей пачки**:
-  законченные пачки остаются в БД, ошибка сообщает число закоммиченных
-  строк; повтор безопасен при идемпотентной записи (ТЗ §3.4).
+- memory is bounded by `batchSize` and does not depend on the data volume
+  (ingest reads files line by line, spec §5.1);
+- progress is committed to the DB in batches — a crash loses at most the
+  unfinished batch;
+- context cancellation interrupts the copying **before the next batch starts**:
+  finished batches stay in the DB, and the error reports the number of committed
+  rows; a retry is safe with idempotent writes (spec §3.4).
 
 ```go
 total, err := db.CopyFromStream(ctx, pool,
 	pgx.Identifier{"domains"}, []string{"zone_id", "label"},
-	50000, // ingest.batch_size (ТЗ §5.1)
+	50000, // ingest.batch_size (spec §5.1)
 	func() ([]any, error) { return parseNextLine() })
 ```
 
-COPY в staging-таблицу (стиль ingest ТЗ §5.1) использует те же хелперы;
-сама staging-таблица и применение add/delete — задача T-017.
+COPY into a staging table (the ingest style of spec §5.1) uses the same helpers;
+the staging table itself and applying add/delete — task T-017.
 
-## Массовое обновление: UPDATE … FROM unnest(...)
+## Bulk update: UPDATE … FROM unnest(...)
 
-`db.Update(table)` строит типизированный пакетный UPDATE: ключи (`Key`),
-значения по строкам (`Set`), фиксированные выражения (`SetExpr`), охрана
-(`Where`), `Returning` + `Query`. Значения передаются **колонками** —
-параллельными массивами (порядок: ключи, затем SET-колонки).
+`db.Update(table)` builds a typed batched UPDATE: keys (`Key`),
+per-row values (`Set`), fixed expressions (`SetExpr`), a guard
+(`Where`), `Returning` + `Query`. Values are passed **as columns** —
+parallel arrays (the order: keys first, then the SET columns).
 
 ```go
-// Scheduler (ТЗ §5.3): перевод выбранных доменов в queued, только из pending.
+// Scheduler (spec §5.3): move the selected domains to queued, from pending only.
 rows, err := db.Update("domains").
 	Key(db.Column{Name: "zone_id", Type: "int2"}).
 	Key(db.Column{Name: "id", Type: "int8"}).
 	Set(db.Column{Name: "check_state", Type: "int2"}).
 	SetExpr("queued_at = now()").
-	Where("t.check_state = 0").      // охрана от гонок
-	Returning("t.zone_id", "t.id").  // публикуем в очередь ровно переведённые
+	Where("t.check_state = 0").      // guard against races
+	Returning("t.zone_id", "t.id").  // publish to the queue exactly the rows that were moved
 	Query(ctx, pool, zones, ids, states)
 ```
 
-Итоговый SQL:
+The resulting SQL:
 
 ```sql
 UPDATE "domains" AS t
@@ -166,197 +166,210 @@ WHERE t."zone_id" = u."zone_id" AND t."id" = u."id" AND t.check_state = 0
 RETURNING t.zone_id, t.id
 ```
 
-Свойства:
+Properties:
 
-- массив каждой колонки — **один** параметр запроса, поэтому размер пачки
-  не упирается в лимит протокола (65535 параметров); контракт зафиксирован
-  интеграционным тестом на 70 000 строк одним запросом. Верхнюю границу
-  пачки задаёт конфигурация этапа (`scheduler.batch_size` и т. п.);
-- `Where` — охрана: массовый перевод состояний меняет только строки
-  в ожидаемом состоянии, повторный запуск возвращает 0 строк
-  (идемпотентность, ТЗ §3.4);
-- имена таблиц и колонок экранируются как идентификаторы; `Where`,
-  `SetExpr` и `Returning` — SQL-выражения из кода, не из пользовательского
-  ввода;
-- пустая пачка — no-op без обращения к БД (`Exec`), у `Query` с пустой
-  пачкой — ошибка (RETURNING не вернёт строк);
-- рассинхрон длинн массивов-колонок — ошибка до выполнения запроса.
+- each column's array is **one** query parameter, so the batch size
+  does not hit the protocol limit (65535 parameters); the contract is pinned
+  by an integration test with 70 000 rows in one query. The upper bound of the
+  batch is set by the stage configuration (`scheduler.batch_size` and the like);
+- `Where` is a guard: a bulk state transition changes only rows
+  in the expected state; a second run returns 0 rows
+  (idempotency, spec §3.4);
+- table and column names are quoted as identifiers; `Where`,
+  `SetExpr` and `Returning` are SQL expressions from code, not from user
+  input;
+- an empty batch is a no-op with no DB access (`Exec`); `Query` with an empty
+  batch returns an error (RETURNING would return no rows);
+- a length desync of the column arrays is an error before the query runs.
 
-## Ошибки и контексты
+## Errors and contexts
 
-Все хелперы принимают `context.Context`: таймаут и отмена прерывают
-текущий запрос; потоковый COPY проверяет контекст между пачками. Ошибки
-оборачиваются с именем таблицы и числом затронутых/записанных строк;
-первопричина доступна через `errors.Is`/`errors.As`. Частичная запись
-возможна только границами пачек — повтор операции безопасен при
-идемпотентной записи (ТЗ §3.4).
+All helpers accept a `context.Context`: a timeout and cancellation interrupt
+the current query; the streaming COPY checks the context between batches. Errors
+are wrapped with the table name and the number of affected/written rows;
+the root cause is available via `errors.Is`/`errors.As`. Partial writes are
+possible only at batch boundaries — retrying the operation is safe with
+idempotent writes (spec §3.4).
 
-## Тюнинг боевого PostgreSQL (NVMe) — T-086
+## Production PostgreSQL tuning (NVMe) — T-086
 
-Боевая конфигурация — [`deploy/postgres/postgresql.conf`](../deploy/postgres/postgresql.conf):
-PostgreSQL 16 из пакетов ОС на сервере 8 ГБ RAM / NVMe (ТЗ §10.1, §3.1),
-ресурсный потолок — systemd-юнит с `MemoryMax` 3 ГБ (T-085,
-`deploy/systemd/`) — страховка над плановым бюджетом ≈ 2,5 ГБ
-(обоснование запаса — раздел «Память» ниже). Файл подключается к кластеру пакетного PG как
-`config_file=` (или include). Формат файла и контрактные значения ТЗ
-охраняются юнит-тестом `deploy/postgres/postgresql_conf_test.go`
-(`make test`); конфигурация выверена живым запуском PostgreSQL 16.15
-(`SHOW` по всем параметрам).
+The production configuration is
+[`deploy/postgres/postgresql.conf`](../deploy/postgres/postgresql.conf):
+PostgreSQL 16 from OS packages on an 8 GB RAM / NVMe server (spec §10.1, §3.1);
+the resource cap — a systemd unit with `MemoryMax` 3 GB (T-085,
+`deploy/systemd/`) — a guard above the planned budget of ≈ 2.5 GB
+(the rationale for the headroom — the "Memory" section below). The file is
+attached to the packaged PG cluster as
+`config_file=` (or an include). The file format and the spec's contract values are
+guarded by the unit test `deploy/postgres/postgresql_conf_test.go`
+(`make test`); the configuration was verified against a live run of
+PostgreSQL 16.15 (`SHOW` for all parameters).
 
-Решение по dev-стеку: Docker-окружение (включая боевой профиль `runtime`)
-продолжает использовать `deploy/docker/postgres/postgresql.dev.conf` —
-семантика планировщика/WAL/autovacuum там совпадает с боевой
+The decision on the dev stack: the Docker environment (including the production
+`runtime` profile) keeps using
+`deploy/docker/postgres/postgresql.dev.conf` —
+its planner/WAL/autovacuum semantics match production
 (`synchronous_commit=off`, `random_page_cost=1.1`,
-`effective_io_concurrency=200`, пониженные факторы autovacuum), объёмы
-памяти — dev-масштаб (`mem_limit` 1536m); `max_connections` = 130 — при 60
-интеграционные тесты на изолированных схемах ловили `53300` (слоты
-исчерпаны параллельными прогонами, комментарий в `postgresql.dev.conf`).
-`compose.yaml` не менялся: боевой PostgreSQL — пакет ОС (ТЗ §10.1), а не
-контейнер; интеграционные тесты работают тем же dev-сервером в изолированных
-схемах и настройками боя не связаны.
+`effective_io_concurrency=200`, lowered autovacuum factors); the memory
+amounts are dev-scale (`mem_limit` 1536m); `max_connections` = 130 — at 60
+the integration tests on isolated schemas hit `53300` (slots
+exhausted by parallel runs, the comment in `postgresql.dev.conf`).
+`compose.yaml` was not changed: production PostgreSQL is an OS package
+(spec §10.1), not a
+container; the integration tests run on the same dev server in isolated
+schemas and are unrelated to production settings.
 
-### Соединения
+### Connections
 
-| Параметр | Значение | Обоснование |
+| Parameter | Value | Rationale |
 |---|---|---|
-| `listen_addresses` | `localhost` | Все сервисы на одном сервере (ТЗ §3.1): TCP только локально + unix-сокет, наружу PostgreSQL не экспонируется (ТЗ §9) |
-| `max_connections` | `50` | Верхняя граница бюджета ТЗ §6.3 (20–50). 8 сервисов × пул 5 (7 конвейерных + web) + dashboard (2 — задаёт его юнит; глобальный `CRAWLER_POSTGRES_POOL_SIZE` его переопределит) + `crawlerctl` (2) + админ ≈ 44–46; 3 слота резервирует `superuser_reserved_connections`. Каждый бэкенд ест память (§3.2) — больше нельзя |
+| `listen_addresses` | `localhost` | All services on one server (spec §3.1): TCP locally only + a unix socket; PostgreSQL is not exposed externally (spec §9) |
+| `max_connections` | `50` | The upper bound of the spec §6.3 budget (20–50). 8 services × a pool of 5 (7 pipeline ones + web) + the dashboard (2 — its unit sets it; the global `CRAWLER_POSTGRES_POOL_SIZE` would override it) + `crawlerctl` (2) + admin ≈ 44–46; 3 slots are reserved by `superuser_reserved_connections`. Every backend eats memory (§3.2) — no more is possible |
 
-### Память (бюджет ТЗ §3.2: ≈ 2,5 ГБ на весь инстанс)
+### Memory (the spec §3.2 budget: ≈ 2.5 GB for the whole instance)
 
-| Параметр | Значение | Обоснование / размен |
+| Parameter | Value | Rationale / trade-off |
 |---|---|---|
-| `shared_buffers` | `2GB` | Бюджет §3.2 «shared_buffers ≈ 2 ГБ» — 25 % RAM; остальное кэширует ОС |
-| `effective_cache_size` | `4GB` | Подсказка планировщику (2 ГБ буферов + page cache); память не выделяется |
-| `work_mem` | `16MB` | Память одного узла плана одного запроса. Точечные запросы по индексам + ленивые пулы → единовременно активны единицы тяжёлых узлов; worst case ~30 × 16 МБ ≈ 0,5 ГБ — бюджет бэкендов. Массовая работа идёт `COPY`/`unnest`-пачками и `work_mem` не тратит. Выше 32 МБ — вылезает из бюджета |
-| `maintenance_work_mem` | `256MB` | `CREATE INDEX`/миграции на партициях 30–50 млн строк (§6); разовая кратковременная память |
-| `autovacuum_work_mem` | `128MB` | Отдельный потолок воркеров вакуума (дефолт −1 делит `maintenance_work_mem`): 4 × 128 МБ и не конкурирует с миграциями. 128 МБ TID-массива ≈ 20 млн мёртвых строк — с триггером 0.02 реально на порядок меньше; при переполнении вакуум деградирует постраничным проходом, память не растёт |
+| `shared_buffers` | `2GB` | The §3.2 budget "shared_buffers ≈ 2 GB" — 25% of RAM; the OS caches the rest |
+| `effective_cache_size` | `4GB` | A hint to the planner (2 GB of buffers + the page cache); no memory is allocated |
+| `work_mem` | `16MB` | The memory of one plan node of one query. Point reads by indexes + lazy pools → only a few heavy nodes are active at a time; worst case ~30 × 16 MB ≈ 0.5 GB — the backends' budget. Bulk work goes in `COPY`/`unnest` batches and spends no `work_mem`. Above 32 MB it leaves the budget |
+| `maintenance_work_mem` | `256MB` | `CREATE INDEX`/migrations on partitions of 30–50M rows (§6); one-off short-lived memory |
+| `autovacuum_work_mem` | `128MB` | A separate cap for the vacuum workers (the default −1 divides `maintenance_work_mem`): 4 × 128 MB and no competition with migrations. A 128 MB TID array ≈ 20M dead rows — with the 0.02 trigger it is actually an order of magnitude less; on overflow vacuum degrades to a page-by-page pass, the memory does not grow |
 
-`MemoryMax` юнита — 3 ГБ, выше планового бюджета ≈ 2,5 ГБ: в окно
-обслуживания поверх `shared_buffers` 2 ГБ легитимно складываются пиковые
-`work_mem` (~0,5 ГБ), `maintenance_work_mem` (256 МБ — CREATE INDEX/миграции
-при работающих воркерах) и autovacuum (до 4 × 128 МБ) — до ~3 ГБ; потолок,
-равный бюджету, убивал бы бэкенд cgroup-OOM вместо защищаемого режима
-(ТЗ 11.4 п. 7). Как у Redis ([redis.md](redis.md) §7), потолок — страховка
-над бюджетом, а не резервация: штатно инстанс живёт в ≈ 2,5 ГБ.
+The unit's `MemoryMax` is 3 GB, above the planned budget of ≈ 2.5 GB: in a
+maintenance window, on top of `shared_buffers` of 2 GB, peak
+`work_mem` (~0.5 GB), `maintenance_work_mem` (256 MB — CREATE INDEX/migrations
+while workers run) and autovacuum (up to 4 × 128 MB) legitimately add up
+to ~3 GB; a cap equal to the budget would kill a backend with a cgroup OOM
+instead of the protected mode
+(spec 11.4 item 7). As with Redis ([redis.md](redis.md) §7), the cap is a guard
+above the budget, not a reservation: normally the instance lives within
+≈ 2.5 GB.
 
-### Планировщик и NVMe (ТЗ §6.3)
+### Planner and NVMe (spec §6.3)
 
-| Параметр | Значение | Обоснование |
+| Parameter | Value | Rationale |
 |---|---|---|
-| `random_page_cost` | `1.1` | Случайное чтение с NVMe почти не дороже последовательного; дефолт 4.0 неоправданно штрафует index scan, а нагрузка — точечные чтения по PK/индексам и bitmap-сканы партиций |
-| `effective_io_concurrency` | `200` | ТЗ «≥ 200»: глубина очереди NVMe переваривает упреждающие чтения bitmap heap scan |
-| `maintenance_io_concurrency` | `200` | Prefetch VACUUM и построения индексов на больших партициях — вакуум не становится узким местом |
-| `default_statistics_target` | `100` | Дефолт; для ключей выборки (label, check_state через частичный индекс) достаточно |
+| `random_page_cost` | `1.1` | Random reads from NVMe are hardly more expensive than sequential ones; the default of 4.0 unfairly penalizes index scan, while the workload is point reads by PK/indexes and bitmap scans of partitions |
+| `effective_io_concurrency` | `200` | Spec "≥ 200": the NVMe queue depth digests the prefetch reads of a bitmap heap scan |
+| `maintenance_io_concurrency` | `200` | Prefetch for VACUUM and index builds on large partitions — vacuum does not become the bottleneck |
+| `default_statistics_target` | `100` | The default; enough for the selection keys (label, check_state via the partial index) |
 
-### WAL и надёжность (ТЗ §6, §3.4)
+### WAL and durability (spec §6, §3.4)
 
-`synchronous_commit = off` — прямо предписано ТЗ §6 («для данных краулера»).
-Размен: при потере сервера (не падения процесса) теряются коммиты последних
-~3 × `wal_writer_delay` ≈ 0,3 с. Все записи идемпотентны и
-восстанавливаемы повторной постановкой/проверкой (§3.4, §6.3: бэкапы не
-требуются) — потеря результата оборачивается лишней проверкой, а не потерей
-данных. Взамен пакетные COMMIT (пачки `COPY`, `UPDATE … FROM unnest`) не
-ждут `fsync` на каждую транзакцию — критично при миллиардах обновлений за
-цикл. Миграции: DDL и запись версии идут одним коммитом — потерянный коммит
-откатывает и пометку, и изменения схемы, повторный старт накатит миграцию
-заново, рассинхрона нет.
+`synchronous_commit = off` is prescribed directly by spec §6 ("for crawler data").
+The trade-off: on the loss of a server (not a process crash), the commits of the
+last ~3 × `wal_writer_delay` ≈ 0.3 s are lost. All writes are idempotent and
+recoverable by re-enqueueing/re-checking (§3.4, §6.3: no
+backups required) — losing a result costs an extra check, not a loss of
+data. In exchange, batched COMMITs (batches of `COPY`, `UPDATE … FROM unnest`)
+do not wait for an `fsync` per transaction — critical with billions of updates
+per cycle. Migrations: the DDL and the version record go in one commit —
+a lost commit rolls back both the marker and the schema changes; the next start
+applies the migration
+again, no desync.
 
-| Параметр | Значение | Обоснование / размен |
+| Parameter | Value | Rationale / trade-off |
 |---|---|---|
-| `wal_writer_delay` | `100ms` | Окно потери ≤ ~0,3 с (3 интервала — задел на пропуск флаша); 10 фоновых fsync/с — ничто для NVMe |
-| `wal_compression` | `on` | Сжимает full-page images: меньше записей на чекпойнтах — меньше износ (ТЗ §10.3; сводная оценка TBW — [`disks.md`](disks.md)), копеечный CPU |
-| `checkpoint_timeout` | `15min` | Реже чекпойнты — меньше full-page writes и износа NVMe (§10.3, оценка — [`disks.md`](disks.md)) |
-| `max_wal_size` / `min_wal_size` | `8GB` / `2GB` | «Свободного места много» (§3.1). Размен: crash recovery реплеит ≤ 8 ГБ WAL — минуты на NVMe, приемлемо для восстанавливаемых данных |
-| `checkpoint_completion_target` | `0.9` | Растянуть сброс грязных страниц на весь интервал — без пиков записи/латентности |
+| `wal_writer_delay` | `100ms` | The loss window ≤ ~0.3 s (3 intervals — headroom for a missed flush); 10 background fsyncs/s — nothing for NVMe |
+| `wal_compression` | `on` | Compresses full-page images: fewer writes at checkpoints — less wear (spec §10.3; a summary TBW estimate — [`disks.md`](disks.md)), a negligible CPU cost |
+| `checkpoint_timeout` | `15min` | Less frequent checkpoints — fewer full-page writes and less NVMe wear (§10.3, the estimate — [`disks.md`](disks.md)) |
+| `max_wal_size` / `min_wal_size` | `8GB` / `2GB` | "Plenty of free space" (§3.1). The trade-off: crash recovery replays ≤ 8 GB of WAL — minutes on NVMe, acceptable for recoverable data |
+| `checkpoint_completion_target` | `0.9` | Spread the flush of dirty pages over the whole interval — without write/latency spikes |
 
-Вклад WAL в износ NVMe оценен сводно по нагрузке краулера —
-[`disks.md`](disks.md) «Оценка TBW»: запись тома PostgreSQL ≈ 0,5–1 ТБ за
-первый цикл (3–6 ГБ/день в стеди-стейте) — на фоне 5–15 ТБ записи контента
-за полгода; режим WAL (`synchronous_commit=off` сокращает fsync, но не
-байты) и редкие чекпойнты выбраны в том числе по §10.3.
+WAL's contribution to NVMe wear is estimated as a summary over the crawler load —
+[`disks.md`](disks.md) "TBW estimate": PostgreSQL volume writes ≈ 0.5–1 TB per
+the first cycle (3–6 GB/day in steady state) — against the background of
+5–15 TB of content writes over half a year; the WAL mode
+(`synchronous_commit=off` reduces fsyncs, but not
+bytes) and rare checkpoints were chosen partly per §10.3.
 
-### Autovacuum под партиции `domains`/`subdomain_results` (ТЗ §6.3)
+### Autovacuum for the `domains`/`subdomain_results` partitions (spec §6.3)
 
-Нагрузка: листовые партиции по 30–50 млн строк (§6, хэш-подпартиционирование
-миграции 000003), частые UPDATE `check_state`/`last_checked_at` (HOT при
-`fillfactor` 85, миграции 000001/000002), первичный ingest 350 млн строк
-через COPY, массовые переводы done→pending суточной перепроверки (T-030);
-с T-166 — фоновые HOT-очистки `content_hash`/jsonb не-находок (retention,
-пачки по `content.retention_batch`, docs/content.md): мёртвые версии тех
-же строк в том же ритме, что у перепроверок, отдельного тюнинга не
-требуют — вставочные триггеры и `scale_factor` ниже закрывают темп.
-Разовая кампания по историческому массиву (T-167) даёт разовый всплеск
-мёртвых версий — по её следам VACUUM (ANALYZE) затронутых партиций
-вручную и контроль bloat (процедура — [`runbooks.md`](runbooks.md) §5.4).
+The load: leaf partitions of 30–50M rows each (§6, the hash subpartitioning of
+migration 000003), frequent UPDATEs of `check_state`/`last_checked_at` (HOT at
+`fillfactor` 85, migrations 000001/000002), the primary ingest of 350M rows
+via COPY, bulk done→pending transitions of the daily recheck (T-030);
+since T-166 — background HOT cleanups of the `content_hash`/jsonb of non-finds
+(retention, batches by `content.retention_batch`, docs/content.md): dead
+versions of the same rows in the same rhythm as the rechecks need no separate
+tuning — the insert triggers and the `scale_factor` below cover the pace.
+A one-off campaign over the historical array (T-167) gives a one-off spike of
+dead versions — after it, VACUUM (ANALYZE) the affected partitions
+manually and watch the bloat (the procedure —
+[`runbooks.md`](runbooks.md) §5.4).
 
-**Решение: настройки только на уровне конфига, per-table `ALTER … SET` в
-миграциях не используется.** Партиции создаются динамически по зонам/хэшу —
-per-table значения пришлось бы дублировать в каждой создаваемой партиции
-(миграция 000003, `crawlerctl zones`), а глобальный конфиг покрывает все
-существующие и будущие партиции разом и переносится между серверами.
+**Decision: settings at the config level only; per-table `ALTER … SET` in
+migrations is not used.** Partitions are created dynamically per zone/hash —
+per-table values would have to be duplicated into every created partition
+(migration 000003, `crawlerctl zones`), while the global config covers all
+existing and future partitions at once and carries over between servers.
 
-| Параметр | Значение | Обоснование / размен |
+| Parameter | Value | Rationale / trade-off |
 |---|---|---|
-| `autovacuum_naptime` | `30s` | Тысячи листовых партиций: при дефолтных 60 с дальние партиции ждут воркера циклами |
-| `autovacuum_max_workers` | `4` | Дефолт 3 — очередь работ на тысячах партиций; память воркеров ограничена `autovacuum_work_mem` |
-| `autovacuum_vacuum_scale_factor` | `0.02` | Триггер: 0,02 × (30–50 млн) = 0,6–1 млн мёртвых строк на партицию против 6–10 млн у дефолта 0.2. Bloat зажат ~2 %, каждый вакуум короткий — 4 воркера успевают; вместе с fillfactor 85 страницы быстро возвращаются в оборот под HOT-версии |
-| `autovacuum_vacuum_insert_scale_factor` | `0.02` | Вставочный триггер (PG13+): COPY не создаёт мёртвых строк, но без вакуума не выставляется visibility map — деградируют index-only scan'ы частичного индекса `domains (check_state = 0)` и не идёт заморозка. Вакуум/ANALYZE на каждые ~2 % прироста ingest'а |
-| `autovacuum_analyze_scale_factor` | `0.01` | Распределение `check_state` постоянно течёт (pending→queued→done), от него зависит план частичного индекса планировщика (§5.3); ANALYZE дёшев (выборка ~30 тыс. строк) |
-| `autovacuum_vacuum_cost_limit` | `2000` | Дефолтные 200 кредитов (лимит делится на воркеров, тик 2 мс) душат вакуум на тысячах партиций — он не успевает за темпом обновлений, копится bloat. 2000 ≈ 125 тыс. страниц/с на воркера — NVMe переваривает |
+| `autovacuum_naptime` | `30s` | Thousands of leaf partitions: at the default 60 s, far-away partitions wait for a worker for cycles on end |
+| `autovacuum_max_workers` | `4` | The default of 3 — a work queue across thousands of partitions; the workers' memory is capped by `autovacuum_work_mem` |
+| `autovacuum_vacuum_scale_factor` | `0.02` | The trigger: 0.02 × (30–50M) = 0.6–1M dead rows per partition versus 6–10M at the default 0.2. Bloat is held at ~2%, each vacuum is short — 4 workers keep up; together with fillfactor 85, pages quickly return to circulation for HOT versions |
+| `autovacuum_vacuum_insert_scale_factor` | `0.02` | The insert trigger (PG13+): COPY creates no dead rows, but without a vacuum the visibility map is never set — the index-only scans of the partial index `domains (check_state = 0)` degrade and freezing does not happen. Vacuum/ANALYZE per ~2% of ingest growth |
+| `autovacuum_analyze_scale_factor` | `0.01` | The `check_state` distribution keeps drifting (pending→queued→done); the planner's plan for the partial index depends on it (§5.3); ANALYZE is cheap (a sample of ~30 thousand rows) |
+| `autovacuum_vacuum_cost_limit` | `2000` | The default 200 credits (the limit is divided among the workers, a 2 ms tick) throttle vacuum on thousands of partitions — it cannot keep up with the update pace and bloat accumulates. 2000 ≈ 125 thousand pages/s per worker — NVMe digests it |
 
-### Мониторинг (ТЗ §5.9)
+### Monitoring (spec §5.9)
 
-`shared_preload_libraries = 'pg_stat_statements'` (запросы сервису monitor),
-`track_io_timing = on` (ввод-вывод — оценка эффекта NVMe-тюнинга),
-`track_functions = pl` (статистика SQL-функции `domain_info`, T-082);
-логи — от `warning`, время UTC.
+`shared_preload_libraries = 'pg_stat_statements'` (queries for the monitor
+service),
+`track_io_timing = on` (I/O — to assess the effect of the NVMe tuning),
+`track_functions = pl` (statistics of the `domain_info` SQL function, T-082);
+logs from `warning`, UTC time.
 
-`log_min_duration_statement = 3000` (T-177) — лог медленных запросов:
-каждый оператор дольше 3 с пишется в журнал сервера строкой
-`duration: … ms` с полным текстом и параметрами. Обоснование порога:
-боевые запросы конвейера — точечные по индексам (миллисекунды), 3 с —
-патология (потерянный индекс, блокировка, деградация плана), а не
-шум; цена — только запись превысивших порог (длительность PostgreSQL
-измеряет всегда), рестарт не нужен (reload). Дублер порога — цикл
-медленных запросов monitor (`internal/monitor/slowqueries.go`,
-`monitor.slow_query_min_duration`): опрашивает `pg_stat_activity` и
-отправляет выполняемые дольше порога операторы в Telegram той же
-доставкой, что алерты, при `monitor.slow_query_telegram` (по умолчанию
-выключена — Warn в журнал и метрики; debounce pid+query_start; свои
-агрегаты monitor исключены по `application_name` пула, метки сервисов
-в сообщении — от
-туда же; полный посмертный след остаётся в журнале сервера). Для текста
-чужих сессий в `pg_stat_activity` роли БД нужен
-`GRANT pg_read_all_stats` (deploy.md §4.1) — без него сообщение честно
-помечает «текст недоступен».
+`log_min_duration_statement = 3000` (T-177) — the slow query log:
+every statement longer than 3 s is written to the server log as a line
+`duration: … ms` with the full text and parameters. The rationale for the
+threshold:
+the pipeline's production queries are point reads by indexes (milliseconds); 3 s is
+pathology (a lost index, a lock, a plan degradation), not
+noise; the cost is only logging those above the threshold (PostgreSQL
+always measures duration), no restart needed (reload). The backstop of the
+threshold — the monitor slow query loop
+(`internal/monitor/slowqueries.go`,
+`monitor.slow_query_min_duration`): it polls `pg_stat_activity` and
+sends statements running longer than the threshold to Telegram with the same
+delivery as alerts, when `monitor.slow_query_telegram` is on (off by default
+— a Warn to the log and the metrics; debounce by pid+query_start; monitor's own
+aggregates are excluded by the pool's `application_name`; the service labels
+in the message come from
+there too; the full post-mortem trace stays in the server log). To read other
+sessions' texts in `pg_stat_activity` the DB role needs
+`GRANT pg_read_all_stats` (deploy.md §4.1) — without it the message honestly
+marks "text unavailable".
 
-`log_lock_waits = on` (T-192) — наблюдаемость держателя блокировок:
-каждая сессия, ждущая лок дольше `deadlock_timeout` (1 с), пишет в
-журнал строку `process N still waiting for ShareLock on transaction X …`
-— по ней следующий конвой называется держатель (pid, транзакция).
-Разбор инцидента 25.10 показал: без параметра имя держателя не
-восстановимо задним числом — жертвы видны (журнал медленных), владелец
-локов нет. Цена — несколько строк только в минуты реального
-конкурентного ожидания; reload-параметр (как `log_min_duration_statement`,
-переносится на сервер заменой конфига + `systemctl reload postgresql` —
-запись в журнале работ [operations.md](operations.md) §5).
+`log_lock_waits = on` (T-192) — lock holder observability:
+every session waiting for a lock longer than `deadlock_timeout` (1 s) writes to
+the log a line `process N still waiting for ShareLock on transaction X …`
+— the next convoy is named after it: the holder (pid, transaction).
+The 25.10 incident analysis showed: without the parameter the holder's identity
+is not reconstructable after the fact — the victims are visible (the slow log),
+the lock owner is not. The cost is a few lines only during minutes of real
+concurrent waiting; a reload parameter (like `log_min_duration_statement`,
+delivered to the server by replacing the config + `systemctl reload postgresql` —
+an entry in the operations runbook [operations.md](operations.md) §5).
 
-## Тесты
+## Tests
 
-- Юнит (`internal/db/*_test.go`, без БД): сборка `pgxpool.Config`
-  (дефолты, приоритет `pool_size` над DSN, валидация, fail-fast на
-  недоступном сервере), текст генерируемого SQL, AfterConnect-хуки —
-  контракт `LockTimeout` (константа 30 с, текст SET, отказ
-  неположительной длительности) и композиция `JoinHooks` (T-192),
-  проводка хуков пула http-worker — состав `afterConnectHooks`
-  (`cmd/http-worker/main_test.go`, T-201), разбивка потока на пачки,
-  ошибки источника, отмена между пачками, валидация аргументов.
-- Интеграционные (`test/integration/db_test.go`, живой PostgreSQL
-  dev-окружения): реальный COPY пачками со спецсимволами и юникодом,
-  отмена посреди потока (в БД ровно законченные пачки), пакетный UPDATE
-  c охраной и разными значениями по строкам, RETURNING, пачка 70 000 строк,
-  хук `LockTimeout` — сессия пула видит `SHOW lock_timeout`, ожидание
-  строки дольше потолка получает SQLSTATE 55P03 (T-192).
-  Тесты работают в собственной схеме `db_test_*` и не затрагивают рабочую
-  схему `crawler`.
+- Unit (`internal/db/*_test.go`, no DB): building `pgxpool.Config`
+  (defaults, the priority of `pool_size` over the DSN, validation, fail-fast on
+  an unreachable server), the text of the generated SQL, the AfterConnect hooks —
+  the `LockTimeout` contract (the 30 s constant, the SET text, the rejection
+  of a non-positive duration) and the `JoinHooks` composition (T-192),
+  the http-worker pool hook wiring — the composition of `afterConnectHooks`
+  (`cmd/http-worker/main_test.go`, T-201), stream splitting into batches,
+  source errors, cancellation between batches, argument validation.
+- Integration (`test/integration/db_test.go`, the live PostgreSQL of the
+  dev environment): a real batched COPY with special characters and unicode,
+  cancellation mid-stream (exactly the finished batches are in the DB), a
+  batched UPDATE with a guard and different per-row values, RETURNING, a batch
+  of 70 000 rows,
+  the `LockTimeout` hook — a pool session sees `SHOW lock_timeout`; waiting
+  for a row longer than the cap gets SQLSTATE 55P03 (T-192).
+  The tests run in their own `db_test_*` schema and do not touch the working
+  `crawler` schema.
