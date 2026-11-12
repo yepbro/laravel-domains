@@ -1,461 +1,452 @@
-# Redis: транспорт очередей и конфигурация
+# Redis: the queue transport and configuration
 
-Redis в проекте — только транспорт задач (Redis Streams с consumer groups,
-ТЗ 4.2): шесть стримов `q:dns`, `q:http`, `q:render`, `q:render-fallback`
-(очередь фолбэка рендера на Chromium, ТЗ 4.3), `q:analyze`, `q:dead`
-и их группы. Источник истины — PostgreSQL (ТЗ 3.4): потеря Redis не фатальна,
-задачи восстанавливает планировщик по lease. Этот принцип определяет выборы
-памяти и персистентности — см. размены ниже.
+In this project Redis is only a task transport (Redis Streams with consumer groups,
+spec 4.2): six streams `q:dns`, `q:http`, `q:render`, `q:render-fallback`
+(the queue of the render fallback to Chromium, spec 4.3), `q:analyze`, `q:dead`
+and their groups. The source of truth is PostgreSQL (spec 3.4): losing Redis is not fatal,
+the tasks are restored by the scheduler via the lease. This principle determines the memory
+and persistence choices — see the trade-offs below.
 
-Содержание:
+Contents:
 
-- [Конфигурации: dev и бой](#1-конфигурации-dev-и-бой)
-- [Что лежит в Redis](#2-что-лежит-в-redis)
-- [Память: бюджет и четыре уровня защиты](#3-память-бюджет-и-четыре-уровня-защиты)
-- [Политика eviction: почему noeviction](#4-политика-eviction-почему-noeviction)
-- [Персистентность: почему выключена](#5-персистентность-почему-выключена)
-- [Сеть и прочие параметры](#6-сеть-и-прочие-параметры)
-- [systemd и MemoryMax](#7-systemd-и-memorymax)
-- [Проверка конфигурации](#8-проверка-конфигурации)
+- [Configurations: dev and production](#1-configurations-dev-and-production)
+- [What is stored in Redis](#2-what-is-stored-in-redis)
+- [Memory: the budget and four layers of protection](#3-memory-the-budget-and-four-layers-of-protection)
+- [Eviction policy: why noeviction](#4-eviction-policy-why-noeviction)
+- [Persistence: why it is disabled](#5-persistence-why-it-is-disabled)
+- [Network and other settings](#6-network-and-other-settings)
+- [systemd and MemoryMax](#7-systemd-and-memorymax)
+- [Checking the configuration](#8-checking-the-configuration)
 
-## 1. Конфигурации: dev и бой
+## 1. Configurations: dev and production
 
-| | Dev (docker) | Бой (сервер) |
+| | Dev (docker) | Production (server) |
 |---|---|---|
-| Файл | `deploy/docker/redis/redis.dev.conf` | `deploy/redis/redis.conf` → `/etc/redis/redis.conf` |
-| Запуск | контейнер `compose` (профиль по умолчанию), `mem_limit 256m` | пакет ОС Ubuntu под systemd (ТЗ 10.1; юниты — `deploy/systemd/`, T-085) |
-| Сеть | `bind 0.0.0.0`, `protected-mode no` — изолированная docker-сеть `crawler_net` | `bind 127.0.0.1 -::1`, `protected-mode yes` — все сервисы на том же сервере |
-| `maxmemory` | `224mb` (ниже `mem_limit` контейнера, чтобы OOM убивал не Redis) | `512mb` — бюджет ТЗ 3.2 |
+| File | `deploy/docker/redis/redis.dev.conf` | `deploy/redis/redis.conf` → `/etc/redis/redis.conf` |
+| Launch | the `compose` container (the default profile), `mem_limit 256m` | the Ubuntu OS package under systemd (spec 10.1; the units — `deploy/systemd/`, T-085) |
+| Network | `bind 0.0.0.0`, `protected-mode no` — the isolated docker network `crawler_net` | `bind 127.0.0.1 -::1`, `protected-mode yes` — all the services on the same server |
+| `maxmemory` | `224mb` (below the container `mem_limit`, so that the OOM killer hits not Redis) | `512mb` — the spec 3.2 budget |
 | `maxmemory-policy` | `noeviction` | `noeviction` |
-| Персистентность | нет (`save ""`, `appendonly no`) | нет (`save ""`, `appendonly no`) |
+| Persistence | none (`save ""`, `appendonly no`) | none (`save ""`, `appendonly no`) |
 
-Оба конфига согласованы по сути (eviction, персистентность), различаются
-только сетевой привязкой и лимитом памяти среды. Параметры подключения
-сервисов (`redis.addr`, по умолчанию `127.0.0.1:6379`) — в
-[`configuration.md`](configuration.md), раздел `redis`.
+Both configs agree in substance (eviction, persistence), differing only
+in the network binding and the memory limit of the environment. The connection parameters
+of the services (`redis.addr`, by default `127.0.0.1:6379`) — in
+[`configuration.md`](configuration.md), the `redis` section.
 
-## 2. Что лежит в Redis
+## 2. What is stored in Redis
 
-- Ключи-стримы `q:*` и вложенные в них consumer groups: записи сообщений
-  (поле `data` с JSON-конвертом, форматы — `internal/queue/message.go`),
-  pending-списки групп (PEL — прочитанные, но не подтверждённые записи) и
-  счётчики доставок (счётчик попыток `max_attempts` живёт в PEL, T-025).
-  Подтверждённый (XACK) префикс стримов не копится: его освобождает
-  цикл планировщика XTRIM MINID (T-141, §3), в стримах живут только
-  недоставленное и неподтверждённое.
-- Прикладные ключи с TTL — два. Короткоживущая проба записи
-  `crawler:queue:write-probe` (T-152): SET с TTL 2 ч, обновляется живым
-  RecoverLoop (гейт клейма — пока Redis отвергает записи, попытки
-  доставок не расходуются). Множества тарпит-классифицированных
-  доставок рендера `render:tarpit:{task_id}` (T-261, ТЗ-fsm §3 ФТ-7):
-  тарпит-финализация решается по числу доставок, завершившихся таймаутом
-  страницы (SCARD ≥ `render.timeout_attempts`), а не по номеру доставки
-  PEL — смешанные серии не финализируют раньше порога. Член множества —
-  «entry-id#номер-доставки» (SADD идемпотентен по доставке), TTL 48 ч
-  (2× горизонт ретраев эпизода) освежается каждой отметкой; бюджет — по
-  одному множеству ~150–250 Б на тарпит-задачу в окне TTL, worst case
-  «все слоты рендера — тарпиты» (16 контекстов × 25 с ≈ 0,64 доставки/с
-  ≈ 110 тыс. доставок за 48 ч, 2 доставки на задачу) — ~55 тыс.
-  множеств ≈ 10–15 МиБ, кратно меньше запаса бюджета §3; реальную долю
-  тарпитов видно по `crawler_render_tarpit_finalized_total`
-  (docs/render.md). Потеря Redis (ошибка команд) — деградация решения к
-  номеру доставки PEL (поведение до T-261), потеря самих ключей при
-  живом Redis — счёт заново: раньше порога не финализирует. Прочих
-  данных (кэшей, pub/sub-состояний) Redis не держит. Сервисы работают
-  в db 0; db 15 выделена интеграционным тестам устойчивости
-  (dev-конфиг, 16 БД).
-- Терять нельзя только записи «в полёте» (pending без результата в БД) —
-  и те восстанавливаемы: домен в `queued` с истёкшим lease вернётся в
-  `pending` и задача будет переиздана (T-029, ТЗ 3.4).
+- The stream keys `q:*` and the consumer groups nested in them: the message entries
+  (the `data` field with a JSON envelope, the formats — `internal/queue/message.go`),
+  the pending lists of the groups (the PEL — entries read but not acknowledged) and
+  the delivery counters (the attempt counter `max_attempts` lives in the PEL, T-025).
+  The acknowledged (XACK) prefix of the streams does not accumulate: it is freed by
+  the scheduler XTRIM MINID loop (T-141, §3); in the streams live only
+  the undelivered and the unacknowledged.
+- The application keys with a TTL — two. The short-lived write probe
+  `crawler:queue:write-probe` (T-152): a SET with a TTL of 2 h, refreshed by the live
+  RecoverLoop (the claim gate — while Redis rejects the writes, the delivery
+  attempts are not spent). The sets of the tarpit-classified
+  render deliveries `render:tarpit:{task_id}` (T-261, TZ-fsm spec §3 FR-7):
+  the tarpit finalization is decided by the number of deliveries that ended with a page timeout
+  (SCARD ≥ `render.timeout_attempts`), and not by the PEL delivery number —
+  mixed streaks do not finalize earlier than the threshold. A set member is
+  “entry-id#delivery-number” (SADD is idempotent per delivery), a TTL of 48 h
+  (2× the retry horizon of an episode) is refreshed by each mark; the budget — one
+  set of ~150–250 B per tarpit task within the TTL window, worst case
+  “all the render slots are tarpits” (16 contexts × 25 s ≈ 0.64 deliveries/s
+  ≈ 110 thousand deliveries over 48 h, 2 deliveries per task) — ~55 thousand
+  sets ≈ 10–15 MiB, a multiple below the headroom of the §3 budget; the real share
+  of tarpits is visible in `crawler_render_tarpit_finalized_total`
+  (docs/render.md). The loss of Redis (a command error) — a degradation of the decision to
+  the PEL delivery number (the behavior before T-261), the loss of the keys themselves with
+  a live Redis — the count anew: it will not finalize earlier than the threshold. Other
+  data (caches, pub/sub states) Redis does not hold. The services run
+  in db 0; db 15 is allotted to the resilience integration tests
+  (the dev config, 16 DBs).
+- Only the entries “in flight” (pending without a result in the DB) must not be lost —
+  and those are recoverable: a domain in `queued` with an expired lease returns to
+  `pending` and the task will be re-published (T-029, spec 3.4).
 
-## 3. Память: бюджет и четыре уровня защиты
+## 3. Memory: the budget and four layers of protection
 
-ТЗ 3.2 даёт Redis ≤ 0,5 ГБ — в бою `maxmemory 512mb` (данные), в dev
-224 МБ под контейнер 256 МБ. Порядок защиты от переполнения — от мягкого
-к жёсткому:
+Spec 3.2 gives Redis ≤ 0.5 GB — in production `maxmemory 512mb` (data), in dev
+224 MB under a 256 MB container. The order of protection against overflow — from soft
+to hard:
 
-1. **Backpressure (T-026)** — мягкое регулирование: планировщик и воркеры
-   публикуют только при глубине стрима (backlog группы потребителей:
-   непрочитанный остаток `lag`, ограниченный длиной стрима, плюс
-   неподтверждённые `pending`, XINFO GROUPS + XLEN) строго ниже
-   `scheduler.queue_high_watermark`; выше — публикация ждёт, в лог
-   уходит одна Warn. Исключение — `q:render`: публикация там
-   неблокирующая (§5.6: рендер не задерживает остальные этапы), ворота
-   ёмкости — отдельный `render.queue_high_watermark` (T-174; 0 —
-   общий, дефолт 10 тыс. ≈ 2 ч потребления): закрыты — домен получает
-   флаг `render_pending` (T-066), тот же кламп MAXLEN/2. `q:render-fallback`
-   и `q:dead` не гейтируются вовсе (п. 3 ниже). Эффективный
-   порог стрима не выше половины его
-   MAXLEN — гейт срабатывает до обрезки (для `q:dns` это 125 пачек
-   ≈ 8 МиБ, для штучных `q:http`/`q:analyze` — 75 000 записей
-   ≈ 52 МиБ; `q:render` — 10 тыс., см. таблицу ниже). Ограничение лага
-   длиной стрима — кламп T-168: `lag` = `entries_added − entries_read`
-   не вычитает записи, срезанные обрезкой недоставленными, и Redis
-   7.0.x (прод) держит фантомный лаг вечно — инцидент 22–23.10.2026
-   (дренаж T-149 оставил lag 1753 при XLEN 1, гейт `q:dns` закрыт
-   ~15,5 ч; разбор — runbooks §2.7). Redis 7.4+ корректирует лаг при
-   обрезке сам, кламп делает гейт независимым от версии сервера:
-   реальный бэклог не занижается (пока недоставленные в стриме,
-   lag ≤ XLEN), фантом отсекается. Эта же формула — единственная
-   глубина очередей в проекте (`queue.GroupDepth`, backpressure.go):
-   гейт, `crawlerctl status`, `crawler_queue_depth`, алерт
-   `queue_frozen` (T-162) и строка «📬 Очереди» отчёта нагрузки
-   (T-173, с T-188) считают её общим расчётом — наблюдение не имеет
-   права разойтись с гейтом о том, есть ли работа; XLEN как глубина
-   остаётся только у стрима без групп (накопление без потребителя) и
-   карантина `q:dead` (инвентарь оператора). Сырой XLEN глубиной не
-   бывает: подтверждённая история до обрезки — не очередь (расхождение
-   25.10: отчёт печатал XLEN и завышал `q:render` в ~5 раз при
-   остановленном морозкой TrimLoop — разобрано в журнале работ
+1. **Backpressure (T-026)** — soft regulation: the scheduler and the workers
+   publish only when the stream depth (the backlog of the consumer group:
+   the unread remainder `lag`, bounded by the stream length, plus
+   the unacknowledged `pending`, XINFO GROUPS + XLEN) is strictly below
+   `scheduler.queue_high_watermark`; above — the publication waits, one Warn goes to the log. The exception — `q:render`: the publication there
+   is non-blocking (§5.6: the render does not delay the other stages), the capacity
+   gate — a separate `render.queue_high_watermark` (T-174; 0 —
+   shared, the default 10K ≈ 2 h of consumption): closed — the domain gets
+   the `render_pending` flag (T-066), the same MAXLEN/2 clamp. `q:render-fallback`
+   and `q:dead` are not gated at all (item 3 below). The effective
+   threshold of a stream is not higher than half of its
+   MAXLEN — the gate fires before the trim (for `q:dns` it is 125 batches
+   ≈ 8 MiB, for the individual-entry `q:http`/`q:analyze` — 75,000 entries
+   ≈ 52 MiB; `q:render` — 10K, see the table below). Bounding the lag
+   by the stream length — the clamp of T-168: `lag` = `entries_added − entries_read`
+   does not subtract the entries cut off by the trim as undelivered, and Redis
+   7.0.x (production) holds the phantom lag forever — the incident of 22–23.10.2026
+   (the T-149 drain left a lag of 1,753 at XLEN 1, the gate of `q:dns` closed
+   for ~15.5 h; the analysis — runbooks §2.7). Redis 7.4+ corrects the lag on
+   the trim by itself, the clamp makes the gate independent of the server version:
+   the real backlog is not understated (as long as the undelivered are in the stream,
+   lag ≤ XLEN), the phantom is cut off. The same formula is the only
+   queue depth in the project (`queue.GroupDepth`, backpressure.go):
+   the gate, `crawlerctl status`, `crawler_queue_depth`, the alert
+   `queue_frozen` (T-162) and the “📬 Queues” line of the load report
+   (T-173, with T-188) compute it by one shared formula — an observation has no
+   right to diverge from the gate on whether there is work; XLEN as the depth
+   remains only for a stream without groups (an accumulation without a consumer) and
+   the quarantine of `q:dead` (the operator's inventory). A raw XLEN is never a depth: the acknowledged history before the trim is not a queue (the discrepancy
+   of 25.10: the report printed XLEN and overstated `q:render` ~5-fold with
+   the TrimLoop stopped by the freeze — analyzed in the operations journal
    [operations.md](operations.md)).
-2. **Освобождение подтверждённого префикса (T-141, ТЗ 4.2 «Дополнение
-   2026-10-23»)** — `XACK` убирает запись из PEL группы, но не из стрима:
-   подтверждённая история копилась бы до потолка MAXLEN и переполняла
-   бюджет (инцидент T-093: сток `q:dns` 1735 пачек ≈ 410 МиБ,
-   «OOM command not allowed», публикации render/analyze падали).
-   Цикл планировщика (`queue.TrimLoop`, `redis.trim_interval`, по
-   умолчанию 1 мин) делает `XTRIM MINID` по старейшей записи, обязанной
-   остаться: старейшая pending группы (всё ниже доставлено и
-   подтверждено — зависший PEL не теряется), при пустом pending —
-   `last-delivered-id` (недоставленный хвост остаётся). Почему XTRIM
-   MINID, а не XDEL после Ack: три команды на стрим за проход (~15/мин
-   на пять стримов) против дополнительной команды на каждую
-   подтверждённую запись (тысячи в минуту на пике HTTP-этапа); XTRIM —
-   атомарная команда, гонка между чтением точки и обрезкой безопасна
-   (новые pending появляются только выше `last-delivered`, id записей
-   монотонны); PEL и lag групп не затрагиваются (недоставленное не
-   обрезается; фантомный лаг от посторонней обрезки недоставленного —
-   клампом гейта, п. 1). Механизм повторяет проверенное серверное
-   решение инцидента (юнит `t092-trimhist`); пока планировщик
-   остановлен, стримы держатся потолками MAXLEN.
-   Интеграционная гарантия — `TestResilience_TrimConfirmedPrefix`
-   (`test/integration/resilience_test.go`): после «публикация →
-   потребление → XACK → TrimOnce» длина стрима возвращается к граничной
-   записи, память ключа не растёт с числом обработанных.
-3. **MAXLEN ~ (T-025)** — аварийный потолок длины каждого стрима
-   (числа — таблица §3.1): неограниченного роста ключей нет
-   (350 млн доменов × несколько стримов); до него гейт уже остановил
-   публикацию рабочих стримов
-   (`q:dead` и `q:render-fallback` гейтом не ограничиваются: перенос
-   в карантин блокироваться не должен, а публикация фолбэка — часть
-   финализации рендера, ожидание ёмкости задержало бы XACK задачи
-   q:render — патология T-066; поток фолбэка держат бюджет доли
-   и темп воркера B, ТЗ 4.3 п.3). Бюджет `q:dead` считается в байтах,
-   а не только записями (T-105): записи **не несут payload исходной
-   задачи** — только идентификаторы предмета (~150–300 Б на запись,
-   пачка `q:dns` — размер вместо списка доменов), поэтому потолок
-   10 000 ≈ 2–3 МБ. С payload пачек `q:dns` эпохи batch_size 5000
-   (~250 КБ на запись — исторический контекст T-105) тот же потолок
-   давал worst-case ~2,5 ГБ — кратно больше бюджета при `noeviction`
-   (отказ всего транспорта), поэтому байтовая защита сделана формой
-   записи, а не обрезкой по расписанию.
-4. **`maxmemory` + `noeviction`** — последний рубеж: при исчерпании 512 МБ
-   записи отклоняются с ошибкой `OOM` (см. ниже), данные не портятся.
+2. **Freeing the acknowledged prefix (T-141, spec 4.2 “Supplement
+   2026-10-23”)** — `XACK` removes the entry from the group PEL, but not from the stream:
+   the acknowledged history would accumulate to the MAXLEN cap and overflow the
+   budget (the T-093 incident: the `q:dns` sink 1,735 batches ≈ 410 MiB,
+   “OOM command not allowed”, the render/analyze publications failed).
+   The scheduler loop (`queue.TrimLoop`, `redis.trim_interval`, by
+   default 1 min) runs `XTRIM MINID` at the oldest entry that must
+   remain: the oldest pending of the group (everything below is delivered and
+   acknowledged — a stuck PEL is not lost), with an empty pending —
+   `last-delivered-id` (the undelivered tail remains). Why XTRIM
+   MINID and not XDEL after the Ack: three commands per stream per pass (~15/min
+   across five streams) against an extra command per each
+   acknowledged entry (thousands per minute at the peak of the HTTP stage); XTRIM is
+   an atomic command, the race between reading the point and the trim is safe
+   (new pending appear only above `last-delivered`, the entry ids
+   are monotonic); the group PEL and lag are not touched (the undelivered is not
+   trimmed; the phantom lag from a third-party trim of the undelivered —
+   by the gate clamp, item 1). The mechanism reproduces the proven server-side
+   solution of the incident (the `t092-trimhist` unit); while the scheduler
+   is stopped, the streams are held by the MAXLEN caps.
+   The integration guarantee — `TestResilience_TrimConfirmedPrefix`
+   (`test/integration/resilience_test.go`): after “publishing →
+   consuming → XACK → TrimOnce” the stream length returns to the boundary
+   entry, and the key memory does not grow with the number of processed entries.
+3. **MAXLEN ~ (T-025)** — the emergency cap of the length of each stream
+   (the numbers — the table §3.1): there is no unbounded growth of keys
+   (350 million domains × several streams); before it the gate has already stopped
+   the publication to the working streams
+   (`q:dead` and `q:render-fallback` are not bounded by the gate: the transfer
+   into quarantine must not be blocked, and the publication of the fallback is part
+   of the render finalization — waiting for capacity would delay the XACK of the task
+   of q:render — the pathology of T-066; the fallback flow is held by the budget of the share
+   and the pace of worker B, spec 4.3 item 3). The budget of `q:dead` is counted in bytes,
+   and not only in entries (T-105): the entries **do not carry the payload of the original
+   task** — only the identifiers of the subject (~150–300 B per entry,
+   a `q:dns` batch — the size instead of the domain list), so the cap
+   10,000 ≈ 2–3 MB. With the payload of the `q:dns` batches of the era of batch_size 5000
+   (~250 KB per entry — the historical context T-105) the same cap
+   gave a worst-case ~2.5 GB — a multiple of the budget at `noeviction`
+   (the failure of the whole transport), so the byte protection is made a property of the entry shape,
+   and not a scheduled trim.
+4. **`maxmemory` + `noeviction`** — the last line: at the exhaustion of 512 MB
+   the entries are rejected with the error `OOM` (see below), the data is not corrupted.
 
-### 3.1. Арифметика бюджета по фактическим размерам записей
+### 3.1. The budget arithmetic by the actual entry sizes
 
-Замеры: пачка `q:dns` из 1000 доменов (`scheduler.batch_size`) ≈ 64 КиБ
-— ~66 Б на домен с накладными стрима (замер T-141 на живом Redis 7.4,
-MEMORY USAGE; прежняя оценка «237 КиБ на пачку» относилась к пачкам эпохи
-batch_size 5000 — инцидентные 1735 батчей = 410 МиБ ≈ 3,7 тыс. доменов
-в пачке); штучные записи `q:http`/`q:render`/`q:analyze` ≈ 0,3–0,7 КиБ
-(docs/load-measurements.md §11, а не «100–200 байт» прежней оценки
-T-025). Сумма потолков MAXLEN обязана укладываться в бюджет: при
-`noeviction` потолок выше бюджета означал бы отказ записи (OOM) раньше
-обрезки — ровно это случилось в инциденте T-093 (старые потолки:
-`q:dns` 10 000 пачек ≈ 2,3 ГиБ).
+Measurements: a `q:dns` batch of 1,000 domains (`scheduler.batch_size`) ≈ 64 KiB
+— ~66 B per domain with the stream overhead (the T-141 measurement on a live Redis 7.4,
+MEMORY USAGE; the earlier estimate “237 KiB per batch” referred to the batches of the era of
+batch_size 5000 — the incident 1,735 batches = 410 MiB ≈ 3.7 thousand domains
+per batch); the individual entries of `q:http`/`q:render`/`q:analyze` ≈ 0.3–0.7 KiB
+(docs/load-measurements.md §11, and not the “100–200 bytes” of the earlier estimate
+T-025). The sum of the MAXLEN caps must fit the budget: at
+`noeviction` a cap above the budget would mean a write rejection (OOM) earlier
+than the trim — exactly this happened in the T-093 incident (the old caps:
+`q:dns` 10,000 batches ≈ 2.3 GiB).
 
-| Стрим | MAXLEN | Размер записи | Потолок | Гейт (min(watermark, MAXLEN/2)) |
+| Stream | MAXLEN | Entry size | Cap | Gate (min(watermark, MAXLEN/2)) |
 |---|---|---|---|---|
-| `q:dns` | 250 пачек | 64 КиБ (1000 доменов) | ≈ 16 МиБ | 125 пачек ≈ 8 МиБ |
-| `q:http` | 150 000 | 0,3–0,7 КиБ | ≈ 103 МиБ | 75 000 ≈ 52 МиБ |
-| `q:render` | 150 000 | 0,3–0,7 КиБ | ≈ 103 МиБ | 10 000 ≈ 7 МиБ (`render.queue_high_watermark`, T-174; 0 — общий → 75 000) |
-| `q:render-fallback` | 15 000 | 0,3–0,7 КиБ | ≈ 10 МиБ | — (не гейтится: потолок — бюджет доли и темп воркера B, ТЗ 4.3 п.3) |
+| `q:dns` | 250 batches | 64 KiB (1,000 domains) | ≈ 16 MiB | 125 batches ≈ 8 MiB |
+| `q:http` | 150,000 | 0.3–0.7 KiB | ≈ 103 MiB | 75,000 ≈ 52 MiB |
+| `q:render` | 150,000 | 0.3–0.7 KiB | ≈ 103 MiB | 10,000 ≈ 7 MiB (`render.queue_high_watermark`, T-174; 0 — shared → 75,000) |
+| `q:render-fallback` | 15,000 | 0.3–0.7 KiB | ≈ 10 MiB | — (not gated: the cap — the budget of the share and the pace of worker B, spec 4.3 item 3) |
 
-Связка потолка с контрольным рейтом выбора движка (сверхраунд ревью,
-S-P3-6): контрольный fallback-рейт канарейки — ≤15 % потока (ТЗ §5.3),
-т.е. при живом воркере B (темп ≥ притока) глубина далеко ниже потолка.
-Потолок 15 000 — последний рубеж памяти: сценарий потери задач —
-остановленный B **и** проигнорированный алерт глубины (7 500) одновременно;
-контроль «глубина ≪ 15 000» — в приёмке ТЗ §6.2 (v0.2). Поднимать потолок
-нельзя (бюджет 480 МиБ), снижать дефолт бюджета доли ниже контрольного
-рейта — рвало бы штатную работу движка-кандидата.
-| `q:analyze` | 150 000 | 0,3–0,7 КиБ | ≈ 103 МиБ | 75 000 ≈ 52 МиБ |
-| `q:dead` | 10 000 | ~0,2 КиБ (без payload, T-105) | ≈ 2 МиБ | — (не гейтится) |
-| **Итого** | | | **≈ 337 МиБ** | одновременно ≈ 119 МиБ (гейт q:render — 10 тыс. ≈ 7 МиБ, T-174) |
+The coupling of the cap with the control rate of the engine selection (the extra review round,
+S-P3-6): the control fallback rate of the canary — ≤15% of the flow (spec §5.3),
+i.e. with a live worker B (the pace ≥ the inflow) the depth is far below the cap.
+The cap 15,000 — the last line of memory: the scenario of task loss —
+a stopped B **and** an ignored depth alert (7,500) at the same time;
+the control “depth ≪ 15,000” — in the acceptance of spec §6.2 (v0.2). Raising the cap
+is not allowed (the budget 480 MiB), lowering the default of the share budget below the control
+rate — would break the routine work of the candidate engine.
+| `q:analyze` | 150,000 | 0.3–0.7 KiB | ≈ 103 MiB | 75,000 ≈ 52 MiB |
+| `q:dead` | 10,000 | ~0.2 KiB (without payload, T-105) | ≈ 2 MiB | — (not gated) |
+| **Total** | | | **≈ 337 MiB** | simultaneously ≈ 119 MiB (the q:render gate — 10K ≈ 7 MiB, T-174) |
 
-512 МиБ − 337 МиБ ≈ 175 МиБ запаса — служебная память Redis,
-фрагментация аллокатора, буферы клиентов и рост записей с длинными
-именами (межобрезочный остаток TrimLoop — минута подтверждённых
-записей: `q:dns` ≤ 60 пачек ≈ 3,8 МиБ при темпе постановки пачка/с,
-штучные ≈ 2 МиБ на стрим — и сам ограничен потолками MAXLEN). Даже
-одновременная остановка всех
-потребителей при живых продюсерах (гейты-full: 8 + 3 × 52 + 2 МиБ
-≈ 166 МиБ) оставляет две трети бюджета; в здоровой системе занятость —
-десятки МиБ (глубины у нуля, между проходами TrimLoop — секунды записей).
+512 MiB − 337 MiB ≈ 175 MiB of headroom — the service memory of Redis,
+the allocator fragmentation, the client buffers and the growth of entries with long
+names (the between-trims remainder of TrimLoop — a minute of acknowledged
+entries: `q:dns` ≤ 60 batches ≈ 3.8 MiB at an enqueue pace of a batch/s,
+individual ≈ 2 MiB per stream — and itself bounded by the MAXLEN caps). Even
+a simultaneous stop of all the
+consumers with live producers (the gates full: 8 + 3 × 52 + 2 MiB
+≈ 166 MiB) leaves two thirds of the budget; in a healthy system the occupancy —
+tens of MiB (the depths near zero, between the TrimLoop passes — seconds of entries).
 
-Размер пачки `q:dns` настраивается (`scheduler.batch_size`
-1000..10000, ТЗ 5.3): потолок стрима пропорционален ей, поэтому предел
-q:dns выбран из худшей нормативной пачки — инвариант «сумма потолков
-≤ бюджета» для всей вилки (худший случай: пачка 10 000 доменов →
-q:dns ≈ 157 МиБ, сумма ≈ 478 МиБ) зафиксирован пин-тестами `queue.TestStreamPolicyFitsBudget`
-и `config.TestSchedulerBatchFitsStreamBudget` (от фактической границы
-валидации). Потолок `q:render-fallback` (15 000 — десятая часть
-штучного: фолбэк-поток ограничен бюджетом доли и темпом воркера B,
-ТЗ 4.3/ФТ-9) согласован с тем же инвариантом: штучные 150 000 делали
-бы худшую сумму ≈ 570 МиБ — пробитие бюджета. Потолок фолбэка —
-последний рубеж памяти, а не рабочий регулятор: стоячую глубину
-держат бюджет доли (T-239) и темп воркера B (T-240), рост ловит алерт
-глубины (ТЗ 4.6 п.3); усечённое неподтверждённое возвращается только
-перепроверкой recheck — как и у прочих потолков MAXLEN. Явный `redis.maxlen` —
-сознательный выход из политики: его арифметику считает оператор. Оговорка dev:
-арифметика этого раздела — боевой бюджет 512 МиБ; dev-Redis
-(`maxmemory 224mb`) ниже суммы потолков, но dev-нагрузка на порядки
-меньше (глубины у нуля), а до T-141 потолки были ≥ 500 МиБ на один
-штучный стрим — dev стал только безопаснее.
+The `q:dns` batch size is configurable (`scheduler.batch_size`
+1000..10000, spec 5.3): the stream cap is proportional to it, so the q:dns limit is chosen for the worst normative batch — the invariant “the sum of the caps
+≤ the budget” for the whole range (the worst case: a batch of 10,000 domains →
+q:dns ≈ 157 MiB, the sum ≈ 478 MiB) is pinned by the pin tests `queue.TestStreamPolicyFitsBudget`
+and `config.TestSchedulerBatchFitsStreamBudget` (from the actual validation
+boundary). The cap `q:render-fallback` (15,000 — one tenth of
+the individual-entry one: the fallback flow is bounded by the budget of the share and the pace of worker B,
+spec 4.3/FR-9) is agreed with the same invariant: individual-entry 150,000 would make
+the worst sum ≈ 570 MiB — a budget breach. The fallback cap —
+the last line of memory, and not a working regulator: the standing depth
+is held by the budget of the share (T-239) and the pace of worker B (T-240), growth is caught by the depth alert
+(spec 4.6 item 3); the trimmed unacknowledged comes back only via a recheck —
+as with the other MAXLEN caps. The explicit `redis.maxlen` —
+a deliberate exit from the policy: its arithmetic is counted by the operator. The dev caveat:
+the arithmetic of this section — the production budget of 512 MiB; dev Redis
+(`maxmemory 224mb`) is below the sum of the caps, but the dev load is orders of magnitude
+smaller (the depths near zero), and before T-141 the caps were ≥ 500 MiB for one
+individual-entry stream — dev became only safer.
 
-### 3.2. Временные меры инцидента T-093 — снять после T-141
+### 3.2. The temporary measures of the T-093 incident — remove after T-141
 
-Во время инцидента на сервере подняты runtime-надбавки памяти и внешний
-trim-цикл. После влития T-141 они избыточны (освобождение встроено
-в scheduler) и подлежат снятию:
+During the incident the runtime memory bonuses and the external
+trim loop were raised on the server. After the merge of T-141 they are redundant (the freeing is built in
+the scheduler) and are subject to removal:
 
 ```bash
-systemctl disable --now t092-trimhist   # внешний XTRIM MINID-цикл
-# /etc/redis/redis.conf: вернуть maxmemory 512mb (была 900mb),
-# юниту redis (T-085) — MemoryMax=640M (было 1G); затем
+systemctl disable --now t092-trimhist   # the external XTRIM MINID loop
+# /etc/redis/redis.conf: revert maxmemory 512mb (it was 900mb),
+# to the redis unit (T-085) — MemoryMax=640M (it was 1G); then
 systemctl restart redis
 ```
 
-## 4. Политика eviction: почему noeviction
+## 4. Eviction policy: why noeviction
 
-Сравнение вариантов для нашего keyspace (только стримы и группы, ТЗ 3.4 —
-всё восстанавливается из PostgreSQL):
+The comparison of the options for our keyspace (only streams and groups, spec 3.4 —
+everything is restored from PostgreSQL):
 
-| Политика | Поведение при исчерпании | Размен |
+| Policy | Behavior at exhaustion | Trade-off |
 |---|---|---|
-| `volatile-ttl` / `volatile-lru` | Вытесняет только ключи с TTL | Ключей с TTL нет — политика вырождается в `noeviction`, создавая ложное чувство защиты |
-| `allkeys-lru` / `allkeys-lfu` | Молча удаляет ключи целиком | Eviction в Redis работает на уровне целых ключей: ключ-стрим исчезает вместе со **всем** содержимым, consumer groups и PEL (сообщения «в полёте», счётчики попыток T-025), а следующие `XADD` молча пересоздают стрим уже без групп — ни одной ошибки издателям. Давно не читаемый `q:dead` — первый кандидат. Задачи исчезают без следа в логах |
-| `noeviction` (выбрано) | Отклоняет записи (`OOM command not allowed when used memory > 'maxmemory'`) | Публикация падает ошибкой — воркеры/планировщик логируют Warn и живут (ТЗ 3.4: сбой компонента не блокирует остальных), ни одна принятая запись не теряется |
+| `volatile-ttl` / `volatile-lru` | Evicts only the keys with a TTL | There are no keys with a TTL — the policy degenerates into `noeviction`, creating a false sense of protection |
+| `allkeys-lru` / `allkeys-lfu` | Silently deletes whole keys | Eviction in Redis works at the level of whole keys: a stream key disappears together with **all** the contents, the consumer groups and the PEL (the “in flight” messages, the T-025 attempt counters), and the next `XADD`s silently recreate the stream already without the groups — not a single error to the publishers. The long-unread `q:dead` — the first candidate. The tasks disappear without a trace in the logs |
+| `noeviction` (chosen) | Rejects the entries (`OOM command not allowed when used memory > 'maxmemory'`) | The publication fails with an error — the workers/scheduler log a Warn and live on (spec 3.4: the failure of a component does not block the others), not a single accepted entry is lost |
 
-Обе альтернативы проверены на `redis:7.4` (30 000 `XADD` в один стрим с
-заранее созданной группой, `maxmemory 2mb`): `allkeys-lru` принял все
-записи молча, но при достижении лимита удалил ключ стрима целиком —
-первые ~17 000 записей и группа исчезли, следующие `XADD` пересоздали
-стрим без группы, в итоге осталось 12 874 записи и ни одного отказа
-записи; `noeviction` принял 17 211, остальные отверг с ошибкой `OOM` —
-и все принятые целы, группа на месте. Громкий отказ — видимый сигнал
-дежурному (и метрикам monitor, T-077/T-080), тихая порча — нет.
+Both alternatives were checked on `redis:7.4` (30,000 `XADD` into one stream with
+a group created in advance, `maxmemory 2mb`): `allkeys-lru` accepted all the
+entries silently, but on reaching the limit deleted the stream key whole —
+the first ~17,000 entries and the group disappeared, the next `XADD` recreated
+the stream without the group, in the end 12,874 entries remained and not a single write
+rejection; `noeviction` accepted 17,211, rejected the rest with the error `OOM` —
+and all the accepted are intact, the group is in place. A loud rejection — a visible signal
+to the on-duty operator (and to the monitor metrics, T-077/T-080), a silent corruption — is not.
 
-Выбор **`noeviction`** — осознанное продолжение архитектуры «Redis —
-расходуемый транспорт»: громкий отказ записи предпочтительнее тихой порчи,
-потому что (а) до потолка публикацию останавливает гейт backpressure
-задолго до 512 МБ, (б) стримы уже ограничены MAXLEN, (в) даже полная потеря
-Redis штатно восстанавливается lease-проходом (T-029, интеграционный тест
-T-032). Eviction же не даёт ничего: от усечения защищает MAXLEN, а
-«спасение памяти» ценой молчаливой потери сообщений и PEL противоречит
-at-least-once-доставке (ТЗ 3.4). Dev-конфиг использует ту же политику.
+The choice of **`noeviction`** — a deliberate continuation of the architecture “Redis —
+an expendable transport”: a loud write rejection is preferable to a silent corruption,
+because (a) up to the cap the publication is stopped by the backpressure gate
+long before 512 MB, (b) the streams are already bounded by MAXLEN, (c) even the complete loss of
+Redis is routinely restored by the lease pass (T-029, the integration test
+T-032). Eviction gives nothing: MAXLEN protects from the truncation, and
+“saving memory” at the price of a silent loss of messages and the PEL contradicts
+at-least-once delivery (spec 3.4). The dev config uses the same policy.
 
-Подтверждение на бою (22–23.10.2026): OOM-окно (легаси-пачки `q:dns`
-≈620 МиБ поверх временно поднятого maxmemory, T-093) около двух часов
-отвергало XADD публикации результатов ошибкой `OOM command not allowed`
-(16 953 отказа у http-worker, 1953 у render-worker, 392 у dns-worker,
-243 у планировщика) — громкий отказ, видимый в журналах; стримы, группы
-и PEL уцелели, данные не испорчены. Побочный эффект — массовый рост
-`q:dead` (ошибка публикации жгла попытки клеймами): сигнатура,
-диагностика и разбор — [`runbooks.md`](runbooks.md) §2.6, пост-мортем —
+Confirmation in production (22–23.10.2026): the OOM window (the legacy batches of `q:dns`
+≈620 MiB on top of the temporarily raised maxmemory, T-093) for about two hours
+rejected the result publication XADDs with the error `OOM command not allowed`
+(16,953 rejections at http-worker, 1,953 at render-worker, 392 at dns-worker,
+243 at the scheduler) — a loud rejection, visible in the journals; the streams, the groups
+and the PEL survived, the data is not corrupted. A side effect — a mass growth of
+`q:dead` (the publication error burned the attempts by claims): the signature,
+the diagnostics and the triage — [`runbooks.md`](runbooks.md) §2.6, the post-mortem —
 [`load-measurements.md`](load-measurements.md) §11.1.
 
-### 4.1. Поведение при OOM: OOM не сжигает попытки (T-152)
+### 4.1. OOM behavior: OOM does not burn attempts (T-152)
 
-Ошибка публикации — ошибка инфраструктуры, а не задачи: результат уже
-вычислен, повторная обработка дала бы тот же отказ записи. После T-152
-конвейер переживает OOM-окно без потерь попыток (до T-152 одно окно
-2,25 ч стоило 5507 смертей в `q:dead` при полностью исправной обработке):
+A publication error — an infrastructure error, not a task one: the result is already
+computed, a reprocessing would give the same write rejection. After T-152
+the pipeline survives an OOM window without attempt losses (before T-152 one window
+of 2.25 h cost 5,507 deaths in `q:dead` at fully working processing):
 
-- **Классификация** — `queue.InfraError` (internal/queue/infra.go):
-  OOM/LOADING/READONLY-ответы сервера и транспортные сбои (обрыв
-  соединения, таймаут, пул) маркируются в `Publish` (XADD) и `Ack`;
-  ошибки обработки (БД результата, декодирование) маркером не
-  оборачиваются — их повторные доставки осмысленны. Ошибки воркеров
-  проходят маркер через `%w`-цепочки (`queue.IsInfra`).
-- **Повтор публикации** — XADD при инфраструктурном сбое повторяется
-  2 раза с удвоением паузы от 250 мс (≈0,75 с худший случай): секундные
-  флапы соединения закрываются на месте, без круга клейм (каждый клейм —
-  +1 доставка к лимиту `redis.max_attempts`).
-- **Пауза потребления** — http/render-воркеры по `InfraError` публикации
-  останавливают чтение своих стримов до восстановления записи (проба
-  `Reliab.Writable`, fuse-паттерн T-139/T-142): черпать задачи, чьи
-  результаты не записать, бессмысленно — они копились бы в PEL. Режимы
-  читателя (чтение | пауза-браузер | пауза-инфра | пауза-предохранитель |
-  пауза-темп; в q:http браузер и темп не смонтированы — режимы
-  недостижимы) формализованы автоматами `internal/renderworker/
-  readerstate.go` и `internal/httpworker/readerstate.go` (T-262): режим
-  прохода выбирает одна функция над наблюдениями (`Alive`, `Writable`,
-  `failed`, allowance), приоритеты пауз — таблица переходов там же;
-  инфра-пауза стрим не читает — попытки доставок не горят.
-- **Гейт клейма** — RecoverLoop перед каждым проходом проверяет запись
-  (SET короткоживущего ключа `crawler:queue:write-probe`): пока Redis
-  отвергает записи, клейм пропускается — счётчик доставок PEL
-  (XPENDING `RetryCount`) не растёт. Запись восстановилась — клейм
-  возвращает доставки, обработка доводит их до XACK: задачи проходят
-  OOM-окно с максимум +1 доставкой, не попадая в `q:dead`.
+- **Classification** — `queue.InfraError` (internal/queue/infra.go):
+  the OOM/LOADING/READONLY server responses and the transport failures (a connection
+  drop, a timeout, the pool) are marked in `Publish` (XADD) and `Ack`;
+  processing errors (the result DB, decoding) are not wrapped with the marker — their repeated
+  deliveries are meaningful. The worker errors carry the marker through the `%w` chains (`queue.IsInfra`).
+- **Publication retry** — XADD at an infrastructure failure is retried
+  2 times with a doubling of the pause from 250 ms (≈0.75 s worst case): second-scale
+  connection flaps are closed on the spot, without a circle of claims (each claim —
+  +1 delivery toward the `redis.max_attempts` limit).
+- **Consumption pause** — the http/render workers on a publication `InfraError`
+  stop reading their streams until the write is restored (the probe
+  `Reliab.Writable`, the fuse pattern of T-139/T-142): drawing tasks whose
+  results cannot be written is pointless — they would accumulate in the PEL. The reader modes (reading | browser pause | infra pause | fuse pause | rate pause; in q:http the browser and the rate are not mounted — the modes
+  are unreachable) are formalized by the state machines of
+  `internal/renderworker/readerstate.go` and `internal/httpworker/readerstate.go` (T-262): the pass mode is chosen by one function over the observations (`Alive`, `Writable`,
+  `failed`, allowance), the pause priorities — the transition table there;
+  the infra pause does not read the stream — the delivery attempts do not burn.
+- **Claim gate** — RecoverLoop before each pass checks the write (a SET of the short-lived key `crawler:queue:write-probe`): while Redis
+  rejects the writes, the claim is skipped — the PEL delivery counter
+  (XPENDING `RetryCount`) does not grow. The write is restored — the claim
+  returns the deliveries, the processing carries them to XACK: the tasks pass
+  the OOM window with at most +1 delivery, not getting into `q:dead`.
 
-Интеграционная проверка сценария (живой Redis, `maxmemory` ниже
-использования) — `TestResilience_OOMDoesNotBurnAttempts`
+The integration check of the scenario (a live Redis, `maxmemory` below
+the usage) — `TestResilience_OOMDoesNotBurnAttempts`
 (test/integration/resilience_test.go).
 
-### 4.2. Отмена RecoverLoop не сжигает попытки (T-222)
+### 4.2. A RecoverLoop cancellation does not burn attempts (T-222)
 
-Второй источник дожигания попыток (рядом с OOM §4.1) — отмена цикла
-возврата посреди заклеймленной пачки. Семантика `XAUTOCLAIM`: счётчик
-доставок PEL (XPENDING `RetryCount`) инкрементируется **всем записям
-пачки в момент клейма**, а не в момент начала обработки записи.
-RecoverLoop обходит пачку последовательно (рендер — секунды на запись),
-бюджет graceful shutdown — 10 с (`ShutdownTimeout` каркаса service,
-конфигурацией не меняется): останов посреди пачки оставлял хвост
-с сожжённой попыткой без единого вызова обработчика. Минус попытка за
-рестарт; после `redis.max_attempts` задача уходила в `q:dead`,
-не обработавшись ни разу, — тот же механизм, что жёг когорту
-в инциденте 22.10 (гейт §4.1 закрывает недоступный Redis, отмену
-контекста он не видит).
+The second source of attempt burn-down (next to the OOM §4.1) — a cancellation of the recovery loop
+in the middle of a claimed batch. The semantics of `XAUTOCLAIM`: the PEL delivery counter
+(XPENDING `RetryCount`) is incremented for **all the entries of
+the batch at the moment of the claim**, and not at the moment of the start of processing of the entry.
+RecoverLoop walks the batch sequentially (the render — seconds per entry),
+the graceful shutdown budget — 10 s (the `ShutdownTimeout` of the service
+framework, not changed by configuration): a stop in the middle of a batch left a tail
+with a burned attempt without a single handler call. Minus an attempt per
+restart; after `redis.max_attempts` the task went into `q:dead`,
+having not been processed even once — the same mechanism that burned the cohort
+in the 22.10 incident (the gate of §4.1 covers an unavailable Redis; it does not see
+a context cancellation).
 
-Фикс — возврат попытки необработанному хвосту: `XCLAIM <stream> <group>
-<consumer> 0 <ids…> JUSTID RETRYCOUNT <attempts-1>` под отдельным
-коротким контекстом (до 5 с внутри общего бюджета остановки, образец —
-discard в ingest): `RETRYCOUNT` устанавливает счётчик точным значением
-(перекрывает инкремент клейма, Redis ≥ 6.2), `JUSTID` экономит тела
-в ответе и сам по себе счётчик не трогает. Запись, начатая обработкой,
-попытку расходует — доставка состоялась. Классификация счётчиков после
-клейма переживает отмену ctx (без отмены вызывающего): классифицированные
-записи возвратимы с уже известным счётчиком. Возврат выполняется, пока
-обход пачки укладывается в `claim_min_idle` (инвариант T-153): после
-окна переклейма соседним воркером возврат погасил бы чужой инкремент —
-пропускается с Warn. Плата — `XCLAIM` обновляет время доставки:
-возвращённые записи снова зреют `claim_min_idle`. Границы (best
-effort): жёсткое убийство процесса между клеймом и возвратом или
-недоступный на остановке Redis оставляют попытки расходованы.
+The fix — the return of the attempt to the unprocessed tail: `XCLAIM <stream> <group>
+<consumer> 0 <ids…> JUSTID RETRYCOUNT <attempts-1>` under a separate
+short context (up to 5 s inside the overall stop budget, the sample —
+the discard in ingest): `RETRYCOUNT` sets the counter to the exact value
+(overriding the claim increment, Redis ≥ 6.2), `JUSTID` saves the bodies
+in the response and does not touch the counter by itself. An entry started by processing
+spends the attempt — the delivery has happened. The counter classification after
+the claim survives a ctx cancellation (without cancelling the caller): the classified
+entries are returnable with the already known counter. The return runs while
+the batch walk fits into `claim_min_idle` (the T-153 invariant): after
+a re-claim window by a neighboring worker the return would cancel a foreign increment —
+it is skipped with a Warn. The price — `XCLAIM` refreshes the delivery time:
+the returned entries ripen for `claim_min_idle` again. The boundaries (best
+effort): a hard kill of the process between the claim and the return, or
+Redis unavailable at the stop, leave the attempts spent.
 
-Интеграционная проверка на живом Redis (включая реальную семантику
-`XCLAIM JUSTID RETRYCOUNT` и `JUSTID` без `RETRYCOUNT`) —
+The integration check on a live Redis (including the real semantics
+of `XCLAIM JUSTID RETRYCOUNT` and `JUSTID` without `RETRYCOUNT`) —
 `TestResilience_CancelMidBatchDoesNotBurnAttempts`
 (test/integration/resilience_test.go).
 
-### 4.3. Незавершённая классификация и записи без task_id (T-260)
+### 4.3. Unfinished classification and entries without task_id (T-260)
 
-Окно возврата §4.2 расширено с «отмена ctx» на «любая незавершённая
-классификация» (T-260, ФТ-6.2 ТЗ-fsm): сбой чтения XPENDING после
-клейма (transient-ошибка, бюджет классификации) раньше сжигал попытку
-бесследно — запись без прочитанного счётчика не попадала в возврат.
-Теперь `Claim` отдаёт такие записи отдельным результатом, а
-`RefundUnclassified` читает счётчик **в момент возврата** (повторное
-XPENDING по каждой записи) и откатывает его же механизмом
-`XCLAIM JUSTID RETRYCOUNT <счётчик-1>`: повторный сбой чтения или
-недоступное окно `Do` оставляют попытку израсходованной (не хуже
-поведения до фикса — следующая успешная классификация решит судьбу
-записи). Бюджет возвратов прохода — один `refundTimeout` (5 с) на все
-возвраты (неклассифицированные записи и необработанный хвост при
-отмене): оба возврата реально случаются в одном проходе (сбой
-классификации + отмена), независимые бюджеты суммировались бы до 10 с —
-весь бюджет graceful shutdown. Живой Redis XPENDING не роняет —
-сценарий проверяется
-инъекцией сбоя в клиенте:
+The return window of §4.2 is extended from “a ctx cancellation” to “any unfinished
+classification” (T-260, FR-6.2 of TZ-fsm): a failure of the XPENDING read after
+the claim (a transient error, the classification budget) earlier burned an attempt
+without a trace — an entry without a read counter did not get into the return.
+Now `Claim` returns such entries as a separate result, and
+`RefundUnclassified` reads the counter **at the moment of the return** (a repeated
+XPENDING per each entry) and rolls it back by the same mechanism
+`XCLAIM JUSTID RETRYCOUNT <counter-1>`: a repeated read failure or
+an unavailable `Do` window leave the attempt spent (no worse than
+the behavior before the fix — the next successful classification will decide the fate
+of the entry). The return budget of a pass — one `refundTimeout` (5 s) for all
+the returns (the unclassified entries and the unprocessed tail at
+a cancellation): both returns really happen in one pass (a failure
+of classification + a cancellation), independent budgets would sum up to 10 s —
+the whole graceful shutdown budget. A live Redis does not crash XPENDING —
+the scenario is checked
+by injecting a failure into the client:
 `TestResilience_PendingFailureDoesNotBurnAttempts`
 (test/integration/resilience_test.go).
 
-Там же закрыт вечный цикл клейма записей без `task_id` (ФТ-6.1):
-тело вне форматов пакета раньше не переводилось в `q:dead` (bury
-отклонял перенос), запись крутилась в PEL по кругу «клейм → ошибка
-переноса». Теперь `bury` публикует Dead с синтетическим идентификатором
-`unknown:<стрим>:<entry_id>` (без предметных полей — субъект такого
-тела не идентифицировать) и подтверждает исходную запись: карантин
-терминален, разбор ручной, поток считает
-`crawler_queue_dead_unidentified_total` (стационарно ноль). Живая
-семантика — `TestResilience_DeadUnidentifiedNoTaskID`. Спецификация
-автомата доставки записи (состояния/переходы/инварианты) —
+There the eternal claim loop of the entries without `task_id` is closed (FR-6.1):
+a body outside the envelope formats earlier was not moved into `q:dead` (bury
+rejected the transfer), the entry spun in the PEL in a circle “claim → transfer
+error”. Now `bury` publishes Dead with a synthetic identifier
+`unknown:<stream>:<entry_id>` (without subject fields — the subject of such
+a body cannot be identified) and acknowledges the original entry: the quarantine
+is terminal, the triage is manual, the flow counts
+`crawler_queue_dead_unidentified_total` (a steady zero). The live
+semantics — `TestResilience_DeadUnidentifiedNoTaskID`. The specification
+of the entry delivery state machine (states/transitions/invariants) —
 `internal/queue/deliverystate.go`.
 
-## 5. Персистентность: почему выключена
+## 5. Persistence: why it is disabled
 
-`save ""` + `appendonly no` — как в dev. Аргументы:
+`save ""` + `appendonly no` — as in dev. The arguments:
 
-- ТЗ 3.4 прямо допускает потерю Redis: задачи восстанавливает планировщик.
-  Это закреплено интеграционным тестом `TestResilience_RedisLossSchedulerRecovery`
-  (T-032, `test/integration/resilience_test.go`): после удаления стримов и
-  групп lease-возврат (T-029) возвращает домены из `queued` в `pending`,
-  диспетчер (T-027) перевыбирает, постановка (T-028) переиздаёт, живой
-  воркер пересоздаёт группу после `NOGROUP` (`internal/queue/redisq.go`).
-  Ровно этот путь выполняется и при рестарте Redis без персистентности —
-  восстановление ограничено сроком lease (`scheduler.lease`, 30 минут),
-  а не скоростью загрузки AOF.
-- Цена AOF: fsync (`appendfsync everysec` — теряем до секунды задач, то
-  есть гарантий «в полёте» всё равно нет) на каждое XADD; нагрузка записи
-  высокая и так (ТЗ 10.3 — мониторинг износа NVMe, [`disks.md`](disks.md))
-  — добавлять поток записей ради данных, которые дешевле переиздать,
-  невыгодно. RDB-снапшоты той же проблемой не страдают, но и пользы
-  не дают: свежесть пачки задач не критична.
-- Что теряется при рестарте без персистентности: содержимое `q:dead` —
-  история исчерпавших попытки задач; недоставленные записи рабочих
-  стримов, ЧЬИ домены уже покинули `queued` — задача `q:http` при
-  записанном DNS-итоге «есть адреса» (check_state = done, статус new):
-  lease-проход такую строку не видит, её возвращает компенсатор
-  «статус повис» (T-270, часовой проход `new ∧ done` старше 24 ч —
-  gauge `new_done_stale`, ФТ-2.2 ТЗ-fsm; инцидент 22.10 — когорта
-  1865 доменов). Остальные задачи не теряются: их домены
-  остаются в `queued`/`leased`, lease-проход переиздаст, при повторных
-  отказах они вернутся в `q:dead`. Для «ручного разбора» (ТЗ 4.2) это
-  означает разбор по факту повторения, а не по накопленной истории.
+- Spec 3.4 explicitly allows the loss of Redis: the tasks are restored by the scheduler.
+  This is pinned by the integration test `TestResilience_RedisLossSchedulerRecovery`
+  (T-032, `test/integration/resilience_test.go`): after the streams and
+  groups are deleted the lease return (T-029) returns the domains from `queued` into `pending`,
+  the dispatcher (T-027) re-selects, the enqueueing (T-028) re-publishes, the live
+  worker recreates the group after `NOGROUP` (`internal/queue/redisq.go`).
+  Exactly this path also runs at a Redis restart without persistence —
+  the recovery is bounded by the lease term (`scheduler.lease`, 30 minutes),
+  and not by the AOF load speed.
+- The price of AOF: fsync (`appendfsync everysec` — we lose up to a second of tasks, that is
+  the “in flight” guarantees are absent anyway) on every XADD; the write
+  load is high already (spec 10.3 — the NVMe wear monitoring, [`disks.md`](disks.md))
+  — adding a write stream for the sake of data that is cheaper to re-publish,
+  is unprofitable. RDB snapshots do not suffer from the same problem, but give no
+  benefit either: the freshness of the task batch is not critical.
+- What is lost at a restart without persistence: the contents of `q:dead` —
+  the history of the tasks that exhausted the attempts; the undelivered entries of the working
+  streams WHOSE domains have already left `queued` — a `q:http` task with
+  a written DNS result “there are addresses” (check_state = done, status new):
+  the lease pass does not see such a row, the compensator “dangling status” returns it
+  (T-270, an hourly pass of `new ∧ done` older than 24 h —
+  the gauge `new_done_stale`, FR-2.2 of TZ-fsm; the incident of 22.10 — a cohort
+  of 1,865 domains). The other tasks are not lost: their domains
+  stay in `queued`/`leased`, the lease pass will re-publish, at repeated
+  rejections they return into `q:dead`. For “manual triage” (spec 4.2) this
+  means triage by the fact of recurrence, and not by the accumulated history.
 
-Включить AOF имеет смысл, только если замеры (ТЗ 11.3) покажут, что окно
-переиздания lease-проходом (до 30 минут простоя этапа после рестарта Redis)
-дороже износа диска; тогда — `appendonly yes`, `appendfsync everysec`,
-`aof-use-rdb-preamble yes` в `/etc/redis/redis.conf`.
+Enabling AOF makes sense only if the measurements (spec 11.3) show that the window
+of re-publishing by the lease pass (up to 30 minutes of stage downtime after a Redis restart)
+costs more than the disk wear; then — `appendonly yes`, `appendfsync everysec`,
+`aof-use-rdb-preamble yes` in `/etc/redis/redis.conf`.
 
-## 6. Сеть и прочие параметры
+## 6. Network and other settings
 
-- `bind 127.0.0.1 -::1`, `protected-mode yes` — все Go-сервисы на том же
-  сервере (ТЗ 3.1, 10.1) и ходят на `redis.addr 127.0.0.1:6379`; пароля в
-  конфигурации сервисов нет (`internal/config`, раздел `redis`), поэтому
-  наружу Redis не торчит. Префикс `-` у `::1` — «необязательный адрес»:
-  хост без IPv6 конфиг не ломает. Unix-сокет вместо TCP возможен
-  (`unixsocket`/`unixsocketperm 770` + доступ общей группе сервисов), но
-  усложняет юниты T-085 и не даёт измеримой выгоды на loopback.
-- `tcp-backlog 511` — соединений немного (в Redis ходят 7 из 9 сервисов —
-  scheduler, четыре воркера, monitor, dashboard; ingest и web — только
-  PostgreSQL; пулы go-redis
-  ленивые, воркеры держат по одному блокирующемуся в `XREADGROUP`
-  соединению), всплесков подключений нет; согласуется с
-  `net.core.somaxconn` хоста (T-088).
-- `timeout 0` + `tcp-keepalive 300` — соединения воркеров долгоживущие:
-  «простаивающее» соединение занято блокированным чтением (`BLOCK 2с`),
-  разрывать его — холостой реконнект; мёртвых клиентов выявляет keepalive.
-- `io-threads 1` (выключено) — нагрузка сотни команд/с (XADD/XREADGROUP/
-  XACK; темп задают DNS/HTTP-этапы), однопоточного ядра хватает на порядки;
-  польза потоков I/O начинается с десятков тысяч операций/с. Включать —
-  только по замерам ТЗ 11.3.
-- `databases 16` — как в dev: db 0 у сервисов, db 15 — контракт
-  интеграционных тестов устойчивости.
-- `supervised auto`, `daemonize no`, `logfile ""` — работа под systemd
-  (T-085) на переднем плане, логи в journald.
+- `bind 127.0.0.1 -::1`, `protected-mode yes` — all the Go services are on the same
+  server (spec 3.1, 10.1) and go to `redis.addr 127.0.0.1:6379`; there is no password in
+  the service configuration (`internal/config`, the `redis` section), so
+  Redis does not stick out outward. The prefix `-` at `::1` — an “optional address”:
+  a host without IPv6 does not break the config. A Unix socket instead of TCP is possible
+  (`unixsocket`/`unixsocketperm 770` + access by a shared services group), but
+  it complicates the units of T-085 and gives no measurable benefit on loopback.
+- `tcp-backlog 511` — the connections are few (7 of 9 services go into Redis —
+  the scheduler, four workers, monitor, dashboard; ingest and web — only
+  PostgreSQL; the go-redis
+  pools are lazy, the workers hold one connection blocked in `XREADGROUP`
+  each), no connection bursts; consistent with
+  the host `net.core.somaxconn` (T-088).
+- `timeout 0` + `tcp-keepalive 300` — the worker connections are long-lived: an “idle” connection is busy with a blocked read (`BLOCK 2s`),
+  tearing it down — an idle reconnect; dead clients are revealed by keepalive.
+- `io-threads 1` (off) — the load is hundreds of commands/s (XADD/XREADGROUP/
+  XACK; the pace is set by the DNS/HTTP stages), the single-threaded core suffices by orders of magnitude;
+  the benefit of the I/O threads starts at tens of thousands of ops/s. Turning on —
+  only by the measurements of spec 11.3.
+- `databases 16` — as in dev: db 0 for the services, db 15 — the contract
+  of the resilience integration tests.
+- `supervised auto`, `daemonize no`, `logfile ""` — running under systemd
+  (T-085) in the foreground, the logs in journald.
 
-## 7. systemd и MemoryMax
+## 7. systemd and MemoryMax
 
-`maxmemory` ограничивает только данные; поверх сидят буферы клиентов,
-фрагментация аллокатора и служебная память процесса. Поэтому systemd-юнит
-Redis (T-085) должен иметь `MemoryMax` **с запасом над `maxmemory`** —
-рекомендация `MemoryMax=640M` (512 МБ данных + ~128 МБ служебных): тогда
-при исчерпании памяти срабатывает `noeviction` (видимый отказ записи,
-Redis жив), а не OOM-killer systemd (шумный рестарт ради того же
-результата). Формально это чуть сверх строки «Redis ≤ 0,5 ГБ» ТЗ 3.2,
-но бюджет строки относится к данным (`maxmemory`), а реально занято
-в здоровой системе ~100 МБ (см. §3).
+`maxmemory` limits only the data; on top sit the client buffers,
+the allocator fragmentation and the service memory of the process. Therefore the systemd unit
+of Redis (T-085) must have `MemoryMax` **with headroom over `maxmemory`** —
+the recommendation `MemoryMax=640M` (512 MB of data + ~128 MB of service memory): then
+at memory exhaustion `noeviction` fires (a visible write rejection,
+Redis alive), and not the systemd OOM-killer (a noisy restart for the same
+result). Formally this is a bit above the line “Redis ≤ 0.5 GB” of spec 3.2,
+but the budget of the line refers to the data (`maxmemory`), and the actually occupied
+in a healthy system is ~100 MB (see §3).
 
-## 8. Проверка конфигурации
+## 8. Checking the configuration
 
-У `redis-server` нет режима «проверить конфиг» — проверяется запуском
-one-off контейнера с боевым конфигом (не трогает dev-стек). Нюанс: `dir`
-из файла применяется в момент разбора (сразу `chdir`), перекрытие
-`--dir` в аргументах не спасает — каталог монтируется томом:
+`redis-server` has no “check the config” mode — the check is by running a
+one-off container with the production config (does not touch the dev stack). A nuance: `dir`
+from the file is applied at the parsing moment (an immediate `chdir`), an override
+`--dir` in the arguments does not save — the directory is mounted as a volume:
 
 ```bash
 docker run --rm -d --name redis-conf-check \
@@ -465,17 +456,17 @@ docker run --rm -d --name redis-conf-check \
 docker exec redis-conf-check redis-cli CONFIG GET \
   maxmemory maxmemory-policy appendonly save bind protected-mode io-threads
 docker exec redis-conf-check redis-cli SET probe ok && \
-docker exec redis-conf-check redis-cli GET probe   # записи работают
+docker exec redis-conf-check redis-cli GET probe   # the writes work
 docker stop redis-conf-check && docker volume rm redis-conf-check
 ```
 
-`supervised auto` вне systemd тихо возвращается к работе без надзора.
-Смысловое содержимое (`CONFIG GET`) обязано совпасть с файлом; чистый
-запуск — синтаксическая валидация. Этим же способом проверено поведение
-eviction-политик (§4): `--maxmemory 2mb --maxmemory-policy allkeys-lru`
-против `noeviction` на потоке из 30 000 `XADD`.
+Outside systemd `supervised auto` quietly returns to running without supervision.
+The meaningful content (`CONFIG GET`) must match the file; a clean
+start — a syntax validation. The same way the behavior
+of the eviction policies was checked (§4): `--maxmemory 2mb --maxmemory-policy allkeys-lru`
+against `noeviction` on a flow of 30,000 `XADD`.
 
-При проверке в контейнере Redis печатает `WARNING Memory overcommit must
-be enabled!` — это рекомендация уровня хоста (`vm.overcommit_memory=1`,
-sysctl — территория T-088), и важна она только для фоновых сохранений
-RDB/AOF и репликации, которые в нашей конфигурации отключены.
+At the check in the container Redis prints `WARNING Memory overcommit must
+be enabled!` — this is a host-level recommendation (`vm.overcommit_memory=1`,
+sysctl — the territory of T-088), and it matters only for the background saves
+of RDB/AOF and replication, which are disabled in our configuration.
