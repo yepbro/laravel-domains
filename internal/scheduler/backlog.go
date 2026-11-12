@@ -1,24 +1,24 @@
-// Scheduler: коллектор глубины backlog (T-077, ТЗ 5.9): периодическое
-// чтение сумм счётчиков зон → gauge crawler_backlog_domains
-// {state=pending|queued} (T-178: справочник вместо прохода по domains).
+// Scheduler: backlog depth collector (T-077, spec 5.9): periodic
+// reads of zone counter sums → gauge crawler_backlog_domains
+// {state=pending|queued} (T-178: the reference table instead of a pass over domains).
 //
-// Архитектурное решение (где живёт фоновый SQL-опрос): в сервисе
-// scheduler — он владелец состояний domains (переводит pending → queued
-// в EnqueueBatch T-028, возвращает queued → pending по lease T-029 и
-// done → pending перепроверками T-030/T-031), имеет пул БД с самого
-// старта и не занят обменами; monitor не трогается (его территория —
-// реконсиляция счётчиков T-178 и алерты T-080). Длина стримов q:* —
-// отдельная метрика crawler_queue_depth у потребителей (internal/metrics/
-// collect.go); backlog из БД — «истинная» глубина: Redis-очередь
-// усечётся MAXLEN, потеряет задачи при сбое (восстановит планировщик,
-// ТЗ 3.4), а pending/queued в БД — полный объём невыполненной работы,
-// включая строки, ещё не попавшие в очередь.
+// Architectural decision (where the background SQL poll lives): in the
+// scheduler service — it owns the domain states (moves pending → queued
+// in EnqueueBatch T-028, returns queued → pending by lease T-029, and
+// done → pending via rechecks T-030/T-031), has a DB pool from the very
+// start and is not busy with exchanges; monitor is untouched (its territory is
+// counter reconciliation T-178 and alerts T-080). The length of the q:* streams is a
+// separate metric, crawler_queue_depth, at the consumers (internal/metrics/
+// collect.go); the backlog from the DB is the "true" depth: the Redis queue
+// is truncated by MAXLEN and loses tasks on failure (the scheduler restores them,
+// spec 3.4), while pending/queued in the DB is the full volume of unfinished work,
+// including rows that have not yet been enqueued.
 //
-// Счётчики отслеживают текущее состояние (gauge), а не наращиваются
-// (counter): backlog — уровень, а не событие; алерты T-080 (остановка
-// прогресса, переполнение) читают уровень. deleted исключены базовым
-// множеством счётчиков (§13.1 — удалённые не проверяются), done не
-// считается: прогресс по зонам — счётчики domains_checked (monitor,
+// The counters track the current state (gauge) and do not accumulate:
+// backlog is a level, not an event; alerts T-080 (progress
+// stall, overflow) read the level. deleted are excluded by the base
+// counter set (§13.1 — deleted domains are not checked), done is not
+// counted: progress over zones is tracked by the domains_checked counters (monitor,
 // T-078).
 package scheduler
 
@@ -36,31 +36,31 @@ import (
 	"crawler/internal/model"
 )
 
-// DefaultBacklogInterval — период опроса: 5 минут. Исходные 30 с (нижняя
-// граница коридора ТЗ 5.9 30–60 с) рассчитаны на малый корпус: замер
-// §12 docs/load-measurements.md — проход GROUP BY по 47 млн строк 17+ с
-// каждые 30 с, вместе с пересчётом зон и агрегатами status — большая
-// часть CPU postgres; T-178 перевёл проход на суммы счётчиков справочника
-// (миллисекунды), период оставлен 5-минутным: gauge глубины на дашборде
-// допускает такую свежесть (постановка T-161), интервал задаёт баланс
-// свежести и нагрузки. Коридор ТЗ остаётся доступным конфигом
-// scheduler.backlog_interval для малых корпусов.
+// DefaultBacklogInterval — poll period: 5 minutes. The original 30 s (the lower
+// bound of the spec 5.9 corridor, 30–60 s) were designed for a small corpus: measurement
+// §12 docs/load-measurements.md — a GROUP BY pass over 47M rows took 17+ s
+// every 30 s, and together with zone recalculation and status aggregates it was most
+// of the postgres CPU; T-178 moved the pass to reference-table counter sums
+// (milliseconds), the period stayed at 5 minutes: the dashboard depth gauge
+// tolerates such freshness (enqueue T-161), and the interval sets the balance
+// between freshness and load. The spec corridor remains available via the
+// scheduler.backlog_interval config for small corpora.
 const DefaultBacklogInterval = 5 * time.Minute
 
-// backlogSQL — глубина backlog из справочника зон: сумма инкрементальных
-// счётчиков (T-178, ТЗИ §8.4) — один дешёвый проход по тысячам строк
-// зон вместо GROUP BY по 47 млн строк domains (замер §12 — 17+ с каждые
-// 5 мин). Счётчики ведут дельты переходов (ТЗИ §6) и реконсиляция
-// monitor (ТЗИ §7); deleted исключены базовым множеством колонок
-// (status <> deleted, ТЗИ §4.1).
+// backlogSQL — backlog depth from the zone reference table: a sum of incremental
+// counters (T-178, incremental-counters spec §8.4) — one cheap pass over thousands
+// of zone rows instead of a GROUP BY over 47M domains rows (measurement §12 — 17+ s every
+// 5 min). The counters keep transition deltas (incremental-counters spec §6) and the monitor
+// reconciliation (incremental-counters spec §7); deleted are excluded by the base column set
+// (status <> deleted, incremental-counters spec §4.1).
 const backlogSQL = "SELECT coalesce(sum(domains_pending), 0), coalesce(sum(domains_queued), 0) FROM zones"
 
-// BacklogOptions — параметры цикла; нулевые значения заменяются
-// дефолтами (withDefaults, стиль EnqueueOptions).
+// BacklogOptions — loop parameters; zero values are replaced
+// with defaults (withDefaults, the EnqueueOptions style).
 type BacklogOptions struct {
-	// Interval — период цикла BacklogLoop (DefaultBacklogInterval).
+	// Interval — period of the BacklogLoop cycle (DefaultBacklogInterval).
 	Interval time.Duration
-	// Log — логгер цикла; nil — записи подавлены (slog.DiscardHandler).
+	// Log — loop logger; nil — records suppressed (slog.DiscardHandler).
 	Log *slog.Logger
 }
 
@@ -71,19 +71,19 @@ func (o BacklogOptions) withDefaults() BacklogOptions {
 	return o
 }
 
-// BacklogResult — итог одного прохода BacklogOnce.
+// BacklogResult — the outcome of a single BacklogOnce pass.
 type BacklogResult struct {
-	// Pending — домены в ожидании выборки планировщиком (check_state =
-	// pending): весь накопленный объём работы цикла.
+	// Pending — domains awaiting scheduler selection (check_state =
+	// pending): the entire accumulated volume of the loop's work.
 	Pending int64
-	// Queued — домены в работе (check_state = queued, действует lease):
-	// поставлены в очередь или обрабатываются этапами.
+	// Queued — domains in progress (check_state = queued, lease in effect):
+	// enqueued or processed by the stages.
 	Queued int64
 }
 
-// NewBacklogGauge создаёт gauge глубины backlog crawler_backlog_domains
-// {state} в реестре reg (метка service подставится фабрикой); nil — nil.
-// Идемпотентен (T-076).
+// NewBacklogGauge creates the backlog depth gauge crawler_backlog_domains
+// {state} in the reg registry (the service label is substituted by the factory); nil — nil.
+// Idempotent (T-076).
 func NewBacklogGauge(reg *metrics.Registry) *prometheus.GaugeVec {
 	if reg == nil {
 		return nil
@@ -94,17 +94,17 @@ func NewBacklogGauge(reg *metrics.Registry) *prometheus.GaugeVec {
 	}, metrics.LabelState)
 }
 
-// backlogLoopMetrics — приборы цикла (T-161): длительность прохода
-// (наблюдаемость «проход дольше интервала» без gdb на pg_stat_activity)
-// и счётчик пропущенных тиков; nil-приёмник — no-op (цикл без реестра,
-// стиль monitor.collectorMetrics).
+// backlogLoopMetrics — loop instruments (T-161): pass duration
+// (observability of "pass longer than interval" without gdb on pg_stat_activity)
+// and a skipped-ticks counter; nil sink — no-op (loop without a registry,
+// the monitor.collectorMetrics style).
 type backlogLoopMetrics struct {
 	seconds prometheus.ObserverVec
 	skipped *prometheus.CounterVec
 }
 
-// newBacklogLoopMetrics — приборы в реестре reg (nil — nil). Проход —
-// чтение справочника зон (T-178): корзины дефолтные с запасом.
+// newBacklogLoopMetrics — instruments in the reg registry (nil — nil). The pass is
+// a read of the zone reference table (T-178): default buckets with headroom.
 func newBacklogLoopMetrics(reg *metrics.Registry) *backlogLoopMetrics {
 	if reg == nil {
 		return nil
@@ -122,7 +122,7 @@ func newBacklogLoopMetrics(reg *metrics.Registry) *backlogLoopMetrics {
 	}
 }
 
-// observe — фиксация длительности прохода; nil — no-op.
+// observe — pass duration recording; nil — no-op.
 func (m *backlogLoopMetrics) observe(seconds float64) {
 	if m == nil {
 		return
@@ -130,7 +130,7 @@ func (m *backlogLoopMetrics) observe(seconds float64) {
 	m.seconds.WithLabelValues().Observe(seconds)
 }
 
-// skip — пропуск тика; nil — no-op.
+// skip — tick skipping; nil — no-op.
 func (m *backlogLoopMetrics) skip() {
 	if m == nil {
 		return
@@ -138,9 +138,9 @@ func (m *backlogLoopMetrics) skip() {
 	m.skipped.WithLabelValues().Inc()
 }
 
-// BacklogOnce — один проход: суммы счётчиков зон (pending/queued,
-// T-178) → gauge обеих серий (пустой справочник — нули: пустой backlog
-// обязан экспортироваться, а не пропадать до следующего непустого).
+// BacklogOnce — a single pass: zone counter sums (pending/queued,
+// T-178) → gauge of both series (empty reference table — zeros: an empty backlog
+// must be exported, not disappear until the next non-empty one).
 func BacklogOnce(ctx context.Context, pool db.DB, gauge *prometheus.GaugeVec) (BacklogResult, error) {
 	if pool == nil {
 		return BacklogResult{}, errors.New("scheduler: глубина backlog: пул не задан")
@@ -171,23 +171,23 @@ func BacklogOnce(ctx context.Context, pool db.DB, gauge *prometheus.GaugeVec) (B
 	return out, nil
 }
 
-// BacklogLoop — периодический цикл проходов: первый сразу при старте
-// (свежая глубина после простоя/рестарта), далее по ticker. Ошибка
-// прохода прерывает только его: логируется Warn, цикл живёт (контракт
-// OnRun, T-012) — очередной проход повторит; gauge тем временем отдаёт
-// последние известные значения. Отмена ctx — чистый nil (graceful
-// shutdown, ТЗ 3.4). nil-реестр/пул — ошибка старта: коллектор без
-// точек записи бессмыслен (стиль NewRecorder T-058).
+// BacklogLoop — a periodic loop of passes: the first one runs immediately at start
+// (fresh depth after an idle period/restart), then by ticker. A pass
+// error interrupts only that pass: a Warn is logged, the loop keeps living (the
+// OnRun contract, T-012) — the next pass will retry; meanwhile the gauge returns
+// the last known values. ctx cancellation — a clean nil (graceful
+// shutdown, spec 3.4). nil registry/pool — a start error: a collector without
+// write points is meaningless (the NewRecorder T-058 style).
 //
-// Single-flight (T-161): проходы выполняются в горутине самого цикла —
-// новый проход структурно не может начаться, пока не завершился
-// предыдущий. Хвост картины «проход дольше интервала» (замер §12: 17+ с
-// по 47 млн строк): ticker буферизует один тик, и накопившийся тик
-// запускал бы новый проход сразу за медленным — агрегат молотил бы БД
-// непрерывно. Поэтому проход дольше интервала сбрасывает накопившийся
-// тик (следующий проход — по следующему тику: проходы не чаще
-// интервала), Warn и счётчик crawler_backlog_skipped_total поднимают
-// шум.
+// Single-flight (T-161): passes run in the loop's own goroutine —
+// a new pass structurally cannot start before the previous one
+// has finished. The tail of the "pass longer than interval" picture (measurement §12: 17+ s
+// over 47M rows): the ticker buffers one tick, and an accumulated tick
+// would start a new pass right after the slow one — the aggregate would hammer the DB
+// continuously. Therefore a pass longer than the interval drops the accumulated
+// tick (the next pass runs on the next tick: passes no more often than
+// the interval), while Warn and the crawler_backlog_skipped_total counter raise
+// the noise.
 func BacklogLoop(ctx context.Context, pool db.DB, reg *metrics.Registry, opts BacklogOptions) error {
 	gauge := NewBacklogGauge(reg)
 	if pool == nil {
@@ -202,28 +202,28 @@ func BacklogLoop(ctx context.Context, pool db.DB, reg *metrics.Registry, opts Ba
 		log = slog.New(slog.DiscardHandler)
 	}
 	m := newBacklogLoopMetrics(reg)
-	// Мутант логирования (T-M06): стартовый Info не меняет наблюдаемого
-	// поведения цикла — гасится по §4 docs/mutation-testing.md
-	// (логирование не тестируется).
+	// Logging mutant (T-M06): the startup Info does not change the observable
+	// behavior of the loop — suppressed per §4 docs/mutation-testing.md
+	// (logging is not tested).
 	// mutator-disable-next-line statement/remove
 	log.Info("цикл глубины backlog", "interval", o.Interval.String())
 
-	// Тикер до стартового прохода: тики отсчитываются от старта цикла,
-	// дренаж накопившегося тика в pass видит один и тот же тикер.
+	// Ticker before the starting pass: ticks are counted from the loop start,
+	// so the accumulated-tick drain inside pass sees the same ticker.
 	ticker := time.NewTicker(o.Interval)
 	defer ticker.Stop()
 	pass := func() {
 		started := time.Now()
 		res, err := BacklogOnce(ctx, pool, gauge)
 		switch {
-		// Тело ветки пустое (только комментарий): branch/case подменяет
-		// его на noop-EmptyStmt с идентичной печатью — мутант с пустым
-		// диффом, тестом не убить; подавление генерации — единственная
-		// альтернатива блэклисту чексумм (§4 docs/mutation-testing.md;
-		// прецедент — monitor/zonestats.go, T-M01).
+		// The branch body is empty (comment only): branch/case replaces it
+		// with a noop-EmptyStmt with identical printing — a mutant with an empty
+		// diff cannot be killed by a test; suppressing generation is the only
+		// alternative to the checksum blacklist (§4 docs/mutation-testing.md;
+		// precedent — monitor/zonestats.go, T-M01).
 		// mutator-disable-next-line branch/case
 		case err != nil && ctx.Err() != nil:
-			// Отмена во время прохода — часть остановки, не тревога.
+			// Cancellation during a pass is part of the stop, not an alarm.
 		case err != nil:
 			log.Warn("проход глубины backlog", "err", err)
 		default:
@@ -233,10 +233,10 @@ func BacklogLoop(ctx context.Context, pool db.DB, reg *metrics.Registry, opts Ba
 		took := time.Since(started)
 		m.observe(took.Seconds())
 		if took > o.Interval {
-			// Single-flight: сбросить тик, накопившийся за медленный
-			// проход, — иначе новый проход стартовал бы сразу за этим
-			// (select/default — тика может и не быть: Warn честен
-			// по длительности, дренаж в этом случае no-op).
+			// Single-flight: drop the tick accumulated during the slow
+			// pass — otherwise a new pass would start right after this one
+			// (select/default — the tick may be absent: the Warn is honest
+			// about duration, the drain is a no-op in that case).
 			select {
 			case <-ticker.C:
 			default:

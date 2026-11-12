@@ -1,15 +1,15 @@
-// Юнит-тесты возврата доменов с истёкшим lease (T-029; форма T-200 —
-// SELECT пачки по курсору + перевод PK-пробами, ТЗ
-// TZ_slow_lease_return.md §7.1) на фейковом pgx-пуле с транзакциями
-// (стиль retry_test.go): точные SQL-тексты обоих операторов и параметры
-// (граница now() − lease, охрана queued, сброс queued_at, коды
-// check_state/status, композитный курсор), пара операторов в одной
-// транзакции (Begin → SELECT → UPDATE → Commit), счёт по RETURNING,
-// пустая пачка не двигает курсор, guard отсеял записанный воркером
-// результат, ошибки и отмена ctx, цикл LeaseWatch (немедленный дренаж,
-// интервал, курсор живёт между пачками/дренажами, рестарт сбрасывает,
-// переживание ошибки, чистый выход). Поведение против живой БД —
-// интеграционные тесты (test/integration/lease_test.go).
+// Unit tests of returning domains with an expired lease (T-029; the T-200 form —
+// a batch SELECT by cursor + a move by PK probes, spec
+// TZ_slow_lease_return.md §7.1) on a fake pgx pool with transactions
+// (the retry_test.go style): the exact SQL texts of both statements and parameters
+// (the now() − lease boundary, the queued guard, the queued_at reset, the
+// check_state/status codes, the composite cursor), the pair of statements in one
+// transaction (Begin → SELECT → UPDATE → Commit), counting by RETURNING,
+// an empty batch does not move the cursor, the guard filtered out a worker-written
+// result, errors and ctx cancellation, the LeaseWatch cycle (an immediate drain,
+// the interval, the cursor lives between batches/drains, a restart resets it,
+// surviving an error, a clean exit). Behavior against a live DB —
+// integration tests (test/integration/lease_test.go).
 package scheduler
 
 import (
@@ -30,58 +30,58 @@ import (
 	"crawler/internal/model"
 )
 
-// --- фейковый пул с транзакциями ------------------------------------------
+// --- fake pool with transactions ------------------------------------------
 //
-// Имена с префиксом lease: в пакете параллельно живут фейки других задач
-// планировщика (retryFakePool T-191), общих хелперов здесь не заводят
-// (кроме retryRows — переиспользуется позиционный Scan).
+// Names prefixed with lease: fakes of other scheduler tasks live
+// in the package in parallel (retryFakePool T-191); no common helpers
+// are introduced here (except retryRows — the positional Scan is reused).
 
-// leaseCall — записанный SQL-вызов с аргументами.
+// leaseCall — a recorded SQL call with arguments.
 type leaseCall struct {
 	sql  string
 	args []any
 }
 
-// leaseBatch — заготовленный ответ прохода: пачка SELECT (строки в
-// порядке индексного ключа) и итог перевода translated — строк RETURNING
-// (guard мог отсеять часть пачки: translated < len(rows)).
+// leaseBatch — a stubbed pass response: the SELECT batch (rows in
+// index key order) and the move outcome translated — RETURNING rows
+// (the guard could have filtered out part of the batch: translated < len(rows)).
 type leaseBatch struct {
 	rows       []leaseRow
 	translated int64
 }
 
-// leaseNullBatch — заготовка ремонтного прохода (leasenull.go): пачка
-// SELECT (ключи queued/NULL строк) и итог перевода.
+// leaseNullBatch — a repair pass stub (leasenull.go): the
+// SELECT batch (keys of queued/NULL rows) and the move outcome.
 type leaseNullBatch struct {
 	rows       []leaseNullRow
 	translated int64
 }
 
-// leaseFakePool — LeaseDB без БД: очередь пачек SELECT (кончилась —
-// пустая пачка), ошибки по шагам прохода, протокол вызовов и порядок
-// операций транзакции. Всё под замком: цикл LeaseWatch работает в
-// горутине, тест ожидает прогресс по счётчикам. Ремонтный проход
-// страховки (ФТ-1.2) — те же поля с префиксом null: счётчики основного
-// прохода тесты проверяют отдельно.
+// leaseFakePool — a LeaseDB without a DB: the queue of SELECT batches (ran out —
+// an empty batch), per-step pass errors, the call protocol and the
+// transaction operation order. Everything under a lock: the LeaseWatch loop runs in
+// a goroutine; the test waits for progress by counters. The repair pass
+// of the guard (FR-1.2) — the same fields with the null prefix: the main
+// pass counters are checked by the tests separately.
 type leaseFakePool struct {
 	mu         sync.Mutex
-	batches    []leaseBatch // FIFO пачек SELECT
-	selectErrs []error      // FIFO ошибок SELECT (nil — без ошибки)
-	updateErrs []error      // FIFO ошибок UPDATE (nil — без ошибки)
+	batches    []leaseBatch // the FIFO of SELECT batches
+	selectErrs []error      // the FIFO of SELECT errors (nil — no error)
+	updateErrs []error      // the FIFO of UPDATE errors (nil — no error)
 	beginErr   error
-	commitErrs []error // FIFO ошибок Commit (кончилась — фиксация без ошибки)
+	commitErrs []error // the FIFO of Commit errors (ran out — a commit without an error)
 
-	nullBatches     []leaseNullBatch // FIFO пачек страховки
+	nullBatches     []leaseNullBatch // the FIFO of guard batches
 	nullSelectErrs  []error
 	nullUpdateErrs  []error
 	nullSelectCalls []leaseCall
 	nullUpdateCalls []leaseCall
 
-	ops         []string    // порядок операций: begin/select/update/commit
-	begins      int         // транзакций открыто
-	commits     int         // зафиксировано
-	selectCalls []leaseCall // SELECT пачки (проверка курсора)
-	updateCalls []leaseCall // UPDATE перевода
+	ops         []string    // the operation order: begin/select/update/commit
+	begins      int         // transactions opened
+	commits     int         // committed
+	selectCalls []leaseCall // the batch SELECT (cursor check)
+	updateCalls []leaseCall // the move UPDATE
 }
 
 func (p *leaseFakePool) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFromSource) (int64, error) {
@@ -108,8 +108,8 @@ func (p *leaseFakePool) Begin(context.Context) (pgx.Tx, error) {
 	return tx, nil
 }
 
-// nextErrLocked — следующая ошибка FIFO-очереди (nil-элемент — шаг без
-// ошибки), ok — очередь непуста.
+// nextErrLocked — the next error of the FIFO queue (a nil element — a step without
+// an error); ok — the queue is non-empty.
 func nextErrLocked(q *[]error) (error, bool) {
 	if len(*q) == 0 {
 		return nil, false
@@ -119,8 +119,8 @@ func nextErrLocked(q *[]error) (error, bool) {
 	return err, true
 }
 
-// nextBatchLocked — следующая пачка FIFO (кончилась — пустая: множество
-// исчерпано).
+// nextBatchLocked — the next FIFO batch (ran out — empty: the set
+// is exhausted).
 func (p *leaseFakePool) nextBatchLocked() leaseBatch {
 	if len(p.batches) == 0 {
 		return leaseBatch{}
@@ -130,8 +130,8 @@ func (p *leaseFakePool) nextBatchLocked() leaseBatch {
 	return b
 }
 
-// nextNullBatchLocked — следующая пачка страховки FIFO (кончилась —
-// пустая).
+// nextNullBatchLocked — the next guard FIFO batch (ran out —
+// empty).
 func (p *leaseFakePool) nextNullBatchLocked() leaseNullBatch {
 	if len(p.nullBatches) == 0 {
 		return leaseNullBatch{}
@@ -141,57 +141,57 @@ func (p *leaseFakePool) nextNullBatchLocked() leaseNullBatch {
 	return b
 }
 
-// stats — снимок счётчиков под замком (ожидание прогресса цикла).
+// stats — a snapshot of the counters under the lock (waiting for loop progress).
 func (p *leaseFakePool) stats() (begins, selects, updates, commits int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.begins, len(p.selectCalls), len(p.updateCalls), p.commits
 }
 
-// opsSnapshot — снимок порядка операций под замком.
+// opsSnapshot — a snapshot of the operation order under the lock.
 func (p *leaseFakePool) opsSnapshot() []string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return append([]string(nil), p.ops...)
 }
 
-// selectSnapshot — снимок протокола SELECT под замком.
+// selectSnapshot — a snapshot of the SELECT protocol under the lock.
 func (p *leaseFakePool) selectSnapshot() []leaseCall {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return append([]leaseCall(nil), p.selectCalls...)
 }
 
-// updateSnapshot — снимок протокола UPDATE под замком.
+// updateSnapshot — a snapshot of the UPDATE protocol under the lock.
 func (p *leaseFakePool) updateSnapshot() []leaseCall {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return append([]leaseCall(nil), p.updateCalls...)
 }
 
-// nullSelectSnapshot — снимок протокола SELECT страховки под замком.
+// nullSelectSnapshot — a snapshot of the guard SELECT protocol under the lock.
 func (p *leaseFakePool) nullSelectSnapshot() []leaseCall {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return append([]leaseCall(nil), p.nullSelectCalls...)
 }
 
-// nullUpdateSnapshot — снимок протокола UPDATE страховки под замком.
+// nullUpdateSnapshot — a snapshot of the guard UPDATE protocol under the lock.
 func (p *leaseFakePool) nullUpdateSnapshot() []leaseCall {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return append([]leaseCall(nil), p.nullUpdateCalls...)
 }
 
-// leaseFakeTx — транзакция фейкового пула: SELECT пачки и UPDATE перевода
-// (оба обязаны идти в ней — пул напрямую операторов не принимает), помнит
-// пачку этого SELECT: UPDATE обязан пробивать ровно её ключи. Операторы
-// ремонтного прохода страховки (ФТ-1.2) — той же транзакцией.
+// leaseFakeTx — the fake pool's transaction: the batch SELECT and the move UPDATE
+// (both must run in it — the pool does not accept statements directly); it remembers
+// the batch of this SELECT: the UPDATE must hit exactly its keys. The
+// repair pass statements of the guard (FR-1.2) — by the same transaction.
 type leaseFakeTx struct {
-	pgx.Tx // остальные методы pgx.Tx проход не использует
+	pgx.Tx // the other pgx.Tx methods are not used by the pass
 
 	pool      *leaseFakePool
-	batch     leaseBatch // пачка SELECT этой транзакции
+	batch     leaseBatch // the SELECT batch of this transaction
 	nullBatch leaseNullBatch
 	committed bool
 }
@@ -253,7 +253,7 @@ func (t *leaseFakeTx) Query(ctx context.Context, sql string, args ...any) (pgx.R
 		t.pool.ops = append(t.pool.ops, "null_update")
 		rows := make([][]any, t.nullBatch.translated)
 		for i := range rows {
-			rows[i] = []any{int16(1)} // zone_id: значение для счёта строк не важно
+			rows[i] = []any{int16(1)} // zone_id: the value does not matter for row counting
 		}
 		return retryRows(rows...), nil
 	case leaseUpdateSQL:
@@ -261,8 +261,8 @@ func (t *leaseFakeTx) Query(ctx context.Context, sql string, args ...any) (pgx.R
 		if err, ok := nextErrLocked(&t.pool.updateErrs); ok && err != nil {
 			return nil, err
 		}
-		// Контракт перевода: unnest-ключи — ровно пачка SELECT этой же
-		// транзакции, в порядке выборки.
+		// The move contract: the unnest keys are exactly the SELECT batch of this same
+		// transaction, in selection order.
 		if len(args) != 5 {
 			return nil, fmt.Errorf("leaseFakeTx: перевод: параметров %d, нужно 5", len(args))
 		}
@@ -284,7 +284,7 @@ func (t *leaseFakeTx) Query(ctx context.Context, sql string, args ...any) (pgx.R
 		t.pool.ops = append(t.pool.ops, "update")
 		rows := make([][]any, t.batch.translated)
 		for i := range rows {
-			rows[i] = []any{int16(1)} // zone_id: значение для счёта строк не важно
+			rows[i] = []any{int16(1)} // zone_id: the value does not matter for row counting
 		}
 		return retryRows(rows...), nil
 	default:
@@ -306,11 +306,11 @@ func (t *leaseFakeTx) Commit(context.Context) error {
 
 func (t *leaseFakeTx) Rollback(context.Context) error { return nil }
 
-// --- заготовки пачек -------------------------------------------------------
+// --- batch stubs -------------------------------------------------------
 
-// leaseSeedBatch — пачка n строк: queuedAt строго растёт по i (последняя
-// строка — максимум ключа: курсор после пачки проверяем по ней), id по
-// порядку, зона одна.
+// leaseSeedBatch — a batch of n rows: queuedAt strictly grows with i (the last
+// row is the key maximum: we check the cursor after the batch by it); ids in
+// order, one zone.
 func leaseSeedBatch(n int, translated int64, base time.Time) leaseBatch {
 	rows := make([]leaseRow, n)
 	for i := range rows {
@@ -323,7 +323,7 @@ func leaseSeedBatch(n int, translated int64, base time.Time) leaseBatch {
 	return leaseBatch{rows: rows, translated: translated}
 }
 
-// --- ожидаемые SQL-тексты (контракт, ТЗ T-200 §§4.1–4.2) ------------------
+// --- expected SQL texts (contract, T-200 spec §§4.1–4.2) ------------------
 
 const wantLeaseSelect = "SELECT zone_id, id, queued_at FROM domains " +
 	"WHERE check_state = 1 AND status <> 6 " +
@@ -345,14 +345,14 @@ const wantLeaseUpdate = "WITH upd AS (UPDATE domains AS t " +
 	"WHERE z.id = c.zone_id) " +
 	"SELECT zone_id FROM upd"
 
-// leaseFixedClock — часы с фиксированным «сейчас» (порог прохода
-// воспроизводим до наносекунды).
+// leaseFixedClock — a clock with a fixed "now" (the pass threshold
+// reproducible to the nanosecond).
 func leaseFixedClock() (time.Time, func() time.Time) {
 	now := time.Date(2026, 10, 17, 4, 30, 0, 0, time.UTC)
 	return now, func() time.Time { return now }
 }
 
-// leaseCursorArgs — аргументы-курсор вызова SELECT (позиции 2–4).
+// leaseCursorArgs — the cursor arguments of the SELECT call (positions 2–4).
 func leaseCursorArgs(c leaseCall) (time.Time, int16, int64) {
 	q, _ := c.args[2].(time.Time)
 	z, _ := c.args[3].(int16)
@@ -362,11 +362,11 @@ func leaseCursorArgs(c leaseCall) (time.Time, int16, int64) {
 
 // --- LeaseOnce -----------------------------------------------------------
 
-// TestLeaseOnceSQL — контракт обоих операторов (ТЗ §§4.1–4.2): SELECT пачки
-// с композитным курсором и порогом серверных часов, UPDATE … FROM unnest с
-// guard-охранами и сбросом queued_at; точные параметры, порядок операций
-// одной транзакции (Begin → SELECT → UPDATE → Commit), счёт по RETURNING,
-// курсор — за последнюю строку пачки.
+// TestLeaseOnceSQL — the contract of both statements (spec §§4.1–4.2): the batch SELECT
+// with the composite cursor and the server clock threshold, UPDATE … FROM unnest with
+// guard re-checks and the queued_at reset; exact parameters, the operation order
+// of one transaction (Begin → SELECT → UPDATE → Commit), counting by RETURNING,
+// the cursor — past the last row of the batch.
 func TestLeaseOnceSQL(t *testing.T) {
 	now, clock := leaseFixedClock()
 	base := time.Date(2026, 10, 17, 4, 0, 0, 0, time.UTC)
@@ -394,10 +394,10 @@ func TestLeaseOnceSQL(t *testing.T) {
 		t.Errorf("SQL выборки:\n%s\nwant:\n%s", sel[0].sql, wantLeaseSelect)
 	}
 	wantSelArgs := []any{
-		&now,                            // «сейчас» тестовых часов (в бою NULL → now() БД)
-		(15 * time.Minute).Seconds(),    // срок аренды — make_interval
-		time.Time{}, int16(0), int64(0), // нулевой курсор — с начала индекса
-		8000, // LIMIT пачки
+		&now,                            // the test clocks' "now" (in production NULL → the DB's now())
+		(15 * time.Minute).Seconds(),    // the lease term — make_interval
+		time.Time{}, int16(0), int64(0), // a zero cursor — from the beginning of the index
+		8000, // the batch LIMIT
 	}
 	if !reflect.DeepEqual(sel[0].args, wantSelArgs) {
 		t.Errorf("аргументы выборки = %v, want %v", sel[0].args, wantSelArgs)
@@ -412,20 +412,20 @@ func TestLeaseOnceSQL(t *testing.T) {
 	}
 	wantUpdArgs := []any{
 		int16(model.CheckStatePending), // SET check_state
-		[]int16{1, 1, 1},               // зоны выбранной пачки
-		[]int64{1, 2, 3},               // домены выбранной пачки
-		&now,                           // то же «сейчас» — порог един
+		[]int16{1, 1, 1},               // the zones of the selected batch
+		[]int64{1, 2, 3},               // the domains of the selected batch
+		&now,                           // the same "now" — the threshold is one
 		(15 * time.Minute).Seconds(),
 	}
 	if !reflect.DeepEqual(upd[0].args, wantUpdArgs) {
 		t.Errorf("аргументы перевода = %v, want %v", upd[0].args, wantUpdArgs)
 	}
 
-	// Счёт по RETURNING: переведено 2 из выбранных 3 (guard отсеял одну).
+	// Counting by RETURNING: 2 of the selected 3 moved (the guard filtered out one).
 	if res.Domains != 2 || res.Selected != 3 {
 		t.Errorf("итог = %+v, want Domains=2 (RETURNING), Selected=3", res)
 	}
-	// Курсор — последняя строка пачки (минутная сетка seed-заготовки).
+	// The cursor — the last row of the batch (the minute grid of the seed stub).
 	want := leaseSeedBatch(3, 0, base).rows[2]
 	if cursor.queuedAt != want.queuedAt || cursor.zone != want.zone || cursor.id != want.id {
 		t.Errorf("курсор = (%v,%d,%d), want последняя строка пачки (%v,%d,%d)",
@@ -433,9 +433,9 @@ func TestLeaseOnceSQL(t *testing.T) {
 	}
 }
 
-// TestLeaseOnceClockIsServer — без тестовых часов «сейчас» не передаётся
-// вовсе (NULL) ни в выборку, ни в перевод: порог считает now() сервера БД,
-// а не часы процесса планировщика.
+// TestLeaseOnceClockIsServer — without test clocks the "now" is not passed
+// at all (NULL) to either the selection or the move: the threshold is counted by the DB server's now(),
+// not by the scheduler process's clock.
 func TestLeaseOnceClockIsServer(t *testing.T) {
 	pool := &leaseFakePool{batches: []leaseBatch{leaseSeedBatch(1, 1, time.Now())}}
 	if _, err := LeaseOnce(context.Background(), pool, nil, LeaseOptions{}); err != nil {
@@ -454,9 +454,9 @@ func TestLeaseOnceClockIsServer(t *testing.T) {
 	}
 }
 
-// TestLeaseOnceDefaults — нулевые опции: срок аренды и пачка — дефолты
-// (30 минут по ТЗ 5.3, 5000), часы фиксированные: «сейчас» и срок уходят
-// в SQL параметрами.
+// TestLeaseOnceDefaults — zero options: the lease term and batch are the defaults
+// (30 minutes per spec 5.3, 5000); the clocks are fixed: the "now" and the term go
+// into the SQL as parameters.
 func TestLeaseOnceDefaults(t *testing.T) {
 	now, clock := leaseFixedClock()
 	pool := &leaseFakePool{batches: []leaseBatch{leaseSeedBatch(1, 1, time.Now())}}
@@ -477,11 +477,11 @@ func TestLeaseOnceDefaults(t *testing.T) {
 	}
 }
 
-// TestLeaseOnceEmpty — исчерпанное множество: пустая пачка — только SELECT
-// (переводить нечего, UPDATE не выполняется), транзакция не фиксируется,
-// итог нулевой, курсор не двигается.
+// TestLeaseOnceEmpty — an exhausted set: an empty batch — only the SELECT
+// (nothing to move, the UPDATE is not executed); the transaction is not committed,
+// the outcome is zero, the cursor does not move.
 func TestLeaseOnceEmpty(t *testing.T) {
-	pool := &leaseFakePool{} // очередь пачек пуста
+	pool := &leaseFakePool{} // the batch queue is empty
 
 	var cursor LeaseCursor
 	res, err := LeaseOnce(context.Background(), pool, &cursor, LeaseOptions{})
@@ -503,13 +503,13 @@ func TestLeaseOnceEmpty(t *testing.T) {
 	}
 }
 
-// TestLeaseOnceCursorMoves — курсор двигается за последнюю строку
-// непустой пачки и передаётся следующим проходом (args SELECT), пустая
-// пачка его не трогает.
+// TestLeaseOnceCursorMoves — the cursor moves past the last row
+// of a non-empty batch and is passed to the next pass (the SELECT args); an empty
+// batch does not touch it.
 func TestLeaseOnceCursorMoves(t *testing.T) {
 	base := time.Date(2026, 10, 17, 3, 0, 0, 0, time.UTC)
-	first := leaseSeedBatch(2, 2, base)                 // строки base+0, base+1m
-	second := leaseSeedBatch(3, 3, base.Add(time.Hour)) // строки base+1h+{0,1,2}m
+	first := leaseSeedBatch(2, 2, base)                 // rows base+0, base+1m
+	second := leaseSeedBatch(3, 3, base.Add(time.Hour)) // rows base+1h+{0,1,2}m
 	pool := &leaseFakePool{batches: []leaseBatch{first, second}}
 
 	var cursor LeaseCursor
@@ -522,8 +522,8 @@ func TestLeaseOnceCursorMoves(t *testing.T) {
 			cursor.queuedAt, cursor.id, want.queuedAt, want.id)
 	}
 
-	// Второй проход получает курсор первого в аргументах SELECT (снимок
-	// курсора до второго прохода — дальше он уходит за вторую пачку).
+	// The second pass receives the first pass's cursor in the SELECT arguments (a snapshot
+	// of the cursor before the second pass — after that it moves past the second batch).
 	cursorAfterFirst := cursor
 	if _, err := LeaseOnce(context.Background(), pool, &cursor, LeaseOptions{}); err != nil {
 		t.Fatalf("второй проход: %v", err)
@@ -534,7 +534,7 @@ func TestLeaseOnceCursorMoves(t *testing.T) {
 			q, z, i, cursorAfterFirst.queuedAt, cursorAfterFirst.zone, cursorAfterFirst.id)
 	}
 
-	// Пустая пачка (очередь кончилась) курсор не двигает.
+	// An empty batch (the queue ran out) does not move the cursor.
 	if _, err := LeaseOnce(context.Background(), pool, &cursor, LeaseOptions{}); err != nil {
 		t.Fatalf("третий проход: %v", err)
 	}
@@ -544,11 +544,11 @@ func TestLeaseOnceCursorMoves(t *testing.T) {
 	}
 }
 
-// TestLeaseOnceGuardFiltered — запись результата между выборкой и
-// блокировкой (гонка с воркером): перевод пробивает ВСЮ выбранную пачку
-// (ключи unnest — выбранное множество), но счёт — по RETURNING: отсеянные
-// охраной строки в Domains не попадают, курсор всё равно уходит за пачку
-// (судьба отсеянных изменилась — под старым ключом их нет).
+// TestLeaseOnceGuardFiltered — a result write between the selection and
+// the lock (a race with a worker): the move hits the ENTIRE selected batch
+// (the unnest keys — the selected set), but the count is by RETURNING: rows filtered out
+// by the guard do not get into Domains; the cursor moves past the batch anyway
+// (the filtered-out ones' fate changed — they do not exist under the old key).
 func TestLeaseOnceGuardFiltered(t *testing.T) {
 	base := time.Date(2026, 10, 17, 5, 0, 0, 0, time.UTC)
 	pool := &leaseFakePool{batches: []leaseBatch{leaseSeedBatch(5, 1, base)}}
@@ -572,9 +572,9 @@ func TestLeaseOnceGuardFiltered(t *testing.T) {
 	}
 }
 
-// TestLeaseOnceRepeatPasses — переведённые строки не выбираются повторно
-// (условие отбора в самом SQL): каждый проход — своя транзакция, после
-// опустошения — нулевой итог.
+// TestLeaseOnceRepeatPasses — moved rows are not selected again
+// (the selection condition is in the SQL itself): each pass is its own transaction; after
+// exhaustion — a zero outcome.
 func TestLeaseOnceRepeatPasses(t *testing.T) {
 	base := time.Date(2026, 10, 17, 6, 0, 0, 0, time.UTC)
 	pool := &leaseFakePool{batches: []leaseBatch{
@@ -604,9 +604,9 @@ func TestLeaseOnceRepeatPasses(t *testing.T) {
 	}
 }
 
-// TestLeaseOnceNilCursor — nil-курсор: разовый проход с начала индекса
-// без сохранения (стиль ReanalyzeTick) — работает и не паникает, каждый
-// вызов стартует с нулевого курсора.
+// TestLeaseOnceNilCursor — a nil cursor: a one-off pass from the beginning of the index
+// without persisting (the ReanalyzeTick style) — works and does not panic; each
+// call starts from the zero cursor.
 func TestLeaseOnceNilCursor(t *testing.T) {
 	pool := &leaseFakePool{batches: []leaseBatch{
 		leaseSeedBatch(2, 2, time.Now()),
@@ -624,9 +624,9 @@ func TestLeaseOnceNilCursor(t *testing.T) {
 	}
 }
 
-// TestLeaseOnceError — ошибки шагов прохода (выборка, перевод, транзакция,
-// фиксация) обёртываются с контекстом задачи; провал НЕ двигает курсор —
-// повтор прохода берёт пачку заново; отмена ctx сохраняется errors.Is.
+// TestLeaseOnceError — pass step errors (selection, move, transaction,
+// commit) are wrapped with the task context; a failure does NOT move the cursor —
+// a repeated pass takes the batch again; ctx cancellation is preserved via errors.Is.
 func TestLeaseOnceError(t *testing.T) {
 	base := time.Date(2026, 10, 17, 7, 0, 0, 0, time.UTC)
 
@@ -685,15 +685,15 @@ func TestLeaseOnceNilPool(t *testing.T) {
 // --- LeaseOptions ---------------------------------------------------------
 
 func TestLeaseOptionsDefaults(t *testing.T) {
-	// Дефолт пачки пинируется литералом ТЗ 5.3 (коридор 1000–10 000):
-	// сравнение с самой константой мутации не замечает.
+	// The batch default is pinned by the spec 5.3 literal (the 1000–10,000 corridor):
+	// comparing with the very constant does not notice mutations.
 	if DefaultLeaseBatch != 5000 {
 		t.Errorf("DefaultLeaseBatch = %d, want 5000", DefaultLeaseBatch)
 	}
 
-	// Нулевые и отрицательные значения — дефолты; интервал цикла —
-	// половина срока аренды (баланс «скорость возврата vs нагрузка»,
-	// см. LeaseWatch), в том числе от дефолтного срока.
+	// Zero and negative values — the defaults; the loop interval is
+	// half the lease term (the "return speed vs load" balance,
+	// see LeaseWatch), including from the default term.
 	got := (LeaseOptions{}).withDefaults()
 	if got.Timeout != DefaultLeaseTimeout || got.BatchSize != DefaultLeaseBatch {
 		t.Errorf("withDefaults = Timeout=%v BatchSize=%v, want %v/%v",
@@ -709,31 +709,31 @@ func TestLeaseOptionsDefaults(t *testing.T) {
 		t.Errorf("withDefaults(отрицательные) = %+v, want дефолты", got)
 	}
 
-	// Короткий срок — интервал ужимается вместе с ним: цикл не
-	// «переспит» настраиваемый lease.
+	// A short term — the interval shrinks with it: the loop does not
+	// "oversleep" the configurable lease.
 	got = (LeaseOptions{Timeout: 2 * time.Minute}).withDefaults()
 	if got.Interval != time.Minute {
 		t.Errorf("Interval = %v, want 1m (Timeout/2 при Timeout=2m)", got.Interval)
 	}
 
-	// Вырожденный Timeout 1 нс делением дал бы 0 — тикеру нужен
-	// положительный интервал.
+	// A degenerate Timeout of 1 ns would give 0 by division — the ticker needs a
+	// positive interval.
 	if got := (LeaseOptions{Timeout: time.Nanosecond}).withDefaults(); got.Interval <= 0 {
 		t.Errorf("Interval = %v при Timeout=1ns, want > 0", got.Interval)
 	}
 
-	// Границы замен: 1 нс и 1 — положительные значения, не дефолты.
+	// Replacement boundaries: 1 ns and 1 are positive values, not defaults.
 	if got := (LeaseOptions{Timeout: time.Nanosecond, BatchSize: 1}).withDefaults(); got.Timeout != time.Nanosecond || got.BatchSize != 1 {
 		t.Errorf("withDefaults(Timeout=1нс, BatchSize=1) = %+v, want без замены", got)
 	}
-	// Интервал 1 нс проверяется при Timeout 4 нс: подмена дефолтом дала
-	// бы 2 нс (Timeout/2), а вырожденный Timeout 1 нс совпадает с
-	// внутренним минимумом тикера и подмену не выявляет.
+	// The 1 ns interval is checked with a Timeout of 4 ns: replacing it with the default would
+	// give 2 ns (Timeout/2), while a degenerate Timeout of 1 ns coincides with
+	// the ticker's internal minimum and does not reveal the replacement.
 	if got := (LeaseOptions{Timeout: 4 * time.Nanosecond, Interval: time.Nanosecond}).withDefaults(); got.Interval != time.Nanosecond {
 		t.Errorf("Interval 1нс = %v, want без замены", got.Interval)
 	}
 
-	// Заданные значения не затираются, Now передаётся как есть.
+	// Given values are not overwritten; Now is passed as is.
 	now := func() time.Time { return time.Unix(0, 0) }
 	got = LeaseOptions{
 		Timeout:   time.Hour,
@@ -751,9 +751,9 @@ func TestLeaseOptionsDefaults(t *testing.T) {
 
 // --- LeaseWatch -----------------------------------------------------------
 
-// TestLeaseWatchImmediateDrain — первый дренаж выполняется сразу при
-// старте, не дожидаясь тика: подбирает зависшее за простой сервиса
-// (ТЗ 3.4, 11.4 п. 9).
+// TestLeaseWatchImmediateDrain — the first drain runs immediately at
+// start, without waiting for a tick: it picks up what hung during the service
+// downtime (spec 3.4, 11.4 item 9).
 func TestLeaseWatchImmediateDrain(t *testing.T) {
 	pool := &leaseFakePool{batches: []leaseBatch{leaseSeedBatch(1, 1, time.Now())}}
 
@@ -762,11 +762,11 @@ func TestLeaseWatchImmediateDrain(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		done <- LeaseWatch(ctx, pool, LeaseOptions{
-			Interval: time.Hour, // тик не наступит: только стартовый дренаж
+			Interval: time.Hour, // the tick never comes: only the starting drain
 		})
 	}()
 
-	// Стартовый дренаж: одна транзакция и тишина до отмены.
+	// The starting drain: one transaction and silence until cancellation.
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		if _, selects, _, commits := pool.stats(); selects >= 1 && commits >= 1 {
@@ -790,15 +790,15 @@ func TestLeaseWatchImmediateDrain(t *testing.T) {
 	}
 }
 
-// TestLeaseWatchLoop — полный дренаж пачками до исчерпания, ошибка
-// пачки прерывает только свой дренаж (Warn), очередной тик продолжает;
-// интервал по умолчанию — половина срока аренды; отмена ctx — чистый nil.
+// TestLeaseWatchLoop — a full drain in batches until exhaustion; a batch
+// error interrupts only its own drain (a Warn); the next tick continues;
+// the default interval is half the lease term; ctx cancellation — a clean nil.
 func TestLeaseWatchLoop(t *testing.T) {
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&buf, nil))
 
-	// Дренаж 1 (старт): ошибка БД — Warn. Дренаж 2 (тик): полная пачка +
-	// неполная — Info с суммой. Дальше — пустые множества.
+	// Drain 1 (start): a DB error — a Warn. Drain 2 (tick): a full batch +
+	// an incomplete one — an Info with the sum. Then — empty sets.
 	base := time.Date(2026, 10, 17, 8, 0, 0, 0, time.UTC)
 	pool := &leaseFakePool{
 		batches: []leaseBatch{
@@ -812,12 +812,12 @@ func TestLeaseWatchLoop(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		done <- LeaseWatch(ctx, pool, LeaseOptions{
-			Timeout: 40 * time.Millisecond, // интервал-дефолт: 20 мс
+			Timeout: 40 * time.Millisecond, // the interval default: 20 ms
 			Log:     logger,
 		})
 	}()
 
-	// Три прохода SELECT: провал первого дренажа и обе пачки второго.
+	// Three SELECT passes: the first drain's failure and both batches of the second.
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		if _, selects, _, _ := pool.stats(); selects >= 3 {
@@ -829,11 +829,11 @@ func TestLeaseWatchLoop(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	// Гонка отмены: между наблюдением третьего SELECT и фиксацией
-	// транзакции второй пачки — микросекунды, но отмена в этом окне
-	// прерывала дренаж молча (ctx.Err() — без Warn/Info) и итоговая
-	// строка лога не писалась. Ждём обе фиксации, пауза — на запись
-	// Info после коммита.
+	// The cancellation race: between observing the third SELECT and committing
+	// the second batch's transaction there are microseconds, but a cancellation in this window
+	// interrupted the drain silently (ctx.Err() — without a Warn/Info) and the final
+	// log line was not written. We wait for both commits; the pause is for writing
+	// the Info after the commit.
 	for {
 		if _, _, _, commits := pool.stats(); commits >= 2 {
 			break
@@ -855,11 +855,11 @@ func TestLeaseWatchLoop(t *testing.T) {
 
 	log := buf.String()
 	for _, want := range []string{
-		"возврат доменов с истёкшим lease", // старт
-		"interval=20ms", // дефолт: Timeout/2
-		"level=WARN",    // ошибка дренажа не убила цикл
+		"возврат доменов с истёкшим lease", // the start
+		"interval=20ms", // the default: Timeout/2
+		"level=WARN",    // a drain error did not kill the loop
 		"бд недоступна",
-		fmt.Sprintf("domains=%d", DefaultLeaseBatch+3), // итог дренажа
+		fmt.Sprintf("domains=%d", DefaultLeaseBatch+3), // the drain outcome
 	} {
 		if !strings.Contains(log, want) {
 			t.Errorf("лог не содержит %q:\n%s", want, log)
@@ -867,11 +867,11 @@ func TestLeaseWatchLoop(t *testing.T) {
 	}
 }
 
-// TestLeaseWatchGuardFilteredFullBatch — полная пачка выборки с нулевым
-// переводом (guard отсеял всё — результаты записаны между выборкой и
-// блокировкой) НЕ останавливает дренаж: критерий продолжения — выборка
-// прошла целиком, курсор ушёл за пачку, возвращаться к пройденному
-// незачем.
+// TestLeaseWatchGuardFilteredFullBatch — a full selection batch with a zero
+// move (the guard filtered everything out — results written between the selection and
+// the lock) does NOT stop the drain: the continuation criterion is that the selection
+// came back full, the cursor moved past the batch; there is no reason to return
+// to what has been covered.
 func TestLeaseWatchGuardFilteredFullBatch(t *testing.T) {
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&buf, nil))
@@ -879,7 +879,7 @@ func TestLeaseWatchGuardFilteredFullBatch(t *testing.T) {
 	base := time.Date(2026, 10, 17, 9, 0, 0, 0, time.UTC)
 	pool := &leaseFakePool{
 		batches: []leaseBatch{
-			leaseSeedBatch(DefaultLeaseBatch, 0, base), // всё отсеял guard
+			leaseSeedBatch(DefaultLeaseBatch, 0, base), // the guard filtered out everything
 			leaseSeedBatch(3, 3, base.Add(time.Hour)),
 		},
 	}
@@ -912,14 +912,14 @@ func TestLeaseWatchGuardFilteredFullBatch(t *testing.T) {
 	}
 }
 
-// TestLeaseWatchCursorLives — курсор дренажа переживает пачки одного
-// дренажа и сами дренажи: вторая пачка стартует за последней строкой
-// первой, первый проход следующего дренажа — за последней строкой
-// прошлого дренажа (не с начала индекса).
+// TestLeaseWatchCursorLives — the drain cursor survives the batches of one
+// drain and the drains themselves: the second batch starts past the last row
+// of the first; the first pass of the next drain — past the last row
+// of the previous drain (not from the beginning of the index).
 func TestLeaseWatchCursorLives(t *testing.T) {
 	base := time.Date(2026, 10, 17, 10, 0, 0, 0, time.UTC)
-	full := leaseSeedBatch(2, 2, base)                     // строки base, base+1m
-	partial := leaseSeedBatch(1, 1, base.Add(time.Minute)) // строка base+2m
+	full := leaseSeedBatch(2, 2, base)                     // rows base, base+1m
+	partial := leaseSeedBatch(1, 1, base.Add(time.Minute)) // row base+2m
 	pool := &leaseFakePool{batches: []leaseBatch{full, partial}}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -927,11 +927,11 @@ func TestLeaseWatchCursorLives(t *testing.T) {
 	go func() {
 		done <- LeaseWatch(ctx, pool, LeaseOptions{
 			BatchSize: 2,
-			Timeout:   40 * time.Millisecond, // интервал-дефолт 20 мс — тик ждём, а не 15 мин
+			Timeout:   40 * time.Millisecond, // the interval default 20 ms — we wait for a tick, not 15 min
 		})
 	}()
 
-	// Дренаж 1: полная пачка (2 == BatchSize) + неполная (1) — стоп.
+	// Drain 1: a full batch (2 == BatchSize) + an incomplete one (1) — a stop.
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		if _, selects, _, commits := pool.stats(); selects >= 2 && commits >= 2 {
@@ -944,7 +944,7 @@ func TestLeaseWatchCursorLives(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 
-	// Дренаж 2 (тик): первый проход продолжает курсором прошлого дренажа.
+	// Drain 2 (tick): the first pass continues with the previous drain's cursor.
 	deadline = time.Now().Add(2 * time.Second)
 	for {
 		if _, selects, _, _ := pool.stats(); selects >= 3 {
@@ -962,17 +962,17 @@ func TestLeaseWatchCursorLives(t *testing.T) {
 	}
 
 	calls := pool.selectSnapshot()
-	// Пачка 1 — нулевой курсор (старт).
+	// Batch 1 — the zero cursor (start).
 	if q, z, i := leaseCursorArgs(calls[0]); !q.IsZero() || z != 0 || i != 0 {
 		t.Errorf("курсор пачки 1 = (%v,%d,%d), want нулевой", q, z, i)
 	}
-	// Пачка 2 — за последнюю строку пачки 1 (внутри дренажа).
+	// Batch 2 — past the last row of batch 1 (within the drain).
 	want1 := full.rows[1]
 	if q, z, i := leaseCursorArgs(calls[1]); q != want1.queuedAt || z != want1.zone || i != want1.id {
 		t.Errorf("курсор пачки 2 = (%v,%d,%d), want (%v,%d,%d) — за пачку 1",
 			q, z, i, want1.queuedAt, want1.zone, want1.id)
 	}
-	// Дренаж 2 — за последнюю строку прошлого дренажа (между дренажами).
+	// Drain 2 — past the last row of the previous drain (between drains).
 	want2 := partial.rows[0]
 	if q, z, i := leaseCursorArgs(calls[2]); q != want2.queuedAt || z != want2.zone || i != want2.id {
 		t.Errorf("курсор дренажа 2 = (%v,%d,%d), want (%v,%d,%d) — курсор переживает дренажи",
@@ -980,10 +980,10 @@ func TestLeaseWatchCursorLives(t *testing.T) {
 	}
 }
 
-// TestLeaseWatchRestartResetsCursor — рестарт процесса (новый запуск цикла)
-// начинает с нулевого курсора: стартовый полный дренаж сохраняется
-// (T-012/T-029) — мёртвый префикс за курсором перечитывается осознанно
-// (ТЗ §5.1).
+// TestLeaseWatchRestartResetsCursor — a process restart (a new launch of the loop)
+// starts from the zero cursor: the initial full drain is preserved
+// (T-012/T-029) — the dead prefix behind the cursor is deliberately reread
+// (spec §5.1).
 func TestLeaseWatchRestartResetsCursor(t *testing.T) {
 	base := time.Date(2026, 10, 17, 11, 0, 0, 0, time.UTC)
 	run := func() []leaseCall {
@@ -1020,15 +1020,15 @@ func TestLeaseWatchRestartResetsCursor(t *testing.T) {
 	}
 }
 
-// TestLeaseWatchCancelDuringDrain — отмена ctx во время дренажа — не
-// тревога: без Warn, чистый nil (контракт OnRun, T-012).
+// TestLeaseWatchCancelDuringDrain — ctx cancellation during a drain is not
+// an alarm: no Warn, a clean nil (the OnRun contract, T-012).
 func TestLeaseWatchCancelDuringDrain(t *testing.T) {
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&buf, nil))
 
 	pool := &leaseFakePool{selectErrs: []error{context.Canceled}}
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // отменён до старта: первый же SELECT дренажа провалится
+	cancel() // cancelled before the start: the drain's very first SELECT will fail
 
 	done := make(chan error, 1)
 	go func() { done <- LeaseWatch(ctx, pool, LeaseOptions{Log: logger}) }()
@@ -1041,14 +1041,14 @@ func TestLeaseWatchCancelDuringDrain(t *testing.T) {
 	}
 }
 
-// TestLeaseWatchDrainTotals — Info-итог дренажа: положительная сумма
-// логируется (ровно 1 — тоже положительная), нулевая — нет.
+// TestLeaseWatchDrainTotals — the drain's Info outcome: a positive sum
+// is logged (exactly 1 is also positive); a zero one — is not.
 func TestLeaseWatchDrainTotals(t *testing.T) {
 	tests := []struct {
 		name        string
 		batches     []leaseBatch
-		wantSelects int    // проходов SELECT до остановки стартового дренажа
-		want        string // подстрока Info-итога дренажа; "" — итог не логируется
+		wantSelects int    // the number of SELECT passes until the starting drain stops
+		want        string // a substring of the drain's Info outcome; "" — the outcome is not logged
 	}{
 		{"неполная пачка из одного", []leaseBatch{leaseSeedBatch(1, 1, time.Now())}, 1, "domains=1"},
 		{"нулевой дренаж", nil, 1, ""},
@@ -1064,8 +1064,8 @@ func TestLeaseWatchDrainTotals(t *testing.T) {
 			done := make(chan error, 1)
 			go func() { done <- LeaseWatch(ctx, pool, LeaseOptions{Log: logger}) }()
 
-			// Стартовый дренаж синхронен и от тика не зависит: ждём
-			// ожидаемое число проходов, даём завершиться.
+			// The starting drain is synchronous and independent of the tick: we wait
+			// for the expected number of passes and let it finish.
 			deadline := time.Now().Add(2 * time.Second)
 			for {
 				if _, selects, _, _ := pool.stats(); selects >= tt.wantSelects {

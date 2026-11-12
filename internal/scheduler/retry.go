@@ -1,45 +1,45 @@
-// Scheduler: повторная проверка temp_error (T-031; ТЗ 5.3, 6.2).
+// Scheduler: temp_error rechecking (T-031; spec 5.3, 6.2).
 //
-// Домен, чья проверка завершилась временной ошибкой (status = temp_error,
-// ТЗ 6.2: SERVFAIL/таймауты, «требуется повтор»), перепроверяется не сразу,
-// а через temp_error_retry_after (по умолчанию 24 ч, ТЗ 5.3) и не более
-// N раз подряд; после исчерпания попыток домен получает итоговый статус
-// по результату последней проверки.
+// A domain whose check ended with a temporary error (status = temp_error,
+// spec 6.2: SERVFAIL/timeouts, "a retry is required") is rechecked not immediately,
+// but after temp_error_retry_after (24 h by default, spec 5.3) and no more than
+// N times in a row; after the attempts are exhausted the domain gets the final status
+// based on the result of the last check.
 //
-// Проход RetryOnce пачкой до opts.BatchSize выбирает кандидатов — домены
-// в статусе temp_error, чья проверка завершена (check_state = done, ТЗ 7)
-// и last_checked_at старше temp_error_retry_after, — и делит их по
-// счётчику попыток domains.temp_attempts (миграция 000005) на два решения,
-// каждое — в СОБСТВЕННОЙ транзакции под 40P01-ретраем (порядок блокировок
-// — retryDecide, T-268; назначение повтора — два оператора: декремент
-// корзин счётчиков вынесен из оператора зон, T-267):
+// The RetryOnce pass with a batch of up to opts.BatchSize selects candidates — domains
+// in the temp_error status whose check is finished (check_state = done, spec 7)
+// and last_checked_at is older than temp_error_retry_after — and splits them by
+// the attempt counter domains.temp_attempts (migration 000005) into two decisions,
+// each in its OWN transaction under a 40P01 retry (the lock order —
+// retryDecide, T-268; the retry assignment is two statements: the decrement
+// of the counter buckets is moved out of the zones statement, T-267):
 //
-//   - попыток меньше N — назначается повтор: check_state → pending
-//     (домена перевыберет диспетчер T-027 и поставит в q:dns, T-028),
-//     счётчик увеличивается на единицу;
-//   - попыток N или больше — фиксируется итоговый статус
-//     delegated_no_address, счётчик сбрасывается в ноль.
+//   - fewer than N attempts — a retry is assigned: check_state → pending
+//     (the T-027 dispatcher will re-select the domain and put it into q:dns, T-028),
+//     the counter is incremented by one;
+//   - N or more attempts — the final status delegated_no_address is recorded,
+//     the counter is reset to zero.
 //
-// Итоговый статус — delegated_no_address (код 2, ТЗ 6.2): последняя
-// проверка закончилась SERVFAIL/таймаутом, то есть адресов для HTTP-этапа
-// не получено — это терминальная ветка «нет адресов» алгоритма ТЗ 7
-// («нет адресов → status=delegated_no_address, done»). not_delegated
-// отвергнут: он кодирует именно NXDOMAIN апекса (ТЗ 5.4 п. 1, RFC 8020),
-// а ТЗ явно различает NXDOMAIN и SERVFAIL/таймаут; новых статусов набор
-// не расширяет — семь статусов подтверждены заказчиком (ТЗ 13.1).
-// Ошибка классификации самокорректируется регулярным циклом: домен
-// остаётся в done и перепроверяется по recheck_interval (T-030, 6 мес).
+// The final status is delegated_no_address (code 2, spec 6.2): the last
+// check ended with SERVFAIL/a timeout, that is, no addresses were obtained for the HTTP stage
+// — this is the terminal "no addresses" branch of the spec 7 algorithm
+// ("no addresses → status=delegated_no_address, done"). not_delegated
+// was rejected: it encodes exactly an NXDOMAIN of the apex (spec 5.4 item 1, RFC 8020),
+// while the spec explicitly distinguishes NXDOMAIN and SERVFAIL/timeouts; the set
+// does not add new statuses — the seven statuses were confirmed by the customer (spec 13.1).
+// A classification error self-corrects in the regular cycle: the domain
+// stays in done and is rechecked by recheck_interval (T-030, 6 months).
 //
-// Счётчик temp_attempts без смены схемы не выразить: check_state —
-// перечисление жизненного цикла, flags — битовые булевы признаки,
-// dns_mask — маска субдоменов, метки времени не считают попытки, истории
-// результатов нет (ТЗ 3.5, перезапись). Миграция 000005 — минимальная:
-// одна smallint-колонка. Сброс счётчика при успешной (не temp_error)
-// проверке — контракт DNS-этапа (T-036+): новый эпизод temp_error
-// начинается с нуля; до его реализации счётчик между эпизодами может
-// остаться ненулевым — эффект консервативен (меньше повторов).
+// The temp_attempts counter cannot be expressed without a schema change: check_state is
+// a lifecycle enumeration, flags are boolean bit flags,
+// dns_mask is a subdomain mask, timestamps do not count attempts, there is no
+// result history (spec 3.5, overwrite). Migration 000005 is minimal:
+// one smallint column. Resetting the counter on a successful (non-temp_error)
+// check is the DNS stage contract (T-036+): a new temp_error episode
+// starts from zero; before it is implemented the counter may
+// remain non-zero between episodes — the effect is conservative (fewer retries).
 //
-// Wiring в cmd/scheduler — поздняя задача (OnRun каркаса T-012).
+// Wiring in cmd/scheduler — a later task (the OnRun of framework T-012).
 
 package scheduler
 
@@ -60,77 +60,77 @@ import (
 )
 
 const (
-	// DefaultRetryAfter — окно повтора temp_error (ТЗ 5.3:
-	// temp_error_retry_after, 24 часа).
+	// DefaultRetryAfter — the temp_error retry window (spec 5.3:
+	// temp_error_retry_after, 24 hours).
 	DefaultRetryAfter = 24 * time.Hour
 
-	// DefaultRetryMaxRetries — максимум повторов подряд (ТЗ 5.3: «не более
-	// N раз подряд»). Число ТЗ не задаёт; 3 — как счётчик попыток доставки
-	// очереди (план T-025): единая политика повторов системы.
+	// DefaultRetryMaxRetries — the maximum retries in a row (spec 5.3: "no more
+	// than N times in a row"). The spec does not set the number; 3 — like the delivery
+	// attempt counter of the queue (plan T-025): a single retry policy of the system.
 	DefaultRetryMaxRetries = 3
 
-	// DefaultRetryBatch — лимит пачки: доменов на один проход, в стиле
-	// пачек планировщика (ТЗ 5.3: 1000–10 000) и фоновой очистки T-020.
+	// DefaultRetryBatch — the batch limit: domains per pass, in the style
+	// of the scheduler batches (spec 5.3: 1000–10,000) and the background cleanup T-020.
 	DefaultRetryBatch = 1000
 
-	// DefaultRetryInterval — интервал проходов цикла RetryTempErrors при
-	// настройках по умолчанию. ТЗ частоту проходов не задаёт: с окном
-	// повтора 24 часа часовой проход назначает повтор не позже чем через
-	// час после готовности домена; если retry_after настроен меньше часа,
-	// интервал ужимается до него (withDefaults), чтобы цикл не «переспал»
-	// собственное окно. Стационар без зрелых кандидатов держит guard
-	// корзин зрелости (T-202, retryMatureSQL — уточнение T-191): часовой
-	// тик стоит одну дешёвую сумму строк счётчика, тяжёлая выборка пачки
-	// не выполняется вовсе; шторм когорты (массовый temp_error-эпизод)
-	// дренируется проходами подряд (drain), темп определяют UPDATE пачки,
-	// а не выборка — seq scan с ранним остановом LIMIT, закреплённый в
-	// транзакции выборки (retryCandidates, T-191).
+	// DefaultRetryInterval — the pass interval of the RetryTempErrors cycle at
+	// the default settings. The spec does not set the pass frequency: with a
+	// retry window of 24 hours, an hourly pass assigns a retry no later than an
+	// hour after the domain becomes ready; if retry_after is configured shorter than an hour,
+	// the interval shrinks to it (withDefaults), so the cycle does not "oversleep"
+	// its own window. In steady state without mature candidates a guard over the
+	// maturity buckets (T-202, retryMatureSQL — the T-191 refinement) holds: an hourly
+	// tick costs one cheap sum of counter rows, the heavy batch selection
+	// is not executed at all; a cohort storm (a mass temp_error episode)
+	// is drained by consecutive passes (drain), the pace is set by the batch UPDATEs,
+	// not the selection — a seq scan with an early LIMIT stop, pinned in
+	// the selection transaction (retryCandidates, T-191).
 	DefaultRetryInterval = time.Hour
 
-	// DefaultRetryDrainFails — потолок ПОДРЯД упавших пачек одного
-	// дренажа (T-268): ошибка пачки больше не срывает часовой проход
-	// (инцидент 07.11 16:04 — WARN единственной пачки оставлял неразобранным
-	// дренаж 118 тыс. доменов до следующего тика), дренаж продолжает
-	// следующие пачки; предел останавливает его при устойчивом сбое
-	// (БД недоступна) — до следующего тика, не молотя БД вхолостую.
+	// DefaultRetryDrainFails — the cap on CONSECUTIVELY failed batches of one
+	// drain (T-268): a batch error no longer wrecks the hourly pass
+	// (the Nov 07 16:04 incident — a WARN of a single batch left the drain of
+	// 118k domains unprocessed until the next tick), the drain continues
+	// with the following batches; the limit stops it on a persistent failure
+	// (the DB unavailable) — until the next tick, without hammering the DB in vain.
 	DefaultRetryDrainFails = 3
 )
 
-// SQL прохода. unnest-пачки — стиль пакетных UPDATE internal/db (ТЗ 6:
-// «запись пачками … UPDATE … FROM unnest(...)»); охраны в WHERE —
-// перечитывание состояния на момент апдейта (гонки с T-027/T-030/T-018
-// не ломают инвариант «один инкремент на эпизод»), RETURNING отдаёт
-// только фактически затронутые строки — счётчики прохода честные.
+// The pass SQL. unnest batches — the internal/db batch UPDATE style (spec 6:
+// "writing in batches … UPDATE … FROM unnest(...)"); the guards in WHERE —
+// re-reading the state at the moment of the update (races with T-027/T-030/T-018
+// do not break the "one increment per episode" invariant); RETURNING returns
+// only the rows actually affected — the pass counters are honest.
 const (
-	// retrySelectSQL — кандидаты повтора: temp_error после завершённой
-	// проверки (check_state = done — точка инкремента: одно назначение
-	// повтора на один эпизод проверки; pending уже ждёт выборки диспетчера,
-	// queued в работе, ТЗ 5.3), окно — по last_checked_at. NULL
-	// last_checked_at не выбирается: «ещё не проверялся» — не повод для
-	// повтора. ORDER BY отсутствует сознательно (T-191, прецедент T-181):
-	// порядок кандидатов не важен — деление пачки по temp_attempts не
-	// зависит от порядка, охраны retryRequeueSQL/retryFinalizeSQL
-	// перепроверяют статус и состояние на момент записи (идемпотентность
-	// ТЗ 3.4), повторный проход безопасен; сортировка держала бы индексный
-	// доступ к таблице. Точность окна — сутки: last_checked_at имеет тип
-	// date (ТЗ 6.1).
+	// retrySelectSQL — retry candidates: temp_error after a finished
+	// check (check_state = done — the increment point: one retry
+	// assignment per one check episode; pending already awaits the dispatcher selection,
+	// queued is in progress, spec 5.3), the window — by last_checked_at. NULL
+	// last_checked_at is not selected: "not checked yet" is not a reason for
+	// a retry. ORDER BY is absent deliberately (T-191, the T-181 precedent):
+	// the candidate order does not matter — splitting the batch by temp_attempts does
+	// not depend on the order, the guards of retryRequeueSQL/retryFinalizeSQL
+	// re-check the status and state at the moment of the write (idempotency
+	// of spec 3.4), a repeated pass is safe; sorting would hold index
+	// access to the table. The window precision is a day: last_checked_at has the type
+	// date (spec 6.1).
 	//
-	// Индекса у прохода нет сознательно (T-104): предикат сводится к
-	// status = temp_error, а индекс с status в ключе или предикате ломал
-	// бы HOT массовых апдейтов статуса без смены check_state — применение
-	// delete-файлов (apply_delete) и фиксация итогового статуса
-	// (retryFinalizeSQL). Но и без status в индексе seq scan не бесплатен:
-	// планировщик садится на частичный domains_recheck_idx (миграция
-	// 000008) — предикат check_state = done доказуем, диапазон по ведущему
-	// last_checked_at кажется узким, а слепая оценка (гистограмма
-	// last_checked_at: 92 % NULL, волна проверок моложе статистики)
-	// обещает планировщику тысячи строк; реально окно «старше 24 ч»
-	// покрывает почти все done-строки, и диапазонный скан вырождается в
-	// марафон по нескольким миллионам строк с heap-визитом каждой (запрос
-	// №1 журнала медленных 25.10: медиана 74,8 с, ≈3,6 ч времени БД за
-	// окно). Форма плана закреплена: seq scan с ранним остановом LIMIT —
-	// доли секунды, замер 195× (T-191) — SET LOCAL в транзакции выборки
-	// (retryCandidates, образец — renderSelectPending T-181).
+	// The pass deliberately has no index (T-104): the predicate reduces to
+	// status = temp_error, and an index with status in the key or predicate would break
+	// the HOT of mass status updates without a check_state change — applying
+	// delete files (apply_delete) and recording the final status
+	// (retryFinalizeSQL). But even without status in the index a seq scan is not free:
+	// the planner lands on the partial domains_recheck_idx (migration
+	// 000008) — the check_state = done predicate is provable, the range over the leading
+	// last_checked_at seems narrow, and the blind estimate (the histogram
+	// of last_checked_at: 92% NULL, the check wave younger than the statistics)
+	// promises the planner thousands of rows; in reality the "older than 24 h" window
+	// covers almost all done rows, and the range scan degenerates into
+	// a marathon over several million rows with a heap visit of each (query
+	// #1 of the slow-query log of Oct 25: median 74.8 s, ≈3.6 h of DB time per
+	// window). The plan form is pinned: a seq scan with an early LIMIT stop —
+	// fractions of a second, measured 195× (T-191) — SET LOCAL in the selection transaction
+	// (retryCandidates, the renderSelectPending T-181 precedent).
 	retrySelectSQL = "SELECT d.zone_id, d.id, d.temp_attempts FROM domains d " +
 		"WHERE d.status = $1 " +
 		"AND d.check_state = $2 " +
@@ -138,38 +138,38 @@ const (
 		"LIMIT $4"
 
 	// retryPlanNoIndexScanSQL/retryPlanNoBitmapScanSQL/retryPlanNoIOSQL —
-	// закрепление формы плана выборки кандидатов (T-191, прецедент T-181):
-	// SET LOCAL в транзакции retryCandidates отключает index scan, bitmap
-	// scan и index-only scan до оператора выборки — закрыты все индексные
-	// формы доступа к domains (PK и оба частичных), seq scan с ранним
-	// остановом LIMIT гарантирует пачку за доли секунды независимо от
-	// статистики (оценке планировщика верить нельзя — см.
-	// retrySelectSQL). Действие SET LOCAL — только эта транзакция,
-	// остальные запросы пула не затронуты.
+	// pinning the plan form of the candidate selection (T-191, the T-181 precedent):
+	// SET LOCAL in the retryCandidates transaction disables index scan, bitmap
+	// scan and index-only scan until the selection statement — all index
+	// forms of access to domains are closed (the PK and both partials), a seq scan with an early
+	// LIMIT stop guarantees the batch in fractions of a second regardless of
+	// statistics (the planner's estimate cannot be trusted — see
+	// retrySelectSQL). SET LOCAL acts for this transaction only,
+	// the other pool queries are unaffected.
 	retryPlanNoIndexScanSQL  = "SET LOCAL enable_indexscan = off"
 	retryPlanNoBitmapScanSQL = "SET LOCAL enable_bitmapscan = off"
 	retryPlanNoIOSQL         = "SET LOCAL enable_indexonlyscan = off"
 
-	// retryRequeueSQL — назначение повтора: check_state → pending (домена
-	// перевыберет диспетчер T-027), счётчик попыток + 1. Охрана
-	// status = temp_error AND check_state = done: домен, успевший уйти
-	// из done мимо прохода (recheck T-030, возврат lease T-029, воскрешение
-	// add-файлом T-018), не инкрементируется повторно. Дельты счётчиков
-	// зон (checked −n / pending +n) — CTE zc того же оператора по
-	// RETURNING zone_id (T-178, ТЗИ §6.2: предикат пинирует старое
-	// состояние done); внешний SELECT — ключи переведённых строк с датой
-	// эпизода (last_checked_at — адресат хвостового декремента корзин
-	// зрелости, retryRequeueMatureSQL). Оператор строго «domains →
-	// zones» (T-267): декремент корзин выведен из него ВТОРЫМ оператором
-	// транзакции решения — нессылаемые DML-CTE зон и счётчика одного
-	// оператора исполняются в непредсказуемом порядке (документация PG,
-	// оговорка в zonestats.go; инцидент 07.11 — ребро «счётчики → зоны»
-	// против зонодержателей, runbooks.md §2.8), операторы же транзакции
-	// исполняются в текстовом порядке; зоны удерживаются до Commit —
-	// конвенция «domains → zones → counters» соблюдена, ребро
-	// «счётчики → domains» (устранено разделением транзакций решений,
-	// 15ff3a3) не возвращается: после декремента транзакция новых строк
-	// domains не захватывает.
+	// retryRequeueSQL — assigning a retry: check_state → pending (the
+	// T-027 dispatcher will re-select the domain), the attempt counter + 1. The guard
+	// status = temp_error AND check_state = done: a domain that managed to leave
+	// done bypassing the pass (a recheck T-030, a lease return T-029, a resurrection
+	// by an add file T-018) is not incremented again. The zone counter
+	// deltas (checked −n / pending +n) — the CTE zc of the same statement over
+	// the RETURNING zone_id (T-178, incremental-counters spec §6.2: the predicate pins the old
+	// done state); the outer SELECT — the keys of the moved rows with the
+	// episode date (last_checked_at — the target of the tail decrement of the maturity
+	// buckets, retryRequeueMatureSQL). The statement is strictly "domains →
+	// zones" (T-267): the bucket decrement is taken out of it as the SECOND statement
+	// of the decision transaction — unreferenced DML-CTEs of zones and the counter of one
+	// statement execute in an unpredictable order (the PG documentation,
+	// the caveat in zonestats.go; the Nov 07 incident — the edge "counters → zones"
+	// against zone holders, runbooks.md §2.8), while the statements of a transaction
+	// execute in textual order; the zones are held until Commit —
+	// the "domains → zones → counters" convention is upheld, the edge
+	// "counters → domains" (eliminated by splitting the decision transactions,
+	// 15ff3a3) does not return: after the decrement the transaction captures no new
+	// domains rows.
 	retryRequeueSQL = "WITH upd AS (UPDATE domains d " +
 		"SET check_state = $3, temp_attempts = d.temp_attempts + 1 " +
 		"FROM unnest($1::int2[], $2::int8[]) AS k(zone_id, domain_id) " +
@@ -183,23 +183,23 @@ const (
 		"WHERE z.id = c.zone_id) " +
 		"SELECT u.zone_id, u.id, u.last_checked_at FROM upd AS u"
 
-	// retryRequeueMatureSQL — хвостовой декремент корзин зрелости
-	// назначения повтора (T-202/T-267): второй оператор транзакции
-	// решения ПОСЛЕ перевода (retryRequeueSQL: upd+zc), по датам
-	// эпизодов переведённых строк — RETURNING первого оператора
-	// (перевод в pending завершает кандидату: момент зрелости выводится
-	// из last_checked_at, ключ тот же, что у инкремента записи
-	// результата — current_date её оператора; рассинхрон ключей лишил
-	// бы декремент адресата). Параметр — пачка дат unnest($1::date[]);
-	// ORDER BY детерминирует захват строк корзин по возрастанию даты
-	// (= имени: старые → вчерашняя) — общий порядок с проходом monitor
-	// (очистка старых → вчерашняя → сегодняшняя), без AB-BA цикла на
-	// смешанных датах пачки (ревью T-202, P2). В той же транзакции,
-	// что и перевод: сбой декремента откатывает пару целиком (§3.4),
-	// кандидаты остаются кандидатами следующего прохода — в отличие от
-	// разнесённых autocommit'ами операторов записи результата DNS-этапа
-	// (dnsworker/result.go, окно ±1 до реконсиляции); пустая пачка
-	// (охрана отбила всех) оператор не выполняется вовсе.
+	// retryRequeueMatureSQL — the tail decrement of the maturity buckets
+	// of the retry assignment (T-202/T-267): the second statement of the decision
+	// transaction AFTER the move (retryRequeueSQL: upd+zc), by the
+	// episode dates of the moved rows — the RETURNING of the first statement
+	// (the move to pending finishes off the candidate: the maturity moment is derived
+	// from last_checked_at, the same key as the increment of the result
+	// write — its current_date; a key desync would leave the decrement
+	// without a target). The parameter — the batch of dates unnest($1::date[]);
+	// ORDER BY determines the capture of bucket rows by ascending date
+	// (= the name: old → yesterday) — a common order with the monitor
+	// pass (cleaning old → yesterday → today), without an AB-BA cycle on
+	// mixed batch dates (review T-202, P2). In the same transaction
+	// as the move: a decrement failure rolls back the pair entirely (§3.4),
+	// the candidates remain the next pass's candidates — unlike the
+	// autocommit-separated statements of the DNS stage result write
+	// (dnsworker/result.go, the ±1 window until reconciliation); on an empty batch
+	// (the guard blocked everyone) the statement is not executed at all.
 	retryRequeueMatureSQL = "INSERT INTO crawler_counters (name, value, updated_at) " +
 		"SELECT 'retry_mature:' || to_char(d, 'YYYY-MM-DD'), -count(*), now() " +
 		"FROM unnest($1::date[]) AS d " +
@@ -207,23 +207,23 @@ const (
 		"ON CONFLICT (name) DO UPDATE " +
 		"SET value = crawler_counters.value + EXCLUDED.value, updated_at = now()"
 
-	// retryFinalizeSQL — исчерпание попыток: итоговый статус по последней
-	// проверке — delegated_no_address (см. комментарий в начале файла),
-	// счётчик в ноль: следующий эпизод temp_error начнётся с чистого
-	// счётчика. Охрана та же, что у назначения повтора. Дельт счётчиков
-	// зон нет: check_state остаётся done, status-распределение
-	// инкрементами не ведётся — его пишет реконсиляция monitor (ТЗИ
-	// §13.3, T-178). CTE rm декрементирует корзину зрелости (T-202):
-	// финализация, как и назначение повтора, завершает кандидату — без
-	// декремента корзина держала бы guard открытым после дренажа (холостые
-	// seq scan каждый тик до прохода реконсиляции); ORDER BY —
-	// детерминация захвата строк корзин (ревью T-202, P2). Декремент
-	// ОСТАВЛЕН в самом операторе сознательно (T-267 выносил ребро
-	// «счётчики → зоны» горячего requeue): rm ссылается на upd —
-	// единственная CTE, исполнение гарантированно после перевода; зон
-	// оператор не трогает — порядок блокировок «domains → counters»
-	// без ребра против зонодержателей, отдельный оператор ничего бы
-	// не изменил.
+	// retryFinalizeSQL — attempts exhausted: the final status per the last
+	// check — delegated_no_address (see the comment at the top of the file),
+	// the counter to zero: the next temp_error episode will start with a clean
+	// counter. The guard is the same as for the retry assignment. No zone counter
+	// deltas: check_state stays done, the status distribution
+	// is not maintained by increments — monitor reconciliation writes it (incremental-counters
+	// spec §13.3, T-178). The CTE rm decrements the maturity bucket (T-202):
+	// finalization, like the retry assignment, finishes off the candidate — without the
+	// decrement the bucket would keep the guard open after the drain (idle
+	// seq scans every tick until the reconciliation pass); ORDER BY —
+	// the determination of the bucket row capture (review T-202, P2). The decrement
+	// is deliberately KEPT in the statement itself (T-267 moved out the edge
+	// "counters → zones" of the hot requeue): rm references upd —
+	// the only CTE whose execution is guaranteed after the move; the statement does not
+	// touch zones — the lock order "domains → counters"
+	// has no edge against zone holders, a separate statement would change
+	// nothing.
 	retryFinalizeSQL = "WITH upd AS (UPDATE domains d " +
 		"SET status = $3, temp_attempts = 0 " +
 		"FROM unnest($1::int2[], $2::int8[]) AS k(zone_id, domain_id) " +
@@ -239,95 +239,95 @@ const (
 		"SELECT u.zone_id, u.id FROM upd AS u"
 )
 
-// retryMatureSQL — guard прохода суммой корзин зрелости temp_error
-// (T-202, уточнение guard T-191: счётчик status_temp_error не отличал
-// зрелых кандидатов от незрелых — 543 тыс. temp_error при пустом окне
-// зрелости держали seq scan без раннего останова на каждом часовом тике,
-// медиана 51 с / max 239 с после фикса T-191). Корзина
-// crawler_counters['retry_mature:YYYY-MM-DD'] — temp_error-эпизоды
-// суток (дата эпизода = last_checked_at записи результата): +1 пишут
-// инкременты записи результата (httpworker/record.go и терминальная
-// temp_error-ветка DNS-этапа dnsworker/result.go — отдельным
-// autocommit-оператором после записи, T-267, — оба источника
-// эпизодов), −n — решения ретрая: назначение повтора хвостовым
-// оператором retryRequeueMatureSQL, финализация — CTE rm самого
-// оператора (кандидата исчерпана); авторитет — реконсиляция monitor
-// (FILTER-позиции прохода, T-202). Сумма корзин прошедших суток —
-// число зрелых кандидатов: last_checked_at — date (миграция 000001),
-// окно «старше 24 ч» по date-колонке зреет когортами в полночь, поэтому
-// ключ корзины — дата эпизода (эквивалент «момента созревания now+24 ч,
-// округлённого до часа»: при date-точности колонки все эпизоды суток
-// зреют вместе в полночь следующего дня — часовая гранулярность
-// вырождается в суточную, формат наследует T-179; тот же ключ выводим и
-// инкрементом (current_date), и декрементом (last_checked_at) —
-// рассинхрон ключей лишил бы декремент адресата). Диапазон по
-// PK-префиксу 'retry_mature:' лексикографически отсекает корзину
-// текущих суток (name < …current_date: сегодняшние эпизоды ещё
-// незрелые) — имя дня вычисляет БД, Go-часы в границе не участвуют
-// (стиль T-179).
-// coalesce — строк корзин может не быть вовсе (до первого инкремента
-// или прохода реконсиляции): честный ноль, а не ошибка — в отличие от
-// status_temp_error строки корзин nobody не гарантирует, их отсутствие
-// и есть «зрелых нет». Значение ≤ 0 — зрелых нет: тяжёлая выборка
-// (seq scan по domains) не выполняется вовсе, стационар стоит одну
-// сумму индексного диапазона из пары строк.
+// retryMatureSQL — the pass guard over the sum of the temp_error maturity buckets
+// (T-202, the refinement of the T-191 guard: the status_temp_error counter did not distinguish
+// mature candidates from immature ones — 543k temp_error with an empty maturity
+// window held a seq scan without an early stop on every hourly tick,
+// median 51 s / max 239 s after the T-191 fix). The bucket
+// crawler_counters['retry_mature:YYYY-MM-DD'] — the temp_error episodes
+// of the day (the episode date = the last_checked_at of the result write): +1 is written by
+// the result write increments (httpworker/record.go and the terminal
+// temp_error branch of the DNS stage dnsworker/result.go — with a separate
+// autocommit statement after the write, T-267, — both sources
+// of episodes), −n — the retry decisions: the retry assignment with the tail
+// statement retryRequeueMatureSQL, finalization — the rm CTE of the
+// statement itself (the candidate is exhausted); the authority is monitor reconciliation
+// (the FILTER positions of the pass, T-202). The sum of the buckets of elapsed days is
+// the number of mature candidates: last_checked_at is a date (migration 000001),
+// the "older than 24 h" window over a date column ripens in cohorts at midnight, hence
+// the bucket key is the episode date (the equivalent of "the ripening moment now+24 h,
+// rounded to the hour": at the column's date precision all episodes of a day
+// ripen together at the midnight of the next day — hourly granularity
+// degenerates into daily, the format inherits T-179; the same key is produced by both
+// the increment (current_date) and the decrement (last_checked_at) —
+// a key desync would leave the decrement without a target). The range over
+// the PK prefix 'retry_mature:' lexicographically cuts off the bucket of
+// the current day (name < …current_date: today's episodes are not
+// mature yet) — the DB computes the day name, Go clocks do not participate in the bound
+// (the T-179 style).
+// coalesce — the bucket rows may be absent entirely (before the first increment
+// or reconciliation pass): an honest zero, not an error — unlike
+// status_temp_error, nobody guarantees the bucket rows; their absence
+// is exactly "no mature ones". A value ≤ 0 — no mature ones: the heavy selection
+// (a seq scan over domains) is not executed at all, steady state costs one
+// sum over an index range of a couple of rows.
 var retryMatureSQL = "SELECT coalesce(sum(value), 0) FROM crawler_counters " +
 	"WHERE name >= 'retry_mature:' " +
 	"AND name < 'retry_mature:' || to_char(current_date, 'YYYY-MM-DD')"
 
-// RetryDB — пул для прохода: db.DB, из которого можно начать транзакцию.
-// Решения пачки (назначение повтора и итоговый статус) идут РАЗДЕЛЬНЫМИ
-// транзакциями (retryDecide): каждая по отдельности соблюдает конвенцию
-// порядка блокировок «domains → zones → counters, счётчики — последними»
-// (docs/schema.md, раздел crawler_counters); общая транзакция захватывала
-// бы domains-строки финализации, уже держа зоны и корзины счётчиков, —
-// ребро «счётчики → domains» замыкало цикл дедлока 40P01 с транзакциями
-// записи результата http-worker (инцидент retry-волны: пачки по 1000,
-// десятки корзин retry_mature до конца tx). Назначение повтора
-// выполняется в своей транзакции ДВУМЯ операторами (T-267): перевод
-// (upd+zc), затем декремент корзин (retryRequeueMatureSQL) — операторы
-// транзакции исполняются в текстовом порядке, зоны удерживаются до
-// Commit. Атомарность пачки не критична: охраны обоих UPDATE
-// идемпотентны, незавершённая половина безопасно подбирается следующим
-// проходом (ТЗ 3.4);
-// *pgxpool.Pool удовлетворяет интерфейсу.
+// RetryDB — the pool for the pass: a db.DB from which a transaction can be started.
+// The batch decisions (the retry assignment and the final status) run in SEPARATE
+// transactions (retryDecide): each on its own upholds the lock order convention
+// "domains → zones → counters, counters last"
+// (docs/schema.md, the crawler_counters section); a shared transaction would capture
+// the finalization domains rows while already holding zones and counter buckets —
+// the edge "counters → domains" would close the 40P01 deadlock cycle with the
+// result write transactions of the http-worker (the retry wave incident: batches of 1000,
+// dozens of retry_mature buckets until the end of the tx). The retry assignment
+// runs in its own transaction with TWO statements (T-267): the move
+// (upd+zc), then the bucket decrement (retryRequeueMatureSQL) — the statements
+// of a transaction execute in textual order, the zones are held until
+// Commit. The batch atomicity is not critical: the guards of both UPDATEs
+// are idempotent, an unfinished half is safely picked up by the next
+// pass (spec 3.4);
+// *pgxpool.Pool satisfies the interface.
 type RetryDB interface {
 	db.DB
 	Begin(ctx context.Context) (pgx.Tx, error)
 }
 
-// compile-time: реальный пул подходит под интерфейс.
+// compile-time: the real pool fits the interface.
 var _ RetryDB = (*pgxpool.Pool)(nil)
 
-// RetryOptions — параметры прохода; нулевые значения заменяются
-// дефолтами (withDefaults, стиль ingest.CleanupOptions).
+// RetryOptions — pass parameters; zero values are replaced
+// with defaults (withDefaults, the ingest.CleanupOptions style).
 type RetryOptions struct {
-	// RetryAfter — окно повтора temp_error: кандидаты — домены с
-	// last_checked_at старше (DefaultRetryAfter; конфиг
-	// scheduler.temp_error_retry_after, ТЗ 5.3).
+	// RetryAfter — the temp_error retry window: candidates are domains with
+	// last_checked_at older (DefaultRetryAfter; config
+	// scheduler.temp_error_retry_after, spec 5.3).
 	RetryAfter time.Duration
-	// MaxRetries — максимум повторов подряд (DefaultRetryMaxRetries;
-	// конфиг scheduler.temp_error_max_retries, ТЗ 5.3: «не более N раз
-	// подряд»).
+	// MaxRetries — the maximum retries in a row (DefaultRetryMaxRetries;
+	// config scheduler.temp_error_max_retries, spec 5.3: "no more than N times
+	// in a row").
 	MaxRetries int
-	// BatchSize — максимум доменов в одном проходе (DefaultRetryBatch);
-	// лимит пачки задаёт SELECT кандидатов.
+	// BatchSize — the maximum domains in one pass (DefaultRetryBatch);
+	// the batch limit is set by the candidate SELECT.
 	BatchSize int
-	// Interval — период проходов цикла RetryTempErrors; на разовый
-	// RetryOnce не влияет. Ноль/отрицательное — min(RetryAfter,
-	// DefaultRetryInterval), см. DefaultRetryInterval.
+	// Interval — the pass period of the RetryTempErrors cycle; does not affect a one-off
+	// RetryOnce. Zero/negative — min(RetryAfter,
+	// DefaultRetryInterval), see DefaultRetryInterval.
 	Interval time.Duration
-	// Metrics — реестр Prometheus сервиса (T-268): счётчик 40P01-повторов
-	// транзакций решений crawler_db_deadlock_retried_total; nil — без
-	// метрик (изолированные сборки/тесты).
+	// Metrics — the service's Prometheus registry (T-268): the counter of
+	// 40P01 retries of the decision transactions crawler_db_deadlock_retried_total; nil — without
+	// metrics (isolated assemblies/tests).
 	Metrics *metrics.Registry
-	// Log — логгер цикла RetryTempErrors; nil — записи подавлены
-	// (slog.DiscardHandler). RetryOnce не логирует — итог возвращается
-	// RetryResult.
+	// Log — the RetryTempErrors loop logger; nil — records suppressed
+	// (slog.DiscardHandler). RetryOnce does not log — the outcome is returned
+	// as RetryResult.
 	Log *slog.Logger
 }
 
-// withDefaults заменяет неположительные значения дефолтами.
+// withDefaults replaces non-positive values with defaults.
 func (o RetryOptions) withDefaults() RetryOptions {
 	if o.RetryAfter <= 0 {
 		o.RetryAfter = DefaultRetryAfter
@@ -339,64 +339,64 @@ func (o RetryOptions) withDefaults() RetryOptions {
 		o.BatchSize = DefaultRetryBatch
 	}
 	if o.Interval <= 0 {
-		// Не дольше собственного окна повтора: при коротком retry_after
-		// (тесты, эксперименты) цикл обязан просыпаться чаще окна.
+		// No longer than its own retry window: with a short retry_after
+		// (tests, experiments) the cycle must wake up more often than the window.
 		o.Interval = min(o.RetryAfter, DefaultRetryInterval)
 	}
 	return o
 }
 
-// RetryResult — итог одного прохода RetryOnce.
+// RetryResult — the outcome of one RetryOnce pass.
 type RetryResult struct {
-	// Requeued — домены, которым назначен повтор (check_state → pending,
-	// temp_attempts + 1); после охраны — только фактически переведённые.
+	// Requeued — domains assigned a retry (check_state → pending,
+	// temp_attempts + 1); after the guard — only the rows actually moved.
 	Requeued int
-	// Finalized — домены с зафиксированным итоговым статусом
+	// Finalized — domains with the recorded final status
 	// (delegated_no_address, temp_attempts → 0).
 	Finalized int
 }
 
-// retryCandidate — кандидат прохода: ключ домена и счётчик попыток.
+// retryCandidate — a pass candidate: the domain key and the attempt counter.
 type retryCandidate struct {
 	zoneID   int16
 	id       int64
 	attempts int16
 }
 
-// RetryOnce выполняет один проход повторных проверок (ТЗ 5.3, 6.2):
-// до opts.BatchSize доменов в статусе temp_error с завершённой
-// проверкой и last_checked_at старше RetryAfter получают либо
-// назначенный повтор (check_state → pending, temp_attempts + 1 — попыток
-// меньше MaxRetries), либо итоговый статус delegated_no_address (попытки
-// исчерпаны, temp_attempts → 0). Решения пачки идут РАЗДЕЛЬНЫМИ
-// транзакциями (retryDecide): каждая соблюдает порядок блокировок
-// «domains → zones → counters» — общая транзакция захватывала бы
-// domains-строки финализации, уже держа зоны и корзины retry_mature
-// (ребро «счётчики → domains», цикл дедлока 40P01 с записью результата
-// http-worker); назначение повтора — ДВА оператора своей транзакции
-// (перевод upd+zc, затем декремент корзин по датам переведённых строк,
-// T-267 — порядок нессылаемых DML-CTE одного оператора PG не
-// гарантирует); сбой между половинами безопасен — охраны обоих UPDATE
-// идемпотентны, незавершённая половина подберётся следующим проходом
-// (ТЗ 3.4). До выборки — guard суммой корзин зрелости
-// crawler_counters['retry_mature:…'] прошедших суток (T-202,
-// retryMatureCount): нулевая сумма возвращает пустой результат без
-// тяжёлой выборки. Повторный проход безопасен (ТЗ 3.4): домены в
-// pending больше не кандидаты, охраны в UPDATE перепроверяют состояние
-// на момент записи.
+// RetryOnce performs one recheck pass (spec 5.3, 6.2):
+// up to opts.BatchSize domains in the temp_error status with a finished
+// check and last_checked_at older than RetryAfter receive either
+// an assigned retry (check_state → pending, temp_attempts + 1 — fewer
+// than MaxRetries attempts), or the final status delegated_no_address (the attempts
+// are exhausted, temp_attempts → 0). The batch decisions run in SEPARATE
+// transactions (retryDecide): each upholds the lock order
+// "domains → zones → counters" — a shared transaction would capture
+// the finalization domains rows while already holding zones and retry_mature buckets
+// (the edge "counters → domains", the 40P01 deadlock cycle with the result
+// write of the http-worker); the retry assignment is TWO statements of its
+// transaction (the move upd+zc, then the bucket decrement by the moved rows'
+// dates, T-267 — PG does not guarantee the order of unreferenced DML-CTEs of one
+// statement); a failure between the halves is safe — the guards of both UPDATEs
+// are idempotent, the unfinished half is picked up by the next pass
+// (spec 3.4). Before the selection — the guard over the sum of the maturity buckets
+// crawler_counters['retry_mature:…'] of the elapsed days (T-202,
+// retryMatureCount): a zero sum returns an empty result without the
+// heavy selection. A repeated pass is safe (spec 3.4): domains in
+// pending are no longer candidates, the guards in the UPDATE re-check the state
+// at the moment of the write.
 func RetryOnce(ctx context.Context, pool RetryDB, opts RetryOptions) (RetryResult, error) {
 	if pool == nil {
 		return RetryResult{}, errors.New("scheduler: повторные проверки temp_error: пул не задан")
 	}
 	o := opts.withDefaults()
 
-	// Guard корзинами зрелости (T-202): до тяжёлой выборки — сумма корзин
-	// прошедших суток (retryMatureCount); 0 → пустой результат без выборки
-	// и транзакции (drain корректно останавливается). Отрицательная сумма —
-	// видимый дрейф декрементов мимо инкрементов (кандидаты, ушедшие мимо
-	// ретрая: удаление temp_error-домена delete-файлом, возрастная
-	// перепроверка T-030): реконсиляция выровняет, а guard обязан молчать —
-	// тихий баг счётчика не должен молотить БД (наследие T-191).
+	// The guard over the maturity buckets (T-202): before the heavy selection — the sum of the
+	// elapsed days' buckets (retryMatureCount); 0 → an empty result without the selection
+	// and a transaction (drain stops correctly). A negative sum —
+	// a visible drift of decrements bypassing the increments (candidates that left
+	// bypassing the retry: a temp_error domain deleted by a delete file, the age-based
+	// recheck T-030): reconciliation will even it out, while the guard must stay silent —
+	// a silent counter bug must not hammer the DB (the T-191 legacy).
 	mature, err := retryMatureCount(ctx, pool)
 	if err != nil {
 		return RetryResult{}, err
@@ -410,12 +410,12 @@ func RetryOnce(ctx context.Context, pool RetryDB, opts RetryOptions) (RetryResul
 		return RetryResult{}, err
 	}
 	if len(candidates) == 0 {
-		// Корзины видят зрелых, выборка — нет (дрейф корзин: кандидат ушёл
-		// мимо инкрементов/декрементов, ЛИБО редкие зрелые рассеяны и ранний
-		// останов LIMIT их не догнал): транзакции решений не открываются,
-		// один холостой seq scan за тик до ближайшей реконсиляции —
-		// остаточный случай TZ T-191 §4.3, суженный T-202 с «всех temp_error»
-		// до «суммы корзин».
+		// The buckets see the mature ones, the selection does not (bucket drift: a candidate left
+		// bypassing the increments/decrements, OR rare mature ones are scattered and the early
+		// LIMIT stop did not catch them): the decision transactions do not open,
+		// one idle seq scan per tick until the nearest reconciliation —
+		// the residual case of the T-191 spec §4.3, narrowed by T-202 from "all temp_error"
+		// to "the bucket sum".
 		return RetryResult{}, nil
 	}
 
@@ -456,17 +456,17 @@ func RetryOnce(ctx context.Context, pool RetryDB, opts RetryOptions) (RetryResul
 	return res, nil
 }
 
-// retryMetrics — приборы прохода повторных проверок (T-268): счётчик
-// 40P01-повторов транзакций решений; nil — no-op (стиль
-// backlogLoopMetrics).
+// retryMetrics — the recheck pass instruments (T-268): the counter of
+// 40P01 retries of the decision transactions; nil — no-op (the
+// backlogLoopMetrics style).
 type retryMetrics struct {
 	dbRetried prometheus.Counter
 }
 
-// newRetryMetrics — приборы в реестре reg (nil — nil). Счётчик
-// 40P01-повторов — единые имя/HELP для всех сервисов (конструктор
-// internal/metrics, T-268); регистрация идемпотентна — построение на
-// каждый проход дренажа делит вектор первого вызова.
+// newRetryMetrics — instruments in the reg registry (nil — nil). The counter of
+// 40P01 retries — a single name/HELP for all services (the
+// internal/metrics constructor, T-268); registration is idempotent — building it on
+// every drain pass shares the vector of the first call.
 func newRetryMetrics(reg *metrics.Registry) *retryMetrics {
 	if reg == nil {
 		return nil
@@ -476,7 +476,7 @@ func newRetryMetrics(reg *metrics.Registry) *retryMetrics {
 	}
 }
 
-// dbDeadlockRetried — транзакция повторена после дедлока (T-268); nil —
+// dbDeadlockRetried — the transaction was retried after a deadlock (T-268); nil —
 // no-op.
 func (m *retryMetrics) dbDeadlockRetried(attempt int) {
 	if m == nil {
@@ -485,45 +485,45 @@ func (m *retryMetrics) dbDeadlockRetried(attempt int) {
 	m.dbRetried.Inc()
 }
 
-// retryDecide — одно решение пачки (назначение повтора или итоговый
-// статус) в собственной транзакции. Разделение транзакций — инвариант
-// порядка блокировок (docs/schema.md, раздел crawler_counters): ДВА
-// решения в одной транзакции захватывают domains-строки второй половины,
-// уже держа зоны и корзины retry_mature:{даты} первой, — ребро
-// «счётчики → domains» против транзакций записи результата http-worker
-// и прохода реконсиляции monitor (обе идут «domains → … → counters» и
-// до счётчиков ждут своих domains-строк) замыкало цикл дедлока 40P01:
-// 9 случаев за 3 ч на retry-волне, задача q:http ределиверилась полным
-// повторным HTTP-эпизодом. Раздельные транзакции каждую возвращают
-// конвенции, циклы через http-worker рвутся.
-// Назначение повтора выполняет в своей транзакции ДВА оператора
-// (T-267, matureSQL = retryRequeueMatureSQL): перевод (retryRequeueSQL:
-// upd → zc), затем хвостовой декремент корзин зрелости по ключам
-// (датам эпизодов) первого — операторы транзакции исполняются в
-// текстовом порядке, в отличие от нессылаемых DML-CTE одного оператора
-// (порядок PG не гарантирует, оговорка в zonestats.go; смешение zc/rm
-// одного оператора создавало ребро «счётчики → зоны» — инцидент
-// 07.11, runbooks.md §2.8). Зоны удерживаются до Commit — порядок
-// «domains → zones → counters» тот же, ребро «счётчики → domains»
-// не возвращается: после декремента транзакция новых строк domains
-// не захватывает. matureSQL = "" — решение без декремента
-// (финализация: rm в самом операторе, ссылается на upd). Декремент
-// выполняется только по непустому множеству ключей (охрана отбила
-// всех — корзины не трогаем).
-// Транзакция решения — под 40P01-ретраем (T-268, met — хук счётчика
-// повторов): попытка повторяется ЦЕЛИКОМ — охраны обоих UPDATE
-// идемпотентны (переведённые первой попыткой не переведутся повторно,
-// откаченная попытка не оставляет половин), остаточные циклы блокировок
-// гасятся на месте, не срывая дренаж.
-// Сбой любого оператора откатывает половину целиком (перевод и
-// декремент — одна транзакция, ТЗ 3.4): прерванная половина не
-// оставляет половинчатых изменений, кандидаты остаются кандидатами
-// следующего прохода (идемпотентность); зафиксированная половина
-// остаётся (переведённые не кандидаты). Ошибка половины (после
-// исчерпания ретраев) возвращает ошибку прохода — RetryResult
-// отбрасывается; дренаж RetryTempErrors повторит пачку тем же тиком
-// (до DefaultRetryDrainFails подряд), при устойчивом сбое — следующим
-// тиком.
+// retryDecide — one batch decision (a retry assignment or the final
+// status) in its own transaction. The transaction split is a lock
+// order invariant (docs/schema.md, the crawler_counters section): TWO
+// decisions in one transaction capture the second half's domains rows
+// while already holding the zones and retry_mature:{dates} buckets of the first — the edge
+// "counters → domains" against the result write transactions of the http-worker
+// and the reconciliation pass of monitor (both go "domains → … → counters" and
+// wait for their domains rows before the counters) closed the 40P01 deadlock cycle:
+// 9 cases in 3 h on the retry wave, the q:http task was redelivered with a full
+// repeated HTTP episode. Separate transactions return each to
+// the convention, the cycles through the http-worker break.
+// The retry assignment runs in its transaction with TWO statements
+// (T-267, matureSQL = retryRequeueMatureSQL): the move (retryRequeueSQL:
+// upd → zc), then the tail decrement of the maturity buckets by the first one's keys
+// (the episode dates) — the statements of a transaction execute in
+// textual order, unlike the unreferenced DML-CTEs of one statement
+// (PG does not guarantee the order, the caveat in zonestats.go; mixing zc/rm
+// of one statement created the edge "counters → zones" — the
+// Nov 07 incident, runbooks.md §2.8). The zones are held until Commit — the order
+// "domains → zones → counters" is the same, the edge "counters → domains"
+// does not return: after the decrement the transaction captures no new
+// domains rows. matureSQL = "" — a decision without a decrement
+// (finalization: rm in the statement itself, references upd). The decrement
+// is executed only over a non-empty set of keys (the guard blocked
+// everyone — the buckets are not touched).
+// The decision transaction runs under a 40P01 retry (T-268, met — the counter
+// hook of the retries): the attempt is repeated IN FULL — the guards of both UPDATEs
+// are idempotent (rows moved by the first attempt are not moved again,
+// a rolled-back attempt leaves no halves), residual lock cycles
+// are absorbed in place, without wrecking the drain.
+// A failure of any statement rolls back the half entirely (the move and the
+// decrement are one transaction, spec 3.4): the interrupted half leaves no
+// half-done changes inside itself, the candidates remain the next
+// pass's candidates (idempotency); the committed half
+// remains (the moved ones are no longer candidates). A half error (after
+// the retries are exhausted) returns a pass error — RetryResult
+// is discarded; the RetryTempErrors drain will retry the batch on the same tick
+// (up to DefaultRetryDrainFails in a row), on a persistent failure — on the
+// next tick.
 func retryDecide(ctx context.Context, pool RetryDB, sql, matureSQL, kind string,
 	zoneIDs []int16, domainIDs []int64, set, guardStatus, guardState int16, met *retryMetrics) (int, error) {
 	var n int
@@ -537,16 +537,16 @@ func retryDecide(ctx context.Context, pool RetryDB, sql, matureSQL, kind string,
 	return n, nil
 }
 
-// retryDecideOnce — ОДНА попытка транзакции решения (точка повтора
-// 40P01 — retryDecide, T-268).
+// retryDecideOnce — ONE attempt of the decision transaction (the 40P01
+// retry point — retryDecide, T-268).
 func retryDecideOnce(ctx context.Context, pool RetryDB, sql, matureSQL, kind string,
 	zoneIDs []int16, domainIDs []int64, set, guardStatus, guardState int16) (int, error) {
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("scheduler: повторные проверки temp_error: транзакция решения (%s): %w", kind, err)
 	}
-	// Откат безусловно: после Commit — no-op (стиль T-044). Прерванная
-	// половина не оставляет половинчатых изменений внутри себя (ТЗ 3.4).
+	// The rollback is unconditional: after Commit — a no-op (the T-044 style). The interrupted
+	// half leaves no half-done changes inside itself (spec 3.4).
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	keys, err := retryUpdate(ctx, tx, sql, kind, zoneIDs, domainIDs, set, guardStatus, guardState)
@@ -568,22 +568,22 @@ func retryDecideOnce(ctx context.Context, pool RetryDB, sql, matureSQL, kind str
 	return len(keys), nil
 }
 
-// retryCandidates выбирает до limit кандидатов повтора (retrySelectSQL) —
-// единая точка тяжёлой выборки прохода: ключи доменов и их счётчики
-// попыток для деления пачки. Выборка идёт в явной транзакции с SET LOCAL
-// enable_indexscan/bitmapscan/indexonlyscan = off (T-191, образец —
-// renderSelectPending T-181): закрепление формы плана — seq scan по
-// domains с ранним остановом LIMIT; без закрепления планировщик садится
-// на частичный domains_recheck_idx и вырождает окно повтора в марафон
-// (медиана 74,8 с на замере 25.10 — комментарий retrySelectSQL).
-// Транзакция — только оболочка закрепления: SELECT читает
-// зафиксированные данные, фиксация/откат по содержанию равнозначны.
+// retryCandidates selects up to limit retry candidates (retrySelectSQL) —
+// the single point of the pass's heavy selection: the domain keys and their attempt
+// counters for splitting the batch. The selection runs in an explicit transaction with SET LOCAL
+// enable_indexscan/bitmapscan/indexonlyscan = off (T-191, the
+// renderSelectPending T-181 precedent): pinning the plan form — a seq scan over
+// domains with an early LIMIT stop; without pinning the planner lands
+// on the partial domains_recheck_idx and degenerates the retry window into a marathon
+// (median 74.8 s on the Oct 25 measurement — the retrySelectSQL comment).
+// The transaction is only the pinning shell: the SELECT reads
+// committed data, commit/rollback are substantively equivalent.
 func retryCandidates(ctx context.Context, pool RetryDB, limit int, retryAfter time.Duration) ([]retryCandidate, error) {
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("scheduler: повторные проверки temp_error: транзакция выборки: %w", err)
 	}
-	// Откат безусловно: после Commit — no-op (стиль T-044).
+	// The rollback is unconditional: after Commit — a no-op (the T-044 style).
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	if _, err := tx.Exec(ctx, retryPlanNoIndexScanSQL); err != nil {
@@ -621,13 +621,13 @@ func retryCandidates(ctx context.Context, pool RetryDB, limit int, retryAfter ti
 	return candidates, nil
 }
 
-// retryMatureCount — guard прохода повторных проверок (T-202): сумма
-// корзин зрелости crawler_counters['retry_mature:…'] прошедших суток
-// (retryMatureSQL; ведут инкременты записи результата, декременты
-// ретрая и реконсиляция monitor — guard читает зрелых кандидатов, а не
-// весь статус temp_error, как T-191). coalesce в SQL гарантирует одну
-// строку даже без строк корзин (честный ноль): пустой набор — обрыв
-// протокола, а не «корзин нет», и обязан быть ошибкой.
+// retryMatureCount — the guard of the recheck pass (T-202): the sum of
+// the maturity buckets crawler_counters['retry_mature:…'] of the elapsed days
+// (retryMatureSQL; maintained by the result write increments, the retry
+// decrements and monitor reconciliation — the guard reads the mature candidates, not
+// the whole temp_error status, as T-191 did). coalesce in the SQL guarantees one
+// row even without bucket rows (an honest zero): an empty set is a protocol
+// break, not "no buckets", and must be an error.
 func retryMatureCount(ctx context.Context, pool RetryDB) (int64, error) {
 	rows, err := pool.Query(ctx, retryMatureSQL)
 	if err != nil {
@@ -636,8 +636,8 @@ func retryMatureCount(ctx context.Context, pool RetryDB) (int64, error) {
 	defer rows.Close()
 	var n int64
 	if !rows.Next() {
-		// Сначала сбой чтения: обрыв соединения — не «пустая сумма»
-		// (coalesce в SQL отвечает строкой всегда).
+		// The read failure first: a connection break is not "an empty sum"
+		// (the coalesce in the SQL always answers with a row).
 		if err := rows.Err(); err != nil {
 			return 0, fmt.Errorf("scheduler: повторные проверки temp_error: корзины зрелости: %w", err)
 		}
@@ -652,33 +652,33 @@ func retryMatureCount(ctx context.Context, pool RetryDB) (int64, error) {
 	return n, nil
 }
 
-// retryKey — ключ переведённой строки пачки: зона, домен и дата
-// эпизода (last_checked_at) — адресат хвостового декремента корзин
-// зрелости (T-202/T-267).
+// retryKey — the key of a moved batch row: the zone, the domain and the
+// episode date (last_checked_at) — the target of the tail decrement of the
+// maturity buckets (T-202/T-267).
 type retryKey struct {
 	zone int16
 	id   int64
 	day  time.Time
 }
 
-// retryUpdate выполняет пачечный UPDATE … RETURNING и возвращает ключи
-// фактически переведённых доменов (после охран — как RETURNING cleanup,
-// T-020: вторая параллельная транзакция, успевшая первой, не считается).
-// Назначение повтора возвращает ключи с датой эпизода (третья колонка
-// RETURNING — адресат декремента корзин, T-267); финализация — пару
-// (зона, id). set — значение SET-колонки (check_state повтора или
-// итоговый status), guardStatus/guardState — охрана WHERE.
+// retryUpdate executes the batch UPDATE … RETURNING and returns the keys of
+// the domains actually moved (after the guards — like the cleanup RETURNING,
+// T-020: a second concurrent transaction that made it first is not counted).
+// The retry assignment returns the keys with the episode date (the third
+// RETURNING column — the target of the bucket decrement, T-267); finalization — the pair
+// (zone, id). set — the value of the SET column (the check_state of the retry or the
+// final status), guardStatus/guardState — the WHERE guard.
 func retryUpdate(ctx context.Context, tx pgx.Tx, sql, kind string,
 	zoneIDs []int16, domainIDs []int64, set, guardStatus, guardState int16) ([]retryKey, error) {
 	rows, err := tx.Query(ctx, sql, zoneIDs, domainIDs, set, guardStatus, guardState)
 	if err != nil {
-		// Результат при err != nil отбрасывается вызывателем (RetryOnce
-		// возвращает RetryResult{}, err) — эквивалентных мутантов нет.
+		// The result at err != nil is discarded by the caller (RetryOnce
+		// returns RetryResult{}, err) — there are no equivalent mutants.
 		return nil, fmt.Errorf("scheduler: повторные проверки temp_error: %s: %w", kind, err)
 	}
 	defer rows.Close()
 
-	withDay := sql == retryRequeueSQL // ключи с датой эпизода — адресат декремента корзин (T-267)
+	withDay := sql == retryRequeueSQL // the keys with the episode date — the target of the bucket decrement (T-267)
 	keys := make([]retryKey, 0, len(zoneIDs))
 	for rows.Next() {
 		var k retryKey
@@ -689,28 +689,28 @@ func retryUpdate(ctx context.Context, tx pgx.Tx, sql, kind string,
 			scanErr = rows.Scan(&k.zone, &k.id)
 		}
 		if scanErr != nil {
-			// Ключи при ошибке Scan не читаются вызывателем (см. выше),
-			// ветка return закрыта тестом TestRetryOnceRowsErrors.
+			// The keys at a Scan error are not read by the caller (see above),
+			// the return branch is covered by the test TestRetryOnceRowsErrors.
 			return nil, fmt.Errorf("scheduler: повторные проверки temp_error: %s: чтение ключей: %w", kind, scanErr)
 		}
 		keys = append(keys, k)
 	}
 	if err := rows.Err(); err != nil {
-		// Ключи при ошибке rows.Err() не читаются вызывателем (см. выше),
-		// ветка return закрыта тестом TestRetryOnceRowsErrors.
+		// The keys at a rows.Err() error are not read by the caller (see above),
+		// the return branch is covered by the test TestRetryOnceRowsErrors.
 		return nil, fmt.Errorf("scheduler: повторные проверки temp_error: %s: %w", kind, err)
 	}
 	return keys, nil
 }
 
-// RetryTempErrors — фоновая задача повторных проверок (ТЗ 5.3): по
-// ticker выполняет дренаж всех созревших кандидатов пачками RetryOnce
-// (первый дренаж — сразу при старте: накопленное за простой разбирается
-// целиком, а не по пачке за тик), до отмены ctx и возвращает nil —
-// контракт OnRun каркаса сервисов (T-012: чистое завершение по
-// SIGTERM). Ошибка пачки не прерывает дренаж (T-268): он продолжает
-// следующие пачки до DefaultRetryDrainFails подряд упавших, затем —
-// очередной тик (цикл живёт, проход идемпотентен, ТЗ 3.4).
+// RetryTempErrors — the background recheck task (spec 5.3): on
+// each ticker tick it drains all ripened candidates in RetryOnce batches
+// (the first drain is immediate at start: what accumulated during the downtime is
+// processed in full, not one batch per tick), runs until ctx is cancelled and returns nil —
+// the OnRun contract of the service framework (T-012: a clean shutdown on
+// SIGTERM). A batch error does not interrupt the drain (T-268): it continues
+// with the following batches until DefaultRetryDrainFails failed in a row, then —
+// the next tick (the loop lives, the pass is idempotent, spec 3.4).
 func RetryTempErrors(ctx context.Context, pool RetryDB, opts RetryOptions) error {
 	if pool == nil {
 		return errors.New("scheduler: повторные проверки temp_error: пул не задан")
@@ -724,19 +724,19 @@ func RetryTempErrors(ctx context.Context, pool RetryDB, opts RetryOptions) error
 		"interval", o.Interval.String(), "batch", o.BatchSize,
 		"retry_after", o.RetryAfter.String(), "max_retries", o.MaxRetries)
 
-	// Дренаж до исчерпания кандидатов (стиль LeaseWatch/RecheckDaily):
-	// один тик обрабатывает все созревшие пачки, а не одну — иначе
-	// очередь повторов рассасывалась темпом BatchSize за интервал
-	// (1000/час по дефолту: массовый DNS-сбой оставался бы в temp_error
-	// месяцами). Пачки повторяются, пока проходят целиком; переведённые
-	// в pending не выбираются повторно — дренаж конечен, переводы
-	// подбирает главный цикл постановки (T-028).
-	// Ошибка пачки не срывает дренаж (T-268: инцидент 07.11 16:04 — WARN
-	// единственной пачки оставлял неразобранными 118 тыс. доменов до
-	// следующего тика): пачка повторяется (40P01 решения гасится ещё
-	// ретраем retryDecide, прочие ошибки — устойчивый сбой — проходят
-	// сюда), пока подряд упавших не накопится DefaultRetryDrainFails;
-	// успешная пачка обнуляет счётчик — дренаж жив, пока идёт прогресс.
+	// The drain until the candidates are exhausted (the LeaseWatch/RecheckDaily style):
+	// one tick processes all ripened batches, not one — otherwise
+	// the retry queue would dissipate at the rate of BatchSize per interval
+	// (1000/hour by default: a mass DNS failure would stay in temp_error
+	// for months). Batches repeat while they come back full; rows moved
+	// to pending are not selected again — the drain is finite, the moves
+	// are picked up by the main enqueue loop (T-028).
+	// A batch error does not wreck the drain (T-268: the Nov 07 16:04 incident — a WARN
+	// of a single batch left 118k domains unprocessed until
+	// the next tick): the batch is retried (a 40P01 of the decision is absorbed by the
+	// retryDecide retry even earlier, other errors — a persistent failure — come
+	// through here) until DefaultRetryDrainFails consecutive failures accumulate;
+	// a successful batch resets the counter — the drain lives as long as there is progress.
 	drain := func() {
 		var total RetryResult
 		fails := 0
@@ -744,7 +744,7 @@ func RetryTempErrors(ctx context.Context, pool RetryDB, opts RetryOptions) error
 			res, err := RetryOnce(ctx, pool, o)
 			switch {
 			case err != nil && ctx.Err() != nil:
-				// Отмена во время прохода — часть остановки, не тревога.
+				// Cancellation during a pass is part of the stop, not an alarm.
 				return
 			case err != nil:
 				fails++
@@ -767,7 +767,7 @@ func RetryTempErrors(ctx context.Context, pool RetryDB, opts RetryOptions) error
 					log.Info("дренаж повторных проверок temp_error",
 						"requeued", total.Requeued, "finalized", total.Finalized)
 				}
-				return // неполная пачка — множество исчерпано
+				return // an incomplete batch — the set is exhausted
 			}
 		}
 	}

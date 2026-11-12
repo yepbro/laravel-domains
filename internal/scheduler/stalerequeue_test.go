@@ -1,16 +1,16 @@
-// Юнит-тесты компенсатора «статус повис» (T-270, ТЗ tasks/TZ-fsm.md §3
-// ФТ-2.2) на фейковом pgx-пуле с транзакциями (стиль retry_test.go,
-// позиционный Scan — общий retryRows): точные SQL-тексты guard/выборки/
-// перевода и параметры (порог now() − 24 ч, LIMIT пачки, охраны
-// new ∧ done ∧ возраст, сброс queued_at, дельты зон checked −n /
-// pending +n), закрепление плана выборки SET LOCAL ×3, РАЗДЕЛЬНЫЕ
-// транзакции выборки и перевода, счёт по RETURNING, guard ноль — проход
-// без касания domains (дешёвая проба пустого множества), пустая пачка —
-// no-op (идемпотентность повторного прохода), ошибки шагов, 40P01-повтор
-// перевода, счётчик crawler_scheduler_stale_requeued_total растёт по
-// переводам, дренаж цикла StaleRequeueLoop пачками до исчерпания с
-// переживанием ошибки. Поведение против живой БД (включая потерянную
-// q:http и gauge new_done_stale) — интеграционные тесты
+// Unit tests of the "hung status" compensator (T-270, spec tasks/TZ-fsm.md §3
+// FR-2.2) on a fake pgx pool with transactions (the retry_test.go style,
+// the positional Scan — the shared retryRows): the exact SQL texts of the guard/selection/
+// move and parameters (the now() − 24 h threshold, the batch LIMIT, the guards
+// new ∧ done ∧ age, the queued_at reset, the zone deltas checked −n /
+// pending +n), the selection plan pinning SET LOCAL ×3, SEPARATE
+// transactions of the selection and the move, counting by RETURNING, a zero guard — a pass
+// without touching domains (a cheap empty-set probe), an empty batch —
+// a no-op (the idempotency of a repeated pass), step errors, a 40P01 retry
+// of the move; the crawler_scheduler_stale_requeued_total counter grows by the
+// moves; the StaleRequeueLoop cycle drain in batches until exhaustion, surviving
+// an error. Behavior against a live DB (including the lost
+// q:http and the new_done_stale gauge) — integration tests
 // (test/integration/stalerequeue_test.go).
 package scheduler
 
@@ -31,14 +31,14 @@ import (
 	"crawler/internal/model"
 )
 
-// --- заготовки -------------------------------------------------------------
+// --- stubs -------------------------------------------------------------
 
-// staleNow — фиксированные часы прохода (стиль lease-тестов): порог
-// вычисляется от них, тест сверяет точное значение.
+// staleNow — the fixed pass clocks (the lease test style): the threshold
+// is computed from them; the test checks the exact value.
 var staleNow = time.Date(2026, 11, 8, 12, 0, 0, 0, time.UTC)
 
-// staleSeedBatch — заготовка пачки: n строк, translated строк RETURNING
-// (guard мог отсеять часть).
+// staleSeedBatch — a batch stub: n rows, translated RETURNING rows
+// (the guard could have filtered out part).
 func staleSeedBatch(rows [][2]int64, translated int64) (*retryFakeRows, *retryFakeRows) {
 	sel := make([][]any, len(rows))
 	for i, r := range rows {
@@ -51,31 +51,31 @@ func staleSeedBatch(rows [][2]int64, translated int64) (*retryFakeRows, *retryFa
 	return retryRows(sel...), retryRows(upd...)
 }
 
-// staleFakePool — StaleRequeueDB без БД: guard-чтение уровня
-// new_done_stale через пул, очереди заготовленных результатов SELECT
-// пачки (в транзакции закрепления плана) и UPDATE … RETURNING (в
-// транзакции перевода), ошибки по шагам прохода, протокол вызовов и
-// порядок операций. Всё под замком: цикл StaleRequeueLoop работает в
-// горутине, тест ожидает прогресс по счётчикам.
+// staleFakePool — a StaleRequeueDB without a DB: the guard read of the
+// new_done_stale level via the pool; the queues of stubbed SELECT results of the
+// batch (in the plan pinning transaction) and UPDATE … RETURNING (in
+// the move transaction), per-step pass errors, the call protocol and the
+// operation order. Everything under a lock: the StaleRequeueLoop loop runs in
+// a goroutine; the test waits for progress by counters.
 type staleFakePool struct {
 	mu sync.Mutex
 
-	guardVal   int64            // уровень new_done_stale (0 — guard закрыт)
-	guardErrs  []error          // FIFO ошибок guard (nil — чтение без ошибки)
-	guardEmpty bool             // guard возвращает пустой набор — обрыв протокола
-	selects    []*retryFakeRows // FIFO результатов SELECT пачки (кончилась — пустой набор)
-	updates    []*retryFakeRows // FIFO результатов UPDATE RETURNING
-	selectErrs []error          // FIFO ошибок SELECT (nil — без ошибки)
-	planErr    error            // ошибка закрепления плана (SET LOCAL)
-	updateErrs []error          // FIFO одноразовых ошибок UPDATE (nil — попытка без ошибки)
-	beginErr   error            // ошибка Begin
-	commitErrs []error          // FIFO ошибок Commit (кончилась — фиксация без ошибки)
+	guardVal   int64            // the new_done_stale level (0 — the guard is closed)
+	guardErrs  []error          // the FIFO of guard errors (nil — a read without an error)
+	guardEmpty bool             // the guard returns an empty set — a protocol break
+	selects    []*retryFakeRows // the FIFO of batch SELECT results (ran out — an empty set)
+	updates    []*retryFakeRows // the FIFO of UPDATE RETURNING results
+	selectErrs []error          // the FIFO of SELECT errors (nil — no error)
+	planErr    error            // the plan pinning error (SET LOCAL)
+	updateErrs []error          // the FIFO of one-off UPDATE errors (nil — an attempt without an error)
+	beginErr   error            // the Begin error
+	commitErrs []error          // the FIFO of Commit errors (ran out — a commit without an error)
 
-	guardQueries []retryCall // guard-чтения через пул
-	selectCalls  []retryCall // SELECT пачки (в транзакциях закрепления)
-	updateCalls  []retryCall // UPDATE перевода (в транзакциях перевода)
-	planCalls    []retryCall // SET LOCAL закрепления плана
-	ops          []string    // порядок операций: begin/plan/select/update/commit
+	guardQueries []retryCall // guard reads via the pool
+	selectCalls  []retryCall // the batch SELECT (in pinning transactions)
+	updateCalls  []retryCall // the move UPDATE (in move transactions)
+	planCalls    []retryCall // the plan pinning SET LOCALs
+	ops          []string    // the operation order: begin/plan/select/update/commit
 	begins       int
 	commits      int
 }
@@ -88,8 +88,8 @@ func (p *staleFakePool) Exec(context.Context, string, ...any) (pgconn.CommandTag
 	return pgconn.CommandTag{}, errors.New("Exec не должен вызываться")
 }
 
-// Query — guard-чтение уровня new_done_stale: единственный SELECT прохода
-// мимо транзакций; выборка пачки идёт в транзакции закрепления плана.
+// Query — the guard read of the new_done_stale level: the pass's only SELECT
+// outside transactions; the batch selection runs in the plan pinning transaction.
 func (p *staleFakePool) Query(_ context.Context, sql string, args ...any) (pgx.Rows, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -105,7 +105,7 @@ func (p *staleFakePool) Query(_ context.Context, sql string, args ...any) (pgx.R
 		}
 	}
 	if p.guardEmpty {
-		return retryRows(), nil // пустой набор — обрыв протокола (coalesce отвечает строкой)
+		return retryRows(), nil // an empty set — a protocol break (coalesce answers with a row)
 	}
 	return retryRows([]any{p.guardVal}), nil
 }
@@ -121,8 +121,8 @@ func (p *staleFakePool) Begin(context.Context) (pgx.Tx, error) {
 	return &staleFakeTx{pool: p}, nil
 }
 
-// nextErrLocked — ошибка из FIFO-очереди одноразовых ошибок (nil —
-// попытка без ошибки); очередь пуста — nil.
+// nextErrLocked — an error from the FIFO queue of one-off errors (nil —
+// an attempt without an error); the queue is empty — nil.
 func (p *staleFakePool) nextErrLocked(queue *[]error) error {
 	if len(*queue) == 0 {
 		return nil
@@ -136,11 +136,11 @@ func errStaleUnexpected(where, sql string) error {
 	return errors.New("staleFakePool: неожидаемый SQL через " + where + ": " + sql)
 }
 
-// снимки протокола под замком (ожидание прогресса цикла в тестах).
+// snapshots of the protocol under the lock (waiting for loop progress in tests).
 
 type staleStats struct {
-	guards  int // guard-чтений уровня
-	selects int // выборок пачки
+	guards  int // guard reads of the level
+	selects int // batch selections
 	begins  int
 	commits int
 }
@@ -175,10 +175,10 @@ func (p *staleFakePool) planSnapshot() []retryCall {
 	return append([]retryCall(nil), p.planCalls...)
 }
 
-// staleFakeTx — транзакция фейкового пула: закрепление плана (Exec) и
-// выборка пачки ЛИБО перевод (Query) — по SQL.
+// staleFakeTx — the fake pool's transaction: plan pinning (Exec) and
+// either the batch selection or the move (Query) — by the SQL.
 type staleFakeTx struct {
-	pgx.Tx // остальные методы pgx.Tx проход не использует
+	pgx.Tx // the other pgx.Tx methods are not used by the pass
 	pool   *staleFakePool
 }
 
@@ -213,7 +213,7 @@ func (t *staleFakeTx) Query(_ context.Context, sql string, args ...any) (pgx.Row
 			t.pool.selects = t.pool.selects[1:]
 			return rows, nil
 		}
-		return retryRows(), nil // множество исчерпано
+		return retryRows(), nil // the set is exhausted
 	case staleRequeueUpdateSQL:
 		t.pool.updateCalls = append(t.pool.updateCalls, retryCall{sql: sql, args: args})
 		t.pool.ops = append(t.pool.ops, "update")
@@ -246,11 +246,11 @@ func (t *staleFakeTx) Commit(context.Context) error {
 	return nil
 }
 
-// Rollback — no-op: откат после Commit пуст, прерванная транзакция
-// ничего не меняла (стиль retryFakeTx).
+// Rollback — a no-op: a rollback after Commit is empty; the interrupted transaction
+// changed nothing (the retryFakeTx style).
 func (t *staleFakeTx) Rollback(context.Context) error { return nil }
 
-// --- ожидаемые SQL-тексты (контракт Р15/ФТ-2.2) ----------------------------
+// --- expected SQL texts (the R15/FR-2.2 contract) ----------------------------
 
 const wantStaleRequeueGuard = "SELECT coalesce((SELECT value FROM crawler_counters WHERE name = 'new_done_stale'), 0)"
 
@@ -273,12 +273,12 @@ const wantStaleRequeueUpdate = "WITH upd AS (UPDATE domains AS t " +
 
 // --- StaleRequeueOnce -------------------------------------------------------
 
-// TestStaleRequeueOnceSQL — контракт всех операторов прохода: guard —
-// точечный лукап уровня, SELECT пачки — new ∧ done ∧ возраст без
-// сортировки (ранний останов LIMIT), UPDATE … FROM unnest с guard-охранами
-// и дельтами зон checked −n / pending +n; точные параметры (порог
-// now() − 24 ч, LIMIT, коды литералами), РАЗДЕЛЬНЫЕ транзакции выборки
-// (закрепление плана SET LOCAL ×3 до SELECT) и перевода, счёт по
+// TestStaleRequeueOnceSQL — the contract of all pass statements: the guard —
+// a point lookup of the level; the batch SELECT — new ∧ done ∧ age without
+// sorting (an early LIMIT stop); UPDATE … FROM unnest with guard re-checks
+// and zone deltas checked −n / pending +n; exact parameters (the
+// now() − 24 h threshold, the LIMIT, the codes as literals), SEPARATE transactions of the
+// selection (plan pinning SET LOCAL ×3 before the SELECT) and the move; counting by
 // RETURNING.
 func TestStaleRequeueOnceSQL(t *testing.T) {
 	sel, upd := staleSeedBatch([][2]int64{{1, 1}, {1, 2}, {2, 3}}, 2)
@@ -323,21 +323,21 @@ func TestStaleRequeueOnceSQL(t *testing.T) {
 	}
 	wantUpdArgs := []any{
 		int16(model.CheckStatePending), // SET check_state
-		[]int16{1, 1, 2},               // зоны выбранной пачки
-		[]int64{1, 2, 3},               // домены выбранной пачки
-		cutoff,                         // порог — тот же, что у выборки
+		[]int16{1, 1, 2},               // the zones of the selected batch
+		[]int64{1, 2, 3},               // the domains of the selected batch
+		cutoff,                         // the threshold — the same as the selection's
 	}
 	if !reflect.DeepEqual(upds[0].args, wantUpdArgs) {
 		t.Errorf("аргументы перевода = %v, want %v", upds[0].args, wantUpdArgs)
 	}
 
-	// Счёт по RETURNING: переведено 2 из выбранных 3 (guard отсеял одну).
+	// Counting by RETURNING: 2 of the selected 3 moved (the guard filtered out one).
 	if res.Domains != 2 || res.Selected != 3 {
 		t.Errorf("итог = %+v, want Domains=2 (RETURNING), Selected=3", res)
 	}
 
-	// Закрепление плана — только в транзакции выборки, тремя SET LOCAL
-	// до SELECT (T-191): переводу не наследуется.
+	// The plan pinning — only in the selection transaction, by three SET LOCALs
+	// before the SELECT (T-191): not inherited by the move.
 	if plans := pool.planSnapshot(); len(plans) != 3 ||
 		plans[0].sql != staleRequeuePlanNoIndexScanSQL ||
 		plans[1].sql != staleRequeuePlanNoBitmapScanSQL ||
@@ -346,8 +346,8 @@ func TestStaleRequeueOnceSQL(t *testing.T) {
 	}
 }
 
-// TestStaleRequeueOnceWindow — порог 24 ч: константа равна окну gauge
-// (ФТ-2.2), параметр выборки — now() − 24 ч от источника времени прохода.
+// TestStaleRequeueOnceWindow — the 24 h threshold: the constant equals the gauge
+// window (FR-2.2); the selection parameter is now() − 24 h from the pass's time source.
 func TestStaleRequeueOnceWindow(t *testing.T) {
 	if StaleRequeueWindow != 24*time.Hour {
 		t.Fatalf("StaleRequeueWindow = %v, want 24 ч (окно gauge new_done_stale)", StaleRequeueWindow)
@@ -368,9 +368,9 @@ func TestStaleRequeueOnceWindow(t *testing.T) {
 	}
 }
 
-// TestStaleRequeueOnceGuardClosed — дешёвая проба пустого множества:
-// уровень new_done_stale ноль (стационар) — проход читает ОДИН лукап
-// счётчика и не открывает транзакций: domains не сканируется вовсе.
+// TestStaleRequeueOnceGuardClosed — a cheap empty-set probe:
+// the new_done_stale level is zero (steady state) — the pass performs ONE
+// counter lookup and opens no transactions: domains is not scanned at all.
 func TestStaleRequeueOnceGuardClosed(t *testing.T) {
 	pool := &staleFakePool{guardVal: 0}
 
@@ -390,11 +390,11 @@ func TestStaleRequeueOnceGuardClosed(t *testing.T) {
 	}
 }
 
-// TestStaleRequeueOnceEmptyBatch — guard открыт, выборка пуста (дрейф
-// уровня до реконсиляции): транзакция перевода не открывается, итог
-// нулевой — повторный проход no-op (идемпотентность).
+// TestStaleRequeueOnceEmptyBatch — the guard is open, the selection is empty (level
+// drift until reconciliation): the move transaction does not open; the outcome
+// is zero — a repeated pass is a no-op (idempotency).
 func TestStaleRequeueOnceEmptyBatch(t *testing.T) {
-	pool := &staleFakePool{guardVal: 1} // selects/updates пусты
+	pool := &staleFakePool{guardVal: 1} // selects/updates are empty
 
 	res, err := StaleRequeueOnce(context.Background(), pool, StaleRequeueOptions{})
 	if err != nil {
@@ -409,9 +409,9 @@ func TestStaleRequeueOnceEmptyBatch(t *testing.T) {
 	}
 }
 
-// TestStaleRequeueOnceIdempotent — повторный проход после переведённой
-// пачки: переведённые перестают удовлетворять отбору (выборка пуста) —
-// no-op, счётчик не растёт.
+// TestStaleRequeueOnceIdempotent — a repeated pass after a moved
+// batch: the moved rows stop matching the selection (the selection is empty) —
+// a no-op, the counter does not grow.
 func TestStaleRequeueOnceIdempotent(t *testing.T) {
 	sel, upd := staleSeedBatch([][2]int64{{1, 1}, {1, 2}}, 2)
 	reg := metrics.New("scheduler")
@@ -433,8 +433,8 @@ func TestStaleRequeueOnceIdempotent(t *testing.T) {
 	}
 }
 
-// TestStaleRequeueOnceDefaults — нулевые опции: LIMIT — дефолтная пачка,
-// порог — от системных часов (Now nil не мешает проходу).
+// TestStaleRequeueOnceDefaults — zero options: the LIMIT is the default batch;
+// the threshold — from the system clock (Now nil does not hinder the pass).
 func TestStaleRequeueOnceDefaults(t *testing.T) {
 	sel, upd := staleSeedBatch([][2]int64{{1, 1}}, 1)
 	pool := &staleFakePool{guardVal: 1, selects: []*retryFakeRows{sel}, updates: []*retryFakeRows{upd}}
@@ -453,9 +453,9 @@ func TestStaleRequeueOnceDefaults(t *testing.T) {
 	}
 }
 
-// TestStaleRequeueOnceError — ошибки шагов прохода обёртываются с
-// контекстом компенсатора; обрыв протокола guard (пустой набор) и nil-пул
-// — ошибки.
+// TestStaleRequeueOnceError — pass step errors are wrapped with the
+// compensator context; a guard protocol break (an empty set) and a nil pool
+// — are errors.
 func TestStaleRequeueOnceError(t *testing.T) {
 	ctx := context.Background()
 
@@ -508,9 +508,9 @@ func TestStaleRequeueOnceError(t *testing.T) {
 	}
 }
 
-// TestStaleRequeueOnceDeadlockRetry — 40P01 транзакции перевода
-// повторяется целиком (T-268): охраны идемпотентны, переведённое первой
-// попыткой не переведётся повторно — повторный Begin того же оператора.
+// TestStaleRequeueOnceDeadlockRetry — a 40P01 of the move transaction
+// is retried in full (T-268): the guards are idempotent, what the first
+// attempt moved is not moved again — a repeated Begin of the same statement.
 func TestStaleRequeueOnceDeadlockRetry(t *testing.T) {
 	sel, upd := staleSeedBatch([][2]int64{{1, 1}}, 1)
 	pool := &staleFakePool{
@@ -532,12 +532,12 @@ func TestStaleRequeueOnceDeadlockRetry(t *testing.T) {
 	}
 }
 
-// TestStaleRequeueOnceMetrics — счётчик crawler_scheduler_stale_requeued_total
-// растёт на фактически переведённые (по RETURNING, не по выборке);
-// без реестра (nil Metrics) проход работает.
+// TestStaleRequeueOnceMetrics — the crawler_scheduler_stale_requeued_total counter
+// grows by the rows actually moved (by RETURNING, not by the selection);
+// without a registry (nil Metrics) the pass works.
 func TestStaleRequeueOnceMetrics(t *testing.T) {
 	reg := metrics.New("scheduler")
-	sel, upd := staleSeedBatch([][2]int64{{1, 1}, {1, 2}, {2, 3}}, 2) // переведено 2 (guard отсеял одну)
+	sel, upd := staleSeedBatch([][2]int64{{1, 1}, {1, 2}, {2, 3}}, 2) // 2 moved (the guard filtered out one)
 	pool := &staleFakePool{guardVal: 1, selects: []*retryFakeRows{sel}, updates: []*retryFakeRows{upd}}
 
 	if _, err := StaleRequeueOnce(context.Background(), pool, StaleRequeueOptions{Metrics: reg}); err != nil {
@@ -547,14 +547,14 @@ func TestStaleRequeueOnceMetrics(t *testing.T) {
 		t.Errorf("счётчик = %v, want 2 (по RETURNING)", got)
 	}
 
-	// Без реестра (nil Metrics) и с закрытым guard — no-op, проход выполняется.
+	// Without a registry (nil Metrics) and with a closed guard — a no-op; the pass runs.
 	emptyPool := &staleFakePool{guardVal: 0}
 	if _, err := StaleRequeueOnce(context.Background(), emptyPool, StaleRequeueOptions{}); err != nil {
 		t.Fatalf("StaleRequeueOnce без реестра: %v", err)
 	}
 }
 
-// staleRequeuedValue — значение счётчика компенсатора в реестре (стиль
+// staleRequeuedValue — the compensator counter's value in the registry (the style
 // leaseNullReturnedValue).
 func staleRequeuedValue(t *testing.T, reg *metrics.Registry) float64 {
 	t.Helper()
@@ -573,18 +573,18 @@ func staleRequeuedValue(t *testing.T, reg *metrics.Registry) float64 {
 	return 0
 }
 
-// --- цикл StaleRequeueLoop ---------------------------------------------------
+// --- the StaleRequeueLoop cycle ---------------------------------------------------
 
-// TestStaleRequeueLoopDrain — стартовый дренаж пачками до исчерпания:
-// полная пачка продолжает дренаж, неполная останавливает; счётчик растёт
-// на итог; без тика новых выборок нет; отмена ctx — чистый nil.
+// TestStaleRequeueLoopDrain — the starting drain in batches until exhaustion:
+// a full batch continues the drain, an incomplete one stops it; the counter grows
+// by the outcome; without a tick there are no new selections; ctx cancellation — a clean nil.
 func TestStaleRequeueLoopDrain(t *testing.T) {
 	reg := metrics.New("scheduler")
 	fullSel, fullUpd := staleSeedBatch([][2]int64{{1, 1}, {1, 2}}, 2)
 	tailSel, tailUpd := staleSeedBatch([][2]int64{{2, 3}}, 1)
 	pool := &staleFakePool{
 		guardVal: 1,
-		selects:  []*retryFakeRows{fullSel, tailSel}, // BatchSize=2: полная, затем неполная
+		selects:  []*retryFakeRows{fullSel, tailSel}, // BatchSize=2: full, then incomplete
 		updates:  []*retryFakeRows{fullUpd, tailUpd},
 	}
 
@@ -594,7 +594,7 @@ func TestStaleRequeueLoopDrain(t *testing.T) {
 	go func() {
 		done <- StaleRequeueLoop(ctx, pool, StaleRequeueOptions{
 			BatchSize: 2,
-			Interval:  time.Hour, // тик не наступит: только стартовый дренаж
+			Interval:  time.Hour, // the tick never comes: only the starting drain
 			Metrics:   reg,
 		})
 	}()
@@ -615,7 +615,7 @@ func TestStaleRequeueLoopDrain(t *testing.T) {
 	if got := staleRequeuedValue(t, reg); got != 3 {
 		t.Errorf("счётчик дренажа = %v, want 3", got)
 	}
-	// Обе пачки — одним стартовым дренажём: неполная пачка останавливает.
+	// Both batches — by one starting drain: an incomplete batch stops it.
 	if got := len(pool.selectSnapshot()); got != 2 {
 		t.Errorf("SELECT-вызовов = %d, want 2 (неполная пачка останавливает)", got)
 	}
@@ -626,9 +626,9 @@ func TestStaleRequeueLoopDrain(t *testing.T) {
 	}
 }
 
-// TestStaleRequeueLoopError — ошибка прохода прерывает только текущий
-// дренаж: цикл живёт, очередной тик повторяет (контракт OnRun); Warn в
-// журнале.
+// TestStaleRequeueLoopError — a pass error interrupts only the current
+// drain: the loop lives, the next tick retries (the OnRun contract); a Warn in
+// the log.
 func TestStaleRequeueLoopError(t *testing.T) {
 	var buf strings.Builder
 	logger := slog.New(slog.NewTextHandler(&buf, nil))
@@ -638,7 +638,7 @@ func TestStaleRequeueLoopError(t *testing.T) {
 		guardVal:  1,
 		selects:   []*retryFakeRows{sel},
 		updates:   []*retryFakeRows{upd},
-		guardErrs: []error{errors.New("бд недоступна")}, // первый проход падает
+		guardErrs: []error{errors.New("бд недоступна")}, // the first pass fails
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -651,10 +651,10 @@ func TestStaleRequeueLoopError(t *testing.T) {
 		})
 	}()
 
-	// Первый дренаж падает, тик повторяет и доводит пачку.
+	// The first drain fails; the tick retries and finishes the batch.
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		if st := pool.stats(); st.commits >= 2 { // выборка и перевод дожаты до фиксаций
+		if st := pool.stats(); st.commits >= 2 { // the selection and the move are pushed through to commits
 			break
 		}
 		if time.Now().After(deadline) {

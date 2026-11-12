@@ -1,9 +1,9 @@
-// Юнит-тесты коллектора глубины backlog (T-077, ТЗ 5.9) на фейковом
-// pgx-пуле: точный SQL-текст и параметр (исключение deleted), экспорт
-// обеих серий gauge через Gather (включая нулевые), дефолты, ошибки,
-// nil-зависимости, цикл BacklogLoop (немедленный первый проход,
-// переживание ошибки, чистый выход по отмене ctx). Поведение против
-// живой БД — интеграционные тесты.
+// Unit tests of the backlog depth collector (T-077, spec 5.9) on a fake
+// pgx pool: the exact SQL text and parameter (excluding deleted), the export
+// of both gauge series via Gather (including zeros), defaults, errors,
+// nil dependencies, the BacklogLoop cycle (an immediate first pass,
+// surviving an error, a clean exit on ctx cancellation). Behavior against
+// a live DB — integration tests.
 package scheduler
 
 import (
@@ -26,21 +26,21 @@ import (
 	"crawler/internal/model"
 )
 
-// --- фейковый пул ---------------------------------------------------------
+// --- fake pool ---------------------------------------------------------
 
-// backlogCall — записанный SQL-вызов с аргументами.
+// backlogCall — a recorded SQL call with its arguments.
 type backlogCall struct {
 	sql  string
 	args []any
 }
 
-// backlogFakeRows — pgx.Rows с заготовленными строками; Scan позиционный,
-// в порядке колонок SQL (check_state, count).
+// backlogFakeRows — pgx.Rows with pre-made rows; Scan is positional,
+// in the order of the SQL columns (check_state, count).
 type backlogFakeRows struct {
 	rows   [][]any
 	i      int
 	closed bool
-	err    error // Err() после исчерпания строк
+	err    error // Err() after the rows are exhausted
 }
 
 func backlogRows(rows ...[]any) *backlogFakeRows {
@@ -86,12 +86,12 @@ func (r *backlogFakeRows) Values() ([]any, error) { return r.rows[r.i-1], nil }
 
 func (r *backlogFakeRows) RawValues() [][]byte { return nil }
 
-// Conn и TypeMap — часть pgx.Rows, не используемая позиционным Scan.
+// Conn and TypeMap — part of pgx.Rows not used by the positional Scan.
 func (r *backlogFakeRows) Conn() *pgx.Conn      { return nil }
 func (r *backlogFakeRows) TypeMap() *pgtype.Map { return nil }
 
-// backlogFakePool — db.DB без БД: ответ Query задаётся hook (пул
-// используется циклом в горутине, тест меняет поведение проходов).
+// backlogFakePool — a db.DB without a DB: the Query response is set by a hook (the pool
+// is used by the loop in a goroutine; the test changes pass behavior).
 type backlogFakePool struct {
 	mu    sync.Mutex
 	hook  func() (pgx.Rows, error)
@@ -114,25 +114,25 @@ func (p *backlogFakePool) Query(_ context.Context, sql string, args ...any) (pgx
 	return hook()
 }
 
-// setHook меняет поведение ответов (тест подменяет сценарий на живом
-// цикле; доступ под замком — Query работает в горутине цикла).
+// setHook changes response behavior (the test swaps the scenario on the live
+// loop; access under a lock — Query runs in the loop's goroutine).
 func (p *backlogFakePool) setHook(f func() (pgx.Rows, error)) {
 	p.mu.Lock()
 	p.hook = f
 	p.mu.Unlock()
 }
 
-// callsCount — снимок числа вызовов под замком (ожидание прогресса
-// цикла в тестах).
+// callsCount — a snapshot of the call count under the lock (waiting for loop
+// progress in tests).
 func (p *backlogFakePool) callsCount() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return len(p.calls)
 }
 
-// syncBuf — bytes.Buffer под замком: slog пишет из горутины цикла, а
-// тест читает лог ДО её завершения (ожидание Warn вживую) — без
-// синхронизации это гонка.
+// syncBuf — a bytes.Buffer under a lock: slog writes from the loop goroutine, and
+// the test reads the log BEFORE it finishes (waiting for a Warn live) — without
+// synchronization this is a race.
 type syncBuf struct {
 	mu  sync.Mutex
 	buf bytes.Buffer
@@ -154,17 +154,17 @@ func (b *syncBuf) contains(s string) bool {
 	return strings.Contains(b.String(), s)
 }
 
-// --- ожидаемый SQL-текст (контракт) ---------------------------------------
+// --- expected SQL text (contract) ---------------------------------------
 
 const wantBacklogSQL = "SELECT coalesce(sum(domains_pending), 0), coalesce(sum(domains_queued), 0) FROM zones"
 
-// backlogPair — строка ответа нового прохода (pending, queued): суммы
-// счётчиков справочника зон (T-178).
+// backlogPair — a row of the new pass's response (pending, queued): sums of
+// the zone reference table counters (T-178).
 func backlogPair(pending, queued int64) *backlogFakeRows {
 	return backlogRows([]any{pending, queued})
 }
 
-// backlogGaugeValue — текущее значение серии crawler_backlog_domains.
+// backlogGaugeValue — the current value of the crawler_backlog_domains series.
 func backlogGaugeValue(t *testing.T, reg *metrics.Registry, state string) (float64, bool) {
 	t.Helper()
 	families, err := reg.Gather()
@@ -177,7 +177,7 @@ func backlogGaugeValue(t *testing.T, reg *metrics.Registry, state string) (float
 		}
 		for _, m := range mf.GetMetric() {
 			for _, l := range m.GetLabel() {
-				// Имя метки — state (docs/services.md, ТЗ 5.9): не type.
+				// The label name is state (docs/services.md, spec 5.9): not type.
 				if l.GetName() == metrics.LabelState && l.GetValue() == state {
 					return m.GetGauge().GetValue(), true
 				}
@@ -220,9 +220,9 @@ func TestBacklogOnce(t *testing.T) {
 	}
 }
 
-// Пустой справочник — нули: пустой backlog обязан экспортироваться, а
-// не пропадать из /metrics до следующего непустого (агрегат без GROUP BY
-// всегда отвечает одной строкой с нулями).
+// An empty reference table — zeros: an empty backlog must be exported, and
+// not disappear from /metrics until the next non-empty one (an aggregate without GROUP BY
+// always answers with a single row of zeros).
 func TestBacklogOnceEmptyStates(t *testing.T) {
 	reg := metrics.New("scheduler")
 	pool := &backlogFakePool{hook: func() (pgx.Rows, error) {
@@ -252,8 +252,8 @@ func TestBacklogOnceErrors(t *testing.T) {
 		!errors.Is(err, boom) {
 		t.Fatalf("ошибка = %v, want исходная ошибка БД", err)
 	}
-	// Сбой прохода gauge не трогает: серии остаются с прошлым значением
-	// или отсутствуют — но не «обнуляются» (ложное «backlog пуст»).
+	// A pass failure does not touch the gauge: the series keep their previous value
+	// or are absent — but not "reset to zero" (a false "backlog is empty").
 	if _, ok := backlogGaugeValue(t, reg, model.CheckStatePending.String()); ok {
 		t.Error("сбойный проход не должен писать gauge")
 	}
@@ -269,9 +269,9 @@ func TestBacklogOnceErrors(t *testing.T) {
 }
 
 func TestBacklogOptionsDefaults(t *testing.T) {
-	// Дефолт пинится литералом (T-161, замер §12: мутация константы
-	// не должна незамеченной менять дефолт): сравнение с самой
-	// константой мутации не замечает.
+	// The default is pinned by a literal (T-161, measurement §12: a mutation of the constant
+	// must not change the default unnoticed): comparing with the very
+	// constant does not notice mutations.
 	if DefaultBacklogInterval != 5*time.Minute {
 		t.Errorf("DefaultBacklogInterval = %v, want 5m", DefaultBacklogInterval)
 	}
@@ -281,20 +281,20 @@ func TestBacklogOptionsDefaults(t *testing.T) {
 	if got := (BacklogOptions{Interval: time.Second}).withDefaults().Interval; got != time.Second {
 		t.Errorf("кастомный Interval затёрт: %v", got)
 	}
-	// 1 нс — положительное значение, дефолтом не заменяется.
+	// 1 ns — a positive value, not replaced by the default.
 	if got := (BacklogOptions{Interval: time.Nanosecond}).withDefaults().Interval; got != time.Nanosecond {
 		t.Errorf("Interval 1нс = %v, want без замены", got)
 	}
 }
 
-// TestBacklogOnceRowsErrors — ошибки чтения ответа: Scan (лишняя колонка
-// ломает позиционный приём), rows.Err после строки и пустой ответ
-// (агрегат обязан отвечать одной строкой) — точные контексты
-// сообщений, исходная ошибка проксируется (errors.Is).
+// TestBacklogOnceRowsErrors — response read errors: Scan (an extra column
+// breaks the positional receiving), rows.Err after a row, and an empty response
+// (the aggregate must answer with a single row) — exact message
+// contexts, the original error is proxied (errors.Is).
 func TestBacklogOnceRowsErrors(t *testing.T) {
 	reg := metrics.New("scheduler")
 
-	// Scan: строка с тремя колонками вместо двух.
+	// Scan: a row with three columns instead of two.
 	scanPool := &backlogFakePool{hook: func() (pgx.Rows, error) {
 		return backlogRows([]any{int64(1), int64(2), int64(3)}), nil
 	}}
@@ -303,7 +303,7 @@ func TestBacklogOnceRowsErrors(t *testing.T) {
 		t.Errorf("ошибка Scan = %v, want контекст «чтение»", err)
 	}
 
-	// rows.Err после строки ответа.
+	// rows.Err after a response row.
 	boom := errors.New("бд недоступна")
 	errRows := backlogPair(3, 4)
 	errRows.err = boom
@@ -313,8 +313,8 @@ func TestBacklogOnceRowsErrors(t *testing.T) {
 		t.Errorf("ошибка rows.Err = %v, want исходная %v", err, boom)
 	}
 
-	// Пустой ответ — аномалия формы (агрегат без GROUP BY отвечает
-	// одной строкой).
+	// An empty response is a form anomaly (an aggregate without GROUP BY answers
+	// with a single row).
 	emptyPool := &backlogFakePool{hook: func() (pgx.Rows, error) { return backlogRows(), nil }}
 	if _, err := BacklogOnce(context.Background(), emptyPool, NewBacklogGauge(reg)); err == nil ||
 		!strings.Contains(err.Error(), "пустой ответ агрегата") {
@@ -340,7 +340,7 @@ func TestBacklogLoop(t *testing.T) {
 		})
 	}()
 
-	// Первый проход — сразу при старте, без ожидания тика.
+	// The first pass — immediately at start, without waiting for a tick.
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		if v, ok := backlogGaugeValue(t, reg, model.CheckStatePending.String()); ok && v == 3 {
@@ -352,9 +352,9 @@ func TestBacklogLoop(t *testing.T) {
 		t.Fatalf("стартовый проход: pending = (%v, %v), want (3, true)", v, ok)
 	}
 
-	// Сбой прохода не останавливает цикл; восстановление — обновление.
+	// A pass failure does not stop the loop; recovery — an update.
 	pool.setHook(func() (pgx.Rows, error) { return nil, errors.New("бд недоступна") })
-	time.Sleep(20 * time.Millisecond) // несколько неудачных тиков
+	time.Sleep(20 * time.Millisecond) // several failed ticks
 	if v, _ := backlogGaugeValue(t, reg, model.CheckStatePending.String()); v != 3 {
 		t.Errorf("при сбоях pending = %v, want последнее известное 3", v)
 	}
@@ -383,9 +383,9 @@ func TestBacklogLoop(t *testing.T) {
 	}
 }
 
-// TestBacklogLoopImmediateFirstPass — первый проход выполняется сразу
-// при старте, не дожидаясь тика: с часовым интервалом gauge обязан
-// заполниться (и только один раз) до любого тика.
+// TestBacklogLoopImmediateFirstPass — the first pass runs immediately
+// at start, without waiting for a tick: with an hourly interval the gauge must
+// be filled (and only once) before any tick.
 func TestBacklogLoopImmediateFirstPass(t *testing.T) {
 	reg := metrics.New("scheduler")
 	pool := &backlogFakePool{}
@@ -397,7 +397,7 @@ func TestBacklogLoopImmediateFirstPass(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		done <- BacklogLoop(ctx, pool, reg, BacklogOptions{
-			Interval: time.Hour, // тик не наступит: только стартовый проход
+			Interval: time.Hour, // the tick never comes: only the starting pass
 			Log:      slog.New(slog.DiscardHandler),
 		})
 	}()
@@ -428,8 +428,8 @@ func TestBacklogLoopImmediateFirstPass(t *testing.T) {
 	}
 }
 
-// TestBacklogLoopLogging — записи цикла: успешный проход — Debug,
-// сбой прохода при живом ctx — Warn с исходной ошибкой.
+// TestBacklogLoopLogging — loop records: a successful pass — Debug,
+// a pass failure with a live ctx — Warn with the original error.
 func TestBacklogLoopLogging(t *testing.T) {
 	slogBuf := &syncBuf{}
 	logger := slog.New(slog.NewTextHandler(slogBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -449,7 +449,7 @@ func TestBacklogLoopLogging(t *testing.T) {
 		})
 	}()
 
-	// Стартовый проход — Debug с итогом.
+	// The starting pass — Debug with the outcome.
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		if v, ok := backlogGaugeValue(t, reg, model.CheckStatePending.String()); ok && v == 3 {
@@ -458,12 +458,12 @@ func TestBacklogLoopLogging(t *testing.T) {
 		time.Sleep(2 * time.Millisecond)
 	}
 
-	// Сбойный проход при живом ctx — Warn. Гонка первого варианта:
-	// ожидание числа вызовов/ошибочных вызовов НЕ гарантирует, что Warn
-	// уже записан — cancel() встраивался между возвратом hook и выбором
-	// ветки switch (тихая ветка «отмена во время прохода»), Warn терялся
-	// (флак ~1/20). Детерминизм: ждём сам Warn в логе (syncBuf под
-	// замком), запись Warn строго раньше нашей cancel.
+	// A failing pass with a live ctx — Warn. The race of the first variant:
+	// waiting for the call/failing-call counts does NOT guarantee the Warn
+	// is already written — cancel() was embedded between the hook's return and the
+	// switch branch choice (the quiet "cancellation during a pass" branch), the Warn was lost
+	// (a flake of ~1/20). Determinism: we wait for the Warn itself in the log (syncBuf under
+	// a lock), the Warn record strictly before our cancel.
 	pool.setHook(func() (pgx.Rows, error) { return nil, errors.New("бд недоступна") })
 	deadline = time.Now().Add(2 * time.Second)
 	for !slogBuf.contains("бд недоступна") {
@@ -486,8 +486,8 @@ func TestBacklogLoopLogging(t *testing.T) {
 
 	log := slogBuf.String()
 	for _, want := range []string{
-		"level=DEBUG", // итог успешного прохода
-		"level=WARN",  // сбой прохода не убил цикл
+		"level=DEBUG", // the outcome of a successful pass
+		"level=WARN",  // a pass failure did not kill the loop
 		"бд недоступна",
 	} {
 		if !strings.Contains(log, want) {
@@ -496,9 +496,9 @@ func TestBacklogLoopLogging(t *testing.T) {
 	}
 }
 
-// TestBacklogLoopCancelDuringPass — ctx отменён до старта: единственный
-// стартовый проход выполняется и логируется Debug — отмена не часть
-// прохода, начатого до неё; выход чистый.
+// TestBacklogLoopCancelDuringPass — ctx cancelled before the start: the only
+// starting pass runs and is logged as Debug — the cancellation is not part
+// of a pass begun before it; the exit is clean.
 func TestBacklogLoopCancelDuringPass(t *testing.T) {
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -536,8 +536,8 @@ func TestBacklogLoopValidation(t *testing.T) {
 
 // --- single-flight (T-161) --------------------------------------------------
 
-// backlogSkippedValue — текущее значение счётчика
-// crawler_backlog_skipped_ticks_total из реестра.
+// backlogSkippedValue — the current value of the
+// crawler_backlog_skipped_ticks_total counter from the registry.
 func backlogSkippedValue(t *testing.T, reg *metrics.Registry) float64 {
 	t.Helper()
 	families, err := reg.Gather()
@@ -555,8 +555,8 @@ func backlogSkippedValue(t *testing.T, reg *metrics.Registry) float64 {
 	return 0
 }
 
-// backlogHistogramSamples — число наблюдений crawler_backlog_pass_seconds
-// (каждый проход обязан попасть в гистограмму).
+// backlogHistogramSamples — the number of crawler_backlog_pass_seconds observations
+// (every pass must land in the histogram).
 func backlogHistogramSamples(t *testing.T, reg *metrics.Registry) uint64 {
 	t.Helper()
 	families, err := reg.Gather()
@@ -574,17 +574,17 @@ func backlogHistogramSamples(t *testing.T, reg *metrics.Registry) uint64 {
 	return 0
 }
 
-// TestBacklogLoopSingleFlight — проход дольше интервала (замер §12:
-// агрегат по 47 млн строк): накопившийся тик не запускает новый проход
-// сразу за медленным — Warn «дольше интервала», счётчик пропусков,
-// гистограмма длительности; следующий проход — по следующему тику,
-// цикл живёт.
+// TestBacklogLoopSingleFlight — a pass longer than the interval (measurement §12:
+// the aggregate over 47M rows): the accumulated tick does not start a new pass
+// right after the slow one — a Warn "longer than the interval", a skip counter,
+// a duration histogram; the next pass — on the next tick,
+// the loop lives.
 //
-// Раскладка без реальных секунд ожидания: интервал 50 мс, медленный
-// стартовый проход 120 мс (тик 50 мс буферизуется, тик 100 мс тонет —
-// канал тикера ёмкостью 1, тик 150 мс ещё не наступил к моменту дренажа
-// в 120 мс): дренаж снимает тик без гонки на границе, проход 2 — не
-// раньше 150 мс.
+// The layout without real seconds of waiting: an interval of 50 ms, a slow
+// starting pass of 120 ms (the 50 ms tick is buffered, the 100 ms tick sinks —
+// the ticker channel has capacity 1, the 150 ms tick has not yet arrived by the moment of the
+// drain at 120 ms): the drain removes the tick without a race at the boundary, pass 2 is not
+// earlier than 150 ms.
 func TestBacklogLoopSingleFlight(t *testing.T) {
 	slogBuf := &syncBuf{}
 	logger := slog.New(slog.NewTextHandler(slogBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -592,7 +592,7 @@ func TestBacklogLoopSingleFlight(t *testing.T) {
 	reg := metrics.New("scheduler")
 	pool := &backlogFakePool{}
 	pool.setHook(func() (pgx.Rows, error) {
-		time.Sleep(120 * time.Millisecond) // медленный агрегат (замер §12)
+		time.Sleep(120 * time.Millisecond) // a slow aggregate (measurement §12)
 		return backlogPair(3, 4), nil
 	})
 
@@ -605,7 +605,7 @@ func TestBacklogLoopSingleFlight(t *testing.T) {
 		})
 	}()
 
-	// Warn приходит в конце медленного прохода (после дренажа тика).
+	// The Warn comes at the end of the slow pass (after the tick drain).
 	deadline := time.Now().Add(2 * time.Second)
 	for !slogBuf.contains("дольше интервала") {
 		if time.Now().After(deadline) {
@@ -617,13 +617,13 @@ func TestBacklogLoopSingleFlight(t *testing.T) {
 	if got := backlogSkippedValue(t, reg); got != 1 {
 		t.Errorf("skipped_ticks = %v, want 1", got)
 	}
-	// Момент наблюдения Warn — до тика 150 мс: второй проход ещё не
-	// мог начаться (единственный buffered-тик снят дренажом).
+	// The moment of observing the Warn — before the 150 ms tick: the second pass could not
+	// have started yet (the only buffered tick was removed by the drain).
 	if n := pool.callsCount(); n != 1 {
 		t.Errorf("проходов = %d после дренажа, want 1 (тик пропущен)", n)
 	}
 
-	// Проход 2 быстрый: обычный режим восстанавливается, цикл живёт.
+	// Pass 2 is fast: the normal mode is restored, the loop lives.
 	pool.setHook(func() (pgx.Rows, error) {
 		return backlogPair(5, 6), nil
 	})
@@ -653,9 +653,9 @@ func TestBacklogLoopSingleFlight(t *testing.T) {
 	}
 }
 
-// TestBacklogLoopFastPassNoSkip — проход короче интервала не_warn'ит и
-// не двигает счётчик пропусков: single-flight касается только хвоста
-// «проход дольше интервала».
+// TestBacklogLoopFastPassNoSkip — a pass shorter than the interval does not Warn
+// and does not move the skip counter: single-flight concerns only the tail
+// "pass longer than the interval".
 func TestBacklogLoopFastPassNoSkip(t *testing.T) {
 	reg := metrics.New("scheduler")
 	pool := &backlogFakePool{}
@@ -667,12 +667,12 @@ func TestBacklogLoopFastPassNoSkip(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		done <- BacklogLoop(ctx, pool, reg, BacklogOptions{
-			Interval: 20 * time.Millisecond, // запас против CI-задержек прохода
+			Interval: 20 * time.Millisecond, // headroom against CI delays of the pass
 			Log:      slog.New(slog.DiscardHandler),
 		})
 	}()
 
-	// Несколько быстрых проходов.
+	// Several fast passes.
 	deadline := time.Now().Add(2 * time.Second)
 	for pool.callsCount() < 3 {
 		if time.Now().After(deadline) {

@@ -1,12 +1,12 @@
-// Юнит-тесты постановки пачек планировщиком (T-028, ТЗ 5.3, 4.2, 3.4) на
-// фейковых pgx-пуле и очереди (стиль dispatch_test.go / retry_test.go):
-// точный SQL-текст перевода и параметры, охрана pending и queued_at,
-// публикация ровно переведённых строк (гонка — переведены не все),
-// группировка пачки в DNSBatch (имена из выборки, порядок сохраняется),
-// ошибки БД/чтения/публикации, пустая пачка, валидация, отмена ctx;
-// smoke цикла EnqueueLoop (выборка → перевод → публикация → пауза,
-// ожидание при пустой пачке, продолжение после ошибок). Поведение против
-// живой БД/Redis — интеграционные тесты (T-032).
+// Unit tests of scheduler batch enqueueing (T-028, spec 5.3, 4.2, 3.4) on
+// a fake pgx pool and queue (the dispatch_test.go / retry_test.go style):
+// the exact SQL text of the move and parameters, the pending and queued_at guard,
+// publishing exactly the moved rows (a race — not all moved),
+// grouping the batch into DNSBatch (names from the selection, order preserved),
+// DB/read/publication errors, an empty batch, validation, ctx cancellation;
+// an EnqueueLoop smoke (selection → move → publication → pause,
+// waiting on an empty batch, continuing after errors). Behavior against
+// a live DB/Redis — integration tests (T-032).
 package scheduler
 
 import (
@@ -28,36 +28,36 @@ import (
 	"crawler/internal/queue"
 )
 
-// --- фейковые пул и очередь ----------------------------------------------
+// --- fake pool and queue ----------------------------------------------
 //
-// Имена с префиксом enqueue: в пакете параллельно живут фейки задач
-// T-027/T-030/T-031 (dispatchPool, retryFakePool), общих хелперов здесь
-// не заводят.
+// Names prefixed with enqueue: fakes of the T-027/T-030/T-031 tasks live
+// in the package in parallel (dispatchPool, retryFakePool); no common helpers
+// are introduced here.
 
-// enqueueCallKind — шаг цикла, обслуженный Query.
+// enqueueCallKind — the loop step served by a Query.
 type enqueueCallKind string
 
 const (
-	enqueueKindZones    enqueueCallKind = "zones"    // SELECT активных зон (T-027)
-	enqueueKindDispatch enqueueCallKind = "dispatch" // SELECT очередей зон (T-027)
+	enqueueKindZones    enqueueCallKind = "zones"    // the SELECT of active zones (T-027)
+	enqueueKindDispatch enqueueCallKind = "dispatch" // the SELECT of zone queues (T-027)
 	enqueueKindUpdate   enqueueCallKind = "update"   // UPDATE … RETURNING (T-028)
 )
 
-// enqueueCall — записанный вызов Query.
+// enqueueCall — a recorded Query call.
 type enqueueCall struct {
 	kind enqueueCallKind
 	sql  string
 	args []any
 }
 
-// enqueueFakeRows — pgx.Rows с заготовленными строками; Scan позиционный
-// (в порядке колонок SQL), как у retryFakeRows.
+// enqueueFakeRows — pgx.Rows with pre-made rows; Scan is positional
+// (in the SQL column order), like retryFakeRows.
 type enqueueFakeRows struct {
 	rows    [][]any
 	i       int
 	closed  bool
-	err     error // Err() после исчерпания строк
-	scanErr error // ошибка Scan, если задана
+	err     error // Err() after the rows are exhausted
+	scanErr error // a Scan error, if set
 }
 
 func enqueueFakeRowsOf(rows ...[]any) *enqueueFakeRows {
@@ -105,25 +105,25 @@ func (r *enqueueFakeRows) Scan(dest ...any) error {
 func (r *enqueueFakeRows) Values() ([]any, error) { return r.rows[r.i-1], nil }
 func (r *enqueueFakeRows) RawValues() [][]byte    { return nil }
 
-// Conn и TypeMap — часть pgx.Rows, не используемая позиционным Scan.
+// Conn and TypeMap — part of pgx.Rows not used by the positional Scan.
 func (r *enqueueFakeRows) Conn() *pgx.Conn      { return nil }
 func (r *enqueueFakeRows) TypeMap() *pgtype.Map { return nil }
 
-// enqueueFakePool — db.DB без БД: Query различает запросы выборки
-// (справочник зон и очереди зон, dispatch.go) и перевод (UPDATE) по
-// тексту, выдаёт заготовленные результаты по шагам. Очередь выборки
-// исчерпана — пустой набор (pending пуст); очередь перевода исчерпана —
-// переводятся все ключи пачки (нет гонки). Всё под замком: цикл
-// EnqueueLoop работает в горутине.
+// enqueueFakePool — a db.DB without a DB: Query distinguishes the selection
+// queries (the zone reference table and zone queues, dispatch.go) from the move (UPDATE) by
+// text, and hands out pre-made results per step. The selection queue
+// exhausted — an empty set (pending is empty); the move queue exhausted —
+// all batch keys are moved (no race). Everything under a lock: the
+// EnqueueLoop loop runs in a goroutine.
 type enqueueFakePool struct {
 	mu          sync.Mutex
-	zones       [][]any // ответ справочника активных зон (nil — зон нет)
+	zones       [][]any // the active zones reference table response (nil — no zones)
 	dispatches  []*enqueueFakeRows
 	updates     []*enqueueFakeRows
-	dispatchErr error // липовая ошибка выборки (зоны/очереди)
-	updateErr   error // липовая ошибка перевода
+	dispatchErr error // a sticky selection error (zones/queues)
+	updateErr   error // a sticky move error
 	calls       []enqueueCall
-	notify      chan struct{} // если задан — неблокирующий сигнал на каждый Query
+	notify      chan struct{} // if set — a non-blocking signal on every Query
 }
 
 func (p *enqueueFakePool) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFromSource) (int64, error) {
@@ -160,8 +160,8 @@ func (p *enqueueFakePool) Query(ctx context.Context, sql string, args ...any) (p
 		if p.dispatchErr != nil {
 			return nil, p.dispatchErr
 		}
-		// Справочник мал и стабилен — один и тот же ответ на каждый
-		// вызов (строки не расходуются, в отличие от очередей).
+		// The reference table is small and stable — the same response on every
+		// call (rows are not consumed, unlike the queues).
 		return enqueueFakeRowsOf(p.zones...), nil
 	}
 
@@ -174,7 +174,7 @@ func (p *enqueueFakePool) Query(ctx context.Context, sql string, args ...any) (p
 			p.dispatches = p.dispatches[1:]
 			return rows, nil
 		}
-		return enqueueFakeRowsOf(), nil // pending пуст
+		return enqueueFakeRowsOf(), nil // pending is empty
 	}
 
 	if p.updateErr != nil {
@@ -185,8 +185,8 @@ func (p *enqueueFakePool) Query(ctx context.Context, sql string, args ...any) (p
 		p.updates = p.updates[1:]
 		return rows, nil
 	}
-	// Дефолт: гонки нет — переведены все ключи пачки (args: []any зоны,
-	// []any идентификаторы; колонки конструктора db.Update — []any).
+	// Default: no race — all batch keys are moved (args: []any zones,
+	// []any identifiers; the db.Update builder columns are []any).
 	zones := args[0].([]any)
 	ids := args[1].([]any)
 	rows := make([][]any, len(zones))
@@ -198,7 +198,7 @@ func (p *enqueueFakePool) Query(ctx context.Context, sql string, args ...any) (p
 
 var _ db.DB = (*enqueueFakePool)(nil)
 
-// enqueuePoolCalls — снимок протокола вызовов.
+// enqueuePoolCalls — a snapshot of the call protocol.
 func (p *enqueueFakePool) enqueuePoolCalls() []enqueueCall {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -207,25 +207,25 @@ func (p *enqueueFakePool) enqueuePoolCalls() []enqueueCall {
 	return out
 }
 
-// enqueuePublish — записанная попытка публикации.
+// enqueuePublish — a recorded publication attempt.
 type enqueuePublish struct {
 	stream string
 	msg    queue.DNSBatch
-	err    error // ошибка, возвращённая Publish (nil — успех)
+	err    error // the error returned by Publish (nil — success)
 }
 
-// enqueueFakeQueue — queue.Queue для постановки: Publish проверяет
-// контекст, запоминает сообщение и стрим, раздаёт заготовленные ошибки по
-// одной на вызов; Consume/Ack постановке не нужны.
+// enqueueFakeQueue — a queue.Queue for enqueueing: Publish checks
+// the context, remembers the message and stream, hands out pre-made errors one
+// per call; Consume/Ack are not needed for enqueueing.
 type enqueueFakeQueue struct {
 	mu        sync.Mutex
 	publishes []enqueuePublish
-	errs      []error // очередь ошибок (пусто — успех)
+	errs      []error // the error queue (empty — success)
 	notify    chan struct{}
-	// onPublish — если задан, вызывается в начале Publish под замком
-	// (непереходным): хук не должен вызывать методы этой очереди —
-	// самодедлок; состояние фейков читает легально только из горутины,
-	// вызвавшей EnqueueBatch (записывающий шов порядка, T-224).
+	// onPublish — if set, called at the beginning of Publish under a
+	// non-reentrant lock: the hook must not call this queue's methods —
+	// a self-deadlock; the fakes' state is legally read only from the goroutine
+	// that called EnqueueBatch (a recording seam of the order, T-224).
 	onPublish func()
 }
 
@@ -267,7 +267,7 @@ func (q *enqueueFakeQueue) Ack(context.Context, string, string, ...string) error
 	return errors.New("enqueueFakeQueue: Ack не должен вызываться")
 }
 
-// enqueueQueuePublishes — снимок попыток публикации.
+// enqueueQueuePublishes — a snapshot of publication attempts.
 func (q *enqueueFakeQueue) enqueueQueuePublishes() []enqueuePublish {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -276,7 +276,7 @@ func (q *enqueueFakeQueue) enqueueQueuePublishes() []enqueuePublish {
 	return out
 }
 
-// enqueueWaitSignal ждёт сигнала с таймаутом (событие фейка или отмена).
+// enqueueWaitSignal waits for a signal with a timeout (a fake event or cancellation).
 func enqueueWaitSignal(t *testing.T, ch <-chan struct{}, what string) {
 	t.Helper()
 	select {
@@ -286,7 +286,7 @@ func enqueueWaitSignal(t *testing.T, ch <-chan struct{}, what string) {
 	}
 }
 
-// enqueueWaitFor опрашивает условие до таймаута.
+// enqueueWaitFor polls a condition until a timeout.
 func enqueueWaitFor(t *testing.T, timeout time.Duration, cond func() bool, what string) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
@@ -301,8 +301,8 @@ func enqueueWaitFor(t *testing.T, timeout time.Duration, cond func() bool, what 
 
 // --- EnqueueBatch ---------------------------------------------------------
 
-// enqueueBatch3 — пачка из трёх доменов двух зон (порядок выборки —
-// чередование зон T-027).
+// enqueueBatch3 — a batch of three domains of two zones (the selection order —
+// the T-027 zone interleaving).
 func enqueueBatch3() []DispatchRow {
 	return []DispatchRow{
 		{DomainID: 101, ZoneID: 1, Name: "a.example.com"},
@@ -312,7 +312,7 @@ func enqueueBatch3() []DispatchRow {
 }
 
 func TestEnqueueBatch(t *testing.T) {
-	pool := &enqueueFakePool{} // перевод без гонки: все ключи пачки
+	pool := &enqueueFakePool{} // a move without a race: all batch keys
 	q := &enqueueFakeQueue{}
 
 	res, err := EnqueueBatch(context.Background(), pool, q, enqueueBatch3())
@@ -323,8 +323,8 @@ func TestEnqueueBatch(t *testing.T) {
 		t.Errorf("итог = %+v, want {Queued:3 Published:3 Skipped:0}", res)
 	}
 
-	// Один пакетный UPDATE с охраной pending и queued_at (контракт SQL —
-	// TestEnqueue_SQLContract), ключи — параллельные массивы зоны/домена.
+	// One batch UPDATE with the pending and queued_at guard (the SQL contract —
+	// TestEnqueue_SQLContract), the keys — parallel arrays of zones/domains.
 	calls := pool.enqueuePoolCalls()
 	if len(calls) != 1 || calls[0].kind != enqueueKindUpdate {
 		t.Fatalf("обращения к БД = %v, want единственный UPDATE", calls)
@@ -337,8 +337,8 @@ func TestEnqueueBatch(t *testing.T) {
 		t.Errorf("аргументы = %v, want [zone_id[], domain_id[]] = %v", calls[0].args, wantArgs)
 	}
 
-	// Публикация: одно сообщение DNSBatch в q:dns, домены — переведённые
-	// строки в порядке выборки (имя из выборки: label || '.' || зона).
+	// Publication: one DNSBatch message to q:dns, the domains — the moved
+	// rows in selection order (the name from the selection: label || '.' || zone).
 	pubs := q.enqueueQueuePublishes()
 	if len(pubs) != 1 {
 		t.Fatalf("публикаций %d, want 1 (пачка — одно сообщение, ТЗ 4.2)", len(pubs))
@@ -356,12 +356,12 @@ func TestEnqueueBatch(t *testing.T) {
 	}
 }
 
-// TestEnqueueBatch_RaceNotAllTranslated — гонка: между выборкой (T-027)
-// и переводом часть строк ушла из pending (возврат lease T-029, второй
-// планировщик). RETURNING отдал только переведённые — публикация строится
-// ровно по ним, проигравшие ждут следующего цикла (at-least-once, ТЗ 3.4).
+// TestEnqueueBatch_RaceNotAllTranslated — a race: between the selection (T-027)
+// and the move some rows left pending (a lease return T-029, a second
+// scheduler). RETURNING gave only the moved ones — the publication is built
+// exactly from them; the losers wait for the next cycle (at-least-once, spec 3.4).
 func TestEnqueueBatch_RaceNotAllTranslated(t *testing.T) {
-	// Переведены первый и третий (зона 1), второй (зона 2) — уже не pending.
+	// The first and third are moved (zone 1), the second (zone 2) — no longer pending.
 	pool := &enqueueFakePool{
 		updates: []*enqueueFakeRows{enqueueFakeRowsOf(
 			[]any{int16(1), int64(101)},
@@ -391,8 +391,8 @@ func TestEnqueueBatch_RaceNotAllTranslated(t *testing.T) {
 	}
 }
 
-// TestEnqueueBatch_RaceAllLost — вся пачка проиграла гонку: перевода нет,
-// публикация не выполняется вовсе (пустая DNSBatch запрещена очередью).
+// TestEnqueueBatch_RaceAllLost — the whole batch lost the race: no move,
+// no publication at all (an empty DNSBatch is forbidden by the queue).
 func TestEnqueueBatch_RaceAllLost(t *testing.T) {
 	pool := &enqueueFakePool{updates: []*enqueueFakeRows{enqueueFakeRowsOf()}}
 	q := &enqueueFakeQueue{}
@@ -409,8 +409,8 @@ func TestEnqueueBatch_RaceAllLost(t *testing.T) {
 	}
 }
 
-// TestEnqueueBatch_DuplicateKeys — дубликат ключа в пачке публикуется
-// один раз (ключ расходуется при первом совпадении).
+// TestEnqueueBatch_DuplicateKeys — a duplicate key in the batch is published
+// once (the key is consumed at the first match).
 func TestEnqueueBatch_DuplicateKeys(t *testing.T) {
 	pool := &enqueueFakePool{}
 	q := &enqueueFakeQueue{}
@@ -432,7 +432,7 @@ func TestEnqueueBatch_DuplicateKeys(t *testing.T) {
 	}
 }
 
-// TestEnqueueBatch_EmptyBatch — пустая пачка: ни БД, ни очереди.
+// TestEnqueueBatch_EmptyBatch — an empty batch: neither the DB nor the queue.
 func TestEnqueueBatch_EmptyBatch(t *testing.T) {
 	pool := &enqueueFakePool{}
 	q := &enqueueFakeQueue{}
@@ -449,8 +449,8 @@ func TestEnqueueBatch_EmptyBatch(t *testing.T) {
 	}
 }
 
-// TestEnqueueBatch_ValidationNumbers — номер домена в сообщении ошибки —
-// 1-based: невалидная вторая строка пачки именуется «домен №2».
+// TestEnqueueBatch_ValidationNumbers — the domain number in the error message is
+// 1-based: an invalid second batch row is named "domain #2".
 func TestEnqueueBatch_ValidationNumbers(t *testing.T) {
 	valid := DispatchRow{ZoneID: 1, DomainID: 1, Name: "ok.example.com"}
 	cases := []struct {
@@ -477,8 +477,8 @@ func TestEnqueueBatch_ValidationNumbers(t *testing.T) {
 	}
 }
 
-// TestEnqueueBatch_NameLenBoundary — имя ровно в 253 октета (лимит ТЗ 5.2
-// п. 4) валидно: граница строгая, 253 проходит (254 — нет, таблица выше).
+// TestEnqueueBatch_NameLenBoundary — a name of exactly 253 octets (the spec 5.2
+// item 4 limit) is valid: the boundary is strict, 253 passes (254 — no, the table above).
 func TestEnqueueBatch_NameLenBoundary(t *testing.T) {
 	name := strings.Repeat("a", 249) + ".com"
 	if len(name) != enqueueMaxNameLen {
@@ -500,9 +500,9 @@ func TestEnqueueBatch_NameLenBoundary(t *testing.T) {
 	}
 }
 
-// TestEnqueueBatch_Validation — nil пула/очереди и недопустимые строки
-// отвергаются до обращения к БД: публикация q:dns отвергла бы такие
-// значения, а перевод к этому моменту уже был бы зафиксирован.
+// TestEnqueueBatch_Validation — a nil pool/queue and invalid rows
+// are rejected before touching the DB: the q:dns publication would reject such
+// values, and the move would already be committed by then.
 func TestEnqueueBatch_Validation(t *testing.T) {
 	pool := &enqueueFakePool{}
 	q := &enqueueFakeQueue{}
@@ -538,8 +538,8 @@ func TestEnqueueBatch_Validation(t *testing.T) {
 	}
 }
 
-// TestEnqueueBatch_UpdateError — ошибка перевода: ничего не опубликовано,
-// ошибка обёрнута контекстом задачи.
+// TestEnqueueBatch_UpdateError — a move error: nothing published,
+// the error wrapped with the task context.
 func TestEnqueueBatch_UpdateError(t *testing.T) {
 	boom := errors.New("база ушла на обед")
 	pool := &enqueueFakePool{updateErr: boom}
@@ -557,14 +557,14 @@ func TestEnqueueBatch_UpdateError(t *testing.T) {
 	}
 }
 
-// TestEnqueueBatch_ReadErrors — ошибка чтения RETURNING (Scan и Err)
-// прерывают постановку: публикация по неполному списку переведённых
-// потеряла бы домены, попавшие в queued.
+// TestEnqueueBatch_ReadErrors — a RETURNING read error (Scan and Err)
+// interrupts the enqueueing: publishing from an incomplete list of moved rows
+// would lose domains that got into queued.
 func TestEnqueueBatch_ReadErrors(t *testing.T) {
 	boom := errors.New("декодирование сорвалось")
 
-	// Курсор закрывается и на ошибочных путях чтения (T-224: явный
-	// Close на каждой ветке) — ссылки на строки фейка пинируют это.
+	// The cursor is closed on the error read paths too (T-224: an explicit
+	// Close on every branch) — references to the fake's rows pin this.
 	scanRows := &enqueueFakeRows{rows: [][]any{{int16(1), int64(101)}, {int16(1), int64(102)}}, scanErr: boom}
 	pool := &enqueueFakePool{updates: []*enqueueFakeRows{scanRows}}
 	_, err := EnqueueBatch(context.Background(), pool, &enqueueFakeQueue{}, enqueueBatch3()[:2])
@@ -586,10 +586,10 @@ func TestEnqueueBatch_ReadErrors(t *testing.T) {
 	}
 }
 
-// TestEnqueueBatch_PublishError — сбой публикации: перевод уже зафиксирован
-// и не откатывается (комментарий enqueue.go: XADD мог удаться, откат дал бы
-// дубли в работе) — итог отдаёт Queued, строк ждут возврата по lease
-// (T-029), попытка публикации одна.
+// TestEnqueueBatch_PublishError — a publication failure: the move is already committed
+// and not rolled back (the enqueue.go comment: XADD may have succeeded; a rollback would give
+// duplicates in progress) — the outcome returns Queued; the rows await the lease return
+// (T-029); the publication attempt is one.
 func TestEnqueueBatch_PublishError(t *testing.T) {
 	pool := &enqueueFakePool{}
 	q := &enqueueFakeQueue{errs: []error{errors.New("redis лёг")}}
@@ -607,20 +607,20 @@ func TestEnqueueBatch_PublishError(t *testing.T) {
 	}
 }
 
-// TestEnqueueBatch_ClosesRowsBeforePublish — курсор RETURNING закрыт до
-// публикации (T-224): q.Publish — сетевой I/O в Redis (XADD с ретраями и
-// паузами до ~0,75 с при сбоях, redisq.go), открытый курсор держал бы
-// соединение пула на всё это время — при малом бюджете соединений
-// планировщик упирается в пул, а не в скорость очереди. Пул подменён
-// фейком (юнит-тесты без живой БД, стиль файла), дедлок на pgxpool
-// MaxConns=1 здесь не построить: тест пинирует инвариант порядка
-// Close→Publish записывающим швом — onPublish выполняется внутри Publish
-// и видит rows.closed; до фикса (defer rows.Close на выходе из функции)
-// Publish заходил с открытым курсором и тест падал.
+// TestEnqueueBatch_ClosesRowsBeforePublish — the RETURNING cursor is closed before
+// publication (T-224): q.Publish is network I/O to Redis (XADD with retries and
+// pauses up to ~0.75 s on failures, redisq.go); an open cursor would hold
+// a pool connection for all that time — with a small connection budget
+// the scheduler hits the pool, not the queue speed. The pool is replaced
+// by a fake (unit tests without a live DB, the file style); a deadlock on pgxpool
+// MaxConns=1 cannot be built here: the test pins the Close→Publish order invariant
+// with a recording seam — onPublish runs inside Publish
+// and sees rows.closed; before the fix (defer rows.Close on function exit)
+// Publish entered with an open cursor and the test failed.
 func TestEnqueueBatch_ClosesRowsBeforePublish(t *testing.T) {
 	for _, tc := range []struct {
 		name string
-		errs []error // ошибка публикации (nil — успех): курсор обязан быть закрыт и здесь
+		errs []error // a publication error (nil — success): the cursor must be closed here too
 	}{
 		{"успешная публикация", nil},
 		{"сбой публикации", []error{errors.New("redis лежит")}},
@@ -645,8 +645,8 @@ func TestEnqueueBatch_ClosesRowsBeforePublish(t *testing.T) {
 		})
 	}
 
-	// Публикации нет вовсе (вся пачка проиграла гонку) — курсор всё равно
-	// закрыт: возврат пути без очереди не должен протекать соединением.
+	// No publication at all (the whole batch lost the race) — the cursor is still
+	// closed: the exit path without a queue must not leak a connection.
 	rows := enqueueFakeRowsOf()
 	pool := &enqueueFakePool{updates: []*enqueueFakeRows{rows}}
 	if _, err := EnqueueBatch(context.Background(), pool, &enqueueFakeQueue{}, enqueueBatch3()); err != nil {
@@ -657,8 +657,8 @@ func TestEnqueueBatch_ClosesRowsBeforePublish(t *testing.T) {
 	}
 }
 
-// TestEnqueueBatch_ContextCanceled — отменённый контекст отказывает до
-// обращений (как реальный pgx и go-redis).
+// TestEnqueueBatch_ContextCanceled — a cancelled context is refused before
+// the calls (like real pgx and go-redis).
 func TestEnqueueBatch_ContextCanceled(t *testing.T) {
 	pool := &enqueueFakePool{}
 	q := &enqueueFakeQueue{}
@@ -677,12 +677,12 @@ func TestEnqueueBatch_ContextCanceled(t *testing.T) {
 	}
 }
 
-// ------------------------------------------------------------ контракт SQL
+// ------------------------------------------------------------ SQL contract
 
-// wantEnqueueUpdateSQL — перевод пачки + дельты счётчиков зон одним
-// оператором (T-178): CTE upd — перевод (бывший один оператор T-028),
-// CTE zc — pending −n / queued +n по зонам переведённых строк, внешний
-// SELECT — ключи переведённых для публикации.
+// wantEnqueueUpdateSQL — the batch move + zone counter deltas in one
+// statement (T-178): the upd CTE — the move (the former single T-028 statement),
+// the zc CTE — pending −n / queued +n over the zones of the moved rows; the outer
+// SELECT — the keys of the moved rows for publication.
 const wantEnqueueUpdateSQL = `WITH upd AS (UPDATE "domains" AS t ` +
 	`SET check_state = 1, queued_at = now(), flags = (t.flags & -5)::int2 ` +
 	`FROM unnest($1::int2[], $2::int8[]) AS u("zone_id", "id") ` +
@@ -695,14 +695,14 @@ const wantEnqueueUpdateSQL = `WITH upd AS (UPDATE "domains" AS t ` +
 	`WHERE z.id = c.zone_id) ` +
 	`SELECT u.zone_id, u.id FROM upd AS u`
 
-// TestEnqueue_SQLContract — точный текст перевода: ключи по PK domains,
-// check_state литералом кода queued, queued_at = now() (сервер БД, единый
-// момент lease пачки), снятие бита http_published (T-108: постановка —
-// единая точка входа в новый эпизод, бит прошлого эпизода не должен
-// подавлять публикацию свежего), охрана pending, RETURNING ключей
-// фактически переведённых строк; дельты счётчиков зон — тем же
-// оператором (T-178). Литералы связаны с кодами модели и схемой
-// миграций 000001/000016 (queued_at, PK, колонки счётчиков).
+// TestEnqueue_SQLContract — the exact move text: keys by the domains PK,
+// check_state as a literal of the queued code, queued_at = now() (the DB server, a single
+// lease moment of the batch), clearing the http_published bit (T-108: the enqueue is
+// the single entry point into a new episode; the previous episode's bit must not
+// suppress the fresh one's publication), the pending guard, RETURNING of the keys
+// of the rows actually moved; the zone counter deltas — by the same
+// statement (T-178). The literals are tied to the model codes and the
+// schema of migrations 000001/000016 (queued_at, the PK, the counter columns).
 func TestEnqueue_SQLContract(t *testing.T) {
 	pool := &enqueueFakePool{}
 	if _, err := EnqueueBatch(context.Background(), pool, &enqueueFakeQueue{}, enqueueBatch3()[:1]); err != nil {
@@ -713,9 +713,9 @@ func TestEnqueue_SQLContract(t *testing.T) {
 		t.Fatalf("SQL = %q,\nwant %q", calls[0].sql, wantEnqueueUpdateSQL)
 	}
 
-	// Литералы текста обязаны следовать за кодами модели (ТЗ 6.1): при
-	// изменении кодов тест ловит рассинхронизацию; маска снятия бита —
-	// знаковое ~int16(FlagHTTPPublished) (T-108).
+	// The text literals must follow the model codes (spec 6.1): when
+	// the codes change the test catches the desync; the bit-clearing mask —
+	// the signed ~int16(FlagHTTPPublished) (T-108).
 	if int16(model.CheckStateQueued) != 1 || int16(model.CheckStatePending) != 0 {
 		t.Errorf("коды модели изменились (pending=%d queued=%d): обновите литералы в wantEnqueueUpdateSQL",
 			int16(model.CheckStatePending), int16(model.CheckStateQueued))
@@ -727,16 +727,16 @@ func TestEnqueue_SQLContract(t *testing.T) {
 
 	up := dispatchReadMigration(t, "000001_init.up.sql")
 
-	// queued_at — колонка lease (ТЗ 6.1); UPDATE ссылается на схему.
+	// queued_at — a lease column (spec 6.1); the UPDATE references the schema.
 	if !strings.Contains(up, "queued_at") {
 		t.Error("в миграции 000001 нет domains.queued_at — отметка lease ссылается на схему")
 	}
-	// Ключи пачки — PK таблицы: UPDATE адресует строки парой (zone_id, id).
+	// The batch keys — the table's PK: the UPDATE addresses rows by the (zone_id, id) pair.
 	if !strings.Contains(up, "PRIMARY KEY (zone_id, id)") {
 		t.Error("в миграции 000001 нет PK domains (zone_id, id) — ключи перевода обязаны совпадать с ним")
 	}
-	// Колонки счётчиков зон (T-178): дельты zc пишут domains_pending/
-	// domains_queued — обязаны существовать (миграция 000016).
+	// The zone counter columns (T-178): the zc deltas write domains_pending/
+	// domains_queued — they must exist (migration 000016).
 	mig := dispatchReadMigration(t, "000016_zone_pipeline_counters.up.sql")
 	for _, col := range []string{"domains_pending", "domains_queued"} {
 		if !strings.Contains(mig, col) {
@@ -745,8 +745,8 @@ func TestEnqueue_SQLContract(t *testing.T) {
 	}
 }
 
-// TestEnqueueDefaults — дефолты цикла пин литералами (ТЗ 5.10 и
-// комментарии констант): рассинхрон заметен тестом, а не ревью.
+// TestEnqueueDefaults — loop defaults pinned by literals (spec 5.10 and
+// the constants' comments): a desync is caught by the test, not by review.
 func TestEnqueueDefaults(t *testing.T) {
 	if DefaultEnqueueBatch != 1000 {
 		t.Errorf("DefaultEnqueueBatch = %d, want 1000 (зеркалит дефолт scheduler.batch_size, T-141)", DefaultEnqueueBatch)
@@ -759,9 +759,9 @@ func TestEnqueueDefaults(t *testing.T) {
 	}
 }
 
-// TestEnqueueOptionsWithDefaults — withDefaults заменяет только
-// неположительные значения: BatchSize = 1 и паузы в 1нс валидны (остаются
-// как есть), ноль и отрицательные — дефолты.
+// TestEnqueueOptionsWithDefaults — withDefaults replaces only
+// non-positive values: BatchSize = 1 and 1 ns pauses are valid (they stay
+// as they are); zero and negative — the defaults.
 func TestEnqueueOptionsWithDefaults(t *testing.T) {
 	cases := []struct {
 		name         string
@@ -792,17 +792,17 @@ func TestEnqueueOptionsWithDefaults(t *testing.T) {
 
 // --- EnqueueLoop ------------------------------------------------------------
 
-// enqueueLoopRun запускает цикл в горутине и возвращает канал результата.
+// enqueueLoopRun starts the loop in a goroutine and returns the result channel.
 func enqueueLoopRun(ctx context.Context, pool *enqueueFakePool, q *enqueueFakeQueue, o EnqueueOptions) <-chan error {
 	done := make(chan error, 1)
 	go func() { done <- EnqueueLoop(ctx, pool, q, o) }()
 	return done
 }
 
-// TestEnqueueLoop — smoke сервиса на фейках: круг «выборка → перевод →
-// публикация q:dns», затем пауза; отмена ctx — чистый nil (контракт OnRun,
-// T-012). Паузы большого размера: после первой пачки цикл гарантированно
-// ждёт — тест детерминирован.
+// TestEnqueueLoop — a service smoke on fakes: the circle "selection → move →
+// q:dns publication", then a pause; ctx cancellation — a clean nil (the OnRun contract,
+// T-012). Long pauses: after the first batch the loop is guaranteed
+// to wait — the test is deterministic.
 func TestEnqueueLoop(t *testing.T) {
 	pool := &enqueueFakePool{
 		zones: [][]any{
@@ -821,7 +821,7 @@ func TestEnqueueLoop(t *testing.T) {
 
 	done := enqueueLoopRun(ctx, pool, q, EnqueueOptions{
 		BatchSize: 1000,
-		Interval:  time.Hour, // одна пачка — затем пауза до отмены
+		Interval:  time.Hour, // one batch — then a pause until cancellation
 		IdleWait:  time.Hour,
 	})
 
@@ -857,11 +857,11 @@ func TestEnqueueLoop(t *testing.T) {
 	}
 }
 
-// TestEnqueueLoop_EmptyBatchWaits — пустая выборка: публикаций нет, цикл
-// ждёт пополнения (recheck T-030 / retry T-031 / lease T-029 / ingest),
-// отмена прерывает ожидание.
+// TestEnqueueLoop_EmptyBatchWaits — an empty selection: no publications, the loop
+// waits for replenishment (recheck T-030 / retry T-031 / lease T-029 / ingest),
+// cancellation interrupts the wait.
 func TestEnqueueLoop_EmptyBatchWaits(t *testing.T) {
-	pool := &enqueueFakePool{notify: make(chan struct{}, 8)} // pending пуст
+	pool := &enqueueFakePool{notify: make(chan struct{}, 8)} // pending is empty
 	q := &enqueueFakeQueue{notify: make(chan struct{}, 8)}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -890,8 +890,8 @@ func TestEnqueueLoop_EmptyBatchWaits(t *testing.T) {
 	}
 }
 
-// TestEnqueueLoop_DispatchError — ошибка выборки не останавливает цикл:
-// Warn в лог, пауза, новый круг; выход — только отмена ctx.
+// TestEnqueueLoop_DispatchError — a selection error does not stop the loop:
+// a Warn in the log, a pause, a new circle; the exit is only by ctx cancellation.
 func TestEnqueueLoop_DispatchError(t *testing.T) {
 	pool := &enqueueFakePool{
 		dispatchErr: errors.New("база моргнула"),
@@ -918,12 +918,12 @@ func TestEnqueueLoop_DispatchError(t *testing.T) {
 	}
 }
 
-// TestEnqueueLoop_PublishErrorContinues — сбой публикации: переведённые
-// строки остаются в queued (вернёт lease, T-029), цикл после паузы
-// продолжает работу и публикует следующие пачки.
+// TestEnqueueLoop_PublishErrorContinues — a publication failure: the moved
+// rows stay in queued (lease will return them, T-029); the loop after the pause
+// keeps working and publishes the following batches.
 func TestEnqueueLoop_PublishErrorContinues(t *testing.T) {
-	// Фейки хранят курсор чтения — каждой выборке свой экземпляр строк
-	// (колонки очередей зон: zone_id, id, label — имя собирает выборка).
+	// The fakes keep a read cursor — each selection gets its own instance of rows
+	// (the zone queue columns: zone_id, id, label — the name is assembled by the selection).
 	batch := func() *enqueueFakeRows {
 		return enqueueFakeRowsOf(
 			[]any{int16(1), int64(101), "a"},
@@ -950,7 +950,7 @@ func TestEnqueueLoop_PublishErrorContinues(t *testing.T) {
 		IdleWait: time.Millisecond,
 	})
 
-	// Первая пачка — неудачная публикация, вторая — успешная: цикл жив.
+	// The first batch — a failed publication; the second — successful: the loop lives.
 	enqueueWaitFor(t, 5*time.Second, func() bool {
 		return len(q.enqueueQueuePublishes()) >= 2
 	}, "две попытки публикации (после ошибки цикл продолжил)")
@@ -970,8 +970,8 @@ func TestEnqueueLoop_PublishErrorContinues(t *testing.T) {
 	}
 }
 
-// TestEnqueueLoop_Validation — nil пула/очереди: ошибка до старта цикла
-// (сборка сервиса падает внятно, а не молча).
+// TestEnqueueLoop_Validation — a nil pool/queue: an error before the loop starts
+// (the service assembly fails clearly, not silently).
 func TestEnqueueLoop_Validation(t *testing.T) {
 	if err := EnqueueLoop(context.Background(), nil, &enqueueFakeQueue{}, EnqueueOptions{}); err == nil || !strings.Contains(err.Error(), "пул не задан") {
 		t.Errorf("nil пул: err = %v, want «пул не задан»", err)
@@ -981,9 +981,9 @@ func TestEnqueueLoop_Validation(t *testing.T) {
 	}
 }
 
-// TestEnqueueLoop_DispatchErrorWaits — после ошибки выборки цикл уходит в
-// паузу IdleWait, а не молотит БД холостыми кругами: до отмены — ровно
-// одна попытка.
+// TestEnqueueLoop_DispatchErrorWaits — after a selection error the loop goes into
+// the IdleWait pause instead of hammering the DB with idle circles: until cancellation —
+// exactly one attempt.
 func TestEnqueueLoop_DispatchErrorWaits(t *testing.T) {
 	pool := &enqueueFakePool{
 		zones:       [][]any{{int16(1), "example.com"}},
@@ -996,7 +996,7 @@ func TestEnqueueLoop_DispatchErrorWaits(t *testing.T) {
 
 	done := enqueueLoopRun(ctx, pool, q, EnqueueOptions{Interval: time.Hour, IdleWait: time.Hour})
 	enqueueWaitSignal(t, pool.notify, "неудачная выборка")
-	time.Sleep(100 * time.Millisecond) // цикл в паузе IdleWait; без неё — поток запросов
+	time.Sleep(100 * time.Millisecond) // the loop is in the IdleWait pause; without it — a stream of queries
 
 	if calls := pool.enqueuePoolCalls(); len(calls) != 1 || calls[0].kind != enqueueKindZones {
 		t.Fatalf("обращения = %v, want одна попытка выборки (пауза IdleWait после ошибки)", calls)
@@ -1016,11 +1016,11 @@ func TestEnqueueLoop_DispatchErrorWaits(t *testing.T) {
 	}
 }
 
-// TestEnqueueLoop_EmptyBatchWaitsStrict — пустая пачка — именно ожидание
-// пополнения IdleWait, а не прогон постановки пустой пачки с паузой
-// Interval: до отмены — одна выборка, холостого цикла нет.
+// TestEnqueueLoop_EmptyBatchWaitsStrict — an empty batch is exactly a wait
+// for replenishment of IdleWait, not a run of enqueueing an empty batch with the
+// Interval pause: until cancellation — one selection, no idle loop.
 func TestEnqueueLoop_EmptyBatchWaitsStrict(t *testing.T) {
-	pool := &enqueueFakePool{notify: make(chan struct{}, 8)} // pending пуст
+	pool := &enqueueFakePool{notify: make(chan struct{}, 8)} // pending is empty
 	q := &enqueueFakeQueue{}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1047,8 +1047,8 @@ func TestEnqueueLoop_EmptyBatchWaitsStrict(t *testing.T) {
 	}
 }
 
-// TestEnqueueLoop_SingleRowBatchEnqueued — пачка из одного домена — не
-// «пустая»: перевод и публикация выполняются.
+// TestEnqueueLoop_SingleRowBatchEnqueued — a batch of one domain is not
+// "empty": the move and publication run.
 func TestEnqueueLoop_SingleRowBatchEnqueued(t *testing.T) {
 	pool := &enqueueFakePool{
 		zones: [][]any{{int16(1), "example.com"}},
@@ -1082,9 +1082,9 @@ func TestEnqueueLoop_SingleRowBatchEnqueued(t *testing.T) {
 	}
 }
 
-// TestEnqueueLoop_EnqueueErrorWaits — после ошибки постановки (перевод
-// сорвался) цикл уходит в паузу IdleWait: до отмены — один полный круг
-// (зоны, выборка, перевод) без новых обращений.
+// TestEnqueueLoop_EnqueueErrorWaits — after an enqueue error (the move
+// failed) the loop goes into the IdleWait pause: until cancellation — one full circle
+// (zones, selection, move) without new calls.
 func TestEnqueueLoop_EnqueueErrorWaits(t *testing.T) {
 	pool := &enqueueFakePool{
 		zones: [][]any{{int16(1), "example.com"}},

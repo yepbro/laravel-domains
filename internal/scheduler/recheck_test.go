@@ -1,9 +1,9 @@
-// Юнит-тесты суточной перепроверки доменов (T-030, ТЗ 5.3, 3.3, 11.4
-// п. 8) на фейковом pgx-пуле: точный SQL-текст и параметры (граница
-// now()−interval, размер пачки, коды check_state/status), дефолты,
-// пустой набор, повторные проходы, ошибки и отмена ctx, цикл
-// RecheckDaily (немедленный дренаж, переживание ошибки, чистый выход).
-// Поведение против живой БД — интеграционные тесты этапа 2.
+// Unit tests of the daily domain recheck (T-030, spec 5.3, 3.3, 11.4
+// item 8) on a fake pgx pool: the exact SQL text and parameters (the
+// now()−interval boundary, the batch size, the check_state/status codes), defaults,
+// an empty set, repeated passes, errors and ctx cancellation, the
+// RecheckDaily cycle (an immediate drain, surviving an error, a clean exit).
+// Behavior against a live DB — integration tests of stage 2.
 package scheduler
 
 import (
@@ -24,23 +24,23 @@ import (
 	"crawler/internal/model"
 )
 
-// --- фейковый пул ---------------------------------------------------------
+// --- fake pool ---------------------------------------------------------
 
-// recheckCall — записанный SQL-вызов с аргументами.
+// recheckCall — a recorded SQL call with arguments.
 type recheckCall struct {
 	sql  string
 	args []any
 }
 
-// recheckFakePool — db.DB без БД: очередь результатов Query (число
-// переведённых строк — строки zone_id внешнего SELECT оператора
-// прохода, T-178) и ошибок, протокол вызовов. Всё под замком: цикл
-// RecheckDaily работает в горутине, тест ожидает прогресс по
-// счётчикам.
+// recheckFakePool — a db.DB without a DB: the queue of Query results (the
+// number of moved rows — the zone_id rows of the pass statement's outer
+// SELECT, T-178) and errors, the call protocol. Everything under a lock: the
+// RecheckDaily loop runs in a goroutine; the test waits for progress by
+// counters.
 type recheckFakePool struct {
 	mu       sync.Mutex
-	tags     []int64 // очередь числа строк ответа (кончилась — 0: пустой набор)
-	execErrs []error // очередь ошибок Query (nil — вызов без ошибки)
+	tags     []int64 // the queue of response row counts (ran out — 0: an empty set)
+	execErrs []error // the queue of Query errors (nil — a call without an error)
 	queries  []recheckCall
 }
 
@@ -70,19 +70,19 @@ func (p *recheckFakePool) Query(_ context.Context, sql string, args ...any) (pgx
 	}
 	rows := make([][]any, n)
 	for i := range rows {
-		rows[i] = []any{int16(1)} // zone_id: значение для счёта строк не важно
+		rows[i] = []any{int16(1)} // zone_id: the value does not matter for row counting
 	}
 	return retryRows(rows...), nil
 }
 
-// stats — снимок числа вызовов под замком (ожидание прогресса цикла).
+// stats — a snapshot of the call count under the lock (waiting for loop progress).
 func (p *recheckFakePool) stats() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return len(p.queries)
 }
 
-// calls — снимок протокола вызовов под замком.
+// calls — a snapshot of the call protocol under the lock.
 func (p *recheckFakePool) calls() []recheckCall {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -104,8 +104,8 @@ const wantRecheckUpdate = "WITH b AS (SELECT zone_id, id FROM domains " +
 	"WHERE z.id = c.zone_id) " +
 	"SELECT zone_id FROM upd"
 
-// recheckFixedClock — часы с фиксированным «сейчас» (порог прохода
-// воспроизводим до наносекунды).
+// recheckFixedClock — a clock with a fixed "now" (the pass threshold
+// reproducible to the nanosecond).
 func recheckFixedClock() (time.Time, func() time.Time) {
 	now := time.Date(2026, 10, 17, 3, 0, 0, 0, time.UTC)
 	return now, func() time.Time { return now }
@@ -113,9 +113,9 @@ func recheckFixedClock() (time.Time, func() time.Time) {
 
 // --- RecheckOnce -----------------------------------------------------------
 
-// TestRecheckOnceSQL — один оператор UPDATE с точными параметрами:
-// целевое состояние pending, отбор done/не-deleted, граница
-// now() − interval и размер пачки.
+// TestRecheckOnceSQL — one UPDATE statement with exact parameters:
+// the target state pending, the done/not-deleted selection, the
+// now() − interval boundary and the batch size.
 func TestRecheckOnceSQL(t *testing.T) {
 	now, clock := recheckFixedClock()
 	pool := &recheckFakePool{tags: []int64{42}}
@@ -138,8 +138,8 @@ func TestRecheckOnceSQL(t *testing.T) {
 	}
 	wantArgs := []any{
 		int16(model.CheckStatePending), // SET check_state
-		now.Add(-2190 * time.Hour),     // граница now() − interval
-		7000,                           // LIMIT пачки
+		now.Add(-2190 * time.Hour),     // the now() − interval boundary
+		7000,                           // the batch LIMIT
 	}
 	if !reflect.DeepEqual(calls[0].args, wantArgs) {
 		t.Errorf("аргументы = %v, want %v", calls[0].args, wantArgs)
@@ -149,9 +149,9 @@ func TestRecheckOnceSQL(t *testing.T) {
 	}
 }
 
-// TestRecheckOnceDefaults — нулевые опции: интервал и пачка — дефолты
-// (4380 ч ≈ 6 месяцев, ТЗ 3.3), часы — фиксированные: порог считается
-// точно.
+// TestRecheckOnceDefaults — zero options: the interval and batch are the defaults
+// (4380 h ≈ 6 months, spec 3.3); the clocks are fixed: the threshold is counted
+// exactly.
 func TestRecheckOnceDefaults(t *testing.T) {
 	now, clock := recheckFixedClock()
 	pool := &recheckFakePool{}
@@ -169,10 +169,10 @@ func TestRecheckOnceDefaults(t *testing.T) {
 	}
 }
 
-// TestRecheckOnceEmpty — исчерпанное множество: RowsAffected 0, итог
-// нулевой, оператор один.
+// TestRecheckOnceEmpty — an exhausted set: RowsAffected 0, a zero
+// outcome, one statement.
 func TestRecheckOnceEmpty(t *testing.T) {
-	pool := &recheckFakePool{} // очередь tags пуста — UPDATE 0
+	pool := &recheckFakePool{} // the tags queue is empty — UPDATE 0
 
 	res, err := RecheckOnce(context.Background(), pool, RecheckOptions{})
 	if err != nil {
@@ -186,9 +186,9 @@ func TestRecheckOnceEmpty(t *testing.T) {
 	}
 }
 
-// TestRecheckOnceRepeatPasses — переведённые строки не выбираются
-// повторно (условие отбора в самом SQL): каждый проход — свой оператор,
-// после опустошения — нулевой итог.
+// TestRecheckOnceRepeatPasses — moved rows are not selected
+// again (the selection condition is in the SQL itself): each pass is its own statement;
+// after exhaustion — a zero outcome.
 func TestRecheckOnceRepeatPasses(t *testing.T) {
 	pool := &recheckFakePool{tags: []int64{5000, 3, 0}}
 
@@ -213,8 +213,8 @@ func TestRecheckOnceRepeatPasses(t *testing.T) {
 	}
 }
 
-// TestRecheckOnceError — ошибка оператора обёрнута с контекстом
-// задачи; отмена ctx сохраняется errors.Is.
+// TestRecheckOnceError — a statement error is wrapped with the task
+// context; ctx cancellation is preserved via errors.Is.
 func TestRecheckOnceError(t *testing.T) {
 	pool := &recheckFakePool{execErrs: []error{errors.New("бд недоступна")}}
 	_, err := RecheckOnce(context.Background(), pool, RecheckOptions{})
@@ -239,8 +239,8 @@ func TestRecheckOnceNilPool(t *testing.T) {
 
 // --- RecheckOptions --------------------------------------------------------
 
-// recheckCheckDefaults — значения после withDefaults (Now — функция,
-// сравнируется отдельно: struct с полем-функцией не сравнивается целиком).
+// recheckCheckDefaults — the values after withDefaults (Now is a function;
+// compared separately: a struct with a function field is not compared in full).
 func recheckCheckDefaults(t *testing.T, got RecheckOptions, wantInterval time.Duration, wantBatch int, wantSchedule time.Duration) {
 	t.Helper()
 	if got.Interval != wantInterval || got.BatchSize != wantBatch || got.Schedule != wantSchedule {
@@ -250,8 +250,8 @@ func recheckCheckDefaults(t *testing.T, got RecheckOptions, wantInterval time.Du
 }
 
 func TestRecheckOptionsDefaults(t *testing.T) {
-	// Дефолты пинятся литералами ТЗ (3.3: 6 месяцев; 5.3: пачки, сутки):
-	// сравнение с самой константой мутации не замечает.
+	// The defaults are pinned by spec literals (3.3: 6 months; 5.3: batches, a day):
+	// comparing with the very constant does not notice mutations.
 	if DefaultRecheckInterval != 4380*time.Hour {
 		t.Errorf("DefaultRecheckInterval = %v, want 4380ч (≈6 месяцев)", DefaultRecheckInterval)
 	}
@@ -262,17 +262,17 @@ func TestRecheckOptionsDefaults(t *testing.T) {
 		t.Errorf("DefaultRecheckSchedule = %v, want сутки", DefaultRecheckSchedule)
 	}
 
-	// Нулевые и отрицательные значения — дефолты.
+	// Zero and negative values — the defaults.
 	recheckCheckDefaults(t, (RecheckOptions{}).withDefaults(),
 		DefaultRecheckInterval, DefaultRecheckBatch, DefaultRecheckSchedule)
 	recheckCheckDefaults(t, (RecheckOptions{Interval: -time.Hour, BatchSize: -1, Schedule: -time.Minute}).withDefaults(),
 		DefaultRecheckInterval, DefaultRecheckBatch, DefaultRecheckSchedule)
 
-	// Границы замен: 1 нс и 1 — положительные значения, не дефолты.
+	// Replacement boundaries: 1 ns and 1 are positive values, not defaults.
 	recheckCheckDefaults(t, (RecheckOptions{Interval: time.Nanosecond, BatchSize: 1, Schedule: time.Nanosecond}).withDefaults(),
 		time.Nanosecond, 1, time.Nanosecond)
 
-	// Заданные значения не затираются, Now передаётся как есть.
+	// Given values are not overwritten; Now is passed as is.
 	now := func() time.Time { return time.Unix(0, 0) }
 	got := RecheckOptions{
 		Interval:  time.Hour,
@@ -288,21 +288,21 @@ func TestRecheckOptionsDefaults(t *testing.T) {
 
 // --- RecheckDaily ----------------------------------------------------------
 
-// TestRecheckDailyImmediateDrain — первый дренаж выполняется сразу при
-// старте, не дожидаясь суток: подбирает созревшее за простой.
+// TestRecheckDailyImmediateDrain — the first drain runs immediately at
+// start, without waiting a day: it picks up what ripened during the downtime.
 func TestRecheckDailyImmediateDrain(t *testing.T) {
-	pool := &recheckFakePool{tags: []int64{7}} // неполная пачка — дренаж закончен
+	pool := &recheckFakePool{tags: []int64{7}} // an incomplete batch — the drain is finished
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
 		done <- RecheckDaily(ctx, pool, RecheckOptions{
-			Schedule: time.Hour, // тик не наступит: только стартовый дренаж
+			Schedule: time.Hour, // the tick never comes: only the starting drain
 		})
 	}()
 
-	// Стартовый дренаж: один оператор и тишина до отмены.
+	// The starting drain: one statement and silence until cancellation.
 	deadline := time.Now().Add(2 * time.Second)
 	for pool.stats() < 1 {
 		if time.Now().After(deadline) {
@@ -322,15 +322,15 @@ func TestRecheckDailyImmediateDrain(t *testing.T) {
 	}
 }
 
-// TestRecheckDailyLoop — полный дренаж пачками до исчерпания, ошибка
-// пачки прерывает только свой дренаж (Warn), очередной тик продолжает;
-// отмена ctx — чистый nil.
+// TestRecheckDailyLoop — a full drain in batches until exhaustion; a batch
+// error interrupts only its own drain (a Warn); the next tick continues;
+// ctx cancellation — a clean nil.
 func TestRecheckDailyLoop(t *testing.T) {
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&buf, nil))
 
-	// Дренаж 1 (старт): ошибка БД — Warn. Дренаж 2 (тик): полная пачка +
-	// неполная — Info с суммой. Дальше — пустые множества.
+	// Drain 1 (start): a DB error — a Warn. Drain 2 (tick): a full batch +
+	// an incomplete one — an Info with the sum. Then — empty sets.
 	pool := &recheckFakePool{
 		tags:     []int64{DefaultRecheckBatch, 3},
 		execErrs: []error{errors.New("бд недоступна")},
@@ -345,7 +345,7 @@ func TestRecheckDailyLoop(t *testing.T) {
 		})
 	}()
 
-	// Три оператора: провал первого дренажа и оба пакета второго.
+	// Three statements: the first drain's failure and both batches of the second.
 	deadline := time.Now().Add(2 * time.Second)
 	for pool.stats() < 3 {
 		if time.Now().After(deadline) {
@@ -362,10 +362,10 @@ func TestRecheckDailyLoop(t *testing.T) {
 
 	log := buf.String()
 	for _, want := range []string{
-		"суточная перепроверка доменов", // старт
-		"level=WARN", // ошибка дренажа не убила цикл
+		"суточная перепроверка доменов", // the start
+		"level=WARN", // a drain error did not kill the loop
 		"бд недоступна",
-		fmt.Sprintf("domains=%d", DefaultRecheckBatch+3), // итог дренажа
+		fmt.Sprintf("domains=%d", DefaultRecheckBatch+3), // the drain outcome
 	} {
 		if !strings.Contains(log, want) {
 			t.Errorf("лог не содержит %q:\n%s", want, log)
@@ -373,15 +373,15 @@ func TestRecheckDailyLoop(t *testing.T) {
 	}
 }
 
-// TestRecheckDailyCancelDuringDrain — отмена ctx во время дренажа — не
-// тревога: без Warn, чистый nil (контракт OnRun, T-012).
+// TestRecheckDailyCancelDuringDrain — ctx cancellation during a drain is not
+// an alarm: no Warn, a clean nil (the OnRun contract, T-012).
 func TestRecheckDailyCancelDuringDrain(t *testing.T) {
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&buf, nil))
 
 	pool := &recheckFakePool{execErrs: []error{context.Canceled}}
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // отменён до старта: первый же оператор дренажа провалится
+	cancel() // cancelled before the start: the drain's very first statement will fail
 
 	done := make(chan error, 1)
 	go func() { done <- RecheckDaily(ctx, pool, RecheckOptions{Log: logger}) }()
@@ -394,15 +394,15 @@ func TestRecheckDailyCancelDuringDrain(t *testing.T) {
 	}
 }
 
-// TestRecheckDailyDrainTotals — Info-итог дренажа: положительная сумма
-// логируется (ровно 1 — тоже положительная), нулевая — нет. Дренаж
-// выполняется при уже отменённом ctx: фейк ошибок не возвращает, отмена
-// не мешает проходам — итог обязан быть подведён.
+// TestRecheckDailyDrainTotals — the drain's Info outcome: a positive sum
+// is logged (exactly 1 is also positive); a zero one — is not. The drain
+// runs with ctx already cancelled: the fake returns no errors; the cancellation
+// does not hinder the passes — the outcome must be tallied.
 func TestRecheckDailyDrainTotals(t *testing.T) {
 	tests := []struct {
 		name string
 		tags []int64
-		want string // подстрока Info-итога дренажа; "" — итог не логируется
+		want string // a substring of the drain's Info outcome; "" — the outcome is not logged
 	}{
 		{"неполная пачка из одного", []int64{1}, "domains=1"},
 		{"нулевой дренаж", []int64{0}, ""},
@@ -414,7 +414,7 @@ func TestRecheckDailyDrainTotals(t *testing.T) {
 			pool := &recheckFakePool{tags: tt.tags}
 
 			ctx, cancel := context.WithCancel(context.Background())
-			cancel() // стартовый дренаж синхронен и от тика не зависит
+			cancel() // the starting drain is synchronous and independent of the tick
 			done := make(chan error, 1)
 			go func() { done <- RecheckDaily(ctx, pool, RecheckOptions{Log: logger}) }()
 

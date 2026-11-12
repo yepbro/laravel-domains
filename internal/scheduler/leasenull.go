@@ -1,33 +1,33 @@
-// Scheduler: терминальная страховка строк queued с NULL queued_at (T-255,
-// ТЗ tasks/TZ-fsm.md §3 ФТ-1.2) — ремонтный проход цикла LeaseWatch
-// (lease.go). Инвариант T-028 «queued ⇒ queued_at NOT NULL» (И1
-// спецификации автомата check_state, checkstate.go) нарушается багом
-// писателя или ручным SQL — сегодня такая строка зависает в queued
-// навсегда: основной lease-проход отбирает по возрасту queued_at, NULL
-// сравнением отсеивается (lease.go leaseSelectSQL), диспетчер выбирает
-// только pending, записи результатов приходят только на доставки задач,
-// которых у строки нет. Страховка возвращает такие строки в pending —
-// перевыберет диспетчер (T-027), повторная проверка идемпотентна
-// (at-least-once, ТЗ 3.4): состояние перестаёт зависеть от выживания
-// чужой отметки времени.
+// Scheduler: the terminal guard of queued rows with NULL queued_at (T-255,
+// spec tasks/TZ-fsm.md §3 FR-1.2) — the repair pass of the LeaseWatch cycle
+// (lease.go). The T-028 invariant "queued ⇒ queued_at NOT NULL" (I1
+// of the check_state machine specification, checkstate.go) is broken by a writer bug
+// or manual SQL — today such a row hangs in queued
+// forever: the main lease pass selects by the queued_at age, NULL
+// is filtered out by the comparison (lease.go leaseSelectSQL), the dispatcher selects
+// only pending, result writes come only on task deliveries,
+// which the row has none of. The guard returns such rows to pending —
+// the dispatcher (T-027) will re-select them, the repeated check is idempotent
+// (at-least-once, spec 3.4): the state stops depending on the survival
+// of someone else's timestamp.
 //
-// Проход — ДВА оператора в одной транзакции (форма основного lease-прохода
-// T-200, без его курсора: множество NULL-строк не растёт повторными
-// постановками — свежая постановка пишет now(), правее любого порога):
-// выборка пачки (leaseNullSelectSQL) и перевод PK-пробами
-// (leaseNullUpdateSQL — guard-оператор того же вида, что leaseUpdateSQL).
-// Форма основного lease-запроса и пригодность domains_lease_idx (T-104)
-// не меняются: выборка страховки — отдельный оператор, идущий по ТОМУ ЖЕ
-// частичному индексу (queued_at IS NULL — поисковое условие на ведущей
-// колонке ключа, NULL-записи лежат в индексе компактным диапазоном),
-// ORDER BY совпадает с ключом индекса — пачки без сортировки.
+// The pass is TWO statements in one transaction (the form of the main lease pass
+// T-200, without its cursor: the set of NULL rows does not grow via re-enqueues — a fresh
+// enqueue writes now(), to the right of any threshold):
+// the batch selection (leaseNullSelectSQL) and the move by PK probes
+// (leaseNullUpdateSQL — a guard statement of the same kind as leaseUpdateSQL).
+// The form of the main lease query and the usability of domains_lease_idx (T-104)
+// are unchanged: the guard selection is a separate statement going over the SAME
+// partial index (queued_at IS NULL — a search condition on the leading
+// key column, NULL records lie in the index as a compact range),
+// ORDER BY matches the index key — batches without sorting.
 //
-// Поведение штатных аренд не меняется: у строк с ненулевой queued_at
-// охрана IS NULL перевода не пропускает, основной проход их и не видит.
-// Счётчик crawler_scheduler_lease_null_returned_total — по RETURNING
-// перевода: каждое событие — одна возвращённая строка; стационарно ноль
-// (инвариант держат все писатели), ненулевой стационар — сигнал
-// оператору (docs/runbooks.md §2.9): где-то пишут queued без отметки.
+// The behavior of regular leases is unchanged: for rows with a non-NULL queued_at
+// the move's IS NULL guard does not let them through, and the main pass does not see them anyway.
+// The crawler_scheduler_lease_null_returned_total counter — by the RETURNING
+// of the move: each event is one returned row; in steady state zero
+// (all writers uphold the invariant), a non-zero steady state is a signal
+// to the operator (docs/runbooks.md §2.9): someone writes queued without a stamp.
 
 package scheduler
 
@@ -43,39 +43,39 @@ import (
 	"crawler/internal/model"
 )
 
-// leaseNullSelectSQL — выборка пачки строк queued с NULL queued_at (не
-// deleted): нарушенный инвариант И1 (checkstate.go). Идёт по частичному
-// индексу domains_lease_idx (T-104): предикат check_state = 1 имплицирован
-// частичным индексом, queued_at IS NULL — поисковое условие на ведущей
-// колонке ключа (btree хранит NULL-записи, IS NULL — индексное равенство),
-// ORDER BY (queued_at, zone_id, id) совпадает с ключом — скан читает
-// только NULL-диапазон каждой партиции и останавливается по LIMIT; ключ
-// целиком детерминирует пачки (стиль leaseSelectSQL). Коды схемы —
-// литералами через model.* (предикат частичного индекса обязан быть
-// доказуем для планировщика; параметр убивал бы индекс в generic-плане
-// подготовленного выражения — стиль dispatch.go). deleted исключён в
-// самой выборке (как в leaseSelectSQL): мёртвая строка не должна
-// занимать лимит пачки и закрывать возврат живым.
+// leaseNullSelectSQL — the selection of a batch of queued rows with NULL queued_at (not
+// deleted): the broken I1 invariant (checkstate.go). It goes over the partial
+// index domains_lease_idx (T-104): the predicate check_state = 1 is implied by the
+// partial index, queued_at IS NULL — a search condition on the leading
+// key column (btree keeps NULL records, IS NULL is an index equality),
+// ORDER BY (queued_at, zone_id, id) matches the key — the scan reads
+// only the NULL range of each partition and stops by LIMIT; the key
+// in full determines the batches (the leaseSelectSQL style). Schema codes —
+// as literals via model.* (a partial index predicate must be
+// provable for the planner; a parameter would kill the index in the generic plan
+// of the prepared statement — the dispatch.go style). deleted is excluded in
+// the selection itself (as in leaseSelectSQL): a dead row must not
+// take the batch limit and shut out the living from returning.
 var leaseNullSelectSQL = fmt.Sprintf(
 	"SELECT zone_id, id FROM domains "+
 		"WHERE check_state = %d AND status <> %d AND queued_at IS NULL "+
 		"ORDER BY queued_at, zone_id, id LIMIT $1",
 	int16(model.CheckStateQueued), int16(model.StatusDeleted))
 
-// leaseNullUpdateSQL — перевод выбранной пачки в pending PK-пробами
-// (guard-оператор вида leaseUpdateSQL, T-200): unnest-пакетный UPDATE,
-// планировщик ведёт от unnest и пробирует domains по PK (zone_id, id) —
-// скан со стороны UPDATE нет. Guard-фильтры те же, что в выборке, и
-// выполняются на момент БЛОКИРОВКИ строки: гонка с записью результата
-// (queued → done) или ручной постановкой отметки между выборкой и
-// блокировкой не переводит строку, чья судьба изменилась. Сброс
-// queued_at = NULL — единая форма с остальными переводами в pending
-// (И2): у строки уже NULL, присваивание семантически no-op, но держит
-// оператор самодостаточным (не порождает особой ветки). Дельты счётчиков
-// зон (queued −n / pending +n) — CTE zc по RETURNING zone_id
-// переведённых строк (T-178, ТЗИ §6.2: предикат пинирует старое
-// состояние queued); внешний SELECT — LeaseNullOnce считает итог по
-// RETURNING (guard мог отсеять часть пачки).
+// leaseNullUpdateSQL — moving the selected batch to pending by PK probes
+// (a guard statement of the leaseUpdateSQL kind, T-200): an unnest batch UPDATE,
+// the planner is led away from unnest and probes domains by PK (zone_id, id) —
+// there is no scan on the UPDATE side. The guard filters are the same as in the selection and
+// are evaluated at the moment the row is LOCKED: a race with a result write
+// (queued → done) or a manual stamping between the selection and the
+// lock does not move a row whose fate changed. The reset
+// queued_at = NULL — a single form with the other moves to pending
+// (I2): the row already has NULL, the assignment is semantically a no-op, but keeps
+// the statement self-sufficient (does not create a special branch). The zone counter
+// deltas (queued −n / pending +n) — the CTE zc over the RETURNING zone_id
+// of the moved rows (T-178, incremental-counters spec §6.2: the predicate pins the old
+// queued state); the outer SELECT — LeaseNullOnce counts the outcome by
+// RETURNING (the guard could have filtered out part of the batch).
 var leaseNullUpdateSQL = fmt.Sprintf(
 	"WITH upd AS (UPDATE domains AS t "+
 		"SET check_state = $1, queued_at = NULL "+
@@ -91,33 +91,33 @@ var leaseNullUpdateSQL = fmt.Sprintf(
 		"SELECT zone_id FROM upd",
 	int16(model.CheckStateQueued), int16(model.StatusDeleted))
 
-// LeaseNullResult — итог одного прохода LeaseNullOnce.
+// LeaseNullResult — the outcome of one LeaseNullOnce pass.
 type LeaseNullResult struct {
-	// Domains — строки, возвращённые в pending ЭТИМ проходом (по RETURNING
-	// перевода, после охран — стиль LeaseResult).
+	// Domains — rows returned to pending by THIS pass (by the RETURNING
+	// of the move, after the guards — the LeaseResult style).
 	Domains int64
-	// Selected — строк в пачке выборки: LIMIT заполнен целиком — за ней
-	// ещё есть, дренаж LeaseWatch продолжается следующей пачкой.
+	// Selected — rows in the selection batch: the LIMIT is filled completely — there are
+	// more beyond it, the LeaseWatch drain continues with the next batch.
 	Selected int
 }
 
-// leaseNullRow — строка пачки страховки: ключ домена (queued_at у всех
-// NULL — курсора нет, хранить нечего).
+// leaseNullRow — a guard batch row: the domain key (queued_at is NULL
+// for all — there is no cursor, nothing to keep).
 type leaseNullRow struct {
 	zone int16
 	id   int64
 }
 
-// leaseNullMetrics — счётчик ремонтного прохода (T-255); nil — no-op
-// (стиль retryMetrics).
+// leaseNullMetrics — the repair pass counter (T-255); nil — no-op
+// (the retryMetrics style).
 type leaseNullMetrics struct {
 	returned prometheus.Counter
 }
 
-// newLeaseNullMetrics — счётчик в реестре reg (nil — nil): имя/HELP —
-// точка правды документации метрики (docs/services.md); регистрация
-// идемпотентна (T-076) — построение на каждый проход безопасно, вектор
-// делится между LeaseWatch и прямыми вызовами LeaseNullOnce.
+// newLeaseNullMetrics — the counter in the reg registry (nil — nil): the name/HELP —
+// the single point of truth of the metric documentation (docs/services.md); registration
+// is idempotent (T-076) — building it on every pass is safe, the vector
+// is shared between LeaseWatch and direct LeaseNullOnce calls.
 func newLeaseNullMetrics(reg *metrics.Registry) *leaseNullMetrics {
 	if reg == nil {
 		return nil
@@ -130,7 +130,7 @@ func newLeaseNullMetrics(reg *metrics.Registry) *leaseNullMetrics {
 	}
 }
 
-// add — n возвращённых строк; nil — no-op.
+// add — n returned rows; nil — no-op.
 func (m *leaseNullMetrics) add(n int64) {
 	if m == nil {
 		return
@@ -138,15 +138,15 @@ func (m *leaseNullMetrics) add(n int64) {
 	m.returned.Add(float64(n))
 }
 
-// LeaseNullOnce выполняет один ремонтный проход (ФТ-1.2): до
-// opts.BatchSize строк check_state = queued с NULL queued_at (не deleted)
-// выбираются и в той же транзакции переводятся в check_state = pending
-// PK-пробами — дельты счётчиков зон ведёт CTE оператора перевода (T-178);
-// счётчик crawler_scheduler_lease_null_returned_total растёт на число
-// фактически переведённых (opts.Metrics; nil — без метрик). Повторный
-// проход безопасен (ТЗ 3.4): переведённые строки перестают удовлетворять
-// отбору. Пустая пачка — no-op без перевода и фиксации (стиль LeaseOnce).
-// Форма основного lease-запроса не затрагивается (lease.go не меняется).
+// LeaseNullOnce performs one repair pass (FR-1.2): up to
+// opts.BatchSize rows check_state = queued with NULL queued_at (not deleted)
+// are selected and in the same transaction are moved to check_state = pending
+// by PK probes — the zone counter deltas are kept by the move statement's CTE (T-178);
+// the crawler_scheduler_lease_null_returned_total counter grows by the number
+// of rows actually moved (opts.Metrics; nil — without metrics). A repeated
+// pass is safe (spec 3.4): the moved rows stop matching
+// the selection. An empty batch is a no-op without a move or commit (the LeaseOnce style).
+// The form of the main lease query is not touched (lease.go is unchanged).
 func LeaseNullOnce(ctx context.Context, pool LeaseDB, opts LeaseOptions) (LeaseNullResult, error) {
 	if pool == nil {
 		return LeaseNullResult{}, errors.New("scheduler: страховка queued без queued_at: пул не задан")
@@ -158,7 +158,7 @@ func LeaseNullOnce(ctx context.Context, pool LeaseDB, opts LeaseOptions) (LeaseN
 	if err != nil {
 		return LeaseNullResult{}, fmt.Errorf("scheduler: страховка queued без queued_at: транзакция: %w", err)
 	}
-	// Откат безусловно: после Commit — no-op (стиль T-020/T-044).
+	// The rollback is unconditional: after Commit — a no-op (the T-020/T-044 style).
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	batch, err := leaseNullSelect(ctx, tx, o.BatchSize)
@@ -166,8 +166,8 @@ func LeaseNullOnce(ctx context.Context, pool LeaseDB, opts LeaseOptions) (LeaseN
 		return LeaseNullResult{}, err
 	}
 	if len(batch) == 0 {
-		// Переводить нечего: UPDATE не выполняется, транзакция только
-		// читала (стиль LeaseOnce).
+		// Nothing to move: the UPDATE is not executed, the transaction only
+		// read (the LeaseOnce style).
 		return LeaseNullResult{}, nil
 	}
 
@@ -182,8 +182,8 @@ func LeaseNullOnce(ctx context.Context, pool LeaseDB, opts LeaseOptions) (LeaseN
 	return LeaseNullResult{Domains: n, Selected: len(batch)}, nil
 }
 
-// leaseNullSelect — пачка строк queued/NULL queued_at (leaseNullSelectSQL)
-// в транзакции прохода: ключи доменов — аргументы перевода.
+// leaseNullSelect — a batch of queued/NULL queued_at rows (leaseNullSelectSQL)
+// in the pass transaction: the domain keys — the move arguments.
 func leaseNullSelect(ctx context.Context, tx pgx.Tx, limit int) ([]leaseNullRow, error) {
 	rows, err := tx.Query(ctx, leaseNullSelectSQL, limit)
 	if err != nil {
@@ -205,9 +205,9 @@ func leaseNullSelect(ctx context.Context, tx pgx.Tx, limit int) ([]leaseNullRow,
 	return out, nil
 }
 
-// leaseNullTranslate — перевод пачки PK-пробами (leaseNullUpdateSQL) в
-// транзакции прохода; возвращает число переведённых строк по RETURNING
-// (после охран — стиль leaseTranslate).
+// leaseNullTranslate — moving a batch by PK probes (leaseNullUpdateSQL) in the
+// pass transaction; returns the number of moved rows by RETURNING
+// (after the guards — the leaseTranslate style).
 func leaseNullTranslate(ctx context.Context, tx pgx.Tx, batch []leaseNullRow) (int64, error) {
 	zones := make([]int16, len(batch))
 	ids := make([]int64, len(batch))

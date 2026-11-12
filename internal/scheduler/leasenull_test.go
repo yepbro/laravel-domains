@@ -1,14 +1,14 @@
-// Юнит-тесты терминальной страховки queued/NULL queued_at (T-255, ТЗ
-// ТЗ-fsm §3 ФТ-1.2) на фейковом pgx-пуле с транзакциями (расширение
-// leaseFakePool — lease_test.go): точные SQL-тексты обоих операторов и
-// параметры (LIMIT пачки, охрана queued + IS NULL, сброс queued_at, коды
-// check_state/status литералами), пара операторов в одной транзакции,
-// счёт по RETURNING, пустая пачка — no-op, guard отсеял изменившиеся
-// строки, ошибки шагов и nil-пул, счётчик
-// crawler_scheduler_lease_null_returned_total растёт по переводам,
-// дренаж цикла LeaseWatch пачками до исчерпания с переживанием ошибки.
-// Поведение против живой БД (включая пригодность domains_lease_idx) —
-// интеграционные тесты (test/integration/checkstate_test.go).
+// Unit tests of the terminal queued/NULL queued_at guard (T-255, the
+// TZ-fsm spec §3 FR-1.2) on a fake pgx pool with transactions (an extension
+// of leaseFakePool — lease_test.go): the exact SQL texts of both statements and
+// parameters (the batch LIMIT, the queued + IS NULL guard, the queued_at reset, the
+// check_state/status codes as literals), the pair of statements in one transaction,
+// counting by RETURNING, an empty batch — a no-op, the guard filtered out changed
+// rows, step errors and a nil pool; the
+// crawler_scheduler_lease_null_returned_total counter grows by the moves,
+// the LeaseWatch cycle drain in batches until exhaustion, surviving an error.
+// Behavior against a live DB (including the usability of domains_lease_idx) —
+// integration tests (test/integration/checkstate_test.go).
 package scheduler
 
 import (
@@ -24,9 +24,9 @@ import (
 	"crawler/internal/model"
 )
 
-// --- заготовки -------------------------------------------------------------
+// --- stubs -------------------------------------------------------------
 
-// leaseNullSeedBatch — пачка страховки n строк: одна зона, id по порядку.
+// leaseNullSeedBatch — a guard batch of n rows: one zone, ids in order.
 func leaseNullSeedBatch(n int, translated int64) leaseNullBatch {
 	rows := make([]leaseNullRow, n)
 	for i := range rows {
@@ -35,7 +35,7 @@ func leaseNullSeedBatch(n int, translated int64) leaseNullBatch {
 	return leaseNullBatch{rows: rows, translated: translated}
 }
 
-// --- ожидаемые SQL-тексты (контракт ФТ-1.2) --------------------------------
+// --- expected SQL texts (the FR-1.2 contract) --------------------------------
 
 const wantLeaseNullSelect = "SELECT zone_id, id FROM domains " +
 	"WHERE check_state = 1 AND status <> 6 AND queued_at IS NULL " +
@@ -56,10 +56,10 @@ const wantLeaseNullUpdate = "WITH upd AS (UPDATE domains AS t " +
 
 // --- LeaseNullOnce ---------------------------------------------------------
 
-// TestLeaseNullOnceSQL — контракт обоих операторов страховки: SELECT пачки
-// queued/NULL без deleted по индексному ключу, UPDATE … FROM unnest с
-// guard-охранами (IS NULL, сброс queued_at, дельты зон); точные
-// параметры, порядок операций одной транзакции, счёт по RETURNING.
+// TestLeaseNullOnceSQL — the contract of both guard statements: the batch SELECT
+// of queued/NULL without deleted by the index key, UPDATE … FROM unnest with
+// guard re-checks (IS NULL, the queued_at reset, zone deltas); exact
+// parameters, the operation order of one transaction, counting by RETURNING.
 func TestLeaseNullOnceSQL(t *testing.T) {
 	pool := &leaseFakePool{nullBatches: []leaseNullBatch{leaseNullSeedBatch(3, 2)}}
 
@@ -99,21 +99,21 @@ func TestLeaseNullOnceSQL(t *testing.T) {
 	}
 	wantUpdArgs := []any{
 		int16(model.CheckStatePending), // SET check_state
-		[]int16{1, 1, 1},               // зоны выбранной пачки
-		[]int64{1, 2, 3},               // домены выбранной пачки
+		[]int16{1, 1, 1},               // the zones of the selected batch
+		[]int64{1, 2, 3},               // the domains of the selected batch
 	}
 	if !reflect.DeepEqual(upd[0].args, wantUpdArgs) {
 		t.Errorf("аргументы перевода = %v, want %v", upd[0].args, wantUpdArgs)
 	}
 
-	// Счёт по RETURNING: переведено 2 из выбранных 3 (guard отсеял одну).
+	// Counting by RETURNING: 2 of the selected 3 moved (the guard filtered out one).
 	if res.Domains != 2 || res.Selected != 3 {
 		t.Errorf("итог = %+v, want Domains=2 (RETURNING), Selected=3", res)
 	}
 }
 
-// TestLeaseNullOnceDefaults — нулевые опции: LIMIT — дефолтная пачка
-// основного прохода (один размер на цикл LeaseWatch).
+// TestLeaseNullOnceDefaults — zero options: the LIMIT is the default batch
+// of the main pass (one size for the LeaseWatch cycle).
 func TestLeaseNullOnceDefaults(t *testing.T) {
 	pool := &leaseFakePool{nullBatches: []leaseNullBatch{leaseNullSeedBatch(1, 1)}}
 	if _, err := LeaseNullOnce(context.Background(), pool, LeaseOptions{}); err != nil {
@@ -125,10 +125,10 @@ func TestLeaseNullOnceDefaults(t *testing.T) {
 	}
 }
 
-// TestLeaseNullOnceEmpty — исчерпанное множество: пустая пачка — только
-// SELECT, перевод и фиксация не выполняются, итог нулевой.
+// TestLeaseNullOnceEmpty — an exhausted set: an empty batch — only
+// the SELECT; the move and commit are not executed, the outcome is zero.
 func TestLeaseNullOnceEmpty(t *testing.T) {
-	pool := &leaseFakePool{} // очередь пачек страховки пуста
+	pool := &leaseFakePool{} // the guard batch queue is empty
 
 	res, err := LeaseNullOnce(context.Background(), pool, LeaseOptions{})
 	if err != nil {
@@ -143,9 +143,9 @@ func TestLeaseNullOnceEmpty(t *testing.T) {
 	}
 }
 
-// TestLeaseNullOnceGuardFiltered — guard перевода отсеял часть пачки
-// (судьба строк изменилась между выборкой и блокировкой): счёт — по
-// RETURNING, unnest пробивает всю выбранную пачку.
+// TestLeaseNullOnceGuardFiltered — the move's guard filtered out part of the batch
+// (the rows' fate changed between the selection and the lock): the count is by
+// RETURNING; the unnest hits the entire selected batch.
 func TestLeaseNullOnceGuardFiltered(t *testing.T) {
 	pool := &leaseFakePool{nullBatches: []leaseNullBatch{leaseNullSeedBatch(5, 1)}}
 
@@ -162,8 +162,8 @@ func TestLeaseNullOnceGuardFiltered(t *testing.T) {
 	}
 }
 
-// TestLeaseNullOnceError — ошибки шагов прохода обёртываются с контекстом
-// страховки; nil-пул — ошибка «пул не задан».
+// TestLeaseNullOnceError — pass step errors are wrapped with the guard
+// context; a nil pool — the "pool not set" error.
 func TestLeaseNullOnceError(t *testing.T) {
 	selectPool := &leaseFakePool{
 		nullBatches:    []leaseNullBatch{leaseNullSeedBatch(2, 2)},
@@ -205,14 +205,14 @@ func TestLeaseNullOnceError(t *testing.T) {
 	}
 }
 
-// TestLeaseNullOnceMetrics — счётчик crawler_scheduler_lease_null_returned_total
-// растёт на фактически переведённые строки (по RETURNING, не по выборке):
-// два прохода 2 + 0 — итог 2; без реестра (nil Metrics) проход работает.
+// TestLeaseNullOnceMetrics — the crawler_scheduler_lease_null_returned_total counter
+// grows by the rows actually moved (by RETURNING, not by the selection):
+// two passes 2 + 0 — the outcome 2; without a registry (nil Metrics) the pass works.
 func TestLeaseNullOnceMetrics(t *testing.T) {
 	reg := metrics.New("scheduler")
 	pool := &leaseFakePool{nullBatches: []leaseNullBatch{
-		leaseNullSeedBatch(3, 2), // переведено 2 (guard отсеял одну)
-		leaseNullSeedBatch(0, 0), // множество исчерпано
+		leaseNullSeedBatch(3, 2), // 2 moved (the guard filtered out one)
+		leaseNullSeedBatch(0, 0), // the set is exhausted
 	}}
 
 	first, err := LeaseNullOnce(context.Background(), pool, LeaseOptions{Metrics: reg})
@@ -231,15 +231,15 @@ func TestLeaseNullOnceMetrics(t *testing.T) {
 		t.Errorf("счётчик после проходов = %v, want 2 (по RETURNING, пустой проход не считается)", got)
 	}
 
-	// Без реестра — no-op, проход выполняется.
+	// Without a registry — a no-op; the pass runs.
 	noop := &leaseFakePool{nullBatches: []leaseNullBatch{leaseNullSeedBatch(1, 1)}}
 	if _, err := LeaseNullOnce(context.Background(), noop, LeaseOptions{}); err != nil {
 		t.Fatalf("LeaseNullOnce без метрик: %v", err)
 	}
 }
 
-// leaseNullReturnedValue — значение счётчика страховки в реестре
-// (стиль driftGaugeValue монитор-тестов).
+// leaseNullReturnedValue — the value of the guard counter in the registry
+// (the driftGaugeValue style of the monitor tests).
 func leaseNullReturnedValue(t *testing.T, reg *metrics.Registry) float64 {
 	t.Helper()
 	families, err := reg.Gather()
@@ -257,16 +257,16 @@ func leaseNullReturnedValue(t *testing.T, reg *metrics.Registry) float64 {
 	return 0
 }
 
-// --- цикл LeaseWatch: ремонтный проход -------------------------------------
+// --- the LeaseWatch cycle: the repair pass -------------------------------------
 
-// TestLeaseWatchNullDrain — цикл LeaseWatch выполняет ремонтный проход
-// страховки тем же тиком (после дренажа основного множества): полная
-// пачка продолжает дренаж, неполная останавливает; счётчик растёт на
-// итог; переведённые не возвращаются (повторный проход — пустая пачка).
+// TestLeaseWatchNullDrain — the LeaseWatch cycle performs the repair
+// guard pass on the same tick (after the main set's drain): a full
+// batch continues the drain, an incomplete one stops it; the counter grows by
+// the outcome; moved rows are not returned (a repeated pass — an empty batch).
 func TestLeaseWatchNullDrain(t *testing.T) {
 	reg := metrics.New("scheduler")
-	// Полная пачка DefaultLeaseBatch + неполная 2 — дренаж двумя
-	// проходами; основное множество пусто (batches нет).
+	// A full batch of DefaultLeaseBatch + an incomplete one of 2 — the drain in two
+	// passes; the main set is empty (no batches).
 	pool := &leaseFakePool{
 		nullBatches: []leaseNullBatch{
 			leaseNullSeedBatch(DefaultLeaseBatch, int64(DefaultLeaseBatch)),
@@ -279,7 +279,7 @@ func TestLeaseWatchNullDrain(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		done <- LeaseWatch(ctx, pool, LeaseOptions{
-			Interval: time.Hour, // тик не наступит: только стартовый дренаж
+			Interval: time.Hour, // the tick never comes: only the starting drain
 			Metrics:  reg,
 		})
 	}()
@@ -301,7 +301,7 @@ func TestLeaseWatchNullDrain(t *testing.T) {
 	if got := leaseNullReturnedValue(t, reg); got != float64(DefaultLeaseBatch+2) {
 		t.Errorf("счётчик дренажа = %v, want %d", got, DefaultLeaseBatch+2)
 	}
-	// Оба прохода — одним тиком старта: без тика новых выборок нет.
+	// Both passes — by the single start tick: without a tick there are no new selections.
 	if sel := len(pool.nullSelectSnapshot()); sel != 2 {
 		t.Errorf("SELECT-вызовов страховки = %d, want 2 (неполная пачка останавливает)", sel)
 	}
@@ -312,9 +312,9 @@ func TestLeaseWatchNullDrain(t *testing.T) {
 	}
 }
 
-// TestLeaseWatchNullDrainError — ошибка пачки страховки прерывает только
-// её дренаж: цикл живёт, очередной тик повторяет (контракт OnRun); Warn
-// в журнале.
+// TestLeaseWatchNullDrainError — a guard batch error interrupts only
+// its drain: the loop lives, the next tick retries (the OnRun contract); a Warn
+// in the log.
 func TestLeaseWatchNullDrainError(t *testing.T) {
 	var buf strings.Builder
 	logger := slog.New(slog.NewTextHandler(&buf, nil))
@@ -324,7 +324,7 @@ func TestLeaseWatchNullDrainError(t *testing.T) {
 			leaseNullSeedBatch(2, 2),
 			leaseNullSeedBatch(1, 1),
 		},
-		nullSelectErrs: []error{errors.New("бд недоступна")}, // первый проход падает
+		nullSelectErrs: []error{errors.New("бд недоступна")}, // the first pass fails
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -332,12 +332,12 @@ func TestLeaseWatchNullDrainError(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		done <- LeaseWatch(ctx, pool, LeaseOptions{
-			Timeout: 40 * time.Millisecond, // интервал-дефолт: 20 мс
+			Timeout: 40 * time.Millisecond, // the interval default: 20 ms
 			Log:     logger,
 		})
 	}()
 
-	// Первый дренаж падает, тик повторяет и доводит обе пачки.
+	// The first drain fails; the tick retries and finishes both batches.
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		if upd := len(pool.nullUpdateSnapshot()); upd >= 2 {
@@ -359,7 +359,7 @@ func TestLeaseWatchNullDrainError(t *testing.T) {
 	for _, want := range []string{
 		"level=WARN",
 		"бд недоступна",
-		"строки queued без queued_at возвращены", // итог дренажа — Warn (сигнал оператору)
+		"строки queued без queued_at возвращены", // the drain outcome — a Warn (a signal to the operator)
 	} {
 		if !strings.Contains(log, want) {
 			t.Errorf("лог не содержит %q:\n%s", want, log)

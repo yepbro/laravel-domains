@@ -1,41 +1,41 @@
-// Package scheduler — планировщик проверок доменов (ТЗ 5.3). Файл
-// recheck — суточный перевод готовых к перепроверке доменов обратно в
-// очередь (T-030; выборку pending и lease — T-027/T-028/T-029).
+// Package scheduler — the domain check scheduler (spec 5.3). The recheck
+// file is the daily move of domains ready for rechecking back into
+// the queue (T-030; pending selection and lease — T-027/T-028/T-029).
 //
-// Семантика (ТЗ 5.3: «переводит done → pending»). done/pending —
-// состояния проверки, колонка domains.check_state (0 pending, 1 queued,
-// 2 done; ТЗ 6.1), а НЕ статус результата domains.status (ТЗ 6.2).
-// Статус результата (alive, no_http, …) не меняется: он хранит итог
-// последней проверки и перезапишется, когда новая завершится; сам факт
-// готовности выражается состоянием — status=alive + check_state=pending
-// означает «проверен ранее, ждёт перепроверки». Обратно в цикл домен
-// возвращает только check_state=pending: его выбирает диспетчер T-027
-// (частичный индекс domains_pending_idx). queued_at сбрасывается в NULL
-// — как у воскрешённого домена в T-018: у pending нет lease (lease
-// заведёт постановка в очередь, T-028).
+// Semantics (spec 5.3: "moves done → pending"). done/pending are
+// check states, the domains.check_state column (0 pending, 1 queued,
+// 2 done; spec 6.1), NOT the result status domains.status (spec 6.2).
+// The result status (alive, no_http, …) is not changed: it keeps the outcome
+// of the last check and will be overwritten when the new one finishes; the very fact
+// of readiness is expressed by the state — status=alive + check_state=pending
+// means "checked earlier, awaiting a recheck". Back into the cycle a domain
+// is returned only by check_state=pending: the T-027 dispatcher selects it
+// (the partial index domains_pending_idx). queued_at is reset to NULL
+// — like a resurrected domain in T-018: pending has no lease (the
+// enqueue will set up the lease, T-028).
 //
-// Условия готовности (ТЗ 5.3, 3.3, 11.4 п. 8): check_state = done И
-// last_checked_at старше scheduler.recheck_interval (по умолчанию
-// 4380 ч ≈ 6 месяцев; повторная проверка — не чаще этого интервала).
-// NULL last_checked_at сравнением отсеивается (никогда не проверялся —
-// возраста нет). Статус deleted исключается (ТЗ 13.1): удалённые из
-// реестра домены повторной проверке не подлежат; temp_error остаётся
-// кандидатом — его частые повторы ведёт T-031 (temp_error_retry_after),
-// а возрастная перепроверка через интервал возвращает даже доменам,
-// застрявшим в temp_error, шанс на итоговый статус.
+// Readiness conditions (spec 5.3, 3.3, 11.4 item 8): check_state = done AND
+// last_checked_at older than scheduler.recheck_interval (4380 h ≈ 6 months
+// by default; a repeated check — no more often than this interval).
+// A NULL last_checked_at is filtered out by the comparison (never checked —
+// there is no age). The deleted status is excluded (spec 13.1): domains deleted
+// from the registry are not subject to rechecking; temp_error remains
+// a candidate — its frequent retries are handled by T-031 (temp_error_retry_after),
+// while the age-based recheck after the interval gives even domains
+// stuck in temp_error a chance at a final status.
 //
-// Проход — один оператор UPDATE … FROM (SELECT … LIMIT): пачка
-// ограничена (стиль T-020: короткие блокировки, автокоммит одного
-// оператора — не транзакция на миллионы строк). Переведённые строки
-// перестают удовлетворять подзапросу, поэтому повторные проходы и
-// рестарты идемпотентны и не делают лишней работы (ТЗ 3.4). Внешний
-// WHERE перепроверяет условия отбора на актуальной версии строки —
-// гонка с delete-файлом (T-019) или вторым проходом не переведёт
-// строку, изменившую состояние между выборкой и блокировкой (как
-// охрана статуса в cleanupDeleteSQL, T-020). Подзапрос идёт по
-// частичному индексу domains_recheck_idx с самых старых done-строк
-// (миграция 000008, T-104): пачки дренажа линейны, а проход не хранит
-// позиции — внешнего состояния нет, сбой и рестарт ничего не теряют.
+// The pass is one UPDATE … FROM (SELECT … LIMIT) statement: the batch is
+// bounded (the T-020 style: short locks, the autocommit of a single
+// statement — not a transaction over millions of rows). The moved rows
+// stop matching the subquery, so repeated passes and
+// restarts are idempotent and do no extra work (spec 3.4). The outer
+// WHERE re-checks the selection conditions on the current version of the row —
+// a race with a delete file (T-019) or a second pass will not move
+// a row that changed its state between the selection and the lock (like
+// the status guard in cleanupDeleteSQL, T-020). The subquery goes over
+// the partial index domains_recheck_idx starting from the oldest done rows
+// (migration 000008, T-104): the drain batches are linear, and the pass keeps no
+// position — there is no external state, a failure and a restart lose nothing.
 package scheduler
 
 import (
@@ -50,65 +50,65 @@ import (
 )
 
 const (
-	// DefaultRecheckInterval — возраст последней проверки, после которого
-	// домен готов к перепроверке: 4380 часов ≈ 6 месяцев (ТЗ 3.3). Зеркалит
-	// дефолт scheduler.recheck_interval (internal/config); рабочий цикл
-	// получает значение из конфига (T-012/T-013: конфиг — источник).
+	// DefaultRecheckInterval — the age of the last check after which
+	// the domain is ready for a recheck: 4380 hours ≈ 6 months (spec 3.3). Mirrors
+	// the default scheduler.recheck_interval (internal/config); the working loop
+	// gets the value from the config (T-012/T-013: the config is the source).
 	DefaultRecheckInterval = 4380 * time.Hour
 
-	// DefaultRecheckBatch — доменов в одной пачке перевода: в диапазоне
-	// пачек планировщика (ТЗ 5.3: 1000–10 000), совпадает с дефолтом
-	// scheduler.batch_size. Пачка ограничивает один UPDATE — блокировки
-	// удерживаются минимум времени (стиль T-020).
+	// DefaultRecheckBatch — domains in one move batch: in the range of the
+	// scheduler batches (spec 5.3: 1000–10,000), matches the default
+	// scheduler.batch_size. The batch bounds one UPDATE — locks are
+	// held for the minimum time (the T-020 style).
 	DefaultRecheckBatch = 5000
 
-	// DefaultRecheckSchedule — период цикла RecheckDaily: раз в сутки
-	// (ТЗ 5.3). Отдельной опции конфига нет: ТЗ 5.10 расписание не
-	// параметризует, суточность фиксирована.
+	// DefaultRecheckSchedule — the period of the RecheckDaily cycle: once a day
+	// (spec 5.3). There is no separate config option: the spec 5.10 does not
+	// parameterize the schedule, the daily cadence is fixed.
 	DefaultRecheckSchedule = 24 * time.Hour
 )
 
-// recheckUpdateSQL — один проход: пачка созревших доменов (check_state
-// = done, last_checked_at старше порога, не deleted) переводится в
-// pending без смены статуса результата. invalid (диагноз ядовитой
-// строки, T-109) в отборе исключён: единственный штатный путь возврата
-// строки в конвейер после терминального диагноза — этот проход, без
-// фильтра ядовитые строки циклились бы вечно (DNS-03). dispatch/lease
-// фильтр не расширяют: lease видит только queued (запись диагноза
-// ставит done), а invalid+pending (окно гонки recheck↔записи диагноза)
-// без фильтра dispatch переиздаётся один раз и диагноз фиксируется
-// заново — самозаживление; с фильтром dispatch такая строка зависла бы
-// в pending навсегда, вне всех фоновых проходов.
-// LIMIT в подзапросе — пачка.
-// Сравнение date < timestamptz — кросс-типовой оператор btree-opfamily
-// datetime: индекс по last_checked_at применим и к параметру-порогу
-// timestamptz, гранулярность колонки — день (ТЗ 6.1), «старше интервала»
-// выполняется с точностью до дня. Внешний WHERE перепроверяет ВСЕ условия
-// отбора на актуальной версии строки — включая возраст last_checked_at
-// (симметрия с lease.go: гонка со свежей записью результата между
-// выборкой и блокировкой не переведёт заново проверенный домен).
+// recheckUpdateSQL — one pass: a batch of ripened domains (check_state
+// = done, last_checked_at older than the threshold, not deleted) is moved to
+// pending without changing the result status. invalid (the diagnosis of a poison
+// row, T-109) is excluded from the selection: the only regular way to return
+// a row to the pipeline after a terminal diagnosis is this pass; without the
+// filter poison rows would cycle forever (DNS-03). dispatch/lease
+// do not widen the filter: lease sees only queued (writing the diagnosis
+// sets done), while invalid+pending (the race window recheck↔diagnosis write)
+// without the dispatch filter is re-published once and the diagnosis is recorded
+// again — self-healing; with the dispatch filter such a row would hang
+// in pending forever, outside all background passes.
+// LIMIT in the subquery — the batch.
+// The date < timestamptz comparison is a btree-opfamily cross-type
+// datetime operator: the index over last_checked_at applies to the timestamptz
+// threshold parameter too; the column granularity is a day (spec 6.1), "older than the interval"
+// holds with day precision. The outer WHERE re-checks ALL selection
+// conditions on the current version of the row — including the age of last_checked_at
+// (symmetry with lease.go: a race with a fresh result write between
+// the selection and the lock will not move an already rechecked domain).
 //
-// Коды check_state/status вшиты в текст литералами через model.* — коды
-// схемы, а не данные (стиль dispatch.go): параметр в предикате частичного
-// индекса планировщик не доказывает, generic-план подготовленного
-// выражения (pgx кеширует их) терял бы пригодность domains_recheck_idx
-// (миграция 000008, T-104); дополнительный предикат по status сужает
-// отбор, не расширяя требование к частичному индексу — пригодность
-// сохраняется (status в индекс не входит, HOT-апдейты не затронуты).
+// The check_state/status codes are baked into the text as literals via model.* — schema
+// codes, not data (the dispatch.go style): the planner cannot prove a parameter in a partial
+// index predicate; the generic plan of the prepared
+// statement (pgx caches them) would lose the usability of domains_recheck_idx
+// (migration 000008, T-104); an extra status predicate narrows
+// the selection without widening the partial index requirement — the usability
+// is preserved (status is not part of the index, HOT updates are unaffected).
 //
-// ORDER BY (last_checked_at, zone_id, id) совпадает с ключом
-// domains_recheck_idx: скан читает с самых старых done-строк ровно
-// созревший префикс и останавливается по LIMIT. Пачки дренажа
-// детерминированы (уникальный доменный ключ в хвосте сортировки),
-// перевод идёт от самых давно проверенных; переведённые строки покидают
-// индекс, следующая пачка продолжается с места остановки — дренаж линеен
-// и не перечитывает несозревшее множество (внешнего состояния нет,
-// сбой и рестарт ничего не теряют, ТЗ 3.4).
+// ORDER BY (last_checked_at, zone_id, id) matches the key of
+// domains_recheck_idx: the scan reads exactly the ripened prefix starting from the
+// oldest done rows and stops by LIMIT. The drain batches are
+// deterministic (a unique domain key at the tail of the sort),
+// the move goes from the longest-ago checked; moved rows leave the
+// index, the next batch continues from the stopping point — the drain is linear
+// and does not reread the unripened set (there is no external state;
+// a failure and a restart lose nothing, spec 3.4).
 //
-// Дельты счётчиков зон (checked −n / pending +n) — CTE zc того же
-// оператора по RETURNING zone_id переведённых строк (T-178, ТЗИ §6.2:
-// предикат пинирует старое состояние done); внешний SELECT отдаёт
-// zone_id переведённых — RecheckOnce считает по нему итог.
+// The zone counter deltas (checked −n / pending +n) — the CTE zc of the same
+// statement over the RETURNING zone_id of the moved rows (T-178, incremental-counters spec §6.2:
+// the predicate pins the old done state); the outer SELECT returns
+// the zone_id of the moved rows — RecheckOnce counts the outcome by it.
 var recheckUpdateSQL = fmt.Sprintf(
 	"WITH b AS (SELECT zone_id, id FROM domains "+
 		"WHERE check_state = %[1]d AND status <> %[2]d AND status <> %[3]d AND last_checked_at < $2 "+
@@ -126,28 +126,28 @@ var recheckUpdateSQL = fmt.Sprintf(
 		"SELECT zone_id FROM upd",
 	int16(model.CheckStateDone), int16(model.StatusDeleted), int16(model.StatusInvalid))
 
-// RecheckOptions — параметры перепроверки; нулевые значения заменяются
-// дефолтами (withDefaults, стиль ingest.CleanupOptions).
+// RecheckOptions — recheck parameters; zero values are replaced
+// with defaults (withDefaults, the ingest.CleanupOptions style).
 type RecheckOptions struct {
-	// Interval — порог возраста последней проверки (DefaultRecheckInterval);
-	// рабочее значение — scheduler.recheck_interval из конфига.
+	// Interval — the age threshold of the last check (DefaultRecheckInterval);
+	// the working value is scheduler.recheck_interval from the config.
 	Interval time.Duration
-	// BatchSize — максимум доменов в одной пачке (DefaultRecheckBatch).
+	// BatchSize — the maximum domains in one batch (DefaultRecheckBatch).
 	BatchSize int
-	// Schedule — период цикла RecheckDaily (DefaultRecheckSchedule);
-	// на разовый RecheckOnce не влияет.
+	// Schedule — the period of the RecheckDaily cycle (DefaultRecheckSchedule);
+	// does not affect a one-off RecheckOnce.
 	Schedule time.Duration
-	// Now — источник времени для порога now() − Interval; nil — time.Now.
-	// Тесты подставляют фиксированные часы (стиль watch, T-013).
+	// Now — the time source for the threshold now() − Interval; nil — time.Now.
+	// Tests substitute a fixed clock (the watch style, T-013).
 	Now func() time.Time
-	// Log — логгер цикла RecheckDaily; nil — записи подавлены
-	// (slog.DiscardHandler). RecheckOnce не логирует — итог возвращается
-	// RecheckResult.
+	// Log — the RecheckDaily loop logger; nil — records suppressed
+	// (slog.DiscardHandler). RecheckOnce does not log — the outcome is returned
+	// as RecheckResult.
 	Log *slog.Logger
 }
 
-// withDefaults заменяет неположительные значения дефолтами (Now
-// проверяется отдельно: функций — nil).
+// withDefaults replaces non-positive values with defaults (Now
+// is checked separately: functions — nil).
 func (o RecheckOptions) withDefaults() RecheckOptions {
 	if o.Interval <= 0 {
 		o.Interval = DefaultRecheckInterval
@@ -161,19 +161,19 @@ func (o RecheckOptions) withDefaults() RecheckOptions {
 	return o
 }
 
-// RecheckResult — итог одного прохода RecheckOnce.
+// RecheckResult — the outcome of one RecheckOnce pass.
 type RecheckResult struct {
-	// Domains — домены, переведённые в pending (не больше размера пачки).
+	// Domains — domains moved to pending (no more than the batch size).
 	Domains int64
 }
 
-// RecheckOnce выполняет один проход (ТЗ 5.3): до opts.BatchSize доменов
-// со check_state = done и last_checked_at старше opts.Interval (не
-// deleted) переводятся в check_state = pending одним оператором —
-// статус результата и остальные колонки не меняются, queued_at
-// сбрасывается; CTE того же оператора ведёт дельты счётчиков зон
-// (T-178). Повторный проход безопасен (ТЗ 3.4): переведённые
-// строки подзапрос больше не выбирает.
+// RecheckOnce performs one pass (spec 5.3): up to opts.BatchSize domains
+// with check_state = done and last_checked_at older than opts.Interval (not
+// deleted) are moved to check_state = pending by one statement —
+// the result status and the other columns are unchanged, queued_at
+// is reset; the same statement's CTE keeps the zone counter deltas
+// (T-178). A repeated pass is safe (spec 3.4): the moved
+// rows are no longer selected by the subquery.
 func RecheckOnce(ctx context.Context, pool db.DB, opts RecheckOptions) (RecheckResult, error) {
 	if pool == nil {
 		return RecheckResult{}, errors.New("scheduler: перепроверка доменов: пул не задан")
@@ -209,15 +209,15 @@ func RecheckOnce(ctx context.Context, pool db.DB, opts RecheckOptions) (RecheckR
 	return RecheckResult{Domains: n}, nil
 }
 
-// RecheckDaily — суточный цикл перепроверки (ТЗ 5.3: «раз в сутки»):
-// дренаж всех созревших доменов пачками RecheckOnce, затем ожидание до
-// следующего суток-тика. Первый дренаж — сразу при старте: проход
-// идемпотентен и подбирает созревшее за время простоя сервиса (стиль
-// ingest.CleanupDeleted, T-020), а не ждёт тика — момент старта
-// ничем не выделен. Ошибка пачки прерывает только текущий дренаж:
-// логируется Warn, цикл живёт (контракт OnRun, T-012), очередной
-// дренаж продолжит с того же места — переведённое не переводится
-// дважды. Отмена ctx — чистый выход с nil (graceful shutdown, ТЗ 3.4).
+// RecheckDaily — the daily recheck cycle (spec 5.3: "once a day"):
+// the drain of all ripened domains in RecheckOnce batches, then waiting until
+// the next daily tick. The first drain is immediate at start: the pass
+// is idempotent and picks up what ripened during the service downtime (the style
+// of ingest.CleanupDeleted, T-020) instead of waiting for a tick — the start moment
+// is nothing special. A batch error interrupts only the current drain:
+// a Warn is logged, the loop lives (the OnRun contract, T-012), the next
+// drain will continue from the same place — what has been moved is not moved
+// twice. ctx cancellation — a clean exit with nil (graceful shutdown, spec 3.4).
 func RecheckDaily(ctx context.Context, pool db.DB, opts RecheckOptions) error {
 	if pool == nil {
 		return errors.New("scheduler: перепроверка доменов: пул не задан")
@@ -232,15 +232,15 @@ func RecheckDaily(ctx context.Context, pool db.DB, opts RecheckOptions) error {
 		"interval", o.Interval.String(),
 		"batch", o.BatchSize)
 
-	// drain переводит все созревшие домены: пачки повторяются, пока
-	// проходят целиком; неполная пачка — множество исчерпано.
+	// drain moves all ripened domains: batches repeat while they
+	// come back full; an incomplete batch — the set is exhausted.
 	drain := func() {
 		var total int64
 		for {
 			res, err := RecheckOnce(ctx, pool, o)
 			if err != nil {
-				// Отмена во время прохода — часть остановки, не тревога;
-				// прочая ошибка — Warn, очередной дренаж повторит.
+				// Cancellation during a pass is part of the stop, not an alarm;
+				// any other error — a Warn, the next drain will retry.
 				if ctx.Err() == nil {
 					log.Warn("суточный дренаж перепроверки доменов",
 						"err", err, "translated", total)

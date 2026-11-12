@@ -1,15 +1,15 @@
-// Тесты триажа выживших мутантов CI-прогона 10.11.2026 (часть B,
-// score 0.857): добивки покрытия scheduler по группам разбора —
-// дефолты опций (единичные значения и литеральные пины констант),
-// ошибки шагов проходов компенсаторов и ретрая (глушение возвратов:
-// Scan/rows.Err чтений, закрепление плана по-операторно, Begin/Commit
-// транзакций, nil-пул циклов), откат транзакций (defer Rollback обязан
-// вызываться даже после Commit — no-op), границы дренажных циклов
-// (обнуление счётчика упавших пачек успехом, останов полной пачкой с
-// нулевым переводом, продолжение дренажа после полностью переведённой
-// пачки), nil-приёмники метрик и корзины гистограммы прохода backlog.
-// Счётчики при ошибках, журналирование и эквивалентные мутанты —
-// блэклист (docs/mutation-testing.md §4).
+// Tests of triaging the surviving mutants of the CI run of Nov 10, 2026 (part B,
+// score 0.857): scheduler coverage top-ups by triage groups —
+// option defaults (single values and literal pins of constants),
+// step errors of the compensator and retry passes (swallowing returns:
+// Scan/rows.Err of reads, per-statement plan pinning, transaction
+// Begin/Commit, nil pools of loops), transaction rollbacks (the defer Rollback must
+// be called even after Commit — a no-op), drain loop boundaries
+// (the failed-batch counter reset by a success; a stop by a full batch with
+// a zero move; the drain continuing after a fully moved
+// batch), nil metric sinks and the backlog pass histogram buckets.
+// Counters on errors, logging and equivalent mutants —
+// the blacklist (docs/mutation-testing.md §4).
 package scheduler
 
 import (
@@ -28,19 +28,19 @@ import (
 	"crawler/internal/metrics"
 )
 
-// --- обёртки фейковых пулов триажа -----------------------------------------
+// --- triage fake pool wrappers -----------------------------------------
 //
-// Базовые фейки пакетов не умеют: падать отдельной операцией закрепления
-// плана (planErr статичен на все три SET LOCAL), возвращать строки с
-// ошибкой Scan/Err (заготовки собираются из типизированных пачек) и
-// считать откаты. Обёртки делегируют базовому фейку всё, что не
-// подменяется: протокол вызовов и статистика остаются честными.
+// The packages' base fakes cannot: fail an individual plan pinning
+// operation (planErr is static across all three SET LOCALs), return rows with
+// a Scan/Err error (stubs are assembled from typed batches) or
+// count rollbacks. The wrappers delegate everything that is not
+// substituted to the base fake: the call protocol and statistics stay honest.
 
-// triStalePool — staleFakePool с подменами для stalerequeue.go.
+// triStalePool — a staleFakePool with substitutions for stalerequeue.go.
 type triStalePool struct {
 	*staleFakePool
-	failNthPlan  int // 0 — без подмены; N — ошибка N-го SET LOCAL пачки
-	beginFailNth int // 0 — без подмены; N — ошибка N-го Begin прохода
+	failNthPlan  int // 0 — no substitution; N — the error of the batch's Nth SET LOCAL
+	beginFailNth int // 0 — no substitution; N — the error of the pass's Nth Begin
 	guardRows    pgx.Rows
 	selectRows   pgx.Rows
 	updateRows   pgx.Rows
@@ -78,8 +78,8 @@ func (p *triStalePool) rollbackCount() int {
 	return p.rollbacks
 }
 
-// triStaleTx — транзакция обёртки: точечный сбой SET LOCAL, подмена
-// строк выборки/перевода, подсчёт откатов.
+// triStaleTx — the wrapper's transaction: a point SET LOCAL failure,
+// a substitution of selection/move rows, rollback counting.
 type triStaleTx struct {
 	*staleFakeTx
 	pool *triStalePool
@@ -115,7 +115,7 @@ func (t *triStaleTx) Rollback(ctx context.Context) error {
 	return t.staleFakeTx.Rollback(ctx)
 }
 
-// triRetryPool — retryFakePool с подменами для retry.go.
+// triRetryPool — a retryFakePool with substitutions for retry.go.
 type triRetryPool struct {
 	*retryFakePool
 	failNthPlan int
@@ -140,7 +140,7 @@ func (p *triRetryPool) Begin(ctx context.Context) (pgx.Tx, error) {
 	return tx, nil
 }
 
-// triRetryTx — точечный сбой N-го SET LOCAL транзакции выборки.
+// triRetryTx — a point failure of the selection transaction's Nth SET LOCAL.
 type triRetryTx struct {
 	*retryFakeTx
 	pool *triRetryPool
@@ -155,7 +155,7 @@ func (t *triRetryTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.
 	return t.retryFakeTx.Exec(ctx, sql, args...)
 }
 
-// triLeasePool — leaseFakePool с подменами строк и подсчётом откатов
+// triLeasePool — a leaseFakePool with row substitutions and rollback counting
 // (lease.go/leasenull.go).
 type triLeasePool struct {
 	*leaseFakePool
@@ -182,8 +182,8 @@ func (p *triLeasePool) rollbackCount() int {
 	return p.rollbacks
 }
 
-// triLeaseTx — подмена ответа оператора и подсчёт откатов; остальное —
-// базовому фейку (протокол и валидации ключей пачки).
+// triLeaseTx — a substitution of the statement's response and rollback counting; the rest —
+// to the base fake (the protocol and the batch key validations).
 type triLeaseTx struct {
 	pgx.Tx
 	pool *triLeasePool
@@ -218,7 +218,7 @@ func (t *triLeaseTx) Rollback(ctx context.Context) error {
 	return t.Tx.Rollback(ctx)
 }
 
-// triRecheckPool — recheckFakePool с подменой строк ответа UPDATE.
+// triRecheckPool — a recheckFakePool with a substitution of the UPDATE response rows.
 type triRecheckPool struct {
 	*recheckFakePool
 	rows pgx.Rows
@@ -233,10 +233,10 @@ func (p *triRecheckPool) Query(ctx context.Context, sql string, args ...any) (pg
 
 // --- stalerequeue.go -------------------------------------------------------
 
-// TestStaleRequeueTriageDefaults — дефолты опций компенсатора: нулевые
-// BatchSize/Interval — DefaultStaleRequeueBatch/Interval; единичные
-// (1) значения — законные явные, дефолтом не заменяются (мутант «≤ 1»
-// подменял бы их).
+// TestStaleRequeueTriageDefaults — the compensator's option defaults: zero
+// BatchSize/Interval — DefaultStaleRequeueBatch/Interval; single
+// (1) values are legitimate explicit ones and are not replaced by defaults (the "≤ 1"
+// mutant would replace them).
 func TestStaleRequeueTriageDefaults(t *testing.T) {
 	o := StaleRequeueOptions{}.withDefaults()
 	if o.BatchSize != DefaultStaleRequeueBatch {
@@ -251,31 +251,31 @@ func TestStaleRequeueTriageDefaults(t *testing.T) {
 	}
 }
 
-// TestStaleRequeueTriageErrors — ошибки шагов прохода обязаны
-// возвращаться: чтения guard (Scan, хвостовой Err), закрепление плана
-// (каждое из трёх SET LOCAL отдельно), чтения выборки и перевода
-// (Scan/Err), Begin транзакции перевода, Commit перевода, nil-пул
-// цикла. Глушение любого возврата молча доводило бы проход до конца.
+// TestStaleRequeueTriageErrors — pass step errors must
+// be returned: the guard reads (Scan, the trailing Err), plan pinning
+// (each of the three SET LOCALs separately), the selection and move reads
+// (Scan/Err), the move transaction's Begin, the move's Commit, the loop's
+// nil pool. Swallowing any return would silently carry the pass to the end.
 func TestStaleRequeueTriageErrors(t *testing.T) {
 	ctx := context.Background()
 
-	// Guard: ширина ответа не совпадает с приёмником — ошибка чтения.
+	// Guard: the response width does not match the receivers — a read error.
 	p := &triStalePool{staleFakePool: &staleFakePool{},
 		guardRows: retryRows([]any{int64(1), int64(2)})}
 	if _, err := StaleRequeueOnce(ctx, p, StaleRequeueOptions{}); err == nil {
 		t.Error("ошибка Scan guard проглочена")
 	}
 
-	// Guard: строка прочитана, но чтение оборвалось после неё.
+	// Guard: the row is read, but the reading broke off after it.
 	p = &triStalePool{staleFakePool: &staleFakePool{},
 		guardRows: &retryFakeRows{rows: [][]any{{int64(5)}}, err: errors.New("обрыв соединения")}}
 	if _, err := StaleRequeueOnce(ctx, p, StaleRequeueOptions{}); err == nil {
 		t.Error("хвостовая ошибка rows.Err() guard проглочена (уровень 5 потерян)")
 	}
 
-	// Закрепление плана: сбой каждого SET LOCAL по отдельности — ошибка
-	// (статичный planErr фейка ловится соседними возвратами — здесь
-	// падает ровно одна операция серии).
+	// Plan pinning: each SET LOCAL failing individually — an error
+	// (the fake's static planErr is caught by neighboring returns — here
+	// exactly one operation of the series fails).
 	for n := 1; n <= 3; n++ {
 		p := &triStalePool{staleFakePool: &staleFakePool{guardVal: 1}, failNthPlan: n}
 		if _, err := StaleRequeueOnce(ctx, p, StaleRequeueOptions{}); err == nil {
@@ -283,9 +283,9 @@ func TestStaleRequeueTriageErrors(t *testing.T) {
 		}
 	}
 
-	// Выборка пачки: Scan и хвостовой Err.
+	// The batch selection: Scan and the trailing Err.
 	p = &triStalePool{staleFakePool: &staleFakePool{guardVal: 1},
-		selectRows: retryRows([]any{int16(1)})} // колонок меньше приёмников
+		selectRows: retryRows([]any{int16(1)})} // fewer columns than receivers
 	if _, err := StaleRequeueOnce(ctx, p, StaleRequeueOptions{}); err == nil {
 		t.Error("ошибка Scan выборки проглочена")
 	}
@@ -295,7 +295,7 @@ func TestStaleRequeueTriageErrors(t *testing.T) {
 		t.Error("хвостовая ошибка rows.Err() выборки проглочена")
 	}
 
-	// Перевод: Scan и хвостовой Err (строки RETURNING).
+	// The move: Scan and the trailing Err (the RETURNING rows).
 	p = &triStalePool{staleFakePool: &staleFakePool{guardVal: 1,
 		selects: []*retryFakeRows{retryRows([]any{int16(1), int64(1)})}},
 		updateRows: retryRows([]any{int16(1), int64(2)})}
@@ -309,7 +309,7 @@ func TestStaleRequeueTriageErrors(t *testing.T) {
 		t.Error("хвостовая ошибка rows.Err() перевода проглочена")
 	}
 
-	// Begin транзакции перевода (второй Begin прохода).
+	// The move transaction's Begin (the pass's second Begin).
 	sel, upd := staleSeedBatch([][2]int64{{1, 1}}, 1)
 	p = &triStalePool{staleFakePool: &staleFakePool{guardVal: 1,
 		selects: []*retryFakeRows{sel}, updates: []*retryFakeRows{upd}},
@@ -318,7 +318,7 @@ func TestStaleRequeueTriageErrors(t *testing.T) {
 		t.Error("сбой Begin транзакции перевода проглочен")
 	}
 
-	// Commit перевода (второй Commit прохода).
+	// The move's Commit (the pass's second Commit).
 	sel, upd = staleSeedBatch([][2]int64{{1, 1}}, 1)
 	p = &triStalePool{staleFakePool: &staleFakePool{guardVal: 1,
 		selects: []*retryFakeRows{sel}, updates: []*retryFakeRows{upd},
@@ -327,7 +327,7 @@ func TestStaleRequeueTriageErrors(t *testing.T) {
 		t.Error("сбой Commit перевода проглочен")
 	}
 
-	// nil-пул цикла — немедленная ошибка (не молчаливое зависание).
+	// The loop's nil pool — an immediate error (not a silent hang).
 	loopErr := make(chan error, 1)
 	go func() { loopErr <- StaleRequeueLoop(ctx, nil, StaleRequeueOptions{}) }()
 	select {
@@ -340,9 +340,9 @@ func TestStaleRequeueTriageErrors(t *testing.T) {
 	}
 }
 
-// TestStaleRequeueTriageRollback — обе транзакции прохода обязаны
-// закрываться откатом (после Commit — no-op, но вызов есть): утечка
-// незакрытой транзакции держит соединение пула.
+// TestStaleRequeueTriageRollback — both pass transactions must
+// close with a rollback (after Commit — a no-op, but the call happens): a leak
+// of an unclosed transaction holds a pool connection.
 func TestStaleRequeueTriageRollback(t *testing.T) {
 	sel, upd := staleSeedBatch([][2]int64{{1, 1}}, 1)
 	p := &triStalePool{staleFakePool: &staleFakePool{guardVal: 1,
@@ -355,9 +355,9 @@ func TestStaleRequeueTriageRollback(t *testing.T) {
 	}
 }
 
-// staleDrainQuiet — запуск StaleRequeueLoop и ожидание успокоения
-// дренажа (прогресс статистики остановился): тик Interval час — после
-// стартового дренажа цикл ждёт, все проходы в памяти — детерминированно.
+// staleDrainQuiet — starting StaleRequeueLoop and waiting for the drain
+// to settle (the statistics progress has stopped): the Interval tick is an hour — after
+// the starting drain the loop waits; all passes are in memory — deterministic.
 func staleDrainQuiet(t *testing.T, p *triStalePool) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -392,12 +392,12 @@ func staleDrainQuiet(t *testing.T, p *triStalePool) {
 	}
 }
 
-// TestStaleRequeueTriageDrain — остановка дренажа: полная пачка с
-// НУЛЕВЫМ переводом (guard/охраны отсеяли всё) — множество исчерпано,
-// второго прохода нет; полная пачка с полным переводом — за ней ещё
-// есть, дренаж продолжает следующей пачкой.
+// TestStaleRequeueTriageDrain — the drain stopping: a full batch with
+// a ZERO move (the guard/guards filtered out everything) — the set is exhausted,
+// no second pass; a full batch with a full move — there are more
+// beyond it; the drain continues with the next batch.
 func TestStaleRequeueTriageDrain(t *testing.T) {
-	// Полная пачка (BatchSize 1), перевод пуст: один проход, один SELECT.
+	// A full batch (BatchSize 1), an empty move: one pass, one SELECT.
 	selZero, _ := staleSeedBatch([][2]int64{{1, 1}}, 0)
 	p := &triStalePool{staleFakePool: &staleFakePool{guardVal: 1,
 		selects: []*retryFakeRows{selZero}}}
@@ -406,8 +406,8 @@ func TestStaleRequeueTriageDrain(t *testing.T) {
 		t.Errorf("нулевая пачка: проходов (select=%d, guard=%d), хочу 1/1 — множество исчерпано", st.selects, st.guards)
 	}
 
-	// Полная пачка с переводом: дренаж продолжает — вторая (пустая)
-	// выборка закрывает дренаж.
+	// A full batch with a move: the drain continues — the second (empty)
+	// selection closes the drain.
 	selFull, updFull := staleSeedBatch([][2]int64{{1, 1}}, 1)
 	p = &triStalePool{staleFakePool: &staleFakePool{guardVal: 1,
 		selects: []*retryFakeRows{selFull}, updates: []*retryFakeRows{updFull}}}
@@ -419,16 +419,16 @@ func TestStaleRequeueTriageDrain(t *testing.T) {
 
 // --- retry.go --------------------------------------------------------------
 
-// TestRetryTriageDefaults — литеральный пин предела упавших пачек
-// (T-268: три подряд — устойчивый сбой, до тика не молоть БД).
+// TestRetryTriageDefaults — a literal pin of the failed-batch limit
+// (T-268: three in a row — a persistent failure; no DB hammering until the tick).
 func TestRetryTriageDefaults(t *testing.T) {
 	if DefaultRetryDrainFails != 3 {
 		t.Errorf("DefaultRetryDrainFails = %d, хочу ровно 3 (T-268)", DefaultRetryDrainFails)
 	}
 }
 
-// TestRetryTriageErrors — ошибки шагов: закрепление плана (каждое SET
-// LOCAL отдельно), чтения guard корзин (Scan, хвостовой Err).
+// TestRetryTriageErrors — step errors: plan pinning (each SET
+// LOCAL separately), the bucket guard reads (Scan, the trailing Err).
 func TestRetryTriageErrors(t *testing.T) {
 	ctx := context.Background()
 
@@ -451,7 +451,7 @@ func TestRetryTriageErrors(t *testing.T) {
 	}
 }
 
-// retryDrainRun — запуск RetryTempErrors до успокоения дренажа.
+// retryDrainRun — starting RetryTempErrors until the drain settles.
 func retryDrainRun(t *testing.T, p *retryFakePool, o RetryOptions) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -484,14 +484,14 @@ func retryDrainRun(t *testing.T, p *retryFakePool, o RetryOptions) {
 	}
 }
 
-// TestRetryTriageDrainFailCounter — счётчик упавших пачек обнуляется
-// КАЖДЫМ успехом: после успешной пачки предел — ровно три падения
-// подряд (сброс в 0, не в ±1 — иначе предел срабатывает раньше/позже).
+// TestRetryTriageDrainFailCounter — the failed-batch counter is reset
+// by EVERY success: after a successful batch the limit is exactly three failures
+// in a row (a reset to 0, not ±1 — otherwise the limit fires earlier/later).
 func TestRetryTriageDrainFailCounter(t *testing.T) {
 	dbDown := errors.New("бд недоступна")
 	full := retryRows([]any{int16(1), int64(10), int16(0)})
 	p := &retryFakePool{
-		// Успех, затем устойчивый сбой guard.
+		// A success, then a persistent guard failure.
 		guardErrs: []error{nil, dbDown, dbDown, dbDown, dbDown, dbDown},
 		selects:   []*retryFakeRows{full},
 		requeues:  []*retryFakeRows{retryRows([]any{int16(1), int64(10), retryDay})},
@@ -502,15 +502,15 @@ func TestRetryTriageDrainFailCounter(t *testing.T) {
 	}
 }
 
-// TestRetryTriageDrainConsecutiveReset — чередование сбой/успех: счётчик
-// именно ПОСЛЕДОВАТЕЛЬНЫХ падений (успех обнуляет) — дренаж дорабатывает
-// до конца (итог requeued=3, без предела).
+// TestRetryTriageDrainConsecutiveReset — a failure/success alternation: the counter
+// is exactly of CONSECUTIVE failures (a success resets it) — the drain finishes
+// to the end (the outcome requeued=3, without the limit).
 func TestRetryTriageDrainConsecutiveReset(t *testing.T) {
 	dbDown := errors.New("бд недоступна")
 	cand := func() *retryFakeRows { return retryRows([]any{int16(1), int64(10), int16(0)}) }
 	ret := func() *retryFakeRows { return retryRows([]any{int16(1), int64(10), retryDay}) }
 	p := &retryFakePool{
-		// сбой, успех, сбой, успех, сбой, успех, затем пусто — итог.
+		// a failure, a success, a failure, a success, a failure, a success, then empty — the outcome.
 		guardErrs: []error{dbDown, nil, dbDown, nil, dbDown, nil},
 		selects:   []*retryFakeRows{cand(), cand(), cand()},
 		requeues:  []*retryFakeRows{ret(), ret(), ret()},
@@ -523,8 +523,8 @@ func TestRetryTriageDrainConsecutiveReset(t *testing.T) {
 
 // --- lease.go / leasenull.go ----------------------------------------------
 
-// TestLeaseTriageErrors — ошибки чтений основного прохода: Scan и
-// хвостовой Err выборки пачки и перевода — ошибки прохода.
+// TestLeaseTriageErrors — the main pass's read errors: the Scan and
+// trailing Err of the batch selection and the move — pass errors.
 func TestLeaseTriageErrors(t *testing.T) {
 	ctx := context.Background()
 	now, clock := leaseFixedClock()
@@ -554,7 +554,7 @@ func TestLeaseTriageErrors(t *testing.T) {
 	_ = now
 }
 
-// TestLeaseTriageRollback — транзакция прохода закрывается откатом.
+// TestLeaseTriageRollback — the pass transaction closes with a rollback.
 func TestLeaseTriageRollback(t *testing.T) {
 	_, clock := leaseFixedClock()
 	base := time.Date(2026, 10, 17, 4, 0, 0, 0, time.UTC)
@@ -569,7 +569,7 @@ func TestLeaseTriageRollback(t *testing.T) {
 	}
 }
 
-// TestLeaseNullTriageErrors — ошибки чтений ремонтного прохода страховки.
+// TestLeaseNullTriageErrors — the guard repair pass's read errors.
 func TestLeaseNullTriageErrors(t *testing.T) {
 	ctx := context.Background()
 	good := func() pgx.Rows { return retryRows([]any{int16(1), int64(1)}) }
@@ -595,7 +595,7 @@ func TestLeaseNullTriageErrors(t *testing.T) {
 	}
 }
 
-// TestLeaseNullTriageRollback — транзакция страховки закрывается откатом.
+// TestLeaseNullTriageRollback — the guard transaction closes with a rollback.
 func TestLeaseNullTriageRollback(t *testing.T) {
 	p := &triLeasePool{leaseFakePool: &leaseFakePool{
 		nullBatches: []leaseNullBatch{leaseNullSeedBatch(2, 2)}}}
@@ -607,17 +607,17 @@ func TestLeaseNullTriageRollback(t *testing.T) {
 	}
 }
 
-// TestLeaseTriageSelectSwallow — глушение возвратов ошибок выборки
-// (Scan/rows.Err) обязано ронять проход ДО перевода: ответ перевода
-// здесь подменён успехом, поэтому проглоченная ошибка доводила бы
-// мутанта до фиксации и nil (кейсы выше ловили её только повторной
-// ошибкой валидации пачки в фейке перевода).
+// TestLeaseTriageSelectSwallow — swallowing the selection error returns
+// (Scan/rows.Err) must crash the pass BEFORE the move: the move response
+// is substituted with success here, so a swallowed error would carry
+// the mutant to the commit and nil (the cases above caught it only by a repeated
+// batch validation error in the move fake).
 func TestLeaseTriageSelectSwallow(t *testing.T) {
 	ctx := context.Background()
 	_, clock := leaseFixedClock()
 	opts := LeaseOptions{Timeout: 15 * time.Minute, BatchSize: 8, Now: clock}
 
-	// Scan-ошибка (одна колонка на три приёмника): ошибка «выборка пачки».
+	// A Scan error (one column for three receivers): the "batch selection" error.
 	p := &triLeasePool{leaseFakePool: &leaseFakePool{},
 		selectRows: retryRows([]any{int16(1)}), updateRows: retryRows()}
 	if _, err := LeaseOnce(ctx, p, &LeaseCursor{}, opts); err == nil ||
@@ -625,7 +625,7 @@ func TestLeaseTriageSelectSwallow(t *testing.T) {
 		t.Errorf("глушение Scan выборки: %v, want ошибку выборки пачки", err)
 	}
 
-	// Хвостовая rows.Err: та же ошибка шага, не успех с пачкой.
+	// A trailing rows.Err: the same step error, not a success with a batch.
 	p = &triLeasePool{leaseFakePool: &leaseFakePool{},
 		selectRows: &retryFakeRows{
 			rows: [][]any{{int16(1), int64(1), time.Date(2026, 10, 17, 4, 0, 0, 0, time.UTC)}},
@@ -638,9 +638,9 @@ func TestLeaseTriageSelectSwallow(t *testing.T) {
 	}
 }
 
-// TestLeaseNullTriageSelectSwallow — то же для выборки ремонтного
-// прохода страховки: перевод подменён успехом — глушение ошибок
-// Scan/rows.Err доводило бы мутанта до фиксации и nil.
+// TestLeaseNullTriageSelectSwallow — the same for the guard repair
+// pass's selection: the move is substituted with success — swallowing the
+// Scan/rows.Err errors would carry the mutant to the commit and nil.
 func TestLeaseNullTriageSelectSwallow(t *testing.T) {
 	ctx := context.Background()
 
@@ -665,12 +665,12 @@ func TestLeaseNullTriageSelectSwallow(t *testing.T) {
 
 // --- recheck.go ------------------------------------------------------------
 
-// TestRecheckTriageRowsErrors — ошибки чтения ответа UPDATE перепроверки:
-// Scan и хвостовой Err — ошибки прохода (глушение молча теряло бы
-// счёт переведённых).
+// TestRecheckTriageRowsErrors — errors of reading the recheck's UPDATE response:
+// the Scan and the trailing Err — pass errors (swallowing would silently lose
+// the moved count).
 func TestRecheckTriageRowsErrors(t *testing.T) {
 	p := &triRecheckPool{recheckFakePool: &recheckFakePool{},
-		rows: retryRows([]any{int16(1), int64(2)})} // колонок больше приёмника
+		rows: retryRows([]any{int16(1), int64(2)})} // more columns than the receiver
 	if _, err := RecheckOnce(context.Background(), p, RecheckOptions{}); err == nil {
 		t.Error("ошибка Scan перепроверки проглочена")
 	}
@@ -683,21 +683,21 @@ func TestRecheckTriageRowsErrors(t *testing.T) {
 
 // --- backlog.go ------------------------------------------------------------
 
-// TestBacklogTriageNilMetrics — nil-приёмники метрик цикла — no-op:
-// конструктор без реестра и наблюдения на nil не паникуют (контракт
-// «nil — no-op», изолированные сборки без Prometheus).
+// TestBacklogTriageNilMetrics — the loop's nil metric sinks — a no-op:
+// the constructor without a registry and observations on nil do not panic (the
+// "nil — no-op" contract; isolated assemblies without Prometheus).
 func TestBacklogTriageNilMetrics(t *testing.T) {
 	if m := newBacklogLoopMetrics(nil); m != nil {
 		t.Errorf("newBacklogLoopMetrics(nil) = %v, хочу nil", m)
 	}
 	var m *backlogLoopMetrics
-	m.observe(1.5) // не паникует
+	m.observe(1.5) // does not panic
 	m.skip()
 }
 
-// TestBacklogTriageHistogramBuckets — корзины длительности прохода —
-// экспоненциальные 0.5с…512с (11 штук, старт 0.5, фактор 2): контракт
-// наблюдаемости «проход дольше интервала» виден в собранной метрике.
+// TestBacklogTriageHistogramBuckets — the pass duration buckets are
+// exponential 0.5s…512s (11 of them, start 0.5, factor 2): the
+// "pass longer than interval" observability contract is visible in the gathered metric.
 func TestBacklogTriageHistogramBuckets(t *testing.T) {
 	reg := metrics.New("scheduler-triage")
 	m := newBacklogLoopMetrics(reg)

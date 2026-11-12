@@ -1,11 +1,11 @@
-// Юнит-тесты выборки пачки планировщиком (T-027, ТЗ 5.3) без БД (стиль
-// internal/ingest/apply_add_test.go / zones_test.go): точные SQL-тексты
-// двух запросов (активные зоны с работой — domains_pending > 0, T-183;
-// LATERAL-префиксы очередей) и их параметры (массивы зон/keyset-курсоров,
-// квота — в дозаполнении остаток пачки, T-183), круговое слияние с
-// весами, дозаполнение голодных зон, пустой результат, валидация
-// параметров, ошибки запроса/чтения, отмена ctx. Реальное поведение
-// против живой БД — интеграционные тесты планировщика.
+// Unit tests of the scheduler batch selection (T-027, spec 5.3) without a DB (the
+// internal/ingest/apply_add_test.go / zones_test.go style): exact SQL texts
+// of both queries (active zones with work — domains_pending > 0, T-183;
+// LATERAL queue prefixes) and their parameters (arrays of zones/keyset cursors,
+// the quota — the batch remainder in top-ups, T-183), round-robin merging with
+// weights, top-up of starved zones, an empty result, validation
+// of parameters, query/read errors, ctx cancellation. The real behavior
+// against a live DB — the scheduler integration tests.
 package scheduler
 
 import (
@@ -25,16 +25,16 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-// --- фейковый pgx-пул -----------------------------------------------
+// --- fake pgx pool -----------------------------------------------
 
-// dispatchPool — db.DB для DispatchBatch: запоминает SQL и аргументы
-// Query, выдаёт заготовленные строки (или ошибку) по очереди вызовов.
-// Как и реальный pgx, отказывается работать с отменённым контекстом.
+// dispatchPool — a db.DB for DispatchBatch: remembers the SQL and arguments
+// of Query, returns pre-made rows (or an error) in call order.
+// Like real pgx, it refuses to work with a cancelled context.
 type dispatchPool struct {
 	queries []dispatchPoolQuery
 	results []*dispatchRows
-	errs    []error // ошибка на каждый вызов Query по одному (nil — успех): инъекция сбоя в середину диалога
-	err     error   // ошибка самого Query, если задана
+	errs    []error // an error per each individual Query call (nil — success): injecting a failure into the middle of the dialogue
+	err     error   // the error of Query itself, if set
 }
 
 type dispatchPoolQuery struct {
@@ -74,16 +74,16 @@ func (p *dispatchPool) Query(ctx context.Context, sql string, args ...any) (pgx.
 	return rows, nil
 }
 
-// dispatchRows — pgx.Rows ответа: имена колонок и строки; Scan
-// раскладывает значения позиционно по типу приёмника (int16/int64/
-// string — как pgx по OID колонок обоих запросов выборки).
+// dispatchRows — the pgx.Rows of a response: column names and rows; Scan
+// distributes the values positionally by the receiver's type (int16/int64/
+// string — like pgx by the OIDs of the columns of both selection queries).
 type dispatchRows struct {
 	colNames []string
 	rows     [][]any
-	i        int // индекс текущей строки (0 — до первого Next)
+	i        int // the index of the current row (0 — before the first Next)
 	closed   bool
-	err      error // Err() после исчерпания, если задан
-	scanErr  error // ошибка Scan, если задана
+	err      error // Err() after exhaustion, if set
+	scanErr  error // a Scan error, if set
 }
 
 func (r *dispatchRows) Close() { r.closed = true }
@@ -137,41 +137,41 @@ func (r *dispatchRows) Scan(dest ...any) error {
 func (r *dispatchRows) Values() ([]any, error) { return r.rows[r.i-1], nil }
 func (r *dispatchRows) RawValues() [][]byte    { return nil }
 
-// Conn и TypeMap — часть pgx.Rows, не используемая чтением вручную.
+// Conn and TypeMap — part of pgx.Rows not used by manual reading.
 func (r *dispatchRows) Conn() *pgx.Conn      { return nil }
 func (r *dispatchRows) TypeMap() *pgtype.Map { return nil }
 
-// --- заготовки ответов --------------------------------------------------------
+// --- response stubs --------------------------------------------------------
 
-// Колонки запросов выборки в порядке SELECT.
+// The columns of the selection queries in SELECT order.
 var (
 	dispatchZonesCols  = []string{"id", "name"}
 	dispatchDomainCols = []string{"zone_id", "id", "label"}
 )
 
-// dispatchZonesResult — ответ запроса активных зон: строки (id, name).
+// dispatchZonesResult — the active zones query response: rows (id, name).
 func dispatchZonesResult(rows ...[]any) *dispatchRows {
 	return &dispatchRows{colNames: dispatchZonesCols, rows: rows}
 }
 
-// dispatchDomainsResult — ответ запроса очередей: строки
-// (zone_id, id, label) в любом порядке — слияние сортирует само.
+// dispatchDomainsResult — the queues query response: rows
+// (zone_id, id, label) in any order — the merge sorts itself.
 func dispatchDomainsResult(rows ...[]any) *dispatchRows {
 	return &dispatchRows{colNames: dispatchDomainCols, rows: rows}
 }
 
-// zrow — строка зон: (id, name).
+// zrow — a zones row: (id, name).
 func zrow(id int16, name string) []any { return []any{id, name} }
 
-// drow — строка очереди: (zone_id, id, label).
+// drow — a queue row: (zone_id, id, label).
 func drow(zone int16, id int64, label string) []any { return []any{zone, id, label} }
 
-// drowID — drow с меткой "d<id>" для многорядных пачек тестов слияния:
-// полное имя домена в ожиданиях — "d<id>.<зона>".
+// drowID — a drow with the label "d<id>" for multi-row batches of merge tests:
+// the full domain name in expectations — "d<id>.<zone>".
 func drowID(zone int16, id int64) []any { return drow(zone, id, fmt.Sprintf("d%d", id)) }
 
-// drowIDs — строки одной зоны по списку id (id по возрастанию — очередь
-// зоны; перемешивание проверяет TestDispatchBatch отдельно).
+// drowIDs — the rows of one zone by an id list (ids ascending — the
+// zone's queue; shuffling is checked by TestDispatchBatch separately).
 func drowIDs(zone int16, ids ...int64) []any {
 	rows := make([]any, len(ids))
 	for i, id := range ids {
@@ -180,8 +180,8 @@ func drowIDs(zone int16, ids ...int64) []any {
 	return rows
 }
 
-// drows — заготовка ответа запроса очередей из строк, собранных
-// append'ом (элементы []any динамически []any — как у drow/drowIDs).
+// drows — a stub response of the queues query from rows assembled
+// by append (the elements are []any of []any — as in drow/drowIDs).
 func drows(rows []any) *dispatchRows {
 	out := make([][]any, len(rows))
 	for i, r := range rows {
@@ -190,11 +190,11 @@ func drows(rows []any) *dispatchRows {
 	return dispatchDomainsResult(out...)
 }
 
-// --- выборка ------------------------------------------------------------
+// --- selection ------------------------------------------------------------
 
 func TestDispatchBatch(t *testing.T) {
-	// Строки зон перемешаны и внутри зоны приходят не по id — слияние
-	// обязано отсортировать очередь зоны и собрать круговой порядок.
+	// The zone rows are shuffled and arrive within a zone not by id — the merge
+	// must sort the zone queue and assemble the round-robin order.
 	pool := &dispatchPool{results: []*dispatchRows{
 		dispatchZonesResult(zrow(1, "example.com"), zrow(2, "example.net")),
 		dispatchDomainsResult(
@@ -209,8 +209,8 @@ func TestDispatchBatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Вес зоны 2 = 3: её первая строка идёт первой (ключ 0.5/3 < 0.5/1),
-	// дальше — чередование по ключу (rn − 0.5)/вес.
+	// Zone 2 weight = 3: its first row goes first (key 0.5/3 < 0.5/1),
+	// then — interleaving by the key (rn − 0.5)/weight.
 	want := []DispatchRow{
 		{DomainID: 201, ZoneID: 2, Name: "b.example.net"},
 		{DomainID: 101, ZoneID: 1, Name: "a.example.com"},
@@ -229,7 +229,7 @@ func TestDispatchBatch(t *testing.T) {
 	if pool.queries[1].sql != dispatchZoneSQL {
 		t.Errorf("запрос очередей: %q, want dispatchZoneSQL", pool.queries[1].sql)
 	}
-	// Аргументы: зоны, keyset-курсоры (0 — с головы) и квота —
+	// Arguments: zones, keyset cursors (0 — from the head) and the quota —
 	// ceil(L × maxW / ΣW) + 1 = ceil(3 × 3 / 4) + 1 = 4.
 	wantArgs := []any{[]any{int16(1), int16(2)}, []any{int64(0), int64(0)}, 4}
 	if !reflect.DeepEqual(pool.queries[1].args, wantArgs) {
@@ -237,18 +237,18 @@ func TestDispatchBatch(t *testing.T) {
 	}
 }
 
-// TestDispatchBatch_Refill — исчерпанные зоны отдают доли соседям:
-// прочитанного префикса не хватило, «голодная» зона (вернула ровно
-// квоту) перезапрашивается keyset-курсором от последнего id.
+// TestDispatchBatch_Refill — exhausted zones give their shares to neighbors:
+// the read prefix was not enough, the "starved" zone (it returned exactly
+// the quota) is re-queried with a keyset cursor from the last id.
 func TestDispatchBatch_Refill(t *testing.T) {
 	pool := &dispatchPool{results: []*dispatchRows{
 		dispatchZonesResult(zrow(1, "example.com"), zrow(2, "example.net")),
-		// Квота ceil(4 × 1 / 2) + 1 = 3: зона 1 обрезана (голодная),
-		// зона 2 исчерпана (меньше квоты).
+		// Quota ceil(4 × 1 / 2) + 1 = 3: zone 1 is truncated (starved),
+		// zone 2 is exhausted (less than the quota).
 		dispatchDomainsResult(
 			drow(1, 11, "a"), drow(1, 12, "b"), drow(1, 13, "c"),
 		),
-		// Дозаполнение: только зона 1, после id 13, квота — остаток пачки.
+		// Top-up: only zone 1, after id 13, the quota — the batch remainder.
 		dispatchDomainsResult(drow(1, 14, "d")),
 	}}
 
@@ -269,31 +269,31 @@ func TestDispatchBatch_Refill(t *testing.T) {
 	if len(pool.queries) != 3 {
 		t.Fatalf("запросов = %d, want 3 (зоны + очереди + дозаполнение)", len(pool.queries))
 	}
-	// Дозаполнение: только зона 1, после id 13, квота — остаток пачки
-	// (4 − 3 = 1): вклад зоны в пачку не превосходит остатка (T-183).
+	// Top-up: only zone 1, after id 13, the quota — the batch remainder
+	// (4 − 3 = 1): a zone's contribution to the batch does not exceed the remainder (T-183).
 	wantArgs := []any{[]any{int16(1)}, []any{int64(13)}, 1}
 	if !reflect.DeepEqual(pool.queries[2].args, wantArgs) {
 		t.Errorf("аргументы дозаполнения = %v, want %v", pool.queries[2].args, wantArgs)
 	}
 }
 
-// TestDispatchBatch_RefillQuotaRemaining — квота раунда дозаполнения —
-// остаток пачки (Limit − набрано), не Limit (T-183): несколько голодных
-// зон, remaining > 1 < Limit — аргумент LATERAL-запроса дозаполнения
-// равен остатку; больше остатка одной зоне недоступно, пачка заполняется.
+// TestDispatchBatch_RefillQuotaRemaining — the top-up round quota is the
+// batch remainder (Limit − collected), not Limit (T-183): several starved
+// zones, remaining > 1 < Limit — the argument of the top-up LATERAL query
+// equals the remainder; more than the remainder is unavailable to one zone, the batch fills up.
 func TestDispatchBatch_RefillQuotaRemaining(t *testing.T) {
 	pool := &dispatchPool{results: []*dispatchRows{
 		dispatchZonesResult(
 			zrow(1, "example.com"), zrow(2, "example.net"), zrow(3, "example.org"),
 			zrow(4, "example.dev"), zrow(5, "example.io"), zrow(6, "example.app"),
 		),
-		// Квота ceil(10 × 1 / 6) + 1 = 3: зоны 1 и 2 обрезаны (голодные),
-		// зоны 3–6 отдали всё (пусты).
+		// Quota ceil(10 × 1 / 6) + 1 = 3: zones 1 and 2 are truncated (starved),
+		// zones 3–6 gave everything (empty).
 		drows(append(drowIDs(1, 11, 12, 13), drowIDs(2, 21, 22, 23)...)),
-		// Дозаполнение: зона 1 исчерпана (2 строки хвоста), зона 2
-		// отдаёт остаток целиком (4 = квота раунда).
+		// Top-up: zone 1 is exhausted (2 tail rows), zone 2
+		// gives the remainder in full (4 = the round quota).
 		drows(append(drowIDs(1, 14, 15), drowIDs(2, 24, 25, 26, 27)...)),
-		// Пачка полна (5 + 7 ≥ 10) — третьего раунда нет.
+		// The batch is full (5 + 7 ≥ 10) — there is no third round.
 		dispatchDomainsResult(),
 	}}
 
@@ -301,8 +301,8 @@ func TestDispatchBatch_RefillQuotaRemaining(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Круговой порядок весов 1: чередование зон 1 и 2, равные ключи —
-	// меньший zone_id; пачка обрезана по Limit = 10.
+	// Round-robin order of weights 1: interleaving zones 1 and 2, equal keys —
+	// the smaller zone_id; the batch is truncated by Limit = 10.
 	wantIDs := []int64{11, 21, 12, 22, 13, 23, 14, 24, 15, 25}
 	if len(batch) != len(wantIDs) {
 		t.Fatalf("пачка = %d строк, want %d", len(batch), len(wantIDs))
@@ -316,9 +316,9 @@ func TestDispatchBatch_RefillQuotaRemaining(t *testing.T) {
 	if len(pool.queries) != 3 {
 		t.Fatalf("запросов = %d, want 3 (зоны + очереди + дозаполнение)", len(pool.queries))
 	}
-	// Квота дозаполнения — остаток пачки: 10 − 6 набранных = 4 (не
-	// Limit = 10): читать сверх остатка бессмысленно — в слияние сверх
-	// не попадает.
+	// The top-up quota is the batch remainder: 10 − 6 collected = 4 (not
+	// Limit = 10): reading beyond the remainder is pointless — beyond it nothing
+	// gets into the merge.
 	wantArgs := []any{[]any{int16(1), int16(2)}, []any{int64(13), int64(23)}, 4}
 	if !reflect.DeepEqual(pool.queries[2].args, wantArgs) {
 		t.Errorf("аргументы дозаполнения = %v, want [голодные зоны, курсоры, quota=остаток 4] = %v",
@@ -326,8 +326,8 @@ func TestDispatchBatch_RefillQuotaRemaining(t *testing.T) {
 	}
 }
 
-// TestDispatchBatch_Empty — активных зон нет: достаточно запроса зон,
-// пачка пуста без ошибки.
+// TestDispatchBatch_Empty — no active zones: the zones query is enough,
+// the batch is empty without an error.
 func TestDispatchBatch_Empty(t *testing.T) {
 	pool := &dispatchPool{results: []*dispatchRows{dispatchZonesResult()}}
 
@@ -343,8 +343,8 @@ func TestDispatchBatch_Empty(t *testing.T) {
 	}
 }
 
-// TestDispatchBatch_Exhausted — все зоны отдали меньше квоты: пачка
-// короче Limit (всё pending прочитано), без дозаполнения.
+// TestDispatchBatch_Exhausted — all zones gave less than the quota: the batch
+// is shorter than Limit (all pending is read), without a top-up.
 func TestDispatchBatch_Exhausted(t *testing.T) {
 	pool := &dispatchPool{results: []*dispatchRows{
 		dispatchZonesResult(zrow(1, "example.com"), zrow(2, "example.net")),
@@ -363,9 +363,9 @@ func TestDispatchBatch_Exhausted(t *testing.T) {
 	}
 }
 
-// TestDispatchBatch_QuotaMissingZoneWeight — зона вне карты весов
-// участвует в квоте раунда с весом 1 (не 0): квота ceil(L × maxW / ΣW) + 1
-// считается по нормализованным весам всех активных зон.
+// TestDispatchBatch_QuotaMissingZoneWeight — a zone outside the weight map
+// participates in the round quota with weight 1 (not 0): the quota ceil(L × maxW / ΣW) + 1
+// is computed over the normalized weights of all active zones.
 func TestDispatchBatch_QuotaMissingZoneWeight(t *testing.T) {
 	pool := &dispatchPool{results: []*dispatchRows{
 		dispatchZonesResult(zrow(1, "example.com"), zrow(2, "example.net")),
@@ -374,7 +374,7 @@ func TestDispatchBatch_QuotaMissingZoneWeight(t *testing.T) {
 
 	batch, err := DispatchBatch(context.Background(), pool, DispatchQuery{
 		Limit:       7,
-		ZoneWeights: map[int16]int{1: 5}, // зона 2 вне карты → вес 1
+		ZoneWeights: map[int16]int{1: 5}, // zone 2 outside the map → weight 1
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -383,7 +383,7 @@ func TestDispatchBatch_QuotaMissingZoneWeight(t *testing.T) {
 		t.Fatalf("пачка = %+v, want единственная строка зоны 1", batch)
 	}
 
-	// Квота ceil(7 × 5 / (5 + 1)) + 1 = 7 — вес отсутствующей зоны равен 1.
+	// Quota ceil(7 × 5 / (5 + 1)) + 1 = 7 — the missing zone's weight equals 1.
 	wantArgs := []any{[]any{int16(1), int16(2)}, []any{int64(0), int64(0)}, 7}
 	if !reflect.DeepEqual(pool.queries[1].args, wantArgs) {
 		t.Errorf("аргументы = %v, want [зоны, курсоры, quota=7] = %v (вес зоны без карты — 1)",
@@ -391,18 +391,18 @@ func TestDispatchBatch_QuotaMissingZoneWeight(t *testing.T) {
 	}
 }
 
-// TestDispatchBatch_FullBatchStopsRefill — пачка заполнилась в раунде
-// дозаполнения: новых запросов нет (break «пачка полная»), обращений —
-// зоны + очереди + одно дозаполнение.
+// TestDispatchBatch_FullBatchStopsRefill — the batch filled up in the top-up
+// round: no new queries (the "batch full" break), the calls are —
+// zones + queues + one top-up.
 func TestDispatchBatch_FullBatchStopsRefill(t *testing.T) {
 	r0 := append(drowIDs(1, 11, 12, 13, 14), drow(2, 31, "z"))
 	pool := &dispatchPool{results: []*dispatchRows{
 		dispatchZonesResult(zrow(1, "example.com"), zrow(2, "example.net")),
-		// Квота ceil(6 × 1 / 2) + 1 = 4: зона 1 обрезана (голодная),
-		// зона 2 отдала всё (1 строка).
+		// Quota ceil(6 × 1 / 2) + 1 = 4: zone 1 is truncated (starved),
+		// zone 2 gave everything (1 row).
 		drows(r0),
-		// Дозаполнение зоны 1 (после id 14): квота — остаток пачки
-		// (6 − 5 = 1, T-183), LATERAL возвращает не больше остатка.
+		// Top-up of zone 1 (after id 14): the quota — the batch remainder
+		// (6 − 5 = 1, T-183), LATERAL returns no more than the remainder.
 		drows(drowIDs(1, 21)),
 	}}
 
@@ -410,8 +410,8 @@ func TestDispatchBatch_FullBatchStopsRefill(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Ключи зоны 1 (вес 1): 0.5, 1.5, …; зона 2 — одна строка с ключом 0.5;
-	// равные ключи — меньший zone_id.
+	// Zone 1 keys (weight 1): 0.5, 1.5, …; zone 2 — one row with key 0.5;
+	// equal keys — the smaller zone_id.
 	want := []DispatchRow{
 		{DomainID: 11, ZoneID: 1, Name: "d11.example.com"},
 		{DomainID: 31, ZoneID: 2, Name: "z.example.net"},
@@ -428,20 +428,20 @@ func TestDispatchBatch_FullBatchStopsRefill(t *testing.T) {
 	}
 }
 
-// TestDispatchBatch_RefillStopsAtExhaustedZone — пустой ответ голодной
-// зоны в раунде дозаполнения не останавливает обработку остальных зон:
-// continue (не break) — хвост соседней зоны входит в пачку.
+// TestDispatchBatch_RefillStopsAtExhaustedZone — an empty response of a starved
+// zone in a top-up round does not stop the processing of the other zones:
+// continue (not break) — the neighbor zone's tail enters the batch.
 func TestDispatchBatch_RefillStopsAtExhaustedZone(t *testing.T) {
 	r0 := append(drowIDs(1, 11, 12, 13, 14, 15, 16, 17, 18),
 		drowIDs(2, 21, 22, 23, 24, 25, 26, 27, 28)...)
 	r0 = append(r0, drow(3, 31, "z1"), drow(3, 32, "z2"), drow(3, 33, "z3"))
 	pool := &dispatchPool{results: []*dispatchRows{
 		dispatchZonesResult(zrow(1, "example.com"), zrow(2, "example.net"), zrow(3, "example.org")),
-		// Квота ceil(20 × 1 / 3) + 1 = 8: зоны 1 и 2 обрезаны (голодные),
-		// зона 3 отдала всё (3 строки).
+		// Quota ceil(20 × 1 / 3) + 1 = 8: zones 1 and 2 are truncated (starved),
+		// zone 3 gave everything (3 rows).
 		drows(r0),
-		// Дозаполнение (квота — остаток 20 − 19 = 1): зона 1 исчерпана
-		// (пусто), зона 2 отдаёт хвост.
+		// Top-up (the quota — the remainder 20 − 19 = 1): zone 1 is exhausted
+		// (empty), zone 2 gives the tail.
 		drows(drowIDs(2, 29)),
 	}}
 
@@ -449,7 +449,7 @@ func TestDispatchBatch_RefillStopsAtExhaustedZone(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Круговой порядок: ключи (rn − 0.5)/1, равные — меньший zone_id.
+	// Round-robin order: keys (rn − 0.5)/1, equal ones — the smaller zone_id.
 	wantIDs := []int64{11, 21, 31, 12, 22, 32, 13, 23, 33, 14, 24, 15, 25, 16, 26, 17, 27, 18, 28, 29}
 	if len(batch) != len(wantIDs) {
 		t.Fatalf("пачка = %d строк, want %d (хвост зоны 2 из дозаполнения вошёл)", len(batch), len(wantIDs))
@@ -464,13 +464,13 @@ func TestDispatchBatch_RefillStopsAtExhaustedZone(t *testing.T) {
 	}
 }
 
-// TestDispatchBatch_MergeSkipsEmptyZones — зона без строк пропускается
-// при построении голов слияния (continue, не break): строки следующих
-// зон попадают в пачку.
+// TestDispatchBatch_MergeSkipsEmptyZones — a zone without rows is skipped
+// when building the merge heads (continue, not break): the rows of the following
+// zones get into the batch.
 func TestDispatchBatch_MergeSkipsEmptyZones(t *testing.T) {
 	pool := &dispatchPool{results: []*dispatchRows{
 		dispatchZonesResult(zrow(1, "example.com"), zrow(2, "example.net")),
-		dispatchDomainsResult(drow(2, 21, "b"), drow(2, 22, "c")), // зона 1 пуста
+		dispatchDomainsResult(drow(2, 21, "b"), drow(2, 22, "c")), // zone 1 is empty
 	}}
 
 	batch, err := DispatchBatch(context.Background(), pool, DispatchQuery{Limit: 5})
@@ -489,25 +489,25 @@ func TestDispatchBatch_MergeSkipsEmptyZones(t *testing.T) {
 	}
 }
 
-// TestDispatchBatch_MergeNormalizesMissingWeight — вес зоны вне карты
-// нормализуется в 1 и в слиянии: ключ первой строки (1 − 0.5)/1 = 0.5 (не
-// +Inf нулевого веса и не 0.25 веса 2) — точный порядок чередования
-// с зоной веса 2.
+// TestDispatchBatch_MergeNormalizesMissingWeight — a zone's weight outside the map
+// is normalized to 1 in the merge too: the key of the first row (1 − 0.5)/1 = 0.5 (not
+// the +Inf of a zero weight and not 0.25 of weight 2) — the exact interleaving order
+// with the weight-2 zone.
 func TestDispatchBatch_MergeNormalizesMissingWeight(t *testing.T) {
 	rows := append(drowIDs(1, 11, 12), drowIDs(3, 31, 32)...)
 	pool := &dispatchPool{results: []*dispatchRows{
 		dispatchZonesResult(zrow(1, "example.com"), zrow(2, "example.net"), zrow(3, "example.org")),
-		drows(rows), // зона 2 пуста
+		drows(rows), // zone 2 is empty
 	}}
 
 	batch, err := DispatchBatch(context.Background(), pool, DispatchQuery{
 		Limit:       4,
-		ZoneWeights: map[int16]int{3: 2}, // зоны 1 и 2 вне карты → вес 1
+		ZoneWeights: map[int16]int{3: 2}, // zones 1 and 2 outside the map → weight 1
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Зона 1 (вес 1): ключи 0.5, 1.5; зона 3 (вес 2): 0.25, 0.75.
+	// Zone 1 (weight 1): keys 0.5, 1.5; zone 3 (weight 2): 0.25, 0.75.
 	want := []DispatchRow{
 		{DomainID: 31, ZoneID: 3, Name: "d31.example.org"},
 		{DomainID: 11, ZoneID: 1, Name: "d11.example.com"},
@@ -519,10 +519,10 @@ func TestDispatchBatch_MergeNormalizesMissingWeight(t *testing.T) {
 	}
 }
 
-// TestDispatchBatch_MergeAdvanceKey — ключ продвижения головы зоны
-// (rn − 0.5)/вес пересчитывается с тем же нормализованным весом: вторая
-// строка зоны без карты идёт по ключу 1.5/1 (не +Inf нулевого веса и не
-// 0.75 веса 2), чередуясь с хвостами зон весов 1 и 2.
+// TestDispatchBatch_MergeAdvanceKey — the zone head advancement key
+// (rn − 0.5)/weight is recomputed with the same normalized weight: the second
+// row of the zone without the map goes by key 1.5/1 (not the +Inf of a zero weight and not
+// 0.75 of weight 2), interleaving with the tails of the weight-1 and weight-2 zones.
 func TestDispatchBatch_MergeAdvanceKey(t *testing.T) {
 	r0 := append(drowIDs(1, 11, 12), drowIDs(3, 31, 32, 33)...)
 	r0 = append(r0, drowIDs(4, 41, 42, 43)...)
@@ -533,13 +533,13 @@ func TestDispatchBatch_MergeAdvanceKey(t *testing.T) {
 
 	batch, err := DispatchBatch(context.Background(), pool, DispatchQuery{
 		Limit:       8,
-		ZoneWeights: map[int16]int{3: 1, 4: 2}, // зона 1 вне карты → вес 1
+		ZoneWeights: map[int16]int{3: 1, 4: 2}, // zone 1 outside the map → weight 1
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Ключи: зона 1 — 0.5, 1.5; зона 3 (вес 1) — 0.5, 1.5, 2.5;
-	// зона 4 (вес 2) — 0.25, 0.75, 1.25; равные — меньший zone_id.
+	// Keys: zone 1 — 0.5, 1.5; zone 3 (weight 1) — 0.5, 1.5, 2.5;
+	// zone 4 (weight 2) — 0.25, 0.75, 1.25; equal ones — the smaller zone_id.
 	want := []DispatchRow{
 		{DomainID: 41, ZoneID: 4, Name: "d41.example.dev"},
 		{DomainID: 11, ZoneID: 1, Name: "d11.example.com"},
@@ -555,9 +555,9 @@ func TestDispatchBatch_MergeAdvanceKey(t *testing.T) {
 	}
 }
 
-// TestDispatchBatch_MergeKeyFormula — ключ головы (rn − 0.5)/вес: первая
-// строка зоны веса 2 опережает строку зоны веса 1, вторая (1.5/2 = 0.75)
-// обгоняет её вторую (1.5/1) — точный паттерн чередования весов 1 и 2.
+// TestDispatchBatch_MergeKeyFormula — the head key (rn − 0.5)/weight: the first
+// row of the weight-2 zone outranks the weight-1 zone's row; the second one (1.5/2 = 0.75)
+// overtakes its second (1.5/1) — the exact interleaving pattern of weights 1 and 2.
 func TestDispatchBatch_MergeKeyFormula(t *testing.T) {
 	rows := append(drowIDs(1, 11, 12), drowIDs(2, 21, 22)...)
 	pool := &dispatchPool{results: []*dispatchRows{
@@ -572,7 +572,7 @@ func TestDispatchBatch_MergeKeyFormula(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Ключи зоны 1: 0.5, 1.5; зоны 2 (вес 2): 0.25, 0.75.
+	// Zone 1 keys: 0.5, 1.5; zone 2 (weight 2): 0.25, 0.75.
 	want := []DispatchRow{
 		{DomainID: 21, ZoneID: 2, Name: "d21.example.net"},
 		{DomainID: 11, ZoneID: 1, Name: "d11.example.com"},
@@ -584,11 +584,11 @@ func TestDispatchBatch_MergeKeyFormula(t *testing.T) {
 	}
 }
 
-// TestDispatchBatch_MergeAdvanceShift — вычитание именно 0.5 в ключе
-// продвижения (rn − 0.5)/вес: сдвиг на +1/вес (мутант +0.5) меняет
-// чередование — вторая строка зоны веса 4 (ключ 1.5/4 = 0.375) идёт до
-// первой строки зоны веса 1 (0.5), а со сдвигом (2.5/4 = 0.625) — после;
-// вес 4 против 1 даёт существенную разницу шагов.
+// TestDispatchBatch_MergeAdvanceShift — subtracting exactly 0.5 in the
+// advancement key (rn − 0.5)/weight: a shift of +1/weight (the +0.5 mutant) changes
+// the interleaving — the second row of the weight-4 zone (key 1.5/4 = 0.375) goes before
+// the first row of the weight-1 zone (0.5), and with the shift (2.5/4 = 0.625) — after;
+// weight 4 against 1 gives a substantial difference of steps.
 func TestDispatchBatch_MergeAdvanceShift(t *testing.T) {
 	rows := append(drowIDs(1, 11, 12), drowIDs(2, 21, 22, 23, 24, 25, 26)...)
 	pool := &dispatchPool{results: []*dispatchRows{
@@ -603,8 +603,8 @@ func TestDispatchBatch_MergeAdvanceShift(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Ключи зоны 1: 0.5, 1.5; зоны 2 (вес 4): 0.125, 0.375, 0.625, 0.875,
-	// 1.125, 1.375 — зона 2 забирает 6 из 8 мест пачки.
+	// Zone 1 keys: 0.5, 1.5; zone 2 (weight 4): 0.125, 0.375, 0.625, 0.875,
+	// 1.125, 1.375 — zone 2 takes 6 of the batch's 8 places.
 	want := []DispatchRow{
 		{DomainID: 21, ZoneID: 2, Name: "d21.example.net"},
 		{DomainID: 22, ZoneID: 2, Name: "d22.example.net"},
@@ -620,12 +620,12 @@ func TestDispatchBatch_MergeAdvanceShift(t *testing.T) {
 	}
 }
 
-// TestDispatchBatch_MergeTieSmallerZoneFirst — равные ключи (равные rn и
-// веса) разрешаются меньшим zone_id, даже когда зона с большим id идёт
-// в справочнике первой.
+// TestDispatchBatch_MergeTieSmallerZoneFirst — equal keys (equal rn and
+// weights) are resolved by the smaller zone_id, even when the zone with the larger id comes
+// first in the reference table.
 func TestDispatchBatch_MergeTieSmallerZoneFirst(t *testing.T) {
 	pool := &dispatchPool{results: []*dispatchRows{
-		// Порядок справочника: зона 2 раньше зоны 1.
+		// The reference table order: zone 2 before zone 1.
 		dispatchZonesResult(zrow(2, "example.net"), zrow(1, "example.com")),
 		dispatchDomainsResult(drow(1, 11, "a"), drow(2, 21, "b")),
 	}}
@@ -643,12 +643,12 @@ func TestDispatchBatch_MergeTieSmallerZoneFirst(t *testing.T) {
 	}
 }
 
-// TestDispatchBatch_MergeKeyBeatsZoneID — ключ главнее zone_id: голова
-// с меньшим ключом берётся раньше, даже если её зона больше по id и
-// позже в heads (тай-брейк — только при равенстве ключей).
+// TestDispatchBatch_MergeKeyBeatsZoneID — the key beats zone_id: the head
+// with the smaller key is taken earlier, even if its zone is larger by id and
+// later in heads (the tie-break applies only on key equality).
 func TestDispatchBatch_MergeKeyBeatsZoneID(t *testing.T) {
 	pool := &dispatchPool{results: []*dispatchRows{
-		// Порядок справочника: зона 2 (вес 3, ключ 1/6) раньше зоны 1 (0.5).
+		// The reference table order: zone 2 (weight 3, key 1/6) before zone 1 (0.5).
 		dispatchZonesResult(zrow(2, "example.net"), zrow(1, "example.com")),
 		dispatchDomainsResult(drow(1, 11, "a"), drow(2, 21, "b")),
 	}}
@@ -669,16 +669,16 @@ func TestDispatchBatch_MergeKeyBeatsZoneID(t *testing.T) {
 	}
 }
 
-// TestDispatchBatch_MergeLimitCap — слияние останавливается ровно на
-// Limit: «лишние» прочитанные строки (запас квоты) в пачку не попадают.
+// TestDispatchBatch_MergeLimitCap — the merge stops exactly at
+// Limit: the "extra" read rows (the quota headroom) do not get into the batch.
 func TestDispatchBatch_MergeLimitCap(t *testing.T) {
 	rows := append(drowIDs(1, 11, 12), drowIDs(2, 21, 22)...)
 	pool := &dispatchPool{results: []*dispatchRows{
 		dispatchZonesResult(zrow(1, "example.com"), zrow(2, "example.net")),
-		// Квота ceil(2 × 1 / 2) + 1 = 2: обе зоны «голодные», прочитано
-		// вдвое больше Limit.
+		// Quota ceil(2 × 1 / 2) + 1 = 2: both zones are "starved", twice
+		// more than Limit is read.
 		drows(rows),
-		dispatchDomainsResult(), // дозаполнение (не выполняется на оригинале)
+		dispatchDomainsResult(), // top-up (not executed on the original)
 	}}
 
 	batch, err := DispatchBatch(context.Background(), pool, DispatchQuery{Limit: 2})
@@ -697,8 +697,8 @@ func TestDispatchBatch_MergeLimitCap(t *testing.T) {
 	}
 }
 
-// TestDispatchBatch_LimitOne — Limit = 1 валиден (нижняя граница):
-// пачка из одной строки.
+// TestDispatchBatch_LimitOne — Limit = 1 is valid (the lower bound):
+// a batch of one row.
 func TestDispatchBatch_LimitOne(t *testing.T) {
 	pool := &dispatchPool{results: []*dispatchRows{
 		dispatchZonesResult(zrow(1, "example.com")),
@@ -715,9 +715,9 @@ func TestDispatchBatch_LimitOne(t *testing.T) {
 	}
 }
 
-// TestDispatchBatch_ZonesIterError — ошибка итерации справочника зон
-// (rows.Err после строк) прерывает выборку обёрнутой ошибкой «активные
-// зоны».
+// TestDispatchBatch_ZonesIterError — an error of iterating the zone reference table
+// (rows.Err after the rows) interrupts the selection with a wrapped "active
+// zones" error.
 func TestDispatchBatch_ZonesIterError(t *testing.T) {
 	boom := errors.New("итерация сорвалась")
 	pool := &dispatchPool{results: []*dispatchRows{
@@ -761,15 +761,15 @@ func TestDispatchBatch_Validation(t *testing.T) {
 func TestDispatchBatch_QueryError(t *testing.T) {
 	boom := errors.New("соединение потеряно")
 
-	// Ошибка запроса зон.
+	// The zones query error.
 	pool := &dispatchPool{err: boom}
 	if _, err := DispatchBatch(context.Background(), pool, DispatchQuery{Limit: 1000}); err == nil ||
 		!errors.Is(err, boom) || !strings.Contains(err.Error(), "активные зоны") {
 		t.Fatalf("err = %v, want обёрнутая ошибка запроса зон", err)
 	}
 
-	// Ошибка запроса очередей (зоны прочитаны): сбой внедрён вторым
-	// вызовом, сообщение — без контекста зон (отличие от ошибки выше).
+	// The queues query error (the zones are read): the failure is injected by the second
+	// call, the message — without the zones context (unlike the error above).
 	pool = &dispatchPool{
 		results: []*dispatchRows{dispatchZonesResult(zrow(1, "example.com"))},
 		errs:    []error{nil, boom},
@@ -781,8 +781,8 @@ func TestDispatchBatch_QueryError(t *testing.T) {
 	}
 }
 
-// TestDispatchBatch_ReadErrors — ошибка чтения строки и ошибка итерации
-// прерывают выборку обёрнутой ошибкой (оба запроса).
+// TestDispatchBatch_ReadErrors — a row read error and an iteration error
+// interrupt the selection with a wrapped error (both queries).
 func TestDispatchBatch_ReadErrors(t *testing.T) {
 	boom := errors.New("декодирование сорвалось")
 
@@ -812,8 +812,8 @@ func TestDispatchBatch_ReadErrors(t *testing.T) {
 	}
 }
 
-// TestDispatchBatch_ContextCanceled — отменённый контекст отказывает на
-// первом же обращении к БД (как реальный pgx).
+// TestDispatchBatch_ContextCanceled — a cancelled context is refused at the
+// very first DB call (like real pgx).
 func TestDispatchBatch_ContextCanceled(t *testing.T) {
 	pool := &dispatchPool{}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -828,17 +828,17 @@ func TestDispatchBatch_ContextCanceled(t *testing.T) {
 	}
 }
 
-// --- веса зон из конфигурации (T-106) ---------------------------------
+// --- zone weights from the configuration (T-106) ---------------------------------
 
-// TestResolveZoneWeights — имена зон (ключи scheduler.zone_weights)
-// разрешаются в zone_id по справочнику одним запросом: все зоны, не
-// только активные (вес неактивной вступит в силу при её включении);
-// лишние строки справочника — мимо карты; имена без строки — unknown
-// по возрастанию (Warn вызывающего); карта вызывающего не изменяется.
+// TestResolveZoneWeights — zone names (the scheduler.zone_weights keys)
+// are resolved to zone_id via the reference table in one query: all zones, not
+// only active ones (an inactive zone's weight takes effect when it is enabled);
+// extra reference table rows — off-map; names without a row — unknown
+// ascending (the caller's Warn); the caller's map is not modified.
 func TestResolveZoneWeights(t *testing.T) {
 	pool := &dispatchPool{results: []*dispatchRows{
 		dispatchZonesResult(
-			zrow(2, "example.net"), // активная или нет — справочник целиком
+			zrow(2, "example.net"), // active or not — the whole reference table
 			zrow(1, "example.com"),
 			zrow(3, "example.org"),
 		),
@@ -854,11 +854,11 @@ func TestResolveZoneWeights(t *testing.T) {
 	if !reflect.DeepEqual(weights, want) {
 		t.Errorf("веса = %v, want %v (имена → zone_id по справочнику)", weights, want)
 	}
-	// Неизвестные имена — по возрастанию: детерминированный Warn.
+	// Unknown names — ascending: a deterministic Warn.
 	if want := []string{"aaa.missing", "zzz.missing"}; !reflect.DeepEqual(unknown, want) {
 		t.Errorf("unknown = %v, want %v", unknown, want)
 	}
-	// Карта вызывающего не изменяется (конфиг живёт своей жизнью).
+	// The caller's map is not modified (the config lives its own life).
 	if len(byName) != 5 || byName["example.net"] != 3 {
 		t.Errorf("карта вызывающего изменена: %v", byName)
 	}
@@ -866,8 +866,8 @@ func TestResolveZoneWeights(t *testing.T) {
 		t.Errorf("запросы = %v, want один resolveZoneWeightsSQL", pool.queries)
 	}
 
-	// Пустая карта и nil — nil без обращения к БД: равные веса,
-	// поведение по умолчанию (ТЗ 5.3: «опционально»).
+	// An empty map and nil — nil without touching the DB: equal weights,
+	// the default behavior (spec 5.3: "optional").
 	for _, m := range []map[string]int{nil, {}} {
 		pool := &dispatchPool{}
 		weights, unknown, err := ResolveZoneWeights(context.Background(), pool, m)
@@ -880,12 +880,12 @@ func TestResolveZoneWeights(t *testing.T) {
 	}
 }
 
-// TestResolveZoneWeights_UnknownSorted — неизвестные имена возвращаются
-// по возрастанию (детерминированный Warn вызывающего): sort.Strings
-// обязателен — порядок итерации карты рандомизирован. Один вызов ловит
-// удаление сортировки лишь с шансом (итерация может совпасть с
-// отсортированным порядком), поэтому несколько проходов по карте из
-// пяти имён (шанс совпадения одного прохода ≤ 1/5!).
+// TestResolveZoneWeights_UnknownSorted — unknown names are returned
+// ascending (a deterministic Warn of the caller): sort.Strings
+// is mandatory — the map iteration order is randomized. One pass catches
+// the removal of sorting only by chance (the iteration may coincide with the
+// sorted order), hence several passes over the map of
+// five names (the chance of one pass coinciding is ≤ 1/5!).
 func TestResolveZoneWeights_UnknownSorted(t *testing.T) {
 	byName := map[string]int{
 		"m.example": 1, "c.example": 2, "a.example": 3, "x.example": 4, "k.example": 5,
@@ -893,7 +893,7 @@ func TestResolveZoneWeights_UnknownSorted(t *testing.T) {
 	want := []string{"a.example", "c.example", "k.example", "m.example", "x.example"}
 	for i := 0; i < 12; i++ {
 		pool := &dispatchPool{results: []*dispatchRows{
-			dispatchZonesResult(zrow(1, "example.com")), // все имена unknown
+			dispatchZonesResult(zrow(1, "example.com")), // all names unknown
 		}}
 		_, unknown, err := ResolveZoneWeights(context.Background(), pool, byName)
 		if err != nil {
@@ -905,9 +905,9 @@ func TestResolveZoneWeights_UnknownSorted(t *testing.T) {
 	}
 }
 
-// TestResolveZoneWeights_Errors — ошибки запроса/чтения/итерации
-// прерывают разрешение обёрнутой ошибкой; отменённый ctx не доходит до
-// БД (как реальный pgx).
+// TestResolveZoneWeights_Errors — query/read/iteration errors
+// interrupt the resolution with a wrapped error; a cancelled ctx does not reach the
+// DB (like real pgx).
 func TestResolveZoneWeights_Errors(t *testing.T) {
 	boom := errors.New("справочник недоступен")
 	weights := map[string]int{"example.com": 2}
@@ -944,14 +944,14 @@ func TestResolveZoneWeights_Errors(t *testing.T) {
 	}
 }
 
-// TestResolveZoneWeights_Dispatch — веса из конфигурации доходят до
-// слияния пачки: имена разрешаются в zone_id, выборка с полученной
-// картой чередует зоны пропорционально весам (по образцу TestDispatchBatch
-// с ZoneWeights — то же ожидание при весе зоны 2 = 3).
+// TestResolveZoneWeights_Dispatch — weights from the configuration reach the
+// batch merge: names are resolved to zone_id, the selection with the obtained
+// map interleaves the zones proportionally to the weights (modeled on TestDispatchBatch
+// with ZoneWeights — the same expectation at zone 2 weight = 3).
 func TestResolveZoneWeights_Dispatch(t *testing.T) {
 	pool := &dispatchPool{results: []*dispatchRows{
-		dispatchZonesResult(zrow(1, "example.com"), zrow(2, "example.net")), // разрешение имён
-		dispatchZonesResult(zrow(1, "example.com"), zrow(2, "example.net")), // выборка
+		dispatchZonesResult(zrow(1, "example.com"), zrow(2, "example.net")), // name resolution
+		dispatchZonesResult(zrow(1, "example.com"), zrow(2, "example.net")), // selection
 		dispatchDomainsResult(
 			drow(2, 201, "b"),
 			drow(1, 102, "c"),
@@ -968,8 +968,8 @@ func TestResolveZoneWeights_Dispatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Вес зоны 2 = 3: её первая строка идёт первой (ключ 0.5/3 < 0.5/1),
-	// дальше — чередование по ключу (rn − 0.5)/вес.
+	// Zone 2 weight = 3: its first row goes first (key 0.5/3 < 0.5/1),
+	// then — interleaving by the key (rn − 0.5)/weight.
 	want := []DispatchRow{
 		{DomainID: 201, ZoneID: 2, Name: "b.example.net"},
 		{DomainID: 101, ZoneID: 1, Name: "a.example.com"},
@@ -980,7 +980,7 @@ func TestResolveZoneWeights_Dispatch(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------- контракт SQL
+// ---------------------------------------------------------------- SQL contract
 
 const wantDispatchZonesSQL = "SELECT id, name FROM zones WHERE is_active AND domains_pending > 0"
 
@@ -993,14 +993,14 @@ const wantDispatchZoneSQL = "SELECT d.zone_id, d.id, d.label " +
 	"ORDER BY dd.id LIMIT $3" +
 	") AS d ON true"
 
-// TestDispatch_SQLContract — точные тексты обоих запросов и опора на
-// схему (миграции 000001/000016): чтение очереди зоны по частичному
-// индексу domains_pending_idx (фильтр зоны + ORDER BY id + LIMIT — без
-// окон и сортировки всего pending), литералы кодов — из модели, охрана от
-// deleted, зоны — только активные и только с работой (domains_pending >
-// 0, T-183: колонка T-178 — её семантика и есть предикат диспетчера,
-// проба зоны без pending вернула бы 0 строк — круг 1 их больше не
-// делает).
+// TestDispatch_SQLContract — the exact texts of both queries and the reliance on
+// the schema (migrations 000001/000016): reading a zone's queue over the partial
+// index domains_pending_idx (the zone filter + ORDER BY id + LIMIT — without
+// windows and sorting of all pending), code literals — from the model, the guard against
+// deleted, zones — only active and only with work (domains_pending >
+// 0, T-183: the T-178 column — its semantics is the dispatcher's predicate itself,
+// a zone probe without pending would return 0 rows — circle 1 no longer does
+// that).
 func TestDispatch_SQLContract(t *testing.T) {
 	if dispatchZonesSQL != wantDispatchZonesSQL {
 		t.Errorf("dispatchZonesSQL = %q,\nwant %q", dispatchZonesSQL, wantDispatchZonesSQL)
@@ -1009,9 +1009,9 @@ func TestDispatch_SQLContract(t *testing.T) {
 		t.Errorf("dispatchZoneSQL = %q,\nwant %q", dispatchZoneSQL, wantDispatchZoneSQL)
 	}
 
-	// Литералы в тексте выше обязаны следовать за кодами модели (ТЗ 6.1,
-	// 6.2): при изменении кодов текст пересобирается сам — тест ловит
-	// рассинхронизацию рукописного литерала.
+	// The literals in the text above must follow the model codes (spec 6.1,
+	// 6.2): when the codes change the text is rebuilt automatically — the test catches
+	// the desync of a hand-written literal.
 	if int16(model.CheckStatePending) != 0 || int16(model.StatusDeleted) != 6 {
 		t.Errorf("коды модели изменились (pending=%d deleted=%d): обновите литералы в wantDispatchZoneSQL",
 			int16(model.CheckStatePending), int16(model.StatusDeleted))
@@ -1019,36 +1019,36 @@ func TestDispatch_SQLContract(t *testing.T) {
 
 	up := dispatchReadMigration(t, "000001_init.up.sql")
 
-	// Очередь зоны — по готовому частичному индексу планировщика:
-	// LATERAL читает (zone_id, id) WHERE check_state = 0 с LIMIT.
+	// The zone queue — over the planner's ready partial index:
+	// LATERAL reads (zone_id, id) WHERE check_state = 0 with a LIMIT.
 	if !strings.Contains(up, "CREATE INDEX domains_pending_idx") ||
 		!strings.Contains(up, "ON domains (zone_id, id) WHERE check_state = 0") {
 		t.Error("в миграции 000001 нет domains_pending_idx (zone_id, id) WHERE check_state = 0 — LATERAL-выборка очереди зоны опирается на него (ТЗ 6.1)")
 	}
-	// Фильтр активных зон — колонка схемы, а не выдумка.
+	// The active zones filter — a schema column, not an invention.
 	if !strings.Contains(up, "is_active") {
 		t.Error("в миграции 000001 нет zones.is_active — фильтр активных зон ссылается на схему")
 	}
-	// Фильтр работы — колонка счётчиков T-178 (миграция 000016):
-	// фильтр диспетчера опирается на живой инкрементальный счётчик.
+	// The work filter — a T-178 counters column (migration 000016):
+	// the dispatcher's filter relies on a live incremental counter.
 	counters := dispatchReadMigration(t, "000016_zone_pipeline_counters.up.sql")
 	if !strings.Contains(counters, "ADD COLUMN domains_pending bigint NOT NULL DEFAULT 0") {
 		t.Error("в миграции 000016 нет zones.domains_pending — фильтр «только зоны с работой» (T-183) ссылается на счётчик T-178")
 	}
-	// Весов в схеме нет — источник весов только DispatchQuery.
+	// There are no weights in the schema — the only source of weights is DispatchQuery.
 	if strings.Contains(up, "zones.weight") {
 		t.Error("в схеме появилась колонка zones.weight — веса можно брать из БД, а не параметрами")
 	}
 }
 
-// wantResolveZoneWeightsSQL — разрешение имён весов из конфигурации:
-// справочник целиком (активные и неактивные зоны — вес неактивной
-// вступит в силу при включении зоны без рестарта планировщика).
+// wantResolveZoneWeightsSQL — resolving weight names from the configuration:
+// the reference table in full (active and inactive zones — an inactive zone's weight
+// takes effect when the zone is enabled without a scheduler restart).
 const wantResolveZoneWeightsSQL = "SELECT id, name FROM zones"
 
-// TestResolveZoneWeights_SQLContract — точный текст запроса и опора на
-// схему: уникальность zones.name (миграция 000001) делает разрешение
-// «имя → zone_id» однозначным.
+// TestResolveZoneWeights_SQLContract — the exact query text and the reliance on
+// the schema: the uniqueness of zones.name (migration 000001) makes the resolution
+// "name → zone_id" unambiguous.
 func TestResolveZoneWeights_SQLContract(t *testing.T) {
 	if resolveZoneWeightsSQL != wantResolveZoneWeightsSQL {
 		t.Errorf("resolveZoneWeightsSQL = %q,\nwant %q", resolveZoneWeightsSQL, wantResolveZoneWeightsSQL)
@@ -1059,9 +1059,9 @@ func TestResolveZoneWeights_SQLContract(t *testing.T) {
 	}
 }
 
-// dispatchReadMigration — SQL миграции из встроенного набора (своя копия
-// хелпера internal/ingest: файл самодостаточен, общих тест-хелперов
-// параллельные задачи T-030/T-031 не делят).
+// dispatchReadMigration — the SQL of a migration from the embedded set (its own copy
+// of the internal/ingest helper: the file is self-sufficient, the shared test helpers
+// are not shared between the parallel tasks T-030/T-031).
 func dispatchReadMigration(t *testing.T, name string) string {
 	t.Helper()
 	raw, err := migrations.FS.ReadFile(name)
