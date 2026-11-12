@@ -1,10 +1,11 @@
-// Интеграционный тест сборщика снимков дашборда (T-129, ТЗД §12.2):
-// полный снимок всех секций против живых PostgreSQL и Redis testbed —
-// SQL-агрегаты internal/status на реальной схеме (зоны/темп/статусы/
-// Laravel/ingest), глубины стримов через BackpressureGate.Len, пробы
-// /livez (живой и недоступный сервис), /api/status отдаёт собранный
-// снимок за авторизацией. Юнит-уровень (SQL-контракты, деградация,
-// JSON-форма, цикл) — internal/status и internal/dashboard.
+// Integration test of the dashboard snapshot collector (T-129, dashboard
+// spec §12.2): a full snapshot of all sections against the live
+// PostgreSQL and Redis of the testbed — SQL aggregates of internal/status
+// on the real schema (zones/throughput/statuses/Laravel/ingest), stream
+// depths via BackpressureGate.Len, /livez probes (a live and an
+// unreachable service), /api/status serves the collected snapshot behind
+// authentication. The unit level (SQL contracts, degradation, JSON shape,
+// loop) — internal/status and internal/dashboard.
 package integration
 
 import (
@@ -28,17 +29,18 @@ import (
 	"crawler/internal/queue"
 )
 
-// dashSeed — данные всех секций, вставленные в изолированную схему.
+// dashSeed — the data of all sections inserted into the isolated schema.
 type dashSeed struct {
 	zoneID  int16
-	domains [3]int64 // id вставленных доменов
+	domains [3]int64 // ids of the inserted domains
 }
 
-// seedDashboardData — согласованный набор: зона, три домена (alive+done,
-// new+pending, temp_error+queued), две Laravel-находки (свежая и старше
-// 24 ч), два ingest-файла (свежий add и старый delete) и строка с NULL
-// processed_at (схема допускает — «последним», колонки в нули).
-// sha256 — встроенная функция PG 11+ (байты для колонки без расширений).
+// seedDashboardData — a coherent set: a zone, three domains (alive+done,
+// new+pending, temp_error+queued), two Laravel finds (a fresh one and one
+// older than 24 h), two ingest files (a fresh add and an old delete), and
+// a row with NULL processed_at (the schema allows it — sorted "last",
+// columns zeroed).
+// sha256 — a built-in PG 11+ function (bytes for the column without extensions).
 func seedDashboardData(t *testing.T, pool *pgxpool.Pool) dashSeed {
 	t.Helper()
 	ctx := context.Background()
@@ -63,7 +65,7 @@ func seedDashboardData(t *testing.T, pool *pgxpool.Pool) dashSeed {
 		}
 	}
 
-	// Laravel-находки: свежая (окно 24 ч) и суточная давность.
+	// Laravel finds: a fresh one (the 24 h window) and a day old.
 	if _, err := pool.Exec(ctx,
 		"INSERT INTO laravel_domains (zone_id, domain_id, score, ver_min, ver_max, found_on_mask, rules_version, updated_at) "+
 			"VALUES ($1, $2, 0.9, '9.19', '11', 1, 1, now())",
@@ -77,7 +79,7 @@ func seedDashboardData(t *testing.T, pool *pgxpool.Pool) dashSeed {
 		t.Fatalf("старая находка: %v", err)
 	}
 
-	// Журнал ingest: свежий add, суточный delete и строка без processed_at.
+	// The ingest journal: a fresh add, a day-old delete, and a row without processed_at.
 	if _, err := pool.Exec(ctx,
 		"INSERT INTO ingest_files (zone_id, action, path, sha256, lines_total, added, existed, rejected, processed_at) "+
 			"VALUES ($1, 1, 'snap.test/add/fresh.txt', sha256('1'::bytea), 100, 98, 2, 0, now())",
@@ -97,9 +99,9 @@ func seedDashboardData(t *testing.T, pool *pgxpool.Pool) dashSeed {
 	return s
 }
 
-// TestDashboard_Snapshot — полный снимок на testbed: все секции живы,
-// числа совпадают с посевом, свежесть окон (24 ч / последние),
-// /api/status за авторизацией отдаёт тот же снимок.
+// TestDashboard_Snapshot — a full snapshot on the testbed: all sections
+// are alive, the numbers match the seed, window freshness (24 h / the
+// latest), /api/status behind authentication serves the same snapshot.
 func TestDashboard_Snapshot(t *testing.T) {
 	skipUnlessIntegration(t)
 	pool := migratedSchema(t)
@@ -112,16 +114,16 @@ func TestDashboard_Snapshot(t *testing.T) {
 		t.Fatal("посев данных не вернул идентификаторы")
 	}
 
-	// Реконсиляция счётчиков (T-178): зоны/status-распределение/
-	// кумулятивы истории читаются дашбордом из zones.domains_* и
-	// crawler_counters — их наполняет совмещённый проход monitor
-	// (посев ниже уровня переходов, прямой SQL). Тот же порядок, что и
-	// в бою: миграция → первый проход monitor → читатели.
+	// Counter reconciliation (T-178): zones / the status distribution /
+	// history cumulatives are read by the dashboard from zones.domains_*
+	// and crawler_counters — the combined monitor pass fills them (the
+	// seed is below the transition level, direct SQL). The same order as
+	// in production: migration → the first monitor pass → readers.
 	if _, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{}); err != nil {
 		t.Fatalf("реконсиляция счётчиков после посева: %v", err)
 	}
 
-	// Глубины стримов: записи без групп потребителей — Len даёт XLEN.
+	// Stream depths: entries without consumer groups — Len gives XLEN.
 	for stream, n := range map[string]int{"q:http": 2, "q:dead": 1} {
 		for i := 0; i < n; i++ {
 			if err := rdb.XAdd(ctx, &redis.XAddArgs{
@@ -133,7 +135,7 @@ func TestDashboard_Snapshot(t *testing.T) {
 		}
 	}
 
-	// Пробы: живой сервис и отказ соединения (закрытый порт).
+	// Probes: a live service and a connection failure (a closed port).
 	alive := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("ok"))
 	}))
@@ -146,14 +148,15 @@ func TestDashboard_Snapshot(t *testing.T) {
 	cfg := config.Default()
 	coll, err := dashboard.NewCollector(pool, gate, cfg.Dashboard, dashboard.CollectorOptions{
 		Probes: map[string]string{"alive": alive.URL, "dead": deadURL},
-		// Секция движков: пустой НЕ-nil срез — «н/д» без ошибок
-		// (operator-способ выключения, S-P2-5): nil подтянул бы дефолт
-		// config.Default() с адресом render-worker:9105, которого нет
-		// в тестовом окружении, — снимок падал бы ошибкой секции render.
+		// The engines section: an empty NON-nil slice — "n/a" without
+		// errors (the operator way of switching it off, S-P2-5): nil would
+		// pull the config.Default() default with the render-worker:9105
+		// address, absent in the test environment, and the snapshot would
+		// fail with a render section error.
 		RenderMetrics: []string{},
-		// Пороги подсветки очередей — как в cmd/dashboard: NewCollector
-		// не читает секции scheduler/redis сам (§5.4); MaxLen — для
-		// эффективного порога стрима (кламп по MAXLEN).
+		// Queue highlighting thresholds — as in cmd/dashboard: NewCollector
+		// does not read the scheduler/redis sections itself (§5.4); MaxLen —
+		// for the effective stream threshold (clamped by MAXLEN).
 		QueueWatermark: int64(cfg.Scheduler.QueueHighWatermark),
 		QueueMaxLen:    int64(cfg.Redis.MaxLen),
 	})
@@ -161,8 +164,9 @@ func TestDashboard_Snapshot(t *testing.T) {
 		t.Fatalf("NewCollector: %v", err)
 	}
 
-	// Цикл: первый проход сразу — ждём готовности (до него Current() nil,
-	// семантика 503 §5.9), затем останавливаем и проверяем снятое.
+	// The loop: the first pass right away — we wait for readiness (until
+	// then Current() is nil, the 503 semantics of §5.9), then stop and
+	// check what was captured.
 	loopCtx, stop := context.WithCancel(ctx)
 	loopDone := make(chan error, 1)
 	go func() { loopDone <- coll.Loop(loopCtx) }()
@@ -184,7 +188,7 @@ func TestDashboard_Snapshot(t *testing.T) {
 		t.Fatalf("снимок с ошибками секций: %v", snap.Errors)
 	}
 
-	// §5.1/§5.3: зона и итоги.
+	// §5.1/§5.3: the zone and the totals.
 	if len(snap.Zones) != 1 || snap.Zones[0].Name != "snap.test" {
 		t.Fatalf("zones = %+v", snap.Zones)
 	}
@@ -196,8 +200,8 @@ func TestDashboard_Snapshot(t *testing.T) {
 		t.Errorf("totals = %+v, хочу всего 3/проверено 1 (счётчики zones)", snap.Totals)
 	}
 
-	// §5.2: темп и скорости (проверок сегодня нет — скорость нулевая,
-	// но известная; часовые окна пусты).
+	// §5.2: throughput and rates (no checks today — the rate is zero but
+	// known; the hourly windows are empty).
 	if snap.Throughput == nil || snap.Throughput.ElapsedSec <= 0 {
 		t.Errorf("throughput = %+v, хочу живой elapsed", snap.Throughput)
 	}
@@ -205,9 +209,10 @@ func TestDashboard_Snapshot(t *testing.T) {
 		t.Errorf("rates = %+v, хочу remaining 2 (pending+queued)", snap.Rates)
 	}
 
-	// §5.4: глубины стримов и эффективные пороги подсветки — кламп по
-	// половине MAXLEN стрима (T-141; дефолты конфигурации: watermark
-	// 100 000 → q:dns 125 пачек, штучные 75 000), как у алерта монитора.
+	// §5.4: stream depths and effective highlighting thresholds — clamped
+	// to half of the stream MAXLEN (T-141; configuration defaults: a
+	// watermark of 100,000 → q:dns 125 batches, individual 75,000), like
+	// the monitor alert.
 	if snap.QueueWatermarks["q:dns"] != 125 || snap.QueueWatermarks["q:http"] != 75000 {
 		t.Errorf("queue_watermarks = %v, хочу q:dns 125 / q:http 75000 (эффективные пороги дефолтов)",
 			snap.QueueWatermarks)
@@ -222,12 +227,12 @@ func TestDashboard_Snapshot(t *testing.T) {
 		t.Errorf("q:dns = %d, хочу 0", got)
 	}
 
-	// §5.5: распределение статусов (легенда полная, счётчики по посеву).
+	// §5.5: the status distribution (the full legend, counters per the seed).
 	if snap.Statuses["alive"] != 1 || snap.Statuses["new"] != 1 || snap.Statuses["temp_error"] != 1 {
 		t.Errorf("statuses = %v, хочу alive/new/temp_error по 1", snap.Statuses)
 	}
 
-	// §5.6: всего 2, за 24 ч — 1, последняя — свежая с диапазоном версий.
+	// §5.6: 2 in total, 1 in the last 24 h, the latest is fresh with a version range.
 	if snap.Laravel == nil || snap.Laravel.Total != 2 || snap.Laravel.Last24h != 1 {
 		t.Errorf("laravel = %+v, хочу всего 2 / за 24 ч 1", snap.Laravel)
 	}
@@ -239,7 +244,7 @@ func TestDashboard_Snapshot(t *testing.T) {
 		t.Errorf("свежая находка = %+v, хочу score ≈0.9 и версии 9.19–11", first)
 	}
 
-	// §5.7: последний файл — свежий add, NULL processed_at — последним.
+	// §5.7: the last file is the fresh add; NULL processed_at sorts last.
 	if len(snap.Ingest) != 3 {
 		t.Fatalf("ingest = %+v, хочу 3 записи", snap.Ingest)
 	}
@@ -254,7 +259,7 @@ func TestDashboard_Snapshot(t *testing.T) {
 		t.Errorf("файл без processed_at = %+v, хочу нулевые поля и пустое время", snap.Ingest[2])
 	}
 
-	// §5.8: живая проба up, закрытый порт down с причиной.
+	// §5.8: the live probe is up, the closed port is down with a reason.
 	if len(snap.Health) != 2 {
 		t.Fatalf("health = %+v, хочу 2 пробы", snap.Health)
 	}
@@ -265,8 +270,9 @@ func TestDashboard_Snapshot(t *testing.T) {
 		t.Errorf("мертвая проба = %+v, хочу down с причиной", snap.Health[1])
 	}
 
-	// Приёмка §12.3 (структура ответа): сервер с реальным пулом и сборщиком
-	// отдаёт снимок за Basic-авторизацией; карта errors пуста.
+	// Acceptance §12.3 (the response structure): a server with a real pool
+	// and collector serves the snapshot behind Basic authentication; the
+	// errors map is empty.
 	cfg.Dashboard.Username = "operator"
 	hash, err := auth.Generate("integration-pass", 1000)
 	if err != nil {

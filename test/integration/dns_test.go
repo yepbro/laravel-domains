@@ -1,21 +1,22 @@
-// Интеграционные тесты DNS-этапа на тестовом стенде (T-040; ТЗ 11.2,
-// 5.4, §7): компоненты этапа 3 против живого стека unbound → coredns
-// (зоны deploy/docker/testbed, сценарии scenarios.yaml).
+// Integration tests of the DNS stage on the test bench (T-040; spec 11.2,
+// 5.4, §7): stage 3 components against the live unbound → coredns stack
+// (zones from deploy/docker/testbed, scenarios.yaml scenarios).
 //
-// Уровень — компоненты, не сырой протокол: TestDNS_TestbedScenarios
-// (env_test.go) уже зафиксировал сценарии резолвинга обменами
-// dns.Exchange; здесь те же зоны прогоняются через dnsclient.Client
-// (пул UDP-сокетов, TCP-fallback, ретраи — T-034) и dnsworker
+// The level is components, not the raw protocol: TestDNS_TestbedScenarios
+// (env_test.go) has already pinned the resolution scenarios by dns.Exchange
+// exchanges; here the same zones are run through dnsclient.Client (a UDP
+// socket pool, TCP fallback, retries — T-034) and dnsworker
 // (CheckApex/CheckSubdomains/DetectWildcard/MarkWildcardSubdomains —
-// T-036…T-038, ProcessDomain/Run — T-039). Дублирования сценариев
-// env_test нет: ожидания здесь — на ветки классификации и структурах
-// этапа, а не на RCODE отдельных вопросов.
+// T-036…T-038, ProcessDomain/Run — T-039). No duplication of the env_test
+// scenarios: the expectations here are on the classification branches and
+// the stage structures, not on the RCODEs of individual questions.
 //
-// Сквозной сценарий (Run): публикация q:dns → цикл воркера → запись
-// результата в изолированной схеме БД (migratedSchema) → задача q:http
-// с адресами; NXDOMAIN-домен — терминальный not_delegated без q:http.
-// Изоляция Redis — выделенная БД 15 (resilienceRedisEnv): боевые имена
-// стримов q:* — константы транспорта (T-024), ключи вычищаются до/после.
+// The end-to-end scenario (Run): publishing to q:dns → the worker loop →
+// writing the result in an isolated DB schema (migratedSchema) → a q:http
+// task with addresses; an NXDOMAIN domain is terminal not_delegated
+// without q:http. Redis isolation — a dedicated DB 15 (resilienceRedisEnv):
+// the production q:* stream names are transport constants (T-024), keys
+// are cleaned up before/after.
 package integration
 
 import (
@@ -35,23 +36,26 @@ import (
 	"crawler/internal/scheduler"
 )
 
-// dnsBlackholeAddr — адрес чёрной дыры стенда (network.blackhole_ip,
-// scenarios.yaml): порты без слушателя, пакеты исчезают — детерминированный
-// транспортный таймаут для dnsclient без гонки с SERVFAIL резолвера
-// (живой unbound на мёртвом апстриме отвечает SERVFAIL за ~0,5 с —
-// исход зависит от jitter; это ветка temp_error в обоих случаях).
+// dnsBlackholeAddr — the bench's black hole address (network.blackhole_ip,
+// scenarios.yaml): ports without a listener, packets vanish — a
+// deterministic transport timeout for dnsclient without racing the
+// resolver's SERVFAIL (a live unbound on a dead upstream answers SERVFAIL
+// in ~0.5 s — the outcome depends on jitter; it is the temp_error branch
+// in both cases).
 const dnsBlackholeAddr = "172.28.100.250:53"
 
-// tcFallbackRecords — число A-записей сценария tc-fallback
-// (dns.a_many в scenarios.yaml): 100 записей ≈ 1.6 КиБ в сжатой упаковке —
-// ответ не помещается и в EDNS0-буфер 1232 Б (dnsclient рекламирует
-// OPT RR), unbound ставит TC=1 и приносит полный набор по TCP.
+// tcFallbackRecords — the number of A records of the tc-fallback scenario
+// (dns.a_many in scenarios.yaml): 100 records ≈ 1.6 KiB in compressed
+// packing — the answer does not fit even in the 1232 B EDNS0 buffer
+// (dnsclient advertises OPT RR), unbound sets TC=1 and delivers the full
+// set over TCP.
 const tcFallbackRecords = 100
 
-// dnsEnv — клиент dnsclient к живому unbound стенда (unboundAddr из
-// env_test.go — адрес из dev-конфига). Таймаут попытки ужат до секунды:
-// все ответы стенда — единицы миллисекунд, а мёртвые ветки не тянут
-// дефолтные циклы ретраев по 2 с (время теста — секунды).
+// dnsEnv — a dnsclient client to the bench's live unbound (unboundAddr
+// from env_test.go — the address from the dev config). The per-attempt
+// timeout is squeezed to a second: all bench answers are single
+// milliseconds, and the dead branches do not need the default 2 s retry
+// cycles (the test runs in seconds).
 func dnsEnv(t *testing.T) *dnsclient.Client {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -72,9 +76,9 @@ func dnsEnv(t *testing.T) *dnsclient.Client {
 
 // ---------------------------------------------------------------- dnsclient
 
-// TestDNSClient_TestbedScenarios — контракт Exchange (T-034) на зонах
-// стенда: RCODE — не ошибка, TCP-fallback при TC=1, ретраи на мёртвом
-// транспорте, IsTimeout.
+// TestDNSClient_TestbedScenarios — the Exchange contract (T-034) on the
+// bench zones: an RCODE is not an error, TCP fallback on TC=1, retries on
+// a dead transport, IsTimeout.
 func TestDNSClient_TestbedScenarios(t *testing.T) {
 	skipUnlessIntegration(t)
 	c := dnsEnv(t)
@@ -173,8 +177,8 @@ func TestDNSClient_TestbedScenarios(t *testing.T) {
 	t.Run("мёртвый резолвер: ретраи исчерпаны, IsTimeout", func(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		// Отдельный клиент на чёрную дыру стенда: NewClient fail-fast
-		// открывает пул, connect(2) UDP не требует слушателя.
+		// A separate client to the bench's black hole: the fail-fast
+		// NewClient opens the pool, UDP connect(2) needs no listener.
 		dead, err := dnsclient.NewClient(ctx, dnsclient.Options{
 			Addr:        dnsBlackholeAddr,
 			Timeout:     250 * time.Millisecond,
@@ -203,10 +207,11 @@ func TestDNSClient_TestbedScenarios(t *testing.T) {
 
 // ---------------------------------------------------------------- CheckApex
 
-// TestDNSWorker_CheckApex — классификация апекса (T-036; ТЗ 5.4 п. 1, §7)
-// по зонам стенда через живой unbound: делегированный адреса, NXDOMAIN →
-// not_delegated + Stop, SERVFAIL/таймаут → temp_error, NODATA с
-// подтверждающим NS → delegated_no_address (ветка апекса).
+// TestDNSWorker_CheckApex — apex classification (T-036; spec 5.4 item 1,
+// §7) on the bench zones through the live unbound: a delegated one gets
+// addresses, NXDOMAIN → not_delegated + Stop, SERVFAIL/timeout →
+// temp_error, NODATA with a confirming NS → delegated_no_address (the
+// apex branch).
 func TestDNSWorker_CheckApex(t *testing.T) {
 	skipUnlessIntegration(t)
 	resolve := dnsEnv(t)
@@ -285,9 +290,9 @@ func TestDNSWorker_CheckApex(t *testing.T) {
 
 // ---------------------------------------------------- CheckSubdomains/wildcard
 
-// dnsTestSubs — вход справочника субдоменов (миграция 000001: бит 0 —
-// апекс, бит 1 — www); достаточно трёх меток, чтобы покрыть и прямые
-// записи, и NXDOMAIN, и wildcard-синтез.
+// dnsTestSubs — the input of the subdomain reference table (migration
+// 000001: bit 0 — apex, bit 1 — www); three labels are enough to cover
+// direct records, NXDOMAIN, and wildcard synthesis.
 func dnsTestSubs() []model.Subdomain {
 	return []model.Subdomain{
 		{ID: 0, Label: "", Enabled: true},
@@ -296,10 +301,11 @@ func dnsTestSubs() []model.Subdomain {
 	}
 }
 
-// TestDNSWorker_CheckSubdomains — проверка субдоменов (T-037; ТЗ 5.4
-// п. 2) на зонах стенда: прямые A, разворачивание CNAME-цепочки до
-// адресов, wildcard-синтез, SERVFAIL зацикленной цепочки и NXDOMAIN —
-// итог по каждому субдомену отдельно, маска — по резолвящимся.
+// TestDNSWorker_CheckSubdomains — subdomain checking (T-037; spec 5.4
+// item 2) on the bench zones: direct A records, unwinding a CNAME chain
+// to addresses, wildcard synthesis, SERVFAIL of a looped chain, and
+// NXDOMAIN — a verdict per subdomain separately, the mask over the
+// resolving ones.
 func TestDNSWorker_CheckSubdomains(t *testing.T) {
 	skipUnlessIntegration(t)
 	resolve := dnsEnv(t)
@@ -326,8 +332,8 @@ func TestDNSWorker_CheckSubdomains(t *testing.T) {
 			if len(r.Chain) != 0 || r.CNAME() != "" {
 				t.Errorf("метка %q: неожиданная CNAME-цепочка %v", label, r.Chain)
 			}
-			// AAAA спрашивалась (askAAAA=true): в зоне стенда AAAA нет —
-			// NODATA не роняет субдомен с найденными A.
+			// AAAA was asked (askAAAA=true): the bench zone has no AAAA —
+			// NODATA does not fail a subdomain with found A records.
 			if len(r.AAAA) != 0 {
 				t.Errorf("метка %q: AAAA = %v, хочу пусто (NODATA)", label, r.AAAA)
 			}
@@ -352,7 +358,7 @@ func TestDNSWorker_CheckSubdomains(t *testing.T) {
 		if len(rep.Results) != 3 {
 			t.Fatalf("результатов: %d, хочу 3", len(rep.Results))
 		}
-		apex := rep.Results[0] // порядок входа: "" первый
+		apex := rep.Results[0] // input order: "" is first
 		if want := "alias-target.crawl.test."; apex.CNAME() != want || apex.Target() != want {
 			t.Errorf("цепочка апекса: cname=%q target=%q, хочу %q", apex.CNAME(), apex.Target(), want)
 		}
@@ -391,9 +397,9 @@ func TestDNSWorker_CheckSubdomains(t *testing.T) {
 			t.Fatalf("CheckSubdomains: %v", err)
 		}
 		r := rep.Results[0]
-		// Unbound сам детектирует цикл и отвечает SERVFAIL (не виснет):
-		// признак в RCode, адресов нет, ошибки транспорта нет — вклад
-		// в temp_error решает T-039, не здесь.
+		// Unbound detects the loop itself and answers SERVFAIL (does not
+		// hang): the sign is in RCode, no addresses, no transport error —
+		// the contribution to temp_error is decided by T-039, not here.
 		if r.RCode != dnsclient.RCodeSERVFAIL || r.HasAddrs() || r.Err != nil {
 			t.Errorf("апекс: rcode=%s addrs=%v err=%v, хочу SERVFAIL без адресов и ошибки",
 				r.RCode, r.A, r.Err)
@@ -404,10 +410,11 @@ func TestDNSWorker_CheckSubdomains(t *testing.T) {
 	})
 }
 
-// TestDNSWorker_DetectWildcard — wildcard-детект (T-038; ТЗ 5.4 п. 3)
-// на живом стеке: случайная метка wildcard-зоны получает адреса, обычной
-// зоны — NXDOMAIN (детект-отрицание); пометка по критерию подмножества —
-// синтезированные admin/crm/api/app помечены, апекс и www — никогда.
+// TestDNSWorker_DetectWildcard — wildcard detection (T-038; spec 5.4
+// item 3) on the live stack: a random label of a wildcard zone gets
+// addresses, of a regular zone — NXDOMAIN (the detection negative); the
+// marking uses the subset criterion — the synthesized admin/crm/api/app
+// are marked, the apex and www never.
 func TestDNSWorker_DetectWildcard(t *testing.T) {
 	skipUnlessIntegration(t)
 	resolve := dnsEnv(t)
@@ -445,9 +452,10 @@ func TestDNSWorker_DetectWildcard(t *testing.T) {
 	t.Run("пометка: синтезированные субдомены помечены, апекс и www — нет", func(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		// Живой конвейер T-039: итоги субдоменов wildcard-зоны против
-		// адресов детект-запроса (все шесть строк справочника 000001:
-		// бит 0 — апекс, бит 1 — www, далее admin/crm/api/app).
+		// The live T-039 pipeline: the subdomain results of the wildcard
+		// zone against the detection query addresses (all six rows of the
+		// 000001 reference table: bit 0 — apex, bit 1 — www, then
+		// admin/crm/api/app).
 		labels := map[int16]string{0: "", 1: "www", 2: "admin", 3: "crm", 4: "api", 5: "app"}
 		subs := make([]model.Subdomain, 0, len(labels))
 		for i := int16(0); i < 6; i++ {
@@ -477,7 +485,7 @@ func TestDNSWorker_DetectWildcard(t *testing.T) {
 			t.Fatalf("MarkWildcardSubdomains: %v", err)
 		}
 		got := marked.IDs()
-		want := []int{2, 3, 4, 5} // admin/crm/api/app — прямое правило ТЗ 5.4 п. 3
+		want := []int{2, 3, 4, 5} // admin/crm/api/app — the direct rule of spec 5.4 item 3
 		if len(got) != len(want) {
 			t.Fatalf("помечены %v, хочу %v (апекс и www не помечаются никогда)", got, want)
 		}
@@ -489,15 +497,16 @@ func TestDNSWorker_DetectWildcard(t *testing.T) {
 	})
 }
 
-// ---------------------------------------------------------------- сквозной
+// ---------------------------------------------------------------- end-to-end
 
-// TestDNSWorker_RunTestbedBatch — сквозной DNS-эпизод (T-039; ТЗ 5.4
-// пп. 4–5, §7): пачка q:dns (делегированный домен + NXDOMAIN) через
-// живые unbound/Redis/PostgreSQL: цикл Run потребляет пачку, записывает
-// результаты в изолированной схеме, делегированный получает задачу
-// q:http с адресами DNS-живых субдоменов (апекс и www), NXDOMAIN —
-// терминальный not_delegated без задачи. Полная устойчивость доставки —
-// T-032, здесь контракт сценария целиком.
+// TestDNSWorker_RunTestbedBatch — an end-to-end DNS episode (T-039; spec
+// 5.4 items 4–5, §7): a q:dns batch (a delegated domain + NXDOMAIN)
+// through the live unbound/Redis/PostgreSQL: the Run loop consumes the
+// batch, writes the results into the isolated schema, the delegated one
+// gets a q:http task with the addresses of the DNS-alive subdomains
+// (apex and www), NXDOMAIN is terminal not_delegated without a task.
+// Full delivery durability is T-032; here is the scenario contract as a
+// whole.
 func TestDNSWorker_RunTestbedBatch(t *testing.T) {
 	skipUnlessIntegration(t)
 	pool := migratedSchema(t)
@@ -508,8 +517,8 @@ func TestDNSWorker_RunTestbedBatch(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// Зона и pending-домены: same-site (A у апекса и www) и
-	// nxdomain-case (NXDOMAIN апекса).
+	// The zone and pending domains: same-site (A at the apex and www) and
+	// nxdomain-case (apex NXDOMAIN).
 	labels := []string{"same-site", "nxdomain-case"}
 	ids := insertPendingDomains(t, pool, "crawl.test", labels)
 	if len(ids) != 2 {
@@ -520,7 +529,7 @@ func TestDNSWorker_RunTestbedBatch(t *testing.T) {
 		t.Fatalf("зона crawl.test: %v", err)
 	}
 
-	// Публикация пачки q:dns — как планировщик T-028.
+	// Publishing the q:dns batch — as the T-028 scheduler does.
 	if _, err := q.Publish(ctx, queue.StreamDNS, queue.DNSBatch{Domains: []queue.DNSDomain{
 		{ZoneID: zoneID, DomainID: ids[0], Name: "same-site.crawl.test"},
 		{ZoneID: zoneID, DomainID: ids[1], Name: "nxdomain-case.crawl.test"},
@@ -528,8 +537,8 @@ func TestDNSWorker_RunTestbedBatch(t *testing.T) {
 		t.Fatalf("публикация q:dns: %v", err)
 	}
 
-	// Цикл воркера (группа/потребатель уникальны — БД Redis тестовая
-	// вычищается, но имена не пересекаются с соседними тестами).
+	// The worker loop (group/consumer are unique — the test Redis DB is
+	// cleaned up, but the names do not clash with neighboring tests).
 	const group = "it-dns-e2e"
 	runDone := make(chan error, 1)
 	go func() {
@@ -539,8 +548,8 @@ func TestDNSWorker_RunTestbedBatch(t *testing.T) {
 		})
 	}()
 
-	// Оба эпизода завершены (deadline опроса держит время теста в
-	// секундах: ответы стенда — миллисекунды).
+	// Both episodes are finished (the polling deadline keeps the test
+	// time in seconds: bench answers are milliseconds).
 	deadline := time.Now().Add(15 * time.Second)
 	for {
 		var done int
@@ -558,9 +567,10 @@ func TestDNSWorker_RunTestbedBatch(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 
-	// Записи доменов: делегированный — маска апекс+www без терминального
-	// статуса (итог за HTTP-этапом, §7), NXDOMAIN — not_delegated с
-	// нулевой маской (RFC 8020: субдомены не проверялись).
+	// Domain records: the delegated one — the apex+www mask without a
+	// terminal status (the verdict belongs to the HTTP stage, §7),
+	// NXDOMAIN — not_delegated with a zero mask (RFC 8020: subdomains were
+	// not checked).
 	type row struct {
 		status   model.Status
 		mask     int64
@@ -592,8 +602,9 @@ func TestDNSWorker_RunTestbedBatch(t *testing.T) {
 		}
 	}
 
-	// Задача q:http — ровно одна, на делегированный домен: DNS-живые
-	// субдомены с адресами (апекс и www),NXDOMAIN-домен задачу не получает.
+	// The q:http task — exactly one, for the delegated domain: DNS-alive
+	// subdomains with addresses (apex and www), the NXDOMAIN domain gets
+	// no task.
 	httpMsgs := consumeTasks(t, q, queue.StreamHTTP, "it-http-e2e", "op", 10)
 	if len(httpMsgs) != 1 {
 		t.Fatalf("задач в q:http: %d, хочу 1 (NXDOMAIN-домен без задачи)", len(httpMsgs))
@@ -619,8 +630,8 @@ func TestDNSWorker_RunTestbedBatch(t *testing.T) {
 		t.Errorf("субдомены задачи: %v, хочу ровно апекс и www (адреса есть только у них)", subIDs)
 	}
 
-	// Доставка q:dns подтверждена после записи (Processing, T-025):
-	// PEL пуст, q:dead пуст.
+	// The q:dns delivery is acknowledged after writing (Processing, T-025):
+	// the PEL is empty, q:dead is empty.
 	if n := pendingCount(t, rdb, queue.StreamDNS, group); n != 0 {
 		t.Errorf("неподтверждённых q:dns: %d, хочу 0 (XACK после записи в БД)", n)
 	}
@@ -628,7 +639,7 @@ func TestDNSWorker_RunTestbedBatch(t *testing.T) {
 		t.Errorf("записей в q:dead: %d, хочу 0", n)
 	}
 
-	// Graceful shutdown: отмена ctx — чистый nil (контракт OnRun, T-012).
+	// Graceful shutdown: canceling ctx — a clean nil (the OnRun contract, T-012).
 	cancel()
 	select {
 	case err := <-runDone:
@@ -640,11 +651,12 @@ func TestDNSWorker_RunTestbedBatch(t *testing.T) {
 	}
 }
 
-// TestDNSWorker_InvalidDomainStatus — терминальный диагноз ядовитой
-// строки (T-109, остаток DNS-03): домен с пустым именем в пачке q:dns
-// фиксируется как invalid + done (вместо вечного цикла queued →
-// lease-возврат → dispatch), доставка подтверждается (не q:dead), и
-// перепроверка recheck строку не возвращает (фильтр статуса в отборе).
+// TestDNSWorker_InvalidDomainStatus — the terminal diagnosis of a poison
+// row (T-109, the DNS-03 residual): a domain with an empty name in a
+// q:dns batch is recorded as invalid + done (instead of the eternal
+// queued → lease-return → dispatch cycle), the delivery is acknowledged
+// (not q:dead), and the recheck does not return the row (the status
+// filter in the selection).
 func TestDNSWorker_InvalidDomainStatus(t *testing.T) {
 	skipUnlessIntegration(t)
 	pool := migratedSchema(t)
@@ -655,8 +667,8 @@ func TestDNSWorker_InvalidDomainStatus(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// Мусорная строка: label валиден для вставки, но имя в сообщении
-	// пачки пробельное — как порченая строка domains (DNS-03).
+	// A junk row: the label is valid for insertion, but the name in the
+	// batch message is whitespace — like the corrupted domains row (DNS-03).
 	ids := insertPendingDomains(t, pool, "crawl.test", []string{"poison"})
 	if len(ids) != 1 {
 		t.Fatalf("вставлено доменов: %d, хочу 1", len(ids))
@@ -681,8 +693,8 @@ func TestDNSWorker_InvalidDomainStatus(t *testing.T) {
 		})
 	}()
 
-	// Диагноз записан: строка уходит в done (lease завершён), а не
-	// остаётся queued для бесконечного переиздания.
+	// The diagnosis is recorded: the row goes to done (the lease is
+	// finished) instead of staying queued for infinite republishing.
 	deadline := time.Now().Add(15 * time.Second)
 	for {
 		var state int16
@@ -715,7 +727,7 @@ func TestDNSWorker_InvalidDomainStatus(t *testing.T) {
 		t.Error("queued_at не сброшен — lease не завершён диагнозом")
 	}
 
-	// Доставка подтверждена после записи, не карантином.
+	// The delivery is acknowledged after the write, not by quarantine.
 	if n := pendingCount(t, rdb, queue.StreamDNS, group); n != 0 {
 		t.Errorf("неподтверждённых q:dns: %d, хочу 0", n)
 	}
@@ -733,10 +745,11 @@ func TestDNSWorker_InvalidDomainStatus(t *testing.T) {
 		t.Error("цикл воркера не остановился после отмены ctx")
 	}
 
-	// Перепроверка не возвращает invalid: обе строки состарены в
-	// 2000-01-01 — контрольная temp_error переводится в pending,
-	// ядовитая остаётся done (фильтр статуса в отборе recheck).
-	// ctx воркера уже отменён — операции проверки идут своим фоном.
+	// The recheck does not return invalid: both rows are aged to
+	// 2000-01-01 — the temp_error control row moves to pending, the
+	// poison one stays done (the status filter in the recheck selection).
+	// The worker ctx is already canceled — the check operations run on
+	// their own background.
 	ageCtx := context.Background()
 	if _, err := pool.Exec(ageCtx, "UPDATE domains SET last_checked_at = DATE '2000-01-01'"); err != nil {
 		t.Fatalf("старение строк: %v", err)
@@ -774,13 +787,14 @@ func TestDNSWorker_InvalidDomainStatus(t *testing.T) {
 	}
 }
 
-// TestDNSWorker_RedeliveryPublishedMarker — семантика повтора пачки со
-// staging-пометкой http_published (T-108, DNS-04): домены, чья задача
-// q:http была опубликована предыдущей попыткой (сбой записи результата
-// после публикации — бит стоит), повторная доставка доводит до записи
-// БЕЗ дубликата q:http; done снимает бит. Эмуляция сбоя: публикации и
-// пометка выполнены руками (воркер «умер» между XADD и записью), пачка
-// q:dns доставляется заново.
+// TestDNSWorker_RedeliveryPublishedMarker — the semantics of redelivering
+// a batch with the http_published staging marker (T-108, DNS-04): for
+// domains whose q:http task was published by the previous attempt (the
+// result write failed after publishing — the bit is set), the redelivery
+// brings them to the write WITHOUT a q:http duplicate; done clears the
+// bit. Failure emulation: the publishing and the marking are done by
+// hand (the worker "died" between XADD and the write), the q:dns batch
+// is delivered again.
 func TestDNSWorker_RedeliveryPublishedMarker(t *testing.T) {
 	skipUnlessIntegration(t)
 	pool := migratedSchema(t)
@@ -791,7 +805,7 @@ func TestDNSWorker_RedeliveryPublishedMarker(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// Два делегированных домена стенда (A у апекса и www — задачи q:http).
+	// Two delegated bench domains (A at the apex and www — q:http tasks).
 	labels := []string{"same-site", "alias-target"}
 	ids := insertPendingDomains(t, pool, "crawl.test", labels)
 	var zoneID int16
@@ -799,8 +813,9 @@ func TestDNSWorker_RedeliveryPublishedMarker(t *testing.T) {
 		t.Fatalf("зона crawl.test: %v", err)
 	}
 
-	// «Прошлая попытка»: опубликовала q:http по обоим доменам и поставила
-	// пометку, но не записала результат (краш между XADD и UPDATE-done).
+	// "The previous attempt": published q:http for both domains and set
+	// the marker, but did not write the result (a crash between XADD and
+	// the UPDATE-done).
 	for i, label := range labels {
 		name := label + ".crawl.test"
 		if _, err := q.Publish(ctx, queue.StreamHTTP, queue.HTTPTask{
@@ -817,7 +832,7 @@ func TestDNSWorker_RedeliveryPublishedMarker(t *testing.T) {
 		}
 	}
 
-	// Повторная доставка той же пачки (вернул бы XAUTOCLAIM, T-025).
+	// Redelivering the same batch (XAUTOCLAIM would return it, T-025).
 	if _, err := q.Publish(ctx, queue.StreamDNS, queue.DNSBatch{Domains: []queue.DNSDomain{
 		{ZoneID: zoneID, DomainID: ids[0], Name: "same-site.crawl.test"},
 		{ZoneID: zoneID, DomainID: ids[1], Name: "alias-target.crawl.test"},
@@ -833,7 +848,7 @@ func TestDNSWorker_RedeliveryPublishedMarker(t *testing.T) {
 		})
 	}()
 
-	// Оба домена записаны (done) — повтор довёл эпизоды до записи.
+	// Both domains are written (done) — the redelivery brought the episodes to the write.
 	deadline := time.Now().Add(15 * time.Second)
 	for {
 		var done int
@@ -860,13 +875,14 @@ func TestDNSWorker_RedeliveryPublishedMarker(t *testing.T) {
 		t.Error("цикл воркера не остановился после отмены ctx")
 	}
 
-	// Проверки после отмены — на собственном контексте: ctx теста
-	// уже отменен, его использование отдавало «context canceled».
+	// Checks after cancellation — on their own context: the test ctx is
+	// already canceled, using it returned "context canceled".
 	postCtx, postCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer postCancel()
 
-	// Запись пометки сняла бит: flags больше не несёт http_published,
-	// статус/maska записаны честно (итог за HTTP-этапом — new).
+	// Writing cleared the marker bit: flags no longer carries
+	// http_published, the status/mask are written honestly (the verdict
+	// belongs to the HTTP stage — new).
 	for i, label := range labels {
 		var (
 			status model.Status
@@ -886,9 +902,10 @@ func TestDNSWorker_RedeliveryPublishedMarker(t *testing.T) {
 		}
 	}
 
-	// Дублей q:http нет: в стриме ровно две записи «прошлой попытки» —
-	// повтор домены с битом не публиковал. (Записи читаются группой без
-	// подтверждения — чтение не меняет PEL теста.)
+	// No q:http duplicates: the stream has exactly the two entries of "the
+	// previous attempt" — the redelivery did not publish the bit-set
+	// domains. (The entries are read by a group without acknowledgment —
+	// reading does not change the test's PEL.)
 	httpMsgs := consumeTasks(t, q, queue.StreamHTTP, "it-http-marker", "op", 10)
 	if len(httpMsgs) != 2 {
 		t.Fatalf("записей в q:http: %d, хочу 2 (повтор не публикует дублей)", len(httpMsgs))
@@ -907,17 +924,17 @@ func TestDNSWorker_RedeliveryPublishedMarker(t *testing.T) {
 		}
 	}
 
-	// Доставка q:dns подтверждена после записи (Processing, T-025).
+	// The q:dns delivery is acknowledged after the write (Processing, T-025).
 	if n := pendingCount(t, rdb, queue.StreamDNS, group); n != 0 {
 		t.Errorf("неподтверждённых q:dns: %d, хочу 0", n)
 	}
 }
 
-// TestDNSWorker_EnqueueClearsMarker — постановка планировщика (T-028)
-// снимает бит http_published (T-108): возврат строки в работу (lease,
-// воскрешение, перепроверка) проходит через pending → queued, и свежий
-// эпизод обязан начинаться с чистого бита — иначе пометка прошлого
-// эпизода подавила бы публикацию его задачи (потеря q:http).
+// TestDNSWorker_EnqueueClearsMarker — scheduler enqueueing (T-028)
+// clears the http_published bit (T-108): returning a row to work (lease,
+// revival, recheck) goes through pending → queued, and a fresh episode
+// must start with a clean bit — otherwise the previous episode's marker
+// would suppress publishing its task (a lost q:http).
 func TestDNSWorker_EnqueueClearsMarker(t *testing.T) {
 	skipUnlessIntegration(t)
 	pool := migratedSchema(t)
@@ -932,8 +949,9 @@ func TestDNSWorker_EnqueueClearsMarker(t *testing.T) {
 	if err := pool.QueryRow(ctx, "SELECT id FROM zones WHERE name = $1", "crawl.test").Scan(&zoneID); err != nil {
 		t.Fatalf("зона crawl.test: %v", err)
 	}
-	// Домен вернулся в pending с неснятым битом (крайний путь сбоя:
-	// запись так и не состоялась, lease перевёл строку в pending).
+	// The domain returned to pending with the bit still set (the extreme
+	// failure path: the write never happened, the lease moved the row to
+	// pending).
 	if _, err := pool.Exec(ctx,
 		fmt.Sprintf("UPDATE domains SET flags = flags | %d WHERE id = $1",
 			int16(model.FlagHTTPPublished)),

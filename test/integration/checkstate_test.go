@@ -1,24 +1,26 @@
-// Интеграционные тесты автомата check_state (T-255, ТЗ tasks/TZ-fsm.md §3
-// ФТ-1) против живого PostgreSQL: сценарная цепочка всех переходов
-// спецификации (internal/scheduler/checkstate.go — единая точка правды)
-// реальными операторами писателей — вставка add-файлом (Р10), постановка
-// планировщика (Р1: queued_at + снятие http_published), запись результата
-// DNS (Р3: done, сброс аренды), суточная перепроверка (Р7), lease-возврат
-// (Р5), терминальная temp_error-ветка DNS (Р2) и повтор temp_error (Р8),
-// удаление (Р14) и воскрешение (Р9) — после каждого эпизода дельты
-// счётчиков зон сходятся с T-178-реконсиляцией. Отдельно — терминальная
-// страховка ФТ-1.2: строка queued/NULL queued_at (нарушенный инвариант
-// И1) невидима основному lease-проходу, возвращается ремонтным проходом
-// LeaseNullOnce (счётчик crawler_scheduler_lease_null_returned_total
-// растёт), повторный проход — 0; EXPLAIN-контракт выборки страховки —
-// предикат IS NULL обслуживается листовым экземпляром domains_lease_idx
-// (T-104), форма основного lease-запроса не меняется. Ручной recheck
-// (Р11) и массовый recheck субдомена (Р12) — cmd/crawlerctl (package
-// main): интеграционный тест recheck_integration_test.go, прогоняет
-// make test-integration тем же списком пакетов. Диагноз invalid (Р13)
-// живой БД покрыт существующим TestCounters_DNSStageTransitions
-// (counters_test.go, RecordInvalid) — здесь не дублируется. Уровень
-// вызовов — библиотечные, без запуска сервисов; изоляция — withTestSchema.
+// Integration tests of the check_state automaton (T-255, TZ-fsm spec
+// tasks/TZ-fsm.md §3 FR-1) against live PostgreSQL: a scenario chain of
+// all specification transitions (internal/scheduler/checkstate.go — the
+// single source of truth) by real writer statements — insert via an add
+// file (R10), scheduler enqueueing (R1: queued_at + clearing
+// http_published), DNS result recording (R3: done, lease reset), daily
+// recheck (R7), lease return (R5), the terminal DNS temp_error branch
+// (R2) and temp_error retry (R8), deletion (R14) and revival (R9) — after
+// each episode the zone counter deltas converge with the T-178
+// reconciliation. Separately — the terminal FR-1.2 guard: a queued row
+// with NULL queued_at (a broken I1 invariant) is invisible to the main
+// lease pass, returned by the LeaseNullOnce repair pass (the
+// crawler_scheduler_lease_null_returned_total counter grows), a repeat
+// pass is 0; the EXPLAIN contract of the guard selection — the IS NULL
+// predicate is served by the leaf instance of domains_lease_idx (T-104),
+// the shape of the main lease query does not change. Manual recheck (R11)
+// and bulk subdomain recheck (R12) — cmd/crawlerctl (package main): the
+// integration test recheck_integration_test.go, run by make
+// test-integration with the same package list. The invalid (R13)
+// diagnosis on a live DB is covered by the existing
+// TestCounters_DNSStageTransitions (counters_test.go, RecordInvalid) —
+// not duplicated here. The call level is library-level, no services
+// started; isolation — withTestSchema.
 package integration
 
 import (
@@ -39,9 +41,9 @@ import (
 	"crawler/internal/scheduler"
 )
 
-// checkStateRow — наблюдаемое состояние строки domains для проверок
-// переходов: check_state, статус, отметка аренды, счётчик temp_error,
-// бит http_published.
+// checkStateRow — the observed state of a domains row for transition
+// checks: check_state, status, the lease mark, the temp_error counter,
+// the http_published bit.
 type checkStateRow struct {
 	state         int16
 	status        int16
@@ -51,7 +53,7 @@ type checkStateRow struct {
 	httpPublished bool
 }
 
-// checkStateOf — строка домена по ключу.
+// checkStateOf — a domain row by key.
 func checkStateOf(ctx context.Context, t *testing.T, pool *pgxpool.Pool, zone int16, id int64) checkStateRow {
 	t.Helper()
 	var r checkStateRow
@@ -69,8 +71,8 @@ func checkStateOf(ctx context.Context, t *testing.T, pool *pgxpool.Pool, zone in
 	return r
 }
 
-// checkStateStageAdd — партия add в staging (метки labels) и применение
-// ApplyAdd: вставка (Р10) или воскрешение (Р9) реальным оператором.
+// checkStateStageAdd — an add batch into staging (labels) and the
+// ApplyAdd application: insert (R10) or revival (R9) by a real statement.
 func checkStateStageAdd(ctx context.Context, t *testing.T, pool ingest.ApplyDB, zone int16, labels ...string) ingest.AddResult {
 	t.Helper()
 	batch, err := ingest.NewBatchID()
@@ -91,20 +93,20 @@ func checkStateStageAdd(ctx context.Context, t *testing.T, pool ingest.ApplyDB, 
 	return res
 }
 
-// TestCheckState_SpecTransitions — цепочка переходов спецификации по
-// порядку Р10 → Р1 → Р3 → Р7 → Р1+Р5 → Р2 → Р8 → Р14 → Р9: каждый
-// эпизод — реальный писатель, побочные действия (queued_at, бит
-// http_published, temp_attempts, дельты зон) проверяются на строке.
+// TestCheckState_SpecTransitions — the specification transition chain in
+// the order R10 → R1 → R3 → R7 → R1+R5 → R2 → R8 → R14 → R9: each
+// episode is a real writer; side effects (queued_at, the http_published
+// bit, temp_attempts, zone deltas) are checked on the row.
 func TestCheckState_SpecTransitions(t *testing.T) {
 	skipUnlessIntegration(t)
-	pool := countersSchema(t) // общий хелпер пакета
+	pool := countersSchema(t) // a shared package helper
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
 	zone := countersSeedZone(t, pool, "fsm.test")
 	q := &countersStubQueue{}
 
-	// Р10: вставка нового домена add-файлом — status=new, pending, аренды нет.
+	// R10: inserting a new domain via an add file — status=new, pending, no lease.
 	add := checkStateStageAdd(ctx, t, pool, zone, "spec")
 	if add.Inserted != 1 || add.Revived != 0 {
 		t.Fatalf("ApplyAdd = %+v, хочу Inserted=1", add)
@@ -121,8 +123,9 @@ func TestCheckState_SpecTransitions(t *testing.T) {
 	}
 	countersVerifyEmpty(t, pool, "после вставки (Р10)")
 
-	// Р1: постановка планировщика — queued, аренда начата, бит
-	// http_published прошлого эпизода снят, публикация q:dns по RETURNING.
+	// R1: scheduler enqueueing — queued, the lease started, the
+	// http_published bit of the previous episode cleared, the q:dns
+	// publication via RETURNING.
 	if _, err := pool.Exec(ctx,
 		"UPDATE domains SET flags = flags | $1 WHERE zone_id = $2 AND id = $3",
 		int16(model.FlagHTTPPublished), zone, id); err != nil {
@@ -140,8 +143,9 @@ func TestCheckState_SpecTransitions(t *testing.T) {
 	}
 	countersVerifyEmpty(t, pool, "после постановки (Р1)")
 
-	// Р3: запись результата DNS «есть адреса» — done, аренда завершена,
-	// статус-итог за HTTP-этапом (не пишется), отметка проверки есть.
+	// R3: recording the DNS result "there are addresses" — done, the
+	// lease is finished, the status verdict belongs to the HTTP stage (not
+	// written), the check mark is present.
 	ok, err := dnsworker.RecordEpisode(ctx, pool, zone, id, dnsworker.EpisodeResult{Mask: 1}, nil)
 	if err != nil || !ok {
 		t.Fatalf("RecordEpisode: ok=%v err=%v (Р3)", ok, err)
@@ -152,8 +156,8 @@ func TestCheckState_SpecTransitions(t *testing.T) {
 	}
 	countersVerifyEmpty(t, pool, "после записи DNS (Р3)")
 
-	// Р7: суточная возрастная перепроверка — done → pending, статус
-	// сохраняется, аренды нет.
+	// R7: the daily age-based recheck — done → pending, the status is
+	// kept, no lease.
 	if _, err := pool.Exec(ctx,
 		"UPDATE domains SET last_checked_at = current_date - 400 WHERE zone_id = $1 AND id = $2",
 		zone, id); err != nil {
@@ -169,7 +173,7 @@ func TestCheckState_SpecTransitions(t *testing.T) {
 	}
 	countersVerifyEmpty(t, pool, "после перепроверки (Р7)")
 
-	// Р1 + Р5: повторная постановка и истёкшая аренда — возврат в pending.
+	// R1 + R5: re-enqueueing and an expired lease — return to pending.
 	if _, err := scheduler.EnqueueBatch(ctx, pool, q, []scheduler.DispatchRow{
 		{ZoneID: zone, DomainID: id, Name: "spec.fsm.test"},
 	}); err != nil {
@@ -189,8 +193,9 @@ func TestCheckState_SpecTransitions(t *testing.T) {
 	}
 	countersVerifyEmpty(t, pool, "после lease-возврата (Р5)")
 
-	// Р2: терминальная temp_error-ветка DNS — done + temp_error, счётчик
-	// попыток сохраняется (новый эпизод с нуля), корзина зрелости сегодня.
+	// R2: the terminal DNS temp_error branch — done + temp_error, the
+	// attempt counter is kept (a new episode starts from scratch), the
+	// maturity bucket is today.
 	if _, err := scheduler.EnqueueBatch(ctx, pool, q, []scheduler.DispatchRow{
 		{ZoneID: zone, DomainID: id, Name: "spec.fsm.test"},
 	}); err != nil {
@@ -209,9 +214,10 @@ func TestCheckState_SpecTransitions(t *testing.T) {
 	}
 	countersVerifyEmpty(t, pool, "после temp_error-ветки DNS (Р2)")
 
-	// Р8: повтор temp_error — done → pending, temp_attempts + 1 (корзину
-	// зрелости прошедших суток кладёт руками: сегодняшние эпизоды не
-	// зреют, окно 24 ч по date — возраст проверки за окном).
+	// R8: the temp_error retry — done → pending, temp_attempts + 1 (the
+	// maturity bucket of the past day is placed by hand: today's episodes
+	// do not ripen, the 24 h window is by date — the check age is outside
+	// the window).
 	if _, err := pool.Exec(ctx,
 		"UPDATE domains SET last_checked_at = current_date - 2 WHERE zone_id = $1 AND id = $2",
 		zone, id); err != nil {
@@ -232,7 +238,7 @@ func TestCheckState_SpecTransitions(t *testing.T) {
 	}
 	countersVerifyEmpty(t, pool, "после повтора temp_error (Р8)")
 
-	// Р14: delete-файл — status=deleted, check_state НЕ меняется (pending).
+	// R14: a delete file — status=deleted, check_state does NOT change (pending).
 	dbatch, err := ingest.NewBatchID()
 	if err != nil {
 		t.Fatal(err)
@@ -252,7 +258,7 @@ func TestCheckState_SpecTransitions(t *testing.T) {
 	}
 	countersVerifyEmpty(t, pool, "после delete (Р14)")
 
-	// Р9: воскрешение add-файлом — new/pending, аренды нет.
+	// R9: revival via an add file — new/pending, no lease.
 	radd := checkStateStageAdd(ctx, t, pool, zone, "spec")
 	if radd.Revived != 1 || radd.Inserted != 0 {
 		t.Fatalf("ApplyAdd воскрешение = %+v, хочу Revived=1 (Р9)", radd)
@@ -264,15 +270,16 @@ func TestCheckState_SpecTransitions(t *testing.T) {
 	countersVerifyEmpty(t, pool, "после воскрешения (Р9)")
 }
 
-// TestCheckState_LeaseNullRepair — терминальная страховка ФТ-1.2: строка
-// queued с NULL queued_at (нарушенный инвариант И1) невидима основному
-// lease-проходу (NULL отсеивается сравнением возраста — вечное
-// зависание до страховки), возвращается ремонтным проходом LeaseNullOnce
-// со счётчиком crawler_scheduler_lease_null_returned_total; повторный
-// проход — 0 (идемпотентность); дельты зон ведёт оператор перевода.
+// TestCheckState_LeaseNullRepair — the terminal FR-1.2 guard: a queued
+// row with NULL queued_at (a broken I1 invariant) is invisible to the
+// main lease pass (NULL is filtered out by the age comparison — an
+// eternal hang before the guard), returned by the LeaseNullOnce repair
+// pass with the crawler_scheduler_lease_null_returned_total counter; a
+// repeat pass is 0 (idempotence); the zone deltas are maintained by the
+// transition statement.
 func TestCheckState_LeaseNullRepair(t *testing.T) {
 	skipUnlessIntegration(t)
-	pool := countersSchema(t) // общий хелпер пакета
+	pool := countersSchema(t) // a shared package helper
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
@@ -285,14 +292,14 @@ func TestCheckState_LeaseNullRepair(t *testing.T) {
 	).Scan(&id); err != nil {
 		t.Fatalf("домен queued/NULL: %v", err)
 	}
-	// Ручной INSERT мимо инкрементальных дельт: реконсиляция — авторитет,
-	// после неё счётчики зоны истинны (1 queued).
+	// A manual INSERT bypassing the incremental deltas: reconciliation is
+	// the authority, after it the zone counters are true (1 queued).
 	if _, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{}); err != nil {
 		t.Fatalf("реконсиляция: %v", err)
 	}
 	countersVerifyEmpty(t, pool, "после реконсиляции")
 
-	// Основной lease-проход строку НЕ видит: NULL сравнением отсеивается.
+	// The main lease pass does NOT see the row: NULL is filtered out by the comparison.
 	lres, err := scheduler.LeaseOnce(ctx, pool, nil, scheduler.LeaseOptions{})
 	if err != nil {
 		t.Fatalf("LeaseOnce: %v", err)
@@ -304,7 +311,7 @@ func TestCheckState_LeaseNullRepair(t *testing.T) {
 		t.Fatalf("строка изменилась основным проходом: %+v, хочу queued", r)
 	}
 
-	// Ремонтный проход ФТ-1.2: возврат в pending, счётчик растёт.
+	// The FR-1.2 repair pass: return to pending, the counter grows.
 	reg := metrics.New("scheduler")
 	nres, err := scheduler.LeaseNullOnce(ctx, pool, scheduler.LeaseOptions{Metrics: reg})
 	if err != nil || nres.Domains != 1 || nres.Selected != 1 {
@@ -318,7 +325,7 @@ func TestCheckState_LeaseNullRepair(t *testing.T) {
 		t.Fatalf("счётчик страховки = %v, хочу 1", got)
 	}
 
-	// Повторный проход — пусто (переведённые больше не выбираются).
+	// A repeat pass — empty (the changed rows are no longer selected).
 	repeat, err := scheduler.LeaseNullOnce(ctx, pool, scheduler.LeaseOptions{Metrics: reg})
 	if err != nil || repeat != (scheduler.LeaseNullResult{}) {
 		t.Fatalf("повторный LeaseNullOnce = %+v err=%v, хочу нулевой (идемпотентность)", repeat, err)
@@ -327,10 +334,11 @@ func TestCheckState_LeaseNullRepair(t *testing.T) {
 		t.Fatalf("счётчик после повтора = %v, хочу 1 (пустой проход не считается)", got)
 	}
 
-	// EXPLAIN-контракт выборки страховки (стиль TestLease_CursorPredicateIndex):
-	// предикат queued_at IS NULL + ORDER BY ключа обслуживаются листовым
-	// экземпляром domains_lease_idx (T-104) — пригодность индекса сохранена,
-	// seq scan по domains нет.
+	// The EXPLAIN contract of the guard selection (the
+	// TestLease_CursorPredicateIndex style): the queued_at IS NULL
+	// predicate + ORDER BY of the key are served by the leaf instance of
+	// domains_lease_idx (T-104) — index usability is preserved, no seq
+	// scan over domains.
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatalf("begin: %v", err)
@@ -352,7 +360,7 @@ func TestCheckState_LeaseNullRepair(t *testing.T) {
 	}
 }
 
-// checkStateNullReturned — значение счётчика страховки в реестре.
+// checkStateNullReturned — the guard counter value in the registry.
 func checkStateNullReturned(t *testing.T, reg *metrics.Registry) float64 {
 	t.Helper()
 	families, err := reg.Gather()
@@ -370,7 +378,7 @@ func checkStateNullReturned(t *testing.T, reg *metrics.Registry) float64 {
 	return 0
 }
 
-// checkStateExplain — текст плана EXPLAIN (COSTS OFF) запроса.
+// checkStateExplain — the EXPLAIN (COSTS OFF) plan text of a query.
 func checkStateExplain(ctx context.Context, t *testing.T, tx pgx.Tx, query string) string {
 	t.Helper()
 	rows, err := tx.Query(ctx, "EXPLAIN (COSTS OFF) "+query)

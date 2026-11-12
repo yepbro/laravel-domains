@@ -1,20 +1,21 @@
-// Интеграционные тесты автомата бита http_published (T-257, ТЗ
-// tasks/TZ-fsm.md §3 ФТ-3) против живого PostgreSQL: сценарная цепочка
-// всех переходов спецификации (internal/dnsworker/result.go, таблица у
-// resultMarkPublishedSQL — единая точка правды) реальными операторами
-// писателей на одном домене: Б1 постановка после XADD q:http, Б4 пропуск
-// публикации повторной доставкой, Б2 снятие записью результата, Б3 снятие
-// постановкой планировщика — включая окно «XADD без бита» (повторная
-// доставка публикует ДОПУСТИМЫЙ дубль) и переживание бита на pending
-// (lease вернул строку незаписанной — вне эпизода бит значения не имеет);
-// переживание «прочих» битов (is_idn) проверяется на каждом переходе.
-// Отдельный сценарий — non-fatal отказ постановки Б1 (эпизод доводится
-// до записи, дубль исключён done-строкой). Эпизоды исполняет ProcessDomain
-// с детерминированным резолвером (сеть и классификация — dns_test.go на
-// стенде); сбой записи эмулирует обёртка пула (стиль
-// countersMatureFailPool). Дельты счётчиков зон после каждого эпизода
-// сверяет реконсиляция monitor (T-178). Уровень вызовов — библиотечные,
-// без запуска сервисов; изоляция — withTestSchema.
+// Integration tests of the http_published bit automaton (T-257, TZ-fsm spec
+// tasks/TZ-fsm.md §3 FR-3) against live PostgreSQL: a scenario chain of all
+// specification transitions (internal/dnsworker/result.go, the table at
+// resultMarkPublishedSQL — the single source of truth) by real writer
+// statements on one domain: B1 setting after XADD q:http, B4 skipping
+// publication on redelivery, B2 clearing by the result write, B3 clearing
+// by scheduler enqueueing — including the "XADD without the bit" window (a
+// redelivery publishes an ALLOWED duplicate) and the bit surviving on
+// pending (the lease returned the row unwritten — outside an episode the
+// bit does not matter); the survival of "other" bits (is_idn) is checked on
+// every transition. A separate scenario — the non-fatal B1 failure (the
+// episode is carried to the write, the duplicate is excluded by the
+// done row). The episodes are executed by ProcessDomain with a
+// deterministic resolver (the network and classification — dns_test.go on
+// the bench); the write failure is emulated by a pool wrapper (the
+// countersMatureFailPool style). The zone counter deltas after each episode
+// are checked by the monitor reconciliation (T-178). The call level is
+// library-level, no services started; isolation — withTestSchema.
 package integration
 
 import (
@@ -38,9 +39,9 @@ import (
 	"crawler/internal/scheduler"
 )
 
-// httpBitQueue — queue.Queue сценария: публикация всегда успешна
-// (транспорт — не предмет теста), q:http считается (единица наблюдения
-// дублей/пропусков), q:dns постановок планировщика — нет.
+// httpBitQueue — the scenario's queue.Queue: publishing always succeeds
+// (the transport is not the test's subject), q:http is counted (the unit of
+// observation of duplicates/skips), scheduler enqueueing q:dns is not.
 type httpBitQueue struct{ http int }
 
 func (q *httpBitQueue) Publish(_ context.Context, stream string, _ queue.Message) (string, error) {
@@ -58,10 +59,10 @@ func (q *httpBitQueue) Ack(context.Context, string, string, ...string) error {
 	panic("httpBitQueue: Ack не используется")
 }
 
-// httpBitResolver — детерминированный dnsclient.Resolver: апекс и www
-// домена отвечают A-записью (эпизод всегда «есть адреса» → задача
-// q:http, запись — ветка keep-status), остальные имена (случайная метка
-// wildcard-детекта T-038) — NXDOMAIN.
+// httpBitResolver — a deterministic dnsclient.Resolver: the domain's apex
+// and www answer with an A record (the episode is always "there are
+// addresses" → a q:http task, the write is the keep-status branch), other
+// names (the random label of the T-038 wildcard detection) — NXDOMAIN.
 type httpBitResolver struct{ domain string }
 
 var _ dnsclient.Resolver = httpBitResolver{}
@@ -78,18 +79,19 @@ func (r httpBitResolver) Exchange(_ context.Context, q dnsclient.Question) (*dns
 	return &dnsclient.Result{RCode: dnsclient.RCodeNXDOMAIN}, nil
 }
 
-// httpBitSubs — справочник сценария: апекс и www (оба резолвятся —
-// маска 0b11, эпизод «есть адреса», запись — ветка keep-status).
+// httpBitSubs — the scenario's reference table: the apex and www (both
+// resolve — the 0b11 mask, the "there are addresses" episode, the write is
+// the keep-status branch).
 func httpBitSubs() []model.Subdomain {
 	return []model.Subdomain{
-		{ID: 0, Label: "", Enabled: true}, // апекс
+		{ID: 0, Label: "", Enabled: true}, // the apex
 		{ID: 1, Label: "www", Enabled: true},
 	}
 }
 
-// httpBitFlags — маска flags строки домена: проверка переживания
-// «прочих» битов (is_idn) операторами постановки/снятия (Б1–Б3 —
-// «прочие сохранены»).
+// httpBitFlags — the flags mask of the domain row: checking the survival of
+// "other" bits (is_idn) under the set/clear statements (B1–B3 — "others
+// preserved").
 func httpBitFlags(ctx context.Context, t *testing.T, pool *pgxpool.Pool, zone int16, id int64) int16 {
 	t.Helper()
 	var flags int16
@@ -101,15 +103,17 @@ func httpBitFlags(ctx context.Context, t *testing.T, pool *pgxpool.Pool, zone in
 	return flags
 }
 
-// httpBitRecordFailMark — опознаватель записи результата «есть адреса»
-// (resultUpdateKeepStatusSQL dnsworker, Р3) в тексте SQL; дублирование
-// литерала — стиль countersMatureIncMark (константа не экспортирована).
+// httpBitRecordFailMark — the identifier of the "there are addresses"
+// result write (dnsworker resultUpdateKeepStatusSQL, R3) in the SQL text;
+// duplicating the literal is the countersMatureIncMark style (the constant
+// is not exported).
 const httpBitRecordFailMark = "SET dns_mask = $3::int8, temp_attempts = 0"
 
-// httpBitRecordFailPool — db.DB-обёртка пула: Query записи результата
-// DNS падает (сценарий «воркер умер после XADD и пометки Б1, до записи
-// Б2» — доставка не подтверждается, повтор доиграет эпизод), всё
-// остальное (фильтр пачки, пометка) делегируется пулу.
+// httpBitRecordFailPool — a db.DB wrapper of the pool: the DNS result
+// write Query fails (the "worker died after XADD and the B1 mark, before
+// the B2 write" scenario — the delivery is not acknowledged, the
+// redelivery will finish the episode); everything else (the batch filter,
+// the mark) is delegated to the pool.
 type httpBitRecordFailPool struct{ *pgxpool.Pool }
 
 func (p *httpBitRecordFailPool) CopyFrom(ctx context.Context, tableName pgx.Identifier, columnNames []string, rowSrc pgx.CopyFromSource) (int64, error) {
@@ -127,14 +131,14 @@ func (p *httpBitRecordFailPool) Query(ctx context.Context, sql string, args ...a
 	return p.Pool.Query(ctx, sql, args...)
 }
 
-// httpBitMarkFailMark — опознаватель постановки бита
-// (resultMarkPublishedSQL dnsworker) в тексте SQL; дублирование литерала
-// — стиль countersMatureIncMark (константа не экспортирована).
+// httpBitMarkFailMark — the identifier of the bit setting (dnsworker
+// resultMarkPublishedSQL) in the SQL text; duplicating the literal is the
+// countersMatureIncMark style (the constant is not exported).
 const httpBitMarkFailMark = "SET flags = (t.flags | 4)::int2"
 
-// httpBitMarkFailPool — db.DB-обёртка пула: Exec постановки бита падает
-// (сценарий «отказ пометки после XADD — non-fatal Б1»: эпизод обязан
-// дойти до записи), остальное делегируется пулу.
+// httpBitMarkFailPool — a db.DB wrapper of the pool: the bit-setting Exec
+// fails (the "mark failure after XADD — non-fatal B1" scenario: the
+// episode must reach the write); the rest is delegated to the pool.
 type httpBitMarkFailPool struct{ *pgxpool.Pool }
 
 func (p *httpBitMarkFailPool) CopyFrom(ctx context.Context, tableName pgx.Identifier, columnNames []string, rowSrc pgx.CopyFromSource) (int64, error) {
@@ -152,8 +156,8 @@ func (p *httpBitMarkFailPool) Query(ctx context.Context, sql string, args ...any
 	return p.Pool.Query(ctx, sql, args...)
 }
 
-// httpBitFilter — фильтр пачки q:dns (resultPendingSQL) ровно на один
-// домен сценария: возвращает его с состоянием бита (Б4).
+// httpBitFilter — the q:dns batch filter (resultPendingSQL) for exactly the
+// one scenario domain: returns it with the bit state (B4).
 func httpBitFilter(ctx context.Context, t *testing.T, pool *pgxpool.Pool, batch []queue.DNSDomain) dnsworker.PendingDomain {
 	t.Helper()
 	pend, err := dnsworker.PendingDomains(ctx, pool, batch)
@@ -166,20 +170,20 @@ func httpBitFilter(ctx context.Context, t *testing.T, pool *pgxpool.Pool, batch 
 	return pend[0]
 }
 
-// TestHTTPPublishedBit_SpecTransitions — цепочка переходов спецификации
-// на одном домене: Р1 → (окно «XADD без бита») → Б1 (+дубль окна) →
-// Б4+Б2 → Р7+Р1 → Б1 → Р5 (бит пережил pending) → Б3 → публикация
-// свежего эпизода без подавления. Число публикаций q:http растёт
-// 1 → 2 (дубль окна) → 2 (Б4: без дубля) → 3 (Б1 эпизода 2) → 4
-// (свежий эпизод после Б3).
+// TestHTTPPublishedBit_SpecTransitions — the specification transition chain
+// on one domain: R1 → (the "XADD without the bit" window) → B1 (+the
+// window duplicate) → B4+B2 → R7+R1 → B1 → R5 (the bit survived pending)
+// → B3 → publishing a fresh episode without suppression. The q:http
+// publication count grows 1 → 2 (the window duplicate) → 2 (B4: no
+// duplicate) → 3 (B1 of episode 2) → 4 (a fresh episode after B3).
 func TestHTTPPublishedBit_SpecTransitions(t *testing.T) {
 	skipUnlessIntegration(t)
-	pool := countersSchema(t) // общий хелпер пакета
+	pool := countersSchema(t) // a shared package helper
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
 	zone := countersSeedZone(t, pool, "fsm-bit.test")
-	// countersSeedDomains нумерует метки: prefix "spec" → label "spec0".
+	// countersSeedDomains numbers the labels: prefix "spec" → label "spec0".
 	ids := countersSeedDomains(t, pool, zone, "spec", 1, model.CheckStatePending, model.StatusNew)
 	id := ids[0]
 	const name = "spec0.fsm-bit.test"
@@ -198,23 +202,24 @@ func TestHTTPPublishedBit_SpecTransitions(t *testing.T) {
 		}
 	}
 
-	// «Прочий бит» is_idn (без связей со счётчиками, в отличие от
-	// render_pending): спецификация Б1–Б3 требует его сохранения —
-	// OR/AND ~бита не трогают чужие разряды.
+	// The "other bit" is_idn (unrelated to the counters, unlike
+	// render_pending): the B1–B3 specification requires preserving it —
+	// the OR/AND ~bit statements do not touch foreign bits.
 	if _, err := pool.Exec(ctx,
 		"UPDATE domains SET flags = flags | $1 WHERE zone_id = $2 AND id = $3",
 		int16(model.FlagIDN), zone, id); err != nil {
 		t.Fatalf("сеем is_idn: %v", err)
 	}
 
-	// Ручная вставка домена мимо инкрементальных дельт — реконсиляция
-	// авторитет (точка отсчёта счётчиков зон, стиль TestCheckState_LeaseNullRepair).
+	// A manual domain insert bypassing the incremental deltas — the
+	// reconciliation is the authority (the baseline of the zone counters,
+	// the TestCheckState_LeaseNullRepair style).
 	if _, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{}); err != nil {
 		t.Fatalf("реконсиляция: %v", err)
 	}
 
-	// Р1: постановка планировщика — queued, бит чист (Б1 ещё не было),
-	// is_idn пережил постановку.
+	// R1: scheduler enqueueing — queued, the bit is clean (no B1 yet),
+	// is_idn survived the enqueueing.
 	enqueue()
 	if r := checkStateOf(ctx, t, pool, zone, id); r.state != int16(model.CheckStateQueued) || r.httpPublished {
 		t.Fatalf("после постановки = %+v, хочу queued/бит чист (Р1)", r)
@@ -224,10 +229,11 @@ func TestHTTPPublishedBit_SpecTransitions(t *testing.T) {
 	}
 	countersVerifyEmpty(t, pool, "после постановки (Р1)")
 
-	// Доставка 1 — окно «XADD без бита»: публикация q:http прошла
-	// (XADD успешен), воркер умер ДО пометки и записи. Прошлая попытка
-	// эмулируется руками (стиль TestDNSWorker_RedeliveryPublishedMarker):
-	// ни Exec пометки, ни записи не было.
+	// Delivery 1 — the "XADD without the bit" window: the q:http
+	// publication went through (XADD succeeded), the worker died BEFORE the
+	// mark and the write. The previous attempt is emulated by hand (the
+	// TestDNSWorker_RedeliveryPublishedMarker style): neither the mark
+	// Exec nor the write happened.
 	if _, err := q.Publish(ctx, queue.StreamHTTP, queue.HTTPTask{
 		ZoneID: zone, DomainID: id, Name: name,
 		Subdomains: []queue.HTTPSubdomain{{SubdomainID: 0, Label: "", Addrs: []string{"192.0.2.10"}}},
@@ -238,10 +244,11 @@ func TestHTTPPublishedBit_SpecTransitions(t *testing.T) {
 		t.Fatalf("публикаций q:http = %d, хочу 1", q.http)
 	}
 
-	// Доставка 2 (повторная): бит ЧИСТ — окно не закрыто, фильтр не
-	// видит пометки, эпизод публикует ДУБЛЬ q:http (допустим — цена
-	// окна, не потеря) и ставит бит (Б1); запись падает обёрткой —
-	// доставка не подтверждена.
+	// Delivery 2 (redelivery): the bit is CLEAN — the window is not
+	// closed, the filter does not see the mark, the episode publishes a
+	// DUPLICATE q:http (allowed — the price of the window, not a loss) and
+	// sets the bit (B1); the write fails via the wrapper — the delivery is
+	// not acknowledged.
 	dom := httpBitFilter(ctx, t, pool, batch)
 	if dom.HTTPPublished {
 		t.Fatal("бит стоит в окне «XADD без бита» — дубль был бы подавлен (нарушение спецификации)")
@@ -260,10 +267,11 @@ func TestHTTPPublishedBit_SpecTransitions(t *testing.T) {
 	}
 	countersVerifyEmpty(t, pool, "после Б1 (запись не состоялась — дельт нет)")
 
-	// Доставка 3 (повторная): бит стоит («опубликовано, не записано») —
-	// публикация ПРОПУЩЕНА (Б4), эпизод доходит до записи: done, бит
-	// снят (Б2), статус не тронут (ветка «есть адреса» — итог за
-	// HTTP-этапом), маска эпизода записана.
+	// Delivery 3 (redelivery): the bit is set ("published, not written") —
+	// the publication is SKIPPED (B4), the episode reaches the write:
+	// done, the bit is cleared (B2), the status is untouched (the "there
+	// are addresses" branch — the verdict belongs to the HTTP stage), the
+	// episode mask is written.
 	dom = httpBitFilter(ctx, t, pool, batch)
 	if !dom.HTTPPublished {
 		t.Fatal("бит http_published не прочитан фильтром пачки (Б4)")
@@ -292,8 +300,8 @@ func TestHTTPPublishedBit_SpecTransitions(t *testing.T) {
 	}
 	countersVerifyEmpty(t, pool, "после записи результата (Б2)")
 
-	// Эпизод 2: суточная перепроверка (Р7) возвращает домен, постановка
-	// (Р1) даёт свежий queued с чистым битом.
+	// Episode 2: the daily recheck (R7) returns the domain, enqueueing
+	// (R1) gives a fresh queued with a clean bit.
 	if _, err := pool.Exec(ctx,
 		"UPDATE domains SET last_checked_at = current_date - 400 WHERE zone_id = $1 AND id = $2",
 		zone, id); err != nil {
@@ -306,10 +314,10 @@ func TestHTTPPublishedBit_SpecTransitions(t *testing.T) {
 	enqueue()
 	countersVerifyEmpty(t, pool, "после Р7+Р1 эпизода 2")
 
-	// Доставка 4: эпизод публикует q:http и ставит бит (Б1), запись
-	// падает (обёртка), аренда истекает — lease-возврат (Р5) оставляет
-	// строку pending с ПЕРЕЖИВШИМ битом: вне эпизода бит значения не
-	// имеет, читает только фильтр пачки.
+	// Delivery 4: the episode publishes q:http and sets the bit (B1), the
+	// write fails (the wrapper), the lease expires — the lease return (R5)
+	// leaves the row pending with the SURVIVING bit: outside an episode
+	// the bit does not matter, only the batch filter reads it.
 	dom = httpBitFilter(ctx, t, pool, batch)
 	if dom.HTTPPublished {
 		t.Fatal("бит стоит до эпизода 2 — постановка не сняла (нарушение Б3)")
@@ -340,8 +348,9 @@ func TestHTTPPublishedBit_SpecTransitions(t *testing.T) {
 	}
 	countersVerifyEmpty(t, pool, "после lease-возврата (Р5)")
 
-	// Б3: постановка нового эпизода снимает бит — иначе пометка прошлого
-	// эпизода подавила бы публикацию свежего (потеря q:http).
+	// B3: enqueueing a new episode clears the bit — otherwise the previous
+	// episode's mark would suppress publishing the fresh one (a lost
+	// q:http).
 	enqueue()
 	if r := checkStateOf(ctx, t, pool, zone, id); r.state != int16(model.CheckStateQueued) || r.httpPublished {
 		t.Fatalf("после Б3 = %+v, хочу queued/бит снят постановкой планировщика", r)
@@ -351,8 +360,8 @@ func TestHTTPPublishedBit_SpecTransitions(t *testing.T) {
 	}
 	countersVerifyEmpty(t, pool, "после Б3")
 
-	// Доставка 5: свежий эпизод с чистым битом публикует q:http БЕЗ
-	// подавления (смысл Б3) и завершается записью (Б2).
+	// Delivery 5: a fresh episode with a clean bit publishes q:http WITHOUT
+	// suppression (the point of B3) and finishes with the write (B2).
 	dom = httpBitFilter(ctx, t, pool, batch)
 	if dom.HTTPPublished {
 		t.Fatal("бит стоит после постановки — публикация эпизода была бы подавлена (нарушение Б3)")
@@ -372,29 +381,33 @@ func TestHTTPPublishedBit_SpecTransitions(t *testing.T) {
 	countersVerifyEmpty(t, pool, "после завершения эпизода 2")
 }
 
-// TestHTTPPublishedBit_MarkFailureNonFatal — отказ постановки бита (Б1)
-// не роняет эпизод: публикация уже состоялась (XADD прошёл), запись
-// результата доводит домен до done (спецификация Б1 — non-fatal, Warn
-// вместо ошибки); дубль q:http невозможен — done отсечён фильтром пачки,
-// окно «XADD без бита» закрывается записью; прочие биты сохранены.
+// TestHTTPPublishedBit_MarkFailureNonFatal — the B1 bit-setting failure
+// does not kill the episode: the publication already happened (XADD went
+// through), the result write carries the domain to done (the B1
+// specification — non-fatal, a Warn instead of an error); a q:http
+// duplicate is impossible — done is cut off by the batch filter, the "XADD
+// without the bit" window is closed by the write; other bits are
+// preserved.
 func TestHTTPPublishedBit_MarkFailureNonFatal(t *testing.T) {
 	skipUnlessIntegration(t)
-	pool := countersSchema(t) // общий хелпер пакета
+	pool := countersSchema(t) // a shared package helper
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	zone := countersSeedZone(t, pool, "fsm-bit-nf.test")
-	// countersSeedDomains нумерует метки: prefix "spec" → label "spec0".
+	// countersSeedDomains numbers the labels: prefix "spec" → label "spec0".
 	ids := countersSeedDomains(t, pool, zone, "spec", 1, model.CheckStateQueued, model.StatusNew)
 	id := ids[0]
 	const name = "spec0.fsm-bit-nf.test"
-	// Строка как после Р1 (queued, аренда начата) с «прочим битом» is_idn.
+	// The row as after R1 (queued, the lease started) with the "other bit"
+	// is_idn.
 	if _, err := pool.Exec(ctx,
 		"UPDATE domains SET flags = flags | $1, queued_at = now() WHERE zone_id = $2 AND id = $3",
 		int16(model.FlagIDN), zone, id); err != nil {
 		t.Fatalf("сеем is_idn/queued_at: %v", err)
 	}
-	// Ручная вставка мимо дельт — реконсиляция авторитет (точка отсчёта).
+	// A manual insert bypassing the deltas — the reconciliation is the
+	// authority (the baseline).
 	if _, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{}); err != nil {
 		t.Fatalf("реконсиляция: %v", err)
 	}

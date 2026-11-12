@@ -1,11 +1,11 @@
-// Интеграционные тесты применения add пачками (T-205, ТЗ 5.1/3.5):
-// курсор по PK staging режет партию на пачки по ingest.batch_size, всё
-// применение — одна транзакция. Проверяется против живого PostgreSQL:
-// файл больше нескольких пачек применяется полностью, счётчики зон
-// сходятся с прямыми подсчётами по domains, повторное применение той же
-// партии (та же — с тем же batch_id и строками) — no-op с нулевыми
-// дельтами. Изоляция — как у ingest_test.go: миграции в собственной
-// схеме (migratedSchema).
+// Integration tests of applying add in batches (T-205, spec 5.1/3.5): the
+// staging PK cursor cuts a batch into chunks of ingest.batch_size, the
+// whole application is one transaction. Checked against live PostgreSQL: a
+// file larger than several chunks is applied fully, the zone counters
+// converge with direct counts over domains, reapplying the same batch (the
+// same — with the same batch_id and rows) is a no-op with zero deltas.
+// Isolation — as in ingest_test.go: migrations in an own schema
+// (migratedSchema).
 package integration
 
 import (
@@ -18,19 +18,19 @@ import (
 	"crawler/internal/model"
 )
 
-// TestIngest_ApplyAddChunked — зона-less add-файл (стиль NRD-фида,
-// T-205) больше трёх пачек (BatchSize 4) применяется полностью:
-// все домены в БД, счётчики каждой зоны сходятся с прямыми подсчётами
-// по domains (дельты пачек накоплены и применены одним оператором).
+// TestIngest_ApplyAddChunked — a zone-less add file (the NRD feed style,
+// T-205) larger than three chunks (BatchSize 4) is applied fully: all
+// domains in the DB, each zone's counters converge with direct counts over
+// domains (the chunk deltas are accumulated and applied by one statement).
 func TestIngest_ApplyAddChunked(t *testing.T) {
 	skipUnlessIntegration(t)
-	env := newIngestEnv(t) // BatchSize 4: COPY и применение — пачками по 4
+	env := newIngestEnv(t) // BatchSize 4: the COPY and the application are in chunks of 4
 
-	// 11 доменов в двух зонах: 3 пачки применения (4 + 4 + 3). Зоны —
-	// реальные TLD (com/org): у zone-less файла зона строки — суффикс
-	// PSL (idn.Result.Zone), «crawl.test»/«walk.test» дали бы одну зону
-	// test с составными метками (проверено Normalize) — как и NRD-фид,
-	// файл смешивает зоны в одном списке.
+	// 11 domains in two zones: 3 application chunks (4 + 4 + 3). The zones
+	// are real TLDs (com/org): for a zone-less file the row zone is the
+	// PSL suffix (idn.Result.Zone); "crawl.test"/"walk.test" would give a
+	// single test zone with compound labels (checked with Normalize) —
+	// like the NRD feed, the file mixes zones in one list.
 	lines := make([]string, 0, 11)
 	for i := 1; i <= 6; i++ {
 		lines = append(lines, fmt.Sprintf("chunk%02d.com", i))
@@ -51,8 +51,8 @@ func TestIngest_ApplyAddChunked(t *testing.T) {
 		t.Errorf("доменов = %d, want 11 (ни одна пачка не потеряна)", n)
 	}
 
-	// Счётчики зон против прямых подсчётов: дельты пачек (total и pending)
-	// обязаны сойтись с реальностью — по одной зоне на строку каждой пачки.
+	// Zone counters against direct counts: the chunk deltas (total and
+	// pending) must converge with reality — one zone per row of each chunk.
 	rows, err := env.pool.Query(context.Background(), `
 		SELECT z.name, z.domains_total, z.domains_pending,
 		       (SELECT count(*) FROM domains AS d WHERE d.zone_id = z.id),
@@ -87,13 +87,13 @@ func TestIngest_ApplyAddChunked(t *testing.T) {
 		t.Errorf("зон = %d, want 2 (com, org)", seen)
 	}
 
-	// Партия покинула staging (применить → очистить, T-017).
+	// The batch has left staging (apply → clean up, T-017).
 	if n := env.countOf(t, "ingest_stage"); n != 0 {
 		t.Errorf("строк в ingest_stage = %d, want 0", n)
 	}
 }
 
-// zoneCounters — наблюдаемые счётчики всех зон (сравнение до/после).
+// zoneCounters — the observed counters of all zones (a before/after comparison).
 func (e *ingestEnv) zoneCounters(t *testing.T) map[int16][2]int64 {
 	t.Helper()
 	rows, err := e.pool.Query(context.Background(),
@@ -117,16 +117,16 @@ func (e *ingestEnv) zoneCounters(t *testing.T) map[int16][2]int64 {
 	return m
 }
 
-// TestIngest_ApplyAddReapplyNoop — повторное применение той же партии
-// (T-205, ТЗ 3.4): Stage с тем же batch_id затирает и копирует партию
-// заново, повторный ApplyAdd упирается в сплошные конфликты — Inserted 0,
-// дельты зон нулевые (счётчики не изменились), staging очищен.
+// TestIngest_ApplyAddReapplyNoop — reapplying the same batch (T-205, spec
+// 3.4): Stage with the same batch_id wipes and copies the batch again, the
+// repeated ApplyAdd runs into all-out conflicts — Inserted 0, the zone
+// deltas are zero (the counters unchanged), staging is cleaned.
 func TestIngest_ApplyAddReapplyNoop(t *testing.T) {
 	skipUnlessIntegration(t)
 	env := newIngestEnv(t)
 	ctx := context.Background()
 
-	// Зоны — как EnsureZone конвейера (T-014).
+	// The zones — as the pipeline's EnsureZone (T-014).
 	store := ingest.NewZoneStore(env.pool)
 	zc, err := ingest.EnsureZone(ctx, store, "crawl.test")
 	if err != nil {
@@ -137,7 +137,7 @@ func TestIngest_ApplyAddReapplyNoop(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Партия 10 строк в двух зонах пачками по 4 (3 пачки применения).
+	// A batch of 10 rows in two zones in chunks of 4 (3 application chunks).
 	id, err := ingest.NewBatchID()
 	if err != nil {
 		t.Fatal(err)
@@ -179,8 +179,8 @@ func TestIngest_ApplyAddReapplyNoop(t *testing.T) {
 	}
 	before := env.zoneCounters(t)
 
-	// Повторная загрузка той же партии тем же batch_id (перезапись
-	// staging) и повторное применение: всё уже в БД.
+	// Restaging the same batch with the same batch_id (overwriting staging)
+	// and reapplying: everything is already in the DB.
 	if _, err := stage(); err != nil {
 		t.Fatalf("Stage повторно: %v", err)
 	}

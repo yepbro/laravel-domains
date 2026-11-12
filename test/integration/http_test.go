@@ -1,25 +1,27 @@
-// Интеграционные тесты HTTP-этапа на тестовом стенде (T-060; ТЗ 11.2, §8,
-// 5.5): компоненты этапа 5 против живого стека testweb (Caddy) и mockserver
-// («злые» ответы, виртуальные хосты сценариев scenarios.yaml).
+// Integration tests of the HTTP stage on the test bench (T-060; spec 11.2,
+// §8, 5.5): stage 5 components against the live testweb (Caddy) and
+// mockserver stack ("nasty" responses, scenario virtual hosts of
+// scenarios.yaml).
 //
-// Уровень — компоненты конвейера, не сырой протокол: TestHTTP_TestwebScenarios
-// и TestHTTP_MockserverEvil (env_test.go) уже зафиксировали фикстуры и
-// эндпоинты обменами net/http; здесь те же сценарии прогоняются через
-// транспорт httpfetch (лимиты и анти-тарпит T-049, цепочки редиректов T-048,
-// TLS-атрибуты T-050, распаковка с потолком T-051) и воркер httpworker
-// (ProcessDomain + ContentSaver T-056 + Recorder T-058 — классификация
-// ошибок §8, варианты/алиасы T-054/T-055, SPA-вердикт T-057).
+// The level is pipeline components, not the raw protocol:
+// TestHTTP_TestwebScenarios and TestHTTP_MockserverEvil (env_test.go) have
+// already pinned the fixtures and endpoints by net/http exchanges; here the
+// same scenarios are run through the httpfetch transport (limits and
+// anti-tarpit T-049, redirect chains T-048, TLS attributes T-050, capped
+// decompression T-051) and the httpworker worker (ProcessDomain +
+// ContentSaver T-056 + Recorder T-058 — the error classification of §8,
+// variants/aliases T-054/T-055, the SPA verdict T-057).
 //
-// Сквозной минимум (как T-040 для DNS): задачи q:http по сценариям same-site
-// и bare→www через живые PostgreSQL/Redis: строки subdomain_results с
-// вариантами и алиасами, публикация q:analyze, refcount contents при
-// повторной доставке. Изоляция — схема migratedSchema и Redis БД 15
-// (resilienceRedisEnv) с очисткой q:* до/после.
+// The end-to-end minimum (as T-040 for DNS): q:http tasks for the same-site
+// and bare→www scenarios through live PostgreSQL/Redis: subdomain_results
+// rows with variants and aliases, publishing to q:analyze, contents refcount
+// on redelivery. Isolation — the migratedSchema schema and Redis DB 15
+// (resilienceRedisEnv) with q:* cleanup before/after.
 //
-// Время тестов — секунды: транспортные таймауты переопределены короткими
-// значениями (таблица лимитов ТЗ 5.5 настраивается), ответы стенда —
-// миллисекунды; медленные ветки (тарпит ~5 с, чёрная дыра ~3 с) — осознанные
-// ожидания классификации, а не фоновые задержки.
+// Test time is seconds: transport timeouts are overridden with short values
+// (the spec 5.5 limit table is configurable), bench answers are
+// milliseconds; the slow branches (tarpit ~5 s, black hole ~3 s) are
+// deliberate classification expectations, not background delays.
 package integration
 
 import (
@@ -45,22 +47,23 @@ import (
 	"crawler/internal/queue"
 )
 
-// httpBlackholeIP — адрес чёрной дыры стенда (closed-ports): TCP-диал
-// завершается EHOSTUNREACH за ~3 с (ARP без ответа) — детерминированная
-// ошибка сети, класс ErrNetwork → no_http.
+// httpBlackholeIP — the bench's black hole address (closed-ports): the TCP
+// dial ends with EHOSTUNREACH in ~3 s (no ARP reply) — a deterministic
+// network error, the ErrNetwork class → no_http.
 const httpBlackholeIP = "172.28.100.250"
 
-// httpTarpitSpeed/httpTarpitCap — параметры анти-тарпита для
-// TestHTTPFetch_Tarpit: скорость 8192 байт/с против отдачи mockserver
-// 512 байт/с и потолок 4 КиБ — сторож срабатывает за ~1 с (дедлайн
-// remain/speed = 500 мс < интервал порций 1 с), общий таймаут (20 с)
-// не успевает: проверяется именно механизм T-049.
+// httpTarpitSpeed/httpTarpitCap — the anti-tarpit parameters for
+// TestHTTPFetch_Tarpit: a speed of 8192 B/s against the mockserver's
+// 512 B/s output and a 4 KiB cap — the watchdog fires in ~1 s (the
+// remain/speed deadline = 500 ms < the 1 s chunk interval), the total
+// timeout (20 s) does not get there: it is the T-049 mechanism that is
+// tested.
 const (
 	httpTarpitSpeed = int64(8192)
 	httpTarpitCap   = int64(4096)
 )
 
-// httpFetchURL парсит URL сценария (ошибка — фатальна, имена фиксированы).
+// httpFetchURL parses a scenario URL (an error is fatal, the names are fixed).
 func httpFetchURL(t *testing.T, raw string) *url.URL {
 	t.Helper()
 	u, err := url.Parse(raw)
@@ -70,15 +73,15 @@ func httpFetchURL(t *testing.T, raw string) *url.URL {
 	return u
 }
 
-// httpTestFetcher — транспорт этапа с InsecureSkipVerify (ТЗ 5.5 п. 3) и
-// честным UA (§9) поверх тестовых параметров: mutate правит Options до
-// создания (таймауты, лимиты, резолвер). nil-мутация — дефолты таблицы
-// лимитов ТЗ 5.5.
+// httpTestFetcher — the stage transport with InsecureSkipVerify (spec 5.5
+// item 3) and an honest UA (§9) over the test parameters: mutate edits the
+// Options before creation (timeouts, limits, resolver). A nil mutation —
+// the defaults of the spec 5.5 limit table.
 func httpTestFetcher(t *testing.T, mutate func(*httpfetch.Options)) *httpfetch.Fetcher {
 	t.Helper()
 	opts := httpfetch.Options{
 		UserAgent:       config.DefaultUserAgent,
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // testbed, ТЗ 5.5 п. 3
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // testbed, spec 5.5 item 3
 		Limits:          &httpfetch.LimitOptions{},
 	}
 	if mutate != nil {
@@ -89,12 +92,13 @@ func httpTestFetcher(t *testing.T, mutate func(*httpfetch.Options)) *httpfetch.F
 	return f
 }
 
-// ---------------------------------------------------------------- транспорт
+// ---------------------------------------------------------------- transport
 
-// TestHTTPFetch_Tarpit — анти-тарпит T-049 (ТЗ 5.5 «мин. скорость после
-// первого байта», §8): mockserver отдаёт тело со скоростью 512 байт/с —
-// ниже минимальной; сторож закрывает соединение, чтение возвращается
-// ошибкой с тайм-классификацией (temp_error у потребителя, не «нет сайта»).
+// TestHTTPFetch_Tarpit — the T-049 anti-tarpit (spec 5.5 "min. speed after
+// the first byte", §8): mockserver serves the body at 512 B/s — below the
+// minimum; the watchdog closes the connection, the read returns an error
+// with the timeout classification (temp_error at the consumer, not "no
+// site").
 func TestHTTPFetch_Tarpit(t *testing.T) {
 	skipUnlessIntegration(t)
 	f := httpTestFetcher(t, func(o *httpfetch.Options) {
@@ -136,10 +140,11 @@ func TestHTTPFetch_Tarpit(t *testing.T) {
 	}
 }
 
-// TestHTTPFetch_HugeBody — потолок тела T-049 (ТЗ 5.5 «макс. размер
-// читаемого тела | 2 МБ», §8): mockserver заявляет Content-Length 1 ГиБ и
-// реально льёт сверх лимита — тело обрезается ровно на 2 МиБ, признак
-// Truncated, чтение без ошибки сети (данные частичны, не сбой).
+// TestHTTPFetch_HugeBody — the body cap of T-049 (spec 5.5 "max readable
+// body size | 2 MB", §8): mockserver declares Content-Length 1 GiB and
+// really pours beyond the limit — the body is cut exactly at 2 MiB, the
+// Truncated flag is set, the read has no network error (partial data, not
+// a failure).
 func TestHTTPFetch_HugeBody(t *testing.T) {
 	skipUnlessIntegration(t)
 	f := httpTestFetcher(t, nil)
@@ -170,10 +175,11 @@ func TestHTTPFetch_HugeBody(t *testing.T) {
 	}
 }
 
-// TestHTTPFetch_ZipBomb — потолок распаковки T-051 (ТЗ 5.5 «распаковка — с
-// ограничением размера», §8): бесконечный gzip-поток нулей распаковывается
-// не дальше MaxBodyBytes — ErrDecompressTooLarge. br-сценарий отсутствует:
-// mockserver отдаёт только gzip, testweb (Caddy) ответы не кодирует.
+// TestHTTPFetch_ZipBomb — the decompression cap of T-051 (spec 5.5
+// "decompression — with a size limit", §8): an infinite gzip stream of
+// zeros decompresses no further than MaxBodyBytes —
+// ErrDecompressTooLarge. There is no br scenario: mockserver serves only
+// gzip, testweb (Caddy) does not encode responses.
 func TestHTTPFetch_ZipBomb(t *testing.T) {
 	skipUnlessIntegration(t)
 	f := httpTestFetcher(t, nil)
@@ -194,10 +200,10 @@ func TestHTTPFetch_ZipBomb(t *testing.T) {
 	}
 }
 
-// TestHTTPChain_RedirectLoops — цепочки T-048 (ТЗ 5.5 п. 1, §8):
-// бесконечный редирект останавливается лимитом max_redirects, кольцо —
-// детектом цикла; обе причины — единая классификация ErrTooManyRedirects,
-// НЕ temp_error (постоянное свойство сайта, ТЗ 6.2).
+// TestHTTPChain_RedirectLoops — the T-048 chains (spec 5.5 item 1, §8):
+// an infinite redirect is stopped by the max_redirects limit, a ring — by
+// loop detection; both causes share the single ErrTooManyRedirects
+// classification, NOT temp_error (a permanent site property, spec 6.2).
 func TestHTTPChain_RedirectLoops(t *testing.T) {
 	skipUnlessIntegration(t)
 	f := httpTestFetcher(t, nil)
@@ -244,11 +250,12 @@ func TestHTTPChain_RedirectLoops(t *testing.T) {
 	})
 }
 
-// TestHTTPFetch_BadTLS — некорректные сертификаты (T-050; ТЗ 5.5 п. 3, §8):
-// коннект проходит (InsecureSkipVerify — нужен контент), атрибуты
-// сертификата сохранены, самостоятельная верификация даёт Valid=false с
-// типизированными причинами. Домены сценариев (tls-*.crawl.test, SNI) и
-// отладочные bad-tls-имена из env_test.go несут одно и то же свойство.
+// TestHTTPFetch_BadTLS — bad certificates (T-050; spec 5.5 item 3, §8):
+// the connect goes through (InsecureSkipVerify — the content is needed),
+// the certificate attributes are preserved, standalone verification gives
+// Valid=false with typed causes. The scenario domains (tls-*.crawl.test,
+// SNI) and the debug bad-tls names from env_test.go carry the same
+// property.
 func TestHTTPFetch_BadTLS(t *testing.T) {
 	skipUnlessIntegration(t)
 	f := httpTestFetcher(t, nil)
@@ -316,12 +323,13 @@ func TestHTTPFetch_BadTLS(t *testing.T) {
 	})
 }
 
-// ---------------------------------------------------------------- конвейер
+// ---------------------------------------------------------------- pipeline
 
-// httpWorkerEnv — конвейер воркера на живых PostgreSQL/Redis: изолированная
-// схема, очередь (публикация q:analyze), PackStore во временном каталоге и
-// цепочка OnResult как в сборке cmd/http-worker (T-056 → T-058). fetcher —
-// транспорт этапа (адаптируется тестом: таймауты, резолв).
+// httpWorkerEnv — the worker pipeline on live PostgreSQL/Redis: an isolated
+// schema, a queue (publishing to q:analyze), a PackStore in a temp directory
+// and an OnResult chain as in the cmd/http-worker build (T-056 → T-058).
+// The fetcher — the stage transport (adapted by the test: timeouts,
+// resolution).
 type httpWorkerEnv struct {
 	pool     *pgxpool.Pool
 	rdb      *redis.Client
@@ -332,7 +340,7 @@ type httpWorkerEnv struct {
 	worker   *httpworker.Worker
 }
 
-// httpWorkerSetup собирает env: mutate правит параметры транспорта.
+// httpWorkerSetup assembles the env: mutate edits the transport parameters.
 func httpWorkerSetup(t *testing.T, mutate func(*httpfetch.Options)) *httpWorkerEnv {
 	t.Helper()
 	pool := migratedSchema(t)
@@ -358,8 +366,9 @@ func httpWorkerSetup(t *testing.T, mutate func(*httpfetch.Options)) *httpWorkerE
 		t.Fatal(err)
 	}
 
-	// Резолв хостов редиректов — тем же резолвером DNS-этапа (ТЗ 5.5 п. 2,
-	// адаптер httpworker.DNSLookup + кэш, как в сборке cmd/http-worker).
+	// Redirect hosts are resolved by the same resolver as the DNS stage
+	// (spec 5.5 item 2, the httpworker.DNSLookup adapter + a cache, as in
+	// the cmd/http-worker build).
 	resolve := dnsEnv(t)
 	fetcher := httpTestFetcher(t, func(o *httpfetch.Options) {
 		o.Resolver = httpfetch.NewCachingResolver(
@@ -369,8 +378,8 @@ func httpWorkerSetup(t *testing.T, mutate func(*httpfetch.Options)) *httpWorkerE
 		}
 	})
 
-	// MaxRedirects — обязательный явный лимит: 0 в Options означает
-	// «не следовать» (T-053), а не дефолт.
+	// MaxRedirects — a mandatory explicit limit: 0 in Options means "do not
+	// follow" (T-053), not the default.
 	w, err := httpworker.New(httpworker.ChainFetch(fetcher), httpworker.Options{
 		MaxRedirects: httpfetch.DefaultMaxRedirects,
 		Store:        store,
@@ -384,10 +393,10 @@ func httpWorkerSetup(t *testing.T, mutate func(*httpfetch.Options)) *httpWorkerE
 	}
 }
 
-// process — эпизод домена целиком, как в processDelivery воркера:
-// ProcessDomain → сохранение контента (T-056) → запись результата и
-// публикация q:analyze (T-058). Возвращает результат с уже применённой
-// разметкой алиасов и нормализацией ContentSaver-а.
+// process — a full domain episode, as in the worker's processDelivery:
+// ProcessDomain → content saving (T-056) → result recording and
+// publishing to q:analyze (T-058). Returns the result with the alias
+// marking and ContentSaver normalization already applied.
 func (e *httpWorkerEnv) process(ctx context.Context, t *testing.T, task queue.HTTPTask) *httpworker.DomainResult {
 	t.Helper()
 	res, err := e.worker.ProcessDomain(ctx, task)
@@ -403,9 +412,9 @@ func (e *httpWorkerEnv) process(ctx context.Context, t *testing.T, task queue.HT
 	return res
 }
 
-// httpTask — задача q:http на домен с субдоменами «метка → адрес».
-// Порядок субдоменов детерминирован (по возрастанию id), как в задачах
-// DNS-этапа (T-039).
+// httpTask — a q:http task for a domain with "label → address" subdomains.
+// The subdomain order is deterministic (by ascending id), as in the DNS
+// stage tasks (T-039).
 func httpTask(zoneID int16, domainID int64, name string, subs map[int16]string) queue.HTTPTask {
 	task := queue.HTTPTask{ZoneID: zoneID, DomainID: domainID, Name: name}
 	for _, id := range []int16{0, 1} {
@@ -420,9 +429,10 @@ func httpTask(zoneID int16, domainID int64, name string, subs map[int16]string) 
 	return task
 }
 
-// httpScenarioAddr — адрес стенда для субдомена сценария: testweb для
-// фикстур Caddy, mockserver для «злых» ответов, чёрная дыра для
-// closed-ports (маршрутизация адресов — та же, что в зонах CoreDNS).
+// httpScenarioAddr — the bench address for a scenario subdomain: testweb
+// for the Caddy fixtures, mockserver for the "nasty" responses, the black
+// hole for closed-ports (the address routing is the same as in the CoreDNS
+// zones).
 func httpScenarioAddr(name, label string) string {
 	host := name
 	if label != "" {
@@ -440,7 +450,7 @@ func httpScenarioAddr(name, label string) string {
 	}
 }
 
-// httpSubdomainRow — строка subdomain_results для проверок.
+// httpSubdomainRow — a subdomain_results row for the checks.
 type httpSubdomainRow struct {
 	subdomainID    int16
 	variant        int16
@@ -453,8 +463,8 @@ type httpSubdomainRow struct {
 	errCode        *int16
 }
 
-// httpRows читает строки subdomain_results домена, отсортированные по
-// subdomain_id (порядок вставки не специфицирован).
+// httpRows reads a domain's subdomain_results rows sorted by subdomain_id
+// (the insertion order is unspecified).
 func httpRows(t *testing.T, pool *pgxpool.Pool, domainID int64) []httpSubdomainRow {
 	t.Helper()
 	rows, err := pool.Query(context.Background(),
@@ -480,7 +490,7 @@ func httpRows(t *testing.T, pool *pgxpool.Pool, domainID int64) []httpSubdomainR
 	return out
 }
 
-// httpDomainRow — состояние домена после эпизода.
+// httpDomainRow — the domain state after an episode.
 type httpDomainRow struct {
 	status        model.Status
 	checkState    int16
@@ -502,12 +512,13 @@ func httpDomainState(t *testing.T, pool *pgxpool.Pool, domainID int64) httpDomai
 	return r
 }
 
-// TestHTTPWorker_E2E — сквозной минимум HTTP-этапа (ТЗ 5.5 пп. 5–6, 9, §7;
-// как T-040 для DNS): задачи q:http по сценариям same-site (http→https на
-// один сайт — единственная запись variant 0) и bare→www (редирект на
-// субдомен — alias_kind 2, контент хранится один раз) через живые
-// PostgreSQL/Redis: строки subdomain_results, публикация q:analyze,
-// refcount contents при повторной доставке (at-least-once, ТЗ 3.4).
+// TestHTTPWorker_E2E — the end-to-end minimum of the HTTP stage (spec 5.5
+// items 5–6, 9, §7; as T-040 for DNS): q:http tasks for the same-site
+// (http→https to one site — a single variant 0 row) and bare→www (a
+// redirect to a subdomain — alias_kind 2, the content is stored once)
+// scenarios through live PostgreSQL/Redis: subdomain_results rows,
+// publishing to q:analyze, the contents refcount on redelivery
+// (at-least-once, spec 3.4).
 func TestHTTPWorker_E2E(t *testing.T) {
 	skipUnlessIntegration(t)
 	env := httpWorkerSetup(t, nil)
@@ -521,7 +532,7 @@ func TestHTTPWorker_E2E(t *testing.T) {
 		"SELECT id FROM zones WHERE name = $1", "crawl.test").Scan(&zoneID); err != nil {
 		t.Fatalf("зона crawl.test: %v", err)
 	}
-	// Хэш страницы bare-to-www для проверок contents.
+	// The bare-to-www page hash for the contents checks.
 	var pageHash *content.Hash
 
 	t.Run("same-site: один сайт — единственная запись variant 0", func(t *testing.T) {
@@ -552,9 +563,10 @@ func TestHTTPWorker_E2E(t *testing.T) {
 			t.Error("контент оригинала не сохраняется (StoreContent/ContentHash)")
 		}
 
-		// www.same-site не настроен в Caddy: https отклоняется по SNI, http
-		// отвечает пустой страницей — одна запись со схемой своей проверки
-		// («работает только один протокол», ТЗ 5.5 п. 5).
+		// www.same-site is not configured in Caddy: https is rejected by
+		// SNI, http answers with an empty page — a single row with the
+		// scheme of its own check ("only one protocol works", spec 5.5
+		// item 5).
 		www := res.Subdomains[1]
 		if len(www.Records) != 1 || www.Records[0].Scheme != model.SchemeHTTP {
 			t.Fatalf("записи www = %d, want 1 по http", len(www.Records))
@@ -600,7 +612,7 @@ func TestHTTPWorker_E2E(t *testing.T) {
 		h := *wrec.ContentHash
 		pageHash = &h
 
-		// Страница читается из хранилища (roundtrip, ТЗ 11.4 п. 3).
+		// The page is read from the store (a roundtrip, spec 11.4 item 3).
 		body, err := env.store.Get(ctx, h)
 		if err != nil {
 			t.Fatalf("Get контента: %v", err)
@@ -717,21 +729,22 @@ func TestHTTPWorker_E2E(t *testing.T) {
 	})
 }
 
-// TestHTTPWorker_EvilScenarios — «злые» ответы через конвейер воркера
-// (ТЗ §8, 5.5): классификация ошибок проверок и итоговые статусы доменов
-// по §7 — тарпит → temp_error (тайм-класс), чёрная дыра → no_http,
-// гигантское тело → обрезка без сохранения контента (T-056), zip-бомба и
-// бесконечный редирект → коды ErrBody/ErrRedirects без temp-класса,
-// SPA-оболочка → вердикт рендера (T-057), некорректные сертификаты →
-// загрузка + TLSInfo с причиной (T-050).
+// TestHTTPWorker_EvilScenarios — "nasty" responses through the worker
+// pipeline (spec §8, 5.5): the check error classification and the final
+// domain statuses per §7 — tarpit → temp_error (the timeout class), black
+// hole → no_http, a giant body → truncation without storing content
+// (T-056), a zip bomb and an infinite redirect → ErrBody/ErrRedirects
+// codes without the temp class, an SPA shell → the render verdict (T-057),
+// bad certificates → a load + TLSInfo with causes (T-050).
 func TestHTTPWorker_EvilScenarios(t *testing.T) {
 	skipUnlessIntegration(t)
-	// Тарпит на уровне конвейера обязан классифицироваться анти-тарпитом
-	// T-049 (limitBodySpeedError — тайм-класс → temp_error): потолок тела и
-	// мин. скорость ужаты, чтобы сторож сработал задолго до общего таймаута
-	// (в бою то же соотношение даёт потолок 2 МиБ против скоростей ниже
-	// 2 КиБ/с). Прочие сценарии ужатым потолком не затронуты: их ответы
-	// короче 4 КиБ или падают по своим лимитам (распаковка, редиректы).
+	// The pipeline-level tarpit must be classified by the T-049 anti-tarpit
+	// (limitBodySpeedError — the timeout class → temp_error): the body cap
+	// and the min. speed are squeezed so that the watchdog fires long
+	// before the total timeout (in production the same ratio gives a cap of
+	// 2 MiB against speeds below 2 KiB/s). The other scenarios are not
+	// affected by the squeezed cap: their responses are shorter than 4 KiB
+	// or fail on their own limits (decompression, redirects).
 	env := httpWorkerSetup(t, func(o *httpfetch.Options) {
 		o.TotalTimeout = 5 * time.Second
 		o.MaxBodyBytes = httpTarpitCap
@@ -755,8 +768,8 @@ func TestHTTPWorker_EvilScenarios(t *testing.T) {
 	for i, l := range labels {
 		byLabel[l] = ids[i]
 	}
-	// Все сценарии без www: один субдомен (апекс) — так объявлены в
-	// scenarios.yaml.
+	// All scenarios without www: one subdomain (the apex) — that is how
+	// they are declared in scenarios.yaml.
 	run := func(label string) *httpworker.DomainResult {
 		t.Helper()
 		name := label + ".crawl.test"

@@ -1,12 +1,12 @@
-// План статических адресов crawler_net (T-180): всем сервисам compose,
-// кроме одноразового run-контейнера tools, задан ipv4_address. Динамический
-// аллокатор Docker не резервирует адреса остановленных контейнеров, и сервис
-// без адреса воспроизводит гонку «Address already in use» (инциденты
-// 2026-10-23/24 — tasks/tasks.md, этап 28). Тест держит инварианты плана
-// (docs/docker.md §8): новый долгоживущий сервис обязан получить адрес;
-// адреса уникальны и лежат в подсети, захардкоженной у потребителей
-// (unbound, testbedgen, config.dev.yaml, интеграционные тесты); .250 —
-// «чёрная дыра» сценариев закрытых портов.
+// Static address plan for crawler_net (T-180): every compose service except
+// the one-off tools run container has an ipv4_address. Docker's dynamic
+// allocator does not reserve addresses of stopped containers, so a service
+// without an address reproduces the "Address already in use" race
+// (incidents of 2026-10-23/24 — tasks/tasks.md, stage 28). The test keeps
+// the plan invariants (docs/docker.md §8): a new long-lived service must
+// get an address; addresses are unique and lie within the subnet hardcoded
+// at consumers (unbound, testbedgen, config.dev.yaml, integration tests);
+// .250 is the "black hole" reserved for closed-port scenarios.
 package integration
 
 import (
@@ -20,8 +20,8 @@ import (
 
 type composeFile struct {
 	Services map[string]struct {
-		// list (динамический attach из якоря x-go-common) или map
-		// с ipv4_address — различаются после резолва YAML-якорей.
+		// a list (dynamic attach from the x-go-common anchor) or a map
+		// with ipv4_address — they differ after YAML anchor resolution.
 		Networks any `yaml:"networks"`
 	} `yaml:"services"`
 	Networks map[string]struct {
@@ -33,8 +33,8 @@ type composeFile struct {
 	} `yaml:"networks"`
 }
 
-// staticIP возвращает ipv4_address сервиса в crawler_net; пустая строка —
-// адрес не задан (динамический).
+// staticIP returns the service's ipv4_address in crawler_net; an empty
+// string means no address is set (dynamic allocation).
 func staticIP(v any) string {
 	m, ok := v.(map[string]any)
 	if !ok {
@@ -61,8 +61,8 @@ func TestComposeStaticAddressPlan(t *testing.T) {
 		t.Fatal("compose.yaml: не прочитаны сервисы")
 	}
 
-	// Подсеть зафиксирована у потребителей — смена это отдельная задача
-	// (список мест — docs/docker.md §7, «pool overlaps»).
+	// The subnet is pinned at consumers — changing it is a separate task
+	// (the list of places — docs/docker.md §7, "pool overlaps").
 	subnetStr := ""
 	for _, cfg := range f.Networks["crawler_net"].IPAM.Config {
 		subnetStr = cfg.Subnet
@@ -80,9 +80,9 @@ func TestComposeStaticAddressPlan(t *testing.T) {
 	for name, svc := range f.Services {
 		ipStr := staticIP(svc.Networks)
 		if name == "tools" {
-			// Исключение плана (T-180): одноразовые run-прогоны идут
-			// параллельно из worktree'ов в ту же сеть — общий адрес
-			// конфликтовал бы между ними.
+			// Plan exception (T-180): one-off runs go in parallel
+			// from worktrees into the same network — a shared address
+			// would conflict between them.
 			if ipStr != "" {
 				t.Errorf("tools: статический адрес %s запрещён (параллельные run-контейнеры, T-180)", ipStr)
 			}

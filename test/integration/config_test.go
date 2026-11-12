@@ -1,6 +1,6 @@
-// Конфигурация сервисов в dev-окружении (T-006): deploy/docker/config.dev.yaml,
-// смонтированный в контейнеры как /etc/crawler/config.yaml (CRAWLER_CONFIG),
-// вместе с переопределениями из compose (APP_PG_DSN, CRAWLER_HTTP_USER_AGENT).
+// Service configuration in the dev environment (T-006): deploy/docker/config.dev.yaml
+// mounted into containers as /etc/crawler/config.yaml (CRAWLER_CONFIG),
+// together with overrides from compose (APP_PG_DSN, CRAWLER_HTTP_USER_AGENT).
 package integration
 
 import (
@@ -21,11 +21,11 @@ func TestConfigDevEnvironment(t *testing.T) {
 		t.Fatalf("config.Load: %v", err)
 	}
 
-	// DSN приходит из устаревшей APP_PG_DSN (compose), а не из YAML.
+	// The DSN comes from the deprecated APP_PG_DSN (compose), not from YAML.
 	if want := os.Getenv("APP_PG_DSN"); want == "" || cfg.Postgres.DSN != want {
 		t.Errorf("postgres.dsn: ожидается DSN из APP_PG_DSN (%q), получен %q", want, cfg.Postgres.DSN)
 	}
-	// Остальные адреса — из config.dev.yaml (статические IP crawler_net).
+	// The remaining addresses come from config.dev.yaml (static crawler_net IPs).
 	if cfg.Redis.Addr != "172.28.100.3:6379" {
 		t.Errorf("redis.addr: ожидается 172.28.100.3:6379, получено %q", cfg.Redis.Addr)
 	}
@@ -45,8 +45,8 @@ func TestConfigDevEnvironment(t *testing.T) {
 		t.Errorf("http.user_agent: ожидается честный UA с контактами, получено %q", ua)
 	}
 
-	// Сам файл compose-окружения валиден и без переопределений окружения
-	// (DSN в нём по умолчанию заменяется на APP_PG_DSN выше).
+	// The compose environment file itself is valid even without environment
+	// overrides (its default DSN is replaced by APP_PG_DSN above).
 	fileCfg, err := config.LoadFile("/etc/crawler/config.yaml")
 	if err != nil {
 		t.Fatalf("config.LoadFile(/etc/crawler/config.yaml): %v", err)
@@ -55,11 +55,11 @@ func TestConfigDevEnvironment(t *testing.T) {
 		t.Errorf("config.dev.yaml: неожиданные значения: redis=%q monitor=%q", fileCfg.Redis.Addr, fileCfg.Monitor.Listen)
 	}
 
-	// Секция dashboard (T-131): listen — docker-сеть (наружу публикует
-	// compose-сервис dashboard на 127.0.0.1:DASHBOARD_PORT хоста), креды —
-	// dev admin/admin (docs/dev-environment.md), пробы — имена
-	// compose-сервисов с их METRICS_PORT (METRICS_ADDR=:91xx в compose —
-	// тот же адрес, что скрейпит Prometheus).
+	// The dashboard section (T-131): listen is the docker network (the compose
+	// dashboard service publishes it externally at 127.0.0.1:DASHBOARD_PORT on
+	// the host), credentials are dev admin/admin (docs/dev-environment.md),
+	// probes are compose service names with their METRICS_PORT
+	// (METRICS_ADDR=:91xx in compose — the same address Prometheus scrapes).
 	if fileCfg.Dashboard.Listen != ":8090" {
 		t.Errorf("dashboard.listen: ожидается :8090 (интерфейсы docker-сети), получено %q", fileCfg.Dashboard.Listen)
 	}
@@ -84,7 +84,7 @@ func TestConfigDevEnvironment(t *testing.T) {
 		t.Errorf("dashboard.probes: ожидается карта compose-сервисов с их METRICS_PORT %v, получено %v", wantProbes, fileCfg.Dashboard.Probes)
 	}
 
-	// Пример из репозитория валиден целиком (config.example.yaml, T-006).
+	// The repository example is valid as a whole (config.example.yaml, T-006).
 	if _, err := config.LoadFile("/src/config.example.yaml"); err != nil {
 		t.Errorf("config.example.yaml должен проходить валидацию: %v", err)
 	}

@@ -1,8 +1,9 @@
-// Интеграционные тесты dev-окружения на testbed (ТЗ 11).
+// Integration tests of the dev environment on the testbed (spec 11).
 //
-// Запускаются только при CRAWLER_INTEGRATION=1 (make test-integration):
-// проверяют DNS-сценарии, HTTP-фикстуры, «злые» ответы mockserver,
-// TLS-сценарии, доступность БД/Redis/Chromium и изоляцию от интернета.
+// Run only when CRAWLER_INTEGRATION=1 (make test-integration): they check
+// DNS scenarios, HTTP fixtures, "nasty" mockserver responses, TLS
+// scenarios, DB/Redis/Chromium availability, and isolation from the
+// internet.
 package integration
 
 import (
@@ -30,7 +31,7 @@ const (
 	testwebIP    = "172.28.100.12"
 	mockserverIP = "172.28.100.13"
 	redisAddr    = "172.28.100.3:6379"
-	// DevTools нового Chromium отклоняет не-IP Host, поэтому обращаемся по IP.
+	// DevTools of the new Chromium rejects a non-IP Host, so we address it by IP.
 	chromiumURL = "http://172.28.100.14:9222/json/version"
 )
 
@@ -161,9 +162,9 @@ func TestDNS_TestbedScenarios(t *testing.T) {
 	})
 }
 
-// Изоляция стенда (ТЗ 11.2): сервисы не резолвят внешние домены
-// в режиме testbed (критерий приёмки 5 — таблицы laravel_*,
-// TestAccept05; этот тест — про изоляцию DNS).
+// Bench isolation (spec 11.2): services do not resolve external domains
+// in testbed mode (acceptance criterion 5 — the laravel_* tables,
+// TestAccept05; this test is about DNS isolation).
 func TestDNS_NoInternetInTestbed(t *testing.T) {
 	skipUnlessIntegration(t)
 	for _, name := range []string{"example.com", "google.com", "ya.ru"} {
@@ -180,9 +181,8 @@ func TestDNS_NoInternetInTestbed(t *testing.T) {
 
 // ---------------------------------------------------------------- HTTP
 
-// clientTo возвращает клиент, который соединяется с фиксированным IP
-// (как это делает http-worker после собственного резолва), сохраняя
-// Host/SNI из URL.
+// clientTo returns a client that connects to a fixed IP (as http-worker
+// does after its own resolution) while keeping Host/SNI from the URL.
 func clientTo(ip string, insecure bool, extra func(*http.Transport)) *http.Client {
 	tr := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -277,7 +277,7 @@ func TestHTTP_TestwebScenarios(t *testing.T) {
 	})
 
 	t.Run("bare→www редирект", func(t *testing.T) {
-		client := &http.Client{Transport: c.Transport.(*http.Transport)} //nolint:forcetypeassert // наш транспорт
+		client := &http.Client{Transport: c.Transport.(*http.Transport)} //nolint:forcetypeassert // our transport
 		client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 		resp, err := client.Get("http://bare-to-www.crawl.test/")
 		if err != nil {
@@ -436,7 +436,7 @@ func TestHTTP_MockserverEvil(t *testing.T) {
 	t.Run("zip-бомба ограничивается при распаковке", func(t *testing.T) {
 		client := clientTo(mockserverIP, true, nil)
 		req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, base+"/zipbomb", nil)
-		req.Header.Set("Accept-Encoding", "gzip") // берём сырой gzip, разжимаем сами
+		req.Header.Set("Accept-Encoding", "gzip") // we take the raw gzip and decompress it ourselves
 		resp, err := client.Do(req)
 		if err != nil {
 			t.Fatal(err)
@@ -504,7 +504,7 @@ func TestTLS_BadCertificates(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------- инфраструктура
+// ---------------------------------------------------------------- infrastructure
 
 func TestInfra_Postgres(t *testing.T) {
 	skipUnlessIntegration(t)

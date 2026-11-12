@@ -1,34 +1,37 @@
-// Сквозной интеграционный тест конвейера (T-091; ТЗ 11.2 «Сквозной прогон:
-// файл в incoming → записи в БД → результаты → laravel_*», критерий приёмки
-// 11.4 п. 5; устойчивость к перезапуску PostgreSQL — ТЗ 11.2 «Устойчивость»,
-// суть критерия 11.4 п. 9 для БД).
+// An end-to-end integration test of the pipeline (T-091; spec 11.2 "End-to-end
+// run: a file in incoming → DB rows → results → laravel_*", acceptance
+// criterion 11.4 item 5; resilience to a PostgreSQL restart — spec 11.2
+// "Resilience", the essence of criterion 11.4 item 9 for the DB).
 //
-// Уровень — библиотечные вызовы компонентов всех этапов против живого стека
-// (PostgreSQL, Redis, unbound → coredns, testweb), без запуска
-// сервисов-процессов: каждая стадия гоняется тем же кодом, что и сборки
-// cmd/* — файл → ingest.Pipeline → планировщик (DispatchBatch/EnqueueBatch,
-// q:dns) → DNS-эпизоды (dnsworker.ProcessDomain, q:http) → HTTP-эпизоды
+// The level is library calls of the components of all stages against the live
+// stack (PostgreSQL, Redis, unbound → coredns, testweb), without starting
+// service processes: every stage runs the same code as the cmd/* builds —
+// file → ingest.Pipeline → scheduler (DispatchBatch/EnqueueBatch,
+// q:dns) → DNS episodes (dnsworker.ProcessDomain, q:http) → HTTP episodes
 // (httpworker.ProcessDomain + ContentSaver + Recorder → subdomain_results,
 // q:analyze) → analyzer.ProcessResult → laravel_findings/laravel_domains.
-// Прежний e2e-минимум HTTP-этапа (TestHTTPWorker_E2E, T-060) не
-// дублируется: здесь он звено полной цепочки; ожидания анализа сверяются
-// с образцами testdata/laravel-samples (meta.yaml, та же сверка, что в
-// корпусе T-075): testbed отдаёт образцы с тех же headers/cookies/index.
+// The former HTTP-stage e2e minimum (TestHTTPWorker_E2E, T-060) is not
+// duplicated: here it is a link of the full chain; the analysis expectations
+// are checked against the testdata/laravel-samples samples (meta.yaml, the
+// same cross-check as in the T-075 corpus): the testbed serves the samples
+// with the same headers/cookies/index.
 //
-// Перезапуск PostgreSQL посреди конвейера: контейнер БД принадлежит общему
-// dev-стеку — рестарт инстанса из теста невозможен (задел бы параллельные
-// прогоны и запущенные сервисы). Эмуляция по существу §11.2: с точки зрения
-// клиентов перезапуск — обрыв всех соединений при выживших данных.
-// pg_terminate_backend по метке application_name (DSN пула теста) закрывает
-// сокеты соединений теста, pgxpool заменяет их новыми при следующем
-// обращении — конвейер продолжает с того же места, итоги сходятся. Права:
-// роль может завершать собственные бэкенды (проверено на dev-стеке),
-// соединения чужих сервисов (без метки) не затрагиваются. Потеря Redis и
-// остановка воркера посреди пачки — территория resilience_test.go (T-032).
+// A PostgreSQL restart in the middle of the pipeline: the DB container
+// belongs to the shared dev stack — restarting the instance from a test is
+// impossible (it would hit parallel runs and running services). The
+// emulation matches §11.2 in essence: from the clients' point of view a
+// restart is the loss of all connections with the data surviving.
+// pg_terminate_backend by the application_name label (the test pool's DSN)
+// closes the sockets of the test's connections, pgxpool replaces them with
+// new ones on the next use — the pipeline continues from the same place and
+// the totals converge. Permissions: a role may terminate its own backends
+// (verified on the dev stack); the connections of other services (unlabeled)
+// are not touched. Redis loss and a worker stopping in the middle of a batch
+// — the territory of resilience_test.go (T-032).
 //
-// Изоляция — как у соседей: изолированная схема с миграциями
-// (withTestSchema), Redis БД 15 (resilienceRedisEnv) с очисткой q:* до/после,
-// incoming и каталог контента — t.TempDir.
+// Isolation — as with the neighbors: an isolated schema with migrations
+// (withTestSchema), Redis DB 15 (resilienceRedisEnv) with q:* cleanup
+// before/after, incoming and the content directory — t.TempDir.
 package integration
 
 import (
@@ -62,24 +65,25 @@ import (
 	"crawler/internal/scheduler"
 )
 
-// e2eAppName помечает соединения пула теста в pg_stat_activity — адресат
-// обрыва при эмуляции перезапуска PostgreSQL (см. комментарий файла).
+// e2eAppName marks the test pool's connections in pg_stat_activity — the
+// target of the disconnect in the PostgreSQL restart emulation (see the
+// file comment).
 const e2eAppName = "it-e2e-t091"
 
-// Группы потребителей стримов уникальны для теста: БД Redis 15 вычищается
-// до/после, но имена не пересекаются с соседними тестами и повторными
-// прогонами в одном окружении.
+// The stream consumer groups are unique to the test: Redis DB 15 is cleaned
+// up before/after, but the names do not clash with neighboring tests and
+// repeated runs in one environment.
 const (
 	e2eDNSGroup       = "it-e2e-dns"
 	e2eHTTPGroup      = "it-e2e-http"
 	e2eAnalyzeGroup   = "it-e2e-an"
 	e2eZone           = "crawl.test"
-	e2eScoreTolerance = 0.001 // float4 в БД (как допуск корпуса T-075)
+	e2eScoreTolerance = 0.001 // float4 in the DB (like the T-075 corpus tolerance)
 )
 
-// e2eSchema — изолированная схема с миграциями (как migratedSchema), но пул
-// помечен application_name: соединения теста адресуемы в pg_stat_activity
-// для эмуляции перезапуска PostgreSQL.
+// e2eSchema — an isolated schema with migrations (like migratedSchema), but
+// the pool is labeled application_name: the test's connections are
+// addressable in pg_stat_activity for the PostgreSQL restart emulation.
 func e2eSchema(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	dsn, cleanup := withTestSchema(t)
@@ -96,9 +100,10 @@ func e2eSchema(t *testing.T) *pgxpool.Pool {
 	return pool
 }
 
-// e2eEnv — конвейер всех этапов на живых PostgreSQL/Redis/testbed: те же
-// компоненты и связки, что в сборках cmd/* (fetcher — как у httpWorkerSetup,
-// T-060; анализатор — Reloader правил, как cmd/analyzer).
+// e2eEnv — the pipeline of all stages on live PostgreSQL/Redis/testbed: the
+// same components and wiring as in the cmd/* builds (the fetcher — as in
+// httpWorkerSetup, T-060; the analyzer — a rules Reloader, as in
+// cmd/analyzer).
 type e2eEnv struct {
 	pool     *pgxpool.Pool
 	rdb      *redis.Client
@@ -137,8 +142,8 @@ func newE2EEnv(t *testing.T) *e2eEnv {
 		t.Fatal(err)
 	}
 
-	// Транспорт этапа — как в сборке cmd/http-worker: резолв хостов
-	// редиректов тем же резолвером DNS-этапа (ТЗ 5.5 п. 2).
+	// The stage transport — as in the cmd/http-worker build: redirect hosts
+	// are resolved by the same resolver as the DNS stage (spec 5.5 item 2).
 	resolve := dnsEnv(t)
 	fetcher := httpTestFetcher(t, func(o *httpfetch.Options) {
 		o.Resolver = httpfetch.NewCachingResolver(
@@ -152,10 +157,11 @@ func newE2EEnv(t *testing.T) *e2eEnv {
 		t.Fatal(err)
 	}
 
-	// Набор правил — рабочий rules/. Приоритет: APP_RULES_DIR (если каталог
-	// существует — контейнеры сервисов), иначе путь от каталога теста к корню
-	// репозитория (tools монтирует правила в /rules, а унаследованный из
-	// go-common APP_RULES_DIR=/etc/crawler/rules в tools не смонтирован).
+	// The rule set is the working rules/. Priority: APP_RULES_DIR (when the
+	// directory exists — the service containers), otherwise the path from
+	// the test directory to the repository root (tools mounts the rules at
+	// /rules, and the go-common-inherited
+	// APP_RULES_DIR=/etc/crawler/rules is not mounted in tools).
 	rulesDir := os.Getenv("APP_RULES_DIR")
 	if dir := rulesDir; dir != "" {
 		if _, err := os.Stat(dir); err != nil {
@@ -183,11 +189,11 @@ func newE2EEnv(t *testing.T) *e2eEnv {
 	}
 }
 
-// e2eSample — ожидания образца testdata/laravel-samples/<label> (meta.yaml;
-// testbed подключает образцы доменами <label>.crawl.test): score — noisy-OR
-// весов сработавших правил, verMin/verMax — точные строки вычисленного
-// диапазона ("" — границы нет, в БД NULL), rules — полный состав
-// срабатываний, title — маркер контента страницы.
+// e2eSample — the expectations of the testdata/laravel-samples/<label>
+// sample (meta.yaml; the testbed serves the samples as <label>.crawl.test
+// domains): score — the noisy-OR of the fired rule weights, verMin/verMax —
+// the exact strings of the computed range ("" — no bound, NULL in the DB),
+// rules — the full set of hits, title — the page content marker.
 type e2eSample struct {
 	label     string
 	title     string
@@ -198,9 +204,9 @@ type e2eSample struct {
 	rules     []string
 }
 
-// e2eSamples — образцы, подключённые testbed-генератором в master: два
-// позитивных Laravel и два негативных (слабое срабатывание symfony и
-// чистый django) — отрицательные фиксируют порог is_laravel (§13.1).
+// e2eSamples — the samples connected by the testbed generator in master:
+// two positive Laravel and two negative ones (a weak symfony hit and a
+// clean django) — the negatives pin the is_laravel threshold (§13.1).
 var e2eSamples = []e2eSample{
 	{
 		label: "laravel-11-vite", title: "Laravel Vite App",
@@ -230,11 +236,11 @@ var e2eSamples = []e2eSample{
 	},
 }
 
-// e2eBreakPostgresConnections — эмуляция перезапуска PostgreSQL (ТЗ 11.2):
-// обрывает все соединения теста (метка application_name) кроме исполняющего.
-// Возвращает число оборванных бэкендов. Одноразовое соединение-«киллер»
-// без метки само под фильтр не попадает; соединения работающих сервисов
-// стека (метки не имеют) не затрагиваются.
+// e2eBreakPostgresConnections — the PostgreSQL restart emulation (spec
+// 11.2): drops all test connections (the application_name label) except the
+// executing one. Returns the number of dropped backends. The one-off
+// "killer" connection without a label does not hit the filter itself; the
+// connections of the running stack services (unlabeled) are not touched.
 func e2eBreakPostgresConnections(t *testing.T) int {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -254,10 +260,10 @@ func e2eBreakPostgresConnections(t *testing.T) int {
 	return killed
 }
 
-// e2eWaitPoolRecovery ждёт переподключения пула после обрыва: мёртвые
-// соединения высвобождаются неудачными обращениями, новые создаются лениво
-// (pgxpool) — цикл пингов до первого успеха и есть «переподключение после
-// рестарта» с точки зрения клиента.
+// e2eWaitPoolRecovery waits for the pool to reconnect after the drop: dead
+// connections are released by failed uses, new ones are created lazily
+// (pgxpool) — the ping loop until the first success is "reconnection after
+// the restart" from the client's point of view.
 func e2eWaitPoolRecovery(t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
 	deadline := time.Now().Add(20 * time.Second)
@@ -275,19 +281,19 @@ func e2eWaitPoolRecovery(t *testing.T, pool *pgxpool.Pool) {
 	}
 }
 
-// e2eSignal — запись signals jsonb (contract T-071).
+// e2eSignal — a signals jsonb row (contract T-071).
 type e2eSignal struct {
 	Rule string `json:"rule"`
 }
 
-// e2eHash — content.Hash ([16]byte) из слайса, прочитанного из БД.
+// e2eHash — a content.Hash ([16]byte) from a slice read from the DB.
 func e2eHash(b []byte) content.Hash {
 	var h content.Hash
 	copy(h[:], b)
 	return h
 }
 
-// e2eStr — строка или NULL → "".
+// e2eStr — a string or NULL → "".
 func e2eStr(p *string) string {
 	if p == nil {
 		return ""
@@ -295,19 +301,21 @@ func e2eStr(p *string) string {
 	return *p
 }
 
-// TestE2E_FileToLaravel — полный конвейер «файл в incoming → laravel_*»
-// (ТЗ 11.2, критерий 11.4 п. 5) с перезапуском PostgreSQL посреди
-// (между DNS- и HTTP-этапами): после обрыва соединений конвейер
-// доделывает эпизоды, итоги в БД сходятся с ожиданиями образцов.
+// TestE2E_FileToLaravel — the full pipeline "a file in incoming →
+// laravel_*" (spec 11.2, criterion 11.4 item 5) with a PostgreSQL restart
+// in the middle (between the DNS and HTTP stages): after the connection
+// drop the pipeline finishes the episodes, and the DB totals converge with
+// the sample expectations.
 func TestE2E_FileToLaravel(t *testing.T) {
 	skipUnlessIntegration(t)
 	env := newE2EEnv(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
-	// ---------------------------------------------------------------- вход
-	// Реальный файл в incoming (ТЗ 5.1): зона создаётся автоматически,
-	// строки — домены; конвейер — тот же, что в cmd/ingest.
+	// ---------------------------------------------------------------- input
+	// A real file in incoming (spec 5.1): the zone is created
+	// automatically, the lines are domains; the pipeline is the same as in
+	// cmd/ingest.
 	dir := t.TempDir()
 	pipe, err := ingest.NewPipeline(
 		ingest.NewZoneStore(env.pool),
@@ -327,13 +335,13 @@ func TestE2E_FileToLaravel(t *testing.T) {
 	for _, s := range e2eSamples {
 		lines = append(lines, s.label+"."+e2eZone)
 	}
-	lines = append(lines, "") // пустая строка — пропускается парсером
+	lines = append(lines, "") // an empty line — skipped by the parser
 	if err := os.WriteFile(file, []byte(fileContent(lines...)), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	// zoneID заполняет ingest-подтест (зона создаётся при применении
-	// файла) — следующие стадии используют его для выборок.
+	// zoneID is filled by the ingest subtest (the zone is created when the
+	// file is applied) — the following stages use it for queries.
 	var zoneID int16
 
 	t.Run("ingest: файл → зоны, домены, отчёт", func(t *testing.T) {
@@ -371,7 +379,7 @@ func TestE2E_FileToLaravel(t *testing.T) {
 		).Scan(&linesTotal, &added, &rejected); err != nil {
 			t.Fatalf("чтение ingest_files: %v", err)
 		}
-		// 6 физических строк: комментарий, 4 домена, пустая; применены 4.
+		// 6 physical lines: a comment, 4 domains, an empty one; 4 applied.
 		if linesTotal != 6 || added != int64(len(e2eSamples)) || rejected != 0 {
 			t.Errorf("ingest_files: lines=%d added=%d rejected=%d, хочу 6/%d/0",
 				linesTotal, added, len(e2eSamples), rejected)
@@ -414,8 +422,9 @@ func TestE2E_FileToLaravel(t *testing.T) {
 		if len(deliveries) != 1 {
 			t.Fatalf("доставок q:dns: %d, хочу 1", len(deliveries))
 		}
-		// Пачка — как processBatch воркера (T-039): справочник субдоменов
-		// → фильтр актуальности → эпизоды; XACK после записи (Processing).
+		// The batch — as the worker's processBatch (T-039): the subdomain
+		// reference table → the freshness filter → episodes; XACK after the
+		// write (Processing).
 		err := queue.Processing(ctx, env.q, e2eDNSGroup, deliveries[0],
 			func(c context.Context, d queue.Delivery) error {
 				b, err := queue.Decode[queue.DNSBatch](d)
@@ -447,9 +456,10 @@ func TestE2E_FileToLaravel(t *testing.T) {
 			t.Fatalf("пачка q:dns: %v", err)
 		}
 
-		// Все эпизоды завершены: done, lease сброшен, маска — только
-		// апекс (у образцов нет записей www/admin/…, §5.4 п. 4);
-		// терминального статуса нет — итог за HTTP-этапом (§7).
+		// All episodes are finished: done, the lease is reset, the mask is
+		// the apex only (the samples have no www/admin/… records, §5.4
+		// item 4); no terminal status — the verdict belongs to the HTTP
+		// stage (§7).
 		for _, s := range e2eSamples {
 			var (
 				status   model.Status
@@ -482,9 +492,9 @@ func TestE2E_FileToLaravel(t *testing.T) {
 	})
 
 	t.Run("перезапуск PostgreSQL посреди конвейера", func(t *testing.T) {
-		// Гарантируем пулу ≥2 живых соединения к моменту обрыва: два
-		// параллельных запроса держат два физических соединения и
-		// возвращают их в пул живыми.
+		// Guarantee the pool ≥2 live connections at the moment of the drop:
+		// two parallel queries hold two physical connections and return
+		// them to the pool alive.
 		var wg sync.WaitGroup
 		for i := 0; i < 2; i++ {
 			wg.Add(1)
@@ -502,12 +512,13 @@ func TestE2E_FileToLaravel(t *testing.T) {
 			t.Fatalf("оборвано соединений: %d, хочу ≥ 2 (два параллельных запроса перед обрывом)", killed)
 		}
 
-		// Клиент переподключается: мёртвые соединения высвобождаются,
-		// пул лениво создаёт новые (суть устойчивости, §11.4 п. 9).
+		// The client reconnects: dead connections are released, the pool
+		// lazily creates new ones (the essence of resilience, §11.4 item 9).
 		e2eWaitPoolRecovery(t, env.pool)
 
-		// Данные и очередь пережили сбой: конвейер продолжается с того
-		// же места (источник истины PostgreSQL, ТЗ 3.4; Redis не тронут).
+		// The data and the queue survived the failure: the pipeline
+		// continues from the same place (PostgreSQL is the source of truth,
+		// spec 3.4; Redis is untouched).
 		if n := countDomains(t, env.pool, ""); n != len(e2eSamples) {
 			t.Errorf("доменов после обрыва: %d, хочу %d", n, len(e2eSamples))
 		}
@@ -524,8 +535,8 @@ func TestE2E_FileToLaravel(t *testing.T) {
 		if len(tasks) != len(e2eSamples) {
 			t.Fatalf("задач q:http: %d, хочу %d", len(tasks), len(e2eSamples))
 		}
-		// Эпизод — как processDelivery воркера (T-053): ProcessDomain →
-		// ContentSaver (T-056) → Recorder (T-058) → XACK.
+		// The episode — as the worker's processDelivery (T-053):
+		// ProcessDomain → ContentSaver (T-056) → Recorder (T-058) → XACK.
 		for _, d := range tasks {
 			err := queue.Processing(ctx, env.q, e2eHTTPGroup, d,
 				func(c context.Context, del queue.Delivery) error {
@@ -558,7 +569,7 @@ func TestE2E_FileToLaravel(t *testing.T) {
 			id := env.domainID(t, zoneID, s.label)
 			name := s.label + "." + e2eZone
 
-			// Домен alive/done (§7), lease завершён.
+			// The domain is alive/done (§7), the lease is finished.
 			st := httpDomainState(t, env.pool, id)
 			if st.status != model.StatusAlive {
 				t.Errorf("%s: status = %s, хочу alive", name, st.status)
@@ -568,8 +579,8 @@ func TestE2E_FileToLaravel(t *testing.T) {
 					name, st.checkState, st.queuedAt, st.tempAttempts)
 			}
 
-			// Образцы отвечают одинаково по http и https → единственная
-			// запись variant 0 https (ТЗ 5.5 п. 5), контент сохранён.
+			// The samples respond identically over http and https → a single
+			// variant 0 https row (spec 5.5 item 5), the content is stored.
 			rows := httpRows(t, env.pool, id)
 			if len(rows) != 1 {
 				t.Fatalf("%s: строк subdomain_results = %d, хочу 1", name, len(rows))
@@ -596,8 +607,8 @@ func TestE2E_FileToLaravel(t *testing.T) {
 			}
 		}
 
-		// Публикация q:analyze — по Result на запись субдомен×вариант
-		// (T-058); рендер-задач не-SPA образцы не создают (T-066).
+		// Publishing to q:analyze — one Result per subdomain×variant row
+		// (T-058); non-SPA samples do not create render tasks (T-066).
 		if n := streamLen(t, env.rdb, queue.StreamAnalyze); n != int64(len(e2eSamples)) {
 			t.Errorf("записей в q:analyze: %d, хочу %d", n, len(e2eSamples))
 		}
@@ -635,8 +646,8 @@ func TestE2E_FileToLaravel(t *testing.T) {
 	})
 
 	t.Run("laravel_*: список, субдомены, диапазон, признаки (§11.4 п. 5)", func(t *testing.T) {
-		// Список доменов с Laravel — выборкой из laravel_domains (порог
-		// §13.1: только уверенные срабатывания).
+		// The list of Laravel domains — a select from laravel_domains (the
+		// §13.1 threshold: only confident hits).
 		rows, err := env.pool.Query(ctx, `
 			SELECT d.label FROM laravel_domains AS ld
 			JOIN domains AS d ON d.zone_id = ld.zone_id AND d.id = ld.domain_id
@@ -679,9 +690,9 @@ func TestE2E_FileToLaravel(t *testing.T) {
 			}
 		}
 
-		// История детекции appeared (T-118): доставки q:analyze этого
-		// цикла свежие (HTTP-этап) — каждый Laravel-домен получил ровно
-		// одну запись appeared=true; lost нет.
+		// The appeared detection history (T-118): this circle's q:analyze
+		// deliveries are fresh (the HTTP stage) — every Laravel domain got
+		// exactly one appeared=true row; no lost ones.
 		{
 			rows, err := env.pool.Query(ctx, `
 				SELECT d.label, h.appeared FROM laravel_history AS h
@@ -716,7 +727,7 @@ func TestE2E_FileToLaravel(t *testing.T) {
 			}
 		}
 
-		// e2eFinding — строка laravel_findings для проверок.
+		// e2eFinding — a laravel_findings row for the checks.
 		type e2eFinding struct {
 			sub          int16
 			variant      int16
@@ -731,8 +742,8 @@ func TestE2E_FileToLaravel(t *testing.T) {
 			id := env.domainID(t, zoneID, s.label)
 			name := s.label + "." + e2eZone
 
-			// laravel_findings: все срабатывания независимо от порога
-			// (§13.1) — состав, score, диапазон, версия набора.
+			// laravel_findings: all hits regardless of the threshold
+			// (§13.1) — the composition, score, range, set version.
 			frows, err := env.pool.Query(ctx, `
 				SELECT subdomain_id, variant, score, ver_min, ver_max, is_laravel, signals::text, rules_version
 				FROM laravel_findings WHERE zone_id = $1 AND domain_id = $2`, zoneID, id)
@@ -797,10 +808,10 @@ func TestE2E_FileToLaravel(t *testing.T) {
 				}
 			}
 
-			// laravel_domains — только уверенные (порог §13.1): у домена
-			// с единственной записью агрегат совпадает со срабатыванием;
-			// found_on_mask — бит субдомена (§5.8). Негативные образцы
-			// (включая чистый django) строки не имеют вовсе.
+			// laravel_domains — only confident ones (the §13.1 threshold):
+			// for a domain with a single row the aggregate matches the hit;
+			// found_on_mask — the subdomain bit (§5.8). Negative samples
+			// (including clean django) have no row at all.
 			var (
 				aggScore float32
 				aggMin   *string
@@ -838,8 +849,8 @@ func TestE2E_FileToLaravel(t *testing.T) {
 			}
 		}
 
-		// Штамп переанализа: все строки проанализированы текущим набором
-		// (контракт T-071/T-074).
+		// The re-analysis stamp: all rows are analyzed by the current set
+		// (the T-071/T-074 contract).
 		var untagged int
 		if err := env.pool.QueryRow(ctx,
 			"SELECT count(*) FROM subdomain_results WHERE rules_version IS DISTINCT FROM $1",
@@ -852,8 +863,8 @@ func TestE2E_FileToLaravel(t *testing.T) {
 	})
 }
 
-// domainByLabel — наблюдаемые колонки домена по punycode-имени зоны и метке
-// (обёртка над запросом, стиль ingestEnv.domain).
+// domainByLabel — the observed domain columns by the zone's punycode name
+// and label (a wrapper over the query, the ingestEnv.domain style).
 func (e *e2eEnv) domainByLabel(t *testing.T, zone, label string) (domainState, bool) {
 	t.Helper()
 	var d domainState
@@ -871,8 +882,8 @@ func (e *e2eEnv) domainByLabel(t *testing.T, zone, label string) (domainState, b
 	return d, true
 }
 
-// domainID — id домена по метке в зоне теста (вызывается из подтестов —
-// t передаётся параметром, Fatalf адресен вызвавшему подтесту).
+// domainID — the domain id by label in the test zone (called from subtests —
+// t is passed as a parameter, Fatalf addresses the calling subtest).
 func (e *e2eEnv) domainID(t *testing.T, zoneID int16, label string) int64 {
 	t.Helper()
 	var id int64

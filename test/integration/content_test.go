@@ -1,9 +1,10 @@
-// Интеграционные тесты хранилища контента (T-046; ТЗ 5.7, 8, 11.4 п. 3):
-// сквозные сценарии поверх живого PostgreSQL (метаданные contents,
-// изолированная схема migratedSchema) и реальных пак-файлов в t.TempDir —
-// запись/чтение со словарём и без, дедупликация, ссылки и SwapRef,
-// ротация паков, компактификация, лимит max_store_bytes и реакция на
-// переполнение диска. Контракт ContentStore (T-041) — на PackStore.
+// Integration tests of the content store (T-046; spec 5.7, 8, 11.4
+// item 3): end-to-end scenarios over live PostgreSQL (the contents
+// metadata, the isolated migratedSchema schema) and real pack files in
+// t.TempDir — write/read with and without a dictionary, deduplication,
+// references and SwapRef, pack rotation, compaction, the max_store_bytes
+// limit and the reaction to disk exhaustion. The ContentStore contract
+// (T-041) — on PackStore.
 package integration
 
 import (
@@ -26,9 +27,9 @@ import (
 	"crawler/internal/content/contenttest"
 )
 
-// contentTestEnv — PackStore на живой схеме (таблица contents из миграции
-// 000001) и пак-файлах во временном каталоге. Маленький PackSize по
-// умолчанию: тесты ротации и компактификации полагаются на неё.
+// contentTestEnv — a PackStore on a live schema (the contents table from
+// migration 000001) and pack files in a temp directory. A small PackSize
+// by default: the rotation and compaction tests rely on it.
 func contentTestEnv(t *testing.T, mutate func(*content.PackOptions)) (*content.PackStore, *pgxpool.Pool) {
 	t.Helper()
 	pool := migratedSchema(t)
@@ -48,7 +49,7 @@ func contentTestEnv(t *testing.T, mutate func(*content.PackOptions)) (*content.P
 	return st, pool
 }
 
-// contentRow — строка contents для проверок напрямую в БД.
+// contentRow — a contents row for checks directly in the DB.
 type contentRow struct {
 	packID int32
 	off    int64
@@ -57,8 +58,8 @@ type contentRow struct {
 	refc   int32
 }
 
-// contentRowByHash — живая или мёртвая строка (без фильтра refcount —
-// тестам интересны именно мёртвые тоже).
+// contentRowByHash — a live or dead row (no refcount filter — the dead
+// ones interest the tests too).
 func contentRowByHash(t *testing.T, pool *pgxpool.Pool, h content.Hash) (contentRow, bool) {
 	t.Helper()
 	var r contentRow
@@ -74,7 +75,7 @@ func contentRowByHash(t *testing.T, pool *pgxpool.Pool, h content.Hash) (content
 	return r, true
 }
 
-// contentPackIDs — отсортированные pack_id живых и мёртвых строк.
+// contentPackIDs — the sorted pack_id of live and dead rows.
 func contentPackIDs(t *testing.T, pool *pgxpool.Pool) []int32 {
 	t.Helper()
 	rows, err := pool.Query(context.Background(), "SELECT DISTINCT pack_id FROM contents ORDER BY pack_id")
@@ -96,7 +97,7 @@ func contentPackIDs(t *testing.T, pool *pgxpool.Pool) []int32 {
 	return ids
 }
 
-// packFileExists — presence пак-файла в каталоге контента.
+// packFileExists — the presence of a pack file in the content directory.
 func packFileExists(t *testing.T, dir string, id int32) bool {
 	t.Helper()
 	_, err := os.Stat(filepath.Join(dir, fmt.Sprintf("pack-%06d.pack", id)))
@@ -110,8 +111,8 @@ func packFileExists(t *testing.T, dir string, id int32) bool {
 	return false
 }
 
-// parkingPage — «парковочная страница» общего шаблона: именно такие
-// сжимаются словарём и дедуплицируются хэшем (ТЗ 5.7, 8).
+// parkingPage — a "parking page" of a shared template: exactly these are
+// compressed with the dictionary and deduplicated by hash (spec 5.7, 8).
 func parkingPage(domain, note string) []byte {
 	return []byte(fmt.Sprintf(`<!doctype html><html><head><title>Добро пожаловать на %s</title>
 <meta name="parking" content="shared-template"></head>
@@ -119,9 +120,10 @@ func parkingPage(domain, note string) []byte {
 <div class="footer">Эта страница размещена на парковке хостинга</div></body></html>`, domain, note))
 }
 
-// TestContent_StoreContract — контракт ContentStore (T-041) на PackStore
-// с живыми PostgreSQL и файлами: главная проверка задачи. Набор — в
-// пакете contenttest с T-228 (testing только в тестовых пакетах).
+// TestContent_StoreContract — the ContentStore contract (T-041) on
+// PackStore with live PostgreSQL and files: the main check of the task.
+// The set is in the contenttest package with T-228 (testing only in test
+// packages).
 func TestContent_StoreContract(t *testing.T) {
 	skipUnlessIntegration(t)
 	contenttest.StoreContract(t, func(t *testing.T) content.ContentStore {
@@ -130,12 +132,13 @@ func TestContent_StoreContract(t *testing.T) {
 	})
 }
 
-// TestContent_PutBatch — групповая фиксация на живой PostgreSQL (T-228,
-// ревью P3-1): дедуп-пачка (unnest-джойн с счётчиками копий) и пакетный
-// INSERT с повторами хэша — единственная проверка операторов пачки
-// реальным сервером и pgx-кодирования аргументов (юнит-тесты идут на
-// фейковом пуле). Оба пути: живой хэш → refcount 1+n, новый с дублями →
-// n; ссылки настоящие — Delete × refcount исчерпывает контент.
+// TestContent_PutBatch — group commit on live PostgreSQL (T-228, review
+// P3-1): the dedup batch (an unnest join with copy counters) and the
+// batched INSERT with hash repeats are the only check of the batch
+// statements by a real server and of the pgx argument encoding (the unit
+// tests run on a fake pool). Both paths: a live hash → refcount 1+n, a new
+// one with duplicates → n; the references are real — Delete × refcount
+// exhausts the content.
 func TestContent_PutBatch(t *testing.T) {
 	skipUnlessIntegration(t)
 	st, pool := contentTestEnv(t, nil)
@@ -156,8 +159,8 @@ func TestContent_PutBatch(t *testing.T) {
 			t.Fatalf("элемент %d: %v", i, e)
 		}
 	}
-	// Created: live — дедуп (байтов нет), fresh — первый элемент пишет
-	// байты, повторы хэша — нет.
+	// Created: live — dedup (no bytes), fresh — the first element writes
+	// the bytes, the hash repeats do not.
 	for i, want := range []bool{false, false, false, true, false, false} {
 		if results[i].Created != want {
 			t.Errorf("элемент %d: Created = %v, want %v", i, results[i].Created, want)
@@ -175,7 +178,7 @@ func TestContent_PutBatch(t *testing.T) {
 		}
 	}
 
-	// Ссылки настоящие: исчерпание Delete × refcount убивает контент.
+	// The references are real: exhausting Delete × refcount kills the content.
 	for i := 0; i < 4; i++ {
 		if err := st.Delete(ctx, content.HashOf(live)); err != nil {
 			t.Fatalf("Delete живого %d из 4: %v", i+1, err)
@@ -194,9 +197,10 @@ func TestContent_PutBatch(t *testing.T) {
 	}
 }
 
-// TestContent_Roundtrip — запись/чтение: со словарём и без, сжатие
-// уменьшает блок (len < raw_len), переоткрытие каталога читает контент
-// (межпроцессная семантика http-worker/render-worker, ТЗ 11.4 п. 3).
+// TestContent_Roundtrip — write/read: with and without a dictionary,
+// compression shrinks the block (len < raw_len), reopening the directory
+// reads the content (the cross-process semantics of
+// http-worker/render-worker, spec 11.4 item 3).
 func TestContent_Roundtrip(t *testing.T) {
 	skipUnlessIntegration(t)
 
@@ -227,10 +231,10 @@ func TestContent_Roundtrip(t *testing.T) {
 			if int(row.rawLen) != len(page) {
 				t.Errorf("raw_len = %d, want %d", row.rawLen, len(page))
 			}
-			// Сжатие работает на сжимаемых страницах (ТЗ 5.7): крупный
-			// повторяющийся контент занимает меньше сырых байтов; для
-			// маленьких страниц zstd-оверхед кадра может превысить выгоду
-			// — сравнение только про сжимаемый случай.
+			// Compression works on compressible pages (spec 5.7): large
+			// repeating content takes fewer raw bytes; for small pages the
+			// zstd frame overhead may exceed the benefit — the comparison
+			// is only about the compressible case.
 			if len(page) > 1024 && int(row.clen) >= len(page) {
 				t.Errorf("сжатый блок %d байт не меньше сырых %d — сжатие не работает", row.clen, len(page))
 			}
@@ -268,9 +272,10 @@ func TestContent_Roundtrip(t *testing.T) {
 			}
 			withDict = append(withDict, row)
 		}
-		// Словарь обязан помогать: блок страницы общего шаблона заметно
-		// меньше сырых байтов (точный коэффициент — зона zstd, здесь —
-		// сам факт заметного сжатия, ТЗ 5.7).
+		// The dictionary must help: a shared-template page's block is
+		// noticeably smaller than the raw bytes (the exact ratio is zstd's
+		// domain; here it is the very fact of noticeable compression,
+		// spec 5.7).
 		for i, row := range withDict {
 			if int(row.clen) > int(row.rawLen)/2 {
 				t.Errorf("страница %d со словарём: блок %d байт при сырых %d — словарь не работает", i, row.clen, row.rawLen)
@@ -296,8 +301,9 @@ func TestContent_Roundtrip(t *testing.T) {
 			t.Fatalf("Close: %v", err)
 		}
 
-		// Второй «процесс»: тот же каталог, тот же пул, чтение блока,
-		// записанного первым (Chromium-воркер читает HTML http-воркера).
+		// The second "process": the same directory, the same pool, reading
+		// the block written by the first (the Chromium worker reads the
+		// http worker's HTML).
 		second, err := content.OpenPackStore(pool, opts)
 		if err != nil {
 			t.Fatalf("переоткрытие: %v", err)
@@ -310,9 +316,10 @@ func TestContent_Roundtrip(t *testing.T) {
 	})
 }
 
-// TestContent_DedupAndRefcount — дедупликация (ТЗ 5.7): повторный Put
-// не пишет байтов (Created=false), refcount растёт; Delete снимает
-// ссылки по одной, последняя делает строку мёртвой (ТЗ 11.4 п. 3).
+// TestContent_DedupAndRefcount — deduplication (spec 5.7): a repeat Put
+// writes no bytes (Created=false), the refcount grows; Delete withdraws
+// the references one by one, the last one makes the row dead (spec 11.4
+// item 3).
 func TestContent_DedupAndRefcount(t *testing.T) {
 	skipUnlessIntegration(t)
 	st, pool := contentTestEnv(t, nil)
@@ -329,7 +336,7 @@ func TestContent_DedupAndRefcount(t *testing.T) {
 	}
 	sizeBefore := row.clen
 
-	dup, err := st.Put(ctx, append([]byte(nil), page...)) // независимая копия байтов
+	dup, err := st.Put(ctx, append([]byte(nil), page...)) // an independent copy of the bytes
 	if err != nil {
 		t.Fatalf("повторный Put: %v", err)
 	}
@@ -347,7 +354,7 @@ func TestContent_DedupAndRefcount(t *testing.T) {
 		t.Errorf("блок перезаписан: len %d → %d, want без изменений", sizeBefore, row.clen)
 	}
 
-	// Снятие ссылок: пока есть — контент жив; последняя — строка мертва.
+	// Withdrawal of references: while any remain the content is alive; the last one makes the row dead.
 	if err := st.Delete(ctx, first.Hash); err != nil {
 		t.Fatalf("Delete первой из двух ссылок: %v", err)
 	}
@@ -367,7 +374,7 @@ func TestContent_DedupAndRefcount(t *testing.T) {
 	if err := st.Delete(ctx, first.Hash); !errors.Is(err, content.ErrNotFound) {
 		t.Errorf("повторный Delete: %v, want ErrNotFound (симптом ошибки учёта)", err)
 	}
-	// Воскрешение: новый Put пишет свежий блок (T-042), refcount 1.
+	// Revival: a new Put writes a fresh block (T-042), refcount 1.
 	res, err := st.Put(ctx, page)
 	if err != nil {
 		t.Fatalf("Put после исчерпания ссылок: %v", err)
@@ -381,8 +388,9 @@ func TestContent_DedupAndRefcount(t *testing.T) {
 	}
 }
 
-// TestContent_SwapRef — перезапись ссылки при перезаписи результата
-// (T-044; ТЗ 5.7, 8): сценарии свопа на живой таблице contents.
+// TestContent_SwapRef — rewriting the reference when the result is
+// overwritten (T-044; spec 5.7, 8): swap scenarios on the live contents
+// table.
 func TestContent_SwapRef(t *testing.T) {
 	skipUnlessIntegration(t)
 	st, pool := contentTestEnv(t, nil)
@@ -484,8 +492,9 @@ func TestContent_SwapRef(t *testing.T) {
 	})
 }
 
-// TestContent_PackRotation — ротация по pack_size (ТЗ 5.7): паки
-// появляются, контент читается из всех, новейший — максимальный id.
+// TestContent_PackRotation — rotation by pack_size (spec 5.7): packs
+// appear, the content is readable from all of them, the newest has the
+// maximum id.
 func TestContent_PackRotation(t *testing.T) {
 	skipUnlessIntegration(t)
 	st, pool := contentTestEnv(t, nil)
@@ -512,13 +521,13 @@ func TestContent_PackRotation(t *testing.T) {
 			t.Errorf("файл пака %d отсутствует", id)
 		}
 	}
-	// Контент читается из каждого пака (блоки по зафиксированным смещениям).
+	// The content is read from every pack (blocks at the committed offsets).
 	for i, h := range hashes {
 		if _, err := st.Get(ctx, h); err != nil {
 			t.Errorf("Get(%d) из пака: %v", i, err)
 		}
 	}
-	// Новейший пак продолжает принимать записи.
+	// The newest pack keeps accepting writes.
 	res, err := st.Put(ctx, parkingPage("last.example", "запись после ротации"))
 	if err != nil {
 		t.Fatalf("Put после ротации: %v", err)
@@ -532,15 +541,15 @@ func TestContent_PackRotation(t *testing.T) {
 	}
 }
 
-// TestContent_Compaction — компактификация (ТЗ 5.7): доля живых ниже
-// порога — пак переписывается и удаляется, живой контент читаем, место
-// освобождено; выше порога — не трогается.
+// TestContent_Compaction — compaction (spec 5.7): a live share below the
+// threshold — the pack is rewritten and deleted, the live content is
+// readable, the space is freed; above the threshold — untouched.
 func TestContent_Compaction(t *testing.T) {
 	skipUnlessIntegration(t)
 	st, pool := contentTestEnv(t, nil)
 	ctx := context.Background()
 
-	// Паки 1 и 2: пять страниц в первом, шестая ротирует во второй.
+	// Packs 1 and 2: five pages in the first, the sixth rotates into the second.
 	byPack := make(map[int32][]content.Hash)
 	var i int
 	for len(contentPackIDs(t, pool)) < 2 {
@@ -561,7 +570,7 @@ func TestContent_Compaction(t *testing.T) {
 	}
 	before := len(first)
 
-	// Один живой, остальные мёртвые: доля живых << 50%.
+	// One live, the rest dead: the live share << 50%.
 	for _, h := range first[1:] {
 		if err := st.Delete(ctx, h); err != nil {
 			t.Fatalf("Delete %s: %v", h, err)
@@ -586,7 +595,7 @@ func TestContent_Compaction(t *testing.T) {
 	if packFileExists(t, st.Dir(), 1) {
 		t.Error("файл пака 1 не удалён после компактификации")
 	}
-	// Живой контент переехал и читается; мёртвые строки вычищены.
+	// The live content has moved and is readable; the dead rows are purged.
 	row, ok := contentRowByHash(t, pool, live)
 	if !ok {
 		t.Fatal("живая строка потеряна компактификацией")
@@ -600,12 +609,12 @@ func TestContent_Compaction(t *testing.T) {
 	if ids := contentPackIDs(t, pool); len(ids) == 0 || ids[0] == 1 {
 		t.Errorf("мёртвые строки пака 1 не удалены: pack_id %v", ids)
 	}
-	// Запись продолжается, место освобождено и учитывается (T-046).
+	// Writing continues, the space is freed and accounted for (T-046).
 	if _, err := st.Put(ctx, parkingPage("after-compact.example", "запись после компактификации")); err != nil {
 		t.Fatalf("Put после компактификации: %v", err)
 	}
 
-	// Пак с живыми данными выше порога не компактифицируется.
+	// A pack with a live share above the threshold is not compacted.
 	t.Run("доля живых выше порога", func(t *testing.T) {
 		st2, pool2 := contentTestEnv(t, nil)
 		var keep []content.Hash
@@ -638,8 +647,8 @@ func TestContent_Compaction(t *testing.T) {
 	})
 }
 
-// TestContent_MaxStoreBytes — лимит одного контента (ТЗ 5.5, 5.7):
-// превышение — ErrTooLarge целиком, граница — проходит.
+// TestContent_MaxStoreBytes — the single content limit (spec 5.5, 5.7):
+// exceeding it — ErrTooLarge as a whole, exactly at the boundary — passes.
 func TestContent_MaxStoreBytes(t *testing.T) {
 	skipUnlessIntegration(t)
 	const limit = 64
@@ -661,11 +670,12 @@ func TestContent_MaxStoreBytes(t *testing.T) {
 	}
 }
 
-// TestContent_DiskFullPause — реакция на переполнение диска (ТЗ 8):
-// порог недостижимо высок — Put возвращает ErrStoreFull (пауза записи),
-// событие алерта несёт реальный снимок statfs; читаемый порог — запись
-// идёт. Заглушаемый statfs и семантика порога — юнит-тесты disk_test.go,
-// здесь — живая файловая система и сквозная связь с Put.
+// TestContent_DiskFullPause — the reaction to disk exhaustion (spec 8):
+// an unreachable threshold — Put returns ErrStoreFull (a write pause),
+// the alert event carries a real statfs snapshot; a sane threshold — the
+// writing goes on. The mockable statfs and the threshold semantics are the
+// unit tests of disk_test.go; here — a live file system and the end-to-end
+// connection with Put.
 func TestContent_DiskFullPause(t *testing.T) {
 	skipUnlessIntegration(t)
 
@@ -674,7 +684,7 @@ func TestContent_DiskFullPause(t *testing.T) {
 		events []content.StoreFullEvent
 	)
 	st, _ := contentTestEnv(t, func(o *content.PackOptions) {
-		o.DiskFreePercent = 101 // выше 100% места не бывает — пауза всегда
+		o.DiskFreePercent = 101 // there is never more than 100% free space — always a pause
 		o.OnStoreFull = func(ev content.StoreFullEvent) {
 			mu.Lock()
 			defer mu.Unlock()
@@ -703,21 +713,22 @@ func TestContent_DiskFullPause(t *testing.T) {
 		t.Error("событие без реального снимка statfs: Total = 0")
 	}
 
-	// Живой порог: места достаточно, запись идёт (тот же каталог).
+	// A live threshold: enough space, writing goes on (the same directory).
 	st2, _ := contentTestEnv(t, func(o *content.PackOptions) { o.DiskFreePercent = 0.0001 })
 	if _, err := st2.Put(ctx, parkingPage("ok.example", "места достаточно")); err != nil {
 		t.Fatalf("Put при живом пороге: %v", err)
 	}
 }
 
-// TestContent_RefcountFSM — инварианты автомата refcount на живой
-// PostgreSQL (T-265, ТЗ-fsm §3 ФТ-11; спецификация — doc-комментарий
-// internal/content/pack.go): воскрешение tombstone-строки идёт веткой
-// ON CONFLICT DO UPDATE — refcount 0→1, размещение переведено на свежий
-// блок (EXCLUDED), Created = false; строка, удалённая целиком
-// (представление retention/компактификации), воскресает веткой INSERT —
-// Created = true; двойной Delete мёртвого — ErrNotFound. Юнит-проход по
-// таблице переходов — internal/content (TestPackRefcountFSM).
+// TestContent_RefcountFSM — the refcount automaton invariants on live
+// PostgreSQL (T-265, TZ-fsm spec §3 FR-11; the specification is the doc
+// comment of internal/content/pack.go): reviving a tombstone row goes
+// through the ON CONFLICT DO UPDATE branch — refcount 0→1, the placement
+// moved to a fresh block (EXCLUDED), Created = false; a row deleted
+// entirely (the retention/compaction view) revives through the INSERT
+// branch — Created = true; a double Delete of a dead one — ErrNotFound.
+// The unit pass over the transition table — internal/content
+// (TestPackRefcountFSM).
 func TestContent_RefcountFSM(t *testing.T) {
 	skipUnlessIntegration(t)
 	st, pool := contentTestEnv(t, nil)
@@ -739,7 +750,7 @@ func TestContent_RefcountFSM(t *testing.T) {
 		t.Fatalf("после дедупа: строка %+v (found=%v), want refcount 2", oldRow, ok)
 	}
 
-	// live(2) → dead·tombstone: обе ссылки сняты, строка остаётся.
+	// live(2) → dead·tombstone: both references withdrawn, the row stays.
 	for i := 0; i < 2; i++ {
 		if err := st.Delete(ctx, res.Hash); err != nil {
 			t.Fatalf("Delete %d: %v", i+1, err)
@@ -753,7 +764,7 @@ func TestContent_RefcountFSM(t *testing.T) {
 		t.Errorf("повторный Delete мёртвой: %v, want ErrNotFound", err)
 	}
 
-	// П6: воскрешение tombstone — DO UPDATE, размещение EXCLUDED.
+	// T6: the tombstone revival — DO UPDATE, the EXCLUDED placement.
 	again, err := st.Put(ctx, page)
 	if err != nil {
 		t.Fatalf("Put воскрешения: %v", err)
@@ -772,9 +783,9 @@ func TestContent_RefcountFSM(t *testing.T) {
 		t.Errorf("Get воскрешённого: %v", err)
 	}
 
-	// Представление «строки нет» (путь retention T-166 / вычистки
-	// компактификации T-045): строка удалена целиком — Get/Delete как у
-	// мёртвого, воскрешение веткой INSERT, Created = true.
+	// The "no row" view (the retention path T-166 / the compaction purge
+	// T-045): the row is deleted entirely — Get/Delete as for a dead one,
+	// the revival through the INSERT branch, Created = true.
 	if _, err := pool.Exec(ctx, "DELETE FROM contents WHERE hash = $1", res.Hash[:]); err != nil {
 		t.Fatalf("удаление строки: %v", err)
 	}
@@ -799,13 +810,13 @@ func TestContent_RefcountFSM(t *testing.T) {
 	}
 }
 
-// TestContent_RefcountClampDesync — клэмп GREATEST(refcount − n, 0) при
-// рассинхроне на живой PostgreSQL (T-265, инвариант И1 автомата
-// refcount, переход П9): две остаревшие записи ссылаются на контент со
-// счётчиком 1 — агрегированное срезание двух ссылок клэмпится в ноль, а
-// не в минус, строка удаляется той же транзакцией (retention минует
-// tombstone), проход не падает и не триггерит CHECK
-// contents_refcount_check (миграция 000019). Юнит-проход —
+// TestContent_RefcountClampDesync — the GREATEST(refcount − n, 0) clamp on
+// desync against live PostgreSQL (T-265, the refcount automaton invariant
+// I1, transition T9): two aged rows reference content with counter 1 —
+// the aggregated withdrawal of two references clamps to zero, not minus,
+// the row is deleted in the same transaction (retention skips the
+// tombstone), the pass neither fails nor triggers the CHECK
+// contents_refcount_check (migration 000019). The unit pass —
 // internal/content (TestRetentionOnce_ClampDesync).
 func TestContent_RefcountClampDesync(t *testing.T) {
 	skipUnlessIntegration(t)
@@ -824,8 +835,9 @@ func TestContent_RefcountClampDesync(t *testing.T) {
 		t.Fatalf("insert domains: %v", err)
 	}
 
-	// Рассинхрон: держателей 2, счётчик 1 (одна ссылка уже снята иным
-	// путём — сценарий ошибки учёта, которую клэмп прощает нулём).
+	// The desync: 2 holders, counter 1 (one reference already withdrawn by
+	// another path — the accounting-error scenario that the clamp forgives
+	// with zero).
 	h := make([]byte, 16)
 	h[15] = 0x42
 	if _, err := pool.Exec(ctx, `
@@ -871,19 +883,19 @@ func TestContent_RefcountClampDesync(t *testing.T) {
 	}
 }
 
-// TestSchema_ContentsRefcountCheck — парный тест-инвариант CHECK
-// contents_refcount_check (T-265, ФТ-11, миграция 000019): refcount < 0
-// отвергается схемой (23514) на INSERT и UPDATE, tombstone refcount = 0
-// легален (мёртвое представление № 1, T-042), ограничение добавлено
-// NOT VALID (convalidated = false — VALIDATE по регламенту миграций,
-// docs/schema.md «CHECK-инварианты»); contents не секционирована —
-// объект один.
+// TestSchema_ContentsRefcountCheck — the companion invariant test of the
+// contents_refcount_check CHECK (T-265, FR-11, migration 000019):
+// refcount < 0 is rejected by the schema (23514) on INSERT and UPDATE, a
+// tombstone refcount = 0 is legal (the dead view #1, T-042), the
+// constraint is added NOT VALID (convalidated = false — VALIDATE per the
+// migration regulations, docs/schema.md "CHECK invariants"); contents is
+// not partitioned — a single object.
 func TestSchema_ContentsRefcountCheck(t *testing.T) {
 	skipUnlessIntegration(t)
 	pool := migratedSchema(t)
 	ctx := context.Background()
 
-	// Легальные строки: живая refcount = 1 и tombstone refcount = 0.
+	// Legal rows: a live refcount = 1 and a tombstone refcount = 0.
 	ins := func(hb byte, refc int) error {
 		_, err := pool.Exec(ctx, `
 			INSERT INTO contents (hash, pack_id, off, len, raw_len, refcount)
@@ -897,21 +909,22 @@ func TestSchema_ContentsRefcountCheck(t *testing.T) {
 		t.Fatalf("tombstone refcount 0: %v (нулевая строка легальна — мёртвая до компактификации T-045)", err)
 	}
 
-	// Нарушение инварианта: INSERT с refcount = −1 — 23514 схемой.
+	// The invariant violation: an INSERT with refcount = −1 — 23514 from the schema.
 	if err := ins(0x03, -1); err == nil || !strings.Contains(err.Error(), "contents_refcount_check") {
 		t.Errorf("INSERT refcount −1: err = %v, want violation contents_refcount_check", err)
 	}
-	// UPDATE существующей строки в минус — тоже отвергается (NOT VALID
-	// бдит новые и изменяемые строки).
+	// An UPDATE of an existing row to minus is rejected too (NOT VALID
+	// watches new and modified rows).
 	if _, err := pool.Exec(ctx,
 		"UPDATE contents SET refcount = -1 WHERE hash = $1", refcTestHash(0x01)); err == nil ||
 		!strings.Contains(err.Error(), "contents_refcount_check") {
 		t.Errorf("UPDATE в минус: err = %v, want violation contents_refcount_check", err)
 	}
 
-	// NOT VALID: ограничение в схеме теста (фильтр по current_schema —
-	// в БД живут схемы соседних прогонов) ещё не валидировано; contents
-	// не секционирована (миграция 000001) — объект один.
+	// NOT VALID: the constraint in the test schema (filtered by
+	// current_schema — the schemas of neighboring runs live in the DB) is
+	// not validated yet; contents is not partitioned (migration 000001) —
+	// a single object.
 	rows, err := pool.Query(ctx,
 		`SELECT count(*) FILTER (WHERE convalidated) AS validated, count(*) AS total
 		 FROM pg_constraint
@@ -933,7 +946,7 @@ func TestSchema_ContentsRefcountCheck(t *testing.T) {
 	}
 }
 
-// refcTestHash — 16-октетный хэш с байтом-заполнителем (посев
+// refcTestHash — a 16-octet hash with a filler byte (the seeding of
 // TestSchema_ContentsRefcountCheck).
 func refcTestHash(b byte) []byte {
 	h := make([]byte, 16)
@@ -941,12 +954,12 @@ func refcTestHash(b byte) []byte {
 	return h
 }
 
-// retentionPinSelectSQL — полный текст retentionSelectSQL с литералами
-// параметров (T-271; якорь — internal/content/retention.go, дублирование
-// — стиль rqBatchSQL): EXPLAIN с параметрами требует подготовленного
-// оператора, проверке формы плана литералы безразличны. Коды схемы —
-// литералами (FlagRenderPending = 2, StatusDeleted = 6 — стиль
-// rqBatchSQL).
+// retentionPinSelectSQL — the full text of retentionSelectSQL with the
+// parameters as literals (T-271; the anchor is
+// internal/content/retention.go, the duplication is the rqBatchSQL
+// style): EXPLAIN with parameters requires a prepared statement, the plan
+// shape check is indifferent to literals. The schema codes as literals
+// (FlagRenderPending = 2, StatusDeleted = 6 — the rqBatchSQL style).
 const retentionPinSelectSQL = "SELECT r.zone_id, r.domain_id, r.subdomain_id, r.variant, r.content_hash, r.checked_at " +
 	"FROM subdomain_results AS r " +
 	"JOIN domains AS d ON d.zone_id = r.zone_id AND d.id = r.domain_id " +
@@ -962,26 +975,28 @@ const retentionPinSelectSQL = "SELECT r.zone_id, r.domain_id, r.subdomain_id, r.
 	"ORDER BY r.checked_at, r.zone_id, r.domain_id, r.subdomain_id, r.variant " +
 	"LIMIT 10000"
 
-// TestContent_RetentionSelectPlanPinned — закрепление формы плана
-// выборки пачки retention (T-271; инцидент 08–09.11.2026 — деградация
-// плана до seq scan 9 млн строк + hash join domains + Sort ≈1 ГиБ
-// поверх shared_buffers 2 ГиБ клала PostgreSQL OOM-киллами, пачки не
-// коммитились — курсор не двигался): внутри транзакции закрепления
-// (SET LOCAL seq/hash/merge/bitmap off — те же литералы
-// internal/content/retention.go) EXPLAIN показывает индексную форму
-// доступа к subdomain_results + Limit, без Hash/Merge Join и Seq Scan;
-// Incremental Sort допустим (enable_sort не отключается — ORDER BY
-// (checked_at, PK) держит его поверх порядка индекса). Bitmap выключен
-// доводкой T-271: битмап-путь не сохраняет порядок индекса → явный
-// Sort, форма недетерминирована.
+// TestContent_RetentionSelectPlanPinned — pinning the plan shape of the
+// retention batch selection (T-271; the incident of Nov 08–09, 2026 — the
+// plan degraded to a seq scan of 9M rows + a hash join of domains + a
+// Sort of ~1 GiB on top of 2 GiB shared_buffers, knocking PostgreSQL down
+// with OOM kills, batches were not committed — the cursor did not move):
+// inside the pinning transaction (SET LOCAL seq/hash/merge/bitmap off —
+// the same literals as internal/content/retention.go) EXPLAIN shows the
+// index access shape to subdomain_results + Limit, without Hash/Merge
+// Join and Seq Scan; an Incremental Sort is allowed (enable_sort is not
+// switched off — ORDER BY (checked_at, PK) keeps it on top of the index
+// order). Bitmap is switched off by the T-271 tuning: the bitmap path
+// does not preserve the index order → an explicit Sort, the shape is
+// nondeterministic.
 func TestContent_RetentionSelectPlanPinned(t *testing.T) {
 	skipUnlessIntegration(t)
 	pool := migratedSchema(t)
 	ctx := context.Background()
 
-	// Посев: зона, живой домен, остаревшая запись с контентом — форма
-	// плана от объёма не зависит (закрепление — SET LOCAL), но пустая
-	// таблица статистикой вводила бы планировщик в нулевые оценки.
+	// Seeding: a zone, a live domain, an aged row with content — the plan
+	// shape does not depend on the volume (the pinning is SET LOCAL), but
+	// an empty table would drive the planner into zero estimates by its
+	// statistics.
 	var zone int16
 	if err := pool.QueryRow(ctx,
 		"INSERT INTO zones (name) VALUES ('pin.test') RETURNING id").Scan(&zone); err != nil {
@@ -1027,9 +1042,10 @@ func TestContent_RetentionSelectPlanPinned(t *testing.T) {
 			t.Errorf("закреплённый план содержит %q (SET LOCAL не подействовал):\n%s", bad, plan)
 		}
 	}
-	// Bitmap-путь — другой диагноз, чем невыключенные GUC: закрепление
-	// действует, но форма не закрыта до конца — битмап не сохраняет
-	// порядок индекса, ORDER BY закрывается явным Sort (доводка T-271).
+	// The bitmap path is a different diagnosis than the un-switched-off
+	// GUCs: the pinning works but the shape is not fully closed — bitmap
+	// does not preserve the index order, the ORDER BY is satisfied by an
+	// explicit Sort (the T-271 tuning).
 	for _, bad := range []string{"Bitmap Index Scan", "Bitmap Heap Scan"} {
 		if strings.Contains(plan, bad) {
 			t.Errorf("закреплённый план содержит %q (bitmap-путь ломает порядок курсора — форма не закреплена до конца):\n%s", bad, plan)
@@ -1037,33 +1053,37 @@ func TestContent_RetentionSelectPlanPinned(t *testing.T) {
 	}
 }
 
-// TestContent_RetentionCatchUpFromZeroCursor — главный тест-пробел T-271,
-// закрытый T-273: catch-up-проход с НУЛЕВОГО курсора обязан завершаться
-// в SelectTimeout при чистом skip-префиксе и дренировать всё множество
-// кандидатов. Прод-механика инцидента 09–10.11.2026 (масштаб —
-// прод-пропорция в миниатюре, свойство важнее абсолютных миллионов):
-// retention стоял с ночи 08.11 → курсор нулевой → каждая выборка идёт
-// «с начала таблицы» через миллионы уже чистых строк (предикат «есть
-// что чистить» вне индекса — heap-визит каждой); дедлайн 600 с убивал
-// проход ДО коммита → курсор не двигался → идентичный обречённый скан
-// (вечная петля). Здесь: 200 тыс. чистых остаревших строк (skip-префикс
-// по checked_at) впереди 30 тыс. кандидатов (jsonb) и 5 тыс. свежих —
-// один проход RetentionOnce обязан очистить всех кандидатов и уложиться
-// в ужиженный через опции SelectTimeout (30 с на пачку против продовых
-// 3600 с), а повторный — увидеть пустое множество (дренаж завершён).
-// Контракт-тест по сути: стоимость прод-петли на фикстуре не
-// воспроизводится (тесту без разницы, секунды или часы шёл проход,
-// пока укладывается в потолок) — он фиксирует, что проход с нулевого
-// курсора ЗАВЕРШАЕТСЯ и двигает дренаж до конца множества; форму плана
-// и факт исполнения на объёме проверяет TestRenderLateSelectPlanUnpinned
-// и EXPLAIN-тест закреплённой выборки retention выше.
+// TestContent_RetentionCatchUpFromZeroCursor — the main test gap of T-271,
+// closed by T-273: a catch-up pass from a ZERO cursor must finish within
+// the SelectTimeout with a clean skip prefix and drain the whole candidate
+// set. The production mechanics of the incident of Nov 09–10, 2026 (the
+// scale is a production proportion in miniature, the property matters
+// more than the absolute millions): retention had been down since the
+// night of Nov 08 → the cursor at zero → every select went "from the
+// beginning of the table" through millions of already clean rows (the
+// "anything to purge" predicate is outside the index — a heap visit of
+// each); the 600 s deadline killed the pass BEFORE the commit → the
+// cursor did not move → the identical doomed scan (an eternal loop).
+// Here: 200k clean aged rows (a clean skip prefix by checked_at) ahead of
+// 30k candidates (jsonb) and 5k fresh ones — one RetentionOnce pass must
+// purge all candidates and fit into the SelectTimeout squeezed through
+// the options (30 s per batch against the production 3600 s), and a
+// repeat pass must see an empty set (the drain is complete). A contract
+// test in essence: the cost of the production loop is not reproduced on
+// the fixture (the test does not care whether the pass took seconds or
+// hours as long as it fits the cap) — it pins down that a pass from a
+// zero cursor FINISHES and moves the drain to the end of the set; the
+// plan shape and the fact of running at scale are checked by
+// TestRenderLateSelectPlanUnpinned and the EXPLAIN test of the pinned
+// retention selection above.
 func TestContent_RetentionCatchUpFromZeroCursor(t *testing.T) {
 	skipUnlessIntegration(t)
 	pool := migratedSchema(t)
 	ctx := context.Background()
 
-	// Две зоны → выделенные партиции subdomain_results (прод — ~677;
-	// партиционирование — часть стоимости: Append по листам, PK-пробы).
+	// Two zones → dedicated partitions of subdomain_results (production —
+	// ~677; partitioning is part of the cost: an Append over the leaves,
+	// PK point reads).
 	var z1, z2 int16
 	if err := pool.QueryRow(ctx,
 		"INSERT INTO zones (name) VALUES ('cup-a.test') RETURNING id").Scan(&z1); err != nil {
@@ -1081,24 +1101,25 @@ func TestContent_RetentionCatchUpFromZeroCursor(t *testing.T) {
 	}
 
 	const (
-		cleanPrefix = 200000 // чистые остаревшие строки ПОЗАДИ курсора стоимости
-		dirty       = 30000  // кандидаты: остаревшие с jsonb
-		fresh       = 5000   // моложе окна — вне дренажа
+		cleanPrefix = 200000 // clean aged rows BEHIND the cost cursor
+		dirty       = 30000  // candidates: aged with jsonb
+		fresh       = 5000   // younger than the window — outside the drain
 		total       = cleanPrefix + dirty + fresh
 	)
-	// Домен на строку — прод-пропорция (43 млн domains при 11,3 млн
-	// записей: большинство доменов без записей).
+	// A domain per row — the production proportion (43M domains at 11.3M
+	// rows: most domains have no rows).
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO domains (zone_id, id, label)
 		SELECT CASE WHEN g % 2 = 0 THEN $1::int2 ELSE $2::int2 END, g, 'cup' || g
 		FROM generate_series(1, $3) g`, z1, z2, total); err != nil {
 		t.Fatalf("посев domains: %v", err)
 	}
-	// Строки по checked_at-порядку: чистый префикс [−35ч, −7,2ч] →
-	// кандидаты [−7ч, −6,2ч] (окно retention 6 ч — остаревшие) → свежие
-	// [−1ч, −59м]. Кандидаты отличимы заголовком jsonb (трим без ссылок
-	// — contents не нужен), чистый префикс — паспорт без jsonb, как их
-	// оставил retention до простоя.
+	// The rows in checked_at order: a clean prefix [−35h, −7.2h] →
+	// candidates [−7h, −6.2h] (the retention window of 6 h — aged) →
+	// fresh [−1h, −59min]. The candidates are distinguishable by the jsonb
+	// header (a trim without references — contents is not needed); the
+	// clean prefix — a passport without jsonb, the way retention left them
+	// before the downtime.
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO subdomain_results
 		    (zone_id, domain_id, subdomain_id, variant, scheme, checked_at, headers)
@@ -1116,10 +1137,11 @@ func TestContent_RetentionCatchUpFromZeroCursor(t *testing.T) {
 		t.Fatalf("ANALYZE: %v", err)
 	}
 
-	// Catch-up-проход с нулевого курсора: SelectTimeout ужижен через
-	// опции (30 с на пачку — щедро против фактических единиц секунд,
-	// многократно меньше продовых 3600 с: свойство «проход успевает»
-	// проверяется, а не ждётся час).
+	// A catch-up pass from the zero cursor: the SelectTimeout is squeezed
+	// through the options (30 s per batch — generous against the actual
+	// single-digit seconds, many times less than the production 3600 s:
+	// the property "the pass makes it" is checked, not waited out for an
+	// hour).
 	start := time.Now()
 	stats, err := content.RetentionOnce(ctx, pool, content.RetentionOptions{
 		Retention:     6 * time.Hour,
@@ -1139,8 +1161,8 @@ func TestContent_RetentionCatchUpFromZeroCursor(t *testing.T) {
 	if stats.BadHashes != 0 || stats.Missing != 0 || stats.Skipped || stats.SkippedPending {
 		t.Errorf("аномалий быть не должно: %+v", stats)
 	}
-	// Дренаж завершён: кандидатов не осталось (свежие не тронуты —
-	// у них headers на месте, окно возраста не вышло).
+	// The drain is complete: no candidates left (the fresh ones untouched —
+	// their headers are in place, the age window has not expired).
 	var n int
 	if err := pool.QueryRow(ctx,
 		"SELECT count(*) FROM subdomain_results WHERE headers IS NOT NULL").Scan(&n); err != nil {
@@ -1153,8 +1175,8 @@ func TestContent_RetentionCatchUpFromZeroCursor(t *testing.T) {
 		t.Errorf("catch-up-проход на фикстуре занял %v — деградация формы плана (бюджет теста: минута)", elapsed)
 	}
 
-	// Повторный проход — множество исчерпано (курсор/очистка
-	// продвинулись): пустой дренаж за одну выборку.
+	// A repeat pass — the set is exhausted (the cursor/cleanup advanced):
+	// an empty drain in one select.
 	stats, err = content.RetentionOnce(ctx, pool, content.RetentionOptions{
 		Retention:     6 * time.Hour,
 		BatchSize:     10000,
@@ -1168,22 +1190,23 @@ func TestContent_RetentionCatchUpFromZeroCursor(t *testing.T) {
 	}
 }
 
-// TestContent_RetentionCursorRestart — главный тест T-274: персистентный
-// курсор дренажа переживает рестарт http-worker. Цикл 1 дренирует окно
-// старения и фиксирует позицию в retention_drain_cursor (миграция 000020,
-// upsert транзакцией пачки); «рестарт» (новый RetentionLoop) читает
-// состояние и продолжает с него: запись, вставленная ПОЗАДИ курсора, не
-// посещается (чистый префикс не обходится — штраф рестарта снят),
-// остаревшая запись ВПЕРЕДИ курсора дренируется штатно. Полный
-// RetentionOnce (нулевой курсор, runbooks T-167 путь А) вычищает и
-// отставшую — потери данных нет, меняется только стоимость прохода.
-// Попутно — контракт одной строки таблицы (CHECK id = 1).
+// TestContent_RetentionCursorRestart — the main test of T-274: the
+// persistent drain cursor survives an http-worker restart. Circle 1
+// drains the aging window and commits the position to
+// retention_drain_cursor (migration 000020, an upsert in the batch's
+// transaction); the "restart" (a new RetentionLoop) reads the state and
+// continues from it: a row inserted BEHIND the cursor is not visited
+// (the clean prefix is not walked — the restart penalty is removed), an
+// aged row AHEAD of the cursor is drained normally. A full RetentionOnce
+// (a zero cursor, the runbooks T-167 path A) purges the laggard too — no
+// data loss, only the pass cost changes. Along the way — the single-row
+// contract of the table (CHECK id = 1).
 func TestContent_RetentionCursorRestart(t *testing.T) {
 	skipUnlessIntegration(t)
 	pool := migratedSchema(t)
 	ctx := context.Background()
 
-	// Вторая строка состояния невозможна по построению (CHECK миграции).
+	// A second state row is impossible by construction (the migration's CHECK).
 	if _, err := pool.Exec(ctx,
 		"INSERT INTO retention_drain_cursor (id, checked_at, zone_id, domain_id, subdomain_id, variant) "+
 			"VALUES (2, now(), 1, 1, 0, 0)"); err == nil {
@@ -1199,14 +1222,14 @@ func TestContent_RetentionCursorRestart(t *testing.T) {
 		"CREATE TABLE subdomain_results_cur_%d PARTITION OF subdomain_results FOR VALUES IN (%d)", z, z)); err != nil {
 		t.Fatalf("партиция зоны %d: %v", z, err)
 	}
-	// Два домена: записи первого дренирует цикл 1; второй — записи
-	// «после рестарта» (одна позади курсора, одна впереди).
+	// Two domains: circle 1 drains the first one's rows; the second — the
+	// rows "after the restart" (one behind the cursor, one ahead).
 	if _, err := pool.Exec(ctx,
 		"INSERT INTO domains (zone_id, id, label) VALUES ($1, 1, 'first'), ($1, 2, 'second')", z); err != nil {
 		t.Fatalf("посев domains: %v", err)
 	}
-	// Кандидаты первого прохода (окно 6 ч): порядок по checked_at
-	// d1/sub0 (−10 ч) → d1/sub1 (−9 ч) — курсор остановится на d1/sub1.
+	// The first pass's candidates (the 6 h window): the checked_at order
+	// d1/sub0 (−10 h) → d1/sub1 (−9 h) — the cursor will stop at d1/sub1.
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO subdomain_results (zone_id, domain_id, subdomain_id, variant, scheme, checked_at, headers)
 		VALUES
@@ -1215,8 +1238,8 @@ func TestContent_RetentionCursorRestart(t *testing.T) {
 		t.Fatalf("посев subdomain_results: %v", err)
 	}
 
-	// Цикл 1 («прошлый процесс»): стартовый проход дренирует окно и
-	// фиксирует курсор пачкой.
+	// Circle 1 ("the previous process"): the starting pass drains the
+	// window and commits the cursor with the batch.
 	loop := func() (content.RetentionStats, error) {
 		passed := make(chan content.RetentionStats, 1)
 		opts := content.RetentionOptions{
@@ -1243,7 +1266,7 @@ func TestContent_RetentionCursorRestart(t *testing.T) {
 		t.Fatalf("цикл 1: Rows = %d, want 2 (всё окно старения)", s.Rows)
 	}
 
-	// Состояние зафиксировано: позиция — последняя строка прохода 1.
+	// The state is committed: the position is the last row of pass 1.
 	var (
 		curChecked      time.Time
 		curZone, curSub int16
@@ -1260,7 +1283,7 @@ func TestContent_RetentionCursorRestart(t *testing.T) {
 			curZone, curDomain, curSub, curVariant, z)
 	}
 
-	// «Простой + рестарт»: появились кандидаты позади и впереди курсора.
+	// "Downtime + restart": candidates appeared behind and ahead of the cursor.
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO subdomain_results (zone_id, domain_id, subdomain_id, variant, scheme, checked_at, headers)
 		VALUES
@@ -1271,7 +1294,7 @@ func TestContent_RetentionCursorRestart(t *testing.T) {
 		t.Fatalf("посев после рестарта: %v", err)
 	}
 
-	// Цикл 2 («рестарт»): продолжает с сохранённого курсора.
+	// Circle 2 ("the restart"): continues from the saved cursor.
 	if s, err := loop(); err != nil {
 		t.Fatalf("цикл 2: %v", err)
 	} else if s.Rows != 1 {
@@ -1288,9 +1311,9 @@ func TestContent_RetentionCursorRestart(t *testing.T) {
 		t.Fatalf("позади курсора headers=%d (want 1 — не посещалась), впереди=%d (want 0 — вычищена)", behind, ahead)
 	}
 
-	// Потери нет: полный проход с нулевого курсора вычищает и отставшую;
-	// разовый проход состояние цикла не пишет — строка курсора цикла 2
-	// (позиция d2/sub1) остаётся на месте.
+	// No loss: a full pass from the zero cursor purges the laggard too;
+	// a one-off pass does not write the circle state — circle 2's cursor
+	// row (the d2/sub1 position) stays in place.
 	if _, err := pool.Exec(ctx, "ANALYZE subdomain_results"); err != nil {
 		t.Fatalf("ANALYZE: %v", err)
 	}
@@ -1315,17 +1338,18 @@ func TestContent_RetentionCursorRestart(t *testing.T) {
 	}
 }
 
-// planIdxScanRe — индексная форма доступа (Index Scan / Index Only
-// Scan) в EXPLAIN-тестах закрепления планов (T-271): покрывает обе
-// записи и листовые партиции PG16, и родителей PG17+. Якорь на начало
-// строки узла (^, ->): «Bitmap Index Scan»/«Bitmap Heap Scan» содержат
-// подстроку «Index Scan», и без якоря bitmap-план проходил проверку
-// (ревью T-271, P3-2) — сами bitmap-узлы запрещены в bad-списках тестов.
+// planIdxScanRe — the index access shape (Index Scan / Index Only Scan) in
+// the plan-pinning EXPLAIN tests (T-271): it covers both the PG16 leaf
+// partitions' entries and the PG17+ parents. The anchor at the start of
+// the node's line (^, ->): "Bitmap Index Scan"/"Bitmap Heap Scan" contain
+// the "Index Scan" substring, and without the anchor a bitmap plan passed
+// the check (the T-271 review, P3-2) — the bitmap nodes themselves are
+// forbidden in the tests' bad lists.
 var planIdxScanRe = regexp.MustCompile(`(?m)^\s*(?:->\s*)?(Index Scan|Index Only Scan)\b`)
 
-// explainPlan — текст EXPLAIN (COSTS OFF) запроса внутри транзакции
-// закрепления (T-271; вынесено из inline-блоков render_requeue_test.go
-// для тестов закрепления обоих курсорных выборок).
+// explainPlan — the EXPLAIN (COSTS OFF) text of a query inside the pinning
+// transaction (T-271; extracted from the inline blocks of
+// render_requeue_test.go for the pinning tests of both cursor selections).
 func explainPlan(t *testing.T, tx pgx.Tx, ctx context.Context, sql string) string {
 	t.Helper()
 	rows, err := tx.Query(ctx, "EXPLAIN (COSTS OFF) "+sql)

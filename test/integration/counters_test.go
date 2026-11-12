@@ -1,12 +1,13 @@
-// Интеграционные тесты инкрементальных счётчиков конвейера (T-178, ТЗИ
-// §12.2) против живого PostgreSQL (изолированная схема с миграциями,
-// стиль e2e_test.go): переходы реальными функциями пакетов
-// (scheduler/httpworker/ingest) ведут дельты; готовая verify-логика
-// monitor сверяет счётчики с живыми агрегатами после каждого эпизода;
-// сценарий дубль-доставки record (повторная запись одного домена) —
-// дельты не двоятся; удаление домена в queued декрементирует правильную
-// колонку; искусственный дрейф (ручной UPDATE zones) ловится verify и
-// чинится recount. Прогон — make test-integration.
+// Integration tests of the pipeline's incremental counters (T-178,
+// incremental-counters spec §12.2) against live PostgreSQL (an isolated
+// schema with migrations, the e2e_test.go style): transitions by the real
+// package functions (scheduler/httpworker/ingest) maintain the deltas; the
+// ready verify logic of monitor cross-checks the counters against live
+// aggregates after each episode; the record duplicate-delivery scenario
+// (writing one domain again) — the deltas are not double-counted;
+// deleting a queued domain decrements the right column; an artificial
+// drift (a manual UPDATE zones) is caught by verify and fixed by recount.
+// Run: make test-integration.
 package integration
 
 import (
@@ -37,8 +38,8 @@ import (
 	"crawler/internal/status"
 )
 
-// countersSchema — изолированная схема с миграциями (без метки
-// pg_stat_activity: обрывы соединений — территория e2e).
+// countersSchema — an isolated schema with migrations (no pg_stat_activity
+// label: connection drops are e2e territory).
 func countersSchema(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	dsn, cleanup := withTestSchema(t)
@@ -54,8 +55,8 @@ func countersSchema(t *testing.T) *pgxpool.Pool {
 	return pool
 }
 
-// countersStubQueue — queue.Queue для постановки: публикация всегда
-// успешна (проверяется БД-сторона переходов, не Redis).
+// countersStubQueue — a queue.Queue for enqueueing: publishing always
+// succeeds (the DB side of the transitions is tested, not Redis).
 type countersStubQueue struct{ published int }
 
 func (q *countersStubQueue) Publish(context.Context, string, queue.Message) (string, error) {
@@ -71,7 +72,7 @@ func (q *countersStubQueue) Ack(context.Context, string, string, ...string) erro
 	panic("countersStubQueue: Ack не используется")
 }
 
-// countersSeedZone — зона справочника; возвращает id.
+// countersSeedZone — a reference table zone; returns the id.
 func countersSeedZone(t *testing.T, pool *pgxpool.Pool, name string) int16 {
 	t.Helper()
 	var id int16
@@ -83,9 +84,9 @@ func countersSeedZone(t *testing.T, pool *pgxpool.Pool, name string) int16 {
 	return id
 }
 
-// countersSeedDomains — вставка доменов с состоянием/статусом; prefix
-// различает пачки одной зоны (UNIQUE (zone_id, label), ревью R2 P2-1);
-// возвращает id по порядку.
+// countersSeedDomains — inserts domains with a state/status; the prefix
+// distinguishes batches of one zone (UNIQUE (zone_id, label), review R2
+// P2-1); returns the ids in order.
 func countersSeedDomains(t *testing.T, pool *pgxpool.Pool, zone int16, prefix string, n int, state model.CheckState, status model.Status) []int64 {
 	t.Helper()
 	ids := make([]int64, 0, n)
@@ -102,8 +103,9 @@ func countersSeedDomains(t *testing.T, pool *pgxpool.Pool, zone int16, prefix st
 	return ids
 }
 
-// countersVerifyEmpty — сверка счётчиков с живыми агрегатами обязана
-// сходиться (допуск 0): любая позиция — ошибка теста с именем эпизода.
+// countersVerifyEmpty — the counters vs live aggregates cross-check must
+// converge (tolerance 0): any position is a test error with the episode
+// name.
 func countersVerifyEmpty(t *testing.T, pool *pgxpool.Pool, what string) {
 	t.Helper()
 	mismatch, err := monitor.VerifyCounters(context.Background(), pool, monitor.VerifyOptions{})
@@ -115,12 +117,12 @@ func countersVerifyEmpty(t *testing.T, pool *pgxpool.Pool, what string) {
 	}
 }
 
-// TestCounters_PipelineTransitions — переходы реальными операторами
-// пакетов (enqueue pending→queued, lease queued→pending, recheck
-// done→pending) ведут дельты зон; после каждого эпизода счётчики
-// сходятся с живыми агрегатами. Первый проход реконсиляции заполняет
-// нули, повторный — нулевой дрейф (идемпотентность), глобальные
-// счётчики — полная легенда model.Statuses.
+// TestCounters_PipelineTransitions — transitions by the real package
+// statements (enqueue pending→queued, lease queued→pending, recheck
+// done→pending) maintain the zone deltas; after each episode the counters
+// converge with the live aggregates. The first reconciliation pass fills
+// the zeros, a repeat one has zero drift (idempotence), the global
+// counters have the full model.Statuses legend.
 func TestCounters_PipelineTransitions(t *testing.T) {
 	skipUnlessIntegration(t)
 	pool := countersSchema(t)
@@ -131,8 +133,8 @@ func TestCounters_PipelineTransitions(t *testing.T) {
 	pending := countersSeedDomains(t, pool, zone, "p", 5, model.CheckStatePending, model.StatusNew)
 	countersSeedDomains(t, pool, zone, "d", 3, model.CheckStateDone, model.StatusAlive)
 
-	// Первый проход реконсиляции — заполняет нули; повторный — нулевой
-	// дрейф (идемпотентность).
+	// The first reconciliation pass fills the zeros; a repeat one has zero
+	// drift (idempotence).
 	first, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{})
 	if err != nil {
 		t.Fatalf("первый проход: %v", err)
@@ -149,9 +151,9 @@ func TestCounters_PipelineTransitions(t *testing.T) {
 			t.Fatalf("повторный проход: дрейф %s = %d→%d (проход идемпотентен)", p.Counter, p.Old, p.New)
 		}
 	}
-	// Легенда глобальных счётчиков — в строках crawler_counters
-	// (позиции дрейфа статусные строки не содержат: пишутся одной
-	// реконсиляцией, R1).
+	// The global counters legend is in the crawler_counters rows (the
+	// drift positions do not include the status rows: they are written by
+	// one reconciliation, R1).
 	{
 		rows, err := pool.Query(ctx, "SELECT name FROM crawler_counters")
 		if err != nil {
@@ -174,7 +176,7 @@ func TestCounters_PipelineTransitions(t *testing.T) {
 	}
 	countersVerifyEmpty(t, pool, "после реконсиляции")
 
-	// enqueue: pending → queued (дельты pending −5 / queued +5).
+	// enqueue: pending → queued (the deltas pending −5 / queued +5).
 	batch := make([]scheduler.DispatchRow, 0, len(pending))
 	for i, id := range pending {
 		batch = append(batch, scheduler.DispatchRow{ZoneID: zone, DomainID: id, Name: fmt.Sprintf("p%d.counters.test", i)})
@@ -188,8 +190,8 @@ func TestCounters_PipelineTransitions(t *testing.T) {
 	}
 	countersVerifyEmpty(t, pool, "после enqueue")
 
-	// lease: истёкшая аренда возвращает переведённые строки в pending
-	// (Timeout по умолчанию 30 минут — сдвигаем queued_at в прошлое).
+	// lease: an expired lease returns the changed rows to pending
+	// (the default Timeout is 30 minutes — shift queued_at into the past).
 	if _, err := pool.Exec(ctx,
 		"UPDATE domains SET queued_at = now() - interval '2 hours' WHERE zone_id = $1 AND check_state = $2",
 		zone, int16(model.CheckStateQueued)); err != nil {
@@ -204,7 +206,7 @@ func TestCounters_PipelineTransitions(t *testing.T) {
 	}
 	countersVerifyEmpty(t, pool, "после lease")
 
-	// recheck (возрастная перепроверка): done-строки старые — перевод
+	// recheck (the age-based recheck): the done rows are old — the change
 	// checked −n / pending +n.
 	if _, err := pool.Exec(ctx,
 		"UPDATE domains SET last_checked_at = current_date - 400 WHERE zone_id = $1 AND check_state = $2",
@@ -221,15 +223,15 @@ func TestCounters_PipelineTransitions(t *testing.T) {
 	countersVerifyEmpty(t, pool, "после recheck")
 }
 
-// TestCounters_RecordDoubleDelivery — запись результата HTTP-эпизода
-// поверх done (DNS-этап уже перевёл домен, T-178: DNS — главный переход
-// queued → done) и её повторная доставка: дельт зон нет ни у одной
-// записи (старое состояние строки — done, ТЗИ §6.4); суточный счётчик
-// проверок (T-179) считает события записи — по +1 на доставку, —
-// реконсиляция сводит строку к живому окну (один домен), дрейф
-// daily:checks наблюдаем в позициях прохода; сверка сходится (суточная
-// строка в verify не входит — принятое расхождение семантик,
-// TZ_slow_done_today §5.1).
+// TestCounters_RecordDoubleDelivery — writing the result of an HTTP
+// episode over done (the DNS stage already moved the domain, T-178: DNS is
+// the main queued → done transition) and its redelivery: neither write has
+// zone deltas (the row's old state is done, incremental-counters spec
+// §6.4); the daily checks counter (T-179) counts write events — +1 per
+// delivery; the reconciliation brings the row to the live window (one
+// domain), the daily:checks drift is observable in the pass positions; the
+// cross-check converges (the daily row is not part of verify — an accepted
+// semantic divergence, TZ_slow_done_today §5.1).
 func TestCounters_RecordDoubleDelivery(t *testing.T) {
 	skipUnlessIntegration(t)
 	pool := countersSchema(t)
@@ -242,8 +244,9 @@ func TestCounters_RecordDoubleDelivery(t *testing.T) {
 		t.Fatalf("счётчики зоны: %v", err)
 	}
 
-	// DNS-эпизод переводит queued → done (терминальный статус не нужен:
-	// ветка «есть адреса» — итог за HTTP-этапом).
+	// A DNS episode moves queued → done (no terminal status needed: the
+	// "there are addresses" branch — the verdict belongs to the HTTP
+	// stage).
 	ok, err := dnsworker.RecordEpisode(ctx, pool, zone, ids[0], dnsworker.EpisodeResult{Mask: 1}, nil)
 	if err != nil || !ok {
 		t.Fatalf("RecordEpisode: ok=%v err=%v", ok, err)
@@ -255,7 +258,7 @@ func TestCounters_RecordDoubleDelivery(t *testing.T) {
 		t.Fatalf("NewRecorder: %v", err)
 	}
 	res := &httpworker.DomainResult{ZoneID: zone, DomainID: ids[0], Name: "q0.record.test"}
-	for i := 0; i < 2; i++ { // дубль-доставка поверх done — без дельт зон
+	for i := 0; i < 2; i++ { // a duplicate delivery over done — no zone deltas
 		ok, err := rec.RecordAndPublish(ctx, res)
 		if err != nil || !ok {
 			t.Fatalf("запись %d: ok=%v err=%v", i+1, ok, err)
@@ -271,16 +274,17 @@ func TestCounters_RecordDoubleDelivery(t *testing.T) {
 		t.Fatalf("после record×2 queued=%d checked=%d, хочу 0/1 (дельта один раз — на DNS-переходе)", queued, checked)
 	}
 
-	// Суточный счётчик (T-179): две записи результата — два события
-	// (дельта не двоится на доставку: одна доставка — один инкремент);
-	// живое окно — один домен с last_checked_at = current_date.
+	// The daily counter (T-179): two result writes — two events (the delta
+	// is not doubled per delivery: one delivery is one increment);
+	// the live window — one domain with last_checked_at = current_date.
 	if got := countersChecksToday(t, pool); got != 2 {
 		t.Fatalf("после record×2 checks:<день> = %d, хочу 2 (по одному событию на запись)", got)
 	}
 	countersVerifyEmpty(t, pool, "после record×2 поверх done (суточная строка вне verify)")
 
-	// Реконсиляция — авторитет: строка дня := живое окно (1), дрейф
-	// |2 − 1| виден позицией daily:checks прохода.
+	// The reconciliation is the authority: the day row := the live window
+	// (1), the |2 − 1| drift is visible in the pass's daily:checks
+	// position.
 	pass, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{})
 	if err != nil {
 		t.Fatalf("реконсиляция: %v", err)
@@ -304,29 +308,29 @@ func TestCounters_RecordDoubleDelivery(t *testing.T) {
 	countersVerifyEmpty(t, pool, "после реконсиляции")
 }
 
-// countersChecksToday — значение строки суточного счётчика проверок
-// текущего дня (имя вычисляет БД — тот же current_date, что у инкремента
-// и окна реконсиляции); отсутствующая строка — ошибка теста.
+// countersChecksToday — the value of the current day's daily checks counter
+// row (the name is computed by the DB — the same current_date as the
+// increment and the reconciliation window); a missing row is a test error.
 func countersChecksToday(t *testing.T, pool *pgxpool.Pool) int64 {
 	t.Helper()
 	return countersDailyToday(t, pool, "checks")
 }
 
-// countersTempToday — значение строки суточного числителя temp_error
-// текущего дня (T-182); отсутствующая строка — ошибка теста.
+// countersTempToday — the value of the current day's daily temp_error
+// numerator row (T-182); a missing row is a test error.
 func countersTempToday(t *testing.T, pool *pgxpool.Pool) int64 {
 	t.Helper()
 	return countersDailyToday(t, pool, "temp_error")
 }
 
-// countersRetryMatureToday — значение сегодняшней корзины зрелости
-// ретрая (T-202); отсутствующая строка — ошибка теста.
+// countersRetryMatureToday — the value of today's retry maturity bucket
+// (T-202); a missing row is a test error.
 func countersRetryMatureToday(t *testing.T, pool *pgxpool.Pool) int64 {
 	t.Helper()
 	return countersDailyToday(t, pool, "retry_mature")
 }
 
-// countersDailyToday — значение суточной строки <prefix>:YYYY-MM-DD.
+// countersDailyToday — the value of the daily <prefix>:YYYY-MM-DD row.
 func countersDailyToday(t *testing.T, pool *pgxpool.Pool, prefix string) int64 {
 	t.Helper()
 	var v int64
@@ -340,13 +344,14 @@ func countersDailyToday(t *testing.T, pool *pgxpool.Pool, prefix string) int64 {
 	return v
 }
 
-// TestCounters_DNSTempErrorShare — суточный числитель temp_error (T-182,
-// TZ_slow_dns_share §8.2): temp_error-эпизод растит числитель и знаменатель
-// вместе; повторный эпизод без temp_error — только знаменатель; дубль
-// temp_error-эпизода — снова оба (доля устойчива к дублям); реконсиляция
-// сводит обе строки к живому окну (доля считается по строкам — скан окна
-// суток из алерта исчез), позиции daily:checks/daily:temp_error наблюдают
-// разницу семантик, verify суточные строки не сверяет.
+// TestCounters_DNSTempErrorShare — the daily temp_error numerator (T-182,
+// TZ_slow_dns_share §8.2): a temp_error episode grows the numerator and the
+// denominator together; a repeat episode without temp_error — the
+// denominator only; a temp_error episode duplicate — both again (the share
+// is robust to duplicates); the reconciliation brings both rows to the
+// live window (the share is computed over rows — the day-window scan from
+// the alert is gone); the daily:checks/daily:temp_error positions observe
+// the semantic difference; verify does not cross-check the daily rows.
 func TestCounters_DNSTempErrorShare(t *testing.T) {
 	skipUnlessIntegration(t)
 	pool := countersSchema(t)
@@ -354,8 +359,8 @@ func TestCounters_DNSTempErrorShare(t *testing.T) {
 
 	zone := countersSeedZone(t, pool, "share.test")
 	ids := countersSeedDomains(t, pool, zone, "s", 2, model.CheckStateQueued, model.StatusNew)
-	// Стартовый проход — колонки зон по живому агрегату (2 queued), суточные
-	// строки дня нулями (домены сегодня не проверялись).
+	// The starting pass — the zone columns from the live aggregate (2
+	// queued), the day's daily rows as zeros (no domains checked today).
 	if _, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{}); err != nil {
 		t.Fatalf("стартовый проход: %v", err)
 	}
@@ -364,8 +369,8 @@ func TestCounters_DNSTempErrorShare(t *testing.T) {
 		t.Fatalf("NewRecorder: %v", err)
 	}
 
-	// temp_error-эпизод: записи нет, все проверки — таймауты (вердикт
-	// temp_error, §5.5 п. 9).
+	// A temp_error episode: no records, all checks are timeouts (the
+	// temp_error verdict, §5.5 item 9).
 	tempRes := &httpworker.DomainResult{
 		ZoneID: zone, DomainID: ids[0], Name: "s0.share.test",
 		Subdomains: []httpworker.SubdomainResult{{
@@ -384,8 +389,8 @@ func TestCounters_DNSTempErrorShare(t *testing.T) {
 		t.Fatalf("после temp_error-эпизода temp_error:<день> = %d, хочу 1", got)
 	}
 
-	// Эпизод без temp_error (молчит постоянно — no_http): знаменатель
-	// растёт, числитель не тронут.
+	// An episode without temp_error (permanently silent — no_http): the
+	// denominator grows, the numerator untouched.
 	silentRes := &httpworker.DomainResult{ZoneID: zone, DomainID: ids[1], Name: "s1.share.test"}
 	if ok, err := rec.RecordAndPublish(ctx, silentRes); err != nil || !ok {
 		t.Fatalf("no_http-эпизод: ok=%v err=%v", ok, err)
@@ -397,8 +402,9 @@ func TestCounters_DNSTempErrorShare(t *testing.T) {
 		t.Fatalf("после no_http-эпизода temp_error:<день> = %d, хочу 1 (не temp_error-итог не инкрементирует)", got)
 	}
 
-	// Дубль-доставка temp_error-эпизода: +1 в числитель и знаменатель
-	// одновременно — доля не менялась бы, события записи честны.
+	// A duplicate delivery of the temp_error episode: +1 to the numerator
+	// and the denominator at once — the share would not change, the write
+	// events are honest.
 	if ok, err := rec.RecordAndPublish(ctx, tempRes); err != nil || !ok {
 		t.Fatalf("дубль temp_error-эпизода: ok=%v err=%v", ok, err)
 	}
@@ -410,9 +416,10 @@ func TestCounters_DNSTempErrorShare(t *testing.T) {
 	}
 	countersVerifyEmpty(t, pool, "после эпизодов доли (суточные строки вне verify)")
 
-	// Реконсиляция — авторитет: живое окно — 2 домена дня (у одного
-	// статус temp_error), доля 1/2; инкременты дали 3/2 (дубль) —
-	// позиции daily:* наблюдают разницу.
+	// The reconciliation is the authority: the live window is 2 domains of
+	// the day (one has the temp_error status), the share 1/2; the
+	// increments gave 3/2 (the duplicate) — the daily:* positions observe
+	// the difference.
 	pass, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{})
 	if err != nil {
 		t.Fatalf("реконсиляция: %v", err)
@@ -436,15 +443,16 @@ func TestCounters_DNSTempErrorShare(t *testing.T) {
 	countersVerifyEmpty(t, pool, "после реконсиляции доли")
 }
 
-// TestCounters_RetryMatureBaskets — корзины зрелости ретрая (T-202):
-// temp_error-эпизоды ОБЕИХ веток конвейера (HTTP-итог и терминальная
-// temp_error-ветка DNS-этапа — массовый DNS-инцидент приходит через
-// неё) инкрементируют сегодняшнюю корзину одним и тем же ключом; итогы
-// без temp_error корзину не трогают; дубль-доставка — ещё одно событие
-// (потоковая семантика, как у суточных строк); реконсиляция пишет
-// корзину живым окном (temp_error × done × дата), позиция
-// retry_mature:today наблюдает разницу семантик. Guard читает только
-// корзины прошедших суток — сегодняшняя тяжёлую выборку не открывает.
+// TestCounters_RetryMatureBaskets — the retry maturity buckets (T-202):
+// temp_error episodes of BOTH pipeline branches (the HTTP verdict and the
+// terminal DNS-stage temp_error branch — a bulk DNS incident arrives
+// through it) increment today's bucket with the same key; verdicts without
+// temp_error do not touch the bucket; a duplicate delivery is one more
+// event (the streaming semantics, like the daily rows); the reconciliation
+// writes the bucket from the live window (temp_error × done × date), the
+// retry_mature:today position observes the semantic difference. The guard
+// reads only the buckets of past days — today's does not open the heavy
+// selection.
 func TestCounters_RetryMatureBaskets(t *testing.T) {
 	skipUnlessIntegration(t)
 	pool := countersSchema(t)
@@ -452,8 +460,8 @@ func TestCounters_RetryMatureBaskets(t *testing.T) {
 
 	zone := countersSeedZone(t, pool, "mature.test")
 	ids := countersSeedDomains(t, pool, zone, "m", 3, model.CheckStateQueued, model.StatusNew)
-	// Стартовый проход — создаёт корзины нулями (сегодняшних temp_error
-	// эпизодов ещё нет).
+	// The starting pass creates the buckets as zeros (no temp_error
+	// episodes today yet).
 	if _, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{}); err != nil {
 		t.Fatalf("стартовый проход: %v", err)
 	}
@@ -462,7 +470,7 @@ func TestCounters_RetryMatureBaskets(t *testing.T) {
 		t.Fatalf("NewRecorder: %v", err)
 	}
 
-	// HTTP temp_error-эпизод (все проверки — таймауты): корзина суток +1.
+	// An HTTP temp_error episode (all checks are timeouts): the day bucket +1.
 	tempRes := &httpworker.DomainResult{
 		ZoneID: zone, DomainID: ids[0], Name: "m0.mature.test",
 		Subdomains: []httpworker.SubdomainResult{{
@@ -478,7 +486,7 @@ func TestCounters_RetryMatureBaskets(t *testing.T) {
 		t.Fatalf("после temp_error-эпизода HTTP retry_mature:<день> = %d, хочу 1", got)
 	}
 
-	// no_http-эпизод: корзину не трогает — зреют только temp_error-итоги.
+	// A no_http episode: does not touch the bucket — only temp_error verdicts ripen.
 	silentRes := &httpworker.DomainResult{ZoneID: zone, DomainID: ids[1], Name: "m1.mature.test"}
 	if ok, err := rec.RecordAndPublish(ctx, silentRes); err != nil || !ok {
 		t.Fatalf("no_http-эпизод: ok=%v err=%v", ok, err)
@@ -487,9 +495,9 @@ func TestCounters_RetryMatureBaskets(t *testing.T) {
 		t.Fatalf("после no_http-эпизода retry_mature:<день> = %d, хочу 1", got)
 	}
 
-	// Терминальная temp_error-ветка DNS-этапа (SERVFAIL апекса): тот же
-	// ключ корзины — отдельный autocommit-оператор ПОСЛЕ записи
-	// (T-267; прежде — CTE того же оператора, T-202).
+	// The terminal DNS-stage temp_error branch (an apex SERVFAIL): the same
+	// bucket key — a separate autocommit statement AFTER the write
+	// (T-267; formerly — a CTE of the same statement, T-202).
 	if ok, err := dnsworker.RecordEpisode(ctx, pool, zone, ids[2], dnsworker.EpisodeResult{
 		SetStatus: true,
 		Status:    model.StatusTempError,
@@ -500,8 +508,9 @@ func TestCounters_RetryMatureBaskets(t *testing.T) {
 		t.Fatalf("после temp_error-эпизода DNS retry_mature:<день> = %d, хочу 2", got)
 	}
 
-	// Дубль-доставка HTTP temp_error-эпизода: +1 событие (живое окно
-	// насчитает 2 домена — разницу семантик сводит реконсиляция).
+	// A duplicate delivery of the HTTP temp_error episode: one more event
+	// (the live window will count 2 domains — the reconciliation brings
+	// the semantic difference together).
 	if ok, err := rec.RecordAndPublish(ctx, tempRes); err != nil || !ok {
 		t.Fatalf("дубль temp_error-эпизода: ok=%v err=%v", ok, err)
 	}
@@ -510,8 +519,8 @@ func TestCounters_RetryMatureBaskets(t *testing.T) {
 	}
 	countersVerifyEmpty(t, pool, "после эпизодов (корзины вне verify)")
 
-	// Guard тяжёлой выборки ретрая: сегодняшняя корзина в сумму НЕ входит
-	// (эпизоды зреют к полуночи) — зрелых нет, сумма 0.
+	// The retry heavy-selection guard: today's bucket is NOT in the sum
+	// (episodes ripen by midnight) — nothing mature, the sum is 0.
 	var mature int64
 	if err := pool.QueryRow(ctx,
 		"SELECT coalesce(sum(value), 0) FROM crawler_counters "+
@@ -523,9 +532,10 @@ func TestCounters_RetryMatureBaskets(t *testing.T) {
 		t.Fatalf("сумма зрелых корзин = %d, хочу 0 (сегодняшние эпизоды незрелые)", mature)
 	}
 
-	// Реконсиляция — авторитет: корзина суток := живое окно
-	// (temp_error × done × текущая дата — два домена), позиция
-	// retry_mature:today наблюдает разницу (дубль события).
+	// The reconciliation is the authority: the day bucket := the live
+	// window (temp_error × done × the current date — two domains), the
+	// retry_mature:today position observes the difference (a duplicate
+	// event).
 	pass, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{})
 	if err != nil {
 		t.Fatalf("реконсиляция: %v", err)
@@ -546,16 +556,18 @@ func TestCounters_RetryMatureBaskets(t *testing.T) {
 	countersVerifyEmpty(t, pool, "после реконсиляции корзин")
 }
 
-// countersMatureFailPool — db.DB-обёртка пула: Exec инкремента корзины
-// retry_mature (resultMatureIncSQL dnsworker, T-267) падает, всё
-// остальное делегируется пулу — сценарий сбоя МЕЖДУ операторами записи
-// результата (переход уже зафиксирован, инкремент — нет).
+// countersMatureFailPool — a db.DB wrapper of the pool: the retry_mature
+// bucket increment Exec (dnsworker resultMatureIncSQL, T-267) fails,
+// everything else is delegated to the pool — a failure BETWEEN the result
+// write statements (the transition is already committed, the increment is
+// not).
 type countersMatureFailPool struct {
 	*pgxpool.Pool
 }
 
-// countersMatureIncMark — опознаватель инкремента корзины в тексте SQL
-// (дублирование литерал — стиль schema_test.go: константа не экспортирована).
+// countersMatureIncMark — the identifier of the bucket increment in the SQL
+// text (a literal duplication — the schema_test.go style: the constant is
+// not exported).
 const countersMatureIncMark = "VALUES ('retry_mature:' || to_char(current_date, 'YYYY-MM-DD'), 1, now())"
 
 func (p *countersMatureFailPool) CopyFrom(ctx context.Context, tableName pgx.Identifier, columnNames []string, rowSrc pgx.CopyFromSource) (int64, error) {
@@ -573,13 +585,13 @@ func (p *countersMatureFailPool) Query(ctx context.Context, sql string, args ...
 	return p.Pool.Query(ctx, sql, args...)
 }
 
-// TestCounters_RetryMatureIncrementFailure — окно неатомарности ±1
-// (T-267): инкремент корзины retry_mature:today — отдельный
-// autocommit-оператор ПОСЛЕ записи перехода; его сбой оставляет домен
-// записанным (done + temp_error), а корзину заниженной до ближайшей
-// реконсиляции — проход monitor пишет корзину живым окном
-// (temp_error × done × дата) и выравнивает её, guard ретрая не
-// страдает (читает только корзины прошедших суток).
+// TestCounters_RetryMatureIncrementFailure — the ±1 non-atomicity window
+// (T-267): the retry_mature:today bucket increment is a separate
+// autocommit statement AFTER the transition write; its failure leaves the
+// domain written (done + temp_error) and the bucket undercounted until the
+// nearest reconciliation — the monitor pass writes the bucket from the
+// live window (temp_error × done × date) and evens it out; the retry guard
+// is not affected (it reads only the buckets of past days).
 func TestCounters_RetryMatureIncrementFailure(t *testing.T) {
 	skipUnlessIntegration(t)
 	pool := countersSchema(t)
@@ -600,7 +612,7 @@ func TestCounters_RetryMatureIncrementFailure(t *testing.T) {
 		t.Fatal("recorded = false, want true: переход зафиксирован до сбоя инкремента")
 	}
 
-	// Переход записан: домен done + temp_error, дельты зоны честные.
+	// The transition is written: the domain done + temp_error, the zone deltas honest.
 	var status, state int16
 	if err := pool.QueryRow(ctx,
 		"SELECT status, check_state FROM domains WHERE zone_id = $1 AND id = $2", zone, ids[0],
@@ -612,11 +624,12 @@ func TestCounters_RetryMatureIncrementFailure(t *testing.T) {
 			status, state)
 	}
 
-	// Корзина занижена на 1 (инкремент не прошёл) — живое окно видит
-	// одного temp_error сегодня. Строки корзины может не быть вовсе:
-	// resultMatureIncSQL — upsert, он же и создатель строки, а его
-	// перехватил fail-пул — ErrNoRows и есть корзина 0 (занижение до
-	// реконсиляции в терминах отсутствия инкремента).
+	// The bucket is undercounted by 1 (the increment failed) — the live
+	// window sees one temp_error today. The bucket row may not exist at
+	// all: resultMatureIncSQL is an upsert and the row's creator, and the
+	// fail pool intercepted it — ErrNoRows is the bucket 0 (the
+	// undercount until the reconciliation, in terms of a missing
+	// increment).
 	var basket int64
 	err = pool.QueryRow(ctx,
 		"SELECT value FROM crawler_counters "+
@@ -624,7 +637,7 @@ func TestCounters_RetryMatureIncrementFailure(t *testing.T) {
 	).Scan(&basket)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
-		basket = 0 // строки нет — корзина не создана (инкремент упал)
+		basket = 0 // no row — the bucket was not created (the increment failed)
 	case err != nil:
 		t.Fatalf("чтение корзины суток: %v", err)
 	}
@@ -632,8 +645,8 @@ func TestCounters_RetryMatureIncrementFailure(t *testing.T) {
 		t.Fatalf("корзина суток = %d, want 0 (инкремент упал — окно ±1 до реконсиляции)", basket)
 	}
 
-	// Реконсиляция — авторитет: корзина := живое окно (один temp_error ×
-	// done сегодня), занижение догнано.
+	// The reconciliation is the authority: the bucket := the live window
+	// (one temp_error × done today), the undercount is caught up.
 	if _, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{}); err != nil {
 		t.Fatalf("реконсиляция: %v", err)
 	}
@@ -648,12 +661,13 @@ func TestCounters_RetryMatureIncrementFailure(t *testing.T) {
 	}
 }
 
-// TestCounters_DailyChecksDayChange — ротация суток (T-179, ТЗ §9.2):
-// эмуляция смены даты фиксированной таймзоной соединения (current_date
-// выводится из TimeZone сессии): записи «в разные дни» ведут разные
-// строки checks:, вчерашняя остаётся историей темпа, живое окно каждого
-// дня считает только его записи. Пул с MaxConns=1 — SET TimeZone
-// действует на единственное соединение, транзакции записи видят его.
+// TestCounters_DailyChecksDayChange — the day rollover (T-179, spec §9.2):
+// emulating a date change with a fixed connection time zone (current_date
+// is derived from the session TimeZone): writes "on different days"
+// maintain different checks: rows, yesterday's stays as throughput history,
+// the live window of each day counts only its writes. A pool with
+// MaxConns=1 — SET TimeZone affects the single connection, the write
+// transactions see it.
 func TestCounters_DailyChecksDayChange(t *testing.T) {
 	skipUnlessIntegration(t)
 	dsn, cleanup := withTestSchema(t)
@@ -665,7 +679,7 @@ func TestCounters_DailyChecksDayChange(t *testing.T) {
 	if err != nil {
 		t.Fatalf("разбор DSN: %v", err)
 	}
-	cfg.MaxConns = 1 // TimeZone сессионный: все операторы — одно соединение
+	cfg.MaxConns = 1 // the TimeZone is session-level: all statements — one connection
 	pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
 	if err != nil {
 		t.Fatalf("пул: %v", err)
@@ -673,11 +687,11 @@ func TestCounters_DailyChecksDayChange(t *testing.T) {
 	t.Cleanup(pool.Close)
 	ctx := context.Background()
 
-	// Pacific/Midway (UTC−11) и Pacific/Kiritimati (UTC+14) —
-	// разносят current_date минимум на сутки в любой момент прогона
-	// (25 часов между зонами; DST в обеих нет). set_config —
-	// параметризуемый аналог SET TIME ZONE (сам SET параметров не
-	// принимает), is_local=false — уровень сессии.
+	// Pacific/Midway (UTC−11) and Pacific/Kiritimati (UTC+14) —
+	// spread current_date by at least a day at any moment of the run
+	// (25 hours between the zones; no DST in either). set_config is the
+	// parameterizable analog of SET TIME ZONE (SET itself takes no
+	// parameters), is_local=false — the session level.
 	const (
 		tzDay1 = "Pacific/Midway"
 		tzDay2 = "Pacific/Kiritimati"
@@ -719,7 +733,7 @@ func TestCounters_DailyChecksDayChange(t *testing.T) {
 		return v, true
 	}
 
-	// День 1: первый домен записан — строка дня создана инкрементом.
+	// Day 1: the first domain is written — the day row is created by the increment.
 	setTZ(tzDay1)
 	if ok, err := rec.RecordAndPublish(ctx, &httpworker.DomainResult{
 		ZoneID: zone, DomainID: ids[0], Name: "d0.days.test",
@@ -730,8 +744,8 @@ func TestCounters_DailyChecksDayChange(t *testing.T) {
 		t.Fatalf("checks:%s = (%d, %v), хочу (1, true) — строку создаёт первый инкремент суток", day1, v, ok)
 	}
 
-	// День 2 (для соединения): второй домен — новая строка, вчерашняя
-	// не тронута.
+	// Day 2 (for the connection): the second domain — a new row,
+	// yesterday's untouched.
 	setTZ(tzDay2)
 	if ok, err := rec.RecordAndPublish(ctx, &httpworker.DomainResult{
 		ZoneID: zone, DomainID: ids[1], Name: "d1.days.test",
@@ -745,9 +759,9 @@ func TestCounters_DailyChecksDayChange(t *testing.T) {
 		t.Fatalf("checks:%s = (%d, %v) после записи дня 2, хочу (1, true) — история не тронута", day1, v, ok)
 	}
 
-	// Реконсиляция «дня 2»: окно current_date видит только домен дня 2
-	// (last_checked_at дня 1 вне окна), строка дня 2 сходится, день 1
-	// проход не перезаписывает.
+	// The "day 2" reconciliation: the current_date window sees only the day
+	// 2 domain (the day 1 last_checked_at is outside the window), the day 2
+	// row converges, the pass does not overwrite day 1.
 	if _, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{}); err != nil {
 		t.Fatalf("реконсиляция: %v", err)
 	}
@@ -759,11 +773,11 @@ func TestCounters_DailyChecksDayChange(t *testing.T) {
 	}
 }
 
-// TestCounters_DNSStageTransitions — главный переход конвейера
-// queued/pending → done ведёт дельты во всех ветках DNS-этапа
-// (терминальный статус, «есть адреса», диагноз invalid), включая
-// домен с истёкшей посреди эпизода арендой (pending) и повторную
-// доставку (done — идемпотентный no-op, ревью P1-1).
+// TestCounters_DNSStageTransitions — the pipeline's main transition
+// queued/pending → done maintains the deltas in all DNS-stage branches
+// (a terminal status, "there are addresses", the invalid diagnosis),
+// including a domain with a lease expired in the middle of the episode
+// (pending) and a redelivery (done — an idempotent no-op, review P1-1).
 func TestCounters_DNSStageTransitions(t *testing.T) {
 	skipUnlessIntegration(t)
 	pool := countersSchema(t)
@@ -775,7 +789,7 @@ func TestCounters_DNSStageTransitions(t *testing.T) {
 		t.Fatalf("реконсиляция: %v", err)
 	}
 
-	// Постановка: 4 × pending → queued.
+	// Enqueueing: 4 × pending → queued.
 	q := &countersStubQueue{}
 	batch := make([]scheduler.DispatchRow, len(ids))
 	for i, id := range ids {
@@ -786,8 +800,9 @@ func TestCounters_DNSStageTransitions(t *testing.T) {
 	}
 	countersVerifyEmpty(t, pool, "после enqueue")
 
-	// d0 «вернула аренда» посреди эпизода: pending → done — дельта
-	// pending −1/checked +1 (предчтение старого состояния, ТЗИ §6.1.2).
+	// d0 "returned by the lease" in the middle of the episode: pending →
+	// done — the delta pending −1/checked +1 (pre-reading the old state,
+	// incremental-counters spec §6.1.2).
 	if _, err := pool.Exec(ctx,
 		"UPDATE domains SET check_state = 0, queued_at = NULL WHERE zone_id = $1 AND id = $2",
 		zone, ids[0]); err != nil {
@@ -797,7 +812,7 @@ func TestCounters_DNSStageTransitions(t *testing.T) {
 		t.Fatalf("дельта возврата: %v", err)
 	}
 
-	// Терминальный статус (not_delegated): queued → done.
+	// A terminal status (not_delegated): queued → done.
 	ok, err := dnsworker.RecordEpisode(ctx, pool, zone, ids[1], dnsworker.EpisodeResult{
 		SetStatus: true, Status: model.StatusNotDelegated, Mask: 1,
 	}, nil)
@@ -806,14 +821,14 @@ func TestCounters_DNSStageTransitions(t *testing.T) {
 	}
 	countersVerifyEmpty(t, pool, "после терминального статуса")
 
-	// Ветка «есть адреса»: pending → done.
+	// The "there are addresses" branch: pending → done.
 	ok, err = dnsworker.RecordEpisode(ctx, pool, zone, ids[0], dnsworker.EpisodeResult{Mask: 3}, nil)
 	if err != nil || !ok {
 		t.Fatalf("RecordEpisode keep-status: ok=%v err=%v", ok, err)
 	}
 	countersVerifyEmpty(t, pool, "после ветки «есть адреса»")
 
-	// Повторная доставка уже зафиксированного эпизода — no-op.
+	// A redelivery of an already committed episode — a no-op.
 	ok, err = dnsworker.RecordEpisode(ctx, pool, zone, ids[1], dnsworker.EpisodeResult{
 		SetStatus: true, Status: model.StatusNotDelegated, Mask: 1,
 	}, nil)
@@ -822,7 +837,7 @@ func TestCounters_DNSStageTransitions(t *testing.T) {
 	}
 	countersVerifyEmpty(t, pool, "после дубля доставки")
 
-	// Диагноз invalid: queued → done, строка покидает цикл.
+	// The invalid diagnosis: queued → done, the row leaves the cycle.
 	ok, err = dnsworker.RecordInvalid(ctx, pool, zone, ids[2], nil)
 	if err != nil || !ok {
 		t.Fatalf("RecordInvalid: ok=%v err=%v", ok, err)
@@ -839,13 +854,14 @@ func TestCounters_DNSStageTransitions(t *testing.T) {
 		t.Fatalf("после DNS-переходов queued=%d checked=%d, хочу 1/3", queued, checked)
 	}
 
-	// Суточный счётчик проверок (T-179): инкремент — событие записи
-	// результата httpworker, DNS-переходы его не дают (эпизода HTTP у
-	// терминальных веток нет) — строка дня осталась нулём стартового
-	// прохода; живое окно выросло до 3 (last_checked_at = current_date
-	// ставит и DNS-этап). Проход — авторитет: перезаписывает строку
-	// окном, дрейф-позиция daily:checks наблюдает разницу потоков
-	// (3 DNS-only завершения), не «нули-аномалию».
+	// The daily checks counter (T-179): the increment is an httpworker
+	// result-write event, the DNS transitions do not produce it (terminal
+	// branches have no HTTP episode) — the day row stayed at the starting
+	// pass's zero; the live window grew to 3 (the DNS stage also sets
+	// last_checked_at = current_date). The pass is the authority: it
+	// overwrites the row with the window, the daily:checks drift position
+	// observes the difference of the flows (3 DNS-only completions), not a
+	// "zero anomaly".
 	if got := countersChecksToday(t, pool); got != 0 {
 		t.Fatalf("после DNS-переходов checks:<день> = %d, хочу 0 (инкремент — только запись результата HTTP)", got)
 	}
@@ -871,9 +887,9 @@ func TestCounters_DNSStageTransitions(t *testing.T) {
 	}
 }
 
-// countersShiftForManual — дельта счётчиков зоны для ручного перевода
-// строки мимо кода (вспомогательный перевод сценария «аренда истекла
-// посреди эпизода»: total, pending, queued, checked).
+// countersShiftForManual — the zone counter delta for a manual row change
+// bypassing the code (supporting the "the lease expired in the middle of
+// the episode" scenario: total, pending, queued, checked).
 func countersShiftForManual(ctx context.Context, pool *pgxpool.Pool, zone int16, total, pending, queued, checked int64) error {
 	_, err := pool.Exec(ctx,
 		"UPDATE zones SET domains_total = domains_total + $2, domains_pending = domains_pending + $3, "+
@@ -882,9 +898,10 @@ func countersShiftForManual(ctx context.Context, pool *pgxpool.Pool, zone int16,
 	return err
 }
 
-// TestCounters_DeleteWhileQueued — удаление доменов в queued
-// (delete-файл через staging): декремент queued-колонки (check_state
-// строк возвращён оператором), total тоже; сверка сходится (ТЗИ §12.2).
+// TestCounters_DeleteWhileQueued — deleting queued domains (a delete file
+// through staging): the queued column is decremented (the rows'
+// check_state returned by the statement), total too; the cross-check
+// converges (incremental-counters spec §12.2).
 func TestCounters_DeleteWhileQueued(t *testing.T) {
 	skipUnlessIntegration(t)
 	pool := countersSchema(t)
@@ -897,8 +914,8 @@ func TestCounters_DeleteWhileQueued(t *testing.T) {
 		t.Fatalf("счётчики зоны: %v", err)
 	}
 
-	// Партия delete в staging (StageTable — прямой INSERT: колонки
-	// партии, line_no заполняет DEFAULT).
+	// A delete batch into staging (StageTable — a direct INSERT: the batch
+	// columns, line_no is filled by DEFAULT).
 	batch, err := ingest.NewBatchID()
 	if err != nil {
 		t.Fatal(err)
@@ -929,12 +946,12 @@ func TestCounters_DeleteWhileQueued(t *testing.T) {
 	countersVerifyEmpty(t, pool, "после delete в queued")
 }
 
-// TestCounters_DeleteWithRenderPending — удаление домена с битом
-// render_pending (T-186): применение delete снимает бит той же
-// транзакцией и декрементирует счётчик рендер-долга (инвариант T-175
-// «счётчик = число строк с битом»); прочие биты сохраняются; повторное
-// применение партии (at-least-once, ТЗ 3.4) не декрементирует дважды;
-// сверка сходится.
+// TestCounters_DeleteWithRenderPending — deleting a domain with the
+// render_pending bit (T-186): applying delete clears the bit in the same
+// transaction and decrements the render debt counter (the T-175 invariant
+// "the counter = the number of rows with the bit"); other bits are
+// preserved; reapplying the batch (at-least-once, spec 3.4) does not
+// decrement twice; the cross-check converges.
 func TestCounters_DeleteWithRenderPending(t *testing.T) {
 	skipUnlessIntegration(t)
 	pool := countersSchema(t)
@@ -942,17 +959,18 @@ func TestCounters_DeleteWithRenderPending(t *testing.T) {
 
 	zone := countersSeedZone(t, pool, "render-del.test")
 	ids := countersSeedDomains(t, pool, zone, "r", 2, model.CheckStateDone, model.StatusAlive)
-	// Бит render_pending (2) поверх is_idn (1) — как постановка флага в
-	// записи результата (renderq.go); счётчик долга — те же переходы
-	// (бэкфилл 000015 считал бы 2).
+	// The render_pending bit (2) over is_idn (1) — as flag setting in the
+	// result write (renderq.go); the debt counter — the same transitions
+	// (the 000015 backfill would count 2).
 	for _, id := range ids {
 		if _, err := pool.Exec(ctx,
 			"UPDATE domains SET flags = 3 WHERE zone_id = $1 AND id = $2", zone, id); err != nil {
 			t.Fatalf("бит render_pending домена %d: %v", id, err)
 		}
 	}
-	// Строка счётчика существует после миграции 000015 (бэкфилл пустой
-	// схемы — 0); сеем значение, как вели бы переходы постановки бита.
+	// The counter row exists after migration 000015 (the backfill of an
+	// empty schema — 0); we seed the value the way the bit-setting
+	// transitions would.
 	if _, err := pool.Exec(ctx,
 		"INSERT INTO crawler_counters (name, value) VALUES ('render_pending', 2) "+
 			"ON CONFLICT (name) DO UPDATE SET value = EXCLUDED.value"); err != nil {
@@ -983,7 +1001,7 @@ func TestCounters_DeleteWithRenderPending(t *testing.T) {
 		t.Fatalf("итог delete = %+v, хочу {2 0}", res)
 	}
 
-	// Бит снят, is_idn сохранён; счётчик долга декрементирован на 2.
+	// The bit is cleared, is_idn preserved; the debt counter decremented by 2.
 	for i, id := range ids {
 		var flags int16
 		if err := pool.QueryRow(ctx,
@@ -1005,10 +1023,11 @@ func TestCounters_DeleteWithRenderPending(t *testing.T) {
 	}
 	countersVerifyEmpty(t, pool, "после delete с битом")
 
-	// Повторная доставка того же delete-содержимого (новая партия,
-	// at-least-once, ТЗ 3.4): домены уже deleted — охрана статуса не
-	// декрементирует счётчик дважды и не трогает биты, отчёт считает
-	// строки «удалёнными» (семантика T-019).
+	// A redelivery of the same delete content (a new batch,
+	// at-least-once, spec 3.4): the domains are already deleted — the
+	// status guard does not decrement the counter twice and does not touch
+	// the bits; the report counts the rows as "deleted" (the T-019
+	// semantics).
 	if res := apply(mustBatchID(t)); res.Deleted != 2 || res.NotFound != 0 {
 		t.Fatalf("повтор = %+v, хочу {2 0} (уже удалён — тоже «удалён»)", res)
 	}
@@ -1022,7 +1041,7 @@ func TestCounters_DeleteWithRenderPending(t *testing.T) {
 	countersVerifyEmpty(t, pool, "после повтора delete")
 }
 
-// mustBatchID — новая партия для повторного применения сценария T-186.
+// mustBatchID — a new batch for reapplying in the T-186 scenario.
 func mustBatchID(t *testing.T) ingest.BatchID {
 	t.Helper()
 	id, err := ingest.NewBatchID()
@@ -1032,9 +1051,10 @@ func mustBatchID(t *testing.T) ingest.BatchID {
 	return id
 }
 
-// TestCounters_DriftCaughtAndFixed — искусственный дрейф (ручной UPDATE
-// zones мимо кода): verify ловит позицию (для CLI это код 1), recount
-// чинит, повторная verify чиста (критерий ТЗИ §12.3).
+// TestCounters_DriftCaughtAndFixed — an artificial drift (a manual UPDATE
+// zones bypassing the code): verify catches the position (for the CLI it
+// is exit code 1), recount fixes it, a repeat verify is clean (the
+// incremental-counters spec §12.3 criterion).
 func TestCounters_DriftCaughtAndFixed(t *testing.T) {
 	skipUnlessIntegration(t)
 	pool := countersSchema(t)
@@ -1046,7 +1066,7 @@ func TestCounters_DriftCaughtAndFixed(t *testing.T) {
 		t.Fatalf("реконсиляция: %v", err)
 	}
 
-	// Дрейф: ручной SQL мимо кода переходов.
+	// The drift: manual SQL bypassing the transition code.
 	if _, err := pool.Exec(ctx,
 		"UPDATE zones SET domains_pending = domains_pending + 5 WHERE id = $1", zone); err != nil {
 		t.Fatalf("дрейф: %v", err)
@@ -1059,16 +1079,16 @@ func TestCounters_DriftCaughtAndFixed(t *testing.T) {
 		t.Fatalf("verify = %+v, хочу единственную зону:%d:pending", mismatch, zone)
 	}
 
-	// recount чинит; повторная verify чиста.
+	// recount fixes it; a repeat verify is clean.
 	if _, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{}); err != nil {
 		t.Fatalf("recount: %v", err)
 	}
 	countersVerifyEmpty(t, pool, "после recount")
 }
 
-// countersHourRenderer — Renderer для часовых корзин (T-203): живой
-// результат рендера без Chromium (проверяется БД-сторона — флаг rendered
-// и корзина, не браузер).
+// countersHourRenderer — a Renderer for the hourly buckets (T-203): a live
+// render result without Chromium (the DB side is tested — the rendered
+// flag and the bucket, not the browser).
 type countersHourRenderer struct{}
 
 func (countersHourRenderer) Run(_ context.Context, _ render.RenderTask) (render.RenderOutput, error) {
@@ -1078,9 +1098,9 @@ func (countersHourRenderer) Run(_ context.Context, _ render.RenderTask) (render.
 	}, nil
 }
 
-// countersHourlyBucket — значение корзины <prefix>:YYYY-MM-DD"T"HH24
-// (boundary — SQL-выражение часа, вычисляет БД); отсутствующая строка —
-// (0, false).
+// countersHourlyBucket — the value of the <prefix>:YYYY-MM-DD"T"HH24
+// bucket (boundary — the SQL expression of the hour, computed by the DB);
+// a missing row is (0, false).
 func countersHourlyBucket(t *testing.T, pool *pgxpool.Pool, prefix, boundary string) (int64, bool) {
 	t.Helper()
 	var v int64
@@ -1094,14 +1114,15 @@ func countersHourlyBucket(t *testing.T, pool *pgxpool.Pool, prefix, boundary str
 	return v, true
 }
 
-// TestCounters_HourlyThroughputBaskets — часовые корзины темпа (T-203):
-// эпизод записи результата ведёт results-корзину текущего часа дельтой
-// вставленных строк (молчаливый эпизод корзину не трогает); рендер ведёт
-// rendered-корзину часа checked_at строки (флаг и корзина — одной
-// транзакцией); реконсиляция сводит корзины с живым count по календарному
-// часу (prev-корзину создаёт по строке, сидированной мимо инкрементов) и
-// удаляет устаревшие корзины; читатель темпа (status.FetchThroughput)
-// собирает окно из двух живых корзин.
+// TestCounters_HourlyThroughputBaskets — the hourly throughput buckets
+// (T-203): a result-write episode maintains the current hour's results
+// bucket with the delta of the inserted rows (a silent episode does not
+// touch the bucket); a render maintains the rendered bucket of the row's
+// checked_at hour (the flag and the bucket — one transaction); the
+// reconciliation brings the buckets to the live count by the calendar hour
+// (it creates the prev bucket from a row seeded bypassing the increments)
+// and deletes stale buckets; the throughput reader
+// (status.FetchThroughput) assembles the window from the two live buckets.
 func TestCounters_HourlyThroughputBaskets(t *testing.T) {
 	skipUnlessIntegration(t)
 	pool := countersSchema(t)
@@ -1117,15 +1138,16 @@ func TestCounters_HourlyThroughputBaskets(t *testing.T) {
 		t.Fatalf("NewRecorder: %v", err)
 	}
 
-	// Строка прошлого часа, сидированная мимо инкрементов (перепроверка
-	// «до деплоя»): prev-корзину обязан создать проход живым окном.
-	// Момент — первая минута предыдущего календарного часа (граница от
-	// БД: строка гарантированно внутри prev-часа в любой момент прогона;
-	// гонка с границей часа посреди теста — окно в миллисекунды).
-	// Домен — ids[2], БЕЗ эпизодов записи: каждый RecordAndPublish
-	// перезаписывает результат домена целиком (recordDeleteSQL, §3.5
-	// «история проверок не хранится») — строка под h0/h1 была бы стёрта
-	// эпизодами ниже, а не дожила бы до реконсиляции.
+	// A row of the past hour, seeded bypassing the increments (a recheck
+	// "before the deploy"): the pass must create the prev bucket from the
+	// live window. The moment — the first minute of the previous calendar
+	// hour (the boundary comes from the DB: the row is guaranteed to be
+	// inside the prev hour at any moment of the run; racing the hour
+	// boundary in the middle of the test leaves a window of milliseconds).
+	// The domain is ids[2], WITHOUT write episodes: every RecordAndPublish
+	// overwrites the domain's result entirely (recordDeleteSQL, §3.5 "no
+	// check history is stored") — a row under h0/h1 would be wiped by the
+	// episodes below rather than survive to the reconciliation.
 	if _, err := pool.Exec(ctx,
 		"INSERT INTO subdomain_results (zone_id, domain_id, subdomain_id, scheme, final_url, checked_at) "+
 			"VALUES ($1, $2, 1, 2, 'https://old.hour.test/', "+
@@ -1134,8 +1156,8 @@ func TestCounters_HourlyThroughputBaskets(t *testing.T) {
 		t.Fatalf("строка прошлого часа: %v", err)
 	}
 
-	// Эпизод с двумя записями (два субдомена × по записи): корзина
-	// текущего часа +2 — дельта равна вставленным строкам.
+	// An episode with two records (two subdomains × one record each): the
+	// current hour bucket +2 — the delta equals the inserted rows.
 	rich := &httpworker.DomainResult{
 		ZoneID: zone, DomainID: ids[0], Name: "h0.hour.test",
 		Subdomains: []httpworker.SubdomainResult{
@@ -1162,7 +1184,7 @@ func TestCounters_HourlyThroughputBaskets(t *testing.T) {
 		t.Fatalf("после эпизода results:<час> = (%d, %v), хочу (2, true) — дельта вставленных строк", v, ok)
 	}
 
-	// Молчаливый temp_error-эпизод: записей нет — корзину не трогает.
+	// A silent temp_error episode: no records — it does not touch the bucket.
 	silent := &httpworker.DomainResult{
 		ZoneID: zone, DomainID: ids[1], Name: "h1.hour.test",
 		Subdomains: []httpworker.SubdomainResult{{
@@ -1178,8 +1200,9 @@ func TestCounters_HourlyThroughputBaskets(t *testing.T) {
 		t.Fatalf("после молчаливого эпизода results:<час> = %d, хочу 2 (эпизод без строк корзину не трогает)", v)
 	}
 
-	// Рендер строки эпизода: rendered-корзина часа checked_at строки +1
-	// (флаг и корзина — одна транзакция замены контента).
+	// Rendering the episode's row: the rendered bucket of the row's
+	// checked_at hour +1 (the flag and the bucket — one content-replacement
+	// transaction).
 	store, err := content.OpenPackStore(pool, content.PackOptions{
 		Dir:           t.TempDir(),
 		PackSize:      8 << 10,
@@ -1203,8 +1226,9 @@ func TestCounters_HourlyThroughputBaskets(t *testing.T) {
 		t.Fatalf("после рендера rendered:<час> = (%d, %v), хочу (1, true)", v, ok)
 	}
 
-	// Устаревшие корзины (старше предыдущего часа): сид прямым INSERT —
-	// проход обязан удалить (живое окно темпа, не история).
+	// Stale buckets (older than the previous hour): seeded by a direct
+	// INSERT — the pass must delete them (the live throughput window, not
+	// history).
 	for _, name := range []string{"results:2000-01-01T00", "rendered:2000-01-01T00"} {
 		if _, err := pool.Exec(ctx,
 			"INSERT INTO crawler_counters (name, value, updated_at) VALUES ($1, 999, now())", name,
@@ -1213,10 +1237,10 @@ func TestCounters_HourlyThroughputBaskets(t *testing.T) {
 		}
 	}
 
-	// Реконсиляция — авторитет: prev-корзины создаются живым окном
-	// (results 1 — сид-строка, rendered 0), cur — сходятся с
-	// инкрементами (2/1, расхождений семантик нет — дрейф нулевой);
-	// устаревшие удаляются.
+	// The reconciliation is the authority: the prev buckets are created
+	// from the live window (results 1 — the seeded row, rendered 0), cur
+	// converges with the increments (2/1, no semantic divergences — zero
+	// drift); the stale ones are deleted.
 	if _, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{}); err != nil {
 		t.Fatalf("реконсиляция: %v", err)
 	}
@@ -1241,8 +1265,9 @@ func TestCounters_HourlyThroughputBaskets(t *testing.T) {
 		}
 	}
 
-	// Читатель темпа: окно из двух живых корзин (prev 1 + cur 2), доля
-	// rendered 1, окно покрытия 1–2 ч — делитель честной скорости.
+	// The throughput reader: a window of the two live buckets (prev 1 +
+	// cur 2), the rendered share 1, the coverage window of 1–2 h — the
+	// divisor of the honest rate.
 	thr, err := status.FetchThroughput(ctx, pool)
 	if err != nil {
 		t.Fatalf("FetchThroughput: %v", err)
@@ -1256,31 +1281,35 @@ func TestCounters_HourlyThroughputBaskets(t *testing.T) {
 	countersVerifyEmpty(t, pool, "после реконсиляции корзин темпа (корзины вне verify)")
 }
 
-// tailContentStub — analyzer.ContentGetter: контента нет (ErrNotFound —
-// строка сида без content_hash, ТЗ 5.8: анализ по заголовкам и кукам).
+// tailContentStub — an analyzer.ContentGetter: no content (ErrNotFound —
+// the seeded row has no content_hash, spec 5.8: the analysis is by headers
+// and cookies).
 type tailContentStub struct{}
 
 func (tailContentStub) Get(_ context.Context, _ content.Hash) ([]byte, error) {
 	return nil, content.ErrNotFound
 }
 
-// tailSetsStub — analyzer.SetSource: пустой набор заданной версии (нет
-// правил — нет срабатываний; штамп ставится и на «пустой» итог, T-071).
+// tailSetsStub — an analyzer.SetSource: an empty set of the given version
+// (no rules — no hits; the stamp is set on the "empty" verdict too,
+// T-071).
 type tailSetsStub struct{ version int32 }
 
 func (s tailSetsStub) Set() *rules.Set { return &rules.Set{Version: s.version} }
 
-// TestCounters_ReanalyzeTailBaskets — корзины неанализированных хвостов
-// переанализа (T-204): потерянная публикация (NULL-строка прошлого часа,
-// сид мимо инкрементов — как перепроверка «до деплоя») материализуется
-// проходом monitor в prev-корзину живым окном; guard тика открывается —
-// тик публикует хвост; штамп анализатора декрементирует корзину часа
-// ЭПИЗОДА (повторная доставка — no-op охраной версии, дельта не двоится);
-// guard закрывается — незрелая строка текущего часа (in-flight) тиком не
-// вычитывается вовсе; устаревшие корзины удаляются проходом.
+// TestCounters_ReanalyzeTailBaskets — the re-analysis unanalyzed tail
+// buckets (T-204): a lost publication (a NULL row of the past hour, seeded
+// bypassing the increments — like a recheck "before the deploy") is
+// materialized by the monitor pass into the prev bucket from the live
+// window; the tick's guard opens — the tick publishes the tail; the
+// analyzer's stamp decrements the bucket of the EPISODE's hour (a
+// redelivery is a no-op by the version guard, the delta is not
+// double-counted); the guard closes — an immature row of the current hour
+// (in-flight) is not read by the tick at all; stale buckets are deleted by
+// the pass.
 func TestCounters_ReanalyzeTailBaskets(t *testing.T) {
 	skipUnlessIntegration(t)
-	reanSkipHourBoundary(t) // сид и окно реконсиляции — «предыдущий час» от now()
+	reanSkipHourBoundary(t) // the seed and the reconciliation window — "the previous hour" from now()
 	pool := countersSchema(t)
 	ctx := context.Background()
 
@@ -1290,11 +1319,11 @@ func TestCounters_ReanalyzeTailBaskets(t *testing.T) {
 		t.Fatalf("стартовый проход: %v", err)
 	}
 
-	// Хвост прошлого часа: NULL-строка (потерянная публикация q:analyze).
-	// Домен ids[1] — БЕЗ эпизодов записи (recordDeleteSQL стирает все
-	// строки домена — урок волны T-203); момент — первая минута
-	// предыдущего календарного часа (граница от БД, гонка с границей часа
-	// — окно в миллисекунды).
+	// The tail of the past hour: a NULL row (a lost q:analyze publication).
+	// The domain ids[1] — WITHOUT write episodes (recordDeleteSQL wipes all
+	// of a domain's rows — the lesson of the T-203 wave); the moment — the
+	// first minute of the previous calendar hour (the boundary comes from
+	// the DB; racing the hour boundary — a window of milliseconds).
 	if _, err := pool.Exec(ctx,
 		"INSERT INTO subdomain_results (zone_id, domain_id, subdomain_id, scheme, final_url, checked_at) "+
 			"VALUES ($1, $2, 1, 2, 'https://lost.tail.test/', "+
@@ -1303,8 +1332,9 @@ func TestCounters_ReanalyzeTailBaskets(t *testing.T) {
 		t.Fatalf("хвост прошлого часа: %v", err)
 	}
 
-	// Реконсиляция — авторитет: prev-корзина хвостов создаётся живым
-	// окном (1 NULL-строка прошлого часа), cur — нуль.
+	// The reconciliation is the authority: the tails' prev bucket is
+	// created from the live window (1 NULL row of the past hour), cur —
+	// zero.
 	if _, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{}); err != nil {
 		t.Fatalf("реконсиляция: %v", err)
 	}
@@ -1315,8 +1345,8 @@ func TestCounters_ReanalyzeTailBaskets(t *testing.T) {
 		t.Fatalf("после реконсиляции reanalyze:<час> = (%d, %v), хочу (0, true) — пустой час создан нулём", v, ok)
 	}
 
-	// Guard открыт (зрелый хвост): тик вычитывает окно время-формой и
-	// публикует ровно хвост.
+	// The guard is open (a mature tail): the tick reads the window with the
+	// time shape and publishes exactly the tail.
 	q := &reanQ{}
 	var cursor analyzer.ReanalyzeCursor
 	res, err := analyzer.ReanalyzeTick(ctx, pool, q, 1001, &cursor, analyzer.ReanalyzeOptions{})
@@ -1330,9 +1360,9 @@ func TestCounters_ReanalyzeTailBaskets(t *testing.T) {
 		t.Fatalf("публикация = %+v, хочу ключ хвоста", got)
 	}
 
-	// Штамп анализатора — декремент корзины часа эпизода (той же
-	// транзакцией); повторная доставка той же версии — no-op охраной
-	// mark (T-204): дельта не двоится.
+	// The analyzer's stamp — a decrement of the episode hour's bucket (in
+	// the same transaction); a redelivery of the same version is a no-op by
+	// the mark guard (T-204): the delta is not double-counted.
 	an, err := analyzer.New(pool, &countersStubQueue{}, tailContentStub{}, tailSetsStub{version: 1001}, analyzer.Options{})
 	if err != nil {
 		t.Fatalf("analyzer.New: %v", err)
@@ -1356,9 +1386,10 @@ func TestCounters_ReanalyzeTailBaskets(t *testing.T) {
 		t.Fatalf("rules_version хвоста = (%d, %v), хочу штамп 1001", stamped, err)
 	}
 
-	// Guard закрыт: свежая NULL-строка ТЕКУЩЕГО часа (in-flight — её
-	// ведёт основной путь записи → q:analyze, корзина часа ещё дораба-
-	// тывается декрементами) зрелой не является — тик окно не вычитывает.
+	// The guard is closed: a fresh NULL row of the CURRENT hour (in-flight
+	// — the main write path → q:analyze maintains it, the hour bucket is
+	// still being finished off by decrements) is not mature — the tick does
+	// not read the window.
 	if _, err := pool.Exec(ctx,
 		"INSERT INTO subdomain_results (zone_id, domain_id, subdomain_id, scheme, final_url, checked_at) "+
 			"VALUES ($1, $2, 2, 2, 'https://inflight.tail.test/', now())",
@@ -1374,8 +1405,8 @@ func TestCounters_ReanalyzeTailBaskets(t *testing.T) {
 			res2, len(q.publishes))
 	}
 
-	// Устаревшая корзина хвостов (старше предыдущего часа) — проход
-	// удаляет: корзины — живое окно guard'а, не история.
+	// A stale tails bucket (older than the previous hour) — the pass
+	// deletes it: the buckets are the guard's live window, not history.
 	if _, err := pool.Exec(ctx,
 		"INSERT INTO crawler_counters (name, value, updated_at) VALUES ('reanalyze:2000-01-01T00', 999, now())",
 	); err != nil {

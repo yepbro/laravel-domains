@@ -1,8 +1,8 @@
-// Интеграционные тесты фильтра выборки диспетчера «только зоны с
-// работой» (T-183, ТЗ tasks/TZ_slow_dispatch_zones.md §5.2): источником
-// множества зон круга 1 становится счётчик zones.domains_pending (T-178),
-// а не сам факт наличия pending-строк — живая семантика против
-// PostgreSQL/миграций. Прогон — make test-integration.
+// Integration tests for the dispatcher selection filter "only zones with
+// work" (T-183, spec tasks/TZ_slow_dispatch_zones.md §5.2): the source of
+// the round 1 zone set becomes the zones.domains_pending counter (T-178),
+// not the mere presence of pending rows — live semantics tested against
+// PostgreSQL/migrations. Run: make test-integration.
 package integration
 
 import (
@@ -16,24 +16,26 @@ import (
 	"crawler/internal/scheduler"
 )
 
-// TestScheduler_DispatchOnlyZonesWithWork — диспетчер выбирает только
-// зоны с domains_pending > 0: зона с pending выбирается; зона с
-// pending-строками, но нулевым счётчиком (дрейф — вставка мимо
-// инкрементов, граница доверия фильтра до ближайшей реконсиляции) не
-// пробируется; исчерпание pending зоны (перевод всех доменов в queued
-// тем же EnqueueBatch) закрывает её до пополнения; add-файл в новую зону
-// открывает её сразу — инкремент apply_add (T-178) без ожидания
-// реконсиляции.
+// TestScheduler_DispatchOnlyZonesWithWork — the dispatcher selects only
+// zones with domains_pending > 0: a zone with pending is selected; a zone
+// with pending rows but a zero counter (drift — inserts bypassing the
+// increments, the filter's trust boundary until the nearest
+// reconciliation) is not selected; exhausting the zone's pending (moving
+// all its domains to queued by the same EnqueueBatch) closes it until a
+// refill; an add-file into a new zone opens it right away — the apply_add
+// increment (T-178) without waiting for reconciliation.
 func TestScheduler_DispatchOnlyZonesWithWork(t *testing.T) {
 	skipUnlessIntegration(t)
 	pool := migratedSchema(t)
 	ctx := context.Background()
 
-	// Зона с работой: счётчик ведёт посев (эквивалент дельт apply_add).
+	// Zone with work: the counter is maintained by the seed (equivalent
+	// of apply_add deltas).
 	busy := insertPendingDomains(t, pool, "busy.test", []string{"b1", "b2"})
 
-	// Зона-дрейф: pending-строки есть, счётчик 0 — ручной SQL мимо
-	// инкрементов (ТЗИ §4.1: дрейф чинит реконсиляция, здесь — до неё).
+	// Drift zone: pending rows exist, counter is 0 — manual SQL bypassing
+	// the increments (incremental-counters spec §4.1: reconciliation fixes
+	// drift; here we are before it).
 	drift := accInsertZone(t, pool, "drift.test", "")
 	if _, err := pool.Exec(ctx,
 		"INSERT INTO domains (zone_id, label) VALUES ($1, 'stale1'), ($1, 'stale2')", drift,
@@ -41,7 +43,7 @@ func TestScheduler_DispatchOnlyZonesWithWork(t *testing.T) {
 		t.Fatalf("вставка доменов зоны-дрейфа: %v", err)
 	}
 
-	// Круг 1 видит только зону с работой: домены зоны-дрейфа не выбраны.
+	// Round 1 sees only the zone with work: drift zone domains are not selected.
 	batch, err := scheduler.DispatchBatch(ctx, pool, scheduler.DispatchQuery{Limit: 10})
 	if err != nil {
 		t.Fatalf("выборка пачки: %v", err)
@@ -62,9 +64,9 @@ func TestScheduler_DispatchOnlyZonesWithWork(t *testing.T) {
 		}
 	}
 
-	// Исчерпание: перевод всех pending зоны в queued декрементирует
-	// счётчик тем же оператором (enqueue, T-178) — следующая выборка
-	// пуста, зона закрыта до пополнения (проб по «хвосту» нет).
+	// Exhaustion: moving all pending of the zone to queued decrements the
+	// counter with the same operator (enqueue, T-178) — the next selection
+	// is empty, the zone is closed until a refill (no probes by "tail").
 	q := &countersStubQueue{}
 	if _, err := scheduler.EnqueueBatch(ctx, pool, q, batch); err != nil {
 		t.Fatalf("постановка пачки: %v", err)
@@ -77,9 +79,10 @@ func TestScheduler_DispatchOnlyZonesWithWork(t *testing.T) {
 		t.Fatalf("после исчерпания выбрано %d, хочу 0 (зона вне выборки)", len(after))
 	}
 
-	// Пополнение: add-файл в новую зону через конвейер ingest (та же
-	// сборка, что cmd/ingest — newIngestEnv) — apply_add инкрементирует
-	// domains_pending (T-178), зона видна диспетчеру сразу.
+	// Refill: an add-file into a new zone through the ingest pipeline (the
+	// same build as cmd/ingest — newIngestEnv) — apply_add increments
+	// domains_pending (T-178), the zone is visible to the dispatcher
+	// immediately.
 	dir := t.TempDir()
 	pipe, err := ingest.NewPipeline(
 		ingest.NewZoneStore(pool),

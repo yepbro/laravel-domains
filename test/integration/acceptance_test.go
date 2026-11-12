@@ -1,39 +1,40 @@
-// Приёмочные тесты по критериям ТЗ §11.4 (T-094): каждый пункт
-// спецификации «Критерии приёмки» — отдельный Test-кейс против живого
-// dev-стека (PostgreSQL, Redis, unbound/coredns, testweb, mockserver,
-// chromium). Suite собирает критерии в явную карту приёмки и не дублирует
-// соседние файлы: их сценарии — источник покрытия деталей, здесь на
-// каждый пункт §11.4 указана формулировка (комментарием над кейсом) и
-// минимальный сценарий, закрывающий пробел:
+// Acceptance tests per the criteria of spec §11.4 (T-094): every item of
+// the "Acceptance criteria" specification is a separate Test case against
+// the live dev stack (PostgreSQL, Redis, unbound/coredns, testweb,
+// mockserver, chromium). The suite gathers the criteria into an explicit
+// acceptance map and does not duplicate the neighboring files: their
+// scenarios are the source of the detail coverage; here, for every §11.4
+// item, the wording (as a comment above the case) and the minimal
+// scenario closing the gap are given:
 //
-//	п. 1  TestAccept01 — add/delete + IDN-зоны без дублей (детали: ingest_test)
-//	п. 2  TestAccept02 — субдомены независимо, варианты/алиасы §5.5 (http_test)
-//	п. 3  TestAccept03 — SPA: DOM и cookies; HTML; дедуп/сжатие; чтение
-//	                     обратно (content_test, render live-тесты);
-//	                     TestAccept03_RenderFallback — сценарий очереди
-//	                     фолбэка рендера (ТЗР этапа 35 §4.4/§4.5, T-238):
-//	                     тарпит основного движка → q:render-fallback без
-//	                     маркера → доработка chromium-воркером B →
+//	item 1  TestAccept01 — add/delete + IDN zones without duplicates (details: ingest_test)
+//	item 2  TestAccept02 — subdomains independently, variants/aliases §5.5 (http_test)
+//	item 3  TestAccept03 — SPA: the DOM and cookies; HTML; dedup/compression; reading
+//	                     back (content_test, the live render tests);
+//	                     TestAccept03_RenderFallback — the scenario of the render
+//	                     fallback queue (the render spec of stage 35 §4.4/§4.5, T-238):
+//	                     the primary engine's tarpit → q:render-fallback without
+//	                     a marker → the finishing by chromium worker B →
 //	                     q:analyze
-//	п. 4  TestAccept04 — анализ версий/score + reanalyze без скачивания
-//	п. 5  TestAccept05 — выборки из laravel_domains/laravel_findings (e2e)
-//	п. 6  TestAccept06 — прогресс зон обновляется автоматически + метрики
-//	п. 7  — целевой сервер под нагрузкой 24 ч: вне dev-стенда, задача
-//	         T-093 (заблокирована до развёртывания боевого железа)
-//	п. 8  TestAccept08 — интервал перепроверки (по умолчанию 6 месяцев,
-//	                     меняется конфигом)
-//	п. 9  TestAccept09 — остановка сервиса: lease возвращает «застрявшие»
-//	                     домены (e2e — перезапуск PostgreSQL, resilience —
-//	                     потеря Redis и смерть воркера)
-//	п. 10 TestAccept10 — поиск по имени в любой форме записи (schema_test —
-//	                     контракт domain_info; crawlerctl — SQL поверх него)
-//	п. 11 TestAccept11 — реальные образцы заказчика через конвейер
+//	item 4  TestAccept04 — version/score analysis + reanalyze without a refetch
+//	item 5  TestAccept05 — selections from laravel_domains/laravel_findings (e2e)
+//	item 6  TestAccept06 — zone progress updates automatically + metrics
+//	item 7  — a target server under a 24 h load: outside the dev bench, task
+//	         T-093 (blocked until the production hardware is deployed)
+//	item 8  TestAccept08 — the recheck interval (6 months by default,
+//	                     changed by config)
+//	item 9  TestAccept09 — a service stop: the lease returns "stuck"
+//	                     domains (e2e — a PostgreSQL restart, resilience —
+//	                     a Redis loss and a worker death)
+//	item 10 TestAccept10 — a search by name in any writing form (schema_test —
+//	                     the domain_info contract; crawlerctl — SQL over it)
+//	item 11 TestAccept11 — real customer samples through the pipeline
 //
-// Уровень — как у e2e_test.go (T-091): библиотечные вызовы компонентов
-// всех этапов без запуска сервисов-процессов; каждая стадия гоняется тем
-// же кодом, что и сборки cmd/*. Изоляция — изолированная схема
-// (migratedSchema), Redis БД 15 (resilienceRedisEnv) с очисткой q:*,
-// каталоги — t.TempDir.
+// The level — as in e2e_test.go (T-091): library calls of the components
+// of all stages without starting service processes; every stage runs the
+// same code as the cmd/* builds. Isolation — an isolated schema
+// (migratedSchema), Redis DB 15 (resilienceRedisEnv) with q:* cleanup,
+// directories — t.TempDir.
 package integration
 
 import (
@@ -75,31 +76,35 @@ import (
 	"crawler/internal/scheduler"
 )
 
-// Группы потребителей стримов уникальны для suite (стиль e2e-констант):
-// БД Redis 15 вычищается до/после, имена не пересекаются с соседями.
+// The stream consumer groups are unique to the suite (the e2e-constants
+// style): Redis DB 15 is cleaned up before/after, the names do not clash
+// with the neighbors.
 const (
 	accDNSGroup     = "acc-dns"
 	accHTTPGroup    = "acc-http"
 	accAnalyzeGroup = "acc-an"
 	accRenderGroup  = "acc-render"
 	accZone         = "crawl.test"
-	// accIDNZone/accIDNLabel — punycode-формы сайт.проверка.test
-	// (зона и домен testbed, сценарий «проверка составных зон и IDN»).
+	// accIDNZone/accIDNLabel — the punycode forms of сайт.проверка.test
+	// (a testbed zone and domain, the "composite zones and IDN" scenario).
 	accIDNZone    = "xn--80adjurfhd.test"
 	accIDNZoneUni = "проверка.test"
 	accIDNLabel   = "xn--80aswg"
 	accIDNLabelU  = "сайт"
-	// accScoreTol — допуск сверки score с meta.yaml образцов (float4
-	// в БД + округление ожидания до 3 знаков; как e2e/корпус T-075).
+	// accScoreTol — the tolerance of the score cross-check with the
+	// samples' meta.yaml (float4 in the DB + rounding the expectation to 3
+	// digits; as in e2e/the T-075 corpus).
 	accScoreTol = 0.001
-	// accSamplesDir — корпус образцов заказчика относительно каталога
-	// теста (в tools контейнер монтирует /testdata, а не переменную
-	// окружения — путь от каталога, стиль rulesDir в e2e).
+	// accSamplesDir — the customer samples corpus relative to the test
+	// directory (in tools the container mounts /testdata, not the
+	// environment variable — a path from the directory, the rulesDir style
+	// in e2e).
 	accSamplesDir = "../../testdata/laravel-samples"
 )
 
-// accEnv — конвейер этапов приёмки на живом стеке (как e2eEnv, без
-// обрыва PostgreSQL: устойчивость к перезапуску БД — территория e2e).
+// accEnv — the pipeline of the acceptance stages on the live stack (like
+// e2eEnv, without the PostgreSQL drop: resilience to a DB restart is e2e
+// territory).
 type accEnv struct {
 	pool     *pgxpool.Pool
 	rdb      *redis.Client
@@ -112,9 +117,10 @@ type accEnv struct {
 	rules    *rules.Set
 }
 
-// newAccEnv собирает окружение: схема с миграциями, очередь, хранилище
-// контента и компоненты DNS/HTTP/analyze-этапов (связки — как в сборках
-// cmd/*). Рендер-конвейер подключается точечно (TestAccept03).
+// newAccEnv assembles the environment: a schema with migrations, a queue,
+// the content store and the DNS/HTTP/analyze stage components (the wiring
+// as in the cmd/* builds). The render pipeline is connected pointwise
+// (TestAccept03).
 func newAccEnv(t *testing.T) *accEnv {
 	t.Helper()
 	pool := migratedSchema(t)
@@ -140,8 +146,8 @@ func newAccEnv(t *testing.T) *accEnv {
 		t.Fatal(err)
 	}
 
-	// Транспорт — как в сборке cmd/http-worker: резолв хостов редиректов
-	// тем же резолвером DNS-этапа (ТЗ 5.5 п. 2).
+	// The transport — as in the cmd/http-worker build: redirect hosts are
+	// resolved by the same resolver as the DNS stage (spec 5.5 item 2).
 	resolve := dnsEnv(t)
 	fetcher := httpTestFetcher(t, func(o *httpfetch.Options) {
 		o.Resolver = httpfetch.NewCachingResolver(
@@ -173,17 +179,17 @@ func newAccEnv(t *testing.T) *accEnv {
 	}
 }
 
-// accResolver — клиент DNS к живому unbound стенда (dnsEnv); кэшируется
-// на время теста, конвейер этапа берёт резолвер один раз.
+// accResolver — a DNS client to the bench's live unbound (dnsEnv); cached
+// for the duration of the test, the stage pipeline takes the resolver once.
 func accResolver(t *testing.T) dnsclient.Resolver {
 	t.Helper()
 	return dnsEnv(t)
 }
 
-// accRulesDir — рабочий rules/: APP_RULES_DIR, если каталог существует
-// (контейнеры сервисов), иначе путь от каталога теста к корню репозитория
-// (в tools переменная унаследована, а сам каталог не смонтирован — урок
-// T-091).
+// accRulesDir — the working rules/: APP_RULES_DIR when the directory
+// exists (the service containers), otherwise the path from the test
+// directory to the repository root (in tools the variable is inherited
+// but the directory itself is not mounted — the T-091 lesson).
 func accRulesDir(t *testing.T) string {
 	t.Helper()
 	if dir := os.Getenv("APP_RULES_DIR"); dir != "" {
@@ -197,19 +203,20 @@ func accRulesDir(t *testing.T) string {
 	return "../../rules"
 }
 
-// accModifiedRulesDir — копия рабочего набора с правилом-пробой,
-// срабатывающей ровно на одном образце конвейера (symfony-negative):
-// канонический хэш (Version) меняется, а reanalyze обязан переприменить
-// правила — у образца-мишени появляется срабатывание пробы и растёт
-// score, у остальных выводы прежние (TestAccept04).
+// accModifiedRulesDir — a copy of the working set with a probe rule firing
+// on exactly one pipeline sample (symfony-negative): the canonical hash
+// (Version) changes, and reanalyze must reapply the rules — the target
+// sample gains the probe hit and a higher score, the others keep their
+// verdicts (TestAccept04).
 const (
-	// accProbeRule — id правила-пробы в копии набора.
+	// accProbeRule — the id of the probe rule in the set copy.
 	accProbeRule = "t094_reanalyze_probe"
-	// accProbeSample — образец-мишень пробы: устойчивая подстрока его
-	// HTML не встречается в остальных образцах и правилах корпуса.
+	// accProbeSample — the probe's target sample: a stable substring of
+	// its HTML does not occur in the other samples or the corpus rules.
 	accProbeSample = "symfony-negative"
-	// accProbeWeight — вес пробы: заметен в score (noisy-OR), но не
-	// переводит слабый негатив через порог is_laravel 0.6.
+	// accProbeWeight — the probe weight: noticeable in the score (noisy-OR)
+	// but does not push the weak negative over the is_laravel threshold of
+	// 0.6.
 	accProbeWeight = 0.05
 )
 
@@ -245,9 +252,9 @@ func accModifiedRulesDir(t *testing.T) string {
 	return dst
 }
 
-// ---------------------------------------------------------------- вставки
+// ---------------------------------------------------------------- inserts
 
-// accInsertZone — зона (unicode-имя для отображения, пустая строка → NULL).
+// accInsertZone — a zone (a unicode name for display, an empty string → NULL).
 func accInsertZone(t *testing.T, pool *pgxpool.Pool, name, unicode string) int16 {
 	t.Helper()
 	var id int16
@@ -261,11 +268,12 @@ func accInsertZone(t *testing.T, pool *pgxpool.Pool, name, unicode string) int16
 	return id
 }
 
-// accInsertDomains — pending-домены зоны (полный конвейер ingest —
-// TestAccept01), возвращает id в порядке labels. Счётчики зоны ведутся
-// как apply_add (domains_total/domains_pending +n, T-178): диспетчер
-// фильтрует зоны по domains_pending > 0 (T-183) — вставка мимо счётчиков
-// оставила бы зону невидимой для DispatchBatch (accPipeline).
+// accInsertDomains — the zone's pending domains (the full ingest pipeline —
+// TestAccept01), returns the ids in the labels order. The zone counters
+// are maintained like apply_add (domains_total/domains_pending +n, T-178):
+// the dispatcher filters zones by domains_pending > 0 (T-183) — inserting
+// bypassing the counters would leave the zone invisible to DispatchBatch
+// (accPipeline).
 func accInsertDomains(t *testing.T, pool *pgxpool.Pool, zoneID int16, labels []string) []int64 {
 	t.Helper()
 	rows, err := pool.Query(context.Background(),
@@ -299,20 +307,20 @@ func accInsertDomains(t *testing.T, pool *pgxpool.Pool, zoneID int16, labels []s
 	return ids
 }
 
-// ---------------------------------------------------------------- конвейер
+// ---------------------------------------------------------------- pipeline
 
-// accPipeline — домены зоны через диспетчер и DNS/HTTP-этапы (как
-// соответствующие стадии e2e): pending → queued + q:dns → эпизоды DNS
-// (маска субдоменов, q:http) → HTTP-эпизоды (subdomain_results,
-// q:analyze). Возвращает карту «метка → id».
+// accPipeline — the zone's domains through the dispatcher and the DNS/HTTP
+// stages (like the corresponding e2e stages): pending → queued + q:dns →
+// DNS episodes (the subdomain mask, q:http) → HTTP episodes
+// (subdomain_results, q:analyze). Returns a "label → id" map.
 func accPipeline(ctx context.Context, t *testing.T, env *accEnv, zone string, labels []string) map[string]int64 {
 	t.Helper()
 	zoneID := accInsertZone(t, env.pool, zone, "")
 	return accPipelineZone(ctx, t, env, zoneID, zone, labels)
 }
 
-// accPipelineZone — accPipeline для заранее созданной зоны (unicode-имя
-// для отображения вставил вызывающий — поиск TestAccept10).
+// accPipelineZone — accPipeline for a pre-created zone (the caller
+// inserted the unicode display name — the TestAccept10 search).
 func accPipelineZone(ctx context.Context, t *testing.T, env *accEnv, zoneID int16, zone string, labels []string) map[string]int64 {
 	t.Helper()
 	ids := accInsertDomains(t, env.pool, zoneID, labels)
@@ -328,7 +336,7 @@ func accPipelineZone(ctx context.Context, t *testing.T, env *accEnv, zoneID int1
 		t.Fatalf("постановка пачки: %v", err)
 	}
 
-	// DNS-этап — как processBatch воркера (T-039): XACK после записи.
+	// The DNS stage — as the worker's processBatch (T-039): XACK after the write.
 	deliveries := consumeTasks(t, env.q, queue.StreamDNS, accDNSGroup, "acc", 5)
 	if len(deliveries) != 1 {
 		t.Fatalf("доставок q:dns: %d, хочу 1 (одна пачка)", len(deliveries))
@@ -365,8 +373,8 @@ func accPipelineZone(ctx context.Context, t *testing.T, env *accEnv, zoneID int1
 		t.Fatalf("пачка q:dns: %v", err)
 	}
 
-	// HTTP-этап — как processDelivery воркера (T-053): эпизод → контент →
-	// запись → XACK.
+	// The HTTP stage — as the worker's processDelivery (T-053): episode →
+	// content → write → XACK.
 	tasks := consumeTasks(t, env.q, queue.StreamHTTP, accHTTPGroup, "acc", len(labels))
 	if len(tasks) != len(labels) {
 		t.Fatalf("задач q:http: %d, хочу %d", len(tasks), len(labels))
@@ -406,9 +414,9 @@ func accPipelineZone(ctx context.Context, t *testing.T, env *accEnv, zoneID int1
 	return out
 }
 
-// accAnalyze — стадия анализатора: n доставок q:analyze через воркер
-// (как processDelivery воркера T-071). Анализатор передаётся явно:
-// переанализ TestAccept04 работает вторым набором правил.
+// accAnalyze — the analyzer stage: n q:analyze deliveries through the
+// worker (as the worker's processDelivery of T-071). The analyzer is
+// passed explicitly: the TestAccept04 re-analysis runs a second rule set.
 func accAnalyze(ctx context.Context, t *testing.T, env *accEnv, an *analyzer.Worker, n int) {
 	t.Helper()
 	msgs := consumeTasks(t, env.q, queue.StreamAnalyze, accAnalyzeGroup, "acc", n)
@@ -438,10 +446,10 @@ func accAnalyze(ctx context.Context, t *testing.T, env *accEnv, an *analyzer.Wor
 	}
 }
 
-// ---------------------------------------------------------------- читатели
+// ---------------------------------------------------------------- readers
 
-// accResultRow — строка subdomain_results для проверок (порядок
-// субдомен/вариант детерминирован).
+// accResultRow — a subdomain_results row for the checks (the
+// subdomain/variant order is deterministic).
 type accResultRow struct {
 	subdomainID int16
 	variant     int16
@@ -482,7 +490,7 @@ func accRows(t *testing.T, pool *pgxpool.Pool, domainID int64) []accResultRow {
 	return out
 }
 
-// accFinding — строка laravel_findings.
+// accFinding — a laravel_findings row.
 type accFinding struct {
 	sub          int16
 	variant      int16
@@ -518,7 +526,7 @@ func accFindings(t *testing.T, pool *pgxpool.Pool, zoneID int16, domainID int64)
 	return out
 }
 
-// accAggregate — строка laravel_domains домена.
+// accAggregate — a domain's laravel_domains row.
 type accAggregate struct {
 	score  float32
 	verMin *string
@@ -543,7 +551,7 @@ func accLaravelDomain(t *testing.T, pool *pgxpool.Pool, zoneID int16, domainID i
 	return a, true
 }
 
-// accStr — строка или NULL → "".
+// accStr — a string or NULL → "".
 func accStr(p *string) string {
 	if p == nil {
 		return ""
@@ -551,19 +559,19 @@ func accStr(p *string) string {
 	return *p
 }
 
-// accHash — content.Hash из слайса, прочитанного из БД.
+// accHash — a content.Hash from a slice read from the DB.
 func accHash(b []byte) content.Hash {
 	var h content.Hash
 	copy(h[:], b)
 	return h
 }
 
-// accSignal — запись signals jsonb (T-071).
+// accSignal — a signals jsonb row (T-071).
 type accSignal struct {
 	Rule string `json:"rule"`
 }
 
-// accFiredRules — множество id сработавших правил из signals jsonb.
+// accFiredRules — the set of fired rule ids from the signals jsonb.
 func accFiredRules(t *testing.T, signals string) map[string]bool {
 	t.Helper()
 	var sigs []accSignal
@@ -577,7 +585,7 @@ func accFiredRules(t *testing.T, signals string) map[string]bool {
 	return m
 }
 
-// accWaitFor — poll до готовности или дедлайна (автоматические обновления
+// accWaitFor — poll until ready or the deadline (the automatic updates of
 // TestAccept06).
 func accWaitFor(t *testing.T, what string, deadline time.Duration, ready func() bool) {
 	t.Helper()
@@ -590,10 +598,11 @@ func accWaitFor(t *testing.T, what string, deadline time.Duration, ready func() 
 	}
 }
 
-// accCounterSum — сумма counter-серий метрики name из реестра g
-// (метрика с метками — все серии; метки-фильтр парами «имя, значение»
-// ограничивает сумму одной серией). Баланс-чек фолбэка T-245 читает
-// счётчики published/consumed тем же Gather, что скрейпит Prometheus.
+// accCounterSum — the sum of the counter series of the name metric from
+// the g registry (a metric with labels — all series; label filters as
+// "name, value" pairs restrict the sum to one series). The T-245 fallback
+// balance check reads the published/consumed counters by the same Gather
+// Prometheus scrapes.
 func accCounterSum(t *testing.T, g prometheus.Gatherer, name string, label ...string) float64 {
 	t.Helper()
 	if len(label)%2 != 0 {
@@ -632,28 +641,30 @@ func accCounterSum(t *testing.T, g prometheus.Gatherer, name string, label ...st
 	return sum
 }
 
-// ---------------------------------------------------------------- п. 1
+// ---------------------------------------------------------------- item 1
 
-// TestAccept01_IngestAddDeleteIDN — §11.4 п. 1: «Файлы add/delete из
-// наблюдаемой папки корректно применяются, в том числе для IDN-зон и
-// доменов (без дублей зон в unicode/punycode формах)». Полный критерий
-// одним сценарием через реальный конвейер ingest: add-файл в unicode-
-// каталоге IDN-зоны, второй add в punycode-каталоге той же зоны (дубля
-// зоны нет), delete-файл и возврат add-файлом тем же списком, undo
-// первого add-файла тем же списком из delete/ (контракт дедупа T-113 —
-// совпадение zone+sha256 при другом действии не дубль; детали —
+// TestAccept01_IngestAddDeleteIDN — §11.4 item 1: "add/delete files from
+// the watched folder apply correctly, including for IDN zones and domains
+// (no duplicate zones in unicode/punycode forms)". The full criterion in
+// one scenario through the real ingest pipeline: an add file in the
+// unicode directory of the IDN zone, a second add in the punycode
+// directory of the same zone (no zone duplicate), a delete file and a
+// revival by an add file with the same list, an undo of the first add
+// file by the same list from delete/ (the dedup contract of T-113 — a
+// zone+sha256 match with a different action is not a duplicate; details —
 // ingest_test).
 func TestAccept01_IngestAddDeleteIDN(t *testing.T) {
 	skipUnlessIntegration(t)
 	env := newIngestEnv(t)
 
-	// Первый add-файл сценария: его список в конце отменяется тем же
-	// списком из delete/ (undo, T-113). Содержимое поделено переменной,
-	// а не копией литерала — «тот же список» байт-точен по построению.
+	// The scenario's first add file: its list is undone at the end by the
+	// same list from delete/ (undo, T-113). The content is shared as a
+	// variable, not a literal copy — "the same list" is byte-exact by
+	// construction.
 	firstAdd := fileContent(
 		"# приёмка §11.4 п. 1",
 		accIDNLabelU+"."+accIDNZoneUni, // сайт.проверка.test
-		"магазин."+accIDNZoneUni,       // второй IDN-домен
+		"магазин."+accIDNZoneUni,       // a second IDN domain
 	)
 
 	t.Run("add в unicode-каталоге IDN-зоны", func(t *testing.T) {
@@ -665,7 +676,7 @@ func TestAccept01_IngestAddDeleteIDN(t *testing.T) {
 			t.Errorf("счётчики: added=%d existed=%d, хочу 2/0", out.Report.Added, out.Report.Existed)
 		}
 
-		// Зона — одна, в punycode, с unicode-именем для отображения.
+		// The zone — one, in punycode, with a unicode name for display.
 		z, ok := env.zone(t, accIDNZone)
 		if !ok {
 			t.Fatalf("зона %s не создана", accIDNZone)
@@ -674,7 +685,7 @@ func TestAccept01_IngestAddDeleteIDN(t *testing.T) {
 			t.Errorf("зона: unicode=%q active=%v, хочу %q/true", z.unicode, z.isActive, accIDNZoneUni)
 		}
 
-		// Домены — punycode-метки с битом is_idn (ТЗ 5.2 п. 9).
+		// The domains — punycode labels with the is_idn bit (spec 5.2 item 9).
 		for _, label := range []string{"xn--80aswg", "xn--80aairftm"} {
 			d, ok := env.domain(t, accIDNZone, label)
 			if !ok {
@@ -694,9 +705,9 @@ func TestAccept01_IngestAddDeleteIDN(t *testing.T) {
 
 	t.Run("punycode-каталог той же зоны — без дубля", func(t *testing.T) {
 		out := env.process(t, filepath.Join(accIDNZone, "add", "punycode-form.txt"), fileContent(
-			"XN--80ASWG.XN--80ADJURFHD.TEST.", // punycode, верхний регистр, точка — тот же домен
-			accIDNLabel+"."+accIDNZone,        // каноничная punycode-форма
-			"новый."+accIDNZoneUni,            // новый IDN-домен
+			"XN--80ASWG.XN--80ADJURFHD.TEST.", // punycode, uppercase, a dot — the same domain
+			accIDNLabel+"."+accIDNZone,        // the canonical punycode form
+			"новый."+accIDNZoneUni,            // a new IDN domain
 		))
 		if out.Kind != ingest.OutcomeApplied {
 			t.Fatalf("итог файла = %q, хочу applied", out.Kind)
@@ -741,12 +752,13 @@ func TestAccept01_IngestAddDeleteIDN(t *testing.T) {
 			t.Errorf("статус после delete = %d, хочу deleted", d.status)
 		}
 
-		// Возврат тем же списком байт-в-байт (тот же sha256, что у
-		// delete-файла): действие другое — точной повторной доставки
-		// нет, файл применяется (дедуп (zone_id, action, sha256),
-		// T-113). До T-113 глобальный ключ по одному sha256 вынуждал
-		// revive-файл уникальное содержимое (63da59c) — пиннинг снят,
-		// то же содержимое другим действием легитимно.
+		// The revival with the same list byte-for-byte (the same sha256 as
+		// the delete file): the action is different — there is no exact
+		// redelivery, the file is applied (the (zone_id, action, sha256)
+		// dedup, T-113). Before T-113 the global key on a single sha256
+		// forced a revive file to have unique content (63da59c) — the
+		// pinning is removed, the same content with a different action is
+		// legitimate.
 		revive := env.process(t, filepath.Join(accIDNZoneUni, "add", "revive.txt"), gone)
 		if revive.Kind != ingest.OutcomeApplied {
 			t.Fatalf("итог возврата = %q, хочу applied (T-113: дубль sha256 delete-файла — не дубль доставки)", revive.Kind)
@@ -764,11 +776,11 @@ func TestAccept01_IngestAddDeleteIDN(t *testing.T) {
 	})
 
 	t.Run("undo тем же списком из delete/ — отменяет первый add-файл", func(t *testing.T) {
-		// Тот же список байт-в-байт, что и первый add-файл сценария
-		// (unicode-form.txt): действие другое — точной повторной
-		// доставки нет, файл ОБРАБАТЫВАЕТСЯ и удаляет домены списка
-		// (контракт T-113; глобальный дедуп по одному sha256 skip-нул
-		// бы его как дубль — семантика до T-113).
+		// The same list byte-for-byte as the scenario's first add file
+		// (unicode-form.txt): the action is different — there is no exact
+		// redelivery, the file IS PROCESSED and deletes the list's domains
+		// (the T-113 contract; the global dedup on a single sha256 would
+		// have skip-zeroed it as a duplicate — the pre-T-113 semantics).
 		undo := env.process(t, filepath.Join(accIDNZoneUni, "delete", "undo.txt"), firstAdd)
 		if undo.Kind != ingest.OutcomeApplied {
 			t.Fatalf("тот же список из delete/: итог = %q, хочу applied (T-113: другое действие — не дубль)", undo.Kind)
@@ -782,11 +794,11 @@ func TestAccept01_IngestAddDeleteIDN(t *testing.T) {
 			}
 		}
 
-		// Журнал: каждая доставка — своя строка; два содержимого
-		// сценария доставлены дважды разными действиями (gone/revive,
-		// unicode-form/undo) плюс одиночный punycode-файл — 5 строк,
-		// 3 содержимых: уникальной остаётся тройка
-		// (zone_id, action, sha256), не sha256 (T-113).
+		// The journal: every delivery is its own row; the two contents of
+		// the scenario were delivered twice with different actions
+		// (gone/revive, unicode-form/undo) plus a single punycode file —
+		// 5 rows, 3 contents: the unique thing is the triple
+		// (zone_id, action, sha256), not the sha256 (T-113).
 		var total, contents int
 		if err := env.pool.QueryRow(context.Background(),
 			"SELECT count(*), count(DISTINCT sha256) FROM ingest_files").Scan(&total, &contents); err != nil {
@@ -798,14 +810,14 @@ func TestAccept01_IngestAddDeleteIDN(t *testing.T) {
 	})
 }
 
-// ---------------------------------------------------------------- п. 2
+// ---------------------------------------------------------------- item 2
 
-// TestAccept02_SubdomainsVariantsAliases — §11.4 п. 2: «Проверка по
-// каждому субдомену выполняется независимо; результаты соответствуют
-// правилам вариантов и алиасов (раздел 5.5)». Четыре сценария стенда
-// через реальные DNS- и HTTP-этапы: same-site (апекс и www проверяются
-// каждый сам по себе), different-sites (два варианта протоколов),
-// equal-pair (алиас «идентичен»), www-to-bare (алиас «редирект»).
+// TestAccept02_SubdomainsVariantsAliases — §11.4 item 2: "The check of
+// each subdomain is performed independently; the results follow the
+// variant and alias rules (section 5.5)". Four bench scenarios through the
+// real DNS and HTTP stages: same-site (the apex and www are checked each
+// on its own), different-sites (two protocol variants), equal-pair (the
+// "identical" alias), www-to-bare (the "redirect" alias).
 func TestAccept02_SubdomainsVariantsAliases(t *testing.T) {
 	skipUnlessIntegration(t)
 	env := newAccEnv(t)
@@ -815,9 +827,9 @@ func TestAccept02_SubdomainsVariantsAliases(t *testing.T) {
 	labels := []string{"same-site", "different-sites", "equal-pair", "www-to-bare"}
 	ids := accPipeline(ctx, t, env, accZone, labels)
 
-	// Всего записей: same-site 2 (апекс https + www http), different-sites 2
-	// (варианты 0/1), equal-pair 2, www-to-bare 2 — по записи на каждую
-	// проверку (§5.5 п. 7); столько же сообщений q:analyze.
+	// The rows in total: same-site 2 (apex https + www http),
+	// different-sites 2 (variants 0/1), equal-pair 2, www-to-bare 2 — one
+	// row per check (§5.5 item 7); as many q:analyze messages.
 	var totalRows int
 	for _, l := range labels {
 		n := len(accRows(t, env.pool, ids[l]))
@@ -840,23 +852,24 @@ func TestAccept02_SubdomainsVariantsAliases(t *testing.T) {
 		if apex.subdomainID != 0 || www.subdomainID != 1 {
 			t.Fatalf("порядок: subdomain_id = %d, %d, хочу 0, 1", apex.subdomainID, www.subdomainID)
 		}
-		// Апекс: протоколы сходятся на один сайт — единственная запись
-		// variant 0, канонический https (ТЗ 5.5 п. 5).
+		// The apex: the protocols converge on one site — a single variant 0
+		// row, canonical https (spec 5.5 item 5).
 		if apex.variant != int16(model.VariantMain) || apex.scheme != int16(model.SchemeHTTPS) {
 			t.Errorf("апекс: variant/scheme = %d/%d, хочу 0/https", apex.variant, apex.scheme)
 		}
 		if accStr(apex.finalURL) != "https://same-site.crawl.test/" || apex.aliasKind != int16(model.AliasNone) {
 			t.Errorf("апекс: url=%q alias=%d, хочу https://same-site…/ без алиаса", accStr(apex.finalURL), apex.aliasKind)
 		}
-		// www не настроен в Caddy: https отклоняется по SNI, http отвечает —
-		// запись схемы своей проверки, а не «копия» апекса.
+		// www is not configured in Caddy: https is rejected by SNI, http
+		// answers — a row of its own check's scheme, not a "copy" of the
+		// apex.
 		if www.variant != int16(model.VariantMain) || www.scheme != int16(model.SchemeHTTP) {
 			t.Errorf("www: variant/scheme = %d/%d, хочу 0/http (независимая проверка)", www.variant, www.scheme)
 		}
 		if accStr(www.finalURL) != "http://www.same-site.crawl.test/" {
 			t.Errorf("www: итоговый URL = %q", accStr(www.finalURL))
 		}
-		// DNS-маска несёт оба субдомена (§5.4 п. 4).
+		// The DNS mask carries both subdomains (§5.4 item 4).
 		var mask int64
 		if err := env.pool.QueryRow(ctx,
 			"SELECT dns_mask FROM domains WHERE id = $1", ids["same-site"],
@@ -937,7 +950,7 @@ func TestAccept02_SubdomainsVariantsAliases(t *testing.T) {
 		if www.aliasSub == nil || *www.aliasSub != 0 {
 			t.Errorf("www: alias_subdomain_id = %v, хочу 0 (апекс)", www.aliasSub)
 		}
-		// Запись-алиас сходится на адрес оригинала (ТЗ 5.5 п. 6).
+		// The alias row converges on the original's address (spec 5.5 item 6).
 		if want := "https://www-to-bare.crawl.test/"; accStr(www.finalURL) != want {
 			t.Errorf("www: итоговый URL = %q, хочу %q", accStr(www.finalURL), want)
 		}
@@ -946,7 +959,7 @@ func TestAccept02_SubdomainsVariantsAliases(t *testing.T) {
 		}
 	})
 
-	// Итог эпизодов — alive/done (§7).
+	// The episodes' outcome — alive/done (§7).
 	for _, l := range labels {
 		st := httpDomainState(t, env.pool, ids[l])
 		if st.status != model.StatusAlive || st.checkState != int16(model.CheckStateDone) {
@@ -965,15 +978,15 @@ func accZoneID(t *testing.T, pool *pgxpool.Pool, zone string) int16 {
 	return id
 }
 
-// ---------------------------------------------------------------- п. 3
+// ---------------------------------------------------------------- item 3
 
-// accHTTPRenderer — адаптер рендера для testbed: навигация по http вместо
-// https. Внутренний CA Caddy не доверен Chromium dev-стека (прод-режим
-// рендерит сайты с публичными сертификатами), поэтому конвейер
-// renderworker реален целиком (чтение цели → рендер → Put DOM → замена
-// ссылки → публикация q:analyze), подменяется только схема навигации —
-// та же страница, тот же JS (живые тесты рендера ходят так же,
-// internal/render/*_live_test.go).
+// accHTTPRenderer — a render adapter for the testbed: navigation over http
+// instead of https. Caddy's internal CA is not trusted by the dev stack's
+// Chromium (production renders sites with public certificates), so the
+// renderworker pipeline is real in full (reading the target → render →
+// Put the DOM → replacing the reference → publishing q:analyze); only the
+// navigation scheme is substituted — the same page, the same JS (the live
+// render tests go the same way, internal/render/*_live_test.go).
 type accHTTPRenderer struct {
 	inner renderworker.Renderer
 }
@@ -986,17 +999,18 @@ func (r accHTTPRenderer) Run(ctx context.Context, task render.RenderTask) (rende
 	return r.inner.Run(ctx, task)
 }
 
-// accFailRenderer — рендерер, всегда возвращающий заданную ошибку:
-// сценарий сбоя основного движка в приёмочном сценарии фолбэка
-// (тарпит на каждой доставке — TestAccept03_RenderFallback).
+// accFailRenderer — a renderer that always returns the given error: the
+// primary engine failure scenario in the acceptance fallback scenario
+// (a tarpit on every delivery — TestAccept03_RenderFallback).
 type accFailRenderer struct{ err error }
 
 func (r accFailRenderer) Run(context.Context, render.RenderTask) (render.RenderOutput, error) {
 	return render.RenderOutput{}, r.err
 }
 
-// accChromiumWS — адрес CDP внешнего Chromium (как live-тесты рендера:
-// CRAWLER_RENDER_REMOTE_URL → CHROMIUM_WS_URL → адрес стека).
+// accChromiumWS — the CDP address of the external Chromium (like the live
+// render tests: CRAWLER_RENDER_REMOTE_URL → CHROMIUM_WS_URL → the stack
+// address).
 func accChromiumWS() string {
 	for _, key := range []string{"CRAWLER_RENDER_REMOTE_URL", "CHROMIUM_WS_URL"} {
 		if u := os.Getenv(key); u != "" {
@@ -1006,9 +1020,10 @@ func accChromiumWS() string {
 	return "ws://172.28.100.14:9222"
 }
 
-// accMonitorMetricsURL — адрес /metrics реального сервиса monitor: имя
-// compose-сервиса через docker DNS (его скрейбит Prometheus dev-стенда,
-// deploy/docker/prometheus/prometheus.yml), переопределяется окружением.
+// accMonitorMetricsURL — the /metrics address of the real monitor service:
+// the compose service name via docker DNS (Prometheus of the dev bench
+// scrapes it, deploy/docker/prometheus/prometheus.yml), overridden by the
+// environment.
 func accMonitorMetricsURL() string {
 	if u := os.Getenv("CRAWLER_MONITOR_METRICS_URL"); u != "" {
 		return u
@@ -1016,19 +1031,20 @@ func accMonitorMetricsURL() string {
 	return "http://monitor:9100/metrics"
 }
 
-// TestAccept03_SPADomCookiesContent — §11.4 п. 3: «Для SPA-страниц
-// сохраняется итоговый DOM и cookies; для остальных — HTML; дедупликация
-// и сжатие работают; контент можно прочитать обратно». SPA-сценарий
-// стенда проходит HTTP-этап с рендер-конвейером (q:render) и
-// render-worker на живом Chromium; парковки проверяют дедупликацию,
-// сохранённые блоки — сжатие (len < raw_len), чтение — roundtrip.
+// TestAccept03_SPADomCookiesContent — §11.4 item 3: "For SPA pages the
+// final DOM and cookies are stored; for the others — HTML; deduplication
+// and compression work; the content can be read back". The bench's SPA
+// scenario goes through the HTTP stage with the render pipeline (q:render)
+// and a render-worker on a live Chromium; the parked pages check
+// deduplication, the stored blocks — compression (len < raw_len), reading
+// — a roundtrip.
 func TestAccept03_SPADomCookiesContent(t *testing.T) {
 	skipUnlessIntegration(t)
 	env := newAccEnv(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
-	// Рендер-конвейер записи (T-066): рекордер с очередью рендера.
+	// The write render pipeline (T-066): a recorder with a render queue.
 	gate := queue.NewBackpressureGate(env.rdb, queue.BackpressureOptions{})
 	renderQ, err := httpworker.NewRenderQueue(env.q, gate, 0, nil)
 	if err != nil {
@@ -1052,7 +1068,7 @@ func TestAccept03_SPADomCookiesContent(t *testing.T) {
 		if h1 != h2 {
 			t.Fatal("идентичные парковки дали разные content_hash — дедупликация не работает")
 		}
-		// Одна ссылка у каждой записи — refcount = 2 на общий блок.
+		// One reference from each row — refcount = 2 on the shared block.
 		row, ok := contentRowByHash(t, env.pool, h1)
 		if !ok {
 			t.Fatal("контент парковок не записан в contents")
@@ -1060,11 +1076,11 @@ func TestAccept03_SPADomCookiesContent(t *testing.T) {
 		if row.refc != 2 {
 			t.Errorf("refcount общего блока = %d, хочу 2 (две записи, один блок)", row.refc)
 		}
-		// Сжатие: блок в паке меньше исходных байт (zstd, T-041).
+		// Compression: the block in the pack is smaller than the original bytes (zstd, T-041).
 		if row.clen >= row.rawLen {
 			t.Errorf("сжатие не работает: len=%d >= raw_len=%d", row.clen, row.rawLen)
 		}
-		// Контент читается обратно (roundtrip).
+		// The content is read back (a roundtrip).
 		body, err := env.store.Get(ctx, h1)
 		if err != nil {
 			t.Fatalf("чтение контента: %v", err)
@@ -1088,7 +1104,7 @@ func TestAccept03_SPADomCookiesContent(t *testing.T) {
 		if n := streamLen(t, env.rdb, queue.StreamRender); n != 1 {
 			t.Fatalf("сообщений q:render = %d, хочу 1 (SPA-вердикт T-057)", n)
 		}
-		// Флаг render_pending не выставлен: ёмкость очереди была.
+		// The render_pending flag is not set: the queue had capacity.
 		var flags int16
 		if err := env.pool.QueryRow(ctx,
 			"SELECT flags FROM domains WHERE id = $1", ids["spa-shell"],
@@ -1153,7 +1169,7 @@ func TestAccept03_SPADomCookiesContent(t *testing.T) {
 		if newHash == rawHash {
 			t.Error("content_hash не изменился — записан сырой HTML вместо DOM")
 		}
-		// Итоговый DOM: контент после JS, которого в сыром HTML нет.
+		// The final DOM: the content after JS, absent from the raw HTML.
 		dom, err := env.store.Get(ctx, newHash)
 		if err != nil {
 			t.Fatalf("чтение DOM из хранилища: %v", err)
@@ -1161,46 +1177,47 @@ func TestAccept03_SPADomCookiesContent(t *testing.T) {
 		if !strings.Contains(string(dom), "SPA-контент после рендера") {
 			t.Errorf("DOM без контента, нарисованного JS: %.120q", dom)
 		}
-		// Cookies: JS выставил куку — CDP снимает всё хранилище (ТЗ 5.6).
+		// Cookies: JS set a cookie — CDP captures the whole storage (spec 5.6).
 		if after.cookies == nil || !strings.Contains(*after.cookies, `"js_session"`) {
 			t.Errorf("cookies рендера без js_session: %v", after.cookies)
 		}
-		// Сырой HTML терял ссылку: блок мёртв (T-044), Get его не отдаёт.
+		// The raw HTML lost its reference: the block is dead (T-044), Get does not serve it.
 		if _, err := env.store.Get(ctx, rawHash); !errors.Is(err, content.ErrNotFound) {
 			t.Errorf("чтение старого HTML после рендера: %v, хочу ErrNotFound (ссылка снята)", err)
 		}
-		// Публикация q:analyze после замены контента (§7).
+		// Publishing to q:analyze after the content replacement (§7).
 		if n := streamLen(t, env.rdb, queue.StreamAnalyze); n != analyzeBefore+1 {
 			t.Errorf("q:analyze после рендера: %d, хочу %d (+1)", n, analyzeBefore+1)
 		}
 	})
 }
 
-// TestAccept03_RenderFallback — сценарий очереди фолбэка рендера (ТЗР
-// этапа 35, §4.4/§4.5, ФТ-7/8/10; карта приёмки фолбэка): движко-
-// зависимый сбой основного движка (тарпит T-148 на исчерпании
-// render.timeout_attempts) не финализирует запись маркером, а публикует
-// её в q:render-fallback — запись остаётся rendered=false без
-// render_failed_at и без публикации q:analyze (первичный воркер);
-// chromium-воркер B — тот же бинарь другой сборкой (стрим
-// q:render-fallback, отдельная группа потребителей, ФТ-12) —
-// дорабатывает запись на живом Chromium: rendered=true со сменой
-// content_hash, публикация q:analyze (Fresh). Рекурсивный фолбэк
-// фолбэка запрещён (ФТ-10) — воркер B публикует только q:analyze.
-// Первичный воркер собирается с движком-кандидатом (engine=moli,
-// S-P1-1: публикации идут только с движка-кандидата — chromium фолбэк
-// не публикует; движок здесь только поле, рендер решает фейк).
-// Движко-независимые причины (DNS T-207/cert T-159) фолбэка не
-// получают (ФТ-7) — фильтр причин покрыт юнит-тестами
-// (TestRenderWorker_DNSCertNoFallback, internal/renderworker).
+// TestAccept03_RenderFallback — the scenario of the render fallback queue
+// (the render spec of stage 35, §4.4/§4.5, FR-7/8/10; the fallback
+// acceptance map): an engine-dependent failure of the primary engine (the
+// T-148 tarpit on exhausting render.timeout_attempts) does not finalize
+// the row with a marker but publishes it to q:render-fallback — the row
+// stays rendered=false without render_failed_at and without a q:analyze
+// publication (the primary worker); chromium worker B — the same binary
+// built differently (the q:render-fallback stream, a separate consumer
+// group, FR-12) — finishes the row on a live Chromium: rendered=true with
+// a content_hash change, a q:analyze publication (Fresh). A recursive
+// fallback of the fallback is forbidden (FR-10) — worker B publishes only
+// q:analyze. The primary worker is assembled with the candidate engine
+// (engine=moli, S-P1-1: publications go only from the candidate engine —
+// chromium does not publish the fallback; the engine here is only a
+// field, the render is decided by the fake). Engine-independent causes
+// (DNS T-207/cert T-159) get no fallback (FR-7) — the cause filter is
+// covered by the unit tests (TestRenderWorker_DNSCertNoFallback,
+// internal/renderworker).
 func TestAccept03_RenderFallback(t *testing.T) {
 	skipUnlessIntegration(t)
 	env := newAccEnv(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer cancel()
 
-	// Рендер-конвейер записи (как TestAccept03): SPA-запись публикуется
-	// в q:render живой HTTP-фазой.
+	// The write render pipeline (as TestAccept03): the SPA row is published
+	// to q:render by the live HTTP phase.
 	gate := queue.NewBackpressureGate(env.rdb, queue.BackpressureOptions{})
 	renderQ, err := httpworker.NewRenderQueue(env.q, gate, 0, nil)
 	if err != nil {
@@ -1217,17 +1234,18 @@ func TestAccept03_RenderFallback(t *testing.T) {
 	before := accRows(t, env.pool, ids["spa-shell"])[0]
 	rawHash := accHash(before.contentHash)
 
-	// Первичный воркер (воркер A): основной движок «виснет» — тарпит на
-	// каждой доставке; фолбэк включён (render.fallback.enabled, T-238).
-	// Клейм укорочен (MinIdle 300 мс): первая доставка возвращает тарпит
-	// ниже лимита (attempts=1 < 2), клейм возвращает с attempts=2 —
-	// публикация в q:render-fallback вместо маркера.
+	// The primary worker (worker A): the primary engine "hangs" — a tarpit
+	// on every delivery; the fallback is enabled (render.fallback.enabled,
+	// T-238). The claim is shortened (MinIdle 300 ms): the first delivery
+	// returns the tarpit below the limit (attempts=1 < 2), the claim
+	// returns with attempts=2 — a publication to q:render-fallback instead
+	// of a marker.
 	tarpit := &render.Error{Class: render.ClassTask, URL: "https://spa.example/",
 		Err: fmt.Errorf("таймаут страницы %s: %w: %w",
 			25*time.Second, context.DeadlineExceeded, errors.New("navigation timeout"))}
-	// Реестры приборов обеих сборок (T-245): published считает воркер A,
-	// consumed — воркер B; сверка баланса — последним блоком теста
-	// (шаг 4 приёмки ТЗ §6.2).
+	// The instrument registries of both builds (T-245): published is
+	// counted by worker A, consumed — by worker B; the balance check is
+	// the test's last block (step 4 of the spec §6.2 acceptance).
 	regA := metrics.New("acc-render-fb-a")
 	regB := metrics.New("acc-render-fb-b")
 	optsA := renderworker.Options{
@@ -1240,10 +1258,11 @@ func TestAccept03_RenderFallback(t *testing.T) {
 		Recover:         queue.NewReliab(env.rdb, env.q, queue.ReliabOptions{MaxAttempts: 3, MinIdle: 300 * time.Millisecond}),
 		RecoverInterval: 200 * time.Millisecond,
 		Fallback:        renderworker.FallbackOptions{Enabled: true},
-		// Движок-кандидат сборки воркера A (S-P1-1): движковый guard
-		// публикации — chromium (включая пустое значение) фолбэк не
-		// публикует (шаг 1 приёмки ТЗ §6.2, откат §6.4); движок — только
-		// поле, рендер решает фейк-тарпит выше.
+		// The candidate engine of worker A's build (S-P1-1): the
+		// engine-based publication guard — chromium (including an empty
+		// value) does not publish the fallback (step 1 of the spec §6.2
+		// acceptance, the §6.4 rollback); the engine is only a field, the
+		// render is decided by the fake tarpit above.
 		Engine:  config.EngineMoli,
 		Metrics: regA,
 	}
@@ -1255,8 +1274,8 @@ func TestAccept03_RenderFallback(t *testing.T) {
 	runADone := make(chan struct{})
 	go func() { defer close(runADone); _ = renderworker.Run(ctxA, wA, optsA) }()
 
-	// Задача ушла в q:render-fallback (первая доставка — ошибка,
-	// клейм с attempts=2 — публикация и XACK).
+	// The task went to q:render-fallback (the first delivery — an error,
+	// the claim with attempts=2 — a publication and an XACK).
 	accWaitFor(t, "задача опубликована в q:render-fallback", 30*time.Second, func() bool {
 		return streamLen(t, env.rdb, queue.StreamRenderFallback) == 1
 	})
@@ -1280,15 +1299,15 @@ func TestAccept03_RenderFallback(t *testing.T) {
 		if failedAt != nil {
 			t.Error("render_failed_at ставить нельзя — маркер ставит воркер B после исчерпания фолбэка (ФТ-10)")
 		}
-		// q:analyze не публикуется первичным воркером: анализ опубликует
-		// воркер B по итогу доработки (ФТ-10).
+		// q:analyze is not published by the primary worker: worker B will
+		// publish the analysis after finishing the row (FR-10).
 		if n := streamLen(t, env.rdb, queue.StreamAnalyze); n != analyzeBefore {
 			t.Errorf("q:analyze = %d, хочу %d (без прироста — публикация за воркером B)", n, analyzeBefore)
 		}
 	})
 
-	// Воркер B: тот же бинарь другой сборкой — стрим q:render-fallback,
-	// отдельная группа; живой Chromium дорабатывает запись.
+	// Worker B: the same binary built differently — the q:render-fallback
+	// stream, a separate group; a live Chromium finishes the row.
 	browser, err := render.StartBrowser(context.Background(), render.Options{
 		RemoteURL:         accChromiumWS(),
 		Contexts:          1,
@@ -1309,8 +1328,8 @@ func TestAccept03_RenderFallback(t *testing.T) {
 		Consume:         4,
 		Recover:         queue.NewReliab(env.rdb, env.q, queue.ReliabOptions{MaxAttempts: 3, MinIdle: 300 * time.Millisecond}),
 		RecoverInterval: 200 * time.Millisecond,
-		Fallback:        renderworker.FallbackOptions{Enabled: true}, // рекурсия запрещена стримом (ФТ-10)
-		Metrics:         regB,                                        // потребление фолбэка — счётчик сборки B (T-245)
+		Fallback:        renderworker.FallbackOptions{Enabled: true}, // the recursion is forbidden by the stream (FR-10)
+		Metrics:         regB,                                        // the fallback consumption is build B's counter (T-245)
 	}
 	wB, err := renderworker.New(env.pool, env.q, env.store, accHTTPRenderer{inner: chromePool}, optsB)
 	if err != nil {
@@ -1324,10 +1343,11 @@ func TestAccept03_RenderFallback(t *testing.T) {
 		rows := accRows(t, env.pool, ids["spa-shell"])
 		return len(rows) == 1 && rows[0].rendered
 	})
-	// Дождаться подтверждения доставки (XACK после записи и публикации):
-	// баланс-блок ниже читает PEL группы и глубину стрима — отмена ctx
-	// воркера B в окне «коммит строки → XACK» оставляла бы запись в PEL
-	// и флакала сверку (ревью T-245).
+	// Wait for the delivery acknowledgment (an XACK after the write and the
+	// publication): the balance block below reads the group's PEL and the
+	// stream depth — canceling worker B's ctx in the "row commit → XACK"
+	// window would leave the row in the PEL and flake the check (the T-245
+	// review).
 	accWaitFor(t, "воркер B подтвердил доставку фолбэка (XACK)", 30*time.Second, func() bool {
 		return pendingCount(t, env.rdb, queue.StreamRenderFallback, "acc-render-fb-b") == 0
 	})
@@ -1357,13 +1377,14 @@ func TestAccept03_RenderFallback(t *testing.T) {
 		}
 	})
 
-	// Баланс-чек фолбэка (T-245, шаг 4 приёмки ТЗ §6.2, ФТ-11):
-	// опубликованное воркером A равно потреблённому воркером B плюс
-	// остатку очереди. Инструментарий — те же приборы, что в бою:
-	// published/consumed — счётчики сборок, остаток — глубина стрима
-	// crawler_queue_depth (BackpressureGate.Len: min(lag, XLEN) + PEL по
-	// группам), её PEL-часть — прямой XPENDING группы сборки B. Сценарий
-	// доработан до конца — остаток 0, расхождений 0.
+	// The fallback balance check (T-245, step 4 of the spec §6.2
+	// acceptance, FR-11): what worker A published equals what worker B
+	// consumed plus the queue remainder. The instrumentation is the same
+	// instruments as in production: published/consumed — the builds'
+	// counters, the remainder — the crawler_queue_depth stream depth
+	// (BackpressureGate.Len: min(lag, XLEN) + the PEL over the groups);
+	// its PEL part is a direct XPENDING of build B's group. The scenario
+	// is finished to the end — the remainder is 0, no divergences.
 	t.Run("баланс: published = consumed + остаток q:render-fallback", func(t *testing.T) {
 		published := accCounterSum(t, regA, "crawler_render_fallback_published_total")
 		if published != 1 {
@@ -1386,25 +1407,25 @@ func TestAccept03_RenderFallback(t *testing.T) {
 		if diff := published - consumed - float64(depth); diff != 0 {
 			t.Errorf("баланс фолбэка: published(%v) != consumed(%v) + остаток(%d), расхождение %v", published, consumed, depth, diff)
 		}
-		// Сборка A ничего не потребляла: серий consumed в её реестре нет.
+		// Build A consumed nothing: its registry has no consumed series.
 		if got := accCounterSum(t, regA, "crawler_render_fallback_consumed_total"); got != 0 {
 			t.Errorf("consumed у основной сборки = %v, хочу 0 (считает только воркер B)", got)
 		}
 	})
 }
 
-// ---------------------------------------------------------------- п. 4
+// ---------------------------------------------------------------- item 4
 
-// TestAccept04_ReanalyzeNoRefetch — §11.4 п. 4: «…изменение правил +
-// reanalyze обновляет результаты без повторного скачивания». Анализ
-// рабочих образцов первым набором → правила меняются (добавляется проба,
-// срабатывающая на одном из образцов) → ReanalyzeOnce публикует
-// q:analyze → воркер со вторым набором перезаписывает findings: у
-// образца-мишени появляются срабатывание пробы и новый score (правила
-// реально переприменены, а не перештампована rules_version), у остальных
-// выводы прежние. Следы повторного скачивания проверяются отсутствием:
-// эпизоды HTTP не запускаются, строки результатов не меняются
-// (checked_at, content_hash), хранилище не растёт.
+// TestAccept04_ReanalyzeNoRefetch — §11.4 item 4: "…a rule change +
+// reanalyze updates the results without a refetch". The working samples
+// are analyzed with the first set → the rules change (a probe firing on
+// one of the samples is added) → ReanalyzeOnce publishes q:analyze → the
+// worker with the second set overwrites the findings: the target sample
+// gains the probe hit and a new score (the rules were really reapplied,
+// not the rules_version re-stamped), the others keep their verdicts. The
+// traces of a refetch are checked by their absence: the HTTP episodes do
+// not run, the result rows do not change (checked_at, content_hash), the
+// store does not grow.
 func TestAccept04_ReanalyzeNoRefetch(t *testing.T) {
 	skipUnlessIntegration(t)
 	env := newAccEnv(t)
@@ -1421,7 +1442,7 @@ func TestAccept04_ReanalyzeNoRefetch(t *testing.T) {
 		t.Fatal("версия рабочего набора не должна быть нулевой")
 	}
 
-	// Снимок «до»: строки результатов и хранилище.
+	// The "before" snapshot: the result rows and the store.
 	type rowSnap struct {
 		checked time.Time
 		hash    []byte
@@ -1455,9 +1476,9 @@ func TestAccept04_ReanalyzeNoRefetch(t *testing.T) {
 	httpBefore := streamLen(t, env.rdb, queue.StreamHTTP)
 	renderBefore := streamLen(t, env.rdb, queue.StreamRender)
 
-	// Правила изменились: копия набора с пробой, срабатывающей на
-	// symfony-negative, — канонический хэш (Version) другой, у мишени
-	// должен появиться новый сигнал и вырасти score.
+	// The rules changed: a set copy with a probe firing on symfony-negative
+	// — the canonical hash (Version) is different; the target must gain a
+	// new signal and a higher score.
 	loader2, err := rules.NewReloader(accModifiedRulesDir(t), nil)
 	if err != nil {
 		t.Fatalf("изменённый набор правил: %v", err)
@@ -1477,24 +1498,25 @@ func TestAccept04_ReanalyzeNoRefetch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReanalyzeOnce: %v", err)
 	}
-	// Выборка — устаревшие строки (rules_version IS DISTINCT FROM v2).
+	// The selection — the stale rows (rules_version IS DISTINCT FROM v2).
 	if res.Selected != len(labels) || res.Published != len(labels) {
 		t.Fatalf("переанализ: selected=%d published=%d, хочу %d/%d", res.Selected, res.Published, len(labels), len(labels))
 	}
 
-	// Воркер второго набора перепотребляет q:analyze.
+	// The second set's worker re-consumes q:analyze.
 	accAnalyze(ctx, t, env, an2, len(labels))
 
-	// findings перезаписаны новой версией; правила реально переприменены:
-	// у образца-мишени пробы срабатывание появилось и score пересчитан
-	// (noisy-OR с весом пробы), у остальных выводы прежние. Заглушка
-	// «обновили только штамп rules_version, переиспользовав signals/score»
-	// здесь падает.
+	// The findings are overwritten with the new version; the rules were
+	// really reapplied: the target sample's probe hit appeared and the
+	// score was recomputed (a noisy-OR with the probe weight), the others
+	// keep their verdicts. A stub that "only updated the rules_version
+	// stamp, reusing signals/score" fails here.
 	for _, l := range labels {
 		fs := accFindings(t, env.pool, zoneID, ids[l])
 		sample := accSampleByID(t, l)
-		// Строка findings — одна на (домен, субдомен, вариант): срабатывания
-		// в signals jsonb, отдельной строки на правило нет (T-071, §6.1).
+		// The findings row is one per (domain, subdomain, variant): the hits
+		// are in the signals jsonb, there is no separate row per rule
+		// (T-071, §6.1).
 		if len(fs) != 1 {
 			t.Errorf("%s: findings после переанализа = %d строк, хочу 1", l, len(fs))
 			continue
@@ -1524,7 +1546,7 @@ func TestAccept04_ReanalyzeNoRefetch(t *testing.T) {
 		}
 	}
 
-	// Без повторного скачивания: строки не менялись вовсе, кроме штампа.
+	// No refetch: the rows did not change at all, except the stamp.
 	for _, l := range labels {
 		rows, err := env.pool.Query(ctx, `
 			SELECT checked_at, content_hash, rules_version FROM subdomain_results
@@ -1579,13 +1601,14 @@ func TestAccept04_ReanalyzeNoRefetch(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------- п. 5
+// ---------------------------------------------------------------- item 5
 
-// TestAccept05_LaravelTablesQueries — §11.4 п. 5: «Таблица laravel_domains
-// / laravel_findings позволяет получить: список доменов с Laravel,
-// субдомены, версию (диапазон), признаки». Выборки SQL из таблиц после
-// конвейера: уверенный домен, слабый негатив (findings без aggregate),
-// чистый негатив (без findings вовсе).
+// TestAccept05_LaravelTablesQueries — §11.4 item 5: "The laravel_domains /
+// laravel_findings table makes it possible to get: the list of Laravel
+// domains, the subdomains, the version (a range), the signals". SQL
+// selections from the tables after the pipeline: a confident domain, a
+// weak negative (findings without an aggregate), a clean negative (no
+// findings at all).
 func TestAccept05_LaravelTablesQueries(t *testing.T) {
 	skipUnlessIntegration(t)
 	env := newAccEnv(t)
@@ -1617,15 +1640,15 @@ func TestAccept05_LaravelTablesQueries(t *testing.T) {
 		if err := rows.Err(); err != nil {
 			t.Fatal(err)
 		}
-		// Порог §13.1: уверенный образец даёт строку, слабые — нет.
+		// The §13.1 threshold: a confident sample gives a row, weak ones do not.
 		if len(got) != 1 || got[0] != "laravel-8-mix" {
 			t.Errorf("домены с Laravel = %v, хочу [laravel-8-mix]", got)
 		}
 	})
 
 	t.Run("субдомены с признаками (found_on_mask ↔ справочник)", func(t *testing.T) {
-		// Расшифровка found_on_mask битами справочника subdomains —
-		// субдомены, на которых найден Laravel (ТЗ 5.8).
+		// Decoding found_on_mask with the bits of the subdomains reference
+		// table — the subdomains Laravel was found on (spec 5.8).
 		var labelsOut []string
 		rows, err := env.pool.Query(ctx, `
 			SELECT s.label FROM laravel_domains AS ld
@@ -1656,7 +1679,7 @@ func TestAccept05_LaravelTablesQueries(t *testing.T) {
 		if !ok {
 			t.Fatal("laravel_domains без строки уверенного домена")
 		}
-		// Диапазон образца: Mix — до 9.x (meta.yaml, границы — строки правил).
+		// The sample's range: Mix — up to 9.x (meta.yaml, the bounds are rule lines).
 		if got := accStr(agg.verMin); got != "" {
 			t.Errorf("ver_min = %q, хочу NULL (нижней границы нет)", got)
 		}
@@ -1686,8 +1709,8 @@ func TestAccept05_LaravelTablesQueries(t *testing.T) {
 	})
 
 	t.Run("слабые срабатывания — только findings", func(t *testing.T) {
-		// rails: csrf-meta + *_session ниже порога — все срабатывания в
-		// laravel_findings (§13.1), строки laravel_domains нет.
+		// rails: csrf-meta + *_session below the threshold — all hits in
+		// laravel_findings (§13.1), no laravel_domains row.
 		fs := accFindings(t, env.pool, zoneID, ids["rails-negative"])
 		if len(fs) != 1 {
 			t.Fatalf("findings rails = %d строк, хочу 1", len(fs))
@@ -1703,7 +1726,7 @@ func TestAccept05_LaravelTablesQueries(t *testing.T) {
 			t.Error("слабый домен попал в laravel_domains — порог 0.6 нарушен")
 		}
 
-		// django: ни одного срабатывания — ни findings, ни aggregate.
+		// django: not a single hit — neither findings nor an aggregate.
 		if fs := accFindings(t, env.pool, zoneID, ids["django-negative"]); len(fs) != 0 {
 			t.Errorf("findings чистого негатива = %d строк, хочу 0", len(fs))
 		}
@@ -1713,23 +1736,23 @@ func TestAccept05_LaravelTablesQueries(t *testing.T) {
 	})
 }
 
-// ---------------------------------------------------------------- п. 6
+// ---------------------------------------------------------------- item 6
 
-// TestAccept06_ZoneProgressAutomatic — §11.4 п. 6: «Прогресс по зонам
-// (всего / проверено) отображается и обновляется автоматически; метрики
-// доступны в Prometheus». Счётчики зон пересчитывает monitor
-// (ZoneStatsOnce/ZoneStatsLoop — тот же код, что сервис); отображение —
-// кэш zones.domains_total/domains_checked, который читает crawlerctl
-// status/zones; метрики — экспозиция /metrics реестра сервиса (то, что
-// скрейбит Prometheus dev-стека).
+// TestAccept06_ZoneProgressAutomatic — §11.4 item 6: "Zone progress
+// (total / checked) is displayed and updated automatically; the metrics
+// are available in Prometheus". The zone counters are recomputed by
+// monitor (ZoneStatsOnce/ZoneStatsLoop — the same code as the service);
+// the display is the zones.domains_total/domains_checked cache that
+// crawlerctl status/zones reads; the metrics — the /metrics exposure of
+// the service's registry (what the dev bench's Prometheus scrapes).
 func TestAccept06_ZoneProgressAutomatic(t *testing.T) {
 	skipUnlessIntegration(t)
 	pool := migratedSchema(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// Данные: зона с 4 живыми (2 done, 1 pending, 1 queued) и 1 удалённым;
-	// пустая зона — её счётчики обнуляются, а не застывают.
+	// The data: a zone with 4 live domains (2 done, 1 pending, 1 queued)
+	// and 1 deleted; an empty zone — its counters are zeroed, not frozen.
 	zoneA := accInsertZone(t, pool, "acc6.test", "")
 	zoneB := accInsertZone(t, pool, "acc6-empty.test", "")
 	done := accInsertDomains(t, pool, zoneA, []string{"d1", "d2"})
@@ -1754,8 +1777,9 @@ func TestAccept06_ZoneProgressAutomatic(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Laravel-находки зоны A (T-120): одна строка laravel_domains — кэш
-	// domains_laravel того же прохода; строки уже прошли порог analyzer.
+	// Zone A's Laravel finds (T-120): one laravel_domains row — the
+	// domains_laravel cache of the same pass; the rows already passed the
+	// analyzer threshold.
 	if _, err := pool.Exec(ctx,
 		`INSERT INTO laravel_domains (zone_id, domain_id, score, found_on_mask, rules_version, updated_at)
 		 VALUES ($1, $2, 0.9, 1, 1, now())`, zoneA, done[0],
@@ -1794,8 +1818,9 @@ func TestAccept06_ZoneProgressAutomatic(t *testing.T) {
 		t.Errorf("пустая зона: total/checked/laravel = %d/%d/%d, хочу 0/0/0", total, checked, laravel)
 	}
 
-	// Отображение: кэш сходится с прямым агрегатом (запрос crawlerctl
-	// status по живым доменам — «всего/проверено» из одних данных).
+	// The display: the cache converges with the direct aggregate (the
+	// crawlerctl status query over the live domains — "total/checked" from
+	// the same data).
 	var liveTotal, liveChecked int
 	if err := pool.QueryRow(ctx, fmt.Sprintf(`
 		SELECT count(*), count(*) FILTER (WHERE check_state = %d)
@@ -1808,9 +1833,9 @@ func TestAccept06_ZoneProgressAutomatic(t *testing.T) {
 		t.Errorf("кэш %d/%d расходится с агрегатом %d/%d", total, checked, liveTotal, liveChecked)
 	}
 
-	// Обновляется автоматически: цикл монитор-сервиса с коротким
-	// интервалом сам подхватывает изменение состояния (первый проход —
-	// сразу, дальше по тику; тот же ZoneStatsLoop, что в cmd/monitor).
+	// Updates automatically: the monitor service's loop with a short
+	// interval picks up the state change itself (the first pass — right
+	// away, then on the tick; the same ZoneStatsLoop as in cmd/monitor).
 	loopCtx, stop := context.WithCancel(ctx)
 	loopDone := make(chan error, 1)
 	go func() {
@@ -1831,14 +1856,14 @@ func TestAccept06_ZoneProgressAutomatic(t *testing.T) {
 		t.Errorf("ZoneStatsLoop завершился с ошибкой: %v", err)
 	}
 
-	// Метрики: реальная экспозиция работающего сервиса monitor — то, что
-	// скрейбит Prometheus dev-стенда (docker DNS monitor:9100, как в
-	// deploy/docker/prometheus/prometheus.yml). HTTP-запрос к сервису,
-	// а не локальный реестр: забытый маршрут, неверный порт или молчащий
-	// хендлер здесь падают по вине продового кода. Если сервис приложения
-	// не поднят (make test-integration запускает только инфраструктуру
-	// и testbed) — честный пропуск, а не тавтология «свой реестр → свой
-	// хендлер».
+	// The metrics: the real exposure of the running monitor service — what
+	// the dev bench's Prometheus scrapes (docker DNS monitor:9100, as in
+	// deploy/docker/prometheus/prometheus.yml). An HTTP request to the
+	// service, not a local registry: a forgotten route, a wrong port or a
+	// silent handler fail here due to the production code. If the
+	// application service is not up (make test-integration starts only the
+	// infrastructure and the testbed) — an honest skip, not the tautology
+	// of "own registry → own handler".
 	url := accMonitorMetricsURL()
 	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Get(url)
@@ -1858,13 +1883,14 @@ func TestAccept06_ZoneProgressAutomatic(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------- п. 8
+// ---------------------------------------------------------------- item 8
 
-// TestAccept08_RecheckInterval — §11.4 п. 8: «Повторная проверка домена
-// происходит не чаще заданного интервала (по умолчанию 6 месяцев);
-// значение меняется конфигом». Домены разного возраста против живой БД:
-// перевод done → pending берёт только созревших, повторный проход пуст
-// (не чаще), уменьшение интервала конфигом подхватывает более свежие.
+// TestAccept08_RecheckInterval — §11.4 item 8: "A domain is rechecked no
+// more often than the given interval (6 months by default); the value is
+// changed by config". Domains of different ages against a live DB: the
+// done → pending change takes only the mature ones, a repeat pass is
+// empty (no more often), shrinking the interval by config picks up more
+// recent ones.
 func TestAccept08_RecheckInterval(t *testing.T) {
 	skipUnlessIntegration(t)
 	pool := migratedSchema(t)
@@ -1897,17 +1923,17 @@ func TestAccept08_RecheckInterval(t *testing.T) {
 		return status, check
 	}
 
-	// Дефолт — 6 месяцев (§3.3): конфиг и константа планировщика —
-	// одно значение.
+	// The default — 6 months (§3.3): the config and the scheduler constant
+	// are one value.
 	if got := config.Default().Scheduler.RecheckInterval; got != config.Duration(scheduler.DefaultRecheckInterval) {
 		t.Errorf("дефолт конфига = %s, хочу %s (6 месяцев)", got, scheduler.DefaultRecheckInterval)
 	}
-	// Значение меняется конфигом: переменная окружения перекрывает.
+	// The value is changed by config: the environment variable overrides.
 	envCfg, err := config.LoadEnv(func(key string) string {
 		if key == "CRAWLER_SCHEDULER_RECHECK_INTERVAL" {
 			return "170h"
 		}
-		return os.Getenv(key) // остальное окружение (в т.ч. APP_PG_DSN) — как есть
+		return os.Getenv(key) // the rest of the environment (incl. APP_PG_DSN) — as is
 	})
 	if err != nil {
 		t.Fatalf("конфиг с переопределением: %v", err)
@@ -1916,7 +1942,7 @@ func TestAccept08_RecheckInterval(t *testing.T) {
 		t.Errorf("переопределение окружением = %s, хочу 170h", got)
 	}
 
-	// Фиксированное «сейчас»: возраст доменов не зависит от даты прогона.
+	// A fixed "now": the domains' age does not depend on the run date.
 	now := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
 	res, err := scheduler.RecheckOnce(ctx, pool, scheduler.RecheckOptions{Now: func() time.Time { return now }})
 	if err != nil {
@@ -1928,7 +1954,7 @@ func TestAccept08_RecheckInterval(t *testing.T) {
 	if _, check := state("old"); check != int16(model.CheckStatePending) {
 		t.Errorf("old: check_state = %d, хочу pending", check)
 	}
-	// Статус результата и чужие состояния не тронуты.
+	// The result status and foreign states are untouched.
 	if s, _ := state("old"); s != int16(model.StatusAlive) {
 		t.Errorf("old: статус результата изменён (%d) — перепроверка меняет только цикл", s)
 	}
@@ -1938,7 +1964,7 @@ func TestAccept08_RecheckInterval(t *testing.T) {
 		}
 	}
 
-	// Не чаще интервала: повторный проход не находит работы.
+	// No more often than the interval: a repeat pass finds no work.
 	res, err = scheduler.RecheckOnce(ctx, pool, scheduler.RecheckOptions{Now: func() time.Time { return now }})
 	if err != nil {
 		t.Fatal(err)
@@ -1947,10 +1973,11 @@ func TestAccept08_RecheckInterval(t *testing.T) {
 		t.Errorf("повторный проход перевёл ещё %d — интервал не соблюдается", res.Domains)
 	}
 
-	// Интервал меняется конфигом: 7 дней (короче возраста fresh ~17 дней,
-	// но длиннее возраста «сегодня проверенных») — fresh тоже созрел, never
-	// (никогда не проверялся) и pending/deleted по-прежнему нет. Созревание
-	// — возраст > интервала (§11.4 п. 8 «не чаще»), длиннее — только старше.
+	// The interval changes by config: 7 days (shorter than fresh's age of
+	// ~17 days, but longer than the age of "checked today") — fresh is
+	// mature too, never (never checked) and pending/deleted still are not.
+	// Maturity — age > interval (§11.4 item 8 "no more often"); a longer
+	// interval takes only the older ones.
 	res, err = scheduler.RecheckOnce(ctx, pool, scheduler.RecheckOptions{
 		Interval: 7 * 24 * time.Hour,
 		Now:      func() time.Time { return now },
@@ -1971,15 +1998,15 @@ func TestAccept08_RecheckInterval(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------- п. 9
+// ---------------------------------------------------------------- item 9
 
-// TestAccept09_RestartNoStuckDomains — §11.4 п. 9: «Остановка/перезапуск
-// любого сервиса не приводит к потере данных и "застрявшим" доменам (в
-// течение времени lease)». Грань, не покрытая соседями (e2e — обрыв
-// PostgreSQL, resilience — потеря Redis и смерть воркера посреди пачки):
-// остановленный сервис оставляет домены queued с арендой; живой lease не
-// отбирается, истёкший — LeaseOnce возвращает в pending, диспетчер
-// перевыбирает и переиздаёт пачку; данные не теряются.
+// TestAccept09_RestartNoStuckDomains — §11.4 item 9: "Stopping/restarting
+// any service does not lead to data loss or "stuck" domains (within the
+// lease time)". The edge not covered by the neighbors (e2e — a PostgreSQL
+// drop, resilience — a Redis loss and a worker death in the middle of a
+// batch): a stopped service leaves the domains queued with a lease; a live
+// lease is not taken away, an expired one — LeaseOnce returns to pending,
+// the dispatcher re-selects and re-publishes the batch; no data is lost.
 func TestAccept09_RestartNoStuckDomains(t *testing.T) {
 	skipUnlessIntegration(t)
 	pool := migratedSchema(t)
@@ -2001,9 +2028,9 @@ func TestAccept09_RestartNoStuckDomains(t *testing.T) {
 		t.Fatalf("queued: %d, хочу %d", n, len(labels))
 	}
 
-	// Живой lease не отдаётся: «сервис работает» — домены остаются в
-	// работе (Now без сдвига, аренда только что выдана). Курсор nil —
-	// разовый проход с нулевого курсора (T-200).
+	// A live lease is not given back: "the service works" — the domains
+	// stay in work (Now without a shift, the lease was just issued). A nil
+	// cursor — a one-off pass from the zero cursor (T-200).
 	res, err := scheduler.LeaseOnce(ctx, pool, nil, scheduler.LeaseOptions{})
 	if err != nil {
 		t.Fatalf("LeaseOnce: %v", err)
@@ -2012,8 +2039,8 @@ func TestAccept09_RestartNoStuckDomains(t *testing.T) {
 		t.Fatalf("возврат при живом lease: %d, хочу 0", res.Domains)
 	}
 
-	// Остановка сервиса: воркер умер, домены зависли в queued. Сдвиг
-	// «сейчас» за срок аренды — взгляд lease-прохода после простоя.
+	// A service stop: the worker died, the domains hung in queued. Shifting
+	// "now" beyond the lease term — the lease pass's view after downtime.
 	shifted := func() time.Time { return time.Now().Add(2 * scheduler.DefaultLeaseTimeout) }
 	res, err = scheduler.LeaseOnce(ctx, pool, nil, scheduler.LeaseOptions{Now: shifted})
 	if err != nil {
@@ -2026,8 +2053,8 @@ func TestAccept09_RestartNoStuckDomains(t *testing.T) {
 		t.Fatalf("pending после возврата: %d, хочу %d (не застряли в queued)", n, len(labels))
 	}
 
-	// Диспетчер перевыбирает и переиздаёт: домены снова в работе, ни один
-	// не потерялся (множество id сохранено).
+	// The dispatcher re-selects and re-publishes: the domains are in work
+	// again, none lost (the id set preserved).
 	batch2, err := scheduler.DispatchBatch(ctx, pool, scheduler.DispatchQuery{Limit: len(labels)})
 	if err != nil {
 		t.Fatal(err)
@@ -2046,8 +2073,8 @@ func TestAccept09_RestartNoStuckDomains(t *testing.T) {
 	if len(got) != len(want) {
 		t.Fatalf("множество доменов изменилось: %v против %v — потеря данных", got, want)
 	}
-	// Состав, а не только размер: перевыбор чужих/дублей при том же
-	// размере — тоже потеря данных.
+	// The composition, not just the size: re-selecting foreign ones or
+	// duplicates at the same size is also data loss.
 	for id := range want {
 		if !got[id] {
 			t.Fatalf("домен %d потерян при переиздании: %v против %v", id, got, want)
@@ -2060,7 +2087,7 @@ func TestAccept09_RestartNoStuckDomains(t *testing.T) {
 		t.Errorf("пачек q:dns: %d, хочу 2 (первая + переизданная)", n)
 	}
 
-	// Удалённый домен вне цикла: lease-проход и диспетчер его не трогают.
+	// A deleted domain outside the cycle: neither the lease pass nor the dispatcher touch it.
 	if _, err := pool.Exec(ctx, fmt.Sprintf(
 		`UPDATE domains SET status = %d WHERE id = $1`, int16(model.StatusDeleted)), ids[0]); err != nil {
 		t.Fatal(err)
@@ -2069,7 +2096,7 @@ func TestAccept09_RestartNoStuckDomains(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Охрана §13.1: удалённый не возвращается в цикл — только живые.
+	// The §13.1 guard: a deleted one does not return to the cycle — only live ones.
 	if res.Domains != int64(len(labels)-1) {
 		t.Fatalf("lease после повторного зависания: %d, хочу %d (deleted вне цикла)", res.Domains, len(labels)-1)
 	}
@@ -2087,22 +2114,23 @@ func TestAccept09_RestartNoStuckDomains(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------- п. 10
+// ---------------------------------------------------------------- item 10
 
-// TestAccept10_DomainSearchByName — §11.4 п. 10: «Поиск по имени
-// (crawlerctl domain) для домена в любой форме записи (unicode/punycode)
-// возвращает статус, результаты по субдоменам и признаки Laravel (если
-// есть); для неизвестного домена выводится понятное сообщение». Уровень
-// SQL-функции domain_info (единая точка правды CLI и psql, T-082) +
-// нормализация форм internal/idn — то, что делает crawlerctl до запроса.
+// TestAccept10_DomainSearchByName — §11.4 item 10: "A search by name
+// (crawlerctl domain) for a domain in any writing form (unicode/punycode)
+// returns the status, the per-subdomain results and the Laravel signals
+// (if any); for an unknown domain a clear message is printed". The level
+// of the SQL function domain_info (the single source of truth of the CLI
+// and psql, T-082) + the form normalization of internal/idn — what
+// crawlerctl does before the query.
 func TestAccept10_DomainSearchByName(t *testing.T) {
 	skipUnlessIntegration(t)
 	env := newAccEnv(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	// Два домена: IDN в IDN-зоне (unicode-имя зоны для отображения) и
-	// Laravel-образец с признаками.
+	// Two domains: an IDN in the IDN zone (the zone's unicode display name)
+	// and a Laravel sample with signals.
 	idnZone := accInsertZone(t, env.pool, accIDNZone, accIDNZoneUni)
 	accPipelineZone(ctx, t, env, idnZone, accIDNZone, []string{accIDNLabel})
 	accPipeline(ctx, t, env, accZone, []string{"laravel-8-mix"})
@@ -2121,11 +2149,12 @@ func TestAccept10_DomainSearchByName(t *testing.T) {
 	}
 
 	t.Run("IDN-домен в любой форме записи", func(t *testing.T) {
-		// Формы входа: unicode (регистр, точка), punycode — нормализация
-		// internal/idn до обращения к БД, как crawlerctl domain (T-081).
+		// The input forms: unicode (case, a dot), punycode — the
+		// internal/idn normalization before the DB call, as crawlerctl
+		// domain (T-081).
 		forms := []string{
 			accIDNLabelU + "." + accIDNZoneUni + ".",     // сайт.Проверка.TEST.
-			"  " + accIDNLabel + "." + accIDNZone + "  ", // punycode с краевыми пробелами
+			"  " + accIDNLabel + "." + accIDNZone + "  ", // punycode with edge spaces
 		}
 		var canonical map[string]any
 		for _, form := range forms {
@@ -2149,7 +2178,7 @@ func TestAccept10_DomainSearchByName(t *testing.T) {
 			}
 		}
 
-		// Статус, результаты по субдоменам, зона с unicode-именем.
+		// The status, the per-subdomain results, the zone with a unicode name.
 		dom := dinfoMap(t, canonical["domain"], "domain")
 		if got := dinfoStr(t, dom["status_name"], "domain.status_name"); got != "alive" {
 			t.Errorf("статус = %q, хочу alive", got)
@@ -2197,9 +2226,10 @@ func TestAccept10_DomainSearchByName(t *testing.T) {
 	})
 
 	t.Run("неизвестный домен — понятный ответ", func(t *testing.T) {
-		// Домена нет, зона есть: NULL — CLI различает «в зоне нет домена»
-		// (второй лёгкий запрос к zones, T-081) от «зона отсутствует».
-		// Вход — как у crawlerctl: нормализованная punycode-форма.
+		// No domain, the zone exists: NULL — the CLI distinguishes "no
+		// domain in the zone" (a second light query to zones, T-081) from
+		// "the zone is missing". The input — as crawlerctl's: a normalized
+		// punycode form.
 		n, err := idn.Normalize("Нет-Такого." + accIDNZoneUni)
 		if err != nil {
 			t.Fatalf("нормализация неизвестного имени: %v", err)
@@ -2216,17 +2246,18 @@ func TestAccept10_DomainSearchByName(t *testing.T) {
 		if !zoneExists {
 			t.Error("зона исчезла — «нет домена» неотличимо от «нет зоны»")
 		}
-		// Незнакомая зона: тоже NULL без ошибки (вход валиден, данных нет).
+		// An unknown zone: NULL too, without an error (the input is valid, no data).
 		if got := info("site.unknown-zone.test"); got != nil {
 			t.Errorf("domain_info в незнакомой зоне = %v, хочу NULL", got)
 		}
 	})
 }
 
-// ---------------------------------------------------------------- п. 11
+// ---------------------------------------------------------------- item 11
 
-// accSampleExpect — точные ожидания образца обязательны (контракт корпуса
-// T-075): отсутствие — внятная ошибка, а не паника разыменования в кейсах.
+// accSampleExpect — the sample's exact expectations are mandatory (the
+// T-075 corpus contract): their absence is a clear error, not a
+// dereference panic in the cases.
 func accSampleExpect(t *testing.T, s rules.Sample) rules.SampleExpect {
 	t.Helper()
 	if s.Expect.IsLaravel == nil || s.Expect.Score == nil ||
@@ -2236,7 +2267,7 @@ func accSampleExpect(t *testing.T, s rules.Sample) rules.SampleExpect {
 	return s.Expect
 }
 
-// accSampleByID — образец корпуса заказчика по имени каталога.
+// accSampleByID — a customer corpus sample by directory name.
 func accSampleByID(t *testing.T, id string) rules.Sample {
 	t.Helper()
 	if _, err := os.Stat(accSamplesDir); err != nil {
@@ -2256,8 +2287,8 @@ func accSampleByID(t *testing.T, id string) rules.Sample {
 	return rules.Sample{}
 }
 
-// accSamples — весь корпус образцов (testbed подключает их доменами
-// <id>.crawl.test, генератор T-090/T-073).
+// accSamples — the whole samples corpus (the testbed serves them as
+// <id>.crawl.test domains, the T-090/T-073 generator).
 func accSamples(t *testing.T) []rules.Sample {
 	t.Helper()
 	if _, err := os.Stat(accSamplesDir); err != nil {
@@ -2276,14 +2307,15 @@ func accSamples(t *testing.T) []rules.Sample {
 	return samples
 }
 
-// TestAccept11_CustomerSamplesPipeline — §11.4 п. 11: «Анализатор на
-// реальных образцах Laravel, предоставленных заказчиком, даёт ожидаемые
-// срабатывания и диапазоны версий; в laravel_findings попадают все
-// срабатывания, в laravel_domains — только со score не ниже порога».
-// Весь корпус (юнит-движок гоняет его T-075; здесь — конвейер): файл
-// образцов через DNS/HTTP/analyze на живом testbed, ожидания — meta.yaml
-// каждого образца; в laravel_findings — все срабатывания включая слабые
-// у негативных, в laravel_domains — только уверенные (порог 0.6, §13.1).
+// TestAccept11_CustomerSamplesPipeline — §11.4 item 11: "The analyzer on
+// real Laravel samples provided by the customer gives the expected hits
+// and version ranges; all hits go into laravel_findings, only those with
+// a score not below the threshold go into laravel_domains". The whole
+// corpus (the unit engine runs it in T-075; here — the pipeline): the
+// samples file through DNS/HTTP/analyze on a live testbed, the
+// expectations — each sample's meta.yaml; in laravel_findings — all hits
+// including weak ones of negatives, in laravel_domains — only confident
+// ones (the 0.6 threshold, §13.1).
 func TestAccept11_CustomerSamplesPipeline(t *testing.T) {
 	skipUnlessIntegration(t)
 	env := newAccEnv(t)
@@ -2304,15 +2336,15 @@ func TestAccept11_CustomerSamplesPipeline(t *testing.T) {
 		sample, id := s, ids[s.ID]
 		name := sample.ID + "." + accZone
 
-		// Домен проверен: alive/done (§7) — образцы отвечают по обоим
-		// протоколам.
+		// The domain is checked: alive/done (§7) — the samples answer over
+		// both protocols.
 		st := httpDomainState(t, env.pool, id)
 		if st.status != model.StatusAlive || st.checkState != int16(model.CheckStateDone) {
 			t.Errorf("%s: status/check_state = %s/%d, хочу alive/done", name, st.status, st.checkState)
 		}
 
-		// laravel_findings: ВСЕ срабатывания (§13.1) — состав, score,
-		// вычисленный диапазон версий, версия набора.
+		// laravel_findings: ALL hits (§13.1) — the composition, score,
+		// the computed version range, the set version.
 		fs := accFindings(t, env.pool, zoneID, id)
 		switch {
 		case len(sample.Expect.Rules) == 0:
@@ -2352,11 +2384,11 @@ func TestAccept11_CustomerSamplesPipeline(t *testing.T) {
 			}
 		}
 
-		// laravel_domains: только уверенные (score ≥ порога); агрегат
-		// домена с единственной записью совпадает со срабатыванием,
-		// found_on_mask — бит субдомена (§5.8). Счётчики ниже — состав
-		// корпуса по meta.yaml (ожидания), расхождения с БД уже отмечены
-		// ошибками выше.
+		// laravel_domains: only confident ones (score ≥ the threshold); the
+		// aggregate of a domain with a single row matches the hit,
+		// found_on_mask — the subdomain bit (§5.8). The counters below are
+		// the corpus composition per meta.yaml (the expectations); the
+		// divergences from the DB are already flagged by the errors above.
 		agg, ok := accLaravelDomain(t, env.pool, zoneID, id)
 		if !*sample.Expect.IsLaravel {
 			if ok {
@@ -2364,7 +2396,7 @@ func TestAccept11_CustomerSamplesPipeline(t *testing.T) {
 			}
 			negatives++
 			if len(sample.Expect.Rules) > 0 {
-				weakNegatives++ // слабые срабатывания остались в findings
+				weakNegatives++ // the weak hits stayed in findings
 			}
 			continue
 		}
@@ -2390,8 +2422,9 @@ func TestAccept11_CustomerSamplesPipeline(t *testing.T) {
 		}
 	}
 
-	// Целостность корпуса на приёмку: позитивы и негативы с «слабыми»
-	// (контроль ложноположительных) обязаны быть (§13.3, корпус T-075).
+	// The corpus integrity for acceptance: positives and negatives with
+	// "weak" hits (the false-positive control) must be present (§13.3, the
+	// T-075 corpus).
 	if positives < 8 {
 		t.Errorf("позитивных образцов %d, хочу не меньше 8 (мажорные версии Laravel)", positives)
 	}

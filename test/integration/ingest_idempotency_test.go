@@ -1,18 +1,18 @@
-// Интеграционные тесты идемпотентности приёма на уровне доменов (T-097,
-// вариант D; ТЗ 3.4, 5.1): повторная доставка и повторная обработка того
-// же файла не меняют состояние доменов — файловый дедуп по sha256 лишь
-// оптимизация, корректность гарантируют операции над доменами
-// (ON CONFLICT по (zone_id, label), охрана revive по status = deleted,
-// UPDATE delete без охраны, очистка refcount строго по фактически
-// удалённым ссылкам).
+// Integration tests of domain-level ingest idempotence (T-097, option D;
+// spec 3.4, 5.1): redelivery and reprocessing of the same file do not
+// change the domain state — the sha256 file dedup is only an optimization,
+// the correctness is guaranteed by the operations over domains (ON CONFLICT
+// by (zone_id, label), the revive guard by status = deleted, the unguarded
+// delete UPDATE, the refcount decrease strictly by the actually deleted
+// references).
 //
-// Сценарий «тот же файл обработан дважды» моделируется сбоем в окне
-// между применением и записью отчёта (at-least-once, ТЗ 3.4): строка
-// журнала откатывается, файл возвращается в incoming — конвейер применяет
-// его снова, и состояние БД (домены, staging, журнал) сходится к тому же
-// итогу. Реальная сходимость против живой БД — предмет этих проверок;
-// юнит-уровень (порядок операций, счётчики на фейках) — internal/ingest/
-// idempotency_test.go.
+// The "the same file processed twice" scenario is modeled by a failure in
+// the window between applying and writing the report (at-least-once, spec
+// 3.4): the journal row is rolled back, the file returns to incoming — the
+// pipeline applies it again, and the DB state (domains, staging, journal)
+// converges to the same result. The real convergence against a live DB is
+// the subject of these checks; the unit level (the operation order,
+// counters on fakes) — internal/ingest/idempotency_test.go.
 package integration
 
 import (
@@ -25,9 +25,9 @@ import (
 	"crawler/internal/model"
 )
 
-// domainSnapshot — полное наблюдаемое состояние доменов схемы в
-// детерминированном порядке: сравнение снимков «до/после» повторной
-// обработки и есть проверка неизменности состояния БД (T-097).
+// domainSnapshot — the full observed state of the schema's domains in a
+// deterministic order: comparing the "before/after" snapshots of
+// reprocessing is the check that the DB state is unchanged (T-097).
 func (e *ingestEnv) domainSnapshot(t *testing.T) []string {
 	t.Helper()
 	rows, err := e.pool.Query(context.Background(), `
@@ -57,9 +57,9 @@ func (e *ingestEnv) domainSnapshot(t *testing.T) []string {
 	return out
 }
 
-// dropJournal имитирует сбой в окне между применением и записью отчёта:
-// строка ingest_files не зафиксирована (откат), файл вернётся в incoming
-// повторной доставкой.
+// dropJournal imitates a failure in the window between applying and writing
+// the report: the ingest_files row is not committed (rolled back), the file
+// will return to incoming by redelivery.
 func (e *ingestEnv) dropJournal(t *testing.T) {
 	t.Helper()
 	if _, err := e.pool.Exec(context.Background(), "DELETE FROM ingest_files"); err != nil {
@@ -67,9 +67,9 @@ func (e *ingestEnv) dropJournal(t *testing.T) {
 	}
 }
 
-// assertStateUnchanged — состояние БД после повторной обработки совпадает
-// с ожидаемым: домены неизменны, staging пуст, в журнале ровно wantFiles
-// строк.
+// assertStateUnchanged — the DB state after reprocessing matches the
+// expectation: the domains are unchanged, staging is empty, the journal has
+// exactly wantFiles rows.
 func (e *ingestEnv) assertStateUnchanged(t *testing.T, want []string, wantFiles int) {
 	t.Helper()
 	if got := e.domainSnapshot(t); !reflect.DeepEqual(got, want) {
@@ -84,7 +84,7 @@ func (e *ingestEnv) assertStateUnchanged(t *testing.T, want []string, wantFiles 
 	}
 }
 
-// joinLines — снимок в многострочном виде для читаемых сообщений.
+// joinLines — a snapshot as multi-line text for readable messages.
 func joinLines(lines []string) string {
 	out := ""
 	for i, l := range lines {
@@ -96,17 +96,17 @@ func joinLines(lines []string) string {
 	return out
 }
 
-// TestIngest_ReapplySameFileConverges — главный сценарий T-097: «тот же
-// файл обработан дважды — состояние БД неизменно». Сбой после применения
-// до записи отчёта → повторная доставка того же содержимого → повторное
-// применение. Add сходится через ON CONFLICT (всё «уже было»), delete —
-// повторным переводом тех же строк в deleted (счётчики стабильны),
-// отчёт в итоге ровно один.
+// TestIngest_ReapplySameFileConverges — the main T-097 scenario: "the same
+// file processed twice — the DB state is unchanged". A failure after
+// applying, before writing the report → a redelivery of the same content →
+// a reapplication. Add converges via ON CONFLICT (everything "was already
+// there"), delete — by moving the same rows to deleted again (the counters
+// are stable); the report ends up exactly one.
 func TestIngest_ReapplySameFileConverges(t *testing.T) {
 	skipUnlessIntegration(t)
 	env := newIngestEnv(t)
 
-	// --- add: первая обработка.
+	// --- add: the first processing.
 	add := fileContent("example.crawl.test", "shop.crawl.test")
 	if out := env.process(t, "crawl.test/add/list.txt", add); out.Kind != ingest.OutcomeApplied {
 		t.Fatalf("add: итог = %q, want applied", out.Kind)
@@ -116,30 +116,31 @@ func TestIngest_ReapplySameFileConverges(t *testing.T) {
 		t.Fatalf("доменов после add = %d, want 2", len(afterAdd))
 	}
 
-	// Сбой в окне применения/отчёта: журнал пуст, файл доставлен снова.
+	// A failure in the application/report window: the journal is empty, the file is delivered again.
 	env.dropJournal(t)
 	out := env.process(t, "crawl.test/add/list.txt", add)
 	if out.Kind != ingest.OutcomeApplied {
 		t.Fatalf("повторный add: итог = %q, want applied (дубль по sha256 не находится — журнал пуст)", out.Kind)
 	}
-	// Повторное применение — no-op для доменов: счётчики отражают
-	// текущее состояние (всё «уже было»), не первую попытку.
+	// The reapplication is a no-op for the domains: the counters reflect
+	// the current state (everything "was already there"), not the first
+	// attempt.
 	if out.Report.Added != 0 || out.Report.Revived != 0 || out.Report.Existed != 2 {
 		t.Errorf("повторный add: added %d, revived %d, existed %d; want 0/0/2",
 			out.Report.Added, out.Report.Revived, out.Report.Existed)
 	}
 	env.assertStateUnchanged(t, afterAdd, 1)
 
-	// --- delete: первая обработка (один домен есть, одного нет).
+	// --- delete: the first processing (one domain exists, one does not).
 	del := fileContent("example.crawl.test", "ghost.crawl.test")
 	if out := env.process(t, "crawl.test/delete/x.txt", del); out.Kind != ingest.OutcomeApplied {
 		t.Fatalf("delete: итог = %q, want applied", out.Kind)
 	}
 	afterDelete := env.domainSnapshot(t)
 
-	// Тот же сбой и повторная доставка: уже удалённый домен остаётся
-	// удалённым (UPDATE без охраны по статусу — счётчик «удалено»
-	// стабилен), отсутствующий — «не найдено».
+	// The same failure and redelivery: the already deleted domain stays
+	// deleted (an UPDATE without a status guard — the "deleted" counter is
+	// stable), the missing one — "not found".
 	env.dropJournal(t)
 	out = env.process(t, "crawl.test/delete/x.txt", del)
 	if out.Kind != ingest.OutcomeApplied {
@@ -152,10 +153,11 @@ func TestIngest_ReapplySameFileConverges(t *testing.T) {
 	env.assertStateUnchanged(t, afterDelete, 1)
 }
 
-// TestIngest_ReviveCycleIdempotent — цикл delete → add (возврат) того же
-// домена сходится: revive возвращает deleted-домен в new/pending;
-// повторный add уже возвращённого — no-op (охрана status = deleted);
-// повторное delete возвращает в deleted без изменения остальных колонок.
+// TestIngest_ReviveCycleIdempotent — the delete → add (revival) cycle of
+// the same domain converges: revive returns a deleted domain to
+// new/pending; re-adding an already revived one is a no-op (the status =
+// deleted guard); a repeated delete returns it to deleted without changing
+// the other columns.
 func TestIngest_ReviveCycleIdempotent(t *testing.T) {
 	skipUnlessIntegration(t)
 	env := newIngestEnv(t)
@@ -175,7 +177,7 @@ func TestIngest_ReviveCycleIdempotent(t *testing.T) {
 		t.Fatalf("после delete: домен = %+v, want status deleted", d)
 	}
 
-	// Возврат: revived, new/pending, без lease.
+	// The revival: revived, new/pending, no lease.
 	out := env.process(t, "crawl.test/add/one.txt",
 		fileContent("example.crawl.test", "# возврат"))
 	if out.Kind != ingest.OutcomeApplied {
@@ -194,8 +196,8 @@ func TestIngest_ReviveCycleIdempotent(t *testing.T) {
 	}
 	afterRevive := env.domainSnapshot(t)
 
-	// Повторный add уже возвращённого домена — no-op: состояние то же,
-	// счётчики «уже было».
+	// Re-adding the already revived domain — a no-op: the state is the
+	// same, the counters say "was already there".
 	out = env.process(t, "crawl.test/add/one.txt",
 		fileContent("example.crawl.test", "# снова"))
 	if out.Kind != ingest.OutcomeApplied {
@@ -207,7 +209,7 @@ func TestIngest_ReviveCycleIdempotent(t *testing.T) {
 	}
 	env.assertStateUnchanged(t, afterRevive, 4)
 
-	// Повторное delete — то же состояние, что после первого.
+	// A repeated delete — the same state as after the first one.
 	if out := env.process(t, "crawl.test/delete/x.txt",
 		fileContent("example.crawl.test", "# повторное снятие")); out.Kind != ingest.OutcomeApplied {
 		t.Fatalf("повторное delete: итог = %q, want applied", out.Kind)
@@ -215,12 +217,12 @@ func TestIngest_ReviveCycleIdempotent(t *testing.T) {
 	env.assertStateUnchanged(t, afterDelete, 5)
 }
 
-// TestIngest_SameContentCrossActionApplied — undo тем же списком (T-113;
-// переопределяет пиннинг T-097 «граница контракта дедупа»): дедуп
-// ослаблен до точной повторной доставки (zone_id, action, sha256) —
-// тот же список из delete/ после add/ ТЕПЕРЬ обрабатывается: домены
-// удаляются, журнал пополняется строкой delete. Последующая точная
-// повторная доставка add-файла тем же содержимым — дубль (skip).
+// TestIngest_SameContentCrossActionApplied — an undo with the same list
+// (T-113; overrides the T-097 pinning "the dedup contract boundary"): the
+// dedup is relaxed to an exact redelivery (zone_id, action, sha256) — the
+// same list from delete/ after add/ is NOW processed: the domains are
+// deleted, the journal gains a delete row. A subsequent exact redelivery
+// of the add file with the same content is a duplicate (skip).
 func TestIngest_SameContentCrossActionApplied(t *testing.T) {
 	skipUnlessIntegration(t)
 	env := newIngestEnv(t)
@@ -230,8 +232,8 @@ func TestIngest_SameContentCrossActionApplied(t *testing.T) {
 		t.Fatalf("add: итог = %q, want applied", out.Kind)
 	}
 
-	// undo тем же списком: действие другое — точной повторной доставки
-	// нет, файл применяется, домены удаляются.
+	// An undo with the same list: the action is different — there is no
+	// exact redelivery, the file is applied, the domains are deleted.
 	out := env.process(t, "crawl.test/delete/list.txt", content)
 	if out.Kind != ingest.OutcomeApplied {
 		t.Fatalf("тот же список из delete/: итог = %q, want applied (T-113: другое действие — не дубль)", out.Kind)
@@ -248,8 +250,8 @@ func TestIngest_SameContentCrossActionApplied(t *testing.T) {
 		t.Errorf("записей в ingest_files = %d, want 2 (add и undo-delete)", n)
 	}
 
-	// Точная повторная доставка add-файла тем же содержимым — дубль:
-	// применение не выполняется, журнал не растёт.
+	// An exact redelivery of the add file with the same content — a
+	// duplicate: no application happens, the journal does not grow.
 	if out := env.process(t, "crawl.test/add/list.txt", content); out.Kind != ingest.OutcomeDuplicate {
 		t.Fatalf("повторный add тем же содержимым: итог = %q, want duplicate", out.Kind)
 	}
@@ -258,11 +260,12 @@ func TestIngest_SameContentCrossActionApplied(t *testing.T) {
 	}
 }
 
-// TestIngest_CleanupIdempotent — фоновая очистка удалённых доменов
-// идемпотентна (T-020, ТЗ 13.1/8): повторный проход не выбирает вычищенных
-// и не трогает refcount; уменьшение строго по фактически удалённым
-// ссылкам; полный цикл delete → очистка → revive → новые результаты →
-// delete → очистка сходится к согласованным refcount.
+// TestIngest_CleanupIdempotent — the background cleanup of deleted domains
+// is idempotent (T-020, spec 13.1/8): a repeat pass does not select the
+// purged ones and does not touch the refcount; the decrease is strictly by
+// the actually deleted references; the full cycle delete → cleanup →
+// revive → new results → delete → cleanup converges to consistent
+// refcounts.
 func TestIngest_CleanupIdempotent(t *testing.T) {
 	skipUnlessIntegration(t)
 	env := newIngestEnv(t)
@@ -273,7 +276,7 @@ func TestIngest_CleanupIdempotent(t *testing.T) {
 		t.Fatalf("add: итог = %q, want applied", out.Kind)
 	}
 
-	// Идентификаторы доменов для посева результатов.
+	// The domain ids for seeding the results.
 	domainKey := func(label string) (int16, int64) {
 		var zoneID int16
 		var id int64
@@ -293,7 +296,7 @@ func TestIngest_CleanupIdempotent(t *testing.T) {
 		t.Fatalf("зоны доменов разошлись: %d/%d/%d", za, zb, zc)
 	}
 
-	// Контент: h1 держат a, b, c (refcount 3), h2 — только b (refcount 1).
+	// The content: h1 is held by a, b, c (refcount 3), h2 — by b only (refcount 1).
 	h1 := make([]byte, 16)
 	h1[15] = 0x01
 	h2 := make([]byte, 16)
@@ -304,7 +307,7 @@ func TestIngest_CleanupIdempotent(t *testing.T) {
 		t.Fatalf("посев contents: %v", err)
 	}
 
-	// Результаты: a → h1; b → h1 и h2; c → h1 (живой домен — не удаляем).
+	// The results: a → h1; b → h1 and h2; c → h1 (a live domain — not deleted).
 	addResult := func(domainID int64, subID int16, hash []byte) {
 		if _, err := env.pool.Exec(ctx, `
 			INSERT INTO subdomain_results (zone_id, domain_id, subdomain_id, scheme, checked_at, content_hash)
@@ -317,7 +320,7 @@ func TestIngest_CleanupIdempotent(t *testing.T) {
 	addResult(b, 1, h2)
 	addResult(c, 0, h1)
 
-	// refcounts — наблюдаемое состояние contents.
+	// refcounts — the observed state of contents.
 	refcounts := func() map[string]int {
 		rows, err := env.pool.Query(ctx, "SELECT encode(hash, 'hex'), refcount FROM contents ORDER BY hash")
 		if err != nil {
@@ -339,8 +342,8 @@ func TestIngest_CleanupIdempotent(t *testing.T) {
 		return out
 	}
 
-	// Удаляем a и b: их результаты (3 строки) обязаны уйти, ссылки
-	// списаться; ссылка живого c сохраняется.
+	// Deleting a and b: their results (3 rows) must go away, the references
+	// withdrawn; the reference of the live c is kept.
 	if out := env.process(t, "crawl.test/delete/x.txt",
 		fileContent("a.crawl.test", "b.crawl.test")); out.Kind != ingest.OutcomeApplied {
 		t.Fatalf("delete: итог = %q, want applied", out.Kind)
@@ -354,15 +357,15 @@ func TestIngest_CleanupIdempotent(t *testing.T) {
 		t.Errorf("первый проход = %+v, want 2 домена, 3 результата, 2 контента", first)
 	}
 	want := map[string]int{
-		fmt.Sprintf("%x", h1): 1, // ссылки a и b списаны, c жива
-		fmt.Sprintf("%x", h2): 0, // единственная ссылка (b) списана
+		fmt.Sprintf("%x", h1): 1, // the references of a and b withdrawn, c alive
+		fmt.Sprintf("%x", h2): 0, // the only reference (b) withdrawn
 	}
 	if got := refcounts(); !reflect.DeepEqual(got, want) {
 		t.Errorf("refcount после очистки = %v, want %v", got, want)
 	}
 
-	// Повторный проход — no-op: вычищенные не выбираются, refcount
-	// повторно не уменьшается (идемпотентность, ТЗ 3.4).
+	// A repeat pass — a no-op: the purged ones are not selected, the
+	// refcount is not decreased again (idempotence, spec 3.4).
 	second, err := ingest.CleanupOnce(ctx, env.pool, ingest.CleanupOptions{BatchSize: 100})
 	if err != nil {
 		t.Fatalf("второй проход очистки: %v", err)
@@ -374,9 +377,9 @@ func TestIngest_CleanupIdempotent(t *testing.T) {
 		t.Errorf("refcount после повтора = %v, want прежние %v", got, want)
 	}
 
-	// Полный цикл: возврат a, воркер пишет новый результат со ссылкой
-	// на h2 (refcount +1), повторное delete и очистка списывают её
-	// обратно — счётчики сходятся.
+	// The full cycle: reviving a, the worker writes a new result with a
+	// reference to h2 (refcount +1), the repeated delete and cleanup
+	// withdraw it back — the counters converge.
 	if out := env.process(t, "crawl.test/add/one.txt",
 		fileContent("a.crawl.test", "# возврат")); out.Kind != ingest.OutcomeApplied {
 		t.Fatalf("возврат: итог = %q, want applied", out.Kind)

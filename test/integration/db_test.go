@@ -1,11 +1,12 @@
-// Интеграционные тесты слоя БД (T-007): пул internal/db и хелперы массовой
-// записи — потокочный COPY пачками и пакетный UPDATE … FROM unnest(...) —
-// на живом PostgreSQL dev-окружения.
+// Integration tests of the DB layer (T-007): the internal/db pool and bulk
+// write helpers — streaming COPY in batches and batched UPDATE … FROM
+// unnest(...) — against the live PostgreSQL of the dev environment.
 //
-// Изоляция: тесты выполняются в собственной схеме db_test_* с таблицей
-// items (ключи zone_id+id, как у таблиц схемы ТЗ 6.1), рабочая схема
-// crawler не затрагивается (как в миграционных тестах, но без наката
-// миграций — слою БД схема проекта не нужна).
+// Isolation: the tests run in their own db_test_* schema with an items
+// table (zone_id+id keys, like the tables of the spec 6.1 schema); the
+// working crawler schema is untouched (as in the migration tests but
+// without applying migrations — the DB layer does not need the project
+// schema).
 package integration
 
 import (
@@ -25,8 +26,8 @@ import (
 	"crawler/internal/db"
 )
 
-// dbTestEnv создаёт схему с таблицей items и возвращает пул с search_path
-// на неё; схема удаляется при завершении теста.
+// dbTestEnv creates a schema with an items table and returns a pool with
+// search_path set to it; the schema is dropped when the test finishes.
 func dbTestEnv(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	ctx := context.Background()
@@ -54,7 +55,7 @@ func dbTestEnv(t *testing.T) *pgxpool.Pool {
 		t.Fatalf("create table: %v", err)
 	}
 
-	// Пул открывается самим пакетом из секции postgres — как в сервисах.
+	// The pool is opened by the package itself from the postgres section — as in the services.
 	pool, err := db.Open(ctx, db.NewOptions(config.Postgres{
 		DSN:      pgDSN(t) + "&search_path=" + schema,
 		PoolSize: 4,
@@ -73,14 +74,14 @@ func dbTestEnv(t *testing.T) *pgxpool.Pool {
 	return pool
 }
 
-// itemData — данные строки: спецсимволы COPY (таб, перенос, кавычки)
-// и юникод, чтобы проверить экранирование без искажений.
+// itemData — row data: COPY special characters (tab, newline, quotes)
+// and unicode, to check escaping without distortion.
 func itemData(i int64) string {
 	return fmt.Sprintf("row-%06d \tданные\nюникод «сайт-проверка» \"в кавычках\"", i)
 }
 
-// itemsIter — итератор n строк (zone_id=1, id=0..n-1); onCancel вызывается
-// перед выдачей строки rowIdx (отмена контекста и т. п.).
+// itemsIter — iterator over n rows (zone_id=1, id=0..n-1); onCancel is
+// called before yielding row rowIdx (context cancellation, etc.).
 func itemsIter(n int64, onCancel func(rowIdx int64)) db.RowIter {
 	i := int64(0)
 	return func() ([]any, error) {
@@ -98,7 +99,7 @@ func itemsIter(n int64, onCancel func(rowIdx int64)) db.RowIter {
 
 var itemsCopyColumns = []string{"zone_id", "id", "data"}
 
-// itemsCopy копирует n строк в items пачками по batchSize (тестовые данные).
+// itemsCopy copies n rows into items in batches of batchSize (test data).
 func itemsCopy(t *testing.T, ctx context.Context, pool *pgxpool.Pool, n int64, batchSize int) {
 	t.Helper()
 	total, err := db.CopyFromStream(ctx, pool, pgx.Identifier{"items"}, itemsCopyColumns, batchSize, itemsIter(n, nil))
@@ -123,8 +124,8 @@ func countItems(t *testing.T, pool *pgxpool.Pool, where string) int {
 	return n
 }
 
-// TestDB_PoolOpen — пул из секции postgres конфигурации открывается
-// (fail-fast Ping уже прошёл), настройки применены, запросы работают.
+// TestDB_PoolOpen — the pool from the config's postgres section opens
+// (the fail-fast Ping has already passed), settings are applied, queries work.
 func TestDB_PoolOpen(t *testing.T) {
 	skipUnlessIntegration(t)
 	pool := dbTestEnv(t)
@@ -141,9 +142,9 @@ func TestDB_PoolOpen(t *testing.T) {
 	}
 }
 
-// TestDB_CopyFromStream — реальный COPY: пачки по 100 строк (1005 строк =
-// 11 вызовов COPY), данные со спецсимволами не искажаются, DEFAULT
-// колонок вне списка COPY применяется.
+// TestDB_CopyFromStream — a real COPY: batches of 100 rows (1005 rows =
+// 11 COPY calls), data with special characters is not distorted, the
+// DEFAULT of columns outside the COPY list is applied.
 func TestDB_CopyFromStream(t *testing.T) {
 	skipUnlessIntegration(t)
 	pool := dbTestEnv(t)
@@ -173,16 +174,17 @@ func TestDB_CopyFromStream(t *testing.T) {
 	}
 }
 
-// TestDB_CopyFromStream_Cancel — отмена контекста посреди потока:
-// законченные пачки остаются в БД, незаконченная не записывается,
-// возвращается ошибка с контекстом и числом закоммиченных строк.
+// TestDB_CopyFromStream_Cancel — context cancellation in the middle of
+// the stream: completed batches stay in the DB, the incomplete one is not
+// written, and an error with the context and the number of committed rows
+// is returned.
 func TestDB_CopyFromStream_Cancel(t *testing.T) {
 	skipUnlessIntegration(t)
 	pool := dbTestEnv(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Отмена перед строкой 30 (31-я): строки 0–29 = 3 полные пачки по 10.
+	// Cancel before row 30 (the 31st): rows 0–29 = 3 full batches of 10.
 	it := itemsIter(100, func(rowIdx int64) {
 		if rowIdx == 30 {
 			cancel()
@@ -200,8 +202,8 @@ func TestDB_CopyFromStream_Cancel(t *testing.T) {
 	}
 }
 
-// TestDB_UpdateUnnest — пакетный UPDATE через unnest: массовый перевод
-// статуса, охрана Where (повтор — 0 строк), разные значения по строкам.
+// TestDB_UpdateUnnest — batched UPDATE via unnest: bulk status change,
+// the Where guard (a repeat — 0 rows), different values per row.
 func TestDB_UpdateUnnest(t *testing.T) {
 	skipUnlessIntegration(t)
 	pool := dbTestEnv(t)
@@ -221,7 +223,7 @@ func TestDB_UpdateUnnest(t *testing.T) {
 		five[i] = int16(5)
 	}
 
-	// Перевод всех в статус 5 с отметкой времени; только из статуса 0.
+	// Move all to status 5 with a timestamp; only from status 0.
 	got, err := db.Update("items").
 		Key(db.Column{Name: "zone_id", Type: "int2"}, db.Column{Name: "id", Type: "int8"}).
 		Set(db.Column{Name: "status", Type: "int2"}).
@@ -238,7 +240,7 @@ func TestDB_UpdateUnnest(t *testing.T) {
 		t.Errorf("status=5 с отметкой: %d, want %d", c, n)
 	}
 
-	// Повтор с той же охраной — ни одной строки (гонка защиты Where).
+	// A repeat with the same guard — zero rows (the Where guard protects against races).
 	if got, err = db.Update("items").
 		Key(db.Column{Name: "zone_id", Type: "int2"}, db.Column{Name: "id", Type: "int8"}).
 		SetExpr("status = 6").
@@ -247,7 +249,7 @@ func TestDB_UpdateUnnest(t *testing.T) {
 		t.Errorf("повторный перевод: (%d, %v), want (0, nil)", got, err)
 	}
 
-	// Разные значения по строкам пачки: чётные → 7, нечётные → 9.
+	// Different values per batch row: even → 7, odd → 9.
 	mixed := make([]any, n)
 	for i := range mixed {
 		mixed[i] = int16(7)
@@ -271,9 +273,9 @@ func TestDB_UpdateUnnest(t *testing.T) {
 	}
 }
 
-// TestDB_UpdateUnnestReturning — Query с RETURNING отдаёт ключи строк,
-// реально переведённых с учётом охраны (паттерн scheduler ТЗ 5.3:
-// публикация в очередь ровно переведённых доменов).
+// TestDB_UpdateUnnestReturning — Query with RETURNING returns the keys of
+// the rows actually changed under the guard (the scheduler pattern of
+// spec 5.3: enqueueing exactly the changed domains).
 func TestDB_UpdateUnnestReturning(t *testing.T) {
 	skipUnlessIntegration(t)
 	pool := dbTestEnv(t)
@@ -331,10 +333,10 @@ func TestDB_UpdateUnnestReturning(t *testing.T) {
 	}
 }
 
-// TestDB_UpdateUnnest_BeyondParamLimit — пачка больше лимита параметров
-// протокола (65535): массив каждой колонки — один аргумент unnest, поэтому
-// 70 000 строк обновляются одним запросом. Регрессионный контракт:
-// конструктор не должен «распадаться» на параметр на строку.
+// TestDB_UpdateUnnest_BeyondParamLimit — a batch larger than the protocol
+// parameter limit (65535): each column's array is a single unnest
+// argument, so 70,000 rows are updated by one query. Regression contract:
+// the builder must not fall apart into a parameter per row.
 func TestDB_UpdateUnnest_BeyondParamLimit(t *testing.T) {
 	skipUnlessIntegration(t)
 	pool := dbTestEnv(t)
@@ -363,7 +365,7 @@ func TestDB_UpdateUnnest_BeyondParamLimit(t *testing.T) {
 	}
 }
 
-// idRange — массив id 0..n-1 (ключи пачки).
+// idRange — array of ids 0..n-1 (the batch keys).
 func idRange(n int64) []any {
 	ids := make([]any, n)
 	for i := range n {
@@ -372,23 +374,24 @@ func idRange(n int64) []any {
 	return ids
 }
 
-// TestDB_AfterConnectLockTimeout — хук LockTimeout (T-192): сессия пула
-// видит потолок lock_timeout (SHOW), а операция, ждущая строку дольше
-// потолка, получает SQLSTATE 55P03 (lock_not_available) — ошибку сервера,
-// а не таймаут контекста; после освобождения строки тот же оператор
-// проходит штатно. Потолок тестового хука 1 с (DefaultLockTimeout —
-// юнит-тест): сценарий быстрый, семантика та же.
+// TestDB_AfterConnectLockTimeout — the LockTimeout hook (T-192): a pool
+// session sees the lock_timeout cap (SHOW), and an operation waiting for
+// a row longer than the cap gets SQLSTATE 55P03 (lock_not_available) — a
+// server error, not a context timeout; after the row is released the same
+// statement passes normally. The test hook's cap is 1 s (DefaultLockTimeout
+// is a unit test): the scenario is quick, the semantics are the same.
 func TestDB_AfterConnectLockTimeout(t *testing.T) {
 	skipUnlessIntegration(t)
-	// Контекст шире потолка (1 с): 55P03 обязан прийти от сервера,
-	// а не от отмены контекста.
+	// The context is wider than the cap (1 s): 55P03 must come from the
+	// server, not from context cancellation.
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 
 	schema := fmt.Sprintf("db_locktimeout_%d_%d", os.Getpid(), time.Now().UnixNano()%1_000_000)
-	// base — держатель строки и DDL: search_path сразу в DSN (схема
-	// создаётся ниже по полному имени — GUC не валидируется при коннекте),
-	// иначе затравка и держатель работали бы с public.
+	// base — the row holder and DDL: search_path goes into the DSN right
+	// away (the schema is created below by its full name — the GUC is not
+	// validated on connect), otherwise the seed and the holder would work
+	// with public.
 	base, err := pgxpool.New(ctx, pgDSN(t)+"&search_path="+schema)
 	if err != nil {
 		t.Fatalf("подключение к PostgreSQL: %v", err)
@@ -407,7 +410,7 @@ func TestDB_AfterConnectLockTimeout(t *testing.T) {
 		t.Fatalf("create table: %v", err)
 	}
 
-	// Держатель строки и пул-жертва; cleanup закрывает всё живое.
+	// The row holder and the victim pool; cleanup closes everything alive.
 	var pool *pgxpool.Pool
 	var holder *pgxpool.Conn
 	t.Cleanup(func() {
@@ -424,8 +427,8 @@ func TestDB_AfterConnectLockTimeout(t *testing.T) {
 		base.Close()
 	})
 
-	// Пул с хуком — как у write-сервисов (T-192): db.Open прогоняет
-	// AfterConnect уже на проверочном Ping.
+	// A pool with the hook — as in the write services (T-192): db.Open
+	// runs AfterConnect already on the verifying Ping.
 	pool, err = db.Open(ctx, db.Options{
 		DSN:          pgDSN(t) + "&search_path=" + schema,
 		PoolSize:     1,
@@ -435,17 +438,17 @@ func TestDB_AfterConnectLockTimeout(t *testing.T) {
 		t.Fatalf("db.Open с AfterConnect LockTimeout: %v", err)
 	}
 
-	// Затравка: закоммиченная строка — конфликт идёт за неё (лок
-	// закоммиченной строки держателем; незакоммиченный INSERT жертва
-	// под READ COMMITTED просто не видит — конфликта нет).
+	// Seed: a committed row — the conflict is over it (the lock on the
+	// committed row held by the holder; the victim simply does not see the
+	// uncommitted INSERT under READ COMMITTED — no conflict).
 	if _, err := base.Exec(ctx, "INSERT INTO items (zone_id, id) VALUES (1, 1)"); err != nil {
 		t.Fatalf("затравка: вставка строки: %v", err)
 	}
 
-	// Держатель строки — вторая сессия с открытой транзакцией
-	// (BEGIN + SELECT FOR UPDATE закоммиченной строки): жертва ждёт
-	// ShareLock on transaction — тот же класс ожидания, что в конвое
-	// 25.10 (записи №2/№6 журнала медленных).
+	// The row holder — a second session with an open transaction
+	// (BEGIN + SELECT FOR UPDATE of the committed row): the victim waits
+	// on ShareLock on transaction — the same wait class as in the lock
+	// convoy of Oct 25 (entries #2/#6 of the slow-query log).
 	holder, err = base.Acquire(ctx)
 	if err != nil {
 		t.Fatalf("соединение держателя: %v", err)
@@ -457,7 +460,7 @@ func TestDB_AfterConnectLockTimeout(t *testing.T) {
 		t.Fatalf("держатель: захват строки: %v", err)
 	}
 
-	// Сессия пула видит потолок хука (1000ms → «1s»).
+	// The pool session sees the hook's cap (1000ms → "1s").
 	var lt string
 	if err := pool.QueryRow(ctx, "SHOW lock_timeout").Scan(&lt); err != nil {
 		t.Fatalf("SHOW lock_timeout: %v", err)
@@ -466,7 +469,7 @@ func TestDB_AfterConnectLockTimeout(t *testing.T) {
 		t.Errorf("lock_timeout сессии пула = %q, want 1s (AfterConnect-хук)", lt)
 	}
 
-	// Жертва: SELECT FOR UPDATE ждёт строку держателя дольше потолка.
+	// The victim: SELECT FOR UPDATE waits on the holder's row longer than the cap.
 	_, err = pool.Exec(ctx, "SELECT zone_id FROM items WHERE zone_id = 1 AND id = 1 FOR UPDATE")
 	var pgErr *pgconn.PgError
 	if !errors.As(err, &pgErr) || pgErr.Code != "55P03" {
@@ -476,8 +479,8 @@ func TestDB_AfterConnectLockTimeout(t *testing.T) {
 		t.Fatal("контекст истёк раньше потолка lock_timeout: ошибка не от сервера")
 	}
 
-	// Освобождение строки (откат держателя) — тот же оператор проходит
-	// без ошибки: потолок режет только ожидание, штатный путь цел.
+	// Row release (the holder's rollback) — the same statement passes
+	// without an error: the cap cuts only the wait, the normal path is intact.
 	if _, err := holder.Exec(ctx, "ROLLBACK"); err != nil {
 		t.Fatalf("держатель: ROLLBACK: %v", err)
 	}
