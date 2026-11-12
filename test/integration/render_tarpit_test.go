@@ -1,13 +1,14 @@
-// Интеграционный тест тарпит-счётчика рендера (T-261, ТЗ-fsm §3 ФТ-7)
-// против живого Redis dev-окружения: прикладной ключ render:tarpit:
-// {task_id} — SADD идемпотентен по id доставки (replay номера доставки
-// после возврата попытки T-222 мощность не растит), SCARD отвечает
-// числом тарпит-классифицированных доставок, EXPIRE держит TTL
-// (48 ч, освежается каждой отметкой) — счётчик переживает рестарты
-// воркеров. Решение воркера по мощности множества (tarpitsExhausted)
-// покрыто юнит-тестами (internal/renderworker/tarpitcount_test.go) —
-// здесь проверяется сама семантика ключа. Изоляция — Redis БД 15
-// (resilienceRedisEnv), созданные ключи убирает cleanup.
+// Integration test of the render tarpit counter (T-261, TZ-fsm spec
+// §3 FR-7) against the live Redis dev environment: the application
+// key render:tarpit:{task_id} — SADD is idempotent by delivery id
+// (replaying a delivery number after an attempt refund T-222 does not
+// grow the cardinality), SCARD returns the number of
+// tarpit-classified deliveries, EXPIRE keeps the TTL (48 h, refreshed
+// by every mark) — the counter survives worker restarts. The worker
+// decision on the set cardinality (tarpitsExhausted) is covered by
+// unit tests (internal/renderworker/tarpitcount_test.go) — here we
+// check the key semantics itself. Isolation — Redis DB 15
+// (resilienceRedisEnv), cleanup removes the created keys.
 
 package integration
 
@@ -30,38 +31,39 @@ func TestRenderTarpitCounterRedis(t *testing.T) {
 	t.Cleanup(func() { _ = rdb.Del(context.Background(), key).Err() })
 
 	ttl := 48 * time.Hour
-	// Первая тарпит-доставка: мощность 1.
+	// First tarpit delivery: cardinality 1.
 	if n, err := c.Track(ctx, taskID, "1719-1#1", ttl); err != nil || n != 1 {
 		t.Fatalf("Track №1 = (%d, %v), хочу (1, nil)", n, err)
 	}
-	// Replay той же доставки (тот же entry-id × номер): SADD идемпотентен.
+	// Replay of the same delivery (the same entry-id × number): SADD is idempotent.
 	if n, err := c.Track(ctx, taskID, "1719-1#1", ttl); err != nil || n != 1 {
 		t.Fatalf("Track дубля = (%d, %v), хочу (1, nil) — одна доставка один член", n, err)
 	}
-	// Новая доставка той же задачи: мощность 2 — порог
-	// render.timeout_attempts (дефолт 2) достигается.
+	// A new delivery of the same task: cardinality 2 — the
+	// render.timeout_attempts threshold (default 2) is reached.
 	if n, err := c.Track(ctx, taskID, "1719-1#2", ttl); err != nil || n != 2 {
 		t.Fatalf("Track №2 = (%d, %v), хочу (2, nil)", n, err)
 	}
-	// Другая задача — другое множество, мощности не смешиваются.
+	// A different task — a different set, cardinalities do not mix.
 	other := queue.NewTaskID()
 	t.Cleanup(func() { _ = rdb.Del(context.Background(), queue.TarpitKey(other)).Err() })
 	if n, err := c.Track(ctx, other, "9999-9#1", ttl); err != nil || n != 1 {
 		t.Fatalf("Track чужой задачи = (%d, %v), хочу (1, nil)", n, err)
 	}
 
-	// TTL ключа жив и в границах горизонта: отметка освежает EXPIRE,
-	// ключ не вечный и не исчезнет до конца эпизода.
+	// The key TTL is alive and within the horizon: the mark refreshes
+	// EXPIRE, the key is not eternal and will not disappear before the
+	// end of the episode.
 	got := rdb.TTL(ctx, key).Val()
 	if got <= 0 || got > ttl {
 		t.Errorf("TTL %s = %s, хочу (0, %s]", key, got, ttl)
 	}
-	// Тип ключа — множество (ручной разбор redis-cli: SMEMBERS).
+	// The key type is a set (manual inspection via redis-cli: SMEMBERS).
 	if kind, err := rdb.Type(ctx, key).Result(); err != nil || kind != "set" {
 		t.Errorf("TYPE %s = %q (%v), хочу set", key, kind, err)
 	}
 
-	// Валидация до команд: недопустимые аргументы не создают ключей.
+	// Validation before commands: invalid arguments do not create keys.
 	if _, err := c.Track(ctx, "", "e#1", ttl); err == nil {
 		t.Error("пустой task_id — ошибка")
 	}

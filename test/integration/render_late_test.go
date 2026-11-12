@@ -1,13 +1,15 @@
-// Интеграционные тесты T-259 (ТЗ-fsm §3 ФТ-5): поздний переиздатель
-// рендера (internal/httpworker/renderlate.go, ФТ-5.3) против живых
-// PostgreSQL/Redis — предикат выборки, интерлок непотреблёнными
-// сообщениями q:render/q:render-fallback, SPA-вердикт по сохранённому
-// контенту и наследование алиаса, курсорное замыкание; и CHECK-инвариант
-// рендер-состояния subdomain_results_rendered_check (миграция 000018,
-// ФТ-5.2): нарушение отвергается, легальные комбинации и существующие
-// данные не задеты (NOT VALID), convalidated = false до регламентного
-// VALIDATE. Уровень вызовов — библиотечные, без запуска сервисов
-// (стиль render_requeue_test.go); изоляция — withTestSchema + Redis БД 15.
+// Integration tests of T-259 (the TZ-fsm spec §3 FR-5): the render
+// late re-publisher (internal/httpworker/renderlate.go, FR-5.3)
+// against live PostgreSQL/Redis — the selection predicate, the
+// interlock with unconsumed q:render/q:render-fallback messages, the
+// SPA verdict by the saved content and alias inheritance, the cursor
+// closure; and the CHECK invariant of the render state
+// subdomain_results_rendered_check (migration 000018, FR-5.2): a
+// violation is rejected, the legal combinations and the existing data
+// are untouched (NOT VALID), convalidated = false until the scheduled
+// VALIDATE. The call level — library-level, without starting services
+// (the render_requeue_test.go style); isolation — withTestSchema +
+// Redis DB 15.
 package integration
 
 import (
@@ -29,13 +31,15 @@ import (
 	"crawler/internal/queue"
 )
 
-// lateBody — SPA-оболочка (T-057, та же, что rqBody соседнего файла).
+// lateBody — an SPA shell (T-057, the same as the rqBody of the
+// neighboring file).
 var lateBody = []byte(`<html><head><title>x</title></head><body><div id="root"></div><noscript>please enable javascript</noscript></body></html>`)
 
-// latePendingRedis — адаптер источника непотреблённых ключей для
-// интерлоков теста: семантика cmd/http-worker retentionPending
-// (недоставленный группе хвост от last-delivered-id; групп нет — весь
-// стрим), минимальная реализация без пагинации (хвосты теста короткие).
+// latePendingRedis — an adapter of the unconsumed key source for the
+// test interlocks: the semantics of the cmd/http-worker
+// retentionPending (the undelivered-to-the-group tail from the
+// last-delivered-id; no groups — the whole stream), a minimal
+// implementation without pagination (the test tails are short).
 type latePendingRedis struct {
 	rdb *redis.Client
 }
@@ -65,10 +69,11 @@ func (p latePendingRedis) PendingKeys(ctx context.Context, stream string) (map[c
 	return keys, nil
 }
 
-// TestRenderLateRepublisher — критерии приёмки ФТ-5.3: потерянная запись
-// (старше 6 ч, без бита, без сообщений) переиздаётся в q:render; запись
-// в стриме (q:render или q:render-fallback) или под битом render_pending
-// НЕ трогается; свежая, отмаркированная, rendered и не-SPA — тоже нет.
+// TestRenderLateRepublisher — the FR-5.3 acceptance criteria: a lost
+// record (older than 6 h, without the bit, without messages) is
+// re-published to q:render; a record in a stream (q:render or
+// q:render-fallback) or under the render_pending bit is NOT touched;
+// a fresh one, a marked one, rendered and non-SPA — not either.
 func TestRenderLateRepublisher(t *testing.T) {
 	skipUnlessIntegration(t)
 	ctx := context.Background()
@@ -101,8 +106,9 @@ func TestRenderLateRepublisher(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = store.Close() })
 
-	// watermark 0 — ёмкость всегда есть: проверяются предикаты и
-	// интерлок, не ворота (стиль render_requeue_test.go).
+	// watermark 0 — there is always capacity: the predicates and the
+	// interlock are checked, not the gate (the render_requeue_test.go
+	// style).
 	gate := queue.NewBackpressureGate(rdb, queue.BackpressureOptions{})
 	renderQ, err := httpworker.NewRenderQueue(q, gate, 0, nil)
 	if err != nil {
@@ -111,8 +117,9 @@ func TestRenderLateRepublisher(t *testing.T) {
 	reg := metrics.New("http-worker-test")
 	met := httpworker.NewMetrics(reg)
 
-	// Живые сообщения для интерлока: публикуются ДО прохода, никто не
-	// потребляет — недоставленный хвост (групп у стримов нет).
+	// Live messages for the interlock: published BEFORE the pass,
+	// nobody consumes — an undelivered tail (the streams have no
+	// groups).
 	liveMsg := func(stream string, res queue.Result) {
 		t.Helper()
 		if _, err := q.Publish(ctx, stream, res); err != nil {
@@ -127,7 +134,8 @@ func TestRenderLateRepublisher(t *testing.T) {
 		t.Fatalf("insert zones: %v", err)
 	}
 
-	// seed — домен + записи; age управляет checked_at (окно ФТ-5.3 — 6 ч).
+	// seed — a domain + records; age controls checked_at (the FR-5.3
+	// window — 6 h).
 	spaHash := func() []byte {
 		put, err := store.Put(ctx, lateBody)
 		if err != nil {
@@ -165,25 +173,31 @@ func TestRenderLateRepublisher(t *testing.T) {
 	}
 
 	old, fresh := 7*time.Hour, time.Hour
-	// Потерянная SPA-запись: старше окна, без бита, без сообщений.
+	// The lost SPA record: older than the window, without the bit,
+	// without messages.
 	lost := seedDomain("lost", 0)
-	// Оригинал + алиас: оба старше окна, алиас без контента — вердикт
-	// наследуется от оригинала (T-055).
+	// The original + the alias: both older than the window, the alias
+	// without content — the verdict is inherited from the original
+	// (T-055).
 	aliasDom := seedDomain("aliasdom", 0)
 	origSub := int16(3)
-	// Свежая запись — моложе окна: издание плодило бы дубли живых задач.
+	// A fresh record — younger than the window: publishing would breed
+	// duplicates of live tasks.
 	freshDom := seedDomain("fresh", 0)
-	// Долг: бит render_pending — владение прохода доработки, не переиздателя.
+	// Debt: the render_pending bit — the ownership of the finish-up
+	// pass, not of the re-publisher.
 	debtDom := seedDomain("debt", 2)
-	// Живые сообщения стримов: интерлок обязан исключить.
+	// The live messages of the streams: the interlock must exclude.
 	liveDom := seedDomain("live", 0)
 	fbDom := seedDomain("fb", 0)
-	// Отмаркированная (Э3), rendered (Э2) и не-SPA — вне переиздания.
+	// The marked one (E3), rendered (E2) and non-SPA — outside the
+	// re-publishing.
 	markedDom := seedDomain("marked", 0)
 	renderedDom := seedDomain("rendered", 0)
 	staticDom := seedDomain("static", 0)
-	// Отрендеренный оригинал + потерянный алиас: факт рендера оригинала
-	// доказывает SPA-вердикт класса — алиас переиздаётся (ревью P2-1).
+	// A rendered original + a lost alias: the fact of the original's
+	// render proves the SPA verdict of the class — the alias is
+	// re-published (review P2-1).
 	doneOrigDom := seedDomain("doneorig", 0)
 	doneOrigSub := int16(4)
 
@@ -203,9 +217,10 @@ func TestRenderLateRepublisher(t *testing.T) {
 	liveMsg(queue.StreamRender, queue.Result{ZoneID: zone, DomainID: liveDom, SubdomainID: 0})
 	liveMsg(queue.StreamRenderFallback, queue.Result{ZoneID: zone, DomainID: fbDom, SubdomainID: 0})
 
-	// Выравнивание счётчика долга за бит seed-домена (инвариант бэкфилла
-	// 000015): проход переиздателя счётчик не трогает, но схема остаётся
-	// консистентной для соседних проверок.
+	// Leveling the debt counter for the seed domain's bit (the 000015
+	// backfill invariant): the re-publisher pass does not touch the
+	// counter, but the schema stays consistent for the neighboring
+	// checks.
 	if _, err := pool.Exec(ctx,
 		"UPDATE crawler_counters SET value = 1 WHERE name = 'render_pending'"); err != nil {
 		t.Fatalf("выравнивание счётчика долга: %v", err)
@@ -217,9 +232,10 @@ func TestRenderLateRepublisher(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LateOnce: %v", err)
 	}
-	// Пачка: потерянная, оригинал+алиас, алиас отрендеренного оригинала,
-	// две живые (интерлок), не-SPA — итого 7 выбрано, 4 издано, 3
-	// пропущено; свежая/долг/отмаркированная/rendered отсечены SQL.
+	// The batch: the lost one, the original+alias pair, the alias of
+	// the rendered original, the two live ones (the interlock), the
+	// non-SPA — 7 selected in total, 4 published, 3 skipped; the
+	// fresh/debt/marked/rendered are cut off by the SQL.
 	if res.Selected != 7 || res.Published != 4 || res.Skipped != 3 || res.Full {
 		t.Fatalf("итог %+v, хочу selected=7 published=4 skipped=3", res)
 	}
@@ -227,8 +243,8 @@ func TestRenderLateRepublisher(t *testing.T) {
 		t.Fatalf("проход не замкнул курсор (пачка короче лимита): %+v", res)
 	}
 
-	// Состав публикаций: потерянная запись, пара оригинал+алиас и алиас
-	// отрендеренного оригинала.
+	// The publication composition: the lost record, the
+	// original+alias pair and the alias of the rendered original.
 	msgs, err := rdb.XRange(ctx, queue.StreamRender, "-", "+").Result()
 	if err != nil {
 		t.Fatalf("XRANGE %s: %v", queue.StreamRender, err)
@@ -252,8 +268,9 @@ func TestRenderLateRepublisher(t *testing.T) {
 		t.Fatalf("crawler_render_late_republish_total = %v, хочу 4", v)
 	}
 
-	// Повторный проход: собственные публикации теперь — непотреблённый
-	// хвост q:render, интерлок исключает их же записи; дублей нет.
+	// A repeated pass: the pass's own publications are now an
+	// unconsumed tail of q:render, the interlock excludes the same
+	// records; no duplicates.
 	res, err = httpworker.LateOnce(ctx, pool, store, renderQ, latePendingRedis{rdb: rdb}, met,
 		httpworker.LateOptions{BatchSize: 100}, cur)
 	if err != nil {
@@ -267,9 +284,9 @@ func TestRenderLateRepublisher(t *testing.T) {
 	}
 }
 
-// label — имя домена для final_url сида (не используется сообщениями).
+// label — the domain name for the final_url seed (not used by the messages).
 
-// markerAge — штамп маркера для сида: NULL либо час назад.
+// markerAge — the marker stamp for the seed: NULL or an hour ago.
 func markerAge(marked bool) any {
 	if !marked {
 		return nil
@@ -277,9 +294,10 @@ func markerAge(marked bool) any {
 	return time.Now().Add(-time.Hour)
 }
 
-// lateMetricValue — значение счётчика реестра по имени (без меток);
-// серия не найдена — −1 (различимо от честного нуля). Типы семейств
-// выводятся (стиль httpMetricValue, internal/httpworker/metrics_test.go).
+// lateMetricValue — the registry counter value by name (without
+// labels); the series is not found — −1 (distinguishable from an
+// honest zero). The family types are inferred (the httpMetricValue
+// style, internal/httpworker/metrics_test.go).
 func lateMetricValue(t *testing.T, g *metrics.Registry, name string) float64 {
 	t.Helper()
 	families, err := g.Gather()
@@ -299,13 +317,14 @@ func lateMetricValue(t *testing.T, g *metrics.Registry, name string) float64 {
 	return -1
 }
 
-// TestSchema_ResultsRenderedCheck — парный тест-инвариант CHECK
-// subdomain_results_rendered_check (T-259, ФТ-5.2, миграция 000018):
-// «rendered = true ⇒ render_failed_at IS NULL» — нарушение отвергается
-// схемой (23514), легальные комбинации проходят, ограничение добавлено
-// NOT VALID (convalidated = false у родителя и секций — VALIDATE по
-// регламенту миграций отдельным шагом, docs/schema.md) и не задевает
-// существующие данные.
+// TestSchema_ResultsRenderedCheck — the paired invariant test of the
+// CHECK subdomain_results_rendered_check (T-259, FR-5.2, migration
+// 000018): "rendered = true ⇒ render_failed_at IS NULL" — a violation
+// is rejected by the schema (23514), the legal combinations pass, the
+// constraint was added NOT VALID (convalidated = false on the parent
+// and the sections — VALIDATE per the migration procedure as a
+// separate step, docs/schema.md) and does not touch the existing
+// data.
 func TestSchema_ResultsRenderedCheck(t *testing.T) {
 	skipUnlessIntegration(t)
 	pool := migratedSchema(t)
@@ -331,8 +350,9 @@ func TestSchema_ResultsRenderedCheck(t *testing.T) {
 		return err
 	}
 
-	// Легальные комбинации: rendered без маркера; не-рендер с маркером
-	// (Э3); не-рендер без маркера (Э0/Э1) — уникальные PK (ревью P1-1).
+	// The legal combinations: rendered without a marker; non-render
+	// with a marker (E3); non-render without a marker (E0/E1) — unique
+	// PKs (review P1-1).
 	if err := insertRow(0, true, nil); err != nil {
 		t.Fatalf("rendered без маркера: %v", err)
 	}
@@ -343,15 +363,16 @@ func TestSchema_ResultsRenderedCheck(t *testing.T) {
 		t.Fatalf("не-рендер без маркера: %v", err)
 	}
 
-	// Нарушение инварианта: rendered = true + маркер — 23514 схемой,
-	// коду не приходится держать пару колонок вручную (ФТ-5.2).
+	// The invariant violation: rendered = true + a marker — 23514 by
+	// the schema, the code does not have to keep the column pair by
+	// hand (FR-5.2).
 	if err := insertRow(3, true, time.Now()); err == nil ||
 		!strings.Contains(err.Error(), "subdomain_results_rendered_check") {
 		t.Errorf("rendered с маркером: err = %v, want violation subdomain_results_rendered_check", err)
 	}
-	// UPDATE существующей строки в нарушение — тоже отвергается (NOT
-	// VALID проверяет новые записи, включая изменения); цель — конкретная
-	// rendered-строка (sub=0).
+	// An UPDATE of an existing row into violation is rejected too (NOT
+	// VALID checks new writes, including changes); the target — the
+	// specific rendered row (sub=0).
 	if _, err := pool.Exec(ctx,
 		"UPDATE subdomain_results SET render_failed_at = now() "+
 			"WHERE zone_id = $1 AND domain_id = $2 AND subdomain_id = 0",
@@ -360,12 +381,13 @@ func TestSchema_ResultsRenderedCheck(t *testing.T) {
 		t.Errorf("UPDATE маркера на rendered-строке: err = %v, want violation", err)
 	}
 
-	// NOT VALID: ограничение в СХЕМЕ ТЕСТА (фильтр по current_schema —
-	// ревью P3-1: в БД живут схемы соседних прогонов) на родителе и
-	// секциях ещё не валидировано — VALIDATE отдельным шагом по
-	// регламенту (docs/schema.md); новые секции (create_zone_partitions,
-	// T-005) наследуют его валидированным. total ≥ 2 — рекурсия на
-	// секции состоялась (родитель + DEFAULT-партиция).
+	// NOT VALID: the constraint in the TEST SCHEMA (the current_schema
+	// filter — review P3-1: the DB holds the schemas of neighboring
+	// runs) is not yet validated on the parent and the sections —
+	// VALIDATE as a separate step per the procedure (docs/schema.md);
+	// new sections (create_zone_partitions, T-005) inherit it
+	// validated. total ≥ 2 — the recursion into the sections happened
+	// (the parent + the DEFAULT partition).
 	rows, err := pool.Query(ctx,
 		`SELECT count(*) FILTER (WHERE convalidated) AS validated, count(*) AS total
 		 FROM pg_constraint
@@ -388,10 +410,10 @@ func TestSchema_ResultsRenderedCheck(t *testing.T) {
 	}
 }
 
-// latePinSelectSQL — полный текст lateRenderRowsSQL с литералами
-// параметров (T-271; якорь — internal/httpworker/renderlate.go,
-// дублирование — стиль rqBatchSQL; коды схемы литералами:
-// FlagRenderPending = 2, StatusDeleted = 6).
+// latePinSelectSQL — the full lateRenderRowsSQL text with literal
+// parameters (T-271; the anchor — internal/httpworker/renderlate.go,
+// the duplication — the rqBatchSQL style; the schema codes as
+// literals: FlagRenderPending = 2, StatusDeleted = 6).
 const latePinSelectSQL = "SELECT r.zone_id, r.domain_id, r.subdomain_id, r.variant, " +
 	"r.content_hash, r.alias_subdomain_id, d.label || '.' || z.name " +
 	"FROM subdomain_results AS r " +
@@ -405,21 +427,23 @@ const latePinSelectSQL = "SELECT r.zone_id, r.domain_id, r.subdomain_id, r.varia
 	"ORDER BY r.zone_id, r.domain_id, r.subdomain_id, r.variant " +
 	"LIMIT 1000"
 
-// TestRenderLateSelectPlanUnpinned — форма плана выборки пачки позднего
-// переиздателя (T-273 снял закрепления T-271): на объёме прод-пропорции
-// (домены ≈ 4× записей — прод 43 млн при 11,3 млн) НЕпиненный
-// планировщик обязан собрать ограниченную пачку с ранним остановом —
-// доступ к subdomain_results по индексу + Limit, без полного Sort
-// записей. Закрепление T-271 (SET LOCAL seq/hash/merge/bitmap off) на
-// таком объёме разворачивало join от domains (cost ≈157 млн) — вечная
-// петля за 60-с дедлайном (инцидент 09–10.11.2026); непиненная форма
-// T-251 («планировщик сам») работала в проде неделями. Конкретный путь
-// не закрепляется (Seq/Hash/Merge в руках планировщика — потому
-// фикстура прод-пропорции, а не три строки: на пустой таблице
-// планировщик законно берёт seq scan + Sort). Замер T-273 (testbed
-// PG 16.15, 2 млн domains / 550 тыс. записей): нулевой курсор —
-// Nested Loop от domains с пробами PK записей, 19 мс; середина
-// таблицы — Merge Join от subdomain_results, 42 мс.
+// TestRenderLateSelectPlanUnpinned — the plan shape of the late
+// re-publisher batch selection (T-273 removed the T-271 pins): at
+// production-proportion volume (domains ≈ 4× the records — production
+// 43M at 11.3M) the UNpinned planner must assemble a limited batch
+// with an early stop — access to subdomain_results via an index +
+// Limit, without a full Sort of the records. The T-271 pinning
+// (SET LOCAL seq/hash/merge/bitmap off) at such volume flipped the
+// join to lead from domains (cost ≈157M) — an infinite loop over the
+// 60 s deadline (the 2026-11-09–10 incident); the unpinned T-251 form
+// ("the planner decides itself") worked in production for weeks. The
+// specific path is not pinned (Seq/Hash/Merge are in the planner's
+// hands — hence the production-proportion fixture, not three rows: on
+// an empty table the planner legitimately takes a seq scan + Sort).
+// The T-273 measurement (the testbed PG 16.15, 2M domains / 550k
+// records): the zero cursor — a Nested Loop from domains with PK
+// probes of the records, 19 ms; the middle of the table — a Merge
+// Join from subdomain_results, 42 ms.
 func TestRenderLateSelectPlanUnpinned(t *testing.T) {
 	skipUnlessIntegration(t)
 	pool := migratedSchema(t)
@@ -431,9 +455,10 @@ func TestRenderLateSelectPlanUnpinned(t *testing.T) {
 		t.Fatalf("insert zones: %v", err)
 	}
 
-	// Прод-пропорция в миниатюре: 480 тыс. доменов, 125 тыс. записей
-	// (1:3,8 ≈ прод 43:11,3 млн) — большинство доменов без записей,
-	// выборка с нулевого курсора предельно несеективна, как в catch-up.
+	// The production proportion in miniature: 480k domains, 125k
+	// records (1:3.8 ≈ the production 43:11.3M) — most domains without
+	// records, the selection from the zero cursor is maximally
+	// non-selective, as in catch-up.
 	const (
 		lateDomains = 480000
 		lateRows    = 125000
@@ -458,17 +483,18 @@ func TestRenderLateSelectPlanUnpinned(t *testing.T) {
 		t.Fatalf("ANALYZE subdomain_results: %v", err)
 	}
 
-	// Без закреплений — как в боевой tx-оболочке T-273 (единственный
-	// SET LOCAL там — statement_timeout, на форму плана не влияющий).
+	// Without pins — as in the production tx wrapper of T-273 (the only
+	// SET LOCAL there is statement_timeout, which does not affect the
+	// plan shape).
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	// EXPLAIN ANALYZE — форма и факт исполнения: пачка обязана
-	// собраться (rows=1000) за конечное время — ровно того, чего не
-	// случалось у закреплённой формы на прод-объёме.
+	// EXPLAIN ANALYZE — the shape and the fact of execution: the batch
+	// must be assembled (rows=1000) in finite time — exactly what the
+	// pinned form failed to do at production volume.
 	plan := explainAnalyze(t, tx, ctx, latePinSelectSQL)
 	if !strings.Contains(plan, "Limit") {
 		t.Errorf("план без Limit (ранний останов пачки):\n%s", plan)
@@ -476,10 +502,11 @@ func TestRenderLateSelectPlanUnpinned(t *testing.T) {
 	if !planIdxScanRe.MatchString(plan) {
 		t.Errorf("план без Index Scan (записи читаются мимо индексов):\n%s", plan)
 	}
-	// Полный Sort записей — форма «сканируй всё и сортируй», её стоимость
-	// приписал инциденту T-271; Incremental Sort поверх порядка индекса
-	// допустим (узел называется «Incremental Sort», якорь badSortRe
-	// его не матчит).
+	// A full Sort of the records — the "scan everything and sort"
+	// shape, its cost was attributed to the T-271 incident; an
+	// Incremental Sort over the index order is allowed (the node is
+	// named "Incremental Sort", the badSortRe anchor does not match
+	// it).
 	if badSortRe.MatchString(plan) {
 		t.Errorf("план содержит полный Sort записей (порядок курсора должен закрываться индексом):\n%s", plan)
 	}
@@ -488,15 +515,16 @@ func TestRenderLateSelectPlanUnpinned(t *testing.T) {
 	}
 }
 
-// badSortRe — полный Sort-узел (не «Incremental Sort» и не строки
-// «Sort Key:»/«Sort Method:») в EXPLAIN-тестах T-273: якорь на начало
-// строки узла и требование скобки/конца строки после имени — Go regexp
-// без lookahead, а «Sort Key» начинается с того же слова.
+// badSortRe — a full Sort node (not "Incremental Sort" and not the
+// "Sort Key:"/"Sort Method:" lines) in the T-273 EXPLAIN tests: the
+// anchor at the beginning of the node line and the requirement of a
+// bracket/line end after the name — Go regexp without lookahead, and
+// "Sort Key" starts with the same word.
 var badSortRe = regexp.MustCompile(`(?m)^\s*(?:->\s*)?Sort(\s*\(|$)`)
 
-// explainAnalyze — текст EXPLAIN ANALYZE (COSTS OFF) запроса внутри
-// транзакции (стиль explainPlan; T-273: ANALYZE — замер фактического
-// исполнения ограниченной пачки).
+// explainAnalyze — the EXPLAIN ANALYZE (COSTS OFF) plan text of a
+// query inside a transaction (the explainPlan style; T-273: ANALYZE —
+// a measurement of the actual execution of the limited batch).
 func explainAnalyze(t *testing.T, tx pgx.Tx, ctx context.Context, sql string) string {
 	t.Helper()
 	rows, err := tx.Query(ctx, "EXPLAIN (ANALYZE, COSTS OFF) "+sql)

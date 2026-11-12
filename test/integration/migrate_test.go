@@ -1,11 +1,12 @@
-// Интеграционные тесты миграционного механизма (T-002): встроенный раннер
-// internal/migrate — тот же код, что сервисы выполняют при старте, —
-// применяется к чистой схеме, идемпотентен и безопасен при одновременном
-// старте нескольких экземпляров (advisory-блокировка).
+// Integration tests of the migration mechanism (T-002): the embedded
+// runner internal/migrate — the same code the services run at startup —
+// is applied to a clean schema, is idempotent and safe when several
+// instances start at once (advisory lock).
 //
-// Чистая схема изолируется через search_path: DSN получает параметр
-// search_path=<временная схема>, и вся DDL выполняется в ней, не задевая
-// рабочую схему crawler (аналог применения на пустой БД).
+// The clean schema is isolated via search_path: the DSN gets the
+// search_path=<temporary schema> parameter, and all DDL runs there
+// without touching the working crawler schema (an equivalent of
+// applying on an empty DB).
 package integration
 
 import (
@@ -28,7 +29,7 @@ import (
 	"crawler/migrations"
 )
 
-// pgDSN возвращает DSN PostgreSQL из окружения (как у сервисов).
+// pgDSN returns the PostgreSQL DSN from the environment (as the services do).
 func pgDSN(t *testing.T) string {
 	t.Helper()
 	dsn := os.Getenv("APP_PG_DSN")
@@ -38,7 +39,7 @@ func pgDSN(t *testing.T) string {
 	return dsn
 }
 
-// embeddedNames — отсортированный список файлов встроенного набора.
+// embeddedNames — the sorted list of the embedded set files.
 func embeddedNames(t *testing.T) []string {
 	t.Helper()
 	entries, err := migrations.FS.ReadDir(".")
@@ -53,7 +54,7 @@ func embeddedNames(t *testing.T) []string {
 	return names
 }
 
-// latestEmbeddedVersion — максимальный номер версии во встроенном наборе.
+// latestEmbeddedVersion — the maximum version number in the embedded set.
 func latestEmbeddedVersion(t *testing.T) uint {
 	t.Helper()
 	var max uint
@@ -69,14 +70,14 @@ func latestEmbeddedVersion(t *testing.T) uint {
 	return max
 }
 
-// schemaSeq — счётчик схем внутри одного тест-бинаря: имя схемы
-// уникально на каждый вызов withTestSchema, иначе второй env внутри
-// одного теста (TestContent_Compaction) делал DROP SCHEMA первого, а
-// t.Parallel был бы небезопасен.
+// schemaSeq — a schema counter within one test binary: the schema name
+// is unique per withTestSchema call, otherwise a second env inside one
+// test (TestContent_Compaction) dropped the first schema, and
+// t.Parallel would be unsafe.
 var schemaSeq atomic.Uint64
 
-// withTestSchema создаёт изолированную схему и возвращает DSN с search_path
-// на неё плюс функцию очистки.
+// withTestSchema creates an isolated schema and returns a DSN with
+// search_path pointing to it plus a cleanup function.
 func withTestSchema(t *testing.T) (string, func()) {
 	t.Helper()
 	ctx := context.Background()
@@ -107,7 +108,7 @@ func withTestSchema(t *testing.T) (string, func()) {
 	}
 }
 
-// schemaVersion читает версию применённых миграций в схеме из DSN.
+// schemaVersion reads the version of applied migrations in the schema from the DSN.
 func schemaVersion(t *testing.T, dsn string) (uint, bool) {
 	t.Helper()
 	ctx := context.Background()
@@ -124,8 +125,8 @@ func schemaVersion(t *testing.T, dsn string) (uint, bool) {
 	return uint(v), true
 }
 
-// TestMigrate_FreshSchema применяет встроенный набор к чистой схеме —
-// ровно то, что делает первый старт сервисов на пустой БД.
+// TestMigrate_FreshSchema applies the embedded set to a clean schema —
+// exactly what the first services start does on an empty DB.
 func TestMigrate_FreshSchema(t *testing.T) {
 	skipUnlessIntegration(t)
 	latest := latestEmbeddedVersion(t)
@@ -148,7 +149,7 @@ func TestMigrate_FreshSchema(t *testing.T) {
 		t.Errorf("версия схемы = %d, want %d (последняя встроенная)", version, latest)
 	}
 
-	// Ключевые таблицы эскиза DDL (ТЗ 6.1) появились в новой схеме.
+	// Key tables of the DDL sketch (spec 6.1) appeared in the new schema.
 	pool, err := pgxpool.New(context.Background(), dsn)
 	if err != nil {
 		t.Fatal(err)
@@ -173,8 +174,9 @@ func TestMigrate_FreshSchema(t *testing.T) {
 	}
 }
 
-// TestMigrate_AlreadyApplied — повторное применение на актуальной схеме
-// («миграции уже применены») — не ошибка, версия не меняется.
+// TestMigrate_AlreadyApplied — re-applying to an up-to-date schema
+// ("migrations are already applied") is not an error, the version does
+// not change.
 func TestMigrate_AlreadyApplied(t *testing.T) {
 	skipUnlessIntegration(t)
 
@@ -195,9 +197,9 @@ func TestMigrate_AlreadyApplied(t *testing.T) {
 	}
 }
 
-// TestMigrate_ConcurrentStart — одновременный старт восьми экземпляров
-// раннера (как сервисы в compose): advisory-блокировка сериализует
-// применение, все экземпляры завершаются успешно.
+// TestMigrate_ConcurrentStart — eight runner instances start at once
+// (as the services in compose do): the advisory lock serializes the
+// apply, all instances finish successfully.
 func TestMigrate_ConcurrentStart(t *testing.T) {
 	skipUnlessIntegration(t)
 
@@ -227,16 +229,18 @@ func TestMigrate_ConcurrentStart(t *testing.T) {
 	}
 }
 
-// TestMigrate_InterruptedMidApply — отмена контекста (сигнал завершения
-// сервиса) во время применения длительной миграции (T-112): выполнявшийся
-// SQL снимается на стороне PostgreSQL по метке раннера, недоведённая
-// миграция откатывается целиком (файл — одна неявная транзакция простого
-// протокола), версия возвращается к предыдущей — и повторный старт
-// доводит применение, не оставляя dirty.
+// TestMigrate_InterruptedMidApply — a context cancellation (the service
+// termination signal) during the apply of a long migration (T-112): the
+// running SQL is cancelled on the PostgreSQL side by the runner tag,
+// the incomplete migration is rolled back as a whole (a file is one
+// implicit transaction of the simple protocol), the version returns to
+// the previous one — and a repeated start finishes the apply without
+// leaving dirty.
 //
-// Длительная миграция моделируется детерминированно: применению 000008
-// (CREATE INDEX, снимается блокировкой записи) препятствует транзакция,
-// держащая ROW EXCLUSIVE на domains, — CREATE INDEX ждёт её освобождения.
+// The long migration is modeled deterministically: the apply of 000008
+// (CREATE INDEX, cancelled by a record lock) is obstructed by a
+// transaction holding ROW EXCLUSIVE on domains — CREATE INDEX waits
+// for its release.
 func TestMigrate_InterruptedMidApply(t *testing.T) {
 	skipUnlessIntegration(t)
 
@@ -248,17 +252,18 @@ func TestMigrate_InterruptedMidApply(t *testing.T) {
 		t.Fatalf("подготовка — полное применение: %v", err)
 	}
 
-	// Состояние «применено 7, предстоит 000008»: индексы 000008 снимаются
-	// её down-миграцией, версия возвращается к 7 (эквивалент force 7).
-	// Псевдо-откат обязан покрывать и миграции ПОСЛЕ 000008 (новые —
-	// дополнять сюда их down-эффектами), иначе повторный Up споткнётся
-	// в них: 000009 возвращает глобальный ключ ingest_files.sha256,
-	// 000011 снимает таблицу laravel_history (000010 — CREATE OR REPLACE
-	// функции, повторное применение безопасно без подготовки), 0013/0014
-	// снимают частичный индекс deleted-доменов и индексы окон
-	// мониторинга (T-170/T-171), 0015 — таблицу счётчика crawler_counters
-	// вместе с колонкой updated_at из 0016 (T-178), 0016 — колонки
-	// счётчиков зон.
+	// The "7 applied, 000008 pending" state: the 000008 indexes are
+	// dropped by its down migration, the version returns to 7 (an
+	// equivalent of force 7). The pseudo-rollback must also cover the
+	// migrations AFTER 000008 (new ones — append their down effects
+	// here), otherwise a repeated Up would stumble on them: 000009
+	// returns the global ingest_files.sha256 key, 000011 drops the
+	// laravel_history table (000010 — CREATE OR REPLACE of functions,
+	// re-applying is safe without preparation), 0013/0014 drop the
+	// partial index of deleted domains and the monitoring window
+	// indexes (T-170/T-171), 0015 — the crawler_counters counter table
+	// together with the updated_at column from 0016 (T-178), 0016 —
+	// the zone counter columns.
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
 		t.Fatal(err)
@@ -280,18 +285,19 @@ func TestMigrate_InterruptedMidApply(t *testing.T) {
 		"ALTER TABLE zones DROP COLUMN IF EXISTS domains_laravel",
 		"ALTER TABLE zones DROP COLUMN IF EXISTS domains_pending",
 		"ALTER TABLE zones DROP COLUMN IF EXISTS domains_queued",
-		// 000017 (T-210): маркер render_failed_at — down-эффект, чтобы
-		// повторный Up применил миграцию на чистую колонку.
+		// 000017 (T-210): the render_failed_at marker — the down effect,
+		// so that a repeated Up applies the migration onto a clean column.
 		"ALTER TABLE subdomain_results DROP COLUMN IF EXISTS render_failed_at",
-		// 000018 (T-259) отдельной записи не требует: её CHECK
-		// subdomain_results_rendered_check умирает вместе с колонкой
-		// render_failed_at (каскад DROP COLUMN) — эффект уже снят
-		// строкой выше. 000019 (T-265): CHECK refcount — down-эффект,
-		// чтобы повторный Up применил ограничение на чистую таблицу
-		// (иначе ADD CONSTRAINT падает 42710 duplicate_object).
+		// 000018 (T-259) needs no separate entry: its CHECK
+		// subdomain_results_rendered_check dies together with the
+		// render_failed_at column (the DROP COLUMN cascade) — the effect
+		// is already removed by the line above. 000019 (T-265): the
+		// refcount CHECK — the down effect, so that a repeated Up applies
+		// the constraint onto a clean table (otherwise ADD CONSTRAINT
+		// fails with 42710 duplicate_object).
 		"ALTER TABLE contents DROP CONSTRAINT IF EXISTS contents_refcount_check",
-		// 000020 (T-274): таблица персистентного курсора дренажа —
-		// down-эффект, иначе повторный Up падает 42P07 already exists.
+		// 000020 (T-274): the persistent drain cursor table — the down
+		// effect, otherwise a repeated Up fails with 42P07 already exists.
 		"DROP TABLE IF EXISTS retention_drain_cursor",
 		"TRUNCATE schema_migrations",
 		"INSERT INTO schema_migrations (version, dirty) VALUES (7, false)",
@@ -301,9 +307,10 @@ func TestMigrate_InterruptedMidApply(t *testing.T) {
 		}
 	}
 
-	// Блокировщик: держит ROW EXCLUSIVE на domains — CREATE INDEX из 000008
-	// (нужен SHARE) висит до освобождения. Отдельное соединение без метки
-	// раннера: проверяет заодно, что отмена не трогает чужие запросы.
+	// The blocker: holds ROW EXCLUSIVE on domains — the 000008
+	// CREATE INDEX (needs SHARE) hangs until release. A separate
+	// connection without the runner tag: also checks that the
+	// cancellation does not touch foreign queries.
 	blocker, err := pgx.Connect(ctx, dsn)
 	if err != nil {
 		t.Fatalf("соединение блокировщика: %v", err)
@@ -322,11 +329,11 @@ func TestMigrate_InterruptedMidApply(t *testing.T) {
 	upDone := make(chan error, 1)
 	go func() { upDone <- migrate.Up(upCtx, dsn) }()
 
-	// Миграция 000008 начала применяться: версия отмечена 8 dirty
-	// (golang-migrate ставит dirty до выполнения файла).
+	// Migration 000008 started applying: the version is marked 8 dirty
+	// (golang-migrate sets dirty before running the file).
 	waitVersionState(t, dsn, 8, true)
 
-	cancelUp() // «сигнал завершения» во время применения
+	cancelUp() // the "termination signal" during the apply
 	select {
 	case err := <-upDone:
 		if !errors.Is(err, migrate.ErrInterrupted) {
@@ -336,8 +343,9 @@ func TestMigrate_InterruptedMidApply(t *testing.T) {
 		t.Fatal("Up не завершился после отмены — применяющаяся миграция не прервана")
 	}
 
-	// Недоведённая миграция откатана: версия 7 чистая, dirty нет,
-	// индексы 000008 не созданы (неявная транзакция откатила CREATE INDEX).
+	// The incomplete migration is rolled back: version 7 is clean, no
+	// dirty, the 000008 indexes are not created (the implicit
+	// transaction rolled back the CREATE INDEX).
 	version, dirty := schemaVersionState(t, dsn)
 	if version != 7 || dirty {
 		t.Errorf("после прерывания: версия = %d dirty = %v, want 7 false (сброс к предыдущей)", version, dirty)
@@ -348,9 +356,9 @@ func TestMigrate_InterruptedMidApply(t *testing.T) {
 		}
 	}
 
-	// Повторный старт доводит применение до конца: 000008 и всё, что за
-	// ней в наборе (последняя версия набора, а не конкретный номер —
-	// набор растёт с новыми миграциями).
+	// A repeated start carries the apply to the end: 000008 and
+	// everything after it in the set (the latest version of the set,
+	// not a specific number — the set grows with new migrations).
 	if _, err := blocker.Exec(ctx, "ROLLBACK"); err != nil {
 		t.Fatalf("освобождение блокировщика: %v", err)
 	}
@@ -368,9 +376,10 @@ func TestMigrate_InterruptedMidApply(t *testing.T) {
 	}
 }
 
-// waitVersionState ждёт, пока schema_migrations примет указанное состояние
-// (применение миграции стартовало: версия помечена dirty), опрашивая
-// отдельным пулом — соединения раннера заняты применением.
+// waitVersionState waits until schema_migrations reaches the given state
+// (the migration apply has started: the version is marked dirty),
+// polling with a separate pool — the runner connections are busy
+// applying.
 func waitVersionState(t *testing.T, dsn string, wantVersion int, wantDirty bool) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -395,7 +404,7 @@ func waitVersionState(t *testing.T, dsn string, wantVersion int, wantDirty bool)
 	}
 }
 
-// schemaVersionState — текущая запись schema_migrations (версия и dirty).
+// schemaVersionState — the current schema_migrations record (version and dirty).
 func schemaVersionState(t *testing.T, dsn string) (int, bool) {
 	t.Helper()
 	pool, err := pgxpool.New(context.Background(), dsn)
@@ -412,7 +421,7 @@ func schemaVersionState(t *testing.T, dsn string) (int, bool) {
 	return version, dirty
 }
 
-// indexExists — индекс существует в текущей схеме DSN.
+// indexExists — the index exists in the current schema of the DSN.
 func indexExists(t *testing.T, pool *pgxpool.Pool, name string) bool {
 	t.Helper()
 	var exists bool
@@ -425,12 +434,12 @@ func indexExists(t *testing.T, pool *pgxpool.Pool, name string) bool {
 	return exists
 }
 
-// TestMigrate_EmbeddedSetMatchesRepo — встроенный в бинарник набор
-// совпадает с актуальными файлами migrations/ (сборка не устарела).
+// TestMigrate_EmbeddedSetMatchesRepo — the set embedded in the binary
+// matches the current migrations/ files (the build is not stale).
 func TestMigrate_EmbeddedSetMatchesRepo(t *testing.T) {
 	skipUnlessIntegration(t)
 
-	// Тесты выполняются из каталога пакета test/integration.
+	// Tests run from the test/integration package directory.
 	onDisk, err := filepath.Glob("../../migrations/*.sql")
 	if err != nil {
 		t.Fatal(err)

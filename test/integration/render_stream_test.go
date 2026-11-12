@@ -1,23 +1,26 @@
-// Интеграционный тест параметра стрима потребления renderworker (T-236,
-// ТЗ §4.1 п.3, ФТ-12) против живых Redis/PostgreSQL dev-окружения:
-// воркер, собранный с Options.Stream = альтернативный стрим и отдельной
-// группой потребителей, читает именно его — XREADGROUP лениво создаёт
-// группу на альтернативном стриме, доставка дорабатывается и
-// подтверждается (PEL пуст), дефолтный q:render не читается вовсе
-// (группа не создаётся, контрольная запись остаётся недоставленной).
+// Integration test of the renderworker consumer stream parameter
+// (T-236, spec §4.1 item 3, FR-12) against the live Redis/PostgreSQL
+// dev environment: a worker built with Options.Stream = the alternative
+// stream and a separate consumer group reads exactly that stream —
+// XREADGROUP lazily creates the group on the alternative stream, the
+// delivery is processed to completion and acknowledged (PEL empty),
+// and the default q:render is not read at all (no group is created,
+// the control record stays undelivered).
 //
-// Альтернативный стрим — q:analyze: транспорт очереди принимает только
-// известные стримы (knownStream), а формат Result допустим в q:render и
-// q:analyze одинаково (message.go); боевой альтернативный стрим
-// q:render-fallback появится в internal/queue задачей T-237 — для
-// проводки воркера безразлично, какой из известных Result-стримов
-// подставлен. Задача адресует несуществующую строку subdomain_results:
-// ProcessResult отвечает штатным отказом (false, nil) без рендера и
-// публикации — доставка подтверждается, а цикл не самоперекармливается
-// публикациями в тот же стрим (успешный рендер публикует q:analyze —
-// читатель увидел бы собственный результат снова). Уровень вызовов — как
-// у соседей (render_requeue_test.go): библиотечный Run воркера без
-// запуска сервиса; изоляция — withTestSchema + Redis БД 15.
+// The alternative stream is q:analyze: the queue transport accepts
+// only known streams (knownStream), and the Result format is valid in
+// q:render and q:analyze alike (message.go); the production
+// alternative stream q:render-fallback will appear in internal/queue
+// with task T-237 — the worker wiring does not care which of the known
+// Result streams is plugged in. The task addresses a non-existent
+// subdomain_results row: ProcessResult answers with the normal
+// rejection (false, nil) without rendering or publishing — the
+// delivery is acknowledged and the loop does not feed itself with
+// publications to the same stream (a successful render publishes to
+// q:analyze — the reader would see its own result again). The call
+// level matches the neighbors (render_requeue_test.go): the library
+// Run of the worker without starting the service; isolation —
+// withTestSchema + Redis DB 15.
 package integration
 
 import (
@@ -36,9 +39,9 @@ import (
 	"crawler/internal/renderworker"
 )
 
-// rsRenderer — заглушка шва рендера: обработка задачи теста до рендера
-// не доходит (строки нет — штатный отказ), вызов фиксируется счётчиком
-// и роняет проверку.
+// rsRenderer — a render seam stub: test task processing never reaches
+// the render (the row is missing — normal rejection), the call is
+// recorded by a counter and fails the check.
 type rsRenderer struct {
 	calls atomic.Int32
 }
@@ -48,10 +51,11 @@ func (r *rsRenderer) Run(_ context.Context, task render.RenderTask) (render.Rend
 	return render.RenderOutput{}, fmt.Errorf("renderworker-stream: рендер не должен вызываться: %s", task.URL)
 }
 
-// TestRenderWorkerAltStream — потребление альтернативного стрима
-// отдельной группой (T-236, ФТ-12): сборка воркера фолбэка — тот же
-// бинарь с Options{Stream, Group} — читает и подтверждает записи своего
-// стрима; дефолтный q:render остаётся нетронутым (записи и группы).
+// TestRenderWorkerAltStream — consumption of the alternative stream
+// by a separate group (T-236, FR-12): a fallback worker build — the
+// same binary with Options{Stream, Group} — reads and acknowledges the
+// records of its own stream; the default q:render stays untouched
+// (records and groups).
 func TestRenderWorkerAltStream(t *testing.T) {
 	skipUnlessIntegration(t)
 	ctx := context.Background()
@@ -79,8 +83,9 @@ func TestRenderWorkerAltStream(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = store.Close() })
 
-	// Сборка воркера фолбэка (ФТ-12): другой стрим и отдельная группа,
-	// остальное — штатные зависимости (БД, очередь, хранилище, рендер).
+	// Fallback worker build (FR-12): a different stream and a separate
+	// group, everything else — normal dependencies (DB, queue, store,
+	// render).
 	const altGroup = "render-alt"
 	renderer := &rsRenderer{}
 	opts := renderworker.Options{
@@ -93,9 +98,10 @@ func TestRenderWorkerAltStream(t *testing.T) {
 		t.Fatalf("renderworker.New: %v", err)
 	}
 
-	// Задача — в альтернативный стрим (ключа в БД нет — штатный отказ);
-	// контрольная — в дефолтный q:render: основная сборка воркера читала
-	// бы именно её, сборка с Options.Stream обязана игнорировать.
+	// The task goes to the alternative stream (the key is missing in
+	// the DB — normal rejection); the control one goes to the default
+	// q:render: the main worker build would read exactly that one, the
+	// build with Options.Stream must ignore it.
 	altTask := queue.Result{
 		TaskID: queue.NewTaskID(), ZoneID: 5, DomainID: 501,
 		SubdomainID: 1, Name: "alt.stream.test",
@@ -115,9 +121,10 @@ func TestRenderWorkerAltStream(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- renderworker.Run(runCtx, w, opts) }()
 
-	// Потребление альтернативного стрима состоялось и доведено до XACK:
-	// группа создана, её last-delivered-id — запись задачи, PEL пуст
-	// (обработка — штатный отказ без ошибки, доставка подтверждается).
+	// The alternative stream was consumed and carried through to XACK:
+	// the group is created, its last-delivered-id is the task record,
+	// the PEL is empty (processing — a normal rejection without an
+	// error, the delivery is acknowledged).
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		groups, err := rdb.XInfoGroups(ctx, queue.StreamAnalyze).Result()
@@ -151,8 +158,8 @@ func TestRenderWorkerAltStream(t *testing.T) {
 		t.Fatal("Run не завершился после отмены ctx")
 	}
 
-	// Дефолтный q:render не читался: группа не создавалась вовсе,
-	// контрольная запись осталась недоставленной.
+	// The default q:render was not read: no group was created at all,
+	// the control record stayed undelivered.
 	renderGroups, err := rdb.XInfoGroups(ctx, queue.StreamRender).Result()
 	if err != nil {
 		t.Fatalf("XINFO GROUPS %s: %v", queue.StreamRender, err)
@@ -164,8 +171,8 @@ func TestRenderWorkerAltStream(t *testing.T) {
 	if n := streamLen(t, rdb, queue.StreamRender); n != 1 {
 		t.Errorf("записей q:render = %d, хочу 1 (контрольная на месте, потерь и дублей нет)", n)
 	}
-	// Альтернативный стрим — только исходная запись: обработка без
-	// публикаций (самоперекармливание отсутствует).
+	// The alternative stream holds only the original record: processing
+	// without publications (no self-feeding).
 	if n := streamLen(t, rdb, queue.StreamAnalyze); n != 1 {
 		t.Errorf("записей q:analyze = %d, хочу 1 (штатный отказ ничего не публикует)", n)
 	}

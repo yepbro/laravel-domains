@@ -1,26 +1,30 @@
-// Интеграционные тесты автомата бита render_pending × счётчика долга
-// (T-258, ТЗ tasks/TZ-fsm.md §3 ФТ-4) против живых PostgreSQL/Redis:
-// сценарная цепочка всех переходов спецификации (internal/httpworker/
-// renderq.go, таблица у renderSetPendingSQL — единая точка правды)
-// реальными писателями на одном домене: Д1 постановка долга записью
-// результата при полной очереди (+1), Д2 повторная доставка с уже
-// стоящим битом (охрана: второй +1 запрещён), Д8 свежий эпизод при
-// свободной очереди (бит не стирается, пара не трогается), Д3 проход
-// доработки «опубликован → снят» (−1) и зеркальная охрана снятия Д7
-// (второй −1 запрещён), Д4 черновой флаг (снятие без публикации, −1),
-// Д5 keep нечитаемого контента (пара сохранена), Д6 снятие delete-файлом
-// (−1, T-186). Парность бита и счётчика (инвариант И2) после каждого
-// шага сверяет реконсиляция monitor (VerifyCounters — счётчик против
-// живого числа строк с битом); переживание «прочих» битов (is_idn)
-// проверяется на каждом переходе (стиль httpbit_test.go, T-257).
-// Переполнение q:render детерминировано: watermark 1 и одно живое
-// сообщение в стриме (групп нет — глубина XLEN); сброс глубины между
-// шагами — DEL стрима (стиль render_late_test.go). Ветка рассинхрона
-// «счётчик > 0, выборка пуста» (диагностика битов-сирот) уже покрыта
-// TestRenderRequeuePass («повторный проход не выбирает снятое»); сами
-// сироты-deleted — особое состояние спецификации, тестами ФТ-4 не
-// требуется. Уровень вызовов — библиотечные, без запуска сервисов;
-// изоляция — withTestSchema + Redis БД 15.
+// Integration tests of the render_pending bit × debt counter automaton
+// (T-258, the TZ-fsm spec tasks/TZ-fsm.md §3 FR-4) against live
+// PostgreSQL/Redis: the scenario chain of all the specification
+// transitions (internal/httpworker/renderq.go, the table at
+// renderSetPendingSQL — the single point of truth) by the real writers
+// on one domain: D1 the debt is set by a result record with a full
+// queue (+1), D2 a repeated delivery with the bit already set (the
+// guard: a second +1 is forbidden), D8 a fresh episode with a free
+// queue (the bit is not erased, the pair is untouched), D3 the
+// finish-up pass "published → cleared" (−1) and the mirror clearing
+// guard D7 (a second −1 is forbidden), D4 the draft flag (a clear
+// without a publication, −1), D5 the keep of unreadable content (the
+// pair is preserved), D6 the clearing by a delete-file (−1, T-186).
+// The bit-counter pairing (the I2 invariant) after every step is
+// checked by the monitor reconciliation (VerifyCounters — the counter
+// against the live number of rows with the bit); surviving the "other"
+// bits (is_idn) is checked on every transition (the httpbit_test.go
+// style, T-257). The q:render overflow is deterministic: watermark 1
+// and one live message in the stream (no groups — the XLEN depth);
+// resetting the depth between steps — a DEL of the stream (the
+// render_late_test.go style). The desync branch "counter > 0, the
+// selection is empty" (the orphan bits diagnostics) is already covered
+// by TestRenderRequeuePass ("a repeated pass does not select the
+// cleared ones"); the deleted-orphans themselves are a special state
+// of the specification, not required by the FR-4 tests. The call level
+// — library-level, without starting services; isolation —
+// withTestSchema + Redis DB 15.
 package integration
 
 import (
@@ -42,12 +46,12 @@ import (
 	"crawler/internal/queue"
 )
 
-// renderBitStaticBody — статическая страница (не-SPA: текст обилен,
-// контейнера и noscript нет) — вердикт DetectSPA ложен, рендер не
-// требуется (T-057).
+// renderBitStaticBody — a static page (non-SPA: the text is abundant,
+// no container and no noscript) — the DetectSPA verdict is false, no
+// render is needed (T-057).
 var renderBitStaticBody = []byte(`<html><body>plain static page with plenty of visible text</body></html>`)
 
-// renderBitDebt — счётчик рендер-долга crawler_counters['render_pending'].
+// renderBitDebt — the render debt counter crawler_counters['render_pending'].
 func renderBitDebt(ctx context.Context, t *testing.T, pool *pgxpool.Pool) int64 {
 	t.Helper()
 	var n int64
@@ -58,32 +62,35 @@ func renderBitDebt(ctx context.Context, t *testing.T, pool *pgxpool.Pool) int64 
 	return n
 }
 
-// renderBitFailContent — RenderContent с транзиентным сбоем чтения
-// (сценарий keep, Д5): любой Get — ошибка хранения, не отмена ctx —
-// renderDomainKeys сохраняет флаг до следующего тика.
+// renderBitFailContent — a RenderContent with a transient read failure
+// (the keep scenario, D5): any Get — a storage error, not a ctx
+// cancellation — renderDomainKeys keeps the flag until the next tick.
 type renderBitFailContent struct{ err error }
 
 func (f renderBitFailContent) Get(context.Context, content.Hash) ([]byte, error) {
 	return nil, f.err
 }
 
-// TestRenderPendingBit_SpecTransitions — цепочка переходов спецификации
-// на одном домене: Д0 стационар → Д1 долг (+1) → Д2 охрана постановки →
-// Д8 свежий эпизод без перехода → Д3 «опубликован → снят» (−1) + Д7
-// охрана снятия → Д4 черновой флаг (−1 без публикации) → Д5 keep → Д6
-// снятие delete-файлом (−1). Значение счётчика ходит 0 → 1 → 0 ровно
-// шагами ±1 переходов, повторные доставки/снятия его не двигают.
+// TestRenderPendingBit_SpecTransitions — the chain of the specification
+// transitions on one domain: D0 steady state → D1 debt (+1) → D2 the
+// setting guard → D8 a fresh episode without a transition → D3
+// "published → cleared" (−1) + D7 the clearing guard → D4 the draft
+// flag (−1 without a publication) → D5 the keep → D6 the clearing by a
+// delete-file (−1). The counter value walks 0 → 1 → 0 exactly by the
+// ±1 steps of the transitions, repeated deliveries/clearings do not
+// move it.
 func TestRenderPendingBit_SpecTransitions(t *testing.T) {
 	skipUnlessIntegration(t)
-	pool := countersSchema(t) // общий хелпер пакета
+	pool := countersSchema(t) // a shared package helper
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
-	// q:render: публикация реальная (XADD); групп у стрима нет — глубина
-	// XLEN, сброс глубины между шагами — DEL (эмуляция потребления).
-	// Уборку стримов и закрытие клиента делает resilienceRedisEnv
-	// (wipeQueueStreams со свежим контекстом; тестовый ctx к моменту
-	// t.Cleanup уже отменён defer cancel — ревью T-258 P1-1).
+	// q:render: the publication is real (XADD); the stream has no
+	// groups — the XLEN depth, resetting the depth between steps — a
+	// DEL (a consumption emulation). The stream cleanup and the client
+	// closing are done by resilienceRedisEnv (wipeQueueStreams with a
+	// fresh context; the test ctx by the time of t.Cleanup is already
+	// cancelled by defer cancel — review T-258 P1-1).
 	rdb := resilienceRedisEnv(t)
 	q := queue.NewRedisQueue(rdb, queue.RedisOptions{Block: 150 * time.Millisecond})
 	store, err := content.OpenPackStore(pool, content.PackOptions{
@@ -96,8 +103,8 @@ func TestRenderPendingBit_SpecTransitions(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = store.Close() })
 
-	// watermark 1: пустой стрим — свободен, одно живое сообщение — уже
-	// переполнение («строго ниже порога», ТЗ 4.2).
+	// watermark 1: an empty stream — free, one live message — already
+	// an overflow ("strictly below the threshold", spec 4.2).
 	gate := queue.NewBackpressureGate(rdb, queue.BackpressureOptions{})
 	renderQ, err := httpworker.NewRenderQueue(q, gate, 1, nil)
 	if err != nil {
@@ -109,20 +116,22 @@ func TestRenderPendingBit_SpecTransitions(t *testing.T) {
 	}
 
 	zone := countersSeedZone(t, pool, "fsm-render.test")
-	// countersSeedDomains нумерует метки: prefix "spec" → label "spec0".
+	// countersSeedDomains numbers the labels: prefix "spec" → label "spec0".
 	ids := countersSeedDomains(t, pool, zone, "spec", 1, model.CheckStateQueued, model.StatusNew)
 	id := ids[0]
 	const name = "spec0.fsm-render.test"
 
-	// «Прочий бит» is_idn (без связей со счётчиком): спецификация Д1–Д8
-	// требует его сохранения — OR/AND ~бита не трогают чужие разряды.
+	// The "other bit" is_idn (unrelated to the counter): the D1–D8
+	// specification requires keeping it — OR/AND ~bit do not touch
+	// foreign digits.
 	if _, err := pool.Exec(ctx,
 		"UPDATE domains SET flags = flags | $1 WHERE zone_id = $2 AND id = $3",
 		int16(model.FlagIDN), zone, id); err != nil {
 		t.Fatalf("сеем is_idn: %v", err)
 	}
-	// Ручная вставка мимо инкрементальных дельт — реконсиляция авторитет
-	// (точка отсчёта счётчиков зон, стиль httpbit_test.go).
+	// A manual insert bypassing the incremental deltas — the
+	// reconciliation is the authority (the reference point of the zone
+	// counters, the httpbit_test.go style).
 	if _, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{}); err != nil {
 		t.Fatalf("реконсиляция: %v", err)
 	}
@@ -149,9 +158,10 @@ func TestRenderPendingBit_SpecTransitions(t *testing.T) {
 		}
 	}
 
-	// episode — HTTP-эпизод реальной цепочкой записи: ранний Put контента
-	// (T-147, как ContentSaver T-056) → RecordAndPublish (T-058/T-066).
-	// Вердикт SPA — DetectSPA над теми же байтами (детерминирован, T-057).
+	// episode — an HTTP episode by the real recording chain: the early
+	// Put of the content (T-147, like the ContentSaver T-056) →
+	// RecordAndPublish (T-058/T-066). The SPA verdict — DetectSPA over
+	// the same bytes (deterministic, T-057).
 	episode := func(body []byte) {
 		t.Helper()
 		put, err := store.Put(ctx, body)
@@ -179,7 +189,7 @@ func TestRenderPendingBit_SpecTransitions(t *testing.T) {
 		}
 	}
 
-	// armFull — заполнить q:render до порога (одно живое сообщение).
+	// armFull — fill q:render up to the threshold (one live message).
 	armFull := func() {
 		t.Helper()
 		if renderLen() == 0 {
@@ -195,8 +205,9 @@ func TestRenderPendingBit_SpecTransitions(t *testing.T) {
 	const debtFlags = int16(model.FlagIDN | model.FlagRenderPending)
 	const cleanFlags = int16(model.FlagIDN)
 
-	// Д0 «без-долга»: стационар — бит чист, счётчик 0; guard T-181 не
-	// выполняет тяжёлую выборку (пустой итог без ошибки).
+	// D0 "no debt": the steady state — the bit is clean, the counter
+	// 0; the T-181 guard does not run the heavy selection (an empty
+	// outcome without an error).
 	if debt() != 0 {
 		t.Fatalf("Д0: счётчик долга = %d, хочу 0", debt())
 	}
@@ -204,9 +215,9 @@ func TestRenderPendingBit_SpecTransitions(t *testing.T) {
 		t.Fatalf("Д0: RequeueOnce = %+v err=%v, хочу selected=0 (стационар)", res, err)
 	}
 
-	// Д1: запись результата при полной очереди — бит и счётчик +1 той
-	// же транзакцией, публикация q:render не выполняется, эпизод
-	// завершается без задержки (done/alive).
+	// D1: a result record with a full queue — the bit and the counter
+	// +1 by the same transaction, no q:render publication happens, the
+	// episode finishes without a delay (done/alive).
 	armFull()
 	episode(rqBody)
 	wantFlags(debtFlags, "после Д1")
@@ -221,9 +232,10 @@ func TestRenderPendingBit_SpecTransitions(t *testing.T) {
 	}
 	countersVerifyEmpty(t, pool, "после Д1 (постановка +1)")
 
-	// Д2: повторная доставка того же эпизода — очередь всё ещё полна,
-	// бит уже стоит: охрана постановки даёт RowsAffected 0, второй +1
-	// ЗАПРЕЩЁН (парность не двоится); строки перезаписаны идемпотентно.
+	// D2: a repeated delivery of the same episode — the queue is still
+	// full, the bit is already set: the setting guard gives RowsAffected
+	// 0, a second +1 is FORBIDDEN (the pairing is not doubled); the rows
+	// are rewritten idempotently.
 	full()
 	episode(rqBody)
 	wantFlags(debtFlags, "после Д2")
@@ -235,9 +247,10 @@ func TestRenderPendingBit_SpecTransitions(t *testing.T) {
 	}
 	countersVerifyEmpty(t, pool, "после Д2 (повторная доставка — дельты нет)")
 
-	// Д8: свежий эпизод при свободной очереди — запись результата бит
-	// НЕ стирает и счётчик не трогает: задачи публикуются самим эпизодом
-	// (дубль ограничен), держателем остаётся проход доработки.
+	// D8: a fresh episode with a free queue — the result record does
+	// NOT erase the bit and does not touch the counter: the tasks are
+	// published by the episode itself (the duplication is bounded), the
+	// holder stays the finish-up pass.
 	drain()
 	episode(rqBody)
 	wantFlags(debtFlags, "после Д8")
@@ -249,8 +262,9 @@ func TestRenderPendingBit_SpecTransitions(t *testing.T) {
 	}
 	countersVerifyEmpty(t, pool, "после Д8 (публикация без перехода)")
 
-	// Д3: проход доработки — «опубликован → снят»: переиздание SPA-задачи
-	// в q:render, затем снятие бита со счётчиком −1 одной транзакцией.
+	// D3: the finish-up pass — "published → cleared": re-publishing the
+	// SPA task to q:render, then clearing the bit with the counter −1
+	// in one transaction.
 	drain()
 	res, err := httpworker.RequeueOnce(ctx, pool, store, renderQ, httpworker.RequeueOptions{})
 	if err != nil {
@@ -268,14 +282,16 @@ func TestRenderPendingBit_SpecTransitions(t *testing.T) {
 	}
 	countersVerifyEmpty(t, pool, "после Д3 (снятие −1)")
 
-	// Д7 (зеркальная охрана снятия): конкурент уже снял бит — повторный
-	// CLEAR по охране даёт RowsAffected 0, второй −1 ЗАПРЕЩЁН (сырой SQL
-	// счётчик не трогает по определению — весь смысл в RowsAffected = 0:
-	// ровно его и проверяем; оператор прохода renderClearPendingTx на
-	// этом нуле пропускает декремент — юнит-тест TestRequeueOnceClearRace).
-	// SQL — литерал renderClearPendingSQL (дублирование — стиль
-	// schema_test.go, константа не экспортирована; рассинхрон литерала
-	// с кодом ловит TestSchema_RenderDebtCounter — контракт охраны).
+	// D7 (the mirror clearing guard): a competitor has already cleared
+	// the bit — a repeated CLEAR by the guard gives RowsAffected 0, a
+	// second −1 is FORBIDDEN (the raw SQL does not touch the counter by
+	// definition — the whole point is in RowsAffected = 0: exactly that
+	// is checked here; the pass operator renderClearPendingTx skips the
+	// decrement on this zero — the TestRequeueOnceClearRace unit test).
+	// The SQL — a literal of renderClearPendingSQL (the duplication —
+	// the schema_test.go style, the constant is not exported; a literal
+	// desync with the code is caught by TestSchema_RenderDebtCounter —
+	// the guard contract).
 	const clearSQL = "UPDATE domains AS t SET flags = (t.flags & -3)::int2 " +
 		"WHERE t.zone_id = $1::int2 AND t.id = $2::int8 AND (t.flags & 2) <> 0"
 	tag, err := pool.Exec(ctx, clearSQL, zone, id)
@@ -290,11 +306,11 @@ func TestRenderPendingBit_SpecTransitions(t *testing.T) {
 	}
 	countersVerifyEmpty(t, pool, "после Д7 (охрана снятия)")
 
-	// Д4 «черновой флаг»: долг перевооружен (Д1 — очередь держит
-	// сообщение, опубликованное проходом Д3), затем страница перестала
-	// быть SPA (свежий эпизод со статическим телом при свободной
-	// очереди — рендерить нечего, бит пережил запись, Д8) — проход
-	// снимает флаг БЕЗ публикации, счётчик −1.
+	// D4 "the draft flag": the debt is re-armed (D1 — the queue holds
+	// the message published by the D3 pass), then the page stopped
+	// being SPA (a fresh episode with a static body with a free queue —
+	// nothing to render, the bit survived the record, D8) — the pass
+	// clears the flag WITHOUT a publication, the counter −1.
 	full()
 	episode(rqBody)
 	wantFlags(debtFlags, "после перевооружения Д4")
@@ -323,9 +339,10 @@ func TestRenderPendingBit_SpecTransitions(t *testing.T) {
 	}
 	countersVerifyEmpty(t, pool, "после Д4 (черновое снятие −1)")
 
-	// Д5 keep: контент записей нечитаем (транзиентный сбой хранилища) —
-	// проход сохраняет пару «бит × счётчик» до следующего тика; тик с
-	// читаемым хранилищем закрывает долг обычным Д3.
+	// D5 the keep: the record content is unreadable (a transient
+	// storage failure) — the pass keeps the "bit × counter" pair until
+	// the next tick; a tick with a readable storage closes the debt by
+	// the usual D3.
 	armFull()
 	episode(rqBody)
 	wantFlags(debtFlags, "после перевооружения Д5")
@@ -360,12 +377,13 @@ func TestRenderPendingBit_SpecTransitions(t *testing.T) {
 	}
 	countersVerifyEmpty(t, pool, "после закрытия Д5 (снятие −1)")
 
-	// Д6: delete-файл снимает бит той же транзакцией перевода статуса и
-	// декрементирует счётчик (T-186): удаляемый домен выборку прохода
-	// больше не пройдёт, бит без владельца не держит долг; is_idn
-	// сохранён; повторное применение партии (at-least-once) не двоит −1
-	// (охрана статуса; полная партия — TestCounters_DeleteWithRenderPending).
-	full() // очередь держит сообщение, опубликованное закрытием Д5
+	// D6: a delete-file clears the bit by the same status transition
+	// transaction and decrements the counter (T-186): the deleted
+	// domain will not pass the pass selection anymore, a bit without an
+	// owner does not hold the debt; is_idn is preserved; a repeated
+	// batch apply (at-least-once) does not double the −1 (the status
+	// guard; the full batch — TestCounters_DeleteWithRenderPending).
+	full() // the queue holds the message published by the D5 closure
 	episode(rqBody)
 	wantFlags(debtFlags, "после перевооружения Д6")
 	if debt() != 1 {
@@ -391,48 +409,54 @@ func TestRenderPendingBit_SpecTransitions(t *testing.T) {
 	countersVerifyEmpty(t, pool, "после Д6 (снятие delete-файлом −1)")
 }
 
-// --- инцидент 08.11.2026 (T-269) --------------------------------------------
+// --- the 2026-11-08 incident (T-269) ----------------------------------------
 //
-// Расследование рассинхрона «−36 за один проход» из prod-reports/
-// 2026-11-08-010800.md: снятие 18 флагов проходом доработки дало −18,
-// ожидаемый 0, а следующий тик охраны прочитал уже −18 — «немой»
-// (updated_at строки счётчика не двигался) второй −18 поверх
-// единственного наблюдаемого набора снятий. Подозрение оператора —
-// реконсиляция monitor (T-178) с «устаревшим ожиданием». Итог аудита
-// всех писателей crawler_counters['render_pending']:
+// The investigation of the "−36 in one pass" desync from prod-reports/
+// 2026-11-08-010800.md: clearing 18 flags by the finish-up pass gave
+// −18, an expected 0, and the next guard tick already read −18 — a
+// "silent" (the counter row's updated_at did not move) second −18 on
+// top of the single observed set of clearings. The operator's
+// suspicion — the monitor reconciliation (T-178) with a "stale
+// expectation". The audit outcome of all the writers of
+// crawler_counters['render_pending']:
 //
-//   - httpworker (renderq.go) — дельты ±1 в паре с битом, охраны
-//     RowsAffected (Д1–Д8, тесты выше) — двойной −1 невозможен;
-//   - monitor (zonestats.go, recountCountersSQL) — АБСОЛЮТНЫЙ upsert
-//     значением агрегата (value = EXCLUDED.value), дельты не пишет;
-//     каждая перезапись двигает updated_at — «немого» следа оставить не
-//     может. Реальная гонка иная: значение вычислено снапшотом раннего
-//     оператора прохода (агрегат), а применяется поздним (upsert) —
-//     конкурентные переходы в окне затираются устаревшим абсолютом
-//     (ложный долг/ложный ноль), транзиентно, самолечится следующим
-//     проходом — воспроизведена тестом опровержения ниже;
-//   - ingest (apply_delete.go, T-186 до фикса) — ЕДИНСТВЕННЫЙ
-//     «немой» дельта-писатель со снимком: CTE rd декрементировал
-//     −count(had_render) по СНАПШОКУ pre, а снятие бита делал CASE по
-//     ТЕКУЩЕЙ версии строки. Проход доработки, снявший биты между
-//     снимком и блокировкой, уже вёл −1 каждый — rd добавлял второе −n
-//     по снимку: ровно −36 инцидента при битах 0 и счётчике −18.
+//   - httpworker (renderq.go) — the ±1 deltas in a pair with the bit,
+//     the RowsAffected guards (D1–D8, the tests above) — a double −1 is
+//     impossible;
+//   - monitor (zonestats.go, recountCountersSQL) — an ABSOLUTE upsert
+//     with the aggregate value (value = EXCLUDED.value), it does not
+//     write deltas; every rewrite moves updated_at — it cannot leave a
+//     "silent" trace. The real race is different: the value is computed
+//     by a snapshot of the pass's early operator (the aggregate) but
+//     applied by the late one (the upsert) — the concurrent transitions
+//     in the window are overwritten by the stale absolute (a false
+//     debt/a false zero), transiently, it self-heals by the next pass —
+//     reproduced by the refutation test below;
+//   - ingest (apply_delete.go, T-186 before the fix) — the ONLY
+//     "silent" delta writer with a snapshot: the CTE rd decremented
+//     −count(had_render) by the SNAPSHOT pre, while the bit clearing
+//     was done by a CASE over the CURRENT row version. A finish-up
+//     pass that cleared the bits between the snapshot and the lock was
+//     already doing −1 each — rd added a second −n by the snapshot:
+//     exactly the −36 of the incident with the bits 0 and the counter
+//     −18.
 //
-// Фикс T-269: применение delete — двумя операторами одной транзакции
-// (перевод статуса; охраняемая пара «снятие бита × −count(факта)» по
-// ключам битовых строк), окно снимка закрыто охраной текущей версии
-// (зеркально Д7). Ниже — репродукция сценария 08.11 (фаза 1: оператор
-// T-186 дословно, ДО фикса — обязана дать −18; фаза 2: тот же
-// интерливинг с фиксом — инвариант |счётчик − count(бит)| = 0 на каждом
-// шаге) и опровержение гипотезы реконсиляции.
+// The T-269 fix: the delete apply — two operators of one transaction
+// (the status transition; the guarded "bit clearing × −count(fact)"
+// pair by the bit-row keys), the snapshot window is closed by the
+// current-version guard (mirroring D7). Below — the reproduction of the
+// 11-08 scenario (phase 1: the T-186 operator verbatim, BEFORE the fix
+// — it must give −18; phase 2: the same interleaving with the fix — the
+// invariant |counter − count(bits)| = 0 on every step) and the
+// refutation of the reconciliation hypothesis.
 
-// renderBitLegacyDeleteSQL — применение delete ДО T-269 (оператор T-186
-// дословно, литералы раскрыты): снимочный had_render из pre кормит CTE
-// rd, снятие бита — CASE текущей версии в moved. Контракт
-// воспроизводимости инцидента: рассинхрон проявляется только у ЭТОЙ
-// формы оператора — расхождение литерала с историей кода заметит ревью
-// текста, живой оператор в internal/ingest/apply_delete.go её больше не
-// содержит.
+// renderBitLegacyDeleteSQL — the delete apply BEFORE T-269 (the T-186
+// operator verbatim, the literals expanded): the snapshot had_render
+// from pre feeds the CTE rd, the bit clearing — a CASE of the current
+// version in moved. The incident reproducibility contract: the desync
+// shows up only in THIS operator shape — a literal divergence from the
+// code history would be noticed by a text review, the live operator in
+// internal/ingest/apply_delete.go no longer contains it.
 const renderBitLegacyDeleteSQL = `WITH pre AS MATERIALIZED (
 	SELECT d.zone_id, d.label, (d.flags & 2) <> 0 AS had_render
 	FROM ingest_stage AS s
@@ -484,13 +508,15 @@ SELECT
 	  AND NOT EXISTS (SELECT 1 FROM domains AS d
 	                  WHERE d.zone_id = s.zone_id AND d.label = s.label)) AS not_found`
 
-// renderBitClearPairSQL — «проход доработки» сценария: снятие бита парой
-// со счётчиком по образцу runbooks §6 (охрана текущей версии, дельта по
-// факту снятых) пачкой по ключам. В воспроизведении играет роль прохода
-// T-066 из транзакции-блокиратора: реальный RequeueOnce лочил бы строку
-// счётчика мимо управляемого порядка интерливинга, а семантика переходов
-// Д3 (публикация сделана заранее — seeding контента не относится к
-// гонке счётчика) здесь та же: бит → 0 и −1 за каждый факт.
+// renderBitClearPairSQL — the "finish-up pass" of the scenario: the
+// bit clearing in a pair with the counter per the runbooks §6 sample
+// (the current-version guard, the delta by the fact of the cleared)
+// as a batch by the keys. In the reproduction it plays the role of the
+// T-066 pass from the blocker transaction: a real RequeueOnce would
+// lock the counter row bypassing the controlled interleaving order,
+// and the D3 transition semantics (the publication was done in
+// advance — the content seeding is not part of the counter race) is
+// the same here: the bit → 0 and −1 per each fact.
 const renderBitClearPairSQL = `WITH cleared AS (
 	UPDATE domains SET flags = (flags & -3)::int2
 	WHERE zone_id = $1 AND id = ANY($2) AND (flags & 2) <> 0
@@ -500,10 +526,11 @@ UPDATE crawler_counters
 SET value = value - (SELECT count(*) FROM cleared)
 WHERE name = 'render_pending' AND (SELECT count(*) FROM cleared) > 0`
 
-// renderBitSeedDebt — состояние «11:48:04» инцидента: n живых доменов с
-// битом render_pending и счётчиком n (ручная §6-установка атомарно со
-// счётчиком), зоны/статусы выровнены реконсиляцией (точка отсчёта
-// сверки). Возвращает метки по порядку id.
+// renderBitSeedDebt — the "11:48:04" state of the incident: n live
+// domains with the render_pending bit and the counter n (a manual §6
+// installation atomically with the counter), the zones/statuses are
+// aligned by the reconciliation (the reference point of the
+// cross-check). Returns the labels in the id order.
 func renderBitSeedDebt(ctx context.Context, t *testing.T, pool *pgxpool.Pool, zone int16, prefix string, n int) []string {
 	t.Helper()
 	ids := countersSeedDomains(t, pool, zone, prefix, n, model.CheckStateDone, model.StatusAlive)
@@ -529,7 +556,7 @@ func renderBitSeedDebt(ctx context.Context, t *testing.T, pool *pgxpool.Pool, zo
 	return labels
 }
 
-// renderBitStageDelete — партия delete по меткам в staging.
+// renderBitStageDelete — a delete batch by the labels into staging.
 func renderBitStageDelete(ctx context.Context, t *testing.T, pool *pgxpool.Pool, zone int16, labels []string) ingest.BatchID {
 	t.Helper()
 	batch := mustBatchID(t)
@@ -543,7 +570,8 @@ func renderBitStageDelete(ctx context.Context, t *testing.T, pool *pgxpool.Pool,
 	return batch
 }
 
-// renderBitBitCount — число строк с битом по ключам (факт парности).
+// renderBitBitCount — the number of rows with the bit by the keys (the
+// pairing fact).
 func renderBitBitCount(ctx context.Context, t *testing.T, pool *pgxpool.Pool, zone int16, ids []int64) int64 {
 	t.Helper()
 	var n int64
@@ -555,12 +583,13 @@ func renderBitBitCount(ctx context.Context, t *testing.T, pool *pgxpool.Pool, zo
 	return n
 }
 
-// renderBitWaitBlocked — ждёт, пока горутина-конкурент заблокируется
-// именно на транзакции-блокираторе xid (pg_locks: ждущий transactionid
-// с целью xid; цель задаёт ожидание ПОДРОБНО — глобальный предикат
-// «есть хоть какой-то ждущий» ловил бы чужие пакеты параллельного
-// test-integration, ревью T-269 P2-2) — точку детерминированного
-// интерливинга. Ошибка горутины до блокировки всплывает сразу.
+// renderBitWaitBlocked — waits until the competitor goroutine blocks
+// exactly on the blocker transaction xid (pg_locks: a waiting
+// transactionid with the target xid; the target defines the wait
+// SPECIFICALLY — a global "some wait exists" predicate would catch
+// foreign packets of the parallel test-integration, review T-269
+// P2-2) — the point of the deterministic interleaving. A goroutine
+// error before the blocking surfaces immediately.
 func renderBitWaitBlocked(t *testing.T, pool *pgxpool.Pool, errc chan error, xid, what string) {
 	t.Helper()
 	deadline := time.Now().Add(15 * time.Second)
@@ -584,8 +613,9 @@ func renderBitWaitBlocked(t *testing.T, pool *pgxpool.Pool, errc chan error, xid
 	}
 }
 
-// renderBitXID — идентификатор транзакции блокиратора (txid_current
-// назначает xid, если запись его ещё не назначила) — цель ожидания.
+// renderBitXID — the transaction identifier of the blocker (txid_current
+// assigns an xid if the record has not assigned one yet) — the wait
+// target.
 func renderBitXID(ctx context.Context, t *testing.T, tx pgx.Tx) string {
 	t.Helper()
 	var xid string
@@ -595,9 +625,9 @@ func renderBitXID(ctx context.Context, t *testing.T, tx pgx.Tx) string {
 	return xid
 }
 
-// renderBitInTxDebt — счётчик долга из открытой транзакции прохода
-// (собственные записи видимы, конкурент ещё заблокирован — чтение без
-// гонки с его фиксацией, ревью T-269 P2-1).
+// renderBitInTxDebt — the debt counter from the open pass transaction
+// (its own writes are visible, the competitor is still blocked — a
+// read without racing with its commit, review T-269 P2-1).
 func renderBitInTxDebt(ctx context.Context, t *testing.T, tx pgx.Tx) int64 {
 	t.Helper()
 	var n int64
@@ -608,8 +638,8 @@ func renderBitInTxDebt(ctx context.Context, t *testing.T, tx pgx.Tx) int64 {
 	return n
 }
 
-// renderBitInTxBits — число строк с битом по ключам из открытой
-// транзакции прохода (см. renderBitInTxDebt).
+// renderBitInTxBits — the number of rows with the bit by the keys from
+// the open pass transaction (see renderBitInTxDebt).
 func renderBitInTxBits(ctx context.Context, t *testing.T, tx pgx.Tx, zone int16, ids []int64) int64 {
 	t.Helper()
 	var n int64
@@ -621,7 +651,7 @@ func renderBitInTxBits(ctx context.Context, t *testing.T, tx pgx.Tx, zone int16,
 	return n
 }
 
-// renderBitJoinErr — результат горутины-конкурента (одна ошибка).
+// renderBitJoinErr — the result of the competitor goroutine (one error).
 func renderBitJoinErr(t *testing.T, errc chan error, what string) {
 	t.Helper()
 	select {
@@ -634,36 +664,39 @@ func renderBitJoinErr(t *testing.T, errc chan error, what string) {
 	}
 }
 
-// TestRenderPendingBit_DeleteClearRace — репродукция сценария 08.11.2026:
-// параллельно снятие флагов проходом доработки × применение delete-файла
-// по тем же доменам. Фаза 1 (оператор T-186 до фикса, дословно):
-// проход снимает биты между снимком pre и блокировкой moved — rd
-// декрементирует −18 по снимку ВТОРЫМ, счётчик уходит в −18 при нулевом
-// бите (суммарный сдвиг −36 за один «проход», updated_at счётчика
-// немой — дельта-писатель его не пишет). Фаза 2 (после фикса T-269):
-// тот же интерливинг — перевод статуса не трогает бит, пара «снятие ×
-// декремент» идёт по факту перехода с охраной текущей версии, инвариант
-// |счётчик − count(бит)| = 0 держится на каждом шаге. Фаза 2b —
-// зеркальный порядок (применение выиграло гонку): пара выполняется
-// применением, парность та же.
+// TestRenderPendingBit_DeleteClearRace — the reproduction of the
+// 2026-11-08 scenario: in parallel, the flag clearing by the finish-up
+// pass × the delete-file apply over the same domains. Phase 1 (the
+// T-186 operator before the fix, verbatim): the pass clears the bits
+// between the pre snapshot and the moved lock — rd decrements −18 by
+// the snapshot SECOND, the counter goes to −18 with a zero bit (the
+// total shift −36 in one "pass", the counter's updated_at is silent —
+// the delta writer does not write it). Phase 2 (after the T-269 fix):
+// the same interleaving — the status transition does not touch the
+// bit, the "clearing × decrement" pair goes by the transition fact
+// with the current-version guard, the invariant |counter −
+// count(bits)| = 0 holds on every step. Phase 2b — the mirrored order
+// (the apply won the race): the pair is executed by the apply, the
+// pairing is the same.
 func TestRenderPendingBit_DeleteClearRace(t *testing.T) {
 	skipUnlessIntegration(t)
 	pool := countersSchema(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
-	const n = 18 // масштаб инцидента: 18 доменов / 18 флагов / −36 сдвиг
+	const n = 18 // the incident scale: 18 domains / 18 flags / a −36 shift
 	zone := countersSeedZone(t, pool, "fsm-delrace.test")
 	raceIDs := renderBitIDsOfLabels(ctx, t, pool, zone, renderBitSeedDebt(ctx, t, pool, zone, "race", n))
 
-	// --- Фаза 1: ДО фикса — воспроизведение −36 --------------------------
+	// --- Phase 1: BEFORE the fix — the −36 reproduction -------------------
 	batch := renderBitStageDelete(ctx, t, pool, zone, renderBitLabels("race", n))
 	if debt := renderBitDebt(ctx, t, pool); debt != n {
 		t.Fatalf("фаза 1: исход счётчик = %d, хочу %d", debt, n)
 	}
 
-	// «Проход доработки» (L): снимает все 18 парой и ДЕРЖИТ транзакцию
-	// незакоммиченной — строки заблокированы, изменения невидимы.
+	// The "finish-up pass" (L): clears all 18 by the pair and KEEPS the
+	// transaction uncommitted — the rows are locked, the changes are
+	// invisible.
 	lx, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatalf("транзакция прохода: %v", err)
@@ -673,8 +706,9 @@ func TestRenderPendingBit_DeleteClearRace(t *testing.T) {
 	}
 	xid := renderBitXID(ctx, t, lx)
 
-	// Применение delete (D) оператором T-186: снимок pre видит биты
-	// (снятие L незакоммичено), moved блокируется на строках L.
+	// The delete apply (D) by the T-186 operator: the pre snapshot sees
+	// the bits (the L clearing is uncommitted), moved locks on the L
+	// rows.
 	errc := make(chan error, 1)
 	go func() {
 		rows, err := pool.Query(ctx, renderBitLegacyDeleteSQL, batch[:], int16(model.StatusDeleted), int16(model.ActionDelete))
@@ -704,23 +738,25 @@ func TestRenderPendingBit_DeleteClearRace(t *testing.T) {
 	}()
 	renderBitWaitBlocked(t, pool, errc, xid, "фаза 1: применение")
 
-	// Шаг «после прохода» — внутри транзакции прохода (собственные
-	// записи видимы, конкурент ещё заблокирован): биты 0, счётчик 0.
+	// The "after the pass" step — inside the pass transaction (its own
+	// writes are visible, the competitor is still blocked): the bits 0,
+	// the counter 0.
 	if debt := renderBitInTxDebt(ctx, t, lx); debt != 0 {
 		t.Fatalf("фаза 1: после прохода счётчик = %d, хочу 0", debt)
 	}
 	if bits := renderBitInTxBits(ctx, t, lx, zone, raceIDs); bits != 0 {
 		t.Fatalf("фаза 1: после прохода бит = %d, хочу 0", bits)
 	}
-	// Фиксация прохода отпускает D — как в 11:50:39.982; промежуточных
-	// чтений из другой сессии больше нет (гонка с фиксацией D, ревью
-	// T-269 P2-1).
+	// The pass commit releases D — as at 11:50:39.982; there are no
+	// intermediate reads from another session anymore (a race with the
+	// D commit, review T-269 P2-1).
 	if err := lx.Commit(ctx); err != nil {
 		t.Fatalf("фиксация прохода: %v", err)
 	}
 
-	// D продолжает на зафиксированной версии: CASE видит бит снятым,
-	// rd всё равно декрементирует −18 по снимку — счётчик −18.
+	// D continues on the committed version: the CASE sees the bit
+	// cleared, rd still decrements −18 by the snapshot — the counter
+	// −18.
 	renderBitJoinErr(t, errc, "фаза 1: применение")
 	if debt := renderBitDebt(ctx, t, pool); debt != -n {
 		t.Fatalf("фаза 1: РЕПРОДУКЦИЯ: счётчик = %d, хочу −%d (второе −n по снимку, суммарный сдвиг −%d)", debt, n, 2*n)
@@ -728,7 +764,8 @@ func TestRenderPendingBit_DeleteClearRace(t *testing.T) {
 	if bits := renderBitBitCount(ctx, t, pool, zone, raceIDs); bits != 0 {
 		t.Fatalf("фаза 1: биты = %d, хочу 0 (долг закрыт проходом)", bits)
 	}
-	// Парность сломана ровно на −n: сверка видит позицию.
+	// The pairing is broken exactly by −n: the cross-check sees the
+	// position.
 	mismatch, err := monitor.VerifyCounters(ctx, pool, monitor.VerifyOptions{})
 	if err != nil {
 		t.Fatalf("фаза 1: VerifyCounters: %v", err)
@@ -738,13 +775,14 @@ func TestRenderPendingBit_DeleteClearRace(t *testing.T) {
 		t.Fatalf("фаза 1: рассинхрон = %+v, хочу [global:render_pending −%d → 0]", mismatch, n)
 	}
 
-	// Операторское выравнивание ~11:59 (runbooks §6): счётчик := факт.
+	// The operator-level leveling ~11:59 (runbooks §6): the counter :=
+	// the fact.
 	if _, err := pool.Exec(ctx,
 		"UPDATE crawler_counters SET value = $1 WHERE name = 'render_pending'", int64(0)); err != nil {
 		t.Fatalf("выравнивание: %v", err)
 	}
 
-	// --- Фаза 2: ПОСЛЕ фикса — тот же интерливинг, инвариант на каждом шаге
+	// --- Phase 2: AFTER the fix — the same interleaving, the invariant on every step
 	fixIDs := renderBitIDsOfLabels(ctx, t, pool, zone, renderBitSeedDebt(ctx, t, pool, zone, "fix", n))
 	batch2 := renderBitStageDelete(ctx, t, pool, zone, renderBitLabels("fix", n))
 	if debt := renderBitDebt(ctx, t, pool); debt != n {
@@ -769,7 +807,8 @@ func TestRenderPendingBit_DeleteClearRace(t *testing.T) {
 	}()
 	renderBitWaitBlocked(t, pool, errc2, xid2, "фаза 2: применение")
 
-	// Шаг «после прохода» — внутри транзакции прохода: инвариант 0.
+	// The "after the pass" step — inside the pass transaction: the
+	// invariant 0.
 	if debt := renderBitInTxDebt(ctx, t, lx2); debt != 0 {
 		t.Fatalf("фаза 2: после прохода счётчик = %d, хочу 0", debt)
 	}
@@ -790,8 +829,9 @@ func TestRenderPendingBit_DeleteClearRace(t *testing.T) {
 	if res.Deleted != n || res.NotFound != 0 {
 		t.Fatalf("фаза 2: ApplyDelete = %+v, хочу deleted %d", res, n)
 	}
-	// Шаг «после применения»: перевод статуса дошёл, бит уже снят
-	// проходом — пара НЕ выполнялась (ключей нет), счётчик не тронут.
+	// The "after the apply" step: the status transition landed, the bit
+	// was already cleared by the pass — the pair did NOT run (no keys),
+	// the counter is untouched.
 	if debt := renderBitDebt(ctx, t, pool); debt != 0 {
 		t.Fatalf("фаза 2: ПОСЛЕ ФИКСА счётчик = %d, хочу 0 (инвариант держится)", debt)
 	}
@@ -805,7 +845,7 @@ func TestRenderPendingBit_DeleteClearRace(t *testing.T) {
 	}
 	countersVerifyEmpty(t, pool, "фаза 2 (проход × применение, после фикса)")
 
-	// --- Фаза 2b: применение выигрывает гонку (бит стоит) — пара по факту
+	// --- Phase 2b: the apply wins the race (the bit is set) — the pair by the fact
 	winIDs := renderBitIDsOfLabels(ctx, t, pool, zone, renderBitSeedDebt(ctx, t, pool, zone, "win", 1))
 	batch3 := renderBitStageDelete(ctx, t, pool, zone, renderBitLabels("win", 1))
 
@@ -822,7 +862,7 @@ func TestRenderPendingBit_DeleteClearRace(t *testing.T) {
 	countersVerifyEmpty(t, pool, "фаза 2b (применение без прохода)")
 }
 
-// renderBitLabels — метки prefix0..prefix(n−1) в порядке посева.
+// renderBitLabels — the labels prefix0..prefix(n−1) in the seed order.
 func renderBitLabels(prefix string, n int) []string {
 	labels := make([]string, n)
 	for i := range labels {
@@ -831,7 +871,7 @@ func renderBitLabels(prefix string, n int) []string {
 	return labels
 }
 
-// renderBitIDsOfLabels — id доменов по меткам (порядок посева).
+// renderBitIDsOfLabels — the domain ids by the labels (the seed order).
 func renderBitIDsOfLabels(ctx context.Context, t *testing.T, pool *pgxpool.Pool, zone int16, labels []string) []int64 {
 	t.Helper()
 	ids := make([]int64, len(labels))
@@ -844,17 +884,18 @@ func renderBitIDsOfLabels(ctx context.Context, t *testing.T, pool *pgxpool.Pool,
 	return ids
 }
 
-// TestRenderPendingBit_ReconciliationStaleSnapshot — опровержение
-// гипотезы инцидента: «реконсиляция monitor применяет дельту от
-// устаревшего ожидания — второе −18». Проход реконсиляции с устаревшим
-// снапшотом (агрегат видел биты ДО снятия проходом доработки, upsert
-// исполнился ПОСЛЕ) пишет устаревший АБСОЛЮТ значением агрегата, не
-// дельту: счётчик становится +18 при нулевом бите (ложный долг), НЕ −18;
-// перезапись двигает updated_at («громкий» след — «немого» второго −n
-// реконсиляция оставить не может) и самолечится следующим проходом
-// (проход авторитетен, ≤ zone_stats_interval). Дрейф самого прохода при
-// этом ноль (старое = новому = 18): рассинхрон парности ловит
-// VerifyCounters, а не gauge дрейфа.
+// TestRenderPendingBit_ReconciliationStaleSnapshot — the refutation of
+// the incident hypothesis: "the monitor reconciliation applies a delta
+// from the stale expectation — a second −18". A reconciliation pass
+// with a stale snapshot (the aggregate saw the bits BEFORE the
+// clearing by the finish-up pass, the upsert executed AFTER) writes
+// the stale ABSOLUTE with the aggregate value, not a delta: the
+// counter becomes +18 with a zero bit (a false debt), NOT −18; the
+// rewrite moves updated_at (a "loud" trace — the reconciliation cannot
+// leave a "silent" second −n) and self-heals by the next pass (the
+// pass is the authority, ≤ zone_stats_interval). The drift of the pass
+// itself is zero here (the old = the new = 18): the pairing desync is
+// caught by VerifyCounters, not by the drift gauge.
 func TestRenderPendingBit_ReconciliationStaleSnapshot(t *testing.T) {
 	skipUnlessIntegration(t)
 	pool := countersSchema(t)
@@ -867,8 +908,8 @@ func TestRenderPendingBit_ReconciliationStaleSnapshot(t *testing.T) {
 	if debt := renderBitDebt(ctx, t, pool); debt != n {
 		t.Fatalf("исход счётчик = %d, хочу %d", debt, n)
 	}
-	// Метка «ручной операции»: updated_at в прошлое — после гонки
-	// обязана сдвинуться (громкость perезаписи).
+	// The "manual operation" mark: updated_at into the past — after the
+	// race it must shift (the loudness of the rewrite).
 	if _, err := pool.Exec(ctx,
 		"UPDATE crawler_counters SET updated_at = now() - interval '1 hour' WHERE name = 'render_pending'"); err != nil {
 		t.Fatalf("метка updated_at: %v", err)
@@ -879,9 +920,9 @@ func TestRenderPendingBit_ReconciliationStaleSnapshot(t *testing.T) {
 		t.Fatalf("чтение updated_at: %v", err)
 	}
 
-	// L держит строку счётчика — upsert реконсиляции заблокируется НАД
-	// снимком (агрегат уже посчитал 18 бит), проход доработки успеет
-	// закрыть долг.
+	// L holds the counter row — the reconciliation upsert will block
+	// ABOVE the snapshot (the aggregate has already counted 18 bits),
+	// the finish-up pass will have time to close the debt.
 	lx, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatalf("транзакция-блокиратор: %v", err)
@@ -892,8 +933,9 @@ func TestRenderPendingBit_ReconciliationStaleSnapshot(t *testing.T) {
 	}
 	xid := renderBitXID(ctx, t, lx)
 
-	// M — реальный проход реконсиляции (T-178): агрегат видит 18 бит,
-	// upsert (значение АБСОЛЮТом из снапшота) блокируется на L.
+	// M — a real reconciliation pass (T-178): the aggregate sees 18
+	// bits, the upsert (the value as an ABSOLUTE from the snapshot)
+	// blocks on L.
 	resc := make(chan monitor.ZoneStatsResult, 1)
 	errc := make(chan error, 1)
 	go func() {
@@ -903,9 +945,10 @@ func TestRenderPendingBit_ReconciliationStaleSnapshot(t *testing.T) {
 	}()
 	renderBitWaitBlocked(t, pool, errc, xid, "реконсиляция")
 
-	// «Проход доработки» внутри L: биты → 0, счётчик −18 (L уже держит
-	// строку — декремент без ожидания). Шаг «долг закрыт» — внутри
-	// транзакции (собственные записи видимы, M ещё заблокирован): 0/0.
+	// The "finish-up pass" inside L: the bits → 0, the counter −18 (L
+	// already holds the row — the decrement without waiting). The "debt
+	// closed" step — inside the transaction (its own writes are
+	// visible, M is still blocked): 0/0.
 	if _, err := lx.Exec(ctx, renderBitClearPairSQL, zone, ids); err != nil {
 		t.Fatalf("проход: снятие парой: %v", err)
 	}
@@ -919,8 +962,9 @@ func TestRenderPendingBit_ReconciliationStaleSnapshot(t *testing.T) {
 		t.Fatalf("фиксация прохода: %v", err)
 	}
 
-	// M отпущен и применяет устаревший АБСОЛЮТ: +18 при нулевом бите —
-	// НЕ −18 (никакой дельты от ожидания), updated_at сдвинут (громко).
+	// M is released and applies the stale ABSOLUTE: +18 with a zero bit
+	// — NOT −18 (no delta from the expectation), updated_at shifted
+	// (loudly).
 	renderBitJoinErr(t, errc, "реконсиляция")
 	var mres monitor.ZoneStatsResult
 	select {
@@ -928,9 +972,9 @@ func TestRenderPendingBit_ReconciliationStaleSnapshot(t *testing.T) {
 	default:
 		t.Fatal("итог реконсиляции не возвращён")
 	}
-	// Дрейф самого прохода — ноль (старое счётчика = новому = 18): gauge
-	// crawler_counters_drift парность не измеряет, ломку парности видит
-	// только сверка ниже.
+	// The drift of the pass itself — zero (the counter old = the new =
+	// 18): the crawler_counters_drift gauge does not measure the
+	// pairing, only the cross-check below sees the pairing break.
 	sawPos := false
 	for _, p := range mres.Positions {
 		if p.Counter != "global:render_pending" {
@@ -959,9 +1003,10 @@ func TestRenderPendingBit_ReconciliationStaleSnapshot(t *testing.T) {
 		t.Fatalf("updated_at не сдвинут (%v ≤ %v): перезапись реконсиляции обязана быть «громкой» — немой дельты она не пишет", at, t0)
 	}
 
-	// Парность сломана транзиентно (+18/0) — сверка видит; дрейф самого
-	// прохода ноль (старое = новому = 18): gauge дрейфа парность не
-	// измеряет, лечит следующий проход (проход авторитетен).
+	// The pairing is broken transiently (+18/0) — the cross-check sees
+	// it; the drift of the pass itself is zero (the old = the new =
+	// 18): the drift gauge does not measure the pairing, the next pass
+	// heals it (the pass is the authority).
 	mismatch, err := monitor.VerifyCounters(ctx, pool, monitor.VerifyOptions{})
 	if err != nil {
 		t.Fatalf("VerifyCounters: %v", err)
@@ -971,7 +1016,7 @@ func TestRenderPendingBit_ReconciliationStaleSnapshot(t *testing.T) {
 		t.Fatalf("рассинхрон = %+v, хочу [global:render_pending %d → 0]", mismatch, n)
 	}
 
-	// Самолечение: следующий проход пишет свежий абсолют (битов нет).
+	// Self-healing: the next pass writes a fresh absolute (no bits).
 	if _, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{}); err != nil {
 		t.Fatalf("лечащий проход: %v", err)
 	}

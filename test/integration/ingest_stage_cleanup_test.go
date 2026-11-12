@@ -1,9 +1,10 @@
-// Интеграционные тесты фоновой зачистки осиротевших партий staging
-// (T-098, страховка ING-P2-3): семантика диапазона batch_id < границы
-// против живой PostgreSQL — партия старше порога удаляется, свежие не
-// задеваются, повторный проход — no-op. Юнит-уровень (кодировка
-// идентификатора и порядок, контракт SQL/аргумента, ошибки и цикл) —
-// internal/ingest/cleanup_test.go и stage_test.go.
+// Integration tests for the background cleanup of orphaned staging
+// batches (T-098, ING-P2-3 guard): the batch_id < threshold range
+// semantics against live PostgreSQL — a batch older than the threshold
+// is removed, fresh ones stay untouched, a repeated pass is a no-op.
+// Unit level (identifier encoding and ordering, the SQL/argument
+// contract, errors and the loop) — internal/ingest/cleanup_test.go
+// and stage_test.go.
 package integration
 
 import (
@@ -17,23 +18,25 @@ import (
 	"crawler/internal/ingest"
 )
 
-// stageBatchID — идентификатор партии с заданным временем создания:
-// старшие 8 байт — микросекунды Unix big-endian, младшие — случайные
-// (кодировка internal/ingest.NewBatchID, T-098; тест пакета integration
-// собирает его сам — генератор принимает только текущее время).
+// stageBatchID builds a batch identifier with the given creation time:
+// the high 8 bytes are Unix microseconds big-endian, the low ones are
+// random (encoding of internal/ingest.NewBatchID, T-098; the
+// integration package test assembles it itself — the generator only
+// accepts the current time).
 func stageBatchID(t *testing.T, at time.Time) []byte {
 	t.Helper()
 	id := make([]byte, ingest.BatchIDLen)
-	binary.BigEndian.PutUint64(id[:8], uint64(at.UnixMicro())) // префикс времени
-	if _, err := rand.Read(id[8:]); err != nil {               // случайный хвост
+	binary.BigEndian.PutUint64(id[:8], uint64(at.UnixMicro())) // time prefix
+	if _, err := rand.Read(id[8:]); err != nil {               // random tail
 		t.Fatalf("случайный хвост batch_id: %v", err)
 	}
 	return id
 }
 
-// stageOrphanRows вставляет строки партии напрямую в ingest_stage —
-// модель осиротевшей партии: конвейер, создавший её, погиб без discard
-// (kill -9, падение СУБД), batch_id больше не встретится.
+// stageOrphanRows inserts batch rows directly into ingest_stage —
+// a model of an orphaned batch: the pipeline that created it died
+// without a discard (kill -9, DBMS crash), the batch_id will never
+// appear again.
 func (e *ingestEnv) stageOrphanRows(t *testing.T, batchID []byte, zoneID int16, n int) {
 	t.Helper()
 	for i := 1; i <= n; i++ {
@@ -46,14 +49,15 @@ func (e *ingestEnv) stageOrphanRows(t *testing.T, batchID []byte, zoneID int16, 
 	}
 }
 
-// TestIngest_CleanupStaleBatches — старше порога удаляется, у порога
-// (но моложе) и свежая живут; повторный проход — no-op.
+// TestIngest_CleanupStaleBatches — the batch older than the threshold
+// is removed; the one at the threshold (but younger) and the fresh one
+// survive; a repeated pass is a no-op.
 func TestIngest_CleanupStaleBatches(t *testing.T) {
 	skipUnlessIntegration(t)
 	e := newIngestEnv(t)
 	ctx := context.Background()
 
-	// Зона создаётся штатным конвейером: staging ссылается на zone_id.
+	// The zone is created by the normal pipeline: staging references zone_id.
 	if out := e.process(t, "com/add/seed.txt", fileContent("seed.com")); out.Kind != ingest.OutcomeApplied {
 		t.Fatalf("посевной файл: итог = %s, want applied", out.Kind)
 	}
@@ -63,9 +67,9 @@ func TestIngest_CleanupStaleBatches(t *testing.T) {
 	}
 
 	now := time.Now()
-	oldID := stageBatchID(t, now.Add(-ingest.StaleBatchAge-time.Hour))  // сутки и час назад
-	edgeID := stageBatchID(t, now.Add(-ingest.StaleBatchAge+time.Hour)) // на час моложе порога
-	freshID := stageBatchID(t, now)                                     // свежая партия
+	oldID := stageBatchID(t, now.Add(-ingest.StaleBatchAge-time.Hour))  // a day and an hour ago
+	edgeID := stageBatchID(t, now.Add(-ingest.StaleBatchAge+time.Hour)) // an hour younger than the threshold
+	freshID := stageBatchID(t, now)                                     // fresh batch
 	e.stageOrphanRows(t, oldID, z.id, 3)
 	e.stageOrphanRows(t, edgeID, z.id, 2)
 	e.stageOrphanRows(t, freshID, z.id, 2)
@@ -81,8 +85,8 @@ func TestIngest_CleanupStaleBatches(t *testing.T) {
 		t.Errorf("строк в ingest_stage = %d, want 4: партии у порога и свежая не задеваются", n)
 	}
 
-	// Повторный проход по тому же моменту — no-op (вычищенное не
-	// выбирается, идемпотентность ТЗ 3.4).
+	// A repeated pass at the same point in time is a no-op (the cleaned
+	// rows are not selected again; spec 3.4 idempotency).
 	rows, err = ingest.CleanupStaleBatches(ctx, e.pool, now)
 	if err != nil {
 		t.Fatalf("повторная CleanupStaleBatches: %v", err)
@@ -94,7 +98,7 @@ func TestIngest_CleanupStaleBatches(t *testing.T) {
 		t.Errorf("строк в ingest_stage после повтора = %d, want 4", n)
 	}
 
-	// Свежие партии покидают staging штатно — ClearBatch своей партии.
+	// Fresh batches leave staging the normal way — ClearBatch of their own batch.
 	for _, id := range [][]byte{edgeID, freshID} {
 		var bid ingest.BatchID
 		copy(bid[:], id)

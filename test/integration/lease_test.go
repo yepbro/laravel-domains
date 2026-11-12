@@ -1,17 +1,20 @@
-// Интеграционные тесты возврата истёкших lease в форме T-200 (ТЗ
-// TZ_slow_lease_return.md §7.2) против живого PostgreSQL: зрелая аренда
-// возвращается пачкой PK-пробами (повторный проход — 0), запись результата
-// воркером между выборкой и переводом не возвращается (guard-гонка),
-// курсор дренажа не пропускает созревающие позже записи (малый lease, два
-// прохода с паузой), дельты счётчиков зон сходятся с T-178-реконсиляцией;
-// EXPLAIN-контракты обеих сторон прохода — предикат композитного курсора
-// обслуживается листом domains_lease_idx (T-104), перевод ведёт от unnest
-// с PK-пробами domains без lease-скана диапазона (§4.2, ревью T-200
-// P3-1). Юнит-уровень (SQL-контракты, курсор, цикл на фейках) —
-// internal/scheduler/lease_test.go. Уровень вызовов — библиотечные, без
-// запуска сервисов (стиль reanalyze_test.go); изоляция — withTestSchema
-// (search_path в DSN; ВСЕ подключения теста — один пул этой схемы).
-// Прогон — make test-integration (после вливания, из основного дерева).
+// Integration tests of the T-200 form of returning expired leases (the
+// TZ_slow_lease_return.md spec §7.2) against live PostgreSQL: a mature
+// lease is returned by a batch of PK probes (a repeated pass — 0), a
+// result recorded by the worker between the selection and the
+// transition is not returned (the guard race), the drain cursor does
+// not skip records that mature later (a small lease, two passes with a
+// pause), the zone counter deltas agree with the T-178 reconciliation;
+// the EXPLAIN contracts of both sides of the pass — the composite
+// cursor predicate is served by the domains_lease_idx leaf (T-104),
+// the transition leads from unnest with PK probes of domains without a
+// range lease scan (§4.2, review T-200 P3-1). Unit level (SQL
+// contracts, the cursor, the loop on fakes) —
+// internal/scheduler/lease_test.go. The call level — library-level,
+// without starting services (the reanalyze_test.go style); isolation —
+// withTestSchema (search_path in the DSN; ALL connections of the test
+// — one pool of that schema). Run — make test-integration (after
+// merging, from the main tree).
 package integration
 
 import (
@@ -29,8 +32,9 @@ import (
 	"crawler/internal/scheduler"
 )
 
-// leaseSeedQueued — домен в queued с отметкой аренды age назад (make_interval
-// — детерминированный ввод без парсинга строк интервалов); возвращает id.
+// leaseSeedQueued — a domain in queued with a lease mark age ago
+// (make_interval — deterministic input without parsing interval
+// strings); returns the id.
 func leaseSeedQueued(ctx context.Context, t *testing.T, pool *pgxpool.Pool, zone int16, label string, ageMinutes int) int64 {
 	t.Helper()
 	var id int64
@@ -44,7 +48,7 @@ func leaseSeedQueued(ctx context.Context, t *testing.T, pool *pgxpool.Pool, zone
 	return id
 }
 
-// leaseCheckState — check_state домена (quote-значение для сообщений).
+// leaseCheckState — the check_state of a domain (the quote value for messages).
 func leaseCheckState(ctx context.Context, t *testing.T, pool *pgxpool.Pool, zone int16, id int64) int16 {
 	t.Helper()
 	var state int16
@@ -56,26 +60,28 @@ func leaseCheckState(ctx context.Context, t *testing.T, pool *pgxpool.Pool, zone
 	return state
 }
 
-// TestLease_MatureReturnedRepeatZero — сценарий §7.2: зрелая аренда
-// возвращается в pending одним проходом (пачка PK-пробами, счёт по
-// RETURNING), повторный проход с тем же курсором — 0 (переведённые строки
-// выпадают из отбора); дельты зон queued −n / pending +n сходятся с
-// T-178-реконсиляцией (VerifyCounters после эпизода).
+// TestLease_MatureReturnedRepeatZero — the §7.2 scenario: a mature
+// lease is returned to pending in one pass (a batch of PK probes, the
+// count by RETURNING), a repeated pass with the same cursor — 0 (the
+// transitioned rows drop out of the selection); the zone deltas
+// queued −n / pending +n agree with the T-178 reconciliation
+// (VerifyCounters after the episode).
 func TestLease_MatureReturnedRepeatZero(t *testing.T) {
 	skipUnlessIntegration(t)
-	pool := countersSchema(t) // общий хелпер пакета (ревью T-200 P2-1)
+	pool := countersSchema(t) // a shared package helper (review T-200 P2-1)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	zone := countersSeedZone(t, pool, "lease.test")
 	labels := []string{"m1", "m2", "m3", "m4"}
 	for i := range labels {
-		leaseSeedQueued(ctx, t, pool, zone, labels[i], 60+i) // все старше lease
+		leaseSeedQueued(ctx, t, pool, zone, labels[i], 60+i) // all older than the lease
 	}
 
-	// Реконсиляция T-178 — заполняет нули счётчиков зоны (4 queued);
-	// после возврата сверка обязана сойтись и без новой реконсиляции:
-	// дельты ведёт CTE того же оператора перевода.
+	// The T-178 reconciliation — fills the zone counter zeros (4 queued);
+	// after the return the cross-check must agree even without a new
+	// reconciliation: the deltas are handled by the CTE of the same
+	// transition operator.
 	if _, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{}); err != nil {
 		t.Fatalf("реконсиляция: %v", err)
 	}
@@ -99,8 +105,9 @@ func TestLease_MatureReturnedRepeatZero(t *testing.T) {
 	}
 	countersVerifyEmpty(t, pool, "после lease (дельты T-178)")
 
-	// Повторный проход с тем же курсором — пустая пачка: переведённые
-	// строки больше не удовлетворяют отбору (идемпотентность, ТЗ 3.4).
+	// A repeated pass with the same cursor — an empty batch: the
+	// transitioned rows no longer satisfy the selection (idempotency,
+	// spec 3.4).
 	repeat, err := scheduler.LeaseOnce(ctx, pool, &cursor, scheduler.LeaseOptions{})
 	if err != nil {
 		t.Fatalf("повторный LeaseOnce: %v", err)
@@ -111,13 +118,14 @@ func TestLease_MatureReturnedRepeatZero(t *testing.T) {
 	countersVerifyEmpty(t, pool, "после повторного прохода")
 }
 
-// --- гонка: результат записан между выборкой и переводом -------------------
+// --- the race: a result recorded between the selection and the transition --
 
-// leaseRacePool — обёртка пула для сценария гонки (§7.2): в ТОЙ ЖЕ
-// транзакции прохода между SELECT пачки и UPDATE перевода пишет результат
-// «воркер» по жертве пачки — guard перевода обязан её отсеять. Оба
-// оператора идентифицируются префиксами текста (SQL пакета не экспортирован);
-// неожидаемый оператор — ошибка: контракт прохода ломается громко.
+// leaseRacePool — a pool wrapper for the race scenario (§7.2): in the
+// SAME pass transaction, between the batch SELECT and the transition
+// UPDATE, a "worker" records a result for the batch victim — the
+// transition guard must filter it out. Both operators are identified
+// by text prefixes (the package SQL is not exported); an unexpected
+// operator — an error: the pass contract breaks loudly.
 type leaseRacePool struct {
 	*pgxpool.Pool
 
@@ -135,7 +143,7 @@ func (p *leaseRacePool) Begin(ctx context.Context) (pgx.Tx, error) {
 	return &leaseRaceTx{Tx: tx, pool: p}, nil
 }
 
-// leaseRaceTx — транзакция с точкой внедрения гонки.
+// leaseRaceTx — a transaction with the race injection point.
 type leaseRaceTx struct {
 	pgx.Tx
 
@@ -147,10 +155,10 @@ func (t *leaseRaceTx) Query(ctx context.Context, sql string, args ...any) (pgx.R
 	case strings.HasPrefix(sql, "SELECT zone_id, id, queued_at FROM domains"):
 		return t.Tx.Query(ctx, sql, args...)
 	case strings.HasPrefix(sql, "WITH upd AS (UPDATE domains AS t"):
-		// «Воркер» записывает результат между выборкой и переводом
-		// (контракт записи: queued → done, отметка аренды сброшена);
-		// транзакция прохода видит собственную правку — guard обязан
-		// отсеять жертву, счёт RETURNING её не считает.
+		// The "worker" records a result between the selection and the
+		// transition (the record contract: queued → done, the lease mark
+		// reset); the pass transaction sees its own edit — the guard must
+		// filter the victim out, the RETURNING count does not count it.
 		if _, err := t.Exec(ctx,
 			"UPDATE domains SET check_state = $1, queued_at = NULL WHERE zone_id = $2 AND id = $3",
 			int16(model.CheckStateDone), t.pool.victimZone, t.pool.victimID); err != nil {
@@ -162,22 +170,24 @@ func (t *leaseRaceTx) Query(ctx context.Context, sql string, args ...any) (pgx.R
 	}
 }
 
-// TestLease_WorkerRaceGuard — сценарий §7.2: запись результата между
-// выборкой и переводом — домен не возвращается (остаётся done), остальные
-// строки пачки переводятся; курсор всё равно уходит за пачку.
+// TestLease_WorkerRaceGuard — the §7.2 scenario: a result recorded
+// between the selection and the transition — the domain is not returned
+// (stays done), the other batch rows are transitioned; the cursor moves
+// past the batch anyway.
 func TestLease_WorkerRaceGuard(t *testing.T) {
 	skipUnlessIntegration(t)
-	pool := countersSchema(t) // общий хелпер пакета (ревью T-200 P2-1)
+	pool := countersSchema(t) // a shared package helper (review T-200 P2-1)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	zone := countersSeedZone(t, pool, "lease-race.test")
 	first := leaseSeedQueued(ctx, t, pool, zone, "r1", 90)
-	victim := leaseSeedQueued(ctx, t, pool, zone, "r2", 60) // ключ пачки — средний
+	victim := leaseSeedQueued(ctx, t, pool, zone, "r2", 60) // the batch key — the middle one
 	last := leaseSeedQueued(ctx, t, pool, zone, "r3", 30)
 
-	// Реконсиляция T-178 — зона считает 3 queued: после гонки прямая
-	// сверка дельт частично переведённой пачки (ревью T-200 P3-2).
+	// The T-178 reconciliation — the zone counts 3 queued: after the
+	// race, the direct cross-check of the deltas of a partially
+	// transitioned batch (review T-200 P3-2).
 	if _, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{}); err != nil {
 		t.Fatalf("реконсиляция: %v", err)
 	}
@@ -201,12 +211,13 @@ func TestLease_WorkerRaceGuard(t *testing.T) {
 		}
 	}
 
-	// Дельты зон учли ТОЛЬКО переведённые строки (T-178): queued 3−2=1,
-	// pending 0+2=2 — guard-отсеянная жертва в дельты не входит. Остаток
-	// queued (1 против 0 живых) — прямой SQL-воркер теста обходит
-	// инкрементальные дельты (результат пишет контракт записи T-058, здесь
-	// упрощение); выравнивает реконсиляция — здесь пинируется ровно
-	// «дельты == RETURNING перевода».
+	// The zone deltas counted ONLY the transitioned rows (T-178):
+	// queued 3−2=1, pending 0+2=2 — the guard-filtered victim is not in
+	// the deltas. The queued remainder (1 against 0 alive) — the test's
+	// direct SQL worker bypasses the incremental deltas (a result is
+	// written by the T-058 record contract, a simplification here); the
+	// reconciliation levels it out — what is pinned here is exactly
+	// "the deltas == the transition RETURNING".
 	var queued, pending int64
 	if err := pool.QueryRow(ctx,
 		"SELECT domains_queued, domains_pending FROM zones WHERE id = $1", zone,
@@ -218,9 +229,9 @@ func TestLease_WorkerRaceGuard(t *testing.T) {
 			queued, pending)
 	}
 
-	// Курсор ушёл за пачку: повторный проход (уже без гонки) ничего не
-	// находит — отсеянная судьба жертвы изменилась, возврат к пачке
-	// ничего бы не дал.
+	// The cursor moved past the batch: a repeated pass (already without
+	// the race) finds nothing — the victim's fate has changed, coming
+	// back to the batch would give nothing.
 	repeat, err := scheduler.LeaseOnce(ctx, pool, &cursor, scheduler.LeaseOptions{})
 	if err != nil {
 		t.Fatalf("повторный LeaseOnce: %v", err)
@@ -230,27 +241,28 @@ func TestLease_WorkerRaceGuard(t *testing.T) {
 	}
 }
 
-// TestLease_CursorNotSkipLaterMatured — сценарий §7.2: курсор не
-// пропускает записи, состарившиеся ПОЗЖЕ прохода (малый lease, проходы с
-// паузой): свежая аренда правее порога не выбирается и не двигает курсор,
-// состарев за паузу — возвращается следующим проходом (её ключ правее
-// курсора, ТЗ §4.1).
+// TestLease_CursorNotSkipLaterMatured — the §7.2 scenario: the cursor
+// does not skip records that aged out AFTER the pass (a small lease,
+// passes with a pause): a fresh lease to the right of the threshold is
+// not selected and does not move the cursor; having aged out over the
+// pause, it is returned by the next pass (its key is to the right of
+// the cursor, spec §4.1).
 func TestLease_CursorNotSkipLaterMatured(t *testing.T) {
 	skipUnlessIntegration(t)
-	pool := countersSchema(t) // общий хелпер пакета (ревью T-200 P2-1)
+	pool := countersSchema(t) // a shared package helper (review T-200 P2-1)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	zone := countersSeedZone(t, pool, "lease-cursor.test")
-	old := leaseSeedQueued(ctx, t, pool, zone, "c1", 30) // зрелая при малом lease
+	old := leaseSeedQueued(ctx, t, pool, zone, "c1", 30) // mature under a small lease
 
-	// Малый lease 2 с: бюджет «свежести» аренды устойчив к паузам раннера
-	// (пауза > lease между посевом и проходом 2 состарила бы аренду —
-	// ложный провал; ревью T-200 P2-1).
+	// A small 2 s lease: the lease "freshness" budget is robust to the
+	// runner pauses (a pause > the lease between the seed and pass 2
+	// would age the lease out — a false failure; review T-200 P2-1).
 	opts := scheduler.LeaseOptions{Timeout: 2 * time.Second}
 	var cursor scheduler.LeaseCursor
 
-	// Проход 1: только зрелая; курсор — за неё.
+	// Pass 1: only the mature one; the cursor — past it.
 	first, err := scheduler.LeaseOnce(ctx, pool, &cursor, opts)
 	if err != nil {
 		t.Fatalf("проход 1: %v", err)
@@ -262,7 +274,8 @@ func TestLease_CursorNotSkipLaterMatured(t *testing.T) {
 		t.Fatalf("зрелая аренда не возвращена: check_state = %d", state)
 	}
 
-	// Свежая аренда: правее порога — второй проход пуст, курсор стоит.
+	// A fresh lease: to the right of the threshold — the second pass is
+	// empty, the cursor stands.
 	fresh := leaseSeedQueued(ctx, t, pool, zone, "c2", 0)
 	second, err := scheduler.LeaseOnce(ctx, pool, &cursor, opts)
 	if err != nil {
@@ -275,8 +288,9 @@ func TestLease_CursorNotSkipLaterMatured(t *testing.T) {
 		t.Fatalf("живая аренда тронута: check_state = %d, хочу queued", state)
 	}
 
-	// Пауза больше lease: свежая состарилась — проход 3 возвращает её,
-	// курсор не пропустил (ключ свежей правее курсора прохода 1).
+	// A pause longer than the lease: the fresh one aged out — pass 3
+	// returns it, the cursor did not skip it (the fresh key is to the
+	// right of the pass 1 cursor).
 	time.Sleep(2500 * time.Millisecond)
 	third, err := scheduler.LeaseOnce(ctx, pool, &cursor, opts)
 	if err != nil {
@@ -290,19 +304,21 @@ func TestLease_CursorNotSkipLaterMatured(t *testing.T) {
 	}
 }
 
-// TestLease_CursorPredicateIndex — EXPLAIN-контракты обеих сторон прохода
-// (стиль reanalyze_test.go). SELECT (§4.1): предикат композитного курсора +
-// порог старения обслуживаются листовым экземпляром domains_lease_idx
-// (T-104), не сортировкой/полным сканом. UPDATE (§4.2, ревью T-200 P3-1):
-// ядро диагноза ТЗ §2.1 — перевод обязан вестись от unnest (Function
-// Scan) и пробировать domains по PK (domains_pkey), lease-скана истёкшего
-// диапазона на стороне UPDATE нет (§3.1/§6.1). На игрушечном объёме seq
-// scan дешевле индекса — enable_seqscan = off проверяет индексируемость
-// предикатов и форму плана, а не выбор по стоимости (стоимость — журнал
-// медленных T-177 на бою).
+// TestLease_CursorPredicateIndex — the EXPLAIN contracts of both sides
+// of the pass (the reanalyze_test.go style). SELECT (§4.1): the
+// composite cursor predicate + the aging threshold are served by the
+// leaf instance of domains_lease_idx (T-104), not by a sort/full scan.
+// UPDATE (§4.2, review T-200 P3-1): the core of the spec §2.1
+// diagnosis — the transition must lead from unnest (a Function Scan)
+// and probe domains by PK (domains_pkey); there is no lease scan of
+// the expired range on the UPDATE side (§3.1/§6.1). On a toy volume a
+// seq scan is cheaper than the index — enable_seqscan = off checks the
+// indexability of the predicates and the plan shape, not the
+// cost-based choice (the cost — the T-177 slow-query log in
+// production).
 func TestLease_CursorPredicateIndex(t *testing.T) {
 	skipUnlessIntegration(t)
-	pool := countersSchema(t) // общий хелпер пакета (ревью T-200 P2-1)
+	pool := countersSchema(t) // a shared package helper (review T-200 P2-1)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
@@ -318,9 +334,10 @@ func TestLease_CursorPredicateIndex(t *testing.T) {
 		t.Fatalf("SET LOCAL: %v", err)
 	}
 
-	// SELECT-сторона: форма leaseSelectSQL с литералами (параметры в
-	// EXPLAIN требуют подготовленного оператора — стиль reanalyze_test.go):
-	// порог 30 мин, курсор 2 часа назад с нулевой PK-частью, LIMIT пачки.
+	// The SELECT side: the leaseSelectSQL form with literals (parameters
+	// in EXPLAIN require a prepared statement — the reanalyze_test.go
+	// style): the 30 min threshold, the cursor 2 hours ago with a zero
+	// PK part, the batch LIMIT.
 	selPlan := leaseExplain(ctx, t, tx, fmt.Sprintf(
 		"SELECT zone_id, id, queued_at FROM domains "+
 			"WHERE check_state = %d AND status <> %d "+
@@ -329,26 +346,29 @@ func TestLease_CursorPredicateIndex(t *testing.T) {
 			"ORDER BY queued_at, zone_id, id LIMIT %d",
 		int16(model.CheckStateQueued), int16(model.StatusDeleted),
 		int(scheduler.DefaultLeaseTimeout.Seconds()), scheduler.DefaultLeaseBatch))
-	// domains партиционирована: имя родителя domains_lease_idx на листы
-	// не наследуется — PG материализует дочерние индексы как
-	// <партиция>_<колонки>_idx (замер: domains_default_queued_at_zone_id_
-	// id_idx на DEFAULT; check_state = 1 в Index Cond нет — имплицирован
-	// предикатом частичного индекса). Assert по суффиксу колонок ключа,
-	// инвариантному к разбиению.
+	// domains is partitioned: the parent name of domains_lease_idx is
+	// not inherited by the leaves — PG materializes the child indexes
+	// as <partition>_<columns>_idx (a measurement:
+	// domains_default_queued_at_zone_id_id_idx on DEFAULT; check_state
+	// = 1 is absent from the Index Cond — implied by the partial index
+	// predicate). The assert matches the key-column suffix, invariant to
+	// the split.
 	if !strings.Contains(selPlan, "queued_at_zone_id_id_idx") {
 		t.Errorf("предикат композитного курсора не обслуживается листовым экземпляром domains_lease_idx:\n%s",
 			selPlan)
 	}
 
-	// UPDATE-сторона: форма leaseUpdateSQL с литералами (unnest-ключи —
-	// засеянный домен, порог 30 мин). Порядок join на тестовом объёме не
-	// пинится: с горстью строк планировщик вправе вести от листа
-	// lease-индекса (диапазон — единицы строк, дешевле PK-проб; на боевой
-	// 42-млн таблице он ведёт от unnest с PK-пробами — TZ §2.1/§3.1,
-	// prod-план охраняется журналом медленных T-177 §7.3, текст оператора —
-	// юнит-контрактом leaseUpdateSQL). Стабильные инварианты теста:
-	// unnest-пакет присутствует в плане (PG16 печатает Function Scan по
-	// алиасу u, не по имени функции) и нет деградации в seq scan по domains.
+	// The UPDATE side: the leaseUpdateSQL form with literals (the
+	// unnest keys — the seeded domain, the 30 min threshold). The join
+	// order is not pinned at the test volume: with a handful of rows
+	// the planner is free to lead from the lease index leaf (a range of
+	// a few rows, cheaper than PK probes; on the production 42M table
+	// it leads from unnest with PK probes — the TZ §2.1/§3.1, the prod
+	// plan is guarded by the T-177 §7.3 slow-query log, the operator
+	// text — by the leaseUpdateSQL unit contract). The stable invariants
+	// of the test: the unnest pack is present in the plan (PG16 prints
+	// a Function Scan by the u alias, not the function name) and there
+	// is no degradation into a seq scan over domains.
 	updPlan := leaseExplain(ctx, t, tx, fmt.Sprintf(
 		"WITH upd AS (UPDATE domains AS t "+
 			"SET check_state = %d, queued_at = NULL "+
@@ -374,7 +394,7 @@ func TestLease_CursorPredicateIndex(t *testing.T) {
 	}
 }
 
-// leaseExplain — текст плана EXPLAIN (COSTS OFF) запроса в транзакции tx.
+// leaseExplain — the EXPLAIN (COSTS OFF) plan text of a query in the tx transaction.
 func leaseExplain(ctx context.Context, t *testing.T, tx pgx.Tx, query string) string {
 	t.Helper()
 	rows, err := tx.Query(ctx, "EXPLAIN (COSTS OFF) "+query)

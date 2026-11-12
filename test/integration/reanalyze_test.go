@@ -1,21 +1,24 @@
-// Интеграционные тесты тикового прохода переанализа на время-курсоре
-// (T-193; ТЗ TZ_slow_reanalyze_tick.md §7.2) против живого PostgreSQL:
-// часовой тик обязан читать свежий срез композитным курсором
-// (checked_at, PK) с опорой на subdomain_results_checked_idx (T-171),
-// якорь старта — now() − 24 ч (остаточный класс старше — территория
-// полного дренажа), курсор переживает проходы; полный дренаж при смене
-// правил остаётся PK-формой с нуля и находит устаревшее вне окна.
-// Guard корзин хвостов (T-204): тик без зрелых хвостов не вычитывает
-// окно вовсе — корзины reanalyze: ведут инкременты записи/рендера,
-// декремент штампа и реконсиляция monitor (FILTER-позиции живого
-// окна), сценарий корзин — test/integration/counters_test.go.
-// Юнит-уровень (SQL-контракты, якорь, продвижение курсора, цикл на
-// фейках) — internal/analyzer/reanalyze_test.go. Уровень вызовов —
-// библиотечные, без запуска сервисов (стиль render_requeue_test.go);
-// изоляция — withTestSchema (search_path в DSN; ВСЕ подключения теста —
-// один пул этой схемы), публикация — захватывающий стаб очереди (стиль
-// counters_test.go): проверяется отбор и публикация, не Redis.
-// Прогон — make test-integration (после вливания, из основного дерева).
+// Integration tests of the tick pass of cursor-time re-analysis
+// (T-193; the TZ_slow_reanalyze_tick.md spec §7.2) against live
+// PostgreSQL: the hourly tick must read a fresh slice with the
+// composite cursor (checked_at, PK) backed by
+// subdomain_results_checked_idx (T-171), the start anchor is
+// now() − 24 h (the older residual class is the territory of the full
+// drain), the cursor survives passes; the full drain on a rules change
+// stays the from-scratch PK form and finds stale rows outside the
+// window. Tail bucket guard (T-204): a tick without mature tails does
+// not read the window at all — the reanalyze: buckets lead the
+// record/render increments, the stamp decrement and the monitor
+// reconciliation (the FILTER positions of the live window); the bucket
+// scenario — test/integration/counters_test.go. Unit level (SQL
+// contracts, the anchor, cursor advancement, the loop on fakes) —
+// internal/analyzer/reanalyze_test.go. The call level — library-level,
+// without starting services (the render_requeue_test.go style);
+// isolation — withTestSchema (search_path in the DSN; ALL connections
+// of the test — one pool of that schema), publication — a capturing
+// queue stub (the counters_test.go style): the selection and
+// publication are checked, not Redis. Run — make test-integration
+// (after merging, from the main tree).
 package integration
 
 import (
@@ -34,8 +37,9 @@ import (
 	"crawler/internal/queue"
 )
 
-// reanQ — queue.Queue: фиксирует публикации Result в q:analyze (только
-// счёт и содержимое; Redis не нужен — стрим проверяют e2e/acceptance).
+// reanQ — a queue.Queue: records Result publications to q:analyze
+// (count and content only; Redis is not needed — the stream is checked
+// by e2e/acceptance).
 type reanQ struct {
 	publishes []queue.Result
 }
@@ -62,10 +66,11 @@ func (q *reanQ) Ack(context.Context, string, string, ...string) error {
 	panic("reanQ: Ack не используется")
 }
 
-// reanSeedRow — строка subdomain_results одного домена: PK различается
-// субдоменом; version nil — NULL (никогда не анализировалась, T-058),
-// иначе штамп набора; age — возраст отметки checked_at (целые часы,
-// make_interval — детерминированный ввод без парсинга строк интервалов).
+// reanSeedRow — a subdomain_results row of one domain: the PK differs
+// by subdomain; version nil — NULL (never analyzed, T-058), otherwise
+// the set stamp; age — the age of the checked_at mark (whole hours,
+// make_interval — deterministic input without parsing interval
+// strings).
 func reanSeedRow(ctx context.Context, t *testing.T, pool *pgxpool.Pool,
 	zone int16, domain int64, sub int16, version *int32, age time.Duration) {
 	t.Helper()
@@ -78,9 +83,9 @@ func reanSeedRow(ctx context.Context, t *testing.T, pool *pgxpool.Pool,
 	}
 }
 
-// reanBasketValue — значение корзины хвостов переанализа заданного
-// возраста-часа (T-204; имя часа вычисляет БД тем же выражением, что
-// операторы прохода).
+// reanBasketValue — the value of the re-analysis tail bucket of the
+// given hour age (T-204; the DB computes the hour name with the same
+// expression as the pass operators).
 func reanBasketValue(ctx context.Context, t *testing.T, pool *pgxpool.Pool, age time.Duration) int64 {
 	t.Helper()
 	var v int64
@@ -92,12 +97,12 @@ func reanBasketValue(ctx context.Context, t *testing.T, pool *pgxpool.Pool, age 
 	return v
 }
 
-// reanSkipHourBoundary — сценарии корзин хвостов привязаны к
-// «предыдущему часу» от now() (сид и окно реконсиляции): смена
-// календарного часа посреди теста сдвигает окно — сид становится
-// двухчасовым, реконсиляция его не видит, ассерты падают. У самой
-// границы часа тест пропускается: ~1 % прогонов дешевле редкого
-// флака (ревью T-204, P3-4).
+// reanSkipHourBoundary — the tail bucket scenarios are tied to the
+// "previous hour" from now() (the seed and the reconciliation window):
+// a calendar hour change in the middle of the test shifts the window —
+// the seed becomes two hours old, reconciliation does not see it, the
+// asserts fail. Right at the hour boundary the test is skipped: ~1% of
+// runs is cheaper than a rare flake (review T-204, P3-4).
 func reanSkipHourBoundary(t *testing.T) {
 	t.Helper()
 	if left := time.Until(time.Now().Truncate(time.Hour).Add(time.Hour)); left < 45*time.Second {
@@ -105,17 +110,18 @@ func reanSkipHourBoundary(t *testing.T) {
 	}
 }
 
-// TestReanalyze_TickCursor — сценарий §7.2 с guard'ом корзин хвостов
-// (T-204): проход monitor материализует корзины живым окном (свежая
-// строка без анализа — в корзине предыдущего часа), guard открывается —
-// тик ходит время-формой и публикует хвост; проанализированная не
-// отбирается; повторный тик не переизбирает (курсор за строкой, а не
-// версия); смена правил — полный дренаж с нуля находит и старое вне
-// lookback. Плюс EXPLAIN-контракт: предикат композитного курсора
-// обслуживается индексом subdomain_results_checked_idx (на игрушечном
-// объёме seq scan дешевле — поэтому enable_seqscan = off: проверяется
-// индексируемость предиката, а не выбор по стоимости; стоимость —
-// журнал T-177 на бою).
+// TestReanalyze_TickCursor — the §7.2 scenario with the tail bucket
+// guard (T-204): the monitor pass materializes the buckets with the
+// live window (a fresh row without analysis lands in the previous-hour
+// bucket), the guard opens — the tick walks the time form and publishes
+// the tail; the analyzed row is not selected; a repeated tick does not
+// re-select (the cursor is past the row, not the version); a rules
+// change — the full drain from scratch finds the old row outside the
+// lookback too. Plus the EXPLAIN contract: the composite cursor
+// predicate is served by the subdomain_results_checked_idx index (on a
+// toy volume a seq scan is cheaper — hence enable_seqscan = off: the
+// indexability of the predicate is checked, not the cost-based choice;
+// the cost — the T-177 journal in production).
 func TestReanalyze_TickCursor(t *testing.T) {
 	skipUnlessIntegration(t)
 	reanSkipHourBoundary(t)
@@ -133,12 +139,14 @@ func TestReanalyze_TickCursor(t *testing.T) {
 	}
 	t.Cleanup(pool.Close)
 
-	// Справочник: зона + домен; три строки одного домена (PK — субдомен):
-	// fresh — новый эпизод без анализа (NULL, 1 ч назад — час корзин
-	//   живого окна прохода monitor: guard обязан его увидеть);
-	// ancient — устаревшая версия 7 трое суток назад: вне lookback-якоря,
-	//   территория только полного дренажа (§4.2);
-	// done — проанализирована текущей версией (1 ч назад): не отбирается.
+	// Reference data: a zone + a domain; three rows of one domain (the
+	// PK — the subdomain):
+	// fresh — a new episode without analysis (NULL, 1 h ago — the
+	//   bucket hour of the monitor pass live window: the guard must see
+	//   it);
+	// ancient — a stale version 7 three days ago: outside the lookback
+	//   anchor, the territory of the full drain only (§4.2);
+	// done — analyzed by the current version (1 h ago): not selected.
 	var zone int16
 	if err := pool.QueryRow(ctx,
 		"INSERT INTO zones (name) VALUES ('reanalyze.test') RETURNING id",
@@ -164,10 +172,11 @@ func TestReanalyze_TickCursor(t *testing.T) {
 	current := vCurrent
 	reanSeedRow(ctx, t, pool, zone, domain, subDone, &current, time.Hour)
 
-	// Проход реконсиляции (T-204): корзины хвостов материализуются
-	// агрегатом живого окна — fresh (NULL, час назад) попадает в корзину
-	// предыдущего часа, guard тика открывается; done (текущая версия) и
-	// ancient (вне окна) корзин не числят.
+	// The reconciliation pass (T-204): the tail buckets are materialized
+	// by the live window aggregate — fresh (NULL, an hour ago) lands in
+	// the previous-hour bucket, the tick guard opens; done (the current
+	// version) and ancient (outside the window) are not counted in any
+	// bucket.
 	if _, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{}); err != nil {
 		t.Fatalf("ZoneStatsOnce: %v", err)
 	}
@@ -183,7 +192,8 @@ func TestReanalyze_TickCursor(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ReanalyzeTick: %v", err)
 		}
-		// fresh — да; done (текущая версия) и ancient (вне окна) — нет.
+		// fresh — yes; done (the current version) and ancient (outside
+		// the window) — no.
 		if res.Selected != 1 || res.Published != 1 {
 			t.Fatalf("итог = %+v, want 1/1 (только свежая NULL)", res)
 		}
@@ -195,9 +205,10 @@ func TestReanalyze_TickCursor(t *testing.T) {
 	})
 
 	t.Run("повторный тик не переизбирает", func(t *testing.T) {
-		// Строка всё ещё не проштампована (rules_version NULL): её
-		// исключает курсор, а не версия — окно исчерпано (guard по-прежнему
-		// открыт корзиной: выборка идёт, публикаций нет).
+		// The row is still not stamped (rules_version NULL): the cursor
+		// excludes it, not the version — the window is exhausted (the
+		// guard is still open by the bucket: the selection runs, there
+		// are no publications).
 		res, err := analyzer.ReanalyzeTick(ctx, pool, q, vCurrent, &cursor, analyzer.ReanalyzeOptions{})
 		if err != nil {
 			t.Fatalf("повторный ReanalyzeTick: %v", err)
@@ -209,8 +220,8 @@ func TestReanalyze_TickCursor(t *testing.T) {
 	})
 
 	t.Run("смена правил — дренаж с нуля находит старое вне lookback", func(t *testing.T) {
-		// PK-форма с нулевого курсора: fresh (NULL) и ancient (vOld) —
-		// устарели против той же текущей версии, done — нет.
+		// The PK form from the zero cursor: fresh (NULL) and ancient
+		// (vOld) — stale against the same current version, done — not.
 		res, err := analyzer.ReanalyzeDrain(ctx, pool, q, vCurrent, nil, analyzer.ReanalyzeOptions{})
 		if err != nil {
 			t.Fatalf("ReanalyzeDrain: %v", err)
@@ -236,16 +247,17 @@ func TestReanalyze_TickCursor(t *testing.T) {
 			t.Fatalf("begin: %v", err)
 		}
 		defer func() { _ = tx.Rollback(ctx) }()
-		// На трёх строках seq scan дешевле индекса — отключаем его и
-		// проверяем индексируемость предиката (форма §4.1), не выбор
-		// планировщика по стоимости: на боевом объёме окно индекса —
-		// доли секунды против 19,9 с полного скана (ТЗ §2).
+		// On three rows a seq scan is cheaper than the index — disable it
+		// and check the indexability of the predicate (the §4.1 shape),
+		// not the planner's cost-based choice: at production volume the
+		// index window is fractions of a second against 19.9 s of the
+		// full scan (spec §2).
 		if _, err := tx.Exec(ctx, "SET LOCAL enable_seqscan = off"); err != nil {
 			t.Fatalf("SET LOCAL: %v", err)
 		}
-		// Время-форма с литералами (параметры в EXPLAIN требуют
-		// подготовленного оператора — стиль rqBatchSQL): якорь —
-		// now() − 24 ч, нулевая PK-часть.
+		// The time form with literals (parameters in EXPLAIN require a
+		// prepared statement — the rqBatchSQL style): the anchor —
+		// now() − 24 h, the zero PK part.
 		explain := "EXPLAIN (COSTS OFF) " + fmt.Sprintf(
 			"SELECT r.zone_id, r.domain_id, r.subdomain_id, r.variant, r.checked_at "+
 				"FROM subdomain_results AS r "+
@@ -275,10 +287,11 @@ func TestReanalyze_TickCursor(t *testing.T) {
 		if err := rows.Err(); err != nil {
 			t.Fatalf("EXPLAIN: %v", err)
 		}
-		// Родительский индекс subdomain_results_checked_idx (миграция 0014)
-		// партиционирован: на листе DEFAULT экземпляр материализуется как
-		// subdomain_results_default_checked_at_idx (и <лист>_checked_at_idx
-		// на зональных) — assert по суффиксу имени, инвариантному к разбиению.
+		// The parent index subdomain_results_checked_idx (migration 0014)
+		// is partitioned: on the DEFAULT leaf the instance materializes
+		// as subdomain_results_default_checked_at_idx (and
+		// <leaf>_checked_at_idx on zonal ones) — the assert matches the
+		// name suffix, invariant to the split.
 		if !strings.Contains(plan.String(), "_checked_at_idx") {
 			t.Errorf("предикат композитного курсора не обслуживается листовым экземпляром subdomain_results_checked_idx:\n%s",
 				plan.String())

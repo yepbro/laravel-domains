@@ -1,20 +1,22 @@
-// Интеграционный тест компенсатора «статус повис» (T-270, ТЗ
-// tasks/TZ-fsm.md §3 ФТ-2.2) против живых PostgreSQL и Redis testbed:
-// полный сценарий класса потерь — О6 записан (DNS «есть адреса»,
-// задача q:http опубликована в живой Redis), отметка состарена за окно
-// 24 ч, недоставленная запись q:http потеряна (XTRIM — рестарт Redis
-// без персистентности теряет так же, docs/redis.md §5) — реконсиляция
-// поднимает уровень new_done_stale (gauge), StaleRequeueOnce
-// возвращает домен в pending (перевод Р15 спецификации check_state,
-// дельты зон ведёт оператор перевода, счётчик
-// crawler_scheduler_stale_requeued_total растёт), повторный проход —
-// no-op (идемпотентность), эпизод завершён ШТАТНО конвейером
-// (постановка → терминальная ветка DNS), gauge обнуляется. Контракты
-// стоимости: guard — точечный PK-лукап crawler_counters (без seq scan
-// по domains), выборка пачки — seq scan по domains с ранним остановом
-// LIMIT под закреплением SET LOCAL (T-191). Уровень вызовов —
-// библиотечные, без запуска сервисов; изоляция — withTestSchema и
-// выделенная БД Redis (resilienceRedisEnv).
+// Integration test of the "stale status" compensator (T-270, TZ-fsm
+// spec tasks/TZ-fsm.md §3 FR-2.2) against the live PostgreSQL and
+// Redis testbed: a complete loss-class scenario — O6 is recorded
+// (DNS "has addresses", the q:http task is published to the live
+// Redis), the mark is aged out beyond the 24 h window, the undelivered
+// q:http record is lost (XTRIM — a Redis restart without persistence
+// loses the same way, docs/redis.md §5) — reconciliation raises the
+// new_done_stale level (gauge), StaleRequeueOnce returns the domain to
+// pending (the R15 transition of the check_state specification, zone
+// deltas are handled by the transition operator, the
+// crawler_scheduler_stale_requeued_total counter grows), a repeated
+// pass is a no-op (idempotency), the episode is finished by the
+// pipeline NORMALLY (enqueue → the terminal DNS branch), the gauge is
+// zeroed. Cost contracts: the guard — a point PK lookup of
+// crawler_counters (no seq scan over domains), the batch selection —
+// a seq scan over domains with the early LIMIT stop under the
+// SET LOCAL pinning (T-191). The call level — library-level, without
+// starting services; isolation — withTestSchema and a dedicated Redis
+// DB (resilienceRedisEnv).
 package integration
 
 import (
@@ -31,9 +33,10 @@ import (
 	"crawler/internal/scheduler"
 )
 
-// TestStaleRequeue_LostHTTPTask — сценарий потери задачи q:http при
-// записанном done: gauge видит когорту, компенсатор возвращает домен в
-// pending, конвейер завершает эпизод, gauge обнуляется.
+// TestStaleRequeue_LostHTTPTask — a scenario of losing a q:http task
+// with done recorded: the gauge sees the cohort, the compensator
+// returns the domain to pending, the pipeline finishes the episode,
+// the gauge is zeroed.
 func TestStaleRequeue_LostHTTPTask(t *testing.T) {
 	skipUnlessIntegration(t)
 	pool := countersSchema(t)
@@ -44,7 +47,7 @@ func TestStaleRequeue_LostHTTPTask(t *testing.T) {
 	zone := countersSeedZone(t, pool, "stale.test")
 	q := &countersStubQueue{}
 
-	// Р10 + Р1: вставка и постановка — домен в очереди на DNS-этап.
+	// R10 + R1: insert and enqueue — the domain is queued for the DNS stage.
 	add := checkStateStageAdd(ctx, t, pool, zone, "lost")
 	if add.Inserted != 1 {
 		t.Fatalf("ApplyAdd = %+v, хочу Inserted=1", add)
@@ -61,10 +64,11 @@ func TestStaleRequeue_LostHTTPTask(t *testing.T) {
 		t.Fatalf("EnqueueBatch: %v", err)
 	}
 
-	// О6: DNS-эпизод «есть адреса» — публикация q:http в ЖИВОЙ Redis,
-	// пометка бита http_published (T-108, порядок воркера: публикация →
-	// бит → запись результата), запись ветки keep-status: check_state =
-	// done, статус остаётся new (итог решает HTTP-этап).
+	// O6: the DNS episode "has addresses" — publishing q:http to the
+	// LIVE Redis, setting the http_published bit (T-108, worker order:
+	// publication → bit → result record), recording the keep-status
+	// branch: check_state = done, the status stays new (the HTTP stage
+	// decides the outcome).
 	httpq := queue.NewRedisQueue(rdb, queue.RedisOptions{})
 	task := queue.HTTPTask{
 		TaskID:     "stale-requeue-test",
@@ -91,9 +95,10 @@ func TestStaleRequeue_LostHTTPTask(t *testing.T) {
 		t.Fatalf("после О6 = %+v, хочу done/new/бит снят — «статус повис» без HTTP-итога", r)
 	}
 
-	// Когорта состарена за окно 24 ч (инцидентная неделя: last_checked_at
-	// давно), недоставленная запись q:http потеряна — XTRIM всего стрима
-	// (рестарт Redis без персистентности теряет то же самое).
+	// The cohort is aged out beyond the 24 h window (incident week:
+	// last_checked_at long ago), the undelivered q:http record is lost
+	// — XTRIM of the whole stream (a Redis restart without persistence
+	// loses the same).
 	if _, err := pool.Exec(ctx,
 		"UPDATE domains SET last_checked_at = current_date - 2 WHERE zone_id = $1 AND id = $2",
 		zone, id); err != nil {
@@ -106,7 +111,7 @@ func TestStaleRequeue_LostHTTPTask(t *testing.T) {
 		t.Fatalf("XLEN q:http после потери = %d, хочу 0", n)
 	}
 
-	// Реконсиляция поднимает уровень: gauge new_done_stale = 1.
+	// Reconciliation raises the level: the new_done_stale gauge = 1.
 	st, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{})
 	if err != nil {
 		t.Fatalf("реконсиляция: %v", err)
@@ -116,8 +121,9 @@ func TestStaleRequeue_LostHTTPTask(t *testing.T) {
 	}
 	countersVerifyEmpty(t, pool, "после реконсиляции (уровень new_done_stale)")
 
-	// Компенсатор (Р15): домен в pending, статус сохранён, аренды нет;
-	// дельты зон ведёт оператор перевода; счётчик растёт.
+	// The compensator (R15): the domain is pending, the status is kept,
+	// no lease; zone deltas are handled by the transition operator; the
+	// counter grows.
 	reg := metrics.New("scheduler")
 	res, err := scheduler.StaleRequeueOnce(ctx, pool, scheduler.StaleRequeueOptions{Metrics: reg})
 	if err != nil || res.Domains != 1 || res.Selected != 1 {
@@ -133,8 +139,8 @@ func TestStaleRequeue_LostHTTPTask(t *testing.T) {
 		t.Fatalf("счётчик компенсатора = %v, хочу 1", got)
 	}
 
-	// Повторный проход — no-op (идемпотентность: переведённые не
-	// выбираются), счётчик не растёт.
+	// A repeated pass is a no-op (idempotency: the transitioned rows are
+	// not selected), the counter does not grow.
 	repeat, err := scheduler.StaleRequeueOnce(ctx, pool, scheduler.StaleRequeueOptions{Metrics: reg})
 	if err != nil || repeat != (scheduler.StaleRequeueResult{}) {
 		t.Fatalf("повторный StaleRequeueOnce = %+v err=%v, хочу нулевой (идемпотентность)", repeat, err)
@@ -143,8 +149,9 @@ func TestStaleRequeue_LostHTTPTask(t *testing.T) {
 		t.Fatalf("счётчик после повтора = %v, хочу 1 (пустой проход не считается)", got)
 	}
 
-	// Эпизод завершён ШТАТНО конвейером: постановка (Р1) и терминальная
-	// ветка DNS (Р2) — домен выходит из аномалии с итоговым статусом.
+	// The episode is finished by the pipeline NORMALLY: enqueue (R1) and
+	// the terminal DNS branch (R2) — the domain leaves the anomaly with
+	// a final status.
 	if _, err := scheduler.EnqueueBatch(ctx, pool, q, []scheduler.DispatchRow{
 		{ZoneID: zone, DomainID: id, Name: "lost.stale.test"},
 	}); err != nil {
@@ -163,7 +170,7 @@ func TestStaleRequeue_LostHTTPTask(t *testing.T) {
 	}
 	countersVerifyEmpty(t, pool, "после штатного завершения эпизода (Р2)")
 
-	// Gauge обнулился: когорта вылечена, сигнал о новых потерях чист.
+	// The gauge is zeroed: the cohort is healed, the signal about new losses is clean.
 	if st, err = monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{}); err != nil {
 		t.Fatalf("реконсиляция повторно: %v", err)
 	}
@@ -178,9 +185,9 @@ func TestStaleRequeue_LostHTTPTask(t *testing.T) {
 	}
 	countersVerifyEmpty(t, pool, "после обнуления gauge")
 
-	// Контракт формы выборки под закреплением (T-191): SET LOCAL ×3 —
-	// seq scan по domains с ранним остановом LIMIT (марафон по
-	// domains_recheck_idx не возвращается).
+	// The selection shape contract under pinning (T-191): SET LOCAL ×3 —
+	// a seq scan over domains with the early LIMIT stop (the marathon
+	// over domains_recheck_idx does not come back).
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatalf("begin: %v", err)
@@ -205,10 +212,11 @@ func TestStaleRequeue_LostHTTPTask(t *testing.T) {
 		t.Fatalf("rollback: %v", err)
 	}
 
-	// Контракт стоимости guard: точечный PK-лукап crawler_counters —
-	// без seq scan по domains (пустое множество — дешёвая проба);
-	// seqscan отключён, чтобы крошечная таблица счётчиков не развалила
-	// контракт выбором тривиального скана — стиль TestCheckState_LeaseNullRepair.
+	// The guard cost contract: a point PK lookup of crawler_counters —
+	// no seq scan over domains (an empty set — a cheap probe); seqscan
+	// is disabled so that the tiny counter table does not break the
+	// contract by choosing a trivial scan — the
+	// TestCheckState_LeaseNullRepair style.
 	tx2, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatalf("begin: %v", err)
@@ -227,8 +235,8 @@ func TestStaleRequeue_LostHTTPTask(t *testing.T) {
 	}
 }
 
-// staleRequeuedTotal — значение счётчика компенсатора в реестре (стиль
-// checkStateNullReturned).
+// staleRequeuedTotal — the compensator counter value in the registry
+// (the checkStateNullReturned style).
 func staleRequeuedTotal(t *testing.T, reg *metrics.Registry) float64 {
 	t.Helper()
 	families, err := reg.Gather()

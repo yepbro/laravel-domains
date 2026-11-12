@@ -1,22 +1,23 @@
-// Интеграционные тесты субпартиционирования крупных зон (T-005, ТЗ §6:
-// «крупные зоны дополнительно по хэшу id, чтобы партиция не превышала
-// ≈ 30–50 млн строк»).
+// Integration tests of subpartitioning of large zones (T-005, spec §6:
+// "large zones additionally by the id hash, so that a partition does
+// not exceed ≈30–50M rows").
 //
-// Процедура create_zone_partitions (миграция 000003) выделяет зону из
-// DEFAULT-партиции во всех четырёх таблицах с zone_id:
-//   - domains — в обычную LIST-партицию: субпартиционирование по хэшу
-//     невозможно при живом UNIQUE (zone_id, label) — PG16 требует включать
-//     колонки ключа партиционирования каждого уровня во все уникальные
-//     ключи, а общая часть PK (zone_id, id) и (zone_id, label) — только
-//     zone_id, константа внутри партиции зоны (решение T-005, docs/schema.md);
-//   - subdomain_results / laravel_domains / laravel_findings — в LIST-партицию,
-//     субпартиционированную HASH по domain_id (PK содержат domain_id,
-//     других уникальных ключей нет).
+// The create_zone_partitions procedure (migration 000003) extracts a
+// zone from the DEFAULT partition in all four tables with zone_id:
+//   - domains — into a plain LIST partition: hash subpartitioning is
+//     impossible with a live UNIQUE (zone_id, label) — PG16 requires
+//     including the partitioning key columns of every level in all
+//     unique keys, and the common part of the PK (zone_id, id) and
+//     (zone_id, label) is only zone_id, a constant inside the zone
+//     partition (the T-005 decision, docs/schema.md);
+//   - subdomain_results / laravel_domains / laravel_findings — into a
+//     LIST partition subpartitioned HASH by domain_id (the PKs contain
+//     domain_id, there are no other unique keys).
 //
-// Проверяются: перенос данных из DEFAULT, структура листьев (bound, fillfactor,
-// дочерние индексы), состояние DEFAULT после цикла detach/attach, маршрутизация
-// новых строк, идемпотентность повторного вызова, валидация аргументов
-// и откат миграции.
+// Checked: the data transfer out of DEFAULT, the leaf structure (bound,
+// fillfactor, child indexes), the DEFAULT state after the detach/attach
+// cycle, the routing of new rows, the idempotency of a repeated call,
+// argument validation, and the migration rollback.
 package integration
 
 import (
@@ -35,13 +36,13 @@ import (
 	"crawler/internal/migrate"
 	"crawler/migrations"
 
-	// database/sql-драйвер для golang-migrate в тесте отката
-	// (тот же, что использует раннер internal/migrate).
+	// The database/sql driver for golang-migrate in the rollback test
+	// (the same one the internal/migrate runner uses).
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
-// insertZone добавляет зону и возвращает её id (identity последовательный,
-// но тест не зависит от конкретных значений).
+// insertZone adds a zone and returns its id (the identity is sequential,
+// but the test does not depend on specific values).
 func insertZone(t *testing.T, pool *pgxpool.Pool, name string) int16 {
 	t.Helper()
 
@@ -54,7 +55,7 @@ func insertZone(t *testing.T, pool *pgxpool.Pool, name string) int16 {
 	return id
 }
 
-// callCreateZonePartitions вызывает процедуру создания партиций зоны.
+// callCreateZonePartitions calls the zone partition creation procedure.
 func callCreateZonePartitions(t *testing.T, pool *pgxpool.Pool, zoneID int16, hashParts int) {
 	t.Helper()
 
@@ -65,8 +66,8 @@ func callCreateZonePartitions(t *testing.T, pool *pgxpool.Pool, zoneID int16, ha
 	}
 }
 
-// zonePartition возвращает партицию зоны <table>_z<zone> (лист для domains,
-// промежуточный родитель hash-листьев для таблиц результатов).
+// zonePartition returns the zone partition <table>_z<zone> (a leaf for
+// domains, the intermediate parent of hash leaves for the result tables).
 func zonePartition(t *testing.T, pool *pgxpool.Pool, table string, zoneID int16) tablePartition {
 	t.Helper()
 
@@ -80,7 +81,8 @@ func zonePartition(t *testing.T, pool *pgxpool.Pool, table string, zoneID int16)
 	return tablePartition{}
 }
 
-// zoneLeafs возвращает hash-листья партиции зоны — части <table>_z<zone>_h<N>.
+// zoneLeafs returns the hash leaves of the zone partition — the
+// <table>_z<zone>_h<N> parts.
 func zoneLeafs(t *testing.T, pool *pgxpool.Pool, table string, zoneID int16) []tablePartition {
 	t.Helper()
 
@@ -94,7 +96,7 @@ func zoneLeafs(t *testing.T, pool *pgxpool.Pool, table string, zoneID int16) []t
 	return leafs
 }
 
-// countZoneRows считает строки зоны в таблице.
+// countZoneRows counts the zone rows in the table.
 func countZoneRows(t *testing.T, pool *pgxpool.Pool, table string, zoneID int16) int {
 	t.Helper()
 
@@ -107,22 +109,22 @@ func countZoneRows(t *testing.T, pool *pgxpool.Pool, table string, zoneID int16)
 	return n
 }
 
-// TestZonePartitions_ExtractZoneWithData — полный сценарий: данные зоны
-// лежат в DEFAULT, процедура выделяет зону, данные переносятся в новые
-// партиции, запросы работают, новые строки маршрутизируются, прочие зоны
-// остаются в DEFAULT.
+// TestZonePartitions_ExtractZoneWithData — the full scenario: the zone
+// data sits in DEFAULT, the procedure extracts the zone, the data is
+// moved to the new partitions, queries work, new rows are routed, the
+// other zones stay in DEFAULT.
 func TestZonePartitions_ExtractZoneWithData(t *testing.T) {
 	skipUnlessIntegration(t)
 	pool := migratedSchema(t)
 	ctx := context.Background()
 
-	// Зоны: big — выделяется с данными; small — остаётся в DEFAULT;
-	// empty — выделяется без данных (путь «до загрузки зоны»).
+	// Zones: big — extracted with data; small — stays in DEFAULT;
+	// empty — extracted without data (the "before zone load" path).
 	big := insertZone(t, pool, "big")
 	small := insertZone(t, pool, "small")
 	empty := insertZone(t, pool, "empty")
 
-	// Данные зоны big до выделения пишутся в DEFAULT-партиции.
+	// The big zone data before extraction is written to the DEFAULT partitions.
 	seed := func(table string, zoneID int16, n int) {
 		t.Helper()
 		queries := map[string]string{
@@ -162,8 +164,8 @@ func TestZonePartitions_ExtractZoneWithData(t *testing.T) {
 			}
 		}
 
-		// Точечный запрос по уникальному ключу (ТЗ 5.11) и апдейт статуса —
-		// строка доступна и изменяема через корневую таблицу.
+		// A point query by the unique key (spec 5.11) and a status update —
+		// the row is accessible and mutable through the root table.
 		var status int
 		if err := pool.QueryRow(ctx,
 			`SELECT status FROM domains WHERE zone_id = $1 AND label = 'site42'`, big,
@@ -189,8 +191,8 @@ func TestZonePartitions_ExtractZoneWithData(t *testing.T) {
 	})
 
 	t.Run("структура партиций зоны", func(t *testing.T) {
-		// domains — обычный лист с fillfactor и всеми тремя индексами
-		// родителя (pkey, zone_id+label, pending).
+		// domains — a plain leaf with the fillfactor and all three parent
+		// indexes (pkey, zone_id+label, pending).
 		dom := zonePartition(t, pool, "domains", big)
 		if dom.relkind != "r" {
 			t.Errorf("domains_z%d: relkind = %s, want r (лист: субпартиционирование domains невозможно)", big, dom.relkind)
@@ -205,14 +207,15 @@ func TestZonePartitions_ExtractZoneWithData(t *testing.T) {
 			t.Errorf("domains_z%d: индексов %d, want %d (дочерние всех индексов родителя)", big, dom.indexCount, n)
 		}
 
-		// Пустая зона выделена по тому же пути, что и нагруженная.
+		// The empty zone is extracted along the same path as the loaded one.
 		if e := zonePartition(t, pool, "domains", empty); !strings.Contains(e.reloptions, "fillfactor=85") {
 			t.Errorf("domains_z%d (пустая зона): reloptions = %q, want fillfactor=85", empty, e.reloptions)
 		}
 
-		// Таблицы результатов: hash-листья с fillfactor у subdomain_results,
-		// без fillfactor у laravel_*, у каждого — дочерний индекс PK.
-		// Каталог не гарантирует порядок частей — лист ищется по имени _h<i>.
+		// The result tables: hash leaves with a fillfactor for
+		// subdomain_results, without one for laravel_*, each with a child
+		// PK index. The catalog does not guarantee the part order — a
+		// leaf is found by the _h<i> name.
 		for _, table := range []string{"subdomain_results", "laravel_domains", "laravel_findings"} {
 			parentIdx := len(tableIndexes(t, pool, table))
 			byName := make(map[string]tablePartition)
@@ -246,7 +249,7 @@ func TestZonePartitions_ExtractZoneWithData(t *testing.T) {
 			}
 		}
 
-		// Пустая зона выделена с другим modulus — число частей задаётся вызовом.
+		// The empty zone is extracted with a different modulus — the number of parts is set by the call.
 		if leafs := zoneLeafs(t, pool, "subdomain_results", empty); len(leafs) != 2 {
 			t.Errorf("subdomain_results_z%d: hash-листьев %d, want 2", empty, len(leafs))
 		}
@@ -286,7 +289,7 @@ func TestZonePartitions_ExtractZoneWithData(t *testing.T) {
 	})
 
 	t.Run("DEFAULT вернулась и принимает прочие зоны", func(t *testing.T) {
-		// Строки невыделенной зоны остались в DEFAULT.
+		// The rows of the non-extracted zone stayed in DEFAULT.
 		for table, want := range map[string]int{"domains": 5, "subdomain_results": 3} {
 			var got int
 			err := pool.QueryRow(ctx,
@@ -301,7 +304,7 @@ func TestZonePartitions_ExtractZoneWithData(t *testing.T) {
 			}
 		}
 
-		// Новые строки: зоны big — в партицию зоны, прочих — в DEFAULT.
+		// New rows: big zone rows — into the zone partition, others — into DEFAULT.
 		var leaf string
 		if err := pool.QueryRow(ctx,
 			`INSERT INTO domains (zone_id, label) VALUES ($1, 'post-extract') RETURNING tableoid::regclass::text`, big,
@@ -329,11 +332,11 @@ func TestZonePartitions_ExtractZoneWithData(t *testing.T) {
 			t.Errorf("новый домен small попал в %s, want domains_default", leaf)
 		}
 
-		// Цикл detach/attach не дублирует индексы на DEFAULT.
+		// The detach/attach cycle does not duplicate indexes on DEFAULT.
 		// domains: PK + unique(zone_id,label) + domains_pending_idx +
-		// 2 частичных миграции 000008 (T-104: lease/recheck) +
+		// 2 partial of migration 000008 (T-104: lease/recheck) +
 		// domains_deleted_idx (T-170) + domains_last_checked_idx (T-171) —
-		// партиция-наследник родительских индексов.
+		// the partition inherits the parent indexes.
 		for table, want := range map[string]int{"domains": 7, "subdomain_results": 2} {
 			for _, p := range tablePartitions(t, pool, table) {
 				if p.name != table+"_default" {
@@ -347,14 +350,14 @@ func TestZonePartitions_ExtractZoneWithData(t *testing.T) {
 	})
 
 	t.Run("повторный вызов идемпотентен", func(t *testing.T) {
-		// Базовые количества — после предыдущих вставок маршрутизации.
+		// The baseline counts — after the previous routing inserts.
 		before := make(map[string]int, len(tables))
 		for _, table := range tables {
 			before[table] = countZoneRows(t, pool, table, big)
 		}
 
-		callCreateZonePartitions(t, pool, big, 4)  // те же параметры
-		callCreateZonePartitions(t, pool, big, 16) // и с другим числом частей: существующая партиция выигрывает
+		callCreateZonePartitions(t, pool, big, 4)  // the same parameters
+		callCreateZonePartitions(t, pool, big, 16) // and with a different part count: the existing partition wins
 
 		if leafs := zoneLeafs(t, pool, "subdomain_results", big); len(leafs) != 4 {
 			t.Errorf("после повторных вызовов hash-листьев %d, want 4 (партиция не пересоздаётся)", len(leafs))
@@ -367,9 +370,9 @@ func TestZonePartitions_ExtractZoneWithData(t *testing.T) {
 	})
 }
 
-// TestZonePartitions_Validation — процедура отклоняет неизвестную зону
-// и не-степень двойки, не оставляя после себя партиций; вызов с одним
-// аргументом использует hash_parts по умолчанию (4).
+// TestZonePartitions_Validation — the procedure rejects an unknown zone
+// and a non-power-of-two leaving no partitions behind; a one-argument
+// call uses the default hash_parts (4).
 func TestZonePartitions_Validation(t *testing.T) {
 	skipUnlessIntegration(t)
 	pool := migratedSchema(t)
@@ -393,12 +396,12 @@ func TestZonePartitions_Validation(t *testing.T) {
 	expectError("hash_parts = 0", ok, 0, "степень двойки")
 	expectError("hash_parts = -4", ok, -4, "степень двойки")
 
-	// Ошибочные вызовы не создали партиций зоны.
+	// The failing calls did not create zone partitions.
 	if parts := zoneLeafs(t, pool, "subdomain_results", ok); len(parts) != 0 {
 		t.Errorf("после ошибочных вызовов создано hash-листьев: %d, want 0", len(parts))
 	}
 
-	// Вызов с одним аргументом — hash_parts по умолчанию (4).
+	// The one-argument call — the default hash_parts (4).
 	if _, err := pool.Exec(ctx, `CALL create_zone_partitions($1)`, ok); err != nil {
 		t.Fatalf("CALL с hash_parts по умолчанию: %v", err)
 	}
@@ -407,11 +410,12 @@ func TestZonePartitions_Validation(t *testing.T) {
 	}
 }
 
-// TestZonePartitions_DownMigration — откат миграции 000003 (down к версии 2
-// тем же golang-migrate, что применяет раннер) удаляет процедуру, не трогая
-// таблицы и данные. Версия указана явно: 000003 — не последняя миграция
-// схемы (после неё идут миграции других задач, например 000004 ingest_stage),
-// Steps(-1) откатывал бы чужую миграцию.
+// TestZonePartitions_DownMigration — the migration 000003 rollback
+// (down to version 2 by the same golang-migrate the runner uses to
+// apply) removes the procedure without touching the tables and data.
+// The version is given explicitly: 000003 is not the last migration of
+// the schema (other tasks' migrations follow it, e.g. 000004
+// ingest_stage), Steps(-1) would roll back a foreign migration.
 const zoneSubpartitioningVersion = 3
 
 func TestZonePartitions_DownMigration(t *testing.T) {
@@ -424,13 +428,14 @@ func TestZonePartitions_DownMigration(t *testing.T) {
 		t.Fatalf("применение миграций: %v", err)
 	}
 
-	// Откат до версии ниже 000003 — та же операция, которую выполнял бы
-	// CLI migrate (internal/migrate сознательно применяет только up).
+	// The rollback to a version below 000003 — the same operation the
+	// migrate CLI would perform (internal/migrate deliberately applies
+	// up only).
 	db, err := sql.Open("pgx/v5", dsn)
 	if err != nil {
 		t.Fatalf("sql.Open: %v", err)
 	}
-	defer db.Close() //nolint:errcheck // тестовое соединение
+	defer db.Close() //nolint:errcheck // test connection
 
 	driver, err := pgxmigrate.WithInstance(db, &pgxmigrate.Config{})
 	if err != nil {
@@ -444,7 +449,7 @@ func TestZonePartitions_DownMigration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("инициализация golang-migrate: %v", err)
 	}
-	defer m.Close() //nolint:errcheck // тестовое соединение — как db выше
+	defer m.Close() //nolint:errcheck // test connection — same as db above
 	if err := m.Migrate(zoneSubpartitioningVersion - 1); err != nil {
 		t.Fatalf("откат к версии %d: %v", zoneSubpartitioningVersion-1, err)
 	}

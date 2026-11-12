@@ -1,17 +1,18 @@
-// Интеграционные тесты прохода доработки рендера RequeueOnce (T-066;
-// выборка пачки без PK-порядка, закрепление плана SET LOCAL и guard
-// счётчиком долга — T-181; приоритет зон двухступенчатой выборкой — T-184)
-// против живых PostgreSQL/Redis: юнит-тесты renderq_test.go проверяют
-// SQL-контракты и последовательность на фейках, здесь — реальное
-// поведение на мигрированной схеме: проход публикует q:render и снимает
-// флаг с декрементом счётчика; стационар без долга (счётчик 0) не
-// выполняет тяжёлую выборку вовсе (обёртка пула со счётчиком вызовов —
-// предписание ТЗ T-181 §7.2); повторный проход не выбирает снятое;
-// отсутствие строки счётчика — ошибка прохода. Форма закреплённого плана
-// проверяется EXPLAIN в той же транзакции с SET LOCAL (seq scan по
-// domains, индексные формы отключены). Уровень вызовов — как у соседей:
-// библиотечные вызовы без запуска сервисов; изоляция — withTestSchema +
-// Redis БД 15.
+// Integration tests of the render finish-up pass RequeueOnce (T-066;
+// the batch selection without a PK order, the plan pinning SET LOCAL
+// and the guard by the debt counter — T-181; the zone priority by the
+// two-stage selection — T-184) against live PostgreSQL/Redis: the
+// renderq_test.go unit tests check the SQL contracts and the sequence
+// on fakes; here — the real behavior on a migrated schema: the pass
+// publishes to q:render and clears the flag with a counter decrement;
+// the steady state without debt (counter 0) does not run the heavy
+// selection at all (a pool wrapper with a call counter — the T-181
+// §7.2 spec prescription); a repeated pass does not select the
+// cleared ones; a missing counter row — a pass error. The pinned plan
+// shape is checked by EXPLAIN in the same transaction with SET LOCAL
+// (a seq scan over domains, the index forms disabled). The call level
+// — like the neighbors: library calls without starting services;
+// isolation — withTestSchema + Redis DB 15.
 package integration
 
 import (
@@ -32,32 +33,34 @@ import (
 	"crawler/internal/queue"
 )
 
-// rqSeqScanRe — seq scan по domains (алиас d) в EXPLAIN: PG16 печатает
-// листовую партицию («Seq Scan on domains_default d»), PG17+ — родителя
-// («Seq Scan on d»).
+// rqSeqScanRe — a seq scan over domains (the d alias) in EXPLAIN:
+// PG16 prints the leaf partition ("Seq Scan on domains_default d"),
+// PG17+ — the parent ("Seq Scan on d").
 var rqSeqScanRe = regexp.MustCompile(`Seq Scan on (\w+ )?d\b`)
 
-// rqBody — SPA-оболочка (T-057: мало видимого текста, корневой контейнер,
-// noscript с требованием JS; то же тело, что в юнит-фикстурах
-// renderq_test.go): повторный вердикт прохода обязан увидеть SPA и
-// опубликовать q:render.
+// rqBody — an SPA shell (T-057: little visible text, a root container,
+// a noscript demanding JS; the same body as in the renderq_test.go
+// unit fixtures): the repeated verdict of the pass must see the SPA
+// and publish to q:render.
 var rqBody = []byte(`<html><head><title>x</title></head><body><div id="root"></div><noscript>please enable javascript</noscript></body></html>`)
 
-// rqBatchPrefix — начало renderPendingDomainsSQL (литерал
-// internal/httpworker/renderq.go, дублирование — стиль schema_test.go):
-// обёртка пула считает вызовы тяжёлой выборки пачки — guard T-181 обязан
-// держать её за нулём счётчика долга. Выборка идёт ВНУТРИ транзакции
-// закрепления плана, потому счётчик живёт в обёртке транзакции.
+// rqBatchPrefix — the beginning of renderPendingDomainsSQL (a literal
+// from internal/httpworker/renderq.go, the duplication — the
+// schema_test.go style): the pool wrapper counts the heavy batch
+// selection calls — the T-181 guard must keep it behind a zero debt
+// counter. The selection runs INSIDE the plan pinning transaction, so
+// the counter lives in the transaction wrapper.
 const rqBatchPrefix = "SELECT d.zone_id, d.id, d.label || '.' || z.name"
 
-// rqBatchSQL — полный текст выборки для EXPLAIN (LIMIT — литералом:
-// параметр в EXPLAIN требует подготовленного оператора, проверке формы
-// плана литерал безразличен).
+// rqBatchSQL — the full selection text for EXPLAIN (the LIMIT — as a
+// literal: a parameter in EXPLAIN requires a prepared statement, the
+// plan shape check does not care).
 const rqBatchSQL = rqBatchPrefix + " FROM domains AS d JOIN zones AS z ON z.id = d.zone_id " +
 	"WHERE (d.flags & 2) <> 0 AND d.status <> 6 LIMIT 100"
 
-// rqTracePool — RecordDB-обёртка пула: считает вызовы тяжёлой выборки
-// пачки (обёртка пула со счётчиком вызовов — предписание ТЗ T-181 §7.2).
+// rqTracePool — a RecordDB pool wrapper: counts the heavy batch
+// selection calls (a pool wrapper with a call counter — the T-181
+// §7.2 spec prescription).
 type rqTracePool struct {
 	*pgxpool.Pool
 
@@ -77,7 +80,7 @@ func (p *rqTracePool) batchCalls() int {
 	return p.batch
 }
 
-// Begin оборачивает транзакцию счётчиком выборки.
+// Begin wraps the transaction with the selection counter.
 func (p *rqTracePool) Begin(ctx context.Context) (pgx.Tx, error) {
 	tx, err := p.Pool.Begin(ctx)
 	if err != nil {
@@ -86,8 +89,8 @@ func (p *rqTracePool) Begin(ctx context.Context) (pgx.Tx, error) {
 	return &rqTraceTx{Tx: tx, pool: p}, nil
 }
 
-// rqTraceTx — транзакция-обёртка: тяжёлая выборка выполняется внутри
-// транзакции закрепления плана (renderSelectPending, T-181).
+// rqTraceTx — a transaction wrapper: the heavy selection runs inside
+// the plan pinning transaction (renderSelectPending, T-181).
 type rqTraceTx struct {
 	pgx.Tx
 	pool *rqTracePool
@@ -100,10 +103,11 @@ func (t *rqTraceTx) Query(ctx context.Context, sql string, args ...any) (pgx.Row
 	return t.Tx.Query(ctx, sql, args...)
 }
 
-// TestRenderRequeuePass — проход доработки на живых PostgreSQL/Redis:
-// долг есть — публикует и снимает; счётчик 0 — тяжёлая выборка не
-// выполняется; снятое не выбирается повторно; отсутствие строки
-// счётчика — ошибка; форма плана закреплена (seq scan).
+// TestRenderRequeuePass — the finish-up pass on live PostgreSQL/Redis:
+// there is debt — publishes and clears; the counter 0 — the heavy
+// selection is not run; the cleared ones are not selected again; a
+// missing counter row — an error; the plan shape is pinned (a seq
+// scan).
 func TestRenderRequeuePass(t *testing.T) {
 	skipUnlessIntegration(t)
 	ctx := context.Background()
@@ -131,19 +135,20 @@ func TestRenderRequeuePass(t *testing.T) {
 		t.Fatalf("OpenPackStore: %v", err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
-	// watermark 0 — ёмкость всегда есть (HasCapacity без Redis): проход
-	// не упирается в ворота, проверяется выборка и guard (T-181).
+	// watermark 0 — there is always capacity (HasCapacity without
+	// Redis): the pass does not hit the gate, the selection and the
+	// guard are checked (T-181).
 	gate := queue.NewBackpressureGate(rdb, queue.BackpressureOptions{})
 	renderQ, err := httpworker.NewRenderQueue(q, gate, 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// Форма плана закреплена (§4.2 ТЗ T-181): внутри транзакции SET LOCAL
-	// (все индексные формы отключены) EXPLAIN показывает seq scan по
-	// domains, индексных узлов нет. PG16 печатает листовую партицию
-	// («Seq Scan on domains_default d»), PG17+ — родителя («Seq Scan on
-	// d»): регулярка покрывает обе формы записи.
+	// The plan shape is pinned (§4.2 of the T-181 spec): inside the
+	// SET LOCAL transaction (all index forms disabled) EXPLAIN shows a
+	// seq scan over domains, no index nodes. PG16 prints the leaf
+	// partition ("Seq Scan on domains_default d"), PG17+ — the parent
+	// ("Seq Scan on d"): the regexp covers both spellings.
 	t.Run("план выборки закреплён SET LOCAL", func(t *testing.T) {
 		tx, err := pool.Begin(ctx)
 		if err != nil {
@@ -184,9 +189,10 @@ func TestRenderRequeuePass(t *testing.T) {
 		}
 	})
 
-	// Долг: домен с флагом и SPA-записью; счётчик выравнивается вручную
-	// (сид — прямой INSERT, пара бит+счётчик ведёт код; инвариант
-	// бэкфилла миграции 000015: счётчик = число строк с битом).
+	// Debt: a domain with the flag and an SPA record; the counter is
+	// aligned by hand (the seed is a direct INSERT, the code keeps the
+	// bit+counter pair; the backfill invariant of migration 000015:
+	// the counter = the number of rows with the bit).
 	var zone int16
 	if err := pool.QueryRow(ctx,
 		"INSERT INTO zones (name) VALUES ('requeue.test') RETURNING id",
@@ -261,9 +267,9 @@ func TestRenderRequeuePass(t *testing.T) {
 	})
 
 	t.Run("повторный проход не выбирает снятое", func(t *testing.T) {
-		// Рассинхрон counter > 0 при снятых флагах (граница доверия
-		// guard, ТЗ T-181 §4.3): один холостой seq scan за проход —
-		// выборка пуста, снятое не переиздаётся.
+	// The counter desync > 0 with the flags cleared (the guard trust
+	// boundary, the T-181 §4.3 spec): one idle seq scan per pass — the
+	// selection is empty, the cleared ones are not re-published.
 		if _, err := pool.Exec(ctx,
 			"UPDATE crawler_counters SET value = 1 WHERE name = 'render_pending'"); err != nil {
 			t.Fatal(err)
@@ -294,14 +300,15 @@ func TestRenderRequeuePass(t *testing.T) {
 	})
 }
 
-// TestRenderRequeueFailedMarker — маркер «рендер невозможен»
-// subdomain_results.render_failed_at (T-210, миграция 000017) на живых
-// PostgreSQL/Redis: штамп финализации (SQL — литерал
-// internal/renderworker/worker.go, дублирование — стиль schema_test.go;
-// охраны content_hash/rendered, идемпотентность) исключает запись из
-// выборки прохода (публикаций нет, флаг снимается без публикации —
-// «черновой»), перезапись эпизода (DELETE + INSERT записи результата,
-// T-058) сбрасывает маркер — следующий проход переиздаёт запись.
+// TestRenderRequeueFailedMarker — the "render is impossible" marker
+// subdomain_results.render_failed_at (T-210, migration 000017) on live
+// PostgreSQL/Redis: the finalization stamp (the SQL — a literal from
+// internal/renderworker/worker.go, the duplication — the
+// schema_test.go style; the content_hash/rendered guards,
+// idempotency) excludes the record from the pass selection (no
+// publications, the flag is cleared without a publication — a "draft"),
+// an episode rewrite (a DELETE + INSERT of the result record, T-058)
+// resets the marker — the next pass re-publishes the record.
 func TestRenderRequeueFailedMarker(t *testing.T) {
 	skipUnlessIntegration(t)
 	ctx := context.Background()
@@ -334,9 +341,9 @@ func TestRenderRequeueFailedMarker(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// renderFailMarkerSQL — литерал internal/renderworker/worker.go
-	// (renderFailMarkerSQL, T-210): расхождение кода и теста видно по
-	// поведению охран ниже.
+	// renderFailMarkerSQL — a literal from internal/renderworker/worker.go
+	// (renderFailMarkerSQL, T-210): a code-vs-test divergence is visible
+	// from the behavior of the guards below.
 	const markerSQL = "UPDATE subdomain_results AS r " +
 		"SET render_failed_at = coalesce(r.render_failed_at, now()) " +
 		"WHERE r.zone_id = $1::int2 AND r.domain_id = $2::int8 " +
@@ -344,7 +351,7 @@ func TestRenderRequeueFailedMarker(t *testing.T) {
 		"AND r.rendered = false " +
 		"AND r.content_hash IS NOT DISTINCT FROM $5::bytea"
 
-	// Сид: домен с флагом долга и SPA-записью.
+	// Seed: a domain with the debt flag and an SPA record.
 	var zone int16
 	if err := pool.QueryRow(ctx,
 		"INSERT INTO zones (name) VALUES ('failed.test') RETURNING id",
@@ -406,8 +413,9 @@ func TestRenderRequeueFailedMarker(t *testing.T) {
 			t.Fatalf("render_failed_at после штампа: %v err=%v", m, err)
 		}
 
-		// Повторная финализация (сбой публикации вернул доставку) —
-		// RowsAffected 1, штамп ПЕРВОЙ финализации сохраняется (coalesce).
+		// A repeated finalization (a publish failure returned the
+		// delivery) — RowsAffected 1, the stamp of the FIRST finalization
+		// is kept (coalesce).
 		if tag, _ := pool.Exec(ctx, markerSQL, zone, id, int16(0), int16(0), put.Hash[:]); tag.RowsAffected() != 1 {
 			t.Fatalf("повторный штамп: RowsAffected = %d, хочу 1 (идемпотентность)", tag.RowsAffected())
 		}
@@ -415,8 +423,8 @@ func TestRenderRequeueFailedMarker(t *testing.T) {
 			t.Fatalf("штамп переставлен повтором: %v (err=%v), хочу первую финализацию %v", m2, err, m)
 		}
 
-		// Охрана контента: новый эпизод переписал content_hash — штамп
-		// старой доставкой не ставится и не трогается.
+		// The content guard: a new episode rewrote content_hash — the
+		// old delivery's stamp is not set and not touched.
 		fresh := put.Hash
 		fresh[0] ^= 0xff
 		if _, err := pool.Exec(ctx,
@@ -431,8 +439,9 @@ func TestRenderRequeueFailedMarker(t *testing.T) {
 			t.Fatalf("штамп сбит охраной: %v err=%v", m, err)
 		}
 
-		// Охрана rendered: успешный конкурентный рендер закрыл вопрос —
-		// штамп не ставится и снимается переводом в rendered.
+		// The rendered guard: a successful concurrent render closed the
+		// question — the stamp is not set and is cleared by the
+		// transition to rendered.
 		if _, err := pool.Exec(ctx,
 			"UPDATE subdomain_results SET rendered = true, render_failed_at = NULL "+
 				"WHERE zone_id = $1 AND domain_id = $2", zone, id); err != nil {
@@ -468,8 +477,9 @@ func TestRenderRequeueFailedMarker(t *testing.T) {
 	})
 
 	t.Run("новый эпизод сбрасывает маркер — проход переиздаёт", func(t *testing.T) {
-		// Перезапись эпизода (T-058): DELETE старых строк + INSERT новых;
-		// render_failed_at в INSERT не входит — DEFAULT NULL.
+		// The episode rewrite (T-058): a DELETE of the old rows + an
+		// INSERT of the new ones; render_failed_at is not in the INSERT —
+		// DEFAULT NULL.
 		if _, err := pool.Exec(ctx, "DELETE FROM subdomain_results WHERE zone_id = $1 AND domain_id = $2", zone, id); err != nil {
 			t.Fatalf("DELETE эпизода: %v", err)
 		}
@@ -492,12 +502,14 @@ func TestRenderRequeueFailedMarker(t *testing.T) {
 	})
 }
 
-// TestRenderRequeueZonePriority — приоритет зон прохода доработки (T-184,
-// решение (а) T-176): пачка первой ступени берёт домены зон НЕ из списка
-// render.requeue_deprioritized_zones (даже лежащие дальше по «куче» —
-// вставка .рф первой имитирует прод-раскладку «флаговый долг .рф в начале
-// кучи», T-181), долг зон списка дорабатывается по остаточному принципу;
-// форма плана ступени с фильтром зон — тот же закреплённый seq scan.
+// TestRenderRequeueZonePriority — the zone priority of the finish-up
+// pass (T-184, the T-176 decision (a)): the first-stage batch takes
+// the domains of the zones NOT in the
+// render.requeue_deprioritized_zones list (even those lying further in
+// the "heap" — inserting .рф first imitates the production layout "the
+// .рф flag debt at the head of the heap", T-181), the debt of the list
+// zones is finished up on the leftovers principle; the plan shape of
+// the stage with the zone filter — the same pinned seq scan.
 func TestRenderRequeueZonePriority(t *testing.T) {
 	skipUnlessIntegration(t)
 	ctx := context.Background()
@@ -513,8 +525,9 @@ func TestRenderRequeueZonePriority(t *testing.T) {
 	}
 	t.Cleanup(raw.Close)
 
-	// Форма плана первой ступени (фильтр зоны в JOIN): seq scan по
-	// domains, индексных форм нет — приоритет не тянет патологию T-181.
+	// The first-stage plan shape (the zone filter in the JOIN): a seq
+	// scan over domains, no index forms — the priority does not pull
+	// the T-181 pathology.
 	t.Run("план ступени закреплён SET LOCAL", func(t *testing.T) {
 		tx, err := raw.Begin(ctx)
 		if err != nil {
@@ -576,8 +589,9 @@ func TestRenderRequeueZonePriority(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Долг: домен .рф вставлен ПЕРВЫМ (прод-раскладка кучи), приоритетная
-	// зона — за ним; обе записи SPA (проход обязан опубликовать обе).
+	// Debt: the .рф domain is inserted FIRST (the production heap
+	// layout), the priority zone — after it; both records are SPA (the
+	// pass must publish both).
 	var zoneRF, zonePrio int16
 	if err := pool.QueryRow(ctx, "INSERT INTO zones (name) VALUES ('xn--p1ai') RETURNING id").Scan(&zoneRF); err != nil {
 		t.Fatalf("insert zones: %v", err)
@@ -623,8 +637,8 @@ func TestRenderRequeueZonePriority(t *testing.T) {
 
 	opts := httpworker.RequeueOptions{BatchSize: 1, DeprioritizedZones: []string{"xn--p1ai"}}
 
-	// Проход 1 (пачка 1): первая ступень берёт приоритетную зону, минуя
-	// .рф в начале кучи.
+	// Pass 1 (batch 1): the first stage takes the priority zone,
+	// skipping .рф at the head of the heap.
 	res, err := httpworker.RequeueOnce(ctx, pool, store, renderQ, opts)
 	if err != nil {
 		t.Fatalf("проход 1: %v", err)
@@ -642,7 +656,7 @@ func TestRenderRequeueZonePriority(t *testing.T) {
 		t.Fatal("домен .рф доработан раньше приоритетного — приоритет зон не работает")
 	}
 
-	// Проход 2: первая ступень исчерпана — вторая дорабатывает .рф.
+	// Pass 2: the first stage is exhausted — the second finishes up .рф.
 	res, err = httpworker.RequeueOnce(ctx, pool, store, renderQ, opts)
 	if err != nil {
 		t.Fatalf("проход 2: %v", err)
@@ -657,8 +671,8 @@ func TestRenderRequeueZonePriority(t *testing.T) {
 		t.Fatalf("счётчик долга после дренажа = %d (err=%v), хочу 0", counter, err)
 	}
 
-	// Порядок публикаций q:render: приоритетная зона — первой, .рф — за
-	// ней (даже наоборот порядку вставки в кучу).
+	// The q:render publication order: the priority zone — first, .рф —
+	// after it (even the reverse of the heap insertion order).
 	msgs, err := rdb.XRange(ctx, queue.StreamRender, "-", "+").Result()
 	if err != nil {
 		t.Fatalf("XRANGE %s: %v", queue.StreamRender, err)

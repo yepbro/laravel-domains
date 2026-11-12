@@ -1,14 +1,15 @@
-// Интеграционные тесты сворачивания 2LD-зон в TLD (T-196, ТЗТ §9):
-// на сидированной схеме с миграциями — dry-run ничего не меняет и
-// печатает план, предусловие check_state = 1 отказывает (и --force
-// обходит), --apply переносит все шесть таблиц (домены с доклейкой
-// label, subdomain_results, laravel_domains, laravel_findings,
-// laravel_history, ingest_files с конфликтом дубля), дропает партиции
-// 2LD (зона с партициями и зона в DEFAULT), удаляет строки зон,
-// реконсиляция сводит счётчики, пост-проверки §7.5 зелёные; повторный
-// запуск — no-op; прерванный перенос (сбой после N батчей)
-// продолжается. Зона allowlist не трогается. Прогон — make
-// test-integration.
+// Integration tests of collapsing 2LD zones into the TLD (T-196, the
+// tld-only-zones spec §9): on a seeded schema with migrations — the
+// dry-run changes nothing and prints the plan, the check_state = 1
+// precondition refuses (and --force bypasses it), --apply moves all
+// six tables (domains with the label re-attachment, subdomain_results,
+// laravel_domains, laravel_findings, laravel_history, ingest_files
+// with the duplicate conflict), drops the 2LD partitions (a zone with
+// partitions and a zone in DEFAULT), removes the zone rows, the
+// reconciliation converges the counters, the §7.5 post-checks are
+// green; a repeated run is a no-op; an interrupted transfer (a failure
+// after N batches) resumes. The allowlist zone is not touched. Run —
+// make test-integration.
 package integration
 
 import (
@@ -25,7 +26,7 @@ import (
 	"crawler/internal/migrate"
 )
 
-// collapseSeedZone — зона справочника; возвращает id.
+// collapseSeedZone — a reference-data zone; returns the id.
 func collapseSeedZone(t *testing.T, pool *pgxpool.Pool, name string) int16 {
 	t.Helper()
 	var id int16
@@ -37,9 +38,10 @@ func collapseSeedZone(t *testing.T, pool *pgxpool.Pool, name string) int16 {
 	return id
 }
 
-// collapseSeedDomains — домены зоны с метками prefix<i>; возвращает id
-// по порядку вставки (id выдаёт последовательность domain_id_seq).
-// Первые queued доменов — check_state = 1 (материал предусловия).
+// collapseSeedDomains — the domain rows of a zone with prefix<i>
+// labels; returns the ids in insertion order (the ids come from the
+// domain_id_seq sequence). The first queued domains — check_state = 1
+// (the precondition material).
 func collapseSeedDomains(t *testing.T, pool *pgxpool.Pool, zone int16, prefix string, n, queued int) []int64 {
 	t.Helper()
 	ids := make([]int64, 0, n)
@@ -60,9 +62,9 @@ func collapseSeedDomains(t *testing.T, pool *pgxpool.Pool, zone int16, prefix st
 	return ids
 }
 
-// collapseSeedChildren — по строке результатов/laravel-домена/находки и
-// истории на каждый домен: перенос всех таблиц проверяется по
-// фактическому перебросу zone_id.
+// collapseSeedChildren — a results/laravel-domain/finding row and a
+// history row per domain: the move of all tables is checked by the
+// actual zone_id re-pointing.
 func collapseSeedChildren(t *testing.T, pool *pgxpool.Pool, zone int16, ids []int64) {
 	t.Helper()
 	ctx := context.Background()
@@ -89,7 +91,7 @@ func collapseSeedChildren(t *testing.T, pool *pgxpool.Pool, zone int16, ids []in
 	}
 }
 
-// collapseCount — скалярный счётчик для проверок.
+// collapseCount — a scalar counter for the checks.
 func collapseCount(t *testing.T, pool *pgxpool.Pool, query string, args ...any) int64 {
 	t.Helper()
 	var n int64
@@ -99,7 +101,7 @@ func collapseCount(t *testing.T, pool *pgxpool.Pool, query string, args ...any) 
 	return n
 }
 
-// collapseZoneID — id зоны по имени; found = false — зоны нет.
+// collapseZoneID — the id of a zone by name; found = false — no zone.
 func collapseZoneID(t *testing.T, pool *pgxpool.Pool, name string) (int16, bool) {
 	t.Helper()
 	var id int16
@@ -113,8 +115,9 @@ func collapseZoneID(t *testing.T, pool *pgxpool.Pool, name string) (int16, bool)
 	return id, true
 }
 
-// collapseHasZonePartition — есть ли у таблицы выделенная партиция зоны
-// (граница «FOR VALUES IN (zid)», два варианта записи pg_get_expr).
+// collapseHasZonePartition — whether the table has an extracted zone
+// partition (the "FOR VALUES IN (zid)" bound, two pg_get_expr
+// spellings).
 func collapseHasZonePartition(t *testing.T, pool *pgxpool.Pool, table string, zone int16) bool {
 	t.Helper()
 	for _, p := range tablePartitions(t, pool, table) {
@@ -126,8 +129,9 @@ func collapseHasZonePartition(t *testing.T, pool *pgxpool.Pool, table string, zo
 	return false
 }
 
-// collapseSnapshot — слепок данных для сравнения «до/после»:
-// домены, справочник зон, имена партиций, история.
+// collapseSnapshot — a data imprint for the "before/after" comparison:
+// the domains, the zone reference data, the partition names, the
+// history.
 type collapseSnapshot struct {
 	domains string
 	zones   string
@@ -189,9 +193,10 @@ func collapseTakeSnapshot(t *testing.T, pool *pgxpool.Pool) collapseSnapshot {
 	return s
 }
 
-// collapseSeed — типовой сид сценария: TLD in (с доменом-аборигеном),
-// 2LD 5g.in (5 доменов, выделенные партиции, файлы с конфликтом дубля),
-// 2LD co.uk без партиций (строки в DEFAULT), allowlist-зона crawl.test.
+// collapseSeed — the scenario's typical seed: a TLD in (with a native
+// domain), the 2LD 5g.in (5 domains, extracted partitions, files with
+// a duplicate conflict), the 2LD co.uk without partitions (rows in
+// DEFAULT), the allowlist zone crawl.test.
 func collapseSeed(t *testing.T, pool *pgxpool.Pool) (in, twoLD, coUK, allow int16) {
 	t.Helper()
 	ctx := context.Background()
@@ -211,8 +216,9 @@ func collapseSeed(t *testing.T, pool *pgxpool.Pool) (in, twoLD, coUK, allow int1
 	allowIDs := collapseSeedDomains(t, pool, allow, "keep", 1, 0)
 	collapseSeedChildren(t, pool, allow, allowIDs)
 
-	// Журнал доставки: файл 5g.in, конфликт дубля (то же содержимое уже
-	// доставлялось в in — остаётся строка-владелец) и файл co.uk.
+	// The delivery journal: a 5g.in file, a duplicate conflict (the
+	// same content was already delivered to in — the owner row stays)
+	// and a co.uk file.
 	dup := []byte{0xAA, 0xBB}
 	for i, f := range []struct {
 		zone   int16
@@ -232,18 +238,19 @@ func collapseSeed(t *testing.T, pool *pgxpool.Pool) (in, twoLD, coUK, allow int1
 		}
 	}
 
-	// Выделенные партиции зоны 5g.in (миграция 000003): строки уезжают
-	// из DEFAULT — перенос обязан дропнуть партиции по завершении.
+	// The extracted partitions of the 5g.in zone (migration 000003):
+	// the rows move out of DEFAULT — the transfer must drop the
+	// partitions at the end.
 	callCreateZonePartitions(t, pool, twoLD, 2)
 	return in, twoLD, coUK, allow
 }
 
-// collapseAllowlist — allowlist тестового сида.
+// collapseAllowlist — the allowlist of the test seed.
 var collapseAllowlist = []string{"crawl.test"}
 
-// TestZonesCollapse — полный сценарий §9: dry-run, предусловие, apply
-// (перенос шести таблиц, партиции, дедуп, счётчики, пост-проверки §7.5),
-// повтор — no-op.
+// TestZonesCollapse — the full §9 scenario: a dry-run, the
+// precondition, the apply (the move of the six tables, the partitions,
+// the dedup, the counters, the §7.5 post-checks), a repeat — a no-op.
 func TestZonesCollapse(t *testing.T) {
 	skipUnlessIntegration(t)
 	pool := migratedSchema(t)
@@ -297,8 +304,8 @@ func TestZonesCollapse(t *testing.T) {
 			t.Error("отказ предусловия изменил данные")
 		}
 
-		// Разбор оператором: очередь дренирована — обычный apply обязан
-		// пройти без --force.
+		// The operator triage: the queue is drained — a normal apply must
+		// go through without --force.
 		if _, err := pool.Exec(ctx,
 			`UPDATE domains SET check_state = 0 WHERE zone_id = $1 AND label = 'site0'`, twoLD); err != nil {
 			t.Fatalf("сброс очереди: %v", err)
@@ -307,14 +314,15 @@ func TestZonesCollapse(t *testing.T) {
 
 	t.Run("apply переносит всё и пост-проверки зелёные", func(t *testing.T) {
 		var out strings.Builder
-		// Batch = 2: пять доменов 5g.in идут несколькими батчами —
-		// попутно проверяется путь окон (§7.3) на живой БД.
+		// Batch = 2: the five 5g.in domains go in several batches — the
+		// window path (§7.3) is checked along the way on a live DB.
 		if err := collapse.Run(ctx, pool, collapse.Options{Allowlist: collapseAllowlist, Apply: true, Batch: 2}, &out); err != nil {
 			t.Fatalf("apply: %v", err)
 		}
 		got := out.String()
 
-		// Зоны: 2LD удалены, TLD созданы, allowlist жив.
+		// Zones: the 2LD ones removed, the TLD created, the allowlist
+		// alive.
 		if _, ok := collapseZoneID(t, pool, "5g.in"); ok {
 			t.Error("строка зоны 5g.in не удалена")
 		}
@@ -329,8 +337,8 @@ func TestZonesCollapse(t *testing.T) {
 			t.Error("allowlist-зона crawl.test затронута")
 		}
 
-		// Домены: зона TLD, label с доклейкой префикса; абориген in
-		// и allowlist-домен не тронуты.
+		// Domains: the TLD zone, the label with the prefix re-attached;
+		// the in native and the allowlist domain are untouched.
 		var n int64
 		if n = collapseCount(t, pool,
 			`SELECT count(*) FROM domains WHERE zone_id = $1 AND label LIKE 'site%.5g'`, in); n != 5 {
@@ -347,7 +355,8 @@ func TestZonesCollapse(t *testing.T) {
 			t.Errorf("allowlist-домен keep0: %d, хочу 1 (не тронут)", n)
 		}
 
-		// Дети и история: переброшены по zone_id (join по domain_id).
+		// The children and the history: re-pointed by zone_id (a join by
+		// domain_id).
 		for table, want := range map[string]int64{
 			`SELECT count(*) FROM subdomain_results r JOIN domains d ON d.id = r.domain_id AND d.zone_id = r.zone_id
 			 WHERE r.zone_id = $1`: 5,
@@ -365,8 +374,8 @@ func TestZonesCollapse(t *testing.T) {
 			t.Errorf("laravel_history зоны in: %d, хочу 5", n)
 		}
 
-		// ingest_files: дубль 5g.in удалён (владелец в in остался),
-		// прочие перепривязаны к TLD.
+		// ingest_files: the 5g.in duplicate is removed (the owner in in
+		// stayed), the others are re-bound to the TLD.
 		if n = collapseCount(t, pool,
 			`SELECT count(*) FROM ingest_files WHERE sha256 = $1`, []byte{0xAA, 0xBB}); n != 1 {
 			t.Errorf("строк журнала с дублем содержимого: %d, хочу 1 (владелец в in)", n)
@@ -380,7 +389,8 @@ func TestZonesCollapse(t *testing.T) {
 			t.Errorf("файлов осталось в 2LD-зонах: %d, хочу 0", n)
 		}
 
-		// Партиции: 2LD дропнуты (включая hash-листья), TLD выделены.
+		// Partitions: the 2LD ones dropped (including the hash leaves),
+		// the TLD extracted.
 		for _, table := range []string{"domains", "subdomain_results", "laravel_domains", "laravel_findings"} {
 			if collapseHasZonePartition(t, pool, table, twoLD) {
 				t.Errorf("%s: партиция 5g.in не дропнута", table)
@@ -396,7 +406,7 @@ func TestZonesCollapse(t *testing.T) {
 			t.Errorf("hash-лист 2LD не дропнут: %s", leaf.name)
 		}
 
-		// Пост-проверки §7.5 — напрямую и из отчёта команды.
+		// The §7.5 post-checks — directly and from the command report.
 		if n = collapseCount(t, pool,
 			`SELECT count(*) FROM zones WHERE name LIKE '%.%' AND name <> ALL($1)`, collapseAllowlist); n != 0 {
 			t.Errorf("2LD-зон вне allowlist: %d, хочу 0", n)
@@ -420,8 +430,8 @@ func TestZonesCollapse(t *testing.T) {
 			}
 		}
 
-		// Счётчики зон = агрегат (реконсиляция шага 8): in содержит
-		// аборигена и пять перенесённых.
+		// The zone counters = the aggregate (the step 8 reconciliation):
+		// in holds the native and the five transferred ones.
 		var total int64
 		if err := pool.QueryRow(ctx,
 			`SELECT domains_total FROM zones WHERE id = $1`, in).Scan(&total); err != nil {
@@ -431,7 +441,8 @@ func TestZonesCollapse(t *testing.T) {
 			t.Errorf("zones.domains_total зоны in = %d, хочу 6 (реконсиляция)", total)
 		}
 
-		// Спот-чек §7.5 — самой SQL-функцией: зона T, label с префиксом.
+		// The §7.5 spot check — by the SQL function itself: the T zone,
+		// the label with the prefix.
 		var zoneName, label string
 		if err := pool.QueryRow(ctx,
 			`SELECT di->'zone'->>'name', di->'domain'->>'label' FROM domain_info('site1.5g.in') di`,
@@ -458,10 +469,11 @@ func TestZonesCollapse(t *testing.T) {
 	})
 }
 
-// TestZonesCollapse_Resume — возобновление после сбоя на середине
-// (§7.1): перенос зоны падает после первого зафиксированного батча
-// (имитация обрыва соединения), повтор Zone по тому же состоянию
-// догоняет без потерь и дублей; итог идентичен однопроходному переносу.
+// TestZonesCollapse_Resume — resuming after a mid-way failure (§7.1):
+// the zone transfer fails after the first committed batch (a connection
+// drop simulation), a repeated Zone over the same state catches up
+// without losses and duplicates; the outcome is identical to the
+// single-pass transfer.
 func TestZonesCollapse_Resume(t *testing.T) {
 	skipUnlessIntegration(t)
 	pool := migratedSchema(t)
@@ -469,8 +481,9 @@ func TestZonesCollapse_Resume(t *testing.T) {
 	twoLD := collapseSeedZone(t, pool, "5g.in")
 	ids := collapseSeedDomains(t, pool, twoLD, "site", 5, 0)
 	collapseSeedChildren(t, pool, twoLD, ids)
-	// Выделенные партиции 2LD-зоны: после сбоя они обязаны оставаться
-	// на месте (перос не завершён), повтор их дропнет.
+	// The extracted 2LD zone partitions: after the failure they must
+	// stay in place (the transfer is not finished), the repeat drops
+	// them.
 	callCreateZonePartitions(t, pool, twoLD, 2)
 
 	spec, err := collapse.SpecOf(collapse.ZoneRow{ID: twoLD, Name: "5g.in"})
@@ -478,10 +491,10 @@ func TestZonesCollapse_Resume(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Соединение, BEGIN которого падает после первого батча: первый
-	// батч фиксируется, второй обрывается — половинчатый перенос.
-	// Release сразу через defer: незакрытое соединение вешает
-	// pool.Close() очистки теста при любом отказе ниже.
+	// A connection whose BEGIN fails after the first batch: the first
+	// batch commits, the second breaks — a half-done transfer. Release
+	// immediately via defer: an unclosed connection hangs the
+	// pool.Close() of the test cleanup on any failure below.
 	conn, err := pool.Acquire(ctx)
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
@@ -500,7 +513,8 @@ func TestZonesCollapse_Resume(t *testing.T) {
 	if moved != 2 || left != 3 {
 		t.Fatalf("после сбоя: перенесено %d, осталось %d; хочу 2/3 (первый батч зафиксирован)", moved, left)
 	}
-	// Строка зоны и партиции на месте — перенос не завершён.
+	// The zone row and the partitions are in place — the transfer is
+	// not finished.
 	if _, ok := collapseZoneID(t, pool, "5g.in"); !ok {
 		t.Fatal("строка зоны удалена до завершения переноса")
 	}
@@ -508,8 +522,9 @@ func TestZonesCollapse_Resume(t *testing.T) {
 		t.Fatal("партиции 2LD дропнуты до завершения переноса")
 	}
 
-	// Повтор тем же кодом (Run): инвентаризация видит зону, moving_ids
-	// пересобирается по остатку, окна идут по оставшимся id.
+	// A repeat by the same code (Run): the inventory sees the zone,
+	// moving_ids is rebuilt over the remainder, the windows walk the
+	// remaining ids.
 	var out strings.Builder
 	if err := collapse.Run(ctx, pool, collapse.Options{Apply: true, Batch: 2}, &out); err != nil {
 		t.Fatalf("возобновление: %v", err)
@@ -537,15 +552,16 @@ func TestZonesCollapse_Resume(t *testing.T) {
 	}
 }
 
-// TestZonesCollapse_Force — семантика предусловия §7.1 целиком: dry-run
-// предупреждает о доменах в очереди, но не отказывает; apply без --force
-// отказывает до переноса; apply --force выполняет перенос.
+// TestZonesCollapse_Force — the §7.1 precondition semantics in full: a
+// dry-run warns about the queued domains but does not refuse; an apply
+// without --force refuses before the transfer; an apply --force
+// performs the transfer.
 func TestZonesCollapse_Force(t *testing.T) {
 	skipUnlessIntegration(t)
 	pool := migratedSchema(t)
 	ctx := context.Background()
 	twoLD := collapseSeedZone(t, pool, "5g.in")
-	ids := collapseSeedDomains(t, pool, twoLD, "site", 2, 2) // оба в очереди
+	ids := collapseSeedDomains(t, pool, twoLD, "site", 2, 2) // both queued
 	collapseSeedChildren(t, pool, twoLD, ids)
 
 	t.Run("dry-run предупреждает, но не отказывает", func(t *testing.T) {
@@ -595,9 +611,9 @@ func TestZonesCollapse_Force(t *testing.T) {
 	})
 }
 
-// collapseFlakyConn — соединение переноса с ограничением числа BEGIN:
-// после allowBegin успешных транзакций BEGIN падает (имитация обрыва
-// команды на середине, §7.1 «возобновляема»).
+// collapseFlakyConn — a transfer connection with a BEGIN count limit:
+// after allowBegin successful transactions BEGIN fails (a simulation
+// of a mid-way command drop, §7.1 "resumable").
 type collapseFlakyConn struct {
 	*pgxpool.Conn
 	allowBegin int
@@ -612,18 +628,20 @@ func (c *collapseFlakyConn) Begin(ctx context.Context) (pgx.Tx, error) {
 	return c.Conn.Begin(ctx)
 }
 
-// TestZonesCollapse_SmallPoolDeadlock — регрессия дедлока пост-проверок
-// §7.5 (T-217, P2-находка окна T-198, инцидент 29.10): crawlerctl zones
-// collapse открывает пул из ДВУХ соединений (бюджет ТЗ 6.3), соединение
-// переноса удерживается до конца Run (temp-таблица moving_ids, §7.3), а
-// пост-проверки читали первый агрегат (CheckZonesLeftSQL) set'ом,
-// закрывавшимся только в defer PostChecks, — второй запрос
-// (CheckOrphansSQL) ждал третье соединение вечно: сервер выполнил
-// CheckZonesLeftSQL (сессия idle in ClientRead, результат не потреблён
-// клиентом), transfer-соединение висело за DELETE FROM zones, процесс
-// стоял в ожидании пула (futex). Тест повторяет контур CLI (MaxConns = 2)
-// и превращает вечное ожидание в FAIL по дедлайну: Run обязан завершиться
-// сам за отведённое время (после фикса — секунды), зависание — падение.
+// TestZonesCollapse_SmallPoolDeadlock — the §7.5 post-check deadlock
+// regression (T-217, a P2 finding of the T-198 window, the 2026-10-29
+// incident): crawlerctl zones collapse opens a pool of TWO connections
+// (the spec 6.3 budget), the transfer connection is held until the end
+// of Run (the moving_ids temp table, §7.3), and the post-checks read
+// the first aggregate (CheckZonesLeftSQL) as a set closed only in
+// defer PostChecks — the second query (CheckOrphansSQL) waited for a
+// third connection forever: the server had executed CheckZonesLeftSQL
+// (the session idle in ClientRead, the result unconsumed by the
+// client), the transfer connection hung on DELETE FROM zones, the
+// process stood waiting for the pool (futex). The test repeats the CLI
+// contour (MaxConns = 2) and turns the eternal wait into a FAIL by
+// deadline: Run must finish on its own within the allotted time
+// (seconds after the fix), a hang — a failure.
 func TestZonesCollapse_SmallPoolDeadlock(t *testing.T) {
 	skipUnlessIntegration(t)
 	dsn, cleanup := withTestSchema(t)
@@ -635,7 +653,7 @@ func TestZonesCollapse_SmallPoolDeadlock(t *testing.T) {
 	if err != nil {
 		t.Fatalf("разбор DSN: %v", err)
 	}
-	cfg.MaxConns = 2 // контур CLI: crawlerctl zones collapse (PoolSize = 2)
+	cfg.MaxConns = 2 // the CLI contour: crawlerctl zones collapse (PoolSize = 2)
 	pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
 	if err != nil {
 		t.Fatalf("пул: %v", err)
@@ -646,9 +664,10 @@ func TestZonesCollapse_SmallPoolDeadlock(t *testing.T) {
 	ids := collapseSeedDomains(t, pool, twoLD, "site", 2, 0)
 	collapseSeedChildren(t, pool, twoLD, ids)
 
-	// Run в горутине: зависший прогон детектируется дедлайном, а не
-	// таймаутом go test; cancel развязывает ожидание Acquire (отмена ctx
-	// прерывает его) и возвращает соединения к pool.Close очистки.
+	// Run in a goroutine: a hung run is detected by the deadline, not
+	// the go test timeout; cancel unties the Acquire wait (a ctx
+	// cancellation interrupts it) and returns the connections to the
+	// cleanup pool.Close.
 	runCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
@@ -667,12 +686,13 @@ func TestZonesCollapse_SmallPoolDeadlock(t *testing.T) {
 			t.Errorf("отчёт apply неполон:\n%s", out.String())
 		}
 	case <-time.After(deadline):
-		// Развязать прогон (Acquire чувствует отмену ctx) и ДОЖДАТЬСЯ
-		// возврата соединений до pool.Close очистки: defer Run делает
-		// movingDropSQL на удерживаемом соединении с бюджетом
-		// movingDropTimeout 5 с (T-229) — если подвисание когда-нибудь
-		// окажется не в Acquire, ждём не вечно, а grace (10 с покрывает
-		// уборку), и падаем честным FAIL (ревью T-217 P3-2).
+		// Untie the run (Acquire feels the ctx cancellation) and WAIT for
+		// the connections to come back before the cleanup pool.Close:
+		// the Run defer runs movingDropSQL on the held connection with
+		// the movingDropTimeout budget of 5 s (T-229) — if the hang ever
+		// turns out to be not in Acquire, we wait not forever but a
+		// grace (10 s covers the cleanup) and fail with an honest FAIL
+		// (review T-217 P3-2).
 		cancel()
 		const grace = 10 * time.Second
 		select {

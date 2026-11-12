@@ -1,17 +1,20 @@
-// Интеграционные тесты конвейера приёма файлов ingest (T-023; ТЗ 11.2,
-// 5.1): путь «файл на диске в incoming → конвейер internal/ingest →
-// записи в zones/domains/ingest_files + перемещение файла в
-// processed/failed» против живого PostgreSQL с настоящей схемой миграций.
+// Integration tests of the file ingest pipeline (T-023; spec 11.2,
+// 5.1): the path "a file on disk in incoming → the internal/ingest
+// pipeline → records in zones/domains/ingest_files + moving the file
+// to processed/failed" against live PostgreSQL with the real migration
+// schema.
 //
-// Уровень: сквозной конвейер Pipeline (T-021) с реальными SQL-хранилищами
-// (SQLZoneStore, SQLFileStore, COPY в staging, применение add/delete) —
-// их поведение против живой БД здесь и проверяется. Наблюдение каталога
-// (fsnotify, стабильность файла) — юнит-территория T-013: конвейер
-// получает готовый путь, как его выдаёт наблюдатель (cmd/ingest).
+// Level: the end-to-end Pipeline (T-021) with real SQL stores
+// (SQLZoneStore, SQLFileStore, COPY into staging, applying add/delete)
+// — their behavior against the live DB is what is checked here.
+// Directory watching (fsnotify, file stability) — the T-013 unit
+// territory: the pipeline receives a ready path, the way the watcher
+// (cmd/ingest) produces it.
 //
-// Изоляция: каждая проверка накатывает миграции в собственную схему
-// (migratedSchema, как тесты схемы) — повторный прогон идемпотентен,
-// рабочая схема crawler не затрагивается. Каталог incoming — t.TempDir.
+// Isolation: each check applies migrations in its own schema
+// (migratedSchema, like the schema tests) — a repeated run is
+// idempotent, the working crawler schema is not touched. The incoming
+// directory — t.TempDir.
 package integration
 
 import (
@@ -33,9 +36,9 @@ import (
 	"crawler/internal/model"
 )
 
-// ingestEnv — окружение проверки приёма: схема с миграциями, каталог
-// incoming (t.TempDir) и конвейер на реальных SQL-хранилищах — та же
-// сборка, что делает cmd/ingest.
+// ingestEnv — the ingest check environment: a schema with migrations,
+// an incoming directory (t.TempDir) and a pipeline on real SQL stores —
+// the same build cmd/ingest makes.
 type ingestEnv struct {
 	pool *pgxpool.Pool
 	dir  string // incoming
@@ -53,12 +56,13 @@ func newIngestEnv(t *testing.T) *ingestEnv {
 		pool,
 		ingest.PipelineOptions{
 			Dir: dir,
-			// Маленькая пачка COPY: файл из десятков строк грузится
-			// несколькими пачками, как большие файлы в проде.
+			// A small COPY batch: a file of dozens of lines is loaded
+			// by several batches, like big files in production.
 			BatchSize: 4,
-			// Тестовые зоны — многоуровневые (crawl.test, проверка.test
-			// в acceptance): каталоги приёма допустимы через allowlist
-			// (ТЗТ tld-only-zones §5.1), как конфиг testbed в проде.
+			// Test zones are multi-level (crawl.test, the IDN one in
+			// acceptance): ingest directories are allowed through an
+			// allowlist (the tld-only-zones spec §5.1), like the
+			// testbed config in production.
 			AllowedZonePaths: []string{"crawl.test", accIDNZone},
 		},
 	)
@@ -68,8 +72,8 @@ func newIngestEnv(t *testing.T) *ingestEnv {
 	return &ingestEnv{pool: pool, dir: dir, pipe: pipe}
 }
 
-// putFile пишет файл rel (относительно incoming) с содержимым content и
-// возвращает абсолютный путь.
+// putFile writes the file rel (relative to incoming) with the content
+// and returns the absolute path.
 func (e *ingestEnv) putFile(t *testing.T, rel, content string) string {
 	t.Helper()
 	abs := filepath.Join(e.dir, filepath.FromSlash(rel))
@@ -82,9 +86,10 @@ func (e *ingestEnv) putFile(t *testing.T, rel, content string) string {
 	return abs
 }
 
-// process пишет файл и прогоняет его через конвейер. Ошибка возврата —
-// только инфраструктурный сбой (файл остался в incoming); плановые итоги
-// (applied/duplicate/failed) проверяются по Outcome.
+// process writes a file and runs it through the pipeline. A returned
+// error — only an infrastructure failure (the file stayed in incoming);
+// the planned outcomes (applied/duplicate/failed) are checked by the
+// Outcome.
 func (e *ingestEnv) process(t *testing.T, rel, content string) ingest.Outcome {
 	t.Helper()
 	out, err := e.pipe.Process(context.Background(), e.putFile(t, rel, content))
@@ -94,12 +99,12 @@ func (e *ingestEnv) process(t *testing.T, rel, content string) ingest.Outcome {
 	return out
 }
 
-// fileContent собирает содержимое файла с завершающим переводом строки.
+// fileContent assembles file content with a trailing newline.
 func fileContent(lines ...string) string {
 	return strings.Join(lines, "\n") + "\n"
 }
 
-// domainState — наблюдаемые колонки domains.
+// domainState — the observable domains columns.
 type domainState struct {
 	label      string
 	status     int16
@@ -108,7 +113,7 @@ type domainState struct {
 	queuedAt   *time.Time
 }
 
-// domain читает домен по punycode-имени зоны и метке.
+// domain reads a domain by the zone punycode name and the label.
 func (e *ingestEnv) domain(t *testing.T, zone, label string) (domainState, bool) {
 	t.Helper()
 	var d domainState
@@ -126,15 +131,15 @@ func (e *ingestEnv) domain(t *testing.T, zone, label string) (domainState, bool)
 	return d, true
 }
 
-// zoneState — наблюдаемые колонки zones.
+// zoneState — the observable zones columns.
 type zoneState struct {
 	id       int16
 	name     string
-	unicode  string // '' при NULL
+	unicode  string // '' when NULL
 	isActive bool
 }
 
-// zone читает строку zones по punycode-имени.
+// zone reads a zones row by the punycode name.
 func (e *ingestEnv) zone(t *testing.T, name string) (zoneState, bool) {
 	t.Helper()
 	var z zoneState
@@ -150,9 +155,9 @@ func (e *ingestEnv) zone(t *testing.T, name string) (zoneState, bool) {
 	return z, true
 }
 
-// fileRecordState — колонки отчёта ingest_files. Конвейер пишет их
-// всегда (nullable в схеме ТЗ 6.1 — для ручных вставок), NULL в живой
-// записи — ошибка проверки.
+// fileRecordState — the ingest_files report columns. The pipeline
+// always writes them (nullable in the spec 6.1 schema — for manual
+// inserts); NULL in a live record — a check error.
 type fileRecordState struct {
 	zoneID     int16
 	action     int16
@@ -164,7 +169,7 @@ type fileRecordState struct {
 	rejected   int64
 }
 
-// fileBySHA читает строку журнала ingest_files по хэшу содержимого.
+// fileBySHA reads the ingest_files journal row by the content hash.
 func (e *ingestEnv) fileBySHA(t *testing.T, sha []byte) (fileRecordState, bool) {
 	t.Helper()
 	var f fileRecordState
@@ -181,7 +186,7 @@ func (e *ingestEnv) fileBySHA(t *testing.T, sha []byte) (fileRecordState, bool) 
 	return f, true
 }
 
-// countOf — строк в таблице тестовой схемы.
+// countOf — the number of rows in a table of the test schema.
 func (e *ingestEnv) countOf(t *testing.T, table string) int {
 	t.Helper()
 	var n int
@@ -191,7 +196,7 @@ func (e *ingestEnv) countOf(t *testing.T, table string) int {
 	return n
 }
 
-// existsOnDisk — путь существует.
+// existsOnDisk — the path exists.
 func existsOnDisk(t *testing.T, path string) bool {
 	t.Helper()
 	_, err := os.Lstat(path)
@@ -201,22 +206,22 @@ func existsOnDisk(t *testing.T, path string) bool {
 	return err == nil
 }
 
-// TestIngest_AddCreatesZonesAndDomains — сценарий «файл в incoming →
-// записи в БД» (ТЗ 11.2, 5.1): add-файл создаёт зону автоматически,
-// строки становятся доменами (new/pending, is_idn у IDN-меток), отчёт
-// пишется в ingest_files (sha256, счётчики), файл уходит в processed
-// с сохранением структуры.
+// TestIngest_AddCreatesZonesAndDomains — the "file in incoming →
+// records in the DB" scenario (spec 11.2, 5.1): an add-file creates
+// the zone automatically, the rows become domains (new/pending, is_idn
+// on IDN labels), the report is written to ingest_files (sha256,
+// counters), the file moves to processed keeping the structure.
 func TestIngest_AddCreatesZonesAndDomains(t *testing.T) {
 	skipUnlessIntegration(t)
 	env := newIngestEnv(t)
 
 	content := fileContent(
-		"example.crawl.test", // валидная строка
-		"# комментарий",      // пропущена парсером
-		"",                   // пустая — тоже
-		"сайт.crawl.test",    // IDN: метка в punycode, бит is_idn (ТЗ 5.2 п. 9)
+		"example.crawl.test", // a valid line
+		"# комментарий",      // skipped by the parser
+		"",                   // an empty one — too
+		"сайт.crawl.test",    // IDN: the label in punycode, the is_idn bit (spec 5.2 item 9)
 		"shop.crawl.test",
-		"example.crawl.test", // повтор строки: валидна, дедуп — на стороне БД
+		"example.crawl.test", // a repeated line: valid, dedup — on the DB side
 	)
 	sha := sha256.Sum256([]byte(content))
 	out := env.process(t, "crawl.test/add/list.txt", content)
@@ -224,7 +229,7 @@ func TestIngest_AddCreatesZonesAndDomains(t *testing.T) {
 		t.Fatalf("итог = %q, want applied", out.Kind)
 	}
 
-	// Зона создана автоматически при первом файле (ТЗ 5.1).
+	// The zone is created automatically on the first file (spec 5.1).
 	z, ok := env.zone(t, "crawl.test")
 	if !ok {
 		t.Fatal("зона crawl.test не создана")
@@ -239,8 +244,9 @@ func TestIngest_AddCreatesZonesAndDomains(t *testing.T) {
 		t.Errorf("зон = %d, want 1", n)
 	}
 
-	// Три уникальных домена (повтор строки не создаёт дубль), все новые
-	// и в ожидании проверки (ТЗ 6.2), без lease.
+	// Three unique domains (a repeated line does not create a
+	// duplicate), all new and pending a check (spec 6.2), without a
+	// lease.
 	if n := env.countOf(t, "domains"); n != 3 {
 		t.Errorf("доменов = %d, want 3", n)
 	}
@@ -260,10 +266,11 @@ func TestIngest_AddCreatesZonesAndDomains(t *testing.T) {
 		}
 	}
 
-	// IDN-домен: метка в punycode (ТЗ 5.2), бит is_idn (ТЗ 5.2 п. 9).
-	// Зона пути crawl.test не входит в PSL, поэтому Label результата
-	// нормализации составной — метка без зоны пути отрезается вручную
-	// (как это делает валидатор T-016).
+	// The IDN domain: the label in punycode (spec 5.2), the is_idn bit
+	// (spec 5.2 item 9). The crawl.test path zone is not in the PSL, so
+	// the Label of the normalization result is compound — the label
+	// without the path zone is cut off manually (the way the T-016
+	// validator does).
 	res, err := idn.Normalize("сайт.crawl.test")
 	if err != nil {
 		t.Fatal(err)
@@ -280,7 +287,8 @@ func TestIngest_AddCreatesZonesAndDomains(t *testing.T) {
 		t.Errorf("у метки %s нет бита is_idn", label)
 	}
 
-	// Отчёт в журнале (ТЗ 6.1): sha256 содержимого и счётчики.
+	// The report in the journal (spec 6.1): the sha256 of the content
+	// and the counters.
 	f, ok := env.fileBySHA(t, sha[:])
 	if !ok {
 		t.Fatal("отчёт файла не записан в ingest_files")
@@ -296,8 +304,8 @@ func TestIngest_AddCreatesZonesAndDomains(t *testing.T) {
 		t.Errorf("запись ingest_files = %+v, want %+v", f, want)
 	}
 
-	// Файл покинул incoming и лёг в processed с сохранением структуры
-	// (ТЗ 5.1); партия staging очищена.
+	// The file left incoming and landed in processed keeping the
+	// structure (spec 5.1); the staging batch is cleared.
 	if !existsOnDisk(t, filepath.Join(env.dir, ingest.DirProcessed, "crawl.test/add/list.txt")) {
 		t.Error("файл не перемещён в processed/crawl.test/add/list.txt")
 	}
@@ -309,10 +317,10 @@ func TestIngest_AddCreatesZonesAndDomains(t *testing.T) {
 	}
 }
 
-// TestIngest_UnicodeZoneDirectory — каталог зоны в unicode и в punycode —
-// одна зона (ТЗ 5.1, 11.4 п. 1): zones.name — punycode, name_unicode —
-// unicode-форма для отображения; файлы из обоих каталогов сходятся в
-// одну строку zones без дублей.
+// TestIngest_UnicodeZoneDirectory — a zone directory in unicode and in
+// punycode — one zone (spec 5.1, 11.4 item 1): zones.name — punycode,
+// name_unicode — the unicode form for display; files from both
+// directories converge into one zones row without duplicates.
 func TestIngest_UnicodeZoneDirectory(t *testing.T) {
 	skipUnlessIntegration(t)
 	env := newIngestEnv(t)
@@ -322,8 +330,9 @@ func TestIngest_UnicodeZoneDirectory(t *testing.T) {
 		t.Fatalf("итог = %q, want applied", out.Kind)
 	}
 
-	// Зона создана в punycode-форме; xn--80adxhks — устоявшаяся
-	// punycode-форма «москва» (независимый якорь против idn.Normalize).
+	// The zone is created in punycode form; xn--80adxhks is the
+	// established punycode form of "москва" (an independent anchor
+	// against idn.Normalize).
 	z, ok := env.zone(t, "xn--80adxhks")
 	if !ok {
 		t.Fatal("зона москва (xn--80adxhks) не создана")
@@ -332,8 +341,8 @@ func TestIngest_UnicodeZoneDirectory(t *testing.T) {
 		t.Errorf("зона = %q/%q, want xn--80adxhks/москва", z.name, z.unicode)
 	}
 
-	// IDN-домен: метка punycode + бит is_idn; unicode-имя файла роли
-	// не играет.
+	// The IDN domain: a punycode label + the is_idn bit; the unicode
+	// file name plays no role.
 	res, err := idn.Normalize("сайт.москва")
 	if err != nil {
 		t.Fatal(err)
@@ -346,8 +355,8 @@ func TestIngest_UnicodeZoneDirectory(t *testing.T) {
 		t.Error("у IDN-метки нет бита is_idn")
 	}
 
-	// Файл из punycode-каталога той же зоны — та же строка zones,
-	// дублей зон не возникает (ТЗ 11.4 п. 1).
+	// A file from the punycode directory of the same zone — the same
+	// zones row, no zone duplicates arise (spec 11.4 item 1).
 	out = env.process(t, "xn--80adxhks/add/second.txt", fileContent("third.москва"))
 	if out.Kind != ingest.OutcomeApplied {
 		t.Fatalf("итог = %q, want applied", out.Kind)
@@ -363,10 +372,10 @@ func TestIngest_UnicodeZoneDirectory(t *testing.T) {
 	}
 }
 
-// TestIngest_DuplicateFileSkipped — повтор того же файла (тот же sha256)
-// уже в журнале: повторная обработка безопасна (ТЗ 5.1) — применение не
-// выполняется, новых строк нет, файл уходит в processed без второй
-// записи ingest_files.
+// TestIngest_DuplicateFileSkipped — a repeat of the same file (the same
+// sha256) already in the journal: re-processing is safe (spec 5.1) —
+// the apply is not performed, no new rows, the file moves to processed
+// without a second ingest_files record.
 func TestIngest_DuplicateFileSkipped(t *testing.T) {
 	skipUnlessIntegration(t)
 	env := newIngestEnv(t)
@@ -377,7 +386,7 @@ func TestIngest_DuplicateFileSkipped(t *testing.T) {
 		t.Fatalf("первая обработка: итог = %q, want applied", out.Kind)
 	}
 
-	// Та же копия файла появляется в incoming снова.
+	// The same copy of the file appears in incoming again.
 	out = env.process(t, "crawl.test/add/list.txt", content)
 	if out.Kind != ingest.OutcomeDuplicate {
 		t.Fatalf("повторная обработка: итог = %q, want duplicate", out.Kind)
@@ -389,7 +398,8 @@ func TestIngest_DuplicateFileSkipped(t *testing.T) {
 		t.Errorf("доменов = %d, want 2 (дубль не применяется)", n)
 	}
 
-	// Оба экземпляра файла в архиве: коллизия имён — суффикс -2 (T-021).
+	// Both file instances are in the archive: a name collision — the
+	// -2 suffix (T-021).
 	proc := filepath.Join(env.dir, ingest.DirProcessed, "crawl.test/add")
 	for _, name := range []string{"list.txt", "list-2.txt"} {
 		if !existsOnDisk(t, filepath.Join(proc, name)) {
@@ -398,10 +408,10 @@ func TestIngest_DuplicateFileSkipped(t *testing.T) {
 	}
 }
 
-// TestIngest_ModifiedFileSamePath — изменённый файл по тому же пути
-// (другой sha256) с пересечением и новыми доменами: существующие не
-// меняются, новые добавляются (ТЗ 5.1: «существующий домен не меняется,
-// кроме случая статуса deleted»).
+// TestIngest_ModifiedFileSamePath — a modified file at the same path (a
+// different sha256) with an overlap and new domains: the existing ones
+// are not changed, the new ones are added (spec 5.1: "an existing
+// domain is not changed, except for the deleted status case").
 func TestIngest_ModifiedFileSamePath(t *testing.T) {
 	skipUnlessIntegration(t)
 	env := newIngestEnv(t)
@@ -411,8 +421,8 @@ func TestIngest_ModifiedFileSamePath(t *testing.T) {
 		t.Fatalf("первая обработка: итог = %q, want applied", out.Kind)
 	}
 
-	// example «прошёл» проверку: статус/состояние сменил не ingest —
-	// повторный add не должен их затирать.
+	// example has "passed" the check: ingest did not change the
+	// status/state — a repeated add must not overwrite them.
 	if _, err := env.pool.Exec(context.Background(), `
 		UPDATE domains AS d SET status = $1, check_state = $2, queued_at = now()
 		FROM zones AS z WHERE z.id = d.zone_id AND z.name = $3 AND d.label = $4`,
@@ -430,7 +440,7 @@ func TestIngest_ModifiedFileSamePath(t *testing.T) {
 			out.Report.Added, out.Report.Existed, out.Report.Revived)
 	}
 
-	// Существующий домен не тронут: alive/done и lease на месте.
+	// The existing domain is untouched: alive/done and the lease in place.
 	d, ok := env.domain(t, "crawl.test", "example")
 	if !ok {
 		t.Fatal("домен example исчез")
@@ -443,7 +453,7 @@ func TestIngest_ModifiedFileSamePath(t *testing.T) {
 		t.Error("queued_at сброшен у существующего домена")
 	}
 
-	// Новые — как из первого файла: new/pending.
+	// The new ones — as from the first file: new/pending.
 	for _, label := range []string{"blog", "forum"} {
 		d, ok := env.domain(t, "crawl.test", label)
 		if !ok {
@@ -461,9 +471,10 @@ func TestIngest_ModifiedFileSamePath(t *testing.T) {
 	}
 }
 
-// TestIngest_DeleteMarksDeleted — delete-файл переводит перечисленные
-// домены в deleted, домен остаётся в БД (ТЗ 13.1); отсутствующие —
-// not_found в отчёте конвейера (колонки в ingest_files нет, ТЗ 6.1).
+// TestIngest_DeleteMarksDeleted — a delete-file transitions the listed
+// domains to deleted, the domain stays in the DB (spec 13.1); missing
+// ones — not_found in the pipeline report (no column in ingest_files,
+// spec 6.1).
 func TestIngest_DeleteMarksDeleted(t *testing.T) {
 	skipUnlessIntegration(t)
 	env := newIngestEnv(t)
@@ -484,7 +495,7 @@ func TestIngest_DeleteMarksDeleted(t *testing.T) {
 			out.Report.Deleted, out.Report.NotFound)
 	}
 
-	// Домен остаётся в БД со статусом deleted (ТЗ 13.1).
+	// The domain stays in the DB with the deleted status (spec 13.1).
 	d, ok := env.domain(t, "crawl.test", "example")
 	if !ok {
 		t.Fatal("удалённый домен исчез из БД (ТЗ 13.1: остаётся)")
@@ -493,7 +504,7 @@ func TestIngest_DeleteMarksDeleted(t *testing.T) {
 		t.Errorf("example: status = %d, want deleted", d.status)
 	}
 
-	// Не перечисленные в файле домены не тронуты.
+	// The domains not listed in the file are untouched.
 	d, ok = env.domain(t, "crawl.test", "shop")
 	if !ok {
 		t.Fatal("домен shop исчез из БД — delete не удаляет строки (ТЗ 13.1)")
@@ -505,7 +516,8 @@ func TestIngest_DeleteMarksDeleted(t *testing.T) {
 		t.Errorf("доменов = %d, want 2 (строки из БД не удаляются)", n)
 	}
 
-	// Отчёт delete-файла в журнале: действие delete, счётчик удалённых.
+	// The delete-file report in the journal: the delete action, the
+	// deleted counter.
 	f, ok := env.fileBySHA(t, sha[:])
 	if !ok {
 		t.Fatal("отчёт delete-файла не записан")
@@ -518,9 +530,10 @@ func TestIngest_DeleteMarksDeleted(t *testing.T) {
 	}
 }
 
-// TestIngest_ReviveDeletedDomain — возврат удалённого домена add-файлом
-// (ТЗ 5.1: «кроме случая статуса deleted — он возвращается в
-// new/pending»): status → new, check_state → pending, lease сброшен.
+// TestIngest_ReviveDeletedDomain — returning a deleted domain by an
+// add-file (spec 5.1: "except for the deleted status case — it returns
+// to new/pending"): status → new, check_state → pending, the lease is
+// reset.
 func TestIngest_ReviveDeletedDomain(t *testing.T) {
 	skipUnlessIntegration(t)
 	env := newIngestEnv(t)
@@ -529,8 +542,9 @@ func TestIngest_ReviveDeletedDomain(t *testing.T) {
 		fileContent("example.crawl.test")); out.Kind != ingest.OutcomeApplied {
 		t.Fatalf("add: итог = %q, want applied", out.Kind)
 	}
-	// Домен успел уйти в работу до удаления: lease остался у
-	// deleted-домена — возврат обязан его сбросить (pending без lease).
+	// The domain had already gone into work before the deletion: the
+	// lease stayed with the deleted domain — the return must reset it
+	// (pending without a lease).
 	if _, err := env.pool.Exec(context.Background(), `
 		UPDATE domains AS d SET check_state = $1, queued_at = now()
 		FROM zones AS z WHERE z.id = d.zone_id AND z.name = $2 AND d.label = $3`,
@@ -542,8 +556,8 @@ func TestIngest_ReviveDeletedDomain(t *testing.T) {
 		t.Fatalf("delete: итог = %q, want applied", out.Kind)
 	}
 
-	// Другое содержимое — другой sha256 (иначе это был бы дубль файла),
-	// домен тот же.
+	// Different content — a different sha256 (otherwise it would be a
+	// file duplicate), the same domain.
 	out := env.process(t, "crawl.test/add/one.txt",
 		fileContent("example.crawl.test", "# повторная загрузка"))
 	if out.Kind != ingest.OutcomeApplied {
@@ -567,10 +581,11 @@ func TestIngest_ReviveDeletedDomain(t *testing.T) {
 	}
 }
 
-// TestIngest_RejectedLinesWithinThreshold — единичные плохие строки не
-// роняют файл (ТЗ 5.1): чужая зона и битый punycode отклонены и видны в
-// счётчиках отчёта (rejected-причины), валидные строки применены, файл
-// обработан в пределах порога ingest.max_error_ratio.
+// TestIngest_RejectedLinesWithinThreshold — single bad lines do not
+// fail the file (spec 5.1): a foreign zone and broken punycode are
+// rejected and visible in the report counters (the rejected reasons),
+// the valid lines are applied, the file is processed within the
+// ingest.max_error_ratio threshold.
 func TestIngest_RejectedLinesWithinThreshold(t *testing.T) {
 	skipUnlessIntegration(t)
 	env := newIngestEnv(t)
@@ -580,8 +595,8 @@ func TestIngest_RejectedLinesWithinThreshold(t *testing.T) {
 		lines = append(lines, fmt.Sprintf("ok%02d.crawl.test", i))
 	}
 	lines = append(lines,
-		"bad.example.com",  // чужая зона (wrong_zone, ТЗ 5.2 п. 6)
-		"xn--a.crawl.test", // битый punycode (invalid, ТЗ 5.2 п. 3)
+		"bad.example.com",  // a foreign zone (wrong_zone, spec 5.2 item 6)
+		"xn--a.crawl.test", // broken punycode (invalid, spec 5.2 item 3)
 	)
 	content := fileContent(lines...)
 	sha := sha256.Sum256([]byte(content))
@@ -597,7 +612,7 @@ func TestIngest_RejectedLinesWithinThreshold(t *testing.T) {
 		t.Errorf("причины отклонений = %v, want wrong_zone 1, invalid 1", out.Report.Reasons)
 	}
 
-	// Только валидные строки стали доменами.
+	// Only the valid lines became domains.
 	if n := env.countOf(t, "domains"); n != 20 {
 		t.Errorf("доменов = %d, want 20", n)
 	}
@@ -617,30 +632,31 @@ func TestIngest_RejectedLinesWithinThreshold(t *testing.T) {
 	}
 }
 
-// TestIngest_ErrorRatioFailsFile — доля отказов выше
-// ingest.max_error_ratio (ТЗ 5.1, T-016): файл ошибочен целиком — ни одна
-// строка не применяется (включая валидные), записи в ingest_files нет,
-// файл в failed/ с лог-отчётом рядом.
+// TestIngest_ErrorRatioFailsFile — a rejection share above
+// ingest.max_error_ratio (spec 5.1, T-016): the file is wrong as a
+// whole — not a single line is applied (including valid ones), no
+// ingest_files record, the file in failed/ with a log report next to
+// it.
 func TestIngest_ErrorRatioFailsFile(t *testing.T) {
 	skipUnlessIntegration(t)
 	env := newIngestEnv(t)
 
-	// 4 отклонения из 5 содержательных строк = 80% > 10%.
+	// 4 rejections out of 5 content lines = 80% > 10%.
 	content := fileContent(
-		"ok.crawl.test", // валидная — но файл ошибочен целиком
-		"a.example.com", // чужая зона
+		"ok.crawl.test", // valid — but the file is wrong as a whole
+		"a.example.com", // a foreign zone
 		"b.example.com",
 		"c.example.com",
-		"xn--a.crawl.test", // битый punycode
+		"xn--a.crawl.test", // broken punycode
 	)
 	out := env.process(t, "crawl.test/add/dump.txt", content)
 	if out.Kind != ingest.OutcomeFailed {
 		t.Fatalf("итог = %q, want failed (доля отказов выше порога)", out.Kind)
 	}
 
-	// Ни доменов, ни отчёта: партия отброшена, строка журнала не пишется
-	// (T-021: тот же хэш не занимает журнал, исправленный файл можно
-	// загрузить снова).
+	// Neither domains nor a report: the batch is dropped, the journal
+	// row is not written (T-021: the same hash does not occupy the
+	// journal, a fixed file can be loaded again).
 	if n := env.countOf(t, "domains"); n != 0 {
 		t.Errorf("доменов = %d, want 0 (файл ошибочен целиком)", n)
 	}
@@ -651,7 +667,7 @@ func TestIngest_ErrorRatioFailsFile(t *testing.T) {
 		t.Errorf("строк в ingest_stage = %d, want 0 (партия отброшена)", n)
 	}
 
-	// Файл в failed/ с лог-отчётом рядом (ТЗ 5.1).
+	// The file in failed/ with a log report next to it (spec 5.1).
 	failed := filepath.Join(env.dir, ingest.DirFailed, "crawl.test/add/dump.txt")
 	if !existsOnDisk(t, failed) {
 		t.Fatal("файл не перемещён в failed/crawl.test/add/dump.txt")

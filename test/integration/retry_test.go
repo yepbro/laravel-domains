@@ -1,20 +1,21 @@
-// Интеграционные тесты прохода повторных проверок temp_error RetryOnce
-// (T-031; выборка кандидатов seq scan'ом с закреплением плана SET LOCAL —
-// T-191, guard корзинами зрелости retry_mature — T-202, вынос декремента
-// корзин из оператора зон повтора — T-267) против живого
-// PostgreSQL: юнит-тесты retry_test.go проверяют SQL-контракты и
-// последовательность на фейках, здесь — реальное поведение на
-// мигрированной схеме: зрелая когорта temp_error дренируется пачками
-// (назначение повтора по temp_attempts < N, финализация в
-// delegated_no_address по исчерпании), переведённые не выбираются
-// повторно; декременты корзин зануляют guard — тяжёлая выборка не
-// выполняется вовсе (обёртка пула со счётчиком вызовов — предписание ТЗ
-// T-191 §7.2); сегодняшние эпизоды guard не открывают; отсутствие строк
-// корзин — честный ноль; реконсиляция корзин сходится с живым окном.
-// Форма закреплённого плана проверяется EXPLAIN в той же транзакции с
-// SET LOCAL (seq scan по domains, индексные формы отключены). Уровень
-// вызовов — как у соседей: библиотечные вызовы без запуска сервисов;
-// изоляция — withTestSchema.
+// Integration tests of the temp_error re-check pass RetryOnce
+// (T-031; the candidate selection by a seq scan with the plan pinning
+// SET LOCAL — T-191, the guard by the retry_mature maturity buckets —
+// T-202, moving the bucket decrement out of the zone requeue operator
+// — T-267) against live PostgreSQL: the retry_test.go unit tests check
+// the SQL contracts and the sequence on fakes; here — the real
+// behavior on a migrated schema: a mature temp_error cohort is drained
+// by batches (a requeue is assigned by temp_attempts < N, a
+// finalization into delegated_no_address on exhaustion), the
+// transitioned ones are not selected again; the bucket decrements zero
+// the guard — the heavy selection is not run at all (a pool wrapper
+// with a call counter — the T-191 §7.2 spec prescription); today's
+// episodes do not open the guard; missing bucket rows — an honest
+// zero; the bucket reconciliation agrees with the live window. The
+// pinned plan shape is checked by EXPLAIN in the same transaction with
+// SET LOCAL (a seq scan over domains, the index forms disabled). The
+// call level — like the neighbors: library calls without starting
+// services; isolation — withTestSchema.
 package integration
 
 import (
@@ -37,29 +38,29 @@ import (
 	"crawler/internal/scheduler"
 )
 
-// retrySeqScanRe — seq scan по domains (алиас d) в EXPLAIN: PG16 печатает
-// листовую партицию («Seq Scan on domains_default d»), PG17+ — родителя
-// («Seq Scan on d»).
+// retrySeqScanRe — a seq scan over domains (the d alias) in EXPLAIN:
+// PG16 prints the leaf partition ("Seq Scan on domains_default d"),
+// PG17+ — the parent ("Seq Scan on d").
 var retrySeqScanRe = regexp.MustCompile(`Seq Scan on (\w+ )?d\b`)
 
-// retryBatchPrefix — начало retrySelectSQL (литерал
-// internal/scheduler/retry.go, дублирование — стиль schema_test.go):
-// обёртка пула считает вызовы тяжёлой выборки кандидатов — guard T-202
-// обязан держать её за нулевой суммой корзин зрелости. Выборка идёт
-// ВНУТРИ транзакции закрепления плана, потому счётчик живёт в обёртке
-// транзакции.
+// retryBatchPrefix — the beginning of retrySelectSQL (a literal from
+// internal/scheduler/retry.go, the duplication — the schema_test.go
+// style): the pool wrapper counts the heavy candidate selection calls
+// — the T-202 guard must keep it behind a zero sum of maturity
+// buckets. The selection runs INSIDE the plan pinning transaction, so
+// the counter lives in the transaction wrapper.
 const retryBatchPrefix = "SELECT d.zone_id, d.id, d.temp_attempts FROM domains d"
 
-// retryBatchSQL — полный текст выборки для EXPLAIN (LIMIT — литералом:
-// параметр в EXPLAIN требует подготовленного оператора, проверке формы
-// плана литерал безразличен; коды — status temp_error 5, check_state
-// done 2).
+// retryBatchSQL — the full selection text for EXPLAIN (the LIMIT — as
+// a literal: a parameter in EXPLAIN requires a prepared statement, the
+// plan shape check does not care; the codes — status temp_error 5,
+// check_state done 2).
 const retryBatchSQL = retryBatchPrefix +
 	" WHERE d.status = 5 AND d.check_state = 2 AND d.last_checked_at < DATE '2020-01-01' LIMIT 100"
 
-// retryTracePool — RetryDB-обёртка пула: считает вызовы тяжёлой выборки
-// кандидатов (обёртка пула со счётчиком вызовов — предписание ТЗ T-191
-// §7.2).
+// retryTracePool — a RetryDB pool wrapper: counts the heavy candidate
+// selection calls (a pool wrapper with a call counter — the T-191 §7.2
+// spec prescription).
 type retryTracePool struct {
 	*pgxpool.Pool
 
@@ -79,7 +80,7 @@ func (p *retryTracePool) batchCalls() int {
 	return p.batch
 }
 
-// Begin оборачивает транзакцию счётчиком выборки.
+// Begin wraps the transaction with the selection counter.
 func (p *retryTracePool) Begin(ctx context.Context) (pgx.Tx, error) {
 	tx, err := p.Pool.Begin(ctx)
 	if err != nil {
@@ -88,8 +89,8 @@ func (p *retryTracePool) Begin(ctx context.Context) (pgx.Tx, error) {
 	return &retryTraceTx{Tx: tx, pool: p}, nil
 }
 
-// retryTraceTx — транзакция-обёртка: тяжёлая выборка выполняется внутри
-// транзакции закрепления плана (retryCandidates, T-191).
+// retryTraceTx — a transaction wrapper: the heavy selection runs
+// inside the plan pinning transaction (retryCandidates, T-191).
 type retryTraceTx struct {
 	pgx.Tx
 
@@ -103,16 +104,18 @@ func (t *retryTraceTx) Query(ctx context.Context, sql string, args ...any) (pgx.
 	return t.Tx.Query(ctx, sql, args...)
 }
 
-// retryMatureFailPool — RetryDB-обёртка пула: транзакция, чей Exec
-// хвостового декремента корзин зрелости (retryRequeueMatureSQL, второй
-// оператор назначения повтора, T-267) падает — проверка атомарности
-// половины повтора: откатываются и перевод, и декремент.
+// retryMatureFailPool — a RetryDB pool wrapper: the transaction whose
+// Exec of the tail maturity bucket decrement (retryRequeueMatureSQL,
+// the second requeue assignment operator, T-267) fails — a check of
+// the atomicity of the retry half: both the transition and the
+// decrement roll back.
 type retryMatureFailPool struct {
 	*pgxpool.Pool
 }
 
-// retryMatureDecMark — опознаватель декремента корзин в тексте SQL
-// (дублирование литерал — стиль schema_test.go: константа не экспортирована).
+// retryMatureDecMark — the bucket decrement identifier in the SQL text
+// (a literal duplication — the schema_test.go style: the constant is
+// not exported).
 const retryMatureDecMark = "FROM unnest($1::date[]) AS d"
 
 func (p *retryMatureFailPool) Begin(ctx context.Context) (pgx.Tx, error) {
@@ -123,8 +126,8 @@ func (p *retryMatureFailPool) Begin(ctx context.Context) (pgx.Tx, error) {
 	return &retryMatureFailTx{Tx: tx}, nil
 }
 
-// retryMatureFailTx — транзакция-обёртка: Exec декремента корзин
-// зрелости падает, остальное делегируется.
+// retryMatureFailTx — a transaction wrapper: the Exec of the maturity
+// bucket decrement fails, everything else is delegated.
 type retryMatureFailTx struct {
 	pgx.Tx
 }
@@ -136,13 +139,14 @@ func (t *retryMatureFailTx) Exec(ctx context.Context, sql string, args ...any) (
 	return t.Tx.Exec(ctx, sql, args...)
 }
 
-// TestRetryTempErrorPass — проход повторных проверок на живом PostgreSQL:
-// зрелая когорта temp_error дренируется пачками (итерации сходятся,
-// переведённые не выбираются повторно), декременты корзин зрелости
-// (T-202) зануляют guard после дренажа — тяжёлая выборка не выполняется
-// вовсе; сегодняшние эпизоды (незрелые) guard не открывает; отсутствие
-// строк корзин — честный ноль, а не ошибка; реконсиляция корзин
-// сходится с живым окном и вычищает устаревшие.
+// TestRetryTempErrorPass — the re-check pass on live PostgreSQL: a
+// mature temp_error cohort is drained by batches (the iterations
+// converge, the transitioned ones are not selected again), the
+// maturity bucket decrements (T-202) zero the guard after the drain —
+// the heavy selection is not run at all; today's episodes (immature)
+// do not open the guard; missing bucket rows — an honest zero, not an
+// error; the bucket reconciliation agrees with the live window and
+// cleans up stale ones.
 func TestRetryTempErrorPass(t *testing.T) {
 	skipUnlessIntegration(t)
 	ctx := context.Background()
@@ -159,10 +163,10 @@ func TestRetryTempErrorPass(t *testing.T) {
 	t.Cleanup(raw.Close)
 	pool := &retryTracePool{Pool: raw}
 
-	// Форма плана закреплена (§4.2 ТЗ T-191): внутри транзакции SET LOCAL
-	// (все индексные формы отключены) EXPLAIN показывает seq scan по
-	// domains, индексных узлов нет — планировщику запрещён вырожденный
-	// диапазонный скан по частичному domains_recheck_idx.
+	// The plan shape is pinned (§4.2 of the T-191 spec): inside the
+	// SET LOCAL transaction (all index forms disabled) EXPLAIN shows a
+	// seq scan over domains, no index nodes — the planner is forbidden
+	// the degenerate range scan over the partial domains_recheck_idx.
 	t.Run("план выборки закреплён SET LOCAL", func(t *testing.T) {
 		tx, err := pool.Begin(ctx)
 		if err != nil {
@@ -203,13 +207,15 @@ func TestRetryTempErrorPass(t *testing.T) {
 		}
 	})
 
-	// Когорта temp_error: зрелые кандидаты повтора (done + старше окна) —
-	// домены requeue (попыток 1 < N) и final (попыток 3 = N); молодые и
-	// незавершённые кандидатами не являются (окно RetryAfter и
-	// check_state). last_checked_at — date-литералом в прошлом (окно
-	// по умолчанию 24 ч, ТЗ 5.3). Корзину зрелости прошедших суток кладёт
-	// руками (значение — как у реконсиляции T-202: два зрелых кандидата;
-	// сид — прямой INSERT, инкрементов записи прямой INSERT не ведёт).
+	// The temp_error cohort: mature re-check candidates (done + older
+	// than the window) — the requeue domains (1 attempt < N) and final
+	// (3 attempts = N); the young and the unfinished are not candidates
+	// (the RetryAfter window and check_state). last_checked_at — a
+	// date literal in the past (the default window is 24 h, spec 5.3).
+	// The maturity bucket of the past day is placed by hand (the value
+	// — like the T-202 reconciliation: two mature candidates; the seed
+	// is a direct INSERT, a direct INSERT does not keep the record
+	// increments).
 	var zone int16
 	if err := pool.QueryRow(ctx,
 		"INSERT INTO zones (name) VALUES ('retry.test') RETURNING id",
@@ -228,8 +234,8 @@ func TestRetryTempErrorPass(t *testing.T) {
 	}
 	seed("requeue", model.StatusTempError, model.CheckStateDone, "2020-01-01", 1)
 	seed("final", model.StatusTempError, model.CheckStateDone, "2020-01-01", int16(scheduler.DefaultRetryMaxRetries))
-	seed("young", model.StatusTempError, model.CheckStateDone, "2999-01-01", 0)      // моложе окна — не кандидат
-	seed("pending", model.StatusTempError, model.CheckStatePending, "2020-01-01", 0) // ждёт диспетчера — не кандидат
+	seed("young", model.StatusTempError, model.CheckStateDone, "2999-01-01", 0)      // younger than the window — not a candidate
+	seed("pending", model.StatusTempError, model.CheckStatePending, "2020-01-01", 0) // awaiting the dispatcher — not a candidate
 	if _, err := pool.Exec(ctx,
 		"INSERT INTO crawler_counters (name, value) "+
 			"VALUES ('retry_mature:' || to_char(current_date - 1, 'YYYY-MM-DD'), 2)",
@@ -237,8 +243,8 @@ func TestRetryTempErrorPass(t *testing.T) {
 		t.Fatalf("insert crawler_counters: %v", err)
 	}
 
-	// retryMatureSum — guard-сумма корзин прошедших суток (тот же
-	// предикат, что retryMatureSQL планировщика).
+	// retryMatureSum — the guard sum of the past-day buckets (the same
+	// predicate as the scheduler retryMatureSQL).
 	retryMatureSum := func(t *testing.T) int64 {
 		t.Helper()
 		var sum int64
@@ -251,13 +257,14 @@ func TestRetryTempErrorPass(t *testing.T) {
 		return sum
 	}
 
-	// Дренаж пачками по 1 (T-031): BatchSize = 1 — каждая пачка полная,
-	// цикл продолжает итерации до исчерпания; переведённые (pending) и
-	// незрелые не выбираются повторно. Итераций с тяжёлой выборкой — две
-	// (по числу кандидатов): каждый перевод декрементирует корзину
-	// (2 → 1 → 0), нулевой guard останавливает дренаж ДО следующей
-	// выборки (T-202) — пустой тяжёлой выборки здесь не бывает; она —
-	// запасной останов дренажа при дрейфе корзин вверх.
+	// The drain by batches of 1 (T-031): BatchSize = 1 — every batch is
+	// complete, the loop keeps iterating until exhaustion; the
+	// transitioned (pending) and the immature ones are not selected
+	// again. There are two iterations with the heavy selection (one per
+	// candidate): each transition decrements the bucket (2 → 1 → 0),
+	// the zero guard stops the drain BEFORE the next selection (T-202)
+	// — an empty heavy selection does not happen here; it is the
+	// backup stop of the drain when the buckets drift up.
 	t.Run("итерации дренажа сходятся: назначение и финализация", func(t *testing.T) {
 		var logBuf strings.Builder
 		logger := slog.New(slog.NewTextHandler(&logBuf, nil))
@@ -268,13 +275,14 @@ func TestRetryTempErrorPass(t *testing.T) {
 		go func() {
 			done <- scheduler.RetryTempErrors(drainCtx, pool, scheduler.RetryOptions{
 				BatchSize: 1,
-				Interval:  time.Hour, // тик не наступит: всё должен разобрать дренаж
+				Interval:  time.Hour, // the tick never fires: the drain must handle everything
 				Log:       logger,
 			})
 		}()
 
-		// Две полные пачки по 1; ждём двух тяжёлых выборок, третьей быть
-		// не должно (guard закрыт декрементами; Interval = час).
+		// Two complete batches of 1; we wait for two heavy selections,
+		// there must be no third (the guard is closed by the decrements;
+		// Interval = an hour).
 		deadline := time.Now().Add(10 * time.Second)
 		for pool.batchCalls() < 2 {
 			if time.Now().After(deadline) {
@@ -283,7 +291,7 @@ func TestRetryTempErrorPass(t *testing.T) {
 			}
 			time.Sleep(5 * time.Millisecond)
 		}
-		time.Sleep(50 * time.Millisecond) // дренаж обязан остановиться без третьей выборки
+		time.Sleep(50 * time.Millisecond) // the drain must stop without a third selection
 		if n := pool.batchCalls(); n != 2 {
 			t.Fatalf("тяжёлых выборок %d, хочу 2: нулевой guard закрывает дренаж до выборки", n)
 		}
@@ -292,9 +300,9 @@ func TestRetryTempErrorPass(t *testing.T) {
 			t.Fatalf("RetryTempErrors: %v", err)
 		}
 
-		// Состояние когорты: повтор — pending и +1 попытка; итог —
-		// delegated_no_address и сброс счётчика; молодые и незавершённые
-		// не тронуты.
+		// The cohort state: a requeue — pending and +1 attempt; a final —
+		// delegated_no_address and the counter reset; the young and the
+		// unfinished ones are untouched.
 		type domRow struct {
 			status    model.Status
 			state     model.CheckState
@@ -335,8 +343,8 @@ func TestRetryTempErrorPass(t *testing.T) {
 			t.Errorf("pending тронут: %+v, want temp_error/pending/0 (не кандидат)", r)
 		}
 
-		// Дельты счётчиков зоны (CTE zc retryRequeueSQL, T-178): единственный
-		// переход done → pending — по requeue.
+		// The zone counter deltas (the zc CTE of retryRequeueSQL, T-178):
+		// the only done → pending transition — via requeue.
 		var checked, pend int64
 		if err := pool.QueryRow(ctx,
 			"SELECT domains_checked, domains_pending FROM zones WHERE id = $1", zone,
@@ -347,12 +355,12 @@ func TestRetryTempErrorPass(t *testing.T) {
 			t.Errorf("счётчики зоны = checked %d pending %d, want -1 и 1 (переход done → pending)", checked, pend)
 		}
 
-		// Корзины зрелости (T-202/T-267): декременты хвостового оператора
-		// назначения повтора ушли в корзину дат эпизодов (2020-01-01,
-		// по −1 на назначение и финализацию — ключ выводится из дат
-		// переведённых строк, переданных пачкой из RETURNING первого
-		// оператора) — guard-сумма сходится с живым числом зрелых
-		// кандидатов (0).
+		// The maturity buckets (T-202/T-267): the decrements of the tail
+		// requeue assignment operator went into the episode date bucket
+		// (2020-01-01, by −1 per requeue and finalization — the key is
+		// derived from the dates of the transitioned rows passed by the
+		// batch from the RETURNING of the first operator) — the guard sum
+		// agrees with the live number of mature candidates (0).
 		var stale int64
 		if err := pool.QueryRow(ctx,
 			"SELECT value FROM crawler_counters WHERE name = 'retry_mature:2020-01-01'",
@@ -366,7 +374,7 @@ func TestRetryTempErrorPass(t *testing.T) {
 			t.Errorf("guard-сумма корзин = %d, want 0 (зрелые исчерпаны, дренаж не откроется)", got)
 		}
 
-		// Итог дренажа — сумма пачек: по одному каждого вида.
+		// The drain outcome — the sum of the batches: one of each kind.
 		for _, want := range []string{"requeued=1", "finalized=1"} {
 			if !strings.Contains(logBuf.String(), want) {
 				t.Errorf("лог дренажа не содержит %q:\n%s", want, logBuf.String())
@@ -374,27 +382,29 @@ func TestRetryTempErrorPass(t *testing.T) {
 		}
 	})
 
-	// Регрессия дедлока 40P01 счётчиков: решения пачки (назначение
-	// повтора и финализация) выполняются РАЗДЕЛЬНЫМИ транзакциями.
-	// Сессия-держатель держит SELECT FOR UPDATE domains-строку кандидата
-	// финализации — как транзакция записи результата http-worker держит
-	// свои domains-строки, пока не дойдёт до хвостовых счётчиков
-	// (checks:/temp_error:/retry_mature:). Половина повтора обязана
-	// зафиксироваться и отпустить свои блокировки (domains/зоны/корзина
-	// retry_mature — перевод и хвостовой декремент ДВУМЯ операторами
-	// одной транзакции, T-267), НЕ дожидаясь финализации: в общей
-	// транзакции пачки она висела бы на чужой domains-строке, держа
-	// корзину счётчика, — ребро «счётчики → domains» цикла дедлока с
-	// записью результата.
+	// The deadlock 40P01 regression of the counters: the batch decisions
+	// (the requeue assignment and the finalization) run in SEPARATE
+	// transactions. The holder session holds SELECT FOR UPDATE of the
+	// finalization candidate domains row — the way the result recording
+	// transaction of the http-worker holds its own domains rows until
+	// it reaches the tail counters
+	// (checks:/temp_error:/retry_mature:). The retry half must commit
+	// and release its locks (domains/zones/the retry_mature bucket —
+	// the transition and the tail decrement as TWO operators of one
+	// transaction, T-267) WITHOUT waiting for the finalization: in a
+	// common batch transaction it would hang on a foreign domains row
+	// while holding the counter bucket — the "counters → domains" edge
+	// of the deadlock cycle with the result recording.
 	t.Run("половины пачки — независимые транзакции (регрессия 40P01)", func(t *testing.T) {
-		seed("mixreq", model.StatusTempError, model.CheckStateDone, "2020-01-01", 0) // повтор
+		seed("mixreq", model.StatusTempError, model.CheckStateDone, "2020-01-01", 0) // requeue
 		seed("mixfin", model.StatusTempError, model.CheckStateDone, "2020-01-01", int16(scheduler.DefaultRetryMaxRetries))
-		// Guard-фикстура самодостаточна: хвосты сабтеста дренажа выше —
-		// корзина вчерашнего дня = 2 (сид guard'а) и декременты
-		// 2020-01-01 = −2 (их сумма нулевая, но новый проход обязан
-		// опираться только на свою корзину) — обнуляются; корзина дат
-		// эпизодов кандидатов := 2. Строки не удаляются: корзину
-		// вчерашнего дня читает сабтест реконсиляции ниже.
+		// The guard fixture is self-sufficient: the tails of the drain
+		// subtest above — the yesterday bucket = 2 (the guard seed) and
+		// the 2020-01-01 decrements = −2 (their sum is zero, but a new
+		// pass must rely only on its own bucket) — are zeroed; the
+		// episode date bucket of the candidates := 2. The rows are not
+		// deleted: the reconciliation subtest below reads the yesterday
+		// bucket.
 		if _, err := pool.Exec(ctx,
 			"UPDATE crawler_counters SET value = 0 WHERE name LIKE 'retry_mature:%'",
 		); err != nil {
@@ -408,8 +418,8 @@ func TestRetryTempErrorPass(t *testing.T) {
 			t.Fatalf("reset корзины зрелости: %v", err)
 		}
 
-		// Держатель: domains-строка кандидата финализации захвачена до
-		// прохода (образ транзакции записи результата).
+		// The holder: the finalization candidate domains row is captured
+		// before the pass (an image of the result recording transaction).
 		holder, err := pool.Begin(ctx)
 		if err != nil {
 			t.Fatalf("begin держателя: %v", err)
@@ -431,11 +441,12 @@ func TestRetryTempErrorPass(t *testing.T) {
 			done <- onceResult{res, err}
 		}()
 
-		// Пока держатель не отпустил строку финализации, половина
-		// повтора уже зафиксирована и видна из другой сессии: retryRequeue
-		// закоммичен ДО ожидания retryFinalize. До фикса (общая
-		// транзакция пачки) перевод повтора висел бы вместе с
-		// финализацией — poll упирался бы в дедлайн.
+		// While the holder has not released the finalization row, the
+		// retry half is already committed and visible from another
+		// session: retryRequeue is committed BEFORE waiting on
+		// retryFinalize. Before the fix (a common batch transaction) the
+		// requeue transition would hang together with the finalization —
+		// the poll would hit the deadline.
 		deadline := time.Now().Add(10 * time.Second)
 		var state int16
 		for time.Now().Before(deadline) {
@@ -453,8 +464,8 @@ func TestRetryTempErrorPass(t *testing.T) {
 			t.Fatalf("половина повтора не зафиксирована до финализации: check_state mixreq = %d", state)
 		}
 
-		// Держатель отпускает строку — финализация проходит, проход
-		// завершается парой {1, 1}.
+		// The holder releases the row — the finalization goes through,
+		// the pass completes with the pair {1, 1}.
 		if err := holder.Rollback(ctx); err != nil {
 			t.Fatalf("откат держателя: %v", err)
 		}
@@ -480,12 +491,14 @@ func TestRetryTempErrorPass(t *testing.T) {
 		}
 	})
 
-	// Атомарность половины повтора (T-267): перевод и хвостовой
-	// декремент корзин — ДВА оператора ОДНОЙ транзакции; сбой декремента
-	// откатывает половину целиком — домен остаётся кандидатом (done),
-	// дельты зон и корзины не тронуты. Контраст с записью результата
-	// DNS-этапа, где операторы разнесены autocommit'ами и корзину
-	// догоняет реконсиляция (counters_test.go, окно ±1).
+	// The atomicity of the retry half (T-267): the transition and the
+	// tail bucket decrement are TWO operators of ONE transaction; a
+	// decrement failure rolls the half back as a whole — the domain
+	// stays a candidate (done), the zone deltas and the buckets are
+	// untouched. In contrast to the DNS stage result recording, where
+	// the operators are spread across autocommits and the bucket is
+	// caught up by the reconciliation (counters_test.go, the ±1
+	// window).
 	t.Run("сбой декремента корзин откатывает половину повтора", func(t *testing.T) {
 		seed("mixfail", model.StatusTempError, model.CheckStateDone, "2020-01-01", 0)
 		if _, err := pool.Exec(ctx,
@@ -536,8 +549,9 @@ func TestRetryTempErrorPass(t *testing.T) {
 		if basket != 1 {
 			t.Errorf("корзина 2020-01-01 = %d, want 1 (декремент откатился вместе с переводом)", basket)
 		}
-		// Кандидат цел — следующий проход (живой пул) его разбирает:
-		// перевод и декремент проходят вместе, дельты зоны уходят.
+		// The candidate is intact — the next pass (the live pool)
+		// handles it: the transition and the decrement go together, the
+		// zone deltas land.
 		res, err := scheduler.RetryOnce(ctx, pool, scheduler.RetryOptions{BatchSize: 1})
 		if err != nil {
 			t.Fatalf("повторный проход: %v", err)
@@ -556,8 +570,9 @@ func TestRetryTempErrorPass(t *testing.T) {
 		}
 	})
 
-	// Стационар (граница доверия guard, TZ T-202): зрелых нет — тяжёлая
-	// выборка не выполняется вовсе, тик стоит одну сумму корзин.
+	// Steady state (the guard trust boundary, the T-202 TZ): no mature
+	// rows — the heavy selection is not run at all, the tick stands for
+	// one bucket sum.
 	t.Run("зрелых нет — тяжёлая выборка не выполняется", func(t *testing.T) {
 		before := pool.batchCalls()
 		res, err := scheduler.RetryOnce(ctx, pool, scheduler.RetryOptions{})
@@ -572,13 +587,15 @@ func TestRetryTempErrorPass(t *testing.T) {
 		}
 	})
 
-	// Незрелые (сегодняшние эпизоды, T-202): корзина текущих суток в
-	// guard не входит — эпизоды зреют к полуночи, тяжёлая выборка не
-	// открывается, хотя домен формально ответил критерию статуса.
+	// The immature (today's episodes, T-202): the current-day bucket is
+	// not in the guard — the episodes mature by midnight, the heavy
+	// selection does not open, although the domain formally answered
+	// the status criterion.
 	t.Run("сегодняшние эпизоды — guard не пускает", func(t *testing.T) {
-		// Дата эпизода — current_date САМОЙ БД (bind-параметр $5::date
-		// принимает только литерал, «current_date» строкой не парсится;
-		// значение из БД — таймзона согласована с FILTER реконсиляции).
+		// The episode date — the current_date of the DB ITSELF (the bind
+		// parameter $5::date accepts only a literal, "current_date" as a
+		// string is not parsed; the value from the DB — the timezone is
+		// aligned with the reconciliation FILTER).
 		var today string
 		if err := pool.QueryRow(ctx,
 			"SELECT to_char(current_date, 'YYYY-MM-DD')",
@@ -605,11 +622,11 @@ func TestRetryTempErrorPass(t *testing.T) {
 		}
 	})
 
-	// Реконсиляция (T-202) — авторитет корзин: сегодняшняя корзина :=
-	// живое окно (fresh — один temp_error × done сегодня), зрелая — 0,
-	// устаревшая корзина дат старых эпизодов (хвост декрементов
-	// 2020-01-01) удаляется; guard-сумма остаётся нулём (сегодняшняя
-	// корзина в сумму не входит).
+	// The reconciliation (T-202) — the authority of the buckets: the
+	// today bucket := the live window (fresh — one temp_error × done
+	// today), the mature one — 0, the stale bucket of the old episode
+	// dates (the tail of the 2020-01-01 decrements) is removed; the
+	// guard sum stays zero (the today bucket is not in the sum).
 	t.Run("реконсиляция корзин сходится с живым окном", func(t *testing.T) {
 		if _, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{}); err != nil {
 			t.Fatalf("ZoneStatsOnce: %v", err)
@@ -645,9 +662,9 @@ func TestRetryTempErrorPass(t *testing.T) {
 		}
 	})
 
-	// Отсутствие строк корзин — честный ноль, а не ошибка: строки корзин
-	// создаёт первый инкремент суток или проход реконсиляции, их никто
-	// не гарантирует (в отличие от status_* T-178).
+	// Missing bucket rows — an honest zero, not an error: the bucket
+	// rows are created by the first day increment or the reconciliation
+	// pass, nobody guarantees them (unlike the status_* of T-178).
 	t.Run("корзин нет — честный ноль", func(t *testing.T) {
 		if _, err := pool.Exec(ctx, "DELETE FROM crawler_counters WHERE name LIKE 'retry_mature:%'"); err != nil {
 			t.Fatal(err)

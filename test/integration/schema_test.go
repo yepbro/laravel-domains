@@ -1,26 +1,28 @@
-// Интеграционные контракты схемы (ТЗ 6, 6.1):
+// Integration contracts of the schema (spec 6, 6.1):
 //
-//   - T-003, таблицы zones/subdomains/domains: партиционирование LIST по
-//     zone_id, fillfactor = 85 у каждой листовой партиции, частичные
-//     индексы проходов планировщика по check_state — выборка pending
-//     (domains_pending_idx), возврат lease (domains_lease_idx) и
-//     перепроверка (domains_recheck_idx, T-104), частичный индекс
-//     deleted-доменов очистки ingest (domains_deleted_idx, T-170), окно
-//     мониторинга по last_checked_at (domains_last_checked_idx, T-171),
-//     sequence domain_id_seq, HOT-совместимость — массово обновляемые
-//     колонки не входят ни в один индекс, кроме возраста lease/recheck
-//     и окна мониторинга в ключах (меняется только вместе с check_state)
-//     и status в предикате deleted-индекса (строки вне deleted в индекс
-//     не попадают);
-//   - T-004, таблицы subdomain_results/contents/laravel_domains/
-//     laravel_findings/ingest_files: партиционирование таблиц с domain_id,
-//     fillfactor = 85 листьев subdomain_results (частые перезаписи
-//     результатов), минимальный состав индексов, идемпотентность записи
-//     по первичным ключам.
+//   - T-003, the zones/subdomains/domains tables: LIST partitioning by
+//     zone_id, fillfactor = 85 on every leaf partition, the partial
+//     scheduler pass indexes over check_state — the pending selection
+//     (domains_pending_idx), the lease return (domains_lease_idx) and
+//     the recheck (domains_recheck_idx, T-104), the partial index of
+//     deleted domains for the ingest cleanup (domains_deleted_idx,
+//     T-170), the monitoring window by last_checked_at
+//     (domains_last_checked_idx, T-171), the domain_id_seq sequence,
+//     HOT compatibility — the mass-updated columns are not in any
+//     index except the lease/recheck age and the monitoring window in
+//     the keys (they change only together with check_state) and status
+//     in the deleted-index predicate (the rows outside deleted do not
+//     get into the index);
+//   - T-004, the subdomain_results/contents/laravel_domains/
+//     laravel_findings/ingest_files tables: partitioning of the tables
+//     with domain_id, fillfactor = 85 of the subdomain_results leaves
+//     (frequent record rewrites), the minimal index set, the write
+//     idempotency by the primary keys.
 //
-// Схема накатывается встроенным раннером (internal/migrate) в изолированную
-// схему через search_path — так же, как при первом старте сервисов на пустой
-// БД; тесты не зависят от состояния рабочей схемы.
+// The schema is applied by the embedded runner (internal/migrate) into
+// an isolated schema via search_path — the same as at the first
+// services start on an empty DB; the tests do not depend on the state
+// of the working schema.
 package integration
 
 import (
@@ -38,8 +40,9 @@ import (
 	"crawler/internal/migrate"
 )
 
-// migratedSchema накатывает встроенный набор миграций в изолированную схему
-// (withTestSchema из migrate_test.go) и возвращает пул с search_path на неё.
+// migratedSchema applies the embedded migration set into an isolated
+// schema (withTestSchema from migrate_test.go) and returns a pool with
+// search_path on it.
 func migratedSchema(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 
@@ -58,30 +61,31 @@ func migratedSchema(t *testing.T) *pgxpool.Pool {
 	return pool
 }
 
-// containsWord — совпадение слова целиком (по границам слова), чтобы,
-// например, поиск «label» не срабатывал на «name_unicode_label».
+// containsWord — a whole-word match (by the word boundaries), so that,
+// for example, a "label" search does not fire on "name_unicode_label".
 func containsWord(s, word string) bool {
 	return regexp.MustCompile(`\b` + regexp.QuoteMeta(word) + `\b`).MatchString(s)
 }
 
-// tablePartition — партиция таблицы: листовая (relkind r) либо
-// промежуточный родитель субпартиций (relkind p, T-005).
+// tablePartition — a table partition: a leaf (relkind r) or an
+// intermediate parent of subpartitions (relkind p, T-005).
 type tablePartition struct {
 	name       string
 	relkind    string
-	reloptions string // array_to_string(reloptions), '' если NULL
-	bound      string // pg_get_expr(relpartbound), '' у корня
+	reloptions string // array_to_string(reloptions), '' when NULL
+	bound      string // pg_get_expr(relpartbound), '' at the root
 	indexCount int
 }
 
-// tablePartitions возвращает все партиции таблицы рекурсивно: прямых детей
-// и (когда появятся субпартиции T-005) вложенные уровни вместе с числом
-// индексов каждой.
+// tablePartitions returns all partitions of a table recursively: the
+// direct children and (once the T-005 subpartitions appear) the nested
+// levels together with the index count of each.
 func tablePartitions(t *testing.T, pool *pgxpool.Pool, table string) []tablePartition {
 	t.Helper()
 
-	// Рекурсивный обход наследования от таблицы (не от индексов:
-	// у партиционированных индексов своё наследование, здесь оно не мешает).
+	// A recursive walk of the inheritance from the table (not from the
+	// indexes: partitioned indexes have their own inheritance, it does
+	// not interfere here).
 	const query = `
 		WITH RECURSIVE parts AS (
 			SELECT c.oid, c.relname, c.relkind, c.reloptions, c.relpartbound
@@ -122,14 +126,14 @@ func tablePartitions(t *testing.T, pool *pgxpool.Pool, table string) []tablePart
 	return parts
 }
 
-// tableIndex — индекс на таблице (для партиционированных — на родителе).
+// tableIndex — an index on a table (for the partitioned ones — on the parent).
 type tableIndex struct {
 	name string
-	def  string // pg_get_indexdef целиком
-	pred string // предикат частичного индекса, '' у обычного
+	def  string // the whole pg_get_indexdef
+	pred string // the partial index predicate, '' for a plain one
 }
 
-// tableIndexes возвращает индексы таблицы (не её партиций).
+// tableIndexes returns the indexes of a table (not its partitions).
 func tableIndexes(t *testing.T, pool *pgxpool.Pool, table string) []tableIndex {
 	t.Helper()
 
@@ -163,8 +167,9 @@ func tableIndexes(t *testing.T, pool *pgxpool.Pool, table string) []tableIndex {
 	return indexes
 }
 
-// assertListPartitionedByZoneID — таблица партиционирована LIST по zone_id
-// (принцип ТЗ 6): relkind p, стратегия l, ключ «LIST (zone_id)».
+// assertListPartitionedByZoneID — the table is LIST partitioned by
+// zone_id (the spec 6 principle): relkind p, strategy l, the key
+// "LIST (zone_id)".
 func assertListPartitionedByZoneID(t *testing.T, pool *pgxpool.Pool, table string) {
 	t.Helper()
 
@@ -191,9 +196,9 @@ func assertListPartitionedByZoneID(t *testing.T, pool *pgxpool.Pool, table strin
 	}
 }
 
-// leafPartitions возвращает листовые партиции таблицы и проверяет, что
-// они есть и среди них DEFAULT: без неё новые зоны не смогут записаться
-// до выделения партиции (T-005).
+// leafPartitions returns the leaf partitions of a table and checks that
+// they exist and include DEFAULT: without it the new zones could not
+// write until a partition is extracted (T-005).
 func leafPartitions(t *testing.T, pool *pgxpool.Pool, table string) []tablePartition {
 	t.Helper()
 
@@ -202,7 +207,7 @@ func leafPartitions(t *testing.T, pool *pgxpool.Pool, table string) []tableParti
 	defaultSeen := false
 	for _, p := range parts {
 		if p.relkind != "r" {
-			continue // промежуточный родитель субпартиций (T-005)
+			continue // the intermediate parent of subpartitions (T-005)
 		}
 		leaves = append(leaves, p)
 		if strings.Contains(p.bound, "DEFAULT") {
@@ -218,12 +223,13 @@ func leafPartitions(t *testing.T, pool *pgxpool.Pool, table string) []tableParti
 	return leaves
 }
 
-// TestSchema_DomainsPartitioning — domains партиционирована LIST по zone_id
-// с DEFAULT-партицией (запись новых зон до выделения отдельных партиций);
-// у каждой листовой партиции fillfactor = 85 (ТЗ 6: место на странице под
-// версии строк при частых апдейтах). Storage parameters на партиционированном
-// родителе в PostgreSQL 16 недопустимы, а reloptions не наследуются — поэтому
-// параметр проверяется у каждой партиции отдельно.
+// TestSchema_DomainsPartitioning — domains is LIST partitioned by
+// zone_id with a DEFAULT partition (writes of new zones until their
+// own partitions are extracted); every leaf partition has fillfactor
+// = 85 (spec 6: page room for the row versions under frequent
+// updates). Storage parameters on a partitioned parent are not allowed
+// in PostgreSQL 16, and reloptions are not inherited — hence the
+// parameter is checked per partition.
 func TestSchema_DomainsPartitioning(t *testing.T) {
 	skipUnlessIntegration(t)
 	pool := migratedSchema(t)
@@ -237,19 +243,20 @@ func TestSchema_DomainsPartitioning(t *testing.T) {
 	}
 }
 
-// TestSchema_DomainsIndexes — на domains ровно семь индексов («минимум
-// индексов», ТЗ 6): первичный ключ, уникальный (zone_id, label) для поиска
-// по имени (ТЗ 5.11), три частичных по check_state для проходов
-// планировщика (ТЗ 5.3): выборка pending (domains_pending_idx, 000001),
-// возврат истёкших lease (domains_lease_idx, T-104) и суточная
-// перепроверка (domains_recheck_idx, T-104), частичный deleted-доменов
-// очистки ingest (domains_deleted_idx, T-170, 0013) и окно мониторинга
-// по last_checked_at (domains_last_checked_idx, T-171, 0014). Ключи
-// фоновых индексов начинаются с колонки возраста (queued_at /
-// last_checked_at) и завершаются доменным ключом — ORDER BY проходов
-// совпадает с ключом, скан читает только нужный префикс. У каждой
-// листовой партиции — прикреплённые дочерние индексы всех индексов
-// родителя.
+// TestSchema_DomainsIndexes — exactly seven indexes on domains (the
+// "minimum of indexes", spec 6): the primary key, the unique
+// (zone_id, label) for the name lookup (spec 5.11), three partial
+// check_state ones for the scheduler passes (spec 5.3): the pending
+// selection (domains_pending_idx, 000001), the expired lease return
+// (domains_lease_idx, T-104) and the daily recheck
+// (domains_recheck_idx, T-104), the partial deleted-domains index of
+// the ingest cleanup (domains_deleted_idx, T-170, 0013) and the
+// monitoring window by last_checked_at (domains_last_checked_idx,
+// T-171, 0014). The keys of the background indexes start with the age
+// column (queued_at / last_checked_at) and end with the domain key —
+// the ORDER BY of the passes matches the key, the scan reads only the
+// needed prefix. Every leaf partition has the attached child indexes
+// of all the parent indexes.
 func TestSchema_DomainsIndexes(t *testing.T) {
 	skipUnlessIntegration(t)
 	pool := migratedSchema(t)
@@ -279,8 +286,8 @@ func TestSchema_DomainsIndexes(t *testing.T) {
 		}
 	}
 
-	// Частичные индексы проходов: предикат — только check_state,
-	// ключ — колонка возраста + доменный ключ (T-104, миграция 000008;
+	// The partial pass indexes: the predicate — check_state only, the
+	// key — the age column + the domain key (T-104, migration 000008;
 	// pending — 000001).
 	wantPartial := map[string]struct{ key, pred string }{
 		"domains_pending_idx": {"(zone_id, id)", "check_state = 0"},
@@ -313,9 +320,10 @@ func TestSchema_DomainsIndexes(t *testing.T) {
 	}
 }
 
-// TestSchema_DomainIDSequence — id доменам выдаёт sequence domain_id_seq,
-// единый для всех зон и партиций (ТЗ 6.1); дубль (zone_id, label) отбивается
-// уникальным индексом (идемпотентность ingest, ТЗ 5.1).
+// TestSchema_DomainIDSequence — the domain ids are issued by the
+// domain_id_seq sequence, shared by all zones and partitions (spec
+// 6.1); a (zone_id, label) duplicate is rejected by the unique index
+// (the ingest idempotency, spec 5.1).
 func TestSchema_DomainIDSequence(t *testing.T) {
 	skipUnlessIntegration(t)
 	pool := migratedSchema(t)
@@ -348,8 +356,8 @@ func TestSchema_DomainIDSequence(t *testing.T) {
 		t.Errorf("domains.id: default = %q, want nextval('domain_id_seq')", idDefault)
 	}
 
-	// id заполняется sequence автоматически (внешних ключей в схеме нет —
-	// минимум индексов, зона не нужна).
+	// The id is filled by the sequence automatically (no foreign keys
+	// in the schema — the minimum of indexes, a zone is not needed).
 	var id int64
 	if err := pool.QueryRow(ctx,
 		`INSERT INTO domains (zone_id, label) VALUES (1, 'example') RETURNING id`,
@@ -366,34 +374,36 @@ func TestSchema_DomainIDSequence(t *testing.T) {
 	}
 }
 
-// TestSchema_DomainsHOTColumns — обновляемые при проверке колонки не
-// входят ни в один индекс, кроме заранее принятых компромиссов (ТЗ 6):
-// massовые апдейты остаются HOT, а fillfactor = 85 оставляет место под
-// новые версии строк на той же странице. Три компромисса:
+// TestSchema_DomainsHOTColumns — the columns updated during a check
+// are not in any index, except the pre-accepted compromises (spec 6):
+// the mass updates stay HOT, and the fillfactor = 85 leaves room for
+// the new row versions on the same page. Three compromises:
 //
-//   - check_state — в предикатах трёх частичных индексов проходов
-//     (pending/lease/recheck): смены состояний всегда non-HOT —
-//     неустранимо при требуемых ТЗ §5.3 частичных индексах;
-//   - queued_at / last_checked_at — в ключах lease/recheck-индексов
-//     (T-104) и last_checked_at ещё в ключе доменного окна мониторинга
-//     domains_last_checked_idx (T-171): их апдейты non-HOT, однако все
-//     писатели меняют эти колонки ТОЛЬКО вместе с check_state
-//     (enqueue, возврат lease, перепроверка, результат воркера dns/http,
-//     воскрешение add-файлом) — переходы уже non-HOT, новых non-HOT
-//     апдейтов индексы не создают;
-//   - status — в предикате (не ключе!) частичного индекса deleted-
-//     доменов domains_deleted_idx (T-170): в индексе живут только
-//     строки status = deleted, non-HOT становятся лишь переходы с
-//     участием deleted (применение delete-файлов T-019, воскрешение
-//     T-018) — редкие события реестра; массовые апдейты
-//     статуса-результата и фиксация итогового статуса temp_error
-//     (T-031) строк в индексе не имеют и остаются HOT.
+//   - check_state — in the predicates of the three partial pass
+//     indexes (pending/lease/recheck): the state changes are always
+//     non-HOT — unavoidable with the spec §5.3-required partial
+//     indexes;
+//   - queued_at / last_checked_at — in the keys of the lease/recheck
+//     indexes (T-104) and last_checked_at also in the key of the
+//     domain monitoring window domains_last_checked_idx (T-171): their
+//     updates are non-HOT, but all the writers change these columns
+//     ONLY together with check_state (the enqueue, the lease return,
+//     the recheck, the dns/http worker result, the revival by an
+//     add-file) — the transitions are already non-HOT, the indexes do
+//     not create new non-HOT updates;
+//   - status — in the predicate (not the key!) of the partial
+//     deleted-domains index domains_deleted_idx (T-170): only the
+//     status = deleted rows live in the index, only the transitions
+//     involving deleted become non-HOT (the T-019 delete-file apply,
+//     the T-018 revival) — rare registry events; the mass updates of
+//     the result status and the finalization of the temp_error final
+//     status (T-031) have no rows in the index and stay HOT.
 func TestSchema_DomainsHOTColumns(t *testing.T) {
 	skipUnlessIntegration(t)
 	pool := migratedSchema(t)
 
 	hotColumns := []string{"flags", "dns_mask", "temp_attempts"}
-	// Колонки возраста — только в ключах своих индексов проходов/окон.
+	// The age columns — only in the keys of their own pass/window indexes.
 	ageColumns := map[string][]string{
 		"queued_at":       {"domains_lease_idx"},
 		"last_checked_at": {"domains_recheck_idx", "domains_last_checked_idx"},
@@ -404,9 +414,9 @@ func TestSchema_DomainsHOTColumns(t *testing.T) {
 				t.Errorf("индекс %s ссылается на часто обновляемую колонку %s: её апдейты перестают быть HOT", ix.name, col)
 			}
 		}
-		// status — только предикат (не ключ) domains_deleted_idx (T-170):
-		// строки вне deleted в индекс не попадают, массовые смены
-		// статуса остаются HOT.
+		// status — only the predicate (not the key) of domains_deleted_idx
+		// (T-170): the rows outside deleted do not get into the index,
+		// the mass status changes stay HOT.
 		if containsWord(ix.def, "status") {
 			if ix.name != "domains_deleted_idx" {
 				t.Errorf("индекс %s ссылается на колонку status: допустима только в предикате domains_deleted_idx (T-170)", ix.name)
@@ -428,9 +438,9 @@ func TestSchema_DomainsHOTColumns(t *testing.T) {
 		}
 	}
 
-	// В частичных индексах проходов check_state — только предикат, не ключ:
-	// индексация смен состояний делала бы их non-HOT даже там, где фильтра
-	// по состоянию достаточно.
+	// In the partial pass indexes check_state is the predicate only,
+	// not the key: indexing the state changes would make them non-HOT
+	// even where the state filter is enough.
 	for _, ix := range tableIndexes(t, pool, "domains") {
 		switch ix.name {
 		case "domains_pending_idx", "domains_lease_idx", "domains_recheck_idx":
@@ -442,16 +452,17 @@ func TestSchema_DomainsHOTColumns(t *testing.T) {
 	}
 }
 
-// TestSchema_TableColumns — зоны и субдомены — маленькие справочники без
-// партиционирования (принцип ТЗ 6 — партиционируются таблицы с domain_id);
-// состав и типы колонок всех трёх таблиц соответствуют эскизу DDL 6.1
-// (минимальные размеры полей).
+// TestSchema_TableColumns — the zones and the subdomains are small
+// reference tables without partitioning (the spec 6 principle — the
+// tables with domain_id are partitioned); the composition and the
+// column types of all three tables match the DDL sketch 6.1 (the
+// minimal field sizes).
 func TestSchema_TableColumns(t *testing.T) {
 	skipUnlessIntegration(t)
 	pool := migratedSchema(t)
 	ctx := context.Background()
 
-	// таблица → relkind (r — обычная, p — партиционированная) и колонка → тип.
+	// table → relkind (r — plain, p — partitioned) and column → type.
 	want := map[string]struct {
 		relkind string
 		columns map[string]string
@@ -460,7 +471,7 @@ func TestSchema_TableColumns(t *testing.T) {
 			"id": "smallint", "name": "text", "name_unicode": "text",
 			"is_active": "boolean", "domains_total": "bigint",
 			"domains_checked": "bigint", "updated_at": "timestamp with time zone",
-			"domains_laravel": "bigint", // кэш Laravel-доменов зоны (T-120, лендинг)
+			"domains_laravel": "bigint", // the zone Laravel-domains cache (T-120, the landing page)
 		}},
 		"subdomains": {relkind: "r", columns: map[string]string{
 			"id": "smallint", "label": "text", "enabled": "boolean",
@@ -470,19 +481,19 @@ func TestSchema_TableColumns(t *testing.T) {
 			"status": "smallint", "check_state": "smallint", "flags": "smallint",
 			"dns_mask": "bigint", "queued_at": "timestamp with time zone",
 			"last_checked_at": "date",
-			"temp_attempts":   "smallint", // T-031: счётчик повторов temp_error (миграция 000005)
+			"temp_attempts":   "smallint", // T-031: the temp_error retry counter (migration 000005)
 		}},
-		"web_checks": {relkind: "r", columns: map[string]string{ // T-120: лог формы лендинга
+		"web_checks": {relkind: "r", columns: map[string]string{ // T-120: the landing form log
 			"id": "bigint", "domain": "text", "punycode_domain": "text",
 			"ip_address": "inet", "found": "boolean", "score": "real",
 			"duration_ms": "integer", "created_at": "timestamp with time zone",
 		}},
-		"crawler_counters": {relkind: "r", columns: map[string]string{ // T-175: счётчики переходов
+		"crawler_counters": {relkind: "r", columns: map[string]string{ // T-175: the transition counters
 			"name": "text", "value": "bigint",
 		}},
 	}
-	// Уникальные ключи справочников: зоны дедуплицируются по punycode-имени
-	// (ТЗ 5.2), субдомены — по метке.
+	// The unique keys of the reference tables: the zones are deduped by
+	// the punycode name (spec 5.2), the subdomains — by the label.
 	wantUnique := map[string]string{"zones": "name", "subdomains": "label"}
 
 	for table, w := range want {
@@ -505,7 +516,8 @@ func TestSchema_TableColumns(t *testing.T) {
 	}
 }
 
-// assertColumnTypes проверяет присутствие колонок и их типы (format_type).
+// assertColumnTypes checks the presence of the columns and their types
+// (format_type).
 func assertColumnTypes(t *testing.T, pool *pgxpool.Pool, table string, want map[string]string) {
 	t.Helper()
 
@@ -540,8 +552,8 @@ func assertColumnTypes(t *testing.T, pool *pgxpool.Pool, table string, want map[
 	}
 }
 
-// assertUniqueIndex проверяет, что на таблице есть уникальный индекс
-// с данным ключом (колонка или список через запятую).
+// assertUniqueIndex checks that the table has a unique index with the
+// given key (a column or a comma-separated list).
 func assertUniqueIndex(t *testing.T, pool *pgxpool.Pool, table, key string) {
 	t.Helper()
 
@@ -575,8 +587,8 @@ func assertUniqueIndex(t *testing.T, pool *pgxpool.Pool, table, key string) {
 	}
 }
 
-// assertNotNull проверяет, что колонки таблицы NOT NULL (обязательные поля
-// эскиза 6.1).
+// assertNotNull checks that the table columns are NOT NULL (the
+// mandatory fields of the sketch 6.1).
 func assertNotNull(t *testing.T, pool *pgxpool.Pool, table string, columns []string) {
 	t.Helper()
 
@@ -600,15 +612,16 @@ func assertNotNull(t *testing.T, pool *pgxpool.Pool, table string, columns []str
 	}
 }
 
-// ---------------------------------------------------------------- T-004: таблицы результатов
+// ---------------------------------------------------------------- T-004: the result tables
 
-// TestSchema_ResultsTablesPartitioning — таблицы результатов с domain_id
-// (subdomain_results, laravel_domains, laravel_findings) партиционированы
-// LIST по zone_id с DEFAULT-партицией (эскиз 6.1). У каждой листовой
-// партиции subdomain_results fillfactor = 85: история проверок не хранится
-// (ТЗ 3.5) — перепроверка перезаписывает строки с тем же PK, а ТЗ 6.3
-// относит таблицу к часто обновляемым; laravel_* пишутся один раз
-// и перезаписываются только переанализом — fillfactor им не задаётся.
+// TestSchema_ResultsTablesPartitioning — the result tables with
+// domain_id (subdomain_results, laravel_domains, laravel_findings) are
+// LIST partitioned by zone_id with a DEFAULT partition (the sketch
+// 6.1). Every leaf partition of subdomain_results has fillfactor = 85:
+// the check history is not kept (spec 3.5) — a recheck rewrites the
+// rows with the same PK, and the spec 6.3 classifies the table as
+// frequently updated; the laravel_* ones are written once and
+// rewritten only by the re-analysis — no fillfactor is set for them.
 func TestSchema_ResultsTablesPartitioning(t *testing.T) {
 	skipUnlessIntegration(t)
 	pool := migratedSchema(t)
@@ -626,10 +639,11 @@ func TestSchema_ResultsTablesPartitioning(t *testing.T) {
 	}
 }
 
-// TestSchema_ResultsTablesColumns — состав и типы колонок пяти таблиц T-004
-// соответствуют эскизу DDL 6.1 (минимальные размеры полей: smallint, int4,
-// bytea); contents и ingest_files без domain_id — обычные таблицы (принцип
-// ТЗ 6: партиционируются таблицы с domain_id).
+// TestSchema_ResultsTablesColumns — the composition and the column
+// types of the five T-004 tables match the DDL sketch 6.1 (the minimal
+// field sizes: smallint, int4, bytea); contents and ingest_files
+// without domain_id — plain tables (the spec 6 principle: the tables
+// with domain_id are partitioned).
 func TestSchema_ResultsTablesColumns(t *testing.T) {
 	skipUnlessIntegration(t)
 	pool := migratedSchema(t)
@@ -648,7 +662,7 @@ func TestSchema_ResultsTablesColumns(t *testing.T) {
 			"rendered": "boolean", "content_hash": "bytea", "error": "smallint",
 			"response_ms": "integer", "checked_at": "timestamp with time zone",
 			"rules_version": "integer",
-			// маркер «рендер невозможен» (T-210, миграция 000017)
+			// the "render is impossible" marker (T-210, migration 000017)
 			"render_failed_at": "timestamp with time zone",
 		}, notNull: []string{
 			"zone_id", "domain_id", "subdomain_id", "variant", "scheme",
@@ -701,30 +715,32 @@ func TestSchema_ResultsTablesColumns(t *testing.T) {
 		assertNotNull(t, pool, table, w.notNull)
 	}
 
-	// Идемпотентность ingest: дедуп — точная повторная доставка
-	// (zone_id, action, sha256) — уникальный ключ T-113 (миграция 000009).
+	// The ingest idempotency: the dedup — an exact repeated delivery
+	// (zone_id, action, sha256) — the unique key of T-113 (migration
+	// 000009).
 	assertUniqueIndex(t, pool, "ingest_files", "zone_id, action, sha256")
 }
 
-// TestSchema_ResultsTablesIndexes — «минимум индексов» (ТЗ 6): на таблицах
-// T-004 только первичные ключи — выборки по домену идут по префиксу
-// (zone_id, domain_id) составных ключей, — плюс уникальный
-// ingest_files (zone_id, action, sha256) с обслуживающим
-// ingest_files_sha256_idx (T-113: дедуп точной повторной доставки и
-// запрос конвейера по содержимому), индекс компактификации
-// contents_pack_off_idx (pack_id, off) для фоновых
-// запросов CompactLoop по паку с сортировкой по смещению (T-096, INFRA-05;
-// refcount в ключ не входит — апдейты счётчика остаются HOT) и окно
-// мониторинга subdomain_results_checked_idx (checked_at) — часовые
-// счётчики темпа сводки (T-171; checked_at пишется только INSERT'ом,
-// HOT-картина не меняется).
-// Индексы под будущие выборки (например, laravel_domains по score — этап 8,
-// ТЗ 5.11) сознательно не добавляются: состав зафиксирован этим контрактом.
+// TestSchema_ResultsTablesIndexes — the "minimum of indexes" (spec 6):
+// on the T-004 tables only the primary keys — the per-domain selections
+// go by the (zone_id, domain_id) prefix of the composite keys — plus
+// the unique ingest_files (zone_id, action, sha256) with its serving
+// ingest_files_sha256_idx (T-113: the dedup of the exact repeated
+// delivery and the pipeline query by content), the contents
+// compaction index contents_pack_off_idx (pack_id, off) for the
+// background CompactLoop queries over a pack sorted by the offset
+// (T-096, INFRA-05; refcount is not in the key — the counter updates
+// stay HOT) and the monitoring window subdomain_results_checked_idx
+// (checked_at) — the hourly pace counters of the summary (T-171;
+// checked_at is written only by an INSERT, the HOT picture does not
+// change). The indexes for the future selections (for example,
+// laravel_domains by score — stage 8, spec 5.11) are deliberately not
+// added: the composition is pinned by this contract.
 func TestSchema_ResultsTablesIndexes(t *testing.T) {
 	skipUnlessIntegration(t)
 	pool := migratedSchema(t)
 
-	// таблица → имя индекса → ожидаемый ключ.
+	// table → index name → expected key.
 	want := map[string]map[string]string{
 		"subdomain_results": {
 			"subdomain_results_pkey":        "(zone_id, domain_id, subdomain_id, variant)",
@@ -736,7 +752,7 @@ func TestSchema_ResultsTablesIndexes(t *testing.T) {
 		},
 		"laravel_domains": {
 			"laravel_domains_pkey":           "(zone_id, domain_id)",
-			"laravel_domains_updated_at_idx": "(updated_at)", // «последние находки» лендинга (T-120)
+			"laravel_domains_updated_at_idx": "(updated_at)", // the landing page "latest findings" (T-120)
 		},
 		"laravel_findings": {"laravel_findings_pkey": "(zone_id, domain_id, subdomain_id, variant)"},
 		"ingest_files": {
@@ -744,7 +760,7 @@ func TestSchema_ResultsTablesIndexes(t *testing.T) {
 			"ingest_files_zone_id_action_sha256_key": "(zone_id, action, sha256)",
 			"ingest_files_sha256_idx":                "(sha256)",
 		},
-		"web_checks": { // лог формы лендинга (T-120)
+		"web_checks": { // the landing form log (T-120)
 			"web_checks_pkey":           "(id)",
 			"web_checks_ip_created_idx": "(ip_address, created_at)",
 			"web_checks_created_idx":    "(created_at)",
@@ -773,7 +789,7 @@ func TestSchema_ResultsTablesIndexes(t *testing.T) {
 		}
 
 		if table == "ingest_files" || table == "contents" || table == "web_checks" {
-			continue // обычные таблицы, дочерних индексов нет
+			continue // plain tables, no child indexes
 		}
 		for _, p := range leafPartitions(t, pool, table) {
 			if p.indexCount != len(wantIndexes) {
@@ -783,20 +799,22 @@ func TestSchema_ResultsTablesIndexes(t *testing.T) {
 	}
 }
 
-// TestSchema_ResultsIdempotency — запись результатов идемпотентна (ТЗ 3.4):
-// повторная вставка строки с тем же ключом отбивается первичным ключом,
-// для ingest_files — уникальной тройкой (zone_id, action, sha256) даже
-// при другом пути файла (T-113, ТЗ 5.1); то же содержимое другим
-// действием (undo) или в другой зоне записывается отдельной строкой;
-// применяются defaults эскиза (variant/alias_kind/rendered, refcount).
-// Внешних ключей на domains нет — минимум индексов (ТЗ 6), целостность
-// ссылок (zone_id, domain_id) обеспечивает код записи.
+// TestSchema_ResultsIdempotency — the record writing is idempotent
+// (spec 3.4): a repeated insert of a row with the same key is rejected
+// by the primary key, for ingest_files — by the unique triple
+// (zone_id, action, sha256) even with a different file path (T-113,
+// spec 5.1); the same content with a different action (undo) or in a
+// different zone is written as a separate row; the sketch defaults are
+// applied (variant/alias_kind/rendered, refcount). There are no
+// foreign keys to domains — the minimum of indexes (spec 6), the
+// integrity of the (zone_id, domain_id) references is provided by the
+// writing code.
 func TestSchema_ResultsIdempotency(t *testing.T) {
 	skipUnlessIntegration(t)
 	pool := migratedSchema(t)
 	ctx := context.Background()
 
-	// dupInsert — вторая вставка той же строки должна упасть на дубликат.
+	// dupInsert — the second insert of the same row must fail on a duplicate.
 	dupInsert := func(table, sql string) {
 		t.Helper()
 		if _, err := pool.Exec(ctx, sql); err == nil || !strings.Contains(err.Error(), "duplicate key") {
@@ -804,7 +822,7 @@ func TestSchema_ResultsIdempotency(t *testing.T) {
 		}
 	}
 
-	// subdomain_results: строка результата с defaults.
+	// subdomain_results: a result row with the defaults.
 	var variant, aliasKind int
 	var rendered bool
 	err := pool.QueryRow(ctx, `
@@ -821,7 +839,7 @@ func TestSchema_ResultsIdempotency(t *testing.T) {
 		INSERT INTO subdomain_results (zone_id, domain_id, subdomain_id, scheme, checked_at)
 		VALUES (1, 10, 0, 2, now())`)
 
-	// contents: метаданные контента, refcount по умолчанию 1.
+	// contents: the content metadata, refcount defaults to 1.
 	var refcount int
 	if err := pool.QueryRow(ctx, `
 		INSERT INTO contents (hash, pack_id, off, len, raw_len)
@@ -836,7 +854,7 @@ func TestSchema_ResultsIdempotency(t *testing.T) {
 		INSERT INTO contents (hash, pack_id, off, len, raw_len)
 		VALUES ('\x00000000000000000000000000000001', 2, 0, 1, 1)`)
 
-	// laravel_domains: агрегат по домену.
+	// laravel_domains: the per-domain aggregate.
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO laravel_domains (zone_id, domain_id, score, ver_min, ver_max, found_on_mask, rules_version, updated_at)
 		VALUES (1, 10, 0.75, '9.19', '11', 3, 1, now())`,
@@ -847,7 +865,7 @@ func TestSchema_ResultsIdempotency(t *testing.T) {
 		INSERT INTO laravel_domains (zone_id, domain_id, score, found_on_mask, rules_version, updated_at)
 		VALUES (1, 10, 1, 1, 1, now())`)
 
-	// laravel_findings: срабатывания правил по (домен, субдомен, вариант).
+	// laravel_findings: the rule hits per (domain, subdomain, variant).
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO laravel_findings (zone_id, domain_id, subdomain_id, variant, score, signals, is_laravel, rules_version)
 		VALUES (1, 10, 0, 0, 0.75, '[{"rule":"cookie_xsrf_token","weight":0.25}]', true, 1)`,
@@ -858,10 +876,11 @@ func TestSchema_ResultsIdempotency(t *testing.T) {
 		INSERT INTO laravel_findings (zone_id, domain_id, subdomain_id, variant, score, signals, is_laravel, rules_version)
 		VALUES (1, 10, 0, 0, 1, '[]', true, 1)`)
 
-	// ingest_files: отчёт по обработанному файлу; точная повторная
-	// доставка — та же зона, действие и sha256 (другой путь не помогает)
-	// — отбивается уникальным ключом T-113; то же содержимое другим
-	// действием (undo) или в другой зоне — отдельные легитимные строки.
+	// ingest_files: the report of a processed file; an exact repeated
+	// delivery — the same zone, action and sha256 (a different path
+	// does not help) — is rejected by the T-113 unique key; the same
+	// content with a different action (undo) or in a different zone —
+	// separate legitimate rows.
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO ingest_files (zone_id, action, path, sha256, lines_total, added, existed, deleted, rejected)
 		VALUES (1, 1, 'incoming/com/add/a.txt', '\x0102', 100, 90, 5, 0, 5)`,
@@ -872,8 +891,8 @@ func TestSchema_ResultsIdempotency(t *testing.T) {
 		INSERT INTO ingest_files (zone_id, action, path, sha256)
 		VALUES (1, 1, 'processed/com/add/a.txt', '\x0102')`)
 	for _, d := range []struct{ zone, action int16 }{
-		{1, 2}, // undo тем же списком: то же содержимое из delete/
-		{2, 1}, // повторная доставка в другой зоне
+		{1, 2}, // an undo with the same list: the same content from delete/
+		{2, 1}, // a repeated delivery in another zone
 	} {
 		if _, err := pool.Exec(ctx, `
 			INSERT INTO ingest_files (zone_id, action, path, sha256)
@@ -884,20 +903,21 @@ func TestSchema_ResultsIdempotency(t *testing.T) {
 	}
 }
 
-// TestSchema_RenderDebtCounter — счётчик рендер-долга (T-175, миграция
-// 000015): строка render_pending создаётся бэкфиллом (пустая схема —
-// ноль), PK name бракует дубли, переходы бита render_pending (SQL —
-// литералы internal/httpworker/renderq.go, стиль T-039; форма закреплена
-// TestRenderSQLContract) работают на живом PostgreSQL контрактом:
-// охрана бита делает RowsAffected индикатором перехода (SET 0→1, CLEAR
-// 1→0, повтор — 0), прочие биты сохраняются, сдвиг счётчика требует
-// строки по имени.
+// TestSchema_RenderDebtCounter — the render debt counter (T-175,
+// migration 000015): the render_pending row is created by the backfill
+// (an empty schema — zero), the PK name rejects duplicates, the
+// render_pending bit transitions (the SQL — literals from
+// internal/httpworker/renderq.go, the T-039 style; the shape pinned by
+// TestRenderSQLContract) work on live PostgreSQL by contract: the bit
+// guard makes RowsAffected the transition indicator (SET 0→1, CLEAR
+// 1→0, a repeat — 0), the other bits are preserved, the counter shift
+// requires the row by name.
 func TestSchema_RenderDebtCounter(t *testing.T) {
 	skipUnlessIntegration(t)
 	pool := migratedSchema(t)
 	ctx := context.Background()
 
-	// Бэкфилл миграции создал строку; пустая схема — ноль.
+	// The migration backfill created the row; an empty schema — zero.
 	var n int64
 	if err := pool.QueryRow(ctx,
 		"SELECT value FROM crawler_counters WHERE name = 'render_pending'",
@@ -907,15 +927,15 @@ func TestSchema_RenderDebtCounter(t *testing.T) {
 	if n != 0 {
 		t.Errorf("счётчик пустой схемы = %d, want 0", n)
 	}
-	// PK по name — дубли бракуются.
+	// The PK by name — duplicates are rejected.
 	if _, err := pool.Exec(ctx,
 		"INSERT INTO crawler_counters (name, value) VALUES ('render_pending', 1)"); err == nil ||
 		!strings.Contains(err.Error(), "duplicate key") {
 		t.Errorf("повторная строка render_pending: err = %v, want duplicate key", err)
 	}
 
-	// Домен с битом is_idn (флаг render_pending ставится поверх, снятие
-	// его сохраняет).
+	// A domain with the is_idn bit (the render_pending flag is set on
+	// top, clearing it preserves the rest).
 	var id int64
 	if err := pool.QueryRow(ctx,
 		`INSERT INTO domains (zone_id, label, flags) VALUES (1, 'render-debt', 1) RETURNING id`,
@@ -923,8 +943,9 @@ func TestSchema_RenderDebtCounter(t *testing.T) {
 		t.Fatalf("insert domains: %v", err)
 	}
 
-	// SET с охраной бита (renderSetPendingSQL): переход 0→1 — одна
-	// строка, повторная установка — ноль (индикатор перехода, T-175).
+	// SET with the bit guard (renderSetPendingSQL): the 0→1 transition
+	// — one row, a repeated set — zero (the transition indicator,
+	// T-175).
 	setSQL := "UPDATE domains AS t SET flags = (t.flags | 2)::int2 " +
 		"WHERE t.zone_id = $1::int2 AND t.id = $2::int8 AND (t.flags & 2) = 0"
 	tag, err := pool.Exec(ctx, setSQL, int16(1), id)
@@ -942,8 +963,8 @@ func TestSchema_RenderDebtCounter(t *testing.T) {
 		t.Errorf("повторная установка: RowsAffected = %d, want 0 (охрана бита)", tag.RowsAffected())
 	}
 
-	// Сдвиг счётчика (renderCounterDeltaSQL): строка есть — UPDATE 1,
-	// значение меняется; чужое имя — ноль строк.
+	// The counter shift (renderCounterDeltaSQL): the row exists —
+	// UPDATE 1, the value changes; a foreign name — zero rows.
 	bumpSQL := "UPDATE crawler_counters AS c SET value = c.value + $1::int8 " +
 		"WHERE c.name = 'render_pending'"
 	tag, err = pool.Exec(ctx, bumpSQL, int64(1))
@@ -967,8 +988,8 @@ func TestSchema_RenderDebtCounter(t *testing.T) {
 		t.Errorf("сдвиг несуществующей строки: RowsAffected = %d, want 0", tag.RowsAffected())
 	}
 
-	// CLEAR с охраной бита (renderClearPendingSQL): 1→0 — одна строка,
-	// повтор — ноль; is_idn сохраняется.
+	// CLEAR with the bit guard (renderClearPendingSQL): 1→0 — one row,
+	// a repeat — zero; is_idn is preserved.
 	clearSQL := "UPDATE domains AS t SET flags = (t.flags & -3)::int2 " +
 		"WHERE t.zone_id = $1::int2 AND t.id = $2::int8 AND (t.flags & 2) <> 0"
 	tag, err = pool.Exec(ctx, clearSQL, int16(1), id)
@@ -993,7 +1014,7 @@ func TestSchema_RenderDebtCounter(t *testing.T) {
 		t.Errorf("flags после снятия = %d, want 1 (is_idn сохранён)", flags)
 	}
 
-	// Декремент возвращает счётчик к нулю.
+	// The decrement returns the counter to zero.
 	if tag, err = pool.Exec(ctx, bumpSQL, int64(-1)); err != nil || tag.RowsAffected() != 1 {
 		t.Errorf("декремент: tag=%v err=%v, want UPDATE 1", tag.RowsAffected(), err)
 	}
@@ -1006,9 +1027,9 @@ func TestSchema_RenderDebtCounter(t *testing.T) {
 
 // ---------------------------------------------------------------- T-082: domain_info
 
-// dinfoDecode разбирает ответ domain_info в карту (encoding/json:
-// числа — float64, порядок ключей jsonb не сохраняет — сравнение
-// по картам, а не по строкам).
+// dinfoDecode parses the domain_info response into a map
+// (encoding/json: the numbers are float64, the jsonb key order is not
+// preserved — the comparison is by maps, not by strings).
 func dinfoDecode(t *testing.T, raw []byte) map[string]any {
 	t.Helper()
 	if raw == nil {
@@ -1021,9 +1042,9 @@ func dinfoDecode(t *testing.T, raw []byte) map[string]any {
 	return m
 }
 
-// dinfoMap, dinfoSlice, dinfoFloat, dinfoStr — доступ к элементам
-// ответа с проверкой типа: имена и виды полей — часть контракта
-// (детерминированные пути для psql и тестов).
+// dinfoMap, dinfoSlice, dinfoFloat, dinfoStr — access to the response
+// elements with a type check: the field names and kinds are part of
+// the contract (the deterministic paths for psql and the tests).
 func dinfoMap(t *testing.T, v any, what string) map[string]any {
 	t.Helper()
 	m, ok := v.(map[string]any)
@@ -1060,9 +1081,9 @@ func dinfoStr(t *testing.T, v any, what string) string {
 	return s
 }
 
-// dinfoTime разбирает метку времени ответа: timestamptz в jsonb —
-// строка RFC 3339 со смещением зоны сессии, поэтому сравниваются
-// моменты, а не строки.
+// dinfoTime parses the timestamp of the response: a timestamptz in
+// jsonb is an RFC 3339 string with the session zone offset, so the
+// moments are compared, not the strings.
 func dinfoTime(t *testing.T, v any, what string) time.Time {
 	t.Helper()
 	tm, err := time.Parse(time.RFC3339, dinfoStr(t, v, what))
@@ -1072,24 +1093,27 @@ func dinfoTime(t *testing.T, v any, what string) time.Time {
 	return tm
 }
 
-// TestSchema_DomainInfoFunction — контракт SQL-функции domain_info(text)
-// (миграция 000006, ТЗ 5.11): сводка домена одним jsonb — зона, строка
-// домена с именами статусов, расшифровка dns_mask, результаты по
-// субдоменам/вариантам и признаки Laravel (агрегат laravel_domains +
-// все findings по убыванию score, слабые с пометкой is_laravel).
-// Вход нормализуется SQL-минимумом (регистр, краевые пробелы и точка),
-// зона — самый длинный суффикс из справочника zones; поиск домена —
-// по уникальному ключу (zone_id, label). Домен/зона не найдены — NULL,
-// не ошибка. Функция только читает: STABLE, PARALLEL SAFE, SECURITY
-// INVOKER, search_path зафиксирован (pg_catalog + схема миграции).
+// TestSchema_DomainInfoFunction — the contract of the SQL function
+// domain_info(text) (migration 000006, spec 5.11): a domain summary in
+// one jsonb — the zone, the domain row with the status names, the
+// dns_mask decode, the results per subdomain/variant and the Laravel
+// signs (the laravel_domains aggregate + all the findings by the score
+// descending, the weak ones flagged is_laravel). The input is
+// normalized by the SQL minimum (the case, the edge spaces and the
+// dot), the zone — the longest suffix from the zones reference table;
+// the domain lookup — by the unique key (zone_id, label). The
+// domain/zone not found — NULL, not an error. The function only reads:
+// STABLE, PARALLEL SAFE, SECURITY INVOKER, the search_path is fixed
+// (pg_catalog + the migration schema).
 func TestSchema_DomainInfoFunction(t *testing.T) {
 	skipUnlessIntegration(t)
 	pool := migratedSchema(t)
 	ctx := context.Background()
 
-	// Функция на месте и только читает: provolatile/proparallel 's'
-	// (STABLE, PARALLEL SAFE), prokind 'f', возврат jsonb, конфигурация
-	// search_path указывает на pg_catalog и схему миграции.
+	// The function is in place and only reads: provolatile/proparallel
+	// 's' (STABLE, PARALLEL SAFE), prokind 'f', a jsonb return, the
+	// search_path configuration points to pg_catalog and the migration
+	// schema.
 	var retType, kind, volatile, parallel, config string
 	err := pool.QueryRow(ctx, `
 		SELECT p.prorettype::regtype::text, p.prokind::text,
@@ -1132,9 +1156,9 @@ func TestSchema_DomainInfoFunction(t *testing.T) {
 		return id
 	}
 
-	// Данные: зоны test + uk/co.uk (для отделения зоны по самому длинному
-	// суффиксу), домен example с результатами и признаками Laravel,
-	// домен site в co.uk без результатов.
+	// The data: the zones test + uk/co.uk (to separate the zone by the
+	// longest suffix), the domain example with results and Laravel
+	// signs, the domain site in co.uk without results.
 	mustExec(`INSERT INTO zones (name) VALUES ('test'), ('uk'), ('co.uk')`)
 	var domID int64
 	err = pool.QueryRow(ctx, `
@@ -1179,8 +1203,9 @@ func TestSchema_DomainInfoFunction(t *testing.T) {
 	mustExec(`INSERT INTO domains (zone_id, label)
 		SELECT id, 'site' FROM zones WHERE name = 'co.uk'`)
 
-	// Найденный домен: вход с регистром, краевыми пробелами и точкой —
-	// SQL-минимум нормализации (ТЗ 5.2 п. 1); поля — ТЗ 5.11.
+	// The found domain: an input with the case, the edge spaces and a
+	// dot — the SQL minimum of normalization (spec 5.2 item 1); the
+	// fields — spec 5.11.
 	var raw []byte
 	if err := pool.QueryRow(ctx,
 		`SELECT domain_info('  Example.TEST.  ')`,
@@ -1217,7 +1242,7 @@ func TestSchema_DomainInfoFunction(t *testing.T) {
 		t.Errorf("domain = %v, want %v", got, wantDomain)
 	}
 
-	// Расшифровка dns_mask = 5 (биты 0 и 2): апекс и admin.
+	// The dns_mask = 5 decode (the bits 0 and 2): the apex and admin.
 	wantAlive := []any{
 		map[string]any{"id": 0.0, "label": ""},
 		map[string]any{"id": 2.0, "label": "admin"},
@@ -1226,8 +1251,9 @@ func TestSchema_DomainInfoFunction(t *testing.T) {
 		t.Errorf("dns_alive = %v, want %v", got, wantAlive)
 	}
 
-	// Результаты по (субдомен, вариант) в порядке субдомен/вариант;
-	// checked_at сравнивается моментом (смещение зависит от зоны сессии).
+	// The results per (subdomain, variant) in the subdomain/variant
+	// order; checked_at is compared as a moment (the offset depends on
+	// the session zone).
 	wantChecked := []time.Time{
 		time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC),
 		time.Date(2026, 10, 1, 12, 0, 1, 0, time.UTC),
@@ -1265,9 +1291,9 @@ func TestSchema_DomainInfoFunction(t *testing.T) {
 		}
 	}
 
-	// Признаки Laravel: агрегат laravel_domains + findings по убыванию
-	// score — уверенное срабатывание первым, слабое (is_laravel = false)
-	// тоже возвращается (ТЗ 5.11).
+	// The Laravel signs: the laravel_domains aggregate + the findings
+	// by the score descending — the confident hit first, the weak one
+	// (is_laravel = false) is returned too (spec 5.11).
 	lar := dinfoMap(t, info["laravel"], "laravel")
 	wantFoundOn := []any{map[string]any{"id": 0.0, "label": ""}}
 	if got := dinfoSlice(t, lar["found_on"], "laravel.found_on"); !reflect.DeepEqual(got, wantFoundOn) {
@@ -1317,8 +1343,9 @@ func TestSchema_DomainInfoFunction(t *testing.T) {
 		}
 	}
 
-	// Зона — самый длинный суффикс имени из zones: site.co.uk в зоне
-	// co.uk, хотя зона uk тоже существует (как PSL в idn.Normalize).
+	// The zone — the longest name suffix from zones: site.co.uk in the
+	// co.uk zone, although the uk zone also exists (like the PSL in
+	// idn.Normalize).
 	var zoneName, label string
 	if err := pool.QueryRow(ctx, `
 		SELECT domain_info('site.co.uk') -> 'zone' ->> 'name',
@@ -1330,9 +1357,9 @@ func TestSchema_DomainInfoFunction(t *testing.T) {
 		t.Errorf("суффикс зоны: zone=%q label=%q, want co.uk/site", zoneName, label)
 	}
 
-	// Не найдено — NULL, не ошибка: неизвестный домен в известной зоне,
-	// неизвестная зона, имя из одной метки (это зона, не домен), пустой
-	// вход и NULL.
+	// Not found — NULL, not an error: an unknown domain in a known
+	// zone, an unknown zone, a name of a single label (that is a zone,
+	// not a domain), an empty input and NULL.
 	var noDomain, noZone, singleLabel, empty, nullIn bool
 	err = pool.QueryRow(ctx, `
 		SELECT domain_info('unknown.test') IS NULL,
@@ -1353,9 +1380,10 @@ func TestSchema_DomainInfoFunction(t *testing.T) {
 		}
 	}
 
-	// Домен без результатов и признаков: пустые массивы, laravel —
-	// jsonb null (не SQL NULL: jsonb_build_object кладёт JSON null);
-	// свежий домен отображается именами статусов по умолчанию.
+	// A domain without results and signs: the empty arrays, laravel —
+	// a jsonb null (not a SQL NULL: jsonb_build_object puts a JSON
+	// null); the fresh domain is displayed with the default status
+	// names.
 	var noResults, noAlive, noLaravel, newStatus bool
 	if err := pool.QueryRow(ctx, `
 		SELECT domain_info('site.co.uk') -> 'results' = '[]'::jsonb,
