@@ -1,373 +1,402 @@
-# Техническое задание: операторский веб-дашборд конвейера Domain Crawler
+# Specification: operator web dashboard of the Domain Crawler pipeline
 
-Версия: 1.0 (дополнение к основному ТЗ [`TZ_domain_crawler.md`](./TZ_domain_crawler.md) v1.1;
-решения подтверждены заказчиком 2026-10-19)
-
----
-
-## 1. Цель и общее описание
-
-Внутренний (операторский) веб-дашборд конвейера Domain Crawler: единая
-страница, показывающая «одним взглядом» статус обработки данных — прогресс,
-скорость, счётчики, очереди, находки и здоровье сервисов, — с доступом по
-паролю.
-
-Операционная задача: сегодня такая сводка собирается только разовой
-CLI-командой `crawlerctl status`, а графики метрик живут в Prometheus
-(профиль monitoring) и требуют составления запросов.
-
-1. Дашборд — Go-сервис проекта (`cmd/dashboard` + `internal/dashboard`),
-   читающий состояние конвейера из тех же источников, что `crawlerctl
-   status` (PostgreSQL, Redis), и зондящий живость сервисов конвейера.
-2. Доступ — только по паролю (HTTP Basic Auth; пароль хранится хэшем, §7.2).
-3. Дашборд строго read-only: никакие действия над конвейером из него
-   недоступны.
+Version: 1.0 (a supplement to the main project spec
+[`TZ_domain_crawler.md`](./TZ_domain_crawler.md) v1.1; decisions confirmed
+by the customer on 2026-10-19)
 
 ---
 
-## 2. Термины
+## 1. Purpose and overview
 
-| Термин | Значение |
+An internal (operator-facing) web dashboard of the Domain Crawler pipeline:
+a single page showing the data-processing status "at a glance" — progress,
+throughput, counters, queues, finds, and service health — password-protected.
+
+Operational problem: today such a summary can only be assembled by the
+one-shot CLI command `crawlerctl status`, while the metric graphs live in
+Prometheus (the monitoring profile) and require writing queries.
+
+1. The dashboard is a project Go service (`cmd/dashboard` +
+   `internal/dashboard`) that reads the pipeline state from the same
+   sources as `crawlerctl status` (PostgreSQL, Redis) and probes the
+   liveness of the pipeline services.
+2. Access is password-only (HTTP Basic Auth; the password is stored as a
+   hash, §7.2).
+3. The dashboard is strictly read-only: no actions on the pipeline are
+   available from it.
+
+---
+
+## 2. Terms
+
+| Term | Meaning |
 |---|---|
-| ТЗ | Основное ТЗ проекта (`TZ_domain_crawler.md`), если не указано иное |
-| ТЗД | Настоящее ТЗ |
-| Оператор | Пользователь дашборда (владелец краулера) |
-| Снимок (snapshot) | Единичный срез состояния конвейера: все секции данных (§5) |
-| Секция | Часть снимка из одного источника (зоны, очереди, статусы, …) |
-| Сессия | Подписанная cookie, выдаваемая после успешной сверки пароля (§7.5) |
+| Spec | The main project spec (`TZ_domain_crawler.md`), unless stated otherwise |
+| Dashboard spec | This spec |
+| Operator | The dashboard user (the crawler owner) |
+| Snapshot | A single snapshot of the pipeline state: all data sections (§5) |
+| Section | A part of the snapshot coming from one source (zones, queues, statuses, …) |
+| Session | A signed cookie issued after successful password verification (§7.5) |
 
 ---
 
-## 3. Ограничения и рамки
+## 3. Constraints and scope
 
-### 3.1. Рамки (что не входит)
+### 3.1. Scope (what is not included)
 
-1. Исторические графики — остаются в Prometheus; дашборд показывает
-   «сейчас» плюс короткую историю спарклайнами из собственных опросов
-   (§6.4).
-2. Публичная часть (лендинг, форма проверки домена) — этап 13 плана
-   (T-121…T-124); дашборд с ним не пересекается: другая аудитория, другие
-   данные, отдельный слушатель.
-3. Управление конвейером (включение зон, recheck, ротация контента) —
-   вне дашборда.
-4. Многопользовательность и роли — один оператор (§7.1).
+1. Historical graphs stay in Prometheus; the dashboard shows "now" plus
+   a short history via sparklines built from its own polls (§6.4).
+2. The public part (the landing page, the domain-check form) is stage 13
+   of the plan (T-121…T-124); the dashboard does not overlap with it:
+   a different audience, different data, a separate listener.
+3. Pipeline management (enabling zones, recheck, content rotation) is
+   outside the dashboard.
+4. Multi-user support and roles — a single operator (§7.1).
 
-### 3.2. Технические ограничения
+### 3.2. Technical constraints
 
-1. Стек — Go, stdlib и уже присутствующие зависимости; новых зависимостей
-   нет (go.mod не меняется). PBKDF2 — stdlib `crypto/pbkdf2` (появился в
-   Go 1.24; проект — на Go 1.26).
-2. Окружение без интернета: фронт без внешних CDN и шрифтов — только
-   артефакты `go:embed` (§6.1).
-3. Нагрузка на БД не зависит от числа открытых вкладок: снимок собирает
-   фоновый цикл, браузер получает кэшированный JSON (§4.4).
-4. Бюджет памяти — как у прочих лёгких Go-сервисов: `mem_limit` 256m в
-   compose (§11.1), `MemoryMax=128M` в systemd (§11.2); ориентир —
-   ТЗ 3.2 (бюджет «Go-сервисы ≈ 1,3 ГБ» суммарно).
-
----
-
-## 4. Архитектура
-
-### 4.1. Сервис
-
-`cmd/dashboard` + `internal/dashboard`; запуск по образцу `cmd/monitor`
-(config.Load → `service.Run`, пул БД через OnDBPool). Рабочая логика
-(OnRun) — фоновый цикл сборки снимков (§4.4) плюс собственный публичный
-`http.Server` с graceful stop по отмене ctx.
-
-### 4.2. Слушатели (порты)
-
-1. Публичный — `dashboard.listen` (§8.1): страницы и API дашборда. В
-   dev-окружении публикуется на `127.0.0.1:8090`.
-2. Метрики/пробы — каркас `internal/service` на METRICS_ADDR
-   `127.0.0.1:9108` (следующий за web:9107 из этапа 13): `/livez`,
-   `/healthz`, `/metrics`; наружу не выставляется (ТЗ §9).
-
-Прецедент «публичный слушатель внутри OnRun» — тот же, что спроектирован
-для `cmd/web` (T-121); кто реализуется раньше — задаёт образец второму.
-
-### 4.3. Источники данных (все — read-only)
-
-1. PostgreSQL: SQL-агрегаты, идентичные `crawlerctl status` (зоны, темп),
-   распределение статусов доменов, Laravel-находки, отчёты ingest_files.
-2. Redis: глубина стримов `q:dns/q:http/q:render/q:analyze/q:dead`
-   (XLEN; тот же узкий API `BackpressureGate.Len`, что у monitor и
-   crawlerctl).
-3. Пробы `/livez` сервисов конвейера из конфига `dashboard.probes`
-   (§8.1): параллельно, таймаут 2 с.
-
-### 4.4. Сборка снимков
-
-Фоновый цикл с периодом `dashboard.refresh` (§8.1): собирает снимок целиком
-и атомарно заменяет предыдущий; HTTP-хендлеры отдают последний готовый
-снимок. Отказ секции не роняет снимок (§5.9).
-
-### 4.5. Общая библиотека сводки
-
-SQL сводки, типы и расчёты, идентичные `crawlerctl status`, выносятся в
-пакет `internal/status`, используемый и CLI, и дашбордом: один источник
-правды о смысле чисел; дублирование SQL между CLI и дашбордом запрещено.
+1. The stack is Go, stdlib, and already-present dependencies; no new
+   dependencies (go.mod is unchanged). PBKDF2 is stdlib
+   `crypto/pbkdf2` (added in Go 1.24; the project is on Go 1.26).
+2. An offline environment: the front uses no external CDNs or fonts —
+   only `go:embed` artifacts (§6.1).
+3. DB load does not depend on the number of open tabs: a background loop
+   builds the snapshot, the browser receives cached JSON (§4.4).
+4. The memory budget is that of the other lightweight Go services:
+   `mem_limit` 256m in compose (§11.1), `MemoryMax=128M` in systemd
+   (§11.2); the reference point is spec §3.2 (the combined
+   "Go services ≈ 1.3 GB" budget).
 
 ---
 
-## 5. Данные дашборда
+## 4. Architecture
 
-Определения чисел — те же, что в `crawlerctl status` и monitor, если явно
-не оговорено иное.
+### 4.1. Service
 
-### 5.1. Сводка (итоги)
+`cmd/dashboard` + `internal/dashboard`; started following the
+`cmd/monitor` pattern (config.Load → `service.Run`, the DB pool via
+OnDBPool). The working logic (OnRun) is the background snapshot-building
+loop (§4.4) plus its own public `http.Server` with a graceful stop on
+ctx cancellation.
 
-Всего доменов (сумма `zones.domains_total`), проверено
-(`domains_checked`), доля %, в работе (pending + queued), остаток первого
-цикла и ETA его завершения, Laravel-находок всего.
+### 4.2. Listeners (ports)
 
-### 5.2. Скорость
+1. Public — `dashboard.listen` (§8.1): the dashboard pages and API. In
+   the dev environment it is published on `127.0.0.1:8090`.
+2. Metrics/probes — the `internal/service` scaffold on METRICS_ADDR
+   `127.0.0.1:9108` (the next one after web:9107 from stage 13):
+   `/livez`, `/healthz`, `/metrics`; not exposed externally (spec §9).
 
-Доменов/с — средняя с начала суток (`last_checked_at`; окно ≥ 10 минут,
-иначе «н/д»); HTTP-результатов/с и рендеров/с — за последний час
-(`subdomain_results.checked_at`) — с T-203 окно собирается из часовых
-корзин темпа `crawler_counters['results:'/'rendered:…']` (сумма
-предыдущего и текущего календарного часа, делитель — фактическая длина
-покрытого окна 1–2 ч); правила «н/д» — как в `crawlerctl
-status` (короткое окно суток, нулевая скорость).
+The precedent of "a public listener inside OnRun" is the same as the
+one designed for `cmd/web` (T-121); whichever is implemented first sets
+the pattern for the other.
 
-### 5.3. Зоны
+### 4.3. Data sources (all read-only)
 
-По каждой зоне: имя (punycode; unicode-форма — только отображение),
-активность, всего/проверено/%, pending/queued/done.
+1. PostgreSQL: SQL aggregates identical to `crawlerctl status` (zones,
+   throughput), the distribution of domain statuses, Laravel finds,
+   ingest_files reports.
+2. Redis: the depth of the `q:dns/q:http/q:render/q:analyze/q:dead`
+   streams (XLEN; the same narrow `BackpressureGate.Len` API as monitor
+   and crawlerctl).
+3. `/livez` probes of the pipeline services from the `dashboard.probes`
+   config (§8.1): in parallel, a 2 s timeout.
 
-### 5.4. Очереди
+### 4.4. Snapshot building
 
-Глубина пяти стримов, включая `q:dead`; подсветка при приближении суммы к
-`scheduler.queue_high_watermark` (порог backpressure) и ненулевом `q:dead`.
+A background loop with the `dashboard.refresh` period (§8.1): it builds
+the snapshot in full and atomically replaces the previous one; the HTTP
+handlers serve the latest ready snapshot. A section failure does not
+take down the snapshot (§5.9).
 
-### 5.5. Статусы доменов
+### 4.5. Shared summary library
 
-Распределение `domains` по `status`; коды и имена — по ТЗ 6.2 основного
-ТЗ (`model.Statuses`).
+The summary SQL, types, and calculations identical to
+`crawlerctl status` are moved into the `internal/status` package used by
+both the CLI and the dashboard: a single source of truth for the meaning
+of the numbers; duplicating SQL between the CLI and the dashboard is
+forbidden.
 
-### 5.6. Laravel-находки
+---
 
-Всего; за 24 ч (`laravel_domains.updated_at`); последние 10: домен, зона,
-score, диапазон версий (ver_min–ver_max), updated_at.
+## 5. Dashboard data
+
+Number definitions are the same as in `crawlerctl status` and monitor
+unless explicitly stated otherwise.
+
+### 5.1. Summary (totals)
+
+Total domains (the sum of `zones.domains_total`), checked
+(`domains_checked`), the share %, in progress (pending + queued), the
+first-cycle residual and the ETA of its completion, total Laravel finds.
+
+### 5.2. Throughput
+
+Domains/s — the average since the start of the day (`last_checked_at`;
+a window ≥ 10 minutes, otherwise "n/a"); HTTP results/s and renders/s —
+over the last hour (`subdomain_results.checked_at`) — since T-203 the
+window is assembled from the hourly throughput buckets
+`crawler_counters['results:'/'rendered:…']` (the sum of the previous
+and the current calendar hour; the divisor is the actual length of the
+covered window, 1–2 h); the "n/a" rules are the same as in
+`crawlerctl status` (a short day window, a zero rate).
+
+### 5.3. Zones
+
+Per zone: the name (punycode; the unicode form is display-only), the
+active flag, total/checked/%, pending/queued/done.
+
+### 5.4. Queues
+
+The depth of the five streams, including `q:dead`; highlighting when
+the sum approaches `scheduler.queue_high_watermark` (the backpressure
+threshold) and when `q:dead` is non-zero.
+
+### 5.5. Domain statuses
+
+The distribution of `domains` by `status`; the codes and names — per
+§6.2 of the main spec (`model.Statuses`).
+
+### 5.6. Laravel finds
+
+Total; over the last 24 h (`laravel_domains.updated_at`); the last 10:
+domain, zone, score, version range (ver_min–ver_max), updated_at.
 
 ### 5.7. Ingest
 
-Последние 10 записей `ingest_files`: файл, действие (add/delete),
+The last 10 `ingest_files` records: file, action (add/delete),
 lines_total, added/existed/deleted/rejected, processed_at.
 
-### 5.8. Здоровье сервисов
+### 5.8. Service health
 
-По каждой пробе из `dashboard.probes`: имя + up/down (недоступен или
-таймаут).
+Per probe from `dashboard.probes`: name + up/down (unreachable or
+timeout).
 
-### 5.9. Деградация
+### 5.9. Degradation
 
-Ошибка секции (БД, Redis, проба) не роняет остальные: секция получает
-признак ошибки с текстом причины, интерфейс показывает «н/д». До первого
-успешного сбора `/api/status` отвечает 503.
+A section error (DB, Redis, a probe) does not take down the others: the
+section gets an error flag with the reason text, and the interface
+shows "n/a". Until the first successful build, `/api/status` responds
+503.
 
 ---
 
-## 6. Веб-интерфейс и API
+## 6. Web interface and API
 
-### 6.1. Роуты и статика
+### 6.1. Routes and static assets
 
-| Роут | Авторизация | Назначение |
+| Route | Auth | Purpose |
 |---|---|---|
-| `GET /` | да | HTML-страница дашборда |
-| `GET /assets/*` | да | статика (js/css) из `go:embed` |
-| `GET /api/status` | да | JSON снимка |
-| `GET /healthz` | нет | ping PostgreSQL (503 при сбое) |
-| `GET /livez` | нет | liveness |
-| `GET /robots.txt` | нет | `Disallow: /` |
+| `GET /` | yes | the dashboard HTML page |
+| `GET /assets/*` | yes | static assets (js/css) from `go:embed` |
+| `GET /api/status` | yes | the snapshot JSON |
+| `GET /healthz` | no | a PostgreSQL ping (503 on failure) |
+| `GET /livez` | no | liveness |
+| `GET /robots.txt` | no | `Disallow: /` |
 
 ### 6.2. `GET /api/status`
 
-JSON: поля зон/итогов/темпа/скоростей — как `crawlerctl status --json`
-(через internal/status, §4.5), плюс секции §5.5–5.8 и карта ошибок
-секций; null для недоступных значений. `Cache-Control: no-store`.
+JSON: the zone/totals/throughput/rate fields — as in
+`crawlerctl status --json` (via internal/status, §4.5), plus the
+§5.5–5.8 sections and a map of section errors; null for unavailable
+values. `Cache-Control: no-store`.
 
-### 6.3. Методы и заголовки
+### 6.3. Methods and headers
 
-Не GET/HEAD — 405. Заголовки ответов: `X-Content-Type-Options: nosniff`;
+Anything other than GET/HEAD — 405. Response headers:
+`X-Content-Type-Options: nosniff`;
 `Content-Security-Policy: default-src 'none'; script-src 'self';
-style-src 'self'; connect-src 'self'; img-src 'self' data:`. Таймауты
-сервера: ReadHeader 5 с, Read 10 с, Write 15 с, Idle 60 с.
+style-src 'self'; connect-src 'self'; img-src 'self' data:`. Server
+timeouts: ReadHeader 5 s, Read 10 s, Write 15 s, Idle 60 s.
 
-### 6.4. Поведение фронта
+### 6.4. Front-end behavior
 
-Автообновление `fetch /api/status` каждые ~5 с; спарклайны (SVG polyline)
-скоростей и очередей из истории опросов в памяти клиента (~120 точек);
-401 — приглашение повторного входа; «н/д» для деградированных секций.
+Auto-refresh via `fetch /api/status` every ~5 s; sparklines (SVG
+polyline) of the rates and queues from the poll history kept in client
+memory (~120 points); 401 — a re-login prompt; "n/a" for degraded
+sections.
 
-### 6.5. Локализация
+### 6.5. Localization
 
-Русский язык интерфейса (один).
-
----
-
-## 7. Авторизация и защита от подбора
-
-### 7.1. Схема доступа
-
-Один оператор: имя (`dashboard.username`) + пароль. Вход — HTTP Basic
-(браузер сам хранит и передаёт креды); передача кредов вне TLS допускается
-только в dev (loopback, §9.1).
-
-### 7.2. Хранение пароля
-
-Только хэш в `dashboard.password_hash` (§8.1), формат строки:
-
-```
-pbkdf2-sha256$<итерации>$<соль base64>$<ключ base64>
-```
-
-- PBKDF2-HMAC-SHA256; соль ≥ 16 байт (`crypto/rand`); ключ 32 байта.
-- Итерации читаются из строки; рекомендуемое при генерации — 600 000
-  (OWASP для PBKDF2-SHA256).
-- Открытый (plaintext) пароль в конфиге и окружении запрещён.
-
-### 7.3. Генерация секрета
-
-`crawlerctl dashboard-secret`: пароль из аргумента или stdin (справка
-предупреждает, что аргумент остаётся в истории shell), печать готовой
-строки `password_hash`.
-
-### 7.4. Сверка
-
-Имя и производный ключ сравниваются `subtle.ConstantTimeCompare`. Сверка
-KDF выполняется только при отсутствии валидной сессии (§7.5).
-
-### 7.5. Cookie-сессия
-
-После успешной Basic-сверки выдаётся cookie
-`<expiry>.<HMAC-SHA256(expiry, производный ключ KDF)>`: HttpOnly,
-SameSite=Lax, срок 24 ч. Ключ HMAC — сам производный ключ KDF: смена
-пароля инвалидирует все сессии, отдельный серверный секрет не нужен.
-Быстрая проверка cookie снимает стоимость KDF с периодического опроса.
-
-### 7.6. Защита от подбора
-
-Per-IP: после 5 неудачных сверок в течение минуты — отказ до конца окна,
-429 + `Retry-After` (in-memory, по образцу токен-бакета T-123).
-
-### 7.7. Обязательность кредов
-
-Пустые `username`/`password_hash` — сервис не стартует (ошибка запуска).
-Проверка выполняется в `cmd/dashboard`, а не в общем `config.Validate`:
-иначе требование коснулось бы всех сервисов проекта.
+The interface language is Russian (a single one).
 
 ---
 
-## 8. Конфигурация
+## 7. Authorization and brute-force protection
 
-### 8.1. Секция `dashboard`
+### 7.1. Access scheme
 
-| Поле | Тип | Default | Смысл |
+A single operator: a username (`dashboard.username`) + a password. The
+login is HTTP Basic (the browser stores and sends the credentials
+itself); sending credentials outside TLS is allowed only in dev
+(loopback, §9.1).
+
+### 7.2. Password storage
+
+Only a hash in `dashboard.password_hash` (§8.1); the string format:
+
+```
+pbkdf2-sha256$<iterations>$<salt base64>$<key base64>
+```
+
+- PBKDF2-HMAC-SHA256; a salt ≥ 16 bytes (`crypto/rand`); a 32-byte key.
+- The iterations are read from the string; the recommended value at
+  generation is 600,000 (OWASP for PBKDF2-SHA256).
+- A plaintext password in the config or the environment is forbidden.
+
+### 7.3. Secret generation
+
+`crawlerctl dashboard-secret`: the password from an argument or stdin
+(the help warns that the argument stays in the shell history); prints
+the ready `password_hash` string.
+
+### 7.4. Verification
+
+The username and the derived key are compared with
+`subtle.ConstantTimeCompare`. The KDF verification runs only when there
+is no valid session (§7.5).
+
+### 7.5. Cookie session
+
+After successful Basic verification a cookie is issued:
+`<expiry>.<HMAC-SHA256(expiry, KDF-derived key)>` — HttpOnly,
+SameSite=Lax, a 24 h lifetime. The HMAC key is the KDF-derived key
+itself: a password change invalidates all sessions, and no separate
+server-side secret is needed. The fast cookie check takes the KDF cost
+off the periodic polling.
+
+### 7.6. Brute-force protection
+
+Per-IP: after 5 failed verifications within a minute — refusal until
+the end of the window, 429 + `Retry-After` (in-memory, following the
+T-123 token-bucket pattern).
+
+### 7.7. Mandatory credentials
+
+Empty `username`/`password_hash` — the service does not start (a
+startup error). The check is performed in `cmd/dashboard`, not in the
+shared `config.Validate`: otherwise the requirement would affect every
+service of the project.
+
+---
+
+## 8. Configuration
+
+### 8.1. The `dashboard` section
+
+| Field | Type | Default | Meaning |
 |---|---|---|---|
-| `listen` | строка | `127.0.0.1:8090` | публичный адрес дашборда |
-| `refresh` | длительность | `5s` | период сборки снимка (коридор 1s–5m) |
-| `username` | строка | `""` | логин оператора (обязателен при запуске, §7.7) |
-| `password_hash` | строка | `""` | формат §7.2 (обязателен при запуске, §7.7) |
-| `probes` | карта имя→URL | `{}` | базы URL метрик сервисов для `/livez`-проб |
+| `listen` | string | `127.0.0.1:8090` | the public dashboard address |
+| `refresh` | duration | `5s` | the snapshot build period (allowed range 1s–5m) |
+| `username` | string | `""` | the operator login (required at startup, §7.7) |
+| `password_hash` | string | `""` | the format per §7.2 (required at startup, §7.7) |
+| `probes` | name→URL map | `{}` | base metric URLs of the services for `/livez` probes |
 
-### 8.2. Переменные окружения
+### 8.2. Environment variables
 
 `CRAWLER_DASHBOARD_LISTEN`, `CRAWLER_DASHBOARD_REFRESH_INTERVAL`,
 `CRAWLER_DASHBOARD_USERNAME`, `CRAWLER_DASHBOARD_PASSWORD_HASH`,
-`CRAWLER_DASHBOARD_PROBES` (формат «имя=url,имя2=url2» — по образцу
-`zone_weights`).
+`CRAWLER_DASHBOARD_PROBES` (the format "name=url,name2=url2" —
+following the `zone_weights` pattern).
 
-### 8.3. Валидация
+### 8.3. Validation
 
-`listen` — `[host]:port`; `refresh` — 1s..5m; `probes` — абсолютные
-http(s)-URL. `username`/`password_hash` общим `config.Validate` не
-проверяются (§7.7).
-
----
-
-## 9. Безопасность
-
-### 9.1. Сеть
-
-Dev — публичный порт только на `127.0.0.1` (compose). Боевой режим —
-listen на loopback (или unix socket) за reverse-proxy с TLS; схема та же,
-что зафиксирована для лендинга (T-124), образец конфига появится там.
-
-### 9.2. Логи
-
-Пароль, хэш и значение cookie в логи не пишутся; неудачные сверки — Warn
-с IP-адресом, без кредов.
-
-### 9.3. Данные и соединения
-
-Дашборд не выполняет записей в БД и Redis. Исходящие соединения — только
-PostgreSQL, Redis и настроенные пробы (§4.3); активных зондов наружу нет.
+`listen` — `[host]:port`; `refresh` — 1s..5m; `probes` — absolute
+http(s) URLs. `username`/`password_hash` are not checked by the shared
+`config.Validate` (§7.7).
 
 ---
 
-## 10. Метрики собственного сервиса
+## 9. Security
 
-На metrics-порту (§4.2), фабрикой `internal/metrics`:
+### 9.1. Network
 
-- `crawler_dashboard_snapshots_total{result=ok|error}` — счётчик сборок;
-- `crawler_dashboard_snapshot_seconds` — гистограмма длительности сборки.
+Dev — the public port is bound to `127.0.0.1` only (compose).
+Production mode — listen on loopback (or a unix socket) behind a
+reverse proxy with TLS; the scheme is the same as the one fixed for the
+landing page (T-124); the config sample will appear there.
+
+### 9.2. Logs
+
+The password, the hash, and the cookie value are never written to logs;
+failed verifications — Warn with the IP address, without credentials.
+
+### 9.3. Data and connections
+
+The dashboard performs no writes to the DB or Redis. Outbound
+connections — only PostgreSQL, Redis, and the configured probes (§4.3);
+no active probes outward.
 
 ---
 
-## 11. Развёртывание
+## 10. Own-service metrics
+
+On the metrics port (§4.2), via the `internal/metrics` factory:
+
+- `crawler_dashboard_snapshots_total{result=ok|error}` — a build
+  counter;
+- `crawler_dashboard_snapshot_seconds` — a histogram of the build
+  duration.
+
+---
+
+## 11. Deployment
 
 ### 11.1. Compose (dev)
 
-Сервис `dashboard`, profile app: клон `go-common` (SERVICE=dashboard,
-METRICS_PORT=9108, app-dns), порт `127.0.0.1:${DASHBOARD_PORT:-8090}:8090`,
-depends_on postgres/redis (healthy), `mem_limit` 256m; healthcheck —
-`/livez` по METRICS_PORT (общий якорь go-common).
+The `dashboard` service, the app profile: a clone of `go-common`
+(SERVICE=dashboard, METRICS_PORT=9108, app-dns), the port
+`127.0.0.1:${DASHBOARD_PORT:-8090}:8090`, depends_on postgres/redis
+(healthy), `mem_limit` 256m; the healthcheck — `/livez` on METRICS_PORT
+(the shared go-common anchor).
 
-### 11.2. systemd (бой)
+### 11.2. systemd (production)
 
-`crawler-dashboard.service` по образцу `crawler-monitor.service`:
-User=crawler-dashboard, Group=crawler,
-`CRAWLER_DASHBOARD_LISTEN=127.0.0.1:8090`, `MemoryMax=128M`, изоляция
-ТЗ §9/§10.1 (NoNewPrivileges, ProtectSystem=strict и пр.). Создание
-пользователя документируется рядом с прочими в docs/deploy.md.
+`crawler-dashboard.service` following the `crawler-monitor.service`
+pattern: User=crawler-dashboard, Group=crawler,
+`CRAWLER_DASHBOARD_LISTEN=127.0.0.1:8090`, `MemoryMax=128M`, the
+isolation of spec §9/§10.1 (NoNewPrivileges, ProtectSystem=strict,
+etc.). User creation is documented alongside the others in
+docs/deploy.md.
 
 ### 11.3. Prometheus
 
-Job `dashboard` (dns_sd, порт 9108) в
+The `dashboard` job (dns_sd, port 9108) in
 deploy/docker/prometheus/prometheus.yml.
 
 ---
 
-## 12. Тестирование и приёмка
+## 12. Testing and acceptance
 
-1. Юнит-тесты: авторизация (§7: сверка, cookie, блокировка подбора),
-   SQL-контракты и семантика агрегатов (§4.5), деградация секций (§5.9),
-   роуты/методы/заголовки (§6), конфигурация (§8), генерация секрета
-   (§7.3).
-2. Интеграционный тест: полный снимок на testbed-стеке
+1. Unit tests: authorization (§7: verification, cookie, brute-force
+   blocking), SQL contracts and aggregate semantics (§4.5), section
+   degradation (§5.9), routes/methods/headers (§6), configuration (§8),
+   secret generation (§7.3).
+2. Integration test: a full snapshot on the testbed stack
    (skipUnlessIntegration).
-3. Приёмка: `make test` + `make lint` зелёные; `make up` →
-   `127.0.0.1:8090` запрашивает пароль; после входа числа сходятся с
-   `crawlerctl status`; остановка Redis — очереди «н/д», остальная сводка
-   жива (§5.9).
+3. Acceptance: `make test` + `make lint` green; `make up` →
+   `127.0.0.1:8090` asks for a password; after login the numbers match
+   `crawlerctl status`; stopping Redis — the queues show "n/a", the
+   rest of the summary stays alive (§5.9).
 
 ---
 
-## 13. Принятые решения и отклонённые варианты
+## 13. Accepted decisions and rejected alternatives
 
-1. Свой Go-сервис вместо Grafana: ноль новых контейнеров и зависимостей,
-   русская локаль, полный контроль состава; исторические графики остаются
-   за Prometheus. Отклонено: Grafana потребовала бы контейнер и exporter
-   DB-счётчиков, локализация ограничена.
-2. Basic Auth + PBKDF2 (stdlib `crypto/pbkdf2`) вместо формы входа и сессий
-   на сервере: минимум кода, браузер сам хранит креды; cookie-сессия
-   (§7.5) снимает стоимость KDF с периодического опроса.
-3. Отдельный сервис `cmd/dashboard`, а не раздел `/admin` будущего
-   `cmd/web`: не зависит от этапа 13, разная аудитория и разные данные.
-4. Кэш снимков фоновым циклом (§4.4): нагрузка на БД фиксирована
-   частотой refresh и не зависит от числа клиентов.
-5. Периодический опрос вместо WebSocket/SSE: достаточно для операционной
-   сводки, код и отладка проще.
+1. A custom Go service instead of Grafana: zero new containers and
+   dependencies, a Russian locale, full control of the composition;
+   historical graphs remain with Prometheus. Rejected: Grafana would
+   require a container and a DB-counter exporter, and its localization
+   is limited.
+2. Basic Auth + PBKDF2 (stdlib `crypto/pbkdf2`) instead of a login form
+   and server-side sessions: minimal code, the browser stores the
+   credentials itself; the cookie session (§7.5) takes the KDF cost off
+   the periodic polling.
+3. A separate `cmd/dashboard` service rather than an `/admin` section
+   of the future `cmd/web`: no dependency on stage 13, a different
+   audience and different data.
+4. Snapshot caching by a background loop (§4.4): the DB load is fixed
+   by the refresh frequency and does not depend on the number of
+   clients.
+5. Periodic polling instead of WebSocket/SSE: sufficient for an
+   operational summary; the code and debugging are simpler.

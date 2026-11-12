@@ -1,17 +1,17 @@
-# Техническое задание: выборка диспетчера — только зоны с работой
+# Specification: dispatcher selection — only zones with work
 
-Версия: 1.0 (по итогам разбора лога медленных запросов боя 2026-10-24 —
-запрос №9 журнала, критический путь конвейера; лог:
-`log_min_duration_statement = 3000`, T-177). Опирается на колонку
-`zones.domains_pending` волны инкрементальных счётчиков
+Version: 1.0 (based on the analysis of the production slow-query log of
+2026-10-24 — log entry #9, the critical path of the pipeline; the log:
+`log_min_duration_statement = 3000`, T-177). It relies on the
+`zones.domains_pending` column of the incremental counters wave
 ([`TZ_incremental_counters.md`](./TZ_incremental_counters.md), T-178) —
-реализация **после** T-178.
+implementation **after** T-178.
 
 ---
 
-## 1. Сегодняшнее состояние и источник
+## 1. Current state and source
 
-Запрос `dispatchZoneSQL` (`internal/scheduler/dispatch.go:103`):
+The `dispatchZoneSQL` query (`internal/scheduler/dispatch.go:103`):
 
 ```sql
 SELECT d.zone_id, d.id, d.label
@@ -24,129 +24,144 @@ JOIN LATERAL (
 ) AS d ON true
 ```
 
-Вызывается `DispatchBatch` (T-027) — главный впуск конвейера: активные
-зоны (`dispatchZonesSQL`) → LATERAL-префиксы pending-очередей по
-частичному индексу `domains_pending_idx` → взвешенное слияние в Go →
-пачка `scheduler.batch_size` в q:dns (через перевод в queued, T-028).
+Called by `DispatchBatch` (T-027) — the main intake of the pipeline:
+active zones (`dispatchZonesSQL`) → LATERAL prefixes of the pending
+queues via the partial index `domains_pending_idx` → a weighted merge
+in Go → a `scheduler.batch_size` batch into q:dns (via the transition
+to queued, T-028).
 
-Статистика боя (журнал 24.10): 26 срабатываний порога 3 с (окно
-09:50–10:09), медиана **5,2 с**, max **132 с**.
+Production statistics (the log of Oct 24): 26 triggers of the 3 s
+threshold (the window 09:50–10:09), median **5.2 s**, max **132 s**.
 
-## 2. Диагноз (EXPLAIN ANALYZE на боевой БД, 24.10)
+## 2. Diagnosis (EXPLAIN ANALYZE on the production DB, Oct 24)
 
-Планы правильные — Index Scan `domains_default_zone_id_id_idx` (частичный
-pending-индекс T-104), keyset `id > after`. Проблема — **объём работы
-впустую**, спроектированный до наполнения справочника зон IANA (T-125):
+The plans are correct — Index Scan `domains_default_zone_id_id_idx`
+(the partial pending index, T-104), keyset `id > after`. The problem is
+**wasted work**, designed before the IANA zone directory was filled in
+(T-125):
 
-1. **Круг 1 — 2204 LATERAL-проб**, по одной на каждую активную зону
-   (справочник IANA целиком `is_active`): ~2000 зон почти пусты по
-   pending (средняя вернула 3 строки) — каждая проба всё равно платит
-   спуск по большому индексу партиции + heap-визит. Замер: 0,6–1,0 с
-   на круг, 0,5–0,8 с из них — I/O (1,2–3,6 тыс. чтений).
-2. **Круг 2 «дозаполнения»** — зоны, вернувшие ровно квоту, считаются
-   «голодными» и перечитываются с квотой = Limit (комментарий
-   dispatch.go: «с раунда 1 quota = Limit»). При 2204 зонах квота
-   круга 1 = ceil(L/2204)+1 = 1 → «голодная» = любая зона с хоть одним
-   pending → круг 2 читает до ~N_зон × 1000 строк с heap-визитами
-   (метки) — до ~200 тыс. чтений за пачку. Это доминанта медианы 5,2 с;
-   max 132 с — эпизод I/O-конкуренции (часы кампании T-167).
-3. `domains_total > 0` не фильтрует (проверено на бою: 2204 из 2204) —
-   зоны различает **pending**, а не наличие доменов.
+1. **Round 1 — 2204 LATERAL probes**, one per active zone (the IANA
+   directory is `is_active` in full): ~2000 zones are nearly empty in
+   terms of pending (the average returned 3 rows) — each probe still
+   pays the descent along the large partition index + a heap visit.
+   Measurement: 0.6–1.0 s per round, 0.5–0.8 s of which is I/O
+   (1.2–3.6k reads).
+2. **Round 2, the "top-up"** — zones that returned exactly the quota
+   are considered "starved" and are re-read with quota = Limit (the
+   dispatch.go comment: "from round 1 on, quota = Limit"). With 2204
+   zones the round 1 quota = ceil(L/2204)+1 = 1 → "starved" = any zone
+   with at least one pending → round 2 reads up to ~N_zones × 1000
+   rows with heap visits (labels) — up to ~200k reads per batch. This
+   dominates the median of 5.2 s; the max of 132 s is an
+   I/O-contention episode (the T-167 campaign hours).
+3. `domains_total > 0` does not filter (verified in production: 2204
+   of 2204) — what tells zones apart is **pending**, not the presence
+   of domains.
 
-## 3. Целевое состояние
+## 3. Target state
 
-1. `dispatchZonesSQL` отбирает только зоны с работой:
-   `WHERE is_active AND domains_pending > 0` — круг 1 = сотни проб
-   вместо 2204, круг 2 — только реально голодные зоны.
-2. Квота круга 2 ограничена остатком пачки: чтение сверх остатка не
-   может попасть в слияние (внешнее ограничение — Limit), а сегодня
-   читается `Limit` на каждую голодную зону.
-3. Семантика выборки не меняется: те же домены, тот же взвешенный
-   круговой порядок, те же ключи/инварианты T-027; меняется только
-   множество предлагаемых зон (пустые по pending исключены — их проба и
-   сегодня возвращает 0 строк).
+1. `dispatchZonesSQL` selects only zones with work:
+   `WHERE is_active AND domains_pending > 0` — round 1 = hundreds of
+   probes instead of 2204; round 2 — only genuinely starved zones.
+2. The round 2 quota is capped by the batch remainder: a read beyond
+   the remainder cannot make it into the merge (the external cap is
+   Limit), while today `Limit` is read for every starved zone.
+3. The selection semantics are unchanged: the same domains, the same
+   weighted round-robin order, the same keys/invariants of T-027; only
+   the set of offered zones changes (zones empty in terms of pending
+   are excluded — their probe returns 0 rows even today).
 
-## 4. Изменения
+## 4. Changes
 
-### 4.1. dispatchZonesSQL — фильтр по работе
+### 4.1. dispatchZonesSQL — a filter by work
 
 ```sql
 SELECT id, name FROM zones WHERE is_active AND domains_pending > 0
 ```
 
-- Колонка `zones.domains_pending` — ТЗИ §4.1; её семантика ровно
-  предикат диспетчера (`check_state = 0` по базовому множеству
-  `status <> deleted`).
-- Свежесть: инкременты переходов T-178 ведут колонку в тех же
-  транзакциях (enqueue диспетчера сам декрементирует — колонка точна к
-  следующей пачке; новый ингест зоны инкрементирует `apply_add` — зона
-  видна сразу, без ожидания реконсиляции); реконсиляция чинит дрейф.
-- Граница доверия: дрейф счётчика (ручной SQL мимо инкрементов) может
-  скрыть зону с работой до ближайшей реконсиляции
-  (`monitor.zone_stats_interval`, 5 мин) — наблюдаем метрикой дрейфа
-  ТЗИ §11; обратный случай (счётчик > 0, очередь пуста) — одна
-  «холостая» проба, деградации нет.
-- Зависимость: **T-178** (колонка + инкременты enqueue/apply_add).
-  До его деплоя задача не реализуема без дублирования семантики —
-  порядок очереди фиксируется.
+- The `zones.domains_pending` column — incremental counters spec §4.1;
+  its semantics is exactly the dispatcher predicate (`check_state = 0`
+  over the base set `status <> deleted`).
+- Freshness: the T-178 transition increments maintain the column in
+  the same transactions (the dispatcher enqueue decrements it itself —
+  the column is exact by the next batch; a new zone ingest increments
+  via `apply_add` — the zone is visible immediately, without waiting
+  for the reconciliation); the reconciliation repairs drift.
+- Trust boundary: counter drift (manual SQL bypassing the increments)
+  can hide a zone with work until the nearest reconciliation
+  (`monitor.zone_stats_interval`, 5 min) — observed via the drift
+  metric of incremental counters spec §11; the reverse case
+  (counter > 0, the queue empty) is a single "idle" probe, no
+  degradation.
+- Dependency: **T-178** (the column + the enqueue/apply_add
+  increments). Before its deploy the task is not implementable without
+  duplicating the semantics — the queue order is fixed.
 
-### 4.2. Квота круга 2 — остаток пачки
+### 4.2. Round 2 quota — the batch remainder
 
-В `DispatchBatch` (логика дозаполнения): для голодных зон круга ≥ 2
-квота LATERAL = `remaining = Limit − набрано` (сегодня — Limit).
-Корректность: вклад любой зоны в пачку не превосходит остатка — слиянию
-достаточно `remaining` строк зоны, чтобы заполнить пачку целиком;
-чтение сверх того в слияние попасть не может (внешний LIMIT — размер
-пачки). Худший случай «пачка из одной зоны» — remaining = Limit,
-поведение прежнее. Тест-комментарий мутанта dispatchMaxRounds
-обновить.
+In `DispatchBatch` (the top-up logic): for starved zones of round ≥ 2
+the LATERAL quota = `remaining = Limit − collected` (today — Limit).
+Correctness: any zone's contribution to the batch does not exceed the
+remainder — `remaining` rows of a zone are enough for the merge to fill
+the batch completely; a read beyond that cannot make it into the merge
+(the external LIMIT is the batch size). The worst case, "a batch from a
+single zone" — remaining = Limit, the behavior is unchanged. Update the
+test comment of the dispatchMaxRounds mutant.
 
-### 4.3. Что не меняется
+### 4.3. What is unchanged
 
-`dispatchZoneSQL` (LATERAL-часть) — без правок: спуск по частичному
-индексу остаётся точечным чтением префикса очереди зоны; веса,
-слияние, publication rate, `ResolveZoneWeights` (T-106) — без правок.
+`dispatchZoneSQL` (the LATERAL part) — no edits: the descent along the
+partial index remains a point read of the zone queue prefix; the
+weights, the merge, publication rate, `ResolveZoneWeights` (T-106) —
+no edits.
 
-## 5. Тестирование и приёмка
+## 5. Testing and acceptance
 
-1. Юнит: текст `dispatchZonesSQL` (точный контракт `AND
-   domains_pending > 0`); квота круга 2 = remaining (таблица случаев:
-   одна голодная зона, несколько, remaining < Limit); круг 1 не
-   предлагает зону с domains_pending = 0 (фейковый пул считает пробы).
-2. Интеграция: зона с pending выбирается, зона с domains_pending = 0
-   не пробируется; после исчерпания pending зоны (перевод всех в
-   queued) зона исчезает из выборки; ingest новых доменов в пустую
-   зону делает её видимой (инкремент apply_add пути T-178).
-3. Приёмка: записи `dispatchZoneSQL`/`dispatchZoneSQL-раундов`
-   исчезают из журнала медленных (порог 3 с, T-177); темп публикаций
-   q:dns не падает (замер комплектом T-092), задержка выборки пачки —
-   единицы сотен мс; `make test` + `make test-integration` зелёные.
+1. Unit: the text of `dispatchZonesSQL` (the exact contract `AND
+   domains_pending > 0`); the round 2 quota = remaining (a table of
+   cases: one starved zone, several, remaining < Limit); round 1 does
+   not offer a zone with domains_pending = 0 (a fake pool counts the
+   probes).
+2. Integration: a zone with pending is selected, a zone with
+   domains_pending = 0 is not probed; after a zone's pending is
+   exhausted (everything transitioned to queued) the zone disappears
+   from the selection; ingesting new domains into an empty zone makes
+   it visible (the apply_add increment of the T-178 path).
+3. Acceptance: the `dispatchZoneSQL`/`dispatchZoneSQL-rounds` entries
+   disappear from the slow log (the 3 s threshold, T-177); the q:dns
+   publication rate does not drop (measured with the T-092 kit), the
+   batch selection latency is a few hundred ms; `make test` +
+   `make test-integration` green.
 
-## 6. Принятые решения и отклонённые варианты
+## 6. Accepted decisions and rejected alternatives
 
-1. **Фильтр по `domains_pending`, не `domains_total`**: замер §2.3 —
-   все 2204 зоны имеют домены; различает pending. Семантика колонки
-   совпадает с предикатом диспетчера — проб, возвращающих пустоту,
-   не остаётся вовсе.
-2. **Синергия с T-178 вместо in-memory эвристик** (пропуск «пустых»
-   зон состоянием планировщика): состояние/эвристики/гонки с новым
-   ингестом против одной колонки, уже поддерживаемой переходами;
-   порядок реализации — после T-178.
-3. **Кап квоты круга 2 = remaining**: чтение `Limit` на каждую голодную
-   зону — артефакт защиты от патологических весов (dispatchMaxRounds);
-   upper bound вклада зоны — остаток пачки, чтение сверх — мусор.
-4. Отклонён **EXISTS-подзапрос pending в dispatchZonesSQL**: та же
-   цена пробы, что круг 1 сегодня (спуск в индекс партиции на зону) —
-   не фильтрует, а переносит стоимость.
-5. Отклонено **«перепроектировать слияние на SQL»**: взвешенный
-   круговой порядок — алгоритм Go (T-027/T-106), выносить в SQL ради
-   одного фильтра — смена точки правды без выигрыша.
+1. **A filter by `domains_pending`, not `domains_total`**: the §2.3
+   measurement — all 2204 zones have domains; pending is what tells
+   them apart. The column semantics matches the dispatcher predicate —
+   no probes returning emptiness remain at all.
+2. **Synergy with T-178 instead of in-memory heuristics** (skipping
+   "empty" zones via scheduler state): state/heuristics/races with new
+   ingest versus a single column already maintained by transitions;
+   the implementation order — after T-178.
+3. **The round 2 quota cap = remaining**: reading `Limit` for every
+   starved zone is an artifact of the protection against pathological
+   weights (dispatchMaxRounds); the upper bound of a zone's
+   contribution is the batch remainder, a read beyond it is garbage.
+4. Rejected an **EXISTS pending subquery in dispatchZonesSQL**: the
+   same probe cost as round 1 today (a descent into the partition
+   index per zone) — it does not filter, it moves the cost.
+5. Rejected **"redesigning the merge in SQL"**: the weighted
+   round-robin order is a Go algorithm (T-027/T-106); moving it into
+   SQL for a single filter is a change of the source of truth with no
+   gain.
 
-## 7. Этапность
+## 7. Staging
 
-1. `dispatchZonesSQL` + проводка фильтра (после деплоя T-178).
-2. Кап квоты круга 2 (§4.2) — независимо, можно раньше T-178.
-3. Тесты §5, комментарий дозаполнения в dispatch.go.
-4. Документация: `docs/services.md` (диспетчер — читатель счётчиков
-   зон, дополнение к ТЗИ §8), примечание в ТЗИ о новом читателе
-   `domains_pending`.
+1. `dispatchZonesSQL` + the filter wiring (after the T-178 deploy).
+2. The round 2 quota cap (§4.2) — independent, may be done earlier
+   than T-178.
+3. The §5 tests, the top-up comment in dispatch.go.
+4. Documentation: `docs/services.md` (the dispatcher as a reader of
+   the zone counters, an addition to incremental counters spec §8),
+   a note in the incremental counters spec about the new
+   `domains_pending` reader.
