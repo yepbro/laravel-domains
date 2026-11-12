@@ -857,7 +857,7 @@ func TestFetchLaravelStatsDegradations(t *testing.T) {
 	// returned.
 	pool = seeded(map[string]statusGlitch{laravelTotalsSQL: {badRow: true}})
 	_, err = FetchLaravelStats(ctx, pool)
-	if err == nil || !strings.Contains(err.Error(), "status: laravel: чтение:") {
+	if err == nil || !strings.Contains(err.Error(), "status: laravel: reading:") {
 		t.Fatalf("нечитаемая строка агрегата: ошибка = %v, want «чтение»", err)
 	}
 	if n := pool.closeCount(); n != 1 {

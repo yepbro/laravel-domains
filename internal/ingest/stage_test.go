@@ -342,7 +342,7 @@ func TestStage_SourceError(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), boom.Error()) {
 		t.Fatalf("err = %v, want обёрнутая %v", err, boom)
 	}
-	if !strings.Contains(err.Error(), "скопировано 20") {
+	if !strings.Contains(err.Error(), "copied 20") {
 		t.Errorf("err = %v, want упоминание 20 закоммиченных строк (2 полные пачки)", err)
 	}
 	if staged != 20 {

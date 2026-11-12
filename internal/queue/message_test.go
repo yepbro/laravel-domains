@@ -291,7 +291,7 @@ func TestDecodeBadData(t *testing.T) {
 		},
 		{
 			"бит субдомена вне диапазона", StreamHTTP,
-			`{"task_id":"t1","zone_id":1,"domain_id":1,"name":"a.test","subdomains":[{"subdomain_id":63,"label":"x","addrs":["192.0.2.1"]}]}`, "вне диапазона",
+			`{"task_id":"t1","zone_id":1,"domain_id":1,"name":"a.test","subdomains":[{"subdomain_id":63,"label":"x","addrs":["192.0.2.1"]}]}`, "out of range",
 			func(d Delivery) error { _, err := Decode[HTTPTask](d); return err },
 		},
 		{
@@ -332,7 +332,7 @@ func TestDecodeBadData(t *testing.T) {
 		},
 		{
 			"бит субдомена вне диапазона", StreamDead,
-			`{"task_id":"t1","stream":"q:render","entry_id":"1-0","attempts":1,"subdomain_id":63}`, "вне диапазона",
+			`{"task_id":"t1","stream":"q:render","entry_id":"1-0","attempts":1,"subdomain_id":63}`, "out of range",
 			func(d Delivery) error { _, err := Decode[Dead](d); return err },
 		},
 	}
