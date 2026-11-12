@@ -47,6 +47,11 @@ selects of retention/render-late (production incident 09–10.11.2026, retention
 Stage 44: **T-274** — retention restart resilience: the select
 cap config key (7200 s) + a persistent drain cursor (every
 http-worker restart currently means a new hour-long catch-up from scratch).
+Stage 45: **T-275** — block_trackers probes moved to async-XHR (moli
+upstream fixes). Stage 46: **T-276** — the block_trackers sync probe on
+the exact-URL semantics of moli #2729. Stage 47: **T-277** — TTL for
+subdomain_results passports of non-findings (10 days): frees ~8–9 GB,
+steady-state table, covers the future recheck-ghost class.
 
 ## Stage 35: render engine selection and the fallback queue (T-233…T-249)
 
@@ -322,3 +327,11 @@ of scope (waiting for upstream #4151 — one browser context per connection).
   → блокировка, включая редиректы), tracker-зонд блокируется на обоих
   движках — ожидание «moli: 200 в сеть» устарело —
   [подробности](task/T-276-block-trackers-sync-exact-url.md).
+
+## Stage 47: TTL for subdomain_results passports of non-findings (T-277)
+
+- **T-277** [new] — P2, background TTL pass (default 10 days, config key):
+  delete retention-trimmed non-finding passports with finding protection
+  and refcount safety — frees ~8–9 GB now, holds the table at a steady
+  state (~1–1.5 GB), and automatically covers the future recheck-ghost
+  class — [details](task/T-277-subdomain-results-passport-ttl.md).
