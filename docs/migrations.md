@@ -1,195 +1,217 @@
-# Миграции PostgreSQL
+# PostgreSQL migrations
 
-Схема БД хранится в репозитории и применяется **автоматически при старте
-сервисов** — отдельного шага развёртывания нет (ТЗ 6.3).
+The DB schema is stored in the repository and applied **automatically at
+service startup** — there is no separate deployment step (spec 6.3).
 
-## Как устроено
+## How it is set up
 
-| Часть | Где | Назначение |
+| Part | Where | Purpose |
 |---|---|---|
-| SQL-миграции | `migrations/` | пары `NNNNNN_имя.up.sql` / `.down.sql` (формат golang-migrate) |
-| Встраивание | `migrations/embed.go` | `go:embed *.sql` — набор попадает в бинарник сервиса |
-| Раннер | `internal/migrate` | применяет встроенный набор через golang-migrate как библиотеку |
-| Подключение к запуску | `internal/service` | DSN из конфигурации (`Options.Config`, ТЗ 5.10) или `Options.PGDSN` → `migrate.Up` до старта HTTP-сервера метрик |
+| SQL migrations | `migrations/` | `NNNNNN_name.up.sql` / `.down.sql` pairs (the golang-migrate format) |
+| Embedding | `migrations/embed.go` | `go:embed *.sql` — the set ends up in the service binary |
+| Runner | `internal/migrate` | applies the embedded set via golang-migrate as a library |
+| Hookup to startup | `internal/service` | the DSN from the configuration (`Options.Config`, spec 5.10) or `Options.PGDSN` → `migrate.Up` before the metrics HTTP server starts |
 
-Все долгоживущие сервисы (ingest, scheduler, dns-worker, http-worker,
-render-worker, analyzer, monitor, web, dashboard) применяют миграции при старте: healthcheck
-начинает отвечать только на актуальной схеме. `crawlerctl` миграции не применяет
-— это CLI: схему к его запуску гарантируют сервисы (БД-команды `status`,
-`domain`, `zones`, `subdomains`, `reanalyze`, `recheck` рассчитывают на
-уже подготовленную схему).
+All long-lived services (ingest, scheduler, dns-worker, http-worker,
+render-worker, analyzer, monitor, web, dashboard) apply the migrations at startup: the healthcheck
+starts answering only on the current schema. `crawlerctl` does not apply
+migrations — it is a CLI: the services guarantee the schema by the time
+it starts (the DB commands `status`,
+`domain`, `zones`, `subdomains`, `reanalyze`, `recheck` assume an
+already-prepared schema).
 
-DSN сервисы берут из конфигурации ([`configuration.md`](configuration.md)):
-переменная `CRAWLER_POSTGRES_DSN` или устаревшая `APP_PG_DSN` (её задаёт
-`deploy/docker/compose.yaml` и Makefile) поверх `postgres.dsn` YAML-файла.
+The services take the DSN from the configuration
+([`configuration.md`](configuration.md)): the `CRAWLER_POSTGRES_DSN`
+variable or the deprecated `APP_PG_DSN` (set by
+`deploy/docker/compose.yaml` and the Makefile) on top of the `postgres.dsn`
+YAML key.
 
-## Параллельный старт
+## Parallel startup
 
-Сервисы стартуют одновременно, поэтому раннер:
+The services start simultaneously, so the runner:
 
-- берёт сессионную `pg_advisory_lock` на выделенном соединении — она
-  сериализует и создание `schema_migrations`, и применение миграций между
-  всеми экземплярами (ждёт до 5 минут, `lockTimeout` в `internal/migrate`);
-- внутри golang-migrate есть своя advisory-блокировка на время `Up`, поэтому
-  CLI `migrate` и раннер тоже не конфликтуют;
-- «миграции уже применены» (`ErrNoChange`) — не ошибка: рестарты и hot reload
-  (air пересобирает сервис при правке кода) безопасны.
+- takes a session-level `pg_advisory_lock` on a dedicated connection —
+  it serializes both the creation of `schema_migrations` and the
+  migration applies across all instances (it waits for up to 5 minutes,
+  the `lockTimeout` in `internal/migrate`);
+- golang-migrate itself holds its own advisory lock for the duration of
+  `Up`, so the CLI `migrate` and the runner do not conflict either;
+- "the migrations are already applied" (`ErrNoChange`) — not an error:
+  restarts and hot reload
+  (air rebuilds the service on a code change) are safe.
 
-## Остановка во время применения
+## Interruption during apply
 
-SIGTERM/SIGINT во время применения миграций (T-112) не убивает процесс
-посреди миграции и не заставляет её дорабатывать: обработчики сигналов
-регистрируются до миграций (C-04), отменяются фазы ожидания (подключение
-к БД, advisory-блокировки), а применяющаяся миграция прерывается
-снятием выполняющегося SQL-запроса на стороне PostgreSQL —
-`pg_cancel_backend` по соединениям раннера (они помечены уникальным
-`application_name` в `pg_stat_activity`, поэтому применяющая миграция
-другого экземпляра и запросы сервисов не затрагиваются).
+SIGTERM/SIGINT during a migration apply (T-112) does not kill the
+process mid-migration and does not force the migration to run to
+completion: the signal handlers are registered before the migrations
+(C-04), the waiting phases are cancelled (connecting to the DB,
+advisory locks), and the applying migration is interrupted by cancelling
+the running SQL statement on the PostgreSQL side —
+`pg_cancel_backend` over the runner's connections (they are marked with
+a unique `application_name` in `pg_stat_activity`, so the applying
+migration of another instance and the services' queries are not
+touched).
 
-Атомарность прерывания гарантирует сам PostgreSQL: драйвер pgx выполняет
-файл миграции одним запросом простого протокола, а несколько инструкций
-в одном таком запросе сервер выполняет в единой неявной транзакции
-(файлы миграций не содержат собственных `BEGIN`/`COMMIT`). Отмена
-откатывает файл целиком — схема остаётся ровно на предыдущей версии.
+The atomicity of the interruption is guaranteed by PostgreSQL itself:
+the pgx driver executes a migration file as a single simple-protocol
+query, and the server executes several statements in one such query
+within a single implicit transaction (the migration files contain no
+`BEGIN`/`COMMIT` of their own). The cancellation rolls back the file as
+a whole — the schema stays exactly at the previous version.
 
-golang-migrate помечает версию `dirty` до выполнения файла и снимает
-метку после успеха, поэтому после отмены раннер сам возвращает версию
-к последней применённой (семантика `migrate force <v−1>`, но только
-когда прерывание гарантированно пришлось на тело миграции). Итог:
+golang-migrate marks the version `dirty` before executing the file and
+removes the mark after success, so after a cancellation the runner
+itself returns the version to the last applied one (the semantics of
+`migrate force <v−1>`, but only
+when the interruption is guaranteed to have hit the migration body).
+The outcome:
 
-- сервис завершается штатно и быстро (`ErrInterrupted` → graceful exit),
-  не поднимая пул БД и рабочую логику;
-- повторный старт применяет прерванную миграцию заново — dirty-состояния
-  не остаётся.
+- the service exits normally and quickly (`ErrInterrupted` → graceful
+  exit), without bringing up the DB pool or the working logic;
+- a repeated start applies the interrupted migration again — no
+  dirty state is left behind.
 
-Запасной путь: если снять запрос не удалось (не-URL DSN без
-`application_name`, БД недоступна для запроса отмены) — применяющаяся
-миграция дорабатывает до конца (поведение C-04), затем сервис
-останавливается штатно.
+The fallback path: if the statement could not be cancelled (a non-URL
+DSN without an `application_name`, the DB unreachable for the
+cancellation request) — the applying migration runs to the end (the
+C-04 behavior), then the service stops normally.
 
-Проверяется интеграционным тестом `test/integration/migrate_test.go`
-(`TestMigrate_InterruptedMidApply`): отмена в середине длительной
-миграции → откат файла и версии → повторный старт доводит применение.
+Verified by the integration test `test/integration/migrate_test.go`
+(`TestMigrate_InterruptedMidApply`): a cancellation in the middle of
+a long migration → the file and version roll back → a repeated start
+completes the apply.
 
-## Создание новой миграции
+## Creating a new migration
 
 ```bash
 make migrate-new NAME=results_indexes
 # → migrations/000003_results_indexes.{up,down}.sql
 ```
 
-Правьте SQL-файлы; при следующем рестарте сервисов (или сразу — air видит
-правки в `migrations/` не всегда, перезапустите `make up`) миграция применится.
-Файл автоматически попадает в бинарники через `go:embed` — ничего
-синхронизировать вручную не нужно.
+Edit the SQL files; at the next service restart (or immediately — air
+does not always see the edits in `migrations/`, restart `make up`) the
+migration will be applied. The file automatically ends up in the
+binaries via `go:embed` — nothing needs to be synced by hand.
 
-Требования к набору (проверяются юнит-тестом `internal/migrate`):
-версии с единицы без пропусков, у каждой версии обе пары up/down, файлы
-не пустые.
+Requirements for the set (checked by the `internal/migrate` unit test):
+versions starting from one with no gaps, both up/down pairs for every
+version, no empty files.
 
-## Ручные операции
+## Manual operations
 
-Сервисы применяют только up. Откат и форс — через CLI golang-migrate
-в контейнере `tools` (каталог `migrations` смонтирован):
+The services apply only up. Rollback and force — via the golang-migrate
+CLI in the `tools` container (the `migrations` directory is mounted):
 
 ```bash
-make migrate-up      # применить все up (обычно не нужно — сервисы сами)
-make migrate-down    # откатить все миграции (--all)
-make psql            # ручные SQL-запросы
+make migrate-up      # apply all up (usually not needed — the services do it themselves)
+make migrate-down    # roll back all migrations (--all)
+make psql            # manual SQL queries
 ```
 
-## Миграция 000003: процедура create_zone_partitions
+## Migration 000003: the create_zone_partitions procedure
 
-Миграция `000003_zone_hash_subpartitioning` (T-005) добавляет хранимую
-процедуру `create_zone_partitions(zone_id, hash_parts)` выделения крупных зон
-из DEFAULT-партиций. Сервисы применяют миграцию как обычно, но саму процедуру
-не вызывают — это операционная команда:
+The `000003_zone_hash_subpartitioning` migration (T-005) adds the stored
+procedure `create_zone_partitions(zone_id, hash_parts)` for splitting
+large zones out of the DEFAULT partitions. The services apply the
+migration as usual but do not call the procedure themselves — it is an
+operational command:
 
 ```bash
 make psql    # CALL create_zone_partitions(<zone_id>, <hash_parts>);
 ```
 
-Когда выделять зону, как считать `hash_parts` под целевые ≈ 30–50 млн строк,
-устройство партиций и блокировки — [`schema.md`](schema.md#субпартиционирование-крупных-зон-t-005).
-Down-миграция удаляет процедуру, но не созданные ею партиции зон.
+When to split out a zone, how to compute `hash_parts` for a target of
+≈ 30–50M rows, the partition layout and locking —
+[`schema.md`](schema.md#subpartitioning-of-large-zones-t-005).
+The down migration removes the procedure but not the zone partitions it
+created.
 
-## Миграция 000015: счётчик рендер-долга
+## Migration 000015: the render debt counter
 
-`000015_render_pending_counter` (T-175) создаёт таблицу
-`crawler_counters(name, value)` и **бэкфиллит** строку `render_pending`
-одним `count(*)` по `domains` с битовой маской `flags & 2`. На боевом
-корпусе 41,8 млн строк это однократный seq scan — десятки секунд (тот же
-класс стоимости, что один проход пересчёта зон T-078); применяется при
-старте сервисов на деплое один раз, дальше строку ведут переходы бита
-(`internal/httpworker/renderq.go`: +1/−1 в транзакции перехода).
-Запускать деплой вне окна не запрещено — старт сервисов просто длится
-дольше на время бэкфилла (раннер миграций держит advisory-локировку,
-параллельные экземпляры ждут). Откат (down) удаляет таблицу целиком —
-повторное применение up пересчитает текущее состояние флагов.
+`000015_render_pending_counter` (T-175) creates the
+`crawler_counters(name, value)` table and **backfills** the
+`render_pending` row with a single `count(*)` over `domains` with the
+bit mask `flags & 2`. On the production corpus of 41.8M rows this is
+a one-time seq scan — tens of seconds (the same cost class as one T-078
+zone recount pass); it applies once at service startup during a deploy,
+and from then on the row is maintained by the bit transitions
+(`internal/httpworker/renderq.go`: +1/−1 in the transition transaction).
+Running the deploy outside a window is not forbidden — the service
+startup just takes longer while the backfill runs (the migration runner
+holds the advisory lock, parallel instances wait). The rollback (down)
+drops the table entirely — a repeated up will recount the current flag
+state.
 
-Порядок деплоя (ревью T-175, P3-8): миграцию применяет любой сервис при
-старте, но ±1 счётчика пишет только http-worker — применять 000015
-вместе с обновлением http-worker (штатный CD перезапускает все юниты
-сразу, окно рассинхрона нулевое; рестарт одного monitor со старым
-http-worker оставил бы бит без инкремента — дрейф вниз до сверки).
-После деплоя один раз выполнить сверку drift —
-[`runbooks.md`](runbooks.md) §6. Обратное направление — то же правило:
-откат 000015 только вместе с откатом http-worker (или после дренажа
-`render_pending` до нуля) — иначе записи результатов с флагом начнут
-откатываться ошибкой счётчика (симптом — runbooks §6).
+Deploy order (the T-175 review, P3-8): any service applies the migration
+at startup, but only http-worker writes the counter's ±1 — apply 000015
+together with the http-worker update (the normal CD restarts all units
+at once, the desync window is zero; restarting only monitor with an old
+http-worker would leave the bit without an increment — a downward drift
+until a reconciliation). After the deploy, run a drift reconciliation
+once — [`runbooks.md`](runbooks.md) §6. The reverse direction — the same
+rule: roll back 000015 only together with the http-worker rollback (or
+after draining `render_pending` to zero) — otherwise result records with
+the flag will start failing on the counter error (the symptom —
+runbooks §6).
 
-Подробнее о таблице и почему индекс по маске отвергнут —
-[`schema.md`](schema.md) §«crawler_counters».
+More about the table and why an index over the mask was rejected —
+[`schema.md`](schema.md) §"crawler_counters".
 
-## Миграция 000017: маркер «рендер невозможен»
+## Migration 000017: the "render failed" marker
 
-`000017_render_failed_marker` (T-210) добавляет nullable-колонку
-`subdomain_results.render_failed_at` — штамп «рендер невозможен»:
-финализации без рендера render-worker'а (тарпит T-148 / cert-класс
-T-159 / класс задачи T-172) помечают запись до смены контента, выборка
-прохода доработки рендера отмаркированные записи не берёт. Миграция —
-только `ADD COLUMN` (метаданные, без rewrite 40+ млн строк и без
-backfill): существующие строки остаются NULL и дорендерятся либо
-перефинализируются обычным путём, получив штамп своими финализациями.
+`000017_render_failed_marker` (T-210) adds the nullable column
+`subdomain_results.render_failed_at` — the "render failed" stamp:
+the render-worker finalizations without a render (the tarpit T-148 /
+the cert class T-159 / the task class T-172) mark the record before the
+content changes, and the render rework pass selection does not pick up
+stamped records. The migration is only an `ADD COLUMN` (metadata, no
+rewrite of 40+M rows and no backfill): the existing rows stay NULL and
+will be rendered or re-finalized the normal way, receiving the stamp
+from their own finalizations.
 
-Порядок деплоя: миграции встроены в бинарники (`migrations/embed.go`)
-и применяются сервисом при старте до запуска воркеров — сервис новой
-версии работает только на схеме с 000017, окно смешанных версий
-безопасно в обе стороны: старые render-worker/http-worker на новой
-схеме просто не пишут и не фильтруют колонку, новые — на старой схеме
-не оказываются (раннер накатывает миграцию первым делом). Откат
-сервисов на версии до T-210 без отката миграции тоже безопасен:
-стоящие штампы старый код просто игнорирует (не читает и не фильтрует
-колонку — поведение как до T-210); откат самой миграции (down)
-делается только вместе с откатом обоих сервисов.
+Deploy order: the migrations are embedded in the binaries
+(`migrations/embed.go`) and applied by the service at startup before the
+workers start — a service of the new version runs only on the schema
+with 000017, the mixed-version window is safe in both directions: old
+render-worker/http-worker on the new schema simply do not write and do
+not filter the column, and new ones never find themselves on the old
+schema (the runner applies the migration first thing). Rolling the
+services back to the pre-T-210 versions without rolling back the
+migration is also safe: the old code simply ignores the existing stamps
+(it does not read and does not filter the column — the behavior as
+before T-210); rolling back the migration itself (down) is done only
+together with rolling back both services.
 
-Подробнее — [`render.md`](render.md) «Цикл очередей» и
-[`schema.md`](schema.md) §«Колонки subdomain_results».
+More — [`render.md`](render.md) "Queue cycle" and
+[`schema.md`](schema.md) §"The subdomain_results columns".
 
-## Восстановление после сбоя
+## Recovery from a failure
 
-Отмена применения по сигналу завершения не оставляет dirty-состояния
-(см. «Остановка во время применения»). Dirty остаётся после сбоя
-внутри самой миграции (ошибка SQL, отключение питания): тогда таблица
-`schema_migrations` содержит неподтверждённую версию и сервисы откажутся
-стартовать с понятной ошибкой («схема в dirty-состоянии»). Разберите
-причину, затем:
+A cancellation by a termination signal leaves no dirty state (see
+"Interruption during apply"). Dirty remains after a failure inside the
+migration itself (an SQL error, a power loss): then the
+`schema_migrations` table contains an unconfirmed version and the
+services will refuse to start with a clear error ("the schema is in
+a dirty state"). Investigate the cause, then:
 
 ```sql
 -- make psql
-TRUNCATE schema_migrations;            -- версия неизвестна, начать с чистой
-INSERT INTO schema_migrations VALUES (1, false);  -- или подтвердить версию N
+TRUNCATE schema_migrations;            -- the version is unknown, start clean
+INSERT INTO schema_migrations VALUES (1, false);  -- or confirm version N
 ```
 
-CLI-вариант: `docker compose run --rm tools sh -c \
+The CLI variant: `docker compose run --rm tools sh -c \
 'migrate -path /migrations -database "$APP_PG_DSN" force 1'`.
 
-## Интеграционные тесты
+## Integration tests
 
-`make test-integration` накатывает схему CLI (сервисы приложения в прогоне
-не участвуют) и проверяет раннер напрямую: применение к чистой схеме,
-идемпотентность и одновременный старт восьми экземпляров
-(`test/integration/migrate_test.go`). Контракт самой схемы (партиционирование,
-fillfactor, индексы, sequence, HOT-совместимость) проверяет
-`test/integration/schema_test.go`, выделение зон из DEFAULT-партиций —
-`test/integration/zone_partitions_test.go` — см. [`schema.md`](schema.md).
+`make test-integration` applies the schema via the CLI (the app services
+do not participate in the run) and verifies the runner directly:
+applying to a clean schema, idempotency, and a simultaneous start of
+eight instances (`test/integration/migrate_test.go`). The contract of
+the schema itself (partitioning, fillfactor, indexes, sequence, HOT
+compatibility) is verified by `test/integration/schema_test.go`, and the
+splitting of zones out of the DEFAULT partitions —
+`test/integration/zone_partitions_test.go` — see
+[`schema.md`](schema.md).
