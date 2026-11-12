@@ -7,7 +7,7 @@
 // queue (+1), D2 a repeated delivery with the bit already set (the
 // guard: a second +1 is forbidden), D8 a fresh episode with a free
 // queue (the bit is not erased, the pair is untouched), D3 the
-// finish-up pass "published → cleared" (−1) and the mirror clearing
+// rework pass "published → cleared" (−1) and the mirror clearing
 // guard D7 (a second −1 is forbidden), D4 the draft flag (a clear
 // without a publication, −1), D5 the keep of unreadable content (the
 // pair is preserved), D6 the clearing by a delete-file (−1, T-186).
@@ -250,7 +250,7 @@ func TestRenderPendingBit_SpecTransitions(t *testing.T) {
 	// D8: a fresh episode with a free queue — the result record does
 	// NOT erase the bit and does not touch the counter: the tasks are
 	// published by the episode itself (the duplication is bounded), the
-	// holder stays the finish-up pass.
+	// holder stays the rework pass.
 	drain()
 	episode(rqBody)
 	wantFlags(debtFlags, "после Д8")
@@ -262,7 +262,7 @@ func TestRenderPendingBit_SpecTransitions(t *testing.T) {
 	}
 	countersVerifyEmpty(t, pool, "после Д8 (публикация без перехода)")
 
-	// D3: the finish-up pass — "published → cleared": re-publishing the
+	// D3: the rework pass — "published → cleared": re-publishing the
 	// SPA task to q:render, then clearing the bit with the counter −1
 	// in one transaction.
 	drain()
@@ -412,7 +412,7 @@ func TestRenderPendingBit_SpecTransitions(t *testing.T) {
 // --- the 2026-11-08 incident (T-269) ----------------------------------------
 //
 // The investigation of the "−36 in one pass" desync from prod-reports/
-// 2026-11-08-010800.md: clearing 18 flags by the finish-up pass gave
+// 2026-11-08-010800.md: clearing 18 flags by the rework pass gave
 // −18, an expected 0, and the next guard tick already read −18 — a
 // "silent" (the counter row's updated_at did not move) second −18 on
 // top of the single observed set of clearings. The operator's
@@ -508,7 +508,7 @@ SELECT
 	  AND NOT EXISTS (SELECT 1 FROM domains AS d
 	                  WHERE d.zone_id = s.zone_id AND d.label = s.label)) AS not_found`
 
-// renderBitClearPairSQL — the "finish-up pass" of the scenario: the
+// renderBitClearPairSQL — the "rework pass" of the scenario: the
 // bit clearing in a pair with the counter per the runbooks §6 sample
 // (the current-version guard, the delta by the fact of the cleared)
 // as a batch by the keys. In the reproduction it plays the role of the
@@ -694,7 +694,7 @@ func TestRenderPendingBit_DeleteClearRace(t *testing.T) {
 		t.Fatalf("фаза 1: исход счётчик = %d, хочу %d", debt, n)
 	}
 
-	// The "finish-up pass" (L): clears all 18 by the pair and KEEPS the
+	// The "rework pass" (L): clears all 18 by the pair and KEEPS the
 	// transaction uncommitted — the rows are locked, the changes are
 	// invisible.
 	lx, err := pool.Begin(ctx)
@@ -888,7 +888,7 @@ func renderBitIDsOfLabels(ctx context.Context, t *testing.T, pool *pgxpool.Pool,
 // the incident hypothesis: "the monitor reconciliation applies a delta
 // from the stale expectation — a second −18". A reconciliation pass
 // with a stale snapshot (the aggregate saw the bits BEFORE the
-// clearing by the finish-up pass, the upsert executed AFTER) writes
+// clearing by the rework pass, the upsert executed AFTER) writes
 // the stale ABSOLUTE with the aggregate value, not a delta: the
 // counter becomes +18 with a zero bit (a false debt), NOT −18; the
 // rewrite moves updated_at (a "loud" trace — the reconciliation cannot
@@ -922,7 +922,7 @@ func TestRenderPendingBit_ReconciliationStaleSnapshot(t *testing.T) {
 
 	// L holds the counter row — the reconciliation upsert will block
 	// ABOVE the snapshot (the aggregate has already counted 18 bits),
-	// the finish-up pass will have time to close the debt.
+	// the rework pass will have time to close the debt.
 	lx, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatalf("транзакция-блокиратор: %v", err)
@@ -945,7 +945,7 @@ func TestRenderPendingBit_ReconciliationStaleSnapshot(t *testing.T) {
 	}()
 	renderBitWaitBlocked(t, pool, errc, xid, "реконсиляция")
 
-	// The "finish-up pass" inside L: the bits → 0, the counter −18 (L
+	// The "rework pass" inside L: the bits → 0, the counter −18 (L
 	// already holds the row — the decrement without waiting). The "debt
 	// closed" step — inside the transaction (its own writes are
 	// visible, M is still blocked): 0/0.

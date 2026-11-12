@@ -1,4 +1,4 @@
-// Integration tests of the render finish-up pass RequeueOnce (T-066;
+// Integration tests of the render rework pass RequeueOnce (T-066;
 // the batch selection without a PK order, the plan pinning SET LOCAL
 // and the guard by the debt counter — T-181; the zone priority by the
 // two-stage selection — T-184) against live PostgreSQL/Redis: the
@@ -103,7 +103,7 @@ func (t *rqTraceTx) Query(ctx context.Context, sql string, args ...any) (pgx.Row
 	return t.Tx.Query(ctx, sql, args...)
 }
 
-// TestRenderRequeuePass — the finish-up pass on live PostgreSQL/Redis:
+// TestRenderRequeuePass — the rework pass on live PostgreSQL/Redis:
 // there is debt — publishes and clears; the counter 0 — the heavy
 // selection is not run; the cleared ones are not selected again; a
 // missing counter row — an error; the plan shape is pinned (a seq
