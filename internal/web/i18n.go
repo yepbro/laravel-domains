@@ -1,10 +1,11 @@
-// i18n лендинга (T-122): перенос lang/{ru,en}/landing.php из larasites —
-// плоские словари по локалям, ключи сохранены (доменная часть формы
-// дополняется в T-123). Русская локаль — дефолт (зафиксированное решение
-// этапа 13: i18n ru+en).
+// The landing i18n (T-122): a port of lang/{ru,en}/landing.php from
+// larasites — flat dictionaries per locale, the keys are preserved (the
+// form's domain part is added in T-123). The Russian locale is the
+// default (a pinned stage-13 decision: i18n ru+en).
 package web
 
-// messages — словарь локали: ключ → строка; всё экранируется шаблоном.
+// messages — the locale dictionary: key → string; everything is
+// escaped by the template.
 type messages map[string]string
 
 var ruMessages = messages{
@@ -163,7 +164,8 @@ var enMessages = messages{
 	"footer.not_affiliated": "Not affiliated with Laravel.",
 }
 
-// localeMessages — словарь локали (неизвестная локаль — дефолтная ru).
+// localeMessages — the locale dictionary (an unknown locale — the
+// default ru).
 func localeMessages(locale string) messages {
 	if m, ok := localeMessagesMap[locale]; ok {
 		return m

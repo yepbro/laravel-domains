@@ -1,12 +1,12 @@
-// Тесты контура живой проверки формы (T-220): шов newLiveCircuit
-// подменяется фейком — проверяется, что параллельные проверки формы
-// собирают контур ровно один на сервис (инвариант «fd не растут с
-// числом запросов»: до T-220 каждый запрос строил собственную цепь
-// резолверов с пулами udp_pool_size и свой Fetcher), и что семафор
-// web.live_concurrency режет одновременные конвейеры быстрым 503 с
-// Retry-After, а не очередью до web.timeout. Прямой подсчёт fd не
-// делается (недетерминирован в общем тест-раннере) — достаточно
-// счётчика сборок контура.
+// Tests of the live check circuit of the form (T-220): the newLiveCircuit
+// seam is substituted with a fake — it verifies that concurrent form
+// checks assemble the circuit exactly once per service (the invariant
+// "fds do not grow with the number of requests": before T-220 each
+// request built its own resolver chain with udp_pool_size pools and its
+// own Fetcher), and that the web.live_concurrency semaphore cuts
+// concurrent pipelines with a fast 503 with Retry-After, not a queue up
+// to web.timeout. A direct fd count is not done (nondeterministic in a
+// common test runner) — the circuit assembly counter is enough.
 
 package web
 
@@ -26,8 +26,9 @@ import (
 	"crawler/internal/config"
 )
 
-// fakeCircuit — контур-фейк: Run делегирует программируемой функции,
-// Close считается (сколько раз сервис закрыл контур).
+// fakeCircuit — a fake circuit: Run delegates to a programmable
+// function, Close is counted (how many times the service closed the
+// circuit).
 type fakeCircuit struct {
 	run    checker.LiveFunc
 	closes atomic.Int32
@@ -39,8 +40,9 @@ func (f *fakeCircuit) Run(ctx context.Context, cfg *config.Config, pool checker.
 
 func (f *fakeCircuit) Close() error { f.closes.Add(1); return nil }
 
-// installCircuitSeam — подменяет шов сборки контура, возвращает счётчик
-// сборок и восстанавливает продакшн-функцию по завершении теста.
+// installCircuitSeam — substitutes the circuit assembly seam, returns
+// the assembly counter, and restores the production function at the end
+// of the test.
 func installCircuitSeam(t *testing.T, factory func() checker.LiveCircuit) *atomic.Int32 {
 	t.Helper()
 	var builds atomic.Int32
@@ -53,7 +55,8 @@ func installCircuitSeam(t *testing.T, factory func() checker.LiveCircuit) *atomi
 	return &builds
 }
 
-// postCheck — параллельный POST формы; возвращает статус и тело.
+// postCheck — a concurrent POST of the form; returns the status and the
+// body.
 func postCheck(t *testing.T, url string) (int, string) {
 	t.Helper()
 	resp, err := http.Post(url+"/api/check-domain", "application/json",
@@ -67,22 +70,23 @@ func postCheck(t *testing.T, url string) (int, string) {
 	return resp.StatusCode, string(body[:n])
 }
 
-// TestLiveCircuitSingleUnderLoad — нагрузочный критерий T-220: 10
-// параллельных проверок при production-пути (liveCheck не подменён,
-// контур лениво собирается швом) строят контур ровно один — сокеты
-// цепи резолверов и Fetcher открываются один раз на сервис, а не по
-// цепи на каждый запрос. live_concurrency поднят до 10, чтобы семафор
-// не мешал замеру (механизм семафора — отдельный тест ниже); попутно
-// /healthz отвечает 200, пока форма занята проверками.
+// TestLiveCircuitSingleUnderLoad — the load criterion of T-220: 10
+// concurrent checks on the production path (liveCheck not substituted,
+// the circuit assembled lazily by the seam) build the circuit exactly
+// once — the sockets of the resolver chain and the Fetcher are opened
+// once per service, not a chain per request. live_concurrency is raised
+// to 10 so that the semaphore does not interfere with the measurement
+// (the semaphore mechanism — a separate test below); along the way,
+// /healthz answers 200 while the form is busy checking.
 func TestLiveCircuitSingleUnderLoad(t *testing.T) {
 	cfg := config.Default()
 	cfg.Web.RateLimit = 100
-	cfg.Web.LiveConcurrency = 10 // шов теста: без отказов семафора
+	cfg.Web.LiveConcurrency = 10 // the test seam: no semaphore rejections
 	db := &fakeDB{seed: seedLanding()}
 
 	builds := installCircuitSeam(t, func() checker.LiveCircuit {
 		return &fakeCircuit{run: func(_ context.Context, _ *config.Config, _ checker.Pool, domain string, _ checker.Logger) (*checker.Result, error) {
-			time.Sleep(50 * time.Millisecond) // окно параллельности проверок
+			time.Sleep(50 * time.Millisecond) // the concurrency window of the checks
 			return &checker.Result{Domain: domain, Zone: "com", Apex: "delegated"}, nil
 		}}
 	})
@@ -98,7 +102,7 @@ func TestLiveCircuitSingleUnderLoad(t *testing.T) {
 	var (
 		wg       sync.WaitGroup
 		statuses = make([]int, 10)
-		healthz  atomic.Int32 // проб OK во время нагрузки
+		healthz  atomic.Int32 // probes OK under load
 	)
 	for i := 0; i < 10; i++ {
 		wg.Add(1)
@@ -140,24 +144,24 @@ func TestLiveCircuitSingleUnderLoad(t *testing.T) {
 		t.Error("пробы /healthz не успели отработать за окно нагрузки — тест не доказал живость healthz")
 	}
 
-	// Остановка сервиса закрывает контур ровно раз и навсегда.
+	// Stopping the service closes the circuit exactly once and forever.
 	srv.closeLive()
 	if got := builds.Load(); got != 1 {
 		t.Fatalf("после closeLive контур пересобран (%d сборок)", got)
 	}
 }
 
-// TestLiveSemaphoreOverload — семафор одновременных живых проверок
-// (детерминированно, без окон на тайминге): два слота занимаются
-// заблокированными конвейерами (сигнал entered), следующие пять
-// запросов обязаны получить быстрый 503 {"error":"busy"} с
-// Retry-After — не ждать слота до web.timeout; после освобождения
-// занявшие слоты отвечают 200.
+// TestLiveSemaphoreOverload — the semaphore of concurrent live checks
+// (deterministically, without timing windows): two slots are taken by
+// blocked pipelines (the entered signal), the next five requests must
+// get a fast 503 {"error":"busy"} with Retry-After — not wait for a
+// slot up to web.timeout; after the release, the slot holders answer
+// 200.
 func TestLiveSemaphoreOverload(t *testing.T) {
 	cfg := config.Default()
 	cfg.Web.RateLimit = 100
 	cfg.Web.LiveConcurrency = 2
-	db := &fakeDB{seed: seedLanding()} // domainInfo нет: stored-части тоже нет
+	db := &fakeDB{seed: seedLanding()} // no domainInfo: no stored part either
 
 	srv, err := New(db, cfg, Options{})
 	if err != nil {
@@ -183,7 +187,7 @@ func TestLiveSemaphoreOverload(t *testing.T) {
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 
-	// Два конвейера занимают оба слота и ждут освобождения.
+	// Two pipelines take both slots and wait for the release.
 	slow := make(chan int, 2)
 	for i := 0; i < 2; i++ {
 		go func() {
@@ -199,7 +203,7 @@ func TestLiveSemaphoreOverload(t *testing.T) {
 		}
 	}
 
-	// Пять запросов поверх занятых слотов — каждому быстрый 503 busy.
+	// Five requests on top of the busy slots — each gets a fast 503 busy.
 	var extra sync.WaitGroup
 	extraStatuses := make([]int, 5)
 	extraBodies := make([]string, 5)
@@ -221,7 +225,7 @@ func TestLiveSemaphoreOverload(t *testing.T) {
 		}
 	}
 
-	// Освобождение: занявшие слоты завершаются 200, потолок не пробит.
+	// Release: the slot holders finish with 200, the cap is not breached.
 	close(release)
 	for i := 0; i < 2; i++ {
 		if st := <-slow; st != http.StatusOK {
@@ -233,8 +237,8 @@ func TestLiveSemaphoreOverload(t *testing.T) {
 	}
 }
 
-// TestLiveSemaphoreRetryAfter — 503 перегрузки несёт Retry-After
-// (клиенту есть когда возвращаться), 200 — нет.
+// TestLiveSemaphoreRetryAfter — the overload 503 carries Retry-After
+// (the client knows when to come back), the 200 does not.
 func TestLiveSemaphoreRetryAfter(t *testing.T) {
 	cfg := config.Default()
 	cfg.Web.RateLimit = 100
@@ -259,9 +263,10 @@ func TestLiveSemaphoreRetryAfter(t *testing.T) {
 		st, _ := postCheck(t, ts.URL)
 		first <- st
 	}()
-	// Первый запрос гарантированно занимает слот (сигнал entered) — только
-	// после этого второй обязан получить быстрый 503, не зависая в очереди
-	// до web.timeout и не перехватив слот сам.
+	// The first request takes the slot for sure (the entered signal) —
+	// only after that the second one must get a fast 503, without
+	// hanging in the queue up to web.timeout and without grabbing the
+	// slot itself.
 	select {
 	case <-entered:
 	case <-time.After(3 * time.Second):
@@ -281,7 +286,8 @@ func TestLiveSemaphoreRetryAfter(t *testing.T) {
 	if ra := resp.Header.Get("Retry-After"); ra == "" {
 		t.Error("503 перегрузки без Retry-After")
 	}
-	// JSON-тело с корректным Content-Type (T-227, унификация с 422).
+	// A JSON body with a correct Content-Type (T-227, the unification
+	// with 422).
 	if ct := resp.Header.Get("Content-Type"); ct != "application/json; charset=utf-8" {
 		t.Errorf("503 Content-Type = %q, хочу application/json", ct)
 	}
@@ -294,10 +300,10 @@ func TestLiveSemaphoreRetryAfter(t *testing.T) {
 	}
 }
 
-// TestLiveCircuitBuildRetriedAfterFailure — ошибка сборки контура не
-// запоминается (web.go liveFunc): первый запрос получает 502
-// check_failed, следующий собирает контур заново — правила/сокеты могли
-// появиться.
+// TestLiveCircuitBuildRetriedAfterFailure — a circuit assembly error is
+// not remembered (web.go liveFunc): the first request gets a 502
+// check_failed, the next one assembles the circuit again — rules/
+// sockets may have appeared.
 func TestLiveCircuitBuildRetriedAfterFailure(t *testing.T) {
 	cfg := config.Default()
 	cfg.Web.RateLimit = 100
@@ -321,9 +327,9 @@ func TestLiveCircuitBuildRetriedAfterFailure(t *testing.T) {
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 
-	// Первый запрос (сборка падает) — 502 check_failed с JSON-телом и
-	// корректным Content-Type (T-227): раньше http.Error отдавал JSON
-	// с text/plain.
+	// The first request (the assembly fails) — a 502 check_failed with a
+	// JSON body and a correct Content-Type (T-227): http.Error used to
+	// serve JSON with text/plain.
 	resp, err := http.Post(ts.URL+"/api/check-domain", "application/json",
 		strings.NewReader(`{"domain":"example.com"}`))
 	if err != nil {
@@ -347,9 +353,10 @@ func TestLiveCircuitBuildRetriedAfterFailure(t *testing.T) {
 	}
 }
 
-// TestLiveCircuitClosedNoRebuild — после closeLive (выход Run, остановка
-// сервиса) контур не собирается заново: запрос получает отказ живой
-// проверки, а не новый контур, который никто не закроет (P3-2 ревью).
+// TestLiveCircuitClosedNoRebuild — after closeLive (the Run exit, the
+// service stop) the circuit is not assembled again: the request gets a
+// live check rejection, not a new circuit nobody would close (P3-2 of
+// the review).
 func TestLiveCircuitClosedNoRebuild(t *testing.T) {
 	cfg := config.Default()
 	cfg.Web.RateLimit = 100
@@ -383,9 +390,9 @@ func TestLiveCircuitClosedNoRebuild(t *testing.T) {
 	}
 }
 
-// TestRunClosesLiveCircuit — выход Run (остановка сервиса) закрывает
-// контур живой проверки: сокеты цепи резолверов и рендер не переживают
-// сервис.
+// TestRunClosesLiveCircuit — the Run exit (the service stop) closes the
+// live check circuit: the sockets of the resolver chain and the render
+// do not outlive the service.
 func TestRunClosesLiveCircuit(t *testing.T) {
 	cfg := config.Default()
 	cfg.Web.RateLimit = 100

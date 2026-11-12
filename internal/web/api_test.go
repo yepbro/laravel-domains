@@ -1,8 +1,9 @@
-// Юнит-тесты формы ручной проверки (T-123): таблица валидатора ввода
-// (URL/IDN/мусор — по образцу CheckDomainRequest larasites), рейт-лимит
-// token bucket (4/мин, 429 + Retry-After, восстановление), e2e handler
-// с фейковым чекером (шов liveCheck): JSON-ответ, stored-секция,
-// запись web_checks, ошибки валидации 422.
+// Unit tests of the manual check form (T-123): the input validator
+// table (URL/IDN/junk — modeled on the larasites CheckDomainRequest),
+// the token bucket rate limit (4/min, 429 + Retry-After, recovery), the
+// e2e handler with a fake checker (the liveCheck seam): the JSON
+// response, the stored section, the web_checks record, the 422
+// validation errors.
 package web
 
 import (
@@ -20,8 +21,8 @@ import (
 	"crawler/internal/rules"
 )
 
-// TestValidateCheckInput — таблица валидатора: trim, точка, схема+порт,
-// IDN, мусор.
+// TestValidateCheckInput — the validator table: trim, a dot, a
+// scheme+port, IDN, junk.
 func TestValidateCheckInput(t *testing.T) {
 	cases := []struct {
 		in      string
@@ -59,8 +60,8 @@ func TestValidateCheckInput(t *testing.T) {
 	}
 }
 
-// TestRateLimit — 4 запроса проходят, пятый — отказ; окно восстанавливает
-// один токен за четверть минуты.
+// TestRateLimit — 4 requests pass, the fifth is rejected; the window
+// restores one token per quarter minute.
 func TestRateLimit(t *testing.T) {
 	l := newLimiter(4, time.Minute)
 	now := time.Now()
@@ -73,7 +74,7 @@ func TestRateLimit(t *testing.T) {
 		t.Fatal("пятый запрос в минуту прошёл, хочу отказ")
 	}
 	if l.allow("5.6.7.8", now) {
-		// Другой IP — свой бакет.
+		// Another IP — its own bucket.
 	} else {
 		t.Fatal("чужой IP отклонён общим бакетом")
 	}
@@ -82,23 +83,24 @@ func TestRateLimit(t *testing.T) {
 	}
 }
 
-// TestClientIP — адрес посетителя за reverse-proxy (T-124): X-Real-IP
-// доверяется только от loopback-пира (TCP) или пира unix-сокета (T-221)
-// и только валидному IP; снаружи и с чужого адреса заголовок
-// игнорируется — подделка не расходует чужой бакет рейт-лимита. Пир
-// unix-сокета без валидного заголовка — ключ-метка unixLocalKey
-// (не IP: в журнал web_checks не пишется). X-Forwarded-For (запас без
-// X-Real-IP) берёт последнюю позицию — её дописал наш прокси,
-// клиентское начало списка не доверено (P1-1 ревью T-221).
+// TestClientIP — the visitor address behind the reverse proxy (T-124):
+// X-Real-IP is trusted only from a loopback peer (TCP) or a unix-socket
+// peer (T-221) and only for a valid IP; from outside and from a foreign
+// address the header is ignored — a forgery does not spend someone
+// else's rate limit bucket. A unix-socket peer without a valid header —
+// the unixLocalKey label key (not an IP: it is not written into the
+// web_checks log). X-Forwarded-For (the fallback without X-Real-IP)
+// takes the last entry — our proxy appended it; the client start of the
+// list is not trusted (P1-1 of the T-221 review).
 func TestClientIP(t *testing.T) {
 	req := func(remote, real, xff string, unix bool) *http.Request {
 		r := httptest.NewRequest(http.MethodPost, "/api/check-domain", nil)
 		r.RemoteAddr = remote
 		if unix {
-			// Положительное распознавание unix-пира — по локальному
-			// адресу соединения из контекста (его кладёт http.Server;
-			// RemoteAddr при этом «@»/путь, путь с двоеточием даже
-			// разобрался бы SplitHostPort'ом как host:port).
+			// Positive unix-peer recognition — by the connection's local
+			// address from the context (http.Server puts it there; the
+			// RemoteAddr in that case is "@"/a path, and a path with a
+			// colon would even parse as host:port by SplitHostPort).
 			r = r.WithContext(context.WithValue(r.Context(), http.LocalAddrContextKey,
 				&net.UnixAddr{Name: "@", Net: "unix"}))
 		}
@@ -123,7 +125,7 @@ func TestClientIP(t *testing.T) {
 		{"loopback + мусорный заголовок", "127.0.0.1:51234", "not-an-ip", "", false, "127.0.0.1", true},
 		{"loopback + заголовок с портом", "127.0.0.1:51234", "198.51.100.9:443", "", false, "127.0.0.1", true},
 		{"чужой адрес + подделка заголовка", "203.0.113.7:44321", "198.51.100.9", "", false, "203.0.113.7", true},
-		// Unix-сокет (T-221): пир доверенный, как loopback TCP.
+		// A unix socket (T-221): the peer is trusted, like loopback TCP.
 		{"unix-пир + X-Real-IP", "@", "198.51.100.9", "", true, "198.51.100.9", true},
 		{"unix-пир именованный + X-Real-IP", "/run/client.sock", "198.51.100.9", "", true, "198.51.100.9", true},
 		{"unix-пир, путь сокета с двоеточием", "/run/web:s.sock", "198.51.100.9", "", true, "198.51.100.9", true},
@@ -135,10 +137,11 @@ func TestClientIP(t *testing.T) {
 		{"unix-пир именованный без заголовков", "/run/client.sock", "", "", true, unixLocalKey, false},
 		{"unix-пир + мусорный X-Real-IP, валидный XFF", "@", "not-an-ip", "198.51.100.10", true, "198.51.100.10", true},
 		{"unix-пир + мусор в конце XFF", "@", "", "198.51.100.10, junk", true, unixLocalKey, false},
-		// Подделка с TCP не расширяет доверие: XFF чужого пира и
-		// loopback-пира без X-Real-IP не читается (TCP-ветка T-124);
-		// RemoteAddr без IP (нет контекста unix-соединения) доверия
-		// не получает и в журнал не пишется.
+		// A forgery over TCP does not extend trust: the XFF of a foreign
+		// peer and of a loopback peer without X-Real-IP is not read (the
+		// TCP branch of T-124); a RemoteAddr without an IP (no unix
+		// connection context) gets no trust and is not written into the
+		// log.
 		{"чужой TCP-адрес + подделка XFF", "203.0.113.7:44321", "", "198.51.100.9", false, "203.0.113.7", true},
 		{"loopback TCP без X-Real-IP (XFF не читается)", "127.0.0.1:51234", "", "198.51.100.9", false, "127.0.0.1", true},
 		{"путь с двоеточием без контекста unix — не доверяем", "/run/web:s.sock", "", "198.51.100.9", false, "/run/web", false},
@@ -150,8 +153,9 @@ func TestClientIP(t *testing.T) {
 	}
 }
 
-// TestCheckDomainE2E — фейковый чекер: 200 + JSON с found/score/записями,
-// запись web_checks, повторные запросы в пределах лимита.
+// TestCheckDomainE2E — a fake checker: a 200 + JSON with
+// found/score/records, a web_checks record, repeated requests within
+// the limit.
 func TestCheckDomainE2E(t *testing.T) {
 	db := &fakeDB{seed: seedLanding()}
 	db.seed.domainInfo = []byte(`{"domain":{"status":0,"status_name":"new","last_checked_at":"2026-10-18"},
@@ -198,10 +202,11 @@ func TestCheckDomainE2E(t *testing.T) {
 			t.Errorf("ответ не содержит %s:\n%s", want, got)
 		}
 	}
-	// web_checks записан: фейк не несёт семантики INSERT — фиксируем
-	// обращение (контракт появляется интеграцией; здесь шов) и что запись
-	// идёт через Exec, а не Query (T-221: Query без чтения строк
-	// проглатывал ошибку — журнал молча пустел).
+	// web_checks is written: the fake carries no INSERT semantics — we
+	// record the access (the contract appears with the integration; here
+	// it is the seam) and that the write goes through Exec, not Query
+	// (T-221: Query without reading rows swallowed the error — the log
+	// silently went empty).
 	if len(db.queries) == 0 {
 		t.Error("к БД не было обращений (stored/web_checks)")
 	}
@@ -210,7 +215,7 @@ func TestCheckDomainE2E(t *testing.T) {
 	}
 }
 
-// TestCheckDomainInvalid — мусорный ввод: 422 в формате landing.js.
+// TestCheckDomainInvalid — junk input: a 422 in the landing.js format.
 func TestCheckDomainInvalid(t *testing.T) {
 	srv := newTestServer(t, &fakeDB{seed: seedLanding()})
 	ts := httptest.NewServer(srv.Handler())
@@ -235,7 +240,7 @@ func TestCheckDomainInvalid(t *testing.T) {
 	}
 }
 
-// TestCheckDomainRateLimited — 429 с Retry-After.
+// TestCheckDomainRateLimited — a 429 with Retry-After.
 func TestCheckDomainRateLimited(t *testing.T) {
 	db := &fakeDB{seed: seedLanding()}
 	cfg := config.Default()
@@ -271,9 +276,9 @@ func TestCheckDomainRateLimited(t *testing.T) {
 	if ra := second.Header.Get("Retry-After"); ra == "" {
 		t.Error("429 без Retry-After")
 	}
-	// JSON-тело с корректным Content-Type (T-227): раньше http.Error
-	// отдавал JSON с text/plain — landing.js смотрит на статус, но
-	// контракт единообразия всех исходов формы.
+	// A JSON body with a correct Content-Type (T-227): http.Error used
+	// to serve JSON with text/plain — landing.js looks at the status,
+	// but this is the uniformity contract for all form outcomes.
 	if ct := second.Header.Get("Content-Type"); ct != "application/json; charset=utf-8" {
 		t.Errorf("429 Content-Type = %q, хочу application/json", ct)
 	}
@@ -282,7 +287,7 @@ func TestCheckDomainRateLimited(t *testing.T) {
 	}
 }
 
-// readBody — тело ответа целиком (закрывает Body).
+// readBody — the response body in full (closes Body).
 func readBody(t *testing.T, resp *http.Response) string {
 	t.Helper()
 	defer func() { _ = resp.Body.Close() }()

@@ -1,19 +1,22 @@
-// Форма ручной проверки лендинга (T-123): POST /api/check-domain —
-// гибрид сохранённых данных конвейера (domain_info) и живой проверки
-// (internal/checker, общий конвейер с crawlerctl check). Рейт-лимит
-// 4 запроса/мин на IP — in-memory token bucket (один инстанс сервиса,
-// stdlib; фиксированное решение этапа 13 — как троттлинг larasites).
-// Результат пишется в web_checks (T-120) — кто/что/когда проверял.
-// Адрес посетителя за прокси и исходы/сбои/длительность формы — T-124
-// (TCP-loopback пир) и T-221 (пир unix-сокета — вариант деплоя из
-// deploy/nginx/README.md; исходы — метрики metrics.go на :9107).
+// Manual landing check form (T-123): POST /api/check-domain — a hybrid
+// of the stored pipeline data (domain_info) and a live check
+// (internal/checker, the same pipeline as crawlerctl check). The rate
+// limit of 4 requests/min per IP — an in-memory token bucket (a single
+// service instance, stdlib; a stage-13 fixed decision — like the
+// larasites throttling). The result is written to web_checks (T-120) —
+// who/what/when checked. The visitor address behind the proxy and the
+// form outcomes/failures/duration — T-124 (the TCP-loopback peer) and
+// T-221 (the unix-socket peer — a deploy variant from
+// deploy/nginx/README.md; the outcomes — the metrics.go metrics
+// on :9107).
 //
-// Ресурсы живой проверки (T-220): конвейер работает на долгоживущем
-// контуре checker.Runtime (одна цепь резолверов с малым пулом UDP,
-// общий Fetcher с общими лимитами, кэш правил, один render.Manager —
-// собирается лениво первой проверкой, web.New/liveFunc), а потолок
-// одновременных конвейеров держит семафор web.live_concurrency:
-// перегруз — быстрый 503 с Retry-After, не очередь до web.timeout.
+// Live check resources (T-220): the pipeline runs on a long-lived
+// checker.Runtime circuit (a single resolver chain with a small UDP
+// pool, a shared Fetcher with shared limits, a rule cache, one
+// render.Manager — assembled lazily by the first check,
+// web.New/liveFunc), and the cap on concurrent pipelines is held by the
+// web.live_concurrency semaphore: an overload is a fast 503 with
+// Retry-After, not a queue up to web.timeout.
 package web
 
 import (
@@ -34,9 +37,10 @@ import (
 	"crawler/internal/idn"
 )
 
-// checkerDB — адаптер web.DB → db.DB пакета checker (CopyFrom/Exec форме
-// не нужны, checker их не вызывает — read-only конвейер; Exec —
-// предохранитель с ошибкой, см. реализацию).
+// checkerDB — an adapter from web.DB to the checker package's db.DB
+// (the form does not need CopyFrom/Exec and checker does not call them —
+// a read-only pipeline; Exec is a fuse returning an error, see the
+// implementation).
 type checkerDB struct{ db DB }
 
 func (c checkerDB) Ping(ctx context.Context) error { return c.db.Ping(ctx) }
@@ -46,10 +50,10 @@ func (c checkerDB) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyF
 }
 
 func (c checkerDB) Exec(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
-	// Предохранитель read-only (P3-1 ревью T-221): живой конвейер Exec
-	// не вызывает, журнал формы пишет собственным путём (recordCheck)
-	// мимо адаптера. Если checker когда-нибудь начнёт писать — ошибка
-	// вскроет это сразу, а не пройдёт молча.
+	// Read-only fuse (P3-1 of the T-221 review): the live pipeline does
+	// not call Exec; the form log is written by its own path (recordCheck)
+	// bypassing the adapter. If checker ever starts writing, the error
+	// will expose it immediately instead of passing silently.
 	return pgconn.CommandTag{}, fmt.Errorf("web: неожидаемый Exec живой проверки: %s", sql)
 }
 
@@ -57,8 +61,9 @@ func (c checkerDB) Query(ctx context.Context, sql string, args ...any) (pgx.Rows
 	return c.db.Query(ctx, sql, args...)
 }
 
-// checkResponse — единый JSON-ответ формы: found/score/версии +
-// per-subdomain записи (контракт перенесённого landing.js).
+// checkResponse — the single JSON response of the form: found/score/
+// versions plus per-subdomain records (the contract of the ported
+// landing.js).
 type checkResponse struct {
 	Found      bool             `json:"found"`
 	Score      float64          `json:"score"`
@@ -69,8 +74,8 @@ type checkResponse struct {
 	DurationMS int64            `json:"duration_ms"`
 }
 
-// storedSummary — последний эпизод краулера по домену (domain_info,
-// сокращение до полей формы).
+// storedSummary — the latest crawler episode for the domain (domain_info,
+// reduced to the form fields).
 type storedSummary struct {
 	Status    string   `json:"status"`
 	CheckedAt string   `json:"checked_at,omitempty"`
@@ -79,7 +84,7 @@ type storedSummary struct {
 	VerMax    string   `json:"ver_max,omitempty"`
 }
 
-// checkSubRecord — запись субдомена в ответе.
+// checkSubRecord — a subdomain record in the response.
 type checkSubRecord struct {
 	Subdomain string             `json:"subdomain"`
 	Variant   string             `json:"variant"`
@@ -105,19 +110,21 @@ type signalJSON struct {
 	Evidence string  `json:"evidence"`
 }
 
-// errLiveOverloaded — семафор одновременных живых проверок полон (T-220):
-// быстрый 503 с Retry-After вместо ожидания слота до web.timeout.
+// errLiveOverloaded — the semaphore of concurrent live checks is full
+// (T-220): a fast 503 with Retry-After instead of waiting for a slot up
+// to web.timeout.
 var errLiveOverloaded = errors.New("живая проверка перегружена")
 
-// handleCheckDomainLive — T-123: валидация → stored → live (timeout
-// web.timeout, семафор web.live_concurrency) → запись web_checks → JSON.
-// Ошибки: 422 (валидация, формат по образцу landing.js), 429 (рейт-лимит,
-// +Retry-After), 503 (перегрузка живых проверок, +Retry-After — всем
-// клиентам: 200 с found=false выглядел бы «Laravel не найден» для домена
-// со stored-данными, а stored-часть landing.js не показывает), 502
-// (живая проверка не удалась инфраструктурно и домен конвейеру неизвестен).
-// Все исходы ошибок — JSON {"error": код} с Content-Type application/json
-// (checkWriteError, T-227).
+// handleCheckDomainLive — T-123: validation → stored → live (timeout
+// web.timeout, the web.live_concurrency semaphore) → a web_checks
+// record → JSON. Errors: 422 (validation, in the landing.js format),
+// 429 (rate limit, +Retry-After), 503 (live check overload,
+// +Retry-After — to all clients: a 200 with found=false would read as
+// "Laravel not found" for a domain with stored data, and landing.js
+// does not show the stored part), 502 (the live check failed
+// infrastructurally and the domain is unknown to the pipeline). All
+// error outcomes — JSON {"error": code} with Content-Type
+// application/json (checkWriteError, T-227).
 func (s *Server) handleCheckDomainLive(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	ip, isIP := clientIP(r)
@@ -145,17 +152,17 @@ func (s *Server) handleCheckDomainLive(w http.ResponseWriter, r *http.Request) {
 
 	resp := checkResponse{Subdomains: []checkSubRecord{}}
 
-	// (1) stored: последний эпизод краулера, если домен известен.
+	// (1) stored: the latest crawler episode, if the domain is known.
 	if st := s.fetchStored(r.Context(), normalized); st != nil {
 		resp.Stored = st
 	}
 
-	// (2) live: полный конвейер с потолком web.timeout под семафором
-	// одновременных проверок (T-220): конвейер держит сеть/память,
-	// перегруз отвечает быстро (503 с Retry-After), а не копит очередь
-	// до таймаута. Сам конвейер работает на общем долгоживущем контуре
-	// checker.Runtime — одна цепь резолверов, общий Fetcher, кэш
-	// правил, один render.Manager на сервис.
+	// (2) live: the full pipeline with the web.timeout cap under the
+	// concurrency semaphore (T-220): the pipeline holds network/memory,
+	// an overload answers fast (503 with Retry-After) instead of building
+	// up a queue until the timeout. The pipeline itself runs on the shared
+	// long-lived checker.Runtime circuit — a single resolver chain, a
+	// shared Fetcher, a rule cache, one render.Manager per service.
 	var (
 		live    *checker.Result
 		liveErr error
@@ -210,16 +217,18 @@ func (s *Server) handleCheckDomainLive(w http.ResponseWriter, r *http.Request) {
 			resp.Subdomains = append(resp.Subdomains, sub)
 		}
 	}
-	// Ошибка живой проверки не рушит ответ: отдаём stored-часть с
-	// пометкой; полностью пустой итог без stored — 502.
+	// A live check failure does not collapse the response: we return the
+	// stored part with a marker; a fully empty result without stored —
+	// 502.
 
-	// (3) журнал web_checks (T-120): best-effort — отказ записи не
-	// ломает ответ посетителю. Перегрузка не журналируется: проверки
-	// не было, строка found=false/score=0 портила бы аудит и добавляла
-	// INSERT в БД на пути «быстрого» 503. Адрес без IP (пир unix-сокета
-	// без валидного заголовка прокси, T-221) не пишется вовсе: колонка
-	// ip_address inet NOT NULL произвольную строку не примет — пропуск
-	// явный (Warn + метрика non_ip), не молчаливый.
+	// (3) the web_checks log (T-120): best-effort — a write failure does
+	// not break the response to the visitor. An overload is not logged:
+	// there was no check, and a found=false/score=0 row would corrupt the
+	// audit and add a DB INSERT to the "fast" 503 path. An address without
+	// an IP (a unix-socket peer without a valid proxy header, T-221) is
+	// not written at all: the ip_address inet NOT NULL column will not
+	// accept an arbitrary string — the skip is explicit (Warn + the
+	// non_ip metric), not silent.
 	if !errors.Is(liveErr, errLiveOverloaded) {
 		if isIP {
 			s.recordCheck(r.Context(), normalized, resp.Found, resp.Score, resp.DurationMS, ip)
@@ -233,10 +242,10 @@ func (s *Server) handleCheckDomainLive(w http.ResponseWriter, r *http.Request) {
 
 	if liveErr != nil {
 		if errors.Is(liveErr, errLiveOverloaded) {
-			// Перегруз — быстрый отказ всем клиентам с подсказкой
-			// повтора: независимо от stored-части (landing.js её не
-			// показывает, 200 с found=false читался бы как «Laravel
-			// не найден»).
+			// Overload — a fast rejection to all clients with a retry
+			// hint: regardless of the stored part (landing.js does not
+			// show it; a 200 with found=false would read as "Laravel
+			// not found").
 			s.met.Outcome(checkResultBusy)
 			w.Header().Set("Retry-After", "5")
 			checkWriteError(w, "busy", http.StatusServiceUnavailable)
@@ -257,9 +266,10 @@ func (s *Server) handleCheckDomainLive(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
-// validateCheckInput — валидация по образцу CheckDomainRequest larasites:
-// trim, срез хвостовой точки, http(s)-префикс → хост, ASCII-домен или
-// IDN (≥2 непустые метки), потолок длины. Возвращает punycode-имя.
+// validateCheckInput — validation modeled on the larasites
+// CheckDomainRequest: trim, a trailing dot cut, an http(s) prefix → host,
+// an ASCII domain or an IDN (≥2 non-empty labels), a length cap. Returns
+// the punycode name.
 func validateCheckInput(input string) (string, error) {
 	s := strings.TrimSpace(input)
 	s = strings.TrimSuffix(s, ".")
@@ -267,7 +277,7 @@ func validateCheckInput(input string) (string, error) {
 		return "", fmt.Errorf("пустой или сверхдлинный ввод")
 	}
 	s = strings.ToLower(s)
-	// http(s)://host/… → host (порт срезается).
+	// http(s)://host/… → host (the port is cut off).
 	if i := strings.Index(s, "://"); i > 0 {
 		rest := s[i+3:]
 		if host, _, ok := strings.Cut(rest, "/"); ok || host != "" {
@@ -287,12 +297,12 @@ func validateCheckInput(input string) (string, error) {
 	return res.ASCII, nil
 }
 
-// fetchStored — чтение domain_info (T-082): сокращение до полей формы.
+// fetchStored — reading domain_info (T-082): reduced to the form fields.
 func (s *Server) fetchStored(ctx context.Context, domain string) *storedSummary {
 	rows, err := s.db.Query(ctx,
 		"SELECT domain_info($1::text)", domain)
 	if err != nil {
-		return nil // best-effort: stored-часть опциональна
+		return nil // best-effort: the stored part is optional
 	}
 	defer rows.Close()
 	if !rows.Next() {
@@ -325,14 +335,15 @@ func (s *Server) fetchStored(ctx context.Context, domain string) *storedSummary 
 	return st
 }
 
-// recordCheck — INSERT web_checks (T-120): best-effort — отказ записи не
-// ломает ответ посетителю, но логируется и считается метрикой (T-221:
-// до неё INSERT шёл через Query без чтения строк — ошибка проглатывалась
-// и журнал молча пустел). Exec, а не Query: INSERT строк не возвращает.
-// Контекст запроса отменяется уходом посетителя (живая проверка до
-// web.timeout), а журнал — аудит «кто/что/когда проверял»: INSERT живёт
-// собственным коротким окном, не зависящим от отключения клиента
-// (P3-5 ревью T-221).
+// recordCheck — an INSERT into web_checks (T-120): best-effort — a write
+// failure does not break the response to the visitor, but it is logged
+// and counted as a metric (T-221: before that, the INSERT went through
+// Query without reading rows — the error was swallowed and the log
+// silently went empty). Exec, not Query: an INSERT returns no rows.
+// The request context is canceled by the visitor leaving (a live check
+// up to web.timeout), while the log is the audit of "who/what/when
+// checked": the INSERT lives in its own short window independent of the
+// client disconnect (P3-5 of the T-221 review).
 func (s *Server) recordCheck(ctx context.Context, punycode string, found bool, score float64, durMS int64, ip string) {
 	jctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
 	defer cancel()
@@ -340,45 +351,49 @@ func (s *Server) recordCheck(ctx context.Context, punycode string, found bool, s
 		"INSERT INTO web_checks (domain, punycode_domain, ip_address, found, score, duration_ms) "+
 			"VALUES ($1::text, $2::text, $3::inet, $4, $5::real, $6::int4)",
 		punycode, punycode, ip, found, score, int32(durMS)); err != nil {
-		// Домен и причина — без адреса посетителя (персональные данные
-		// в лог не попадают, адрес остаётся только в web_checks).
+		// The domain and the cause — without the visitor address (no
+		// personal data in the log; the address stays only in
+		// web_checks).
 		s.opt.Log.Warn("форма: журнал web_checks не записан", "domain", punycode, "err", err)
 		s.met.Failure(checkErrJournal)
 	}
 }
 
-// unixLocalKey — ключ бакета рейт-лимита для пира unix-сокета без
-// валидного X-Real-IP/X-Forwarded-For (T-221): строка, заведомо не IP —
-// не пишется в inet, все такие посетители делят один бакет (прокси
-// сконфигурирован без заголовков — общее окно честнее обхода лимита).
+// unixLocalKey — the rate limit bucket key for a unix-socket peer
+// without a valid X-Real-IP/X-Forwarded-For (T-221): a string that is
+// definitely not an IP — it is not written into inet, and all such
+// visitors share one bucket (the proxy is configured without headers —
+// a shared window is fairer than circumventing the limit).
 const unixLocalKey = "unix-local"
 
-// clientIP — адрес клиента для рейт-лимита и журнала web_checks.
-// Второе возвращаемое — является ли результат IP вовсе: ложь для пира
-// unix-сокета без валидного заголовка прокси и мусорного RemoteAddr
-// (в inet не пишется).
+// clientIP — the client address for the rate limit and the web_checks
+// log. The second return value — whether the result is an IP at all:
+// false for a unix-socket peer without a valid proxy header and a junk
+// RemoteAddr (it is not written into inet).
 //
-// Unix-сокет (T-221, deploy/nginx/README.md §«Вариант unix-сокета»)
-// распознаётся положительно — по локальному адресу соединения, который
-// http.Server кладёт в контекст: у пира unix-сокета это *net.UnixAddr
-// (RemoteAddr при этом «@» автобинда или путь сокета — не IP, а путь с
-// двоеточием даже разобрался бы SplitHostPort'ом как host:port).
-// Пир unix-сокета — сам nginx на том же хосте: доверенный прокси, как и
-// loopback TCP. Адрес посетителя — X-Real-IP, затем X-Forwarded-For
-// (запас для конфигураций без X-Real-IP), только валидный net.ParseIP;
-// невалидный или отсутствующий — ключ-метка unixLocalKey без записи в
-// журнал (inet NOT NULL).
+// A unix socket (T-221, deploy/nginx/README.md §"The unix-socket
+// variant") is recognized positively — by the connection's local
+// address, which http.Server puts into the context: for a unix-socket
+// peer it is a *net.UnixAddr (the RemoteAddr in that case is the "@"
+// autobind or the socket path — not an IP; a path with a colon would
+// even parse as host:port by SplitHostPort). The unix-socket peer is
+// nginx itself on the same host: a trusted proxy, just like loopback
+// TCP. The visitor address — X-Real-IP, then X-Forwarded-For (a fallback
+// for configurations without X-Real-IP), only a valid net.ParseIP;
+// invalid or missing — the unixLocalKey label key, without a log record
+// (inet NOT NULL).
 //
-// TCP-ветка (T-124) без изменений: за reverse-proxy все соединения
-// приходят с loopback nginx — адрес посетителя несёт X-Real-IP (образец
-// nginx перезаписывает его значением $remote_addr — подделать снаружи
-// нельзя, а сам сервис слушает loopback, прямых соединений с визитором
-// нет). Заголовку доверяем только от loopback-пира и только валидному
-// IP; иначе — RemoteAddr (подделка заголовка снаружи и с чужих адресов
-// не расходует чужой бакет).
+// The TCP branch (T-124) unchanged: behind the reverse proxy all
+// connections come from the nginx loopback — the visitor address is
+// carried by X-Real-IP (the sample nginx config overwrites it with the
+// $remote_addr value — it cannot be forged from outside, and the service
+// itself listens on loopback, with no direct visitor connections). The
+// header is trusted only from a loopback peer and only for a valid IP;
+// otherwise — RemoteAddr (a header forged from outside and from foreign
+// addresses does not spend someone else's bucket).
 func clientIP(r *http.Request) (string, bool) {
 	if isUnixPeer(r) {
-		// Пир unix-сокета: доверенный прокси.
+		// A unix-socket peer: a trusted proxy.
 		if pip := proxyHeaderIP(r.Header); pip != "" {
 			return pip, true
 		}
@@ -393,19 +408,20 @@ func clientIP(r *http.Request) (string, bool) {
 	return host, net.ParseIP(host) != nil
 }
 
-// isUnixPeer — соединение пришло через unix-сокет (T-221): пир — сам
-// nginx на этом хосте, доверенный прокси. Положительное распознавание —
-// по локальному адресу соединения из контекста, который кладёт туда
-// http.Server: у пира unix-сокета это *net.UnixAddr (RemoteAddr при
-// этом «@» автобинда или путь сокета — не IP, а путь с двоеточием даже
-// разобрался бы SplitHostPort'ом как host:port).
+// isUnixPeer — the connection came through a unix socket (T-221): the
+// peer is nginx itself on this host, a trusted proxy. Positive
+// recognition — by the connection's local address from the context,
+// which http.Server puts there: for a unix-socket peer it is a
+// *net.UnixAddr (the RemoteAddr in that case is the "@" autobind or the
+// socket path — not an IP; a path with a colon would even parse as
+// host:port by SplitHostPort).
 func isUnixPeer(r *http.Request) bool {
 	_, ok := r.Context().Value(http.LocalAddrContextKey).(*net.UnixAddr)
 	return ok
 }
 
-// remoteHost — хост RemoteAddr без порта; строка не в форме host:port
-// возвращается как есть (SplitHostPort для неё ошибочен).
+// remoteHost — the RemoteAddr host without the port; a string not in
+// the host:port form is returned as is (SplitHostPort errors on it).
 func remoteHost(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
@@ -414,13 +430,13 @@ func remoteHost(r *http.Request) string {
 	return host
 }
 
-// trustedProxyPeer — пир соединения является доверенным reverse-proxy
-// этого хоста (T-227): nginx за TCP-loopback (deploy/nginx/
-// crawler.example.conf) либо за unix-сокетом (deploy/nginx/README.md).
-// Заголовкам, которые ставит прокси (X-Real-IP, X-Forwarded-For,
-// X-Forwarded-Proto), доверяем только от такого пира — прямой
-// посетитель и чужой адрес могут слать свои значения, но они не
-// читаются (тот же принцип, что адрес посетителя в clientIP).
+// trustedProxyPeer — the connection peer is a trusted reverse proxy of
+// this host (T-227): nginx behind TCP loopback (deploy/nginx/
+// crawler.example.conf) or behind a unix socket (deploy/nginx/README.md).
+// The headers the proxy sets (X-Real-IP, X-Forwarded-For,
+// X-Forwarded-Proto) are trusted only from such a peer — a direct
+// visitor and a foreign address may send their own values, but they are
+// not read (the same principle as the visitor address in clientIP).
 func trustedProxyPeer(r *http.Request) bool {
 	if isUnixPeer(r) {
 		return true
@@ -429,13 +445,13 @@ func trustedProxyPeer(r *http.Request) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-// proxyHeaderIP — адрес посетителя из заголовков прокси (unix-пир):
-// X-Real-IP, затем X-Forwarded-For. XFF берётся ПОСЛЕДНЯЯ позиция — её
-// дописал наш nginx ($proxy_add_x_forwarded_for, P1-1 ревью T-221):
-// начало списка пришло от клиента и не доверено — иначе посетитель
-// слал бы каждый запрос с новым значением и обходил токен-бакет.
-// Возвращается только валидный net.ParseIP; неверный или отсутствующий
-// заголовок — "".
+// proxyHeaderIP — the visitor address from the proxy headers (a unix
+// peer): X-Real-IP, then X-Forwarded-For. XFF takes the LAST entry — it
+// was appended by our nginx ($proxy_add_x_forwarded_for, P1-1 of the
+// T-221 review): the start of the list came from the client and is not
+// trusted — otherwise a visitor would send each request with a new
+// value and circumvent the token bucket. Only a valid net.ParseIP is
+// returned; an invalid or missing header — "".
 func proxyHeaderIP(h http.Header) string {
 	if pip := net.ParseIP(strings.TrimSpace(h.Get("X-Real-IP"))); pip != nil {
 		return pip.String()
@@ -449,11 +465,12 @@ func proxyHeaderIP(h http.Header) string {
 	return ""
 }
 
-// checkWriteError — JSON-тело ошибки формы с корректным Content-Type
-// (единый формат всех исходов, включая 429/503/502 — до T-227 они
-// уходили через http.Error с text/plain; landing.js различает исходы по
-// статусу, тело — контракт прочих JSON-клиентов). nosniff — как ставил
-// http.Error, паритет поведения до унификации.
+// checkWriteError — the JSON error body of the form with a correct
+// Content-Type (a single format for all outcomes, including 429/503/502 —
+// before T-227 they went through http.Error with text/plain; landing.js
+// distinguishes the outcomes by status, the body is the contract for
+// other JSON clients). nosniff — as http.Error set it, the behavior
+// parity before the unification.
 func checkWriteError(w http.ResponseWriter, code string, status int) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -461,7 +478,7 @@ func checkWriteError(w http.ResponseWriter, code string, status int) {
 	_, _ = w.Write([]byte(`{"error":"` + code + `"}`))
 }
 
-// --- token bucket: 4 запроса/мин на IP ---------------------------------------
+// --- token bucket: 4 requests/min per IP ------------------------------------
 
 type tokenBucketLimiter struct {
 	rate  int
@@ -486,8 +503,9 @@ func (l *tokenBucketLimiter) allow(ip string, now time.Time) bool {
 	if !ok {
 		st = &bucketState{tokens: float64(l.rate) - 1, last: now}
 		l.state[ip] = st
-		// Ленивая уборка: карта растёт с числом уникальных IP; записи
-		// старше окна удаляются при проходе (форма — не hot path).
+		// Lazy cleanup: the map grows with the number of unique IPs;
+		// entries older than the window are deleted on a pass (the form
+		// is not a hot path).
 		if len(l.state) > 4096 {
 			for k, v := range l.state {
 				if now.Sub(v.last) > l.per*4 {

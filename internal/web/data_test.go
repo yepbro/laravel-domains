@@ -1,7 +1,7 @@
-// Юнит-тесты данных лендинга (T-122) на фейковом пуле web_test.go:
-// SQL-контракты выборок, живая семантика фейка (статистика, облако с
-// лог-масштабом, таблица с долями, последние находки с бейджами маски),
-// ошибки не скрываются.
+// Unit tests of the landing data (T-122) on the fake pool of
+// web_test.go: the SQL contracts of the selects, the live fake
+// semantics (the stats, the cloud with a log scale, the table with
+// shares, the latest finds with mask badges), errors are not hidden.
 package web
 
 import (
@@ -10,8 +10,9 @@ import (
 	"testing"
 )
 
-// TestLandingSQLContracts — тексты выборок зафиксированы: кэши T-120,
-// LIMIT облака/таблицы, ORDER BY updated_at по индексу T-120.
+// TestLandingSQLContracts — the select texts are pinned: the T-120
+// caches, the cloud/table LIMIT, the ORDER BY updated_at by the T-120
+// index.
 func TestLandingSQLContracts(t *testing.T) {
 	for sql, want := range map[string]string{
 		statsSQL:      "sum(domains_laravel)",
@@ -27,9 +28,9 @@ func TestLandingSQLContracts(t *testing.T) {
 	}
 }
 
-// TestFetchLandingData — семантика: суммы статистики, лог-масштаб
-// облака (ранг сохранён, максимум — верх границы), проценты таблицы,
-// бейджи found_on_mask и версии находок.
+// TestFetchLandingData — the semantics: the stats sums, the cloud log
+// scale (the rank preserved, the maximum — the top of the range), the
+// table percentages, the found_on_mask badges and the find versions.
 func TestFetchLandingData(t *testing.T) {
 	db := &fakeDB{seed: seedLanding()}
 	data, err := FetchLandingData(context.Background(), db)
@@ -72,7 +73,7 @@ func TestFetchLandingData(t *testing.T) {
 	if it.Name != "shop.example.com" || it.VerText != "9.19–12" {
 		t.Errorf("находка = %+v", it)
 	}
-	// found_on_mask 0b11 — апекс (бит 0, без бейджа) и www (бит 1).
+	// found_on_mask 0b11 — the apex (bit 0, no badge) and www (bit 1).
 	if len(it.Subdomains) != 1 || it.Subdomains[0].Label != "www" ||
 		it.Subdomains[0].Host != "www.shop.example.com" {
 		t.Errorf("бейджи = %+v, хочу только www", it.Subdomains)
@@ -82,22 +83,22 @@ func TestFetchLandingData(t *testing.T) {
 	}
 }
 
-// TestFetchLandingNilPool — без пула — ошибка.
+// TestFetchLandingNilPool — no pool — an error.
 func TestFetchLandingNilPool(t *testing.T) {
 	if _, err := FetchLandingData(context.Background(), nil); err == nil {
 		t.Fatal("nil пул = nil error, хочу ошибку")
 	}
 }
 
-// TestFetchLandingQueryError — ошибка запроса всплывает (страница без
-// данных не рендерится наполовину).
+// TestFetchLandingQueryError — a query error surfaces (a page without
+// data does not render half-built).
 func TestFetchLandingQueryError(t *testing.T) {
 	if _, err := FetchLandingData(context.Background(), brokenDB{}); err == nil {
 		t.Fatal("слой БД недоступен = nil error, хочу ошибку")
 	}
 }
 
-// TestDisplayUnicode — punycode → Unicode, ASCII — как есть.
+// TestDisplayUnicode — punycode → Unicode, ASCII as is.
 func TestDisplayUnicode(t *testing.T) {
 	if got := displayUnicode("xn--80ak6aa92e.com"); got == "xn--80ak6aa92e.com" {
 		t.Errorf("IDN не декодирован: %q", got)

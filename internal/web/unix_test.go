@@ -1,11 +1,12 @@
-// Тесты формы на unix-сокете (T-221): пир unix-сокета — доверенный
-// прокси (вариант деплоя deploy/nginx/README.md §«Вариант unix-сокета»;
-// RemoteAddr пира — «@» для безымянного клиента автобинда или путь
-// сокета, никогда не IP). Критерии: X-Real-IP/X-Forwarded-For дают
-// независимые бакеты рейт-лимита (до T-221 — один бакет на всех
-// посетителей), пир без валидного заголовка — общий бакет-метка без
-// записи не-IP в inet (INSERT не пытается, Warn в журнале), ошибка
-// INSERT логируется, метрики формы регистрируются и отдаются реестром.
+// Tests of the form on a unix socket (T-221): a unix-socket peer is a
+// trusted proxy (the deploy variant of deploy/nginx/README.md §"The
+// unix-socket variant"; the peer's RemoteAddr is "@" for an unnamed
+// autobind client or the socket path, never an IP). The criteria:
+// X-Real-IP/X-Forwarded-For give independent rate limit buckets (before
+// T-221 — one bucket for all visitors), a peer without a valid header —
+// the shared label bucket without writing a non-IP into inet (the
+// INSERT is not attempted, a Warn in the log), an INSERT error is
+// logged, the form metrics are registered and served by the registry.
 package web
 
 import (
@@ -27,8 +28,8 @@ import (
 	"crawler/internal/metrics"
 )
 
-// newUnixTestServer — httptest-сервер на unix-сокете во временном
-// каталоге; возвращает клиент с диалером на сокет.
+// newUnixTestServer — an httptest server on a unix socket in a
+// temporary directory; returns a client with a dialer to the socket.
 func newUnixTestServer(t *testing.T, h http.Handler) *http.Client {
 	t.Helper()
 	sock := filepath.Join(t.TempDir(), "web.sock")
@@ -48,8 +49,9 @@ func newUnixTestServer(t *testing.T, h http.Handler) *http.Client {
 	}}
 }
 
-// postFormUnix — POST формы через клиента с заголовками прокси
-// (X-Real-IP/X-Forwarded-For); пустое значение — заголовок не ставится.
+// postFormUnix — a POST of the form through the client with proxy
+// headers (X-Real-IP/X-Forwarded-For); an empty value — the header is
+// not set.
 func postFormUnix(t *testing.T, c *http.Client, realIP, xff string) int {
 	t.Helper()
 	req, err := http.NewRequest(http.MethodPost, "http://unix/api/check-domain",
@@ -72,14 +74,15 @@ func postFormUnix(t *testing.T, c *http.Client, realIP, xff string) int {
 	return resp.StatusCode
 }
 
-// fakeLiveCheck — шов живой проверки: всегда успешный результат.
+// fakeLiveCheck — the live check seam: an always successful result.
 func fakeLiveCheck() checker.LiveFunc {
 	return func(context.Context, *config.Config, checker.Pool, string, checker.Logger) (*checker.Result, error) {
 		return &checker.Result{Domain: "example.com", Found: true, Score: 0.5}, nil
 	}
 }
 
-// serveOn — прямой вызов хендлера сервера с заданным RemoteAddr.
+// serveOn — a direct call of the server handler with the given
+// RemoteAddr.
 func serveOn(srv *Server, remote, body string) int {
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/api/check-domain", strings.NewReader(body))
@@ -88,18 +91,19 @@ func serveOn(srv *Server, remote, body string) int {
 	return rec.Code
 }
 
-// TestCheckDomainUnixSocketBuckets — критерий T-221: на unix-сокете два
-// разных X-Real-IP получают независимые бакеты (первый исчерпал лимит —
-// второй проходит); X-Forwarded-For без X-Real-IP работает так же;
-// «@»-пир без заголовков — общий бакет-метка unixLocalKey, INSERT
-// web_checks для него не выполняется вовсе (inet NOT NULL), пропуск
-// виден Warn-ом в журнале сервиса.
+// TestCheckDomainUnixSocketBuckets — the T-221 criterion: on a unix
+// socket two different X-Real-IPs get independent buckets (the first
+// exhausted the limit — the second passes); X-Forwarded-For without
+// X-Real-IP works the same way; an "@" peer without headers — the
+// shared unixLocalKey label bucket, the web_checks INSERT is not
+// attempted for it at all (inet NOT NULL), the skip is visible as a
+// Warn in the service log.
 func TestCheckDomainUnixSocketBuckets(t *testing.T) {
 	var buf bytes.Buffer
 	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
 	db := &fakeDB{seed: seedLanding()}
 	cfg := config.Default()
-	cfg.Web.RateLimit = 1 // один запрос на бакет: независимость видна сразу
+	cfg.Web.RateLimit = 1 // one request per bucket: independence is visible at once
 	srv, err := New(db, cfg, Options{Log: log})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -107,9 +111,9 @@ func TestCheckDomainUnixSocketBuckets(t *testing.T) {
 	srv.liveCheck = fakeLiveCheck()
 	client := newUnixTestServer(t, srv.Handler())
 
-	// Независимые бакеты по X-Real-IP: первый IP исчерпал лимит —
-	// второй проходит (до T-221 пир «@» не был доверенным и все
-	// посетители делили один бакет: 4 проверки/мин на весь сайт).
+	// Independent buckets by X-Real-IP: the first IP exhausted the limit
+	// — the second passes (before T-221 the "@" peer was not trusted and
+	// all visitors shared one bucket: 4 checks/min for the whole site).
 	if st := postFormUnix(t, client, "198.51.100.1", ""); st != http.StatusOK {
 		t.Fatalf("первый запрос c X-Real-IP A: %d, хочу 200", st)
 	}
@@ -119,14 +123,14 @@ func TestCheckDomainUnixSocketBuckets(t *testing.T) {
 	if st := postFormUnix(t, client, "198.51.100.2", ""); st != http.StatusOK {
 		t.Fatalf("запрос с X-Real-IP B: %d, хочу 200 (бакет независим)", st)
 	}
-	// X-Forwarded-For без X-Real-IP — запасной источник адреса: ключ —
-	// ПОСЛЕДНЯЯ позиция (её дописал наш прокси; клиентское начало
-	// списка не доверено — P1-1 ревью T-221).
+	// X-Forwarded-For without X-Real-IP — the fallback address source:
+	// the key is the LAST entry (our proxy appended it; the client start
+	// of the list is not trusted — P1-1 of the T-221 review).
 	if st := postFormUnix(t, client, "", "6.6.6.6, 198.51.100.3"); st != http.StatusOK {
 		t.Fatalf("запрос с X-Forwarded-For C: %d, хочу 200 (свой бакет по последней позиции)", st)
 	}
-	// Подделка первой позиции XFF не даёт новый бакет: тот же адрес
-	// в конце списка — лимит исчерпан.
+	// A forged first entry of the XFF gives no new bucket: the same
+	// address at the end of the list — the limit is exhausted.
 	if st := postFormUnix(t, client, "", "1.2.3.4, 198.51.100.3"); st != http.StatusTooManyRequests {
 		t.Fatalf("подделка начала XFF: %d, хочу 429 (бакет один — по последней позиции)", st)
 	}
@@ -134,9 +138,9 @@ func TestCheckDomainUnixSocketBuckets(t *testing.T) {
 		t.Fatalf("INSERT web_checks выполнен %d раз, хочу 3 (по одному на валидный IP)", got)
 	}
 
-	// «@»-пир без заголовков: общий бакет-метка — первый проходит,
-	// второй исчерпывает; запись в БД не пытается (inet NOT NULL),
-	// пропуск каждого запроса — Warn в журнале.
+	// An "@" peer without headers: the shared label bucket — the first
+	// passes, the second exhausts it; the DB write is not attempted
+	// (inet NOT NULL), the skip of each request is a Warn in the log.
 	warnsBefore := strings.Count(buf.String(), "web_checks")
 	if st := postFormUnix(t, client, "", ""); st != http.StatusOK {
 		t.Fatalf("первый запрос без заголовков: %d, хочу 200 (бакет-метка свеж)", st)
@@ -147,16 +151,18 @@ func TestCheckDomainUnixSocketBuckets(t *testing.T) {
 	if got := db.webCheckInserts(); got != 3 {
 		t.Fatalf("INSERT web_checks после не-IP пира: %d обращений, хочу по-прежнему 3 (запись не пытается)", got)
 	}
-	// Пропуск журнала — Warn на каждый состоявшийся запрос (первый
-	// прошёл лимит и дошёл до журнала; второй — 429, до журнала не дошёл).
+	// The log skip — a Warn per each completed request (the first passed
+	// the limit and reached the log; the second — a 429, it did not
+	// reach the log).
 	if got, want := strings.Count(buf.String(), "web_checks")-warnsBefore, 1; got != want {
 		t.Errorf("Warn-ов пропуска журнала %d, хочу %d (не молча):\n%s", got, want, buf.String())
 	}
 }
 
-// TestCheckDomainUnixJournalError — отказ INSERT web_checks (unix-пир с
-// валидным X-Real-IP): ответ посетителю не ломается, отказ логируется
-// Warn-ом (до T-221 уходил через Query без чтения строк — молча).
+// TestCheckDomainUnixJournalError — a web_checks INSERT failure (a
+// unix peer with a valid X-Real-IP): the response to the visitor is not
+// broken, the failure is logged with a Warn (before T-221 it went
+// through Query without reading rows — silently).
 func TestCheckDomainUnixJournalError(t *testing.T) {
 	var buf bytes.Buffer
 	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
@@ -181,10 +187,11 @@ func TestCheckDomainUnixJournalError(t *testing.T) {
 	}
 }
 
-// TestRecordCheckClientCanceled — ушедший посетитель (отмена контекста
-// запроса после живой проверки) не выглядит отказом журнала: INSERT
-// web_checks живёт собственным окном без отмены клиента (P3-5 ревью
-// T-221) — аудит «кто/что/когда проверял» не зависит от отключения.
+// TestRecordCheckClientCanceled — a visitor who left (the request
+// context canceled after the live check) does not look like a log
+// failure: the web_checks INSERT lives in its own window without the
+// client cancellation (P3-5 of the T-221 review) — the audit of
+// "who/what/when checked" does not depend on the disconnect.
 func TestRecordCheckClientCanceled(t *testing.T) {
 	var buf bytes.Buffer
 	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
@@ -206,8 +213,9 @@ func TestRecordCheckClientCanceled(t *testing.T) {
 	}
 }
 
-// counterByLabels — значение счётчика name с точным набором меток,
-// кроме сервисной; -1, если ряд не найден (стиль retentionmetrics_test).
+// counterByLabels — the value of the name counter with the exact label
+// set, except the service one; -1 if the row is not found (the
+// retentionmetrics_test style).
 func counterByLabels(t *testing.T, g prometheus.Gatherer, name string, labels map[string]string) float64 {
 	t.Helper()
 	families, err := g.Gather()
@@ -240,10 +248,11 @@ func counterByLabels(t *testing.T, g prometheus.Gatherer, name string, labels ma
 	return -1
 }
 
-// TestCheckDomainMetrics — метрики формы (T-221) регистрируются в
-// реестре сервиса и отдаются /metrics (:9107): исходы запросов по
-// result (ok/rate_limited/invalid/failed/busy), сбои по стадиям
-// (live/journal/non_ip), длительность — гистограммой.
+// TestCheckDomainMetrics — the form metrics (T-221) are registered in
+// the service registry and served by /metrics (:9107): the request
+// outcomes by result (ok/rate_limited/invalid/failed/busy), the
+// failures by stage (live/journal/non_ip), the duration — as a
+// histogram.
 func TestCheckDomainMetrics(t *testing.T) {
 	reg := metrics.New("web")
 	db := &fakeDB{seed: seedLanding(), execErr: errors.New("insert failed")}
@@ -256,21 +265,22 @@ func TestCheckDomainMetrics(t *testing.T) {
 	}
 	srv.liveCheck = fakeLiveCheck()
 
-	// ok + отказ журнала (journal): первый запрос IP A.
+	// ok + a log failure (journal): the first request from IP A.
 	if st := serveOn(srv, "203.0.113.1:1000", `{"domain":"example.com"}`); st != http.StatusOK {
 		t.Fatalf("ok-запрос: %d, хочу 200", st)
 	}
-	// rate_limited: повтор с того же IP A.
+	// rate_limited: a repeat from the same IP A.
 	if st := serveOn(srv, "203.0.113.1:1000", `{"domain":"example.com"}`); st != http.StatusTooManyRequests {
 		t.Fatalf("повтор: %d, хочу 429", st)
 	}
-	// invalid: мусорный домен с IP B (валидация после лимита).
+	// invalid: a junk domain from IP B (the validation after the limit).
 	if st := serveOn(srv, "203.0.113.2:1000", `{"domain":"not a domain"}`); st != http.StatusUnprocessableEntity {
 		t.Fatalf("мусорный ввод: %d, хочу 422", st)
 	}
 
-	// busy: слот семафора занят блокированным конвейером (IP C),
-	// запрос с IP D — быстрый 503; освобождение — занявший отвечает 200.
+	// busy: the semaphore slot is taken by a blocked pipeline (IP C),
+	// a request from IP D — a fast 503; the release — the holder answers
+	// 200.
 	block := make(chan struct{})
 	entered := make(chan struct{}, 1)
 	done := make(chan int, 1)
@@ -289,8 +299,9 @@ func TestCheckDomainMetrics(t *testing.T) {
 		t.Fatalf("занявший слот: %d, хочу 200", st)
 	}
 
-	// failed + live-ошибка: сбой конвейера без stored-данных (TCP-пир),
-	// затем пир unix-сокета без заголовков — тот же исход плюс non_ip.
+	// failed + a live error: a pipeline failure without stored data (a
+	// TCP peer), then a unix-socket peer without headers — the same
+	// outcome plus non_ip.
 	failing, err := New(db, cfg, Options{Metrics: reg})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -305,8 +316,8 @@ func TestCheckDomainMetrics(t *testing.T) {
 		t.Fatalf("unix-пир без заголовков: %d, хочу 502 (сбой конвейера, stored нет)", st)
 	}
 
-	// stored_only: живая проверка сбоила, домен известен конвейеру —
-	// 200 из сохранённых данных (P3-3 ревью T-221).
+	// stored_only: the live check failed, the domain is known to the
+	// pipeline — a 200 from the stored data (P3-3 of the T-221 review).
 	seed := seedLanding()
 	seed.domainInfo = []byte(`{"domain":{"status":0,"status_name":"new","last_checked_at":"2026-11-01"}}`)
 	stored, err := New(&fakeDB{seed: seed}, cfg, Options{Metrics: reg})
@@ -338,9 +349,9 @@ func TestCheckDomainMetrics(t *testing.T) {
 		}
 	}
 
-	// Длительность — гистограмма: наблюдения есть у всех, кто дошёл до
-	// живой проверки (2 ok + 2 failed + 1 stored_only), 429/422/busy не
-	// наблюдались.
+	// Duration — a histogram: observed by everyone who reached the live
+	// check (2 ok + 2 failed + 1 stored_only), 429/422/busy were not
+	// observed.
 	families, err := reg.Gather()
 	if err != nil {
 		t.Fatalf("Gather: %v", err)
@@ -360,7 +371,8 @@ func TestCheckDomainMetrics(t *testing.T) {
 		t.Error("crawler_web_check_seconds без 5 наблюдений (2 ok + 2 failed + 1 stored_only)")
 	}
 
-	// Отдача реестра хендлером /metrics (как каркас на :9107).
+	// Serving the registry by the /metrics handler (like the framework
+	// on :9107).
 	rec := httptest.NewRecorder()
 	metrics.Handler(reg).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 	body := rec.Body.String()

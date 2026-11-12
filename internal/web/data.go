@@ -1,10 +1,11 @@
-// Данные лендинга (T-122): дёшево по кэшам T-120 — статистика и зоны
-// читают справочник zones целиком (суммы кэширующих счётчиков, строки —
-// тысячи), последние находки — индекс laravel_domains_updated_at_idx,
-// «находки за 24 ч» — индекс laravel_history_changed_at_idx (T-118).
-// Облако зон — топ-50 по domains_laravel, размер метки — лог-масштаб
-// (как в larasites: линейный масштаб одной доминирующей зоной .com
-// ужал бы остальные в нечитаемость).
+// Landing data (T-122): cheap off the T-120 caches — the stats and the
+// zones read the zones reference table in full (sums of caching
+// counters, thousands of rows), the latest finds — the
+// laravel_domains_updated_at_idx index, "finds in 24 h" — the
+// laravel_history_changed_at_idx index (T-118). The zone cloud — the
+// top 50 by domains_laravel, the label size is a log scale (as in
+// larasites: a linear scale with one dominating .com zone would squeeze
+// the rest into unreadability).
 package web
 
 import (
@@ -18,41 +19,41 @@ import (
 	"crawler/internal/model"
 )
 
-// LandingStats — карточки статистики.
+// LandingStats — the statistics cards.
 type LandingStats struct {
-	Zones   int64 // активные зоны
-	Total   int64 // сумма zones.domains_total
-	Checked int64 // сумма zones.domains_checked
-	Laravel int64 // сумма zones.domains_laravel
-	Last24h int64 // появления laravel_history за 24 ч (T-118)
+	Zones   int64 // active zones
+	Total   int64 // the sum of zones.domains_total
+	Checked int64 // the sum of zones.domains_checked
+	Laravel int64 // the sum of zones.domains_laravel
+	Last24h int64 // laravel_history appearances in 24 h (T-118)
 }
 
-// ZoneItem — зона облака/таблицы.
+// ZoneItem — a zone of the cloud/table.
 type ZoneItem struct {
 	Name        string
 	NameUnicode string
 	Checked     int64
 	Laravel     int64
-	Percent     float64 // доля laravel/checked, %
-	Size        float64 // размер шрифта облака, rem (лог-масштаб)
+	Percent     float64 // the laravel/checked share, %
+	Size        float64 // the cloud font size, rem (log scale)
 }
 
-// LatestItem — последняя находка: домен, бейджи субдоменов, диапазон
-// версий, время обновления.
+// LatestItem — the latest find: the domain, the subdomain badges, the
+// version range, the update time.
 type LatestItem struct {
 	Name        string
-	Subdomains  []Badge // субдомены с готовыми хостами для ссылок
-	VerText     string  // «9.19–11» или "" (диапазон не определён)
+	Subdomains  []Badge // subdomains with ready hosts for links
+	VerText     string  // "9.19–11" or "" (the range is undetermined)
 	UpdatedText string
 }
 
-// Badge — бейдж субдомена находки.
+// Badge — a find's subdomain badge.
 type Badge struct {
-	Label string // метка ("" — апекс, бейдж не строится)
-	Host  string // label.domain — готовый хост ссылки
+	Label string // the label ("" — the apex, no badge is built)
+	Host  string // label.domain — the ready host of the link
 }
 
-// LandingData — всё, что рендерит страница.
+// LandingData — everything the page renders.
 type LandingData struct {
 	Stats  LandingStats
 	Cloud  []ZoneItem
@@ -60,7 +61,7 @@ type LandingData struct {
 	Latest []LatestItem
 }
 
-// SQL данных (контракты — тесты на фейковом db.DB).
+// Data SQL (the contracts — tests on the fake db.DB).
 const (
 	statsSQL = "SELECT count(*), COALESCE(sum(domains_total), 0), " +
 		"COALESCE(sum(domains_checked), 0), COALESCE(sum(domains_laravel), 0) " +
@@ -87,10 +88,10 @@ const (
 	subdomainsSQL = "SELECT id, label FROM subdomains WHERE enabled ORDER BY id"
 )
 
-// FetchLandingData собирает данные страницы одним проходом по дешёвым
-// кэшам; ошибки запросов не скрываются — страница без данных бессмысленна
-// (read-only, деградация отдельных секций — паттерн дашборда T-129, не
-// публичной страницы).
+// FetchLandingData collects the page data in a single pass over the
+// cheap caches; query errors are not hidden — a page without data is
+// meaningless (read-only; the degradation of individual sections — the
+// dashboard pattern of T-129, not a public page).
 func FetchLandingData(ctx context.Context, pool Querier) (LandingData, error) {
 	if pool == nil {
 		return LandingData{}, fmt.Errorf("web: данные лендинга: пул не задан")
@@ -136,8 +137,8 @@ func FetchLandingData(ctx context.Context, pool Querier) (LandingData, error) {
 	return data, nil
 }
 
-// countRows — единственное значение агрегата (db.DB без QueryRow, стиль
-// monitor.NearStatsOnce).
+// countRows — the single value of an aggregate (db.DB without QueryRow,
+// the monitor.NearStatsOnce style).
 func countRows(ctx context.Context, pool Querier, sql, what string) (int64, error) {
 	rows, err := pool.Query(ctx, sql)
 	if err != nil {
@@ -175,9 +176,9 @@ func fetchZones(ctx context.Context, pool Querier, sql string, withChecked bool)
 	return out, rows.Err()
 }
 
-// sizeCloud — лог-масштаб размеров меток облака: 0.875..1.5 rem по
-// log(1+count)/log(1+max) — порядок разницы .com vs малой зоны сжат
-// без потери ранга.
+// sizeCloud — a log scale of the cloud label sizes: 0.875..1.5 rem by
+// log(1+count)/log(1+max) — the order-of-magnitude difference between
+// .com and a small zone is compressed without losing rank.
 func sizeCloud(zones []ZoneItem) {
 	if len(zones) == 0 {
 		return
@@ -197,7 +198,8 @@ func sizeCloud(zones []ZoneItem) {
 }
 
 func fetchLatest(ctx context.Context, pool Querier) ([]LatestItem, error) {
-	// Справочник субдоменов — расшифровка бейджей found_on_mask.
+	// The subdomain reference table — the decoding of the found_on_mask
+	// badges.
 	subs := map[int16]string{}
 	srows, err := pool.Query(ctx, subdomainsSQL)
 	if err != nil {
@@ -238,7 +240,7 @@ func fetchLatest(ctx context.Context, pool Querier) ([]LatestItem, error) {
 		for _, id := range m.IDs() {
 			label, ok := subs[int16(id)]
 			if !ok || label == "" {
-				continue // апекс (бит 0) бейджем не отмечается
+				continue // the apex (bit 0) is not marked with a badge
 			}
 			it.Subdomains = append(it.Subdomains, Badge{Label: label, Host: label + "." + it.Name})
 		}
@@ -256,8 +258,9 @@ func fetchLatest(ctx context.Context, pool Querier) ([]LatestItem, error) {
 	return out, rows.Err()
 }
 
-// displayUnicode — имя домена в Unicode для показа (punycode-метки
-// декодируются, ASCII — как есть; ошибка декодирования — исходная строка).
+// displayUnicode — the domain name in Unicode for display (punycode
+// labels are decoded, ASCII as is; a decode error — the original
+// string).
 func displayUnicode(name string) string {
 	if u, err := idna.Lookup.ToUnicode(name); err == nil {
 		return u

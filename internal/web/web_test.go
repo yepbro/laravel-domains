@@ -1,6 +1,6 @@
-// Юнит-тесты каркаса и данных публичного лендинга (T-121/T-122):
-// маршрутизация, healthz, рендер ru/en на фейковом пуле с живой
-// семантикой SQL данных, SQL-контракты, graceful stop — httptest без
+// Unit tests of the public landing framework and data (T-121/T-122):
+// routing, healthz, the ru/en render on a fake pool with live SQL data
+// semantics, SQL contracts, the graceful stop — httptest without
 // PostgreSQL.
 package web
 
@@ -27,9 +27,9 @@ import (
 	"crawler/internal/config"
 )
 
-// --- фейковый пул ------------------------------------------------------------
+// --- fake pool ---------------------------------------------------------------
 
-// webSeed — данные лендинга в фейке.
+// webSeed — the landing data in the fake.
 type webSeed struct {
 	zones      int64
 	total      int64
@@ -40,15 +40,16 @@ type webSeed struct {
 	table      [][]any // (name, unicode, checked, laravel)
 	latest     [][]any // (name, mask, ver_min, ver_max, updated)
 	subdomains [][]any // (id, label)
-	domainInfo []byte  // ответ domain_info(text) или nil (домен неизвестен)
+	domainInfo []byte  // the domain_info(text) response, or nil (the domain is unknown)
 }
 
-// fakeDB — Pinger + Querier + Execer с живой семантикой SQL данных
-// лендинга.
+// fakeDB — Pinger + Querier + Execer with the live landing SQL data
+// semantics.
 type fakeDB struct {
 	seed webSeed
 	ping error
-	// execErr — отказ Exec (INSERT web_checks, T-221); nil — успех.
+	// execErr — an Exec failure (the INSERT into web_checks, T-221);
+	// nil — success.
 	execErr error
 
 	mu      sync.Mutex
@@ -72,7 +73,7 @@ func (d *fakeDB) Exec(_ context.Context, sql string, _ ...any) (pgconn.CommandTa
 	return pgconn.CommandTag{}, nil
 }
 
-// webCheckInserts — сколько INSERT web_checks прошло через Exec.
+// webCheckInserts — how many INSERT web_checks went through Exec.
 func (d *fakeDB) webCheckInserts() int {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -107,7 +108,7 @@ func (d *fakeDB) Query(ctx context.Context, sql string, _ ...any) (pgx.Rows, err
 		return webRowsOf(d.seed.subdomains), nil
 	case "SELECT domain_info($1::text)":
 		if d.seed.domainInfo == nil {
-			return webRowsOf(nil), nil // NULL — домен неизвестен
+			return webRowsOf(nil), nil // NULL — the domain is unknown
 		}
 		return webRowsOf([][]any{{d.seed.domainInfo}}), nil
 	default:
@@ -115,8 +116,8 @@ func (d *fakeDB) Query(ctx context.Context, sql string, _ ...any) (pgx.Rows, err
 	}
 }
 
-// webRows — pgx.Rows с заготовленными строками (позиционный Scan по
-// типам значений, стиль anAggRows).
+// webRows — pgx.Rows with pre-stocked rows (a positional Scan by the
+// value types, the anAggRows style).
 type webRows struct {
 	rows [][]any
 	i    int
@@ -168,7 +169,7 @@ func (r *webRows) RawValues() [][]byte    { return nil }
 func (r *webRows) Conn() *pgx.Conn        { return nil }
 func (r *webRows) TypeMap() *pgtype.Map   { return nil }
 
-// seedLanding — типовые данные страницы (зоны/находки).
+// seedLanding — typical page data (zones/finds).
 func seedLanding() webSeed {
 	return webSeed{
 		zones: 12, total: 1_000_000, checked: 800_000, laravel: 4_242, last24h: 17,
@@ -191,7 +192,7 @@ func seedLanding() webSeed {
 func newTestServer(t *testing.T, db DB) *Server {
 	t.Helper()
 	cfg := config.Default()
-	cfg.Web.RateLimit = 100 // тесты маршрутизации не упираются в лимит
+	cfg.Web.RateLimit = 100 // the routing tests do not hit the limit
 	s, err := New(db, cfg, Options{})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -199,9 +200,9 @@ func newTestServer(t *testing.T, db DB) *Server {
 	return s
 }
 
-// --- каркас -------------------------------------------------------------------
+// --- framework ---------------------------------------------------------------
 
-// TestNewNilDB — без БД сервис не собирается.
+// TestNewNilDB — without a DB the service is not assembled.
 func TestNewNilDB(t *testing.T) {
 	cfg := config.Default()
 	if _, err := New(nil, cfg, Options{}); err == nil {
@@ -212,8 +213,8 @@ func TestNewNilDB(t *testing.T) {
 	}
 }
 
-// TestRoutingLanding — лендинг локалей рендерится с данными, корень
-// редиректит, чужой префикс — 404, статика отдаётся.
+// TestRoutingLanding — the locale landing renders with data, the root
+// redirects, a foreign prefix — 404, static assets are served.
 func TestRoutingLanding(t *testing.T) {
 	srv := newTestServer(t, &fakeDB{seed: seedLanding()})
 	ts := httptest.NewServer(srv.Handler())
@@ -241,7 +242,8 @@ func TestRoutingLanding(t *testing.T) {
 		}
 	}
 
-	// Чужая локаль — 404; статика — 200 с типом; корень — Location.
+	// A foreign locale — 404; static assets — 200 with a type; the root —
+	// Location.
 	resp, _ := http.Get(ts.URL + "/de")
 	if resp.StatusCode != http.StatusNotFound {
 		t.Errorf("/de = %d, хочу 404", resp.StatusCode)
@@ -269,7 +271,7 @@ func TestRoutingLanding(t *testing.T) {
 	}
 }
 
-// TestLandingDBError — сбой данных: 500 без внутренних деталей.
+// TestLandingDBError — a data failure: a 500 without internal details.
 func TestLandingDBError(t *testing.T) {
 	srv := newTestServer(t, brokenDB{})
 	ts := httptest.NewServer(srv.Handler())
@@ -285,7 +287,7 @@ func TestLandingDBError(t *testing.T) {
 	}
 }
 
-// brokenDB — Querier, отказывающий на любой запрос.
+// brokenDB — a Querier failing on every query.
 type brokenDB struct{}
 
 func (brokenDB) Ping(context.Context) error { return nil }
@@ -299,7 +301,7 @@ func (brokenDB) Query(context.Context, string, ...any) (pgx.Rows, error) {
 	return nil, errors.New("бд недоступна")
 }
 
-// TestHealthzDB — недоступная БД: 503.
+// TestHealthzDB — an unavailable DB: a 503.
 func TestHealthzDB(t *testing.T) {
 	srv := newTestServer(t, &fakeDB{ping: errors.New("connection refused")})
 	ts := httptest.NewServer(srv.Handler())
@@ -315,7 +317,8 @@ func TestHealthzDB(t *testing.T) {
 	}
 }
 
-// TestMethodNotAllowed — не-GET на страницах и не-POST на API — 405.
+// TestMethodNotAllowed — a non-GET on the pages and a non-POST on the
+// API — 405.
 func TestMethodNotAllowed(t *testing.T) {
 	srv := newTestServer(t, &fakeDB{seed: seedLanding()})
 	ts := httptest.NewServer(srv.Handler())
@@ -338,8 +341,8 @@ func TestMethodNotAllowed(t *testing.T) {
 	}
 }
 
-// TestRunGracefulStop — Run слушает, отменённый ctx останавливает
-// сервер чистым nil в окне остановки.
+// TestRunGracefulStop — Run listens, a canceled ctx stops the server
+// with a clean nil within the stop window.
 func TestRunGracefulStop(t *testing.T) {
 	srv := newTestServer(t, &fakeDB{seed: seedLanding()})
 
@@ -379,16 +382,18 @@ func TestRunGracefulStop(t *testing.T) {
 	}
 }
 
-// TestRunUnixSocket — listen абсолютным путём = unix-сокет (вариант
-// деплоя за nginx без TCP-порта, T-124): сервер отвечает, чистая
-// остановка убирает файл сокета. Осиротевший файл (крах прошлой серии —
-// SIGKILL, defer не отработал) снимается до Listen: иначе рестарт по
-// Restart=on-failure циклился бы на address already in use.
+// TestRunUnixSocket — a listen with an absolute path = a unix socket
+// (the deploy variant behind nginx without a TCP port, T-124): the
+// server answers, a clean stop removes the socket file. An orphaned
+// file (a crash of the previous run — SIGKILL, the defer did not fire)
+// is removed before Listen: otherwise a restart by Restart=on-failure
+// would loop on address already in use.
 func TestRunUnixSocket(t *testing.T) {
 	srv := newTestServer(t, &fakeDB{seed: seedLanding()})
 	sock := filepath.Join(t.TempDir(), "web.sock")
 
-	// «Осиротевший» сокет прошлой серии: обычный файл на пути Listen.
+	// An "orphaned" socket of the previous run: a regular file on the
+	// Listen path.
 	if err := os.WriteFile(sock, []byte("stale"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -431,11 +436,12 @@ func TestRunUnixSocket(t *testing.T) {
 	}
 }
 
-// TestRobotsSitemap — служебные файлы поисковых роботов у корня (T-124):
-// robots.txt — статика из embed; sitemap.xml — минимальный набор
-// локалей с абсолютным URL (хост — Host запроса при пустом
-// web.public_host, схему за reverse-proxy передаёт X-Forwarded-Proto —
-// T-227 доверяет ему только loopback/unix-пиру); POST на маршруты — 405.
+// TestRobotsSitemap — the search engine service files at the root
+// (T-124): robots.txt — static assets from embed; sitemap.xml — a
+// minimal set of locales with an absolute URL (the host — the request
+// Host when web.public_host is empty; behind the reverse proxy the
+// scheme is carried by X-Forwarded-Proto — T-227 trusts it only from a
+// loopback/unix peer); a POST on the routes — 405.
 func TestRobotsSitemap(t *testing.T) {
 	srv := newTestServer(t, &fakeDB{seed: seedLanding()})
 	ts := httptest.NewServer(srv.Handler())
@@ -459,7 +465,8 @@ func TestRobotsSitemap(t *testing.T) {
 		}
 	}
 
-	// sitemap: URL обеих локалей с хостом запроса; ничего лишнего.
+	// sitemap: the URLs of both locales with the request host; nothing
+	// extra.
 	resp, err = http.Get(ts.URL + "/sitemap.xml")
 	if err != nil {
 		t.Fatal(err)
@@ -485,13 +492,14 @@ func TestRobotsSitemap(t *testing.T) {
 		t.Errorf("sitemap.xml содержит %d URL, хочу %d (только локали):\n%s", n, len(Locales), s)
 	}
 
-	// За reverse-proxy схему передаёт X-Forwarded-Proto (публичный вход
-	// — TLS), Host берётся из запроса (public_host не задан — фолбэк).
-	// Заголовок читается только от доверенного пира (T-227): по умолчанию
-	// httptest.NewRequest ставит RemoteAddr 192.0.2.1:1234 (TEST-NET-1,
-	// недоверенный пир) — поэтому пир задаётся явно loopback-адресом,
-	// как реальный nginx на этом хосте. Чужое значение заголовка
-	// игнорируется (остаётся схема соединения).
+	// Behind the reverse proxy the scheme is carried by X-Forwarded-Proto
+	// (the public entry — TLS), the Host is taken from the request
+	// (public_host is not set — the fallback). The header is read only
+	// from a trusted peer (T-227): by default httptest.NewRequest sets
+	// the RemoteAddr to 192.0.2.1:1234 (TEST-NET-1, an untrusted peer) —
+	// hence the peer is set explicitly to a loopback address, like the
+	// real nginx on this host. A foreign header value is ignored (the
+	// connection scheme stays).
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/sitemap.xml", nil)
 	req.RemoteAddr = "127.0.0.1:60001"
@@ -508,13 +516,13 @@ func TestRobotsSitemap(t *testing.T) {
 	req = httptest.NewRequest(http.MethodGet, "/sitemap.xml", nil)
 	req.RemoteAddr = "127.0.0.1:60002"
 	req.Host = "crawler.example.com"
-	req.Header.Set("X-Forwarded-Proto", "javascript") // мусор — не web-схема
+	req.Header.Set("X-Forwarded-Proto", "javascript") // junk — not a web scheme
 	srv.Handler().ServeHTTP(rec, req)
 	if want := "<loc>http://crawler.example.com/ru</loc>"; !strings.Contains(rec.Body.String(), want) {
 		t.Errorf("sitemap.xml с мусорной схемой без %q:\n%s", want, rec.Body.String())
 	}
 
-	// Маршруты GET-only: POST отдаётся mux-ом как 405.
+	// GET-only routes: a POST is served by the mux as a 405.
 	req, _ = http.NewRequest(http.MethodPost, ts.URL+"/robots.txt", nil)
 	resp, err = http.DefaultClient.Do(req)
 	if err != nil {
@@ -526,15 +534,16 @@ func TestRobotsSitemap(t *testing.T) {
 	}
 }
 
-// TestSitemapCanonicalHost — <loc> sitemap не зависит от Host и
-// X-Forwarded-Proto недоверенных пиров (T-227): хост — канонический
-// web.public_host (пустое поле — фолбэк на Host запроса), схема — факт
-// TLS либо XFP только от доверенного пира (loopback TCP/unix-сокет).
+// TestSitemapCanonicalHost — the sitemap <loc> does not depend on the
+// Host and X-Forwarded-Proto of untrusted peers (T-227): the host — the
+// canonical web.public_host (an empty field — the fallback to the
+// request Host); the scheme — the TLS fact or XFP only from a trusted
+// peer (loopback TCP/a unix socket).
 func TestSitemapCanonicalHost(t *testing.T) {
-	// body — тело sitemap для запроса с заданными public_host, пиром,
-	// Host и XFP; unix — запрос «от nginx за unix-сокетом» (контекст
-	// локального адреса, как в TestClientIP), directTLS — прямое
-	// TLS-соединение.
+	// body — the sitemap body for a request with the given public_host,
+	// peer, Host and XFP; unix — a request "from nginx behind a unix
+	// socket" (the local address context, as in TestClientIP);
+	// directTLS — a direct TLS connection.
 	body := func(publicHost, remote, host, xfp string, unix, directTLS bool) string {
 		cfg := config.Default()
 		cfg.Web.PublicHost = publicHost
@@ -571,55 +580,59 @@ func TestSitemapCanonicalHost(t *testing.T) {
 		want       string
 	}{
 		{
-			// Канон задан: прямой запрос с чужими Host/XFP не влияет
-			// ни на хост, ни на схему (дефолт — http, соединение без TLS).
+			// The canonical host is set: a direct request with foreign
+			// Host/XFP affects neither the host nor the scheme (the
+			// default — http, a connection without TLS).
 			name:       "канон + недоверенный пир с чужими Host/XFP",
 			publicHost: "crawler.example.com", remote: "203.0.113.9:40001", host: evil,
 			xfp:  "https",
 			want: "<loc>http://crawler.example.com/ru</loc>",
 		},
 		{
-			// Канон + доверенный loopback-пир с XFP https: схема https,
-			// Host запроса игнорируется.
+			// The canonical host + a trusted loopback peer with XFP
+			// https: the scheme is https, the request Host is ignored.
 			name:       "канон + loopback-прокси с XFP https",
 			publicHost: "crawler.example.com", remote: "127.0.0.1:40002", host: evil,
 			xfp:  "https",
 			want: "<loc>https://crawler.example.com/ru</loc>",
 		},
 		{
-			// Канон + доверенный пир unix-сокета: тот же результат.
+			// The canonical host + a trusted unix-socket peer: the same
+			// result.
 			name:       "канон + unix-прокси с XFP https",
 			publicHost: "crawler.example.com", remote: "@", host: evil,
 			xfp: "https", unix: true,
 			want: "<loc>https://crawler.example.com/ru</loc>",
 		},
 		{
-			// Канон + список XFP: последняя позиция (наша), начало
-			// списка пришло от клиента.
+			// The canonical host + an XFP list: the last entry (ours),
+			// the start of the list came from the client.
 			name:       "канон + список XFP (клиент, прокси)",
 			publicHost: "crawler.example.com", remote: "127.0.0.1:40003", host: evil,
 			xfp:  "http, https",
 			want: "<loc>https://crawler.example.com/ru</loc>",
 		},
 		{
-			// Прямое TLS-соединение: https независимо от XFP (web так не
-			// слушает — ветка publicScheme на будущее, T-227).
+			// A direct TLS connection: https regardless of the XFP (web
+			// does not listen this way — the publicScheme branch for the
+			// future, T-227).
 			name:       "канон + прямое TLS с XFP http",
 			publicHost: "crawler.example.com", remote: "203.0.113.9:40006", host: evil,
 			xfp: "http", directTLS: true,
 			want: "<loc>https://crawler.example.com/ru</loc>",
 		},
 		{
-			// Канон не задан: фолбэк на Host запроса за доверенным
-			// пиром (публичный вход передаёт Host $host).
+			// No canonical host: the fallback to the request Host behind
+			// a trusted peer (the public entry passes the Host as
+			// $host).
 			name:   "фолбэк Host + loopback-прокси с XFP https",
 			remote: "127.0.0.1:40004", host: "crawler.example.com",
 			xfp:  "https",
 			want: "<loc>https://crawler.example.com/ru</loc>",
 		},
 		{
-			// Канон не задан, пир недоверенный: XFP не читается —
-			// дефолтная схема соединения (http).
+			// No canonical host, the peer is untrusted: the XFP is not
+			// read — the default connection scheme (http).
 			name:   "фолбэк Host + недоверенный пир с XFP https",
 			remote: "203.0.113.9:40005", host: "crawler.example.com",
 			xfp:  "https",
