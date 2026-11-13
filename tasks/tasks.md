@@ -335,3 +335,23 @@ of scope (waiting for upstream #4151 — one browser context per connection).
   and refcount safety — frees ~8–9 GB now, holds the table at a steady
   state (~1–1.5 GB), and automatically covers the future recheck-ghost
   class — [details](task/T-277-subdomain-results-passport-ttl.md).
+
+## Этап 48: устойчивость прода — ретраи, память PG, метрики таймаутов, crawlerctl (T-278–T-281)
+
+- **T-278** [новая] — P1, прогрессивный backoff ретраев temp_error (24 ч →
+  72 ч при attempts≥2): мёртвый корпус даёт 63–69 % temp_error (норма
+  23–40 %) и прогоняется по кругу до 4 раз — до ⅔ повторной нагрузки
+  q:http/PG; фон серии OOM-киллов PG 11–13.11 —
+  [подробности](task/T-278-temp-error-retry-backoff.md).
+- **T-279** [новая] — P1, потолок памяти PostgreSQL: memcg OOM-киллы бэкенда
+  каждые 4–5 ч под полным фронтом (11.11 21:10, 12.11 03:14, 13.11 02:32);
+  аудит shared_buffers/work_mem/лимита cgroup против бюджета VM 8 ГиБ —
+  [подробности](task/T-279-pg-memory-ceiling.md).
+- **T-280** [новая] — P2, split метрики timeout HTTP-стадии (connect/tls/
+  tarpit/ctx-в-очереди per-IP): сегодня 92,7 % ошибок — один счётчик,
+  локальная петля «нагрузка→таймауты→ретраи» неотделима от мёртвого
+  корпуса — [подробности](task/T-280-stage-errors-timeout-split.md).
+- **T-281** [новая] — P2, фикс crawlerctl domain на проде
+  («domain_info: пустой ответ» для любого домена, включая живые; обнаружено
+  при исследовании 13.11) —
+  [подробности](task/T-281-crawlerctl-domain-fix.md).
