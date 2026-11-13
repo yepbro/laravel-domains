@@ -345,7 +345,15 @@ AGENTS.md (отдельный worktree, ревью по схеме, один к�
 | L-05 | [done] | ld-landing | Деплой-механика готова (87ef8ae, запушено): deploy/release/rollback/releases, ControlMaster-ssh, prune keep-5; релизы залиты на оба сервера, current не тронут; 41 тест | L-02, L-03, L-04 |
 | L-06 | [done] | uspromo, aphrodite | **Лендинги в проде 13.11**: релиз API `200792a..29f6a9e` (L-03+L-4, deploy OK); `web.cors.allowed_origins` включён на larasites (config.bak-20261113-cors, префлайт 204/ACAO-эхо проверены); `make release` — релизы 20261113-201209 (uspromo) / 20261113-201241 (aphrodite); чеки зелёные: canonical/hreflang/sitemap/robots, 301-карта, api9 в бандле, браузерный e2e (живые stats, refresh, метрика; единственный console-error — внешний маячок mdd.yandex.net Метрики) | L-05 |
 | L-07 | [done] | серверы | Наблюдение чистое (5xx нет, боты режутся deny-правилом, Метрика №105207729 принимает данные, метрики web в норме); старые лендинг-vhost'ы sites.* сняты из `crawler.conf` (бэкап `/etc/nginx/backups/`), общий LE-серт перевыпущен без sites.* (5 имён), корневые редиректы/дашборд/api9 проверены; access-лог добавлен на uspromo | L-06 |
-| L-08 | [done] | laravel-domains | Лендинг вырезан (a874071, −1735 строк): маршруты/embed/словари/статика/web-css/public_host удалены, API-only; тесты+интеграция зелёные, ревью чистое; релиз в прод — по разрешению сразу после слияния | L-07 |
+| L-08 | [done] | laravel-domains | Лендинг вырезан (a874071, −1735 строк): маршруты/embed/словари/статика/web-css/public_host удалены, API-only; тесты+интеграция зелёные, ревью чистое. **Релиз в прод выполнен 14.11: `origin/master` запушен (200792a..c6f5fa3 — обязателен для workflow_run), ci+deploy зелёные; пост-чеки ok** (healthz 200, stats+CORS, префлайт 204, GET check-domain 405+Allow, лендинги 200) | L-07 |
+
+### Финал (14.11)
+
+План L-01…L-08 закрыт полностью: лендинги — статика на uspromo/aphrodite
+(github.com/yepbro/ld-landing), API — larasites (`api9.laravel.city`),
+Go-репа — API-only. Урок релиза: `deploy.yml` при `workflow_run` читается
+из `origin/master` — перед пушем в production необходимо пушить и
+`origin/master` (иначе деплой выполняет шаги старой версии workflow).
 
 ### 11.1. Выполнено досрочно: nginx + TLS (13.11)
 
