@@ -403,9 +403,13 @@ a re-up brings it back) and analyze the cause.
    Fetch interception on, a synchronous XHR fails on the client with
    NetworkError, `failRequest` of the main navigation leaves the tab
    unresponsive without a load error; Stylesheet is not accepted in v1.1.23 either
-   (the `BlockStylesheet` CSS mode fails the whole call) — until the
-   upstream fix the moli slice must stay red (a retest per release,
-   T-247).
+   (the `BlockStylesheet` CSS mode fails the whole call). The upstream fix
+   has landed: the retest of moli main `f857b6651` (reports v1.1.24,
+   2026-11-13, T-247) — the Fetch interception defects are closed
+   (#2704/#2696/#2729), the slice is green with the T-276 expectations (the
+   current engine state and the retest history — the doc comment of
+   `internal/render/engines_live_test.go`; the pin switch to a release
+   build and the per-release retest remain with T-247).
 3. **Real smoke test on the smoke subsample.** The bench is a separate instance
    of the dev stack in internet mode (`ALLOW_INTERNET=1`, `make up-internet` —
    real domains need outward resolution) with the composition and isolation from

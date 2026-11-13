@@ -51,9 +51,9 @@ type blockLiveCounters struct {
 	// (clarityProbe — c.clarity.ms, mcProbe — mc.yandex.ru) and
 	// a request with a tracker domain in the PATH but its own host (trackerTrap).
 	// claritySync — a separate synchronous probe of c.clarity.ms
-	// (an engine-branched case, moli#2728): the counter is separate from
-	// clarityProbe, otherwise "sync gets through" on moli would mask
-	// "async is blocked".
+	// (the unified #2729 case, T-276): the counter is separate from
+	// clarityProbe for diagnostics — in a red run it shows which probe
+	// leaked (the sync one or the async one).
 	clarityProbe atomic.Int64
 	mcProbe      atomic.Int64
 	trackerJS    atomic.Int64
@@ -124,11 +124,13 @@ x.open('GET','/data.json',false);x.send();`)
 	// attribute (CORS: we read the status too): the control run with the option
 	// off must DELIVER them (proves resolve+serving), the working one —
 	// cut them off before sending (proves the blocking by the server counter).
-	// Async, not sync: real web analytics (clarity, mc.yandex,
-	// google-analytics) travels async/fetch/beacon, and only an async XHR
-	// is blocked by the interception on all engines — under the interception
-	// moli's sync XHR goes to the network past the pause (the #2728 divergence,
-	// a separate engine-branched probe below). The async probe's outcome is written into the
+	// Async for the main probes: real web analytics (clarity, mc.yandex,
+	// google-analytics) travels async/fetch/beacon, and an async XHR is
+	// blocked by the interception on all engines. The sync XHR travels as
+	// a separate probe (probeSync below) with expectations unified across
+	// the engines by the moli #2729 line (T-276: a matching sync XHR is
+	// cut off before the network on both engines; the upstream history —
+	// in the helper's doc comment below). The async probe's outcome is written into the
 	// attribute on the request's completion: the guarantee here is not a waiting mechanism
 	// (the quiet window of wait.go is counted from the last requestWillBeSent and
 	// a request completion does not hold it) but the headroom: the fixture replies within
@@ -181,14 +183,15 @@ probeSync('sync-xhr', 'http://c.clarity.ms:`+"%[1]d"+`/clarity-sync-probe');
 		_, _ = fmt.Fprint(w, "// clarity.ms probe")
 	}
 	mux.HandleFunc("/clarity-probe", clarityProbe)
-	// A separate endpoint of the sync probe: the claritySync counter must differ
-	// from clarityProbe — on moli the sync goes to the network (200) while the
-	// async is blocked; a shared counter would hide this divergence.
+	// A separate endpoint of the sync probe: the claritySync counter is kept
+	// apart from clarityProbe — with the unified expectations (T-276) both are
+	// zero in the blocking run, and a separate counter in a red run shows
+	// which probe leaked (the sync one or the async one).
 	mux.HandleFunc("/clarity-sync-probe", func(w http.ResponseWriter, _ *http.Request) {
 		c.claritySync.Add(1)
 		w.Header().Set("Content-Type", "text/javascript")
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		_, _ = fmt.Fprint(w, "// sync probe clarity.ms (the engine-branched case)")
+		_, _ = fmt.Fprint(w, "// sync probe clarity.ms (the #2729 unified case)")
 	})
 	mux.HandleFunc("/mc-probe", func(w http.ResponseWriter, _ *http.Request) {
 		c.mcProbe.Add(1)
@@ -378,20 +381,34 @@ func TestBlockLiveTrackerDomains(t *testing.T) {
 //     host is our server) passes: the substring pause of the urlPattern is released by
 //     the exact host check.
 //
-// The probes are async XHRs: real web analytics (clarity, mc.yandex,
+// The main probes are async XHRs: real web analytics (clarity, mc.yandex,
 // google-analytics) travels async/fetch/beacon, and the T-214 contract is exactly
-// "tracker hits into the network are stopped on any engine". Sync XHR
-// is left as a separate engine-branched probe: under the interception moli
-// does NOT pause sync XHR and it goes to the network the regular way — the pause
-// is architecturally impossible (an owner-loop deadlock), the failure factory was removed
-// (lexmount/moli#2728, PR #2729; PR #2704 also lifts the sync-XHR ban).
-// The documented divergence from Chromium: there sync XHR is paused and
-// blocked fully; on moli a deliberate blocking of sync XHR is
-// unavailable — hence the main probes are async, and the sync probe checks the
-// expectation PER ENGINE (a switch over opts.Engine, as in the smoke contracts):
-// chromium — "blocked" (error, the counter 0), moli — "went to the network,
-// 200, not blocked" (the counter 1); the other engines — SKIP: the
-// sync XHR semantics under the interception is not documented for them.
+// "tracker hits into the network are stopped on any engine". The sync XHR
+// is a separate probe with expectations UNIFIED across the engines (T-276):
+// on the #2728/#2729 line moli reached parity with Chromium for a sync XHR
+// under the interception. The upstream history of the semantics: the sync
+// XHR went the network path past the interception (the #2728 state); the
+// #2729 draft (8ff18ca02 → e8ce829d8 in main, the analysis base of T-276)
+// rejected a matching sync request upfront by the URL — the pause was then
+// impossible (an owner-loop deadlock); the final step (9e357b95e "keep
+// network interception live during synchronous sends") made the pause
+// live: one-shot pause ports, the synchronous-only URL-rule copy removed —
+// a matching sync request is paused at the Request stage and the client's
+// verdict decides (failRequest → the error attribute, the counter 0;
+// continueRequest → the request reaches the network) — exactly the Chromium
+// contract, including the path-trap shape (a tracker domain in the path,
+// a clean host: the wide substring pattern suspends the request, the
+// listener's exact host check releases it; the upstream test
+// matching_synchronous_xhr_uses_client_decisions_and_disable_restores_network).
+// A NON-matching sync XHR is outside the interception admission and takes
+// the ordinary network path (#2704 lifted the sync-XHR ban crash). The
+// exact-URL tracker probe here is blocked under BOTH upstream regimes
+// (the upfront rejection and the live pause) — the live slice cannot
+// distinguish them, the upstream tests can; the retest of moli main
+// f857b6651 (reports v1.1.24, 2026-11-13) confirmed the block. The
+// path-trap probe stays async (the release logic is covered on both
+// engines); the other engines (lightpanda): SKIP — the sync XHR semantics
+// under the interception is not documented for them.
 //
 // The probes: c.clarity.ms — a subdomain of a list domain (suffix matching),
 // mc.yandex.ru — an exact list host. Google analytics (google-analytics,
@@ -420,9 +437,14 @@ func blockLiveTrackerDomains(t *testing.T, opts Options) {
 	if attr := domAttr(offOut.DOM, "mc-xhr"); attr != "loaded 200" {
 		t.Errorf("control: mc-xhr %q, want loaded 200 (no blocking)", attr)
 	}
-	// The control sync probe reaches the server and is read on both engines: without
-	// the blocking enabled the #2728 divergence does not manifest — the branching
-	// per engine is needed only in the working run below.
+	// The control sync probe reaches the server and is read — an
+	// engine-independent expectation: with the option off the interception
+	// patterns carry no XHR class, the sync XHR is outside the admission
+	// and goes the regular network way on every engine.
+	if got := cOff.claritySync.Load(); got < 1 {
+		t.Fatalf("control: the sync clarity.ms probe did not reach the server (%d) — "+
+			"check the --use-aliases flag of compose run and the tools service DNS aliases (T-214)", got)
+	}
 	if attr := domAttr(offOut.DOM, "sync-xhr"); attr != "loaded 200" {
 		t.Errorf("control: sync-xhr %q, want loaded 200 (no blocking)", attr)
 	}
@@ -475,44 +497,41 @@ func blockLiveTrackerDomains(t *testing.T, opts Options) {
 		t.Errorf("path-trap %q, want loaded 200 (the host is not a tracker — it passes)", attr)
 	}
 
-	// The sync XHR probe — an engine-branched case (T-275): under the
-	// interception moli does not pause sync XHR and it goes to the network (the documented
-	// divergence lexmount/moli#2728, PR #2729): "went to the network, 200, not
-	// blocked". Chromium blocks sync XHR fully — "blocked". This is exactly
-	// why the main probes of the test are async (the T-214 contract on any engine),
-	// and the sync one checks the behavior of the concrete engine. The branching over
-	// opts.Engine, as in the smoke contracts. On moli without #2729 (v1.1.23 and
-	// the integration builds before it) sync XHR under the interception was crashed
-	// by the failure factory "Synchronous XMLHttpRequest interception is not
-	// supported" — there this branch is red (the slice must show
-	// the engine divergence/regression until the fix); on v1.1.21/1.1.22
-	// it was red earlier and for another reason — InvalidParams on Fetch.enable.
-	// The other engines (lightpanda): the sync XHR semantics under the
-	// interception is not documented — an honest SKIP instead of an unchecked assert.
+	// The sync XHR probe — the expectations are UNIFIED across the engines
+	// (T-276): on the #2729 line moli reached parity with Chromium for a
+	// sync XHR under the interception — the retested build f857b6651
+	// (reports v1.1.24) pauses a matching sync request at the Request stage
+	// and the client's verdict decides (9e357b95e "keep network
+	// interception live during synchronous sends"; the intermediate
+	// exact-URL upfront rejection e8ce829d8 — under either regime the
+	// tracker probe is cut off before the network): both engines expect
+	// the block (the error attribute, the counter 0). The history of the
+	// case on moli: v1.1.21/1.1.22 — red for another reason (InvalidParams
+	// on Fetch.enable); v1.1.23 and the integration builds before the
+	// rework — red too: sync XHR was crashed by the failure factory
+	// "Synchronous XMLHttpRequest interception is not supported", and
+	// T-275 expected "to the network, 200" under the draft semantics of
+	// #2729; the final maintainer line replaced it (retested on moli main
+	// f857b6651, 2026-11-13: the probe is blocked). A sync XHR with
+	// a NON-matching URL stays outside the interception — the ordinary
+	// network path (#2704). The other engines (lightpanda): the sync XHR
+	// semantics under the interception is not documented — an honest SKIP
+	// instead of an unchecked assert.
 	switch opts.Engine {
-	case config.EngineMoli:
-		if got := cOn.claritySync.Load(); got < 1 {
-			t.Errorf("the sync probe clarity.ms did not reach the server %d times, want >= 1 "+
-				"(moli: sync-XHR is not blocked, discrepancy #2728)", got)
-		}
-		if attr := domAttr(onOut.DOM, "sync-xhr"); attr != "loaded 200" {
-			t.Errorf("sync-xhr %q, want loaded 200 (moli: sync-XHR goes to the network, #2728)", attr)
-		}
-	case "", config.EngineChromium:
+	case config.EngineMoli, "", config.EngineChromium:
 		// The %q engine in the hint — diagnostics of a single-test run with
 		// CRAWLER_RENDER_REMOTE_URL on a foreign engine: liveOptions does not
-		// fill in Engine, the semantics are taken to be chromium — a red here would look like
-		// a blocking failure. moli — only via the per-engine slice
-		// (MOLI_WS_URL, EnginesLive).
+		// fill in Engine, the semantics are taken to be chromium (the
+		// expectation is the same for moli now, no per-engine slice needed).
 		if got := cOn.claritySync.Load(); got != 0 {
-			t.Errorf("sync-the clarity.ms probe reached the server %d times, want 0 (blocked; the engine %q — for moli sync-XHR is not blocked, use the per-engine slice MOLI_WS_URL)",
+			t.Errorf("the sync clarity.ms probe reached the server %d times, want 0 (blocked; the engine %q)",
 				got, opts.Engine)
 		}
 		if attr := domAttr(onOut.DOM, "sync-xhr"); attr != "error" {
-			t.Errorf("sync-xhr %q, want error (blocked; the engine %q — for moli sync-XHR is not blocked, use the per-engine slice MOLI_WS_URL)",
-				attr, opts.Engine)
+			t.Errorf("sync-xhr %q, want error (blocked; the engine %q)", attr, opts.Engine)
 		}
 	default:
-		t.Skipf("the sync-XHR behavior under interception is not documented for the engine %q — the assert is only for chromium/moli (#2728)", opts.Engine)
+		t.Skipf("the sync-XHR behavior under interception is not documented for the engine %q — the assert is only for chromium/moli (#2729)",
+			opts.Engine)
 	}
 }

@@ -49,38 +49,55 @@ package render
 // A single engine — with a Go filter: -run 'TestEnginesLiveCDPSlice/moli'.
 //
 // The engines' state against the slice (pinned versions and retests:
-// the live run of 2026-11-06, the moli v1.1.23 retest of 2026-11-10) — moli and
-// lightpanda 1.0.2, both alternatives are BROKEN against the slice; the slice must
-// show this in red until the engines/core are fixed):
+// the live run of 2026-11-06, the moli v1.1.23 retest of 2026-11-10, the
+// moli main retest of 2026-11-13) — lightpanda 1.0.2 is BROKEN against the
+// slice (the slice must show this in red until the engine is fixed); moli:
+// the pinned in the repo stays v1.1.21, but upstream main has closed the
+// Fetch interception defects of v1.1.23 — with the T-276 expectations the
+// slice of a main build is green (5/6 on the 2026-11-13 retest before
+// T-276, the only red was the stale expectations — see the bullet):
 //
-//   - moli v1.1.23 (T-272; the pinned in the repo stays v1.1.21):
-//     the InvalidParams on Fetch.enable is gone — Font/Media in the patterns
-//     got the fixes of lexmount/moli#2470 (our PR, the yepbro/moli fork) +
-//     the paired #2476. Navigation/DOM/cookies/context isolation/UA override
-//     are green. The slice is held red by the Fetch interception defects:
-//     (1) with the interception enabled a synchronous XHR from the page's JS
-//     fails on the client with NetworkError (the moli log: Uncaught NetworkError:
-//     Failed to execute 'send' on 'XMLHttpRequest') — the request does not reach
-//     the server (block_resources); the block_trackers
-//     probes are switched to async XHR (T-275: real analytics is async,
-//     blocked on all engines); the sync probe there is a separate
-//     engine-branched case of the #2728/#2729 divergence (moli does not pause sync-XHR
-//     and it goes to the network; on builds without #2729 — a
-//     NetworkError failure factory);
-//     (2) the fetch.failRequest of the main navigation does not finish the navigation with
-//     a load error — the tab is unresponsive (classifyCtx → context),
-//     ERR_BLOCKED_BY_CLIENT arrives outside the loadFailed channel, there is no
-//     load code (ssrf); (3) Stylesheet is absent from supports_fetch_enable()
-//     v1.1.23 (fetch_support.rs: the enum type parses, but is not in the
+//   - moli: v1.1.23 (T-272) lifted the InvalidParams on Fetch.enable —
+//     Font/Media in the patterns got the fixes of lexmount/moli#2470 (our
+//     PR, the yepbro/moli fork) + the paired #2476; navigation/DOM/cookies/
+//     context isolation/UA override are green. The Fetch interception
+//     defects of v1.1.23 are closed in main:
+//     (1) the sync XHR under the interception: #2704 (the XHR class-set
+//     fix) — a non-matching sync XHR travels the regular network way, no
+//     more Uncaught NetworkError: Failed to execute 'send' on
+//     'XMLHttpRequest' (block_resources green); the #2729 line then reached
+//     parity with Chromium for a matching sync XHR too — the exact-URL
+//     upfront rejection of the draft (8ff18ca02 → e8ce829d8, the analysis
+//     base of T-276) was superseded by the live pause (9e357b95e "keep
+//     network interception live during synchronous sends"): the request is
+//     paused at the Request stage and the client's verdict decides, the
+//     path-trap shape included (the T-275 async switch of the probes
+//     stands — real analytics is async; the sync probe's expectations are
+//     unified by T-276; the upstream history and references —
+//     block_live_test.go);
+//     (2) the fetch.failRequest of the main navigation now finishes the
+//     navigation with a load error (#2696) — ssrf green (on v1.1.23 the tab
+//     hung: ERR_BLOCKED_BY_CLIENT arrived outside the loadFailed channel,
+//     there was no load code);
+//     (3) Stylesheet is absent from supports_fetch_enable() v1.1.23
+//     (fetch_support.rs: the enum type parses, but is not in the
 //     supports list) — the Stylesheet pattern brings down the whole
 //     Fetch.enable with InvalidParams: BlockStylesheet (T-213, the CSS mode)
-//     is unavailable on moli; not a blocker for the base profile (the option defaults to
-//     false). We wait for the upstream fix → a retest with
+//     is unavailable on moli; not a blocker for the base profile (the option
+//     defaults to false) and not covered by the slice (the Stylesheet
+//     pattern is enabled only by block_stylesheet — the separate BlockLive
+//     test); we wait for the upstream fix → a retest with
 //     the next release (T-247). The history before v1.1.23 (v1.1.21/1.1.22,
 //     the run of 2026-11-06): Fetch.enable with Media/Font patterns
 //     answered InvalidParams — moli distinguished a trimmed set of
 //     resourceType; every task failed at startBlock (0/100 on
 //     the seed hundred).
+//     The retest of moli main f857b6651 (v1.1.24, an integration build of
+//     2026-11-13, the moli-t247 container): the slice is 5/6 — green except
+//     block_trackers, red ONLY against the stale T-275 expectations (the
+//     moli branch still waited for "sync to the network, 200"); the actual
+//     behavior matched the new #2729 semantics — the sync probe blocked
+//     (error, the counter 0) — fixed by T-276.
 //   - lightpanda 1.0.2: one browser context per connection ("Cannot have
 //     more than one browser context at a time", also recorded by
 //     third-party measurements). The service tab of the starting context
@@ -91,8 +108,9 @@ package render
 // A red slice = an engine regression against the stage's invariants (pinning
 // a new version — the smoke procedure of FR-17/T-254,
 // docs/dev-environment.md); a green chromium is the reference (the control
-// of 2026-11-10: 6/6 subtests PASS; the re-check of 2026-11-11 after
-// T-275 — again 6/6, the block_trackers probes async) — the moli failures are
+// of 2026-11-10: 6/6 subtests PASS; the re-checks of 2026-11-11 (after
+// T-275) and 2026-11-13 (the moli main retest) — again 6/6, the
+// block_trackers probes async) — the moli failures are
 // engine ones, not bench ones).
 
 import (
