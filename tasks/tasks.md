@@ -68,7 +68,7 @@ green `make test`/`make lint` before handing off to review.
 
 ### Operational (sequential)
 
-- **T-247** [new] — P1, bench comparison of the engines and canary-readiness
+- **T-247** [in progress] — P1, bench comparison of the engines and canary-readiness
   verdicts (spec §5.1; depends on T-234, T-241, T-243,
   T-244; T-254 — engine smoke preliminaries). Not code: runs of the three engines ×
   a 3000-domain sample twice (variability control), baseline — a fresh
