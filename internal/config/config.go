@@ -770,15 +770,16 @@ type Alerts struct {
 	RenderDebtPasses int `yaml:"render_debt_passes"`
 }
 
-// Web — the public landing service (stage 13, T-121; a production
-// extension outside the main spec — a port from larasites). The public
+// Web — the public API service (stage 13, T-121; a production
+// extension outside the main spec — a port from larasites; since L-08 —
+// API-only, the landing pages are static). The public
 // listener is its own http.Server inside OnRun: the service framework gives
 // one port per service and hangs /metrics there (it must not be exposed
 // publicly), so MetricsAddr stays on loopback while web.listen serves the
 // visitor (the precedent of lifecycle control inside OnRun — the worker
 // clients).
 type Web struct {
-	// Listen — the public address of the landing: [host]:port or an
+	// Listen — the public address of the API service: [host]:port or an
 	// absolute unix socket path (the deployment option behind nginx,
 	// T-124). The default is loopback: publishing outward is a reverse
 	// proxy with TLS (deploy/nginx/).
@@ -798,18 +799,6 @@ type Web struct {
 	// parallelism is limited by the memory of the checks (page bodies,
 	// render) in the unit budget.
 	LiveConcurrency int `yaml:"live_concurrency"`
-	// PublicHost — the canonical host of the public address of the
-	// landing (T-227, for example "crawler.example.com"; with a
-	// non-standard port — with it: "host:8443"): the absolute URLs of
-	// sitemap.xml are built from it. An empty string — a fallback to the
-	// request Host: behind the nginx reverse proxy it passes the
-	// visitor's value as $host, and <loc> depends on the header of an
-	// untrusted side (host-header poisoning) — a publicly published
-	// landing must set the field. The field does not set the sitemap
-	// scheme: a direct connection is a TLS fact, behind a proxy —
-	// X-Forwarded-Proto of a trusted peer (see internal/web publicScheme).
-	// An extension to the minimal set of spec 5.10.
-	PublicHost string `yaml:"public_host"`
 	// CORS — the browser policy of the /api/* endpoints (L-04,
 	// TZ-ld-landing §7.2): the static landings of the separate
 	// ld-landing repo live on their own domains and call this API
@@ -820,7 +809,7 @@ type Web struct {
 
 // CORS — the cross-origin policy of the web /api/* surface (L-04,
 // TZ-ld-landing §7.2). The section is an extension outside the spec 5.10
-// set, like public_host.
+// set.
 type CORS struct {
 	// AllowedOrigins — the exact origins allowed to call /api/* from a
 	// browser: scheme://host[:port] ("https://sites.laravel.city"),
@@ -1279,11 +1268,6 @@ func Default() *Config {
 			// a rare visitor does not wait for a slot, a burst of
 			// interest is discharged with a 503.
 			LiveConcurrency: 4,
-			// The canonical host of the public address is not set:
-			// sitemap.xml builds <loc> from the request Host (T-227); a
-			// publicly published landing sets web.public_host to its own
-			// domain.
-			PublicHost: "",
 			// The CORS allowlist is empty: the /api/* surface is
 			// same-origin (the SSR landing before L-04). The static
 			// landings of the ld-landing repo (L-04, TZ-ld-landing
@@ -1367,11 +1351,6 @@ func (c *Config) normalize() {
 	// read it (the render spec §4.1 item 1).
 	c.Render.Engine = strings.ToLower(strings.TrimSpace(c.Render.Engine))
 	c.Log.Level = strings.ToLower(strings.TrimSpace(c.Log.Level))
-	// The canonical host of the landing — without edge spaces (no IDN
-	// normalization: the field sets the public address host as is;
-	// punycode is the operator's concern; the shape is checked by
-	// Validate).
-	c.Web.PublicHost = strings.TrimSpace(c.Web.PublicHost)
 	// The CORS allowlist (L-04) — the origins without edge spaces; empty
 	// entries (a trailing comma of the environment list) are dropped and
 	// duplicates after trimming collapse (the style of the zone paths):
@@ -2123,33 +2102,6 @@ func (c *Config) Validate() error {
 		problems = append(problems, fmt.Sprintf("web.timeout: expected %s..%s, got %s",
 			Duration(time.Second), Duration(10*time.Minute), c.Web.Timeout))
 	}
-	// The canonical host of the public address (T-227): host[:port]
-	// without a scheme, path and userinfo — the value goes into <loc> of
-	// sitemap.xml entirely (the port is optional: a host without a port
-	// is a normal address behind a proxy on 80/443; an IPv6 literal is in
-	// square brackets, as in URLs). Control characters would break the
-	// URL/XML; 253 octets — the DNS name limit (without a port). An empty
-	// field — the sitemap fallback to the request Host.
-	if h := c.Web.PublicHost; h != "" {
-		hostPart := h
-		if i := strings.LastIndex(h, ":"); i >= 0 {
-			hostPart = h[:i]
-			if n, err := strconv.Atoi(h[i+1:]); err != nil || n < 1 || n > 65535 {
-				problems = append(problems, fmt.Sprintf(
-					"web.public_host: port not in 1..65535 — expected host[:port] (e.g. crawler.example.com:8443), got %q", h))
-			}
-		}
-		// A ":" without a port ("https:"), an empty host, userinfo
-		// ("user@host"), a bare IPv6 without brackets ("::1"),
-		// schemes/paths/fragments and control characters — not a host.
-		if hostPart == "" || len(hostPart) > 253 || strings.ContainsAny(hostPart, "/?#@") ||
-			strings.ContainsFunc(h, unicode.IsControl) ||
-			(strings.Contains(hostPart, ":") &&
-				(!strings.HasPrefix(hostPart, "[") || !strings.HasSuffix(hostPart, "]"))) {
-			problems = append(problems, fmt.Sprintf(
-				"web.public_host: expected host[:port] without scheme, path or userinfo (e.g. crawler.example.com, IPv6 in brackets), got %q", h))
-		}
-	}
 	// The CORS allowlist of the /api/* surface (L-04, TZ-ld-landing
 	// §7.2): every entry is an exact origin — scheme http(s)://host[:port]
 	// without a path, query, fragment or userinfo. The comparison with
@@ -2157,8 +2109,8 @@ func (c *Config) Validate() error {
 	// entry outside the serialization the browser sends would silently
 	// never match — CORS just would not work for that origin, with a 200
 	// on the wire and nothing in the log. Such entries are rejected here
-	// as a configuration error instead (the style of public_host: the
-	// operator's value is not silently rewritten): an uppercase scheme or
+	// as a configuration error instead (the operator's value is not
+	// silently rewritten): an uppercase scheme or
 	// host (the browser lowercases both), an IDN host (the browser sends
 	// punycode), a wildcard label, an explicit default port (:443/:80 —
 	// the URL serialization omits it), a trailing FQDN dot. An empty

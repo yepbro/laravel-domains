@@ -94,7 +94,7 @@ itself, not an aggregator of other services' metrics.
 | http-worker | `:9104` | `METRICS_ADDR` |
 | render-worker | `:9105` | `METRICS_ADDR` |
 | analyzer | `:9106` | `METRICS_ADDR` |
-| web | `127.0.0.1:9107` | `METRICS_ADDR` (loopback: the landing page is public on `web.listen`, metrics are not, spec §9) |
+| web | `127.0.0.1:9107` | `METRICS_ADDR` (loopback: the public API is on `web.listen`, metrics are not, spec §9) |
 | dashboard | `127.0.0.1:9108` | `METRICS_ADDR` (loopback: the dashboard is public on `dashboard.listen`, metrics are not, dashboard spec §4.2) |
 
 ### Liveness and Readiness Probes (T-110)
@@ -1558,7 +1558,8 @@ in Prometheus will be set up by the T-077 layer over `internal/metrics`,
 to avoid duplicating registries and labels.
 
 `web` (stage 13, T-121/T-122; a product extension outside the main
-spec — ported from larasites): the public landing page. The framework is
+spec — ported from larasites; since L-08 — API-only): the public API.
+The framework is
 `cmd/web`
 (`config.Load` → `service.Run`, the pool via `OnDBPool`, metrics/probes —
 loopback `127.0.0.1:9107`); the public listener `web.listen` —
@@ -1566,17 +1567,13 @@ its own `http.Server` inside OnRun with graceful stop on ctx
 cancellation: the framework gives one HTTP port per service and hangs
 `/metrics` on it,
 which must not be exposed (spec §9) — the precedent of lifecycle
-management inside OnRun. Routes: `GET /` — a redirect to the default
-locale `/ru`; `GET /{ru|en}` — the landing page (T-122: the markup
-ported from larasites — a hero with an SVG radar, stat cards with
-count-up counters, a cloud of the top-50 zones with log scale and
-collisions, a top-10 zone table with sorting, how-it-works, a manual
-check form, recent findings with subdomain badges and a version range,
-contacts/Telegram; SEO canonical/hreflang/OG/Twitter, a Yandex.Metrica
-counter); data —
-the T-120 caches + laravel_history ("findings over 24 h", T-118);
+management inside OnRun. The landing pages it served until L-08 (the
+locale SSR, the static assets, robots/sitemap) moved to the static
+ld-landing repo; the former routes (`GET /`, `/{locale}`, `/static/*`,
+`/robots.txt`, `/sitemap.xml`) are the router's honest 404. Routes:
 `POST
-/api/check-domain` — a live check from the form (T-123; the pipeline
+/api/check-domain` — a live check from the form of the static landing
+(T-123; the pipeline
 runs on
 the long-lived circuit of `checker.Runtime`, T-220: one resolver chain
 with a small UDP pool, a shared Fetcher, a rule cache, one
@@ -1594,13 +1591,8 @@ leaked, the collections are `[]` — never null; the client caching —
 `Cache-Control: public, max-age=60`; a DB failure — a 500 without
 details in the uniform JSON error body of the /api/* surface,
 `{"error":"unavailable"}`); `GET /healthz` —
-a PostgreSQL readiness ping (503); `GET /robots.txt` and
-`GET /sitemap.xml` — the service files of search crawlers (T-124:
-robots — statics from an embed; sitemap — a minimal locale set;
-absolute URLs — from the canonical host `web.public_host` with a
-fallback to the request's `Host`; the scheme — an actual TLS fact or
-`X-Forwarded-Proto` from a trusted peer, T-227); `GET /static/*` —
-statics (go:embed). The form visitor's address behind a proxy —
+a PostgreSQL readiness ping (503). The form visitor's address behind a
+proxy —
 `X-Real-IP` from a TCP loopback peer or a unix-socket peer
 (T-221; both trust positions — the deploy variant from
 deploy/nginx/README.md; the fallback `X-Forwarded-For` without
@@ -1611,8 +1603,8 @@ into
 `web_checks`; the outcomes/failures/duration of the form — the metrics
 `crawler_web_checks_total{result}` /
 `crawler_web_check_errors_total{type}` / `crawler_web_check_seconds`
-(T-221, the "Working logic metrics" table below). Templates —
-`html/template` + `go:embed`; no new dependencies.
+(T-221, the "Working logic metrics" table below). No html/template, no
+embedded assets, no new dependencies.
 
 The CORS policy of the `/api/*` surface (L-04, TZ-ld-landing §7.2; the
 allowlist wrapper — `internal/web/cors.go`): the static landings of the
@@ -1636,8 +1628,8 @@ the browser blocks the script's read itself, and the server's controls
 (the rate limit, the live-check budget) are origin-independent. An
 empty/absent allowlist — CORS is off entirely: no CORS headers, and
 `OPTIONS` on the API routes stays the router's 405 (the behavior before
-L-04). The non-API routes (the landing pages, `/healthz`, statics) are
-not wrapped at all. A note for a future shared cache: nginx
+L-04). The non-API routes (`/healthz` and the 404s of the removed
+landing routes) are not wrapped at all. A note for a future shared cache: nginx
 `proxy_cache` ignores `Vary` (its key is `proxy_cache_key`) — if one is
 ever put in front of the API, the key must include `$http_origin`,
 otherwise the exact cross-origin confusion `Vary` prevents returns.
@@ -1667,20 +1659,15 @@ ld-landing client: the refresh action of the domains block
 `max-age=60` a plain `fetch` is served from the HTTP cache without a
 network round-trip and the "refresh" returns the identical body.
 
-The landing CSS is Tailwind v4 without node: the source
-`internal/web/static/app.src.css` (classes scanned by the template's
-`@source`), the built bundle is not stored in git (`.gitignore` — a fresh
-clone gives a page without styles, not a 500). The build: the `css`
-stage in `deploy/docker/Dockerfile.go` (alpine + the standalone
-tailwindcss CLI; the version — `TAILWINDCSS_VERSION` in `.env`; the
-artifact is placed in the build stage before `go build` — go:embed
-embeds the real CSS), or
-`make web-css` for dev viewing (a one-off docker run).
+The landing CSS is gone with the landing (L-08): the static sites of
+the ld-landing repo carry their own bundles, and the Go image has no
+CSS build step (the former `css` stage of Dockerfile.go / `make
+web-css`).
 
 Configuration — the `web` section (`listen`/`rate_limit`/`timeout`/
-`live_concurrency`/`public_host`/`cors.allowed_origins`,
+`live_concurrency`/`cors.allowed_origins`,
 [`configuration.md`](configuration.md)). Deployment (T-124):
-dev — the `web` compose service of the app profile (the landing port is
+dev — the `web` compose service of the app profile (the API port is
 published on the host's `127.0.0.1`, `WEB_PORT`); production — the
 `crawler-web.service` unit
 (docs/deploy.md) behind a reverse proxy with TLS (the first sample —

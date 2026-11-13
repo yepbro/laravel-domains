@@ -1,9 +1,0 @@
-# robots.txt of the Domain Crawler landing (T-124): the locale pages and the
-# static assets are indexed; the check-form API and the service healthz are
-# not needed by bots. Sitemap — /sitemap.xml (the route builds the absolute
-# locale URLs from the request; there is no separate Sitemap line in robots
-# because the publication address is not stored in the config — see
-# internal/web/web.go).
-User-agent: *
-Disallow: /api/
-Disallow: /healthz

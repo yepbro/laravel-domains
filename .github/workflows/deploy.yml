@@ -48,14 +48,6 @@ jobs:
           go-version-file: go.mod
           cache: false
 
-      - name: Prepare .env (Tailwind/Alpine versions for web-css)
-        id: env
-        run: cp .env.example .env
-
-      - name: Build landing page CSS (go:embed, deploy.md §4.2)
-        id: web-css
-        run: make web-css
-
       - name: Build static binaries
         id: build
         run: |
@@ -227,8 +219,7 @@ jobs:
           }
           step="outside the main deploy steps (see the run log)"
           rollback=""
-          if pick "${{ steps.web-css.outcome }}" "Build landing page CSS (go:embed, deploy.md §4.2)"; then :
-          elif pick "${{ steps.build.outcome }}" "Build static binaries"; then :
+          if pick "${{ steps.build.outcome }}" "Build static binaries"; then :
           elif pick "${{ steps.ssh.outcome }}" "Set up SSH"; then :
           elif pick "${{ steps.upload.outcome }}" "Upload binaries (scp)"; then :
           elif pick "${{ steps.install.outcome }}" "Install on the server"; then
@@ -267,7 +258,7 @@ jobs:
             esac
           fi
           version="${{ steps.build.outputs.version }}"
-          if [ -z "$version" ] && [ "${{ steps.web-css.outcome }}" = success ]; then
+          if [ -z "$version" ]; then
             version="$(git describe --tags --always 2>/dev/null || true)"
           fi
           args=(--status "$status" --workflow deploy --event "$event")

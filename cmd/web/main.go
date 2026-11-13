@@ -1,12 +1,14 @@
-// The web service — the public landing (stage 13, T-121; a production
-// extension outside the main spec — moved from larasites): precomputed
-// pipeline counters (cards, the zone cloud/table, the latest finds —
-// T-122) and the manual domain check form (T-123). The framework is
+// The web service — the public API (stage 13, T-121; a production
+// extension outside the main spec — moved from larasites; since L-08 —
+// API-only: the landing pages are static sites of the separate
+// ld-landing repo). The endpoints: POST /api/check-domain (the live
+// check of the landing form, T-123), GET /api/v1/landing/stats (the
+// landing data as JSON, L-03), GET /healthz. The framework is
 // internal/service: migrations, the DB pool (OnDBPool), the probes and
 // /metrics on loopback :9107, graceful shutdown (spec 3.4); the public
 // listener web.listen — its own http.Server inside OnRun (the metrics are
-// not exposed outward, spec §9). The landing is the only public port of
-// the system.
+// not exposed outward, spec §9). The API is the only public port of the
+// system.
 package main
 
 import (

@@ -503,10 +503,12 @@ monitor:
     render_debt_passes: 2
 
 web:
-  # The public landing page (stage 13, T-121): the system's public port
-  # for visitors — a reverse-proxy with TLS publishes it outward
-  # (deploy/nginx/ — the first specimen, T-124), the service itself keeps
-  # loopback; the web metrics — on METRICS_ADDR (127.0.0.1:9107). listen —
+  # The public API service (stage 13, T-121; since L-08 — API-only: the
+  # landing pages are static sites of the separate ld-landing repo):
+  # the system's public port for visitors — a reverse-proxy with TLS
+  # publishes it outward (deploy/nginx/ — the first specimen, T-124),
+  # the service itself keeps loopback; the web metrics — on METRICS_ADDR
+  # (127.0.0.1:9107). listen —
   # [host]:port or an absolute unix socket path (the deploy variant behind
   # nginx). The operator dashboard — a separate dashboard.listen listener
   # (dashboard spec).
@@ -519,13 +521,6 @@ web:
   # one resolver chain with a small UDP pool, a shared Fetcher, a rule
   # cache, one render.Manager per service.
   live_concurrency: 4
-  # The canonical host of the public address (T-227): the absolute
-  # sitemap.xml URLs are built with it — behind the proxy nginx passes the
-  # visitor's value as the request Host, without a canonical one the <loc>
-  # would depend on a foreign header. An empty value — a fallback to the
-  # request Host; the publicly published landing sets the field to its own
-  # domain (with the port at a non-standard port).
-  # public_host: "crawler.example.com"
   # The CORS allowlist of the /api/* endpoints (L-04, TZ-ld-landing §7.2):
   # exact origins (scheme://host[:port], no wildcards) allowed to call the
   # API from a browser — the static landings of the ld-landing repo live

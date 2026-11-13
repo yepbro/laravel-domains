@@ -85,7 +85,7 @@ widened to 1 s as a guard).
 
 Not in the default scope; checked spot-wise as needed:
 
-- `config`, `web` — hundreds of mutants over yaml binding and i18n
+- `config`, `web` — hundreds of mutants over yaml binding and routing
   plumbing at low signal;
 - heavy in run time (`httpfetch`, `content`, `watch`, `dnsclient`,
   `httpworker`, `dnsworker`, `ingest`, `migrate`, `db`, `service`,

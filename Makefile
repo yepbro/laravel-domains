@@ -28,26 +28,7 @@ ALPINE_VERSION ?= $(shell sed -n 's/^ALPINE_VERSION=\(.*\)/\1/p' .env 2>/dev/nul
 PG_ADMIN_USER  ?= $(shell sed -n 's/^POSTGRES_ADMIN_USER=\(.*\)/\1/p' .env 2>/dev/null)
 PG_DB          ?= $(shell sed -n 's/^POSTGRES_DB=\(.*\)/\1/p' .env 2>/dev/null)
 
-# Tailwind v4 standalone CLI — the css stage of Dockerfile.go and make web-css
-# (landing bundle, T-124); the default is set as an ARG in the Dockerfile, .env
-# may override it. The host architecture picks the musl CLI build (x64 | arm64).
-TAILWINDCSS_VERSION ?= $(or $(shell sed -n 's/^TAILWINDCSS_VERSION=\(.*\)/\1/p' .env 2>/dev/null),v4.3.3)
-UNAME_M := $(shell uname -m)
-ifeq ($(findstring aarch64,$(UNAME_M)),aarch64)
-TAILWIND_ARCH ?= arm64
-else ifeq ($(filter x86_64 amd64,$(UNAME_M)),)
-TAILWIND_ARCH ?= unsupported
-else
-TAILWIND_ARCH ?= x64
-endif
-# The web-css generated artifact on the bind-mount is owned by the developer (like the app services).
-DEV_UID := $(or $(shell sed -n 's/^DEV_UID=\(.*\)/\1/p' .env 2>/dev/null),1000)
-DEV_GID := $(or $(shell sed -n 's/^DEV_GID=\(.*\)/\1/p' .env 2>/dev/null),1000)
-
-TAILWINDCSS_URL := https://github.com/tailwindlabs/tailwindcss/releases/download/$(TAILWINDCSS_VERSION)/tailwindcss-linux-$(TAILWIND_ARCH)-musl
-
-BUILD_ARGS := --build-arg GO_VERSION=$(GO_VERSION) --build-arg ALPINE_VERSION=$(ALPINE_VERSION) \
-	--build-arg TAILWINDCSS_VERSION=$(TAILWINDCSS_VERSION)
+BUILD_ARGS := --build-arg GO_VERSION=$(GO_VERSION) --build-arg ALPINE_VERSION=$(ALPINE_VERSION)
 
 # Version/revision of the production images for crawler_build_info metrics (T-111):
 # .git is excluded by .dockerignore, the values are computed on the calling machine
@@ -155,27 +136,6 @@ build-runtime: ## Build production images (runtime + render) for verification
 	docker build $(BUILD_ARGS) $(VERSION_ARGS) -f deploy/docker/Dockerfile.render \
 		--target render -t crawler/render:check .
 
-# Landing Tailwind bundle (T-124): source internal/web/static/app.src.css →
-# app.css (go:embed, compiled into the binary). The generated artifact is not
-# stored in git (.gitignore) — after editing the template/CSS source, run this
-# target for a dev preview; production image builds compile the CSS themselves
-# (css stage of Dockerfile.go), node is not needed.
-.PHONY: web-css
-web-css: ## Build the landing CSS (Tailwind v4: app.src.css → static/app.css)
-	$(check_env)
-	@test "$(TAILWIND_ARCH)" = "x64" || test "$(TAILWIND_ARCH)" = "arm64" || { \
-	  echo "ERROR: no musl build of tailwindcss for $(shell uname -m) (x86_64/aarch64)."; exit 1; }
-	docker run --rm -v $(CURDIR):/src \
-	  -w /src/internal/web/static alpine:$(ALPINE_VERSION) sh -eu -c '\
-	  apk add --no-cache libstdc++ libgcc >/dev/null \
-	  && wget -q -O /tmp/tailwindcss $(TAILWINDCSS_URL) \
-	  && chmod +x /tmp/tailwindcss \
-	  && /tmp/tailwindcss -i app.src.css -o app.css --minify \
-	  && chown $(DEV_UID):$(DEV_GID) app.css'
-	@echo 'internal/web/static/app.css built (generated artifact, not stored in git).'
-	@echo 'To apply in dev: restart the web service — air watches only .go files:'
-	@echo '  docker restart crawler-web-1'
-
 GO_PKGS := ./cmd/... ./internal/... ./migrations/... ./test/... ./deploy/postgres
 
 # gofmt paths (directories): the same coverage as lint — gofmt in CI is gated
@@ -235,7 +195,7 @@ test-integration: ## Environment integration tests on the testbed
 # Default coverage — the "logic core": business-logic packages with
 # hermetic, fast unit tests (no network/DB/Chromium). A full
 # run takes ~2.5 h (2632 mutants, score 1.000); config and web are not included:
-# hundreds of mutants there cover yaml binding and i18n wiring at low signal.
+# hundreds of mutants there cover yaml binding and routing plumbing at low signal.
 # To run a single package:
 #   make mutate PKGS='./internal/httpfetch/...'
 # CI (mutation.yml) splits this set into three parts for the weekly run

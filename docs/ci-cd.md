@@ -15,7 +15,7 @@ push to production ──▶ ci (tests, lint, integration)
                        │ success
                        ▼
                    deploy (workflow_run)
-                       │ build (setup-go + make web-css + go build)
+                       │ build (setup-go + go build)
                        │ upload (scp with the deploy key)
                        │ install (deploy/deploy-install.sh: backup → replace → restart)
                        ▼

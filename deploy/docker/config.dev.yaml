@@ -128,7 +128,7 @@ monitor:
   render_metrics_url: "http://render-worker:9105/metrics"
 
 web:
-  # dev: the landing listens on all the container's interfaces (:8080 —
+  # dev: the public API listens on all the container's interfaces (:8080 —
   # inside the docker network), the compose service web publishes the port
   # outward on the host's 127.0.0.1 (WEB_PORT); the config default —
   # loopback behind a reverse-proxy (the systemd deploy, deploy/nginx/).

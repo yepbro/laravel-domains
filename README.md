@@ -20,8 +20,11 @@ make test        # unit tests
 make test-integration  # environment check against the testbed
 ```
 
-The landing page (app profile) after startup — http://127.0.0.1:8081 (the
-`WEB_PORT` port in `.env`, published to loopback only). The pipeline operator
+The public API of the web service (app profile) after startup —
+http://127.0.0.1:8081 (the
+`WEB_PORT` port in `.env`, published to loopback only; the landing pages
+are static now — the separate ld-landing repo, they do not run here). The
+pipeline operator
 dashboard — http://127.0.0.1:8090 (the `DASHBOARD_PORT` port; login admin/admin
 — dev creds, see [`docs/dev-environment.md`](docs/dev-environment.md)).
 
@@ -29,8 +32,9 @@ A live check of a single domain from the host (DNS → HTTP/render → Laravel
 analysis, read-only): `make check DOMAIN=example.com` — works for both real
 domains and the testbed (`*.crawl.test`): the primary resolver is the testbed
 unbound, and on SERVFAIL/REFUSED the checker escalates to the public fallback
-resolvers (`internal/checker/resolve.go`). The landing page form
-(`POST /api/check-domain`) checks real domains the same way — the web service
+resolvers (`internal/checker/resolve.go`). The domain check API
+(`POST /api/check-domain` on the web service) checks real domains the
+same way — the web service
 in dev gets the public `CRAWLER_DNS_FALLBACK_RESOLVERS` (see
 [`docs/dev-environment.md`](docs/dev-environment.md) §6).
 
@@ -97,8 +101,9 @@ without resetting the DB, is simpler — Redis in dev runs without persistence:
 restart the container (`make down && make up` or `restart redis`).
 
 A single-domain check without enqueueing it into the pipeline —
-`make check DOMAIN=…` (see above); a live check via the landing page form —
-http://127.0.0.1:8081.
+`make check DOMAIN=…` (see above); a live check via the API —
+`POST http://127.0.0.1:8081/api/check-domain` with a JSON body
+`{"domain":"example.com"}`.
 
 ## Documentation
 
@@ -170,8 +175,12 @@ Production deployment (T-135) — systemd units, details in
 
 Public entry points (TLS — Let's Encrypt, nginx):
 
-- EN landing page: <https://sites.laravel.city> (the primary/www names redirect here)
-- RU landing page: <https://sites.laracity.ru>
+- Public API of the crawler: <https://api9.laravel.city> (`/api/check-domain`,
+  `/api/v1/landing/stats`; only `/api/` and `/healthz` are proxied, the rest — 404)
+- EN landing page: <https://sites.laravel.city> — static, the separate
+  [ld-landing](https://github.com/yepbro/ld-landing) repo (the primary/www
+  names redirect here)
+- RU landing page: <https://sites.laracity.ru> — static, the same repo
 - Operator dashboard: <https://dashboard.laracity.ru> (HTTP Basic; credentials — held by the operator, in the server configuration)
 
 ## Structure
@@ -182,11 +191,11 @@ ones — in the archive [`tasks/tasks_done.md`](tasks/tasks_done.md)).
 
 | Directory | Purpose |
 |---|---|
-| `cmd/` | Go services (ingest, scheduler, dns-worker, http-worker, render-worker, analyzer, monitor, web — the public landing page, dashboard — the operator dashboard, crawlerctl) and testbed utilities (mockserver, testbedgen) |
-| `internal/` | Shared code: the service framework (`service`, [docs/services.md](docs/services.md)), configuration (`config`), PostgreSQL access — pool and bulk writes (`db`), the domain model — statuses, flags, subdomain masks (`model`), name normalization — punycode/UTS-46, name zone — TLD (`idn`), Prometheus metrics (`metrics`), migrations at startup (`migrate`), file ingest — watching and the ingest pipeline (`watch`, `ingest`), the scheduler — selection/enqueue/lease/rechecks (`scheduler`), Redis Streams queues (`queue`), the DNS client with limits (`dnsclient`) and the q:dns loop (`dnsworker`), the HTTP transport with limits and redirects (`httpfetch`) and the q:http loop (`httpworker`), content storage (`content`, [docs/content.md](docs/content.md)), render (`render`, [docs/render.md](docs/render.md)) and the q:render loop (`renderworker`), the Laravel rules engine and the q:analyze loop (`rules`, `analyzer`, [docs/analyzer.md](docs/analyzer.md)), reconciliation of the pipeline's incremental counters and alerts (`monitor`), the pipeline status summary — queries and calculations for the CLI and dashboard (`status`), the public landing page — i18n, the check form, Tailwind static assets (`web`), the operator dashboard — authentication and the state snapshot builder (`dashboard`, [docs/services.md](docs/services.md)) |
+| `cmd/` | Go services (ingest, scheduler, dns-worker, http-worker, render-worker, analyzer, monitor, web — the public API, dashboard — the operator dashboard, crawlerctl) and testbed utilities (mockserver, testbedgen) |
+| `internal/` | Shared code: the service framework (`service`, [docs/services.md](docs/services.md)), configuration (`config`), PostgreSQL access — pool and bulk writes (`db`), the domain model — statuses, flags, subdomain masks (`model`), name normalization — punycode/UTS-46, name zone — TLD (`idn`), Prometheus metrics (`metrics`), migrations at startup (`migrate`), file ingest — watching and the ingest pipeline (`watch`, `ingest`), the scheduler — selection/enqueue/lease/rechecks (`scheduler`), Redis Streams queues (`queue`), the DNS client with limits (`dnsclient`) and the q:dns loop (`dnsworker`), the HTTP transport with limits and redirects (`httpfetch`) and the q:http loop (`httpworker`), content storage (`content`, [docs/content.md](docs/content.md)), render (`render`, [docs/render.md](docs/render.md)) and the q:render loop (`renderworker`), the Laravel rules engine and the q:analyze loop (`rules`, `analyzer`, [docs/analyzer.md](docs/analyzer.md)), reconciliation of the pipeline's incremental counters and alerts (`monitor`), the pipeline status summary — queries and calculations for the CLI and dashboard (`status`), the public API — the check form endpoint, the landing stats endpoint (`web`), the operator dashboard — authentication and the state snapshot builder (`dashboard`, [docs/services.md](docs/services.md)) |
 | `deploy/docker/` | The Compose environment, Dockerfiles, configs, testbed |
 | `deploy/systemd/` | Production deployment on the target server: service systemd units, OS-package budget drop-ins, environment ([docs/deploy.md](docs/deploy.md)) |
-| `deploy/nginx/` | A sample public entry point: a TLS reverse proxy in front of the `web` landing page ([docs/deploy.md](docs/deploy.md) §6) |
+| `deploy/nginx/` | A sample public entry point: a TLS reverse proxy in front of the `web` public API ([docs/deploy.md](docs/deploy.md) §6) |
 | `deploy/sysctl/` | Production server kernel tuning (spec §10.2): `99-crawler.conf` for `/etc/sysctl.d` + application instructions; calculations — [docs/os-tuning.md](docs/os-tuning.md) |
 | `deploy/smartd/` | NVMe SMART/TBW monitoring (spec §10.3): the smartd config, a warning handler for syslog/journald, a udev rule and a drop-in granting monitor alerts access to `/dev/nvme*`; calculations — [docs/disks.md](docs/disks.md) |
 | `migrations/` | PostgreSQL migrations (golang-migrate): embedded into the binaries and applied by the services at startup |

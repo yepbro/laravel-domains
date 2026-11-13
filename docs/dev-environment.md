@@ -64,7 +64,7 @@ The compose profiles (`deploy/docker/compose.yaml`):
 |---|---|
 | (default) | `postgres`, `redis`, `unbound` |
 | `testbed` | `coredns`, `testweb` (Caddy), `mockserver` |
-| `app` | the Go services (`ingest` … `monitor`, `render-worker`) + the public landing `web` (http://127.0.0.1:8081) + the operator dashboard `dashboard` (http://127.0.0.1:8090, dev creds — admin/admin) + `chromium` |
+| `app` | the Go services (`ingest` … `monitor`, `render-worker`) + the public API `web` (http://127.0.0.1:8081) + the operator dashboard `dashboard` (http://127.0.0.1:8090, dev creds — admin/admin) + `chromium` |
 | `render-engines` | `lightpanda`, `moli` — alternative render engines (stage 35): on demand, when the render-worker is switched off chromium (see "Render engines" below) |
 | `monitoring` | `prometheus` (the UI at http://127.0.0.1:9090) |
 | `tools` | `adminer` (http://127.0.0.1:8080), `redis-insight` (http://127.0.0.1:5540), the `tools` container |
@@ -99,14 +99,6 @@ Monitoring and the tools are brought up on demand:
 docker compose --project-directory . -f deploy/docker/compose.yaml --env-file .env \
   --profile monitoring --profile tools up -d
 ```
-
-The landing styles (Tailwind v4) are built into the binary via go:embed:
-`internal/web/static/app.css` is a generated artifact and is not stored in git
-(`.gitignore`). To preview in dev with the real styles, build the bundle
-after editing the template/source — `make web-css` (a one-off container,
-node is not needed; the production docker build does it itself — the `css`
-stage in Dockerfile.go) — and restart the web service: air watches only
-`.go` files and will not rebuild on a CSS change (`docker restart crawler-web-1`).
 
 ### Dashboard: dev credentials and hash regeneration
 
@@ -758,7 +750,7 @@ switching needed),
 `docker compose run --rm tools go run ./cmd/crawlerctl <command>`
 (see `make shell`).
 
-The landing form (`POST /api/check-domain`, T-123) uses the same
+The domain check API (`POST /api/check-domain`, T-123) uses the same
 pipeline and in dev checks real domains: compose gives the web service the public
 `CRAWLER_DNS_FALLBACK_RESOLVERS`, and the checker escalates to them when unbound fails (the semantics — a "single manual
 question", not a mass pipeline: dns-worker gets no fallbacks,

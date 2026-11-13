@@ -1,7 +1,9 @@
-// Package web — the public landing service (stage 13, T-121/T-122;
-// a product extension outside the main spec — ported from larasites):
-// precomputed pipeline counters, the manual domain check form,
-// i18n ru/en.
+// Package web — the public API service (stage 13, T-121/T-122; a product
+// extension outside the main spec — ported from larasites). Until L-08 it
+// also served the SSR landing (the locale pages, the static assets, the
+// SEO service files); the landing now lives as static sites in the
+// separate ld-landing repo (TZ-ld-landing §7.3), and this package serves
+// only the JSON surface those sites fetch.
 //
 // Framework (T-121): the public listener is its own http.Server inside
 // OnRun with a graceful stop on ctx cancellation. The internal/service
@@ -14,20 +16,15 @@
 //
 // Routes:
 //
-//   - GET /            → redirect to the default locale /ru;
-//   - GET /{locale}    — the ru|en locale landing (T-122: the ported
-//     larasites markup — stats/cloud/zone table, latest finds, the
-//     form, SEO canonical/hreflang/OG/Twitter);
-//   - POST /api/check-domain — the live check (T-123, a 501 stub);
+//   - POST /api/check-domain — the live check of the manual form
+//     (T-123; the form UI itself is a part of the static landing);
 //   - GET /api/v1/landing/stats — the landing data as JSON for the
 //     static landing of the ld-landing repo (L-03: the same
 //     FetchLandingData pass, a stats view model, max-age=60);
-//   - GET /healthz     — readiness: a PostgreSQL ping (503 on failure);
-//   - GET /robots.txt  — static assets from embed (T-124);
-//   - GET /sitemap.xml — a minimal sitemap of the locales (T-124);
-//   - GET /static/*    — the landing static assets (go:embed; app.css —
-//     a Tailwind generated artifact, not stored in git — make web-css /
-//     the css stage of Dockerfile.go, T-124).
+//   - GET /healthz     — readiness: a PostgreSQL ping (503 on failure).
+//
+// The former landing routes (GET /, /{locale}, /static/*, /robots.txt,
+// /sitemap.xml) are gone: a request to them is the router's honest 404.
 //
 // The /api/* routes are wrapped with the CORS allowlist
 // web.cors.allowed_origins (L-04, TZ-ld-landing §7.2; internal/web/cors.go):
@@ -36,12 +33,8 @@ package web
 
 import (
 	"context"
-	"embed"
-	"encoding/json"
-	"encoding/xml"
 	"errors"
 	"fmt"
-	"html/template"
 	"io/fs"
 	"log/slog"
 	"net"
@@ -84,13 +77,6 @@ type DB interface {
 	Execer
 }
 
-// Locales — the locales supported by the landing (a stage-13 pinned
-// decision: i18n ru+en; ru is the default).
-var Locales = []string{"ru", "en"}
-
-// DefaultLocale — where GET / redirects to.
-const DefaultLocale = "en"
-
 // Options — the service options.
 type Options struct {
 	// Log — the service logger; nil — records suppressed
@@ -102,11 +88,10 @@ type Options struct {
 	Metrics *metrics.Registry
 }
 
-// Server — the public landing HTTP server.
+// Server — the public API HTTP server.
 type Server struct {
 	db      DB
 	opt     Options
-	tpl     *template.Template
 	cfg     *config.Config
 	limiter *tokenBucketLimiter
 	// met — the form instruments (T-221); nil — no-op.
@@ -137,53 +122,20 @@ type Server struct {
 	corsOrigins map[string]bool
 }
 
-// landingVM — the landing render data: the locale, the locale list, the
-// page data, and the locale dictionary (the Msg/MsgRaw/ToJSON methods
-// are called from the template as {{$.Msg "key"}} — data methods, not a
-// FuncMap: the template is parsed once without a locale).
-type landingVM struct {
-	Locale  string
-	Locales []string
-	Data    LandingData
-	msgs    messages
-}
-
-// Msg — a locale string, safely escaped.
-func (v landingVM) Msg(key string) template.HTML {
-	return template.HTML(template.HTMLEscapeString(v.msgs[key]))
-}
-
-// MsgRaw — a locale string without escaping (for JSON inserts).
-func (v landingVM) MsgRaw(key string) string { return v.msgs[key] }
-
-// ToJSON — the JSON literal of a string for <script type="application/json">.
-func (v landingVM) ToJSON(s string) template.HTML {
-	b, err := json.Marshal(s)
-	if err != nil {
-		return template.HTML(`""`)
-	}
-	return template.HTML(b)
-}
-
 // New assembles the server: db — the DB pool (a ping + the page data +
 // the form log). cfg — the web section configuration (the rate limit,
 // the live check timeout, the concurrent live checks cap,
-// T-123/T-220). The template is parsed once: the locale arrives as
-// data (landingVM), the dictionary is a render method. New does not
+// T-123/T-220). New does not
 // assemble the live check circuit (checker.Runtime) — it is created
 // lazily by the first live check (liveFunc) and lives until the service
 // stops (Run → closeLive); assembly errors do not affect the other
-// pages.
+// endpoints.
 func New(db DB, cfg *config.Config, opts Options) (*Server, error) {
 	if db == nil {
 		return nil, errors.New("web: the DB pool is not set (postgres.dsn is mandatory)")
 	}
 	if cfg == nil {
 		return nil, errors.New("web: the configuration is not set")
-	}
-	tpl, err := template.ParseFS(templates, "templates/landing.html")
-	if err != nil {
-		return nil, fmt.Errorf("web: templates: %w", err)
 	}
 	if opts.Log == nil {
 		opts.Log = slog.New(slog.DiscardHandler)
@@ -207,7 +159,6 @@ func New(db DB, cfg *config.Config, opts Options) (*Server, error) {
 	return &Server{
 		db:          db,
 		opt:         opts,
-		tpl:         tpl,
 		cfg:         cfg,
 		limiter:     newLimiter(cfg.Web.RateLimit, time.Minute),
 		liveSem:     make(chan struct{}, live),
@@ -282,36 +233,19 @@ func (s *Server) closeLive() {
 	_ = c.Close()
 }
 
-//go:embed templates
-var templates embed.FS
-
-//go:embed static
-var staticFS embed.FS
-
 // Handler — the router of the public surface (tests — httptest).
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("POST /api/check-domain", s.handleCheckDomainLive)
-	// A GET on the API endpoint would be intercepted by the landing
-	// prefix (GET /) with a misleading 404 — an honest 405 without
-	// revealing details.
-	mux.HandleFunc("GET /api/check-domain", func(w http.ResponseWriter, _ *http.Request) {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-	})
 	// The stats endpoint of the static landing (L-03): the path patterns
 	// are GET-only, a non-GET method — the mux answers an honest 405.
 	mux.HandleFunc("GET /api/v1/landing/stats", s.handleLandingStats)
-	// Exact root routes win over the landing catch-all (GET /).
-	mux.HandleFunc("GET /robots.txt", s.handleRobots)
-	mux.HandleFunc("GET /sitemap.xml", s.handleSitemap)
-	mux.HandleFunc("GET /static/", s.handleStatic)
-	mux.HandleFunc("GET /{$}", s.handleRoot)
-	mux.HandleFunc("GET /", s.handleLanding)
 	// The /api/* surface carries the CORS policy (L-04, TZ-ld-landing
 	// §7.2): with a non-empty web.cors.allowed_origins the wrapper adds
-	// the allowlist echo and answers preflights; the landing routes and
-	// /healthz pass through untouched.
+	// the allowlist echo and answers preflights; /healthz passes through
+	// untouched. A non-POST method on /api/check-domain — the mux's own
+	// 405 (Go 1.22: the path is registered with another method).
 	return s.apiCORS(mux)
 }
 
@@ -372,7 +306,7 @@ func (s *Server) Run(ctx context.Context, listen string) error {
 		}
 		done <- nil
 	}()
-	s.opt.Log.Info("the public landing service started", "listen", listen)
+	s.opt.Log.Info("the public web API service started", "listen", listen)
 
 	select {
 	case err := <-done:
@@ -389,59 +323,9 @@ func (s *Server) Run(ctx context.Context, listen string) error {
 	}
 }
 
-// handleRoot — GET / — a redirect to the default locale (the locale is
-// chosen by the path prefix, not a cookie — canonical addresses for
-// SEO).
-func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
-	http.Redirect(w, r, "/"+DefaultLocale, http.StatusFound)
-}
-
-// handleLanding — GET /{locale}: the page data from the caches (T-120)
-// and the locale template render. A DB failure — a 500 without
-// revealing details: a page without data is meaningless (the section
-// degradation — the pattern of the internal dashboard T-129, not a
-// public page).
-func (s *Server) handleLanding(w http.ResponseWriter, r *http.Request) {
-	path := strings.TrimPrefix(r.URL.Path, "/")
-	locale, _, _ := strings.Cut(path, "/")
-	if _, ok := localeMessagesMap[locale]; !ok {
-		http.NotFound(w, r)
-		return
-	}
-	data, err := FetchLandingData(r.Context(), s.db)
-	if err != nil {
-		s.opt.Log.Warn("landing data", "locale", locale, "err", err)
-		http.Error(w, "temporarily unavailable", http.StatusInternalServerError)
-		return
-	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := s.tpl.ExecuteTemplate(w, "landing.html", landingVM{
-		Locale:  locale,
-		Locales: Locales,
-		Data:    data,
-		msgs:    localeMessages(locale),
-	}); err != nil {
-		// The header may already be gone — the status cannot be changed;
-		// we log and abort.
-		s.opt.Log.Warn("landing render", "locale", locale, "err", err)
-	}
-}
-
-// handleStatic — static assets from embed: built into the binary,
-// served with the immutable header (hash-less names — cached by the
-// common rule).
-func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
-	sub, err := fs.Sub(staticFS, "static")
-	if err != nil {
-		http.NotFound(w, r)
-		return
-	}
-	// app.css — a Tailwind generated artifact (make web-css / the css
-	// stage of the Dockerfile, T-124); not stored in git (.gitignore):
-	// on a fresh clone the file is absent — /static/app.css answers 404
-	// (a page without styles, not a 500).
-	http.StripPrefix("/static/", http.FileServer(http.FS(sub))).ServeHTTP(w, r)
-}
+// The former landing handlers (GET /, /{locale}, /static/*, /robots.txt,
+// /sitemap.xml) were removed in L-08 (TZ-ld-landing §7.3): the landing is
+// static now — the ld-landing repo; those paths are the router's 404.
 
 // handleCheckDomain removed (T-123): the form is served by
 // handleCheckDomainLive (api.go) — a stored/live hybrid with a rate
@@ -459,73 +343,4 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	_, _ = w.Write([]byte("ok"))
-}
-
-// handleRobots — GET /robots.txt: static assets from embed (T-124).
-// The locale pages and the static assets are indexed; the check form
-// API and healthz are closed to bots. There is still no Sitemap line (a
-// deliberate decision, T-227): the address is at the standard
-// /sitemap.xml path — web.public_host sets the <loc> host, a separate
-// line adds nothing.
-func (s *Server) handleRobots(w http.ResponseWriter, r *http.Request) {
-	b, err := staticFS.ReadFile("static/robots.txt")
-	if err != nil {
-		// embed — the file is in the binary; its absence is a build error.
-		s.opt.Log.Error("robots.txt is missing from embed", "err", err)
-		http.Error(w, "temporarily unavailable", http.StatusInternalServerError)
-		return
-	}
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	_, _ = w.Write(b)
-}
-
-// handleSitemap — GET /sitemap.xml: a minimal sitemap — only the static
-// locale pages (T-124); the landing has no domain pages. <loc> must be
-// an absolute URL. The host is the canonical web.public_host (T-227):
-// behind the reverse proxy nginx passes the visitor's host into the
-// request Host as the $host value, and without the canonical host <loc>
-// would depend on a header from an untrusted party (host-header
-// poisoning); an empty field — the previous fallback to the request
-// Host. The scheme is publicScheme (X-Forwarded-Proto only from a
-// trusted peer). Hence the sitemap is assembled per request rather than
-// served as a static file.
-func (s *Server) handleSitemap(w http.ResponseWriter, r *http.Request) {
-	scheme := publicScheme(r)
-	host := strings.TrimSpace(s.cfg.Web.PublicHost)
-	if host == "" {
-		host = r.Host
-	}
-	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
-	_, _ = fmt.Fprint(w, xml.Header, `<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">`+"\n")
-	for _, loc := range Locales {
-		url := template.HTMLEscapeString(fmt.Sprintf("%s://%s/%s", scheme, host, loc))
-		_, _ = fmt.Fprintf(w, "\t<url>\n\t\t<loc>%s</loc>\n\t\t<changefreq>daily</changefreq>\n\t\t<priority>1.0</priority>\n\t</url>\n", url)
-	}
-	_, _ = fmt.Fprint(w, "</urlset>\n")
-}
-
-// publicScheme — the public URL scheme (<loc> of the sitemap, T-227):
-// a direct TLS connection — https; behind the reverse proxy the client
-// scheme is carried by X-Forwarded-Proto, but only from a trusted peer
-// (loopback/unix — trustedProxyPeer, the same principle as the visitor
-// address in clientIP): a direct visitor's header does not control the
-// scheme, the default by the TLS fact (http) stays. The values may be a
-// list — the LAST entry is taken (our proxy appended it; the client
-// start of the list is not trusted — modeled on X-Forwarded-For in
-// proxyHeaderIP), the sample nginx sets a single $scheme value; junk or
-// empty — the default.
-func publicScheme(r *http.Request) string {
-	if r.TLS != nil {
-		return "https"
-	}
-	if !trustedProxyPeer(r) {
-		return "http"
-	}
-	proto := strings.TrimSpace(r.Header.Get("X-Forwarded-Proto"))
-	last := strings.ToLower(strings.TrimSpace(proto[strings.LastIndex(proto, ",")+1:]))
-	switch last {
-	case "http", "https":
-		return last
-	}
-	return "http"
 }

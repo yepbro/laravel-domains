@@ -29,7 +29,7 @@ const (
 	checkResultBusy = "busy"
 	// checkResultRateLimited — 429: the form rate limit is exhausted.
 	checkResultRateLimited = "rate_limited"
-	// checkResultInvalid — 422: junk input (the landing.js format).
+	// checkResultInvalid — 422: junk input (the landing client format).
 	checkResultInvalid = "invalid"
 )
 

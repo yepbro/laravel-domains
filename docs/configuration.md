@@ -1483,14 +1483,22 @@ semantics — [`services.md`](services.md); delivery setup —
 | `rate_limit` | `CRAWLER_WEB_RATE_LIMIT` | number | `4` |
 | `timeout` | `CRAWLER_WEB_TIMEOUT` | duration | `60s` |
 | `live_concurrency` | `CRAWLER_WEB_LIVE_CONCURRENCY` | number | `4` |
-| `public_host` | `CRAWLER_WEB_PUBLIC_HOST` | string (host[:port]) | `""` |
 | `cors.allowed_origins` | `CRAWLER_WEB_CORS_ALLOWED_ORIGINS` | list (comma-separated in the env) | `[]` (CORS off) |
 
-`listen` — the landing page's public address: the system's public port
-for
+`listen` — the public address of the API service: the system's public
+port for
 visitors (the operator dashboard is a separate `dashboard.listen`
 listener
-for the operator, the dashboard spec).
+for the operator, the dashboard spec). Until L-08 the section also held
+`public_host` (the canonical host of the sitemap URLs) — it is gone
+together with the sitemap: the landing is static now (the ld-landing
+repo), the service serves only `/api/*` and `/healthz`. **An upgrade
+note:** the YAML parsing is strict (an unknown key is a startup error) —
+a leftover `web.public_host` in an existing `config.yaml` must be
+deleted before the L-08 build starts, otherwise every unit fails at
+config load and the deploy rolls back (a leftover
+`CRAWLER_WEB_PUBLIC_HOST` env var is harmless: the env loader reads
+known keys only).
 The form is [host]:port (TCP) or an absolute unix-socket path (a
 deployment variant
 behind nginx without occupying a TCP port, T-124; the path ≤100 bytes —
@@ -1543,22 +1551,6 @@ is assembled by the first live check and closed at service shutdown
 `udp_pool_size` pools — up to 6000 UDP sockets per request; ~10
 parallel
 checks exhausted the unit's fds together with `/healthz`).
-`public_host` —
-the canonical host of the landing's public address (T-227, e.g.
-`crawler.example.com`, with a non-standard port — with it): the
-absolute URLs of `sitemap.xml` are built from it. Behind a reverse
-proxy nginx passes `Host`
-as the visitor's `$host` — without the canonical host `<loc>` depends
-on the header
-of an untrusted party (host-header poisoning); an empty field (the
-default) —
-a fallback to the request's `Host`; a landing published outward must
-set
-the field. The field does not set the sitemap scheme: a direct
-connection is a TLS fact; behind a
-proxy — `X-Forwarded-Proto` from a trusted peer (loopback/unix, the
-same
-principle as the visitor's address); an untrusted value is ignored.
 `cors.allowed_origins` —
 the CORS allowlist of the `/api/*` endpoints (L-04, TZ-ld-landing §7.2):
 exact origins `scheme://host[:port]`, compared byte-for-byte with the
@@ -1632,10 +1624,9 @@ cache does not help
 at the default `refresh` of 5 s; above 5 minutes the summary loses its
 operativeness.
 `crawlerctl status` does not use the cache: one-off diagnostics values
-fresh data, and a separate process gets no hits; the `web` landing
-does not read the `internal/status` summary (its data — cached zone
-counters —
-is cheap by design, T-122).
+fresh data, and a separate process gets no hits; the `web` API service
+does not read the `internal/status` summary either (its data — cached
+zone counters — is cheap by design, T-122).
 
 `username`/`password_hash` — the operator's credentials (HTTP Basic,
 dashboard spec §7.1).

@@ -1,10 +1,7 @@
 # Multi-stage image of the Domain Crawler Go services.
 #
 #   dev         — toolchain + air + delve + golangci-lint + migrate (hot reload)
-#   css         — alpine + the standalone tailwindcss v4 CLI: the landing bundle
-#   build       — a static build of all cmd/* (the CSS from the css stage
-#                 replaces the placeholder before go build — go:embed embeds
-#                 the built file)
+#   build       — a static build of all cmd/*
 #   runtime     — the minimal image (distroless), to verify the production build
 #   mockserver  — alpine + the mockserver binary (wget is needed for the healthcheck)
 #
@@ -53,37 +50,6 @@ ENV PATH="/go/bin:${PATH}" \
 # so that the bind-mounts belong to the developer (spec 7.4).
 
 # --------------------------------------------------------------------------
-# The css stage — the Tailwind bundle of the landing (T-122/T-124): the
-# standalone tailwindcss v4 CLI builds internal/web/static/app.css from the
-# app.src.css source (the markup classes are scanned by the template's
-# @source). Node appears neither in the project build nor at runtime; the
-# built bundle is not stored in git (there is a placeholder) — the stage
-# replaces it in build before go build, so go:embed embeds the real CSS.
-FROM alpine:${ALPINE_VERSION} AS css
-ARG TAILWINDCSS_VERSION=v4.3.3
-# The automatic platform ARG: the CLI ships separate musl builds for x64/arm64.
-ARG TARGETARCH
-# The CLI is built by Bun under musl but links dynamically to the C++
-# runtime — libstdc++/libgcc cover that (hundreds of kilobytes, they live
-# only in the css stage and do not reach the runtime image).
-RUN apk add --no-cache libstdc++ libgcc
-RUN set -eux; \
-    case "${TARGETARCH}" in \
-        amd64) arch=x64 ;; \
-        arm64) arch=arm64 ;; \
-        *) echo "css: unsupported architecture ${TARGETARCH}" >&2; exit 1 ;; \
-    esac; \
-    wget -q -O /usr/local/bin/tailwindcss \
-        "https://github.com/tailwindlabs/tailwindcss/releases/download/${TAILWINDCSS_VERSION}/tailwindcss-linux-${arch}-musl" \
-    && chmod +x /usr/local/bin/tailwindcss
-WORKDIR /src/internal/web/static
-# Only the CSS source and the @source template: Go code edits do not
-# invalidate the layer.
-COPY internal/web/static/app.src.css ./
-COPY internal/web/templates/landing.html ../templates/
-RUN /usr/local/bin/tailwindcss -i app.src.css -o /out/app.css --minify
-
-# --------------------------------------------------------------------------
 FROM base AS build
 # The version/revision for crawler_build_info (T-111): .git is excluded
 # from the build context (.dockerignore), so the caller computes the values
@@ -92,10 +58,6 @@ FROM base AS build
 ARG BUILD_VERSION=unknown
 ARG BUILD_REVISION=unknown
 COPY . .
-# The Tailwind bundle from the css stage replaces the placeholder (see the
-# header): go:embed static in internal/web will pick up the built CSS,
-# not the stub from git.
-COPY --from=css /out/app.css internal/web/static/app.css
 # Static binaries of all the services (spec 6.1: CGO_ENABLED=0, -trimpath, -ldflags).
 # buildMode=prod honestly marks the production builds in crawler_build_info
 # (dev without -X stays a dev-stub); buildVersion/buildRevision — the git

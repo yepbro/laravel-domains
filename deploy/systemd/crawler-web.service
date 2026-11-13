@@ -1,9 +1,10 @@
-# Domain Crawler — web: the public landing page (stage 13, T-121…T-124).
+# Domain Crawler — web: the public API service (stage 13, T-121…T-124;
+# since L-08 — API-only: the landing pages are static, the ld-landing repo).
 # web.listen — the public port of the visitor-facing system: a reverse-proxy
 # with TLS publishes the service externally (the first example —
 # deploy/nginx/), the service itself keeps loopback (the config default
 # 127.0.0.1:8080). Metrics and probes — METRICS_ADDR on loopback
-# (127.0.0.1:9107, like the other units): nothing but the landing page is
+# (127.0.0.1:9107, like the other units): nothing but the API is
 # exposed externally (spec §9); the operator dashboard is a separate unit,
 # crawler-dashboard, with its own listener.
 # MemoryMax — the "Go services" budget line (spec 3.2); breakdown —
@@ -28,11 +29,11 @@
 # an empty env value counts as unset, like everywhere in the config.
 
 [Unit]
-Description=Domain Crawler — web (public landing page)
+Description=Domain Crawler — web (public API)
 PartOf=crawler.target
 # For the After/Wants without Requires rationale, see crawler-ingest.service.
 # crawler-chromium — ordering only: a live form check needs CDP
-# (render.remote_url); without the browser the landing page and stored data
+# (render.remote_url); without the browser the form API and stored data
 # work.
 After=network-online.target crawler-chromium.service postgresql.service redis-server.service unbound.service
 Wants=network-online.target
@@ -58,7 +59,7 @@ Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=30s
 MemoryMax=256M
-# CPU priority (T-158): a supporting service — the landing page and one-off
+# CPU priority (T-158): a supporting service — the public API and one-off
 # live form checks are no match for the mass pipeline under CPU starvation
 # (§12: PSI some 91–95%); weight 50 vs 1000 for the critical path.
 CPUWeight=50

@@ -36,8 +36,9 @@ const (
 // apiCORS wraps the router with the CORS policy of the /api/* surface
 // (L-04). The path gate is a prefix check, not a route list: everything
 // under /api/ — both landing endpoints, their 405/404 answers, and any
-// future API route — answers with the same policy, while the landing
-// pages and /healthz are untouched. The preflight short-circuit lives
+// future API route — answers with the same policy, while /healthz and
+// the 404s of the removed landing routes (L-08) are untouched. The
+// preflight short-circuit lives
 // here, before the mux: the mux has no OPTIONS routes (registering them
 // would change the routing table for the CORS-off mode too).
 func (s *Server) apiCORS(h http.Handler) http.Handler {

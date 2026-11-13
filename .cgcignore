@@ -3,7 +3,6 @@
 /var/
 /tmp/
 /bin/
-internal/web/static/app.css
 *.test
 *.out
 coverage.*

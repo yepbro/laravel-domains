@@ -285,20 +285,27 @@ func TestCORSDisabled(t *testing.T) {
 	assertNoCORSHeaders(t, presp)
 }
 
-// TestCORSNonAPIRoutesUntouched — the landing page and /healthz carry
-// no CORS answer even with the allowlist set: the wrapper gates on the
-// /api/ prefix only.
+// TestCORSNonAPIRoutesUntouched — the non-API routes carry no CORS
+// answer even with the allowlist set: the wrapper gates on the /api/
+// prefix only. After L-08 the non-API surface is /healthz (200) and the
+// 404s of the removed landing routes — they pass through the wrapper
+// untouched as well.
 func TestCORSNonAPIRoutesUntouched(t *testing.T) {
 	const origin = "https://sites.laravel.city"
 	srv := newCORSServer(t, &fakeDB{seed: seedLanding()}, origin)
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 
-	for _, path := range []string{"/en", "/healthz", "/static/favicon.svg"} {
+	for path, wantStatus := range map[string]int{
+		"/healthz":            http.StatusOK,
+		"/en":                 http.StatusNotFound, // the landing is static now (L-08)
+		"/robots.txt":         http.StatusNotFound,
+		"/static/favicon.svg": http.StatusNotFound,
+	} {
 		resp := corsGet(t, ts.URL+path, origin)
 		_ = resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			t.Errorf("%s = %d, want 200", path, resp.StatusCode)
+		if resp.StatusCode != wantStatus {
+			t.Errorf("%s = %d, want %d", path, resp.StatusCode, wantStatus)
 		}
 		if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "" {
 			t.Errorf("%s: Allow-Origin = %q, want empty (not an /api route)", path, got)

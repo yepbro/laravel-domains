@@ -387,7 +387,7 @@ does not matter.
 
 Host ports (`127.0.0.1` only): `5432` PostgreSQL, `6379` Redis, `9090`
 Prometheus, `8080` Adminer, `5540` Redis Insight, `8088`/`8443` testweb
-HTTP/HTTPS, `8081` the web landing page (`WEB_PORT` in `.env`), `8090` the
+HTTP/HTTPS, `8081` the web public API (`WEB_PORT` in `.env`), `8090` the
 dashboard service's operator dashboard (`DASHBOARD_PORT`; password login —
 dev creds in config.dev.yaml, see [`dev-environment.md`](dev-environment.md)).
 Service metrics: `9100`–`9108` (inside the network only).

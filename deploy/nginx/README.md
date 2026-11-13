@@ -1,15 +1,21 @@
-# Public entrance: nginx + TLS (sample, T-124)
+# Public entrance: nginx + TLS (sample, T-124; reworked in L-08)
 
-The landing page (`cmd/web`, `web.listen`) is the system's public entrance
-for visitors. The service listens on loopback (the default `127.0.0.1:8080`);
-a reverse proxy terminating TLS publishes it outward. Until stage 13 there
-was no public entrance in the repository — this directory records the first
-sample. The operator dashboard is published by the same scheme in a
-separate server block (docs/deploy.md §6, dashboard spec §9.1).
+The public API (`cmd/web`, `web.listen`) is the system's public entrance:
+`POST /api/check-domain` (the live check of the landing form) and
+`GET /api/v1/landing/stats` (the data of the static landings), plus
+`GET /healthz`. The service listens on loopback (the default
+`127.0.0.1:8080`); a reverse proxy terminating TLS publishes it outward.
+The landing pages themselves are static now — the separate ld-landing
+repo deployed on its own servers (`sites.laravel.city`,
+`sites.laracity.ru`) — and are not served through this vhost at all:
+everything outside `/api/` and `/healthz` is a 404. The operator
+dashboard is published by the same scheme in a separate server block
+(docs/deploy.md §6, dashboard spec §9.1); the production API host is
+`api9.laravel.city` (155.212.174.88).
 
 | File | Purpose |
 |---|---|
-| `crawler.example.conf` | the nginx server: HTTP→HTTPS, TLS, proxying to `web.listen` |
+| `crawler.example.conf` | the nginx server: HTTP→HTTPS, TLS, proxying `/api/` + `/healthz` to `web.listen`, the rest — 404 |
 
 ## Installation
 
@@ -21,7 +27,7 @@ ln -s /etc/nginx/sites-available/crawler.conf /etc/nginx/sites-enabled/
 nginx -t && systemctl reload nginx
 ```
 
-The access model (spec §9): only the landing page goes outward; the web
+The access model (spec §9): only the API goes outward; the web
 service's metrics and probes live on loopback `127.0.0.1:9107`
 (`METRICS_ADDR` of the `crawler-web.service` unit, docs/deploy.md) and are
 not published through the proxy. The form's rate limit (`web.rate_limit`,
@@ -55,15 +61,3 @@ The fallback source is `X-Forwarded-For` without `X-Real-IP`: the last
 position of the list is taken as the address (it was appended by this
 proxy, `$proxy_add_x_forwarded_for`; the head of the list came from the
 client and is not trusted — otherwise the rate limit is bypassed).
-
-## The scheme and host for sitemap.xml
-
-The landing page's `GET /sitemap.xml` builds absolute URLs: the host is
-the canonical `web.public_host` from the configuration (T-227: behind the
-proxy the request's `Host` is the visitor's `$host`; without the canon
-set, `<loc>` would depend on a foreign header; an empty field — a fallback
-to the request's `Host`); behind this proxy the scheme is passed by
-`X-Forwarded-Proto` — the service trusts the header only from a loopback
-peer and a unix-socket peer (like `X-Real-IP`); a foreign value is ignored
-and the connection's scheme stays. The public entrance must pass both
-headers and set `web.public_host` if you change the config.

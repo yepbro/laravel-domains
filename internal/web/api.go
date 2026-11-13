@@ -62,8 +62,8 @@ func (c checkerDB) Query(ctx context.Context, sql string, args ...any) (pgx.Rows
 }
 
 // checkResponse — the single JSON response of the form: found/score/
-// versions plus per-subdomain records (the contract of the ported
-// landing.js).
+// versions plus per-subdomain records (the contract of the landing
+// client — the ported landing.js, now DomainCheckForm.vue of ld-landing).
 type checkResponse struct {
 	Found      bool             `json:"found"`
 	Score      float64          `json:"score"`
@@ -117,11 +117,11 @@ var errLiveOverloaded = errors.New("the live check is overloaded")
 
 // handleCheckDomainLive — T-123: validation → stored → live (timeout
 // web.timeout, the web.live_concurrency semaphore) → a web_checks
-// record → JSON. Errors: 422 (validation, in the landing.js format),
-// 429 (rate limit, +Retry-After), 503 (live check overload,
+// record → JSON. Errors: 422 (validation, in the landing client
+// format), 429 (rate limit, +Retry-After), 503 (live check overload,
 // +Retry-After — to all clients: a 200 with found=false would read as
-// "Laravel not found" for a domain with stored data, and landing.js
-// does not show the stored part), 502 (the live check failed
+// "Laravel not found" for a domain with stored data, and the landing
+// client does not show the stored part), 502 (the live check failed
 // infrastructurally and the domain is unknown to the pipeline). All
 // error outcomes — JSON {"error": code} with Content-Type
 // application/json (checkWriteError, T-227).
@@ -243,9 +243,9 @@ func (s *Server) handleCheckDomainLive(w http.ResponseWriter, r *http.Request) {
 	if liveErr != nil {
 		if errors.Is(liveErr, errLiveOverloaded) {
 			// Overload — a fast rejection to all clients with a retry
-			// hint: regardless of the stored part (landing.js does not
-			// show it; a 200 with found=false would read as "Laravel
-			// not found").
+			// hint: regardless of the stored part (the landing client
+			// does not show it; a 200 with found=false would read as
+			// "Laravel not found").
 			s.met.Outcome(checkResultBusy)
 			w.Header().Set("Retry-After", "5")
 			checkWriteError(w, "busy", http.StatusServiceUnavailable)
@@ -430,21 +430,6 @@ func remoteHost(r *http.Request) string {
 	return host
 }
 
-// trustedProxyPeer — the connection peer is a trusted reverse proxy of
-// this host (T-227): nginx behind TCP loopback (deploy/nginx/
-// crawler.example.conf) or behind a unix socket (deploy/nginx/README.md).
-// The headers the proxy sets (X-Real-IP, X-Forwarded-For,
-// X-Forwarded-Proto) are trusted only from such a peer — a direct
-// visitor and a foreign address may send their own values, but they are
-// not read (the same principle as the visitor address in clientIP).
-func trustedProxyPeer(r *http.Request) bool {
-	if isUnixPeer(r) {
-		return true
-	}
-	ip := net.ParseIP(remoteHost(r))
-	return ip != nil && ip.IsLoopback()
-}
-
 // proxyHeaderIP — the visitor address from the proxy headers (a unix
 // peer): X-Real-IP, then X-Forwarded-For. XFF takes the LAST entry — it
 // was appended by our nginx ($proxy_add_x_forwarded_for, P1-1 of the
@@ -467,9 +452,9 @@ func proxyHeaderIP(h http.Header) string {
 
 // checkWriteError — the JSON error body of the form with a correct
 // Content-Type (a single format for all outcomes, including 429/503/502 —
-// before T-227 they went through http.Error with text/plain; landing.js
-// distinguishes the outcomes by status, the body is the contract for
-// other JSON clients). nosniff — as http.Error set it, the behavior
+// before T-227 they went through http.Error with text/plain; the landing
+// client distinguishes the outcomes by status, the body is the contract
+// for other JSON clients). nosniff — as http.Error set it, the behavior
 // parity before the unification.
 func checkWriteError(w http.ResponseWriter, code string, status int) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")

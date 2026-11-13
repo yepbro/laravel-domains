@@ -446,7 +446,9 @@ services:
     profiles: ["app"]
 
   web:
-    # The public landing page (stage 13, T-124): in dev it is published on
+    # The public API service (stage 13, T-124; since L-08 — API-only: the
+    # landing pages are static, the ld-landing repo): in dev it is
+    # published on
     # the host loopback (127.0.0.1:WEB_PORT, web.listen in config.dev.yaml
     # listens on 8080 in the container) — like the operator dashboard (the
     # dashboard service below, DASHBOARD_PORT); the production entry — a
@@ -462,7 +464,7 @@ services:
       SERVICE: web
       METRICS_PORT: "9107"
       METRICS_ADDR: ":9107"
-      # The landing form (T-123): live checks of real domains in dev.
+      # The domain check API (T-123): live checks of real domains in dev.
       # The testbed unbound is hermetic — it answers SERVFAIL for anything
       # outside the test zones, the checker escalates to the public
       # dns.fallback_resolvers (internal/checker/resolve.go). The bulk

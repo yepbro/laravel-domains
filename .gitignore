@@ -7,10 +7,6 @@
 
 # Go build artifacts
 /bin/
-
-# Generated Tailwind landing artifact (make web-css / css stage of Dockerfile.go):
-# embedded into the binary via go:embed, not stored in git
-internal/web/static/app.css
 *.test
 *.out
 coverage.*

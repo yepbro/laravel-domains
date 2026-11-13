@@ -207,7 +207,6 @@ func envSpecs() []envSpec {
 		{"CRAWLER_WEB_RATE_LIMIT", setInt(func(c *Config) *int { return &c.Web.RateLimit })},
 		{"CRAWLER_WEB_LIVE_CONCURRENCY", setInt(func(c *Config) *int { return &c.Web.LiveConcurrency })},
 		{"CRAWLER_WEB_TIMEOUT", setDuration(func(c *Config) *Duration { return &c.Web.Timeout })},
-		{"CRAWLER_WEB_PUBLIC_HOST", setString(func(c *Config) *string { return &c.Web.PublicHost })},
 		// The CORS allowlist (L-04): comma-separated exact origins; empty
 		// elements are dropped by normalize (the setStrings semantics),
 		// the shape — by Validate. The value replaces the YAML list
