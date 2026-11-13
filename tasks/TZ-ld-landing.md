@@ -122,6 +122,10 @@ vite-ssg генерирует HTML на каждую страницу × тар�
 Вариант EN: *“Laravel Domains landing pages — static sites (Vue 3 + vite-ssg,
 TypeScript): one domain per language, build and deploy to multiple servers”*.
 
+**Язык репо ld-landing (решение 13.11):** коммиты (conventional) и вся
+документация — README.md, AGENTS.md, docs/, комментарии в коде и конфигах —
+**только на английском**; описание репо на gitverse — EN-вариант.
+
 Структура (pnpm workspaces):
 
 ```
