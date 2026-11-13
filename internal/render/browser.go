@@ -192,7 +192,7 @@ func StartBrowser(ctx context.Context, opts Options) (*Browser, error) {
 		cancelAlloc()
 		return nil, &Error{
 			Class: ClassBrowser,
-			Err:   fmt.Errorf("Chromium initialization (%s): %w", mode, err),
+			Err:   fmt.Errorf("chromium initialization (%s): %w", mode, err),
 		}
 	}
 
@@ -453,7 +453,7 @@ func (b *Browser) classifyCtx(err error, url string, s *Session) *Error {
 	switch {
 	case !b.Alive():
 		return &Error{Class: ClassBrowser, URL: url,
-			Err: fmt.Errorf("Chromium browser unavailable: %w", err)}
+			Err: fmt.Errorf("chromium browser unavailable: %w", err)}
 	case s != nil && s.ctx != nil && s.ctx.Err() != nil:
 		return &Error{Class: ClassContext, URL: url,
 			Err: fmt.Errorf("the tab context is cancelled: %w", err)}
@@ -472,7 +472,7 @@ func (b *Browser) classifyCtx(err error, url string, s *Session) *Error {
 		// generation, a second failure in a row kills it.
 		if !b.probeConn() {
 			return &Error{Class: ClassBrowser, URL: url,
-				Err: fmt.Errorf("Chromium browser unavailable: %w", err)}
+				Err: fmt.Errorf("chromium browser unavailable: %w", err)}
 		}
 		return &Error{Class: ClassContext, URL: url,
 			Err: fmt.Errorf("the tab is not responding: %w", err)}

@@ -421,7 +421,7 @@ func TestZonesCollapse(t *testing.T) {
 			"post-checks: 2LD zones outside the allowlist: 0",
 			"orphan zone_id: domains 0, subdomain_results 0, laravel_domains 0, laravel_findings 0, laravel_history 0",
 			"zone counters = the aggregate: no mismatches",
-			"counter reconciliation: 2 zones rewritten",
+			"counter reconciliation: 3 zones rewritten, 10 positions with drift",
 			"spot check site0.5g.in: zone in, label site0.5g — ok",
 			"the move is finished: 2 2LD zones",
 		} {

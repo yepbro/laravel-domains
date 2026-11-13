@@ -269,7 +269,7 @@ func subdomCheckOne(ctx context.Context, resolve dnsclient.Resolver, name string
 				if ctxErr := ctx.Err(); ctxErr != nil {
 					return out, ctxErr
 				}
-				out.Err = fmt.Errorf("A query %s: %w", cur, err)
+				out.Err = fmt.Errorf("a query %s: %w", cur, err)
 				return out, nil
 			}
 			res = r
