@@ -340,9 +340,37 @@ AGENTS.md (отдельный worktree, ревью по схеме, один к�
 | L-03 | [in progress] | laravel-domains | `GET /api/v1/landing/stats` (§7.1) | — (параллельно L-01/L-02) |
 | L-04 | [new] | laravel-domains | CORS для `/api/*` (§7.2) | L-03 (обе в `internal/web`) |
 | L-05 | [new] | ld-landing | targets.yaml, `make deploy/rollback`, verify-скрипт, e2e; проверка на моках | L-02, L-03, L-04 |
-| L-06 | [new] | uspromo, aphrodite, larasites | Настройка серверов: nginx vhost под статику (docroot, releases/current) + TLS-сертификаты (certbot, §10) на uspromo/aphrodite; на larasites — vhost `api9.laravel.city` → 127.0.0.1:8080 + TLS (дашборд уже на `dashboard.laracity.ru`); деплой стенда, curl-чеки, SEO-аудит (hreflang/canonical/sitemap), проверка формы и stats на живом API | L-05 |
+| L-06 | [new] | uspromo, aphrodite | **Остаток после досрочной настройки (§11.1)**: деплой статики через L-05, curl-чеки, SEO-аудит (hreflang/canonical/sitemap), проверка формы и stats на живом API. Nginx+TLS+vhost'ы уже готовы 13.11 | L-05 |
 | L-07 | [new] | серверы | Cut-over: DNS уже переключен заранее (reg.ru, 13.11, sites.* → новые серверы, TTL 60) — задача снимается с критического пути; финальные сертификаты/проверка HTTPS; карта 301 (§10); после стабилизации — снятие старых лендинг-vhost'ов на larasites; наблюдение (Метрика, 404, логи api, rate limit) | L-06 |
 | L-08 | [new] | laravel-domains | Вырезание лендинга (§7.3), обновление доков | L-07 |
+
+### 11.1. Выполнено досрочно: nginx + TLS (13.11)
+
+Настройка серверов из L-06 выполнена заранее, чтобы L-06 свёлся к деплою
+статики. Фактическое состояние (для реализации L-05):
+
+- **uspromo** (`root@150.241.122.242`, nginx 1.24): vhost
+  `/etc/nginx/sites-available/sites.laravel.city` — 80: ACME + редирект;
+  443: `root /var/www/sites.laravel.city/current`, `try_files`,
+  карта 301 (`/en*` → `/`, `/ru*` → sites.laracity.ru), кэш `^/assets/` 1y
+  immutable. LE-сертификат `sites.laravel.city` (webroot
+  `<docroot>/shared/acme`). Docroot: `releases/0-init/` (английская
+  заглушка), `current → releases/0-init`, владелец `forge`.
+- **aphrodite** (`forge@85.208.85.156`, nginx 1.30, Forge-стиль): vhost
+  `/etc/nginx/sites-available/sites.laracity.ru` (enabled-симлинк
+  `50-sites.laracity.ru`) — симметрично, карта 301 зеркальная (`/ru*` → `/`,
+  `/en*` → sites.laravel.city). LE-сертификат свой. Docroot
+  `/var/www/sites.laracity.ru/...`, владелец `forge`, русская заглушка.
+- **larasites** (`root@155.212.174.88`): vhost
+  `/etc/nginx/sites-available/api9.laravel.city` с отдельным
+  LE-сертификатом; проксирует **только** `/api/` и `/healthz` →
+  `127.0.0.1:8080` (cmd/web), прочее — 404 (лендинг не отдаётся под
+  api9-хостом). Старый `crawler.conf` не тронут. Проверено: `/healthz` 200,
+  `GET /api/check-domain` 405, `/` 404, сертификат `CN=api9.laravel.city`.
+- Деплой статики (L-05) должен: `rsync dist/ → <docroot>/releases/<ts>/`,
+  переключить symlink `current`, healthcheck `https://<site>/`; откат —
+  symlink на предыдущий релиз. Vite-артефакты класть в `assets/` (под
+  кэш-правило уже существующего location).
 
 ## 12. Критерии приёмки
 
