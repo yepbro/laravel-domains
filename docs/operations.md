@@ -1120,3 +1120,48 @@ why, and how to roll it back. Normal CD deploys are not recorded here
   -b -1` (poweroff vs reboot vs crash) before forming hypotheses; (c)
   external power-cycles are outside our control — one more argument for
   the persistent drain cursor (implemented by T-274).
+
+### 2026-11-13 — T-247: the moli retest from upstream/main f857b6651 — layer 1 green (T-276), layer 2 NOT READY
+
+- The build: upstream/main `f857b6651` (reports 1.1.24; the release
+  1.1.24 itself lacks ④ and ① — merged 13.11 after the release cut),
+  the debug binary built from source (12 min, warm target), the image
+  `moli:t247` on ubuntu:26.04 (the host glibc 2.43 does not fit
+  Debian bases), the container on 172.28.100.18 with the stack's DNS.
+  `/json/version` carried the commit SHA in `WebKit-Version` — the
+  build provenance checked at the gate.
+- Layer 1 (the CDP slice, the retest goal): all three upstream fixes
+  confirmed — ② #2696 (failRequest of a blocked navigation finishes
+  with a load error → ssrf green), ① #2704 (the interception class set
+  → block_resources green), ④ #2729+#2883 (sync-XHR). The first run
+  was 5/6: block_trackers was red exactly because the T-275
+  expectations ("moli: sync-XHR goes to the network, 200") were stale —
+  the final maintainer line (`9e357b95e`, after the exact-URL draft
+  `8ff18ca02`/`e8ce829d8`) made the sync-XHR pause live: a matching
+  sync request is paused at the Request stage and the client's verdict
+  decides — full parity with Chromium, the path-trap shape included.
+  **T-276** (the same day) unified the sync-probe expectations (both
+  engines expect the block; the control run got its missing sync
+  counter check) — the slice is now 6/6 on moli and 6/6 on the
+  chromium control (the main tree, post-merge; review: deepseek, one
+  round, all findings accepted).
+- Layer 2 (the smoke on the seed hundred, internet mode, baseline
+  chromium-1 of the same dump 242): **NOT READY** — success 69/100 vs
+  the baseline 92/100 (the gap: tarpit finalizations 27 vs 4 and
+  4× net::ERR_FAILED; engine-independent losses 0), the Laravel
+  detection divergences 2.94% (2 of 68 comparable; 12 Laravel verdicts
+  on both sides) against the <1% threshold, the engine RSS 736.4 MiB —
+  above ⅓ of the chromium budget (682.7 MiB), grew monotonically over
+  the run; the pace verdict is NO DATA (q:analyze held <2 records at
+  the snapshot — a late redelivery; indicatively the drain took ~34
+  min for 100 tasks ≈0.049 rows/s vs the baseline 0.07). 0 engine
+  crashes (PASSED; the engine log shows page-side JS errors and
+  session-teardown warns only, no panics/OOM).
+- Consequences: moli stays a permanent candidate, "not ready now"; the
+  pin in the repo defaults is NOT raised (a main build, not a release);
+  the retest goes with the first release carrying ①④ (expected
+  1.1.25+) — the bench procedure is this entry + the artifacts
+  `var/fixtures-l2/moli-main-f857b6651.snapshot.json` and
+  `report-moli-main-f857b6651.txt`. The bench container/image
+  (`moli-t247`, `moli:t247`) removed after the run; the stand returned
+  to chromium + the isolated DNS (`ALLOW_INTERNET=0`).
