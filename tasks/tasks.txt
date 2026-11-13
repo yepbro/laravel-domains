@@ -1,163 +1,170 @@
-# План: разбор выживших мутантов go-mutesting (baseline 2026-10-20)
+# Plan: triage of the surviving go-mutesting mutants (the 2026-10-20 baseline)
 
-Источник: полный прогон `make mutate` (94 мин, 2877 мутантов, score 0.673,
-941 выживший) — `var/mutation/go-mutesting-report.html`, машиночитаемо
-`var/mutation/report.json`. Дайджесты выживших по группам (дифф + строка +
-мутатор + чексумма для блэклиста) — `var/mutation/escaped/<задача>.txt`.
+Source: a full `make mutate` run (94 min, 2877 mutants, score 0.673,
+941 survivors) — `var/mutation/go-mutesting-report.html`, machine-readable
+`var/mutation/report.json`. The survivor digests by group (the diff + line +
+mutator + checksum for the blacklist) — `var/mutation/escaped/<task>.txt`.
 
-Терминология (docs/mutation-testing.md §3): в mutate.log `PASS` — мутант
-убит (хорошо), `FAIL` — выжил (дыра в тестах). Здесь работаем только с
-выжившими.
+Terminology (docs/mutation-testing.md §3): in mutate.log `PASS` — the mutant
+is killed (good), `FAIL` — it survived (a hole in the tests). Here we work
+only with the survivors.
 
-## Политика каждой задачи
+## The policy per task
 
-1. Каждый выживший мутант из дайджеста разбирается индивидуально:
-   - **убить тестом** — основной путь: граничные условия (`<= 0` vs `< 0`,
-     длина ровно 63/253 октета, `>` vs `>=`), содержание ошибок (номер
-     элемента `i+1`, имя поля), математика (окна, ключи round-robin,
-     проценты), дефолты опций (±1 у `Default*` констант и порогов);
-   - **погасить аннотацией** (docs §4, приоритетный способ гашения):
-     логирование (`log.Debug/Info/Warn`, `slog.*`, `*.log().*`) — через
-     `mutator-disable-regexp` по строкам вызовов; аппаратные passthrough
-     без исполнения в контейнере (ioctl NVMe) — `mutator-disable-func`;
-     чисто косметические тексты, не несущие контракта;
-   - **блэклист чексумм** (`test/mutation/blacklist.txt`) — только если
-     мутанта нельзя закрыть ни тестом, ни аннотацией (docs §4.2).
-2. Решение по каждому мутанту фиксируется в теле коммита (сводка:
-   убито тестами N, погашено аннотациями M, блэклист K — с перечнем
-   строк и обоснованием гашения).
-3. Тесты — герметичные юниты в стиле пакета (table-driven), без
-   расширения временных бюджетов существующих тестов.
-4. Проверки в worktree: `COMPOSE_PROJECT_NAME=crawler make test`,
-   `make lint`, контрольный точечный мутационный прогон
+1. Every surviving mutant from the digest is triaged individually:
+   - **kill with a test** — the main path: boundary conditions (`<= 0` vs
+     `< 0`, a length of exactly 63/253 octets, `>` vs `>=`), error contents
+     (the element number `i+1`, the field name), math (the windows, the
+     round-robin keys, the percentages), the option defaults (±1 at the
+     `Default*` constants and the thresholds);
+   - **suppress with an annotation** (docs §4, the preferred suppression
+     method): logging (`log.Debug/Info/Warn`, `slog.*`, `*.log().*`) — via
+     `mutator-disable-regexp` over the call lines; hardware passthroughs
+     without execution in the container (ioctl NVMe) —
+     `mutator-disable-func`; purely cosmetic texts carrying no contract;
+   - **the checksum blacklist** (`test/mutation/blacklist.txt`) — only if
+     the mutant can be closed by neither a test nor an annotation
+     (docs §4.2).
+2. The decision per mutant is recorded in the commit body (the summary:
+   killed by tests N, suppressed by annotations M, blacklist K — with the
+   list of lines and the suppression rationale).
+3. Tests — hermetic units in the style of the package (table-driven),
+   without extending the time budgets of the existing tests.
+4. Checks in a worktree: `COMPOSE_PROJECT_NAME=crawler make test`,
+   `make lint`, a control spot mutation run
    `COMPOSE_PROJECT_NAME=crawler make mutate PKGS='./internal/<pkg>/...'`
-   — выжившие из дайджеста либо убиты, либо исключены (в логе пропали).
-5. Аннотации не прятать: у каждой — короткий комментарий, почему мутант
-   ложный.
+   — the digest survivors are either killed or excluded (gone from the log).
+5. Do not hide the annotations: each one carries a short comment on why the
+   mutant is a false positive.
 
-Итоговая цель: score ≥ 0.75 по полному охвату, обновление таблицы
-docs/mutation-testing.md и подъём порога ночного CI.
+The final goal: score ≥ 0.75 over the full coverage, an update of the
+docs/mutation-testing.md table and raising the nightly CI threshold.
 
-## Задачи
+## Tasks
 
-- **T-M01** [сделана] — `internal/monitor/alerts.go` (117 выживших; score
-  пакета 0.59 — худший после dashboard). Дайджест:
+- **T-M01** [done] — `internal/monitor/alerts.go` (117 survivors; the
+  package score 0.59 — the worst after dashboard). Digest:
   `var/mutation/escaped/T-M01-monitor-alerts.txt`.
-  NVMe-посредник (L274–L403, ~55 мутантов: ioctl, struct layout, unsafe)
-  — аппаратный passthrough, в CI не исполняется: погасить
-  `mutator-disable-func` с обоснованием. Остальное — тестами:
-  `formatGiB/MiB/KiB` (таблица на границах 1<<30/1<<20/1<<10 и внутри
-  диапазонов), гистерезис и пороги DNS-алерта (`>=` vs `>` на
-  AlertDNSRecoverShare, AlertDNSMinSamples), окно bad-hashes
-  (AlertBadHashesWindow±1, `*` vs `/` на Interval), statfs
-  (`Avail/Total * bs`), выбор худшего износа (`wears[1:]`, `>` vs `>=`),
-  `humanBytes`-цепочка, дефолты опций (`Interval <= 0` vs `<= 1` и т.п.),
-  `w.i = (w.i+1) % len(deltas)`.
-- **T-M02** [сделана] — `internal/monitor/{badhashes,nearstats,historystats,
-  zonestats}.go` (72 выживших). Дайджест:
+  The NVMe intermediary (L274–L403, ~55 mutants: ioctl, struct layout,
+  unsafe) — a hardware passthrough, not executed in CI: suppress with
+  `mutator-disable-func` with a rationale. The rest — with tests:
+  `formatGiB/MiB/KiB` (a table at the 1<<30/1<<20/1<<10 boundaries and
+  inside the ranges), the DNS alert hysteresis and thresholds (`>=` vs `>`
+  at AlertDNSRecoverShare, AlertDNSMinSamples), the bad-hashes window
+  (AlertBadHashesWindow±1, `*` vs `/` at Interval), statfs
+  (`Avail/Total * bs`), the worst-wear selection (`wears[1:]`, `>` vs `>=`),
+  the `humanBytes` chain, the option defaults (`Interval <= 0` vs `<= 1`
+  and the like), `w.i = (w.i+1) % len(deltas)`.
+- **T-M02** [done] — `internal/monitor/{badhashes,nearstats,historystats,
+  zonestats}.go` (72 survivors). Digest:
   `var/mutation/escaped/T-M02-monitor-stats.txt`.
-  Границы окон и лимитов (`badHashesBodyLimit = 4<<20`, таймауты зондов),
-  ветки ошибок чтения/парсинга, инкременты счётчиков окон, сравнения
-  `>=`/`>` на порогах срабатываний, SQL-обвязка — по политике.
-- **T-M03** [сделана] — `internal/queue/message.go` (63 выживших). Дайджест:
+  The window and limit boundaries (`badHashesBodyLimit = 4<<20`, the probe
+  timeouts), the read/parse error branches, the window counter increments,
+  the `>=`/`>` comparisons at the trigger thresholds, the SQL wrapper — per
+  the policy.
+- **T-M03** [done] — `internal/queue/message.go` (63 survivors). Digest:
   `var/mutation/escaped/T-M03-queue-message.txt`.
-  Валидация сообщений — границы: `ZoneID/DomainID <= 0` против `< 0`
-  (случай ID==0 обязан отклоняться), длина метки ровно 63 и CNAME/имя
-  ровно 253 (`>` против `>=`, mutants `maxLabelLen 63/64`,
-  `maxNameLen 253/252`), тексты ошибок с номером элемента (`i+1` против
-  `i-1/i+0/i+2` — таблица с ошибкой во втором элементе пачки),
-  `m.TaskID = NewTaskID()` при пустом (генерация на десериализации),
-  `len(d.Payload) == 0`.
-- **T-M04** [сделана] — `internal/queue/{redisq,backpressure,recover,
-  reliab}.go` (96 выживших). Дайджест:
+  Message validation — boundaries: `ZoneID/DomainID <= 0` vs `< 0`
+  (the ID==0 case must be rejected), a label of exactly 63 and a CNAME/name
+  of exactly 253 (`>` vs `>=`, mutants `maxLabelLen 63/64`,
+  `maxNameLen 253/252`), the error texts with the element number (`i+1` vs
+  `i-1/i+0/i+2` — a table with an error in the second element of the
+  chunk), `m.TaskID = NewTaskID()` at an empty one (the generation at
+  deserialization), `len(d.Payload) == 0`.
+- **T-M04** [done] — `internal/queue/{redisq,backpressure,recover,
+  reliab}.go` (96 survivors). Digest:
   `var/mutation/escaped/T-M04-queue-streams.txt`.
-  redisq: `parseID` ms/seq (разрядность 64, base 10, не-число, порядок
-  `>` против `>=` при равных ms), `DefaultRedisBlock`, `BUSYGROUP`,
-  `start = "0"`, пустые msgs. backpressure/recover/reliab: пороги
-  включения/выключения (`>` vs `>=`, ±1), окно оценки, счётчики.
-- **T-M05** [сделана] — `internal/scheduler/{dispatch,enqueue}.go`
-  (92 выживших). Дайджест:
+  redisq: `parseID` ms/seq (the 64-bit width, base 10, a non-number, the
+  order `>` vs `>=` at equal ms), `DefaultRedisBlock`, `BUSYGROUP`,
+  `start = "0"`, empty msgs. backpressure/recover/reliab: the on/off
+  thresholds (`>` vs `>=`, ±1), the estimation window, the counters.
+- **T-M05** [done] — `internal/scheduler/{dispatch,enqueue}.go`
+  (92 survivors). Digest:
   `var/mutation/escaped/T-M05-scheduler-dispatch.txt`.
-  dispatch: взвешенный round-robin — `key = (rn-0.5)/w` (порядок выбора
-  зон при фиксированных rn, деление против умножения), нормализация
-  весов `w < 1 → 1`, `quota < 1 → 1`, `q.Limit < 1`, границы цикла
-  `dispatchMaxRounds`, тай-брейк `zone.id` при равных key,
-  `continue`→`break`. enqueue: границы `len(Name) > 253`, дефолты
-  (`DefaultEnqueueBatch/IdleWait/Interval`, `<= 0` vs `< 0`), тексты
-  ошибок с `i+1`.
-- **T-M06** [сделана] — `internal/scheduler/{retry,backlog,recheck,lease}.go`
-  (66 выживших). Дайджест:
+  dispatch: weighted round-robin — `key = (rn-0.5)/w` (the zone selection
+  order at fixed rn, division vs multiplication), the weight normalization
+  `w < 1 → 1`, `quota < 1 → 1`, `q.Limit < 1`, the loop boundaries
+  `dispatchMaxRounds`, the `zone.id` tie-break at equal keys,
+  `continue`→`break`. enqueue: the `len(Name) > 253` boundaries, the
+  defaults (`DefaultEnqueueBatch/IdleWait/Interval`, `<= 0` vs `< 0`), the
+  error texts with `i+1`.
+- **T-M06** [done] — `internal/scheduler/{retry,backlog,recheck,lease}.go`
+  (66 survivors). Digest:
   `var/mutation/escaped/T-M06-scheduler-cycles.txt`.
-  Пороги повторов и экспоненты бэкоффа (±1 на константах и степенях),
-  границы выборок backlog, перепланирование recheck, продление lease
-  (`>` vs `>=` на таймингах — с фейковыми часами, без реальных пауз).
-- **T-M07** [сделана] — `internal/render/{browser,proc,pool}.go`
-  (67 выживших). Дайджест:
+  The retry thresholds and the backoff exponents (±1 at the constants and
+  the powers), the backlog selection boundaries, the recheck rescheduling,
+  the lease extension (`>` vs `>=` on the timings — with fake clocks, no
+  real pauses).
+- **T-M07** [done] — `internal/render/{browser,proc,pool}.go`
+  (67 survivors). Digest:
   `var/mutation/escaped/T-M07-render-browser.txt`.
-  browser: `rootPID <= 0` (0 и -1), порог памяти `rss > 0 && rss >=
-  MemoryThreshold` (rss==0, rss==threshold), ветки nil/ctx.Err().
-  Взаимодействие с реальным Chromium — только через моки/интерфейсы,
-  как принято в тестах пакета; запуск браузера в мутационном прогоне
-  недетерминирован — ложные гасить по политике. proc: ожидание сигналов
-  процесса, retry-паузы (фейковые часы). pool: границы пула.
-- **T-M08** [сделана] — `internal/render/{manager,render}.go`
-  (60 выживших). Дайджест:
+  browser: `rootPID <= 0` (0 and -1), the memory threshold `rss > 0 && rss >=
+  MemoryThreshold` (rss==0, rss==threshold), the nil/ctx.Err() branches.
+  Interaction with a real Chromium — only via mocks/interfaces, as accepted
+  in the package's tests; a browser launch in a mutation run is
+  nondeterministic — suppress the false ones per the policy. proc: waiting
+  for the process signals, the retry pauses (fake clocks). pool: the pool
+  boundaries.
+- **T-M08** [done] — `internal/render/{manager,render}.go`
+  (60 survivors). Digest:
   `var/mutation/escaped/T-M08-render-manager.txt`.
-  manager: переходы состояний воркеров, счётчики. render: маски
-  разрешённых доменов/путей (битовые сдвиги `<<`, `>` vs `>=` на
-  индексах), лимиты размеров (±1).
-- **T-M09** [сделана] — `internal/render/{extract,block,wait}.go`
-  (46 выживших). Дайджест:
+  manager: the worker state transitions, the counters. render: the masks of
+  the allowed domains/paths (bit shifts `<<`, `>` vs `>=` at the indexes),
+  the size limits (±1).
+- **T-M09** [done] — `internal/render/{extract,block,wait}.go`
+  (46 survivors). Digest:
   `var/mutation/escaped/T-M09-render-extract.txt`.
-  extract: пороги извлечения (число вхождений, длины фрагментов —
-  границы ровно-на-пороге). block: лимиты блокировок. wait: циклы
-  ожидания (`range_break`, снятие ожидания).
-- **T-M10** [сделана] — `internal/analyzer/{worker,reanalyze,aggregate,
-  metrics}.go` (97 выживших). Дайджест:
+  extract: the extraction thresholds (the occurrence count, the fragment
+  lengths — the exactly-at-threshold boundaries). block: the blocking
+  limits. wait: the wait loops (`range_break`, clearing the wait).
+- **T-M10** [done] — `internal/analyzer/{worker,reanalyze,aggregate,
+  metrics}.go` (97 survivors). Digest:
   `var/mutation/escaped/T-M10-analyzer.txt`.
-  worker: дефолты `DefaultConcurrency/Consume/ErrorWait` (`<= 0` vs
-  `<= 1`), ветки «правила не загружены», ошибки записи findings
-  (в т.ч. `RowsAffected`), `s == nil || *s == ""`, `len(raw) == 0`.
-  aggregate: границы объединения диапазонов версий (NULL-границы, min/max
-  по компонентам), `scanAggregate`. reanalyze: дефолты batch/interval,
-  ошибки пул/очередь. metrics — по политике.
-- **T-M11** [сделана] — `internal/dashboard/{dashboard,assets,snapshot}.go`
-  + `internal/dashboard/auth/secret.go` (49 выживших; score пакета 0.50 —
-  худший в охвате). Дайджест:
+  worker: the `DefaultConcurrency/Consume/ErrorWait` defaults (`<= 0` vs
+  `<= 1`), the “rules not loaded” branches, the findings write errors
+  (incl. `RowsAffected`), `s == nil || *s == ""`, `len(raw) == 0`.
+  aggregate: the version-range union boundaries (NULL bounds, min/max over
+  the components), `scanAggregate`. reanalyze: the batch/interval defaults,
+  the pool/queue errors. metrics — per the policy.
+- **T-M11** [done] — `internal/dashboard/{dashboard,assets,snapshot}.go`
+  + `internal/dashboard/auth/secret.go` (49 survivors; the package score
+  0.50 — the worst in the coverage). Digest:
   `var/mutation/escaped/T-M11-dashboard.txt`.
-  dashboard: арифметика агрегатов (инкременты/декременты счётчиков —
-  применить утверждения на точные значения после прохода), лимиты
-  выборки, ветки ошибок. auth/secret: сравнение времени сравнения
-  (timing), длина секрета (±1), границы base64. assets: иммутабельность
-  кэша. snapshot: ветка ошибки.
-- **T-M12** [сделана] — `internal/rules/{rules,score,engine,reload}.go`
-  (60 выживших). Дайджест:
+  dashboard: the aggregate arithmetic (the counter increments/decrements —
+  apply assertions on the exact values after a pass), the selection limits,
+  the error branches. auth/secret: the constant-time comparison (timing),
+  the secret length (±1), the base64 boundaries. assets: the cache
+  immutability. snapshot: the error branch.
+- **T-M12** [done] — `internal/rules/{rules,score,engine,reload}.go`
+  (60 survivors). Digest:
   `var/mutation/escaped/T-M12-rules.txt`.
-  score: веса правил (±1 на константах, `>=` vs `>` на порогах
-  уверенности — граница 0.6 из ТЗ §13.1), порядок правил (`loop/break`).
-  rules/engine: ветки применения правил, `expression/remove` на
-  условиях. reload: логгирование — по политике гашения.
-- **T-M13** [сделана] — `internal/status/status.go` + `internal/idn/idn.go`
-  + `internal/model/{dnsmask,enums,flags}.go` (56 выживших). Дайджест:
+  score: the rule weights (±1 at the constants, `>=` vs `>` at the
+  confidence thresholds — the 0.6 boundary from spec §13.1), the rule order
+  (`loop/break`). rules/engine: the rule application branches,
+  `expression/remove` on the conditions. reload: logging — per the
+  suppression policy.
+- **T-M13** [done] — `internal/status/status.go` + `internal/idn/idn.go`
+  + `internal/model/{dnsmask,enums,flags}.go` (56 survivors). Digest:
   `var/mutation/escaped/T-M13-status-idn-model.txt`.
-  status: ветки `rows.Err()`/`rows.Close()` (ошибка после чтения —
-  проверить, что тесты умеют инжектить ошибку rows; если фейк не
-  позволяет — расширить фейк, а не гасить), пустые агрегаты,
-  `Remaining > 0 && DomainsPerSec > 0` (ровно 0), MinSpeedWindowSec.
-  idn: границы длин (±1), punycode-ветки. model: биты маски субдоменов
-  (`<<` сдвиги, `>` vs `>=` на индексах), значения enum (±1 — контракты
-  хранения).
-- **T-M14** [сделана] — Финализация: полный `make mutate` (2632 мутанта,
-  score 0.9992, 2 выживших) — оба закрыты: `idn.go.8` — прямой
-  контракт-тест `isNumericZone` (3132510; через Normalize пустая зона
-  недостижима — эквивалентен API, фиксируется прямым вызовом);
-  `wait.go.6` — детерминированный субтест ошибки декодирования события
-  (3e4342e; kill через отмену ctx — в принципе гонка teardown chromedp
-  v0.21.0, замер 35/40 — окно негативной проверки расширено до 1 с как
-  страховка). Контрольный полный прогон: score 1.000000, 2632/2632,
-  0 выживших, порог 0.98 пройден. Сводный итог T-M01…T-M14: убито
-  тестами 716 (714 + 2 финальных), погашено аннотациями 227 (+18
-  попутно гранулярностью аннотаций), блэклист 0 (файл не создавался).
-  Обновлены docs/mutation-testing.md (§2 таблица и baseline, §5),
-  Makefile-замер; порог ночного CI 0.60 → 0.98, timeout 180 → 240 мин.
-  README числового score не содержит — правка не требовалась.
+  status: the `rows.Err()`/`rows.Close()` branches (an error after a read —
+  check that the tests know how to inject a rows error; if the fake does
+  not allow it — extend the fake rather than suppress), empty aggregates,
+  `Remaining > 0 && DomainsPerSec > 0` (exactly 0), MinSpeedWindowSec.
+  idn: the length boundaries (±1), the punycode branches. model: the
+  subdomain mask bits (`<<` shifts, `>` vs `>=` at the indexes), the enum
+  values (±1 — the storage contracts).
+- **T-M14** [done] — Finalization: a full `make mutate` (2632 mutants,
+  score 0.9992, 2 survivors) — both closed: `idn.go.8` — a direct
+  contract test of `isNumericZone` (3132510; via Normalize an empty zone
+  is unreachable — equivalent to the API, pinned by a direct call);
+  `wait.go.6` — a deterministic subtest of the event decoding error
+  (3e4342e; killed via the ctx cancellation — fundamentally a chromedp
+  v0.21.0 teardown race, the 35/40 measurement — the negative-check window
+  extended to 1 s as a guard). The control full run: score 1.000000,
+  2632/2632, 0 survivors, the 0.98 threshold passed. The summary of
+  T-M01…T-M14: killed by tests 716 (714 + 2 final), suppressed by
+  annotations 227 (+18 along the way via annotation granularity),
+  blacklist 0 (the file was not created). docs/mutation-testing.md updated
+  (§2 the table and the baseline, §5), the Makefile measurement; the
+  nightly CI threshold 0.60 → 0.98, timeout 180 → 240 min.
+  README contains no numeric score — no edit was needed.

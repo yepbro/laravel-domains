@@ -320,13 +320,13 @@ of scope (waiting for upstream #4151 — one browser context per connection).
   an engine-branched case —
   [details](task/T-275-block-trackers-async-probes.md).
 
-## Этап 46: block_trackers — sync-зонд на exact-URL семантике moli #2729 (T-276)
+## Stage 46: block_trackers — the sync probe on the moli #2729 exact-URL semantics (T-276)
 
-- **T-276** [новая] — P1, схлопнуть движко-ветвление sync-зонда после
-  мержа #2729: мейнтейнер ввёл точный матчинг URL для sync-XHR (совпадение
-  → блокировка, включая редиректы), tracker-зонд блокируется на обоих
-  движках — ожидание «moli: 200 в сеть» устарело —
-  [подробности](task/T-276-block-trackers-sync-exact-url.md).
+- **T-276** [new] — P1, collapse the sync probe's engine branching after
+  #2729 is merged: the maintainer introduced exact URL matching for sync XHR
+  (a match → a block, including redirects), the tracker probe is blocked on
+  both engines — the “moli: 200 to the network” expectation is outdated —
+  [details](task/T-276-block-trackers-sync-exact-url.md).
 
 ## Stage 47: TTL for subdomain_results passports of non-findings (T-277)
 
@@ -336,22 +336,23 @@ of scope (waiting for upstream #4151 — one browser context per connection).
   state (~1–1.5 GB), and automatically covers the future recheck-ghost
   class — [details](task/T-277-subdomain-results-passport-ttl.md).
 
-## Этап 48: устойчивость прода — ретраи, память PG, метрики таймаутов, crawlerctl (T-278–T-281)
+## Stage 48: production resilience — retries, PG memory, timeout metrics, crawlerctl (T-278–T-281)
 
-- **T-278** [новая] — P1, прогрессивный backoff ретраев temp_error (24 ч →
-  72 ч при attempts≥2): мёртвый корпус даёт 63–69 % temp_error (норма
-  23–40 %) и прогоняется по кругу до 4 раз — до ⅔ повторной нагрузки
-  q:http/PG; фон серии OOM-киллов PG 11–13.11 —
-  [подробности](task/T-278-temp-error-retry-backoff.md).
-- **T-279** [новая] — P1, потолок памяти PostgreSQL: memcg OOM-киллы бэкенда
-  каждые 4–5 ч под полным фронтом (11.11 21:10, 12.11 03:14, 13.11 02:32);
-  аудит shared_buffers/work_mem/лимита cgroup против бюджета VM 8 ГиБ —
-  [подробности](task/T-279-pg-memory-ceiling.md).
-- **T-280** [новая] — P2, split метрики timeout HTTP-стадии (connect/tls/
-  tarpit/ctx-в-очереди per-IP): сегодня 92,7 % ошибок — один счётчик,
-  локальная петля «нагрузка→таймауты→ретраи» неотделима от мёртвого
-  корпуса — [подробности](task/T-280-stage-errors-timeout-split.md).
-- **T-281** [новая] — P2, фикс crawlerctl domain на проде
-  («domain_info: пустой ответ» для любого домена, включая живые; обнаружено
-  при исследовании 13.11) —
-  [подробности](task/T-281-crawlerctl-domain-fix.md).
+- **T-278** [new] — P1, a progressive temp_error retry backoff (24 h →
+  72 h at attempts≥2): the dead corpus gives 63–69% temp_error (the norm
+  23–40%) and is driven in a circle up to 4 times — up to ⅔ of the repeated
+  q:http/PG load; against the background of the PG OOM kill series of
+  11–13.11 — [details](task/T-278-temp-error-retry-backoff.md).
+- **T-279** [new] — P1, a PostgreSQL memory cap: memcg OOM kills of the
+  backend every 4–5 h under full front (11.11 21:10, 12.11 03:14,
+  13.11 02:32); an audit of shared_buffers/work_mem/the cgroup limit
+  against the 8 GiB VM budget —
+  [details](task/T-279-pg-memory-ceiling.md).
+- **T-280** [new] — P2, split the HTTP-stage timeout metric (connect/tls/
+  tarpit/per-IP ctx-in-queue): today 92.7% of the errors are one counter,
+  the local “load→timeouts→retries” loop is inseparable from the dead
+  corpus — [details](task/T-280-stage-errors-timeout-split.md).
+- **T-281** [new] — P2, fix crawlerctl domain on production
+  (“domain_info: empty response” for any domain, including live ones;
+  discovered during the 13.11 investigation) —
+  [details](task/T-281-crawlerctl-domain-fix.md).

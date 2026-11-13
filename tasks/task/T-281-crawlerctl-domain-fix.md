@@ -1,40 +1,40 @@
-# T-281: Фикс crawlerctl domain на проде («domain_info: пустой ответ»)
+# T-281: Fix crawlerctl domain on production (“domain_info: empty response”)
 
-- **Приоритет:** P2
-- **Статус:** [новая]
+- **Priority:** P2
+- **Status:** [new]
 
-## Контекст и симптомы
+## Context and symptoms
 
-- На проде `crawlerctl domain <имя> [--json]` отвечает
-  «domain_info: пустой ответ» для любого домена — включая заведомо
-  живой ya.ru. Обнаружено 13.11.2026 при исследовании temp_error
-  (выборочную проверку доменов пришлось вести через psql + curl).
-- Остальные read-команды crawlerctl на проде работают (`status`,
-  `zones`) — ломается именно путь domain_info: кандидат-причины —
-  RPC-ручка/сокет/формат ответа/права, либо обращение к сервису,
-  которого на проде нет (юнит/порт).
+- On production `crawlerctl domain <name> [--json]` answers
+  “domain_info: empty response” for any domain — including the known-alive
+  ya.ru. Discovered 13.11.2026 during the temp_error investigation (the
+  spot checks of the domains had to go through psql + curl).
+- The other crawlerctl read commands work on production (`status`,
+  `zones`) — it is exactly the domain_info path that breaks: the candidate
+  causes — the RPC handle/socket/response format/permissions, or a call to
+  a service that does not exist on production (unit/port).
 
-## Корневая причина
+## Root cause
 
-Не установлена (в задаче: воспроизвести и локализовать).
+Not established (in the task: reproduce and localize).
 
-## Требования
+## Requirements
 
-1. Воспроизвести на проде и на дев-стенде; локализовать точку
-   отказа (клиент ↔ сервис, какой сервис владеет domain_info).
-2. Починить; покрыть тестом обе стороны (клиентская обработка
-   пустого ответа не маскирует ошибку).
-3. Прогнать остальные read-команды crawlerctl на проде (subdomains,
-   zones, reanalyze dry-режимы, если есть) — убедиться, что класс
-   дефекта один и он не размазан по командам.
+1. Reproduce on production and on the dev bench; localize the failure
+   point (the client ↔ the service, which service owns domain_info).
+2. Fix it; cover both sides with a test (the client's handling of an empty
+   response does not mask the error).
+3. Run the other crawlerctl read commands on production (subdomains,
+   zones, the reanalyze dry modes, if any) — make sure the defect class is
+   a single one and is not smeared across the commands.
 
-## Критерии приёмки
+## Acceptance criteria
 
-- `crawlerctl domain ya.ru --json` на проде возвращает данные;
-  для несуществующего домена — осмысленный ответ (не «пустой»).
-- `make test` + `make lint` зелёные.
+- `crawlerctl domain ya.ru --json` on production returns data; for a
+  non-existent domain — a meaningful response (not “empty”).
+- `make test` + `make lint` green.
 
-## Ссылки
+## References
 
-- ТЗ 5.11 (crawlerctl domain)
-- Исследование temp_error 13.11.2026 (место обнаружения)
+- Spec §5.11 (crawlerctl domain)
+- The temp_error investigation of 13.11.2026 (the discovery site)

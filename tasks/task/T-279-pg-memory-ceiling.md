@@ -1,58 +1,58 @@
-# T-279: Потолок памяти PostgreSQL против OOM-киллов
+# T-279: A PostgreSQL memory cap against the OOM kills
 
-- **Приоритет:** P1
-- **Статус:** [новая]
+- **Priority:** P1
+- **Status:** [new]
 
-## Контекст и симптомы
+## Context and symptoms
 
-- Серия memcg OOM-киллов бэкенда postgres при полном фронте
-  (CONSTRAINT_MEMCG, cgroup postgresql@16-main): 11.11 21:10,
-  12.11 03:14, 13.11 02:32 — интервал ~4–5 ч. Каждый раз лечение —
-  спокойное окно §4.6 (симптоматическое; 13.11 окно прошло штатно,
-  фронт поднят стражем через 39 мин).
-- PG — главный потребитель RAM сервера (4 vCPU / 8 ГиБ): бэкенды
-  250–890 МБ RSS, top swap-потребители тоже postgres; available
-  опускается до ~1.2 Ги, swap 2–3 Ги, свопинг до 76 МБ/с.
-- Текущий конфиг PG: shared_buffers = 2 ГБ, work_mem = 16 МБ
-  (× сортировки в каждом бэкенде), maintenance_work_mem = 256 МБ,
-  30+ соединений в пиках.
-- Паттерн килла: «длинный retention/аналитический SELECT + полный
-  фронт» (см. красные флаги скилла prod-report).
+- A series of memcg OOM kills of the postgres backend at full front
+  (CONSTRAINT_MEMCG, the postgresql@16-main cgroup): 11.11 21:10,
+  12.11 03:14, 13.11 02:32 — a ~4–5 h interval. Each time the treatment is
+  the §4.6 quiet window (symptomatic; the 13.11 window went through
+  normally, the front was re-raised by the watchdog after 39 min).
+- PG is the server's main RAM consumer (4 vCPU / 8 GiB): backends at
+  250–890 MB RSS, the top swap consumers are postgres too; available drops
+  to ~1.2 GiB, swap 2–3 GiB, swapping up to 76 MB/s.
+- The current PG config: shared_buffers = 2 GB, work_mem = 16 MB
+  (× the sorts in every backend), maintenance_work_mem = 256 MB,
+  30+ connections at the peaks.
+- The kill pattern: “a long retention/analytics SELECT + a full front”
+  (see the red flags of the prod-report skill).
 
-## Корневая причина
+## Root cause
 
-Суммарный footprint PG (shared_buffers + бэкенды × work_mem +
-maintenance_work_mem) упирается в cgroup-лимит юнита при пиковых
-запросах; лимит/конфиг не сбалансированы с бюджетом VM
-(http-worker ~0.7 Ги, unbound ~0.7 Ги, chromium + движки ~1 Ги,
-ОС и кэши — остальное).
+The total PG footprint (shared_buffers + the backends × work_mem +
+maintenance_work_mem) hits the unit's cgroup limit under peak queries; the
+limit/config are not balanced against the VM budget
+(http-worker ~0.7 GiB, unbound ~0.7 GiB, chromium + the engines ~1 GiB,
+the OS and the caches — the rest).
 
-## Требования
+## Requirements
 
-1. Аудит: фактический лимит cgroup юнита, наблюдаемые пики RSS PG,
-   число/тип соединений и тяжёлых запросов в пиках.
-2. Выбрать и провести один путь (или комбинацию):
-   - ужать work_mem / maintenance_work_mem / ограничить
-     max_connections и пулы соединений приложений;
-   - пересмотреть shared_buffers под реальный рабочий набор;
-   - пересмотреть memcg-лимит с явным бюджетом VM.
-3. Изменения — конфигом/деплоем, с замером скорости конвейера
-   (дом/с) до и после; откат — тем же изменением.
-4. Обновить docs/db.md и бюджет памяти в docs/load-measurements.md.
+1. An audit: the actual cgroup limit of the unit, the observed PG RSS peaks,
+   the number/types of the connections and heavy queries at the peaks.
+2. Choose and carry out one path (or a combination):
+   - tighten work_mem / maintenance_work_mem / cap max_connections and the
+     applications' connection pools;
+   - revisit shared_buffers for the real working set;
+   - revisit the memcg limit with an explicit VM budget.
+3. The changes — via config/deploy, with a pipeline-speed measurement
+   (domains/s) before and after; the rollback — the same change.
+4. Update docs/db.md and the memory budget in docs/load-measurements.md.
 
-## Критерии приёмки
+## Acceptance criteria
 
-- 24–48 ч непрерывного полного фронта без OOM-киллов PG
-  (watch-тики: «OOM 0»), без ручных спокойных окон.
-- available в пиках не ниже ~1.2 Ги; свопинг не имеет постоянного
-  характера (vmstat si/so).
-- Темп конвейера (дом/с) не хуже −10 % от базового.
-- `make test` + `make lint` зелёные; `make test-integration`, если
-  тронуты тестбед/конфиги окружения.
+- 24–48 h of continuous full front without PG OOM kills (watch ticks:
+  “OOM 0”), without manual quiet windows.
+- available at the peaks not below ~1.2 GiB; the swapping is not of a
+  permanent nature (vmstat si/so).
+- The pipeline pace (domains/s) no worse than −10% of the baseline.
+- `make test` + `make lint` green; `make test-integration` if the testbed/
+  environment configs are touched.
 
-## Ссылки
+## References
 
 - docs/db.md, docs/operations.md §4.6, docs/load-measurements.md
 - prod-reports/2026-11-11-051557.md, 2026-11-12-110746.md,
-  2026-11-12-165812.md (хронология киллов и окон)
-- T-278 (снижение повторной нагрузки — смежный рычаг)
+  2026-11-12-165812.md (the chronology of the kills and windows)
+- T-278 (reducing the repeated load — a related lever)

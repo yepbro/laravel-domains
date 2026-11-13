@@ -1,50 +1,51 @@
-# T-280: Разделить метрику timeout HTTP-стадии (connect/tls/tarpit/ctx-в-очереди)
+# T-280: Split the HTTP-stage timeout metric (connect/tls/tarpit/ctx-in-queue)
 
-- **Приоритет:** P2
-- **Статус:** [новая]
+- **Priority:** P2
+- **Status:** [new]
 
-## Контекст и симптомы
+## Context and symptoms
 
-- 92,7 % ошибок HTTP-стадии — один счётчик
-  `crawler_stage_errors_total{type="timeout"}`: в нём смешаны
-  - удалённые отказы (connect timeout, tarpit — свойство мёртвого
-    корпуса),
-  - самоинфлицированные (ctx истёк в ожидании per-IP семафора:
-    код-путь ctx.Err → DeadlineExceeded → ErrTimeout подтверждён).
-- Исследование 13.11: per-IP парковка — 30 % ожиданий >2 с (норма
-  T-165 <5 %), 21 % >30 с. Пер-чек ошибки в журнал не пишутся —
-  только агрегат, поэтому долю локальной петли (A) против мёртвого
-  корпуса (B) измерить нельзя.
+- 92.7% of the HTTP-stage errors are a single counter
+  `crawler_stage_errors_total{type="timeout"}`: it mixes
+  - the remote failures (a connect timeout, a tarpit — a property of the
+    dead corpus),
+  - the self-inflicted ones (the ctx expired while waiting for the per-IP
+    semaphore: the code path ctx.Err → DeadlineExceeded → ErrTimeout is
+    confirmed).
+- The 13.11 investigation: per-IP parking — 30% of the waits >2 s (the
+  T-165 norm <5%), 21% >30 s. Per-check errors are not written to the
+  journal — only the aggregate, so the share of the local loop (A) against
+  the dead corpus (B) cannot be measured.
 
-## Корневая причина
+## Root cause
 
-Классификация причины таймаута не доносится до метрик: одна серия
-на все механизмы, у которых разные владельцы (сеть/корпус vs
-наша очередь per-IP).
+The timeout-cause classification does not reach the metrics: one series for
+all the mechanisms whose owners are different (the network/corpus vs our
+per-IP queue).
 
-## Требования
+## Requirements
 
-1. Ввести reason-лейбл (или отдельные series):
+1. Introduce a reason label (or separate series):
    connect_timeout / tls_timeout / tarpit / ctx_expired_in_queue.
-2. Классифицировать в месте возникновения ошибки (не пост-фактум
-   по строке).
-3. Обратная совместимость чтения: старая серия `type="timeout"`
-   либо остаётся суммой, либо помечается deprecated в доках.
-4. Обновить документацию метрик (словарь) и, при необходимости,
-   панель дашборда HTTP-стадии.
+2. Classify at the point where the error arises (not post-factum by a
+   string).
+3. Read compatibility: the old `type="timeout"` series either stays the sum
+   or is marked deprecated in the docs.
+4. Update the metrics documentation (the dictionary) and, if needed, the
+   dashboard panel of the HTTP stage.
 
-## Критерии приёмки
+## Acceptance criteria
 
-- /metrics отдаёт раздельные счётчики; после деплоя на проде виден
-  реальный расклад причин (ожидаемо: tarpit/connect — большинство,
-  ctx-в-очереди — единицы процентов вне штормов).
-- Watch-отчёты могут считать баланс A/B по диффам счётчиков.
-- `make test` + `make lint` зелёные (+ `make test-race` для
-  render/httpworker по правилам Makefile).
+- /metrics exposes the split counters; after the deploy the real cause
+  breakdown is visible on production (expected: tarpit/connect — the
+  majority, ctx-in-queue — single-digit percents outside the storms).
+- The watch reports can compute the A/B balance by the counter diffs.
+- `make test` + `make lint` green (+ `make test-race` for
+  render/httpworker per the Makefile rules).
 
-## Ссылки
+## References
 
-- Исследование temp_error 13.11.2026 (отчёт субагента, сессия
-  основной сессии; выжимка в T-278)
-- T-165 (per-IP семафоры и их норма <5 % ожиданий >2 с),
-  T-148 (tarpit), T-278 (backoff ретраев — потребитель метрики)
+- The temp_error investigation of 13.11.2026 (a subagent report, the main
+  session's session; the digest in T-278)
+- T-165 (the per-IP semaphores and their norm of <5% of the waits >2 s),
+  T-148 (tarpit), T-278 (the retry backoff — the metric's consumer)
