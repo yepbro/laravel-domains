@@ -338,8 +338,8 @@ AGENTS.md (отдельный worktree, ревью по схеме, один к�
 
 | № | Статус | Где | Что | Зависимости |
 |---|---|---|---|---|
-| L-01 | [in progress] | ld-landing | приватный репо ld-landing на **GitHub** + описание; каркас монорепо (vite-ssg + TS + весь тулинг §8); README.md; Makefile §9; пустая страница-заглушка | — |
-| L-02 | [new] | ld-landing | Перенос лендинга: index.vue 1:1, компоненты (§6), словари ru/en из `i18n.go`, Metrika, seo.ts (canonical/hreflang/OG), sitemap/robots; мок API в dev | L-01 |
+| L-01 | [done] | ld-landing | Каркас готов: github.com/yepbro/ld-landing (private, main, 4 коммита), make check/build/build-all/verify/e2e зелёные | — |
+| L-02 | [in progress] | ld-landing | Перенос лендинга: index.vue 1:1, компоненты (§6), словари ru/en из `i18n.go`, Metrika, seo.ts (canonical/hreflang/OG), sitemap/robots; мок API в dev | L-01 |
 | L-03 | [done] | laravel-domains | `GET /api/v1/landing/stats` (§7.1) — слит в master (3911ece), ревью P2/P3-фиксы применены | — (параллельно L-01/L-02) |
 | L-04 | [new] | laravel-domains | CORS для `/api/*` (§7.2) | L-03 (обе в `internal/web`) |
 | L-05 | [new] | ld-landing | targets.yaml, `make deploy/rollback`, verify-скрипт, e2e; проверка на моках | L-02, L-03, L-04 |
