@@ -23,10 +23,11 @@ Prod is the project's only production server; the deploy is native systemd
    IPs or passwords.
 4. All heavy queries (psql, two queue snapshots) are gentle anyway: one
    `collect.sh` run ≈ 25–30 s. Do not run it more often than necessary.
-5. **The standing watch mode (section below) may extend these rules by an
-   explicit user grant** to stop/start `crawler-scheduler` — and only it,
-   only within the criteria of that section. Rule 2 ("ask, do not fix")
-   applies unless the grant covers the situation.
+5. **In the standing watch mode (section below) stop/start of
+   `crawler-scheduler` is allowed by default** — and only it, only within
+   the criteria of that section's autonomy table; an explicit user
+   prohibition overrides the default. Rule 2 ("ask, do not fix") applies
+   outside those criteria.
 
 ## Procedure
 
@@ -54,7 +55,15 @@ Prod is the project's only production server; the deploy is native systemd
    `prod-reports/` directory already exists in the repo root and is
    entirely ignored by git (it has its own `.gitignore`)
    — the reports are local and never reach commits.
-6. Finish with a question about further actions.
+6. **Новые проблемные места → предложить дополнять правила standing
+   watch.** Если в полном отчёте обнаружен симптом/аномалия, которую
+   проверки standing watch ещё не видят (проверки `hourly-snap.sh`,
+   таблица красных флагов, критерии автономии) — в рекомендации предложить
+   добавить её туда: новой проверкой в `hourly-snap.sh` и/или строкой
+   красных флагов (прецедент — 12.11.2026: доля temp_error, долгий
+   PG-запрос, свопинг si/so, WARN-серия, /var/log/postgresql — все пять
+   тогда добавлены). Без правки файлов до согласия пользователя.
+7. Finish with a question about further actions.
 
 ## Standing watch (continuous monitoring)
 
@@ -63,20 +72,30 @@ hour", "every 20 minutes") — usually with a grant to decide on stopping/
 starting the queue (`crawler-scheduler`). One-off report rules stay for
 one-off reports; this section adds the loop and the autonomy.
 
+**Defaults:** если период не указан — **1 час**. Если не указано, можно ли
+останавливать/запускать `crawler-scheduler`, — по умолчанию **можно**
+(автономия только по таблице критериев ниже). Явное указание пользователя
+перекрывает оба умолчания.
+
 ### Procedure
 
 1. Baseline snapshot right away:
    `<base-dir>/scripts/hourly-snap.sh` — a light diff-grade snapshot
-   (~15–20 s, no double queue cuts; collect.sh stays for one-off reports).
-2. Background timer per the requested period:
-   `sleep <N> && <base-dir>/scripts/hourly-snap.sh`. On each tick:
-   analyze → decide (criteria below) → post a compact diff-report →
-   relaunch the timer.
-3. Quiet-hour format: a 5–6 row diff table (load / PG OOM / checks rate /
-   retention cursor / disk+content / queue depths) + "no action
-   required". Do NOT write hourly files into `prod-reports/` — full
-   reports and files only on anomalies, actions taken, and the final
-   summary of the watch.
+   (~20–30 s, no double queue cuts; collect.sh stays for one-off reports).
+2. Background timer per the requested period (default 3600 s if the user
+   did not name one): `sleep <N> && <base-dir>/scripts/hourly-snap.sh`.
+   On each tick: analyze → decide (criteria below) → post a compact
+   diff-report → relaunch the timer.
+3. Quiet-hour format: a 5–6 row diff table (load+swap вкл. si/so / PG
+   OOM-киллы + WARN-серия http-worker / checks rate + доля temp_error /
+   retention: курсор+errors+долгий PG-запрос / очереди: глубины +
+   render-долг (lag+render_pending) + q:dead / диск+контент
+   +/var/log/postgresql) + "no action required". Do NOT write hourly
+   files into `prod-reports/` — full reports and files only on anomalies,
+   actions taken, and the final summary of the watch. The light snapshot
+   does NOT compute queue rates (no double cuts): if a depth grows
+   between ticks (в первую очередь q:http) — снять rates повторным
+   `collect.sh` (это и есть inflow > consumption из красных флагов).
 4. Any prod action — with a one-line justification in the report.
 
 ### Autonomy criteria (only under an explicit user grant)
@@ -143,8 +162,8 @@ holding → re-arm the guard).
 
 | Flag | Threshold / sign | Where to dig |
 |---|---|---|
-| Load | ≥ 2× vCPU (8) sustained | Top CPU: `headless-shell`/`postgres` in rendering — normal (baseline measurements — docs/load-measurements.md); after the 35/36 deploy — also the moli/lightpanda engines (budget ≤1 GB each) and worker B (+256M, a second headless-shell — see the "Render engines and fallback" section) — also normal; an anomaly is an unfamiliar process |
-| Memory | swap occupied and growing | `postgres` with a large RSS, chromium copies; unit MemoryHigh |
+| Load | ≥ 2× vCPU (4) sustained | Top CPU: `headless-shell`/`postgres` in rendering — normal (baseline measurements — docs/load-measurements.md); after the 35/36 deploy — also the moli/lightpanda engines (budget ≤1 GB each) and worker B (+256M, a second headless-shell — see the "Render engines and fallback" section) — also normal; an anomaly is an unfamiliar process |
+| Memory | swap occupied and growing; активный свопинг (vmstat si/so > 0 постоянного характера) и run queue ≫ vCPU — усиление того же флага | `postgres` with a large RSS, chromium copies; unit MemoryHigh; long retention select + full front (см. флаг PG long query) |
 | Disk `/` | ≥ 85% or < 10 GB free | retention/compaction: the http-worker journal (the "pack compaction pass" line, retention skips), `/var/log` |
 | Queue | lag growing (inflow > consumption) | Is the worker alive (`systemctl`), the render-worker WARN "render tarpit" |
 | q:render | the lag near ~10k (`render.queue_high_watermark`) is not melting | Normal at render_pending > 0: the T-066/T-174 rework pass replenishes the queue from the debt — a jam only at zero consumption; watch the trend via lag + render_pending (see the formulas) |
@@ -158,6 +177,8 @@ holding → re-arm the guard).
 | Logs | journal > 1 GB or syslog growing | Is the spam back? Is the `crawler-chromium.service.d/10-logfilter.conf` drop-in in place? |
 | PG | `n_dead_tup` of contents/subdomain_results — millions | Autovacuum cannot keep up (docs/db.md) |
 | PG OOM kills | ≥1 cgroup OOM kill of postgres per hour with the front active (often a long retention select + full front) | The tight PG memory ceiling (F2, the operations.md journal); a calm window per docs/operations.md §4.6 + scripts/drain-guard.sh; with the persisted cursor (T-274) restarts no longer reset the drain |
+| PG long query | активный запрос в `pg_stat_activity` > ~30 мин при живом фронте (норма retention-прохода в тишине — минуты; исторически под фронтом доживал ~60 мин «впритык») | retention-проход под нагрузкой → свопинг и OOM (см. флаги Memory/PG OOM); WARN-серия http-worker, возраст курсора `retention_drain_cursor`; спокойное окно §4.6 |
+| temp_error share | доля temp_error за сутки > ~50 % (норма 23–40 % по дням 09–11.11.2026) при живом фронте | петля «нагрузка → таймауты → ретраи → нагрузка»: swap/нагрузка, retry_mature, приток q:http > потребления; природу ошибки (timeout vs refused) — по выборке `crawlerctl domain` |
 | scheduler active unexpectedly | active although the operator had stopped it | Deploys restart crawler.target (install) — re-open the stop window after a deploy if it must survive it (docs/operations.md §4.6) |
 
 ## Render engines and fallback (stage 35/36)

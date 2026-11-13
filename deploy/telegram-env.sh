@@ -61,7 +61,7 @@ systemctl restart "$UNIT"
 # we do not fail — the run is yellow on the check below (the text is for the
 # operator), the state is visible in journalctl.
 sleep 5
-if journalctl -u "$UNIT" --since '-2 min' --no-pager | grep -q 'telegram: доставка алертов включена'; then
+if journalctl -u "$UNIT" --since '-2 min' --no-pager | grep -q 'telegram: alert delivery on'; then
     echo "telegram-env: секреты доставлены, доставка включена (журнал monitor)"
 else
     echo "telegram-env: секреты записаны, строка включения в журнале не найдена — проверьте journalctl -u $UNIT" >&2
