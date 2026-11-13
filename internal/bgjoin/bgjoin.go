@@ -76,8 +76,8 @@ func Check(t *testing.T, file string) {
 
 	var (
 		withCancel = token.NoPos // ctx, cancel := context.WithCancel(ctx)
-	ctxName    string        // identifier of the derived ctx (LHS[0])
-	cancelName = "cancel"    // identifier of the cancellation (LHS[1]; the pattern contract)
+		ctxName    string        // identifier of the derived ctx (LHS[0])
+		cancelName = "cancel"    // identifier of the cancellation (LHS[1]; the pattern contract)
 		joinDefer  *ast.DeferStmt
 		waits      int // bg.Wait() in run — exactly one
 		launches   int

@@ -93,9 +93,9 @@ func TestConsumersTriageIdleBoundary(t *testing.T) {
 // DELCONSUMER).
 func TestConsumersTriageXInfoErrors(t *testing.T) {
 	quiet := map[string]error{
-		"redis.Nil":         redis.Nil,
+		"redis.Nil":            redis.Nil,
 		"the no such key text": errors.New("ERR no such key"), // the textual form of the Redis answer
-		"NOGROUP":           errors.New("NOGROUP No such consumer group 'x' for key name 'y'"),
+		"NOGROUP":              errors.New("NOGROUP No such consumer group 'x' for key name 'y'"),
 	}
 	for name, err := range quiet {
 		f := &fakeConsumers{listsErr: map[string]error{StreamHTTP + "|http-worker": err}}

@@ -344,9 +344,9 @@ func TestReRegistrationHistogramBuckets(t *testing.T) {
 	}
 }
 
-	// The parallel registration of same-named metrics and the increments
-	// are safe: the prometheus registry is synchronized, the curried
-	// vectors are thread-safe (a run with -race catches the races).
+// The parallel registration of same-named metrics and the increments
+// are safe: the prometheus registry is synchronized, the curried
+// vectors are thread-safe (a run with -race catches the races).
 func TestConcurrentRegistration(t *testing.T) {
 	reg := New("test-svc")
 	const goroutines = 16

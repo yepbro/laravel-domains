@@ -58,9 +58,9 @@ func TestParseRedisUptimeINFO(t *testing.T) {
 	}
 
 	for name, bad := range map[string]string{
-		"no field":      "# Server\nredis_version:7.0.15\n",
-		"not a number":      "# Server\nuptime_in_seconds:days\n",
-		"negative": "# Server\nuptime_in_seconds:-1\n",
+		"no field":     "# Server\nredis_version:7.0.15\n",
+		"not a number": "# Server\nuptime_in_seconds:days\n",
+		"negative":     "# Server\nuptime_in_seconds:-1\n",
 	} {
 		if _, err := parseRedisUptimeINFO(bad); err == nil {
 			t.Errorf("%s: parse succeeded, want an error", name)

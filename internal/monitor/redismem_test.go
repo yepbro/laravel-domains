@@ -97,12 +97,12 @@ func TestParseRedisMemoryINFO(t *testing.T) {
 	}
 
 	for name, bad := range map[string]string{
-		"no used_memory":       "# Memory\nmaxmemory:1\nmaxmemory_policy:noeviction\n",
-		"no maxmemory":         "# Memory\nused_memory:1\nmaxmemory_policy:noeviction\n",
-		"no policy":          "# Memory\nused_memory:1\nmaxmemory:1\n",
-		"used is not a number":         "# Memory\nused_memory:100M\nmaxmemory:1\nmaxmemory_policy:noeviction\n",
+		"no used_memory":        "# Memory\nmaxmemory:1\nmaxmemory_policy:noeviction\n",
+		"no maxmemory":          "# Memory\nused_memory:1\nmaxmemory_policy:noeviction\n",
+		"no policy":             "# Memory\nused_memory:1\nmaxmemory:1\n",
+		"used is not a number":  "# Memory\nused_memory:100M\nmaxmemory:1\nmaxmemory_policy:noeviction\n",
 		"maxmemory is negative": "# Memory\nused_memory:1\nmaxmemory:-1\nmaxmemory_policy:noeviction\n",
-		"an empty response":          "",
+		"an empty response":     "",
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := parseRedisMemoryINFO(bad); err == nil {

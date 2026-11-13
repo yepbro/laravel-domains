@@ -57,11 +57,11 @@ func TestParseProcStat(t *testing.T) {
 	for name, bad := range map[string]string{
 		"without parentheses":                "1 2 3 4",
 		"without parentheses, enough fields": "a 7 " + strings.Repeat("0 ", 20) + "128",
-		"a tail shorter than i+2":          "1 ()",
-		"an empty name":                "1 () R 7",
-		"too few fields":                "1 (p) R 7 0",
-		"ppid is not a number":             "1 (p) R x " + strings.Repeat("0 ", 20),
-		"rss is not a number":              "1 (p) R 7 " + strings.Repeat("0 ", 19) + "y",
+		"a tail shorter than i+2":            "1 ()",
+		"an empty name":                      "1 () R 7",
+		"too few fields":                     "1 (p) R 7 0",
+		"ppid is not a number":               "1 (p) R x " + strings.Repeat("0 ", 20),
+		"rss is not a number":                "1 (p) R 7 " + strings.Repeat("0 ", 19) + "y",
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, ok := parseProcStat([]byte(bad)); ok {

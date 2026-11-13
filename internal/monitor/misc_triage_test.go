@@ -270,10 +270,10 @@ func TestTelegramNotifierNotMeasuredEpisode(t *testing.T) {
 		return AlertsResult{Alerts: []AlertSnapshot{{Name: AlertQueueDead, Status: status, Detail: detail}}}
 	}
 	n.OnPass(pass(AlertStatusNotMeasured, "Redis not set")) // the "not measured" base
-	n.OnPass(pass(AlertStatusFiring, "depth 5"))           // 🚨
+	n.OnPass(pass(AlertStatusFiring, "depth 5"))            // 🚨
 	n.OnPass(pass(AlertStatusNotMeasured, "drop"))          // an interruption — without a message
-	n.OnPass(pass(AlertStatusOK, "depth 0"))               // ✅
-	n.OnPass(pass(AlertStatusOK, "depth 0"))               // silence
+	n.OnPass(pass(AlertStatusOK, "depth 0"))                // ✅
+	n.OnPass(pass(AlertStatusOK, "depth 0"))                // silence
 	waitForJournal(t, journal, "🚨")
 	waitForJournal(t, journal, "✅")
 	b, err := os.ReadFile(journal)

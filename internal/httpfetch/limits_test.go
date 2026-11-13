@@ -393,9 +393,9 @@ func TestParsePerIPOverrides(t *testing.T) {
 	}
 
 	for name, m := range map[string]map[string]int{
-		"a junk CIDR":  {"195.208.0.0.1/16": 8},
-		"a limit below 1": {"195.208.0.0/16": 0},
-		"a duplicate network":     {"195.208.0.0/16": 8, "195.208.9.9/16": 12},
+		"a junk CIDR":         {"195.208.0.0.1/16": 8},
+		"a limit below 1":     {"195.208.0.0/16": 0},
+		"a duplicate network": {"195.208.0.0/16": 8, "195.208.9.9/16": 12},
 	} {
 		if _, err := parsePerIPOverrides(m); err == nil {
 			t.Errorf("%s: a parse error expected", name)

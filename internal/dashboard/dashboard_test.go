@@ -149,7 +149,7 @@ func TestNewCredentials(t *testing.T) {
 	}{
 		{"an empty name", "", valid, "the username is empty"},
 		{"an empty hash", testUser, "", "password_hash is empty"},
-		{"both empty", "", "", "the username is empty"},                        // the name is checked first
+		{"both empty", "", "", "the username is empty"},                 // the name is checked first
 		{"a name with a colon", "op:erator", valid, "must not contain"}, // Basic splits at the first ":" — a login would be impossible
 		{"junk instead of a hash", testUser, " plaintext ", "password_hash: "},
 		{"a hash without the scheme", testUser, "sha256$1000$c2FsdA==$a2V5", "password_hash: "},

@@ -140,8 +140,8 @@ func TestBlockResourceType(t *testing.T) {
 		types []network.ResourceType
 		want  map[network.ResourceType]bool
 	}{
-		"without the option (T-062)":        {blockTypes(false), baseWant},
-		"block_stylesheet (T-213)": {blockTypes(true), cssWant},
+		"without the option (T-062)": {blockTypes(false), baseWant},
+		"block_stylesheet (T-213)":   {blockTypes(true), cssWant},
 	} {
 		t.Run(name, func(t *testing.T) {
 			for _, rt := range all {
@@ -191,8 +191,8 @@ func TestBlockTypes(t *testing.T) {
 // The tracker domain patterns (T-214) — a separate TestBlockPatternsTrackers.
 func TestBlockPatterns(t *testing.T) {
 	for name, types := range map[string][]network.ResourceType{
-		"without the option (T-062)":        blockTypes(false),
-		"block_stylesheet (T-213)": blockTypes(true),
+		"without the option (T-062)": blockTypes(false),
+		"block_stylesheet (T-213)":   blockTypes(true),
 	} {
 		t.Run(name, func(t *testing.T) {
 			patterns := blockPatterns(types, false, false)
@@ -262,8 +262,8 @@ func TestBlockPatternsTrackers(t *testing.T) {
 	}
 
 	for name, types := range map[string][]network.ResourceType{
-		"without the option (T-062)":        blockTypes(false),
-		"block_stylesheet (T-213)": blockTypes(true),
+		"without the option (T-062)": blockTypes(false),
+		"block_stylesheet (T-213)":   blockTypes(true),
 	} {
 		t.Run("off: "+name, func(t *testing.T) {
 			off := blockPatterns(types, false, false)

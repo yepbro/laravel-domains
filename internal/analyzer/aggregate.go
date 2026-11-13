@@ -273,10 +273,10 @@ func aggregateDomain(ctx context.Context, tx pgx.Tx, zoneID int16, domainID int6
 func aggregateShiftZoneLaravel(ctx context.Context, tx pgx.Tx, zoneID int16, delta int64) error {
 	tag, err := tx.Exec(ctx, aggregateZoneLaravelSQL, delta, zoneID)
 	if err != nil {
-		return fmt.Errorf("Laravel zone counter: %w", err)
+		return fmt.Errorf("laravel zone counter: %w", err)
 	}
 	if tag.RowsAffected() != 1 {
-		return fmt.Errorf("Laravel zone counter: %d rows affected (zone row %d is required)", tag.RowsAffected(), zoneID)
+		return fmt.Errorf("laravel zone counter: %d rows affected (zone row %d is required)", tag.RowsAffected(), zoneID)
 	}
 	return nil
 }

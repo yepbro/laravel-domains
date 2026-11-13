@@ -1303,7 +1303,7 @@ func TestZoneStatsLoopTickerDriftWarn(t *testing.T) {
 	log := slogBuf.String()
 	for _, want := range []string{
 		"counter reconciliation loop", // the start
-		"level=WARN", // the second pass's drift
+		"level=WARN",                  // the second pass's drift
 		"positions", "sum_abs",
 		"zone:7:pending: 4 → 5",
 		"global:render_pending: 5 → 6",

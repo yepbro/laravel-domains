@@ -787,7 +787,7 @@ func TestAggregate_Counters(t *testing.T) {
 	// fails loudly — silent drift is unacceptable.
 	f.pool.zoneNoRow = true
 	f.pool.seedResult(anKey, anHeaders(t), anCookies(t, "XSRF-TOKEN", "laravel_session"), laravelHash[:])
-	if _, err := f.w.ProcessResult(ctx, anTask); err == nil || !strings.Contains(err.Error(), "Laravel zone counter") {
+	if _, err := f.w.ProcessResult(ctx, anTask); err == nil || !strings.Contains(err.Error(), "laravel zone counter") {
 		t.Fatalf("missing zone row: err = %v, want a zone counter error", err)
 	}
 	f.pool.zoneNoRow = false

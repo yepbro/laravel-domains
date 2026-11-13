@@ -273,7 +273,7 @@ func TestRenderCountersAdd(t *testing.T) {
 		{Name: fbConsumedMetric, Labels: map[string]string{"result": "rendered"}, Value: 2}, // 3
 		{Name: stageTasksMetric, Labels: map[string]string{"stage": "render"}, Value: 40},
 		{Name: stageTasksMetric, Labels: map[string]string{"stage": "http"}, Value: 999}, // a foreign stage
-		{Name: processRSSMetric, Labels: nil, Value: 123},                               // → the moli engine
+		{Name: processRSSMetric, Labels: nil, Value: 123},                                // → the moli engine
 	})
 	// A second exposure of the same engine (a second worker): the RSS
 	// and the other cumulatives are summed across exposures.

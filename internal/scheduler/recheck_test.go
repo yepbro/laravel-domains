@@ -363,7 +363,7 @@ func TestRecheckDailyLoop(t *testing.T) {
 	log := buf.String()
 	for _, want := range []string{
 		"daily domain recheck", // the start
-		"level=WARN", // a drain error did not kill the loop
+		"level=WARN",           // a drain error did not kill the loop
 		"db unavailable",
 		fmt.Sprintf("domains=%d", DefaultRecheckBatch+3), // the drain outcome
 	} {

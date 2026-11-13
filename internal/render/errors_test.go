@@ -76,9 +76,9 @@ func TestLoadErrorCode(t *testing.T) {
 		t.Errorf("LoadErrorCode through the wrappers = %q", got)
 	}
 	for name, err := range map[string]error{
-		"no error":            nil,
-		"not a load error":    errors.New("page timeout"),
-		"a load marker":       chromedp.ErrPageLoad,
+		"no error":                  nil,
+		"not a load error":          errors.New("page timeout"),
+		"a load marker":             chromedp.ErrPageLoad,
 		"an error of another class": &Error{Class: ClassBrowser, Err: errors.New("canceled")},
 	} {
 		if got := LoadErrorCode(err); got != "" {

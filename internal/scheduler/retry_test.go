@@ -1424,9 +1424,9 @@ func TestRetryTempErrorsLoop(t *testing.T) {
 	log := buf.String()
 	for _, want := range []string{
 		"background temp_error rechecks", // the start
-		"temp_error recheck drain",  // the first drain's outcome
-		"requeued=1",    // the pass counters
-		"db unavailable", // the second pass's error
+		"temp_error recheck drain",       // the first drain's outcome
+		"requeued=1",                     // the pass counters
+		"db unavailable",                 // the second pass's error
 	} {
 		if !strings.Contains(log, want) {
 			t.Errorf("log does not contain %q:\n%s", want, log)

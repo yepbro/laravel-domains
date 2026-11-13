@@ -735,8 +735,8 @@ func TestCompactScanValidation(t *testing.T) {
 
 	for name, mutate := range map[string]func(){
 		"a block past the end of the file": func() { pool.contents[h].off = row.off + 1<<20 },
-		"the offset in the header": func() { pool.contents[h].off = 4 },
-		"a foreign length prefix":  func() { pool.contents[h].clen = row.clen + 1 },
+		"the offset in the header":         func() { pool.contents[h].off = 4 },
+		"a foreign length prefix":          func() { pool.contents[h].clen = row.clen + 1 },
 	} {
 		t.Run(name, func(t *testing.T) {
 			pool.contents[h].off, pool.contents[h].clen = row.off, row.clen

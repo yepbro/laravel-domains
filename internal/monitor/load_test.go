@@ -259,10 +259,10 @@ func TestLoadReportLoop_OnePass(t *testing.T) {
 	}
 	r := reports[0]
 	for _, want := range []string{
-		"📊 Load: CPU n/a",           // no delta — the base
-		"🧮 CPU top: n/a",                // the process rates are also a delta
+		"📊 Load: CPU n/a",                 // no delta — the base
+		"🧮 CPU top: n/a",                  // the process rates are also a delta
 		"headless-shell 2.0GiB (2 procs)", // the memory top is full right away
-		"💾 RAM: used 5.4 of 7.6 GiB",  // 7973728−2359296 KiB
+		"💾 RAM: used 5.4 of 7.6 GiB",      // 7973728−2359296 KiB
 		"swap 198 MiB",
 		"📀 Disk /var/lib/crawler/content: free 44 of 79 GiB (56%)",
 		"📬 Queues: q:dns 121 · q:render 116320", // backlogs without deltas

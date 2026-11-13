@@ -84,9 +84,9 @@ func TestParseZoneList(t *testing.T) {
 func TestParseZoneListVersion(t *testing.T) {
 	cases := map[string]string{
 		"# Version 2026101900, Last Updated Sun Oct 19 07:07:01 2026 UTC": "2026101900",
-		"# Version 42":  "42",
+		"# Version 42":    "42",
 		"# a custom list": "a custom list", // a non-version comment — in full
-		"#":             "",
+		"#":               "",
 	}
 	for comment, want := range cases {
 		src := comment + "\nCOM\nORG\n"
@@ -132,7 +132,7 @@ func TestParseZoneListGarbageLine(t *testing.T) {
 
 func TestParseZoneListNoZones(t *testing.T) {
 	for name, src := range map[string]string{
-		"an empty file":          "",
+		"an empty file":    "",
 		"a comment only":   "# Version 1\n",
 		"empty lines only": "\n\n",
 	} {

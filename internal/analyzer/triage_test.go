@@ -130,7 +130,7 @@ func TestAggregateZoneCounterErrors(t *testing.T) {
 	f.pool.seedResult(anKey, anHeaders(t), anCookies(t, "XSRF-TOKEN", "laravel_session"), hash[:])
 	f.pool.zoneLaravelErr = errors.New("zone: boom")
 	_, err := f.w.ProcessResult(context.Background(), anTask)
-	if err == nil || !strings.Contains(err.Error(), "Laravel zone counter") ||
+	if err == nil || !strings.Contains(err.Error(), "laravel zone counter") ||
 		!strings.Contains(err.Error(), "zone: boom") {
 		t.Errorf("the zone delta failure = %v, want the zone counter context and the original", err)
 	}

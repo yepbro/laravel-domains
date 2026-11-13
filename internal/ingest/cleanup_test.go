@@ -778,14 +778,14 @@ func TestCleanupDeletedLoop(t *testing.T) {
 	log := buf.String()
 	for _, want := range []string{
 		"the deleted-domains background cleanup", // start
-		"the deleted-domains cleanup pass",  // the first pass's result
-		"domains=1",                 // pass counters
-		"malformed content_hash", // poison pill — a Warn (ING-P2-4)
-		"db unavailable",             // the second pass's error
-		"orphaned staging rows were deleted", // the cleanup: a Warn with the row count (T-098)
-		"rows=5",                               // the cleanup counter
-		"older_than=" + StaleBatchAge.String(), // the age threshold
-		"purging orphaned staging batches", // the cleanup error — a Warn, the loop is alive
+		"the deleted-domains cleanup pass",       // the first pass's result
+		"domains=1",                              // pass counters
+		"malformed content_hash",                 // poison pill — a Warn (ING-P2-4)
+		"db unavailable",                         // the second pass's error
+		"orphaned staging rows were deleted",     // the cleanup: a Warn with the row count (T-098)
+		"rows=5",                                 // the cleanup counter
+		"older_than=" + StaleBatchAge.String(),   // the age threshold
+		"purging orphaned staging batches",       // the cleanup error — a Warn, the loop is alive
 	} {
 		if !strings.Contains(log, want) {
 			t.Errorf("the log does not contain %q:\n%s", want, log)
