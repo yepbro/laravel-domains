@@ -141,13 +141,13 @@ jobs:
       # The step fails the run on partial success (the units are not all
       # active / the rollback failed): pick() in the notification names
       # healthcheck as the failure root, the rollback details are in the
-      # "Откат: …" line.
+      # "Rollback: …" line.
       - name: Rollback (on healthcheck failure)
         id: rollback
         # Only a confirmed check failure (rc=1): 255 (the ssh transport)
         # and 2 (a script parse failure) mean the check did not complete —
         # the state is unknown, the rollback is not started (the
-        # notification reports "откат неизвестен").
+        # notification reports "rollback unknown").
         if: failure() && steps.healthcheck.outcome == 'failure' && steps.healthcheck.outputs.rc == '1'
         run: |
           set +e
@@ -156,13 +156,13 @@ jobs:
           set -e
           echo "rc=$rc" >> "$GITHUB_OUTPUT"
           case "$rc" in
-            0)   result=performed;           note='откат выполнен, все юниты active' ;;
-            1)   result=performed-degraded;  note='откат выполнен, но не все юниты active' ;;
-            3)   result=failed;              note='откат не удался — требуется оператор' ;;
-            4)   result=nothing-to-rollback; note='bin.prev отсутствует — откатывать нечего' ;;
-            255) result=unknown;             note='ssh-транспорт (rc=255) — состояние сервера неизвестно' ;;
-            2)   result=unknown;             note='скрипт не выполнился (bash rc=2) — состояние сервера неизвестно' ;;
-            *)   result=failed;              note="неожидаемый код $rc" ;;
+            0)   result=performed;           note='rollback performed, all units active' ;;
+            1)   result=performed-degraded;  note='rollback performed, but not all units are active' ;;
+            3)   result=failed;              note='rollback failed — an operator is required' ;;
+            4)   result=nothing-to-rollback; note='bin.prev is missing — nothing to roll back' ;;
+            255) result=unknown;             note='ssh transport (rc=255) — the server state is unknown' ;;
+            2)   result=unknown;             note='the script did not run (bash rc=2) — the server state is unknown' ;;
+            *)   result=failed;              note="unexpected code $rc" ;;
           esac
           echo "result=$result" >> "$GITHUB_OUTPUT"
           echo "rollback: $note"
@@ -211,12 +211,12 @@ jobs:
           JOB_STATUS: ${{ job.status }}
         run: |
           status=fail
-          event="Деплой не успешен"
+          event="Deploy failed"
           if [ "$JOB_STATUS" = success ]; then
             status=ok
-            event="Деплой успешен"
+            event="Deploy succeeded"
           elif [ "$JOB_STATUS" = cancelled ]; then
-            event="Деплой не успешен (ран отменён)"
+            event="Deploy failed (run cancelled)"
           fi
           # The step names below must be kept in sync with the name: of the
           # steps above.

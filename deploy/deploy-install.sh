@@ -47,21 +47,21 @@ rollback_rc=0
 # start-limit of units that hit it in the crash loop of the broken version —
 # without it the restart may be refused.
 rollback() {
-    echo "ОТКАТ: восстанавливаю $BACKUP -> $BIN_DIR" >&2
+    echo "ROLLBACK: restoring $BACKUP -> $BIN_DIR" >&2
     ok=0
     if rb="$(mktemp -d "${BIN_DIR}.rollback.XXXXXX")"; then
         if rmdir "$rb" && cp -a "$BACKUP" "$rb" && rm -rf "$BIN_DIR" && mv "$rb" "$BIN_DIR"; then
             ok=1
         else
             rm -rf "$rb" || true
-            echo "ОТКАТ: восстановление не удалось — проверьте $BIN_DIR" >&2
+            echo "ROLLBACK: the restore failed — check $BIN_DIR" >&2
         fi
     else
-        echo "ОТКАТ: не создать временный каталог рядом с $BIN_DIR — $BIN_DIR не тронут" >&2
+        echo "ROLLBACK: cannot create a temp directory next to $BIN_DIR — $BIN_DIR is untouched" >&2
     fi
     systemctl reset-failed 'crawler-*' 2>/dev/null || true
     if ! systemctl restart crawler.target; then
-        echo "ОТКАТ: рестарт набора вернул ошибку — требуется оператор" >&2
+        echo "ROLLBACK: the set restart returned an error — an operator is required" >&2
         if [ "$ok" = 1 ]; then rollback_rc=5; else rollback_rc=6; fi
         return 0
     fi
@@ -86,12 +86,12 @@ rollback() {
         fi
         state=$(systemctl is-active "$u" 2>/dev/null || true)
         if [ "$state" != active ]; then
-            echo "юнит $u после отката: $state" >&2
+            echo "unit $u after the rollback: $state" >&2
             degraded=1
         fi
     done
     if [ "$degraded" -ne 0 ]; then
-        echo "ОТКАТ: выполнен, но не все юниты active — требуется оператор" >&2
+        echo "ROLLBACK: performed, but not all units are active — an operator is required" >&2
         rollback_rc=5
     fi
     return 0
@@ -110,12 +110,12 @@ on_exit() {
             # there is nothing to roll back to (bin.prev holds version N-1;
             # a rollback would downgrade the live N) — bring the set back
             # on the same version.
-            echo "СБОЙ до построения бэкапа — $BIN_DIR не тронут, стартую набор" >&2
+            echo "FAILURE before the backup was built — $BIN_DIR is untouched, starting the set" >&2
             systemctl reset-failed 'crawler-*' 2>/dev/null || true
             if systemctl start crawler.target; then
                 rc=7
             else
-                echo "старт набора не удался — состояние сервера требует оператора" >&2
+                echo "the set start failed — the server state needs an operator" >&2
                 rc=8
             fi
         fi
@@ -123,11 +123,11 @@ on_exit() {
     exit "$rc"
 }
 
-[ -f "$ARCHIVE" ] || { echo "ОШИБКА: нет архива $ARCHIVE" >&2; exit 4; }
+[ -f "$ARCHIVE" ] || { echo "ERROR: no archive $ARCHIVE" >&2; exit 4; }
 
 # Before the trap (the code shows no rollback ran and none was needed):
 # a stop failure = bin untouched, but the set may have stopped only partly.
-systemctl stop crawler.target || { echo "ОШИБКА: не удалось остановить crawler.target" >&2; exit 3; }
+systemctl stop crawler.target || { echo "ERROR: failed to stop crawler.target" >&2; exit 3; }
 trap on_exit EXIT
 # Exit on a signal (ssh dropped on a run cancel/timeout, a manual interrupt):
 # without this $? is 0 in the EXIT handler and the rollback never starts.
@@ -153,4 +153,4 @@ rm -f "$ARCHIVE"
 trap - EXIT
 trap - INT TERM HUP
 
-echo "установлено в $BIN_DIR; предыдущие бинарники — в $BACKUP"
+echo "installed into $BIN_DIR; the previous binaries are in $BACKUP"

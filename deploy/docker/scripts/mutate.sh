@@ -20,7 +20,7 @@
 #                         (test/mutation/blacklist.txt, when non-empty).
 set -eu
 
-: "${MUTATE_PKGS:?MUTATE_PKGS env is required (задаётся make mutate)}"
+: "${MUTATE_PKGS:?MUTATE_PKGS env is required (set by make mutate)}"
 MUTATE_TIMEOUT="${MUTATE_TIMEOUT:-60}"
 MUTATION_MIN_SCORE="${MUTATION_MIN_SCORE:-0}"
 MUTATE_BLACKLIST="${MUTATE_BLACKLIST:-test/mutation/blacklist.txt}"
@@ -30,7 +30,7 @@ root_dir=$(CDPATH= cd -- "${script_dir}/../../.." && pwd)
 out_dir="${root_dir}/var/mutation"
 
 command -v go-mutesting >/dev/null 2>&1 || {
-	echo 'ОШИБКА: go-mutesting не найден в образе. Пересоберите: make build' >&2
+	echo 'ERROR: go-mutesting is not found in the image. Rebuild: make build' >&2
 	exit 1
 }
 
@@ -65,16 +65,16 @@ cp -f go-mutesting-report.html "${out_dir}/go-mutesting-report.html"
 score=$(sed -n 's/^The mutation score is \([0-9][0-9.]*\).*/\1/p' \
 	"${out_dir}/mutate.log" | tail -n 1)
 [ -n "$score" ] || {
-	echo 'ОШИБКА: в выводе нет итогового mutation score — упал go-mutesting?' >&2
+	echo 'ERROR: no final mutation score in the output — did go-mutesting crash?' >&2
 	exit 1
 }
 
 status=0
 awk -v s="$score" -v m="$MUTATION_MIN_SCORE" 'BEGIN { exit (s + 0 >= m + 0) ? 0 : 1 }' || {
-	echo "ОШИБКА: mutation score $score ниже порога $MUTATION_MIN_SCORE." >&2
-	echo 'Разбор выживших мутантов — var/mutation/go-mutesting-report.html.' >&2
+	echo "ERROR: mutation score $score is below the threshold $MUTATION_MIN_SCORE." >&2
+	echo 'Survivor analysis — var/mutation/go-mutesting-report.html.' >&2
 	status=1
 }
-echo "Mutation score: $score (порог $MUTATION_MIN_SCORE). Отчёты: var/mutation/"
+echo "Mutation score: $score (threshold $MUTATION_MIN_SCORE). Reports: var/mutation/"
 
 exit $status

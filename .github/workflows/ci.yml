@@ -124,8 +124,8 @@ jobs:
       # Telegram notification (spec §10.4): one message per failed ci run.
       # The category follows the first failed step (the steps before it are
       # green, the ones after are skipped): image build/lint/production
-      # images → "Ошибка в коде", tests → "Ошибка тестов"; other failures
-      # (diagnostics, environment preparation) → the "Ошибка конвейера CI"
+      # images → "Code error", tests → "Tests error"; other failures
+      # (diagnostics, environment preparation) → the "CI pipeline error"
       # fallback — the event is missing from the §10.4 table, but staying
       # silent about a red run is worse (the decision is recorded in
       # commit T-136). Manual ci runs stay silent — §10.4: manual runs do
@@ -141,22 +141,22 @@ jobs:
         run: |
           # The step names in the categories must be kept in sync with the
           # name: of the steps above.
-          event="Ошибка конвейера CI"
+          event="CI pipeline error"
           step="outside build and test steps (see the run log)"
           if [ "${{ steps.build.outcome }}" = failure ]; then
-            event="Ошибка в коде"; step="Build images (with layer cache)"
+            event="Code error"; step="Build images (with layer cache)"
           elif [ "${{ steps.lint.outcome }}" = failure ]; then
-            event="Ошибка в коде"; step="Lint (golangci-lint)"
+            event="Code error"; step="Lint (golangci-lint)"
           elif [ "${{ steps.test.outcome }}" = failure ]; then
-            event="Ошибка тестов"; step="Unit tests"
+            event="Tests error"; step="Unit tests"
           elif [ "${{ steps.test-race.outcome }}" = failure ]; then
-            event="Ошибка тестов"; step="Race-detector tests (monitor)"
+            event="Tests error"; step="Race-detector tests (monitor)"
           elif [ "${{ steps.test-rules.outcome }}" = failure ]; then
-            event="Ошибка тестов"; step="Laravel rules against the sample corpus"
+            event="Tests error"; step="Laravel rules against the sample corpus"
           elif [ "${{ steps.test-integration.outcome }}" = failure ]; then
-            event="Ошибка тестов"; step="Integration tests on the testbed"
+            event="Tests error"; step="Integration tests on the testbed"
           elif [ "${{ steps.build-runtime.outcome }}" = failure ]; then
-            event="Ошибка в коде"; step="Production image check (runtime + render)"
+            event="Code error"; step="Production image check (runtime + render)"
           fi
           # In PR runs HEAD is a merge commit: the offending commit is the
           # PR branch head.

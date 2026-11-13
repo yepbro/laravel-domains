@@ -24,7 +24,7 @@ BIN_DIR=${BIN_DIR:-/opt/crawler/bin}
 BACKUP=${BACKUP:-/opt/crawler/bin.prev}
 
 if [ ! -d "$BACKUP" ]; then
-    echo "ОТКАТ: откатывать нечего — нет $BACKUP (первый деплой); набор не тронут, работает новая версия" >&2
+    echo "ROLLBACK: nothing to roll back — no $BACKUP (the first deploy); the set is untouched, the new version is running" >&2
     exit 4
 fi
 
@@ -35,20 +35,20 @@ fi
 # a partly copied bin. rmdir: cp must create the directory itself, otherwise
 # the copy would land inside the ready one.
 if ! tmp="$(mktemp -d "${BIN_DIR}.rollback.XXXXXX")"; then
-    echo "ОТКАТ: не удался — не создать временный каталог рядом с $BIN_DIR; набор не тронут, работает новая версия" >&2
+    echo "ROLLBACK: failed — cannot create a temp directory next to $BIN_DIR; the set is untouched, the new version is running" >&2
     exit 3
 fi
-rmdir "$tmp" || { echo "ОТКАТ: не удался — не очистить временный $tmp; набор не тронут, работает новая версия" >&2; exit 3; }
+rmdir "$tmp" || { echo "ROLLBACK: failed — cannot clean the temp $tmp; the set is untouched, the new version is running" >&2; exit 3; }
 trap 'rm -rf "$tmp"' EXIT
 if ! cp -a "$BACKUP" "$tmp"; then
-    echo "ОТКАТ: не удался — копирование $BACKUP; набор не тронут, работает новая версия" >&2
+    echo "ROLLBACK: failed — copying $BACKUP; the set is untouched, the new version is running" >&2
     exit 3
 fi
 
 if ! (systemctl stop crawler.target &&
       rm -rf "$BIN_DIR" &&
       mv "$tmp" "$BIN_DIR"); then
-    echo "ОТКАТ: не удался (stop/замена) — проверьте $BIN_DIR и systemctl status crawler.target" >&2
+    echo "ROLLBACK: failed (stop/replacement) — check $BIN_DIR and systemctl status crawler.target" >&2
     exit 3
 fi
 
@@ -60,7 +60,7 @@ fi
 # rollback never brings the set up.
 systemctl reset-failed 'crawler-*' 2>/dev/null || true
 if ! systemctl start crawler.target; then
-    echo "старт набора после отката вернул ошибку — состояние юнитов см. ниже" >&2
+    echo "the set start after the rollback returned an error — see the unit states below" >&2
 fi
 
 # A light check after the rollback: the units active (the list — like in
@@ -83,14 +83,14 @@ for u in crawler-chromium crawler-ingest crawler-scheduler crawler-dns-worker \
     fi
     state=$(systemctl is-active "$u" 2>/dev/null || true)
     if [ "$state" != active ]; then
-        echo "юнит $u после отката: $state" >&2
+        echo "unit $u after the rollback: $state" >&2
         degraded=1
     fi
 done
 
 if [ "$degraded" -ne 0 ]; then
-    echo "ОТКАТ: $BACKUP -> $BIN_DIR выполнен, набор перезапущен, но не все юниты active — требуется оператор" >&2
+    echo "ROLLBACK: $BACKUP -> $BIN_DIR performed, the set restarted, but not all units are active — an operator is required" >&2
     exit 1
 fi
 
-echo "ОТКАТ: $BACKUP -> $BIN_DIR выполнен, набор перезапущен, все юниты active"
+echo "ROLLBACK: $BACKUP -> $BIN_DIR performed, the set restarted, all units are active"

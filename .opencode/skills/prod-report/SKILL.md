@@ -37,7 +37,8 @@ Prod is the project's only production server; the deploy is native systemd
    ```
    The script goes over ssh to `larasites` and prints a markdown snapshot
    in sections: System, Units, Top CPU, Queues (with rate calculation),
-   Redis, Pipeline (crawlerctl), PostgreSQL, Content, Metrics, Logs.
+   Redis, Pipeline (crawlerctl), PostgreSQL, Content, Metrics,
+   Render (engines and fallback, after the stage 35/36 deploy), Logs.
 2. Read the snapshot and interpret it: what is normal and what is not —
    using the red flags table below.
 3. On anomalies, open `references/prod-topology.md` — it has the prod

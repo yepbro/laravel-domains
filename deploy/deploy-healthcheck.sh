@@ -33,7 +33,7 @@ for spec in crawler-chromium:- crawler-ingest:9101 crawler-scheduler:9102 \
     p=${spec#*:}
     enabled=$(systemctl is-enabled "$u" 2>/dev/null || true)
     if [ "$enabled" = disabled ] || [ "$enabled" = masked ]; then
-        echo "юнит $u: $enabled — исключён из проверки (отключён оператором)"
+        echo "unit $u: $enabled — excluded from the check (disabled by the operator)"
         continue
     fi
     checked+=("$u")
@@ -50,7 +50,7 @@ while :; do
     for u in "${checked[@]}"; do
         state=$(systemctl is-active "$u" 2>/dev/null || true)
         if [ "$state" != active ]; then
-            echo "юнит $u: $state"
+            echo "unit $u: $state"
             fail=1
         fi
     done
@@ -65,7 +65,7 @@ deadline=$((SECONDS + READY_DEADLINE))
 for p in "${ports[@]}"; do
     until curl -fsS -m "$PROBE_TIMEOUT" "127.0.0.1:$p/healthz" >/dev/null 2>&1; do
         if [ "$SECONDS" -ge "$deadline" ]; then
-            echo "healthz 127.0.0.1:$p: FAIL (нет ответа за ${READY_DEADLINE}s)"
+            echo "healthz 127.0.0.1:$p: FAIL (no response within ${READY_DEADLINE}s)"
             fail=1
             break
         fi
@@ -83,7 +83,7 @@ if ! timeout $((READY_DEADLINE * 2)) env CRAWLER_CONFIG=/etc/crawler/config.yaml
 fi
 
 if [ "$fail" -ne 0 ]; then
-    echo "ЕСТЬ КРАСНЫЕ ПРОВЕРКИ" >&2
+    echo "SOME CHECKS ARE RED" >&2
     exit 1
 fi
-echo "все проверки зелёные: ${#checked[@]} юнитов active, healthz ${ports[*]} ok, crawlerctl ok (за ${SECONDS}s)"
+echo "all checks green: ${#checked[@]} units active, healthz ${ports[*]} ok, crawlerctl ok (in ${SECONDS}s)"

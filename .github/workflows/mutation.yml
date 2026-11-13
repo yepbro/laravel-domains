@@ -109,7 +109,7 @@ jobs:
             # but defense in depth is cheaper than parsing).
             case "$DISPATCH_PKGS" in
               *[!A-Za-z0-9./_\ -]*)
-                echo "ОШИБКА: недопустимые символы в pkgs (допустимы буквы/цифры и ./_ и пробел): $DISPATCH_PKGS" >&2
+                echo "ERROR: invalid characters in pkgs (letters/digits and ./_ and space are allowed): $DISPATCH_PKGS" >&2
                 exit 2 ;;
             esac
             pkgs="$DISPATCH_PKGS"

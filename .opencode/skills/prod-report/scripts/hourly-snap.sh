@@ -15,10 +15,10 @@ journalctl -k --since "-65min" -q 2>/dev/null | grep -ci "out of memory"
 echo "=== retention: metrics / cursor / journal ==="
 curl -s 127.0.0.1:9104/metrics | grep -E "^crawler_content_retention_(errors_total|pass_seconds_count|rows_total|contents_total|freed_bytes_total)" | sed "s/{service=\"http-worker\"}//"
 sudo -u postgres psql -d crawler -tAc "SELECT checked_at, updated_at FROM retention_drain_cursor;" 2>&1
-journalctl -u crawler-http-worker --since "-65min" -q | grep -iE "проход retention|курсор" | tail -3
-echo "=== очереди / скорость ==="
+journalctl -u crawler-http-worker --since "-65min" -q | grep -iE "retention pass|cursor" | tail -3
+echo "=== queues / rates ==="
 systemctl is-active crawler-scheduler
 set -a; . /etc/crawler/crawler.env 2>/dev/null; set +a
-/opt/crawler/bin/crawlerctl status 2>/dev/null | grep -A6 "очереди (глубина)"
+/opt/crawler/bin/crawlerctl status 2>/dev/null | grep -A6 "queues (depth)"
 redis-cli XLEN q:dead
 '

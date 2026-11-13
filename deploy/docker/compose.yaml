@@ -54,7 +54,7 @@ x-go-build: &go-build
   dockerfile: deploy/docker/Dockerfile.go
   target: dev
   args:
-    GO_VERSION: ${GO_VERSION:?GO_VERSION must be set (см. .env.example)}
+    GO_VERSION: ${GO_VERSION:?GO_VERSION must be set (see .env.example)}
     ALPINE_VERSION: ${ALPINE_VERSION:-3.24.2}
     AIR_VERSION: ${AIR_VERSION:-v1.67.4}
     DELVE_VERSION: ${DELVE_VERSION:-v1.27.2}
@@ -673,7 +673,7 @@ services:
       dockerfile: deploy/docker/Dockerfile.render
       target: render
       args:
-        GO_VERSION: ${GO_VERSION:?GO_VERSION must be set (см. .env.example)}
+        GO_VERSION: ${GO_VERSION:?GO_VERSION must be set (see .env.example)}
         CHROMEDP_HEADLESS_IMAGE: ${CHROMEDP_HEADLESS_IMAGE:-chromedp/headless-shell:156.0.8078.17}
     image: crawler/render:local
     # The worker writes the content pack files to the host-bind
@@ -738,7 +738,7 @@ services:
       dockerfile: deploy/docker/Dockerfile.render
       target: render
       args:
-        GO_VERSION: ${GO_VERSION:?GO_VERSION must be set (см. .env.example)}
+        GO_VERSION: ${GO_VERSION:?GO_VERSION must be set (see .env.example)}
         CHROMEDP_HEADLESS_IMAGE: ${CHROMEDP_HEADLESS_IMAGE:-chromedp/headless-shell:156.0.8078.17}
     image: crawler/render:local
     user: "${DEV_UID:-1000}:${DEV_GID:-1000}"

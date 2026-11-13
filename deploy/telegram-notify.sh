@@ -37,11 +37,11 @@ set -euo pipefail
 
 usage() {
     cat >&2 <<'EOF'
-использование: telegram-notify.sh --status ok|fail --event ТИП --workflow ИМЯ
-                         [--step ШАГ] [--version ВЕРСИЯ] [--sha SHA]
+usage: telegram-notify.sh --status ok|fail --event TYPE --workflow NAME
+                         [--step STEP] [--version VERSION] [--sha SHA]
                          [--rollback performed|performed-degraded|nothing-to-rollback|failed|unknown]
                          [--dry-run]
-              telegram-notify.sh --message ТЕКСТ [--dry-run]
+        telegram-notify.sh --message TEXT [--dry-run]
 EOF
     exit 2
 }
@@ -59,7 +59,7 @@ while [ $# -gt 0 ]; do
         --message)  [ $# -ge 2 ] || usage; message=$2;  shift 2 ;;
         --dry-run)  dry_run=1; shift ;;
         -h|--help)  usage ;;
-        *)          echo "telegram-notify: неизвестный аргумент: $1" >&2; usage ;;
+        *)          echo "telegram-notify: unknown argument: $1" >&2; usage ;;
     esac
 done
 
@@ -70,7 +70,7 @@ done
 if [ -n "$message" ]; then
     if [ -n "$status" ] || [ -n "$event" ] || [ -n "$workflow" ] || \
        [ -n "$step" ] || [ -n "$version" ] || [ -n "$rollback" ] || [ -n "$sha" ]; then
-        echo 'telegram-notify: --message не сочетается с аргументами CI/CD (--status/--event/--workflow/...)' >&2
+        echo 'telegram-notify: --message does not combine with the CI/CD arguments (--status/--event/--workflow/...)' >&2
         exit 2
     fi
 else
@@ -79,11 +79,11 @@ else
     fi
     case "$status" in
         ok|fail) ;;
-        *) echo "telegram-notify: --status должен быть ok или fail" >&2; exit 2 ;;
+        *) echo "telegram-notify: --status must be ok or fail" >&2; exit 2 ;;
     esac
     case "$rollback" in
         performed|performed-degraded|nothing-to-rollback|failed|unknown|'') ;;
-        *) echo "telegram-notify: --rollback должен быть performed, performed-degraded, nothing-to-rollback, failed или unknown" >&2; exit 2 ;;
+        *) echo "telegram-notify: --rollback must be performed, performed-degraded, nothing-to-rollback, failed or unknown" >&2; exit 2 ;;
     esac
 fi
 
@@ -92,7 +92,7 @@ fi
 # substituting placeholders).
 if [ "$dry_run" -eq 0 ]; then
     if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
-        echo 'telegram: извещение пропущено — не задан TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID (PR из форка или секреты репозитория не настроены)'
+        echo 'telegram: notification skipped — TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID is not set (a PR from a fork or the repository secrets are not configured)'
         exit 0
     fi
 fi
@@ -130,33 +130,33 @@ else
     # "infrastructure/attention").
     marker=''
     case "$event" in
-        'Ошибка в коде'*)       marker='🟥 ❌' ;;
-        'Ошибка тестов'*)       marker='🛑' ;;
-        'Ошибка конвейера CI'*) marker='⚠️' ;;
-        'Деплой успешен'*)      marker='✅' ;;
-        'Деплой не успешен'*)   marker='⛔️' ;;
+        'Code error'*)          marker='🟥 ❌' ;;
+        'Tests error'*)         marker='🛑' ;;
+        'CI pipeline error'*)   marker='⚠️' ;;
+        'Deploy succeeded'*)    marker='✅' ;;
+        'Deploy failed'*)       marker='⛔️' ;;
         *) # unknown event: the previous status marker
            if [ "$status" = ok ]; then marker='✅'; else marker='❌'; fi ;;
     esac
 
     head="$workflow"
     if [ -n "$step" ]; then
-        head="$head · шаг: $step"
+        head="$head · step: $step"
     fi
     if [ -n "$version" ]; then
-        head="$head · версия деплоя: $version"
+        head="$head · deploy version: $version"
     fi
 
     rollback_line=''
     case "$rollback" in
-        performed)           rollback_line='Откат: выполнен на предыдущую версию (bin.prev)' ;;
-        performed-degraded)  rollback_line='Откат: выполнен на предыдущую версию (bin.prev), но не все юниты active — требуется оператор' ;;
-        nothing-to-rollback) rollback_line='Откат: не выполнен — предыдущей версии нет (bin.prev отсутствует, первый деплой); на сервере осталась новая версия' ;;
-        failed)              rollback_line='Откат: не удался — состояние сервера требует проверки оператора (диагностика в логе рана)' ;;
-        unknown)             rollback_line='Откат: неизвестен — работа с сервером не доведена до конца (потеря связи, отмена рана или сбой остановки набора); проверьте /opt/crawler/bin и systemctl status crawler.target' ;;
+        performed)           rollback_line='Rollback: performed to the previous version (bin.prev)' ;;
+        performed-degraded)  rollback_line='Rollback: performed to the previous version (bin.prev), but not all units are active — an operator is required' ;;
+        nothing-to-rollback) rollback_line='Rollback: not performed — there is no previous version (bin.prev is missing, the first deploy); the new version remains on the server' ;;
+        failed)              rollback_line='Rollback: failed — the server state needs an operator check (diagnostics in the run log)' ;;
+        unknown)             rollback_line='Rollback: unknown — the work on the server was not carried to the end (a lost connection, a run cancellation, or a set-stop failure); check /opt/crawler/bin and systemctl status crawler.target' ;;
     esac
 
-    commit_line="Коммит: $short_sha"
+    commit_line="Commit: $short_sha"
     if [ -n "$subject" ]; then
         commit_line="$commit_line — $subject"
     fi
@@ -177,8 +177,8 @@ fi
 if [ "$dry_run" -eq 1 ]; then
     masked_payload="$(jq -cn --arg chat_id '<TELEGRAM_CHAT_ID>' --arg text "$text" \
         '{chat_id: $chat_id, text: $text}')"
-    echo 'telegram: dry-run — отправки нет'
-    echo 'telegram: эндпоинт: https://api.telegram.org/bot<TOKEN>/sendMessage'
+    echo 'telegram: dry-run — nothing is sent'
+    echo 'telegram: endpoint: https://api.telegram.org/bot<TOKEN>/sendMessage'
     printf 'telegram: payload: %s\n' "$masked_payload"
     exit 0
 fi
@@ -204,10 +204,10 @@ if ! http_code="$(curl -sS -o "$resp" -w '%{http_code}' \
     [ -n "$http_code" ] || http_code=000
 fi
 if [ "$http_code" = 200 ]; then
-    echo 'telegram: извещение отправлено'
+    echo 'telegram: notification sent'
 else
-    echo "telegram: ошибка отправки (HTTP $http_code); ран это не красит — шаг с continue-on-error" >&2
-    api_err="$(jq -r '"\(.error_code // "?"): \(.description // "нет описания")"' \
+    echo "telegram: send error (HTTP $http_code); the run is not failed by it — the step has continue-on-error" >&2
+    api_err="$(jq -r '"\(.error_code // "?"): \(.description // "no description")"' \
         "$resp" 2>/dev/null || true)"
     if [ -n "$api_err" ]; then
         echo "telegram: API: $api_err" >&2
