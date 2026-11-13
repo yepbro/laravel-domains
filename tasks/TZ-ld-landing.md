@@ -344,8 +344,8 @@ AGENTS.md (отдельный worktree, ревью по схеме, один к�
 | L-04 | [done] | laravel-domains | CORS для `/api/*` — слит в master (4726aea); `web.cors.allowed_origins` + env, префлайт 204, строгий Validate; ревью-фиксы применены | L-03 (обе в `internal/web`) |
 | L-05 | [done] | ld-landing | Деплой-механика готова (87ef8ae, запушено): deploy/release/rollback/releases, ControlMaster-ssh, prune keep-5; релизы залиты на оба сервера, current не тронут; 41 тест | L-02, L-03, L-04 |
 | L-06 | [done] | uspromo, aphrodite | **Лендинги в проде 13.11**: релиз API `200792a..29f6a9e` (L-03+L-4, deploy OK); `web.cors.allowed_origins` включён на larasites (config.bak-20261113-cors, префлайт 204/ACAO-эхо проверены); `make release` — релизы 20261113-201209 (uspromo) / 20261113-201241 (aphrodite); чеки зелёные: canonical/hreflang/sitemap/robots, 301-карта, api9 в бандле, браузерный e2e (живые stats, refresh, метрика; единственный console-error — внешний маячок mdd.yandex.net Метрики) | L-05 |
-| L-07 | [in progress] | серверы | Cut-over завершён (DNS заранее, сертификаты/301 — в L-06). Осталось: наблюдение (Метрика, 404, логи api, rate limit) и после стабилизации — снятие старых лендинг-vhost'ов `sites.*` из `crawler.conf` на larasites (редиректы корневых доменов оставить) | L-06 |
-| L-08 | [new] | laravel-domains | Вырезание лендинга (§7.3), обновление доков | L-07 |
+| L-07 | [done] | серверы | Наблюдение чистое (5xx нет, боты режутся deny-правилом, Метрика №105207729 принимает данные, метрики web в норме); старые лендинг-vhost'ы sites.* сняты из `crawler.conf` (бэкап `/etc/nginx/backups/`), общий LE-серт перевыпущен без sites.* (5 имён), корневые редиректы/дашборд/api9 проверены; access-лог добавлен на uspromo | L-06 |
+| L-08 | [in progress] | laravel-domains | Вырезание лендинга (§7.3), обновление доков; после слияния — релиз API-only бинарника в прод (по отдельному указанию) | L-07 |
 
 ### 11.1. Выполнено досрочно: nginx + TLS (13.11)
 
