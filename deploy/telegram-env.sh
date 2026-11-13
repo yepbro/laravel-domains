@@ -20,14 +20,14 @@ ENV_FILE=/etc/crawler/crawler.env
 UNIT=crawler-monitor.service
 
 if [ $# -ne 2 ] || [ -z "$1" ] || [ -z "$2" ]; then
-    echo "telegram-env: ожидаются два аргумента (токен, chat id)" >&2
+    echo "telegram-env: two arguments expected (token, chat id)"; >&2
     exit 4
 fi
 token="$1"
 chat="$2"
 
 if [ ! -f "$ENV_FILE" ]; then
-    echo "telegram-env: $ENV_FILE не найден" >&2
+    echo "telegram-env: $ENV_FILE not found" >&2
     exit 4
 fi
 
@@ -62,8 +62,8 @@ systemctl restart "$UNIT"
 # operator), the state is visible in journalctl.
 sleep 5
 if journalctl -u "$UNIT" --since '-2 min' --no-pager | grep -q 'telegram: alert delivery on'; then
-    echo "telegram-env: секреты доставлены, доставка включена (журнал monitor)"
+    echo "telegram-env: secrets delivered, delivery enabled (see the monitor journal)"
 else
-    echo "telegram-env: секреты записаны, строка включения в журнале не найдена — проверьте journalctl -u $UNIT" >&2
+    echo "telegram-env: secrets written, the enable line not found in the journal — check journalctl -u $UNIT" >&2
     exit 3
 fi
