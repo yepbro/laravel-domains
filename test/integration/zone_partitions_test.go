@@ -77,7 +77,7 @@ func zonePartition(t *testing.T, pool *pgxpool.Pool, table string, zoneID int16)
 			return p
 		}
 	}
-	t.Fatalf("партиция %s не найдена", name)
+	t.Fatalf("partition %s not found", name)
 	return tablePartition{}
 }
 
@@ -157,10 +157,10 @@ func TestZonePartitions_ExtractZoneWithData(t *testing.T) {
 	callCreateZonePartitions(t, pool, big, 4)
 	callCreateZonePartitions(t, pool, empty, 2)
 
-	t.Run("данные перенесены и читаются", func(t *testing.T) {
+	t.Run("the data is moved and readable", func(t *testing.T) {
 		for _, table := range tables {
 			if got := countZoneRows(t, pool, table, big); got != wantRows[table] {
-				t.Errorf("%s: строк зоны стало %d, было %d (потери при переносе)", table, got, wantRows[table])
+				t.Errorf("%s: zone rows now %d, was %d (losses in the move)", table, got, wantRows[table])
 			}
 		}
 
@@ -170,7 +170,7 @@ func TestZonePartitions_ExtractZoneWithData(t *testing.T) {
 		if err := pool.QueryRow(ctx,
 			`SELECT status FROM domains WHERE zone_id = $1 AND label = 'site42'`, big,
 		).Scan(&status); err != nil {
-			t.Fatalf("точечный запрос по (zone_id, label): %v", err)
+			t.Fatalf("point query by (zone_id, label): %v", err)
 		}
 		if status != 0 {
 			t.Errorf("status = %d, want 0 (default)", status)
@@ -178,24 +178,24 @@ func TestZonePartitions_ExtractZoneWithData(t *testing.T) {
 		if _, err := pool.Exec(ctx,
 			`UPDATE domains SET status = 4, check_state = 2 WHERE zone_id = $1 AND label = 'site1'`, big,
 		); err != nil {
-			t.Fatalf("update строки зоны: %v", err)
+			t.Fatalf("updating the zone row: %v", err)
 		}
 		if err := pool.QueryRow(ctx,
 			`SELECT status FROM domains WHERE zone_id = $1 AND label = 'site1'`, big,
 		).Scan(&status); err != nil {
-			t.Fatalf("перечитывание после update: %v", err)
+			t.Fatalf("re-reading after the update: %v", err)
 		}
 		if status != 4 {
-			t.Errorf("status после update = %d, want 4", status)
+			t.Errorf("status after the update = %d, want 4", status)
 		}
 	})
 
-	t.Run("структура партиций зоны", func(t *testing.T) {
+	t.Run("the zone partition structure", func(t *testing.T) {
 		// domains — a plain leaf with the fillfactor and all three parent
 		// indexes (pkey, zone_id+label, pending).
 		dom := zonePartition(t, pool, "domains", big)
 		if dom.relkind != "r" {
-			t.Errorf("domains_z%d: relkind = %s, want r (лист: субпартиционирование domains невозможно)", big, dom.relkind)
+			t.Errorf("domains_z%d: relkind = %s, want r (a leaf: subpartitioning domains is impossible)", big, dom.relkind)
 		}
 		if dom.bound != fmt.Sprintf("FOR VALUES IN ('%d')", big) {
 			t.Errorf("domains_z%d: bound = %q", big, dom.bound)
@@ -204,12 +204,12 @@ func TestZonePartitions_ExtractZoneWithData(t *testing.T) {
 			t.Errorf("domains_z%d: reloptions = %q, want fillfactor=85", big, dom.reloptions)
 		}
 		if n := len(tableIndexes(t, pool, "domains")); dom.indexCount != n {
-			t.Errorf("domains_z%d: индексов %d, want %d (дочерние всех индексов родителя)", big, dom.indexCount, n)
+			t.Errorf("domains_z%d: %d indexes, want %d (children of all the parent indexes)", big, dom.indexCount, n)
 		}
 
 		// The empty zone is extracted along the same path as the loaded one.
 		if e := zonePartition(t, pool, "domains", empty); !strings.Contains(e.reloptions, "fillfactor=85") {
-			t.Errorf("domains_z%d (пустая зона): reloptions = %q, want fillfactor=85", empty, e.reloptions)
+			t.Errorf("domains_z%d (the empty zone): reloptions = %q, want fillfactor=85", empty, e.reloptions)
 		}
 
 		// The result tables: hash leaves with a fillfactor for
@@ -223,12 +223,12 @@ func TestZonePartitions_ExtractZoneWithData(t *testing.T) {
 				byName[leaf.name] = leaf
 			}
 			if len(byName) != 4 {
-				t.Fatalf("%s: hash-листьев %d, want 4", table, len(byName))
+				t.Fatalf("%s: %d hash leaves, want 4", table, len(byName))
 			}
 			for i := range 4 {
 				leaf, ok := byName[fmt.Sprintf("%s_z%d_h%d", table, big, i)]
 				if !ok {
-					t.Errorf("%s: лист h%d не найден", table, i)
+					t.Errorf("%s: leaf h%d not found", table, i)
 					continue
 				}
 				if leaf.relkind != "r" {
@@ -238,29 +238,29 @@ func TestZonePartitions_ExtractZoneWithData(t *testing.T) {
 					t.Errorf("%s: bound = %q, want %q", leaf.name, leaf.bound, want)
 				}
 				if leaf.indexCount != parentIdx {
-					t.Errorf("%s: индексов %d, want %d (дочерние всех индексов родителя)", leaf.name, leaf.indexCount, parentIdx)
+					t.Errorf("%s: %d indexes, want %d (children of all the parent indexes)", leaf.name, leaf.indexCount, parentIdx)
 				}
 				if table == "subdomain_results" && !strings.Contains(leaf.reloptions, "fillfactor=85") {
-					t.Errorf("%s: reloptions = %q, want fillfactor=85 (частые перезаписи, ТЗ 6.3)", leaf.name, leaf.reloptions)
+					t.Errorf("%s: reloptions = %q, want fillfactor=85 (frequent rewrites, spec 6.3)", leaf.name, leaf.reloptions)
 				}
 				if table != "subdomain_results" && strings.Contains(leaf.reloptions, "fillfactor") {
-					t.Errorf("%s: reloptions = %q, laravel_* без fillfactor", leaf.name, leaf.reloptions)
+					t.Errorf("%s: reloptions = %q, laravel_* without a fillfactor", leaf.name, leaf.reloptions)
 				}
 			}
 		}
 
 		// The empty zone is extracted with a different modulus — the number of parts is set by the call.
 		if leafs := zoneLeafs(t, pool, "subdomain_results", empty); len(leafs) != 2 {
-			t.Errorf("subdomain_results_z%d: hash-листьев %d, want 2", empty, len(leafs))
+			t.Errorf("subdomain_results_z%d: %d hash leaves, want 2", empty, len(leafs))
 		}
 	})
 
-	t.Run("хэш распределяет строки по листьям", func(t *testing.T) {
+	t.Run("the hash distributes rows across leaves", func(t *testing.T) {
 		rows, err := pool.Query(ctx, `
 			SELECT tableoid::regclass::text, count(*)
 			FROM subdomain_results WHERE zone_id = $1 GROUP BY 1`, big)
 		if err != nil {
-			t.Fatalf("группировка по листьям: %v", err)
+			t.Fatalf("grouping by leaves: %v", err)
 		}
 		defer rows.Close()
 
@@ -270,25 +270,25 @@ func TestZonePartitions_ExtractZoneWithData(t *testing.T) {
 			var name string
 			var n int
 			if err := rows.Scan(&name, &n); err != nil {
-				t.Fatalf("чтение группы листа: %v", err)
+				t.Fatalf("reading a leaf group: %v", err)
 			}
 			if !pattern.MatchString(name) {
-				t.Errorf("строки зоны big в неожиданной партиции %s", name)
+				t.Errorf("big zone rows in an unexpected partition %s", name)
 			}
 			if n <= 0 {
-				t.Errorf("лист %s пуст в группировке", name)
+				t.Errorf("leaf %s empty in the grouping", name)
 			}
 			leafs++
 		}
 		if err := rows.Err(); err != nil {
-			t.Fatalf("итерация групп листьев: %v", err)
+			t.Fatalf("iterating leaf groups: %v", err)
 		}
 		if leafs != 4 {
-			t.Errorf("непустых hash-листьев %d, want 4 (40 строк распределены по всем частям)", leafs)
+			t.Errorf("non-empty hash leaves %d, want 4 (40 rows distributed across all the parts)", leafs)
 		}
 	})
 
-	t.Run("DEFAULT вернулась и принимает прочие зоны", func(t *testing.T) {
+	t.Run("DEFAULT is back and accepts other zones", func(t *testing.T) {
 		// The rows of the non-extracted zone stayed in DEFAULT.
 		for table, want := range map[string]int{"domains": 5, "subdomain_results": 3} {
 			var got int
@@ -297,10 +297,10 @@ func TestZonePartitions_ExtractZoneWithData(t *testing.T) {
 				small, table+"_default",
 			).Scan(&got)
 			if err != nil {
-				t.Fatalf("count %s в DEFAULT: %v", table, err)
+				t.Fatalf("count %s in DEFAULT: %v", table, err)
 			}
 			if got != want {
-				t.Errorf("%s: строк зоны small в DEFAULT = %d, want %d", table, got, want)
+				t.Errorf("%s: small zone rows in DEFAULT = %d, want %d", table, got, want)
 			}
 		}
 
@@ -309,27 +309,27 @@ func TestZonePartitions_ExtractZoneWithData(t *testing.T) {
 		if err := pool.QueryRow(ctx,
 			`INSERT INTO domains (zone_id, label) VALUES ($1, 'post-extract') RETURNING tableoid::regclass::text`, big,
 		).Scan(&leaf); err != nil {
-			t.Fatalf("insert после выделения (big): %v", err)
+			t.Fatalf("insert after the extraction (big): %v", err)
 		}
 		if want := fmt.Sprintf("domains_z%d", big); leaf != want {
-			t.Errorf("новый домен big попал в %s, want %s", leaf, want)
+			t.Errorf("the new big domain landed in %s, want %s", leaf, want)
 		}
 		if err := pool.QueryRow(ctx,
 			`INSERT INTO subdomain_results (zone_id, domain_id, subdomain_id, scheme, checked_at)
 			 VALUES ($1, 999, 0, 2, now()) RETURNING tableoid::regclass::text`, big,
 		).Scan(&leaf); err != nil {
-			t.Fatalf("insert результата после выделения: %v", err)
+			t.Fatalf("inserting the result after the extraction: %v", err)
 		}
 		if !regexp.MustCompile(fmt.Sprintf(`^subdomain_results_z%d_h\d+$`, big)).MatchString(leaf) {
-			t.Errorf("новый результат big попал в %s, want hash-лист", leaf)
+			t.Errorf("the new big result landed in %s, want a hash leaf", leaf)
 		}
 		if err := pool.QueryRow(ctx,
 			`INSERT INTO domains (zone_id, label) VALUES ($1, 'new-small') RETURNING tableoid::regclass::text`, small,
 		).Scan(&leaf); err != nil {
-			t.Fatalf("insert после выделения (small): %v", err)
+			t.Fatalf("insert after the extraction (small): %v", err)
 		}
 		if leaf != "domains_default" {
-			t.Errorf("новый домен small попал в %s, want domains_default", leaf)
+			t.Errorf("the new small domain landed in %s, want domains_default", leaf)
 		}
 
 		// The detach/attach cycle does not duplicate indexes on DEFAULT.
@@ -343,13 +343,13 @@ func TestZonePartitions_ExtractZoneWithData(t *testing.T) {
 					continue
 				}
 				if p.indexCount != want {
-					t.Errorf("%s_default: индексов %d, want %d (detach/attach без дублей)", table, p.indexCount, want)
+					t.Errorf("%s_default: %d indexes, want %d (detach/attach without duplicates)", table, p.indexCount, want)
 				}
 			}
 		}
 	})
 
-	t.Run("повторный вызов идемпотентен", func(t *testing.T) {
+	t.Run("a repeated call is idempotent", func(t *testing.T) {
 		// The baseline counts — after the previous routing inserts.
 		before := make(map[string]int, len(tables))
 		for _, table := range tables {
@@ -360,11 +360,11 @@ func TestZonePartitions_ExtractZoneWithData(t *testing.T) {
 		callCreateZonePartitions(t, pool, big, 16) // and with a different part count: the existing partition wins
 
 		if leafs := zoneLeafs(t, pool, "subdomain_results", big); len(leafs) != 4 {
-			t.Errorf("после повторных вызовов hash-листьев %d, want 4 (партиция не пересоздаётся)", len(leafs))
+			t.Errorf("after the repeated calls %d hash leaves, want 4 (the partition is not recreated)", len(leafs))
 		}
 		for _, table := range tables {
 			if got := countZoneRows(t, pool, table, big); got != before[table] {
-				t.Errorf("%s: строк зоны после повторного вызова %d, want %d", table, got, before[table])
+				t.Errorf("%s: zone rows after the repeated call %d, want %d", table, got, before[table])
 			}
 		}
 	})
@@ -384,29 +384,29 @@ func TestZonePartitions_Validation(t *testing.T) {
 		t.Helper()
 		_, err := pool.Exec(ctx, `CALL create_zone_partitions($1, $2)`, zoneID, hashParts)
 		if err == nil {
-			t.Errorf("%s: ожидалась ошибка, CALL прошёл", name)
+			t.Errorf("%s: an error was expected, the CALL went through", name)
 			return
 		}
 		if !strings.Contains(err.Error(), wantSubstr) {
-			t.Errorf("%s: err = %v, want упоминание %q", name, err, wantSubstr)
+			t.Errorf("%s: err = %v, want a mention of %q", name, err, wantSubstr)
 		}
 	}
-	expectError("неизвестная зона", 999, 4, "нет в таблице zones")
-	expectError("hash_parts = 3", ok, 3, "степень двойки")
-	expectError("hash_parts = 0", ok, 0, "степень двойки")
-	expectError("hash_parts = -4", ok, -4, "степень двойки")
+	expectError("unknown zone", 999, 4, "is missing from the zones table")
+	expectError("hash_parts = 3", ok, 3, "a power of two")
+	expectError("hash_parts = 0", ok, 0, "a power of two")
+	expectError("hash_parts = -4", ok, -4, "a power of two")
 
 	// The failing calls did not create zone partitions.
 	if parts := zoneLeafs(t, pool, "subdomain_results", ok); len(parts) != 0 {
-		t.Errorf("после ошибочных вызовов создано hash-листьев: %d, want 0", len(parts))
+		t.Errorf("hash leaves created after the failing calls: %d, want 0", len(parts))
 	}
 
 	// The one-argument call — the default hash_parts (4).
 	if _, err := pool.Exec(ctx, `CALL create_zone_partitions($1)`, ok); err != nil {
-		t.Fatalf("CALL с hash_parts по умолчанию: %v", err)
+		t.Fatalf("CALL with the default hash_parts: %v", err)
 	}
 	if leafs := zoneLeafs(t, pool, "subdomain_results", ok); len(leafs) != 4 {
-		t.Errorf("hash-листьев по умолчанию %d, want 4", len(leafs))
+		t.Errorf("default hash leaves %d, want 4", len(leafs))
 	}
 }
 
@@ -425,7 +425,7 @@ func TestZonePartitions_DownMigration(t *testing.T) {
 	t.Cleanup(cleanup)
 
 	if err := migrate.Up(context.Background(), dsn); err != nil {
-		t.Fatalf("применение миграций: %v", err)
+		t.Fatalf("applying migrations: %v", err)
 	}
 
 	// The rollback to a version below 000003 — the same operation the
@@ -439,19 +439,19 @@ func TestZonePartitions_DownMigration(t *testing.T) {
 
 	driver, err := pgxmigrate.WithInstance(db, &pgxmigrate.Config{})
 	if err != nil {
-		t.Fatalf("драйвер миграций: %v", err)
+		t.Fatalf("migration driver: %v", err)
 	}
 	src, err := iofs.New(migrations.FS, ".")
 	if err != nil {
-		t.Fatalf("источник миграций: %v", err)
+		t.Fatalf("migration source: %v", err)
 	}
 	m, err := golangmigrate.NewWithInstance("iofs", src, "postgres", driver)
 	if err != nil {
-		t.Fatalf("инициализация golang-migrate: %v", err)
+		t.Fatalf("golang-migrate initialization: %v", err)
 	}
 	defer m.Close() //nolint:errcheck // test connection — same as db above
 	if err := m.Migrate(zoneSubpartitioningVersion - 1); err != nil {
-		t.Fatalf("откат к версии %d: %v", zoneSubpartitioningVersion-1, err)
+		t.Fatalf("rolling back to version %d: %v", zoneSubpartitioningVersion-1, err)
 	}
 
 	pool, err := pgxpool.New(context.Background(), dsn)
@@ -461,7 +461,7 @@ func TestZonePartitions_DownMigration(t *testing.T) {
 	defer pool.Close()
 
 	if version, ok := schemaVersion(t, dsn); !ok || version != zoneSubpartitioningVersion-1 {
-		t.Errorf("версия схемы после отката = %d (ok=%v), want %d", version, ok, zoneSubpartitioningVersion-1)
+		t.Errorf("schema version after the rollback = %d (ok=%v), want %d", version, ok, zoneSubpartitioningVersion-1)
 	}
 
 	var procExists bool
@@ -471,7 +471,7 @@ func TestZonePartitions_DownMigration(t *testing.T) {
 			JOIN pg_namespace n ON n.oid = p.pronamespace
 			WHERE n.nspname = current_schema() AND p.proname = 'create_zone_partitions')`,
 	).Scan(&procExists); err != nil || procExists {
-		t.Errorf("процедура create_zone_partitions после отката: exists=%v (err=%v), want false", procExists, err)
+		t.Errorf("the create_zone_partitions procedure after the rollback: exists=%v (err=%v), want false", procExists, err)
 	}
 
 	var domainsExists bool
@@ -480,6 +480,6 @@ func TestZonePartitions_DownMigration(t *testing.T) {
 			SELECT 1 FROM information_schema.tables
 			WHERE table_schema = current_schema() AND table_name = 'domains')`,
 	).Scan(&domainsExists); err != nil || !domainsExists {
-		t.Errorf("таблица domains после отката миграции 000003: exists=%v (err=%v), want true", domainsExists, err)
+		t.Errorf("the domains table after rolling back migration 000003: exists=%v (err=%v), want true", domainsExists, err)
 	}
 }

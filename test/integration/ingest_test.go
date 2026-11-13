@@ -126,7 +126,7 @@ func (e *ingestEnv) domain(t *testing.T, zone, label string) (domainState, bool)
 		return d, false
 	}
 	if err != nil {
-		t.Fatalf("чтение домена %s.%s: %v", label, zone, err)
+		t.Fatalf("reading the domain %s.%s: %v", label, zone, err)
 	}
 	return d, true
 }
@@ -150,7 +150,7 @@ func (e *ingestEnv) zone(t *testing.T, name string) (zoneState, bool) {
 		return z, false
 	}
 	if err != nil {
-		t.Fatalf("чтение зоны %s: %v", name, err)
+		t.Fatalf("reading the zone %s: %v", name, err)
 	}
 	return z, true
 }
@@ -181,7 +181,7 @@ func (e *ingestEnv) fileBySHA(t *testing.T, sha []byte) (fileRecordState, bool) 
 		return f, false
 	}
 	if err != nil {
-		t.Fatalf("чтение ingest_files: %v", err)
+		t.Fatalf("reading ingest_files: %v", err)
 	}
 	return f, true
 }
@@ -226,43 +226,43 @@ func TestIngest_AddCreatesZonesAndDomains(t *testing.T) {
 	sha := sha256.Sum256([]byte(content))
 	out := env.process(t, "crawl.test/add/list.txt", content)
 	if out.Kind != ingest.OutcomeApplied {
-		t.Fatalf("итог = %q, want applied", out.Kind)
+		t.Fatalf("outcome = %q, want applied", out.Kind)
 	}
 
 	// The zone is created automatically on the first file (spec 5.1).
 	z, ok := env.zone(t, "crawl.test")
 	if !ok {
-		t.Fatal("зона crawl.test не создана")
+		t.Fatal("the crawl.test zone not created")
 	}
 	if !z.isActive {
-		t.Error("зона создана неактивной, want is_active = true")
+		t.Error("the zone created inactive, want is_active = true")
 	}
 	if z.unicode != "" {
-		t.Errorf("name_unicode = %q, want NULL (ASCII-зона, ТЗ 5.2 п. 7)", z.unicode)
+		t.Errorf("name_unicode = %q, want NULL (an ASCII zone, spec 5.2 item 7)", z.unicode)
 	}
 	if n := env.countOf(t, "zones"); n != 1 {
-		t.Errorf("зон = %d, want 1", n)
+		t.Errorf("zones = %d, want 1", n)
 	}
 
 	// Three unique domains (a repeated line does not create a
 	// duplicate), all new and pending a check (spec 6.2), without a
 	// lease.
 	if n := env.countOf(t, "domains"); n != 3 {
-		t.Errorf("доменов = %d, want 3", n)
+		t.Errorf("domains = %d, want 3", n)
 	}
 	for _, label := range []string{"example", "shop"} {
 		d, ok := env.domain(t, "crawl.test", label)
 		if !ok {
-			t.Fatalf("домен %s.crawl.test не создан", label)
+			t.Fatalf("the %s.crawl.test domain not created", label)
 		}
 		if d.status != int16(model.StatusNew) || d.checkState != int16(model.CheckStatePending) {
 			t.Errorf("%s: status/check_state = %d/%d, want new/pending", label, d.status, d.checkState)
 		}
 		if d.queuedAt != nil {
-			t.Errorf("%s: queued_at не NULL у нового домена", label)
+			t.Errorf("%s: queued_at not NULL on a new domain", label)
 		}
 		if d.flags&int16(model.FlagIDN) != 0 {
-			t.Errorf("%s: бит is_idn выставлен у ASCII-метки", label)
+			t.Errorf("%s: the is_idn bit set on an ASCII label", label)
 		}
 	}
 
@@ -277,21 +277,21 @@ func TestIngest_AddCreatesZonesAndDomains(t *testing.T) {
 	}
 	label := strings.TrimSuffix(res.ASCII, ".crawl.test")
 	if !strings.HasPrefix(label, "xn--") || strings.Contains(label, ".") {
-		t.Fatalf("тестовые данные: метка сайт = %q, ожидается punycode без точек", label)
+		t.Fatalf("the test data: the сайт label = %q, punycode without dots expected", label)
 	}
 	d, ok := env.domain(t, "crawl.test", label)
 	if !ok {
-		t.Fatalf("IDN-домен сайт.crawl.test (%s) не создан", label)
+		t.Fatalf("the IDN domain сайт.crawl.test (%s) not created", label)
 	}
 	if d.flags&int16(model.FlagIDN) == 0 {
-		t.Errorf("у метки %s нет бита is_idn", label)
+		t.Errorf("the %s label has no is_idn bit", label)
 	}
 
 	// The report in the journal (spec 6.1): the sha256 of the content
 	// and the counters.
 	f, ok := env.fileBySHA(t, sha[:])
 	if !ok {
-		t.Fatal("отчёт файла не записан в ingest_files")
+		t.Fatal("the file report not written to ingest_files")
 	}
 	want := fileRecordState{
 		zoneID:     z.id,
@@ -301,19 +301,19 @@ func TestIngest_AddCreatesZonesAndDomains(t *testing.T) {
 		added:      3,
 	}
 	if f != want {
-		t.Errorf("запись ingest_files = %+v, want %+v", f, want)
+		t.Errorf("the ingest_files record = %+v, want %+v", f, want)
 	}
 
 	// The file left incoming and landed in processed keeping the
 	// structure (spec 5.1); the staging batch is cleared.
 	if !existsOnDisk(t, filepath.Join(env.dir, ingest.DirProcessed, "crawl.test/add/list.txt")) {
-		t.Error("файл не перемещён в processed/crawl.test/add/list.txt")
+		t.Error("the file not moved to processed/crawl.test/add/list.txt")
 	}
 	if existsOnDisk(t, filepath.Join(env.dir, "crawl.test/add/list.txt")) {
-		t.Error("файл остался в incoming")
+		t.Error("the file left in incoming")
 	}
 	if n := env.countOf(t, "ingest_stage"); n != 0 {
-		t.Errorf("строк в ingest_stage после обработки = %d, want 0", n)
+		t.Errorf("ingest_stage rows after the processing = %d, want 0", n)
 	}
 }
 
@@ -327,7 +327,7 @@ func TestIngest_UnicodeZoneDirectory(t *testing.T) {
 
 	out := env.process(t, "москва/add/список.txt", fileContent("сайт.москва", "торг.москва"))
 	if out.Kind != ingest.OutcomeApplied {
-		t.Fatalf("итог = %q, want applied", out.Kind)
+		t.Fatalf("outcome = %q, want applied", out.Kind)
 	}
 
 	// The zone is created in punycode form; xn--80adxhks is the
@@ -335,10 +335,10 @@ func TestIngest_UnicodeZoneDirectory(t *testing.T) {
 	// against idn.Normalize).
 	z, ok := env.zone(t, "xn--80adxhks")
 	if !ok {
-		t.Fatal("зона москва (xn--80adxhks) не создана")
+		t.Fatal("the москва zone (xn--80adxhks) not created")
 	}
 	if z.name != "xn--80adxhks" || z.unicode != "москва" {
-		t.Errorf("зона = %q/%q, want xn--80adxhks/москва", z.name, z.unicode)
+		t.Errorf("the zone = %q/%q, want xn--80adxhks/москва", z.name, z.unicode)
 	}
 
 	// The IDN domain: a punycode label + the is_idn bit; the unicode
@@ -349,26 +349,26 @@ func TestIngest_UnicodeZoneDirectory(t *testing.T) {
 	}
 	d, ok := env.domain(t, "xn--80adxhks", res.Label)
 	if !ok {
-		t.Fatalf("домен сайт.москва (%s) не создан", res.Label)
+		t.Fatalf("the сайт.москва domain (%s) not created", res.Label)
 	}
 	if d.flags&int16(model.FlagIDN) == 0 {
-		t.Error("у IDN-метки нет бита is_idn")
+		t.Error("the IDN label has no is_idn bit")
 	}
 
 	// A file from the punycode directory of the same zone — the same
 	// zones row, no zone duplicates arise (spec 11.4 item 1).
 	out = env.process(t, "xn--80adxhks/add/second.txt", fileContent("third.москва"))
 	if out.Kind != ingest.OutcomeApplied {
-		t.Fatalf("итог = %q, want applied", out.Kind)
+		t.Fatalf("outcome = %q, want applied", out.Kind)
 	}
 	if n := env.countOf(t, "zones"); n != 1 {
-		t.Errorf("зон = %d, want 1 (unicode/punycode-каталоги — одна зона)", n)
+		t.Errorf("zones = %d, want 1 (the unicode/punycode directories — one zone)", n)
 	}
 	if n := env.countOf(t, "domains"); n != 3 {
-		t.Errorf("доменов = %d, want 3", n)
+		t.Errorf("domains = %d, want 3", n)
 	}
 	if _, ok := env.domain(t, "xn--80adxhks", "third"); !ok {
-		t.Error("домен third.москва не создан")
+		t.Error("the third.москва domain not created")
 	}
 }
 
@@ -383,19 +383,19 @@ func TestIngest_DuplicateFileSkipped(t *testing.T) {
 	content := fileContent("example.crawl.test", "shop.crawl.test")
 	out := env.process(t, "crawl.test/add/list.txt", content)
 	if out.Kind != ingest.OutcomeApplied {
-		t.Fatalf("первая обработка: итог = %q, want applied", out.Kind)
+		t.Fatalf("the first processing: outcome = %q, want applied", out.Kind)
 	}
 
 	// The same copy of the file appears in incoming again.
 	out = env.process(t, "crawl.test/add/list.txt", content)
 	if out.Kind != ingest.OutcomeDuplicate {
-		t.Fatalf("повторная обработка: итог = %q, want duplicate", out.Kind)
+		t.Fatalf("the repeated processing: outcome = %q, want duplicate", out.Kind)
 	}
 	if n := env.countOf(t, "ingest_files"); n != 1 {
-		t.Errorf("записей в ingest_files = %d, want 1 (дубль не отчётится)", n)
+		t.Errorf("ingest_files records = %d, want 1 (a duplicate is not reported)", n)
 	}
 	if n := env.countOf(t, "domains"); n != 2 {
-		t.Errorf("доменов = %d, want 2 (дубль не применяется)", n)
+		t.Errorf("domains = %d, want 2 (a duplicate is not applied)", n)
 	}
 
 	// Both file instances are in the archive: a name collision — the
@@ -403,7 +403,7 @@ func TestIngest_DuplicateFileSkipped(t *testing.T) {
 	proc := filepath.Join(env.dir, ingest.DirProcessed, "crawl.test/add")
 	for _, name := range []string{"list.txt", "list-2.txt"} {
 		if !existsOnDisk(t, filepath.Join(proc, name)) {
-			t.Errorf("в архиве processed нет %s", name)
+			t.Errorf("%s missing from the processed archive", name)
 		}
 	}
 }
@@ -418,7 +418,7 @@ func TestIngest_ModifiedFileSamePath(t *testing.T) {
 
 	if out := env.process(t, "crawl.test/add/list.txt",
 		fileContent("example.crawl.test", "shop.crawl.test")); out.Kind != ingest.OutcomeApplied {
-		t.Fatalf("первая обработка: итог = %q, want applied", out.Kind)
+		t.Fatalf("the first processing: outcome = %q, want applied", out.Kind)
 	}
 
 	// example has "passed" the check: ingest did not change the
@@ -433,41 +433,41 @@ func TestIngest_ModifiedFileSamePath(t *testing.T) {
 	out := env.process(t, "crawl.test/add/list.txt",
 		fileContent("example.crawl.test", "blog.crawl.test", "forum.crawl.test"))
 	if out.Kind != ingest.OutcomeApplied {
-		t.Fatalf("вторая обработка: итог = %q, want applied", out.Kind)
+		t.Fatalf("the second processing: outcome = %q, want applied", out.Kind)
 	}
 	if out.Report.Added != 2 || out.Report.Existed != 1 || out.Report.Revived != 0 {
-		t.Errorf("счётчики = added %d, existed %d, revived %d; want 2/1/0",
+		t.Errorf("counters = added %d, existed %d, revived %d; want 2/1/0",
 			out.Report.Added, out.Report.Existed, out.Report.Revived)
 	}
 
 	// The existing domain is untouched: alive/done and the lease in place.
 	d, ok := env.domain(t, "crawl.test", "example")
 	if !ok {
-		t.Fatal("домен example исчез")
+		t.Fatal("the example domain disappeared")
 	}
 	if d.status != int16(model.StatusAlive) || d.checkState != int16(model.CheckStateDone) {
-		t.Errorf("example: status/check_state = %d/%d, want alive/done (повторный add не меняет)",
+		t.Errorf("example: status/check_state = %d/%d, want alive/done (a repeated add does not change them)",
 			d.status, d.checkState)
 	}
 	if d.queuedAt == nil {
-		t.Error("queued_at сброшен у существующего домена")
+		t.Error("queued_at reset on the existing domain")
 	}
 
 	// The new ones — as from the first file: new/pending.
 	for _, label := range []string{"blog", "forum"} {
 		d, ok := env.domain(t, "crawl.test", label)
 		if !ok {
-			t.Fatalf("домен %s не добавлен", label)
+			t.Fatalf("the %s domain not added", label)
 		}
 		if d.status != int16(model.StatusNew) || d.checkState != int16(model.CheckStatePending) {
 			t.Errorf("%s: status/check_state = %d/%d, want new/pending", label, d.status, d.checkState)
 		}
 	}
 	if n := env.countOf(t, "domains"); n != 4 {
-		t.Errorf("доменов = %d, want 4", n)
+		t.Errorf("domains = %d, want 4", n)
 	}
 	if n := env.countOf(t, "ingest_files"); n != 2 {
-		t.Errorf("записей в ingest_files = %d, want 2 (по одной на файл)", n)
+		t.Errorf("ingest_files records = %d, want 2 (one per file)", n)
 	}
 }
 
@@ -481,24 +481,24 @@ func TestIngest_DeleteMarksDeleted(t *testing.T) {
 
 	if out := env.process(t, "crawl.test/add/list.txt",
 		fileContent("example.crawl.test", "shop.crawl.test")); out.Kind != ingest.OutcomeApplied {
-		t.Fatalf("add: итог = %q, want applied", out.Kind)
+		t.Fatalf("add: outcome = %q, want applied", out.Kind)
 	}
 
 	content := fileContent("example.crawl.test", "ghost.crawl.test")
 	sha := sha256.Sum256([]byte(content))
 	out := env.process(t, "crawl.test/delete/x.txt", content)
 	if out.Kind != ingest.OutcomeApplied {
-		t.Fatalf("delete: итог = %q, want applied", out.Kind)
+		t.Fatalf("delete: outcome = %q, want applied", out.Kind)
 	}
 	if out.Report.Deleted != 1 || out.Report.NotFound != 1 {
-		t.Errorf("счётчики delete = deleted %d, not_found %d; want 1/1",
+		t.Errorf("delete counters = deleted %d, not_found %d; want 1/1",
 			out.Report.Deleted, out.Report.NotFound)
 	}
 
 	// The domain stays in the DB with the deleted status (spec 13.1).
 	d, ok := env.domain(t, "crawl.test", "example")
 	if !ok {
-		t.Fatal("удалённый домен исчез из БД (ТЗ 13.1: остаётся)")
+		t.Fatal("the deleted domain disappeared from the DB (spec 13.1: it stays)")
 	}
 	if d.status != int16(model.StatusDeleted) {
 		t.Errorf("example: status = %d, want deleted", d.status)
@@ -507,26 +507,26 @@ func TestIngest_DeleteMarksDeleted(t *testing.T) {
 	// The domains not listed in the file are untouched.
 	d, ok = env.domain(t, "crawl.test", "shop")
 	if !ok {
-		t.Fatal("домен shop исчез из БД — delete не удаляет строки (ТЗ 13.1)")
+		t.Fatal("the shop domain disappeared from the DB — delete does not remove rows (spec 13.1)")
 	}
 	if d.status != int16(model.StatusNew) {
-		t.Errorf("shop: status = %d, want new (в delete-файле не упомянут)", d.status)
+		t.Errorf("shop: status = %d, want new (not listed in the delete file)", d.status)
 	}
 	if n := env.countOf(t, "domains"); n != 2 {
-		t.Errorf("доменов = %d, want 2 (строки из БД не удаляются)", n)
+		t.Errorf("domains = %d, want 2 (the DB rows are not removed)", n)
 	}
 
 	// The delete-file report in the journal: the delete action, the
 	// deleted counter.
 	f, ok := env.fileBySHA(t, sha[:])
 	if !ok {
-		t.Fatal("отчёт delete-файла не записан")
+		t.Fatal("the delete-file report not written")
 	}
 	if f.action != int16(model.ActionDelete) || f.path != "crawl.test/delete/x.txt" || f.deleted != 1 {
-		t.Errorf("запись ingest_files = %+v, want action delete, deleted 1", f)
+		t.Errorf("the ingest_files record = %+v, want action delete, deleted 1", f)
 	}
 	if !existsOnDisk(t, filepath.Join(env.dir, ingest.DirProcessed, "crawl.test/delete/x.txt")) {
-		t.Error("delete-файл не перемещён в processed")
+		t.Error("the delete file not moved to processed")
 	}
 }
 
@@ -540,7 +540,7 @@ func TestIngest_ReviveDeletedDomain(t *testing.T) {
 
 	if out := env.process(t, "crawl.test/add/one.txt",
 		fileContent("example.crawl.test")); out.Kind != ingest.OutcomeApplied {
-		t.Fatalf("add: итог = %q, want applied", out.Kind)
+		t.Fatalf("add: outcome = %q, want applied", out.Kind)
 	}
 	// The domain had already gone into work before the deletion: the
 	// lease stayed with the deleted domain — the return must reset it
@@ -553,7 +553,7 @@ func TestIngest_ReviveDeletedDomain(t *testing.T) {
 	}
 	if out := env.process(t, "crawl.test/delete/x.txt",
 		fileContent("# снятие с проверки", "example.crawl.test")); out.Kind != ingest.OutcomeApplied {
-		t.Fatalf("delete: итог = %q, want applied", out.Kind)
+		t.Fatalf("delete: outcome = %q, want applied", out.Kind)
 	}
 
 	// Different content — a different sha256 (otherwise it would be a
@@ -561,23 +561,23 @@ func TestIngest_ReviveDeletedDomain(t *testing.T) {
 	out := env.process(t, "crawl.test/add/one.txt",
 		fileContent("example.crawl.test", "# повторная загрузка"))
 	if out.Kind != ingest.OutcomeApplied {
-		t.Fatalf("возврат: итог = %q, want applied", out.Kind)
+		t.Fatalf("the revival: outcome = %q, want applied", out.Kind)
 	}
 	if out.Report.Added != 1 || out.Report.Revived != 1 || out.Report.Existed != 0 {
-		t.Errorf("счётчики = added %d, revived %d, existed %d; want 1/1/0",
+		t.Errorf("counters = added %d, revived %d, existed %d; want 1/1/0",
 			out.Report.Added, out.Report.Revived, out.Report.Existed)
 	}
 
 	d, ok := env.domain(t, "crawl.test", "example")
 	if !ok {
-		t.Fatal("домен example исчез")
+		t.Fatal("the example domain disappeared")
 	}
 	if d.status != int16(model.StatusNew) || d.checkState != int16(model.CheckStatePending) {
-		t.Errorf("example: status/check_state = %d/%d, want new/pending после возврата",
+		t.Errorf("example: status/check_state = %d/%d, want new/pending after the revival",
 			d.status, d.checkState)
 	}
 	if d.queuedAt != nil {
-		t.Error("queued_at не сброшен у возвращённого домена")
+		t.Error("queued_at not reset on the revived domain")
 	}
 }
 
@@ -603,32 +603,32 @@ func TestIngest_RejectedLinesWithinThreshold(t *testing.T) {
 
 	out := env.process(t, "crawl.test/add/dump.txt", content)
 	if out.Kind != ingest.OutcomeApplied {
-		t.Fatalf("итог = %q, want applied (2 отклонения из 22 ≈ 9%% ниже порога 10%%)", out.Kind)
+		t.Fatalf("outcome = %q, want applied (2 rejections out of 22 ≈ 9%% below the 10%% threshold)", out.Kind)
 	}
 	if out.Report.Rejected != 2 || out.Report.Accepted != 20 {
-		t.Errorf("строки = accepted %d, rejected %d; want 20/2", out.Report.Accepted, out.Report.Rejected)
+		t.Errorf("lines = accepted %d, rejected %d; want 20/2", out.Report.Accepted, out.Report.Rejected)
 	}
 	if out.Report.Reasons[ingest.ReasonWrongZone] != 1 || out.Report.Reasons[ingest.ReasonInvalid] != 1 {
-		t.Errorf("причины отклонений = %v, want wrong_zone 1, invalid 1", out.Report.Reasons)
+		t.Errorf("rejection reasons = %v, want wrong_zone 1, invalid 1", out.Report.Reasons)
 	}
 
 	// Only the valid lines became domains.
 	if n := env.countOf(t, "domains"); n != 20 {
-		t.Errorf("доменов = %d, want 20", n)
+		t.Errorf("domains = %d, want 20", n)
 	}
 	if _, ok := env.domain(t, "crawl.test", "bad"); ok {
-		t.Error("строка чужой зоны попала в domains")
+		t.Error("a foreign-zone line made it into domains")
 	}
 
 	f, ok := env.fileBySHA(t, sha[:])
 	if !ok {
-		t.Fatal("отчёт не записан")
+		t.Fatal("the report not written")
 	}
 	if f.rejected != 2 || f.added != 20 || f.linesTotal != 22 {
-		t.Errorf("запись ingest_files = %+v, want rejected 2, added 20, lines 22", f)
+		t.Errorf("the ingest_files record = %+v, want rejected 2, added 20, lines 22", f)
 	}
 	if !existsOnDisk(t, filepath.Join(env.dir, ingest.DirProcessed, "crawl.test/add/dump.txt")) {
-		t.Error("файл с единичными отказами ушёл не в processed")
+		t.Error("the file with single rejections did not land in processed")
 	}
 }
 
@@ -651,40 +651,40 @@ func TestIngest_ErrorRatioFailsFile(t *testing.T) {
 	)
 	out := env.process(t, "crawl.test/add/dump.txt", content)
 	if out.Kind != ingest.OutcomeFailed {
-		t.Fatalf("итог = %q, want failed (доля отказов выше порога)", out.Kind)
+		t.Fatalf("outcome = %q, want failed (the rejection share above the threshold)", out.Kind)
 	}
 
 	// Neither domains nor a report: the batch is dropped, the journal
 	// row is not written (T-021: the same hash does not occupy the
 	// journal, a fixed file can be loaded again).
 	if n := env.countOf(t, "domains"); n != 0 {
-		t.Errorf("доменов = %d, want 0 (файл ошибочен целиком)", n)
+		t.Errorf("domains = %d, want 0 (the file is wrong as a whole)", n)
 	}
 	if n := env.countOf(t, "ingest_files"); n != 0 {
-		t.Errorf("записей в ingest_files = %d, want 0", n)
+		t.Errorf("ingest_files records = %d, want 0", n)
 	}
 	if n := env.countOf(t, "ingest_stage"); n != 0 {
-		t.Errorf("строк в ingest_stage = %d, want 0 (партия отброшена)", n)
+		t.Errorf("ingest_stage rows = %d, want 0 (the batch dropped)", n)
 	}
 
 	// The file in failed/ with a log report next to it (spec 5.1).
 	failed := filepath.Join(env.dir, ingest.DirFailed, "crawl.test/add/dump.txt")
 	if !existsOnDisk(t, failed) {
-		t.Fatal("файл не перемещён в failed/crawl.test/add/dump.txt")
+		t.Fatal("the file not moved to failed/crawl.test/add/dump.txt")
 	}
 	report, err := os.ReadFile(failed + ".report")
 	if err != nil {
-		t.Fatalf("лог-отчёт рядом с файлом: %v", err)
+		t.Fatalf("the log report next to the file: %v", err)
 	}
 	if !strings.Contains(string(report), "crawl.test/add/dump.txt") {
-		t.Errorf("лог-отчёт не называет файл:\n%s", report)
+		t.Errorf("the log report does not name the file:\n%s", report)
 	}
 	for _, reason := range []string{"wrong_zone: 3", "invalid: 1"} {
 		if !strings.Contains(string(report), reason) {
-			t.Errorf("лог-отчёт без счётчика %q:\n%s", reason, report)
+			t.Errorf("the log report missing the %q counter:\n%s", reason, report)
 		}
 	}
 	if existsOnDisk(t, filepath.Join(env.dir, "crawl.test/add/dump.txt")) {
-		t.Error("файл остался в incoming")
+		t.Error("the file left in incoming")
 	}
 }

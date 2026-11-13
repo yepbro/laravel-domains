@@ -33,7 +33,7 @@ func collapseSeedZone(t *testing.T, pool *pgxpool.Pool, name string) int16 {
 	if err := pool.QueryRow(context.Background(),
 		`INSERT INTO zones (name) VALUES ($1) RETURNING id`, name,
 	).Scan(&id); err != nil {
-		t.Fatalf("зона %s: %v", name, err)
+		t.Fatalf("zone %s: %v", name, err)
 	}
 	return id
 }
@@ -55,7 +55,7 @@ func collapseSeedDomains(t *testing.T, pool *pgxpool.Pool, zone int16, prefix st
 			`INSERT INTO domains (zone_id, label, check_state) VALUES ($1, $2, $3) RETURNING id`,
 			zone, fmt.Sprintf("%s%d", prefix, i), state,
 		).Scan(&id); err != nil {
-			t.Fatalf("домен %s%d: %v", prefix, i, err)
+			t.Fatalf("domain %s%d: %v", prefix, i, err)
 		}
 		ids = append(ids, id)
 	}
@@ -96,7 +96,7 @@ func collapseCount(t *testing.T, pool *pgxpool.Pool, query string, args ...any) 
 	t.Helper()
 	var n int64
 	if err := pool.QueryRow(context.Background(), query, args...).Scan(&n); err != nil {
-		t.Fatalf("счётчик %q %v: %v", query, args, err)
+		t.Fatalf("counter %q %v: %v", query, args, err)
 	}
 	return n
 }
@@ -110,7 +110,7 @@ func collapseZoneID(t *testing.T, pool *pgxpool.Pool, name string) (int16, bool)
 		return 0, false
 	}
 	if err != nil {
-		t.Fatalf("зона %s: %v", name, err)
+		t.Fatalf("zone %s: %v", name, err)
 	}
 	return id, true
 }
@@ -146,7 +146,7 @@ func collapseTakeSnapshot(t *testing.T, pool *pgxpool.Pool) collapseSnapshot {
 
 	rows, err := pool.Query(ctx, `SELECT zone_id, id, label, check_state FROM domains ORDER BY zone_id, id`)
 	if err != nil {
-		t.Fatalf("слепок доменов: %v", err)
+		t.Fatalf("domains snapshot: %v", err)
 	}
 	for rows.Next() {
 		var z, state int16
@@ -154,31 +154,31 @@ func collapseTakeSnapshot(t *testing.T, pool *pgxpool.Pool) collapseSnapshot {
 		var label string
 		if err := rows.Scan(&z, &id, &label, &state); err != nil {
 			rows.Close()
-			t.Fatalf("слепок доменов: чтение: %v", err)
+			t.Fatalf("domains snapshot: reading: %v", err)
 		}
 		s.domains += fmt.Sprintf("[%d %d %s %d]", z, id, label, state)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
-		t.Fatalf("слепок доменов: %v", err)
+		t.Fatalf("domains snapshot: %v", err)
 	}
 
 	zrows, err := pool.Query(ctx, `SELECT id, name FROM zones ORDER BY name`)
 	if err != nil {
-		t.Fatalf("слепок зон: %v", err)
+		t.Fatalf("zones snapshot: %v", err)
 	}
 	for zrows.Next() {
 		var id int16
 		var name string
 		if err := zrows.Scan(&id, &name); err != nil {
 			zrows.Close()
-			t.Fatalf("слепок зон: чтение: %v", err)
+			t.Fatalf("zones snapshot: reading: %v", err)
 		}
 		s.zones += fmt.Sprintf("[%d %s]", id, name)
 	}
 	zrows.Close()
 	if err := zrows.Err(); err != nil {
-		t.Fatalf("слепок зон: %v", err)
+		t.Fatalf("zones snapshot: %v", err)
 	}
 
 	for _, table := range []string{"domains", "subdomain_results", "laravel_domains", "laravel_findings"} {
@@ -257,7 +257,7 @@ func TestZonesCollapse(t *testing.T) {
 	ctx := context.Background()
 	in, twoLD, coUK, allow := collapseSeed(t, pool)
 
-	t.Run("dry-run: план без изменений", func(t *testing.T) {
+	t.Run("dry-run: the plan, no changes", func(t *testing.T) {
 		before := collapseTakeSnapshot(t, pool)
 		var out strings.Builder
 		if err := collapse.Run(ctx, pool, collapse.Options{Allowlist: collapseAllowlist}, &out); err != nil {
@@ -265,25 +265,25 @@ func TestZonesCollapse(t *testing.T) {
 		}
 		got := out.String()
 		for _, want := range []string{
-			"зона", "TLD", "доменов", "результатов", "находок", "история", "файлов", "партиции",
-			"5g.in", "co.uk", " in ", " uk ", "есть", "default",
-			"итого: 2LD-зон 1, доменов 5 → зона in",
-			"итого: 2LD-зон 1, доменов 2 → зона uk",
-			"dry-run: данные не изменены",
+			"zone", "TLD", "domains", "results", "findings", "history", "files", "partitions",
+			"5g.in", "co.uk", " in ", " uk ", "yes", "default",
+			"total: 1 2LD zones, 5 domains → zone in",
+			"total: 1 2LD zones, 2 domains → zone uk",
+			"dry-run: no data changed",
 		} {
 			if !strings.Contains(got, want) {
-				t.Errorf("план dry-run не содержит %q:\n%s", want, got)
+				t.Errorf("the dry-run plan does not contain %q:\n%s", want, got)
 			}
 		}
 		if strings.Contains(got, "crawl.test") {
-			t.Errorf("allowlist-зона попала в план:\n%s", got)
+			t.Errorf("the allowlist zone made it into the plan:\n%s", got)
 		}
 		if after := collapseTakeSnapshot(t, pool); after != before {
-			t.Error("dry-run изменил данные")
+			t.Error("the dry-run changed the data")
 		}
 	})
 
-	t.Run("предусловие check_state = 1 отказывает", func(t *testing.T) {
+	t.Run("the check_state = 1 precondition refuses", func(t *testing.T) {
 		if _, err := pool.Exec(ctx,
 			`UPDATE domains SET check_state = 1 WHERE zone_id = $1 AND label = 'site0'`, twoLD); err != nil {
 			t.Fatalf("queued: %v", err)
@@ -292,27 +292,27 @@ func TestZonesCollapse(t *testing.T) {
 		var out strings.Builder
 		err := collapse.Run(ctx, pool, collapse.Options{Allowlist: collapseAllowlist, Apply: true}, &out)
 		if err == nil || !strings.Contains(err.Error(), "check_state = 1") {
-			t.Fatalf("ошибка = %v, хочу отказ предусловия", err)
+			t.Fatalf("error = %v, want the precondition refusal", err)
 		}
 		if !strings.Contains(err.Error(), "5g.in") {
-			t.Errorf("ошибка %v не перечисляет зону", err)
+			t.Errorf("error %v does not list the zone", err)
 		}
 		if !strings.Contains(out.String(), "5g.in — 1") {
-			t.Errorf("отчёт не перечисляет домены в очереди:\n%s", out.String())
+			t.Errorf("the report does not list the queued domains:\n%s", out.String())
 		}
 		if after := collapseTakeSnapshot(t, pool); after != before {
-			t.Error("отказ предусловия изменил данные")
+			t.Error("the precondition refusal changed the data")
 		}
 
 		// The operator triage: the queue is drained — a normal apply must
 		// go through without --force.
 		if _, err := pool.Exec(ctx,
 			`UPDATE domains SET check_state = 0 WHERE zone_id = $1 AND label = 'site0'`, twoLD); err != nil {
-			t.Fatalf("сброс очереди: %v", err)
+			t.Fatalf("queue reset: %v", err)
 		}
 	})
 
-	t.Run("apply переносит всё и пост-проверки зелёные", func(t *testing.T) {
+	t.Run("apply moves everything and the post-checks are green", func(t *testing.T) {
 		var out strings.Builder
 		// Batch = 2: the five 5g.in domains go in several batches — the
 		// window path (§7.3) is checked along the way on a live DB.
@@ -324,17 +324,17 @@ func TestZonesCollapse(t *testing.T) {
 		// Zones: the 2LD ones removed, the TLD created, the allowlist
 		// alive.
 		if _, ok := collapseZoneID(t, pool, "5g.in"); ok {
-			t.Error("строка зоны 5g.in не удалена")
+			t.Error("the 5g.in zone row not deleted")
 		}
 		if _, ok := collapseZoneID(t, pool, "co.uk"); ok {
-			t.Error("строка зоны co.uk не удалена")
+			t.Error("the co.uk zone row not deleted")
 		}
 		uk, hasUK := collapseZoneID(t, pool, "uk")
 		if !hasUK {
-			t.Error("зона uk не создана переносом")
+			t.Error("the uk zone not created by the move")
 		}
 		if id, ok := collapseZoneID(t, pool, "crawl.test"); !ok || id != allow {
-			t.Error("allowlist-зона crawl.test затронута")
+			t.Error("the allowlist zone crawl.test touched")
 		}
 
 		// Domains: the TLD zone, the label with the prefix re-attached;
@@ -342,17 +342,17 @@ func TestZonesCollapse(t *testing.T) {
 		var n int64
 		if n = collapseCount(t, pool,
 			`SELECT count(*) FROM domains WHERE zone_id = $1 AND label LIKE 'site%.5g'`, in); n != 5 {
-			t.Errorf("доменов site<N>.5g в зоне in: %d, хочу 5", n)
+			t.Errorf("site<N>.5g domains in the in zone: %d, want 5", n)
 		}
 		if n = collapseCount(t, pool,
 			`SELECT count(*) FROM domains WHERE zone_id = $1 AND label LIKE 'shop%.co'`, uk); n != 2 {
-			t.Errorf("доменов shop<N>.co в зоне uk: %d, хочу 2", n)
+			t.Errorf("shop<N>.co domains in the uk zone: %d, want 2", n)
 		}
 		if n = collapseCount(t, pool, `SELECT count(*) FROM domains WHERE zone_id = $1 AND label = 'native0'`, in); n != 1 {
-			t.Errorf("домен-абориген native0: %d, хочу 1 (не тронут)", n)
+			t.Errorf("native domain native0: %d, want 1 (untouched)", n)
 		}
 		if n = collapseCount(t, pool, `SELECT count(*) FROM domains WHERE zone_id = $1 AND label = 'keep0'`, allow); n != 1 {
-			t.Errorf("allowlist-домен keep0: %d, хочу 1 (не тронут)", n)
+			t.Errorf("allowlist domain keep0: %d, want 1 (untouched)", n)
 		}
 
 		// The children and the history: re-pointed by zone_id (a join by
@@ -366,67 +366,67 @@ func TestZonesCollapse(t *testing.T) {
 			 WHERE r.zone_id = $1`: 5,
 		} {
 			if n = collapseCount(t, pool, table, in); n != want {
-				t.Errorf("дети зоны in (%s…): %d, хочу %d", table[:40], n, want)
+				t.Errorf("children of the in zone (%s…): %d, want %d", table[:40], n, want)
 			}
 		}
 		if n = collapseCount(t, pool,
 			`SELECT count(*) FROM laravel_history WHERE zone_id = $1`, in); n != 5 {
-			t.Errorf("laravel_history зоны in: %d, хочу 5", n)
+			t.Errorf("laravel_history of the in zone: %d, want 5", n)
 		}
 
 		// ingest_files: the 5g.in duplicate is removed (the owner in in
 		// stayed), the others are re-bound to the TLD.
 		if n = collapseCount(t, pool,
 			`SELECT count(*) FROM ingest_files WHERE sha256 = $1`, []byte{0xAA, 0xBB}); n != 1 {
-			t.Errorf("строк журнала с дублем содержимого: %d, хочу 1 (владелец в in)", n)
+			t.Errorf("journal rows with the duplicate content: %d, want 1 (the owner in in)", n)
 		}
 		if n = collapseCount(t, pool,
 			`SELECT count(*) FROM ingest_files WHERE zone_id IN ($1, $2)`, in, allow); n != 2 {
-			t.Errorf("файлов в in/crawl.test: %d, хочу 2 (перепривязка без потерь)", n)
+			t.Errorf("files in in/crawl.test: %d, want 2 (rebinding without losses)", n)
 		}
 		if n = collapseCount(t, pool,
 			`SELECT count(*) FROM ingest_files WHERE zone_id = ANY($1)`, []int16{twoLD, coUK}); n != 0 {
-			t.Errorf("файлов осталось в 2LD-зонах: %d, хочу 0", n)
+			t.Errorf("files left in the 2LD zones: %d, want 0", n)
 		}
 
 		// Partitions: the 2LD ones dropped (including the hash leaves),
 		// the TLD extracted.
 		for _, table := range []string{"domains", "subdomain_results", "laravel_domains", "laravel_findings"} {
 			if collapseHasZonePartition(t, pool, table, twoLD) {
-				t.Errorf("%s: партиция 5g.in не дропнута", table)
+				t.Errorf("%s: the 5g.in partition not dropped", table)
 			}
 			if collapseHasZonePartition(t, pool, table, coUK) {
-				t.Errorf("%s: партиция co.uk не дропнута", table)
+				t.Errorf("%s: the co.uk partition not dropped", table)
 			}
 			if !collapseHasZonePartition(t, pool, table, in) {
-				t.Errorf("%s: партиция зоны in не создана (шаг 2)", table)
+				t.Errorf("%s: the in zone partition not created (step 2)", table)
 			}
 		}
 		for _, leaf := range zoneLeafs(t, pool, "subdomain_results", twoLD) {
-			t.Errorf("hash-лист 2LD не дропнут: %s", leaf.name)
+			t.Errorf("the 2LD hash leaf not dropped: %s", leaf.name)
 		}
 
 		// The §7.5 post-checks — directly and from the command report.
 		if n = collapseCount(t, pool,
 			`SELECT count(*) FROM zones WHERE name LIKE '%.%' AND name <> ALL($1)`, collapseAllowlist); n != 0 {
-			t.Errorf("2LD-зон вне allowlist: %d, хочу 0", n)
+			t.Errorf("2LD zones outside the allowlist: %d, want 0", n)
 		}
 		for _, table := range []string{"domains", "subdomain_results", "laravel_domains", "laravel_findings", "laravel_history"} {
 			if n = collapseCount(t, pool,
 				`SELECT count(*) FROM `+table+` x WHERE NOT EXISTS (SELECT 1 FROM zones z WHERE z.id = x.zone_id)`); n != 0 {
-				t.Errorf("%s: сиротских zone_id %d, хочу 0", table, n)
+				t.Errorf("%s: orphan zone_id %d, want 0", table, n)
 			}
 		}
 		for _, want := range []string{
-			"пост-проверки: 2LD-зон вне allowlist: 0",
-			"сиротских zone_id: domains 0, subdomain_results 0, laravel_domains 0, laravel_findings 0, laravel_history 0",
-			"счётчики зон = агрегат: расхождений нет",
-			"реконсиляция счётчиков: перезаписано зон",
-			"спот-чек site0.5g.in: зона in, label site0.5g — ок",
-			"перенос завершён: 2LD-зон 2",
+			"post-checks: 2LD zones outside the allowlist: 0",
+			"orphan zone_id: domains 0, subdomain_results 0, laravel_domains 0, laravel_findings 0, laravel_history 0",
+			"zone counters = the aggregate: no mismatches",
+			"counter reconciliation: 2 zones rewritten",
+			"spot check site0.5g.in: zone in, label site0.5g — ok",
+			"the move is finished: 2 2LD zones",
 		} {
 			if !strings.Contains(got, want) {
-				t.Errorf("отчёт apply не содержит %q:\n%s", want, got)
+				t.Errorf("the apply report does not contain %q:\n%s", want, got)
 			}
 		}
 
@@ -438,7 +438,7 @@ func TestZonesCollapse(t *testing.T) {
 			t.Fatalf("zones.domains_total: %v", err)
 		}
 		if total != 6 {
-			t.Errorf("zones.domains_total зоны in = %d, хочу 6 (реконсиляция)", total)
+			t.Errorf("zones.domains_total of in = %d, want 6 (the reconciliation)", total)
 		}
 
 		// The §7.5 spot check — by the SQL function itself: the T zone,
@@ -450,21 +450,21 @@ func TestZonesCollapse(t *testing.T) {
 			t.Fatalf("domain_info(site1.5g.in): %v", err)
 		}
 		if zoneName != "in" || label != "site1.5g" {
-			t.Errorf("domain_info: зона %q, label %q; хочу in / site1.5g", zoneName, label)
+			t.Errorf("domain_info: zone %q, label %q; want in / site1.5g", zoneName, label)
 		}
 	})
 
-	t.Run("повторный apply — no-op", func(t *testing.T) {
+	t.Run("a repeated apply — a no-op", func(t *testing.T) {
 		before := collapseTakeSnapshot(t, pool)
 		var out strings.Builder
 		if err := collapse.Run(ctx, pool, collapse.Options{Allowlist: collapseAllowlist, Apply: true, Batch: 2}, &out); err != nil {
-			t.Fatalf("повторный apply: %v", err)
+			t.Fatalf("repeated apply: %v", err)
 		}
-		if got := out.String(); !strings.Contains(got, "2LD-зон вне allowlist нет — сворачивать нечего") {
-			t.Errorf("повторный apply не no-op:\n%s", got)
+		if got := out.String(); !strings.Contains(got, "no 2LD zones outside the allowlist — nothing to collapse") {
+			t.Errorf("the repeated apply is not a no-op:\n%s", got)
 		}
 		if after := collapseTakeSnapshot(t, pool); after != before {
-			t.Error("повторный apply изменил данные")
+			t.Error("the repeated apply changed the data")
 		}
 	})
 }
@@ -502,24 +502,24 @@ func TestZonesCollapse_Resume(t *testing.T) {
 	defer conn.Release()
 	flaky := &collapseFlakyConn{Conn: conn, allowBegin: 1}
 	if _, err := collapse.Zone(ctx, flaky, spec, 2); err == nil {
-		t.Fatal("имитация сбоя не сработала")
+		t.Fatal("the failure simulation did not fire")
 	}
 	var in int16
 	if err := pool.QueryRow(ctx, `SELECT id FROM zones WHERE name = 'in'`).Scan(&in); err != nil {
-		t.Fatalf("зона in после сбоя: %v", err)
+		t.Fatalf("the in zone after the failure: %v", err)
 	}
 	moved := collapseCount(t, pool, `SELECT count(*) FROM domains WHERE zone_id = $1`, in)
 	left := collapseCount(t, pool, `SELECT count(*) FROM domains WHERE zone_id = $1`, twoLD)
 	if moved != 2 || left != 3 {
-		t.Fatalf("после сбоя: перенесено %d, осталось %d; хочу 2/3 (первый батч зафиксирован)", moved, left)
+		t.Fatalf("after the failure: moved %d, left %d; want 2/3 (the first batch committed)", moved, left)
 	}
 	// The zone row and the partitions are in place — the transfer is
 	// not finished.
 	if _, ok := collapseZoneID(t, pool, "5g.in"); !ok {
-		t.Fatal("строка зоны удалена до завершения переноса")
+		t.Fatal("the zone row deleted before the move finished")
 	}
 	if !collapseHasZonePartition(t, pool, "domains", twoLD) {
-		t.Fatal("партиции 2LD дропнуты до завершения переноса")
+		t.Fatal("the 2LD partitions dropped before the move finished")
 	}
 
 	// A repeat by the same code (Run): the inventory sees the zone,
@@ -527,28 +527,28 @@ func TestZonesCollapse_Resume(t *testing.T) {
 	// remaining ids.
 	var out strings.Builder
 	if err := collapse.Run(ctx, pool, collapse.Options{Apply: true, Batch: 2}, &out); err != nil {
-		t.Fatalf("возобновление: %v", err)
+		t.Fatalf("resume: %v", err)
 	}
 
 	if _, ok := collapseZoneID(t, pool, "5g.in"); ok {
-		t.Error("строка зоны не удалена повтором")
+		t.Error("the zone row not deleted by the repeat")
 	}
 	if n := collapseCount(t, pool,
 		`SELECT count(*) FROM domains WHERE zone_id = $1 AND label LIKE 'site%.5g'`, in); n != 5 {
-		t.Errorf("доменов site<N>.5g в зоне in: %d, хочу 5 (без потерь и дублей)", n)
+		t.Errorf("site<N>.5g domains in the in zone: %d, want 5 (no losses or duplicates)", n)
 	}
 	for _, table := range []string{"domains", "subdomain_results", "laravel_domains", "laravel_findings", "laravel_history"} {
 		if n := collapseCount(t, pool,
 			`SELECT count(*) FROM `+table+` WHERE zone_id = $1`, twoLD); n != 0 {
-			t.Errorf("%s: строк 2LD-зоны осталось %d, хочу 0", table, n)
+			t.Errorf("%s: %d 2LD-zone rows left, want 0", table, n)
 		}
 	}
 	if collapseHasZonePartition(t, pool, "domains", twoLD) {
-		t.Error("партиции 2LD не дропнуты повтором")
+		t.Error("the 2LD partitions not dropped by the repeat")
 	}
 	if n := collapseCount(t, pool,
 		`SELECT count(*) FROM domains d WHERE NOT EXISTS (SELECT 1 FROM zones z WHERE z.id = d.zone_id)`); n != 0 {
-		t.Errorf("сиротских zone_id после возобновления: %d", n)
+		t.Errorf("orphan zone_id after the resume: %d", n)
 	}
 }
 
@@ -564,49 +564,49 @@ func TestZonesCollapse_Force(t *testing.T) {
 	ids := collapseSeedDomains(t, pool, twoLD, "site", 2, 2) // both queued
 	collapseSeedChildren(t, pool, twoLD, ids)
 
-	t.Run("dry-run предупреждает, но не отказывает", func(t *testing.T) {
+	t.Run("the dry-run warns but does not refuse", func(t *testing.T) {
 		var out strings.Builder
 		if err := collapse.Run(ctx, pool, collapse.Options{}, &out); err != nil {
-			t.Fatalf("dry-run с очередью: %v", err)
+			t.Fatalf("dry-run with a queue: %v", err)
 		}
 		got := out.String()
-		for _, want := range []string{"5g.in — 2", "dry-run: данные не изменены"} {
+		for _, want := range []string{"5g.in — 2", "dry-run: no data changed"} {
 			if !strings.Contains(got, want) {
-				t.Errorf("dry-run не содержит %q:\n%s", want, got)
+				t.Errorf("the dry-run does not contain %q:\n%s", want, got)
 			}
 		}
 	})
 
-	t.Run("apply без --force отказывает", func(t *testing.T) {
+	t.Run("apply without --force refuses", func(t *testing.T) {
 		before := collapseTakeSnapshot(t, pool)
 		var out strings.Builder
 		if err := collapse.Run(ctx, pool, collapse.Options{Apply: true}, &out); err == nil ||
 			!strings.Contains(err.Error(), "check_state = 1") {
-			t.Fatalf("ошибка = %v, хочу отказ предусловия", err)
+			t.Fatalf("error = %v, want the precondition refusal", err)
 		}
 		if after := collapseTakeSnapshot(t, pool); after != before {
-			t.Error("отказ предусловия изменил данные")
+			t.Error("the precondition refusal changed the data")
 		}
 	})
 
-	t.Run("apply --force переносит", func(t *testing.T) {
+	t.Run("apply --force moves", func(t *testing.T) {
 		var out strings.Builder
 		if err := collapse.Run(ctx, pool, collapse.Options{Apply: true, Force: true}, &out); err != nil {
 			t.Fatalf("apply --force: %v", err)
 		}
-		if !strings.Contains(out.String(), "продолжение по --force") {
-			t.Errorf("отчёт не отмечает обход предусловия:\n%s", out.String())
+		if !strings.Contains(out.String(), "continuing with --force") {
+			t.Errorf("the report does not note the precondition bypass:\n%s", out.String())
 		}
 		if _, ok := collapseZoneID(t, pool, "5g.in"); ok {
-			t.Error("зона 5g.in не свернулась")
+			t.Error("the 5g.in zone not collapsed")
 		}
 		var in int16
 		if err := pool.QueryRow(ctx, `SELECT id FROM zones WHERE name = 'in'`).Scan(&in); err != nil {
-			t.Fatalf("зона in: %v", err)
+			t.Fatalf("the in zone: %v", err)
 		}
 		if n := collapseCount(t, pool,
 			`SELECT count(*) FROM domains WHERE zone_id = $1 AND label LIKE 'site%.5g'`, in); n != 2 {
-			t.Errorf("доменов site<N>.5g в in: %d, хочу 2 (включая бывший queued)", n)
+			t.Errorf("site<N>.5g domains in in: %d, want 2 (including the former queued)", n)
 		}
 	})
 }
@@ -623,7 +623,7 @@ type collapseFlakyConn struct {
 func (c *collapseFlakyConn) Begin(ctx context.Context) (pgx.Tx, error) {
 	c.begins++
 	if c.begins > c.allowBegin {
-		return nil, fmt.Errorf("имитация сбоя: соединение потеряно после %d батчей", c.allowBegin)
+		return nil, fmt.Errorf("failure simulation: the connection lost after %d batches", c.allowBegin)
 	}
 	return c.Conn.Begin(ctx)
 }
@@ -647,16 +647,16 @@ func TestZonesCollapse_SmallPoolDeadlock(t *testing.T) {
 	dsn, cleanup := withTestSchema(t)
 	t.Cleanup(cleanup)
 	if err := migrate.Up(context.Background(), dsn); err != nil {
-		t.Fatalf("миграции: %v", err)
+		t.Fatalf("migrations: %v", err)
 	}
 	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
-		t.Fatalf("разбор DSN: %v", err)
+		t.Fatalf("parsing the DSN: %v", err)
 	}
 	cfg.MaxConns = 2 // the CLI contour: crawlerctl zones collapse (PoolSize = 2)
 	pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
 	if err != nil {
-		t.Fatalf("пул: %v", err)
+		t.Fatalf("pool: %v", err)
 	}
 	t.Cleanup(pool.Close)
 
@@ -680,10 +680,10 @@ func TestZonesCollapse_SmallPoolDeadlock(t *testing.T) {
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Fatalf("collapse.Run (пул 2): %v", err)
+			t.Fatalf("collapse.Run (pool 2): %v", err)
 		}
-		if !strings.Contains(out.String(), "перенос завершён: 2LD-зон 1") {
-			t.Errorf("отчёт apply неполон:\n%s", out.String())
+		if !strings.Contains(out.String(), "the move is finished: 1 2LD zones") {
+			t.Errorf("the apply report is incomplete:\n%s", out.String())
 		}
 	case <-time.After(deadline):
 		// Untie the run (Acquire feels the ctx cancellation) and WAIT for
@@ -699,6 +699,6 @@ func TestZonesCollapse_SmallPoolDeadlock(t *testing.T) {
 		case <-done:
 		case <-time.After(grace):
 		}
-		t.Fatalf("collapse.Run не завершился за %v (+%v на развязку отменой) — подвисание прохода, подозрение: дедлок пост-проверок §7.5 на пуле из 2 соединений (T-217)", deadline, grace)
+		t.Fatalf("collapse.Run did not finish within %v (+%v to untie by canceling) — a hung pass, suspicion: the §7.5 post-check deadlock on a pool of 2 connections (T-217)", deadline, grace)
 	}
 }

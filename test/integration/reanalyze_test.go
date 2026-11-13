@@ -48,22 +48,22 @@ var _ queue.Queue = (*reanQ)(nil)
 
 func (q *reanQ) Publish(_ context.Context, stream string, msg queue.Message) (string, error) {
 	if stream != queue.StreamAnalyze {
-		return "", fmt.Errorf("reanQ: публикация в %s, нужен %s", stream, queue.StreamAnalyze)
+		return "", fmt.Errorf("reanQ: publishing to %s, need %s", stream, queue.StreamAnalyze)
 	}
 	res, ok := msg.(queue.Result)
 	if !ok {
-		return "", fmt.Errorf("reanQ: публикация %T, нужен queue.Result", msg)
+		return "", fmt.Errorf("reanQ: publishing %T, need queue.Result", msg)
 	}
 	q.publishes = append(q.publishes, res)
 	return fmt.Sprintf("entry-%d", len(q.publishes)), nil
 }
 
 func (q *reanQ) Consume(context.Context, string, string, string, int) ([]queue.Delivery, error) {
-	panic("reanQ: Consume не используется")
+	panic("reanQ: Consume is not used")
 }
 
 func (q *reanQ) Ack(context.Context, string, string, ...string) error {
-	panic("reanQ: Ack не используется")
+	panic("reanQ: Ack is not used")
 }
 
 // reanSeedRow — a subdomain_results row of one domain: the PK differs
@@ -92,7 +92,7 @@ func reanBasketValue(ctx context.Context, t *testing.T, pool *pgxpool.Pool, age 
 	if err := pool.QueryRow(ctx,
 		"SELECT value FROM crawler_counters WHERE name = 'reanalyze:' || to_char(date_trunc('hour', now() - make_interval(hours => $1)), 'YYYY-MM-DD\"T\"HH24')",
 		int(age/time.Hour)).Scan(&v); err != nil {
-		t.Fatalf("корзина хвостов (%v назад): %v", age, err)
+		t.Fatalf("tail bucket (%v ago): %v", age, err)
 	}
 	return v
 }
@@ -106,7 +106,7 @@ func reanBasketValue(ctx context.Context, t *testing.T, pool *pgxpool.Pool, age 
 func reanSkipHourBoundary(t *testing.T) {
 	t.Helper()
 	if left := time.Until(time.Now().Truncate(time.Hour).Add(time.Hour)); left < 45*time.Second {
-		t.Skipf("граница календарного часа через %v — окно «предыдущего часа» нестабильно", left)
+		t.Skipf("calendar hour boundary in %v — the previous-hour window is unstable", left)
 	}
 }
 
@@ -131,11 +131,11 @@ func TestReanalyze_TickCursor(t *testing.T) {
 	dsn, cleanup := withTestSchema(t)
 	t.Cleanup(cleanup)
 	if err := migrate.Up(ctx, dsn); err != nil {
-		t.Fatalf("применение миграций к изолированной схеме: %v", err)
+		t.Fatalf("applying migrations to the isolated schema: %v", err)
 	}
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
-		t.Fatalf("подключение к тестовой схеме: %v", err)
+		t.Fatalf("connecting to the test schema: %v", err)
 	}
 	t.Cleanup(pool.Close)
 
@@ -181,13 +181,13 @@ func TestReanalyze_TickCursor(t *testing.T) {
 		t.Fatalf("ZoneStatsOnce: %v", err)
 	}
 	if got := reanBasketValue(ctx, t, pool, time.Hour); got != 1 {
-		t.Fatalf("корзина хвостов предыдущего часа = %d, want 1 (fresh NULL строка)", got)
+		t.Fatalf("previous-hour tail bucket = %d, want 1 (the fresh NULL row)", got)
 	}
 
 	q := &reanQ{}
 	var cursor analyzer.ReanalyzeCursor
 
-	t.Run("тик с якоря подбирает свежую без анализа", func(t *testing.T) {
+	t.Run("tick from the anchor picks up a fresh unanalyzed row", func(t *testing.T) {
 		res, err := analyzer.ReanalyzeTick(ctx, pool, q, vCurrent, &cursor, analyzer.ReanalyzeOptions{})
 		if err != nil {
 			t.Fatalf("ReanalyzeTick: %v", err)
@@ -195,31 +195,31 @@ func TestReanalyze_TickCursor(t *testing.T) {
 		// fresh — yes; done (the current version) and ancient (outside
 		// the window) — no.
 		if res.Selected != 1 || res.Published != 1 {
-			t.Fatalf("итог = %+v, want 1/1 (только свежая NULL)", res)
+			t.Fatalf("outcome = %+v, want 1/1 (only the fresh NULL)", res)
 		}
 		got := q.publishes[0]
 		if got.ZoneID != zone || got.DomainID != domain || got.SubdomainID != subFresh ||
 			got.Variant != model.VariantMain || got.Name != "example.reanalyze.test" {
-			t.Errorf("публикация = %+v, want ключ строки fresh", got)
+			t.Errorf("publication = %+v, want the fresh row key", got)
 		}
 	})
 
-	t.Run("повторный тик не переизбирает", func(t *testing.T) {
+	t.Run("a repeated tick does not re-select", func(t *testing.T) {
 		// The row is still not stamped (rules_version NULL): the cursor
 		// excludes it, not the version — the window is exhausted (the
 		// guard is still open by the bucket: the selection runs, there
 		// are no publications).
 		res, err := analyzer.ReanalyzeTick(ctx, pool, q, vCurrent, &cursor, analyzer.ReanalyzeOptions{})
 		if err != nil {
-			t.Fatalf("повторный ReanalyzeTick: %v", err)
+			t.Fatalf("repeat ReanalyzeTick: %v", err)
 		}
 		if res.Selected != 0 || res.Published != 0 || len(q.publishes) != 1 {
-			t.Fatalf("повторный итог = %+v (публикаций %d), want 0/0/1 — без переизбрания",
+			t.Fatalf("repeat outcome = %+v (%d publications), want 0/0/1 — no re-selection",
 				res, len(q.publishes))
 		}
 	})
 
-	t.Run("смена правил — дренаж с нуля находит старое вне lookback", func(t *testing.T) {
+	t.Run("rules change — the from-scratch drain finds stale rows outside the lookback", func(t *testing.T) {
 		// The PK form from the zero cursor: fresh (NULL) and ancient
 		// (vOld) — stale against the same current version, done — not.
 		res, err := analyzer.ReanalyzeDrain(ctx, pool, q, vCurrent, nil, analyzer.ReanalyzeOptions{})
@@ -227,21 +227,21 @@ func TestReanalyze_TickCursor(t *testing.T) {
 			t.Fatalf("ReanalyzeDrain: %v", err)
 		}
 		if res.Selected != 2 || res.Published != 2 {
-			t.Fatalf("дренаж = %+v, want 2/2 (fresh + ancient вне lookback)", res)
+			t.Fatalf("drain = %+v, want 2/2 (fresh + ancient outside the lookback)", res)
 		}
 		subs := map[int16]bool{}
 		for _, m := range q.publishes[1:] {
 			subs[m.SubdomainID] = true
 		}
 		if !subs[subAncient] {
-			t.Errorf("дренаж не нашёл ancient (субдомен %d) — вне lookback", subAncient)
+			t.Errorf("the drain did not find ancient (subdomain %d) — outside the lookback", subAncient)
 		}
 		if subs[subDone] {
-			t.Errorf("дренаж отобрал done (текущая версия) — не должна отбираться")
+			t.Errorf("the drain selected done (the current version) — it must not be selected")
 		}
 	})
 
-	t.Run("предикат курсора обслуживает subdomain_results_checked_idx", func(t *testing.T) {
+	t.Run("the cursor predicate is served by subdomain_results_checked_idx", func(t *testing.T) {
 		tx, err := pool.Begin(ctx)
 		if err != nil {
 			t.Fatalf("begin: %v", err)
@@ -279,7 +279,7 @@ func TestReanalyze_TickCursor(t *testing.T) {
 		for rows.Next() {
 			var line string
 			if err := rows.Scan(&line); err != nil {
-				t.Fatalf("EXPLAIN: чтение: %v", err)
+				t.Fatalf("EXPLAIN: reading: %v", err)
 			}
 			plan.WriteString(line)
 			plan.WriteByte('\n')
@@ -293,7 +293,7 @@ func TestReanalyze_TickCursor(t *testing.T) {
 		// <leaf>_checked_at_idx on zonal ones) — the assert matches the
 		// name suffix, invariant to the split.
 		if !strings.Contains(plan.String(), "_checked_at_idx") {
-			t.Errorf("предикат композитного курсора не обслуживается листовым экземпляром subdomain_results_checked_idx:\n%s",
+			t.Errorf("the composite cursor predicate is not served by the leaf instance of subdomain_results_checked_idx:\n%s",
 				plan.String())
 		}
 	})

@@ -134,7 +134,7 @@ type retryMatureFailTx struct {
 
 func (t *retryMatureFailTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
 	if strings.Contains(sql, "retry_mature") && strings.Contains(sql, retryMatureDecMark) {
-		return pgconn.CommandTag{}, errors.New("сбой декремента корзин (сценарий)")
+		return pgconn.CommandTag{}, errors.New("bucket decrement failure (the scenario)")
 	}
 	return t.Tx.Exec(ctx, sql, args...)
 }
@@ -154,11 +154,11 @@ func TestRetryTempErrorPass(t *testing.T) {
 	dsn, cleanup := withTestSchema(t)
 	t.Cleanup(cleanup)
 	if err := migrate.Up(ctx, dsn); err != nil {
-		t.Fatalf("применение миграций к изолированной схеме: %v", err)
+		t.Fatalf("applying migrations to the isolated schema: %v", err)
 	}
 	raw, err := pgxpool.New(ctx, dsn)
 	if err != nil {
-		t.Fatalf("подключение к тестовой схеме: %v", err)
+		t.Fatalf("connecting to the test schema: %v", err)
 	}
 	t.Cleanup(raw.Close)
 	pool := &retryTracePool{Pool: raw}
@@ -167,7 +167,7 @@ func TestRetryTempErrorPass(t *testing.T) {
 	// SET LOCAL transaction (all index forms disabled) EXPLAIN shows a
 	// seq scan over domains, no index nodes — the planner is forbidden
 	// the degenerate range scan over the partial domains_recheck_idx.
-	t.Run("план выборки закреплён SET LOCAL", func(t *testing.T) {
+	t.Run("the selection plan pinned by SET LOCAL", func(t *testing.T) {
 		tx, err := pool.Begin(ctx)
 		if err != nil {
 			t.Fatalf("begin: %v", err)
@@ -191,7 +191,7 @@ func TestRetryTempErrorPass(t *testing.T) {
 		for rows.Next() {
 			var line string
 			if err := rows.Scan(&line); err != nil {
-				t.Fatalf("EXPLAIN: чтение: %v", err)
+				t.Fatalf("EXPLAIN: reading: %v", err)
 			}
 			plan.WriteString(line)
 			plan.WriteByte('\n')
@@ -200,10 +200,10 @@ func TestRetryTempErrorPass(t *testing.T) {
 			t.Fatalf("EXPLAIN: %v", err)
 		}
 		if !retrySeqScanRe.MatchString(plan.String()) {
-			t.Errorf("закреплённый план без seq scan по domains (алиас d):\n%s", plan.String())
+			t.Errorf("the pinned plan has no seq scan over domains (the d alias):\n%s", plan.String())
 		}
 		if strings.Contains(plan.String(), "Index") || strings.Contains(plan.String(), "Bitmap") {
-			t.Errorf("закреплённый план содержит индексную форму (SET LOCAL не подействовал):\n%s", plan.String())
+			t.Errorf("the pinned plan has an index form (SET LOCAL did not take effect):\n%s", plan.String())
 		}
 	})
 
@@ -252,7 +252,7 @@ func TestRetryTempErrorPass(t *testing.T) {
 			"SELECT coalesce(sum(value), 0) FROM crawler_counters "+
 				"WHERE name >= 'retry_mature:' AND name < 'retry_mature:' || to_char(current_date, 'YYYY-MM-DD')",
 		).Scan(&sum); err != nil {
-			t.Fatalf("guard-сумма корзин: %v", err)
+			t.Fatalf("the guard sum of the buckets: %v", err)
 		}
 		return sum
 	}
@@ -265,7 +265,7 @@ func TestRetryTempErrorPass(t *testing.T) {
 	// the zero guard stops the drain BEFORE the next selection (T-202)
 	// — an empty heavy selection does not happen here; it is the
 	// backup stop of the drain when the buckets drift up.
-	t.Run("итерации дренажа сходятся: назначение и финализация", func(t *testing.T) {
+	t.Run("the drain iterations converge: requeue and finalization", func(t *testing.T) {
 		var logBuf strings.Builder
 		logger := slog.New(slog.NewTextHandler(&logBuf, nil))
 
@@ -287,13 +287,13 @@ func TestRetryTempErrorPass(t *testing.T) {
 		for pool.batchCalls() < 2 {
 			if time.Now().After(deadline) {
 				cancel()
-				t.Fatalf("дренаж не дошёл до исчерпания: тяжёлых выборок %d", pool.batchCalls())
+				t.Fatalf("the drain did not reach exhaustion: %d heavy selections", pool.batchCalls())
 			}
 			time.Sleep(5 * time.Millisecond)
 		}
 		time.Sleep(50 * time.Millisecond) // the drain must stop without a third selection
 		if n := pool.batchCalls(); n != 2 {
-			t.Fatalf("тяжёлых выборок %d, хочу 2: нулевой guard закрывает дренаж до выборки", n)
+			t.Fatalf("%d heavy selections, want 2: the zero guard closes the drain before the selection", n)
 		}
 		cancel()
 		if err := <-done; err != nil {
@@ -322,7 +322,7 @@ func TestRetryTempErrorPass(t *testing.T) {
 			var r domRow
 			var status, state int16
 			if err := rows.Scan(&label, &status, &state, &r.attempts, &r.lastCheck); err != nil {
-				t.Fatalf("select domains: чтение: %v", err)
+				t.Fatalf("select domains: reading: %v", err)
 			}
 			r.status, r.state = model.Status(status), model.CheckState(state)
 			got[label] = r
@@ -331,16 +331,16 @@ func TestRetryTempErrorPass(t *testing.T) {
 			t.Fatalf("select domains: %v", err)
 		}
 		if r := got["requeue"]; r.status != model.StatusTempError || r.state != model.CheckStatePending || r.attempts != 2 {
-			t.Errorf("requeue = статус %d состояние %d попыток %d, want temp_error/pending/2 (назначен повтор)", r.status, r.state, r.attempts)
+			t.Errorf("requeue = status %d state %d attempts %d, want temp_error/pending/2 (a retry assigned)", r.status, r.state, r.attempts)
 		}
 		if r := got["final"]; r.status != model.StatusDelegatedNoAddress || r.state != model.CheckStateDone || r.attempts != 0 {
-			t.Errorf("final = статус %d состояние %d попыток %d, want delegated_no_address/done/0 (итог по temp_attempts)", r.status, r.state, r.attempts)
+			t.Errorf("final = status %d state %d attempts %d, want delegated_no_address/done/0 (the outcome by temp_attempts)", r.status, r.state, r.attempts)
 		}
 		if r := got["young"]; r.status != model.StatusTempError || r.state != model.CheckStateDone || r.attempts != 0 {
-			t.Errorf("young тронут: %+v, want temp_error/done/0 (моложе окна)", r)
+			t.Errorf("young touched: %+v, want temp_error/done/0 (younger than the window)", r)
 		}
 		if r := got["pending"]; r.status != model.StatusTempError || r.state != model.CheckStatePending || r.attempts != 0 {
-			t.Errorf("pending тронут: %+v, want temp_error/pending/0 (не кандидат)", r)
+			t.Errorf("pending touched: %+v, want temp_error/pending/0 (not a candidate)", r)
 		}
 
 		// The zone counter deltas (the zc CTE of retryRequeueSQL, T-178):
@@ -352,7 +352,7 @@ func TestRetryTempErrorPass(t *testing.T) {
 			t.Fatalf("select zones: %v", err)
 		}
 		if checked != -1 || pend != 1 {
-			t.Errorf("счётчики зоны = checked %d pending %d, want -1 и 1 (переход done → pending)", checked, pend)
+			t.Errorf("zone counters = checked %d pending %d, want -1 and 1 (the done → pending transition)", checked, pend)
 		}
 
 		// The maturity buckets (T-202/T-267): the decrements of the tail
@@ -365,19 +365,19 @@ func TestRetryTempErrorPass(t *testing.T) {
 		if err := pool.QueryRow(ctx,
 			"SELECT value FROM crawler_counters WHERE name = 'retry_mature:2020-01-01'",
 		).Scan(&stale); err != nil {
-			t.Fatalf("корзина дат эпизодов: %v", err)
+			t.Fatalf("the episode date bucket: %v", err)
 		}
 		if stale != -2 {
-			t.Errorf("корзина 2020-01-01 = %d, want -2 (декременты назначения и финализации)", stale)
+			t.Errorf("the 2020-01-01 bucket = %d, want -2 (the requeue and finalization decrements)", stale)
 		}
 		if got := retryMatureSum(t); got != 0 {
-			t.Errorf("guard-сумма корзин = %d, want 0 (зрелые исчерпаны, дренаж не откроется)", got)
+			t.Errorf("the guard sum of the buckets = %d, want 0 (the mature exhausted, the drain will not open)", got)
 		}
 
 		// The drain outcome — the sum of the batches: one of each kind.
 		for _, want := range []string{"requeued=1", "finalized=1"} {
 			if !strings.Contains(logBuf.String(), want) {
-				t.Errorf("лог дренажа не содержит %q:\n%s", want, logBuf.String())
+				t.Errorf("the drain log does not contain %q:\n%s", want, logBuf.String())
 			}
 		}
 	})
@@ -395,7 +395,7 @@ func TestRetryTempErrorPass(t *testing.T) {
 	// common batch transaction it would hang on a foreign domains row
 	// while holding the counter bucket — the "counters → domains" edge
 	// of the deadlock cycle with the result recording.
-	t.Run("половины пачки — независимые транзакции (регрессия 40P01)", func(t *testing.T) {
+	t.Run("batch halves — independent transactions (the 40P01 regression)", func(t *testing.T) {
 		seed("mixreq", model.StatusTempError, model.CheckStateDone, "2020-01-01", 0) // requeue
 		seed("mixfin", model.StatusTempError, model.CheckStateDone, "2020-01-01", int16(scheduler.DefaultRetryMaxRetries))
 		// The guard fixture is self-sufficient: the tails of the drain
@@ -408,27 +408,27 @@ func TestRetryTempErrorPass(t *testing.T) {
 		if _, err := pool.Exec(ctx,
 			"UPDATE crawler_counters SET value = 0 WHERE name LIKE 'retry_mature:%'",
 		); err != nil {
-			t.Fatalf("обнуление корзин зрелости: %v", err)
+			t.Fatalf("zeroing the maturity buckets: %v", err)
 		}
 		if _, err := pool.Exec(ctx,
 			"INSERT INTO crawler_counters (name, value, updated_at) "+
 				"VALUES ('retry_mature:2020-01-01', 2, now()) "+
 				"ON CONFLICT (name) DO UPDATE SET value = EXCLUDED.value",
 		); err != nil {
-			t.Fatalf("reset корзины зрелости: %v", err)
+			t.Fatalf("resetting the maturity bucket: %v", err)
 		}
 
 		// The holder: the finalization candidate domains row is captured
 		// before the pass (an image of the result recording transaction).
 		holder, err := pool.Begin(ctx)
 		if err != nil {
-			t.Fatalf("begin держателя: %v", err)
+			t.Fatalf("beginning the holder: %v", err)
 		}
 		defer func() { _ = holder.Rollback(ctx) }()
 		if _, err := holder.Exec(ctx,
 			"SELECT id FROM domains WHERE zone_id = $1 AND label = $2 FOR UPDATE", zone, "mixfin",
 		); err != nil {
-			t.Fatalf("FOR UPDATE держателя: %v", err)
+			t.Fatalf("the holder FOR UPDATE: %v", err)
 		}
 
 		type onceResult struct {
@@ -453,7 +453,7 @@ func TestRetryTempErrorPass(t *testing.T) {
 			if err := pool.QueryRow(ctx,
 				"SELECT check_state FROM domains WHERE zone_id = $1 AND label = $2", zone, "mixreq",
 			).Scan(&state); err != nil {
-				t.Fatalf("чтение mixreq: %v", err)
+				t.Fatalf("reading mixreq: %v", err)
 			}
 			if state == int16(model.CheckStatePending) {
 				break
@@ -461,13 +461,13 @@ func TestRetryTempErrorPass(t *testing.T) {
 			time.Sleep(5 * time.Millisecond)
 		}
 		if state != int16(model.CheckStatePending) {
-			t.Fatalf("половина повтора не зафиксирована до финализации: check_state mixreq = %d", state)
+			t.Fatalf("the requeue half not committed before the finalization: check_state mixreq = %d", state)
 		}
 
 		// The holder releases the row — the finalization goes through,
 		// the pass completes with the pair {1, 1}.
 		if err := holder.Rollback(ctx); err != nil {
-			t.Fatalf("откат держателя: %v", err)
+			t.Fatalf("rolling back the holder: %v", err)
 		}
 		select {
 		case r := <-done:
@@ -475,19 +475,19 @@ func TestRetryTempErrorPass(t *testing.T) {
 				t.Fatalf("RetryOnce: %v", r.err)
 			}
 			if want := (scheduler.RetryResult{Requeued: 1, Finalized: 1}); r.res != want {
-				t.Errorf("итог = %+v, want %+v", r.res, want)
+				t.Errorf("outcome = %+v, want %+v", r.res, want)
 			}
 		case <-time.After(10 * time.Second):
-			t.Fatal("RetryOnce не завершился после освобождения строки")
+			t.Fatal("RetryOnce did not finish after the row was released")
 		}
 		var finStatus int16
 		if err := pool.QueryRow(ctx,
 			"SELECT status FROM domains WHERE zone_id = $1 AND label = $2", zone, "mixfin",
 		).Scan(&finStatus); err != nil {
-			t.Fatalf("чтение mixfin: %v", err)
+			t.Fatalf("reading mixfin: %v", err)
 		}
 		if finStatus != int16(model.StatusDelegatedNoAddress) {
-			t.Errorf("статус mixfin = %d, want delegated_no_address (финализация после освобождения)", finStatus)
+			t.Errorf("mixfin status = %d, want delegated_no_address (the finalization after the release)", finStatus)
 		}
 	})
 
@@ -499,14 +499,14 @@ func TestRetryTempErrorPass(t *testing.T) {
 	// the operators are spread across autocommits and the bucket is
 	// caught up by the reconciliation (counters_test.go, the ±1
 	// window).
-	t.Run("сбой декремента корзин откатывает половину повтора", func(t *testing.T) {
+	t.Run("a bucket decrement failure rolls back the requeue half", func(t *testing.T) {
 		seed("mixfail", model.StatusTempError, model.CheckStateDone, "2020-01-01", 0)
 		if _, err := pool.Exec(ctx,
 			"INSERT INTO crawler_counters (name, value, updated_at) "+
 				"VALUES ('retry_mature:2020-01-01', 1, now()) "+
 				"ON CONFLICT (name) DO UPDATE SET value = EXCLUDED.value",
 		); err != nil {
-			t.Fatalf("reset корзины зрелости: %v", err)
+			t.Fatalf("resetting the maturity bucket: %v", err)
 		}
 		fail := &retryMatureFailPool{Pool: raw}
 
@@ -514,20 +514,20 @@ func TestRetryTempErrorPass(t *testing.T) {
 		if err := pool.QueryRow(ctx,
 			"SELECT domains_checked, domains_pending FROM zones WHERE id = $1", zone,
 		).Scan(&checkedBefore, &pendBefore); err != nil {
-			t.Fatalf("select zones до: %v", err)
+			t.Fatalf("select zones before: %v", err)
 		}
 		if _, err := scheduler.RetryOnce(ctx, fail, scheduler.RetryOptions{BatchSize: 1}); err == nil ||
-			!strings.Contains(err.Error(), "декремент корзин зрелости") {
-			t.Fatalf("RetryOnce = %v, want ошибка декремента корзин зрелости", err)
+			!strings.Contains(err.Error(), "maturity bucket decrement") {
+			t.Fatalf("RetryOnce = %v, want a maturity bucket decrement error", err)
 		}
 		var state, attempts int16
 		if err := pool.QueryRow(ctx,
 			"SELECT check_state, temp_attempts FROM domains WHERE zone_id = $1 AND label = $2", zone, "mixfail",
 		).Scan(&state, &attempts); err != nil {
-			t.Fatalf("чтение mixfail: %v", err)
+			t.Fatalf("reading mixfail: %v", err)
 		}
 		if model.CheckState(state) != model.CheckStateDone || attempts != 0 {
-			t.Fatalf("mixfail = состояние %d попыток %d, want done/0 (перевод откатился вместе с декрементом)",
+			t.Fatalf("mixfail = state %d attempts %d, want done/0 (the transition rolled back together with the decrement)",
 				state, attempts)
 		}
 		var checked, pend int64
@@ -537,35 +537,35 @@ func TestRetryTempErrorPass(t *testing.T) {
 			t.Fatalf("select zones: %v", err)
 		}
 		if checked != checkedBefore || pend != pendBefore {
-			t.Errorf("дельты зоны изменились при откате: checked %d pending %d, want без изменений (%d/%d)",
+			t.Errorf("the zone deltas changed on the rollback: checked %d pending %d, want unchanged (%d/%d)",
 				checked, pend, checkedBefore, pendBefore)
 		}
 		var basket int64
 		if err := pool.QueryRow(ctx,
 			"SELECT value FROM crawler_counters WHERE name = 'retry_mature:2020-01-01'",
 		).Scan(&basket); err != nil {
-			t.Fatalf("корзина дат эпизодов: %v", err)
+			t.Fatalf("the episode date bucket: %v", err)
 		}
 		if basket != 1 {
-			t.Errorf("корзина 2020-01-01 = %d, want 1 (декремент откатился вместе с переводом)", basket)
+			t.Errorf("the 2020-01-01 bucket = %d, want 1 (the decrement rolled back together with the transition)", basket)
 		}
 		// The candidate is intact — the next pass (the live pool)
 		// handles it: the transition and the decrement go together, the
 		// zone deltas land.
 		res, err := scheduler.RetryOnce(ctx, pool, scheduler.RetryOptions{BatchSize: 1})
 		if err != nil {
-			t.Fatalf("повторный проход: %v", err)
+			t.Fatalf("a repeated pass: %v", err)
 		}
 		if res.Requeued != 1 {
-			t.Errorf("повторный проход = %+v, want requeued=1 (кандидат уцелел в done)", res)
+			t.Errorf("a repeated pass = %+v, want requeued=1 (the candidate survived in done)", res)
 		}
 		if err := pool.QueryRow(ctx,
 			"SELECT domains_checked, domains_pending FROM zones WHERE id = $1", zone,
 		).Scan(&checked, &pend); err != nil {
-			t.Fatalf("select zones после прохода: %v", err)
+			t.Fatalf("select zones after the pass: %v", err)
 		}
 		if checked != checkedBefore-1 || pend != pendBefore+1 {
-			t.Errorf("дельты зоны после прохода: checked %d pending %d, want %d и %d (done → pending)",
+			t.Errorf("the zone deltas after the pass: checked %d pending %d, want %d and %d (done → pending)",
 				checked, pend, checkedBefore-1, pendBefore+1)
 		}
 	})
@@ -573,17 +573,17 @@ func TestRetryTempErrorPass(t *testing.T) {
 	// Steady state (the guard trust boundary, the T-202 TZ): no mature
 	// rows — the heavy selection is not run at all, the tick stands for
 	// one bucket sum.
-	t.Run("зрелых нет — тяжёлая выборка не выполняется", func(t *testing.T) {
+	t.Run("no mature ones — the heavy selection does not run", func(t *testing.T) {
 		before := pool.batchCalls()
 		res, err := scheduler.RetryOnce(ctx, pool, scheduler.RetryOptions{})
 		if err != nil {
 			t.Fatalf("RetryOnce: %v", err)
 		}
 		if res != (scheduler.RetryResult{}) {
-			t.Fatalf("итог %+v, хочу пустой (guard: зрелых нет)", res)
+			t.Fatalf("outcome %+v, want empty (the guard: no mature ones)", res)
 		}
 		if n := pool.batchCalls(); n != before {
-			t.Fatalf("тяжёлая выборка выполнена %d раз при нулевой сумме корзин (было %d)", n-before, before)
+			t.Fatalf("the heavy selection ran %d times with a zero bucket sum (was %d)", n-before, before)
 		}
 	})
 
@@ -591,7 +591,7 @@ func TestRetryTempErrorPass(t *testing.T) {
 	// not in the guard — the episodes mature by midnight, the heavy
 	// selection does not open, although the domain formally answered
 	// the status criterion.
-	t.Run("сегодняшние эпизоды — guard не пускает", func(t *testing.T) {
+	t.Run("today's episodes — the guard does not let them through", func(t *testing.T) {
 		// The episode date — the current_date of the DB ITSELF (the bind
 		// parameter $5::date accepts only a literal, "current_date" as a
 		// string is not parsed; the value from the DB — the timezone is
@@ -607,7 +607,7 @@ func TestRetryTempErrorPass(t *testing.T) {
 			"INSERT INTO crawler_counters (name, value) "+
 				"VALUES ('retry_mature:' || to_char(current_date, 'YYYY-MM-DD'), 1)",
 		); err != nil {
-			t.Fatalf("insert корзина суток: %v", err)
+			t.Fatalf("inserting the day bucket: %v", err)
 		}
 		before := pool.batchCalls()
 		res, err := scheduler.RetryOnce(ctx, pool, scheduler.RetryOptions{})
@@ -615,10 +615,10 @@ func TestRetryTempErrorPass(t *testing.T) {
 			t.Fatalf("RetryOnce: %v", err)
 		}
 		if res != (scheduler.RetryResult{}) {
-			t.Fatalf("итог %+v, хочу пустой (сегодняшний эпизод незрелый)", res)
+			t.Fatalf("outcome %+v, want empty (today's episode is immature)", res)
 		}
 		if n := pool.batchCalls(); n != before {
-			t.Fatalf("тяжёлая выборка выполнена при незрелых корзинах: %d вызовов (было %d)", n-before, before)
+			t.Fatalf("the heavy selection ran with immature buckets: %d calls (was %d)", n-before, before)
 		}
 	})
 
@@ -627,7 +627,7 @@ func TestRetryTempErrorPass(t *testing.T) {
 	// today), the mature one — 0, the stale bucket of the old episode
 	// dates (the tail of the 2020-01-01 decrements) is removed; the
 	// guard sum stays zero (the today bucket is not in the sum).
-	t.Run("реконсиляция корзин сходится с живым окном", func(t *testing.T) {
+	t.Run("the bucket reconciliation converges with the live window", func(t *testing.T) {
 		if _, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{}); err != nil {
 			t.Fatalf("ZoneStatsOnce: %v", err)
 		}
@@ -635,50 +635,50 @@ func TestRetryTempErrorPass(t *testing.T) {
 		if err := pool.QueryRow(ctx,
 			"SELECT value FROM crawler_counters WHERE name = 'retry_mature:' || to_char(current_date, 'YYYY-MM-DD')",
 		).Scan(&today); err != nil {
-			t.Fatalf("корзина суток: %v", err)
+			t.Fatalf("the day bucket: %v", err)
 		}
 		if today != 1 {
-			t.Errorf("корзина суток после прохода = %d, want 1 (fresh — один эпизод сегодня)", today)
+			t.Errorf("the day bucket after the pass = %d, want 1 (fresh — one episode today)", today)
 		}
 		if err := pool.QueryRow(ctx,
 			"SELECT value FROM crawler_counters WHERE name = 'retry_mature:' || to_char(current_date - 1, 'YYYY-MM-DD')",
 		).Scan(&past); err != nil {
-			t.Fatalf("зрелая корзина: %v", err)
+			t.Fatalf("the mature bucket: %v", err)
 		}
 		if past != 0 {
-			t.Errorf("зрелая корзина после прохода = %d, want 0 (живых зрелых нет)", past)
+			t.Errorf("the mature bucket after the pass = %d, want 0 (no live mature ones)", past)
 		}
 		var stale int
 		if err := pool.QueryRow(ctx,
 			"SELECT count(*) FROM crawler_counters WHERE name = 'retry_mature:2020-01-01'",
 		).Scan(&stale); err != nil {
-			t.Fatalf("устаревшая корзина: %v", err)
+			t.Fatalf("the stale bucket: %v", err)
 		}
 		if stale != 0 {
-			t.Error("устаревшая корзина 2020-01-01 жива после прохода (очистка T-202 не сработала)")
+			t.Error("the stale 2020-01-01 bucket alive after the pass (the T-202 cleanup did not fire)")
 		}
 		if got := retryMatureSum(t); got != 0 {
-			t.Errorf("guard-сумма корзин = %d, want 0 (сегодняшняя корзина в сумму не входит)", got)
+			t.Errorf("the guard sum of the buckets = %d, want 0 (today's bucket is not in the sum)", got)
 		}
 	})
 
 	// Missing bucket rows — an honest zero, not an error: the bucket
 	// rows are created by the first day increment or the reconciliation
 	// pass, nobody guarantees them (unlike the status_* of T-178).
-	t.Run("корзин нет — честный ноль", func(t *testing.T) {
+	t.Run("no buckets — an honest zero", func(t *testing.T) {
 		if _, err := pool.Exec(ctx, "DELETE FROM crawler_counters WHERE name LIKE 'retry_mature:%'"); err != nil {
 			t.Fatal(err)
 		}
 		before := pool.batchCalls()
 		res, err := scheduler.RetryOnce(ctx, pool, scheduler.RetryOptions{})
 		if err != nil {
-			t.Fatalf("RetryOnce: %v (отсутствие корзин — не ошибка: coalesce даёт ноль)", err)
+			t.Fatalf("RetryOnce: %v (missing buckets are not an error: coalesce gives zero)", err)
 		}
 		if res != (scheduler.RetryResult{}) {
-			t.Fatalf("итог %+v, хочу пустой", res)
+			t.Fatalf("outcome %+v, want empty", res)
 		}
 		if n := pool.batchCalls(); n != before {
-			t.Fatalf("тяжёлая выборка выполнена без корзин: %d вызовов (было %d)", n-before, before)
+			t.Fatalf("the heavy selection ran without buckets: %d calls (was %d)", n-before, before)
 		}
 	})
 }

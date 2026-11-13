@@ -50,13 +50,13 @@ func TestStaleRequeue_LostHTTPTask(t *testing.T) {
 	// R10 + R1: insert and enqueue — the domain is queued for the DNS stage.
 	add := checkStateStageAdd(ctx, t, pool, zone, "lost")
 	if add.Inserted != 1 {
-		t.Fatalf("ApplyAdd = %+v, хочу Inserted=1", add)
+		t.Fatalf("ApplyAdd = %+v, want Inserted=1", add)
 	}
 	var id int64
 	if err := pool.QueryRow(ctx,
 		"SELECT id FROM domains WHERE zone_id = $1 AND label = 'lost'", zone,
 	).Scan(&id); err != nil {
-		t.Fatalf("id вставленного: %v", err)
+		t.Fatalf("inserted id: %v", err)
 	}
 	if _, err := scheduler.EnqueueBatch(ctx, pool, q, []scheduler.DispatchRow{
 		{ZoneID: zone, DomainID: id, Name: "lost.stale.test"},
@@ -78,21 +78,21 @@ func TestStaleRequeue_LostHTTPTask(t *testing.T) {
 		Subdomains: []queue.HTTPSubdomain{{SubdomainID: 1, Label: "lost", Addrs: []string{"127.0.0.1"}}},
 	}
 	if _, err := httpq.Publish(ctx, queue.StreamHTTP, task); err != nil {
-		t.Fatalf("публикация q:http: %v", err)
+		t.Fatalf("publishing q:http: %v", err)
 	}
 	if n := streamLen(t, rdb, queue.StreamHTTP); n != 1 {
-		t.Fatalf("XLEN q:http = %d, хочу 1 — задача опубликована", n)
+		t.Fatalf("XLEN q:http = %d, want 1 — the task is published", n)
 	}
 	if _, err := dnsworker.MarkHTTPPublished(ctx, pool, zone, id); err != nil {
 		t.Fatalf("MarkHTTPPublished: %v", err)
 	}
 	ok, err := dnsworker.RecordEpisode(ctx, pool, zone, id, dnsworker.EpisodeResult{Mask: 1}, nil)
 	if err != nil || !ok {
-		t.Fatalf("RecordEpisode: ok=%v err=%v (О6)", ok, err)
+		t.Fatalf("RecordEpisode: ok=%v err=%v (O6)", ok, err)
 	}
 	r := checkStateOf(ctx, t, pool, zone, id)
 	if r.state != int16(model.CheckStateDone) || r.status != int16(model.StatusNew) || r.httpPublished {
-		t.Fatalf("после О6 = %+v, хочу done/new/бит снят — «статус повис» без HTTP-итога", r)
+		t.Fatalf("after O6 = %+v, want done/new/bit clear — the status hangs without an HTTP outcome", r)
 	}
 
 	// The cohort is aged out beyond the 24 h window (incident week:
@@ -102,24 +102,24 @@ func TestStaleRequeue_LostHTTPTask(t *testing.T) {
 	if _, err := pool.Exec(ctx,
 		"UPDATE domains SET last_checked_at = current_date - 2 WHERE zone_id = $1 AND id = $2",
 		zone, id); err != nil {
-		t.Fatalf("возраст проверки: %v", err)
+		t.Fatalf("aging the check: %v", err)
 	}
 	if err := rdb.XTrimMaxLen(ctx, queue.StreamHTTP, 0).Err(); err != nil {
-		t.Fatalf("XTRIM q:http (потеря недоставленного): %v", err)
+		t.Fatalf("XTRIM q:http (losing the undelivered): %v", err)
 	}
 	if n := streamLen(t, rdb, queue.StreamHTTP); n != 0 {
-		t.Fatalf("XLEN q:http после потери = %d, хочу 0", n)
+		t.Fatalf("XLEN q:http after the loss = %d, want 0", n)
 	}
 
 	// Reconciliation raises the level: the new_done_stale gauge = 1.
 	st, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{})
 	if err != nil {
-		t.Fatalf("реконсиляция: %v", err)
+		t.Fatalf("reconciliation: %v", err)
 	}
 	if st.NewDoneStale != 1 {
-		t.Fatalf("NewDoneStale = %d, хочу 1 — gauge видит когорту", st.NewDoneStale)
+		t.Fatalf("NewDoneStale = %d, want 1 — the gauge sees the cohort", st.NewDoneStale)
 	}
-	countersVerifyEmpty(t, pool, "после реконсиляции (уровень new_done_stale)")
+	countersVerifyEmpty(t, pool, "after reconciliation (the new_done_stale level)")
 
 	// The compensator (R15): the domain is pending, the status is kept,
 	// no lease; zone deltas are handled by the transition operator; the
@@ -127,26 +127,26 @@ func TestStaleRequeue_LostHTTPTask(t *testing.T) {
 	reg := metrics.New("scheduler")
 	res, err := scheduler.StaleRequeueOnce(ctx, pool, scheduler.StaleRequeueOptions{Metrics: reg})
 	if err != nil || res.Domains != 1 || res.Selected != 1 {
-		t.Fatalf("StaleRequeueOnce = %+v err=%v, хочу Domains=Selected=1 (Р15)", res, err)
+		t.Fatalf("StaleRequeueOnce = %+v err=%v, want Domains=Selected=1 (R15)", res, err)
 	}
 	r = checkStateOf(ctx, t, pool, zone, id)
 	if r.state != int16(model.CheckStatePending) || r.status != int16(model.StatusNew) ||
 		!r.queuedAtNull || !r.lastChecked || r.httpPublished {
-		t.Fatalf("после компенсатора = %+v, хочу pending/new/queued_at NULL/отметка есть/бит снят (Р15)", r)
+		t.Fatalf("after the compensator = %+v, want pending/new/queued_at NULL/mark present/bit clear (R15)", r)
 	}
-	countersVerifyEmpty(t, pool, "после компенсатора (Р15) — дельты вёл оператор перевода")
+	countersVerifyEmpty(t, pool, "after the compensator (R15) — the deltas were handled by the transition operator")
 	if got := staleRequeuedTotal(t, reg); got != 1 {
-		t.Fatalf("счётчик компенсатора = %v, хочу 1", got)
+		t.Fatalf("compensator counter = %v, want 1", got)
 	}
 
 	// A repeated pass is a no-op (idempotency: the transitioned rows are
 	// not selected), the counter does not grow.
 	repeat, err := scheduler.StaleRequeueOnce(ctx, pool, scheduler.StaleRequeueOptions{Metrics: reg})
 	if err != nil || repeat != (scheduler.StaleRequeueResult{}) {
-		t.Fatalf("повторный StaleRequeueOnce = %+v err=%v, хочу нулевой (идемпотентность)", repeat, err)
+		t.Fatalf("repeat StaleRequeueOnce = %+v err=%v, want zero (idempotency)", repeat, err)
 	}
 	if got := staleRequeuedTotal(t, reg); got != 1 {
-		t.Fatalf("счётчик после повтора = %v, хочу 1 (пустой проход не считается)", got)
+		t.Fatalf("counter after the repeat = %v, want 1 (an empty pass does not count)", got)
 	}
 
 	// The episode is finished by the pipeline NORMALLY: enqueue (R1) and
@@ -155,35 +155,35 @@ func TestStaleRequeue_LostHTTPTask(t *testing.T) {
 	if _, err := scheduler.EnqueueBatch(ctx, pool, q, []scheduler.DispatchRow{
 		{ZoneID: zone, DomainID: id, Name: "lost.stale.test"},
 	}); err != nil {
-		t.Fatalf("EnqueueBatch (штатный конвейер): %v", err)
+		t.Fatalf("EnqueueBatch (the normal pipeline): %v", err)
 	}
 	ok, err = dnsworker.RecordEpisode(ctx, pool, zone, id, dnsworker.EpisodeResult{
 		SetStatus: true,
 		Status:    model.StatusNotDelegated,
 	}, nil)
 	if err != nil || !ok {
-		t.Fatalf("RecordEpisode терминальная: ok=%v err=%v (Р2)", ok, err)
+		t.Fatalf("RecordEpisode terminal: ok=%v err=%v (R2)", ok, err)
 	}
 	r = checkStateOf(ctx, t, pool, zone, id)
 	if r.state != int16(model.CheckStateDone) || r.status != int16(model.StatusNotDelegated) || !r.queuedAtNull {
-		t.Fatalf("после штатного завершения = %+v, хочу done/not_delegated/queued_at NULL (Р2)", r)
+		t.Fatalf("after the normal finish = %+v, want done/not_delegated/queued_at NULL (R2)", r)
 	}
-	countersVerifyEmpty(t, pool, "после штатного завершения эпизода (Р2)")
+	countersVerifyEmpty(t, pool, "after the normal episode finish (R2)")
 
 	// The gauge is zeroed: the cohort is healed, the signal about new losses is clean.
 	if st, err = monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{}); err != nil {
-		t.Fatalf("реконсиляция повторно: %v", err)
+		t.Fatalf("second reconciliation: %v", err)
 	}
 	if st.NewDoneStale != 0 {
-		t.Fatalf("NewDoneStale после лечения = %d, хочу 0 (gauge обнулён)", st.NewDoneStale)
+		t.Fatalf("NewDoneStale after healing = %d, want 0 (the gauge is zeroed)", st.NewDoneStale)
 	}
 	var level int64
 	if err := pool.QueryRow(ctx,
 		"SELECT value FROM crawler_counters WHERE name = 'new_done_stale'",
 	).Scan(&level); err != nil || level != 0 {
-		t.Fatalf("строка new_done_stale = (%d, %v), хочу 0", level, err)
+		t.Fatalf("new_done_stale row = (%d, %v), want 0", level, err)
 	}
-	countersVerifyEmpty(t, pool, "после обнуления gauge")
+	countersVerifyEmpty(t, pool, "after zeroing the gauge")
 
 	// The selection shape contract under pinning (T-191): SET LOCAL ×3 —
 	// a seq scan over domains with the early LIMIT stop (the marathon
@@ -206,7 +206,7 @@ func TestStaleRequeue_LostHTTPTask(t *testing.T) {
 		"WHERE d.status = 0 AND d.check_state = 2 AND d.last_checked_at < now() - interval '24 hours' "+
 		"LIMIT 1000")
 	if !strings.Contains(plan, "Seq Scan on domains") || !strings.Contains(plan, "Limit") {
-		t.Errorf("выборка пачки не seq scan с ранним остановом:\n%s", plan)
+		t.Errorf("the batch selection is not a seq scan with an early stop:\n%s", plan)
 	}
 	if err := tx.Rollback(ctx); err != nil {
 		t.Fatalf("rollback: %v", err)
@@ -228,10 +228,10 @@ func TestStaleRequeue_LostHTTPTask(t *testing.T) {
 	plan = checkStateExplain(ctx, t, tx2,
 		"SELECT coalesce((SELECT value FROM crawler_counters WHERE name = 'new_done_stale'), 0)")
 	if !strings.Contains(plan, "crawler_counters_pkey") {
-		t.Errorf("guard не идёт по PK crawler_counters:\n%s", plan)
+		t.Errorf("the guard does not go over the crawler_counters PK:\n%s", plan)
 	}
 	if strings.Contains(plan, "domains") {
-		t.Errorf("guard трогает domains:\n%s", plan)
+		t.Errorf("the guard touches domains:\n%s", plan)
 	}
 }
 

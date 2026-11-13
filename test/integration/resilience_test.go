@@ -92,7 +92,7 @@ func resilienceRedisEnv(t *testing.T) *redis.Client {
 	defer cancel()
 	if err := rdb.Ping(ctx).Err(); err != nil {
 		_ = rdb.Close()
-		t.Fatalf("подключение к Redis %s: %v", redisAddr, err)
+		t.Fatalf("connecting to Redis %s: %v", redisAddr, err)
 	}
 	wipeQueueStreams(t, rdb)
 	t.Cleanup(func() {
@@ -109,7 +109,7 @@ func wipeQueueStreams(t *testing.T, rdb *redis.Client) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := rdb.Del(ctx, resilienceStreams...).Err(); err != nil {
-		t.Errorf("очистка стримов %v: %v", resilienceStreams, err)
+		t.Errorf("clearing the streams %v: %v", resilienceStreams, err)
 	}
 }
 
@@ -176,7 +176,7 @@ func waitPendingIdle(t *testing.T, rdb *redis.Client, stream, group string, n in
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("записи %s/%s не состарились до %s за 5с (готово %d из %d)", stream, group, minIdle, ready, n)
+			t.Fatalf("the %s/%s records did not age to %s within 5 s (%d of %d ready)", stream, group, minIdle, ready, n)
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
@@ -203,7 +203,7 @@ func consumeTasks(t *testing.T, q *queue.RedisQueue, stream, group, consumer str
 	t.Helper()
 	ds, err := q.Consume(context.Background(), stream, group, consumer, n)
 	if err != nil {
-		t.Fatalf("Consume %s (группа %s, потребитель %s): %v", stream, group, consumer, err)
+		t.Fatalf("Consume %s (the group %s, the consumer %s): %v", stream, group, consumer, err)
 	}
 	return ds
 }
@@ -224,25 +224,25 @@ func insertPendingDomains(t *testing.T, pool *pgxpool.Pool, zone string, labels 
 		"INSERT INTO zones (name, domains_total, domains_pending) VALUES ($1, $2, $2) RETURNING id",
 		zone, len(labels),
 	).Scan(&zoneID); err != nil {
-		t.Fatalf("вставка зоны %s: %v", zone, err)
+		t.Fatalf("inserting the zone %s: %v", zone, err)
 	}
 	rows, err := pool.Query(ctx,
 		"INSERT INTO domains (zone_id, label) SELECT $1, unnest($2::text[]) RETURNING id",
 		zoneID, labels)
 	if err != nil {
-		t.Fatalf("вставка доменов зоны %s: %v", zone, err)
+		t.Fatalf("inserting the domains of the zone %s: %v", zone, err)
 	}
 	defer rows.Close()
 	ids := make([]int64, 0, len(labels))
 	for rows.Next() {
 		var id int64
 		if err := rows.Scan(&id); err != nil {
-			t.Fatalf("чтение id домена: %v", err)
+			t.Fatalf("reading the domain id: %v", err)
 		}
 		ids = append(ids, id)
 	}
 	if err := rows.Err(); err != nil {
-		t.Fatalf("вставка доменов зоны %s: %v", zone, err)
+		t.Fatalf("inserting the domains of the zone %s: %v", zone, err)
 	}
 	return ids
 }
@@ -297,18 +297,18 @@ func TestResilience_ProcessingAckAfterDB(t *testing.T) {
 	// dispatcher gives the next one.
 	labels := []string{"h01", "h02", "h03", "h04", "h05", "h06"}
 	if ids := insertPendingDomains(t, pool, "resil.test", labels); len(ids) != len(labels) {
-		t.Fatalf("вставлено доменов: %d, хочу %d", len(ids), len(labels))
+		t.Fatalf("domains inserted: %d, want %d", len(ids), len(labels))
 	}
 	for i := 0; i < 2; i++ {
 		batch, err := scheduler.DispatchBatch(ctx, pool, scheduler.DispatchQuery{Limit: 3})
 		if err != nil {
-			t.Fatalf("выборка пачки №%d: %v", i+1, err)
+			t.Fatalf("selecting batch #%d: %v", i+1, err)
 		}
 		if len(batch) != 3 {
-			t.Fatalf("пачка №%d: выбрано %d доменов, хочу 3", i+1, len(batch))
+			t.Fatalf("batch #%d: %d domains selected, want 3", i+1, len(batch))
 		}
 		if _, err := scheduler.EnqueueBatch(ctx, pool, q, batch); err != nil {
-			t.Fatalf("постановка пачки №%d: %v", i+1, err)
+			t.Fatalf("enqueuing batch #%d: %v", i+1, err)
 		}
 	}
 
@@ -317,7 +317,7 @@ func TestResilience_ProcessingAckAfterDB(t *testing.T) {
 	// first consumer receives both batches.
 	got := consumeTasks(t, q, queue.StreamDNS, group, "w1", 10)
 	if len(got) != 2 {
-		t.Fatalf("потреблено сообщений: %d, хочу 2 (обе пачки, история до группы)", len(got))
+		t.Fatalf("messages consumed: %d, want 2 (both batches, the history before the group)", len(got))
 	}
 
 	// The result record is idempotent (spec 3.4): the queued → done
@@ -342,28 +342,28 @@ func TestResilience_ProcessingAckAfterDB(t *testing.T) {
 
 	// The first batch is processed: the DB record → XACK.
 	if err := queue.Processing(ctx, q, group, got[0], writeResult); err != nil {
-		t.Fatalf("Processing первой пачки: %v", err)
+		t.Fatalf("Processing of the first batch: %v", err)
 	}
 	if n := countDomains(t, pool, stateWhere(model.CheckStateDone)); n != 3 {
-		t.Fatalf("done после первой пачки: %d, хочу 3 (XACK только после записи в БД)", n)
+		t.Fatalf("done after the first batch: %d, want 3 (XACK only after the DB write)", n)
 	}
 
 	// The second batch: "the worker died" before the result record —
 	// Processing returns an error, no XACK, the record stays in the
 	// group pending.
-	workerDied := errors.New("воркер пал до записи результата")
+	workerDied := errors.New("the worker died before writing the result")
 	if err := queue.Processing(ctx, q, group, got[1],
 		func(context.Context, queue.Delivery) error { return workerDied }); err == nil {
-		t.Fatal("Processing сбойной обработки вернул nil")
+		t.Fatal("Processing of the failing handling returned nil")
 	}
 	if n := pendingCount(t, rdb, queue.StreamDNS, group); n != 1 {
-		t.Fatalf("неподтверждённых записей: %d, хочу 1", n)
+		t.Fatalf("unacknowledged records: %d, want 1", n)
 	}
 
 	// A restart-like break: the new consumer reads only the new records
 	// (">") — neither the acknowledged nor the hung ones are re-given.
 	if got := consumeTasks(t, q, queue.StreamDNS, group, "w2", 10); len(got) != 0 {
-		t.Fatalf("новый потребитель получил %d записей, хочу 0", len(got))
+		t.Fatalf("the new consumer received %d records, want 0", len(got))
 	}
 
 	// The claim returns the hung record (attempts = 2: the first
@@ -374,25 +374,25 @@ func TestResilience_ProcessingAckAfterDB(t *testing.T) {
 		t.Fatalf("Claim: %v", err)
 	}
 	if len(claimed) != 1 || claimed[0].ID != got[1].ID {
-		t.Fatalf("клейм вернул %+v, хочу запись %s", claimed, got[1].ID)
+		t.Fatalf("the claim returned %+v, want the record %s", claimed, got[1].ID)
 	}
 	if claimed[0].Attempts != 2 {
-		t.Errorf("попыток после клейма: %d, хочу 2 (доставка + клейм)", claimed[0].Attempts)
+		t.Errorf("attempts after the claim: %d, want 2 (a delivery + a claim)", claimed[0].Attempts)
 	}
 	if err := queue.Processing(ctx, q, group, claimed[0].Delivery, writeResult); err != nil {
-		t.Fatalf("Processing восстановленной пачки: %v", err)
+		t.Fatalf("Processing of the recovered batch: %v", err)
 	}
 
 	// The data is not lost: all 6 domains passed the check, the pending
 	// is empty, nothing landed in q:dead.
 	if n := countDomains(t, pool, stateWhere(model.CheckStateDone)); n != 6 {
-		t.Errorf("done в итоге: %d, хочу 6", n)
+		t.Errorf("done in the end: %d, want 6", n)
 	}
 	if n := pendingCount(t, rdb, queue.StreamDNS, group); n != 0 {
-		t.Errorf("неподтверждённых записей в итоге: %d, хочу 0", n)
+		t.Errorf("unacknowledged records in the end: %d, want 0", n)
 	}
 	if n := streamLen(t, rdb, queue.StreamDead); n != 0 {
-		t.Errorf("записей в q:dead: %d, хочу 0", n)
+		t.Errorf("records in q:dead: %d, want 0", n)
 	}
 }
 
@@ -424,13 +424,13 @@ func TestResilience_WorkerDiesMidBatch(t *testing.T) {
 			Name:       fmt.Sprintf("mid%02d.resil.test", i+1),
 			Subdomains: []queue.HTTPSubdomain{{SubdomainID: 0, Addrs: []string{"192.0.2.1"}}},
 		}); err != nil {
-			t.Fatalf("публикация задачи %s: %v", task, err)
+			t.Fatalf("publishing the task %s: %v", task, err)
 		}
 	}
 
 	batch := consumeTasks(t, q, queue.StreamHTTP, group, "w1", 10)
 	if len(batch) != total {
-		t.Fatalf("потреблено задач: %d, хочу %d", len(batch), total)
+		t.Fatalf("tasks consumed: %d, want %d", len(batch), total)
 	}
 	origPayload := make(map[string][]byte, total)
 	for _, d := range batch {
@@ -440,12 +440,12 @@ func TestResilience_WorkerDiesMidBatch(t *testing.T) {
 	// The first two are processed (the DB record → XACK), on the third
 	// the worker died: the rest of the batch is not acknowledged.
 	if err := q.Ack(ctx, queue.StreamHTTP, group, batch[0].ID, batch[1].ID); err != nil {
-		t.Fatalf("XACK доработанных: %v", err)
+		t.Fatalf("XACK of the finished ones: %v", err)
 	}
 
 	// A new consumer does not receive the foreign unacknowledged records.
 	if got := consumeTasks(t, q, queue.StreamHTTP, group, "w2", 10); len(got) != 0 {
-		t.Fatalf("новый потребитель получил %d чужих записей, хочу 0", len(got))
+		t.Fatalf("the new consumer received %d foreign records, want 0", len(got))
 	}
 
 	// The recovery pass: XAUTOCLAIM returns the rest of the batch
@@ -456,52 +456,52 @@ func TestResilience_WorkerDiesMidBatch(t *testing.T) {
 		t.Fatalf("Claim: %v", err)
 	}
 	if len(claimed) != total-2 {
-		t.Fatalf("клейм вернул %d записей, хочу %d (недоработанный остаток пачки)",
+		t.Fatalf("the claim returned %d records, want %d (the unfinished remainder of the batch)",
 			len(claimed), total-2)
 	}
 	doneTasks := make(map[string]bool, total)
 	for _, d := range batch[:2] { // the processed ones before the fall
 		task, err := queue.Decode[queue.HTTPTask](d)
 		if err != nil {
-			t.Fatalf("декодирование записи %s: %v", d.ID, err)
+			t.Fatalf("decoding the record %s: %v", d.ID, err)
 		}
 		doneTasks[task.TaskID] = true
 	}
 	for _, c := range claimed {
 		if c.Attempts != 2 {
-			t.Errorf("запись %s: попыток %d, хочу 2 (доставка + клейм)", c.ID, c.Attempts)
+			t.Errorf("record %s: attempts %d, want 2 (a delivery + a claim)", c.ID, c.Attempts)
 		}
 		if string(c.Payload) != string(origPayload[c.ID]) {
-			t.Errorf("запись %s: тело изменено клеймом:\n получил %s\n хочу   %s",
+			t.Errorf("record %s: the body changed by the claim:\n got  %s\n want %s",
 				c.ID, c.Payload, origPayload[c.ID])
 		}
 		task, err := queue.Decode[queue.HTTPTask](c.Delivery)
 		if err != nil {
-			t.Fatalf("декодирование записи %s: %v", c.ID, err)
+			t.Fatalf("decoding the record %s: %v", c.ID, err)
 		}
 		doneTasks[task.TaskID] = true
 		// The recoverer finishes up: processing → XACK.
 		if err := queue.Processing(ctx, q, group, c.Delivery,
 			func(context.Context, queue.Delivery) error { return nil }); err != nil {
-			t.Fatalf("Processing восстановленной записи %s: %v", c.ID, err)
+			t.Fatalf("Processing of the recovered record %s: %v", c.ID, err)
 		}
 	}
 
 	// All the task_id of the batch survived the fall: each is processed
 	// exactly once, none is lost and none flew to q:dead.
 	if len(doneTasks) != total {
-		t.Fatalf("уникальных task_id после восстановления: %d, хочу %d", len(doneTasks), total)
+		t.Fatalf("unique task_ids after the recovery: %d, want %d", len(doneTasks), total)
 	}
 	for task := range wantTasks {
 		if !doneTasks[task] {
-			t.Errorf("задача %s потеряна при восстановлении", task)
+			t.Errorf("the task %s lost during the recovery", task)
 		}
 	}
 	if n := pendingCount(t, rdb, queue.StreamHTTP, group); n != 0 {
-		t.Errorf("неподтверждённых записей в итоге: %d, хочу 0", n)
+		t.Errorf("unacknowledged records in the end: %d, want 0", n)
 	}
 	if n := streamLen(t, rdb, queue.StreamDead); n != 0 {
-		t.Errorf("записей в q:dead: %d, хочу 0", n)
+		t.Errorf("records in q:dead: %d, want 0", n)
 	}
 }
 
@@ -536,12 +536,12 @@ func TestResilience_DeadLetterAfterMaxAttempts(t *testing.T) {
 		}
 		wantRes[res.TaskID] = res
 		if _, err := q.Publish(ctx, queue.StreamRender, res); err != nil {
-			t.Fatalf("публикация %s: %v", res.TaskID, err)
+			t.Fatalf("publishing %s: %v", res.TaskID, err)
 		}
 	}
 	batch := consumeTasks(t, q, queue.StreamRender, group, "w1", 10)
 	if len(batch) != total {
-		t.Fatalf("потреблено задач: %d, хочу %d", len(batch), total)
+		t.Fatalf("tasks consumed: %d, want %d", len(batch), total)
 	}
 
 	// The worker died without acknowledging anything. The "recoverers"
@@ -554,15 +554,15 @@ func TestResilience_DeadLetterAfterMaxAttempts(t *testing.T) {
 		waitPendingIdle(t, rdb, queue.StreamRender, group, total, 20*time.Millisecond)
 		claimed, _, _, err := reliab.Claim(ctx, queue.StreamRender, group, "recover", 20*time.Millisecond, total, "0-0")
 		if err != nil {
-			t.Fatalf("клейм №%d: %v", round+1, err)
+			t.Fatalf("claim #%d: %v", round+1, err)
 		}
 		if len(claimed) != total {
-			t.Fatalf("клейм №%d вернул %d записей, хочу %d (лимит ещё не исчерпан)",
+			t.Fatalf("claim #%d returned %d records, want %d (the limit is not exhausted yet)",
 				round+1, len(claimed), total)
 		}
 		for _, c := range claimed {
 			if c.Attempts != wantAttempts {
-				t.Errorf("клейм №%d, запись %s: попыток %d, хочу %d",
+				t.Errorf("claim #%d, record %s: attempts %d, want %d",
 					round+1, c.ID, c.Attempts, wantAttempts)
 			}
 		}
@@ -574,15 +574,15 @@ func TestResilience_DeadLetterAfterMaxAttempts(t *testing.T) {
 	// the original stream.
 	waitPendingIdle(t, rdb, queue.StreamRender, group, total, 20*time.Millisecond)
 	if claimed, _, _, err := reliab.Claim(ctx, queue.StreamRender, group, "recover", 20*time.Millisecond, total, "0-0"); err != nil {
-		t.Fatalf("клейм №3: %v", err)
+		t.Fatalf("claim #3: %v", err)
 	} else if len(claimed) != 0 {
-		t.Fatalf("клейм №3 вернул работу %+v, хочу перевод в q:dead", claimed)
+		t.Fatalf("claim #3 returned work %+v, want the transition to q:dead", claimed)
 	}
 	if n := pendingCount(t, rdb, queue.StreamRender, group); n != 0 {
-		t.Fatalf("исходные записи не покинули pending: %d, хочу 0", n)
+		t.Fatalf("the original records did not leave pending: %d, want 0", n)
 	}
 	if n := streamLen(t, rdb, queue.StreamDead); n != total {
-		t.Fatalf("записей в q:dead: %d, хочу %d", n, total)
+		t.Fatalf("records in q:dead: %d, want %d", n, total)
 	}
 
 	// The manual q:dead triage (T-024/T-025/T-105): the Dead format
@@ -593,38 +593,38 @@ func TestResilience_DeadLetterAfterMaxAttempts(t *testing.T) {
 	// batches up to ~250 KB × the 10,000 cap ≈ 2.5 GB — see T-105).
 	deadMsgs := consumeTasks(t, q, queue.StreamDead, "resil-dead", "operator", 10)
 	if len(deadMsgs) != total {
-		t.Fatalf("прочитано из q:dead: %d, хочу %d", len(deadMsgs), total)
+		t.Fatalf("read from q:dead: %d, want %d", len(deadMsgs), total)
 	}
 	seen := make(map[string]bool, total)
 	for _, d := range deadMsgs {
 		dead, err := queue.Decode[queue.Dead](d)
 		if err != nil {
-			t.Fatalf("декодирование Dead: %v", err)
+			t.Fatalf("decoding Dead: %v", err)
 		}
 		res, ok := wantRes[dead.TaskID]
 		if !ok || seen[dead.TaskID] {
-			t.Errorf("Dead.task_id = %q — вне исходной пачки или дубль", dead.TaskID)
+			t.Errorf("Dead.task_id = %q — outside the original batch or a duplicate", dead.TaskID)
 			continue
 		}
 		seen[dead.TaskID] = true
 		if dead.Stream != queue.StreamRender {
-			t.Errorf("Dead.stream = %q, хочу %q", dead.Stream, queue.StreamRender)
+			t.Errorf("Dead.stream = %q, want %q", dead.Stream, queue.StreamRender)
 		}
 		if dead.ZoneID != res.ZoneID || dead.DomainID != res.DomainID ||
 			dead.SubdomainID != res.SubdomainID || dead.Variant != res.Variant || dead.Name != res.Name {
-			t.Errorf("Dead записи %s: идентификаторы %+v, хочу предмет задачи %+v",
+			t.Errorf("the Dead of the record %s: the subject fields %+v, want the task subject %+v",
 				dead.EntryID, dead, res)
 		}
 		if len(dead.Payload) != 0 {
-			t.Errorf("Dead.payload записи %s перенесён (T-105 — записи без payload): %d байт",
+			t.Errorf("the Dead.payload of the record %s carried over (T-105 — records without a payload): %d bytes",
 				dead.EntryID, len(dead.Payload))
 		}
 		if dead.Attempts != 4 {
-			t.Errorf("Dead.attempts = %d, хочу 4 (доставка + 3 клейма)", dead.Attempts)
+			t.Errorf("Dead.attempts = %d, want 4 (a delivery + 3 claims)", dead.Attempts)
 		}
 	}
 	if len(seen) != total {
-		t.Errorf("уникальных task_id в q:dead: %d, хочу %d", len(seen), total)
+		t.Errorf("unique task_ids in q:dead: %d, want %d", len(seen), total)
 	}
 }
 
@@ -654,11 +654,11 @@ func TestResilience_DeadUnidentifiedNoTaskID(t *testing.T) {
 		Values: map[string]any{"data": `{"no_task":"id","zone_id":3}`},
 	}).Result()
 	if err != nil {
-		t.Fatalf("XADD неидентифицируемой записи: %v", err)
+		t.Fatalf("XADD of an unidentifiable record: %v", err)
 	}
 	batch := consumeTasks(t, q, queue.StreamHTTP, group, "w1", 10)
 	if len(batch) != 1 || batch[0].ID != id {
-		t.Fatalf("потреблено %d записей, хочу 1 (%s)", len(batch), id)
+		t.Fatalf("%d records consumed, want 1 (%s)", len(batch), id)
 	}
 
 	// Claims #1–#2 return the record to work (the counters 2 and 3 —
@@ -668,50 +668,50 @@ func TestResilience_DeadUnidentifiedNoTaskID(t *testing.T) {
 		waitPendingIdle(t, rdb, queue.StreamHTTP, group, 1, 20*time.Millisecond)
 		claimed, _, _, err := reliab.Claim(ctx, queue.StreamHTTP, group, "recover", 20*time.Millisecond, 10, "0-0")
 		if err != nil {
-			t.Fatalf("клейм №%d: %v", round+1, err)
+			t.Fatalf("claim #%d: %v", round+1, err)
 		}
 		if len(claimed) != 1 || claimed[0].Attempts != int(wantAttempts) {
-			t.Fatalf("клейм №%d вернул %+v, хочу запись %s с попыткой %d",
+			t.Fatalf("claim #%d returned %+v, want the record %s with the attempt %d",
 				round+1, claimed, id, wantAttempts)
 		}
 	}
 	waitPendingIdle(t, rdb, queue.StreamHTTP, group, 1, 20*time.Millisecond)
 	if claimed, _, _, err := reliab.Claim(ctx, queue.StreamHTTP, group, "recover", 20*time.Millisecond, 10, "0-0"); err != nil {
-		t.Fatalf("клейм №3: %v", err)
+		t.Fatalf("claim #3: %v", err)
 	} else if len(claimed) != 0 {
-		t.Fatalf("клейм №3 вернул работу %+v, хочу терминальную ветку", claimed)
+		t.Fatalf("claim #3 returned work %+v, want the terminal branch", claimed)
 	}
 
 	// The record left the PEL (the claim loop is broken) and is visible
 	// in q:dead.
 	if n := pendingCount(t, rdb, queue.StreamHTTP, group); n != 0 {
-		t.Fatalf("запись без task_id не покинула pending: %d, хочу 0 (ФТ-6.1)", n)
+		t.Fatalf("the record without task_id did not leave pending: %d, want 0 (FR-6.1)", n)
 	}
 	if n := streamLen(t, rdb, queue.StreamDead); n != 1 {
-		t.Fatalf("записей в q:dead: %d, хочу 1", n)
+		t.Fatalf("records in q:dead: %d, want 1", n)
 	}
 	deadMsgs := consumeTasks(t, q, queue.StreamDead, "resil-dead", "operator", 10)
 	if len(deadMsgs) != 1 {
-		t.Fatalf("прочитано из q:dead: %d, хочу 1", len(deadMsgs))
+		t.Fatalf("read from q:dead: %d, want 1", len(deadMsgs))
 	}
 	dead, err := queue.Decode[queue.Dead](deadMsgs[0])
 	if err != nil {
-		t.Fatalf("декодирование Dead: %v", err)
+		t.Fatalf("decoding Dead: %v", err)
 	}
 	if dead.TaskID != "unknown:q:http:"+id {
-		t.Errorf("Dead.task_id = %q, хочу синтетический unknown:q:http:%s", dead.TaskID, id)
+		t.Errorf("Dead.task_id = %q, want the synthetic unknown:q:http:%s", dead.TaskID, id)
 	}
 	if dead.Stream != queue.StreamHTTP || dead.EntryID != id {
-		t.Errorf("Dead.stream/entry_id = %q/%q, хочу %q/%q", dead.Stream, dead.EntryID, queue.StreamHTTP, id)
+		t.Errorf("Dead.stream/entry_id = %q/%q, want %q/%q", dead.Stream, dead.EntryID, queue.StreamHTTP, id)
 	}
 	if dead.Attempts != 4 {
-		t.Errorf("Dead.attempts = %d, хочу 4 (доставка + 3 клейма)", dead.Attempts)
+		t.Errorf("Dead.attempts = %d, want 4 (a delivery + 3 claims)", dead.Attempts)
 	}
 	// No subject fields: the body is outside the packet formats, the
 	// extraction is not trusted (the zone_id of the original body is
 	// not carried).
 	if dead.ZoneID != 0 || dead.DomainID != 0 || dead.Name != "" || dead.Domains != 0 {
-		t.Errorf("Dead неидентифицируемой записи несёт предметные поля: %+v", dead)
+		t.Errorf("the Dead of an unidentifiable record carries the subject fields: %+v", dead)
 	}
 }
 
@@ -731,7 +731,7 @@ func (f *pendingFlakyRedis) XPendingExt(ctx context.Context, a *redis.XPendingEx
 	if n, ok := f.failOnce[a.Start]; ok && n > 0 {
 		f.failOnce[a.Start] = n - 1
 		cmd := redis.NewXPendingExtCmd(ctx, "xpending")
-		cmd.SetErr(errors.New("инъекция сбоя чтения счётчика (тест ФТ-6.2)"))
+		cmd.SetErr(errors.New("counter read failure injection (the FR-6.2 test)"))
 		return cmd
 	}
 	return f.Client.XPendingExt(ctx, a)
@@ -761,13 +761,13 @@ func TestResilience_PendingFailureDoesNotBurnAttempts(t *testing.T) {
 			TaskID: task, ZoneID: 13, DomainID: 777,
 		})
 		if err != nil {
-			t.Fatalf("публикация %s: %v", task, err)
+			t.Fatalf("publishing %s: %v", task, err)
 		}
 		ids = append(ids, id)
 	}
 	batch := consumeTasks(t, q, queue.StreamRender, group, "w1", len(ids))
 	if len(batch) != len(ids) {
-		t.Fatalf("потреблено задач: %d, хочу %d", len(batch), len(ids))
+		t.Fatalf("tasks consumed: %d, want %d", len(batch), len(ids))
 	}
 	waitPendingIdle(t, rdb, queue.StreamRender, group, len(ids), 30*time.Millisecond)
 
@@ -779,13 +779,13 @@ func TestResilience_PendingFailureDoesNotBurnAttempts(t *testing.T) {
 	reliab := queue.NewReliab(flaky, q, queue.ReliabOptions{MinIdle: 30 * time.Millisecond})
 	claimed, unclassified, _, err := reliab.Claim(ctx, queue.StreamRender, group, "recover", 30*time.Millisecond, 10, "0-0")
 	if err == nil {
-		t.Fatal("Claim со сбойной классификацией: ожидалась ошибка чтения счётчика")
+		t.Fatal("Claim with the failing classification: a counter read error expected")
 	}
 	if len(claimed) != 1 || claimed[0].ID != ids[1] {
-		t.Fatalf("валидная часть клейма: %+v, хочу запись %s", claimed, ids[1])
+		t.Fatalf("the valid part of the claim: %+v, want the record %s", claimed, ids[1])
 	}
 	if len(unclassified) != 1 || unclassified[0].ID != ids[0] {
-		t.Fatalf("записи без классификации: %+v, хочу %s", unclassified, ids[0])
+		t.Fatalf("the records without classification: %+v, want %s", unclassified, ids[0])
 	}
 
 	// B is processed normally (the result "to the DB" → XACK) —
@@ -793,7 +793,7 @@ func TestResilience_PendingFailureDoesNotBurnAttempts(t *testing.T) {
 	// usual.
 	if err := queue.Processing(ctx, q, group, claimed[0].Delivery,
 		func(context.Context, queue.Delivery) error { return nil }); err != nil {
-		t.Fatalf("Processing записи %s: %v", ids[1], err)
+		t.Fatalf("Processing of the record %s: %v", ids[1], err)
 	}
 
 	// The refund of A's attempt: the counter is read at the refund
@@ -804,10 +804,10 @@ func TestResilience_PendingFailureDoesNotBurnAttempts(t *testing.T) {
 	}
 	pending := pendingExt(t, rdb, queue.StreamRender, group)
 	if len(pending) != 1 || pending[0].ID != ids[0] {
-		t.Fatalf("PEL после возврата: %+v, хочу только запись %s (B подтверждена)", pending, ids[0])
+		t.Fatalf("the PEL after the return: %+v, want only the record %s (B acknowledged)", pending, ids[0])
 	}
 	if pending[0].RetryCount != 1 {
-		t.Errorf("счётчик A после возврата: %d, хочу 1 (RETRYCOUNT откачен к значению до клейма, ФТ-6.2)", pending[0].RetryCount)
+		t.Errorf("the counter A after the return: %d, want 1 (RETRYCOUNT rolled back to the pre-claim value, FR-6.2)", pending[0].RetryCount)
 	}
 
 	// A repeated delivery of A: the claim reads the counter 2 (1 + the
@@ -818,24 +818,24 @@ func TestResilience_PendingFailureDoesNotBurnAttempts(t *testing.T) {
 	plain := queue.NewReliab(rdb, q, queue.ReliabOptions{MinIdle: 30 * time.Millisecond})
 	reclaimed, _, _, err := plain.Claim(ctx, queue.StreamRender, group, "recover", 30*time.Millisecond, 10, "0-0")
 	if err != nil {
-		t.Fatalf("повторный клейм A: %v", err)
+		t.Fatalf("a repeated claim of A: %v", err)
 	}
 	if len(reclaimed) != 1 || reclaimed[0].ID != ids[0] {
-		t.Fatalf("повторный клейм: %+v, хочу запись %s", reclaimed, ids[0])
+		t.Fatalf("the repeated claim: %+v, want the record %s", reclaimed, ids[0])
 	}
 	if reclaimed[0].Attempts != 2 {
-		t.Errorf("попыток A после возврата: %d, хочу 2 (возврат откатил клейм со сбойной классификацией)", reclaimed[0].Attempts)
+		t.Errorf("attempts of A after the return: %d, want 2 (the return rolled back the claim with the failing classification)", reclaimed[0].Attempts)
 	}
 	if err := queue.Processing(ctx, q, group, reclaimed[0].Delivery,
 		func(context.Context, queue.Delivery) error { return nil }); err != nil {
-		t.Fatalf("Processing записи %s: %v", ids[0], err)
+		t.Fatalf("Processing of the record %s: %v", ids[0], err)
 	}
 
 	if n := pendingCount(t, rdb, queue.StreamRender, group); n != 0 {
-		t.Errorf("неподтверждённых в итоге: %d, хочу 0", n)
+		t.Errorf("unacknowledged in the end: %d, want 0", n)
 	}
 	if n := streamLen(t, rdb, queue.StreamDead); n != 0 {
-		t.Errorf("записей в q:dead: %d, хочу 0 (попытки не сгорели, записи обработаны)", n)
+		t.Errorf("records in q:dead: %d, want 0 (the attempts did not burn, the records processed)", n)
 	}
 }
 
@@ -864,36 +864,36 @@ func TestResilience_RedisLossSchedulerRecovery(t *testing.T) {
 	}
 	wantIDs := idSet(insertPendingDomains(t, pool, "resil.test", labels))
 	if len(wantIDs) != 10 {
-		t.Fatalf("вставлено доменов: %d, хочу 10", len(wantIDs))
+		t.Fatalf("domains inserted: %d, want 10", len(wantIDs))
 	}
 
 	// The scheduler cycle: the selection → the transition to queued
 	// with a lease → the batch to q:dns (T-027/T-028).
 	batch, err := scheduler.DispatchBatch(ctx, pool, scheduler.DispatchQuery{Limit: 10})
 	if err != nil {
-		t.Fatalf("выборка пачки: %v", err)
+		t.Fatalf("selecting the batch: %v", err)
 	}
 	if len(batch) != 10 {
-		t.Fatalf("выбрано доменов: %d, хочу 10", len(batch))
+		t.Fatalf("domains selected: %d, want 10", len(batch))
 	}
 	res, err := scheduler.EnqueueBatch(ctx, pool, q, batch)
 	if err != nil {
-		t.Fatalf("постановка пачки: %v", err)
+		t.Fatalf("enqueuing the batch: %v", err)
 	}
 	if res.Queued != 10 || res.Published != 10 {
-		t.Fatalf("постановка: queued %d, published %d; хочу 10/10", res.Queued, res.Published)
+		t.Fatalf("enqueue: queued %d, published %d; want 10/10", res.Queued, res.Published)
 	}
 	if n := countDomains(t, pool, stateWhere(model.CheckStateQueued)); n != 10 {
-		t.Fatalf("queued после постановки: %d, хочу 10", n)
+		t.Fatalf("queued after the enqueue: %d, want 10", n)
 	}
 	if n := streamLen(t, rdb, queue.StreamDNS); n != 1 {
-		t.Fatalf("записей в q:dns: %d, хочу 1 (одна пачка)", n)
+		t.Fatalf("records in q:dns: %d, want 1 (one batch)", n)
 	}
 
 	// The worker took the task (the group is created), no
 	// acknowledgement.
 	if got := consumeTasks(t, q, queue.StreamDNS, group, "w1", 5); len(got) != 1 {
-		t.Fatalf("воркер получил задач: %d, хочу 1", len(got))
+		t.Fatalf("the worker received tasks: %d, want 1", len(got))
 	}
 
 	// The Redis loss: the stream keys (and the groups in them) are
@@ -901,15 +901,15 @@ func TestResilience_RedisLossSchedulerRecovery(t *testing.T) {
 	// test keys: the foreign data is not touched (the full cleanup —
 	// resilienceRedisEnv).
 	if err := rdb.Del(ctx, resilienceStreams...).Err(); err != nil {
-		t.Fatalf("удаление стримов (потеря Redis): %v", err)
+		t.Fatalf("deleting the streams (losing Redis): %v", err)
 	}
 	if n := streamLen(t, rdb, queue.StreamDNS); n != 0 {
-		t.Fatalf("после потери Redis записей в q:dns: %d, хочу 0", n)
+		t.Fatalf("after losing Redis, records in q:dns: %d, want 0", n)
 	}
 
 	// The domains "hang" in queued — the task is gone, no result.
 	if n := countDomains(t, pool, stateWhere(model.CheckStateQueued)); n != 10 {
-		t.Fatalf("домены не зависли в queued: %d, хочу 10", n)
+		t.Fatalf("domains stuck in queued: %d, want 10", n)
 	}
 
 	// The lease return (T-029): the time until expiry is shortened by
@@ -919,75 +919,75 @@ func TestResilience_RedisLossSchedulerRecovery(t *testing.T) {
 	// of the client and the DB server.
 	if _, err := pool.Exec(ctx,
 		"UPDATE domains SET queued_at = now() - interval '1 hour'"); err != nil {
-		t.Fatalf("старение queued_at: %v", err)
+		t.Fatalf("aging queued_at: %v", err)
 	}
 	lease, err := scheduler.LeaseOnce(ctx, pool, nil, scheduler.LeaseOptions{})
 	if err != nil {
 		t.Fatalf("LeaseOnce: %v", err)
 	}
 	if lease.Domains != 10 {
-		t.Fatalf("возврат по lease: %d доменов, хочу 10", lease.Domains)
+		t.Fatalf("the lease return: %d domains, want 10", lease.Domains)
 	}
 	if n := countDomains(t, pool, stateWhere(model.CheckStatePending)); n != 10 {
-		t.Fatalf("pending после возврата lease: %d, хочу 10", n)
+		t.Fatalf("pending after the lease return: %d, want 10", n)
 	}
 	if n := countDomains(t, pool, "queued_at IS NOT NULL"); n != 0 {
-		t.Errorf("queued_at не сброшен у возвращённых: %d, хочу 0", n)
+		t.Errorf("queued_at not reset on the returned ones: %d, want 0", n)
 	}
 
 	// The full scheduler cycle after the loss: the re-selection and the
 	// re-publishing.
 	batch2, err := scheduler.DispatchBatch(ctx, pool, scheduler.DispatchQuery{Limit: 10})
 	if err != nil {
-		t.Fatalf("перевыборка пачки: %v", err)
+		t.Fatalf("re-selecting the batch: %v", err)
 	}
 	if len(batch2) != 10 {
-		t.Fatalf("перевыбрано доменов: %d, хочу 10", len(batch2))
+		t.Fatalf("re-selected domains: %d, want 10", len(batch2))
 	}
 	res2, err := scheduler.EnqueueBatch(ctx, pool, q, batch2)
 	if err != nil {
-		t.Fatalf("переиздание пачки: %v", err)
+		t.Fatalf("re-publishing the batch: %v", err)
 	}
 	if res2.Queued != 10 || res2.Published != 10 {
-		t.Fatalf("переиздание: queued %d, published %d; хочу 10/10", res2.Queued, res2.Published)
+		t.Fatalf("re-publishing: queued %d, published %d; want 10/10", res2.Queued, res2.Published)
 	}
 	if n := streamLen(t, rdb, queue.StreamDNS); n != 1 {
-		t.Fatalf("записей в q:dns после переиздания: %d, хочу 1", n)
+		t.Fatalf("records in q:dns after the re-publishing: %d, want 1", n)
 	}
 
 	// A live worker (the same process) reads the re-published: the
 	// group is recreated after NOGROUP — no process restart needed.
 	msgs := consumeTasks(t, q, queue.StreamDNS, group, "w1", 5)
 	if len(msgs) != 1 {
-		t.Fatalf("воркер получил задач после потери: %d, хочу 1", len(msgs))
+		t.Fatalf("the worker received the task after the loss: %d, want 1", len(msgs))
 	}
 	dnsBatch, err := queue.Decode[queue.DNSBatch](msgs[0])
 	if err != nil {
-		t.Fatalf("декодирование переизданной пачки: %v", err)
+		t.Fatalf("decoding the re-published batch: %v", err)
 	}
 	gotIDs := make(map[int64]bool, len(dnsBatch.Domains))
 	for _, dom := range dnsBatch.Domains {
 		gotIDs[dom.DomainID] = true
 		if dom.Name == "" {
-			t.Errorf("домен %d в переизданной пачке без имени", dom.DomainID)
+			t.Errorf("domain %d in the re-published batch without a name", dom.DomainID)
 		}
 	}
 	if len(gotIDs) != len(wantIDs) {
-		t.Fatalf("в переизданной пачке доменов: %d, хочу %d", len(gotIDs), len(wantIDs))
+		t.Fatalf("domains in the re-published batch: %d, want %d", len(gotIDs), len(wantIDs))
 	}
 	for id := range wantIDs {
 		if !gotIDs[id] {
-			t.Errorf("домен %d потерян при восстановлении", id)
+			t.Errorf("domain %d lost during the recovery", id)
 		}
 	}
 
 	// The data did not get lost: the domain count did not change, all
 	// are in work (queued) again.
 	if n := countDomains(t, pool, ""); n != 10 {
-		t.Errorf("доменов в БД: %d, хочу 10", n)
+		t.Errorf("domains in the DB: %d, want 10", n)
 	}
 	if n := countDomains(t, pool, stateWhere(model.CheckStateQueued)); n != 10 {
-		t.Errorf("queued после переиздания: %d, хочу 10", n)
+		t.Errorf("queued after the re-publishing: %d, want 10", n)
 	}
 }
 
@@ -1024,11 +1024,11 @@ func TestResilience_BackpressureGate(t *testing.T) {
 	// the length 4 and brings the stream exactly to the threshold.
 	for i := 1; i <= watermark; i++ {
 		if _, err := pub.Publish(ctx, queue.StreamRender, task(i)); err != nil {
-			t.Fatalf("публикация №%d до порога: %v", i, err)
+			t.Fatalf("publication #%d below the threshold: %v", i, err)
 		}
 	}
 	if n := streamLen(t, rdb, queue.StreamRender); n != watermark {
-		t.Fatalf("длина стрима: %d, хочу %d (порог)", n, watermark)
+		t.Fatalf("the stream length: %d, want %d (the threshold)", n, watermark)
 	}
 
 	// The threshold is reached (len == watermark): the next publication
@@ -1040,7 +1040,7 @@ func TestResilience_BackpressureGate(t *testing.T) {
 	}()
 	select {
 	case err := <-blocked:
-		t.Fatalf("публикация на пороге прошла без ожидания: %v", err)
+		t.Fatalf("the publication at the threshold went through without waiting: %v", err)
 	case <-time.After(250 * time.Millisecond):
 	}
 
@@ -1053,13 +1053,13 @@ func TestResilience_BackpressureGate(t *testing.T) {
 	select {
 	case err := <-blocked:
 		if err != nil {
-			t.Fatalf("публикация после освобождения ёмкости: %v", err)
+			t.Fatalf("publishing after the capacity freed up: %v", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("публикация не разблокировалась после освобождения ёмкости")
+		t.Fatal("the publication did not unblock after the capacity freed up")
 	}
 	if n := streamLen(t, rdb, queue.StreamRender); n != 1 {
-		t.Errorf("длина после публикации: %d, хочу 1", n)
+		t.Errorf("the length after the publication: %d, want 1", n)
 	}
 
 	// A cancellation during the wait — a clean exit (the graceful
@@ -1067,7 +1067,7 @@ func TestResilience_BackpressureGate(t *testing.T) {
 	// to the threshold again.
 	for i := 1; i < watermark; i++ {
 		if _, err := q.Publish(ctx, queue.StreamRender, task(100+i)); err != nil {
-			t.Fatalf("заполнение до порога: %v", err)
+			t.Fatalf("filling to the threshold: %v", err)
 		}
 	}
 	cancelCtx, cancel := context.WithCancel(context.Background())
@@ -1078,17 +1078,17 @@ func TestResilience_BackpressureGate(t *testing.T) {
 	}()
 	select {
 	case err := <-shutdown:
-		t.Fatalf("публикация прошла до отмены: %v", err)
+		t.Fatalf("the publication went through before the cancel: %v", err)
 	case <-time.After(150 * time.Millisecond):
 	}
 	cancel()
 	select {
 	case err := <-shutdown:
 		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("отмена ожидания гейта: %v, хочу context.Canceled", err)
+			t.Fatalf("canceling the gate wait: %v, want context.Canceled", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("отмена контекста не прервала ожидание гейта")
+		t.Fatal("the ctx cancel did not interrupt the gate wait")
 	}
 }
 
@@ -1145,7 +1145,7 @@ func TestResilience_BackpressureTrimmedLag(t *testing.T) {
 	}
 	for i := 0; i < total; i++ {
 		if _, err := q.Publish(ctx, queue.StreamAnalyze, task(i)); err != nil {
-			t.Fatalf("публикация №%d: %v", i+1, err)
+			t.Fatalf("publication #%d: %v", i+1, err)
 		}
 	}
 	if err := rdb.XTrimMaxLen(ctx, queue.StreamAnalyze, keep).Err(); err != nil {
@@ -1153,31 +1153,31 @@ func TestResilience_BackpressureTrimmedLag(t *testing.T) {
 	}
 	xlen := streamLen(t, rdb, queue.StreamAnalyze)
 	if xlen != keep {
-		t.Fatalf("XLEN после XTRIM: %d, хочу %d", xlen, keep)
+		t.Fatalf("XLEN after the XTRIM: %d, want %d", xlen, keep)
 	}
 	groups, err := rdb.XInfoGroups(ctx, queue.StreamAnalyze).Result()
 	if err != nil {
 		t.Fatalf("XINFO GROUPS: %v", err)
 	}
 	if len(groups) != 1 {
-		t.Fatalf("групп у стрима: %d, хочу 1", len(groups))
+		t.Fatalf("groups on the stream: %d, want 1", len(groups))
 	}
 	if groups[0].Lag <= 0 {
-		t.Fatalf("лаг группы после XTRIM недоставленного: %d, хочу положительный (срезанное недоставленное сервер либо держит в счётчике, либо скорректировал — но не NULL)", groups[0].Lag)
+		t.Fatalf("the group lag after the XTRIM of the undelivered: %d, want positive (the server either keeps the trimmed undelivered in the counter or corrected it — but not NULL)", groups[0].Lag)
 	}
 	n, err := gate.Len(ctx, queue.StreamAnalyze)
 	if err != nil {
-		t.Fatalf("Len после XTRIM: %v", err)
+		t.Fatalf("Len after the XTRIM: %v", err)
 	}
 	// The group at "0": all the remaining records are undelivered — the
 	// real backlog equals XLEN, the clamp guarantees it on any server
 	// version.
 	if n != keep {
-		t.Fatalf("глубина после XTRIM: %d, хочу %d (min(lag %d, XLEN %d) + pending 0)",
+		t.Fatalf("the depth after the XTRIM: %d, want %d (min(lag %d, XLEN %d) + pending 0)",
 			n, keep, groups[0].Lag, xlen)
 	}
 	if _, err := pub.Publish(ctx, queue.StreamAnalyze, task(total)); err != nil {
-		t.Fatalf("публикация после XTRIM недоставленного: %v", err)
+		t.Fatalf("publishing after the XTRIM of the undelivered: %v", err)
 	}
 
 	// The 7.0.15 production state — a frozen entries-read counter: the
@@ -1189,19 +1189,19 @@ func TestResilience_BackpressureTrimmedLag(t *testing.T) {
 	// is computed from the counter — a "raw" depth ≥ the watermark
 	// would close the gate forever, the clamp opens the publication.
 	if err := rdb.Del(ctx, queue.StreamAnalyze).Err(); err != nil {
-		t.Fatalf("очистка стрима: %v", err)
+		t.Fatalf("clearing the stream: %v", err)
 	}
 	for i := 0; i < total; i++ {
 		if _, err := q.Publish(ctx, queue.StreamAnalyze, task(100+i)); err != nil {
-			t.Fatalf("публикация (застывший счётчик) №%d: %v", i+1, err)
+			t.Fatalf("publication (the frozen counter) #%d: %v", i+1, err)
 		}
 	}
 	if err := rdb.XTrimMaxLen(ctx, queue.StreamAnalyze, keep).Err(); err != nil {
-		t.Fatalf("XTRIM MAXLEN (застывший счётчик): %v", err)
+		t.Fatalf("XTRIM MAXLEN (the frozen counter): %v", err)
 	}
 	ids := entryIDs(t, rdb, queue.StreamAnalyze)
 	if len(ids) != keep {
-		t.Fatalf("записей после XTRIM (застывший счётчик): %d, хочу %d", len(ids), keep)
+		t.Fatalf("records after the XTRIM (the frozen counter): %d, want %d", len(ids), keep)
 	}
 	if err := rdb.Do(ctx, "XGROUP", "CREATE", queue.StreamAnalyze, group+"-stuck",
 		ids[0], "ENTRIESREAD", "0").Err(); err != nil {
@@ -1209,27 +1209,27 @@ func TestResilience_BackpressureTrimmedLag(t *testing.T) {
 	}
 	groups, err = rdb.XInfoGroups(ctx, queue.StreamAnalyze).Result()
 	if err != nil {
-		t.Fatalf("XINFO GROUPS (застывший счётчик): %v", err)
+		t.Fatalf("XINFO GROUPS (the frozen counter): %v", err)
 	}
 	if len(groups) != 1 {
-		t.Fatalf("групп у стрима после пересоздания: %d, хочу 1", len(groups))
+		t.Fatalf("groups on the stream after the recreation: %d, want 1", len(groups))
 	}
 	if lag := groups[0].Lag; lag < watermark {
-		t.Fatalf("лаг группы %d ниже watermark %d — фантом не воспроизведён (сырой лаг обязан закрывать гейт)", lag, watermark)
+		t.Fatalf("the group lag %d below the watermark %d — the phantom not reproduced (the raw lag must close the gate)", lag, watermark)
 	}
 	n, err = gate.Len(ctx, queue.StreamAnalyze)
 	if err != nil {
-		t.Fatalf("Len (застывший счётчик): %v", err)
+		t.Fatalf("Len (the frozen counter): %v", err)
 	}
 	if n != keep {
-		t.Fatalf("глубина с застывшим счётчиком: %d, хочу %d (кламп min(lag %d, XLEN %d))",
+		t.Fatalf("the depth with the frozen counter: %d, want %d (the clamped min(lag %d, XLEN %d))",
 			n, keep, groups[0].Lag, keep)
 	}
 	if _, err := pub.Publish(ctx, queue.StreamAnalyze, task(200)); err != nil {
-		t.Fatalf("публикация с застывшим счётчиком: %v", err)
+		t.Fatalf("publishing with the frozen counter: %v", err)
 	}
 	if n := streamLen(t, rdb, queue.StreamAnalyze); n != keep+1 {
-		t.Fatalf("XLEN после публикации: %d, хочу %d", n, keep+1)
+		t.Fatalf("XLEN after the publication: %d, want %d", n, keep+1)
 	}
 }
 
@@ -1271,41 +1271,41 @@ func TestResilience_TrimConfirmedPrefix(t *testing.T) {
 	for r := 0; r < rounds; r++ {
 		for i := 0; i < perRound; i++ {
 			if _, err := q.Publish(ctx, queue.StreamAnalyze, task(r*perRound+i)); err != nil {
-				t.Fatalf("раунд %d: публикация №%d: %v", r+1, i+1, err)
+				t.Fatalf("round %d: publication #%d: %v", r+1, i+1, err)
 			}
 		}
 		batch := consumeTasks(t, q, queue.StreamAnalyze, group, "w1", perRound)
 		if len(batch) != perRound {
-			t.Fatalf("раунд %d: потреблено %d, хочу %d", r+1, len(batch), perRound)
+			t.Fatalf("round %d: %d consumed, want %d", r+1, len(batch), perRound)
 		}
 		ids := make([]string, len(batch))
 		for i, d := range batch {
 			ids[i] = d.ID
 		}
 		if err := q.Ack(ctx, queue.StreamAnalyze, group, ids...); err != nil {
-			t.Fatalf("раунд %d: XACK: %v", r+1, err)
+			t.Fatalf("round %d: XACK: %v", r+1, err)
 		}
 		// An XACK frees only the PEL: the history in the stream
 		// accumulates — that is the very subject of the fix (after the
 		// first round — all the records).
 		if n := streamLen(t, rdb, queue.StreamAnalyze); n < int64(perRound) {
-			t.Fatalf("раунд %d: после XACK в стриме %d записей < %d — история не копится?",
+			t.Fatalf("round %d: after the XACK the stream holds %d records < %d — is the history not accumulating?",
 				r+1, n, perRound)
 		}
 		trimmed, _, err := queue.TrimOnce(ctx, rdb, queue.TrimOptions{Streams: []string{queue.StreamAnalyze}})
 		if err != nil {
-			t.Fatalf("раунд %d: TrimOnce: %v", r+1, err)
+			t.Fatalf("round %d: TrimOnce: %v", r+1, err)
 		}
 		if trimmed == 0 {
-			t.Fatalf("раунд %d: TrimOnce не удалил ни одной записи", r+1)
+			t.Fatalf("round %d: TrimOnce did not delete a single record", r+1)
 		}
 		if n := streamLen(t, rdb, queue.StreamAnalyze); n != 1 {
-			t.Fatalf("раунд %d: после TrimOnce в стриме %d записей, хочу 1 (граничная last-delivered-id, всё подтверждено)",
+			t.Fatalf("round %d: after TrimOnce the stream holds %d records, want 1 (the boundary last-delivered-id, everything acknowledged)",
 				r+1, n)
 		}
 		mem, err := rdb.MemoryUsage(ctx, queue.StreamAnalyze).Result()
 		if err != nil {
-			t.Fatalf("раунд %d: MEMORY USAGE: %v", r+1, err)
+			t.Fatalf("round %d: MEMORY USAGE: %v", r+1, err)
 		}
 		if r == 0 {
 			firstMem = mem
@@ -1314,12 +1314,12 @@ func TestResilience_TrimConfirmedPrefix(t *testing.T) {
 		// and the group: it does not grow with the number of processed
 		// records (2000 by the last round against 400 by the first).
 		if grown := mem - firstMem; grown > 4096 {
-			t.Fatalf("память ключа растёт с числом обработанных: %d → %d байт (+%d)",
+			t.Fatalf("the key memory grows with the processed count: %d → %d bytes (+%d)",
 				firstMem, mem, grown)
 		}
 	}
 	if mem, _ := rdb.MemoryUsage(ctx, queue.StreamAnalyze).Result(); mem > 16*1024 {
-		t.Errorf("память «пустого» стрима после %d обработанных записей: %d байт, хочу ≤ 16 КиБ",
+		t.Errorf("the memory of the \"empty\" stream after %d processed records: %d bytes, want ≤ 16 KiB",
 			rounds*perRound, mem)
 	}
 
@@ -1329,30 +1329,30 @@ func TestResilience_TrimConfirmedPrefix(t *testing.T) {
 	const hungTotal = 6
 	for i := 0; i < hungTotal; i++ {
 		if _, err := q.Publish(ctx, queue.StreamRender, task(10000+i)); err != nil {
-			t.Fatalf("публикация зависающей %d: %v", i+1, err)
+			t.Fatalf("publishing the hanging one %d: %v", i+1, err)
 		}
 	}
 	hung := consumeTasks(t, q, queue.StreamRender, "resil-render", "w1", hungTotal)
 	if len(hung) != hungTotal {
-		t.Fatalf("потреблено зависающих: %d, хочу %d", len(hung), hungTotal)
+		t.Fatalf("hung records consumed: %d, want %d", len(hung), hungTotal)
 	}
 	if err := q.Ack(ctx, queue.StreamRender, "resil-render", hung[0].ID, hung[1].ID, hung[2].ID); err != nil {
-		t.Fatalf("XACK подтверждённого префикса: %v", err)
+		t.Fatalf("XACK of the acknowledged prefix: %v", err)
 	}
 	if _, _, err := queue.TrimOnce(ctx, rdb, queue.TrimOptions{Streams: []string{queue.StreamRender}}); err != nil {
-		t.Fatalf("TrimOnce с зависшими: %v", err)
+		t.Fatalf("TrimOnce with the hung ones: %v", err)
 	}
 	if n := streamLen(t, rdb, queue.StreamRender); n != hungTotal-3 {
-		t.Fatalf("после TrimOnce в стриме %d записей, хочу %d (подтверждённые удалены, зависшие остались)",
+		t.Fatalf("after TrimOnce the stream holds %d records, want %d (the acknowledged removed, the hung stayed)",
 			n, hungTotal-3)
 	}
 	if n := pendingCount(t, rdb, queue.StreamRender, "resil-render"); n != hungTotal-3 {
-		t.Fatalf("зависших в PEL: %d, хочу %d (обрезка PEL не трогает)", n, hungTotal-3)
+		t.Fatalf("hung ones in the PEL: %d, want %d (the PEL trim does not touch them)", n, hungTotal-3)
 	}
 	left := entryIDs(t, rdb, queue.StreamRender)
 	for i, d := range hung[3:] {
 		if left[i] != d.ID {
-			t.Errorf("запись %s потеряна/смещена (в стриме %s)", d.ID, left[i])
+			t.Errorf("the record %s lost/shifted (in the stream %s)", d.ID, left[i])
 		}
 	}
 
@@ -1366,25 +1366,25 @@ func TestResilience_TrimConfirmedPrefix(t *testing.T) {
 			Name:       fmt.Sprintf("tail%02d.resil.test", i),
 			Subdomains: []queue.HTTPSubdomain{{Addrs: []string{"192.0.2.1"}}},
 		}); err != nil {
-			t.Fatalf("публикация хвоста %d: %v", i+1, err)
+			t.Fatalf("publishing the tail %d: %v", i+1, err)
 		}
 	}
 	head := consumeTasks(t, q, queue.StreamHTTP, "resil-http", "w1", 3)
 	if len(head) != 3 {
-		t.Fatalf("потреблено записей хвоста: %d, хочу 3", len(head))
+		t.Fatalf("tail records consumed: %d, want 3", len(head))
 	}
 	if err := q.Ack(ctx, queue.StreamHTTP, "resil-http", head[0].ID, head[1].ID, head[2].ID); err != nil {
-		t.Fatalf("XACK головы: %v", err)
+		t.Fatalf("XACK of the head: %v", err)
 	}
 	if _, _, err := queue.TrimOnce(ctx, rdb, queue.TrimOptions{Streams: []string{queue.StreamHTTP}}); err != nil {
-		t.Fatalf("TrimOnce с недоставленным хвостом: %v", err)
+		t.Fatalf("TrimOnce with an undelivered tail: %v", err)
 	}
 	if n := streamLen(t, rdb, queue.StreamHTTP); n != 3 {
-		t.Fatalf("после TrimOnce в стриме %d записей, хочу 3 (граница + 2 недоставленных)", n)
+		t.Fatalf("after TrimOnce the stream holds %d records, want 3 (the boundary + 2 undelivered)", n)
 	}
 	rest := consumeTasks(t, q, queue.StreamHTTP, "resil-http", "w2", 5)
 	if len(rest) != 2 {
-		t.Fatalf("недоставленный хвост после обрезки: %d записей, хочу 2", len(rest))
+		t.Fatalf("the undelivered tail after the trim: %d records, want 2", len(rest))
 	}
 
 	// A stream without a group (q:dead: the manual triage, no consumer
@@ -1397,14 +1397,14 @@ func TestResilience_TrimConfirmedPrefix(t *testing.T) {
 			EntryID:  fmt.Sprintf("%d-1", 1700000000000+i),
 			Attempts: 4,
 		}); err != nil {
-			t.Fatalf("публикация в q:dead %d: %v", i+1, err)
+			t.Fatalf("publishing to q:dead %d: %v", i+1, err)
 		}
 	}
 	if _, _, err := queue.TrimOnce(ctx, rdb, queue.TrimOptions{Streams: []string{queue.StreamDead}}); err != nil {
-		t.Fatalf("TrimOnce по стриму без группы: %v", err)
+		t.Fatalf("TrimOnce on a stream without a group: %v", err)
 	}
 	if n := streamLen(t, rdb, queue.StreamDead); n != 3 {
-		t.Fatalf("записей в q:dead после TrimOnce: %d, хочу 3 (без группы стрим не освобождается)", n)
+		t.Fatalf("records in q:dead after TrimOnce: %d, want 3 (without a group the stream is not freed)", n)
 	}
 }
 
@@ -1433,7 +1433,7 @@ func TestResilience_MaxLenTrims(t *testing.T) {
 			SubdomainID: 0,
 		})
 		if err != nil {
-			t.Fatalf("публикация №%d: %v", i+1, err)
+			t.Fatalf("publication #%d: %v", i+1, err)
 		}
 		if first == "" {
 			first = id
@@ -1449,7 +1449,7 @@ func TestResilience_MaxLenTrims(t *testing.T) {
 	// node size.
 	n := streamLen(t, rdb, queue.StreamAnalyze)
 	if n < 1 || n > maxLen*2 {
-		t.Fatalf("длина q:analyze после %d публикаций: %d, хочу 1..%d (MAXLEN ~ %d, запас — один макроузел списка записей)",
+		t.Fatalf("the q:analyze length after %d publications: %d, want 1..%d (MAXLEN ~ %d, the margin — one list-record macro-node)",
 			published, n, maxLen*2, maxLen)
 	}
 
@@ -1457,10 +1457,10 @@ func TestResilience_MaxLenTrims(t *testing.T) {
 	// newer than the first published one.
 	oldest, err := rdb.XRangeN(ctx, queue.StreamAnalyze, "-", "+", 1).Result()
 	if err != nil || len(oldest) != 1 {
-		t.Fatalf("XRANGE q:analyze: %d записей, err=%v", len(oldest), err)
+		t.Fatalf("XRANGE q:analyze: %d records, err=%v", len(oldest), err)
 	}
 	if oldest[0].ID <= first {
-		t.Errorf("самая ранняя запись %s не новее первой опубликованной %s — обрезки не было",
+		t.Errorf("the earliest record %s is not newer than the first published %s — no trim happened",
 			oldest[0].ID, first)
 	}
 }
@@ -1519,7 +1519,7 @@ func (g *oomGuard) usedMemory() int64 {
 			return n
 		}
 	}
-	g.t.Fatal("INFO memory без поля used_memory")
+	g.t.Fatal("INFO memory without the used_memory field")
 	return 0
 }
 
@@ -1548,7 +1548,7 @@ func (g *oomGuard) enterOOM() {
 	g.configSet("maxmemory", strconv.FormatInt(cap, 10))
 	if err := g.rdb.Set(ctx, "t152-oom-precondition", 1, time.Second).Err(); err == nil {
 		g.release()
-		g.t.Skipf("SET прошёл под потолком %d — OOM не сымитирован, сценарий не воспроизводим", cap)
+		g.t.Skipf("SET went through under the cap %d — OOM not simulated, the scenario not reproducible", cap)
 	}
 }
 
@@ -1610,12 +1610,12 @@ func TestResilience_OOMDoesNotBurnAttempts(t *testing.T) {
 			DomainID:    int64(400 + i),
 			SubdomainID: 0,
 		}); err != nil {
-			t.Fatalf("публикация %d: %v", i+1, err)
+			t.Fatalf("publishing %d: %v", i+1, err)
 		}
 	}
 	batch := consumeTasks(t, q, queue.StreamRender, group, "w1", total)
 	if len(batch) != total {
-		t.Fatalf("потреблено задач: %d, хочу %d", len(batch), total)
+		t.Fatalf("tasks consumed: %d, want %d", len(batch), total)
 	}
 
 	// The handler — a model of the incident worker: the processing is
@@ -1651,16 +1651,16 @@ func TestResilience_OOMDoesNotBurnAttempts(t *testing.T) {
 	time.Sleep(700 * time.Millisecond)
 	pending := pendingExt(t, rdb, queue.StreamRender, group)
 	if len(pending) != total {
-		t.Fatalf("записей в PEL: %d, хочу %d", len(pending), total)
+		t.Fatalf("records in the PEL: %d, want %d", len(pending), total)
 	}
 	for _, p := range pending {
 		if p.RetryCount != 1 {
-			t.Errorf("запись %s: доставок %d, хочу 1 — клеймы при недоступной записи жгут попытки (T-152)",
+			t.Errorf("record %s: deliveries %d, want 1 — claims on an unavailable record burn attempts (T-152)",
 				p.ID, p.RetryCount)
 		}
 	}
 	if n := streamLen(t, rdb, queue.StreamAnalyze); n != 0 {
-		t.Errorf("публикаций q:analyze при OOM: %d, хочу 0", n)
+		t.Errorf("q:analyze publications under OOM: %d, want 0", n)
 	}
 
 	// The memory is freed: the records go through — the claim returns
@@ -1670,7 +1670,7 @@ func TestResilience_OOMDoesNotBurnAttempts(t *testing.T) {
 	deadline := time.Now().Add(10 * time.Second)
 	for pendingCount(t, rdb, queue.StreamRender, group) != 0 {
 		if time.Now().After(deadline) {
-			t.Fatalf("после освобождения памяти PEL не опустел: %d записей",
+			t.Fatalf("after the memory freed up the PEL is not empty: %d records",
 				pendingCount(t, rdb, queue.StreamRender, group))
 		}
 		time.Sleep(20 * time.Millisecond)
@@ -1678,10 +1678,10 @@ func TestResilience_OOMDoesNotBurnAttempts(t *testing.T) {
 	cancelLoop()
 	<-loopDone
 	if n := streamLen(t, rdb, queue.StreamAnalyze); n != total {
-		t.Errorf("результатов в q:analyze: %d, хочу %d (обработка исправна, умерла только публикация)", n, total)
+		t.Errorf("results in q:analyze: %d, want %d (the processing is healthy, only the publication died)", n, total)
 	}
 	if n := streamLen(t, rdb, queue.StreamDead); n != 0 {
-		t.Errorf("записей в q:dead: %d, хочу 0 (T-152: OOM не сжигает попытки)", n)
+		t.Errorf("records in q:dead: %d, want 0 (T-152: OOM does not burn attempts)", n)
 	}
 }
 
@@ -1721,12 +1721,12 @@ func TestResilience_CancelMidBatchDoesNotBurnAttempts(t *testing.T) {
 			ZoneID:   12,
 			DomainID: int64(500 + i),
 		}); err != nil {
-			t.Fatalf("публикация %d: %v", i, err)
+			t.Fatalf("publishing %d: %v", i, err)
 		}
 	}
 	batch := consumeTasks(t, q, queue.StreamRender, group, "w1", total)
 	if len(batch) != total {
-		t.Fatalf("потреблено задач: %d, хочу %d", len(batch), total)
+		t.Fatalf("tasks consumed: %d, want %d", len(batch), total)
 	}
 	waitPendingIdle(t, rdb, queue.StreamRender, group, total, 500*time.Millisecond)
 
@@ -1764,7 +1764,7 @@ func TestResilience_CancelMidBatchDoesNotBurnAttempts(t *testing.T) {
 		t.Helper()
 		pending := pendingExt(t, rdb, queue.StreamRender, group)
 		if len(pending) != total {
-			t.Fatalf("записей в PEL: %d, хочу %d", len(pending), total)
+			t.Fatalf("records in the PEL: %d, want %d", len(pending), total)
 		}
 		for _, p := range pending {
 			want := int64(1)
@@ -1772,7 +1772,7 @@ func TestResilience_CancelMidBatchDoesNotBurnAttempts(t *testing.T) {
 				want = 2
 			}
 			if p.RetryCount != want {
-				t.Errorf("запись %s: доставок %d, хочу %d (отмена посреди пачки не сжигает попытки необработанным, T-222)",
+				t.Errorf("record %s: deliveries %d, want %d (a cancel mid-batch does not burn the attempts of the unprocessed ones, T-222)",
 					p.ID, p.RetryCount, want)
 			}
 		}
@@ -1788,6 +1788,6 @@ func TestResilience_CancelMidBatchDoesNotBurnAttempts(t *testing.T) {
 	assertRefundCounts()
 
 	if n := streamLen(t, rdb, queue.StreamDead); n != 0 {
-		t.Errorf("записей в q:dead: %d, хочу 0", n)
+		t.Errorf("records in q:dead: %d, want 0", n)
 	}
 }

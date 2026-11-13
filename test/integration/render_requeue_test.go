@@ -115,11 +115,11 @@ func TestRenderRequeuePass(t *testing.T) {
 	dsn, cleanup := withTestSchema(t)
 	t.Cleanup(cleanup)
 	if err := migrate.Up(ctx, dsn); err != nil {
-		t.Fatalf("применение миграций к изолированной схеме: %v", err)
+		t.Fatalf("applying migrations to the isolated schema: %v", err)
 	}
 	raw, err := pgxpool.New(ctx, dsn)
 	if err != nil {
-		t.Fatalf("подключение к тестовой схеме: %v", err)
+		t.Fatalf("connecting to the test schema: %v", err)
 	}
 	t.Cleanup(raw.Close)
 	pool := &rqTracePool{Pool: raw}
@@ -149,7 +149,7 @@ func TestRenderRequeuePass(t *testing.T) {
 	// seq scan over domains, no index nodes. PG16 prints the leaf
 	// partition ("Seq Scan on domains_default d"), PG17+ — the parent
 	// ("Seq Scan on d"): the regexp covers both spellings.
-	t.Run("план выборки закреплён SET LOCAL", func(t *testing.T) {
+	t.Run("the selection plan pinned by SET LOCAL", func(t *testing.T) {
 		tx, err := pool.Begin(ctx)
 		if err != nil {
 			t.Fatalf("begin: %v", err)
@@ -173,7 +173,7 @@ func TestRenderRequeuePass(t *testing.T) {
 		for rows.Next() {
 			var line string
 			if err := rows.Scan(&line); err != nil {
-				t.Fatalf("EXPLAIN: чтение: %v", err)
+				t.Fatalf("EXPLAIN: reading: %v", err)
 			}
 			plan.WriteString(line)
 			plan.WriteByte('\n')
@@ -182,10 +182,10 @@ func TestRenderRequeuePass(t *testing.T) {
 			t.Fatalf("EXPLAIN: %v", err)
 		}
 		if !rqSeqScanRe.MatchString(plan.String()) {
-			t.Errorf("закреплённый план без seq scan по domains (алиас d):\n%s", plan.String())
+			t.Errorf("the pinned plan has no seq scan over domains (the d alias):\n%s", plan.String())
 		}
 		if strings.Contains(plan.String(), "Index") || strings.Contains(plan.String(), "Bitmap") {
-			t.Errorf("закреплённый план содержит индексную форму (SET LOCAL не подействовал):\n%s", plan.String())
+			t.Errorf("the pinned plan has an index form (SET LOCAL did not take effect):\n%s", plan.String())
 		}
 	})
 
@@ -207,7 +207,7 @@ func TestRenderRequeuePass(t *testing.T) {
 	}
 	put, err := store.Put(ctx, rqBody)
 	if err != nil {
-		t.Fatalf("сохранение контента: %v", err)
+		t.Fatalf("storing the content: %v", err)
 	}
 	if _, err := pool.Exec(ctx,
 		`INSERT INTO subdomain_results
@@ -218,19 +218,19 @@ func TestRenderRequeuePass(t *testing.T) {
 	}
 	if _, err := pool.Exec(ctx,
 		"UPDATE crawler_counters SET value = 1 WHERE name = 'render_pending'"); err != nil {
-		t.Fatalf("выравнивание счётчика долга: %v", err)
+		t.Fatalf("aligning the debt counter: %v", err)
 	}
 
-	t.Run("долг есть — проход публикует и снимает", func(t *testing.T) {
+	t.Run("there is debt — the pass publishes and clears", func(t *testing.T) {
 		res, err := httpworker.RequeueOnce(ctx, pool, store, renderQ, httpworker.RequeueOptions{})
 		if err != nil {
 			t.Fatalf("RequeueOnce: %v", err)
 		}
 		if res.Selected != 1 || res.Cleared != 1 || res.Published != 1 {
-			t.Fatalf("итог %+v, ожидался selected=1 cleared=1 published=1", res)
+			t.Fatalf("outcome %+v, expected selected=1 cleared=1 published=1", res)
 		}
 		if n := streamLen(t, rdb, queue.StreamRender); n != 1 {
-			t.Fatalf("сообщений q:render = %d, хочу 1", n)
+			t.Fatalf("q:render messages = %d, want 1", n)
 		}
 		var flags int16
 		if err := pool.QueryRow(ctx,
@@ -239,34 +239,34 @@ func TestRenderRequeuePass(t *testing.T) {
 			t.Fatal(err)
 		}
 		if flags&2 != 0 {
-			t.Errorf("бит render_pending не снят (flags=%d)", flags)
+			t.Errorf("the render_pending bit not cleared (flags=%d)", flags)
 		}
 		var counter int64
 		if err := pool.QueryRow(ctx,
 			"SELECT value FROM crawler_counters WHERE name = 'render_pending'",
 		).Scan(&counter); err != nil || counter != 0 {
-			t.Errorf("счётчик долга после снятия = %d (err=%v), хочу 0", counter, err)
+			t.Errorf("the debt counter after the clear = %d (err=%v), want 0", counter, err)
 		}
 	})
 
-	t.Run("стационар: счётчик 0 — тяжёлая выборка не выполняется", func(t *testing.T) {
+	t.Run("steady state: counter 0 — the heavy selection does not run", func(t *testing.T) {
 		before := pool.batchCalls()
 		res, err := httpworker.RequeueOnce(ctx, pool, store, renderQ, httpworker.RequeueOptions{})
 		if err != nil {
 			t.Fatalf("RequeueOnce: %v", err)
 		}
 		if res.Selected != 0 || res.Published != 0 || res.Full {
-			t.Fatalf("итог %+v, ожидался пустой (guard: долга нет)", res)
+			t.Fatalf("outcome %+v, expected empty (the guard: no debt)", res)
 		}
 		if n := pool.batchCalls(); n != before {
-			t.Fatalf("тяжёлая выборка выполнена %d раз при нулевом счётчике (было %d)", n-before, before)
+			t.Fatalf("the heavy selection ran %d times with a zero counter (was %d)", n-before, before)
 		}
 		if n := streamLen(t, rdb, queue.StreamRender); n != 1 {
-			t.Fatalf("публикаций q:render стало %d, хочу 1 (новых нет)", n)
+			t.Fatalf("q:render publications became %d, want 1 (no new ones)", n)
 		}
 	})
 
-	t.Run("повторный проход не выбирает снятое", func(t *testing.T) {
+	t.Run("a repeated pass does not select the cleared ones", func(t *testing.T) {
 		// The counter desync > 0 with the flags cleared (the guard trust
 		// boundary, the T-181 §4.3 spec): one idle seq scan per pass — the
 		// selection is empty, the cleared ones are not re-published.
@@ -280,22 +280,22 @@ func TestRenderRequeuePass(t *testing.T) {
 			t.Fatalf("RequeueOnce: %v", err)
 		}
 		if res.Selected != 0 || res.Published != 0 {
-			t.Fatalf("итог %+v, ожидался selected=0 published=0 (снятое не выбирается)", res)
+			t.Fatalf("outcome %+v, expected selected=0 published=0 (the cleared ones are not selected)", res)
 		}
 		if n := pool.batchCalls(); n != before+1 {
-			t.Fatalf("тяжёлых выборок %d (было %d), хочу +1 — холостой проход по счётчику", n, before)
+			t.Fatalf("%d heavy selections (was %d), want +1 — an idle pass driven by the counter", n, before)
 		}
 		if n := streamLen(t, rdb, queue.StreamRender); n != 1 {
-			t.Fatalf("публикаций q:render стало %d, хочу 1 (дубликатов нет)", n)
+			t.Fatalf("q:render publications became %d, want 1 (no duplicates)", n)
 		}
 	})
 
-	t.Run("строки счётчика нет — ошибка прохода", func(t *testing.T) {
+	t.Run("the counter row is missing — a pass error", func(t *testing.T) {
 		if _, err := pool.Exec(ctx, "DELETE FROM crawler_counters WHERE name = 'render_pending'"); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := httpworker.RequeueOnce(ctx, pool, store, renderQ, httpworker.RequeueOptions{}); err == nil {
-			t.Fatal("отсутствие строки счётчика не возвращено ошибкой (guard обязан лгать громче)")
+			t.Fatal("the missing counter row not returned as an error (the guard must fail loudly)")
 		}
 	})
 }
@@ -316,11 +316,11 @@ func TestRenderRequeueFailedMarker(t *testing.T) {
 	dsn, cleanup := withTestSchema(t)
 	t.Cleanup(cleanup)
 	if err := migrate.Up(ctx, dsn); err != nil {
-		t.Fatalf("применение миграций к изолированной схеме: %v", err)
+		t.Fatalf("applying migrations to the isolated schema: %v", err)
 	}
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
-		t.Fatalf("подключение к тестовой схеме: %v", err)
+		t.Fatalf("connecting to the test schema: %v", err)
 	}
 	t.Cleanup(pool.Close)
 
@@ -366,7 +366,7 @@ func TestRenderRequeueFailedMarker(t *testing.T) {
 	}
 	put, err := store.Put(ctx, rqBody)
 	if err != nil {
-		t.Fatalf("сохранение контента: %v", err)
+		t.Fatalf("storing the content: %v", err)
 	}
 	insertRow := func(url string, hash []byte) {
 		t.Helper()
@@ -383,11 +383,11 @@ func TestRenderRequeueFailedMarker(t *testing.T) {
 		t.Helper()
 		if _, err := pool.Exec(ctx,
 			"UPDATE domains SET flags = flags | 2 WHERE zone_id = $1 AND id = $2", zone, id); err != nil {
-			t.Fatalf("постановка флага: %v", err)
+			t.Fatalf("setting the flag: %v", err)
 		}
 		if _, err := pool.Exec(ctx,
 			"UPDATE crawler_counters SET value = 1 WHERE name = 'render_pending'"); err != nil {
-			t.Fatalf("выравнивание счётчика долга: %v", err)
+			t.Fatalf("aligning the debt counter: %v", err)
 		}
 	}
 	alignDebt()
@@ -400,27 +400,27 @@ func TestRenderRequeueFailedMarker(t *testing.T) {
 		return m, err
 	}
 
-	t.Run("штамп финализации идемпотентен, охраны работают", func(t *testing.T) {
+	t.Run("the finalization stamp is idempotent, the guards work", func(t *testing.T) {
 		tag, err := pool.Exec(ctx, markerSQL, zone, id, int16(0), int16(0), put.Hash[:])
 		if err != nil {
-			t.Fatalf("маркер: %v", err)
+			t.Fatalf("the marker: %v", err)
 		}
 		if tag.RowsAffected() != 1 {
-			t.Fatalf("RowsAffected = %d, хочу 1 (строка того контента, rendered = false)", tag.RowsAffected())
+			t.Fatalf("RowsAffected = %d, want 1 (the row of that content, rendered = false)", tag.RowsAffected())
 		}
 		m, err := marker()
 		if err != nil || m == nil {
-			t.Fatalf("render_failed_at после штампа: %v err=%v", m, err)
+			t.Fatalf("render_failed_at after the stamp: %v err=%v", m, err)
 		}
 
 		// A repeated finalization (a publish failure returned the
 		// delivery) — RowsAffected 1, the stamp of the FIRST finalization
 		// is kept (coalesce).
 		if tag, _ := pool.Exec(ctx, markerSQL, zone, id, int16(0), int16(0), put.Hash[:]); tag.RowsAffected() != 1 {
-			t.Fatalf("повторный штамп: RowsAffected = %d, хочу 1 (идемпотентность)", tag.RowsAffected())
+			t.Fatalf("a repeated stamp: RowsAffected = %d, want 1 (idempotency)", tag.RowsAffected())
 		}
 		if m2, err := marker(); err != nil || m2 == nil || !m2.Equal(*m) {
-			t.Fatalf("штамп переставлен повтором: %v (err=%v), хочу первую финализацию %v", m2, err, m)
+			t.Fatalf("the stamp moved by the repeat: %v (err=%v), want the first finalization %v", m2, err, m)
 		}
 
 		// The content guard: a new episode rewrote content_hash — the
@@ -430,13 +430,13 @@ func TestRenderRequeueFailedMarker(t *testing.T) {
 		if _, err := pool.Exec(ctx,
 			"UPDATE subdomain_results SET content_hash = $3 WHERE zone_id = $1 AND domain_id = $2",
 			zone, id, fresh[:]); err != nil {
-			t.Fatalf("смена контента: %v", err)
+			t.Fatalf("changing the content: %v", err)
 		}
 		if tag, _ := pool.Exec(ctx, markerSQL, zone, id, int16(0), int16(0), put.Hash[:]); tag.RowsAffected() != 0 {
-			t.Fatalf("штамп чужому контенту: RowsAffected = %d, хочу 0 (охрана content_hash)", tag.RowsAffected())
+			t.Fatalf("a stamp on foreign content: RowsAffected = %d, want 0 (the content_hash guard)", tag.RowsAffected())
 		}
 		if m, err := marker(); err != nil || m == nil {
-			t.Fatalf("штамп сбит охраной: %v err=%v", m, err)
+			t.Fatalf("the stamp knocked out by the guard: %v err=%v", m, err)
 		}
 
 		// The rendered guard: a successful concurrent render closed the
@@ -445,47 +445,47 @@ func TestRenderRequeueFailedMarker(t *testing.T) {
 		if _, err := pool.Exec(ctx,
 			"UPDATE subdomain_results SET rendered = true, render_failed_at = NULL "+
 				"WHERE zone_id = $1 AND domain_id = $2", zone, id); err != nil {
-			t.Fatalf("перевод в rendered: %v", err)
+			t.Fatalf("moving to rendered: %v", err)
 		}
 		if tag, _ := pool.Exec(ctx, markerSQL, zone, id, int16(0), int16(0), fresh[:]); tag.RowsAffected() != 0 {
-			t.Fatalf("штамп rendered-строке: RowsAffected = %d, хочу 0 (охрана rendered)", tag.RowsAffected())
+			t.Fatalf("a stamp on a rendered row: RowsAffected = %d, want 0 (the rendered guard)", tag.RowsAffected())
 		}
 		if m, err := marker(); err != nil || m != nil {
-			t.Fatalf("render_failed_at после успешного рендера: %v err=%v (снимается)", m, err)
+			t.Fatalf("render_failed_at after a successful render: %v err=%v (it is removed)", m, err)
 		}
 	})
 
-	t.Run("отмаркированная запись проходом не переиздаётся", func(t *testing.T) {
+	t.Run("a marked record is not re-published by the pass", func(t *testing.T) {
 		if _, err := pool.Exec(ctx, "DELETE FROM subdomain_results WHERE zone_id = $1 AND domain_id = $2", zone, id); err != nil {
-			t.Fatalf("очистка строк: %v", err)
+			t.Fatalf("clearing the rows: %v", err)
 		}
 		insertRow("https://spa.failed.test/", put.Hash[:])
 		alignDebt()
 		if tag, _ := pool.Exec(ctx, markerSQL, zone, id, int16(0), int16(0), put.Hash[:]); tag.RowsAffected() != 1 {
-			t.Fatalf("штамп: RowsAffected = %d, хочу 1", tag.RowsAffected())
+			t.Fatalf("the stamp: RowsAffected = %d, want 1", tag.RowsAffected())
 		}
 		res, err := httpworker.RequeueOnce(ctx, pool, store, renderQ, httpworker.RequeueOptions{})
 		if err != nil {
 			t.Fatalf("RequeueOnce: %v", err)
 		}
 		if res.Selected != 1 || res.Cleared != 1 || res.Published != 0 {
-			t.Fatalf("итог %+v, ожидался selected=1 cleared=1 published=0 (отмаркированная запись не переиздаётся)", res)
+			t.Fatalf("outcome %+v, expected selected=1 cleared=1 published=0 (a marked record is not re-published)", res)
 		}
 		if n := streamLen(t, rdb, queue.StreamRender); n != 0 {
-			t.Fatalf("сообщений q:render = %d, хочу 0 (T-210)", n)
+			t.Fatalf("q:render messages = %d, want 0 (T-210)", n)
 		}
 	})
 
-	t.Run("новый эпизод сбрасывает маркер — проход переиздаёт", func(t *testing.T) {
+	t.Run("a new episode resets the marker — the pass re-publishes", func(t *testing.T) {
 		// The episode rewrite (T-058): a DELETE of the old rows + an
 		// INSERT of the new ones; render_failed_at is not in the INSERT —
 		// DEFAULT NULL.
 		if _, err := pool.Exec(ctx, "DELETE FROM subdomain_results WHERE zone_id = $1 AND domain_id = $2", zone, id); err != nil {
-			t.Fatalf("DELETE эпизода: %v", err)
+			t.Fatalf("the episode DELETE: %v", err)
 		}
 		insertRow("https://spa.failed.test/", put.Hash[:])
 		if m, err := marker(); err != nil || m != nil {
-			t.Fatalf("render_failed_at после перезаписи эпизода: %v err=%v (сброс в NULL)", m, err)
+			t.Fatalf("render_failed_at after the episode rewrite: %v err=%v (reset to NULL)", m, err)
 		}
 		alignDebt()
 
@@ -494,10 +494,10 @@ func TestRenderRequeueFailedMarker(t *testing.T) {
 			t.Fatalf("RequeueOnce: %v", err)
 		}
 		if res.Selected != 1 || res.Cleared != 1 || res.Published != 1 {
-			t.Fatalf("итог %+v, ожидался selected=1 cleared=1 published=1 (сброшенный маркер вернул запись в выборку)", res)
+			t.Fatalf("outcome %+v, expected selected=1 cleared=1 published=1 (the reset marker returned the record to the selection)", res)
 		}
 		if n := streamLen(t, rdb, queue.StreamRender); n != 1 {
-			t.Fatalf("сообщений q:render = %d, хочу 1", n)
+			t.Fatalf("q:render messages = %d, want 1", n)
 		}
 	})
 }
@@ -517,18 +517,18 @@ func TestRenderRequeueZonePriority(t *testing.T) {
 	dsn, cleanup := withTestSchema(t)
 	t.Cleanup(cleanup)
 	if err := migrate.Up(ctx, dsn); err != nil {
-		t.Fatalf("применение миграций к изолированной схеме: %v", err)
+		t.Fatalf("applying migrations to the isolated schema: %v", err)
 	}
 	raw, err := pgxpool.New(ctx, dsn)
 	if err != nil {
-		t.Fatalf("подключение к тестовой схеме: %v", err)
+		t.Fatalf("connecting to the test schema: %v", err)
 	}
 	t.Cleanup(raw.Close)
 
 	// The first-stage plan shape (the zone filter in the JOIN): a seq
 	// scan over domains, no index forms — the priority does not pull
 	// the T-181 pathology.
-	t.Run("план ступени закреплён SET LOCAL", func(t *testing.T) {
+	t.Run("the stage plan pinned by SET LOCAL", func(t *testing.T) {
 		tx, err := raw.Begin(ctx)
 		if err != nil {
 			t.Fatalf("begin: %v", err)
@@ -555,7 +555,7 @@ func TestRenderRequeueZonePriority(t *testing.T) {
 		for rows.Next() {
 			var line string
 			if err := rows.Scan(&line); err != nil {
-				t.Fatalf("EXPLAIN: чтение: %v", err)
+				t.Fatalf("EXPLAIN: reading: %v", err)
 			}
 			plan.WriteString(line)
 			plan.WriteByte('\n')
@@ -564,10 +564,10 @@ func TestRenderRequeueZonePriority(t *testing.T) {
 			t.Fatalf("EXPLAIN: %v", err)
 		}
 		if !rqSeqScanRe.MatchString(plan.String()) {
-			t.Errorf("закреплённый план ступени без seq scan по domains (алиас d):\n%s", plan.String())
+			t.Errorf("the pinned stage plan has no seq scan over domains (the d alias):\n%s", plan.String())
 		}
 		if strings.Contains(plan.String(), "Index") || strings.Contains(plan.String(), "Bitmap") {
-			t.Errorf("закреплённый план ступени содержит индексную форму:\n%s", plan.String())
+			t.Errorf("the pinned stage plan has an index form:\n%s", plan.String())
 		}
 	})
 
@@ -612,7 +612,7 @@ func TestRenderRequeueZonePriority(t *testing.T) {
 	}
 	put, err := store.Put(ctx, rqBody)
 	if err != nil {
-		t.Fatalf("сохранение контента: %v", err)
+		t.Fatalf("storing the content: %v", err)
 	}
 	for _, d := range []struct {
 		zone int16
@@ -632,7 +632,7 @@ func TestRenderRequeueZonePriority(t *testing.T) {
 	}
 	if _, err := pool.Exec(ctx,
 		"UPDATE crawler_counters SET value = 2 WHERE name = 'render_pending'"); err != nil {
-		t.Fatalf("выравнивание счётчика долга: %v", err)
+		t.Fatalf("aligning the debt counter: %v", err)
 	}
 
 	opts := httpworker.RequeueOptions{BatchSize: 1, DeprioritizedZones: []string{"xn--p1ai"}}
@@ -641,10 +641,10 @@ func TestRenderRequeueZonePriority(t *testing.T) {
 	// skipping .рф at the head of the heap.
 	res, err := httpworker.RequeueOnce(ctx, pool, store, renderQ, opts)
 	if err != nil {
-		t.Fatalf("проход 1: %v", err)
+		t.Fatalf("pass 1: %v", err)
 	}
 	if res.Selected != 1 || res.Deprioritized != 0 || res.Cleared != 1 || res.Published != 1 {
-		t.Fatalf("проход 1: итог %+v, ожидался selected=1 deprioritized=0 cleared=1 published=1", res)
+		t.Fatalf("pass 1: outcome %+v, expected selected=1 deprioritized=0 cleared=1 published=1", res)
 	}
 	var rfFlags int16
 	if err := pool.QueryRow(ctx,
@@ -653,22 +653,22 @@ func TestRenderRequeueZonePriority(t *testing.T) {
 		t.Fatal(err)
 	}
 	if rfFlags&2 == 0 {
-		t.Fatal("домен .рф доработан раньше приоритетного — приоритет зон не работает")
+		t.Fatal("the .рф domain finished up before the priority one — the zone priority does not work")
 	}
 
 	// Pass 2: the first stage is exhausted — the second finishes up .рф.
 	res, err = httpworker.RequeueOnce(ctx, pool, store, renderQ, opts)
 	if err != nil {
-		t.Fatalf("проход 2: %v", err)
+		t.Fatalf("pass 2: %v", err)
 	}
 	if res.Selected != 1 || res.Deprioritized != 1 || res.Cleared != 1 || res.Published != 1 {
-		t.Fatalf("проход 2: итог %+v, ожидался selected=1 deprioritized=1 (долг зон списка)", res)
+		t.Fatalf("pass 2: outcome %+v, expected selected=1 deprioritized=1 (the list-zone debt)", res)
 	}
 	var counter int64
 	if err := pool.QueryRow(ctx,
 		"SELECT value FROM crawler_counters WHERE name = 'render_pending'",
 	).Scan(&counter); err != nil || counter != 0 {
-		t.Fatalf("счётчик долга после дренажа = %d (err=%v), хочу 0", counter, err)
+		t.Fatalf("the debt counter after the drain = %d (err=%v), want 0", counter, err)
 	}
 
 	// The q:render publication order: the priority zone — first, .рф —
@@ -678,17 +678,17 @@ func TestRenderRequeueZonePriority(t *testing.T) {
 		t.Fatalf("XRANGE %s: %v", queue.StreamRender, err)
 	}
 	if len(msgs) != 2 {
-		t.Fatalf("сообщений q:render = %d, хочу 2", len(msgs))
+		t.Fatalf("q:render messages = %d, want 2", len(msgs))
 	}
 	got := make([]int64, 0, 2)
 	for _, m := range msgs {
 		var r queue.Result
 		if err := json.Unmarshal([]byte(m.Values["data"].(string)), &r); err != nil {
-			t.Fatalf("разбор сообщения %s: %v", m.ID, err)
+			t.Fatalf("parsing message %s: %v", m.ID, err)
 		}
 		got = append(got, r.DomainID)
 	}
 	if got[0] != prioID || got[1] != rfID {
-		t.Fatalf("порядок публикаций %v, ожидался [приоритетная %d, .рф %d]", got, prioID, rfID)
+		t.Fatalf("the publication order %v, expected [the priority one %d, .рф %d]", got, prioID, rfID)
 	}
 }

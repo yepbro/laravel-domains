@@ -81,18 +81,18 @@ func TestRenderLateRepublisher(t *testing.T) {
 	dsn, cleanup := withTestSchema(t)
 	t.Cleanup(cleanup)
 	if err := migrate.Up(ctx, dsn); err != nil {
-		t.Fatalf("применение миграций к изолированной схеме: %v", err)
+		t.Fatalf("applying migrations to the isolated schema: %v", err)
 	}
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
-		t.Fatalf("подключение к тестовой схеме: %v", err)
+		t.Fatalf("connecting to the test schema: %v", err)
 	}
 	t.Cleanup(pool.Close)
 
 	rdb := resilienceRedisEnv(t)
 	t.Cleanup(func() {
 		if err := rdb.Del(ctx, queue.StreamRender, queue.StreamRenderFallback).Err(); err != nil {
-			t.Fatalf("очистка стримов: %v", err)
+			t.Fatalf("clearing the streams: %v", err)
 		}
 	})
 	q := queue.NewRedisQueue(rdb, queue.RedisOptions{Block: 150 * time.Millisecond})
@@ -123,7 +123,7 @@ func TestRenderLateRepublisher(t *testing.T) {
 	liveMsg := func(stream string, res queue.Result) {
 		t.Helper()
 		if _, err := q.Publish(ctx, stream, res); err != nil {
-			t.Fatalf("публикация живой задачи %s: %v", stream, err)
+			t.Fatalf("publishing the live task %s: %v", stream, err)
 		}
 	}
 
@@ -139,13 +139,13 @@ func TestRenderLateRepublisher(t *testing.T) {
 	spaHash := func() []byte {
 		put, err := store.Put(ctx, lateBody)
 		if err != nil {
-			t.Fatalf("сохранение SPA-контента: %v", err)
+			t.Fatalf("storing the SPA content: %v", err)
 		}
 		return put.Hash[:]
 	}()
 	rawPut, err := store.Put(ctx, []byte(`<html><body>plain static page with plenty of text</body></html>`))
 	if err != nil {
-		t.Fatalf("сохранение статического контента: %v", err)
+		t.Fatalf("storing the static content: %v", err)
 	}
 
 	var domainID int64
@@ -168,7 +168,7 @@ func TestRenderLateRepublisher(t *testing.T) {
 			 VALUES ($1, $2, $3, 2, 'https://late.test/', $4, $5, $6, $7, now() - $8::interval)`,
 			zone, domain, sub, hash, alias,
 			markerAge(marked), rendered, age.String()); err != nil {
-			t.Fatalf("insert subdomain_results (домен %d): %v", domain, err)
+			t.Fatalf("insert subdomain_results (domain %d): %v", domain, err)
 		}
 	}
 
@@ -223,7 +223,7 @@ func TestRenderLateRepublisher(t *testing.T) {
 	// checks.
 	if _, err := pool.Exec(ctx,
 		"UPDATE crawler_counters SET value = 1 WHERE name = 'render_pending'"); err != nil {
-		t.Fatalf("выравнивание счётчика долга: %v", err)
+		t.Fatalf("aligning the debt counter: %v", err)
 	}
 
 	cur := &httpworker.RenderLateCursor{}
@@ -237,10 +237,10 @@ func TestRenderLateRepublisher(t *testing.T) {
 	// non-SPA — 7 selected in total, 4 published, 3 skipped; the
 	// fresh/debt/marked/rendered are cut off by the SQL.
 	if res.Selected != 7 || res.Published != 4 || res.Skipped != 3 || res.Full {
-		t.Fatalf("итог %+v, хочу selected=7 published=4 skipped=3", res)
+		t.Fatalf("outcome %+v, want selected=7 published=4 skipped=3", res)
 	}
 	if !res.Wrapped {
-		t.Fatalf("проход не замкнул курсор (пачка короче лимита): %+v", res)
+		t.Fatalf("the pass did not wrap the cursor (the batch shorter than the limit): %+v", res)
 	}
 
 	// The publication composition: the lost record, the
@@ -253,19 +253,19 @@ func TestRenderLateRepublisher(t *testing.T) {
 	for _, m := range msgs {
 		var r queue.Result
 		if err := json.Unmarshal([]byte(m.Values["data"].(string)), &r); err != nil {
-			t.Fatalf("разбор сообщения %s: %v", m.ID, err)
+			t.Fatalf("parsing message %s: %v", m.ID, err)
 		}
 		got[r.DomainID]++
 	}
 	if len(got) != 4 || got[lost] != 1 || got[aliasDom] != 2 || got[doneOrigDom] != 1 {
-		t.Fatalf("публикации по доменам %v, хочу {потерянная %d:1, оригинал+алиас %d:2, алиас rendered-оригинала %d:1}",
+		t.Fatalf("publications by domains %v, want {the lost one %d:1, the original+alias %d:2, the alias of the rendered original %d:1}",
 			got, lost, aliasDom, doneOrigDom)
 	}
 	if n := streamLen(t, rdb, queue.StreamRender); n != 5 {
-		t.Fatalf("сообщений q:render = %d, хочу 5 (4 переиздания + 1 живая)", n)
+		t.Fatalf("q:render messages = %d, want 5 (4 re-publications + 1 live)", n)
 	}
 	if v := lateMetricValue(t, reg, "crawler_render_late_republish_total"); v != 4 {
-		t.Fatalf("crawler_render_late_republish_total = %v, хочу 4", v)
+		t.Fatalf("crawler_render_late_republish_total = %v, want 4", v)
 	}
 
 	// A repeated pass: the pass's own publications are now an
@@ -274,13 +274,13 @@ func TestRenderLateRepublisher(t *testing.T) {
 	res, err = httpworker.LateOnce(ctx, pool, store, renderQ, latePendingRedis{rdb: rdb}, met,
 		httpworker.LateOptions{BatchSize: 100}, cur)
 	if err != nil {
-		t.Fatalf("повторный LateOnce: %v", err)
+		t.Fatalf("a repeated LateOnce: %v", err)
 	}
 	if res.Published != 0 {
-		t.Fatalf("повторный проход: published=%d, хочу 0 (интерлок собственных сообщений)", res.Published)
+		t.Fatalf("a repeated pass: published=%d, want 0 (the interlock of its own messages)", res.Published)
 	}
 	if n := streamLen(t, rdb, queue.StreamRender); n != 5 {
-		t.Fatalf("сообщений q:render после повтора = %d, хочу 5 (без дублей)", n)
+		t.Fatalf("q:render messages after the repeat = %d, want 5 (no duplicates)", n)
 	}
 }
 
@@ -354,13 +354,13 @@ func TestSchema_ResultsRenderedCheck(t *testing.T) {
 	// with a marker (E3); non-render without a marker (E0/E1) — unique
 	// PKs (review P1-1).
 	if err := insertRow(0, true, nil); err != nil {
-		t.Fatalf("rendered без маркера: %v", err)
+		t.Fatalf("rendered without a marker: %v", err)
 	}
 	if err := insertRow(1, false, time.Now()); err != nil {
-		t.Fatalf("не-рендер с маркером: %v", err)
+		t.Fatalf("non-render with a marker: %v", err)
 	}
 	if err := insertRow(2, false, nil); err != nil {
-		t.Fatalf("не-рендер без маркера: %v", err)
+		t.Fatalf("non-render without a marker: %v", err)
 	}
 
 	// The invariant violation: rendered = true + a marker — 23514 by
@@ -368,7 +368,7 @@ func TestSchema_ResultsRenderedCheck(t *testing.T) {
 	// hand (FR-5.2).
 	if err := insertRow(3, true, time.Now()); err == nil ||
 		!strings.Contains(err.Error(), "subdomain_results_rendered_check") {
-		t.Errorf("rendered с маркером: err = %v, want violation subdomain_results_rendered_check", err)
+		t.Errorf("rendered with a marker: err = %v, want violation subdomain_results_rendered_check", err)
 	}
 	// An UPDATE of an existing row into violation is rejected too (NOT
 	// VALID checks new writes, including changes); the target — the
@@ -378,7 +378,7 @@ func TestSchema_ResultsRenderedCheck(t *testing.T) {
 			"WHERE zone_id = $1 AND domain_id = $2 AND subdomain_id = 0",
 		zone, id); err == nil ||
 		!strings.Contains(err.Error(), "subdomain_results_rendered_check") {
-		t.Errorf("UPDATE маркера на rendered-строке: err = %v, want violation", err)
+		t.Errorf("UPDATE of the marker on a rendered row: err = %v, want violation", err)
 	}
 
 	// NOT VALID: the constraint in the TEST SCHEMA (the current_schema
@@ -399,13 +399,13 @@ func TestSchema_ResultsRenderedCheck(t *testing.T) {
 	defer rows.Close()
 	var validated, total int
 	if !rows.Next() || rows.Scan(&validated, &total) != nil {
-		t.Fatalf("чтение pg_constraint: %v", rows.Err())
+		t.Fatalf("reading pg_constraint: %v", rows.Err())
 	}
 	if total < 2 {
-		t.Fatalf("ограничение в схеме теста на %d объектах, хочу ≥2 (родитель + секция; миграция 000018)", total)
+		t.Fatalf("the constraint in the test schema on %d objects, want ≥2 (the parent + a section; migration 000018)", total)
 	}
 	if validated != 0 {
-		t.Errorf("convalidated = true у %d из %d строк ограничения, хочу 0 (NOT VALID, VALIDATE — по регламенту)",
+		t.Errorf("convalidated = true on %d of %d constraint rows, want 0 (NOT VALID, VALIDATE — per the procedure)",
 			validated, total)
 	}
 }
@@ -466,7 +466,7 @@ func TestRenderLateSelectPlanUnpinned(t *testing.T) {
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO domains (zone_id, id, label)
 		SELECT $1, g, 'lu' || g FROM generate_series(1, $2) g`, zone, lateDomains); err != nil {
-		t.Fatalf("посев domains: %v", err)
+		t.Fatalf("seeding domains: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO subdomain_results
@@ -474,7 +474,7 @@ func TestRenderLateSelectPlanUnpinned(t *testing.T) {
 		SELECT $1, g, (g % 63)::smallint, 2, 'https://lu.test/' || g,
 		       now() - interval '7 hours' - (g * interval '1 second')
 		FROM generate_series(1, $2) g`, zone, lateRows); err != nil {
-		t.Fatalf("посев subdomain_results: %v", err)
+		t.Fatalf("seeding subdomain_results: %v", err)
 	}
 	if _, err := pool.Exec(ctx, "ANALYZE domains"); err != nil {
 		t.Fatalf("ANALYZE domains: %v", err)
@@ -497,10 +497,10 @@ func TestRenderLateSelectPlanUnpinned(t *testing.T) {
 	// pinned form failed to do at production volume.
 	plan := explainAnalyze(t, tx, ctx, latePinSelectSQL)
 	if !strings.Contains(plan, "Limit") {
-		t.Errorf("план без Limit (ранний останов пачки):\n%s", plan)
+		t.Errorf("the plan has no Limit (the early stop of the batch):\n%s", plan)
 	}
 	if !planIdxScanRe.MatchString(plan) {
-		t.Errorf("план без Index Scan (записи читаются мимо индексов):\n%s", plan)
+		t.Errorf("the plan has no Index Scan (the records are read past the indexes):\n%s", plan)
 	}
 	// A full Sort of the records — the "scan everything and sort"
 	// shape, its cost was attributed to the T-271 incident; an
@@ -508,10 +508,10 @@ func TestRenderLateSelectPlanUnpinned(t *testing.T) {
 	// named "Incremental Sort", the badSortRe anchor does not match
 	// it).
 	if badSortRe.MatchString(plan) {
-		t.Errorf("план содержит полный Sort записей (порядок курсора должен закрываться индексом):\n%s", plan)
+		t.Errorf("the plan has a full Sort of the records (the cursor order must be served by an index):\n%s", plan)
 	}
 	if !strings.Contains(plan, "rows=1000 loops=1") {
-		t.Errorf("исполнение не собрало пачку 1000 (rows=1000 loops=1 в Limit-узле):\n%s", plan)
+		t.Errorf("the execution did not assemble the batch of 1000 (rows=1000 loops=1 in the Limit node):\n%s", plan)
 	}
 }
 
@@ -536,7 +536,7 @@ func explainAnalyze(t *testing.T, tx pgx.Tx, ctx context.Context, sql string) st
 	for rows.Next() {
 		var line string
 		if err := rows.Scan(&line); err != nil {
-			t.Fatalf("EXPLAIN ANALYZE: чтение: %v", err)
+			t.Fatalf("EXPLAIN ANALYZE: reading: %v", err)
 		}
 		plan.WriteString(line)
 		plan.WriteByte('\n')

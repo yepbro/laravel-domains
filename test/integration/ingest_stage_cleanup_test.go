@@ -28,7 +28,7 @@ func stageBatchID(t *testing.T, at time.Time) []byte {
 	id := make([]byte, ingest.BatchIDLen)
 	binary.BigEndian.PutUint64(id[:8], uint64(at.UnixMicro())) // time prefix
 	if _, err := rand.Read(id[8:]); err != nil {               // random tail
-		t.Fatalf("случайный хвост batch_id: %v", err)
+		t.Fatalf("random batch_id tail: %v", err)
 	}
 	return id
 }
@@ -44,7 +44,7 @@ func (e *ingestEnv) stageOrphanRows(t *testing.T, batchID []byte, zoneID int16, 
 			"INSERT INTO ingest_stage (batch_id, zone_id, label, action, line_no) "+
 				"VALUES ($1, $2, $3, 1, $4)",
 			batchID, zoneID, fmt.Sprintf("orphan-%d", i), int64(i)); err != nil {
-			t.Fatalf("вставка строки осиротевшей партии: %v", err)
+			t.Fatalf("inserting an orphaned batch row: %v", err)
 		}
 	}
 }
@@ -59,11 +59,11 @@ func TestIngest_CleanupStaleBatches(t *testing.T) {
 
 	// The zone is created by the normal pipeline: staging references zone_id.
 	if out := e.process(t, "com/add/seed.txt", fileContent("seed.com")); out.Kind != ingest.OutcomeApplied {
-		t.Fatalf("посевной файл: итог = %s, want applied", out.Kind)
+		t.Fatalf("seed file: outcome = %s, want applied", out.Kind)
 	}
 	z, ok := e.zone(t, "com")
 	if !ok {
-		t.Fatal("зона com не найдена")
+		t.Fatal("zone com not found")
 	}
 
 	now := time.Now()
@@ -79,23 +79,23 @@ func TestIngest_CleanupStaleBatches(t *testing.T) {
 		t.Fatalf("CleanupStaleBatches: %v", err)
 	}
 	if rows != 3 {
-		t.Errorf("удалено строк = %d, want 3 (только партия старше порога)", rows)
+		t.Errorf("rows deleted = %d, want 3 (only the batch older than the threshold)", rows)
 	}
 	if n := e.countOf(t, "ingest_stage"); n != 4 {
-		t.Errorf("строк в ingest_stage = %d, want 4: партии у порога и свежая не задеваются", n)
+		t.Errorf("ingest_stage rows = %d, want 4: the at-threshold and fresh batches stay untouched", n)
 	}
 
 	// A repeated pass at the same point in time is a no-op (the cleaned
 	// rows are not selected again; spec 3.4 idempotency).
 	rows, err = ingest.CleanupStaleBatches(ctx, e.pool, now)
 	if err != nil {
-		t.Fatalf("повторная CleanupStaleBatches: %v", err)
+		t.Fatalf("second CleanupStaleBatches: %v", err)
 	}
 	if rows != 0 {
-		t.Errorf("повторная зачистка удалила %d, want 0", rows)
+		t.Errorf("repeat cleanup deleted %d, want 0", rows)
 	}
 	if n := e.countOf(t, "ingest_stage"); n != 4 {
-		t.Errorf("строк в ingest_stage после повтора = %d, want 4", n)
+		t.Errorf("ingest_stage rows after the repeat = %d, want 4", n)
 	}
 
 	// Fresh batches leave staging the normal way — ClearBatch of their own batch.
@@ -107,6 +107,6 @@ func TestIngest_CleanupStaleBatches(t *testing.T) {
 		}
 	}
 	if n := e.countOf(t, "ingest_stage"); n != 0 {
-		t.Errorf("строк в ingest_stage после ClearBatch = %d, want 0", n)
+		t.Errorf("ingest_stage rows after ClearBatch = %d, want 0", n)
 	}
 }

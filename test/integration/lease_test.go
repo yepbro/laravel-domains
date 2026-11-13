@@ -43,7 +43,7 @@ func leaseSeedQueued(ctx context.Context, t *testing.T, pool *pgxpool.Pool, zone
 		 VALUES ($1, $2, $3, $4, now() - make_interval(mins => $5)) RETURNING id`,
 		zone, label, int16(model.CheckStateQueued), int16(model.StatusNew), ageMinutes,
 	).Scan(&id); err != nil {
-		t.Fatalf("домен %s: %v", label, err)
+		t.Fatalf("domain %s: %v", label, err)
 	}
 	return id
 }
@@ -55,7 +55,7 @@ func leaseCheckState(ctx context.Context, t *testing.T, pool *pgxpool.Pool, zone
 	if err := pool.QueryRow(ctx,
 		"SELECT check_state FROM domains WHERE zone_id = $1 AND id = $2", zone, id,
 	).Scan(&state); err != nil {
-		t.Fatalf("чтение домена %d: %v", id, err)
+		t.Fatalf("reading domain %d: %v", id, err)
 	}
 	return state
 }
@@ -83,9 +83,9 @@ func TestLease_MatureReturnedRepeatZero(t *testing.T) {
 	// reconciliation: the deltas are handled by the CTE of the same
 	// transition operator.
 	if _, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{}); err != nil {
-		t.Fatalf("реконсиляция: %v", err)
+		t.Fatalf("reconciliation: %v", err)
 	}
-	countersVerifyEmpty(t, pool, "после реконсиляции")
+	countersVerifyEmpty(t, pool, "after reconciliation")
 
 	var cursor scheduler.LeaseCursor
 	res, err := scheduler.LeaseOnce(ctx, pool, &cursor, scheduler.LeaseOptions{})
@@ -93,29 +93,29 @@ func TestLease_MatureReturnedRepeatZero(t *testing.T) {
 		t.Fatalf("LeaseOnce: %v", err)
 	}
 	if res.Domains != int64(len(labels)) || res.Selected != len(labels) {
-		t.Fatalf("итог = %+v, want Domains=Selected=%d", res, len(labels))
+		t.Fatalf("outcome = %+v, want Domains=Selected=%d", res, len(labels))
 	}
 	if n := countDomains(t, pool,
 		fmt.Sprintf("zone_id = %d AND check_state = %d", zone, int16(model.CheckStatePending))); n != len(labels) {
-		t.Fatalf("pending после возврата: %d, хочу %d", n, len(labels))
+		t.Fatalf("pending after the return: %d, want %d", n, len(labels))
 	}
 	if n := countDomains(t, pool,
 		fmt.Sprintf("zone_id = %d AND queued_at IS NOT NULL", zone)); n != 0 {
-		t.Errorf("queued_at не сброшен у возвращённых: %d, хочу 0", n)
+		t.Errorf("queued_at not reset on the returned ones: %d, want 0", n)
 	}
-	countersVerifyEmpty(t, pool, "после lease (дельты T-178)")
+	countersVerifyEmpty(t, pool, "after the lease (the T-178 deltas)")
 
 	// A repeated pass with the same cursor — an empty batch: the
 	// transitioned rows no longer satisfy the selection (idempotency,
 	// spec 3.4).
 	repeat, err := scheduler.LeaseOnce(ctx, pool, &cursor, scheduler.LeaseOptions{})
 	if err != nil {
-		t.Fatalf("повторный LeaseOnce: %v", err)
+		t.Fatalf("repeat LeaseOnce: %v", err)
 	}
 	if repeat != (scheduler.LeaseResult{}) {
-		t.Fatalf("повторный проход = %+v, want нулевой", repeat)
+		t.Fatalf("repeat pass = %+v, want zero", repeat)
 	}
-	countersVerifyEmpty(t, pool, "после повторного прохода")
+	countersVerifyEmpty(t, pool, "after the repeated pass")
 }
 
 // --- the race: a result recorded between the selection and the transition --
@@ -162,11 +162,11 @@ func (t *leaseRaceTx) Query(ctx context.Context, sql string, args ...any) (pgx.R
 		if _, err := t.Exec(ctx,
 			"UPDATE domains SET check_state = $1, queued_at = NULL WHERE zone_id = $2 AND id = $3",
 			int16(model.CheckStateDone), t.pool.victimZone, t.pool.victimID); err != nil {
-			return nil, fmt.Errorf("leaseRaceTx: запись результата воркера: %w", err)
+			return nil, fmt.Errorf("leaseRaceTx: recording the worker result: %w", err)
 		}
 		return t.Tx.Query(ctx, sql, args...)
 	default:
-		return nil, fmt.Errorf("leaseRaceTx: неожидаемый SQL прохода: %s", sql)
+		return nil, fmt.Errorf("leaseRaceTx: unexpected pass SQL: %s", sql)
 	}
 }
 
@@ -189,25 +189,25 @@ func TestLease_WorkerRaceGuard(t *testing.T) {
 	// race, the direct cross-check of the deltas of a partially
 	// transitioned batch (review T-200 P3-2).
 	if _, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{}); err != nil {
-		t.Fatalf("реконсиляция: %v", err)
+		t.Fatalf("reconciliation: %v", err)
 	}
-	countersVerifyEmpty(t, pool, "после реконсиляции")
+	countersVerifyEmpty(t, pool, "after reconciliation")
 
 	race := &leaseRacePool{Pool: pool, victimZone: zone, victimID: victim}
 	var cursor scheduler.LeaseCursor
 	res, err := scheduler.LeaseOnce(ctx, race, &cursor, scheduler.LeaseOptions{})
 	if err != nil {
-		t.Fatalf("LeaseOnce с гонкой: %v", err)
+		t.Fatalf("LeaseOnce with the race: %v", err)
 	}
 	if res.Domains != 2 || res.Selected != 3 {
-		t.Fatalf("итог = %+v, want Domains=2 (жертва отсеяна guard), Selected=3", res)
+		t.Fatalf("outcome = %+v, want Domains=2 (the victim filtered by the guard), Selected=3", res)
 	}
 	if state := leaseCheckState(ctx, t, pool, zone, victim); state != int16(model.CheckStateDone) {
-		t.Errorf("жертва гонки: check_state = %d, хочу done — результат воркера не затёрт возвратом", state)
+		t.Errorf("race victim: check_state = %d, want done — the worker result not overwritten by the return", state)
 	}
 	for _, id := range []int64{first, last} {
 		if state := leaseCheckState(ctx, t, pool, zone, id); state != int16(model.CheckStatePending) {
-			t.Errorf("домен %d: check_state = %d, хочу pending — соседние строки пачки возвращены", id, state)
+			t.Errorf("domain %d: check_state = %d, want pending — the neighboring batch rows returned", id, state)
 		}
 	}
 
@@ -222,10 +222,10 @@ func TestLease_WorkerRaceGuard(t *testing.T) {
 	if err := pool.QueryRow(ctx,
 		"SELECT domains_queued, domains_pending FROM zones WHERE id = $1", zone,
 	).Scan(&queued, &pending); err != nil {
-		t.Fatalf("чтение счётчиков зоны: %v", err)
+		t.Fatalf("reading zone counters: %v", err)
 	}
 	if queued != 1 || pending != 2 {
-		t.Errorf("дельты зоны = queued %d / pending %d, want 1/2 — дельты ведут ровно RETURNING перевода",
+		t.Errorf("zone deltas = queued %d / pending %d, want 1/2 — the deltas lead exactly the transition RETURNING",
 			queued, pending)
 	}
 
@@ -234,10 +234,10 @@ func TestLease_WorkerRaceGuard(t *testing.T) {
 	// back to the batch would give nothing.
 	repeat, err := scheduler.LeaseOnce(ctx, pool, &cursor, scheduler.LeaseOptions{})
 	if err != nil {
-		t.Fatalf("повторный LeaseOnce: %v", err)
+		t.Fatalf("repeat LeaseOnce: %v", err)
 	}
 	if repeat != (scheduler.LeaseResult{}) {
-		t.Fatalf("повторный проход = %+v, want нулевой — курсор за пачкой", repeat)
+		t.Fatalf("repeat pass = %+v, want zero — the cursor is past the batch", repeat)
 	}
 }
 
@@ -265,13 +265,13 @@ func TestLease_CursorNotSkipLaterMatured(t *testing.T) {
 	// Pass 1: only the mature one; the cursor — past it.
 	first, err := scheduler.LeaseOnce(ctx, pool, &cursor, opts)
 	if err != nil {
-		t.Fatalf("проход 1: %v", err)
+		t.Fatalf("pass 1: %v", err)
 	}
 	if first.Domains != 1 || first.Selected != 1 {
-		t.Fatalf("проход 1 = %+v, want 1/1", first)
+		t.Fatalf("pass 1 = %+v, want 1/1", first)
 	}
 	if state := leaseCheckState(ctx, t, pool, zone, old); state != int16(model.CheckStatePending) {
-		t.Fatalf("зрелая аренда не возвращена: check_state = %d", state)
+		t.Fatalf("mature lease not returned: check_state = %d", state)
 	}
 
 	// A fresh lease: to the right of the threshold — the second pass is
@@ -279,13 +279,13 @@ func TestLease_CursorNotSkipLaterMatured(t *testing.T) {
 	fresh := leaseSeedQueued(ctx, t, pool, zone, "c2", 0)
 	second, err := scheduler.LeaseOnce(ctx, pool, &cursor, opts)
 	if err != nil {
-		t.Fatalf("проход 2: %v", err)
+		t.Fatalf("pass 2: %v", err)
 	}
 	if second != (scheduler.LeaseResult{}) {
-		t.Fatalf("проход 2 = %+v, want нулевой — аренда ещё не истекла", second)
+		t.Fatalf("pass 2 = %+v, want zero — the lease has not expired yet", second)
 	}
 	if state := leaseCheckState(ctx, t, pool, zone, fresh); state != int16(model.CheckStateQueued) {
-		t.Fatalf("живая аренда тронута: check_state = %d, хочу queued", state)
+		t.Fatalf("live lease touched: check_state = %d, want queued", state)
 	}
 
 	// A pause longer than the lease: the fresh one aged out — pass 3
@@ -294,13 +294,13 @@ func TestLease_CursorNotSkipLaterMatured(t *testing.T) {
 	time.Sleep(2500 * time.Millisecond)
 	third, err := scheduler.LeaseOnce(ctx, pool, &cursor, opts)
 	if err != nil {
-		t.Fatalf("проход 3: %v", err)
+		t.Fatalf("pass 3: %v", err)
 	}
 	if third.Domains != 1 || third.Selected != 1 {
-		t.Fatalf("проход 3 = %+v, want 1/1 — состарившаяся позже запись не пропущена курсором", third)
+		t.Fatalf("pass 3 = %+v, want 1/1 — the record that matured later was not skipped by the cursor", third)
 	}
 	if state := leaseCheckState(ctx, t, pool, zone, fresh); state != int16(model.CheckStatePending) {
-		t.Errorf("состарившаяся аренда не возвращена: check_state = %d, хочу pending", state)
+		t.Errorf("aged-out lease not returned: check_state = %d, want pending", state)
 	}
 }
 
@@ -354,7 +354,7 @@ func TestLease_CursorPredicateIndex(t *testing.T) {
 	// predicate). The assert matches the key-column suffix, invariant to
 	// the split.
 	if !strings.Contains(selPlan, "queued_at_zone_id_id_idx") {
-		t.Errorf("предикат композитного курсора не обслуживается листовым экземпляром domains_lease_idx:\n%s",
+		t.Errorf("the composite cursor predicate is not served by the leaf instance of domains_lease_idx:\n%s",
 			selPlan)
 	}
 
@@ -387,10 +387,10 @@ func TestLease_CursorPredicateIndex(t *testing.T) {
 		int16(model.CheckStateQueued), int16(model.StatusDeleted),
 		int(scheduler.DefaultLeaseTimeout.Seconds())))
 	if !strings.Contains(updPlan, "Function Scan on u") {
-		t.Errorf("в плане перевода нет unnest-пакета (Function Scan on u):\n%s", updPlan)
+		t.Errorf("no unnest pack in the transition plan (Function Scan on u):\n%s", updPlan)
 	}
 	if strings.Contains(updPlan, "Seq Scan on domains") {
-		t.Errorf("перевод пачки деградировал в seq scan по domains:\n%s", updPlan)
+		t.Errorf("the batch transition degraded into a seq scan over domains:\n%s", updPlan)
 	}
 }
 
@@ -406,7 +406,7 @@ func leaseExplain(ctx context.Context, t *testing.T, tx pgx.Tx, query string) st
 	for rows.Next() {
 		var line string
 		if err := rows.Scan(&line); err != nil {
-			t.Fatalf("EXPLAIN: чтение: %v", err)
+			t.Fatalf("EXPLAIN: reading: %v", err)
 		}
 		plan.WriteString(line)
 		plan.WriteByte('\n')

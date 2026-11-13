@@ -44,7 +44,7 @@ func embeddedNames(t *testing.T) []string {
 	t.Helper()
 	entries, err := migrations.FS.ReadDir(".")
 	if err != nil {
-		t.Fatalf("чтение встроенного набора: %v", err)
+		t.Fatalf("reading the embedded set: %v", err)
 	}
 	names := make([]string, 0, len(entries))
 	for _, e := range entries {
@@ -61,7 +61,7 @@ func latestEmbeddedVersion(t *testing.T) uint {
 	for _, name := range embeddedNames(t) {
 		var v uint
 		if _, err := fmt.Sscanf(name, "%d_", &v); err != nil {
-			t.Fatalf("имя миграции %s: %v", name, err)
+			t.Fatalf("migration name %s: %v", name, err)
 		}
 		if v > max {
 			max = v
@@ -83,7 +83,7 @@ func withTestSchema(t *testing.T) (string, func()) {
 	ctx := context.Background()
 	pool, err := pgxpool.New(ctx, pgDSN(t))
 	if err != nil {
-		t.Fatalf("подключение к PostgreSQL: %v", err)
+		t.Fatalf("connecting to PostgreSQL: %v", err)
 	}
 	defer pool.Close()
 
@@ -98,12 +98,12 @@ func withTestSchema(t *testing.T) (string, func()) {
 	return dsn, func() {
 		p, err := pgxpool.New(ctx, pgDSN(t))
 		if err != nil {
-			t.Errorf("подключение для очистки: %v", err)
+			t.Errorf("cleanup connection: %v", err)
 			return
 		}
 		defer p.Close()
 		if _, err := p.Exec(ctx, "DROP SCHEMA IF EXISTS "+name+" CASCADE"); err != nil {
-			t.Errorf("drop schema после теста: %v", err)
+			t.Errorf("drop schema after the test: %v", err)
 		}
 	}
 }
@@ -114,7 +114,7 @@ func schemaVersion(t *testing.T, dsn string) (uint, bool) {
 	ctx := context.Background()
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
-		t.Fatalf("подключение: %v", err)
+		t.Fatalf("connecting: %v", err)
 	}
 	defer pool.Close()
 	var v int
@@ -131,22 +131,22 @@ func TestMigrate_FreshSchema(t *testing.T) {
 	skipUnlessIntegration(t)
 	latest := latestEmbeddedVersion(t)
 	if latest == 0 {
-		t.Fatal("встроенный набор миграций пуст")
+		t.Fatal("the embedded migration set is empty")
 	}
 
 	dsn, cleanup := withTestSchema(t)
 	defer cleanup()
 
 	if err := migrate.Up(context.Background(), dsn); err != nil {
-		t.Fatalf("применение миграций к чистой схеме: %v", err)
+		t.Fatalf("applying migrations to a clean schema: %v", err)
 	}
 
 	version, ok := schemaVersion(t, dsn)
 	if !ok {
-		t.Fatal("schema_migrations не создана или пуста")
+		t.Fatal("schema_migrations is not created or empty")
 	}
 	if version != latest {
-		t.Errorf("версия схемы = %d, want %d (последняя встроенная)", version, latest)
+		t.Errorf("schema version = %d, want %d (the latest embedded)", version, latest)
 	}
 
 	// Key tables of the DDL sketch (spec 6.1) appeared in the new schema.
@@ -161,7 +161,7 @@ func TestMigrate_FreshSchema(t *testing.T) {
 			"SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = $1)",
 			table,
 		).Scan(&ok); err != nil || !ok {
-			t.Errorf("таблица %s не создана (err=%v)", table, err)
+			t.Errorf("table %s not created (err=%v)", table, err)
 		}
 	}
 
@@ -170,7 +170,7 @@ func TestMigrate_FreshSchema(t *testing.T) {
 		t.Fatalf("subdomains: %v", err)
 	}
 	if subdomains != 6 {
-		t.Errorf("включённых субдоменов = %d, want 6 (миграция 000001)", subdomains)
+		t.Errorf("enabled subdomains = %d, want 6 (migration 000001)", subdomains)
 	}
 }
 
@@ -185,15 +185,15 @@ func TestMigrate_AlreadyApplied(t *testing.T) {
 
 	ctx := context.Background()
 	if err := migrate.Up(ctx, dsn); err != nil {
-		t.Fatalf("первое применение: %v", err)
+		t.Fatalf("first apply: %v", err)
 	}
 	before, _ := schemaVersion(t, dsn)
 
 	if err := migrate.Up(ctx, dsn); err != nil {
-		t.Fatalf("повторное применение: %v (ожидался успех как «нет изменений»)", err)
+		t.Fatalf("second apply: %v (expected success as \"no changes\")", err)
 	}
 	if after, _ := schemaVersion(t, dsn); after != before {
-		t.Errorf("версия изменилась при повторном применении: %d → %d", before, after)
+		t.Errorf("the version changed on re-apply: %d → %d", before, after)
 	}
 }
 
@@ -220,12 +220,12 @@ func TestMigrate_ConcurrentStart(t *testing.T) {
 
 	for i, err := range errs {
 		if err != nil {
-			t.Errorf("экземпляр %d: %v", i, err)
+			t.Errorf("instance %d: %v", i, err)
 		}
 	}
 
 	if version, ok := schemaVersion(t, dsn); !ok || version != latestEmbeddedVersion(t) {
-		t.Errorf("версия после гонки старта = %d (ok=%v), want %d", version, ok, latestEmbeddedVersion(t))
+		t.Errorf("version after the start race = %d (ok=%v), want %d", version, ok, latestEmbeddedVersion(t))
 	}
 }
 
@@ -249,7 +249,7 @@ func TestMigrate_InterruptedMidApply(t *testing.T) {
 
 	ctx := context.Background()
 	if err := migrate.Up(ctx, dsn); err != nil {
-		t.Fatalf("подготовка — полное применение: %v", err)
+		t.Fatalf("setup — the full apply: %v", err)
 	}
 
 	// The "7 applied, 000008 pending" state: the 000008 indexes are
@@ -303,7 +303,7 @@ func TestMigrate_InterruptedMidApply(t *testing.T) {
 		"INSERT INTO schema_migrations (version, dirty) VALUES (7, false)",
 	} {
 		if _, err := pool.Exec(ctx, stmt); err != nil {
-			t.Fatalf("подготовка версии 7 (%s): %v", stmt, err)
+			t.Fatalf("setup of version 7 (%s): %v", stmt, err)
 		}
 	}
 
@@ -313,15 +313,15 @@ func TestMigrate_InterruptedMidApply(t *testing.T) {
 	// cancellation does not touch foreign queries.
 	blocker, err := pgx.Connect(ctx, dsn)
 	if err != nil {
-		t.Fatalf("соединение блокировщика: %v", err)
+		t.Fatalf("blocker connection: %v", err)
 	}
 	defer func() { _ = blocker.Close(ctx) }()
 	if _, err := blocker.Exec(ctx, "BEGIN"); err != nil {
-		t.Fatalf("BEGIN блокировщика: %v", err)
+		t.Fatalf("blocker BEGIN: %v", err)
 	}
 	defer func() { _, _ = blocker.Exec(ctx, "ROLLBACK") }()
 	if _, err := blocker.Exec(ctx, "LOCK TABLE domains IN ROW EXCLUSIVE MODE"); err != nil {
-		t.Fatalf("LOCK TABLE блокировщика: %v", err)
+		t.Fatalf("blocker LOCK TABLE: %v", err)
 	}
 
 	upCtx, cancelUp := context.WithCancel(ctx)
@@ -337,10 +337,10 @@ func TestMigrate_InterruptedMidApply(t *testing.T) {
 	select {
 	case err := <-upDone:
 		if !errors.Is(err, migrate.ErrInterrupted) {
-			t.Fatalf("Up = %v, хочу migrate.ErrInterrupted", err)
+			t.Fatalf("Up = %v, want migrate.ErrInterrupted", err)
 		}
 	case <-time.After(15 * time.Second):
-		t.Fatal("Up не завершился после отмены — применяющаяся миграция не прервана")
+		t.Fatal("Up did not finish after the cancel — the in-flight migration was not interrupted")
 	}
 
 	// The incomplete migration is rolled back: version 7 is clean, no
@@ -348,11 +348,11 @@ func TestMigrate_InterruptedMidApply(t *testing.T) {
 	// transaction rolled back the CREATE INDEX).
 	version, dirty := schemaVersionState(t, dsn)
 	if version != 7 || dirty {
-		t.Errorf("после прерывания: версия = %d dirty = %v, want 7 false (сброс к предыдущей)", version, dirty)
+		t.Errorf("after the interruption: version = %d dirty = %v, want 7 false (reset to the previous one)", version, dirty)
 	}
 	for _, idx := range []string{"domains_lease_idx", "domains_recheck_idx"} {
 		if indexExists(t, pool, idx) {
-			t.Errorf("индекс %s создан прерванной миграцией — файл не откатился целиком", idx)
+			t.Errorf("index %s was created by the interrupted migration — the file did not roll back as a whole", idx)
 		}
 	}
 
@@ -360,18 +360,18 @@ func TestMigrate_InterruptedMidApply(t *testing.T) {
 	// everything after it in the set (the latest version of the set,
 	// not a specific number — the set grows with new migrations).
 	if _, err := blocker.Exec(ctx, "ROLLBACK"); err != nil {
-		t.Fatalf("освобождение блокировщика: %v", err)
+		t.Fatalf("blocker release: %v", err)
 	}
 	if err := migrate.Up(ctx, dsn); err != nil {
-		t.Fatalf("повторный старт: %v", err)
+		t.Fatalf("second start: %v", err)
 	}
 	latest := int(latestEmbeddedVersion(t))
 	if version, dirty := schemaVersionState(t, dsn); version != latest || dirty {
-		t.Errorf("после повторного старта: версия = %d dirty = %v, want %d false", version, dirty, latest)
+		t.Errorf("after the second start: version = %d dirty = %v, want %d false", version, dirty, latest)
 	}
 	for _, idx := range []string{"domains_lease_idx", "domains_recheck_idx"} {
 		if !indexExists(t, pool, idx) {
-			t.Errorf("индекс %s не создан повторным применением", idx)
+			t.Errorf("index %s not created by the re-apply", idx)
 		}
 	}
 }
@@ -386,7 +386,7 @@ func waitVersionState(t *testing.T, dsn string, wantVersion int, wantDirty bool)
 	defer cancel()
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
-		t.Fatalf("подключение для опроса версии: %v", err)
+		t.Fatalf("version-polling connection: %v", err)
 	}
 	defer pool.Close()
 	for {
@@ -398,7 +398,7 @@ func waitVersionState(t *testing.T, dsn string, wantVersion int, wantDirty bool)
 		}
 		select {
 		case <-ctx.Done():
-			t.Fatalf("версия не достигла %d dirty=%v: последняя ошибка опроса %v", wantVersion, wantDirty, err)
+			t.Fatalf("version did not reach %d dirty=%v: last polling error %v", wantVersion, wantDirty, err)
 		case <-time.After(25 * time.Millisecond):
 		}
 	}
@@ -409,14 +409,14 @@ func schemaVersionState(t *testing.T, dsn string) (int, bool) {
 	t.Helper()
 	pool, err := pgxpool.New(context.Background(), dsn)
 	if err != nil {
-		t.Fatalf("подключение: %v", err)
+		t.Fatalf("connecting: %v", err)
 	}
 	defer pool.Close()
 	var version int
 	var dirty bool
 	if err := pool.QueryRow(context.Background(),
 		"SELECT version, dirty FROM schema_migrations").Scan(&version, &dirty); err != nil {
-		t.Fatalf("чтение schema_migrations: %v", err)
+		t.Fatalf("reading schema_migrations: %v", err)
 	}
 	return version, dirty
 }
@@ -429,7 +429,7 @@ func indexExists(t *testing.T, pool *pgxpool.Pool, name string) bool {
 		"SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = current_schema() AND indexname = $1)",
 		name,
 	).Scan(&exists); err != nil {
-		t.Fatalf("чтение pg_indexes (%s): %v", name, err)
+		t.Fatalf("reading pg_indexes (%s): %v", name, err)
 	}
 	return exists
 }
@@ -452,6 +452,6 @@ func TestMigrate_EmbeddedSetMatchesRepo(t *testing.T) {
 
 	embedded := embeddedNames(t)
 	if strings.Join(embedded, ",") != strings.Join(names, ",") {
-		t.Errorf("встроенный набор отличается от migrations/ на диске:\n  embedded: %v\n  disk:     %v", embedded, names)
+		t.Errorf("the embedded set differs from migrations/ on disk:\n  embedded: %v\n  disk:     %v", embedded, names)
 	}
 }

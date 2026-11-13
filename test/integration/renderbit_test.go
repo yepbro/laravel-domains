@@ -57,7 +57,7 @@ func renderBitDebt(ctx context.Context, t *testing.T, pool *pgxpool.Pool) int64 
 	var n int64
 	if err := pool.QueryRow(ctx,
 		"SELECT value FROM crawler_counters WHERE name = 'render_pending'").Scan(&n); err != nil {
-		t.Fatalf("счётчик рендер-долга: %v", err)
+		t.Fatalf("the render debt counter: %v", err)
 	}
 	return n
 }
@@ -127,13 +127,13 @@ func TestRenderPendingBit_SpecTransitions(t *testing.T) {
 	if _, err := pool.Exec(ctx,
 		"UPDATE domains SET flags = flags | $1 WHERE zone_id = $2 AND id = $3",
 		int16(model.FlagIDN), zone, id); err != nil {
-		t.Fatalf("сеем is_idn: %v", err)
+		t.Fatalf("seeding is_idn: %v", err)
 	}
 	// A manual insert bypassing the incremental deltas — the
 	// reconciliation is the authority (the reference point of the zone
 	// counters, the httpbit_test.go style).
 	if _, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{}); err != nil {
-		t.Fatalf("реконсиляция: %v", err)
+		t.Fatalf("reconciliation: %v", err)
 	}
 
 	debt := func() int64 { return renderBitDebt(ctx, t, pool) }
@@ -142,19 +142,19 @@ func TestRenderPendingBit_SpecTransitions(t *testing.T) {
 	wantFlags := func(want int16, what string) {
 		t.Helper()
 		if f := flags(); f != want {
-			t.Fatalf("%s: flags = %b, хочу %b", what, f, want)
+			t.Fatalf("%s: flags = %b, want %b", what, f, want)
 		}
 	}
 	full := func() {
 		t.Helper()
 		if free, err := renderQ.HasCapacity(ctx); err != nil || free {
-			t.Fatalf("HasCapacity = %v err=%v, хочу false (q:render полон, глубина %d)", free, err, renderLen())
+			t.Fatalf("HasCapacity = %v err=%v, want false (q:render is full, depth %d)", free, err, renderLen())
 		}
 	}
 	drain := func() {
 		t.Helper()
 		if err := rdb.Del(ctx, queue.StreamRender).Err(); err != nil {
-			t.Fatalf("сброс глубины q:render: %v", err)
+			t.Fatalf("resetting the q:render depth: %v", err)
 		}
 	}
 
@@ -166,7 +166,7 @@ func TestRenderPendingBit_SpecTransitions(t *testing.T) {
 		t.Helper()
 		put, err := store.Put(ctx, body)
 		if err != nil {
-			t.Fatalf("сохранение контента: %v", err)
+			t.Fatalf("storing the content: %v", err)
 		}
 		h := put.Hash
 		v := httpfetch.DetectSPA(body)
@@ -196,7 +196,7 @@ func TestRenderPendingBit_SpecTransitions(t *testing.T) {
 			if _, err := q.Publish(ctx, queue.StreamRender, queue.Result{
 				ZoneID: zone, DomainID: id, SubdomainID: 0, Name: name,
 			}); err != nil {
-				t.Fatalf("заполнение q:render: %v", err)
+				t.Fatalf("filling q:render: %v", err)
 			}
 		}
 		full()
@@ -209,10 +209,10 @@ func TestRenderPendingBit_SpecTransitions(t *testing.T) {
 	// 0; the T-181 guard does not run the heavy selection (an empty
 	// outcome without an error).
 	if debt() != 0 {
-		t.Fatalf("Д0: счётчик долга = %d, хочу 0", debt())
+		t.Fatalf("D0: debt counter = %d, want 0", debt())
 	}
 	if res, err := httpworker.RequeueOnce(ctx, pool, store, renderQ, httpworker.RequeueOptions{}); err != nil || res.Selected != 0 {
-		t.Fatalf("Д0: RequeueOnce = %+v err=%v, хочу selected=0 (стационар)", res, err)
+		t.Fatalf("D0: RequeueOnce = %+v err=%v, want selected=0 (steady state)", res, err)
 	}
 
 	// D1: a result record with a full queue — the bit and the counter
@@ -220,17 +220,17 @@ func TestRenderPendingBit_SpecTransitions(t *testing.T) {
 	// episode finishes without a delay (done/alive).
 	armFull()
 	episode(rqBody)
-	wantFlags(debtFlags, "после Д1")
+	wantFlags(debtFlags, "after D1")
 	if debt() != 1 {
-		t.Fatalf("Д1: счётчик = %d, хочу 1 (постановка +1)", debt())
+		t.Fatalf("D1: counter = %d, want 1 (the set +1)", debt())
 	}
 	if n := renderLen(); n != 1 {
-		t.Fatalf("Д1: q:render = %d, хочу 1 (только заполнение — публикация не выполнялась)", n)
+		t.Fatalf("D1: q:render = %d, want 1 (only the fill — no publication happened)", n)
 	}
 	if r := checkStateOf(ctx, t, pool, zone, id); r.state != int16(model.CheckStateDone) || r.status != int16(model.StatusAlive) {
-		t.Fatalf("после Д1 = %+v, хочу done/alive (флаг не задерживает эпизод, §5.6)", r)
+		t.Fatalf("after D1 = %+v, want done/alive (the flag does not delay the episode, §5.6)", r)
 	}
-	countersVerifyEmpty(t, pool, "после Д1 (постановка +1)")
+	countersVerifyEmpty(t, pool, "after D1 (the set +1)")
 
 	// D2: a repeated delivery of the same episode — the queue is still
 	// full, the bit is already set: the setting guard gives RowsAffected
@@ -238,14 +238,14 @@ func TestRenderPendingBit_SpecTransitions(t *testing.T) {
 	// are rewritten idempotently.
 	full()
 	episode(rqBody)
-	wantFlags(debtFlags, "после Д2")
+	wantFlags(debtFlags, "after D2")
 	if debt() != 1 {
-		t.Fatalf("Д2: счётчик = %d, хочу 1 (охрана бита: второй +1 запрещён)", debt())
+		t.Fatalf("D2: counter = %d, want 1 (the bit guard: a second +1 is forbidden)", debt())
 	}
 	if n := renderLen(); n != 1 {
-		t.Fatalf("Д2: q:render = %d, хочу 1 (публикации по-прежнему нет)", n)
+		t.Fatalf("D2: q:render = %d, want 1 (still no publication)", n)
 	}
-	countersVerifyEmpty(t, pool, "после Д2 (повторная доставка — дельты нет)")
+	countersVerifyEmpty(t, pool, "after D2 (a repeated delivery — no delta)")
 
 	// D8: a fresh episode with a free queue — the result record does
 	// NOT erase the bit and does not touch the counter: the tasks are
@@ -253,14 +253,14 @@ func TestRenderPendingBit_SpecTransitions(t *testing.T) {
 	// holder stays the rework pass.
 	drain()
 	episode(rqBody)
-	wantFlags(debtFlags, "после Д8")
+	wantFlags(debtFlags, "after D8")
 	if debt() != 1 {
-		t.Fatalf("Д8: счётчик = %d, хочу 1 (новый эпизод пару не трогает)", debt())
+		t.Fatalf("D8: counter = %d, want 1 (a fresh episode does not touch the pair)", debt())
 	}
 	if n := renderLen(); n != 1 {
-		t.Fatalf("Д8: q:render = %d, хочу 1 (свежий эпизод публикует сам)", n)
+		t.Fatalf("D8: q:render = %d, want 1 (the fresh episode publishes itself)", n)
 	}
-	countersVerifyEmpty(t, pool, "после Д8 (публикация без перехода)")
+	countersVerifyEmpty(t, pool, "after D8 (a publication without a transition)")
 
 	// D3: the rework pass — "published → cleared": re-publishing the
 	// SPA task to q:render, then clearing the bit with the counter −1
@@ -268,19 +268,19 @@ func TestRenderPendingBit_SpecTransitions(t *testing.T) {
 	drain()
 	res, err := httpworker.RequeueOnce(ctx, pool, store, renderQ, httpworker.RequeueOptions{})
 	if err != nil {
-		t.Fatalf("Д3: RequeueOnce: %v", err)
+		t.Fatalf("D3: RequeueOnce: %v", err)
 	}
 	if res.Selected != 1 || res.Cleared != 1 || res.Published != 1 {
-		t.Fatalf("Д3: итог %+v, хочу selected=1 cleared=1 published=1", res)
+		t.Fatalf("D3: outcome %+v, want selected=1 cleared=1 published=1", res)
 	}
 	if n := renderLen(); n != 1 {
-		t.Fatalf("Д3: q:render = %d, хочу 1 (переиздание SPA-задачи)", n)
+		t.Fatalf("D3: q:render = %d, want 1 (re-publishing the SPA task)", n)
 	}
-	wantFlags(cleanFlags, "после Д3")
+	wantFlags(cleanFlags, "after D3")
 	if debt() != 0 {
-		t.Fatalf("Д3: счётчик = %d, хочу 0 (снятие −1)", debt())
+		t.Fatalf("D3: counter = %d, want 0 (the clear −1)", debt())
 	}
-	countersVerifyEmpty(t, pool, "после Д3 (снятие −1)")
+	countersVerifyEmpty(t, pool, "after D3 (the clear −1)")
 
 	// D7 (the mirror clearing guard): a competitor has already cleared
 	// the bit — a repeated CLEAR by the guard gives RowsAffected 0, a
@@ -296,15 +296,15 @@ func TestRenderPendingBit_SpecTransitions(t *testing.T) {
 		"WHERE t.zone_id = $1::int2 AND t.id = $2::int8 AND (t.flags & 2) <> 0"
 	tag, err := pool.Exec(ctx, clearSQL, zone, id)
 	if err != nil {
-		t.Fatalf("Д7: повторное снятие: %v", err)
+		t.Fatalf("D7: the repeated clear: %v", err)
 	}
 	if tag.RowsAffected() != 0 {
-		t.Fatalf("Д7: повторное снятие: RowsAffected = %d, хочу 0 (охрана бита)", tag.RowsAffected())
+		t.Fatalf("D7: the repeated clear: RowsAffected = %d, want 0 (the bit guard)", tag.RowsAffected())
 	}
 	if debt() != 0 {
-		t.Fatalf("Д7: счётчик = %d, хочу 0 (второй −1 запрещён)", debt())
+		t.Fatalf("D7: counter = %d, want 0 (a second −1 is forbidden)", debt())
 	}
-	countersVerifyEmpty(t, pool, "после Д7 (охрана снятия)")
+	countersVerifyEmpty(t, pool, "after D7 (the clearing guard)")
 
 	// D4 "the draft flag": the debt is re-armed (D1 — the queue holds
 	// the message published by the D3 pass), then the page stopped
@@ -313,31 +313,31 @@ func TestRenderPendingBit_SpecTransitions(t *testing.T) {
 	// clears the flag WITHOUT a publication, the counter −1.
 	full()
 	episode(rqBody)
-	wantFlags(debtFlags, "после перевооружения Д4")
+	wantFlags(debtFlags, "after re-arming D4")
 	if debt() != 1 {
-		t.Fatalf("перевооружение Д4: счётчик = %d, хочу 1", debt())
+		t.Fatalf("re-arming D4: counter = %d, want 1", debt())
 	}
 	drain()
 	episode(renderBitStaticBody)
-	wantFlags(debtFlags, "после не-SPA эпизода (бит пережил запись)")
+	wantFlags(debtFlags, "after the non-SPA episode (the bit survived the record)")
 	if debt() != 1 {
-		t.Fatalf("не-SPA эпизод: счётчик = %d, хочу 1 (пара не тронута)", debt())
+		t.Fatalf("non-SPA episode: counter = %d, want 1 (the pair untouched)", debt())
 	}
 	if n := renderLen(); n != 0 {
-		t.Fatalf("не-SPA эпизод: q:render = %d, хочу 0 (не-SPA не публикуется)", n)
+		t.Fatalf("non-SPA episode: q:render = %d, want 0 (non-SPA is not published)", n)
 	}
 	res, err = httpworker.RequeueOnce(ctx, pool, store, renderQ, httpworker.RequeueOptions{})
 	if err != nil {
-		t.Fatalf("Д4: RequeueOnce: %v", err)
+		t.Fatalf("D4: RequeueOnce: %v", err)
 	}
 	if res.Selected != 1 || res.Cleared != 1 || res.Published != 0 {
-		t.Fatalf("Д4: итог %+v, хочу selected=1 cleared=1 published=0 (черновой флаг)", res)
+		t.Fatalf("D4: outcome %+v, want selected=1 cleared=1 published=0 (the draft flag)", res)
 	}
-	wantFlags(cleanFlags, "после Д4")
+	wantFlags(cleanFlags, "after D4")
 	if debt() != 0 {
-		t.Fatalf("Д4: счётчик = %d, хочу 0 (черновое снятие −1)", debt())
+		t.Fatalf("D4: counter = %d, want 0 (the draft clear −1)", debt())
 	}
-	countersVerifyEmpty(t, pool, "после Д4 (черновое снятие −1)")
+	countersVerifyEmpty(t, pool, "after D4 (the draft clear −1)")
 
 	// D5 the keep: the record content is unreadable (a transient
 	// storage failure) — the pass keeps the "bit × counter" pair until
@@ -345,37 +345,37 @@ func TestRenderPendingBit_SpecTransitions(t *testing.T) {
 	// the usual D3.
 	armFull()
 	episode(rqBody)
-	wantFlags(debtFlags, "после перевооружения Д5")
+	wantFlags(debtFlags, "after re-arming D5")
 	if debt() != 1 {
-		t.Fatalf("перевооружение Д5: счётчик = %d, хочу 1", debt())
+		t.Fatalf("re-arming D5: counter = %d, want 1", debt())
 	}
 	drain()
 	res, err = httpworker.RequeueOnce(ctx, pool, renderBitFailContent{
-		err: errors.New("транзиентный сбой хранилища (сценарий)"),
+		err: errors.New("transient storage failure (the scenario)"),
 	}, renderQ, httpworker.RequeueOptions{})
 	if err != nil {
-		t.Fatalf("Д5: RequeueOnce: %v", err)
+		t.Fatalf("D5: RequeueOnce: %v", err)
 	}
 	if res.Selected != 1 || res.Cleared != 0 || res.Published != 0 {
-		t.Fatalf("Д5: итог %+v, хочу selected=1 cleared=0 published=0 (keep)", res)
+		t.Fatalf("D5: outcome %+v, want selected=1 cleared=0 published=0 (keep)", res)
 	}
-	wantFlags(debtFlags, "после Д5")
+	wantFlags(debtFlags, "after D5")
 	if debt() != 1 {
-		t.Fatalf("Д5: счётчик = %d, хочу 1 (пара сохранена)", debt())
+		t.Fatalf("D5: counter = %d, want 1 (the pair kept)", debt())
 	}
-	countersVerifyEmpty(t, pool, "после Д5 (keep — без дельты)")
+	countersVerifyEmpty(t, pool, "after D5 (keep — no delta)")
 
 	res, err = httpworker.RequeueOnce(ctx, pool, store, renderQ, httpworker.RequeueOptions{})
 	if err != nil {
-		t.Fatalf("закрытие Д5: RequeueOnce: %v", err)
+		t.Fatalf("closing D5: RequeueOnce: %v", err)
 	}
 	if res.Selected != 1 || res.Cleared != 1 || res.Published != 1 {
-		t.Fatalf("закрытие Д5: итог %+v, хочу selected=1 cleared=1 published=1", res)
+		t.Fatalf("closing D5: outcome %+v, want selected=1 cleared=1 published=1", res)
 	}
 	if debt() != 0 {
-		t.Fatalf("закрытие Д5: счётчик = %d, хочу 0", debt())
+		t.Fatalf("closing D5: counter = %d, want 0", debt())
 	}
-	countersVerifyEmpty(t, pool, "после закрытия Д5 (снятие −1)")
+	countersVerifyEmpty(t, pool, "after closing D5 (the clear −1)")
 
 	// D6: a delete-file clears the bit by the same status transition
 	// transaction and decrements the counter (T-186): the deleted
@@ -385,9 +385,9 @@ func TestRenderPendingBit_SpecTransitions(t *testing.T) {
 	// guard; the full batch — TestCounters_DeleteWithRenderPending).
 	full() // the queue holds the message published by the D5 closure
 	episode(rqBody)
-	wantFlags(debtFlags, "после перевооружения Д6")
+	wantFlags(debtFlags, "after re-arming D6")
 	if debt() != 1 {
-		t.Fatalf("перевооружение Д6: счётчик = %d, хочу 1", debt())
+		t.Fatalf("re-arming D6: counter = %d, want 1", debt())
 	}
 	batch := mustBatchID(t)
 	if _, err := pool.Exec(ctx,
@@ -397,16 +397,16 @@ func TestRenderPendingBit_SpecTransitions(t *testing.T) {
 	}
 	dres, err := ingest.ApplyDelete(ctx, pool, ingest.Batch{ID: batch, ZoneID: zone, Action: model.ActionDelete})
 	if err != nil || dres.Deleted != 1 || dres.NotFound != 0 {
-		t.Fatalf("Д6: ApplyDelete = %+v err=%v, хочу {1 0}", dres, err)
+		t.Fatalf("D6: ApplyDelete = %+v err=%v, want {1 0}", dres, err)
 	}
-	wantFlags(cleanFlags, "после Д6")
+	wantFlags(cleanFlags, "after D6")
 	if debt() != 0 {
-		t.Fatalf("Д6: счётчик = %d, хочу 0 (декремент удаления −1)", debt())
+		t.Fatalf("D6: counter = %d, want 0 (the delete decrement −1)", debt())
 	}
 	if r := checkStateOf(ctx, t, pool, zone, id); r.status != int16(model.StatusDeleted) {
-		t.Fatalf("после Д6: status = %d, хочу deleted", r.status)
+		t.Fatalf("after D6: status = %d, want deleted", r.status)
 	}
-	countersVerifyEmpty(t, pool, "после Д6 (снятие delete-файлом −1)")
+	countersVerifyEmpty(t, pool, "after D6 (the delete-file clear −1)")
 }
 
 // --- the 2026-11-08 incident (T-269) ----------------------------------------
@@ -538,7 +538,7 @@ func renderBitSeedDebt(ctx context.Context, t *testing.T, pool *pgxpool.Pool, zo
 		if _, err := pool.Exec(ctx,
 			"UPDATE domains SET flags = flags | $1 WHERE zone_id = $2 AND id = $3",
 			int16(model.FlagRenderPending), zone, id); err != nil {
-			t.Fatalf("бит домена %d: %v", id, err)
+			t.Fatalf("domain %d bit: %v", id, err)
 		}
 	}
 	labels := make([]string, len(ids))
@@ -548,10 +548,10 @@ func renderBitSeedDebt(ctx context.Context, t *testing.T, pool *pgxpool.Pool, zo
 	if _, err := pool.Exec(ctx,
 		"INSERT INTO crawler_counters (name, value) VALUES ('render_pending', $1) "+
 			"ON CONFLICT (name) DO UPDATE SET value = EXCLUDED.value", int64(n)); err != nil {
-		t.Fatalf("счётчик долга: %v", err)
+		t.Fatalf("the debt counter: %v", err)
 	}
 	if _, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{}); err != nil {
-		t.Fatalf("реконсиляция-точка отсчёта: %v", err)
+		t.Fatalf("the baseline reconciliation: %v", err)
 	}
 	return labels
 }
@@ -578,7 +578,7 @@ func renderBitBitCount(ctx context.Context, t *testing.T, pool *pgxpool.Pool, zo
 	if err := pool.QueryRow(ctx,
 		"SELECT count(*) FROM domains WHERE zone_id = $1 AND id = ANY($2) AND (flags & $3) <> 0",
 		zone, ids, int16(model.FlagRenderPending)).Scan(&n); err != nil {
-		t.Fatalf("подсчёт битов: %v", err)
+		t.Fatalf("counting the bits: %v", err)
 	}
 	return n
 }
@@ -596,7 +596,7 @@ func renderBitWaitBlocked(t *testing.T, pool *pgxpool.Pool, errc chan error, xid
 	for {
 		select {
 		case err := <-errc:
-			t.Fatalf("%s: конкурент упал до блокировки: %v", what, err)
+			t.Fatalf("%s: the competitor failed before blocking: %v", what, err)
 		default:
 		}
 		var n int
@@ -607,7 +607,7 @@ func renderBitWaitBlocked(t *testing.T, pool *pgxpool.Pool, errc chan error, xid
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("%s: конкурент не заблокировался за 15 с (pg_locks: err=%v n=%d)", what, err, n)
+			t.Fatalf("%s: the competitor did not block within 15 s (pg_locks: err=%v n=%d)", what, err, n)
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
@@ -633,7 +633,7 @@ func renderBitInTxDebt(ctx context.Context, t *testing.T, tx pgx.Tx) int64 {
 	var n int64
 	if err := tx.QueryRow(ctx,
 		"SELECT value FROM crawler_counters WHERE name = 'render_pending'").Scan(&n); err != nil {
-		t.Fatalf("счётчик долга в транзакции: %v", err)
+		t.Fatalf("the debt counter in the transaction: %v", err)
 	}
 	return n
 }
@@ -646,7 +646,7 @@ func renderBitInTxBits(ctx context.Context, t *testing.T, tx pgx.Tx, zone int16,
 	if err := tx.QueryRow(ctx,
 		"SELECT count(*) FROM domains WHERE zone_id = $1 AND id = ANY($2) AND (flags & $3) <> 0",
 		zone, ids, int16(model.FlagRenderPending)).Scan(&n); err != nil {
-		t.Fatalf("подсчёт битов в транзакции: %v", err)
+		t.Fatalf("counting the bits in the transaction: %v", err)
 	}
 	return n
 }
@@ -660,7 +660,7 @@ func renderBitJoinErr(t *testing.T, errc chan error, what string) {
 			t.Fatalf("%s: %v", what, err)
 		}
 	case <-time.After(30 * time.Second):
-		t.Fatalf("%s: не завершился за 30 с", what)
+		t.Fatalf("%s: did not finish within 30 s", what)
 	}
 }
 
@@ -691,7 +691,7 @@ func TestRenderPendingBit_DeleteClearRace(t *testing.T) {
 	// --- Phase 1: BEFORE the fix — the −36 reproduction -------------------
 	batch := renderBitStageDelete(ctx, t, pool, zone, renderBitLabels("race", n))
 	if debt := renderBitDebt(ctx, t, pool); debt != n {
-		t.Fatalf("фаза 1: исход счётчик = %d, хочу %d", debt, n)
+		t.Fatalf("phase 1: baseline counter = %d, want %d", debt, n)
 	}
 
 	// The "rework pass" (L): clears all 18 by the pair and KEEPS the
@@ -699,10 +699,10 @@ func TestRenderPendingBit_DeleteClearRace(t *testing.T) {
 	// invisible.
 	lx, err := pool.Begin(ctx)
 	if err != nil {
-		t.Fatalf("транзакция прохода: %v", err)
+		t.Fatalf("the pass transaction: %v", err)
 	}
 	if _, err := lx.Exec(ctx, renderBitClearPairSQL, zone, raceIDs); err != nil {
-		t.Fatalf("проход: снятие парой: %v", err)
+		t.Fatalf("the pass: clearing by the pair: %v", err)
 	}
 	xid := renderBitXID(ctx, t, lx)
 
@@ -719,11 +719,11 @@ func TestRenderPendingBit_DeleteClearRace(t *testing.T) {
 		defer rows.Close()
 		var deleted, notFound int64
 		if !rows.Next() {
-			errc <- fmt.Errorf("legacy применение: итог не возвращен: %w", rows.Err())
+			errc <- fmt.Errorf("legacy apply: the outcome not returned: %w", rows.Err())
 			return
 		}
 		if err := rows.Scan(&deleted, &notFound); err != nil {
-			errc <- fmt.Errorf("legacy применение: чтение итога: %w", err)
+			errc <- fmt.Errorf("legacy apply: reading the outcome: %w", err)
 			return
 		}
 		if err := rows.Err(); err != nil {
@@ -731,70 +731,70 @@ func TestRenderPendingBit_DeleteClearRace(t *testing.T) {
 			return
 		}
 		if deleted != n || notFound != 0 {
-			errc <- fmt.Errorf("legacy применение: итог {deleted %d not_found %d}, хочу {%d 0}", deleted, notFound, n)
+			errc <- fmt.Errorf("legacy apply: the outcome {deleted %d not_found %d}, want {%d 0}", deleted, notFound, n)
 			return
 		}
 		errc <- nil
 	}()
-	renderBitWaitBlocked(t, pool, errc, xid, "фаза 1: применение")
+	renderBitWaitBlocked(t, pool, errc, xid, "phase 1: the apply")
 
 	// The "after the pass" step — inside the pass transaction (its own
 	// writes are visible, the competitor is still blocked): the bits 0,
 	// the counter 0.
 	if debt := renderBitInTxDebt(ctx, t, lx); debt != 0 {
-		t.Fatalf("фаза 1: после прохода счётчик = %d, хочу 0", debt)
+		t.Fatalf("phase 1: after the pass counter = %d, want 0", debt)
 	}
 	if bits := renderBitInTxBits(ctx, t, lx, zone, raceIDs); bits != 0 {
-		t.Fatalf("фаза 1: после прохода бит = %d, хочу 0", bits)
+		t.Fatalf("phase 1: after the pass bit = %d, want 0", bits)
 	}
 	// The pass commit releases D — as at 11:50:39.982; there are no
 	// intermediate reads from another session anymore (a race with the
 	// D commit, review T-269 P2-1).
 	if err := lx.Commit(ctx); err != nil {
-		t.Fatalf("фиксация прохода: %v", err)
+		t.Fatalf("committing the pass: %v", err)
 	}
 
 	// D continues on the committed version: the CASE sees the bit
 	// cleared, rd still decrements −18 by the snapshot — the counter
 	// −18.
-	renderBitJoinErr(t, errc, "фаза 1: применение")
+	renderBitJoinErr(t, errc, "phase 1: the apply")
 	if debt := renderBitDebt(ctx, t, pool); debt != -n {
-		t.Fatalf("фаза 1: РЕПРОДУКЦИЯ: счётчик = %d, хочу −%d (второе −n по снимку, суммарный сдвиг −%d)", debt, n, 2*n)
+		t.Fatalf("phase 1: REPRODUCTION: counter = %d, want −%d (a second −n by the snapshot, the total shift −%d)", debt, n, 2*n)
 	}
 	if bits := renderBitBitCount(ctx, t, pool, zone, raceIDs); bits != 0 {
-		t.Fatalf("фаза 1: биты = %d, хочу 0 (долг закрыт проходом)", bits)
+		t.Fatalf("phase 1: bits = %d, want 0 (the debt closed by the pass)", bits)
 	}
 	// The pairing is broken exactly by −n: the cross-check sees the
 	// position.
 	mismatch, err := monitor.VerifyCounters(ctx, pool, monitor.VerifyOptions{})
 	if err != nil {
-		t.Fatalf("фаза 1: VerifyCounters: %v", err)
+		t.Fatalf("phase 1: VerifyCounters: %v", err)
 	}
 	if len(mismatch) != 1 || mismatch[0].Counter != "global:render_pending" ||
 		mismatch[0].Old != -n || mismatch[0].New != 0 {
-		t.Fatalf("фаза 1: рассинхрон = %+v, хочу [global:render_pending −%d → 0]", mismatch, n)
+		t.Fatalf("phase 1: desync = %+v, want [global:render_pending −%d → 0]", mismatch, n)
 	}
 
 	// The operator-level leveling ~11:59 (runbooks §6): the counter :=
 	// the fact.
 	if _, err := pool.Exec(ctx,
 		"UPDATE crawler_counters SET value = $1 WHERE name = 'render_pending'", int64(0)); err != nil {
-		t.Fatalf("выравнивание: %v", err)
+		t.Fatalf("leveling: %v", err)
 	}
 
 	// --- Phase 2: AFTER the fix — the same interleaving, the invariant on every step
 	fixIDs := renderBitIDsOfLabels(ctx, t, pool, zone, renderBitSeedDebt(ctx, t, pool, zone, "fix", n))
 	batch2 := renderBitStageDelete(ctx, t, pool, zone, renderBitLabels("fix", n))
 	if debt := renderBitDebt(ctx, t, pool); debt != n {
-		t.Fatalf("фаза 2: исход счётчик = %d, хочу %d", debt, n)
+		t.Fatalf("phase 2: baseline counter = %d, want %d", debt, n)
 	}
 
 	lx2, err := pool.Begin(ctx)
 	if err != nil {
-		t.Fatalf("фаза 2: транзакция прохода: %v", err)
+		t.Fatalf("phase 2: the pass transaction: %v", err)
 	}
 	if _, err := lx2.Exec(ctx, renderBitClearPairSQL, zone, fixIDs); err != nil {
-		t.Fatalf("фаза 2: проход: снятие парой: %v", err)
+		t.Fatalf("phase 2: the pass: clearing by the pair: %v", err)
 	}
 	xid2 := renderBitXID(ctx, t, lx2)
 
@@ -805,45 +805,45 @@ func TestRenderPendingBit_DeleteClearRace(t *testing.T) {
 		resc <- res
 		errc2 <- err
 	}()
-	renderBitWaitBlocked(t, pool, errc2, xid2, "фаза 2: применение")
+	renderBitWaitBlocked(t, pool, errc2, xid2, "phase 2: the apply")
 
 	// The "after the pass" step — inside the pass transaction: the
 	// invariant 0.
 	if debt := renderBitInTxDebt(ctx, t, lx2); debt != 0 {
-		t.Fatalf("фаза 2: после прохода счётчик = %d, хочу 0", debt)
+		t.Fatalf("phase 2: after the pass counter = %d, want 0", debt)
 	}
 	if bits := renderBitInTxBits(ctx, t, lx2, zone, fixIDs); bits != 0 {
-		t.Fatalf("фаза 2: после прохода биты = %d, хочу 0", bits)
+		t.Fatalf("phase 2: after the pass bits = %d, want 0", bits)
 	}
 	if err := lx2.Commit(ctx); err != nil {
-		t.Fatalf("фаза 2: фиксация прохода: %v", err)
+		t.Fatalf("phase 2: committing the pass: %v", err)
 	}
 
-	renderBitJoinErr(t, errc2, "фаза 2: применение")
+	renderBitJoinErr(t, errc2, "phase 2: the apply")
 	var res ingest.DeleteResult
 	select {
 	case res = <-resc:
 	default:
-		t.Fatal("фаза 2: итог применения не возвращён")
+		t.Fatal("phase 2: the apply outcome not returned")
 	}
 	if res.Deleted != n || res.NotFound != 0 {
-		t.Fatalf("фаза 2: ApplyDelete = %+v, хочу deleted %d", res, n)
+		t.Fatalf("phase 2: ApplyDelete = %+v, want deleted %d", res, n)
 	}
 	// The "after the apply" step: the status transition landed, the bit
 	// was already cleared by the pass — the pair did NOT run (no keys),
 	// the counter is untouched.
 	if debt := renderBitDebt(ctx, t, pool); debt != 0 {
-		t.Fatalf("фаза 2: ПОСЛЕ ФИКСА счётчик = %d, хочу 0 (инвариант держится)", debt)
+		t.Fatalf("phase 2: AFTER THE FIX counter = %d, want 0 (the invariant holds)", debt)
 	}
 	if bits := renderBitBitCount(ctx, t, pool, zone, fixIDs); bits != 0 {
-		t.Fatalf("фаза 2: биты = %d, хочу 0", bits)
+		t.Fatalf("phase 2: bits = %d, want 0", bits)
 	}
 	for i, id := range fixIDs {
 		if r := checkStateOf(ctx, t, pool, zone, id); r.status != int16(model.StatusDeleted) {
-			t.Fatalf("фаза 2: домен fix%d: status = %d, хочу deleted", i, r.status)
+			t.Fatalf("phase 2: the fix%d domain: status = %d, want deleted", i, r.status)
 		}
 	}
-	countersVerifyEmpty(t, pool, "фаза 2 (проход × применение, после фикса)")
+	countersVerifyEmpty(t, pool, "phase 2 (the pass × the apply, after the fix)")
 
 	// --- Phase 2b: the apply wins the race (the bit is set) — the pair by the fact
 	winIDs := renderBitIDsOfLabels(ctx, t, pool, zone, renderBitSeedDebt(ctx, t, pool, zone, "win", 1))
@@ -851,15 +851,15 @@ func TestRenderPendingBit_DeleteClearRace(t *testing.T) {
 
 	res3, err := ingest.ApplyDelete(ctx, pool, ingest.Batch{ID: batch3, ZoneID: zone, Action: model.ActionDelete})
 	if err != nil || res3.Deleted != 1 {
-		t.Fatalf("фаза 2b: ApplyDelete = %+v err=%v, хочу deleted 1", res3, err)
+		t.Fatalf("phase 2b: ApplyDelete = %+v err=%v, want deleted 1", res3, err)
 	}
 	if bits := renderBitBitCount(ctx, t, pool, zone, winIDs); bits != 0 {
-		t.Fatalf("фаза 2b: бит не снят применением (%d)", bits)
+		t.Fatalf("phase 2b: the bit not cleared by the apply (%d)", bits)
 	}
 	if debt := renderBitDebt(ctx, t, pool); debt != 0 {
-		t.Fatalf("фаза 2b: счётчик = %d, хочу 0 (пара −1 по факту)", debt)
+		t.Fatalf("phase 2b: counter = %d, want 0 (the pair −1 by the fact)", debt)
 	}
-	countersVerifyEmpty(t, pool, "фаза 2b (применение без прохода)")
+	countersVerifyEmpty(t, pool, "phase 2b (the apply without the pass)")
 }
 
 // renderBitLabels — the labels prefix0..prefix(n−1) in the seed order.
@@ -878,7 +878,7 @@ func renderBitIDsOfLabels(ctx context.Context, t *testing.T, pool *pgxpool.Pool,
 	for i, label := range labels {
 		if err := pool.QueryRow(ctx,
 			"SELECT id FROM domains WHERE zone_id = $1 AND label = $2", zone, label).Scan(&ids[i]); err != nil {
-			t.Fatalf("id домена %s: %v", label, err)
+			t.Fatalf("the %s domain id: %v", label, err)
 		}
 	}
 	return ids
@@ -906,18 +906,18 @@ func TestRenderPendingBit_ReconciliationStaleSnapshot(t *testing.T) {
 	zone := countersSeedZone(t, pool, "fsm-monrace.test")
 	ids := renderBitIDsOfLabels(ctx, t, pool, zone, renderBitSeedDebt(ctx, t, pool, zone, "mon", n))
 	if debt := renderBitDebt(ctx, t, pool); debt != n {
-		t.Fatalf("исход счётчик = %d, хочу %d", debt, n)
+		t.Fatalf("baseline counter = %d, want %d", debt, n)
 	}
 	// The "manual operation" mark: updated_at into the past — after the
 	// race it must shift (the loudness of the rewrite).
 	if _, err := pool.Exec(ctx,
 		"UPDATE crawler_counters SET updated_at = now() - interval '1 hour' WHERE name = 'render_pending'"); err != nil {
-		t.Fatalf("метка updated_at: %v", err)
+		t.Fatalf("the updated_at mark: %v", err)
 	}
 	var t0 time.Time
 	if err := pool.QueryRow(ctx,
 		"SELECT updated_at FROM crawler_counters WHERE name = 'render_pending'").Scan(&t0); err != nil {
-		t.Fatalf("чтение updated_at: %v", err)
+		t.Fatalf("reading updated_at: %v", err)
 	}
 
 	// L holds the counter row — the reconciliation upsert will block
@@ -925,11 +925,11 @@ func TestRenderPendingBit_ReconciliationStaleSnapshot(t *testing.T) {
 	// the rework pass will have time to close the debt.
 	lx, err := pool.Begin(ctx)
 	if err != nil {
-		t.Fatalf("транзакция-блокиратор: %v", err)
+		t.Fatalf("the blocker transaction: %v", err)
 	}
 	if _, err := lx.Exec(ctx,
 		"SELECT value FROM crawler_counters WHERE name = 'render_pending' FOR UPDATE"); err != nil {
-		t.Fatalf("блокировка строки счётчика: %v", err)
+		t.Fatalf("locking the counter row: %v", err)
 	}
 	xid := renderBitXID(ctx, t, lx)
 
@@ -943,34 +943,34 @@ func TestRenderPendingBit_ReconciliationStaleSnapshot(t *testing.T) {
 		resc <- res
 		errc <- err
 	}()
-	renderBitWaitBlocked(t, pool, errc, xid, "реконсиляция")
+	renderBitWaitBlocked(t, pool, errc, xid, "reconciliation")
 
 	// The "rework pass" inside L: the bits → 0, the counter −18 (L
 	// already holds the row — the decrement without waiting). The "debt
 	// closed" step — inside the transaction (its own writes are
 	// visible, M is still blocked): 0/0.
 	if _, err := lx.Exec(ctx, renderBitClearPairSQL, zone, ids); err != nil {
-		t.Fatalf("проход: снятие парой: %v", err)
+		t.Fatalf("the pass: clearing by the pair: %v", err)
 	}
 	if debt := renderBitInTxDebt(ctx, t, lx); debt != 0 {
-		t.Fatalf("после прохода счётчик = %d, хочу 0", debt)
+		t.Fatalf("after the pass counter = %d, want 0", debt)
 	}
 	if bits := renderBitInTxBits(ctx, t, lx, zone, ids); bits != 0 {
-		t.Fatalf("после прохода биты = %d, хочу 0", bits)
+		t.Fatalf("after the pass bits = %d, want 0", bits)
 	}
 	if err := lx.Commit(ctx); err != nil {
-		t.Fatalf("фиксация прохода: %v", err)
+		t.Fatalf("committing the pass: %v", err)
 	}
 
 	// M is released and applies the stale ABSOLUTE: +18 with a zero bit
 	// — NOT −18 (no delta from the expectation), updated_at shifted
 	// (loudly).
-	renderBitJoinErr(t, errc, "реконсиляция")
+	renderBitJoinErr(t, errc, "reconciliation")
 	var mres monitor.ZoneStatsResult
 	select {
 	case mres = <-resc:
 	default:
-		t.Fatal("итог реконсиляции не возвращён")
+		t.Fatal("the reconciliation outcome not returned")
 	}
 	// The drift of the pass itself — zero (the counter old = the new =
 	// 18): the crawler_counters_drift gauge does not measure the
@@ -982,25 +982,25 @@ func TestRenderPendingBit_ReconciliationStaleSnapshot(t *testing.T) {
 		}
 		sawPos = true
 		if p.Old != n || p.New != n || p.Drift() != 0 {
-			t.Fatalf("дрейф прохода = %+v, хочу old=new=%d drift 0 (дрейф — счётчик о счётчике, парность не видит)", p, n)
+			t.Fatalf("the pass drift = %+v, want old=new=%d drift 0 (the drift is a counter about counters, it does not see the pairing)", p, n)
 		}
 	}
 	if !sawPos {
-		t.Fatal("позиция global:render_pending отсутствует в итоге прохода")
+		t.Fatal("the global:render_pending position missing from the pass outcome")
 	}
 	if debt := renderBitDebt(ctx, t, pool); debt != n {
-		t.Fatalf("ОПРОВЕРЖЕНИЕ: реконсиляция с устаревшим снимком оставила счётчик %d, хочу +%d (устаревший АБСОЛЮТ; «второго −18» не существует)", debt, n)
+		t.Fatalf("REFUTATION: the reconciliation with a stale snapshot left the counter %d, want +%d (the stale ABSOLUTE; a \"second −18\" does not exist)", debt, n)
 	}
 	if bits := renderBitBitCount(ctx, t, pool, zone, ids); bits != 0 {
-		t.Fatalf("биты = %d, хочу 0", bits)
+		t.Fatalf("bits = %d, want 0", bits)
 	}
 	var at time.Time
 	if err := pool.QueryRow(ctx,
 		"SELECT updated_at FROM crawler_counters WHERE name = 'render_pending'").Scan(&at); err != nil {
-		t.Fatalf("чтение updated_at: %v", err)
+		t.Fatalf("reading updated_at: %v", err)
 	}
 	if !at.After(t0) {
-		t.Fatalf("updated_at не сдвинут (%v ≤ %v): перезапись реконсиляции обязана быть «громкой» — немой дельты она не пишет", at, t0)
+		t.Fatalf("updated_at not moved (%v ≤ %v): the reconciliation rewrite must be \"loud\" — it does not write a silent delta", at, t0)
 	}
 
 	// The pairing is broken transiently (+18/0) — the cross-check sees
@@ -1013,15 +1013,15 @@ func TestRenderPendingBit_ReconciliationStaleSnapshot(t *testing.T) {
 	}
 	if len(mismatch) != 1 || mismatch[0].Counter != "global:render_pending" ||
 		mismatch[0].Old != n || mismatch[0].New != 0 {
-		t.Fatalf("рассинхрон = %+v, хочу [global:render_pending %d → 0]", mismatch, n)
+		t.Fatalf("desync = %+v, want [global:render_pending %d → 0]", mismatch, n)
 	}
 
 	// Self-healing: the next pass writes a fresh absolute (no bits).
 	if _, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{}); err != nil {
-		t.Fatalf("лечащий проход: %v", err)
+		t.Fatalf("the healing pass: %v", err)
 	}
 	if debt := renderBitDebt(ctx, t, pool); debt != 0 {
-		t.Fatalf("после следующего прохода счётчик = %d, хочу 0 (самолечение ≤ zone_stats_interval)", debt)
+		t.Fatalf("after the next pass counter = %d, want 0 (self-healing ≤ zone_stats_interval)", debt)
 	}
-	countersVerifyEmpty(t, pool, "после самолечения реконсиляцией")
+	countersVerifyEmpty(t, pool, "after the reconciliation self-healing")
 }

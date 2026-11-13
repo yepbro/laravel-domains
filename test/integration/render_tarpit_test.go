@@ -33,22 +33,22 @@ func TestRenderTarpitCounterRedis(t *testing.T) {
 	ttl := 48 * time.Hour
 	// First tarpit delivery: cardinality 1.
 	if n, err := c.Track(ctx, taskID, "1719-1#1", ttl); err != nil || n != 1 {
-		t.Fatalf("Track №1 = (%d, %v), хочу (1, nil)", n, err)
+		t.Fatalf("Track #1 = (%d, %v), want (1, nil)", n, err)
 	}
 	// Replay of the same delivery (the same entry-id × number): SADD is idempotent.
 	if n, err := c.Track(ctx, taskID, "1719-1#1", ttl); err != nil || n != 1 {
-		t.Fatalf("Track дубля = (%d, %v), хочу (1, nil) — одна доставка один член", n, err)
+		t.Fatalf("Track of a duplicate = (%d, %v), want (1, nil) — one delivery one member", n, err)
 	}
 	// A new delivery of the same task: cardinality 2 — the
 	// render.timeout_attempts threshold (default 2) is reached.
 	if n, err := c.Track(ctx, taskID, "1719-1#2", ttl); err != nil || n != 2 {
-		t.Fatalf("Track №2 = (%d, %v), хочу (2, nil)", n, err)
+		t.Fatalf("Track #2 = (%d, %v), want (2, nil)", n, err)
 	}
 	// A different task — a different set, cardinalities do not mix.
 	other := queue.NewTaskID()
 	t.Cleanup(func() { _ = rdb.Del(context.Background(), queue.TarpitKey(other)).Err() })
 	if n, err := c.Track(ctx, other, "9999-9#1", ttl); err != nil || n != 1 {
-		t.Fatalf("Track чужой задачи = (%d, %v), хочу (1, nil)", n, err)
+		t.Fatalf("Track of another task = (%d, %v), want (1, nil)", n, err)
 	}
 
 	// The key TTL is alive and within the horizon: the mark refreshes
@@ -56,18 +56,18 @@ func TestRenderTarpitCounterRedis(t *testing.T) {
 	// end of the episode.
 	got := rdb.TTL(ctx, key).Val()
 	if got <= 0 || got > ttl {
-		t.Errorf("TTL %s = %s, хочу (0, %s]", key, got, ttl)
+		t.Errorf("TTL %s = %s, want (0, %s]", key, got, ttl)
 	}
 	// The key type is a set (manual inspection via redis-cli: SMEMBERS).
 	if kind, err := rdb.Type(ctx, key).Result(); err != nil || kind != "set" {
-		t.Errorf("TYPE %s = %q (%v), хочу set", key, kind, err)
+		t.Errorf("TYPE %s = %q (%v), want set", key, kind, err)
 	}
 
 	// Validation before commands: invalid arguments do not create keys.
 	if _, err := c.Track(ctx, "", "e#1", ttl); err == nil {
-		t.Error("пустой task_id — ошибка")
+		t.Error("empty task_id must be an error")
 	}
 	if _, err := c.Track(ctx, queue.NewTaskID(), "e#1", 0); err == nil {
-		t.Error("TTL 0 — ошибка (EXPIRE удалил бы ключ)")
+		t.Error("TTL 0 must be an error (EXPIRE would delete the key)")
 	}
 }

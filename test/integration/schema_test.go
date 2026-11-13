@@ -50,12 +50,12 @@ func migratedSchema(t *testing.T) *pgxpool.Pool {
 	t.Cleanup(cleanup)
 
 	if err := migrate.Up(context.Background(), dsn); err != nil {
-		t.Fatalf("применение миграций к изолированной схеме: %v", err)
+		t.Fatalf("applying migrations to the isolated schema: %v", err)
 	}
 
 	pool, err := pgxpool.New(context.Background(), dsn)
 	if err != nil {
-		t.Fatalf("подключение к тестовой схеме: %v", err)
+		t.Fatalf("connecting to the test schema: %v", err)
 	}
 	t.Cleanup(pool.Close)
 	return pool
@@ -108,7 +108,7 @@ func tablePartitions(t *testing.T, pool *pgxpool.Pool, table string) []tablePart
 
 	rows, err := pool.Query(context.Background(), query, table)
 	if err != nil {
-		t.Fatalf("каталог партиций %s: %v", table, err)
+		t.Fatalf("the partition catalog of %s: %v", table, err)
 	}
 	defer rows.Close()
 
@@ -116,12 +116,12 @@ func tablePartitions(t *testing.T, pool *pgxpool.Pool, table string) []tablePart
 	for rows.Next() {
 		var p tablePartition
 		if err := rows.Scan(&p.name, &p.relkind, &p.reloptions, &p.bound, &p.indexCount); err != nil {
-			t.Fatalf("чтение партиции: %v", err)
+			t.Fatalf("reading a partition: %v", err)
 		}
 		parts = append(parts, p)
 	}
 	if err := rows.Err(); err != nil {
-		t.Fatalf("итерация партиций: %v", err)
+		t.Fatalf("iterating the partitions: %v", err)
 	}
 	return parts
 }
@@ -149,7 +149,7 @@ func tableIndexes(t *testing.T, pool *pgxpool.Pool, table string) []tableIndex {
 
 	rows, err := pool.Query(context.Background(), query, table)
 	if err != nil {
-		t.Fatalf("каталог индексов %s: %v", table, err)
+		t.Fatalf("the index catalog of %s: %v", table, err)
 	}
 	defer rows.Close()
 
@@ -157,12 +157,12 @@ func tableIndexes(t *testing.T, pool *pgxpool.Pool, table string) []tableIndex {
 	for rows.Next() {
 		var ix tableIndex
 		if err := rows.Scan(&ix.name, &ix.def, &ix.pred); err != nil {
-			t.Fatalf("чтение индекса: %v", err)
+			t.Fatalf("reading an index: %v", err)
 		}
 		indexes = append(indexes, ix)
 	}
 	if err := rows.Err(); err != nil {
-		t.Fatalf("итерация индексов: %v", err)
+		t.Fatalf("iterating the indexes: %v", err)
 	}
 	return indexes
 }
@@ -183,16 +183,16 @@ func assertListPartitionedByZoneID(t *testing.T, pool *pgxpool.Pool, table strin
 		WHERE n.nspname = current_schema() AND c.relname = $1`, table,
 	).Scan(&relkind, &strat, &partkey)
 	if err != nil {
-		t.Fatalf("pg_class для %s: %v", table, err)
+		t.Fatalf("pg_class for %s: %v", table, err)
 	}
 	if relkind != "p" {
-		t.Errorf("%s: relkind = %s, want p (партиционированная таблица)", table, relkind)
+		t.Errorf("%s: relkind = %s, want p (a partitioned table)", table, relkind)
 	}
 	if strat != "l" {
-		t.Errorf("%s: стратегия партиционирования = %q, want \"l\" (LIST)", table, strat)
+		t.Errorf("%s: the partitioning strategy = %q, want \"l\" (LIST)", table, strat)
 	}
 	if partkey != "LIST (zone_id)" {
-		t.Errorf("%s: ключ партиционирования = %q, want \"LIST (zone_id)\"", table, partkey)
+		t.Errorf("%s: the partitioning key = %q, want \"LIST (zone_id)\"", table, partkey)
 	}
 }
 
@@ -215,10 +215,10 @@ func leafPartitions(t *testing.T, pool *pgxpool.Pool, table string) []tableParti
 		}
 	}
 	if len(leaves) == 0 {
-		t.Errorf("нет ни одной листовой партиции %s", table)
+		t.Errorf("no leaf partition of %s at all", table)
 	}
 	if !defaultSeen {
-		t.Errorf("нет DEFAULT-партиции %s: новые зоны не смогут записаться до выделения партиции", table)
+		t.Errorf("no DEFAULT partition of %s: new zones will not be able to write until a partition is extracted", table)
 	}
 	return leaves
 }
@@ -238,7 +238,7 @@ func TestSchema_DomainsPartitioning(t *testing.T) {
 
 	for _, p := range leafPartitions(t, pool, "domains") {
 		if !strings.Contains(p.reloptions, "fillfactor=85") {
-			t.Errorf("партиция %s: reloptions = %q, want fillfactor=85 (reloptions не наследуются от родителя)", p.name, p.reloptions)
+			t.Errorf("partition %s: reloptions = %q, want fillfactor=85 (reloptions are not inherited from the parent)", p.name, p.reloptions)
 		}
 	}
 }
@@ -277,12 +277,12 @@ func TestSchema_DomainsIndexes(t *testing.T) {
 	}
 	for name := range want {
 		if !got[name] {
-			t.Errorf("индекс %s отсутствует на domains", name)
+			t.Errorf("index %s missing on domains", name)
 		}
 	}
 	for name := range got {
 		if !want[name] {
-			t.Errorf("лишний индекс %s на domains: состав индексов зафиксирован (минимум индексов, ТЗ 6)", name)
+			t.Errorf("extra index %s on domains: the index set is pinned (the minimum of indexes, spec 6)", name)
 		}
 	}
 
@@ -303,19 +303,19 @@ func TestSchema_DomainsIndexes(t *testing.T) {
 			}
 		}
 		if ix == nil {
-			t.Fatalf("%s не найден", name)
+			t.Fatalf("%s not found", name)
 		}
 		if key, _, _ := strings.Cut(ix.def, " WHERE "); !strings.Contains(key, w.key) {
-			t.Errorf("%s: ключ = %q, want %s", name, key, w.key)
+			t.Errorf("%s: key = %q, want %s", name, key, w.key)
 		}
 		if !strings.Contains(ix.pred, w.pred) {
-			t.Errorf("%s: предикат = %q, want %q", name, ix.pred, w.pred)
+			t.Errorf("%s: predicate = %q, want %q", name, ix.pred, w.pred)
 		}
 	}
 
 	for _, p := range leafPartitions(t, pool, "domains") {
 		if p.indexCount != len(indexes) {
-			t.Errorf("партиция %s: индексов %d, want %d (дочерние всех индексов родителя)", p.name, p.indexCount, len(indexes))
+			t.Errorf("partition %s: %d indexes, want %d (children of all the parent indexes)", p.name, p.indexCount, len(indexes))
 		}
 	}
 }
@@ -337,7 +337,7 @@ func TestSchema_DomainIDSequence(t *testing.T) {
 			WHERE c.relkind = 'S' AND c.relname = 'domain_id_seq'
 			  AND n.nspname = current_schema())`,
 	).Scan(&seqExists); err != nil || !seqExists {
-		t.Fatalf("sequence domain_id_seq не создана (err=%v)", err)
+		t.Fatalf("the domain_id_seq sequence not created (err=%v)", err)
 	}
 
 	var idDefault string
@@ -350,7 +350,7 @@ func TestSchema_DomainIDSequence(t *testing.T) {
 		WHERE n.nspname = current_schema() AND tbl.relname = 'domains'
 		  AND a.attname = 'id'`,
 	).Scan(&idDefault); err != nil {
-		t.Fatalf("default колонки domains.id: %v", err)
+		t.Fatalf("the domains.id column default: %v", err)
 	}
 	if !strings.Contains(idDefault, "nextval(") || !strings.Contains(idDefault, "domain_id_seq") {
 		t.Errorf("domains.id: default = %q, want nextval('domain_id_seq')", idDefault)
@@ -362,15 +362,15 @@ func TestSchema_DomainIDSequence(t *testing.T) {
 	if err := pool.QueryRow(ctx,
 		`INSERT INTO domains (zone_id, label) VALUES (1, 'example') RETURNING id`,
 	).Scan(&id); err != nil {
-		t.Fatalf("insert без id: %v", err)
+		t.Fatalf("insert without an id: %v", err)
 	}
 	if id <= 0 {
-		t.Errorf("id = %d, want > 0 (выдан sequence)", id)
+		t.Errorf("id = %d, want > 0 (issued by the sequence)", id)
 	}
 	if _, err := pool.Exec(ctx,
 		`INSERT INTO domains (zone_id, label) VALUES (1, 'example')`,
 	); err == nil || !strings.Contains(err.Error(), "duplicate key") {
-		t.Errorf("повторный insert (zone_id, label): err = %v, want duplicate key", err)
+		t.Errorf("a repeated insert (zone_id, label): err = %v, want duplicate key", err)
 	}
 }
 
@@ -411,7 +411,7 @@ func TestSchema_DomainsHOTColumns(t *testing.T) {
 	for _, ix := range tableIndexes(t, pool, "domains") {
 		for _, col := range hotColumns {
 			if containsWord(ix.def, col) {
-				t.Errorf("индекс %s ссылается на часто обновляемую колонку %s: её апдейты перестают быть HOT", ix.name, col)
+				t.Errorf("index %s references the frequently updated column %s: its updates stop being HOT", ix.name, col)
 			}
 		}
 		// status — only the predicate (not the key) of domains_deleted_idx
@@ -419,22 +419,22 @@ func TestSchema_DomainsHOTColumns(t *testing.T) {
 		// the mass status changes stay HOT.
 		if containsWord(ix.def, "status") {
 			if ix.name != "domains_deleted_idx" {
-				t.Errorf("индекс %s ссылается на колонку status: допустима только в предикате domains_deleted_idx (T-170)", ix.name)
+				t.Errorf("index %s references the status column: allowed only in the domains_deleted_idx predicate (T-170)", ix.name)
 			} else {
 				key, _, _ := strings.Cut(ix.def, " WHERE ")
 				if containsWord(key, "status") {
-					t.Errorf("domains_deleted_idx: status в ключе (%s): индексация смен статуса всегда non-HOT", key)
+					t.Errorf("domains_deleted_idx: status in the key (%s): indexing status changes is always non-HOT", key)
 				}
 			}
 		}
 		for col, allowed := range ageColumns {
 			if !slices.Contains(allowed, ix.name) && containsWord(ix.def, col) {
-				t.Errorf("индекс %s ссылается на колонку %s: допустима только в ключах %v", ix.name, col, allowed)
+				t.Errorf("index %s references the column %s: allowed only in the keys %v", ix.name, col, allowed)
 			}
 		}
 		if containsWord(ix.def, "check_state") &&
 			ix.name != "domains_pending_idx" && ix.name != "domains_lease_idx" && ix.name != "domains_recheck_idx" {
-			t.Errorf("индекс %s ссылается на check_state: допустимо только в предикатах индексов проходов", ix.name)
+			t.Errorf("index %s references check_state: allowed only in the predicates of the pass indexes", ix.name)
 		}
 	}
 
@@ -446,7 +446,7 @@ func TestSchema_DomainsHOTColumns(t *testing.T) {
 		case "domains_pending_idx", "domains_lease_idx", "domains_recheck_idx":
 			key, _, _ := strings.Cut(ix.def, " WHERE ")
 			if containsWord(key, "check_state") {
-				t.Errorf("%s: check_state в ключе (%s): индексируемые смены состояния всегда non-HOT", ix.name, key)
+				t.Errorf("%s: check_state in the key (%s): indexed state changes are always non-HOT", ix.name, key)
 			}
 		}
 	}
@@ -503,7 +503,7 @@ func TestSchema_TableColumns(t *testing.T) {
 			JOIN pg_namespace n ON n.oid = c.relnamespace
 			WHERE n.nspname = current_schema() AND c.relname = $1`, table,
 		).Scan(&relkind); err != nil {
-			t.Fatalf("таблица %s не найдена: %v", table, err)
+			t.Fatalf("the table %s not found: %v", table, err)
 		}
 		if relkind != w.relkind {
 			t.Errorf("%s: relkind = %s, want %s", table, relkind, w.relkind)
@@ -529,7 +529,7 @@ func assertColumnTypes(t *testing.T, pool *pgxpool.Pool, table string, want map[
 		WHERE n.nspname = current_schema() AND c.relname = $1
 		  AND a.attnum > 0 AND NOT a.attisdropped`, table)
 	if err != nil {
-		t.Fatalf("колонки %s: %v", table, err)
+		t.Fatalf("the columns of %s: %v", table, err)
 	}
 	defer rows.Close()
 
@@ -537,17 +537,17 @@ func assertColumnTypes(t *testing.T, pool *pgxpool.Pool, table string, want map[
 	for rows.Next() {
 		var name, typ string
 		if err := rows.Scan(&name, &typ); err != nil {
-			t.Fatalf("чтение колонки %s: %v", table, err)
+			t.Fatalf("reading the column %s: %v", table, err)
 		}
 		got[name] = typ
 	}
 	if err := rows.Err(); err != nil {
-		t.Fatalf("итерация колонок %s: %v", table, err)
+		t.Fatalf("iterating the columns of %s: %v", table, err)
 	}
 
 	for col, typ := range want {
 		if got[col] != typ {
-			t.Errorf("%s.%s: тип = %q, want %q", table, col, got[col], typ)
+			t.Errorf("%s.%s: type = %q, want %q", table, col, got[col], typ)
 		}
 	}
 }
@@ -565,7 +565,7 @@ func assertUniqueIndex(t *testing.T, pool *pgxpool.Pool, table, key string) {
 		WHERE n.nspname = current_schema() AND tbl.relname = $1
 		  AND x.indisunique`, table)
 	if err != nil {
-		t.Fatalf("уникальные индексы %s: %v", table, err)
+		t.Fatalf("the unique indexes of %s: %v", table, err)
 	}
 	defer rows.Close()
 
@@ -573,17 +573,17 @@ func assertUniqueIndex(t *testing.T, pool *pgxpool.Pool, table, key string) {
 	for rows.Next() {
 		var def string
 		if err := rows.Scan(&def); err != nil {
-			t.Fatalf("чтение индекса %s: %v", table, err)
+			t.Fatalf("reading the index %s: %v", table, err)
 		}
 		if head, _, _ := strings.Cut(def, " WHERE "); strings.Contains(head, "("+key+")") {
 			found = true
 		}
 	}
 	if err := rows.Err(); err != nil {
-		t.Fatalf("итерация индексов %s: %v", table, err)
+		t.Fatalf("iterating the indexes of %s: %v", table, err)
 	}
 	if !found {
-		t.Errorf("%s: нет уникального индекса по ключу %s", table, key)
+		t.Errorf("%s: no unique index on the key %s", table, key)
 	}
 }
 
@@ -604,10 +604,10 @@ func assertNotNull(t *testing.T, pool *pgxpool.Pool, table string, columns []str
 			table, col,
 		).Scan(&notNull)
 		if err != nil {
-			t.Fatalf("колонка %s.%s не найдена: %v", table, col, err)
+			t.Fatalf("the column %s.%s not found: %v", table, col, err)
 		}
 		if !notNull {
-			t.Errorf("%s.%s: ожидается NOT NULL (эскиз 6.1)", table, col)
+			t.Errorf("%s.%s: NOT NULL expected (the sketch 6.1)", table, col)
 		}
 	}
 }
@@ -629,7 +629,7 @@ func TestSchema_ResultsTablesPartitioning(t *testing.T) {
 	assertListPartitionedByZoneID(t, pool, "subdomain_results")
 	for _, p := range leafPartitions(t, pool, "subdomain_results") {
 		if !strings.Contains(p.reloptions, "fillfactor=85") {
-			t.Errorf("партиция %s: reloptions = %q, want fillfactor=85 (частые перезаписи результатов, ТЗ 6.3)", p.name, p.reloptions)
+			t.Errorf("partition %s: reloptions = %q, want fillfactor=85 (frequent result rewrites, spec 6.3)", p.name, p.reloptions)
 		}
 	}
 
@@ -706,7 +706,7 @@ func TestSchema_ResultsTablesColumns(t *testing.T) {
 			JOIN pg_namespace n ON n.oid = c.relnamespace
 			WHERE n.nspname = current_schema() AND c.relname = $1`, table,
 		).Scan(&relkind); err != nil {
-			t.Fatalf("таблица %s не найдена: %v", table, err)
+			t.Fatalf("the table %s not found: %v", table, err)
 		}
 		if relkind != w.relkind {
 			t.Errorf("%s: relkind = %s, want %s", table, relkind, w.relkind)
@@ -775,16 +775,16 @@ func TestSchema_ResultsTablesIndexes(t *testing.T) {
 		for name, key := range wantIndexes {
 			def, ok := got[name]
 			if !ok {
-				t.Errorf("%s: индекс %s отсутствует", table, name)
+				t.Errorf("%s: index %s missing", table, name)
 				continue
 			}
 			if !strings.Contains(def, " USING btree "+key) {
-				t.Errorf("%s.%s: определение = %s, want ключ %s", table, name, def, key)
+				t.Errorf("%s.%s: definition = %s, want the key %s", table, name, def, key)
 			}
 		}
 		for name := range got {
 			if _, ok := wantIndexes[name]; !ok {
-				t.Errorf("%s: лишний индекс %s: состав индексов зафиксирован (минимум индексов, ТЗ 6)", table, name)
+				t.Errorf("%s: extra index %s: the index set is pinned (the minimum of indexes, spec 6)", table, name)
 			}
 		}
 
@@ -793,7 +793,7 @@ func TestSchema_ResultsTablesIndexes(t *testing.T) {
 		}
 		for _, p := range leafPartitions(t, pool, table) {
 			if p.indexCount != len(wantIndexes) {
-				t.Errorf("партиция %s: индексов %d, want %d (дочерние всех индексов родителя)", p.name, p.indexCount, len(wantIndexes))
+				t.Errorf("partition %s: %d indexes, want %d (children of all the parent indexes)", p.name, p.indexCount, len(wantIndexes))
 			}
 		}
 	}
@@ -818,7 +818,7 @@ func TestSchema_ResultsIdempotency(t *testing.T) {
 	dupInsert := func(table, sql string) {
 		t.Helper()
 		if _, err := pool.Exec(ctx, sql); err == nil || !strings.Contains(err.Error(), "duplicate key") {
-			t.Errorf("%s: повторная вставка: err = %v, want duplicate key", table, err)
+			t.Errorf("%s: a repeated insert: err = %v, want duplicate key", table, err)
 		}
 	}
 
@@ -897,7 +897,7 @@ func TestSchema_ResultsIdempotency(t *testing.T) {
 		if _, err := pool.Exec(ctx, `
 			INSERT INTO ingest_files (zone_id, action, path, sha256)
 			VALUES ($1, $2, 'com/add/b.txt', '\x0102')`, d.zone, d.action); err != nil {
-			t.Errorf("ingest_files: то же содержимое (zone=%d, action=%d) обязано записываться отдельно: %v",
+			t.Errorf("ingest_files: the same content (zone=%d, action=%d) must be recorded separately: %v",
 				d.zone, d.action, err)
 		}
 	}
@@ -922,16 +922,16 @@ func TestSchema_RenderDebtCounter(t *testing.T) {
 	if err := pool.QueryRow(ctx,
 		"SELECT value FROM crawler_counters WHERE name = 'render_pending'",
 	).Scan(&n); err != nil {
-		t.Fatalf("строка счётчика: %v (бэкфилл миграции 000015)", err)
+		t.Fatalf("the counter row: %v (the backfill of migration 000015)", err)
 	}
 	if n != 0 {
-		t.Errorf("счётчик пустой схемы = %d, want 0", n)
+		t.Errorf("the counter of the empty schema = %d, want 0", n)
 	}
 	// The PK by name — duplicates are rejected.
 	if _, err := pool.Exec(ctx,
 		"INSERT INTO crawler_counters (name, value) VALUES ('render_pending', 1)"); err == nil ||
 		!strings.Contains(err.Error(), "duplicate key") {
-		t.Errorf("повторная строка render_pending: err = %v, want duplicate key", err)
+		t.Errorf("a repeated render_pending row: err = %v, want duplicate key", err)
 	}
 
 	// A domain with the is_idn bit (the render_pending flag is set on
@@ -953,14 +953,14 @@ func TestSchema_RenderDebtCounter(t *testing.T) {
 		t.Fatalf("set render_pending: %v", err)
 	}
 	if tag.RowsAffected() != 1 {
-		t.Errorf("переход 0→1: RowsAffected = %d, want 1", tag.RowsAffected())
+		t.Errorf("the 0→1 transition: RowsAffected = %d, want 1", tag.RowsAffected())
 	}
 	tag, err = pool.Exec(ctx, setSQL, int16(1), id)
 	if err != nil {
-		t.Fatalf("повторный set render_pending: %v", err)
+		t.Fatalf("setting render_pending again: %v", err)
 	}
 	if tag.RowsAffected() != 0 {
-		t.Errorf("повторная установка: RowsAffected = %d, want 0 (охрана бита)", tag.RowsAffected())
+		t.Errorf("the repeated set: RowsAffected = %d, want 0 (the bit guard)", tag.RowsAffected())
 	}
 
 	// The counter shift (renderCounterDeltaSQL): the row exists —
@@ -969,23 +969,23 @@ func TestSchema_RenderDebtCounter(t *testing.T) {
 		"WHERE c.name = 'render_pending'"
 	tag, err = pool.Exec(ctx, bumpSQL, int64(1))
 	if err != nil {
-		t.Fatalf("сдвиг счётчика: %v", err)
+		t.Fatalf("shifting the counter: %v", err)
 	}
 	if tag.RowsAffected() != 1 {
-		t.Errorf("сдвиг счётчика: RowsAffected = %d, want 1", tag.RowsAffected())
+		t.Errorf("shifting the counter: RowsAffected = %d, want 1", tag.RowsAffected())
 	}
 	if err := pool.QueryRow(ctx,
 		"SELECT value FROM crawler_counters WHERE name = 'render_pending'",
 	).Scan(&n); err != nil || n != 1 {
-		t.Errorf("счётчик после +1 = %d (err=%v), want 1", n, err)
+		t.Errorf("the counter after +1 = %d (err=%v), want 1", n, err)
 	}
 	tag, err = pool.Exec(ctx,
 		"UPDATE crawler_counters AS c SET value = c.value + $1::int8 WHERE c.name = 'nope'", int64(1))
 	if err != nil {
-		t.Fatalf("сдвиг несуществующей строки: %v", err)
+		t.Fatalf("shifting a missing row: %v", err)
 	}
 	if tag.RowsAffected() != 0 {
-		t.Errorf("сдвиг несуществующей строки: RowsAffected = %d, want 0", tag.RowsAffected())
+		t.Errorf("shifting a missing row: RowsAffected = %d, want 0", tag.RowsAffected())
 	}
 
 	// CLEAR with the bit guard (renderClearPendingSQL): 1→0 — one row,
@@ -997,31 +997,31 @@ func TestSchema_RenderDebtCounter(t *testing.T) {
 		t.Fatalf("clear render_pending: %v", err)
 	}
 	if tag.RowsAffected() != 1 {
-		t.Errorf("переход 1→0: RowsAffected = %d, want 1", tag.RowsAffected())
+		t.Errorf("the 1→0 transition: RowsAffected = %d, want 1", tag.RowsAffected())
 	}
 	tag, err = pool.Exec(ctx, clearSQL, int16(1), id)
 	if err != nil {
-		t.Fatalf("повторный clear render_pending: %v", err)
+		t.Fatalf("clearing render_pending again: %v", err)
 	}
 	if tag.RowsAffected() != 0 {
-		t.Errorf("повторное снятие: RowsAffected = %d, want 0 (охрана бита)", tag.RowsAffected())
+		t.Errorf("the repeated clear: RowsAffected = %d, want 0 (the bit guard)", tag.RowsAffected())
 	}
 	var flags int16
 	if err := pool.QueryRow(ctx, "SELECT flags FROM domains WHERE id = $1", id).Scan(&flags); err != nil {
 		t.Fatal(err)
 	}
 	if flags != 1 {
-		t.Errorf("flags после снятия = %d, want 1 (is_idn сохранён)", flags)
+		t.Errorf("flags after the clear = %d, want 1 (is_idn preserved)", flags)
 	}
 
 	// The decrement returns the counter to zero.
 	if tag, err = pool.Exec(ctx, bumpSQL, int64(-1)); err != nil || tag.RowsAffected() != 1 {
-		t.Errorf("декремент: tag=%v err=%v, want UPDATE 1", tag.RowsAffected(), err)
+		t.Errorf("the decrement: tag=%v err=%v, want UPDATE 1", tag.RowsAffected(), err)
 	}
 	if err := pool.QueryRow(ctx,
 		"SELECT value FROM crawler_counters WHERE name = 'render_pending'",
 	).Scan(&n); err != nil || n != 0 {
-		t.Errorf("счётчик после −1 = %d (err=%v), want 0", n, err)
+		t.Errorf("the counter after −1 = %d (err=%v), want 0", n, err)
 	}
 }
 
@@ -1033,11 +1033,11 @@ func TestSchema_RenderDebtCounter(t *testing.T) {
 func dinfoDecode(t *testing.T, raw []byte) map[string]any {
 	t.Helper()
 	if raw == nil {
-		t.Fatal("domain_info: ответ NULL, ожидался jsonb")
+		t.Fatal("domain_info: a NULL answer, a jsonb expected")
 	}
 	var m map[string]any
 	if err := json.Unmarshal(raw, &m); err != nil {
-		t.Fatalf("domain_info: разбор jsonb: %v", err)
+		t.Fatalf("domain_info: parsing the jsonb: %v", err)
 	}
 	return m
 }
@@ -1049,7 +1049,7 @@ func dinfoMap(t *testing.T, v any, what string) map[string]any {
 	t.Helper()
 	m, ok := v.(map[string]any)
 	if !ok {
-		t.Fatalf("domain_info: %s — не объект: %T", what, v)
+		t.Fatalf("domain_info: %s — not an object: %T", what, v)
 	}
 	return m
 }
@@ -1058,7 +1058,7 @@ func dinfoSlice(t *testing.T, v any, what string) []any {
 	t.Helper()
 	s, ok := v.([]any)
 	if !ok {
-		t.Fatalf("domain_info: %s — не массив: %T", what, v)
+		t.Fatalf("domain_info: %s — not an array: %T", what, v)
 	}
 	return s
 }
@@ -1067,7 +1067,7 @@ func dinfoFloat(t *testing.T, v any, what string) float64 {
 	t.Helper()
 	f, ok := v.(float64)
 	if !ok {
-		t.Fatalf("domain_info: %s — не число: %T", what, v)
+		t.Fatalf("domain_info: %s — not a number: %T", what, v)
 	}
 	return f
 }
@@ -1076,7 +1076,7 @@ func dinfoStr(t *testing.T, v any, what string) string {
 	t.Helper()
 	s, ok := v.(string)
 	if !ok {
-		t.Fatalf("domain_info: %s — не строка: %T", what, v)
+		t.Fatalf("domain_info: %s — not a string: %T", what, v)
 	}
 	return s
 }
@@ -1127,22 +1127,22 @@ func TestSchema_DomainInfoFunction(t *testing.T) {
 		t.Fatalf("pg_proc domain_info: %v", err)
 	}
 	if retType != "jsonb" || kind != "f" {
-		t.Errorf("domain_info: возврат %s/%s, want jsonb/f", retType, kind)
+		t.Errorf("domain_info: returns %s/%s, want jsonb/f", retType, kind)
 	}
 	if volatile != "s" {
-		t.Errorf("domain_info: provolatile = %s, want s (STABLE — только чтение)", volatile)
+		t.Errorf("domain_info: provolatile = %s, want s (STABLE — read-only)", volatile)
 	}
 	if parallel != "s" {
 		t.Errorf("domain_info: proparallel = %s, want s (PARALLEL SAFE)", parallel)
 	}
 	if !strings.Contains(config, "search_path") || !strings.Contains(config, "pg_catalog") {
-		t.Errorf("domain_info: search_path не зафиксирован: %q", config)
+		t.Errorf("domain_info: search_path not pinned: %q", config)
 	}
 
 	mustExec := func(q string, args ...any) {
 		t.Helper()
 		if _, err := pool.Exec(ctx, q, args...); err != nil {
-			t.Fatalf("подготовка данных: %v", err)
+			t.Fatalf("preparing the data: %v", err)
 		}
 	}
 	zoneID := func(name string) int {
@@ -1151,7 +1151,7 @@ func TestSchema_DomainInfoFunction(t *testing.T) {
 		if err := pool.QueryRow(ctx,
 			`SELECT id FROM zones WHERE name = $1`, name,
 		).Scan(&id); err != nil {
-			t.Fatalf("зона %s: %v", name, err)
+			t.Fatalf("the zone %s: %v", name, err)
 		}
 		return id
 	}
@@ -1278,7 +1278,7 @@ func TestSchema_DomainInfoFunction(t *testing.T) {
 	}
 	results := dinfoSlice(t, info["results"], "results")
 	if len(results) != len(wantResults) {
-		t.Fatalf("results: %d записей, want %d", len(results), len(wantResults))
+		t.Fatalf("results: %d records, want %d", len(results), len(wantResults))
 	}
 	for i, w := range wantResults {
 		got := dinfoMap(t, results[i], "results[i]")
@@ -1335,7 +1335,7 @@ func TestSchema_DomainInfoFunction(t *testing.T) {
 	}
 	findings := dinfoSlice(t, lar["findings"], "laravel.findings")
 	if len(findings) != len(wantFindings) {
-		t.Fatalf("laravel.findings: %d записей, want %d", len(findings), len(wantFindings))
+		t.Fatalf("laravel.findings: %d records, want %d", len(findings), len(wantFindings))
 	}
 	for i, w := range wantFindings {
 		if got := dinfoMap(t, findings[i], "findings[i]"); !reflect.DeepEqual(got, w) {
@@ -1354,7 +1354,7 @@ func TestSchema_DomainInfoFunction(t *testing.T) {
 		t.Fatalf("domain_info site.co.uk: %v", err)
 	}
 	if zoneName != "co.uk" || label != "site" {
-		t.Errorf("суффикс зоны: zone=%q label=%q, want co.uk/site", zoneName, label)
+		t.Errorf("the zone suffix: zone=%q label=%q, want co.uk/site", zoneName, label)
 	}
 
 	// Not found — NULL, not an error: an unknown domain in a known
@@ -1369,14 +1369,14 @@ func TestSchema_DomainInfoFunction(t *testing.T) {
 		       domain_info(NULL) IS NULL`,
 	).Scan(&noDomain, &noZone, &singleLabel, &empty, &nullIn)
 	if err != nil {
-		t.Fatalf("domain_info не найдено: %v", err)
+		t.Fatalf("domain_info not found: %v", err)
 	}
 	for name, got := range map[string]bool{
-		"неизвестный домен": noDomain, "неизвестная зона": noZone,
-		"одна метка": singleLabel, "пустой вход": empty, "NULL": nullIn,
+		"unknown domain": noDomain, "unknown zone": noZone,
+		"a single label": singleLabel, "empty input": empty, "NULL": nullIn,
 	} {
 		if !got {
-			t.Errorf("domain_info(%s): ожидался NULL", name)
+			t.Errorf("domain_info(%s): NULL expected", name)
 		}
 	}
 
@@ -1391,10 +1391,10 @@ func TestSchema_DomainInfoFunction(t *testing.T) {
 		       domain_info('site.co.uk') -> 'laravel' = 'null'::jsonb,
 		       domain_info('site.co.uk') -> 'domain' ->> 'status_name' = 'new'`,
 	).Scan(&noResults, &noAlive, &noLaravel, &newStatus); err != nil {
-		t.Fatalf("domain_info site (пустой): %v", err)
+		t.Fatalf("domain_info site (empty): %v", err)
 	}
 	if !noResults || !noAlive || !noLaravel || !newStatus {
-		t.Errorf("домен без результатов: results-пусто=%v dns_alive-пусто=%v laravel-null=%v status=%v, want все true",
+		t.Errorf("a domain without results: results-empty=%v dns_alive-empty=%v laravel-null=%v status=%v, want all true",
 			noResults, noAlive, noLaravel, newStatus)
 	}
 }

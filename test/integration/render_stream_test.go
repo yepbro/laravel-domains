@@ -48,7 +48,7 @@ type rsRenderer struct {
 
 func (r *rsRenderer) Run(_ context.Context, task render.RenderTask) (render.RenderOutput, error) {
 	r.calls.Add(1)
-	return render.RenderOutput{}, fmt.Errorf("renderworker-stream: рендер не должен вызываться: %s", task.URL)
+	return render.RenderOutput{}, fmt.Errorf("renderworker-stream: render must not be called: %s", task.URL)
 }
 
 // TestRenderWorkerAltStream — consumption of the alternative stream
@@ -63,11 +63,11 @@ func TestRenderWorkerAltStream(t *testing.T) {
 	dsn, cleanup := withTestSchema(t)
 	t.Cleanup(cleanup)
 	if err := migrate.Up(ctx, dsn); err != nil {
-		t.Fatalf("применение миграций к изолированной схеме: %v", err)
+		t.Fatalf("applying migrations to the isolated schema: %v", err)
 	}
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
-		t.Fatalf("подключение к тестовой схеме: %v", err)
+		t.Fatalf("connecting to the test schema: %v", err)
 	}
 	t.Cleanup(pool.Close)
 
@@ -108,13 +108,13 @@ func TestRenderWorkerAltStream(t *testing.T) {
 	}
 	altID, err := q.Publish(ctx, queue.StreamAnalyze, altTask)
 	if err != nil {
-		t.Fatalf("публикация в %s: %v", queue.StreamAnalyze, err)
+		t.Fatalf("publishing to %s: %v", queue.StreamAnalyze, err)
 	}
 	if _, err := q.Publish(ctx, queue.StreamRender, queue.Result{
 		TaskID: queue.NewTaskID(), ZoneID: 5, DomainID: 502,
 		SubdomainID: 1, Name: "default.stream.test",
 	}); err != nil {
-		t.Fatalf("публикация контрольной в %s: %v", queue.StreamRender, err)
+		t.Fatalf("publishing the control record to %s: %v", queue.StreamRender, err)
 	}
 
 	runCtx, cancel := context.WithCancel(ctx)
@@ -142,7 +142,7 @@ func TestRenderWorkerAltStream(t *testing.T) {
 		}
 		if time.Now().After(deadline) {
 			cancel()
-			t.Fatalf("группа %s не потребила запись %s стрима %s (groups=%+v)",
+			t.Fatalf("group %s did not consume record %s of stream %s (groups=%+v)",
 				altGroup, altID, queue.StreamAnalyze, groups)
 		}
 		time.Sleep(5 * time.Millisecond)
@@ -152,10 +152,10 @@ func TestRenderWorkerAltStream(t *testing.T) {
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Fatalf("Run после отмены: %v", err)
+			t.Fatalf("Run after cancel: %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("Run не завершился после отмены ctx")
+		t.Fatal("Run did not finish after ctx cancel")
 	}
 
 	// The default q:render was not read: no group was created at all,
@@ -165,18 +165,18 @@ func TestRenderWorkerAltStream(t *testing.T) {
 		t.Fatalf("XINFO GROUPS %s: %v", queue.StreamRender, err)
 	}
 	if len(renderGroups) != 0 {
-		t.Errorf("группы %s = %+v — дефолтный стрим читался (Options.Stream = %s обязан заменить точку потребления)",
+		t.Errorf("%s groups = %+v — the default stream was read (Options.Stream = %s must replace the consumption point)",
 			queue.StreamRender, renderGroups, queue.StreamAnalyze)
 	}
 	if n := streamLen(t, rdb, queue.StreamRender); n != 1 {
-		t.Errorf("записей q:render = %d, хочу 1 (контрольная на месте, потерь и дублей нет)", n)
+		t.Errorf("q:render records = %d, want 1 (the control record is in place, no losses or duplicates)", n)
 	}
 	// The alternative stream holds only the original record: processing
 	// without publications (no self-feeding).
 	if n := streamLen(t, rdb, queue.StreamAnalyze); n != 1 {
-		t.Errorf("записей q:analyze = %d, хочу 1 (штатный отказ ничего не публикует)", n)
+		t.Errorf("q:analyze records = %d, want 1 (the normal rejection publishes nothing)", n)
 	}
 	if n := renderer.calls.Load(); n != 0 {
-		t.Errorf("рендер вызван %d раз — задача без строки не должна до него доходить", n)
+		t.Errorf("render called %d times — a task without a row must not reach it", n)
 	}
 }
