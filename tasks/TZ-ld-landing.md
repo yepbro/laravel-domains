@@ -54,7 +54,7 @@
 | Данные статистики | **клиентский fetch** | всегда свежие; HTML статичен |
 | Связь с API | **прямые запросы + CORS** | без nginx-прокси; `trusted_proxies` не нужен — браузер ходит на api-домен напрямую, текущая схема доверия loopback сохраняется |
 | Локаль в URL | **нет; домен на язык** | выбор пользователя; следствия — hreflang/редиректы, см. §4.3 |
-| Расположение репо | gitverse, приватный | `gv repo create ld-landing --private` |
+| Расположение репо | **GitHub, приватный** (решение 13.11 — вместо gitverse) | `gh repo create ld-landing --private`; origin `git@github.com:yepbro/ld-landing.git`; git-автор локально как в laravel-domains |
 | Простой при переходе | **ждать статику** (L-05→L-06) | решение 13.11: временный proxy на larasites и откат DNS отклонены; DNS уже переключён, лендинг в дауне до деплоя статики — L-06 становится критическим путём |
 
 ## 4. Архитектура
@@ -114,7 +114,10 @@ vite-ssg генерирует HTML на каждую страницу × тар�
 
 ## 5. Репозиторий ld-landing
 
-Приватный, gitverse: `gv repo create ld-landing --private -d "<описание>"`.
+Приватный, **GitHub**: `gh repo create ld-landing --private -d "<описание>"`;
+создан 13.11 — https://github.com/yepbro/ld-landing, origin
+`git@github.com:yepbro/ld-landing.git`. Git-автор в локальном клоне —
+как в laravel-domains (`--local`: Den Brooks / denis@yepbro.pro).
 
 Описание (вариант RU): *«Лендинги Laravel Domains — статические сайты
 (Vue 3 + vite-ssg, TypeScript): язык = домен, сборка и деплой статики на
@@ -253,8 +256,8 @@ ld-landing/
 | Окружение | corepack + `packageManager`, `engines` (node/pnpm), `.nvmrc`, `.editorconfig` | версия node зафиксирована |
 | Доп. (опц.) | knip (мёртвые экспорты), Renovate | включить после стабилизации каркаса |
 
-CI на gitverse (если доступен пайплайн) — те же `make check` + `make build-all`
-+ `make verify`; до того — обязательные локальные проверки перед деплоем
+CI (GitHub Actions) — те же `make check` + `make build-all`
++ `make verify`; до включения — обязательные локальные проверки перед деплоем
 (`make deploy` сам прогоняет `check → build → verify`, см. §9).
 
 ## 9. Make-команды (ld-landing)
@@ -335,7 +338,7 @@ AGENTS.md (отдельный worktree, ревью по схеме, один к�
 
 | № | Статус | Где | Что | Зависимости |
 |---|---|---|---|---|
-| L-01 | [in progress] | ld-landing | `gv repo create ld-landing --private` + описание; каркас монорепо (vite-ssg + TS + весь тулинг §8); README.md; Makefile §9; пустая страница-заглушка | — |
+| L-01 | [in progress] | ld-landing | приватный репо ld-landing на **GitHub** + описание; каркас монорепо (vite-ssg + TS + весь тулинг §8); README.md; Makefile §9; пустая страница-заглушка | — |
 | L-02 | [new] | ld-landing | Перенос лендинга: index.vue 1:1, компоненты (§6), словари ru/en из `i18n.go`, Metrika, seo.ts (canonical/hreflang/OG), sitemap/robots; мок API в dev | L-01 |
 | L-03 | [in progress] | laravel-domains | `GET /api/v1/landing/stats` (§7.1) | — (параллельно L-01/L-02) |
 | L-04 | [new] | laravel-domains | CORS для `/api/*` (§7.2) | L-03 (обе в `internal/web`) |
@@ -408,4 +411,6 @@ AGENTS.md (отдельный worktree, ревью по схеме, один к�
    до переключения DNS не нужна.
 5. **Состав страниц**: известны ли страницы сверх `index` (about, pricing…)
    или сначала задел архитектуры.
-6. Зеркалировать ли ld-landing на GitHub — нет/да.
+6. ~~Зеркалировать ли ld-landing на GitHub~~ — **решено 13.11**: репозиторий
+   живёт на GitHub (`yepbro/ld-landing`, приватный), gitverse не
+   используется.
