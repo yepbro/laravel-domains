@@ -2409,8 +2409,11 @@ func TestRequeueRenderPendingZoneCycle(t *testing.T) {
 				i, pub[i].msg.ZoneID, pub[i].msg.DomainID, w.zone, w.id)
 		}
 	}
-	if got := pool.counters["render_pending"]; got != 0 {
-		t.Fatalf("the debt counter = %d, 0 expected", got)
+	pool.mu.Lock()
+	debt := pool.counters["render_pending"]
+	pool.mu.Unlock()
+	if debt != 0 {
+		t.Fatalf("the debt counter = %d, 0 expected", debt)
 	}
 
 	cancel()
