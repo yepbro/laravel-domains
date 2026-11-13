@@ -19,6 +19,9 @@
 //     larasites markup — stats/cloud/zone table, latest finds, the
 //     form, SEO canonical/hreflang/OG/Twitter);
 //   - POST /api/check-domain — the live check (T-123, a 501 stub);
+//   - GET /api/v1/landing/stats — the landing data as JSON for the
+//     static landing of the ld-landing repo (L-03: the same
+//     FetchLandingData pass, a stats view model, max-age=60);
 //   - GET /healthz     — readiness: a PostgreSQL ping (503 on failure);
 //   - GET /robots.txt  — static assets from embed (T-124);
 //   - GET /sitemap.xml — a minimal sitemap of the locales (T-124);
@@ -273,6 +276,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/check-domain", func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	})
+	// The stats endpoint of the static landing (L-03): the path patterns
+	// are GET-only, a non-GET method — the mux answers an honest 405.
+	mux.HandleFunc("GET /api/v1/landing/stats", s.handleLandingStats)
 	// Exact root routes win over the landing catch-all (GET /).
 	mux.HandleFunc("GET /robots.txt", s.handleRobots)
 	mux.HandleFunc("GET /sitemap.xml", s.handleSitemap)

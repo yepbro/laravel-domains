@@ -69,6 +69,12 @@ func TestFetchLandingData(t *testing.T) {
 	if len(data.Latest) != 1 {
 		t.Fatalf("the finds = %d, want 1", len(data.Latest))
 	}
+	// The subdomain reference travels with the data (L-03: the stats
+	// API) — the same single query that decodes the masks.
+	if len(data.Subdomains) != 3 || data.Subdomains[0].ID != 0 ||
+		data.Subdomains[1].ID != 1 || data.Subdomains[1].Label != "www" {
+		t.Errorf("the subdomain reference = %+v", data.Subdomains)
+	}
 	it := data.Latest[0]
 	if it.Name != "shop.example.com" || it.VerText != "9.19–12" {
 		t.Errorf("the find = %+v", it)

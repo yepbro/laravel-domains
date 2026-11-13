@@ -1583,7 +1583,17 @@ with a small UDP pool, a shared Fetcher, a rule cache, one
 render.Manager —
 assembled by the first check, closed on service stop; concurrent checks
 are limited by `web.live_concurrency`; overload —
-a fast 503 with `Retry-After`); `GET /healthz` —
+a fast 503 with `Retry-After`); `GET /api/v1/landing/stats` —
+the landing statistics as JSON for the static landing of the separate
+ld-landing repo (L-03, TZ-ld-landing §7.1: the same single
+`FetchLandingData` pass — the counters, the top-50 zone cloud with the
+log-scale label sizes, the top-10 table, the latest finds with badges,
+the subdomain reference; serialized through a dedicated view model with
+json tags — `internal/web/stats.go`, the internal structures are not
+leaked, the collections are `[]` — never null; the client caching —
+`Cache-Control: public, max-age=60`; a DB failure — a 500 without
+details in the uniform JSON error body of the /api/* surface,
+`{"error":"unavailable"}`); `GET /healthz` —
 a PostgreSQL readiness ping (503); `GET /robots.txt` and
 `GET /sitemap.xml` — the service files of search crawlers (T-124:
 robots — statics from an embed; sitemap — a minimal locale set;
@@ -1603,6 +1613,31 @@ into
 `crawler_web_check_errors_total{type}` / `crawler_web_check_seconds`
 (T-221, the "Working logic metrics" table below). Templates —
 `html/template` + `go:embed`; no new dependencies.
+
+The JSON contract of `GET /api/v1/landing/stats` (the landing API
+section, L-03; the source of truth — the view model
+`internal/web/stats.go`): `stats` — the counters `zones` (active),
+`total`, `checked`, `laravel` (the sums over the zones reference
+table) and `laravel_last_24h`, all numbers; `cloud` — the top-50 zones
+by findings: `name` (ASCII/punycode, as stored), `name_unicode` (the
+display form; omitted for ASCII zones), `laravel` (the tooltip
+counter), `size` (the log-scale label size in rem, 0.875–1.5, already
+rounded to 3 decimals — the client applies it without rescaling);
+`table` — the top-10: `name`, `name_unicode`, `checked`, `laravel`,
+`percent` (a percentage rounded to 2 decimals, not a 0..1 share);
+`latest` — the latest finds: `name`, `badges` — the subdomain badges
+`{label, host}` with a scheme-less ready host `label.domain`,
+`versions` (the preformatted range "9.19–12" / "≥ 9.19"; omitted when
+undetermined), `updated` (the preformatted en date "Jan 02, 2006" —
+the display form of the SSR page; the locale formatting stays on the
+consumer); `subdomains` — the reference table `{id, label}` (the
+`found_on_mask` bits; includes the apex `{id:0, label:""}`). Empty
+collections are `[]`, never null; non-GET — 405. A note for the
+ld-landing client: the refresh action of the domains block
+(RefreshButton, TZ-ld-landing §6) must bypass the browser cache —
+`fetch` with `cache: "no-cache"` or a cache-buster — otherwise within
+`max-age=60` a plain `fetch` is served from the HTTP cache without a
+network round-trip and the "refresh" returns the identical body.
 
 The landing CSS is Tailwind v4 without node: the source
 `internal/web/static/app.src.css` (classes scanned by the template's

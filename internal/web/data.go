@@ -6,6 +6,8 @@
 // top 50 by domains_laravel, the label size is a log scale (as in
 // larasites: a linear scale with one dominating .com zone would squeeze
 // the rest into unreadability).
+// The same pass feeds GET /api/v1/landing/stats (L-03): data.go stays the
+// single source, the render goes through the stats view model (stats.go).
 package web
 
 import (
@@ -53,12 +55,23 @@ type Badge struct {
 	Host  string // label.domain — the ready host of the link
 }
 
+// SubdomainRef — an entry of the subdomain reference table: the pipeline
+// checks these subdomains on each domain (the mask bits of
+// laravel_domains.found_on_mask; id 0 — the domain apex with an empty
+// label). Rendered by the template indirectly — through the find badges;
+// the stats API (L-03) exposes the directory as is.
+type SubdomainRef struct {
+	ID    int16
+	Label string
+}
+
 // LandingData — everything the page renders.
 type LandingData struct {
-	Stats  LandingStats
-	Cloud  []ZoneItem
-	Table  []ZoneItem
-	Latest []LatestItem
+	Stats      LandingStats
+	Cloud      []ZoneItem
+	Table      []ZoneItem
+	Latest     []LatestItem
+	Subdomains []SubdomainRef // the reference table (the stats API, L-03)
 }
 
 // Data SQL (the contracts — tests on the fake db.DB).
@@ -131,7 +144,13 @@ func FetchLandingData(ctx context.Context, pool Querier) (LandingData, error) {
 			data.Table[i].Percent = math.Round(float64(data.Table[i].Laravel)/float64(c)*10000) / 100
 		}
 	}
-	if data.Latest, err = fetchLatest(ctx, pool); err != nil {
+	// The subdomain reference table is fetched once: the directory goes
+	// into the data (the stats API, L-03), the map decodes found_on_mask.
+	var subs map[int16]string
+	if data.Subdomains, subs, err = fetchSubdomains(ctx, pool); err != nil {
+		return data, err
+	}
+	if data.Latest, err = fetchLatest(ctx, pool, subs); err != nil {
 		return data, err
 	}
 	return data, nil
@@ -197,28 +216,35 @@ func sizeCloud(zones []ZoneItem) {
 	}
 }
 
-func fetchLatest(ctx context.Context, pool Querier) ([]LatestItem, error) {
-	// The subdomain reference table — the decoding of the found_on_mask
-	// badges.
-	subs := map[int16]string{}
-	srows, err := pool.Query(ctx, subdomainsSQL)
+// fetchSubdomains — the subdomain reference table in a single pass: the
+// ordered directory (the stats API, L-03) and the id→label map for
+// decoding the found_on_mask badges of the latest finds (one query for
+// both consumers).
+func fetchSubdomains(ctx context.Context, pool Querier) ([]SubdomainRef, map[int16]string, error) {
+	rows, err := pool.Query(ctx, subdomainsSQL)
 	if err != nil {
-		return nil, fmt.Errorf("web: the subdomain reference table: %w", err)
+		return nil, nil, fmt.Errorf("web: the subdomain reference table: %w", err)
 	}
-	for srows.Next() {
-		var id int16
-		var label string
-		if err := srows.Scan(&id, &label); err != nil {
-			srows.Close()
-			return nil, fmt.Errorf("web: the subdomain reference table: read: %w", err)
+	defer rows.Close()
+	var (
+		out  []SubdomainRef
+		subs = map[int16]string{}
+	)
+	for rows.Next() {
+		var s SubdomainRef
+		if err := rows.Scan(&s.ID, &s.Label); err != nil {
+			return nil, nil, fmt.Errorf("web: the subdomain reference table: read: %w", err)
 		}
-		subs[id] = label
+		out = append(out, s)
+		subs[s.ID] = s.Label
 	}
-	srows.Close()
-	if err := srows.Err(); err != nil {
-		return nil, fmt.Errorf("web: the subdomain reference table: %w", err)
+	if err := rows.Err(); err != nil {
+		return nil, nil, fmt.Errorf("web: the subdomain reference table: %w", err)
 	}
+	return out, subs, nil
+}
 
+func fetchLatest(ctx context.Context, pool Querier, subs map[int16]string) ([]LatestItem, error) {
 	rows, err := pool.Query(ctx, latestSQL)
 	if err != nil {
 		return nil, fmt.Errorf("web: the latest finds: %w", err)
