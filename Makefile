@@ -1,12 +1,12 @@
-# Domain Crawler — команды разработчика.
-# Полное описание окружения: docs/dev-environment.md
+# Domain Crawler — developer commands.
+# Full environment description: docs/dev-environment.md
 
 SHELL := /bin/bash
 
 COMPOSE_FILE := deploy/docker/compose.yaml
 COMPOSE := docker compose --project-directory . -f $(COMPOSE_FILE) --env-file .env
 
-# Профиль app + testbed — стандартный сценарий разработчика (make up)
+# app + testbed profiles — the standard developer scenario (make up)
 APP_PROFILES := --profile app --profile testbed
 ALL_PROFILES := --profile '*'
 
@@ -15,22 +15,22 @@ NAME ?=
 DOMAIN ?=
 N ?= 1000000
 FORCE ?= 0
-# Резолверы для make check: первичный — unbound testbed (тестовые зоны),
-# резервы — публичные: чекер эскалирует на них при SERVFAIL/REFUSED
-# (internal/checker/resolve.go), поэтому одна команда проверяет и
-# testbed-домены (*.crawl.test), и реальные.
+# Resolvers for make check: primary — unbound testbed (test zones),
+# fallbacks — public: the checker escalates to them on SERVFAIL/REFUSED
+# (internal/checker/resolve.go), so one command checks both testbed
+# domains (*.crawl.test) and real ones.
 RESOLVER ?= 172.28.100.10:53
 FALLBACK ?= 1.1.1.1:53,9.9.9.9:53
 
-# Перенные из .env, нужные самому Makefile
+# Variables from .env that the Makefile itself needs
 GO_VERSION     ?= $(shell sed -n 's/^GO_VERSION=\(.*\)/\1/p' .env 2>/dev/null)
 ALPINE_VERSION ?= $(shell sed -n 's/^ALPINE_VERSION=\(.*\)/\1/p' .env 2>/dev/null)
 PG_ADMIN_USER  ?= $(shell sed -n 's/^POSTGRES_ADMIN_USER=\(.*\)/\1/p' .env 2>/dev/null)
 PG_DB          ?= $(shell sed -n 's/^POSTGRES_DB=\(.*\)/\1/p' .env 2>/dev/null)
 
-# Standalone-CLI Tailwind v4 — стадия css Dockerfile.go и make web-css
-# (бандл лендинга, T-124); дефолт — как ARG в Dockerfile, .env может
-# поднять. Архитектура хоста выбирает musl-сборку CLI (x64 | arm64).
+# Tailwind v4 standalone CLI — the css stage of Dockerfile.go and make web-css
+# (landing bundle, T-124); the default is set as an ARG in the Dockerfile, .env
+# may override it. The host architecture picks the musl CLI build (x64 | arm64).
 TAILWINDCSS_VERSION ?= $(or $(shell sed -n 's/^TAILWINDCSS_VERSION=\(.*\)/\1/p' .env 2>/dev/null),v4.3.3)
 UNAME_M := $(shell uname -m)
 ifeq ($(findstring aarch64,$(UNAME_M)),aarch64)
@@ -40,7 +40,7 @@ TAILWIND_ARCH ?= unsupported
 else
 TAILWIND_ARCH ?= x64
 endif
-# Владелец генерата web-css на bind-mount — разработчик (как сервисы app).
+# The web-css generated artifact on the bind-mount is owned by the developer (like the app services).
 DEV_UID := $(or $(shell sed -n 's/^DEV_UID=\(.*\)/\1/p' .env 2>/dev/null),1000)
 DEV_GID := $(or $(shell sed -n 's/^DEV_GID=\(.*\)/\1/p' .env 2>/dev/null),1000)
 
@@ -49,10 +49,10 @@ TAILWINDCSS_URL := https://github.com/tailwindlabs/tailwindcss/releases/download
 BUILD_ARGS := --build-arg GO_VERSION=$(GO_VERSION) --build-arg ALPINE_VERSION=$(ALPINE_VERSION) \
 	--build-arg TAILWINDCSS_VERSION=$(TAILWINDCSS_VERSION)
 
-# Версия/ревизия боевых образов для метрик crawler_build_info (T-111):
-# .git исключён .dockerignore, значения вычисляются на вызывающей машине
-# и передаются build-аргами (ARG BUILD_VERSION/BUILD_REVISION в Dockerfile);
-# без git (или вне репозитория) — graceful fallback unknown.
+# Version/revision of the production images for crawler_build_info metrics (T-111):
+# .git is excluded by .dockerignore, the values are computed on the calling machine
+# and passed as build args (ARG BUILD_VERSION/BUILD_REVISION in the Dockerfile);
+# without git (or outside a repository) — graceful fallback to unknown.
 BUILD_VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo unknown)
 BUILD_REVISION ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 VERSION_ARGS := --build-arg BUILD_VERSION=$(BUILD_VERSION) --build-arg BUILD_REVISION=$(BUILD_REVISION)
@@ -60,46 +60,46 @@ VERSION_ARGS := --build-arg BUILD_VERSION=$(BUILD_VERSION) --build-arg BUILD_REV
 .DEFAULT_GOAL := help
 
 define check_env
-	@test -f .env || { echo 'ОШИБКА: нет файла .env. Выполните: cp .env.example .env'; exit 1; }
+	@test -f .env || { echo 'ERROR: no .env file. Run: cp .env.example .env'; exit 1; }
 endef
 
 .PHONY: help
-help: ## Показать список команд
+help: ## Show the command list
 	@grep -E '^[a-zA-Z0-9_.-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-22s\033[0m %s\n", $$1, $$2}'
 
-# --------------------------------------------------------------- жизненный цикл
+# --------------------------------------------------------------- lifecycle
 
 .PHONY: up
-up: ## Запустить инфраструктуру + testbed + приложения
+up: ## Start infrastructure + testbed + apps
 	$(check_env)
 	mkdir -p var/incoming var/content
 	$(MAKE) warm-cache
 	$(COMPOSE) $(APP_PROFILES) up -d --build --wait
 
 .PHONY: up-infra
-up-infra: ## Только postgres, redis, unbound (схему применят сервисы при старте)
+up-infra: ## Only postgres, redis, unbound (services apply the schema on startup)
 	$(check_env)
 	$(COMPOSE) up -d --build --wait
 
 .PHONY: up-internet
-up-internet: ## Включить реальную рекурсию DNS (требует ALLOW_INTERNET=1 в .env)
+up-internet: ## Enable real DNS recursion (requires ALLOW_INTERNET=1 in .env)
 	$(check_env)
 	@grep -q '^ALLOW_INTERNET=1' .env || { echo \
-	  'ОТКАЗ: выход в интернет включается явно.';\
-	  echo 'Добавьте в .env:  ALLOW_INTERNET=1'; exit 1; }
+	  'REFUSAL: internet access is enabled explicitly.';\
+	  echo 'Add to .env:  ALLOW_INTERNET=1'; exit 1; }
 	$(COMPOSE) $(APP_PROFILES) up -d --build --wait
 	UNBOUND_MODE=internet UNBOUND_HEALTH_NAME=example.com \
 		$(COMPOSE) up -d --no-deps --force-recreate unbound
-	@echo 'ВНИМАНИЕ: DNS теперь резолвится в реальный интернет.'
-	@echo 'User-Agent краулера должен содержать пометку dev (CRAWLER_USER_AGENT в .env).'
-	@echo 'Возврат в изолированный режим: make up'
+	@echo 'WARNING: DNS now resolves into the real internet.'
+	@echo 'The crawler User-Agent must carry a dev marker (CRAWLER_USER_AGENT in .env).'
+	@echo 'Return to the isolated mode: make up'
 
 .PHONY: reset-internet
-reset-internet: ## Полный сброс среды и старт с реальным DNS (ALLOW_INTERNET=1)
+reset-internet: ## Full environment reset and start with real DNS (ALLOW_INTERNET=1)
 	$(check_env)
 	@grep -q '^ALLOW_INTERNET=1' .env || { echo \
-	  'ОТКАЗ: выход в интернет включается явно (сброс отменён).';\
-	  echo 'Добавьте в .env:  ALLOW_INTERNET=1'; exit 1; }
+	  'REFUSAL: internet access is enabled explicitly (reset cancelled).';\
+	  echo 'Add to .env:  ALLOW_INTERNET=1'; exit 1; }
 	$(MAKE) clean FORCE=1
 	rm -rf var/content/* var/incoming/processed/* var/incoming/failed/*
 	$(MAKE) mod-download
@@ -107,64 +107,64 @@ reset-internet: ## Полный сброс среды и старт с реал�
 	$(MAKE) up-internet
 
 .PHONY: down
-down: ## Остановить окружение (тома сохраняются)
+down: ## Stop the environment (volumes are kept)
 	$(check_env)
 	$(COMPOSE) $(ALL_PROFILES) down --remove-orphans
 
 .PHONY: clean
-clean: ## Остановить окружение и удалить все тома (с подтверждением)
+clean: ## Stop the environment and remove all volumes (with confirmation)
 	$(check_env)
 	@if [ "$(FORCE)" != "1" ]; then \
-	  read -r -p 'Удалить все тома (данные БД, кэши сборки, контент)? [y/N] ' ans; \
-	  [ "$$ans" = "y" ] || { echo 'Отменено (или make clean FORCE=1).'; exit 1; }; \
+	  read -r -p 'Remove all volumes (DB data, build caches, content)? [y/N] ' ans; \
+	  [ "$$ans" = "y" ] || { echo 'Cancelled (or make clean FORCE=1).'; exit 1; }; \
 	fi
 	$(COMPOSE) $(ALL_PROFILES) down -v --remove-orphans
 
 .PHONY: logs
-logs: ## Логи сервиса: make logs SERVICE=analyzer
+logs: ## Service logs: make logs SERVICE=analyzer
 	$(check_env)
 	$(COMPOSE) logs --tail=200 -f $(SERVICE)
 
 .PHONY: ps
-ps: ## Состояние всех сервисов
+ps: ## State of all services
 	$(check_env)
 	$(COMPOSE) $(ALL_PROFILES) ps -a
 
-# --------------------------------------------------------------- сборка и код
+# --------------------------------------------------------------- build and code
 
 .PHONY: build
-build: ## Собрать dev-образы (hot reload)
+build: ## Build dev images (hot reload)
 	$(check_env)
-	# Все профили: без них compose собирает только сервисы без профиля
-	# (unbound); go-dev (app+tools) и mockserver (testbed) остались бы несобранными.
+	# All profiles: without them compose builds only the services without a profile
+	# (unbound); go-dev (app+tools) and mockserver (testbed) would stay unbuilt.
 	$(COMPOSE) $(ALL_PROFILES) build
 
-# Прогрев общего кэша сборки: одна компиляция всех сервисов в tools (лимит 2G)
-# вместо восьми параллельных air-сборок с лимитом 256m — на холодном кэше
-# (первый запуск / после make clean) параллельная компиляция не влезает в память.
+# Shared build cache warm-up: one compilation of all services in tools (2G limit)
+# instead of eight parallel air builds with a 256m limit — on a cold cache
+# (first run / after make clean) parallel compilation does not fit in memory.
 .PHONY: warm-cache
-warm-cache: ## Прогреть общий кэш сборки Go (одна компиляция в tools)
+warm-cache: ## Warm up the shared Go build cache (one compilation in tools)
 	$(check_env)
 	$(COMPOSE) run --rm tools go build ./cmd/...
 
 .PHONY: build-runtime
-build-runtime: ## Собрать боевые образы (runtime + render) для проверки
+build-runtime: ## Build production images (runtime + render) for verification
 	$(check_env)
 	docker build $(BUILD_ARGS) $(VERSION_ARGS) -f deploy/docker/Dockerfile.go \
 		--target runtime -t crawler/runtime:check .
 	docker build $(BUILD_ARGS) $(VERSION_ARGS) -f deploy/docker/Dockerfile.render \
 		--target render -t crawler/render:check .
 
-# Бандл Tailwind лендинга (T-124): исходник internal/web/static/app.src.css →
-# app.css (go:embed, собирается в бинарь). Генерат в git не хранится
-# (.gitignore) — после правок шаблона/исходника CSS запустите цель для
-# dev-просмотра; сборка боевых образов собирает CSS сама (стадия css
-# Dockerfile.go), node не нужен.
+# Landing Tailwind bundle (T-124): source internal/web/static/app.src.css →
+# app.css (go:embed, compiled into the binary). The generated artifact is not
+# stored in git (.gitignore) — after editing the template/CSS source, run this
+# target for a dev preview; production image builds compile the CSS themselves
+# (css stage of Dockerfile.go), node is not needed.
 .PHONY: web-css
-web-css: ## Собрать CSS лендинга (Tailwind v4: app.src.css → static/app.css)
+web-css: ## Build the landing CSS (Tailwind v4: app.src.css → static/app.css)
 	$(check_env)
 	@test "$(TAILWIND_ARCH)" = "x64" || test "$(TAILWIND_ARCH)" = "arm64" || { \
-	  echo "ОШИБКА: нет musl-сборки tailwindcss под $(shell uname -m) (x86_64/aarch64)."; exit 1; }
+	  echo "ERROR: no musl build of tailwindcss for $(shell uname -m) (x86_64/aarch64)."; exit 1; }
 	docker run --rm -v $(CURDIR):/src \
 	  -w /src/internal/web/static alpine:$(ALPINE_VERSION) sh -eu -c '\
 	  apk add --no-cache libstdc++ libgcc >/dev/null \
@@ -172,31 +172,31 @@ web-css: ## Собрать CSS лендинга (Tailwind v4: app.src.css → st
 	  && chmod +x /tmp/tailwindcss \
 	  && /tmp/tailwindcss -i app.src.css -o app.css --minify \
 	  && chown $(DEV_UID):$(DEV_GID) app.css'
-	@echo 'internal/web/static/app.css собран (генерат, в git не хранится).'
-	@echo 'Применение в dev: перезапустите сервис web — air следит только за .go:'
+	@echo 'internal/web/static/app.css built (generated artifact, not stored in git).'
+	@echo 'To apply in dev: restart the web service — air watches only .go files:'
 	@echo '  docker restart crawler-web-1'
 
 GO_PKGS := ./cmd/... ./internal/... ./migrations/... ./test/... ./deploy/postgres
 
-# Пути gofmt (каталогами): тот же охват, что у линта — gofmt в CI гейтится
-# golangci-lint (formatters.gofmt на GO_PKGS, включая migrations/embed.go),
-# make fmt должен править те же файлы, иначе гейт ловит то, что fmt не чинит.
+# gofmt paths (directories): the same coverage as lint — gofmt in CI is gated
+# by golangci-lint (formatters.gofmt over GO_PKGS, including migrations/embed.go),
+# make fmt must fix the same files, otherwise the gate catches what fmt does not.
 GOFMT_PATHS := cmd internal test deploy/postgres migrations
 
 .PHONY: test
-test: ## Модульные тесты Go (в контейнере)
+test: ## Go unit tests (in a container)
 	$(check_env)
 	$(COMPOSE) run --rm tools go test $(GO_PKGS) -count=1
 
-# -race для пакетов с горутинными циклами (T-190): штатный make test
-# идёт без -race (CGO_ENABLED=0 в образе — боевые бинарники статические),
-# детектор гонок требует cgo — включается на один run-контейнер
-# (-e CGO_ENABLED=1; gcc в tools есть — build-base). По умолчанию только
-# Пакеты с горутинными циклами/воркерами — детектор гонок обязан
-# видеть их все (инцидент 10.11: гонки триаж-тестов monitor прошлись
-# мимо локального make test). Расширение списка — по мере появления
-# новых конкурентных пакетов (RACE_PKGS='./internal/a/... ./internal/b').
-# Замер: полный набор ~50 с (render/content с -race — основная часть).
+# -race for packages with goroutine loops (T-190): the regular make test
+# runs without -race (CGO_ENABLED=0 in the image — production binaries are static);
+# the race detector requires cgo — enabled for a single run container
+# (-e CGO_ENABLED=1; gcc is present in tools — build-base). By default only
+# packages with goroutine loops/workers — the race detector must
+# see all of them (incident of Nov 10: races in monitor triage tests slipped
+# past the local make test). The list grows as new
+# concurrent packages appear (RACE_PKGS='./internal/a/... ./internal/b').
+# Timing: the full set takes ~50 s (render/content with -race — the bulk).
 RACE_PKGS ?= ./internal/monitor \
 	./internal/scheduler \
 	./internal/renderworker \
@@ -207,61 +207,61 @@ RACE_PKGS ?= ./internal/monitor \
 	./internal/content
 
 .PHONY: test-race
-test-race: ## Тесты с детектором гонок (-race, по умолчанию internal/monitor)
+test-race: ## Tests with the race detector (-race, internal/monitor by default)
 	$(check_env)
 	$(COMPOSE) run --rm -e CGO_ENABLED=1 tools go test -race $(RACE_PKGS) -count=1
 
 .PHONY: test-integration
-test-integration: ## Интеграционные тесты окружения на testbed
+test-integration: ## Environment integration tests on the testbed
 	$(check_env)
-	# --build: сценарии HTTP-этапа живут в исходнике mockserver (виртуальные
-	# хосты сценариев, TLS-сертификаты) — образ обязан быть свежее исходника;
-	# стадия mockserver-build собирается за секунды (stdlib-only).
+	# --build: HTTP-stage scenarios live in the mockserver source (scenario
+	# virtual hosts, TLS certificates) — the image must be newer than the source;
+	# the mockserver-build stage builds in seconds (stdlib-only).
 	$(COMPOSE) --profile testbed --profile app up -d --build --wait \
 		postgres redis unbound coredns testweb mockserver chromium
-	# Сервисы приложения не запускаются, поэтому схему для тестов накатывает
-	# CLI (тот же набор migrations/); раннер сервисов проверяют TestMigrate_*.
+	# App services are not started, so the schema for tests is applied
+	# by the CLI (the same migrations/ set); service runners are covered by TestMigrate_*.
 	$(COMPOSE) run --rm tools sh -c \
 	  'migrate -path /migrations -database "$$APP_PG_DSN" up'
-	# ./cmd/crawlerctl — интеграционный тест наката фикстуры T-243
-	# (гейт CRAWLER_INTEGRATION, изолированная схема в той же БД).
+	# ./cmd/crawlerctl — integration test of the T-243 fixture import
+	# (CRAWLER_INTEGRATION gate, isolated schema in the same DB).
 	$(COMPOSE) run --rm -e CRAWLER_INTEGRATION=1 tools \
 		go test ./test/integration ./cmd/crawlerctl -count=1 -v -timeout 10m
 
-# --------------------------------------------------------------- мутационное тестирование
-# Как читать отчёты, гейтить порог и помечать ложных мутантов —
+# --------------------------------------------------------------- mutation testing
+# How to read reports, gate on the threshold and flag false mutants —
 # docs/mutation-testing.md.
 
-# Охват по умолчанию — «логическое ядро»: пакеты бизнес-логики с
-# герметичными и быстрыми юнит-тестами (без сети/БД/Chromium). Полный
-# прогон ~2.5 ч (2632 мутанта, score 1.000); config и web не включены:
-# там сотни мутантов по yaml-биндингу и i18n-обвязке при низком сигнале.
-# Точечный запуск любого пакета:
+# Default coverage — the "logic core": business-logic packages with
+# hermetic, fast unit tests (no network/DB/Chromium). A full
+# run takes ~2.5 h (2632 mutants, score 1.000); config and web are not included:
+# hundreds of mutants there cover yaml binding and i18n wiring at low signal.
+# To run a single package:
 #   make mutate PKGS='./internal/httpfetch/...'
-# CI (mutation.yml) для еженедельного прогона делит этот набор на три
-# части по замеренному времени и гоняет их параллельными джобами —
-# полный охват на hosted-раннере не влезает в 6-часовой потолок джоба
-# (render с темпом ~29 с/мутант — отдельный джоб). Локальный прогон —
-# всегда полный набор ниже (или точечный).
+# CI (mutation.yml) splits this set into three parts for the weekly run
+# by measured time and runs them as parallel jobs —
+# full coverage on a hosted runner does not fit into the 6-hour job ceiling
+# (render at ~29 s/mutant — a separate job). A local run is
+# always the full set below (or a single package).
 PKGS ?= ./internal/analyzer/... \
 	./internal/dashboard/... ./internal/idn/... ./internal/model/... \
 	./internal/monitor/... ./internal/queue/... ./internal/render/... \
 	./internal/rules/... ./internal/scheduler/... ./internal/status/...
-# Таймаут go test на одного мутанта, секунд (компиляция + тест пакета)
+# go test timeout per mutant, seconds (package compilation + test)
 MUTATE_TIMEOUT ?= 60
-# Порог mutation score 0..1: ниже — ненулевой код выхода (гейт CI;
-# локально 0 = только отчёт)
+# mutation score threshold 0..1: below it — non-zero exit code (CI gate;
+# locally 0 = report only)
 MUTATION_MIN_SCORE ?= 0
 
 .PHONY: mutate
-mutate: ## Мутационное тестирование go-mutesting (отчёт var/mutation/)
+mutate: ## Mutation testing with go-mutesting (report in var/mutation/)
 	$(check_env)
-	# Каталог отчётов создаём на хосте ДО compose run: на чистом
-	# чекауте (CI) var/ отсутствует, и недостающие хост-пути bind-маунтов
-	# (./var/incoming, ./var/content и родителя var/) демон docker
-	# создаёт от root — после этого непривилегированный контейнер
-	# (user DEV_UID) не может создать var/mutation в bind /src
-	# (Permission denied; мутационный CI падал так с первого прогона).
+	# The report directory is created on the host BEFORE compose run: on a clean
+	# checkout (CI) var/ is missing, and the missing host paths of the bind mounts
+	# (./var/incoming, ./var/content and the var/ parent) are created by the docker
+	# daemon as root — after that the unprivileged container
+	# (user DEV_UID) cannot create var/mutation inside the /src bind
+	# (Permission denied; the mutation CI failed this way from the first run).
 	mkdir -p var/mutation
 	$(COMPOSE) run --rm \
 		-e MUTATE_PKGS='$(PKGS)' \
@@ -270,132 +270,132 @@ mutate: ## Мутационное тестирование go-mutesting (отч�
 		tools sh deploy/docker/scripts/mutate.sh
 
 .PHONY: lint
-lint: ## golangci-lint (в контейнере)
+lint: ## golangci-lint (in a container)
 	$(check_env)
 	$(COMPOSE) run --rm tools golangci-lint run $(GO_PKGS)
 
 .PHONY: fmt
-fmt: ## gofmt + go vet (в контейнере)
+fmt: ## gofmt + go vet (in a container)
 	$(check_env)
 	$(COMPOSE) run --rm tools sh -c 'gofmt -l -w $(GOFMT_PATHS) && go vet $(GO_PKGS)'
 
 .PHONY: mod-download
-mod-download: ## Докачать Go-модули в общий кэш (нужен интернет; tools его имеет)
+mod-download: ## Fetch Go modules into the shared cache (needs internet; tools has it)
 	$(check_env)
-	@# Без all: качаем только модули, нужные для сборки пакетов проекта.
-	@# go mod download all скачал бы весь транзитивный граф (migrate требует
-	@# драйверы всех СУБД) и дописал бы их h1-хэши в go.sum (~350 строк шума).
+	@# Without all: download only the modules needed to build the project packages.
+	@# go mod download all would fetch the whole transitive graph (migrate requires
+	@# drivers of every DBMS) and append their h1 hashes to go.sum (~350 lines of noise).
 	$(COMPOSE) run --rm tools go mod download
 
-# --------------------------------------------------------------- БД
-# Сервисы применяют миграции автоматически при старте (internal/migrate);
-# цели ниже — ручные операции через CLI golang-migrate в контейнере tools.
+# --------------------------------------------------------------- DB
+# Services apply migrations automatically on startup (internal/migrate);
+# the targets below are manual operations via the golang-migrate CLI in the tools container.
 
 .PHONY: migrate-up
-migrate-up: ## Применить миграции вручную (обычно не нужно: сервисы сами)
+migrate-up: ## Apply migrations manually (usually not needed: services do it themselves)
 	$(check_env)
 	$(COMPOSE) run --rm tools sh -c \
 	  'migrate -path /migrations -database "$$APP_PG_DSN" up'
 
 .PHONY: migrate-down
-migrate-down: ## Откатить все миграции (у сервисов отката нет)
+migrate-down: ## Roll back all migrations (services have no rollback)
 	$(check_env)
 	$(COMPOSE) run --rm tools sh -c \
 	  'migrate -path /migrations -database "$$APP_PG_DSN" down --all'
 
 .PHONY: migrate-new
-migrate-new: ## Создать пару миграций: make migrate-new NAME=add_index
+migrate-new: ## Create a migration pair: make migrate-new NAME=add_index
 	$(check_env)
-	@test -n "$(NAME)" || { echo 'Использование: make migrate-new NAME=имя_миграции'; exit 1; }
+	@test -n "$(NAME)" || { echo 'Usage: make migrate-new NAME=migration_name'; exit 1; }
 	$(COMPOSE) run --rm tools migrate create -ext sql -dir /migrations -seq $(NAME)
 
 .PHONY: psql
-psql: ## Консоль PostgreSQL
+psql: ## PostgreSQL console
 	$(check_env)
 	$(COMPOSE) exec postgres psql -U $(PG_ADMIN_USER) -d $(PG_DB)
 
 .PHONY: redis-cli
-redis-cli: ## Консоль Redis
+redis-cli: ## Redis console
 	$(check_env)
 	$(COMPOSE) exec redis redis-cli
 
 .PHONY: seed
-seed: ## Тестовые данные: списки доменов в var/incoming/<зона>/add/
+seed: ## Test data: domain lists in var/incoming/<zone>/add/
 	$(check_env)
 	mkdir -p var/incoming
 	$(COMPOSE) run --rm tools go run ./cmd/crawlerctl seed --incoming /data/incoming
 
 .PHONY: seed-bulk
-seed-bulk: ## Большой синтетический набор: make seed-bulk N=1000000
+seed-bulk: ## Large synthetic set: make seed-bulk N=1000000
 	$(check_env)
-	@echo 'Генерация N=$(N) доменов в var/incoming/crawl.test/add/seed-bulk.txt'
+	@echo 'Generating N=$(N) domains into var/incoming/crawl.test/add/seed-bulk.txt'
 	$(COMPOSE) run --rm tools go run ./cmd/crawlerctl seed --incoming /data/incoming --bulk $(N)
 
 .PHONY: db-reset
-db-reset: ## Полное пересоздание БД и томов проекта (с подтверждением)
+db-reset: ## Full recreation of the project DB and volumes (with confirmation)
 	$(check_env)
-	@echo 'Это то же самое, что make clean + make up (удаление томов, включая кэши).'
+	@echo 'This is the same as make clean + make up (removes volumes, including caches).'
 	$(MAKE) clean
-	# После clean общий gomodcache пуст, а сервисы приложения качать модули
-	# не могут (DNS — только герметичный unbound): прогреваем из tools.
+	# After clean the shared gomodcache is empty, and the app services cannot
+	# download modules (DNS — hermetic unbound only): warm it up from tools.
 	$(MAKE) mod-download
-	# Холодный gocache: параллельные air-сборки восьми сервисов не влезают
-	# в память (лимиты 256m) — прогреваем кэш одной компиляцией в tools.
+	# Cold gocache: parallel air builds of eight services do not fit
+	# in memory (256m limits) — warm the cache with one compilation in tools.
 	$(MAKE) warm-cache
 	$(MAKE) up
 
 # --------------------------------------------------------------- testbed
 
 .PHONY: testbed-gen
-testbed-gen: ## Регенерировать зоны CoreDNS и фикстуры Caddy из scenarios.yaml
+testbed-gen: ## Regenerate CoreDNS zones and Caddy fixtures from scenarios.yaml
 	$(check_env)
 	$(COMPOSE) run --rm tools go run ./cmd/testbedgen --root /src
 	-$(COMPOSE) --profile testbed restart coredns testweb mockserver 2>/dev/null
 	-$(COMPOSE) restart unbound 2>/dev/null
 
 .PHONY: test-rules
-test-rules: ## Прогон правил Laravel по корпусу testdata/laravel-samples (без сети)
+test-rules: ## Run Laravel rules against the testdata/laravel-samples corpus (no network)
 	$(check_env)
 	$(COMPOSE) run --rm tools go run ./cmd/crawlerctl test-rules \
 		--rules /rules --samples /testdata/laravel-samples
 
 .PHONY: rules-reload
-rules-reload: ## SIGHUP анализатору — перезагрузить правила Laravel без рестарта
+rules-reload: ## SIGHUP the analyzer — reload Laravel rules without a restart
 	$(check_env)
 	$(COMPOSE) exec -T analyzer pkill -HUP -f 'tmp/analyzer$$' \
-		|| echo 'analyzer не запущен (make up)?'
+		|| echo 'analyzer not running (make up)?'
 
 .PHONY: reanalyze
-reanalyze: ## Запустить переанализ результатов (crawlerctl)
+reanalyze: ## Re-run result analysis (crawlerctl)
 	$(check_env)
 	$(COMPOSE) run --rm -e CRAWLER_ANALYZER_RULES_DIR=/rules \
 		tools go run ./cmd/crawlerctl reanalyze
 
-# --------------------------------------------------------------- отладка / CLI
+# --------------------------------------------------------------- debug / CLI
 
 .PHONY: debug
-debug: ## Запустить сервис под delve: make debug SERVICE=dns-worker
+debug: ## Run a service under delve: make debug SERVICE=dns-worker
 	$(check_env)
-	@test -n "$(SERVICE)" || { echo 'Использование: make debug SERVICE=dns-worker'; exit 1; }
+	@test -n "$(SERVICE)" || { echo 'Usage: make debug SERVICE=dns-worker'; exit 1; }
 	$(COMPOSE) run --rm --no-deps -p 127.0.0.1:2345:2345 $(SERVICE) \
 		dlv debug ./cmd/$(SERVICE) \
 		--headless --listen=0.0.0.0:2345 --api-version=2 --accept-multiclient
 
 .PHONY: status
-status: ## Сводка по зонам и очередям (crawlerctl status)
+status: ## Zones and queues summary (crawlerctl status)
 	$(check_env)
 	$(COMPOSE) run --rm tools go run ./cmd/crawlerctl status
 
 .PHONY: domain
-domain: ## Информация о домене: make domain NAME=laravel-11-vite.crawl.test
+domain: ## Domain info: make domain NAME=laravel-11-vite.crawl.test
 	$(check_env)
-	@test -n "$(NAME)" || { echo 'Использование: make domain NAME=example.crawl.test'; exit 1; }
+	@test -n "$(NAME)" || { echo 'Usage: make domain NAME=example.crawl.test'; exit 1; }
 	$(COMPOSE) run --rm tools go run ./cmd/crawlerctl domain "$(NAME)"
 
 .PHONY: check
-check: ## Живая проверка домена: make check DOMAIN=example.com
+check: ## Live domain check: make check DOMAIN=example.com
 	$(check_env)
-	@test -n "$(DOMAIN)" || { echo 'Использование: make check DOMAIN=example.com'; exit 1; }
+	@test -n "$(DOMAIN)" || { echo 'Usage: make check DOMAIN=example.com'; exit 1; }
 	$(COMPOSE) run --rm \
 		-e CRAWLER_DNS_RESOLVERS=$(RESOLVER) \
 		-e CRAWLER_DNS_FALLBACK_RESOLVERS=$(FALLBACK) \
@@ -403,7 +403,7 @@ check: ## Живая проверка домена: make check DOMAIN=example.co
 		tools go run ./cmd/crawlerctl check "$(DOMAIN)"
 
 .PHONY: shell
-shell: ## Оболочка в контейнере: make shell [SERVICE=tools]
+shell: ## Shell in a container: make shell [SERVICE=tools]
 	$(check_env)
 	@if [ -z "$(SERVICE)" ]; then \
 	  $(COMPOSE) --profile tools up -d --no-deps tools; \

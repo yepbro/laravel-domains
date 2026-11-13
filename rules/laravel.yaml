@@ -1,56 +1,63 @@
-# Рабочий набор правил поиска Laravel (ТЗ §5.8; порог is_laravel — score >= 0.6,
-# конфиг analyzer.laravel_min_score, §13.1). Все срабатывания (любое правило)
-# пишутся в laravel_findings, поэтому слабые признаки сознательно получают низкий
-# вес: поодиночке они остаются ниже порога и не попадают в laravel_domains.
+# The production Laravel detection rule set (spec §5.8; the is_laravel
+# threshold — score >= 0.6, the analyzer.laravel_min_score config, §13.1).
+# All firings (any rule) are written to laravel_findings, so weak signs
+# deliberately get a low weight: on their own they stay below the threshold
+# and do not reach laravel_domains.
 #
-# Вес (0..1] — «сила» признака: чем реже он встречается вне Laravel, тем выше.
-# Накопление независимых признаков — noisy-OR: 1 − Π(1 − wᵢ) (ТЗ §5.8), порог
-# 0.6 достигается 1–2 сильными признаками либо сочетанием слабых.
+# The weight (0..1] — the "strength" of a sign: the rarer it is outside
+# Laravel, the higher. Independent signs accumulate — noisy-OR: 1 − Π(1 − wᵢ)
+# (spec §5.8); the 0.6 threshold is reached by 1–2 strong signs or a
+# combination of weak ones.
 #
-# Калибровка T-116 (сверка с larasites 2026-10-19): stateless API (api-субдомен
-# без сессии на главной) детектируется парой кук XSRF-TOKEN + шифрованный
-# конверт — 0.25 + 0.5 → 0.625 ≥ 0.6; для этого вес cookie_encrypted_payload
-# поднят с 0.45 (пара давала 0.5875 — сайт выпадал из laravel_domains).
-# Шумовые сочетания без шифрованной куки остаются ниже порога: Rails-пара
-# csrf-meta + *_session — 0.32; CodeIgniter-тройка ci_session + csrf-meta +
-# форма _token — 0.49. Порог 0.6 не менялся.
+# T-116 calibration (a cross-check against larasites, 2026-10-19): a stateless
+# API (an api subdomain without a session on the front page) is detected by
+# the XSRF-TOKEN cookie pair + the encrypted envelope — 0.25 + 0.5 → 0.625
+# ≥ 0.6; for that the weight of cookie_encrypted_payload was raised from 0.45
+# (the pair gave 0.5875 — the site dropped out of laravel_domains). Noisy
+# combinations without the encrypted cookie stay below the threshold: the
+# Rails pair csrf-meta + *_session — 0.32; the CodeIgniter triple
+# ci_session + csrf-meta + the _token form — 0.49. The 0.6 threshold did not
+# change.
 #
-# Калибровка T-134 (сверка с larasites, 2026-10-19): CMS на Laravel ставят
-# собственные имена сессии (проверено по исходникам): October — october_session
-# (config/session.php), Winter — winter_session (str_slug(APP_NAME,'winter')
-# .'_session'), Bagisto — Str::slug(APP_NAME).'_session' по скелету. Пару
-# «кастомное имя сессии + шифро-конверт» без XSRF-TOKEN ловил только
-# генерический суффикс *_session: 0.15 + 0.5 → 0.575 < 0.6 — пропуск, который
-# не закрыла калибровка T-116. Правило cookie_cms_session (0.35, уровень
-# laravel_session — имена Laravel-экосистемны, в отличие от суффикса,
-# совпадающего с ci_session): 0.35 + 0.5 → 0.675 ≥ 0.6. Состав — только
-# имена, проверяемые по исходникам (кандидаты botble/pyrocms/asgard не
-# подтверждены — не включены; statamic оставляет laravel_session). Двойной
-# учёт с суффиксным правилом консистентен с поведением laravel_session
-# (совпадает с обоими). Префиксы __Secure-/__Host- (October ≥1.1 добавляет
-# автоматически на https) учтены в обоих правилах.
+# T-134 calibration (a cross-check against larasites, 2026-10-19): Laravel
+# CMSs set their own session names (verified against the sources): October —
+# october_session (config/session.php), Winter — winter_session
+# (str_slug(APP_NAME,'winter').'._session'), Bagisto —
+# Str::slug(APP_NAME).'_session' per the skeleton. The pair "a custom session
+# name + the encrypted envelope" without XSRF-TOKEN was caught only by the
+# generic *_session suffix: 0.15 + 0.5 → 0.575 < 0.6 — a miss the T-116
+# calibration did not close. The cookie_cms_session rule (0.35, the level of
+# laravel_session — the names are Laravel-ecosystem, unlike the suffix, which
+# collides with ci_session): 0.35 + 0.5 → 0.675 ≥ 0.6. The composition —
+# only names verified against the sources (the botble/pyrocms/asgard
+# candidates were not confirmed — not included; statamic keeps
+# laravel_session). Double counting with the suffix rule is consistent with
+# the laravel_session behavior (it matches both). The __Secure-/__Host-
+# prefixes (October ≥1.1 adds them automatically on https) are covered in
+# both rules.
 #
-# Версионные границы ver_min/ver_max — по документации и истории каркаса Laravel
-# (laravel.com/docs, github.com/laravel/laravel):
-#   * Vite — основная сборка начиная с Laravel 9.19.0 (июнь 2022,
-#     laravel-vite-plugin); Vite можно подключить и вручную на любую версию,
-#     граница индикативная, как и все границы набора;
-#   * Laravel Mix — сборка по умолчанию до 9.19 (сам Mix — с Laravel 5.4, до
-#     этого Elixir); Mix ставится и на новые версии — ver_max индикативный;
-#   * классическая welcome-страница (стиль position-ref) — Laravel 5.3–7.x,
-#     в 8.0 (сентябрь 2020) заменена на Tailwind-версию.
-# Пересечение диапазонов сработавших правил и фиксацию конфликта (пустое
-# пересечение) считает движок (ТЗ §5.8).
+# The ver_min/ver_max version bounds — per the documentation and the history
+# of the Laravel skeleton (laravel.com/docs, github.com/laravel/laravel):
+#   * Vite — the main build since Laravel 9.19.0 (June 2022,
+#     laravel-vite-plugin); Vite can also be wired manually to any version,
+#     the bound is indicative, like all the set's bounds;
+#   * Laravel Mix — the default build until 9.19 (Mix itself — since Laravel
+#     5.4, before that Elixir); Mix is installed on new versions too — ver_max
+#     is indicative;
+#   * the classic welcome page (the position-ref style) — Laravel 5.3–7.x,
+#     replaced by the Tailwind version in 8.0 (September 2020).
+# The intersection of hit-rule ranges and the conflict flag (an empty
+# intersection) are computed by the engine (spec §5.8).
 #
-# Корпус образцов для проверки — testdata/laravel-samples (make test-rules и
-# тест internal/rules/laravel_test.go): ожидаемый состав сработавших правил,
-# is_laravel и диапазон версий фиксируются в meta.yaml каждого образца.
+# The sample corpus for checks — testdata/laravel-samples (make test-rules and
+# the internal/rules/laravel_test.go test): the expected composition of hit
+# rules, is_laravel and the version range are pinned in each sample's meta.yaml.
 
 rules:
   # ------------------------------------------------------------ cookies
-  # Laravel шифрует значения всех кук (EncryptCookies): значение — base64
-  # JSON {"iv":..., "tag":..., "value":...}, т.е. начинается с eyJpdiI6.
-  # XSRF-TOKEN выставляет VerifyCsrfToken, имя сессии по умолчанию —
+  # Laravel encrypts the values of all cookies (EncryptCookies): the value is
+  # base64 JSON {"iv":..., "tag":..., "value":...}, i.e. it starts with eyJpdiI6.
+  # XSRF-TOKEN is set by VerifyCsrfToken; the default session name is
   # laravel_session (Str::slug(APP_NAME)+'_session', Laravel 5+).
   - id: cookie_xsrf_token
     description: XSRF-TOKEN cookie (VerifyCsrfToken; the name also occurs outside Laravel — medium weight)
@@ -89,11 +96,12 @@ rules:
     weight: 0.35
 
   # ------------------------------------------------------------ headers
-  # PHP built-in server (php -S; php artisan serve — команда фреймворка с
-  # Laravel 5.7) — практически единственный сервер, шлющий заголовок Host в
-  # ОТВЕТЕ. Слабый признак «dev-бокса»: php -S годится и для не-Laravel
-  # приложений. Обычные PHP-хостинги (X-Powered-By, Server: PHP/…) не берём —
-  # это признак PHP вообще, а не Laravel, и шумел бы на каждом WordPress.
+  # The PHP built-in server (php -S; php artisan serve — the framework's
+  # command since Laravel 5.7) — practically the only server sending the Host
+  # header in the RESPONSE. A weak "dev box" sign: php -S suits non-Laravel
+  # apps too. Ordinary PHP hostings (X-Powered-By, Server: PHP/…) are not
+  # taken — that is a sign of PHP in general, not Laravel, and would be noise
+  # on every WordPress.
   - id: header_php_cli_server
     description: Host header in a response — PHP built-in server (php artisan serve)
     target: header_name
@@ -107,14 +115,14 @@ rules:
     regex: 'name=["'']csrf-token["'']'
     weight: 0.2
 
-  # ------------------------------------------------------------ HTML: формы
+  # ------------------------------------------------------------ HTML: forms
   - id: form_csrf_input
     description: Hidden _token field — csrf_field() output (Symfony writes form[_token], CakePHP — _csrfToken)
     target: html
     regex: '<input[^>]+name="_token"'
     weight: 0.25
 
-  # ------------------------------------------------------------ HTML: сборка
+  # ------------------------------------------------------------ HTML: builds
   - id: vite_assets
     description: Vite build — the laravel-vite-plugin default (/build/assets/ + an 8-character hash)
     target: html
@@ -136,7 +144,7 @@ rules:
     weight: 0.15
     ver_max: "9.x"
 
-  # ------------------------------------------------------------ HTML: стек
+  # ------------------------------------------------------------ HTML: stack
   - id: inertia
     description: Inertia.js (the data-page attribute; a Laravel-first ecosystem, but there are adapters for Rails too)
     target: html
@@ -185,7 +193,7 @@ rules:
     regex: '\{"message":"[^"]{1,120}"\}'
     weight: 0.25
 
-  # --------------------------------------- HTML: страницы/виды по умолчанию
+  # --------------------------------------- HTML: default pages/views
   - id: welcome_classic
     description: Classic Laravel 5.3–7.x welcome page (position-ref / title m-b-md)
     target: html

@@ -1,14 +1,14 @@
-# Локальный DNS-резолвер dev-окружения.
+# Local DNS resolver of the dev environment.
 #
-# Два конфига:
-#   unbound.testbed.conf  — всё форвардится в coredns, внешний интернет не резолвится
-#   unbound.internet.conf — реальная рекурсия (включается через make up-internet)
+# Two configs:
+#   unbound.testbed.conf  — everything is forwarded to coredns, the external internet is not resolved
+#   unbound.internet.conf — real recursion (enabled via make up-internet)
 ARG ALPINE_VERSION=3.24.2
 FROM alpine:${ALPINE_VERSION}
 RUN apk add --no-cache unbound
 COPY deploy/docker/unbound/unbound.testbed.conf deploy/docker/unbound/unbound.internet.conf /etc/unbound/
 RUN unbound-checkconf /etc/unbound/unbound.testbed.conf \
  && unbound-checkconf /etc/unbound/unbound.internet.conf
-# Непривилегированный запуск: unbound сам сбрасывает привилегии до пользователя
-# unbound (см. username: в конфиге), начиная от root, чтобы забиндить :53.
+# Unprivileged run: unbound drops privileges to the unbound user itself
+# (see username: in the config), starting from root, to bind :53.
 EXPOSE 53 53/udp

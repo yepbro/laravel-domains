@@ -4,9 +4,9 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="dark">
-<!-- Период опроса /api/status в секундах (ТЗД §6.4 «каждые ~5 с»);
-     может отличаться от dashboard.refresh сервера: фронт показывает
-     последний готовый снимок, а не ждёт своей сборки. -->
+<!-- The /api/status polling period in seconds (dashboard spec §6.4 "every
+     ~5 s"); may differ from the server's dashboard.refresh: the frontend
+     shows the last ready snapshot instead of waiting for its own build. -->
 <meta name="dashboard-refresh" content="5">
 <title>Domain Crawler Dashboard</title>
 <link rel="stylesheet" href="/assets/style.css">
@@ -32,8 +32,8 @@
 
 <main>
 
-<!-- §5.1–5.2: сводка и скорость. Значения расставляет app.js из /api/status,
-     «н/д» — до первого снимка и для деградировавших секций (§5.9). -->
+<!-- §5.1–5.2: the summary and the pace. app.js fills the values from /api/status;
+     "n/a" — before the first snapshot and for degraded sections (§5.9). -->
 <section class="cards" aria-label="Pipeline summary">
   <div class="card">
     <div class="card-label">Total domains</div>
@@ -84,8 +84,8 @@
   </div>
 </section>
 
-<!-- §5.4: пять стримов; подсветка глубины рабочего стрима против его
-     эффективного watermark (queue_watermarks) и ненулевого q:dead — app.js. -->
+<!-- §5.4: five streams; app.js highlights the working stream's depth against
+     its effective watermark (queue_watermarks) and a non-zero q:dead. -->
 <section>
   <h2>Queues <span class="hint" id="queue-hint"></span></h2>
   <div class="tbl-wrap">
@@ -104,13 +104,14 @@
   </div>
 </section>
 
-<!-- Панель движков рендера и фолбэка (ТЗ рендер-движков §4.6 п.4,
-     T-246; полнота §4.6 п.4 — S-P3-2): темп/успешность/тарпит-рейт/RSS
-     по движкам (метки engine метрик этапа, T-235/S-P2-4) и фолбэк —
-     fallback-рейт (published/страницы этапа), consumed воркера B /
-     глубина q:render-fallback. Значения — из экспозиций /metrics
-     рендер-воркеров (dashboard.render_metrics_urls); адреса не заданы
-     или экспозиции недоступны — «н/д». -->
+<!-- The render engines and fallback panel (the render-engines spec §4.6
+     item 4, T-246; the completeness of §4.6 item 4 — S-P3-2): the pace/
+     success/tarpit rate/RSS per engine (the engine labels of the stage
+     metrics, T-235/S-P2-4) and the fallback — the fallback rate
+     (published/stage pages), worker B's consumed / the q:render-fallback
+     depth. The values — from the /metrics expositions of the render
+     workers (dashboard.render_metrics_urls); the addresses unset or the
+     expositions unavailable — "n/a". -->
 <section>
   <h2>Render engines <span class="hint" id="render-hint"></span></h2>
   <div class="tbl-wrap">
@@ -134,7 +135,7 @@
   <div class="fb" id="render-fallback"><span class="nd">n/a</span></div>
 </section>
 
-<!-- §5.3: зоны с прогресс-барами; punycode — имя, unicode — подсказка. -->
+<!-- §5.3: zones with progress bars; punycode — the name, unicode — the tooltip. -->
 <section>
   <h2>Zones</h2>
   <div class="tbl-wrap">
@@ -158,14 +159,14 @@
   </div>
 </section>
 
-<!-- §5.5: полоса-легенда распределения статусов со счётчиками. -->
+<!-- §5.5: the status distribution bar-legend with counters. -->
 <section>
   <h2>Domain statuses</h2>
   <div class="statusbar" id="statusbar"></div>
   <div class="legend" id="statuslegend"></div>
 </section>
 
-<!-- §5.6: последние Laravel-находки. -->
+<!-- §5.6: the latest Laravel finds. -->
 <section>
   <h2>Latest Laravel finds</h2>
   <div class="tbl-wrap">
@@ -186,7 +187,7 @@
   </div>
 </section>
 
-<!-- §5.7: последние ingest-файлы. -->
+<!-- §5.7: the latest ingest files. -->
 <section>
   <h2>Latest ingest files</h2>
   <div class="tbl-wrap">
@@ -210,7 +211,7 @@
   </div>
 </section>
 
-<!-- §5.8: чипы здоровья сервисов (dashboard.probes). -->
+<!-- §5.8: the service health chips (dashboard.probes). -->
 <section>
   <h2>Service health</h2>
   <div class="chips" id="health"><span class="nd">n/a</span></div>

@@ -1,13 +1,13 @@
 /*
- * landing.js — перенос из larasites (T-122) с адаптацией:
- *  - эндпоинт формы — data-атрибут (без Laravel-роутов);
- *  - CSRF-заголовок удалён (JSON API + рейт-лимит, без сессий);
- *  - ответ рендерится по контракту T-123 (found/score/версии/
+ * landing.js — a port from larasites (T-122) with adaptations:
+ *  - the form endpoint — a data attribute (no Laravel routes);
+ *  - the CSRF header removed (a JSON API + rate limit, no sessions);
+ *  - the response is rendered per the T-123 contract (found/score/versions/
  *    per-subdomain).
  *
- * Состав: count-up карточек статистики (IntersectionObserver), облако
- * зон с коллизиями (клеточная раскладка с анимацией появления),
- * сортировка таблицы зон, AJAX-форма проверки домена.
+ * Contents: count-up of the stats cards (IntersectionObserver), a zone
+ * cloud with collisions (a grid layout with an entrance animation),
+ * zone table sorting, the AJAX domain check form.
  */
 (function () {
     'use strict';
@@ -63,8 +63,8 @@
         });
     }
 
-    // Раскладка облака: клетки по сетке с проверкой перекрытия
-    // (rects-коллизии), случайный джиттер против рядов.
+    // Cloud layout: grid cells with an overlap check (rect collisions),
+    // random jitter against rows.
     function layoutCloud(container, items) {
         if (!items.length) return;
         var w = container.clientWidth || 600;
@@ -94,8 +94,8 @@
                 }
             }
             if (!placed) {
-                // Не влезло честно — наслаиваем в центр (режутся крайние
-                // редкие зоны; плотность важнее идеальной читаемости).
+                // Did not fit honestly — layer it in the center (the rarest
+                // fringe zones get cut; density beats perfect readability).
                 el.style.left = Math.round(w / 2 - width / 2 + (Math.random() - 0.5) * w * 0.6) + 'px';
                 el.style.top = Math.round(h / 2 - height / 2 + (Math.random() - 0.5) * h * 0.6) + 'px';
             }

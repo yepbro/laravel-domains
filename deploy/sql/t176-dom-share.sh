@@ -57,12 +57,12 @@ pause="${T176_PAUSE:-5}"          # the pause between queries, s
 PSQL=(psql -X --no-psqlrc -v ON_ERROR_STOP=1 -Atq)
 [ -n "$dsn" ] && PSQL+=(-d "$dsn")
 
-fail() { echo "ОШИБКА: $*" >&2; exit 2; }
-[[ "$psi_max" =~ ^[0-9.]+$ ]] || fail "T176_PSI_MAX: ожидается число: $psi_max"
-[[ "$timeout_s" =~ ^[0-9]+$ ]] || fail "T176_TIMEOUT: ожидается целое число: $timeout_s"
-[[ "$pause" =~ ^[0-9]+$ ]] || fail "T176_PAUSE: ожидается целое число: $pause"
-command -v psql >/dev/null 2>&1 || fail "psql не найден"
-"${PSQL[@]}" -c "SELECT 1" >/dev/null || fail "нет соединения с БД (CRAWLER_PG_DSN / PG*)"
+fail() { echo "ERROR: $*" >&2; exit 2; }
+[[ "$psi_max" =~ ^[0-9.]+$ ]] || fail "T176_PSI_MAX: a number is expected: $psi_max"
+[[ "$timeout_s" =~ ^[0-9]+$ ]] || fail "T176_TIMEOUT: an integer is expected: $timeout_s"
+[[ "$pause" =~ ^[0-9]+$ ]] || fail "T176_PAUSE: an integer is expected: $pause"
+command -v psql >/dev/null 2>&1 || fail "psql not found"
+"${PSQL[@]}" -c "SELECT 1" >/dev/null || fail "no DB connection (CRAWLER_PG_DSN / PG*)"
 
 # The shared session settings: the timeout and the plan protection against
 # seq scans of the large tables (the planner hints apply only to this session).
@@ -76,13 +76,13 @@ psi_wait() {
     local f avg
     f=/proc/pressure/cpu
     if [[ ! -r $f ]]; then
-        (( psi_missing )) || { echo "WARN: $f недоступен — ворота PSI пропущены" >&2; psi_missing=1; }
+        (( psi_missing )) || { echo "WARN: $f unavailable — PSI gates skipped" >&2; psi_missing=1; }
         return 0
     fi
     avg=$(sed -n 's/^some avg10=\([0-9.]*\).*/\1/p' "$f")
     [[ "$avg" =~ ^[0-9.]+$ ]] || return 0
     if awk -v a="$avg" -v b="$psi_max" 'BEGIN { exit !(a > b) }'; then
-        echo "WAIT: PSI CPU some avg10=${avg}% > ${psi_max}% — пауза" >&2
+        echo "WAIT: PSI CPU some avg10=${avg}% > ${psi_max}% — pause" >&2
         return 1
     fi
     return 0
@@ -93,7 +93,7 @@ gates() {
     until psi_wait; do
         (( waited += 10 ))
         if (( waited >= 600 )); then
-            echo "ОСТАНОВКА: PSI не отпускает 600 с — замер прерван" >&2
+            echo "STOP: PSI does not release within 600 s — the measurement is interrupted" >&2
             return 1
         fi
         sleep 10
@@ -105,11 +105,11 @@ gates() {
 # cookie_name/cookie_value/header_name.
 H_RULES="'cookie_xsrf_token','cookie_laravel_session','cookie_cms_session','cookie_session_suffix','cookie_encrypted_payload','cookie_remember_guard','header_php_cli_server'"
 
-echo "T-176: замер DOM-вклада (read-only); timeout=${timeout_s}s pause=${pause}s psi_max=${psi_max}%"
-echo "время: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+echo "T-176: DOM-contribution measurement (read-only); timeout=${timeout_s}s pause=${pause}s psi_max=${psi_max}%"
+echo "time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
 
 gates
-echo "=== 0. контрольный EXPLAIN основного join (план: nested loop + index scan по PK)"
+echo "=== 0. control EXPLAIN of the main join (the plan: nested loop + index scan by PK)"
 "${PSQL[@]}" -c "$COMMON
 EXPLAIN (COSTS OFF)
 SELECT count(*) FROM laravel_findings f
@@ -120,13 +120,13 @@ WHERE f.is_laravel;"
 sleep "$pause"
 
 gates
-echo "=== 1. версии правил в laravel_findings"
+echo "=== 1. rule versions in laravel_findings"
 "${PSQL[@]}" -c "$COMMON
 SELECT rules_version, count(*) FROM laravel_findings GROUP BY 1 ORDER BY 2 DESC;"
 sleep "$pause"
 
 gates
-echo "=== 2. зоны: findings / is_laravel / rendered (JOIN по PK)"
+echo "=== 2. zones: findings / is_laravel / rendered (a JOIN by PK)"
 "${PSQL[@]}" -c "$COMMON
 SELECT z.id, z.name, count(*) AS findings_all,
        count(*) FILTER (WHERE f.is_laravel) AS is_laravel,
@@ -144,12 +144,12 @@ sleep "$pause"
 # render debt drains).
 zones=$(awk -F'|' '$5 > 0 { print $1 }' /tmp/t176_zones.$$ | paste -sd, -)
 rm -f /tmp/t176_zones.$$
-[ -n "$zones" ] || { echo "rendered-находок нет — декомпозиция не нужна"; exit 0; }
-echo "зоны декомпозиции (rendered > 0): $zones"
+[ -n "$zones" ] || { echo "no rendered finds — no decomposition needed"; exit 0; }
+echo "decomposition zones (rendered > 0): $zones"
 sleep "$pause"
 
 gates
-echo "=== 3. декомпозиция зон $zones: dom_only / needs_dom"
+echo "=== 3. decomposition of the zones $zones: dom_only / needs_dom"
 # First the rendered filter (hundreds of rows), then the jsonb parsing — an
 # order of magnitude cheaper than parsing all of the zone's is_laravel finds
 # under CPU starvation.
@@ -184,7 +184,7 @@ GROUP BY 1;"
 sleep "$pause"
 
 gates
-echo "=== 4. rendered-записи subdomain_results по зонам (TABLESAMPLE 0.5%, оценка ×200)"
+echo "=== 4. rendered records of subdomain_results by zones (TABLESAMPLE 0.5%, a ×200 estimate)"
 "${PSQL[@]}" -c "$COMMON
 SELECT zone_id, rendered, count(*) AS sample_n, (count(*)*200)::bigint AS est_rows
 FROM subdomain_results TABLESAMPLE SYSTEM (0.5)
@@ -192,7 +192,7 @@ GROUP BY 1,2 ORDER BY 4 DESC LIMIT 15;"
 sleep "$pause"
 
 gates
-echo "=== 5. частоты правил в is_laravel-находках по rendered-статусу (все зоны)"
+echo "=== 5. rule frequencies in is_laravel finds by the rendered status (all zones)"
 # The global count — the measurement's heaviest query (a jsonb parse of all
 # the is_laravel finds); under the chronic starvation it takes 1–3 min.
 # It tolerates a timeout — rerunning is idempotent (read-only).
@@ -210,7 +210,7 @@ GROUP BY 1 ORDER BY 3 DESC;"
 sleep "$pause"
 
 gates
-echo "=== 6. сырые (rendered=false) is_laravel-находки зон $zones с парой кук XSRF+encrypted"
+echo "=== 6. raw (rendered=false) is_laravel finds of the zones $zones with the XSRF+encrypted cookie pair"
 "${PSQL[@]}" -c "$COMMON
 SELECT z.name,
        count(*) AS raw_is_laravel,
@@ -227,7 +227,7 @@ GROUP BY 1;"
 sleep "$pause"
 
 gates
-echo "=== 7. свежесть: rendered-находки без переанализа после рендера (rules_version IS NULL)"
+echo "=== 7. freshness: rendered finds without re-analysis after the render (rules_version IS NULL)"
 "${PSQL[@]}" -c "$COMMON
 SELECT count(*) AS rendered_stale
 FROM laravel_findings f
@@ -236,4 +236,4 @@ JOIN subdomain_results r
  AND r.subdomain_id = f.subdomain_id AND r.variant = f.variant
 WHERE f.is_laravel AND r.rendered AND r.rules_version IS NULL;"
 
-echo "T-176: замер завершён $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+echo "T-176: the measurement is complete $(date -u '+%Y-%m-%d %H:%M:%S UTC')"

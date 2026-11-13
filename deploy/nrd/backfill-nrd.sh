@@ -22,9 +22,9 @@
 set -euo pipefail
 
 before="${NRD_BEFORE:-}"
-[ -n "$before" ] || { echo "укажите границу: NRD_BEFORE=YYYY-MM-DD — дни строго раньше неё" >&2; exit 2; }
-[[ "$before" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || { echo "NRD_BEFORE должна быть датой YYYY-MM-DD" >&2; exit 2; }
-[ "$(id -u)" -eq 0 ] || { echo "запускайте от root (доставка требует chown на crawler-ingest)" >&2; exit 2; }
+[ -n "$before" ] || { echo "specify the boundary: NRD_BEFORE=YYYY-MM-DD — days strictly earlier than it" >&2; exit 2; }
+[[ "$before" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || { echo "NRD_BEFORE must be a YYYY-MM-DD date" >&2; exit 2; }
+[ "$(id -u)" -eq 0 ] || { echo "run as root (delivery requires chown to crawler-ingest)" >&2; exit 2; }
 
 base="${NRD_BASE:-https://smet.cz/nrd/data/daily}"
 incoming="${CRAWLER_NRD_INCOMING:-/var/lib/crawler/incoming}"
@@ -41,11 +41,11 @@ curl -fsS --connect-timeout 30 --max-time 120 --retry 3 -o "$manifest" \
 mapfile -t days < <(grep -oE '"date":"[0-9]{4}-[0-9]{2}-[0-9]{2}"' "$manifest" \
     | cut -d'"' -f4 | sort -u | awk -v b="$before" '$0 < b')
 if [ "${#days[@]}" -eq 0 ]; then
-    echo "дней раньше $before в manifest нет"
+    echo "no days earlier than $before in the manifest"
     exit 0
 fi
 
-echo "дней к доставке: ${#days[@]} (${days[0]} … ${days[-1]})"
+echo "days to deliver: ${#days[@]} (${days[0]} … ${days[-1]})"
 
 ok=0; skip=0; fail=0
 for day in "${days[@]}"; do
@@ -54,7 +54,7 @@ for day in "${days[@]}"; do
     part="$dest.part"
     # idempotent rerun: the day was already delivered — skip
     if [ -e "$dest" ] || [ -e "$incoming/processed/add/nrd-$day.txt.gz" ]; then
-        echo "SKIP $day (уже доставлялся)"
+        echo "SKIP $day (already delivered)"
         skip=$((skip+1))
         continue
     fi
@@ -72,11 +72,11 @@ for day in "${days[@]}"; do
     chown "$owner:$group" "$part"
     chmod 0640 "$part"
     mv -f "$part" "$dest"   # atomic: the watcher sees a complete file
-    echo "OK $day ($(wc -c <"$dest") байт)"
+    echo "OK $day ($(wc -c <"$dest") bytes)"
     ok=$((ok+1))
     sleep 2
 done
 
-echo "итог: ok=$ok skip=$skip fail=$fail из ${#days[@]}"
-logger -t crawler-nrd-backfill -- "бэкфилл NRD (<$before): ok=$ok skip=$skip fail=$fail из ${#days[@]}"
+echo "summary: ok=$ok skip=$skip fail=$fail out of ${#days[@]}"
+logger -t crawler-nrd-backfill -- "NRD backfill (<$before): ok=$ok skip=$skip fail=$fail out of ${#days[@]}"
 [ "$fail" -eq 0 ]

@@ -1,30 +1,31 @@
-# Минимальный образ Moli (github.com/lexmount/moli, Apache-2.0/MIT) —
-# альтернативный движок рендера для dev-стека (этап 35, T-241; ТЗ
-# рендер-движков §4.7, ФТ-16). Официального docker-образа нет: бинарь
-# берём из tarball релиза (сборка x86_64-unknown-linux-gnu, glibc — alpine
-# не подходит) и кладём на debian-slim. Версии пинятся build-args из .env
-# (ФТ-17): смена версии движка — отдельная процедура со smoke-прогоном,
-# не «поехало с latest». Образ тегируется версией (crawler/moli:
-# ${MOLI_VERSION} в compose): смена MOLI_VERSION/MOLI_SHA256 в .env даёт
-# новый тег — compose собирает его сам, старый запуск не «залипает».
+# Minimal Moli image (github.com/lexmount/moli, Apache-2.0/MIT) —
+# an alternative render engine for the dev stack (stage 35, T-241; the
+# render-engines spec §4.7, FR-16). There is no official docker image: the
+# binary is taken from the release tarball (an x86_64-unknown-linux-gnu build,
+# glibc — alpine does not fit) and placed on debian-slim. Versions are pinned
+# via build-args from .env (FR-17): an engine version change is a separate
+# procedure with a smoke run, not "drifted with latest". The image is tagged
+# with the version (crawler/moli:${MOLI_VERSION} in compose): changing
+# MOLI_VERSION/MOLI_SHA256 in .env yields a new tag — compose builds it itself,
+# the old build does not stick around.
 #
-# Запуск (CMD): serve --host 0.0.0.0 --port 9222 (дефолт хоста у serve —
-# 127.0.0.1; 0.0.0.0 — универсальный дефолт для docker run) — без --layout
-# (реальная геометрия DOM-first краулеру не нужна) и без --resource
-# (опциональные ресурсные семейства не включаются: картинки и шрифты
-# блокирует этап рендера, T-062); --obey-robots не передаётся (ФТ-18).
-# --block-private-networks (второй слой SSRF, ФТ-18) тоже не включаем:
-# в testbed страницы отдаёт testweb 172.28.100.12 — приватный адрес;
-# SSRF-контур держит воркер (T-219/T-230), а не движок.
-# В compose-сервисе хост бинда переопределяется на статический адрес
-# 172.28.100.17: Moli строит webSocketDebuggerUrl из адреса бинда, и при
-# 0.0.0.0 реклама слала бы ws://0.0.0.0:9222. Для воркера это не критично
-# (T-234: аллокатор движка moli берёт из /json/version путь browser-сессии,
-# authority — из render.remote_url), статический бинд оставлен для честной
-# рекламы сторонним CDP-клиентам (см. комментарий у сервиса moli в
-# compose.yaml).
+# Run (CMD): serve --host 0.0.0.0 --port 9222 (the default host of serve is
+# 127.0.0.1; 0.0.0.0 is the universal default for docker run) — without --layout
+# (the DOM-first crawler does not need real geometry) and without --resource
+# (optional resource families are not enabled: images and fonts are blocked
+# by the render stage, T-062); --obey-robots is not passed (FR-18).
+# --block-private-networks (the second SSRF layer, FR-18) is not enabled either:
+# in the testbed the pages are served by testweb 172.28.100.12 — a private
+# address; the SSRF perimeter is held by the worker (T-219/T-230), not the engine.
+# In the compose service the bind host is overridden to the static address
+# 172.28.100.17: Moli builds webSocketDebuggerUrl from the bind address, and at
+# 0.0.0.0 the advertisement would send ws://0.0.0.0:9222. For the worker this is
+# not critical (T-234: the moli engine allocator takes the browser-session path
+# from /json/version, the authority — from render.remote_url); the static bind
+# is kept for honest advertisement to third-party CDP clients (see the comment
+# at the moli service in compose.yaml).
 #
-# Сборка: dc --profile render-engines up -d moli (или dc build moli).
+# Build: dc --profile render-engines up -d moli (or dc build moli).
 
 # syntax=docker/dockerfile:1
 
@@ -35,30 +36,31 @@ ARG MOLI_SHA256=048d9e482b6c618af08b17eb19200ea65b1b2fafd39975e5b9de19a60653ed8f
 FROM debian:${DEBIAN_VERSION}
 ARG MOLI_VERSION
 ARG MOLI_SHA256
-# Релизный бинарь динамически линкуется (проверено ldd): libstdc++/libgcc
-# и стек шрифтов libfontconfig/libfreetype (+их зависимости: libpng, brotli,
-# expat, bz2) — в debian-slim их нет, ставим минимальный набор явно.
-# curl — скачивание tarball и healthcheck /json/version (по образцу стадии
-# mockserver в Dockerfile.go); ca-certificates — TLS-верификация рендеримых
-# страниц.
+# The release binary is dynamically linked (verified with ldd): libstdc++/libgcc
+# and the font stack libfontconfig/libfreetype (+their dependencies: libpng, brotli,
+# expat, bz2) — debian-slim lacks them, we install the minimal set explicitly.
+# curl — tarball download and the /json/version healthcheck (modeled on the
+# mockserver stage in Dockerfile.go); ca-certificates — TLS verification of
+# rendered pages.
 RUN apt-get update -yq \
  && apt-get install -yq --no-install-recommends ca-certificates curl \
     libstdc++6 libfontconfig1 libfreetype6 \
  && rm -rf /var/lib/apt/lists/*
-# Tarball качаем и распаковываем одним RUN: удаление в отдельном слое не
-# уменьшает образ, а отдельный ADD с URL оставил бы 45 МБ мёртвым слоем.
-# Контрольная сумма релизного ассета (digest со страницы релиза GitHub;
-# формат sha256sum -c — ровно два пробела) — защита от подмены/битой
-# выгрузки; MOLI_VERSION и MOLI_SHA256 в .env меняются парой. Целевая
-# архитектура — по TARGETARCH BuildKit (amd64/arm64), релизные ассеты есть
-# для обеих. Tarball содержит каталог верхнего уровня с бинарём —
-# --strip-components=1 (как в официальном moli-installer.sh).
-# Загрузка устойчива к флапу release-CDN GitHub (инцидент 08.11.2026:
-# два падения CI подряд, 504 раннерам при живом ассете): 504/503/таймаут
-# — transient для curl, --retry повторяет попытку внутри того же RUN;
-# --max-time ограничивает зависшую попытку, чтобы повторы успели
-# случиться. Ошибки вроде 404 (битый пин версии) повторами НЕ считаются —
-# падаем сразу, как и раньше.
+# The tarball is downloaded and unpacked in a single RUN: deletion in a separate
+# layer does not shrink the image, and a separate ADD with a URL would leave
+# 45 MB as a dead layer. Checksum of the release asset (digest from the GitHub
+# release page; the sha256sum -c format — exactly two spaces) — protection
+# against substitution/a corrupted download; MOLI_VERSION and MOLI_SHA256 in
+# .env change as a pair. Target architecture — per the BuildKit TARGETARCH
+# (amd64/arm64), release assets exist for both. The tarball contains a
+# top-level directory with the binary — --strip-components=1 (as in the
+# official moli-installer.sh).
+# The download is resilient to GitHub release-CDN flapping (incident of
+# Nov 8, 2026: two CI failures in a row, 504s to the runners with a live asset):
+# 504/503/timeout are transient for curl, --retry repeats the attempt inside
+# the same RUN; --max-time bounds a hung attempt so the retries have time
+# to happen. Errors like 404 (a broken version pin) are NOT counted as retries —
+# we fail immediately, as before.
 ARG TARGETARCH
 RUN set -eu \
  && case "${TARGETARCH}" in \
@@ -73,8 +75,8 @@ RUN set -eu \
  && install -m 0755 /tmp/moli /usr/local/bin/moli \
  && moli --version \
  && rm -rf /tmp/moli.tar.gz /tmp/moli
-# Рендер недоверенных страниц без root (ТЗ §9); временные файлы профиля
-# (IndexedDB/OPFS без --profile-dir) пишутся в /tmp (1777).
+# Rendering of untrusted pages without root (spec §9); temporary profile files
+# (IndexedDB/OPFS without --profile-dir) are written to /tmp (1777).
 USER nobody
 EXPOSE 9222/tcp
 ENTRYPOINT ["/usr/local/bin/moli"]

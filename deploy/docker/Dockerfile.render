@@ -1,16 +1,16 @@
-# Образ рендера: headless-Chromium + бинарник render-worker (ТЗ 4.3).
-# render-worker запускает Chromium сам (chromedp), поэтому один процесс
-# на контейнер; shm_size/init/mem_limit задаются при запуске.
+# The render image: headless-Chromium + the render-worker binary (spec 4.3).
+# render-worker starts Chromium itself (chromedp), hence one process
+# per container; shm_size/init/mem_limit are set at run time.
 #
-# Пользователь — nobody: отдельный непривилегированный пользователь для
-# рендера недоверенных страниц (ТЗ §9, §10.1). Лимит памяти контейнера —
-# бюджет Chromium ≈ 2 ГБ (ТЗ 3.2): compose-профиль runtime
-# (deploy/docker/compose.yaml, сервис render, mem_limit — docker-аналог
-# cgroup MemoryMax из ТЗ 10.1); systemd-юниты с MemoryMax — этап 9.
-# Перезапуски Chromium по страницам/памяти выполняет воркер (T-065,
-# render.restart_every_pages / render.restart_memory_bytes).
+# The user is nobody: a dedicated unprivileged user for rendering untrusted
+# pages (spec §9, §10.1). The container memory limit — the Chromium budget
+# ≈ 2 GB (spec 3.2): the runtime compose profile
+# (deploy/docker/compose.yaml, the render service, mem_limit — the docker
+# analog of the cgroup MemoryMax from spec 10.1); systemd units with MemoryMax
+# — stage 9. Chromium restarts by pages/memory are performed by the worker
+# (T-065, render.restart_every_pages / render.restart_memory_bytes).
 #
-# Проверочная сборка: make build-runtime
+# Verification build: make build-runtime
 
 # syntax=docker/dockerfile:1
 
@@ -25,10 +25,10 @@ ENV GOFLAGS=-mod=readonly \
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
-# Версия/ревизия для crawler_build_info (T-111) — как в Dockerfile.go:
-# передаются build-аргами вызывающей стороной (.git вне контекста сборки),
-# без арок — unknown. ARG объявлен у первого использования (COPY . .),
-# после кэшируемого слоя go mod download.
+# Version/revision for crawler_build_info (T-111) — as in Dockerfile.go:
+# passed as build args by the caller (.git is outside the build context);
+# without the args — unknown. The ARG is declared at the first use (COPY . .),
+# after the cacheable go mod download layer.
 ARG BUILD_VERSION=unknown
 ARG BUILD_REVISION=unknown
 COPY . .
@@ -37,7 +37,7 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X crawler/internal/metrics
 FROM ${CHROMEDP_HEADLESS_IMAGE} AS render
 COPY --from=build /out/render-worker /usr/local/bin/render-worker
 ENV HOME=/tmp
-# headless-shell лежит в /headless-shell; render-worker запускает его сам
-# (флаг --no-sandbox передаётся кодом воркера при запуске в контейнере).
+# headless-shell lives in /headless-shell; render-worker starts it itself
+# (the --no-sandbox flag is passed by the worker code when running in a container).
 USER nobody
 ENTRYPOINT ["/usr/local/bin/render-worker"]

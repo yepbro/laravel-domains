@@ -1,22 +1,22 @@
-# Локальное окружение и секреты
+# Local environment and secrets
 .env
 
-# Рабочие данные окружения
+# Environment working data
 /var/
 /tmp/
 
-# Артефакты сборки Go
+# Go build artifacts
 /bin/
 
-# Генерат Tailwind лендинга (make web-css / стадия css Dockerfile.go):
-# в бинарь встраивается go:embed-ом, в git не хранится
+# Generated Tailwind landing artifact (make web-css / css stage of Dockerfile.go):
+# embedded into the binary via go:embed, not stored in git
 internal/web/static/app.css
 *.test
 *.out
 coverage.*
-# ...кроме генерата testbedgen: DNS-зоны CoreDNS (db.<zone>.test) и фикстуры
-# Caddy для зон *.test коммитятся в репо — в CI testbed не регенерируется,
-# а без зон unbound/coredns не проходят healthcheck.
+# ...except the testbedgen generated artifacts: CoreDNS DNS zones (db.<zone>.test)
+# and Caddy fixtures for the *.test zones are committed to the repo — the testbed
+# is not regenerated in CI, and without the zones unbound/coredns fail healthchecks.
 !deploy/docker/testbed/coredns/zones/*
 !deploy/docker/testbed/web/sites/*.test/
 !deploy/docker/testbed/web/sites/*.test/**
@@ -27,11 +27,11 @@ coverage.*
 *.swp
 .config/
 
-# Сборка боевых бинарников (deploy.md §4.2)
+# Production binary builds (deploy.md §4.2)
 out/
 
 # open-codebase-index
 .opencode/index/
 
-# codegraphcontext (локальный индекс MCP)
+# codegraphcontext (local MCP index)
 .codegraphcontext/

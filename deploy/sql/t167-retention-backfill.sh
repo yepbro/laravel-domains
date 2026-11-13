@@ -51,25 +51,25 @@ gate_max_wait="${T167_GATE_MAX_WAIT:-3600}" # how long the gates wait before sto
 PSQL=(psql -X --no-psqlrc -v ON_ERROR_STOP=1 -Atq)
 [ -n "$dsn" ] && PSQL+=(-d "$dsn")
 
-fail() { echo "ОШИБКА: $*" >&2; exit 2; }
+fail() { echo "ERROR: $*" >&2; exit 2; }
 
 # Validation of the substitutions: the values reach the SQL as literals, so
 # the alphabets are closed in advance (the interval — letters/digits/
 # separators, no quotes; everything else — digits only).
-[[ "$retention" =~ ^[0-9A-Za-z_[:space:]:.,-]+$ ]] || fail "T167_RETENTION: недопустимые символы: $retention"
+[[ "$retention" =~ ^[0-9A-Za-z_[:space:]:.,-]+$ ]] || fail "T167_RETENTION: invalid characters: $retention"
 for v in "$batch" "$pause" "$max_batches" "$psi_max" "$queue_max" "$render_lag_max" "$analyze_lag_max" "$gate_max_wait"; do
-    [[ "$v" =~ ^[0-9]+$ ]] || fail "ожидается целое число: $v"
+    [[ "$v" =~ ^[0-9]+$ ]] || fail "an integer is expected: $v"
 done
 
-command -v psql >/dev/null 2>&1 || fail "psql не найден"
+command -v psql >/dev/null 2>&1 || fail "psql not found"
 "${PSQL[@]}" -c "SELECT '$retention'::interval + interval '0'" >/dev/null \
-    || fail "T167_RETENTION не разбирается как interval: $retention"
-"${PSQL[@]}" -c "SELECT 1" >/dev/null || fail "нет соединения с БД (CRAWLER_PG_DSN / PG*)"
+    || fail "T167_RETENTION does not parse as an interval: $retention"
+"${PSQL[@]}" -c "SELECT 1" >/dev/null || fail "no DB connection (CRAWLER_PG_DSN / PG*)"
 
 # One instance: a second parallel instance is pointless (idempotent, but it
 # shares the CPU) — a soft file lock.
 exec 9>/tmp/crawler-t167-backfill.lock
-flock -n 9 || fail "уже запущен другой экземпляр (flock /tmp/crawler-t167-backfill.lock)"
+flock -n 9 || fail "another instance is already running (flock /tmp/crawler-t167-backfill.lock)"
 
 # psi_wait — the CPU-starvation gates: some avg10 above the threshold (the
 # §12 measurement held 91–95%) — wait until it releases. No /proc/pressure
@@ -79,13 +79,13 @@ psi_wait() {
     local f avg
     f=/proc/pressure/cpu
     if [[ ! -r $f ]]; then
-        (( psi_missing )) || { echo "WARN: $f недоступен — ворота PSI пропущены"; psi_missing=1; }
+        (( psi_missing )) || { echo "WARN: $f unavailable — PSI gates skipped"; psi_missing=1; }
         return 0
     fi
     avg=$(sed -n 's/^some avg10=\([0-9.]*\).*/\1/p' "$f")
     [[ "$avg" =~ ^[0-9.]+$ ]] || return 0
     if awk -v a="$avg" -v b="$psi_max" 'BEGIN { exit !(a > b) }'; then
-        echo "WAIT: PSI CPU some avg10=${avg}% > ${psi_max}% — пауза"
+        echo "WAIT: PSI CPU some avg10=${avg}% > ${psi_max}% — pause"
         return 1
     fi
     return 0
@@ -127,25 +127,25 @@ lag_missing=0
 queue_wait() {
     local s n lag max
     if ! command -v redis-cli >/dev/null 2>&1; then
-        (( redis_missing )) || { echo "WARN: redis-cli не найден — ворота очередей пропущены"; redis_missing=1; }
+        (( redis_missing )) || { echo "WARN: redis-cli not found — queue gates skipped"; redis_missing=1; }
         return 0
     fi
     for s in q:render q:analyze; do
         n=$(redis-cli --raw XLEN "$s" 2>/dev/null || echo 0)
         if [[ "$n" =~ ^[0-9]+$ ]] && (( n >= queue_max )); then
-            echo "WAIT: XLEN $s = $n >= $queue_max — пауза"
+            echo "WAIT: XLEN $s = $n >= $queue_max — pause"
             return 1
         fi
         max=$render_lag_max
         [[ "$s" == q:analyze ]] && max=$analyze_lag_max
         lag=$(lag_of "$s") || continue
         if [[ "$lag" == unknown ]]; then
-            (( lag_missing )) || { echo "WARN: лаг $s недоступен (nil либо Redis < 7) — лаг-ворота пропущены, действует XLEN"; lag_missing=1; }
+            (( lag_missing )) || { echo "WARN: the $s lag is unavailable (nil or Redis < 7) — lag gates skipped, XLEN applies"; lag_missing=1; }
             continue
         fi
         [[ "$lag" =~ ^[0-9]+$ ]] || continue
         if (( lag >= max )); then
-            echo "WAIT: лаг $s = $lag >= $max — пауза (записи, ждущие потребителя, не трогаем)"
+            echo "WAIT: the $s lag = $lag >= $max — pause (records waiting for a consumer are not touched)"
             return 1
         fi
     done
@@ -157,7 +157,7 @@ gates() {
     until psi_wait && queue_wait; do
         (( waited += 10 ))
         if (( waited >= gate_max_wait )); then
-            echo "ОСТАНОВКА: ворота не отпускают ${gate_max_wait} с — кампания прервана (итог ниже)"
+            echo "STOP: the gates do not release within ${gate_max_wait} s — the campaign is interrupted (the summary below)"
             return 1
         fi
         sleep 10
@@ -264,8 +264,8 @@ COMMIT;
 SQL
 }
 
-echo "T-167 путь Б: batch=$batch retention='$retention' pause=${pause}s max_batches=$max_batches"
-echo "ворота: PSI some avg10 <= ${psi_max}%, XLEN q:render/q:analyze < $queue_max, лаг q:render < $render_lag_max / q:analyze < $analyze_lag_max, ожидание ворот <= ${gate_max_wait}s"
+echo "T-167 path B: batch=$batch retention='$retention' pause=${pause}s max_batches=$max_batches"
+echo "gates: PSI some avg10 <= ${psi_max}%, XLEN q:render/q:analyze < $queue_max, the q:render lag < $render_lag_max / q:analyze < $analyze_lag_max, the gate wait <= ${gate_max_wait}s"
 
 cz=0 cd=0 cs=0 cv=0
 batches=0
@@ -282,49 +282,49 @@ while :; do
     fi
     t0=$SECONDS
     if ! line=$(run_batch "$cz" "$cd" "$cs" "$cv" | tail -n 1); then
-        echo "ОШИБКА пачки — прервано (незавершённая пачка откатилась целиком; повторный запуск идемпотентен)"
+        echo "batch error — interrupted (the incomplete chunk rolled back in full; rerunning is idempotent)"
         exit_code=1
         break
     fi
     IFS='|' read -r cand trimmed refs bad dec missing deleted freed nz nd ns nv <<<"$line"
     for v in cand trimmed refs bad dec missing deleted freed; do
-        [[ "${!v}" =~ ^[0-9]+$ ]] || fail "неожидаемый вывод пачки: $line"
+        [[ "${!v}" =~ ^[0-9]+$ ]] || fail "unexpected batch output: $line"
     done
     batches=$((batches + 1))
     t_rows=$((t_rows + trimmed)); t_refs=$((t_refs + refs))
     t_bad=$((t_bad + bad)); t_missing=$((t_missing + missing))
     t_deleted=$((t_deleted + deleted)); t_freed=$((t_freed + freed))
-    echo "пачка $batches: кандидатов=$cand срезано=$trimmed ссылок=$refs удалено contents=$deleted"
-    echo "  (${trimmed} строк за $((SECONDS - t0)) с, курсор → ($nz,$nd,$ns,$nv))"
+    echo "chunk $batches: candidates=$cand trimmed=$trimmed refs=$refs contents deleted=$deleted"
+    echo "  (${trimmed} rows in $((SECONDS - t0)) s, cursor → ($nz,$nd,$ns,$nv))"
 
     # Accounting anomalies — a stop signal (analogous to retention.go
     # BadHashes/Missing): the refcount was not changed for them, but growth
     # means a writer/accounting error.
     if (( bad > 0 || missing > 0 )); then
-        echo "ОСТАНОВКА: аномалии учёта (bad_hashes=$bad, missing_refs=$missing) — разберитесь до продолжения (runbook §5.5)"
+        echo "STOP: accounting anomalies (bad_hashes=$bad, missing_refs=$missing) — triage before continuing (runbook §5.5)"
         exit_code=1
         break
     fi
     # An incomplete chunk — the drainage is exhausted (like RetentionOnce of T-166).
     if (( cand < batch )); then
-        echo "дренаж исчерпан (кандидатов $cand < $batch)"
+        echo "drain exhausted (candidates $cand < $batch)"
         break
     fi
     # The next chunk's cursor is numbers too (with cand >= batch the keys are
     # not NULL; the check protects against unexpected output, like the
     # counters above).
     for v in nz nd ns nv; do
-        [[ "${!v}" =~ ^[0-9]+$ ]] || fail "неожидаемый курсор пачки: $line"
+        [[ "${!v}" =~ ^[0-9]+$ ]] || fail "unexpected batch cursor: $line"
     done
     cz=$nz; cd=$nd; cs=$ns; cv=$nv
     if (( batches >= max_batches )); then
-        echo "достигнут потолок max_batches=$max_batches — продолжите повторным запуском (идемпотентно)"
+        echo "the max_batches cap of $max_batches is reached — continue by rerunning (idempotent)"
         break
     fi
     sleep "$pause"
 done
 
-summary="T-167 путь Б: пачек=$batches строк=$t_rows ссылок=$t_refs contents=$t_deleted освобождено байт=$t_freed аномалии: bad=$t_bad missing=$t_missing"
+summary="T-167 path B: chunks=$batches rows=$t_rows refs=$t_refs contents=$t_deleted freed bytes=$t_freed anomalies: bad=$t_bad missing=$t_missing"
 echo "$summary"
 command -v logger >/dev/null 2>&1 && logger -t crawler-t167 -- "$summary" || true
 exit "$exit_code"

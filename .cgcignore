@@ -1,4 +1,4 @@
-# CGC-зеркало .gitignore
+# CGC mirror of .gitignore
 .env
 /var/
 /tmp/

@@ -1,15 +1,15 @@
-# Ежедневная выгрузка списка новых доменов (NRD) smet.cz в incoming/
-# ingest — deploy/nrd/README.md, docs/deploy.md §4.9.
+# Daily fetch of the new-domain list (NRD) of smet.cz into the ingest
+# incoming/ — deploy/nrd/README.md, docs/deploy.md §4.9.
 #
-# Время: 05:33 UTC. Ниже — часы МЕСТНОГО времени сервера: cron не умеет
-# per-file TZ, зона сервера Europe/Moscow (UTC+3) => 08:33. При смене
-# зоны сервера (timedatectl) пересчитайте часы строки обратно в 05:33 UTC.
+# Time: 05:33 UTC. The hours below are the SERVER's LOCAL time: cron cannot
+# do per-file TZ, the server zone is Europe/Moscow (UTC+3) => 08:33. When the
+# server zone changes (timedatectl), recalculate the line's hours back to 05:33 UTC.
 #
-# Почему 05:33 UTC, а не вечером (перенос 26.10, T-205): применение
-# суточного NRD-файла (~470 тыс. доменов) попало в вечернее окно CPU-
-# голода (PSI ~80%) и полуночный шторм суточной перепроверки — теперь
-# загрузка идёт вне часов голода; день источника закрыт >9 ч, контракт
-# «только закрытые дни» сохранён (README).
+# Why 05:33 UTC and not the evening (the Oct 26 move, T-205): applying the
+# daily NRD file (~470 k domains) landed in the evening CPU-starvation window
+# (PSI ~80%) and the midnight storm of the daily recheck — the fetch now runs
+# outside the starvation hours; the source day has been closed for >9 h, the
+# "closed days only" contract is kept (README).
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
 33 8 * * * root /usr/local/bin/crawler-fetch-nrd
