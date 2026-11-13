@@ -87,8 +87,10 @@ one-off reports; this section adds the loop and the autonomy.
    On each tick: analyze → decide (criteria below) → post a compact
    diff-report → relaunch the timer.
 3. Quiet-hour format: a 5–6 row diff table (load+swap вкл. si/so / PG
-   OOM-киллы + WARN-серия http-worker / checks rate + доля temp_error /
-   retention: курсор+errors+долгий PG-запрос / очереди: глубины +
+   OOM-киллы + WARN-серия http-worker / checks rate + доля temp_error +
+   A/B-баланс ошибок HTTP (дифф stage_errors по типам) + per-IP ожидания
+   >2 с (T-165: доля 1−bucket{le=2}/count, норма <5 %) / retention:
+   курсор+errors+долгий PG-запрос / очереди: глубины +
    render-долг (lag+render_pending) + q:dead / диск+контент
    +/var/log/postgresql) + "no action required". Do NOT write hourly
    files into `prod-reports/` — full reports and files only on anomalies,

@@ -3,7 +3,8 @@
 # no double queue cuts — do NOT use per-tick instead of collect.sh).
 # Covers: time/load/mem + swap si/so thrash, disk/content/packs
 # + /var/log/postgresql, PG restarts + OOM per hour + longest active
-# query, http-worker WARN/err series per hour, retention metrics
+# query, http-worker WARN/err series per hour, stage errors by type +
+# per-IP wait share >2s (T-165; A/B balance, diffs between ticks), retention metrics
 # + persisted cursor + journal tail, today's crawler_counters (checks /
 # temp_error / retry_mature / render_pending), queue depths, scheduler
 # state, q:dead.
@@ -25,6 +26,9 @@ echo "=== retention: metrics / cursor / journal ==="
 curl -s 127.0.0.1:9104/metrics | grep -E "^crawler_content_retention_(errors_total|pass_seconds_count|rows_total|contents_total|freed_bytes_total)" | sed "s/{service=\"http-worker\"}//"
 sudo -u postgres psql -d crawler -tAc "SELECT checked_at, updated_at FROM retention_drain_cursor;" 2>&1
 journalctl -u crawler-http-worker --since "-65min" -q | grep -iE "retention pass|cursor" | tail -3
+echo "=== http: ошибки по типам + per-IP ожидания (кумулятив с рестарта http-worker; дифф между тиками) ==="
+curl -s 127.0.0.1:9104/metrics | grep "^crawler_stage_errors_total" | sed "s/crawler_stage_errors_total{service=\"http-worker\",stage=\"http\",type=\"/  /;s/\"} /= /"
+curl -s 127.0.0.1:9104/metrics | grep -E "^crawler_http_per_ip_wait_seconds_(bucket\{service=\"http-worker\",le=\"(2|10)\"\}|count)" | sed "s/{service=\"http-worker\"}//"
 echo "=== counters today: checks / temp_error / retry_mature / render_pending ==="
 sudo -u postgres psql -d crawler -tAc "SELECT name||'"'"'='"'"'||value FROM crawler_counters WHERE name IN ('"'"'checks:'"'"'||current_date,'"'"'temp_error:'"'"'||current_date,'"'"'retry_mature:'"'"'||current_date,'"'"'render_pending'"'"');" 2>/dev/null
 echo "=== queues / rates ==="
