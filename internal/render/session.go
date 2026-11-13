@@ -105,7 +105,7 @@ func (s *Session) start(ctx context.Context) error {
 		// connection (T-218).
 		if !s.b.probeConn() {
 			return &Error{Class: ClassBrowser,
-				Err: fmt.Errorf("Chromium browser unavailable: context creation timeout %s",
+				Err: fmt.Errorf("chromium browser unavailable: context creation timeout %s",
 					s.b.opts.SessionStartTimeout)}
 		}
 		return &Error{Class: ClassContext,
@@ -253,7 +253,7 @@ func (s *Session) wrap(err error, caller, opCtx context.Context, url string) *Er
 		// class is needed.
 		if !s.b.probeConn() {
 			return &Error{Class: ClassBrowser, URL: url,
-				Err: fmt.Errorf("Chromium browser unavailable: page timeout %s: %w: %w",
+				Err: fmt.Errorf("chromium browser unavailable: page timeout %s: %w: %w",
 					s.b.opts.Timeout, opCtx.Err(), err)}
 		}
 		return &Error{Class: ClassTask, URL: url,
