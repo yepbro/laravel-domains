@@ -68,7 +68,7 @@ green `make test`/`make lint` before handing off to review.
 
 ### Operational (sequential)
 
-- **T-247** [in progress] — P1, bench comparison of the engines and canary-readiness
+- **T-247** [done] — P1, bench comparison of the engines and canary-readiness
   verdicts (spec §5.1; depends on T-234, T-241, T-243,
   T-244; T-254 — engine smoke preliminaries). Not code: runs of the three engines ×
   a 3000-domain sample twice (variability control), baseline — a fresh
@@ -322,7 +322,7 @@ of scope (waiting for upstream #4151 — one browser context per connection).
 
 ## Stage 46: block_trackers — the sync probe on the moli #2729 exact-URL semantics (T-276)
 
-- **T-276** [in progress] — P1, collapse the sync probe's engine branching after
+- **T-276** [done] — P1, collapse the sync probe's engine branching after
   #2729 is merged: the maintainer introduced exact URL matching for sync XHR
   (a match → a block, including redirects), the tracker probe is blocked on
   both engines — the “moli: 200 to the network” expectation is outdated —
