@@ -339,10 +339,10 @@ AGENTS.md (отдельный worktree, ревью по схеме, один к�
 | № | Статус | Где | Что | Зависимости |
 |---|---|---|---|---|
 | L-01 | [done] | ld-landing | Каркас готов: github.com/yepbro/ld-landing (private, main, 4 коммита), make check/build/build-all/verify/e2e зелёные | — |
-| L-02 | [in progress] | ld-landing | Перенос лендинга: index.vue 1:1, компоненты (§6), словари ru/en из `i18n.go`, Metrika, seo.ts (canonical/hreflang/OG), sitemap/robots; мок API в dev | L-01 |
+| L-02 | [done] | ld-landing | Лендинг перенесён (5b1951f, запушено): компоненты/словари/Metrika/seo/sitemap, 18 юнит-тестов, verify 11/11, e2e 2/2 | L-01 |
 | L-03 | [done] | laravel-domains | `GET /api/v1/landing/stats` (§7.1) — слит в master (3911ece), ревью P2/P3-фиксы применены | — (параллельно L-01/L-02) |
 | L-04 | [done] | laravel-domains | CORS для `/api/*` — слит в master (4726aea); `web.cors.allowed_origins` + env, префлайт 204, строгий Validate; ревью-фиксы применены | L-03 (обе в `internal/web`) |
-| L-05 | [new] | ld-landing | targets.yaml, `make deploy/rollback`, verify-скрипт, e2e; проверка на моках | L-02, L-03, L-04 |
+| L-05 | [in progress] | ld-landing | targets.yaml (уточнить по §11.1), `make deploy/rollback/deploy-all` (check→build→verify→rsync→symlink→healthcheck), full build-verify; проверка механики на серверах **без** переключения current (релиз статики — только в L-06 после релиза API) | L-02, L-03, L-04 |
 | L-06 | [new] | uspromo, aphrodite | **Остаток после досрочной настройки (§11.1)**: деплой статики через L-05, curl-чеки, SEO-аудит (hreflang/canonical/sitemap), проверка формы и stats на живом API. Nginx+TLS+vhost'ы уже готовы 13.11. **Предусловие: релиз laravel-domains master→production (L-03+L-04) + включение `web.cors.allowed_origins` в конфиге larasites** — иначе статике недоступны ни stats, ни форма | L-05 |
 | L-07 | [new] | серверы | Cut-over: DNS уже переключен заранее (reg.ru, 13.11, sites.* → новые серверы, TTL 60) — задача снимается с критического пути; финальные сертификаты/проверка HTTPS; карта 301 (§10); после стабилизации — снятие старых лендинг-vhost'ов на larasites; наблюдение (Метрика, 404, логи api, rate limit) | L-06 |
 | L-08 | [new] | laravel-domains | Вырезание лендинга (§7.3), обновление доков | L-07 |
