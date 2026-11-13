@@ -30,7 +30,7 @@ func main() {
 	// A configuration error — before the logger is initialized: stderr and exit code 1.
 	cfg, err := config.Load()
 	if err != nil {
-		log.Fatalf("[ingest] конфигурация: %v", err)
+		log.Fatalf("[ingest] configuration: %v", err)
 	}
 	logger := service.NewLogger("ingest", cfg)
 
@@ -63,7 +63,7 @@ func main() {
 // the current file, the cleanup exits on the cancellation.
 func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgxpool.Pool, reg *metrics.Registry) error {
 	if pool == nil {
-		return errors.New("ingest: пул БД не получен (postgres.dsn обязателен)")
+		return errors.New("ingest: the DB pool is not provided (postgres.dsn is required)")
 	}
 
 	pipe, err := ingest.NewPipeline(
@@ -120,7 +120,7 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		// the rest will be reprocessed by a restart (at-least-once,
 		// spec 3.4).
 		if _, err := pipe.Process(ctx, f.Path); err != nil {
-			logger.Error("файл не обработан — останется в incoming",
+			logger.Error("file not processed — stays in incoming",
 				"path", f.Path, "err", err)
 		}
 	}

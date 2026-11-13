@@ -40,7 +40,7 @@ func main() {
 	// A configuration error — before the logger is initialized: stderr and exit code 1.
 	cfg, err := config.Load()
 	if err != nil {
-		log.Fatalf("[analyzer] конфигурация: %v", err)
+		log.Fatalf("[analyzer] configuration: %v", err)
 	}
 	logger := service.NewLogger("analyzer", cfg)
 
@@ -52,7 +52,7 @@ func main() {
 	// of the framework, make rules-reload).
 	reloader, err := rules.NewReloader(cfg.Analyzer.RulesDir, logger)
 	if err != nil {
-		log.Fatalf("[analyzer] правила %s: %v", cfg.Analyzer.RulesDir, err)
+		log.Fatalf("[analyzer] rules %s: %v", cfg.Analyzer.RulesDir, err)
 	}
 
 	// The pool comes from the framework after the migrations (OnDBPool)
@@ -93,7 +93,7 @@ func main() {
 // the defer-closes of store/rdb (T-232).
 func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgxpool.Pool, reloader *rules.Reloader, reg *metrics.Registry) error {
 	if pool == nil {
-		return errors.New("analyzer: пул БД не получен (postgres.dsn обязателен)")
+		return errors.New("analyzer: the DB pool is not provided (postgres.dsn is required)")
 	}
 
 	// The content store (spec 5.7, T-042): the stage only reads (the
@@ -188,7 +188,7 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		if err := analyzer.ReanalyzeLoop(ctx, pool, publish, reloader, analyzer.ReanalyzeOptions{
 			Log: logger,
 		}); err != nil {
-			logger.Warn("переанализ: цикл остановлен", slog.Any("err", err))
+			logger.Warn("reanalysis: the loop stopped", slog.Any("err", err))
 		}
 	}()
 

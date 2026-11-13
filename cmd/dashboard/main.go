@@ -33,7 +33,7 @@ func main() {
 	// A configuration error — before the logger is initialized: stderr and exit code 1.
 	cfg, err := config.Load()
 	if err != nil {
-		log.Fatalf("[dashboard] конфигурация: %v", err)
+		log.Fatalf("[dashboard] configuration: %v", err)
 	}
 	logger := service.NewLogger("dashboard", cfg)
 	// Dashboard spec §7.7: the operator credentials are required — empty
@@ -43,7 +43,7 @@ func main() {
 	// check them — otherwise the requirement would affect all the services
 	// of the project.
 	if _, err := dashboard.ParseCredentials(cfg); err != nil {
-		logger.Error("креды дашборда", "err", err)
+		logger.Error("dashboard credentials", "err", err)
 		os.Exit(1)
 	}
 
@@ -81,7 +81,7 @@ func main() {
 // derived ctx cancellation); the completion is returned to the framework.
 func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgxpool.Pool, reg *metrics.Registry) error {
 	if pool == nil {
-		return errors.New("dashboard: пул БД не получен (postgres.dsn обязателен)")
+		return errors.New("dashboard: the DB pool is not provided (postgres.dsn is required)")
 	}
 
 	// The stream depths — via the same narrow API as monitor and

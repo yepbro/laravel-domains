@@ -28,7 +28,7 @@ func main() {
 	// A configuration error — before the logger is initialized: stderr and exit code 1.
 	cfg, err := config.Load()
 	if err != nil {
-		log.Fatalf("[web] конфигурация: %v", err)
+		log.Fatalf("[web] configuration: %v", err)
 	}
 	logger := service.NewLogger("web", cfg)
 
@@ -60,7 +60,7 @@ func main() {
 // framework.
 func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgxpool.Pool, reg *metrics.Registry) error {
 	if pool == nil {
-		return errors.New("web: пул БД не получен (postgres.dsn обязателен)")
+		return errors.New("web: the DB pool is not provided (postgres.dsn is required)")
 	}
 	srv, err := web.New(pool, cfg, web.Options{Log: logger, Metrics: reg})
 	if err != nil {

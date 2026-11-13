@@ -36,7 +36,7 @@ func main() {
 	// A configuration error — before the logger is initialized: stderr and exit code 1.
 	cfg, err := config.Load()
 	if err != nil {
-		log.Fatalf("[scheduler] конфигурация: %v", err)
+		log.Fatalf("[scheduler] configuration: %v", err)
 	}
 	logger := service.NewLogger("scheduler", cfg)
 
@@ -96,7 +96,7 @@ func main() {
 // return nil.
 func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgxpool.Pool, reg *metrics.Registry) error {
 	if pool == nil {
-		return errors.New("scheduler: пул БД не получен (postgres.dsn обязателен)")
+		return errors.New("scheduler: the DB pool is not provided (postgres.dsn is required)")
 	}
 
 	rdb := queue.NewClient(cfg.Redis.Addr)
@@ -127,7 +127,7 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		return err
 	}
 	if len(unknownZones) > 0 {
-		logger.Warn("веса зон: нет в справочнике zones (создаёт ingest первым файлом) — проверяются с весом 1 до рестарта с появившейся зоной",
+		logger.Warn("zone weights: not in the zones reference table (ingest creates it with the first file) — checked with weight 1 until a restart with the zone present",
 			"zones", strings.Join(unknownZones, ", "))
 	}
 

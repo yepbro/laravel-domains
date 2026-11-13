@@ -107,7 +107,7 @@ type generator struct {
 }
 
 func main() {
-	root := flag.String("root", ".", "корень репозитория")
+	root := flag.String("root", ".", "repository root")
 	flag.Parse()
 
 	cfgBytes, err := os.ReadFile(filepath.Join(*root, "deploy/docker/testbed/scenarios.yaml"))
@@ -119,7 +119,7 @@ func main() {
 		log.Fatalf("testbedgen: scenarios.yaml: %v", err)
 	}
 	if len(cfg.Zones) == 0 {
-		log.Fatal("testbedgen: не задано ни одной зоны")
+		log.Fatal("testbedgen: no zones defined")
 	}
 
 	g := &generator{cfg: cfg, zones: map[string]*zoneData{}, baseDir: *root}
@@ -170,7 +170,7 @@ func (g *generator) run() {
 	g.writeZones()
 	g.writeZonesConf()
 	g.writeCaddyfile()
-	fmt.Printf("testbedgen: готово: зон=%d, сценариев=%d\n", len(g.zones), len(g.cfg.Scenarios))
+	fmt.Printf("testbedgen: done: zones=%d, scenarios=%d\n", len(g.zones), len(g.cfg.Scenarios))
 }
 
 // ---------------------------------------------------------------- scenarios
@@ -286,7 +286,7 @@ func (g *generator) addSamples(baseZone string) {
 	samplesDir := filepath.Join(g.baseDir, "testdata/laravel-samples")
 	entries, err := os.ReadDir(samplesDir)
 	if err != nil {
-		log.Printf("testbedgen: каталог образцов не найден (%v) — пропускаю", err)
+		log.Printf("testbedgen: samples directory not found (%v) — skipping", err)
 		return
 	}
 	for _, e := range entries {
@@ -561,7 +561,7 @@ func spaPage(title string) string {
 func puny(name string) string {
 	p, err := idna.Lookup.ToASCII(name)
 	if err != nil {
-		log.Fatalf("testbedgen: некорректное имя %q: %v", name, err)
+		log.Fatalf("testbedgen: invalid name %q: %v", name, err)
 	}
 	return p
 }

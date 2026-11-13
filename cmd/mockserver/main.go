@@ -79,7 +79,7 @@ func routeByHost(next http.Handler) http.Handler {
 func main() {
 	certs, err := buildCerts()
 	if err != nil {
-		log.Fatalf("mockserver: генерация сертификатов: %v", err)
+		log.Fatalf("mockserver: certificate generation: %v", err)
 	}
 
 	go func() {
@@ -88,7 +88,7 @@ func main() {
 			_, _ = w.Write([]byte("ok\n"))
 		})
 		mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
-			_, _ = fmt.Fprint(w, "# HELP mockserver_up Сервер запущен.\n# TYPE mockserver_up gauge\nmockserver_up 1\n")
+			_, _ = fmt.Fprint(w, "# HELP mockserver_up Server is up.\n# TYPE mockserver_up gauge\nmockserver_up 1\n")
 		})
 		srv := &http.Server{Addr: ":8080", Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 		if err := srv.ListenAndServe(); err != nil {
@@ -102,7 +102,7 @@ func main() {
 
 	httpSrv := &http.Server{Addr: ":80", Handler: routed, ReadHeaderTimeout: 10 * time.Second}
 	go func() {
-		log.Println("mockserver: HTTP на :80")
+		log.Println("mockserver: HTTP on :80")
 		if err := httpSrv.ListenAndServe(); err != nil {
 			log.Fatalf("mockserver: http: %v", err)
 		}
@@ -118,7 +118,7 @@ func main() {
 		},
 	}
 	tlsSrv := &http.Server{Addr: ":443", Handler: routed, ReadHeaderTimeout: 10 * time.Second, TLSConfig: tlsCfg}
-	log.Println("mockserver: TLS на :443")
+	log.Println("mockserver: TLS on :443")
 	if err := tlsSrv.ListenAndServeTLS("", ""); err != nil {
 		log.Fatalf("mockserver: tls: %v", err)
 	}
@@ -174,7 +174,7 @@ func registerRoutes(mux *http.ServeMux) {
 		case <-r.Context().Done(): // the client is gone — we do not hold the goroutine
 			return
 		}
-		writePage(w, "slow", "наконец-то")
+		writePage(w, "slow", "finally")
 	})
 
 	// Tarpit: serves the body at the rate bytes/s, endlessly.
@@ -259,7 +259,7 @@ func registerRoutes(mux *http.ServeMux) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Header().Set("Content-Length", "1048576")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("<html><body>тут будет очень много контент"))
+		_, _ = w.Write([]byte("<html><body>a lot of content will go here"))
 		if f, ok := w.(http.Flusher); ok {
 			f.Flush()
 		}
@@ -300,7 +300,7 @@ func registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/cookies", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Add("Set-Cookie", "XSRF-TOKEN=eyJpdiI6ZmFrZVRva2VuOjE2Oml7InZhbCI6IjEyMzQ1Njc4OTAiLCJpdiI6ImFiY2RlZmFhYmNkZWYiLCJ0YWciOiIifQ==; expires=Wed, 21 Oct 2026 07:28:00 GMT; path=/; secure")
 		w.Header().Add("Set-Cookie", "laravel_session=eyJpdiI6c2Vzc2lvbjoxNjppeyJpc3MiOiJodHRwczovL2V4YW1wbGUifQ==; path=/; httponly; samesite=lax")
-		writePage(w, "cookies", "страница с куками Laravel")
+		writePage(w, "cookies", "Laravel cookies page")
 	})
 
 	// Echo of the Host header — useful when debugging proxies/virtual
@@ -311,7 +311,7 @@ func registerRoutes(mux *http.ServeMux) {
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" {
-			writePage(w, "mockserver", "запросы уходят на /tarpit, /huge, /zipbomb, ...")
+			writePage(w, "mockserver", "requests go to /tarpit, /huge, /zipbomb, ...")
 			return
 		}
 		http.NotFound(w, r)

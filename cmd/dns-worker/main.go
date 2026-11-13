@@ -43,7 +43,7 @@ func main() {
 	// A configuration error — before the logger is initialized: stderr and exit code 1.
 	cfg, err := config.Load()
 	if err != nil {
-		log.Fatalf("[dns-worker] конфигурация: %v", err)
+		log.Fatalf("[dns-worker] configuration: %v", err)
 	}
 	logger := service.NewLogger("dns-worker", cfg)
 
@@ -88,7 +88,7 @@ func main() {
 // joined before the defer-closes of rdb/the resolvers (T-232).
 func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgxpool.Pool, reg *metrics.Registry) error {
 	if pool == nil {
-		return errors.New("dns-worker: пул БД не получен (postgres.dsn обязателен)")
+		return errors.New("dns-worker: the DB pool is not provided (postgres.dsn is required)")
 	}
 
 	// The resolver chain (T-107): the primary — the first of dns.resolvers
@@ -121,7 +121,7 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		fbopt.Addr = addr
 		fc, err := dnsclient.NewClient(ctx, fbopt)
 		if err != nil {
-			return fmt.Errorf("dns-worker: резервный резолвер %s: %w", addr, err)
+			return fmt.Errorf("dns-worker: fallback resolver %s: %w", addr, err)
 		}
 		clients = append(clients, fc)
 		chain = append(chain, dnsclient.FallbackTarget{Addr: addr, Resolver: fc})
