@@ -1484,6 +1484,7 @@ semantics — [`services.md`](services.md); delivery setup —
 | `timeout` | `CRAWLER_WEB_TIMEOUT` | duration | `60s` |
 | `live_concurrency` | `CRAWLER_WEB_LIVE_CONCURRENCY` | number | `4` |
 | `public_host` | `CRAWLER_WEB_PUBLIC_HOST` | string (host[:port]) | `""` |
+| `cors.allowed_origins` | `CRAWLER_WEB_CORS_ALLOWED_ORIGINS` | list (comma-separated in the env) | `[]` (CORS off) |
 
 `listen` — the landing page's public address: the system's public port
 for
@@ -1558,6 +1559,33 @@ connection is a TLS fact; behind a
 proxy — `X-Forwarded-Proto` from a trusted peer (loopback/unix, the
 same
 principle as the visitor's address); an untrusted value is ignored.
+`cors.allowed_origins` —
+the CORS allowlist of the `/api/*` endpoints (L-04, TZ-ld-landing §7.2):
+exact origins `scheme://host[:port]`, compared byte-for-byte with the
+request's `Origin`. An entry must be the browser's origin serialization
+— a lowercase scheme and host, an IDN host in punycode, no wildcard, no
+explicit default port (`:443`/`:80`), no path/query/userinfo: anything
+that could never match is rejected at startup (a silently never-matching
+origin would look like "CORS does not work" with a 200 on the wire).
+The static landings
+of the separate ld-landing repo live on their own domains
+(`sites.laravel.city`, `sites.laracity.ru`) and call this API
+(`POST /api/check-domain`, `GET /api/v1/landing/stats`) straight from
+the browser — a cross-origin fetch needs the server's echo
+`Access-Control-Allow-Origin: <the exact origin>` (never `*`) with
+`Vary: Origin`; a preflight `OPTIONS` of an allowlisted origin gets
+`204` with `Access-Control-Allow-Methods: GET, POST, OPTIONS`,
+`Access-Control-Allow-Headers: Content-Type` and
+`Access-Control-Max-Age: 600` (and does not spend the form's rate
+limit — the preflight is not a request to the endpoint). A foreign
+origin gets no CORS headers (the browser blocks the read itself; the
+request still passes to the handler — the server's controls are the
+rate limit and the live-check budget, not CORS). An empty/absent list —
+CORS is off entirely: no CORS headers, and `OPTIONS` on the API routes
+is the router's usual 405 (the behavior before L-04); an empty value of
+the environment variable counts as unset (the shared rule of the
+overrides), so the switch is the YAML list itself. The production
+value: `https://sites.laravel.city,https://sites.laracity.ru`.
 
 ### `dashboard` (the dashboard, dashboard spec §8.1)
 

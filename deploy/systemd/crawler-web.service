@@ -22,6 +22,10 @@
 # http://unix:/run/crawler-web/web.sock in nginx — the RuntimeDirectory
 # below creates the directory in /run (ProtectSystem=strict forbids the
 # rest).
+# The CORS allowlist of the /api/* endpoints (L-04; nginx passes the
+# browser's Origin as is): CRAWLER_WEB_CORS_ALLOWED_ORIGINS="https://sites.laravel.city,https://sites.laracity.ru"
+# in crawler.env — an absent list (or an empty YAML list) means CORS off;
+# an empty env value counts as unset, like everywhere in the config.
 
 [Unit]
 Description=Domain Crawler — web (public landing page)

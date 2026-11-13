@@ -28,6 +28,10 @@
 //   - GET /static/*    — the landing static assets (go:embed; app.css —
 //     a Tailwind generated artifact, not stored in git — make web-css /
 //     the css stage of Dockerfile.go, T-124).
+//
+// The /api/* routes are wrapped with the CORS allowlist
+// web.cors.allowed_origins (L-04, TZ-ld-landing §7.2; internal/web/cors.go):
+// an empty list — CORS is off, the behavior before L-04.
 package web
 
 import (
@@ -125,6 +129,12 @@ type Server struct {
 	liveCircuit checker.LiveCircuit
 	liveClosed  bool            // the circuit is closed forever (the Run exit) — no more assembly
 	lifeCtx     context.Context // the circuit lifetime context (set in Run)
+
+	// corsOrigins — the CORS allowlist of the /api/* surface (L-04):
+	// an exact origin → allowed; the set is built once in New from
+	// web.cors.allowed_origins. nil/empty — CORS is off (no headers, no
+	// OPTIONS special-casing — the behavior before L-04).
+	corsOrigins map[string]bool
 }
 
 // landingVM — the landing render data: the locale, the locale list, the
@@ -182,14 +192,27 @@ func New(db DB, cfg *config.Config, opts Options) (*Server, error) {
 	if live < 1 {
 		live = 1 // config without Default/Validate: at least one slot
 	}
+	// The CORS allowlist (L-04): an exact-match set built once; the
+	// empty list leaves it empty — apiCORS then passes the router
+	// through unchanged (CORS off). An empty entry is skipped: the
+	// lookup of an absent Origin header is also "" and must not match
+	// (normalize drops empties; a hand-built Config is also covered).
+	cors := make(map[string]bool, len(cfg.Web.CORS.AllowedOrigins))
+	for _, o := range cfg.Web.CORS.AllowedOrigins {
+		if o == "" {
+			continue
+		}
+		cors[o] = true
+	}
 	return &Server{
-		db:      db,
-		opt:     opts,
-		tpl:     tpl,
-		cfg:     cfg,
-		limiter: newLimiter(cfg.Web.RateLimit, time.Minute),
-		liveSem: make(chan struct{}, live),
-		met:     NewMetrics(opts.Metrics),
+		db:          db,
+		opt:         opts,
+		tpl:         tpl,
+		cfg:         cfg,
+		limiter:     newLimiter(cfg.Web.RateLimit, time.Minute),
+		liveSem:     make(chan struct{}, live),
+		met:         NewMetrics(opts.Metrics),
+		corsOrigins: cors,
 	}, nil
 }
 
@@ -285,7 +308,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /static/", s.handleStatic)
 	mux.HandleFunc("GET /{$}", s.handleRoot)
 	mux.HandleFunc("GET /", s.handleLanding)
-	return mux
+	// The /api/* surface carries the CORS policy (L-04, TZ-ld-landing
+	// §7.2): with a non-empty web.cors.allowed_origins the wrapper adds
+	// the allowlist echo and answers preflights; the landing routes and
+	// /healthz pass through untouched.
+	return s.apiCORS(mux)
 }
 
 // Run — the lifecycle: the web.listen listener, a graceful stop on ctx

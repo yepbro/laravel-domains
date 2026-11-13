@@ -810,6 +810,28 @@ type Web struct {
 	// X-Forwarded-Proto of a trusted peer (see internal/web publicScheme).
 	// An extension to the minimal set of spec 5.10.
 	PublicHost string `yaml:"public_host"`
+	// CORS — the browser policy of the /api/* endpoints (L-04,
+	// TZ-ld-landing §7.2): the static landings of the separate
+	// ld-landing repo live on their own domains and call this API
+	// straight from the browser — a cross-origin fetch needs the exact
+	// allowlist below. An empty list (the default) — CORS is off.
+	CORS CORS `yaml:"cors"`
+}
+
+// CORS — the cross-origin policy of the web /api/* surface (L-04,
+// TZ-ld-landing §7.2). The section is an extension outside the spec 5.10
+// set, like public_host.
+type CORS struct {
+	// AllowedOrigins — the exact origins allowed to call /api/* from a
+	// browser: scheme://host[:port] ("https://sites.laravel.city"),
+	// compared byte-for-byte with the browser's Origin header. No
+	// wildcards: the value is echoed into Access-Control-Allow-Origin,
+	// and a "*" would be a different (public) policy — the credentials
+	// of the form are the visitor's IP (the rate limit), but the exact
+	// allowlist keeps the API surfaces explicit. An empty list — CORS
+	// is off: no CORS headers and no OPTIONS special-casing (the
+	// behavior before L-04).
+	AllowedOrigins []string `yaml:"allowed_origins"`
 }
 
 // Log — the logging level of the services (the internal/service framework).
@@ -1262,6 +1284,11 @@ func Default() *Config {
 			// publicly published landing sets web.public_host to its own
 			// domain.
 			PublicHost: "",
+			// The CORS allowlist is empty: the /api/* surface is
+			// same-origin (the SSR landing before L-04). The static
+			// landings of the ld-landing repo (L-04, TZ-ld-landing
+			// §7.2) enable it with their own domains.
+			CORS: CORS{},
 		},
 		Dashboard: Dashboard{
 			// Loopback: publishing outward is a reverse proxy with TLS
@@ -1345,6 +1372,24 @@ func (c *Config) normalize() {
 	// punycode is the operator's concern; the shape is checked by
 	// Validate).
 	c.Web.PublicHost = strings.TrimSpace(c.Web.PublicHost)
+	// The CORS allowlist (L-04) — the origins without edge spaces; empty
+	// entries (a trailing comma of the environment list) are dropped and
+	// duplicates after trimming collapse (the style of the zone paths):
+	// the list is a set for an exact byte-for-byte comparison, the shape
+	// of each origin is checked by Validate.
+	if len(c.Web.CORS.AllowedOrigins) > 0 {
+		seen := make(map[string]bool, len(c.Web.CORS.AllowedOrigins))
+		out := make([]string, 0, len(c.Web.CORS.AllowedOrigins))
+		for _, o := range c.Web.CORS.AllowedOrigins {
+			o = strings.TrimSpace(o)
+			if o == "" || seen[o] {
+				continue
+			}
+			seen[o] = true
+			out = append(out, o)
+		}
+		c.Web.CORS.AllowedOrigins = out
+	}
 	// The zone weight keys — punycode names in lower case (like
 	// zones.name); the map is rebuilt in ascending key order so that a
 	// collision after folding ("Com" and "com" in one YAML) resolves
@@ -2103,6 +2148,41 @@ func (c *Config) Validate() error {
 				(!strings.HasPrefix(hostPart, "[") || !strings.HasSuffix(hostPart, "]"))) {
 			problems = append(problems, fmt.Sprintf(
 				"web.public_host: expected host[:port] without scheme, path or userinfo (e.g. crawler.example.com, IPv6 in brackets), got %q", h))
+		}
+	}
+	// The CORS allowlist of the /api/* surface (L-04, TZ-ld-landing
+	// §7.2): every entry is an exact origin — scheme http(s)://host[:port]
+	// without a path, query, fragment or userinfo. The comparison with
+	// the browser's Origin is byte-for-byte (internal/web/cors.go), so an
+	// entry outside the serialization the browser sends would silently
+	// never match — CORS just would not work for that origin, with a 200
+	// on the wire and nothing in the log. Such entries are rejected here
+	// as a configuration error instead (the style of public_host: the
+	// operator's value is not silently rewritten): an uppercase scheme or
+	// host (the browser lowercases both), an IDN host (the browser sends
+	// punycode), a wildcard label, an explicit default port (:443/:80 —
+	// the URL serialization omits it), a trailing FQDN dot. An empty
+	// list — CORS is off (no range to check).
+	for _, o := range c.Web.CORS.AllowedOrigins {
+		u, err := url.Parse(o)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" ||
+			u.Path != "" || u.RawQuery != "" || u.Fragment != "" || u.User != nil {
+			problems = append(problems, fmt.Sprintf(
+				"web.cors.allowed_origins: %q — expected an exact origin scheme://host[:port] (e.g. https://sites.laravel.city), without a path, query, fragment or userinfo", o))
+			continue
+		}
+		// Not the browser's origin serialization: can never match the
+		// byte-for-byte comparison. url.Parse lowercases the scheme but
+		// keeps the host as is; the raw string check catches "HTTPS://…".
+		if o != u.Scheme+"://"+u.Host ||
+			strings.ToLower(u.Host) != u.Host ||
+			strings.Contains(u.Host, "*") ||
+			strings.HasSuffix(u.Host, ".") ||
+			strings.IndexFunc(u.Host, func(r rune) bool { return r > unicode.MaxASCII }) >= 0 ||
+			(u.Scheme == "https" && u.Port() == "443") ||
+			(u.Scheme == "http" && u.Port() == "80") {
+			problems = append(problems, fmt.Sprintf(
+				"web.cors.allowed_origins: %q — not the browser's origin serialization: a lowercase scheme and host, an IDN host in punycode, no wildcard label, no explicit default port, no trailing dot; e.g. https://sites.laravel.city", o))
 		}
 	}
 

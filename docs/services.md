@@ -1614,6 +1614,34 @@ into
 (T-221, the "Working logic metrics" table below). Templates —
 `html/template` + `go:embed`; no new dependencies.
 
+The CORS policy of the `/api/*` surface (L-04, TZ-ld-landing §7.2; the
+allowlist wrapper — `internal/web/cors.go`): the static landings of the
+separate ld-landing repo live on their own domains
+(`sites.laravel.city`, `sites.laracity.ru`) and call this API straight
+from the browser, so `/api/check-domain` and `/api/v1/landing/stats`
+answer with the exact-allowlist echo when `web.cors.allowed_origins`
+holds the request's `Origin`: `Access-Control-Allow-Origin: <the exact
+origin>` (never `*`) and `Vary: Origin` — the latter on every `/api/*`
+answer while the allowlist is set (the stats endpoint is publicly
+cacheable, `max-age=60`, and a cache must key on `Origin` — otherwise
+it would serve one origin's Allow-Origin to a request of another). A
+preflight `OPTIONS` of an allowlisted origin — `204` with
+`Access-Control-Allow-Methods: GET, POST, OPTIONS`,
+`Access-Control-Allow-Headers: Content-Type` and
+`Access-Control-Max-Age: 600`, without calling the endpoint (a
+preflight does not spend the form's rate limit; the JSON body of the
+form makes the browser preflight every check). A foreign or absent
+`Origin` — no CORS headers, the request passes to the handler as is:
+the browser blocks the script's read itself, and the server's controls
+(the rate limit, the live-check budget) are origin-independent. An
+empty/absent allowlist — CORS is off entirely: no CORS headers, and
+`OPTIONS` on the API routes stays the router's 405 (the behavior before
+L-04). The non-API routes (the landing pages, `/healthz`, statics) are
+not wrapped at all. A note for a future shared cache: nginx
+`proxy_cache` ignores `Vary` (its key is `proxy_cache_key`) — if one is
+ever put in front of the API, the key must include `$http_origin`,
+otherwise the exact cross-origin confusion `Vary` prevents returns.
+
 The JSON contract of `GET /api/v1/landing/stats` (the landing API
 section, L-03; the source of truth — the view model
 `internal/web/stats.go`): `stats` — the counters `zones` (active),
@@ -1650,7 +1678,7 @@ embeds the real CSS), or
 `make web-css` for dev viewing (a one-off docker run).
 
 Configuration — the `web` section (`listen`/`rate_limit`/`timeout`/
-`live_concurrency`/`public_host`,
+`live_concurrency`/`public_host`/`cors.allowed_origins`,
 [`configuration.md`](configuration.md)). Deployment (T-124):
 dev — the `web` compose service of the app profile (the landing port is
 published on the host's `127.0.0.1`, `WEB_PORT`); production — the

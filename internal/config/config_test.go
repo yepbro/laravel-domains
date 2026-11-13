@@ -145,6 +145,7 @@ func TestDefault(t *testing.T) {
 		{"web.rate_limit", c.Web.RateLimit, 4},
 		{"web.timeout", c.Web.Timeout.D(), 60 * time.Second},
 		{"web.live_concurrency", c.Web.LiveConcurrency, 4},
+		{"web.cors.allowed_origins", len(c.Web.CORS.AllowedOrigins), 0}, // CORS off by default (L-04)
 		{"dashboard.listen", c.Dashboard.Listen, "127.0.0.1:8090"},
 		{"dashboard.refresh", c.Dashboard.Refresh.D(), 5 * time.Second},
 		{"dashboard.status_cache_ttl", c.Dashboard.StatusCacheTTL.D(), time.Minute},
@@ -731,6 +732,7 @@ func TestEnvOverrides(t *testing.T) {
 		"CRAWLER_WEB_LIVE_CONCURRENCY":                "7",
 		"CRAWLER_WEB_TIMEOUT":                         "90s",
 		"CRAWLER_WEB_PUBLIC_HOST":                     " crawler.example.com ",
+		"CRAWLER_WEB_CORS_ALLOWED_ORIGINS":            " https://sites.laravel.city, https://sites.laracity.ru , ,",
 		"CRAWLER_DASHBOARD_LISTEN":                    "127.0.0.1:8191",
 		"CRAWLER_DASHBOARD_REFRESH_INTERVAL":          "30s",
 		"CRAWLER_DASHBOARD_STATUS_CACHE_TTL":          "3m",
@@ -845,6 +847,8 @@ func TestEnvOverrides(t *testing.T) {
 		{"web.timeout", cfg.Web.Timeout.D(), 90 * time.Second},
 		{"web.live_concurrency", cfg.Web.LiveConcurrency, 7},
 		{"web.public_host (space normalization)", cfg.Web.PublicHost, "crawler.example.com"},
+		{"web.cors.allowed_origins (a full list from env)", strings.Join(cfg.Web.CORS.AllowedOrigins, "|"),
+			"https://sites.laravel.city|https://sites.laracity.ru"},
 		{"dashboard.listen", cfg.Dashboard.Listen, "127.0.0.1:8191"},
 		{"dashboard.refresh", cfg.Dashboard.Refresh.D(), 30 * time.Second},
 		{"dashboard.status_cache_ttl", cfg.Dashboard.StatusCacheTTL.D(), 3 * time.Minute},
@@ -1310,6 +1314,45 @@ func TestValidate(t *testing.T) {
 		{"web.public_host IPv6 without brackets", func(c *Config) { c.Web.PublicHost = "::1" }, "web.public_host"},
 		{"web.public_host userinfo", func(c *Config) { c.Web.PublicHost = "user@crawler.example.com" }, "web.public_host"},
 		{"web.public_host control character", func(c *Config) { c.Web.PublicHost = "crawler\x00.example.com" }, "web.public_host"},
+		{"web.cors.allowed_origins without a scheme", func(c *Config) {
+			c.Web.CORS.AllowedOrigins = []string{"sites.laravel.city"}
+		}, "web.cors.allowed_origins"},
+		{"web.cors.allowed_origins a wildcard", func(c *Config) {
+			c.Web.CORS.AllowedOrigins = []string{"*"}
+		}, "web.cors.allowed_origins"},
+		{"web.cors.allowed_origins with a path", func(c *Config) {
+			c.Web.CORS.AllowedOrigins = []string{"https://sites.laravel.city/"}
+		}, "web.cors.allowed_origins"},
+		{"web.cors.allowed_origins with a query", func(c *Config) {
+			c.Web.CORS.AllowedOrigins = []string{"https://sites.laravel.city/?x=1"}
+		}, "web.cors.allowed_origins"},
+		{"web.cors.allowed_origins with userinfo", func(c *Config) {
+			c.Web.CORS.AllowedOrigins = []string{"https://user@sites.laravel.city"}
+		}, "web.cors.allowed_origins"},
+		{"web.cors.allowed_origins not http(s)", func(c *Config) {
+			c.Web.CORS.AllowedOrigins = []string{"ftp://sites.laravel.city"}
+		}, "web.cors.allowed_origins"},
+		{"web.cors.allowed_origins the string null", func(c *Config) {
+			c.Web.CORS.AllowedOrigins = []string{"null"}
+		}, "web.cors.allowed_origins"},
+		{"web.cors.allowed_origins an uppercase scheme", func(c *Config) {
+			c.Web.CORS.AllowedOrigins = []string{"HTTPS://sites.laravel.city"}
+		}, "web.cors.allowed_origins"},
+		{"web.cors.allowed_origins an uppercase host", func(c *Config) {
+			c.Web.CORS.AllowedOrigins = []string{"https://Sites.Laravel.City"}
+		}, "web.cors.allowed_origins"},
+		{"web.cors.allowed_origins a wildcard label", func(c *Config) {
+			c.Web.CORS.AllowedOrigins = []string{"https://*.laravel.city"}
+		}, "web.cors.allowed_origins"},
+		{"web.cors.allowed_origins an explicit default port", func(c *Config) {
+			c.Web.CORS.AllowedOrigins = []string{"https://sites.laravel.city:443"}
+		}, "web.cors.allowed_origins"},
+		{"web.cors.allowed_origins a trailing dot", func(c *Config) {
+			c.Web.CORS.AllowedOrigins = []string{"https://sites.laravel.city."}
+		}, "web.cors.allowed_origins"},
+		{"web.cors.allowed_origins an IDN host", func(c *Config) {
+			c.Web.CORS.AllowedOrigins = []string{"https://сайт.рф"}
+		}, "web.cors.allowed_origins"},
 		{"malformed dashboard.listen", func(c *Config) { c.Dashboard.Listen = "8090" }, "dashboard.listen"},
 		{"dashboard.refresh 0", func(c *Config) { c.Dashboard.Refresh = 0 }, "dashboard.refresh"},
 		{"dashboard.refresh under a second", func(c *Config) { c.Dashboard.Refresh = Duration(500 * time.Millisecond) }, "dashboard.refresh"},
@@ -1355,10 +1398,12 @@ func TestValidate(t *testing.T) {
 	c.Scheduler.ZoneWeights = map[string]int{"com": 1, "co.uk": 500, "xn--p1ai": 1000} // the weight bounds
 	c.Web.Listen = "/run/crawler-web/web.sock"                                         // a unix socket — the public web entry variant (T-124)
 	c.Web.PublicHost = "crawler.example.com:8443"                                      // the canonical host with a port (T-227)
-	c.Dashboard.Refresh = Duration(5 * time.Minute)                                    // the upper bound of the snapshot period (the dashboard spec §8.3)
-	c.Dashboard.Probes = map[string]string{"dns-worker": "http://dns-worker:9102"}     // a liveness probe (the dashboard spec §5.8)
-	c.Monitor.SlowQueryInterval = 0                                                    // slow queries disabled — allowed (T-177)
-	c.Monitor.SlowQueryMinDuration = 0                                                 // a threshold of 0 — the loop default (T-177)
+	c.Web.CORS.AllowedOrigins = []string{"https://sites.laravel.city",                 // the exact origins of the L-04 allowlist
+		"http://localhost:8080", "https://[2001:db8::1]:8443"} // a dev origin and an IPv6 literal with a port
+	c.Dashboard.Refresh = Duration(5 * time.Minute)                                // the upper bound of the snapshot period (the dashboard spec §8.3)
+	c.Dashboard.Probes = map[string]string{"dns-worker": "http://dns-worker:9102"} // a liveness probe (the dashboard spec §5.8)
+	c.Monitor.SlowQueryInterval = 0                                                // slow queries disabled — allowed (T-177)
+	c.Monitor.SlowQueryMinDuration = 0                                             // a threshold of 0 — the loop default (T-177)
 	c.Subdomains = make([]string, maxSubdomains)
 	for i := range c.Subdomains {
 		c.Subdomains[i] = fmt.Sprintf("s%d", i)

@@ -208,6 +208,11 @@ func envSpecs() []envSpec {
 		{"CRAWLER_WEB_LIVE_CONCURRENCY", setInt(func(c *Config) *int { return &c.Web.LiveConcurrency })},
 		{"CRAWLER_WEB_TIMEOUT", setDuration(func(c *Config) *Duration { return &c.Web.Timeout })},
 		{"CRAWLER_WEB_PUBLIC_HOST", setString(func(c *Config) *string { return &c.Web.PublicHost })},
+		// The CORS allowlist (L-04): comma-separated exact origins; empty
+		// elements are dropped by normalize (the setStrings semantics),
+		// the shape — by Validate. The value replaces the YAML list
+		// entirely.
+		{"CRAWLER_WEB_CORS_ALLOWED_ORIGINS", setStrings(func(c *Config) *[]string { return &c.Web.CORS.AllowedOrigins })},
 		{"CRAWLER_DASHBOARD_LISTEN", setString(func(c *Config) *string { return &c.Dashboard.Listen })},
 		{"CRAWLER_DASHBOARD_REFRESH_INTERVAL", setDuration(func(c *Config) *Duration { return &c.Dashboard.Refresh })},
 		{"CRAWLER_DASHBOARD_STATUS_CACHE_TTL", setDuration(func(c *Config) *Duration { return &c.Dashboard.StatusCacheTTL })},
