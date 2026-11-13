@@ -63,7 +63,7 @@ func checkStateOf(ctx context.Context, t *testing.T, pool *pgxpool.Pool, zone in
 		"SELECT check_state, status, queued_at, last_checked_at, temp_attempts, flags "+
 			"FROM domains WHERE zone_id = $1 AND id = $2", zone, id,
 	).Scan(&r.state, &r.status, &queuedAt, &lastChecked, &r.tempAttempts, &flags); err != nil {
-		t.Fatalf("чтение домена %d: %v", id, err)
+		t.Fatalf("read domain %d: %v", id, err)
 	}
 	r.queuedAtNull = queuedAt == nil
 	r.lastChecked = lastChecked != nil
@@ -109,19 +109,19 @@ func TestCheckState_SpecTransitions(t *testing.T) {
 	// R10: inserting a new domain via an add file — status=new, pending, no lease.
 	add := checkStateStageAdd(ctx, t, pool, zone, "spec")
 	if add.Inserted != 1 || add.Revived != 0 {
-		t.Fatalf("ApplyAdd = %+v, хочу Inserted=1", add)
+		t.Fatalf("ApplyAdd = %+v, want Inserted=1", add)
 	}
 	var id int64
 	if err := pool.QueryRow(ctx,
 		"SELECT id FROM domains WHERE zone_id = $1 AND label = 'spec'", zone,
 	).Scan(&id); err != nil {
-		t.Fatalf("id вставленного: %v", err)
+		t.Fatalf("the inserted row's id: %v", err)
 	}
 	if r := checkStateOf(ctx, t, pool, zone, id); r.state != int16(model.CheckStatePending) ||
 		r.status != int16(model.StatusNew) || !r.queuedAtNull {
-		t.Fatalf("после вставки = %+v, хочу new/pending/queued_at NULL (Р10)", r)
+		t.Fatalf("after the insert = %+v, want new/pending/queued_at NULL (R10)", r)
 	}
-	countersVerifyEmpty(t, pool, "после вставки (Р10)")
+	countersVerifyEmpty(t, pool, "after the insert (R10)")
 
 	// R1: scheduler enqueueing — queued, the lease started, the
 	// http_published bit of the previous episode cleared, the q:dns
@@ -129,69 +129,69 @@ func TestCheckState_SpecTransitions(t *testing.T) {
 	if _, err := pool.Exec(ctx,
 		"UPDATE domains SET flags = flags | $1 WHERE zone_id = $2 AND id = $3",
 		int16(model.FlagHTTPPublished), zone, id); err != nil {
-		t.Fatalf("сеем бит http_published: %v", err)
+		t.Fatalf("seeding the http_published bit: %v", err)
 	}
 	eres, err := scheduler.EnqueueBatch(ctx, pool, q, []scheduler.DispatchRow{
 		{ZoneID: zone, DomainID: id, Name: "spec.fsm.test"},
 	})
 	if err != nil || eres.Queued != 1 || eres.Published != 1 {
-		t.Fatalf("EnqueueBatch = %+v err=%v, хочу Queued=Published=1 (Р1)", eres, err)
+		t.Fatalf("EnqueueBatch = %+v err=%v, want Queued=Published=1 (R1)", eres, err)
 	}
 	if r := checkStateOf(ctx, t, pool, zone, id); r.state != int16(model.CheckStateQueued) ||
 		r.queuedAtNull || r.httpPublished {
-		t.Fatalf("после постановки = %+v, хочу queued/queued_at NOT NULL/бит снят (Р1)", r)
+		t.Fatalf("after the enqueue = %+v, want queued/queued_at NOT NULL/the bit cleared (R1)", r)
 	}
-	countersVerifyEmpty(t, pool, "после постановки (Р1)")
+	countersVerifyEmpty(t, pool, "after the enqueue (R1)")
 
 	// R3: recording the DNS result "there are addresses" — done, the
 	// lease is finished, the status verdict belongs to the HTTP stage (not
 	// written), the check mark is present.
 	ok, err := dnsworker.RecordEpisode(ctx, pool, zone, id, dnsworker.EpisodeResult{Mask: 1}, nil)
 	if err != nil || !ok {
-		t.Fatalf("RecordEpisode: ok=%v err=%v (Р3)", ok, err)
+		t.Fatalf("RecordEpisode: ok=%v err=%v (R3)", ok, err)
 	}
 	if r := checkStateOf(ctx, t, pool, zone, id); r.state != int16(model.CheckStateDone) ||
 		!r.queuedAtNull || !r.lastChecked || r.status != int16(model.StatusNew) {
-		t.Fatalf("после записи DNS = %+v, хочу done/queued_at NULL/отметка есть/статус не тронут (Р3)", r)
+		t.Fatalf("after the DNS recording = %+v, want done/queued_at NULL/the mark present/the status untouched (R3)", r)
 	}
-	countersVerifyEmpty(t, pool, "после записи DNS (Р3)")
+	countersVerifyEmpty(t, pool, "after the DNS recording (R3)")
 
 	// R7: the daily age-based recheck — done → pending, the status is
 	// kept, no lease.
 	if _, err := pool.Exec(ctx,
 		"UPDATE domains SET last_checked_at = current_date - 400 WHERE zone_id = $1 AND id = $2",
 		zone, id); err != nil {
-		t.Fatalf("возраст проверки: %v", err)
+		t.Fatalf("the check age: %v", err)
 	}
 	rk, err := scheduler.RecheckOnce(ctx, pool, scheduler.RecheckOptions{Interval: 300 * 24 * time.Hour})
 	if err != nil || rk.Domains != 1 {
-		t.Fatalf("RecheckOnce = %+v err=%v, хочу 1 (Р7)", rk, err)
+		t.Fatalf("RecheckOnce = %+v err=%v, want 1 (R7)", rk, err)
 	}
 	if r := checkStateOf(ctx, t, pool, zone, id); r.state != int16(model.CheckStatePending) ||
 		!r.queuedAtNull || r.status != int16(model.StatusNew) {
-		t.Fatalf("после перепроверки = %+v, хочу pending/queued_at NULL (Р7)", r)
+		t.Fatalf("after the recheck = %+v, want pending/queued_at NULL (R7)", r)
 	}
-	countersVerifyEmpty(t, pool, "после перепроверки (Р7)")
+	countersVerifyEmpty(t, pool, "after the recheck (R7)")
 
 	// R1 + R5: re-enqueueing and an expired lease — return to pending.
 	if _, err := scheduler.EnqueueBatch(ctx, pool, q, []scheduler.DispatchRow{
 		{ZoneID: zone, DomainID: id, Name: "spec.fsm.test"},
 	}); err != nil {
-		t.Fatalf("EnqueueBatch (Р1 повторно): %v", err)
+		t.Fatalf("EnqueueBatch (R1 again): %v", err)
 	}
 	if _, err := pool.Exec(ctx,
 		"UPDATE domains SET queued_at = now() - interval '2 hours' WHERE zone_id = $1 AND id = $2",
 		zone, id); err != nil {
-		t.Fatalf("возраст аренды: %v", err)
+		t.Fatalf("the lease age: %v", err)
 	}
 	lres, err := scheduler.LeaseOnce(ctx, pool, nil, scheduler.LeaseOptions{})
 	if err != nil || lres.Domains != 1 {
-		t.Fatalf("LeaseOnce = %+v err=%v, хочу 1 (Р5)", lres, err)
+		t.Fatalf("LeaseOnce = %+v err=%v, want 1 (R5)", lres, err)
 	}
 	if r := checkStateOf(ctx, t, pool, zone, id); r.state != int16(model.CheckStatePending) || !r.queuedAtNull {
-		t.Fatalf("после lease-возврата = %+v, хочу pending/queued_at NULL (Р5)", r)
+		t.Fatalf("after the lease return = %+v, want pending/queued_at NULL (R5)", r)
 	}
-	countersVerifyEmpty(t, pool, "после lease-возврата (Р5)")
+	countersVerifyEmpty(t, pool, "after the lease return (R5)")
 
 	// R2: the terminal DNS temp_error branch — done + temp_error, the
 	// attempt counter is kept (a new episode starts from scratch), the
@@ -199,20 +199,20 @@ func TestCheckState_SpecTransitions(t *testing.T) {
 	if _, err := scheduler.EnqueueBatch(ctx, pool, q, []scheduler.DispatchRow{
 		{ZoneID: zone, DomainID: id, Name: "spec.fsm.test"},
 	}); err != nil {
-		t.Fatalf("EnqueueBatch (перед Р2): %v", err)
+		t.Fatalf("EnqueueBatch (before R2): %v", err)
 	}
 	ok, err = dnsworker.RecordEpisode(ctx, pool, zone, id, dnsworker.EpisodeResult{
 		SetStatus: true,
 		Status:    model.StatusTempError,
 	}, nil)
 	if err != nil || !ok {
-		t.Fatalf("RecordEpisode temp_error: ok=%v err=%v (Р2)", ok, err)
+		t.Fatalf("RecordEpisode temp_error: ok=%v err=%v (R2)", ok, err)
 	}
 	if r := checkStateOf(ctx, t, pool, zone, id); r.state != int16(model.CheckStateDone) ||
 		r.status != int16(model.StatusTempError) || !r.queuedAtNull {
-		t.Fatalf("после temp_error-ветки DNS = %+v, хочу done/temp_error/queued_at NULL (Р2)", r)
+		t.Fatalf("after the DNS temp_error branch = %+v, want done/temp_error/queued_at NULL (R2)", r)
 	}
-	countersVerifyEmpty(t, pool, "после temp_error-ветки DNS (Р2)")
+	countersVerifyEmpty(t, pool, "after the DNS temp_error branch (R2)")
 
 	// R8: the temp_error retry — done → pending, temp_attempts + 1 (the
 	// maturity bucket of the past day is placed by hand: today's episodes
@@ -221,22 +221,22 @@ func TestCheckState_SpecTransitions(t *testing.T) {
 	if _, err := pool.Exec(ctx,
 		"UPDATE domains SET last_checked_at = current_date - 2 WHERE zone_id = $1 AND id = $2",
 		zone, id); err != nil {
-		t.Fatalf("возраст temp_error: %v", err)
+		t.Fatalf("the temp_error age: %v", err)
 	}
 	if _, err := pool.Exec(ctx,
 		"INSERT INTO crawler_counters (name, value) "+
 			"VALUES ('retry_mature:' || to_char(current_date - 1, 'YYYY-MM-DD'), 1)"); err != nil {
-		t.Fatalf("корзина зрелости: %v", err)
+		t.Fatalf("the maturity bucket: %v", err)
 	}
 	tr, err := scheduler.RetryOnce(ctx, pool, scheduler.RetryOptions{})
 	if err != nil || tr.Requeued != 1 || tr.Finalized != 0 {
-		t.Fatalf("RetryOnce = %+v err=%v, хочу Requeued=1 (Р8)", tr, err)
+		t.Fatalf("RetryOnce = %+v err=%v, want Requeued=1 (R8)", tr, err)
 	}
 	if r := checkStateOf(ctx, t, pool, zone, id); r.state != int16(model.CheckStatePending) ||
 		r.status != int16(model.StatusTempError) || r.tempAttempts != 1 {
-		t.Fatalf("после повтора temp_error = %+v, хочу pending/temp_error/attempts=1 (Р8)", r)
+		t.Fatalf("after the temp_error retry = %+v, want pending/temp_error/attempts=1 (R8)", r)
 	}
-	countersVerifyEmpty(t, pool, "после повтора temp_error (Р8)")
+	countersVerifyEmpty(t, pool, "after the temp_error retry (R8)")
 
 	// R14: a delete file — status=deleted, check_state does NOT change (pending).
 	dbatch, err := ingest.NewBatchID()
@@ -250,24 +250,24 @@ func TestCheckState_SpecTransitions(t *testing.T) {
 	}
 	dres, err := ingest.ApplyDelete(ctx, pool, ingest.Batch{ID: dbatch, ZoneID: zone, Action: model.ActionDelete})
 	if err != nil || dres.Deleted != 1 {
-		t.Fatalf("ApplyDelete = %+v err=%v, хочу Deleted=1 (Р14)", dres, err)
+		t.Fatalf("ApplyDelete = %+v err=%v, want Deleted=1 (R14)", dres, err)
 	}
 	if r := checkStateOf(ctx, t, pool, zone, id); r.state != int16(model.CheckStatePending) ||
 		r.status != int16(model.StatusDeleted) {
-		t.Fatalf("после delete = %+v, хочу pending/deleted — check_state не меняется (Р14)", r)
+		t.Fatalf("after the delete = %+v, want pending/deleted — check_state unchanged (R14)", r)
 	}
-	countersVerifyEmpty(t, pool, "после delete (Р14)")
+	countersVerifyEmpty(t, pool, "after the delete (R14)")
 
 	// R9: revival via an add file — new/pending, no lease.
 	radd := checkStateStageAdd(ctx, t, pool, zone, "spec")
 	if radd.Revived != 1 || radd.Inserted != 0 {
-		t.Fatalf("ApplyAdd воскрешение = %+v, хочу Revived=1 (Р9)", radd)
+		t.Fatalf("ApplyAdd revival = %+v, want Revived=1 (R9)", radd)
 	}
 	if r := checkStateOf(ctx, t, pool, zone, id); r.state != int16(model.CheckStatePending) ||
 		r.status != int16(model.StatusNew) || !r.queuedAtNull {
-		t.Fatalf("после воскрешения = %+v, хочу new/pending/queued_at NULL (Р9)", r)
+		t.Fatalf("after the revival = %+v, want new/pending/queued_at NULL (R9)", r)
 	}
-	countersVerifyEmpty(t, pool, "после воскрешения (Р9)")
+	countersVerifyEmpty(t, pool, "after the revival (R9)")
 }
 
 // TestCheckState_LeaseNullRepair — the terminal FR-1.2 guard: a queued
@@ -290,14 +290,14 @@ func TestCheckState_LeaseNullRepair(t *testing.T) {
 		 VALUES ($1, 'broken', $2, $3, NULL) RETURNING id`,
 		zone, int16(model.CheckStateQueued), int16(model.StatusNew),
 	).Scan(&id); err != nil {
-		t.Fatalf("домен queued/NULL: %v", err)
+		t.Fatalf("the queued/NULL domain: %v", err)
 	}
 	// A manual INSERT bypassing the incremental deltas: reconciliation is
 	// the authority, after it the zone counters are true (1 queued).
 	if _, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{}); err != nil {
-		t.Fatalf("реконсиляция: %v", err)
+		t.Fatalf("reconciliation: %v", err)
 	}
-	countersVerifyEmpty(t, pool, "после реконсиляции")
+	countersVerifyEmpty(t, pool, "after the reconciliation")
 
 	// The main lease pass does NOT see the row: NULL is filtered out by the comparison.
 	lres, err := scheduler.LeaseOnce(ctx, pool, nil, scheduler.LeaseOptions{})
@@ -305,33 +305,33 @@ func TestCheckState_LeaseNullRepair(t *testing.T) {
 		t.Fatalf("LeaseOnce: %v", err)
 	}
 	if lres.Domains != 0 {
-		t.Fatalf("основной lease-проход вернул NULL-строку: %+v, хочу 0 — NULL отсеивается возрастом", lres)
+		t.Fatalf("the main lease pass returned the NULL row: %+v, want 0 — NULL is filtered out by age", lres)
 	}
 	if r := checkStateOf(ctx, t, pool, zone, id); r.state != int16(model.CheckStateQueued) {
-		t.Fatalf("строка изменилась основным проходом: %+v, хочу queued", r)
+		t.Fatalf("the row changed by the main pass: %+v, want queued", r)
 	}
 
 	// The FR-1.2 repair pass: return to pending, the counter grows.
 	reg := metrics.New("scheduler")
 	nres, err := scheduler.LeaseNullOnce(ctx, pool, scheduler.LeaseOptions{Metrics: reg})
 	if err != nil || nres.Domains != 1 || nres.Selected != 1 {
-		t.Fatalf("LeaseNullOnce = %+v err=%v, хочу Domains=Selected=1", nres, err)
+		t.Fatalf("LeaseNullOnce = %+v err=%v, want Domains=Selected=1", nres, err)
 	}
 	if r := checkStateOf(ctx, t, pool, zone, id); r.state != int16(model.CheckStatePending) || !r.queuedAtNull {
-		t.Fatalf("после страховки = %+v, хочу pending/queued_at NULL (Р6)", r)
+		t.Fatalf("after the guard = %+v, want pending/queued_at NULL (R6)", r)
 	}
-	countersVerifyEmpty(t, pool, "после страховки (Р6) — дельты вёл оператор перевода")
+	countersVerifyEmpty(t, pool, "after the guard (R6) — the deltas maintained by the transition statement")
 	if got := checkStateNullReturned(t, reg); got != 1 {
-		t.Fatalf("счётчик страховки = %v, хочу 1", got)
+		t.Fatalf("the guard counter = %v, want 1", got)
 	}
 
 	// A repeat pass — empty (the changed rows are no longer selected).
 	repeat, err := scheduler.LeaseNullOnce(ctx, pool, scheduler.LeaseOptions{Metrics: reg})
 	if err != nil || repeat != (scheduler.LeaseNullResult{}) {
-		t.Fatalf("повторный LeaseNullOnce = %+v err=%v, хочу нулевой (идемпотентность)", repeat, err)
+		t.Fatalf("the repeat LeaseNullOnce = %+v err=%v, want the zero value (idempotence)", repeat, err)
 	}
 	if got := checkStateNullReturned(t, reg); got != 1 {
-		t.Fatalf("счётчик после повтора = %v, хочу 1 (пустой проход не считается)", got)
+		t.Fatalf("the counter after the repeat = %v, want 1 (an empty pass not counted)", got)
 	}
 
 	// The EXPLAIN contract of the guard selection (the
@@ -353,10 +353,10 @@ func TestCheckState_LeaseNullRepair(t *testing.T) {
 			"ORDER BY queued_at, zone_id, id LIMIT %d",
 		int16(model.CheckStateQueued), int16(model.StatusDeleted), scheduler.DefaultLeaseBatch))
 	if !strings.Contains(plan, "queued_at_zone_id_id_idx") {
-		t.Errorf("выборка страховки не обслуживается листовым экземпляром domains_lease_idx:\n%s", plan)
+		t.Errorf("the guard selection not served by the leaf instance of domains_lease_idx:\n%s", plan)
 	}
 	if strings.Contains(plan, "Seq Scan on domains") {
-		t.Errorf("выборка страховки деградировала в seq scan по domains:\n%s", plan)
+		t.Errorf("the guard selection degraded into a seq scan over domains:\n%s", plan)
 	}
 }
 
@@ -390,7 +390,7 @@ func checkStateExplain(ctx context.Context, t *testing.T, tx pgx.Tx, query strin
 	for rows.Next() {
 		var line string
 		if err := rows.Scan(&line); err != nil {
-			t.Fatalf("EXPLAIN: чтение: %v", err)
+			t.Fatalf("EXPLAIN: read: %v", err)
 		}
 		plan.WriteString(line)
 		plan.WriteByte('\n')

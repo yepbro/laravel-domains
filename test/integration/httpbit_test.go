@@ -52,11 +52,11 @@ func (q *httpBitQueue) Publish(_ context.Context, stream string, _ queue.Message
 }
 
 func (q *httpBitQueue) Consume(context.Context, string, string, string, int) ([]queue.Delivery, error) {
-	panic("httpBitQueue: Consume не используется")
+	panic("httpBitQueue: Consume not used")
 }
 
 func (q *httpBitQueue) Ack(context.Context, string, string, ...string) error {
-	panic("httpBitQueue: Ack не используется")
+	panic("httpBitQueue: Ack not used")
 }
 
 // httpBitResolver — a deterministic dnsclient.Resolver: the domain's apex
@@ -98,7 +98,7 @@ func httpBitFlags(ctx context.Context, t *testing.T, pool *pgxpool.Pool, zone in
 	if err := pool.QueryRow(ctx,
 		"SELECT flags FROM domains WHERE zone_id = $1 AND id = $2", zone, id,
 	).Scan(&flags); err != nil {
-		t.Fatalf("чтение flags: %v", err)
+		t.Fatalf("reading flags: %v", err)
 	}
 	return flags
 }
@@ -126,7 +126,7 @@ func (p *httpBitRecordFailPool) Exec(ctx context.Context, sql string, args ...an
 
 func (p *httpBitRecordFailPool) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
 	if strings.Contains(sql, httpBitRecordFailMark) {
-		return nil, errors.New("сбой записи результата (сценарий)")
+		return nil, errors.New("the result write failure (the scenario)")
 	}
 	return p.Pool.Query(ctx, sql, args...)
 }
@@ -147,7 +147,7 @@ func (p *httpBitMarkFailPool) CopyFrom(ctx context.Context, tableName pgx.Identi
 
 func (p *httpBitMarkFailPool) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
 	if strings.Contains(sql, httpBitMarkFailMark) {
-		return pgconn.CommandTag{}, errors.New("сбой постановки бита (сценарий)")
+		return pgconn.CommandTag{}, errors.New("the bit enqueue failure (the scenario)")
 	}
 	return p.Pool.Exec(ctx, sql, args...)
 }
@@ -162,10 +162,10 @@ func httpBitFilter(ctx context.Context, t *testing.T, pool *pgxpool.Pool, batch 
 	t.Helper()
 	pend, err := dnsworker.PendingDomains(ctx, pool, batch)
 	if err != nil {
-		t.Fatalf("фильтр пачки: %v", err)
+		t.Fatalf("the batch filter: %v", err)
 	}
 	if len(pend) != 1 {
-		t.Fatalf("фильтр пачки: доменов %d, хочу 1", len(pend))
+		t.Fatalf("the batch filter: %d domains, want 1", len(pend))
 	}
 	return pend[0]
 }
@@ -198,7 +198,7 @@ func TestHTTPPublishedBit_SpecTransitions(t *testing.T) {
 			{ZoneID: zone, DomainID: id, Name: name},
 		})
 		if err != nil || eres.Queued != 1 || eres.Published != 1 {
-			t.Fatalf("EnqueueBatch = %+v err=%v, хочу Queued=Published=1 (Р1)", eres, err)
+			t.Fatalf("EnqueueBatch = %+v err=%v, want Queued=Published=1 (R1)", eres, err)
 		}
 	}
 
@@ -208,26 +208,26 @@ func TestHTTPPublishedBit_SpecTransitions(t *testing.T) {
 	if _, err := pool.Exec(ctx,
 		"UPDATE domains SET flags = flags | $1 WHERE zone_id = $2 AND id = $3",
 		int16(model.FlagIDN), zone, id); err != nil {
-		t.Fatalf("сеем is_idn: %v", err)
+		t.Fatalf("seeding is_idn: %v", err)
 	}
 
 	// A manual domain insert bypassing the incremental deltas — the
 	// reconciliation is the authority (the baseline of the zone counters,
 	// the TestCheckState_LeaseNullRepair style).
 	if _, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{}); err != nil {
-		t.Fatalf("реконсиляция: %v", err)
+		t.Fatalf("reconciliation: %v", err)
 	}
 
 	// R1: scheduler enqueueing — queued, the bit is clean (no B1 yet),
 	// is_idn survived the enqueueing.
 	enqueue()
 	if r := checkStateOf(ctx, t, pool, zone, id); r.state != int16(model.CheckStateQueued) || r.httpPublished {
-		t.Fatalf("после постановки = %+v, хочу queued/бит чист (Р1)", r)
+		t.Fatalf("after the enqueue = %+v, want queued/the bit clean (R1)", r)
 	}
 	if f := httpBitFlags(ctx, t, pool, zone, id); f != int16(model.FlagIDN) {
-		t.Fatalf("flags после постановки = %b, хочу только is_idn (прочие биты сохранены)", f)
+		t.Fatalf("flags after the enqueue = %b, want only is_idn (the other bits preserved)", f)
 	}
-	countersVerifyEmpty(t, pool, "после постановки (Р1)")
+	countersVerifyEmpty(t, pool, "after the enqueue (R1)")
 
 	// Delivery 1 — the "XADD without the bit" window: the q:http
 	// publication went through (XADD succeeded), the worker died BEFORE the
@@ -238,10 +238,10 @@ func TestHTTPPublishedBit_SpecTransitions(t *testing.T) {
 		ZoneID: zone, DomainID: id, Name: name,
 		Subdomains: []queue.HTTPSubdomain{{SubdomainID: 0, Label: "", Addrs: []string{"192.0.2.10"}}},
 	}); err != nil {
-		t.Fatalf("публикация q:http доставки 1: %v", err)
+		t.Fatalf("publishing the q:http delivery 1: %v", err)
 	}
 	if q.http != 1 {
-		t.Fatalf("публикаций q:http = %d, хочу 1", q.http)
+		t.Fatalf("q:http publications = %d, want 1", q.http)
 	}
 
 	// Delivery 2 (redelivery): the bit is CLEAN — the window is not
@@ -251,21 +251,21 @@ func TestHTTPPublishedBit_SpecTransitions(t *testing.T) {
 	// not acknowledged.
 	dom := httpBitFilter(ctx, t, pool, batch)
 	if dom.HTTPPublished {
-		t.Fatal("бит стоит в окне «XADD без бита» — дубль был бы подавлен (нарушение спецификации)")
+		t.Fatal("the bit set in the \"XADD without the bit\" window — the duplicate would be suppressed (a specification violation)")
 	}
 	if err := dnsworker.ProcessDomain(ctx, fail, q, resolve, dom, subs, false, nil, nil); err == nil {
-		t.Fatal("ProcessDomain доставки 2 = nil, хочу ошибку записи (сценарий сбоя до Б2)")
+		t.Fatal("ProcessDomain of delivery 2 = nil, want a write error (the failure-before-B2 scenario)")
 	}
 	if q.http != 2 {
-		t.Fatalf("публикаций q:http = %d, хочу 2 (дубль окна допустим)", q.http)
+		t.Fatalf("q:http publications = %d, want 2 (the window duplicate allowed)", q.http)
 	}
 	if r := checkStateOf(ctx, t, pool, zone, id); r.state != int16(model.CheckStateQueued) || !r.httpPublished {
-		t.Fatalf("после Б1 = %+v, хочу queued/бит установлен (постановка после XADD)", r)
+		t.Fatalf("after B1 = %+v, want queued/the bit set (the enqueue after XADD)", r)
 	}
 	if f := httpBitFlags(ctx, t, pool, zone, id); f != int16(model.FlagIDN|model.FlagHTTPPublished) {
-		t.Fatalf("flags после Б1 = %b, хочу is_idn|http_published (OR сохраняет прочие)", f)
+		t.Fatalf("flags after B1 = %b, want is_idn|http_published (OR preserves the others)", f)
 	}
-	countersVerifyEmpty(t, pool, "после Б1 (запись не состоялась — дельт нет)")
+	countersVerifyEmpty(t, pool, "after B1 (the write did not happen — no deltas)")
 
 	// Delivery 3 (redelivery): the bit is set ("published, not written") —
 	// the publication is SKIPPED (B4), the episode reaches the write:
@@ -274,45 +274,45 @@ func TestHTTPPublishedBit_SpecTransitions(t *testing.T) {
 	// episode mask is written.
 	dom = httpBitFilter(ctx, t, pool, batch)
 	if !dom.HTTPPublished {
-		t.Fatal("бит http_published не прочитан фильтром пачки (Б4)")
+		t.Fatal("the http_published bit not read by the batch filter (B4)")
 	}
 	if err := dnsworker.ProcessDomain(ctx, pool, q, resolve, dom, subs, false, nil, nil); err != nil {
-		t.Fatalf("ProcessDomain доставки 3: %v", err)
+		t.Fatalf("ProcessDomain of delivery 3: %v", err)
 	}
 	if q.http != 2 {
-		t.Fatalf("публикаций q:http = %d, хочу 2 (Б4: дубль исключён)", q.http)
+		t.Fatalf("q:http publications = %d, want 2 (B4: the duplicate excluded)", q.http)
 	}
 	if r := checkStateOf(ctx, t, pool, zone, id); r.state != int16(model.CheckStateDone) ||
 		r.httpPublished || !r.lastChecked || r.status != int16(model.StatusNew) {
-		t.Fatalf("после Б2 = %+v, хочу done/бит снят/отметка есть/статус не тронут", r)
+		t.Fatalf("after B2 = %+v, want done/the bit cleared/the mark present/the status untouched", r)
 	}
 	if f := httpBitFlags(ctx, t, pool, zone, id); f != int16(model.FlagIDN) {
-		t.Fatalf("flags после Б2 = %b, хочу только is_idn (маска ~бита сохраняет прочие)", f)
+		t.Fatalf("flags after B2 = %b, want only is_idn (the ~bit mask preserves the others)", f)
 	}
 	var mask int64
 	if err := pool.QueryRow(ctx,
 		"SELECT dns_mask FROM domains WHERE zone_id = $1 AND id = $2", zone, id,
 	).Scan(&mask); err != nil {
-		t.Fatalf("чтение dns_mask: %v", err)
+		t.Fatalf("reading dns_mask: %v", err)
 	}
 	if mask != 0b11 {
-		t.Fatalf("dns_mask = %b, хочу 0b11 (апекс и www резолвятся)", mask)
+		t.Fatalf("dns_mask = %b, want 0b11 (the apex and www resolve)", mask)
 	}
-	countersVerifyEmpty(t, pool, "после записи результата (Б2)")
+	countersVerifyEmpty(t, pool, "after the result write (B2)")
 
 	// Episode 2: the daily recheck (R7) returns the domain, enqueueing
 	// (R1) gives a fresh queued with a clean bit.
 	if _, err := pool.Exec(ctx,
 		"UPDATE domains SET last_checked_at = current_date - 400 WHERE zone_id = $1 AND id = $2",
 		zone, id); err != nil {
-		t.Fatalf("возраст проверки: %v", err)
+		t.Fatalf("the check age: %v", err)
 	}
 	rk, err := scheduler.RecheckOnce(ctx, pool, scheduler.RecheckOptions{Interval: 300 * 24 * time.Hour})
 	if err != nil || rk.Domains != 1 {
-		t.Fatalf("RecheckOnce = %+v err=%v, хочу 1 (Р7)", rk, err)
+		t.Fatalf("RecheckOnce = %+v err=%v, want 1 (R7)", rk, err)
 	}
 	enqueue()
-	countersVerifyEmpty(t, pool, "после Р7+Р1 эпизода 2")
+	countersVerifyEmpty(t, pool, "after the R7+R1 episode 2")
 
 	// Delivery 4: the episode publishes q:http and sets the bit (B1), the
 	// write fails (the wrapper), the lease expires — the lease return (R5)
@@ -320,65 +320,65 @@ func TestHTTPPublishedBit_SpecTransitions(t *testing.T) {
 	// the bit does not matter, only the batch filter reads it.
 	dom = httpBitFilter(ctx, t, pool, batch)
 	if dom.HTTPPublished {
-		t.Fatal("бит стоит до эпизода 2 — постановка не сняла (нарушение Б3)")
+		t.Fatal("the bit set before episode 2 — the enqueue did not clear it (a B3 violation)")
 	}
 	if err := dnsworker.ProcessDomain(ctx, fail, q, resolve, dom, subs, false, nil, nil); err == nil {
-		t.Fatal("ProcessDomain доставки 4 = nil, хочу ошибку записи (сценарий сбоя до Б2)")
+		t.Fatal("ProcessDomain of delivery 4 = nil, want a write error (the failure-before-B2 scenario)")
 	}
 	if q.http != 3 {
-		t.Fatalf("публикаций q:http = %d, хочу 3 (Б1 эпизода 2)", q.http)
+		t.Fatalf("q:http publications = %d, want 3 (B1 of episode 2)", q.http)
 	}
 	if r := checkStateOf(ctx, t, pool, zone, id); r.state != int16(model.CheckStateQueued) || !r.httpPublished {
-		t.Fatalf("после Б1 эпизода 2 = %+v, хочу queued/бит установлен", r)
+		t.Fatalf("after B1 of episode 2 = %+v, want queued/the bit set", r)
 	}
 	if f := httpBitFlags(ctx, t, pool, zone, id); f != int16(model.FlagIDN|model.FlagHTTPPublished) {
-		t.Fatalf("flags после Б1 эпизода 2 = %b, хочу is_idn|http_published", f)
+		t.Fatalf("flags after B1 of episode 2 = %b, want is_idn|http_published", f)
 	}
 	if _, err := pool.Exec(ctx,
 		"UPDATE domains SET queued_at = now() - interval '2 hours' WHERE zone_id = $1 AND id = $2",
 		zone, id); err != nil {
-		t.Fatalf("возраст аренды: %v", err)
+		t.Fatalf("the lease age: %v", err)
 	}
 	lres, err := scheduler.LeaseOnce(ctx, pool, nil, scheduler.LeaseOptions{})
 	if err != nil || lres.Domains != 1 {
-		t.Fatalf("LeaseOnce = %+v err=%v, хочу 1 (Р5)", lres, err)
+		t.Fatalf("LeaseOnce = %+v err=%v, want 1 (R5)", lres, err)
 	}
 	if r := checkStateOf(ctx, t, pool, zone, id); r.state != int16(model.CheckStatePending) || !r.httpPublished {
-		t.Fatalf("после lease-возврата = %+v, хочу pending/бит пережил (вне эпизода)", r)
+		t.Fatalf("after the lease return = %+v, want pending/the bit survived (outside the episode)", r)
 	}
-	countersVerifyEmpty(t, pool, "после lease-возврата (Р5)")
+	countersVerifyEmpty(t, pool, "after the lease return (R5)")
 
 	// B3: enqueueing a new episode clears the bit — otherwise the previous
 	// episode's mark would suppress publishing the fresh one (a lost
 	// q:http).
 	enqueue()
 	if r := checkStateOf(ctx, t, pool, zone, id); r.state != int16(model.CheckStateQueued) || r.httpPublished {
-		t.Fatalf("после Б3 = %+v, хочу queued/бит снят постановкой планировщика", r)
+		t.Fatalf("after B3 = %+v, want queued/the bit cleared by the scheduler's enqueue", r)
 	}
 	if f := httpBitFlags(ctx, t, pool, zone, id); f != int16(model.FlagIDN) {
-		t.Fatalf("flags после Б3 = %b, хочу только is_idn (маска ~бита сохраняет прочие)", f)
+		t.Fatalf("flags after B3 = %b, want only is_idn (the ~bit mask preserves the others)", f)
 	}
-	countersVerifyEmpty(t, pool, "после Б3")
+	countersVerifyEmpty(t, pool, "after B3")
 
 	// Delivery 5: a fresh episode with a clean bit publishes q:http WITHOUT
 	// suppression (the point of B3) and finishes with the write (B2).
 	dom = httpBitFilter(ctx, t, pool, batch)
 	if dom.HTTPPublished {
-		t.Fatal("бит стоит после постановки — публикация эпизода была бы подавлена (нарушение Б3)")
+		t.Fatal("the bit set after the enqueue — the episode's publication would be suppressed (a B3 violation)")
 	}
 	if err := dnsworker.ProcessDomain(ctx, pool, q, resolve, dom, subs, false, nil, nil); err != nil {
-		t.Fatalf("ProcessDomain доставки 5: %v", err)
+		t.Fatalf("ProcessDomain of delivery 5: %v", err)
 	}
 	if q.http != 4 {
-		t.Fatalf("публикаций q:http = %d, хочу 4 (свежий эпизод публикует после Б3)", q.http)
+		t.Fatalf("q:http publications = %d, want 4 (a fresh episode publishes after B3)", q.http)
 	}
 	if r := checkStateOf(ctx, t, pool, zone, id); r.state != int16(model.CheckStateDone) || r.httpPublished {
-		t.Fatalf("после завершения эпизода 2 = %+v, хочу done/бит снят", r)
+		t.Fatalf("after the episode 2 completion = %+v, want done/the bit cleared", r)
 	}
 	if f := httpBitFlags(ctx, t, pool, zone, id); f != int16(model.FlagIDN) {
-		t.Fatalf("flags после эпизода 2 = %b, хочу только is_idn", f)
+		t.Fatalf("flags after episode 2 = %b, want only is_idn", f)
 	}
-	countersVerifyEmpty(t, pool, "после завершения эпизода 2")
+	countersVerifyEmpty(t, pool, "after the episode 2 completion")
 }
 
 // TestHTTPPublishedBit_MarkFailureNonFatal — the B1 bit-setting failure
@@ -404,12 +404,12 @@ func TestHTTPPublishedBit_MarkFailureNonFatal(t *testing.T) {
 	if _, err := pool.Exec(ctx,
 		"UPDATE domains SET flags = flags | $1, queued_at = now() WHERE zone_id = $2 AND id = $3",
 		int16(model.FlagIDN), zone, id); err != nil {
-		t.Fatalf("сеем is_idn/queued_at: %v", err)
+		t.Fatalf("seeding is_idn/queued_at: %v", err)
 	}
 	// A manual insert bypassing the deltas — the reconciliation is the
 	// authority (the baseline).
 	if _, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{}); err != nil {
-		t.Fatalf("реконсиляция: %v", err)
+		t.Fatalf("reconciliation: %v", err)
 	}
 
 	resolve := httpBitResolver{domain: name}
@@ -417,17 +417,17 @@ func TestHTTPPublishedBit_MarkFailureNonFatal(t *testing.T) {
 	fail := &httpBitMarkFailPool{Pool: pool}
 	dom := httpBitFilter(ctx, t, pool, []queue.DNSDomain{{ZoneID: zone, DomainID: id, Name: name}})
 	if err := dnsworker.ProcessDomain(ctx, fail, q, resolve, dom, httpBitSubs(), false, nil, nil); err != nil {
-		t.Fatalf("ProcessDomain = %v, хочу nil (пометка non-fatal — эпизод доведён до записи)", err)
+		t.Fatalf("ProcessDomain = %v, want nil (the marking non-fatal — the episode carried to the write)", err)
 	}
 	if q.http != 1 {
-		t.Fatalf("публикаций q:http = %d, хочу 1 (XADD прошёл до отказа пометки)", q.http)
+		t.Fatalf("q:http publications = %d, want 1 (XADD happened before the marking failure)", q.http)
 	}
 	if r := checkStateOf(ctx, t, pool, zone, id); r.state != int16(model.CheckStateDone) ||
 		r.httpPublished || !r.lastChecked {
-		t.Fatalf("после эпизода = %+v, хочу done/бит чист/отметка есть", r)
+		t.Fatalf("after the episode = %+v, want done/the bit clean/the mark present", r)
 	}
 	if f := httpBitFlags(ctx, t, pool, zone, id); f != int16(model.FlagIDN) {
-		t.Fatalf("flags = %b, хочу только is_idn (прочие биты сохранены)", f)
+		t.Fatalf("flags = %b, want only is_idn (the other bits preserved)", f)
 	}
-	countersVerifyEmpty(t, pool, "после эпизода с отказом пометки")
+	countersVerifyEmpty(t, pool, "after the episode with the marking failure")
 }

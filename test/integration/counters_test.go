@@ -45,11 +45,11 @@ func countersSchema(t *testing.T) *pgxpool.Pool {
 	dsn, cleanup := withTestSchema(t)
 	t.Cleanup(cleanup)
 	if err := migrate.Up(context.Background(), dsn); err != nil {
-		t.Fatalf("применение миграций к изолированной схеме: %v", err)
+		t.Fatalf("applying the migrations to the isolated schema: %v", err)
 	}
 	pool, err := pgxpool.New(context.Background(), dsn)
 	if err != nil {
-		t.Fatalf("подключение к тестовой схеме: %v", err)
+		t.Fatalf("connecting to the test schema: %v", err)
 	}
 	t.Cleanup(pool.Close)
 	return pool
@@ -65,11 +65,11 @@ func (q *countersStubQueue) Publish(context.Context, string, queue.Message) (str
 }
 
 func (q *countersStubQueue) Consume(context.Context, string, string, string, int) ([]queue.Delivery, error) {
-	panic("countersStubQueue: Consume не используется")
+	panic("countersStubQueue: Consume not used")
 }
 
 func (q *countersStubQueue) Ack(context.Context, string, string, ...string) error {
-	panic("countersStubQueue: Ack не используется")
+	panic("countersStubQueue: Ack not used")
 }
 
 // countersSeedZone — a reference table zone; returns the id.
@@ -79,7 +79,7 @@ func countersSeedZone(t *testing.T, pool *pgxpool.Pool, name string) int16 {
 	if err := pool.QueryRow(context.Background(),
 		"INSERT INTO zones (name, is_active) VALUES ($1, true) RETURNING id", name,
 	).Scan(&id); err != nil {
-		t.Fatalf("зона %s: %v", name, err)
+		t.Fatalf("zone %s: %v", name, err)
 	}
 	return id
 }
@@ -96,7 +96,7 @@ func countersSeedDomains(t *testing.T, pool *pgxpool.Pool, zone int16, prefix st
 			"INSERT INTO domains (zone_id, label, check_state, status) VALUES ($1, $2, $3, $4) RETURNING id",
 			zone, fmt.Sprintf("%s%d", prefix, i), int16(state), int16(status),
 		).Scan(&id); err != nil {
-			t.Fatalf("домен %s%d: %v", prefix, i, err)
+			t.Fatalf("domain %s%d: %v", prefix, i, err)
 		}
 		ids = append(ids, id)
 	}
@@ -113,7 +113,7 @@ func countersVerifyEmpty(t *testing.T, pool *pgxpool.Pool, what string) {
 		t.Fatalf("%s: VerifyCounters: %v", what, err)
 	}
 	if len(mismatch) > 0 {
-		t.Fatalf("%s: дрейф счётчиков после эпизода: %+v", what, mismatch)
+		t.Fatalf("%s: the counters drift after the episode: %+v", what, mismatch)
 	}
 }
 
@@ -137,18 +137,18 @@ func TestCounters_PipelineTransitions(t *testing.T) {
 	// drift (idempotence).
 	first, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{})
 	if err != nil {
-		t.Fatalf("первый проход: %v", err)
+		t.Fatalf("the first pass: %v", err)
 	}
 	if first.Zones != 1 {
-		t.Fatalf("первый проход: зон %d, хочу 1", first.Zones)
+		t.Fatalf("the first pass: %d zones, want 1", first.Zones)
 	}
 	second, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{})
 	if err != nil {
-		t.Fatalf("повторный проход: %v", err)
+		t.Fatalf("the repeat pass: %v", err)
 	}
 	for _, p := range second.Positions {
 		if p.Drift() != 0 {
-			t.Fatalf("повторный проход: дрейф %s = %d→%d (проход идемпотентен)", p.Counter, p.Old, p.New)
+			t.Fatalf("the repeat pass: the %s drift = %d→%d (the pass is idempotent)", p.Counter, p.Old, p.New)
 		}
 	}
 	// The global counters legend is in the crawler_counters rows (the
@@ -157,24 +157,24 @@ func TestCounters_PipelineTransitions(t *testing.T) {
 	{
 		rows, err := pool.Query(ctx, "SELECT name FROM crawler_counters")
 		if err != nil {
-			t.Fatalf("чтение счётчиков: %v", err)
+			t.Fatalf("reading the counters: %v", err)
 		}
 		names := map[string]bool{}
 		for rows.Next() {
 			var n string
 			if err := rows.Scan(&n); err != nil {
-				t.Fatalf("чтение счётчиков: строка: %v", err)
+				t.Fatalf("reading the counters: row: %v", err)
 			}
 			names[n] = true
 		}
 		rows.Close()
 		for _, want := range monitor.CounterNames() {
 			if !names[want] {
-				t.Fatalf("легенда глобальных счётчиков без %s", want)
+				t.Fatalf("the global counters legend without %s", want)
 			}
 		}
 	}
-	countersVerifyEmpty(t, pool, "после реконсиляции")
+	countersVerifyEmpty(t, pool, "after the reconciliation")
 
 	// enqueue: pending → queued (the deltas pending −5 / queued +5).
 	batch := make([]scheduler.DispatchRow, 0, len(pending))
@@ -186,41 +186,41 @@ func TestCounters_PipelineTransitions(t *testing.T) {
 		t.Fatalf("EnqueueBatch: %v", err)
 	}
 	if res.Queued != len(pending) {
-		t.Fatalf("EnqueueBatch: переведено %d, хочу %d", res.Queued, len(pending))
+		t.Fatalf("EnqueueBatch: %d moved, want %d", res.Queued, len(pending))
 	}
-	countersVerifyEmpty(t, pool, "после enqueue")
+	countersVerifyEmpty(t, pool, "after the enqueue")
 
 	// lease: an expired lease returns the changed rows to pending
 	// (the default Timeout is 30 minutes — shift queued_at into the past).
 	if _, err := pool.Exec(ctx,
 		"UPDATE domains SET queued_at = now() - interval '2 hours' WHERE zone_id = $1 AND check_state = $2",
 		zone, int16(model.CheckStateQueued)); err != nil {
-		t.Fatalf("возраст аренды: %v", err)
+		t.Fatalf("the lease age: %v", err)
 	}
 	leaseRes, err := scheduler.LeaseOnce(ctx, pool, nil, scheduler.LeaseOptions{})
 	if err != nil {
 		t.Fatalf("LeaseOnce: %v", err)
 	}
 	if leaseRes.Domains != int64(len(pending)) {
-		t.Fatalf("LeaseOnce: возвращено %d, хочу %d", leaseRes.Domains, len(pending))
+		t.Fatalf("LeaseOnce: %d returned, want %d", leaseRes.Domains, len(pending))
 	}
-	countersVerifyEmpty(t, pool, "после lease")
+	countersVerifyEmpty(t, pool, "after the lease")
 
 	// recheck (the age-based recheck): the done rows are old — the change
 	// checked −n / pending +n.
 	if _, err := pool.Exec(ctx,
 		"UPDATE domains SET last_checked_at = current_date - 400 WHERE zone_id = $1 AND check_state = $2",
 		zone, int16(model.CheckStateDone)); err != nil {
-		t.Fatalf("возраст done-строк: %v", err)
+		t.Fatalf("the done rows' age: %v", err)
 	}
 	rk, err := scheduler.RecheckOnce(ctx, pool, scheduler.RecheckOptions{Interval: 300 * 24 * time.Hour})
 	if err != nil {
 		t.Fatalf("RecheckOnce: %v", err)
 	}
 	if rk.Domains != 3 {
-		t.Fatalf("RecheckOnce: переведено %d, хочу 3", rk.Domains)
+		t.Fatalf("RecheckOnce: %d moved, want 3", rk.Domains)
 	}
-	countersVerifyEmpty(t, pool, "после recheck")
+	countersVerifyEmpty(t, pool, "after the recheck")
 }
 
 // TestCounters_RecordDoubleDelivery — writing the result of an HTTP
@@ -241,7 +241,7 @@ func TestCounters_RecordDoubleDelivery(t *testing.T) {
 	ids := countersSeedDomains(t, pool, zone, "q", 1, model.CheckStateQueued, model.StatusNew)
 	if _, err := pool.Exec(ctx,
 		"UPDATE zones SET domains_total = 1, domains_queued = 1 WHERE id = $1", zone); err != nil {
-		t.Fatalf("счётчики зоны: %v", err)
+		t.Fatalf("the zone counters: %v", err)
 	}
 
 	// A DNS episode moves queued → done (no terminal status needed: the
@@ -251,7 +251,7 @@ func TestCounters_RecordDoubleDelivery(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("RecordEpisode: ok=%v err=%v", ok, err)
 	}
-	countersVerifyEmpty(t, pool, "после DNS-перехода")
+	countersVerifyEmpty(t, pool, "after the DNS transition")
 
 	rec, err := httpworker.NewRecorder(pool, &countersStubQueue{}, nil, nil)
 	if err != nil {
@@ -261,36 +261,36 @@ func TestCounters_RecordDoubleDelivery(t *testing.T) {
 	for i := 0; i < 2; i++ { // a duplicate delivery over done — no zone deltas
 		ok, err := rec.RecordAndPublish(ctx, res)
 		if err != nil || !ok {
-			t.Fatalf("запись %d: ok=%v err=%v", i+1, ok, err)
+			t.Fatalf("record %d: ok=%v err=%v", i+1, ok, err)
 		}
 	}
 	var queued, checked int64
 	if err := pool.QueryRow(ctx,
 		"SELECT domains_queued, domains_checked FROM zones WHERE id = $1", zone,
 	).Scan(&queued, &checked); err != nil {
-		t.Fatalf("чтение зоны: %v", err)
+		t.Fatalf("read zone: %v", err)
 	}
 	if queued != 0 || checked != 1 {
-		t.Fatalf("после record×2 queued=%d checked=%d, хочу 0/1 (дельта один раз — на DNS-переходе)", queued, checked)
+		t.Fatalf("after record×2 queued=%d checked=%d, want 0/1 (the delta once — at the DNS transition)", queued, checked)
 	}
 
 	// The daily counter (T-179): two result writes — two events (the delta
 	// is not doubled per delivery: one delivery is one increment);
 	// the live window — one domain with last_checked_at = current_date.
 	if got := countersChecksToday(t, pool); got != 2 {
-		t.Fatalf("после record×2 checks:<день> = %d, хочу 2 (по одному событию на запись)", got)
+		t.Fatalf("after record×2 checks:<day> = %d, want 2 (one event per write)", got)
 	}
-	countersVerifyEmpty(t, pool, "после record×2 поверх done (суточная строка вне verify)")
+	countersVerifyEmpty(t, pool, "after record×2 over done (the daily row outside verify)")
 
 	// The reconciliation is the authority: the day row := the live window
 	// (1), the |2 − 1| drift is visible in the pass's daily:checks
 	// position.
 	pass, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{})
 	if err != nil {
-		t.Fatalf("реконсиляция: %v", err)
+		t.Fatalf("reconciliation: %v", err)
 	}
 	if got := countersChecksToday(t, pool); got != 1 {
-		t.Fatalf("после реконсиляции checks:<день> = %d, хочу 1 (живое окно: один домен сегодня)", got)
+		t.Fatalf("after the reconciliation checks:<day> = %d, want 1 (the live window: one domain today)", got)
 	}
 	drifted := false
 	for _, p := range pass.Positions {
@@ -299,13 +299,13 @@ func TestCounters_RecordDoubleDelivery(t *testing.T) {
 		}
 		drifted = true
 		if p.Old != 2 || p.New != 1 || p.Drift() != 1 {
-			t.Fatalf("daily:checks = %+v, хочу old=2 new=1 drift=1", p)
+			t.Fatalf("daily:checks = %+v, want old=2 new=1 drift=1", p)
 		}
 	}
 	if !drifted {
-		t.Fatal("позиция daily:checks отсутствует в итогах прохода")
+		t.Fatal("the daily:checks position missing from the pass results")
 	}
-	countersVerifyEmpty(t, pool, "после реконсиляции")
+	countersVerifyEmpty(t, pool, "after the reconciliation")
 }
 
 // countersChecksToday — the value of the current day's daily checks counter
@@ -339,7 +339,7 @@ func countersDailyToday(t *testing.T, pool *pgxpool.Pool, prefix string) int64 {
 		prefix+":",
 	).Scan(&v)
 	if err != nil {
-		t.Fatalf("чтение %s:<день>: %v", prefix, err)
+		t.Fatalf("read %s:<day>: %v", prefix, err)
 	}
 	return v
 }
@@ -362,7 +362,7 @@ func TestCounters_DNSTempErrorShare(t *testing.T) {
 	// The starting pass — the zone columns from the live aggregate (2
 	// queued), the day's daily rows as zeros (no domains checked today).
 	if _, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{}); err != nil {
-		t.Fatalf("стартовый проход: %v", err)
+		t.Fatalf("the starting pass: %v", err)
 	}
 	rec, err := httpworker.NewRecorder(pool, &countersStubQueue{}, nil, nil)
 	if err != nil {
@@ -380,41 +380,41 @@ func TestCounters_DNSTempErrorShare(t *testing.T) {
 		}},
 	}
 	if ok, err := rec.RecordAndPublish(ctx, tempRes); err != nil || !ok {
-		t.Fatalf("temp_error-эпизод: ok=%v err=%v", ok, err)
+		t.Fatalf("temp_error episode: ok=%v err=%v", ok, err)
 	}
 	if got := countersChecksToday(t, pool); got != 1 {
-		t.Fatalf("после temp_error-эпизода checks:<день> = %d, хочу 1", got)
+		t.Fatalf("after the temp_error episode checks:<day> = %d, want 1", got)
 	}
 	if got := countersTempToday(t, pool); got != 1 {
-		t.Fatalf("после temp_error-эпизода temp_error:<день> = %d, хочу 1", got)
+		t.Fatalf("after the temp_error episode temp_error:<day> = %d, want 1", got)
 	}
 
 	// An episode without temp_error (permanently silent — no_http): the
 	// denominator grows, the numerator untouched.
 	silentRes := &httpworker.DomainResult{ZoneID: zone, DomainID: ids[1], Name: "s1.share.test"}
 	if ok, err := rec.RecordAndPublish(ctx, silentRes); err != nil || !ok {
-		t.Fatalf("no_http-эпизод: ok=%v err=%v", ok, err)
+		t.Fatalf("no_http episode: ok=%v err=%v", ok, err)
 	}
 	if got := countersChecksToday(t, pool); got != 2 {
-		t.Fatalf("после no_http-эпизода checks:<день> = %d, хочу 2", got)
+		t.Fatalf("after the no_http episode checks:<day> = %d, want 2", got)
 	}
 	if got := countersTempToday(t, pool); got != 1 {
-		t.Fatalf("после no_http-эпизода temp_error:<день> = %d, хочу 1 (не temp_error-итог не инкрементирует)", got)
+		t.Fatalf("after the no_http episode temp_error:<day> = %d, want 1 (a non-temp_error verdict does not increment)", got)
 	}
 
 	// A duplicate delivery of the temp_error episode: +1 to the numerator
 	// and the denominator at once — the share would not change, the write
 	// events are honest.
 	if ok, err := rec.RecordAndPublish(ctx, tempRes); err != nil || !ok {
-		t.Fatalf("дубль temp_error-эпизода: ok=%v err=%v", ok, err)
+		t.Fatalf("the temp_error episode duplicate: ok=%v err=%v", ok, err)
 	}
 	if got := countersChecksToday(t, pool); got != 3 {
-		t.Fatalf("после дубля checks:<день> = %d, хочу 3", got)
+		t.Fatalf("after the duplicate checks:<day> = %d, want 3", got)
 	}
 	if got := countersTempToday(t, pool); got != 2 {
-		t.Fatalf("после дубля temp_error:<день> = %d, хочу 2", got)
+		t.Fatalf("after the duplicate temp_error:<day> = %d, want 2", got)
 	}
-	countersVerifyEmpty(t, pool, "после эпизодов доли (суточные строки вне verify)")
+	countersVerifyEmpty(t, pool, "after the share episodes (the daily rows outside verify)")
 
 	// The reconciliation is the authority: the live window is 2 domains of
 	// the day (one has the temp_error status), the share 1/2; the
@@ -422,25 +422,25 @@ func TestCounters_DNSTempErrorShare(t *testing.T) {
 	// the difference.
 	pass, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{})
 	if err != nil {
-		t.Fatalf("реконсиляция: %v", err)
+		t.Fatalf("reconciliation: %v", err)
 	}
 	if got := countersChecksToday(t, pool); got != 2 {
-		t.Fatalf("после реконсиляции checks:<день> = %d, хочу 2 (живое окно: два домена сегодня)", got)
+		t.Fatalf("after the reconciliation checks:<day> = %d, want 2 (the live window: two domains today)", got)
 	}
 	if got := countersTempToday(t, pool); got != 1 {
-		t.Fatalf("после реконсиляции temp_error:<день> = %d, хочу 1 (один temp_error-домен дня)", got)
+		t.Fatalf("after the reconciliation temp_error:<day> = %d, want 1 (one temp_error domain of the day)", got)
 	}
 	byName := map[string]monitor.CounterPosition{}
 	for _, p := range pass.Positions {
 		byName[p.Counter] = p
 	}
 	if p := byName["daily:checks"]; p.Old != 3 || p.New != 2 || p.Drift() != 1 {
-		t.Fatalf("daily:checks = %+v, хочу old=3 new=2 drift=1", p)
+		t.Fatalf("daily:checks = %+v, want old=3 new=2 drift=1", p)
 	}
 	if p := byName["daily:temp_error"]; p.Old != 2 || p.New != 1 || p.Drift() != 1 {
-		t.Fatalf("daily:temp_error = %+v, хочу old=2 new=1 drift=1 (дубль события)", p)
+		t.Fatalf("daily:temp_error = %+v, want old=2 new=1 drift=1 (a duplicate event)", p)
 	}
-	countersVerifyEmpty(t, pool, "после реконсиляции доли")
+	countersVerifyEmpty(t, pool, "after the share reconciliation")
 }
 
 // TestCounters_RetryMatureBaskets — the retry maturity buckets (T-202):
@@ -463,7 +463,7 @@ func TestCounters_RetryMatureBaskets(t *testing.T) {
 	// The starting pass creates the buckets as zeros (no temp_error
 	// episodes today yet).
 	if _, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{}); err != nil {
-		t.Fatalf("стартовый проход: %v", err)
+		t.Fatalf("the starting pass: %v", err)
 	}
 	rec, err := httpworker.NewRecorder(pool, &countersStubQueue{}, nil, nil)
 	if err != nil {
@@ -480,19 +480,19 @@ func TestCounters_RetryMatureBaskets(t *testing.T) {
 		}},
 	}
 	if ok, err := rec.RecordAndPublish(ctx, tempRes); err != nil || !ok {
-		t.Fatalf("temp_error-эпизод HTTP: ok=%v err=%v", ok, err)
+		t.Fatalf("temp_error HTTP episode: ok=%v err=%v", ok, err)
 	}
 	if got := countersRetryMatureToday(t, pool); got != 1 {
-		t.Fatalf("после temp_error-эпизода HTTP retry_mature:<день> = %d, хочу 1", got)
+		t.Fatalf("after the temp_error HTTP episode retry_mature:<day> = %d, want 1", got)
 	}
 
 	// A no_http episode: does not touch the bucket — only temp_error verdicts ripen.
 	silentRes := &httpworker.DomainResult{ZoneID: zone, DomainID: ids[1], Name: "m1.mature.test"}
 	if ok, err := rec.RecordAndPublish(ctx, silentRes); err != nil || !ok {
-		t.Fatalf("no_http-эпизод: ok=%v err=%v", ok, err)
+		t.Fatalf("no_http episode: ok=%v err=%v", ok, err)
 	}
 	if got := countersRetryMatureToday(t, pool); got != 1 {
-		t.Fatalf("после no_http-эпизода retry_mature:<день> = %d, хочу 1", got)
+		t.Fatalf("after the no_http episode retry_mature:<day> = %d, want 1", got)
 	}
 
 	// The terminal DNS-stage temp_error branch (an apex SERVFAIL): the same
@@ -502,22 +502,22 @@ func TestCounters_RetryMatureBaskets(t *testing.T) {
 		SetStatus: true,
 		Status:    model.StatusTempError,
 	}, nil); err != nil || !ok {
-		t.Fatalf("temp_error-эпизод DNS: ok=%v err=%v", ok, err)
+		t.Fatalf("temp_error DNS episode: ok=%v err=%v", ok, err)
 	}
 	if got := countersRetryMatureToday(t, pool); got != 2 {
-		t.Fatalf("после temp_error-эпизода DNS retry_mature:<день> = %d, хочу 2", got)
+		t.Fatalf("after the temp_error DNS episode retry_mature:<day> = %d, want 2", got)
 	}
 
 	// A duplicate delivery of the HTTP temp_error episode: one more event
 	// (the live window will count 2 domains — the reconciliation brings
 	// the semantic difference together).
 	if ok, err := rec.RecordAndPublish(ctx, tempRes); err != nil || !ok {
-		t.Fatalf("дубль temp_error-эпизода: ok=%v err=%v", ok, err)
+		t.Fatalf("the temp_error episode duplicate: ok=%v err=%v", ok, err)
 	}
 	if got := countersRetryMatureToday(t, pool); got != 3 {
-		t.Fatalf("после дубля retry_mature:<день> = %d, хочу 3", got)
+		t.Fatalf("after the duplicate retry_mature:<day> = %d, want 3", got)
 	}
-	countersVerifyEmpty(t, pool, "после эпизодов (корзины вне verify)")
+	countersVerifyEmpty(t, pool, "after the episodes (the buckets outside verify)")
 
 	// The retry heavy-selection guard: today's bucket is NOT in the sum
 	// (episodes ripen by midnight) — nothing mature, the sum is 0.
@@ -526,10 +526,10 @@ func TestCounters_RetryMatureBaskets(t *testing.T) {
 		"SELECT coalesce(sum(value), 0) FROM crawler_counters "+
 			"WHERE name >= 'retry_mature:' AND name < 'retry_mature:' || to_char(current_date, 'YYYY-MM-DD')",
 	).Scan(&mature); err != nil {
-		t.Fatalf("guard-сумма корзин: %v", err)
+		t.Fatalf("the guard sum of the buckets: %v", err)
 	}
 	if mature != 0 {
-		t.Fatalf("сумма зрелых корзин = %d, хочу 0 (сегодняшние эпизоды незрелые)", mature)
+		t.Fatalf("the sum of the mature buckets = %d, want 0 (today's episodes immature)", mature)
 	}
 
 	// The reconciliation is the authority: the day bucket := the live
@@ -538,22 +538,22 @@ func TestCounters_RetryMatureBaskets(t *testing.T) {
 	// event).
 	pass, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{})
 	if err != nil {
-		t.Fatalf("реконсиляция: %v", err)
+		t.Fatalf("reconciliation: %v", err)
 	}
 	if got := countersRetryMatureToday(t, pool); got != 2 {
-		t.Fatalf("после реконсиляции retry_mature:<день> = %d, хочу 2 (живое окно: два temp_error-домена сегодня)", got)
+		t.Fatalf("after the reconciliation retry_mature:<day> = %d, want 2 (the live window: two temp_error domains today)", got)
 	}
 	byName := map[string]monitor.CounterPosition{}
 	for _, p := range pass.Positions {
 		byName[p.Counter] = p
 	}
 	if p := byName["retry_mature:today"]; p.Old != 3 || p.New != 2 || p.Drift() != 1 {
-		t.Fatalf("retry_mature:today = %+v, хочу old=3 new=2 drift=1 (дубль события)", p)
+		t.Fatalf("retry_mature:today = %+v, want old=3 new=2 drift=1 (a duplicate event)", p)
 	}
 	if p := byName["retry_mature:past"]; p.Old != 0 || p.New != 0 || p.Drift() != 0 {
-		t.Fatalf("retry_mature:past = %+v, хочу нули (зрелой когорты нет)", p)
+		t.Fatalf("retry_mature:past = %+v, want zeros (no mature cohort)", p)
 	}
-	countersVerifyEmpty(t, pool, "после реконсиляции корзин")
+	countersVerifyEmpty(t, pool, "after the buckets reconciliation")
 }
 
 // countersMatureFailPool — a db.DB wrapper of the pool: the retry_mature
@@ -576,7 +576,7 @@ func (p *countersMatureFailPool) CopyFrom(ctx context.Context, tableName pgx.Ide
 
 func (p *countersMatureFailPool) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
 	if strings.Contains(sql, countersMatureIncMark) {
-		return pgconn.CommandTag{}, errors.New("сбой инкремента корзины (сценарий)")
+		return pgconn.CommandTag{}, errors.New("the bucket increment failure (the scenario)")
 	}
 	return p.Pool.Exec(ctx, sql, args...)
 }
@@ -606,10 +606,10 @@ func TestCounters_RetryMatureIncrementFailure(t *testing.T) {
 		Status:    model.StatusTempError,
 	}, nil)
 	if err == nil || !strings.Contains(err.Error(), "retry_mature bucket increment") {
-		t.Fatalf("RecordEpisode = (%v, %v), want (true, ошибка инкремента)", recorded, err)
+		t.Fatalf("RecordEpisode = (%v, %v), want (true, an increment error)", recorded, err)
 	}
 	if !recorded {
-		t.Fatal("recorded = false, want true: переход зафиксирован до сбоя инкремента")
+		t.Fatal("recorded = false, want true: the transition committed before the increment failure")
 	}
 
 	// The transition is written: the domain done + temp_error, the zone deltas honest.
@@ -617,10 +617,10 @@ func TestCounters_RetryMatureIncrementFailure(t *testing.T) {
 	if err := pool.QueryRow(ctx,
 		"SELECT status, check_state FROM domains WHERE zone_id = $1 AND id = $2", zone, ids[0],
 	).Scan(&status, &state); err != nil {
-		t.Fatalf("чтение домена: %v", err)
+		t.Fatalf("read domain: %v", err)
 	}
 	if model.Status(status) != model.StatusTempError || model.CheckState(state) != model.CheckStateDone {
-		t.Fatalf("домен = статус %d состояние %d, want temp_error/done (переход пережил сбой инкремента)",
+		t.Fatalf("the domain = status %d state %d, want temp_error/done (the transition survived the increment failure)",
 			status, state)
 	}
 
@@ -639,25 +639,25 @@ func TestCounters_RetryMatureIncrementFailure(t *testing.T) {
 	case errors.Is(err, pgx.ErrNoRows):
 		basket = 0 // no row — the bucket was not created (the increment failed)
 	case err != nil:
-		t.Fatalf("чтение корзины суток: %v", err)
+		t.Fatalf("read the day bucket: %v", err)
 	}
 	if basket != 0 {
-		t.Fatalf("корзина суток = %d, want 0 (инкремент упал — окно ±1 до реконсиляции)", basket)
+		t.Fatalf("the day bucket = %d, want 0 (the increment failed — the ±1 window until the reconciliation)", basket)
 	}
 
 	// The reconciliation is the authority: the bucket := the live window
 	// (one temp_error × done today), the undercount is caught up.
 	if _, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{}); err != nil {
-		t.Fatalf("реконсиляция: %v", err)
+		t.Fatalf("reconciliation: %v", err)
 	}
 	if err := pool.QueryRow(ctx,
 		"SELECT value FROM crawler_counters "+
 			"WHERE name = 'retry_mature:' || to_char(current_date, 'YYYY-MM-DD')",
 	).Scan(&basket); err != nil {
-		t.Fatalf("чтение корзины суток после прохода: %v", err)
+		t.Fatalf("read the day bucket after the pass: %v", err)
 	}
 	if basket != 1 {
-		t.Fatalf("корзина суток после реконсиляции = %d, want 1 (живое окно догнало сбой инкремента)", basket)
+		t.Fatalf("the day bucket after the reconciliation = %d, want 1 (the live window caught up the increment failure)", basket)
 	}
 }
 
@@ -673,16 +673,16 @@ func TestCounters_DailyChecksDayChange(t *testing.T) {
 	dsn, cleanup := withTestSchema(t)
 	t.Cleanup(cleanup)
 	if err := migrate.Up(context.Background(), dsn); err != nil {
-		t.Fatalf("миграции: %v", err)
+		t.Fatalf("the migrations: %v", err)
 	}
 	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
-		t.Fatalf("разбор DSN: %v", err)
+		t.Fatalf("parsing the DSN: %v", err)
 	}
 	cfg.MaxConns = 1 // the TimeZone is session-level: all statements — one connection
 	pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
 	if err != nil {
-		t.Fatalf("пул: %v", err)
+		t.Fatalf("the pool: %v", err)
 	}
 	t.Cleanup(pool.Close)
 	ctx := context.Background()
@@ -699,7 +699,7 @@ func TestCounters_DailyChecksDayChange(t *testing.T) {
 	setTZ := func(tz string) {
 		t.Helper()
 		if _, err := pool.Exec(ctx, "SELECT set_config('TimeZone', $1, false)", tz); err != nil {
-			t.Fatalf("таймзона %s: %v", tz, err)
+			t.Fatalf("the %s timezone: %v", tz, err)
 		}
 	}
 	var day1, day2 string
@@ -714,7 +714,7 @@ func TestCounters_DailyChecksDayChange(t *testing.T) {
 	day1 = readDate(tzDay1)
 	day2 = readDate(tzDay2)
 	if day1 == day2 {
-		t.Fatalf("таймзоны не развели сутки: %s == %s (прогон в окне ±14ч вокруг полуночи — повторить)", day1, day2)
+		t.Fatalf("the timezones did not split the days: %s == %s (the run in the ±14h window around midnight — repeat)", day1, day2)
 	}
 
 	zone := countersSeedZone(t, pool, "days.test")
@@ -738,10 +738,10 @@ func TestCounters_DailyChecksDayChange(t *testing.T) {
 	if ok, err := rec.RecordAndPublish(ctx, &httpworker.DomainResult{
 		ZoneID: zone, DomainID: ids[0], Name: "d0.days.test",
 	}); err != nil || !ok {
-		t.Fatalf("запись дня 1: ok=%v err=%v", ok, err)
+		t.Fatalf("the day 1 write: ok=%v err=%v", ok, err)
 	}
 	if v, ok := checksRow(day1); !ok || v != 1 {
-		t.Fatalf("checks:%s = (%d, %v), хочу (1, true) — строку создаёт первый инкремент суток", day1, v, ok)
+		t.Fatalf("checks:%s = (%d, %v), want (1, true) — the first daily increment creates the row", day1, v, ok)
 	}
 
 	// Day 2 (for the connection): the second domain — a new row,
@@ -750,26 +750,26 @@ func TestCounters_DailyChecksDayChange(t *testing.T) {
 	if ok, err := rec.RecordAndPublish(ctx, &httpworker.DomainResult{
 		ZoneID: zone, DomainID: ids[1], Name: "d1.days.test",
 	}); err != nil || !ok {
-		t.Fatalf("запись дня 2: ok=%v err=%v", ok, err)
+		t.Fatalf("the day 2 write: ok=%v err=%v", ok, err)
 	}
 	if v, ok := checksRow(day2); !ok || v != 1 {
-		t.Fatalf("checks:%s = (%d, %v), хочу (1, true) — новая строка нового дня", day2, v, ok)
+		t.Fatalf("checks:%s = (%d, %v), want (1, true) — a new row of the new day", day2, v, ok)
 	}
 	if v, ok := checksRow(day1); !ok || v != 1 {
-		t.Fatalf("checks:%s = (%d, %v) после записи дня 2, хочу (1, true) — история не тронута", day1, v, ok)
+		t.Fatalf("checks:%s = (%d, %v) after the day 2 write, want (1, true) — the history untouched", day1, v, ok)
 	}
 
 	// The "day 2" reconciliation: the current_date window sees only the day
 	// 2 domain (the day 1 last_checked_at is outside the window), the day 2
 	// row converges, the pass does not overwrite day 1.
 	if _, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{}); err != nil {
-		t.Fatalf("реконсиляция: %v", err)
+		t.Fatalf("reconciliation: %v", err)
 	}
 	if v, _ := checksRow(day2); v != 1 {
-		t.Fatalf("после реконсиляции checks:%s = %d, хочу 1", day2, v)
+		t.Fatalf("after the reconciliation checks:%s = %d, want 1", day2, v)
 	}
 	if v, _ := checksRow(day1); v != 1 {
-		t.Fatalf("реконсиляция тронула вчерашнюю строку checks:%s = %d, хочу 1 (история)", day1, v)
+		t.Fatalf("the reconciliation touched yesterday's checks:%s = %d, want 1 (history)", day1, v)
 	}
 }
 
@@ -786,7 +786,7 @@ func TestCounters_DNSStageTransitions(t *testing.T) {
 	zone := countersSeedZone(t, pool, "dns.test")
 	ids := countersSeedDomains(t, pool, zone, "p", 4, model.CheckStatePending, model.StatusNew)
 	if _, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{}); err != nil {
-		t.Fatalf("реконсиляция: %v", err)
+		t.Fatalf("reconciliation: %v", err)
 	}
 
 	// Enqueueing: 4 × pending → queued.
@@ -798,7 +798,7 @@ func TestCounters_DNSStageTransitions(t *testing.T) {
 	if _, err := scheduler.EnqueueBatch(ctx, pool, q, batch); err != nil {
 		t.Fatalf("EnqueueBatch: %v", err)
 	}
-	countersVerifyEmpty(t, pool, "после enqueue")
+	countersVerifyEmpty(t, pool, "after the enqueue")
 
 	// d0 "returned by the lease" in the middle of the episode: pending →
 	// done — the delta pending −1/checked +1 (pre-reading the old state,
@@ -806,10 +806,10 @@ func TestCounters_DNSStageTransitions(t *testing.T) {
 	if _, err := pool.Exec(ctx,
 		"UPDATE domains SET check_state = 0, queued_at = NULL WHERE zone_id = $1 AND id = $2",
 		zone, ids[0]); err != nil {
-		t.Fatalf("возврат аренды: %v", err)
+		t.Fatalf("the lease return: %v", err)
 	}
 	if err := countersShiftForManual(ctx, pool, zone, 0, 1, -1, 0); err != nil {
-		t.Fatalf("дельта возврата: %v", err)
+		t.Fatalf("the return delta: %v", err)
 	}
 
 	// A terminal status (not_delegated): queued → done.
@@ -819,39 +819,39 @@ func TestCounters_DNSStageTransitions(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("RecordEpisode terminal: ok=%v err=%v", ok, err)
 	}
-	countersVerifyEmpty(t, pool, "после терминального статуса")
+	countersVerifyEmpty(t, pool, "after the terminal status")
 
 	// The "there are addresses" branch: pending → done.
 	ok, err = dnsworker.RecordEpisode(ctx, pool, zone, ids[0], dnsworker.EpisodeResult{Mask: 3}, nil)
 	if err != nil || !ok {
 		t.Fatalf("RecordEpisode keep-status: ok=%v err=%v", ok, err)
 	}
-	countersVerifyEmpty(t, pool, "после ветки «есть адреса»")
+	countersVerifyEmpty(t, pool, "after the \"there are addresses\" branch")
 
 	// A redelivery of an already committed episode — a no-op.
 	ok, err = dnsworker.RecordEpisode(ctx, pool, zone, ids[1], dnsworker.EpisodeResult{
 		SetStatus: true, Status: model.StatusNotDelegated, Mask: 1,
 	}, nil)
 	if err != nil || ok {
-		t.Fatalf("RecordEpisode дубль: ok=%v err=%v, хочу (false, nil)", ok, err)
+		t.Fatalf("RecordEpisode duplicate: ok=%v err=%v, want (false, nil)", ok, err)
 	}
-	countersVerifyEmpty(t, pool, "после дубля доставки")
+	countersVerifyEmpty(t, pool, "after the delivery duplicate")
 
 	// The invalid diagnosis: queued → done, the row leaves the cycle.
 	ok, err = dnsworker.RecordInvalid(ctx, pool, zone, ids[2], nil)
 	if err != nil || !ok {
 		t.Fatalf("RecordInvalid: ok=%v err=%v", ok, err)
 	}
-	countersVerifyEmpty(t, pool, "после диагноза invalid")
+	countersVerifyEmpty(t, pool, "after the invalid diagnosis")
 
 	var queued, checked int64
 	if err := pool.QueryRow(ctx,
 		"SELECT domains_queued, domains_checked FROM zones WHERE id = $1", zone,
 	).Scan(&queued, &checked); err != nil {
-		t.Fatalf("чтение зоны: %v", err)
+		t.Fatalf("read zone: %v", err)
 	}
 	if queued != 1 || checked != 3 {
-		t.Fatalf("после DNS-переходов queued=%d checked=%d, хочу 1/3", queued, checked)
+		t.Fatalf("after the DNS transitions queued=%d checked=%d, want 1/3", queued, checked)
 	}
 
 	// The daily checks counter (T-179): the increment is an httpworker
@@ -863,14 +863,14 @@ func TestCounters_DNSStageTransitions(t *testing.T) {
 	// observes the difference of the flows (3 DNS-only completions), not a
 	// "zero anomaly".
 	if got := countersChecksToday(t, pool); got != 0 {
-		t.Fatalf("после DNS-переходов checks:<день> = %d, хочу 0 (инкремент — только запись результата HTTP)", got)
+		t.Fatalf("after the DNS transitions checks:<day> = %d, want 0 (the increment is an HTTP result write only)", got)
 	}
 	pass, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{})
 	if err != nil {
-		t.Fatalf("реконсиляция: %v", err)
+		t.Fatalf("reconciliation: %v", err)
 	}
 	if got := countersChecksToday(t, pool); got != 3 {
-		t.Fatalf("после реконсиляции checks:<день> = %d, хочу 3 (живое окно всех веток конвейера)", got)
+		t.Fatalf("after the reconciliation checks:<day> = %d, want 3 (the live window of all the pipeline branches)", got)
 	}
 	dailySeen := false
 	for _, p := range pass.Positions {
@@ -879,11 +879,11 @@ func TestCounters_DNSStageTransitions(t *testing.T) {
 		}
 		dailySeen = true
 		if p.Old != 0 || p.New != 3 || p.Drift() != 3 {
-			t.Fatalf("daily:checks = %+v, хочу old=0 new=3 drift=3 (DNS-only завершения окна)", p)
+			t.Fatalf("daily:checks = %+v, want old=0 new=3 drift=3 (DNS-only window completions)", p)
 		}
 	}
 	if !dailySeen {
-		t.Fatal("позиция daily:checks отсутствует в итогах прохода")
+		t.Fatal("the daily:checks position missing from the pass results")
 	}
 }
 
@@ -911,7 +911,7 @@ func TestCounters_DeleteWhileQueued(t *testing.T) {
 	countersSeedDomains(t, pool, zone, "q", 2, model.CheckStateQueued, model.StatusNew)
 	if _, err := pool.Exec(ctx,
 		"UPDATE zones SET domains_total = 2, domains_queued = 2 WHERE id = $1", zone); err != nil {
-		t.Fatalf("счётчики зоны: %v", err)
+		t.Fatalf("the zone counters: %v", err)
 	}
 
 	// A delete batch into staging (StageTable — a direct INSERT: the batch
@@ -932,18 +932,18 @@ func TestCounters_DeleteWhileQueued(t *testing.T) {
 		t.Fatalf("ApplyDelete: %v", err)
 	}
 	if dres.Deleted != 2 || dres.NotFound != 0 {
-		t.Fatalf("итог delete = %+v, хочу {2 0}", dres)
+		t.Fatalf("the delete outcome = %+v, want {2 0}", dres)
 	}
 	var total, queued int64
 	if err := pool.QueryRow(ctx,
 		"SELECT domains_total, domains_queued FROM zones WHERE id = $1", zone,
 	).Scan(&total, &queued); err != nil {
-		t.Fatalf("чтение зоны: %v", err)
+		t.Fatalf("read zone: %v", err)
 	}
 	if total != 0 || queued != 0 {
-		t.Fatalf("после delete total=%d queued=%d, хочу 0/0", total, queued)
+		t.Fatalf("after the delete total=%d queued=%d, want 0/0", total, queued)
 	}
-	countersVerifyEmpty(t, pool, "после delete в queued")
+	countersVerifyEmpty(t, pool, "after the delete in queued")
 }
 
 // TestCounters_DeleteWithRenderPending — deleting a domain with the
@@ -965,7 +965,7 @@ func TestCounters_DeleteWithRenderPending(t *testing.T) {
 	for _, id := range ids {
 		if _, err := pool.Exec(ctx,
 			"UPDATE domains SET flags = 3 WHERE zone_id = $1 AND id = $2", zone, id); err != nil {
-			t.Fatalf("бит render_pending домена %d: %v", id, err)
+			t.Fatalf("the domain %d render_pending bit: %v", id, err)
 		}
 	}
 	// The counter row exists after migration 000015 (the backfill of an
@@ -974,11 +974,11 @@ func TestCounters_DeleteWithRenderPending(t *testing.T) {
 	if _, err := pool.Exec(ctx,
 		"INSERT INTO crawler_counters (name, value) VALUES ('render_pending', 2) "+
 			"ON CONFLICT (name) DO UPDATE SET value = EXCLUDED.value"); err != nil {
-		t.Fatalf("счётчик долга: %v", err)
+		t.Fatalf("the debt counter: %v", err)
 	}
 	if _, err := pool.Exec(ctx,
 		"UPDATE zones SET domains_total = 2, domains_checked = 2 WHERE id = $1", zone); err != nil {
-		t.Fatalf("счётчики зоны: %v", err)
+		t.Fatalf("the zone counters: %v", err)
 	}
 
 	apply := func(batch ingest.BatchID) ingest.DeleteResult {
@@ -998,7 +998,7 @@ func TestCounters_DeleteWithRenderPending(t *testing.T) {
 	}
 
 	if res := apply(mustBatchID(t)); res.Deleted != 2 || res.NotFound != 0 {
-		t.Fatalf("итог delete = %+v, хочу {2 0}", res)
+		t.Fatalf("the delete outcome = %+v, want {2 0}", res)
 	}
 
 	// The bit is cleared, is_idn preserved; the debt counter decremented by 2.
@@ -1007,21 +1007,21 @@ func TestCounters_DeleteWithRenderPending(t *testing.T) {
 		if err := pool.QueryRow(ctx,
 			"SELECT flags FROM domains WHERE zone_id = $1 AND id = $2", zone, id,
 		).Scan(&flags); err != nil {
-			t.Fatalf("домен r%d: %v", i, err)
+			t.Fatalf("domain r%d: %v", i, err)
 		}
 		if flags != 1 {
-			t.Fatalf("домен r%d: flags = %d, хочу 1 (бит render_pending снят, is_idn сохранён)", i, flags)
+			t.Fatalf("domain r%d: flags = %d, want 1 (the render_pending bit cleared, is_idn preserved)", i, flags)
 		}
 	}
 	var debt int64
 	if err := pool.QueryRow(ctx,
 		"SELECT value FROM crawler_counters WHERE name = 'render_pending'").Scan(&debt); err != nil {
-		t.Fatalf("счётчик долга: %v", err)
+		t.Fatalf("the debt counter: %v", err)
 	}
 	if debt != 0 {
-		t.Fatalf("счётчик рендер-долга = %d, хочу 0 (декремент на 2)", debt)
+		t.Fatalf("the render debt counter = %d, want 0 (a decrement by 2)", debt)
 	}
-	countersVerifyEmpty(t, pool, "после delete с битом")
+	countersVerifyEmpty(t, pool, "after the delete with the bit")
 
 	// A redelivery of the same delete content (a new batch,
 	// at-least-once, spec 3.4): the domains are already deleted — the
@@ -1029,16 +1029,16 @@ func TestCounters_DeleteWithRenderPending(t *testing.T) {
 	// the bits; the report counts the rows as "deleted" (the T-019
 	// semantics).
 	if res := apply(mustBatchID(t)); res.Deleted != 2 || res.NotFound != 0 {
-		t.Fatalf("повтор = %+v, хочу {2 0} (уже удалён — тоже «удалён»)", res)
+		t.Fatalf("the repeat = %+v, want {2 0} (already deleted — also \"deleted\")", res)
 	}
 	if err := pool.QueryRow(ctx,
 		"SELECT value FROM crawler_counters WHERE name = 'render_pending'").Scan(&debt); err != nil {
-		t.Fatalf("счётчик долга (повтор): %v", err)
+		t.Fatalf("the debt counter (the repeat): %v", err)
 	}
 	if debt != 0 {
-		t.Fatalf("счётчик рендер-долга после повтора = %d, хочу 0 (идемпотентность)", debt)
+		t.Fatalf("the render debt counter after the repeat = %d, want 0 (idempotence)", debt)
 	}
-	countersVerifyEmpty(t, pool, "после повтора delete")
+	countersVerifyEmpty(t, pool, "after the delete repeat")
 }
 
 // mustBatchID — a new batch for reapplying in the T-186 scenario.
@@ -1063,27 +1063,27 @@ func TestCounters_DriftCaughtAndFixed(t *testing.T) {
 	zone := countersSeedZone(t, pool, "drift.test")
 	countersSeedDomains(t, pool, zone, "p", 4, model.CheckStatePending, model.StatusNew)
 	if _, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{}); err != nil {
-		t.Fatalf("реконсиляция: %v", err)
+		t.Fatalf("reconciliation: %v", err)
 	}
 
 	// The drift: manual SQL bypassing the transition code.
 	if _, err := pool.Exec(ctx,
 		"UPDATE zones SET domains_pending = domains_pending + 5 WHERE id = $1", zone); err != nil {
-		t.Fatalf("дрейф: %v", err)
+		t.Fatalf("the drift: %v", err)
 	}
 	mismatch, err := monitor.VerifyCounters(ctx, pool, monitor.VerifyOptions{})
 	if err != nil {
 		t.Fatalf("verify: %v", err)
 	}
 	if len(mismatch) != 1 || mismatch[0].Counter != fmt.Sprintf("zone:%d:pending", zone) {
-		t.Fatalf("verify = %+v, хочу единственную зону:%d:pending", mismatch, zone)
+		t.Fatalf("verify = %+v, want the only zone:%d:pending", mismatch, zone)
 	}
 
 	// recount fixes it; a repeat verify is clean.
 	if _, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{}); err != nil {
 		t.Fatalf("recount: %v", err)
 	}
-	countersVerifyEmpty(t, pool, "после recount")
+	countersVerifyEmpty(t, pool, "after the recount")
 }
 
 // countersHourRenderer — a Renderer for the hourly buckets (T-203): a live
@@ -1131,7 +1131,7 @@ func TestCounters_HourlyThroughputBaskets(t *testing.T) {
 	zone := countersSeedZone(t, pool, "hour.test")
 	ids := countersSeedDomains(t, pool, zone, "h", 3, model.CheckStateDone, model.StatusNew)
 	if _, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{}); err != nil {
-		t.Fatalf("стартовый проход: %v", err)
+		t.Fatalf("the starting pass: %v", err)
 	}
 	rec, err := httpworker.NewRecorder(pool, &countersStubQueue{}, nil, nil)
 	if err != nil {
@@ -1153,7 +1153,7 @@ func TestCounters_HourlyThroughputBaskets(t *testing.T) {
 			"VALUES ($1, $2, 1, 2, 'https://old.hour.test/', "+
 			"date_trunc('hour', now() - interval '1 hour') + interval '1 minute')",
 		zone, ids[2]); err != nil {
-		t.Fatalf("строка прошлого часа: %v", err)
+		t.Fatalf("the past hour's row: %v", err)
 	}
 
 	// An episode with two records (two subdomains × one record each): the
@@ -1178,10 +1178,10 @@ func TestCounters_HourlyThroughputBaskets(t *testing.T) {
 		},
 	}
 	if ok, err := rec.RecordAndPublish(ctx, rich); err != nil || !ok {
-		t.Fatalf("эпизод с записями: ok=%v err=%v", ok, err)
+		t.Fatalf("the episode with records: ok=%v err=%v", ok, err)
 	}
 	if v, ok := countersHourlyBucket(t, pool, "results", "date_trunc('hour', now())"); !ok || v != 2 {
-		t.Fatalf("после эпизода results:<час> = (%d, %v), хочу (2, true) — дельта вставленных строк", v, ok)
+		t.Fatalf("after the episode results:<hour> = (%d, %v), want (2, true) — the inserted rows' delta", v, ok)
 	}
 
 	// A silent temp_error episode: no records — it does not touch the bucket.
@@ -1194,10 +1194,10 @@ func TestCounters_HourlyThroughputBaskets(t *testing.T) {
 		}},
 	}
 	if ok, err := rec.RecordAndPublish(ctx, silent); err != nil || !ok {
-		t.Fatalf("молчаливый эпизод: ok=%v err=%v", ok, err)
+		t.Fatalf("the silent episode: ok=%v err=%v", ok, err)
 	}
 	if v, _ := countersHourlyBucket(t, pool, "results", "date_trunc('hour', now())"); v != 2 {
-		t.Fatalf("после молчаливого эпизода results:<час> = %d, хочу 2 (эпизод без строк корзину не трогает)", v)
+		t.Fatalf("after the silent episode results:<hour> = %d, want 2 (an episode without rows does not touch the bucket)", v)
 	}
 
 	// Rendering the episode's row: the rendered bucket of the row's
@@ -1223,7 +1223,7 @@ func TestCounters_HourlyThroughputBaskets(t *testing.T) {
 		t.Fatalf("ProcessResult: ok=%v err=%v", rendered, err)
 	}
 	if v, ok := countersHourlyBucket(t, pool, "rendered", "date_trunc('hour', now())"); !ok || v != 1 {
-		t.Fatalf("после рендера rendered:<час> = (%d, %v), хочу (1, true)", v, ok)
+		t.Fatalf("after the render rendered:<hour> = (%d, %v), want (1, true)", v, ok)
 	}
 
 	// Stale buckets (older than the previous hour): seeded by a direct
@@ -1233,7 +1233,7 @@ func TestCounters_HourlyThroughputBaskets(t *testing.T) {
 		if _, err := pool.Exec(ctx,
 			"INSERT INTO crawler_counters (name, value, updated_at) VALUES ($1, 999, now())", name,
 		); err != nil {
-			t.Fatalf("устаревшая корзина %s: %v", name, err)
+			t.Fatalf("the stale bucket %s: %v", name, err)
 		}
 	}
 
@@ -1242,26 +1242,26 @@ func TestCounters_HourlyThroughputBaskets(t *testing.T) {
 	// converges with the increments (2/1, no semantic divergences — zero
 	// drift); the stale ones are deleted.
 	if _, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{}); err != nil {
-		t.Fatalf("реконсиляция: %v", err)
+		t.Fatalf("reconciliation: %v", err)
 	}
 	if v, ok := countersHourlyBucket(t, pool, "results", "date_trunc('hour', now() - interval '1 hour')"); !ok || v != 1 {
-		t.Fatalf("после реконсиляции results:<prev час> = (%d, %v), хочу (1, true) — живое окно прошлого часа", v, ok)
+		t.Fatalf("after the reconciliation results:<prev hour> = (%d, %v), want (1, true) — the past hour's live window", v, ok)
 	}
 	if v, ok := countersHourlyBucket(t, pool, "rendered", "date_trunc('hour', now() - interval '1 hour')"); !ok || v != 0 {
-		t.Fatalf("после реконсиляции rendered:<prev час> = (%d, %v), хочу (0, true) — пустой prev-час создан нулём", v, ok)
+		t.Fatalf("after the reconciliation rendered:<prev hour> = (%d, %v), want (0, true) — the empty prev hour created by zero", v, ok)
 	}
 	if v, _ := countersHourlyBucket(t, pool, "results", "date_trunc('hour', now())"); v != 2 {
-		t.Fatalf("после реконсиляции results:<час> = %d, хочу 2 (корзина сходится с живым count)", v)
+		t.Fatalf("after the reconciliation results:<hour> = %d, want 2 (the bucket converges with the live count)", v)
 	}
 	if v, _ := countersHourlyBucket(t, pool, "rendered", "date_trunc('hour', now())"); v != 1 {
-		t.Fatalf("после реконсиляции rendered:<час> = %d, хочу 1", v)
+		t.Fatalf("after the reconciliation rendered:<hour> = %d, want 1", v)
 	}
 	for _, name := range []string{"results:2000-01-01T00", "rendered:2000-01-01T00"} {
 		var n int
 		if err := pool.QueryRow(ctx,
 			"SELECT count(*) FROM crawler_counters WHERE name = $1", name,
 		).Scan(&n); err != nil || n != 0 {
-			t.Fatalf("устаревшая корзина %s пережила проход (count=%d err=%v)", name, n, err)
+			t.Fatalf("the stale bucket %s survived the pass (count=%d err=%v)", name, n, err)
 		}
 	}
 
@@ -1273,12 +1273,12 @@ func TestCounters_HourlyThroughputBaskets(t *testing.T) {
 		t.Fatalf("FetchThroughput: %v", err)
 	}
 	if thr.ResultsHour != 3 || thr.RenderedHour != 1 {
-		t.Fatalf("throughput = %+v, хочу results_hour=3 rendered_hour=1 (prev+cur корзины)", thr)
+		t.Fatalf("throughput = %+v, want results_hour=3 rendered_hour=1 (the prev+cur buckets)", thr)
 	}
 	if thr.HourWindowSec < 3600 || thr.HourWindowSec >= 7200 {
-		t.Fatalf("hour_window_sec = %v, хочу [3600, 7200) — окно prev+cur корзин", thr.HourWindowSec)
+		t.Fatalf("hour_window_sec = %v, want [3600, 7200) — the prev+cur buckets window", thr.HourWindowSec)
 	}
-	countersVerifyEmpty(t, pool, "после реконсиляции корзин темпа (корзины вне verify)")
+	countersVerifyEmpty(t, pool, "after the throughput buckets reconciliation (the buckets outside verify)")
 }
 
 // tailContentStub — an analyzer.ContentGetter: no content (ErrNotFound —
@@ -1316,7 +1316,7 @@ func TestCounters_ReanalyzeTailBaskets(t *testing.T) {
 	zone := countersSeedZone(t, pool, "tail.test")
 	ids := countersSeedDomains(t, pool, zone, "t", 2, model.CheckStateDone, model.StatusNew)
 	if _, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{}); err != nil {
-		t.Fatalf("стартовый проход: %v", err)
+		t.Fatalf("the starting pass: %v", err)
 	}
 
 	// The tail of the past hour: a NULL row (a lost q:analyze publication).
@@ -1329,20 +1329,20 @@ func TestCounters_ReanalyzeTailBaskets(t *testing.T) {
 			"VALUES ($1, $2, 1, 2, 'https://lost.tail.test/', "+
 			"date_trunc('hour', now() - interval '1 hour') + interval '1 minute')",
 		zone, ids[1]); err != nil {
-		t.Fatalf("хвост прошлого часа: %v", err)
+		t.Fatalf("the past hour's tail: %v", err)
 	}
 
 	// The reconciliation is the authority: the tails' prev bucket is
 	// created from the live window (1 NULL row of the past hour), cur —
 	// zero.
 	if _, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{}); err != nil {
-		t.Fatalf("реконсиляция: %v", err)
+		t.Fatalf("reconciliation: %v", err)
 	}
 	if v, ok := countersHourlyBucket(t, pool, "reanalyze", "date_trunc('hour', now() - interval '1 hour')"); !ok || v != 1 {
-		t.Fatalf("после реконсиляции reanalyze:<prev час> = (%d, %v), хочу (1, true) — живое окно прошлого часа", v, ok)
+		t.Fatalf("after the reconciliation reanalyze:<prev hour> = (%d, %v), want (1, true) — the past hour's live window", v, ok)
 	}
 	if v, ok := countersHourlyBucket(t, pool, "reanalyze", "date_trunc('hour', now())"); !ok || v != 0 {
-		t.Fatalf("после реконсиляции reanalyze:<час> = (%d, %v), хочу (0, true) — пустой час создан нулём", v, ok)
+		t.Fatalf("after the reconciliation reanalyze:<hour> = (%d, %v), want (0, true) — the empty hour created by zero", v, ok)
 	}
 
 	// The guard is open (a mature tail): the tick reads the window with the
@@ -1354,10 +1354,10 @@ func TestCounters_ReanalyzeTailBaskets(t *testing.T) {
 		t.Fatalf("ReanalyzeTick: %v", err)
 	}
 	if res.Selected != 1 || res.Published != 1 {
-		t.Fatalf("тик = %+v, хочу 1/1 (хвост прошлого часа)", res)
+		t.Fatalf("the tick = %+v, want 1/1 (the past hour's tail)", res)
 	}
 	if got := q.publishes[0]; got.DomainID != ids[1] || got.SubdomainID != 1 {
-		t.Fatalf("публикация = %+v, хочу ключ хвоста", got)
+		t.Fatalf("the publication = %+v, want the tail's key", got)
 	}
 
 	// The analyzer's stamp — a decrement of the episode hour's bucket (in
@@ -1373,17 +1373,17 @@ func TestCounters_ReanalyzeTailBaskets(t *testing.T) {
 	}
 	for i := 0; i < 2; i++ {
 		if _, err := an.ProcessResult(ctx, task); err != nil {
-			t.Fatalf("ProcessResult №%d: %v", i+1, err)
+			t.Fatalf("ProcessResult #%d: %v", i+1, err)
 		}
 	}
 	if v, _ := countersHourlyBucket(t, pool, "reanalyze", "date_trunc('hour', now() - interval '1 hour')"); v != 0 {
-		t.Fatalf("после штампа reanalyze:<prev час> = %d, хочу 0 (декремент без дубля)", v)
+		t.Fatalf("after the stamp reanalyze:<prev hour> = %d, want 0 (a decrement without a duplicate)", v)
 	}
 	var stamped int32
 	if err := pool.QueryRow(ctx,
 		"SELECT rules_version FROM subdomain_results WHERE zone_id = $1 AND domain_id = $2 AND subdomain_id = 1",
 		zone, ids[1]).Scan(&stamped); err != nil || stamped != 1001 {
-		t.Fatalf("rules_version хвоста = (%d, %v), хочу штамп 1001", stamped, err)
+		t.Fatalf("the tail's rules_version = (%d, %v), want the 1001 stamp", stamped, err)
 	}
 
 	// The guard is closed: a fresh NULL row of the CURRENT hour (in-flight
@@ -1394,14 +1394,14 @@ func TestCounters_ReanalyzeTailBaskets(t *testing.T) {
 		"INSERT INTO subdomain_results (zone_id, domain_id, subdomain_id, scheme, final_url, checked_at) "+
 			"VALUES ($1, $2, 2, 2, 'https://inflight.tail.test/', now())",
 		zone, ids[1]); err != nil {
-		t.Fatalf("in-flight строка: %v", err)
+		t.Fatalf("the in-flight row: %v", err)
 	}
 	res2, err := analyzer.ReanalyzeTick(ctx, pool, q, 1001, &cursor, analyzer.ReanalyzeOptions{})
 	if err != nil {
-		t.Fatalf("ReanalyzeTick (guard закрыт): %v", err)
+		t.Fatalf("ReanalyzeTick (the guard closed): %v", err)
 	}
 	if res2 != (analyzer.ReanalyzeResult{}) || len(q.publishes) != 1 {
-		t.Fatalf("тик при закрытом guard = %+v (публикаций %d), хочу 0/0/1 — незрелая строка не вычитывается",
+		t.Fatalf("the tick with the closed guard = %+v (%d publications), want 0/0/1 — the immature row not read",
 			res2, len(q.publishes))
 	}
 
@@ -1410,16 +1410,16 @@ func TestCounters_ReanalyzeTailBaskets(t *testing.T) {
 	if _, err := pool.Exec(ctx,
 		"INSERT INTO crawler_counters (name, value, updated_at) VALUES ('reanalyze:2000-01-01T00', 999, now())",
 	); err != nil {
-		t.Fatalf("устаревшая корзина: %v", err)
+		t.Fatalf("the stale bucket: %v", err)
 	}
 	if _, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{}); err != nil {
-		t.Fatalf("финальная реконсиляция: %v", err)
+		t.Fatalf("the final reconciliation: %v", err)
 	}
 	var n int
 	if err := pool.QueryRow(ctx,
 		"SELECT count(*) FROM crawler_counters WHERE name = 'reanalyze:2000-01-01T00'",
 	).Scan(&n); err != nil || n != 0 {
-		t.Fatalf("устаревшая корзина пережила проход (count=%d err=%v)", n, err)
+		t.Fatalf("the stale bucket survived the pass (count=%d err=%v)", n, err)
 	}
-	countersVerifyEmpty(t, pool, "после сценария корзин хвостов (корзины вне verify)")
+	countersVerifyEmpty(t, pool, "after the tails buckets scenario (the buckets outside verify)")
 }

@@ -114,29 +114,29 @@ func TestHTTPFetch_Tarpit(t *testing.T) {
 		Addrs: []netip.Addr{netip.MustParseAddr(mockserverIP)},
 	})
 	if err != nil {
-		t.Fatalf("Fetch (заголовки тарпита приходят сразу): %v", err)
+		t.Fatalf("Fetch (the tarpit's headers arrive at once): %v", err)
 	}
 	if res.StatusCode != 200 {
-		t.Fatalf("статус = %d, want 200", res.StatusCode)
+		t.Fatalf("status = %d, want 200", res.StatusCode)
 	}
 
 	start := time.Now()
 	body, readErr := io.ReadAll(res.Body)
 	_ = res.Body.Close()
 	if readErr == nil {
-		t.Fatal("чтение бесконечного медленного тела должно прерваться сторожем скорости")
+		t.Fatal("reading the infinite slow body must break by the speed watchdog")
 	}
-	if !strings.Contains(readErr.Error(), "тарпит") {
-		t.Errorf("ошибка не анти-тарпит: %v", readErr)
+	if !strings.Contains(readErr.Error(), "tarpit") {
+		t.Errorf("the error is not anti-tarpit: %v", readErr)
 	}
 	if !httpfetch.IsTimeout(readErr) {
-		t.Errorf("ошибка без тайм-классификации (temp_error у воркера): %v", readErr)
+		t.Errorf("the error without a time classification (temp_error at the worker): %v", readErr)
 	}
 	if n := len(body); n == 0 || int64(n) > httpTarpitCap {
-		t.Errorf("прочитано %d байт — вне диапазона (0; %d]", n, httpTarpitCap)
+		t.Errorf("read %d bytes — outside the range (0; %d]", n, httpTarpitCap)
 	}
 	if el := time.Since(start); el > 10*time.Second {
-		t.Errorf("срабатывание заняло %v — работал общий таймаут, а не сторож скорости", el)
+		t.Errorf("the trigger took %v — the overall timeout worked, not the speed watchdog", el)
 	}
 }
 
@@ -160,18 +160,18 @@ func TestHTTPFetch_HugeBody(t *testing.T) {
 	}
 	defer func() { _ = res.Body.Close() }()
 	if got := res.Header.Get("Content-Length"); got != "1073741824" {
-		t.Fatalf("Content-Length = %q, want 1073741824 (сценарий заявляет гигабайт)", got)
+		t.Fatalf("Content-Length = %q, want 1073741824 (the scenario declares a gigabyte)", got)
 	}
 
 	body, readErr := io.ReadAll(res.Body)
 	if readErr != nil {
-		t.Fatalf("обрезка потолком — не ошибка сети: %v", readErr)
+		t.Fatalf("the cap truncation — not a network error: %v", readErr)
 	}
 	if n := len(body); n != 2<<20 {
-		t.Errorf("прочитано %d байт, want ровно %d (потолок)", n, 2<<20)
+		t.Errorf("read %d bytes, want exactly %d (the cap)", n, 2<<20)
 	}
 	if res.BodyLimiter == nil || !res.BodyLimiter.Truncated() {
-		t.Error("признак Truncated не выставлен (решение о частичности — за T-056/T-058)")
+		t.Error("the Truncated sign not set (the partiality decision belongs to T-056/T-058)")
 	}
 }
 
@@ -191,12 +191,12 @@ func TestHTTPFetch_ZipBomb(t *testing.T) {
 		Addrs: []netip.Addr{netip.MustParseAddr(mockserverIP)},
 	})
 	if err != nil {
-		t.Fatalf("Fetch (заголовки приходят, ошибка — в распаковке тела): %v", err)
+		t.Fatalf("Fetch (the headers arrive, the error — in the body unpacking): %v", err)
 	}
 	_, readErr := io.ReadAll(res.Body)
 	_ = res.Body.Close()
 	if !errors.Is(readErr, httpfetch.ErrDecompressTooLarge) {
-		t.Fatalf("ошибка чтения = %v, want ErrDecompressTooLarge", readErr)
+		t.Fatalf("the read error = %v, want ErrDecompressTooLarge", readErr)
 	}
 }
 
@@ -211,41 +211,41 @@ func TestHTTPChain_RedirectLoops(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	t.Run("бесконечный редирект — лимит", func(t *testing.T) {
+	t.Run("an infinite redirect — the limit", func(t *testing.T) {
 		cr, err := httpfetch.FetchChain(ctx, f, httpfetch.FetchRequest{
 			URL:   httpFetchURL(t, "http://infinite-redirect.crawl.test/"),
 			Addrs: addrs,
 		})
 		if !errors.Is(err, httpfetch.ErrTooManyRedirects) {
-			t.Fatalf("ошибка = %v, want ErrTooManyRedirects", err)
+			t.Fatalf("the error = %v, want ErrTooManyRedirects", err)
 		}
-		if !strings.Contains(err.Error(), "лимит") {
-			t.Errorf("причина не лимит: %v", err)
+		if !strings.Contains(err.Error(), "limit") {
+			t.Errorf("the reason is not the limit: %v", err)
 		}
 		if httpfetch.IsTimeout(err) {
-			t.Error("редирект-лимит не тайм-класс (не temp_error, ТЗ 6.2)")
+			t.Error("the redirect limit is not a time class (not temp_error, spec 6.2)")
 		}
 		if cr == nil || cr.Result != nil {
-			t.Fatal("итоговой страницы нет: Result обязан быть nil")
+			t.Fatal("no final page: the Result must be nil")
 		}
 		if want := httpfetch.DefaultMaxRedirects + 1; len(cr.Chain) != want {
-			t.Errorf("цепочка = %d шагов, want %d (старт + 8 переходов)", len(cr.Chain), want)
+			t.Errorf("the chain = %d steps, want %d (the start + 8 hops)", len(cr.Chain), want)
 		}
 	})
 
-	t.Run("циклический редирект — детект цикла", func(t *testing.T) {
+	t.Run("a cyclic redirect — the cycle detection", func(t *testing.T) {
 		cr, err := httpfetch.FetchChain(ctx, f, httpfetch.FetchRequest{
 			URL:   httpFetchURL(t, "http://cycle-redirect.crawl.test/"),
 			Addrs: addrs,
 		})
 		if !errors.Is(err, httpfetch.ErrTooManyRedirects) {
-			t.Fatalf("ошибка = %v, want ErrTooManyRedirects (цикл — та же классификация)", err)
+			t.Fatalf("the error = %v, want ErrTooManyRedirects (a cycle — the same classification)", err)
 		}
-		if !strings.Contains(err.Error(), "цикл") {
-			t.Errorf("причина не цикл: %v", err)
+		if !strings.Contains(err.Error(), "cycle") {
+			t.Errorf("the reason is not a cycle: %v", err)
 		}
 		if cr == nil || cr.Result != nil || len(cr.Chain) != 3 {
-			t.Errorf("итог = %+v (chain %d), want Result nil и цепочка «/»→/b→/a (старт — главная страница сценария)", cr, len(cr.Chain))
+			t.Errorf("the outcome = %+v (chain %d), want a nil Result and the \"/\"→/b→/a chain (the start — the scenario's main page)", cr, len(cr.Chain))
 		}
 	})
 }
@@ -281,34 +281,34 @@ func TestHTTPFetch_BadTLS(t *testing.T) {
 				Addrs: addrs,
 			})
 			if err != nil {
-				t.Fatalf("коннект с InsecureSkipVerify обязан проходить: %v", err)
+				t.Fatalf("the connect with InsecureSkipVerify must pass: %v", err)
 			}
 			defer func() { _ = res.Body.Close() }()
 			if res.StatusCode != 200 {
-				t.Fatalf("статус = %d, want 200 (некорректный сертификат загрузке не мешает, §8)", res.StatusCode)
+				t.Fatalf("status = %d, want 200 (an invalid certificate does not hinder the fetch, §8)", res.StatusCode)
 			}
 			info := res.TLSInfo
 			if info == nil {
-				t.Fatal("TLSInfo не разобран (издатель/срок/SAN обязаны сохраняться)")
+				t.Fatal("TLSInfo not parsed (the issuer/expiry/SAN must be preserved)")
 			}
 			if info.Valid {
-				t.Error("Valid = true у некорректного сертификата")
+				t.Error("Valid = true for an invalid certificate")
 			}
 			if len(info.Problems) != len(tc.problems) {
-				t.Fatalf("причины = %v, want %v", info.Problems, tc.problems)
+				t.Fatalf("the problems = %v, want %v", info.Problems, tc.problems)
 			}
 			for i, p := range tc.problems {
 				if info.Problems[i] != p {
-					t.Errorf("причина[%d] = %s, want %s (порядок: срок, хост, самоподписанность)", i, info.Problems[i], p)
+					t.Errorf("problem[%d] = %s, want %s (the order: expiry, host, self-signed)", i, info.Problems[i], p)
 				}
 			}
 			if !info.SelfSigned {
-				t.Error("SelfSigned = false — сертификаты mockserver самодельные")
+				t.Error("SelfSigned = false — the mockserver certificates are homemade")
 			}
 		})
 	}
 
-	t.Run("http — TLSInfo nil, не ошибка", func(t *testing.T) {
+	t.Run("http — TLSInfo nil, not an error", func(t *testing.T) {
 		res, err := f.Fetch(ctx, httpfetch.FetchRequest{
 			URL:   httpFetchURL(t, "http://cookies.crawl.test/"),
 			Addrs: addrs,
@@ -318,7 +318,7 @@ func TestHTTPFetch_BadTLS(t *testing.T) {
 		}
 		defer func() { _ = res.Body.Close() }()
 		if res.TLSInfo != nil {
-			t.Error("TLSInfo у http-ответа должен быть nil (§8)")
+			t.Error("TLSInfo of an http answer must be nil (§8)")
 		}
 	})
 }
@@ -472,7 +472,7 @@ func httpRows(t *testing.T, pool *pgxpool.Pool, domainID int64) []httpSubdomainR
 		        alias_subdomain_id, content_hash, error
 		 FROM subdomain_results WHERE domain_id = $1 ORDER BY subdomain_id`, domainID)
 	if err != nil {
-		t.Fatalf("чтение subdomain_results: %v", err)
+		t.Fatalf("read subdomain_results: %v", err)
 	}
 	defer rows.Close()
 	var out []httpSubdomainRow
@@ -480,12 +480,12 @@ func httpRows(t *testing.T, pool *pgxpool.Pool, domainID int64) []httpSubdomainR
 		var r httpSubdomainRow
 		if err := rows.Scan(&r.subdomainID, &r.variant, &r.scheme, &r.httpStatus, &r.finalURL,
 			&r.aliasKind, &r.aliasSubdomain, &r.contentHash, &r.errCode); err != nil {
-			t.Fatalf("строка subdomain_results: %v", err)
+			t.Fatalf("a subdomain_results row: %v", err)
 		}
 		out = append(out, r)
 	}
 	if err := rows.Err(); err != nil {
-		t.Fatalf("итерация subdomain_results: %v", err)
+		t.Fatalf("subdomain_results iteration: %v", err)
 	}
 	return out
 }
@@ -507,7 +507,7 @@ func httpDomainState(t *testing.T, pool *pgxpool.Pool, domainID int64) httpDomai
 		 FROM domains WHERE id = $1`, domainID,
 	).Scan(&r.status, &r.checkState, &r.queuedAt, &r.lastCheckedAt, &r.tempAttempts)
 	if err != nil {
-		t.Fatalf("чтение domains: %v", err)
+		t.Fatalf("reading domains: %v", err)
 	}
 	return r
 }
@@ -530,37 +530,37 @@ func TestHTTPWorker_E2E(t *testing.T) {
 	var zoneID int16
 	if err := env.pool.QueryRow(ctx,
 		"SELECT id FROM zones WHERE name = $1", "crawl.test").Scan(&zoneID); err != nil {
-		t.Fatalf("зона crawl.test: %v", err)
+		t.Fatalf("zone crawl.test: %v", err)
 	}
 	// The bare-to-www page hash for the contents checks.
 	var pageHash *content.Hash
 
-	t.Run("same-site: один сайт — единственная запись variant 0", func(t *testing.T) {
+	t.Run("same-site: one site — the only variant 0 record", func(t *testing.T) {
 		task := httpTask(zoneID, ids[0], "same-site.crawl.test", map[int16]string{0: "", 1: "www"})
 		res := env.process(ctx, t, task)
 		if !res.HasRecords() {
-			t.Fatal("домен same-site обязан быть alive (записи есть)")
+			t.Fatal("the same-site domain must be alive (records exist)")
 		}
 
 		apex := res.Subdomains[0]
 		if len(apex.Records) != 1 {
-			t.Fatalf("записей апекса: %d, want 1 (протоколы сходятся на один сайт)", len(apex.Records))
+			t.Fatalf("apex records: %d, want 1 (the protocols converge on one site)", len(apex.Records))
 		}
 		rec := apex.Records[0]
 		if rec.Variant != model.VariantMain || rec.Scheme != model.SchemeHTTPS {
-			t.Errorf("вариант/схема = %d/%d, want 0/https (https канонический, ТЗ 5.5 п. 5)", rec.Variant, rec.Scheme)
+			t.Errorf("variant/scheme = %d/%d, want 0/https (https canonical, spec 5.5 item 5)", rec.Variant, rec.Scheme)
 		}
 		if rec.FinalURL != "https://same-site.crawl.test/" {
-			t.Errorf("итоговый URL = %q, want https://same-site.crawl.test/", rec.FinalURL)
+			t.Errorf("the final URL = %q, want https://same-site.crawl.test/", rec.FinalURL)
 		}
 		if rec.AliasKind != model.AliasNone || rec.AliasSubdomainID != nil {
-			t.Errorf("алиас апекса = %d/%v, want нет", rec.AliasKind, rec.AliasSubdomainID)
+			t.Errorf("the apex alias = %d/%v, want none", rec.AliasKind, rec.AliasSubdomainID)
 		}
 		if rec.HTTPStatus != 200 || rec.ErrClass != httpworker.ErrNone {
-			t.Errorf("статус/ошибка = %d/%s, want 200/none", rec.HTTPStatus, rec.ErrClass)
+			t.Errorf("status/error = %d/%s, want 200/none", rec.HTTPStatus, rec.ErrClass)
 		}
 		if !rec.StoreContent || rec.ContentHash == nil {
-			t.Error("контент оригинала не сохраняется (StoreContent/ContentHash)")
+			t.Error("the original's content not stored (StoreContent/ContentHash)")
 		}
 
 		// www.same-site is not configured in Caddy: https is rejected by
@@ -569,45 +569,45 @@ func TestHTTPWorker_E2E(t *testing.T) {
 		// item 5).
 		www := res.Subdomains[1]
 		if len(www.Records) != 1 || www.Records[0].Scheme != model.SchemeHTTP {
-			t.Fatalf("записи www = %d, want 1 по http", len(www.Records))
+			t.Fatalf("www records = %d, want 1 over http", len(www.Records))
 		}
 		if www.HTTPS.Available {
-			t.Error("https www.same-site должен падать (хост не настроен в Caddy)")
+			t.Error("https www.same-site must fail (the host not configured in Caddy)")
 		}
 	})
 
-	t.Run("bare→www: алиас и контент один раз", func(t *testing.T) {
+	t.Run("bare→www: an alias and the content once", func(t *testing.T) {
 		task := httpTask(zoneID, ids[1], "bare-to-www.crawl.test", map[int16]string{0: "", 1: "www"})
 		res := env.process(ctx, t, task)
 
 		apex := res.Subdomains[0]
 		if len(apex.Records) != 1 {
-			t.Fatalf("записей апекса: %d, want 1", len(apex.Records))
+			t.Fatalf("apex records: %d, want 1", len(apex.Records))
 		}
 		arec := apex.Records[0]
 		if arec.AliasKind != model.AliasRedirect {
-			t.Errorf("alias_kind апекса = %d, want 2 (редирект на субдомен-оригинал)", arec.AliasKind)
+			t.Errorf("the apex's alias_kind = %d, want 2 (a redirect to the original subdomain)", arec.AliasKind)
 		}
 		if arec.AliasSubdomainID == nil || *arec.AliasSubdomainID != 1 {
 			t.Errorf("alias_subdomain_id = %v, want 1 (www)", arec.AliasSubdomainID)
 		}
 		if arec.StoreContent || arec.ContentHash != nil {
-			t.Error("алиас не хранит собственный контент (хэш нормализуется в NULL)")
+			t.Error("the alias does not store its own content (the hash normalized to NULL)")
 		}
 		if arec.FinalURL != "https://www.bare-to-www.crawl.test/" {
-			t.Errorf("итоговый URL апекса = %q, want https://www.bare-to-www.crawl.test/", arec.FinalURL)
+			t.Errorf("the apex's final URL = %q, want https://www.bare-to-www.crawl.test/", arec.FinalURL)
 		}
 
 		www := res.Subdomains[1]
 		if len(www.Records) != 1 {
-			t.Fatalf("записей www: %d, want 1", len(www.Records))
+			t.Fatalf("www records: %d, want 1", len(www.Records))
 		}
 		wrec := www.Records[0]
 		if wrec.AliasKind != model.AliasNone || wrec.AliasSubdomainID != nil {
-			t.Errorf("alias www = %d/%v, want нет (запись-оригинал «дома»)", wrec.AliasKind, wrec.AliasSubdomainID)
+			t.Errorf("the www alias = %d/%v, want none (the original record \"at home\")", wrec.AliasKind, wrec.AliasSubdomainID)
 		}
 		if !wrec.StoreContent || wrec.ContentHash == nil {
-			t.Fatal("контент оригинала не сохранён")
+			t.Fatal("the original's content not stored")
 		}
 		h := *wrec.ContentHash
 		pageHash = &h
@@ -615,48 +615,48 @@ func TestHTTPWorker_E2E(t *testing.T) {
 		// The page is read from the store (a roundtrip, spec 11.4 item 3).
 		body, err := env.store.Get(ctx, h)
 		if err != nil {
-			t.Fatalf("Get контента: %v", err)
+			t.Fatalf("Get of the content: %v", err)
 		}
 		if !strings.Contains(string(body), "bare-to-www.crawl.test") {
-			t.Errorf("контент не похож на страницу фикстуры: %.80q", body)
+			t.Errorf("the content does not look like the fixture page: %.80q", body)
 		}
 	})
 
-	t.Run("строки subdomain_results", func(t *testing.T) {
+	t.Run("subdomain_results rows", func(t *testing.T) {
 		rows := httpRows(t, env.pool, ids[1])
 		if len(rows) != 2 {
-			t.Fatalf("строк у bare-to-www: %d, want 2 (апекс и www, variant 0)", len(rows))
+			t.Fatalf("bare-to-www rows: %d, want 2 (the apex and www, variant 0)", len(rows))
 		}
 		apex, www := rows[0], rows[1]
 		if apex.subdomainID != 0 || www.subdomainID != 1 {
-			t.Fatalf("порядок строк: subdomain_id = %d, %d, want 0, 1", apex.subdomainID, www.subdomainID)
+			t.Fatalf("row order: subdomain_id = %d, %d, want 0, 1", apex.subdomainID, www.subdomainID)
 		}
 		for _, r := range rows {
 			if r.variant != int16(model.VariantMain) || r.scheme != int16(model.SchemeHTTPS) {
-				t.Errorf("строка %d: variant/scheme = %d/%d, want 0/https", r.subdomainID, r.variant, r.scheme)
+				t.Errorf("row %d: variant/scheme = %d/%d, want 0/https", r.subdomainID, r.variant, r.scheme)
 			}
 			if r.httpStatus != 200 || r.finalURL != "https://www.bare-to-www.crawl.test/" {
-				t.Errorf("строка %d: статус/URL = %d/%q", r.subdomainID, r.httpStatus, r.finalURL)
+				t.Errorf("row %d: status/URL = %d/%q", r.subdomainID, r.httpStatus, r.finalURL)
 			}
 			if r.errCode != nil {
-				t.Errorf("строка %d: error = %d, want NULL", r.subdomainID, *r.errCode)
+				t.Errorf("row %d: error = %d, want NULL", r.subdomainID, *r.errCode)
 			}
 		}
 		if apex.aliasKind != int16(model.AliasRedirect) || apex.aliasSubdomain == nil || *apex.aliasSubdomain != 1 {
-			t.Errorf("апекс: alias = %d/%v, want 2/1", apex.aliasKind, apex.aliasSubdomain)
+			t.Errorf("apex: alias = %d/%v, want 2/1", apex.aliasKind, apex.aliasSubdomain)
 		}
 		if apex.contentHash != nil {
-			t.Error("апекс: content_hash должен быть NULL (контент — у оригинала)")
+			t.Error("apex: content_hash must be NULL (the content belongs to the original)")
 		}
 		if www.aliasKind != int16(model.AliasNone) || www.aliasSubdomain != nil {
-			t.Errorf("www: alias = %d/%v, want нет", www.aliasKind, www.aliasSubdomain)
+			t.Errorf("www: alias = %d/%v, want none", www.aliasKind, www.aliasSubdomain)
 		}
 		if len(www.contentHash) != 16 {
-			t.Errorf("www: content_hash = %d байт, want 16", len(www.contentHash))
+			t.Errorf("www: content_hash = %d bytes, want 16", len(www.contentHash))
 		}
 	})
 
-	t.Run("домены: alive/done, lease завершён", func(t *testing.T) {
+	t.Run("domains: alive/done, the lease finished", func(t *testing.T) {
 		for i, label := range labels {
 			r := httpDomainState(t, env.pool, ids[i])
 			if r.status != model.StatusAlive {
@@ -671,15 +671,15 @@ func TestHTTPWorker_E2E(t *testing.T) {
 		}
 	})
 
-	t.Run("публикация q:analyze", func(t *testing.T) {
+	t.Run("publishing q:analyze", func(t *testing.T) {
 		if n := streamLen(t, env.rdb, queue.StreamAnalyze); n != 4 {
-			t.Fatalf("записей в q:analyze = %d, want 4 (по одной на запись субдомен×вариант)", n)
+			t.Fatalf("entries in q:analyze = %d, want 4 (one per subdomain×variant write)", n)
 		}
 		got := map[string]bool{}
 		for _, d := range consumeTasks(t, env.q, queue.StreamAnalyze, "it-http-e2e", "an", 10) {
 			res, err := queue.Decode[queue.Result](d)
 			if err != nil {
-				t.Fatalf("декодирование Result: %v", err)
+				t.Fatalf("decoding Result: %v", err)
 			}
 			got[fmt.Sprintf("%d/%d/%d", res.DomainID, res.SubdomainID, res.Variant)] = true
 		}
@@ -689,25 +689,25 @@ func TestHTTPWorker_E2E(t *testing.T) {
 			want[fmt.Sprintf("%d/1/0", id)] = true
 		}
 		if len(got) != len(want) {
-			t.Fatalf("ключи q:analyze = %v, want %v", got, want)
+			t.Fatalf("the q:analyze keys = %v, want %v", got, want)
 		}
 		for k := range want {
 			if !got[k] {
-				t.Errorf("в q:analyze нет ключа %s (домен/субдомен/вариант)", k)
+				t.Errorf("no %s key in q:analyze (domain/subdomain/variant)", k)
 			}
 		}
 	})
 
-	t.Run("повторная доставка: refcount не течёт", func(t *testing.T) {
+	t.Run("a redelivery: no refcount leak", func(t *testing.T) {
 		if pageHash == nil {
-			t.Fatal("хэш страницы не зафиксирован (проверка bare→www не прошла)")
+			t.Fatal("the page's hash not pinned (the bare→www check did not pass)")
 		}
 		before, ok := contentRowByHash(t, env.pool, *pageHash)
 		if !ok {
-			t.Fatal("контент страницы не записан в contents до повтора")
+			t.Fatal("the page's content not stored in contents before the repeat")
 		}
 		if before.refc != 1 {
-			t.Fatalf("refcount до повтора = %d, want 1", before.refc)
+			t.Fatalf("the refcount before the repeat = %d, want 1", before.refc)
 		}
 
 		task := httpTask(zoneID, ids[1], "bare-to-www.crawl.test", map[int16]string{0: "", 1: "www"})
@@ -715,16 +715,16 @@ func TestHTTPWorker_E2E(t *testing.T) {
 
 		after, ok := contentRowByHash(t, env.pool, *pageHash)
 		if !ok {
-			t.Fatal("контент исчез после повторной доставки")
+			t.Fatal("the content disappeared after the redelivery")
 		}
 		if after.refc != 1 {
-			t.Errorf("refcount после повтора = %d, want 1 (повторный Put +1 и DELETE старой строки −1)", after.refc)
+			t.Errorf("the refcount after the repeat = %d, want 1 (a repeat Put +1 and the old row's DELETE −1)", after.refc)
 		}
 		if n := len(httpRows(t, env.pool, ids[1])); n != 2 {
-			t.Errorf("строк после повтора = %d, want 2 (перезапись, а не рост)", n)
+			t.Errorf("rows after the repeat = %d, want 2 (an overwrite, not growth)", n)
 		}
 		if n := streamLen(t, env.rdb, queue.StreamAnalyze); n != 6 {
-			t.Errorf("записей в q:analyze = %d, want 6 (дубликаты ограничены доставкой)", n)
+			t.Errorf("entries in q:analyze = %d, want 6 (the duplicates limited by delivery)", n)
 		}
 	})
 }
@@ -762,7 +762,7 @@ func TestHTTPWorker_EvilScenarios(t *testing.T) {
 	var zoneID int16
 	if err := env.pool.QueryRow(ctx,
 		"SELECT id FROM zones WHERE name = $1", "crawl.test").Scan(&zoneID); err != nil {
-		t.Fatalf("зона crawl.test: %v", err)
+		t.Fatalf("zone crawl.test: %v", err)
 	}
 	byLabel := map[string]int64{}
 	for i, l := range labels {
@@ -776,106 +776,106 @@ func TestHTTPWorker_EvilScenarios(t *testing.T) {
 		return env.process(ctx, t, httpTask(zoneID, byLabel[label], name, map[int16]string{0: ""}))
 	}
 
-	t.Run("тарпит: тайм-классификация → temp_error", func(t *testing.T) {
+	t.Run("the tarpit: the time classification → temp_error", func(t *testing.T) {
 		res := run("tarpit")
 		for _, c := range []struct {
 			name string
 			chk  httpworker.SchemeCheck
 		}{{"https", res.Subdomains[0].HTTPS}, {"http", res.Subdomains[0].HTTP}} {
 			if c.chk.ErrClass != httpworker.ErrTimeout {
-				t.Errorf("%s: класс = %s, want timeout (temp_error, ТЗ 6.2)", c.name, c.chk.ErrClass)
+				t.Errorf("%s: class = %s, want timeout (temp_error, spec 6.2)", c.name, c.chk.ErrClass)
 			}
 			if c.chk.Available {
-				t.Errorf("%s: Available у оборванного тарпита", c.name)
+				t.Errorf("%s: Available for the cut-off tarpit", c.name)
 			}
 		}
 		if res.HasRecords() || !res.AnyTimeout() {
-			t.Fatal("записей нет и есть таймауты — вход статуса temp_error (§7)")
+			t.Fatal("no records and there are timeouts — the temp_error status input (§7)")
 		}
 		if r := httpDomainState(t, env.pool, byLabel["tarpit"]); r.status != model.StatusTempError {
-			t.Errorf("статус тарпита = %s, want temp_error (не no_http)", r.status)
+			t.Errorf("the tarpit's status = %s, want temp_error (not no_http)", r.status)
 		}
 	})
 
-	t.Run("закрытые порты: без ответа → no_http", func(t *testing.T) {
+	t.Run("closed ports: no answer → no_http", func(t *testing.T) {
 		res := run("closed-ports")
 		if res.HasRecords() {
-			t.Fatal("веб молчит — записей быть не должно")
+			t.Fatal("the web silent — there must be no records")
 		}
 		if res.AnyTimeout() {
-			t.Error("отказ соединения — не тайм-класс (не temp_error)")
+			t.Error("a connection refusal is not a time class (not temp_error)")
 		}
 		if r := httpDomainState(t, env.pool, byLabel["closed-ports"]); r.status != model.StatusNoHTTP {
-			t.Errorf("статус = %s, want no_http", r.status)
+			t.Errorf("status = %s, want no_http", r.status)
 		}
 	})
 
-	t.Run("гигантское тело: обрезка без контента", func(t *testing.T) {
+	t.Run("a giant body: truncation without content", func(t *testing.T) {
 		res := run("huge-body")
 		recs := res.Subdomains[0].Records
 		if len(recs) != 1 {
-			t.Fatalf("записей: %d, want 1 (статус получен — протокол доступен)", len(recs))
+			t.Fatalf("records: %d, want 1 (the status received — the protocol available)", len(recs))
 		}
 		rec := recs[0]
 		if rec.HTTPStatus != 200 || !rec.Truncated || rec.ErrClass != httpworker.ErrBody {
-			t.Errorf("статус/обрезка/класс = %d/%v/%s, want 200/truncated/body (§8)", rec.HTTPStatus, rec.Truncated, rec.ErrClass)
+			t.Errorf("status/truncation/class = %d/%v/%s, want 200/truncated/body (§8)", rec.HTTPStatus, rec.Truncated, rec.ErrClass)
 		}
 		if rec.ContentHash != nil || !rec.ContentNotStored {
-			t.Error("обрезанное тело не хэшируется и не сохраняется (хэш усечённых байт врал бы при дедупе, T-056)")
+			t.Error("the truncated body not hashed and not stored (a hash of truncated bytes would lie at dedup, T-056)")
 		}
 		rows := httpRows(t, env.pool, byLabel["huge-body"])
 		if len(rows) != 1 || rows[0].errCode == nil || *rows[0].errCode != int16(httpworker.ErrBody) {
-			t.Fatalf("строки БД = %+v, want одна с error=body", rows)
+			t.Fatalf("the DB rows = %+v, want one with error=body", rows)
 		}
 		if rows[0].contentHash != nil {
-			t.Error("content_hash обрезанной записи должен быть NULL")
+			t.Error("the truncated record's content_hash must be NULL")
 		}
 		if r := httpDomainState(t, env.pool, byLabel["huge-body"]); r.status != model.StatusAlive {
-			t.Errorf("статус = %s, want alive (страница ответила)", r.status)
+			t.Errorf("status = %s, want alive (the page answered)", r.status)
 		}
 	})
 
-	t.Run("zip-бомба: ErrBody без записей", func(t *testing.T) {
+	t.Run("a zip bomb: ErrBody without records", func(t *testing.T) {
 		res := run("zip-bomb")
 		for _, chk := range []httpworker.SchemeCheck{res.Subdomains[0].HTTPS, res.Subdomains[0].HTTP} {
 			if chk.ErrClass != httpworker.ErrBody || chk.Available {
-				t.Errorf("класс/Available = %s/%v, want body/false (потолок распаковки, T-051)", chk.ErrClass, chk.Available)
+				t.Errorf("class/Available = %s/%v, want body/false (the unpacking cap, T-051)", chk.ErrClass, chk.Available)
 			}
 		}
 		if res.HasRecords() {
-			t.Error("страницы нет — записей быть не должно")
+			t.Error("no page — there must be no records")
 		}
 		if r := httpDomainState(t, env.pool, byLabel["zip-bomb"]); r.status != model.StatusNoHTTP {
-			t.Errorf("статус = %s, want no_http (лимит — не temp-класс)", r.status)
+			t.Errorf("status = %s, want no_http (the limit is not a temp class)", r.status)
 		}
 	})
 
-	t.Run("бесконечный редирект: ErrRedirects, не temp", func(t *testing.T) {
+	t.Run("an infinite redirect: ErrRedirects, not temp", func(t *testing.T) {
 		res := run("infinite-redirect")
 		chk := res.Subdomains[0].HTTPS
 		if chk.ErrClass != httpworker.ErrRedirects {
-			t.Fatalf("класс = %s, want redirects", chk.ErrClass)
+			t.Fatalf("class = %s, want redirects", chk.ErrClass)
 		}
 		if chk.ErrClass.IsTemp() {
-			t.Error("редирект-лимит — постоянное свойство сайта (не temp_error, T-048)")
+			t.Error("the redirect limit is a permanent property of the site (not temp_error, T-048)")
 		}
 		if want := httpfetch.DefaultMaxRedirects + 1; len(chk.Redirects) != want {
-			t.Errorf("цепочка в результате = %d шагов, want %d", len(chk.Redirects), want)
+			t.Errorf("the chain in the result = %d steps, want %d", len(chk.Redirects), want)
 		}
 		if r := httpDomainState(t, env.pool, byLabel["infinite-redirect"]); r.status != model.StatusNoHTTP {
-			t.Errorf("статус = %s, want no_http", r.status)
+			t.Errorf("status = %s, want no_http", r.status)
 		}
 	})
 
-	t.Run("SPA-оболочка: вердикт рендера и контент", func(t *testing.T) {
+	t.Run("the SPA shell: the render verdict and content", func(t *testing.T) {
 		res := run("spa-shell")
 		recs := res.Subdomains[0].Records
 		if len(recs) != 1 {
-			t.Fatalf("записей: %d, want 1", len(recs))
+			t.Fatalf("records: %d, want 1", len(recs))
 		}
 		rec := recs[0]
 		if rec.SPA == nil || !rec.SPA.SPA {
-			t.Fatal("SPA-вердикт не выставлен (T-057: публикация q:render — рендер-этап)")
+			t.Fatal("the SPA verdict not set (T-057: the q:render publication — the render stage)")
 		}
 		reasons := map[httpfetch.SPAReason]bool{}
 		for _, r := range rec.SPA.Reasons {
@@ -885,18 +885,18 @@ func TestHTTPWorker_EvilScenarios(t *testing.T) {
 			httpfetch.SPAReasonLowText, httpfetch.SPAReasonRootContainer, httpfetch.SPAReasonNoScriptJS,
 		} {
 			if !reasons[want] {
-				t.Errorf("признак %s не сработал (фикстура #root + noscript)", want)
+				t.Errorf("the sign %s did not fire (the fixture #root + noscript)", want)
 			}
 		}
 		if rec.Charset != "utf-8" {
-			t.Errorf("кодировка = %q, want utf-8", rec.Charset)
+			t.Errorf("the charset = %q, want utf-8", rec.Charset)
 		}
 		if !rec.StoreContent || rec.ContentHash == nil {
-			t.Error("контент SPA-оболочки обязан сохраняться (рендер заменит его позже, T-067)")
+			t.Error("the SPA shell's content must be stored (the render will replace it later, T-067)")
 		}
 		rows := httpRows(t, env.pool, byLabel["spa-shell"])
 		if len(rows) != 1 || rows[0].contentHash == nil {
-			t.Fatalf("строки БД = %+v, want одна с контентом", rows)
+			t.Fatalf("the DB rows = %+v, want one with content", rows)
 		}
 	})
 
@@ -909,29 +909,29 @@ func TestHTTPWorker_EvilScenarios(t *testing.T) {
 		{"tls-wrong-san", []httpfetch.TLSProblem{httpfetch.TLSProblemHostnameMismatch, httpfetch.TLSProblemSelfSigned}},
 	}
 	for _, tc := range tlsCases {
-		t.Run(tc.label+": загрузка + TLSInfo в записи", func(t *testing.T) {
+		t.Run(tc.label+": the fetch + TLSInfo in the record", func(t *testing.T) {
 			res := run(tc.label)
 			chk := res.Subdomains[0].HTTPS
 			if !chk.Available || chk.TLS == nil {
-				t.Fatalf("https недоступен или TLS не разобран (некорректный сертификат не мешает, §8)")
+				t.Fatalf("https unavailable or TLS not parsed (an invalid certificate does not hinder, §8)")
 			}
 			if chk.TLS.Valid || len(chk.TLS.Problems) != len(tc.problems) {
-				t.Fatalf("проверка сертификата = valid:%v problems:%v, want false %v",
+				t.Fatalf("the certificate check = valid:%v problems:%v, want false %v",
 					chk.TLS.Valid, chk.TLS.Problems, tc.problems)
 			}
 			rows := httpRows(t, env.pool, byLabel[tc.label])
 			if len(rows) != 1 {
-				t.Fatalf("строк: %d, want 1 (протоколы ведут на один сайт)", len(rows))
+				t.Fatalf("rows: %d, want 1 (the protocols lead to one site)", len(rows))
 			}
 			var tlsJSON string
 			if err := env.pool.QueryRow(ctx,
 				"SELECT tls::text FROM subdomain_results WHERE domain_id = $1", byLabel[tc.label],
 			).Scan(&tlsJSON); err != nil {
-				t.Fatalf("чтение tls jsonb: %v", err)
+				t.Fatalf("reading the tls jsonb: %v", err)
 			}
 			for _, p := range tc.problems {
 				if !strings.Contains(tlsJSON, `"`+p.String()+`"`) {
-					t.Errorf("tls jsonb без причины %s: %s", p, tlsJSON)
+					t.Errorf("the tls jsonb without the %s problem: %s", p, tlsJSON)
 				}
 			}
 		})

@@ -34,7 +34,7 @@ func dbTestEnv(t *testing.T) *pgxpool.Pool {
 
 	base, err := pgxpool.New(ctx, pgDSN(t))
 	if err != nil {
-		t.Fatalf("подключение к PostgreSQL: %v", err)
+		t.Fatalf("PostgreSQL connection: %v", err)
 	}
 
 	schema := fmt.Sprintf("db_test_%d_%d", os.Getpid(), time.Now().UnixNano()%1_000_000)
@@ -67,7 +67,7 @@ func dbTestEnv(t *testing.T) *pgxpool.Pool {
 	t.Cleanup(func() {
 		pool.Close()
 		if _, err := base.Exec(ctx, "DROP SCHEMA IF EXISTS "+schema+" CASCADE"); err != nil {
-			t.Errorf("очистка схемы %s: %v", schema, err)
+			t.Errorf("schema %s cleanup: %v", schema, err)
 		}
 		base.Close()
 	})
@@ -104,10 +104,10 @@ func itemsCopy(t *testing.T, ctx context.Context, pool *pgxpool.Pool, n int64, b
 	t.Helper()
 	total, err := db.CopyFromStream(ctx, pool, pgx.Identifier{"items"}, itemsCopyColumns, batchSize, itemsIter(n, nil))
 	if err != nil {
-		t.Fatalf("COPY %d строк: %v", n, err)
+		t.Fatalf("COPY %d rows: %v", n, err)
 	}
 	if total != n {
-		t.Fatalf("COPY вернул %d, want %d", total, n)
+		t.Fatalf("COPY returned %d, want %d", total, n)
 	}
 }
 
@@ -131,14 +131,14 @@ func TestDB_PoolOpen(t *testing.T) {
 	pool := dbTestEnv(t)
 
 	if max := pool.Config().MaxConns; max != 4 {
-		t.Errorf("MaxConns = %d, want 4 (pool_size из NewOptions)", max)
+		t.Errorf("MaxConns = %d, want 4 (pool_size from NewOptions)", max)
 	}
 	var one int
 	if err := pool.QueryRow(context.Background(), "SELECT 1").Scan(&one); err != nil || one != 1 {
 		t.Errorf("SELECT 1: %d, err=%v", one, err)
 	}
 	if total := pool.Stat().TotalConns(); total < 1 {
-		t.Errorf("TotalConns = %d, want >= 1 после запроса", total)
+		t.Errorf("TotalConns = %d, want >= 1 after a query", total)
 	}
 }
 
@@ -154,7 +154,7 @@ func TestDB_CopyFromStream(t *testing.T) {
 	itemsCopy(t, ctx, pool, n, 100)
 
 	if got := countItems(t, pool, ""); got != n {
-		t.Errorf("строк в items = %d, want %d", got, n)
+		t.Errorf("rows in items = %d, want %d", got, n)
 	}
 
 	var data string
@@ -162,7 +162,7 @@ func TestDB_CopyFromStream(t *testing.T) {
 		t.Fatal(err)
 	}
 	if want := itemData(500); data != want {
-		t.Errorf("data строки 500 = %q, want %q (COPY исказил спецсимволы?)", data, want)
+		t.Errorf("row 500 data = %q, want %q (did COPY distort the special characters?)", data, want)
 	}
 
 	var status int
@@ -170,7 +170,7 @@ func TestDB_CopyFromStream(t *testing.T) {
 		t.Fatal(err)
 	}
 	if status != 0 {
-		t.Errorf("status = %d, want 0 (DEFAULT колонки вне списка COPY)", status)
+		t.Errorf("status = %d, want 0 (a DEFAULT column outside the COPY list)", status)
 	}
 }
 
@@ -195,10 +195,10 @@ func TestDB_CopyFromStream_Cancel(t *testing.T) {
 		t.Fatalf("err = %v, want context.Canceled", err)
 	}
 	if total != 30 {
-		t.Errorf("скопировано %d, want 30 (пачки до отмены)", total)
+		t.Errorf("copied %d, want 30 (the batches before the cancel)", total)
 	}
 	if got := countItems(t, pool, ""); got != 30 {
-		t.Errorf("строк в items = %d, want 30 (незаконченная пачка не записана)", got)
+		t.Errorf("rows in items = %d, want 30 (an unfinished chunk not written)", got)
 	}
 }
 
@@ -234,10 +234,10 @@ func TestDB_UpdateUnnest(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got != n {
-		t.Errorf("обновлено %d, want %d", got, n)
+		t.Errorf("updated %d, want %d", got, n)
 	}
 	if c := countItems(t, pool, "status = 5 AND queued_at IS NOT NULL"); c != n {
-		t.Errorf("status=5 с отметкой: %d, want %d", c, n)
+		t.Errorf("status=5 with the mark: %d, want %d", c, n)
 	}
 
 	// A repeat with the same guard — zero rows (the Where guard protects against races).
@@ -246,7 +246,7 @@ func TestDB_UpdateUnnest(t *testing.T) {
 		SetExpr("status = 6").
 		Where("t.status = 0").
 		Exec(ctx, pool, zones, ids); err != nil || got != 0 {
-		t.Errorf("повторный перевод: (%d, %v), want (0, nil)", got, err)
+		t.Errorf("the repeat move: (%d, %v), want (0, nil)", got, err)
 	}
 
 	// Different values per batch row: even → 7, odd → 9.
@@ -263,7 +263,7 @@ func TestDB_UpdateUnnest(t *testing.T) {
 		Where("t.status = 5").
 		Exec(ctx, pool, zones, ids, mixed)
 	if err != nil || got != n {
-		t.Fatalf("перевод из 5: (%d, %v), want (%d, nil)", got, err, n)
+		t.Fatalf("the move of 5: (%d, %v), want (%d, nil)", got, err, n)
 	}
 	if c := countItems(t, pool, "status = 7"); c != n/2 {
 		t.Errorf("status=7: %d, want %d", c, n/2)
@@ -316,16 +316,16 @@ func TestDB_UpdateUnnestReturning(t *testing.T) {
 		got[id] = true
 	}
 	if err := rows.Err(); err != nil {
-		t.Fatalf("итерация RETURNING: %v", err)
+		t.Fatalf("RETURNING iteration: %v", err)
 	}
 	rows.Close()
 
 	if len(got) != n/2 {
-		t.Fatalf("RETURNING вернул %d строк, want %d", len(got), n/2)
+		t.Fatalf("RETURNING returned %d rows, want %d", len(got), n/2)
 	}
 	for i := 0; i < n; i += 2 {
 		if !got[int64(i)] {
-			t.Errorf("id %d отсутствует в RETURNING", i)
+			t.Errorf("id %d missing from RETURNING", i)
 		}
 	}
 	if c := countItems(t, pool, "status = 3"); c != n/2 {
@@ -355,10 +355,10 @@ func TestDB_UpdateUnnest_BeyondParamLimit(t *testing.T) {
 		SetExpr("status = 1").
 		Exec(ctx, pool, zones, idRange(n))
 	if err != nil {
-		t.Fatalf("обновление %d строк одним запросом: %v", n, err)
+		t.Fatalf("updating %d rows in one query: %v", n, err)
 	}
 	if got != n {
-		t.Errorf("обновлено %d, want %d", got, n)
+		t.Errorf("updated %d, want %d", got, n)
 	}
 	if c := countItems(t, pool, "status = 1"); c != n {
 		t.Errorf("status=1: %d, want %d", c, n)
@@ -394,7 +394,7 @@ func TestDB_AfterConnectLockTimeout(t *testing.T) {
 	// with public.
 	base, err := pgxpool.New(ctx, pgDSN(t)+"&search_path="+schema)
 	if err != nil {
-		t.Fatalf("подключение к PostgreSQL: %v", err)
+		t.Fatalf("PostgreSQL connection: %v", err)
 	}
 	if _, err := base.Exec(ctx, "DROP SCHEMA IF EXISTS "+schema+" CASCADE"); err != nil {
 		t.Fatalf("drop schema: %v", err)
@@ -422,7 +422,7 @@ func TestDB_AfterConnectLockTimeout(t *testing.T) {
 			holder.Release()
 		}
 		if _, err := base.Exec(context.Background(), "DROP SCHEMA IF EXISTS "+schema+" CASCADE"); err != nil {
-			t.Errorf("очистка схемы %s: %v", schema, err)
+			t.Errorf("schema %s cleanup: %v", schema, err)
 		}
 		base.Close()
 	})
@@ -435,14 +435,14 @@ func TestDB_AfterConnectLockTimeout(t *testing.T) {
 		AfterConnect: db.LockTimeout(time.Second),
 	})
 	if err != nil {
-		t.Fatalf("db.Open с AfterConnect LockTimeout: %v", err)
+		t.Fatalf("db.Open with the AfterConnect LockTimeout: %v", err)
 	}
 
 	// Seed: a committed row — the conflict is over it (the lock on the
 	// committed row held by the holder; the victim simply does not see the
 	// uncommitted INSERT under READ COMMITTED — no conflict).
 	if _, err := base.Exec(ctx, "INSERT INTO items (zone_id, id) VALUES (1, 1)"); err != nil {
-		t.Fatalf("затравка: вставка строки: %v", err)
+		t.Fatalf("the seed: inserting a row: %v", err)
 	}
 
 	// The row holder — a second session with an open transaction
@@ -451,13 +451,13 @@ func TestDB_AfterConnectLockTimeout(t *testing.T) {
 	// convoy of Oct 25 (entries #2/#6 of the slow-query log).
 	holder, err = base.Acquire(ctx)
 	if err != nil {
-		t.Fatalf("соединение держателя: %v", err)
+		t.Fatalf("the holder's connection: %v", err)
 	}
 	if _, err := holder.Exec(ctx, "BEGIN"); err != nil {
-		t.Fatalf("держатель: BEGIN: %v", err)
+		t.Fatalf("the holder: BEGIN: %v", err)
 	}
 	if _, err := holder.Exec(ctx, "SELECT zone_id FROM items WHERE zone_id = 1 AND id = 1 FOR UPDATE"); err != nil {
-		t.Fatalf("держатель: захват строки: %v", err)
+		t.Fatalf("the holder: grabbing the row: %v", err)
 	}
 
 	// The pool session sees the hook's cap (1000ms → "1s").
@@ -466,25 +466,25 @@ func TestDB_AfterConnectLockTimeout(t *testing.T) {
 		t.Fatalf("SHOW lock_timeout: %v", err)
 	}
 	if lt != "1s" {
-		t.Errorf("lock_timeout сессии пула = %q, want 1s (AfterConnect-хук)", lt)
+		t.Errorf("the pool session's lock_timeout = %q, want 1s (the AfterConnect hook)", lt)
 	}
 
 	// The victim: SELECT FOR UPDATE waits on the holder's row longer than the cap.
 	_, err = pool.Exec(ctx, "SELECT zone_id FROM items WHERE zone_id = 1 AND id = 1 FOR UPDATE")
 	var pgErr *pgconn.PgError
 	if !errors.As(err, &pgErr) || pgErr.Code != "55P03" {
-		t.Fatalf("ошибка ожидания строки = %v, want SQLSTATE 55P03 (lock_not_available)", err)
+		t.Fatalf("the row wait error = %v, want SQLSTATE 55P03 (lock_not_available)", err)
 	}
 	if ctx.Err() != nil {
-		t.Fatal("контекст истёк раньше потолка lock_timeout: ошибка не от сервера")
+		t.Fatal("the context expired before the lock_timeout cap: the error is not from the server")
 	}
 
 	// Row release (the holder's rollback) — the same statement passes
 	// without an error: the cap cuts only the wait, the normal path is intact.
 	if _, err := holder.Exec(ctx, "ROLLBACK"); err != nil {
-		t.Fatalf("держатель: ROLLBACK: %v", err)
+		t.Fatalf("the holder: ROLLBACK: %v", err)
 	}
 	if _, err := pool.Exec(ctx, "SELECT zone_id FROM items WHERE zone_id = 1 AND id = 1 FOR UPDATE"); err != nil {
-		t.Fatalf("после освобождения строки: %v", err)
+		t.Fatalf("after the row release: %v", err)
 	}
 }

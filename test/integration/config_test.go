@@ -23,26 +23,26 @@ func TestConfigDevEnvironment(t *testing.T) {
 
 	// The DSN comes from the deprecated APP_PG_DSN (compose), not from YAML.
 	if want := os.Getenv("APP_PG_DSN"); want == "" || cfg.Postgres.DSN != want {
-		t.Errorf("postgres.dsn: ожидается DSN из APP_PG_DSN (%q), получен %q", want, cfg.Postgres.DSN)
+		t.Errorf("postgres.dsn: the DSN from APP_PG_DSN expected (%q), got %q", want, cfg.Postgres.DSN)
 	}
 	// The remaining addresses come from config.dev.yaml (static crawler_net IPs).
 	if cfg.Redis.Addr != "172.28.100.3:6379" {
-		t.Errorf("redis.addr: ожидается 172.28.100.3:6379, получено %q", cfg.Redis.Addr)
+		t.Errorf("redis.addr: 172.28.100.3:6379 expected, got %q", cfg.Redis.Addr)
 	}
 	if got := strings.Join(cfg.DNS.Resolvers, ";"); got != "172.28.100.10:53" {
-		t.Errorf("dns.resolvers: ожидается unbound 172.28.100.10:53, получено %q", got)
+		t.Errorf("dns.resolvers: unbound 172.28.100.10:53 expected, got %q", got)
 	}
 	if cfg.DNS.IPv6 {
-		t.Errorf("dns.ipv6: в docker-сети dev-окружения IPv6 выключен (config.dev.yaml)")
+		t.Errorf("dns.ipv6: IPv6 disabled in the dev environment's docker network (config.dev.yaml)")
 	}
 	if len(cfg.DNS.FallbackResolvers) != 0 {
-		t.Errorf("dns.fallback_resolvers: dev изолирован от интернета, ожидается пустой список, получено %v", cfg.DNS.FallbackResolvers)
+		t.Errorf("dns.fallback_resolvers: the dev is isolated from the internet, an empty list expected, got %v", cfg.DNS.FallbackResolvers)
 	}
 	if cfg.Render.RemoteURL != "ws://172.28.100.14:9222" {
-		t.Errorf("render.remote_url: ожидается chromium ws://172.28.100.14:9222, получено %q", cfg.Render.RemoteURL)
+		t.Errorf("render.remote_url: chromium ws://172.28.100.14:9222 expected, got %q", cfg.Render.RemoteURL)
 	}
 	if ua := cfg.HTTP.UserAgent; ua == "" || !strings.Contains(ua, "contact") {
-		t.Errorf("http.user_agent: ожидается честный UA с контактами, получено %q", ua)
+		t.Errorf("http.user_agent: an honest UA with contacts expected, got %q", ua)
 	}
 
 	// The compose environment file itself is valid even without environment
@@ -52,7 +52,7 @@ func TestConfigDevEnvironment(t *testing.T) {
 		t.Fatalf("config.LoadFile(/etc/crawler/config.yaml): %v", err)
 	}
 	if fileCfg.Redis.Addr != "172.28.100.3:6379" || fileCfg.Monitor.Listen != ":9100" {
-		t.Errorf("config.dev.yaml: неожиданные значения: redis=%q monitor=%q", fileCfg.Redis.Addr, fileCfg.Monitor.Listen)
+		t.Errorf("config.dev.yaml: unexpected values: redis=%q monitor=%q", fileCfg.Redis.Addr, fileCfg.Monitor.Listen)
 	}
 
 	// The dashboard section (T-131): listen is the docker network (the compose
@@ -61,15 +61,15 @@ func TestConfigDevEnvironment(t *testing.T) {
 	// probes are compose service names with their METRICS_PORT
 	// (METRICS_ADDR=:91xx in compose — the same address Prometheus scrapes).
 	if fileCfg.Dashboard.Listen != ":8090" {
-		t.Errorf("dashboard.listen: ожидается :8090 (интерфейсы docker-сети), получено %q", fileCfg.Dashboard.Listen)
+		t.Errorf("dashboard.listen: :8090 expected (the docker network interfaces), got %q", fileCfg.Dashboard.Listen)
 	}
 	if fileCfg.Dashboard.Username != "admin" {
-		t.Errorf("dashboard.username: dev-креда admin, получено %q", fileCfg.Dashboard.Username)
+		t.Errorf("dashboard.username: the dev credential admin, got %q", fileCfg.Dashboard.Username)
 	}
 	if creds, err := dashboard.ParseCredentials(fileCfg); err != nil {
-		t.Errorf("dashboard.password_hash (формат ТЗД §7.2): %v", err)
+		t.Errorf("dashboard.password_hash (the dashboard spec §7.2 format): %v", err)
 	} else if !creds.Verify("admin") {
-		t.Errorf("dashboard.password_hash: dev-пароль admin не проходит сверку (перегенерируйте хэш, docs/dev-environment.md)")
+		t.Errorf("dashboard.password_hash: the dev password admin fails the verification (regenerate the hash, docs/dev-environment.md)")
 	}
 	wantProbes := map[string]string{
 		"ingest":        "http://ingest:9101",
@@ -81,11 +81,11 @@ func TestConfigDevEnvironment(t *testing.T) {
 		"monitor":       "http://monitor:9100",
 	}
 	if !reflect.DeepEqual(fileCfg.Dashboard.Probes, wantProbes) {
-		t.Errorf("dashboard.probes: ожидается карта compose-сервисов с их METRICS_PORT %v, получено %v", wantProbes, fileCfg.Dashboard.Probes)
+		t.Errorf("dashboard.probes: a map of the compose services with their METRICS_PORT expected %v, got %v", wantProbes, fileCfg.Dashboard.Probes)
 	}
 
 	// The repository example is valid as a whole (config.example.yaml, T-006).
 	if _, err := config.LoadFile("/src/config.example.yaml"); err != nil {
-		t.Errorf("config.example.yaml должен проходить валидацию: %v", err)
+		t.Errorf("config.example.yaml must pass validation: %v", err)
 	}
 }

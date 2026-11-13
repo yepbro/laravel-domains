@@ -51,14 +51,14 @@ func staticIP(v any) string {
 func TestComposeStaticAddressPlan(t *testing.T) {
 	raw, err := os.ReadFile(filepath.Join("..", "..", "deploy/docker/compose.yaml"))
 	if err != nil {
-		t.Fatalf("прочитать deploy/docker/compose.yaml: %v", err)
+		t.Fatalf("read deploy/docker/compose.yaml: %v", err)
 	}
 	var f composeFile
 	if err := yaml.Unmarshal(raw, &f); err != nil {
-		t.Fatalf("разобрать compose.yaml (якоря/merge — yaml.v3): %v", err)
+		t.Fatalf("parse compose.yaml (anchors/merge — yaml.v3): %v", err)
 	}
 	if len(f.Services) == 0 {
-		t.Fatal("compose.yaml: не прочитаны сервисы")
+		t.Fatal("compose.yaml: no services read")
 	}
 
 	// The subnet is pinned at consumers — changing it is a separate task
@@ -69,10 +69,10 @@ func TestComposeStaticAddressPlan(t *testing.T) {
 	}
 	_, subnet, err := net.ParseCIDR(subnetStr)
 	if err != nil {
-		t.Fatalf("networks.crawler_net.ipam: ожидается подсеть, получено %q (%v)", subnetStr, err)
+		t.Fatalf("networks.crawler_net.ipam: a subnet expected, got %q (%v)", subnetStr, err)
 	}
 	if subnetStr != "172.28.100.0/24" {
-		t.Errorf("подсеть crawler_net = %q: смена ломает потребителей (unbound, testbedgen, config.dev.yaml, тесты)", subnetStr)
+		t.Errorf("the crawler_net subnet = %q: a change breaks the consumers (unbound, testbedgen, config.dev.yaml, tests)", subnetStr)
 	}
 
 	blackhole := net.ParseIP("172.28.100.250")
@@ -84,28 +84,28 @@ func TestComposeStaticAddressPlan(t *testing.T) {
 			// from worktrees into the same network — a shared address
 			// would conflict between them.
 			if ipStr != "" {
-				t.Errorf("tools: статический адрес %s запрещён (параллельные run-контейнеры, T-180)", ipStr)
+				t.Errorf("tools: the static address %s forbidden (parallel run containers, T-180)", ipStr)
 			}
 			continue
 		}
 		if ipStr == "" {
-			t.Errorf("сервис %s без ipv4_address: долгоживущий сервис обязан иметь статический адрес (T-180, docs/docker.md §8)", name)
+			t.Errorf("the service %s without ipv4_address: a long-lived service must have a static address (T-180, docs/docker.md §8)", name)
 			continue
 		}
 		if other, dup := seen[ipStr]; dup {
-			t.Errorf("адрес %s занят дважды: %s и %s", ipStr, other, name)
+			t.Errorf("the address %s taken twice: %s and %s", ipStr, other, name)
 		}
 		seen[ipStr] = name
 		ip := net.ParseIP(ipStr)
 		if ip == nil {
-			t.Errorf("сервис %s: некорректный адрес %q", name, ipStr)
+			t.Errorf("the service %s: an invalid address %q", name, ipStr)
 			continue
 		}
 		if !subnet.Contains(ip) {
-			t.Errorf("сервис %s: адрес %s вне подсети %s", name, ipStr, subnetStr)
+			t.Errorf("the service %s: the address %s outside the subnet %s", name, ipStr, subnetStr)
 		}
 		if ip.Equal(blackhole) {
-			t.Errorf("сервис %s занял 172.28.100.250 — «чёрная дыра» сценариев закрытых портов (scenarios.yaml)", name)
+			t.Errorf("the service %s took 172.28.100.250 — the \"black hole\" of the closed-port scenarios (scenarios.yaml)", name)
 		}
 	}
 }

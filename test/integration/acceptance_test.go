@@ -163,7 +163,7 @@ func newAccEnv(t *testing.T) *accEnv {
 
 	loader, err := rules.NewReloader(accRulesDir(t), nil)
 	if err != nil {
-		t.Fatalf("набор правил: %v", err)
+		t.Fatalf("rules set: %v", err)
 	}
 	an, err := analyzer.New(pool, q, store, loader, analyzer.Options{
 		MinScore: rules.DefaultMinScore,
@@ -198,7 +198,7 @@ func accRulesDir(t *testing.T) string {
 		}
 	}
 	if _, err := os.Stat("../../rules"); err != nil {
-		t.Fatalf("набор правил недоступен: %v", err)
+		t.Fatalf("rules set unavailable: %v", err)
 	}
 	return "../../rules"
 }
@@ -226,7 +226,7 @@ func accModifiedRulesDir(t *testing.T) string {
 	dst := t.TempDir()
 	entries, err := os.ReadDir(src)
 	if err != nil {
-		t.Fatalf("чтение %s: %v", src, err)
+		t.Fatalf("read %s: %v", src, err)
 	}
 	for _, e := range entries {
 		if e.IsDir() {
@@ -234,20 +234,20 @@ func accModifiedRulesDir(t *testing.T) string {
 		}
 		raw, err := os.ReadFile(filepath.Join(src, e.Name()))
 		if err != nil {
-			t.Fatalf("копия правила %s: %v", e.Name(), err)
+			t.Fatalf("copy rule %s: %v", e.Name(), err)
 		}
 		if err := os.WriteFile(filepath.Join(dst, e.Name()), raw, 0o644); err != nil {
-			t.Fatalf("копия правила %s: %v", e.Name(), err)
+			t.Fatalf("copy rule %s: %v", e.Name(), err)
 		}
 	}
 	probe := "rules:\n" +
 		"  - id: " + accProbeRule + "\n" +
-		"    description: приёмочная проба T-094 — срабатывает на образце " + accProbeSample + ", доказывая переприменение правил после reanalyze\n" +
+		"    description: T-094 acceptance probe — fires on the sample " + accProbeSample + ", proving the rules are reapplied after reanalyze\n" +
 		"    target: html\n" +
 		"    regex: 'Hello Symfony!'\n" +
 		"    weight: " + fmt.Sprintf("%g", accProbeWeight) + "\n"
 	if err := os.WriteFile(filepath.Join(dst, "t094_probe.yaml"), []byte(probe), 0o644); err != nil {
-		t.Fatalf("правило-проба: %v", err)
+		t.Fatalf("probe rule: %v", err)
 	}
 	return dst
 }
@@ -263,7 +263,7 @@ func accInsertZone(t *testing.T, pool *pgxpool.Pool, name, unicode string) int16
 		name, unicode,
 	).Scan(&id)
 	if err != nil {
-		t.Fatalf("вставка зоны %s: %v", name, err)
+		t.Fatalf("insert zone %s: %v", name, err)
 	}
 	return id
 }
@@ -281,28 +281,28 @@ func accInsertDomains(t *testing.T, pool *pgxpool.Pool, zoneID int16, labels []s
 		zoneID, labels,
 	)
 	if err != nil {
-		t.Fatalf("вставка доменов зоны %d: %v", zoneID, err)
+		t.Fatalf("insert zone %d domains: %v", zoneID, err)
 	}
 	defer rows.Close()
 	ids := make([]int64, 0, len(labels))
 	for rows.Next() {
 		var id int64
 		if err := rows.Scan(&id); err != nil {
-			t.Fatalf("чтение id домена: %v", err)
+			t.Fatalf("read domain id: %v", err)
 		}
 		ids = append(ids, id)
 	}
 	if err := rows.Err(); err != nil {
-		t.Fatalf("вставка доменов зоны %d: %v", zoneID, err)
+		t.Fatalf("insert zone %d domains: %v", zoneID, err)
 	}
 	if len(ids) != len(labels) {
-		t.Fatalf("вставлено доменов: %d, хочу %d", len(ids), len(labels))
+		t.Fatalf("domains inserted: %d, want %d", len(ids), len(labels))
 	}
 	if _, err := pool.Exec(context.Background(),
 		"UPDATE zones SET domains_total = domains_total + $2, domains_pending = domains_pending + $2 WHERE id = $1",
 		zoneID, len(labels),
 	); err != nil {
-		t.Fatalf("счётчики зоны %d: %v", zoneID, err)
+		t.Fatalf("zone %d counters: %v", zoneID, err)
 	}
 	return ids
 }
@@ -327,19 +327,19 @@ func accPipelineZone(ctx context.Context, t *testing.T, env *accEnv, zoneID int1
 
 	batch, err := scheduler.DispatchBatch(ctx, env.pool, scheduler.DispatchQuery{Limit: len(labels)})
 	if err != nil {
-		t.Fatalf("выборка пачки: %v", err)
+		t.Fatalf("dispatch batch: %v", err)
 	}
 	if len(batch) != len(labels) {
-		t.Fatalf("выбрано доменов: %d, хочу %d", len(batch), len(labels))
+		t.Fatalf("dispatched domains: %d, want %d", len(batch), len(labels))
 	}
 	if _, err := scheduler.EnqueueBatch(ctx, env.pool, env.q, batch); err != nil {
-		t.Fatalf("постановка пачки: %v", err)
+		t.Fatalf("enqueue batch: %v", err)
 	}
 
 	// The DNS stage — as the worker's processBatch (T-039): XACK after the write.
 	deliveries := consumeTasks(t, env.q, queue.StreamDNS, accDNSGroup, "acc", 5)
 	if len(deliveries) != 1 {
-		t.Fatalf("доставок q:dns: %d, хочу 1 (одна пачка)", len(deliveries))
+		t.Fatalf("q:dns deliveries: %d, want 1 (one batch)", len(deliveries))
 	}
 	err = queue.Processing(ctx, env.q, accDNSGroup, deliveries[0],
 		func(c context.Context, d queue.Delivery) error {
@@ -348,7 +348,7 @@ func accPipelineZone(ctx context.Context, t *testing.T, env *accEnv, zoneID int1
 				return err
 			}
 			if len(b.Domains) != len(labels) {
-				return fmt.Errorf("в пачке %d доменов, хочу %d", len(b.Domains), len(labels))
+				return fmt.Errorf("batch has %d domains, want %d", len(b.Domains), len(labels))
 			}
 			subs, err := dnsworker.LoadSubdomains(c, env.pool)
 			if err != nil {
@@ -359,7 +359,7 @@ func accPipelineZone(ctx context.Context, t *testing.T, env *accEnv, zoneID int1
 				return err
 			}
 			if len(pending) != len(labels) {
-				return fmt.Errorf("актуальных доменов: %d, хочу %d", len(pending), len(labels))
+				return fmt.Errorf("pending domains: %d, want %d", len(pending), len(labels))
 			}
 			resolve := accResolver(t)
 			for _, dom := range pending {
@@ -370,14 +370,14 @@ func accPipelineZone(ctx context.Context, t *testing.T, env *accEnv, zoneID int1
 			return nil
 		})
 	if err != nil {
-		t.Fatalf("пачка q:dns: %v", err)
+		t.Fatalf("q:dns batch: %v", err)
 	}
 
 	// The HTTP stage — as the worker's processDelivery (T-053): episode →
 	// content → write → XACK.
 	tasks := consumeTasks(t, env.q, queue.StreamHTTP, accHTTPGroup, "acc", len(labels))
 	if len(tasks) != len(labels) {
-		t.Fatalf("задач q:http: %d, хочу %d", len(tasks), len(labels))
+		t.Fatalf("q:http tasks: %d, want %d", len(tasks), len(labels))
 	}
 	for _, d := range tasks {
 		err := queue.Processing(ctx, env.q, accHTTPGroup, d,
@@ -398,12 +398,12 @@ func accPipelineZone(ctx context.Context, t *testing.T, env *accEnv, zoneID int1
 					return err
 				}
 				if !recorded {
-					return fmt.Errorf("домен %s: результат не записан (охрана записи, T-058)", task.Name)
+					return fmt.Errorf("domain %s: result not recorded (the write guard, T-058)", task.Name)
 				}
 				return nil
 			})
 		if err != nil {
-			t.Fatalf("HTTP-эпизод: %v", err)
+			t.Fatalf("HTTP episode: %v", err)
 		}
 	}
 
@@ -421,7 +421,7 @@ func accAnalyze(ctx context.Context, t *testing.T, env *accEnv, an *analyzer.Wor
 	t.Helper()
 	msgs := consumeTasks(t, env.q, queue.StreamAnalyze, accAnalyzeGroup, "acc", n)
 	if len(msgs) != n {
-		t.Fatalf("доставок q:analyze: %d, хочу %d", len(msgs), n)
+		t.Fatalf("q:analyze deliveries: %d, want %d", len(msgs), n)
 	}
 	for _, d := range msgs {
 		err := queue.Processing(ctx, env.q, accAnalyzeGroup, d,
@@ -435,13 +435,13 @@ func accAnalyze(ctx context.Context, t *testing.T, env *accEnv, an *analyzer.Wor
 					return err
 				}
 				if !processed {
-					return fmt.Errorf("строка %d/%d/%d/%d не найдена или перезаписана",
+					return fmt.Errorf("row %d/%d/%d/%d not found or overwritten",
 						res.ZoneID, res.DomainID, res.SubdomainID, int16(res.Variant))
 				}
 				return nil
 			})
 		if err != nil {
-			t.Fatalf("анализ: %v", err)
+			t.Fatalf("analyze: %v", err)
 		}
 	}
 }
@@ -472,7 +472,7 @@ func accRows(t *testing.T, pool *pgxpool.Pool, domainID int64) []accResultRow {
 		FROM subdomain_results WHERE domain_id = $1
 		ORDER BY subdomain_id, variant`, domainID)
 	if err != nil {
-		t.Fatalf("чтение subdomain_results: %v", err)
+		t.Fatalf("read subdomain_results: %v", err)
 	}
 	defer rows.Close()
 	var out []accResultRow
@@ -480,12 +480,12 @@ func accRows(t *testing.T, pool *pgxpool.Pool, domainID int64) []accResultRow {
 		var r accResultRow
 		if err := rows.Scan(&r.subdomainID, &r.variant, &r.scheme, &r.httpStatus, &r.finalURL,
 			&r.aliasKind, &r.aliasSub, &r.rendered, &r.contentHash, &r.cookies, &r.errCode); err != nil {
-			t.Fatalf("строка subdomain_results: %v", err)
+			t.Fatalf("subdomain_results row: %v", err)
 		}
 		out = append(out, r)
 	}
 	if err := rows.Err(); err != nil {
-		t.Fatalf("итерация subdomain_results: %v", err)
+		t.Fatalf("subdomain_results iteration: %v", err)
 	}
 	return out
 }
@@ -508,7 +508,7 @@ func accFindings(t *testing.T, pool *pgxpool.Pool, zoneID int16, domainID int64)
 		SELECT subdomain_id, variant, score, ver_min, ver_max, is_laravel, signals::text, rules_version
 		FROM laravel_findings WHERE zone_id = $1 AND domain_id = $2`, zoneID, domainID)
 	if err != nil {
-		t.Fatalf("чтение laravel_findings: %v", err)
+		t.Fatalf("read laravel_findings: %v", err)
 	}
 	defer rows.Close()
 	var out []accFinding
@@ -516,12 +516,12 @@ func accFindings(t *testing.T, pool *pgxpool.Pool, zoneID int16, domainID int64)
 		var f accFinding
 		if err := rows.Scan(&f.sub, &f.variant, &f.score, &f.verMin, &f.verMax,
 			&f.isLaravel, &f.signals, &f.rulesVersion); err != nil {
-			t.Fatalf("строка laravel_findings: %v", err)
+			t.Fatalf("laravel_findings row: %v", err)
 		}
 		out = append(out, f)
 	}
 	if err := rows.Err(); err != nil {
-		t.Fatalf("итерация laravel_findings: %v", err)
+		t.Fatalf("laravel_findings iteration: %v", err)
 	}
 	return out
 }
@@ -546,7 +546,7 @@ func accLaravelDomain(t *testing.T, pool *pgxpool.Pool, zoneID int16, domainID i
 		return a, false
 	}
 	if err != nil {
-		t.Fatalf("чтение laravel_domains: %v", err)
+		t.Fatalf("read laravel_domains: %v", err)
 	}
 	return a, true
 }
@@ -592,7 +592,7 @@ func accWaitFor(t *testing.T, what string, deadline time.Duration, ready func() 
 	end := time.Now().Add(deadline)
 	for !ready() {
 		if time.Now().After(end) {
-			t.Fatalf("%s: не наступило за %s", what, deadline)
+			t.Fatalf("%s: did not happen within %s", what, deadline)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
@@ -606,7 +606,7 @@ func accWaitFor(t *testing.T, what string, deadline time.Duration, ready func() 
 func accCounterSum(t *testing.T, g prometheus.Gatherer, name string, label ...string) float64 {
 	t.Helper()
 	if len(label)%2 != 0 {
-		t.Fatalf("accCounterSum: метки-фильтр парами «имя, значение», получили %d", len(label))
+		t.Fatalf("accCounterSum: label filters as \"name, value\" pairs, got %d", len(label))
 	}
 	filter := map[string]string{}
 	for i := 0; i < len(label); i += 2 {
@@ -662,58 +662,58 @@ func TestAccept01_IngestAddDeleteIDN(t *testing.T) {
 	// variable, not a literal copy — "the same list" is byte-exact by
 	// construction.
 	firstAdd := fileContent(
-		"# приёмка §11.4 п. 1",
+		"# acceptance §11.4 item 1",
 		accIDNLabelU+"."+accIDNZoneUni, // сайт.проверка.test
 		"магазин."+accIDNZoneUni,       // a second IDN domain
 	)
 
-	t.Run("add в unicode-каталоге IDN-зоны", func(t *testing.T) {
+	t.Run("add in the IDN zone's unicode directory", func(t *testing.T) {
 		out := env.process(t, filepath.Join(accIDNZoneUni, "add", "unicode-form.txt"), firstAdd)
 		if out.Kind != ingest.OutcomeApplied {
-			t.Fatalf("итог файла = %q, хочу applied", out.Kind)
+			t.Fatalf("file outcome = %q, want applied", out.Kind)
 		}
 		if out.Report.Added != 2 || out.Report.Existed != 0 {
-			t.Errorf("счётчики: added=%d existed=%d, хочу 2/0", out.Report.Added, out.Report.Existed)
+			t.Errorf("counters: added=%d existed=%d, want 2/0", out.Report.Added, out.Report.Existed)
 		}
 
 		// The zone — one, in punycode, with a unicode name for display.
 		z, ok := env.zone(t, accIDNZone)
 		if !ok {
-			t.Fatalf("зона %s не создана", accIDNZone)
+			t.Fatalf("zone %s not created", accIDNZone)
 		}
 		if z.unicode != accIDNZoneUni || !z.isActive {
-			t.Errorf("зона: unicode=%q active=%v, хочу %q/true", z.unicode, z.isActive, accIDNZoneUni)
+			t.Errorf("zone: unicode=%q active=%v, want %q/true", z.unicode, z.isActive, accIDNZoneUni)
 		}
 
 		// The domains — punycode labels with the is_idn bit (spec 5.2 item 9).
 		for _, label := range []string{"xn--80aswg", "xn--80aairftm"} {
 			d, ok := env.domain(t, accIDNZone, label)
 			if !ok {
-				t.Fatalf("домен %s.%s не создан", label, accIDNZone)
+				t.Fatalf("domain %s.%s not created", label, accIDNZone)
 			}
 			if d.status != int16(model.StatusNew) || d.checkState != int16(model.CheckStatePending) {
-				t.Errorf("%s: status/check_state = %d/%d, хочу new/pending", label, d.status, d.checkState)
+				t.Errorf("%s: status/check_state = %d/%d, want new/pending", label, d.status, d.checkState)
 			}
 			if d.flags&int16(model.FlagIDN) == 0 {
-				t.Errorf("%s: бит is_idn не выставлен", label)
+				t.Errorf("%s: the is_idn bit not set", label)
 			}
 		}
 		if !existsOnDisk(t, filepath.Join(env.dir, "processed", accIDNZoneUni, "add", "unicode-form.txt")) {
-			t.Error("файл не перемещён в processed/")
+			t.Error("the file not moved into processed/")
 		}
 	})
 
-	t.Run("punycode-каталог той же зоны — без дубля", func(t *testing.T) {
+	t.Run("the same zone's punycode directory — no duplicate", func(t *testing.T) {
 		out := env.process(t, filepath.Join(accIDNZone, "add", "punycode-form.txt"), fileContent(
 			"XN--80ASWG.XN--80ADJURFHD.TEST.", // punycode, uppercase, a dot — the same domain
 			accIDNLabel+"."+accIDNZone,        // the canonical punycode form
 			"новый."+accIDNZoneUni,            // a new IDN domain
 		))
 		if out.Kind != ingest.OutcomeApplied {
-			t.Fatalf("итог файла = %q, хочу applied", out.Kind)
+			t.Fatalf("file outcome = %q, want applied", out.Kind)
 		}
 		if out.Report.Added != 1 || out.Report.Existed != 1 {
-			t.Errorf("счётчики: added=%d existed=%d, хочу 1/1 (новый + существующий)", out.Report.Added, out.Report.Existed)
+			t.Errorf("counters: added=%d existed=%d, want 1/1 (new + existing)", out.Report.Added, out.Report.Existed)
 		}
 
 		var zones int
@@ -722,34 +722,34 @@ func TestAccept01_IngestAddDeleteIDN(t *testing.T) {
 			t.Fatal(err)
 		}
 		if zones != 1 {
-			t.Errorf("строк зоны %s: %d, хочу 1 (unicode/punycode — одна зона)", accIDNZone, zones)
+			t.Errorf("zone %s rows: %d, want 1 (unicode/punycode — one zone)", accIDNZone, zones)
 		}
 		var total int
 		if err := env.pool.QueryRow(context.Background(), "SELECT count(*) FROM domains").Scan(&total); err != nil {
 			t.Fatal(err)
 		}
 		if total != 3 {
-			t.Errorf("доменов в БД: %d, хочу 3", total)
+			t.Errorf("domains in the DB: %d, want 3", total)
 		}
 	})
 
-	t.Run("delete и возврат add-файлом тем же списком", func(t *testing.T) {
+	t.Run("delete and a revival by an add file with the same list", func(t *testing.T) {
 		gone := fileContent(
 			accIDNLabelU + "." + accIDNZoneUni, // сайт.проверка.test
 		)
 		out := env.process(t, filepath.Join(accIDNZoneUni, "delete", "gone.txt"), gone)
 		if out.Kind != ingest.OutcomeApplied {
-			t.Fatalf("итог delete = %q, хочу applied", out.Kind)
+			t.Fatalf("delete outcome = %q, want applied", out.Kind)
 		}
 		if out.Report.Deleted != 1 {
-			t.Errorf("deleted = %d, хочу 1", out.Report.Deleted)
+			t.Errorf("deleted = %d, want 1", out.Report.Deleted)
 		}
 		d, ok := env.domain(t, accIDNZone, accIDNLabel)
 		if !ok {
-			t.Fatal("удалённый домен обязан остаться в БД (§13.1)")
+			t.Fatal("a deleted domain must stay in the DB (§13.1)")
 		}
 		if d.status != int16(model.StatusDeleted) {
-			t.Errorf("статус после delete = %d, хочу deleted", d.status)
+			t.Errorf("status after delete = %d, want deleted", d.status)
 		}
 
 		// The revival with the same list byte-for-byte (the same sha256 as
@@ -761,21 +761,21 @@ func TestAccept01_IngestAddDeleteIDN(t *testing.T) {
 		// legitimate.
 		revive := env.process(t, filepath.Join(accIDNZoneUni, "add", "revive.txt"), gone)
 		if revive.Kind != ingest.OutcomeApplied {
-			t.Fatalf("итог возврата = %q, хочу applied (T-113: дубль sha256 delete-файла — не дубль доставки)", revive.Kind)
+			t.Fatalf("revival outcome = %q, want applied (T-113: a sha256 duplicate of the delete file is not a delivery duplicate)", revive.Kind)
 		}
 		if revive.Report.Revived != 1 || revive.Report.Added != 1 {
-			t.Errorf("возврат: added=%d revived=%d, хочу 1/1 (Added включает Revived — контракт T-021)", revive.Report.Added, revive.Report.Revived)
+			t.Errorf("revival: added=%d revived=%d, want 1/1 (Added includes Revived — the T-021 contract)", revive.Report.Added, revive.Report.Revived)
 		}
 		d, _ = env.domain(t, accIDNZone, accIDNLabel)
 		if d.status != int16(model.StatusNew) || d.checkState != int16(model.CheckStatePending) {
-			t.Errorf("после возврата: status/check_state = %d/%d, хочу new/pending", d.status, d.checkState)
+			t.Errorf("after the revival: status/check_state = %d/%d, want new/pending", d.status, d.checkState)
 		}
 		if d.queuedAt != nil {
-			t.Errorf("после возврата queued_at = %v, хочу NULL (снова в цикле проверок)", *d.queuedAt)
+			t.Errorf("after the revival queued_at = %v, want NULL (back in the check cycle)", *d.queuedAt)
 		}
 	})
 
-	t.Run("undo тем же списком из delete/ — отменяет первый add-файл", func(t *testing.T) {
+	t.Run("undo by the same list from delete/ — cancels the first add file", func(t *testing.T) {
 		// The same list byte-for-byte as the scenario's first add file
 		// (unicode-form.txt): the action is different — there is no exact
 		// redelivery, the file IS PROCESSED and deletes the list's domains
@@ -783,14 +783,14 @@ func TestAccept01_IngestAddDeleteIDN(t *testing.T) {
 		// have skip-zeroed it as a duplicate — the pre-T-113 semantics).
 		undo := env.process(t, filepath.Join(accIDNZoneUni, "delete", "undo.txt"), firstAdd)
 		if undo.Kind != ingest.OutcomeApplied {
-			t.Fatalf("тот же список из delete/: итог = %q, хочу applied (T-113: другое действие — не дубль)", undo.Kind)
+			t.Fatalf("the same list from delete/: outcome = %q, want applied (T-113: a different action is not a duplicate)", undo.Kind)
 		}
 		if undo.Report.Deleted != 2 {
-			t.Errorf("undo: deleted=%d, хочу 2 (оба домена первого add-файла)", undo.Report.Deleted)
+			t.Errorf("undo: deleted=%d, want 2 (both domains of the first add file)", undo.Report.Deleted)
 		}
 		for _, label := range []string{accIDNLabel, "xn--80aairftm"} {
 			if d, ok := env.domain(t, accIDNZone, label); !ok || d.status != int16(model.StatusDeleted) {
-				t.Errorf("после undo: домен %s = %+v, хочу deleted (остался в БД, §13.1)", label, d)
+				t.Errorf("after undo: domain %s = %+v, want deleted (stayed in the DB, §13.1)", label, d)
 			}
 		}
 
@@ -805,7 +805,7 @@ func TestAccept01_IngestAddDeleteIDN(t *testing.T) {
 			t.Fatal(err)
 		}
 		if total != 5 || contents != 3 {
-			t.Errorf("ingest_files: строк %d, содержим %d, хочу 5/3 (строка на доставку, не на содержимое; дублей точной доставки в сценарии нет)", total, contents)
+			t.Errorf("ingest_files: %d rows, %d contents, want 5/3 (a row per delivery, not per content; no exact delivery duplicates in the scenario)", total, contents)
 		}
 	})
 }
@@ -833,41 +833,41 @@ func TestAccept02_SubdomainsVariantsAliases(t *testing.T) {
 	var totalRows int
 	for _, l := range labels {
 		n := len(accRows(t, env.pool, ids[l]))
-		t.Logf("домен %s: записей %d", l, n)
+		t.Logf("domain %s: %d rows", l, n)
 		totalRows += n
 	}
 	if totalRows != 8 {
-		t.Fatalf("записей subdomain_results по 4 доменам: %d, хочу 8", totalRows)
+		t.Fatalf("subdomain_results rows across 4 domains: %d, want 8", totalRows)
 	}
 	if n := streamLen(t, env.rdb, queue.StreamAnalyze); n != int64(totalRows) {
-		t.Errorf("сообщений q:analyze = %d, хочу %d (по записи на проверку)", n, totalRows)
+		t.Errorf("q:analyze messages = %d, want %d (one per check)", n, totalRows)
 	}
 
-	t.Run("каждый субдомен — своя проверка (same-site)", func(t *testing.T) {
+	t.Run("each subdomain has its own check (same-site)", func(t *testing.T) {
 		rows := accRows(t, env.pool, ids["same-site"])
 		if len(rows) != 2 {
-			t.Fatalf("записей: %d, хочу 2 (апекс и www независимо)", len(rows))
+			t.Fatalf("rows: %d, want 2 (apex and www independently)", len(rows))
 		}
 		apex, www := rows[0], rows[1]
 		if apex.subdomainID != 0 || www.subdomainID != 1 {
-			t.Fatalf("порядок: subdomain_id = %d, %d, хочу 0, 1", apex.subdomainID, www.subdomainID)
+			t.Fatalf("order: subdomain_id = %d, %d, want 0, 1", apex.subdomainID, www.subdomainID)
 		}
 		// The apex: the protocols converge on one site — a single variant 0
 		// row, canonical https (spec 5.5 item 5).
 		if apex.variant != int16(model.VariantMain) || apex.scheme != int16(model.SchemeHTTPS) {
-			t.Errorf("апекс: variant/scheme = %d/%d, хочу 0/https", apex.variant, apex.scheme)
+			t.Errorf("apex: variant/scheme = %d/%d, want 0/https", apex.variant, apex.scheme)
 		}
 		if accStr(apex.finalURL) != "https://same-site.crawl.test/" || apex.aliasKind != int16(model.AliasNone) {
-			t.Errorf("апекс: url=%q alias=%d, хочу https://same-site…/ без алиаса", accStr(apex.finalURL), apex.aliasKind)
+			t.Errorf("apex: url=%q alias=%d, want https://same-site…/ without an alias", accStr(apex.finalURL), apex.aliasKind)
 		}
 		// www is not configured in Caddy: https is rejected by SNI, http
 		// answers — a row of its own check's scheme, not a "copy" of the
 		// apex.
 		if www.variant != int16(model.VariantMain) || www.scheme != int16(model.SchemeHTTP) {
-			t.Errorf("www: variant/scheme = %d/%d, хочу 0/http (независимая проверка)", www.variant, www.scheme)
+			t.Errorf("www: variant/scheme = %d/%d, want 0/http (an independent check)", www.variant, www.scheme)
 		}
 		if accStr(www.finalURL) != "http://www.same-site.crawl.test/" {
-			t.Errorf("www: итоговый URL = %q", accStr(www.finalURL))
+			t.Errorf("www: final URL = %q", accStr(www.finalURL))
 		}
 		// The DNS mask carries both subdomains (§5.4 item 4).
 		var mask int64
@@ -877,85 +877,85 @@ func TestAccept02_SubdomainsVariantsAliases(t *testing.T) {
 			t.Fatal(err)
 		}
 		if mask != 0b11 {
-			t.Errorf("dns_mask = %b, хочу биты 0 и 1 (апекс и www живы)", mask)
+			t.Errorf("dns_mask = %b, want bits 0 and 1 (apex and www alive)", mask)
 		}
 	})
 
-	t.Run("варианты протоколов (different-sites, §5.5 п. 5)", func(t *testing.T) {
+	t.Run("protocol variants (different-sites, §5.5 item 5)", func(t *testing.T) {
 		rows := accRows(t, env.pool, ids["different-sites"])
 		if len(rows) != 2 {
-			t.Fatalf("записей: %d, хочу 2 (http и https — разные сайты)", len(rows))
+			t.Fatalf("rows: %d, want 2 (http and https — different sites)", len(rows))
 		}
 		if rows[0].subdomainID != 0 || rows[1].subdomainID != 0 {
-			t.Fatalf("записи не апекс: %d, %d", rows[0].subdomainID, rows[1].subdomainID)
+			t.Fatalf("rows are not the apex: %d, %d", rows[0].subdomainID, rows[1].subdomainID)
 		}
 		main, alt := rows[0], rows[1]
 		if main.variant != int16(model.VariantMain) || main.scheme != int16(model.SchemeHTTPS) {
-			t.Errorf("variant 0: scheme = %d, хочу https (канонический)", main.scheme)
+			t.Errorf("variant 0: scheme = %d, want https (canonical)", main.scheme)
 		}
 		if alt.variant != int16(model.VariantHTTP) || alt.scheme != int16(model.SchemeHTTP) {
-			t.Errorf("variant 1: scheme = %d, хочу http", alt.scheme)
+			t.Errorf("variant 1: scheme = %d, want http", alt.scheme)
 		}
 		if accStr(main.finalURL) == accStr(alt.finalURL) {
-			t.Errorf("итоговые URL совпали: %q — сайты обязаны быть разными", accStr(main.finalURL))
+			t.Errorf("the final URLs match: %q — the sites must be different", accStr(main.finalURL))
 		}
 		if got := accStr(alt.finalURL); got != "http://different-sites-alt.crawl.test/" {
-			t.Errorf("итоговый URL http-варианта = %q, хочу http://different-sites-alt.crawl.test/ (редирект на хост-спутник)", got)
+			t.Errorf("the http variant's final URL = %q, want http://different-sites-alt.crawl.test/ (a redirect to the satellite host)", got)
 		}
 		for i, r := range rows {
 			if r.aliasKind != int16(model.AliasNone) || r.aliasSub != nil {
-				t.Errorf("строка %d: алиас = %d/%v, хочу нет", i, r.aliasKind, r.aliasSub)
+				t.Errorf("row %d: alias = %d/%v, want none", i, r.aliasKind, r.aliasSub)
 			}
 		}
 	})
 
-	t.Run("алиас «идентичен» (equal-pair, §5.5 п. 6)", func(t *testing.T) {
+	t.Run("the \"identical\" alias (equal-pair, §5.5 item 6)", func(t *testing.T) {
 		rows := accRows(t, env.pool, ids["equal-pair"])
 		if len(rows) != 2 {
-			t.Fatalf("записей: %d, хочу 2", len(rows))
+			t.Fatalf("rows: %d, want 2", len(rows))
 		}
 		apex, www := rows[0], rows[1]
 		if apex.subdomainID != 0 || www.subdomainID != 1 {
-			t.Fatalf("порядок: %d, %d, хочу апекс, www", apex.subdomainID, www.subdomainID)
+			t.Fatalf("order: %d, %d, want apex, www", apex.subdomainID, www.subdomainID)
 		}
 		if apex.aliasKind != int16(model.AliasNone) {
-			t.Errorf("апекс (оригинал): alias_kind = %d, хочу 0", apex.aliasKind)
+			t.Errorf("apex (the original): alias_kind = %d, want 0", apex.aliasKind)
 		}
 		if len(apex.contentHash) != 16 {
-			t.Errorf("апекс: контент не сохранён (content_hash = %d байт)", len(apex.contentHash))
+			t.Errorf("apex: content not stored (content_hash = %d bytes)", len(apex.contentHash))
 		}
 		if www.aliasKind != int16(model.AliasIdentical) {
-			t.Errorf("www: alias_kind = %d, хочу 1 (идентичен)", www.aliasKind)
+			t.Errorf("www: alias_kind = %d, want 1 (identical)", www.aliasKind)
 		}
 		if www.aliasSub == nil || *www.aliasSub != 0 {
-			t.Errorf("www: alias_subdomain_id = %v, хочу 0 (оригинал — апекс)", www.aliasSub)
+			t.Errorf("www: alias_subdomain_id = %v, want 0 (the original is the apex)", www.aliasSub)
 		}
 		if www.contentHash != nil {
-			t.Error("www-алиас хранит собственный контент — контент обязан быть один (у оригинала)")
+			t.Error("the www alias stores its own content — there must be one content (the original's)")
 		}
 	})
 
-	t.Run("алиас «редирект» (www-to-bare, §5.5 п. 6)", func(t *testing.T) {
+	t.Run("the \"redirect\" alias (www-to-bare, §5.5 item 6)", func(t *testing.T) {
 		rows := accRows(t, env.pool, ids["www-to-bare"])
 		if len(rows) != 2 {
-			t.Fatalf("записей: %d, хочу 2", len(rows))
+			t.Fatalf("rows: %d, want 2", len(rows))
 		}
 		apex, www := rows[0], rows[1]
 		if apex.aliasKind != int16(model.AliasNone) || len(apex.contentHash) != 16 {
-			t.Errorf("апекс: alias=%d контент=%d байт, хочу оригинал с контентом", apex.aliasKind, len(apex.contentHash))
+			t.Errorf("apex: alias=%d content=%d bytes, want the original with content", apex.aliasKind, len(apex.contentHash))
 		}
 		if www.aliasKind != int16(model.AliasRedirect) {
-			t.Errorf("www: alias_kind = %d, хочу 2 (редирект на оригинал)", www.aliasKind)
+			t.Errorf("www: alias_kind = %d, want 2 (a redirect to the original)", www.aliasKind)
 		}
 		if www.aliasSub == nil || *www.aliasSub != 0 {
-			t.Errorf("www: alias_subdomain_id = %v, хочу 0 (апекс)", www.aliasSub)
+			t.Errorf("www: alias_subdomain_id = %v, want 0 (the apex)", www.aliasSub)
 		}
 		// The alias row converges on the original's address (spec 5.5 item 6).
 		if want := "https://www-to-bare.crawl.test/"; accStr(www.finalURL) != want {
-			t.Errorf("www: итоговый URL = %q, хочу %q", accStr(www.finalURL), want)
+			t.Errorf("www: final URL = %q, want %q", accStr(www.finalURL), want)
 		}
 		if www.contentHash != nil {
-			t.Error("www-алиас хранит собственный контент")
+			t.Error("the www alias stores its own content")
 		}
 	})
 
@@ -963,7 +963,7 @@ func TestAccept02_SubdomainsVariantsAliases(t *testing.T) {
 	for _, l := range labels {
 		st := httpDomainState(t, env.pool, ids[l])
 		if st.status != model.StatusAlive || st.checkState != int16(model.CheckStateDone) {
-			t.Errorf("%s: status/check_state = %s/%d, хочу alive/done", l, st.status, st.checkState)
+			t.Errorf("%s: status/check_state = %s/%d, want alive/done", l, st.status, st.checkState)
 		}
 	}
 }
@@ -973,7 +973,7 @@ func accZoneID(t *testing.T, pool *pgxpool.Pool, zone string) int16 {
 	var id int16
 	if err := pool.QueryRow(context.Background(),
 		"SELECT id FROM zones WHERE name = $1", zone).Scan(&id); err != nil {
-		t.Fatalf("зона %s: %v", zone, err)
+		t.Fatalf("zone %s: %v", zone, err)
 	}
 	return id
 }
@@ -1058,51 +1058,51 @@ func TestAccept03_SPADomCookiesContent(t *testing.T) {
 
 	ids := accPipeline(ctx, t, env, accZone, []string{"spa-shell", "parked-1", "parked-2"})
 
-	t.Run("не-SPA: HTML сохраняется, дедуп и сжатие", func(t *testing.T) {
+	t.Run("non-SPA: HTML stored, dedup and compression", func(t *testing.T) {
 		p1 := accRows(t, env.pool, ids["parked-1"])
 		p2 := accRows(t, env.pool, ids["parked-2"])
 		if len(p1) != 1 || len(p2) != 1 {
-			t.Fatalf("записей парковок: %d/%d, хочу 1/1", len(p1), len(p2))
+			t.Fatalf("parked page rows: %d/%d, want 1/1", len(p1), len(p2))
 		}
 		h1, h2 := accHash(p1[0].contentHash), accHash(p2[0].contentHash)
 		if h1 != h2 {
-			t.Fatal("идентичные парковки дали разные content_hash — дедупликация не работает")
+			t.Fatal("identical parked pages produced different content_hash — deduplication broken")
 		}
 		// One reference from each row — refcount = 2 on the shared block.
 		row, ok := contentRowByHash(t, env.pool, h1)
 		if !ok {
-			t.Fatal("контент парковок не записан в contents")
+			t.Fatal("the parked pages' content not stored in contents")
 		}
 		if row.refc != 2 {
-			t.Errorf("refcount общего блока = %d, хочу 2 (две записи, один блок)", row.refc)
+			t.Errorf("the shared block refcount = %d, want 2 (two rows, one block)", row.refc)
 		}
 		// Compression: the block in the pack is smaller than the original bytes (zstd, T-041).
 		if row.clen >= row.rawLen {
-			t.Errorf("сжатие не работает: len=%d >= raw_len=%d", row.clen, row.rawLen)
+			t.Errorf("compression broken: len=%d >= raw_len=%d", row.clen, row.rawLen)
 		}
 		// The content is read back (a roundtrip).
 		body, err := env.store.Get(ctx, h1)
 		if err != nil {
-			t.Fatalf("чтение контента: %v", err)
+			t.Fatalf("content read: %v", err)
 		}
 		if !strings.Contains(string(body), "Future home of something quite cool") {
-			t.Errorf("контент не похож на парковку: %.80q", body)
+			t.Errorf("the content does not look like a parked page: %.80q", body)
 		}
 		if p1[0].rendered {
-			t.Error("не-SPA запись обязана остаться rendered = false (HTML, не DOM)")
+			t.Error("the non-SPA row must stay rendered = false (HTML, not DOM)")
 		}
 	})
 
-	t.Run("SPA: HTTP-этап публикует q:render", func(t *testing.T) {
+	t.Run("SPA: the HTTP stage publishes q:render", func(t *testing.T) {
 		rows := accRows(t, env.pool, ids["spa-shell"])
 		if len(rows) != 1 {
-			t.Fatalf("записей spa-shell: %d, хочу 1", len(rows))
+			t.Fatalf("spa-shell rows: %d, want 1", len(rows))
 		}
 		if rows[0].rendered {
-			t.Error("до рендера rendered = false (сырой HTML)")
+			t.Error("before the render rendered = false (raw HTML)")
 		}
 		if n := streamLen(t, env.rdb, queue.StreamRender); n != 1 {
-			t.Fatalf("сообщений q:render = %d, хочу 1 (SPA-вердикт T-057)", n)
+			t.Fatalf("q:render messages = %d, want 1 (the SPA verdict T-057)", n)
 		}
 		// The render_pending flag is not set: the queue had capacity.
 		var flags int16
@@ -1112,11 +1112,11 @@ func TestAccept03_SPADomCookiesContent(t *testing.T) {
 			t.Fatal(err)
 		}
 		if flags&int16(model.FlagRenderPending) != 0 {
-			t.Error("бит render_pending выставлен вопреки свободной очереди рендера")
+			t.Error("the render_pending bit set despite a free render queue")
 		}
 	})
 
-	t.Run("render-worker: итоговый DOM и cookies", func(t *testing.T) {
+	t.Run("render-worker: the final DOM and cookies", func(t *testing.T) {
 		before := accRows(t, env.pool, ids["spa-shell"])[0]
 		rawHash := accHash(before.contentHash)
 		analyzeBefore := streamLen(t, env.rdb, queue.StreamAnalyze)
@@ -1128,7 +1128,7 @@ func TestAccept03_SPADomCookiesContent(t *testing.T) {
 			RestartEveryPages: 1000,
 		})
 		if err != nil {
-			t.Fatalf("подключение к Chromium: %v", err)
+			t.Fatalf("Chromium connection: %v", err)
 		}
 		t.Cleanup(browser.Close)
 		pool := render.NewPool(browser)
@@ -1140,7 +1140,7 @@ func TestAccept03_SPADomCookiesContent(t *testing.T) {
 
 		deliveries := consumeTasks(t, env.q, queue.StreamRender, accRenderGroup, "acc", 1)
 		if len(deliveries) != 1 {
-			t.Fatalf("доставок q:render: %d, хочу 1", len(deliveries))
+			t.Fatalf("q:render deliveries: %d, want 1", len(deliveries))
 		}
 		err = queue.Processing(ctx, env.q, accRenderGroup, deliveries[0],
 			func(c context.Context, d queue.Delivery) error {
@@ -1153,41 +1153,41 @@ func TestAccept03_SPADomCookiesContent(t *testing.T) {
 					return err
 				}
 				if !processed {
-					return errors.New("рендер не записан (строка ушла из-под задачи)")
+					return errors.New("the render not recorded (the row moved out from under the task)")
 				}
 				return nil
 			})
 		if err != nil {
-			t.Fatalf("рендер spa-shell: %v", err)
+			t.Fatalf("spa-shell render: %v", err)
 		}
 
 		after := accRows(t, env.pool, ids["spa-shell"])[0]
 		if !after.rendered {
-			t.Error("rendered не выставлен — DOM не заменил HTML")
+			t.Error("rendered not set — the DOM did not replace the HTML")
 		}
 		newHash := accHash(after.contentHash)
 		if newHash == rawHash {
-			t.Error("content_hash не изменился — записан сырой HTML вместо DOM")
+			t.Error("content_hash unchanged — raw HTML stored instead of the DOM")
 		}
 		// The final DOM: the content after JS, absent from the raw HTML.
 		dom, err := env.store.Get(ctx, newHash)
 		if err != nil {
-			t.Fatalf("чтение DOM из хранилища: %v", err)
+			t.Fatalf("DOM read from the store: %v", err)
 		}
 		if !strings.Contains(string(dom), "SPA-контент после рендера") {
-			t.Errorf("DOM без контента, нарисованного JS: %.120q", dom)
+			t.Errorf("the DOM lacks the JS-drawn content: %.120q", dom)
 		}
 		// Cookies: JS set a cookie — CDP captures the whole storage (spec 5.6).
 		if after.cookies == nil || !strings.Contains(*after.cookies, `"js_session"`) {
-			t.Errorf("cookies рендера без js_session: %v", after.cookies)
+			t.Errorf("render cookies without js_session: %v", after.cookies)
 		}
 		// The raw HTML lost its reference: the block is dead (T-044), Get does not serve it.
 		if _, err := env.store.Get(ctx, rawHash); !errors.Is(err, content.ErrNotFound) {
-			t.Errorf("чтение старого HTML после рендера: %v, хочу ErrNotFound (ссылка снята)", err)
+			t.Errorf("reading the old HTML after the render: %v, want ErrNotFound (the reference removed)", err)
 		}
 		// Publishing to q:analyze after the content replacement (§7).
 		if n := streamLen(t, env.rdb, queue.StreamAnalyze); n != analyzeBefore+1 {
-			t.Errorf("q:analyze после рендера: %d, хочу %d (+1)", n, analyzeBefore+1)
+			t.Errorf("q:analyze after the render: %d, want %d (+1)", n, analyzeBefore+1)
 		}
 	})
 }
@@ -1241,7 +1241,7 @@ func TestAccept03_RenderFallback(t *testing.T) {
 	// returns with attempts=2 — a publication to q:render-fallback instead
 	// of a marker.
 	tarpit := &render.Error{Class: render.ClassTask, URL: "https://spa.example/",
-		Err: fmt.Errorf("таймаут страницы %s: %w: %w",
+		Err: fmt.Errorf("page timeout %s: %w: %w",
 			25*time.Second, context.DeadlineExceeded, errors.New("navigation timeout"))}
 	// The instrument registries of both builds (T-245): published is
 	// counted by worker A, consumed — by worker B; the balance check is
@@ -1276,19 +1276,19 @@ func TestAccept03_RenderFallback(t *testing.T) {
 
 	// The task went to q:render-fallback (the first delivery — an error,
 	// the claim with attempts=2 — a publication and an XACK).
-	accWaitFor(t, "задача опубликована в q:render-fallback", 30*time.Second, func() bool {
+	accWaitFor(t, "the task published to q:render-fallback", 30*time.Second, func() bool {
 		return streamLen(t, env.rdb, queue.StreamRenderFallback) == 1
 	})
 	cancelA()
 	<-runADone
 
-	t.Run("первичный воркер: запись ждёт фолбэка без маркера", func(t *testing.T) {
+	t.Run("the primary worker: the row waits for the fallback without a marker", func(t *testing.T) {
 		row := accRows(t, env.pool, ids["spa-shell"])[0]
 		if row.rendered {
-			t.Error("rendered обязан остаться false — рендера не было")
+			t.Error("rendered must stay false — no render happened")
 		}
 		if accHash(row.contentHash) != rawHash {
-			t.Error("content_hash не должен меняться до доработки воркером B")
+			t.Error("content_hash must not change before worker B finishes the row")
 		}
 		var failedAt *time.Time
 		if err := env.pool.QueryRow(ctx,
@@ -1297,12 +1297,12 @@ func TestAccept03_RenderFallback(t *testing.T) {
 			t.Fatal(err)
 		}
 		if failedAt != nil {
-			t.Error("render_failed_at ставить нельзя — маркер ставит воркер B после исчерпания фолбэка (ФТ-10)")
+			t.Error("render_failed_at must not be set — worker B sets the marker after exhausting the fallback (FR-10)")
 		}
 		// q:analyze is not published by the primary worker: worker B will
 		// publish the analysis after finishing the row (FR-10).
 		if n := streamLen(t, env.rdb, queue.StreamAnalyze); n != analyzeBefore {
-			t.Errorf("q:analyze = %d, хочу %d (без прироста — публикация за воркером B)", n, analyzeBefore)
+			t.Errorf("q:analyze = %d, want %d (no growth — the publication belongs to worker B)", n, analyzeBefore)
 		}
 	})
 
@@ -1315,7 +1315,7 @@ func TestAccept03_RenderFallback(t *testing.T) {
 		RestartEveryPages: 1000,
 	})
 	if err != nil {
-		t.Fatalf("подключение к Chromium: %v", err)
+		t.Fatalf("Chromium connection: %v", err)
 	}
 	t.Cleanup(browser.Close)
 	chromePool := render.NewPool(browser)
@@ -1339,7 +1339,7 @@ func TestAccept03_RenderFallback(t *testing.T) {
 	runBDone := make(chan struct{})
 	go func() { defer close(runBDone); _ = renderworker.Run(ctxB, wB, optsB) }()
 
-	accWaitFor(t, "воркер B отрендерил запись фолбэка", 90*time.Second, func() bool {
+	accWaitFor(t, "worker B rendered the fallback row", 90*time.Second, func() bool {
 		rows := accRows(t, env.pool, ids["spa-shell"])
 		return len(rows) == 1 && rows[0].rendered
 	})
@@ -1348,32 +1348,32 @@ func TestAccept03_RenderFallback(t *testing.T) {
 	// stream depth — canceling worker B's ctx in the "row commit → XACK"
 	// window would leave the row in the PEL and flake the check (the T-245
 	// review).
-	accWaitFor(t, "воркер B подтвердил доставку фолбэка (XACK)", 30*time.Second, func() bool {
+	accWaitFor(t, "worker B acknowledged the fallback delivery (XACK)", 30*time.Second, func() bool {
 		return pendingCount(t, env.rdb, queue.StreamRenderFallback, "acc-render-fb-b") == 0
 	})
 	cancelB()
 	<-runBDone
 
-	t.Run("воркер B: DOM записан, q:analyze опубликована", func(t *testing.T) {
+	t.Run("worker B: the DOM stored, q:analyze published", func(t *testing.T) {
 		after := accRows(t, env.pool, ids["spa-shell"])[0]
 		if !after.rendered {
-			t.Fatal("rendered не выставлен — доработка фолбэка не записана")
+			t.Fatal("rendered not set — the fallback finish not recorded")
 		}
 		if accHash(after.contentHash) == rawHash {
-			t.Error("content_hash не изменился — записан сырой HTML вместо DOM")
+			t.Error("content_hash unchanged — raw HTML stored instead of the DOM")
 		}
 		dom, err := env.store.Get(ctx, accHash(after.contentHash))
 		if err != nil {
-			t.Fatalf("чтение DOM из хранилища: %v", err)
+			t.Fatalf("DOM read from the store: %v", err)
 		}
 		if !strings.Contains(string(dom), "SPA-контент после рендера") {
-			t.Errorf("DOM без контента, нарисованного JS: %.120q", dom)
+			t.Errorf("the DOM lacks the JS-drawn content: %.120q", dom)
 		}
 		if n := streamLen(t, env.rdb, queue.StreamAnalyze); n != analyzeBefore+1 {
-			t.Errorf("q:analyze = %d, хочу %d (+1 — публикация доработки, Fresh)", n, analyzeBefore+1)
+			t.Errorf("q:analyze = %d, want %d (+1 — the finish publication, Fresh)", n, analyzeBefore+1)
 		}
 		if n := streamLen(t, env.rdb, queue.StreamRenderFallback); n != 1 {
-			t.Errorf("q:render-fallback = %d, хочу 1 (рекурсивный фолбэк запрещён, ФТ-10)", n)
+			t.Errorf("q:render-fallback = %d, want 1 (a recursive fallback forbidden, FR-10)", n)
 		}
 	})
 
@@ -1385,31 +1385,31 @@ func TestAccept03_RenderFallback(t *testing.T) {
 	// (BackpressureGate.Len: min(lag, XLEN) + the PEL over the groups);
 	// its PEL part is a direct XPENDING of build B's group. The scenario
 	// is finished to the end — the remainder is 0, no divergences.
-	t.Run("баланс: published = consumed + остаток q:render-fallback", func(t *testing.T) {
+	t.Run("balance: published = consumed + the q:render-fallback remainder", func(t *testing.T) {
 		published := accCounterSum(t, regA, "crawler_render_fallback_published_total")
 		if published != 1 {
-			t.Fatalf("published = %v, хочу 1 (одна публикация тарпита)", published)
+			t.Fatalf("published = %v, want 1 (one tarpit publication)", published)
 		}
 		consumed := accCounterSum(t, regB, "crawler_render_fallback_consumed_total")
 		if consumed != 1 {
-			t.Fatalf("consumed = %v, хочу 1 (одна доработка воркером B)", consumed)
+			t.Fatalf("consumed = %v, want 1 (one finish by worker B)", consumed)
 		}
 		if got := accCounterSum(t, regB, "crawler_render_fallback_consumed_total", "result", "rendered"); got != 1 {
-			t.Errorf("consumed{rendered} = %v, хочу 1 (исход доработки — успех)", got)
+			t.Errorf("consumed{rendered} = %v, want 1 (the finish outcome — success)", got)
 		}
 		depth, err := gate.Len(ctx, queue.StreamRenderFallback)
 		if err != nil {
-			t.Fatalf("глубина q:render-fallback (crawler_queue_depth): %v", err)
+			t.Fatalf("q:render-fallback depth (crawler_queue_depth): %v", err)
 		}
 		if pel := pendingCount(t, env.rdb, queue.StreamRenderFallback, "acc-render-fb-b"); pel != 0 {
-			t.Errorf("остаток PEL группы воркера B = %d, хочу 0 (доставка подтверждена)", pel)
+			t.Errorf("worker B's group PEL remainder = %d, want 0 (the delivery acknowledged)", pel)
 		}
 		if diff := published - consumed - float64(depth); diff != 0 {
-			t.Errorf("баланс фолбэка: published(%v) != consumed(%v) + остаток(%d), расхождение %v", published, consumed, depth, diff)
+			t.Errorf("the fallback balance: published(%v) != consumed(%v) + remainder(%d), divergence %v", published, consumed, depth, diff)
 		}
 		// Build A consumed nothing: its registry has no consumed series.
 		if got := accCounterSum(t, regA, "crawler_render_fallback_consumed_total"); got != 0 {
-			t.Errorf("consumed у основной сборки = %v, хочу 0 (считает только воркер B)", got)
+			t.Errorf("the primary build's consumed = %v, want 0 (only worker B counts)", got)
 		}
 	})
 }
@@ -1439,7 +1439,7 @@ func TestAccept04_ReanalyzeNoRefetch(t *testing.T) {
 
 	v1 := env.rules.Version
 	if v1 == 0 {
-		t.Fatal("версия рабочего набора не должна быть нулевой")
+		t.Fatal("the working set's version must not be zero")
 	}
 
 	// The "before" snapshot: the result rows and the store.
@@ -1481,11 +1481,11 @@ func TestAccept04_ReanalyzeNoRefetch(t *testing.T) {
 	// new signal and a higher score.
 	loader2, err := rules.NewReloader(accModifiedRulesDir(t), nil)
 	if err != nil {
-		t.Fatalf("изменённый набор правил: %v", err)
+		t.Fatalf("the modified rule set: %v", err)
 	}
 	v2 := loader2.Set().Version
 	if v2 == v1 {
-		t.Fatal("версия набора не изменилась — reanalyze не найдёт устаревших строк")
+		t.Fatal("the set version unchanged — reanalyze will not find stale rows")
 	}
 	an2, err := analyzer.New(env.pool, env.q, env.store, loader2, analyzer.Options{
 		MinScore: rules.DefaultMinScore,
@@ -1500,7 +1500,7 @@ func TestAccept04_ReanalyzeNoRefetch(t *testing.T) {
 	}
 	// The selection — the stale rows (rules_version IS DISTINCT FROM v2).
 	if res.Selected != len(labels) || res.Published != len(labels) {
-		t.Fatalf("переанализ: selected=%d published=%d, хочу %d/%d", res.Selected, res.Published, len(labels), len(labels))
+		t.Fatalf("reanalyze: selected=%d published=%d, want %d/%d", res.Selected, res.Published, len(labels), len(labels))
 	}
 
 	// The second set's worker re-consumes q:analyze.
@@ -1518,7 +1518,7 @@ func TestAccept04_ReanalyzeNoRefetch(t *testing.T) {
 		// are in the signals jsonb, there is no separate row per rule
 		// (T-071, §6.1).
 		if len(fs) != 1 {
-			t.Errorf("%s: findings после переанализа = %d строк, хочу 1", l, len(fs))
+			t.Errorf("%s: findings after the reanalysis = %d rows, want 1", l, len(fs))
 			continue
 		}
 		fired := accFiredRules(t, fs[0].signals)
@@ -1528,20 +1528,20 @@ func TestAccept04_ReanalyzeNoRefetch(t *testing.T) {
 			wantFired++
 			wantScore = 1 - (1-*sample.Expect.Score)*(1-accProbeWeight)
 			if !fired[accProbeRule] {
-				t.Errorf("%s: в signals нет пробы %s — правила не переприменены (перештамповка rules_version?)", l, accProbeRule)
+				t.Errorf("%s: the probe %s missing from signals — the rules not reapplied (a rules_version re-stamp?)", l, accProbeRule)
 			}
 		} else if fired[accProbeRule] {
-			t.Errorf("%s: проба %s сработала вне образца-мишени %s", l, accProbeRule, accProbeSample)
+			t.Errorf("%s: the probe %s fired outside the target sample %s", l, accProbeRule, accProbeSample)
 		}
 		if got := len(fired); got != wantFired {
-			t.Errorf("%s: срабатываний в signals = %d (%v), хочу %d", l, got, fired, wantFired)
+			t.Errorf("%s: hits in signals = %d (%v), want %d", l, got, fired, wantFired)
 		}
 		for _, f := range fs {
 			if f.rulesVersion != v2 {
-				t.Errorf("%s: rules_version срабатывания = %d, хочу %d (новый набор)", l, f.rulesVersion, v2)
+				t.Errorf("%s: the hit's rules_version = %d, want %d (the new set)", l, f.rulesVersion, v2)
 			}
 			if math.Abs(float64(f.score)-wantScore) > accScoreTol {
-				t.Errorf("%s: score после переанализа = %.4f, хочу ≈%.3f", l, f.score, wantScore)
+				t.Errorf("%s: score after the reanalysis = %.4f, want ≈%.3f", l, f.score, wantScore)
 			}
 		}
 	}
@@ -1561,17 +1561,17 @@ func TestAccept04_ReanalyzeNoRefetch(t *testing.T) {
 				t.Fatal(err)
 			}
 			if i >= len(before[ids[l]]) {
-				t.Fatalf("%s: строк после переанализа больше, чем до", l)
+				t.Fatalf("%s: more rows after the reanalysis than before", l)
 			}
 			want := before[ids[l]][i]
 			if !s.checked.Equal(want.checked) {
-				t.Errorf("%s: checked_at изменился (%v → %v) — повторная проверка?", l, want.checked, s.checked)
+				t.Errorf("%s: checked_at changed (%v → %v) — a recheck?", l, want.checked, s.checked)
 			}
 			if string(s.hash) != string(want.hash) {
-				t.Errorf("%s: content_hash изменился — контент перекачан", l)
+				t.Errorf("%s: content_hash changed — the content refetched", l)
 			}
 			if s.version != v2 {
-				t.Errorf("%s: rules_version строки = %d, хочу %d", l, s.version, v2)
+				t.Errorf("%s: the row's rules_version = %d, want %d", l, s.version, v2)
 			}
 			i++
 		}
@@ -1580,24 +1580,24 @@ func TestAccept04_ReanalyzeNoRefetch(t *testing.T) {
 			t.Fatal(err)
 		}
 		if i != len(before[ids[l]]) {
-			t.Errorf("%s: строк %d, хочу %d", l, i, len(before[ids[l]]))
+			t.Errorf("%s: %d rows, want %d", l, i, len(before[ids[l]]))
 		}
 	}
 	if n := streamLen(t, env.rdb, queue.StreamDNS); n != dnsBefore {
-		t.Errorf("q:dns вырос: %d → %d — DNS-этап запускался", dnsBefore, n)
+		t.Errorf("q:dns grew: %d → %d — the DNS stage ran", dnsBefore, n)
 	}
 	if n := streamLen(t, env.rdb, queue.StreamHTTP); n != httpBefore {
-		t.Errorf("q:http вырос: %d → %d — скачивание повторялось", httpBefore, n)
+		t.Errorf("q:http grew: %d → %d — the download repeated", httpBefore, n)
 	}
 	if n := streamLen(t, env.rdb, queue.StreamRender); n != renderBefore {
-		t.Errorf("q:render изменился: %d → %d", renderBefore, n)
+		t.Errorf("q:render changed: %d → %d", renderBefore, n)
 	}
 	var contentsAfter int
 	if err := env.pool.QueryRow(ctx, "SELECT count(*) FROM contents").Scan(&contentsAfter); err != nil {
 		t.Fatal(err)
 	}
 	if contentsAfter != contentsBefore {
-		t.Errorf("хранилище выросло: %d → %d блоков — контент перекачан", contentsBefore, contentsAfter)
+		t.Errorf("the store grew: %d → %d blocks — the content refetched", contentsBefore, contentsAfter)
 	}
 }
 
@@ -1620,7 +1620,7 @@ func TestAccept05_LaravelTablesQueries(t *testing.T) {
 	zoneID := accZoneID(t, env.pool, accZone)
 	accAnalyze(ctx, t, env, env.analyzer, len(labels))
 
-	t.Run("список доменов с Laravel", func(t *testing.T) {
+	t.Run("the list of Laravel domains", func(t *testing.T) {
 		rows, err := env.pool.Query(ctx, `
 			SELECT d.label FROM laravel_domains AS ld
 			JOIN domains AS d ON d.zone_id = ld.zone_id AND d.id = ld.domain_id
@@ -1642,11 +1642,11 @@ func TestAccept05_LaravelTablesQueries(t *testing.T) {
 		}
 		// The §13.1 threshold: a confident sample gives a row, weak ones do not.
 		if len(got) != 1 || got[0] != "laravel-8-mix" {
-			t.Errorf("домены с Laravel = %v, хочу [laravel-8-mix]", got)
+			t.Errorf("Laravel domains = %v, want [laravel-8-mix]", got)
 		}
 	})
 
-	t.Run("субдомены с признаками (found_on_mask ↔ справочник)", func(t *testing.T) {
+	t.Run("subdomains with hits (found_on_mask ↔ the reference table)", func(t *testing.T) {
 		// Decoding found_on_mask with the bits of the subdomains reference
 		// table — the subdomains Laravel was found on (spec 5.8).
 		var labelsOut []string
@@ -1670,25 +1670,25 @@ func TestAccept05_LaravelTablesQueries(t *testing.T) {
 			t.Fatal(err)
 		}
 		if len(labelsOut) != 1 || labelsOut[0] != "" {
-			t.Errorf("субдомены с признаками = %q, хочу пустую метку (апекс, бит 0)", labelsOut)
+			t.Errorf("subdomains with hits = %q, want an empty label (the apex, bit 0)", labelsOut)
 		}
 	})
 
-	t.Run("версия (диапазон) и признаки уверенного домена", func(t *testing.T) {
+	t.Run("the version (a range) and the confident domain's hits", func(t *testing.T) {
 		agg, ok := accLaravelDomain(t, env.pool, zoneID, ids["laravel-8-mix"])
 		if !ok {
-			t.Fatal("laravel_domains без строки уверенного домена")
+			t.Fatal("laravel_domains has no row for the confident domain")
 		}
 		// The sample's range: Mix — up to 9.x (meta.yaml, the bounds are rule lines).
 		if got := accStr(agg.verMin); got != "" {
-			t.Errorf("ver_min = %q, хочу NULL (нижней границы нет)", got)
+			t.Errorf("ver_min = %q, want NULL (no lower bound)", got)
 		}
 		if got := accStr(agg.verMax); got != "9.x" {
-			t.Errorf("ver_max = %q, хочу 9.x", got)
+			t.Errorf("ver_max = %q, want 9.x", got)
 		}
 		fs := accFindings(t, env.pool, zoneID, ids["laravel-8-mix"])
 		if len(fs) != 1 {
-			t.Fatalf("findings = %d строк, хочу 1 (апекс, variant 0)", len(fs))
+			t.Fatalf("findings = %d rows, want 1 (the apex, variant 0)", len(fs))
 		}
 		fired := accFiredRules(t, fs[0].signals)
 		want := []string{
@@ -1697,41 +1697,41 @@ func TestAccept05_LaravelTablesQueries(t *testing.T) {
 		}
 		for _, r := range want {
 			if !fired[r] {
-				t.Errorf("признак %s отсутствует (сработали %v)", r, fired)
+				t.Errorf("the rule %s did not fire (fired %v)", r, fired)
 			}
 		}
 		if len(fired) != len(want) {
-			t.Errorf("сработавших признаков %d, хочу %d (%v)", len(fired), len(want), fired)
+			t.Errorf("%d fired rules, want %d (%v)", len(fired), len(want), fired)
 		}
 		if !fs[0].isLaravel {
-			t.Error("is_laravel уверенного срабатывания = false, хочу true (порог 0.6)")
+			t.Error("is_laravel of a confident hit = false, want true (the 0.6 threshold)")
 		}
 	})
 
-	t.Run("слабые срабатывания — только findings", func(t *testing.T) {
+	t.Run("weak hits — findings only", func(t *testing.T) {
 		// rails: csrf-meta + *_session below the threshold — all hits in
 		// laravel_findings (§13.1), no laravel_domains row.
 		fs := accFindings(t, env.pool, zoneID, ids["rails-negative"])
 		if len(fs) != 1 {
-			t.Fatalf("findings rails = %d строк, хочу 1", len(fs))
+			t.Fatalf("rails findings = %d rows, want 1", len(fs))
 		}
 		if fs[0].isLaravel {
-			t.Error("слабое срабатывание помечено is_laravel = true")
+			t.Error("a weak hit marked is_laravel = true")
 		}
 		fired := accFiredRules(t, fs[0].signals)
 		if !fired["meta_csrf_token"] || !fired["cookie_session_suffix"] {
-			t.Errorf("слабые признаки rails = %v, хочу csrf-meta и *_session", fired)
+			t.Errorf("rails weak signs = %v, want csrf-meta and *_session", fired)
 		}
 		if _, ok := accLaravelDomain(t, env.pool, zoneID, ids["rails-negative"]); ok {
-			t.Error("слабый домен попал в laravel_domains — порог 0.6 нарушен")
+			t.Error("a weak domain made it into laravel_domains — the 0.6 threshold violated")
 		}
 
 		// django: not a single hit — neither findings nor an aggregate.
 		if fs := accFindings(t, env.pool, zoneID, ids["django-negative"]); len(fs) != 0 {
-			t.Errorf("findings чистого негатива = %d строк, хочу 0", len(fs))
+			t.Errorf("the clean negative's findings = %d rows, want 0", len(fs))
 		}
 		if _, ok := accLaravelDomain(t, env.pool, zoneID, ids["django-negative"]); ok {
-			t.Error("чистый негатив попал в laravel_domains")
+			t.Error("a clean negative made it into laravel_domains")
 		}
 	})
 }
@@ -1792,7 +1792,7 @@ func TestAccept06_ZoneProgressAutomatic(t *testing.T) {
 		t.Fatalf("ZoneStatsOnce: %v", err)
 	}
 	if res.Zones != 2 {
-		t.Errorf("пересчитано зон: %d, хочу 2", res.Zones)
+		t.Errorf("zones recomputed: %d, want 2", res.Zones)
 	}
 	accZoneCounters := func(zone int16) (total, checked, laravel int32, updated bool) {
 		t.Helper()
@@ -1806,16 +1806,16 @@ func TestAccept06_ZoneProgressAutomatic(t *testing.T) {
 	}
 	total, checked, laravel, updated := accZoneCounters(zoneA)
 	if total != 4 || checked != 2 {
-		t.Errorf("зона A: total/checked = %d/%d, хочу 4/2 (deleted вне знаменателя, queued не проверен)", total, checked)
+		t.Errorf("zone A: total/checked = %d/%d, want 4/2 (deleted outside the denominator, queued not checked)", total, checked)
 	}
 	if laravel != 1 {
-		t.Errorf("зона A: domains_laravel = %d, хочу 1 (тем же проходом, T-120)", laravel)
+		t.Errorf("zone A: domains_laravel = %d, want 1 (the same pass, T-120)", laravel)
 	}
 	if !updated {
-		t.Error("updated_at не проставлен — алерт «остановка прогресса» (T-080) ослепнет")
+		t.Error("updated_at not set — the \"progress stall\" alert (T-080) goes blind")
 	}
 	if total, checked, laravel, _ := accZoneCounters(zoneB); total != 0 || checked != 0 || laravel != 0 {
-		t.Errorf("пустая зона: total/checked/laravel = %d/%d/%d, хочу 0/0/0", total, checked, laravel)
+		t.Errorf("empty zone: total/checked/laravel = %d/%d/%d, want 0/0/0", total, checked, laravel)
 	}
 
 	// The display: the cache converges with the direct aggregate (the
@@ -1830,7 +1830,7 @@ func TestAccept06_ZoneProgressAutomatic(t *testing.T) {
 		t.Fatal(err)
 	}
 	if int32(liveTotal) != total || int32(liveChecked) != checked {
-		t.Errorf("кэш %d/%d расходится с агрегатом %d/%d", total, checked, liveTotal, liveChecked)
+		t.Errorf("the cache %d/%d diverges from the aggregate %d/%d", total, checked, liveTotal, liveChecked)
 	}
 
 	// Updates automatically: the monitor service's loop with a short
@@ -1847,13 +1847,13 @@ func TestAccept06_ZoneProgressAutomatic(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
-	accWaitFor(t, "автоматическое обновление checked 2 → 3", 5*time.Second, func() bool {
+	accWaitFor(t, "the automatic checked 2 → 3 update", 5*time.Second, func() bool {
 		_, checked, _, _ := accZoneCounters(zoneA)
 		return checked == 3
 	})
 	stop()
 	if err := <-loopDone; err != nil {
-		t.Errorf("ZoneStatsLoop завершился с ошибкой: %v", err)
+		t.Errorf("ZoneStatsLoop exited with an error: %v", err)
 	}
 
 	// The metrics: the real exposure of the running monitor service — what
@@ -1868,18 +1868,18 @@ func TestAccept06_ZoneProgressAutomatic(t *testing.T) {
 	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Get(url)
 	if err != nil {
-		t.Skipf("сервис monitor недоступен (%s: %v) — поднимите профиль app (make up): реальная экспозиция /metrics требует работающего сервиса", url, err)
+		t.Skipf("the monitor service unavailable (%s: %v) — bring up the app profile (make up): the real /metrics exposure needs a running service", url, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		t.Fatalf("чтение %s: %v", url, err)
+		t.Fatalf("read %s: %v", url, err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("/metrics сервиса monitor: код %d, хочу 200", resp.StatusCode)
+		t.Fatalf("the monitor service's /metrics: code %d, want 200", resp.StatusCode)
 	}
 	if !strings.Contains(string(body), `crawler_service_up{service="monitor"} 1`) {
-		t.Errorf("экспозиция monitor без crawler_service_up{service=\"monitor\"} 1:\n%s", string(body))
+		t.Errorf("the monitor exposure without crawler_service_up{service=\"monitor\"} 1:\n%s", string(body))
 	}
 }
 
@@ -1902,7 +1902,7 @@ func TestAccept08_RecheckInterval(t *testing.T) {
 	set := func(label string, q string, args ...any) {
 		t.Helper()
 		if _, err := pool.Exec(ctx, q, args...); err != nil {
-			t.Fatalf("домен %s: %v", label, err)
+			t.Fatalf("domain %s: %v", label, err)
 		}
 	}
 	alive, done, del := int16(model.StatusAlive), int16(model.CheckStateDone), int16(model.StatusDeleted)
@@ -1926,7 +1926,7 @@ func TestAccept08_RecheckInterval(t *testing.T) {
 	// The default — 6 months (§3.3): the config and the scheduler constant
 	// are one value.
 	if got := config.Default().Scheduler.RecheckInterval; got != config.Duration(scheduler.DefaultRecheckInterval) {
-		t.Errorf("дефолт конфига = %s, хочу %s (6 месяцев)", got, scheduler.DefaultRecheckInterval)
+		t.Errorf("the config default = %s, want %s (6 months)", got, scheduler.DefaultRecheckInterval)
 	}
 	// The value is changed by config: the environment variable overrides.
 	envCfg, err := config.LoadEnv(func(key string) string {
@@ -1936,10 +1936,10 @@ func TestAccept08_RecheckInterval(t *testing.T) {
 		return os.Getenv(key) // the rest of the environment (incl. APP_PG_DSN) — as is
 	})
 	if err != nil {
-		t.Fatalf("конфиг с переопределением: %v", err)
+		t.Fatalf("config with an override: %v", err)
 	}
 	if got := envCfg.Scheduler.RecheckInterval; got != config.Duration(170*time.Hour) {
-		t.Errorf("переопределение окружением = %s, хочу 170h", got)
+		t.Errorf("the environment override = %s, want 170h", got)
 	}
 
 	// A fixed "now": the domains' age does not depend on the run date.
@@ -1949,18 +1949,18 @@ func TestAccept08_RecheckInterval(t *testing.T) {
 		t.Fatalf("RecheckOnce: %v", err)
 	}
 	if res.Domains != 1 {
-		t.Fatalf("переведено доменов: %d, хочу 1 (только созревший old)", res.Domains)
+		t.Fatalf("domains moved: %d, want 1 (only the mature old)", res.Domains)
 	}
 	if _, check := state("old"); check != int16(model.CheckStatePending) {
-		t.Errorf("old: check_state = %d, хочу pending", check)
+		t.Errorf("old: check_state = %d, want pending", check)
 	}
 	// The result status and foreign states are untouched.
 	if s, _ := state("old"); s != int16(model.StatusAlive) {
-		t.Errorf("old: статус результата изменён (%d) — перепроверка меняет только цикл", s)
+		t.Errorf("old: the result status changed (%d) — a recheck only touches the cycle", s)
 	}
 	for _, label := range []string{"fresh", "never", "pending", "gone"} {
 		if _, check := state(label); check == int16(model.CheckStatePending) && label != "pending" {
-			t.Errorf("%s: переведён в pending вне интервала", label)
+			t.Errorf("%s: moved to pending outside the interval", label)
 		}
 	}
 
@@ -1970,7 +1970,7 @@ func TestAccept08_RecheckInterval(t *testing.T) {
 		t.Fatal(err)
 	}
 	if res.Domains != 0 {
-		t.Errorf("повторный проход перевёл ещё %d — интервал не соблюдается", res.Domains)
+		t.Errorf("a repeat pass moved %d more — the interval not respected", res.Domains)
 	}
 
 	// The interval changes by config: 7 days (shorter than fresh's age of
@@ -1986,14 +1986,14 @@ func TestAccept08_RecheckInterval(t *testing.T) {
 		t.Fatal(err)
 	}
 	if res.Domains != 1 {
-		t.Fatalf("после смены интервала переведено %d, хочу 1 (fresh)", res.Domains)
+		t.Fatalf("after the interval change %d moved, want 1 (fresh)", res.Domains)
 	}
 	if _, check := state("fresh"); check != int16(model.CheckStatePending) {
-		t.Errorf("fresh: check_state = %d, хочу pending", check)
+		t.Errorf("fresh: check_state = %d, want pending", check)
 	}
 	for _, label := range []string{"never", "gone"} {
 		if _, check := state(label); check != int16(model.CheckStateDone) {
-			t.Errorf("%s: check_state = %d, хочу done (возраста/статуса нет)", label, check)
+			t.Errorf("%s: check_state = %d, want done (no age/status)", label, check)
 		}
 	}
 }
@@ -2019,13 +2019,13 @@ func TestAccept09_RestartNoStuckDomains(t *testing.T) {
 	ids := insertPendingDomains(t, pool, "acc9.test", labels)
 	batch, err := scheduler.DispatchBatch(ctx, pool, scheduler.DispatchQuery{Limit: len(labels)})
 	if err != nil {
-		t.Fatalf("выборка пачки: %v", err)
+		t.Fatalf("dispatch batch: %v", err)
 	}
 	if _, err := scheduler.EnqueueBatch(ctx, pool, q, batch); err != nil {
-		t.Fatalf("постановка пачки: %v", err)
+		t.Fatalf("enqueue batch: %v", err)
 	}
 	if n := countDomains(t, pool, stateWhere(model.CheckStateQueued)); n != len(labels) {
-		t.Fatalf("queued: %d, хочу %d", n, len(labels))
+		t.Fatalf("queued: %d, want %d", n, len(labels))
 	}
 
 	// A live lease is not given back: "the service works" — the domains
@@ -2036,7 +2036,7 @@ func TestAccept09_RestartNoStuckDomains(t *testing.T) {
 		t.Fatalf("LeaseOnce: %v", err)
 	}
 	if res.Domains != 0 {
-		t.Fatalf("возврат при живом lease: %d, хочу 0", res.Domains)
+		t.Fatalf("the return with a live lease: %d, want 0", res.Domains)
 	}
 
 	// A service stop: the worker died, the domains hung in queued. Shifting
@@ -2047,10 +2047,10 @@ func TestAccept09_RestartNoStuckDomains(t *testing.T) {
 		t.Fatal(err)
 	}
 	if res.Domains != int64(len(labels)) {
-		t.Fatalf("возврат истёкших: %d, хочу %d", res.Domains, len(labels))
+		t.Fatalf("the expired returned: %d, want %d", res.Domains, len(labels))
 	}
 	if n := countDomains(t, pool, stateWhere(model.CheckStatePending)); n != len(labels) {
-		t.Fatalf("pending после возврата: %d, хочу %d (не застряли в queued)", n, len(labels))
+		t.Fatalf("pending after the return: %d, want %d (not stuck in queued)", n, len(labels))
 	}
 
 	// The dispatcher re-selects and re-publishes: the domains are in work
@@ -2060,7 +2060,7 @@ func TestAccept09_RestartNoStuckDomains(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(batch2) != len(labels) {
-		t.Fatalf("перевыбрано: %d, хочу %d", len(batch2), len(labels))
+		t.Fatalf("re-dispatched: %d, want %d", len(batch2), len(labels))
 	}
 	got := idSet(func() []int64 {
 		out := make([]int64, 0, len(batch2))
@@ -2071,20 +2071,20 @@ func TestAccept09_RestartNoStuckDomains(t *testing.T) {
 	}())
 	want := idSet(ids)
 	if len(got) != len(want) {
-		t.Fatalf("множество доменов изменилось: %v против %v — потеря данных", got, want)
+		t.Fatalf("the domain set changed: %v vs %v — data loss", got, want)
 	}
 	// The composition, not just the size: re-selecting foreign ones or
 	// duplicates at the same size is also data loss.
 	for id := range want {
 		if !got[id] {
-			t.Fatalf("домен %d потерян при переиздании: %v против %v", id, got, want)
+			t.Fatalf("domain %d lost on republishing: %v vs %v", id, got, want)
 		}
 	}
 	if _, err := scheduler.EnqueueBatch(ctx, pool, q, batch2); err != nil {
 		t.Fatal(err)
 	}
 	if n := streamLen(t, rdb, queue.StreamDNS); n != 2 {
-		t.Errorf("пачек q:dns: %d, хочу 2 (первая + переизданная)", n)
+		t.Errorf("q:dns batches: %d, want 2 (the first + the republished)", n)
 	}
 
 	// A deleted domain outside the cycle: neither the lease pass nor the dispatcher touch it.
@@ -2098,18 +2098,18 @@ func TestAccept09_RestartNoStuckDomains(t *testing.T) {
 	}
 	// The §13.1 guard: a deleted one does not return to the cycle — only live ones.
 	if res.Domains != int64(len(labels)-1) {
-		t.Fatalf("lease после повторного зависания: %d, хочу %d (deleted вне цикла)", res.Domains, len(labels)-1)
+		t.Fatalf("the lease after the second hang: %d, want %d (deleted outside the cycle)", res.Domains, len(labels)-1)
 	}
 	batch3, err := scheduler.DispatchBatch(ctx, pool, scheduler.DispatchQuery{Limit: 10})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(batch3) != len(labels)-1 {
-		t.Errorf("перевыбрано после удаления: %d, хочу %d", len(batch3), len(labels)-1)
+		t.Errorf("re-dispatched after the deletion: %d, want %d", len(batch3), len(labels)-1)
 	}
 	for _, d := range batch3 {
 		if d.DomainID == ids[0] {
-			t.Error("удалённый домен выбран диспетчером (§13.1)")
+			t.Error("a deleted domain dispatched (§13.1)")
 		}
 	}
 }
@@ -2148,7 +2148,7 @@ func TestAccept10_DomainSearchByName(t *testing.T) {
 		return dinfoDecode(t, raw)
 	}
 
-	t.Run("IDN-домен в любой форме записи", func(t *testing.T) {
+	t.Run("the IDN domain in any writing form", func(t *testing.T) {
 		// The input forms: unicode (case, a dot), punycode — the
 		// internal/idn normalization before the DB call, as crawlerctl
 		// domain (T-081).
@@ -2160,82 +2160,82 @@ func TestAccept10_DomainSearchByName(t *testing.T) {
 		for _, form := range forms {
 			n, err := idn.Normalize(form)
 			if err != nil {
-				t.Fatalf("нормализация %q: %v", form, err)
+				t.Fatalf("normalize %q: %v", form, err)
 			}
 			if n.ASCII != accIDNLabel+"."+accIDNZone {
-				t.Fatalf("нормализованная форма %q → %q, хочу %s", form, n.ASCII, accIDNLabel+"."+accIDNZone)
+				t.Fatalf("the normalized form %q → %q, want %s", form, n.ASCII, accIDNLabel+"."+accIDNZone)
 			}
 			got := info(n.ASCII)
 			if got == nil {
-				t.Fatalf("domain_info(%q из формы %q) = NULL", n.ASCII, form)
+				t.Fatalf("domain_info(%q from the form %q) = NULL", n.ASCII, form)
 			}
 			if canonical == nil {
 				canonical = got
 				continue
 			}
 			if fmt.Sprint(got["domain"]) != fmt.Sprint(canonical["domain"]) {
-				t.Errorf("формы записи дали разные ответы: %v против %v", got["domain"], canonical["domain"])
+				t.Errorf("the writing forms gave different answers: %v vs %v", got["domain"], canonical["domain"])
 			}
 		}
 
 		// The status, the per-subdomain results, the zone with a unicode name.
 		dom := dinfoMap(t, canonical["domain"], "domain")
 		if got := dinfoStr(t, dom["status_name"], "domain.status_name"); got != "alive" {
-			t.Errorf("статус = %q, хочу alive", got)
+			t.Errorf("status = %q, want alive", got)
 		}
 		if got := dinfoStr(t, dom["name"], "domain.name"); got != accIDNLabel+"."+accIDNZone {
-			t.Errorf("имя = %q, хочу punycode-форму", got)
+			t.Errorf("the name = %q, want the punycode form", got)
 		}
 		if alive := dinfoSlice(t, canonical["dns_alive"], "dns_alive"); len(alive) != 1 {
-			t.Errorf("dns_alive = %v, хочу один живой субдомен (апекс)", alive)
+			t.Errorf("dns_alive = %v, want one alive subdomain (the apex)", alive)
 		}
 		results := dinfoSlice(t, canonical["results"], "results")
 		if len(results) != 1 {
-			t.Fatalf("results = %d записей, хочу 1", len(results))
+			t.Fatalf("results = %d entries, want 1", len(results))
 		}
 		rec := dinfoMap(t, results[0], "results[0]")
 		if got := dinfoStr(t, rec["final_url"], "results[0].final_url"); got != "https://"+accIDNLabel+"."+accIDNZone+"/" {
-			t.Errorf("итоговый URL = %q", got)
+			t.Errorf("the final URL = %q", got)
 		}
 		zone := dinfoMap(t, canonical["zone"], "zone")
 		if got := dinfoStr(t, zone["name_unicode"], "zone.name_unicode"); got != accIDNZoneUni {
-			t.Errorf("unicode-имя зоны = %q, хочу %q (отображение, ТЗ 5.2 п. 7)", got, accIDNZoneUni)
+			t.Errorf("the zone's unicode name = %q, want %q (display, spec 5.2 item 7)", got, accIDNZoneUni)
 		}
 		if canonical["laravel"] != nil {
-			t.Errorf("laravel у не-Laravel домена = %v, хочу null", canonical["laravel"])
+			t.Errorf("laravel of a non-Laravel domain = %v, want null", canonical["laravel"])
 		}
 	})
 
-	t.Run("признаки Laravel в ответе", func(t *testing.T) {
+	t.Run("Laravel signs in the response", func(t *testing.T) {
 		got := info("laravel-8-mix." + accZone)
 		if got == nil {
 			t.Fatal("domain_info(laravel-8-mix) = NULL")
 		}
 		lar := dinfoMap(t, got["laravel"], "laravel")
 		if got := dinfoStr(t, lar["ver_max"], "laravel.ver_max"); got != "9.x" {
-			t.Errorf("laravel.ver_max = %q, хочу 9.x", got)
+			t.Errorf("laravel.ver_max = %q, want 9.x", got)
 		}
 		findings := dinfoSlice(t, lar["findings"], "laravel.findings")
 		if len(findings) != 1 {
-			t.Fatalf("findings = %d, хочу 1", len(findings))
+			t.Fatalf("findings = %d, want 1", len(findings))
 		}
 		first := dinfoMap(t, findings[0], "findings[0]")
 		if v, ok := first["is_laravel"].(bool); !ok || !v {
-			t.Errorf("уверенное срабатывание: is_laravel = %v (present=%v), хочу true", first["is_laravel"], ok)
+			t.Errorf("a confident hit: is_laravel = %v (present=%v), want true", first["is_laravel"], ok)
 		}
 	})
 
-	t.Run("неизвестный домен — понятный ответ", func(t *testing.T) {
+	t.Run("an unknown domain — a clear answer", func(t *testing.T) {
 		// No domain, the zone exists: NULL — the CLI distinguishes "no
 		// domain in the zone" (a second light query to zones, T-081) from
 		// "the zone is missing". The input — as crawlerctl's: a normalized
 		// punycode form.
 		n, err := idn.Normalize("Нет-Такого." + accIDNZoneUni)
 		if err != nil {
-			t.Fatalf("нормализация неизвестного имени: %v", err)
+			t.Fatalf("normalize the unknown name: %v", err)
 		}
 		if got := info(n.ASCII); got != nil {
-			t.Errorf("domain_info несуществующего домена = %v, хочу NULL", got)
+			t.Errorf("domain_info of a non-existent domain = %v, want NULL", got)
 		}
 		var zoneExists bool
 		if err := env.pool.QueryRow(ctx,
@@ -2244,11 +2244,11 @@ func TestAccept10_DomainSearchByName(t *testing.T) {
 			t.Fatal(err)
 		}
 		if !zoneExists {
-			t.Error("зона исчезла — «нет домена» неотличимо от «нет зоны»")
+			t.Error("the zone disappeared — \"no domain\" indistinguishable from \"no zone\"")
 		}
 		// An unknown zone: NULL too, without an error (the input is valid, no data).
 		if got := info("site.unknown-zone.test"); got != nil {
-			t.Errorf("domain_info в незнакомой зоне = %v, хочу NULL", got)
+			t.Errorf("domain_info in an unknown zone = %v, want NULL", got)
 		}
 	})
 }
@@ -2262,7 +2262,7 @@ func accSampleExpect(t *testing.T, s rules.Sample) rules.SampleExpect {
 	t.Helper()
 	if s.Expect.IsLaravel == nil || s.Expect.Score == nil ||
 		s.Expect.CalcVerMin == nil || s.Expect.CalcVerMax == nil {
-		t.Fatalf("samples/%s/meta.yaml: нужны ожидания is_laravel/score/calc_ver_min/calc_ver_max", s.ID)
+		t.Fatalf("samples/%s/meta.yaml: the is_laravel/score/calc_ver_min/calc_ver_max expectations are required", s.ID)
 	}
 	return s.Expect
 }
@@ -2271,11 +2271,11 @@ func accSampleExpect(t *testing.T, s rules.Sample) rules.SampleExpect {
 func accSampleByID(t *testing.T, id string) rules.Sample {
 	t.Helper()
 	if _, err := os.Stat(accSamplesDir); err != nil {
-		t.Fatalf("корпус образцов недоступен: %v", err)
+		t.Fatalf("the samples corpus unavailable: %v", err)
 	}
 	samples, err := rules.LoadSamples(accSamplesDir)
 	if err != nil {
-		t.Fatalf("корпус не загружается: %v", err)
+		t.Fatalf("the corpus does not load: %v", err)
 	}
 	for _, s := range samples {
 		if s.ID == id {
@@ -2283,7 +2283,7 @@ func accSampleByID(t *testing.T, id string) rules.Sample {
 			return s
 		}
 	}
-	t.Fatalf("образец %s отсутствует в корпусе", id)
+	t.Fatalf("the sample %s missing from the corpus", id)
 	return rules.Sample{}
 }
 
@@ -2292,14 +2292,14 @@ func accSampleByID(t *testing.T, id string) rules.Sample {
 func accSamples(t *testing.T) []rules.Sample {
 	t.Helper()
 	if _, err := os.Stat(accSamplesDir); err != nil {
-		t.Fatalf("корпус образцов недоступен: %v", err)
+		t.Fatalf("the samples corpus unavailable: %v", err)
 	}
 	samples, err := rules.LoadSamples(accSamplesDir)
 	if err != nil {
-		t.Fatalf("корпус не загружается: %v", err)
+		t.Fatalf("the corpus does not load: %v", err)
 	}
 	if len(samples) < 13 {
-		t.Fatalf("корпус усох: %d образцов, хочу не меньше 13", len(samples))
+		t.Fatalf("the corpus shrank: %d samples, want at least 13", len(samples))
 	}
 	for _, s := range samples {
 		accSampleExpect(t, s)
@@ -2340,7 +2340,7 @@ func TestAccept11_CustomerSamplesPipeline(t *testing.T) {
 		// both protocols.
 		st := httpDomainState(t, env.pool, id)
 		if st.status != model.StatusAlive || st.checkState != int16(model.CheckStateDone) {
-			t.Errorf("%s: status/check_state = %s/%d, хочу alive/done", name, st.status, st.checkState)
+			t.Errorf("%s: status/check_state = %s/%d, want alive/done", name, st.status, st.checkState)
 		}
 
 		// laravel_findings: ALL hits (§13.1) — the composition, score,
@@ -2349,37 +2349,37 @@ func TestAccept11_CustomerSamplesPipeline(t *testing.T) {
 		switch {
 		case len(sample.Expect.Rules) == 0:
 			if len(fs) != 0 {
-				t.Errorf("%s: чистый негатив, findings = %d строк", name, len(fs))
+				t.Errorf("%s: a clean negative, findings = %d rows", name, len(fs))
 			}
 		case len(fs) != 1:
-			t.Errorf("%s: findings = %d строк, хочу 1 (апекс, variant 0)", name, len(fs))
+			t.Errorf("%s: findings = %d rows, want 1 (the apex, variant 0)", name, len(fs))
 		default:
 			f := fs[0]
 			if f.sub != 0 || f.variant != int16(model.VariantMain) {
-				t.Errorf("%s: срабатывание субдомена/варианта = %d/%d, хочу 0/0", name, f.sub, f.variant)
+				t.Errorf("%s: the hit's subdomain/variant = %d/%d, want 0/0", name, f.sub, f.variant)
 			}
 			if f.rulesVersion != env.rules.Version {
-				t.Errorf("%s: rules_version = %d, хочу %d (версия набора)", name, f.rulesVersion, env.rules.Version)
+				t.Errorf("%s: rules_version = %d, want %d (the set version)", name, f.rulesVersion, env.rules.Version)
 			}
 			if math.Abs(float64(f.score)-*sample.Expect.Score) > accScoreTol {
-				t.Errorf("%s: score = %.4f, хочу ≈%.3f", name, f.score, *sample.Expect.Score)
+				t.Errorf("%s: score = %.4f, want ≈%.3f", name, f.score, *sample.Expect.Score)
 			}
 			if got, want := accStr(f.verMin), accStr(sample.Expect.CalcVerMin); got != want {
-				t.Errorf("%s: ver_min = %q, хочу %q", name, got, want)
+				t.Errorf("%s: ver_min = %q, want %q", name, got, want)
 			}
 			if got, want := accStr(f.verMax), accStr(sample.Expect.CalcVerMax); got != want {
-				t.Errorf("%s: ver_max = %q, хочу %q", name, got, want)
+				t.Errorf("%s: ver_max = %q, want %q", name, got, want)
 			}
 			if f.isLaravel != *sample.Expect.IsLaravel {
-				t.Errorf("%s: is_laravel = %v, хочу %v (порог 0.6)", name, f.isLaravel, *sample.Expect.IsLaravel)
+				t.Errorf("%s: is_laravel = %v, want %v (the 0.6 threshold)", name, f.isLaravel, *sample.Expect.IsLaravel)
 			}
 			fired := accFiredRules(t, f.signals)
 			if len(fired) != len(sample.Expect.Rules) {
-				t.Errorf("%s: сработавших признаков %d, хочу %d (%v)", name, len(fired), len(sample.Expect.Rules), fired)
+				t.Errorf("%s: %d fired rules, want %d (%v)", name, len(fired), len(sample.Expect.Rules), fired)
 			}
 			for _, r := range sample.Expect.Rules {
 				if !fired[r] {
-					t.Errorf("%s: признак %s отсутствует (сработали %v)", name, r, fired)
+					t.Errorf("%s: the rule %s did not fire (fired %v)", name, r, fired)
 				}
 			}
 		}
@@ -2392,7 +2392,7 @@ func TestAccept11_CustomerSamplesPipeline(t *testing.T) {
 		agg, ok := accLaravelDomain(t, env.pool, zoneID, id)
 		if !*sample.Expect.IsLaravel {
 			if ok {
-				t.Errorf("%s: негативный образец в laravel_domains (score %.3f)", name, agg.score)
+				t.Errorf("%s: a negative sample in laravel_domains (score %.3f)", name, agg.score)
 			}
 			negatives++
 			if len(sample.Expect.Rules) > 0 {
@@ -2402,23 +2402,23 @@ func TestAccept11_CustomerSamplesPipeline(t *testing.T) {
 		}
 		positives++
 		if !ok {
-			t.Errorf("%s: уверенный образец без строки laravel_domains", name)
+			t.Errorf("%s: a confident sample without a laravel_domains row", name)
 			continue
 		}
 		if math.Abs(float64(agg.score)-*sample.Expect.Score) > accScoreTol {
-			t.Errorf("%s: агрегат score = %.4f, хочу ≈%.3f", name, agg.score, *sample.Expect.Score)
+			t.Errorf("%s: the aggregate score = %.4f, want ≈%.3f", name, agg.score, *sample.Expect.Score)
 		}
 		if got, want := accStr(agg.verMin), accStr(sample.Expect.CalcVerMin); got != want {
-			t.Errorf("%s: агрегат ver_min = %q, хочу %q", name, got, want)
+			t.Errorf("%s: the aggregate ver_min = %q, want %q", name, got, want)
 		}
 		if got, want := accStr(agg.verMax), accStr(sample.Expect.CalcVerMax); got != want {
-			t.Errorf("%s: агрегат ver_max = %q, хочу %q", name, got, want)
+			t.Errorf("%s: the aggregate ver_max = %q, want %q", name, got, want)
 		}
 		if agg.mask != 0b1 {
-			t.Errorf("%s: found_on_mask = %b, хочу бит 0 (апекс)", name, agg.mask)
+			t.Errorf("%s: found_on_mask = %b, want bit 0 (the apex)", name, agg.mask)
 		}
 		if agg.rulesV != env.rules.Version {
-			t.Errorf("%s: агрегат rules_version = %d, хочу %d", name, agg.rulesV, env.rules.Version)
+			t.Errorf("%s: the aggregate rules_version = %d, want %d", name, agg.rulesV, env.rules.Version)
 		}
 	}
 
@@ -2426,9 +2426,9 @@ func TestAccept11_CustomerSamplesPipeline(t *testing.T) {
 	// "weak" hits (the false-positive control) must be present (§13.3, the
 	// T-075 corpus).
 	if positives < 8 {
-		t.Errorf("позитивных образцов %d, хочу не меньше 8 (мажорные версии Laravel)", positives)
+		t.Errorf("%d positive samples, want at least 8 (Laravel major versions)", positives)
 	}
 	if negatives < 4 || weakNegatives < 2 {
-		t.Errorf("негативных %d (слабых %d), хочу не меньше 4/2", negatives, weakNegatives)
+		t.Errorf("%d negatives (%d weak), want at least 4/2", negatives, weakNegatives)
 	}
 }

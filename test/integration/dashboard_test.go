@@ -49,7 +49,7 @@ func seedDashboardData(t *testing.T, pool *pgxpool.Pool) dashSeed {
 	if err := pool.QueryRow(ctx,
 		"INSERT INTO zones (name, is_active, domains_total, domains_checked) "+
 			"VALUES ('snap.test', true, 3, 1) RETURNING id").Scan(&s.zoneID); err != nil {
-		t.Fatalf("зона: %v", err)
+		t.Fatalf("zone: %v", err)
 	}
 	domains := []struct {
 		label  string
@@ -61,7 +61,7 @@ func seedDashboardData(t *testing.T, pool *pgxpool.Pool) dashSeed {
 			"INSERT INTO domains (zone_id, label, status, check_state) "+
 				"VALUES ($1, $2, $3, $4) RETURNING id",
 			s.zoneID, d.label, d.status, d.state).Scan(&s.domains[i]); err != nil {
-			t.Fatalf("домен %s: %v", d.label, err)
+			t.Fatalf("domain %s: %v", d.label, err)
 		}
 	}
 
@@ -70,13 +70,13 @@ func seedDashboardData(t *testing.T, pool *pgxpool.Pool) dashSeed {
 		"INSERT INTO laravel_domains (zone_id, domain_id, score, ver_min, ver_max, found_on_mask, rules_version, updated_at) "+
 			"VALUES ($1, $2, 0.9, '9.19', '11', 1, 1, now())",
 		s.zoneID, s.domains[0]); err != nil {
-		t.Fatalf("свежая находка: %v", err)
+		t.Fatalf("the fresh find: %v", err)
 	}
 	if _, err := pool.Exec(ctx,
 		"INSERT INTO laravel_domains (zone_id, domain_id, score, found_on_mask, rules_version, updated_at) "+
 			"VALUES ($1, $2, 0.7, 1, 1, now() - interval '30 hours')",
 		s.zoneID, s.domains[1]); err != nil {
-		t.Fatalf("старая находка: %v", err)
+		t.Fatalf("the old find: %v", err)
 	}
 
 	// The ingest journal: a fresh add, a day-old delete, and a row without processed_at.
@@ -84,17 +84,17 @@ func seedDashboardData(t *testing.T, pool *pgxpool.Pool) dashSeed {
 		"INSERT INTO ingest_files (zone_id, action, path, sha256, lines_total, added, existed, rejected, processed_at) "+
 			"VALUES ($1, 1, 'snap.test/add/fresh.txt', sha256('1'::bytea), 100, 98, 2, 0, now())",
 		s.zoneID); err != nil {
-		t.Fatalf("свежий файл: %v", err)
+		t.Fatalf("the fresh file: %v", err)
 	}
 	if _, err := pool.Exec(ctx,
 		"INSERT INTO ingest_files (zone_id, action, path, sha256, lines_total, deleted, rejected, processed_at) "+
 			"VALUES ($1, 2, 'snap.test/delete/stale.txt', sha256('2'::bytea), 50, 49, 1, now() - interval '26 hours')",
 		s.zoneID); err != nil {
-		t.Fatalf("старый файл: %v", err)
+		t.Fatalf("the old file: %v", err)
 	}
 	if _, err := pool.Exec(ctx,
 		"INSERT INTO ingest_files (sha256) VALUES (sha256('3'::bytea))"); err != nil {
-		t.Fatalf("файл без processed_at: %v", err)
+		t.Fatalf("the file without processed_at: %v", err)
 	}
 	return s
 }
@@ -111,7 +111,7 @@ func TestDashboard_Snapshot(t *testing.T) {
 
 	seed := seedDashboardData(t, pool)
 	if seed.zoneID == 0 || seed.domains[0] == 0 {
-		t.Fatal("посев данных не вернул идентификаторы")
+		t.Fatal("the data seeding returned no identifiers")
 	}
 
 	// Counter reconciliation (T-178): zones / the status distribution /
@@ -120,7 +120,7 @@ func TestDashboard_Snapshot(t *testing.T) {
 	// seed is below the transition level, direct SQL). The same order as
 	// in production: migration → the first monitor pass → readers.
 	if _, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{}); err != nil {
-		t.Fatalf("реконсиляция счётчиков после посева: %v", err)
+		t.Fatalf("the counter reconciliation after the seeding: %v", err)
 	}
 
 	// Stream depths: entries without consumer groups — Len gives XLEN.
@@ -174,7 +174,7 @@ func TestDashboard_Snapshot(t *testing.T) {
 	for coll.Current() == nil {
 		if time.Now().After(deadline) {
 			stop()
-			t.Fatal("первый успешный сбор не завершился за 10 с")
+			t.Fatal("the first successful gather did not finish within 10 s")
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -185,7 +185,7 @@ func TestDashboard_Snapshot(t *testing.T) {
 	}
 
 	if len(snap.Errors) != 0 {
-		t.Fatalf("снимок с ошибками секций: %v", snap.Errors)
+		t.Fatalf("the snapshot with section errors: %v", snap.Errors)
 	}
 
 	// §5.1/§5.3: the zone and the totals.
@@ -194,19 +194,19 @@ func TestDashboard_Snapshot(t *testing.T) {
 	}
 	z := snap.Zones[0]
 	if z.Pending != 1 || z.Queued != 1 || z.Done != 1 {
-		t.Errorf("агрегат зоны = pending %d queued %d done %d, хочу 1/1/1", z.Pending, z.Queued, z.Done)
+		t.Errorf("the zone aggregate = pending %d queued %d done %d, want 1/1/1", z.Pending, z.Queued, z.Done)
 	}
 	if snap.Totals == nil || snap.Totals.DomainsTotal != 3 || snap.Totals.DomainsChecked != 1 {
-		t.Errorf("totals = %+v, хочу всего 3/проверено 1 (счётчики zones)", snap.Totals)
+		t.Errorf("totals = %+v, want 3 total/1 checked (the zones counters)", snap.Totals)
 	}
 
 	// §5.2: throughput and rates (no checks today — the rate is zero but
 	// known; the hourly windows are empty).
 	if snap.Throughput == nil || snap.Throughput.ElapsedSec <= 0 {
-		t.Errorf("throughput = %+v, хочу живой elapsed", snap.Throughput)
+		t.Errorf("throughput = %+v, want a live elapsed", snap.Throughput)
 	}
 	if snap.Rates == nil || snap.Rates.Remaining != 2 {
-		t.Errorf("rates = %+v, хочу remaining 2 (pending+queued)", snap.Rates)
+		t.Errorf("rates = %+v, want remaining 2 (pending+queued)", snap.Rates)
 	}
 
 	// §5.4: stream depths and effective highlighting thresholds — clamped
@@ -214,60 +214,60 @@ func TestDashboard_Snapshot(t *testing.T) {
 	// watermark of 100,000 → q:dns 125 batches, individual 75,000), like
 	// the monitor alert.
 	if snap.QueueWatermarks["q:dns"] != 125 || snap.QueueWatermarks["q:http"] != 75000 {
-		t.Errorf("queue_watermarks = %v, хочу q:dns 125 / q:http 75000 (эффективные пороги дефолтов)",
+		t.Errorf("queue_watermarks = %v, want q:dns 125 / q:http 75000 (the defaults' effective thresholds)",
 			snap.QueueWatermarks)
 	}
 	if got := snap.Queues["q:http"]; got != 2 {
-		t.Errorf("q:http = %d, хочу 2 (XLEN без групп)", got)
+		t.Errorf("q:http = %d, want 2 (XLEN without groups)", got)
 	}
 	if got := snap.Queues["q:dead"]; got != 1 {
-		t.Errorf("q:dead = %d, хочу 1", got)
+		t.Errorf("q:dead = %d, want 1", got)
 	}
 	if got := snap.Queues["q:dns"]; got != 0 {
-		t.Errorf("q:dns = %d, хочу 0", got)
+		t.Errorf("q:dns = %d, want 0", got)
 	}
 
 	// §5.5: the status distribution (the full legend, counters per the seed).
 	if snap.Statuses["alive"] != 1 || snap.Statuses["new"] != 1 || snap.Statuses["temp_error"] != 1 {
-		t.Errorf("statuses = %v, хочу alive/new/temp_error по 1", snap.Statuses)
+		t.Errorf("statuses = %v, want alive/new/temp_error one each", snap.Statuses)
 	}
 
 	// §5.6: 2 in total, 1 in the last 24 h, the latest is fresh with a version range.
 	if snap.Laravel == nil || snap.Laravel.Total != 2 || snap.Laravel.Last24h != 1 {
-		t.Errorf("laravel = %+v, хочу всего 2 / за 24 ч 1", snap.Laravel)
+		t.Errorf("laravel = %+v, want 2 total / 1 in 24 h", snap.Laravel)
 	}
 	if len(snap.Laravel.Recent) != 2 || snap.Laravel.Recent[0].Domain != "alpha.snap.test" {
-		t.Fatalf("laravel.recent = %+v, хочу свежую alpha.snap.test первой", snap.Laravel.Recent)
+		t.Fatalf("laravel.recent = %+v, want the fresh alpha.snap.test first", snap.Laravel.Recent)
 	}
 	first := snap.Laravel.Recent[0]
 	if first.VerMin != "9.19" || first.VerMax != "11" || first.Score < 0.89 {
-		t.Errorf("свежая находка = %+v, хочу score ≈0.9 и версии 9.19–11", first)
+		t.Errorf("the fresh find = %+v, want score ≈0.9 and versions 9.19–11", first)
 	}
 
 	// §5.7: the last file is the fresh add; NULL processed_at sorts last.
 	if len(snap.Ingest) != 3 {
-		t.Fatalf("ingest = %+v, хочу 3 записи", snap.Ingest)
+		t.Fatalf("ingest = %+v, want 3 entries", snap.Ingest)
 	}
 	if snap.Ingest[0].Path != "snap.test/add/fresh.txt" || snap.Ingest[0].Action != "add" ||
 		snap.Ingest[0].Added != 98 || snap.Ingest[0].Existed != 2 {
-		t.Errorf("свежий файл = %+v", snap.Ingest[0])
+		t.Errorf("the fresh file = %+v", snap.Ingest[0])
 	}
 	if snap.Ingest[1].Action != "delete" || snap.Ingest[1].Deleted != 49 {
-		t.Errorf("старый файл = %+v", snap.Ingest[1])
+		t.Errorf("the old file = %+v", snap.Ingest[1])
 	}
 	if snap.Ingest[2].ProcessedAt != "" || snap.Ingest[2].Path != "" {
-		t.Errorf("файл без processed_at = %+v, хочу нулевые поля и пустое время", snap.Ingest[2])
+		t.Errorf("the file without processed_at = %+v, want zero fields and an empty time", snap.Ingest[2])
 	}
 
 	// §5.8: the live probe is up, the closed port is down with a reason.
 	if len(snap.Health) != 2 {
-		t.Fatalf("health = %+v, хочу 2 пробы", snap.Health)
+		t.Fatalf("health = %+v, want 2 probes", snap.Health)
 	}
 	if !snap.Health[0].Up || snap.Health[0].Name != "alive" {
-		t.Errorf("живая проба = %+v", snap.Health[0])
+		t.Errorf("the alive probe = %+v", snap.Health[0])
 	}
 	if snap.Health[1].Up || snap.Health[1].Error == "" {
-		t.Errorf("мертвая проба = %+v, хочу down с причиной", snap.Health[1])
+		t.Errorf("the dead probe = %+v, want down with a reason", snap.Health[1])
 	}
 
 	// Acceptance §12.3 (the response structure): a server with a real pool
@@ -297,22 +297,22 @@ func TestDashboard_Snapshot(t *testing.T) {
 		t.Fatalf("GET /api/status = %d: %s", resp.StatusCode, body)
 	}
 	if cc := resp.Header.Get("Cache-Control"); cc != "no-store" {
-		t.Errorf("Cache-Control = %q, хочу no-store", cc)
+		t.Errorf("Cache-Control = %q, want no-store", cc)
 	}
 	var doc map[string]json.RawMessage
 	if err := json.NewDecoder(resp.Body).Decode(&doc); err != nil {
-		t.Fatalf("ответ не JSON: %v", err)
+		t.Fatalf("the response is not JSON: %v", err)
 	}
 	for _, key := range []string{"zones", "totals", "queues", "throughput", "rates",
 		"statuses", "laravel", "ingest", "health", "errors", "built_at", "queue_watermarks"} {
 		if _, ok := doc[key]; !ok {
-			t.Errorf("ответ без секции %q (§6.2)", key)
+			t.Errorf("the response without the %q section (§6.2)", key)
 		}
 	}
 	if string(doc["errors"]) != "{}" {
-		t.Errorf("errors = %s, хочу пустую карту (все секции живы)", doc["errors"])
+		t.Errorf("errors = %s, want an empty map (all the sections alive)", doc["errors"])
 	}
 	if !strings.Contains(string(doc["laravel"]), `"last_24h":1`) {
-		t.Errorf("laravel в ответе: %s", doc["laravel"])
+		t.Errorf("laravel in the response: %s", doc["laravel"])
 	}
 }

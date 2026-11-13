@@ -41,14 +41,14 @@ func TestIngest_ApplyAddChunked(t *testing.T) {
 
 	out := env.process(t, "add/chunks.txt", fileContent(lines...))
 	if out.Kind != ingest.OutcomeApplied {
-		t.Fatalf("итог = %q, want applied", out.Kind)
+		t.Fatalf("the outcome = %q, want applied", out.Kind)
 	}
 	if out.Report.Added != 11 || out.Report.Existed != 0 || out.Report.Revived != 0 {
-		t.Errorf("счётчики = added %d, existed %d, revived %d; want 11/0/0 (партия применена полностью)",
+		t.Errorf("the counters = added %d, existed %d, revived %d; want 11/0/0 (the batch applied in full)",
 			out.Report.Added, out.Report.Existed, out.Report.Revived)
 	}
 	if n := env.countOf(t, "domains"); n != 11 {
-		t.Errorf("доменов = %d, want 11 (ни одна пачка не потеряна)", n)
+		t.Errorf("domains = %d, want 11 (no chunk lost)", n)
 	}
 
 	// Zone counters against direct counts: the chunk deltas (total and
@@ -76,7 +76,7 @@ func TestIngest_ApplyAddChunked(t *testing.T) {
 		}
 		seen++
 		if total != totalDir || pending != pendDir {
-			t.Errorf("зона %s: счётчики total/pending = %d/%d, прямые подсчёты = %d/%d — дельты пачек разошлись",
+			t.Errorf("zone %s: the counters total/pending = %d/%d, the direct counts = %d/%d — the batch deltas diverged",
 				name, total, pending, totalDir, pendDir)
 		}
 	}
@@ -84,12 +84,12 @@ func TestIngest_ApplyAddChunked(t *testing.T) {
 		t.Fatal(err)
 	}
 	if seen != 2 {
-		t.Errorf("зон = %d, want 2 (com, org)", seen)
+		t.Errorf("zones = %d, want 2 (com, org)", seen)
 	}
 
 	// The batch has left staging (apply → clean up, T-017).
 	if n := env.countOf(t, "ingest_stage"); n != 0 {
-		t.Errorf("строк в ingest_stage = %d, want 0", n)
+		t.Errorf("rows in ingest_stage = %d, want 0", n)
 	}
 }
 
@@ -168,42 +168,42 @@ func TestIngest_ApplyAddReapplyNoop(t *testing.T) {
 		t.Fatalf("Stage: %v", err)
 	}
 	if staged != 10 {
-		t.Fatalf("загружено строк = %d, want 10", staged)
+		t.Fatalf("staged rows = %d, want 10", staged)
 	}
 	res, err := ingest.ApplyAdd(ctx, env.pool, batch, 4)
 	if err != nil {
 		t.Fatalf("ApplyAdd: %v", err)
 	}
 	if res.Inserted != 10 || res.Revived != 0 || res.Existing != 0 {
-		t.Fatalf("первое применение = %+v, want Inserted 10 (3 пачки)", res)
+		t.Fatalf("the first application = %+v, want Inserted 10 (3 chunks)", res)
 	}
 	before := env.zoneCounters(t)
 
 	// Restaging the same batch with the same batch_id (overwriting staging)
 	// and reapplying: everything is already in the DB.
 	if _, err := stage(); err != nil {
-		t.Fatalf("Stage повторно: %v", err)
+		t.Fatalf("Stage again: %v", err)
 	}
 	res2, err := ingest.ApplyAdd(ctx, env.pool, batch, 4)
 	if err != nil {
-		t.Fatalf("ApplyAdd повторно: %v", err)
+		t.Fatalf("ApplyAdd again: %v", err)
 	}
 	if res2.Inserted != 0 || res2.Revived != 0 || res2.Existing != 10 {
-		t.Errorf("повторное применение = %+v, want no-op: Inserted/Revived 0, Existing 10", res2)
+		t.Errorf("the repeat application = %+v, want a no-op: Inserted/Revived 0, Existing 10", res2)
 	}
 	after := env.zoneCounters(t)
 	if len(after) != len(before) {
-		t.Fatalf("зон = %d после повтора, было %d", len(after), len(before))
+		t.Fatalf("zones = %d after the repeat, were %d", len(after), len(before))
 	}
 	for id, c := range before {
 		if after[id] != c {
-			t.Errorf("зона %d: счётчики изменились %v → %v — повтор обязан быть no-op (нулевые дельты)", id, c, after[id])
+			t.Errorf("zone %d: the counters changed %v → %v — the repeat must be a no-op (zero deltas)", id, c, after[id])
 		}
 	}
 	if n := env.countOf(t, "ingest_stage"); n != 0 {
-		t.Errorf("строк в ingest_stage = %d, want 0 (партия очищена)", n)
+		t.Errorf("rows in ingest_stage = %d, want 0 (the batch cleaned)", n)
 	}
 	if n := env.countOf(t, "domains"); n != 10 {
-		t.Errorf("доменов = %d, want 10 (повтор не дублирует)", n)
+		t.Errorf("domains = %d, want 10 (the repeat does not duplicate)", n)
 	}
 }

@@ -68,7 +68,7 @@ func dnsEnv(t *testing.T) *dnsclient.Client {
 		UDPPoolSize: 8,
 	})
 	if err != nil {
-		t.Fatalf("dnsclient к %s: %v", unboundAddr, err)
+		t.Fatalf("dnsclient to %s: %v", unboundAddr, err)
 	}
 	t.Cleanup(func() { _ = c.Close() })
 	return c
@@ -85,7 +85,7 @@ func TestDNSClient_TestbedScenarios(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	t.Run("обычный A: адрес одной попыткой без TCP", func(t *testing.T) {
+	t.Run("a regular A: the address in one attempt without TCP", func(t *testing.T) {
 		r, err := c.Exchange(ctx, dnsclient.Question{Name: "same-site.crawl.test", Type: dns.TypeA})
 		if err != nil {
 			t.Fatalf("Exchange: %v", err)
@@ -94,66 +94,66 @@ func TestDNSClient_TestbedScenarios(t *testing.T) {
 			t.Errorf("rcode = %s, want NOERROR", r.RCode)
 		}
 		if r.TCP || r.Attempts != 1 {
-			t.Errorf("tcp=%v attempts=%d, want false/1 (маленький ответ целиком в UDP)", r.TCP, r.Attempts)
+			t.Errorf("tcp=%v attempts=%d, want false/1 (a small answer fully in UDP)", r.TCP, r.Attempts)
 		}
 		as := r.RecordsOf(dns.TypeA)
 		if len(as) != 1 {
-			t.Fatalf("A-записей: %d, хочу 1", len(as))
+			t.Fatalf("A records: %d, want 1", len(as))
 		}
 		if a, ok := as[0].(*dns.A); !ok || a.A.String() != testwebIP {
-			t.Errorf("адрес = %v, хочу %s", as[0], testwebIP)
+			t.Errorf("the address = %v, want %s", as[0], testwebIP)
 		}
 	})
 
-	t.Run("NXDOMAIN — код ответа, не ошибка; SOA в authority", func(t *testing.T) {
+	t.Run("NXDOMAIN — a response code, not an error; SOA in authority", func(t *testing.T) {
 		r, err := c.Exchange(ctx, dnsclient.Question{Name: "nxdomain-case.crawl.test", Type: dns.TypeA})
 		if err != nil {
-			t.Fatalf("Exchange: %v (NXDOMAIN — не сетевая ошибка, контракт T-034)", err)
+			t.Fatalf("Exchange: %v (NXDOMAIN is not a network error, the T-034 contract)", err)
 		}
 		if r.RCode != dnsclient.RCodeNXDOMAIN {
 			t.Errorf("rcode = %s, want NXDOMAIN", r.RCode)
 		}
 		if len(r.Answer) != 0 {
-			t.Errorf("answer не пуст: %d записей", len(r.Answer))
+			t.Errorf("answer not empty: %d records", len(r.Answer))
 		}
 		if len(r.Ns) == 0 {
-			t.Error("authority пуст — отрицательный ответ без SOA (RFC 2308), Ns нужен потребителю T-036")
+			t.Error("authority empty — a negative answer without SOA (RFC 2308), the T-036 consumer needs Ns")
 		}
 	})
 
-	t.Run("NODATA: NOERROR без A-записей", func(t *testing.T) {
+	t.Run("NODATA: NOERROR without A records", func(t *testing.T) {
 		r, err := c.Exchange(ctx, dnsclient.Question{Name: "delegated-no-address.crawl.test", Type: dns.TypeA})
 		if err != nil {
 			t.Fatalf("Exchange: %v", err)
 		}
 		if r.RCode != dnsclient.RCodeNOERROR {
-			t.Fatalf("rcode = %s, want NOERROR (имя есть, записей типа нет)", r.RCode)
+			t.Fatalf("rcode = %s, want NOERROR (the name exists, no records of the type)", r.RCode)
 		}
 		if n := len(r.RecordsOf(dns.TypeA)); n != 0 {
-			t.Errorf("A-записей: %d, хочу 0 (NODATA)", n)
+			t.Errorf("A records: %d, want 0 (NODATA)", n)
 		}
 	})
 
-	t.Run("SERVFAIL — код ответа, не ошибка", func(t *testing.T) {
+	t.Run("SERVFAIL — a response code, not an error", func(t *testing.T) {
 		r, err := c.Exchange(ctx, dnsclient.Question{Name: "servfail.crawl.test", Type: dns.TypeA})
 		if err != nil {
-			t.Fatalf("Exchange: %v (SERVFAIL — не сетевая ошибка, контракт T-034)", err)
+			t.Fatalf("Exchange: %v (SERVFAIL is not a network error, the T-034 contract)", err)
 		}
 		if r.RCode != dnsclient.RCodeSERVFAIL {
 			t.Errorf("rcode = %s, want SERVFAIL", r.RCode)
 		}
 	})
 
-	t.Run("TCP-fallback: TC=1 на большом ответе, полный набор по TCP", func(t *testing.T) {
+	t.Run("TCP-fallback: TC=1 on a large answer, the full set over TCP", func(t *testing.T) {
 		r, err := c.Exchange(ctx, dnsclient.Question{Name: "tc-fallback.crawl.test", Type: dns.TypeA})
 		if err != nil {
 			t.Fatalf("Exchange: %v", err)
 		}
 		if !r.TCP {
-			t.Error("итог не по TCP: усечённый ответ (TC=1) не повлёк fallback (T-034)")
+			t.Error("not over TCP in the end: the truncated answer (TC=1) did not trigger the fallback (T-034)")
 		}
 		if r.Attempts != 2 {
-			t.Errorf("attempts = %d, хочу 2 (UDP с TC=1 + повтор по TCP)", r.Attempts)
+			t.Errorf("attempts = %d, want 2 (UDP with TC=1 + a repeat over TCP)", r.Attempts)
 		}
 		if r.RCode != dnsclient.RCodeNOERROR {
 			t.Fatalf("rcode = %s, want NOERROR", r.RCode)
@@ -162,19 +162,19 @@ func TestDNSClient_TestbedScenarios(t *testing.T) {
 		for _, rr := range r.RecordsOf(dns.TypeA) {
 			a, ok := rr.(*dns.A)
 			if !ok {
-				t.Fatalf("запись не A: %v", rr)
+				t.Fatalf("not an A record: %v", rr)
 			}
 			if a.A.Mask(net.CIDRMask(24, 32)).String() != "192.0.2.0" {
-				t.Errorf("адрес %s вне блока сценария 192.0.2.0/24", a.A)
+				t.Errorf("the address %s outside the scenario block 192.0.2.0/24", a.A)
 			}
 			uniq[a.A.String()] = true
 		}
 		if len(uniq) != tcFallbackRecords {
-			t.Errorf("уникальных A-адресов: %d, хочу %d (TCP-ответ не обрезан)", len(uniq), tcFallbackRecords)
+			t.Errorf("unique A addresses: %d, want %d (the TCP answer not truncated)", len(uniq), tcFallbackRecords)
 		}
 	})
 
-	t.Run("мёртвый резолвер: ретраи исчерпаны, IsTimeout", func(t *testing.T) {
+	t.Run("a dead resolver: the retries exhausted, IsTimeout", func(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		// A separate client to the bench's black hole: the fail-fast
@@ -187,20 +187,20 @@ func TestDNSClient_TestbedScenarios(t *testing.T) {
 			UDPPoolSize: 2,
 		})
 		if err != nil {
-			t.Fatalf("клиент на чёрную дыру %s: %v", dnsBlackholeAddr, err)
+			t.Fatalf("the client to the black hole %s: %v", dnsBlackholeAddr, err)
 		}
 		defer func() { _ = dead.Close() }()
 
 		start := time.Now()
 		_, err = dead.Exchange(ctx, dnsclient.Question{Name: "same-site.crawl.test", Type: dns.TypeA})
 		if err == nil {
-			t.Fatal("мёртвый резолвер вернул ответ")
+			t.Fatal("the dead resolver returned an answer")
 		}
 		if !dnsclient.IsTimeout(err) {
-			t.Errorf("ошибка не таймаут (адаптив T-035 различает ветки): %v", err)
+			t.Errorf("the error is not a timeout (the T-035 adaptive distinguishes the branches): %v", err)
 		}
 		if el := time.Since(start); el > 3*time.Second {
-			t.Errorf("ретраи длились %v — дольше двух попыток с паузой", el)
+			t.Errorf("the retries lasted %v — longer than two attempts with a pause", el)
 		}
 	})
 }
@@ -227,12 +227,12 @@ func TestDNSWorker_CheckApex(t *testing.T) {
 		domOK     bool
 	}{
 		{
-			name: "обычный домен", domain: "same-site.crawl.test",
+			name: "a regular domain", domain: "same-site.crawl.test",
 			status: dnsworker.ApexDelegated,
 			addrs:  []netip.Addr{netip.MustParseAddr(testwebIP)},
 		},
 		{
-			name: "wildcard-зона: явный A апекса", domain: "wildcard.crawl.test",
+			name: "a wildcard zone: the apex's explicit A", domain: "wildcard.crawl.test",
 			status: dnsworker.ApexDelegated,
 			addrs:  []netip.Addr{netip.MustParseAddr(testwebIP)},
 		},
@@ -247,12 +247,12 @@ func TestDNSWorker_CheckApex(t *testing.T) {
 			domStatus: model.StatusTempError, domOK: true,
 		},
 		{
-			name: "мёртвый апстрим зоны (таймаут/SERVFAIL) → temp_error", domain: "dns-timeout.crawl.test",
+			name: "the zone's dead upstream (timeout/SERVFAIL) → temp_error", domain: "dns-timeout.crawl.test",
 			status: dnsworker.ApexTempError, stop: true,
 			domStatus: model.StatusTempError, domOK: true,
 		},
 		{
-			name: "NODATA + NS → ветка без адресов", domain: "delegated-no-address.crawl.test",
+			name: "NODATA + NS → the no-addresses branch", domain: "delegated-no-address.crawl.test",
 			status: dnsworker.ApexDelegatedNoAddress, nsQueried: true,
 		},
 	}
@@ -265,23 +265,23 @@ func TestDNSWorker_CheckApex(t *testing.T) {
 				t.Fatalf("CheckApex: %v", err)
 			}
 			if res.Status != tc.status {
-				t.Errorf("статус = %s, хочу %s", res.Status, tc.status)
+				t.Errorf("status = %s, want %s", res.Status, tc.status)
 			}
 			if res.Status.Stop() != tc.stop {
-				t.Errorf("Stop = %v, хочу %v (ветка %s)", res.Status.Stop(), tc.stop, res.Status)
+				t.Errorf("Stop = %v, want %v (the %s branch)", res.Status.Stop(), tc.stop, res.Status)
 			}
 			if st, ok := res.Status.DomainStatus(); st != tc.domStatus || ok != tc.domOK {
-				t.Errorf("DomainStatus = (%s, %v), хочу (%s, %v)", st, ok, tc.domStatus, tc.domOK)
+				t.Errorf("DomainStatus = (%s, %v), want (%s, %v)", st, ok, tc.domStatus, tc.domOK)
 			}
 			if res.NSQueried != tc.nsQueried {
-				t.Errorf("NSQueried = %v, хочу %v", res.NSQueried, tc.nsQueried)
+				t.Errorf("NSQueried = %v, want %v", res.NSQueried, tc.nsQueried)
 			}
 			if len(res.Addresses) != len(tc.addrs) {
-				t.Fatalf("адресов: %v, хочу %v", res.Addresses, tc.addrs)
+				t.Fatalf("addresses: %v, want %v", res.Addresses, tc.addrs)
 			}
 			for i, a := range res.Addresses {
 				if a != tc.addrs[i] {
-					t.Errorf("адрес[%d] = %s, хочу %s", i, a, tc.addrs[i])
+					t.Errorf("address[%d] = %s, want %s", i, a, tc.addrs[i])
 				}
 			}
 		})
@@ -310,7 +310,7 @@ func TestDNSWorker_CheckSubdomains(t *testing.T) {
 	skipUnlessIntegration(t)
 	resolve := dnsEnv(t)
 
-	t.Run("обычный домен: апекс и www резолвятся, admin NXDOMAIN", func(t *testing.T) {
+	t.Run("a regular domain: the apex and www resolve, admin NXDOMAIN", func(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		rep, err := dnsworker.CheckSubdomains(ctx, resolve, "same-site.crawl.test", dnsTestSubs(), true)
@@ -324,31 +324,31 @@ func TestDNSWorker_CheckSubdomains(t *testing.T) {
 		for _, label := range []string{"", "www"} {
 			r := byLabel[label]
 			if !r.HasAddrs() || len(r.A) != 1 || r.A[0].String() != testwebIP {
-				t.Errorf("метка %q: A = %v, хочу [%s]", label, r.A, testwebIP)
+				t.Errorf("label %q: A = %v, want [%s]", label, r.A, testwebIP)
 			}
 			if r.Err != nil || r.RCode != dnsclient.RCodeNOERROR {
-				t.Errorf("метка %q: err=%v rcode=%s — легальный ответ не ошибка", label, r.Err, r.RCode)
+				t.Errorf("label %q: err=%v rcode=%s — a legal answer is not an error", label, r.Err, r.RCode)
 			}
 			if len(r.Chain) != 0 || r.CNAME() != "" {
-				t.Errorf("метка %q: неожиданная CNAME-цепочка %v", label, r.Chain)
+				t.Errorf("label %q: an unexpected CNAME chain %v", label, r.Chain)
 			}
 			// AAAA was asked (askAAAA=true): the bench zone has no AAAA —
 			// NODATA does not fail a subdomain with found A records.
 			if len(r.AAAA) != 0 {
-				t.Errorf("метка %q: AAAA = %v, хочу пусто (NODATA)", label, r.AAAA)
+				t.Errorf("label %q: AAAA = %v, want empty (NODATA)", label, r.AAAA)
 			}
 		}
 		admin := byLabel["admin"]
 		if admin.RCode != dnsclient.RCodeNXDOMAIN || admin.HasAddrs() || admin.Err != nil {
-			t.Errorf("admin: rcode=%s addrs=%v err=%v, хочу NXDOMAIN без адресов и без ошибки",
+			t.Errorf("admin: rcode=%s addrs=%v err=%v, want NXDOMAIN without addresses and without an error",
 				admin.RCode, admin.A, admin.Err)
 		}
 		if !rep.Mask.Test(0) || !rep.Mask.Test(1) || rep.Mask.Test(2) {
-			t.Errorf("маска = %b: биты 0,1 резолвящихся, бит 2 нет (ТЗ 5.4 п. 4)", int64(rep.Mask))
+			t.Errorf("the mask = %b: bits 0,1 resolving, bit 2 not (spec 5.4 item 4)", int64(rep.Mask))
 		}
 	})
 
-	t.Run("CNAME-цепочка разворачивается до конечных адресов", func(t *testing.T) {
+	t.Run("a CNAME chain unfolds to the final addresses", func(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		rep, err := dnsworker.CheckSubdomains(ctx, resolve, "cname-chain.crawl.test", dnsTestSubs(), false)
@@ -356,21 +356,21 @@ func TestDNSWorker_CheckSubdomains(t *testing.T) {
 			t.Fatalf("CheckSubdomains: %v", err)
 		}
 		if len(rep.Results) != 3 {
-			t.Fatalf("результатов: %d, хочу 3", len(rep.Results))
+			t.Fatalf("results: %d, want 3", len(rep.Results))
 		}
 		apex := rep.Results[0] // input order: "" is first
 		if want := "alias-target.crawl.test."; apex.CNAME() != want || apex.Target() != want {
-			t.Errorf("цепочка апекса: cname=%q target=%q, хочу %q", apex.CNAME(), apex.Target(), want)
+			t.Errorf("the apex chain: cname=%q target=%q, want %q", apex.CNAME(), apex.Target(), want)
 		}
 		if len(apex.A) != 1 || apex.A[0].String() != testwebIP {
-			t.Errorf("адреса цепочки: %v, хочу [%s] (рекурсор приносит целевые A)", apex.A, testwebIP)
+			t.Errorf("the chain's addresses: %v, want [%s] (the recursing resolver brings the target A)", apex.A, testwebIP)
 		}
 		if !rep.Mask.Test(0) || rep.Mask.Test(1) || rep.Mask.Test(2) {
-			t.Errorf("маска = %b: только бит 0 — www/admin цепочки не резолвятся", int64(rep.Mask))
+			t.Errorf("the mask = %b: only bit 0 — the www/admin chains do not resolve", int64(rep.Mask))
 		}
 	})
 
-	t.Run("wildcard-зона: все метки синтезируются одним адресом", func(t *testing.T) {
+	t.Run("a wildcard zone: all labels synthesized to one address", func(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		rep, err := dnsworker.CheckSubdomains(ctx, resolve, "wildcard.crawl.test", dnsTestSubs(), false)
@@ -379,17 +379,17 @@ func TestDNSWorker_CheckSubdomains(t *testing.T) {
 		}
 		for _, r := range rep.Results {
 			if len(r.A) != 1 || r.A[0].String() != testwebIP {
-				t.Errorf("метка %q: A = %v, хочу [%s] (*.wildcard)", r.Label, r.A, testwebIP)
+				t.Errorf("label %q: A = %v, want [%s] (*.wildcard)", r.Label, r.A, testwebIP)
 			}
 		}
 		for _, id := range []int{0, 1, 2} {
 			if !rep.Mask.Test(id) {
-				t.Errorf("бит %d не установлен — wildcard-имена резолвятся (в маске, ТЗ 5.4 п. 4)", id)
+				t.Errorf("bit %d not set — the wildcard names resolve (in the mask, spec 5.4 item 4)", id)
 			}
 		}
 	})
 
-	t.Run("зацикленная CNAME: резолвер отвечает SERVFAIL, субдомен без адресов", func(t *testing.T) {
+	t.Run("a looping CNAME: the resolver answers SERVFAIL, the subdomain without addresses", func(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		rep, err := dnsworker.CheckSubdomains(ctx, resolve, "cname-loop.crawl.test", dnsTestSubs()[:1], false)
@@ -401,11 +401,11 @@ func TestDNSWorker_CheckSubdomains(t *testing.T) {
 		// hang): the sign is in RCode, no addresses, no transport error —
 		// the contribution to temp_error is decided by T-039, not here.
 		if r.RCode != dnsclient.RCodeSERVFAIL || r.HasAddrs() || r.Err != nil {
-			t.Errorf("апекс: rcode=%s addrs=%v err=%v, хочу SERVFAIL без адресов и ошибки",
+			t.Errorf("apex: rcode=%s addrs=%v err=%v, want SERVFAIL without addresses and an error",
 				r.RCode, r.A, r.Err)
 		}
 		if rep.Mask.Test(0) {
-			t.Error("бит апекса установлен без адресов")
+			t.Error("the apex bit set without addresses")
 		}
 	})
 }
@@ -419,7 +419,7 @@ func TestDNSWorker_DetectWildcard(t *testing.T) {
 	skipUnlessIntegration(t)
 	resolve := dnsEnv(t)
 
-	t.Run("wildcard-зона: случайная метка получает адреса", func(t *testing.T) {
+	t.Run("a wildcard zone: a random label gets addresses", func(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		info, err := dnsworker.DetectWildcard(ctx, resolve, "wildcard.crawl.test")
@@ -427,29 +427,29 @@ func TestDNSWorker_DetectWildcard(t *testing.T) {
 			t.Fatalf("DetectWildcard: %v", err)
 		}
 		if !info.Detected {
-			t.Fatal("wildcard не детектирован: *.wildcard синтезирует A для любой метки")
+			t.Fatal("the wildcard not detected: *.wildcard synthesizes A for any label")
 		}
 		if len(info.Addrs) != 1 || !info.Addrs[0].Equal(net.ParseIP(testwebIP)) {
-			t.Errorf("адреса wildcard = %v, хочу [%s]", info.Addrs, testwebIP)
+			t.Errorf("the wildcard addresses = %v, want [%s]", info.Addrs, testwebIP)
 		}
 		if len(info.Label) != 16 {
-			t.Errorf("метка детекта %q: длина %d, хочу 16 (crypto/rand)", info.Label, len(info.Label))
+			t.Errorf("the detect label %q: length %d, want 16 (crypto/rand)", info.Label, len(info.Label))
 		}
 	})
 
-	t.Run("обычная зона: детект-отрицание без ошибки", func(t *testing.T) {
+	t.Run("a regular zone: the detect negation without an error", func(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		info, err := dnsworker.DetectWildcard(ctx, resolve, "same-site.crawl.test")
 		if err != nil {
-			t.Fatalf("DetectWildcard: %v (NXDOMAIN случайной метки — авторитетное «нет»)", err)
+			t.Fatalf("DetectWildcard: %v (a random label's NXDOMAIN is an authoritative \"no\")", err)
 		}
 		if info.Detected || len(info.Addrs) != 0 {
-			t.Errorf("итог = %+v, хочу Detected=false без адресов", info)
+			t.Errorf("the outcome = %+v, want Detected=false without addresses", info)
 		}
 	})
 
-	t.Run("пометка: синтезированные субдомены помечены, апекс и www — нет", func(t *testing.T) {
+	t.Run("the marking: synthesized subdomains marked, the apex and www not", func(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		// The live T-039 pipeline: the subdomain results of the wildcard
@@ -487,11 +487,11 @@ func TestDNSWorker_DetectWildcard(t *testing.T) {
 		got := marked.IDs()
 		want := []int{2, 3, 4, 5} // admin/crm/api/app — the direct rule of spec 5.4 item 3
 		if len(got) != len(want) {
-			t.Fatalf("помечены %v, хочу %v (апекс и www не помечаются никогда)", got, want)
+			t.Fatalf("marked %v, want %v (the apex and www are never marked)", got, want)
 		}
 		for i := range want {
 			if got[i] != want[i] {
-				t.Fatalf("помечены %v, хочу %v", got, want)
+				t.Fatalf("marked %v, want %v", got, want)
 			}
 		}
 	})
@@ -522,11 +522,11 @@ func TestDNSWorker_RunTestbedBatch(t *testing.T) {
 	labels := []string{"same-site", "nxdomain-case"}
 	ids := insertPendingDomains(t, pool, "crawl.test", labels)
 	if len(ids) != 2 {
-		t.Fatalf("вставлено доменов: %d, хочу 2", len(ids))
+		t.Fatalf("domains inserted: %d, want 2", len(ids))
 	}
 	var zoneID int16
 	if err := pool.QueryRow(ctx, "SELECT id FROM zones WHERE name = $1", "crawl.test").Scan(&zoneID); err != nil {
-		t.Fatalf("зона crawl.test: %v", err)
+		t.Fatalf("zone crawl.test: %v", err)
 	}
 
 	// Publishing the q:dns batch — as the T-028 scheduler does.
@@ -534,7 +534,7 @@ func TestDNSWorker_RunTestbedBatch(t *testing.T) {
 		{ZoneID: zoneID, DomainID: ids[0], Name: "same-site.crawl.test"},
 		{ZoneID: zoneID, DomainID: ids[1], Name: "nxdomain-case.crawl.test"},
 	}}); err != nil {
-		t.Fatalf("публикация q:dns: %v", err)
+		t.Fatalf("publishing q:dns: %v", err)
 	}
 
 	// The worker loop (group/consumer are unique — the test Redis DB is
@@ -556,13 +556,13 @@ func TestDNSWorker_RunTestbedBatch(t *testing.T) {
 		if err := pool.QueryRow(ctx,
 			fmt.Sprintf("SELECT count(*) FROM domains WHERE check_state = %d", int16(model.CheckStateDone)),
 		).Scan(&done); err != nil {
-			t.Fatalf("подсчёт done: %v", err)
+			t.Fatalf("counting done: %v", err)
 		}
 		if done == 2 {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("домены не переведены в done за 15 с — цикл воркера не обработал пачку")
+			t.Fatal("the domains not moved to done within 15 s — the worker's loop did not process the batch")
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
@@ -583,22 +583,22 @@ func TestDNSWorker_RunTestbedBatch(t *testing.T) {
 		if err := pool.QueryRow(ctx,
 			"SELECT status, dns_mask, queued_at, last_checked_at FROM domains WHERE id = $1", ids[i],
 		).Scan(&r.status, &r.mask, &r.queuedAt, &r.lastAt); err != nil {
-			t.Fatalf("домен %s: %v", label, err)
+			t.Fatalf("domain %s: %v", label, err)
 		}
 		rows[label] = r
 	}
 	if r := rows["same-site"]; r.status != model.StatusNew || r.mask != 0b11 {
-		t.Errorf("same-site: status=%s mask=%b, хочу new и биты 0,1 (апекс+www)", r.status, r.mask)
+		t.Errorf("same-site: status=%s mask=%b, want new and bits 0,1 (apex+www)", r.status, r.mask)
 	}
 	if r := rows["nxdomain-case"]; r.status != model.StatusNotDelegated || r.mask != 0 {
-		t.Errorf("nxdomain-case: status=%s mask=%b, хочу not_delegated и пустую маску", r.status, r.mask)
+		t.Errorf("nxdomain-case: status=%s mask=%b, want not_delegated and an empty mask", r.status, r.mask)
 	}
 	for label, r := range rows {
 		if r.queuedAt != nil {
-			t.Errorf("%s: queued_at не сброшен по завершении lease", label)
+			t.Errorf("%s: queued_at not cleared on the lease completion", label)
 		}
 		if r.lastAt == nil {
-			t.Errorf("%s: last_checked_at не записан", label)
+			t.Errorf("%s: last_checked_at not recorded", label)
 		}
 	}
 
@@ -607,36 +607,36 @@ func TestDNSWorker_RunTestbedBatch(t *testing.T) {
 	// no task.
 	httpMsgs := consumeTasks(t, q, queue.StreamHTTP, "it-http-e2e", "op", 10)
 	if len(httpMsgs) != 1 {
-		t.Fatalf("задач в q:http: %d, хочу 1 (NXDOMAIN-домен без задачи)", len(httpMsgs))
+		t.Fatalf("tasks in q:http: %d, want 1 (the NXDOMAIN domain without a task)", len(httpMsgs))
 	}
 	task, err := queue.Decode[queue.HTTPTask](httpMsgs[0])
 	if err != nil {
-		t.Fatalf("декодирование q:http: %v", err)
+		t.Fatalf("decoding q:http: %v", err)
 	}
 	if task.Name != "same-site.crawl.test" || task.ZoneID != zoneID || task.DomainID != ids[0] {
-		t.Errorf("задача q:http: name=%s zone=%d domain=%d", task.Name, task.ZoneID, task.DomainID)
+		t.Errorf("the q:http task: name=%s zone=%d domain=%d", task.Name, task.ZoneID, task.DomainID)
 	}
 	subIDs := map[int16]bool{}
 	for _, s := range task.Subdomains {
 		subIDs[s.SubdomainID] = true
 		if len(s.Addrs) != 1 || s.Addrs[0] != testwebIP {
-			t.Errorf("субдомен %d (%q): адреса %v, хочу [%s]", s.SubdomainID, s.Label, s.Addrs, testwebIP)
+			t.Errorf("subdomain %d (%q): addresses %v, want [%s]", s.SubdomainID, s.Label, s.Addrs, testwebIP)
 		}
 		if s.CNAME != "" {
-			t.Errorf("субдомен %d: неожиданный CNAME %q", s.SubdomainID, s.CNAME)
+			t.Errorf("subdomain %d: an unexpected CNAME %q", s.SubdomainID, s.CNAME)
 		}
 	}
 	if len(subIDs) != 2 || !subIDs[0] || !subIDs[1] {
-		t.Errorf("субдомены задачи: %v, хочу ровно апекс и www (адреса есть только у них)", subIDs)
+		t.Errorf("the task's subdomains: %v, want exactly the apex and www (only they have addresses)", subIDs)
 	}
 
 	// The q:dns delivery is acknowledged after writing (Processing, T-025):
 	// the PEL is empty, q:dead is empty.
 	if n := pendingCount(t, rdb, queue.StreamDNS, group); n != 0 {
-		t.Errorf("неподтверждённых q:dns: %d, хочу 0 (XACK после записи в БД)", n)
+		t.Errorf("unacked q:dns: %d, want 0 (XACK after the DB write)", n)
 	}
 	if n := streamLen(t, rdb, queue.StreamDead); n != 0 {
-		t.Errorf("записей в q:dead: %d, хочу 0", n)
+		t.Errorf("entries in q:dead: %d, want 0", n)
 	}
 
 	// Graceful shutdown: canceling ctx — a clean nil (the OnRun contract, T-012).
@@ -644,10 +644,10 @@ func TestDNSWorker_RunTestbedBatch(t *testing.T) {
 	select {
 	case err := <-runDone:
 		if err != nil {
-			t.Errorf("Run после отмены ctx: %v, хочу nil", err)
+			t.Errorf("Run after the ctx cancel: %v, want nil", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Error("цикл воркера не остановился после отмены ctx")
+		t.Error("the worker's loop did not stop after the ctx cancel")
 	}
 }
 
@@ -671,17 +671,17 @@ func TestDNSWorker_InvalidDomainStatus(t *testing.T) {
 	// batch message is whitespace — like the corrupted domains row (DNS-03).
 	ids := insertPendingDomains(t, pool, "crawl.test", []string{"poison"})
 	if len(ids) != 1 {
-		t.Fatalf("вставлено доменов: %d, хочу 1", len(ids))
+		t.Fatalf("domains inserted: %d, want 1", len(ids))
 	}
 	var zoneID int16
 	if err := pool.QueryRow(ctx, "SELECT id FROM zones WHERE name = $1", "crawl.test").Scan(&zoneID); err != nil {
-		t.Fatalf("зона crawl.test: %v", err)
+		t.Fatalf("zone crawl.test: %v", err)
 	}
 
 	if _, err := q.Publish(ctx, queue.StreamDNS, queue.DNSBatch{Domains: []queue.DNSDomain{
 		{ZoneID: zoneID, DomainID: ids[0], Name: "   "},
 	}}); err != nil {
-		t.Fatalf("публикация q:dns: %v", err)
+		t.Fatalf("publishing q:dns: %v", err)
 	}
 
 	const group = "it-dns-invalid"
@@ -701,13 +701,13 @@ func TestDNSWorker_InvalidDomainStatus(t *testing.T) {
 		if err := pool.QueryRow(ctx,
 			"SELECT check_state FROM domains WHERE id = $1", ids[0],
 		).Scan(&state); err != nil {
-			t.Fatalf("чтение домена: %v", err)
+			t.Fatalf("reading the domain: %v", err)
 		}
 		if model.CheckState(state) == model.CheckStateDone {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("ядовитый домен не получил терминальный диагноз за 15 с")
+			t.Fatal("the poison domain did not get a terminal diagnosis within 15 s")
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
@@ -718,31 +718,31 @@ func TestDNSWorker_InvalidDomainStatus(t *testing.T) {
 	if err := pool.QueryRow(ctx,
 		"SELECT status, queued_at FROM domains WHERE id = $1", ids[0],
 	).Scan(&status, &queuedAt); err != nil {
-		t.Fatalf("чтение диагноза: %v", err)
+		t.Fatalf("reading the diagnosis: %v", err)
 	}
 	if status != model.StatusInvalid {
-		t.Errorf("статус = %s, хочу invalid (терминальный диагноз T-109)", status)
+		t.Errorf("status = %s, want invalid (the terminal diagnosis T-109)", status)
 	}
 	if queuedAt != nil {
-		t.Error("queued_at не сброшен — lease не завершён диагнозом")
+		t.Error("queued_at not cleared — the lease not finished by the diagnosis")
 	}
 
 	// The delivery is acknowledged after the write, not by quarantine.
 	if n := pendingCount(t, rdb, queue.StreamDNS, group); n != 0 {
-		t.Errorf("неподтверждённых q:dns: %d, хочу 0", n)
+		t.Errorf("unacked q:dns: %d, want 0", n)
 	}
 	if n := streamLen(t, rdb, queue.StreamDead); n != 0 {
-		t.Errorf("записей в q:dead: %d, хочу 0 (диагноз — не карантин)", n)
+		t.Errorf("entries in q:dead: %d, want 0 (a diagnosis is not quarantine)", n)
 	}
 
 	cancel()
 	select {
 	case err := <-runDone:
 		if err != nil {
-			t.Errorf("Run после отмены ctx: %v, хочу nil", err)
+			t.Errorf("Run after the ctx cancel: %v, want nil", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Error("цикл воркера не остановился после отмены ctx")
+		t.Error("the worker's loop did not stop after the ctx cancel")
 	}
 
 	// The recheck does not return invalid: both rows are aged to
@@ -752,37 +752,37 @@ func TestDNSWorker_InvalidDomainStatus(t *testing.T) {
 	// their own background.
 	ageCtx := context.Background()
 	if _, err := pool.Exec(ageCtx, "UPDATE domains SET last_checked_at = DATE '2000-01-01'"); err != nil {
-		t.Fatalf("старение строк: %v", err)
+		t.Fatalf("aging the rows: %v", err)
 	}
 	if _, err := pool.Exec(ageCtx,
 		fmt.Sprintf("INSERT INTO domains (zone_id, label, status, check_state, last_checked_at) "+
 			"VALUES ($1, 'control', %d, %d, DATE '2000-01-01')",
 			int16(model.StatusTempError), int16(model.CheckStateDone)),
 		zoneID); err != nil {
-		t.Fatalf("вставка контрольного домена: %v", err)
+		t.Fatalf("inserting the control domain: %v", err)
 	}
 	res, err := scheduler.RecheckOnce(ageCtx, pool, scheduler.RecheckOptions{})
 	if err != nil {
 		t.Fatalf("RecheckOnce: %v", err)
 	}
 	if res.Domains != 1 {
-		t.Errorf("RecheckOnce перевёл %d доменов, хочу 1 (только контрольный)", res.Domains)
+		t.Errorf("RecheckOnce moved %d domains, want 1 (only the control one)", res.Domains)
 	}
 	var poisonState, controlState int16
 	if err := pool.QueryRow(ageCtx,
 		"SELECT check_state FROM domains WHERE id = $1", ids[0]).Scan(&poisonState); err != nil {
-		t.Fatalf("чтение ядовитого: %v", err)
+		t.Fatalf("reading the poison one: %v", err)
 	}
 	if err := pool.QueryRow(ageCtx,
 		"SELECT check_state FROM domains WHERE label = 'control' AND zone_id = $1", zoneID).Scan(&controlState); err != nil {
-		t.Fatalf("чтение контрольного: %v", err)
+		t.Fatalf("reading the control one: %v", err)
 	}
 	if model.CheckState(poisonState) != model.CheckStateDone {
-		t.Errorf("ядовитый: check_state = %s, хочу done (recheck не возвращает invalid)",
+		t.Errorf("the poison one: check_state = %s, want done (the recheck does not return invalid)",
 			model.CheckState(poisonState))
 	}
 	if model.CheckState(controlState) != model.CheckStatePending {
-		t.Errorf("контрольный: check_state = %s, хочу pending (обычные done-строки возвращаются)",
+		t.Errorf("the control one: check_state = %s, want pending (regular done rows are returned)",
 			model.CheckState(controlState))
 	}
 }
@@ -810,7 +810,7 @@ func TestDNSWorker_RedeliveryPublishedMarker(t *testing.T) {
 	ids := insertPendingDomains(t, pool, "crawl.test", labels)
 	var zoneID int16
 	if err := pool.QueryRow(ctx, "SELECT id FROM zones WHERE name = $1", "crawl.test").Scan(&zoneID); err != nil {
-		t.Fatalf("зона crawl.test: %v", err)
+		t.Fatalf("zone crawl.test: %v", err)
 	}
 
 	// "The previous attempt": published q:http for both domains and set
@@ -822,13 +822,13 @@ func TestDNSWorker_RedeliveryPublishedMarker(t *testing.T) {
 			ZoneID: zoneID, DomainID: ids[i], Name: name,
 			Subdomains: []queue.HTTPSubdomain{{SubdomainID: 0, Label: "", Addrs: []string{testwebIP}}},
 		}); err != nil {
-			t.Fatalf("публикация q:http (%s): %v", name, err)
+			t.Fatalf("publishing q:http (%s): %v", name, err)
 		}
 		if _, err := pool.Exec(ctx,
 			fmt.Sprintf("UPDATE domains SET flags = flags | %d, check_state = %d WHERE id = $1",
 				int16(model.FlagHTTPPublished), int16(model.CheckStateQueued)),
 			ids[i]); err != nil {
-			t.Fatalf("пометка http_published (%s): %v", label, err)
+			t.Fatalf("marking http_published (%s): %v", label, err)
 		}
 	}
 
@@ -837,7 +837,7 @@ func TestDNSWorker_RedeliveryPublishedMarker(t *testing.T) {
 		{ZoneID: zoneID, DomainID: ids[0], Name: "same-site.crawl.test"},
 		{ZoneID: zoneID, DomainID: ids[1], Name: "alias-target.crawl.test"},
 	}}); err != nil {
-		t.Fatalf("публикация q:dns: %v", err)
+		t.Fatalf("publishing q:dns: %v", err)
 	}
 
 	const group = "it-dns-marker"
@@ -855,13 +855,13 @@ func TestDNSWorker_RedeliveryPublishedMarker(t *testing.T) {
 		if err := pool.QueryRow(ctx,
 			fmt.Sprintf("SELECT count(*) FROM domains WHERE check_state = %d", int16(model.CheckStateDone)),
 		).Scan(&done); err != nil {
-			t.Fatalf("подсчёт done: %v", err)
+			t.Fatalf("counting done: %v", err)
 		}
 		if done == 2 {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("домены не записаны за 15 с — повтор пачки не дообработан")
+			t.Fatal("the domains not recorded within 15 s — the batch repeat not finished")
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
@@ -869,10 +869,10 @@ func TestDNSWorker_RedeliveryPublishedMarker(t *testing.T) {
 	select {
 	case err := <-runDone:
 		if err != nil {
-			t.Errorf("Run после отмены ctx: %v, хочу nil", err)
+			t.Errorf("Run after the ctx cancel: %v, want nil", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Error("цикл воркера не остановился после отмены ctx")
+		t.Error("the worker's loop did not stop after the ctx cancel")
 	}
 
 	// Checks after cancellation — on their own context: the test ctx is
@@ -892,13 +892,13 @@ func TestDNSWorker_RedeliveryPublishedMarker(t *testing.T) {
 		if err := pool.QueryRow(postCtx,
 			"SELECT status, flags, dns_mask FROM domains WHERE id = $1", ids[i],
 		).Scan(&status, &flags, &mask); err != nil {
-			t.Fatalf("домен %s: %v", label, err)
+			t.Fatalf("domain %s: %v", label, err)
 		}
 		if model.Flags(flags).IsHTTPPublished() {
-			t.Errorf("%s: бит http_published не снят записью результата", label)
+			t.Errorf("%s: the http_published bit not cleared by the result write", label)
 		}
 		if status != model.StatusNew || mask != 0b11 {
-			t.Errorf("%s: status=%s mask=%b, хочу new и биты 0,1 (апекс+www)", label, status, mask)
+			t.Errorf("%s: status=%s mask=%b, want new and bits 0,1 (apex+www)", label, status, mask)
 		}
 	}
 
@@ -908,25 +908,25 @@ func TestDNSWorker_RedeliveryPublishedMarker(t *testing.T) {
 	// reading does not change the test's PEL.)
 	httpMsgs := consumeTasks(t, q, queue.StreamHTTP, "it-http-marker", "op", 10)
 	if len(httpMsgs) != 2 {
-		t.Fatalf("записей в q:http: %d, хочу 2 (повтор не публикует дублей)", len(httpMsgs))
+		t.Fatalf("entries in q:http: %d, want 2 (the repeat publishes no duplicates)", len(httpMsgs))
 	}
 	seen := map[string]int{}
 	for _, m := range httpMsgs {
 		task, err := queue.Decode[queue.HTTPTask](m)
 		if err != nil {
-			t.Fatalf("декодирование q:http: %v", err)
+			t.Fatalf("decoding q:http: %v", err)
 		}
 		seen[task.Name]++
 	}
 	for _, name := range []string{"same-site.crawl.test", "alias-target.crawl.test"} {
 		if seen[name] != 1 {
-			t.Errorf("задач q:http для %s: %d, хочу ровно одну", name, seen[name])
+			t.Errorf("q:http tasks for %s: %d, want exactly one", name, seen[name])
 		}
 	}
 
 	// The q:dns delivery is acknowledged after the write (Processing, T-025).
 	if n := pendingCount(t, rdb, queue.StreamDNS, group); n != 0 {
-		t.Errorf("неподтверждённых q:dns: %d, хочу 0", n)
+		t.Errorf("unacked q:dns: %d, want 0", n)
 	}
 }
 
@@ -947,7 +947,7 @@ func TestDNSWorker_EnqueueClearsMarker(t *testing.T) {
 	ids := insertPendingDomains(t, pool, "crawl.test", []string{"same-site"})
 	var zoneID int16
 	if err := pool.QueryRow(ctx, "SELECT id FROM zones WHERE name = $1", "crawl.test").Scan(&zoneID); err != nil {
-		t.Fatalf("зона crawl.test: %v", err)
+		t.Fatalf("zone crawl.test: %v", err)
 	}
 	// The domain returned to pending with the bit still set (the extreme
 	// failure path: the write never happened, the lease moved the row to
@@ -956,7 +956,7 @@ func TestDNSWorker_EnqueueClearsMarker(t *testing.T) {
 		fmt.Sprintf("UPDATE domains SET flags = flags | %d WHERE id = $1",
 			int16(model.FlagHTTPPublished)),
 		ids[0]); err != nil {
-		t.Fatalf("пометка http_published: %v", err)
+		t.Fatalf("marking http_published: %v", err)
 	}
 
 	res, err := scheduler.EnqueueBatch(ctx, pool, q, []scheduler.DispatchRow{
@@ -966,14 +966,14 @@ func TestDNSWorker_EnqueueClearsMarker(t *testing.T) {
 		t.Fatalf("EnqueueBatch: %v", err)
 	}
 	if res.Queued != 1 || res.Published != 1 {
-		t.Fatalf("EnqueueBatch = %+v, хочу queued=published=1", res)
+		t.Fatalf("EnqueueBatch = %+v, want queued=published=1", res)
 	}
 
 	var flags int16
 	if err := pool.QueryRow(ctx, "SELECT flags FROM domains WHERE id = $1", ids[0]).Scan(&flags); err != nil {
-		t.Fatalf("чтение flags: %v", err)
+		t.Fatalf("reading flags: %v", err)
 	}
 	if model.Flags(flags).IsHTTPPublished() {
-		t.Error("бит http_published пережил постановку — свежий эпизод начнётся с подавленной публикацией")
+		t.Error("the http_published bit survived the enqueue — a fresh episode would start with a suppressed publication")
 	}
 }

@@ -90,11 +90,11 @@ func e2eSchema(t *testing.T) *pgxpool.Pool {
 	t.Cleanup(cleanup)
 	dsn += "&application_name=" + e2eAppName
 	if err := migrate.Up(context.Background(), dsn); err != nil {
-		t.Fatalf("применение миграций к изолированной схеме: %v", err)
+		t.Fatalf("applying the migrations to the isolated schema: %v", err)
 	}
 	pool, err := pgxpool.New(context.Background(), dsn)
 	if err != nil {
-		t.Fatalf("подключение к тестовой схеме: %v", err)
+		t.Fatalf("connecting to the test schema: %v", err)
 	}
 	t.Cleanup(pool.Close)
 	return pool
@@ -173,7 +173,7 @@ func newE2EEnv(t *testing.T) *e2eEnv {
 	}
 	loader, err := rules.NewReloader(rulesDir, nil)
 	if err != nil {
-		t.Fatalf("набор правил %s: %v", rulesDir, err)
+		t.Fatalf("the rules set %s: %v", rulesDir, err)
 	}
 	an, err := analyzer.New(pool, q, store, loader, analyzer.Options{
 		MinScore: rules.DefaultMinScore,
@@ -247,7 +247,7 @@ func e2eBreakPostgresConnections(t *testing.T) int {
 	defer cancel()
 	conn, err := pgx.Connect(ctx, pgDSN(t))
 	if err != nil {
-		t.Fatalf("подключение для обрыва соединений: %v", err)
+		t.Fatalf("the connection for breaking the connections: %v", err)
 	}
 	defer func() { _ = conn.Close(ctx) }()
 	var killed int
@@ -255,7 +255,7 @@ func e2eBreakPostgresConnections(t *testing.T) int {
 		SELECT count(*) FILTER (WHERE pg_terminate_backend(pid)) FROM pg_stat_activity
 		WHERE application_name = $1 AND pid <> pg_backend_pid()`, e2eAppName,
 	).Scan(&killed); err != nil {
-		t.Fatalf("обрыв соединений (pg_terminate_backend): %v", err)
+		t.Fatalf("breaking the connections (pg_terminate_backend): %v", err)
 	}
 	return killed
 }
@@ -275,7 +275,7 @@ func e2eWaitPoolRecovery(t *testing.T, pool *pgxpool.Pool) {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("пул не переподключился после обрыва соединений: %v", err)
+			t.Fatalf("the pool did not reconnect after the connection break: %v", err)
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
@@ -331,7 +331,7 @@ func TestE2E_FileToLaravel(t *testing.T) {
 		t.Fatal(err)
 	}
 	lines := make([]string, 0, len(e2eSamples)+2)
-	lines = append(lines, "# сквозной прогон T-091: образцы Laravel и негативные")
+	lines = append(lines, "# end-to-end run T-091: Laravel samples and negatives")
 	for _, s := range e2eSamples {
 		lines = append(lines, s.label+"."+e2eZone)
 	}
@@ -344,83 +344,83 @@ func TestE2E_FileToLaravel(t *testing.T) {
 	// file is applied) — the following stages use it for queries.
 	var zoneID int16
 
-	t.Run("ingest: файл → зоны, домены, отчёт", func(t *testing.T) {
+	t.Run("ingest: a file → zones, domains, the report", func(t *testing.T) {
 		out, err := pipe.Process(ctx, file)
 		if err != nil {
-			t.Fatalf("конвейер ingest: %v", err)
+			t.Fatalf("the ingest pipeline: %v", err)
 		}
 		if out.Kind != ingest.OutcomeApplied {
-			t.Fatalf("итог файла = %q, хочу applied", out.Kind)
+			t.Fatalf("file outcome = %q, want applied", out.Kind)
 		}
 		if !existsOnDisk(t, filepath.Join(dir, "processed", e2eZone, "add", "e2e.txt")) {
-			t.Error("файл не перемещён в processed/")
+			t.Error("the file not moved into processed/")
 		}
 
 		if n := countDomains(t, env.pool, ""); n != len(e2eSamples) {
-			t.Fatalf("доменов в БД: %d, хочу %d", n, len(e2eSamples))
+			t.Fatalf("domains in the DB: %d, want %d", n, len(e2eSamples))
 		}
 		for _, s := range e2eSamples {
 			d, ok := env.domainByLabel(t, e2eZone, s.label)
 			if !ok {
-				t.Fatalf("домен %s.%s не создан", s.label, e2eZone)
+				t.Fatalf("domain %s.%s not created", s.label, e2eZone)
 			}
 			if d.status != int16(model.StatusNew) || d.checkState != int16(model.CheckStatePending) {
-				t.Errorf("%s: status/check_state = %d/%d, хочу new/pending", s.label, d.status, d.checkState)
+				t.Errorf("%s: status/check_state = %d/%d, want new/pending", s.label, d.status, d.checkState)
 			}
 		}
 
 		if err := env.pool.QueryRow(ctx,
 			"SELECT id FROM zones WHERE name = $1", e2eZone).Scan(&zoneID); err != nil {
-			t.Fatalf("зона %s: %v", e2eZone, err)
+			t.Fatalf("zone %s: %v", e2eZone, err)
 		}
 		var linesTotal, added, rejected int64
 		if err := env.pool.QueryRow(ctx,
 			"SELECT lines_total, added, rejected FROM ingest_files WHERE zone_id = $1", zoneID,
 		).Scan(&linesTotal, &added, &rejected); err != nil {
-			t.Fatalf("чтение ingest_files: %v", err)
+			t.Fatalf("reading ingest_files: %v", err)
 		}
 		// 6 physical lines: a comment, 4 domains, an empty one; 4 applied.
 		if linesTotal != 6 || added != int64(len(e2eSamples)) || rejected != 0 {
-			t.Errorf("ingest_files: lines=%d added=%d rejected=%d, хочу 6/%d/0",
+			t.Errorf("ingest_files: lines=%d added=%d rejected=%d, want 6/%d/0",
 				linesTotal, added, len(e2eSamples), rejected)
 		}
 		var staging int
 		if err := env.pool.QueryRow(ctx, "SELECT count(*) FROM ingest_stage").Scan(&staging); err != nil {
-			t.Fatalf("чтение ingest_stage: %v", err)
+			t.Fatalf("reading ingest_stage: %v", err)
 		}
 		if staging != 0 {
-			t.Errorf("staging не очищена: %d строк", staging)
+			t.Errorf("staging not cleaned: %d rows", staging)
 		}
 	})
 
-	t.Run("scheduler: pending → queued + пачка q:dns", func(t *testing.T) {
+	t.Run("scheduler: pending → queued + a q:dns batch", func(t *testing.T) {
 		batch, err := scheduler.DispatchBatch(ctx, env.pool, scheduler.DispatchQuery{Limit: 10})
 		if err != nil {
-			t.Fatalf("выборка пачки: %v", err)
+			t.Fatalf("dispatch batch: %v", err)
 		}
 		if len(batch) != len(e2eSamples) {
-			t.Fatalf("выбрано доменов: %d, хочу %d", len(batch), len(e2eSamples))
+			t.Fatalf("dispatched domains: %d, want %d", len(batch), len(e2eSamples))
 		}
 		res, err := scheduler.EnqueueBatch(ctx, env.pool, env.q, batch)
 		if err != nil {
-			t.Fatalf("постановка пачки: %v", err)
+			t.Fatalf("enqueue batch: %v", err)
 		}
 		if res.Queued != len(e2eSamples) || res.Published != len(e2eSamples) {
-			t.Fatalf("постановка: queued=%d published=%d, хочу %d/%d",
+			t.Fatalf("the enqueue: queued=%d published=%d, want %d/%d",
 				res.Queued, res.Published, len(e2eSamples), len(e2eSamples))
 		}
 		if n := countDomains(t, env.pool, stateWhere(model.CheckStateQueued)); n != len(e2eSamples) {
-			t.Errorf("queued после постановки: %d, хочу %d", n, len(e2eSamples))
+			t.Errorf("queued after the enqueue: %d, want %d", n, len(e2eSamples))
 		}
 		if n := streamLen(t, env.rdb, queue.StreamDNS); n != 1 {
-			t.Errorf("записей в q:dns: %d, хочу 1 (одна пачка)", n)
+			t.Errorf("entries in q:dns: %d, want 1 (one batch)", n)
 		}
 	})
 
-	t.Run("DNS-этап: q:dns → записи доменов и задачи q:http", func(t *testing.T) {
+	t.Run("the DNS stage: q:dns → the domain records and q:http tasks", func(t *testing.T) {
 		deliveries := consumeTasks(t, env.q, queue.StreamDNS, e2eDNSGroup, "e2e", 10)
 		if len(deliveries) != 1 {
-			t.Fatalf("доставок q:dns: %d, хочу 1", len(deliveries))
+			t.Fatalf("q:dns deliveries: %d, want 1", len(deliveries))
 		}
 		// The batch — as the worker's processBatch (T-039): the subdomain
 		// reference table → the freshness filter → episodes; XACK after the
@@ -432,7 +432,7 @@ func TestE2E_FileToLaravel(t *testing.T) {
 					return err
 				}
 				if len(b.Domains) != len(e2eSamples) {
-					return fmt.Errorf("в пачке %d доменов, хочу %d", len(b.Domains), len(e2eSamples))
+					return fmt.Errorf("batch has %d domains, want %d", len(b.Domains), len(e2eSamples))
 				}
 				subs, err := dnsworker.LoadSubdomains(c, env.pool)
 				if err != nil {
@@ -443,7 +443,7 @@ func TestE2E_FileToLaravel(t *testing.T) {
 					return err
 				}
 				if len(pending) != len(e2eSamples) {
-					return fmt.Errorf("актуальных доменов: %d, хочу %d", len(pending), len(e2eSamples))
+					return fmt.Errorf("pending domains: %d, want %d", len(pending), len(e2eSamples))
 				}
 				for _, dom := range pending {
 					if err := dnsworker.ProcessDomain(c, env.pool, env.q, env.resolve, dom, subs, true, nil, nil); err != nil {
@@ -453,7 +453,7 @@ func TestE2E_FileToLaravel(t *testing.T) {
 				return nil
 			})
 		if err != nil {
-			t.Fatalf("пачка q:dns: %v", err)
+			t.Fatalf("q:dns batch: %v", err)
 		}
 
 		// All episodes are finished: done, the lease is reset, the mask is
@@ -471,27 +471,27 @@ func TestE2E_FileToLaravel(t *testing.T) {
 				"SELECT status, dns_mask, queued_at, last_checked_at FROM domains WHERE id = $1",
 				env.domainID(t, zoneID, s.label),
 			).Scan(&status, &mask, &queuedAt, &lastAt); err != nil {
-				t.Fatalf("домен %s: %v", s.label, err)
+				t.Fatalf("domain %s: %v", s.label, err)
 			}
 			if status != model.StatusNew {
-				t.Errorf("%s: status = %s, хочу new (итог за HTTP-этапом)", s.label, status)
+				t.Errorf("%s: status = %s, want new (the verdict belongs to the HTTP stage)", s.label, status)
 			}
 			if mask != 0b1 {
-				t.Errorf("%s: dns_mask = %b, хочу бит 0 (апекс)", s.label, mask)
+				t.Errorf("%s: dns_mask = %b, want bit 0 (the apex)", s.label, mask)
 			}
 			if queuedAt != nil || lastAt == nil {
 				t.Errorf("%s: queued_at=%v last_checked_at=%v", s.label, queuedAt, lastAt)
 			}
 		}
 		if n := countDomains(t, env.pool, stateWhere(model.CheckStateDone)); n != len(e2eSamples) {
-			t.Fatalf("done после DNS-этапа: %d, хочу %d", n, len(e2eSamples))
+			t.Fatalf("done after the DNS stage: %d, want %d", n, len(e2eSamples))
 		}
 		if n := streamLen(t, env.rdb, queue.StreamHTTP); n != int64(len(e2eSamples)) {
-			t.Fatalf("задач в q:http: %d, хочу %d (по одной на домен)", n, len(e2eSamples))
+			t.Fatalf("tasks in q:http: %d, want %d (one per domain)", n, len(e2eSamples))
 		}
 	})
 
-	t.Run("перезапуск PostgreSQL посреди конвейера", func(t *testing.T) {
+	t.Run("a PostgreSQL restart in the middle of the pipeline", func(t *testing.T) {
 		// Guarantee the pool ≥2 live connections at the moment of the drop:
 		// two parallel queries hold two physical connections and return
 		// them to the pool alive.
@@ -501,7 +501,7 @@ func TestE2E_FileToLaravel(t *testing.T) {
 			go func() {
 				defer wg.Done()
 				if _, err := env.pool.Exec(ctx, "SELECT pg_sleep(1)"); err != nil {
-					t.Errorf("прогрев соединений пула: %v", err)
+					t.Errorf("warming up the pool's connections: %v", err)
 				}
 			}()
 		}
@@ -509,7 +509,7 @@ func TestE2E_FileToLaravel(t *testing.T) {
 
 		killed := e2eBreakPostgresConnections(t)
 		if killed < 2 {
-			t.Fatalf("оборвано соединений: %d, хочу ≥ 2 (два параллельных запроса перед обрывом)", killed)
+			t.Fatalf("connections broken: %d, want ≥ 2 (two parallel queries before the break)", killed)
 		}
 
 		// The client reconnects: dead connections are released, the pool
@@ -520,20 +520,20 @@ func TestE2E_FileToLaravel(t *testing.T) {
 		// continues from the same place (PostgreSQL is the source of truth,
 		// spec 3.4; Redis is untouched).
 		if n := countDomains(t, env.pool, ""); n != len(e2eSamples) {
-			t.Errorf("доменов после обрыва: %d, хочу %d", n, len(e2eSamples))
+			t.Errorf("domains after the break: %d, want %d", n, len(e2eSamples))
 		}
 		if n := countDomains(t, env.pool, stateWhere(model.CheckStateDone)); n != len(e2eSamples) {
-			t.Errorf("done после обрыва: %d, хочу %d (результаты DNS не потеряны)", n, len(e2eSamples))
+			t.Errorf("done after the break: %d, want %d (the DNS results not lost)", n, len(e2eSamples))
 		}
 		if n := streamLen(t, env.rdb, queue.StreamHTTP); n != int64(len(e2eSamples)) {
-			t.Errorf("задач q:http после обрыва: %d, хочу %d", n, len(e2eSamples))
+			t.Errorf("q:http tasks after the break: %d, want %d", n, len(e2eSamples))
 		}
 	})
 
-	t.Run("HTTP-этап после сбоя: q:http → subdomain_results + q:analyze", func(t *testing.T) {
+	t.Run("the HTTP stage after the failure: q:http → subdomain_results + q:analyze", func(t *testing.T) {
 		tasks := consumeTasks(t, env.q, queue.StreamHTTP, e2eHTTPGroup, "e2e", 10)
 		if len(tasks) != len(e2eSamples) {
-			t.Fatalf("задач q:http: %d, хочу %d", len(tasks), len(e2eSamples))
+			t.Fatalf("q:http tasks: %d, want %d", len(tasks), len(e2eSamples))
 		}
 		// The episode — as the worker's processDelivery (T-053):
 		// ProcessDomain → ContentSaver (T-056) → Recorder (T-058) → XACK.
@@ -556,12 +556,12 @@ func TestE2E_FileToLaravel(t *testing.T) {
 						return err
 					}
 					if !recorded {
-						return fmt.Errorf("домен %s: результат не записан (охрана записи, T-058)", task.Name)
+						return fmt.Errorf("domain %s: result not recorded (the write guard, T-058)", task.Name)
 					}
 					return nil
 				})
 			if err != nil {
-				t.Fatalf("HTTP-эпизод: %v", err)
+				t.Fatalf("HTTP episode: %v", err)
 			}
 		}
 
@@ -572,7 +572,7 @@ func TestE2E_FileToLaravel(t *testing.T) {
 			// The domain is alive/done (§7), the lease is finished.
 			st := httpDomainState(t, env.pool, id)
 			if st.status != model.StatusAlive {
-				t.Errorf("%s: status = %s, хочу alive", name, st.status)
+				t.Errorf("%s: status = %s, want alive", name, st.status)
 			}
 			if st.checkState != int16(model.CheckStateDone) || st.queuedAt != nil || st.tempAttempts != 0 {
 				t.Errorf("%s: check_state=%d queued_at=%v temp_attempts=%d",
@@ -583,44 +583,44 @@ func TestE2E_FileToLaravel(t *testing.T) {
 			// variant 0 https row (spec 5.5 item 5), the content is stored.
 			rows := httpRows(t, env.pool, id)
 			if len(rows) != 1 {
-				t.Fatalf("%s: строк subdomain_results = %d, хочу 1", name, len(rows))
+				t.Fatalf("%s: subdomain_results rows = %d, want 1", name, len(rows))
 			}
 			r := rows[0]
 			if r.subdomainID != 0 || r.variant != int16(model.VariantMain) || r.scheme != int16(model.SchemeHTTPS) {
-				t.Errorf("%s: строка %d/%d/%d, хочу апекс/0/https", name, r.subdomainID, r.variant, r.scheme)
+				t.Errorf("%s: row %d/%d/%d, want apex/0/https", name, r.subdomainID, r.variant, r.scheme)
 			}
 			if r.httpStatus != 200 || r.finalURL != "https://"+name+"/" || r.errCode != nil {
-				t.Errorf("%s: статус/URL/ошибка = %d/%q/%v", name, r.httpStatus, r.finalURL, r.errCode)
+				t.Errorf("%s: status/URL/error = %d/%q/%v", name, r.httpStatus, r.finalURL, r.errCode)
 			}
 			if r.aliasKind != int16(model.AliasNone) || r.aliasSubdomain != nil {
-				t.Errorf("%s: алиас = %d/%v, хочу нет", name, r.aliasKind, r.aliasSubdomain)
+				t.Errorf("%s: alias = %d/%v, want none", name, r.aliasKind, r.aliasSubdomain)
 			}
 			if len(r.contentHash) != 16 {
-				t.Fatalf("%s: content_hash = %d байт, хочу 16", name, len(r.contentHash))
+				t.Fatalf("%s: content_hash = %d bytes, want 16", name, len(r.contentHash))
 			}
 			body, err := env.store.Get(ctx, e2eHash(r.contentHash))
 			if err != nil {
-				t.Fatalf("%s: чтение контента из хранилища: %v", name, err)
+				t.Fatalf("%s: reading the content from the store: %v", name, err)
 			}
 			if !strings.Contains(string(body), s.title) {
-				t.Errorf("%s: контент без маркера %q: %.80q", name, s.title, body)
+				t.Errorf("%s: the content without the marker %q: %.80q", name, s.title, body)
 			}
 		}
 
 		// Publishing to q:analyze — one Result per subdomain×variant row
 		// (T-058); non-SPA samples do not create render tasks (T-066).
 		if n := streamLen(t, env.rdb, queue.StreamAnalyze); n != int64(len(e2eSamples)) {
-			t.Errorf("записей в q:analyze: %d, хочу %d", n, len(e2eSamples))
+			t.Errorf("entries in q:analyze: %d, want %d", n, len(e2eSamples))
 		}
 		if n := streamLen(t, env.rdb, queue.StreamRender); n != 0 {
-			t.Errorf("записей в q:render: %d, хочу 0 (образцы без SPA-оболочек)", n)
+			t.Errorf("entries in q:render: %d, want 0 (the samples without SPA shells)", n)
 		}
 	})
 
 	t.Run("analyzer: q:analyze → laravel_findings/laravel_domains", func(t *testing.T) {
 		msgs := consumeTasks(t, env.q, queue.StreamAnalyze, e2eAnalyzeGroup, "e2e", 10)
 		if len(msgs) != len(e2eSamples) {
-			t.Fatalf("доставок q:analyze: %d, хочу %d", len(msgs), len(e2eSamples))
+			t.Fatalf("q:analyze deliveries: %d, want %d", len(msgs), len(e2eSamples))
 		}
 		for _, d := range msgs {
 			err := queue.Processing(ctx, env.q, e2eAnalyzeGroup, d,
@@ -634,18 +634,18 @@ func TestE2E_FileToLaravel(t *testing.T) {
 						return err
 					}
 					if !processed {
-						return fmt.Errorf("строка %d/%d/%d/%d не найдена или перезаписана — результат HTTP-этапа не записан",
+						return fmt.Errorf("row %d/%d/%d/%d not found or overwritten — the HTTP stage's result not recorded",
 							res.ZoneID, res.DomainID, res.SubdomainID, int16(res.Variant))
 					}
 					return nil
 				})
 			if err != nil {
-				t.Fatalf("анализ: %v", err)
+				t.Fatalf("analyze: %v", err)
 			}
 		}
 	})
 
-	t.Run("laravel_*: список, субдомены, диапазон, признаки (§11.4 п. 5)", func(t *testing.T) {
+	t.Run("laravel_*: the list, the subdomains, the range, the signs (§11.4 item 5)", func(t *testing.T) {
 		// The list of Laravel domains — a select from laravel_domains (the
 		// §13.1 threshold: only confident hits).
 		rows, err := env.pool.Query(ctx, `
@@ -653,19 +653,19 @@ func TestE2E_FileToLaravel(t *testing.T) {
 			JOIN domains AS d ON d.zone_id = ld.zone_id AND d.id = ld.domain_id
 			WHERE d.zone_id = $1 ORDER BY d.label`, zoneID)
 		if err != nil {
-			t.Fatalf("список доменов с Laravel: %v", err)
+			t.Fatalf("the list of Laravel domains: %v", err)
 		}
 		defer rows.Close()
 		var withLaravel []string
 		for rows.Next() {
 			var label string
 			if err := rows.Scan(&label); err != nil {
-				t.Fatalf("чтение списка: %v", err)
+				t.Fatalf("reading the list: %v", err)
 			}
 			withLaravel = append(withLaravel, label)
 		}
 		if err := rows.Err(); err != nil {
-			t.Fatalf("список доменов с Laravel: %v", err)
+			t.Fatalf("the list of Laravel domains: %v", err)
 		}
 		var want []string
 		for _, s := range e2eSamples {
@@ -674,7 +674,7 @@ func TestE2E_FileToLaravel(t *testing.T) {
 			}
 		}
 		if len(withLaravel) != len(want) {
-			t.Errorf("домены с Laravel = %v, хочу %v", withLaravel, want)
+			t.Errorf("Laravel domains = %v, want %v", withLaravel, want)
 		} else {
 			for _, label := range want {
 				found := false
@@ -685,7 +685,7 @@ func TestE2E_FileToLaravel(t *testing.T) {
 					}
 				}
 				if !found {
-					t.Errorf("в списке доменов с Laravel нет %s (получено %v)", label, withLaravel)
+					t.Errorf("%s missing from the list of Laravel domains (got %v)", label, withLaravel)
 				}
 			}
 		}
@@ -699,7 +699,7 @@ func TestE2E_FileToLaravel(t *testing.T) {
 				JOIN domains AS d ON d.zone_id = h.zone_id AND d.id = h.domain_id
 				WHERE h.zone_id = $1 ORDER BY d.label`, zoneID)
 			if err != nil {
-				t.Fatalf("чтение laravel_history: %v", err)
+				t.Fatalf("reading laravel_history: %v", err)
 			}
 			defer rows.Close()
 			type histRow struct {
@@ -710,19 +710,19 @@ func TestE2E_FileToLaravel(t *testing.T) {
 			for rows.Next() {
 				var h histRow
 				if err := rows.Scan(&h.label, &h.appeared); err != nil {
-					t.Fatalf("строка laravel_history: %v", err)
+					t.Fatalf("a laravel_history row: %v", err)
 				}
 				hist = append(hist, h)
 			}
 			if err := rows.Err(); err != nil {
-				t.Fatalf("чтение laravel_history: %v", err)
+				t.Fatalf("reading laravel_history: %v", err)
 			}
 			if len(hist) != len(want) {
-				t.Fatalf("laravel_history = %d записей, хочу %d (по одной appeared на Laravel-домен)", len(hist), len(want))
+				t.Fatalf("laravel_history = %d entries, want %d (one appeared per Laravel domain)", len(hist), len(want))
 			}
 			for _, h := range hist {
 				if !h.appeared {
-					t.Errorf("laravel_history %s: appeared=false, хочу true (потерь в цикле нет)", h.label)
+					t.Errorf("laravel_history %s: appeared=false, want true (no losses in the cycle)", h.label)
 				}
 			}
 		}
@@ -748,47 +748,47 @@ func TestE2E_FileToLaravel(t *testing.T) {
 				SELECT subdomain_id, variant, score, ver_min, ver_max, is_laravel, signals::text, rules_version
 				FROM laravel_findings WHERE zone_id = $1 AND domain_id = $2`, zoneID, id)
 			if err != nil {
-				t.Fatalf("%s: чтение laravel_findings: %v", name, err)
+				t.Fatalf("%s: reading laravel_findings: %v", name, err)
 			}
 			var findings []e2eFinding
 			for frows.Next() {
 				var f e2eFinding
 				if err := frows.Scan(&f.sub, &f.variant, &f.score, &f.verMin, &f.verMax,
 					&f.isLaravel, &f.signals, &f.rulesVersion); err != nil {
-					t.Fatalf("%s: строка laravel_findings: %v", name, err)
+					t.Fatalf("%s: a laravel_findings row: %v", name, err)
 				}
 				findings = append(findings, f)
 			}
 			if err := frows.Err(); err != nil {
-				t.Fatalf("%s: чтение laravel_findings: %v", name, err)
+				t.Fatalf("%s: reading laravel_findings: %v", name, err)
 			}
 			frows.Close()
 			if len(s.rules) == 0 {
 				if len(findings) != 0 {
-					t.Errorf("%s: негативный образец без срабатываний, findings = %d строк", name, len(findings))
+					t.Errorf("%s: a negative sample without hits, findings = %d rows", name, len(findings))
 				}
 			} else {
 				if len(findings) != 1 {
-					t.Fatalf("%s: findings = %d строк, хочу 1 (апекс, variant 0)", name, len(findings))
+					t.Fatalf("%s: findings = %d rows, want 1 (the apex, variant 0)", name, len(findings))
 				}
 				f := findings[0]
 				if f.sub != 0 || f.variant != int16(model.VariantMain) {
-					t.Errorf("%s: срабатывание субдомена/варианта %d/%d, хочу 0/0 (апекс, variant 0)", name, f.sub, f.variant)
+					t.Errorf("%s: the hit's subdomain/variant %d/%d, want 0/0 (the apex, variant 0)", name, f.sub, f.variant)
 				}
 				if f.rulesVersion != env.rules.Version {
-					t.Errorf("%s: rules_version срабатывания = %d, хочу %d (версия набора)", name, f.rulesVersion, env.rules.Version)
+					t.Errorf("%s: the hit's rules_version = %d, want %d (the set version)", name, f.rulesVersion, env.rules.Version)
 				}
 				if math.Abs(float64(f.score)-s.score) > e2eScoreTolerance {
-					t.Errorf("%s: score = %.4f, хочу ≈%.3f", name, f.score, s.score)
+					t.Errorf("%s: score = %.4f, want ≈%.3f", name, f.score, s.score)
 				}
 				if got := e2eStr(f.verMin); got != s.verMin {
-					t.Errorf("%s: ver_min = %q, хочу %q", name, got, s.verMin)
+					t.Errorf("%s: ver_min = %q, want %q", name, got, s.verMin)
 				}
 				if got := e2eStr(f.verMax); got != s.verMax {
-					t.Errorf("%s: ver_max = %q, хочу %q", name, got, s.verMax)
+					t.Errorf("%s: ver_max = %q, want %q", name, got, s.verMax)
 				}
 				if f.isLaravel != s.isLaravel {
-					t.Errorf("%s: is_laravel = %v, хочу %v (порог 0.6)", name, f.isLaravel, s.isLaravel)
+					t.Errorf("%s: is_laravel = %v, want %v (the 0.6 threshold)", name, f.isLaravel, s.isLaravel)
 				}
 				var sigs []e2eSignal
 				if err := json.Unmarshal([]byte(f.signals), &sigs); err != nil {
@@ -799,11 +799,11 @@ func TestE2E_FileToLaravel(t *testing.T) {
 					gotRules[sig.Rule] = true
 				}
 				if len(gotRules) != len(s.rules) {
-					t.Errorf("%s: срабатываний %v, хочу %v", name, gotRules, s.rules)
+					t.Errorf("%s: hits %v, want %v", name, gotRules, s.rules)
 				}
 				for _, r := range s.rules {
 					if !gotRules[r] {
-						t.Errorf("%s: срабатывание %s отсутствует (признаки = %v)", name, r, gotRules)
+						t.Errorf("%s: the hit %s missing (the signs = %v)", name, r, gotRules)
 					}
 				}
 			}
@@ -825,27 +825,27 @@ func TestE2E_FileToLaravel(t *testing.T) {
 			).Scan(&aggScore, &aggMin, &aggMax, &aggMask, &aggVer)
 			if !s.isLaravel {
 				if !errors.Is(err, pgx.ErrNoRows) {
-					t.Errorf("%s: негативный образец: чтение laravel_domains = %v, хочу отсутствие строки (ErrNoRows)", name, err)
+					t.Errorf("%s: a negative sample: reading laravel_domains = %v, want no row (ErrNoRows)", name, err)
 				}
 				continue
 			}
 			if err != nil {
-				t.Fatalf("%s: чтение laravel_domains: %v", name, err)
+				t.Fatalf("%s: reading laravel_domains: %v", name, err)
 			}
 			if math.Abs(float64(aggScore)-s.score) > e2eScoreTolerance {
-				t.Errorf("%s: агрегат score = %.4f, хочу ≈%.3f", name, aggScore, s.score)
+				t.Errorf("%s: the aggregate score = %.4f, want ≈%.3f", name, aggScore, s.score)
 			}
 			if got := e2eStr(aggMin); got != s.verMin {
-				t.Errorf("%s: агрегат ver_min = %q, хочу %q", name, got, s.verMin)
+				t.Errorf("%s: the aggregate ver_min = %q, want %q", name, got, s.verMin)
 			}
 			if got := e2eStr(aggMax); got != s.verMax {
-				t.Errorf("%s: агрегат ver_max = %q, хочу %q", name, got, s.verMax)
+				t.Errorf("%s: the aggregate ver_max = %q, want %q", name, got, s.verMax)
 			}
 			if aggMask != 0b1 {
-				t.Errorf("%s: found_on_mask = %b, хочу бит 0 (апекс)", name, aggMask)
+				t.Errorf("%s: found_on_mask = %b, want bit 0 (the apex)", name, aggMask)
 			}
 			if aggVer != env.rules.Version {
-				t.Errorf("%s: rules_version = %d, хочу %d (версия набора)", name, aggVer, env.rules.Version)
+				t.Errorf("%s: rules_version = %d, want %d (the set version)", name, aggVer, env.rules.Version)
 			}
 		}
 
@@ -855,10 +855,10 @@ func TestE2E_FileToLaravel(t *testing.T) {
 		if err := env.pool.QueryRow(ctx,
 			"SELECT count(*) FROM subdomain_results WHERE rules_version IS DISTINCT FROM $1",
 			env.rules.Version).Scan(&untagged); err != nil {
-			t.Fatalf("подсчёт нештампованных строк: %v", err)
+			t.Fatalf("counting the unstamped rows: %v", err)
 		}
 		if untagged != 0 {
-			t.Errorf("строк без rules_version текущего набора: %d, хочу 0", untagged)
+			t.Errorf("rows without the current set's rules_version: %d, want 0", untagged)
 		}
 	})
 }
@@ -877,7 +877,7 @@ func (e *e2eEnv) domainByLabel(t *testing.T, zone, label string) (domainState, b
 		return d, false
 	}
 	if err != nil {
-		t.Fatalf("чтение домена %s.%s: %v", label, zone, err)
+		t.Fatalf("reading %s.%s: %v", label, zone, err)
 	}
 	return d, true
 }
@@ -890,7 +890,7 @@ func (e *e2eEnv) domainID(t *testing.T, zoneID int16, label string) int64 {
 	if err := e.pool.QueryRow(context.Background(),
 		"SELECT id FROM domains WHERE zone_id = $1 AND label = $2", zoneID, label,
 	).Scan(&id); err != nil {
-		t.Fatalf("домен %s: %v", label, err)
+		t.Fatalf("domain %s: %v", label, err)
 	}
 	return id
 }

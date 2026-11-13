@@ -38,7 +38,7 @@ const (
 func skipUnlessIntegration(t *testing.T) {
 	t.Helper()
 	if os.Getenv("CRAWLER_INTEGRATION") != "1" {
-		t.Skip("интеграционные тесты: запустите make test-integration")
+		t.Skip("integration tests: run make test-integration")
 	}
 }
 
@@ -51,7 +51,7 @@ func dnsQuery(t *testing.T, name string, qtype uint16) *dns.Msg {
 	m.RecursionDesired = true
 	resp, err := dns.Exchange(m, unboundAddr)
 	if err != nil {
-		t.Fatalf("DNS-запрос %s: %v", name, err)
+		t.Fatalf("DNS query %s: %v", name, err)
 	}
 	return resp
 }
@@ -69,13 +69,13 @@ func aRecord(t *testing.T, msg *dns.Msg) string {
 func TestDNS_TestbedScenarios(t *testing.T) {
 	skipUnlessIntegration(t)
 
-	t.Run("обычный A", func(t *testing.T) {
+	t.Run("a regular A", func(t *testing.T) {
 		if got := aRecord(t, dnsQuery(t, "same-site.crawl.test", dns.TypeA)); got != testwebIP {
 			t.Errorf("same-site.crawl.test = %q, want %s", got, testwebIP)
 		}
 	})
 
-	t.Run("NXDOMAIN апекса", func(t *testing.T) {
+	t.Run("the apex NXDOMAIN", func(t *testing.T) {
 		if rcode := dnsQuery(t, "nxdomain-case.crawl.test", dns.TypeA).Rcode; rcode != dns.RcodeNameError {
 			t.Errorf("rcode = %d (%s), want NXDOMAIN", rcode, dns.RcodeToString[rcode])
 		}
@@ -90,17 +90,17 @@ func TestDNS_TestbedScenarios(t *testing.T) {
 	t.Run("wildcard", func(t *testing.T) {
 		name := fmt.Sprintf("rnd%d.wildcard.crawl.test", time.Now().UnixNano()%100000)
 		if got := aRecord(t, dnsQuery(t, name, dns.TypeA)); got != testwebIP {
-			t.Errorf("случайная метка %s = %q, want %s (wildcard)", name, got, testwebIP)
+			t.Errorf("the random label %s = %q, want %s (wildcard)", name, got, testwebIP)
 		}
 	})
 
-	t.Run("CNAME-цепочка разворачивается", func(t *testing.T) {
+	t.Run("a CNAME chain unfolds", func(t *testing.T) {
 		if got := aRecord(t, dnsQuery(t, "cname-chain.crawl.test", dns.TypeA)); got != testwebIP {
 			t.Errorf("cname-chain = %q, want %s", got, testwebIP)
 		}
 	})
 
-	t.Run("зацикленный CNAME не подвешивает резолвер", func(t *testing.T) {
+	t.Run("a looping CNAME does not hang the resolver", func(t *testing.T) {
 		m := new(dns.Msg)
 		m.SetQuestion(dns.Fqdn("cname-loop.crawl.test"), dns.TypeA)
 		m.RecursionDesired = true
@@ -108,7 +108,7 @@ func TestDNS_TestbedScenarios(t *testing.T) {
 		go func() {
 			resp, err := dns.Exchange(m, unboundAddr)
 			if err != nil {
-				t.Errorf("запрос cname-loop: %v", err)
+				t.Errorf("the cname-loop query: %v", err)
 				done <- nil
 				return
 			}
@@ -117,27 +117,27 @@ func TestDNS_TestbedScenarios(t *testing.T) {
 		select {
 		case <-done:
 		case <-time.After(15 * time.Second):
-			t.Fatal("резолвер завис на циклическом CNAME")
+			t.Fatal("the resolver hung on a cyclic CNAME")
 		}
 	})
 
-	t.Run("delegated без адресов — NODATA", func(t *testing.T) {
+	t.Run("delegated without addresses — NODATA", func(t *testing.T) {
 		resp := dnsQuery(t, "www.delegated-no-address.crawl.test", dns.TypeA)
 		if resp.Rcode != dns.RcodeSuccess {
 			t.Fatalf("rcode = %s, want NOERROR", dns.RcodeToString[resp.Rcode])
 		}
 		if len(resp.Answer) != 0 {
-			t.Errorf("ожидались пустые ответы (NODATA), получено %d", len(resp.Answer))
+			t.Errorf("empty answers expected (NODATA), got %d", len(resp.Answer))
 		}
 	})
 
-	t.Run("закрытые порты — адрес чёрной дыры", func(t *testing.T) {
+	t.Run("closed ports — the black hole address", func(t *testing.T) {
 		if got := aRecord(t, dnsQuery(t, "closed-ports.crawl.test", dns.TypeA)); got != "172.28.100.250" {
 			t.Errorf("closed-ports = %q, want 172.28.100.250", got)
 		}
 	})
 
-	t.Run("составная зона co.test", func(t *testing.T) {
+	t.Run("the composite zone co.test", func(t *testing.T) {
 		for _, name := range []string{"example.co.test", "www.example.co.test", "shop.co.test"} {
 			if got := aRecord(t, dnsQuery(t, name, dns.TypeA)); got != testwebIP {
 				t.Errorf("%s = %q, want %s", name, got, testwebIP)
@@ -145,7 +145,7 @@ func TestDNS_TestbedScenarios(t *testing.T) {
 		}
 	})
 
-	t.Run("IDN-домен в punycode", func(t *testing.T) {
+	t.Run("an IDN domain in punycode", func(t *testing.T) {
 		ascii, err := idna.Lookup.ToASCII("сайт.проверка.test")
 		if err != nil {
 			t.Fatal(err)
@@ -155,7 +155,7 @@ func TestDNS_TestbedScenarios(t *testing.T) {
 		}
 	})
 
-	t.Run("вторая зона", func(t *testing.T) {
+	t.Run("the second zone", func(t *testing.T) {
 		if got := aRecord(t, dnsQuery(t, "alpha.crawl2.test", dns.TypeA)); got != testwebIP {
 			t.Errorf("alpha.crawl2.test = %q, want %s", got, testwebIP)
 		}
@@ -172,7 +172,7 @@ func TestDNS_NoInternetInTestbed(t *testing.T) {
 			resp := dnsQuery(t, name, qtype)
 			resolved := resp.Rcode == dns.RcodeSuccess && len(resp.Answer) > 0
 			if resolved {
-				t.Errorf("%s %s: внешний домен резолвится (rcode=%s, answers=%d) — изоляция нарушена",
+				t.Errorf("%s %s: an external domain resolves (rcode=%s, answers=%d) — the isolation broken",
 					dns.TypeToString[qtype], name, dns.RcodeToString[resp.Rcode], len(resp.Answer))
 			}
 		}
@@ -210,7 +210,7 @@ func getBody(t *testing.T, c *http.Client, rawURL string) (int, string) {
 	defer func() { _ = resp.Body.Close() }()
 	b, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		t.Fatalf("чтение тела %s: %v", rawURL, err)
+		t.Fatalf("reading the %s body: %v", rawURL, err)
 	}
 	return resp.StatusCode, string(b)
 }
@@ -219,7 +219,7 @@ func TestHTTP_TestwebScenarios(t *testing.T) {
 	skipUnlessIntegration(t)
 	c := clientTo(testwebIP, true, nil)
 
-	t.Run("http→https редирект ведёт на один сайт", func(t *testing.T) {
+	t.Run("the http→https redirect leads to one site", func(t *testing.T) {
 		client := clientTo(testwebIP, true, nil)
 		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 			if len(via) >= 10 {
@@ -233,31 +233,31 @@ func TestHTTP_TestwebScenarios(t *testing.T) {
 		}
 		defer func() { _ = resp.Body.Close() }()
 		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("итоговый статус = %d, want 200", resp.StatusCode)
+			t.Fatalf("the final status = %d, want 200", resp.StatusCode)
 		}
 		if !strings.HasPrefix(resp.Request.URL.String(), "https://same-site.crawl.test") {
-			t.Errorf("итоговый URL = %s, want https://same-site...", resp.Request.URL)
+			t.Errorf("the final URL = %s, want https://same-site...", resp.Request.URL)
 		}
 	})
 
-	t.Run("http и https — разные сайты", func(t *testing.T) {
+	t.Run("http and https — different sites", func(t *testing.T) {
 		_, httpBody := getBody(t, c, "http://different-sites.crawl.test/")
 		_, httpsBody := getBody(t, c, "https://different-sites.crawl.test/")
 		if httpBody == httpsBody {
-			t.Error("контент http и https совпадает — сценарий different-sites сломан")
+			t.Error("the http and https content matches — the different-sites scenario broken")
 		}
 	})
 
-	t.Run("только http и только https", func(t *testing.T) {
+	t.Run("http-only and https-only", func(t *testing.T) {
 		if code, _ := getBody(t, c, "http://http-only.crawl.test/"); code != 200 {
-			t.Errorf("http-only по http = %d, want 200", code)
+			t.Errorf("http-only over http = %d, want 200", code)
 		}
 		if code, _ := getBody(t, c, "https://https-only.crawl.test/"); code != 200 {
-			t.Errorf("https-only по https = %d, want 200", code)
+			t.Errorf("https-only over https = %d, want 200", code)
 		}
 	})
 
-	t.Run("цепочка редиректов доходит до финала", func(t *testing.T) {
+	t.Run("the redirect chain reaches the final", func(t *testing.T) {
 		client := clientTo(testwebIP, true, nil)
 		resp, err := client.Get("http://redirect-chain.crawl.test/")
 		if err != nil {
@@ -265,18 +265,18 @@ func TestHTTP_TestwebScenarios(t *testing.T) {
 		}
 		defer func() { _ = resp.Body.Close() }()
 		if resp.StatusCode != 200 || !strings.HasSuffix(resp.Request.URL.Path, "/final.html") {
-			t.Errorf("итог = %d %s, want 200 .../final.html", resp.StatusCode, resp.Request.URL)
+			t.Errorf("the outcome = %d %s, want 200 .../final.html", resp.StatusCode, resp.Request.URL)
 		}
 	})
 
-	t.Run("meta refresh на месте", func(t *testing.T) {
+	t.Run("the meta refresh in place", func(t *testing.T) {
 		_, body := getBody(t, c, "http://meta-refresh.crawl.test/")
 		if !strings.Contains(body, `http-equiv="refresh"`) {
-			t.Error("на странице нет meta refresh")
+			t.Error("the page has no meta refresh")
 		}
 	})
 
-	t.Run("bare→www редирект", func(t *testing.T) {
+	t.Run("the bare→www redirect", func(t *testing.T) {
 		client := &http.Client{Transport: c.Transport.(*http.Transport)} //nolint:forcetypeassert // our transport
 		client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 		resp, err := client.Get("http://bare-to-www.crawl.test/")
@@ -285,42 +285,42 @@ func TestHTTP_TestwebScenarios(t *testing.T) {
 		}
 		defer func() { _ = resp.Body.Close() }()
 		if resp.StatusCode != 301 {
-			t.Fatalf("статус = %d, want 301 (Caddy permanent)", resp.StatusCode)
+			t.Fatalf("status = %d, want 301 (Caddy permanent)", resp.StatusCode)
 		}
 		if loc := resp.Header.Get("Location"); !strings.HasPrefix(loc, "https://www.bare-to-www.crawl.test") {
 			t.Errorf("Location = %q, want https://www.bare-to-www...", loc)
 		}
 	})
 
-	t.Run("www и bare одинаковы без редиректа", func(t *testing.T) {
+	t.Run("www and bare identical without a redirect", func(t *testing.T) {
 		codeA, bodyA := getBody(t, c, "http://equal-pair.crawl.test/")
 		codeW, bodyW := getBody(t, c, "http://www.equal-pair.crawl.test/")
 		if codeA != 200 || codeW != 200 {
-			t.Fatalf("статусы: apex=%d www=%d, want 200/200", codeA, codeW)
+			t.Fatalf("statuses: apex=%d www=%d, want 200/200", codeA, codeW)
 		}
 		if bodyA != bodyW {
-			t.Error("контент apex и www должен совпадать (alias_kind = 1)")
+			t.Error("the apex and www content must match (alias_kind = 1)")
 		}
 	})
 
-	t.Run("парковки идентичны — дедупликация по хэшу", func(t *testing.T) {
+	t.Run("parked pages identical — dedup by hash", func(t *testing.T) {
 		_, b1 := getBody(t, c, "http://parked-1.crawl.test/")
 		_, b2 := getBody(t, c, "http://parked-2.crawl.test/")
 		if b1 != b2 {
-			t.Error("контент parked-1 и parked-2 должен быть побайтово одинаков")
+			t.Error("the parked-1 and parked-2 content must be byte-identical")
 		}
 	})
 
-	t.Run("SPA-оболочка", func(t *testing.T) {
+	t.Run("the SPA shell", func(t *testing.T) {
 		_, body := getBody(t, c, "https://spa-shell.crawl.test/")
 		for _, marker := range []string{`id="root"`, "<noscript>", "document.cookie"} {
 			if !strings.Contains(body, marker) {
-				t.Errorf("SPA-фикстура без маркера %q", marker)
+				t.Errorf("the SPA fixture without the marker %q", marker)
 			}
 		}
 	})
 
-	t.Run("образцы Laravel отдаются с заголовками", func(t *testing.T) {
+	t.Run("the Laravel samples served with headers", func(t *testing.T) {
 		client := clientTo(testwebIP, true, nil)
 		resp, err := client.Get("https://laravel-11-vite.crawl.test/")
 		if err != nil {
@@ -328,10 +328,10 @@ func TestHTTP_TestwebScenarios(t *testing.T) {
 		}
 		defer func() { _ = resp.Body.Close() }()
 		if resp.StatusCode != 200 {
-			t.Fatalf("статус = %d", resp.StatusCode)
+			t.Fatalf("status = %d", resp.StatusCode)
 		}
 		if len(resp.Cookies()) == 0 {
-			t.Error("у образца laravel-11-vite должны проставляться cookies из headers.json")
+			t.Error("the laravel-11-vite sample must get the cookies from headers.json")
 		}
 		found := false
 		for _, ck := range resp.Cookies() {
@@ -340,7 +340,7 @@ func TestHTTP_TestwebScenarios(t *testing.T) {
 			}
 		}
 		if !found {
-			t.Error("cookie XSRF-TOKEN не выставлена")
+			t.Error("the XSRF-TOKEN cookie not set")
 		}
 	})
 }
@@ -349,51 +349,51 @@ func TestHTTP_MockserverEvil(t *testing.T) {
 	skipUnlessIntegration(t)
 	base := "http://" + mockserverIP
 
-	t.Run("тарпит обрывается по таймауту", func(t *testing.T) {
+	t.Run("the tarpit breaks on timeout", func(t *testing.T) {
 		client := clientTo(mockserverIP, true, nil)
 		client.Timeout = 3 * time.Second
 		resp, err := client.Get(base + "/tarpit")
 		if err != nil {
-			t.Fatalf("запрос к тарпиту: %v", err)
+			t.Fatalf("the tarpit query: %v", err)
 		}
 		_, err = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
 		if err == nil {
-			t.Error("чтение бесконечного тела должно было прерваться по таймауту")
+			t.Error("reading the infinite body must have broken by timeout")
 		}
 	})
 
-	t.Run("медленные заголовки дают header timeout", func(t *testing.T) {
+	t.Run("slow headers give a header timeout", func(t *testing.T) {
 		client := clientTo(mockserverIP, true, func(tr *http.Transport) {
 			tr.ResponseHeaderTimeout = 2 * time.Second
 		})
 		_, err := client.Get(base + "/slow?delay=30s")
 		if err == nil {
-			t.Error("ожидался header timeout на /slow")
+			t.Error("a header timeout expected on /slow")
 		}
 	})
 
-	t.Run("бесконечный редирект упирается в лимит", func(t *testing.T) {
+	t.Run("an infinite redirect hits the limit", func(t *testing.T) {
 		client := clientTo(mockserverIP, true, nil)
 		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 			if len(via) >= 10 {
-				return fmt.Errorf("остановлено после %d редиректов: %w", len(via), http.ErrUseLastResponse)
+				return fmt.Errorf("stopped after %d redirects: %w", len(via), http.ErrUseLastResponse)
 			}
 			return nil
 		}
 		resp, err := client.Get(base + "/redirect/infinite")
 		if err == nil {
 			_ = resp.Body.Close()
-			t.Fatal("редиректы не должны были закончиться")
+			t.Fatal("the redirects must not have ended")
 		}
 	})
 
-	t.Run("циклический редирект обнаруживается", func(t *testing.T) {
+	t.Run("a cyclic redirect detected", func(t *testing.T) {
 		client := clientTo(mockserverIP, true, nil)
 		seen := map[string]bool{}
 		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 			if seen[req.URL.String()] {
-				return errors.New("цикл редиректов")
+				return errors.New("the redirect loop")
 			}
 			seen[req.URL.String()] = true
 			if len(via) >= 10 {
@@ -403,11 +403,11 @@ func TestHTTP_MockserverEvil(t *testing.T) {
 		}
 		_, err := client.Get(base + "/redirect/cycle/a")
 		if err == nil {
-			t.Error("ожидался детект цикла /a→/b→/a")
+			t.Error("the /a→/b→/a cycle detection expected")
 		}
 	})
 
-	t.Run("обрыв соединения посреди тела", func(t *testing.T) {
+	t.Run("a connection break in the middle of the body", func(t *testing.T) {
 		client := clientTo(mockserverIP, true, nil)
 		resp, err := client.Get(base + "/truncate")
 		if err != nil {
@@ -416,11 +416,11 @@ func TestHTTP_MockserverEvil(t *testing.T) {
 		_, err = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
 		if err == nil {
-			t.Error("чтение должно было завершиться ошибкой (unexpected EOF)")
+			t.Error("the read must have ended with an error (unexpected EOF)")
 		}
 	})
 
-	t.Run("огромное тело читается не больше лимита", func(t *testing.T) {
+	t.Run("a huge body read no more than the limit", func(t *testing.T) {
 		client := clientTo(mockserverIP, true, nil)
 		resp, err := client.Get(base + "/huge")
 		if err != nil {
@@ -429,11 +429,11 @@ func TestHTTP_MockserverEvil(t *testing.T) {
 		n, err := io.Copy(io.Discard, io.LimitReader(resp.Body, 2<<20))
 		_ = resp.Body.Close()
 		if err != nil || n != 2<<20 {
-			t.Fatalf("прочитано %d байт (err=%v), want %d без ошибки", n, err, 2<<20)
+			t.Fatalf("read %d bytes (err=%v), want %d without an error", n, err, 2<<20)
 		}
 	})
 
-	t.Run("zip-бомба ограничивается при распаковке", func(t *testing.T) {
+	t.Run("a zip bomb limited on unpacking", func(t *testing.T) {
 		client := clientTo(mockserverIP, true, nil)
 		req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, base+"/zipbomb", nil)
 		req.Header.Set("Accept-Encoding", "gzip") // we take the raw gzip and decompress it ourselves
@@ -448,11 +448,11 @@ func TestHTTP_MockserverEvil(t *testing.T) {
 		n, err := io.Copy(io.Discard, io.LimitReader(zr, 2<<20))
 		_ = resp.Body.Close()
 		if err != nil || n != 2<<20 {
-			t.Fatalf("распаковано %d байт (err=%v), want %d без ошибки", n, err, 2<<20)
+			t.Fatalf("unpacked %d bytes (err=%v), want %d without an error", n, err, 2<<20)
 		}
 	})
 
-	t.Run("cookies Laravel выставляются", func(t *testing.T) {
+	t.Run("the Laravel cookies set", func(t *testing.T) {
 		client := clientTo(mockserverIP, true, nil)
 		resp, err := client.Get(base + "/cookies")
 		if err != nil {
@@ -464,7 +464,7 @@ func TestHTTP_MockserverEvil(t *testing.T) {
 			names[ck.Name] = true
 		}
 		if !names["XSRF-TOKEN"] || !names["laravel_session"] {
-			t.Errorf("cookies = %v, want XSRF-TOKEN и laravel_session", names)
+			t.Errorf("cookies = %v, want XSRF-TOKEN and laravel_session", names)
 		}
 	})
 }
@@ -491,14 +491,14 @@ func TestTLS_BadCertificates(t *testing.T) {
 	for _, host := range cases {
 		t.Run(host, func(t *testing.T) {
 			if _, err := fetch(host, false); err == nil {
-				t.Error("верификация должна была провалиться (сертификат невалиден)")
+				t.Error("the verification must have failed (the certificate invalid)")
 			}
 			resp, err := fetch(host, true)
 			if err != nil {
 				t.Fatalf("InsecureSkipVerify: %v", err)
 			}
 			if resp.TLS == nil || len(resp.TLS.PeerCertificates) == 0 {
-				t.Error("данные сертификата должны быть доступны")
+				t.Error("the certificate data must be available")
 			}
 		})
 	}
@@ -517,21 +517,21 @@ func TestInfra_Postgres(t *testing.T) {
 
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
-		t.Fatalf("подключение к PostgreSQL: %v", err)
+		t.Fatalf("PostgreSQL connection: %v", err)
 	}
 	defer pool.Close()
 
 	var ok bool
 	if err := pool.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'domains')").Scan(&ok); err != nil || !ok {
-		t.Fatalf("таблица domains отсутствует — миграции не применены (err=%v)", err)
+		t.Fatalf("the domains table missing — the migrations not applied (err=%v)", err)
 	}
 
 	var subdomains int
 	if err := pool.QueryRow(ctx, "SELECT count(*) FROM subdomains WHERE enabled").Scan(&subdomains); err != nil {
-		t.Fatalf("таблица subdomains: %v", err)
+		t.Fatalf("the subdomains table: %v", err)
 	}
 	if subdomains != 6 {
-		t.Errorf("включённых субдоменов = %d, want 6 (миграция 000001)", subdomains)
+		t.Errorf("enabled subdomains = %d, want 6 (migration 000001)", subdomains)
 	}
 
 	if _, err := pool.Exec(ctx, "SELECT 1"); err != nil {
@@ -543,7 +543,7 @@ func TestInfra_Redis(t *testing.T) {
 	skipUnlessIntegration(t)
 	conn, err := net.DialTimeout("tcp", redisAddr, 5*time.Second)
 	if err != nil {
-		t.Fatalf("подключение к Redis: %v", err)
+		t.Fatalf("Redis connection: %v", err)
 	}
 	defer func() { _ = conn.Close() }()
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
@@ -555,7 +555,7 @@ func TestInfra_Redis(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !strings.Contains(line, "PONG") {
-		t.Errorf("ответ Redis = %q, want +PONG", strings.TrimSpace(line))
+		t.Errorf("the Redis reply = %q, want +PONG", strings.TrimSpace(line))
 	}
 }
 
@@ -564,11 +564,11 @@ func TestChromium_CDP(t *testing.T) {
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Get(chromiumURL)
 	if err != nil {
-		t.Fatalf("CDP-эндпоинт chromium недоступен: %v", err)
+		t.Fatalf("the chromium CDP endpoint unavailable: %v", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode != 200 || !strings.Contains(string(body), "Browser") {
-		t.Errorf("ответ /json/version: %d %s", resp.StatusCode, string(body))
+		t.Errorf("the /json/version reply: %d %s", resp.StatusCode, string(body))
 	}
 }

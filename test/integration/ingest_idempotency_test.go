@@ -37,7 +37,7 @@ func (e *ingestEnv) domainSnapshot(t *testing.T) []string {
 		FROM domains AS d JOIN zones AS z ON z.id = d.zone_id
 		ORDER BY z.name, d.label`)
 	if err != nil {
-		t.Fatalf("снимок доменов: %v", err)
+		t.Fatalf("the domains snapshot: %v", err)
 	}
 	defer rows.Close()
 
@@ -46,13 +46,13 @@ func (e *ingestEnv) domainSnapshot(t *testing.T) []string {
 		var name, label, queued, checked string
 		var status, checkState, flags int16
 		if err := rows.Scan(&name, &label, &status, &checkState, &flags, &queued, &checked); err != nil {
-			t.Fatalf("снимок доменов: чтение: %v", err)
+			t.Fatalf("the domains snapshot: read: %v", err)
 		}
 		out = append(out, fmt.Sprintf("%s/%s status=%d check=%d flags=%d queued=%s checked=%s",
 			name, label, status, checkState, flags, queued, checked))
 	}
 	if err := rows.Err(); err != nil {
-		t.Fatalf("снимок доменов: %v", err)
+		t.Fatalf("the domains snapshot: %v", err)
 	}
 	return out
 }
@@ -63,7 +63,7 @@ func (e *ingestEnv) domainSnapshot(t *testing.T) []string {
 func (e *ingestEnv) dropJournal(t *testing.T) {
 	t.Helper()
 	if _, err := e.pool.Exec(context.Background(), "DELETE FROM ingest_files"); err != nil {
-		t.Fatalf("откат журнала ingest_files: %v", err)
+		t.Fatalf("rolling back the ingest_files journal: %v", err)
 	}
 }
 
@@ -73,14 +73,14 @@ func (e *ingestEnv) dropJournal(t *testing.T) {
 func (e *ingestEnv) assertStateUnchanged(t *testing.T, want []string, wantFiles int) {
 	t.Helper()
 	if got := e.domainSnapshot(t); !reflect.DeepEqual(got, want) {
-		t.Errorf("состояние доменов изменилось:\nполучено:\n%s\nwant:\n%s",
+		t.Errorf("the domains state changed:\ngot:\n%s\nwant:\n%s",
 			joinLines(got), joinLines(want))
 	}
 	if n := e.countOf(t, "ingest_stage"); n != 0 {
-		t.Errorf("строк в ingest_stage = %d, want 0 (партии покидают staging)", n)
+		t.Errorf("rows in ingest_stage = %d, want 0 (the batches leave staging)", n)
 	}
 	if n := e.countOf(t, "ingest_files"); n != wantFiles {
-		t.Errorf("записей в ingest_files = %d, want %d", n, wantFiles)
+		t.Errorf("entries in ingest_files = %d, want %d", n, wantFiles)
 	}
 }
 
@@ -109,24 +109,24 @@ func TestIngest_ReapplySameFileConverges(t *testing.T) {
 	// --- add: the first processing.
 	add := fileContent("example.crawl.test", "shop.crawl.test")
 	if out := env.process(t, "crawl.test/add/list.txt", add); out.Kind != ingest.OutcomeApplied {
-		t.Fatalf("add: итог = %q, want applied", out.Kind)
+		t.Fatalf("add: the outcome = %q, want applied", out.Kind)
 	}
 	afterAdd := env.domainSnapshot(t)
 	if len(afterAdd) != 2 {
-		t.Fatalf("доменов после add = %d, want 2", len(afterAdd))
+		t.Fatalf("domains after the add = %d, want 2", len(afterAdd))
 	}
 
 	// A failure in the application/report window: the journal is empty, the file is delivered again.
 	env.dropJournal(t)
 	out := env.process(t, "crawl.test/add/list.txt", add)
 	if out.Kind != ingest.OutcomeApplied {
-		t.Fatalf("повторный add: итог = %q, want applied (дубль по sha256 не находится — журнал пуст)", out.Kind)
+		t.Fatalf("the repeat add: the outcome = %q, want applied (a sha256 duplicate not found — the journal empty)", out.Kind)
 	}
 	// The reapplication is a no-op for the domains: the counters reflect
 	// the current state (everything "was already there"), not the first
 	// attempt.
 	if out.Report.Added != 0 || out.Report.Revived != 0 || out.Report.Existed != 2 {
-		t.Errorf("повторный add: added %d, revived %d, existed %d; want 0/0/2",
+		t.Errorf("the repeat add: added %d, revived %d, existed %d; want 0/0/2",
 			out.Report.Added, out.Report.Revived, out.Report.Existed)
 	}
 	env.assertStateUnchanged(t, afterAdd, 1)
@@ -134,7 +134,7 @@ func TestIngest_ReapplySameFileConverges(t *testing.T) {
 	// --- delete: the first processing (one domain exists, one does not).
 	del := fileContent("example.crawl.test", "ghost.crawl.test")
 	if out := env.process(t, "crawl.test/delete/x.txt", del); out.Kind != ingest.OutcomeApplied {
-		t.Fatalf("delete: итог = %q, want applied", out.Kind)
+		t.Fatalf("delete: the outcome = %q, want applied", out.Kind)
 	}
 	afterDelete := env.domainSnapshot(t)
 
@@ -144,10 +144,10 @@ func TestIngest_ReapplySameFileConverges(t *testing.T) {
 	env.dropJournal(t)
 	out = env.process(t, "crawl.test/delete/x.txt", del)
 	if out.Kind != ingest.OutcomeApplied {
-		t.Fatalf("повторный delete: итог = %q, want applied", out.Kind)
+		t.Fatalf("the repeat delete: the outcome = %q, want applied", out.Kind)
 	}
 	if out.Report.Deleted != 1 || out.Report.NotFound != 1 {
-		t.Errorf("повторный delete: deleted %d, not_found %d; want 1/1 (счётчики стабильны)",
+		t.Errorf("the repeat delete: deleted %d, not_found %d; want 1/1 (the counters stable)",
 			out.Report.Deleted, out.Report.NotFound)
 	}
 	env.assertStateUnchanged(t, afterDelete, 1)
@@ -164,55 +164,55 @@ func TestIngest_ReviveCycleIdempotent(t *testing.T) {
 
 	if out := env.process(t, "crawl.test/add/one.txt",
 		fileContent("example.crawl.test")); out.Kind != ingest.OutcomeApplied {
-		t.Fatalf("add: итог = %q, want applied", out.Kind)
+		t.Fatalf("add: the outcome = %q, want applied", out.Kind)
 	}
 
 	if out := env.process(t, "crawl.test/delete/x.txt",
-		fileContent("example.crawl.test", "# снятие")); out.Kind != ingest.OutcomeApplied {
-		t.Fatalf("delete: итог = %q, want applied", out.Kind)
+		fileContent("example.crawl.test", "# delete")); out.Kind != ingest.OutcomeApplied {
+		t.Fatalf("delete: the outcome = %q, want applied", out.Kind)
 	}
 	afterDelete := env.domainSnapshot(t)
 	d, ok := env.domain(t, "crawl.test", "example")
 	if !ok || d.status != int16(model.StatusDeleted) {
-		t.Fatalf("после delete: домен = %+v, want status deleted", d)
+		t.Fatalf("after the delete: domain = %+v, want status deleted", d)
 	}
 
 	// The revival: revived, new/pending, no lease.
 	out := env.process(t, "crawl.test/add/one.txt",
-		fileContent("example.crawl.test", "# возврат"))
+		fileContent("example.crawl.test", "# revival"))
 	if out.Kind != ingest.OutcomeApplied {
-		t.Fatalf("возврат: итог = %q, want applied", out.Kind)
+		t.Fatalf("the revival: the outcome = %q, want applied", out.Kind)
 	}
 	if out.Report.Added != 1 || out.Report.Revived != 1 || out.Report.Existed != 0 {
-		t.Errorf("возврат: added %d, revived %d, existed %d; want 1/1/0",
+		t.Errorf("the revival: added %d, revived %d, existed %d; want 1/1/0",
 			out.Report.Added, out.Report.Revived, out.Report.Existed)
 	}
 	d, ok = env.domain(t, "crawl.test", "example")
 	if !ok || d.status != int16(model.StatusNew) || d.checkState != int16(model.CheckStatePending) {
-		t.Fatalf("после возврата: домен = %+v, want new/pending", d)
+		t.Fatalf("after the revival: domain = %+v, want new/pending", d)
 	}
 	if d.queuedAt != nil {
-		t.Error("после возврата queued_at не сброшен")
+		t.Error("after the revival queued_at not cleared")
 	}
 	afterRevive := env.domainSnapshot(t)
 
 	// Re-adding the already revived domain — a no-op: the state is the
 	// same, the counters say "was already there".
 	out = env.process(t, "crawl.test/add/one.txt",
-		fileContent("example.crawl.test", "# снова"))
+		fileContent("example.crawl.test", "# again"))
 	if out.Kind != ingest.OutcomeApplied {
-		t.Fatalf("повторный add: итог = %q, want applied", out.Kind)
+		t.Fatalf("the repeat add: the outcome = %q, want applied", out.Kind)
 	}
 	if out.Report.Added != 0 || out.Report.Revived != 0 || out.Report.Existed != 1 {
-		t.Errorf("повторный add: added %d, revived %d, existed %d; want 0/0/1",
+		t.Errorf("the repeat add: added %d, revived %d, existed %d; want 0/0/1",
 			out.Report.Added, out.Report.Revived, out.Report.Existed)
 	}
 	env.assertStateUnchanged(t, afterRevive, 4)
 
 	// A repeated delete — the same state as after the first one.
 	if out := env.process(t, "crawl.test/delete/x.txt",
-		fileContent("example.crawl.test", "# повторное снятие")); out.Kind != ingest.OutcomeApplied {
-		t.Fatalf("повторное delete: итог = %q, want applied", out.Kind)
+		fileContent("example.crawl.test", "# delete again")); out.Kind != ingest.OutcomeApplied {
+		t.Fatalf("the repeat delete: the outcome = %q, want applied", out.Kind)
 	}
 	env.assertStateUnchanged(t, afterDelete, 5)
 }
@@ -229,34 +229,34 @@ func TestIngest_SameContentCrossActionApplied(t *testing.T) {
 
 	content := fileContent("example.crawl.test", "shop.crawl.test")
 	if out := env.process(t, "crawl.test/add/list.txt", content); out.Kind != ingest.OutcomeApplied {
-		t.Fatalf("add: итог = %q, want applied", out.Kind)
+		t.Fatalf("add: the outcome = %q, want applied", out.Kind)
 	}
 
 	// An undo with the same list: the action is different — there is no
 	// exact redelivery, the file is applied, the domains are deleted.
 	out := env.process(t, "crawl.test/delete/list.txt", content)
 	if out.Kind != ingest.OutcomeApplied {
-		t.Fatalf("тот же список из delete/: итог = %q, want applied (T-113: другое действие — не дубль)", out.Kind)
+		t.Fatalf("the same list from delete/: the outcome = %q, want applied (T-113: a different action is not a duplicate)", out.Kind)
 	}
 	if out.Report.Deleted != 2 {
-		t.Errorf("undo: deleted = %d, want 2 (оба домена списка)", out.Report.Deleted)
+		t.Errorf("undo: deleted = %d, want 2 (both domains of the list)", out.Report.Deleted)
 	}
 	for _, label := range []string{"example", "shop"} {
 		if d, ok := env.domain(t, "crawl.test", label); !ok || d.status != int16(model.StatusDeleted) {
-			t.Errorf("после undo: домен %s = %+v, want status deleted", label, d)
+			t.Errorf("after undo: domain %s = %+v, want status deleted", label, d)
 		}
 	}
 	if n := env.countOf(t, "ingest_files"); n != 2 {
-		t.Errorf("записей в ingest_files = %d, want 2 (add и undo-delete)", n)
+		t.Errorf("entries in ingest_files = %d, want 2 (the add and the undo-delete)", n)
 	}
 
 	// An exact redelivery of the add file with the same content — a
 	// duplicate: no application happens, the journal does not grow.
 	if out := env.process(t, "crawl.test/add/list.txt", content); out.Kind != ingest.OutcomeDuplicate {
-		t.Fatalf("повторный add тем же содержимым: итог = %q, want duplicate", out.Kind)
+		t.Fatalf("the repeat add with the same content: the outcome = %q, want duplicate", out.Kind)
 	}
 	if n := env.countOf(t, "ingest_files"); n != 2 {
-		t.Errorf("записей в ingest_files = %d, want 2 (дубль не отчётится)", n)
+		t.Errorf("entries in ingest_files = %d, want 2 (the duplicate not journaled)", n)
 	}
 }
 
@@ -273,7 +273,7 @@ func TestIngest_CleanupIdempotent(t *testing.T) {
 
 	if out := env.process(t, "crawl.test/add/list.txt",
 		fileContent("a.crawl.test", "b.crawl.test", "c.crawl.test")); out.Kind != ingest.OutcomeApplied {
-		t.Fatalf("add: итог = %q, want applied", out.Kind)
+		t.Fatalf("add: the outcome = %q, want applied", out.Kind)
 	}
 
 	// The domain ids for seeding the results.
@@ -285,7 +285,7 @@ func TestIngest_CleanupIdempotent(t *testing.T) {
 			JOIN zones AS z ON z.id = d.zone_id
 			WHERE z.name = $1 AND d.label = $2`, "crawl.test", label,
 		).Scan(&zoneID, &id); err != nil {
-			t.Fatalf("домен %s: %v", label, err)
+			t.Fatalf("domain %s: %v", label, err)
 		}
 		return zoneID, id
 	}
@@ -293,7 +293,7 @@ func TestIngest_CleanupIdempotent(t *testing.T) {
 	zb, b := domainKey("b")
 	zc, c := domainKey("c")
 	if za != zb || zb != zc {
-		t.Fatalf("зоны доменов разошлись: %d/%d/%d", za, zb, zc)
+		t.Fatalf("the domains' zones diverged: %d/%d/%d", za, zb, zc)
 	}
 
 	// The content: h1 is held by a, b, c (refcount 3), h2 — by b only (refcount 1).
@@ -304,7 +304,7 @@ func TestIngest_CleanupIdempotent(t *testing.T) {
 	if _, err := env.pool.Exec(ctx, `
 		INSERT INTO contents (hash, pack_id, off, len, raw_len, refcount)
 		VALUES ($1, 1, 0, 10, 20, 3), ($2, 1, 16, 5, 5, 1)`, h1, h2); err != nil {
-		t.Fatalf("посев contents: %v", err)
+		t.Fatalf("seeding contents: %v", err)
 	}
 
 	// The results: a → h1; b → h1 and h2; c → h1 (a live domain — not deleted).
@@ -312,7 +312,7 @@ func TestIngest_CleanupIdempotent(t *testing.T) {
 		if _, err := env.pool.Exec(ctx, `
 			INSERT INTO subdomain_results (zone_id, domain_id, subdomain_id, scheme, checked_at, content_hash)
 			VALUES ($1, $2, $3, 2, now(), $4)`, za, domainID, subID, hash); err != nil {
-			t.Fatalf("посев результата %d/%d: %v", domainID, subID, err)
+			t.Fatalf("seeding the %d/%d result: %v", domainID, subID, err)
 		}
 	}
 	addResult(a, 0, h1)
@@ -324,7 +324,7 @@ func TestIngest_CleanupIdempotent(t *testing.T) {
 	refcounts := func() map[string]int {
 		rows, err := env.pool.Query(ctx, "SELECT encode(hash, 'hex'), refcount FROM contents ORDER BY hash")
 		if err != nil {
-			t.Fatalf("чтение refcount: %v", err)
+			t.Fatalf("reading the refcount: %v", err)
 		}
 		defer rows.Close()
 		out := map[string]int{}
@@ -332,12 +332,12 @@ func TestIngest_CleanupIdempotent(t *testing.T) {
 			var h string
 			var n int
 			if err := rows.Scan(&h, &n); err != nil {
-				t.Fatalf("чтение refcount: %v", err)
+				t.Fatalf("reading the refcount: %v", err)
 			}
 			out[h] = n
 		}
 		if err := rows.Err(); err != nil {
-			t.Fatalf("чтение refcount: %v", err)
+			t.Fatalf("reading the refcount: %v", err)
 		}
 		return out
 	}
@@ -346,69 +346,69 @@ func TestIngest_CleanupIdempotent(t *testing.T) {
 	// withdrawn; the reference of the live c is kept.
 	if out := env.process(t, "crawl.test/delete/x.txt",
 		fileContent("a.crawl.test", "b.crawl.test")); out.Kind != ingest.OutcomeApplied {
-		t.Fatalf("delete: итог = %q, want applied", out.Kind)
+		t.Fatalf("delete: the outcome = %q, want applied", out.Kind)
 	}
 
 	first, err := ingest.CleanupOnce(ctx, env.pool, ingest.CleanupOptions{BatchSize: 100})
 	if err != nil {
-		t.Fatalf("первый проход очистки: %v", err)
+		t.Fatalf("the first cleanup pass: %v", err)
 	}
 	if first.Domains != 2 || first.Results != 3 || first.Contents != 2 {
-		t.Errorf("первый проход = %+v, want 2 домена, 3 результата, 2 контента", first)
+		t.Errorf("the first pass = %+v, want 2 domains, 3 results, 2 contents", first)
 	}
 	want := map[string]int{
 		fmt.Sprintf("%x", h1): 1, // the references of a and b withdrawn, c alive
 		fmt.Sprintf("%x", h2): 0, // the only reference (b) withdrawn
 	}
 	if got := refcounts(); !reflect.DeepEqual(got, want) {
-		t.Errorf("refcount после очистки = %v, want %v", got, want)
+		t.Errorf("the refcount after the cleanup = %v, want %v", got, want)
 	}
 
 	// A repeat pass — a no-op: the purged ones are not selected, the
 	// refcount is not decreased again (idempotence, spec 3.4).
 	second, err := ingest.CleanupOnce(ctx, env.pool, ingest.CleanupOptions{BatchSize: 100})
 	if err != nil {
-		t.Fatalf("второй проход очистки: %v", err)
+		t.Fatalf("the second cleanup pass: %v", err)
 	}
 	if second != (ingest.CleanupResult{}) {
-		t.Errorf("второй проход = %+v, want no-op", second)
+		t.Errorf("the second pass = %+v, want a no-op", second)
 	}
 	if got := refcounts(); !reflect.DeepEqual(got, want) {
-		t.Errorf("refcount после повтора = %v, want прежние %v", got, want)
+		t.Errorf("the refcount after the repeat = %v, want the same %v", got, want)
 	}
 
 	// The full cycle: reviving a, the worker writes a new result with a
 	// reference to h2 (refcount +1), the repeated delete and cleanup
 	// withdraw it back — the counters converge.
 	if out := env.process(t, "crawl.test/add/one.txt",
-		fileContent("a.crawl.test", "# возврат")); out.Kind != ingest.OutcomeApplied {
-		t.Fatalf("возврат: итог = %q, want applied", out.Kind)
+		fileContent("a.crawl.test", "# revival")); out.Kind != ingest.OutcomeApplied {
+		t.Fatalf("the revival: the outcome = %q, want applied", out.Kind)
 	}
 	addResult(a, 0, h2)
 	if _, err := env.pool.Exec(ctx,
 		"UPDATE contents SET refcount = refcount + 1 WHERE hash = $1", h2); err != nil {
-		t.Fatalf("инкремент refcount: %v", err)
+		t.Fatalf("the refcount increment: %v", err)
 	}
 	if got := refcounts(); got[fmt.Sprintf("%x", h2)] != 1 {
-		t.Errorf("refcount h2 после нового результата = %v, want 1", got)
+		t.Errorf("the h2 refcount after the new result = %v, want 1", got)
 	}
 
 	if out := env.process(t, "crawl.test/delete/y.txt",
-		fileContent("a.crawl.test", "# повторное снятие")); out.Kind != ingest.OutcomeApplied {
-		t.Fatalf("повторное delete: итог = %q, want applied", out.Kind)
+		fileContent("a.crawl.test", "# delete again")); out.Kind != ingest.OutcomeApplied {
+		t.Fatalf("the repeat delete: the outcome = %q, want applied", out.Kind)
 	}
 	third, err := ingest.CleanupOnce(ctx, env.pool, ingest.CleanupOptions{BatchSize: 100})
 	if err != nil {
-		t.Fatalf("третий проход очистки: %v", err)
+		t.Fatalf("the third cleanup pass: %v", err)
 	}
 	if third.Domains != 1 || third.Results != 1 {
-		t.Errorf("третий проход = %+v, want 1 домен, 1 результат", third)
+		t.Errorf("the third pass = %+v, want 1 domain, 1 result", third)
 	}
 	want[fmt.Sprintf("%x", h2)] = 0
 	if got := refcounts(); !reflect.DeepEqual(got, want) {
-		t.Errorf("refcount после цикла = %v, want %v", got, want)
+		t.Errorf("the refcount after the cycle = %v, want %v", got, want)
 	}
 	if n := env.countOf(t, "ingest_stage"); n != 0 {
-		t.Errorf("строк в ingest_stage = %d, want 0", n)
+		t.Errorf("rows in ingest_stage = %d, want 0", n)
 	}
 }

@@ -70,7 +70,7 @@ func contentRowByHash(t *testing.T, pool *pgxpool.Pool, h content.Hash) (content
 		return r, false
 	}
 	if err != nil {
-		t.Fatalf("чтение contents по %s: %v", h, err)
+		t.Fatalf("read contents by %s: %v", h, err)
 	}
 	return r, true
 }
@@ -87,12 +87,12 @@ func contentPackIDs(t *testing.T, pool *pgxpool.Pool) []int32 {
 	for rows.Next() {
 		var id int32
 		if err := rows.Scan(&id); err != nil {
-			t.Fatalf("чтение pack_id: %v", err)
+			t.Fatalf("read pack_id: %v", err)
 		}
 		ids = append(ids, id)
 	}
 	if err := rows.Err(); err != nil {
-		t.Fatalf("итерация pack_id: %v", err)
+		t.Fatalf("pack_id iteration: %v", err)
 	}
 	return ids
 }
@@ -156,14 +156,14 @@ func TestContent_PutBatch(t *testing.T) {
 	}
 	for i, e := range errs {
 		if e != nil {
-			t.Fatalf("элемент %d: %v", i, e)
+			t.Fatalf("element %d: %v", i, e)
 		}
 	}
 	// Created: live — dedup (no bytes), fresh — the first element writes
 	// the bytes, the hash repeats do not.
 	for i, want := range []bool{false, false, false, true, false, false} {
 		if results[i].Created != want {
-			t.Errorf("элемент %d: Created = %v, want %v", i, results[i].Created, want)
+			t.Errorf("element %d: Created = %v, want %v", i, results[i].Created, want)
 		}
 	}
 	for h, want := range map[content.Hash]int32{
@@ -171,29 +171,29 @@ func TestContent_PutBatch(t *testing.T) {
 	} {
 		row, ok := contentRowByHash(t, pool, h)
 		if !ok {
-			t.Fatalf("%s: нет строки contents", h)
+			t.Fatalf("%s: no contents row", h)
 		}
 		if row.refc != want {
-			t.Errorf("%s: refcount = %d, want %d (каждая копия в пачке — ссылка)", h, row.refc, want)
+			t.Errorf("%s: refcount = %d, want %d (each copy in the batch is a reference)", h, row.refc, want)
 		}
 	}
 
 	// The references are real: exhausting Delete × refcount kills the content.
 	for i := 0; i < 4; i++ {
 		if err := st.Delete(ctx, content.HashOf(live)); err != nil {
-			t.Fatalf("Delete живого %d из 4: %v", i+1, err)
+			t.Fatalf("Delete of the live one %d of 4: %v", i+1, err)
 		}
 	}
 	if _, err := st.Get(ctx, content.HashOf(live)); !errors.Is(err, content.ErrNotFound) {
-		t.Errorf("Get живого после 4 Delete: %v, want ErrNotFound", err)
+		t.Errorf("Get of the live one after 4 Delete: %v, want ErrNotFound", err)
 	}
 	for i := 0; i < 3; i++ {
 		if err := st.Delete(ctx, content.HashOf(fresh)); err != nil {
-			t.Fatalf("Delete свежего %d из 3: %v", i+1, err)
+			t.Fatalf("Delete of the fresh one %d of 3: %v", i+1, err)
 		}
 	}
 	if _, err := st.Get(ctx, content.HashOf(fresh)); !errors.Is(err, content.ErrNotFound) {
-		t.Errorf("Get свежего после 3 Delete: %v, want ErrNotFound", err)
+		t.Errorf("Get of the fresh one after 3 Delete: %v, want ErrNotFound", err)
 	}
 }
 
@@ -204,7 +204,7 @@ func TestContent_PutBatch(t *testing.T) {
 func TestContent_Roundtrip(t *testing.T) {
 	skipUnlessIntegration(t)
 
-	t.Run("без словаря", func(t *testing.T) {
+	t.Run("without a dictionary", func(t *testing.T) {
 		st, pool := contentTestEnv(t, nil)
 		ctx := context.Background()
 		pages := [][]byte{
@@ -222,11 +222,11 @@ func TestContent_Roundtrip(t *testing.T) {
 				t.Fatalf("Get(%d): %v", i, err)
 			}
 			if !bytes.Equal(got, page) {
-				t.Errorf("Get(%d): байты не совпали (%d vs %d)", i, len(got), len(page))
+				t.Errorf("Get(%d): the bytes did not match (%d vs %d)", i, len(got), len(page))
 			}
 			row, ok := contentRowByHash(t, pool, res.Hash)
 			if !ok {
-				t.Fatalf("строка contents для %s не появилась", res.Hash)
+				t.Fatalf("no contents row for %s appeared", res.Hash)
 			}
 			if int(row.rawLen) != len(page) {
 				t.Errorf("raw_len = %d, want %d", row.rawLen, len(page))
@@ -236,12 +236,12 @@ func TestContent_Roundtrip(t *testing.T) {
 			// zstd frame overhead may exceed the benefit — the comparison
 			// is only about the compressible case.
 			if len(page) > 1024 && int(row.clen) >= len(page) {
-				t.Errorf("сжатый блок %d байт не меньше сырых %d — сжатие не работает", row.clen, len(page))
+				t.Errorf("the compressed block of %d bytes is not smaller than the raw %d — compression broken", row.clen, len(page))
 			}
 		}
 	})
 
-	t.Run("со словарём", func(t *testing.T) {
+	t.Run("with a dictionary", func(t *testing.T) {
 		samples := make([][]byte, 0, 4)
 		for i := range 4 {
 			samples = append(samples, parkingPage(fmt.Sprintf("parked-%d.example", i), fmt.Sprintf("заметка %d", i)))
@@ -264,11 +264,11 @@ func TestContent_Roundtrip(t *testing.T) {
 			}
 			got, err := st.Get(ctx, res.Hash)
 			if err != nil || !bytes.Equal(got, page) {
-				t.Fatalf("Get(%d): %v, совпадение=%v", i, err, bytes.Equal(got, page))
+				t.Fatalf("Get(%d): %v, match=%v", i, err, bytes.Equal(got, page))
 			}
 			row, ok := contentRowByHash(t, pool, res.Hash)
 			if !ok {
-				t.Fatalf("строка contents для %s не появилась", res.Hash)
+				t.Fatalf("no contents row for %s appeared", res.Hash)
 			}
 			withDict = append(withDict, row)
 		}
@@ -278,12 +278,12 @@ func TestContent_Roundtrip(t *testing.T) {
 		// spec 5.7).
 		for i, row := range withDict {
 			if int(row.clen) > int(row.rawLen)/2 {
-				t.Errorf("страница %d со словарём: блок %d байт при сырых %d — словарь не работает", i, row.clen, row.rawLen)
+				t.Errorf("page %d with the dictionary: a %d-byte block against %d raw — the dictionary not working", i, row.clen, row.rawLen)
 			}
 		}
 	})
 
-	t.Run("переоткрытие каталога", func(t *testing.T) {
+	t.Run("directory reopen", func(t *testing.T) {
 		pool := migratedSchema(t)
 		dir := t.TempDir()
 		opts := content.PackOptions{Dir: dir, PackSize: 8 << 10, MaxStoreBytes: 1 << 20}
@@ -306,12 +306,12 @@ func TestContent_Roundtrip(t *testing.T) {
 		// http worker's HTML).
 		second, err := content.OpenPackStore(pool, opts)
 		if err != nil {
-			t.Fatalf("переоткрытие: %v", err)
+			t.Fatalf("reopen: %v", err)
 		}
 		t.Cleanup(func() { _ = second.Close() })
 		got, err := second.Get(ctx, res.Hash)
 		if err != nil || !bytes.Equal(got, page) {
-			t.Fatalf("Get после переоткрытия: %v, совпадение=%v", err, bytes.Equal(got, page))
+			t.Fatalf("Get after the reopen: %v, match=%v", err, bytes.Equal(got, page))
 		}
 	})
 }
@@ -328,63 +328,63 @@ func TestContent_DedupAndRefcount(t *testing.T) {
 	page := parkingPage("dup.example", "парковка")
 	first, err := st.Put(ctx, page)
 	if err != nil {
-		t.Fatalf("первый Put: %v", err)
+		t.Fatalf("the first Put: %v", err)
 	}
 	row, ok := contentRowByHash(t, pool, first.Hash)
 	if !ok {
-		t.Fatalf("строка contents для %s не появилась", first.Hash)
+		t.Fatalf("no contents row for %s appeared", first.Hash)
 	}
 	sizeBefore := row.clen
 
 	dup, err := st.Put(ctx, append([]byte(nil), page...)) // an independent copy of the bytes
 	if err != nil {
-		t.Fatalf("повторный Put: %v", err)
+		t.Fatalf("the repeat Put: %v", err)
 	}
 	if dup.Hash != first.Hash {
-		t.Fatalf("хэш изменился: %s vs %s", dup.Hash, first.Hash)
+		t.Fatalf("the hash changed: %s vs %s", dup.Hash, first.Hash)
 	}
 	if dup.Created {
-		t.Error("повторный Put записал байты: Created=true, want false (дедупликация)")
+		t.Error("the repeat Put stored bytes: Created=true, want false (deduplication)")
 	}
 	row, _ = contentRowByHash(t, pool, first.Hash)
 	if row.refc != 2 {
-		t.Errorf("refcount после дедупа = %d, want 2", row.refc)
+		t.Errorf("the refcount after the dedup = %d, want 2", row.refc)
 	}
 	if row.clen != sizeBefore {
-		t.Errorf("блок перезаписан: len %d → %d, want без изменений", sizeBefore, row.clen)
+		t.Errorf("the block rewritten: len %d → %d, want unchanged", sizeBefore, row.clen)
 	}
 
 	// Withdrawal of references: while any remain the content is alive; the last one makes the row dead.
 	if err := st.Delete(ctx, first.Hash); err != nil {
-		t.Fatalf("Delete первой из двух ссылок: %v", err)
+		t.Fatalf("Delete of the first of the two references: %v", err)
 	}
 	row, _ = contentRowByHash(t, pool, first.Hash)
 	if row.refc != 1 {
-		t.Errorf("refcount после одного Delete = %d, want 1", row.refc)
+		t.Errorf("the refcount after one Delete = %d, want 1", row.refc)
 	}
 	if _, err := st.Get(ctx, first.Hash); err != nil {
-		t.Fatalf("Get при одной живой ссылке: %v", err)
+		t.Fatalf("Get with one live reference: %v", err)
 	}
 	if err := st.Delete(ctx, first.Hash); err != nil {
-		t.Fatalf("Delete последней ссылки: %v", err)
+		t.Fatalf("Delete of the last reference: %v", err)
 	}
 	if _, err := st.Get(ctx, first.Hash); !errors.Is(err, content.ErrNotFound) {
-		t.Errorf("Get после исчерпания ссылок: %v, want ErrNotFound", err)
+		t.Errorf("Get after the references exhausted: %v, want ErrNotFound", err)
 	}
 	if err := st.Delete(ctx, first.Hash); !errors.Is(err, content.ErrNotFound) {
-		t.Errorf("повторный Delete: %v, want ErrNotFound (симптом ошибки учёта)", err)
+		t.Errorf("a repeat Delete: %v, want ErrNotFound (an accounting bug symptom)", err)
 	}
 	// Revival: a new Put writes a fresh block (T-042), refcount 1.
 	res, err := st.Put(ctx, page)
 	if err != nil {
-		t.Fatalf("Put после исчерпания ссылок: %v", err)
+		t.Fatalf("Put after the references exhausted: %v", err)
 	}
 	if res.Hash != first.Hash {
-		t.Fatalf("хэш воскресшего контента изменился: %s", res.Hash)
+		t.Fatalf("the revived content's hash changed: %s", res.Hash)
 	}
 	row, ok = contentRowByHash(t, pool, first.Hash)
 	if !ok || row.refc != 1 {
-		t.Errorf("воскрешение: строка %+v (found=%v), want refcount 1", row, ok)
+		t.Errorf("revival: row %+v (found=%v), want refcount 1", row, ok)
 	}
 }
 
@@ -406,30 +406,30 @@ func TestContent_SwapRef(t *testing.T) {
 		t.Fatalf("Put B: %v", err)
 	}
 
-	t.Run("перезапись со сменой контента", func(t *testing.T) {
+	t.Run("overwrite with a content change", func(t *testing.T) {
 		if err := st.SwapRef(ctx, a.Hash, b.Hash); err != nil {
 			t.Fatalf("SwapRef A→B: %v", err)
 		}
 		rowA, ok := contentRowByHash(t, pool, a.Hash)
 		if !ok {
-			t.Fatal("строка старого контента A исчезла после свопа")
+			t.Fatal("the old content A row disappeared after the swap")
 		}
 		rowB, ok := contentRowByHash(t, pool, b.Hash)
 		if !ok {
-			t.Fatal("строка нового контента B не записана")
+			t.Fatal("the new content B row not stored")
 		}
 		if rowA.refc != 0 || rowB.refc != 2 {
-			t.Errorf("refcount после свопа: A=%d (want 0), B=%d (want 2)", rowA.refc, rowB.refc)
+			t.Errorf("refcount after the swap: A=%d (want 0), B=%d (want 2)", rowA.refc, rowB.refc)
 		}
 		if _, err := st.Get(ctx, a.Hash); !errors.Is(err, content.ErrNotFound) {
-			t.Errorf("Get старого контента после свопа: %v, want ErrNotFound", err)
+			t.Errorf("Get of the old content after the swap: %v, want ErrNotFound", err)
 		}
 		if _, err := st.Get(ctx, b.Hash); err != nil {
-			t.Errorf("Get нового контента после свопа: %v", err)
+			t.Errorf("Get of the new content after the swap: %v", err)
 		}
 	})
 
-	t.Run("первый контент результата", func(t *testing.T) {
+	t.Run("the result's first content", func(t *testing.T) {
 		c, err := st.Put(ctx, parkingPage("swap.example", "результат без контента ранее"))
 		if err != nil {
 			t.Fatalf("Put C: %v", err)
@@ -439,55 +439,55 @@ func TestContent_SwapRef(t *testing.T) {
 		}
 		rowC, ok := contentRowByHash(t, pool, c.Hash)
 		if !ok {
-			t.Fatalf("строка contents для %s не появилась", c.Hash)
+			t.Fatalf("no contents row for %s appeared", c.Hash)
 		}
 		if rowC.refc != 2 {
-			t.Errorf("refcount C после 0→C = %d, want 2", rowC.refc)
+			t.Errorf("refcount C after 0→C = %d, want 2", rowC.refc)
 		}
 	})
 
-	t.Run("результат без контента", func(t *testing.T) {
+	t.Run("a result without content", func(t *testing.T) {
 		if err := st.SwapRef(ctx, b.Hash, noHash); err != nil {
 			t.Fatalf("SwapRef B→0: %v", err)
 		}
 		rowB, ok := contentRowByHash(t, pool, b.Hash)
 		if !ok {
-			t.Fatal("строка контента B исчезла после свопа B→0")
+			t.Fatal("the content B row disappeared after the B→0 swap")
 		}
 		if rowB.refc != 1 {
-			t.Errorf("refcount B после B→0 = %d, want 1", rowB.refc)
+			t.Errorf("refcount B after B→0 = %d, want 1", rowB.refc)
 		}
 	})
 
-	t.Run("контент не сменился — no-op", func(t *testing.T) {
+	t.Run("the content unchanged — no-op", func(t *testing.T) {
 		before, ok := contentRowByHash(t, pool, b.Hash)
 		if !ok {
-			t.Fatal("строка контента B исчезла до no-op свопа")
+			t.Fatal("the content B row disappeared before the no-op swap")
 		}
 		if err := st.SwapRef(ctx, b.Hash, b.Hash); err != nil {
 			t.Fatalf("SwapRef B→B: %v", err)
 		}
 		after, ok := contentRowByHash(t, pool, b.Hash)
 		if !ok {
-			t.Fatal("строка контента B исчезла после no-op свопа")
+			t.Fatal("the content B row disappeared after the no-op swap")
 		}
 		if before.refc != after.refc {
-			t.Errorf("no-op своп изменил refcount: %d → %d", before.refc, after.refc)
+			t.Errorf("the no-op swap changed the refcount: %d → %d", before.refc, after.refc)
 		}
 	})
 
-	t.Run("нецелостность: новый не записан", func(t *testing.T) {
-		ghost := content.HashOf([]byte("не было Put-а"))
+	t.Run("integrity violation: the new one not stored", func(t *testing.T) {
+		ghost := content.HashOf([]byte("never Put"))
 		err := st.SwapRef(ctx, b.Hash, ghost)
 		if !errors.Is(err, content.ErrRefIntegrity) {
-			t.Fatalf("SwapRef на незаписанный контент: %v, want ErrRefIntegrity", err)
+			t.Fatalf("SwapRef on unstored content: %v, want ErrRefIntegrity", err)
 		}
 		rowB, ok := contentRowByHash(t, pool, b.Hash)
 		if !ok {
-			t.Fatal("строка контента B исчезла при откаченном свопе")
+			t.Fatal("the content B row disappeared on the rolled-back swap")
 		}
 		if rowB.refc != 1 {
-			t.Errorf("откаченный своп изменил refcount B: %d, want 1", rowB.refc)
+			t.Errorf("the rolled-back swap changed refcount B: %d, want 1", rowB.refc)
 		}
 	})
 }
@@ -509,35 +509,35 @@ func TestContent_PackRotation(t *testing.T) {
 		}
 		hashes = append(hashes, res.Hash)
 		if i > 100 {
-			t.Fatal("ротация не наступила за 100 записей — pack_size не работает")
+			t.Fatal("the rotation did not happen within 100 writes — pack_size broken")
 		}
 	}
 	ids := contentPackIDs(t, pool)
 	if len(ids) < 3 || ids[0] != 1 {
-		t.Fatalf("pack_id после серии записей: %v, want минимум [1 2 3]", ids)
+		t.Fatalf("pack_id after the write series: %v, want at least [1 2 3]", ids)
 	}
 	for _, id := range ids {
 		if !packFileExists(t, st.Dir(), id) {
-			t.Errorf("файл пака %d отсутствует", id)
+			t.Errorf("the pack %d file missing", id)
 		}
 	}
 	// The content is read from every pack (blocks at the committed offsets).
 	for i, h := range hashes {
 		if _, err := st.Get(ctx, h); err != nil {
-			t.Errorf("Get(%d) из пака: %v", i, err)
+			t.Errorf("Get(%d) from the pack: %v", i, err)
 		}
 	}
 	// The newest pack keeps accepting writes.
 	res, err := st.Put(ctx, parkingPage("last.example", "запись после ротации"))
 	if err != nil {
-		t.Fatalf("Put после ротации: %v", err)
+		t.Fatalf("Put after the rotation: %v", err)
 	}
 	row, ok := contentRowByHash(t, pool, res.Hash)
 	if !ok {
-		t.Fatalf("строка contents для %s не появилась", res.Hash)
+		t.Fatalf("no contents row for %s appeared", res.Hash)
 	}
 	if row.packID != ids[len(ids)-1] {
-		t.Errorf("новая запись попала в пак %d, want новейший %d", row.packID, ids[len(ids)-1])
+		t.Errorf("the new write landed in pack %d, want the newest %d", row.packID, ids[len(ids)-1])
 	}
 }
 
@@ -559,14 +559,14 @@ func TestContent_Compaction(t *testing.T) {
 		}
 		row, ok := contentRowByHash(t, pool, res.Hash)
 		if !ok {
-			t.Fatalf("строка для %s не появилась", res.Hash)
+			t.Fatalf("no row for %s appeared", res.Hash)
 		}
 		byPack[row.packID] = append(byPack[row.packID], res.Hash)
 		i++
 	}
 	first := byPack[1]
 	if len(first) < 2 {
-		t.Fatalf("в паке 1 контента %d, want минимум 2 для доли живых", len(first))
+		t.Fatalf("pack 1 has %d contents, want at least 2 for the live share", len(first))
 	}
 	before := len(first)
 
@@ -582,7 +582,7 @@ func TestContent_Compaction(t *testing.T) {
 		t.Fatalf("CompactScan: %v", err)
 	}
 	if info.Ratio >= 0.5 {
-		t.Fatalf("доля живых пака 1 = %.2f, want < 0.5 (удалено %d из %d)", info.Ratio, before-1, before)
+		t.Fatalf("pack 1's live share = %.2f, want < 0.5 (deleted %d of %d)", info.Ratio, before-1, before)
 	}
 
 	stats, err := content.CompactOnce(ctx, st, content.CompactOptions{Threshold: 0.5})
@@ -590,32 +590,32 @@ func TestContent_Compaction(t *testing.T) {
 		t.Fatalf("CompactOnce: %v", err)
 	}
 	if stats.Compacted < 1 || stats.FreedBytes <= 0 {
-		t.Fatalf("CompactOnce: %+v, want Compacted ≥ 1 и FreedBytes > 0", stats)
+		t.Fatalf("CompactOnce: %+v, want Compacted ≥ 1 and FreedBytes > 0", stats)
 	}
 	if packFileExists(t, st.Dir(), 1) {
-		t.Error("файл пака 1 не удалён после компактификации")
+		t.Error("the pack 1 file not deleted after the compaction")
 	}
 	// The live content has moved and is readable; the dead rows are purged.
 	row, ok := contentRowByHash(t, pool, live)
 	if !ok {
-		t.Fatal("живая строка потеряна компактификацией")
+		t.Fatal("the live row lost by the compaction")
 	}
 	if row.packID == 1 {
-		t.Errorf("живая строка осталась в удалённом паке 1")
+		t.Errorf("the live row stayed in the deleted pack 1")
 	}
 	if got, err := st.Get(ctx, live); err != nil || len(got) == 0 {
-		t.Errorf("Get живого после компактификации: %v", err)
+		t.Errorf("Get of the live one after the compaction: %v", err)
 	}
 	if ids := contentPackIDs(t, pool); len(ids) == 0 || ids[0] == 1 {
-		t.Errorf("мёртвые строки пака 1 не удалены: pack_id %v", ids)
+		t.Errorf("the dead rows of pack 1 not deleted: pack_id %v", ids)
 	}
 	// Writing continues, the space is freed and accounted for (T-046).
 	if _, err := st.Put(ctx, parkingPage("after-compact.example", "запись после компактификации")); err != nil {
-		t.Fatalf("Put после компактификации: %v", err)
+		t.Fatalf("Put after the compaction: %v", err)
 	}
 
 	// A pack with a live share above the threshold is not compacted.
-	t.Run("доля живых выше порога", func(t *testing.T) {
+	t.Run("the live share above the threshold", func(t *testing.T) {
 		st2, pool2 := contentTestEnv(t, nil)
 		var keep []content.Hash
 		for j := 0; len(contentPackIDs(t, pool2)) < 2; j++ {
@@ -625,24 +625,24 @@ func TestContent_Compaction(t *testing.T) {
 			}
 			row, ok := contentRowByHash(t, pool2, res.Hash)
 			if !ok {
-				t.Fatalf("строка contents для %s не появилась", res.Hash)
+				t.Fatalf("no contents row for %s appeared", res.Hash)
 			}
 			if row.packID == 1 {
 				keep = append(keep, res.Hash)
 			}
 		}
 		if len(keep) == 0 {
-			t.Fatal("пак 1 пуст — нечего беречь")
+			t.Fatal("pack 1 empty — nothing to keep")
 		}
 		stats, err := content.CompactOnce(ctx, st2, content.CompactOptions{Threshold: 0.5})
 		if err != nil {
 			t.Fatalf("CompactOnce: %v", err)
 		}
 		if stats.Compacted != 0 {
-			t.Errorf("компактифицирован живой пак: %+v, want Compacted 0", stats)
+			t.Errorf("a live pack compacted: %+v, want Compacted 0", stats)
 		}
 		if !packFileExists(t, st2.Dir(), 1) {
-			t.Error("пак 1 с живыми данными удалён")
+			t.Error("pack 1 with live data deleted")
 		}
 	})
 }
@@ -656,17 +656,17 @@ func TestContent_MaxStoreBytes(t *testing.T) {
 	ctx := context.Background()
 
 	if _, err := st.Put(ctx, bytes.Repeat([]byte("x"), limit+1)); !errors.Is(err, content.ErrTooLarge) {
-		t.Fatalf("Put сверх лимита: %v, want ErrTooLarge", err)
+		t.Fatalf("Put over the limit: %v, want ErrTooLarge", err)
 	}
 	res, err := st.Put(ctx, bytes.Repeat([]byte("y"), limit))
 	if err != nil {
-		t.Fatalf("Put ровно в лимит: %v", err)
+		t.Fatalf("Put exactly at the limit: %v", err)
 	}
 	if !res.Created {
-		t.Error("Put в лимит не записал контент")
+		t.Error("the Put at the limit did not store content")
 	}
 	if _, ok := contentRowByHash(t, pool, content.HashOf(bytes.Repeat([]byte("x"), limit+1))); ok {
-		t.Error("строка сверхлимитного контента появилась в БД")
+		t.Error("an over-limit content row appeared in the DB")
 	}
 }
 
@@ -695,28 +695,28 @@ func TestContent_DiskFullPause(t *testing.T) {
 
 	_, err := st.Put(ctx, parkingPage("full.example", "запись в полный диск"))
 	if !errors.Is(err, content.ErrStoreFull) {
-		t.Fatalf("Put при недостижимом пороге: %v, want ErrStoreFull", err)
+		t.Fatalf("Put at an unreachable threshold: %v, want ErrStoreFull", err)
 	}
 	if !strings.Contains(err.Error(), "content.disk_free_percent") {
-		t.Errorf("ошибка не называет порог: %q", err.Error())
+		t.Errorf("the error does not name the threshold: %q", err.Error())
 	}
 	mu.Lock()
 	if len(events) != 1 {
-		t.Fatalf("событий алерта %d, want 1", len(events))
+		t.Fatalf("%d alert events, want 1", len(events))
 	}
 	ev := events[0]
 	mu.Unlock()
 	if ev.Source != content.StoreFullPut || ev.Recovered {
-		t.Errorf("событие: %+v, want Source=%s Recovered=false", ev, content.StoreFullPut)
+		t.Errorf("the event: %+v, want Source=%s Recovered=false", ev, content.StoreFullPut)
 	}
 	if ev.Space.Total == 0 {
-		t.Error("событие без реального снимка statfs: Total = 0")
+		t.Error("the event without a real statfs snapshot: Total = 0")
 	}
 
 	// A live threshold: enough space, writing goes on (the same directory).
 	st2, _ := contentTestEnv(t, func(o *content.PackOptions) { o.DiskFreePercent = 0.0001 })
 	if _, err := st2.Put(ctx, parkingPage("ok.example", "места достаточно")); err != nil {
-		t.Fatalf("Put при живом пороге: %v", err)
+		t.Fatalf("Put at a live threshold: %v", err)
 	}
 }
 
@@ -740,14 +740,14 @@ func TestContent_RefcountFSM(t *testing.T) {
 		t.Fatalf("Put: %v", err)
 	}
 	if !res.Created {
-		t.Error("первый Put: Created = false, want true (вставка)")
+		t.Error("the first Put: Created = false, want true (an insert)")
 	}
 	if _, err := st.Put(ctx, append([]byte(nil), page...)); err != nil {
-		t.Fatalf("Put-дедуп: %v", err)
+		t.Fatalf("the dedup Put: %v", err)
 	}
 	oldRow, ok := contentRowByHash(t, pool, res.Hash)
 	if !ok || oldRow.refc != 2 {
-		t.Fatalf("после дедупа: строка %+v (found=%v), want refcount 2", oldRow, ok)
+		t.Fatalf("after the dedup: row %+v (found=%v), want refcount 2", oldRow, ok)
 	}
 
 	// live(2) → dead·tombstone: both references withdrawn, the row stays.
@@ -758,55 +758,55 @@ func TestContent_RefcountFSM(t *testing.T) {
 	}
 	row, ok := contentRowByHash(t, pool, res.Hash)
 	if !ok || row.refc != 0 {
-		t.Fatalf("tombstone: строка %+v (found=%v), want refcount 0", row, ok)
+		t.Fatalf("tombstone: row %+v (found=%v), want refcount 0", row, ok)
 	}
 	if err := st.Delete(ctx, res.Hash); !errors.Is(err, content.ErrNotFound) {
-		t.Errorf("повторный Delete мёртвой: %v, want ErrNotFound", err)
+		t.Errorf("a repeat Delete of the dead one: %v, want ErrNotFound", err)
 	}
 
 	// T6: the tombstone revival — DO UPDATE, the EXCLUDED placement.
 	again, err := st.Put(ctx, page)
 	if err != nil {
-		t.Fatalf("Put воскрешения: %v", err)
+		t.Fatalf("the revival Put: %v", err)
 	}
 	if again.Created {
-		t.Error("воскрешение tombstone: Created = true, want false (DO UPDATE)")
+		t.Error("the tombstone revival: Created = true, want false (DO UPDATE)")
 	}
 	row, _ = contentRowByHash(t, pool, res.Hash)
 	if row.refc != 1 {
-		t.Errorf("после воскрешения: refcount = %d, want 1", row.refc)
+		t.Errorf("after the revival: refcount = %d, want 1", row.refc)
 	}
 	if row.packID == oldRow.packID && row.off == oldRow.off {
-		t.Error("воскрешение не перевело размещение на свежий блок (EXCLUDED)")
+		t.Error("the revival did not move the placement to a fresh block (EXCLUDED)")
 	}
 	if got, err := st.Get(ctx, res.Hash); err != nil || string(got) != string(page) {
-		t.Errorf("Get воскрешённого: %v", err)
+		t.Errorf("Get of the revived one: %v", err)
 	}
 
 	// The "no row" view (the retention path T-166 / the compaction purge
 	// T-045): the row is deleted entirely — Get/Delete as for a dead one,
 	// the revival through the INSERT branch, Created = true.
 	if _, err := pool.Exec(ctx, "DELETE FROM contents WHERE hash = $1", res.Hash[:]); err != nil {
-		t.Fatalf("удаление строки: %v", err)
+		t.Fatalf("row deletion: %v", err)
 	}
 	if _, ok := contentRowByHash(t, pool, res.Hash); ok {
-		t.Fatal("строка обязана быть удалена")
+		t.Fatal("the row must be deleted")
 	}
 	if _, err := st.Get(ctx, res.Hash); !errors.Is(err, content.ErrNotFound) {
-		t.Errorf("Get отсутствующей: %v, want ErrNotFound", err)
+		t.Errorf("Get of the missing one: %v, want ErrNotFound", err)
 	}
 	if err := st.Delete(ctx, res.Hash); !errors.Is(err, content.ErrNotFound) {
-		t.Errorf("Delete отсутствующей: %v, want ErrNotFound", err)
+		t.Errorf("Delete of the missing one: %v, want ErrNotFound", err)
 	}
 	fresh, err := st.Put(ctx, page)
 	if err != nil {
-		t.Fatalf("Put после удаления строки: %v", err)
+		t.Fatalf("Put after the row deletion: %v", err)
 	}
 	if !fresh.Created {
-		t.Error("воскрешение отсутствующей строки: Created = false, want true (INSERT)")
+		t.Error("the missing row's revival: Created = false, want true (INSERT)")
 	}
 	if row, ok := contentRowByHash(t, pool, res.Hash); !ok || row.refc != 1 {
-		t.Errorf("после INSERT-воскрешения: строка %+v (found=%v), want refcount 1", row, ok)
+		t.Errorf("after the INSERT revival: row %+v (found=%v), want refcount 1", row, ok)
 	}
 }
 
@@ -843,13 +843,13 @@ func TestContent_RefcountClampDesync(t *testing.T) {
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO contents (hash, pack_id, off, len, raw_len, refcount)
 		VALUES ($1, 1, 0, 10, 20, 1)`, h); err != nil {
-		t.Fatalf("посев contents: %v", err)
+		t.Fatalf("seeding contents: %v", err)
 	}
 	for sub := int16(0); sub < 2; sub++ {
 		if _, err := pool.Exec(ctx, `
 			INSERT INTO subdomain_results (zone_id, domain_id, subdomain_id, scheme, checked_at, content_hash)
 			VALUES ($1, $2, $3, 2, now() - interval '2 hours', $4)`, zone, id, sub, h); err != nil {
-			t.Fatalf("посев результата sub=%d: %v", sub, err)
+			t.Fatalf("seeding the sub=%d result: %v", sub, err)
 		}
 	}
 
@@ -858,28 +858,28 @@ func TestContent_RefcountClampDesync(t *testing.T) {
 		BatchSize: 100,
 	})
 	if err != nil {
-		t.Fatalf("RetentionOnce при рассинхроне: %v", err)
+		t.Fatalf("RetentionOnce on desync: %v", err)
 	}
 	if stats.Rows != 2 || stats.Refs != 2 || stats.Contents != 1 || stats.FreedBytes != 10 {
-		t.Fatalf("stats = %+v, want Rows=2 Refs=2 Contents=1 FreedBytes=10 (клэмп 1−2 → 0)", stats)
+		t.Fatalf("stats = %+v, want Rows=2 Refs=2 Contents=1 FreedBytes=10 (the clamp 1−2 → 0)", stats)
 	}
 	if stats.BadHashes != 0 || stats.Missing != 0 || stats.Skipped || stats.SkippedPending {
-		t.Errorf("аномалий быть не должно: %+v", stats)
+		t.Errorf("no anomalies expected: %+v", stats)
 	}
 	var n int
 	if err := pool.QueryRow(ctx,
 		"SELECT count(*) FROM contents WHERE hash = $1", h).Scan(&n); err != nil {
-		t.Fatalf("чтение contents: %v", err)
+		t.Fatalf("read contents: %v", err)
 	}
 	if n != 0 {
-		t.Errorf("contents после клэмпа: строк %d, want 0 (refcount дошёл до нуля — удалена)", n)
+		t.Errorf("contents after the clamp: %d rows, want 0 (the refcount reached zero — deleted)", n)
 	}
 	if err := pool.QueryRow(ctx,
 		"SELECT count(*) FROM subdomain_results WHERE content_hash IS NOT NULL").Scan(&n); err != nil {
-		t.Fatalf("чтение subdomain_results: %v", err)
+		t.Fatalf("read subdomain_results: %v", err)
 	}
 	if n != 0 {
-		t.Errorf("ссылок осталось %d, want 0 (обе записи очищены)", n)
+		t.Errorf("%d references left, want 0 (both rows cleared)", n)
 	}
 }
 
@@ -903,10 +903,10 @@ func TestSchema_ContentsRefcountCheck(t *testing.T) {
 		return err
 	}
 	if err := ins(0x01, 1); err != nil {
-		t.Fatalf("живая строка refcount 1: %v", err)
+		t.Fatalf("the live row refcount 1: %v", err)
 	}
 	if err := ins(0x02, 0); err != nil {
-		t.Fatalf("tombstone refcount 0: %v (нулевая строка легальна — мёртвая до компактификации T-045)", err)
+		t.Fatalf("tombstone refcount 0: %v (a zero row is legal — dead until the compaction T-045)", err)
 	}
 
 	// The invariant violation: an INSERT with refcount = −1 — 23514 from the schema.
@@ -918,7 +918,7 @@ func TestSchema_ContentsRefcountCheck(t *testing.T) {
 	if _, err := pool.Exec(ctx,
 		"UPDATE contents SET refcount = -1 WHERE hash = $1", refcTestHash(0x01)); err == nil ||
 		!strings.Contains(err.Error(), "contents_refcount_check") {
-		t.Errorf("UPDATE в минус: err = %v, want violation contents_refcount_check", err)
+		t.Errorf("an UPDATE to minus: err = %v, want the contents_refcount_check violation", err)
 	}
 
 	// NOT VALID: the constraint in the test schema (filtered by
@@ -936,13 +936,13 @@ func TestSchema_ContentsRefcountCheck(t *testing.T) {
 	defer rows.Close()
 	var validated, total int
 	if !rows.Next() || rows.Scan(&validated, &total) != nil {
-		t.Fatalf("чтение pg_constraint: %v", rows.Err())
+		t.Fatalf("read pg_constraint: %v", rows.Err())
 	}
 	if total != 1 {
-		t.Fatalf("ограничение в схеме теста на %d объектах, want 1 (миграция 000019)", total)
+		t.Fatalf("the constraint in the test schema on %d objects, want 1 (migration 000019)", total)
 	}
 	if validated != 0 {
-		t.Errorf("convalidated = true, want false (NOT VALID, VALIDATE — по регламенту)")
+		t.Errorf("convalidated = true, want false (NOT VALID, VALIDATE — per the regulations)")
 	}
 }
 
@@ -1012,7 +1012,7 @@ func TestContent_RetentionSelectPlanPinned(t *testing.T) {
 		INSERT INTO subdomain_results (zone_id, domain_id, subdomain_id, scheme, final_url, content_hash, checked_at)
 		VALUES ($1, $2, 0, 2, 'https://pin.test/', $3, now() - interval '2 hours')`,
 		zone, id, refcTestHash(0x77)); err != nil {
-		t.Fatalf("посев результата: %v", err)
+		t.Fatalf("seeding the result: %v", err)
 	}
 
 	tx, err := pool.Begin(ctx)
@@ -1032,14 +1032,14 @@ func TestContent_RetentionSelectPlanPinned(t *testing.T) {
 	}
 	plan := explainPlan(t, tx, ctx, retentionPinSelectSQL)
 	if !planIdxScanRe.MatchString(plan) {
-		t.Errorf("закреплённый план без индексного доступа к subdomain_results:\n%s", plan)
+		t.Errorf("the pinned plan without index access to subdomain_results:\n%s", plan)
 	}
 	if !strings.Contains(plan, "Limit") {
-		t.Errorf("закреплённый план без Limit (ранний останов пачки):\n%s", plan)
+		t.Errorf("the pinned plan without Limit (the batch early stop):\n%s", plan)
 	}
 	for _, bad := range []string{"Hash Join", "Merge Join", "Seq Scan"} {
 		if strings.Contains(plan, bad) {
-			t.Errorf("закреплённый план содержит %q (SET LOCAL не подействовал):\n%s", bad, plan)
+			t.Errorf("the pinned plan contains %q (SET LOCAL had no effect):\n%s", bad, plan)
 		}
 	}
 	// The bitmap path is a different diagnosis than the un-switched-off
@@ -1048,7 +1048,7 @@ func TestContent_RetentionSelectPlanPinned(t *testing.T) {
 	// explicit Sort (the T-271 tuning).
 	for _, bad := range []string{"Bitmap Index Scan", "Bitmap Heap Scan"} {
 		if strings.Contains(plan, bad) {
-			t.Errorf("закреплённый план содержит %q (bitmap-путь ломает порядок курсора — форма не закреплена до конца):\n%s", bad, plan)
+			t.Errorf("the pinned plan contains %q (the bitmap path breaks the cursor order — the shape not fully pinned):\n%s", bad, plan)
 		}
 	}
 }
@@ -1096,7 +1096,7 @@ func TestContent_RetentionCatchUpFromZeroCursor(t *testing.T) {
 	for _, z := range []int16{z1, z2} {
 		if _, err := pool.Exec(ctx, fmt.Sprintf(
 			"CREATE TABLE subdomain_results_cup_%d PARTITION OF subdomain_results FOR VALUES IN (%d)", z, z)); err != nil {
-			t.Fatalf("партиция зоны %d: %v", z, err)
+			t.Fatalf("the zone %d partition: %v", z, err)
 		}
 	}
 
@@ -1112,7 +1112,7 @@ func TestContent_RetentionCatchUpFromZeroCursor(t *testing.T) {
 		INSERT INTO domains (zone_id, id, label)
 		SELECT CASE WHEN g % 2 = 0 THEN $1::int2 ELSE $2::int2 END, g, 'cup' || g
 		FROM generate_series(1, $3) g`, z1, z2, total); err != nil {
-		t.Fatalf("посев domains: %v", err)
+		t.Fatalf("seeding domains: %v", err)
 	}
 	// The rows in checked_at order: a clean prefix [−35h, −7.2h] →
 	// candidates [−7h, −6.2h] (the retention window of 6 h — aged) →
@@ -1131,7 +1131,7 @@ func TestContent_RetentionCatchUpFromZeroCursor(t *testing.T) {
 		       END,
 		       CASE WHEN g > $3 THEN '{"cup":1}'::jsonb END
 		FROM generate_series(1, $5) g`, z1, z2, cleanPrefix, cleanPrefix+dirty, total); err != nil {
-		t.Fatalf("посев subdomain_results: %v", err)
+		t.Fatalf("seeding subdomain_results: %v", err)
 	}
 	if _, err := pool.Exec(ctx, "ANALYZE subdomain_results"); err != nil {
 		t.Fatalf("ANALYZE: %v", err)
@@ -1150,29 +1150,29 @@ func TestContent_RetentionCatchUpFromZeroCursor(t *testing.T) {
 	})
 	elapsed := time.Since(start)
 	if err != nil {
-		t.Fatalf("catch-up с нулевого курсора не завершился в SelectTimeout: %v (проход %v)", err, elapsed)
+		t.Fatalf("the catch-up from the zero cursor did not finish within the SelectTimeout: %v (the pass %v)", err, elapsed)
 	}
 	if stats.Rows != dirty {
-		t.Fatalf("очищено строк = %d, want %d (весь бэклог одним проходом)", stats.Rows, dirty)
+		t.Fatalf("rows purged = %d, want %d (the whole backlog in one pass)", stats.Rows, dirty)
 	}
 	if stats.Batches != dirty/10000 {
-		t.Fatalf("пачек = %d, want %d", stats.Batches, dirty/10000)
+		t.Fatalf("batches = %d, want %d", stats.Batches, dirty/10000)
 	}
 	if stats.BadHashes != 0 || stats.Missing != 0 || stats.Skipped || stats.SkippedPending {
-		t.Errorf("аномалий быть не должно: %+v", stats)
+		t.Errorf("no anomalies expected: %+v", stats)
 	}
 	// The drain is complete: no candidates left (the fresh ones untouched —
 	// their headers are in place, the age window has not expired).
 	var n int
 	if err := pool.QueryRow(ctx,
 		"SELECT count(*) FROM subdomain_results WHERE headers IS NOT NULL").Scan(&n); err != nil {
-		t.Fatalf("чтение остатков: %v", err)
+		t.Fatalf("read the remainder: %v", err)
 	}
 	if n != fresh {
-		t.Errorf("строк с jsonb после прохода = %d, want %d (только свежие)", n, fresh)
+		t.Errorf("rows with jsonb after the pass = %d, want %d (the fresh ones only)", n, fresh)
 	}
 	if elapsed > time.Minute {
-		t.Errorf("catch-up-проход на фикстуре занял %v — деградация формы плана (бюджет теста: минута)", elapsed)
+		t.Errorf("the catch-up pass on the fixture took %v — a plan shape degradation (the test budget: a minute)", elapsed)
 	}
 
 	// A repeat pass — the set is exhausted (the cursor/cleanup advanced):
@@ -1183,10 +1183,10 @@ func TestContent_RetentionCatchUpFromZeroCursor(t *testing.T) {
 		SelectTimeout: 30 * time.Second,
 	})
 	if err != nil {
-		t.Fatalf("повторный проход: %v", err)
+		t.Fatalf("the repeat pass: %v", err)
 	}
 	if stats.Rows != 0 || stats.Batches != 0 {
-		t.Fatalf("повторный проход = %+v, want пустой (множество исчерпано)", stats)
+		t.Fatalf("the repeat pass = %+v, want empty (the set exhausted)", stats)
 	}
 }
 
@@ -1210,7 +1210,7 @@ func TestContent_RetentionCursorRestart(t *testing.T) {
 	if _, err := pool.Exec(ctx,
 		"INSERT INTO retention_drain_cursor (id, checked_at, zone_id, domain_id, subdomain_id, variant) "+
 			"VALUES (2, now(), 1, 1, 0, 0)"); err == nil {
-		t.Fatal("вторая строка retention_drain_cursor прошла вопреки CHECK (id = 1)")
+		t.Fatal("the second retention_drain_cursor row passed despite the CHECK (id = 1)")
 	}
 
 	var z int16
@@ -1220,13 +1220,13 @@ func TestContent_RetentionCursorRestart(t *testing.T) {
 	}
 	if _, err := pool.Exec(ctx, fmt.Sprintf(
 		"CREATE TABLE subdomain_results_cur_%d PARTITION OF subdomain_results FOR VALUES IN (%d)", z, z)); err != nil {
-		t.Fatalf("партиция зоны %d: %v", z, err)
+		t.Fatalf("the zone %d partition: %v", z, err)
 	}
 	// Two domains: circle 1 drains the first one's rows; the second — the
 	// rows "after the restart" (one behind the cursor, one ahead).
 	if _, err := pool.Exec(ctx,
 		"INSERT INTO domains (zone_id, id, label) VALUES ($1, 1, 'first'), ($1, 2, 'second')", z); err != nil {
-		t.Fatalf("посев domains: %v", err)
+		t.Fatalf("seeding domains: %v", err)
 	}
 	// The first pass's candidates (the 6 h window): the checked_at order
 	// d1/sub0 (−10 h) → d1/sub1 (−9 h) — the cursor will stop at d1/sub1.
@@ -1235,7 +1235,7 @@ func TestContent_RetentionCursorRestart(t *testing.T) {
 		VALUES
 		  ($1, 1, 0, 0, 2, now() - interval '10 hours', '{"a":1}'),
 		  ($1, 1, 1, 0, 2, now() - interval '9 hours',  '{"a":1}')`, z); err != nil {
-		t.Fatalf("посев subdomain_results: %v", err)
+		t.Fatalf("seeding subdomain_results: %v", err)
 	}
 
 	// Circle 1 ("the previous process"): the starting pass drains the
@@ -1257,13 +1257,13 @@ func TestContent_RetentionCursorRestart(t *testing.T) {
 			return s, nil
 		case <-time.After(time.Minute):
 			cancel()
-			return content.RetentionStats{}, errors.New("стартовый проход цикла не завершился")
+			return content.RetentionStats{}, errors.New("the loop's starting pass did not finish")
 		}
 	}
 	if s, err := loop(); err != nil {
-		t.Fatalf("цикл 1: %v", err)
+		t.Fatalf("circle 1: %v", err)
 	} else if s.Rows != 2 {
-		t.Fatalf("цикл 1: Rows = %d, want 2 (всё окно старения)", s.Rows)
+		t.Fatalf("circle 1: Rows = %d, want 2 (the whole aging window)", s.Rows)
 	}
 
 	// The state is committed: the position is the last row of pass 1.
@@ -1276,10 +1276,10 @@ func TestContent_RetentionCursorRestart(t *testing.T) {
 	if err := pool.QueryRow(ctx,
 		"SELECT checked_at, zone_id, domain_id, subdomain_id, variant FROM retention_drain_cursor WHERE id = 1",
 	).Scan(&curChecked, &curZone, &curDomain, &curSub, &curVariant); err != nil {
-		t.Fatalf("строка персистентного курсора: %v", err)
+		t.Fatalf("the persistent cursor row: %v", err)
 	}
 	if curZone != z || curDomain != 1 || curSub != 1 || curVariant != 0 {
-		t.Fatalf("курсор = %d/%d/%d/%d, want позиция последней строки прохода 1 (%d/1/1/0)",
+		t.Fatalf("the cursor = %d/%d/%d/%d, want pass 1's last row position (%d/1/1/0)",
 			curZone, curDomain, curSub, curVariant, z)
 	}
 
@@ -1291,24 +1291,24 @@ func TestContent_RetentionCursorRestart(t *testing.T) {
 		  ($1, 2, 0, 0, 2, now() - interval '9 hours 30 minutes', '{"b":1}'),
 		  -- впереди курсора (−7 ч): остаревшая — дренаж подберёт
 		  ($1, 2, 1, 0, 2, now() - interval '7 hours', '{"b":1}')`, z); err != nil {
-		t.Fatalf("посев после рестарта: %v", err)
+		t.Fatalf("seeding after the restart: %v", err)
 	}
 
 	// Circle 2 ("the restart"): continues from the saved cursor.
 	if s, err := loop(); err != nil {
-		t.Fatalf("цикл 2: %v", err)
+		t.Fatalf("circle 2: %v", err)
 	} else if s.Rows != 1 {
-		t.Fatalf("цикл 2: Rows = %d, want 1 (только запись впереди курсора — рестарт не ходит с нуля)", s.Rows)
+		t.Fatalf("circle 2: Rows = %d, want 1 (only the row ahead of the cursor — the restart does not walk from zero)", s.Rows)
 	}
 	var behind, ahead int
 	if err := pool.QueryRow(ctx,
 		"SELECT count(*) FILTER (WHERE domain_id = 2 AND subdomain_id = 0), "+
 			"count(*) FILTER (WHERE domain_id = 2 AND subdomain_id = 1) "+
 			"FROM subdomain_results WHERE headers IS NOT NULL").Scan(&behind, &ahead); err != nil {
-		t.Fatalf("остатки после рестарта: %v", err)
+		t.Fatalf("the remainder after the restart: %v", err)
 	}
 	if behind != 1 || ahead != 0 {
-		t.Fatalf("позади курсора headers=%d (want 1 — не посещалась), впереди=%d (want 0 — вычищена)", behind, ahead)
+		t.Fatalf("behind the cursor headers=%d (want 1 — not visited), ahead=%d (want 0 — purged)", behind, ahead)
 	}
 
 	// No loss: a full pass from the zero cursor purges the laggard too;
@@ -1326,15 +1326,15 @@ func TestContent_RetentionCursorRestart(t *testing.T) {
 		t.Fatalf("RetentionOnce: %v", err)
 	}
 	if stats.Rows != 1 {
-		t.Fatalf("RetentionOnce: Rows = %d, want 1 (запись позади курсора — идемпотентность)", stats.Rows)
+		t.Fatalf("RetentionOnce: Rows = %d, want 1 (the row behind the cursor — idempotence)", stats.Rows)
 	}
 	if err := pool.QueryRow(ctx,
 		"SELECT zone_id, domain_id, subdomain_id FROM retention_drain_cursor WHERE id = 1",
 	).Scan(&curZone, &curDomain, &curSub); err != nil {
-		t.Fatalf("строка курсора после RetentionOnce: %v", err)
+		t.Fatalf("the cursor row after RetentionOnce: %v", err)
 	}
 	if curDomain != 2 || curSub != 1 {
-		t.Fatalf("строка курсора = %d/%d, want позиция цикла 2 (2/1) — разовый проход её не трогает", curDomain, curSub)
+		t.Fatalf("the cursor row = %d/%d, want circle 2's position (2/1) — the one-off pass does not touch it", curDomain, curSub)
 	}
 }
 
@@ -1361,7 +1361,7 @@ func explainPlan(t *testing.T, tx pgx.Tx, ctx context.Context, sql string) strin
 	for rows.Next() {
 		var line string
 		if err := rows.Scan(&line); err != nil {
-			t.Fatalf("EXPLAIN: чтение: %v", err)
+			t.Fatalf("EXPLAIN: read: %v", err)
 		}
 		plan.WriteString(line)
 		plan.WriteByte('\n')

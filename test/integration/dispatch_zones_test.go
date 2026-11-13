@@ -40,16 +40,16 @@ func TestScheduler_DispatchOnlyZonesWithWork(t *testing.T) {
 	if _, err := pool.Exec(ctx,
 		"INSERT INTO domains (zone_id, label) VALUES ($1, 'stale1'), ($1, 'stale2')", drift,
 	); err != nil {
-		t.Fatalf("вставка доменов зоны-дрейфа: %v", err)
+		t.Fatalf("inserting the drift zone's domains: %v", err)
 	}
 
 	// Round 1 sees only the zone with work: drift zone domains are not selected.
 	batch, err := scheduler.DispatchBatch(ctx, pool, scheduler.DispatchQuery{Limit: 10})
 	if err != nil {
-		t.Fatalf("выборка пачки: %v", err)
+		t.Fatalf("dispatch batch: %v", err)
 	}
 	if len(batch) != 2 {
-		t.Fatalf("выбрано доменов: %d, хочу 2 (только зона с работой)", len(batch))
+		t.Fatalf("dispatched domains: %d, want 2 (only the zone with work)", len(batch))
 	}
 	got := idSet(func() []int64 {
 		ids := make([]int64, 0, len(batch))
@@ -60,7 +60,7 @@ func TestScheduler_DispatchOnlyZonesWithWork(t *testing.T) {
 	}())
 	for _, id := range busy {
 		if !got[id] {
-			t.Fatalf("домен %d зоны busy.test не выбран (пачка %+v)", id, batch)
+			t.Fatalf("domain %d of busy.test not dispatched (batch %+v)", id, batch)
 		}
 	}
 
@@ -69,14 +69,14 @@ func TestScheduler_DispatchOnlyZonesWithWork(t *testing.T) {
 	// is empty, the zone is closed until a refill (no probes by "tail").
 	q := &countersStubQueue{}
 	if _, err := scheduler.EnqueueBatch(ctx, pool, q, batch); err != nil {
-		t.Fatalf("постановка пачки: %v", err)
+		t.Fatalf("enqueue batch: %v", err)
 	}
 	after, err := scheduler.DispatchBatch(ctx, pool, scheduler.DispatchQuery{Limit: 10})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(after) != 0 {
-		t.Fatalf("после исчерпания выбрано %d, хочу 0 (зона вне выборки)", len(after))
+		t.Fatalf("after the exhaustion dispatched %d, want 0 (the zone outside the selection)", len(after))
 	}
 
 	// Refill: an add-file into a new zone through the ingest pipeline (the
@@ -101,18 +101,18 @@ func TestScheduler_DispatchOnlyZonesWithWork(t *testing.T) {
 		t.Fatal(err)
 	}
 	if out, err := pipe.Process(ctx, file); err != nil || out.Kind != ingest.OutcomeApplied {
-		t.Fatalf("конвейер ingest: out=%+v err=%v, хочу applied", out, err)
+		t.Fatalf("the ingest pipeline: out=%+v err=%v, want applied", out, err)
 	}
 	refilled, err := scheduler.DispatchBatch(ctx, pool, scheduler.DispatchQuery{Limit: 10})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(refilled) != 2 {
-		t.Fatalf("после ingest выбрано %d, хочу 2 (apply_add открыл зону сразу)", len(refilled))
+		t.Fatalf("after the ingest dispatched %d, want 2 (apply_add opened the zone immediately)", len(refilled))
 	}
 	for _, d := range refilled {
 		if !strings.HasSuffix(d.Name, ".fresh.test") {
-			t.Fatalf("в пачке чужой домен %q — хочу только fresh.test", d.Name)
+			t.Fatalf("a foreign domain %q in the batch — want only fresh.test", d.Name)
 		}
 	}
 }
