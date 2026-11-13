@@ -340,7 +340,7 @@ AGENTS.md (отдельный worktree, ревью по схеме, один к�
 |---|---|---|---|---|
 | L-01 | [in progress] | ld-landing | приватный репо ld-landing на **GitHub** + описание; каркас монорепо (vite-ssg + TS + весь тулинг §8); README.md; Makefile §9; пустая страница-заглушка | — |
 | L-02 | [new] | ld-landing | Перенос лендинга: index.vue 1:1, компоненты (§6), словари ru/en из `i18n.go`, Metrika, seo.ts (canonical/hreflang/OG), sitemap/robots; мок API в dev | L-01 |
-| L-03 | [in progress] | laravel-domains | `GET /api/v1/landing/stats` (§7.1) | — (параллельно L-01/L-02) |
+| L-03 | [done] | laravel-domains | `GET /api/v1/landing/stats` (§7.1) — слит в master (3911ece), ревью P2/P3-фиксы применены | — (параллельно L-01/L-02) |
 | L-04 | [new] | laravel-domains | CORS для `/api/*` (§7.2) | L-03 (обе в `internal/web`) |
 | L-05 | [new] | ld-landing | targets.yaml, `make deploy/rollback`, verify-скрипт, e2e; проверка на моках | L-02, L-03, L-04 |
 | L-06 | [new] | uspromo, aphrodite | **Остаток после досрочной настройки (§11.1)**: деплой статики через L-05, curl-чеки, SEO-аудит (hreflang/canonical/sitemap), проверка формы и stats на живом API. Nginx+TLS+vhost'ы уже готовы 13.11 | L-05 |
