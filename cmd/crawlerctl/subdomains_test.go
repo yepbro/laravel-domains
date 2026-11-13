@@ -460,7 +460,7 @@ func TestSubdomainsDisableRunLabelPriority(t *testing.T) {
 func TestSubdomainsDisableRunNotFound(t *testing.T) {
 	pool := newSubdomainsPool()
 	err := subdomainsDisableRun(context.Background(), pool, "nope", &bytes.Buffer{})
-	if err == nil || !strings.Contains(err.Error(), `subdomain \"nope\" not found in the catalog`) {
+	if err == nil || !strings.Contains(err.Error(), "subdomain \"nope\" not found in the catalog") {
 		t.Fatalf("err = %v, want \"not found in the catalog\"", err)
 	}
 	// A numeric argument missing from the occupied bits — also not found.

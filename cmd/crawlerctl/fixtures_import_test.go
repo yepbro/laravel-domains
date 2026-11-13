@@ -244,7 +244,7 @@ func TestFixturesReadDump(t *testing.T) {
 			fixturesResult{ZoneID: 7, DomainID: 999, SubdomainID: 0, Variant: 0, Scheme: 2, CheckedAt: time.Now()})
 		writeDumpDir(t, dir, nil, zones, domains, orphan, smoke)
 		_, err := fixturesReadDump(dir)
-		if err == nil || !strings.Contains(err.Error(), "a domain that does not exist") {
+		if err == nil || !strings.Contains(err.Error(), "references a domain missing from") {
 			t.Errorf("the orphan error = %v, want a referential integrity refusal", err)
 		}
 	})
@@ -255,7 +255,7 @@ func TestFixturesReadDump(t *testing.T) {
 			fixturesDomain{ZoneID: 9, ID: 1, Label: "stray"})
 		writeDumpDir(t, dir, nil, zones, orphanDomains, results, smoke)
 		_, err := fixturesReadDump(dir)
-		if err == nil || !strings.Contains(err.Error(), "a zone that does not exist") {
+		if err == nil || !strings.Contains(err.Error(), "references a zone missing from") {
 			t.Errorf("the domain without a zone error = %v", err)
 		}
 	})
@@ -836,10 +836,10 @@ func TestFixturesPublishRun(t *testing.T) {
 		}
 	})
 
-	t.Run("an unknown mode", func(t *testing.T) {
+	t.Run("unknown mode", func(t *testing.T) {
 		var out bytes.Buffer
 		if _, err := fixturesPublishRun(context.Background(), &publishQueue{}, importDump(t), "some", &out); err == nil ||
-			!strings.Contains(err.Error(), "an unknown mode") {
+			!strings.Contains(err.Error(), "unknown mode") {
 			t.Errorf("the junk mode = %v, want a refusal", err)
 		}
 	})

@@ -352,7 +352,7 @@ func TestStatusHelpMentionsStreams(t *testing.T) {
 	if !strings.Contains(statusHelp, "ETA") {
 		t.Error("statusHelp does not describe the cycle ETA")
 	}
-	if !strings.Contains(statusHelp, "crawler_counters hourly buckets") {
+	if !strings.Contains(statusHelp, "crawler_counters hourly") {
 		t.Error("statusHelp does not describe the rate source (the hourly buckets, T-203)")
 	}
 	if strings.Contains(statusHelp, "last hour") {

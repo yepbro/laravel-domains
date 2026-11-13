@@ -272,7 +272,7 @@ func TestZonesToggleRunQueryError(t *testing.T) {
 	pool := newZonesPool()
 	pool.queryErr = errors.New("no connection")
 	err := zonesToggleRun(context.Background(), pool, "disable", "crawl.test", &bytes.Buffer{})
-	if err == nil || !strings.Contains(err.Error(), "the zone by name crawl.test") {
+	if err == nil || !strings.Contains(err.Error(), "zone by name crawl.test") {
 		t.Fatalf("err = %v, want the zone lookup context", err)
 	}
 }

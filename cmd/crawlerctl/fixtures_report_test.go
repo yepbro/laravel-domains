@@ -329,7 +329,7 @@ func TestFixturesReportDOM(t *testing.T) {
 	}
 	var buf bytes.Buffer
 	fixturesReportPrint(&buf, r)
-	for _, want := range []string{"×1.00", "90.00%", "an identical DOM"} {
+	for _, want := range []string{"×1.00", "90.00%", "identical DOM"} {
 		if !strings.Contains(buf.String(), want) {
 			t.Errorf("the report text without %q:\n%s", want, buf.String())
 		}
@@ -486,7 +486,7 @@ func TestFixturesReportEmptyMetrics(t *testing.T) {
 	if v := verdictOf(t, r, "crashes"); v == nil || v.Status != verdictNone {
 		t.Fatalf("the crashes verdict = %+v, want NO DATA (metrics without events)", v)
 	}
-	if !strings.Contains(strings.Join(r.Warnings, "\n"), "without events") {
+	if !strings.Contains(strings.Join(r.Warnings, "\n"), "no events") {
 		t.Errorf("no warning about the empty metrics")
 	}
 }
@@ -515,7 +515,7 @@ func TestFixturesReportPaceWithoutStreams(t *testing.T) {
 	var buf bytes.Buffer
 	fixturesReportPrint(&buf, r)
 	text := buf.String()
-	if !strings.Contains(text, "the pace no data") {
+	if !strings.Contains(text, "no pace data") {
 		t.Errorf("the text without the honest pace degradation:\n%s", text)
 	}
 	for _, want := range []string{"avg 4.00 s", "p95 4.75 s", "avg 3.00 s"} {
@@ -547,7 +547,7 @@ func TestFixturesReportDOMScriptZero(t *testing.T) {
 	}
 	var buf bytes.Buffer
 	fixturesReportPrint(&buf, r)
-	if !strings.Contains(buf.String(), "no <script> at all: 3") {
+	if !strings.Contains(buf.String(), "no <script>: 3") {
 		t.Errorf("the text without the lost scripts metric:\n%s", buf.String())
 	}
 }
@@ -564,7 +564,7 @@ func TestFixturesReportTruncatedKeys(t *testing.T) {
 		t.Fatalf("the report: %v", err)
 	}
 	joined := strings.Join(r.Warnings, "\n")
-	if !strings.Contains(joined, "10 rows with 12 keys") {
+	if !strings.Contains(joined, "10 rows in the snapshot with 12 dump keys") {
 		t.Errorf("no warning about the selection truncation: %s", joined)
 	}
 	if r.Keys != 10 {

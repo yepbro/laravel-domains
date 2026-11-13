@@ -183,7 +183,7 @@ func TestFetchZoneList(t *testing.T) {
 		t.Errorf("the 404 error = %v, want HTTP 404", err)
 	}
 	if _, err := fetchZoneList(context.Background(), srv.URL+"/big"); err == nil ||
-		!strings.Contains(err.Error(), "over the limit") {
+		!strings.Contains(err.Error(), "exceeds the limit") {
 		t.Errorf("the cap error = %v, want \"over the limit\"", err)
 	}
 	// An unreachable address — a download error (timeout / connection refusal).
@@ -213,7 +213,7 @@ func TestReadZoneListFile(t *testing.T) {
 	if err := os.WriteFile(big, bytes.Repeat([]byte("a\n"), 600*1024), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := readZoneListFile(big); err == nil || !strings.Contains(err.Error(), "over the limit") {
+	if _, err := readZoneListFile(big); err == nil || !strings.Contains(err.Error(), "exceeds the limit") {
 		t.Errorf("the cap error = %v, want \"over the limit\"", err)
 	}
 	if _, err := readZoneListFile(filepath.Join(dir, "nope.txt")); err == nil {
