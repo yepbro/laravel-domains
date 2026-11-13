@@ -322,7 +322,7 @@ of scope (waiting for upstream #4151 — one browser context per connection).
 
 ## Stage 46: block_trackers — the sync probe on the moli #2729 exact-URL semantics (T-276)
 
-- **T-276** [new] — P1, collapse the sync probe's engine branching after
+- **T-276** [in progress] — P1, collapse the sync probe's engine branching after
   #2729 is merged: the maintainer introduced exact URL matching for sync XHR
   (a match → a block, including redirects), the tracker probe is blocked on
   both engines — the “moli: 200 to the network” expectation is outdated —
