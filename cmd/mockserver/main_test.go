@@ -28,7 +28,7 @@ func TestTarpitRate(t *testing.T) {
 		}
 	}
 	if tarpitMaxRate <= 0 || tarpitMaxRate > 1<<21 {
-		t.Errorf("tarpitMaxRate = %d — предел должен быть мал против гигабайтных заказов", tarpitMaxRate)
+		t.Errorf("tarpitMaxRate = %d — the limit must be small against gigabyte-sized requests", tarpitMaxRate)
 	}
 }
 
@@ -73,9 +73,9 @@ func TestSlowHandlerClientGone(t *testing.T) {
 	select {
 	case <-done:
 		if rec.Body.Len() != 0 {
-			t.Errorf("после отмены клиентом тело = %q, хочу ответ не писался", rec.Body.String())
+			t.Errorf("after the client cancellation the body = %q, want no response written", rec.Body.String())
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("обработчик /slow держит горутину после отключения клиента (ctx не учтён)")
+		t.Fatal("the /slow handler keeps the goroutine after the client disconnects (ctx is not respected)")
 	}
 }

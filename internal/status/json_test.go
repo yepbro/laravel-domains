@@ -43,7 +43,7 @@ func TestBuildSummaryJSON(t *testing.T) {
 		`"throughput":{"done_today":3599,"elapsed_sec":3600,"results_hour":7199,"rendered_hour":1,"hour_window_sec":3600}`,
 	} {
 		if !strings.Contains(got, want) {
-			t.Errorf("JSON не содержит %s:\n%s", want, got)
+			t.Errorf("the JSON does not contain %s:\n%s", want, got)
 		}
 	}
 
@@ -51,29 +51,29 @@ func TestBuildSummaryJSON(t *testing.T) {
 	// rates — 7199/3600 = 1.99972… → 2; 1/3600 = 0.00027… → 0.
 	r := doc.Rates
 	if r.DomainsPerSec == nil || *r.DomainsPerSec != 1 {
-		t.Errorf("domains_per_sec = %v, хочу 1 (3599/3600 округляется до 1)", r.DomainsPerSec)
+		t.Errorf("domains_per_sec = %v, want 1 (3599/3600 rounds to 1)", r.DomainsPerSec)
 	}
 	if r.ResultsPerSec != 2 || r.RendersPerSec != 0 {
-		t.Errorf("скорости часа = %v/%v, хочу 2/0", r.ResultsPerSec, r.RendersPerSec)
+		t.Errorf("the hour rates = %v/%v, want 2/0", r.ResultsPerSec, r.RendersPerSec)
 	}
 	if r.Remaining != 62 {
-		t.Errorf("remaining = %d, хочу 62", r.Remaining)
+		t.Errorf("remaining = %d, want 62", r.Remaining)
 	}
 	if r.ETASec == nil || *r.ETASec != 62 {
-		t.Errorf("eta_sec = %v, хочу 62", r.ETASec)
+		t.Errorf("eta_sec = %v, want 62", r.ETASec)
 	}
 
 	// Empty zones — "[]", not null; the unicode of an empty zone is
 	// omitted.
 	empty := BuildSummaryJSON(nil, Totals{}, Throughput{ElapsedSec: 300}, ComputeRates(Throughput{ElapsedSec: 300}, 10, 0), nil)
 	if empty.Zones == nil || len(empty.Zones) != 0 {
-		t.Errorf("zones = %v, хочу пустой срез", empty.Zones)
+		t.Errorf("zones = %v, want an empty slice", empty.Zones)
 	}
 	if empty.Rates.DomainsPerSec != nil || empty.Rates.ETASec != nil {
-		t.Errorf("короткое окно: rates = %+v, хочу null/null", *empty.Rates)
+		t.Errorf("a short window: rates = %+v, want null/null", *empty.Rates)
 	}
 	if empty.Rates.Remaining != 10 {
-		t.Errorf("remaining = %d, хочу 10", empty.Rates.Remaining)
+		t.Errorf("remaining = %d, want 10", empty.Rates.Remaining)
 	}
 }
 

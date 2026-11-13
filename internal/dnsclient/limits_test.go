@@ -212,7 +212,7 @@ func limitPollCond(t *testing.T, cond func() bool, msg string) {
 	deadline := time.Now().Add(2 * time.Second)
 	for !cond() {
 		if time.Now().After(deadline) {
-			t.Fatal("не дождались: " + msg)
+			t.Fatal("did not wait in time: " + msg)
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
@@ -245,7 +245,7 @@ func TestLimitOptionsDefaults(t *testing.T) {
 	}
 	got = LimitOptions{Concurrency: 42, Burst: 7}.withDefaults()
 	if got.Burst != 7 {
-		t.Fatalf("burst = %d, want 7 (задан явно)", got.Burst)
+		t.Fatalf("burst = %d, want 7 (set explicitly)", got.Burst)
 	}
 }
 
@@ -268,12 +268,12 @@ func TestLimitOptionsValidate(t *testing.T) {
 			opts := LimitOptions{}.withDefaults()
 			tc.modify(&opts)
 			if err := opts.validate(); err == nil {
-				t.Fatal("ожидается ошибка валидации")
+				t.Fatal("want a validation error")
 			}
 		})
 	}
 	if err := (LimitOptions{}).withDefaults().validate(); err != nil {
-		t.Fatalf("дефолты валидны: %v", err)
+		t.Fatalf("the defaults are valid: %v", err)
 	}
 }
 
@@ -284,13 +284,13 @@ func TestNewLimitOptions(t *testing.T) {
 	}
 	cfg.IPv6 = true
 	if got := NewLimitOptions(cfg); got.DisableAAAA {
-		t.Fatalf("NewLimitOptions(ipv6=true) = %+v: AAAA не отключаются", got)
+		t.Fatalf("NewLimitOptions(ipv6=true) = %+v: AAAA is not disabled", got)
 	}
 }
 
 func TestNewLimitResolverNilNext(t *testing.T) {
 	if _, err := NewLimitResolver(nil, LimitOptions{}); err == nil {
-		t.Fatal("nil-резолвер: ожидается ошибка")
+		t.Fatal("a nil resolver: want an error")
 	}
 }
 
@@ -310,13 +310,13 @@ func TestLimitSemaphore(t *testing.T) {
 	ctx, cancel := context.WithTimeout(bg, 40*time.Millisecond)
 	defer cancel()
 	if err := s.acquire(ctx); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("acquire за потолком: %v, want DeadlineExceeded", err)
+		t.Fatalf("acquire above the cap: %v, want DeadlineExceeded", err)
 	}
 
 	// The freed slot goes to the next waiter.
 	s.release()
 	if err := s.acquire(bg); err != nil {
-		t.Fatalf("acquire после release: %v", err)
+		t.Fatalf("acquire after release: %v", err)
 	}
 	if cur, max := s.state(); cur != 2 || max != 2 {
 		t.Fatalf("state = (%d, %d), want (2, 2)", cur, max)
@@ -338,7 +338,7 @@ func TestLimitSemaphoreShrink(t *testing.T) {
 	time.Sleep(30 * time.Millisecond)
 	select {
 	case err := <-done:
-		t.Fatalf("ждущий.acquire при cur=max: вернулся до освобождения: %v", err)
+		t.Fatalf("a waiter.acquire at cur=max: returned before the release: %v", err)
 	default:
 	}
 
@@ -346,7 +346,7 @@ func TestLimitSemaphoreShrink(t *testing.T) {
 	time.Sleep(30 * time.Millisecond)
 	select {
 	case err := <-done:
-		t.Fatalf("ждущий.acquire при cur=max=1: вернулся: %v", err)
+		t.Fatalf("a waiter.acquire at cur=max=1: returned: %v", err)
 	default:
 	}
 
@@ -357,14 +357,14 @@ func TestLimitSemaphoreShrink(t *testing.T) {
 			t.Fatalf("acquire: %v", err)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("acquire не прошёл после освобождения слота")
+		t.Fatal("acquire did not succeed after the slot was released")
 	}
 	cancel()
 
 	// Raising the cap: new slots are handed out without waiting.
 	s.setMax(3)
 	if err := s.acquire(bg); err != nil {
-		t.Fatalf("acquire после роста потолка: %v", err)
+		t.Fatalf("acquire after the cap grew: %v", err)
 	}
 }
 
@@ -382,7 +382,7 @@ func TestLimitBucket(t *testing.T) {
 		}
 	}
 	if sleeps := fc.slept(); len(sleeps) != 0 {
-		t.Fatalf("в пределах burst не ждём, паузы: %v", sleeps)
+		t.Fatalf("within the burst we do not wait, sleeps: %v", sleeps)
 	}
 
 	// Then the rate: 100 ms per token (1/10 s).
@@ -393,21 +393,21 @@ func TestLimitBucket(t *testing.T) {
 	}
 	want := []time.Duration{100 * time.Millisecond, 100 * time.Millisecond}
 	if sleeps := fc.slept(); !equalDurations(sleeps, want) {
-		t.Fatalf("паузы: %v, want %v", sleeps, want)
+		t.Fatalf("sleeps: %v, want %v", sleeps, want)
 	}
 
 	// A long idle does not overflow the bucket: the refill is capped at burst.
 	fc.advance(10 * time.Second)
 	for i := 0; i < 5; i++ {
 		if err := b.take(bg); err != nil {
-			t.Fatalf("take после простоя %d: %v", i+1, err)
+			t.Fatalf("take after idle %d: %v", i+1, err)
 		}
 	}
 	if err := b.take(bg); err != nil {
-		t.Fatalf("take сверх burst: %v", err)
+		t.Fatalf("take above the burst: %v", err)
 	}
 	if sleeps := fc.slept(); len(sleeps) != 3 {
-		t.Fatalf("паузы: %v, want 3 × 100ms", sleeps)
+		t.Fatalf("sleeps: %v, want 3 × 100ms", sleeps)
 	}
 }
 
@@ -423,7 +423,7 @@ func TestLimitBucketRateChange(t *testing.T) {
 		t.Fatal(err)
 	}
 	if sleeps := fc.slept(); !equalDurations(sleeps, []time.Duration{500 * time.Millisecond}) {
-		t.Fatalf("паузы: %v, want [500ms]", sleeps)
+		t.Fatalf("sleeps: %v, want [500ms]", sleeps)
 	}
 }
 
@@ -448,13 +448,13 @@ func TestLimitBucketSingleWakePerToken(t *testing.T) {
 	}
 	wg.Wait()
 	if n := cc.sleeps.Load(); n != total-1 {
-		t.Fatalf("пауз %d, want %d (по одной на ждущего — шторма пробуждений нет)", n, total-1)
+		t.Fatalf("sleeps %d, want %d (one per waiter — no wakeup storms)", n, total-1)
 	}
 	// The last waiter entered the queue ~right after the start: its mark is
 	// 9/100 s. Real timers sleep no less than requested, so the lower
 	// bound is reliable.
 	if since := time.Since(start); since < 9*10*time.Millisecond {
-		t.Fatalf("итоговое время %s < 90 мс — темп очереди не выдержан", since)
+		t.Fatalf("the total time %s < 90ms — the queue rate is not kept", since)
 	}
 }
 
@@ -465,7 +465,7 @@ func TestLimitBucketUnreserve(t *testing.T) {
 	b := newLimitBucket(1, 1, fc.clock())
 
 	if _, ok := b.reserve(); !ok {
-		t.Fatal("первый токен обязан пройти без ожидания")
+		t.Fatal("the first token must pass without waiting")
 	}
 	wait, ok := b.reserve() // balance −1: waiting 1s
 	if ok || wait != time.Second {
@@ -474,7 +474,7 @@ func TestLimitBucketUnreserve(t *testing.T) {
 	b.unreserve() // the waiter is cancelled: the debt is removed
 	wait, ok = b.reserve()
 	if ok || wait != time.Second {
-		t.Fatalf("reserve после unreserve = (%v, %v), want (1s, false) — долг не накопился", wait, ok)
+		t.Fatalf("reserve after unreserve = (%v, %v), want (1s, false) — no debt accumulated", wait, ok)
 	}
 
 	// The debt of two waiters without cancellation — the third one's mark is farther: 3s, not 2s.
@@ -483,7 +483,7 @@ func TestLimitBucketUnreserve(t *testing.T) {
 	_, _ = b.reserve()
 	wait, ok = b.reserve()
 	if ok || wait != 3*time.Second {
-		t.Fatalf("reserve третьего в очереди = (%v, %v), want (3s, false)", wait, ok)
+		t.Fatalf("reserve of the third in the queue = (%v, %v), want (3s, false)", wait, ok)
 	}
 }
 
@@ -502,7 +502,7 @@ func TestLimitBucketBurstCappedByQPS(t *testing.T) {
 		}
 	}
 	if took != 50 {
-		t.Fatalf("мгновенно взято %d токенов, want 50 (секунда темпа, не 2000)", took)
+		t.Fatalf("instantly took %d tokens, want 50 (a second of rate, not 2000)", took)
 	}
 }
 
@@ -526,7 +526,7 @@ func TestLimitBucketBurstFollowsRate(t *testing.T) {
 		}
 	}
 	if took != 10 {
-		t.Fatalf("мгновенно взято %d токенов после снижения, want 10 (секунда нового темпа)", took)
+		t.Fatalf("instantly took %d tokens after the decrease, want 10 (a second of the new rate)", took)
 	}
 
 	// The rate is restored — the capacity is back to the original.
@@ -541,7 +541,7 @@ func TestLimitBucketBurstFollowsRate(t *testing.T) {
 		}
 	}
 	if took != 100 {
-		t.Fatalf("мгновенно взято %d токенов после восстановления, want 100", took)
+		t.Fatalf("instantly took %d tokens after the recovery, want 100", took)
 	}
 }
 
@@ -572,10 +572,10 @@ func TestLimitResolverConcurrency(t *testing.T) {
 	close(start)
 
 	// Exactly cap exchanges got through to the resolver: 3.
-	limitPollCond(t, func() bool { c, _, _ := next.stats(); return c == 3 }, "3 обмена до резолвера")
+	limitPollCond(t, func() bool { c, _, _ := next.stats(); return c == 3 }, "3 exchanges to the resolver")
 	time.Sleep(30 * time.Millisecond)
 	if c, _, _ := next.stats(); c != 3 {
-		t.Fatalf("обменов к резолверу: %d, want 3 (семафор)", c)
+		t.Fatalf("exchanges to the resolver: %d, want 3 (the semaphore)", c)
 	}
 
 	close(hold)
@@ -587,13 +587,13 @@ func TestLimitResolverConcurrency(t *testing.T) {
 	}
 	calls, maxInflight, inflight := next.stats()
 	if calls != total {
-		t.Fatalf("обменов: %d, want %d", calls, total)
+		t.Fatalf("exchanges: %d, want %d", calls, total)
 	}
 	if maxInflight != 3 {
-		t.Fatalf("максимальная параллельность: %d, want 3", maxInflight)
+		t.Fatalf("max parallelism: %d, want 3", maxInflight)
 	}
 	if inflight != 0 {
-		t.Fatalf("осталось в полёте: %d", inflight)
+		t.Fatalf("still in flight: %d", inflight)
 	}
 	if st := r.Stats(); st.InFlight != 0 || st.Concurrency != 3 || st.ConcurrencyCfg != 3 {
 		t.Fatalf("Stats: %+v", st)
@@ -624,7 +624,7 @@ func TestLimitResolverQPSPacing(t *testing.T) {
 		200 * time.Millisecond, 200 * time.Millisecond,
 	}
 	if sleeps := fc.slept(); !equalDurations(sleeps, want) {
-		t.Fatalf("паузы: %v, want %v", sleeps, want)
+		t.Fatalf("sleeps: %v, want %v", sleeps, want)
 	}
 	if st := r.Stats(); st.Exchanges != 6 {
 		t.Fatalf("Stats.Exchanges = %d, want 6", st.Exchanges)
@@ -662,7 +662,7 @@ func TestLimitResolverAdaptiveDecrease(t *testing.T) {
 		}
 	}
 	if st := r.Stats(); st.Concurrency != 100 || st.WindowFilled {
-		t.Fatalf("до заполнения окна: %+v", st)
+		t.Fatalf("before the window is filled: %+v", st)
 	}
 
 	// The 10th timeout fills the window (share 1.0 ≥ 0.5): the first shed ×0.5.
@@ -670,7 +670,7 @@ func TestLimitResolverAdaptiveDecrease(t *testing.T) {
 		t.Fatal(err)
 	}
 	if st := r.Stats(); st.Concurrency != 50 || st.QPS != 50 || !st.WindowFilled || st.WindowTimeouts != 10 {
-		t.Fatalf("после заполнения: %+v", st)
+		t.Fatalf("after filling: %+v", st)
 	}
 
 	// Then down to the floor: base/100 = 1 (the floor holds both concurrency and QPS).
@@ -680,10 +680,10 @@ func TestLimitResolverAdaptiveDecrease(t *testing.T) {
 		}
 	}
 	if st := r.Stats(); st.Concurrency != 1 || st.QPS != 1 {
-		t.Fatalf("пол: %+v, want Concurrency=1 QPS=1", st)
+		t.Fatalf("the floor: %+v, want Concurrency=1 QPS=1", st)
 	}
 	if st := r.Stats(); st.Timeouts != 20 || st.Errors != 0 || st.Exchanges != 20 {
-		t.Fatalf("счётчики: %+v", st)
+		t.Fatalf("the counters: %+v", st)
 	}
 }
 
@@ -703,7 +703,7 @@ func TestLimitResolverAdaptiveRecover(t *testing.T) {
 		_, _ = r.Exchange(bg, q)
 	}
 	if st := r.Stats(); st.Concurrency != 1 {
-		t.Fatalf("после снижения: %+v", st)
+		t.Fatalf("after the decrease: %+v", st)
 	}
 
 	// The resolver came back: the window clears of timeouts, the share
@@ -715,7 +715,7 @@ func TestLimitResolverAdaptiveRecover(t *testing.T) {
 		}
 	}
 	if st := r.Stats(); st.Concurrency != 2 || st.QPS != 1.25 {
-		t.Fatalf("первый шаг восстановления: %+v, want Concurrency=2 QPS=1.25", st)
+		t.Fatalf("the first recovery step: %+v, want Concurrency=2 QPS=1.25", st)
 	}
 
 	for i := 0; i < 40; i++ {
@@ -725,10 +725,10 @@ func TestLimitResolverAdaptiveRecover(t *testing.T) {
 	}
 	st := r.Stats()
 	if st.Concurrency != 100 || st.QPS != 100 {
-		t.Fatalf("восстановление до base: %+v", st)
+		t.Fatalf("recovery to base: %+v", st)
 	}
 	if st.WindowTimeouts != 0 || st.Errors != 0 || st.Timeouts != 20 {
-		t.Fatalf("счётчики: %+v", st)
+		t.Fatalf("the counters: %+v", st)
 	}
 }
 
@@ -747,7 +747,7 @@ func TestLimitResolverAdaptiveIgnoresOtherErrors(t *testing.T) {
 		_, _ = r.Exchange(context.Background(), q)
 	}
 	if st := r.Stats(); st.Concurrency != 100 || st.QPS != 100 || st.Errors != 20 {
-		t.Fatalf("не-таймаутные ошибки: %+v", st)
+		t.Fatalf("non-timeout errors: %+v", st)
 	}
 }
 
@@ -774,17 +774,17 @@ func TestLimitAdaptiveAppliesUnderLock(t *testing.T) {
 
 	a.record(true, apply) // the window is not full yet — no changes
 	if applied != 0 {
-		t.Fatalf("применений до заполнения окна: %d, want 0", applied)
+		t.Fatalf("applications before the window is filled: %d, want 0", applied)
 	}
 	a.record(true, apply) // the window is full of timeouts: shed ×0.5
 	if applied != 1 {
-		t.Fatalf("применений: %d, want 1", applied)
+		t.Fatalf("applications: %d, want 1", applied)
 	}
 	if !inLock {
-		t.Fatal("лимиты применены вне блокировки адаптива")
+		t.Fatal("the limits were applied outside the adaptive lock")
 	}
 	if conc, _, _, _, _, _, _ := a.snapshot(); conc != 50 {
-		t.Fatalf("conc = %d, want 50 (первое снижение)", conc)
+		t.Fatalf("conc = %d, want 50 (the first decrease)", conc)
 	}
 }
 
@@ -806,7 +806,7 @@ func TestLimitResolverAdaptiveShrinksLiveSemaphore(t *testing.T) {
 		_, _ = r.Exchange(bg, q)
 	}
 	if st := r.Stats(); st.Concurrency != 2 {
-		t.Fatalf("снижение: %+v", st)
+		t.Fatalf("the decrease: %+v", st)
 	}
 
 	hold := make(chan struct{})
@@ -819,10 +819,10 @@ func TestLimitResolverAdaptiveShrinksLiveSemaphore(t *testing.T) {
 			_, _ = r.Exchange(bg, q)
 		}()
 	}
-	limitPollCond(t, func() bool { c, _, _ := next.stats(); return c == 12 }, "2 обмена после снижения")
+	limitPollCond(t, func() bool { c, _, _ := next.stats(); return c == 12 }, "2 exchanges after the decrease")
 	time.Sleep(30 * time.Millisecond)
 	if c, _, _ := next.stats(); c != 12 {
-		t.Fatalf("обменов: %d, want 12 (новый потолок 2)", c)
+		t.Fatalf("exchanges: %d, want 12 (the new cap 2)", c)
 	}
 	if st := r.Stats(); st.InFlight != 2 {
 		t.Fatalf("InFlight = %d, want 2", st.InFlight)
@@ -831,7 +831,7 @@ func TestLimitResolverAdaptiveShrinksLiveSemaphore(t *testing.T) {
 	close(hold)
 	wg.Wait()
 	if _, maxInflight, inflight := next.stats(); maxInflight != 2 || inflight != 0 {
-		t.Fatalf("параллельность после снижения: max=%d inflight=%d, want 2/0", maxInflight, inflight)
+		t.Fatalf("parallelism after the decrease: max=%d inflight=%d, want 2/0", maxInflight, inflight)
 	}
 }
 
@@ -854,20 +854,20 @@ func TestLimitResolverDisableAAAA(t *testing.T) {
 			t.Fatalf("Exchange AAAA %d: %v", i+1, err)
 		}
 		if res.RCode != RCodeNOERROR || len(res.Answer) != 0 || len(res.Ns) != 0 {
-			t.Fatalf("Exchange AAAA %d: %+v, want пустой NOERROR", i+1, res)
+			t.Fatalf("Exchange AAAA %d: %+v, want an empty NOERROR", i+1, res)
 		}
 		if len(res.RecordsOf(dns.TypeAAAA)) != 0 {
-			t.Fatalf("записей AAAA: %d, want 0", len(res.RecordsOf(dns.TypeAAAA)))
+			t.Fatalf("AAAA records: %d, want 0", len(res.RecordsOf(dns.TypeAAAA)))
 		}
 		if res.Attempts != 0 || res.TCP || res.Elapsed != 0 {
-			t.Fatalf("локальный ответ без обмена: %+v", res)
+			t.Fatalf("a local answer without an exchange: %+v", res)
 		}
 	}
 	if c, _, _ := next.stats(); c != 0 {
-		t.Fatalf("нижний резолвер вызван %d раз, want 0", c)
+		t.Fatalf("the underlying resolver was called %d times, want 0", c)
 	}
 	if sleeps := fc.slept(); len(sleeps) != 0 {
-		t.Fatalf("AAAA не тратит лимиты темпа, паузы: %v", sleeps)
+		t.Fatalf("AAAA does not spend the rate limits, sleeps: %v", sleeps)
 	}
 	if st := r.Stats(); st.AAAAIgnored != 3 || st.Exchanges != 0 {
 		t.Fatalf("Stats: %+v", st)
@@ -879,7 +879,7 @@ func TestLimitResolverDisableAAAA(t *testing.T) {
 		t.Fatal(err)
 	}
 	if c, _, _ := next.stats(); c != 1 {
-		t.Fatalf("обменов A: %d, want 1", c)
+		t.Fatalf("A exchanges: %d, want 1", c)
 	}
 	// A rate of 1 QPS with burst 1: the second exchange waits a second — the
 	// AAAA exchanges did not dilute the bucket.
@@ -887,7 +887,7 @@ func TestLimitResolverDisableAAAA(t *testing.T) {
 		t.Fatal(err)
 	}
 	if sleeps := fc.slept(); !equalDurations(sleeps, []time.Duration{time.Second}) {
-		t.Fatalf("паузы: %v, want [1s]", sleeps)
+		t.Fatalf("sleeps: %v, want [1s]", sleeps)
 	}
 
 	// Without AAAA disabling it goes to the resolver as an ordinary question.
@@ -897,7 +897,7 @@ func TestLimitResolverDisableAAAA(t *testing.T) {
 		t.Fatal(err)
 	}
 	if c, _, _ := next2.stats(); c != 1 {
-		t.Fatalf("обменов AAAA без отключения: %d, want 1", c)
+		t.Fatalf("AAAA exchanges without disabling: %d, want 1", c)
 	}
 }
 
@@ -921,7 +921,7 @@ func TestLimitResolverCancelWaitingSlot(t *testing.T) {
 		_, err := r.Exchange(bg, q)
 		done1 <- err
 	}()
-	limitPollCond(t, func() bool { c, _, _ := next.stats(); return c == 1 }, "первый обмен дошёл до резолвера")
+	limitPollCond(t, func() bool { c, _, _ := next.stats(); return c == 1 }, "the first exchange reached the resolver")
 
 	// The second waits for a slot; the cancellation removes it from the semaphore queue.
 	ctx, cancel := context.WithCancel(bg)
@@ -935,13 +935,13 @@ func TestLimitResolverCancelWaitingSlot(t *testing.T) {
 	select {
 	case err := <-done2:
 		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("отмена в очереди слотов: %v, want Canceled", err)
+			t.Fatalf("cancellation in the slot queue: %v, want Canceled", err)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("отмена не вынула из очереди слотов")
+		t.Fatal("cancellation did not remove it from the slot queue")
 	}
 	if c, _, _ := next.stats(); c != 1 {
-		t.Fatalf("обменов: %d, want 1 (отменённый не дошёл)", c)
+		t.Fatalf("exchanges: %d, want 1 (the cancelled one did not arrive)", c)
 	}
 
 	// The slot is not lost: the first one finishes, the next one goes through.
@@ -950,7 +950,7 @@ func TestLimitResolverCancelWaitingSlot(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := r.Exchange(bg, q); err != nil {
-		t.Fatalf("Exchange после разблокировки: %v", err)
+		t.Fatalf("Exchange after the unlock: %v", err)
 	}
 	if st := r.Stats(); st.InFlight != 0 {
 		t.Fatalf("InFlight = %d, want 0", st.InFlight)
@@ -981,28 +981,28 @@ func TestLimitResolverCancelWaitingToken(t *testing.T) {
 		_, err := r.Exchange(ctx, q)
 		done <- err
 	}()
-	limitPollCond(t, func() bool { return gc.sleeps.Load() > 0 }, "второй обмен ждёт токен")
+	limitPollCond(t, func() bool { return gc.sleeps.Load() > 0 }, "the second exchange waits for a token")
 	cancel()
 	select {
 	case err := <-done:
 		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("отмена в очереди токенов: %v, want Canceled", err)
+			t.Fatalf("cancellation in the token queue: %v, want Canceled", err)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("отмена не вынула из очереди токенов")
+		t.Fatal("cancellation did not remove it from the token queue")
 	}
 	// The concurrency slot is not lost (returned on the token error).
 	if st := r.Stats(); st.InFlight != 0 {
-		t.Fatalf("InFlight = %d, want 0 (слот возвращён)", st.InFlight)
+		t.Fatalf("InFlight = %d, want 0 (the slot returned)", st.InFlight)
 	}
 
 	// Time is moving — exchanges continue, the bucket is not "broken".
 	close(gc.gate)
 	if _, err := r.Exchange(bg, q); err != nil {
-		t.Fatalf("Exchange после открытия gate: %v", err)
+		t.Fatalf("Exchange after the gate opened: %v", err)
 	}
 	if c, _, _ := next.stats(); c != 2 {
-		t.Fatalf("обменов: %d, want 2", c)
+		t.Fatalf("exchanges: %d, want 2", c)
 	}
 }
 
@@ -1026,14 +1026,14 @@ func TestLimitResolverPassThrough(t *testing.T) {
 	}
 	if got.RCode != want.RCode || got.Elapsed != want.Elapsed || got.Attempts != want.Attempts ||
 		got.TCP != want.TCP || len(got.Answer) != 1 || len(got.Ns) != 1 {
-		t.Fatalf("результат изменён декоратором: %+v, want %+v", got, want)
+		t.Fatalf("the result was changed by the decorator: %+v, want %+v", got, want)
 	}
 
 	// The lower resolver's error is returned as is.
-	sentinel := errors.New("dnsclient: сеть отвалилась")
+	sentinel := errors.New("dnsclient: the network dropped")
 	next.setErr(sentinel)
 	if _, err := r.Exchange(context.Background(), Question{Name: "example.com", Type: dns.TypeA}); !errors.Is(err, sentinel) {
-		t.Fatalf("ошибка: %v, want исходная", err)
+		t.Fatalf("the error: %v, want the original", err)
 	}
 }
 
@@ -1047,6 +1047,6 @@ func TestLimitSleepRealClock(t *testing.T) {
 	ctx, cancel := context.WithCancel(bg)
 	cancel()
 	if err := limitRealClock().sleep(ctx, time.Minute); !errors.Is(err, context.Canceled) {
-		t.Fatalf("sleep после отмены: %v, want Canceled", err)
+		t.Fatalf("sleep after cancellation: %v, want Canceled", err)
 	}
 }

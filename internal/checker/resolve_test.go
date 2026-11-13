@@ -88,13 +88,13 @@ func TestEscalateUsefulFirstAnswer(t *testing.T) {
 			)
 			res, err := r.Exchange(context.Background(), q())
 			if err != nil {
-				t.Fatalf("неожиданная ошибка: %v", err)
+				t.Fatalf("unexpected error: %v", err)
 			}
 			if res.RCode != tc.rcode {
-				t.Fatalf("итог = %s, ожидался %s", res.RCode, tc.rcode)
+				t.Fatalf("result = %s, want %s", res.RCode, tc.rcode)
 			}
 			if n := called(calls, "f"); n != 0 {
-				t.Fatalf("резерв опрошен (%d раз) при полезном итоге основного", n)
+				t.Fatalf("the fallback was polled (%d times) with a useful result from the primary", n)
 			}
 		})
 	}
@@ -121,13 +121,13 @@ func TestEscalateOnRCODEFailure(t *testing.T) {
 			)
 			res, err := r.Exchange(context.Background(), q())
 			if err != nil {
-				t.Fatalf("неожиданная ошибка: %v", err)
+				t.Fatalf("unexpected error: %v", err)
 			}
 			if res.RCode != tc.expected {
-				t.Fatalf("итог = %s, ожидался %s", res.RCode, tc.expected)
+				t.Fatalf("result = %s, want %s", res.RCode, tc.expected)
 			}
 			if n := called(calls, "f"); n != 1 {
-				t.Fatalf("резерв опрошен %d раз, ожидался 1", n)
+				t.Fatalf("the fallback was polled %d times, want 1", n)
 			}
 		})
 	}
@@ -144,13 +144,13 @@ func TestEscalateOnTransportError(t *testing.T) {
 	)
 	res, err := r.Exchange(context.Background(), q())
 	if err != nil {
-		t.Fatalf("неожиданная ошибка: %v", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
 	if res.RCode != dnsclient.RCodeNOERROR {
-		t.Fatalf("итог = %s, ожидался NOERROR", res.RCode)
+		t.Fatalf("result = %s, want NOERROR", res.RCode)
 	}
 	if n := called(calls, "f"); n != 1 {
-		t.Fatalf("резерв опрошен %d раз, ожидался 1", n)
+		t.Fatalf("the fallback was polled %d times, want 1", n)
 	}
 }
 
@@ -166,14 +166,14 @@ func TestEscalateAllFailedRCODE(t *testing.T) {
 	)
 	res, err := r.Exchange(context.Background(), q())
 	if err != nil {
-		t.Fatalf("RCODE-отказ — не ошибка цепи: %v", err)
+		t.Fatalf("an RCODE refusal is not a chain error: %v", err)
 	}
 	if res.RCode != dnsclient.RCodeREFUSED {
-		t.Fatalf("итог = %s, ожидался последний REFUSED", res.RCode)
+		t.Fatalf("result = %s, want the last REFUSED", res.RCode)
 	}
 	for _, name := range []string{"p", "f1", "f2"} {
 		if n := called(calls, name); n != 1 {
-			t.Fatalf("%s опрошен %d раз, ожидался 1", name, n)
+			t.Fatalf("%s was polled %d times, want 1", name, n)
 		}
 	}
 }
@@ -188,15 +188,15 @@ func TestEscalateAllTransportFailed(t *testing.T) {
 	)
 	_, err := r.Exchange(context.Background(), q())
 	if err == nil {
-		t.Fatal("ожидалась ошибка исчерпания цепи")
+		t.Fatal("want a chain exhaustion error")
 	}
 	for _, sub := range []string{"p:", "f:", "connection refused", "i/o timeout"} {
 		if !strings.Contains(err.Error(), sub) {
-			t.Fatalf("в сообщении нет %q: %v", sub, err)
+			t.Fatalf("the message does not contain %q: %v", sub, err)
 		}
 	}
 	if !errors.Is(err, boom) {
-		t.Fatal("errors.Is не находит причину последнего резолвера")
+		t.Fatal("errors.Is does not find the last resolver's cause")
 	}
 }
 
@@ -212,7 +212,7 @@ func TestEscalateContextCancelled(t *testing.T) {
 	)
 	_, err := r.Exchange(ctx, q())
 	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("ожидалась ошибка отмены, получено: %v", err)
+		t.Fatalf("want a cancellation error, got: %v", err)
 	}
 }
 
@@ -230,11 +230,11 @@ func TestEscalateConcurrent(t *testing.T) {
 			defer wg.Done()
 			res, err := r.Exchange(context.Background(), q())
 			if err != nil {
-				t.Errorf("параллельный обмен: %v", err)
+				t.Errorf("parallel exchange: %v", err)
 				return
 			}
 			if res.RCode != dnsclient.RCodeNOERROR {
-				t.Errorf("параллельный обмен: итог %s, ожидался NOERROR", res.RCode)
+				t.Errorf("parallel exchange: result %s, want NOERROR", res.RCode)
 			}
 		}()
 	}

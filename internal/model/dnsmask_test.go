@@ -16,12 +16,12 @@ func TestDNSMaskSetTestUnset(t *testing.T) {
 	}
 	for _, id := range []int{0, 5, 62} {
 		if !m.Test(id) {
-			t.Errorf("Test(%d) = false после установки", id)
+			t.Errorf("Test(%d) = false after Set", id)
 		}
 	}
 	for _, id := range []int{1, 4, 6, 61} {
 		if m.Test(id) {
-			t.Errorf("Test(%d) = true для неустановленного бита", id)
+			t.Errorf("Test(%d) = true for an unset bit", id)
 		}
 	}
 
@@ -29,10 +29,10 @@ func TestDNSMaskSetTestUnset(t *testing.T) {
 		t.Fatal(err)
 	}
 	if m.Test(5) {
-		t.Error("Test(5) = true после Unset(5)")
+		t.Error("Test(5) = true after Unset(5)")
 	}
 	if !m.Test(0) || !m.Test(62) {
-		t.Error("Unset(5) снял другие биты")
+		t.Error("Unset(5) cleared other bits")
 	}
 
 	// Setting again and clearing an unset bit — idempotency.
@@ -44,41 +44,41 @@ func TestDNSMaskSetTestUnset(t *testing.T) {
 		t.Fatal(err)
 	}
 	if m != before {
-		t.Errorf("повторные Set/Unset изменили маску: %d, want %d", int64(m), int64(before))
+		t.Errorf("repeated Set/Unset changed the mask: %d, want %d", int64(m), int64(before))
 	}
 }
 
 func TestDNSMaskLimits(t *testing.T) {
 	if MaxSubdomains != 63 {
-		t.Fatalf("MaxSubdomains = %d, want 63 (ТЗ 5.10: ограничение маски int8)", MaxSubdomains)
+		t.Fatalf("MaxSubdomains = %d, want 63 (spec 5.10: the int8 mask limit)", MaxSubdomains)
 	}
 	if err := ValidateSubdomainID(0); err != nil {
 		t.Errorf("ValidateSubdomainID(0) = %v, want nil", err)
 	}
 	if err := ValidateSubdomainID(62); err != nil {
-		t.Errorf("ValidateSubdomainID(62) = %v, want nil (последний допустимый бит)", err)
+		t.Errorf("ValidateSubdomainID(62) = %v, want nil (the last allowed bit)", err)
 	}
 	for _, id := range []int{-1, 63, 64, 1000} {
 		if err := ValidateSubdomainID(id); err == nil {
-			t.Errorf("ValidateSubdomainID(%d) = nil, want ошибка (вне 0..62)", id)
+			t.Errorf("ValidateSubdomainID(%d) = nil, want an error (outside 0..62)", id)
 		}
 	}
 
 	var m DNSMask
 	if err := m.Set(63); err == nil {
-		t.Error("Set(63) = nil error, want ошибка (бит 63 знаковый)")
+		t.Error("Set(63) = nil error, want an error (bit 63 is the sign bit)")
 	}
 	if err := m.Set(-1); err == nil {
-		t.Error("Set(-1) = nil error, want ошибка")
+		t.Error("Set(-1) = nil error, want an error")
 	}
 	if err := m.Unset(63); err == nil {
-		t.Error("Unset(63) = nil error, want ошибка")
+		t.Error("Unset(63) = nil error, want an error")
 	}
 	if _, err := NewDNSMask(0, 63); err == nil {
-		t.Error("NewDNSMask(0, 63) = nil error, want ошибка")
+		t.Error("NewDNSMask(0, 63) = nil error, want an error")
 	}
 	if m != 0 {
-		t.Errorf("после ошибочных операций маска = %d, want 0", int64(m))
+		t.Errorf("after the failed operations the mask = %d, want 0", int64(m))
 	}
 
 	// Test of an invalid number is false, not a panic: a nonexistent bit
@@ -95,10 +95,10 @@ func TestDNSMaskLimits(t *testing.T) {
 func TestDNSMaskErrorValue(t *testing.T) {
 	m, err := NewDNSMask(63)
 	if err == nil {
-		t.Fatal("NewDNSMask(63): want ошибка")
+		t.Fatal("NewDNSMask(63): want an error")
 	}
 	if m != 0 {
-		t.Errorf("NewDNSMask(63) = %d, want 0 при ошибке", int64(m))
+		t.Errorf("NewDNSMask(63) = %d, want 0 on error", int64(m))
 	}
 }
 
@@ -107,7 +107,7 @@ func TestDNSMaskErrorValue(t *testing.T) {
 // Test cuts it off before the mask is touched.
 func TestDNSMaskTestOutsideRange(t *testing.T) {
 	if DNSMask(-1).Test(63) {
-		t.Error("DNSMask(-1).Test(63) = true, want false (63 вне 0..62)")
+		t.Error("DNSMask(-1).Test(63) = true, want false (63 is outside 0..62)")
 	}
 }
 
@@ -119,16 +119,16 @@ func TestDNSMaskAtomicOnError(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := m.Set(1, 63); err == nil {
-		t.Fatal("Set(1, 63): want ошибка")
+		t.Fatal("Set(1, 63): want an error")
 	}
 	if m.Test(1) {
-		t.Error("ошибочный Set частично применился: бит 1 установлен")
+		t.Error("the failed Set applied partially: bit 1 is set")
 	}
 	if err := m.Unset(0, 63); err == nil {
-		t.Fatal("Unset(0, 63): want ошибка")
+		t.Fatal("Unset(0, 63): want an error")
 	}
 	if !m.Test(0) {
-		t.Error("ошибочный Unset частично применился: бит 0 снят")
+		t.Error("the failed Unset applied partially: bit 0 is cleared")
 	}
 }
 
@@ -144,16 +144,16 @@ func TestDNSMaskAllBits(t *testing.T) {
 		t.Fatal(err)
 	}
 	if int64(m) != math.MaxInt64 {
-		t.Errorf("маска всех битов 0..62 = %d, want %d (бит 63 не используется)", int64(m), int64(math.MaxInt64))
+		t.Errorf("the mask of all bits 0..62 = %d, want %d (bit 63 is unused)", int64(m), int64(math.MaxInt64))
 	}
 	if !m.Valid() {
-		t.Error("маска из битов 0..62 обязана быть валидной (неотрицательной)")
+		t.Error("a mask of bits 0..62 must be valid (non-negative)")
 	}
 	if m.Count() != MaxSubdomains {
 		t.Errorf("Count = %d, want %d", m.Count(), MaxSubdomains)
 	}
 	if got := m.IDs(); len(got) != MaxSubdomains {
-		t.Errorf("IDs: %d номеров, want %d", len(got), MaxSubdomains)
+		t.Errorf("IDs: %d numbers, want %d", len(got), MaxSubdomains)
 	}
 }
 
@@ -164,7 +164,7 @@ func TestDNSMaskIDsAscending(t *testing.T) {
 	}
 	want := []int{0, 3, 5, 62}
 	if got := m.IDs(); !reflect.DeepEqual(got, want) {
-		t.Errorf("IDs() = %v, want %v (по возрастанию)", got, want)
+		t.Errorf("IDs() = %v, want %v (ascending)", got, want)
 	}
 	if m.Count() != len(want) {
 		t.Errorf("Count = %d, want %d", m.Count(), len(want))
@@ -174,23 +174,23 @@ func TestDNSMaskIDsAscending(t *testing.T) {
 func TestDNSMaskEmpty(t *testing.T) {
 	var m DNSMask
 	if !m.IsEmpty() {
-		t.Error("нулевая маска не IsEmpty")
+		t.Error("the zero mask is not IsEmpty")
 	}
 	if m.Count() != 0 {
 		t.Errorf("Count = %d, want 0", m.Count())
 	}
 	if got := m.IDs(); len(got) != 0 {
-		t.Errorf("IDs() = %v, want пусто", got)
+		t.Errorf("IDs() = %v, want empty", got)
 	}
 	if !m.Valid() {
-		t.Error("нулевая маска обязана быть валидной")
+		t.Error("the zero mask must be valid")
 	}
 	m2, err := NewDNSMask()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !m2.IsEmpty() {
-		t.Errorf("NewDNSMask() без аргументов = %d, want 0", int64(m2))
+		t.Errorf("NewDNSMask() without arguments = %d, want 0", int64(m2))
 	}
 }
 
@@ -198,9 +198,9 @@ func TestDNSMaskEmpty(t *testing.T) {
 // check: such data is never written to the DB.
 func TestDNSMaskValid(t *testing.T) {
 	if DNSMask(-1).Valid() {
-		t.Error("DNSMask(-1).Valid() = true, want false (бит 63 знаковый)")
+		t.Error("DNSMask(-1).Valid() = true, want false (bit 63 is the sign bit)")
 	}
 	if !DNSMask(0).Valid() || !DNSMask(math.MaxInt64).Valid() {
-		t.Error("неотрицательные маски обязаны быть валидными")
+		t.Error("non-negative masks must be valid")
 	}
 }

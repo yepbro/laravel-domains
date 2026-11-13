@@ -57,7 +57,7 @@ func TestStructColumnsMatchSchema(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			got := dbTags(t, tc.row)
 			if !slices.Equal(got, tc.columns) {
-				t.Errorf("колонки %s = %v,\nwant (миграция 000001) %v", name, got, tc.columns)
+				t.Errorf("columns %s = %v,\nwant (migration 000001) %v", name, got, tc.columns)
 			}
 		})
 	}
@@ -68,14 +68,14 @@ func dbTags(t *testing.T, row any) []string {
 	t.Helper()
 	typ := reflect.TypeOf(row)
 	if typ.Kind() != reflect.Struct {
-		t.Fatalf("%T — не структура", row)
+		t.Fatalf("%T is not a struct", row)
 	}
 	tags := make([]string, 0, typ.NumField())
 	for i := range typ.NumField() {
 		field := typ.Field(i)
 		tag := field.Tag.Get("db")
 		if tag == "" {
-			t.Fatalf("поле %s.%s без тега db", typ.Name(), field.Name)
+			t.Fatalf("the field %s.%s has no db tag", typ.Name(), field.Name)
 		}
 		tags = append(tags, tag)
 	}
@@ -131,7 +131,7 @@ func TestSubdomainInitialSet(t *testing.T) {
 	}
 	for _, s := range want {
 		if err := ValidateSubdomainID(int(s.ID)); err != nil {
-			t.Errorf("начальный субдомен id=%d: %v", s.ID, err)
+			t.Errorf("the initial subdomain id=%d: %v", s.ID, err)
 		}
 	}
 }

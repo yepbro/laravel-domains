@@ -74,7 +74,7 @@ func TestProbeAliveOnAnyRCode(t *testing.T) {
 		t.Run(rcode.String(), func(t *testing.T) {
 			r := &fbFake{res: &Result{RCode: rcode}}
 			if err := Probe(context.Background(), r); err != nil {
-				t.Fatalf("Probe при ответе %v: %v", rcode, err)
+				t.Fatalf("Probe on the answer %v: %v", rcode, err)
 			}
 		})
 	}
@@ -85,7 +85,7 @@ func TestProbeAliveOnAnyRCode(t *testing.T) {
 func TestProbeDeadOnTransportError(t *testing.T) {
 	sentinel := errors.New("udp: connection refused")
 	if err := Probe(context.Background(), &fbFake{err: sentinel}); !errors.Is(err, sentinel) {
-		t.Fatalf("Probe: %v, ожидалась причина %v", err, sentinel)
+		t.Fatalf("Probe: %v, want the cause %v", err, sentinel)
 	}
 }
 
@@ -101,14 +101,14 @@ func TestProbeQuestionIsRootNS(t *testing.T) {
 		t.Fatalf("Probe: %v", err)
 	}
 	if got.Name != "." || got.Type != dns.TypeNS {
-		t.Fatalf("вопрос пробы: %+v, ожидался NS \".\"", got)
+		t.Fatalf("the probe question: %+v, want NS \".\"", got)
 	}
 }
 
 // TestProbeNilResolver — a guard against a programming error.
 func TestProbeNilResolver(t *testing.T) {
 	if err := Probe(context.Background(), nil); err == nil {
-		t.Fatal("nil-резолвер: ожидается ошибка")
+		t.Fatal("a nil resolver: want an error")
 	}
 }
 
@@ -127,11 +127,11 @@ func TestProbeChainAllAlive(t *testing.T) {
 	}
 	entries := rec.entries()
 	if len(entries) != 2 {
-		t.Fatalf("записей лога %d, ожидалось 2", len(entries))
+		t.Fatalf("log entries %d, want 2", len(entries))
 	}
 	for _, e := range entries {
 		if e.level != slog.LevelInfo {
-			t.Fatalf("уровень живого резолвера: %v (%s)", e.level, e.message)
+			t.Fatalf("the live resolver level: %v (%s)", e.level, e.message)
 		}
 	}
 }
@@ -154,13 +154,13 @@ func TestProbeChainPrimaryDeadReserveAlive(t *testing.T) {
 		case e.attr == "127.0.0.1:53" && e.level == slog.LevelWarn:
 			warns++
 		case e.attr == "127.0.0.1:53":
-			t.Fatalf("мёртвый локальный — Warn, получен %v", e.level)
+			t.Fatalf("a dead local — Warn, got %v", e.level)
 		case e.attr == "1.1.1.1:53" && e.level != slog.LevelInfo:
-			t.Fatalf("живой резерв — Info, получен %v", e.level)
+			t.Fatalf("a live fallback — Info, got %v", e.level)
 		}
 	}
 	if warns != 1 {
-		t.Fatalf("Warn по мёртвому локальному: %d, ожидался 1", warns)
+		t.Fatalf("Warn about the dead local: %d, want 1", warns)
 	}
 }
 
@@ -178,7 +178,7 @@ func TestProbeChainPrimaryAliveReserveDead(t *testing.T) {
 	}
 	for _, e := range rec.entries() {
 		if e.attr == "1.1.1.1:53" && e.level != slog.LevelWarn {
-			t.Fatalf("мёртвый резерв — Warn, получен %v", e.level)
+			t.Fatalf("a dead fallback — Warn, got %v", e.level)
 		}
 	}
 }
@@ -192,11 +192,11 @@ func TestProbeChainAllDead(t *testing.T) {
 	}
 	err := ProbeChain(context.Background(), targets, slog.New(&probeRecorder{}))
 	if err == nil {
-		t.Fatal("все мертвы — ошибка старта")
+		t.Fatal("all dead — a start error")
 	}
 	for _, want := range []string{"127.0.0.1:53", "1.1.1.1:53"} {
 		if !strings.Contains(err.Error(), want) {
-			t.Fatalf("ошибка без адреса %q: %v", want, err)
+			t.Fatalf("the error without the address %q: %v", want, err)
 		}
 	}
 }
@@ -205,7 +205,7 @@ func TestProbeChainAllDead(t *testing.T) {
 // guarantees a primary resolver, spec 5.10).
 func TestProbeChainEmpty(t *testing.T) {
 	if err := ProbeChain(context.Background(), nil, nil); err == nil {
-		t.Fatal("пустая цепь: ожидается ошибка")
+		t.Fatal("an empty chain: want an error")
 	}
 }
 
@@ -230,6 +230,6 @@ func TestProbeChainCancelled(t *testing.T) {
 		{Addr: "1.1.1.1:53", Resolver: &fbFake{}},
 	}
 	if err := ProbeChain(ctx, targets, slog.New(&probeRecorder{})); !errors.Is(err, context.Canceled) {
-		t.Fatalf("ожидается context.Canceled, получено %v", err)
+		t.Fatalf("want context.Canceled, got %v", err)
 	}
 }

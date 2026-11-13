@@ -41,7 +41,7 @@ func validDSN() map[string]string {
 func TestDefault(t *testing.T) {
 	c := Default()
 	if c.Postgres.DSN != "" {
-		t.Errorf("postgres.dsn по умолчанию пуст (обязателен из YAML/env), получен %q", c.Postgres.DSN)
+		t.Errorf("the postgres.dsn default is empty (required from YAML/env), got %q", c.Postgres.DSN)
 	}
 	checks := []struct {
 		name string
@@ -159,32 +159,32 @@ func TestDefault(t *testing.T) {
 	}
 	for _, ch := range checks {
 		if ch.got != ch.want {
-			t.Errorf("%s: по умолчанию ожидается %v, получено %v", ch.name, ch.want, ch.got)
+			t.Errorf("%s: the default want %v, got %v", ch.name, ch.want, ch.got)
 		}
 	}
 	if want := []string{"", "www", "admin", "crm", "api", "app"}; strings.Join(c.Subdomains, ",") != strings.Join(want, ",") {
-		t.Errorf("subdomains: ожидается %v, получено %v", want, c.Subdomains)
+		t.Errorf("subdomains: want %v, got %v", want, c.Subdomains)
 	}
 	if len(c.Scheduler.ZoneWeights) != 0 {
-		t.Errorf("scheduler.zone_weights: по умолчанию пуст (равные веса, ТЗ 5.3 «опционально»), получено %v", c.Scheduler.ZoneWeights)
+		t.Errorf("scheduler.zone_weights: empty by default (equal weights, spec 5.3 "optional"), got %v", c.Scheduler.ZoneWeights)
 	}
 	if len(c.HTTP.PerIPOverrides) != 0 {
-		t.Errorf("http.per_ip_overrides: по умолчанию пуст (один per_ip_limit на все IP, T-165), получено %v", c.HTTP.PerIPOverrides)
+		t.Errorf("http.per_ip_overrides: empty by default (a single per_ip_limit for all IPs, T-165), got %v", c.HTTP.PerIPOverrides)
 	}
 	if len(c.Dashboard.Probes) != 0 {
-		t.Errorf("dashboard.probes: по умолчанию пуст (пробы не заданы, ТЗД §8.1), получено %v", c.Dashboard.Probes)
+		t.Errorf("dashboard.probes: empty by default (no probes set, dashboard spec §8.1), got %v", c.Dashboard.Probes)
 	}
 	if len(c.Render.RequeueDeprioritizedZones) != 0 {
-		t.Errorf("render.requeue_deprioritized_zones: по умолчанию пуст (приоритет зон не задан, T-184), получено %v", c.Render.RequeueDeprioritizedZones)
+		t.Errorf("render.requeue_deprioritized_zones: empty by default (no zone priorities set, T-184), got %v", c.Render.RequeueDeprioritizedZones)
 	}
 	if len(c.Ingest.AllowedZonePaths) != 0 {
-		t.Errorf("ingest.allowed_zone_paths: по умолчанию пуст (рабочие каталоги только TLD, ТЗТ §6.1), получено %v", c.Ingest.AllowedZonePaths)
+		t.Errorf("ingest.allowed_zone_paths: empty by default (working directories are TLD-only, tld-only-zones spec §6.1), got %v", c.Ingest.AllowedZonePaths)
 	}
 
 	// All the default values pass validation after setting dsn.
 	c.Postgres.DSN = "postgres://u:p@127.0.0.1:5432/crawler"
 	if err := c.Validate(); err != nil {
-		t.Errorf("конфигурация по умолчанию должна быть валидна: %v", err)
+		t.Errorf("the default configuration must be valid: %v", err)
 	}
 }
 
@@ -432,30 +432,30 @@ log:
 	}
 	for _, ch := range checks {
 		if ch.got != ch.want {
-			t.Errorf("%s: ожидается %v, получено %v", ch.name, ch.want, ch.got)
+			t.Errorf("%s: want %v, got %v", ch.name, ch.want, ch.got)
 		}
 	}
 	if want := []string{"", "www", "dev"}; strings.Join(cfg.Subdomains, ",") != strings.Join(want, ",") {
-		t.Errorf("subdomains: ожидается %v, получено %v", want, cfg.Subdomains)
+		t.Errorf("subdomains: want %v, got %v", want, cfg.Subdomains)
 	}
 	if w := cfg.Scheduler.ZoneWeights; len(w) != 3 || w["com"] != 5 || w["co.uk"] != 3 || w["xn--p1ai"] != 2 {
-		t.Errorf("scheduler.zone_weights: ожидается map[com:5 co.uk:3 xn--p1ai:2], получено %v", w)
+		t.Errorf("scheduler.zone_weights: want map[com:5 co.uk:3 xn--p1ai:2], got %v", w)
 	}
 	// The zone path allowlist (the tld-only-zones spec §6.1): duplicates
 	// after folding collapse at load.
 	if a := cfg.Ingest.AllowedZonePaths; strings.Join(a, ",") != "crawl.test" {
-		t.Errorf("ingest.allowed_zone_paths: ожидается [crawl.test] после дедупа, получено %v", a)
+		t.Errorf("ingest.allowed_zone_paths: want [crawl.test] after dedup, got %v", a)
 	}
 	// The zone priority of the render finish pass (T-184): the list as is.
 	if z := cfg.Render.RequeueDeprioritizedZones; strings.Join(z, ",") != "xn--p1ai,net" {
-		t.Errorf("render.requeue_deprioritized_zones: ожидается [xn--p1ai net], получено %v", z)
+		t.Errorf("render.requeue_deprioritized_zones: want [xn--p1ai net], got %v", z)
 	}
 	// The parker prefixes (T-165): the CIDR → limit map as is.
 	if o := cfg.HTTP.PerIPOverrides; len(o) != 2 || o["195.208.0.0/16"] != 12 || o["2a02:6b8::/32"] != 8 {
-		t.Errorf("http.per_ip_overrides: ожидается map[195.208.0.0/16:12 2a02:6b8::/32:8], получено %v", o)
+		t.Errorf("http.per_ip_overrides: want map[195.208.0.0/16:12 2a02:6b8::/32:8], got %v", o)
 	}
 	if p := cfg.Dashboard.Probes; len(p) != 2 || p["dns-worker"] != "http://10.0.0.2:9102" || p["http-worker"] != "http://10.0.0.3:9103" {
-		t.Errorf("dashboard.probes: ожидается map[dns-worker:http://10.0.0.2:9102 http-worker:http://10.0.0.3:9103], получено %v", p)
+		t.Errorf("dashboard.probes: want map[dns-worker:http://10.0.0.2:9102 http-worker:http://10.0.0.3:9103], got %v", p)
 	}
 }
 
@@ -468,13 +468,13 @@ http:
   total_timeout: "45s"
 `, nil)
 	if cfg.HTTP.TotalTimeout.D() != 45*time.Second {
-		t.Errorf("http.total_timeout: ожидается 45s из YAML, получено %s", cfg.HTTP.TotalTimeout)
+		t.Errorf("http.total_timeout: want 45s from YAML, got %s", cfg.HTTP.TotalTimeout)
 	}
 	if cfg.HTTP.ConnectTimeout.D() != 5*time.Second {
-		t.Errorf("http.connect_timeout: ожидается значение по умолчанию 5s, получено %s", cfg.HTTP.ConnectTimeout)
+		t.Errorf("http.connect_timeout: want the default 5s, got %s", cfg.HTTP.ConnectTimeout)
 	}
 	if cfg.Redis.Addr != "127.0.0.1:6379" {
-		t.Errorf("redis.addr: ожидается значение по умолчанию, получено %q", cfg.Redis.Addr)
+		t.Errorf("redis.addr: want the default value, got %q", cfg.Redis.Addr)
 	}
 }
 
@@ -484,26 +484,26 @@ func TestLoadYAMLErrors(t *testing.T) {
 		yaml string
 		want string
 	}{
-		{"неизвестное поле", "postgres:\n  dsn: x\n  unknown_key: 1\n", "unknown_key"},
-		{"неизвестная секция", "postgers:\n  dsn: x\n", "postgers"},
-		{"длительность без единицы", "http:\n  total_timeout: 20\n", "duration"},
-		{"кривая длительность", "http:\n  total_timeout: \"abc\"\n", "duration"},
-		{"кривой размер", "content:\n  pack_size: \"512QB\"\n", "size"},
-		{"размер не число", "content:\n  pack_size: \"много\"\n", "size"},
-		{"не тот тип", "http:\n  concurrency: \"много\"\n", "unmarshal"},
-		{"веса не карта", "scheduler:\n  zone_weights: [1, 2]\n", "unmarshal"},
-		{"вес не число", "scheduler:\n  zone_weights:\n    com: много\n", "unmarshal"},
-		{"пробы не карта", "dashboard:\n  probes: [1]\n", "unmarshal"},
-		{"проба не строка", "dashboard:\n  probes:\n    mon: [1]\n", "unmarshal"},
+		{"unknown field", "postgres:\n  dsn: x\n  unknown_key: 1\n", "unknown_key"},
+		{"unknown section", "postgers:\n  dsn: x\n", "postgers"},
+		{"duration without a unit", "http:\n  total_timeout: 20\n", "duration"},
+		{"malformed duration", "http:\n  total_timeout: \"abc\"\n", "duration"},
+		{"malformed size", "content:\n  pack_size: \"512QB\"\n", "size"},
+		{"size is not a number", "content:\n  pack_size: \"много\"\n", "size"},
+		{"wrong type", "http:\n  concurrency: \"много\"\n", "unmarshal"},
+		{"weights are not a map", "scheduler:\n  zone_weights: [1, 2]\n", "unmarshal"},
+		{"a weight is not a number", "scheduler:\n  zone_weights:\n    com: много\n", "unmarshal"},
+		{"probes are not a map", "dashboard:\n  probes: [1]\n", "unmarshal"},
+		{"a probe is not a string", "dashboard:\n  probes:\n    mon: [1]\n", "unmarshal"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			_, err := loadFrom(t, tt.yaml, validDSN())
 			if err == nil {
-				t.Fatalf("ожидается ошибка, конфигурация загрузилась")
+				t.Fatalf("want an error, the configuration loaded")
 			}
 			if !strings.Contains(err.Error(), tt.want) {
-				t.Errorf("ошибка %q не содержит %q", err, tt.want)
+				t.Errorf("the error %q does not contain %q", err, tt.want)
 			}
 		})
 	}
@@ -516,7 +516,7 @@ func TestLoadYAMLErrors(t *testing.T) {
 // non-zone name are validation errors; the message cites the crawl.test
 // example.
 func TestAllowedZonePaths(t *testing.T) {
-	t.Run("нормализация и дедуп при загрузке", func(t *testing.T) {
+	t.Run("normalization and dedup on load", func(t *testing.T) {
 		cfg := mustLoad(t, `
 postgres:
   dsn: "postgres://u:p@127.0.0.1:5432/crawler"
@@ -537,20 +537,20 @@ ingest:
 		path    string
 		wantMsg string
 	}{
-		{"TLD-зона", "com", "a TLD has no place in the allowlist"},
-		{"не имя зоны", "под_чёртка.test", "is not a zone name"},
-		{"пустая запись", "\" \"", "is not a zone name"},
+		{"TLD zone", "com", "a TLD has no place in the allowlist"},
+		{"not a zone name", "под_чёртка.test", "is not a zone name"},
+		{"empty entry", "\" \"", "is not a zone name"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			yaml := "postgres:\n  dsn: \"postgres://u:p@127.0.0.1:5432/crawler\"\ningest:\n  allowed_zone_paths:\n    - " + tt.path + "\n"
 			_, err := loadFrom(t, yaml, nil)
 			if err == nil {
-				t.Fatalf("запись %s: ожидается ошибка валидации", tt.path)
+				t.Fatalf("the entry %s: want a validation error", tt.path)
 			}
 			for _, want := range []string{"ingest.allowed_zone_paths", "crawl.test", tt.wantMsg} {
 				if !strings.Contains(err.Error(), want) {
-					t.Errorf("ошибка %q не содержит %q", err, want)
+					t.Errorf("the error %q does not contain %q", err, want)
 				}
 			}
 		})
@@ -570,7 +570,7 @@ func TestZoneNameErrorTexts(t *testing.T) {
 	cfg.Render.RequeueDeprioritizedZones = []string{"рф"}
 	err := cfg.Validate()
 	if err == nil {
-		t.Fatal("ожидается ошибка валидации имён зон")
+		t.Fatal("want a zone-name validation error")
 	}
 	msg := err.Error()
 	for _, want := range []string{
@@ -580,12 +580,12 @@ func TestZoneNameErrorTexts(t *testing.T) {
 		"in, uk; IDN — xn--p1ai",
 	} {
 		if !strings.Contains(msg, want) {
-			t.Errorf("текст валидации не содержит %q:\n%s", want, msg)
+			t.Errorf("the validation text does not contain %q:\n%s", want, msg)
 		}
 	}
 	for _, banned := range []string{"co.uk", "composite"} {
 		if strings.Contains(msg, banned) {
-			t.Errorf("текст валидации упоминает составные зоны (%q) — убраны ТЗТ §6.2:\n%s", banned, msg)
+			t.Errorf("the validation text mentions composite zones (%q) — removed by the tld-only-zones spec §6.2:\n%s", banned, msg)
 		}
 	}
 }
@@ -611,17 +611,17 @@ func TestParseSizeForms(t *testing.T) {
 			continue
 		}
 		if got != tt.want {
-			t.Errorf("ParseSize(%q) = %d, ожидается %d", tt.in, got, tt.want)
+			t.Errorf("ParseSize(%q) = %d, want %d", tt.in, got, tt.want)
 		}
 	}
 	if _, err := ParseSize("512 XB"); err == nil {
-		t.Errorf("ParseSize должен отклонять неизвестную единицу")
+		t.Errorf("ParseSize must reject an unknown unit")
 	}
 	if _, err := ParseSize(""); err == nil {
-		t.Errorf("ParseSize должен отклонять пустую строку")
+		t.Errorf("ParseSize must reject an empty string")
 	}
 	if _, err := ParseSize("99999999999999999999GB"); err == nil {
-		t.Errorf("ParseSize должен отклонять переполнение")
+		t.Errorf("ParseSize must reject an overflow")
 	}
 }
 
@@ -844,7 +844,7 @@ func TestEnvOverrides(t *testing.T) {
 		{"web.rate_limit", cfg.Web.RateLimit, 10},
 		{"web.timeout", cfg.Web.Timeout.D(), 90 * time.Second},
 		{"web.live_concurrency", cfg.Web.LiveConcurrency, 7},
-		{"web.public_host (нормализация пробелов)", cfg.Web.PublicHost, "crawler.example.com"},
+		{"web.public_host (space normalization)", cfg.Web.PublicHost, "crawler.example.com"},
 		{"dashboard.listen", cfg.Dashboard.Listen, "127.0.0.1:8191"},
 		{"dashboard.refresh", cfg.Dashboard.Refresh.D(), 30 * time.Second},
 		{"dashboard.status_cache_ttl", cfg.Dashboard.StatusCacheTTL.D(), 3 * time.Minute},
@@ -854,45 +854,45 @@ func TestEnvOverrides(t *testing.T) {
 	}
 	for _, ch := range checks {
 		if ch.got != ch.want {
-			t.Errorf("%s: ожидается %v, получено %v", ch.name, ch.want, ch.got)
+			t.Errorf("%s: want %v, got %v", ch.name, ch.want, ch.got)
 		}
 	}
 	// The subdomain list from env replaces the list entirely (including
 	// the apex).
 	if want := []string{"www", "mail"}; strings.Join(cfg.Subdomains, ",") != strings.Join(want, ",") {
-		t.Errorf("subdomains: ожидается %v (замена целиком, без апекса), получено %v", want, cfg.Subdomains)
+		t.Errorf("subdomains: want %v (a full replacement, without the apex), got %v", want, cfg.Subdomains)
 	}
 	// The zone weight map from env: the keys are lower-cased.
 	if w := cfg.Scheduler.ZoneWeights; len(w) != 2 || w["org"] != 7 || w["xn--p1ai"] != 2 {
-		t.Errorf("scheduler.zone_weights: ожидается map[org:7 xn--p1ai:2], получено %v", w)
+		t.Errorf("scheduler.zone_weights: want map[org:7 xn--p1ai:2], got %v", w)
 	}
 	// The zone priority of the render finish pass from env (T-184): a
 	// comma-separated list, the names are lower-cased, the value replaces
 	// the YAML.
 	if z := cfg.Render.RequeueDeprioritizedZones; strings.Join(z, ",") != "xn--p1ai,org" {
-		t.Errorf("render.requeue_deprioritized_zones: ожидается [xn--p1ai org], получено %v", z)
+		t.Errorf("render.requeue_deprioritized_zones: want [xn--p1ai org], got %v", z)
 	}
 	// The zone path allowlist from env (the tld-only-zones spec §6.1): a
 	// comma-separated list, the value replaces the YAML (the style of the
 	// zone names).
 	if a := cfg.Ingest.AllowedZonePaths; strings.Join(a, ",") != "crawl.test,co.test" {
-		t.Errorf("ingest.allowed_zone_paths: ожидается [crawl.test co.test], получено %v", a)
+		t.Errorf("ingest.allowed_zone_paths: want [crawl.test co.test], got %v", a)
 	}
 	// The per-IP override limits map from env (T-165): the CIDR is
 	// normalized by masking, the value replaces the YAML map entirely.
 	if o := cfg.HTTP.PerIPOverrides; len(o) != 2 || o["195.209.0.0/16"] != 9 || o["2a02:7b8::/32"] != 6 {
-		t.Errorf("http.per_ip_overrides: ожидается map[195.209.0.0/16:9 2a02:7b8::/32:6], получено %v", o)
+		t.Errorf("http.per_ip_overrides: want map[195.209.0.0/16:9 2a02:7b8::/32:6], got %v", o)
 	}
 	// The probes map from env: the keys are lower-cased, the value edges
 	// are trimmed.
 	if p := cfg.Dashboard.Probes; len(p) != 2 || p["mon"] != "http://mon:9100" || p["api"] != "http://api:9104" {
-		t.Errorf("dashboard.probes: ожидается map[api:http://api:9104 mon:http://mon:9100], получено %v", p)
+		t.Errorf("dashboard.probes: want map[api:http://api:9104 mon:http://mon:9100], got %v", p)
 	}
 	// The engines panel address list from env (S-P2-2): comma-separated
 	// elements, the value replaces the YAML entirely; the empty elements
 	// (extra commas) are removed by normalize.
 	if u := cfg.Dashboard.RenderMetrics; strings.Join(u, ";") != "http://env-render:9105/metrics;http://env-render-fb:9120/metrics" {
-		t.Errorf("dashboard.render_metrics_urls: ожидается [http://env-render:9105/metrics http://env-render-fb:9120/metrics], получено %v", u)
+		t.Errorf("dashboard.render_metrics_urls: want [http://env-render:9105/metrics http://env-render-fb:9120/metrics], got %v", u)
 	}
 }
 
@@ -925,10 +925,10 @@ func TestEnvBadValues(t *testing.T) {
 		}
 		_, err := loadFrom(t, "", env)
 		if err == nil {
-			t.Fatalf("переменная %s: ожидается ошибка разбора", tt.want)
+			t.Fatalf("the variable %s: want a parse error", tt.want)
 		}
 		if !strings.Contains(err.Error(), tt.want) {
-			t.Errorf("ошибка %q не содержит имя переменной %q", err, tt.want)
+			t.Errorf("the error %q does not contain the variable name %q", err, tt.want)
 		}
 	}
 }
@@ -957,26 +957,26 @@ dashboard:
 		"CRAWLER_DASHBOARD_PROBES":       "live=http://env-live:9100",
 	})
 	if cfg.HTTP.TotalTimeout.D() != 40*time.Second {
-		t.Errorf("env > yaml: ожидается 40s, получено %s", cfg.HTTP.TotalTimeout)
+		t.Errorf("env > yaml: want 40s, got %s", cfg.HTTP.TotalTimeout)
 	}
 	if cfg.HTTP.HeaderTimeout.D() != 11*time.Second {
-		t.Errorf("пустой env не должен перекрывать YAML: ожидается 11s, получено %s", cfg.HTTP.HeaderTimeout)
+		t.Errorf("an empty env must not override YAML: want 11s, got %s", cfg.HTTP.HeaderTimeout)
 	}
 	if cfg.HTTP.ConnectTimeout.D() != 5*time.Second {
-		t.Errorf("нет env и нет yaml: ожидается default 5s, получено %s", cfg.HTTP.ConnectTimeout)
+		t.Errorf("no env and no yaml: want the default 5s, got %s", cfg.HTTP.ConnectTimeout)
 	}
 	if cfg.Postgres.DSN != "postgres://yaml@db/crawler" {
-		t.Errorf("postgres.dsn должен прийти из YAML, получено %q", cfg.Postgres.DSN)
+		t.Errorf("postgres.dsn must come from YAML, got %q", cfg.Postgres.DSN)
 	}
 	// The weight map from env replaces the YAML map entirely (like the
 	// lists).
 	if w := cfg.Scheduler.ZoneWeights; len(w) != 1 || w["net"] != 9 {
-		t.Errorf("scheduler.zone_weights: ожидается map[net:9] (замена целиком), получено %v", w)
+		t.Errorf("scheduler.zone_weights: want map[net:9] (a full replacement), got %v", w)
 	}
 	// The probes map from env replaces the YAML map entirely (like the
 	// lists and the zone weights).
 	if p := cfg.Dashboard.Probes; len(p) != 1 || p["live"] != "http://env-live:9100" {
-		t.Errorf("dashboard.probes: ожидается map[live:http://env-live:9100] (замена целиком), получено %v", p)
+		t.Errorf("dashboard.probes: want map[live:http://env-live:9100] (a full replacement), got %v", p)
 	}
 }
 
@@ -984,7 +984,7 @@ dashboard:
 func TestLegacyPGDSN(t *testing.T) {
 	cfg := mustLoad(t, "", map[string]string{"APP_PG_DSN": "postgres://legacy@db/crawler"})
 	if cfg.Postgres.DSN != "postgres://legacy@db/crawler" {
-		t.Errorf("APP_PG_DSN: ожидается DSN из переменной, получено %q", cfg.Postgres.DSN)
+		t.Errorf("APP_PG_DSN: want the DSN from the variable, got %q", cfg.Postgres.DSN)
 	}
 
 	cfg = mustLoad(t, "postgres:\n  dsn: \"postgres://yaml@db/crawler\"\n", map[string]string{
@@ -992,7 +992,7 @@ func TestLegacyPGDSN(t *testing.T) {
 		"CRAWLER_POSTGRES_DSN": "postgres://new@db/crawler",
 	})
 	if cfg.Postgres.DSN != "postgres://new@db/crawler" {
-		t.Errorf("CRAWLER_POSTGRES_DSN должен быть важнее APP_PG_DSN, получено %q", cfg.Postgres.DSN)
+		t.Errorf("CRAWLER_POSTGRES_DSN must take precedence over APP_PG_DSN, got %q", cfg.Postgres.DSN)
 	}
 }
 
@@ -1012,7 +1012,7 @@ func TestConfigPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	if cfg.Redis.Addr != "10.1.1.1:6379" || cfg.Postgres.DSN != "postgres://path@db/crawler" {
-		t.Errorf("CRAWLER_CONFIG: файл не прочитан: %+v", cfg.Redis)
+		t.Errorf("CRAWLER_CONFIG: the file was not read: %+v", cfg.Redis)
 	}
 
 	// The deprecated APP_CONFIG works as the fallback name.
@@ -1021,13 +1021,13 @@ func TestConfigPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	if cfg.Redis.Addr != "10.1.1.1:6379" {
-		t.Errorf("APP_CONFIG: файл не прочитан")
+		t.Errorf("APP_CONFIG: the file was not read")
 	}
 
 	// An explicitly given missing file is an error (not silent defaults).
 	_, err = LoadEnv(env(map[string]string{"CRAWLER_CONFIG": filepath.Join(dir, "missing.yaml")}))
 	if err == nil || !strings.Contains(err.Error(), "missing.yaml") {
-		t.Errorf("ожидается ошибка с путём к файлу, получено %v", err)
+		t.Errorf("want an error with the file path, got %v", err)
 	}
 
 	// Without the variable and without ./config.yaml — defaults + env only.
@@ -1036,7 +1036,7 @@ func TestConfigPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	if cfg.Redis.Addr != "127.0.0.1:6379" || cfg.Postgres.DSN != "postgres://envonly@db/crawler" {
-		t.Errorf("без файла ожидаются defaults+env, получено redis=%q dsn=%q", cfg.Redis.Addr, cfg.Postgres.DSN)
+		t.Errorf("without a file want defaults+env, got redis=%q dsn=%q", cfg.Redis.Addr, cfg.Postgres.DSN)
 	}
 }
 
@@ -1051,10 +1051,10 @@ func TestEmptyYAMLFile(t *testing.T) {
 	t.Setenv("CRAWLER_POSTGRES_DSN", "postgres://empty@db/crawler")
 	cfg, err := LoadFile(path)
 	if err != nil {
-		t.Fatalf("пустой файл: %v", err)
+		t.Fatalf("an empty file: %v", err)
 	}
 	if cfg.Redis.Addr != "127.0.0.1:6379" {
-		t.Errorf("пустой файл: ожидаются значения по умолчанию")
+		t.Errorf("an empty file: want the default values")
 	}
 }
 
@@ -1075,7 +1075,7 @@ func TestSchedulerBatchFitsStreamBudget(t *testing.T) {
 		queue.DefaultStreamMaxLen(queue.StreamRenderFallback)*queue.UnitStreamBytesWorst +
 		queue.DefaultStreamMaxLen(queue.StreamDead)*queue.DeadStreamBytesWorst
 	if total > streamLimit {
-		t.Errorf("сумма потолков стримов при пачке %d ≈ %d МиБ > %d МиБ — бюджет Redis 512 МиБ (ТЗ 3.2) пробит: пересогласуйте queue.DefaultStreamMaxLen / вилку scheduler.batch_size (docs/redis.md §3.1)",
+		t.Errorf("the sum of the stream caps for a chunk %d ≈ %d MiB > %d MiB — the Redis 512 MiB budget (spec 3.2) is broken: renegotiate queue.DefaultStreamMaxLen / the scheduler.batch_size range (docs/redis.md §3.1)",
 			maxSchedulerBatchSize, total>>20, streamLimit>>20)
 	}
 }
@@ -1091,148 +1091,148 @@ func TestValidate(t *testing.T) {
 		mutate func(*Config)
 		want   string
 	}{
-		{"dsn пуст", func(c *Config) { c.Postgres.DSN = "" }, "postgres.dsn"},
-		{"dsn из пробелов", func(c *Config) { c.Postgres.DSN = "   " }, "postgres.dsn"},
+		{"empty dsn", func(c *Config) { c.Postgres.DSN = "" }, "postgres.dsn"},
+		{"dsn of spaces", func(c *Config) { c.Postgres.DSN = "   " }, "postgres.dsn"},
 		{"pool_size 0", func(c *Config) { c.Postgres.PoolSize = 0 }, "postgres.pool_size"},
-		{"redis без порта", func(c *Config) { c.Redis.Addr = "127.0.0.1" }, "redis.addr"},
-		{"redis кривой порт", func(c *Config) { c.Redis.Addr = "127.0.0.1:port" }, "redis.addr"},
-		{"redis.maxlen мал", func(c *Config) { c.Redis.MaxLen = 10 }, "redis.maxlen"},
+		{"redis without a port", func(c *Config) { c.Redis.Addr = "127.0.0.1" }, "redis.addr"},
+		{"redis malformed port", func(c *Config) { c.Redis.Addr = "127.0.0.1:port" }, "redis.addr"},
+		{"redis.maxlen too small", func(c *Config) { c.Redis.MaxLen = 10 }, "redis.maxlen"},
 		{"redis.max_attempts 0", func(c *Config) { c.Redis.MaxAttempts = 0 }, "redis.max_attempts"},
-		{"redis.max_attempts велик", func(c *Config) { c.Redis.MaxAttempts = 101 }, "redis.max_attempts"},
+		{"redis.max_attempts too large", func(c *Config) { c.Redis.MaxAttempts = 101 }, "redis.max_attempts"},
 		{"claim_min_idle 0", func(c *Config) { c.Redis.ClaimMinIdle = 0 }, "redis.claim_min_idle"},
 		{"recover_batch 0", func(c *Config) { c.Redis.RecoverBatch = 0 }, "redis.recover_batch"},
-		{"recover_batch велик", func(c *Config) { c.Redis.RecoverBatch = 1001 }, "redis.recover_batch"},
+		{"recover_batch too large", func(c *Config) { c.Redis.RecoverBatch = 1001 }, "redis.recover_batch"},
 		{"recover_interval 0", func(c *Config) { c.Redis.RecoverInterval = 0 }, "redis.recover_interval"},
-		{"recover_interval меньше секунды", func(c *Config) { c.Redis.RecoverInterval = Duration(10 * time.Millisecond) }, "redis.recover_interval"},
-		{"recover_interval больше часа", func(c *Config) { c.Redis.RecoverInterval = Duration(90 * time.Minute) }, "redis.recover_interval"},
+		{"recover_interval under a second", func(c *Config) { c.Redis.RecoverInterval = Duration(10 * time.Millisecond) }, "redis.recover_interval"},
+		{"recover_interval over an hour", func(c *Config) { c.Redis.RecoverInterval = Duration(90 * time.Minute) }, "redis.recover_interval"},
 		{"trim_interval 0", func(c *Config) { c.Redis.TrimInterval = 0 }, "redis.trim_interval"},
-		{"trim_interval меньше секунды", func(c *Config) { c.Redis.TrimInterval = Duration(10 * time.Millisecond) }, "redis.trim_interval"},
-		{"trim_interval больше суток", func(c *Config) { c.Redis.TrimInterval = Duration(25 * time.Hour) }, "redis.trim_interval"},
+		{"trim_interval under a second", func(c *Config) { c.Redis.TrimInterval = Duration(10 * time.Millisecond) }, "redis.trim_interval"},
+		{"trim_interval over a day", func(c *Config) { c.Redis.TrimInterval = Duration(25 * time.Hour) }, "redis.trim_interval"},
 		{"consumer_idle 0", func(c *Config) { c.Redis.ConsumerIdle = 0 }, "redis.consumer_idle"},
-		{"consumer_idle меньше минуты", func(c *Config) { c.Redis.ConsumerIdle = Duration(10 * time.Second) }, "redis.consumer_idle"},
-		{"consumer_idle больше 30 дней", func(c *Config) { c.Redis.ConsumerIdle = Duration(721 * time.Hour) }, "redis.consumer_idle"},
-		{"ingest.dir пуст", func(c *Config) { c.Ingest.Dir = "" }, "ingest.dir"},
+		{"consumer_idle under a minute", func(c *Config) { c.Redis.ConsumerIdle = Duration(10 * time.Second) }, "redis.consumer_idle"},
+		{"consumer_idle over 30 days", func(c *Config) { c.Redis.ConsumerIdle = Duration(721 * time.Hour) }, "redis.consumer_idle"},
+		{"ingest.dir empty", func(c *Config) { c.Ingest.Dir = "" }, "ingest.dir"},
 		{"batch_size 0", func(c *Config) { c.Ingest.BatchSize = 0 }, "ingest.batch_size"},
 		{"stable_seconds 0", func(c *Config) { c.Ingest.StableSeconds = 0 }, "ingest.stable_seconds"},
 		{"scan_interval 0", func(c *Config) { c.Ingest.ScanInterval = 0 }, "ingest.scan_interval"},
-		{"scan_interval слишком велик", func(c *Config) { c.Ingest.ScanInterval = Duration(2 * time.Hour) }, "ingest.scan_interval"},
+		{"scan_interval too large", func(c *Config) { c.Ingest.ScanInterval = Duration(2 * time.Hour) }, "ingest.scan_interval"},
 		{"max_error_ratio 0", func(c *Config) { c.Ingest.MaxErrorRatio = 0 }, "ingest.max_error_ratio"},
-		{"max_error_ratio отрицательный", func(c *Config) { c.Ingest.MaxErrorRatio = -0.1 }, "ingest.max_error_ratio"},
-		{"max_error_ratio больше 1", func(c *Config) { c.Ingest.MaxErrorRatio = 1.5 }, "ingest.max_error_ratio"},
+		{"max_error_ratio negative", func(c *Config) { c.Ingest.MaxErrorRatio = -0.1 }, "ingest.max_error_ratio"},
+		{"max_error_ratio over 1", func(c *Config) { c.Ingest.MaxErrorRatio = 1.5 }, "ingest.max_error_ratio"},
 		{"archive_max_uncompressed 0", func(c *Config) { c.Ingest.ArchiveMaxUncompressed = 0 }, "ingest.archive_max_uncompressed"},
-		{"archive_max_uncompressed велик", func(c *Config) { c.Ingest.ArchiveMaxUncompressed = ByteSize(2 << 40) }, "ingest.archive_max_uncompressed"},
+		{"archive_max_uncompressed too large", func(c *Config) { c.Ingest.ArchiveMaxUncompressed = ByteSize(2 << 40) }, "ingest.archive_max_uncompressed"},
 		{"archive_max_files 0", func(c *Config) { c.Ingest.ArchiveMaxFiles = 0 }, "ingest.archive_max_files"},
-		{"archive_max_files велик", func(c *Config) { c.Ingest.ArchiveMaxFiles = 1000001 }, "ingest.archive_max_files"},
-		{"allowed_zone_path без точки", func(c *Config) { c.Ingest.AllowedZonePaths = []string{"com"} }, "ingest.allowed_zone_paths"},
-		{"allowed_zone_path не-зона", func(c *Config) { c.Ingest.AllowedZonePaths = []string{"под_чёртка.test"} }, "ingest.allowed_zone_paths"},
+		{"archive_max_files too large", func(c *Config) { c.Ingest.ArchiveMaxFiles = 1000001 }, "ingest.archive_max_files"},
+		{"allowed_zone_path without a dot", func(c *Config) { c.Ingest.AllowedZonePaths = []string{"com"} }, "ingest.allowed_zone_paths"},
+		{"allowed_zone_path not a zone", func(c *Config) { c.Ingest.AllowedZonePaths = []string{"под_чёртка.test"} }, "ingest.allowed_zone_paths"},
 		{"recheck_interval 0", func(c *Config) { c.Scheduler.RecheckInterval = 0 }, "scheduler.recheck_interval"},
 		{"backlog_interval 0", func(c *Config) { c.Scheduler.BacklogInterval = 0 }, "scheduler.backlog_interval"},
-		{"backlog_interval меньше 30с", func(c *Config) { c.Scheduler.BacklogInterval = Duration(10 * time.Second) }, "scheduler.backlog_interval"},
-		{"backlog_interval больше часа", func(c *Config) { c.Scheduler.BacklogInterval = Duration(90 * time.Minute) }, "scheduler.backlog_interval"},
+		{"backlog_interval under 30s", func(c *Config) { c.Scheduler.BacklogInterval = Duration(10 * time.Second) }, "scheduler.backlog_interval"},
+		{"backlog_interval over an hour", func(c *Config) { c.Scheduler.BacklogInterval = Duration(90 * time.Minute) }, "scheduler.backlog_interval"},
 		{"batch scheduler 0", func(c *Config) { c.Scheduler.BatchSize = 0 }, "scheduler.batch_size"},
-		{"batch scheduler меньше 1000", func(c *Config) { c.Scheduler.BatchSize = 999 }, "scheduler.batch_size"},
-		{"batch scheduler больше 10000", func(c *Config) { c.Scheduler.BatchSize = 10001 }, "scheduler.batch_size"},
+		{"scheduler batch under 1000", func(c *Config) { c.Scheduler.BatchSize = 999 }, "scheduler.batch_size"},
+		{"scheduler batch over 10000", func(c *Config) { c.Scheduler.BatchSize = 10001 }, "scheduler.batch_size"},
 		{"watermark 0", func(c *Config) { c.Scheduler.QueueHighWatermark = 0 }, "scheduler.queue_high_watermark"},
 		{"lease 0", func(c *Config) { c.Scheduler.Lease = 0 }, "scheduler.lease"},
 		{"retry_after 0", func(c *Config) { c.Scheduler.TempErrorRetryAfter = 0 }, "scheduler.temp_error_retry_after"},
 		{"max retries 0", func(c *Config) { c.Scheduler.TempErrorMaxRetries = 0 }, "scheduler.temp_error_max_retries"},
-		{"max retries велик", func(c *Config) { c.Scheduler.TempErrorMaxRetries = 101 }, "scheduler.temp_error_max_retries"},
-		{"вес зоны 0", func(c *Config) { c.Scheduler.ZoneWeights = map[string]int{"com": 0} }, "scheduler.zone_weights"},
-		{"вес зоны отрицательный", func(c *Config) { c.Scheduler.ZoneWeights = map[string]int{"com": -2} }, "scheduler.zone_weights"},
-		{"вес зоны велик", func(c *Config) { c.Scheduler.ZoneWeights = map[string]int{"com": 1001} }, "scheduler.zone_weights"},
-		{"имя зоны пустое", func(c *Config) { c.Scheduler.ZoneWeights = map[string]int{"": 1} }, "scheduler.zone_weights"},
-		{"имя зоны unicode", func(c *Config) { c.Scheduler.ZoneWeights = map[string]int{"рф": 1} }, "scheduler.zone_weights"},
-		{"имя зоны с точкой в конце", func(c *Config) { c.Scheduler.ZoneWeights = map[string]int{"com.": 1} }, "scheduler.zone_weights"},
-		{"имя зоны с дефисом в начале", func(c *Config) { c.Scheduler.ZoneWeights = map[string]int{"-com": 1} }, "scheduler.zone_weights"},
-		{"resolvers пуст", func(c *Config) { c.DNS.Resolvers = nil }, "dns.resolvers"},
-		{"resolver без порта", func(c *Config) { c.DNS.Resolvers = []string{"127.0.0.1"} }, "dns.resolvers"},
-		{"fallback кривой", func(c *Config) { c.DNS.FallbackResolvers = []string{"noport"} }, "dns.fallback"},
+		{"max retries too large", func(c *Config) { c.Scheduler.TempErrorMaxRetries = 101 }, "scheduler.temp_error_max_retries"},
+		{"zone weight 0", func(c *Config) { c.Scheduler.ZoneWeights = map[string]int{"com": 0} }, "scheduler.zone_weights"},
+		{"zone weight negative", func(c *Config) { c.Scheduler.ZoneWeights = map[string]int{"com": -2} }, "scheduler.zone_weights"},
+		{"zone weight too large", func(c *Config) { c.Scheduler.ZoneWeights = map[string]int{"com": 1001} }, "scheduler.zone_weights"},
+		{"empty zone name", func(c *Config) { c.Scheduler.ZoneWeights = map[string]int{"": 1} }, "scheduler.zone_weights"},
+		{"unicode zone name", func(c *Config) { c.Scheduler.ZoneWeights = map[string]int{"рф": 1} }, "scheduler.zone_weights"},
+		{"zone name with a trailing dot", func(c *Config) { c.Scheduler.ZoneWeights = map[string]int{"com.": 1} }, "scheduler.zone_weights"},
+		{"zone name with a leading hyphen", func(c *Config) { c.Scheduler.ZoneWeights = map[string]int{"-com": 1} }, "scheduler.zone_weights"},
+		{"resolvers empty", func(c *Config) { c.DNS.Resolvers = nil }, "dns.resolvers"},
+		{"resolver without a port", func(c *Config) { c.DNS.Resolvers = []string{"127.0.0.1"} }, "dns.resolvers"},
+		{"malformed fallback", func(c *Config) { c.DNS.FallbackResolvers = []string{"noport"} }, "dns.fallback"},
 		{"dns concurrency 0", func(c *Config) { c.DNS.Concurrency = 0 }, "dns.concurrency"},
 		{"max_qps 0", func(c *Config) { c.DNS.MaxQPS = 0 }, "dns.max_qps"},
 		{"dns timeout 0", func(c *Config) { c.DNS.Timeout = 0 }, "dns.timeout"},
 		{"dns tcp_timeout 0", func(c *Config) { c.DNS.TCPTimeout = 0 }, "dns.tcp_timeout"},
 		{"dns retries 0", func(c *Config) { c.DNS.Retries = 0 }, "dns.retries"},
-		{"dns retries велик", func(c *Config) { c.DNS.Retries = 11 }, "dns.retries"},
+		{"dns retries too large", func(c *Config) { c.DNS.Retries = 11 }, "dns.retries"},
 		{"dns retry_delay 0", func(c *Config) { c.DNS.RetryDelay = 0 }, "dns.retry_delay"},
 		{"dns udp_pool_size 0", func(c *Config) { c.DNS.UDPPoolSize = 0 }, "dns.udp_pool_size"},
 		{"http concurrency 0", func(c *Config) { c.HTTP.Concurrency = 0 }, "http.concurrency"},
 		{"per_ip_limit 0", func(c *Config) { c.HTTP.PerIPLimit = 0 }, "http.per_ip_limit"},
-		{"per-IP override не CIDR", func(c *Config) { c.HTTP.PerIPOverrides = map[string]int{"195.208.0.0.1/16": 8} }, "http.per_ip_overrides"},
-		{"per-IP override лимит 0", func(c *Config) { c.HTTP.PerIPOverrides = map[string]int{"195.208.0.0/16": 0} }, "http.per_ip_overrides"},
-		{"per-IP override лимит велик", func(c *Config) { c.HTTP.PerIPOverrides = map[string]int{"195.208.0.0/16": 65} }, "http.per_ip_overrides"},
-		{"per-IP override дубль сети", func(c *Config) {
+		{"per-IP override not a CIDR", func(c *Config) { c.HTTP.PerIPOverrides = map[string]int{"195.208.0.0.1/16": 8} }, "http.per_ip_overrides"},
+		{"per-IP override limit 0", func(c *Config) { c.HTTP.PerIPOverrides = map[string]int{"195.208.0.0/16": 0} }, "http.per_ip_overrides"},
+		{"per-IP override limit too large", func(c *Config) { c.HTTP.PerIPOverrides = map[string]int{"195.208.0.0/16": 65} }, "http.per_ip_overrides"},
+		{"per-IP override duplicate network", func(c *Config) {
 			c.HTTP.PerIPOverrides = map[string]int{"195.208.0.0/16": 8, "195.208.9.9/16": 12}
 		}, "http.per_ip_overrides"},
 		{"connect_timeout 0", func(c *Config) { c.HTTP.ConnectTimeout = 0 }, "http.connect_timeout"},
 		{"tls_handshake_timeout 0", func(c *Config) { c.HTTP.TLSHandshakeTimeout = 0 }, "http.tls_handshake_timeout"},
 		{"header_timeout 0", func(c *Config) { c.HTTP.HeaderTimeout = 0 }, "http.header_timeout"},
-		{"total_timeout отрицательный", func(c *Config) { c.HTTP.TotalTimeout = Duration(-time.Second) }, "http.total_timeout"},
+		{"total_timeout negative", func(c *Config) { c.HTTP.TotalTimeout = Duration(-time.Second) }, "http.total_timeout"},
 		{"max_redirects -1", func(c *Config) { c.HTTP.MaxRedirects = -1 }, "http.max_redirects"},
 		{"max_body_bytes 0", func(c *Config) { c.HTTP.MaxBodyBytes = 0 }, "http.max_body_bytes"},
 		{"task_concurrency 0", func(c *Config) { c.HTTP.TaskConcurrency = 0 }, "http.task_concurrency"},
-		{"task_concurrency велик", func(c *Config) { c.HTTP.TaskConcurrency = 10001 }, "http.task_concurrency"},
+		{"task_concurrency too large", func(c *Config) { c.HTTP.TaskConcurrency = 10001 }, "http.task_concurrency"},
 		{"task_consume 0", func(c *Config) { c.HTTP.TaskConsume = 0 }, "http.task_consume"},
-		{"task_consume велик", func(c *Config) { c.HTTP.TaskConsume = 1001 }, "http.task_consume"},
+		{"task_consume too large", func(c *Config) { c.HTTP.TaskConsume = 1001 }, "http.task_consume"},
 		{"task_per_domain 0", func(c *Config) { c.HTTP.TaskPerDomain = 0 }, "http.task_per_domain"},
-		{"task_per_domain велик", func(c *Config) { c.HTTP.TaskPerDomain = 127 }, "http.task_per_domain"},
-		{"mem_limit мал", func(c *Config) { c.HTTP.MemLimit = ByteSize(1 << 20) }, "http.mem_limit"},
-		{"mem_limit велик", func(c *Config) { c.HTTP.MemLimit = ByteSize(17 << 30) }, "http.mem_limit"},
-		{"user_agent пуст", func(c *Config) { c.HTTP.UserAgent = "" }, "http.user_agent"},
-		{"remote_url кривой", func(c *Config) { c.Render.RemoteURL = "not-url" }, "render.remote_url"},
+		{"task_per_domain too large", func(c *Config) { c.HTTP.TaskPerDomain = 127 }, "http.task_per_domain"},
+		{"mem_limit too small", func(c *Config) { c.HTTP.MemLimit = ByteSize(1 << 20) }, "http.mem_limit"},
+		{"mem_limit too large", func(c *Config) { c.HTTP.MemLimit = ByteSize(17 << 30) }, "http.mem_limit"},
+		{"user_agent empty", func(c *Config) { c.HTTP.UserAgent = "" }, "http.user_agent"},
+		{"malformed remote_url", func(c *Config) { c.Render.RemoteURL = "not-url" }, "render.remote_url"},
 		{"contexts 0", func(c *Config) { c.Render.Contexts = 0 }, "render.contexts"},
 		{"render.timeout 0", func(c *Config) { c.Render.Timeout = 0 }, "render.timeout"},
 		{"timeout_attempts 0", func(c *Config) { c.Render.TimeoutAttempts = 0 }, "render.timeout_attempts"},
-		{"timeout_attempts велик", func(c *Config) { c.Render.TimeoutAttempts = 101 }, "render.timeout_attempts"},
-		{"timeout_attempts выше max_attempts", func(c *Config) { c.Render.TimeoutAttempts = c.Redis.MaxAttempts + 1 }, "render.timeout_attempts"},
+		{"timeout_attempts too large", func(c *Config) { c.Render.TimeoutAttempts = 101 }, "render.timeout_attempts"},
+		{"timeout_attempts above max_attempts", func(c *Config) { c.Render.TimeoutAttempts = c.Redis.MaxAttempts + 1 }, "render.timeout_attempts"},
 		{"restart_every_pages 0", func(c *Config) { c.Render.RestartEveryPages = 0 }, "render.restart_every_pages"},
-		{"restart_memory_bytes мал", func(c *Config) { c.Render.RestartMemoryBytes = ByteSize(1 << 20) }, "render.restart_memory_bytes"},
-		{"restart_memory_bytes велик", func(c *Config) { c.Render.RestartMemoryBytes = ByteSize(17 << 30) }, "render.restart_memory_bytes"},
-		{"render.queue_high_watermark отрицательный", func(c *Config) { c.Render.QueueHighWatermark = -1 }, "render.queue_high_watermark"},
-		{"render.queue_high_watermark сверхпотолка", func(c *Config) { c.Render.QueueHighWatermark = 100000001 }, "render.queue_high_watermark"},
-		{"requeue-зона пустая", func(c *Config) { c.Render.RequeueDeprioritizedZones = []string{""} }, "render.requeue_deprioritized_zones"},
-		{"requeue-зона unicode", func(c *Config) { c.Render.RequeueDeprioritizedZones = []string{"рф"} }, "render.requeue_deprioritized_zones"},
-		{"requeue-зона с точкой в конце", func(c *Config) { c.Render.RequeueDeprioritizedZones = []string{"com."} }, "render.requeue_deprioritized_zones"},
-		{"requeue-зона повтор", func(c *Config) { c.Render.RequeueDeprioritizedZones = []string{"com", "com"} }, "render.requeue_deprioritized_zones"},
-		{"движок неизвестен", func(c *Config) { c.Render.Engine = "webkit" }, "render.engine"},
-		{"moli без remote_url", func(c *Config) {
+		{"restart_memory_bytes too small", func(c *Config) { c.Render.RestartMemoryBytes = ByteSize(1 << 20) }, "render.restart_memory_bytes"},
+		{"restart_memory_bytes too large", func(c *Config) { c.Render.RestartMemoryBytes = ByteSize(17 << 30) }, "render.restart_memory_bytes"},
+		{"render.queue_high_watermark negative", func(c *Config) { c.Render.QueueHighWatermark = -1 }, "render.queue_high_watermark"},
+		{"render.queue_high_watermark above the cap", func(c *Config) { c.Render.QueueHighWatermark = 100000001 }, "render.queue_high_watermark"},
+		{"empty requeue zone", func(c *Config) { c.Render.RequeueDeprioritizedZones = []string{""} }, "render.requeue_deprioritized_zones"},
+		{"unicode requeue zone", func(c *Config) { c.Render.RequeueDeprioritizedZones = []string{"рф"} }, "render.requeue_deprioritized_zones"},
+		{"requeue zone with a trailing dot", func(c *Config) { c.Render.RequeueDeprioritizedZones = []string{"com."} }, "render.requeue_deprioritized_zones"},
+		{"duplicate requeue zone", func(c *Config) { c.Render.RequeueDeprioritizedZones = []string{"com", "com"} }, "render.requeue_deprioritized_zones"},
+		{"unknown engine", func(c *Config) { c.Render.Engine = "webkit" }, "render.engine"},
+		{"moli without remote_url", func(c *Config) {
 			c.Render.Engine = EngineMoli
 			c.Render.RestartMemoryBytes = 0
 		}, "render.engine"},
-		{"moli с порогом памяти", func(c *Config) {
+		{"moli with a memory threshold", func(c *Config) {
 			c.Render.Engine = EngineMoli
 			c.Render.RemoteURL = "ws://10.0.0.9:9222"
 		}, "render.restart_memory_bytes"},
-		{"lightpanda без remote_url и с порогом", func(c *Config) { c.Render.Engine = EngineLightpanda }, "render.engine"},
+		{"lightpanda without remote_url and with a threshold", func(c *Config) { c.Render.Engine = EngineLightpanda }, "render.engine"},
 		{"fallback worker_rate 0", func(c *Config) { c.Render.Fallback.WorkerRate = 0 }, "render.fallback.worker_rate"},
-		{"fallback worker_rate велик", func(c *Config) { c.Render.Fallback.WorkerRate = 1000001 }, "render.fallback.worker_rate"},
-		{"fallback share_percent отрицательный", func(c *Config) { c.Render.Fallback.SharePercent = -1 }, "render.fallback.share_percent"},
+		{"fallback worker_rate too large", func(c *Config) { c.Render.Fallback.WorkerRate = 1000001 }, "render.fallback.worker_rate"},
+		{"fallback share_percent negative", func(c *Config) { c.Render.Fallback.SharePercent = -1 }, "render.fallback.share_percent"},
 		{"fallback share_percent >100", func(c *Config) { c.Render.Fallback.SharePercent = 100.1 }, "render.fallback.share_percent"},
 		{"fallback share_percent NaN", func(c *Config) { c.Render.Fallback.SharePercent = math.NaN() }, "render.fallback.share_percent"},
 		{"fallback health_gate_streak 0", func(c *Config) { c.Render.Fallback.HealthGateStreak = 0 }, "render.fallback.health_gate_streak"},
-		{"fallback health_gate_streak велик", func(c *Config) { c.Render.Fallback.HealthGateStreak = 101 }, "render.fallback.health_gate_streak"},
-		{"content.dir пуст", func(c *Config) { c.Content.Dir = "" }, "content.dir"},
-		{"pack_size мал", func(c *Config) { c.Content.PackSize = 1 }, "content.pack_size"},
-		{"pack_size велик", func(c *Config) { c.Content.PackSize = ByteSize(16 << 30) }, "content.pack_size"},
+		{"fallback health_gate_streak too large", func(c *Config) { c.Render.Fallback.HealthGateStreak = 101 }, "render.fallback.health_gate_streak"},
+		{"content.dir empty", func(c *Config) { c.Content.Dir = "" }, "content.dir"},
+		{"pack_size too small", func(c *Config) { c.Content.PackSize = 1 }, "content.pack_size"},
+		{"pack_size too large", func(c *Config) { c.Content.PackSize = ByteSize(16 << 30) }, "content.pack_size"},
 		{"max_store_bytes 0", func(c *Config) { c.Content.MaxStoreBytes = 0 }, "content.max_store_bytes"},
 		{"disk_free_percent 0", func(c *Config) { c.Content.DiskFreePercent = 0 }, "content.disk_free_percent"},
 		{"disk_free_percent >95", func(c *Config) { c.Content.DiskFreePercent = 96 }, "content.disk_free_percent"},
-		{"retention отрицательное", func(c *Config) { c.Content.Retention = Duration(-time.Hour) }, "content.retention"},
-		{"retention меньше минуты", func(c *Config) { c.Content.Retention = Duration(10 * time.Second) }, "content.retention"},
-		{"retention больше 30 суток", func(c *Config) { c.Content.Retention = Duration(721 * time.Hour) }, "content.retention"},
-		{"retention_interval меньше минуты", func(c *Config) { c.Content.RetentionInterval = Duration(10 * time.Second) }, "content.retention_interval"},
-		{"retention_interval больше суток", func(c *Config) { c.Content.RetentionInterval = Duration(25 * time.Hour) }, "content.retention_interval"},
-		{"retention_batch меньше 1000", func(c *Config) { c.Content.RetentionBatch = 999 }, "content.retention_batch"},
-		{"retention_batch больше 100000", func(c *Config) { c.Content.RetentionBatch = 100001 }, "content.retention_batch"},
-		{"retention_analyze_watermark отрицательный", func(c *Config) { c.Content.RetentionAnalyzeWatermark = -1 }, "content.retention_analyze_watermark"},
-		{"retention_analyze_watermark сверхпотолка", func(c *Config) { c.Content.RetentionAnalyzeWatermark = 100000001 }, "content.retention_analyze_watermark"},
-		{"retention_select_timeout меньше минуты", func(c *Config) { c.Content.RetentionSelectTimeout = Duration(30 * time.Second) }, "content.retention_select_timeout"},
-		{"retention_select_timeout больше суток", func(c *Config) { c.Content.RetentionSelectTimeout = Duration(25 * time.Hour) }, "content.retention_select_timeout"},
-		{"late_select_timeout меньше минуты", func(c *Config) { c.Render.LateSelectTimeout = Duration(30 * time.Second) }, "render.late_select_timeout"},
-		{"late_select_timeout больше суток", func(c *Config) { c.Render.LateSelectTimeout = Duration(25 * time.Hour) }, "render.late_select_timeout"},
-		{"rules_dir пуст", func(c *Config) { c.Analyzer.RulesDir = "" }, "analyzer.rules_dir"},
+		{"negative retention", func(c *Config) { c.Content.Retention = Duration(-time.Hour) }, "content.retention"},
+		{"retention under a minute", func(c *Config) { c.Content.Retention = Duration(10 * time.Second) }, "content.retention"},
+		{"retention over 30 days", func(c *Config) { c.Content.Retention = Duration(721 * time.Hour) }, "content.retention"},
+		{"retention_interval under a minute", func(c *Config) { c.Content.RetentionInterval = Duration(10 * time.Second) }, "content.retention_interval"},
+		{"retention_interval over a day", func(c *Config) { c.Content.RetentionInterval = Duration(25 * time.Hour) }, "content.retention_interval"},
+		{"retention_batch under 1000", func(c *Config) { c.Content.RetentionBatch = 999 }, "content.retention_batch"},
+		{"retention_batch over 100000", func(c *Config) { c.Content.RetentionBatch = 100001 }, "content.retention_batch"},
+		{"retention_analyze_watermark negative", func(c *Config) { c.Content.RetentionAnalyzeWatermark = -1 }, "content.retention_analyze_watermark"},
+		{"retention_analyze_watermark above the cap", func(c *Config) { c.Content.RetentionAnalyzeWatermark = 100000001 }, "content.retention_analyze_watermark"},
+		{"retention_select_timeout under a minute", func(c *Config) { c.Content.RetentionSelectTimeout = Duration(30 * time.Second) }, "content.retention_select_timeout"},
+		{"retention_select_timeout over a day", func(c *Config) { c.Content.RetentionSelectTimeout = Duration(25 * time.Hour) }, "content.retention_select_timeout"},
+		{"late_select_timeout under a minute", func(c *Config) { c.Render.LateSelectTimeout = Duration(30 * time.Second) }, "render.late_select_timeout"},
+		{"late_select_timeout over a day", func(c *Config) { c.Render.LateSelectTimeout = Duration(25 * time.Hour) }, "render.late_select_timeout"},
+		{"rules_dir empty", func(c *Config) { c.Analyzer.RulesDir = "" }, "analyzer.rules_dir"},
 		{"min_score 0", func(c *Config) { c.Analyzer.LaravelMinScore = 0 }, "analyzer.laravel_min_score"},
 		{"min_score >1", func(c *Config) { c.Analyzer.LaravelMinScore = 1.5 }, "analyzer.laravel_min_score"},
-		{"subdomains пуст", func(c *Config) { c.Subdomains = nil }, "subdomains"},
+		{"subdomains empty", func(c *Config) { c.Subdomains = nil }, "subdomains"},
 		{"subdomains 64", func(c *Config) {
 			s := make([]string, 64)
 			for i := range s {
@@ -1240,86 +1240,86 @@ func TestValidate(t *testing.T) {
 			}
 			c.Subdomains = s
 		}, "subdomains"},
-		{"subdomain с точкой", func(c *Config) { c.Subdomains = []string{"", "a.b"} }, "subdomains"},
-		{"subdomain с дефисом в начале", func(c *Config) { c.Subdomains = []string{"", "-www"} }, "subdomains"},
-		{"subdomain повтор", func(c *Config) { c.Subdomains = []string{"", "www", "www"} }, "subdomains"},
-		{"listen кривой", func(c *Config) { c.Monitor.Listen = "abc" }, "monitor.listen"},
+		{"subdomain with a dot", func(c *Config) { c.Subdomains = []string{"", "a.b"} }, "subdomains"},
+		{"subdomain with a leading hyphen", func(c *Config) { c.Subdomains = []string{"", "-www"} }, "subdomains"},
+		{"duplicate subdomain", func(c *Config) { c.Subdomains = []string{"", "www", "www"} }, "subdomains"},
+		{"malformed listen", func(c *Config) { c.Monitor.Listen = "abc" }, "monitor.listen"},
 		{"zone_stats_interval 0", func(c *Config) { c.Monitor.ZoneStatsInterval = 0 }, "monitor.zone_stats_interval"},
-		{"zone_stats_interval меньше 30с", func(c *Config) { c.Monitor.ZoneStatsInterval = Duration(10 * time.Second) }, "monitor.zone_stats_interval"},
-		{"zone_stats_interval больше часа", func(c *Config) { c.Monitor.ZoneStatsInterval = Duration(2 * time.Hour) }, "monitor.zone_stats_interval"},
+		{"zone_stats_interval under 30s", func(c *Config) { c.Monitor.ZoneStatsInterval = Duration(10 * time.Second) }, "monitor.zone_stats_interval"},
+		{"zone_stats_interval over an hour", func(c *Config) { c.Monitor.ZoneStatsInterval = Duration(2 * time.Hour) }, "monitor.zone_stats_interval"},
 		{"alerts_interval 0", func(c *Config) { c.Monitor.AlertsInterval = 0 }, "monitor.alerts_interval"},
-		{"alerts_interval меньше 30с", func(c *Config) { c.Monitor.AlertsInterval = Duration(10 * time.Second) }, "monitor.alerts_interval"},
-		{"alerts_interval больше часа", func(c *Config) { c.Monitor.AlertsInterval = Duration(2 * time.Hour) }, "monitor.alerts_interval"},
-		{"slow_query_interval меньше 5с", func(c *Config) { c.Monitor.SlowQueryInterval = Duration(2 * time.Second) }, "monitor.slow_query_interval"},
-		{"slow_query_interval больше 10м", func(c *Config) { c.Monitor.SlowQueryInterval = Duration(11 * time.Minute) }, "monitor.slow_query_interval"},
-		{"slow_query_min_duration меньше секунды", func(c *Config) {
+		{"alerts_interval under 30s", func(c *Config) { c.Monitor.AlertsInterval = Duration(10 * time.Second) }, "monitor.alerts_interval"},
+		{"alerts_interval over an hour", func(c *Config) { c.Monitor.AlertsInterval = Duration(2 * time.Hour) }, "monitor.alerts_interval"},
+		{"slow_query_interval under 5s", func(c *Config) { c.Monitor.SlowQueryInterval = Duration(2 * time.Second) }, "monitor.slow_query_interval"},
+		{"slow_query_interval over 10m", func(c *Config) { c.Monitor.SlowQueryInterval = Duration(11 * time.Minute) }, "monitor.slow_query_interval"},
+		{"slow_query_min_duration under a second", func(c *Config) {
 			c.Monitor.SlowQueryMinDuration = Duration(500 * time.Millisecond)
 		}, "monitor.slow_query_min_duration"},
-		{"slow_query_min_duration больше часа", func(c *Config) {
+		{"slow_query_min_duration over an hour", func(c *Config) {
 			c.Monitor.SlowQueryMinDuration = Duration(61 * time.Minute)
 		}, "monitor.slow_query_min_duration"},
-		{"ingest_metrics_url не адрес", func(c *Config) { c.Monitor.IngestMetricsURL = "ingest:9101" }, "monitor.ingest_metrics_url"},
-		{"ingest_metrics_url не http(s)", func(c *Config) { c.Monitor.IngestMetricsURL = "ftp://ingest:9101/metrics" }, "monitor.ingest_metrics_url"},
-		{"render_metrics_url не адрес", func(c *Config) { c.Monitor.RenderMetricsURL = "render-worker:9105" }, "monitor.render_metrics_url"},
-		{"render_metrics_url не http(s)", func(c *Config) { c.Monitor.RenderMetricsURL = "ftp://render:9105/metrics" }, "monitor.render_metrics_url"},
-		{"dashboard.render_metrics_urls не адрес", func(c *Config) {
+		{"ingest_metrics_url not an address", func(c *Config) { c.Monitor.IngestMetricsURL = "ingest:9101" }, "monitor.ingest_metrics_url"},
+		{"ingest_metrics_url not http(s)", func(c *Config) { c.Monitor.IngestMetricsURL = "ftp://ingest:9101/metrics" }, "monitor.ingest_metrics_url"},
+		{"render_metrics_url not an address", func(c *Config) { c.Monitor.RenderMetricsURL = "render-worker:9105" }, "monitor.render_metrics_url"},
+		{"render_metrics_url not http(s)", func(c *Config) { c.Monitor.RenderMetricsURL = "ftp://render:9105/metrics" }, "monitor.render_metrics_url"},
+		{"dashboard.render_metrics_urls not an address", func(c *Config) {
 			c.Dashboard.RenderMetrics = []string{"http://render-worker:9105/metrics", "render-fallback:9110"}
 		}, "dashboard.render_metrics_urls"},
 		{"alerts crit ≥ min", func(c *Config) {
 			c.Monitor.Alerts.DiskFreeCritBytes = c.Monitor.Alerts.DiskFreeMinBytes
 		}, "monitor.alerts.disk_free_crit_bytes"},
-		{"alerts queue_freeze коротко", func(c *Config) {
+		{"alerts queue_freeze too short", func(c *Config) {
 			c.Monitor.Alerts.QueueFreeze = Duration(30 * time.Second)
 		}, "monitor.alerts.queue_freeze_window"},
-		{"alerts queue_freeze длинно", func(c *Config) {
+		{"alerts queue_freeze too long", func(c *Config) {
 			c.Monitor.Alerts.QueueFreeze = Duration(7 * time.Hour)
 		}, "monitor.alerts.queue_freeze_window"},
 		{"alerts psi_cpu_percent 0", func(c *Config) { c.Monitor.Alerts.PSICPUPercent = 0 }, "monitor.alerts.psi_cpu_percent"},
 		{"alerts psi_cpu_percent >100", func(c *Config) { c.Monitor.Alerts.PSICPUPercent = 100.1 }, "monitor.alerts.psi_cpu_percent"},
-		{"alerts psi_cpu_window коротко", func(c *Config) {
+		{"alerts psi_cpu_window too short", func(c *Config) {
 			c.Monitor.Alerts.PSIWindow = Duration(10 * time.Second)
 		}, "monitor.alerts.psi_cpu_window"},
-		{"alerts psi_cpu_window длинно", func(c *Config) {
+		{"alerts psi_cpu_window too long", func(c *Config) {
 			c.Monitor.Alerts.PSIWindow = Duration(12 * time.Hour)
 		}, "monitor.alerts.psi_cpu_window"},
 		{"alerts mem_high_passes 0", func(c *Config) { c.Monitor.Alerts.MemHighPasses = 0 }, "monitor.alerts.mem_high_passes"},
-		{"alerts mem_high_passes велик", func(c *Config) { c.Monitor.Alerts.MemHighPasses = 11 }, "monitor.alerts.mem_high_passes"},
+		{"alerts mem_high_passes too large", func(c *Config) { c.Monitor.Alerts.MemHighPasses = 11 }, "monitor.alerts.mem_high_passes"},
 		{"render_debt_interval 0", func(c *Config) { c.Monitor.RenderDebtInterval = 0 }, "monitor.render_debt_interval"},
-		{"render_debt_interval меньше 30с", func(c *Config) { c.Monitor.RenderDebtInterval = Duration(10 * time.Second) }, "monitor.render_debt_interval"},
-		{"render_debt_interval больше часа", func(c *Config) { c.Monitor.RenderDebtInterval = Duration(2 * time.Hour) }, "monitor.render_debt_interval"},
+		{"render_debt_interval under 30s", func(c *Config) { c.Monitor.RenderDebtInterval = Duration(10 * time.Second) }, "monitor.render_debt_interval"},
+		{"render_debt_interval over an hour", func(c *Config) { c.Monitor.RenderDebtInterval = Duration(2 * time.Hour) }, "monitor.render_debt_interval"},
 		{"alerts render_debt_domains 0", func(c *Config) { c.Monitor.Alerts.RenderDebtDomains = 0 }, "monitor.alerts.render_debt_domains"},
-		{"alerts render_debt_domains сверх корпуса", func(c *Config) { c.Monitor.Alerts.RenderDebtDomains = 100000001 }, "monitor.alerts.render_debt_domains"},
+		{"alerts render_debt_domains above the corpus", func(c *Config) { c.Monitor.Alerts.RenderDebtDomains = 100000001 }, "monitor.alerts.render_debt_domains"},
 		{"alerts render_debt_passes 0", func(c *Config) { c.Monitor.Alerts.RenderDebtPasses = 0 }, "monitor.alerts.render_debt_passes"},
-		{"alerts render_debt_passes велик", func(c *Config) { c.Monitor.Alerts.RenderDebtPasses = 11 }, "monitor.alerts.render_debt_passes"},
-		{"alerts telegram без скрипта", func(c *Config) { c.Monitor.Alerts.TelegramScript = "" }, "monitor.alerts.telegram_script"},
-		{"web.listen кривой", func(c *Config) { c.Web.Listen = "no-port" }, "web.listen"},
-		{"web.listen относительный путь", func(c *Config) { c.Web.Listen = "web.sock" }, "web.listen"},
-		{"web.listen путь сокета длинный", func(c *Config) { c.Web.Listen = "/" + strings.Repeat("s", 101) }, "web.listen"},
+		{"alerts render_debt_passes too large", func(c *Config) { c.Monitor.Alerts.RenderDebtPasses = 11 }, "monitor.alerts.render_debt_passes"},
+		{"alerts telegram without a script", func(c *Config) { c.Monitor.Alerts.TelegramScript = "" }, "monitor.alerts.telegram_script"},
+		{"malformed web.listen", func(c *Config) { c.Web.Listen = "no-port" }, "web.listen"},
+		{"web.listen relative path", func(c *Config) { c.Web.Listen = "web.sock" }, "web.listen"},
+		{"web.listen socket path too long", func(c *Config) { c.Web.Listen = "/" + strings.Repeat("s", 101) }, "web.listen"},
 		{"web.rate_limit 0", func(c *Config) { c.Web.RateLimit = 0 }, "web.rate_limit"},
-		{"web.rate_limit велик", func(c *Config) { c.Web.RateLimit = 1001 }, "web.rate_limit"},
+		{"web.rate_limit too large", func(c *Config) { c.Web.RateLimit = 1001 }, "web.rate_limit"},
 		{"web.live_concurrency 0", func(c *Config) { c.Web.LiveConcurrency = 0 }, "web.live_concurrency"},
-		{"web.live_concurrency велик", func(c *Config) { c.Web.LiveConcurrency = 65 }, "web.live_concurrency"},
+		{"web.live_concurrency too large", func(c *Config) { c.Web.LiveConcurrency = 65 }, "web.live_concurrency"},
 		{"web.timeout 0", func(c *Config) { c.Web.Timeout = 0 }, "web.timeout"},
-		{"web.timeout велик", func(c *Config) { c.Web.Timeout = Duration(11 * time.Minute) }, "web.timeout"},
-		{"web.public_host со схемой", func(c *Config) { c.Web.PublicHost = "https://crawler.example.com" }, "web.public_host"},
-		{"web.public_host с путём", func(c *Config) { c.Web.PublicHost = "crawler.example.com/ru" }, "web.public_host"},
-		{"web.public_host длинный", func(c *Config) { c.Web.PublicHost = strings.Repeat("h", 254) }, "web.public_host"},
-		{"web.public_host голая схема", func(c *Config) { c.Web.PublicHost = "https:" }, "web.public_host"},
-		{"web.public_host порт не число", func(c *Config) { c.Web.PublicHost = "crawler.example.com:8O80" }, "web.public_host"},
-		{"web.public_host порт вне диапазона", func(c *Config) { c.Web.PublicHost = "crawler.example.com:99999" }, "web.public_host"},
-		{"web.public_host IPv6 без скобок", func(c *Config) { c.Web.PublicHost = "::1" }, "web.public_host"},
+		{"web.timeout too large", func(c *Config) { c.Web.Timeout = Duration(11 * time.Minute) }, "web.timeout"},
+		{"web.public_host with a scheme", func(c *Config) { c.Web.PublicHost = "https://crawler.example.com" }, "web.public_host"},
+		{"web.public_host with a path", func(c *Config) { c.Web.PublicHost = "crawler.example.com/ru" }, "web.public_host"},
+		{"web.public_host too long", func(c *Config) { c.Web.PublicHost = strings.Repeat("h", 254) }, "web.public_host"},
+		{"web.public_host bare scheme", func(c *Config) { c.Web.PublicHost = "https:" }, "web.public_host"},
+		{"web.public_host port not a number", func(c *Config) { c.Web.PublicHost = "crawler.example.com:8O80" }, "web.public_host"},
+		{"web.public_host port out of range", func(c *Config) { c.Web.PublicHost = "crawler.example.com:99999" }, "web.public_host"},
+		{"web.public_host IPv6 without brackets", func(c *Config) { c.Web.PublicHost = "::1" }, "web.public_host"},
 		{"web.public_host userinfo", func(c *Config) { c.Web.PublicHost = "user@crawler.example.com" }, "web.public_host"},
-		{"web.public_host управляющий символ", func(c *Config) { c.Web.PublicHost = "crawler\x00.example.com" }, "web.public_host"},
-		{"dashboard.listen кривой", func(c *Config) { c.Dashboard.Listen = "8090" }, "dashboard.listen"},
+		{"web.public_host control character", func(c *Config) { c.Web.PublicHost = "crawler\x00.example.com" }, "web.public_host"},
+		{"malformed dashboard.listen", func(c *Config) { c.Dashboard.Listen = "8090" }, "dashboard.listen"},
 		{"dashboard.refresh 0", func(c *Config) { c.Dashboard.Refresh = 0 }, "dashboard.refresh"},
-		{"dashboard.refresh менее секунды", func(c *Config) { c.Dashboard.Refresh = Duration(500 * time.Millisecond) }, "dashboard.refresh"},
-		{"dashboard.refresh более 5 минут", func(c *Config) { c.Dashboard.Refresh = Duration(6 * time.Minute) }, "dashboard.refresh"},
-		{"status_cache_ttl меньше минуты", func(c *Config) { c.Dashboard.StatusCacheTTL = Duration(30 * time.Second) }, "dashboard.status_cache_ttl"},
-		{"status_cache_ttl больше 5 минут", func(c *Config) { c.Dashboard.StatusCacheTTL = Duration(6 * time.Minute) }, "dashboard.status_cache_ttl"},
-		{"проба не абсолютный URL", func(c *Config) { c.Dashboard.Probes = map[string]string{"mon": "mon:9100"} }, "dashboard.probes"},
-		{"проба не http(s)", func(c *Config) { c.Dashboard.Probes = map[string]string{"mon": "ftp://mon:9100"} }, "dashboard.probes"},
-		{"имя пробы пустое", func(c *Config) { c.Dashboard.Probes = map[string]string{"": "http://mon:9100"} }, "dashboard.probes"},
-		{"log.level кривой", func(c *Config) { c.Log.Level = "verbose" }, "log.level"},
+		{"dashboard.refresh under a second", func(c *Config) { c.Dashboard.Refresh = Duration(500 * time.Millisecond) }, "dashboard.refresh"},
+		{"dashboard.refresh over 5 minutes", func(c *Config) { c.Dashboard.Refresh = Duration(6 * time.Minute) }, "dashboard.refresh"},
+		{"status_cache_ttl under a minute", func(c *Config) { c.Dashboard.StatusCacheTTL = Duration(30 * time.Second) }, "dashboard.status_cache_ttl"},
+		{"status_cache_ttl over 5 minutes", func(c *Config) { c.Dashboard.StatusCacheTTL = Duration(6 * time.Minute) }, "dashboard.status_cache_ttl"},
+		{"a probe is not an absolute URL", func(c *Config) { c.Dashboard.Probes = map[string]string{"mon": "mon:9100"} }, "dashboard.probes"},
+		{"a probe is not http(s)", func(c *Config) { c.Dashboard.Probes = map[string]string{"mon": "ftp://mon:9100"} }, "dashboard.probes"},
+		{"empty probe name", func(c *Config) { c.Dashboard.Probes = map[string]string{"": "http://mon:9100"} }, "dashboard.probes"},
+		{"malformed log.level", func(c *Config) { c.Log.Level = "verbose" }, "log.level"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1328,10 +1328,10 @@ func TestValidate(t *testing.T) {
 			c.normalize()
 			err := c.Validate()
 			if err == nil {
-				t.Fatalf("ожидается ошибка валидации")
+				t.Fatalf("want a validation error")
 			}
 			if !strings.Contains(err.Error(), tt.want) {
-				t.Errorf("ошибка %q не содержит %q", err, tt.want)
+				t.Errorf("the error %q does not contain %q", err, tt.want)
 			}
 		})
 	}
@@ -1364,7 +1364,7 @@ func TestValidate(t *testing.T) {
 		c.Subdomains[i] = fmt.Sprintf("s%d", i)
 	}
 	if err := c.Validate(); err != nil {
-		t.Errorf("граничные значения должны быть валидны: %v", err)
+		t.Errorf("the boundary values must be valid: %v", err)
 	}
 	c.Scheduler.BatchSize = 1000                             // the lower bound of the scheduler batches (spec 5.3)
 	c.Dashboard.Refresh = Duration(time.Second)              // the lower bound of the snapshot period (the dashboard spec §8.3)
@@ -1378,11 +1378,11 @@ func TestValidate(t *testing.T) {
 	c.Render.Fallback.SharePercent = 0                       // the share budget disabled — allowed (T-233)
 	c.Render.Fallback.HealthGateStreak = 1                   // the lower bound of the health gate streak (T-233)
 	if err := c.Validate(); err != nil {
-		t.Errorf("нижние границы должны быть валидны: %v", err)
+		t.Errorf("the lower bounds must be valid: %v", err)
 	}
 	c.Render.QueueHighWatermark = 0 // 0 — the shared scheduler.queue_high_watermark, the fallback (T-174)
 	if err := c.Validate(); err != nil {
-		t.Errorf("порог 0 (общий) должен быть валиден: %v", err)
+		t.Errorf("threshold 0 (shared) must be valid: %v", err)
 	}
 }
 
@@ -1401,19 +1401,19 @@ func TestRenderEngineFallbackMatrix(t *testing.T) {
 		mem      ByteSize
 		wantErrs []string // empty — the config is valid
 	}{
-		{"chromium: собственный процесс (прод)", EngineChromium, "", ByteSize(1536 << 20), nil},
-		{"chromium: внешний CDP (dev-стек)", EngineChromium, ws, 0, nil},
-		{"chromium: внешний CDP с порогом памяти — не работает, но не запрещён", EngineChromium, ws, ByteSize(1536 << 20), nil},
-		{"moli: внешний CDP", EngineMoli, ws, 0, nil},
-		{"moli: без remote_url", EngineMoli, "", 0, []string{"render.engine"}},
-		{"moli: с порогом памяти", EngineMoli, ws, ByteSize(1 << 30), []string{"render.restart_memory_bytes"}},
-		{"moli: без remote_url и с порогом", EngineMoli, "", ByteSize(1 << 30), []string{"render.engine", "render.restart_memory_bytes"}},
-		{"lightpanda: внешний CDP", EngineLightpanda, ws, 0, nil},
-		{"lightpanda: без remote_url", EngineLightpanda, "", 0, []string{"render.engine"}},
-		{"lightpanda: с порогом памяти", EngineLightpanda, ws, ByteSize(256 << 20), []string{"render.restart_memory_bytes"}},
-		{"lightpanda: без remote_url и с порогом", EngineLightpanda, "", ByteSize(1 << 30), []string{"render.engine", "render.restart_memory_bytes"}},
-		{"неизвестный движок", "webkit", "", ByteSize(1536 << 20), []string{"render.engine"}},
-		{"пустой движок — конфиг без Default(), трактуется как chromium", "", "", ByteSize(1536 << 20), nil},
+		{"chromium: own process (production)", EngineChromium, "", ByteSize(1536 << 20), nil},
+		{"chromium: external CDP (dev stack)", EngineChromium, ws, 0, nil},
+		{"chromium: external CDP with a memory threshold — not functional but not forbidden", EngineChromium, ws, ByteSize(1536 << 20), nil},
+		{"moli: external CDP", EngineMoli, ws, 0, nil},
+		{"moli: without remote_url", EngineMoli, "", 0, []string{"render.engine"}},
+		{"moli: with a memory threshold", EngineMoli, ws, ByteSize(1 << 30), []string{"render.restart_memory_bytes"}},
+		{"moli: without remote_url and with a threshold", EngineMoli, "", ByteSize(1 << 30), []string{"render.engine", "render.restart_memory_bytes"}},
+		{"lightpanda: external CDP", EngineLightpanda, ws, 0, nil},
+		{"lightpanda: without remote_url", EngineLightpanda, "", 0, []string{"render.engine"}},
+		{"lightpanda: with a memory threshold", EngineLightpanda, ws, ByteSize(256 << 20), []string{"render.restart_memory_bytes"}},
+		{"lightpanda: without remote_url and with a threshold", EngineLightpanda, "", ByteSize(1 << 30), []string{"render.engine", "render.restart_memory_bytes"}},
+		{"unknown engine", "webkit", "", ByteSize(1536 << 20), []string{"render.engine"}},
+		{"empty engine — a config without Default(), treated as chromium", "", "", ByteSize(1536 << 20), nil},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1426,16 +1426,16 @@ func TestRenderEngineFallbackMatrix(t *testing.T) {
 			err := c.Validate()
 			if len(tt.wantErrs) == 0 {
 				if err != nil {
-					t.Fatalf("комбинация должна быть валидна: %v", err)
+					t.Fatalf("the combination must be valid: %v", err)
 				}
 				return
 			}
 			if err == nil {
-				t.Fatalf("ожидается ошибка валидации (%s)", strings.Join(tt.wantErrs, "; "))
+				t.Fatalf("want a validation error (%s)", strings.Join(tt.wantErrs, "; "))
 			}
 			for _, want := range tt.wantErrs {
 				if !strings.Contains(err.Error(), want) {
-					t.Errorf("ошибка %q не содержит %q", err, want)
+					t.Errorf("the error %q does not contain %q", err, want)
 				}
 			}
 		})
@@ -1446,7 +1446,7 @@ func TestRenderEngineFallbackMatrix(t *testing.T) {
 	c.Postgres.DSN = "postgres://u:p@127.0.0.1:5432/crawler"
 	c.Render.Fallback.Enabled = true
 	if err := c.Validate(); err != nil {
-		t.Errorf("включённый фолбэк на дефолтных потолках должен быть валиден: %v", err)
+		t.Errorf("an enabled fallback at the default caps must be valid: %v", err)
 	}
 }
 
@@ -1455,11 +1455,11 @@ func TestRenderEngineFallbackMatrix(t *testing.T) {
 func TestSubdomainsNormalize(t *testing.T) {
 	cfg := mustLoad(t, "subdomains:\n  - \"\"\n  - \" WWW \"\n  - \"Api\"\n", validDSN())
 	if want := []string{"", "www", "api"}; strings.Join(cfg.Subdomains, ",") != strings.Join(want, ",") {
-		t.Errorf("subdomains после normalize: ожидаются %v, получено %v", want, cfg.Subdomains)
+		t.Errorf("subdomains after normalize: want %v, got %v", want, cfg.Subdomains)
 	}
 	_, err := loadFrom(t, "subdomains:\n  - \"\"\n  - \"www\"\n  - \"WWW\"\n", validDSN())
 	if err == nil || !strings.Contains(err.Error(), "duplicate") {
-		t.Errorf("www и WWW после normalize — дубль, ожидается ошибка, получено %v", err)
+		t.Errorf("www and WWW after normalize — a duplicate, want an error, got %v", err)
 	}
 }
 
@@ -1469,7 +1469,7 @@ func TestSubdomainsNormalize(t *testing.T) {
 func TestZoneWeightsNormalize(t *testing.T) {
 	cfg := mustLoad(t, "scheduler:\n  zone_weights:\n    \" COM \": 5\n    net: 2\n", validDSN())
 	if w := cfg.Scheduler.ZoneWeights; len(w) != 2 || w["com"] != 5 || w["net"] != 2 {
-		t.Errorf("scheduler.zone_weights после normalize: ожидается map[com:5 net:2], получено %v", w)
+		t.Errorf("scheduler.zone_weights after normalize: want map[com:5 net:2], got %v", w)
 	}
 	// A collision after folding ("Com" and "com") resolves
 	// deterministically — the lexicographically greater key wins
@@ -1480,7 +1480,7 @@ func TestZoneWeightsNormalize(t *testing.T) {
 	} {
 		cfg := mustLoad(t, yaml, validDSN())
 		if w := cfg.Scheduler.ZoneWeights; len(w) != 1 || w["com"] != 2 {
-			t.Errorf("%q: после normalize: ожидается map[com:2], получено %v", yaml, w)
+			t.Errorf("%q: after normalize: want map[com:2], got %v", yaml, w)
 		}
 	}
 }
@@ -1492,13 +1492,13 @@ func TestZoneWeightsNormalize(t *testing.T) {
 func TestRequeueDeprioritizedZonesNormalize(t *testing.T) {
 	cfg := mustLoad(t, "render:\n  requeue_deprioritized_zones:\n    - \" XN--P1AI \"\n    - net\n", validDSN())
 	if z := cfg.Render.RequeueDeprioritizedZones; strings.Join(z, ",") != "xn--p1ai,net" {
-		t.Errorf("render.requeue_deprioritized_zones после normalize: ожидается [xn--p1ai net], получено %v", z)
+		t.Errorf("render.requeue_deprioritized_zones after normalize: want [xn--p1ai net], got %v", z)
 	}
 	// A duplicate after folding is a validation error (like "WWW"/"www"
 	// for the subdomains).
 	_, err := loadFrom(t, "render:\n  requeue_deprioritized_zones:\n    - com\n    - \" COM \"\n", validDSN())
 	if err == nil || !strings.Contains(err.Error(), "duplicate") {
-		t.Errorf("com и COM после normalize — дубль, ожидается ошибка, получено %v", err)
+		t.Errorf("com and COM after normalize — a duplicate, want an error, got %v", err)
 	}
 }
 
@@ -1511,7 +1511,7 @@ func TestRequeueDeprioritizedZonesEnvEmpty(t *testing.T) {
 	env["CRAWLER_RENDER_REQUEUE_DEPRIORITIZED_ZONES"] = " xn--p1ai , ,net, "
 	cfg := mustLoad(t, "", env)
 	if z := cfg.Render.RequeueDeprioritizedZones; strings.Join(z, ",") != "xn--p1ai,net" {
-		t.Errorf("env после разбора: ожидается [xn--p1ai net] без пустых элементов, получено %v", z)
+		t.Errorf("env after parsing: want [xn--p1ai net] without empty elements, got %v", z)
 	}
 }
 
@@ -1521,7 +1521,7 @@ func TestRequeueDeprioritizedZonesEnvEmpty(t *testing.T) {
 func TestDashboardProbesNormalize(t *testing.T) {
 	cfg := mustLoad(t, "dashboard:\n  probes:\n    \" DNS-Worker \": \" http://dns:9102 \"\n    mon: \"http://mon:9100\"\n", validDSN())
 	if p := cfg.Dashboard.Probes; len(p) != 2 || p["dns-worker"] != "http://dns:9102" || p["mon"] != "http://mon:9100" {
-		t.Errorf("dashboard.probes после normalize: ожидается map[dns-worker:http://dns:9102 mon:http://mon:9100], получено %v", p)
+		t.Errorf("dashboard.probes after normalize: want map[dns-worker:http://dns:9102 mon:http://mon:9100], got %v", p)
 	}
 	// A collision after folding ("Mon" and "mon") resolves
 	// deterministically — the lexicographically greater key wins (like
@@ -1532,7 +1532,7 @@ func TestDashboardProbesNormalize(t *testing.T) {
 	} {
 		cfg := mustLoad(t, yaml, validDSN())
 		if p := cfg.Dashboard.Probes; len(p) != 1 || p["mon"] != "http://b:1" {
-			t.Errorf("%q: после normalize: ожидается map[mon:http://b:1], получено %v", yaml, p)
+			t.Errorf("%q: after normalize: want map[mon:http://b:1], got %v", yaml, p)
 		}
 	}
 }
@@ -1544,7 +1544,7 @@ func TestDashboardRenderMetricsNormalize(t *testing.T) {
 	cfg := mustLoad(t, "dashboard:\n  render_metrics_urls:\n    - \" http://render-worker:9105/metrics \"\n    - \"\"\n    - \"http://render-fallback:9110/metrics\"\n", validDSN())
 	want := []string{"http://render-worker:9105/metrics", "http://render-fallback:9110/metrics"}
 	if got := cfg.Dashboard.RenderMetrics; len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
-		t.Errorf("dashboard.render_metrics_urls после normalize: ожидается %v, получено %v", want, got)
+		t.Errorf("dashboard.render_metrics_urls after normalize: want %v, got %v", want, got)
 	}
 }
 
@@ -1554,13 +1554,13 @@ func TestDashboardRenderMetricsNormalize(t *testing.T) {
 func TestLogLevelNormalize(t *testing.T) {
 	cfg := mustLoad(t, "log:\n  level: \"  WARN \"\n", validDSN())
 	if cfg.Log.Level != "warn" {
-		t.Errorf("log.level после normalize: ожидается %q, получено %q", "warn", cfg.Log.Level)
+		t.Errorf("log.level after normalize: want %q, got %q", "warn", cfg.Log.Level)
 	}
 	env := validDSN()
 	env["CRAWLER_LOG_LEVEL"] = "ERROR"
 	cfg = mustLoad(t, "", env)
 	if cfg.Log.Level != "error" {
-		t.Errorf("log.level из env после normalize: ожидается %q, получено %q", "error", cfg.Log.Level)
+		t.Errorf("log.level from env after normalize: want %q, got %q", "error", cfg.Log.Level)
 	}
 }
 
@@ -1570,7 +1570,7 @@ func TestEnvSpecsNoDuplicates(t *testing.T) {
 	seen := map[string]bool{}
 	for _, s := range envSpecs() {
 		if seen[s.key] {
-			t.Errorf("переменная %s встречается в таблице дважды", s.key)
+			t.Errorf("the variable %s appears twice in the table", s.key)
 		}
 		seen[s.key] = true
 	}

@@ -22,7 +22,7 @@ func assertNormalize(t *testing.T, in string, want Result) {
 	t.Helper()
 	got, err := Normalize(in)
 	if err != nil {
-		t.Fatalf("Normalize(%q) = %v, want без ошибки", in, err)
+		t.Fatalf("Normalize(%q) = %v, want no error", in, err)
 	}
 	if got != want {
 		t.Errorf("Normalize(%q) = %+v, want %+v", in, got, want)
@@ -34,11 +34,11 @@ func assertNormalizeError(t *testing.T, in string, want ErrorKind) {
 	t.Helper()
 	_, err := Normalize(in)
 	if err == nil {
-		t.Fatalf("Normalize(%q): нет ошибки, want %s", in, want)
+		t.Fatalf("Normalize(%q): no error, want %s", in, want)
 	}
 	kind, ok := KindOf(err)
 	if !ok {
-		t.Fatalf("Normalize(%q): ошибка %v не *idn.Error", in, err)
+		t.Fatalf("Normalize(%q): the error %v is not *idn.Error", in, err)
 	}
 	if kind != want {
 		t.Errorf("Normalize(%q): kind = %s, want %s (err: %v)", in, kind, want, err)
@@ -144,7 +144,7 @@ func TestNormalizeEmoji(t *testing.T) {
 		assertNormalize(t, "xn--e28h.com", Result{"xn--e28h.com", "😀.com", "com", "xn--e28h", true})
 	})
 	// The "family" ZWJ sequence: U+200D outside the allowed context.
-	t.Run("ZWJ-последовательность", func(t *testing.T) {
+	t.Run("a ZWJ sequence", func(t *testing.T) {
 		assertNormalizeError(t, "\U0001F468\u200D\U0001F469\u200D\U0001F466.com", ErrInvalid)
 	})
 }
@@ -254,13 +254,13 @@ func TestNormalizeLengthPunycode(t *testing.T) {
 	ok := strings.Repeat("р", 57) + ".com"
 	got, err := Normalize(ok)
 	if err != nil {
-		t.Fatalf("Normalize(р×57): %v, want без ошибки (метка ровно 63 октета)", err)
+		t.Fatalf("Normalize(р×57): %v, want no error (the label is exactly 63 octets)", err)
 	}
 	if !strings.HasPrefix(got.Label, xnPrefix) {
-		t.Errorf("метка р×57 = %q, want punycode-метку (префикс %s)", got.Label, xnPrefix)
+		t.Errorf("the р×57 label = %q, want a punycode label (the prefix %s)", got.Label, xnPrefix)
 	}
 	if len(got.Label) != maxLabelLen {
-		t.Errorf("метка р×57: %d октет, want ровно %d", len(got.Label), maxLabelLen)
+		t.Errorf("the р×57 label: %d octets, want exactly %d", len(got.Label), maxLabelLen)
 	}
 	assertNormalizeError(t, strings.Repeat("р", 58)+".com", ErrLabelLen)
 }
@@ -386,7 +386,7 @@ func TestNormalizeZoneUnicode(t *testing.T) {
 	for _, in := range []string{"xn--p1ai-", "рф!!"} {
 		t.Run(in, func(t *testing.T) {
 			if _, err := NormalizeZone(in); err == nil {
-				t.Errorf("NormalizeZone(%q): нет ошибки, want ошибка", in)
+				t.Errorf("NormalizeZone(%q): no error, want an error", in)
 			}
 		})
 	}
@@ -429,7 +429,7 @@ func TestHostToASCIICorpus(t *testing.T) {
 		t.Run(tc.in, func(t *testing.T) {
 			_, err := HostToASCII(tc.in)
 			if err == nil {
-				t.Fatalf("HostToASCII(%q): нет ошибки, want %s", tc.in, tc.kind)
+				t.Fatalf("HostToASCII(%q): no error, want %s", tc.in, tc.kind)
 			}
 			if kind, ok := KindOf(err); !ok || kind != tc.kind {
 				t.Errorf("HostToASCII(%q): kind = %s (%v), want %s", tc.in, kind, err, tc.kind)

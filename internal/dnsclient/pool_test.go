@@ -33,7 +33,7 @@ func assertConnClosed(t *testing.T, conn *net.UDPConn) {
 	t.Helper()
 	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
 	if _, err := conn.Read(make([]byte, 16)); err == nil {
-		t.Fatal("ожидается ошибка чтения закрытого сокета, получен ответ")
+		t.Fatal("want a read error on a closed socket, got an answer")
 	}
 }
 
@@ -58,7 +58,7 @@ func TestUDPPoolReuseSocket(t *testing.T) {
 		t.Fatalf("get: %v", err)
 	}
 	if c1 != c2 {
-		t.Fatal("возвращённый сокет должен переиспользоваться, получен новый")
+		t.Fatal("the returned socket must be reused, got a new one")
 	}
 	p.Put(c2)
 }
@@ -80,7 +80,7 @@ func TestUDPPoolGetWaitsForFreeSocket(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
 	defer cancel()
 	if c, err := p.Get(ctx); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("ожидается DeadlineExceeded, получены %v, %v", c, err)
+		t.Fatalf("want DeadlineExceeded, got %v, %v", c, err)
 	}
 
 	// A release wakes the waiter.
@@ -100,13 +100,13 @@ func TestUDPPoolGetWaitsForFreeSocket(t *testing.T) {
 	select {
 	case c := <-got:
 		if c != c1 {
-			t.Fatal("ждущий должен получить освободившийся сокет")
+			t.Fatal("the waiter must get the released socket")
 		}
 		p.Put(c)
 	case err := <-errCh:
-		t.Fatalf("get после освобождения: %v", err)
+		t.Fatalf("get after the release: %v", err)
 	case <-time.After(2 * time.Second):
-		t.Fatal("Get не дождался освобождения сокета")
+		t.Fatal("Get did not wait for the socket release")
 	}
 }
 
@@ -135,10 +135,10 @@ func TestUDPPoolGetCancelledWhileWaiting(t *testing.T) {
 	select {
 	case err := <-res:
 		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("ожидается context.Canceled, получено %v", err)
+			t.Fatalf("want context.Canceled, got %v", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("Get не отреагировал на отмену контекста")
+		t.Fatal("Get did not react to the context cancellation")
 	}
 }
 
@@ -177,7 +177,7 @@ func TestUDPPoolParallelInvariants(t *testing.T) {
 				mu.Lock()
 				if inUse[conn] {
 					mu.Unlock()
-					t.Errorf("сокет %v выдан повторно при живом владельце", conn)
+					t.Errorf("the socket %v was handed out again while its owner is alive", conn)
 					p.Put(conn)
 					return
 				}
@@ -199,10 +199,10 @@ func TestUDPPoolParallelInvariants(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	if len(inUse) != 0 {
-		t.Fatalf("после завершения всех горутин сокеты числятся выданными: %d", len(inUse))
+		t.Fatalf("after all goroutines finish the sockets are still counted as in use: %d", len(inUse))
 	}
 	if len(seenAll) == 0 || len(seenAll) > size {
-		t.Fatalf("число различных сокетов пула %d вне 1..%d", len(seenAll), size)
+		t.Fatalf("the number of distinct pool sockets %d is outside 1..%d", len(seenAll), size)
 	}
 }
 
@@ -234,13 +234,13 @@ func TestUDPPoolDiscardReplacedLazily(t *testing.T) {
 	// hands it out instead of dialing a replacement.
 	c2, err := p.Get(context.Background())
 	if err != nil {
-		t.Fatalf("get после discard: %v", err)
+		t.Fatalf("get after discard: %v", err)
 	}
 	if c2 == c1 {
-		t.Fatal("списанный сокет не выдаётся повторно")
+		t.Fatal("a retired socket is not handed out again")
 	}
 	if n := dials.Load(); n != 0 {
-		t.Fatalf("наборов %d рядом со свободным сокетом, want 0", n)
+		t.Fatalf("dial sets %d next to a free socket, want 0", n)
 	}
 
 	// The channel is empty and there is room — now Get lazily dials a replacement.
@@ -249,10 +249,10 @@ func TestUDPPoolDiscardReplacedLazily(t *testing.T) {
 		t.Fatalf("get: %v", err)
 	}
 	if c3 == c1 || c3 == c2 {
-		t.Fatal("ожидался замещающий (новый) сокет")
+		t.Fatal("want a replacement (new) socket")
 	}
 	if n := dials.Load(); n != 1 {
-		t.Fatalf("наборов %d, want 1 (ленивый замещающий)", n)
+		t.Fatalf("dial sets %d, want 1 (a lazy replacement)", n)
 	}
 	p.Put(c2)
 	p.Put(c3)
@@ -276,10 +276,10 @@ func TestUDPPoolClose(t *testing.T) {
 	assertConnClosed(t, held) // the issued socket is closed on return…
 	p.Put(held)               // …and does not go back into the closed pool
 	if _, err := p.Get(context.Background()); !errors.Is(err, ErrPoolClosed) {
-		t.Fatalf("get после close: ожидается ErrPoolClosed, получено %v", err)
+		t.Fatalf("get after close: want ErrPoolClosed, got %v", err)
 	}
 	if err := p.Close(); err != nil {
-		t.Fatalf("повторный close должен быть no-op: %v", err)
+		t.Fatalf("a second close must be a no-op: %v", err)
 	}
 }
 
@@ -309,25 +309,25 @@ func TestUDPPoolCloseWakesWaiters(t *testing.T) {
 	select {
 	case err := <-res:
 		if !errors.Is(err, ErrPoolClosed) {
-			t.Fatalf("ждущий Get после Close: %v, want ErrPoolClosed", err)
+			t.Fatalf("a waiting Get after Close: %v, want ErrPoolClosed", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("Close не разбудил ждущего Get")
+		t.Fatal("Close did not wake the waiting Get")
 	}
 	p.Put(held)
 }
 
 func TestUDPPoolBadArguments(t *testing.T) {
 	if _, err := NewUDPPool(context.Background(), "127.0.0.1:53", 0); err == nil {
-		t.Fatal("size 0: ожидается ошибка")
+		t.Fatal("size 0: want an error")
 	}
 	if _, err := NewUDPPool(context.Background(), "nohostport", 1); err == nil {
-		t.Fatal("кривой адрес: ожидается ошибка")
+		t.Fatal("a malformed address: want an error")
 	}
 	// A port out of range: SplitHostPort will parse it, DialContext will
 	// not — the eager dial must fail, not hand out a dead pool.
 	if _, err := NewUDPPool(context.Background(), "127.0.0.1:99999", 1); err == nil {
-		t.Fatal("недоступный порт: ожидается ошибка eager-набора")
+		t.Fatal("an unreachable port: want an eager dial set error")
 	}
 }
 
@@ -356,12 +356,12 @@ func TestUDPPoolDialFailureAtGet(t *testing.T) {
 		return old(ctx)
 	}
 	if _, err := p.Get(context.Background()); err == nil {
-		t.Fatal("первый (падающий) набор: ожидается ошибка")
+		t.Fatal("the first (failing) dial set: want an error")
 	}
 	// The room counter is freed: a repeated Get dials the socket again.
 	c2, err := p.Get(context.Background())
 	if err != nil {
-		t.Fatalf("get после неудачного набора: %v", err)
+		t.Fatalf("get after a failed dial set: %v", err)
 	}
 	p.Put(c2)
 }

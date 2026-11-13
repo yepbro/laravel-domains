@@ -65,19 +65,19 @@ func TestScenariosCoverTZ(t *testing.T) {
 	}{
 		{"NXDOMAIN", "nxdomain-case", func(d DNSCfg, _ SiteCfg) bool { return d == (DNSCfg{}) }},
 		{"wildcard", "wildcard", func(d DNSCfg, _ SiteCfg) bool { return d.Wildcard && d.A == "testweb" }},
-		{"тарпит", "tarpit", mockAt("/tarpit")},
-		{"бесконечный редирект", "infinite-redirect", mockAt("/redirect/infinite")},
-		{"гигантское тело", "huge-body", mockAt("/huge")},
-		{"SPA-страница", "spa-shell", func(_ DNSCfg, s SiteCfg) bool { return s.Template == "spa" }},
+		{"tarpit", "tarpit", mockAt("/tarpit")},
+		{"infinite redirect", "infinite-redirect", mockAt("/redirect/infinite")},
+		{"huge body", "huge-body", mockAt("/huge")},
+		{"SPA page", "spa-shell", func(_ DNSCfg, s SiteCfg) bool { return s.Template == "spa" }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.req, func(t *testing.T) {
 			sc, found := byName[tc.scenario]
 			if !found {
-				t.Fatalf("сценарий %q (ТЗ 11.2 «%s») отсутствует в scenarios.yaml", tc.scenario, tc.req)
+				t.Fatalf("the scenario %q (spec 11.2 "%s") is missing from scenarios.yaml", tc.scenario, tc.req)
 			}
 			if !tc.ok(sc.DNS, sc.Site) {
-				t.Errorf("сценарий %q не соответствует ТЗ 11.2 «%s»: dns=%+v site=%+v",
+				t.Errorf("the scenario %q does not match spec 11.2 "%s": dns=%+v site=%+v",
 					tc.scenario, tc.req, sc.DNS, sc.Site)
 			}
 		})
@@ -88,7 +88,7 @@ func TestScenariosCoverTZ(t *testing.T) {
 	// Host.
 	for _, sc := range cfg.Scenarios {
 		if sc.Site.Template == "mock" && sc.Site.MockPath == "" {
-			t.Errorf("сценарий %s: template=mock без mock_path", sc.Name)
+			t.Errorf("the scenario %s: template=mock without mock_path", sc.Name)
 		}
 	}
 }
@@ -134,7 +134,7 @@ func TestSamplesCoverLaravelVersions(t *testing.T) {
 		var hdrs map[string][]string
 		raw, err = os.ReadFile(filepath.Join(samplesDir, e.Name(), "headers.json"))
 		if err != nil {
-			t.Errorf("%s: позитивный образец без headers.json: %v", e.Name(), err)
+			t.Errorf("%s: a positive sample without headers.json: %v", e.Name(), err)
 			continue
 		}
 		if err := yaml.Unmarshal(raw, &hdrs); err != nil {
@@ -142,7 +142,7 @@ func TestSamplesCoverLaravelVersions(t *testing.T) {
 			continue
 		}
 		if len(hdrs["Set-Cookie"]) == 0 {
-			t.Errorf("%s: у позитивного образца нет Set-Cookie — анализ по кукам невозможен на e2e", e.Name())
+			t.Errorf("%s: the positive sample has no Set-Cookie — the cookie-based analysis is impossible on e2e", e.Name())
 			continue
 		}
 		hasLaravelCookie := false
@@ -156,7 +156,7 @@ func TestSamplesCoverLaravelVersions(t *testing.T) {
 			}
 		}
 		if !hasLaravelCookie {
-			t.Errorf("%s: в Set-Cookie нет кук Laravel (XSRF-TOKEN/_session/remember_)", e.Name())
+			t.Errorf("%s: the Set-Cookie has no Laravel cookies (XSRF-TOKEN/_session/remember_)", e.Name())
 		}
 
 		if major := majorOf(meta.VerMin); minMajor < 0 || major < minMajor {
@@ -168,12 +168,12 @@ func TestSamplesCoverLaravelVersions(t *testing.T) {
 	}
 
 	if positives < 7 {
-		t.Errorf("позитивных образцов Laravel = %d, хочу >= 7 (спектр версий и стеков mix/vite/inertia/livewire)", positives)
+		t.Errorf("Laravel positive samples = %d, want >= 7 (a range of versions and mix/vite/inertia/livewire stacks)", positives)
 	}
 	// The version line: from the legacy 5.x to the current 12 (spec 11.2
 	// "different versions").
 	if minMajor > 6 || maxMajor < 11 {
-		t.Errorf("спектр мажорных версий образцов [%d..%d], хочу покрытие 5.x–12", minMajor, maxMajor)
+		t.Errorf("the sample major-version range [%d..%d], want 5.x–12 coverage", minMajor, maxMajor)
 	}
 }
 
@@ -264,7 +264,7 @@ func assertTreesEqual(t *testing.T, got, want string) {
 			return nil
 		})
 		if err != nil {
-			t.Fatalf("обход %s: %v", root, err)
+			t.Fatalf("walking %s: %v", root, err)
 		}
 		return out
 	}
@@ -272,14 +272,14 @@ func assertTreesEqual(t *testing.T, got, want string) {
 	gotFiles, wantFiles := snapshot(got), snapshot(want)
 	for rel, sum := range wantFiles {
 		if gotSum, ok := gotFiles[rel]; !ok {
-			t.Errorf("%s: файла нет в свежем генерате (устарел/лишний): %s", filepath.Base(got), rel)
+			t.Errorf("%s: the file is missing from the fresh generate (stale/extra): %s", filepath.Base(got), rel)
 		} else if gotSum != sum {
-			t.Errorf("%s: %s расходится с scenarios.yaml — выполните make testbed-gen и закоммитьте генерат", filepath.Base(got), rel)
+			t.Errorf("%s: %s diverges from scenarios.yaml — run make testbed-gen and commit the generated artifacts", filepath.Base(got), rel)
 		}
 	}
 	for rel := range gotFiles {
 		if _, ok := wantFiles[rel]; !ok {
-			t.Errorf("%s: в свежем генерате появился файл, отсутствующий в репозитории: %s (выполните make testbed-gen)", filepath.Base(got), rel)
+			t.Errorf("%s: the fresh generate has a file missing from the repository: %s (run make testbed-gen)", filepath.Base(got), rel)
 		}
 	}
 }
@@ -345,14 +345,14 @@ ver_min: "11"
 
 	for _, id := range []string{"laravel-ex", "plain-ex"} {
 		if !strings.Contains(aRecords.String(), id+" IN A 172.28.100.12") {
-			t.Errorf("образец %s не получил A-запись в базовой зоне", id)
+			t.Errorf("the sample %s got no A record in the base zone", id)
 		}
 		if !strings.Contains(caddy, id+".crawl.test") {
-			t.Errorf("образец %s не получил виртуальный хост в Caddyfile", id)
+			t.Errorf("the sample %s got no virtual host in the Caddyfile", id)
 		}
 	}
 	if strings.Contains(caddy, "not-a-sample") || strings.Contains(aRecords.String(), "not-a-sample") {
-		t.Error("каталог без meta.yaml не должен подключаться как образец")
+		t.Error("a directory without meta.yaml must not be picked up as a sample")
 	}
 
 	// Headers: both cookies and an ordinary header; the names are sorted
@@ -366,7 +366,7 @@ ver_min: "11"
 		"root * /srv/samples/laravel-ex",
 	} {
 		if !strings.Contains(caddy, want) {
-			t.Errorf("сниппет образца без фрагмента %q", want)
+			t.Errorf("the sample snippet is missing the fragment %q", want)
 		}
 	}
 }

@@ -46,11 +46,11 @@ func waitFor(t *testing.T, files <-chan File) File {
 	select {
 	case f, ok := <-files:
 		if !ok {
-			t.Fatal("канал готовых файлов закрыт")
+			t.Fatal("the ready-files channel is closed")
 		}
 		return f
 	case <-time.After(3 * time.Second):
-		t.Fatal("готовый файл не получен за 3 с")
+		t.Fatal("the ready file was not received within 3s")
 		return File{}
 	}
 }
@@ -60,7 +60,7 @@ func expectEmpty(t *testing.T, files <-chan File, quiet time.Duration) {
 	t.Helper()
 	select {
 	case f := <-files:
-		t.Errorf("неожижиданная выдача файла %q", f.Path)
+		t.Errorf("an unexpected file delivery %q", f.Path)
 	case <-time.After(quiet):
 	}
 }
@@ -84,10 +84,10 @@ func TestDir_StableFileDelivered(t *testing.T) {
 
 	f := waitFor(t, files)
 	if f.Path != name {
-		t.Errorf("выдан путь %q, want %q", f.Path, name)
+		t.Errorf("delivered the path %q, want %q", f.Path, name)
 	}
 	if f.Size != int64(len("example.com\n")) {
-		t.Errorf("размер = %d, want %d", f.Size, len("example.com\n"))
+		t.Errorf("the size = %d, want %d", f.Size, len("example.com\n"))
 	}
 }
 
@@ -136,7 +136,7 @@ func TestDir_TmpPartHiddenIgnored(t *testing.T) {
 		t.Fatal(err)
 	}
 	if f := waitFor(t, files); filepath.Base(f.Path) != "a.txt" {
-		t.Errorf("выдан %q, want a.txt", f.Path)
+		t.Errorf("delivered %q, want a.txt", f.Path)
 	}
 }
 
@@ -164,7 +164,7 @@ func TestDir_ArchiveExtensions(t *testing.T) {
 	}
 	for _, name := range want {
 		if !got[name] {
-			t.Errorf("архив %s не выдан (выданы %v)", name, got)
+			t.Errorf("the archive %s was not delivered (delivered %v)", name, got)
 		}
 	}
 	// Nothing extra (rar/7z/tmp/hidden).
@@ -210,7 +210,7 @@ func TestDir_ScanPicksPreExistingFile(t *testing.T) {
 
 	files := start(t, dir, nil)
 	if f := waitFor(t, files); f.Path != name {
-		t.Errorf("выдан путь %q, want %q", f.Path, name)
+		t.Errorf("delivered the path %q, want %q", f.Path, name)
 	}
 }
 
@@ -224,7 +224,7 @@ func TestDir_NewNestedDirsWatched(t *testing.T) {
 	name := filepath.Join(dir, "новая-зона.test", "add", "seed.txt")
 	writeFile(t, name, "example.com\n")
 	if f := waitFor(t, files); f.Path != name {
-		t.Errorf("выдан путь %q, want %q", f.Path, name)
+		t.Errorf("delivered the path %q, want %q", f.Path, name)
 	}
 }
 
@@ -241,7 +241,7 @@ func TestDir_NoDuplicateButReplacedFileRedelivered(t *testing.T) {
 	writeFile(t, name, "one\ntwo\n")
 	f := waitFor(t, files)
 	if f.Size != int64(len("one\ntwo\n")) {
-		t.Errorf("размер перезаписанного файла = %d, want %d", f.Size, len("one\ntwo\n"))
+		t.Errorf("the rewritten file size = %d, want %d", f.Size, len("one\ntwo\n"))
 	}
 }
 
@@ -293,7 +293,7 @@ func TestDir_BackpressureNoLoss(t *testing.T) {
 	}
 	for _, name := range want {
 		if !got[name] {
-			t.Errorf("файл %q потерян при backpressure", name)
+			t.Errorf("the file %q was lost under backpressure", name)
 		}
 	}
 
@@ -301,7 +301,7 @@ func TestDir_BackpressureNoLoss(t *testing.T) {
 	name := filepath.Join(dir, "crawl.test", "add", "z.txt")
 	writeFile(t, name, "example.com\n")
 	if f := waitFor(t, files); f.Path != name {
-		t.Errorf("после backpressure выдан %q, want %q", f.Path, name)
+		t.Errorf("after the backpressure delivered %q, want %q", f.Path, name)
 	}
 }
 
@@ -321,10 +321,10 @@ func TestDir_CancelClosesChannel(t *testing.T) {
 	select {
 	case _, ok := <-files:
 		if ok {
-			t.Error("после cancel в канале осталось значение")
+			t.Error("after cancel a value remained in the channel")
 		}
 	case <-time.After(3 * time.Second):
-		t.Fatal("канал не закрылся после cancel")
+		t.Fatal("the channel did not close after cancel")
 	}
 }
 
@@ -333,13 +333,13 @@ func TestDir_MissingDirCreated(t *testing.T) {
 	files := start(t, dir, nil)
 
 	if st, err := os.Stat(dir); err != nil || !st.IsDir() {
-		t.Fatalf("отсутствующий каталог не создан: %v", err)
+		t.Fatalf("a missing directory was not created: %v", err)
 	}
 
 	name := filepath.Join(dir, "crawl.test", "add", "seed.txt")
 	writeFile(t, name, "example.com\n")
 	if f := waitFor(t, files); f.Path != name {
-		t.Errorf("выдан путь %q, want %q", f.Path, name)
+		t.Errorf("delivered the path %q, want %q", f.Path, name)
 	}
 }
 
@@ -354,7 +354,7 @@ func TestDir_HiddenRootWatched(t *testing.T) {
 	name := filepath.Join(dir, "crawl.test", "add", "seed.txt")
 	writeFile(t, name, "example.com\n")
 	if f := waitFor(t, files); f.Path != name {
-		t.Errorf("выдан путь %q, want %q (скрытый корень наблюдается)", f.Path, name)
+		t.Errorf("delivered the path %q, want %q (a hidden root is watched)", f.Path, name)
 	}
 
 	writeFile(t, filepath.Join(dir, ".hidden", "add", "x.txt"), "x")
@@ -363,6 +363,6 @@ func TestDir_HiddenRootWatched(t *testing.T) {
 
 func TestDir_RequiresDir(t *testing.T) {
 	if _, err := Dir(context.Background(), Options{}); err == nil {
-		t.Error("ожидалась ошибка при пустом Options.Dir")
+		t.Error("want an error with an empty Options.Dir")
 	}
 }

@@ -17,7 +17,7 @@ import (
 func TestScanGate(t *testing.T) {
 	// nil — a no-op: Acquire/Release with no effect and no panic.
 	if err := ScanGate(nil).Acquire(context.Background()); err != nil {
-		t.Fatalf("nil-гейт Acquire: %v", err)
+		t.Fatalf("the nil gate Acquire: %v", err)
 	}
 	ScanGate(nil).Release()
 
@@ -55,13 +55,13 @@ func TestScanGate(t *testing.T) {
 	close(hold)
 	wg.Wait()
 	if max := maxSeen.Load(); max != 1 {
-		t.Fatalf("пик одновременных держателей = %d, want 1 (взаимное исключение)", max)
+		t.Fatalf("the peak of concurrent holders = %d, want 1 (mutual exclusion)", max)
 	}
 
 	// ctx cancellation while waiting for the gate: a busy gate — a ctx
 	// error, not a hang.
 	if err := gate.Acquire(context.Background()); err != nil {
-		t.Fatalf("занятие свободного гейта: %v", err)
+		t.Fatalf("acquiring a free gate: %v", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	got := make(chan error, 1)
@@ -71,10 +71,10 @@ func TestScanGate(t *testing.T) {
 	select {
 	case err := <-got:
 		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("ожидание гейта под отменой = %v, want context.Canceled", err)
+			t.Fatalf("waiting for the gate under cancellation = %v, want context.Canceled", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("Acquire не вернулся по отмене ctx")
+		t.Fatal("Acquire did not return on ctx cancellation")
 	}
 	gate.Release()
 }

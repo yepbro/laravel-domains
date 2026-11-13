@@ -85,7 +85,7 @@ func (r *rowsMini) Next() bool {
 
 func (r *rowsMini) Scan(dest ...any) error {
 	if r.i == 0 || r.i > len(r.rows) || len(dest) != len(r.rows[r.i-1]) {
-		return fmt.Errorf("rowsMini: Scan без Next или арность %d ≠ колонок", len(dest))
+		return fmt.Errorf("rowsMini: Scan without Next or arity %d ≠ columns", len(dest))
 	}
 	for i, d := range dest {
 		switch dst := d.(type) {
@@ -96,7 +96,7 @@ func (r *rowsMini) Scan(dest ...any) error {
 		case *bool:
 			*dst = r.rows[r.i-1][i].(bool)
 		default:
-			return fmt.Errorf("rowsMini: приёмник[%d] %T", i, d)
+			return fmt.Errorf("rowsMini: dest[%d] %T", i, d)
 		}
 	}
 	return nil
@@ -112,10 +112,10 @@ type poolFake struct{}
 
 func (poolFake) Ping(context.Context) error { return nil }
 func (poolFake) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFromSource) (int64, error) {
-	return 0, errors.New("CopyFrom не используется живой проверкой")
+	return 0, errors.New("CopyFrom is not used by the live check")
 }
 func (poolFake) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
-	return pgconn.CommandTag{}, errors.New("Exec не используется живой проверкой")
+	return pgconn.CommandTag{}, errors.New("Exec is not used by the live check")
 }
 func (poolFake) Query(context.Context, string, ...any) (pgx.Rows, error) {
 	return &rowsMini{rows: [][]any{{int16(0), "", true}}}, nil
@@ -155,13 +155,13 @@ func TestNewRuntimeSmallPoolOnce(t *testing.T) {
 	}
 	defer func() { _ = rt.Close() }()
 	if got := spy.builds.Load(); got != 1 {
-		t.Fatalf("цепь собрана %d раз, ожидалась 1 (на NewRuntime)", got)
+		t.Fatalf("the chain was built %d times, want 1 (on NewRuntime)", got)
 	}
 	if len(spy.poolSizes) != 1 || spy.poolSizes[0] != LiveUDPPoolSize {
-		t.Fatalf("пул цепи = %v, ожидался [%d] (малый пул живой проверки)", spy.poolSizes, LiveUDPPoolSize)
+		t.Fatalf("the chain pool = %v, want [%d] (the small live-check pool)", spy.poolSizes, LiveUDPPoolSize)
 	}
 	if rt.renderer != nil {
-		t.Error("render.Manager создан при пустом render.remote_url")
+		t.Error("render.Manager created with an empty render.remote_url")
 	}
 }
 
@@ -177,7 +177,7 @@ func TestNewRuntimeExplicitPool(t *testing.T) {
 	}
 	defer func() { _ = rt.Close() }()
 	if len(spy.poolSizes) != 1 || spy.poolSizes[0] != 8 {
-		t.Fatalf("пул цепи = %v, ожидался [8]", spy.poolSizes)
+		t.Fatalf("the chain pool = %v, want [8]", spy.poolSizes)
 	}
 }
 
@@ -209,17 +209,17 @@ func TestRuntimeRunReusesCircuit(t *testing.T) {
 				return
 			}
 			if res.Terminal == "" {
-				t.Errorf("Run %d: ожидалась терминальная ветка NXDOMAIN, итог %+v", n, res)
+				t.Errorf("Run %d: want the terminal NXDOMAIN branch, result %+v", n, res)
 			}
 		}(i)
 	}
 	wg.Wait()
 
 	if got := spy.builds.Load(); got != 1 {
-		t.Fatalf("после 10 параллельных Run цепь собрана %d раз, ожидалась 1", got)
+		t.Fatalf("after 10 parallel Runs the chain was built %d times, want 1", got)
 	}
 	if got := spy.exchanges.Load(); got != 10 {
-		t.Fatalf("DNS-обменов %d, ожидалось 10 (по одному апексу на Run)", got)
+		t.Fatalf("DNS exchanges %d, want 10 (one apex per Run)", got)
 	}
 }
 
@@ -238,10 +238,10 @@ func TestRuntimeCloseClosesChainOnce(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 	if err := rt.Close(); err != nil {
-		t.Fatalf("повторный Close: %v", err)
+		t.Fatalf("the second Close: %v", err)
 	}
 	if got := spy.closes.Load(); got != 1 {
-		t.Fatalf("цепь закрыта %d раз, ожидался 1", got)
+		t.Fatalf("the chain was closed %d times, want 1", got)
 	}
 }
 
@@ -256,10 +256,10 @@ func TestRunOneShotBuildsAndCloses(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 	if got := spy.builds.Load(); got != 1 {
-		t.Fatalf("цепь собрана %d раз, ожидалась 1", got)
+		t.Fatalf("the chain was built %d times, want 1", got)
 	}
 	if got := spy.closes.Load(); got != 1 {
-		t.Fatalf("цепь закрыта %d раз, ожидался 1 (defer Close)", got)
+		t.Fatalf("the chain was closed %d times, want 1 (defer Close)", got)
 	}
 }
 
@@ -279,7 +279,7 @@ func TestRuntimeRulesReload(t *testing.T) {
 		t.Fatalf("NewRuntime: %v", err)
 	}
 	if got := rt.rules.Set().Rules[0].ID; got != "rule_one" {
-		t.Fatalf("начальный набор: %q, ожидался rule_one", got)
+		t.Fatalf("the initial rule set: %q, want rule_one", got)
 	}
 
 	// A set change: another id → another rules_version.
@@ -290,15 +290,15 @@ func TestRuntimeRulesReload(t *testing.T) {
 	deadline := time.Now().Add(3 * time.Second)
 	for rt.rules.Set().Rules[0].ID == "rule_one" {
 		if time.Now().After(deadline) {
-			t.Fatal("фоновая перезагрузка не подхватила новый набор за 3 с")
+			t.Fatal("the background reload did not pick up the new rule set within 3s")
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 	if rt.rules.Set().Rules[0].ID != "rule_two" {
-		t.Fatalf("после перезагрузки набор %q, ожидался rule_two", rt.rules.Set().Rules[0].ID)
+		t.Fatalf("after the reload the rule set is %q, want rule_two", rt.rules.Set().Rules[0].ID)
 	}
 	if got := spy.builds.Load(); got != 1 {
-		t.Fatalf("перезагрузка правил пересобрала цепь (%d сборок)", got)
+		t.Fatalf("the rules reload rebuilt the chain (%d builds)", got)
 	}
 
 	// Close stops the reload loop.
@@ -308,7 +308,7 @@ func TestRuntimeRulesReload(t *testing.T) {
 	select {
 	case <-rt.tickDone:
 	default:
-		t.Fatal("фоновый цикл перезагрузки не остановился после Close")
+		t.Fatal("the background reload loop did not stop after Close")
 	}
 }
 
@@ -324,11 +324,11 @@ func TestNewRuntimeRendererConfigured(t *testing.T) {
 	cfg.Render.RemoteURL = "ws://127.0.0.1:19222"
 	rt, err := NewRuntime(context.Background(), cfg, nil, RuntimeOptions{RulesReload: -1})
 	if err != nil {
-		t.Fatalf("NewRuntime с render.remote_url: %v", err)
+		t.Fatalf("NewRuntime with render.remote_url: %v", err)
 	}
 	defer func() { _ = rt.Close() }()
 	if rt.renderer == nil {
-		t.Fatal("render.Manager не создан при настроенном render.remote_url")
+		t.Fatal("render.Manager was not created with render.remote_url configured")
 	}
 }
 
@@ -342,9 +342,9 @@ func TestNewRuntimeBadRules(t *testing.T) {
 	cfg := config.Default()
 	cfg.Analyzer.RulesDir = filepath.Join(t.TempDir(), "нет-такого")
 	if _, err := NewRuntime(context.Background(), cfg, nil, RuntimeOptions{RulesReload: -1}); err == nil {
-		t.Fatal("NewRuntime без каталога правил = nil error, хочу ошибку")
+		t.Fatal("NewRuntime without a rules directory = nil error, want an error")
 	}
 	if got := spy.closes.Load(); got != 1 {
-		t.Fatalf("цепь закрыта %d раз при сбое сборки, ожидался 1 (без утечки)", got)
+		t.Fatalf("the chain was closed %d times on a build failure, want 1 (no leak)", got)
 	}
 }

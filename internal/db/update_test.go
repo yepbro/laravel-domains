@@ -26,7 +26,7 @@ type fakeExecer struct {
 }
 
 func (f *fakeExecer) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFromSource) (int64, error) {
-	return 0, errors.New("CopyFrom не должен вызываться")
+	return 0, errors.New("CopyFrom must not be called")
 }
 
 func (f *fakeExecer) Exec(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
@@ -66,7 +66,7 @@ func TestUpdate_SQL(t *testing.T) {
 		t.Errorf("SQL:\n got  %s\n want %s", sql, want)
 	}
 	if strings.Join(colNames(cols), ",") != "zone_id,id,check_state" {
-		t.Errorf("колонки значений = %v, want [zone_id id check_state] (ключи, затем SET)", colNames(cols))
+		t.Errorf("the value columns = %v, want [zone_id id check_state] (keys, then SET)", colNames(cols))
 	}
 }
 
@@ -78,10 +78,10 @@ func TestUpdate_SQLReturning(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !strings.HasSuffix(sql, ` RETURNING t.zone_id, t.id`) {
-		t.Errorf("SQL без RETURNING: %s", sql)
+		t.Errorf("SQL without RETURNING: %s", sql)
 	}
 	if len(cols) != 3 {
-		t.Errorf("Returning не должно добавлять колонки значений: %v", colNames(cols))
+		t.Errorf("Returning must not add value columns: %v", colNames(cols))
 	}
 }
 
@@ -100,7 +100,7 @@ func TestUpdate_MultipleWherePredicates(t *testing.T) {
 	}
 	want := `WHERE t."id" = u."id" AND t.check_state = 0 AND t.attempts < 3`
 	if !strings.HasSuffix(sql, want) {
-		t.Errorf("SQL:\n got  %s\n want суффикс %s", sql, want)
+		t.Errorf("SQL:\n got  %s\n want the suffix %s", sql, want)
 	}
 }
 
@@ -113,7 +113,7 @@ func TestUpdate_SQLSchemaQualifiedTable(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !strings.HasPrefix(sql, `UPDATE "public"."domains" AS t`) {
-		t.Errorf("SQL = %s, want схема экранируется по частям", sql)
+		t.Errorf("SQL = %s, want the schema quoted part by part", sql)
 	}
 }
 
@@ -123,21 +123,21 @@ func TestUpdate_BuildValidation(t *testing.T) {
 		b        *UpdateBuilder
 		problems []string
 	}{
-		{"без ключей", Update("domains").SetExpr("a = 1"), []string{"keys not set"}},
-		{"без присваиваний", Update("domains").Key(Column{Name: "id", Type: "int8"}), []string{"no assignments"}},
-		{"без таблицы", Update("").Key(Column{Name: "id", Type: "int8"}).SetExpr("a = 1"), []string{"table not set"}},
-		{"без типа колонки", Update("domains").Key(Column{Name: "id"}).SetExpr("a = 1"), []string{"SQL type not set"}},
-		{"без имени колонки", Update("domains").Key(Column{Name: "", Type: "int8"}).SetExpr("a = 1"), []string{"empty name"}},
+		{"no keys", Update("domains").SetExpr("a = 1"), []string{"keys not set"}},
+		{"no assignments", Update("domains").Key(Column{Name: "id", Type: "int8"}), []string{"no assignments"}},
+		{"no table", Update("").Key(Column{Name: "id", Type: "int8"}).SetExpr("a = 1"), []string{"table not set"}},
+		{"no column type", Update("domains").Key(Column{Name: "id"}).SetExpr("a = 1"), []string{"SQL type not set"}},
+		{"no column name", Update("domains").Key(Column{Name: "", Type: "int8"}).SetExpr("a = 1"), []string{"empty name"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			_, _, err := tc.b.build()
 			if err == nil {
-				t.Fatal("ожидалась ошибка сборки")
+				t.Fatal("want a build error")
 			}
 			for _, want := range tc.problems {
 				if !strings.Contains(err.Error(), want) {
-					t.Errorf("err = %v, want содержит %q", err, want)
+					t.Errorf("err = %v, want it to contain %q", err, want)
 				}
 			}
 		})
@@ -158,21 +158,21 @@ func TestUpdate_Exec(t *testing.T) {
 		t.Errorf("RowsAffected = %d, want %d", n, f.rows)
 	}
 	if !f.called {
-		t.Fatal("Exec не дошёл до БД")
+		t.Fatal("Exec did not reach the DB")
 	}
 	if len(f.args) != 3 {
-		t.Fatalf("аргументов %d, want 3 (по одному массиву на колонку)", len(f.args))
+		t.Fatalf("arguments %d, want 3 (one array per column)", len(f.args))
 	}
 	gotZones, ok := f.args[0].([]any)
 	if !ok || !reflect.DeepEqual(gotZones, zones) {
-		t.Errorf("аргумент 0 = %#v, want массив зоны %v", f.args[0], zones)
+		t.Errorf("argument 0 = %#v, want the zone array %v", f.args[0], zones)
 	}
 	gotStates, ok := f.args[2].([]any)
 	if !ok || !reflect.DeepEqual(gotStates, states) {
-		t.Errorf("аргумент 2 = %#v, want массив состояний %v", f.args[2], states)
+		t.Errorf("argument 2 = %#v, want the state array %v", f.args[2], states)
 	}
 	if !strings.Contains(f.sql, "unnest($1::int2[], $2::int8[], $3::int2[])") {
-		t.Errorf("SQL = %s, want приведение типов массивов", f.sql)
+		t.Errorf("SQL = %s, want the array type casts", f.sql)
 	}
 }
 
@@ -183,7 +183,7 @@ func TestUpdate_ExecEmptyBatch(t *testing.T) {
 		t.Fatalf("(%d, %v), want (0, nil)", n, err)
 	}
 	if f.called {
-		t.Error("пустая пачка не должна обращаться к БД")
+		t.Error("an empty chunk must not touch the DB")
 	}
 }
 
@@ -195,17 +195,17 @@ func TestUpdate_ExecArgsValidation(t *testing.T) {
 		columns [][]any
 		want    string
 	}{
-		{"мало массивов", [][]any{{}, {}}, "need 3"},
-		{"разная длина", [][]any{{1, 2}, {1}, {1, 2}}, "parallel"},
+		{"too few arrays", [][]any{{}, {}}, "need 3"},
+		{"unequal lengths", [][]any{{1, 2}, {1}, {1, 2}}, "parallel"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := schedulerUpdate().Exec(context.Background(), f, tc.columns...)
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
-				t.Errorf("err = %v, want содержит %q", err, tc.want)
+				t.Errorf("err = %v, want it to contain %q", err, tc.want)
 			}
 			if f.called {
-				t.Error("невалидные аргументы дошли до БД")
+				t.Error("invalid arguments reached the DB")
 			}
 		})
 	}
@@ -215,28 +215,28 @@ func TestUpdate_ExecReturningMismatch(t *testing.T) {
 	f := &fakeExecer{}
 	// Exec with Returning set — an error: the result rows would be lost.
 	if _, err := schedulerUpdate().Returning("t.id").Exec(context.Background(), f, []any{1}, []any{1}, []any{1}); err == nil || !strings.Contains(err.Error(), "Query") {
-		t.Errorf("err = %v, want подсказка использовать Query", err)
+		t.Errorf("err = %v, want the hint to use Query", err)
 	}
 	// Query without Returning — an error.
 	if _, err := schedulerUpdate().Query(context.Background(), f, []any{1}, []any{1}, []any{1}); err == nil || !strings.Contains(err.Error(), "Returning") {
-		t.Errorf("err = %v, want подсказка задать Returning", err)
+		t.Errorf("err = %v, want the hint to set Returning", err)
 	}
 }
 
 func TestUpdate_QueryEmptyBatch(t *testing.T) {
 	f := &fakeExecer{}
 	if _, err := schedulerUpdate().Returning("t.id").Query(context.Background(), f, []any{}, []any{}, []any{}); err == nil {
-		t.Error("Query с пустой пачкой: ожидалась ошибка (RETURNING не вернёт строк)")
+		t.Error("Query with an empty chunk: want an error (RETURNING will return no rows)")
 	}
 	if f.called {
-		t.Error("запрос не должен был выполниться")
+		t.Error("the query must not have run")
 	}
 }
 
 func TestUpdate_ExecError(t *testing.T) {
 	f := &fakeExecer{err: errors.New("boom")}
 	if _, err := schedulerUpdate().Exec(context.Background(), f, []any{1}, []any{1}, []any{1}); err == nil || !strings.Contains(err.Error(), "UPDATE domains") {
-		t.Errorf("err = %v, want имя таблицы в обёрнутой ошибке", err)
+		t.Errorf("err = %v, want the table name in the wrapped error", err)
 	}
 }
 

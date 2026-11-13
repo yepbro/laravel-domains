@@ -231,14 +231,14 @@ func (p *statusPool) calls() []string {
 }
 
 func (p *statusPool) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFromSource) (int64, error) {
-	return 0, errors.New("statusPool: CopyFrom не должен вызываться")
+	return 0, errors.New("statusPool: CopyFrom must not be called")
 }
 
 func (p *statusPool) Exec(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
 	p.mu.Lock()
 	p.execCalls++
 	p.mu.Unlock()
-	return pgconn.CommandTag{}, fmt.Errorf("statusPool: неожидаемый Exec: %s", sql)
+	return pgconn.CommandTag{}, fmt.Errorf("statusPool: an unexpected Exec: %s", sql)
 }
 
 func (p *statusPool) Query(ctx context.Context, sql string, _ ...any) (pgx.Rows, error) {
@@ -280,13 +280,13 @@ func (p *statusPool) Query(ctx context.Context, sql string, _ ...any) (pgx.Rows,
 		// be closed BEFORE the second query: the order, not just the sum
 		// of the Closes.
 		if p.closes != 1 {
-			return nil, fmt.Errorf("statusPool: laravelRecentSQL при %d закрытых set'ах, want 1 (первый set закрывается до второго запроса)", p.closes)
+			return nil, fmt.Errorf("statusPool: laravelRecentSQL with %d closed sets, want 1 (the first set closes before the second query)", p.closes)
 		}
 		return p.decorate(sql, p.laravelRowsData()), nil
 	case ingestRecentSQL:
 		return p.decorate(sql, p.ingestRowsData()), nil
 	default:
-		return nil, fmt.Errorf("statusPool: неожидаемый SQL Query: %s", sql)
+		return nil, fmt.Errorf("statusPool: an unexpected SQL Query: %s", sql)
 	}
 }
 
@@ -416,16 +416,16 @@ func (r *statusRows) Next() bool {
 
 func (r *statusRows) Scan(dest ...any) error {
 	if r.i == 0 || r.i > len(r.rows) {
-		return errors.New("statusRows: Scan без Next")
+		return errors.New("statusRows: Scan without Next")
 	}
 	row := r.rows[r.i-1]
 	if len(dest) != len(row) {
-		return fmt.Errorf("statusRows: приёмников %d, колонок %d", len(dest), len(row))
+		return fmt.Errorf("statusRows: dest %d, columns %d", len(dest), len(row))
 	}
 	for i, d := range dest {
 		v := row[i]
 		if _, bad := v.(statusBadColumn); bad {
-			return fmt.Errorf("statusRows: колонка %d нечитаема", i)
+			return fmt.Errorf("statusRows: column %d is unreadable", i)
 		}
 		switch dst := d.(type) {
 		case *int16:
@@ -453,7 +453,7 @@ func (r *statusRows) Scan(dest ...any) error {
 		case **time.Time:
 			assignPtr(dst, v)
 		default:
-			return fmt.Errorf("statusRows: приёмник %T не поддерживается", d)
+			return fmt.Errorf("statusRows: the dest %T is not supported", d)
 		}
 	}
 	return nil
@@ -535,7 +535,7 @@ func TestFetchZoneStats(t *testing.T) {
 		t.Fatalf("FetchZoneStats: %v", err)
 	}
 	if calls := pool.calls(); len(calls) != 1 || calls[0] != wantZoneStatsSQL {
-		t.Fatalf("запросы = %q, хочу один zoneStatsSQL", calls)
+		t.Fatalf("queries = %q, want one zoneStatsSQL", calls)
 	}
 	want := []ZoneStats{
 		{ID: 2, Name: "com", NameUnicode: "com", IsActive: true, DomainsTotal: 1000,
@@ -556,7 +556,7 @@ func TestFetchZoneStatsEmpty(t *testing.T) {
 		t.Fatalf("FetchZoneStats: %v", err)
 	}
 	if len(zones) != 0 {
-		t.Errorf("zones = %+v, хочу пусто", zones)
+		t.Errorf("zones = %+v, want empty", zones)
 	}
 }
 
@@ -571,7 +571,7 @@ func TestFetchThroughput(t *testing.T) {
 		t.Fatalf("FetchThroughput: %v", err)
 	}
 	if calls := pool.calls(); len(calls) != 1 || calls[0] != wantThroughputSQL {
-		t.Fatalf("запросы = %q, хочу один throughputSQL", calls)
+		t.Fatalf("queries = %q, want one throughputSQL", calls)
 	}
 	if thr != pool.thr {
 		t.Errorf("thr = %+v, want %+v", thr, pool.thr)
@@ -585,16 +585,16 @@ func TestStatusFetchErrors(t *testing.T) {
 	pool := newStatusPool()
 	pool.setQueryErr(boom)
 	if _, err := FetchZoneStats(context.Background(), pool); err == nil || !strings.Contains(err.Error(), "status: zones:") {
-		t.Errorf("FetchZoneStats err = %v, хочу контекст «status: зоны:»", err)
+		t.Errorf("FetchZoneStats err = %v, want the \"status: zones:\" context", err)
 	}
 	if _, err := FetchThroughput(context.Background(), pool); err == nil || !strings.Contains(err.Error(), "status: throughput:") {
-		t.Errorf("FetchThroughput err = %v, хочу контекст «status: темп:»", err)
+		t.Errorf("FetchThroughput err = %v, want the \"status: throughput:\" context", err)
 	}
 	if _, err := FetchZoneStats(context.Background(), nil); err == nil {
-		t.Error("FetchZoneStats(nil) = nil, хочу ошибку")
+		t.Error("FetchZoneStats(nil) = nil, want an error")
 	}
 	if _, err := FetchThroughput(context.Background(), nil); err == nil {
-		t.Error("FetchThroughput(nil) = nil, хочу ошибку")
+		t.Error("FetchThroughput(nil) = nil, want an error")
 	}
 }
 
@@ -611,15 +611,15 @@ func TestFetchRowDegradations(t *testing.T) {
 		glitch  statusGlitch
 		wantErr string
 	}{
-		{"зоны: нечитаемая строка", zoneStatsSQL, statusGlitch{badRow: true}, "status: zones: reading:"},
-		{"зоны: ошибка итерации", zoneStatsSQL, statusGlitch{rowsErr: errors.New("соединение сброшено")}, "status: zones: соединение сброшено"},
-		{"темп: пустой ответ", throughputSQL, statusGlitch{empty: true}, "status: throughput: empty response"},
-		{"темп: нечитаемая строка", throughputSQL, statusGlitch{badRow: true}, "status: throughput: reading:"},
-		{"темп: ошибка итерации", throughputSQL, statusGlitch{rowsErr: errors.New("соединение сброшено")}, "status: throughput: соединение сброшено"},
-		{"статусы: нечитаемая строка", domainStatusSQL, statusGlitch{badRow: true}, "status: statuses: reading:"},
-		{"статусы: ошибка итерации", domainStatusSQL, statusGlitch{rowsErr: errors.New("соединение сброшено")}, "status: statuses: соединение сброшено"},
-		{"ingest: нечитаемая строка", ingestRecentSQL, statusGlitch{badRow: true}, "status: ingest: reading:"},
-		{"ingest: ошибка итерации", ingestRecentSQL, statusGlitch{rowsErr: errors.New("соединение сброшено")}, "status: ingest: соединение сброшено"},
+		{"zones: an unreadable row", zoneStatsSQL, statusGlitch{badRow: true}, "status: zones: reading:"},
+		{"zones: an iteration error", zoneStatsSQL, statusGlitch{rowsErr: errors.New("connection reset")}, "status: zones: connection reset"},
+		{"throughput: an empty response", throughputSQL, statusGlitch{empty: true}, "status: throughput: empty response"},
+		{"throughput: an unreadable row", throughputSQL, statusGlitch{badRow: true}, "status: throughput: reading:"},
+		{"throughput: an iteration error", throughputSQL, statusGlitch{rowsErr: errors.New("connection reset")}, "status: throughput: connection reset"},
+		{"statuses: an unreadable row", domainStatusSQL, statusGlitch{badRow: true}, "status: statuses: reading:"},
+		{"statuses: an iteration error", domainStatusSQL, statusGlitch{rowsErr: errors.New("connection reset")}, "status: statuses: connection reset"},
+		{"ingest: an unreadable row", ingestRecentSQL, statusGlitch{badRow: true}, "status: ingest: reading:"},
+		{"ingest: an iteration error", ingestRecentSQL, statusGlitch{rowsErr: errors.New("connection reset")}, "status: ingest: connection reset"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -640,7 +640,7 @@ func TestFetchRowDegradations(t *testing.T) {
 				_, err = FetchIngestReports(context.Background(), pool)
 			}
 			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
-				t.Fatalf("ошибка = %v, want содержит %q", err, tc.wantErr)
+				t.Fatalf("the error = %v, want it to contain %q", err, tc.wantErr)
 			}
 		})
 	}
@@ -661,29 +661,29 @@ func TestFetchQueueLens(t *testing.T) {
 		t.Errorf("lens = %v, want %v", got, lens)
 	}
 	if order := lenner.order(); !reflect.DeepEqual(order, Streams) {
-		t.Errorf("порядок опроса = %v, want %v", order, Streams)
+		t.Errorf("the poll order = %v, want %v", order, Streams)
 	}
 	// S-P3-1: the list is derived from the single source of the queue
 	// (queue.allStreams), the pipeline order; q:render-fallback (T-237)
 	// enters as a working stream. A copy, not a slice of the source: a
 	// mutation of the result does not affect the package lists.
 	if want := []string{"q:dns", "q:http", "q:render", "q:render-fallback", "q:analyze", "q:dead"}; !reflect.DeepEqual(Streams, want) {
-		t.Errorf("Streams = %v, want %v (все стримы ТЗ 4.2 + q:render-fallback)", Streams, want)
+		t.Errorf("Streams = %v, want %v (all spec 4.2 streams + q:render-fallback)", Streams, want)
 	}
 	if !reflect.DeepEqual(Streams, queue.AllStreams()) {
-		t.Errorf("Streams = %v, want queue.AllStreams() = %v (единый источник)", Streams, queue.AllStreams())
+		t.Errorf("Streams = %v, want queue.AllStreams() = %v (a single source)", Streams, queue.AllStreams())
 	}
 	mutated := append(Streams, "q:extra")
 	if len(queue.AllStreams()) == len(mutated) {
-		t.Error("AllStreams возвращает срез источника: мутация копии изменила источник")
+		t.Error("AllStreams returns the source slice: mutating the copy changed the source")
 	}
 
 	_, err = FetchQueueLens(context.Background(), &statusLenner{err: errors.New("connection refused")})
 	if err == nil {
-		t.Error("ошибка XLEN потеряна")
+		t.Error("the XLEN error is lost")
 	}
 	if _, err := FetchQueueLens(context.Background(), nil); err == nil {
-		t.Error("FetchQueueLens(nil) = nil, хочу ошибку")
+		t.Error("FetchQueueLens(nil) = nil, want an error")
 	}
 }
 
@@ -717,7 +717,7 @@ func TestFetchDomainStatuses(t *testing.T) {
 		t.Fatalf("FetchDomainStatuses: %v", err)
 	}
 	if calls := pool.calls(); len(calls) != 1 || calls[0] != wantDomainStatusSQL {
-		t.Fatalf("запросы = %q, хочу один domainStatusSQL", calls)
+		t.Fatalf("queries = %q, want one domainStatusSQL", calls)
 	}
 	want := map[string]int64{
 		"new": 1000, "not_delegated": 0, "delegated_no_address": 0, "no_http": 0,
@@ -730,14 +730,14 @@ func TestFetchDomainStatuses(t *testing.T) {
 	// An empty table — a legend of zeros, not an empty map.
 	got, err = FetchDomainStatuses(context.Background(), newStatusPool())
 	if err != nil {
-		t.Fatalf("FetchDomainStatuses (пусто): %v", err)
+		t.Fatalf("FetchDomainStatuses (empty): %v", err)
 	}
 	if len(got) != len(model.Statuses) {
-		t.Fatalf("пустая таблица: %d статусов, хочу легенду %d", len(got), len(model.Statuses))
+		t.Fatalf("an empty table: %d statuses, want the legend %d", len(got), len(model.Statuses))
 	}
 	for name, n := range got {
 		if n != 0 {
-			t.Errorf("статус %s = %d, хочу 0", name, n)
+			t.Errorf("the status %s = %d, want 0", name, n)
 		}
 	}
 
@@ -745,10 +745,10 @@ func TestFetchDomainStatuses(t *testing.T) {
 	pool = newStatusPool()
 	pool.setQueryErr(errors.New("boom"))
 	if _, err := FetchDomainStatuses(context.Background(), pool); err == nil || !strings.Contains(err.Error(), "status: statuses:") {
-		t.Errorf("ошибка пула = %v, хочу контекст «status: статусы:»", err)
+		t.Errorf("the pool error = %v, want the \"status: statuses:\" context", err)
 	}
 	if _, err := FetchDomainStatuses(context.Background(), nil); err == nil {
-		t.Error("FetchDomainStatuses(nil) = nil, хочу ошибку")
+		t.Error("FetchDomainStatuses(nil) = nil, want an error")
 	}
 }
 
@@ -771,17 +771,17 @@ func TestFetchLaravelStats(t *testing.T) {
 		t.Fatalf("FetchLaravelStats: %v", err)
 	}
 	if calls := pool.calls(); !reflect.DeepEqual(calls, []string{wantLaravelTotalsSQL, wantLaravelRecentSQL}) {
-		t.Fatalf("запросы = %q, хочу [laravelTotalsSQL laravelRecentSQL]", calls)
+		t.Fatalf("queries = %q, want [laravelTotalsSQL laravelRecentSQL]", calls)
 	}
 	// The first set is closed BEFORE the second query, the second one —
 	// with defer: exactly two Closes on a successful pass (holding the
 	// set would occupy a pool connection — the FetchLaravelStats
 	// comment).
 	if n := pool.closeCount(); n != 2 {
-		t.Errorf("закрытий set'ов = %d, want 2 (агрегат до второго запроса + последние через defer)", n)
+		t.Errorf("set closes = %d, want 2 (the aggregate before the second query + the latest via defer)", n)
 	}
 	if st.Total != 3 || st.Last24h != 1 {
-		t.Errorf("счётчики = %d/%d, хочу 3/1 (окно 24 ч по updated_at)", st.Total, st.Last24h)
+		t.Errorf("the counters = %d/%d, want 3/1 (a 24h window over updated_at)", st.Total, st.Last24h)
 	}
 	want := []LaravelRecent{
 		{Domain: "shop.crawl.test", Zone: "crawl.test", Score: 0.9, VerMin: "9.19", VerMax: "11", UpdatedAt: fresh},
@@ -796,10 +796,10 @@ func TestFetchLaravelStats(t *testing.T) {
 	// section is alive).
 	st, err = FetchLaravelStats(context.Background(), newStatusPool())
 	if err != nil {
-		t.Fatalf("FetchLaravelStats (пусто): %v", err)
+		t.Fatalf("FetchLaravelStats (empty): %v", err)
 	}
 	if st.Total != 0 || st.Last24h != 0 || len(st.Recent) != 0 {
-		t.Errorf("пустая таблица: %+v, хочу нули и пустой recent", st)
+		t.Errorf("an empty table: %+v, want zeros and an empty recent", st)
 	}
 
 	// An error of either of the two queries is the error of the whole
@@ -809,10 +809,10 @@ func TestFetchLaravelStats(t *testing.T) {
 	pool.laravel = []statusLaravelSeed{{zone: 1, domain: 1, label: "shop", updatedAt: fresh}}
 	pool.setQueryErr(errors.New("boom"))
 	if _, err := FetchLaravelStats(context.Background(), pool); err == nil || !strings.Contains(err.Error(), "status: laravel:") {
-		t.Errorf("ошибка пула = %v, хочу контекст «status: laravel:»", err)
+		t.Errorf("the pool error = %v, want the \"status: laravel:\" context", err)
 	}
 	if _, err := FetchLaravelStats(context.Background(), nil); err == nil {
-		t.Error("FetchLaravelStats(nil) = nil, хочу ошибку")
+		t.Error("FetchLaravelStats(nil) = nil, want an error")
 	}
 }
 
@@ -839,18 +839,18 @@ func TestFetchLaravelStatsDegradations(t *testing.T) {
 	pool := seeded(map[string]statusGlitch{laravelTotalsSQL: {empty: true}})
 	_, err := FetchLaravelStats(ctx, pool)
 	if err == nil || !strings.Contains(err.Error(), "status: laravel: empty aggregate response") {
-		t.Fatalf("пустой агрегат: ошибка = %v, want «пустой ответ агрегата»", err)
+		t.Fatalf("empty aggregate: the error = %v, want \"empty aggregate response\"", err)
 	}
 	if n := pool.closeCount(); n != 1 {
-		t.Errorf("пустой агрегат: Close = %d, want 1 (set закрыт до синтетической ошибки)", n)
+		t.Errorf("empty aggregate: Close = %d, want 1 (the set closes before the synthetic error)", n)
 	}
 
 	// An empty aggregate with a rows error — a row-level error is more
 	// valuable.
-	pool = seeded(map[string]statusGlitch{laravelTotalsSQL: {empty: true, rowsErr: errors.New("соединение сброшено")}})
+	pool = seeded(map[string]statusGlitch{laravelTotalsSQL: {empty: true, rowsErr: errors.New("connection reset")}})
 	_, err = FetchLaravelStats(ctx, pool)
-	if err == nil || !strings.Contains(err.Error(), "status: laravel: соединение сброшено") {
-		t.Fatalf("пустой агрегат с rows-ошибкой: ошибка = %v, want причину уровня строк", err)
+	if err == nil || !strings.Contains(err.Error(), "status: laravel: connection reset") {
+		t.Fatalf("empty aggregate with a rows error: the error = %v, want the row-level cause", err)
 	}
 
 	// An unreadable aggregate row: the set is closed before the error is
@@ -858,42 +858,42 @@ func TestFetchLaravelStatsDegradations(t *testing.T) {
 	pool = seeded(map[string]statusGlitch{laravelTotalsSQL: {badRow: true}})
 	_, err = FetchLaravelStats(ctx, pool)
 	if err == nil || !strings.Contains(err.Error(), "status: laravel: reading:") {
-		t.Fatalf("нечитаемая строка агрегата: ошибка = %v, want «чтение»", err)
+		t.Fatalf("an unreadable aggregate row: the error = %v, want \"reading\"", err)
 	}
 	if n := pool.closeCount(); n != 1 {
-		t.Errorf("нечитаемая строка агрегата: Close = %d, want 1", n)
+		t.Errorf("an unreadable aggregate row: Close = %d, want 1", n)
 	}
 
 	// An aggregate iteration error — after a successful Scan, the set is
 	// closed.
-	pool = seeded(map[string]statusGlitch{laravelTotalsSQL: {rowsErr: errors.New("соединение сброшено")}})
+	pool = seeded(map[string]statusGlitch{laravelTotalsSQL: {rowsErr: errors.New("connection reset")}})
 	_, err = FetchLaravelStats(ctx, pool)
-	if err == nil || !strings.Contains(err.Error(), "status: laravel: соединение сброшено") {
-		t.Fatalf("ошибка итерации агрегата: ошибка = %v, want причину уровня строк", err)
+	if err == nil || !strings.Contains(err.Error(), "status: laravel: connection reset") {
+		t.Fatalf("an aggregate iteration error: the error = %v, want the row-level cause", err)
 	}
 	if n := pool.closeCount(); n != 1 {
-		t.Errorf("ошибка итерации агрегата: Close = %d, want 1", n)
+		t.Errorf("an aggregate iteration error: Close = %d, want 1", n)
 	}
 
 	// An error of the second query — the "recent" context.
-	pool = seeded(map[string]statusGlitch{laravelRecentSQL: {queryErr: errors.New("бд недоступна")}})
+	pool = seeded(map[string]statusGlitch{laravelRecentSQL: {queryErr: errors.New("db unavailable")}})
 	_, err = FetchLaravelStats(ctx, pool)
-	if err == nil || !strings.Contains(err.Error(), "status: laravel: latest: бд недоступна") {
-		t.Fatalf("ошибка второго запроса: ошибка = %v, want «последние»", err)
+	if err == nil || !strings.Contains(err.Error(), "status: laravel: latest: db unavailable") {
+		t.Fatalf("a second-query error: the error = %v, want \"latest\"", err)
 	}
 
 	// An unreadable row of the recent finds.
 	pool = seeded(map[string]statusGlitch{laravelRecentSQL: {badRow: true}})
 	_, err = FetchLaravelStats(ctx, pool)
 	if err == nil || !strings.Contains(err.Error(), "status: laravel: latest: reading:") {
-		t.Fatalf("нечитаемая строка последних: ошибка = %v, want «чтение»", err)
+		t.Fatalf("an unreadable latest row: the error = %v, want \"reading\"", err)
 	}
 
 	// An iteration error of the recent finds.
-	pool = seeded(map[string]statusGlitch{laravelRecentSQL: {rowsErr: errors.New("соединение сброшено")}})
+	pool = seeded(map[string]statusGlitch{laravelRecentSQL: {rowsErr: errors.New("connection reset")}})
 	_, err = FetchLaravelStats(ctx, pool)
-	if err == nil || !strings.Contains(err.Error(), "status: laravel: latest: соединение сброшено") {
-		t.Fatalf("ошибка итерации последних: ошибка = %v, want причину уровня строк", err)
+	if err == nil || !strings.Contains(err.Error(), "status: laravel: latest: connection reset") {
+		t.Fatalf("a latest iteration error: the error = %v, want the row-level cause", err)
 	}
 }
 
@@ -922,7 +922,7 @@ func TestFetchIngestReports(t *testing.T) {
 		t.Fatalf("FetchIngestReports: %v", err)
 	}
 	if calls := pool.calls(); len(calls) != 1 || calls[0] != wantIngestRecentSQL {
-		t.Fatalf("запросы = %q, хочу один ingestRecentSQL", calls)
+		t.Fatalf("queries = %q, want one ingestRecentSQL", calls)
 	}
 	want := []IngestReport{
 		{Path: "crawl.test/delete/five.txt", Action: "delete", LinesTotal: 50, Deleted: 49, Rejected: 1, ProcessedAt: *at(1)},
@@ -940,19 +940,19 @@ func TestFetchIngestReports(t *testing.T) {
 	pool2.ingest = []statusIngestSeed{{id: 1, action: int16Ptr(7), processedAt: at(1)}}
 	got, err = FetchIngestReports(context.Background(), pool2)
 	if err != nil {
-		t.Fatalf("FetchIngestReports (чужой код): %v", err)
+		t.Fatalf("FetchIngestReports (a foreign code): %v", err)
 	}
 	if len(got) != 1 || got[0].Action != "Action(7)" {
-		t.Errorf("чужой код действия: %+v, хочу Action(7)", got)
+		t.Errorf("a foreign action code: %+v, want Action(7)", got)
 	}
 
 	pool3 := newStatusPool()
 	pool3.setQueryErr(errors.New("boom"))
 	if _, err := FetchIngestReports(context.Background(), pool3); err == nil || !strings.Contains(err.Error(), "status: ingest:") {
-		t.Errorf("ошибка пула = %v, хочу контекст «status: ingest:»", err)
+		t.Errorf("the pool error = %v, want the \"status: ingest:\" context", err)
 	}
 	if _, err := FetchIngestReports(context.Background(), nil); err == nil {
-		t.Error("FetchIngestReports(nil) = nil, хочу ошибку")
+		t.Error("FetchIngestReports(nil) = nil, want an error")
 	}
 }
 
@@ -968,7 +968,7 @@ func TestComputeTotals(t *testing.T) {
 		t.Errorf("ComputeTotals = %+v, want %+v", got, want)
 	}
 	if got := ComputeTotals(nil); got != (Totals{}) {
-		t.Errorf("ComputeTotals(nil) = %+v, хочу нули", got)
+		t.Errorf("ComputeTotals(nil) = %+v, want zeros", got)
 	}
 }
 
@@ -981,16 +981,16 @@ func TestComputeRates(t *testing.T) {
 	// the ETA 90s.
 	r := ComputeRates(Throughput{DoneToday: 3600, ElapsedSec: 3600, ResultsHour: 7200, RenderedHour: 3600}, 60, 30)
 	if !r.DomainsKnown || r.DomainsPerSec != 1 {
-		t.Errorf("скорость доменов = %v (%v), хочу 1 (известна)", r.DomainsPerSec, r.DomainsKnown)
+		t.Errorf("the domain rate = %v (%v), want 1 (known)", r.DomainsPerSec, r.DomainsKnown)
 	}
 	if r.ResultsPerSec != 2 || r.RenderPerSec != 1 {
-		t.Errorf("скорости часа = %v/%v, хочу 2/1", r.ResultsPerSec, r.RenderPerSec)
+		t.Errorf("the hour rates = %v/%v, want 2/1", r.ResultsPerSec, r.RenderPerSec)
 	}
 	if r.Remaining != 90 {
-		t.Errorf("остаток = %d, хочу 90", r.Remaining)
+		t.Errorf("the remainder = %d, want 90", r.Remaining)
 	}
 	if !r.ETAKnown || r.ETASec != 90 {
-		t.Errorf("ETA = %d (%v), хочу 90 (известна)", r.ETASec, r.ETAKnown)
+		t.Errorf("ETA = %d (%v), want 90 (known)", r.ETASec, r.ETAKnown)
 	}
 
 	// A window shorter than the minimum: no domain rate and no ETA; the
@@ -998,13 +998,13 @@ func TestComputeRates(t *testing.T) {
 	// divisor, T-203).
 	r = ComputeRates(Throughput{ElapsedSec: MinSpeedWindowSec - 1, ResultsHour: 3600}, 10, 0)
 	if r.DomainsKnown || r.DomainsPerSec != 0 {
-		t.Errorf("короткое окно: Known=%v speed=%v, хочу неизвестную", r.DomainsKnown, r.DomainsPerSec)
+		t.Errorf("a short window: Known=%v speed=%v, want unknown", r.DomainsKnown, r.DomainsPerSec)
 	}
 	if r.ETAKnown {
-		t.Error("короткое окно: ETA известна, хочу н/д")
+		t.Error("a short window: the ETA is known, want n/a")
 	}
 	if r.ResultsPerSec != 1 {
-		t.Errorf("результаты/с = %v, хочу 1 (фиксированный делитель при нулевом окне)", r.ResultsPerSec)
+		t.Errorf("results/s = %v, want 1 (a fixed divisor at a zero window)", r.ResultsPerSec)
 	}
 
 	// The throughput bucket window (T-203): the divisor is the actual
@@ -1013,28 +1013,28 @@ func TestComputeRates(t *testing.T) {
 	// a zero window of a manual assembly — the former fixed hour.
 	r = ComputeRates(Throughput{ResultsHour: 7200, RenderedHour: 3600, HourWindowSec: 5400}, 0, 0)
 	if r.ResultsPerSec != 7200.0/5400.0 || r.RenderPerSec != 3600.0/5400.0 {
-		t.Errorf("скорости окна корзин = %v/%v, хочу %v/%v (деление на длину окна)",
+		t.Errorf("the bucket-window rates = %v/%v, want %v/%v (dividing by the window length)",
 			r.ResultsPerSec, r.RenderPerSec, 7200.0/5400.0, 3600.0/5400.0)
 	}
 
 	// The window boundary exactly at the minimum — the rate is known.
 	if r := ComputeRates(Throughput{DoneToday: MinSpeedWindowSec, ElapsedSec: MinSpeedWindowSec}, 1, 0); !r.DomainsKnown {
-		t.Error("окно = MinSpeedWindowSec: скорость должна быть известна")
+		t.Error("the window = MinSpeedWindowSec: the rate must be known")
 	}
 
 	// A rate of 0 (no checks in the window): the ETA is n/a, not a panic.
 	r = ComputeRates(Throughput{DoneToday: 0, ElapsedSec: 7200}, 5, 0)
 	if !r.DomainsKnown || r.DomainsPerSec != 0 {
-		t.Errorf("нулевые проверки: Known=%v speed=%v, хочу известную 0", r.DomainsKnown, r.DomainsPerSec)
+		t.Errorf("zero checks: Known=%v speed=%v, want a known 0", r.DomainsKnown, r.DomainsPerSec)
 	}
 	if r.ETAKnown {
-		t.Error("скорость 0: ETA не должна быть известна (деление на ноль)")
+		t.Error("a zero rate: the ETA must not be known (division by zero)")
 	}
 
 	// An empty circle: the ETA is 0 even without a rate.
 	r = ComputeRates(Throughput{ElapsedSec: 1}, 0, 0)
 	if !r.ETAKnown || r.ETASec != 0 {
-		t.Errorf("пустой цикл: ETA = %d (%v), хочу 0 (известна)", r.ETASec, r.ETAKnown)
+		t.Errorf("an empty cycle: ETA = %d (%v), want 0 (known)", r.ETASec, r.ETAKnown)
 	}
 
 	// An empty circle with a known non-zero rate: the ETA stays 0 — the
@@ -1043,18 +1043,18 @@ func TestComputeRates(t *testing.T) {
 	// would have lifted a 1).
 	r = ComputeRates(Throughput{DoneToday: 600, ElapsedSec: 600}, 0, 0)
 	if !r.DomainsKnown || r.DomainsPerSec != 1 {
-		t.Errorf("пустой цикл при скорости: Known=%v speed=%v, хочу известную 1", r.DomainsKnown, r.DomainsPerSec)
+		t.Errorf("an empty cycle with a rate: Known=%v speed=%v, want a known 1", r.DomainsKnown, r.DomainsPerSec)
 	}
 	if !r.ETAKnown || r.ETASec != 0 {
-		t.Errorf("пустой цикл при скорости: ETA = %d (%v), хочу 0 (известна)", r.ETASec, r.ETAKnown)
+		t.Errorf("an empty cycle with a rate: ETA = %d (%v), want 0 (known)", r.ETASec, r.ETAKnown)
 	}
 
 	// Rounding up/down and the minimum: 100/3 = 33.3 → 33; 1/3 = 0.3 → 1.
 	if r := ComputeRates(Throughput{DoneToday: 3000, ElapsedSec: 1000}, 100, 0); r.ETASec != 33 {
-		t.Errorf("ETA 100/3 = %d, хочу 33", r.ETASec)
+		t.Errorf("ETA 100/3 = %d, want 33", r.ETASec)
 	}
 	if r := ComputeRates(Throughput{DoneToday: 3000, ElapsedSec: 1000}, 1, 0); r.ETASec != 1 {
-		t.Errorf("ETA 1/3 = %d, хочу минимум 1", r.ETASec)
+		t.Errorf("ETA 1/3 = %d, want at least 1", r.ETASec)
 	}
 }
 
@@ -1063,7 +1063,7 @@ func TestComputeRates(t *testing.T) {
 // notice the ±1 mutant.
 func TestMinSpeedWindowSec(t *testing.T) {
 	if MinSpeedWindowSec != 600 {
-		t.Errorf("MinSpeedWindowSec = %d, want 600 (10 минут, ТЗ 3.3)", MinSpeedWindowSec)
+		t.Errorf("MinSpeedWindowSec = %d, want 600 (10 minutes, spec 3.3)", MinSpeedWindowSec)
 	}
 }
 

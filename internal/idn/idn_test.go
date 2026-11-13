@@ -54,7 +54,7 @@ func TestNormalizeValid(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := Normalize(tc.name)
 			if err != nil {
-				t.Fatalf("Normalize(%q) = %v, want без ошибки", tc.name, err)
+				t.Fatalf("Normalize(%q) = %v, want no error", tc.name, err)
 			}
 			if got.ASCII != tc.ascii {
 				t.Errorf("ASCII = %q, want %q", got.ASCII, tc.ascii)
@@ -109,11 +109,11 @@ func TestNormalizeInvalid(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := Normalize(tc.name)
 			if err == nil {
-				t.Fatalf("Normalize(%q) = %+v, want ошибка %s", tc.name, got, tc.kind)
+				t.Fatalf("Normalize(%q) = %+v, want the error %s", tc.name, got, tc.kind)
 			}
 			kind, ok := KindOf(err)
 			if !ok {
-				t.Fatalf("Normalize(%q): ошибка %v не *idn.Error", tc.name, err)
+				t.Fatalf("Normalize(%q): the error %v is not *idn.Error", tc.name, err)
 			}
 			if kind != tc.kind {
 				t.Errorf("Normalize(%q): kind = %s, want %s (err: %v)", tc.name, kind, tc.kind, err)
@@ -127,14 +127,14 @@ func TestNormalizeInvalid(t *testing.T) {
 func TestNormalizeBoundaryLengths(t *testing.T) {
 	name := strings.Repeat("a", 63) + "." + strings.Repeat("b", 63) + "." + strings.Repeat("c", 63) + "." + strings.Repeat("d", 61)
 	if len(name) != 253 {
-		t.Fatalf("длина тестового имени %d, want 253", len(name))
+		t.Fatalf("the test name length %d, want 253", len(name))
 	}
 	got, err := Normalize(name)
 	if err != nil {
-		t.Fatalf("Normalize(имя 253) = %v, want без ошибки", err)
+		t.Fatalf("Normalize(name 253) = %v, want no error", err)
 	}
 	if got.ASCII != name {
-		t.Errorf("ASCII = %q, want имя без изменений", got.ASCII)
+		t.Errorf("ASCII = %q, want the name unchanged", got.ASCII)
 	}
 	// The last label is the zone (TLD-only).
 	if want := strings.Repeat("d", 61); got.Zone != want {
@@ -168,7 +168,7 @@ func TestNormalizeZone(t *testing.T) {
 	}
 	for _, in := range []string{"", "  ", ".", "рф!!"} {
 		if _, err := NormalizeZone(in); err == nil {
-			t.Errorf("NormalizeZone(%q): нет ошибки, want ошибка", in)
+			t.Errorf("NormalizeZone(%q): no error, want an error", in)
 		}
 	}
 }
@@ -197,7 +197,7 @@ func TestHostToASCII(t *testing.T) {
 		// the bare address (a colon is an STD3 violation); T-047/T-048
 		// handles them separately via net.ParseIP.
 		if _, err := HostToASCII(in); err == nil {
-			t.Errorf("HostToASCII(%q): нет ошибки, want ошибка", in)
+			t.Errorf("HostToASCII(%q): no error, want an error", in)
 		}
 	}
 }
@@ -279,23 +279,23 @@ func TestIsNumericZone(t *testing.T) {
 func TestError(t *testing.T) {
 	_, err := Normalize("xn--bcher--kva.com")
 	if err == nil {
-		t.Fatal("Normalize(битый xn--): нет ошибки")
+		t.Fatal("Normalize(a broken xn--): no error")
 	}
 	var e *Error
 	if !errors.As(err, &e) {
-		t.Fatalf("ошибка %v не *idn.Error", err)
+		t.Fatalf("the error %v is not *idn.Error", err)
 	}
 	if e.Kind != ErrInvalid {
 		t.Errorf("Kind = %s, want %s", e.Kind, ErrInvalid)
 	}
 	if e.Name != "xn--bcher--kva.com" {
-		t.Errorf("Name = %q, want исходное имя", e.Name)
+		t.Errorf("Name = %q, want the original name", e.Name)
 	}
 	if e.Err == nil {
-		t.Error("Err = nil, want причина (ошибка idna)")
+		t.Error("Err = nil, want the cause (an idna error)")
 	}
 	if msg := e.Error(); !strings.Contains(msg, "invalid domain name") || !strings.Contains(msg, "xn--bcher--kva.com") {
-		t.Errorf("Error() = %q, want класс и имя", msg)
+		t.Errorf("Error() = %q, want the class and the name", msg)
 	}
 
 	// The Error() format — exact strings, with a cause and without (a
@@ -303,26 +303,26 @@ func TestError(t *testing.T) {
 	// format).
 	withCause := &Error{Kind: ErrNameLen, Name: "x", Err: errors.New("reason")}
 	if got, want := withCause.Error(), `idn: name longer than 253 characters: "x": reason`; got != want {
-		t.Errorf("Error() с причиной = %q, want %q", got, want)
+		t.Errorf("Error() with a cause = %q, want %q", got, want)
 	}
 	withoutCause := &Error{Kind: ErrEmpty, Name: "y"}
 	if got, want := withoutCause.Error(), `idn: empty name: "y"`; got != want {
-		t.Errorf("Error() без причины = %q, want %q", got, want)
+		t.Errorf("Error() without a cause = %q, want %q", got, want)
 	}
 
 	// The kind is extracted from the wrapped error (fmt.Errorf %w).
-	wrapped := fmt.Errorf("строка 42: %w", err)
+	wrapped := fmt.Errorf("line 42: %w", err)
 	kind, ok := KindOf(wrapped)
 	if !ok || kind != ErrInvalid {
-		t.Errorf("KindOf(обёрнутая) = %s, %v; want %s, true", kind, ok, ErrInvalid)
+		t.Errorf("KindOf(wrapped) = %s, %v; want %s, true", kind, ok, ErrInvalid)
 	}
-	if _, ok := KindOf(errors.New("чужая")); ok {
-		t.Error("KindOf(чужая ошибка) = true, want false")
+	if _, ok := KindOf(errors.New("foreign")); ok {
+		t.Error("KindOf(a foreign error) = true, want false")
 	}
 
 	// The cause is reachable via Unwrap (an idna error).
 	if errors.Unwrap(e) == nil {
-		t.Error("Unwrap(e) = nil, want причина")
+		t.Error("Unwrap(e) = nil, want the cause")
 	}
 }
 
@@ -332,17 +332,17 @@ func TestErrorNameTruncated(t *testing.T) {
 	long := strings.Repeat("р", 1000)
 	_, err := Normalize(long)
 	if err == nil {
-		t.Fatal("Normalize(1000 р): нет ошибки")
+		t.Fatal("Normalize(1000 р): no error")
 	}
 	var e *Error
 	if !errors.As(err, &e) {
-		t.Fatalf("ошибка %v не *idn.Error", err)
+		t.Fatalf("the error %v is not *idn.Error", err)
 	}
 	if runes := len([]rune(e.Name)); runes > maxErrNameLen+1 {
-		t.Errorf("Name = %d рун, want ≤ %d+1", runes, maxErrNameLen)
+		t.Errorf("Name = %d runes, want ≤ %d+1", runes, maxErrNameLen)
 	}
 	if msg := e.Error(); len(msg) > 1024 {
-		t.Errorf("Error() длиной %d, want ≤ 1024", len(msg))
+		t.Errorf("Error() of length %d, want ≤ 1024", len(msg))
 	}
 
 	// The boundary: a name of exactly maxErrNameLen runes is not
@@ -350,13 +350,13 @@ func TestErrorNameTruncated(t *testing.T) {
 	boundary := strings.Repeat("р", maxErrNameLen)
 	_, err = Normalize(boundary)
 	if err == nil {
-		t.Fatal("Normalize(граничное имя): нет ошибки")
+		t.Fatal("Normalize(a boundary name): no error")
 	}
 	if !errors.As(err, &e) {
-		t.Fatalf("ошибка %v не *idn.Error", err)
+		t.Fatalf("the error %v is not *idn.Error", err)
 	}
 	if e.Name != boundary {
-		t.Errorf("Name обрезано: %d рун, want %d без обрезки", len([]rune(e.Name)), maxErrNameLen)
+		t.Errorf("Name truncated: %d runes, want %d without truncation", len([]rune(e.Name)), maxErrNameLen)
 	}
 
 	// The truncation bounds — by literals (the checks above are adaptive
@@ -365,23 +365,23 @@ func TestErrorNameTruncated(t *testing.T) {
 	exactly := strings.Repeat("р", 255)
 	_, err = Normalize(exactly)
 	if err == nil {
-		t.Fatal("Normalize(255 р): нет ошибки")
+		t.Fatal("Normalize(255 р): no error")
 	}
 	if !errors.As(err, &e) {
-		t.Fatalf("ошибка %v не *idn.Error", err)
+		t.Fatalf("the error %v is not *idn.Error", err)
 	}
 	if e.Name != exactly {
-		t.Errorf("имя ровно в лимите обрезано: %d рун, want 255", len([]rune(e.Name)))
+		t.Errorf("a name exactly at the limit is truncated: %d runes, want 255", len([]rune(e.Name)))
 	}
 	over := strings.Repeat("р", 256)
 	_, err = Normalize(over)
 	if err == nil {
-		t.Fatal("Normalize(256 р): нет ошибки")
+		t.Fatal("Normalize(256 р): no error")
 	}
 	if !errors.As(err, &e) {
-		t.Fatalf("ошибка %v не *idn.Error", err)
+		t.Fatalf("the error %v is not *idn.Error", err)
 	}
 	if want := strings.Repeat("р", 255) + "…"; e.Name != want {
-		t.Errorf("имя над лимитом = %d рун, want 255 рун + «…»", len([]rune(e.Name)))
+		t.Errorf("a name above the limit = %d runes, want 255 runes + \"…\"", len([]rune(e.Name)))
 	}
 }

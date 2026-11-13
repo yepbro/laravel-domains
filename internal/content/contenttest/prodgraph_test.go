@@ -1,9 +1,9 @@
-// Инвариант размещения набора (T-228, ревью P3-3): contenttest импортирует
-// testing и потому обязан быть только в тестовой сборке. Нетестовой импорт
-// contenttest тихо вернул бы testing (и сам contenttest) в прод-граф
-// бинарников cmd — lint, vet и тесты при этом остались бы зелёными. Guard —
-// единственная автоматическая проверка критерия «testing вне нетестовой
-// сборки»; ручная проверка — go list -deps ./cmd/... | grep testing.
+// The rule-set placement invariant (T-228, review P3-3): contenttest imports
+// testing and therefore must only be in the test build. A non-test import
+// of contenttest would quietly pull testing (and contenttest itself) into the
+// production graph of the cmd binaries — lint, vet and tests would stay green.
+// The guard is the only automated check of the "testing outside a non-test
+// build" criterion; a manual check — go list -deps ./cmd/... | grep testing.
 package contenttest
 
 import (
@@ -12,10 +12,10 @@ import (
 	"testing"
 )
 
-// TestNotInProductionGraph — прод-граф всех cmd-бинарников не содержит
-// ни testing, ни contenttest (import-path-паттерн работает из любого
-// каталога внутри модуля — тестовый бинарник запускается в каталоге
-// пакета).
+// TestNotInProductionGraph — the production graph of all cmd binaries contains
+// neither testing nor contenttest (the import-path pattern works from any
+// directory inside the module — the test binary runs in the package
+// directory).
 func TestNotInProductionGraph(t *testing.T) {
 	if _, err := exec.LookPath("go"); err != nil {
 		t.Skipf("the Go toolchain unavailable, the production graph check skipped: %v", err)

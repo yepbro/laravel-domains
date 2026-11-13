@@ -1,8 +1,8 @@
-// Эталонная in-memory реализация контракта и прогон на ней самого
-// набора StoreContract (переехали из content/store_test.go, T-228):
-// набор корректен и готов к переиспользованию тестами реализаций —
-// T-042 (PackStore, внешний тест-пакет content_test) и T-046 (живая
-// БД, test/integration) вызывают StoreContract со своим конструктором.
+// The reference in-memory implementation of the contract and a run of the
+// StoreContract rule set itself on it (moved from content/store_test.go, T-228):
+// the rule set is correct and ready for reuse by implementation tests —
+// T-042 (PackStore, the external test package content_test) and T-046 (a
+// live DB, test/integration) call StoreContract with their own constructor.
 package contenttest
 
 import (
@@ -14,22 +14,22 @@ import (
 	"crawler/internal/content"
 )
 
-// storeFake — эталонная реализация контракта для прогона самого набора
-// StoreContract: карта «Hash → байты + счётчик ссылок», без сжатия и
-// внешних хранилищ. Ссылки ведутся по правилам контракта: Put добавляет,
-// Delete снимает, исчерпание — удаление.
+// storeFake — a reference implementation of the contract for running the
+// StoreContract rule set itself: a map "Hash → bytes + a reference counter",
+// without compression or external stores. References follow the contract rules:
+// Put adds, Delete removes, exhaustion — deletion.
 type storeFake struct {
 	mu      sync.Mutex
 	entries map[content.Hash]*storeFakeEntry
 }
 
-// storeFakeEntry — контент и число живых ссылок на него (contents.refcount).
+// storeFakeEntry — the content and the number of live references to it (contents.refcount).
 type storeFakeEntry struct {
 	data []byte
 	refc int
 }
 
-// compile-time: storeFake реализует ContentStore.
+// compile-time: storeFake implements ContentStore.
 var _ content.ContentStore = (*storeFake)(nil)
 
 func newStoreFake() *storeFake {
@@ -82,9 +82,9 @@ func (s *storeFake) Delete(ctx context.Context, hash content.Hash) error {
 	return nil
 }
 
-// TestStoreContractOnFake — эталонная реализация проходит собственный
-// контрактный набор: набор корректен и готов к переиспользованию
-// реализациями (T-042, T-046).
+// TestStoreContractOnFake — the reference implementation passes its own
+// contract rule set: the rule set is correct and ready for reuse by
+// implementations (T-042, T-046).
 func TestStoreContractOnFake(t *testing.T) {
 	StoreContract(t, func(*testing.T) content.ContentStore { return newStoreFake() })
 }

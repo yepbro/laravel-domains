@@ -35,7 +35,7 @@ func TestLoggerServiceAttrAndAttrs(t *testing.T) {
 	out := buf.String()
 	for _, want := range []string{"level=INFO", "service=test-svc", "msg=запуск", "port=9101"} {
 		if !strings.Contains(out, want) {
-			t.Errorf("лог не содержит %q:\n%s", want, out)
+			t.Errorf("the log does not contain %q:\n%s", want, out)
 		}
 	}
 }
@@ -44,7 +44,7 @@ func TestLoggerLevelFiltering(t *testing.T) {
 	var buf bytes.Buffer
 	newLogger(&buf, "svc", slog.LevelInfo).Debug("отладка")
 	if buf.Len() != 0 {
-		t.Errorf("debug при уровне info не должен попадать в лог:\n%s", buf.String())
+		t.Errorf("debug at the info level must not reach the log:\n%s", buf.String())
 	}
 
 	buf.Reset()
@@ -52,17 +52,17 @@ func TestLoggerLevelFiltering(t *testing.T) {
 	logger.Info("скрыто")
 	logger.Warn("видно")
 	if strings.Contains(buf.String(), "скрыто") {
-		t.Errorf("info при уровне warn не должен попадать в лог:\n%s", buf.String())
+		t.Errorf("info at the warn level must not reach the log:\n%s", buf.String())
 	}
 	if !strings.Contains(buf.String(), "видно") {
-		t.Errorf("warn при уровне warn должен попадать в лог:\n%s", buf.String())
+		t.Errorf("warn at the warn level must reach the log:\n%s", buf.String())
 	}
 }
 
 func TestNewLoggerDefaultsToInfo(t *testing.T) {
 	// A nil config (a service without config.Load) — the info level.
 	if got := NewLogger("svc", nil).Enabled(context.Background(), slog.LevelInfo); !got {
-		t.Error("NewLogger(nil-конфиг) должен включать уровень info")
+		t.Error("NewLogger(a nil config) must enable the info level")
 	}
 
 	// The level comes from the configuration: warn lets Warn through and
@@ -74,10 +74,10 @@ func TestNewLoggerDefaultsToInfo(t *testing.T) {
 	logger.Info("скрыто")
 	logger.Warn("видно")
 	if strings.Contains(buf.String(), "скрыто") {
-		t.Errorf("info при уровне warn из конфига не должен попадать в лог:\n%s", buf.String())
+		t.Errorf("info at the config's warn level must not reach the log:\n%s", buf.String())
 	}
 	if !strings.Contains(buf.String(), "видно") {
-		t.Errorf("warn при уровне warn из конфига должен попадать в лог:\n%s", buf.String())
+		t.Errorf("warn at the config's warn level must reach the log:\n%s", buf.String())
 	}
 }
 
@@ -99,7 +99,7 @@ func TestLogLevel(t *testing.T) {
 	}
 	for in, want := range cases {
 		if got := logLevel(in); got != want {
-			t.Errorf("logLevel(%q) = %v, хочу %v", in, got, want)
+			t.Errorf("logLevel(%q) = %v, want %v", in, got, want)
 		}
 	}
 }
@@ -147,7 +147,7 @@ func waitFor(t *testing.T, r *recorder, event string) {
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
-	t.Fatalf("событие %q не наступило за 2 с; события: %v", event, r.snapshot())
+	t.Fatalf("the event %q did not happen within 2s; events: %v", event, r.snapshot())
 }
 
 // lifecycle — one serve run: the signal channels, the result, the events.
@@ -166,7 +166,7 @@ type lifecycle struct {
 func (lc *lifecycle) failHTTP(t *testing.T) {
 	t.Helper()
 	if err := lc.ln.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
-		t.Fatalf("закрытие listener: %v", err)
+		t.Fatalf("closing the listener: %v", err)
 	}
 }
 
@@ -208,7 +208,7 @@ func startServe(t *testing.T, opts Options, handler http.Handler, rec *recorder)
 		select {
 		case <-lc.finished:
 		case <-time.After(2 * time.Second):
-			t.Error("serve не завершился после закрытия listener")
+			t.Error("serve did not finish after the listener was closed")
 		}
 	})
 	return lc
@@ -220,7 +220,7 @@ func (lc *lifecycle) waitDone(t *testing.T) error {
 	case <-lc.finished:
 		return lc.err
 	case <-time.After(3 * time.Second):
-		t.Fatal("serve не завершился за 3 с")
+		t.Fatal("serve did not finish within 3s")
 		return nil
 	}
 }
@@ -265,11 +265,11 @@ func TestServeShutdownOrder(t *testing.T) {
 	want := []string{"http-start", "onrun-done", "http-done", "pool-closed"}
 	got := rec.snapshot()
 	if len(got) != len(want) {
-		t.Fatalf("события = %v, хочу %v", got, want)
+		t.Fatalf("events = %v, want %v", got, want)
 	}
 	for i := range want {
 		if got[i] != want[i] {
-			t.Fatalf("порядок остановки = %v, хочу %v (ТЗ 3.4: OnRun → HTTP → пул)", got, want)
+			t.Fatalf("the shutdown order = %v, want %v (spec 3.4: OnRun → HTTP → the pool)", got, want)
 		}
 	}
 }
@@ -288,17 +288,17 @@ func TestServeOnRunCleanExit(t *testing.T) {
 
 	<-done
 	if err := lc.waitDone(t); err != nil {
-		t.Fatalf("serve: %v (чистое завершение — nil)", err)
+		t.Fatalf("serve: %v (a clean finish — nil)", err)
 	}
 	if !lc.rec.has("pool-closed") {
-		t.Errorf("пул должен закрываться и при чистом завершении; события: %v", lc.rec.snapshot())
+		t.Errorf("the pool must close on a clean finish too; events: %v", lc.rec.snapshot())
 	}
 }
 
 // TestServeOnRunError — a working logic error stops the service
 // and is returned to the caller (the exit code 1).
 func TestServeOnRunError(t *testing.T) {
-	boom := errors.New("воркер сломался")
+	boom := errors.New("the worker failed")
 	ready := make(chan struct{})
 	lc := startServe(t, Options{
 		Name: "test",
@@ -311,10 +311,10 @@ func TestServeOnRunError(t *testing.T) {
 	<-ready
 	err := lc.waitDone(t)
 	if !errors.Is(err, boom) {
-		t.Fatalf("serve = %v, хочу исходная ошибка OnRun", err)
+		t.Fatalf("serve = %v, want the original OnRun error", err)
 	}
 	if !lc.rec.has("pool-closed") {
-		t.Errorf("пул должен закрываться и при ошибке; события: %v", lc.rec.snapshot())
+		t.Errorf("the pool must close on an error too; events: %v", lc.rec.snapshot())
 	}
 }
 
@@ -341,13 +341,13 @@ func TestServeShutdownTimeout(t *testing.T) {
 	lc.term <- syscall.SIGTERM
 	err := lc.waitDone(t)
 	if err == nil || !strings.Contains(err.Error(), "did not stop") {
-		t.Fatalf("serve = %v, хочу ошибку таймаута остановки", err)
+		t.Fatalf("serve = %v, want a shutdown timeout error", err)
 	}
 	if elapsed := time.Since(start); elapsed > 450*time.Millisecond {
-		t.Fatalf("остановка заняла %s — таймаут не сработал", elapsed)
+		t.Fatalf("the shutdown took %s — the timeout did not fire", elapsed)
 	}
 	if !rec.has("pool-closed") {
-		t.Errorf("пул должен закрываться и после таймаута; события: %v", rec.snapshot())
+		t.Errorf("the pool must close after the timeout too; events: %v", rec.snapshot())
 	}
 }
 
@@ -378,13 +378,13 @@ func TestServeSecondSignalForcesExit(t *testing.T) {
 	lc.term <- syscall.SIGTERM
 	err := lc.waitDone(t)
 	if !errors.Is(err, errForcedExit) {
-		t.Fatalf("serve = %v, хочу errForcedExit", err)
+		t.Fatalf("serve = %v, want errForcedExit", err)
 	}
 	if elapsed := time.Since(start); elapsed > time.Second {
-		t.Fatalf("принудительный выход занял %s", elapsed)
+		t.Fatalf("the forced exit took %s", elapsed)
 	}
 	if rec.has("pool-closed") {
-		t.Errorf("принудительный выход не должен закрывать пул (немедленный выход)")
+		t.Errorf("a forced exit must not close the pool (an immediate exit)")
 	}
 }
 
@@ -434,12 +434,12 @@ func TestServeHTTPServerError(t *testing.T) {
 
 	err := lc.waitDone(t)
 	if err == nil || !strings.Contains(err.Error(), "metrics HTTP server") {
-		t.Fatalf("serve = %v, хочу ошибку HTTP-сервера", err)
+		t.Fatalf("serve = %v, want an HTTP server error", err)
 	}
 	want := []string{"onrun-done", "pool-closed"}
 	got := rec.snapshot()
 	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
-		t.Fatalf("события = %v, хочу %v", got, want)
+		t.Fatalf("events = %v, want %v", got, want)
 	}
 }
 
@@ -452,17 +452,17 @@ func TestServeOnRunPanic(t *testing.T) {
 		Name: "test",
 		OnRun: func(context.Context) error {
 			close(ready)
-			panic("битое сообщение из очереди")
+			panic("a poison message from the queue")
 		},
 	}, http.NewServeMux(), nil)
 
 	<-ready
 	err := lc.waitDone(t)
 	if err == nil || !strings.Contains(err.Error(), "panic") {
-		t.Fatalf("serve = %v, хочу ошибку паники OnRun", err)
+		t.Fatalf("serve = %v, want an OnRun panic error", err)
 	}
 	if !lc.rec.has("pool-closed") {
-		t.Errorf("пул должен закрываться и при панике; события: %v", lc.rec.snapshot())
+		t.Errorf("the pool must close on a panic too; events: %v", lc.rec.snapshot())
 	}
 }
 
@@ -471,7 +471,7 @@ func TestServeOnRunPanic(t *testing.T) {
 // TestRunValidation — the service name is mandatory.
 func TestRunValidation(t *testing.T) {
 	if err := Run(Options{}); err == nil || !strings.Contains(err.Error(), "service name") {
-		t.Fatalf("Run без Name = %v, хочу ошибку об обязательном имени", err)
+		t.Fatalf("Run without Name = %v, want a required-name error", err)
 	}
 }
 
@@ -502,7 +502,7 @@ func TestHealthzHandler(t *testing.T) {
 	rec := httptest.NewRecorder()
 	healthzHandler(nil).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
 	if rec.Code != http.StatusOK || rec.Body.String() != "ok\n" {
-		t.Errorf("без пула: %d %q, want 200 %q", rec.Code, rec.Body.String(), "ok\n")
+		t.Errorf("without a pool: %d %q, want 200 %q", rec.Code, rec.Body.String(), "ok\n")
 	}
 
 	pool := newDeadPool(t)
@@ -510,7 +510,7 @@ func TestHealthzHandler(t *testing.T) {
 	rec = httptest.NewRecorder()
 	healthzHandler(pool).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
 	if rec.Code != http.StatusServiceUnavailable {
-		t.Errorf("с недоступной БД: %d %q, want 503", rec.Code, rec.Body.String())
+		t.Errorf("with an unreachable DB: %d %q, want 503", rec.Code, rec.Body.String())
 	}
 }
 
@@ -542,10 +542,10 @@ func TestRegisterProbes(t *testing.T) {
 		return rec.Code
 	}
 	if got := get("/livez"); got != http.StatusOK {
-		t.Errorf("/livez = %d, want 200 (liveness не зависит от БД)", got)
+		t.Errorf("/livez = %d, want 200 (liveness does not depend on the DB)", got)
 	}
 	if got := get("/healthz"); got != http.StatusServiceUnavailable {
-		t.Errorf("/healthz = %d, want 503 (readiness: БД недоступна)", got)
+		t.Errorf("/healthz = %d, want 503 (readiness: the DB is unreachable)", got)
 	}
 	if got := get("/metrics"); got != http.StatusNotFound {
 		t.Errorf("/metrics = %d, want 404 (the probes do not occupy foreign routes)", got)
@@ -588,7 +588,7 @@ func TestRunSignalDuringMigrationWait(t *testing.T) {
 			MetricsAddr: "127.0.0.1:0",
 			Logger:      newLogger(io.Discard, "run-test", slog.LevelError),
 			OnRun: func(context.Context) error {
-				t.Error("OnRun не должен запускаться: сигнал пришёл во время миграций")
+				t.Error("OnRun must not run: the signal arrived during migrations")
 				return nil
 			},
 		})
@@ -601,10 +601,10 @@ func TestRunSignalDuringMigrationWait(t *testing.T) {
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Fatalf("Run = %v, хочу nil (штатная остановка по сигналу во время миграций)", err)
+			t.Fatalf("Run = %v, want nil (a graceful signal shutdown during migrations)", err)
 		}
 	case <-time.After(3 * time.Second):
-		t.Fatal("Run не завершился после SIGTERM во время миграций")
+		t.Fatal("Run did not finish after SIGTERM during migrations")
 	}
 }
 
@@ -621,7 +621,7 @@ func TestRunSignalDuringMigrationInterrupted(t *testing.T) {
 	restore := withMigrateUp(func(ctx context.Context, _ string) error {
 		close(started)
 		<-ctx.Done() // "the application": cancelled by the signal via pg_cancel_backend
-		return fmt.Errorf("%w: миграция 8 отменена и откатана: %w",
+		return fmt.Errorf("%w: migration 8 canceled and rolled back: %w",
 			migrate.ErrInterrupted, errors.New("canceling statement due to user request"))
 	})
 	defer restore()
@@ -634,7 +634,7 @@ func TestRunSignalDuringMigrationInterrupted(t *testing.T) {
 			MetricsAddr: "127.0.0.1:0",
 			Logger:      newLogger(io.Discard, "run-test", slog.LevelError),
 			OnRun: func(context.Context) error {
-				t.Error("OnRun не должен запускаться: сигнал пришёл во время миграций")
+				t.Error("OnRun must not run: the signal arrived during migrations")
 				return nil
 			},
 		})
@@ -647,10 +647,10 @@ func TestRunSignalDuringMigrationInterrupted(t *testing.T) {
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Fatalf("Run = %v, хочу nil (миграция прервана и откатана — штатная остановка)", err)
+			t.Fatalf("Run = %v, want nil (the migration interrupted and rolled back — a graceful shutdown)", err)
 		}
 	case <-time.After(3 * time.Second):
-		t.Fatal("Run не завершился после SIGTERM во время применения миграций")
+		t.Fatal("Run did not finish after SIGTERM while applying migrations")
 	}
 }
 
@@ -681,7 +681,7 @@ func TestRunSignalDuringMigrationApply(t *testing.T) {
 			MetricsAddr: "127.0.0.1:0",
 			Logger:      newLogger(io.Discard, "run-test", slog.LevelError),
 			OnRun: func(context.Context) error {
-				t.Error("OnRun не должен запускаться: сигнал пришёл во время миграций")
+				t.Error("OnRun must not run: the signal arrived during migrations")
 				return nil
 			},
 		})
@@ -690,15 +690,15 @@ func TestRunSignalDuringMigrationApply(t *testing.T) {
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Fatalf("Run = %v, хочу nil (миграция доработана, штатная остановка)", err)
+			t.Fatalf("Run = %v, want nil (the migration finished, a graceful shutdown)", err)
 		}
 	case <-time.After(3 * time.Second):
-		t.Fatal("Run не завершился после SIGTERM во время применения миграций")
+		t.Fatal("Run did not finish after SIGTERM while applying migrations")
 	}
 	select { // the migration really ran to the end after the signal, not before it
 	case <-applied:
 	default:
-		t.Error("миграция прервана сигналом (должна дорабатывать)")
+		t.Error("the migration was interrupted by the signal (it must run to the end)")
 	}
 }
 
@@ -741,10 +741,10 @@ func TestRunSecondSignalForcedExit(t *testing.T) {
 	select {
 	case err := <-done:
 		if !errors.Is(err, errForcedExit) {
-			t.Fatalf("Run = %v, хочу errForcedExit", err)
+			t.Fatalf("Run = %v, want errForcedExit", err)
 		}
 	case <-time.After(3 * time.Second):
-		t.Fatal("Run не завершился после повторного сигнала (os.Exit в библиотеке?)")
+		t.Fatal("Run did not finish after the second signal (os.Exit in a library?)")
 	}
 }
 
@@ -754,12 +754,12 @@ func TestRunSecondSignalForcedExit(t *testing.T) {
 func TestNewRegistry(t *testing.T) {
 	own := metrics.New("workers-svc")
 	if got := newRegistry(Options{Metrics: own}); got != own {
-		t.Errorf("newRegistry с Options.Metrics = %v, хочу тот же реестр", got)
+		t.Errorf("newRegistry with Options.Metrics = %v, want the same registry", got)
 	}
 
 	reg := newRegistry(Options{Name: "plain-svc"})
 	if reg == nil {
-		t.Fatal("newRegistry без Metrics = nil, хочу собственный реестр каркаса")
+		t.Fatal("newRegistry without Metrics = nil, want the framework's own registry")
 	}
 	// The framework's own registry is initialized as metrics.New: the
 	// instrument of the working logic is registered by the factory and
@@ -780,7 +780,7 @@ func TestNewRegistry(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Error("прибор рабочей логики не попал в Gather реестра каркаса")
+		t.Error("the working-logic metric did not get into the framework registry's Gather")
 	}
 }
 
@@ -805,7 +805,7 @@ func TestRunWithOwnMetrics(t *testing.T) {
 		OnRun:       func(context.Context) error { return nil },
 	})
 	if err != nil {
-		t.Fatalf("Run с Options.Metrics = %v, хочу nil", err)
+		t.Fatalf("Run with Options.Metrics = %v, want nil", err)
 	}
 }
 
@@ -824,10 +824,10 @@ func TestRunLifecycle(t *testing.T) {
 		OnRun:       func(context.Context) error { return nil },
 	})
 	if err != nil {
-		t.Fatalf("Run (чистое завершение OnRun) = %v, хочу nil", err)
+		t.Fatalf("Run (a clean OnRun finish) = %v, want nil", err)
 	}
 
-	boom := errors.New("сбой воркера")
+	boom := errors.New("worker failure")
 	err = Run(Options{
 		Name:        "run-test",
 		MetricsAddr: "127.0.0.1:0",
@@ -835,7 +835,7 @@ func TestRunLifecycle(t *testing.T) {
 		OnRun:       func(context.Context) error { return boom },
 	})
 	if !errors.Is(err, boom) {
-		t.Fatalf("Run (ошибка OnRun) = %v, хочу исходную ошибку", err)
+		t.Fatalf("Run (an OnRun error) = %v, want the original error", err)
 	}
 }
 
@@ -859,11 +859,11 @@ func TestRunExtraMux(t *testing.T) {
 		OnRun: func(context.Context) error { return nil },
 	})
 	if err != nil {
-		t.Fatalf("Run с ExtraMux = %v, хочу nil", err)
+		t.Fatalf("Run with ExtraMux = %v, want nil", err)
 	}
 	select {
 	case <-registered:
 	default:
-		t.Error("ExtraMux не вызван при инициализации HTTP-сервера")
+		t.Error("ExtraMux was not called on HTTP server initialization")
 	}
 }

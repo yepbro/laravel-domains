@@ -36,12 +36,12 @@ func parseConf(t *testing.T, content string) map[string]string {
 		}
 		m := settingRe.FindStringSubmatch(trimmed)
 		if m == nil {
-			t.Errorf("строка %d не является «name = value»: %q", i+1, line)
+			t.Errorf("line %d is not "name = value": %q", i+1, line)
 			continue
 		}
 		name, value := m[1], m[2]
 		if _, dup := settings[name]; dup {
-			t.Errorf("параметр %s задаётся повторно (строка %d)", name, i+1)
+			t.Errorf("the parameter %s is set again (line %d)", name, i+1)
 			continue
 		}
 		settings[name] = stripComment(unquote(value))
@@ -80,7 +80,7 @@ func parseBytes(t *testing.T, value string) int64 {
 	t.Helper()
 	m := regexp.MustCompile(`^(\d+)(B|kB|MB|GB)$`).FindStringSubmatch(value)
 	if m == nil {
-		t.Fatalf("размер %q не по форме «<число>B|kB|MB|GB»", value)
+		t.Fatalf("the size %q does not match "<number>B|kB|MB|GB"", value)
 	}
 	units := map[string]int64{"B": 1, "kB": 1 << 10, "MB": 1 << 20, "GB": 1 << 30}
 	n, _ := strconv.ParseInt(m[1], 10, 64)
@@ -91,10 +91,10 @@ func readConf(t *testing.T) map[string]string {
 	t.Helper()
 	content, err := os.ReadFile(confFile)
 	if err != nil {
-		t.Fatalf("прочитать %s: %v", confFile, err)
+		t.Fatalf("read %s: %v", confFile, err)
 	}
 	if len(content) == 0 {
-		t.Fatalf("%s пуст", confFile)
+		t.Fatalf("%s is empty", confFile)
 	}
 	return parseConf(t, string(content))
 }
@@ -104,7 +104,7 @@ func readConf(t *testing.T) map[string]string {
 func TestFormat(t *testing.T) {
 	settings := readConf(t)
 	if len(settings) < 20 {
-		t.Fatalf("подозрительно мало параметров: %d", len(settings))
+		t.Fatalf("suspiciously few parameters: %d", len(settings))
 	}
 }
 
@@ -143,7 +143,7 @@ func TestRequiredSettings(t *testing.T) {
 	}
 	for name, want := range required {
 		if got := settings[name]; got != want {
-			t.Errorf("%s = %q, ожидается %q (ТЗ)", name, got, want)
+			t.Errorf("%s = %q, want %q (spec)", name, got, want)
 		}
 	}
 }
@@ -157,7 +157,7 @@ func TestRanges(t *testing.T) {
 	settings := readConf(t)
 
 	if n, err := strconv.Atoi(settings["effective_io_concurrency"]); err != nil || n < 200 {
-		t.Errorf("effective_io_concurrency = %q, ожидается ≥ 200 (ТЗ §6.3)", settings["effective_io_concurrency"])
+		t.Errorf("effective_io_concurrency = %q, want ≥ 200 (spec §6.3)", settings["effective_io_concurrency"])
 	}
 
 	for name, def := range map[string]float64{
@@ -167,23 +167,23 @@ func TestRanges(t *testing.T) {
 	} {
 		v, err := strconv.ParseFloat(settings[name], 64)
 		if err != nil {
-			t.Errorf("%s не число: %v", name, err)
+			t.Errorf("%s is not a number: %v", name, err)
 			continue
 		}
 		if v >= def {
-			t.Errorf("%s = %v не ниже дефолта PostgreSQL %v", name, v, def)
+			t.Errorf("%s = %v is not below the PostgreSQL default %v", name, v, def)
 		}
 	}
 
 	// The budget of §3.2: shared_buffers ≈ 2 GB, the whole instance ≈
 	// 2.5 GB.
 	if got := parseBytes(t, settings["shared_buffers"]); got < 2<<30 || got > 3<<30 {
-		t.Errorf("shared_buffers = %d байт, коридор бюджета §3.2 — 2–3 ГБ", got)
+		t.Errorf("shared_buffers = %d bytes, the §3.2 budget corridor is 2–3 GB", got)
 	}
 	if got := parseBytes(t, settings["work_mem"]); got > 32<<20 {
-		t.Errorf("work_mem = %d байт: выше 32 МБ вылезает из бюджета бэкендов §3.2", got)
+		t.Errorf("work_mem = %d bytes: above 32 MB it breaks out of the §3.2 backend budget", got)
 	}
 	if got := parseBytes(t, settings["max_wal_size"]); got < 4<<30 {
-		t.Errorf("max_wal_size = %d байт: под NVMe и «места много» (§3.1/§10.3) нужен запас ≥ 4 ГБ", got)
+		t.Errorf("max_wal_size = %d bytes: on NVMe with plenty of disk (§3.1/§10.3) a margin of ≥ 4 GB is needed", got)
 	}
 }

@@ -24,7 +24,7 @@ func TestCacheTriage(t *testing.T) {
 	// A TTL of 1ns is a positive explicit value; the default does not
 	// replace it.
 	if o := (CacheOptions{TTL: time.Nanosecond}).withDefaults(); o.TTL != time.Nanosecond {
-		t.Errorf("TTL 1ns заменён дефолтом: %+v (дефолт — только для ≤ 0)", o)
+		t.Errorf("TTL 1ns replaced by the default: %+v (the default is only for ≤ 0)", o)
 	}
 
 	// NewCache without a clock: a nil Now must be replaced with
@@ -35,13 +35,13 @@ func TestCacheTriage(t *testing.T) {
 		return map[string]int64{"new": 1, "alive": 2}, nil
 	})
 	if err != nil {
-		t.Fatalf("cached без явных часов: %v", err)
+		t.Fatalf("cached without explicit clocks: %v", err)
 	}
 	// The defensive copy is COMPLETE: a cut-short/skipped record in
 	// cloneOf would return a trimmed map (a mutation of the result by the
 	// caller would tear the cache).
 	if len(got) != 2 || got["new"] != 1 || got["alive"] != 2 {
-		t.Errorf("копия кэш-значения = %v, хочу обе записи (полная копия)", got)
+		t.Errorf("a copy of the cache value = %v, want both entries (a full copy)", got)
 	}
 }
 
@@ -60,7 +60,7 @@ func TestFetchDomainStatusesTriageUnknownFirst(t *testing.T) {
 		t.Fatalf("FetchDomainStatuses: %v", err)
 	}
 	if got["alive"] != 40 || got["new"] != 1000 {
-		t.Errorf("статусы после неизвестного имени = %v: живые строки обязаны считаться", got)
+		t.Errorf("statuses after an unknown name = %v: live rows must be counted", got)
 	}
 }
 
@@ -71,7 +71,7 @@ func TestFetchDomainStatusesTriageUnknownFirst(t *testing.T) {
 func TestComputeRatesTriageWindowOne(t *testing.T) {
 	r := ComputeRates(Throughput{HourWindowSec: 1, ResultsHour: 3600, RenderedHour: 60}, 0, 0)
 	if r.ResultsPerSec != 3600 || r.RenderPerSec != 60 {
-		t.Errorf("темп окна 1с = %v/%v, хочу 3600/60 (деление на фактическую длину окна)",
+		t.Errorf("the 1s-window rate = %v/%v, want 3600/60 (dividing by the actual window length)",
 			r.ResultsPerSec, r.RenderPerSec)
 	}
 }

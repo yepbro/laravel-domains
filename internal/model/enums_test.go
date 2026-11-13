@@ -28,12 +28,12 @@ func TestStatusCodes(t *testing.T) {
 		{7, "invalid"}, // diagnostic, T-109
 	}
 	if len(Statuses) != len(want) {
-		t.Fatalf("Statuses: %d статусов, want %d (все статусы ТЗ 6.2)", len(Statuses), len(want))
+		t.Fatalf("Statuses: %d statuses, want %d (all spec 6.2 statuses)", len(Statuses), len(want))
 	}
 	for i, w := range want {
 		s := Statuses[i]
 		if int16(s) != w.code {
-			t.Errorf("Statuses[%d] = код %d, want %d", i, int16(s), w.code)
+			t.Errorf("Statuses[%d] = code %d, want %d", i, int16(s), w.code)
 		}
 		if got := s.String(); got != w.name {
 			t.Errorf("Status(%d).String() = %q, want %q", w.code, got, w.name)
@@ -58,7 +58,7 @@ func TestStatusStringUnknown(t *testing.T) {
 func TestStatusValidInvalid(t *testing.T) {
 	for _, code := range []int16{-1, 8, 42} {
 		if Status(code).Valid() {
-			t.Errorf("Status(%d).Valid() = true, want false (код вне ТЗ 6.2)", code)
+			t.Errorf("Status(%d).Valid() = true, want false (the code is outside spec 6.2)", code)
 		}
 	}
 }
@@ -88,13 +88,13 @@ func TestParseStatus(t *testing.T) {
 func TestParseStatusErrors(t *testing.T) {
 	for _, in := range []string{"", "parked", "no-http", "notdelegated", "new domain", "не-домен"} {
 		if _, err := ParseStatus(in); err == nil {
-			t.Errorf("ParseStatus(%q) = nil error, want ошибка", in)
+			t.Errorf("ParseStatus(%q) = nil error, want an error", in)
 		}
 	}
 	// The error message lists the valid names — a hint to the caller.
 	_, err := ParseStatus("parked")
 	if err == nil || !strings.Contains(err.Error(), "not_delegated") {
-		t.Errorf("ошибка ParseStatus должна называть допустимые имена, получено: %v", err)
+		t.Errorf("the ParseStatus error must name the allowed names, got: %v", err)
 	}
 }
 
@@ -105,10 +105,10 @@ func TestParseStatusErrors(t *testing.T) {
 // so the pin only fixes the convention (the caller must check err).
 func TestParseErrorZeroCode(t *testing.T) {
 	if got, err := ParseStatus("nope"); err == nil || got != 0 {
-		t.Errorf("ParseStatus(ошибка) = %d, %v, want 0 и ошибка", int16(got), err)
+		t.Errorf("ParseStatus(error) = %d, %v, want 0 and an error", int16(got), err)
 	}
 	if got, err := ParseScheme("ftp"); err == nil || got != 0 {
-		t.Errorf("ParseScheme(ошибка) = %d, %v, want 0 и ошибка", int16(got), err)
+		t.Errorf("ParseScheme(error) = %d, %v, want 0 and an error", int16(got), err)
 	}
 }
 
@@ -172,7 +172,7 @@ func TestScheme(t *testing.T) {
 		t.Errorf("SchemeHTTPS.String() = %q, want %q", got, want)
 	}
 	if int16(SchemeHTTP) != 1 || int16(SchemeHTTPS) != 2 {
-		t.Errorf("коды схем = %d/%d, want 1/2 (комментарий миграции 000001)", int16(SchemeHTTP), int16(SchemeHTTPS))
+		t.Errorf("the scheme codes = %d/%d, want 1/2 (the migration 000001 comment)", int16(SchemeHTTP), int16(SchemeHTTPS))
 	}
 	if !SchemeHTTP.Valid() || !SchemeHTTPS.Valid() {
 		t.Error("SchemeHTTP/HTTPS.Valid() = false, want true")
@@ -205,7 +205,7 @@ func TestParseScheme(t *testing.T) {
 	}
 	for _, in := range []string{"", "ftp", "httpx"} {
 		if _, err := ParseScheme(in); err == nil {
-			t.Errorf("ParseScheme(%q) = nil error, want ошибка", in)
+			t.Errorf("ParseScheme(%q) = nil error, want an error", in)
 		}
 	}
 }

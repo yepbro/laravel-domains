@@ -57,15 +57,15 @@ func TestCacheTTLHit(t *testing.T) {
 		t.Fatalf("ZoneStats: %v", err)
 	}
 	if len(z1) != 1 || z1[0].DomainsTotal != 100 {
-		t.Fatalf("зоны = %+v, want одна зона crawl.test", z1)
+		t.Fatalf("zones = %+v, want one crawl.test zone", z1)
 	}
 	// Within the window — the cache, not SQL.
 	clock.tick(59 * time.Second)
 	if _, err := c.ZoneStats(ctx, pool); err != nil {
-		t.Fatalf("ZoneStats из кэша: %v", err)
+		t.Fatalf("ZoneStats from the cache: %v", err)
 	}
 	if n := countSQL(pool.calls(), "FROM zones AS z"); n != 1 {
-		t.Errorf("выборок зон = %d, want 1 (внутри TTL)", n)
+		t.Errorf("zone selects = %d, want 1 (within the TTL)", n)
 	}
 
 	// Exactly at the TTL boundary the entry is no longer valid (the cache
@@ -73,13 +73,13 @@ func TestCacheTTLHit(t *testing.T) {
 	clock.tick(time.Second)
 	z2, err := c.ZoneStats(ctx, pool)
 	if err != nil {
-		t.Fatalf("ZoneStats после TTL: %v", err)
+		t.Fatalf("ZoneStats after the TTL: %v", err)
 	}
 	if n := countSQL(pool.calls(), "FROM zones AS z"); n != 2 {
-		t.Errorf("выборок зон = %d, want 2 (TTL истёк — перечёт)", n)
+		t.Errorf("zone selects = %d, want 2 (the TTL expired — a re-count)", n)
 	}
 	if !reflect.DeepEqual(z1, z2) {
-		t.Errorf("после перечёта зоны = %+v, want как в первый раз %+v", z2, z1)
+		t.Errorf("after the re-count the zones = %+v, want the same as the first time %+v", z2, z1)
 	}
 }
 
@@ -116,17 +116,17 @@ func TestCacheSectionsIndependent(t *testing.T) {
 
 	calls := pool.calls()
 	if n := countSQL(calls, "FROM zones AS z"); n != 2 {
-		t.Errorf("выборок зон = %d, want 2 (первая + после истечения)", n)
+		t.Errorf("zone selects = %d, want 2 (the first + after expiry)", n)
 	}
 	if n := countSQL(calls, "AS done_today"); n != 1 {
-		t.Errorf("выборок темпа = %d, want 1 (запись жива)", n)
+		t.Errorf("throughput selects = %d, want 1 (the entry is alive)", n)
 	}
 	// The statuses marker is LIKE 'status (domainStatusSQL): with T-179
 	// the throughputSQL also reads crawler_counters (the daily check
 	// counter) — the FROM crawler_counters substring no longer
 	// distinguishes the queries.
 	if n := countSQL(calls, "LIKE 'status"); n != 1 {
-		t.Errorf("выборок статусов = %d, want 1 (запись жива)", n)
+		t.Errorf("status selects = %d, want 1 (the entry is alive)", n)
 	}
 }
 
@@ -138,21 +138,21 @@ func TestCacheErrorsNotCached(t *testing.T) {
 	c := NewCache(CacheOptions{TTL: time.Minute, Now: clock.Now})
 	ctx := context.Background()
 
-	boom := errors.New("бд недоступна")
+	boom := errors.New("db unavailable")
 	pool.setQueryErr(boom)
 	if _, err := c.ZoneStats(ctx, pool); !errors.Is(err, boom) {
-		t.Fatalf("ошибка = %v, want исходная ошибка БД", err)
+		t.Fatalf("the error = %v, want the original DB error", err)
 	}
 	pool.setQueryErr(nil)
 	z, err := c.ZoneStats(ctx, pool)
 	if err != nil {
-		t.Fatalf("ZoneStats после восстановления: %v", err)
+		t.Fatalf("ZoneStats after the recovery: %v", err)
 	}
 	if len(z) != 1 {
-		t.Errorf("зоны = %+v, want данные восстановившейся БД", z)
+		t.Errorf("zones = %+v, want the recovered DB data", z)
 	}
 	if n := countSQL(pool.calls(), "FROM zones AS z"); n != 2 {
-		t.Errorf("выборок зон = %d, want 2 (ошибка не закэширована)", n)
+		t.Errorf("zone selects = %d, want 2 (the error is not cached)", n)
 	}
 }
 
@@ -177,17 +177,17 @@ func TestCacheCloneOnReturn(t *testing.T) {
 
 	z2, err := c.ZoneStats(ctx, pool)
 	if err != nil {
-		t.Fatalf("ZoneStats из кэша: %v", err)
+		t.Fatalf("ZoneStats from the cache: %v", err)
 	}
 	if z2[0].DomainsTotal != 100 {
-		t.Errorf("мутация результата испортила кэш зон: %+v", z2[0])
+		t.Errorf("mutating the result corrupted the zone cache: %+v", z2[0])
 	}
 	s2, err := c.DomainStatuses(ctx, pool)
 	if err != nil {
-		t.Fatalf("DomainStatuses из кэша: %v", err)
+		t.Fatalf("DomainStatuses from the cache: %v", err)
 	}
 	if s2["new"] == 999999 {
-		t.Errorf("мутация результата испортила кэш статусов: %v", s2)
+		t.Errorf("mutating the result corrupted the status cache: %v", s2)
 	}
 }
 
@@ -198,7 +198,7 @@ func TestCacheNilPool(t *testing.T) {
 	c := NewCache(CacheOptions{TTL: time.Minute, Now: clock.Now})
 	if _, err := c.ZoneStats(context.Background(), nil); err == nil ||
 		!strings.Contains(err.Error(), "pool not set") {
-		t.Fatalf("nil-пул = %v, want ошибка FetchZoneStats", err)
+		t.Fatalf("a nil pool = %v, want a FetchZoneStats error", err)
 	}
 }
 
@@ -210,12 +210,12 @@ func TestCacheOptionsDefaults(t *testing.T) {
 		t.Errorf("DefaultCacheTTL = %v, want 60s", DefaultCacheTTL)
 	}
 	if got := (CacheOptions{}).withDefaults().TTL; got != time.Minute {
-		t.Errorf("TTL = %v, want дефолт 60s", got)
+		t.Errorf("TTL = %v, want the default 60s", got)
 	}
 	if got := (CacheOptions{TTL: -time.Second}).withDefaults().TTL; got != time.Minute {
-		t.Errorf("TTL = %v после отрицательного, want дефолт", got)
+		t.Errorf("TTL = %v after a negative value, want the default", got)
 	}
 	if got := (CacheOptions{TTL: 5 * time.Minute}).withDefaults().TTL; got != 5*time.Minute {
-		t.Errorf("TTL = %v, want заданный (дефолт не затирает)", got)
+		t.Errorf("TTL = %v, want the set value (the default must not overwrite)", got)
 	}
 }

@@ -79,22 +79,22 @@ func TestCopyFrom_Validation(t *testing.T) {
 	ctx := context.Background()
 
 	if n, err := CopyFrom(ctx, f, testTable, []string{"zone_id"}, nil); err != nil || n != 0 {
-		t.Errorf("пустая пачка: (%d, %v), want (0, nil) без обращения к БД", n, err)
+		t.Errorf("an empty chunk: (%d, %v), want (0, nil) without touching the DB", n, err)
 	}
 	if len(f.batches) != 0 {
-		t.Errorf("пустая пачка привела к вызовам БД: %v", f.batches)
+		t.Errorf("an empty chunk led to DB calls: %v", f.batches)
 	}
 
 	if _, err := CopyFrom(ctx, f, testTable, nil, simpleRows(1)); err == nil || !strings.Contains(err.Error(), "column") {
-		t.Errorf("пустой список колонок: err = %v, want ошибка про колонки", err)
+		t.Errorf("an empty column list: err = %v, want a columns error", err)
 	}
 
 	bad := [][]any{{1, 2, 3}}
 	if _, err := CopyFrom(ctx, f, testTable, []string{"a", "b"}, bad); err == nil || !strings.Contains(err.Error(), "row 0") {
-		t.Errorf("несоответствие строки колонкам: err = %v, want ошибка со строкой 0", err)
+		t.Errorf("a row does not match the columns: err = %v, want an error about row 0", err)
 	}
 	if len(f.batches) != 0 {
-		t.Errorf("невалидная пачка дошла до БД: %v", f.batches)
+		t.Errorf("an invalid chunk reached the DB: %v", f.batches)
 	}
 }
 
@@ -105,10 +105,10 @@ func TestCopyFrom_SingleBatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	if n != 3 {
-		t.Errorf("скопировано %d, want 3", n)
+		t.Errorf("copied %d, want 3", n)
 	}
 	if strings.Join(ints(f.batches), ",") != "3" {
-		t.Errorf("пачки = %v, want [3]", f.batches)
+		t.Errorf("chunks = %v, want [3]", f.batches)
 	}
 }
 
@@ -120,11 +120,11 @@ func TestCopyFromStream_Batching(t *testing.T) {
 		t.Fatal(err)
 	}
 	if n != 105 {
-		t.Errorf("скопировано %d, want 105", n)
+		t.Errorf("copied %d, want 105", n)
 	}
 	// 10 full chunks + a tail of 5 rows; memory is bounded by batchSize.
 	if strings.Join(ints(f.batches), ",") != "10,10,10,10,10,10,10,10,10,10,5" {
-		t.Errorf("пачки = %v, want 10×10 + 5", f.batches)
+		t.Errorf("chunks = %v, want 10×10 + 5", f.batches)
 	}
 }
 
@@ -136,7 +136,7 @@ func TestCopyFromStream_BatchSmallerThanSource(t *testing.T) {
 		t.Fatalf("(%d, %v), want (7, nil)", n, err)
 	}
 	if strings.Join(ints(f.batches), ",") != "7" {
-		t.Errorf("пачки = %v, want [7] (одна неполная)", f.batches)
+		t.Errorf("chunks = %v, want [7] (one incomplete)", f.batches)
 	}
 }
 
@@ -144,17 +144,17 @@ func TestCopyFromStream_InvalidBatchSize(t *testing.T) {
 	for _, size := range []int{0, -1} {
 		f := &fakeCopier{}
 		if _, err := CopyFromStream(context.Background(), f, testTable, []string{"a"}, size, (&rowsIter{rows: simpleRows(1)}).next); err == nil {
-			t.Errorf("batchSize %d: ожидалась ошибка", size)
+			t.Errorf("batchSize %d: want an error", size)
 		}
 		if len(f.batches) != 0 {
-			t.Errorf("batchSize %d: копирование дошло до БД", size)
+			t.Errorf("batchSize %d: the copy reached the DB", size)
 		}
 	}
 }
 
 func TestCopyFromStream_SourceError(t *testing.T) {
 	f := &fakeCopier{}
-	boom := errors.New("источник сломался")
+	boom := errors.New("the source is broken")
 	it := &rowsIter{rows: simpleRows(30)}
 	// The source fails on row 22, short of the third chunk's flush.
 	next := func() ([]any, error) {
@@ -166,16 +166,16 @@ func TestCopyFromStream_SourceError(t *testing.T) {
 
 	n, err := CopyFromStream(context.Background(), f, testTable, []string{"a", "b", "c"}, 10, next)
 	if err == nil || !strings.Contains(err.Error(), boom.Error()) {
-		t.Fatalf("err = %v, want обёрнутая %v", err, boom)
+		t.Fatalf("err = %v, want the wrapped %v", err, boom)
 	}
 	if !strings.Contains(err.Error(), "copied 20") {
-		t.Errorf("err = %v, want упоминание 20 закоммиченных строк (2 полные пачки)", err)
+		t.Errorf("err = %v, want a mention of 20 committed rows (2 full chunks)", err)
 	}
 	if n != 20 {
-		t.Errorf("скопировано %d, want 20 (только законченные пачки)", n)
+		t.Errorf("copied %d, want 20 (only finished chunks)", n)
 	}
 	if strings.Join(ints(f.batches), ",") != "10,10" {
-		t.Errorf("пачки = %v, want [10,10]", f.batches)
+		t.Errorf("chunks = %v, want [10,10]", f.batches)
 	}
 }
 
@@ -184,10 +184,10 @@ func TestCopyFromStream_RowMismatch(t *testing.T) {
 	rows := [][]any{{1, 2, 3}, {1, 2}} // the second row is short
 	n, err := CopyFromStream(context.Background(), f, testTable, []string{"a", "b", "c"}, 10, (&rowsIter{rows: rows}).next)
 	if err == nil || !strings.Contains(err.Error(), "row 1") {
-		t.Errorf("err = %v, want ошибка про строку 1", err)
+		t.Errorf("err = %v, want an error about row 1", err)
 	}
 	if n != 0 || len(f.batches) != 0 {
-		t.Errorf("n = %d, пачки = %v: невалидная пачка не должна попадать в БД", n, f.batches)
+		t.Errorf("n = %d, chunks = %v: an invalid chunk must not reach the DB", n, f.batches)
 	}
 }
 
@@ -207,10 +207,10 @@ func TestCopyFromStream_CancelBetweenBatches(t *testing.T) {
 		t.Fatalf("err = %v, want context.Canceled", err)
 	}
 	if n != 30 {
-		t.Errorf("скопировано %d, want 30 (отмена до сброса 4-й пачки)", n)
+		t.Errorf("copied %d, want 30 (cancelled before the 4th chunk is flushed)", n)
 	}
 	if strings.Join(ints(f.batches), ",") != "10,10,10" {
-		t.Errorf("пачки = %v, want [10,10,10]", f.batches)
+		t.Errorf("chunks = %v, want [10,10,10]", f.batches)
 	}
 }
 
@@ -218,13 +218,13 @@ func TestCopyFromStream_CopyError(t *testing.T) {
 	f := &fakeCopier{err: errors.New("relation does not exist")}
 	n, err := CopyFromStream(context.Background(), f, testTable, []string{"a", "b", "c"}, 2, (&rowsIter{rows: simpleRows(5)}).next)
 	if err == nil || !strings.Contains(err.Error(), "relation does not exist") {
-		t.Fatalf("err = %v, want обёрнутая ошибка COPY", err)
+		t.Fatalf("err = %v, want a wrapped COPY error", err)
 	}
 	if !strings.Contains(err.Error(), "items") {
-		t.Errorf("err = %v, want имя таблицы в ошибке", err)
+		t.Errorf("err = %v, want the table name in the error", err)
 	}
 	if n != 0 {
-		t.Errorf("n = %d, want 0 (первая же пачка упала)", n)
+		t.Errorf("n = %d, want 0 (the very first chunk failed)", n)
 	}
 }
 

@@ -22,7 +22,7 @@ const testDSN = "postgres://crawler:secret@127.0.0.1:5432/crawler?sslmode=disabl
 func TestNewOptions(t *testing.T) {
 	opts := NewOptions(config.Postgres{DSN: testDSN, PoolSize: 7})
 	if opts.DSN != testDSN || opts.PoolSize != 7 {
-		t.Errorf("NewOptions: %+v, want DSN и pool_size из секции postgres", opts)
+		t.Errorf("NewOptions: %+v, want the DSN and pool_size from the postgres section", opts)
 	}
 }
 
@@ -32,10 +32,10 @@ func TestBuildPoolConfig_Defaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	if cfg.MaxConns != DefaultPoolSize {
-		t.Errorf("MaxConns = %d, want %d (pool_size не задан — значение по умолчанию)", cfg.MaxConns, DefaultPoolSize)
+		t.Errorf("MaxConns = %d, want %d (pool_size not set — the default value)", cfg.MaxConns, DefaultPoolSize)
 	}
 	if cfg.MinConns != 0 {
-		t.Errorf("MinConns = %d, want 0 (ленивое открытие соединений)", cfg.MinConns)
+		t.Errorf("MinConns = %d, want 0 (lazy connection opening)", cfg.MinConns)
 	}
 	if cfg.MaxConnLifetime != DefaultMaxConnLifetime {
 		t.Errorf("MaxConnLifetime = %s, want %s", cfg.MaxConnLifetime, DefaultMaxConnLifetime)
@@ -67,7 +67,7 @@ func TestBuildPoolConfig_Overrides(t *testing.T) {
 		t.Fatal(err)
 	}
 	if cfg.MaxConns != 5 {
-		t.Errorf("MaxConns = %d, want 5 (pool_size важнее pool_max_conns из DSN)", cfg.MaxConns)
+		t.Errorf("MaxConns = %d, want 5 (pool_size takes precedence over pool_max_conns from the DSN)", cfg.MaxConns)
 	}
 	if cfg.MinConns != 1 {
 		t.Errorf("MinConns = %d, want 1", cfg.MinConns)
@@ -98,7 +98,7 @@ func TestBuildPoolConfig_AppName(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got := cfg.ConnConfig.RuntimeParams["application_name"]; got != "ops-console" {
-		t.Errorf("application_name = %q, want ops-console (DSN важнее AppName)", got)
+		t.Errorf("application_name = %q, want ops-console (the DSN takes precedence over AppName)", got)
 	}
 
 	// An empty AppName — the parameter is not set at all.
@@ -107,7 +107,7 @@ func TestBuildPoolConfig_AppName(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got, ok := cfg.ConnConfig.RuntimeParams["application_name"]; ok {
-		t.Errorf("application_name = %q без AppName, want не задан", got)
+		t.Errorf("application_name = %q without AppName, want it unset", got)
 	}
 }
 
@@ -117,23 +117,23 @@ func TestBuildPoolConfig_Validation(t *testing.T) {
 		opts Options
 		want string // a substring of the expected error
 	}{
-		{"пустой DSN", Options{}, "empty PostgreSQL DSN"},
-		{"отрицательный pool_size", Options{DSN: testDSN, PoolSize: -1}, "out of range"},
-		{"pool_size больше лимита", Options{DSN: testDSN, PoolSize: MaxPoolSize + 1}, "out of range"},
-		{"битый DSN", Options{DSN: "://not-a-dsn"}, "parsing DSN"},
+		{"an empty DSN", Options{}, "empty PostgreSQL DSN"},
+		{"a negative pool_size", Options{DSN: testDSN, PoolSize: -1}, "out of range"},
+		{"pool_size above the limit", Options{DSN: testDSN, PoolSize: MaxPoolSize + 1}, "out of range"},
+		{"a broken DSN", Options{DSN: "://not-a-dsn"}, "parsing DSN"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := buildPoolConfig(tc.opts)
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
-				t.Errorf("ошибка = %v, want содержит %q", err, tc.want)
+				t.Errorf("the error = %v, want it to contain %q", err, tc.want)
 			}
 		})
 	}
 
 	// The boundary value passes.
 	if _, err := buildPoolConfig(Options{DSN: testDSN, PoolSize: MaxPoolSize}); err != nil {
-		t.Errorf("pool_size = %d должен быть допустим: %v", MaxPoolSize, err)
+		t.Errorf("pool_size = %d must be allowed: %v", MaxPoolSize, err)
 	}
 }
 
@@ -142,7 +142,7 @@ func TestBuildPoolConfig_Validation(t *testing.T) {
 // valid for PostgreSQL GUC time at any duration.
 func TestLockTimeout_HookSQL(t *testing.T) {
 	if DefaultLockTimeout != 30*time.Second {
-		t.Errorf("DefaultLockTimeout = %s, want 30s (инцидентный потолок T-192)", DefaultLockTimeout)
+		t.Errorf("DefaultLockTimeout = %s, want 30s (the incident cap T-192)", DefaultLockTimeout)
 	}
 	if got := fmt.Sprintf(lockTimeoutSQLFmt, DefaultLockTimeout.Milliseconds()); got != "SET lock_timeout = '30000ms'" {
 		t.Errorf("SET lock_timeout = %q, want \"SET lock_timeout = '30000ms'\"", got)
@@ -151,7 +151,7 @@ func TestLockTimeout_HookSQL(t *testing.T) {
 	// a fail-fast pool open, not a silent disabling of the cap.
 	for _, d := range []time.Duration{0, -time.Second} {
 		if err := LockTimeout(d)(context.Background(), nil); err == nil {
-			t.Errorf("LockTimeout(%s): want ошибку неположительной длительности", d)
+			t.Errorf("LockTimeout(%s): want an error for a non-positive duration", d)
 		}
 	}
 }
@@ -169,20 +169,20 @@ func TestJoinHooks(t *testing.T) {
 		}
 	}
 
-	fail := errors.New("сбой хука")
+	fail := errors.New("hook failure")
 	if err := JoinHooks(nil, hook("a", nil), hook("b", fail), hook("c", nil))(context.Background(), nil); !errors.Is(err, fail) {
-		t.Errorf("ошибка композиции = %v, want %v", err, fail)
+		t.Errorf("the composition error = %v, want %v", err, fail)
 	}
 	if got := strings.Join(calls, ","); got != "a,b" {
-		t.Errorf("выполнены %q, want a,b (nil пропущен, сбой прерывает)", got)
+		t.Errorf("ran %q, want a,b (nil skipped, a failure aborts)", got)
 	}
 
 	calls = nil
 	if err := JoinHooks(hook("a", nil), hook("b", nil))(context.Background(), nil); err != nil {
-		t.Errorf("ошибка композиции успешных хуков = %v, want nil", err)
+		t.Errorf("the composition error of successful hooks = %v, want nil", err)
 	}
 	if got := strings.Join(calls, ","); got != "a,b" {
-		t.Errorf("выполнены %q, want a,b", got)
+		t.Errorf("ran %q, want a,b", got)
 	}
 }
 
@@ -197,13 +197,13 @@ func TestOpen_UnreachableFailFast(t *testing.T) {
 		ConnectTimeout: 500 * time.Millisecond,
 	})
 	if err == nil {
-		t.Fatal("Open на недоступном PostgreSQL должен вернуть ошибку")
+		t.Fatal("Open on an unreachable PostgreSQL must return an error")
 	}
 	if !strings.Contains(err.Error(), "unreachable") {
-		t.Errorf("ошибка = %v, want «unreachable»", err)
+		t.Errorf("the error = %v, want \"unreachable\"", err)
 	}
 	if strings.Contains(err.Error(), "secret") {
-		t.Error("пароль DSN попал в сообщение об ошибке")
+		t.Error("the DSN password leaked into the error message")
 	}
 }
 
@@ -212,17 +212,17 @@ func TestRedactDSN(t *testing.T) {
 		name, dsn, want string
 	}{
 		{
-			"пароль в userinfo",
+			"the password in userinfo",
 			testDSN,
 			"postgres://crawler@127.0.0.1:5432/crawler?sslmode=disable",
 		},
 		{
-			"пароль в query-строке (libpq-форма pgx)",
+			"the password in the query string (the pgx libpq form)",
 			"postgres://crawler@127.0.0.1:5432/crawler?password=qwerty&sslmode=disable",
 			"postgres://crawler@127.0.0.1:5432/crawler?password=redacted&sslmode=disable",
 		},
 		{
-			"sslpassword в query-строке, остальные параметры целы",
+			"sslpassword in the query string, the other parameters intact",
 			"postgres://crawler@127.0.0.1:5432/crawler?sslmode=disable&sslpassword=k&pool_max_conns=4",
 			// Encode() sorts the parameters by name
 			"postgres://crawler@127.0.0.1:5432/crawler?pool_max_conns=4&sslmode=disable&sslpassword=redacted",
@@ -234,7 +234,7 @@ func TestRedactDSN(t *testing.T) {
 		}
 	}
 	if got := redactDSN("postgres://localhost/db"); got != "see postgres.dsn (configuration)" {
-		t.Errorf("redactDSN без пользователя = %q", got)
+		t.Errorf("redactDSN without a user = %q", got)
 	}
 }
 

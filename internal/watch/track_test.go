@@ -20,18 +20,18 @@ func TestTrackerStableAfterWindow(t *testing.T) {
 
 	mtime := time.Unix(1000, 0)
 	if !tr.observe("f.txt", 42, mtime, false) {
-		t.Fatal("observe нового файла должен делать его кандидатом")
+		t.Fatal("observe of a new file must make it a candidate")
 	}
 
 	clock.Add(10*time.Second - time.Nanosecond)
 	if _, ok := tr.ready("f.txt", 42, mtime); ok {
-		t.Error("файл выдан раньше истечения окна стабильности")
+		t.Error("the file was delivered before the stability window expired")
 	}
 
 	clock.Add(time.Nanosecond)
 	f, ok := tr.ready("f.txt", 42, mtime)
 	if !ok {
-		t.Fatal("файл не выдан после окна стабильности")
+		t.Fatal("the file was not delivered after the stability window")
 	}
 	if f.Path != "f.txt" || f.Size != 42 || !f.ModTime.Equal(mtime) {
 		t.Errorf("File = %+v, want path f.txt, size 42, mtime %v", f, mtime)
@@ -39,7 +39,7 @@ func TestTrackerStableAfterWindow(t *testing.T) {
 
 	// Redelivery of the same file is excluded.
 	if _, ok := tr.ready("f.txt", 42, mtime); ok {
-		t.Error("файл выдан второй раз")
+		t.Error("the file was delivered a second time")
 	}
 }
 
@@ -54,14 +54,14 @@ func TestTrackerEventResetsWindow(t *testing.T) {
 	// A write event with the same signature (a coarse mtime on the FS):
 	// the window must start anew.
 	if !tr.observe("f.txt", 42, mtime, true) {
-		t.Fatal("событие записи не вернуло файл в кандидаты")
+		t.Fatal("the write event did not return the file to the candidates")
 	}
 	if _, ok := tr.ready("f.txt", 42, mtime); ok {
-		t.Error("событие записи не сбросило окно стабильности")
+		t.Error("the write event did not reset the stability window")
 	}
 	clock.Add(10 * time.Second)
 	if _, ok := tr.ready("f.txt", 42, mtime); !ok {
-		t.Error("файл не выдан после нового окна")
+		t.Error("the file was not delivered after the new window")
 	}
 }
 
@@ -77,7 +77,7 @@ func TestTrackerScanDoesNotResetUnchanged(t *testing.T) {
 	// window.
 	tr.observe("f.txt", 42, mtime, false)
 	if _, ok := tr.ready("f.txt", 42, mtime); !ok {
-		t.Error("неизменный при обходе файл не выдан")
+		t.Error("an unchanged-on-traversal file must not be delivered")
 	}
 }
 
@@ -91,17 +91,17 @@ func TestTrackerChangedSignatureResets(t *testing.T) {
 	// An append: the size and mtime changed — a new window.
 	mtime2 := time.Unix(1005, 0)
 	if !tr.observe("f.txt", 100, mtime2, false) {
-		t.Fatal("изменённый файл не остался кандидатом")
+		t.Fatal("a changed file did not stay a candidate")
 	}
 	if _, ok := tr.ready("f.txt", 100, mtime2); ok {
-		t.Error("изменённая сигнатура выдала файл без нового окна")
+		t.Error("a changed signature delivered the file without a new window")
 	}
 	if _, ok := tr.ready("f.txt", 42, time.Unix(1000, 0)); ok {
-		t.Error("выдана устаревшая сигнатура кандидата")
+		t.Error("a stale candidate signature was delivered")
 	}
 	clock.Add(10 * time.Second)
 	if f, ok := tr.ready("f.txt", 100, mtime2); !ok || f.Size != 100 {
-		t.Errorf("после нового окна файл не выдан или размер неверен: %+v ok=%v", f, ok)
+		t.Errorf("after the new window the file was not delivered or the size is wrong: %+v ok=%v", f, ok)
 	}
 }
 
@@ -116,7 +116,7 @@ func TestTrackerReadyRequiresExactCurrentState(t *testing.T) {
 	// growing) — no delivery; the window will start anew at the next
 	// observe.
 	if _, ok := tr.ready("f.txt", 50, time.Unix(1000, 0)); ok {
-		t.Error("файл с изменившимся размером выдан как стабильный")
+		t.Error("a file with a changed size was delivered as stable")
 	}
 }
 
@@ -130,10 +130,10 @@ func TestTrackerForget(t *testing.T) {
 	tr.forget("f.txt")
 
 	if _, ok := tr.ready("f.txt", 42, mtime); ok {
-		t.Error("забытый (удалённый) файл выдан")
+		t.Error("a forgotten (deleted) file was delivered")
 	}
 	if got := tr.paths(); len(got) != 0 {
-		t.Errorf("paths после forget = %v, want пусто", got)
+		t.Errorf("paths after forget = %v, want empty", got)
 	}
 }
 
@@ -145,21 +145,21 @@ func TestTrackerDeliveredSameSignatureNotTrackedAgain(t *testing.T) {
 	tr.observe("f.txt", 42, mtime, false)
 	clock.Add(10 * time.Second)
 	if _, ok := tr.ready("f.txt", 42, mtime); !ok {
-		t.Fatal("файл не выдан")
+		t.Fatal("the file was not delivered")
 	}
 
 	// The same file seen again by a pass — not a candidate.
 	if tr.observe("f.txt", 42, mtime, false) {
-		t.Error("выданный файл с той же сигнатурой снова стал кандидатом")
+		t.Error("a delivered file with the same signature became a candidate again")
 	}
 
 	// A new file at the same path (a different signature) — a candidate.
 	if !tr.observe("f.txt", 43, mtime.Add(time.Second), false) {
-		t.Error("новый файл по известному пути не стал кандидатом")
+		t.Error("a new file at a known path did not become a candidate")
 	}
 	clock.Add(10 * time.Second)
 	if _, ok := tr.ready("f.txt", 43, mtime.Add(time.Second)); !ok {
-		t.Error("новый файл по тому же пути не выдан")
+		t.Error("a new file at the same path was not delivered")
 	}
 }
 
@@ -178,22 +178,22 @@ func TestTrackerForgetDropsDelivered(t *testing.T) {
 	tr.observe("f.txt", 42, mtime, false)
 	clock.Add(10 * time.Second)
 	if _, ok := tr.ready("f.txt", 42, mtime); !ok {
-		t.Fatal("файл не выдан")
+		t.Fatal("the file was not delivered")
 	}
 	if tr.observe("f.txt", 42, mtime, false) {
-		t.Fatal("выданный файл не должен становиться кандидатом повторно")
+		t.Fatal("a delivered file must not become a candidate again")
 	}
 
 	tr.forget("f.txt") // the file left the watched directory
 	if len(tr.delivered) != 0 {
-		t.Errorf("delivered = %v, want пусто после forget", tr.delivered)
+		t.Errorf("delivered = %v, want empty after forget", tr.delivered)
 	}
 	if !tr.observe("f.txt", 42, mtime, false) {
-		t.Error("повторно появившийся файл с той же сигнатурой должен стать кандидатом")
+		t.Error("a re-appearing file with the same signature must become a candidate")
 	}
 	clock.Add(10 * time.Second)
 	if _, ok := tr.ready("f.txt", 42, mtime); !ok {
-		t.Error("повторно появившийся файл не выдан после окна стабильности")
+		t.Error("a re-appearing file was not delivered after the stability window")
 	}
 }
 

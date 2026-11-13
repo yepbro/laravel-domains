@@ -35,24 +35,24 @@ func TestRenderFallbackProfileValid(t *testing.T) {
 		return ""
 	})
 	if err != nil {
-		t.Fatalf("loadPath(config.render-fallback.yaml): %v (профиль обязан проходить валидацию)", err)
+		t.Fatalf("loadPath(config.render-fallback.yaml): %v (the profile must pass validation)", err)
 	}
 	if cfg.Render.Engine != EngineChromium {
-		t.Errorf("render.engine = %q, хочу %q (воркер B — всегда chromium, ТЗ §4.5; рекурсивный фолбэк запрещён, ФТ-10)",
+		t.Errorf("render.engine = %q, want %q (worker B is always chromium, spec §4.5; a recursive fallback is forbidden, FR-10)",
 			cfg.Render.Engine, EngineChromium)
 	}
 	if cfg.Render.RemoteURL != "" {
-		t.Errorf("render.remote_url = %q, хочу пусто (собственный процесс headless-shell — сегодняшний render-образ без изменений)",
+		t.Errorf("render.remote_url = %q, want empty (an own headless-shell process — the current render image unchanged)",
 			cfg.Render.RemoteURL)
 	}
 	if cfg.Render.RestartMemoryBytes == 0 {
-		t.Errorf("render.restart_memory_bytes = 0: собственный процесс браузера — RSS-контроль T-065 обязан работать (как у основного render)")
+		t.Errorf("render.restart_memory_bytes = 0: an own browser process — the T-065 RSS control must work (as in the main render)")
 	}
 	if !cfg.Render.Fallback.Enabled {
-		t.Error("render.fallback.enabled = false: профиль воркера B документирует включённый фолбэк-контур (сборке флаг безразличен — publishFallback не публикует со стрима фолбэка)")
+		t.Error("render.fallback.enabled = false: the worker B profile documents an enabled fallback circuit (the build does not care about the flag — publishFallback does not publish from the fallback stream)")
 	}
 	if cfg.Render.Fallback.WorkerRate != 100 {
-		t.Errorf("render.fallback.worker_rate = %d, хочу 100 (дефолт потолка темпа, T-233 — калибруется стендом)", cfg.Render.Fallback.WorkerRate)
+		t.Errorf("render.fallback.worker_rate = %d, want 100 (the rate cap default, T-233 — calibrated by the bench)", cfg.Render.Fallback.WorkerRate)
 	}
 }
 
@@ -80,10 +80,10 @@ func TestDevProfileEngineSwitch(t *testing.T) {
 			return ""
 		})
 		if err != nil {
-			t.Fatalf("loadPath(config.dev.yaml, engine=%s): %v (переключение движка — engine+remote_url, порог в профиле уже 0)", engine.name, err)
+			t.Fatalf("loadPath(config.dev.yaml, engine=%s): %v (switching the engine is engine+remote_url, the threshold in the profile is already 0)", engine.name, err)
 		}
 		if cfg.Render.RestartMemoryBytes != 0 {
-			t.Errorf("engine=%s: render.restart_memory_bytes = %s, хочу 0 (внешний браузер dev-стека)", engine.name, cfg.Render.RestartMemoryBytes)
+			t.Errorf("engine=%s: render.restart_memory_bytes = %s, want 0 (the dev-stack external browser)", engine.name, cfg.Render.RestartMemoryBytes)
 		}
 	}
 }
