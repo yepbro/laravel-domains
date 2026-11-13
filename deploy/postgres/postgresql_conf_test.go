@@ -36,7 +36,7 @@ func parseConf(t *testing.T, content string) map[string]string {
 		}
 		m := settingRe.FindStringSubmatch(trimmed)
 		if m == nil {
-			t.Errorf("line %d is not "name = value": %q", i+1, line)
+			t.Errorf("line %d is not \"name = value\": %q", i+1, line)
 			continue
 		}
 		name, value := m[1], m[2]
@@ -80,7 +80,7 @@ func parseBytes(t *testing.T, value string) int64 {
 	t.Helper()
 	m := regexp.MustCompile(`^(\d+)(B|kB|MB|GB)$`).FindStringSubmatch(value)
 	if m == nil {
-		t.Fatalf("the size %q does not match "<number>B|kB|MB|GB"", value)
+		t.Fatalf("the size %q does not match \"<number>B|kB|MB|GB\"", value)
 	}
 	units := map[string]int64{"B": 1, "kB": 1 << 10, "MB": 1 << 20, "GB": 1 << 30}
 	n, _ := strconv.ParseInt(m[1], 10, 64)

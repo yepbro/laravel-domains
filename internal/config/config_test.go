@@ -166,7 +166,7 @@ func TestDefault(t *testing.T) {
 		t.Errorf("subdomains: want %v, got %v", want, c.Subdomains)
 	}
 	if len(c.Scheduler.ZoneWeights) != 0 {
-		t.Errorf("scheduler.zone_weights: empty by default (equal weights, spec 5.3 "optional"), got %v", c.Scheduler.ZoneWeights)
+		t.Errorf("scheduler.zone_weights: empty by default (equal weights, spec 5.3 \"optional\"), got %v", c.Scheduler.ZoneWeights)
 	}
 	if len(c.HTTP.PerIPOverrides) != 0 {
 		t.Errorf("http.per_ip_overrides: empty by default (a single per_ip_limit for all IPs, T-165), got %v", c.HTTP.PerIPOverrides)

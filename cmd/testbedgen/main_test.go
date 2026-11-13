@@ -74,7 +74,7 @@ func TestScenariosCoverTZ(t *testing.T) {
 		t.Run(tc.req, func(t *testing.T) {
 			sc, found := byName[tc.scenario]
 			if !found {
-				t.Fatalf("the scenario %q (spec 11.2 "%s") is missing from scenarios.yaml", tc.scenario, tc.req)
+				t.Fatalf("the scenario %q (spec 11.2 \"%s\") is missing from scenarios.yaml", tc.scenario, tc.req)
 			}
 			if !tc.ok(sc.DNS, sc.Site) {
 				t.Errorf("the scenario %q does not match spec 11.2 "%s": dns=%+v site=%+v",
