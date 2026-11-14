@@ -68,7 +68,7 @@ green `make test`/`make lint` before handing off to review.
 
 ### Operational (sequential)
 
-- **T-247** [done] — P1, bench comparison of the engines and canary-readiness
+- **T-247** [new] — P1, bench comparison of the engines and canary-readiness
   verdicts (spec §5.1; depends on T-234, T-241, T-243,
   T-244; T-254 — engine smoke preliminaries). Not code: runs of the three engines ×
   a 3000-domain sample twice (variability control), baseline — a fresh
@@ -82,6 +82,13 @@ green `make test`/`make lint` before handing off to review.
   FR-17/T-254), the cadence follows engine releases.
   Criterion: the reports are saved, a verdict per candidate is explicitly
   recorded against the thresholds; for the unready ones — a re-test plan written down.
+  Returned to [new] on 2026-11-13 (operator): the moli re-test from
+  upstream/main f857b6651 — layer 1 green (after T-276), layer 2 NOT
+  READY (success 69% vs 92%, detection divergences 2.94%, RSS 736 MiB
+  above ⅓ of the chromium budget; 0 crashes) → the retest is scheduled
+  with the first moli release carrying ①④. The 13.11 run: the journal
+  docs/operations.md 2026-11-13, the artifacts in var/fixtures-l2/
+  (moli-main-f857b6651.snapshot.json, report-moli-main-f857b6651.txt).
 
 - **T-248** [new] — P1, production rollout of BOTH engine containers and
   worker B (spec §4.7 items 2–3 v0.3, §6.2 item 1; depends on T-247,
