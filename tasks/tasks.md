@@ -10,7 +10,7 @@ finite-state machines (stage 37, audit 2026-11-06).
 
 ## How to work with this file
 
-- Tasks are numbered `T-001…T-281` and ordered by execution (top to bottom).
+- Tasks are numbered `T-001…T-282` and ordered by execution (top to bottom).
 - A task status is a bracketed label, changed by editing:
   - `[new]` — task not started;
   - `[in progress]` — task underway;
@@ -54,7 +54,7 @@ to async-XHR (moli upstream fixes), stage 46 **T-276** — the block_trackers
 sync probe on the exact-URL semantics of moli #2729. Stage 47: **T-277** —
 TTL for subdomain_results passports of non-findings (10 days): frees
 ~8–9 GB, steady-state table, covers the future recheck-ghost class.
-Stage 48: **T-278–T-281** — production resilience: retries, PG memory,
+Stage 48: **T-278–T-282** — production resilience: retries, PG memory,
 timeout metrics, crawlerctl.
 
 ## Stage 35: render engine selection and the fallback queue (T-233…T-249)
@@ -125,7 +125,7 @@ green `make test`/`make lint` before handing off to review.
   state (~1–1.5 GB), and automatically covers the future recheck-ghost
   class — [details](task/T-277-subdomain-results-passport-ttl.md).
 
-## Stage 48: production resilience — retries, PG memory, timeout metrics, crawlerctl (T-278–T-281)
+## Stage 48: production resilience — retries, PG memory, timeout metrics, crawlerctl (T-278–T-282)
 
 - **T-278** [new] — P1, a progressive temp_error retry backoff (24 h →
   72 h at attempts≥2): the dead corpus gives 63–69% temp_error (the norm
@@ -145,3 +145,8 @@ green `make test`/`make lint` before handing off to review.
   (“domain_info: empty response” for any domain, including live ones;
   discovered during the 13.11 investigation) —
   [details](task/T-281-crawlerctl-domain-fix.md).
+- **T-282** [new] — P1, the retention drain cursor lost after the 14.11
+  deploy (0 rows): cursor-less full scans → retention SELECT 74–80 min
+  under the front → the 14.11 02:30–06:11 PG OOM storm (4 kills + 3
+  global) and q:dead +97 — restore T-274 persistence,
+  [details](task/T-282-retention-cursor-lost-after-deploy.md).
