@@ -16,8 +16,6 @@ import (
 	"math"
 	"time"
 
-	"golang.org/x/net/idna"
-
 	"crawler/internal/model"
 )
 
@@ -282,14 +280,4 @@ func fetchLatest(ctx context.Context, pool Querier, subs map[int16]string) ([]La
 		out = append(out, it)
 	}
 	return out, rows.Err()
-}
-
-// displayUnicode — the domain name in Unicode for display (punycode
-// labels are decoded, ASCII as is; a decode error — the original
-// string).
-func displayUnicode(name string) string {
-	if u, err := idna.Lookup.ToUnicode(name); err == nil {
-		return u
-	}
-	return name
 }

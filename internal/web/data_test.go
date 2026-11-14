@@ -103,16 +103,3 @@ func TestFetchLandingQueryError(t *testing.T) {
 		t.Fatal("the DB layer unavailable = nil error, want an error")
 	}
 }
-
-// TestDisplayUnicode — punycode → Unicode, ASCII as is.
-func TestDisplayUnicode(t *testing.T) {
-	if got := displayUnicode("xn--80ak6aa92e.com"); got == "xn--80ak6aa92e.com" {
-		t.Errorf("the IDN is not decoded: %q", got)
-	}
-	if got := displayUnicode("example.com"); got != "example.com" {
-		t.Errorf("the ASCII changed: %q", got)
-	}
-	if got := displayUnicode("!!"); got != "!!" {
-		t.Errorf("the junk changed: %q", got)
-	}
-}
