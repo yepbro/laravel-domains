@@ -206,7 +206,9 @@ tools container `CHROMIUM_WS_URL` is set by compose — an unreachable chromium
 gives a failure, not SKIP). How to run them and the current state of the pinned versions —
 the doc comment of `internal/render/engines_live_test.go` and the section
 ["Switching the pinned engine version (FR-17)"](#switching-the-pinned-engine-version-fr-17-t-254)
-below.
+below. Why lightpanda is pinned red — one browser context per connection,
+waiting for upstream PR #4151 — the settled note
+[`questions/lightpanda-browser-contexts.md`](questions/lightpanda-browser-contexts.md).
 
 ### Render fixtures and an isolated stage run (T-242/T-243/T-244)
 

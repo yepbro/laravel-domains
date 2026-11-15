@@ -131,6 +131,7 @@ The documentation map (the same table with "when to read" notes — in
 | [`docs/ci-cd.md`](docs/ci-cd.md) | continuous deployment: GitHub Actions after green CI, rollback, secrets, Telegram notifications |
 | [`docs/disks.md`](docs/disks.md) | production server disks: PostgreSQL and content volumes, SMART/TBW (spec §10.3) |
 | [`docs/os-tuning.md`](docs/os-tuning.md) | production server OS tuning: sysctl — ephemeral ports, TIME_WAIT, nofile, conntrack, DNS UDP buffers (spec §10.2) |
+| [`docs/questions/`](docs/questions/) | settled questions with the upstream state and retrigger conditions (check before re-researching); e.g. [lightpanda browser contexts](docs/questions/lightpanda-browser-contexts.md) — why the engine stays red |
 
 Command list: `make help`.
 
