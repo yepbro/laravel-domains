@@ -924,7 +924,7 @@ then the flags at the same rate. A separate threshold, not the shared
 `scheduler.queue_high_watermark`: with the T-168 clamp the shared
 threshold of 100K kept the gates open at a lag of 98.4K out of 100K —
 inflow equaled consumption (≈5.1K tasks/h, the 24.10 equilibrium —
-stage 25 of `tasks/tasks.md`), and debt drainage was zero. The default
+the `render-debt-drain` group on the `LaravelDomains` board), and debt drainage was zero. The default
 of 10K ≈ 2 h of consumption buffer (the 24.10 measurement): it closes
 the gates on the current debt (a lag of 98.4K + 344.5K `render_pending`
 flags) and restores the "drain — then admit" hysteresis — full

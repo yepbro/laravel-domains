@@ -17,8 +17,8 @@
 # (T-180): ipv4_address is set for all long-lived services. The dynamic
 # allocator of Docker does not reserve addresses of stopped containers, and
 # a starting dynamic service used to take a foreign address — the owner
-# fell over "Address already in use" (the 2026-10-23/24 incidents —
-# tasks/tasks.md, stage 28). The address plan by class (the table with
+# fell over "Address already in use" (the 2026-10-23/24 incidents — the
+# TZ_docker_dev_environment group on the LaravelDomains board). The address plan by class (the table with
 # profiles — docs/docker.md §8):
 #   infrastructure: postgres 172.28.100.2, redis 172.28.100.3, unbound 172.28.100.10
 #   testbed:        coredns 172.28.100.11, testweb 172.28.100.12, mockserver 172.28.100.13

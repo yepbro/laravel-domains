@@ -305,7 +305,8 @@ services got static addresses (T-180): Docker's dynamic allocator does not
 reserve the addresses of stopped containers, and a starting dynamic service
 would take someone else's address — the owner failed with
 "Address already in use" and would not come up without manual fixing
-(incidents 2026-10-23/24 — stage 28 in `tasks/tasks.md`). The address plan
+(incidents 2026-10-23/24 — the `TZ_docker_dev_environment` group on the
+`LaravelDomains` board). The address plan
 by class:
 
 | Service | Address | Profile |

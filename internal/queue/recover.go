@@ -42,7 +42,7 @@ const DefaultRecoverInterval = 30 * time.Second
 // pace (batch/interval) out to redis.recover_batch/recover_interval: at
 // 16/30 s a PEL traversal of ~5k entries takes ≈2.6 h — in the Oct 22
 // incident (Redis OOM) the attempt burn-down of a single cohort stretched
-// to 12 h (stage 23, tasks.md), healthy tasks waited hours for their
+// to 12 h (the q:dead investigation — the LaravelDomains board), healthy tasks waited hours for their
 // return. The cost of re-processing claimed entries is bounded by
 // idempotence (spec 3.4: a repeat of Processing — the same "result in
 // the DB → XACK") — raising the batch costs only stage time, not

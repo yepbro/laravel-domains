@@ -187,8 +187,8 @@ Public entry points (TLS — Let's Encrypt, nginx):
 ## Structure
 
 Matches Appendix A of the main spec; the `internal/` packages are filled in
-as the stages are implemented (task links — in `tasks/tasks.md`, completed
-ones — in the archive [`tasks/tasks_done.md`](tasks/tasks_done.md)).
+as the stages are implemented (tasks live on the Todoist board
+`LaravelDomains`; completed ones — in its ARCHIVE column).
 
 | Directory | Purpose |
 |---|---|

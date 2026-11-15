@@ -331,7 +331,7 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	// capacity threshold — a separate render.queue_high_watermark (T-174,
 	// renderQueueWatermark below): the common scheduler.queue_high_watermark
 	// kept the gate open at a lag of 98.4k out of 100k (the equilibrium of
-	// 24.10, the stage 25 of tasks.md) — the inflow equaled the
+	// 24.10, the render-debt-drain group on the LaravelDomains board) — the inflow equaled the
 	// consumption, the debt drain was zero.
 	renderQ, err := httpworker.NewRenderQueue(rawQ, gate, renderQueueWatermark(cfg), logger)
 	if err != nil {

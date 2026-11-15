@@ -475,8 +475,8 @@ type Render struct {
 	// threshold, not the shared scheduler.queue_high_watermark: with the
 	// clamp of T-168 (min(lag, XLEN)+pending) the shared threshold of
 	// 100 k kept the gate open at a lag of 98.4 k out of 100 k — the
-	// inflow equaled the consumption (the equilibrium of 24.10, stage 25
-	// of tasks.md), the debt drain was zero. The default 10 k is ≈2 h of
+	// inflow equaled the consumption (the equilibrium of 24.10, the
+	// render-debt-drain group on the LaravelDomains board), the debt drain was zero. The default 10 k is ≈2 h of
 	// consumption buffer (the measurement of 24.10: ≈5.1 k tasks/h): it
 	// closes the gate at the current debt (the lag of 98.4 k + 344.5 k
 	// render_pending flags) and returns the "draining — admitting"

@@ -6,28 +6,64 @@ Instructions for an agent working in a loop on project tasks.
 
 Go monorepo: a service for bulk domain checking and discovery of Laravel sites.
 The dev environment is Docker (Go is not needed on the host). Structure and description: `README.md`.
-Specs: `tasks/TZ_*.md`. Task breakdown: `tasks/tasks.md`.
-
-## New task format
-
-- Details of a new task (incident context and symptoms, root
-  cause, requirements, acceptance criteria, links to specs/reports/commits) go
-  into a separate file `tasks/task/<T-NNN>-<slug>.md`.
-- The `tasks/tasks.md` plan holds only a title line with the status and
-  a link to the task file:
-  `- **T-NNN** [status] — <title> ([details](task/<T-NNN>-<slug>.md))`.
-  Details are not duplicated in the plan; detail edits live in the task file.
-- Pass the task file link to the task subagent — it reads the file itself.
+Specs — the sources of stage groups: `tasks/TZ_*.md`. The task breakdown
+lives on the Todoist board **LaravelDomains** (see "Work cycle").
 
 ## Work cycle
 
-1. Pick a task: the first `[in progress]` one; if there is none — the topmost `[new]` one (top to bottom).
-   No suitable tasks — the cycle is finished.
-2. Set its status to `[in progress]` in `tasks/tasks.md`.
-3. Implement the task according to its description and the spec links.
-4. Run the checks (see "Commands"). All green — mandatory.
-5. If needed, create/update documentation: `docs/`, `README.md`; if needed — `AGENTS.md`.
-6. Set the status to `[done]` and make the final commit. Go to step 1.
+Machine-readable board ids:
+
+```text
+todoist-project: 6hx3xR5WF9GpPG7P
+todoist-inbox-section: 6j2h8f4HJJJ59mww
+todoist-drafts-section: 6j2hGJwGW9fgJpMP
+todoist-todo-section: 6j2hGJxpF336Gqvw
+todoist-processing-section: 6j2hGM2X7rpjFr8P
+todoist-done-section: 6j2hGJwXCRgQXGFw
+todoist-archive-section: 6j2hGM2JW7J42HpP
+```
+
+- Tasks live in the Todoist project **LaravelDomains** (project id
+  `6hx3xR5WF9GpPG7P`, board view) and are managed through the Todoist MCP.
+  The board sections double as statuses:
+  - INBOX `6j2h8f4HJJJ59mww` — unsorted intake; the agent does not take
+    tasks from here (the user triages it);
+  - DRAFT `6j2hGJwGW9fgJpMP` — backlog; tasks here are worked on **only
+    on the user's direct instruction** (moving one to TODO is that
+    instruction);
+  - TODO `6j2hGJxpF336Gqvw` — ready for the cycle;
+  - PROCESSING `6j2hGM2X7rpjFr8P` — taken into work;
+  - DONE `6j2hGJwXCRgQXGFw` — finished ("done" means merged into `master`,
+    not "code written");
+  - ARCHIVE `6j2hGM2JW7J42HpP` — archive of finished tasks; the agent does
+    not move anything here unless instructed.
+- The cycle: if PROCESSING holds a task from an interrupted run, continue
+  it first; otherwise take the topmost task from TODO. TODO empty and
+  nothing in PROCESSING — the cycle ends. DRAFT and INBOX tasks are never
+  pulled into the cycle on the agent's own initiative.
+- **Only the main session touches the board** — it moves tasks between
+  sections and posts the workflow comments; executing subagents never
+  change it (anything worth keeping from their reports is posted by the
+  main session as a task comment). If the Todoist MCP is unavailable, the
+  cycle stops and the user is told.
+- Taking a task into work: move the card to PROCESSING and post a start
+  comment (start time, feature branch, worktree path). Finishing: post a
+  completion comment (end time, merged commit) and move the card to DONE.
+  Blockers, decisions and problems go into task comments.
+- Task cards: the title is `T-NNN — <short summary>` (continue the
+  existing numbering: the next number is the max T-number on the board,
+  including ARCHIVE, plus one), optionally prefixed with a stage slug.
+  The card description is the implementation spec — the main session
+  passes it verbatim into the executing subagent's prompt. Task detail
+  files in the repo are no longer created; new tasks are created in INBOX.
+- A **Stage** is a group of tasks sharing one source (a `tasks/TZ_*.md`
+  spec, a review round, an incident series). Membership is shown by the
+  title prefix: `[TZ_render_engines] T-247 — …`. Lone independent tasks
+  have no prefix. Stage numbers are not stored in git — the grouping
+  lives only on the board; git references only the task number
+  (`(T-NNN)` in the commit message).
+- One-off assignments outside the board: same rules, but no board changes
+  and no task reference in the commit message.
 
 ## Cycle operating rules
 
@@ -41,23 +77,21 @@ The main session keeps a sliding window of up to 4 tasks at a time (see
 independent tasks, it launches new ones without waiting for the running
 ones to finish.
 
-1. The main session picks the next independent task (the first
-   `[in progress]` one; if none — the topmost `[new]` one, skipping those
-   dependent on the running tasks), sets it to `[in progress]` with a status
-   commit in the main branch, creates a feature branch `t-NNN` and a
+1. The main session picks the next independent task per the cycle rules
+   (skipping those dependent on the running tasks), moves its card to
+   PROCESSING, creates a feature branch `t-NNN` and a
    worktree for the task (see "Branches and worktrees") and launches a
    subagent **in the background** with the model
    `zai-coding-plan/glm-5.3` (all development goes through it only)
-   with full context: the task text, links to the specs, the current
-   repository state, and the check requirements.
+   with full context: the task description from the card, links to the
+   specs, the current repository state, and the check requirements.
 2. The subagent runs the inner loop (implementation → tests → documentation)
    in the worktree of the `t-NNN` branch and makes **one commit per task**
-   (format `<type>: <description> (T-0NN)`). The subagent **does not touch**
-   `tasks/tasks.md`: only the main session changes statuses (step 5) —
-   this removes rebase conflicts between parallel waves and keeps the
-   status honest ("done" = "in master"). Review fixes are applied via
-   `git commit --amend` — the commit stays single. The subagent does not
-   push and does not merge.
+   (format `<type>: <description> (T-0NN)`). The subagent **does not touch
+   the board**: only the main session moves cards and posts comments —
+   this keeps the status honest ("done" = "in master"). Review fixes are
+   applied via `git commit --amend` — the commit stays single. The
+   subagent does not push and does not merge.
 3. After green tests the subagent runs a code review per the scheme from
    the "Review scheme" section below, with follow-up work in its own
    session: agrees with a finding — fix + amend + a re-run of the tests;
@@ -67,7 +101,7 @@ ones to finish.
    review is performed; the fact is recorded in the report and the commit.
 4. On the subagent completion notification the main session verifies the
    result: the commit is in place and there is exactly one, `git status`
-   is clean, the status in `tasks/tasks.md` is updated; if in doubt — a
+   is clean; if in doubt — a
    control `make test` / `make lint`. Verification and merging run in
    parallel with the other window tasks; the freed slot is immediately
    taken by the next task.
@@ -75,15 +109,13 @@ ones to finish.
    linearly — rebase + `--ff-only` (see "Linear master history"),
    sequentially; after each merge — `make test` +
    `make test-integration` in the main tree, then it removes the
-   task worktree and branch. Pushing — only on an explicit instruction
-   (see "Rules").
-   After a green merge — the status commit `chore: T-0NN [done] — <short
-   summary from the report>` in `tasks/tasks.md` (only the main session
-   sets the status — see step 2).
+   task worktree and branch, then moves the card to DONE and posts the
+   completion comment (end time, merged commit — see "Work cycle").
+   Pushing — only on an explicit instruction (see "Rules").
 6. The subagent returns a full report: what was done and which decisions
    were made, the check results, the review outcomes (findings / fixes /
-   rejections), the commit hash. The main session validates the report
-   and wraps up.
+   rejections), the commit hash. The main session validates the report,
+   posts the essentials as a task comment and wraps up.
 
 ### Review scheme
 
@@ -205,7 +237,7 @@ A full codebase audit is a separate mode on top of the task cycle
    `COMPOSE_PROJECT_NAME=crawler make test` + `make lint` in the worktree.
    An invalid finding is not fixed but is analyzed in the report with
    argumentation; P3 items at the level of new functionality are not
-   forced in — take them out as a task in `tasks/tasks.md`.
+   forced in — take them out as new INBOX cards on the board.
 6. **Merge.** After green tests the main session merges
    `fix-<slug>` into `master` linearly — rebase + `--ff-only`
    (see "Linear master history"), sequentially; it removes the worktree
@@ -223,11 +255,10 @@ A full codebase audit is a separate mode on top of the task cycle
   directories, removal
   after the merge).
 - In the main branch the main session makes only service commits:
-  status commits `chore: … in progress` when launching tasks (one at a
-  time or in a batch — whichever is more convenient), targeted fixes of
-  checks that failed after a merge
+  targeted fixes of checks that failed after a merge
   (with the task noted in the message), AGENTS.md edits
-  on direct instructions. No merge commits are created (linear history —
+  on direct instructions. Task status lives on the board — no status
+  commits. No merge commits are created (linear history —
   see "Linear master history").
 - Fixes following a bulk review — the `fix-<slug>` branch and the worktree
   `~/worktrees/laravel-domains/fix-<slug>` (see "Bulk code review
@@ -287,7 +318,7 @@ deploy → healthcheck with auto-rollback; details — docs/ci-cd.md).
 ### Parallel execution
 
 - By default — a sliding window: up to 4 independent tasks at a time
-  (within a stage — top to bottom as they are launched); purely
+  (within TODO — top to bottom as they are launched); purely
   sequential execution — only when all remaining tasks are dependent.
 - Only independent tasks may run in parallel (different packages/files,
   no shared migrations or DB schema); dependent ones — strictly
@@ -302,7 +333,7 @@ deploy → healthcheck with auto-rollback; details — docs/ci-cd.md).
   are launched in the background; the completion notification of one is
   the signal to immediately launch the next one from the queue, without
   waiting for the rest to finish. The queue may be mixed
-  (tasks + reviews + fixes) as long as task files do not overlap.
+  (tasks + reviews + fixes) as long as the tasks' files do not overlap.
   Reviews — read-only against the main tree; tasks and fixes — in a
   worktree; merges and service commits are done by the main session.
 - **Forced subagent stop:** `opencode session delete
@@ -314,11 +345,11 @@ deploy → healthcheck with auto-rollback; details — docs/ci-cd.md).
   Use when switching the model/task, for zombie agents, or when an agent
   goes off track.
 
-### One-off tasks outside the plan
+### One-off tasks outside the board
 
-Assignments outside `tasks/tasks.md` (CI, infrastructure, documentation) are
-executed by a subagent under the same rules; the status in tasks.md is not
-changed, the commit has no T-number. Review — as needed, per the scheme
+Assignments outside the board (CI, infrastructure, documentation) are
+executed by a subagent under the same rules; the board is not touched,
+the commit has no T-number. Review — as needed, per the scheme
 from "Review scheme".
 
 ## Tests
@@ -333,7 +364,7 @@ from "Review scheme".
 - `make test-integration` — if migrations, the DB, queues, services, or
   the testbed are affected.
 - A failing test — fix it; if it is outside the task scope, record the
-  cause in the commit and `tasks/tasks.md`.
+  cause in the commit and a task comment on the board.
 
 ## Documentation
 
@@ -344,7 +375,7 @@ from "Review scheme".
 
 ## Commits
 
-- One task — one commit (code, tests, docs); the subagent does not touch `tasks/tasks.md`. The `[done]` status is a separate service commit by the main session after a green merge (`chore: T-0NN [done] — <summary>`); `[in progress]` is the status commit of the wave at launch.
+- One task — one commit (code, tests, docs); the subagent does not touch the Todoist board. Task status lives on the board (DONE = merged into `master`); there are no status commits in git.
 - Message format: `<type>: <description> (T-0NN)`. Types: `feat`, `fix`, `docs`, `test`, `refactor`, `chore`.
 - Do not mix in changes unrelated to the task. Do not commit junk (`var/`, `tmp/`, local configs).
 
@@ -365,7 +396,8 @@ from "Review scheme".
   opencode-go/deepseek-v4.1-flash` → `cursor-agent grok-4.7-high` →
   `opencode run zai-coding-plan/glm-5.3#max` → `kimi kimi-code/k3.1-pro`;
   one round).
-- Execute the stages in `tasks/tasks.md` in order; within a stage — top to bottom.
+- Execute tasks from TODO top to bottom; a Stage is a grouping, not an
+  execution order.
 - Follow the structure, naming, and style of the existing code.
 - Design and refine behavioral logic (statuses, states, lifecycles,
   retries) as an explicit finite-state machine — a fixed
@@ -373,8 +405,8 @@ from "Review scheme".
   not scattered flags and conditions (the FSM registry and the
   formalization priorities —
   `tasks/TZ-fsm.md`).
-- A task is blocked — return its status to `[new]`, add a line with the
-  reason under it, take the next one.
+- A task is blocked — move its card back to TODO with a one-line reason
+  in its comments, take the next one.
 - Doubts about the spec interpretation — resolve by the spec text; briefly
   record the accepted decision in the commit.
 - Do not break existing behavior; changes to contracts between services

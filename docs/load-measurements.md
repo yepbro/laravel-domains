@@ -359,7 +359,8 @@ inside “live” domains — subdomain tarpits). CPU in steady state:
 postgres 177%, chromium 140%, analyzer 66%, dns-worker 26%, http-worker
 ~90% of one core.
 
-Problems and findings (filed as stage 24, tasks/tasks.md):
+Problems and findings (filed as the `load-measurement` group on the
+`LaravelDomains` board):
 
 - **http-worker memory (P0, T-157)**: at 05:48 killed by OOM killer,
   at 09:17 an exit code at the peak of 900.5 MiB = MemoryMax; MemoryHigh=850M —
@@ -394,8 +395,8 @@ Problems and findings (filed as stage 24, tasks/tasks.md):
   per-IP head-of-line — meanwhile the transport is fast (0.54 s/request),
   the bottleneck is in the task lifetime, not in the network.
 
-The measurement was performed by an operator session on 2026-10-23 ~11:00 MSK; the filing
-of stage 24 — tasks/tasks.md (stage 24).
+The measurement was performed by an operator session on 2026-10-23 ~11:00 MSK; the filing —
+the `load-measurement` group on the `LaravelDomains` board.
 
 ## 13. The T-093 daily run — closing the criterion (2026-10-24)
 

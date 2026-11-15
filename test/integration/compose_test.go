@@ -2,7 +2,7 @@
 // the one-off tools run container has an ipv4_address. Docker's dynamic
 // allocator does not reserve addresses of stopped containers, so a service
 // without an address reproduces the "Address already in use" race
-// (incidents of 2026-10-23/24 — tasks/tasks.md, stage 28). The test keeps
+// (incidents of 2026-10-23/24 — the TZ_docker_dev_environment group on the LaravelDomains board). The test keeps
 // the plan invariants (docs/docker.md §8): a new long-lived service must
 // get an address; addresses are unique and lie within the subnet hardcoded
 // at consumers (unbound, testbedgen, config.dev.yaml, integration tests);

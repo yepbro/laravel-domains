@@ -982,7 +982,8 @@ why, and how to roll it back. Normal CD deploys are not recorded here
   waits, all ≤1.1 s, all acquired — T-192 works); the T-191/T-193 fixes
   confirmed (retrySelect 150 → 10 events, the reanalysis tick 18–25 →
   5–12 s, renderRequeue 137 → 1). As a result, stage 31 was put on the
-  plan (T-199…T-205, tasks/tasks.md); the lease and retention analysis
+  plan (T-199…T-205, the `pg-slow-queries` group on the `LaravelDomains`
+  board); the lease and retention analysis
   specs — `tasks/TZ_slow_lease_return.md`,
   `tasks/TZ_slow_retention_residual.md`.
 - T-199 (operationally, before the defaults deploy):

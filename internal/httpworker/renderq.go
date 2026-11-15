@@ -35,7 +35,7 @@
 // of spec 5.10): the common scheduler.queue_high_watermark (T-026) at the
 // T-168 clamp (min(lag, XLEN)+pending) kept the gate open at a lag
 // of 98.4k of 100k — the inflow equaled the consumption, the debt
-// drainage was zero (the Oct 24 equilibrium, stage 25 of tasks.md). A default of 10k ≈ 2 h
+// drainage was zero (the Oct 24 equilibrium, the render-debt-drain group on the LaravelDomains board). A default of 10k ≈ 2 h
 // of consumption buffer (the Oct 24 measurement: ≈5.1k tasks/h) closes
 // the gate at the current debt and returns the "draining —
 // letting in" hysteresis; 0 — the common threshold. The effective value (the clamp
