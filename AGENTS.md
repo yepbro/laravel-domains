@@ -2,6 +2,12 @@
 
 Instructions for an agent working in a loop on project tasks.
 
+**Priority:** these project instructions take precedence over the global
+`~/AGENTS.md` and the `~/.agents/agent-guides/*.md` guides. Where they
+overlap, this file wins. The file contains only the project's refinements
+and deviations — general rules are not repeated here; they live in the
+global instructions and the guides.
+
 ## Project
 
 Go monorepo: a service for bulk domain checking and discovery of Laravel sites.
@@ -11,7 +17,11 @@ lives on the Todoist board **LaravelDomains** (see "Work cycle").
 
 ## Work cycle
 
-Machine-readable board ids:
+Tasks live on the Todoist board **LaravelDomains** (board view), managed
+through the Todoist MCP. The board rules — sections as statuses, the
+cycle order, workflow comments, `T-NNN` numbering, blocked-task handling —
+per the todoist guide (loaded via the global AGENTS.md table). Ids of this
+board (the machine-readable block the guide requires):
 
 ```text
 todoist-project: 6hx3xR5WF9GpPG7P
@@ -23,47 +33,17 @@ todoist-done-section: 6j2hGJwXCRgQXGFw
 todoist-archive-section: 6j2hGM2JW7J42HpP
 ```
 
-- Tasks live in the Todoist project **LaravelDomains** (project id
-  `6hx3xR5WF9GpPG7P`, board view) and are managed through the Todoist MCP.
-  The board sections double as statuses:
-  - INBOX `6j2h8f4HJJJ59mww` — unsorted intake; the agent does not take
-    tasks from here (the user triages it);
-  - DRAFT `6j2hGJwGW9fgJpMP` — backlog; tasks here are worked on **only
-    on the user's direct instruction** (moving one to TODO is that
-    instruction);
-  - TODO `6j2hGJxpF336Gqvw` — ready for the cycle;
-  - PROCESSING `6j2hGM2X7rpjFr8P` — taken into work;
-  - DONE `6j2hGJwXCRgQXGFw` — finished ("done" means merged into `master`,
-    not "code written");
-  - ARCHIVE `6j2hGM2JW7J42HpP` — archive of finished tasks; the agent does
-    not move anything here unless instructed.
-- The cycle: if PROCESSING holds a task from an interrupted run, continue
-  it first; otherwise take the topmost task from TODO. TODO empty and
-  nothing in PROCESSING — the cycle ends. DRAFT and INBOX tasks are never
-  pulled into the cycle on the agent's own initiative.
-- **Only the main session touches the board** — it moves tasks between
-  sections and posts the workflow comments; executing subagents never
-  change it (anything worth keeping from their reports is posted by the
-  main session as a task comment). If the Todoist MCP is unavailable, the
-  cycle stops and the user is told.
-- Taking a task into work: move the card to PROCESSING and post a start
-  comment (start time, feature branch, worktree path). Finishing: post a
-  completion comment (end time, merged commit) and move the card to DONE.
-  Blockers, decisions and problems go into task comments.
-- Task cards: the title is `T-NNN — <short summary>` (continue the
-  existing numbering: the next number is the max T-number on the board,
-  including ARCHIVE, plus one), optionally prefixed with a stage slug.
-  The card description is the implementation spec — the main session
-  passes it verbatim into the executing subagent's prompt. Task detail
-  files in the repo are no longer created; new tasks are created in INBOX.
+Project refinements:
+
 - A **Stage** is a group of tasks sharing one source (a `tasks/TZ_*.md`
   spec, a review round, an incident series). Membership is shown by the
   title prefix: `[TZ_render_engines] T-247 — …`. Lone independent tasks
   have no prefix. Stage numbers are not stored in git — the grouping
   lives only on the board; git references only the task number
   (`(T-NNN)` in the commit message).
-- One-off assignments outside the board: same rules, but no board changes
-  and no task reference in the commit message.
+- Task detail files in the repo are no longer created; the card
+  description is the implementation spec, and new tasks are created in
+  INBOX.
 
 ## Cycle operating rules
 
@@ -87,11 +67,8 @@ ones to finish.
    specs, the current repository state, and the check requirements.
 2. The subagent runs the inner loop (implementation → tests → documentation)
    in the worktree of the `t-NNN` branch and makes **one commit per task**
-   (format `<type>: <description> (T-0NN)`). The subagent **does not touch
-   the board**: only the main session moves cards and posts comments —
-   this keeps the status honest ("done" = "in master"). Review fixes are
-   applied via `git commit --amend` — the commit stays single. The
-   subagent does not push and does not merge.
+   (format `<type>: <description> (T-0NN)`). Review fixes are applied via
+   `git commit --amend` — the commit stays single.
 3. After green tests the subagent runs a code review per the scheme from
    the "Review scheme" section below, with follow-up work in its own
    session: agrees with a finding — fix + amend + a re-run of the tests;
@@ -124,7 +101,8 @@ if the previous one produced no review (a non-zero exit, an auth/
 provider/quota error in the output file, or no findings text); the chain
 stops at the first one that produced findings. The review runs **once
 per task** — no repeat rounds; a failed primary covered
-by a fallback is still one round.
+by a fallback is still one round. The chosen reviewer runs synchronously
+in the subagent's session (the code-review guide).
 
 1. Primary reviewer — `opencode run` with `opencode-go/deepseek-v4.1-flash`,
    from the worktree under review:
@@ -146,8 +124,7 @@ by a fallback is still one round.
    shell (there is no nested-subagent spawn tool — do not look for one).
    The prompt carries the read-only rules and the report path; the final
    message remains in the stdout file as a backup.
-2. First fallback — `cursor-agent` (Cursor CLI, model `grok-4.7-high`;
-   auth/diagnostics — `~/.agents/agent-guides/agents/cursor.md`):
+2. First fallback — `cursor-agent` (Cursor CLI, model `grok-4.7-high`):
 
    ```bash
    timeout 1200 cursor-agent -p --output-format text --mode ask \
@@ -163,9 +140,6 @@ by a fallback is still one round.
    without it a headless run hangs; `--model` — the model for a single
    run; `</dev/null` keeps it headless. Do not use `-f`/`--yolo` —
    they force-allow commands and contradict read-only.
-   As with kimi, the text output may contain a working transcript —
-   look for the report body (P0–P3 labels) before declaring the run
-   failed.
 3. Second fallback — `opencode run` with `zai-coding-plan/glm-5.3#max`
    (the same command shape as the primary, a different model):
 
@@ -175,8 +149,7 @@ by a fallback is still one round.
      --title "review-<slug>" "$(cat /tmp/opencode/review/prompt-<slug>.md)" \
      > /tmp/opencode/review/<slug>-glm.md 2>&1; echo "exit=$?"
    ```
-4. Third fallback — `kimi` (Kimi Code CLI, model `kimi-code/k3.1-pro`;
-   auth/diagnostics — `~/.agents/agent-guides/agents/kimi.md`):
+4. Third fallback — `kimi` (Kimi Code CLI, model `kimi-code/k3.1-pro`):
 
    ```bash
    timeout 1200 kimi -m kimi-code/k3.1-pro \
@@ -185,31 +158,12 @@ by a fallback is still one round.
    ```
 
    Never combine `-p` with `-y`/`--auto`; `</dev/null` keeps it
-   headless. The text output may contain a working transcript before
-   the report body — look for the body (findings with P0–P3 labels)
-   before declaring the run failed.
+   headless.
 
-Reviewer rules (the same for the whole chain; explicitly duplicated in the
-prompt — read-only and the P0–P3 format must be present in the prompt
-text):
-
-- Strictly read-only: does not modify repository files, makes no commits
-  or branches. The only write is the report `/tmp/opencode/review/NN-<slug>.md`.
-- Report: P0–P3 findings (P0 — security/data loss/crash; P1 —
-  a significant bug; P2 — code quality; P3 — ideas), file:line, essence,
-  a proposed fix, confidence (high/medium/low). Every finding is verified
-  against context: callers/consumers via grep across the
-  repository before inclusion in the report; unverified — not a finding.
-
-The winning reviewer runs **synchronously in the subagent's session**:
-the subagent waits for the CLI call to finish, processes the findings and
-only then returns the final report (not in the background and not "after
-the report" — the session would close earlier and the findings would stay
-unprocessed).
-
-If everyone in the chain is unavailable (a non-zero exit, provider errors/
-limits in the output files) — no review is performed (see "Task execution
-order", step 3).
+Reviewer rules — per the code-review guide (loaded via the global AGENTS.md
+table); they apply to every reviewer in the chain and must be carried
+verbatim in the review prompt. Project-specific: the report file for any
+reviewer is `/tmp/opencode/review/NN-<slug>.md`.
 
 ### Bulk code review and fixes
 
@@ -250,10 +204,9 @@ A full codebase audit is a separate mode on top of the task cycle
 - Work on cycle tasks is **not done** in the main branch (`master`). Any
   task — sequential or parallel with others — is executed
   by a subagent in a feature branch `t-NNN` in a separate worktree
-  `~/worktrees/laravel-domains/<t-NNN>` (the recipe is in the global
-  AGENTS.md: creating the worktree and branch, bootstrapping `.env`/working
-  directories, removal
-  after the merge).
+  `~/worktrees/laravel-domains/<t-NNN>`. Creation/removal and bootstrap
+  recipes — the git-worktree guide (loaded via the global AGENTS.md table);
+  the project bootstrap: symlink `.env` from the main tree, `mkdir -p var tmp`.
 - In the main branch the main session makes only service commits:
   targeted fixes of checks that failed after a merge
   (with the task noted in the message), AGENTS.md edits
@@ -279,9 +232,9 @@ bypass is not used). Merging a task/fix branch — only linearly:
 
 - The rebase is performed in the worktree (the branch is checked out
   there); conflicts are resolved by the main session in the same worktree.
-- Merges are sequential; after each — `make test`
-  (+ `make test-integration` for tasks touching migrations, the DB,
-  queues, the testbed), then removal of the worktree and the branch.
+- Merges are sequential; after each — `make test` +
+  `make test-integration` in the main tree (see "Task execution order",
+  step 5), then removal of the worktree and the branch.
   Pushing (`git push origin master`) — only on an explicit instruction
   (see "Rules").
 
@@ -317,25 +270,17 @@ deploy → healthcheck with auto-rollback; details — docs/ci-cd.md).
 
 ### Parallel execution
 
-- By default — a sliding window: up to 4 independent tasks at a time
-  (within TODO — top to bottom as they are launched); purely
-  sequential execution — only when all remaining tasks are dependent.
-- Only independent tasks may run in parallel (different packages/files,
-  no shared migrations or DB schema); dependent ones — strictly
-  sequentially (the next one starts after the previous one is merged).
-- When running in parallel, each task has its own branch and its own
-  worktree
-  (see "Branches and worktrees"); branches are merged — sequentially from
-  the main tree, linearly (see "Linear master history"), after
-  each — `make test` + `make test-integration` in the main tree.
-- **Subagent sliding window:** no more than 4
-  subagents of any type work at a time (cycle tasks, reviews, fixes). All
-  are launched in the background; the completion notification of one is
-  the signal to immediately launch the next one from the queue, without
-  waiting for the rest to finish. The queue may be mixed
-  (tasks + reviews + fixes) as long as the tasks' files do not overlap.
-  Reviews — read-only against the main tree; tasks and fixes — in a
-  worktree; merges and service commits are done by the main session.
+- The sliding window — per the work-cycle guide: up to 4 subagents of any
+  type (cycle tasks, reviews, fixes), all launched in the background; the
+  completion of one immediately launches the next from the queue; the
+  queue may mix tasks, reviews and fixes while the tasks' files do not
+  overlap.
+- Project refinement: only independent tasks may run in parallel —
+  different packages/files and no shared migrations or DB schema;
+  dependent tasks — strictly sequentially, the next one starts after the
+  previous one is merged. Each parallel task — its own branch and
+  worktree (see "Branches and worktrees"); merges — sequential, linear,
+  with full checks in the main tree (see "Linear master history").
 - **Forced subagent stop:** `opencode session delete
   <sessionID>` (the session is marked cancelled). Before that, take away
   the working directory: remove the worktree (`git worktree remove --force`;
@@ -354,7 +299,6 @@ from "Review scheme".
 
 ## Tests
 
-- Tests are mandatory: new/changed logic is covered by unit tests.
 - Before a commit: `make test` and `make lint` — no errors.
 - `make test-race` — mandatory for tasks touching packages with goroutine
   loops/workers (the `RACE_PKGS` set in the Makefile: monitor, scheduler,
@@ -368,14 +312,12 @@ from "Review scheme".
 
 ## Documentation
 
-- Updated after successful test runs, not before.
 - What to update when behavior, config, project structure, migrations, or
   the Makefile change: `README.md`, the corresponding file in `docs/`.
-- Outdated documentation is a bug: fix it within the same task.
 
 ## Commits
 
-- One task — one commit (code, tests, docs); the subagent does not touch the Todoist board. Task status lives on the board (DONE = merged into `master`); there are no status commits in git.
+- One task — one commit: code, tests and docs together.
 - Message format: `<type>: <description> (T-0NN)`. Types: `feat`, `fix`, `docs`, `test`, `refactor`, `chore`.
 - Do not mix in changes unrelated to the task. Do not commit junk (`var/`, `tmp/`, local configs).
 
@@ -405,8 +347,6 @@ from "Review scheme".
   not scattered flags and conditions (the FSM registry and the
   formalization priorities —
   `tasks/TZ-fsm.md`).
-- A task is blocked — move its card back to TODO with a one-line reason
-  in its comments, take the next one.
 - Doubts about the spec interpretation — resolve by the spec text; briefly
   record the accepted decision in the commit.
 - Do not break existing behavior; changes to contracts between services
