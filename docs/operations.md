@@ -231,7 +231,25 @@ the former alert frequency (5 min) alongside the 30-min reconciliation.
 as messages in the same dedicated group as the CI/CD notifications
 (spec §10.4) — "🚨 Alert …" on firing and "✅ Recovered …" on clearing;
 duplicates are debounced (one episode = two messages), the monitor log
-does not flood. Enabled by default (`monitor.alerts.telegram`); it
+does not flood. An alert already firing at the monitor start (a deploy
+restart in the middle of an incident) is announced with an informational
+"⏳ Still firing at the monitor start" instead of a fresh 🚨 — healthy
+states are not mailed out, and the later ✅ stays paired with a visible
+opening (T-290). The delivery itself is serialized (T-290): one sender,
+the first message immediately, then at most one per 3 s — the pace of the
+Telegram group cap (20/min), never above it on the monitor's own (a
+residual 429 — the group is shared with the CI/CD posts — is retried with
+the API's Retry-After); transient failures — HTTP 429, 5xx, network/proxy
+errors — are retried with a backoff; a 🚨 that still fails (or could not
+even be queued — a full queue) is re-attempted on the next alert pass, so
+a rate-limit blip no longer loses the opening of an episode (an episode
+whose opening was not delivered closes silently — no unpaired ✅). At
+shutdown the sender drains within an 8 s budget (smaller than the
+service's 10 s graceful window): the in-flight send finishes, the
+queued-but-unsent tail is dropped with a Warn. Alert details over
+3500 characters are truncated with a
+"… (full text in the monitor journal)" pointer — the sendMessage limit is
+4096. Enabled by default (`monitor.alerts.telegram`); it
 actually works under two conditions:
 
 1. Secrets in `/etc/crawler/crawler.env` (the monitor unit's

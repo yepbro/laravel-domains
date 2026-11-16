@@ -490,6 +490,37 @@ func TestAlertsDNSHysteresis(t *testing.T) {
 	}
 }
 
+// TestAlertsDNSHysteresisSurvivesDegradation — the corridor lives in the
+// track latch, not in the status: a "not measured" pass in the middle of
+// an episode does not close it — the source returning with a share inside
+// the corridor keeps firing (the bulk review 12#P2-1: a status-bound
+// corridor gave a false ok → a false ✅ and an episode flapping every
+// pass while the level oscillates). Only a value below the corridor clears.
+func TestAlertsDNSHysteresisSurvivesDegradation(t *testing.T) {
+	env := newAlertsTestEnv(t, nil)
+	ctx := context.Background()
+	m := env.newDNSMachine()
+
+	if s := m.transition(env.Alerts, ctx, obs(dnsShare{temp: 350, total: 1000})); s.Status != AlertStatusFiring {
+		t.Fatalf("35%%: %s (%s), want firing", s.Status, s.Detail)
+	}
+	if s := m.transition(env.Alerts, ctx, obsErr[dnsShare](errors.New("db unavailable"))); s.Status != AlertStatusNotMeasured {
+		t.Fatalf("a source error: %s, want not_measured", s.Status)
+	}
+	// The source is back at 25% — inside the 20–30% corridor: the episode
+	// holds (the latch, not the overwritten status).
+	if s := m.transition(env.Alerts, ctx, obs(dnsShare{temp: 250, total: 1000})); s.Status != AlertStatusFiring {
+		t.Errorf("the corridor after a degradation: %s (%s), want firing (the latch survived)", s.Status, s.Detail)
+	}
+	// A repeated degradation — still not measured, the latch untouched.
+	if s := m.transition(env.Alerts, ctx, obsReason[dnsShare]("checks for the current day 50 < 100")); s.Status != AlertStatusNotMeasured {
+		t.Fatalf("a quiet reason: %s, want not_measured", s.Status)
+	}
+	if s := m.transition(env.Alerts, ctx, obs(dnsShare{temp: 100, total: 1000})); s.Status != AlertStatusOK {
+		t.Errorf("10%% after a degradation: %s (%s), want ok (below the corridor)", s.Status, s.Detail)
+	}
+}
+
 // TestAlertsDNSMinSamples — an empty day counter (no rows yet — an honest
 // zero) and a small window (fewer than 100 denominator events): the share is
 // not indicative — "not measured", not a firing. Exactly 100 is already
@@ -832,6 +863,30 @@ func TestAlertsRedisMemoryThreshold(t *testing.T) {
 	if s.Status != AlertStatusFiring ||
 		!strings.Contains(s.Detail, "80.0%") || !strings.Contains(s.Detail, "noeviction") {
 		t.Errorf("detail = %q (%s), want firing with the 80.0%% share and the policy", s.Detail, s.Status)
+	}
+}
+
+// TestAlertsRedisMemoryHysteresisSurvivesDegradation — the 75–80% corridor
+// survives a source failure (the track latch, 12#P2-1): the Redis INFO read
+// breaking for a pass in the middle of an episode does not close it — the
+// return inside the corridor holds firing, below the corridor — clearing.
+func TestAlertsRedisMemoryHysteresisSurvivesDegradation(t *testing.T) {
+	env := newAlertsTestEnv(t, nil)
+	ctx := context.Background()
+	m := env.newRedisMemoryMachine()
+	const max = int64(1000)
+
+	if s := m.transition(env.Alerts, ctx, obs(RedisMemory{UsedBytes: 800, MaxBytes: max})); s.Status != AlertStatusFiring {
+		t.Fatalf("80%%: %s (%s), want firing", s.Status, s.Detail)
+	}
+	if s := m.transition(env.Alerts, ctx, obsErr[RedisMemory](errors.New("connection refused"))); s.Status != AlertStatusNotMeasured {
+		t.Fatalf("a source error: %s, want not_measured", s.Status)
+	}
+	if s := m.transition(env.Alerts, ctx, obs(RedisMemory{UsedBytes: 770, MaxBytes: max})); s.Status != AlertStatusFiring {
+		t.Errorf("77%% after a degradation: %s (%s), want firing (the corridor holds)", s.Status, s.Detail)
+	}
+	if s := m.transition(env.Alerts, ctx, obs(RedisMemory{UsedBytes: 700, MaxBytes: max})); s.Status != AlertStatusOK {
+		t.Errorf("70%%: %s (%s), want ok (below the corridor)", s.Status, s.Detail)
 	}
 }
 

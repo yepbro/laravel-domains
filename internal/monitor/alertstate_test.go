@@ -65,7 +65,9 @@ func wantSequence(t *testing.T, name string, got, want []string) {
 // measured" with the reason in detail, the track memory untouched (the
 // series survives the failure); a quiet reason — the same without a Warn; a ctx cancellation — without
 // a Warn (part of the shutdown); the status is written only by transition and is visible
-// to the next pass (the hysteresis/hold read it as prev).
+// to the next pass (the series tracks read it as prev; the hysteresis latch
+// lives in the track memory itself — hysteresisTrack.decide does not read
+// prev, T-290).
 func TestAlertMachineTransition(t *testing.T) {
 	env := newAlertsTestEnv(t, nil)
 	ctx := context.Background()

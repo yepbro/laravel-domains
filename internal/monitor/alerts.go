@@ -1170,7 +1170,7 @@ func (a *Alerts) observeDNS(ctx context.Context) observation[dnsShare] {
 func (a *Alerts) newDNSMachine() *alertMachine[dnsShare] {
 	return &alertMachine[dnsShare]{
 		name: AlertDNSErrors,
-		track: hysteresisTrack[dnsShare]{
+		track: &hysteresisTrack[dnsShare]{
 			fire: func(v dnsShare) bool { return v.share() >= AlertDNSFireShare },
 			hold: func(v dnsShare) bool { return v.share() >= AlertDNSRecoverShare },
 			okDetail: func(v dnsShare) string {
@@ -1224,7 +1224,7 @@ func (a *Alerts) newQueuesMachine() *alertMachine[map[string]int64] {
 	}
 	return &alertMachine[map[string]int64]{
 		name: AlertQueueOverflow,
-		track: hysteresisTrack[map[string]int64]{
+		track: &hysteresisTrack[map[string]int64]{
 			fire: func(lens map[string]int64) bool {
 				for _, s := range alertStreams {
 					if lens[s] >= wm[s] {
@@ -1771,7 +1771,7 @@ func (a *Alerts) newRedisMemoryMachine() *alertMachine[RedisMemory] {
 	}
 	return &alertMachine[RedisMemory]{
 		name: AlertRedisMemory,
-		track: hysteresisTrack[RedisMemory]{
+		track: &hysteresisTrack[RedisMemory]{
 			fire:     func(m RedisMemory) bool { return share(m) >= AlertRedisMemFireRatio },
 			hold:     func(m RedisMemory) bool { return share(m) >= AlertRedisMemRecoverRatio },
 			okDetail: func(m RedisMemory) string { return detail(m) },

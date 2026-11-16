@@ -44,7 +44,7 @@
 //	| track type | machines | firing entry | firing hold | clearing → ok |
 //	|-----------|--------|--------------------|-----------------|-------------|
 //	| level threshold thresholdTrack | progress_stall, disk_free, disk_free_min, disk_free_crit, nvme_wear, unit_oom, redis_restart | the observation predicate | — (no memory: every pass decides anew; the "memory" is the observed level itself, monotonic by mechanics: the stamp age, space, wear, event counters, Redis uptime) | the same predicate |
-//	| threshold hysteresis hysteresisTrack | dns_temp_error_share, queue_overflow, redis_memory | fire(v) | prev = firing ∧ hold(v) — the clearing corridor does not flap the Warn | ¬(fire ∨ hold) |
+//	| threshold hysteresis hysteresisTrack | dns_temp_error_share, queue_overflow, redis_memory | fire(v) | latch = firing ∧ hold(v) — the clearing corridor does not flap the Warn; the latch survives a source degradation (T-290, the bulk review 12#P2-1) | ¬(fire ∨ hold) |
 //	| series: deadStreakTrack | queue_dead | a non-zero depth for N=3 passes in a row | prev = firing ∧ depth > 0 | a zero depth |
 //	| series: memHighStreakTrack | memory_high | growth of the unit's high counter for N=2 passes in a row (any unit) | the hot unit series is not broken | the first pass without growth |
 //	| series: counterGrowthTrack | render_browser_errors | counter growth for N=2 passes in a row | the series is not broken | the first pass without growth |
@@ -56,11 +56,11 @@
 //	| time window: queueFreezeTrack | queue_frozen | the group's last-delivered-id is immobile ≥ the window (15 min) at depth > 0 | the immobility holds | the ID moves / depth 0 / no groups |
 //
 //	Degradation (any machine): → not_measured, the track memory untouched.
-//	Level latches are the only ones whose LIVED episode survives
-//	degradation (firing lives in the track memory, not in the status); for the hystereses
-//	and series "not measured" overwrites the status — the return of the source
-//	in the hold corridor yields ok, not a hold (the former state map
-//	semantics, documented as a decision).
+//	A LIVED episode survives the degradation in the track memory, not in
+//	the status: the hysteresis latch (T-290, the bulk review 12#P2-1), the
+//	level latches and the series (a kept streak/level re-fires on the
+//	return of measurements) — "not measured" overwrites only the status;
+//	a return of the source in the hold corridor holds the episode.
 //
 // # Transition side effects (shared, only transition)
 //
@@ -81,8 +81,8 @@
 //	    measurement.
 //	I2  A source degradation does not touch the track memory: the series/windows/latches
 //	    survive the failure; the status is meanwhile overwritten to
-//	    not_measured (the status-bound hysteresis corridors
-//	    are reset — the former behavior).
+//	    not_measured — the lived episode lives in the track memory (the
+//	    hysteresis corridor — in the latch, T-290), not in the status.
 //	I3  Front entries — only on a status change (debouncing); a repeated
 //	    pass in the same state is silent.
 //	I4  The machine order is fixed (NewAlerts): the AlertsResult
@@ -226,27 +226,36 @@ func (t thresholdTrack[V]) decide(_ string, now time.Time, v V) decision {
 // --------------------------------------------------------- threshold hysteresis
 
 // hysteresisTrack — a threshold hysteresis: entry by fire, holding
-// the fired state by hold (the clearing corridor); the memory is the machine
-// status (prev): a value in the corridor between the thresholds does not flap the Warn.
-// The corridor lives only while the status is firing: "not measured" (a source
-// failure) overwrites the status — the return of the source in the corridor yields
-// ok, not a hold (the former state map semantics, I2).
+// the fired state by hold (the clearing corridor); the memory is the
+// firing latch — the depthGrowth style: a source failure ("not
+// measured") overwrites the status but not the latch (I2), so the return
+// of measurements with a value inside the corridor keeps the episode
+// (firing), and only a value below the corridor closes it. Until T-290
+// the corridor was bound to the status (prev = firing): a single
+// degraded pass erased it, and the return inside the corridor gave a
+// false ok → a false ✅ and an episode flapping every pass at an
+// oscillating level (the bulk review 12#P2-1).
 type hysteresisTrack[V any] struct {
 	fire      func(v V) bool
 	hold      func(v V) bool
 	okDetail  func(v V) string
 	hotDetail func(v V) string // nil — the ok detail (one DNS error share for both statuses)
+	// firing — the episode latch: set by an entry (fire), held by the
+	// corridor (hold), cleared only by a value outside both.
+	firing bool
 }
 
-// decide — the hysteresis transition: fire ∨ (prev = firing ∧ hold) → firing.
-func (t hysteresisTrack[V]) decide(prev string, _ time.Time, v V) decision {
-	if t.fire(v) || (prev == AlertStatusFiring && t.hold(v)) {
+// decide — the hysteresis transition: fire ∨ (latch ∧ hold) → firing.
+func (t *hysteresisTrack[V]) decide(_ string, _ time.Time, v V) decision {
+	if t.fire(v) || (t.firing && t.hold(v)) {
+		t.firing = true
 		d := t.okDetail(v)
 		if t.hotDetail != nil {
 			d = t.hotDetail(v)
 		}
 		return decision{AlertStatusFiring, d}
 	}
+	t.firing = false
 	return decision{AlertStatusOK, t.okDetail(v)}
 }
 

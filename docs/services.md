@@ -1142,7 +1142,9 @@ reconciliation periods (see the alert below):
   the window is a day; the day name is computed by the DB
   (`current_date`; the day precision of
   `last_checked_at` — spec 6.1). On at a share ≥ 30 %, off below
-  20 % (hysteresis); with < 100 denominator events the share is the
+  20 % (hysteresis — the corridor lives in the machine latch and
+  survives a source break into "not measured", T-290); with < 100
+  denominator events the share is the
   noise of an empty
   window — the alert is "not measured". The former live aggregate over
   the day window
@@ -1173,7 +1175,9 @@ reconciliation periods (see the alert below):
   (75k at defaults) and fires later than the gate closes — the signal
   that debt draining cannot keep up); clearing below 90 % of the
   threshold (hysteresis
-  against depth flapping near the threshold);
+  against depth flapping near the threshold); the corridor lives in the
+  machine latch — a source break into "not measured" does not tear a
+  lived episode (T-290);
 - **progress stop** — `zones.updated_at` (written by `ZoneStatsLoop`)
   older than 5 × `zone_stats_interval` (2.5 h at the default 30 min,
   T-199):
@@ -1274,7 +1278,8 @@ reconciliation periods (see the alert below):
 - **Redis memory** (T-154) — `used_memory/maxmemory` from `INFO memory`
   (the source `RedisInfo` of the same client as the depth gate; the
   `NewRedisMemoryMetrics` wrapper mirrors `crawler_redis_memory_ratio`/
-  `_bytes`) ≥ 80 % — firing, < 75 % — clearing (hysteresis):
+  `_bytes`) ≥ 80 % — firing, < 75 % — clearing (hysteresis, the
+  latch survives a source break — T-290):
   under noeviction (the budget policy, spec 3.2) filling maxmemory is
   an XADD write refusal ("OOM command not allowed", the incidents
   T-093/22.10);

@@ -324,5 +324,13 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 			err = bgErr
 		}
 	}
+	// The Telegram delivery is drained last (T-290): by this point all its
+	// producers — the alerts loop above, the load report, the slow queries —
+	// have stopped; Close waits for the in-flight send within its drain
+	// budget (8 s — smaller than the service's own graceful window of 10 s,
+	// 29#P2-3) and drops the queued-but-unsent with a Warn. Before
+	// T-290 the per-message goroutines were not tracked at all: the process
+	// exit cut the sends mid-flight.
+	telegram.Close()
 	return err
 }
